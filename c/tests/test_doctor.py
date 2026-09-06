@@ -10,6 +10,8 @@ from unittest import mock
 
 from doctor import (
     _tensor_layout,
+    deep_container_report,
+    missing_core_roles,
     cuda_linkage,
     exit_code,
     format_doctor,
@@ -138,12 +140,29 @@ class DoctorTest(unittest.TestCase):
     def test_cpu_engine_with_detected_gpu_is_only_a_warning(self):
         gpu = {"index": 0, "name": "fixture", "total_bytes": 12 * GB,
                "free_bytes": 10 * GB}
-        report = self.report(gpu_indices=None, gpus=[gpu])
+        report = self.report(gpu_indices=[0], vram_gb=8, gpus=[gpu])
         check = self.checks_by_id(report)["accelerator.gpu"]
 
         self.assertEqual(check["status"], "warn")
+        self.assertEqual(report["plan"]["tiers"]["vram"]["devices"], [])
+        self.assertEqual(report["plan"]["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertEqual(report["plan"]["warnings"], [])
+        self.assertNotIn("COLI_CUDA_PIPE", report["plan"]["tune"])
+        self.assertNotIn("GPU", report["plan"]["expected_bottleneck"])
         self.assertEqual(report["status"], "warning")
         self.assertEqual(exit_code(report), 0)
+
+    def test_gpu_engine_with_detected_gpu_keeps_vram_plan(self):
+        gpu = {"index": 0, "name": "fixture", "total_bytes": 12 * GB,
+               "free_bytes": 10 * GB}
+        report = self.report(gpu_indices=None, gpus=[gpu],
+                             linkage={"linked": True, "missing": False})
+
+        self.assertGreater(report["plan"]["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertEqual(report["plan"]["tiers"]["vram"]["devices"], [
+            {**gpu, "reserve_bytes": 2 * GB, "usable_bytes": 8 * GB},
+        ])
+        self.assertIn("COLI_CUDA_PIPE", report["plan"]["tune"])
 
     def test_gpu_check_uses_backend_neutral_identifier(self):
         gpu = {"index": 0, "name": "Intel Arc B570", "total_bytes": 10 * GB,
@@ -417,9 +436,12 @@ class DoctorTest(unittest.TestCase):
 
         self.assertEqual(checks["model.container"]["status"], "pass")
         self.assertEqual(checks["model.required"]["status"], "fail")
-        self.assertEqual(checks["model.required"]["details"]["missing_tensors"], [
-            "model.norm.weight",
-            "lm_head.weight",
+        # Roles, not names (#1365). The shard above holds only an embedding,
+        # so what is genuinely absent is a final norm and an output head --
+        # true whatever prefix the family puts in front of them.
+        self.assertEqual(checks["model.required"]["details"]["missing_roles"], [
+            "final norm",
+            "output head",
         ])
 
     def test_deep_check_reports_runtime_equivalent_partial_mirror(self):
@@ -498,6 +520,110 @@ class DoctorTest(unittest.TestCase):
         checks = self.checks_by_id(report)
         self.assertEqual(report["mode"], "deep")
         self.assertIn("model.container", checks)
+
+
+class CoreTensorRoleTest(unittest.TestCase):
+    """#1365: `coli doctor` reported "2 required core tensor(s) are missing"
+    for every GLM-5.3-Flash checkpoint, converted locally or downloaded
+    pre-converted. Nothing was missing. The check held three literal tensor
+    names taken from GLM-5.2, and Flash nests its language model under the
+    vision wrapper, so two of the three names did not match a healthy model.
+
+    The reporter tried both sources before asking, which is the cost of a
+    check that says a number instead of what it looked for."""
+
+    FLASH = [
+        "model.language_model.embed_tokens.weight",
+        "model.language_model.norm.weight",
+        "lm_head.weight",
+        "model.visual.post_layernorm.weight",
+        "model.language_model.layers.0.input_layernorm.weight",
+        "model.language_model.layers.0.shared_head.norm.weight",
+    ]
+    FLAT = [
+        "model.embed_tokens.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+        "model.layers.0.input_layernorm.weight",
+    ]
+
+    def test_the_nested_layout_that_started_this_is_complete(self):
+        self.assertEqual(missing_core_roles(self.FLASH), [])
+
+    def test_the_flat_layout_is_still_complete(self):
+        self.assertEqual(missing_core_roles(self.FLAT), [])
+
+    def test_a_prefix_nobody_has_written_yet_also_works(self):
+        """The property that makes this hold for future families is that the
+        rule is prefix-agnostic, so assert the property rather than a list of
+        the prefixes we happen to know today. Every engine already discovers
+        its prefix at load time; qwen38.c probes the nested name and falls
+        back to the flat one. Only the doctor assumed a constant."""
+        invented = [
+            "backbone.text_tower.v2.embed_tokens.weight",
+            "backbone.text_tower.v2.norm.weight",
+            "backbone.lm_head.weight",
+        ]
+        self.assertEqual(missing_core_roles(invented), [])
+
+    def test_a_truncated_download_still_fails(self):
+        # The check must keep doing its job: this is the same nested model
+        # with the embedding shard absent.
+        truncated = [n for n in self.FLASH if "embed_tokens" not in n]
+        self.assertEqual(missing_core_roles(truncated), ["token embedding"])
+
+    def test_a_block_norm_does_not_stand_in_for_the_final_norm(self):
+        only_block_norms = [
+            "model.embed_tokens.weight",
+            "model.layers.0.shared_head.norm.weight",
+            "lm_head.weight",
+        ]
+        self.assertEqual(missing_core_roles(only_block_norms), ["final norm"])
+
+    def test_a_vision_tower_layernorm_does_not_either(self):
+        """`model.visual.post_layernorm.weight` ends in "norm.weight" and sits
+        outside the layer stack, so a tail match alone would accept it as the
+        language model's final norm and pass a checkpoint that is missing one."""
+        vision_only = [
+            "model.language_model.embed_tokens.weight",
+            "model.visual.post_layernorm.weight",
+            "lm_head.weight",
+        ]
+        self.assertEqual(missing_core_roles(vision_only), ["final norm"])
+
+    def test_tied_embeddings_need_no_output_head(self):
+        tied = [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+        ]
+        self.assertEqual(missing_core_roles(tied, {"tie_word_embeddings": True}), [])
+        self.assertEqual(missing_core_roles(tied, {"tie_word_embeddings": False}),
+                         ["output head"])
+        self.assertEqual(missing_core_roles(tied, None), ["output head"])
+
+    def test_the_report_names_the_roles_it_could_not_fill(self):
+        """A count sends someone to re-download. A name sends them to the
+        right question."""
+        model = Path(self.tmp.name) / "nested"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"model_type": "glm5_next"}))
+        write_shard(model / "model.safetensors",
+                    [(name, 8) for name in self.FLASH])
+        report = deep_container_report(model)
+        required = next(c for c in report if c["id"] == "model.required") \
+            if isinstance(report, list) else report["required"]
+        self.assertEqual(required["status"], "pass", required["summary"])
+
+        write_shard(model / "model.safetensors",
+                    [(n, 8) for n in self.FLASH if "embed_tokens" not in n])
+        required = deep_container_report(model)["required"]
+        self.assertEqual(required["status"], "fail")
+        self.assertIn("token embedding", required["summary"])
+        self.assertEqual(required["details"]["missing_roles"], ["token embedding"])
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
 
 
 if __name__ == "__main__":

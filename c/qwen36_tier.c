@@ -23,6 +23,13 @@ typedef struct {
 static struct {
     int on, nl, ne, D, Ih, topk, ndev;
     int egs; size_t sc_gu, sc_d;   /* expert group size + per-matrix scale counts (gs64) */
+    /* Formato dei pesi che il tier spedisce in VRAM: 4 = int4 raggruppato
+     * (container gs64), 1 = int8 per-riga. Prima era cablato a 4 in ogni punto,
+     * e su un container int8 -- dove s->g4 e' NULL perche' non c'e' nulla da
+     * impacchettare -- il tier riservava budget, marcava planned=1 e non
+     * promuoveva mai niente, senza dire una parola (#1331). backend_cuda sa
+     * gia' leggere fmt=1: mancava solo che glielo offrissimo. */
+    int wfmt;
     int dev[QT_MAX_DEV];
     size_t budget[QT_MAX_DEV], used[QT_MAX_DEV];
     size_t exp_bytes;                     /* estimated VRAM bytes per expert */
@@ -39,7 +46,7 @@ static struct {
     /* issue state of the (single) decode thread */
     int is_cnt[QT_MAX_DEV];
     int is_k[QT_MAX_DEV][32];
-    float *is_x;                          /* count*D input replicas per device */
+    float *is_x; size_t is_x_floats;      /* 32*D input replicas per device */
     /* M3 */
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
     int issue_open;                       /* guard: no tensor_free while a group is in flight */
@@ -56,11 +63,20 @@ static int home(int eid){ return eid % G.ndev; }
 static void stage(uint8_t *dw, float *dsc,
                   const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
                   const float *gs,const float *us,const float *ds){
-    size_t mb = (size_t)G.D*G.Ih/2;
+    size_t mb = (size_t)G.D*G.Ih/(G.wfmt==1?1:2);
+    if(G.wfmt==1){
+        /* int8: il formato del backend e' gia' quello in RAM, si copia e basta.
+         * Niente XOR: quello serve a portare i nibble int4 da complemento a due
+         * a binario sfalsato, e su byte interi sarebbe corruzione. */
+        memcpy(dw,        g4, mb);
+        memcpy(dw+mb,     u4, mb);
+        memcpy(dw+2*mb,   d4, mb);
+    } else {
     const uint64_t X=0x8888888888888888ull;
     const uint64_t *sg=(const uint64_t*)g4,*su=(const uint64_t*)u4,*sd=(const uint64_t*)d4;
     uint64_t *w0=(uint64_t*)dw,*w1=(uint64_t*)(dw+mb),*w2=(uint64_t*)(dw+2*mb);
     for(size_t i=0;i<mb/8;i++){ w0[i]=sg[i]^X; w1[i]=su[i]^X; w2[i]=sd[i]^X; }
+    }
     memcpy(dsc,                 gs, G.sc_gu*sizeof(float));
     memcpy(dsc+G.sc_gu,         us, G.sc_gu*sizeof(float));
     memcpy(dsc+2*G.sc_gu,       ds, G.sc_d *sizeof(float));
@@ -81,6 +97,17 @@ static void *uploader(void *arg){
             /* LFRU swap: free the victim only when no group is in flight */
             while(G.issue_open && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
             QSlot *v=qs(vl,ve);
+            if(G.th_stop && G.issue_open){
+                /* Shutting down with a group still open: qt_take() -- the only
+                 * thing that clears issue_open -- will never come. Abandon
+                 * this swap instead of freeing a victim tensor the in-flight
+                 * group may still reference; qt_lfru_tick_locked already
+                 * cleared the victim's resident flag before enqueueing, so
+                 * restore it to keep the flag consistent with the tensor it
+                 * still holds. */
+                v->resident=1; qs(layer,eid)->queued=0;
+                pthread_mutex_unlock(&G.mx); free(w); free(sc); continue;
+            }
             ColiCudaTensor *a=v->tg,*b=v->tu,*ct=v->td;
             v->tg=v->tu=v->td=NULL;
             pthread_mutex_unlock(&G.mx);
@@ -88,10 +115,18 @@ static void *uploader(void *arg){
         } else pthread_mutex_unlock(&G.mx);
 
         int dv = G.dev[home(eid)];
-        size_t mb=(size_t)G.D*G.Ih/2;
+        /* passo fra le tre matrici nello staging: int4 impacchettato = mezzo
+         * byte per elemento, int8 = uno. */
+        size_t mb=(size_t)G.D*G.Ih/(G.wfmt==1?1:2);
         ColiCudaTensor *tg=NULL,*tu=NULL,*td=NULL;
         int ok;
-        if(G.egs){
+        if(G.wfmt==1){
+            /* int8, scale per riga: qt_init ha gia' rifiutato il caso raggruppato,
+             * che questo formato non sa esprimere. */
+            ok = coli_cuda_tensor_upload(&tg, w,      sc,          1, G.D,  G.Ih, dv)
+              && coli_cuda_tensor_upload(&tu, w+mb,   sc+G.Ih,     1, G.D,  G.Ih, dv)
+              && coli_cuda_tensor_upload(&td, w+2*mb, sc+2*G.Ih,   1, G.Ih, G.D,  dv);
+        } else if(G.egs){
             ok = coli_cuda_tensor_upload_g(&tg, w,      sc,             4, G.D,  G.Ih, dv, G.egs)
               && coli_cuda_tensor_upload_g(&tu, w+mb,   sc+G.sc_gu,     4, G.D,  G.Ih, dv, G.egs)
               && coli_cuda_tensor_upload_g(&td, w+2*mb, sc+2*G.sc_gu,   4, G.Ih, G.D,  dv, G.egs);
@@ -111,7 +146,8 @@ static void *uploader(void *arg){
     }
 }
 
-int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs){
+int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
+            int expert_is_int4){
     const char *e=getenv("COLI_CUDA");
     if(!(e && *e=='1')) return 0;
     if(cap != ne){
@@ -143,10 +179,25 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs){
     /* per-device budget: CUDA_EXPERT_GB, or auto = free minus 1 GB headroom.
      * Scale counts follow the container: per-row (expert_gs=0) or grouped
      * (gs64: [O, ceil(I/gs)] per projection). */
+    G.wfmt = expert_is_int4 ? 4 : 1;
+    /* fmt=1 non ha scale raggruppate: backend_cuda le onora solo per fmt=4
+     * (want_gs = (fmt==4 && ...)). Un container int8 con scale a gruppi non e'
+     * esprimibile sulla GPU, e promuoverlo lo stesso darebbe numeri sbagliati:
+     * meglio restare su CPU dicendolo. Rifiutare qui, PRIMA di riservare
+     * qualunque budget, e' il punto giusto -- il difetto di #1331 era proprio
+     * riservare per poi non promuovere.  */
+    if(G.wfmt==1 && expert_gs>0){
+        fprintf(stderr,"[qtier] int8 experts with grouped scales (gs=%d) cannot be "
+                       "expressed on the GPU (fmt=1 is per-row only) -> CPU path\n", expert_gs);
+        return 0;
+    }
     G.egs = expert_gs;
     G.sc_gu = expert_gs ? (size_t)Ih * ((D + expert_gs - 1)/expert_gs) : (size_t)Ih;
     G.sc_d  = expert_gs ? (size_t)D  * ((Ih + expert_gs - 1)/expert_gs) : (size_t)D;
-    G.exp_bytes = 3ull*D*Ih/2 + (2*G.sc_gu+G.sc_d)*sizeof(float) + 4096; /* + allocation slack */
+    /* int8 occupa il doppio dell'int4 impacchettato: il budget deve saperlo,
+     * se no si promettono il doppio degli esperti che ci stanno. */
+    G.exp_bytes = (G.wfmt==1 ? 3ull*D*Ih : 3ull*D*Ih/2)
+                + (2*G.sc_gu+G.sc_d)*sizeof(float) + 4096; /* + allocation slack */
     const char *bg=getenv("CUDA_EXPERT_GB");
     for(int i=0;i<G.ndev;i++){
         size_t freeb=0,totb=0; coli_cuda_mem_info(G.dev[i],&freeb,&totb);
@@ -158,7 +209,11 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs){
                 G.dev[i], freeb/1073741824.0, b/1073741824.0, b/G.exp_bytes);
     }
     G.slot=calloc((size_t)nl*ne,sizeof(QSlot));
-    G.is_x=malloc((size_t)32*D*sizeof(float));
+    /* qt_issue strides each device's block by 32*D floats (its max row
+     * count), not 8*D: a device other than 0 with a full 32-row issue used
+     * to run past its own slice and off the end of this allocation (#1339). */
+    G.is_x_floats=(size_t)G.ndev*32*D;
+    G.is_x=malloc(G.is_x_floats*sizeof(float));
     if(!G.slot||!G.is_x) return 0;
     /* load learned heat (HEAT_FILE): warmstart order + initial values */
     const char *hf=getenv("HEAT_FILE");
@@ -203,7 +258,7 @@ static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
     if(G.qn>=QT_QCAP){ G.q_full_skips++; return 0; }
     int hd=home(eid);
     if(!reserved && v_eid<0 && G.used[hd]+G.exp_bytes>G.budget[hd]) return 0;
-    size_t mb=(size_t)G.D*G.Ih/2;
+    size_t mb=(size_t)G.D*G.Ih/(G.wfmt==1?1:2);   /* buffer di staging: int8 = 1 byte/elemento */
     uint8_t *w=malloc(3*mb); float *sc=malloc((2*G.sc_gu+G.sc_d)*sizeof(float));
     if(!w||!sc){ free(w); free(sc); return 0; }
     if(!reserved && v_eid<0) G.used[hd]+=G.exp_bytes;
@@ -307,6 +362,9 @@ int qt_plan_fill(int *layers,int *eids,int max){
 
 /* Thread-safe (callable from multiple loader threads): stage + enqueue one
  * expert reserved by qt_plan_fill; blocks only while the queue is full. */
+/* g/u/d: i pesi COME STANNO IN RAM -- int4 impacchettati su un container gs64,
+ * int8 su un container int8. Il formato lo decide qt_init dal container, e da
+ * li' in poi staging e upload lo seguono. */
 void qt_note_planned(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
@@ -383,7 +441,7 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     for(int di=0;di<G.ndev;di++){
         int c=G.is_cnt[di];
         if(!c) continue;
-        float *xr=G.is_x + (size_t)di*8*G.D;               /* per-device input block */
+        float *xr=G.is_x + (size_t)di*32*G.D;              /* per-device input block */
         for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x, (size_t)G.D*sizeof(float));
         if(!coli_cuda_expert_group_issue(tg[di],tu[di],td[di],rows,c,xr)){
             /* issue failed -> hand these k back to the CPU */
@@ -450,7 +508,10 @@ void qt_shutdown(void){
             fprintf(stderr,"[qtier] HEAT_FILE saved: %s\n",hf);
         }
     }
-    pthread_mutex_lock(&G.mx); G.th_stop=1; pthread_cond_signal(&G.cv); pthread_mutex_unlock(&G.mx);
+    /* Wake cv_take too: the uploader's LFRU victim wait (and qt_note_block /
+     * qt_note_planned / qt_fill_wait, all waiting on the same condvar) would
+     * otherwise never notice th_stop and pthread_join below would hang (#1340). */
+    pthread_mutex_lock(&G.mx); G.th_stop=1; pthread_cond_signal(&G.cv); pthread_cond_broadcast(&G.cv_take); pthread_mutex_unlock(&G.mx);
     pthread_join(G.th,NULL);
     G.on=0;
     coli_cuda_shutdown();
