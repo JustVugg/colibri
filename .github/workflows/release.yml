@@ -135,6 +135,11 @@ jobs:
           # run it -- the second half of #720.
           mkdir -p dist/tools
           cp c/tools/k3_tokenizer.py dist/tools/
+          # check_ablate_evidence.py verifies the ABLATE evidence that eval_glm.py
+          # (packaged above) produces. Nothing in the code names it -- its caller is a
+          # person with argparse arguments -- so pack_python's import walk cannot reach
+          # it, exactly like k3_tokenizer.py. Copied explicitly for the same reason.
+          cp c/tools/check_ablate_evidence.py dist/tools/
           cp c/coli dist/
           # Windows has nothing to click otherwise: `coli` is an extensionless
           # Python script, and the .exe files are engines that exit at once
@@ -189,6 +194,9 @@ jobs:
           # Kimi K3 needs tokenizer.json synthesized from tiktoken.model; without this
           # script in the archive the engine ships but cannot be driven by coli chat.
           test -f tools/k3_tokenizer.py || { echo "FAIL: k3_tokenizer.py missing from archive"; exit 1; }
+          # Same position as k3_tokenizer.py: reachable only by a person, so only an
+          # explicit gate can prove it shipped.
+          test -f tools/check_ablate_evidence.py || { echo "FAIL: check_ablate_evidence.py missing from archive"; exit 1; }
           # E tutto cio' che coli raggiunge, import e sottoprocessi. Il controllo
           # qui sopra guarda l'unico file che il passo di copia aveva appena
           # scritto: conferma se stesso, ed e' il motivo per cui la v1.10.0 e'
@@ -201,6 +209,8 @@ jobs:
           # fine. The check was wrong, not the artifact.
           python3 -c "import ast; ast.parse(open('tools/k3_tokenizer.py', encoding='utf-8').read())" \
             || { echo "FAIL: packaged k3_tokenizer.py does not parse"; exit 1; }
+          python3 -c "import ast; ast.parse(open('tools/check_ablate_evidence.py', encoding='utf-8').read())" \
+            || { echo "FAIL: packaged check_ablate_evidence.py does not parse"; exit 1; }
           COLI_EXPECT="$SIBLINGS" python3 - <<'PYCHK'
           import importlib.machinery, importlib.util, json, os, sys, tempfile
           from family_registry import all_families
