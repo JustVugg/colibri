@@ -13,6 +13,11 @@
 #include "tier.h"
 
 #define QT_MAX_DEV 8
+/* Max rows in one issued group = max topk. The stride of a device's input
+ * replica block, the width of every per-device row array and the topk clamp
+ * must all agree: #1339 was three of these disagreeing, each spelling the
+ * same literal 32 separately. Name it once. */
+#define QT_MAX_ROWS 32
 #define QT_QCAP 48            /* upload queue depth (staging ~1.6 MB/entry) */
 
 typedef struct {
@@ -49,8 +54,8 @@ static struct {
     uint64_t hits[QT_MAX_DEV], miss, uploads, q_full_skips;
     /* issue state of the (single) decode thread */
     int is_cnt[QT_MAX_DEV];
-    int is_k[QT_MAX_DEV][32];
-    float *is_x; size_t is_x_floats;      /* 32*D input replicas per device */
+    int is_k[QT_MAX_DEV][QT_MAX_ROWS];
+    float *is_x; size_t is_x_floats;      /* QT_MAX_ROWS*D input replicas per device */
     /* M3 */
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
     int issue_open;                       /* guard: no tensor_free while a group is in flight */
@@ -479,7 +484,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         fprintf(stderr,"[qtier] cap=%d != n_experts=%d -> tier disabled (needs full RAM residency)\n",cap,ne);
         return 0;
     }
-    if(topk>32){ fprintf(stderr,"[qtier] topk>32 unsupported\n"); return 0; }
+    if(topk>QT_MAX_ROWS){ fprintf(stderr,"[qtier] topk>%d unsupported\n",QT_MAX_ROWS); return 0; }
     memset(&G,0,sizeof G);
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk;
     /* Placement state is re-derived per init: the device fold-in below reads
@@ -683,7 +688,11 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
                 G.dev[i], G.budget[i]/1073741824.0, G.budget[i]/G.exp_bytes,
                 trunk ? " after trunk" : "");
     }
-    G.is_x_floats=(size_t)G.ndev*32*D;
+    /* qt_issue strides each device's block by QT_MAX_ROWS*D floats (its max
+     * row count), not 8*D: a device other than 0 with a full 32-row issue
+     * used to run past its own slice and off the end of this allocation
+     * (#1339). The stride and G.is_k's row capacity are the same constant. */
+    G.is_x_floats=(size_t)G.ndev*QT_MAX_ROWS*D;
     G.is_x=malloc(G.is_x_floats*sizeof(float));
     if(!G.is_x) return 0;
     pthread_mutex_init(&G.mx,NULL); pthread_cond_init(&G.cv,NULL); pthread_cond_init(&G.cv_take,NULL);
@@ -977,11 +986,11 @@ static void qt_lfru_tick_locked(void){
 }
 
 uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
-    if(!G.on||K>32) return 0;
+    if(!G.on||K>QT_MAX_ROWS) return 0;
     uint32_t mask=0;
-    ColiCudaTensor *tg[QT_MAX_DEV][32],*tu[QT_MAX_DEV][32],*td[QT_MAX_DEV][32];
-    static int rows[32]={0};
-    if(!rows[0]) for(int i=0;i<32;i++) rows[i]=1;
+    ColiCudaTensor *tg[QT_MAX_DEV][QT_MAX_ROWS],*tu[QT_MAX_DEV][QT_MAX_ROWS],*td[QT_MAX_DEV][QT_MAX_ROWS];
+    static int rows[QT_MAX_ROWS]={0};
+    if(!rows[0]) for(int i=0;i<QT_MAX_ROWS;i++) rows[i]=1;
     for(int i=0;i<G.ndev;i++) G.is_cnt[i]=0;
 
     pthread_mutex_lock(&G.mx);
@@ -1001,7 +1010,7 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     for(int di=0;di<G.ndev;di++){
         int c=G.is_cnt[di];
         if(!c) continue;
-        float *xr=G.is_x + (size_t)di*32*G.D;              /* per-device input block */
+        float *xr=G.is_x + (size_t)di*QT_MAX_ROWS*G.D;     /* per-device input block */
         for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x, (size_t)G.D*sizeof(float));
         if(!coli_cuda_expert_group_issue(tg[di],tu[di],td[di],rows,c,xr)){
             /* issue failed -> hand these k back to the CPU */

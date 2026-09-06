@@ -105,12 +105,32 @@ int main(void) {
     }
     check(inside, "blocks_stay_inside_the_replica_buffer");
 
+    /* In-bounds and disjoint are both necessary and both insufficient: a
+     * stride SMALLER than the row capacity keeps every block inside the
+     * allocation while sliding device 1's window down onto device 0's, and a
+     * single-row issue on device 1 is disjoint from device 0's under any
+     * stride at all. The two checks below pin the stride itself. */
+    check(sizeof G.is_k[0] / sizeof G.is_k[0][0] == QT_MAX_ROWS &&
+          G.is_x_floats == (size_t)G.ndev * (sizeof G.is_k[0] / sizeof G.is_k[0][0]) * (size_t)G.D,
+          "replica_block_stride_equals_the_per_device_row_capacity");
+
     check(nrec == base2 + 2, "the mixed batch should issue once per device (two calls)");
     if (nrec == base2 + 2) {
         const float *a0 = records[base2].x, *a1 = records[base2 + 1].x;
         size_t c0 = (size_t)records[base2].count, c1 = (size_t)records[base2 + 1].count;
         int disjoint = (a0 + c0 * G.D <= a1) || (a1 + c1 * G.D <= a0);
         check(disjoint, "device_blocks_do_not_overlap");
+        /* Where, not just whether: device di's block starts at
+         * G.is_x + di*QT_MAX_ROWS*D. This is the one assertion that fails on
+         * the old 8*D stride even when device 1 carries a single row. */
+        int dev0 = records[base2].device == 0 ? base2 : base2 + 1;
+        int dev1 = dev0 == base2 ? base2 + 1 : base2;
+        check(records[dev0].device == 0 && records[dev1].device == 1,
+              "the mixed batch should issue once on device 0 and once on device 1");
+        check(records[dev0].x == G.is_x,
+              "device_0_block_starts_at_the_buffer_base");
+        check(records[dev1].x == G.is_x + (size_t)QT_MAX_ROWS * (size_t)G.D,
+              "device_1_block_starts_one_full_row_capacity_in");
     }
 
     float val[32]; for (int k = 0; k < 32; k++) val[k] = 1.0f;

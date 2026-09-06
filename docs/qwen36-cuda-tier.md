@@ -28,10 +28,14 @@ more GPUs and computed there through the existing shared CUDA backend
   groups on all devices (`coli_cuda_expert_group_issue/take`); VRAM misses
   fall back to the CPU int8 path and overlap with the in-flight groups, as
   does the shared expert. Placement never changes routing or precision.
-- **Memory:** the warmstart frees the RAM int8 copies of VRAM-resident
-  experts (rematerialized from the packed int4 copy on LFRU eviction; no
-  container access). Peak RSS for the 35B int4 container: ~29 GB with two
-  8 GB GPUs.
+- **Memory:** on an **int4 container** the warmstart frees the RAM int8 copies
+  of VRAM-resident experts (rematerialized from the packed int4 copy on LFRU
+  eviction; no container access). Peak RSS for the 35B int4 container: ~29 GB
+  with two 8 GB GPUs. The RSS saving is a property of packed containers only:
+  on an **int8 container** there is no second copy to rematerialize from, so
+  since #1341 nothing is freed and every resident keeps its full RAM weights —
+  such a run gets the tier's VRAM speed at full residency cost, and the 29 GB
+  figure below does not apply to it.
 
 ## Usage
 
@@ -129,6 +133,9 @@ CPU fallback. Known, not yet addressed.
 | VRAM hit rate (cold / warm) | 44 % / 95 % | 85 % / 100 % |
 | peak RSS | 40 GB | **29 GB** |
 | reference: Ollama q4_K_M, same box | 7.5 | 10.5 |
+
+All figures above are int4-container measurements; the peak-RSS row in
+particular has no int8 analogue (see **Memory**).
 
 CPU-only baseline of this engine before the tier: 0.35 tok/s.
 Numerics: logits cosine vs the f32 CPU reference 0.9992 (dense int8 on),

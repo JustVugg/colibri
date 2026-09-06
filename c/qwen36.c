@@ -2793,8 +2793,17 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
     }
     qt_fill_wait();
     free(wpl); free(wpe); free(planned);
-    fprintf(stderr, "[qtier] warmstart (parallel): all %d experts in RAM (int8 only for non-residents), %d in VRAM -- %.1f s\n",
-            cap_total, wn, now_s()-t0);
+    /* The parenthesis used to read "int8 only for non-residents", which was
+     * true only while the int8 copy of every resident was freed. Since #1341
+     * that free is int4-only: on an int8 container every resident keeps its
+     * weights, so the RSS saving the old line implied does not exist there.
+     * Say which container this is instead of promising a saving the reader
+     * will not see. */
+    fprintf(stderr, "[qtier] warmstart (parallel): all %d experts in RAM (%s), %d in VRAM -- %.1f s\n",
+            cap_total,
+            expert_is_int4 ? "int8 copy dropped for residents, kept for non-residents"
+                           : "int8 container: all experts keep their weights in RAM",
+            wn, now_s()-t0);
 }
 
 int main(int argc, char **argv) {
