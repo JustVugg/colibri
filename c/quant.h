@@ -511,8 +511,10 @@ static const float E4M3_LUT[256] = {
 };
 static inline float e4m3_decode(uint8_t b){ return E4M3_LUT[b]; }
 
-#define FP8_BLOCK 128
-static inline int64_t fp8_nblk(int n){ return ((int64_t)n + FP8_BLOCK - 1) / FP8_BLOCK; }
+/* FP8_BLOCK / fp8_nblk moved to fp8_format.h so the CUDA backend shares the
+ * same named constant instead of restating 128 as literals (see that header's
+ * comment for the drift hazard this closes). */
+#include "fp8_format.h"
 
 /* y[S,O] = x[S,I] @ W^T, W raw e4m3 bytes (byte-identical layout to fmt=1) +
  * per-128x128-BLOCK f32 scale [ceil(O/128),ceil(I/128)]. Scalar reference path

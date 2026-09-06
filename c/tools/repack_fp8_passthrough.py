@@ -112,28 +112,21 @@ when no `.qs` sidecar exists, colibri.c) -- nothing new is exercised on the
 read side. `main()` also copies `config.json` (mandatory, colibri.c's
 load_cfg) and `generation_config.json` (best-effort) from --indir into
 --outdir. Together with kv_b_proj emission below, this makes the tool's
-output a standalone-loadable model directory on its own, with one caveat: the
-engine's fmt=8 absorb support (branch `f8/absorb-fmt8`) must land before a
-kv_b_proj-carrying container is safe to decode through the batched serving
-path -- see below.
+output a standalone-loadable model directory on its own: both halves of the
+engine-side absorb support (CPU and CUDA) exist -- see below.
 
 kv_b_proj (kind "kvb") is now emitted the same way as o_proj/attn: byte-
 preserved fp8 weight + renamed `.qs` scale sidecar, stamped (it clears the
 collision shape the same way o_proj does -- M1 audit, GLM-5.2's kv_b_proj is
-never at the ambiguous [O,I] this tool's `_check_geometry` guards). THIS TOOL
-CHANGE IS INDEPENDENT of, and does not wait on, the engine-side absorb work:
-colibri.c's MLA-absorption CPU path (qt_addrow/qt_matvec_rows, called only on
-l->kv_b) and the CUDA absorb kernels have no fmt==8 case as of this tool's own
-HEAD -- that support is being built in parallel on `f8/absorb-fmt8` and is
-NOT part of this diff. A container minted with this tool BEFORE that engine
-branch lands will load clean (qt_from_disk resolves the stamp exactly like
-o_proj's) but crash -- loudly, not silently -- on any decode that reaches the
-batched (`kvs`-nonNULL) serving path, because `ABSORB=0` cannot bypass absorb
-there. Sequencing that correctly (engine work before this container is used
-for decode) is the gate's job, not this tool's: repacking kv_b_proj here is
-the tool-side half of a two-sided integration, done now because engine and
-tool work can (and per the gate's assembly manifest, should) proceed in
-parallel.
+never at the ambiguous [O,I] this tool's `_check_geometry` guards). The
+engine side of this two-sided integration now exists on both backends:
+colibri.c's MLA-absorption path (qt_addrow/qt_matvec_rows, called only on
+l->kv_b) carries explicit fmt==8 decode arms, and the CUDA absorb kernels
+decode fmt=8 through weight_at/absorb_scale (admitted by
+coli_cuda_weight_at_supported, uploads gated on the published e4m3 LUT).
+A container minted here loads clean (qt_from_disk resolves the stamp
+exactly like o_proj's) and decodes correctly through the batched
+(`kvs`-nonNULL) serving path, where absorb cannot be bypassed.
 
 METADATA STAMP (reference implementation of the FORMATS-registry FR -- see
 docs/FORMATS.md): every output shard's safetensors `__metadata__` carries a
@@ -934,16 +927,16 @@ def _print_inventory_summary(all_inv, dry_run):
 #
 # The EXTERNAL (non-tensor) files the loader/server actually open from a
 # model dir at runtime, verified against this worktree's HEAD:
-#   - config.json          cfg_root, colibri.c:1361 -- fopen(...); if(!f){
+#   - config.json          cfg_root, colibri.c:1616 -- fopen(...); if(!f){
 #     perror(p); exit(1); } -- MANDATORY, the run aborts without it. Also
-#     read by openai_server.py's Engine.__init__ (:1773) for arch detection.
-#   - generation_config.json  colibri.c:1404-1405 -- fopen, comment "assente
+#     read by openai_server.py's Engine.__init__ (:2635) for arch detection.
+#   - generation_config.json  colibri.c:1659 -- fopen, comment "assente
 #     = nessun problema: e' opzionale" -- best-effort; HF's authority for
 #     generation defaults (extra EOS stop ids) when present.
 #   - tokenizer.json        c/tok.h:101 (tk_read_file, called from tok_load)
 #     -- fopen(...); if(!f){ perror(path); exit(1); } -- MANDATORY. Called
 #     from every serve/generate entry point that needs a tokenizer
-#     (colibri.c:7294 run_text, :7952 run_serve_mux, :8134 main serve loop).
+#     (colibri.c:8171 run_text, :8952 run_serve_mux, :9135 main serve loop).
 #     Before this fix main() never copied it into --outdir, so a minted
 #     directory was not standalone-loadable for THIS reason alone (confirmed
 #     by V2's end-to-end smoke test, 2026-08-18: load only succeeded via a
@@ -954,8 +947,8 @@ def _print_inventory_summary(all_inv, dry_run):
 # fopen/Path().open against a model dir) and therefore excluded:
 #   - tokenizer_config.json, chat_template.jinja -- the GLM-5.2 chat template
 #     is reimplemented natively in code, not read from the .jinja file
-#     (colibri.c:8211 comment: "template UFFICIALE GLM-5.2 (chat_template
-#     .jinja): niente \n dopo i ruoli..."; openai_server.py:1016: "AUTHORITATIVE
+#     (colibri.c:9211 comment: "template UFFICIALE GLM-5.2 (chat_template
+#     .jinja): niente \n dopo i ruoli..."; openai_server.py:1524: "AUTHORITATIVE
 #     GLM-5.2 tool-declaration block (byte-matches chat_template.jinja)" --
 #     both hardcoded to match the file's behavior, not sourced from it).
 #   - README.md, LICENSE, .gitattributes -- pure repo/documentation metadata,

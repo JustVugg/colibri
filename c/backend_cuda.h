@@ -23,7 +23,9 @@ extern "C" {
 
 /* Weight formats the generic per-element device decoder (weight_at,
  * backend_cuda.cu) can actually decode: f32, int8-row, int4 nibbles (fmt=2 and
- * the grouped fmt=4, same packing), and int2. Nothing else.
+ * the grouped fmt=4, same packing), int2, and fmt=8 (fp8-e4m3 raw bytes,
+ * decoded through the c_e4m3 LUT -- absorb-path support; absorb_scale supplies
+ * its per-128x128-block scale). Nothing else.
  *
  * WHY THIS IS A PREDICATE AND NOT A COMMENT. weight_at used to END in the int2
  * decode as an unguarded fall-through, so ANY other format handed to it -- a
@@ -42,12 +44,28 @@ extern "C" {
  * same arrangement colibri.c uses for metal_fused_fmt_ok.
  *
  * NOT a statement about which formats the CUDA BACKEND supports: quant_matmul
- * has its own explicit branches for fmt=6 (E8/IQ3), fmt=7 (MXFP4) and fmt=8
- * (fp8-e4m3) that never route through weight_at. This predicate is scoped to
- * weight_at's own dispatch, which is what the absorb and grouped-expert kernels
- * decode through. */
+ * has its own explicit branches for fmt=6 (E8/IQ3) and fmt=7 (MXFP4) that
+ * never route through weight_at (and its own fmt=8 branch for the dense path
+ * -- weight_at's fmt=8 branch serves the absorb kernels, which share the same
+ * c_e4m3 LUT). This predicate is scoped to weight_at's own dispatch, which is
+ * what the absorb and grouped-expert kernels decode through.
+ *
+ * fmt=8 CAVEAT, stated because the truth table alone cannot carry it: a fmt=8
+ * decode additionally requires the e4m3 LUT to have been published to the
+ * configured devices (coli_cuda_fp8_set_lut). The exact mechanism, so the
+ * claim cannot outrun it: coli_cuda_fp8_set_lut copies the table into every
+ * context live AT CALL TIME and sets a process-wide flag; the flag gates
+ * fmt=8 uploads (coli_cuda_tensor_upload refuses until it is set), and BOTH
+ * coli_cuda_shutdown AND coli_cuda_init clear it -- the flag is process-wide
+ * while the table is per-device, so any context rebuild (including a re-init
+ * that widens the device set) must publish the LUT again before a fmt=8
+ * tensor exists. Between one publish and the next init/shutdown, no fmt=8
+ * ColiCudaTensor can reach a kernel with an unwritten table. This predicate
+ * deliberately does not restate that gate: it answers "does weight_at have a
+ * decode branch for this fmt", which is the question the launch-site gates
+ * and the device-side __trap() backstop share. */
 static inline int coli_cuda_weight_at_supported(int fmt) {
-    return fmt == 0 || fmt == 1 || fmt == 2 || fmt == 3 || fmt == 4;
+    return fmt == 0 || fmt == 1 || fmt == 2 || fmt == 3 || fmt == 4 || fmt == 8;
 }
 
 /* Opaque, persistent device copy of one resident quantized tensor. */
