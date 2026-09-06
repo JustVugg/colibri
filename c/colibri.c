@@ -101,6 +101,11 @@ static inline void omp_set_num_threads(int n){ (void)n; }
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
 #endif
+#ifdef COLI_XDNA
+/* Optional AMD XDNA2 lane. This header pulls in no XRT: the engine owns the
+ * prepared-host state, and XRT lives only behind an optional helper DLL. */
+#include "backend_xdna.h"
+#endif
 /* Declared unconditionally (not just under COLI_METAL): on a non-Metal build they just sit
  * at 0 forever, which is the correct value there (no Metal backend => never enabled, and
  * COLI_METAL_MOE_EXACT is only parsed under COLI_METAL). Kept outside the #ifdef so
@@ -251,6 +256,14 @@ typedef struct {
 #endif
 #ifdef COLI_VULKAN
     ColiVkTensor *vk; int vk_eligible;   /* resident on the Vulkan expert tier */
+#endif
+#ifdef COLI_XDNA
+    /* Derived, disposable BF16 host image for the XDNA lane. NULL for an
+     * ordinary tensor and created only when preparation is actually requested:
+     * loading a model allocates nothing here. Deliberately a single opaque
+     * pointer rather than an *_eligible flag -- allocation, validity and byte
+     * consumption vary independently and live inside the object. */
+    ColiXdnaPrepared *xdna;
 #endif
     int cuda_eligible, cuda_device;   /* resident tensor, never a reused expert slot */
     /* #767: the row count of the smallest call that has failed on this tensor, or 0 if
@@ -672,6 +685,18 @@ static void cuda_disabled_note(void){
 }
 static int g_cuda_e8_ready;   /* codebook published to the devices (see cuda_boot) */
 static int g_cuda_fp8_ready;  /* e4m3 LUT published to the devices (see cuda_boot) */
+#endif
+#ifdef COLI_XDNA
+/* Drop a QT's derived XDNA host image. The authoritative fmt=4 weight (q4, s)
+ * is untouched: only the derived state goes. Used when an expert slot is reused
+ * for a DIFFERENT expert, where a stale prepared image would otherwise be a
+ * silently wrong weight rather than a missing one.
+ *
+ * Deliberately outside the COLI_VULKAN guard: the XDNA lane is independent of
+ * whether Vulkan is compiled in. */
+static void qt_xdna_reset(QT *t){
+    if(t->xdna) coli_xdna_prepared_release(&t->xdna);
+}
 #endif
 #ifdef COLI_VULKAN
 /* Drop a QT's Vulkan-resident copy (slot reused for a different expert). */
@@ -2789,6 +2814,12 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
      * Keep its tier assignment, but invalidate the old device weights. */
     if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
 #endif
+#ifdef COLI_XDNA
+    /* Same reuse hazard as the GPU tiers: a stale prepared BF16 image belongs to
+     * the OLD expert's weights, so reusing the slot without dropping it would
+     * compute a wrong answer rather than fail. */
+    if(s->eid!=eid){ qt_xdna_reset(&s->g); qt_xdna_reset(&s->u); qt_xdna_reset(&s->d); }
+#endif
 #ifdef COLI_VULKAN
     /* Slot reused for a different expert: free the stale VK-resident weights so the new
      * expert re-uploads instead of computing with the old expert's tensors. */
@@ -3347,6 +3378,12 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
         return uring_load_error(l,ENOTSUP,"URING requires quantized expert tensors"),li;
 #ifdef COLI_CUDA
     if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
+#endif
+#ifdef COLI_XDNA
+    /* Same reuse hazard as the GPU tiers: a stale prepared BF16 image belongs to
+     * the OLD expert's weights, so reusing the slot without dropping it would
+     * compute a wrong answer rather than fail. */
+    if(s->eid!=eid){ qt_xdna_reset(&s->g); qt_xdna_reset(&s->u); qt_xdna_reset(&s->d); }
 #endif
     for(int k=0;k<3;k++){
         l->tw[k]=st_find(&m->S,nm[k]);
@@ -6287,10 +6324,31 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         if(!shared_cuda){
 #endif
         sg=falloc((int64_t)S*sI);su=falloc((int64_t)S*sI);
+        /* Optional XDNA2 lane, gate/up only. Same idiom as vk_matmul_qt: 0 means
+         * "not handled, run the current path", and the candidate never calls
+         * matmul_qt itself, so there is no recursion and no double dispatch.
+         * The semantic family is passed EXPLICITLY -- it is never inferred from
+         * M/K/N, so an unrelated operation of the same shape cannot inherit this
+         * one's qualification. sh_down is deliberately absent below: its
+         * orientation (I=sI, O=D) is not what the qualified F3 artifact
+         * computes. Inert without the internal test control; there is no public
+         * switch and no automatic policy in this slice. */
+#ifdef COLI_XDNA
+        if(!coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &l->sh_gate.xdna,
+                                 l->sh_gate.fmt, l->sh_gate.q4, l->sh_gate.s,
+                                 l->sh_gate.I, l->sh_gate.O, l->sh_gate.gs, l->sh_gate.planar,
+                                 sg, x, S))
+#endif
 #ifdef COLI_VULKAN
         if(!vk_matmul_qt(&l->sh_gate, sg, x, S))
 #endif
         matmul_qt(sg, x, &l->sh_gate, S);
+#ifdef COLI_XDNA
+        if(!coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &l->sh_up.xdna,
+                                 l->sh_up.fmt, l->sh_up.q4, l->sh_up.s,
+                                 l->sh_up.I, l->sh_up.O, l->sh_up.gs, l->sh_up.planar,
+                                 su, x, S))
+#endif
 #ifdef COLI_VULKAN
         if(!vk_matmul_qt(&l->sh_up, su, x, S))
 #endif
@@ -11105,6 +11163,87 @@ int main(int argc, char **argv){
     if(getenv("CLUSTER_WORKERS") && *getenv("CLUSTER_WORKERS")){
         cluster_init();
         atexit(cluster_close_all);
+    }
+#endif
+    /* EXPLICIT XDNA REQUEST (W2-N7-P1, ordering corrected by P1-A1).
+     *
+     * COLI_XDNA=1 is an explicit user decision, parsed and owned by `coli`
+     * (--xdna). Read once, before the model runs.
+     *
+     * ORDERING IS THE POINT. P1 emitted the reduced-precision warning as soon
+     * as the request was parsed -- it announced that operations "will use the
+     * native NPU", and then dispatched zero times because no production
+     * artifact root existed. The message was a promise the run did not keep.
+     *
+     * So the success warning now comes LAST, after the package has been
+     * resolved and every qualified artifact verified against the registry.
+     * Anything short of that gets its own diagnostic and the normal path:
+     * "this build cannot", "install the package", "your package is corrupt"
+     * and "the helper will not load" are four different problems with four
+     * different fixes.
+     *
+     * Everything goes to stderr. SCORE mode writes machine-readable results
+     * to stdout and its parser consumes any stdout line starting with a digit
+     * or a minus sign, so a diagnostic there would be absorbed as a score. */
+#ifdef COLI_XDNA
+    {   const char *xe = getenv("COLI_XDNA");
+        if(xe && atoi(xe)){
+            const char *missing = NULL;
+            ColiXdnaProvision pv = coli_xdna_provision_status(&missing);
+            char root[1024];
+            int have_root = coli_xdna_product_artifact_root(root, sizeof root);
+            switch(pv){
+            case COLI_XDNA_PROV_READY:
+                coli_xdna_set_explicit_enabled(1);
+                fprintf(stderr,
+                    "[XDNA] experimental: qualified GLM shared expert operations will use the\n"
+                    "[XDNA] native NPU with a reduced-precision BF16 compute path. Model output\n"
+                    "[XDNA] may differ from the normal path, and generated text has been observed\n"
+                    "[XDNA] to diverge. Operations this lane does not support continue to use the\n"
+                    "[XDNA] normal path.\n");
+                break;
+            case COLI_XDNA_PROV_PACKAGE_MISSING:
+                fprintf(stderr,
+                    "[XDNA] requested, but the XDNA package was not found%s%s: "
+                    "continuing on the normal path\n",
+                    have_root ? " at " : "", have_root ? root : "");
+                break;
+            case COLI_XDNA_PROV_PACKAGE_INCOMPLETE:
+                fprintf(stderr,
+                    "[XDNA] requested, but the XDNA package is incomplete (missing %s)%s%s: "
+                    "continuing on the normal path\n",
+                    missing ? missing : "a required artifact",
+                    have_root ? " in " : "", have_root ? root : "");
+                break;
+            case COLI_XDNA_PROV_INTEGRITY_FAILED:
+                fprintf(stderr,
+                    "[XDNA] requested, but an XDNA artifact does not match its expected hash "
+                    "(%s): refusing to use it, continuing on the normal path\n",
+                    missing ? missing : "unknown file");
+                break;
+            case COLI_XDNA_PROV_HELPER_UNAVAILABLE:
+                fprintf(stderr,
+                    "[XDNA] requested, and the artifact package is valid, but the XDNA helper "
+                    "(" COLI_XDNA_HELPER_DLL ") is not usable beside the executable: "
+                    "continuing on the normal path\n");
+                break;
+            case COLI_XDNA_PROV_REGISTRY_INVALID:
+                fprintf(stderr,
+                    "[XDNA] requested, but this build's artifact registry is invalid: "
+                    "continuing on the normal path\n");
+                break;
+            case COLI_XDNA_PROV_NOT_REQUESTED:
+                break;   /* unreachable here: the request is what got us in */
+            }
+        }
+    }
+#else
+    /* Built without the lane. An explicit request deserves an answer rather
+     * than silence -- the user asked for something this binary cannot do. */
+    {   const char *xe = getenv("COLI_XDNA");
+        if(xe && atoi(xe))
+            fprintf(stderr, "[XDNA] requested, but this build has no XDNA support: "
+                            "continuing on the normal path\n");
     }
 #endif
     /* static, not a stack local: the PILOT prefetch worker is detached and

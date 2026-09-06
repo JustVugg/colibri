@@ -472,12 +472,23 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 # test_uring is Linux-only. V4 engine tests are appended below only on supported
 # x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
 # unconditional rules and therefore remain portable gates.
+#
+# test_xdna_execution and test_xdna_failure are Windows-only for the same kind
+# of reason: they load tests/xdna_fake_helper.dll through the XDNA loader, which
+# is LoadLibraryExA. Off Windows the loader answers ABSENT by design, so there
+# is nothing for them to bind to, and the synthetic helper is a __declspec DLL
+# that gcc and clang refuse to compile. The other three XDNA owners (registry,
+# prepared state, QT state) touch no loader and stay portable gates.
 TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
 	test_segment_adapters_registration test_segment_adapters_real \
-	test_edge_adapters_registration test_edge_adapters_real
+	test_edge_adapters_registration test_edge_adapters_real \
+	test_xdna_execution test_xdna_failure
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
+endif
+ifneq (,$(IS_WIN))
+TEST_BINS += tests/test_xdna_execution$(EXE) tests/test_xdna_failure$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
@@ -629,6 +640,22 @@ VK_OBJ    = backend_vulkan.o
 VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv
 endif
 
+# Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
+# a switch, a define, an object. Deliberately NOT a second executable -- the
+# capability compiles into the ordinary host and stays off until the user passes
+# `coli --xdna`.
+#
+# No LDFLAGS entry, unlike VK: this side never links XRT. backend_xdna.c resolves
+# the optional helper (coli_xdna.dll) through LoadLibraryExA at runtime, so an
+# XDNA=1 host has the same import table as a default one and starts normally on a
+# machine with no NPU, no XRT and no helper. See docs/xdna.md.
+XDNA      ?= 0
+XDNA_OBJ   =
+ifeq ($(XDNA),1)
+CFLAGS   += -DCOLI_XDNA
+XDNA_OBJ  = backend_xdna.o
+endif
+
 all: colibri$(EXE)
 
 # Tiny Kimi K3 fixture + vendor oracle.  The generator is numpy-only and
@@ -710,7 +737,7 @@ glm: colibri$(EXE)
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
@@ -723,8 +750,8 @@ $(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c cli_args.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h abl.h backend_cuda.h backend_metal.h backend_vulkan.h decode_batch.h edge_adapters.h edge_runtime.h edge_tok_internal.h schema_gbnf.h segment_adapter_internal.h segment_adapters.h segment_runtime.h tier.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o colibri$(EXE) $(LDFLAGS)
+colibri$(EXE): colibri.c cli_args.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h abl.h backend_cuda.h backend_metal.h backend_vulkan.h backend_xdna.h decode_batch.h edge_adapters.h edge_runtime.h edge_tok_internal.h schema_gbnf.h segment_adapter_internal.h segment_adapters.h segment_runtime.h tier.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) $(XDNA_OBJ) .build-config
+	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(XDNA_OBJ) -o colibri$(EXE) $(LDFLAGS)
 
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
 backend_vulkan.o: backend_vulkan.c backend_vulkan.h .build-config
@@ -736,6 +763,20 @@ shaders/%.spv: shaders/%.comp
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
 backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
 	$(CC) $(CFLAGS) -c backend_loader.c -o $@
+
+# Optional XDNA2 (Ryzen AI NPU) lane, host side only. This object resolves an
+# optional coli_xdna.dll at runtime and links nothing: it needs no XRT header,
+# no XRT import library and no NPU, exactly like backend_loader.o needs no CUDA
+# SDK.
+#
+# W2-N8: colibri$(EXE) NOW links it, but only under XDNA=1 (see the switch
+# beside VK above). The default build still does not, and stays byte-for-byte
+# what it was. `make xdna-obj` remains useful on its own so a break in the C
+# side is caught without building a whole host.
+.PHONY: xdna-obj
+xdna-obj: backend_xdna.o
+backend_xdna.o: backend_xdna.c backend_xdna.h .build-config
+	$(CC) $(CFLAGS) -c backend_xdna.c -o $@
 
 # Windows CUDA DLL: compile backend_cuda.cu with nvcc (+MSVC cl.exe as host
 # compiler, required by nvcc on Windows) into coli_cuda.dll. Run this from a
@@ -1137,6 +1178,50 @@ tests/test_cluster_protocol$(EXE): tests/test_cluster_protocol.c colibri.c st.h 
 
 tests/test_ue8m0$(EXE): tests/test_ue8m0.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Compiles the engine with -DCOLI_XDNA so the QT side pointer, its reset helper
+# and the expert-slot wiring are exercised as the engine actually builds them.
+tests/test_xdna_qt_state$(EXE): tests/test_xdna_qt_state.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c -o $@ $(LDFLAGS)
+tests/test_xdna_prepared_state$(EXE): tests/test_xdna_prepared_state.c backend_xdna.c backend_xdna.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_xdna_registry$(EXE): tests/test_xdna_registry.c backend_xdna.c backend_xdna.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Synthetic ABI-2 helpers for the execution tests. Plain C, no XRT, no device:
+# they let the whole execution control flow be qualified on a machine with no
+# NPU. Three variants so the all-or-nothing binding contract is testable.
+XDNA_FAKE_HELPERS = tests/xdna_fake_helper.dll \
+                    tests/xdna_fake_helper_abi1.dll \
+                    tests/xdna_fake_helper_partial.dll
+tests/xdna_fake_helper.dll: tests/xdna_fake_helper.c
+	$(CC) $(CFLAGS) -shared $< -o $@
+tests/xdna_fake_helper_abi1.dll: tests/xdna_fake_helper.c
+	$(CC) $(CFLAGS) -DFAKE_ABI1 -shared $< -o $@
+tests/xdna_fake_helper_partial.dll: tests/xdna_fake_helper.c
+	$(CC) $(CFLAGS) -DFAKE_PARTIAL -shared $< -o $@
+
+tests/test_xdna_execution$(EXE): tests/test_xdna_execution.c backend_xdna.c backend_xdna.h compat.h $(XDNA_FAKE_HELPERS)
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Failure/fallback owner. Needs BOTH the engine (matmul_qt is the fallback
+# target it verifies against) and the synthetic ABI-2 helpers, which is why it
+# is a separate owner from test_xdna_execution.
+tests/test_xdna_failure$(EXE): tests/test_xdna_failure.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(XDNA_FAKE_HELPERS)
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c -o $@ $(LDFLAGS)
+
+# NOT a test gate -- intentionally absent from TEST_BINS (its name does not match
+# the tests/test_*$(EXE) pattern the gate list is derived from). It needs a real
+# XDNA2 NPU, a working XRT, a built coli_xdna.dll and the qualified artifact
+# bytes, none of which a build machine may assume. Build and run it explicitly:
+#   make tests/xdna_physical_probe$(EXE)
+#   tests/xdna_physical_probe <artifact-root> <path-to-coli_xdna.dll> [M-list]
+#
+# M-list defaults to 1,32,64 (the M64 bucket); pass 65,130,256 to qualify
+# the M256 bucket through the same owner.
+tests/xdna_physical_probe$(EXE): tests/xdna_physical_probe.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c -o $@ $(LDFLAGS)
 
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

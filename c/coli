@@ -730,6 +730,9 @@ def env_for(a):
         e.setdefault("PIPE", "1")
         e.setdefault("PILOT_REAL", "1")
     e["COLI_POLICY"]=a.policy
+    # Explicit request only. Absent flag => variable absent => engine default,
+    # which is the current path. Never set from discovery or from a plan.
+    if getattr(a, "xdna", False): e["COLI_XDNA"]="1"
     if getattr(a, "cluster_workers", None): e["CLUSTER_WORKERS"] = a.cluster_workers
     if getattr(a, "cluster_coordinator", None): e["CLUSTER_COORDINATOR"] = a.cluster_coordinator
     if a.ram:  e["RAM_GB"]=str(a.ram)
@@ -2100,6 +2103,15 @@ def main():
                         default=os.environ.get("COLI_POLICY","quality"),
                         help="resource policy (explicit --topk/--topp overrides warn and proceed)")
     common.add_argument("--repin", type=int, default=0, help="adapt RAM/VRAM experts every N tokens")
+    # Explicit, default-off opt-in to the qualified native XDNA2 (Ryzen AI NPU)
+    # lane. Deliberately NOT a --policy value: --policy chooses how the planner may
+    # spend memory, this chooses a compute device, and a user wanting quality
+    # planning ON the NPU must be able to say both. Deliberately not inferred from
+    # hardware either -- the reduced-precision consequence means the user has to ask.
+    common.add_argument("--xdna", action="store_true",
+                        help="experimental: run qualified GLM operations on the AMD XDNA2 NPU "
+                             "(reduced-precision BF16 path; output may differ; unsupported "
+                             "operations use the normal path)")
     # Absent (None) = not explicitly set: the glm engine gets the 0 sentinel and picks
     # (8 historically; 1 on Metal+darwin+fast SSD, #379 -- an honest F_NOCACHE probe
     # measures "fast", cached in <model>/.coli_ssd), while non-glm arches get the
