@@ -62,6 +62,19 @@ int main(void) {
         qt_note_block(0, eid, g4[eid], u4[eid], d4[eid], sc[eid], sc[eid] + IH, sc[eid] + 2 * IH);
     }
     qt_fill_wait();
+    /* qt_fill_wait returns when the QUEUE is empty; the expert the uploader
+     * dequeued last is still queued=1 (not yet resident) until its upload
+     * returns. Checking residency right here raced that upload and failed
+     * about one run in fifteen. Wait for the uploader to settle. */
+    for (int i = 0; i < 1000; i++) {
+        int pending = 0;
+        pthread_mutex_lock(&G.mx);
+        for (int eid = 0; eid < NE; eid++) pending += qs(0, eid)->queued;
+        pthread_mutex_unlock(&G.mx);
+        if (!pending) break;
+        struct timespec ts = {0, 2000000};
+        nanosleep(&ts, NULL);
+    }
     for (int eid = 0; eid < NE; eid++)
         check(qt_is_resident(0, eid), "expert did not become resident during warmstart");
 

@@ -1674,6 +1674,23 @@ tests/test_qwen36_tier_shutdown$(EXE): tests/test_qwen36_tier_shutdown.c tests/q
 # int8 container there is no packed copy to rebuild them from (#1341). Includes
 # qwen36_tier.c in its own TU like the other tier tests, so nothing else is
 # compiled in and no model file is needed.
+# Same fake backend, the RULES the three regression tests above are instances
+# of: budget accounting balances on every device (reservations are consumed or
+# returned, never leaked), shutdown wakes all four cv_take waiters at once, and
+# issue blocks stay inside, disjoint and at their device's slot under random
+# routing on 1-3 devices. Under test-asan the third doubles as a fuzz for the
+# #1339 class.
+tests/test_qwen36_tier_invariants$(EXE): tests/test_qwen36_tier_invariants.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend: the automatic placement (COLI_PLACE unset/"auto") puts
+# the offered dense trunk into VRAM by bytes-saved-per-byte, prices displaced
+# experts by heat, keeps the trunk on the CPU when the marginal experts are
+# hotter, honours an explicit list and "off", and takes placed bytes out of
+# the expert budget -- on one and on two devices.
+tests/test_qwen36_tier_autoplace$(EXE): tests/test_qwen36_tier_autoplace.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c tests/qwen36_fake_cuda.h qwen36.c qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
