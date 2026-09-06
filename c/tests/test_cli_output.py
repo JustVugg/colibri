@@ -368,13 +368,19 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
                     "OMP_DYNAMIC", "OMP_PROC_BIND", "OMP_PLACES"):
             self.assertNotIn(key, env)
 
-    def test_qwen38_rejects_gpu_and_vram_flags_before_binary_detection(self):
-        gpu_args = self.args();gpu_args.gpu="0";gpu_args.vram=0
-        with self.assertRaisesRegex(SystemExit, "CPU only.*--gpu"):
-            self.coli.env_for_engine(gpu_args, "qwen38")
-        vram_args = self.args();vram_args.gpu=None;vram_args.vram=4
-        with self.assertRaisesRegex(SystemExit, "CPU only.*--vram"):
-            self.coli.env_for_engine(vram_args, "qwen38")
+    def test_qwen38_gpu_flags_need_the_cuda_build(self):
+        """qwen38 has a GPU path now (expert tier, dense trunk), so --gpu and
+        --vram are no longer refused up front as "CPU only". On a CPU-only
+        binary they fail the way every accelerated engine's do: by asking for
+        the CUDA build. cuda_binary() is mocked so the test does not depend on
+        what happens to be built next to it."""
+        with mock.patch.object(self.coli, "cuda_binary", return_value=None):
+            gpu_args = self.args();gpu_args.gpu="0";gpu_args.vram=0
+            with self.assertRaisesRegex(SystemExit, "--gpu needs the CUDA build"):
+                self.coli.env_for_engine(gpu_args, "qwen38")
+            vram_args = self.args();vram_args.gpu=None;vram_args.vram=4
+            with self.assertRaisesRegex(SystemExit, "--vram needs the CUDA build"):
+                self.coli.env_for_engine(vram_args, "qwen38")
 
 
 class ContextFlagHonestyTest(unittest.TestCase):

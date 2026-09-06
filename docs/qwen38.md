@@ -153,6 +153,63 @@ when nothing is cached and roughly half that at the cap-32 hit rate, so at this
 cache size the engine spends about two thirds of every request waiting on the
 disk, and the planner labels cold expert reads as the expected bottleneck.
 
+## GPU: CUDA VRAM expert tier
+
+With `CUDA=1` the engine links the same expert tier as Qwen3.6
+(`c/qwen36_tier.c`, [qwen36-cuda-tier.md](qwen36-cuda-tier.md)) in its
+**fp8 streaming mode**. Nothing about the model or the RAM cache changes:
+experts still stream from disk into the per-layer LRU (`cap`), and the tier
+keeps its own copies of the hot ones in VRAM as a third stage above it,
+disk -> RAM LRU -> VRAM. Routed experts that are resident are computed on
+the GPU (`grouped_hidden_f8w_dual` / `grouped_down_f8w` from #817: e4m3
+bytes plus the checkpoint's `[ceil(O/128), ceil(I/128)]` block scales, no
+conversion); the rest run on the CPU as before. Every expert the CPU
+computes is reported to the tier, which copies the 4.7 MiB slab and the
+three scale tables during that call -- the RAM slot may be recycled by the
+next token -- and promotes it when it has room or when it is hotter than
+the coldest resident expert on its device (budget-neutral swap). The dense
+trunk, prefill, QSA and the PLE table stay on the CPU.
+
+```bash
+make -C c qwen38 CUDA=1 CUDA_ARCH=native      # NVCC=/usr/bin/nvcc on distro CUDA
+COLI_CUDA=1 COLI_GPUS=0,1 CUDA_EXPERT_GB=auto COLI_TIMERS=1 \
+OMP_NUM_THREADS=<physical cores - 1> OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close \
+SNAP=<checkpoint> N_NEW=200 ./c/qwen38 128 8 prompt.txt
+```
+
+`coli chat --gpu <n>` does the same through the planner (`supports_accelerator`
+in the `qwen38` descriptor). The tier reports next to the cache hit rate:
+resident experts, uploads, VRAM hits and misses, LFRU swaps. Requirements:
+native FP8 routed experts (`Q38_NATIVE_FP8=1`, the default) with every layer's
+block-scale bank resident; a checkpoint that falls back to the per-matrix
+scale loader stays on the CPU and says so.
+
+**What a VRAM budget buys.** The routing of Qwen3.8-Flash-Next has no hot set
+that carries over between prompts: the 1,400 experts (5.8 % of the model) that
+were hottest in one 100-token run covered a different prompt's routes at
+chance level (4.7 %; two cards, 2,800 experts: 9.3 % against 11.5 % chance;
+rank correlation of expert frequency per layer between the two runs -0.2). A
+heat file from an earlier run therefore does not help, and the engine does no
+warmstart. Inside a run the locality is strong -- on the route trace of a
+315-token prompt plus 100 generated tokens, an LRU of 32 slots per layer
+serves 55 % of decode routes, 64 serve 79 %, 128 serve 90 % -- so the tier
+earns its VRAM by promotion at touch time: with the RAM LRU at cap 128 and one
+8 GB card, 49 % of decode routes were served from VRAM on the real checkpoint.
+
+**VRAM per expert.** The tier charges what `cudaMalloc` takes, not the payload:
+an allocation above 1 MiB rounds up to a multiple of 2 MiB, so each 1.56 MiB
+expert matrix occupies 2 MiB and an expert costs 6.03 MiB of VRAM for 4.69 MiB
+of bytes. A 6.5 GB budget holds about 1,080 experts. Pooling experts into one
+arena per device would recover the 22 %; it is not done yet.
+
+**Where the time goes** (this checkpoint, Threadripper 3945WX 12 cores, 12
+threads, cap 32, `COLI_TIMERS=1`): 4.6 s per decode token were 1.4 s dense
+kernels (BF16 trunk and DeltaNet projections), 1.8 s expert disk reads, 0.9 s
+routed-expert GEMV on the CPU (1.9 ms per expert: e4m3 decode, not bandwidth),
+0.3 s the rest. The VRAM tier attacks the routed-expert GEMV and, together
+with a larger cap, the disk reads; the dense trunk is the largest item and is
+not on the GPU yet.
+
 ## Performance telemetry
 
 Every served request reports its own routed-expert cache hit rate; persistent

@@ -47,7 +47,7 @@ int main(void) {
     setenv("COLI_PLACE", "off", 1);
     setenv("HEAT_FILE", "", 1);
     /* room for six of the sixteen experts, so promotion has to swap */
-    size_t exp_bytes = 3ull * 32 * 8 + 3ull * 1 * sizeof(float) + 4096;
+    size_t exp_bytes = 3 * dev_alloc_footprint(32 * 8) + 3 * dev_alloc_footprint(1 * sizeof(float));
     char gb[64]; snprintf(gb, sizeof gb, "%.15f", (double)(6 * exp_bytes + exp_bytes / 2) / 1073741824.0);
     setenv("CUDA_EXPERT_GB", gb, 1);
     fake_ndev = 1; fake_uploads = 0; fake_lut_published = 0;
@@ -60,7 +60,7 @@ int main(void) {
 
     tk(G.on, "tier started from q38_tier_start on the FP8 fixture");
     tk(G.wfmt == 8, "streaming mode, weight format 8");
-    tk(G.exp_bytes == exp_bytes, "exp_bytes = 3 x D x Ih + 3 block scales + slack");
+    tk(G.exp_bytes == exp_bytes, "exp_bytes charged at cudaMalloc granularity (three matrices, three scale tables)");
     tk(fake_lut_published, "e4m3 LUT published before the first upload");
     tk(fake_uploads > 0 && fake_uploads % 3 == 0, "uploads come in gate/up/down triples");
     tk(last_fmt == 8 && last_bytes == (size_t)G.D * G.Ih, "fmt 8 uploads carry one byte per element");

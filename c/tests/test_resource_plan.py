@@ -643,7 +643,7 @@ memInfo.free:                     23.50 GB (97%)
         self.assertEqual(plan["tiers"]["vram"]["devices"], [])
         self.assertIn("not detected", plan["warnings"][0])
 
-    def test_qwen38_cpu_only_plan_prices_heterogeneous_cache_and_exports_cap(self):
+    def test_qwen38_plan_prices_heterogeneous_cache_exports_cap_and_plans_vram(self):
         config = {
             "model_type": "qwen4_exp",
             "text_config": {
@@ -691,12 +691,19 @@ memInfo.free:                     23.50 GB (97%)
                "free_bytes": 14 * GB, "unified_memory": True}
         plan = build_plan(self.model, context=64, available_memory=16 * GB,
                           available_disk=16 * GB, gpus=[gpu])
-        self.assertEqual(plan["tiers"]["vram"]["devices"], [])
-        self.assertEqual(plan["tiers"]["vram"]["budget_bytes"], 0)
-        self.assertFalse(any(item["target"] == "VRAM" for item in plan["decisions"]))
+        # Qwen3.8 has the CUDA VRAM expert tier (fp8 streaming mode): a
+        # qualified device is planned, the environment names it, and the RAM
+        # cache cap is still exported -- VRAM is a stage above the LRU, not
+        # a replacement for it.
+        self.assertEqual([device["index"] for device in plan["tiers"]["vram"]["devices"]], [0])
+        self.assertGreater(plan["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertTrue(any(item["target"] == "VRAM" for item in plan["decisions"]))
         cap = plan["tiers"]["ram"]["cache_slots_per_layer"]
         self.assertGreaterEqual(cap, 1)
-        self.assertEqual(environment_for_plan(plan)["COLI_PLAN_CAP"], str(cap))
+        environment = environment_for_plan(plan)
+        self.assertEqual(environment["COLI_PLAN_CAP"], str(cap))
+        self.assertEqual(environment["COLI_CUDA"], "1")
+        self.assertEqual(environment["COLI_GPU"], "0")
         for variable in ("Q38_NATIVE_FP8", "Q38_NATIVE_BF16"):
             with self.subTest(variable=variable), self.assertRaisesRegex(
                     ValueError, "requires native expert storage"):
@@ -704,12 +711,12 @@ memInfo.free:                     23.50 GB (97%)
         plan["tiers"]["ram"]["cache_slots_per_layer"] = 0
         with self.assertRaisesRegex(ValueError, "one expert slot"):
             environment_for_plan(plan)
-        with self.assertRaisesRegex(ValueError, "CPU only"):
-            build_plan(self.model, context=64, gpu_indices=[0], available_memory=16 * GB,
-                       available_disk=16 * GB, gpus=[gpu])
-        with self.assertRaisesRegex(ValueError, "CPU only"):
-            build_plan(self.model, context=64, vram_gb=4, available_memory=16 * GB,
-                       available_disk=16 * GB, gpus=[gpu])
+        selected = build_plan(self.model, context=64, gpu_indices=[0], available_memory=16 * GB,
+                              available_disk=16 * GB, gpus=[gpu])
+        self.assertEqual([device["index"] for device in selected["tiers"]["vram"]["devices"]], [0])
+        capped = build_plan(self.model, context=64, vram_gb=4, available_memory=16 * GB,
+                            available_disk=16 * GB, gpus=[gpu])
+        self.assertLessEqual(capped["tiers"]["vram"]["budget_bytes"], 4 * GB)
 
     def test_cli_emits_versioned_json(self):
         cli = Path(__file__).parents[1] / "coli"

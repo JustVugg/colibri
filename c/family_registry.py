@@ -1160,7 +1160,10 @@ FAMILIES = (
             "and prioritize correctness, consistency, and clarity in the final answer."
             "<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n"
             "<|im_start|>assistant\n<think>\n"),
-        supports_accelerator=False,
+        # CUDA VRAM expert tier (qwen36_tier.c, fp8 streaming mode): hot
+        # routed experts get VRAM copies above the RAM LRU; the dense trunk
+        # stays on the CPU for now (docs/qwen38.md, "GPU").
+        supports_accelerator=True,
     ),
     FamilyDescriptor(
         id="deepseek_v4",

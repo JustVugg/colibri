@@ -6,14 +6,14 @@ in RAM, the **hot** ones are promoted into DEVICE_LOCAL VRAM across one or
 more GPUs and computed there through the existing shared CUDA backend
 (`backend_cuda.cu` expert-group API — no new backend).
 
-> **A second mode.** Besides the Qwen3.6 modes below, the tier has an *fp8
-> streaming mode* (`qt_init_fp8`) for an engine whose experts do not all live
-> in RAM: `cap` may be smaller than the expert count, the tier copies each
-> expert's e4m3 slab and block scales when the engine reports it and keeps no
-> pointer into the engine's slot, and promotion happens at report time instead
-> of a warmstart. It is exercised by `tests/test_qwen36_tier_fp8.c`; the
-> Qwen3.8 engine that uses it comes in its own PR. Everything below describes
-> the Qwen3.6 modes unless it says otherwise.
+> **Two engines.** The tier also serves Qwen3.8-Flash-Next (`c/qwen38.c`,
+> [qwen38.md](qwen38.md#gpu-cuda-vram-expert-tier)) in its *fp8 streaming
+> mode* (`qt_init_fp8`): experts do not all live in RAM there, `cap` may be
+> smaller than the expert count, the tier copies each expert's e4m3 slab and
+> block scales when the engine reports it and keeps no pointer into the
+> engine's slot, and promotion happens at report time instead of a warmstart.
+> Everything below describes the Qwen3.6 modes unless it says otherwise.
+
 
 ## How it works
 
