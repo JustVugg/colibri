@@ -34,6 +34,8 @@ class FakeEngine:
                  on_tool=None):
         self.prompts.append(prompt)
         self.emitted = 0
+        if on_accept is not None:  # simulate the engine's ACCEPT frame (#597)
+            on_accept({"prompt_tokens": 11})
         for chunk in self.script:
             on_text(chunk)
             self.emitted += 1

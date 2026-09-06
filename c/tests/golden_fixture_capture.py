@@ -22,8 +22,9 @@ Usage:
     python3 tests/golden_fixture_capture.py diff fixtures_pre fixtures_post
 
 Battery: chat, chat+tools, chat streaming, completions without logprobs, and
-the error cases whose behavior must not move (seed 400, array-prompt 400,
-logprobs 400, out-of-range temperature 400) plus /v1/models.
+the error/no-op cases whose behavior must not move (seed accepted-and-ignored,
+an array `prompt` classified as one flat token-id prompt, logprobs served on
+the glm engine, out-of-range temperature 400) plus /v1/models.
 
 Normalization: every "id"/"created" field (recursively, and per SSE event) is
 replaced with a constant; nothing else is touched. Generation-bearing requests
@@ -76,11 +77,11 @@ def battery(model):
         ("completions_stop", "POST", "/v1/completions",
          {"model": model, "prompt": "Count: one, two,",
           "max_tokens": 16, "temperature": 0, "stop": ["five"]}),
-        ("err_seed", "POST", "/v1/completions",
+        ("seed_accepted", "POST", "/v1/completions",
          {"model": model, "prompt": "hello", "max_tokens": 1, "seed": 1234}),
-        ("err_array_prompt", "POST", "/v1/completions",
+        ("array_prompt_token_ids", "POST", "/v1/completions",
          {"model": model, "prompt": [1, 2, 3], "max_tokens": 1}),
-        ("err_logprobs", "POST", "/v1/completions",
+        ("logprobs_served", "POST", "/v1/completions",
          {"model": model, "prompt": "hello", "max_tokens": 1, "logprobs": 1}),
         ("err_bad_temperature", "POST", "/v1/chat/completions",
          {"model": model, "messages": chat_messages,
