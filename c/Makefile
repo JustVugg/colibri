@@ -1691,6 +1691,13 @@ tests/test_qwen36_tier_invariants$(EXE): tests/test_qwen36_tier_invariants.c tes
 tests/test_qwen36_tier_autoplace$(EXE): tests/test_qwen36_tier_autoplace.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# Same fake backend: the fp8 streaming mode a model whose experts do not fit
+# in RAM needs (Qwen3.8) -- cap < n_experts accepted, fmt=8 uploads with
+# 128x128 block scales, bytes staged unchanged, no pointer kept into the
+# engine's recycled slot, promotion decided when the bytes pass by.
+tests/test_qwen36_tier_fp8$(EXE): tests/test_qwen36_tier_fp8.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c tests/qwen36_fake_cuda.h qwen36.c qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 

@@ -63,8 +63,8 @@ static int home(int eid){ return eid % G.ndev; }
 static void stage(uint8_t *dw, float *dsc,
                   const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
                   const float *gs,const float *us,const float *ds){
-    size_t mb = (size_t)G.D*G.Ih/(G.wfmt==1?1:2);
-    if(G.wfmt==1){
+    size_t mb = (size_t)G.D*G.Ih/(G.wfmt==4?2:1);
+    if(G.wfmt==1 || G.wfmt==8){
         /* int8: il formato del backend e' gia' quello in RAM, si copia e basta.
          * Niente XOR: quello serve a portare i nibble int4 da complemento a due
          * a binario sfalsato, e su byte interi sarebbe corruzione. */
@@ -117,10 +117,17 @@ static void *uploader(void *arg){
         int dv = G.dev[home(eid)];
         /* passo fra le tre matrici nello staging: int4 impacchettato = mezzo
          * byte per elemento, int8 = uno. */
-        size_t mb=(size_t)G.D*G.Ih/(G.wfmt==1?1:2);
+        size_t mb=(size_t)G.D*G.Ih/(G.wfmt==4?2:1);
         ColiCudaTensor *tg=NULL,*tu=NULL,*td=NULL;
         int ok;
-        if(G.wfmt==1){
+        if(G.wfmt==8){
+            /* e4m3 bytes as they came from the checkpoint, block scales
+             * [ceil(O/128), ceil(I/128)] per matrix -- the layout #817's
+             * kernels and tensor_upload(fmt=8) already agree on */
+            ok = coli_cuda_tensor_upload(&tg, w,      sc,            8, G.D,  G.Ih, dv)
+              && coli_cuda_tensor_upload(&tu, w+mb,   sc+G.sc_gu,    8, G.D,  G.Ih, dv)
+              && coli_cuda_tensor_upload(&td, w+2*mb, sc+2*G.sc_gu,  8, G.Ih, G.D,  dv);
+        } else if(G.wfmt==1){
             /* int8, scale per riga: qt_init ha gia' rifiutato il caso raggruppato,
              * che questo formato non sa esprimere. */
             ok = coli_cuda_tensor_upload(&tg, w,      sc,          1, G.D,  G.Ih, dv)
@@ -373,11 +380,32 @@ static void auto_place(int nl, int ne, int topk, const size_t *capacity, const u
 }
 
 
+/* ---- fp8 streaming mode (Qwen3.8) -----------------------------------------
+ * qwen36 keeps every expert in RAM and lets the tier retain raw pointers into
+ * slots that are never recycled; that is what `cap == n_experts` guards. A
+ * model whose experts do not fit in RAM (Qwen3.8: 24 576 x 4.7 MiB) streams
+ * them through an LRU whose slots ARE recycled, so a retained pointer would
+ * dangle by the next token. In this mode the tier owns what it uploads: the
+ * bytes are copied into the staging buffer inside the qt_note call, while the
+ * engine's slot is still live, and the pointers are dropped right after. A
+ * promotion can therefore only happen when the bytes pass by -- the LFRU
+ * decision moves from the periodic tick into qt_note, which asks: is this
+ * expert, now in hand, hotter than the coldest resident on its device? */
+static int G_fp8_stream;
+static const float *G_fp8_lut;
+
+int qt_init_fp8(int nl, int ne, int D, int Ih, int cap, int topk, const float *e4m3_lut){
+    G_fp8_stream = 1; G_fp8_lut = e4m3_lut;
+    int ok = qt_init(nl, ne, D, Ih, cap, topk, 0, 0);
+    if(!ok) G_fp8_stream = 0;
+    return ok;
+}
+
 int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             int expert_is_int4){
     const char *e=getenv("COLI_CUDA");
     if(!(e && *e=='1')) return 0;
-    if(cap != ne){
+    if(cap != ne && !G_fp8_stream){
         fprintf(stderr,"[qtier] cap=%d != n_experts=%d -> tier disabled (needs full RAM residency)\n",cap,ne);
         return 0;
     }
@@ -422,19 +450,32 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     int have=coli_cuda_device_count();
     if(have<G.ndev){ G.ndev=have; }
     if(G.ndev<1){ fprintf(stderr,"[qtier] no CUDA devices -> CPU path\n"); return 0; }
+    if(G_fp8_stream){
+        if(!G_fp8_lut || !coli_cuda_fp8_set_lut(G_fp8_lut)){
+            fprintf(stderr,"[qtier] fmt=8 decode table not published -> CPU path\n");
+            return 0;
+        }
+    }
 
     /* Weight format and bytes per expert come first now: the automatic
      * placement below needs them to price the experts a trunk item displaces. */
-    G.wfmt = expert_is_int4 ? 4 : 1;
+    G.wfmt = G_fp8_stream ? 8 : (expert_is_int4 ? 4 : 1);
     if(G.wfmt==1 && expert_gs>0){
         fprintf(stderr,"[qtier] int8 experts with grouped scales (gs=%d) cannot be "
                        "expressed on the GPU (fmt=1 is per-row only) -> CPU path\n", expert_gs);
         return 0;
     }
     G.egs = expert_gs;
-    G.sc_gu = expert_gs ? (size_t)Ih * ((D + expert_gs - 1)/expert_gs) : (size_t)Ih;
-    G.sc_d  = expert_gs ? (size_t)D  * ((Ih + expert_gs - 1)/expert_gs) : (size_t)D;
-    G.exp_bytes = (G.wfmt==1 ? 3ull*D*Ih : 3ull*D*Ih/2)
+    if(G.wfmt==8){
+        /* one f32 scale per 128x128 block of [O,I]: gate/up are [Ih,D], down is
+         * [D,Ih] -- the same count either way, kept as two fields for symmetry */
+        size_t nbD=(size_t)(D+127)/128, nbI=(size_t)(Ih+127)/128;
+        G.sc_gu = nbI*nbD; G.sc_d = nbD*nbI;
+    } else {
+        G.sc_gu = expert_gs ? (size_t)Ih * ((D + expert_gs - 1)/expert_gs) : (size_t)Ih;
+        G.sc_d  = expert_gs ? (size_t)D  * ((Ih + expert_gs - 1)/expert_gs) : (size_t)D;
+    }
+    G.exp_bytes = (G.wfmt==4 ? 3ull*D*Ih/2 : 3ull*D*Ih)
                 + (2*G.sc_gu+G.sc_d)*sizeof(float) + 4096; /* + allocation slack */
 
     /* Per-device allowance for tier + trunk: CUDA_EXPERT_GB when numeric,
@@ -633,7 +674,7 @@ static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
     if(G.qn>=QT_QCAP){ G.q_full_skips++; return 0; }
     int hd=home(eid);
     if(!reserved && v_eid<0 && G.used[hd]+G.exp_bytes>G.budget[hd]) return 0;
-    size_t mb=(size_t)G.D*G.Ih/(G.wfmt==1?1:2);   /* buffer di staging: int8 = 1 byte/elemento */
+    size_t mb=(size_t)G.D*G.Ih/(G.wfmt==4?2:1);   /* buffer di staging: int8/fp8 = 1 byte/elemento */
     uint8_t *w=malloc(3*mb); float *sc=malloc((2*G.sc_gu+G.sc_d)*sizeof(float));
     if(!w||!sc){ free(w); free(sc); return 0; }
     if(!reserved && v_eid<0) G.used[hd]+=G.exp_bytes;
@@ -646,12 +687,50 @@ static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
     return 1;
 }
 
+/* streaming mode: the bytes in hand are valid only during this call, so set
+ * the pointers for the enqueue (which stages a copy under the lock) and drop
+ * them again before returning. Nothing downstream may read them later. */
+static void stream_point(QSlot *s,const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
+                         const float *gs,const float *us,const float *ds){
+    s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds;
+}
+static void stream_forget(QSlot *s){ s->g4=s->u4=s->d4=NULL; s->gs=s->us=s->ds=NULL; }
+
+/* The LFRU decision at the moment the bytes pass by: if this expert is not
+ * resident and its device has no room, evict the coldest resident there when
+ * the admission rule says the newcomer is worth it. Budget-neutral swap. */
+static void stream_promote_locked(int layer,int eid){
+    QSlot *s=qs(layer,eid);
+    if(s->resident||s->queued) return;
+    int hd=home(eid);
+    if(G.used[hd]+G.exp_bytes<=G.budget[hd]){ enqueue_locked(layer,eid,-1,-1,0); return; }
+    size_t n=(size_t)G.nl*G.ne; int cold=-1; uint32_t ch=0;
+    for(size_t i=0;i<n;i++){
+        QSlot *c=&G.slot[i];
+        if(home((int)(i%G.ne))!=hd || !c->resident || c->queued) continue;
+        if(cold<0||c->heat<ch){ cold=(int)i; ch=c->heat; }
+    }
+    if(cold<0 || !tier_should_promote(s->heat,ch)) return;
+    QSlot *v=&G.slot[cold];
+    v->resident=0;
+    if(enqueue_locked(layer,eid,cold/G.ne,cold%G.ne,0)) G.swaps++;
+    else v->resident=1;
+}
+
 void qt_note(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
     if(!G.on || !g4) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
+    if(G_fp8_stream){
+        if(s->heat<0xFFFFFFFFu) s->heat++;
+        stream_point(s,g4,u4,d4,gs,us,ds);
+        stream_promote_locked(layer,eid);
+        stream_forget(s);
+        pthread_mutex_unlock(&G.mx);
+        return;
+    }
     if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
     if(s->heat<0xFFFFFFFFu) s->heat++;
     enqueue_locked(layer,eid,-1,-1,0);
@@ -665,9 +744,11 @@ void qt_note_block(int layer,int eid,
     if(!G.on || !g4) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
-    if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
+    if(G_fp8_stream) stream_point(s,g4,u4,d4,gs,us,ds);
+    else if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
     while(G.qn>=QT_QCAP && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
     enqueue_locked(layer,eid,-1,-1,0);
+    if(G_fp8_stream) stream_forget(s);
     pthread_mutex_unlock(&G.mx);
 }
 
@@ -756,13 +837,15 @@ void qt_note_planned(int layer,int eid,
         pthread_mutex_unlock(&G.mx);
         return;
     }
-    if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
+    if(G_fp8_stream) stream_point(s,g4,u4,d4,gs,us,ds);
+    else if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
     while(G.qn>=QT_QCAP && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
     if(!enqueue_locked(layer,eid,-1,-1,1)){
         /* not enqueueable (e.g. already resident): return the reservation */
         if(s->planned) G.used[home(eid)]-=G.exp_bytes;
     }
     s->planned=0;
+    if(G_fp8_stream) stream_forget(s);
     pthread_mutex_unlock(&G.mx);
 }
 
@@ -902,6 +985,7 @@ void qt_shutdown(void){
     pthread_mutex_lock(&G.mx); G.th_stop=1; pthread_cond_signal(&G.cv); pthread_cond_broadcast(&G.cv_take); pthread_mutex_unlock(&G.mx);
     pthread_join(G.th,NULL);
     G.on=0;
+    G_fp8_stream=0;
     coli_cuda_shutdown();
 }
 

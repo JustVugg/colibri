@@ -52,7 +52,7 @@ static int upload_common(ColiCudaTensor **t, const void *w, int fmt,
     *t = n;
     fake_uploads++;
     last_fmt = fmt;
-    last_bytes = (size_t)I * O / (fmt == 1 ? 1 : 2);
+    last_bytes = (size_t)I * O / ((fmt == 1 || fmt == 8) ? 1 : 2);
     if (fake_uploads == 1) {
         captured_len = last_bytes < sizeof captured ? last_bytes : sizeof captured;
         memcpy(captured, w, captured_len);
@@ -71,6 +71,8 @@ void coli_cuda_tensor_free(ColiCudaTensor *t) { free(t); }
 int coli_cuda_available_device_count(void) { return fake_ndev; }
 int coli_cuda_device_count(void) { return fake_ndev; }
 int coli_cuda_init(const int *d, int n) { (void)d; (void)n; return 1; }
+static int fake_lut_published;
+int coli_cuda_fp8_set_lut(const float *lut) { fake_lut_published = lut != NULL; return lut != NULL; }
 void coli_cuda_shutdown(void) {}
 int coli_cuda_mem_info(int device, size_t *freeb, size_t *total) {
     (void)device;
