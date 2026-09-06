@@ -2694,8 +2694,13 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
         const uint8_t *wg = expert_is_int4 ? e->g4 : (const uint8_t *)e->g;
         const uint8_t *wu = expert_is_int4 ? e->u4 : (const uint8_t *)e->u;
         const uint8_t *wd = expert_is_int4 ? e->d4 : (const uint8_t *)e->d;
-        if (planned[gi] && wg) {
+        if (planned[gi]) {
+            /* Reported even when wg is NULL: the tier reserved budget for
+             * this expert in qt_plan_fill, and a planned expert that is never
+             * reported keeps that reservation forever. With no weights the
+             * tier hands the bytes back instead of uploading. */
             qt_note_planned(l, eidw, wg, wu, wd, e->gs, e->us, e->ds);
+            if (!wg) continue;
             /* The staging copy is done. On an int4 container the int8 copy
              * can go RIGHT AWAY so it never shows up in peak RSS: g4/u4/d4
              * stay as the source of truth, and slot_ensure_int8() rebuilds

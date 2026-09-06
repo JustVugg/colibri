@@ -254,6 +254,11 @@ int qt_is_resident(int layer,int eid){
  * reserved here); victim>=0: LFRU swap (budget neutral). */
 static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
     QSlot *s=qs(layer,eid);
+    /* Nothing is accepted once shutdown has been requested: a waiter woken by
+     * the shutdown broadcast (qt_note_block / qt_note_planned on a full queue)
+     * would otherwise enqueue into a queue the uploader may already have left,
+     * and that entry stays queued=1 with its staging buffers forever. */
+    if(G.th_stop) return 0;
     if(s->resident||s->queued||!s->g4) return 0;
     if(G.qn>=QT_QCAP){ G.q_full_skips++; return 0; }
     int hd=home(eid);
@@ -368,9 +373,19 @@ int qt_plan_fill(int *layers,int *eids,int max){
 void qt_note_planned(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
-    if(!G.on || !g4) return;
+    if(!G.on) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
+    if(!g4){
+        /* The loader had nothing to hand over. qt_plan_fill reserved budget
+         * and set planned=1 for this expert; returning here without undoing
+         * both keeps the bytes out of the budget for the life of the process
+         * and "if(resident||queued||planned) continue" never reconsiders the
+         * expert. #1331 was this leak for every expert of an int8 container. */
+        if(s->planned){ G.used[home(eid)]-=G.exp_bytes; s->planned=0; }
+        pthread_mutex_unlock(&G.mx);
+        return;
+    }
     if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
     while(G.qn>=QT_QCAP && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
     if(!enqueue_locked(layer,eid,-1,-1,1)){
