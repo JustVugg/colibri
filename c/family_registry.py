@@ -89,6 +89,26 @@ class FamilyDescriptor:
     # separate from expert_inventory prevents a fixed allocation from
     # being multiplied by the cache capacity.
     fixed_resident_inventory: object = None
+    # Lo script sotto tools/ che `coli convert` puo' guidare per questa famiglia,
+    # e le opzioni di `coli convert` che quello script accetta davvero.
+    #
+    # #1368: `coli convert` lanciava convert_fp8_to_int4.py qualunque cosa gli si
+    # desse. Quel convertitore e' di GLM-5.2 e classifica i tensori per nome
+    # PIATTO, mentre GLM-5.3-Flash annida il testuale sotto il wrapper vision:
+    # `model.language_model.embed_tokens.weight` non corrisponde a nessuna regola
+    # e cade nel fallback finale, che lo quantizza. Poi glm53.c lo legge con
+    # load_f32, rifiuta l'U8, e il motore muore dentro `coli web`.
+    #
+    # Vuoto significa "coli non guida questa famiglia": non e' una lacuna, e'
+    # che il suo convertitore ha un'altra riga di comando (convert_qwen36.py usa
+    # --out e --gs, convert_inkling_int4.py non ha --repo) o non serve affatto
+    # (Qwen3.8 gira sul checkpoint ufficiale). In quel caso si lascia parlare la
+    # guardia del convertitore, che quelle indicazioni le ha gia' per famiglia e
+    # sotto test: due copie della stessa mappa sarebbero il difetto che questa
+    # correzione sta chiudendo.
+    converter: str = ""
+    converter_accepts: tuple = ()
+    converter_mtp_pass: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -888,6 +908,12 @@ FAMILIES = (
         # export di solo testo dichiara "glm5_next_text" al primo livello.
         model_types=("glm5_next", "glm5_next_text"),
         display_name="GLM-5.3-Flash",
+        # Niente ebits/io_bits/xbits: questo convertitore tiene i densi e
+        # l'embedding in BF16 e la precisione la sceglie il motore a load time
+        # (GLM53_BITS). Accettare quelle opzioni per poi ignorarle sarebbe la
+        # versione silenziosa dello stesso guasto.
+        converter="convert_glm53.py",
+        converter_accepts=("group_size",),
         display_scale="321B",
         engine_artifact="glm53",
         engine_aliases=(),
@@ -945,6 +971,9 @@ FAMILIES = (
         # family loads. If a future release ever adds a real discriminator,
         # split this then, on evidence.
         display_name="GLM-5.2/5.3",
+        converter="convert_fp8_to_int4.py",
+        converter_accepts=("ebits", "io_bits", "xbits", "group_size"),
+        converter_mtp_pass=True,
         display_scale="744B",
         engine_artifact="colibri",
         engine_aliases=("glm",),

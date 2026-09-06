@@ -262,11 +262,22 @@ class BannerModelLineTest(unittest.TestCase):
         self.assertNotIn("GLM-5.2", line)
 
     def test_no_model_keeps_the_generic_tagline(self):
-        self.assertIn("GLM-5.2", self.coli.model_banner_line(None))
+        """What matters is that a tagline comes back and that it names no
+        model. It used to assert the substring "GLM-5.2", which pinned the
+        example rather than the property: the tagline named the flagship
+        family, and #1367 renamed that family out from under it."""
+        line = self.coli.model_banner_line(None)
+        self.assertTrue(line.strip())
+        self.assertIn("model families", line)
+        for family in self.coli.all_families():
+            self.assertNotIn(family.display_name, line,
+                             "the generic tagline names a specific model; it is "
+                             "printed when no model was given")
 
     def test_unreadable_model_falls_back_instead_of_raising(self):
         """`coli info` banners before validating the path; it must not crash."""
-        self.assertIn("GLM-5.2", self.coli.model_banner_line("/nonexistent/xyz"))
+        self.assertEqual(self.coli.model_banner_line("/nonexistent/xyz"),
+                         self.coli.model_banner_line(None))
 
     def test_size_is_reported_without_rounding_to_zero(self):
         small = self.line({"model_type": "olmoe"}, shard_bytes=4_200_000_000)
