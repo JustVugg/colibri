@@ -70,9 +70,12 @@ int main(void) {
     setenv("COLI_CUDA", "1", 1);
     setenv("COLI_GPUS", "0", 1);
     setenv("QT_NO_WARMSTART", "1", 1);
-    /* exp_bytes = 3*D*IH/2 + (2*IH+D)*4 + 4096 = 3072+512+4096 = 7680 B.
-     * 0.00001 GiB ~= 10737 B: enough for one expert (7680), not two (15360). */
-    setenv("CUDA_EXPERT_GB", "0.00001", 1);
+    /* budget for one expert and a half, at the allocator's granularity (three
+     * int4 matrices of D*32/2 bytes plus three scale tables, each charged
+     * what cudaMalloc takes): enough for one expert, not two */
+    size_t exp_bytes = 3 * dev_alloc_footprint((size_t)D * 32 / 2) + 3 * dev_alloc_footprint((2 * 32 + D) / 3 * sizeof(float));
+    char gb[64]; snprintf(gb, sizeof gb, "%.15f", (double)(exp_bytes + exp_bytes / 2) / 1073741824.0);
+    setenv("CUDA_EXPERT_GB", gb, 1);
     fake_ndev = 1;
 
     if (!qt_init(1, 2, D, 32, 2, 1, 0 /* per-row */, 1 /* int4 */)) {
