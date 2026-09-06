@@ -140,6 +140,8 @@ typedef struct {
      * `vis_rows`, oppure -1. Assoluta e non relativa al chunk: il prefill arriva
      * a pezzi, e un indice relativo darebbe l'immagine sbagliata al secondo
      * pezzo senza che niente protesti. */
+    /* PLE prefetto: le righe gia' lette per il chunk in corso, o NULL. */
+    float *ple_pref; int ple_pref_rows;
     Q38Vision vis;
     int vis_ready;
     float *vis_rows;
@@ -1092,6 +1094,21 @@ static void q38_load_native_fp8_ranges(Model *m,int layer,int expert,Slot *slot,
     Cfg *c=&m->c;
     Q38ExpertScaleCache *cache=&m->expert_scales[layer];
     float *scales=cache->values+(int64_t)expert*3*cache->scale_count;
+    /* Se i tre intervalli sono mappati (COLI_MAP_EXPERTS=1), lo slot li PUNTA
+     * invece di copiarli: niente slab, niente 14 MB per miss. */
+    {
+        const uint8_t *pg=(const uint8_t*)st_map_shard_range(weight[0]->fd,weight[0]->off,weight[0]->nbytes);
+        const uint8_t *pu=(const uint8_t*)st_map_shard_range(weight[1]->fd,weight[1]->off,weight[1]->nbytes);
+        const uint8_t *pd=(const uint8_t*)st_map_shard_range(weight[2]->fd,weight[2]->off,weight[2]->nbytes);
+        if(pg&&pu&&pd){
+            int sc=(int)cache->scale_count;
+            q38_bind_borrowed_fp8(&slot->gate,(void*)pg,scales,c->inter,c->hidden);
+            q38_bind_borrowed_fp8(&slot->up,(void*)pu,scales+sc,c->inter,c->hidden);
+            q38_bind_borrowed_fp8(&slot->down,(void*)pd,scales+2*sc,c->hidden,c->inter);
+            if(slot->fp8_slab){free(slot->fp8_slab);slot->fp8_slab=NULL;slot->fp8_slab_bytes=0;}
+            return;
+        }
+    }
     q38_bind_fp8_slot(slot,scales,(int)cache->scale_count,c->hidden,c->inter);
     int64_t pair_bytes=weight[0]->nbytes+weight[1]->nbytes;
     unsigned char *raw=(unsigned char*)slot->fp8_slab;
@@ -1346,6 +1363,69 @@ static int64_t q38_hash_row(Model *m,int head,int ngram,int64_t cur,int64_t p1,i
     return m->ple_head_offset[head]+r;
 }
 
+
+/* Anticipa le letture PLE all'inizio del forward invece di emetterle inline al
+ * layer che le usa.
+ *
+ * Perche' si puo' fare, e perche' NON si puo' fare con gli esperti: gli indici
+ * delle righe PLE sono funzione pura degli id dei token e della finestra di due
+ * token che li precede -- q38_hash_row non guarda nessuno stato nascosto. Sono
+ * quindi noti PRIMA che parta un solo calcolo. Gli esperti no: quelli dipendono
+ * dal router del layer precedente, e per questo la loro finestra di anticipo e'
+ * di un layer e non di tutto il forward.
+ *
+ * Il PLE cade sul layer 2 di 48, quindi fra l'emissione e l'uso ci sono due
+ * layer interi di calcolo -- con il loro streaming di esperti, che su questo
+ * motore e' la parte lenta. E' abbondantemente il tempo di far arrivare 16
+ * righe da 160 byte.
+ *
+ * Sono anche letture PARALLELE invece che in fila: prima erano 16 pread seriali
+ * a queue depth 1 per token, che in prefill diventano lunghezza-del-prompt per
+ * 16, una alla volta.
+ *
+ * Riordino puro: stessi byte, letti prima. I token non cambiano, e il test lo
+ * pretende invece di darlo per scontato. */
+static void q38_ple_prefetch(Model *m,const int *ids,int S) {
+    Cfg *c=&m->c;
+    free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;
+    if(c->ple_layer<0||S<1||c->ngram_heads<1||c->ngram_head_dim<1) return;
+    if(!q38_env_bool("Q38_PLE_PREFETCH",1)) return;
+
+    int64_t per_row=c->ngram_head_dim, per_pos=(int64_t)c->ngram_heads*per_row;
+    if(S>INT_MAX/c->ngram_heads) return;
+    float *buffer=(float*)malloc((size_t)S*per_pos*sizeof(float));
+    int64_t *rows=(int64_t*)malloc((size_t)S*c->ngram_heads*sizeof(int64_t));
+    if(!buffer||!rows){free(buffer);free(rows);return;}   /* niente prefetch: si legge inline */
+
+    /* La finestra di due token viene SIMULATA, non mutata: q38_ple la aggiorna
+     * per conto suo mentre gira, e toccarla qui la farebbe avanzare due volte. */
+    int64_t history[2]={m->ple_history[0],m->ple_history[1]};
+    int history_len=m->ple_history_len;
+    for(int s=0;s<S;s++){
+        int64_t p1=history_len>=1?history[history_len-1]:c->eos_id;
+        int64_t p2=history_len>=2?history[history_len-2]:c->eos_id;
+        for(int h=0;h<c->ngram_heads;h++){
+            int ng=h<c->heads_per_ngram?2:3;
+            rows[(int64_t)s*c->ngram_heads+h]=q38_hash_row(m,h,ng,ids[s],p1,p2);
+        }
+        if(ids[s]==c->eos_id) history_len=0;
+        else if(history_len==0){history[0]=ids[s];history_len=1;}
+        else if(history_len==1){history[1]=ids[s];history_len=2;}
+        else {history[0]=history[1];history[1]=ids[s];}
+    }
+
+    int64_t total=(int64_t)S*c->ngram_heads;
+    volatile int failed=0;
+    #pragma omp parallel for schedule(static)
+    for(int64_t i=0;i<total;i++){
+        if(failed) continue;
+        q38_ple_row(m,rows[i],buffer+i*per_row);
+    }
+    free(rows);
+    if(failed){free(buffer);return;}
+    m->ple_pref=buffer; m->ple_pref_rows=S;
+}
+
 static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out) {
     double phase_started=now_s();
     Cfg *c=&m->c; Layer *l=&m->L[c->ple_layer]; int H=c->hidden,C=c->hc_count,W=c->hc_width,E=c->ple_dim;
@@ -1354,7 +1434,12 @@ static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out)
     for(int s=0;s<S;s++){
         int64_t p1=m->ple_history_len>=1?m->ple_history[m->ple_history_len-1]:c->eos_id;
         int64_t p2=m->ple_history_len>=2?m->ple_history[m->ple_history_len-2]:c->eos_id;
-        for(int h=0;h<c->ngram_heads;h++){
+        if(m->ple_pref&&s<m->ple_pref_rows){
+            /* gia' in memoria: le ha portate q38_ple_prefetch mentre i primi
+             * layer calcolavano */
+            memcpy(emb,m->ple_pref+(int64_t)s*c->ngram_heads*c->ngram_head_dim,
+                   (size_t)c->ngram_heads*c->ngram_head_dim*sizeof(float));
+        } else for(int h=0;h<c->ngram_heads;h++){
             int ng=h<c->heads_per_ngram?2:3; int64_t row=q38_hash_row(m,h,ng,ids[s],p1,p2);
             q38_ple_row(m,row,emb+(int64_t)h*c->ngram_head_dim);
         }
@@ -1871,6 +1956,10 @@ static float *step(Model *m,const int *ids,int S,int pos_base) {
     Cfg *c=&m->c;int H=c->hidden,W=c->hc_width,C=c->hc_count;
     m->timers.forwards++;
     float *hyper=falloc((int64_t)S*W);
+    /* Le righe PLE partono ADESSO, non al layer 2 dove servono: sono note dagli
+     * id dei token soltanto, e i due layer che le precedono danno il tempo di
+     * farle arrivare dal disco. */
+    q38_ple_prefetch(m,ids,S);
     for(int s=0;s<S;s++){
         if(ids[s]<0||ids[s]>=c->vocab){fprintf(stderr,"token id %d outside vocabulary\n",ids[s]);exit(1);}
         float *e=hyper+(int64_t)s*W;
@@ -1884,7 +1973,11 @@ static float *step(Model *m,const int *ids,int S,int pos_base) {
     float *mixed=falloc((int64_t)S*H),*inject=falloc((int64_t)S*C),*block=falloc((int64_t)S*H);
     for(int i=0;i<c->layers;i++){
         Layer *l=&m->L[i];
-        if(i==c->ple_layer){float *ple=falloc((int64_t)S*W);q38_ple(m,ids,S,hyper,ple);for(int64_t z=0;z<(int64_t)S*W;z++)hyper[z]+=ple[z];free(ple);}
+        if(i==c->ple_layer){float *ple=falloc((int64_t)S*W);q38_ple(m,ids,S,hyper,ple);for(int64_t z=0;z<(int64_t)S*W;z++)hyper[z]+=ple[z];free(ple);
+            /* consumate: il chunk successivo ha altri token, e riusare queste
+             * righe darebbe gli embedding del chunk precedente combaciando in
+             * silenzio invece di dare errore. */
+            free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;}
         q38_gr_read(m,&l->attn_gr,hyper,S,mixed,inject);
         if(c->is_attn[i])q38_attention(m,l,i,mixed,S,pos_base,block);else q38_deltanet(m,l,i,mixed,S,block);
         q38_gr_apply(c,hyper,block,inject,S);

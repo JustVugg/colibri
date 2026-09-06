@@ -57,6 +57,7 @@
 #if defined(_WIN32) && (defined(__x86_64__) || defined(__i386__))
 #include <cpuid.h>                                /* hwinfo_emit: CPU brand string senza /proc */
 #endif
+#include "cli_args.h"
 #include "st.h"
 #ifdef __linux__
 #include "uring.h"
@@ -809,17 +810,44 @@ static double current_rss_gb(void) {
     return rss_gb();  /*Return peak memory usage if we can't measure current usage*/
   }
 
-  char line[256];
-  unsigned long long kb = 0;
+    char line[256];
+    unsigned long long kb = 0, anon_kb = 0, vmrss_kb = 0;
+    int have_anon = 0, have_vmrss = 0;
 
-  while (fgets(line, sizeof(line), f)) {
-    if (strncmp(line, "VmRSS:", 6) == 0) {
-      if (sscanf(line + 6, "%llu", &kb) == 1) {
-        fclose(f);
-        return (double)kb / (1024.0 * 1024.0);
+    /* RssAnon, non VmRSS: sono le pagine che il processo POSSIEDE davvero.
+     *
+     * VmRSS conta anche le pagine di file mappate, che il kernel recupera da
+     * solo quando serve memoria. Con COLI_MAP_EXPERTS=1 (#1325) gli esperti
+     * arrivano da una mappatura invece che da una copia, quindi VmRSS sale di
+     * gigabyte senza che un byte in piu' sia sottratto al sistema -- e
+     * rss_guard, che SFRATTA esperti quando la misura supera il budget, si
+     * metterebbe a sfrattare per liberare memoria che non stava occupando.
+     * Non un avviso cosmetico: cache distrutta e lavoro rifatto.
+     *
+     * Misurato su GLM-5.3 (391 GB di container, 25 GB di RAM): con la
+     * mappatura accesa il pianificatore riportava 18.2 GB e avvisava di uno
+     * sforamento di 0.8 GB che non esisteva.
+     *
+     * Senza mappatura RssAnon e VmRSS coincidono quasi esattamente, perche' la
+     * memoria degli esperti e' malloc'ata e quindi anonima: questo cambio NON
+     * altera il comportamento del percorso pread di oggi, ed e' la ragione per
+     * cui e' sicuro farlo PRIMA di accendere la mappatura.
+     *
+     * RssAnon esiste da Linux 4.5; se manca si torna a VmRSS, cioe' al
+     * comportamento precedente, che resta corretto quando nulla e' mappato. */
+    while (fgets(line, sizeof(line), f)) {
+      if (!have_anon && strncmp(line, "RssAnon:", 8) == 0) {
+        if (sscanf(line + 8, "%llu", &anon_kb) == 1) have_anon = 1;
+      } else if (!have_vmrss && strncmp(line, "VmRSS:", 6) == 0) {
+        if (sscanf(line + 6, "%llu", &vmrss_kb) == 1) have_vmrss = 1;
       }
+      if (have_anon && have_vmrss) break;
     }
-  }
+    if (have_anon || have_vmrss) {
+      kb = have_anon ? anon_kb : vmrss_kb;
+      fclose(f);
+      return (double)kb / (1024.0 * 1024.0);
+    }
 
   fclose(f);
   if(!announced_proc_failure) {
@@ -10861,10 +10889,10 @@ int main(int argc, char **argv){
     /* cap itself is resolved below, once g_metal_enabled and the SSD probe (both
      * needed for the platform default) are known -- see coli_resolve_cap(). */
     int cap_given = argc>1;
-    int cap_arg = cap_given?atoi(argv[1]):0;
+    int cap_arg = cap_given?coli_arg_int(argv[1],"cache/layer"):0;
     int cap_env = getenv("CAP")?atoi(getenv("CAP")):0;
-    int ebits= argc>2?atoi(argv[2]):8;
-    int dbits= argc>3?atoi(argv[3]):ebits;
+    int ebits= argc>2?coli_arg_int(argv[2],"expert bits"):8;
+    int dbits= argc>3?coli_arg_int(argv[3],"dense bits"):ebits;
 #if !defined(_WIN32)
     if(getenv("EXPERT_WORKER")){
         int port=getenv("CLUSTER_WORKER_PORT")?atoi(getenv("CLUSTER_WORKER_PORT")):9100;

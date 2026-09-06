@@ -1825,11 +1825,31 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     elif tool_choice == "none":
         tools = None                              # il client li ha vietati: non si offrono
 
-    # low e high passano, tutto il resto e' Max: e' la scala del template, non
-    # la nostra. `none` non arriva qui, spegne il ragionamento a monte.
+    prompt = ["[gMASK]<sop>"]
+    # La riga di effort esce SEMPRE, come nel template: `effective_reasoning_effort`
+    # ha un ramo else che vale 'max', quindi non e' mai none. GLM-5.3 non ha un modo
+    # "non ragionare" -- in questo template `enable_thinking` non esiste proprio, e
+    # il prompt di generazione APRE sempre <think>.
+    #
+    # Quindi enable_thinking=False qui non puo' voler dire "spegni": vuol dire "il
+    # minimo che il modello supporta", cioe' Low. Il ragionamento avviene comunque;
+    # a nasconderlo e' il gateway, non il prompt.
+    #
+    # La forma che questo sostituisce -- nessuna riga di effort e <think></think>
+    # chiuso -- non esiste nel template e il modello non l'ha mai vista: e' la causa
+    # di #1278. Meta' di quella deviazione l'ho aggiunta io in #1282, giustificandola
+    # con un meccanismo poi misurato falso e ritirato pubblicamente sulla issue.
+    # Reso il template con jinja2 accanto a questo renderer, l'unica forma che sa
+    # produrre e':
+    #     [gMASK]<sop><|system|>Reasoning Effort: {Low|High|Max}<|user|>..<|assistant|><think>
+    #
+    # low e high passano, tutto il resto e' Max: e' la scala del template, non la
+    # nostra. `none` non arriva qui, spegne il ragionamento a monte per le famiglie
+    # che possono davvero spegnerlo.
     effort = {"minimal": "Low", "low": "Low", "medium": "High",
-              "high": "High", "xhigh": "Max"}.get(reasoning_effort, "Max")
-    prompt = ["[gMASK]<sop>", f"<|system|>Reasoning Effort: {effort}"]
+              "high": "High", "xhigh": "Max"}.get(reasoning_effort,
+                                                  "Max" if enable_thinking else "Low")
+    prompt.append(f"<|system|>Reasoning Effort: {effort}")
     if tools:
         prompt.append(_glm53_tool_block(tools))
 
@@ -1859,17 +1879,13 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
         else:
             raise APIError(400, f"unsupported message role {role!r}.", "messages")
 
-    # Il prompt di generazione apre il blocco di ragionamento; con il
-    # ragionamento spento lo chiude subito.
-    #
-    # Il template ufficiale conosce solo la prima forma, perche' per lui il
-    # modello ragiona sempre. La seconda pero' non e' inventata: e' esattamente
-    # quello che il template scrive davanti a un turno passato che ragionamento
-    # non ne aveva (<think></think> seguito dal contenuto), quindi e' uno stato
-    # su cui il modello e' stato addestrato e non una posizione mai vista.
-    # Chi vuole il comportamento ufficiale non tocca niente: acceso e' il caso
-    # che combacia col template, ed e' quello che il test confronta.
-    prompt.append("<|assistant|><think>" if enable_thinking else "<|assistant|><think></think>")
+    # Il prompt di generazione apre il blocco, sempre, come il template:
+    #     {%- if add_generation_prompt -%}<|assistant|>{{- '<think>' -}}{%- endif -%}
+    # Il vecchio commento qui sosteneva che <think></think> chiuso fosse "uno stato
+    # su cui il modello e' addestrato" perche' il template lo scrive davanti a un
+    # TURNO PASSATO senza ragionamento. E' vero per un turno passato e falso per il
+    # prompt di generazione: la posizione da cui il modello scrive non e' mai quella.
+    prompt.append("<|assistant|><think>")
     return "".join(prompt)
 
 

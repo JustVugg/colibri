@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://discord.gg/MAaKtQRc"><b>Discord</b></a> ·
+  <a href="https://discord.gg/FkyrEeJR"><b>Discord</b></a> ·
   <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · Italiano
 </p>
 
@@ -12,8 +12,10 @@ miliardi a 2,8 mila miliardi di parametri** — su hardware consumer ed eterogen
 in C puro e senza dipendenze del motore, trattando storage, RAM e VRAM come
 un'unica gerarchia di inferenza.
 
-Oggi girano sei famiglie: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
-(2,8T), **DeepSeek V4 Flash** (284B), **Qwen3.6** (35B-A3B) e **OLMoE** (7B) — un
+Oggi girano otto famiglie: **GLM-5.2/5.3** (744B), **GLM-5.3-Flash** (321B, con
+vision), **Inkling** (975B), **Kimi K3** (2,8T), **DeepSeek V4 Flash** (284B),
+**Qwen3.8-Flash-Next** (125B + 51B n-gram), **Qwen3.6** (35B-A3B) e
+**OLMoE** (7B) — un
 file C ciascuna, la stessa interfaccia `coli chat` / `coli serve` / `coli web`. [Elenco completo](README.md#other-supported-models)
 
 > **Colibrì è un motore di inferenza che puoi usare oggi, e una piattaforma di
@@ -32,7 +34,7 @@ ma non ridefinire il modello di nascosto.
 
 ```
 $ ./coli chat
-  🐦 colibri v1.9.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.10.1 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -336,10 +338,10 @@ e per il gateway API opzionale.
   end-to-end, revisionati e sviluppati apertamente.
 - **Più modelli aperti.** L'algoritmo di tiering è indipendente dal modello:
   qualsiasi MoE con expert instradati può essere organizzato allo stesso modo.
-  Sette famiglie funzionano già (GLM-5.2, GLM-5.3-Flash con la vision,
-  Inkling, Kimi K3, DeepSeek V4 Flash, Qwen3.6, OLMoE); altre famiglie
-  open-weight, **MiniMax** tra le candidate, si guadagnano un engine come le
-  prime sette: quando qualcuno le misura end-to-end.
+  Otto famiglie funzionano già (GLM-5.2, GLM-5.3-Flash con la vision,
+  Inkling, Kimi K3, DeepSeek V4 Flash, Qwen3.8-Flash-Next, Qwen3.6, OLMoE);
+  altre famiglie open-weight, **MiniMax** tra le candidate, si guadagnano un
+  engine come le prime otto: quando qualcuno le misura end-to-end.
 
 ## Sostenere il progetto
 
@@ -350,7 +352,7 @@ Se ti è utile:
 - ⭐ metti una stella al repository e condividilo;
 - 🐛 apri issue con i numeri di benchmark del tuo hardware — i datapoint
   fanno avanzare questo progetto più di qualsiasi altra cosa;
-- 💬 entra nella [comunità Discord](https://discord.gg/MAaKtQRc) per discutere
+- 💬 entra nella [comunità Discord](https://discord.gg/FkyrEeJR) per discutere
   esperimenti, risultati hardware e direzioni di ricerca;
 - 💬 contattaci via GitHub issues per sponsorizzare lo sviluppo o donare hardware.
 

@@ -32,6 +32,63 @@ import numpy as np
 _positioned_write_lock = threading.Lock()
 
 
+# ---------- guardia di famiglia (#1304) ----------
+# Questo convertitore serve UNA famiglia: GLM-5.2. Ma `coli convert` accetta
+# qualunque --repo, e in una settimana due utenti gli hanno dato Qwen3.8:
+# i tensori BF16 che non riconosce come esperti GLM passano upcastati a f32,
+# ogni shard raddoppia, e #1304 si e' fermato a 424 GB scritti su 360 di
+# sorgente. Il controllo del model_type costa 5 KB di config.json e va fatto
+# PRIMA del primo shard, non dopo il disco pieno.
+#
+# I due insiemi qui sotto sono copie di family_registry.py, e una copia che
+# diverge e' esattamente il difetto che questa guardia cura: il test
+# tests/test_convert_guard.py li confronta col registry e fallisce alla prima
+# famiglia aggiunta o rinominata.
+GLM52_MODEL_TYPES = {"glm_moe_dsa", "glm5_moe", "glm"}
+OTHER_FAMILY_PATHS = {
+    "glm5_next":       "GLM-5.3-Flash: use tools/convert_glm53.py",
+    "glm5_next_text":  "GLM-5.3-Flash: use tools/convert_glm53.py",
+    "qwen4_exp":       "Qwen3.8-Flash-Next is NOT converted: download the official "
+                       "FP8 checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) and run it "
+                       "directly; see docs/qwen38.md and issue #1304",
+    "qwen4_exp_text":  "Qwen3.8-Flash-Next is NOT converted: download the official "
+                       "FP8 checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) and run it "
+                       "directly; see docs/qwen38.md and issue #1304",
+    "qwen3_5_moe":     "Qwen3.6: use tools/convert_qwen36.py",
+    "qwen3_5_moe_text":"Qwen3.6: use tools/convert_qwen36.py",
+    "inkling_mm_model":"Inkling: use tools/convert_inkling_int4.py",
+    "inkling":         "Inkling: use tools/convert_inkling_int4.py",
+    "olmoe":           "OLMoE: use tools/convert_olmoe.py",
+    "kimi_k3":         "Kimi K3: see docs/kimi_k3.md for its container pipeline",
+    "kimi_linear":     "Kimi K3: see docs/kimi_k3.md for its container pipeline",
+    "deepseek_v4":     "DeepSeek V4: see docs/deepseek-v4.md, section Download",
+}
+
+
+def check_model_family(config, where):
+    """Ferma il convertitore su un checkpoint che non e' GLM-5.2.
+
+    `config` e' il config.json del checkpoint gia' parsato; `where` dice al
+    messaggio da dove viene (un path o un repo id). Ritorna in silenzio per
+    GLM-5.2; esce con indicazione per-famiglia per tutto il resto.
+    """
+    model_type = config.get("model_type")
+    if not isinstance(model_type, str) or not model_type:
+        raise SystemExit(f"ERROR: {where}: config.json has no usable model_type; "
+                         "refusing to guess. This converter is for GLM-5.2 only.")
+    if model_type in GLM52_MODEL_TYPES:
+        return
+    hint = OTHER_FAMILY_PATHS.get(model_type)
+    if hint:
+        raise SystemExit(f"ERROR: {where} is '{model_type}', not GLM-5.2.\n"
+                         f"  This converter would silently upcast most of its "
+                         f"tensors and roughly double the size (#1304).\n  {hint}")
+    raise SystemExit(f"ERROR: {where} is '{model_type}', which this converter does "
+                     f"not know. It converts GLM-5.2 only; other families have "
+                     f"their own tools under c/tools/, and Qwen3.8 needs none.")
+
+
+
 def _save_file_atomic(save_file, tensors, destination, **kwargs):
     destination = os.fspath(destination)
     temporary = destination + ".tmp"
@@ -636,6 +693,11 @@ def main():
 
     os.makedirs(a.outdir, exist_ok=True)
     if a.indir:    # conversione locale (test)
+        cfg_path = os.path.join(a.indir, "config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path) as fh:
+                check_model_family(json.load(fh), a.indir)
+        # niente config.json: fixture sintetiche (glm_tiny) -- si procede come sempre
         shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
         from safetensors.numpy import save_file
         # #383: se l'indice c'e', i passaggi --mtp/--indexer convertono SOLO gli shard
@@ -784,6 +846,19 @@ def main():
     # EN: force the classic HTTP path, which curl proved works (measured 2026-07-02).
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")   # =0 per riabilitare xet / to re-enable xet
     from huggingface_hub import HfApi, hf_hub_download
+
+    # La guardia va qui: config.json pesa 5 KB e decide se i prossimi 300 GB
+    # hanno senso. Se il repo non ha config.json si procede con un avviso, per
+    # non rompere mirror atipici: il fallimento utile e' sul model_type
+    # sbagliato, non sulla rete.
+    try:
+        with open(hf_hub_download(a.repo, "config.json")) as fh:
+            check_model_family(json.load(fh), a.repo)
+    except SystemExit:
+        raise
+    except Exception as problem:
+        print(f"WARNING: could not read {a.repo}/config.json ({problem}); "
+              "proceeding without the family check.")
 
     # lock anti-doppione: DUE convertitori sulla stessa outdir si corrompono a vicenda.
     # EN: anti-duplicate lock: TWO converters on the same outdir corrupt each other.

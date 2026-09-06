@@ -1,5 +1,6 @@
 import json
 import re
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -26,6 +27,16 @@ from family_registry import (
     resolve_model,
     tuning_replay_prompt,
 )
+
+
+def _readmes(repo):
+    """Ogni README del repo, trovato e non elencato.
+
+    Una lista scritta a mano qui avrebbe lo stesso difetto che questi test
+    esistono per prendere: chi aggiunge README.fr.md non tocca il test, il
+    test continua a passare, e il lettore francese non trova il modello.
+    """
+    return sorted(repo.glob("README*.md"))
 
 
 def qwen_geometry(config, context, _model_dir):
@@ -1101,6 +1112,239 @@ class FamilyRegistryTest(unittest.TestCase):
                 f"{family.id}: registry says tools={family.capabilities.tools} but the "
                 f"renderer {'refuses' if refused else 'accepts'} them")
 
+    def test_a_reasoning_family_gets_more_room_than_a_single_answer(self):
+        """Chi ragiona deve avere un budget interattivo piu' largo del default.
+
+        Il tetto sui token e' una rete di sicurezza: la fine vera la decidono
+        gli stop token. Ma su un modello che riflette prima di rispondere, un
+        tetto stretto non ti prende DOPO la risposta, ti prende DENTRO al
+        pensiero, e il turno finisce senza che l'utente veda niente (#1278).
+
+        glm53, inkling e kimi erano rimaste all'interattivo uguale al default,
+        mentre ogni altra famiglia che ragiona lo aveva gia' alzato. Nessuno se
+        n'e' accorto perche' il registro accetta qualsiasi valore >= 1: questo
+        controllo esiste perche' la prossima non passi allo stesso modo.
+        """
+        for family in FAMILIES:
+            if not family.capabilities.thinking:
+                continue          # senza ragionamento il default e' la risposta intera
+            self.assertGreater(
+                family.limits.interactive_max_output, family.limits.default_max_output,
+                f"{family.id}: reasons, but its interactive budget "
+                f"({family.limits.interactive_max_output}) is no larger than the "
+                f"non-interactive default ({family.limits.default_max_output}) -- "
+                f"reasoning can consume it before the answer starts")
+
+    def test_every_readme_names_every_family(self):
+        """Ogni README, tradotto compreso, deve nominare ogni famiglia.
+
+        E' la terza volta oggi che un conteggio ripetuto in due posti diverge:
+        release.yml costruiva sei motori e ne copiava sette, i contatori degli
+        adapter dicevano 7 con 8 famiglie registrate, e i README dichiaravano
+        sei, sette e otto famiglie contemporaneamente -- l'inglese si
+        contraddiceva da solo fra riga 21 e riga 586.
+
+        Il nome della famiglia e' il controllo giusto, non il numerale: sono
+        quattro lingue e il numerale si scrive in quattro modi, mentre
+        `Qwen3.8-Flash-Next` si scrive uguale ovunque. Chi aggiunge una famiglia
+        e dimentica le traduzioni lo scopre qui invece che da un utente che
+        legge la sua lingua e non trova il modello.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        for path in _readmes(repo):
+            name = path.name
+            text = path.read_text(encoding="utf-8")
+            for family in FAMILIES:
+                # Il nome senza il suffisso di taglia: i README scrivono
+                # "**Qwen3.6** (35B-A3B)", non "Qwen3.6-35B-A3B", perche' la
+                # dimensione sta fra parentesi. Cercare il display_name intero
+                # fallirebbe su una differenza di formattazione invece che su
+                # una famiglia mancante, che e' quello che qui interessa.
+                parts = []
+                for piece in family.display_name.split("-"):
+                    if re.fullmatch(r"A?\d+(\.\d+)?B", piece):
+                        break
+                    parts.append(piece)
+                token = "-".join(parts) or family.display_name
+                # assertTrue e non assertIn: assertIn stampa il README intero
+                # nel messaggio di errore, e mille righe di markdown nascondono
+                # la riga che dice cosa manca.
+                self.assertTrue(token in text,
+                                f"{name}: does not mention {family.display_name} "
+                                f"({family.id}); a reader in that language cannot "
+                                f"tell the family is supported")
+
+    def test_release_ships_everything_coli_reaches(self):
+        """L'archivio deve contenere ogni file Python che coli raggiunge.
+
+        #1296: il pacchetto v1.10.0 aveva quattro comandi rotti. release.yml
+        copiava sette .py scelti a mano piu' un solo file in tools/, e il
+        codice era andato avanti. Mancavano convert_fp8_to_int4.py,
+        eval_glm.py, fetch_benchmarks.py, mirror_plan.py, e i moduli cluster,
+        glm53_image, qwen38_image.
+
+        Ora la lista la calcola c/tools/pack_python.py. Questo test fissa i
+        due punti ciechi che avevano fatto passare il difetto, perche' sono i
+        due modi in cui un file sfugge a chi guarda a occhio:
+
+        - un import dentro una funzione, dopo un sys.path.insert. E' il caso
+          di qwen38_image in openai_server.py, e l'ImportError li' e'
+          catturato e riscritto come "image support needs Pillow and numpy":
+          nel pacchetto pubblicato mandare un'immagine dava la colpa
+          all'ambiente dell'utente per un file che non avevamo spedito.
+        - un sottoprocesso scritto con lo spazio dopo la virgola,
+          os.path.join(TOOLS, "mirror_plan.py"). La mia prima grep cercava
+          TOOLS," senza spazio e non lo vedeva: quattro invocazioni, non tre.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        sys.path.insert(0, str(repo / "c" / "tools"))
+        try:
+            import pack_python
+        finally:
+            sys.path.pop(0)
+
+        reached = {path.name for path in pack_python.needed(repo / "c")}
+
+        # I sette file che mancavano davvero dall'archivio v1.10.0.
+        for name in ("convert_fp8_to_int4.py", "eval_glm.py",
+                     "fetch_benchmarks.py", "mirror_plan.py",
+                     "cluster.py", "glm53_image.py", "qwen38_image.py"):
+            self.assertIn(name, reached,
+                          f"{name} mancava dall'archivio v1.10.0 e il calcolo "
+                          f"non lo ritrova: #1296 si ripeterebbe")
+
+        release = (repo / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8")
+        self.assertIn("pack_python.py c dist", release,
+                      "release.yml non calcola piu' i file da copiare")
+        self.assertIn("--check", release,
+                      "release.yml non verifica piu' l'archivio estratto")
+
+    def test_the_python_job_builds_every_engine_a_test_skips_without(self):
+        """Un test protetto da skipUnless(ENGINE.exists()) sparisce se il job
+        non compila quel motore, e sparisce in silenzio: la classe si salta,
+        il job resta verde, e nessuno distingue "passato" da "mai eseguito".
+
+        E' successo davvero. Il job Python non compilava nessun motore, quindi
+        sette test fra test_kimi_usage_cli e test_inkling_prefix_serve non
+        giravano da sempre, e uno era rosso da quando il messaggio di kimi_k3
+        e' stato riscritto. E' la stessa forma del job dei sanitizer che
+        rieseguiva un binario senza strumentazione: verde perche' vuoto.
+
+        Il controllo va nella direzione che serve. Non chiede che il job
+        compili una certa lista, che sarebbe un'altra costante da tenere
+        allineata a mano: parte dai test, guarda su quale binario si saltano,
+        e pretende che il job lo costruisca.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        tests_dir = repo / "c" / "tests"
+        guard = re.compile(r'ENGINE\s*=\s*HERE\s*/\s*\(?\s*"([a-z0-9_]+)\.exe"'
+                           r'.*?else\s*"([a-z0-9_]+)"', re.S)
+        needed = {}
+        for path in sorted(tests_dir.glob("test_*.py")):
+            text = path.read_text(encoding="utf-8")
+            if "skipUnless" not in text or "ENGINE.exists()" not in text:
+                continue
+            m = guard.search(text)
+            if m:
+                needed[m.group(2)] = path.name
+        self.assertTrue(needed,
+                        "nessun test guardato da ENGINE.exists() trovato: il "
+                        "controllo non sta piu' guardando niente")
+        ci = (repo / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        # Il corpo del job va da "  python:" fino al job successivo, cioe' la
+        # prossima riga indentata di due spazi esatti. Tagliare al primo "\n  "
+        # non funziona: le righe interne sono indentate di quattro e cominciano
+        # anch'esse per due spazi, quindi il corpo verrebbe vuoto e il test
+        # fallirebbe sempre, per la ragione sbagliata.
+        job = re.search(r"(?m)^  python:\n(.*?)(?=^  \S|\Z)", ci, re.S)
+        self.assertIsNotNone(job, "il job 'python:' non esiste piu' in ci.yml")
+        body = job.group(1)
+        # I bersagli veri di make, non il corpo del job: un commento che nomina
+        # "test_inkling_prefix_serve.py" contiene la parola "inkling" e farebbe
+        # passare il controllo senza che nulla venga compilato. Il controllo
+        # negativo di questo test lo ha dimostrato togliendo inkling dalla
+        # riga di build: passava lo stesso.
+        built = set()
+        for run_line in re.findall(r"(?m)^\s*run:\s*(.+)$", body):
+            m = re.search(r"\bmake\b(?:\s+-C\s+\S+)?\s+(.*)", run_line)
+            if m:
+                built.update(tok for tok in m.group(1).split() if not tok.startswith("-"))
+        for engine, where in sorted(needed.items()):
+            self.assertIn(engine, built,
+                          f"{where} si salta se '{engine}' non e' compilato, e il "
+                          f"job Python della CI non lo compila: quei test non "
+                          f"girano mai e il job resta verde perche' e' vuoto")
+
+    def test_every_readme_banner_matches_the_declared_version(self):
+        """Il banner dei README deve dire la versione che dichiara version.py.
+
+        Il numero vive in cinque posti e finora niente li legava. Il modo in
+        cui questo sbaglia non e' rumoroso: si aggiornano quattro file su
+        cinque, la release esce, e il banner del quinto annuncia la versione
+        precedente a chiunque legga quella lingua. E' la stessa forma che ha
+        fatto uscire la v1.9.0 senza archivi -- una costante, piu' consumatori,
+        nessun controllo -- solo su un file diverso.
+
+        Qui il confronto e' con version.py e non fra i README fra loro: se
+        divergessero tutti insieme dal codice, un test di sola coerenza
+        reciproca li troverebbe d'accordo e non direbbe niente.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        declared = re.search(r'__version__\s*=\s*"([^"]+)"',
+                             (repo / "c" / "version.py").read_text(encoding="utf-8"))
+        self.assertIsNotNone(declared, "c/version.py: __version__ non trovato")
+        version = declared.group(1)
+        seen = 0
+        for path in _readmes(repo):
+            for banner in re.findall(r"colibri v(\d+\.\d+\.\d+)",
+                                     path.read_text(encoding="utf-8")):
+                seen += 1
+                self.assertEqual(
+                    banner, version,
+                    f"{path.name}: il banner dice v{banner} ma version.py "
+                    f"dichiara {version}; la release annuncerebbe due numeri "
+                    f"diversi a seconda della lingua che il lettore apre")
+        # Se un giorno il banner cambia forma questo test smetterebbe di
+        # guardare qualcosa senza mai fallire: meglio che lo dica.
+        self.assertGreater(seen, 0,
+                           "nessun banner 'colibri vX.Y.Z' trovato in alcun "
+                           "README: il test non sta piu' controllando niente")
+
+    def test_the_site_shows_the_version_and_every_family(self):
+        """site/index.html deve dire la versione vera e nominare ogni famiglia.
+
+        Trovato fermo a "Currently shipping v1.7.0" con sei famiglie su otto:
+        quattro release e due modelli indietro. E' la sesta copia del numero di
+        versione e la quinta lista di famiglie, e ne' il contratto dei banner
+        (#1288) ne' quello dei README (#1287) la guardavano. Il sito e' la
+        prima cosa che un visitatore vede e l'ultima che ci si ricorda di
+        aggiornare: esattamente il posto per un contratto.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        site = (repo / "site" / "index.html").read_text(encoding="utf-8")
+        declared = re.search(r'__version__\s*=\s*"([^"]+)"',
+                             (repo / "c" / "version.py").read_text(encoding="utf-8"))
+        shown = re.search(r"Currently shipping <b>v([\d.]+)</b>", site)
+        self.assertIsNotNone(shown,
+                             "site/index.html: la riga 'Currently shipping' non "
+                             "c'e' piu'; il contratto non sta controllando niente")
+        self.assertEqual(shown.group(1), declared.group(1),
+                         f"il sito dice v{shown.group(1)} ma version.py dichiara "
+                         f"{declared.group(1)}: il visitatore legge una versione "
+                         f"vecchia")
+        for family in FAMILIES:
+            parts = []
+            for piece in family.display_name.split("-"):
+                if re.fullmatch(r"A?\d+(\.\d+)?B", piece):
+                    break
+                parts.append(piece)
+            token = "-".join(parts) or family.display_name
+            self.assertTrue(token in site,
+                            f"site/index.html non nomina {family.display_name} "
+                            f"({family.id}): il sito mostra meno famiglie di "
+                            f"quante ne girano")
+
     def test_build_install_ci_and_release_cover_registered_engines(self):
         repo = Path(__file__).resolve().parents[2]
         makefile = (repo / "c" / "Makefile").read_text(encoding="utf-8")
@@ -1155,8 +1399,75 @@ class FamilyRegistryTest(unittest.TestCase):
                 else:
                     self.assertIn("deepseek-v4", ci)
                     self.assertIn("cp c/deepseek_v4", release)
-        for text in (makefile, release, docker):
+        for text in (makefile, docker):
             self.assertIn("family_registry.py", text)
+        # release.yml non nomina piu' i singoli .py: da #1296 la lista la
+        # calcola pack_python.py seguendo gli import a partire da coli. Il
+        # contratto qui e' sempre lo stesso -- family_registry.py deve finire
+        # nell'archivio -- ma va verificato alla fonte nuova, se no si
+        # controlla che esista una riga invece che il file venga spedito.
+        sys.path.insert(0, str(repo / "c" / "tools"))
+        try:
+            import pack_python
+        finally:
+            sys.path.pop(0)
+        shipped = {path.name for path in pack_python.needed(repo / "c")}
+        self.assertIn("family_registry.py", shipped,
+                      "l'archivio non spedirebbe family_registry.py")
+
+
+class GlmFamilyNamesBothModelsTest(unittest.TestCase):
+    """#1365 follow-up: a GLM-5.3 container was announced as "GLM-5.2 744B".
+
+    The engine loaded the right weights; only the banner named a different
+    model. The fix is the name, and the reason the name covers two models
+    rather than choosing between them is worth pinning here, because the
+    obvious "improvement" later is to add detection.
+
+    There is nothing to detect. Z.ai say so on GLM-5.3's own card -- "GLM-5.3
+    uses the same base model as GLM-5.2; every gain comes from post-training"
+    -- and the checkpoints agree: diffing the two real config.json leaves one
+    extra key and the transformers_version that wrote the file. If a release
+    ever ships a genuine discriminator, split the family then, on evidence,
+    and this test is where to record it.
+    """
+
+    #: The two configs, reduced to what the registry reads plus the only two
+    #: keys that actually differ between the real files.
+    BASE = {
+        "model_type": "glm_moe_dsa",
+        "num_hidden_layers": 78,
+        "n_routed_experts": 256,
+        "hidden_size": 6144,
+        "moe_intermediate_size": 2048,
+    }
+
+    def test_both_checkpoints_resolve_to_the_same_family(self):
+        v52 = dict(self.BASE, transformers_version="5.12.0")
+        v53 = dict(self.BASE, transformers_version="5.15.0",
+                   moe_router_dtype="float32")
+        self.assertEqual(family_for_config(v52).id, family_for_config(v53).id)
+        self.assertEqual(family_for_config(v53).engine_artifact, "colibri")
+
+    def test_the_only_differences_are_not_discriminators(self):
+        """Neither key can carry the decision, so neither may be read as if it
+        could. `transformers_version` records the library that wrote the file
+        and changes when anyone re-exports; `moe_router_dtype` is a precision
+        hint that a re-export of GLM-5.2 could equally carry."""
+        source = Path(__file__).resolve().parents[1] / "family_registry.py"
+        text = source.read_text(encoding="utf-8")
+        for key in ("transformers_version", "moe_router_dtype"):
+            self.assertNotIn(f'"{key}"', text,
+                             f"{key} is not a version discriminator; naming a "
+                             f"checkpoint from it would be a guess wearing a "
+                             f"rule's clothes")
+
+    def test_the_name_states_both_models(self):
+        family = family_for_config(dict(self.BASE))
+        for model in ("5.2", "5.3"):
+            self.assertIn(model, family.display_name,
+                          "a user running one of the two must not read the "
+                          "name of the other")
 
 
 if __name__ == "__main__":

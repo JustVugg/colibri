@@ -65,6 +65,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 
+#include "cli_args.h"
 #include "json.h"
 #include "st.h"
 #include "quant.h"
@@ -1144,7 +1145,9 @@ typedef struct ERef {
     int contig;                           /* i sei pezzi sono consecutivi in un file */
 } ERef;
 
-typedef struct { int eid; uint8_t *base; uint64_t used; } Slot;
+/* I sei pezzi non sono adiacenti nel file, ma non devono esserlo nemmeno in
+ * memoria: expert_mats ci costruisce sopra solo tre viste in sola lettura. */
+typedef struct { int eid; uint8_t *piece[GLM53_EXPERT_PIECES]; uint8_t *own; uint64_t used; } Slot;
 typedef struct LCache { Slot *s; int n, cap; } LCache;
 
 /* Lunghezze e posizioni dei sei pezzi dentro allo slot. Gate e up sono
@@ -1279,15 +1282,25 @@ static Slot *slot_find(GModel *m, int layer, int eid) {
 
 static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
     const ERef *ref = &m->eref[(size_t)layer * m->c.n_experts + eid];
-    if (!slot->base) {
-        slot->base = malloc((size_t)m->e_slot);
-        if (!slot->base) { fprintf(stderr, "OOM su uno slot esperto\n"); exit(1); }
+    int mapped_ok = 1;
+    for (int p = 0; p < GLM53_EXPERT_PIECES && mapped_ok; p++) {
+        const void *pr = st_map_shard_range(ref->fd[p], ref->off[p], m->e_len[p]);
+        if (!pr) { mapped_ok = 0; break; }
+        slot->piece[p] = (uint8_t *)pr;
     }
+    if (mapped_ok) { slot->eid = eid; return; }
+    /* Fallback: si torna a scrivere in memoria NOSTRA, non in una mappatura
+     * di sola lettura che questo slot poteva star usando prima. */
+    if (!slot->own) {
+        slot->own = malloc((size_t)m->e_slot);
+        if (!slot->own) { fprintf(stderr, "OOM su uno slot esperto\n"); exit(1); }
+    }
+    for (int p = 0; p < GLM53_EXPERT_PIECES; p++) slot->piece[p] = slot->own + m->e_at[p];
     if (ref->contig) {
-        st_pread_full(ref->fd[0], slot->base, m->e_slot, ref->off[0], "expert");
+        st_pread_full(ref->fd[0], slot->own, m->e_slot, ref->off[0], "expert");
     } else {
         for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
-            st_pread_full(ref->fd[p], slot->base + m->e_at[p], m->e_len[p],
+            st_pread_full(ref->fd[p], slot->own + m->e_at[p], m->e_len[p],
                           ref->off[p], "expert piece");
     }
     slot->eid = eid;
@@ -1326,11 +1339,11 @@ static Slot *expert_slot(GModel *m, int layer, int eid) {
 static void expert_mats(const GModel *m, const Slot *slot, Mat *gate, Mat *up, Mat *down) {
     const int hidden = m->c.hidden, inter = m->c.moe_inter;
     const Mat shape[3] = {
-        { 4, NULL, NULL, slot->base + m->e_at[0], (const float *)(slot->base + m->e_at[1]),
+        { 4, NULL, NULL, slot->piece[0], (const float *)slot->piece[1],
           inter, hidden, 64 },
-        { 4, NULL, NULL, slot->base + m->e_at[2], (const float *)(slot->base + m->e_at[3]),
+        { 4, NULL, NULL, slot->piece[2], (const float *)slot->piece[3],
           inter, hidden, 64 },
-        { 4, NULL, NULL, slot->base + m->e_at[4], (const float *)(slot->base + m->e_at[5]),
+        { 4, NULL, NULL, slot->piece[4], (const float *)slot->piece[5],
           hidden, inter, 64 },
     };
     *gate = shape[0]; *up = shape[1]; *down = shape[2];
@@ -1924,7 +1937,7 @@ static void model_release(GModel *m) {
     if (m->ecache) {
         for (int i = 0; i < m->c.n_layers; i++) {
             LCache *cache = &m->ecache[i];
-            for (int j = 0; j < cache->cap; j++) free(cache->s[j].base);
+            for (int j = 0; j < cache->cap; j++) free(cache->s[j].own);
             free(cache->s);
         }
         free(m->ecache);
@@ -2578,7 +2591,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) dir = argv[++i];
         else if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids = argv[++i];
-        else if (!strcmp(argv[i], "--greedy") && i + 1 < argc) greedy = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--greedy") && i + 1 < argc) greedy = coli_arg_int(argv[++i], "--greedy");
         else if (!strcmp(argv[i], "--logits")) show_logits = 1;
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
         else if (!strcmp(argv[i], "--patches") && i + 1 < argc) patch_file = argv[++i];
@@ -2588,10 +2601,10 @@ int main(int argc, char **argv) {
             /* Capienza posizionale: e' cosi' che il gateway lancia ogni motore
              * (openai_server.py, Engine.__init__). Zero vuol dire "decidila
              * tu", che qui e' il budget misurato dalla RAM disponibile. */
-            const int cap = atoi(argv[i]);
+            const int cap = coli_arg_int(argv[i], "cache/layer");
             if (cap > 0) g_cap_override = cap;
         }
-        else { fprintf(stderr, "argomento sconosciuto: %s\n", argv[i]); return 2; }
+        else { fprintf(stderr, "unknown argument: %s\n", argv[i]); return 2; }
     }
     /* SERVE=1 e SNAP=<dir>: il motore non e' piu' una CLI ma il capo di una
      * pipa, e il modello arriva dall'ambiente perche' e' cosi' che lo lancia
