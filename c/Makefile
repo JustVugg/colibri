@@ -845,16 +845,16 @@ cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def $(DEEPGEMM_S
 dsv4-cuda-loader-test: tests/test_dsv4_decode_cuda.c backend_loader_dsv4.c backend_cuda_dsv4.h
 	$(CC) $(CFLAGS) tests/test_dsv4_decode_cuda.c backend_loader_dsv4.c -o dsv4_decode_loader_test$(EXE)
 	./dsv4_decode_loader_test$(EXE)
-backend_metal.o: backend_metal.mm backend_metal.h
+backend_metal.o: backend_metal.mm backend_metal.h affine_quant.h
 	$(METALXX) -c backend_metal.mm -o $@
 
-metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h
+metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h affine_quant.h
 	$(METALXX) tests/test_backend_metal.mm backend_metal.mm -framework Metal -framework Foundation -o backend_metal_test
 	./backend_metal_test
 
 # Standalone large-batch GEMM correctness sweep — reproduces the long-context prefill
 # corruption in seconds (no model). OMP-parallel CPU reference.
-gemm-test: tests/test_gemm_largebatch.mm backend_metal.mm backend_metal.h
+gemm-test: tests/test_gemm_largebatch.mm backend_metal.mm backend_metal.h affine_quant.h
 	$(METALXX) $(OMPC) tests/test_gemm_largebatch.mm backend_metal.mm $(OMPL) -framework Metal -framework Foundation -o gemm_largebatch_test
 	./gemm_largebatch_test
 
@@ -1129,6 +1129,9 @@ portable:
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
 
+qpack-inspect$(EXE): qpack_inspect.c qpack.c qpack.h affine_quant.h json.h compat.h
+	$(CC) $(CFLAGS) qpack_inspect.c qpack.c -o qpack-inspect$(EXE) $(LDFLAGS)
+
 tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c compat.h serve_codec.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -1390,6 +1393,14 @@ tests/test_expert_store_ops$(EXE): tests/test_expert_store_ops.c expert_store.h 
 
 tests/test_native_quant$(EXE): tests/test_native_quant.c deepseek_v4.c native_quant.h tensor.h quant.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT deepseek_v4.c $< -o $@ $(LDFLAGS)
+
+# Portable MLX affine Q4/Q8 format contract and CPU oracle.  This stays
+# separate from QT fmt=4, whose signed-int4 scale-only layout is incompatible.
+tests/test_affine_quant$(EXE): tests/test_affine_quant.c affine_quant.h backend_metal.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_qpack$(EXE): tests/test_qpack.c qpack.c qpack.h affine_quant.h json.h compat.h
+	$(CC) $(CFLAGS) tests/test_qpack.c qpack.c -o $@ $(LDFLAGS)
 
 tests/test_edge_runtime$(EXE): tests/test_edge_runtime.c edge_runtime.c edge_runtime.h
 	$(CC) $(CFLAGS) tests/test_edge_runtime.c edge_runtime.c -o $@ $(LDFLAGS)
