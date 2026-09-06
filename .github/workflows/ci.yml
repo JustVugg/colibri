@@ -6,6 +6,11 @@ on:
   push:
     branches: [dev, main]
 
+# CI only reads the tree; no job here writes to the repo. Pin the token to
+# read-only so a compromised step (or action) cannot push, tag or release.
+permissions:
+  contents: read
+
 jobs:
   engine:
     name: Engine (Linux, CPU)
@@ -55,7 +60,7 @@ jobs:
       - name: Lint both Dockerfiles
         # docker/Dockerfile is not built here (see above) but it is still shipped
         # and followed by users, so it gets checked for syntax at least.
-        uses: hadolint/hadolint-action@v3.1.0
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
         with:
           dockerfile: docker/Dockerfile
           failure-threshold: error
@@ -170,7 +175,7 @@ jobs:
       - uses: actions/checkout@v4
       - if: matrix.os == 'windows-latest'
         id: msys2
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: UCRT64
           update: false
@@ -310,7 +315,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install CUDA toolkit (compiler only)
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@4bd727d5619dc6fa323b1e76c3aa5dca94f5ec6d # v0.2.19
         with:
           # v0.2.19's version table stops at 12.6.2 — 12.6.3 fails the install
           # step with "Version not available" before nvcc is ever reached.
@@ -679,9 +684,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: MSVC environment (puts cl.exe on PATH for nvcc -ccbin)
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
       - name: Install CUDA toolkit (compiler only)
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@4bd727d5619dc6fa323b1e76c3aa5dca94f5ec6d # v0.2.19
         with:
           # Same pin as engine-cuda-syntax: v0.2.19's version table stops at
           # 12.6.2. This installs to the default "C:\Program Files\NVIDIA GPU
@@ -694,7 +699,7 @@ jobs:
           # runtime headers/import lib ship as a separate installer component —
           # with '["nvcc"]' alone this fails at `#include <cuda_runtime.h>`.
           sub-packages: '["nvcc", "cudart"]'
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: UCRT64
           update: false

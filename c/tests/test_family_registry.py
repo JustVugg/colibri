@@ -119,6 +119,10 @@ class FamilyRegistryTest(unittest.TestCase):
                 json.dumps(public_metadata(family))
                 self.assertIn(family.id, by_id)
 
+    def test_glm53_exposes_engine_kv_slot_limit(self):
+        by_id, _ = _build_registry(FAMILIES)
+        self.assertEqual(by_id["glm53"].limits.max_kv_slots, 16)
+
     def test_unknown_or_invalid_config_never_falls_back_to_glm(self):
         with self.assertRaises(UnknownFamilyError):
             family_for_config({"model_type": "qwen3_moe"})

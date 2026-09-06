@@ -1597,7 +1597,16 @@ GLM53_IMAGE_OPEN, GLM53_IMAGE, GLM53_IMAGE_CLOSE = (
 
 
 def _image_bytes_from_url(url):
-    """data: URI, file:// o percorso sul disco -> i byte dell'immagine."""
+    """data: URI, file:// o percorso sul disco -> i byte dell'immagine.
+
+    A local path is read with the server process's own permissions. On a
+    server that binds beyond loopback (which already requires an API key),
+    an authenticated client could otherwise read any file the process can
+    reach -- e.g. "file:///etc/passwd". Two guards without breaking the
+    documented loopback single-user case: '..' is refused outright (never
+    needed for a real image path), and if COLI_IMAGE_ROOT is set the resolved
+    path must stay inside it, mirroring serve_static's relative_to() check.
+    Errors stay generic so the reply never confirms a path or its permissions."""
     if not isinstance(url, str) or not url:
         raise APIError(400, "image_url.url must be a non-empty string.", "messages")
     if url.startswith("data:"):
@@ -1615,12 +1624,21 @@ def _image_bytes_from_url(url):
         raise APIError(400, "remote image URLs are not fetched; send the image "
                             "as a base64 data: URI or a path on this machine.",
                        "messages")
-    path = url[7:] if url.startswith("file://") else url
+    raw = url[7:] if url.startswith("file://") else url
+    if ".." in Path(raw).parts:
+        raise APIError(400, "image path is not allowed.", "messages")
     try:
-        with open(path, "rb") as handle:
+        target = Path(raw).resolve()
+        image_root = os.environ.get("COLI_IMAGE_ROOT")
+        if image_root:
+            target.relative_to(Path(image_root).resolve())
+    except (ValueError, OSError):
+        raise APIError(400, "image path is not allowed.", "messages")
+    try:
+        with open(target, "rb") as handle:
             return handle.read()
-    except OSError as problem:
-        raise APIError(400, f"cannot read image {path}: {problem}", "messages")
+    except OSError:
+        raise APIError(400, "cannot read the requested image.", "messages")
 
 
 # Qwen3.8 splices images as <|vision_start|> + N x <|image_pad|> + <|vision_end|>,

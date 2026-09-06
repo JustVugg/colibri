@@ -947,7 +947,7 @@ FAMILIES = (
         # e' una ghigliottina che cade DENTRO al blocco di pensiero e chiude il
         # turno senza risposta (#1278). 16384 e' il valore che hanno gia' tutte
         # le famiglie con lo stesso contesto massimo di 1048576.
-        limits=FamilyLimits(8192, 1048576, 1024, 16384, 1, 0, "GLM53_MAXT"),
+        limits=FamilyLimits(8192, 1048576, 1024, 16384, 16, 0, "GLM53_MAXT"),
         # tools=True: this family DOES render and parse tool calls. It used to
         # share COMMON_CAP, which says otherwise -- the flag is descriptive
         # (it only feeds the capability dict) so nothing broke, but a client
