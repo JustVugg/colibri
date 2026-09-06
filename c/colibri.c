@@ -1285,6 +1285,13 @@ static int g_expert_budget=0; /* EXPERT_BUDGET=N -> cap distinct experts loaded 
                                * (arXiv 2602.16052): top-32 of 64 capture 93% routing weight. */
 static int64_t g_budget_dropped=0; /* total experts dropped by EXPERT_BUDGET across all layers */
 static int64_t g_budget_rescued=0; /* experts re-kept because a position would have been left with zero */
+static int   g_degrade_zero=0;   /* DEGRADE_ZERO=1: zero-fill miss slots whose per-position gate weight
+                                   * is below DEGRADE_TAU instead of blocking on a demand-load.
+                                   * Opt-in only; changes output. Decode-only (S<=4 guard in moe()). */
+static float g_degrade_tau=0.03f; /* DEGRADE_TAU=<f>: gate weight threshold (default 0.03).
+                                   * Issue #865: tau=0.03 zeroes 21.8% of slots for +2.9% perplexity. */
+static int64_t g_degrade_dropped=0; /* cumulative miss slots zeroed by DEGRADE_ZERO across all layers */
+static int64_t g_degrade_dropped_by_layer[512]; /* per-layer miss slots zeroed (for footer breakdown) */
 /* CACHE_ROUTE (paper 2412.00099 max-rank): opt-in only. Keep true top-J always;
  * fill remaining slots preferring pin∪LRU experts ranked within top-M (or mass ROUTE_P). */
 static int g_cache_route=0;
@@ -5515,6 +5522,79 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         nu=nu2;
         free(wsum); free(is_hit); free(keep);
     }
+    /* ---- DEGRADE_ZERO: zero-fill miss slots below the gate-weight threshold --------
+     * When a prefetch deadline is missed, blocking on a demand-load stalls the compute
+     * thread.  For experts whose per-position gate weight is below DEGRADE_TAU the
+     * contribution is small enough that zeroing the slot costs less in output quality
+     * than the I/O stall costs in latency (issue #865: tau=0.03 zeroes 21.8% of slots
+     * for +2.9% perplexity).  tau is compared per-position (post-norm_topk,
+     * pre-routed_scale) — each position independently, matching the measured numbers.
+     * No renorm: the approximation IS the dropped mass; renorm would hide it and bias
+     * the output upward.
+     * Opt-in only (DEGRADE_ZERO=1); decode-only (S<=4) for the same reason as
+     * EXPERT_BUDGET: during prefill every dropped expert corrupts the KV cache. */
+    if(g_degrade_zero && S<=4){
+        /* residency scan: hits are always kept regardless of weight */
+        unsigned char *dg_keep=xzalloc((size_t)nu,"moe dg_keep");
+        for(int j=0;j<nu;j++){
+            int eid=uniq[j], resident=0;
+            ESlot *P=m->pin[layer];
+            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ resident=1; break; }
+            if(!resident){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
+                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ resident=1; break; } }
+            if(resident) dg_keep[j]=1;
+        }
+        /* per-position tau gate: a miss expert is kept if ANY position routes to it
+         * with weight >= tau.  Each position's weight is tested independently — this
+         * is the gate the +2.9% ppl measurement was taken under. */
+        for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
+            float wv=ws[(int64_t)s*K+kk];
+            if(wv>=g_degrade_tau){
+                int e=idxs[(int64_t)s*K+kk];
+                for(int j=0;j<nu;j++) if(uniq[j]==e){ dg_keep[j]=1; break; }
+            }
+        }
+        /* rescue: no position may end up with zero routed experts.
+         * If all of a position's experts were misses below tau, reinstate the
+         * highest-gate-weight one — same guard as EXPERT_BUDGET (#292). */
+        memset(seen,0,(size_t)E);
+        for(int j=0;j<nu;j++) if(dg_keep[j]) seen[uniq[j]]=1;
+        for(int s=0;s<S;s++){
+            int alive=0;
+            for(int kk=0;kk<keff[s] && !alive;kk++) if(seen[idxs[(int64_t)s*K+kk]]) alive=1;
+            if(alive || keff[s]<=0) continue;
+            int be=-1; float bw=-1e30f;
+            for(int kk=0;kk<keff[s];kk++){
+                float wv=ws[(int64_t)s*K+kk];
+                if(wv>bw){ bw=wv; be=idxs[(int64_t)s*K+kk]; }
+            }
+            if(be<0) be=idxs[(int64_t)s*K];
+            seen[be]=1;
+            for(int j=0;j<nu;j++) if(uniq[j]==be && !dg_keep[j]){ dg_keep[j]=1; break; }
+        }
+        /* apply: compact routing lists, no renorm — survivors keep original weights */
+        int dg_dropped=0;
+        for(int j=0;j<nu;j++) if(!dg_keep[j]) dg_dropped++;
+        if(dg_dropped){
+            g_degrade_dropped+=dg_dropped;
+            if(layer<512) g_degrade_dropped_by_layer[layer]+=dg_dropped;
+            memset(seen,0,(size_t)E);
+            for(int j=0;j<nu;j++) if(dg_keep[j]) seen[uniq[j]]=1;
+            for(int s=0;s<S;s++){
+                int w=0;
+                for(int kk=0;kk<keff[s];kk++){
+                    int e=idxs[(int64_t)s*K+kk]; float wv=ws[(int64_t)s*K+kk];
+                    if(seen[e]){ idxs[(int64_t)s*K+w]=e; ws[(int64_t)s*K+w]=wv; w++; }
+                }
+                if(w<keff[s]) keff[s]=w;
+            }
+            /* compact uniq[] to kept experts only */
+            int nu2=0;
+            for(int j=0;j<nu;j++) if(dg_keep[j]) uniq[nu2++]=uniq[j];
+            nu=nu2;
+        }
+        free(dg_keep);
+    }
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     /* quantizzazione sollevata (g_pq): materializzata al PRIMO expert che prenderebbe
@@ -8201,6 +8281,22 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         printf(" | EXPERT_BUDGET=%d (dropped %lld experts, ~%.1f GB I/O saved)", g_expert_budget, (long long)g_budget_dropped, g_budget_dropped*18.9e6/1e9);
         if(g_budget_rescued) printf(" [%lld rescued: budget too tight, position would have had 0 routed experts]", (long long)g_budget_rescued);
     }
+    if(g_degrade_zero){
+        printf(" | DEGRADE_ZERO tau=%.3f (zeroed %lld miss slots", g_degrade_tau, (long long)g_degrade_dropped);
+        if(g_degrade_dropped>0){
+            /* top-3 layers by drop count */
+            int top[3]={-1,-1,-1}; int64_t tv[3]={0,0,0};
+            for(int i=0;i<512;i++){
+                int64_t v=g_degrade_dropped_by_layer[i]; if(!v) continue;
+                if(v>tv[0]){tv[2]=tv[1];top[2]=top[1];tv[1]=tv[0];top[1]=top[0];tv[0]=v;top[0]=i;}
+                else if(v>tv[1]){tv[2]=tv[1];top[2]=top[1];tv[1]=v;top[1]=i;}
+                else if(v>tv[2]){tv[2]=v;top[2]=i;}
+            }
+            printf("; top layers:");
+            for(int k=0;k<3&&top[k]>=0;k++) printf(" L%d:%lld",top[k],(long long)tv[k]);
+        }
+        printf(")");
+    }
     printf("\n");
     printf("speculation: %.2f tokens/forward (%llu forwards per %llu tokens) | MTP acceptance %.0f%% (%llu/%llu)\n",
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
@@ -10821,6 +10917,11 @@ int main(int argc, char **argv){
     g_pilot_nw = getenv("PILOT_WORKERS")?atoi(getenv("PILOT_WORKERS")):1;
     if(g_pilot_nw<1) g_pilot_nw=1; if(g_pilot_nw>16) g_pilot_nw=16;
     g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD")?atoi(getenv("PILOT_EVICT_GUARD")):1; /* 0 = old LRU eviction (A/B) */
+    g_degrade_zero = getenv("DEGRADE_ZERO")?atoi(getenv("DEGRADE_ZERO")):0;
+    g_degrade_tau  = getenv("DEGRADE_TAU") ?atof(getenv("DEGRADE_TAU")) :0.03f;
+    if(g_degrade_tau<=0.f||g_degrade_tau>1.f) g_degrade_tau=0.03f; /* clamp to sane range */
+    if(g_degrade_zero)
+        fprintf(stderr,"[DEGRADE] zero-fill ON, tau=%.3f (approximate mode: miss slots with per-position gate weight < tau are never loaded)\n",g_degrade_tau);
     g_disk_split = getenv("DISK_SPLIT")?atoi(getenv("DISK_SPLIT")):0; /* 1 = split dei disk load nelle stats */
     g_pipe = getenv("PIPE")?atoi(getenv("PIPE")):
 #ifdef _WIN32

@@ -203,6 +203,50 @@ COLI_CUDA=0` if you also want kernel-family/GPU independence. Acceptance
 percentages are not comparable across engine versions under `--topp`
 ([#163](https://github.com/JustVugg/colibri/issues/163) has the full story).
 
+## Approximate mode: `DEGRADE_ZERO` (opt-in, OLMoE-calibrated)
+
+`DEGRADE_ZERO=1` enables an opt-in degraded inference policy: when a prefetch
+deadline is missed, experts whose per-position gate weight falls below
+`DEGRADE_TAU` (default 0.03) are **zero-filled instead of loaded from disk**.
+The slot contributes nothing to the layer output; the approximation is the
+dropped mass, not a rescaled version of it (renorm is catastrophically worse —
+see issue #865 for the measured A/B).
+
+This reduces blocking disk reads on NVMe-bound workloads at the cost of a small
+quality hit. Measured on OLMoE-1B-7B:
+
+| `DEGRADE_TAU` | slots zeroed | ppl delta |
+|---|---|---|
+| 0.03 | ~22% | +2.9% |
+| 0.05 | ~60% | +41% |
+
+**These numbers are OLMoE-specific.** GLM-5.2 (`norm_topk=1`) and Kimi K3 have
+different router contracts and expert counts — their operating points have not
+been measured. Until they are, treat `tau=0.03` as a starting point and verify
+quality on your model before relying on it.
+
+**These numbers assume a warm expert cache.** Cold-start sessions — where the cache
+begins empty and all experts miss initially — will see higher drop rates until the LRU
+fills. The steady-state perplexity delta above is what was measured; cold-start transient
+behavior has not been separately characterized.
+
+The feature is decode-only (`S≤4` guard, same as `EXPERT_BUDGET`): dropping
+experts during prefill corrupts the KV cache. A rescue rule ensures no token
+position is left with zero routed experts. Resident (pinned or LRU-cached)
+experts are never dropped regardless of weight.
+
+The `[PROF]` footer reports the total zeroed slot count and the top-3 layers by
+drop share when the flag is active, so a miscalibrated tau is visible rather
+than silent.
+
+```bash
+DEGRADE_ZERO=1 DEGRADE_TAU=0.03 COLI_MODEL=/nvme/glm52_i4 ./coli chat
+```
+
+See [ENVIRONMENT.md](ENVIRONMENT.md) for the full variable reference and
+[issue #865](https://github.com/JustVugg/colibri/issues/865) for the
+measurement methodology.
+
 ## Conversations reopen warm
 
 `coli chat` persists the compressed MLA KV-cache to disk after every turn
