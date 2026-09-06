@@ -2,14 +2,31 @@ name: CI
 
 on:
   pull_request:
-    branches: [dev, main]
+    # dev only, deliberately. The release PR is dev->main, so its head IS dev:
+    # with `main` listed here every push to dev ran the whole matrix TWICE on
+    # one commit -- once for `push`, once for the open release PR -- 36 jobs
+    # where 18 suffice, and the duplicate pair is what filled release PRs with
+    # doubled check names. Check runs attach to the SHA, so the release PR
+    # still displays the push run's results. main carries no required status
+    # checks (its ruleset requires a review), so nothing merge-gating is lost,
+    # and a PR mistargeted at main visibly gets no CI -- which is the signal
+    # that it needs retargeting to dev.
+    branches: [dev]
   push:
     branches: [dev, main]
+
+# Supersede, don't accumulate: a second push to the same ref cancels the first
+# run instead of leaving both to burn runner slots. PR refs and branch refs get
+# distinct groups, so a merge to dev never cancels an unrelated PR.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   engine:
     name: Engine (Linux, CPU)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Build colibri + inkling
@@ -34,6 +51,7 @@ jobs:
   docker:
     name: Container image
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Build the slim image
@@ -75,6 +93,7 @@ jobs:
   sanitizers:
     name: Sanitizers (ASan + UBSan)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: C suite under ASan + UBSan
@@ -99,6 +118,7 @@ jobs:
   vulkan:
     name: Vulkan (Lavapipe, software)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install the Vulkan toolchain and a software driver
@@ -163,6 +183,7 @@ jobs:
             shell: "msys2 {0}"
             v4: "1"
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     defaults:
       run:
         shell: ${{ matrix.shell }}
@@ -307,6 +328,7 @@ jobs:
   engine-cuda-syntax:
     name: CUDA syntax check
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install CUDA toolkit (compiler only)
@@ -488,6 +510,7 @@ jobs:
   inkling-oracle:
     name: Inkling oracle (token-exact vs transformers)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -538,6 +561,7 @@ jobs:
   efficiency:
     name: Efficiency suite (tiny oracle)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -618,6 +642,7 @@ jobs:
   engine-hip-syntax:
     name: HIP syntax check
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Free runner disk
@@ -676,6 +701,7 @@ jobs:
     # a CI quirk — pinning tracks what the toolkit actually supports. Revisit when
     # a CUDA release accepts VS 18; -allow-unsupported-compiler would only mask it.
     runs-on: windows-2022
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: MSVC environment (puts cl.exe on PATH for nvcc -ccbin)
@@ -749,6 +775,7 @@ jobs:
   web:
     name: Web UI
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: web
@@ -768,6 +795,7 @@ jobs:
   python:
     name: Python tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
