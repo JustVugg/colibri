@@ -1,3 +1,4 @@
+#include "qwen36_tier.h"   /* CUDA VRAM expert tier, shared with qwen36; CPU-only builds get the inline no-op stubs */
 /* Native Qwen3.8-Flash-Next text core.
  *
  * This header is included once by qwen38.c after its tokenizer and protocol
@@ -1664,6 +1665,43 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
 /* The single-row path is intentionally kept separate from prefill.  Decode is
  * the latency-sensitive steady state and should not pay for route tables or a
  * prompt-sized workspace. */
+/* ---- CUDA VRAM expert tier (qwen36_tier.c, fp8 streaming mode) ------------
+ * The tier keeps its own copies of hot experts in VRAM; the RAM LRU below is
+ * untouched by it. qt_issue() takes the resident experts of a token's route
+ * off the CPU, qt_take() adds their outputs back, and every expert the CPU
+ * did compute is reported with qt_note() so the tier can promote it. The
+ * tier copies what it needs during qt_note; the slot may be recycled by the
+ * next token. Only native FP8 slots are reported: gate.data at the slab start
+ * is what q38_bind_fp8_slot() produces, an expanded slot points elsewhere. */
+static void q38_tier_note(int layer,int eid,const Slot *ex) {
+    if(!qt_ready()||!ex->fp8_slab||ex->gate.data!=ex->fp8_slab)return;
+    qt_note(layer,eid,(const uint8_t*)ex->gate.data,(const uint8_t*)ex->up.data,
+            (const uint8_t*)ex->down.data,ex->gate.scales,ex->up.scales,ex->down.scales);
+}
+
+/* Start the tier after the model is loaded. COLI_CUDA=1 turns it on (the
+ * tier reads that itself); it needs every layer's experts in native FP8 with
+ * the block-scale bank resident, because the GPU kernels consume exactly the
+ * checkpoint layout (e4m3 bytes + [ceil(O/128), ceil(I/128)] scales). */
+static void q38_tier_start(Model *m,int cap) {
+    const char *on=getenv("COLI_CUDA");
+    if(!on||on[0]!='1'||on[1])return;
+    Cfg *c=&m->c;
+    if(!m->native_fp8){
+        fprintf(stderr,"[qtier] qwen38: expert tier needs native FP8 experts (Q38_NATIVE_FP8=1); staying on the CPU\n");
+        return;
+    }
+    for(int layer=0;layer<c->layers;layer++)
+        if(!q38_prepare_expert_scale_bank(m,layer)){
+            fprintf(stderr,"[qtier] qwen38: layer %d experts are not native FP8; staying on the CPU\n",layer);
+            return;
+        }
+    if(qt_init_fp8(c->layers,c->experts,c->hidden,c->inter,cap,c->topk,E4M3_LUT)){
+        atexit(qt_shutdown);
+        fprintf(stderr,"[qtier] qwen38: fp8 expert tier on (RAM LRU %d/layer stays; experts stream to VRAM as they get hot)\n",cap);
+    }
+}
+
 static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
     Cfg *c=&m->c;int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
     float *logits=falloc(E),*sg=falloc(SI),*su=falloc(SI),*sh=falloc(SI),*shared=falloc(H);
@@ -1678,21 +1716,31 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
         float route_gates[Q38_MAX_TOPK];
         for(int z=0;z<K;z++) route_gates[z]=(float)(val[z]/den);
         rt_route(layer,s,idx,route_gates,K); /* shared counts + post-normalization trace */
-        q38_prefetch_native_fp8_experts(m,layer,idx,K);
+        /* Resident experts run on the GPU from here on (asynchronously); the
+         * CPU only loads and computes the rest, in route order. */
+        uint32_t qmask=qt_issue(layer,idx,K,xs);
+        int cpu_idx[Q38_MAX_TOPK],cpu_rank[Q38_MAX_TOPK],cpu_n=0;
+        for(int z=0;z<K;z++)if(!((qmask>>z)&1u)){cpu_idx[cpu_n]=idx[z];cpu_rank[cpu_n]=z;cpu_n++;}
+        q38_prefetch_native_fp8_experts(m,layer,cpu_idx,cpu_n);
         double phase_started=now_s();
         q38_weight_matmul(sg,xs,&l->sh_g,1,H,SI);q38_weight_matmul(su,xs,&l->sh_u,1,H,SI);
         for(int j=0;j<SI;j++)sh[j]=q38_silu(sg[j])*su[j];q38_weight_matmul(shared,sh,&l->sh_d,1,SI,H);
         float gate=0.f;for(int d=0;d<H;d++)gate+=xs[d]*l->sh_gate[d];gate=q38_sigmoid(gate);
         q38_tm_add(m,Q38_TM_SHARED_EXPERT,phase_started);
         Slot *selected[Q38_MAX_TOPK];
-        int loaded_batch=q38_expert_get_batch(m,layer,idx,K,selected);
-        for(int z=0;z<K;z++){
-            Slot *ex=loaded_batch?selected[z]:q38_expert_get(m,layer,idx[z]);phase_started=now_s();
+        int loaded_batch=q38_expert_get_batch(m,layer,cpu_idx,cpu_n,selected);
+        for(int i=0;i<cpu_n;i++){
+            int z=cpu_rank[i];
+            Slot *ex=loaded_batch?selected[i]:q38_expert_get(m,layer,cpu_idx[i]);phase_started=now_s();
             q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
             for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
             for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
+            q38_tier_note(layer,cpu_idx[i],ex);
         }
+        /* GPU experts land after the CPU ones: same values, one more group in
+         * the float sum (that is the only ordering difference to a CPU run). */
+        qt_take(qmask,route_gates,K,ys);
         for(int d=0;d<H;d++)ys[d]+=gate*shared[d];
     }
     rt_trace_end();

@@ -192,7 +192,25 @@ def _rewrite_shard_fp8(out: Path, packed):
         assert name in tensors, name
         tensors[name] = q.contiguous()
         tensors[name + "_scale_inv"] = scale_inv.to(torch.bfloat16).contiguous()
-    save_file(tensors, str(path), metadata={"format": "pt"})
+    # The release keeps a layer's gate/up expert tensors and its down_proj
+    # tensors in different shards. Because the writer sorts BF16 before F8 and
+    # by name within a dtype, that is what makes every layer's gate/up
+    # weight_scale_inv sidecars one compact byte range and the down sidecars
+    # another -- the invariant behind the engine's resident scale bank
+    # (q38_prepare_expert_scale_bank). One file would interleave
+    # down/gate/up per expert and silently send the engine down the
+    # per-matrix fallback, so the fixture ships two shards plus the index.
+    down = {k: v for k, v in tensors.items() if ".mlp.experts." in k and ".down_proj." in k}
+    rest = {k: v for k, v in tensors.items() if k not in down}
+    shards = {"model-00001-of-00002.safetensors": rest, "model-00002-of-00002.safetensors": down}
+    weight_map = {}
+    for fname, group in shards.items():
+        save_file(group, str(out / fname), metadata={"format": "pt"})
+        for k in group: weight_map[k] = fname
+    path.unlink()
+    (out / "model.safetensors.index.json").write_text(json.dumps(
+        {"metadata": {"total_size": sum(v.numel() * v.element_size() for v in tensors.values())},
+         "weight_map": weight_map}, indent=1), encoding="utf-8")
     cfg_path = out / "config.json"
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     cfg["quantization_config"] = {"quant_method": "fp8", "activation_scheme": "dynamic",

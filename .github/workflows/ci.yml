@@ -515,6 +515,8 @@ jobs:
         run: pip install -r c/tools/requirements-qwen38-tiny.txt
       - name: Generate the upstream text fixture and run the token-and-logit oracle
         run: make -C c qwen38-tiny-check
+      - name: Routed experts as the release ships them (FP8 shards), then the engine on the fake CUDA tier
+        run: make -C c qwen38-tiny-fp8-check qwen38-tier-engine-check
       - name: Repeat the eviction path under ASan and UBSan
         run: |
           cd c

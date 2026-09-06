@@ -472,9 +472,12 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 # test_uring is Linux-only. V4 engine tests are appended below only on supported
 # x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
 # unconditional rules and therefore remain portable gates.
+# test_qwen38_tier_engine drives qwen38.c over the generated FP8 fixture
+# (qwen38_tiny_fp8, gitignored); it runs from qwen38-tier-engine-check.
 TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
 	test_segment_adapters_registration test_segment_adapters_real \
-	test_edge_adapters_registration test_edge_adapters_real
+	test_edge_adapters_registration test_edge_adapters_real \
+	test_qwen38_tier_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -1042,11 +1045,12 @@ endif
 qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h st.h json.h compat.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
-# Qwen3.8-Flash-Next text-only sibling. This target is intentionally CPU-only;
-# qwen38.c owns the direct checkpoint loader and SERVE=1 protocol, with no
-# CUDA/Metal tier advertised by the control plane.
-qwen38$(EXE): qwen38.c cli_args.h qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h
-	$(CC) $(NOCUDA_CFLAGS) qwen38.c -o qwen38$(EXE) $(NOCUDA_LDFLAGS)
+# Qwen3.8-Flash-Next text-only sibling. qwen38.c owns the direct checkpoint
+# loader and SERVE=1 protocol. With CUDA=1 it links the same expert tier as
+# qwen36 (fp8 streaming mode: hot experts get VRAM copies, the RAM LRU stays);
+# without it the tier header's inline stubs keep the build toolkit-free.
+qwen38$(EXE): qwen38.c cli_args.h qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) qwen38.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen38$(EXE) $(QWEN36_LDFLAGS)
 
 .PHONY: qwen38-tiny-generate qwen38-tiny-check
 qwen38-tiny-generate:
@@ -1072,6 +1076,23 @@ qwen38-tiny-check: qwen38-tiny-generate qwen38$(EXE)
 	done; \
 	done; \
 	done
+
+# Same oracle with the routed experts as the release ships them: e4m3 bytes
+# plus BF16 128x128 block scales, gate/up and down in separate shards. The
+# native slab path and the expanded path must both reproduce the reference;
+# then the engine runs on the fake CUDA tier (no toolkit, no GPU).
+.PHONY: qwen38-tiny-fp8-generate qwen38-tiny-fp8-check qwen38-tier-engine-check
+qwen38-tiny-fp8-generate:
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_fp8 --fp8-experts
+
+qwen38-tiny-fp8-check: qwen38-tiny-fp8-generate qwen38$(EXE)
+	@for native in 1 0; do for cap in 1 2; do \
+		Q38_NATIVE_FP8=$$native OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_fp8 ./qwen38$(EXE) $$cap 8 ./qwen38_tiny_fp8/ref.json || exit $$?; \
+	done; \
+	done
+
+qwen38-tier-engine-check: qwen38-tiny-fp8-generate tests/test_qwen38_tier_engine$(EXE)
+	./tests/test_qwen38_tier_engine$(EXE)
 
 # Context-size gates: KV layout, growth across requests, and the attention
 # capacity. Includes qwen36.c directly, so no model file is needed.
@@ -1716,6 +1737,12 @@ tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c t
 
 # #1391: il decode path deve offrire gli esperti int8 al tier, non solo il warmstart
 tests/test_qwen36_tier_int8_decode$(EXE): tests/test_qwen36_tier_int8_decode.c tests/qwen36_fake_cuda.h qwen36.c qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# The qwen38 engine through its own main() on the fake backend: tier start
+# from the FP8 fixture, reduced CPU list, qt_note on recycled slots, oracle
+# tokens unchanged. Needs the fixture (qwen38-tiny-fp8-generate).
+tests/test_qwen38_tier_engine$(EXE): tests/test_qwen38_tier_engine.c tests/qwen36_fake_cuda.h qwen38.c qwen38_core.h qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h quant.h route_trace.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
 tests/test_serve_poll$(EXE): tests/test_serve_poll.c serve_poll.h
