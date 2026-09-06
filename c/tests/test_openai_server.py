@@ -1,8 +1,10 @@
+import contextlib
 import http.client
 import io
 import json
 import math
 import socket
+import subprocess
 import tempfile
 import threading
 import sys
@@ -18,8 +20,9 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
-                           generation_options, parse_tool_calls, parse_dsv4_tool_calls,
-                           parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
+                           default_engine, generation_options, parse_arch_tool_calls,
+                           parse_dsv4_tool_calls, parse_k3_tool_calls,
+                           parse_qwen38_tool_calls, parse_tool_calls,
                            read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
                            render_chat_qwen38, render_chat_v4, _dsv4_tool_calls, serve,
                            split_thinking_reply,
@@ -463,6 +466,11 @@ class StopFilterTest(unittest.TestCase):
 
 
 class ProtocolTest(unittest.TestCase):
+    def test_default_engine_uses_current_binary_name(self):
+        with patch("openai_server.Path.exists", autospec=True,
+                   side_effect=lambda candidate: candidate.name == "colibri.exe"):
+            self.assertEqual(default_engine().name, "colibri.exe")
+
     def test_reads_payload_and_extended_status(self):
         stream = io.BytesIO(b"hello" + END + b"STAT 2 3.5 44 1.2 7 1\n")
         chunks = []
@@ -655,6 +663,153 @@ class FakeProcess:
 
     def kill(self):
         self.terminate()
+
+
+class StartupProcess:
+    def __init__(self, output=b"", ignore_terminate=False):
+        self.stdout = BlockingStream(output)
+        self.stdin = io.BytesIO()
+        self.returncode = None
+        self.ignore_terminate = ignore_terminate
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.wait_calls = []
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminate_calls += 1
+        if not self.ignore_terminate:
+            self.returncode = 0
+            self.stdout.close()
+
+    def wait(self, timeout=None):
+        self.wait_calls.append(timeout)
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("glm", timeout)
+        return self.returncode
+
+    def kill(self):
+        self.kill_calls += 1
+        self.returncode = -9
+        self.stdout.close()
+
+
+class EngineStartupTest(unittest.TestCase):
+    def test_default_spawn_hook_preserves_popen_contract(self):
+        process = StartupProcess(READY + b"STAT 0 0 0 0\n")
+        stderr = object()
+        with patch("openai_server.subprocess.Popen", return_value=process) as popen:
+            engine = Engine(
+                "/opt/colibri", "/model", env={"EXPLICIT": "yes"},
+                command_prefix=("numactl", "--localalloc"), stderr=stderr,
+            )
+            engine.close()
+
+        popen.assert_called_once_with(
+            ["numactl", "--localalloc", "/opt/colibri", "0"],
+            env={
+                "EXPLICIT": "yes", "SNAP": "/model", "SERVE": "1",
+                "SERVE_BATCH": "1", "NGEN": "1024", "KV_SLOTS": "1",
+            },
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
+            bufsize=0,
+        )
+
+    def test_subclass_spawn_hook_sees_final_command_and_environment(self):
+        process = StartupProcess(READY + b"STAT 0 0 0 0\n")
+        captured = {}
+
+        class CapturingEngine(Engine):
+            def _spawn_process(self, command, *, child_env, stderr):
+                captured.update({
+                    "command": command,
+                    "child_env": child_env,
+                    "stderr": stderr,
+                })
+                return process
+
+        stderr = object()
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "model"
+            model.mkdir()
+            (model / "config.json").write_text(
+                json.dumps({"model_type": "deepseek_v4"}), encoding="utf-8",
+            )
+            env = {
+                "EXPLICIT": "yes", "OMP_NUM_THREADS": "9",
+                "V4_MTP_CONF": "0.7",
+            }
+            with patch("resource_plan.physical_cpu_count", return_value=6), \
+                 patch("openai_server.sys.platform", "linux"), \
+                 patch("openai_server.subprocess.Popen",
+                       side_effect=AssertionError("subclass hook was bypassed")):
+                engine = CapturingEngine(
+                    "/opt/colibri", str(model), cap=5, max_tokens=77,
+                    kv_slots=4, env=env,
+                    command_prefix=("numactl", "--cpunodebind=1"),
+                    stderr=stderr,
+                )
+                self.assertIs(engine.process, process)
+                engine.close()
+
+        self.assertEqual(captured["command"], [
+            "numactl", "--cpunodebind=1", "/opt/colibri", "5",
+        ])
+        self.assertEqual(captured["child_env"], {
+            "EXPLICIT": "yes", "OMP_NUM_THREADS": "9",
+            "V4_MTP_CONF": "0.7", "SNAP": str(model), "SERVE": "1",
+            "SERVE_BATCH": "1", "NGEN": "77", "KV_SLOTS": "4",
+            "OMP_WAIT_POLICY": "active", "GOMP_SPINCOUNT": "200000",
+            "OMP_DYNAMIC": "FALSE", "OMP_PROC_BIND": "close",
+            "OMP_PLACES": "cores", "V4_DRAFT": "0", "V4_MTP": "0",
+            "V4_MTP_DRAFT": "3", "V4_MTP_GB": "0.45", "V4_MTP_GPU": "0",
+            "V4_MTP_MISS": "96", "V4_MTP_MIN": "3",
+            "V4_MTP_CONF": "0.7",
+        })
+        self.assertIs(captured["stderr"], stderr)
+
+    def test_readiness_parse_failure_reaps_stubborn_child_before_reraising(self):
+        process = StartupProcess(READY + b"BROKEN\n", ignore_terminate=True)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            with self.assertRaisesRegex(RuntimeError, "invalid engine status: BROKEN"):
+                Engine("glm", "model")
+
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertEqual(process.kill_calls, 1)
+        self.assertEqual(process.wait_calls, [5, 5])
+        self.assertEqual(process.returncode, -9)
+
+    def test_readiness_timeout_terminates_child_without_changing_constructor_api(self):
+        process = StartupProcess()
+        errors = []
+
+        def construct():
+            try:
+                Engine(
+                    "glm",
+                    "model",
+                    env={"COLI_ENGINE_READY_TIMEOUT": "0.01"},
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            thread = threading.Thread(target=construct, daemon=True)
+            thread.start()
+            thread.join(timeout=0.5)
+            finished_within_bound = not thread.is_alive()
+            if thread.is_alive():
+                process.terminate()
+                thread.join(timeout=1)
+
+        self.assertTrue(finished_within_bound, "Engine readiness wait was unbounded")
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(str(errors[0]), "did not become ready within")
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertEqual(process.kill_calls, 0)
+        self.assertEqual(process.wait_calls, [5])
 
 
 class DispatcherTest(unittest.TestCase):
@@ -939,7 +1094,286 @@ class DispatcherTest(unittest.TestCase):
             "wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
             "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
             "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15,
+            "tokens_per_second": 4.8, "cache_hit_percent": 0.0,
+            "rss_gb": 1.0, "length_limited": False,
         }])
+
+    def test_records_inkling_done_then_prof_profile_order(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(
+                b"DONE " + request_id
+                + b" STAT 12 4.8 25 1.0 7 0\n"
+            )
+            process.stdout.feed(
+                b"PROF 2.500 7 12 0.400 0.100 0.900 "
+                b"0.600 0.200 15\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+        for _ in range(100):
+            if engine.profile_seq:
+                break
+            threading.Event().wait(0.01)
+        engine.close()
+
+        self.assertEqual(engine.profile_seq, 1)
+        profile = list(engine.profile)[0]
+        self.assertEqual(profile["prompt_tokens"], 7)
+        self.assertEqual(profile["completion_tokens"], 12)
+        self.assertEqual(profile["tokens_per_second"], 4.8)
+        self.assertEqual(profile["cache_hit_percent"], 25.0)
+
+    def test_records_legacy_and_detailed_gpu_telemetry(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(
+                b"GPUS 2 0.600 1.000 3 1.300 2.000 6\n"
+                b"GPUDETAIL 1 2 "
+                b"2 - 1000 400 500 300 200 3 "
+                b"5 GPU-abc 2000 700 900 600 300 6\n"
+                b"DONE " + request_id + b" STAT 1 2.5 0 1.0 4 0\n"
+            )
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
+
+        self.assertEqual(engine.gpus_seq, 2)
+        self.assertEqual(engine.gpus, [
+            {
+                "device": 2, "identity": None,
+                "total_bytes": 1000, "free_bytes": 400, "used_bytes": 600,
+                "model_bytes": 500, "expert_bytes": 300, "nonexpert_bytes": 200,
+                "expert_count": 3,
+            },
+            {
+                "device": 5, "identity": "GPU-abc",
+                "total_bytes": 2000, "free_bytes": 700, "used_bytes": 1300,
+                "model_bytes": 900, "expert_bytes": 600, "nonexpert_bytes": 300,
+                "expert_count": 6,
+            },
+        ])
+
+    def test_legacy_gpu_telemetry_remains_available_without_detail_frame(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"GPUS 1 1.250 24.000 7\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 2.5 0 1.0 4 0\n")
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
+        self.assertEqual(engine.gpus_seq, 1)
+        self.assertEqual(engine.gpus, [{
+            "device": 0, "identity": None, "used_gb": 1.25,
+            "total_gb": 24.0, "expert_count": 7,
+        }])
+
+    def test_empty_gpu_detail_reports_cpu_only_engine(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"GPUS 0\nGPUDETAIL 1 0\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 2.5 0 1.0 4 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
+        self.assertEqual(engine.gpus, [])
+        self.assertEqual(engine.gpus_seq, 2)
+
+    def test_ignores_unknown_advisory_telemetry(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"FUTURE_TELEMETRY any shape is advisory\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 2.5 0 1.0 4 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        stats = engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
+        self.assertEqual(stats["tokens_per_second"], 2.5)
+
+    def test_malformed_known_gpu_telemetry_stops_dispatcher(self):
+        def respond(process, _frame):
+            process.stdout.feed(b"GPUDETAIL 1 1 0 - 100\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "GPUDETAIL"):
+            engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
+
+    def test_gpu_detail_rejects_duplicate_and_impossible_device_rows(self):
+        frames = {
+            "duplicate ordinal": (
+                b"GPUDETAIL 1 2 "
+                b"0 - 1000 400 500 300 200 3 "
+                b"0 - 2000 700 900 600 300 6\n"
+            ),
+            "free exceeds total": (
+                b"GPUDETAIL 1 1 0 - 1000 1001 500 300 200 3\n"
+            ),
+            "model exceeds total": (
+                b"GPUDETAIL 1 1 0 - 1000 400 1001 600 401 6\n"
+            ),
+        }
+        for label, telemetry in frames.items():
+            with self.subTest(label=label):
+                def respond(process, _frame, telemetry=telemetry):
+                    process.stdout.feed(telemetry)
+
+                process = FakeProcess(respond)
+                with patch("openai_server.subprocess.Popen", return_value=process):
+                    engine = Engine("glm", "model")
+                with self.assertRaisesRegex(RuntimeError, "GPUDETAIL"):
+                    engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+                engine.close()
+
+    def test_records_extended_persistent_benchmark_telemetry(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+            process.stdout.feed(
+                b"PROF 2.500 7 32 0.400 0.100 0.900 0.600 0.200 15 "
+                b"12.500 44.000 4096 8 65536 123.000 1.250\n"
+            )
+            process.stdout.feed(b"DONE " + request_id + b" STAT 32 12.8 0 1.0 7 1\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 32, 0.0, 1.0, lambda _: None)
+        engine.close()
+        profile = list(engine.profile)[0]
+        self.assertEqual(profile["forward_p50_ms"], 12.5)
+        self.assertEqual(profile["forward_p99_ms"], 44.0)
+        self.assertEqual(profile["physical_ssd_bytes"], 4096)
+        self.assertIs(profile["physical_ssd_valid"], True)
+        self.assertEqual(profile["rammap_experts"], 8)
+        self.assertEqual(profile["rammap_bytes"], 65536)
+        self.assertEqual(profile["ttft_ms"], 123.0)
+        self.assertEqual(profile["prefault_seconds"], 1.25)
+
+    def test_extended_profile_distinguishes_unavailable_physical_io(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(
+                b"PROF 2.500 7 32 0.400 0.100 0.900 0.600 0.200 15 "
+                b"12.500 44.000 0 8 65536 123.000 1.250 0\n"
+            )
+            process.stdout.feed(b"DONE " + request_id + b" STAT 32 12.8 0 1.0 7 1\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 32, 0.0, 1.0, lambda _: None)
+        engine.close()
+        profile = list(engine.profile)[0]
+        self.assertIsNone(profile["physical_ssd_bytes"])
+        self.assertIs(profile["physical_ssd_valid"], False)
+
+    def test_prof_rejects_unsupported_field_count(self):
+        # Only 10, 17, and 18 fields are well-formed. Counts between the
+        # accepted shapes (15) and beyond the eighteen-field form (19) are
+        # protocol errors, not silently truncated or ignored.
+        frames = {
+            "fifteen fields": (
+                b"PROF 2.500 7 12 0.400 0.100 0.900 0.600 0.200 15 "
+                b"12.500 44.000 4096 8 65536\n"
+            ),
+            "nineteen fields": (
+                b"PROF 2.500 7 12 0.400 0.100 0.900 0.600 0.200 15 "
+                b"12.500 44.000 4096 8 65536 123.000 1.250 1 EXTRA\n"
+            ),
+        }
+        for label, telemetry in frames.items():
+            with self.subTest(label=label):
+                def respond(process, _frame, telemetry=telemetry):
+                    process.stdout.feed(telemetry)
+
+                process = FakeProcess(respond)
+                with patch("openai_server.subprocess.Popen", return_value=process):
+                    engine = Engine("glm", "model")
+                with self.assertRaisesRegex(RuntimeError, "PROF"):
+                    engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+                engine.close()
+
+    def test_prof_rejects_non_finite_numeric(self):
+        # Every float field must be finite; nan/inf would poison the
+        # /profile scorecards. Both base and additive floats are guarded.
+        frames = {
+            "nan wall_s": (
+                b"PROF nan 7 12 0.400 0.100 0.900 0.600 0.200 15 "
+                b"12.500 44.000 4096 8 65536 123.000 1.250 1\n"
+            ),
+            "inf ttft_ms": (
+                b"PROF 2.500 7 32 0.400 0.100 0.900 0.600 0.200 15 "
+                b"12.500 44.000 4096 8 65536 inf 1.250 1\n"
+            ),
+        }
+        for label, telemetry in frames.items():
+            with self.subTest(label=label):
+                def respond(process, _frame, telemetry=telemetry):
+                    process.stdout.feed(telemetry)
+
+                process = FakeProcess(respond)
+                with patch("openai_server.subprocess.Popen", return_value=process):
+                    engine = Engine("glm", "model")
+                with self.assertRaisesRegex(RuntimeError, "PROF"):
+                    engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+                engine.close()
+
+    def test_prof_physical_ssd_valid_requires_literal_one(self):
+        # Validity is "==" against the literal token "1": a "2" (which the
+        # old bool(int()) path wrongly treated as valid) is reported as
+        # unverified, not as a protocol error — the frame is well-formed.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(
+                b"PROF 2.500 7 32 0.400 0.100 0.900 0.600 0.200 15 "
+                b"12.500 44.000 4096 8 65536 123.000 1.250 2\n"
+            )
+            process.stdout.feed(b"DONE " + request_id + b" STAT 32 12.8 0 1.0 7 1\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 32, 0.0, 1.0, lambda _: None)
+        engine.close()
+        profile = list(engine.profile)[0]
+        self.assertIs(profile["physical_ssd_valid"], False)
+        self.assertIsNone(profile["physical_ssd_bytes"])
+
+    def test_prof_accepts_legacy_seventeen_field_frame(self):
+        # The 17-field producer carries no validity token; a positive byte
+        # count is known-valid and zero is unverified (None). This shape must
+        # remain accepted now that field counts are restricted to 10/17/18.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(
+                b"PROF 2.500 7 32 0.400 0.100 0.900 0.600 0.200 15 "
+                b"12.500 44.000 4096 8 65536 123.000 1.250\n"
+            )
+            process.stdout.feed(b"DONE " + request_id + b" STAT 32 12.8 0 1.0 7 1\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 32, 0.0, 1.0, lambda _: None)
+        engine.close()
+        profile = list(engine.profile)[0]
+        self.assertEqual(profile["physical_ssd_bytes"], 4096)
+        self.assertIs(profile["physical_ssd_valid"], True)
 
     def test_accepts_u7a_echo_and_extended_data_frames(self):
         # U7a forward-compat: the engine's opt-in per-token numeric channel --
@@ -975,20 +1409,20 @@ class DispatcherTest(unittest.TestCase):
         self.assertIsNone(engine.dispatcher_error)
         engine.close()
 
-    def test_unknown_frame_still_stops_dispatcher(self):
-        # The catch-all that makes an unrecognized frame a hard failure is
-        # load-bearing for the U7a compatibility asymmetry (a new engine's
-        # frame reaching an OLD server kills the dispatcher -- the reason the
-        # engine half ships first and stays opt-in). Accepting ECHO/extended
-        # DATA must not have widened acceptance beyond those frames.
+    def test_malformed_u7a_echo_stops_dispatcher(self):
+        # Unknown telemetry remains forward-compatible, but ECHO is now a
+        # known protocol kind. A truncated ECHO header must therefore take the
+        # malformed-known-frame path instead of being ignored as advisory.
         def respond(process, frame):
             request_id = frame.split()[1]
-            process.stdout.feed(b"LOGPROB " + request_id + b" 0.5\n")
+            process.stdout.feed(b"ECHO " + request_id + b" 0\n")
+            process.stdout.feed(
+                b"DONE " + request_id + b" STAT 0 0 0 1.0 1 0\n")
 
         process = FakeProcess(respond)
         with patch("openai_server.subprocess.Popen", return_value=process):
             engine = Engine("glm", "model")
-        with self.assertRaisesRegex(RuntimeError, "invalid engine response: LOGPROB"):
+        with self.assertRaisesRegex(RuntimeError, "invalid engine response: ECHO"):
             engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
         engine.close()
 
@@ -1305,6 +1739,53 @@ class HTTPTest(unittest.TestCase):
         self.assertEqual(scheduler["max_queue"], 8)
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
+        self.assertEqual(health["gpus"], [])
+        self.assertEqual(health["gpus_seq"], 0)
+
+    def test_health_exposes_gpu_details_only_to_authenticated_callers(self):
+        gpu = {
+            "device": 2, "identity": "GPU-abc",
+            "total_bytes": 1000, "free_bytes": 400, "used_bytes": 600,
+            "model_bytes": 500, "expert_bytes": 300, "nonexpert_bytes": 200,
+            "expert_count": 3,
+        }
+        self.engine.gpus = [gpu]
+        self.engine.gpus_seq = 7
+        try:
+            with self.request("/health") as response:
+                health = json.load(response)
+            self.assertEqual(health["gpus"], [gpu])
+            self.assertEqual(health["gpus_seq"], 7)
+
+            with urlopen(self.base + "/health", timeout=2) as response:
+                public = json.load(response)
+            self.assertEqual(public, {"status": "ok"})
+        finally:
+            del self.engine.gpus, self.engine.gpus_seq
+
+    def test_health_is_unavailable_after_dispatcher_or_child_failure(self):
+        failures = (
+            ("dispatcher-error", RuntimeError("engine reader failed"), None),
+            ("process-exited", None, 17),
+        )
+        for reason, dispatcher_error, returncode in failures:
+            with self.subTest(reason=reason):
+                self.engine.dispatcher_error = dispatcher_error
+                self.engine.process = type(
+                    "ProcessState",
+                    (),
+                    {"poll": lambda _self, value=returncode: value},
+                )()
+                try:
+                    with self.assertRaises(HTTPError) as caught:
+                        urlopen(self.base + "/health", timeout=2)
+                    self.assertEqual(caught.exception.code, 503)
+                    self.assertEqual(
+                        json.load(caught.exception),
+                        {"status": "error", "reason": reason},
+                    )
+                finally:
+                    del self.engine.dispatcher_error, self.engine.process
 
     def test_profile_requires_auth(self):
         """/profile is served before require_auth(), so it needs its own gate.
@@ -1628,6 +2109,12 @@ class StaticServingTest(unittest.TestCase):
             urlopen(self.base + "/%2e%2e/dist-private/secret.txt", timeout=2)
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 404)
+
+    def test_health_without_configured_key_exposes_gpu_telemetry_shape(self):
+        with urlopen(self.base + "/health", timeout=2) as response:
+            health = json.load(response)
+        self.assertEqual(health["gpus"], [])
+        self.assertEqual(health["gpus_seq"], 0)
 
 
 class SchedulerHTTPTest(unittest.TestCase):
@@ -2404,11 +2891,20 @@ class KeepAliveFramingTest(unittest.TestCase):
     def test_engine_failure_after_commit_does_not_splice_a_second_response(self):
         """Once the 200 is out, a 500 status line would land inside the event stream."""
         server = self._server(_ExplodingEngine())
-        raw = self._raw(server, self._request_bytes(dict(self.CHAT, stream=True)))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            raw = self._raw(
+                server,
+                self._request_bytes(dict(self.CHAT, stream=True)),
+            )
         self.assertEqual(raw.count("HTTP/1."), 1,
                          "a second HTTP response was spliced into the committed SSE stream")
         self.assertIn("partial", raw)            # the events sent before the failure survive
         self.assertNotIn("<STILL-OPEN>", raw)
+        self.assertIn(
+            "request failed: engine died mid-stream",
+            stderr.getvalue(),
+        )
 
     def test_non_streaming_response_still_reuses_the_connection(self):
         """The fix must not turn every response into a close: plain JSON stays persistent."""

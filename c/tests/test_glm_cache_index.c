@@ -64,11 +64,28 @@ int main(void){
     CHECK(ecache_indexed(&m,0,1,0)==&m.ecache[0][0]&&
           ecache_indexed(&m,0,2,0)==&m.ecache[0][1],"initial LRU publication mismatch");
 
+    /* The asynchronous hint worker consumes an item after the producer's
+     * locked residency check.  Its raw advice path must not re-read mutable
+     * pin/LRU indices while demand promotion or REPIN can update them. */
+    g_glm_slot_index_probes=0; g_glm_prefetch_raw_calls=0;
+    expert_prefetch_unchecked(&m,0,1);
+    CHECK(g_glm_slot_index_probes==0 && g_glm_prefetch_raw_calls==1,
+          "unchecked hint worker path probed mutable residency indices");
+    g_glm_slot_index_probes=0;
+    expert_prefetch(&m,0,1);
+    CHECK(g_glm_slot_index_probes>0 && g_glm_prefetch_raw_calls==1,
+          "synchronous prefetch lost its residency guard");
+
     ecache_reserve(&m,0,&m.ecache[0][1],3);
     CHECK(m.ecache_slot_by_expert[0][2]==-1,"victim mapping survived reservation");
     CHECK(ecache_indexed(&m,0,3,0)==NULL&&
           ecache_indexed(&m,0,3,1)==&m.ecache[0][1],
           "PILOT reservation visibility is wrong");
+    g_pilot_real=1;
+    expert_prefetch(&m,0,3);
+    g_pilot_real=0;
+    CHECK(g_glm_prefetch_raw_calls==1,
+          "checked prefetch advised a PILOT-reserved expert");
     ecache_publish(&m,0,&m.ecache[0][1],3);
     CHECK(ecache_indexed(&m,0,3,0)==&m.ecache[0][1],"reservation did not publish");
     ecache_hide(&m,0,&m.ecache[0][1]);

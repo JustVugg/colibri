@@ -56,6 +56,49 @@ routed experts into RAM **up to the `--ram` budget** (it clamps — [#229](https
 eliminating decode-time disk misses when capacity permits. This mode is intended
 for dedicated high-memory inference hosts.
 
+## Managed RAM-workspace GPU layouts
+
+`coli ramdisk` turns its reviewed `--gpu` and `--gpu-layout` contract into a
+sanitized engine environment. It persists each card's UUID and maps the
+reviewed UUID list through `CUDA_VISIBLE_DEVICES`; CUDA then exposes those
+cards as logical ordinals `0..n-1`. A single selected device therefore uses
+`COLI_GPU=0`; multiple devices use `COLI_GPUS=0,1,...`. Managed GPU plans also
+set:
+
+```text
+COLI_CUDA=1
+CUDA_EXPERT_GB=auto
+CUDA_RESERVE_GB=2.147483648
+COLI_CUDA_ASYNC=1
+COLI_MMAP=1
+COLI_RAMMAP=0
+PIN=auto
+PIN_GB=all
+PIN_FILL=1
+REPIN=16
+```
+
+The layout changes exactly these dense/attention controls:
+
+| `--gpu-layout` | `CUDA_DENSE` | `COLI_CUDA_ATTN` | `COLI_CUDA_ATTN_SHARD` | Status |
+|---|---:|---:|---:|---|
+| `experts-only` | `0` | `0` | `0` | Stable default: dense tensors and attention stay on CPU; selected hot experts use GPU. |
+| `dense-attention` | `1` | `1` | `0` | Experimental dense placement and GPU attention. |
+| `dense-attention-sharded` | `1` | `1` | `1` | Experimental; requires at least two GPUs and shards KV-b attention heads. |
+
+Ambient values for accelerator controls are removed before this contract is
+applied, so an unrelated shell setting cannot silently change reviewed model
+placement. This includes the ordinary CUDA placement switches plus
+`COLI_GROUP_ASYNC` and `COLI_DSA_GATHER`; `DRAFT` is normalized to `0`. An ambient
+`CUDA_VISIBLE_DEVICES` is not silently replaced: managed GPU launch fails
+closed and asks the operator to rerun the managed command with it unset. A legacy
+prepared GPU workspace without persisted UUID-to-logical-ordinal mappings
+must be stopped, destroyed, and prepared again.
+
+CPU-only RAM-workspace serving applies `COLI_CUDA=0`,
+`CUDA_DENSE=0`, `COLI_CUDA_ATTN=0`, `COLI_CUDA_ATTN_SHARD=0`,
+`COLI_MMAP=0`, and `COLI_RAMMAP=1`.
+
 ### Full-residency reference result (6× RTX 5090, 251 GiB host)
 
 `CUDA_EXPERT_GB=auto PIN_GB=all` selected a 176.7 GB VRAM tier + 191.3 GB RAM

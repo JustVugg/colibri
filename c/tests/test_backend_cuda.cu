@@ -157,6 +157,10 @@ static int test_fmt6(int dev) {
     ColiCudaTensor *t6 = nullptr;
     int ok = coli_cuda_matmul(&t6, got, x, q, nullptr, 6, S, I, O, dev, 0);
     if (!ok) { std::fprintf(stderr,"fmt=6 matmul rejected\n"); return 0; }
+    if (coli_cuda_tensor_bytes(t6) != (size_t)O*nb*T6_BB) {
+        std::fprintf(stderr,"fmt=6 tensor bytes include an unallocated scale buffer\n");
+        return 0;
+    }
     if (!relative_rms(got, want, S*O, 1e-4f)) { std::fprintf(stderr,"fmt=6 matmul mismatch\n"); return 0; }
 
     /* --- expert MLP: gate/up, silu, the device-side down rotation, down ---
@@ -199,6 +203,12 @@ static int test_fmt6(int dev) {
         !coli_cuda_tensor_upload(&tu6,qu,nullptr,6,I,O,dev) ||
         !coli_cuda_tensor_upload(&td6,qd,nullptr,6,O,I,dev)) {
         std::fprintf(stderr,"fmt=6 expert upload failed\n"); return 0;
+    }
+    if (coli_cuda_tensor_bytes(tg6) != (size_t)O*nb*T6_BB ||
+        coli_cuda_tensor_bytes(tu6) != (size_t)O*nb*T6_BB ||
+        coli_cuda_tensor_bytes(td6) != (size_t)I*nbd*T6_BB) {
+        std::fprintf(stderr,"fmt=6 expert tensor byte accounting mismatch\n");
+        return 0;
     }
     float *got_e = (float*)std::malloc((size_t)S*I*sizeof(float));
     if (!coli_cuda_expert_mlp(tg6,tu6,td6,got_e,x,S)) {
