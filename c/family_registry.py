@@ -928,7 +928,23 @@ FAMILIES = (
     FamilyDescriptor(
         id="glm",
         model_types=("glm_moe_dsa", "glm5_moe", "glm"),
-        display_name="GLM-5.2",
+        # Two model names, one family, and that is not a shortcut. Z.ai state
+        # it on GLM-5.3's own card: "GLM-5.3 uses the same base model as
+        # GLM-5.2 -- every gain comes from post-training." The checkpoints
+        # agree. Diffing the two config.json leaves exactly one extra key
+        # (moe_router_dtype) and the transformers_version that wrote the file:
+        # same 78 layers, 256 experts, hidden 6144, moe_intermediate 2048, same
+        # parameter count. There is nothing architectural to tell them apart,
+        # so no rule over the configuration can name one and not the other, now
+        # or later. #1326's approach for Qwen -- name a checkpoint by its
+        # geometry -- cannot apply here, because the geometry is identical.
+        #
+        # Announcing a GLM-5.3 container as "GLM-5.2" was wrong in the one way
+        # that matters: the engine ran the right weights and the banner named a
+        # different model. Naming both is the honest statement of what this
+        # family loads. If a future release ever adds a real discriminator,
+        # split this then, on evidence.
+        display_name="GLM-5.2/5.3",
         display_scale="744B",
         engine_artifact="colibri",
         engine_aliases=("glm",),

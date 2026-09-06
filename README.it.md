@@ -12,7 +12,7 @@ miliardi a 2,8 mila miliardi di parametri** — su hardware consumer ed eterogen
 in C puro e senza dipendenze del motore, trattando storage, RAM e VRAM come
 un'unica gerarchia di inferenza.
 
-Oggi girano otto famiglie: **GLM-5.2** (744B), **GLM-5.3-Flash** (321B, con
+Oggi girano otto famiglie: **GLM-5.2/5.3** (744B), **GLM-5.3-Flash** (321B, con
 vision), **Inkling** (975B), **Kimi K3** (2,8T), **DeepSeek V4 Flash** (284B),
 **Qwen3.8-Flash-Next** (125B + 51B n-gram), **Qwen3.6** (35B-A3B) e
 **OLMoE** (7B) — un
