@@ -101,6 +101,8 @@ typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const flo
                                     int fmt, int S, int I, int O, int device, int gs);
 typedef void           (*fn_tensor_free)(ColiCudaTensor *tensor);
 typedef size_t         (*fn_tensor_bytes)(const ColiCudaTensor *tensor);
+typedef size_t         (*fn_tensor_vram)(const ColiCudaTensor *tensor);
+typedef size_t         (*fn_alloc_footprint)(size_t bytes);
 typedef int            (*fn_tensor_device)(const ColiCudaTensor *tensor);
 
 /* --- #111 GPU resident pipeline additions (matched to backend_cuda.h) --- */
@@ -174,6 +176,8 @@ static struct {
     fn_matmul          matmul;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
+    fn_tensor_vram     tensor_vram;
+    fn_alloc_footprint alloc_footprint;
     fn_tensor_device   tensor_device;
 
     fn_attention_absorb_batch attention_absorb_batch;
@@ -1418,6 +1422,13 @@ static int coli_cuda_load(void){
     RESOLVE(matmul,         fn_matmul)
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
+    /* Optional, same reasoning as e8_set_grid above: a DLL predating #687
+     * leaves these NULL and the wrappers fall back to the logical byte
+     * count, which is exactly the behaviour that shipped before. Using
+     * RESOLVE here instead would unload the whole CUDA backend over one
+     * missing symbol - a far worse failure than the over-commit it fixes. */
+    RESOLVE_OPT(tensor_vram,     fn_tensor_vram)
+    RESOLVE_OPT(alloc_footprint, fn_alloc_footprint)
     RESOLVE(tensor_device,  fn_tensor_device)
 
     RESOLVE(attention_absorb_batch, fn_attention_absorb_batch)
@@ -1617,6 +1628,22 @@ void coli_cuda_tensor_free(ColiCudaTensor *tensor){
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor){
     if(!g_cuda.available) return 0;
     return g_cuda.tensor_bytes(tensor);
+}
+
+/* Falls back to the LOGICAL size when the DLL predates #687. That is an
+ * under-count, and it is the pre-existing behaviour rather than a new
+ * failure mode: the tier over-commits exactly as much as it always did.
+ * Returning 0 here would be far worse - the caller would charge nothing
+ * for an expert it just placed. */
+size_t coli_cuda_tensor_vram(const ColiCudaTensor *tensor){
+    if(!g_cuda.available) return 0;
+    if(!g_cuda.tensor_vram) return g_cuda.tensor_bytes(tensor);
+    return g_cuda.tensor_vram(tensor);
+}
+
+size_t coli_cuda_alloc_footprint(size_t bytes){
+    if(!g_cuda.available || !g_cuda.alloc_footprint) return bytes;
+    return g_cuda.alloc_footprint(bytes);
 }
 
 int coli_cuda_tensor_device(const ColiCudaTensor *tensor){
