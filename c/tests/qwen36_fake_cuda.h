@@ -42,6 +42,7 @@ static unsigned char captured[4096];
 static size_t captured_len;
 
 static int fake_ndev = 1;
+static size_t fake_free_bytes = 2ull << 30;    /* what coli_cuda_mem_info reports as free */
 static int (*fake_issue_hook)(int device, int count, const float *x) = NULL;
 
 static int upload_common(ColiCudaTensor **t, const void *w, int fmt,
@@ -51,7 +52,7 @@ static int upload_common(ColiCudaTensor **t, const void *w, int fmt,
     *t = n;
     fake_uploads++;
     last_fmt = fmt;
-    last_bytes = (size_t)I * O / (fmt == 1 ? 1 : 2);
+    last_bytes = (size_t)I * O / ((fmt == 1 || fmt == 8) ? 1 : 2);
     if (fake_uploads == 1) {
         captured_len = last_bytes < sizeof captured ? last_bytes : sizeof captured;
         memcpy(captured, w, captured_len);
@@ -70,10 +71,12 @@ void coli_cuda_tensor_free(ColiCudaTensor *t) { free(t); }
 int coli_cuda_available_device_count(void) { return fake_ndev; }
 int coli_cuda_device_count(void) { return fake_ndev; }
 int coli_cuda_init(const int *d, int n) { (void)d; (void)n; return 1; }
+static int fake_lut_published;
+int coli_cuda_fp8_set_lut(const float *lut) { fake_lut_published = lut != NULL; return lut != NULL; }
 void coli_cuda_shutdown(void) {}
 int coli_cuda_mem_info(int device, size_t *freeb, size_t *total) {
     (void)device;
-    *freeb = 2ull << 30; *total = 4ull << 30;      /* 2 GiB liberi */
+    *freeb = fake_free_bytes; *total = 4ull << 30;   /* 2 GiB liberi by default */
     return 1;
 }
 int coli_cuda_expert_group_issue(ColiCudaTensor *const *g, ColiCudaTensor *const *u,
@@ -91,6 +94,15 @@ void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
 }
 void coli_cuda_stats(int device, size_t *count, size_t *bytes) {
     (void)device; if (count) *count = 0; if (bytes) *bytes = 0;
+}
+
+/* dense GEMV on a resident tensor (lm_head / DeltaNet projections placed on a
+ * device). Counted, never computed: the placement tests check WHERE work
+ * went; the arithmetic has its own oracle in the CUDA build. Parameters are
+ * unused on purpose (CFLAGS carry -Wno-unused-parameter). */
+static int fake_matmuls;
+int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x, const void *weights, const float *scales, int fmt, int S, int I, int O, int device, int gs) {
+    fake_matmuls++; return 1;
 }
 
 #endif /* QWEN36_FAKE_CUDA_H */

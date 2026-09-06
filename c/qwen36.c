@@ -2032,8 +2032,12 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     float scale = 1.f / sqrtf((float)kdim);
     int H = c->hidden;
 
-    float *qkv = falloc(conv_dim);
-    float *z   = falloc(value_dim);
+    /* qkv and z live in ONE buffer: the fused GPU projection writes
+     * [conv_dim ++ value_dim] in a single GEMV, and the CPU fallback fills the
+     * same two regions. Either way the code below reads qkv/z unchanged. */
+    float *qkvz = falloc((int64_t)conv_dim + value_dim);
+    float *qkv = qkvz;
+    float *z   = qkvz + conv_dim;
     float *b   = falloc(vh);
     float *a   = falloc(vh);
     float *beta= falloc(vh);
@@ -2053,9 +2057,12 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
         const float *xs = x + (int64_t)s * H;
         extern double g_dn_sub[4];
         double _d0 = tm_on()? tm_now():0;
-        /* projections (single-token matmuls) */
-        matmul_d(qkv, xs, l->dn_qkv, 1, H, conv_dim);
-        matmul_d(z,   xs, l->dn_z,   1, H, value_dim);
+        /* projections (single-token matmuls). One fused GEMV when this layer's
+         * dnproj is placed on a GPU, the two CPU matmuls otherwise. */
+        if (!qt_dnproj_matmul(layer, qkvz, xs, H, conv_dim + value_dim)) {
+            matmul_d(qkv, xs, l->dn_qkv, 1, H, conv_dim);
+            matmul_d(z,   xs, l->dn_z,   1, H, value_dim);
+        }
         matmul(b,   xs, l->dn_b,   1, H, vh);
         matmul(a,   xs, l->dn_a,   1, H, vh);
         if (tm_on() && S==1){ double t=tm_now(); g_dn_sub[0]+=t-_d0; _d0=t; }
@@ -2171,7 +2178,8 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
             }
         }
     }
-    free(qkv); free(z); free(b); free(a); free(beta); free(gg);
+    free(qkvz);   /* qkv and z are regions of this one allocation */
+    free(b); free(a); free(beta); free(gg);
     free(conv_out); free(q); free(k); free(outv); free(outr); free(kv); free(delta);
 }
 
@@ -2244,7 +2252,8 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
     double _th = tm_on() ? tm_now() : 0.0;
-    matmul_d(logit, last, m->lm_head, 1, D, c->vocab);
+    if (!qt_lmhead_matmul(logit, last, D, c->vocab))
+        matmul_d(logit, last, m->lm_head, 1, D, c->vocab);
     if (tm_on()) { tm_add(S, 5, tm_now()-_th); if (S==1) g_tm_dec_tokens++; else g_tm_pre_tokens += S; }
     free(x); free(last);
     if (lf) fclose(lf);
@@ -2694,8 +2703,13 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
         const uint8_t *wg = expert_is_int4 ? e->g4 : (const uint8_t *)e->g;
         const uint8_t *wu = expert_is_int4 ? e->u4 : (const uint8_t *)e->u;
         const uint8_t *wd = expert_is_int4 ? e->d4 : (const uint8_t *)e->d;
-        if (planned[gi] && wg) {
+        if (planned[gi]) {
+            /* Reported even when wg is NULL: the tier reserved budget for
+             * this expert in qt_plan_fill, and a planned expert that is never
+             * reported keeps that reservation forever. With no weights the
+             * tier hands the bytes back instead of uploading. */
             qt_note_planned(l, eidw, wg, wu, wd, e->gs, e->us, e->ds);
+            if (!wg) continue;
             /* The staging copy is done. On an int4 container the int8 copy
              * can go RIGHT AWAY so it never shows up in peak RSS: g4/u4/d4
              * stay as the source of truth, and slot_ensure_int8() rebuilds
@@ -2845,10 +2859,70 @@ int main(int argc, char **argv) {
         int64_t want = 2*(int64_t)m.c.inter*m.c.hidden + (int64_t)m.c.hidden*m.c.inter;
         if (pt && pt->nbytes == want) expert_is_int4 = 0;   /* int8: un byte per elemento */
     }
+    /* Offer the dense trunk to the placer before the tier decides its budget:
+     * sizes only, from the same dense-i8 entries the uploads below will use.
+     * No entry (dense-i8 off) means nothing to offer, and the CPU path stands. */
+    {
+        int O_qkv = m.c.dn_conv_dim, O_z = m.c.dn_vheads * m.c.dn_vdim;
+        for (int i = 0; i < g_qdw_n; i++)
+            if (g_qdw[i].w == m.lm_head)
+                qt_trunk_offer("lmhead", 0, (size_t)g_qdw[i].I * g_qdw[i].O + (size_t)g_qdw[i].O * sizeof(float));
+        for (int i = 0; i < m.c.n_layers; i++) {
+            if (m.c.is_attn[i]) continue;
+            int have = 0;
+            for (int j = 0; j < g_qdw_n; j++)
+                if (g_qdw[j].w == m.L[i].dn_qkv || g_qdw[j].w == m.L[i].dn_z) have++;
+            if (have == 2)
+                qt_trunk_offer("dnproj", i, (size_t)(O_qkv + O_z) * m.c.hidden + (size_t)(O_qkv + O_z) * sizeof(float));
+        }
+    }
     if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
         atexit(qt_shutdown);
+        /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The
+         * qdw entry keyed by m.lm_head holds the int8 rows + per-row scales
+         * the CPU path uses; the GPU applies the identical semantics. */
+        for (int i = 0; i < g_qdw_n; i++)
+            if (g_qdw[i].w == m.lm_head) {
+                qt_lmhead_init(g_qdw[i].q, g_qdw[i].sc, g_qdw[i].I, g_qdw[i].O);
+                break;
+            }
+        /* R4 step 2: DeltaNet input projections, per layer, wherever
+         * COLI_PLACE puts them. qkv and z are both [O_x, hidden] int8 with
+         * per-row scales, so fusing them is a concatenation along O -- two
+         * memcpys, no requantization, and the GPU sees one GEMV per layer
+         * instead of two. The host copy is freed right after the upload. */
+        {
+            int placed = 0, O_qkv = m.c.dn_conv_dim, O_z = m.c.dn_vheads * m.c.dn_vdim;
+            int Of = O_qkv + O_z, Hd = m.c.hidden;
+            double vram = 0;
+            for (int i = 0; i < m.c.n_layers; i++) {
+                if (m.c.is_attn[i]) continue;
+                int dev = qt_place_of("dnproj", i);
+                if (dev == QT_PLACE_CPU) continue;
+                const int8_t *q1 = NULL, *q2 = NULL; const float *s1 = NULL, *s2 = NULL;
+                for (int j = 0; j < g_qdw_n; j++) {
+                    if (g_qdw[j].w == m.L[i].dn_qkv) { q1 = g_qdw[j].q; s1 = g_qdw[j].sc; }
+                    if (g_qdw[j].w == m.L[i].dn_z)   { q2 = g_qdw[j].q; s2 = g_qdw[j].sc; }
+                }
+                if (!q1 || !q2) continue;      /* dense-i8 off: CPU path stands */
+                int8_t *qf = malloc((size_t)Of * Hd);
+                float  *sf = malloc((size_t)Of * sizeof(float));
+                if (!qf || !sf) { free(qf); free(sf); break; }
+                memcpy(qf, q1, (size_t)O_qkv * Hd);
+                memcpy(qf + (size_t)O_qkv * Hd, q2, (size_t)O_z * Hd);
+                memcpy(sf, s1, (size_t)O_qkv * sizeof(float));
+                memcpy(sf + O_qkv, s2, (size_t)O_z * sizeof(float));
+                if (qt_dnproj_init(i, qf, sf, Hd, Of, dev)) {
+                    placed++; vram += (double)Of * Hd;
+                }
+                free(qf); free(sf);
+            }
+            if (placed)
+                fprintf(stderr, "[dnp] %d DeltaNet-Projektionen auf GPU (%.2f GB VRAM)\n",
+                        placed, vram / 1073741824.0);
+        }
         /* Warmstart: fill the VRAM budget BEFORE the first token (heat order
          * when HEAT_FILE exists, natural order otherwise), loading all RAM
          * slots along the way. */
