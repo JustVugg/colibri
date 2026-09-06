@@ -516,6 +516,7 @@ Two things that differ per model, both documented in the per-model page:
 | CUDA backend, VRAM expert tier, full residency | [docs/cuda.md](docs/cuda.md) |
 | Vulkan backend (any GPU: AMD via RADV, incl. cards ROCm dropped) | [docs/vulkan.md](docs/vulkan.md) |
 | Apple Silicon Metal backend | [docs/metal.md](docs/metal.md) |
+| Experimental Gemma 4 runtime adaptation | [docs/gemma4.md](docs/gemma4.md) |
 | OpenAI-compatible API, KV slots, web dashboard | [docs/api.md](docs/api.md) |
 | Experimental layer-segment embedding ABI | [docs/segment-runtime.md](docs/segment-runtime.md) |
 | Experimental tokenizer/embedding/head Edge ABI | [docs/edge-runtime.md](docs/edge-runtime.md) |
