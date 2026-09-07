@@ -88,6 +88,25 @@ int main(void) {
     qt_shutdown();
     tk(!G_fp8_stream && !G.on, "shutdown leaves the mode");
 
+    /* Second pass: the dense trunk on the fake tier. Every dense matrix of the
+     * fixture is offered (Q38_TRUNK_MIN_KB=0), quantized to int8 per row and
+     * "uploaded"; the fake backend now computes fmt 1 from the uploaded bytes,
+     * so the run must reproduce the oracle within its limits like the CPU int8
+     * reference (Q38_TRUNK_CPU_INT8=1) does, and every offered matrix must have
+     * been placed and released again at shutdown. */
+    printf(" trunk on the fake tier\n");
+    setenv("Q38_TRUNK_GPU", "1", 1);
+    setenv("Q38_TRUNK_MIN_KB", "0", 1);
+    setenv("COLI_PLACE", "auto", 1);             /* the placer decides per offer */
+    setenv("CUDA_EXPERT_GB", "0.5", 1);          /* room for the trunk and every expert */
+    fake_dense_compute = 1; fake_uploads = 0;
+    rc = qwen38_main_unused(4, argv);
+    tk(rc == 0, "engine with the int8 trunk on the fake tier stays within the oracle's limits");
+    tk(g_trunk_n > 0 && qt_dense_count() == g_trunk_n, "every offered dense matrix was placed and uploaded");
+    tk(fake_uploads >= g_trunk_n, "one upload per placed matrix");
+    qt_shutdown();
+    tk(qt_dense_count() == 0, "dense handles released at shutdown");
+
     if (t_fails) { printf("test_qwen38_tier_engine: %d failure(s)\n", t_fails); return 1; }
     printf("test_qwen38_tier_engine: ok\n");
     return 0;

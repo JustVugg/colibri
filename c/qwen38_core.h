@@ -49,6 +49,7 @@ typedef struct {
     Q38WeightKind kind;
     unsigned owns_data:1, owns_scales:1;
     int gpu;                       /* 0 = CPU; else 1 + tier handle of an int8 copy resident in VRAM (decode, S == 1) */
+    int8_t *q8; float *q8sc;       /* Q38_TRUNK_CPU_INT8=1: the same int8 rows kept on the CPU (reference for the GPU path, no GPU needed) */
 } Q38Weight;
 
 typedef struct { float *norm; Q38Weight down, up, inject; } GatedResidual;
@@ -206,6 +207,7 @@ static void q38_weight_free(Q38Weight *weight) {
     if(!weight)return;
     if(weight->owns_data)free(weight->data);
     if(weight->owns_scales)free(weight->scales);
+    free(weight->q8); free(weight->q8sc);
     memset(weight,0,sizeof(*weight));
 }
 
@@ -268,6 +270,18 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
      * so the BF16 copy stays the reference for everything but S == 1. */
     if(S==1&&weight&&weight->gpu&&weight->rows==O&&weight->cols==I&&
        qt_dense_matmul(weight->gpu-1,y,x,I,O))return;
+    if(S==1&&weight&&weight->q8&&weight->rows==O&&weight->cols==I){
+        /* the int8 rows the GPU would hold, computed here: what the trunk
+         * quantization alone does to the output, GPU or not */
+        const int8_t *q=weight->q8; const float *sc=weight->q8sc;
+        #pragma omp parallel for schedule(static)
+        for(int o=0;o<O;o++){
+            const int8_t *w=q+(size_t)o*I; float a=0.f;
+            for(int i=0;i<I;i++)a+=x[i]*(float)w[i];
+            y[o]=a*sc[o];
+        }
+        return;
+    }
     if(!weight||weight->rows!=O||weight->cols!=I||!weight->data){
         fprintf(stderr,"invalid matmul weight: have [%d,%d] kind=%d, need [%d,%d]\n",
                 weight?weight->rows:0,weight?weight->cols:0,
@@ -1698,7 +1712,17 @@ static Q38TrunkItem *g_trunk; static int g_trunk_n, g_trunk_cap;
 static void q38_trunk_add(Q38Weight *w,const char *name,int layer) {
     if(!w||!w->data||(w->kind!=Q38_WEIGHT_BF16&&w->kind!=Q38_WEIGHT_F32))return;
     size_t bytes=(size_t)w->rows*w->cols+(size_t)w->rows*sizeof(float);
-    if(bytes<(1u<<20))return;                      /* a round trip costs more than a tiny GEMV saves */
+    /* Q38_TRUNK_MIN_KB (default 1024): a round trip costs more than a tiny
+     * GEMV saves; Q38_TRUNK_SKIP=name,name: leave those components on the
+     * CPU (bisecting a numeric difference, or a component that does not pay) */
+    static long min_kb=-1; static const char *skip;
+    if(min_kb<0){ const char *e=getenv("Q38_TRUNK_MIN_KB"); min_kb=e?atol(e):1024; skip=getenv("Q38_TRUNK_SKIP"); }
+    if(bytes<(size_t)min_kb*1024)return;
+    if(skip&&*skip){
+        size_t n=strlen(name); const char *s=skip;
+        while(*s){ const char *c=strchr(s,','); size_t l=c?(size_t)(c-s):strlen(s);
+                   if(l==n&&!strncmp(s,name,n))return; if(!c)break; s=c+1; }
+    }
     if(g_trunk_n==g_trunk_cap){
         g_trunk_cap=g_trunk_cap?2*g_trunk_cap:256;
         g_trunk=(Q38TrunkItem*)realloc(g_trunk,(size_t)g_trunk_cap*sizeof(*g_trunk));
@@ -1735,6 +1759,38 @@ static void q38_trunk_offer_all(Model *m) {
         q38_trunk_add(&L->router,"router",l);
     }
 }
+/* int8 per row, scale = max|w| / 127 (the qwen36 dnproj/lmhead format) */
+static void q38_trunk_quantize(const Q38Weight *w,int8_t **qp,float **scp) {
+    int O=w->rows,I=w->cols;
+    int8_t *q=(int8_t*)malloc((size_t)O*I); float *sc=(float*)malloc((size_t)O*sizeof(float));
+    if(!q||!sc){fprintf(stderr,"OOM trunk quantization\n");exit(1);}
+    #pragma omp parallel for schedule(static)
+    for(int r=0;r<O;r++){
+        float row[8192]; float *src=row; float *heap=NULL;
+        if(I>8192){heap=(float*)malloc((size_t)I*sizeof(float)); src=heap;}
+        q38_weight_row(w,r,src);
+        float mx=0.f; for(int k=0;k<I;k++){float a=fabsf(src[k]); if(a>mx)mx=a;}
+        float s=mx>0.f?mx/127.f:1.f, inv=1.f/s; sc[r]=s;
+        int8_t *dst=q+(size_t)r*I;
+        for(int k=0;k<I;k++){int v=(int)lrintf(src[k]*inv); if(v>127)v=127; if(v<-127)v=-127; dst[k]=(int8_t)v;}
+        free(heap);
+    }
+    *qp=q; *scp=sc;
+}
+/* Q38_TRUNK_CPU_INT8=1: keep the int8 rows on the CPU instead (or as well),
+ * so the quantization can be judged without a GPU (PPL, token parity) */
+static void q38_trunk_cpu_int8(Model *m) {
+    const char *e=getenv("Q38_TRUNK_CPU_INT8");
+    if(!e||e[0]!='1'||e[1])return;
+    if(!g_trunk_n) q38_trunk_offer_all(m);
+    double t0=now_s(); size_t bytes=0;
+    for(int i=0;i<g_trunk_n;i++){
+        Q38Weight *w=g_trunk[i].w; if(w->q8)continue;
+        q38_trunk_quantize(w,&w->q8,&w->q8sc); bytes+=(size_t)w->rows*w->cols;
+    }
+    fprintf(stderr,"[qwen38] trunk: %d matrices int8 on the CPU (%.2f GiB) in %.1fs (Q38_TRUNK_CPU_INT8)\n",
+            g_trunk_n,bytes/1073741824.0,now_s()-t0);
+}
 /* after qt_init: quantize and upload what the placer accepted */
 static void q38_trunk_place_all(Model *m) {
     (void)m;
@@ -1744,20 +1800,18 @@ static void q38_trunk_place_all(Model *m) {
         int dev=qt_place_of(it->name,it->layer);
         if(dev==QT_PLACE_CPU)continue;
         int O=w->rows,I=w->cols;
-        int8_t *q=(int8_t*)malloc((size_t)O*I); float *sc=(float*)malloc((size_t)O*sizeof(float));
-        if(!q||!sc){fprintf(stderr,"OOM trunk quantization\n");exit(1);}
-        #pragma omp parallel for schedule(static)
-        for(int r=0;r<O;r++){
-            float row[8192]; float *src=row; float *heap=NULL;
-            if(I>8192){heap=(float*)malloc((size_t)I*sizeof(float)); src=heap;}
-            q38_weight_row(w,r,src);
-            float mx=0.f; for(int k=0;k<I;k++){float a=fabsf(src[k]); if(a>mx)mx=a;}
-            float s=mx>0.f?mx/127.f:1.f, inv=1.f/s; sc[r]=s;
-            int8_t *dst=q+(size_t)r*I;
-            for(int k=0;k<I;k++){int v=(int)lrintf(src[k]*inv); if(v>127)v=127; if(v<-127)v=-127; dst[k]=(int8_t)v;}
-            free(heap);
-        }
+        int8_t *q; float *sc; q38_trunk_quantize(w,&q,&sc);
         int h=qt_dense_init(q,sc,I,O,dev);
+        if(h>=0&&getenv("Q38_TRUNK_SELFTEST")){
+            /* DIAG: GPU int8 GEMV against the same int8 matrix on the CPU */
+            float *x=(float*)malloc((size_t)I*sizeof(float)),*yg=(float*)malloc((size_t)O*sizeof(float)),*yc=(float*)malloc((size_t)O*sizeof(float));
+            for(int k=0;k<I;k++)x[k]=sinf(0.37f*k)+0.1f*(k%7);
+            for(int r=0;r<O;r++){double a=0; for(int k=0;k<I;k++)a+=(double)q[(size_t)r*I+k]*x[k]; yc[r]=(float)(a*sc[r]);}
+            int ok=qt_dense_matmul(h,yg,x,I,O); double num=0,den=0; int worst=0;
+            for(int r=0;r<O;r++){double d=yg[r]-yc[r]; num+=d*d; den+=(double)yc[r]*yc[r]; if(fabs(d)>fabs(yg[worst]-yc[worst]))worst=r;}
+            fprintf(stderr,"[selftest] %-7s L%-2d [O=%d I=%d] ok=%d rel.err %.2e worst row %d gpu %.5g cpu %.5g\n",it->name,it->layer,O,I,ok,den>0?sqrt(num/den):-1.0,worst,yg[worst],yc[worst]);
+            free(x);free(yg);free(yc);
+        }
         free(q); free(sc);
         if(h>=0){ w->gpu=h+1; placed++; placed_bytes+=(size_t)O*I; }
     }

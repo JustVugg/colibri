@@ -167,8 +167,9 @@ conversion); the rest run on the CPU as before. Every expert the CPU
 computes is reported to the tier, which copies the 4.7 MiB slab and the
 three scale tables during that call -- the RAM slot may be recycled by the
 next token -- and promotes it when it has room or when it is hotter than
-the coldest resident expert on its device (budget-neutral swap). The dense
-trunk, prefill, QSA and the PLE table stay on the CPU.
+the coldest resident expert on its device (budget-neutral swap). Prefill,
+the DeltaNet recurrence, QSA and the PLE table stay on the CPU; the dense
+trunk goes to the GPU as well, see below.
 
 ```bash
 make -C c qwen38 CUDA=1 CUDA_ARCH=native      # NVCC=/usr/bin/nvcc on distro CUDA
@@ -229,6 +230,81 @@ the wall time does not move. The parity holds, the plumbing is exercised on a
 real checkpoint, and the honest summary is: on a machine of this class the
 expert tier is not where Qwen3.8's decode time is. The dense trunk (a third of
 the token) and the expert reads (another third, a RAM-cap question) are.
+
+### The dense trunk in VRAM (stage 1)
+
+The trunk is the largest fixed cost of a decode token and it is
+bandwidth-bound: 8 GiB of BF16 matmul weights read on every token at the
+memory bus's pace. With the tier on, the engine offers every dense matmul
+matrix of at least 1 MiB to the tier's placer by name and layer (the
+DeltaNet projections `dnqkv`/`dnz`/`dnout`, attention `attnq`/`attnk`/
+`attnv`/`attno`/`qsaidx`, the hyper-connection mixers `hcad`/`hcau`/`hcmd`/
+`hcmu`, the shared expert `shg`/`shu`/`shd`, the `router`, and `lmhead`);
+whatever the placer accepts is quantized to **int8 per row** (scale = max|w|
+/ 127, the qwen36 dnproj/lmhead format) when the tier starts -- about 2 s
+for the 553 matrices, 3.96 GiB on one card -- and answers decode GEMVs from
+there, one round trip per matmul (`x` up, `y` down; activations stay on the
+CPU). Prefill rows (S > 1) and any backend failure take the BF16 CPU path,
+which stays in RAM. The placer takes the trunk before the experts (it is
+read on every token), so on an 8 GB card about 2 GB remain for hot experts;
+`coli plan` prices it the same way (`4.0 GB int8 trunk + ... hot tier`).
+
+| variable | effect |
+|---|---|
+| `Q38_TRUNK_GPU=0` | keep the trunk on the CPU (experts-only tier, the behaviour before this) |
+| `Q38_TRUNK_MIN_KB=<n>` | offer matrices of at least n KiB (default 1024; a round trip costs more than a tiny GEMV saves) |
+| `Q38_TRUNK_SKIP=name,name` | leave the named components on the CPU (bisecting, or a component that does not pay) |
+| `Q38_TRUNK_CPU_INT8=1` | the same int8 rows on the CPU instead -- what the quantization alone does to the output, no GPU needed (perplexity, token parity); a matrix the GPU holds is still answered from VRAM |
+| `Q38_TRUNK_SELFTEST=1` | at start, every placed matrix is checked once: GPU GEMV against the same int8 rows on the CPU (relative error printed per matrix) |
+
+**Numerics.** GPU int8 against CPU int8 on the same rows: relative error
+~1e-7 on all 553 matrices (float summation order), greedy tokens identical
+over 30 tokens on the 315-token prompt and 20 on a short one. int8 against
+BF16: the per-row quantization error is 1 - 3 % per matrix (largest on the
+router and the hyper-connection down-mixers), and on the same prompts the
+greedy text is identical to the BF16 run for the 30 tokens compared.
+Perplexity on wikitext-2 (8 chunks of 512, 2048 scored tokens, llama-perplexity
+protocol): 1.880 with the trunk and the expert tier on the GPU against 1.845 for
+the BF16 CPU run, +1.9 %. The expert tier on its own is neutral (+0.0008 nats on
+a 256-token probe), the lm_head contributes nothing, and keeping the 48 routers
+in BF16 on the CPU (`Q38_TRUNK_SKIP=router`) only recovers 0.3 points (1.875):
+the per-row int8 error is spread over the trunk, not concentrated in one class.
+Group scales (gs 64/128) for the trunk are the lever left; that needs a kernel
+format, not a placement change.
+
+**Measured** (same machine and prompt as above, cap 224 so the RAM LRU
+serves 84 % of expert reads, `COLI_TIMERS=1` decode bank, 100 tokens):
+
+| | CPU only (BF16 trunk) | experts only, one card | trunk on one card, no experts | trunk + experts, one card | trunk + experts, two cards |
+|---|---:|---:|---:|---:|---:|
+| VRAM: trunk / experts | -- | 0 / 6.1 GB | 4.0 / 0.1 GB | 4.0 / 2.1 GB | 1.8 + 2.2 / 4.3 + 4.3 GB |
+| VRAM share of routed experts | -- | 43 % | 2 % | 22 % | 52 % |
+| resident-mm (dense trunk incl. DeltaNet proj.), ms/token | 284 | 285 | 52 | 63 | 89 |
+| shared expert / lm-head, ms/token | 21 / 46 | 21 / 46 | 6 / 5 | 7 / 5 | 12 / 14 |
+| routed-expert GEMV on the CPU, ms/token | 179 | 118 | 182 | 151 | 93 |
+| expert-read (page-cache copies), ms/token | 168 | 164 | 162 | 160 | 145 |
+| **decode, ms/token** | **744** | **754** | **557** | **523** | **466** |
+| **decode tok/s** | **1.34** | **1.33** | **1.80** | **1.91** | **2.14** |
+| greedy tokens (100) | reference | identical | identical | identical | identical |
+
+Peak RSS 60.1 - 60.5 GB in every run (cap 224); TTFT 183 - 185 s in every run (the prompt's
+forward stays on the CPU). On two cards the placer spreads the trunk by free room (1.8 GB on
+the 3070, 2.2 GB with the lm_head on the Quadro) and the experts on both; the Quadro is the
+slower card (lm-head 14 ms there against 5 ms on the 3070), which is the +26 ms of
+resident-mm against one card -- and the 52 % expert share still wins by 57 ms. The trunk is
+worth +34 % on its own (1.34 -> 1.80), the expert tier nothing on its own (1.33) and +6 %
+on top of the trunk (1.91), because the GEMVs it saves were the small part all along; the
+two-card run gets its +60 % from both. The first calibration (06.09.) gave 1.45 -> 1.76 on
+the same prompt with the old binary; today's CPU baseline is 8 % lower, run-to-run scatter
+of the page-cache expert reads (168 vs 149 ms), so the ratios are the comparable figures.
+
+One thing found on the way: the backend's resident dense matvec shared its
+`x`/`y` staging buffers with the asynchronous expert group. The shared
+expert's three GEMVs run between `qt_issue` and `qt_take`, so with the trunk
+in VRAM they overwrote the in-flight group's input and output -- no CUDA
+error, only wrong tokens, worse the more experts were resident. The dense
+path has its own buffers now ([qwen36-cuda-tier.md](qwen36-cuda-tier.md));
+qwen36 never called the dense path inside that window.
 
 ## Performance telemetry
 

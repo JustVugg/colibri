@@ -668,7 +668,15 @@ memInfo.free:                     23.50 GB (97%)
             },
         }
         (self.model / "config.json").write_text(json.dumps(config))
-        tensors = [("model.embed_tokens.weight", 256, "BF16")]
+        MiB = 1 << 20
+        tensors = [("model.embed_tokens.weight", 256, "BF16"),
+                   # dense matmul matrices the engine offers to the tier: one
+                   # big enough to go (4 MiB BF16 -> 2 MiB int8), one under the
+                   # 1 MiB line that stays on the CPU, one PLE projection that
+                   # is never offered
+                   ("model.layers.0.linear_attn.in_proj_qkv.weight", 4 * MiB, "BF16"),
+                   ("model.layers.0.mlp.gate.weight", 1024, "BF16"),
+                   ("model.layers.1.ple.key_proj.weight", 4 * MiB, "BF16")]
         for projection in ("gate_proj", "up_proj", "down_proj"):
             prefix = f"model.layers.0.mlp.experts.0.{projection}"
             tensors.append((prefix + ".weight", 32, "F8_E4M3"))
@@ -678,7 +686,9 @@ memInfo.free:                     23.50 GB (97%)
             ))
         write_shard(self.model / "model.safetensors", tensors)
         analysis = analyze_model(self.model)
-        self.assertEqual(analysis["dense_bytes"], 256)
+        self.assertEqual(analysis["dense_bytes"], 256 + 4 * MiB + 1024 + 4 * MiB)
+        # The stage-1 trunk offload: int8 bytes of the offered matrices only.
+        self.assertEqual(analysis["trunk_int8_bytes"], 2 * MiB)
         # The three native FP8 sidecars are retained once in the normalized
         # scale bank, not once per cache slot.
         self.assertEqual(analysis["expert_fixed_bytes"], 12)
@@ -698,6 +708,11 @@ memInfo.free:                     23.50 GB (97%)
         self.assertEqual([device["index"] for device in plan["tiers"]["vram"]["devices"]], [0])
         self.assertGreater(plan["tiers"]["vram"]["budget_bytes"], 0)
         self.assertTrue(any(item["target"] == "VRAM" for item in plan["decisions"]))
+        # The trunk goes first, out of the same VRAM, and the plan says so.
+        self.assertEqual(plan["tiers"]["vram"]["trunk_bytes"], 2 * MiB)
+        self.assertTrue(any(item["reason"] == "dense trunk as int8 residents"
+                            for item in plan["decisions"]))
+        self.assertIn("int8 trunk", format_plan(plan))
         cap = plan["tiers"]["ram"]["cache_slots_per_layer"]
         self.assertGreaterEqual(cap, 1)
         environment = environment_for_plan(plan)
@@ -716,7 +731,12 @@ memInfo.free:                     23.50 GB (97%)
         self.assertEqual([device["index"] for device in selected["tiers"]["vram"]["devices"]], [0])
         capped = build_plan(self.model, context=64, vram_gb=4, available_memory=16 * GB,
                             available_disk=16 * GB, gpus=[gpu])
-        self.assertLessEqual(capped["tiers"]["vram"]["budget_bytes"], 4 * GB)
+        self.assertLessEqual(capped["tiers"]["vram"]["budget_bytes"], 4 * GB - 2 * MiB)
+        self.assertEqual(capped["tiers"]["vram"]["trunk_bytes"], 2 * MiB)
+        # A budget too small for the trunk leaves it on the CPU: experts only.
+        tiny = build_plan(self.model, context=64, vram_gb=0.001, available_memory=16 * GB,
+                          available_disk=16 * GB, gpus=[gpu])
+        self.assertEqual(tiny["tiers"]["vram"]["trunk_bytes"], 0)
 
     def test_cli_emits_versioned_json(self):
         cli = Path(__file__).parents[1] / "coli"
