@@ -73,6 +73,13 @@ int  qt_dnproj_init(int layer, const int8_t *q, const float *sc,
                     int I, int O, int device);
 int  qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O);
 
+/* fp8 streaming mode (Qwen3.8): experts arrive as e4m3 bytes with 128x128
+ * block scales and do NOT all fit in RAM. cap may be smaller than n_experts;
+ * the tier copies what it uploads inside the qt_note call and keeps no
+ * pointer into the engine's slot. e4m3_lut is quant.h's E4M3_LUT, published
+ * to the backend so fmt=8 uploads are accepted. */
+int  qt_init_fp8(int n_layers, int n_experts, int hidden, int inter,
+                 int cap_experts_per_layer, int topk, const float *e4m3_lut);
 int  qt_init(int n_layers, int n_experts, int hidden, int inter,
              int cap_experts_per_layer, int topk, int expert_gs,
              int expert_is_int4);
@@ -112,6 +119,7 @@ void qt_stats(void);
 #else /* !COLI_CUDA: inline stubs, engine stays CPU-only */
 
 static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g,int h){(void)h;(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
+static inline int  qt_init_fp8(int a,int b,int c,int d,int e,int f,const float*g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_lmhead_init(const int8_t*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int  qt_lmhead_matmul(float*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 #define QT_PLACE_CPU (-1)
