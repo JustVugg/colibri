@@ -600,4 +600,43 @@ static inline void coli_print_launcher_help(const char *engine)
     coli_hold_console();
 }
 
+/* --- RAM disponibile ADESSO, in GB, per tutte le piattaforme ---------------
+ * "Disponibile" = recuperabile senza swap: MemAvailable su Linux; free +
+ * inactive + purgeable su macOS; su Windows ullAvailPhys MA limitata da
+ * ullAvailPageFile, il commit ancora concedibile: e' quello che decide se
+ * il prossimo malloc riesce, e su una macchina con pagefile piccolo puo'
+ * essere molto meno della RAM fisica libera.
+ *
+ * #1375: glm53.c leggeva /proc/meminfo ovunque, e su Windows quel file non
+ * esiste: la funzione tornava 0, il budget della cache esperti si clampava a
+ * 1 GB, e Flash su Windows girava con uno slot per layer. colibri.c aveva la
+ * versione giusta (macOS + Windows) da mesi, come funzione sua. Due copie di
+ * cui una sbagliata: ora e' una, qui, e i motori la chiamano.
+ * 0 = non misurabile; e' il chiamante a decidere il fallback. */
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+#include <unistd.h>
+static inline double compat_mem_available_gb(void){
+#ifdef __APPLE__
+    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vm;
+    if(host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &cnt) != KERN_SUCCESS) return 0;
+    return ((double)vm.free_count + (double)vm.inactive_count + (double)vm.purgeable_count)
+           * (double)sysconf(_SC_PAGESIZE) / 1e9;
+#elif defined(_WIN32)
+    MEMORYSTATUSEX msx = {0};
+    msx.dwLength = sizeof(msx);
+    if(!GlobalMemoryStatusEx(&msx)) return 0;
+    double phys = (double)msx.ullAvailPhys / 1e9;
+    double commit = (double)msx.ullAvailPageFile / 1e9;
+    return commit > 0 && commit < phys ? commit : phys;
+#else
+    FILE *f = fopen("/proc/meminfo", "r"); if(!f) return 0;
+    char ln[256]; double kb = 0;
+    while(fgets(ln, sizeof ln, f)) if(sscanf(ln, "MemAvailable: %lf", &kb) == 1) break;
+    fclose(f); return kb / 1e6;
+#endif
+}
+
 #endif /* COMPAT_H */

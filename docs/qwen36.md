@@ -66,7 +66,8 @@ Both optimizations are bit-exact and on by default.  For controlled A/Bs,
 Requirements: ~30 GB RAM for comfortable expert caching and NVMe storage for
 the container. The default build is CPU-only; `make -C c qwen36 CUDA=1` or
 `make -C c qwen36 VK=1` adds the optional VRAM expert tier documented in
-[`qwen36-tier.md`](qwen36-tier.md).
+[`qwen36-cuda-tier.md`](qwen36-cuda-tier.md) (CUDA, and how the tier works)
+and [`qwen36-tier.md`](qwen36-tier.md) (what differs on Vulkan).
 
 ## Which container?
 

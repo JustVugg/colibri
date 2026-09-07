@@ -63,6 +63,8 @@ c/tests/test_*
 !c/tests/test_*.cu
 !c/tests/test_*.mm
 !c/tests/test_*.py
+# scratch fixture directories the test binaries write at run time
+c/tests/tmp_*
 # bench_* and fuzz_* build to extensionless binaries in the same directory and
 # were not covered here, which is how c/tests/bench_omp_grain reached the tree.
 c/tests/bench_*
