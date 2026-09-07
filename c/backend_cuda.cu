@@ -82,6 +82,13 @@ typedef struct {
     int compute_major,compute_minor;
     float *x, *y, *gate, *up;
     size_t x_cap, y_cap, gate_cap, up_cap;
+    /* Staging of the resident dense matvec (coli_cuda_matmul), apart from
+     * x/y: the expert group (coli_cuda_expert_group_issue) runs on ctx->stream
+     * asynchronously while the engine's thread keeps computing -- qwen38's
+     * shared expert and the Qwen3.8 trunk go through coli_cuda_matmul between
+     * qt_issue and qt_take. Sharing x/y there overwrote the group's input and
+     * output mid-flight (silent, output-only corruption, no CUDA error). */
+    float *dx, *dy; size_t dx_cap, dy_cap;
     uint8_t *qx; float *qscale;
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y,*host_kv; size_t host_x_cap,host_y_cap,host_kv_cap;
@@ -1283,6 +1290,8 @@ extern "C" void coli_cuda_shutdown(void) {
         if (!select_ctx(ctx)) continue;
         if (ctx->x) cudaFree(ctx->x);
         if (ctx->y) cudaFree(ctx->y);
+        if (ctx->dx) cudaFree(ctx->dx);
+        if (ctx->dy) cudaFree(ctx->dy);
         if (ctx->gate) cudaFree(ctx->gate);
         if (ctx->up) cudaFree(ctx->up);
         if (ctx->qx) cudaFree(ctx->qx);
@@ -1304,6 +1313,7 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->ans_host=nullptr;ctx->ans_host_cap=0;ctx->ans_copy_pending=0;
 #endif
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
+        ctx->dx = ctx->dy = nullptr; ctx->dx_cap = ctx->dy_cap = 0;
         ctx->qx=nullptr; ctx->qscale=nullptr;
         ctx->aq=ctx->al=ctx->ar=ctx->ac=nullptr;
         ctx->host_x=ctx->host_y=ctx->host_kv=nullptr;ctx->stream=nullptr;
@@ -1689,11 +1699,11 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     if (!select_ctx(ctx)) return 0;
     size_t rb = row_bytes(fmt, I);
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
-    if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
-    if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
-    quant_matmul_launch(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
+    if (!reserve(&ctx->dx, &ctx->dx_cap, xb) || !reserve(&ctx->dy, &ctx->dy_cap, yb)) return 0;
+    if (!cuda_ok(cudaMemcpy(ctx->dx, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
+    quant_matmul_launch(ctx->dy, ctx->dx, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
-        !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
+        !cuda_ok(cudaMemcpy(y, ctx->dy, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
     return 1;
 }
 
