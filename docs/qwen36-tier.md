@@ -53,7 +53,11 @@ timings and tier telemetry.
 - **CUDA wins** when a binary is built with both `CUDA=1` and `VK=1`.
 - Numerics: the same offset-binary int4 layout as the CUDA upload, so
   `test_qwen36_tier_vk` (built into `make check`) holds the GPU output to
-  within 2e-3 relative of the CPU int4 path.
+  within 2e-3 relative of the CPU int4 path. It needs a device and skips
+  without one; the shim's control flow (single device, budget and its 4 GB
+  fallback, upload formats, fill-once, issue/take, the fp8 and trunk
+  refusals) is covered by `test_qwen36_tier_vk_fake` on a fake backend
+  (`tests/qwen36_fake_vulkan.h`), which runs everywhere `make check` does.
 
 ## Measured (RX 580 8 GB, i7-7700K, Qwen3.6-35B-A3B int4-gs64, 64-token decode)
 

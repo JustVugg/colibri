@@ -1313,6 +1313,16 @@ tests/test_qwen36_tier_vk$(EXE): tests/test_qwen36_tier_vk.c qwen36_tier.c qwen3
 tests/test_qwen36_tier_vk_int8$(EXE): tests/test_qwen36_tier_vk_int8.c tests/test_qwen36_tier_vk.c qwen36_tier.c qwen36_tier.h tier.h backend_vulkan.h $(VK_OBJ) $(VK_SPV)
 	$(CC) $(NOCUDA_CFLAGS) $< qwen36_tier.c $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+# The shim's CONTROL FLOW with no device: tests/qwen36_fake_vulkan.h defines
+# every coli_vk_* symbol the tier links against and records what it receives
+# (the Vulkan twin of qwen36_fake_cuda.h), so single-device init, the
+# VK_EXPERT_GB budget and its 4 GB fallback, the upload formats, fill-once,
+# issue/take through ybuf and the fp8/trunk refusals run in make check and
+# under the sanitizers on every platform. The numerics stay in the two gates
+# above. -UCOLI_CUDA because the shim prefers CUDA when both are defined.
+tests/test_qwen36_tier_vk_fake$(EXE): tests/test_qwen36_tier_vk_fake.c tests/qwen36_fake_vulkan.h qwen36_tier.c qwen36_tier.h tier.h backend_vulkan.h
+	$(CC) $(NOCUDA_CFLAGS) -UCOLI_CUDA -DCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
