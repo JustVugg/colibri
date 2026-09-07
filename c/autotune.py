@@ -478,7 +478,7 @@ def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
                     # instead of repeatedly teaching the cache one prompt.
                     for repeat in range(repeats):
                         active_prompt = serving_prompts[repeat % len(serving_prompts)]
-                        progress(f"{name} ({repeat + 1}/{repeats}, prompt "
+                        progress(f"{name} cap={cap} ({repeat + 1}/{repeats}, prompt "
                                  f"{repeat % len(serving_prompts) + 1}/"
                                  f"{len(serving_prompts)})")
                         pieces = []
@@ -529,7 +529,7 @@ def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
             def measure(name, overlay, launch_cap):
                 samples = []
                 for repeat in range(repeats):
-                    progress(f"{name} ({repeat + 1}/{repeats})")
+                    progress(f"{name} cap={cap} ({repeat + 1}/{repeats})")
                     sample = run_once(name, overlay, launch_cap)
                     sample["ttft_s"] = None
                     samples.append(sample)

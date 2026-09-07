@@ -1709,6 +1709,11 @@ tests/test_serve_poll$(EXE): tests/test_serve_poll.c serve_poll.h
 tests/test_rss_anon$(EXE): tests/test_rss_anon.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# #1375: la memoria disponibile e' misurata in compat.h per Linux, macOS e
+# Windows; questo test gira nei tre job e fallisce dove la misura vale 0.
+tests/test_mem_available$(EXE): tests/test_mem_available.c compat.h
+	$(CC) $(CFLAGS) tests/test_mem_available.c -o $@ $(LDFLAGS)
+
 tests/test_798_guards$(EXE): tests/test_798_guards.c st.h json.h compat.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
