@@ -1887,21 +1887,21 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
             for (int t = 0; t < n; t++)
                 rms(normed + (size_t)t * D, collapsed + (size_t)t * D,
                     site ? l->post_ln : l->in_ln, D, c->eps);
+            const double t_phase = now_s();
             if (!site) {
                 GLayerState *st = &s->layer[i];
                 /* Lo stato non si azzera a ogni chiamata: e' della
                  * conversazione, e azzerarlo qui vorrebbe dire ricominciare
                  * la ricorrenza a ogni token generato. */
-                double t_phase = now_s();
                 if (c->is_full[i]) mla_layer(c, l, normed, n, branch, st, start);
                 else kda_layer(c, l, normed, n, branch, st->kda_state, st->kda_window,
                                s->kda_scratch);
-                m->t_attn += now_s() - t_phase;
             } else {
-                double t_phase = now_s();
                 ffn_layer(m, l, i, normed, n, branch);
-                m->t_ffn += now_s() - t_phase;
             }
+            /* Un solo paio di letture del clock per sito, il ramo dice a chi
+             * va il tempo. */
+            *(site ? &m->t_ffn : &m->t_attn) += now_s() - t_phase;
             for (int t = 0; t < n; t++)
                 coli_hc_post(next + (size_t)t * H * D, branch + (size_t)t * D,
                              streams + (size_t)t * H * D, post + (size_t)t * H,
@@ -2208,7 +2208,11 @@ static int load_stops(const char *dir, int *out, int max) {
  * questo motore riprefilla ogni volta invece di riprendere la conversazione da
  * dove era. E' piu' lento e non e' sbagliato, e il giorno che ci sara' una
  * cache il protocollo non cambia. */
-static double now_s(void) {
+/* noinline: GCC 16.1 (MSYS2 UCRT64) crashes in its IPA inliner when this
+ * clock is inlined into run_layers/forward_span at every phase timer; the
+ * bisect on the CI runner points at the inlining, not the timers, and a call
+ * per phase costs nothing next to a layer. */
+__attribute__((noinline)) static double now_s(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
@@ -2604,7 +2608,6 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
  * matmul esperti (ffn_layer meno il disco), attention (mla/kda), testa
  * (mv su lm_head). L'attesa asincrona non esiste qui: glm53 legge in modo
  * sincrono, quindi expert_wait_s e' 0 per costruzione, non per omissione. */
-__attribute__((noinline, optimize("no-tree-vectorize")))
 static void ehit_mark(GModel *m, int layer, int eid) {
     const Cfg *c = &m->c;
     if (!m->ehit) {
@@ -2613,13 +2616,11 @@ static void ehit_mark(GModel *m, int layer, int eid) {
     }
     if (layer >= 0 && layer < c->n_layers && eid >= 0 && eid < c->n_experts) m->ehit[layer][eid] = 1;
 }
-__attribute__((noinline, optimize("no-tree-vectorize")))
 static int dash_rows(const GModel *m) {
     int rows = 0;
     for (int i = m->c.first_dense; i < m->c.n_layers; i++) if (i >= m->layer_begin && i < m->layer_end) rows++;
     return rows;
 }
-__attribute__((noinline, optimize("no-tree-vectorize")))
 static void emap_emit(GModel *m) {
     const Cfg *c = &m->c;
     const int rows = dash_rows(m), cols = c->n_experts;
@@ -2637,7 +2638,6 @@ static void emap_emit(GModel *m) {
     hex[w] = 0;
     serve_line("EMAP %d %d %s\n", rows, cols, hex); free(hex);
 }
-__attribute__((noinline, optimize("no-tree-vectorize")))
 static void hits_emit(GModel *m) {
     const Cfg *c = &m->c;
     /* Un turno che non ha toccato esperti (tutto denso, o tutto riuso) emette
