@@ -1950,8 +1950,14 @@ def starts_in_reasoning(enable_thinking):
     dice il suo interruttore: acceso apre il blocco e il modello lo chiude da
     solo, spento lo chiude gia' il prompt e quello che torna e' risposta pura.
     Se le due cose non concordano il ragionamento finisce incollato davanti
-    alla risposta, che e' il difetto che questa funzione esiste per non avere."""
-    return enable_thinking
+    alla risposta, che e' il difetto che questa funzione esiste per non avere.
+
+    GLM-5.3 e' l'eccezione che rende la regola esplicita: il suo template non
+    ha un interruttore, render_chat_glm53 apre <think> SEMPRE, e "thinking
+    spento" vuol dire solo effort Low. L'uscita comincia dentro al blocco in
+    ogni caso; partire in modalita' testo perche' il client ha detto False e'
+    esattamente il ragionamento incollato davanti alla risposta di #1278."""
+    return enable_thinking or ARCH == "glm53"
 
 
 class ThinkingStreamSplit:

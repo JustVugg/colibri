@@ -2024,6 +2024,21 @@ class ThinkingSplitUnitTest(unittest.TestCase):
         self.assertEqual(split_thinking_reply("plain answer", enable_thinking=False),
                          ("", "plain answer"))
 
+    def test_glm53_starts_in_reasoning_even_with_thinking_off(self):
+        """#1278: render_chat_glm53 opens <think> unconditionally (the template
+        has no switch; "off" only lowers the effort), so the reply always starts
+        inside the block. With the splitter started in text mode the reasoning
+        streamed as `content`, glued in front of the answer. The family, not the
+        client flag, decides where the output starts."""
+        import openai_server as srv
+        with patch("openai_server.ARCH", "glm53"):
+            self.assertTrue(srv.starts_in_reasoning(False))
+            self.assertEqual(split_thinking_reply("why</think>answer", enable_thinking=False),
+                             ("why", "answer"))
+        with patch("openai_server.ARCH", "glm"):
+            self.assertFalse(srv.starts_in_reasoning(False),
+                             "GLM-5.2 closes the block in the prompt when thinking is off")
+
     def test_missing_close_tag_surfaces_reasoning(self):
         self.assertEqual(split_thinking_reply("thought with no end"),
                          ("thought with no end", ""))
