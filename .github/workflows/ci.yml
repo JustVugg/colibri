@@ -445,6 +445,15 @@ jobs:
           grep -q "config.json says 4 layers" bad.log || {
             echo "FAIL: refused, but not for the reason under test"; cat bad.log; exit 1; }
           echo "refused as expected:"; grep '^\[cfg\]' bad.log
+      - name: Brain and Profile reach the dashboard
+        run: |
+          cd c
+          # The oracle fixture has no tokenizer (weights only); `coli serve`
+          # needs one to encode the prompt. The byte tokenizer is test data
+          # sized to the fixture's vocab, the same as the GLM-5.3 gate uses.
+          python3 tools/make_edge_tiny_tokenizer.py --vocab-size 320 qwen36_tiny_c
+          make qwen36 >/dev/null
+          COLI_QWEN36_FIXTURE=qwen36_tiny_c python3 -m unittest -v tests.test_qwen36_dashboard
 
   qwen38-tiny-check:
     name: Qwen3.8 tiny oracle (GDN + QSA + PLE + MoE)
