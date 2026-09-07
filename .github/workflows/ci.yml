@@ -531,6 +531,13 @@ jobs:
             exit 1
           fi
           grep -qE "elements, expected|gated residual dimensions" qwen38-bad.log
+      - name: "Brain tab: EMAP after READY and STAT, HITS after every turn"
+        run: |
+          cd c
+          # the oracle fixture has no tokenizer; serve mode needs one
+          python3 tools/make_edge_tiny_tokenizer.py --vocab-size "$(python3 -c 'import json;print(json.load(open("qwen38_tiny/config.json"))["vocab_size"])')" qwen38_tiny
+          make qwen38 >/dev/null
+          QWEN38_TINY=qwen38_tiny python3 -m unittest -v tests.test_qwen38_dashboard
 
   inkling-oracle:
     name: Inkling oracle (token-exact vs transformers)
@@ -831,7 +838,7 @@ jobs:
       # rieseguiva un binario non strumentato. Uno di quei test era rosso da
       # settimane senza che nessuno potesse vederlo.
       - name: Build the engines those tests exercise
-        run: make -C c kimi_k3 inkling colibri olmoe
+        run: make -C c kimi_k3 inkling colibri olmoe qwen38
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
 
