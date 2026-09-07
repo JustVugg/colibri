@@ -1339,9 +1339,9 @@ static Slot *expert_slot(GModel *m, int layer, int eid) {
             if (cache->s[j].used < cache->s[lru].used) lru = j;
         slot = &cache->s[lru];
     }
-    const double t0 = now_s();
+    double t_read0 = now_s();
     expert_read(m, layer, eid, slot);
-    m->t_disk += now_s() - t0;
+    m->t_disk += now_s() - t_read0;
     slot->used = ++m->clock;
     return slot;
 }
@@ -1494,7 +1494,8 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             slot_of[i] = (int)(victim - cache->s);
             to_read[reads++] = i;
         }
-        const double t_batch = now_s();
+        double t_batch0;
+        t_batch0 = now_s();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
@@ -1502,7 +1503,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             const int i = to_read[r];
             expert_read(m, index, union_ids[base + i], &cache->s[slot_of[i]]);
         }
-        m->t_disk += now_s() - t_batch;   /* fuori dalla regione omp: e' il muro del batch */
+        m->t_disk += now_s() - t_batch0;  /* fuori dalla regione omp: e' il muro del batch */
 
         /* Un esperto per volta, e per ognuno tutti i token che lo hanno
          * scelto. Nell'ordine opposto i suoi 12,6 MB di pesi verrebbero
@@ -1891,15 +1892,15 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                 /* Lo stato non si azzera a ogni chiamata: e' della
                  * conversazione, e azzerarlo qui vorrebbe dire ricominciare
                  * la ricorrenza a ogni token generato. */
-                const double t0 = now_s();
+                double t_phase = now_s();
                 if (c->is_full[i]) mla_layer(c, l, normed, n, branch, st, start);
                 else kda_layer(c, l, normed, n, branch, st->kda_state, st->kda_window,
                                s->kda_scratch);
-                m->t_attn += now_s() - t0;
+                m->t_attn += now_s() - t_phase;
             } else {
-                const double t0 = now_s();
+                double t_phase = now_s();
                 ffn_layer(m, l, i, normed, n, branch);
-                m->t_ffn += now_s() - t0;
+                m->t_ffn += now_s() - t_phase;
             }
             for (int t = 0; t < n; t++)
                 coli_hc_post(next + (size_t)t * H * D, branch + (size_t)t * D,
@@ -2065,10 +2066,10 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
         rms(normed + (size_t)t * D, collapsed + (size_t)t * D, m->final_norm, D, c->eps);
 
     float *logits = malloc((size_t)n * c->vocab * sizeof(float));
-    const double th = now_s();
+    double t_head0 = now_s();
     for (int t = 0; t < n; t++)
         mv(logits + (size_t)t * c->vocab, &m->head, normed + (size_t)t * D);
-    m->t_head += now_s() - th;
+    m->t_head += now_s() - t_head0;
     m->forwards++;
 
     free(normed); free(collapsed);
