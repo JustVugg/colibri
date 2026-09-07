@@ -101,6 +101,7 @@ typedef struct {
     double dense_load_s;
     /* IMPROVEMENT 2: expert frequency heatmap */
     uint32_t **freq;                   /* per-layer expert counts, owned by route_trace.h */
+    uint8_t **ehit;                    /* experts routed this turn, for HITS (dashboard Brain) */
     int freq_token_count, hot_pinned, hot_n, warmup_tokens;
     int token_count;
     /* PREDICTION IMPROVEMENT A: per-layer EMA of gate logits across tokens.
@@ -568,9 +569,22 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
 }
 
 /* ---------- cache expert: ritorna i pesi quantizzati (q+scale) da cache o disco ---------- */
+/* One byte per expert: routed in this turn or not. The dashboard's Brain tab
+ * reads it as the HITS bitmap after every turn (serve_hits), and it is cleared
+ * there. Outside OLMOE_NO_MAIN: expert_get is in the segment adapter object. */
+static void ehit_mark(Model *m, int layer, int eid) {
+    Cfg *c = &m->c;
+    if (!m->ehit) {
+        m->ehit = calloc((size_t)c->n_layers, sizeof(uint8_t *));
+        for (int i = 0; i < c->n_layers; i++) m->ehit[i] = calloc((size_t)c->n_experts, 1);
+    }
+    if (layer >= 0 && layer < c->n_layers && eid >= 0 && eid < c->n_experts) m->ehit[layer][eid] = 1;
+}
+
 static void expert_get(Model *m, int layer, int eid, Slot **out) {
     LCache *lc = &m->cache[layer];
     pthread_mutex_lock(&g_pilot_mx);
+    ehit_mark(m, layer, eid);          /* under the lock: the routing loop is parallel */
     Slot *hit = slot_indexed(m, layer, eid);
     if (hit) {
         m->hits++; hit->used = ++m->clock; *out = hit;
@@ -1326,6 +1340,24 @@ static int serve_read_cmd(FILE *in, FILE *out, const char *cur_id) {
     return 0;
 }
 
+/* HITS rows cols hex: which experts this turn routed, one bit each, every
+ * layer (all are MoE here, same rows and columns as EMAP), packed 8 per hex
+ * pair. Same line colibri.c emits; the Brain tab lights up from it. */
+static void serve_hits(Model *m) {
+    Cfg *c = &m->c; int E = c->n_experts, rows = c->n_layers;
+    if (!m->ehit) ehit_mark(m, -1, -1);
+    int nb = (rows * E + 7) / 8;
+    uint8_t *bm = calloc((size_t)nb, 1); int bit = 0;
+    for (int i = 0; i < rows; i++)
+        for (int e = 0; e < E; e++, bit++)
+            if (m->ehit[i][e]) { bm[bit >> 3] |= (uint8_t)(1 << (bit & 7)); m->ehit[i][e] = 0; }
+    char *hex = malloc((size_t)nb * 2 + 1); int w = 0;
+    for (int b = 0; b < nb; b++) { hex[w++] = "0123456789abcdef"[bm[b] >> 4]; hex[w++] = "0123456789abcdef"[bm[b] & 15]; }
+    hex[w] = 0;
+    printf("HITS %d %d %s\n", rows, E, hex);
+    fflush(stdout); free(hex); free(bm);
+}
+
 static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     Cfg *c = &m->c;
     int cap = q->plen + 16;
@@ -1380,6 +1412,7 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
      * is future work, not a protocol requirement. */
     printf("PROF %.3f %d %d 0.0 0.0 0.0 0.0 0.0 %d\n", dt, np, gen, gen + 1);
     fflush(stdout);
+    serve_hits(m);
     free(ids);
     return 0;
 }

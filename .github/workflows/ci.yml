@@ -446,6 +446,39 @@ jobs:
             echo "FAIL: refused, but not for the reason under test"; cat bad.log; exit 1; }
           echo "refused as expected:"; grep '^\[cfg\]' bad.log
 
+  olmoe-tiny-check:
+    name: OLMoE tiny oracle (token-exact + dashboard HITS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + transformers
+        run: pip install -r c/tools/oracle-requirements.txt
+      - name: Tiny OLMoE checkpoint, converted
+        run: |
+          cd c
+          # 4 layers x 8 experts at toy dimensions, greedy reference from the
+          # HF model in ref_olmoe.json. The converter is the real one.
+          python3 tools/make_olmoe_tiny.py --output olmoe_tiny
+          python3 tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
+          # weights only: serve mode needs a tokenizer to encode the prompt
+          python3 tools/make_edge_tiny_tokenizer.py --vocab-size 128 olmoe_tiny_c
+      - name: Token-exact against the reference
+        run: |
+          cd c
+          make olmoe
+          SNAP=olmoe_tiny_c ./olmoe 8 8 olmoe_tiny/ref_olmoe.json | tee oracle.log
+          # the engine prints the score and exits 0 either way: the gate is here
+          grep -qE 'Matching tokens: ([0-9]+)/\1$' oracle.log
+      - name: Brain tab: HITS after every turn, on the grid EMAP declared
+        run: |
+          cd c
+          OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_dashboard_hits
+
   qwen38-tiny-check:
     name: Qwen3.8 tiny oracle (GDN + QSA + PLE + MoE)
     runs-on: ubuntu-latest
@@ -527,6 +560,10 @@ jobs:
           # the only gate that would catch it. Needs the fixture above, which is
           # why it runs here and not in `make check`.
           INKLING_TINY=tiny_inkling python3 -m unittest -v tests.test_inkling_prefix_serve
+      - name: Brain tab: HITS after every turn, on the grid EMAP declared
+        run: |
+          cd c
+          INKLING_TINY=tiny_inkling python3 -m unittest -v tests.test_inkling_dashboard_hits
 
   # The efficiency suite against the tiny GLM oracle. These 8 tests existed but
   # had never run anywhere: they looked for c/glm.exe, a name that stopped
