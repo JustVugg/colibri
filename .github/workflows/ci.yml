@@ -454,6 +454,19 @@ jobs:
           python3 tools/make_edge_tiny_tokenizer.py --vocab-size 320 qwen36_tiny_c
           make qwen36 >/dev/null
           COLI_QWEN36_FIXTURE=qwen36_tiny_c python3 -m unittest -v tests.test_qwen36_dashboard
+      - name: "The expert format probe reads int8 as int8 and int4 as int4 (#1331)"
+        run: |
+          cd c
+          # #1331 was the CUDA tier receiving fmt=4 for an int8 container: budget
+          # reserved, zero promotions. The probe is decided from the on-disk
+          # size of the first expert and printed once; pin it on both formats
+          # without a GPU. The int4 run is not held to token-exactness here.
+          SNAP=qwen36_tiny_c ./qwen36 1 8 qwen36_tiny/ref_full.json 2> probe8.log >/dev/null || true
+          grep -q 'expert format on disk: int8' probe8.log || { echo "FAIL: int8 container probed as"; grep 'expert format' probe8.log; exit 1; }
+          python3 tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c4 --ebits 4 >/dev/null
+          SNAP=qwen36_tiny_c4 ./qwen36 1 4 qwen36_tiny/ref_full.json 2> probe4.log >/dev/null || true
+          grep -q 'expert format on disk: int4' probe4.log || { echo "FAIL: int4 container probed as"; grep 'expert format' probe4.log; exit 1; }
+          echo "probe: int8 -> fmt=1, int4 -> fmt=4"
 
   olmoe-tiny-check:
     name: OLMoE tiny oracle (token-exact + dashboard HITS)

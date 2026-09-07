@@ -2929,6 +2929,10 @@ int main(int argc, char **argv) {
         int64_t want = 2*(int64_t)m.c.inter*m.c.hidden + (int64_t)m.c.hidden*m.c.inter;
         if (pt && pt->nbytes == want) expert_is_int4 = 0;   /* int8: un byte per elemento */
     }
+    /* Una riga, sempre: e' l'unico modo di verificare il probe dall'esterno
+     * (CI sul container tiny int8, #1331) senza una scheda. */
+    fprintf(stderr, "[qwen36] expert format on disk: %s\n",
+            expert_is_int4 ? "int4 packed (tier fmt=4)" : "int8 (tier fmt=1)");
     /* Offer the dense trunk to the placer before the tier decides its budget:
      * sizes only, from the same dense-i8 entries the uploads below will use.
      * No entry (dense-i8 off) means nothing to offer, and the CPU path stands. */
