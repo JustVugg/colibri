@@ -668,6 +668,12 @@ typedef struct {
     int64_t e_len[6], e_at[6], e_slot;
     uint64_t clock, ebytes;
     long hits, miss;
+    /* Telemetria per la dashboard (#1376 follow-up: Brain e Profile erano
+     * vuoti su Flash perche' il motore non emetteva nulla). Tempi di fase
+     * cumulativi dall'avvio; il turno ne prende la differenza. */
+    double t_attn, t_ffn, t_disk, t_head;
+    uint64_t forwards;
+    uint8_t **ehit;                       /* [layer][expert] toccato in questo turno */
     /* torre vision: presente solo se il checkpoint la porta */
     int has_vision;
     ColiVisionTower vision;
@@ -1317,7 +1323,12 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
 
 /* Lo slot dell'esperto chiesto, letto se non c'e'. La vittima e' quella usata
  * meno di recente. */
+static double now_s(void);
+static void ehit_mark(GModel *m, int layer, int eid);
+static void hits_emit(GModel *m);
+static void emap_emit(GModel *m);
 static Slot *expert_slot(GModel *m, int layer, int eid) {
+    ehit_mark(m, layer, eid);
     Slot *slot = slot_find(m, layer, eid);
     if (slot) return slot;
     LCache *cache = &m->ecache[layer];
@@ -1328,7 +1339,9 @@ static Slot *expert_slot(GModel *m, int layer, int eid) {
             if (cache->s[j].used < cache->s[lru].used) lru = j;
         slot = &cache->s[lru];
     }
+    double t_read0 = now_s();
     expert_read(m, layer, eid, slot);
+    m->t_disk += now_s() - t_read0;
     slot->used = ++m->clock;
     return slot;
 }
@@ -1464,6 +1477,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         int reads = 0;
         for (int i = 0; i < here; i++) {
             const int eid = union_ids[base + i];
+            ehit_mark(m, index, eid);
             Slot *hit = slot_find(m, index, eid);
             if (hit) { slot_of[i] = (int)(hit - cache->s); continue; }
             Slot *victim;
@@ -1480,6 +1494,8 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             slot_of[i] = (int)(victim - cache->s);
             to_read[reads++] = i;
         }
+        double t_batch0;
+        t_batch0 = now_s();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
@@ -1487,6 +1503,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             const int i = to_read[r];
             expert_read(m, index, union_ids[base + i], &cache->s[slot_of[i]]);
         }
+        m->t_disk += now_s() - t_batch0;  /* fuori dalla regione omp: e' il muro del batch */
 
         /* Un esperto per volta, e per ognuno tutti i token che lo hanno
          * scelto. Nell'ordine opposto i suoi 12,6 MB di pesi verrebbero
@@ -1870,6 +1887,7 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
             for (int t = 0; t < n; t++)
                 rms(normed + (size_t)t * D, collapsed + (size_t)t * D,
                     site ? l->post_ln : l->in_ln, D, c->eps);
+            const double t_phase = now_s();
             if (!site) {
                 GLayerState *st = &s->layer[i];
                 /* Lo stato non si azzera a ogni chiamata: e' della
@@ -1881,6 +1899,9 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
             } else {
                 ffn_layer(m, l, i, normed, n, branch);
             }
+            /* Un solo paio di letture del clock per sito, il ramo dice a chi
+             * va il tempo. */
+            *(site ? &m->t_ffn : &m->t_attn) += now_s() - t_phase;
             for (int t = 0; t < n; t++)
                 coli_hc_post(next + (size_t)t * H * D, branch + (size_t)t * D,
                              streams + (size_t)t * H * D, post + (size_t)t * H,
@@ -2045,8 +2066,11 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
         rms(normed + (size_t)t * D, collapsed + (size_t)t * D, m->final_norm, D, c->eps);
 
     float *logits = malloc((size_t)n * c->vocab * sizeof(float));
+    double t_head0 = now_s();
     for (int t = 0; t < n; t++)
         mv(logits + (size_t)t * c->vocab, &m->head, normed + (size_t)t * D);
+    m->t_head += now_s() - t_head0;
+    m->forwards++;
 
     free(normed); free(collapsed);
     free(next); free(streams);
@@ -2184,7 +2208,11 @@ static int load_stops(const char *dir, int *out, int max) {
  * questo motore riprefilla ogni volta invece di riprendere la conversazione da
  * dove era. E' piu' lento e non e' sbagliato, e il giorno che ci sara' una
  * cache il protocollo non cambia. */
-static double now_s(void) {
+/* noinline: GCC 16.1 (MSYS2 UCRT64) crashes in its IPA inliner when this
+ * clock is inlined into run_layers/forward_span at every phase timer; the
+ * bisect on the CI runner points at the inlining, not the timers, and a call
+ * per phase costs nothing next to a layer. */
+__attribute__((noinline)) static double now_s(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
@@ -2461,6 +2489,8 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     }
 
     const double started = now_s();
+    const double s_attn = m->t_attn, s_ffn = m->t_ffn, s_disk = m->t_disk, s_head = m->t_head;
+    const uint64_t s_fw = m->forwards;
     int emitted = 0, limited = 0;
     const int budget = q->max_tokens > 0 ? q->max_tokens : 256;
 
@@ -2549,11 +2579,82 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * occhi di chi voleva solo la risposta. */
     if (getenv("GLM53_VERBOSE"))
         fprintf(stderr, "REUSE %llu %d %d\n", q->id, reused, prompt_tokens);
+    hits_emit(m);
+    {
+        const double disk = m->t_disk - s_disk, ffn = m->t_ffn - s_ffn;
+        serve_line("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n", elapsed,
+                   prompt_tokens, emitted, disk, 0.0, ffn > disk ? ffn - disk : 0.0,
+                   m->t_attn - s_attn, m->t_head - s_head,
+                   (unsigned long long)(m->forwards - s_fw));
+    }
     serve_line("DONE %llu STAT %d %.2f %.1f %.1f %d %d\n", q->id, emitted,
                elapsed > 0 ? emitted / elapsed : 0.0,
                m->miss + m->hits ? 100.0 * m->hits / (double)(m->hits + m->miss) : 0.0,
                rss_gb(), prompt_tokens, limited);
     free(sequence);
+}
+
+/* --- Dashboard: Brain e Profile ------------------------------------------
+ * Il server legge quattro righe dallo stdout del motore e nient'altro:
+ *   EMAP rows cols hex   griglia (layer sparsi x esperti), una volta all'avvio
+ *   HITS rows cols hex   bitmap degli esperti toccati nel turno, a fine turno
+ *   PROF + 9 numeri      tempi per fase del turno
+ * colibri.c le emette da mesi (telemetry.h); deepseek_v4.c anche. Qui non
+ * c'erano, e le due schede su GLM-5.3-Flash restavano vuote: non c'era
+ * niente da attivare, mancava l'emissione. Stesso formato byte per byte,
+ * cosi' la dashboard non distingue i motori.
+ *
+ * Fasi che questo motore misura: disco (expert_read, muro del batch),
+ * matmul esperti (ffn_layer meno il disco), attention (mla/kda), testa
+ * (mv su lm_head). L'attesa asincrona non esiste qui: glm53 legge in modo
+ * sincrono, quindi expert_wait_s e' 0 per costruzione, non per omissione. */
+static void ehit_mark(GModel *m, int layer, int eid) {
+    const Cfg *c = &m->c;
+    if (!m->ehit) {
+        m->ehit = calloc((size_t)c->n_layers, sizeof(uint8_t *));
+        for (int i = 0; i < c->n_layers; i++) m->ehit[i] = calloc((size_t)c->n_experts, 1);
+    }
+    if (layer >= 0 && layer < c->n_layers && eid >= 0 && eid < c->n_experts) m->ehit[layer][eid] = 1;
+}
+static int dash_rows(const GModel *m) {
+    int rows = 0;
+    for (int i = m->c.first_dense; i < m->c.n_layers; i++) if (i >= m->layer_begin && i < m->layer_end) rows++;
+    return rows;
+}
+static void emap_emit(GModel *m) {
+    const Cfg *c = &m->c;
+    const int rows = dash_rows(m), cols = c->n_experts;
+    char *hex = malloc((size_t)rows * cols * 2 + 1); int w = 0;
+    for (int i = c->first_dense; i < c->n_layers; i++) {
+        if (i < m->layer_begin || i >= m->layer_end) continue;
+        for (int e = 0; e < cols; e++) {
+            int tier = 0;                       /* 0 = su disco, 1 = in RAM (cache) */
+            if (m->ecache) { const LCache *cache = &m->ecache[i];
+                for (int j = 0; j < cache->n; j++) if (cache->s[j].eid == e) { tier = 1; break; } }
+            const int b = tier << 6;            /* nessun contatore di calore qui: heat = 0 */
+            hex[w++] = "0123456789abcdef"[b >> 4]; hex[w++] = "0123456789abcdef"[b & 15];
+        }
+    }
+    hex[w] = 0;
+    serve_line("EMAP %d %d %s\n", rows, cols, hex); free(hex);
+}
+static void hits_emit(GModel *m) {
+    const Cfg *c = &m->c;
+    /* Un turno che non ha toccato esperti (tutto denso, o tutto riuso) emette
+     * una bitmap a zero: la dashboard deve vedere QUESTO turno, non l'ultimo
+     * che ha avuto hit. */
+    if (!m->ehit) ehit_mark(m, -1, -1);
+    const int rows = dash_rows(m), cols = c->n_experts, nb = (rows * cols + 7) / 8;
+    uint8_t *bm = calloc((size_t)nb, 1); int bit = 0;
+    for (int i = c->first_dense; i < c->n_layers; i++) {
+        if (i < m->layer_begin || i >= m->layer_end) continue;
+        for (int e = 0; e < cols; e++, bit++)
+            if (m->ehit[i][e]) { bm[bit >> 3] |= (uint8_t)(1 << (bit & 7)); m->ehit[i][e] = 0; }
+    }
+    char *hex = malloc((size_t)nb * 2 + 1); int w = 0;
+    for (int b = 0; b < nb; b++) { hex[w++] = "0123456789abcdef"[bm[b] >> 4]; hex[w++] = "0123456789abcdef"[bm[b] & 15]; }
+    hex[w] = 0;
+    serve_line("HITS %d %d %s\n", rows, cols, hex); free(hex); free(bm);
 }
 
 static void serve_loop(GModel *m, Tok *tokenizer) {
@@ -2562,6 +2663,9 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
     slots_init(m);
     serve_line("\x01\x01READY\x01\x01\n");
     serve_line("STAT 0 0.00 0.0 %.1f\n", rss_gb());
+    /* La griglia va DOPO READY: il lettore di boot del server scarta tutto
+     * fino al sentinel, e colibri.c fa lo stesso (READY, STAT, poi EMAP). */
+    emap_emit(m);
     for (;;) {
         ServeReq q; char verb[16];
         if (!serve_read_req(&q, verb, sizeof(verb))) break;   /* EOF: si esce */
