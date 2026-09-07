@@ -2787,8 +2787,13 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
              * slot_ensure_int8() unable to bring the expert back: it returns
              * early without g4, and the CPU fallback in the decode loop then
              * dereferences NULL. Keep it (#1341). COLI_KEEP_INT8 keeps its
-             * meaning for int4. */
-            if (!keep8 && expert_is_int4 && e->g) { free(e->g); e->g = e->u = e->d = NULL; }
+             * meaning for int4.
+             * The condition is ownership, not format: do not free what was
+             * just handed over. int4 handed g4 (wg != e->g), so the int8
+             * copy is spare; int8 handed e->g itself, so it stays. A future
+             * format that also aliases e->g is then correct without anyone
+             * remembering to extend a format check here. */
+            if (!keep8 && e->g && wg != (const uint8_t *)e->g) { free(e->g); e->g = e->u = e->d = NULL; }
         }
     }
     qt_fill_wait();
