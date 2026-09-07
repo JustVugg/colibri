@@ -114,6 +114,7 @@ typedef struct {
     GatedResidual final_gr;
     Layer *L;
     LCache *cache;
+    uint8_t **ehit;                    /* experts routed this turn, for HITS (dashboard Brain) */
     Q38ExpertScaleCache *expert_scales;
     uint64_t clock, hits, miss;
     uint64_t expert_weight_reads, expert_scale_reads, expert_pair_reads;
@@ -1238,7 +1239,19 @@ static void q38_load_expert(Model *m,int layer,int eid,Slot *s) {
     }
 }
 
+/* One byte per expert: routed in this turn or not. The dashboard's Brain tab
+ * reads it as the HITS bitmap after every turn (serve_hits in qwen38.c),
+ * cleared there. Marked on both lookup paths, single and batched. */
+static void q38_ehit_mark(Model *m,int layer,int eid) {
+    const Cfg *c=&m->c;
+    if(!m->ehit){
+        m->ehit=(uint8_t**)calloc((size_t)c->layers,sizeof(uint8_t*));
+        for(int i=0;i<c->layers;i++)m->ehit[i]=(uint8_t*)calloc((size_t)c->experts,1);
+    }
+    if(layer>=0&&layer<c->layers&&eid>=0&&eid<c->experts)m->ehit[layer][eid]=1;
+}
 static Slot *q38_expert_get(Model *m,int layer,int eid) {
+    q38_ehit_mark(m,layer,eid);
     LCache *lc=&m->cache[layer]; int si=lc->by_expert[eid];
     if(si>=0){m->hits++;lc->slots[si].used=++m->clock;return &lc->slots[si];}
     m->miss++; Slot *s;
@@ -1271,6 +1284,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
     for(int index=0;index<count;index++){
         int expert=experts[index];
         if(expert<0||expert>=m->c.experts)return 0;
+        q38_ehit_mark(m,layer,expert);
         for(int previous=0;previous<index;previous++)
             if(experts[previous]==expert)return 0;
         int slot_index=cache->by_expert[expert];

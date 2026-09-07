@@ -1465,6 +1465,40 @@ static int q38_format_prof(char *out,size_t capacity,double wall_s,int prompt_to
     return count>=0&&(size_t)count<capacity?count:-1;
 }
 
+/* ---------- dashboard protocol: EMAP / HITS ----------
+ * Same stdout lines colibri.c emits for the web dashboard's Brain tab. Every
+ * layer here is a MoE layer, so rows are all layers, columns the experts.
+ * EMAP: one byte per expert as two hex digits, tier<<6 | heat (tier 1 =
+ * resident in the layer cache; heat 0, no usage counter here). Printed after
+ * READY and STAT, and again after every turn. HITS: one bit per expert routed
+ * in the turn, packed 8 per hex pair, printed after DONE next to PROF. */
+static void serve_emap(Model *m){
+    const Cfg *c=&m->c; int E=c->experts, rows=c->layers;
+    char *hex=(char*)malloc((size_t)rows*E*2+1); int w=0;
+    for(int i=0;i<rows;i++){
+        LCache *lc=&m->cache[i];
+        for(int e=0;e<E;e++){
+            int si=lc->by_expert?lc->by_expert[e]:-1;
+            int b=(si>=0&&si<lc->n&&lc->slots[si].eid==e?1:0)<<6;
+            hex[w++]="0123456789abcdef"[b>>4]; hex[w++]="0123456789abcdef"[b&15];
+        }
+    }
+    hex[w]=0;
+    printf("EMAP %d %d %s\n",rows,E,hex); fflush(stdout); free(hex);
+}
+static void serve_hits(Model *m){
+    const Cfg *c=&m->c; int E=c->experts, rows=c->layers;
+    if(!m->ehit)q38_ehit_mark(m,-1,-1);   /* a turn that routed nothing still reports a bitmap: all zero */
+    int nb=(rows*E+7)/8; uint8_t *bm=(uint8_t*)calloc((size_t)nb,1); int bit=0;
+    for(int i=0;i<rows;i++)
+        for(int e=0;e<E;e++,bit++)
+            if(m->ehit[i][e]){ bm[bit>>3]|=(uint8_t)(1<<(bit&7)); m->ehit[i][e]=0; }
+    char *hex=(char*)malloc((size_t)nb*2+1); int w=0;
+    for(int b=0;b<nb;b++){ hex[w++]="0123456789abcdef"[bm[b]>>4]; hex[w++]="0123456789abcdef"[bm[b]&15]; }
+    hex[w]=0;
+    printf("HITS %d %d %s\n",rows,E,hex); fflush(stdout); free(hex); free(bm);
+}
+
 static int serve_one(Model *m, ServeReq *q){
     int *ids=NULL, np=0;
     encode_text_n(q->payload,(size_t)q->plen,&ids,&np); /* byte-counted prompt; qwen38 adds no BOS */
@@ -1590,6 +1624,7 @@ static int serve_one(Model *m, ServeReq *q){
     if(profile_bytes>0)fwrite(profile,1,(size_t)profile_bytes,stdout);
     else fprintf(stderr,"[qwen38] internal error: PROF frame overflow\n");
     fflush(stdout);
+    serve_hits(m);
     q38_tm_report_bank(&timers,"request");
     return input_eof?-1:0;
 }
@@ -1606,6 +1641,7 @@ static void serve_loop(Model *m){
     fputs("\x01\x01READY\x01\x01\n",stdout);
     printf("STAT 0 0.00 0.0 %.2f\n",rss_gb());
     fflush(stdout);
+    serve_emap(m);                       /* after READY and STAT: the boot reader discards what precedes them */
     for(;;){
         ServeReq q={0}; int r;
         do r=serve_read_req(stdin,stdout,&q,NULL); while(r!=2&&r>=0);
@@ -1613,6 +1649,7 @@ static void serve_loop(Model *m){
         if(r==2){
             int status=serve_one(m,&q);free(q.payload);
             if(status<0){q38_prefix_cache_release(m);return;}
+            serve_emap(m);
         }
     }
 }
