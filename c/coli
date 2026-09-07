@@ -492,7 +492,14 @@ def env_for_engine(a, arch, plan=None):
             except (TypeError, ValueError):
                 pass
     if a.ctx:
-        env[family_by_id(arch).limits.context_env] = str(a.ctx)
+        limits = family_by_id(arch).limits
+        # #1376: the engine clamps silently to its hard ceiling. A flag that is
+        # accepted and then ignored is worse than one refused with the number.
+        if limits.max_context and a.ctx > limits.max_context:
+            sys.exit(f"{C.yel}--ctx {a.ctx} exceeds what {family_by_id(arch).display_name} "
+                     f"supports ({limits.max_context} tokens).{C.r}\n"
+                     f"  Pass --ctx {limits.max_context} or less.")
+        env[limits.context_env] = str(a.ctx)
     if arch == "deepseek_v4":
         # Speculation stays opt-in. Real multi-turn chat measured only 1/15
         # accepted prompt-lookup candidates; recurrent-state replay dominated

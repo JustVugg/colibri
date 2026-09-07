@@ -2611,5 +2611,35 @@ class ImageUrlPathGuard(unittest.TestCase):
         self.assertNotIn("secret-name", str(caught.exception))
 
 
+class ContextExceededMessageTest(unittest.TestCase):
+    """#1376: the engine writes `CONTEXT_EXCEEDED prompt_tokens=N requested=M
+    capacity=C`. The message took fields[2] ("requested=M", the completion
+    budget) as the limit and printed the raw key=value token, so a user with a
+    9000-token prompt on an 8192 ceiling read "maximum context length is
+    requested=4 tokens". The number that mattered, capacity, appeared nowhere."""
+
+    def test_limit_is_capacity_and_used_is_prompt_tokens(self):
+        from openai_server import _engine_error
+        err = _engine_error(["CONTEXT_EXCEEDED", "prompt_tokens=9000", "requested=4",
+                             "capacity=8192"], "ignored")
+        text = str(err)
+        self.assertIn("8192", text)
+        self.assertIn("9000", text)
+        self.assertNotIn("requested=", text)
+        self.assertNotIn("prompt_tokens=", text)
+        self.assertNotIn("capacity=", text)
+
+    def test_the_positional_spelling_of_colibri_and_deepseek_still_reads(self):
+        from openai_server import _engine_error
+        text = str(_engine_error(["CONTEXT_EXCEEDED", "8321", "4094"], "ignored"))
+        self.assertIn("4094", text)
+        self.assertIn("8321", text)
+
+    def test_missing_fields_do_not_crash_the_message(self):
+        from openai_server import _engine_error
+        text = str(_engine_error(["CONTEXT_EXCEEDED"], "ignored"))
+        self.assertIn("the context", text)
+
+
 if __name__ == "__main__":
     unittest.main()
