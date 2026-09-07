@@ -9651,6 +9651,25 @@ static int pin_count_for_budget(Model *m, const PinRec *r, int from, int n,
     }
     return count;
 }
+/* #1351: how many ranked experts a VRAM budget holds, priced at each row's
+ * real width. Dividing the budget by expert_bytes_probe() priced every routed
+ * int4 expert at the int8 MTP width, and the single-GPU auto tier stopped at
+ * 56% of the card (3,604 experts in 136 GB, exact to the expert). The probe's
+ * width is right for slots shared ACROSS rows (ws[], staging); the VRAM prefix
+ * is one upload per expert at that expert's own width.
+ *
+ * raw_n >= 0 is the COLI_ANS split: the first raw_n ranked experts go up raw,
+ * the rest entropy-coded at ~0.80 of their width (same factor as before).
+ * Returns the count only; the caller adds its per-device slack. */
+static int pin_prefix_for_budget(Model *m, const PinRec *r, int n, double budget_b, int raw_n){
+    if(budget_b<=0.0 || n<=0) return 0;
+    if(raw_n<0) return pin_count_for_budget(m,r,0,n,budget_b);
+    if(raw_n>n) raw_n=n;
+    int got=pin_count_for_budget(m,r,0,raw_n,budget_b);
+    if(got<raw_n) return got;                    /* the budget ends inside the raw prefix */
+    double left=budget_b-pin_range_bytes(m,r,0,got);
+    return got+pin_count_for_budget(m,r,got,n,left/0.80);
+}
 
 #ifdef __linux__
 /* #419: bind the pinned hot-store as ONE arena per layer instead of one mbind
@@ -9786,14 +9805,17 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
      * tier under CUDA_DENSE=1 regardless of the configured budget (#491). */
     if(g_cuda_expert_auto) budget=safe_total;
     if(g_cuda_enabled&&g_cuda_release_host&&budget>0){
-        prefix_est=(int)(budget/eb)+g_cuda_ndev;
+        /* Per row, not budget/eb: eb is the container's WIDEST expert (the int8
+         * MTP row on shipped GLM-5.2), the right price for a slot shared across
+         * rows and the wrong one for a VRAM upload, which costs the expert's own
+         * width. With the widest as divisor the single-GPU auto tier placed 56%
+         * of its budget and stopped (#1351). The staging cap below keeps eb on
+         * purpose: it bounds a HOST peak of slabs that are reused across rows. */
+        int raw_n=-1;
 #ifdef COLI_ANS
-        if(g_cuda_raw_experts>=0){
-            int raw=g_cuda_raw_experts;
-            if((double)raw*eb>budget) raw=(int)(budget/eb);
-            prefix_est=raw+(int)((budget-(double)raw*eb)/(0.80*eb))+g_cuda_ndev;
-        }
+        raw_n=g_cuda_raw_experts;
 #endif
+        prefix_est=pin_prefix_for_budget(m,r,n,budget,raw_n)+g_cuda_ndev;
         if(prefix_est>n) prefix_est=n;
         cpu_from=prefix_est;                    /* prefix RAM is returned after upload */
     }
