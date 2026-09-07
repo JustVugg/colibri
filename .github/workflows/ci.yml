@@ -474,7 +474,7 @@ jobs:
           SNAP=olmoe_tiny_c ./olmoe 8 8 olmoe_tiny/ref_olmoe.json | tee oracle.log
           # the engine prints the score and exits 0 either way: the gate is here
           grep -qE 'Matching tokens: ([0-9]+)/\1$' oracle.log
-      - name: Brain tab: HITS after every turn, on the grid EMAP declared
+      - name: "Brain tab: HITS after every turn, on the grid EMAP declared"
         run: |
           cd c
           OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_dashboard_hits
@@ -560,7 +560,7 @@ jobs:
           # the only gate that would catch it. Needs the fixture above, which is
           # why it runs here and not in `make check`.
           INKLING_TINY=tiny_inkling python3 -m unittest -v tests.test_inkling_prefix_serve
-      - name: Brain tab: HITS after every turn, on the grid EMAP declared
+      - name: "Brain tab: HITS after every turn, on the grid EMAP declared"
         run: |
           cd c
           INKLING_TINY=tiny_inkling python3 -m unittest -v tests.test_inkling_dashboard_hits
