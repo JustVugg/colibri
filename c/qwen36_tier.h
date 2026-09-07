@@ -111,7 +111,7 @@ int  qt_fill_next(int *layer, int *eid);
 void qt_note_block(int layer, int eid,
              const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
              const float *gs, const float *us, const float *ds);
-void qt_fill_wait(void);   /* blocks until the upload queue is drained */
+void qt_fill_wait(void);   /* blocks until every enqueued upload is resident (not merely dequeued) */
 
 /* One telemetry block on stderr: residency, hits/misses, uploads per device. */
 void qt_stats(void);
