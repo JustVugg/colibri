@@ -2604,6 +2604,7 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
  * matmul esperti (ffn_layer meno il disco), attention (mla/kda), testa
  * (mv su lm_head). L'attesa asincrona non esiste qui: glm53 legge in modo
  * sincrono, quindi expert_wait_s e' 0 per costruzione, non per omissione. */
+__attribute__((noinline, optimize("no-tree-vectorize")))
 static void ehit_mark(GModel *m, int layer, int eid) {
     const Cfg *c = &m->c;
     if (!m->ehit) {
@@ -2612,11 +2613,13 @@ static void ehit_mark(GModel *m, int layer, int eid) {
     }
     if (layer >= 0 && layer < c->n_layers && eid >= 0 && eid < c->n_experts) m->ehit[layer][eid] = 1;
 }
+__attribute__((noinline, optimize("no-tree-vectorize")))
 static int dash_rows(const GModel *m) {
     int rows = 0;
     for (int i = m->c.first_dense; i < m->c.n_layers; i++) if (i >= m->layer_begin && i < m->layer_end) rows++;
     return rows;
 }
+__attribute__((noinline, optimize("no-tree-vectorize")))
 static void emap_emit(GModel *m) {
     const Cfg *c = &m->c;
     const int rows = dash_rows(m), cols = c->n_experts;
@@ -2634,6 +2637,7 @@ static void emap_emit(GModel *m) {
     hex[w] = 0;
     serve_line("EMAP %d %d %s\n", rows, cols, hex); free(hex);
 }
+__attribute__((noinline, optimize("no-tree-vectorize")))
 static void hits_emit(GModel *m) {
     const Cfg *c = &m->c;
     /* Un turno che non ha toccato esperti (tutto denso, o tutto riuso) emette
