@@ -76,11 +76,12 @@ static int count_resident(int layer){ int n=0; for(int e=0;e<NE;e++) n+=qt_is_re
 
 /* One tier init for the whole run: the backend is not designed to be torn down and
  * brought up again inside one process (arenas outlive coli_vk_shutdown). The budget
- * admits exactly two experts:
- *   int4: per-expert bytes = 3*D*IH/2 + (2*IH+D)*4 + 4096 = 7680; VK_EXPERT_GB=0.00002
- *         (21474 bytes) admits two, not three.
- *   int8: per-expert bytes = 3*D*IH   + (2*IH+D)*4 + 4096 = 10752; VK_EXPERT_GB=0.000025
- *         (26843 bytes) admits two, not three.
+ * admits exactly two experts. The tier charges each expert at the device
+ * allocator's granularity (dev_alloc_footprint: 8 KiB minimum per allocation,
+ * six allocations per expert), not by payload, so at this geometry an expert
+ * costs 6 x 8 KiB = 49152 bytes in BOTH modes -- the int4 matrices (1024 B)
+ * and the int8 ones (2048 B) round to the same 8 KiB, as do the scales.
+ * VK_EXPERT_GB=0.0001 (107374 bytes) admits two (98304), not three (147456).
  * The natural warmstart order fills layer 0, eids 0 and 1, so those two are the
  * resident pair and eid 2 is a guaranteed miss in both modes. */
 
@@ -140,11 +141,7 @@ int main(void){
     fprintf(stderr,"qwen36 tier vk test: %s experts\n", TIER_VK_INT8 ? "int8" : "int4");
     for(int l=0;l<NL;l++) for(int e=0;e<NE;e++) make_expert(&E[l][e]);
     setenv("COLI_VULKAN","1",1);
-#if TIER_VK_INT8
-    setenv("VK_EXPERT_GB","0.000025",1);
-#else
-    setenv("VK_EXPERT_GB","0.00002",1);
-#endif
+    setenv("VK_EXPERT_GB","0.0001",1);      /* same footprint in both modes, see above */
     unsetenv("HEAT_FILE"); unsetenv("QT_NO_WARMSTART");
     /* per-row scales (expert_gs=0); expert_is_int4 picks packed int4 vs raw int8 */
 #if TIER_VK_INT8
