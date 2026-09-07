@@ -392,8 +392,8 @@ static double auto_displaced_value(int di, size_t room, int k, size_t exp_bytes,
         }
     }
     qsort(p, m, sizeof *p, cmp_double_desc);
-    double value = 0, pm = 0; int cnt = 0;
-    for(size_t r = (fit > (size_t)k ? fit - k : 0); r < fit && r < m; r++){ value += cpu_factor * p[r] * (double)exp_bytes; pm = p[r]; cnt++; }
+    double value = 0, pm = 0;
+    for(size_t r = (fit > (size_t)k ? fit - k : 0); r < fit && r < m; r++){ value += cpu_factor * p[r] * (double)exp_bytes; pm = p[r]; }
     free(p);
     *p_marginal_out = pm;
     return value;
