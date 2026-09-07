@@ -438,7 +438,7 @@ def _dsv4_tools_block(tools):
 
 
 def _dsv4_tool_calls(tool_calls):
-    """Render OpenAI-format tool_calls into a V4 DSML block (incl. the leading 
+    """Render OpenAI-format tool_calls into a V4 DSML block (incl. the leading
 
 )."""
     return v4_dsml.render_tool_calls(tool_calls)
@@ -1824,7 +1824,7 @@ def _glm53_tool_calls(calls):
 
 
 def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                      tool_choice=None):
+                      tool_choice=None, add_generation_prompt=True):
     """Render the text-only subset of the official GLM-5.3-Flash chat template.
 
     Not a variant of the GLM-5.2 renderer above, and the differences are not
@@ -1915,18 +1915,125 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     # su cui il modello e' addestrato" perche' il template lo scrive davanti a un
     # TURNO PASSATO senza ragionamento. E' vero per un turno passato e falso per il
     # prompt di generazione: la posizione da cui il modello scrive non e' mai quella.
-    prompt.append("<|assistant|><think>")
+    #
+    # add_generation_prompt=False non e' una forma nostra: e' l'altro ramo di questo stesso
+    # `if` nel template. Il prompt finisce allora sull'ultimo turno assistant reso come
+    # turno PASSATO -- <think></think> seguito dal contenuto -- e il modello lo prosegue
+    # invece di aprirne uno nuovo. Chi non chiede la prosecuzione non vede differenza:
+    # il ramo True e' invariato, byte per byte, ed e' quello che il test confronta.
+    if add_generation_prompt:
+        prompt.append("<|assistant|><think>")
     return "".join(prompt)
 
 
+# ---- continuing an unfinished assistant turn (COLI_CONTINUE_ASSISTANT) ----------------
+# A trailing `assistant` message means "continue writing this turn", not "here is a turn I
+# already finished". The official template says exactly that, and says it in one place --
+#     {%- if add_generation_prompt -%}<|assistant|>{{- '<think>' -}}{%- endif -%}
+# -- whose False branch every renderer in this file hard-codes to True. With the cue
+# suppressed the prompt ends mid-turn, on the shape the template writes in front of a PAST
+# assistant turn, which is a position the model saw all through training.
+#
+# That distinction is what makes this safe on GLM-5.3 specifically. #1327 measured that a
+# CLOSED, EMPTY <think></think> at the end of a prompt is out of distribution and the model
+# keeps reasoning through it. The position here is a different one: <think></think> followed
+# by real content, i.e. the past-turn shape, which is why a continuation must carry text.
+#
+# llama.cpp needs no switch for this because it runs the checkpoint's jinja at request time,
+# so `add_generation_prompt=False` costs it nothing. This gateway renders by hand, on purpose
+# and for speed (tests/test_glm53_chat_template.py says why), and the bill for that choice is
+# exactly here: one template flag, eight open-turn shapes to derive. That is the honest reason
+# this ships for one family behind a switch instead of for all of them by default.
+
+
+def resolve_generation_prompt(messages, body):
+    """Does this prompt end on a generation cue, or on an assistant turn to continue?
+
+    Returns True for the ordinary case (append the cue) and False for a continuation, which is
+    the template's `add_generation_prompt=False`.
+
+    COLI_CONTINUE_ASSISTANT=1 turns continuation on for the whole server, the way
+    COLI_THINK and COLI_TOOL_SALVAGE turn on their behaviours. It is deliberately NOT a
+    request field: a client would have to know colibri specifically to send one, and the
+    clients that most want this -- anything pointed at an OpenAI- or Anthropic-compatible
+    URL -- send a message list and nothing else. A trailing assistant turn already says
+    "continue me"; a second way to say it in the body would only be reachable by hand.
+
+    Off is the default so that no existing deployment changes under anyone. Read it as a
+    migration switch rather than a mode: what it disables is not a behaviour anybody wants,
+    only the one that is there today.
+
+    While off, both protocol paths keep their existing behaviour so clients sending a
+    trailing assistant turn today do not start getting errors from a release they did not
+    opt into.
+    """
+    continuing = os.environ.get("COLI_CONTINUE_ASSISTANT", "0") == "1"
+    last = messages[-1] if isinstance(messages, list) and messages else None
+    if not (isinstance(last, dict) and last.get("role") == "assistant"):
+        return True
+    where = f"messages.{len(messages) - 1}"
+    if not continuing:
+        return True
+    if ARCH != "glm53":
+        raise APIError(400, f"COLI_CONTINUE_ASSISTANT is on, but continuing an assistant "
+                       f"turn is implemented for the glm53 engine only, not {ARCH!r}: every "
+                       f"family needs its own open-turn shape derived from its own template.",
+                       "messages", "unsupported_parameter")
+    if body.get("tools") or body.get("functions"):
+        raise APIError(400, "A continued assistant turn cannot be combined with `tools`: "
+                       "the tool-call parsers read an assistant turn from its start, and a "
+                       "continuation can end anywhere -- including inside a <tool_call> "
+                       "block.", "tools", "unsupported_parameter")
+    if last.get("tool_calls"):
+        raise APIError(400, "A continued `assistant` message cannot carry `tool_calls`.",
+                       f"{where}.tool_calls", "unsupported_value")
+    if len(messages) < 2:
+        raise APIError(400, "A continued `assistant` turn needs a preceding turn to "
+                       "continue from.", "messages")
+    raw = last.get("content")
+    if isinstance(raw, list):                       # multimodal parts: only the text counts
+        text = "".join(part.get("text", "") for part in raw
+                       if isinstance(part, dict) and part.get("type") == "text")
+    elif raw is None:
+        text = ""
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        raise APIError(400, "Message content must be a string or an array of blocks.",
+                       f"{where}.content")
+    if not text.strip():
+        raise APIError(400, "A continued `assistant` turn needs text to continue. An empty "
+                       "one ends the prompt on a closed, empty <think></think> block, which "
+                       "is the out-of-distribution position #1327 removed -- the model "
+                       "reasons straight through it instead of answering.",
+                       f"{where}.content", "invalid_value")
+    if text != text.rstrip():
+        raise APIError(400, "A continued `assistant` turn cannot end with whitespace: the "
+                       "template strips it, so the model would resume from different bytes "
+                       "than the ones sent. Put the space at the start of what you expect "
+                       "back instead.", f"{where}.content", "invalid_value")
+    return False
+
+
 def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                         tool_choice=None, audio_out=None):
-    """Render a chat request with the active engine's native prompt contract."""
+                         tool_choice=None, audio_out=None, add_generation_prompt=True):
+    """Render a chat request with the active engine's native prompt contract.
+
+    `add_generation_prompt=False` (a continued assistant turn) is implemented for glm53 only.
+    resolve_generation_prompt() refuses it for every other family upstream; the assert
+    here is the backstop, because silently appending a cue to a continuation is the exact
+    failure this change exists to remove.
+    """
+    if not add_generation_prompt and ARCH != "glm53":
+        raise APIError(400, f"Continuing an assistant turn is not implemented for {ARCH!r}.",
+                       "messages", "unsupported_parameter")
     if ARCH == "inkling":
         return render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
                                     tool_choice, audio_out=audio_out)
-    renderer = (render_chat_glm53 if ARCH == "glm53" else
-                render_chat_kimi if ARCH == "kimi" else
+    if ARCH == "glm53":
+        return render_chat_glm53(messages, enable_thinking, reasoning_effort, tools,
+                                 tool_choice, add_generation_prompt)
+    renderer = (render_chat_kimi if ARCH == "kimi" else
                 render_chat_qwen if ARCH == "qwen36" else
                 render_chat_qwen38 if ARCH == "qwen38" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
@@ -1943,7 +2050,7 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
 ANTHROPIC_LOCAL_SIGNATURE = "colibri-local"  # opaque compatibility metadata, not a crypto proof
 
 
-def starts_in_reasoning(enable_thinking):
+def starts_in_reasoning(enable_thinking, add_generation_prompt=True):
     """Se l'uscita del modello comincia DENTRO al blocco di ragionamento.
 
     Dipende da come il prompt lo ha lasciato, e ogni famiglia lo lascia come
@@ -1956,8 +2063,20 @@ def starts_in_reasoning(enable_thinking):
     ha un interruttore, render_chat_glm53 apre <think> SEMPRE, e "thinking
     spento" vuol dire solo effort Low. L'uscita comincia dentro al blocco in
     ogni caso; partire in modalita' testo perche' il client ha detto False e'
-    esattamente il ragionamento incollato davanti alla risposta di #1278."""
-    return enable_thinking or ARCH == "glm53"
+    esattamente il ragionamento incollato davanti alla risposta di #1278.
+
+    Il turno proseguito (add_generation_prompt=False) e' il terzo stato, e non
+    lo dice l'interruttore: il prompt finisce sull'ultimo turno assistant reso
+    come turno PASSATO, quindi <think></think> GIA' CHIUSO seguito dal
+    contenuto, col ragionamento acceso o spento che sia. Il modello riprende in
+    modalita' testo; se lo splitter parte in modalita' ragionamento aspetta un
+    </think> che e' gia' passato, e archivia come ragionamento tutta la
+    risposta -- content vuoto, reasoning_content pieno, stop pulito. Misurato
+    su glm53 int4, CPU: 10 e 109 caratteri di ragionamento contro
+    zero di risposta, col prompt corretto sul filo. Vale anche per glm53: la
+    regola di famiglia sopra dice dove comincia un turno NUOVO, e il turno
+    proseguito non ne apre nessuno."""
+    return (enable_thinking or ARCH == "glm53") and add_generation_prompt
 
 
 class ThinkingStreamSplit:
@@ -2010,10 +2129,12 @@ class ThinkingStreamSplit:
     close = finish        # interface parity with InklingStreamSplit in the streaming path
 
 
-def split_thinking_reply(text, enable_thinking=True):
+def split_thinking_reply(text, enable_thinking=True, add_generation_prompt=True):
     """Return the marker-free (thinking, answer) portions of one GLM reply."""
     thinking, answer = [], []
-    split = ThinkingStreamSplit(thinking.append, answer.append, initial_thinking=starts_in_reasoning(enable_thinking))
+    split = ThinkingStreamSplit(thinking.append, answer.append,
+                                initial_thinking=starts_in_reasoning(enable_thinking,
+                                                                     add_generation_prompt))
     split.feed(text)
     split.finish()
     return "".join(thinking), "".join(answer)
@@ -3571,7 +3692,8 @@ class APIHandler(BaseHTTPRequestHandler):
         return {"type": "error", "error": {"type": error.error_type, "message": error.message}}
 
     def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
-                   enable_thinking=False, audio=None, image=None):
+                   enable_thinking=False, audio=None, image=None,
+                   add_generation_prompt=True):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
         # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
         # tool results into `prompt`, so level 2 is the full conversation the engine saw.
@@ -3647,7 +3769,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     # #597 item 4: GLM emits reasoning then </think> then the answer. Route the
                     # reasoning to reasoning_content instead of dumping it (or the raw </think>)
                     # into the visible answer / tool-call parser.
-                    reasoning, text = split_thinking_reply(text, enable_thinking)
+                    reasoning, text = split_thinking_reply(text, enable_thinking,
+                                                           add_generation_prompt)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
                     content, calls = parse_arch_tool_calls(text, tools, sideband.reply())
@@ -3802,7 +3925,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 # #597: keep GLM reasoning out of the tool-call buffer — a think splitter sends it
                 # to reasoning_content and passes only the answer text on to feed_content/parser.
                 think = (ThinkingStreamSplit(emit_reasoning, feed_content,
-                                             initial_thinking=starts_in_reasoning(enable_thinking))
+                                             initial_thinking=starts_in_reasoning(
+                                                 enable_thinking, add_generation_prompt))
                          if glm_think else None)
                 def emit_tools(chunk):
                     if dbg_echo:
@@ -3837,8 +3961,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 if splitter is not None:                   # inkling content/marker splitter
                     content_split = splitter
                 elif glm_think:                            # GLM <think> reasoning → reasoning_content
-                    content_split = ThinkingStreamSplit(emit_reasoning, emit,
-                                                        initial_thinking=starts_in_reasoning(enable_thinking))
+                    content_split = ThinkingStreamSplit(
+                        emit_reasoning, emit,
+                        initial_thinking=starts_in_reasoning(enable_thinking,
+                                                             add_generation_prompt))
                 else:
                     content_split = None
                 def emit_plain(chunk):
@@ -3944,10 +4070,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 raise APIError(400, "one image per request for now; the engine "
                                     "holds a single pending image.", "messages")
             image = images[0] if images else None
+        add_generation_prompt = resolve_generation_prompt(messages, body)
         prompt = render_chat_for_arch(messages, enable_thinking, reasoning_effort,
-                                      tools, tool_choice, audio_out=audio_clips)
+                                      tools, tool_choice, audio_out=audio_clips,
+                                      add_generation_prompt=add_generation_prompt)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
                         enable_thinking=enable_thinking,
+                        add_generation_prompt=add_generation_prompt,
                         audio=b"".join(audio_clips) if audio_clips else None,
                         image=image)
 
@@ -3986,12 +4115,16 @@ class APIHandler(BaseHTTPRequestHandler):
         if tool_choice == "none":
             tools = None
         default_effort = "xhigh" if ARCH == "qwen38" and thinking is None else "high"
+        add_generation_prompt = resolve_generation_prompt(messages, body)
         prompt = render_chat_for_arch(messages, enable_thinking,
                                       default_effort if enable_thinking else None,
-                                      tools, tool_choice)
-        self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking)
+                                      tools, tool_choice,
+                                      add_generation_prompt=add_generation_prompt)
+        self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking,
+                                  add_generation_prompt)
 
-    def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking):
+    def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking,
+                             add_generation_prompt=True):
         maximum, temperature, top_p, grammar, _stop_sequences = generation_options(
             body, self.server.max_tokens)
         # Same policy as /v1/chat/completions: `body` is the translated OpenAI-shaped
@@ -4023,7 +4156,8 @@ class APIHandler(BaseHTTPRequestHandler):
             if ARCH == "inkling":
                 text, reasoning = split_inkling(text)
             elif enable_thinking:
-                reasoning, text = split_thinking_reply(text)
+                reasoning, text = split_thinking_reply(text, enable_thinking,
+                                                       add_generation_prompt)
             if enable_thinking:
                 content.append({"type": "thinking", "thinking": reasoning,
                                 "signature": ANTHROPIC_LOCAL_SIGNATURE})
@@ -4185,7 +4319,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 # lo splitter serve pure col ragionamento "spento", o il
                 # pensiero finisce incollato davanti alla risposta.
                 split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
-                         if starts_in_reasoning(enable_thinking) else None)
+                         if starts_in_reasoning(enable_thinking, add_generation_prompt)
+                         else None)
 
             def on_text(chunk):
                 raw.append(chunk)

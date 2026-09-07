@@ -458,6 +458,7 @@ These are read by the Python programs (not the `glm` engine), so they don't appe
 | `COLI_DEBUG` | `0` (off) | Tee the engine transaction to stderr, by level. **`1`** = decoded model output stream only (byte-by-byte, on both the tool-call and plain paths). **`2`** = both sides — the fully-rendered prompt the engine received *and* the output, bracketed and correlated by request id, so stderr reads as the whole conversation. Invaluable for seeing what the model received vs. emitted during an OpenCode session. |
 | `COLI_TOOL_SALVAGE` | `0` (off) | Opt-in de-mangler: reconstruct a malformed int4 tool call by mapping its lone payload onto the tool's primary parameter. Never rewrites well-formed output; recommended for int4 deployments. |
 | `COLI_THINK` | `0` (off) | Make thinking the default when the client sends *neither* `reasoning_effort` nor `enable_thinking`. Any explicit client value still wins. |
+| `COLI_CONTINUE_ASSISTANT` | `0` (off) | On the OpenAI- and Anthropic-compatible chat endpoints, continue a trailing `assistant` message instead of opening a new turn — the checkpoint's own template with `add_generation_prompt=False`. `glm53` only; refused with `tools`, and the turn must carry text not ending in whitespace. Off preserves each endpoint's existing behavior. Unrelated to `COLI_PREFILL_CHUNK`, which is the compute phase. |
 | `COLI_MODEL` | unset | Default model directory (fallback for `--model`). |
 | `COLI_MODEL_ID` | `glm-5.2-colibri` | Model id reported by the API. |
 | `COLI_API_KEY` | unset | Required bearer token for the server. |

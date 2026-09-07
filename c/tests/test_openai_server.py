@@ -21,9 +21,11 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            _engine_error, _image_bytes_from_url, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
                            parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
-                           read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
+                           read_engine_turn, render_chat, render_chat_glm53, render_chat_kimi,
+                           render_chat_olmoe,
                            render_chat_qwen38, render_chat_v4, _dsv4_tool_calls, serve,
-                           split_thinking_reply,
+                           resolve_generation_prompt, split_thinking_reply,
+                           starts_in_reasoning,
                            stop_policy, tune_child_env)
 
 
@@ -1927,6 +1929,137 @@ class ToolChoiceTest(unittest.TestCase):
     def test_rejects_tool_choice_without_tools(self):
         with self.assertRaises(APIError):
             generation_options({"messages": [], "tool_choice": "required"}, 128)
+
+
+class TrailingAssistantTurnTest(unittest.TestCase):
+    """A trailing `assistant` message is a turn to CONTINUE, not one already finished.
+
+    The gateway used to fold it into a completed turn and append a fresh generation cue,
+    so the model wrote a second assistant turn and the client's opening was dropped. These
+    pin what replaced that: the switch that turns continuation on, what the prompt looks
+    like when it is on, and what is refused rather than silently reshaped.
+
+    The switch is COLI_CONTINUE_ASSISTANT and not a request field on purpose -- a body
+    extension would only be reachable by hand-written JSON, and the clients that want this
+    send a message list and nothing else.
+    """
+
+    OPEN_TURN = [{"role": "user", "content": "capitale della Francia?"},
+               {"role": "assistant", "content": "La capitale e'"}]
+
+    @staticmethod
+    def on():
+        return patch.dict(os.environ, {"COLI_CONTINUE_ASSISTANT": "1"})
+
+    @staticmethod
+    def off():
+        return patch.dict(os.environ, {"COLI_CONTINUE_ASSISTANT": "0"})
+
+    def test_switch_on_leaves_the_turn_open(self):
+        with self.on(), patch("openai_server.ARCH", "glm53"):
+            self.assertFalse(resolve_generation_prompt(self.OPEN_TURN, {}))
+            prompt = render_chat_glm53(self.OPEN_TURN, enable_thinking=True,
+                                       add_generation_prompt=False)
+        # ends INSIDE the turn, on the client's opening -- no new cue after it
+        self.assertTrue(prompt.endswith("La capitale e'"), prompt[-60:])
+        self.assertFalse(prompt.endswith("<|assistant|><think>"))
+        self.assertEqual(prompt.count("<|assistant|>"), 1)
+
+    def test_switch_off_changes_nothing(self):
+        """The default deployment must behave exactly as it did before this existed."""
+        with self.off(), patch("openai_server.ARCH", "glm53"):
+            self.assertTrue(resolve_generation_prompt(self.OPEN_TURN, {}))
+            self.assertEqual(render_chat_glm53(self.OPEN_TURN, enable_thinking=True),
+                             render_chat_glm53(self.OPEN_TURN, enable_thinking=True,
+                                               add_generation_prompt=True))
+        self.assertTrue(render_chat_glm53(self.OPEN_TURN,
+                                          enable_thinking=True).endswith("<|assistant|><think>"))
+
+    def test_no_trailing_assistant_turn_is_untouched_either_way(self):
+        messages = [{"role": "user", "content": "a"}]
+        for switch in (self.on(), self.off()):
+            with switch, patch("openai_server.ARCH", "glm53"):
+                self.assertTrue(resolve_generation_prompt(messages, {}))
+
+    def test_rejects_trailing_whitespace(self):
+        """The template strips it, so the model would resume from different bytes than the
+        ones sent -- the same reason Anthropic's own prefill validator refuses it."""
+        messages = [{"role": "user", "content": "a"},
+                    {"role": "assistant", "content": "La capitale e' "}]
+        with self.on(), patch("openai_server.ARCH", "glm53"):
+            with self.assertRaises(APIError):
+                resolve_generation_prompt(messages, {})
+
+    def test_rejects_an_empty_continuation(self):
+        """An empty one ends the prompt on a closed, empty <think></think>: the
+        out-of-distribution position #1327 removed."""
+        for empty in ("", "   ", None):
+            messages = [{"role": "user", "content": "a"},
+                        {"role": "assistant", "content": empty}]
+            with self.on(), patch("openai_server.ARCH", "glm53"):
+                with self.assertRaises(APIError):
+                    resolve_generation_prompt(messages, {})
+
+    def test_rejects_tools_and_tool_calls(self):
+        with self.on(), patch("openai_server.ARCH", "glm53"):
+            with self.assertRaises(APIError):
+                resolve_generation_prompt(self.OPEN_TURN, {"tools": ORDER_TOOL})
+            calls = [{"role": "user", "content": "a"},
+                     {"role": "assistant", "content": "x", "tool_calls": [
+                         {"type": "function", "function": {"name": "f", "arguments": "{}"}}]}]
+            with self.assertRaises(APIError):
+                resolve_generation_prompt(calls, {})
+
+    def test_rejects_families_without_an_open_turn_shape(self):
+        """Every family needs its own, derived from its own template. Until then, say so
+        instead of appending a cue to a turn the client meant to be continued."""
+        for arch in ("glm", "deepseek_v4", "kimi", "qwen38", "olmoe", "inkling", "qwen36"):
+            with self.on(), patch("openai_server.ARCH", arch):
+                with self.assertRaises(APIError):
+                    resolve_generation_prompt(self.OPEN_TURN, {})
+
+    def test_splitter_starts_in_content_mode_on_a_continued_turn(self):
+        """Measured glm53 int4, CPU: content '' with reasoning_chars 10 and 109,
+        clean stop, and a byte-correct open turn on the wire. The model was fine; the
+        splitter was primed from enable_thinking alone, so it waited for a </think> the
+        prompt had already passed and filed the whole answer as reasoning.
+
+        starts_in_reasoning's own docstring is about exactly this invariant -- a continued
+        turn is the third state it did not model. Nothing else in the suite covers it:
+        every other thinking test runs against a prompt with the generation cue appended,
+        where enable_thinking really does say where the block was left.
+
+        Pinned to glm53 because that is the only family the switch serves. Left on the
+        module default (ARCH = "glm") this exercised the continuation path on a family
+        resolve_generation_prompt refuses, and passed for the wrong reason.
+
+        The family rule itself -- whether a NEW turn starts inside the block -- belongs to
+        #1278 and is pinned by its own test; asserted here it would only duplicate it. What
+        this test owns is the axis crossing it: a continued turn opens no block, whatever
+        the family rule says."""
+        with patch("openai_server.ARCH", "glm53"):
+            self.assertTrue(starts_in_reasoning(True))                   # cue: block left open
+            self.assertFalse(starts_in_reasoning(True, add_generation_prompt=False))
+            self.assertFalse(starts_in_reasoning(False, add_generation_prompt=False))
+
+            # what the engine actually returns after "...The capital of France is": no
+            # markers, because the turn's <think></think> is already behind it in the prompt
+            emitted = " Paris."
+            reasoning, answer = split_thinking_reply(emitted, enable_thinking=True,
+                                                     add_generation_prompt=False)
+            self.assertEqual(answer, emitted)
+            self.assertEqual(reasoning, "")
+            # and the bug it replaces, so this test fails if the priming is ever reverted
+            reasoning, answer = split_thinking_reply(emitted, enable_thinking=True,
+                                                     add_generation_prompt=True)
+            self.assertEqual(answer, "")
+            self.assertEqual(reasoning, emitted)
+
+    def test_rejects_a_continuation_with_nothing_to_continue_from(self):
+        lone = [{"role": "assistant", "content": "La capitale e'"}]
+        with self.on(), patch("openai_server.ARCH", "glm53"):
+            with self.assertRaises(APIError):
+                resolve_generation_prompt(lone, {})
 
 
 class AllowedHostsTest(unittest.TestCase):
