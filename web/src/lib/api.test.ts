@@ -56,7 +56,9 @@ describe("chat request extensions", () => {
     headers: { "content-type": "text/event-stream" },
   })
 
-  async function requestBody(cacheSlot?: number) {
+  async function requestBody(
+    extra: { cacheSlot?: number; enableThinking?: boolean; reasoningEffort?: string } = {},
+  ) {
     const fetchMock = vi.fn().mockResolvedValue(completedStream())
     vi.stubGlobal("fetch", fetchMock)
     await streamChat({
@@ -66,8 +68,9 @@ describe("chat request extensions", () => {
       messages: [],
       temperature: 0,
       maxTokens: 8,
-      enableThinking: false,
-      cacheSlot,
+      enableThinking: extra.enableThinking ?? false,
+      reasoningEffort: extra.reasoningEffort,
+      cacheSlot: extra.cacheSlot,
       signal: new AbortController().signal,
       onDelta: () => undefined,
     })
@@ -79,6 +82,17 @@ describe("chat request extensions", () => {
   })
 
   it("sends cache_slot zero when colibrì advertises KV slots", async () => {
-    expect(await requestBody(0)).toMatchObject({ cache_slot: 0 })
+    expect(await requestBody({ cacheSlot: 0 })).toMatchObject({ cache_slot: 0 })
+  })
+
+  it("sends reasoning_effort when reasoning is on", async () => {
+    expect(await requestBody({ enableThinking: true, reasoningEffort: "high" }))
+      .toMatchObject({ enable_thinking: true, reasoning_effort: "high" })
+  })
+
+  it("omits reasoning_effort when reasoning is off, even if a level is passed", async () => {
+    const body = await requestBody({ enableThinking: false, reasoningEffort: "high" })
+    expect(body).toMatchObject({ enable_thinking: false })
+    expect(body).not.toHaveProperty("reasoning_effort")
   })
 })

@@ -46,6 +46,24 @@ const message = (role: ChatMessage["role"], content: string): ChatMessage => {
   return { id, role, content }
 }
 
+/* Reasoning depth for GLM. The engine renders enable_thinking + reasoning_effort;
+   these levels map onto the words GLM understands (Low/Medium/High/Max), and "off"
+   turns thinking off entirely. GLM 5.3 cannot disable reasoning, so "off" is dropped
+   for it -- the model's own constraint, mirrored in the control rather than sent and
+   silently ignored. */
+type ReasoningLevel = "off" | "low" | "medium" | "high" | "max"
+
+const REASONING_EFFORT: Record<Exclude<ReasoningLevel, "off">, string> = {
+  low: "low", medium: "medium", high: "high", max: "xhigh",
+}
+
+const modelForcesReasoning = (model: string) => /5\.3/.test(model)
+
+const reasoningLevelsFor = (model: string): ReasoningLevel[] =>
+  modelForcesReasoning(model)
+    ? ["low", "medium", "high", "max"]
+    : ["off", "low", "medium", "high", "max"]
+
 export default function App() {
   const { t, locale, setLocale, locales } = useLocale()
 
@@ -61,7 +79,7 @@ export default function App() {
   const [model, setModel] = useState(() => stored(localStorage, "colibri.model", "glm-5.2-colibri"))
   const [temperature, setTemperature] = useState(0.7)
   const [maxTokens, setMaxTokens] = useState(4096)
-  const [thinking, setThinking] = useState(false)
+  const [reasoning, setReasoning] = useState<ReasoningLevel>("off")
   const [cacheSlot, setCacheSlot] = useState(0)
   const [conversations, setConversations] = useState<Record<number, ChatMessage[]>>({ 0: [] })
   const [health, setHealth] = useState<HealthResponse | null>(null)
@@ -160,6 +178,13 @@ export default function App() {
   // EFFECT #6
   useEffect(() => { setLastRun(null) }, [cacheSlot])
 
+  /* GLM 5.3 cannot turn reasoning off. If the user switches to such a model
+     while "off" is selected, lift it to a sane on-state instead of sending a
+     level the model will ignore. */
+  useEffect(() => {
+    if (modelForcesReasoning(model)) setReasoning((level) => level === "off" ? "high" : level)
+  }, [model])
+
   // EFFECT #7
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }) }, [messages])
 
@@ -236,7 +261,8 @@ export default function App() {
         messages: history,
         temperature,
         maxTokens,
-        enableThinking: thinking,
+        enableThinking: reasoning !== "off",
+        reasoningEffort: reasoning === "off" ? undefined : REASONING_EFFORT[reasoning],
         cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
         signal: controller.signal,
         /* Reasoning tokens are tokens: they count toward the rate, and the
@@ -349,9 +375,11 @@ export default function App() {
           </select><span className="field-help">{t("sidebar.kvSessionHelp")}</span></label> : null}
           <label><span className="label-line"><span>{t("sidebar.temperature")}</span><code>{temperature.toFixed(1)}</code></span><input className="range" type="range" min="0" max="2" step="0.1" value={temperature} onChange={(event) => setTemperature(Number(event.target.value))} /></label>
           <label>{t("sidebar.maxTokens")}<Input type="number" min={1} max={32768} value={maxTokens} onChange={(event) => { const value = Number(event.target.value); if (Number.isFinite(value)) setMaxTokens(Math.min(32768, Math.max(1, Math.round(value)))) }} /></label>
-          <button type="button" className={cn("toggle-row", thinking && "active")} aria-pressed={thinking} onClick={() => setThinking((value) => !value)}>
-            <span><BrainCircuit className="size-4" /> {t("sidebar.reasoning")}</span><i><b /></i>
-          </button>
+          <label><span className="label-line"><span><BrainCircuit className="size-4" /> {t("sidebar.reasoning")}</span></span>
+            <select value={reasoning} onChange={(event) => setReasoning(event.target.value as ReasoningLevel)} disabled={loading}>
+              {reasoningLevelsFor(model).map((level) => <option key={level} value={level}>{t(`sidebar.reasoning.${level}`)}</option>)}
+            </select>
+          </label>
         </section>
 
         <div className="sidebar-foot">

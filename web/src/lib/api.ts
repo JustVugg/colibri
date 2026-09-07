@@ -152,6 +152,10 @@ export interface StreamChatOptions {
   temperature: number
   maxTokens: number
   enableThinking: boolean
+  /* GLM reasoning depth when enableThinking is on: low | medium | high | xhigh.
+     The server maps it onto the model's own words (Low/Medium/High/Max); when
+     absent it keeps the server default, so a plain on/off client still works. */
+  reasoningEffort?: string
   cacheSlot?: number
   signal: AbortSignal
   onDelta: (text: string) => void
@@ -181,6 +185,8 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
       temperature: options.temperature,
       max_completion_tokens: options.maxTokens,
       enable_thinking: options.enableThinking,
+      ...(options.enableThinking && options.reasoningEffort
+        ? { reasoning_effort: options.reasoningEffort } : {}),
       ...(options.cacheSlot === undefined ? {} : { cache_slot: options.cacheSlot }),
       stream: true,
       stream_options: { include_usage: true },
