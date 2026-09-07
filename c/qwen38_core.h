@@ -27,6 +27,10 @@ typedef struct {
     int ple_layer, ple_dim, ple_convk, ngram_size, heads_per_ngram;
     int ngram_heads, ngram_head_dim, ngram_parts;
     uint8_t *is_attn;
+    /* vision: 0 = checkpoint di solo testo, o torre non caricata */
+    int image_token;
+    int vis_depth, vis_hidden, vis_heads, vis_inter, vis_patch;
+    int vis_merge, vis_temporal, vis_in_ch, vis_out_hidden, vis_num_pos;
 } Cfg;
 
 typedef enum {
@@ -132,6 +136,16 @@ typedef struct {
     int prefill_batch;
     uint64_t resident_weight_bytes;
     double dense_load_s;
+    /* vision. `vis_map` mappa la posizione ASSOLUTA nella sequenza alla riga di
+     * `vis_rows`, oppure -1. Assoluta e non relativa al chunk: il prefill arriva
+     * a pezzi, e un indice relativo darebbe l'immagine sbagliata al secondo
+     * pezzo senza che niente protesti. */
+    /* PLE prefetto: le righe gia' lette per il chunk in corso, o NULL. */
+    float *ple_pref; int ple_pref_rows;
+    Q38Vision vis;
+    int vis_ready;
+    float *vis_rows;
+    int *vis_map, vis_map_len, vis_rows_n;
     Q38Timers timers;
 } Model;
 
@@ -476,12 +490,46 @@ static void q38_load_cfg(Cfg *c,const char *snap) {
         else if(!strcmp(s,"full_attention")||!strcmp(s,"qwen_sparse_attention")) c->is_attn[i]=1;
         else {fprintf(stderr,"unsupported layer type %s\n",s);exit(1);}
     }
+    /* Vision: opzionale. Un checkpoint di solo testo non ha vision_config, e in
+     * quel caso la torre resta spenta invece di rifiutare il modello. La
+     * geometria viene dal file, non da costanti qui: una torre di misura diversa
+     * deve fallire dicendo cosa non torna, non leggere pesi della misura
+     * sbagliata. */
+    {
+        jval *vc = q38_obj(root, "vision_config");
+        if (vc) {
+            c->vis_depth      = q38_num_int(vc,"depth",0,1,1,1024);
+            c->vis_hidden     = q38_num_int(vc,"hidden_size",0,1,1,65536);
+            c->vis_heads      = q38_num_int(vc,"num_heads",0,1,1,1024);
+            c->vis_inter      = q38_num_int(vc,"intermediate_size",0,1,1,262144);
+            c->vis_patch      = q38_num_int(vc,"patch_size",16,0,1,512);
+            c->vis_merge      = q38_num_int(vc,"spatial_merge_size",2,0,1,8);
+            c->vis_temporal   = q38_num_int(vc,"temporal_patch_size",2,0,1,8);
+            c->vis_in_ch      = q38_num_int(vc,"in_channels",3,0,1,8);
+            c->vis_out_hidden = q38_num_int(vc,"out_hidden_size",c->hidden,0,1,65536);
+            c->vis_num_pos    = q38_num_int(vc,"num_position_embeddings",0,1,1,1<<20);
+            c->image_token    = q38_num_int(root,"image_token_id",-1,0,0,INT_MAX);
+        }
+    }
     json_free(root); free(buf); free(arena);
 }
 
 #define Q38_NEED(x,...) do{if(!(x)){fprintf(stderr,"[qwen38 config] ");fprintf(stderr,__VA_ARGS__);fprintf(stderr," -- refusing\n");exit(1);}}while(0)
 static void q38_validate_cfg(const Cfg *c) {
     Q38_NEED(c->hidden>0&&c->hidden<=65536,"hidden_size=%d",c->hidden);
+    if (c->vis_depth) {
+        /* La torre proietta direttamente nello spazio del testo: se le due
+         * dimensioni non coincidono i token immagine finirebbero nel posto
+         * giusto con i numeri sbagliati, che e' peggio di un rifiuto. */
+        Q38_NEED(c->vis_out_hidden==c->hidden,
+                 "vision out_hidden_size=%d but text hidden_size=%d",
+                 c->vis_out_hidden,c->hidden);
+        Q38_NEED(c->vis_hidden%c->vis_heads==0,
+                 "vision hidden_size=%d not divisible by num_heads=%d",
+                 c->vis_hidden,c->vis_heads);
+        Q38_NEED(c->image_token>=0&&c->image_token<c->vocab,
+                 "image_token_id=%d outside vocabulary",c->image_token);
+    }
     Q38_NEED(c->layers>0&&c->layers<=Q38_MAX_LAYERS,"layers=%d",c->layers);
     Q38_NEED(c->vocab>0&&c->max_positions>0&&
              c->max_positions<=QWEN38_ATTN_MAX_CTX,"vocab/context invalid");
@@ -641,6 +689,127 @@ static void q38_alloc_state(Model *m) {
     }
 }
 
+/* ---- vision ------------------------------------------------------------- */
+
+/* La torre e' in F32 residente: 27 blocchi da 1152 sono ~0.6 GB, che accanto ai
+ * 9.2 GiB dei pesi densi non cambia la classe di macchina. Gli esperti restano
+ * su disco; la torre no, perche' si usa una volta per immagine e non per token. */
+static const float *q38_vis_tensor(Model *m,const char *suffix,int64_t expect) {
+    char nm[512];
+    snprintf(nm,sizeof nm,"%s.visual.%s",m->prefix,suffix);
+    if(!st_has(&m->S,nm)){
+        snprintf(nm,sizeof nm,"model.visual.%s",suffix);
+        if(!st_has(&m->S,nm)){fprintf(stderr,"vision tensor missing: %s\n",suffix);exit(1);}
+    }
+    st_tensor *t=st_find(&m->S,nm);
+    if(expect>0&&t->numel!=expect){
+        fprintf(stderr,"vision tensor %s has %lld values, expected %lld -- refusing\n",
+                nm,(long long)t->numel,(long long)expect);exit(1);
+    }
+    float *buf=(float*)malloc((size_t)t->numel*sizeof(float));
+    if(!buf){fprintf(stderr,"OOM loading %s\n",nm);exit(1);}
+    st_read_f32(&m->S,nm,buf,t->numel);
+    m->resident_weight_bytes+=(uint64_t)t->numel*sizeof(float);
+    return buf;
+}
+
+static void q38_vis_linear(Model *m,Q38Linear *l,const char *stem,int out,int in) {
+    char nm[512];
+    snprintf(nm,sizeof nm,"%s.weight",stem); l->w=q38_vis_tensor(m,nm,(int64_t)out*in);
+    snprintf(nm,sizeof nm,"%s.bias",stem);   l->b=q38_vis_tensor(m,nm,out);
+    l->out=out; l->in=in;
+}
+
+static void q38_vis_norm(Model *m,Q38Norm *n,const char *stem,int width) {
+    char nm[512];
+    snprintf(nm,sizeof nm,"%s.weight",stem); n->w=q38_vis_tensor(m,nm,width);
+    snprintf(nm,sizeof nm,"%s.bias",stem);   n->b=q38_vis_tensor(m,nm,width);
+}
+
+static void q38_load_vision(Model *m) {
+    Cfg *c=&m->c;
+    if(!c->vis_depth) return;
+    char probe[512];
+    snprintf(probe,sizeof probe,"%s.visual.pos_embed.weight",m->prefix);
+    if(!st_has(&m->S,probe)&&!st_has(&m->S,"model.visual.pos_embed.weight")){
+        /* config multimodale ma pesi assenti: e' un export solo-testo di un
+         * checkpoint multimodale. Spegnere la torre e dirlo e' meglio che
+         * rifiutare un modello che per il testo funziona benissimo. */
+        fprintf(stderr,"[qwen38] vision_config present but no visual weights; text only\n");
+        c->vis_depth=0; return;
+    }
+    Q38Vision *v=&m->vis;
+    memset(v,0,sizeof *v);
+    v->depth=c->vis_depth; v->hidden=c->vis_hidden; v->heads=c->vis_heads;
+    v->head_dim=c->vis_hidden/c->vis_heads; v->inter=c->vis_inter;
+    v->patch=c->vis_patch; v->merge=c->vis_merge; v->temporal=c->vis_temporal;
+    v->in_ch=c->vis_in_ch; v->out_hidden=c->vis_out_hidden;
+    v->num_pos=c->vis_num_pos; v->side=(int)(sqrt((double)c->vis_num_pos)+0.5);
+    v->eps=1e-6f;
+    if(v->side*v->side!=v->num_pos){
+        fprintf(stderr,"[qwen38] num_position_embeddings=%d is not a square grid -- refusing\n",
+                v->num_pos);exit(1);
+    }
+    int features=v->in_ch*v->temporal*v->patch*v->patch;
+    q38_vis_linear(m,&v->patch_embed,"patch_embed.proj",v->hidden,features);
+    v->pos_embed=q38_vis_tensor(m,"pos_embed.weight",(int64_t)v->num_pos*v->hidden);
+    v->blocks=(Q38VBlock*)calloc((size_t)v->depth,sizeof(Q38VBlock));
+    if(!v->blocks){fprintf(stderr,"OOM vision blocks\n");exit(1);}
+    for(int i=0;i<v->depth;i++){
+        char stem[160];
+        snprintf(stem,sizeof stem,"blocks.%d.norm1",i);          q38_vis_norm(m,&v->blocks[i].norm1,stem,v->hidden);
+        snprintf(stem,sizeof stem,"blocks.%d.norm2",i);          q38_vis_norm(m,&v->blocks[i].norm2,stem,v->hidden);
+        snprintf(stem,sizeof stem,"blocks.%d.attn.qkv",i);       q38_vis_linear(m,&v->blocks[i].qkv,stem,3*v->hidden,v->hidden);
+        snprintf(stem,sizeof stem,"blocks.%d.attn.proj",i);      q38_vis_linear(m,&v->blocks[i].proj,stem,v->hidden,v->hidden);
+        snprintf(stem,sizeof stem,"blocks.%d.mlp.linear_fc1",i); q38_vis_linear(m,&v->blocks[i].fc1,stem,v->inter,v->hidden);
+        snprintf(stem,sizeof stem,"blocks.%d.mlp.linear_fc2",i); q38_vis_linear(m,&v->blocks[i].fc2,stem,v->hidden,v->inter);
+    }
+    int wide=v->hidden*v->merge*v->merge;
+    q38_vis_norm(m,&v->merger_norm,"merger.norm",v->hidden);
+    q38_vis_linear(m,&v->merger_fc1,"merger.linear_fc1",wide,wide);
+    q38_vis_linear(m,&v->merger_fc2,"merger.linear_fc2",v->out_hidden,wide);
+    m->vis_ready=1;
+    fprintf(stderr,"[qwen38] vision tower: %d blocks, hidden %d, %d heads, patch %d, merge %d\n",
+            v->depth,v->hidden,v->heads,v->patch,v->merge);
+}
+
+/* Esegue la torre su un'immagine gia' preprocessata e prepara la mappa
+ * posizione->riga. `ids`/`n` sono i token del prompt: le righe vengono
+ * assegnate ai token immagine nell'ordine in cui compaiono. */
+static int q38_vision_attach(Model *m,const float *patches,int grid_h,int grid_w,
+                             const int *ids,int n) {
+    Cfg *c=&m->c;
+    if(!m->vis_ready) return -1;
+    int tokens=(grid_h*grid_w)/(c->vis_merge*c->vis_merge);
+    int slots=0;
+    for(int i=0;i<n;i++) if(ids[i]==c->image_token) slots++;
+    if(slots!=tokens){
+        /* Il numero di segnaposto nel prompt DEVE essere quello che la griglia
+         * produce. Se non lo e', il template e il preprocessing hanno visto due
+         * immagini diverse, e proseguire vorrebbe dire mettere i vettori giusti
+         * nelle posizioni sbagliate. */
+        fprintf(stderr,"[qwen38] prompt has %d image placeholders but the grid gives %d tokens\n",
+                slots,tokens);
+        return -1;
+    }
+    free(m->vis_rows); free(m->vis_map);
+    m->vis_rows=(float*)calloc((size_t)tokens*c->hidden,sizeof(float));
+    m->vis_map=(int*)malloc((size_t)n*sizeof(int));
+    if(!m->vis_rows||!m->vis_map){free(m->vis_rows);free(m->vis_map);
+        m->vis_rows=NULL;m->vis_map=NULL;return -1;}
+    if(q38_vision_forward(&m->vis,patches,grid_h,grid_w,m->vis_rows)!=tokens){
+        free(m->vis_rows);free(m->vis_map);m->vis_rows=NULL;m->vis_map=NULL;return -1;}
+    int next=0;
+    for(int i=0;i<n;i++) m->vis_map[i]=(ids[i]==c->image_token)?next++:-1;
+    m->vis_map_len=n; m->vis_rows_n=tokens;
+    return tokens;
+}
+
+static void q38_vision_detach(Model *m) {
+    free(m->vis_rows); free(m->vis_map);
+    m->vis_rows=NULL; m->vis_map=NULL; m->vis_map_len=0; m->vis_rows_n=0;
+}
+
 static void model_init_range(Model *m,const char *snap,int cap,int bits,
                              int layer_begin,int layer_end,int load_boundaries,
                              int allocate_state) {
@@ -702,6 +871,10 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
         if(!lc->slots||!lc->by_expert){fprintf(stderr,"OOM expert cache\n");exit(1);} for(int e=0;e<c->experts;e++)lc->by_expert[e]=-1;
     }
     if(c->ple_layer>=layer_begin&&c->ple_layer<layer_end) q38_load_ple(m,&m->L[c->ple_layer]);
+    /* La torre solo quando il motore possiede la sequenza intera: uno shard che
+     * ospita solo alcuni layer non ha da fare niente con le immagini, e
+     * caricarla la' sarebbe mezzo giga per nulla. */
+    if(load_boundaries&&q38_env_bool("Q38_VISION",1)) q38_load_vision(m);
     if(allocate_state) q38_alloc_state(m);
     m->dense_load_s=now_s()-t0;
     fprintf(stderr,"[qwen38] native text weights: prefix=%s, %d layers, PLE=%d, cache=%d/layer, "
@@ -921,6 +1094,21 @@ static void q38_load_native_fp8_ranges(Model *m,int layer,int expert,Slot *slot,
     Cfg *c=&m->c;
     Q38ExpertScaleCache *cache=&m->expert_scales[layer];
     float *scales=cache->values+(int64_t)expert*3*cache->scale_count;
+    /* Se i tre intervalli sono mappati (COLI_MAP_EXPERTS=1), lo slot li PUNTA
+     * invece di copiarli: niente slab, niente 14 MB per miss. */
+    {
+        const uint8_t *pg=(const uint8_t*)st_map_shard_range(weight[0]->fd,weight[0]->off,weight[0]->nbytes);
+        const uint8_t *pu=(const uint8_t*)st_map_shard_range(weight[1]->fd,weight[1]->off,weight[1]->nbytes);
+        const uint8_t *pd=(const uint8_t*)st_map_shard_range(weight[2]->fd,weight[2]->off,weight[2]->nbytes);
+        if(pg&&pu&&pd){
+            int sc=(int)cache->scale_count;
+            q38_bind_borrowed_fp8(&slot->gate,(void*)pg,scales,c->inter,c->hidden);
+            q38_bind_borrowed_fp8(&slot->up,(void*)pu,scales+sc,c->inter,c->hidden);
+            q38_bind_borrowed_fp8(&slot->down,(void*)pd,scales+2*sc,c->hidden,c->inter);
+            if(slot->fp8_slab){free(slot->fp8_slab);slot->fp8_slab=NULL;slot->fp8_slab_bytes=0;}
+            return;
+        }
+    }
     q38_bind_fp8_slot(slot,scales,(int)cache->scale_count,c->hidden,c->inter);
     int64_t pair_bytes=weight[0]->nbytes+weight[1]->nbytes;
     unsigned char *raw=(unsigned char*)slot->fp8_slab;
@@ -1175,6 +1363,69 @@ static int64_t q38_hash_row(Model *m,int head,int ngram,int64_t cur,int64_t p1,i
     return m->ple_head_offset[head]+r;
 }
 
+
+/* Anticipa le letture PLE all'inizio del forward invece di emetterle inline al
+ * layer che le usa.
+ *
+ * Perche' si puo' fare, e perche' NON si puo' fare con gli esperti: gli indici
+ * delle righe PLE sono funzione pura degli id dei token e della finestra di due
+ * token che li precede -- q38_hash_row non guarda nessuno stato nascosto. Sono
+ * quindi noti PRIMA che parta un solo calcolo. Gli esperti no: quelli dipendono
+ * dal router del layer precedente, e per questo la loro finestra di anticipo e'
+ * di un layer e non di tutto il forward.
+ *
+ * Il PLE cade sul layer 2 di 48, quindi fra l'emissione e l'uso ci sono due
+ * layer interi di calcolo -- con il loro streaming di esperti, che su questo
+ * motore e' la parte lenta. E' abbondantemente il tempo di far arrivare 16
+ * righe da 160 byte.
+ *
+ * Sono anche letture PARALLELE invece che in fila: prima erano 16 pread seriali
+ * a queue depth 1 per token, che in prefill diventano lunghezza-del-prompt per
+ * 16, una alla volta.
+ *
+ * Riordino puro: stessi byte, letti prima. I token non cambiano, e il test lo
+ * pretende invece di darlo per scontato. */
+static void q38_ple_prefetch(Model *m,const int *ids,int S) {
+    Cfg *c=&m->c;
+    free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;
+    if(c->ple_layer<0||S<1||c->ngram_heads<1||c->ngram_head_dim<1) return;
+    if(!q38_env_bool("Q38_PLE_PREFETCH",1)) return;
+
+    int64_t per_row=c->ngram_head_dim, per_pos=(int64_t)c->ngram_heads*per_row;
+    if(S>INT_MAX/c->ngram_heads) return;
+    float *buffer=(float*)malloc((size_t)S*per_pos*sizeof(float));
+    int64_t *rows=(int64_t*)malloc((size_t)S*c->ngram_heads*sizeof(int64_t));
+    if(!buffer||!rows){free(buffer);free(rows);return;}   /* niente prefetch: si legge inline */
+
+    /* La finestra di due token viene SIMULATA, non mutata: q38_ple la aggiorna
+     * per conto suo mentre gira, e toccarla qui la farebbe avanzare due volte. */
+    int64_t history[2]={m->ple_history[0],m->ple_history[1]};
+    int history_len=m->ple_history_len;
+    for(int s=0;s<S;s++){
+        int64_t p1=history_len>=1?history[history_len-1]:c->eos_id;
+        int64_t p2=history_len>=2?history[history_len-2]:c->eos_id;
+        for(int h=0;h<c->ngram_heads;h++){
+            int ng=h<c->heads_per_ngram?2:3;
+            rows[(int64_t)s*c->ngram_heads+h]=q38_hash_row(m,h,ng,ids[s],p1,p2);
+        }
+        if(ids[s]==c->eos_id) history_len=0;
+        else if(history_len==0){history[0]=ids[s];history_len=1;}
+        else if(history_len==1){history[1]=ids[s];history_len=2;}
+        else {history[0]=history[1];history[1]=ids[s];}
+    }
+
+    int64_t total=(int64_t)S*c->ngram_heads;
+    volatile int failed=0;
+    #pragma omp parallel for schedule(static)
+    for(int64_t i=0;i<total;i++){
+        if(failed) continue;
+        q38_ple_row(m,rows[i],buffer+i*per_row);
+    }
+    free(rows);
+    if(failed){free(buffer);return;}
+    m->ple_pref=buffer; m->ple_pref_rows=S;
+}
+
 static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out) {
     double phase_started=now_s();
     Cfg *c=&m->c; Layer *l=&m->L[c->ple_layer]; int H=c->hidden,C=c->hc_count,W=c->hc_width,E=c->ple_dim;
@@ -1183,7 +1434,12 @@ static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out)
     for(int s=0;s<S;s++){
         int64_t p1=m->ple_history_len>=1?m->ple_history[m->ple_history_len-1]:c->eos_id;
         int64_t p2=m->ple_history_len>=2?m->ple_history[m->ple_history_len-2]:c->eos_id;
-        for(int h=0;h<c->ngram_heads;h++){
+        if(m->ple_pref&&s<m->ple_pref_rows){
+            /* gia' in memoria: le ha portate q38_ple_prefetch mentre i primi
+             * layer calcolavano */
+            memcpy(emb,m->ple_pref+(int64_t)s*c->ngram_heads*c->ngram_head_dim,
+                   (size_t)c->ngram_heads*c->ngram_head_dim*sizeof(float));
+        } else for(int h=0;h<c->ngram_heads;h++){
             int ng=h<c->heads_per_ngram?2:3; int64_t row=q38_hash_row(m,h,ng,ids[s],p1,p2);
             q38_ple_row(m,row,emb+(int64_t)h*c->ngram_head_dim);
         }
@@ -1700,15 +1956,28 @@ static float *step(Model *m,const int *ids,int S,int pos_base) {
     Cfg *c=&m->c;int H=c->hidden,W=c->hc_width,C=c->hc_count;
     m->timers.forwards++;
     float *hyper=falloc((int64_t)S*W);
+    /* Le righe PLE partono ADESSO, non al layer 2 dove servono: sono note dagli
+     * id dei token soltanto, e i due layer che le precedono danno il tempo di
+     * farle arrivare dal disco. */
+    q38_ple_prefetch(m,ids,S);
     for(int s=0;s<S;s++){
         if(ids[s]<0||ids[s]>=c->vocab){fprintf(stderr,"token id %d outside vocabulary\n",ids[s]);exit(1);}
-        float *e=hyper+(int64_t)s*W;q38_weight_row(&m->embed,ids[s],e);
+        float *e=hyper+(int64_t)s*W;
+        int abs_pos=pos_base+s, vis_row=-1;
+        if(m->vis_map&&abs_pos>=0&&abs_pos<m->vis_map_len) vis_row=m->vis_map[abs_pos];
+        if(vis_row>=0&&vis_row<m->vis_rows_n)
+            memcpy(e,m->vis_rows+(int64_t)vis_row*H,(size_t)H*sizeof(float));
+        else q38_weight_row(&m->embed,ids[s],e);
         for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
     }
     float *mixed=falloc((int64_t)S*H),*inject=falloc((int64_t)S*C),*block=falloc((int64_t)S*H);
     for(int i=0;i<c->layers;i++){
         Layer *l=&m->L[i];
-        if(i==c->ple_layer){float *ple=falloc((int64_t)S*W);q38_ple(m,ids,S,hyper,ple);for(int64_t z=0;z<(int64_t)S*W;z++)hyper[z]+=ple[z];free(ple);}
+        if(i==c->ple_layer){float *ple=falloc((int64_t)S*W);q38_ple(m,ids,S,hyper,ple);for(int64_t z=0;z<(int64_t)S*W;z++)hyper[z]+=ple[z];free(ple);
+            /* consumate: il chunk successivo ha altri token, e riusare queste
+             * righe darebbe gli embedding del chunk precedente combaciando in
+             * silenzio invece di dare errore. */
+            free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;}
         q38_gr_read(m,&l->attn_gr,hyper,S,mixed,inject);
         if(c->is_attn[i])q38_attention(m,l,i,mixed,S,pos_base,block);else q38_deltanet(m,l,i,mixed,S,block);
         q38_gr_apply(c,hyper,block,inject,S);

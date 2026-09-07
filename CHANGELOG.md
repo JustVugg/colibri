@@ -3,7 +3,75 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [1.10.2] — 2026-09-06
+
+Patch release. Three of these fixes answer reports made against 1.10.1 in the
+days after it shipped.
+
+### Fixed
+
+- `coli convert` picks the converter from the checkpoint's `config.json`. It ran
+  GLM-5.2's converter on everything; on GLM-5.3-Flash that quantized the nested
+  embedding and the engine refused the result hours later inside `coli web`.
+  An option the target converter does not take is refused, not dropped (#1368,
+  #1369). The converter also refuses a checkpoint it cannot serve, with a
+  per-family pointer (#1305).
+- `coli doctor` no longer reports two missing core tensors on a healthy
+  GLM-5.3-Flash: it matches roles, prefix-agnostically, instead of GLM-5.2's
+  literal names (#1365, #1366).
+- The release archive ships every file `coli` reaches: `iq3_pack.py`, its grid
+  data file, and `tools/convert_glm53.py`, which had never been packaged
+  (#1359, #1364).
+- The RSS guard counts anonymous memory, not reclaimable page cache, so a mapped
+  container no longer evicts experts to free memory it was not using (#1350).
+- `serve` honors CANCEL while a turn is still running (#1336), and the
+  disconnect scenario is built rather than hoped for (#1329).
+- Metal: bit-exact fp8-e4m3 decode (#1346). Qwen3.6: tokenizer merges in both
+  spellings (#1319). macOS: Homebrew prefixes found when `brew` is off the PATH
+  (#1320). DeepSeek V4 on macOS: real CPU and memory in HWINFO (#1308).
+- `coli doctor` omits the GPU plan for a CPU-only engine (#1322); a missing core
+  tensor explains itself on every fatal path (#1318); GLM-5.3-Flash `--no-think`
+  is the template's lowest effort level, not a shape of ours (#1327).
+- GLM-5.3-Flash `serve` can use the 16 KV slots the engine has; the registry
+  declared 1 (#1283).
+- `image_url` local reads: `..` is refused, and with `COLI_IMAGE_ROOT` set a
+  path must resolve inside it, so an authenticated client of a non-loopback
+  server cannot read arbitrary files through the image API. Error messages no
+  longer confirm a path or its permissions (#1354).
+
+### Changed
+
+- The GLM family is named `GLM-5.2/5.3`: the two checkpoints share the base
+  model and cannot be told apart from their configuration (#1367).
+- DeepSeek V4 Flash REAP-150B (85 GB, 132 of 256 experts) loads with the same
+  engine (#1310), is documented, and is announced by its measured geometry
+  rather than the official checkpoint's 284B.
+- The qwen36 VRAM tier promotes int8 experts instead of reserving for nothing
+  (#1334), and the three tier bugs that surfaced with it are fixed: an `is_x`
+  overrun with two or more GPUs, a shutdown that could hang, and a
+  use-after-free on int8 containers (#1339, #1340, #1341, #1344). Kimi K3
+  stops paying for a DSA indexer nothing reads (#1335).
+- Opt-in: `COLI_MAP_EXPERTS=1` serves experts through a per-shard file mapping
+  (#1325). Off by default; output is byte-identical either way.
+
+### Docs
+
+- Windows DeepSeek V4 users are led to the release launcher (`coli.cmd`)
+  instead of a source build (#1291).
+
+### Build and CI
+
+- CI workflows run with `contents: read`, and third-party actions are pinned
+  by commit SHA (#1354).
+- Makefile lists the headers each engine includes as prerequisites (#1284,
+  #1349). Site and READMEs carry the eight families with real RAM figures under
+  a contract test (#1302).
+
+## [1.10.1] — 2026-08-31
+
+Packaging repair for the prebuilt archives; no engine changes.
+
+## [1.10.0] — 2026-08-31
 
 ### A seventh engine: Qwen3.8-Flash-Next
 

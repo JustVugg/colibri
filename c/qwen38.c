@@ -59,7 +59,9 @@ static int qwen38_max_ctx(void) {
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+#include "cli_args.h"
 #include "st.h"
+#include "qwen38_vision.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "tok_unicode.h"
 #include "tok_unicode_o200k.h"
@@ -1137,6 +1139,19 @@ static const ColiServeWireProfile q38_wire = {
 /* Returns 2=SUBMIT, 1=STOP(active), 3=CANCEL(active), 0=ignored, -1=EOF/fatal.
  * A SUBMIT encountered during a synchronous turn is consumed and rejected so
  * its payload cannot desynchronize the following control frame. */
+/* Un'immagine in attesa del SUBMIT che la usa. Se ne arriva una seconda prima
+ * del SUBMIT, la prima viene buttata e lo si dice: rispondere sulla foto
+ * precedente senza avvisare sarebbe peggio di rifiutare. */
+static struct { unsigned char *patches; uint64_t bytes; int grid_h, grid_w; int present; } g_pending_image;
+/* Il modello del turno in corso, per poter rifiutare un'immagine gia' alla
+ * lettura del frame invece che dopo averla accettata. */
+static Model *g_serve_model;
+
+static void q38_pending_image_clear(void){
+    free(g_pending_image.patches);
+    memset(&g_pending_image,0,sizeof g_pending_image);
+}
+
 static int serve_read_req(FILE *in,FILE *out,ServeReq *q,const char *active_id){
     ColiServeCommand command;
     ColiServeReadResult result=coli_serve_read_command(in,&q38_wire,&command);
@@ -1152,6 +1167,22 @@ static int serve_read_req(FILE *in,FILE *out,ServeReq *q,const char *active_id){
         int active=active_id&&!strcmp(command.id,active_id);
         int control=active?(command.kind==COLI_SERVE_COMMAND_STOP?1:3):0;
         coli_serve_command_dispose(&command);return control;
+    }
+    if(command.kind==COLI_SERVE_COMMAND_IMAGE){
+        if(!g_serve_model||!g_serve_model->vis_ready){
+            coli_serve_write_error(out,command.id,
+                "this engine has no vision tower; images are not supported");
+            coli_serve_command_dispose(&command);return 0;
+        }
+        if(g_pending_image.present)
+            fprintf(stderr,"[qwen38] a second image arrived before its SUBMIT; dropping the first\n");
+        q38_pending_image_clear();
+        g_pending_image.patches=coli_serve_command_take_payload(&command);
+        g_pending_image.bytes=command.payload_bytes;
+        g_pending_image.grid_h=command.grid_h;
+        g_pending_image.grid_w=command.grid_w;
+        g_pending_image.present=1;
+        coli_serve_command_dispose(&command);return 0;
     }
     if(command.kind!=COLI_SERVE_COMMAND_SUBMIT){coli_serve_command_dispose(&command);return 0;}
     if(active_id){
@@ -1437,6 +1468,25 @@ static int q38_format_prof(char *out,size_t capacity,double wall_s,int prompt_to
 static int serve_one(Model *m, ServeReq *q){
     int *ids=NULL, np=0;
     encode_text_n(q->payload,(size_t)q->plen,&ids,&np); /* byte-counted prompt; qwen38 adds no BOS */
+    if(g_pending_image.present){
+        /* Le patch arrivano gia' float32 dal gateway: qui si controlla solo che
+         * ce ne sia un numero intero e che la griglia le giustifichi, perche' un
+         * conteggio storto darebbe una torre alimentata con byte disallineati. */
+        Cfg *vc=&m->c;
+        int features=vc->vis_in_ch*vc->vis_temporal*vc->vis_patch*vc->vis_patch;
+        uint64_t want=(uint64_t)g_pending_image.grid_h*g_pending_image.grid_w*features*sizeof(float);
+        if(!m->vis_ready||g_pending_image.bytes!=want){
+            printf("ERROR %s BAD_IMAGE bytes=%llu expected=%llu\n",q->id,
+                   (unsigned long long)g_pending_image.bytes,(unsigned long long)want);
+            fflush(stdout); q38_pending_image_clear(); free(ids); return 0;
+        }
+        if(q38_vision_attach(m,(const float*)g_pending_image.patches,
+                             g_pending_image.grid_h,g_pending_image.grid_w,ids,np)<0){
+            printf("ERROR %s BAD_IMAGE the prompt and the grid disagree\n",q->id);
+            fflush(stdout); q38_pending_image_clear(); free(ids); return 0;
+        }
+        q38_pending_image_clear();
+    }
     int max_ctx=m->kv_cap;
     if(np<1 || np>max_ctx || q->max_tok<1 || q->max_tok>max_ctx-np){
         printf("ERROR %s CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n",q->id,np,q->max_tok,max_ctx);
@@ -1513,6 +1563,11 @@ static int serve_one(Model *m, ServeReq *q){
         if(s == q->max_tok - 1) break;
         lo = step(m, &tk, 1, np+s);
     }
+    /* I vettori dell'immagine valgono per QUESTO turno soltanto: lasciarli
+     * agganciati farebbe rispondere la richiesta successiva sulla foto
+     * precedente, e la mappa e' per posizione assoluta, quindi combacerebbe
+     * silenziosamente invece di dare errore. */
+    q38_vision_detach(m);
     free(lo); free(ids);
     if(cancelled){coli_serve_write_error(stdout,q->id,"CANCELLED");return input_eof?-1:0;}
     if(stopped)limited=0;
@@ -1540,6 +1595,7 @@ static int serve_one(Model *m, ServeReq *q){
 }
 
 static void serve_loop(Model *m){
+    g_serve_model=m;
     coli_serve_binary_mode();
     setvbuf(stdin,NULL,_IONBF,0);
     int max_ctx=qwen38_max_ctx();
@@ -1574,8 +1630,8 @@ int main(int argc, char **argv) {
     if (getenv("OPENAI")) g_openai = 1;                       /* OpenAI-compatible output */
     const char *mv = getenv("MODEL");
     if (mv && *mv) snprintf(g_model, sizeof g_model, "%s", mv);
-    int cap   = argc > 1 ? atoi(argv[1]) : 1;
-    int bits  = argc > 2 ? atoi(argv[2]) : 8;
+    int cap   = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 1;
+    int bits  = argc > 2 ? coli_arg_int(argv[2], "expert bits") : 8;
     /* cap < 1 leaves every layer cache empty, so expert_get finds no slot to
      * evict and waits for a publish that can never come. The old lru=0 fallback
      * turned that into a heap OOB instead; neither is a failure mode to ship. */

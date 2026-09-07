@@ -20,6 +20,11 @@ typedef enum {
     COLI_SERVE_COMMAND_SUBMIT,
     COLI_SERVE_COMMAND_STOP,
     COLI_SERVE_COMMAND_CANCEL,
+    /* IMAGE <id> <bytes> <grid_h> <grid_w>\n<payload>\n, annunciato subito prima
+     * del SUBMIT a cui appartiene. Un motore di solo testo che non lo gestisce lo
+     * vede come un comando che non sa trattare e lo rifiuta, che e' la risposta
+     * giusta: meglio dire di no che accettare una foto e ignorarla. */
+    COLI_SERVE_COMMAND_IMAGE,
 } ColiServeCommandKind;
 
 typedef enum {
@@ -52,6 +57,9 @@ typedef struct {
     float top_p;
     uint64_t extension_bytes;
     int prefix_bytes;
+    /* IMAGE: la griglia di patch che accompagna il payload. Zero per ogni altro
+     * comando. */
+    int grid_h, grid_w;
     unsigned char *payload;
 } ColiServeCommand;
 
@@ -134,6 +142,8 @@ static inline void coli_serve_classify_line(
         command->kind = COLI_SERVE_COMMAND_STOP;
     else if (name_size == 6 && !memcmp(name, "CANCEL", 6))
         command->kind = COLI_SERVE_COMMAND_CANCEL;
+    else if (name_size == 5 && !memcmp(name, "IMAGE", 5))
+        command->kind = COLI_SERVE_COMMAND_IMAGE;
     else
         return;
     while (*cursor == ' ' || *cursor == '\t') cursor++;
@@ -200,6 +210,7 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
     if (!strcmp(fields[0], "SUBMIT")) command->kind = COLI_SERVE_COMMAND_SUBMIT;
     else if (!strcmp(fields[0], "STOP")) command->kind = COLI_SERVE_COMMAND_STOP;
     else if (!strcmp(fields[0], "CANCEL")) command->kind = COLI_SERVE_COMMAND_CANCEL;
+    else if (!strcmp(fields[0], "IMAGE")) command->kind = COLI_SERVE_COMMAND_IMAGE;
     else {
         free(line);
         return COLI_SERVE_READ_IGNORED;
@@ -213,6 +224,39 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
         command->kind == COLI_SERVE_COMMAND_CANCEL) {
         if (nfields != 2) { free(line); return COLI_SERVE_READ_BAD_REQUEST; }
         free(line);
+        return COLI_SERVE_READ_OK;
+    }
+    if (command->kind == COLI_SERVE_COMMAND_IMAGE) {
+        /* IMAGE <id> <bytes> <grid_h> <grid_w>\n<payload>\n
+         *
+         * Il payload va consumato SEMPRE, anche quando il motore non sa cosa
+         * farsene: lasciarlo nello stream sposterebbe il frame successivo di
+         * qualche megabyte e il gateway leggerebbe pixel come se fossero
+         * un'intestazione. Per questo il rifiuto vive nel chiamante, non qui. */
+        if (nfields != 5 ||
+            !coli_serve_parse_u64(fields[2], &command->payload_bytes) ||
+            !coli_serve_parse_i32(fields[3], &command->grid_h) ||
+            !coli_serve_parse_i32(fields[4], &command->grid_w) ||
+            command->payload_bytes > profile->max_payload_bytes ||
+            command->grid_h < 1 || command->grid_w < 1) {
+            free(line);
+            return COLI_SERVE_READ_BAD_REQUEST;
+        }
+        free(line);
+        command->payload = (unsigned char *)allocate((size_t)command->payload_bytes + 1);
+        if (!command->payload) return COLI_SERVE_READ_NOMEM;
+        if (command->payload_bytes &&
+            fread(command->payload, 1, (size_t)command->payload_bytes, input)
+                != (size_t)command->payload_bytes) {
+            coli_serve_command_dispose(command);
+            return COLI_SERVE_READ_BAD_FRAME;
+        }
+        command->payload[command->payload_bytes] = 0;
+        int terminator = fgetc(input);
+        if (terminator != '\n' && !(terminator == '\r' && fgetc(input) == '\n')) {
+            coli_serve_command_dispose(command);
+            return COLI_SERVE_READ_BAD_FRAME;
+        }
         return COLI_SERVE_READ_OK;
     }
     int minimum_fields = 7;

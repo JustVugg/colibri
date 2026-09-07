@@ -30,7 +30,34 @@ COLI_MODEL=~/Models/Qwen3.8-Flash-Next-FP8 ./c/coli chat
 `coli serve` and `coli web` use the same text-only gateway path. Qwen3.8 thinks
 by default; `reasoning_effort` accepts `low`, `medium`, `high`, and `xhigh`, and
 `enable_thinking: false` emits the model's official empty thinking prefix.
-Tools, image content, audio, and grammar constraints are rejected explicitly.
+Audio and grammar constraints are rejected explicitly. Images are supported;
+see **Vision** below.
+
+Tool calling works. Qwen3.8 declares and emits calls in an XML-ish form of
+its own rather than the JSON block GLM uses, so it has its own renderer and
+its own parser:
+
+```
+<tool_call>
+<function=NAME>
+<parameter=KEY>
+VALUE
+</parameter>
+</function>
+</tool_call>
+```
+
+Both sides are transcribed from `chat_template.jinja` rather than
+paraphrased, because the declaration is what teaches the model the syntax it
+must emit: a preamble it has never seen is a different prompt. The whole
+rendering is pinned byte for byte against the official template
+(`tests/test_qwen38_chat_template.py`, 27 cases across the three reasoning
+levels).
+
+One asymmetry worth knowing: the template writes a string argument unquoted,
+so a value's original type is not recoverable from the text alone. The parser
+reads the declared schema and restores numbers and booleans from it, and
+leaves anything the schema did not describe as a string rather than guessing.
 
 The official FP8 repository is about 185.5 GB in decimal units (roughly 173
 GiB). The default CPU engine keeps resident BF16 matrices in their native
@@ -177,3 +204,103 @@ A/B diagnosis. It does not change the single-token decode path.
 
 The weights remain covered by the Qwen Community License 1.0 in the downloaded
 checkpoint. They are not redistributed by Colibri.
+
+## Vision
+
+The released checkpoint is multimodal and the engine already reads its
+`model.language_model` prefix, so the vision tensors are present and reachable.
+The tower itself is not implemented yet; images are still refused rather than
+silently dropped.
+
+What exists today is the half that decides whether vision is *correct* rather
+than nearly correct: `tools/qwen38_image.py`, pinned against the official
+`Qwen2VLImageProcessor` in `tests/test_qwen38_image.py`.
+
+```
+python3 tests/test_qwen38_image.py --config <model>/preprocessor_config.json
+```
+
+Neither needs the weights. The reference processor is built from
+`preprocessor_config.json` alone, which is 390 bytes, so the preprocessing can be
+developed and verified without the 185 GB.
+
+Measured against it on eight shapes: **geometry and patch order identical**, and
+pixels bit-identical wherever no resampling happens (0.0000 on 256x256 and
+640x480), 0.0157 worst case where it does, which is Pillow's bicubic against
+torchvision's. A wrong patch order would show as a discrepancy near 1, not 0.01.
+
+Two things differ from GLM-5.3's tower and are the reason this is its own file:
+
+**The resolution is dynamic.** GLM-5.3 fits everything onto a 448 canvas and
+pads. Qwen keeps the aspect ratio and picks a canvas whose *area* falls inside
+`[shortest_edge, longest_edge]`, so there is no padding but the token count
+depends on the image. A 1080p photo becomes **2040 tokens**, which on a
+disk-streaming engine is a prefill nobody will sit through -- the same reason
+`GLM53_MAX_IMAGE_TOKENS` exists, and `preprocess(max_tokens=...)` is the same
+lever here. It shrinks rather than crops: what is lost is detail, not pieces.
+
+**Normalisation is 0.5/0.5**, not the CLIP constants.
+
+### The tower
+
+`qwen38_vision.h` implements it: 27 blocks, hidden 1152, 16 heads, patch 16,
+spatial merge 2, projecting to 2560. Verified against the upstream
+`Qwen4ExpVisionModel`, again without the checkpoint -- the fixture is a 240 kB
+tower with random weights:
+
+```
+make -C c qwen38-vision-check
+```
+
+Two findings from building it are worth carrying, because both were invisible
+until an oracle was there to see them.
+
+**The merger uses a different GELU from the blocks.** The blocks take
+`ACT2FN[hidden_act]`, which is `gelu_pytorch_tanh` here; the merger instantiates
+`nn.GELU()`, the exact erf one. Using one for both matches to 4.6e-3 -- close
+enough to look right and far enough to move the image tokens.
+
+**A fixture can be too weak to test what it claims to.** The first version scaled
+the random weights to 0.05, which makes the q.k products so small that softmax
+comes out essentially uniform: attention degenerates into the mean of the values
+and stops depending on the scores. A tower with **no RoPE at all** passed that
+fixture. At 0.6 the scores have a real range, and the four negative controls
+(rope off, wrong GELU, raster patch order, flat position interpolation) all fail
+as they should.
+
+The tolerance is measured, not chosen: the reference in float32 differs from
+itself in float64 by 1.83e-4 on these activations, so a gap of that order is the
+arithmetic rather than a defect, and the threshold sits between it and the
+4.6e-3 the real bug produced.
+
+### Wired up
+
+Images work end to end. Send an OpenAI `image_url` part with a base64 data URI or
+a local path; the gateway preprocesses it, replaces the part with
+`<|vision_start|>` + N x `<|image_pad|>` + `<|vision_end|>`, and hands the patches
+to the engine in an `IMAGE` frame ahead of the `SUBMIT` they belong to. The engine
+runs the tower once and substitutes its output for the embedding of each
+placeholder.
+
+N is not a constant. The resolution is dynamic, so the placeholder count comes
+from the grid the preprocessor chose, and the engine **refuses** a request where
+the prompt and the grid disagree rather than guessing which vectors go where.
+`Q38_MAX_IMAGE_TOKENS` caps it; a 1080p photo is 2040 tokens without one.
+
+```
+make -C c qwen38-vision-serve-check
+```
+
+That gate does not check the model answers -- with random weights it would answer
+regardless, and would answer identically while ignoring the picture entirely. It
+checks that **two different images produce two different answers**, which is the
+only question a random fixture can answer honestly, and the one that catches the
+likeliest defect: patches loaded, tower run, result dropped somewhere between the
+merger and the embeddings. It also checks the refusals, since accepting a wrong
+image is worse than refusing it.
+
+Remote URLs are refused rather than fetched, as elsewhere: a request should not
+make the server open a connection of the sender's choosing.
+
+One image per request for now -- the engine holds a single pending image, and a
+second arriving before its `SUBMIT` drops the first and says so.

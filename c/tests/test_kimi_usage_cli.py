@@ -41,9 +41,26 @@ class KimiUsageTest(unittest.TestCase):
                 self.assertNotIn("config.json", out,
                                  f"{flag} was treated as a model directory")
 
-    def test_no_arguments_prints_usage_and_fails(self):
+    def test_no_arguments_points_at_the_launcher_and_fails(self):
+        """Senza argomenti il messaggio non e' piu' l'elenco dei flag, ed e'
+        giusto cosi': chi lancia il motore a mani vuote quasi sempre voleva
+        `coli`, e un elenco di flag lo lascia dove si trova. Il contratto qui
+        e' che dica che manca il modello e nomini il launcher; l'elenco
+        completo resta il contratto di --help, provato sopra.
+
+        Questa asserzione chiedeva `<model_dir>`, `--ngen` e `--ids` anche a
+        questo percorso, ed era rossa da quando il messaggio e' stato
+        riscritto. Nessuno se n'e' accorto perche' l'intera classe si salta
+        se kimi_k3 non e' compilato, e il job Python della CI non compilava
+        nessun motore: verde perche' vuota.
+        """
         r = run()
-        self.assertUsage(r.stdout + r.stderr, "no args")
+        out = r.stdout + r.stderr
+        self.assertIn("without a model", out,
+                      "no args: does not say what is missing")
+        self.assertIn("coli chat", out,
+                      "no args: does not name the launcher, which is what the "
+                      "person almost certainly wanted")
         self.assertNotEqual(r.returncode, 0, "a missing model dir is a failure")
 
     def test_usage_names_the_launcher(self):

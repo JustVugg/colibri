@@ -16,6 +16,8 @@ from resource_plan import (
     environment_for_plan,
     format_plan,
     memory_available,
+    windows_available_bytes,
+    WINDOWS_MEMORYSTATUSEX_FIELDS,
     parse_ssd_cache,
     physical_cpu_count,
     read_ssd_probe,
@@ -982,3 +984,23 @@ class PhysicalCpuCountTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WindowsCommitLimitTest(unittest.TestCase):
+    """#1375: a 14 MB malloc failing on a 128 GB machine. Free physical memory
+    is not what decides whether malloc succeeds on Windows; grantable commit
+    is, and it can be far lower with a small page file."""
+
+    def test_commit_caps_the_budget_when_lower_than_physical(self):
+        self.assertEqual(windows_available_bytes(110 << 30, 40 << 30), 40 << 30)
+
+    def test_physical_is_used_when_commit_is_larger_or_unknown(self):
+        self.assertEqual(windows_available_bytes(110 << 30, 200 << 30), 110 << 30)
+        self.assertEqual(windows_available_bytes(110 << 30, 0), 110 << 30)
+
+    def test_memorystatusex_layout_is_the_documented_one(self):
+        # Order matters for ctypes: a skipped field shifts every later one.
+        self.assertEqual([n for n, _ in WINDOWS_MEMORYSTATUSEX_FIELDS], [
+            "dwLength", "dwMemoryLoad", "ullTotalPhys", "ullAvailPhys",
+            "ullTotalPageFile", "ullAvailPageFile", "ullTotalVirtual",
+            "ullAvailVirtual", "ullAvailExtendedVirtual"])

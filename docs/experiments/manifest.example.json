@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "hypothesis": "Describe one causal hypothesis",
+  "commit": "0000000000000000000000000000000000000000",
+  "model": "model family, checkpoint and container format",
+  "command": "exact build and benchmark command",
+  "prompt_hash": "sha256 of the prompt set",
+  "hardware": {
+    "cpu": "CPU model and topology",
+    "ram": "capacity and relevant topology",
+    "storage": "device, controller, filesystem and mount options",
+    "os": "OS, compiler, driver and accelerator runtime"
+  },
+  "warmup_runs": 1,
+  "changed_variables": ["ONLY_THIS_KEY"],
+  "baseline": {
+    "config": {"ONLY_THIS_KEY": "old", "EVERYTHING_ELSE": "fixed"},
+    "samples": {"tok_s": [1.0, 1.1, 1.2]},
+    "median_tok_s": 1.1,
+    "quality": {"method": "token-exact oracle", "passed": true},
+    "evidence": {"uri": "artifact URL", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}
+  },
+  "trial": {
+    "config": {"ONLY_THIS_KEY": "new", "EVERYTHING_ELSE": "fixed"},
+    "samples": {"tok_s": [1.2, 1.3, 1.4]},
+    "median_tok_s": 1.3,
+    "quality": {"method": "token-exact oracle", "passed": true},
+    "evidence": {"uri": "artifact URL", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}
+  },
+  "outcome": "improvement"
+}

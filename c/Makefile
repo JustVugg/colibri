@@ -52,6 +52,13 @@ ifneq (,$(DARWIN))
 # Niente -march: su arm64 NEON e' baseline (i kernel __ARM_NEON si attivano da soli).
 CC      = clang
 OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
+# CLT-only Macs routinely have Homebrew installed but off the non-interactive
+# PATH (`make` from scripts, SSH, CI), which turned this probe into a silent
+# single-threaded build with libomp sitting right there on disk. Fall back to
+# the two standard Homebrew prefixes before concluding it is absent.
+ifeq ($(OMPDIR),)
+OMPDIR := $(firstword $(wildcard /opt/homebrew/opt/libomp /usr/local/opt/libomp))
+endif
 # `brew --prefix libomp` can print the formula's prospective path even when it
 # is not installed, so verify both artifacts before adding unusable flags.
 ifneq ($(and $(OMPDIR),$(wildcard $(OMPDIR)/include/omp.h),$(wildcard $(OMPDIR)/lib/libomp.*)),)
@@ -725,7 +732,7 @@ $(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+colibri$(EXE): colibri.c cli_args.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h abl.h backend_cuda.h backend_metal.h backend_vulkan.h decode_batch.h edge_adapters.h edge_runtime.h edge_tok_internal.h schema_gbnf.h segment_adapter_internal.h segment_adapters.h segment_runtime.h tier.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o colibri$(EXE) $(LDFLAGS)
 
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
@@ -1006,7 +1013,7 @@ fp8-bench: fp8_bench$(EXE)
 # the GPU sits idle. Same guard #783 put on kimi_k3, which since gaining an
 # MXFP4 expert path no longer needs it. tests/test_makefile_cuda_scope.py
 # asserts this shape.
-olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+olmoe$(EXE): olmoe.c cli_args.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h edge_adapters.h edge_runtime.h edge_tok_internal.h fused_simd.h segment_adapter_internal.h segment_adapters.h segment_runtime.h
 	$(CC) $(NOCUDA_CFLAGS) olmoe.c -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
@@ -1028,18 +1035,32 @@ QWEN36_TIER_SRC =
 QWEN36_CFLAGS   = $(NOCUDA_CFLAGS)
 QWEN36_LDFLAGS  = $(NOCUDA_LDFLAGS)
 endif
-qwen36$(EXE): qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h st.h json.h compat.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # Qwen3.8-Flash-Next text-only sibling. This target is intentionally CPU-only;
 # qwen38.c owns the direct checkpoint loader and SERVE=1 protocol, with no
 # CUDA/Metal tier advertised by the control plane.
-qwen38$(EXE): qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h
+qwen38$(EXE): qwen38.c cli_args.h qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h
 	$(CC) $(NOCUDA_CFLAGS) qwen38.c -o qwen38$(EXE) $(NOCUDA_LDFLAGS)
 
 .PHONY: qwen38-tiny-generate qwen38-tiny-check
 qwen38-tiny-generate:
 	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny
+
+# Il prefetch PLE e' un riordino, non un cambio di calcolo: le stesse righe,
+# lette prima e in parallelo. Quindi acceso e spento devono dare gli STESSI
+# token, e questo lo pretende invece di fidarsi. Se un giorno divergono, il
+# prefetch ha smesso di essere un riordino e va guardato, non spento.
+.PHONY: qwen38-ple-prefetch-check
+qwen38-ple-prefetch-check: qwen38-tiny-generate qwen38$(EXE)
+	@fail=0; for cap in 1 2 4 8; do for pb in 0 1; do for bf in 0 1; do \
+		on=$$(Q38_PREFILL_BATCH=$$pb Q38_NATIVE_BF16=$$bf OMP_NUM_THREADS=2 SNAP=./qwen38_tiny ./qwen38$(EXE) $$cap 8 ./qwen38_tiny/ref.json 2>/dev/null | grep '^C engine'); \
+		off=$$(Q38_PLE_PREFETCH=0 Q38_PREFILL_BATCH=$$pb Q38_NATIVE_BF16=$$bf OMP_NUM_THREADS=2 SNAP=./qwen38_tiny ./qwen38$(EXE) $$cap 8 ./qwen38_tiny/ref.json 2>/dev/null | grep '^C engine'); \
+		if [ -z "$$on" ]; then echo "FAIL cap=$$cap batch=$$pb bf16=$$bf: no output"; fail=1; \
+		elif [ "$$on" != "$$off" ]; then echo "FAIL cap=$$cap batch=$$pb bf16=$$bf: prefetch changes the tokens"; fail=1; fi; \
+	done; done; done; \
+	[ $$fail -eq 0 ] && echo "PLE prefetch: identical tokens on and off, 16 configurations" || exit 1
 
 qwen38-tiny-check: qwen38-tiny-generate qwen38$(EXE)
 	@for batch in 0 1; do for bf16 in 0 1; do for cap in 1 4; do \
@@ -1062,11 +1083,16 @@ tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c qwen36.c qw
 tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# Both tokenizer.json merge spellings ("a b" strings and ["a","b"] pairs)
+# must index the same merge table; the pair form is what Qwen3.6 ships.
+tests/test_qwen36_tok_merges$(EXE): tests/test_qwen36_tok_merges.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 # Reproducible local timing evidence; intentionally not a noisy CI perf gate.
 tests/bench_qwen36_dense_batch$(EXE): tests/bench_qwen36_dense_batch.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
-inkling$(EXE): inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
+inkling$(EXE): inkling.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h backend_cuda_ink.h backend_metal.h edge_adapters.h edge_runtime.h edge_tok_internal.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
 # ENGINES WITHOUT A CUDA BACKEND (#783).
@@ -1084,10 +1110,10 @@ NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
 # GLM-5.3-Flash: CPU puro, esperti in streaming dal contenitore int4 gs64.
 # Nessun oggetto CUDA/Vulkan/Metal fra le dipendenze perche' il motore non ne
 # ha ancora: quando li avra', questa riga somigliera' a quella di kimi_k3.
-glm53$(EXE): glm53.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h $(VK_OBJ) $(VK_SPV)
+glm53$(EXE): glm53.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h backend_vulkan.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(VK_OBJ) $(VK_SPV)
 	$(CC) $(CFLAGS) glm53.c $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
-kimi_k3$(EXE): kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h backend_cuda.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
+kimi_k3$(EXE): kimi_k3.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h backend_cuda.h backend_metal.h backend_vulkan.h edge_adapters.h edge_runtime.h edge_tok_internal.h hybrid_split.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
 	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
@@ -1149,6 +1175,25 @@ tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c qwen38.c qwen38_core.
 
 tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen38_vision$(EXE): tests/test_qwen38_vision.c qwen38_vision.h st.h json.h compat.h
+	$(CC) $(CFLAGS) -Wno-unused-function $< -o $@ $(LDFLAGS)
+
+# Genera la fixture della torre e la confronta con l'oracolo upstream. Non serve
+# il checkpoint: 240k parametri casuali, meno di un megabyte.
+.PHONY: qwen38-vision-check
+qwen38-vision-check: tests/test_qwen38_vision$(EXE)
+	$(PYTHON) tools/make_qwen38_vision_tiny.py --out ./qwen38_vision_tiny
+	./tests/test_qwen38_vision$(EXE) ./qwen38_vision_tiny
+
+# Il percorso completo: frame IMAGE, torre, sostituzione degli embedding,
+# generazione. Prova che due immagini diverse danno risposte diverse, che e'
+# l'unica domanda a cui una fixture con pesi casuali sa rispondere onestamente.
+.PHONY: qwen38-vision-serve-check
+qwen38-vision-serve-check: qwen38$(EXE)
+	$(PYTHON) tools/make_qwen38_multimodal_tiny.py --out ./qwen38_mm_tiny
+	$(PYTHON) tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_mm_tiny
+	$(PYTHON) tests/test_qwen38_vision_serve.py --binary ./qwen38$(EXE) --fixture ./qwen38_mm_tiny
 
 tests/test_qwen38_prefix$(EXE): tests/test_qwen38_prefix.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
@@ -1609,6 +1654,74 @@ endif
 
 tests/test_route_trace$(EXE): tests/test_route_trace.c route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_cli_args$(EXE): tests/test_cli_args.c cli_args.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Il tier CUDA con un backend finto: gira SENZA GPU perche' il test definisce i
+# coli_cuda_* e registra cosa riceve. E' il solo modo di provare in CI che un
+# esperto arriva davvero in VRAM e nel formato giusto (#1331) -- un test che si
+# fermasse a "qt_init ritorna 1" sarebbe passato anche col difetto.
+tests/test_qwen36_tier_int8$(EXE): tests/test_qwen36_tier_int8.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend (tests/qwen36_fake_cuda.h), two devices: proves the tier's
+# per-device input-replica block (G.is_x) is sized and strided so device 1's
+# block cannot run past the end of the buffer or into device 0's (#1339).
+tests/test_qwen36_tier_multidev$(EXE): tests/test_qwen36_tier_multidev.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend, single device: proves qt_shutdown returns (under an
+# alarm(10) watchdog) instead of hanging forever when a group is still open
+# and an LFRU swap is parked waiting for cv_take (#1340).
+tests/test_qwen36_tier_shutdown$(EXE): tests/test_qwen36_tier_shutdown.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend, but driving the ENGINE: the warmstart in qwen36.c hands the
+# tier raw pointers into the RAM expert slots, so only a test that includes
+# qwen36.c can prove the weights behind them are still there afterwards -- on an
+# int8 container there is no packed copy to rebuild them from (#1341). Includes
+# qwen36_tier.c in its own TU like the other tier tests, so nothing else is
+# compiled in and no model file is needed.
+# Same fake backend, the RULES the three regression tests above are instances
+# of: budget accounting balances on every device (reservations are consumed or
+# returned, never leaked), shutdown wakes all four cv_take waiters at once, and
+# issue blocks stay inside, disjoint and at their device's slot under random
+# routing on 1-3 devices. Under test-asan the third doubles as a fuzz for the
+# #1339 class.
+tests/test_qwen36_tier_invariants$(EXE): tests/test_qwen36_tier_invariants.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend: the automatic placement (COLI_PLACE unset/"auto") puts
+# the offered dense trunk into VRAM by bytes-saved-per-byte, prices displaced
+# experts by heat, keeps the trunk on the CPU when the marginal experts are
+# hotter, honours an explicit list and "off", and takes placed bytes out of
+# the expert budget -- on one and on two devices.
+tests/test_qwen36_tier_autoplace$(EXE): tests/test_qwen36_tier_autoplace.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend: the fp8 streaming mode a model whose experts do not fit
+# in RAM needs (Qwen3.8) -- cap < n_experts accepted, fmt=8 uploads with
+# 128x128 block scales, bytes staged unchanged, no pointer kept into the
+# engine's recycled slot, promotion decided when the bytes pass by.
+tests/test_qwen36_tier_fp8$(EXE): tests/test_qwen36_tier_fp8.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c tests/qwen36_fake_cuda.h qwen36.c qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+tests/test_serve_poll$(EXE): tests/test_serve_poll.c serve_poll.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Linux-only: legge /proc/self/status. La regola c'e' comunque, il test si
+# salta da solo dove /proc non esiste.
+tests/test_rss_anon$(EXE): tests/test_rss_anon.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# #1375: la memoria disponibile e' misurata in compat.h per Linux, macOS e
+# Windows; questo test gira nei tre job e fallisce dove la misura vale 0.
+tests/test_mem_available$(EXE): tests/test_mem_available.c compat.h
+	$(CC) $(CFLAGS) tests/test_mem_available.c -o $@ $(LDFLAGS)
 
 tests/test_798_guards$(EXE): tests/test_798_guards.c st.h json.h compat.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

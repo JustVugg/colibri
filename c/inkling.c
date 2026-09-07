@@ -32,6 +32,7 @@
 #include <sys/resource.h>
 #include <sys/select.h>                              /* serve-loop stdin poll (POSIX); inkling serves on Linux */
 #endif
+#include "cli_args.h"
 #include "st.h"
 #include "tok.h"
 #ifdef _OPENMP
@@ -2411,11 +2412,11 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p") && i+1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "-f") && i+1 < argc) pfile = argv[++i];
-        else if (!strcmp(argv[i], "-n") && i+1 < argc) n_new = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-n") && i+1 < argc) n_new = coli_arg_int(argv[++i], "-n");
         else if (!strcmp(argv[i], "--chat")) chat = 1;
         else if (!strcmp(argv[i], "--audio") && i+1 < argc) audiopath = argv[++i];
-        else if (npos == 0) { cap = atoi(argv[i]); npos++; }
-        else if (npos == 1) { bits = atoi(argv[i]); npos++; }
+        else if (npos == 0) { cap = coli_arg_int(argv[i], "cache/layer"); npos++; }
+        else if (npos == 1) { bits = coli_arg_int(argv[i], "expert bits"); npos++; }
         else refpath = argv[i];
     }
     /* --audio <file>: raw u8 DMel frames, [n_frames, mel_bins] row-major —

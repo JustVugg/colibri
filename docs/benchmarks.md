@@ -138,6 +138,12 @@ Real numbers from real machines, stock build (`setup.sh`, gcc 13), greedy decodi
 | i9-14900K (24C/32T) · native Windows 11 · 128 GB DDR5 · Samsung 990 Pro, SN850P partial mirror · RTX 3090 24 GB ([#1183](https://github.com/JustVugg/colibri/issues/1183)) | — | GLM-5.2 int4 · CUDA expert tier | **0.71 tok/s median** — the 24 GB VRAM point on the curve |
 | Apple M4 Max (16C, 40-core GPU) · macOS · 128 GB unified · **XPG MARS 980 Gen5 over Thunderbolt 5** ([#1210](https://github.com/JustVugg/colibri/issues/1210)) | — (TB5 enclosure) | `COLI_METAL=1 DIRECT=1 MTP=0 PIPE_WORKERS=8` · `PIN_GB=90` | 0.88 tok/s at `--ram 90` → **1.06–1.17 tok/s** pinned · hit 68–73% · RSS 96.7 GB |
 | Threadripper PRO 7965WX (24C/48T, Zen 4 avx512-vnni) · Linux · 123 GB · **two NVMe on independent controllers** (990 PRO 4 TB + 9100) ([#1249](https://github.com/JustVugg/colibri/issues/1249)) | 6.70 / 8.05 GB/s single-drive O_DIRECT | `DIRECT=1`, CPU-only (RTX 5090 present, not engaged) | one drive **0.80** → both **1.10 tok/s**, **+37.5%** · with `DIRECT=0` the same split is worth only +16% · expert wait 98.9 → 55.5 s |
+| Intel i9-12900K (8P+8E, avx-vnni, no avx512) · Debian trixie · **64 GB** DDR4-3200 · Samsung 990 Pro 2 TB ext4 · RTX 3090 (commit `72d3d37`, 2026-07-18) | **6.44 GB/s** O_DIRECT 8T · 5.78 GB/s buffered true-cold | int8 MTP head · cap 26/layer · default (MTP on) | 0.31 cold / 0.33 warm · hit 40-42% · MTP acceptance 43% (2.29 tok/fw) · RSS 47.9 GB · profile **48% disk / 34% matmul / 12% attn** · ~9.9 GB read/token |
+| 〃 | 〃 | **`MTP=0`** | **0.34 tok/s** · hit **54.9%** · 600 experts/token vs 1,062 with MTP on |
+| 〃 | 〃 | `MTP=0` + CUDA expert tier (3090) | 0.35-0.36 · hit 52.9-55.1% · **+13-16% over default, of which the GPU itself is +0-6%** |
+| 〃 second drive: 200 GB LV on a Crucial P310, 57 interleaved expert shards (139 GB, ~40%) symlinked — **file-level split, not block striping** | 990 Pro 6.44 + P310-LV 4.40 GB/s O_DIRECT, independent controllers | `MTP=0`, `coli serve` mux | N=1 **0.324 (+5.5%)** · N=2 **0.426 (+3.1%)** — see the note below on why this is so much smaller than #1249 |
+| 〃 | 〃 | `MTP=0 REPIN=1`, six consecutive N=2 rounds | **0.461 aggregate** · 0.404 → 0.405 → **0.456** → 0.458 → 0.433 → **0.461**: pins converge in ~3 rounds (~300 tokens) and hold |
+| Apple M4 Pro (8P+4E, 24 GB unified) · macOS 15.6 · libomp, 8 physical-core threads · **OLMoE int8**, fully resident (v1.9.0) | model in page cache; no disk in the loop | 226-token teacher-forced eval (`PPL=1`), `cap` 32 vs 64, **paired** (alternating within one session), 8 pairs | median **19.1 tok/s at cap 32** vs **16.3 at cap 64** · cap 32 wins **7 of 8 pairs** · hit rate 74.1% vs 96.7% — see the note |
 
 ### Two datapoints that are not rows
 
@@ -147,6 +153,42 @@ self-test on native Windows, but there is no decode number to report, because a
 cold token needs ~11 GB of expert reads and the RAM cap leaves almost nothing
 resident. On machines this size, run OLMoE or Qwen3.6 rather than GLM-5.2: the
 M3 row above is 16 GB unified and reaches 3.69–4.18 tok/s on OLMoE.
+
+**More expert cache is not always faster once the model is resident, but you have
+to measure it in pairs.** On a fully-resident OLMoE the whole 7 GB container is in
+the page cache, so a miss is a memcpy and not a device read, and the extra
+residency a larger cap buys has to pay for itself against nothing. It does not:
+cap 32 beat cap 64 in **7 of 8 interleaved pairs**, median 19.1 against 16.3 tok/s,
+at half the resident footprint (3.1 GB of expert slabs against 6.1 GB, on a 24 GB
+machine).
+
+The pairing is not a formality, and the first version of this note was wrong
+without it. Unpaired sweeps on this host disagreed with each other about the sign:
+one five-run sweep put cap 64 ahead on median (14.96 vs 14.32), a later ten-run
+block put cap 32 ahead by 35% (18.21 vs 13.45), and cap 32 alone ranged from 13.97
+to 20.62 tok/s across sessions. Absolute throughput drifts far more between
+sessions than the effect being measured, so only same-session alternation resolves
+it — the discipline [the decode failure ledger](glm52-decode-failure-ledger-2026-07-31.md)
+already asks for after the WarpDecode episode. Quoting this machine's cap curve
+from a single ordered sweep produces whatever the machine felt like that hour.
+
+Related to [#1050](https://github.com/JustVugg/colibri/issues/1050), but not the
+same shape: that report's `miss_rate × cap` bookkeeping term is *lowest* at cap 64
+and so predicts cap 64 fastest, which is the opposite of the paired result here.
+The O(cap) scan is presumably real on that host; on this one something scaling
+with residency dominates it.
+
+**A file-level shard split is not a substitute for the mirror path.** The +5.5%
+in the 12900K split row and the **+37.5%** in
+[#1249](https://github.com/JustVugg/colibri/issues/1249) are both two NVMe
+drives on independent controllers, and the gap between them is the mechanism,
+not the hardware. Splitting *whole shards* across two mounts with symlinks only
+parallelises reads that are already concurrent, and decode on that box sat at
+queue depth ~1 with the drive 24-28% utilised -- there was nothing to overlap.
+Block-level striping and the engine's own weighted mirror parallelise *within*
+each 19 MB read, which is where the real factor lives. Recorded because the
+negative is the useful half: it prices the difference between splitting files
+and striping blocks at roughly 5% versus 37%.
 
 **Vulkan beat ROCm/HIP on RDNA4** ([#523](https://github.com/JustVugg/colibri/issues/523)):
 on an RX 9070 XT, Vulkan measured 19–24% faster than the HIP path. The first
