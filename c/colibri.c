@@ -991,13 +991,62 @@ static void *xzalloc(size_t n, const char *what){
 /* Fused gate+up for grouped int4 (fmt=4): computes both yg[S,O] and yu[S,O] from
  * the same x[S,I], reading x once instead of twice — saves ~33% of expert-matmul time at decode.
  * The per-group scale logic matches matmul_i4_grouped exactly. */
+#if defined(__SSE4_1__) && !defined(__AVX2__)
+static void matmul_i4_grouped_pair_sse41_rows4(float *yg,float *yu,const float *x,
+                                                const uint8_t *qg,const float *sg,
+                                                const uint8_t *qu,const float *su,
+                                                int S,int I,int O,int gs,int rb,
+                                                int ng,int o4){
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<o4;o+=4){
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I;
+            __m128 ag=_mm_setzero_ps(),au=_mm_setzero_ps();
+            for(int g=0;g*gs<I;g++){
+                int base=g*gs,end=base+gs; if(end>I) end=I;
+                __m128 scg=colibri_f32_rows4(sg,ng,o,g);
+                __m128 scu=colibri_f32_rows4(su,ng,o,g); int i=base;
+                for(;i+1<end;i+=2){
+                    __m128 gl,gh,ul,uh;
+                    colibri_i4_rows4(qg,rb,o,i>>1,&gl,&gh);
+                    colibri_i4_rows4(qu,rb,o,i>>1,&ul,&uh);
+                    __m128 x0=_mm_set1_ps(xs[i]),x1=_mm_set1_ps(xs[i+1]);
+                    __m128 gp=_mm_add_ps(_mm_mul_ps(x0,gl),_mm_mul_ps(x1,gh));
+                    __m128 up=_mm_add_ps(_mm_mul_ps(x0,ul),_mm_mul_ps(x1,uh));
+                    ag=_mm_add_ps(ag,_mm_mul_ps(gp,scg));
+                    au=_mm_add_ps(au,_mm_mul_ps(up,scu));
+                }
+                if(i<end){
+                    __m128 gl,gh,ul,uh;
+                    colibri_i4_rows4(qg,rb,o,i>>1,&gl,&gh);
+                    colibri_i4_rows4(qu,rb,o,i>>1,&ul,&uh); (void)gh; (void)uh;
+                    __m128 xi=_mm_set1_ps(xs[i]);
+                    ag=_mm_add_ps(ag,_mm_mul_ps(_mm_mul_ps(xi,gl),scg));
+                    au=_mm_add_ps(au,_mm_mul_ps(_mm_mul_ps(xi,ul),scu));
+                }
+            }
+            colibri_sse41_storeu_ps(yg+(int64_t)s*O+o,ag);
+            colibri_sse41_storeu_ps(yu+(int64_t)s*O+o,au);
+        }
+    }
+}
+#endif
+
 static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
                                     const uint8_t *qg, const float *sg,
                                     const uint8_t *qu, const float *su,
                                     int S, int I, int O, int gs){
     int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+    int o0=0;
+#if defined(__SSE4_1__) && !defined(__AVX2__)
+    if(!(gs&1)){
+        o0=O&~3;
+        if(o0) matmul_i4_grouped_pair_sse41_rows4(yg,yu,x,qg,sg,qu,su,S,I,O,gs,rb,ng,o0);
+        if(o0==O) return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){
+    for(int o=o0;o<O;o++){
         const uint8_t *wg=qg+(int64_t)o*rb; const uint8_t *wu2=qu+(int64_t)o*rb;
         const float *sgl=sg+(int64_t)o*ng;   const float *sul=su+(int64_t)o*ng;
         for(int s=0;s<S;s++){
