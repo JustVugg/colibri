@@ -84,8 +84,20 @@ def _engine_error(fields, message):
     know how to compact a conversation actually get the chance to (previously the engine
     silently truncated the prompt instead, which is #401)."""
     if fields and fields[0] == "CONTEXT_EXCEEDED":
-        limit = fields[2] if len(fields) > 2 else "the context"
-        used = fields[1] if len(fields) > 1 else "?"
+        # Two spellings of the same frame. colibri and deepseek_v4 write the
+        # original `CONTEXT_EXCEEDED <used> <limit>`; qwen36 and qwen38 write
+        # `prompt_tokens=N requested=M capacity=C`. Reading the second by
+        # position took "requested=M" (the completion budget) as the limit and
+        # printed it raw: "maximum context length is requested=4 tokens", with
+        # the real ceiling nowhere (#1376). Unifying the engines' spelling is
+        # a separate change; the server must read both meanwhile.
+        kv = dict(f.split("=", 1) for f in fields[1:] if "=" in f)
+        if kv:
+            limit = kv.get("capacity") or "the context"
+            used = kv.get("prompt_tokens") or "?"
+        else:
+            limit = fields[2] if len(fields) > 2 else "the context"
+            used = fields[1] if len(fields) > 1 else "?"
         return APIError(400,
                         f"This model's maximum context length is {limit} tokens, however your "
                         f"messages resulted in at least {used} tokens. Please shorten the "
