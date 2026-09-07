@@ -239,6 +239,31 @@ def analyze_model(model):
     return result
 
 
+#: MEMORYSTATUSEX as Windows defines it, in order. Kept as data so a test can
+#: pin the order without a Windows machine.
+WINDOWS_MEMORYSTATUSEX_FIELDS = (
+    ("dwLength", "c_ulong"), ("dwMemoryLoad", "c_ulong"),
+    ("ullTotalPhys", "c_ulonglong"), ("ullAvailPhys", "c_ulonglong"),
+    ("ullTotalPageFile", "c_ulonglong"), ("ullAvailPageFile", "c_ulonglong"),
+    ("ullTotalVirtual", "c_ulonglong"), ("ullAvailVirtual", "c_ulonglong"),
+    ("ullAvailExtendedVirtual", "c_ulonglong"),
+)
+
+
+def windows_available_bytes(avail_phys, avail_pagefile):
+    """What a Windows process can still get from malloc: the smaller of free
+    physical memory and the commit still grantable (RAM + page file, minus
+    what every process has already committed).
+
+    #1375: the planner budgeted 88 % of ullAvailPhys on a 128 GB machine and
+    handed the resulting cap to the engine; the engine filled it slot by slot
+    until Windows refused the next 14 MB. Physical memory was there. Commit
+    was not, and nothing had looked at it."""
+    if avail_pagefile and 0 < avail_pagefile < avail_phys:
+        return avail_pagefile
+    return avail_phys
+
+
 def memory_available():
     # Linux (and MSYS2/Git-Bash CPython where /proc exists): MemAvailable.
     try:
@@ -254,20 +279,19 @@ def memory_available():
             import ctypes
 
             class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_ulong),
-                            ("dwMemoryLoad", ctypes.c_ulong),
-                            ("ullTotalPhys", ctypes.c_ulonglong),
-                            ("ullAvailPhys", ctypes.c_ulonglong),
-                            ("ullTotalVirtual", ctypes.c_ulonglong),
-                            ("ullAvailVirtual", ctypes.c_ulonglong),
-                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+                # The real layout. The previous copy skipped the two PageFile
+                # fields, which put ullTotalVirtual/ullAvailVirtual at the
+                # wrong offsets; ullAvailPhys happened to be right, so nobody
+                # noticed. The PageFile pair is the point now (#1375).
+                _fields_ = [(name, getattr(ctypes, kind))
+                            for name, kind in WINDOWS_MEMORYSTATUSEX_FIELDS]
 
             stat = MEMORYSTATUSEX(dwLength=ctypes.sizeof(MEMORYSTATUSEX))
             kernel32 = ctypes.windll.kernel32
             kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.c_void_p]
             kernel32.GlobalMemoryStatusEx.restype = ctypes.c_int
             if kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)) and stat.ullAvailPhys:
-                return stat.ullAvailPhys
+                return windows_available_bytes(stat.ullAvailPhys, stat.ullAvailPageFile)
             # Fallback (e.g. sandboxed callers where GlobalMemoryStatusEx reports
             # nothing): total installed RAM in KB. Less precise than ullAvailPhys
             # — it ignores standby/reclaimable pages — but never returns 0 on a

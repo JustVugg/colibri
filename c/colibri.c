@@ -9972,22 +9972,10 @@ static double g_mem_avail_boot=0;   /* MemAvailable all'avvio, prima di caricare
  * (stessa semantica: recuperabili senza swap). Senza questo ramo il fallback
  * "assumo 8 GB" castrava la cache expert proprio sulle macchine con piu' RAM. */
 static double mem_available_gb(void){
-#ifdef __APPLE__
-    mach_msg_type_number_t cnt=HOST_VM_INFO64_COUNT;
-    vm_statistics64_data_t vm;
-    if(host_statistics64(mach_host_self(),HOST_VM_INFO64,(host_info64_t)&vm,&cnt)!=KERN_SUCCESS) return 0;
-    return ((double)vm.free_count+(double)vm.inactive_count+(double)vm.purgeable_count)
-           * (double)sysconf(_SC_PAGESIZE) / 1e9;
-#elif defined(_WIN32)
-    double total, avail;
-    compat_meminfo(&total, &avail);
-    return avail;
-#else
-    FILE *f=fopen("/proc/meminfo","r"); if(!f) return 0;
-    char ln[256]; double kb=0;
-    while(fgets(ln,sizeof(ln),f)) if(sscanf(ln,"MemAvailable: %lf",&kb)==1) break;
-    fclose(f); return kb/1e6;
-#endif
+    /* Era la sola copia giusta di questa misura; glm53.c ne aveva una che
+     * leggeva /proc ovunque (#1375). Ora vive in compat.h e la chiamano
+     * entrambi: su Windows tiene anche conto del commit disponibile. */
+    return compat_mem_available_gb();
 }
 
 static int kv_slot_count(void){

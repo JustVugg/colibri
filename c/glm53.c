@@ -1215,16 +1215,9 @@ static void expert_table_init(GModel *m) {
  * la seconda ignora la page cache riutilizzabile e farebbe stimare molto meno
  * di quello che c'e'. */
 static double memory_available_gb(void) {
-    FILE *f = fopen("/proc/meminfo", "r");
-    if (!f) return 0.0;
-    char line[256];
-    double gb = 0.0;
-    while (fgets(line, sizeof(line), f)) {
-        long kb;
-        if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) { gb = kb / 1048576.0; break; }
-    }
-    fclose(f);
-    return gb;
+    /* #1375: era una lettura di /proc/meminfo, che su Windows e macOS non
+     * esiste: 0 -> budget 1 GB -> uno slot per layer, in silenzio. */
+    return compat_mem_available_gb();
 }
 
 static void expert_cache_init(GModel *m) {
@@ -1293,7 +1286,12 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
      * di sola lettura che questo slot poteva star usando prima. */
     if (!slot->own) {
         slot->own = malloc((size_t)m->e_slot);
-        if (!slot->own) { fprintf(stderr, "OOM su uno slot esperto\n"); exit(1); }
+        if (!slot->own) {
+            fprintf(stderr, "OOM su uno slot esperto (%.1f MB): la cache esperti non ci sta "
+                            "in memoria; riduci con --ram N o GLM53_EXPERT_GB=N (#1375)\n",
+                    m->e_slot / 1e6);
+            exit(1);
+        }
     }
     for (int p = 0; p < GLM53_EXPERT_PIECES; p++) slot->piece[p] = slot->own + m->e_at[p];
     if (ref->contig) {
