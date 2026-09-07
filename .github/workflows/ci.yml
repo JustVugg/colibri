@@ -522,7 +522,7 @@ jobs:
             exit 1
           fi
           grep -qE "elements, expected|gated residual dimensions" qwen38-bad.log
-      - name: Brain tab: EMAP after READY and STAT, HITS after every turn
+      - name: "Brain tab: EMAP after READY and STAT, HITS after every turn"
         run: |
           cd c
           # the oracle fixture has no tokenizer; serve mode needs one
