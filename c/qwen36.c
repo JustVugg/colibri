@@ -1573,7 +1573,17 @@ static void slot_ensure_int8(Model *m, Slot *s) {
     s->g = w; s->u = w + ng; s->d = w + ng + ng;
 }
 
-static void ehit_mark(Model *m, int layer, int eid);
+/* Segna l'esperto instradato per la bitmap HITS della dashboard. Vive qui,
+ * fuori dalla regione QWEN36_NO_MAIN: expert_get la chiama anche nel build
+ * del segment adapter, dove il resto della telemetria serve non esiste. */
+static void ehit_mark(Model *m, int layer, int eid){
+    const Cfg *c=&m->c;
+    if(!m->ehit){
+        m->ehit=calloc((size_t)c->n_layers,sizeof(uint8_t*));
+        for(int i=0;i<c->n_layers;i++) m->ehit[i]=calloc((size_t)c->n_experts,1);
+    }
+    if(layer>=0&&layer<c->n_layers&&eid>=0&&eid<c->n_experts) m->ehit[layer][eid]=1;
+}
 static void expert_get(Model *m, int layer, int eid, Slot **out) {
     ehit_mark(m, layer, eid);   /* tocca solo m->ehit[layer][eid] */
     LCache *lc = &m->cache[layer];
@@ -2621,14 +2631,6 @@ static int serve_cancel_pending(const char *id){
  * ora accumulati sempre e riportati a schermo solo con COLI_TIMERS=1; il
  * disco e' misurato attorno a load_expert_merged su entrambi i percorsi.
  * L'attesa asincrona resta 0 per costruzione. */
-static void ehit_mark(Model *m, int layer, int eid){
-    const Cfg *c=&m->c;
-    if(!m->ehit){
-        m->ehit=calloc((size_t)c->n_layers,sizeof(uint8_t*));
-        for(int i=0;i<c->n_layers;i++) m->ehit[i]=calloc((size_t)c->n_experts,1);
-    }
-    if(layer>=0&&layer<c->n_layers&&eid>=0&&eid<c->n_experts) m->ehit[layer][eid]=1;
-}
 static void dash_hex(const uint8_t *bytes,int n,char *hex){
     for(int b=0;b<n;b++){ hex[2*b]="0123456789abcdef"[bytes[b]>>4]; hex[2*b+1]="0123456789abcdef"[bytes[b]&15]; }
     hex[2*n]=0;
