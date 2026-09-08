@@ -898,9 +898,21 @@ static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
     if(S>=2){ matmul_q_idot_mm(y,xq,sx,q,scale,S,I,O); return; }
 #endif
-    #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
-        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+    /* IDOT_TEAM=1: execute the entire O×S output in a single OpenMP team
+     * instead of one parallel region per output column. This fuses the three
+     * IDOT stages (gate/up, SiLU+quant, down) into one team, eliminating
+     * 2× team barrier spin per expert. */
+    if (getenv("IDOT_TEAM") && atoi(getenv("IDOT_TEAM")) == 1) {
+        #pragma omp parallel for schedule(static) collapse(2)
+        for(int o=0;o<O;o++) {
+            const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
+            for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s];
+        }
+    } else {
+        #pragma omp parallel for schedule(static)
+        for(int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
+            for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+    }
 }
 static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
                            const float *scale, int S, int I, int O){
@@ -908,9 +920,21 @@ static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const ui
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
     if(S>=2){ matmul_i4_idot_mm(y,xq,sx,q4,scale,S,I,O); return; }
 #endif
-    #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
-        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+    /* IDOT_TEAM=1: execute the entire O×S output in a single OpenMP team
+     * instead of one parallel region per output column. This fuses the three
+     * IDOT stages (gate/up, SiLU+quant, down) into one team, eliminating
+     * 2× team barrier spin per expert. */
+    if (getenv("IDOT_TEAM") && atoi(getenv("IDOT_TEAM")) == 1) {
+        #pragma omp parallel for schedule(static) collapse(2)
+        for(int o=0;o<O;o++) {
+            const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
+            for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s];
+        }
+    } else {
+        #pragma omp parallel for schedule(static)
+        for(int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
+            for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+    }
 }
 
 
