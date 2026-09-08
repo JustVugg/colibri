@@ -5789,8 +5789,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             if(g_pipe){                            /* PIPE: launch loads async, matmul overlaps them */
                 if(!g_pp.started) pipe_init(m);
                 double t0=now_s();
-                int eids[64]; for(int q=0;q<nmiss;q++) eids[q]=uniq[base+missk[q]];
-                pipe_dispatch(m,layer,eids,nmiss);
+                int eids[64]; ESlot *slots[64];
+                for(int q=0;q<nmiss;q++){
+                    eids[q]=uniq[base+missk[q]];
+                    slots[q]=&m->ws[q];
+                }
+                /* try coalesced batch load first */
+                if(expert_load_batch(m, layer, eids, nmiss, slots, 1, 1) != 0) {
+                    pipe_dispatch(m,layer,eids,nmiss);
+                }
                 m->t_ewait += now_s()-t0;           /* dispatch only; the reads overlap matmul and
                                                      * are timed as service inside expert_load */
             } else { double t0=now_s();             /* ORIGINALE: blocking parallel load */
