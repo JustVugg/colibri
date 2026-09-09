@@ -23,6 +23,12 @@
  * the tier accepted an int8 pointer (fake_uploads > 0) and that the resident
  * set grows -- the assertion from #1391 that fails on the old expression.
  */
+/* The production offer path itself: qwen36.c's tier_offer_slot() is the exact
+ * function moe()'s resident offer and the pilot-prefetch lookahead call, so
+ * this test drives the real code, not a copy. The two sites and the warmstart
+ * can no longer drift apart: reverting the production gate to the bare
+ * `if (s->g4)` makes the int8 case below fail exactly the way #1391 reports. */
+#define decode_offer tier_offer_slot
 #define main qwen36_main_unused
 #include "../qwen36.c"
 #undef main
@@ -129,18 +135,6 @@ static int wait_resident(void) {
         nanosleep(&ts, NULL);
     }
     return 0;
-}
-
-/* The offer decision both decode-path sites now make, lifted verbatim from
- * moe()'s resident offer (the prefetch site is the same choice on `ps`). If
- * this expression regresses to the bare `if (e->g4)`, the int8 case below
- * fails exactly the way the issue describes. */
-static void decode_offer(int layer, int eid, Slot *s) {
-    if (s->g4)
-        qt_note(layer, eid, s->g4, s->u4, s->d4, s->gs, s->us, s->ds);
-    else if (!g_expert_is_int4 && s->g)
-        qt_note(layer, eid, (const uint8_t *)s->g, (const uint8_t *)s->u,
-                (const uint8_t *)s->d, s->gs, s->us, s->ds);
 }
 
 /* --- an int8 container, QT_NO_WARMSTART=1: the decode offer must promote --- */

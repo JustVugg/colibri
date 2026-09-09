@@ -959,6 +959,21 @@ static int g_expert_gs = 0;   /* set from qwen36_meta.json (expert_gs) at load *
  * Same signal main's nbytes probe and tier_warmstart receive; the decode path
  * needs it to offer int8 experts (#1391): on an int8 container e->g4 is NULL. */
 static int g_expert_is_int4 = 1;
+
+/* The single offer decision the decode path makes for a routed expert: offer
+ * whichever format the container actually packed, exactly what tier_warmstart
+ * does (int4 → the packed g4/u4/d4, int8 → the live RAM weights, tier fmt=1
+ * since #1334). moe()'s resident offer, the pilot-prefetch lookahead, and the
+ * #1391 test all call THIS function, so the gate can't drift between them.
+ * Read-only: never frees, never rewrites -- ownership stays in warmstart
+ * (#1341). */
+static void tier_offer_slot(int layer, int eid, const Slot *s) {
+    if (s->g4)
+        qt_note(layer, eid, s->g4, s->u4, s->d4, s->gs, s->us, s->ds);
+    else if (!g_expert_is_int4 && s->g)
+        qt_note(layer, eid, (const uint8_t *)s->g, (const uint8_t *)s->u,
+                (const uint8_t *)s->d, s->gs, s->us, s->ds);
+}
 static void matmul_q_gs(float *y, const float *x, const int8_t *q, const float *scale,
                         int I, int O, int gs) {
     int ng = (I + gs - 1) / gs;
@@ -1973,14 +1988,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 /* Offer whichever format the container actually packed. The old
                  * gate `if (e->g4)` never fired on an int8 container (g4 is
                  * NULL there), so the tier stayed at 0 uploads for the life of
-                 * the process (#1391). Same pointer choice tier_warmstart
-                 * makes: int4 → packed, int8 → the weights themselves. The
-                 * priority on g4 first keeps mid-flight format flips harmless. */
-                if (e->g4)
-                    qt_note(layer, idx[kk], e->g4, e->u4, e->d4, e->gs, e->us, e->ds);
-                else if (!g_expert_is_int4 && e->g)
-                    qt_note(layer, idx[kk], (const uint8_t *)e->g, (const uint8_t *)e->u,
-                            (const uint8_t *)e->d, e->gs, e->us, e->ds);
+                 * the process (#1391). tier_offer_slot is the shared decision:
+                 * same pointer choice tier_warmstart makes, one place. */
+                tier_offer_slot(layer, idx[kk], e);
             }
             double _q0 = tm_now();
             uint32_t qmask = qt_issue(layer, idx, K, xs);
@@ -2387,12 +2397,8 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
                 Slot *ps = &lc->slots[fz];
                 /* Same int8 container case as the resident offer in moe():
                  * on an int8 container ps->g4 is NULL and the prefetch offer
-                 * never fired (#1391). Offer the int8 weights instead. */
-                if (ps->g4)
-                    qt_note(lnext, eid, ps->g4, ps->u4, ps->d4, ps->gs, ps->us, ps->ds);
-                else if (!g_expert_is_int4 && ps->g)
-                    qt_note(lnext, eid, (const uint8_t *)ps->g, (const uint8_t *)ps->u,
-                            (const uint8_t *)ps->d, ps->gs, ps->us, ps->ds);
+                 * never fired (#1391). tier_offer_slot handles both formats. */
+                tier_offer_slot(lnext, eid, ps);
             }
             if (!found) {
                 int gidx = lnext*E + eid;
