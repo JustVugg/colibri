@@ -752,13 +752,15 @@ jobs:
       - name: MSVC environment (puts cl.exe on PATH for nvcc -ccbin)
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
       - name: Install CUDA toolkit (compiler only)
-        uses: Jimver/cuda-toolkit@4bd727d5619dc6fa323b1e76c3aa5dca94f5ec6d # v0.2.19
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         with:
-          # Same pin as engine-cuda-syntax: v0.2.19's version table stops at
-          # 12.6.2. This installs to the default "C:\Program Files\NVIDIA GPU
-          # Computing Toolkit\..." path, so CUDA_HOME is space-bearing here —
-          # which is exactly the #314 regression this job would have caught.
-          cuda: '12.6.2'
+          # 12.8 is the floor for sm_120 (RTX 50-series), which the portable
+          # DLL below carries; the 12.x runtime keeps the driver floor where
+          # users already are (#1405). v0.2.19 stopped at 12.6.2, hence the
+          # action bump. This installs to the default "C:\Program Files\NVIDIA
+          # GPU Computing Toolkit\..." path, so CUDA_HOME is space-bearing here
+          # -- which is exactly the #314 regression this job would have caught.
+          cuda: '12.8.1'
           method: network
           # cudart as well as nvcc: unlike the Linux job (which only needs to
           # *compile* backend_cuda.cu), cuda-dll links it, and on Windows the
@@ -803,12 +805,16 @@ jobs:
         shell: msys2 {0}
         run: |
           cd c
-          # CUDA_ARCH is pinned: the default is `native`, which asks the driver
-          # what card is present — there is none here, so it must be explicit.
-          # sm_80 matches engine-cuda-syntax and is supported by the 12.6 pin.
-          make cuda-dll CUDA_ARCH=sm_80
+          # CUDA_ARCH is explicit: the default is `native`, which asks the driver
+          # what card is present, and there is none here. `portable` is the DLL
+          # a Windows user can download and run: SASS for sm_80/86/89/90/120
+          # plus PTX, one file for the 30xx, 40xx and 50xx cards (#1405). The
+          # runner cannot execute it; the artifact below is for the people who
+          # can, until the release ships it.
+          make cuda-dll CUDA_ARCH=portable
           test -f coli_cuda.dll || { echo "cuda-dll reported success but produced no DLL" >&2; exit 1; }
-          echo "coli_cuda.dll built (MSVC host)"
+          ls -l coli_cuda.dll
+          echo "coli_cuda.dll built (MSVC host, portable gencode)"
       - name: make colibri CUDA_DLL=1 (host links backend_loader, not cudart)
         shell: msys2 {0}
         run: |
@@ -816,6 +822,28 @@ jobs:
           make colibri CUDA_DLL=1
           test -f colibri.exe || { echo "colibri CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "colibri.exe built against the DLL loader"
+          make qwen36 CUDA_DLL=1
+          test -f qwen36.exe || { echo "qwen36 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "qwen36.exe built against the DLL loader"
+      - name: Collect the runtime the DLL links (cudart64_12.dll)
+        shell: bash
+        run: |
+          # coli_cuda.dll links cudart dynamically; without the toolkit on the
+          # user's machine the loader reports "module or one of its dependencies
+          # was not found". Ship the runtime next to it, from this same toolkit.
+          ls "$CUDA_PATH/bin"/cudart64_*.dll
+          cp "$CUDA_PATH/bin"/cudart64_*.dll c/
+      - name: Publish the portable DLL for people with a card (#1405)
+        uses: actions/upload-artifact@v4
+        with:
+          name: coli_cuda-windows-portable
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            c/coli_cuda.dll
+            c/cudart64_*.dll
+            c/colibri.exe
+            c/qwen36.exe
 
   web:
     name: Web UI
