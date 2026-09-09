@@ -955,6 +955,10 @@ static void matmul_q_batch(float *y, const float *x, const int8_t *q,
 /* Group-scaled int8 GEMV: one f32 scale per `gs` input elements per row
  * (gs64 expert containers). Row layout of `scale`: [O][I/gs] row-major. */
 static int g_expert_gs = 0;   /* set from qwen36_meta.json (expert_gs) at load */
+/* 1 = expert container packs int4 (tier fmt=4); 0 = int8 per-row (tier fmt=1).
+ * Same signal main's nbytes probe and tier_warmstart receive; the decode path
+ * needs it to offer int8 experts (#1391): on an int8 container e->g4 is NULL. */
+static int g_expert_is_int4 = 1;
 static void matmul_q_gs(float *y, const float *x, const int8_t *q, const float *scale,
                         int I, int O, int gs) {
     int ng = (I + gs - 1) / gs;
@@ -1966,7 +1970,17 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
              * collect the GPU results. */
             for (int kk = 0; kk < K; kk++) {
                 Slot *e; expert_get(m, layer, idx[kk], &e);
-                if (e->g4) qt_note(layer, idx[kk], e->g4, e->u4, e->d4, e->gs, e->us, e->ds);
+                /* Offer whichever format the container actually packed. The old
+                 * gate `if (e->g4)` never fired on an int8 container (g4 is
+                 * NULL there), so the tier stayed at 0 uploads for the life of
+                 * the process (#1391). Same pointer choice tier_warmstart
+                 * makes: int4 → packed, int8 → the weights themselves. The
+                 * priority on g4 first keeps mid-flight format flips harmless. */
+                if (e->g4)
+                    qt_note(layer, idx[kk], e->g4, e->u4, e->d4, e->gs, e->us, e->ds);
+                else if (!g_expert_is_int4 && e->g)
+                    qt_note(layer, idx[kk], (const uint8_t *)e->g, (const uint8_t *)e->u,
+                            (const uint8_t *)e->d, e->gs, e->us, e->ds);
             }
             double _q0 = tm_now();
             uint32_t qmask = qt_issue(layer, idx, K, xs);
@@ -2371,7 +2385,14 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
             /* Lookahead: RAM-resident layer-L+1 candidates go to VRAM asynchronously */
             if (found && fz >= 0 && qt_ready()) {
                 Slot *ps = &lc->slots[fz];
-                if (ps->g4) qt_note(lnext, eid, ps->g4, ps->u4, ps->d4, ps->gs, ps->us, ps->ds);
+                /* Same int8 container case as the resident offer in moe():
+                 * on an int8 container ps->g4 is NULL and the prefetch offer
+                 * never fired (#1391). Offer the int8 weights instead. */
+                if (ps->g4)
+                    qt_note(lnext, eid, ps->g4, ps->u4, ps->d4, ps->gs, ps->us, ps->ds);
+                else if (!g_expert_is_int4 && ps->g)
+                    qt_note(lnext, eid, (const uint8_t *)ps->g, (const uint8_t *)ps->u,
+                            (const uint8_t *)ps->d, ps->gs, ps->us, ps->ds);
             }
             if (!found) {
                 int gidx = lnext*E + eid;
@@ -2933,6 +2954,7 @@ int main(int argc, char **argv) {
      * (CI sul container tiny int8, #1331) senza una scheda. */
     fprintf(stderr, "[qwen36] expert format on disk: %s\n",
             expert_is_int4 ? "int4 packed (tier fmt=4)" : "int8 (tier fmt=1)");
+    g_expert_is_int4 = expert_is_int4;
     /* Offer the dense trunk to the placer before the tier decides its budget:
      * sizes only, from the same dense-i8 entries the uploads below will use.
      * No entry (dense-i8 off) means nothing to offer, and the CPU path stands. */
