@@ -1185,14 +1185,20 @@ def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, to
 
 
 def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                     tool_choice=None):
+                     tool_choice=None, add_generation_prompt=True):
     """Text-only subset of Qwen3.6's chat_template: <|im_start|>role\\n ...
     <|im_end|>\\n frames, then the generation prompt. The official template
     opens a mandatory <think> block after `<|im_start|>assistant\\n` — the
     model was never trained on the bare `assistant\\n` state, and greedy
     argmax there lands on an EOS special (measured: gen=0). With thinking
     disabled the template pre-closes the block instead; both branches are
-    mirrored here byte for byte."""
+    mirrored here byte for byte.
+
+    add_generation_prompt=False continues a trailing assistant turn. The template renders an
+    assistant turn AFTER the last user query with its <think></think> block (an earlier one,
+    from history, has it stripped) -- so the open-turn shape is that think-form minus the
+    <|im_end|> terminator and with no cue, not the bare history form the loop emits otherwise.
+    ChatML's per-turn terminator is why the marker has to be dropped explicitly, as on qwen38."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     if tools or tool_choice not in (None, "none"):
@@ -1209,9 +1215,20 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
             raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
         raw = message.get("content")
         text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if not add_generation_prompt and role == "assistant" and index == len(messages) - 1:
+            # Continued turn: the template gives a post-query assistant turn a <think></think>
+            # block, then the model resumes the content. Match it, minus the terminator/cue.
+            reasoning = message.get("reasoning_content", "")
+            if not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            parts.append(f"<|im_start|>assistant\n<think>\n{reasoning.strip()}\n</think>\n\n"
+                         f"{text.strip()}")
+            continue
         parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
-    parts.append("<|im_start|>assistant\n")
-    parts.append("<think>\n" if enable_thinking else "<think>\n\n</think>\n\n")
+    if add_generation_prompt:
+        parts.append("<|im_start|>assistant\n")
+        parts.append("<think>\n" if enable_thinking else "<think>\n\n</think>\n\n")
     return "".join(parts)
 
 
@@ -1963,7 +1980,7 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
 # (the cue is appended, exactly as before this existed) rather than erroring -- continuation is
 # on by default, and a family without its open-turn shape yet must not start rejecting requests
 # nobody opted into. Each renderer adds itself here in the same commit that derives its shape.
-CONTINUATION_FAMILIES = {"glm53", "qwen38"}
+CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36"}
 
 
 def resolve_generation_prompt(messages, body):
@@ -2054,8 +2071,10 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if ARCH == "qwen38":
         return render_chat_qwen38(messages, enable_thinking, reasoning_effort, tools,
                                   tool_choice, add_generation_prompt)
+    if ARCH == "qwen36":
+        return render_chat_qwen(messages, enable_thinking, reasoning_effort, tools,
+                                tool_choice, add_generation_prompt)
     renderer = (render_chat_kimi if ARCH == "kimi" else
-                render_chat_qwen if ARCH == "qwen36" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
                 render_chat_olmoe if ARCH == "olmoe" else render_chat)
     return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
