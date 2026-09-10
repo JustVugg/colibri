@@ -69,8 +69,18 @@ def _cc_flags():
         # becomes a -Wunknown-pragmas warning (-Wall enables it), and the assertion
         # below requires an empty stderr -- so on Linux this test failed for a
         # reason that had nothing to do with what it is testing. macOS gets the
-        # libomp probe just below; Windows/MinGW is left alone.
+        # libomp probe just below.
         cflags += ["-fopenmp"]
+        ldflags += ["-fopenmp"]
+    if sys.platform == "win32":
+        # MinGW mirrors CFLAGS too, rather than being left alone. compat.h
+        # refuses to compile a Windows off_t that is not 64-bit, and the
+        # Makefile passes -D_FILE_OFFSET_BITS=64 (and -fopenmp) on Windows as
+        # well. Without the define the harness died on the #error, so this test
+        # could only ever run where torch is absent -- i.e. it skipped on CI's
+        # Windows job and failed on any Windows box that had torch installed,
+        # for a reason that had nothing to do with what it is testing.
+        cflags += ["-D_FILE_OFFSET_BITS=64", "-fopenmp"]
         ldflags += ["-fopenmp"]
     if sys.platform == "darwin":
         try:
