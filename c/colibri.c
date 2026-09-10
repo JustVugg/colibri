@@ -261,6 +261,10 @@ typedef struct {
      * fault fails at S=1, records 1, and is never retried -- the old behaviour, reached
      * as a special case of the general rule rather than as a separate one. */
     int cuda_fail_s;
+    /* TRUNK_RESIDENT_LAYERS: 1 = this QT is a READ-ONLY mmap view of the
+     * safetensors (non-resident trunk layer). Free paths must never free()
+     * q8/q4/s; they are interior pointers into g_maps[] shard mappings. */
+    int mmap_view;
 } QT;
 static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
@@ -290,6 +294,12 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
         return n + nblkO*nblkI*4; }
     return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;  /* fmt=2 int4 per-row */
 }
+
+/* TRUNK_RESIDENT_LAYERS: byte che contano davvero nella RSS. Una vista mmap
+ * (mmap_view=1) e' file-backed e pageable: il suo qt_bytes() logico NON e'
+ * residente, quindi non deve entrare in resident_bytes (che cap_for_ram() ed
+ * expert_avail() sottraggono dal budget RAM). */
+static int64_t qt_rb(const QT *t){ return t->mmap_view ? 0 : qt_bytes(t); }
 /* scale-array byte count only, format-aware -- split out of qt_bytes() because
  * qt_wire_mmap/qt_unwire_mmap mlock the weight and scale ranges as TWO SEPARATE
  * regions (separate allocations, not one contiguous buffer: qt_from_disk always
@@ -372,6 +382,9 @@ typedef struct {
     int shared_w4a16_failed;
 #endif
     int sparse;
+    /* TRUNK_RESIDENT_LAYERS: 1 = this layer's dense/attention tensors are
+     * file-backed mmap views (pageable, never wired); 0 = resident qalloc. */
+    int trunk_mmap;
     /* dense mlp (sparse==0) */
     QT gate_proj, up_proj, down_proj;
     /* moe (sparse==1) */
@@ -2067,6 +2080,16 @@ static void qt_verify_fmt_stamp(const char *name, const char *stamped, int fmt){
     exit(1);
 }
 
+/* TRUNK_RESIDENT_LAYERS=N (#826): keep the TOP N dense/attention layers
+ * resident (qalloc + optional NUMA); the remaining (bottom) layers' dense
+ * tensors load as READ-ONLY mmap views of the safetensors (pageable, never
+ * wired). Default INT_MAX = every layer resident = byte-identical current
+ * behaviour. The knob is a "run at all vs run fast" lever: on a host where
+ * the trunk does not fit in RAM, the mmap'd layers page from disk instead of
+ * OOMing. CPU-only in phase 1 (GPU backends refuse, see main). */
+static int g_trunk_resident=INT_MAX;
+static void *map_of_fd(int fd);   /* definita sotto, zona COLI_MMAP (shard mmap registry) */
+
 /* costruisce un QT [O,I] dal disco in `t` (buffer riusabili tra chiamate).
  *  - se esiste `name.qs`: pesi GIA' quantizzati nel container (U8 qdata + F32 scala) -> letti diretti
  *  - altrimenti: tensore pieno (f32/bf16) -> quantizzato a runtime a `bits` (oracolo tiny / pesi pieni)
@@ -2143,6 +2166,37 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
         else { float *tmp=falloc((int64_t)O*I); st_read_f32_cap(&m->S,name,tmp,(int64_t)O*I,drop); qt_fill(t,tmp,bits); free(tmp); }
     }
 }
+
+/* TRUNK_RESIDENT_LAYERS: carica UN tensore denso del trunk come VISTA mmap
+ * read-only del safetensor (stessa meccanica di expert_load_impl sotto g_mmap:
+ * map_of_fd registra la mappa dello shard, e q8/q4/s puntano DENTRO di essa).
+ * I matmul site non distinguono l'origine dei puntatori -> nessuna modifica li'.
+ * Precondizioni: tensore gia' quantizzato (name.qs presente) e offset allineati;
+ * se non applicabile ritorna -1 e il chiamante fa fallback al path residente.
+ * NOTA NUMA: la vista mmap NON riceve l'interleave NUMA che qalloc() fa per slab
+ * >1MB (req. maintainer: documentare nel PR; il path residente lo conserva). */
+static int qt_load_mmap(Model *m, const char *name, int O, int I, QT *t){
+    /* map_of_fd() funziona indipendentemente da COLI_MMAP degli experti:
+     * registra/riusa la mappa dello shard. Il knob del trunk e' autonomo. */
+    char sn[300]; snprintf(sn,sizeof(sn),"%s.qs",name);
+    st_tensor *tw=st_find(&m->S,name), *tq=st_find(&m->S,sn);
+    if(!tw||!tq||(tw->off&3)||(tq->off&3)) return -1;   /* solo quantizzato + allineato */
+    void *bw=map_of_fd(tw->fd);
+    void *bq=map_of_fd(tq->fd);
+    if(!bw||!bq) return -1;
+    int gs=0;
+    const char *stamped=st_fmt_stamp(&m->S,name);
+    int fmt=qt_resolve_fmt(name,O,I,tw->nbytes,tq->nbytes,&gs,stamped);
+    qt_verify_fmt_stamp(name,stamped,fmt);     /* TRUST-VERIFY-REFUSE, come qt_from_disk */
+    if(fmt==0) return -1;                      /* f32 pieno: non mmap-abile, fallback */
+    memset(t,0,sizeof(*t));
+    t->fmt=fmt; t->O=O; t->I=I; t->gs=gs; t->qf=NULL; t->planar=0;   /* MAI planarizzare */
+    t->q8=(int8_t*)((char*)bw+tw->off); t->q4=(uint8_t*)((char*)bw+tw->off);
+    t->s =(float*)((char*)bq+tq->off);
+    t->mmap_view=1;
+    return 0;
+}
+
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
     QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t);
 #ifdef COLI_CUDA
@@ -2154,6 +2208,18 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
 #endif
     return t;
 }
+/* TRUNK_RESIDENT_LAYERS: carica UN QT del trunk come vista mmap se mmap_ok e il
+ * tensore e' mmap-abile (quantizzato + allineato); altrimenti path residente
+ * classico. Il flag mmap_view del QT risultante distingue i due casi per
+ * planarize, contabilita' e free paths. */
+static QT qt_load_ex(Model *m, const char *name, int O, int I, int bits, int mmap_ok){
+    if(mmap_ok){
+        QT t;
+        if(qt_load_mmap(m,name,O,I,&t)==0) return t;
+    }
+    return qt_load(m,name,O,I,bits);
+}
+
 static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (norme/bias) */
     int64_t n=st_numel(&m->S,name); if(n<0) st_die_missing(&m->S,name);
     float *p=(float*)qalloc((size_t)n*sizeof(float));   /* registrato per la GPU sotto METAL */
@@ -2281,7 +2347,7 @@ static void metal_fmt_gate_notice(Model *m){
 static void model_init_range(Model *m, const char *snap, int cap,
                              int ebits, int dbits, int layer_begin,
                              int layer_end, int load_boundaries, int load_mtp,
-                             int init_telemetry){
+                             int init_telemetry, int allow_trunk_mmap){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
     load_cfg(&m->c,snap);
     { const char *xd=getenv("COLI_MODEL_DIRS");        /* SPLIT: model shards spread across N drives */
@@ -2336,16 +2402,26 @@ static void model_init_range(Model *m, const char *snap, int cap,
     m->kv_start=m->kv->kv_start=calloc(NR,sizeof(int));
     for(int i=layer_begin;i<layer_end;i++){
         Layer *l=&m->L[i];
+        /* TRUNK_RESIDENT_LAYERS: top-N residente. Le layer fuori dal top-N
+         * (i < n_layers - g_trunk_resident) caricano i tensori densi come vista
+         * mmap se il tensore lo permette; il resto, residente classico.
+         * Solo il path full-model puo' produrre viste (allow_trunk_mmap): un
+         * range/segment load resta residente, cosi' i suoi destroy non liberano
+         * puntatori interni di una mappa di shard (review #1399). */
+        int mmap_ok = allow_trunk_mmap
+                    && (g_trunk_resident < c->n_layers)
+                    && (i < c->n_layers - g_trunk_resident);
+        l->trunk_mmap = mmap_ok;
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
         l->in_ln=ld(m,P("input_layernorm.weight"));
         l->post_ln=ld(m,P("post_attention_layernorm.weight"));
-        l->q_a   = qt_load(m,P("self_attn.q_a_proj.weight"), c->q_lora, D, dbits);
+        l->q_a   = qt_load_ex(m,P("self_attn.q_a_proj.weight"), c->q_lora, D, dbits,mmap_ok);
         l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"));
-        l->q_b   = qt_load(m,P("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits);
-        l->kv_a  = qt_load(m,P("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits);
+        l->q_b   = qt_load_ex(m,P("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits,mmap_ok);
+        l->kv_a  = qt_load_ex(m,P("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits,mmap_ok);
         l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
-        l->kv_b  = qt_load(m,P("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
-        l->o     = qt_load(m,P("self_attn.o_proj.weight"), D, H*c->v_head, dbits);
+        l->kv_b  = qt_load_ex(m,P("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits,mmap_ok);
+        l->o     = qt_load_ex(m,P("self_attn.o_proj.weight"), D, H*c->v_head, dbits,mmap_ok);
 #ifdef COLI_CUDA
         qt_cuda_colocate(&l->o,&l->kv_b);
         qt_cuda_colocate(&l->q_a,&l->kv_b);   /* PIPE: intera catena attention sulla */
@@ -2356,18 +2432,22 @@ static void model_init_range(Model *m, const char *snap, int cap,
 #endif
         l->sparse = (i >= c->first_dense);
         if(!l->sparse){
-            l->gate_proj = qt_load(m,P("mlp.gate_proj.weight"), c->dense_inter, D, dbits);
-            l->up_proj   = qt_load(m,P("mlp.up_proj.weight"),   c->dense_inter, D, dbits);
-            l->down_proj = qt_load(m,P("mlp.down_proj.weight"), D, c->dense_inter, dbits);
-            qt_planarize(&l->gate_proj); qt_planarize(&l->up_proj); qt_planarize(&l->down_proj);   /* K1 */
+            l->gate_proj = qt_load_ex(m,P("mlp.gate_proj.weight"), c->dense_inter, D, dbits,mmap_ok);
+            l->up_proj   = qt_load_ex(m,P("mlp.up_proj.weight"),   c->dense_inter, D, dbits,mmap_ok);
+            l->down_proj = qt_load_ex(m,P("mlp.down_proj.weight"), D, c->dense_inter, dbits,mmap_ok);
+            if(!l->gate_proj.mmap_view) qt_planarize(&l->gate_proj);   /* K1 (mai su mmap: read-only) */
+            if(!l->up_proj.mmap_view)   qt_planarize(&l->up_proj);
+            if(!l->down_proj.mmap_view) qt_planarize(&l->down_proj);
         } else {
             l->router=ld(m,P("mlp.gate.weight"));
             l->router_bias=ld(m,P("mlp.gate.e_score_correction_bias"));
             int sI=c->moe_inter*c->n_shared;
-            l->sh_gate = qt_load(m,P("mlp.shared_experts.gate_proj.weight"), sI, D, dbits);
-            l->sh_up   = qt_load(m,P("mlp.shared_experts.up_proj.weight"),   sI, D, dbits);
-            l->sh_down = qt_load(m,P("mlp.shared_experts.down_proj.weight"), D, sI, dbits);
-            qt_planarize(&l->sh_gate); qt_planarize(&l->sh_up); qt_planarize(&l->sh_down);   /* K1 */
+            l->sh_gate = qt_load_ex(m,P("mlp.shared_experts.gate_proj.weight"), sI, D, dbits,mmap_ok);
+            l->sh_up   = qt_load_ex(m,P("mlp.shared_experts.up_proj.weight"),   sI, D, dbits,mmap_ok);
+            l->sh_down = qt_load_ex(m,P("mlp.shared_experts.down_proj.weight"), D, sI, dbits,mmap_ok);
+            if(!l->sh_gate.mmap_view) qt_planarize(&l->sh_gate);   /* K1 (mai su mmap) */
+            if(!l->sh_up.mmap_view)   qt_planarize(&l->sh_up);
+            if(!l->sh_down.mmap_view) qt_planarize(&l->sh_down);
 #ifdef COLI_CUDA
             qt_cuda_colocate(&l->sh_gate,&l->kv_b);  /* PIPE2: shared chain on the layer home device */
             qt_cuda_colocate(&l->sh_up,&l->sh_gate);
@@ -2471,9 +2551,12 @@ static void model_init_range(Model *m, const char *snap, int cap,
     /* byte della parte DENSA residente (embed+lm_head+attn+mlp densa+shared+norme) */
     int64_t rb=load_boundaries?(qt_bytes(&m->embed)+qt_bytes(&m->lm_head)):0;
     for(int i=layer_begin;i<layer_end;i++){ Layer *l=&m->L[i];
-        rb+=qt_bytes(&l->q_a)+qt_bytes(&l->q_b)+qt_bytes(&l->kv_a)+qt_bytes(&l->kv_b)+qt_bytes(&l->o);
-        if(!l->sparse) rb+=qt_bytes(&l->gate_proj)+qt_bytes(&l->up_proj)+qt_bytes(&l->down_proj);
-        else rb+=qt_bytes(&l->sh_gate)+qt_bytes(&l->sh_up)+qt_bytes(&l->sh_down);
+        /* TRUNK_RESIDENT_LAYERS: qt_rb()==0 per i tensori mmap (file-backed,
+         * pageable): resident_bytes deve contare solo la RSS reale, cosi'
+         * cap_for_ram()/expert_avail() restituiscono al budget il trunk liberato. */
+        rb+=qt_rb(&l->q_a)+qt_rb(&l->q_b)+qt_rb(&l->kv_a)+qt_rb(&l->kv_b)+qt_rb(&l->o);
+        if(!l->sparse) rb+=qt_rb(&l->gate_proj)+qt_rb(&l->up_proj)+qt_rb(&l->down_proj);
+        else rb+=qt_rb(&l->sh_gate)+qt_rb(&l->sh_up)+qt_rb(&l->sh_down);
     }
     if(m->has_mtp){ Layer *l=&m->mtpL;
         rb+=qt_bytes(&l->q_a)+qt_bytes(&l->q_b)+qt_bytes(&l->kv_a)+qt_bytes(&l->kv_b)+qt_bytes(&l->o);
@@ -2496,7 +2579,7 @@ static void model_init_range(Model *m, const char *snap, int cap,
 
 static void model_init(Model *m, const char *snap, int cap,
                        int ebits, int dbits){
-    model_init_range(m,snap,cap,ebits,dbits,0,0,1,1,1);
+    model_init_range(m,snap,cap,ebits,dbits,0,0,1,1,1,1);   /* #826: full-model path may mmap the trunk */
 }
 
 /* embed: dequantizza la riga del token (scala per-riga) in x[hidden] */
@@ -10774,6 +10857,19 @@ int main(int argc, char **argv){
     g_drop = getenv("DROP")?1:0;
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
     g_mmap = getenv("COLI_MMAP")?atoi(getenv("COLI_MMAP")):0;
+    { const char *tr=getenv("TRUNK_RESIDENT_LAYERS");
+      if(tr){ g_trunk_resident=atoi(tr);
+        if(g_trunk_resident<0){ fprintf(stderr,"TRUNK_RESIDENT_LAYERS must be >= 0\n"); return 2; }
+        /* #826 phase 1 is CPU-only. The Metal/CUDA/Vulkan paths assume resident
+         * dense buffers; a backend that quietly reads a pointer to a layer that
+         * is no longer resident is the #813 class of bug -- refuse, don't degrade. */
+        if((getenv("COLI_METAL")&&atoi(getenv("COLI_METAL"))) ||
+           (getenv("COLI_VULKAN")&&atoi(getenv("COLI_VULKAN"))) ||
+           (getenv("COLI_CUDA")&&atoi(getenv("COLI_CUDA")))){
+            fprintf(stderr,"TRUNK_RESIDENT_LAYERS is CPU-only in phase 1 (#826): "
+                           "unset it or drop the GPU backend (COLI_METAL/COLI_VULKAN/COLI_CUDA)\n");
+            return 2;
+        } } }
     if(g_mmap) fprintf(stderr,"[MMAP] expert = viste zero-copy nei file (page cache = cache)\n");
     numa_init();                                       /* COLI_NUMA=1: expert-slab interleave (#82) */
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
@@ -11474,6 +11570,10 @@ typedef struct {
 
 static void glm_segment_qt_destroy(QT *tensor) {
     if (!tensor) return;
+    /* #826: a file-backed mmap view (mmap_view=1) holds interior pointers into a
+     * shard mapping; free() on q8/q4/s would abort. Segment loads are gated to the
+     * resident path, but keep this guard so the mmap_view contract holds here too. */
+    if (tensor->mmap_view) return;
     free(tensor->qf); free(tensor->q8); free(tensor->q4); free(tensor->s);
     memset(tensor, 0, sizeof(*tensor));
 }
@@ -11665,7 +11765,7 @@ static int glm_segment_engine_open(
     }
     model_init_range(&engine->model, options->model_dir, cap, ebits, dbits,
                      (int)options->layer_begin, (int)options->layer_end,
-                     0, 0, 0);
+                     0, 0, 0, 0);   /* #826: range load stays resident (never a mmap view) */
     engine->base_kv = engine->model.kv;
 
     memset(capabilities, 0, sizeof(*capabilities));
@@ -11910,6 +12010,10 @@ typedef struct {
 
 static void glm_edge_qt_destroy(QT *tensor) {
     if (!tensor) return;
+    /* #826: never free() a file-backed mmap view (interior pointers into a shard
+     * mapping). Edge loads embed/lm_head via the resident path today; this guard
+     * keeps the mmap_view contract true if that ever changes. */
+    if (tensor->mmap_view) return;
     free(tensor->qf); free(tensor->q8); free(tensor->q4); free(tensor->s);
     memset(tensor, 0, sizeof(*tensor));
 }
