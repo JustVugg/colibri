@@ -1965,8 +1965,16 @@ class TrailingAssistantTurnTest(unittest.TestCase):
         self.assertFalse(prompt.endswith("<|assistant|><think>"))
         self.assertEqual(prompt.count("<|assistant|>"), 1)
 
-    def test_switch_off_changes_nothing(self):
-        """The default deployment must behave exactly as it did before this existed."""
+    def test_default_is_on(self):
+        """Continuation is the default now: unset (the ordinary deployment) continues a
+        trailing assistant turn. Only COLI_CONTINUE_ASSISTANT=0 turns it off."""
+        with patch.dict(os.environ, {}, clear=False), patch("openai_server.ARCH", "glm53"):
+            os.environ.pop("COLI_CONTINUE_ASSISTANT", None)
+            self.assertFalse(resolve_generation_prompt(self.OPEN_TURN, {}))
+
+    def test_switch_off_restores_old_behaviour(self):
+        """COLI_CONTINUE_ASSISTANT=0 is the off-switch: a deployment that sets it behaves
+        exactly as the gateway did before continuation existed -- append a fresh cue."""
         with self.off(), patch("openai_server.ARCH", "glm53"):
             self.assertTrue(resolve_generation_prompt(self.OPEN_TURN, {}))
             self.assertEqual(render_chat_glm53(self.OPEN_TURN, enable_thinking=True),
@@ -2010,16 +2018,17 @@ class TrailingAssistantTurnTest(unittest.TestCase):
             with self.assertRaises(APIError):
                 resolve_generation_prompt(calls, {})
 
-    def test_rejects_families_without_an_open_turn_shape(self):
-        """Every family needs its own, derived from its own template. Until then, say so
-        instead of appending a cue to a turn the client meant to be continued."""
+    def test_unimplemented_family_passes_through(self):
+        """Continuation is on by default, so a family whose renderer has no open-turn shape
+        yet must render as before -- append the cue -- not reject a request nobody opted into.
+        Each family leaves this list in the commit that derives its shape; Kimi K3 (framed
+        engine-side, so its open turn is a change in kimi_k3.c) is the standing case."""
         for arch in ("glm", "deepseek_v4", "kimi", "qwen38", "olmoe", "inkling", "qwen36"):
             with self.on(), patch("openai_server.ARCH", arch):
-                with self.assertRaises(APIError):
-                    resolve_generation_prompt(self.OPEN_TURN, {})
+                self.assertTrue(resolve_generation_prompt(self.OPEN_TURN, {}))
 
     def test_splitter_starts_in_content_mode_on_a_continued_turn(self):
-        """Measured glm53 int4, CPU: content '' with reasoning_chars 10 and 109,
+        """Measured on glm53 int4, CPU: content '' with reasoning_chars 10 and 109,
         clean stop, and a byte-correct open turn on the wire. The model was fine; the
         splitter was primed from enable_thinking alone, so it waited for a </think> the
         prompt had already passed and filed the whole answer as reasoning.

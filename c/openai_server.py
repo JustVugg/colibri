@@ -1942,8 +1942,18 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
 # llama.cpp needs no switch for this because it runs the checkpoint's jinja at request time,
 # so `add_generation_prompt=False` costs it nothing. This gateway renders by hand, on purpose
 # and for speed (tests/test_glm53_chat_template.py says why), and the bill for that choice is
-# exactly here: one template flag, eight open-turn shapes to derive. That is the honest reason
-# this ships for one family behind a switch instead of for all of them by default.
+# exactly here: one template flag, one open-turn shape to derive per renderer. Each string
+# renderer derives its own, pinned byte-for-byte against the checkpoint's template;
+# CONTINUATION_FAMILIES is the set that has done so. Kimi K3 is the exception -- its prompt is
+# framed engine-side (render_chat_kimi hands a K3CHAT1 record to kimi_k3.c, which assembles the
+# XTML tokens), so its open turn is a change in the C path, not here, and is left to that engine.
+
+# Families whose renderer implements the add_generation_prompt=False (open-turn) branch. A
+# trailing assistant turn on a family NOT in this set falls through to the ordinary render
+# (the cue is appended, exactly as before this existed) rather than erroring -- continuation is
+# on by default, and a family without its open-turn shape yet must not start rejecting requests
+# nobody opted into. Each renderer adds itself here in the same commit that derives its shape.
+CONTINUATION_FAMILIES = {"glm53"}
 
 
 def resolve_generation_prompt(messages, body):
@@ -1952,33 +1962,31 @@ def resolve_generation_prompt(messages, body):
     Returns True for the ordinary case (append the cue) and False for a continuation, which is
     the template's `add_generation_prompt=False`.
 
-    COLI_CONTINUE_ASSISTANT=1 turns continuation on for the whole server, the way
-    COLI_THINK and COLI_TOOL_SALVAGE turn on their behaviours. It is deliberately NOT a
-    request field: a client would have to know colibri specifically to send one, and the
-    clients that most want this -- anything pointed at an OpenAI- or Anthropic-compatible
-    URL -- send a message list and nothing else. A trailing assistant turn already says
-    "continue me"; a second way to say it in the body would only be reachable by hand.
+    Continuation is ON by default. A message list ending in a non-empty assistant turn already
+    says "continue me" -- the same contract as Anthropic's API -- and no OpenAI-compatible
+    client sends a trailing assistant turn by accident. It is deliberately NOT a request field:
+    a client would have to know colibri specifically to send one, and the clients that most
+    want this -- anything pointed at an OpenAI- or Anthropic-compatible URL -- send a message
+    list and nothing else.
 
-    Off is the default so that no existing deployment changes under anyone. Read it as a
-    migration switch rather than a mode: what it disables is not a behaviour anybody wants,
-    only the one that is there today.
+    COLI_CONTINUE_ASSISTANT=0 is the off-switch, for a deployment that wants the old behaviour
+    (fold the trailing turn into a completed one and append a fresh cue). It is the only value
+    that turns this off; anything else, including unset, leaves it on.
 
-    While off, both protocol paths keep their existing behaviour so clients sending a
-    trailing assistant turn today do not start getting errors from a release they did not
-    opt into.
+    A family whose renderer has no open-turn shape yet (ARCH not in CONTINUATION_FAMILIES --
+    Kimi K3, whose turn is framed engine-side) falls through to the ordinary render rather than
+    erroring: continuation defaults on, so an unimplemented family must not start rejecting
+    trailing-assistant requests that worked before.
     """
-    continuing = os.environ.get("COLI_CONTINUE_ASSISTANT", "0") == "1"
+    continuing = os.environ.get("COLI_CONTINUE_ASSISTANT", "1") != "0"
     last = messages[-1] if isinstance(messages, list) and messages else None
     if not (isinstance(last, dict) and last.get("role") == "assistant"):
         return True
     where = f"messages.{len(messages) - 1}"
     if not continuing:
         return True
-    if ARCH != "glm53":
-        raise APIError(400, f"COLI_CONTINUE_ASSISTANT is on, but continuing an assistant "
-                       f"turn is implemented for the glm53 engine only, not {ARCH!r}: every "
-                       f"family needs its own open-turn shape derived from its own template.",
-                       "messages", "unsupported_parameter")
+    if ARCH not in CONTINUATION_FAMILIES:
+        return True   # open-turn shape not derived for this family yet -- render as before
     if body.get("tools") or body.get("functions"):
         raise APIError(400, "A continued assistant turn cannot be combined with `tools`: "
                        "the tool-call parsers read an assistant turn from its start, and a "
@@ -2019,12 +2027,12 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
                          tool_choice=None, audio_out=None, add_generation_prompt=True):
     """Render a chat request with the active engine's native prompt contract.
 
-    `add_generation_prompt=False` (a continued assistant turn) is implemented for glm53 only.
-    resolve_generation_prompt() refuses it for every other family upstream; the assert
-    here is the backstop, because silently appending a cue to a continuation is the exact
-    failure this change exists to remove.
+    `add_generation_prompt=False` (a continued assistant turn) is implemented for the families
+    in CONTINUATION_FAMILIES. resolve_generation_prompt() passes any other family through with
+    the cue appended, so it never reaches here with the flag False; this stays as the backstop,
+    because silently appending a cue to a continuation is the exact failure this exists to remove.
     """
-    if not add_generation_prompt and ARCH != "glm53":
+    if not add_generation_prompt and ARCH not in CONTINUATION_FAMILIES:
         raise APIError(400, f"Continuing an assistant turn is not implemented for {ARCH!r}.",
                        "messages", "unsupported_parameter")
     if ARCH == "inkling":

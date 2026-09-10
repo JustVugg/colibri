@@ -28,18 +28,20 @@ completion requests support JSON responses, SSE streaming, usage counts,
 custom `stop` sequences. Stop sequences are removed from the response and end
 generation early in both JSON and streaming modes.
 
-The server-side switch `COLI_CONTINUE_ASSISTANT=1` makes a trailing `assistant`
-message *continue* that turn instead of starting a new one: the prompt ends
-inside it, which is the official template rendered with
-`add_generation_prompt=False`. There is no request field for this — a trailing
-assistant turn already says "continue me", and a body extension would only be
-reachable by hand-written JSON rather than from the clients that want it.
-Implemented for the `glm53` engine only (every family needs an open-turn shape
-derived from its own template) and refused together with `tools`, because the
-tool-call parsers read an assistant turn from its start. The continuation must
-carry text and must not end with whitespace: the template strips trailing
-whitespace, so the model would resume from different bytes than the ones sent.
-Off by default, and off means exactly today's behaviour.
+A trailing `assistant` message *continues* that turn instead of starting a new
+one: the prompt ends inside it, which is the official template rendered with
+`add_generation_prompt=False`. This is on by default — a message list ending in a
+non-empty `assistant` turn continues, the same contract as Anthropic's API — and
+there is no request field for it, because a trailing assistant turn already says
+"continue me" and a body extension would only be reachable by hand-written JSON
+rather than from the clients that want it. The server-side switch
+`COLI_CONTINUE_ASSISTANT=0` restores the old behaviour (fold the turn into a
+completed one and append a fresh cue). Continuation is refused together with
+`tools`/`tool_calls`, because the tool-call parsers read an assistant turn from
+its start, and the turn must carry text not ending in whitespace: the template
+strips trailing whitespace, so the model would resume from different bytes than
+the ones sent. A family whose renderer has no open-turn shape yet — Kimi K3,
+whose turn is framed engine-side — falls through to the old behaviour.
 
 A continuation resumes from the exact bytes you send, which makes the split
 point part of the prompt. Splitting mid-word puts the model at a token boundary
@@ -163,9 +165,13 @@ Not supported, and refused explicitly rather than ignored: `stop_sequences`,
 features that have not been wired to this protocol are likewise rejected with
 an explicit error.
 
-A trailing `assistant` message keeps this endpoint's existing behavior while
-`COLI_CONTINUE_ASSISTANT` is off. With the switch on, both the Anthropic- and
-OpenAI-compatible endpoints continue that turn on `glm53`.
+A trailing `assistant` message continues that turn by default on both the
+Anthropic- and OpenAI-compatible endpoints (`COLI_CONTINUE_ASSISTANT=0` restores
+the old behavior, where this endpoint appended a fresh cue). Note this changes
+what an existing Anthropic client sees on `/v1/messages`: a trailing assistant
+turn now continues rather than starting fresh — which is the real Anthropic
+contract — and the off-switch is the escape hatch for anyone relying on the old
+behavior.
 
 > The prefill warning below applies here too, and applies *hardest* to Claude Code:
 > its system prompt and tool catalog are large, and on a disk-streaming CPU path
