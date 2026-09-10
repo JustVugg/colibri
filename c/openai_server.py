@@ -1742,6 +1742,57 @@ def expand_glm53_images(messages, model_dir):
     return rewritten, images
 
 
+# DeepSeek V4.1's image placeholder: every position of an image span carries the same
+# id, and what each one MEANS follows from the aligner grid (image_processor.py
+# image_token_types): start, then one newline per row of image tokens, then end. The
+# engine rebuilds that layout from the grid it gets in the IMAGE frame, so the gateway
+# only has to insert the right NUMBER of placeholders -- and getting that number wrong
+# is the one failure the engine cannot paper over, which is why it refuses instead.
+DSV41_IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
+
+
+def expand_dsv41_images(messages, model_dir, max_tokens=None):
+    """Replace image parts with their placeholder span and pull out the patches."""
+    images, rewritten = [], []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            rewritten.append(message)
+            continue
+        pieces = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "text":
+                pieces.append(part.get("text", ""))
+            elif kind in ("image_url", "input_image"):
+                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
+                      else part.get("image_url") or part.get("url")
+                data = _image_bytes_from_url(url)
+                patches, grid_h, grid_w, llm_h, llm_w = _preprocess_dsv41_image(
+                    data, model_dir, max_tokens)
+                span = 1 + (llm_w + 1) * llm_h + 1
+                images.append((patches, grid_h, grid_w))
+                pieces.append(DSV41_IMAGE_PLACEHOLDER * span)
+            else:
+                raise APIError(400, f"unsupported content part {kind!r}.", "messages")
+        rewritten.append({**message, "content": "".join(pieces)})
+    return rewritten, images
+
+
+def _preprocess_dsv41_image(data, model_dir, max_tokens=None):
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
+        from dsv41_image import preprocess
+    except ImportError as problem:
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+                       "messages")
+    return preprocess(data, model_dir, max_tokens)
+
+
 def _preprocess_image(data, model_dir):
     """L'immagine nelle patch che la torre vuole. Il lavoro sta in
     tools/glm53_image.py, verificato contro il processore ufficiale."""
@@ -1919,6 +1970,79 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     return "".join(prompt)
 
 
+# ---- DeepSeek V4.1 Flash -----------------------------------------------------------------
+# The checkpoint ships its chat format as a Python module (encoding/encoding.py), not a
+# jinja template, so this is that module's render_message transcribed for the shapes the
+# gateway sends. Its pieces, with the vendor's own names:
+#
+#   <｜begin▁of▁sentence｜>  once, at the head of a fresh conversation
+#   <｜System｜>             leads the conversation when there is a system message or a
+#                           reasoning-effort line; also precedes a mid-conversation one
+#   Reasoning Effort: N     index 0 only, thinking mode only, N in 1..100
+#   <｜User｜> / <｜Assistant｜>
+#   <think> or </think>     the generation cue: open in thinking mode, closed otherwise
+#   assistant turns end with <｜end▁of▁sentence｜>
+DSV41_BOS = "<｜begin▁of▁sentence｜>"
+DSV41_EOS = "<｜end▁of▁sentence｜>"
+DSV41_SYSTEM = "<｜System｜>"
+DSV41_USER = "<｜User｜>"
+DSV41_ASSISTANT = "<｜Assistant｜>"
+# encoding.py REASONING_EFFORT_MAPPINGS; the default there is "high"
+DSV41_EFFORT = {"minimal": 50, "low": 50, "medium": 75, "high": 75, "xhigh": 100}
+
+
+def render_chat_dsv41(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                      tool_choice=None):
+    """encoding.py _encode_messages_text for one turn.
+
+    `tools` and `tool_choice` are accepted and refused rather than ignored: V4.1 declares
+    tools inside the system message as a DSML block, and half-rendering that would produce
+    a model that announces tools it cannot be told the results of.
+    """
+    if tools or (isinstance(tool_choice, dict) and tool_choice):
+        raise APIError(400, "DeepSeek V4.1 tool calling is not wired in this build; send "
+                            "the request without `tools`.", "tools")
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    budget = DSV41_EFFORT.get(reasoning_effort or "high", 75)
+    prompt = [DSV41_BOS]
+    last_user = -1
+    for index, message in enumerate(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            last_user = index
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role == "developer":
+            role = "system"
+        if role not in ("system", "user", "assistant"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        content = content_text(message.get("content"), f"messages.{index}.content")
+        if role == "system":
+            prompt.append(DSV41_SYSTEM)
+            if index == 0 and enable_thinking:
+                prompt.append(f"Reasoning Effort: {budget} (range 1-100, the higher the "
+                              f"value, the more thorough the reasoning)\n\n")
+            prompt.append(content)
+        elif role == "user":
+            if index == 0 and enable_thinking:
+                prompt.append(DSV41_SYSTEM)
+                prompt.append(f"Reasoning Effort: {budget} (range 1-100, the higher the "
+                              f"value, the more thorough the reasoning)\n\n")
+            prompt.append(DSV41_USER + content)
+        else:
+            reasoning = message.get("reasoning_content")
+            opened = ""
+            if isinstance(reasoning, str) and reasoning:
+                opened = f"<think>{reasoning}</think>"
+            prompt.append(DSV41_ASSISTANT + opened + content + DSV41_EOS)
+    # the generation cue, exactly as render_message appends it after a user turn
+    prompt.append(DSV41_ASSISTANT)
+    prompt.append("<think>" if enable_thinking and len(messages) - 1 >= last_user else "</think>")
+    return "".join(prompt)
+
+
 def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                          tool_choice=None, audio_out=None):
     """Render a chat request with the active engine's native prompt contract."""
@@ -1930,6 +2054,7 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
                 render_chat_qwen if ARCH == "qwen36" else
                 render_chat_qwen38 if ARCH == "qwen38" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
+                render_chat_dsv41 if ARCH == "deepseek_v41" else
                 render_chat_olmoe if ARCH == "olmoe" else render_chat)
     return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
 
@@ -3931,6 +4056,15 @@ class APIHandler(BaseHTTPRequestHandler):
         if ARCH == "glm53":
             messages, images = expand_glm53_images(
                 messages, getattr(self.server.engine, "model_dir", None))
+            if len(images) > 1:
+                raise APIError(400, "one image per request for now; the engine "
+                                    "holds a single pending image.", "messages")
+            image = images[0] if images else None
+        elif ARCH == "deepseek_v41":
+            ceiling = os.environ.get("V41_MAX_IMAGE_TOKENS")
+            messages, images = expand_dsv41_images(
+                messages, getattr(self.server.engine, "model_dir", None),
+                int(ceiling) if ceiling else None)
             if len(images) > 1:
                 raise APIError(400, "one image per request for now; the engine "
                                     "holds a single pending image.", "messages")

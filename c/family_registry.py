@@ -689,6 +689,58 @@ def _dsv4_geometry(config, context, _model_dir):
     return PlannerGeometry(state, fixed, workspace, experts)
 
 
+def _dsv41_geometry(config, context, _model_dir):
+    """DeepSeek V4.1 Flash: window ring, compressed KV and index keys, engram rows.
+
+    What the engine keeps resident per layer (deepseek_v41.c model_load):
+
+        window ring   n_layers * window_size * head_dim * 4      (fixed)
+        compressed KV ceil(context / ratio) * head_dim * 4       (per kv source)
+        index keys    ceil(context / ratio) * index_head_dim * 4 (per kv source)
+
+    The engram tables are NOT in here on purpose: 203 GB of the released
+    checkpoint is n-gram memory read row by row from disk (264 bytes per row,
+    at most (max_ngram - 1) * n_heads rows per layer per token), with a small
+    LRU whose size is a runtime knob rather than a function of the context.
+    Counting them as resident would tell a user with 128 GB that this model
+    cannot be served, which is the opposite of true.
+
+    Workspace mirrors forward()'s per-chunk buffers: hc_mult residual copies
+    plus the sublayer scratch, at batch == context.
+    """
+    section = config.get("text_config", config)
+    layers = _required_int(section, "num_hidden_layers", "deepseek_v41")
+    experts = _required_int(section, "n_routed_experts", "deepseek_v41")
+    hidden = _required_int(section, "hidden_size", "deepseek_v41")
+    head_dim = _required_int(section, "head_dim", "deepseek_v41")
+    window = _required_int(section, "sliding_window", "deepseek_v41") \
+        if "sliding_window" in section else _required_int(section, "window_size", "deepseek_v41")
+    index_hd = _required_int(section, "index_head_dim", "deepseek_v41")
+    hc_mult = _required_int(section, "hc_mult", "deepseek_v41")
+
+    ratios = section.get("compress_ratios")
+    if not isinstance(ratios, list) or len(ratios) < layers:
+        raise ValueError("deepseek_v41: compress_ratios must be a list of at least "
+                         "num_hidden_layers entries")
+    sources = section.get("kv_source_layer_ids") or section.get("kv_source_layers") or []
+    if not isinstance(sources, list):
+        raise ValueError("deepseek_v41: kv_source_layer_ids must be a list")
+
+    fixed = layers * window * head_dim * 4
+    state = 0
+    for layer in sources:
+        if not isinstance(layer, int) or isinstance(layer, bool) or not 0 <= layer < layers:
+            raise ValueError("deepseek_v41: kv_source_layer_ids entries must index a layer")
+        ratio = ratios[layer]
+        if not isinstance(ratio, int) or isinstance(ratio, bool) or ratio < 1:
+            raise ValueError("deepseek_v41: a kv source layer must compress")
+        compressed = (context + ratio - 1) // ratio
+        state += compressed * (head_dim + index_hd) * 4
+
+    workspace = (context * hc_mult * hidden * 2 + context * hidden * 2 + hidden) * 4
+    return PlannerGeometry(state, fixed, workspace, experts)
+
+
 _GLM_EXPERT = re.compile(
     r"(?:^|\.)model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
 )
@@ -1194,6 +1246,33 @@ FAMILIES = (
         config_section="root",
         limits=FamilyLimits(4096, 1048576, 1024, 16384, 1, 8, "CTX"),
         capabilities=FamilyCapabilities(True, False, False, True),
+        has_gateway_adapter=True,
+        has_cli_adapter=True,
+    ),
+    FamilyDescriptor(
+        id="deepseek_v41",
+        model_types=("deepseek_v41", "deepseek_v41_text"),
+        display_name="DeepSeek V4.1 Flash",
+        display_scale="552B",
+        # deepseek-ai/DeepSeek-V4.1-Flash: 40 layers, 384 experts, top-6, plus
+        # two 384M-row engram tables that never enter RAM.
+        reference_experts=384,
+        engine_artifact="deepseek_v41",
+        engine_aliases=(),
+        engine_group="deepseek_v41",
+        internal_arch="deepseek_v41",
+        build_target="deepseek_v41",
+        process_names=("deepseek_v41",),
+        default_model_id="deepseek-v4.1-flash-colibri",
+        cli_adapter="deepseek_v41",
+        gateway_adapter="deepseek_v41",
+        planner_id="deepseek_v41",
+        planner_geometry=_dsv41_geometry,
+        planner_unsupported_reason="",
+        expert_inventory=_individual_expert_inventory(_V4_EXPERT),
+        config_section="text_config",
+        limits=FamilyLimits(4096, 1048576, 1024, 16384, 1, 8, "CTX"),
+        capabilities=FamilyCapabilities(True, True, False, True),
         has_gateway_adapter=True,
         has_cli_adapter=True,
     ),

@@ -226,7 +226,7 @@ jobs:
         run: |
           cd c
           rc=0
-          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38"
+          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41"
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
           for t in $ENGINES; do
             echo "::group::$t"
@@ -561,6 +561,62 @@ jobs:
         run: |
           cd c
           OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_dashboard_hits
+
+  dsv41-tiny-check:
+    name: DeepSeek V4.1 tiny oracle (engram + DSA + fp4 experts + vision)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + sympy
+        run: |
+          pip install -r c/tools/oracle-requirements.txt
+          pip install sympy
+      - name: Tiny V4.1-shaped container and its reference
+        run: |
+          cd c
+          # The same tensor names, dtypes and block-scale conventions as the released
+          # checkpoint at toy dimensions, so the engine reads the real format: fp8 dense
+          # with 32x32 ue8m0 tiles, fp4 experts with per-32 group scales, an fp8 engram
+          # table read row by row, and a vision tower.
+          python3 tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json
+      - name: Token-exact against the reference, at several cache capacities
+        run: |
+          cd c
+          make deepseek_v41
+          # cap=1 evicts on every routed expert, which is where slot bookkeeping breaks;
+          # cap=8 never would. The engine exits non-zero on any token mismatch, and on a
+          # vision tower that drifts from its reference rows.
+          for cap in 1 2 8; do
+            echo "::group::cap=$cap"
+            SNAP=dsv41_tiny ./deepseek_v41 "$cap" dsv41_tiny/ref.json
+            echo "::endgroup::"
+          done
+      - name: The published index cache is the vendor's, not the tidy one
+        run: |
+          cd c
+          # model.py republishes shared_attn.index_k only when a layer completes a
+          # compression group, so a decode step with an incomplete group scores against
+          # whichever cache was published last. That is the released behaviour and every
+          # number for this model was produced with it; V41_INDEX_OWNER=1 is the reading
+          # the architecture implies, and it is a DIFFERENT model. Assert they differ, so
+          # nobody "fixes" the default by accident.
+          if SNAP=dsv41_tiny V41_INDEX_OWNER=1 ./deepseek_v41 8 dsv41_tiny/ref.json > /dev/null 2>&1; then
+            echo "FAIL: V41_INDEX_OWNER=1 reproduced the vendor's tokens; one of the two"
+            echo "      paths is not doing what its comment says"
+            exit 1
+          fi
+          echo "the two index-key policies differ, as documented"
+      - name: "Brain tab: EMAP after READY and STAT, HITS after every turn"
+        run: |
+          cd c
+          # the oracle fixture ships no tokenizer; serve mode needs one to encode
+          python3 tools/make_edge_tiny_tokenizer.py --vocab-size 256 dsv41_tiny
+          COLI_DSV41_FIXTURE=dsv41_tiny python3 -m unittest -v tests.test_dsv41_dashboard
 
   qwen38-tiny-check:
     name: Qwen3.8 tiny oracle (GDN + QSA + PLE + MoE)
