@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 from pathlib import Path
 
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
+                           CONTINUATION_FAMILIES,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, _image_bytes_from_url, cap_for_arch, conversation_cache_slot, model_arch,
@@ -2083,6 +2084,40 @@ class TrailingAssistantTurnTest(unittest.TestCase):
             self.assertEqual(normal, cont + END + cue)
             self.assertTrue(cont.endswith("La capitale e'"), cont[-40:])
             self.assertFalse(cont.endswith("<|end_message|>"))
+
+    def test_only_the_final_assistant_turn_is_opened(self):
+        """Across every continuation family: only the TRAILING assistant turn is opened, and
+        each earlier turn renders exactly as it does in a completed conversation. The
+        single-turn fixtures elsewhere cannot see this -- their assistant turn is trivially
+        last -- but the terminator is dropped by a per-family `index == last` check, written
+        out by hand in each renderer; a family that lost that check would open every assistant
+        turn, and nothing else in the suite would notice.
+
+        Family-agnostic on purpose, because the open-turn SHAPE is not uniform: qwen36 injects
+        an empty <think></think>, GLM carries no per-turn terminator at all, ChatML drops an
+        <|im_end|>. What IS uniform is that the completed render (a fresh generation cue
+        appended) and the open render share their entire prefix up to the final turn -- so the
+        SECOND user turn must survive into their common prefix. If the first assistant turn
+        lost its terminator in the open render, that prefix would break right after it, before
+        this text. Checked in both thinking modes; the set drives the loop so a newly added
+        family is covered the day it joins."""
+        multi = [{"role": "user", "content": "1+1?"},
+                 {"role": "assistant", "content": "2"},
+                 {"role": "user", "content": "capitale della Francia?"},
+                 {"role": "assistant", "content": "La capitale e'"}]
+        for arch in sorted(CONTINUATION_FAMILIES):
+            for enable_thinking in (True, False):
+                where = (arch, enable_thinking)
+                with patch("openai_server.ARCH", arch):
+                    completed = render_chat_for_arch(multi, enable_thinking=enable_thinking)
+                    opened = render_chat_for_arch(multi, enable_thinking=enable_thinking,
+                                                  add_generation_prompt=False)
+                common = os.path.commonprefix([opened, completed])
+                # the prior assistant turn (and its terminator) rendered identically: the turn
+                # AFTER it survives into the shared prefix
+                self.assertIn("capitale della Francia?", common, where)
+                # and only the last turn is open -- the prompt ends on the client's opening
+                self.assertTrue(opened.endswith("La capitale e'"), (where, opened[-40:]))
 
     def test_splitter_starts_in_content_mode_on_a_continued_turn(self):
         """Measured on glm53 int4, CPU: content '' with reasoning_chars 10 and 109,
