@@ -1038,12 +1038,16 @@ def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, too
 
 
 def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                   tool_choice=None):
+                   tool_choice=None, add_generation_prompt=True):
     """DeepSeek V4's native multi-turn chat template.
 
     The target engine receives this as a raw prompt. Prior assistant turns end
     with the checkpoint's EOS marker; the final assistant marker selects the
     thinking or direct-answer prefix for the new turn.
+
+    add_generation_prompt=False continues a trailing assistant turn: the last assistant turn
+    is rendered open, i.e. without its closing EOS and with no cue, the position the model
+    occupies mid-turn. EOS is the terminator to drop here, as <|im_end|> is for ChatML.
 
     Tool use follows the official DSML format (encoding/encoding_dsv4.py): tool
     schemas are declared on the first system/developer message, assistant tool
@@ -1119,7 +1123,7 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
         effort = DSV4_REASONING_EFFORT.get(reasoning_effort, "low")
         if effort != "low":
             parts.append(DSV4_REASONING_EFFORT_PROMPTS[effort])
-    for message in merged:
+    for m_index, message in enumerate(merged):
         role = message["role"]
         if role in ("system", "developer"):
             if role == "developer":
@@ -1141,8 +1145,11 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
             parts.append(message["content"])
             if message.get("tool_calls"):
                 parts.append(_dsv4_tool_calls(message["tool_calls"]))
-            parts.append(eos)
-    parts.extend((assistant, "<think>" if enable_thinking else "</think>"))
+            # A continued turn is the last message rendered open: no EOS, no cue below.
+            if add_generation_prompt or m_index != len(merged) - 1:
+                parts.append(eos)
+    if add_generation_prompt:
+        parts.extend((assistant, "<think>" if enable_thinking else "</think>"))
     return "".join(parts)
 
 
@@ -1993,7 +2000,7 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
 # (the cue is appended, exactly as before this existed) rather than erroring -- continuation is
 # on by default, and a family without its open-turn shape yet must not start rejecting requests
 # nobody opted into. Each renderer adds itself here in the same commit that derives its shape.
-CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36", "glm", "olmoe"}
+CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36", "glm", "olmoe", "deepseek_v4"}
 
 
 def resolve_generation_prompt(messages, body):
@@ -2093,8 +2100,10 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if ARCH == "olmoe":
         return render_chat_olmoe(messages, enable_thinking, reasoning_effort, tools,
                                  tool_choice, add_generation_prompt)
-    renderer = (render_chat_kimi if ARCH == "kimi" else
-                render_chat_v4 if ARCH == "deepseek_v4" else render_chat)
+    if ARCH == "deepseek_v4":
+        return render_chat_v4(messages, enable_thinking, reasoning_effort, tools,
+                              tool_choice, add_generation_prompt)
+    renderer = (render_chat_kimi if ARCH == "kimi" else render_chat)
     return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
 
 

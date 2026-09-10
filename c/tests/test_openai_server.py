@@ -21,7 +21,8 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            _engine_error, _image_bytes_from_url, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
                            parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
-                           read_engine_turn, render_chat, render_chat_glm53, render_chat_kimi,
+                           read_engine_turn, render_chat, render_chat_for_arch,
+                           render_chat_glm53, render_chat_kimi,
                            render_chat_olmoe,
                            render_chat_qwen38, render_chat_v4, _dsv4_tool_calls, serve,
                            resolve_generation_prompt, split_thinking_reply,
@@ -2023,9 +2024,38 @@ class TrailingAssistantTurnTest(unittest.TestCase):
         yet must render as before -- append the cue -- not reject a request nobody opted into.
         Each family leaves this list in the commit that derives its shape; Kimi K3 (framed
         engine-side, so its open turn is a change in kimi_k3.c) is the standing case."""
-        for arch in ("deepseek_v4", "kimi", "inkling"):
+        for arch in ("kimi", "inkling"):
             with self.on(), patch("openai_server.ARCH", arch):
                 self.assertTrue(resolve_generation_prompt(self.OPEN_TURN, {}))
+
+    def test_continuation_open_turn_deepseek_v4(self):
+        """deepseek_v4 has no authoritative vendored jinja template to diff against:
+        render_chat_v4 is pinned to the official encoding_dsv4.py, and the community
+        reap-150b template on the Hub diverges on the reasoning-block convention (a bare
+        </think> for a direct answer vs <think></think>). So this is the expected-string
+        pin the maintainer allows for such families -- the open turn is pinned to a literal
+        here, with the past-turn-minus-EOS invariant kept as an added check, in both
+        thinking modes."""
+        EOS = "<｜end▁of▁sentence｜>"
+        ASSISTANT = "<｜Assistant｜>"
+        # The literal open turn, written out so the test does not lean on another renderer
+        # call for its only expected value -- a bug that corrupts render_chat_v4 and the
+        # continuation path identically would slip past the comparison below but not this.
+        # Identical in both thinking modes: the open turn is the shape of the PAST turn,
+        # which carries no generation cue for enable_thinking to steer.
+        EXPECTED_OPEN = ("<｜begin▁of▁sentence｜><｜User｜>capitale della Francia?"
+                         "<｜Assistant｜></think>La capitale e'")
+        for enable_thinking in (True, False):
+            cue = ASSISTANT + ("<think>" if enable_thinking else "</think>")
+            with patch("openai_server.ARCH", "deepseek_v4"):
+                normal = render_chat_v4(self.OPEN_TURN, enable_thinking=enable_thinking)
+                cont = render_chat_for_arch(self.OPEN_TURN, enable_thinking=enable_thinking,
+                                            add_generation_prompt=False)
+            self.assertEqual(cont, EXPECTED_OPEN)
+            # and the invariant tying it to the normal render: past turn without its EOS + cue
+            self.assertEqual(normal, cont + EOS + cue)
+            self.assertTrue(cont.endswith("La capitale e'"), cont[-40:])
+            self.assertFalse(cont.endswith(EOS))
 
     def test_splitter_starts_in_content_mode_on_a_continued_turn(self):
         """Measured on glm53 int4, CPU: content '' with reasoning_chars 10 and 109,
