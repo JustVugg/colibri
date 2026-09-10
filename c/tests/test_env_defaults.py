@@ -203,8 +203,33 @@ class CudaAutoEnableTest(unittest.TestCase):
         # so it must be present and positive — never a guess or zero.
         self.assertIn("CUDA_EXPERT_GB", e)
         self.assertGreater(float(e["CUDA_EXPERT_GB"]), 0.0)
-        # Dense offload is an explicit opt-in (matches --auto-tier): not set here.
+        # No dense size in this plan: dense placement is not decided here.
         self.assertNotIn("CUDA_DENSE", e)
+
+    def test_win32_puts_the_dense_trunk_on_a_card_that_holds_it(self):
+        """#1409: a 5090 (30.7 GB tier) with a 12.5 GB dense trunk ran the trunk
+        on the CPU because the auto path never set CUDA_DENSE. When the plan says
+        the trunk fits with room for experts, it goes on the card and its bytes
+        leave the expert budget, or the lazy dense uploads fail against a full
+        tier (#687)."""
+        GPB = 1024 ** 3
+        gpus = [self._fake_gpu(name="NVIDIA GeForce RTX 5090", total_mib=34000, free_mib=33000)]
+        plan = {"tiers": {"ram": {"budget_bytes": 120 * GPB, "cache_slots_per_layer": 62,
+                                  "dense_bytes": int(12.5 * GPB)},
+                          "vram": {"budget_bytes": int(30.7 * GPB), "devices": gpus}}}
+        e = self._env_for("win32", cuda=True, gpus=gpus, plan=plan)
+        self.assertEqual(e["CUDA_DENSE"], "1")
+        self.assertAlmostEqual(float(e["CUDA_EXPERT_GB"]), 30.7 - 12.5, places=2)
+
+    def test_win32_keeps_the_dense_trunk_on_cpu_when_the_card_is_too_small(self):
+        GPB = 1024 ** 3
+        gpus = [self._fake_gpu(total_mib=16384, free_mib=15000)]
+        plan = {"tiers": {"ram": {"budget_bytes": 64 * GPB, "cache_slots_per_layer": 8,
+                                  "dense_bytes": int(12.5 * GPB)},
+                          "vram": {"budget_bytes": int(13.0 * GPB), "devices": gpus}}}
+        e = self._env_for("win32", cuda=True, gpus=gpus, plan=plan)
+        self.assertNotIn("CUDA_DENSE", e)          # 0.5 GB left for experts: not worth it
+        self.assertAlmostEqual(float(e["CUDA_EXPERT_GB"]), 13.0, places=2)
 
     def test_win32_falls_back_to_cpu_when_nvidia_smi_missing(self):
         # coli_cuda.dll present (cuda=True) but nvidia-smi absent (no GPUs found)
