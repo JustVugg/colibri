@@ -75,6 +75,7 @@
 static int g_vk_ready = 0;
 #endif
 #include "compat.h"
+#include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
 #include <time.h>
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -2462,30 +2463,105 @@ static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
     return 1;
 }
 
-/* Genera per una richiesta e chiude col suo DONE. */
-static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
-    if (!q->plen) { serve_line("ERROR %llu EMPTY_PROMPT\n", q->id); return; }
+/* Cosa ha chiesto il gateway mentre il turno girava: niente, un abort del
+ * client, o uno stop del template. Vedi serve_cancel_pending per il perche'
+ * CANCEL e STOP non possono condividere un esito. */
+enum { SERVE_CTL_NONE = 0, SERVE_CTL_CANCEL = 1, SERVE_CTL_STOP = 2 };
+
+/* Un CANCEL per la richiesta in corso, visto SENZA bloccarsi (#1332).
+ *
+ * Prima serve_read_req era l'unico posto che leggeva un CANCEL, e serve_loop
+ * la chiama solo fra una richiesta e l'altra: quando il comando arrivava, il
+ * turno che doveva fermare era gia' finito, e la riga qui sotto lo diceva pure
+ * ("un CANCEL arriva sempre per una che non e' piu' in volo"). Il gateway
+ * intanto manda CANCEL e aspetta l'ack tenendo l'ammissione dello scheduler,
+ * quindi un client che si disconnette non libera niente: si aspetta comunque la
+ * fine del turno, e le richieste successive restano in coda dietro a una
+ * generazione che nessuno vuole piu'. Su un n_new lungo o su un modello che
+ * entra in loop di ripetizione non restava che uccidere il processo.
+ *
+ * Ritorna cosa ha chiesto il gateway: SERVE_CTL_NONE, SERVE_CTL_CANCEL, o
+ * SERVE_CTL_STOP. Si legge il frame intero con serve_read_req, non una riga: il
+ * SUBMIT porta il payload a byte contati, e consumarne solo l'header
+ * lascerebbe i byte del prompt nello stream, disallineando tutto quello che
+ * segue.
+ *
+ * CANCEL e STOP NON sono la stessa cosa e non possono finire nello stesso
+ * posto. CANCEL e' un client che se n'e' andato: si aborta e si risponde
+ * ERROR <id> CANCELLED. STOP e' un template di stop che ha combaciato -- la
+ * risposta e' completa e va consegnata -- e il protocollo dice testualmente
+ * "STOP ends generation through the normal successful DONE path. Statistics,
+ * usage history, and KV state are persisted". Il gateway la aspetta: dopo aver
+ * mandato STOP consuma i frame fino al DONE e lo tratta come riuscito
+ * (openai_server.py alza ClientCancelled solo se aveva mandato CANCEL). Se
+ * arrivano tutti e due nello stesso giro vince il CANCEL: il client non c'e'
+ * piu' e il DONE non lo consegnerebbe a nessuno.
+ *
+ * Un SUBMIT non puo' legalmente arrivare mentre lo slot e' occupato -- il
+ * gateway serve una richiesta per volta e aspetta il DONE -- ma se arriva non
+ * lo si tiene in coda: si risponde SLOT_BUSY, il codice che il protocollo
+ * documenta e che colibri.c usa sul suo mux, cosi' il thread del gateway
+ * fallisce subito invece di aspettare una pipa che nessuno legge. IMAGE resta
+ * in g_pending per il SUBMIT che lo nomina.
+ *
+ * Un CANCEL per un id che non conosciamo risponde NOT_FOUND, che e' il codice
+ * che il protocollo gli da'. Uno STOP per un id che non conosciamo si ignora,
+ * come fa gia' serve_loop: li' non c'e' niente da consegnare e nessuno che
+ * aspetti.
+ *
+ * Non legge MAI se stdin non e' pronto: una fgets bloccante qui fermerebbe la
+ * generazione in attesa di un comando che potrebbe non arrivare mai -- un
+ * guasto peggiore di quello che questa funzione cura. */
+static int serve_cancel_pending(unsigned long long id, int *input_eof) {
+    int cancelled = 0, stopped = 0;
+    while (coli_serve_stdin_ready()) {
+        ServeReq n; char verb[16];
+        if (!serve_read_req(&n, verb, sizeof(verb))) { *input_eof = 1; break; }
+        if (!strcmp(verb, "CANCEL")) {
+            if (n.id == id) cancelled = 1;
+            else serve_line("ERROR %llu NOT_FOUND\n", n.id);
+        } else if (!strcmp(verb, "STOP")) {
+            if (n.id == id) stopped = 1;
+        } else if (!strcmp(verb, "SUBMIT")) {
+            serve_line("ERROR %llu SLOT_BUSY\n", n.id);
+            free(n.payload);
+        } else if (!strcmp(verb, "BAD_FRAME")) {
+            serve_line("ERROR %llu BAD_FRAME\n", n.id);
+        }
+        /* IMAGE non risponde niente, come nel ciclo principale. */
+    }
+    if (cancelled) return SERVE_CTL_CANCEL;
+    return stopped ? SERVE_CTL_STOP : SERVE_CTL_NONE;
+}
+
+/* Genera per una richiesta e chiude col suo DONE.
+ *
+ * Ritorna -1 se stdin ha raggiunto EOF durante il turno, 0 altrimenti: il turno
+ * e' comunque finito e il suo DONE e' gia' partito, ma serve_loop deve sapere
+ * che dopo non c'e' piu' un gateway a cui rispondere e puo' uscire. */
+static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
+    if (!q->plen) { serve_line("ERROR %llu EMPTY_PROMPT\n", q->id); return 0; }
     g_temp = q->temp; g_topp = q->top_p > 0.0f ? q->top_p : 1.0f;
 
     if (q->slot < 0 || q->slot >= g_n_slots) {
         serve_line("ERROR %llu BAD_REQUEST\n", q->id);
-        return;
+        return 0;
     }
     KVSlot *slot = &g_slots[q->slot];
     const int room = g_slot_context;
     int *sequence = malloc((size_t)room * sizeof(int));
-    if (!sequence) { serve_line("ERROR %llu BAD_REQUEST\n", q->id); return; }
+    if (!sequence) { serve_line("ERROR %llu BAD_REQUEST\n", q->id); return 0; }
     int total = tok_encode(tokenizer, q->payload, q->plen, sequence, room);
     const int prompt_tokens = total;
     if (!total) {
         free(sequence);
         serve_line("ERROR %llu EMPTY_PROMPT\n", q->id);
-        return;
+        return 0;
     }
     if (total >= room) {
         free(sequence);
         serve_line("ERROR %llu BAD_REQUEST\n", q->id);
-        return;
+        return 0;
     }
 
     const double started = now_s();
@@ -2528,7 +2604,7 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
             pending_clear();
             free(sequence);
             serve_line("ERROR %llu BAD_REQUEST\n", q->id);
-            return;
+            return 0;
         }
         if (shared) {                             /* niente riuso con un'immagine */
             slot_reset(m, slot);
@@ -2544,8 +2620,23 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     float *logits = forward_prefill(m, slot->session, sequence + shared,
                                     total - shared, vision, n_vision, 0);
     GSession *session = slot->session;
-    int rows = 1;
+    int rows = 1, ctl = SERVE_CTL_NONE, input_eof = 0;
     for (int step = 0; step < budget; step++) {
+        /* #1332: una guardata a stdin per token. Il costo e' una select con
+         * timeout zero; il guadagno e' che il gateway smette di aspettare un
+         * turno che nessuno vuole piu'. In cima al ciclo, non in fondo: qui la
+         * sessione ha macinato esattamente `total` token, quindi la storia che
+         * slot_remember scrive sotto combacia con quello che la cache contiene
+         * davvero (`filled`). */
+        /* EOF NON chiude il turno: "EOF on stdin = graceful shutdown: in-flight
+         * requests finish first". Serviva solo a smettere di leggere, quindi da
+         * li' in poi non si legge piu': con la pipa chiusa
+         * coli_serve_stdin_ready resterebbe pronto per sempre, e ogni token
+         * pagherebbe una select e una fgets a vuoto. Il turno finisce qui sotto
+         * e il DONE parte lo stesso; e' serve_one a dire a serve_loop, col
+         * valore di ritorno, che dopo non c'e' piu' nessuno. */
+        if (!input_eof) ctl = serve_cancel_pending(q->id, &input_eof);
+        if (ctl != SERVE_CTL_NONE) break;
         if (total >= room) { limited = 1; break; }
         int next = sample_token(logits + (size_t)(rows - 1) * m->c.vocab, m->c.vocab);
         free(logits);
@@ -2565,6 +2656,26 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     /* La sessione resta allo slot per il turno dopo, con la sequenza che ha
      * davvero macinato: prompt piu' quello che ha generato. */
     slot_remember(slot, sequence, total);
+    /* Il turno e' stato interrotto: si risponde col frame che il gateway
+     * aspetta per rilasciare l'ammissione dello scheduler (openai_server.py
+     * accetta ERROR <id> CANCELLED oppure un DONE, ma il DONE direbbe al
+     * client che la risposta e' completa, che e' falso). Niente PROF ne'
+     * HITS: sono il ritratto di un turno che non e' finito.
+     *
+     * Lo slot resta com'e': la sessione ha macinato `total` token e la storia
+     * scritta sopra e' esattamente quella, quindi il turno dopo puo' ancora
+     * riusare il prefisso. Buttarlo costerebbe un prefill intero per punire
+     * un client che ha cambiato idea. */
+    if (ctl == SERVE_CTL_CANCEL) {
+        serve_line("ERROR %llu CANCELLED\n", q->id);
+        free(sequence);
+        return input_eof ? -1 : 0;
+    }
+    /* ctl == SERVE_CTL_STOP non esce qui: cade nel DONE qui sotto, che e' il
+     * "normal successful DONE path" del protocollo, con STAT, PROF e HITS di un
+     * turno che il client ha ricevuto per intero. `limited` resta 0 -- non e'
+     * stato il limite di token a fermarlo -- e la storia e' gia' stata scritta
+     * sopra, quindi lo slot resta quello che e'. */
     const double elapsed = now_s() - started;
     /* Quanto prefisso lo slot ha risparmiato.
      *
@@ -2592,6 +2703,7 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
                m->miss + m->hits ? 100.0 * m->hits / (double)(m->hits + m->miss) : 0.0,
                rss_gb(), prompt_tokens, limited);
     free(sequence);
+    return input_eof ? -1 : 0;
 }
 
 /* --- Dashboard: Brain e Profile ------------------------------------------
@@ -2670,19 +2782,32 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
         ServeReq q; char verb[16];
         if (!serve_read_req(&q, verb, sizeof(verb))) break;   /* EOF: si esce */
         if (!strcmp(verb, "SUBMIT")) {
-            serve_one(m, tokenizer, &q);
+            /* < 0: stdin e' finito mentre il turno girava. Il turno e' stato
+             * servito per intero (e' la regola: "in-flight requests finish
+             * first"), ma ora non c'e' piu' nessuno dall'altra parte, quindi si
+             * esce senza riprovare a leggere. */
+            int gateway_gone = serve_one(m, tokenizer, &q) < 0;
             free(q.payload);
+            if (gateway_gone) break;
         } else if (!strcmp(verb, "IMAGE")) {
             /* annunciata: nessuna risposta, la si usa al SUBMIT che segue */
         } else if (!strcmp(verb, "BAD_FRAME")) {
             serve_line("ERROR %llu BAD_FRAME\n", q.id);
         } else if (!strcmp(verb, "CANCEL")) {
-            /* Le richieste qui si servono una per volta e a fine giro, quindi
-             * un CANCEL arriva sempre per una che non e' piu' in volo. */
+            /* Un CANCEL per una richiesta in volo non arriva piu' qui: il ciclo
+             * di decode lo vede da solo, una volta per token
+             * (serve_cancel_pending, #1332). Questo ramo resta per l'id che non
+             * conosciamo -- una richiesta gia' chiusa, o mai vista -- ed e' il
+             * NOT_FOUND che il protocollo documenta. */
             serve_line("ERROR %llu NOT_FOUND\n", q.id);
         }
         /* STOP e le righe che non riconosciamo si ignorano: la regola di
-         * compatibilita' del protocollo vale in tutte e due le direzioni. */
+         * compatibilita' del protocollo vale in tutte e due le direzioni. Uno
+         * STOP per la richiesta in volo non passa di qui -- lo raccoglie il
+         * ciclo di decode, che chiude il turno col DONE normale -- e uno STOP
+         * per un id gia' chiuso non ha niente da fermare ne' nessuno che
+         * aspetti una risposta: il gateway manda STOP e poi continua a leggere
+         * fino al DONE, non si mette in attesa di un ack. */
     }
 }
 
