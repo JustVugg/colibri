@@ -1531,8 +1531,13 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
 
 
 def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                tool_choice=None):
-    """Render the text-only subset of the official GLM-5.2 chat template."""
+                tool_choice=None, add_generation_prompt=True):
+    """Render the text-only subset of the official GLM-5.2 chat template.
+
+    add_generation_prompt=False continues a trailing assistant turn. GLM has no per-turn
+    terminator (the next role token ends a turn), so the loop already renders that last message
+    as a past turn -- <|assistant|><think></think>{content} -- and suppressing the cue leaves
+    the prompt open on it, exactly as on glm53. Nothing to strip, unlike the ChatML families."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     prompt = ["[gMASK]<sop>"]
@@ -1620,8 +1625,9 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
             raise APIError(400, f"Unsupported message role: {role!r}.",
                            f"messages.{index}.role", "unsupported_role")
         prev_tool = (role == "tool")
-    prompt.append("<|assistant|><think>" if enable_thinking else
-                  "<|assistant|><think></think>")
+    if add_generation_prompt:
+        prompt.append("<|assistant|><think>" if enable_thinking else
+                      "<|assistant|><think></think>")
     return "".join(prompt)
 
 
@@ -1980,7 +1986,7 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
 # (the cue is appended, exactly as before this existed) rather than erroring -- continuation is
 # on by default, and a family without its open-turn shape yet must not start rejecting requests
 # nobody opted into. Each renderer adds itself here in the same commit that derives its shape.
-CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36"}
+CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36", "glm"}
 
 
 def resolve_generation_prompt(messages, body):
@@ -2074,6 +2080,9 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if ARCH == "qwen36":
         return render_chat_qwen(messages, enable_thinking, reasoning_effort, tools,
                                 tool_choice, add_generation_prompt)
+    if ARCH == "glm":
+        return render_chat(messages, enable_thinking, reasoning_effort, tools,
+                           tool_choice, add_generation_prompt)
     renderer = (render_chat_kimi if ARCH == "kimi" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
                 render_chat_olmoe if ARCH == "olmoe" else render_chat)
