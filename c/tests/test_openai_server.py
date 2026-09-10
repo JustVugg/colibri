@@ -2023,11 +2023,12 @@ class TrailingAssistantTurnTest(unittest.TestCase):
     def test_unimplemented_family_passes_through(self):
         """Continuation is on by default, so a family whose renderer has no open-turn shape
         yet must render as before -- append the cue -- not reject a request nobody opted into.
-        Each family leaves this list in the commit that derives its shape; Kimi K3 (framed
-        engine-side, so its open turn is a change in kimi_k3.c) is the standing case."""
-        for arch in ("kimi",):
-            with self.on(), patch("openai_server.ARCH", arch):
-                self.assertTrue(resolve_generation_prompt(self.OPEN_TURN, {}))
+        Every shipped family is now in CONTINUATION_FAMILIES (Kimi K3 too, via its C `C`
+        record), so the backstop is exercised with a hypothetical future arch: it must pass
+        through, not error, the day a new renderer lands before its open-turn shape does."""
+        self.assertNotIn("future_family", CONTINUATION_FAMILIES)
+        with self.on(), patch("openai_server.ARCH", "future_family"):
+            self.assertTrue(resolve_generation_prompt(self.OPEN_TURN, {}))
 
     def test_continuation_open_turn_deepseek_v4(self):
         """deepseek_v4 has no authoritative vendored jinja template to diff against:
@@ -2100,12 +2101,18 @@ class TrailingAssistantTurnTest(unittest.TestCase):
         SECOND user turn must survive into their common prefix. If the first assistant turn
         lost its terminator in the open render, that prefix would break right after it, before
         this text. Checked in both thinking modes; the set drives the loop so a newly added
-        family is covered the day it joins."""
+        family is covered the day it joins.
+
+        Kimi K3 is excluded: render_chat_for_arch returns its engine-side K3CHAT1 wire, not a
+        string prompt, so this string-level invariant doesn't apply -- its open turn is pinned
+        at the token level in tests/test_k3_chat_tools.c against the tiny tokenizer instead."""
         multi = [{"role": "user", "content": "1+1?"},
                  {"role": "assistant", "content": "2"},
                  {"role": "user", "content": "capitale della Francia?"},
                  {"role": "assistant", "content": "La capitale e'"}]
         for arch in sorted(CONTINUATION_FAMILIES):
+            if arch == "kimi":
+                continue
             for enable_thinking in (True, False):
                 where = (arch, enable_thinking)
                 with patch("openai_server.ARCH", arch):

@@ -952,12 +952,18 @@ def _k3_order_tool_results(messages):
 
 
 def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                     tool_choice=None):
+                     tool_choice=None, add_generation_prompt=True):
     """Validated multi-turn K3 payload for the C engine.
 
     K3's rank-BPE makes ordinary-text segment boundaries part of the tokenizer
     contract. This private length-framed payload preserves roles, UTF-8 bytes,
     and message boundaries; kimi_k3.c constructs the native XTML tokens.
+
+    add_generation_prompt=False continues a trailing assistant turn. Kimi frames turns
+    engine-side, so unlike the string renderers there is no terminator to drop here: the final
+    assistant turn is emitted as a `C` record (reasoning + text), which kimi_k3.c renders as
+    the open turn -- no <|close|>/<|end_of_msg|>, and no fresh generation cue. An engine that
+    predates the record rejects the payload rather than miswiring it.
     """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
@@ -1010,6 +1016,14 @@ def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, too
         if role == "assistant":
             last_calls = calls or []
             tool_index = 0
+        if not add_generation_prompt and index == len(messages) - 1:
+            # Continuation: the trailing assistant turn is left OPEN. resolve_generation_prompt
+            # has already refused tools/tool_calls and a non-assistant trailing turn, so this is
+            # a plain assistant turn; the C record carries its reasoning (if any) and text, and
+            # kimi_k3.c renders it as the open turn with no cue.
+            r = reasoning or ""
+            parts.append(f"C {len(r.encode('utf-8'))} {len(text.encode('utf-8'))}\n{r}{text}")
+            continue
         if calls:
             if len(calls) > 64:
                 raise APIError(400, "Too many tool calls in one message (max 64).",
@@ -2000,16 +2014,18 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
 # and for speed (tests/test_glm53_chat_template.py says why), and the bill for that choice is
 # exactly here: one template flag, one open-turn shape to derive per renderer. Each string
 # renderer derives its own, pinned byte-for-byte against the checkpoint's template;
-# CONTINUATION_FAMILIES is the set that has done so. Kimi K3 is the exception -- its prompt is
-# framed engine-side (render_chat_kimi hands a K3CHAT1 record to kimi_k3.c, which assembles the
-# XTML tokens), so its open turn is a change in the C path, not here, and is left to that engine.
+# CONTINUATION_FAMILIES is the set that has done so. Kimi K3 differs in WHERE its shape lives:
+# its prompt is framed engine-side (render_chat_kimi hands a K3CHAT1 record to kimi_k3.c, which
+# assembles the XTML tokens), so its open turn is a `C` record here plus a branch in that C path,
+# pinned by tests/test_k3_chat_tools.c against the tiny tokenizer rather than by a template diff.
 
 # Families whose renderer implements the add_generation_prompt=False (open-turn) branch. A
 # trailing assistant turn on a family NOT in this set falls through to the ordinary render
 # (the cue is appended, exactly as before this existed) rather than erroring -- continuation is
 # on by default, and a family without its open-turn shape yet must not start rejecting requests
 # nobody opted into. Each renderer adds itself here in the same commit that derives its shape.
-CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36", "glm", "olmoe", "deepseek_v4", "inkling"}
+CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36", "glm", "olmoe", "deepseek_v4", "inkling",
+                         "kimi"}
 
 
 def resolve_generation_prompt(messages, body):
@@ -2029,10 +2045,11 @@ def resolve_generation_prompt(messages, body):
     (fold the trailing turn into a completed one and append a fresh cue). It is the only value
     that turns this off; anything else, including unset, leaves it on.
 
-    A family whose renderer has no open-turn shape yet (ARCH not in CONTINUATION_FAMILIES --
-    Kimi K3, whose turn is framed engine-side) falls through to the ordinary render rather than
-    erroring: continuation defaults on, so an unimplemented family must not start rejecting
-    trailing-assistant requests that worked before.
+    A family whose renderer has no open-turn shape yet (ARCH not in CONTINUATION_FAMILIES)
+    falls through to the ordinary render rather than erroring: continuation defaults on, so a
+    family added before its open-turn shape must not start rejecting trailing-assistant
+    requests that worked before. Every shipped family is in the set today, Kimi K3 included --
+    its open turn is framed in kimi_k3.c (a `C` record), not derived in the renderer here.
     """
     continuing = os.environ.get("COLI_CONTINUE_ASSISTANT", "1") != "0"
     last = messages[-1] if isinstance(messages, list) and messages else None
@@ -2113,8 +2130,10 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if ARCH == "deepseek_v4":
         return render_chat_v4(messages, enable_thinking, reasoning_effort, tools,
                               tool_choice, add_generation_prompt)
-    renderer = (render_chat_kimi if ARCH == "kimi" else render_chat)
-    return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
+    if ARCH == "kimi":
+        return render_chat_kimi(messages, enable_thinking, reasoning_effort, tools,
+                                tool_choice, add_generation_prompt=add_generation_prompt)
+    return render_chat(messages, enable_thinking, reasoning_effort, tools, tool_choice)
 
 
 # ---- Anthropic Messages API (#343) --------------------------------------------------------

@@ -40,8 +40,10 @@ completed one and append a fresh cue). Continuation is refused together with
 `tools`/`tool_calls`, because the tool-call parsers read an assistant turn from
 its start, and the turn must carry text not ending in whitespace: the template
 strips trailing whitespace, so the model would resume from different bytes than
-the ones sent. A family whose renderer has no open-turn shape yet — Kimi K3,
-whose turn is framed engine-side — falls through to the old behaviour.
+the ones sent. A family whose renderer has no open-turn shape yet falls through
+to the old behaviour rather than erroring — though every shipped family supports
+continuation today, Kimi K3 included (its open turn is framed engine-side, in
+`kimi_k3.c`, not derived in the gateway renderer).
 
 A continuation resumes from the exact bytes you send, which makes the split
 point part of the prompt. Splitting mid-word puts the model at a token boundary
