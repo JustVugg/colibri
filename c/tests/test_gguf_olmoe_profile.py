@@ -12,7 +12,10 @@ import sys
 import unittest
 from pathlib import Path
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError as exc:
+    raise unittest.SkipTest("numpy not installed: %s" % exc)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 

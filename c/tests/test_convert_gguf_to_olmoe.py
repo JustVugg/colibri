@@ -18,7 +18,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
+import importlib
+
+try:
+    import numpy as np
+    for _dependency in ("safetensors", "safetensors.numpy"):
+        importlib.import_module(_dependency)
+except ImportError as exc:
+    raise unittest.SkipTest("numpy/safetensors not installed: %s" % exc)
 
 TESTDIR = Path(__file__).resolve().parent
 TOOLS = TESTDIR.parent / "tools"
