@@ -22,7 +22,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
                            parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
                            read_engine_turn, render_chat, render_chat_for_arch,
-                           render_chat_glm53, render_chat_kimi,
+                           render_chat_glm53, render_chat_inkling, render_chat_kimi,
                            render_chat_olmoe,
                            render_chat_qwen38, render_chat_v4, _dsv4_tool_calls, serve,
                            resolve_generation_prompt, split_thinking_reply,
@@ -2024,7 +2024,7 @@ class TrailingAssistantTurnTest(unittest.TestCase):
         yet must render as before -- append the cue -- not reject a request nobody opted into.
         Each family leaves this list in the commit that derives its shape; Kimi K3 (framed
         engine-side, so its open turn is a change in kimi_k3.c) is the standing case."""
-        for arch in ("kimi", "inkling"):
+        for arch in ("kimi",):
             with self.on(), patch("openai_server.ARCH", arch):
                 self.assertTrue(resolve_generation_prompt(self.OPEN_TURN, {}))
 
@@ -2056,6 +2056,33 @@ class TrailingAssistantTurnTest(unittest.TestCase):
             self.assertEqual(normal, cont + EOS + cue)
             self.assertTrue(cont.endswith("La capitale e'"), cont[-40:])
             self.assertFalse(cont.endswith(EOS))
+
+    def test_continuation_open_turn_inkling(self):
+        """inkling uses its own markers, and render_chat_inkling deliberately deviates from
+        the template's generation cue (it prefills <|content_text|> in the thinking-off case
+        to force content mode, and defaults thinking off), so it is pinned with an
+        expected-string test: the open turn is pinned to a literal here, with the
+        past-turn-minus-terminators invariant kept as an added check, in both thinking modes."""
+        END = "<|end_message|><|content_model_end_sampling|>"
+        for enable_thinking in (True, False):
+            # eff is 0.9 with thinking on, 0.0 off; the off cue prefills the content channel
+            eff = "0.9" if enable_thinking else "0"
+            cue = "<|message_model|>" + ("" if enable_thinking else "<|content_text|>")
+            # The literal open turn, written out so the test does not lean on another renderer
+            # call for its only expected value (see the deepseek_v4 test). The two modes differ
+            # only in the system effort line; both end on the prefilled content channel.
+            expected = ("<|message_system|><|content_text|>Thinking effort level: " + eff +
+                        "<|end_message|><|message_user|><|content_text|>capitale della Francia?"
+                        "<|end_message|><|message_model|><|content_text|>La capitale e'")
+            with patch("openai_server.ARCH", "inkling"):
+                normal = render_chat_inkling(self.OPEN_TURN, enable_thinking=enable_thinking)
+                cont = render_chat_for_arch(self.OPEN_TURN, enable_thinking=enable_thinking,
+                                            add_generation_prompt=False)
+            self.assertEqual(cont, expected)
+            # and the invariant tying it to the normal render: past turn without terminators + cue
+            self.assertEqual(normal, cont + END + cue)
+            self.assertTrue(cont.endswith("La capitale e'"), cont[-40:])
+            self.assertFalse(cont.endswith("<|end_message|>"))
 
     def test_splitter_starts_in_content_mode_on_a_continued_turn(self):
         """Measured on glm53 int4, CPU: content '' with reasoning_chars 10 and 109,

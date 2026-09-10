@@ -1472,12 +1472,16 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
 
 
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                        tool_choice=None, audio_out=None):
+                        tool_choice=None, audio_out=None, add_generation_prompt=True):
     """Text-only subset of Inkling's chat_template.jinja: role tokens with
     <|content_text|> parts and <|end_message|> terminators, an assistant
     <|content_model_end_sampling|> after each prior model turn, the
     thinking-effort hint appended after the messages (the template's fallback
-    branch), then <|message_model|> as the generation prompt."""
+    branch), then <|message_model|> as the generation prompt.
+
+    add_generation_prompt=False continues a trailing assistant turn: the last model turn is
+    rendered open -- without its <|end_message|> and the <|content_model_end_sampling|> that
+    close it, and with no cue. Those two markers are the terminator to drop here."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     if tools or (tool_choice not in (None, "none")):
@@ -1513,6 +1517,8 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
         if not effort_emitted and role not in ("system", "developer"):
             prompt.append(effort_str)
             effort_emitted = True
+        open_turn = (not add_generation_prompt and role == "assistant"
+                     and index == len(messages) - 1)
         raw = message.get("content")
         if audio_out is not None and role == "user" and isinstance(raw, list):
             # multipart user content: text runs and audio clips become separate
@@ -1527,20 +1533,23 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
                                   + "<|audio|>" * val + "<|audio_end|><|end_message|>")
         else:
             text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
-            prompt.append(f"{rtok}<|content_text|>{text}<|end_message|>")
-        if role == "assistant":
+            # A continued turn is the last model message rendered open: no <|end_message|>.
+            terminator = "" if open_turn else "<|end_message|>"
+            prompt.append(f"{rtok}<|content_text|>{text}{terminator}")
+        if role == "assistant" and not open_turn:
             prompt.append("<|content_model_end_sampling|>")
     if not effort_emitted:                       # all-system edge case: fallback
         prompt.append(effort_str)
-    prompt.append("<|message_model|>")           # add_generation_prompt
-    # Thinking off: prefill the content channel. Without this the model can still
-    # sample <|content_thinking|> as its first token (the effort hint is only a
-    # soft signal), open a reasoning block, and burn the whole token budget before
-    # reaching <|content_text|> — which the splitter then strips to an empty
-    # answer. Ending the prompt at <|message_model|><|content_text|> forces content
-    # mode; it is exactly the sequence every non-thinking turn is trained on.
-    if eff == 0.0:
-        prompt.append("<|content_text|>")
+    if add_generation_prompt:
+        prompt.append("<|message_model|>")           # generation cue
+        # Thinking off: prefill the content channel. Without this the model can still
+        # sample <|content_thinking|> as its first token (the effort hint is only a
+        # soft signal), open a reasoning block, and burn the whole token budget before
+        # reaching <|content_text|> — which the splitter then strips to an empty
+        # answer. Ending the prompt at <|message_model|><|content_text|> forces content
+        # mode; it is exactly the sequence every non-thinking turn is trained on.
+        if eff == 0.0:
+            prompt.append("<|content_text|>")
     return "".join(prompt)
 
 
@@ -2000,7 +2009,7 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
 # (the cue is appended, exactly as before this existed) rather than erroring -- continuation is
 # on by default, and a family without its open-turn shape yet must not start rejecting requests
 # nobody opted into. Each renderer adds itself here in the same commit that derives its shape.
-CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36", "glm", "olmoe", "deepseek_v4"}
+CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36", "glm", "olmoe", "deepseek_v4", "inkling"}
 
 
 def resolve_generation_prompt(messages, body):
@@ -2084,7 +2093,8 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
                        "messages", "unsupported_parameter")
     if ARCH == "inkling":
         return render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
-                                    tool_choice, audio_out=audio_out)
+                                    tool_choice, audio_out=audio_out,
+                                    add_generation_prompt=add_generation_prompt)
     if ARCH == "glm53":
         return render_chat_glm53(messages, enable_thinking, reasoning_effort, tools,
                                  tool_choice, add_generation_prompt)
