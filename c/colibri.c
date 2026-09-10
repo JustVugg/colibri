@@ -9898,7 +9898,16 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
 #ifdef COLI_ANS
         raw_n=g_cuda_raw_experts;
 #endif
-        prefix_est=pin_prefix_for_budget(m,r,n,budget,raw_n)+g_cuda_ndev;
+        /* Size the prefix against what the card can actually take, not the
+         * number on the command line. An explicit CUDA_EXPERT_GB above the
+         * measured headroom is honoured by the upload loop (#491: it degrades
+         * per expert), but a prefix estimated from it lands its excess in the
+         * RAM pin: 5090 + CUDA_DENSE=1 + CUDA_EXPERT_GB=28, headroom ~18 GB,
+         * 864 uploaded and the other ~450 of a 1,314 prefix pinned in RAM on
+         * top of PIN_GB, 9.7 GB the user never asked for (#1405). */
+        double prefix_budget=budget;
+        if(safe_total>0 && safe_total<prefix_budget) prefix_budget=safe_total;
+        prefix_est=pin_prefix_for_budget(m,r,n,prefix_budget,raw_n)+g_cuda_ndev;
         if(prefix_est>n) prefix_est=n;
         cpu_from=prefix_est;                    /* prefix RAM is returned after upload */
     }
