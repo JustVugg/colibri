@@ -1147,7 +1147,7 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
 
 
 def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                      tool_choice=None):
+                      tool_choice=None, add_generation_prompt=True):
     """OLMoE-Instruct's native chat_template (tokenizer_config.json): one
     bos_token, then per-message <|system|>/<|user|>/<|assistant|> turns each
     closed by a newline, prior assistant turns also closed by eos_token
@@ -1155,7 +1155,11 @@ def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, to
     repurposed as this tokenizer's BOS/EOS marker), and a trailing
     "<|assistant|>\\n" generation prompt. No tool-call syntax and no thinking
     mode exist in this template, so both parameters are accepted but unused.
-    """
+
+    add_generation_prompt=False continues a trailing assistant turn. The template closes
+    even the last assistant turn with eos_token, so the open-turn shape is that turn without
+    the eos and with no cue -- the same drop-the-terminator move as the ChatML families, with
+    eos_token as the terminator here."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     if tools or tool_choice not in (None, "none"):
@@ -1177,10 +1181,13 @@ def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, to
         elif role == "user":
             parts.append(f"<|user|>\n{text}\n")
         else:
-            parts.append(f"<|assistant|>\n{text}{boundary}")
+            # A continued turn is the last message rendered open: no eos, no cue.
+            terminator = "" if (not add_generation_prompt and index == last) else boundary
+            parts.append(f"<|assistant|>\n{text}{terminator}")
             if index != last:
                 parts.append("\n")
-    parts.append("<|assistant|>\n")
+    if add_generation_prompt:
+        parts.append("<|assistant|>\n")
     return "".join(parts)
 
 
@@ -1986,7 +1993,7 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
 # (the cue is appended, exactly as before this existed) rather than erroring -- continuation is
 # on by default, and a family without its open-turn shape yet must not start rejecting requests
 # nobody opted into. Each renderer adds itself here in the same commit that derives its shape.
-CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36", "glm"}
+CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36", "glm", "olmoe"}
 
 
 def resolve_generation_prompt(messages, body):
@@ -2083,9 +2090,11 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if ARCH == "glm":
         return render_chat(messages, enable_thinking, reasoning_effort, tools,
                            tool_choice, add_generation_prompt)
+    if ARCH == "olmoe":
+        return render_chat_olmoe(messages, enable_thinking, reasoning_effort, tools,
+                                 tool_choice, add_generation_prompt)
     renderer = (render_chat_kimi if ARCH == "kimi" else
-                render_chat_v4 if ARCH == "deepseek_v4" else
-                render_chat_olmoe if ARCH == "olmoe" else render_chat)
+                render_chat_v4 if ARCH == "deepseek_v4" else render_chat)
     return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
 
 

@@ -2023,7 +2023,7 @@ class TrailingAssistantTurnTest(unittest.TestCase):
         yet must render as before -- append the cue -- not reject a request nobody opted into.
         Each family leaves this list in the commit that derives its shape; Kimi K3 (framed
         engine-side, so its open turn is a change in kimi_k3.c) is the standing case."""
-        for arch in ("deepseek_v4", "kimi", "olmoe", "inkling"):
+        for arch in ("deepseek_v4", "kimi", "inkling"):
             with self.on(), patch("openai_server.ARCH", arch):
                 self.assertTrue(resolve_generation_prompt(self.OPEN_TURN, {}))
 
