@@ -88,7 +88,9 @@ int  qt_is_resident(int layer, int eid);
 void qt_shutdown(void);
 
 /* Call once per routed expert per token (pointers to the RAM slot: packed
- * int4 + per-row scales). Updates heat and may enqueue a background upload. */
+ * int4 or, on an int8 container, the live int8 weights -- tier fmt=1 is
+ * accepted since #1334; see also #1391 for the decode-path offer). Updates
+ * heat and may enqueue a background upload. */
 void qt_note(int layer, int eid,
              const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
              const float *gs, const float *us, const float *ds);
