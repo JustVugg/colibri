@@ -99,6 +99,8 @@ typedef int            (*fn_fp8_set_lut)(const float *lut);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
                                     const void *weights, const float *scales,
                                     int fmt, int S, int I, int O, int device, int gs);
+typedef int            (*fn_matmul_mxfp4)(float *y, const float *x, const unsigned char *q4,
+                                          const unsigned char *e8s, int S, int I, int O);
 typedef void           (*fn_tensor_free)(ColiCudaTensor *tensor);
 typedef size_t         (*fn_tensor_bytes)(const ColiCudaTensor *tensor);
 typedef size_t         (*fn_tensor_vram)(const ColiCudaTensor *tensor);
@@ -174,6 +176,7 @@ static struct {
     fn_e8_set_grid     e8_set_grid;
     fn_fp8_set_lut     fp8_set_lut;
     fn_matmul          matmul;
+    fn_matmul_mxfp4    matmul_mxfp4;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
     fn_tensor_vram     tensor_vram;
@@ -1420,6 +1423,10 @@ static int coli_cuda_load(void){
     RESOLVE_OPT(e8_set_grid, fn_e8_set_grid)
     RESOLVE_OPT(fp8_set_lut, fn_fp8_set_lut)
     RESOLVE(matmul,         fn_matmul)
+    /* Kimi K3's MXFP4 expert matmul. Optional: a DLL built before it exports
+     * nothing by this name, and the wrapper's 0 is the engine's own "fall back
+     * to CPU" result, so an older DLL still serves GLM and Qwen3.6 (#1405). */
+    RESOLVE_OPT(matmul_mxfp4,   fn_matmul_mxfp4)
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
     /* Optional, same reasoning as e8_set_grid above: a DLL predating #687
@@ -1619,6 +1626,12 @@ int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,
                      int fmt, int S, int I, int O, int device, int gs){
     if(!g_cuda.available) return 0;
     return g_cuda.matmul(tensor, y, x, weights, scales, fmt, S, I, O, device, gs);
+}
+
+int coli_cuda_matmul_mxfp4(float *y, const float *x, const unsigned char *q4,
+                           const unsigned char *e8s, int S, int I, int O){
+    if(!g_cuda.available || !g_cuda.matmul_mxfp4) return 0;   /* 0 = CPU path */
+    return g_cuda.matmul_mxfp4(y, x, q4, e8s, S, I, O);
 }
 
 void coli_cuda_tensor_free(ColiCudaTensor *tensor){
