@@ -572,10 +572,10 @@ jobs:
           python-version: '3.12'
           cache: pip
           cache-dependency-path: c/tools/oracle-requirements.txt
-      - name: Install torch (CPU) + sympy
+      - name: Install torch (CPU) + sympy + Pillow
         run: |
           pip install -r c/tools/oracle-requirements.txt
-          pip install sympy
+          pip install sympy pillow
       - name: Tiny V4.1-shaped container and its reference
         run: |
           cd c
@@ -611,12 +611,39 @@ jobs:
             exit 1
           fi
           echo "the two index-key policies differ, as documented"
+      - name: "DSpark: a verified draft is the token sequential decode would have given"
+        run: |
+          cd c
+          # The fixture's draft head is random, so nothing it proposes would ever be
+          # accepted and the verification path would never run. V41_SPEC_FORCE drafts
+          # the reference's own tokens instead: 1 accepts the whole block, 2 corrupts
+          # the last draft so a round is rejected part way and the rollback runs, 3
+          # keeps the head's drafts, which is what serving does. All three have to
+          # reproduce the reference token for token, at any cache capacity.
+          for force in 1 2 3; do
+            for cap in 1 8; do
+              echo "::group::V41_SPEC_FORCE=$force cap=$cap"
+              SNAP=dsv41_tiny V41_SPEC_FORCE=$force ./deepseek_v41 "$cap" dsv41_tiny/ref.json
+              echo "::endgroup::"
+            done
+          done
+          # and with only part of the block verified, which is a different rollback
+          SNAP=dsv41_tiny V41_SPEC_FORCE=2 V41_DSPARK_MAX=1 ./deepseek_v41 8 dsv41_tiny/ref.json
       - name: "Brain tab: EMAP after READY and STAT, HITS after every turn"
         run: |
           cd c
-          # the oracle fixture ships no tokenizer; serve mode needs one to encode
-          python3 tools/make_edge_tiny_tokenizer.py --vocab-size 256 dsv41_tiny
           COLI_DSV41_FIXTURE=dsv41_tiny python3 -m unittest -v tests.test_dsv41_dashboard
+      - name: "Serving: an image changes the answer, a draft does not"
+        run: |
+          cd c
+          COLI_DSV41_FIXTURE=dsv41_tiny python3 -m unittest -v \
+            tests.test_dsv41_image_serve tests.test_dsv41_dspark_serve
+      - name: "Tool calling: the checkpoint's own encoding cases, byte for byte"
+        run: |
+          cd c
+          # no engine and no fixture here: the mock speaks the SERVE protocol, and the
+          # vendor's encoding cases are checked into tests/fixtures
+          python3 -m unittest -v tests.test_openai_tools_v41_e2e
 
   qwen38-tiny-check:
     name: Qwen3.8 tiny oracle (GDN + QSA + PLE + MoE)

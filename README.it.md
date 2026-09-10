@@ -13,7 +13,7 @@ in C puro e senza dipendenze del motore, trattando storage, RAM e VRAM come
 un'unica gerarchia di inferenza.
 
 Oggi girano otto famiglie: **GLM-5.2/5.3** (744B), **GLM-5.3-Flash** (321B, con
-vision), **Inkling** (975B), **Kimi K3** (2,8T), **DeepSeek V4 Flash** (284B), **DeepSeek V4.1 Flash** (552B),
+vision), **Inkling** (975B), **Kimi K3** (2,8T), **DeepSeek V4 Flash** (284B), **DeepSeek V4.1 Flash** (552B, con visione),
 **Qwen3.8-Flash-Next** (125B + 51B n-gram), **Qwen3.6** (35B-A3B) e
 **OLMoE** (7B) — un
 file C ciascuna, la stessa interfaccia `coli chat` / `coli serve` / `coli web`. [Elenco completo](README.md#other-supported-models)
