@@ -826,6 +826,20 @@ def env_for(a):
                                         kv_slots=requested_kv_slots(a,e))
                         e.update(environment_for_plan(plan,e,cuda_enabled=True))
                         vt=plan["tiers"]["vram"]
+                        # #1409: the dense trunk is read on every token; leaving
+                        # it on the CPU next to a 30 GB expert tier is the
+                        # slowest possible placement of a card that could hold
+                        # it. Put it on the GPU when the plan says it fits with
+                        # room for experts, and take its bytes out of the expert
+                        # budget: dense uploads are lazy, and a tier that already
+                        # filled the card makes them fail (#687). Explicit
+                        # CUDA_DENSE / CUDA_EXPERT_GB from the user always win.
+                        dense=int(plan["tiers"].get("ram",{}).get("dense_bytes",0) or 0)
+                        room=int(vt.get("budget_bytes",0) or 0)-dense
+                        if dense>0 and room>=4*(1024**3) and "CUDA_DENSE" not in e:
+                            e["CUDA_DENSE"]="1"
+                            if "CUDA_EXPERT_GB" in e:
+                                e["CUDA_EXPERT_GB"]=f"{room/(1024**3):.3f}"
                         names=",".join(g["name"].strip() for g in gpus)
                         print(f"  {C.dim}[GPU] auto-enabled CUDA · {names} · "
                               f"{format_bytes(vt['budget_bytes'])} expert tier{C.r}", file=sys.stderr)

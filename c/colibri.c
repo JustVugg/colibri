@@ -11020,18 +11020,19 @@ int main(int argc, char **argv){
     if(getenv("CUDA_RELEASE_HOST")) g_cuda_release_host=atoi(getenv("CUDA_RELEASE_HOST"));
     else if(g_cuda_ndev>1)          g_cuda_release_host=1;          /* unchanged */
     else if(g_cuda_enabled && (g_cuda_expert_gb>0||g_cuda_expert_auto)){
-        const char *pg=getenv("PIN_GB");
-        /* "large PIN_GB" = all, or >= the VRAM tier itself. Under CUDA_EXPERT_GB=auto
-         * the tier is sized to the whole card, so any explicit PIN_GB qualifies. */
-        if(pg&&*pg){
-            if(!strcmp(pg,"all")) g_cuda_release_host=1;
-            else { double p=atof(pg);
-                   if(p>0 && (g_cuda_expert_auto || p>=g_cuda_expert_gb)) g_cuda_release_host=1; }
-        }
-        if(g_cuda_release_host)
-            fprintf(stderr,"[CUDA] single-GPU with a large PIN_GB: releasing host copies of the "
-                           "VRAM tier so the RAM tier can use that memory (#686; "
-                           "CUDA_RELEASE_HOST=0 keeps them)\n");
+        /* #1409: not only under a large PIN_GB. Without the release the VRAM
+         * prefix is bounded by the RAM pin (gpu_prefix <= npin), and the RAM
+         * pin is whatever the autopin planner left after its LRU reserve: on a
+         * 5090 + 128 GB host that was 1.1 GB, so the card got 53 experts of a
+         * 30.7 GB budget and the user saw an idle GPU (#1405). With the release
+         * the prefix is priced against the VRAM budget itself (pin_load), and
+         * the host copies were provably redundant already (#686: a CUDA
+         * failure reloads from disk). An explicit CUDA_RELEASE_HOST=0 keeps
+         * the old behaviour. */
+        g_cuda_release_host=1;
+        fprintf(stderr,"[CUDA] single GPU with an expert tier: releasing host copies of the "
+                       "VRAM tier so the RAM tier can use that memory and the tier is sized "
+                       "from the VRAM budget (#686, #1409; CUDA_RELEASE_HOST=0 keeps them)\n");
     }
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
@@ -11326,7 +11327,15 @@ int main(int argc, char **argv){
               (expert_available-lru_reserve)/1e9, pin_bytes/1e9,
               pin_bytes+1.0<planned_pin ? "  [CAPPED by the LRU reserve]" : "");
           double pin_gb=pin_bytes/1e9;
+          /* #1409: the VRAM prefix is loaded by the same pin_load, priced against
+           * the VRAM budget (CUDA_RELEASE_HOST). A RAM pin under the 0.5 GB floor
+           * used to skip the call, and with it the whole VRAM tier. */
+          int vram_tier=0;
+#ifdef COLI_CUDA
+          vram_tier=g_cuda_enabled&&g_cuda_release_host&&(g_cuda_expert_gb>0||g_cuda_expert_auto);
+#endif
           if(pin_gb>=0.5) pin_load(&m, g_usage_path, pin_gb, 0);   /* auto-discovered: not trusted */
+          else if(vram_tier) pin_load(&m, g_usage_path, 0.0, 0);   /* VRAM prefix only, no RAM pin */
       }
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
        * RAM_GB assente o <=0 = budget automatico da MemAvailable. */
