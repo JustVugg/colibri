@@ -59,6 +59,7 @@
  */
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <pthread.h>   /* ehit_mark publishes the lazy HITS table under a lock */
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -2720,13 +2721,27 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
  * matmul esperti (ffn_layer meno il disco), attention (mla/kda), testa
  * (mv su lm_head). L'attesa asincrona non esiste qui: glm53 legge in modo
  * sincrono, quindi expert_wait_s e' 0 per costruzione, non per omissione. */
+static pthread_mutex_t g_ehit_mx = PTHREAD_MUTEX_INITIALIZER;
 static void ehit_mark(GModel *m, int layer, int eid) {
     const Cfg *c = &m->c;
-    if (!m->ehit) {
-        m->ehit = calloc((size_t)c->n_layers, sizeof(uint8_t *));
-        for (int i = 0; i < c->n_layers; i++) m->ehit[i] = calloc((size_t)c->n_experts, 1);
+    /* The first touch can come from a parallel region (qwen36: the tier
+     * warmstart's omp loop calls expert_get from twelve threads at once):
+     * one thread published m->ehit while it was still filling the rows and
+     * a sibling dereferenced m->ehit[layer] == NULL -- SIGSEGV in about one
+     * run in twelve on a CUDA warmstart. Build the table privately, publish
+     * it once under a lock (double-checked), and read it with acquire order. */
+    uint8_t **ehit = __atomic_load_n(&m->ehit, __ATOMIC_ACQUIRE);
+    if (!ehit) {
+        pthread_mutex_lock(&g_ehit_mx);
+        ehit = m->ehit;
+        if (!ehit) {
+            ehit = calloc((size_t)c->n_layers, sizeof(uint8_t *));
+            for (int i = 0; i < c->n_layers; i++) ehit[i] = calloc((size_t)c->n_experts, 1);
+            __atomic_store_n(&m->ehit, ehit, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&g_ehit_mx);
     }
-    if (layer >= 0 && layer < c->n_layers && eid >= 0 && eid < c->n_experts) m->ehit[layer][eid] = 1;
+    if (layer >= 0 && layer < c->n_layers && eid >= 0 && eid < c->n_experts) ehit[layer][eid] = 1;
 }
 static int dash_rows(const GModel *m) {
     int rows = 0;

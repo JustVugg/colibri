@@ -8,6 +8,7 @@
  */
 #ifndef COLI_QWEN38_CORE_H
 #define COLI_QWEN38_CORE_H
+#include <pthread.h>   /* q38_ehit_mark publishes the lazy HITS table under a lock */
 
 #define Q38_MAX_LAYERS 512
 #define Q38_MAX_EXPERTS 1024
@@ -1242,13 +1243,27 @@ static void q38_load_expert(Model *m,int layer,int eid,Slot *s) {
 /* One byte per expert: routed in this turn or not. The dashboard's Brain tab
  * reads it as the HITS bitmap after every turn (serve_hits in qwen38.c),
  * cleared there. Marked on both lookup paths, single and batched. */
+static pthread_mutex_t g_q38_ehit_mx=PTHREAD_MUTEX_INITIALIZER;
 static void q38_ehit_mark(Model *m,int layer,int eid) {
     const Cfg *c=&m->c;
-    if(!m->ehit){
-        m->ehit=(uint8_t**)calloc((size_t)c->layers,sizeof(uint8_t*));
-        for(int i=0;i<c->layers;i++)m->ehit[i]=(uint8_t*)calloc((size_t)c->experts,1);
+    /* The first touch can come from a parallel region (qwen36: the tier
+     * warmstart's omp loop calls expert_get from twelve threads at once):
+     * one thread published m->ehit while it was still filling the rows and
+     * a sibling dereferenced m->ehit[layer] == NULL -- SIGSEGV in about one
+     * run in twelve on a CUDA warmstart. Build the table privately, publish
+     * it once under a lock (double-checked), and read it with acquire order. */
+    uint8_t **ehit=__atomic_load_n(&m->ehit,__ATOMIC_ACQUIRE);
+    if(!ehit){
+        pthread_mutex_lock(&g_q38_ehit_mx);
+        ehit=m->ehit;
+        if(!ehit){
+            ehit=(uint8_t**)calloc((size_t)c->layers,sizeof(uint8_t*));
+            for(int i=0;i<c->layers;i++)ehit[i]=(uint8_t*)calloc((size_t)c->experts,1);
+            __atomic_store_n(&m->ehit,ehit,__ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&g_q38_ehit_mx);
     }
-    if(layer>=0&&layer<c->layers&&eid>=0&&eid<c->experts)m->ehit[layer][eid]=1;
+    if(layer>=0&&layer<c->layers&&eid>=0&&eid<c->experts)ehit[layer][eid]=1;
 }
 static Slot *q38_expert_get(Model *m,int layer,int eid) {
     q38_ehit_mark(m,layer,eid);
