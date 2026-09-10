@@ -92,6 +92,9 @@ typedef struct {
     int64_t engram_rows[V41_MAX_ENGRAM];
     int engram_max_ngram, engram_heads, engram_head_dim, engram_pad_id;
     int engram_cols;                     /* (max_ngram - 1) * heads */
+    /* DSpark: the MTP draft head. n_mtp == 0 means the checkpoint carries none. */
+    int n_mtp, spec_block, spec_noise, spec_targets[8], n_spec_targets;
+    int markov_rank, spec_routed, spec_activated;
     /* vision (VL). vision_layers == 0 means a text-only container. */
     int vision_layers, vision_dim, vision_heads, vision_inter, vision_patch;
     int vision_ratio, vision_max_tokens, image_token_id;
@@ -200,6 +203,19 @@ static void cfg_load(Cfg *c, const char *snap) {
         if (c->kv_source[i]) owner = i;
         c->index_owner[i] = owner;
     }
+    /* DSpark. The released config spells the activated count two ways depending on
+     * which file it comes from (config.json says dspark_num_experts_per_tok,
+     * inference/config.json says dspark_n_activated_experts); read either. */
+    c->n_mtp = (int)jnum(t, "n_mtp_layers", 0);
+    c->spec_block = (int)jnum(t, "dspark_block_size", 0);
+    c->spec_noise = (int)jnum(t, "dspark_noise_token_id", 0);
+    c->n_spec_targets = jints(t, "dspark_target_layer_ids", c->spec_targets, 8);
+    c->markov_rank = (int)jnum(t, "dspark_markov_rank", 0);
+    c->spec_routed = (int)jnum(t, "dspark_n_routed_experts", c->n_routed);
+    c->spec_activated = (int)jnum(t, "dspark_n_activated_experts",
+                                 jnum(t, "dspark_num_experts_per_tok", c->n_activated));
+    if (c->spec_block <= 0 || c->n_spec_targets <= 0) c->n_mtp = 0;
+
     jval *vision = json_get(root, "vision_config");
     if (vision && vision->t == J_OBJ) {
         c->vision_layers = (int)jnum(vision, "num_hidden_layers", 0);
@@ -571,10 +587,53 @@ typedef struct {
     int engram_index;           /* which table, -1 when this layer has none */
     /* per-layer state */
     float *window;              /* [window_size, head_dim] ring of raw KV */
+    /* Which position each ring slot holds, -1 when it holds nothing yet. A single
+     * decode step needs only "slot i is position i until the ring wraps", but a
+     * speculative step writes several positions at once and then keeps only some of
+     * them: the slots of the rejected drafts still hold their keys, and the only thing
+     * that makes them unreadable is knowing which position they came from. */
+    int *window_pos;
     float *ckv;                 /* [max_pos/ratio, head_dim] compressed KV (owners) */
     float *ikey;                /* [max_pos/ratio, index_head_dim] index keys (owners) */
     float *cstate_kv, *cstate_score;   /* compressor group still filling */
+    /* What a speculative step displaced, one entry per row of the batch: the ring slot
+     * it overwrote and the compressor slot it overwrote. Both are addressed modulo
+     * something (the window, the compression ratio), so a draft several positions ahead
+     * lands on a slot a committed position still needs -- the key one window back, or
+     * the earlier half of a group that has not closed yet. Rejected rows put these
+     * back. */
+    float *ring_save, *cstate_save_kv, *cstate_save_score;
+    int *ring_save_pos, *cstate_save_slot;
 } Layer;
+
+/* DSpark: the MTP draft head, under `mtp.*` in the checkpoint.
+ *
+ * Three stages of the same block the backbone uses, with three differences: the
+ * attention never compresses (it is window-only, and the window holds the MAIN
+ * stream's keys), the expert set is its own and smaller, and the last stage carries
+ * the heads that turn one hidden state into a block of guesses -- a Markov head that
+ * biases each position by the token before it, and a confidence head nobody has to
+ * trust, because the main model verifies every draft before a single one is emitted.
+ *
+ * The vendor ships the module and no loop: `forward_spec` exists, nothing calls it.
+ * The accept/reject loop here is therefore ours, and it is written to be exact rather
+ * than clever -- a token that comes out of a draft is the token the sequential decode
+ * would have produced, or it is not emitted. */
+typedef struct {
+    int active;                 /* the stages loaded                              */
+    Layer *stage;
+    LCache *cache;              /* one expert cache per stage, its own expert set  */
+    W8 main_proj;
+    WF main_norm, norm;
+    WB markov_embed, markov_out, conf_proj;
+    uint64_t proposed, accepted, rounds;
+    /* Drafting is not free: a round reads the stages' experts whether or not anything
+     * is accepted. When acceptance collapses -- a different domain, a long verbatim
+     * quote, anything the head has no signal on -- the drafts are pure disk tax, so
+     * they pause for a while and the guard re-measures. */
+    int pause, min_accept, max_verify;
+    uint64_t window_prop, window_acc;
+} Spec;
 
 typedef struct {
     Cfg c;
@@ -586,14 +645,14 @@ typedef struct {
     LCache *cache;
     int ecap;                   /* expert slots per layer */
     uint64_t clock, hits, miss;
-    double t_disk, t_expert, t_attn, t_engram;
+    double t_disk, t_expert, t_attn, t_engram, t_spec;
     uint64_t forwards, expert_bytes;
     /* rope tables: [max_pos, rope_dim/2] cos/sin pairs, one per theta in use */
     float *rope_window, *rope_compress;
     int pos;                    /* positions consumed so far */
     /* candidate mask published by the candidate source layer, one row per query */
     uint8_t *candidates;
-    int candidate_width;
+    int candidate_width, candidate_rows;
     /* What an index source publishes for the layers after it (model.py's
      * shared_attn.topk_idxs): the compressed positions each query keeps, already
      * shifted by the window offset. A layer that compresses but does not index reads
@@ -616,8 +675,26 @@ typedef struct {
      * is a different model, not a bug fix, and is why it is not the default. */
     const float *published_index_k;
     int published_index_layer;
+    /* A speculative step runs several positions in one pass, and the slot above is
+     * per-STEP state in the vendor: to stay equal to the same positions decoded one at
+     * a time, each row has to read what was published as of its own position. These
+     * three hold the schedule -- which layer publishes at each sub-step, computed
+     * before the layers run because a layer AFTER this one still publishes BEFORE this
+     * one's later rows -- and the pointer the step began with. */
+    int *pub_layer;
+    int pub_rows;
+    const float *pub_before;
+    int pub_before_layer;
     uint8_t **ehit;             /* experts routed this turn (dashboard HITS) */
     struct Vision *vision;      /* the VL tower, NULL on a text-only container */
+    Spec spec;
+    /* the DSpark input the last forward produced: [rows, n_targets * dim] */
+    float *main_hidden;
+    int main_hidden_rows;
+    /* where the last forward started and how many of its rows survived it: a
+     * speculative step keeps only the prefix that verified, and the next draft has to
+     * seed the stages with exactly the positions that were committed */
+    int last_start, last_rows;
 } Model;
 
 /* ------------------------------------------------------------ rope --------- */
@@ -681,7 +758,7 @@ static void rms_into(float *out, const float *x, const float *weight, int n, flo
 
 /* --------------------------------------------------------- expert cache ---- */
 
-static void expert_read(Model *m, int layer, int eid, Slot *s) {
+static void expert_read(Model *m, const char *kind, int layer, int eid, Slot *s) {
     Cfg *c = &m->c;
     char name[256];
     int64_t packed_gate = (int64_t)c->moe_inter * c->dim / 2;
@@ -695,9 +772,9 @@ static void expert_read(Model *m, int layer, int eid, Slot *s) {
         { "w2", s->w2, packed_down, s->s2, scales_down },
     };
     for (int i = 0; i < 3; i++) {
-        snprintf(name, sizeof(name), "layers.%d.ffn.experts.%d.%s.weight", layer, eid, part[i].suffix);
+        snprintf(name, sizeof(name), "%s.%d.ffn.experts.%d.%s.weight", kind, layer, eid, part[i].suffix);
         st_read_raw_cap(&m->S, name, part[i].bytes, part[i].size, 1);
-        snprintf(name, sizeof(name), "layers.%d.ffn.experts.%d.%s.scale", layer, eid, part[i].suffix);
+        snprintf(name, sizeof(name), "%s.%d.ffn.experts.%d.%s.scale", kind, layer, eid, part[i].suffix);
         st_read_raw_cap(&m->S, name, part[i].scale, part[i].scale_size, 1);
         m->expert_bytes += part[i].size + part[i].scale_size;
     }
@@ -718,9 +795,12 @@ static void ehit_mark(Model *m, int layer, int eid) {
     if (layer >= 0 && layer < c->n_layers && eid >= 0 && eid < c->n_routed) m->ehit[layer][eid] = 1;
 }
 
-static Slot *expert_slot(Model *m, int layer, int eid) {
-    ehit_mark(m, layer, eid);
-    LCache *cache = &m->cache[layer];
+/* `kind` is the checkpoint namespace, "layers" for the backbone and "mtp" for a
+ * DSpark stage: same slot shapes, same LRU, a different set of experts. Only the
+ * backbone's routing reaches the dashboard's grid -- the draft head has its own,
+ * smaller expert set, and a row of it would not line up with anything. */
+static Slot *expert_slot_at(Model *m, LCache *cache, const char *kind, int layer, int eid) {
+    if (!strcmp(kind, "layers")) ehit_mark(m, layer, eid);
     for (int i = 0; i < cache->n; i++)
         if (cache->slot[i].eid == eid) {
             cache->slot[i].used = ++m->clock;
@@ -737,9 +817,13 @@ static Slot *expert_slot(Model *m, int layer, int eid) {
             if (cache->slot[i].used < cache->slot[oldest].used) oldest = i;
         victim = &cache->slot[oldest];
     }
-    expert_read(m, layer, eid, victim);
+    expert_read(m, kind, layer, eid, victim);
     victim->used = ++m->clock;
     return victim;
+}
+
+static Slot *expert_slot(Model *m, int layer, int eid) {
+    return expert_slot_at(m, &m->cache[layer], "layers", layer, eid);
 }
 
 /* ------------------------------------------------------------- loading ----- */
@@ -762,6 +846,29 @@ typedef struct Vision {
 static void vision_load(Model *m, Vision *v);
 static void vision_forward(Model *m, Vision *v, const float *patches, int n_h, int n_w, float *out);
 static int vision_tokens(const Cfg *c, int n_h, int n_w);
+static void spec_load(Model *m, int ecap);
+
+/* One layer's expert cache. The DSpark stages route over their own, smaller expert set
+ * but the experts themselves are the same shape, so the slots are too. */
+static void cache_init(Model *m, LCache *cache, int ecap) {
+    Cfg *c = &m->c;
+    int64_t packed_gate = (int64_t)c->moe_inter * c->dim / 2;
+    int64_t packed_down = (int64_t)c->dim * c->moe_inter / 2;
+    int64_t scales_gate = (int64_t)c->moe_inter * (c->dim / 32);
+    int64_t scales_down = (int64_t)c->dim * (c->moe_inter / 32);
+    cache->cap = ecap; cache->n = 0;
+    cache->slot = xmalloc((size_t)ecap * sizeof(Slot), "expert slots");
+    for (int k = 0; k < ecap; k++) {
+        Slot *s = &cache->slot[k];
+        s->eid = -1; s->used = 0;
+        s->w1 = xmalloc((size_t)packed_gate, "expert w1");
+        s->w3 = xmalloc((size_t)packed_gate, "expert w3");
+        s->w2 = xmalloc((size_t)packed_down, "expert w2");
+        s->s1 = xmalloc((size_t)scales_gate, "expert w1 scale");
+        s->s3 = xmalloc((size_t)scales_gate, "expert w3 scale");
+        s->s2 = xmalloc((size_t)scales_down, "expert w2 scale");
+    }
+}
 
 static void model_load(Model *m, const char *snap, int ecap, int engram_cache_rows) {
     Cfg *c = &m->c;
@@ -807,6 +914,11 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
 
         l->window = xmalloc((size_t)c->window * hd * sizeof(float), "window ring");
         memset(l->window, 0, (size_t)c->window * hd * sizeof(float));
+        l->window_pos = xmalloc((size_t)c->window * sizeof(int), "window positions");
+        for (int k = 0; k < c->window; k++) l->window_pos[k] = -1;
+        int rows = c->n_mtp > 0 ? c->spec_block + 1 : 1;
+        l->ring_save = xmalloc((size_t)rows * hd * sizeof(float), "displaced ring keys");
+        l->ring_save_pos = xmalloc((size_t)rows * sizeof(int), "displaced ring positions");
         int ratio = c->compress_ratio[i];
         if (c->kv_source[i]) {
             wb_load(&m->S, &l->comp_wkv, NAME("layers.%d.attn.compressor.wkv.weight", i), hd, dim);
@@ -815,6 +927,9 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
                 wb_load(&m->S, &l->comp_wgate, NAME("layers.%d.attn.compressor.wgate.weight", i), hd, dim);
                 l->cstate_kv = xmalloc((size_t)ratio * hd * sizeof(float), "compressor group");
                 l->cstate_score = xmalloc((size_t)ratio * hd * sizeof(float), "compressor scores");
+                l->cstate_save_kv = xmalloc((size_t)rows * hd * sizeof(float), "displaced group");
+                l->cstate_save_score = xmalloc((size_t)rows * hd * sizeof(float), "displaced scores");
+                l->cstate_save_slot = xmalloc((size_t)rows * sizeof(int), "displaced group slots");
                 memset(l->cstate_kv, 0, (size_t)ratio * hd * sizeof(float));
                 for (int k = 0; k < ratio * hd; k++) l->cstate_score[k] = -INFINITY;
             }
@@ -856,23 +971,8 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
     /* expert cache: `ecap` slots per layer, each holding one expert's three matrices */
     m->ecap = ecap;
     m->cache = xmalloc((size_t)c->n_layers * sizeof(LCache), "expert caches");
-    int64_t packed_gate = (int64_t)c->moe_inter * dim / 2, packed_down = (int64_t)dim * c->moe_inter / 2;
-    int64_t scales_gate = (int64_t)c->moe_inter * (dim / 32), scales_down = (int64_t)dim * (c->moe_inter / 32);
-    for (int i = 0; i < c->n_layers; i++) {
-        LCache *cache = &m->cache[i];
-        cache->cap = ecap; cache->n = 0;
-        cache->slot = xmalloc((size_t)ecap * sizeof(Slot), "expert slots");
-        for (int k = 0; k < ecap; k++) {
-            Slot *s = &cache->slot[k];
-            s->eid = -1; s->used = 0;
-            s->w1 = xmalloc((size_t)packed_gate, "expert w1");
-            s->w3 = xmalloc((size_t)packed_gate, "expert w3");
-            s->w2 = xmalloc((size_t)packed_down, "expert w2");
-            s->s1 = xmalloc((size_t)scales_gate, "expert w1 scale");
-            s->s3 = xmalloc((size_t)scales_gate, "expert w3 scale");
-            s->s2 = xmalloc((size_t)scales_down, "expert w2 scale");
-        }
-    }
+    for (int i = 0; i < c->n_layers; i++) cache_init(m, &m->cache[i], ecap);
+    spec_load(m, ecap);
     if (c->vision_layers > 0) {
         m->vision = xmalloc(sizeof(Vision), "vision tower");
         memset(m->vision, 0, sizeof(Vision));
@@ -894,8 +994,23 @@ static const float *rope_for(const Model *m, int layer) {
 /* ----------------------------------------------------------- attention ----- */
 
 /* model.py get_window_topk_idxs, one batch: which ring slots query `t` may read.
- * Prefill indexes the chunk itself (slot i is position i); decode indexes the ring. */
-static void window_idxs(const Cfg *c, int n, int start_pos, int t, int *out, int *count) {
+ * Prefill indexes the chunk itself (slot i is position i); decode indexes the ring.
+ *
+ * On decode the readable set is stated in POSITIONS, not in slot numbers: a slot is
+ * readable when the position it holds is at or before this query's own and still
+ * inside the window. For one token a step that is the same thing as the vendor's
+ * `i > start_pos` test, since slot i then holds position i until the ring wraps. For a
+ * speculative step it is not: the ring also holds the drafts that were rejected, whose
+ * positions are ahead of every query that follows, and the position map is what keeps
+ * them out. The traversal stays oldest-slot-first, per query, because the attention
+ * kernel sums in list order and a different order is a different rounding. */
+static int window_slot_ok(const Layer *l, int slot, int pos, int win) {
+    int held = l->window_pos[slot];
+    return held >= 0 && held <= pos && held > pos - win;
+}
+
+static void window_idxs(const Cfg *c, const Layer *l, int n, int start_pos, int t,
+                        int *out, int *count) {
     int win = c->window;
     if (start_pos == 0) {
         int width = n < win ? n : win;
@@ -906,10 +1021,11 @@ static void window_idxs(const Cfg *c, int n, int start_pos, int t, int *out, int
         }
         *count = width;
     } else {
-        int oldest = start_pos % win + 1;
+        int pos = start_pos + t;
+        int oldest = pos % win + 1;
         int at = 0;
-        for (int i = oldest; i < win; i++) out[at++] = i > start_pos ? -1 : i;
-        for (int i = 0; i < oldest; i++) out[at++] = i > start_pos ? -1 : i;
+        for (int i = oldest; i < win; i++) out[at++] = window_slot_ok(l, i, pos, win) ? i : -1;
+        for (int i = 0; i < oldest; i++) out[at++] = window_slot_ok(l, i, pos, win) ? i : -1;
         *count = win;
     }
 }
@@ -945,7 +1061,8 @@ static void sparse_attend(float *out, const float *q, const float *kv, const int
 
 /* model.py Compressor.forward. Writes the latents this chunk completes into `latent`
  * and returns how many there are (pre-RoPE, as the indexer needs them unrotated). */
-static int compressor_run(Model *m, int layer, const float *x, int n, int start_pos, float *latent) {
+static int compressor_run(Model *m, int layer, const float *x, int n, int start_pos,
+                          float *latent, int *rows) {
     Cfg *c = &m->c;
     Layer *l = &m->L[layer];
     int hd = c->head_dim, ratio = c->compress_ratio[layer];
@@ -956,6 +1073,7 @@ static int compressor_run(Model *m, int layer, const float *x, int n, int start_
                 fprintf(stderr, "[compressor] head_dim %d exceeds the scratch\n", hd); exit(1); }
             mvb(kv, &l->comp_wkv, x + (size_t)t * c->dim);
             rms_into(latent + (size_t)t * hd, kv, l->comp_norm.w, hd, c->norm_eps);
+            rows[t] = start_pos + t;
         }
         return n;
     }
@@ -983,17 +1101,31 @@ static int compressor_run(Model *m, int layer, const float *x, int n, int start_
                 }
                 latent[(size_t)g * hd + i] = mixed / total;
             }
-            produced++;
+            rows[produced++] = g;
         }
         for (int k = 0; k < remainder; k++) {
             memcpy(l->cstate_kv + (size_t)k * hd, kv + (size_t)(cutoff + k) * hd, (size_t)hd * sizeof(float));
             memcpy(l->cstate_score + (size_t)k * hd, score + (size_t)(cutoff + k) * hd, (size_t)hd * sizeof(float));
         }
     } else {
-        int slot = start_pos % ratio;
-        memcpy(l->cstate_kv + (size_t)slot * hd, kv, (size_t)hd * sizeof(float));
-        memcpy(l->cstate_score + (size_t)slot * hd, score, (size_t)hd * sizeof(float));
-        if ((start_pos + 1) % ratio == 0) {
+        /* One position at a time, which is what a decode step is -- and a speculative
+         * step is several of them in a row. The group state is indexed by position
+         * modulo the ratio, so a draft that is rejected leaves its slot to be rewritten
+         * by the token that really lands there, before the group can complete. */
+        for (int t = 0; t < n; t++) {
+            int pos = start_pos + t;
+            int slot = pos % ratio;
+            if (n > 1) {
+                memcpy(l->cstate_save_kv + (size_t)t * hd, l->cstate_kv + (size_t)slot * hd,
+                       (size_t)hd * sizeof(float));
+                memcpy(l->cstate_save_score + (size_t)t * hd, l->cstate_score + (size_t)slot * hd,
+                       (size_t)hd * sizeof(float));
+                l->cstate_save_slot[t] = slot;
+            }
+            memcpy(l->cstate_kv + (size_t)slot * hd, kv + (size_t)t * hd, (size_t)hd * sizeof(float));
+            memcpy(l->cstate_score + (size_t)slot * hd, score + (size_t)t * hd, (size_t)hd * sizeof(float));
+            if ((pos + 1) % ratio) continue;
+            float *out = latent + (size_t)produced * hd;
             for (int i = 0; i < hd; i++) {
                 float best = -INFINITY;
                 for (int k = 0; k < ratio; k++) {
@@ -1006,9 +1138,9 @@ static int compressor_run(Model *m, int layer, const float *x, int n, int start_
                     total += weight;
                     mixed += weight * l->cstate_kv[(size_t)k * hd + i];
                 }
-                latent[i] = mixed / total;
+                out[i] = mixed / total;
             }
-            produced = 1;
+            rows[produced++] = pos / ratio;
         }
     }
     if (produced) {
@@ -1048,6 +1180,27 @@ static void candidate_blocks(const Cfg *c, const float *score, int width, int le
     free(best);
 }
 
+/* Does this layer complete a compression group at `pos`, and so republish its index
+ * keys? model.py: `if self.owns_k and latent is not None`. */
+static int layer_publishes(const Cfg *c, int layer, int pos) {
+    int ratio = c->compress_ratio[layer];
+    if (!c->kv_source[layer] || ratio <= 0) return 0;
+    return ratio == 1 || (pos + 1) % ratio == 0;
+}
+
+/* Which layer's index keys row `t` reads, or -1 for "whatever the step began with".
+ * Sequential order is (position, layer): everything at an earlier position happened,
+ * whatever its layer, and at this position only the layers up to this one -- including
+ * this one, which publishes before its own indexer runs. */
+static int published_owner(const Model *m, int layer, int start_pos, int t) {
+    if (m->pub_rows == 0) return -1;              /* one position: the step's own slot */
+    for (int L = layer; L >= 0; L--)
+        if (layer_publishes(&m->c, L, start_pos + t)) return L;
+    for (int j = t - 1; j >= 0; j--)
+        if (m->pub_layer[j] >= 0) return m->pub_layer[j];
+    return -1;
+}
+
 /* model.py Indexer.forward: score every compressed position this query can reach and
  * keep the best `index_topk`, in position order, shifted by `offset`. */
 static void indexer_run(Model *m, int layer, const float *x, const float *qr, int n,
@@ -1057,8 +1210,7 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
     Layer *l = &m->L[layer];
     int owner = c->index_owner[layer];
     int nh = c->index_n_heads, ihd = c->index_head_dim, ratio = c->compress_ratio[layer];
-    const float *ikey = m->L[owner].ikey;
-    if (!getenv("V41_INDEX_OWNER") && m->published_index_k) ikey = m->published_index_k;
+    int tidy = getenv("V41_INDEX_OWNER") != NULL;
     const float *rope = rope_for(m, layer);
     float *q = xmalloc((size_t)nh * ihd * sizeof(float), "indexer queries");
     float *weights = xmalloc((size_t)nh * sizeof(float), "indexer weights");
@@ -1066,12 +1218,22 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
     float scale = (1.0f / sqrtf((float)ihd)) * (1.0f / sqrtf((float)nh));
 
     for (int t = 0; t < n; t++) {
+        const float *ikey = m->L[owner].ikey;
+        if (!tidy) {
+            int published = published_owner(m, layer, start_pos, t);
+            if (published >= 0) ikey = m->L[published].ikey;
+            else if (m->pub_rows > 0) { if (m->pub_before) ikey = m->pub_before; }
+            else if (m->published_index_k) ikey = m->published_index_k;
+        }
         mv8(q, &l->idx_wq_b, qr + (size_t)t * c->q_lora);
         for (int h = 0; h < nh; h++)
             rope_apply(q + (size_t)h * ihd + ihd - c->rope_dim, rope, start_pos + t, c->rope_dim, 0);
         mvb(weights, &l->idx_wproj, x + (size_t)t * c->dim);
         for (int h = 0; h < nh; h++) weights[h] *= scale;
-        int lens = start_pos == 0 ? (t + 1) / ratio : (start_pos + n) / ratio;
+        /* how many compressed positions this query can reach: the groups closed at or
+         * before its own position, which is one expression for prefill and decode
+         * alike -- and, for a speculative step, per row rather than per step */
+        int lens = (start_pos + t + 1) / ratio;
         for (int j = 0; j < compress_len; j++) {
             if (j >= lens) { score[j] = -INFINITY; continue; }
             float total = 0.0f;
@@ -1085,10 +1247,11 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
             score[j] = total;
         }
         if (layer == c->candidate_source) {
-            if (m->candidate_width != compress_len) {
+            if (m->candidate_width != compress_len || m->candidate_rows != n) {
                 free(m->candidates);
                 m->candidates = xmalloc((size_t)n * compress_len, "candidate mask");
                 m->candidate_width = compress_len;
+                m->candidate_rows = n;
             }
             candidate_blocks(c, score, compress_len, lens, m->candidates + (size_t)t * compress_len);
         } else if (c->candidate_source >= 0 && c->candidate_source < layer && m->candidates) {
@@ -1117,11 +1280,41 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
         for (int a = 0; a < taken; a++)          /* insertion sort: taken <= index_topk */
             for (int b = a + 1; b < taken; b++)
                 if (row[b] < row[a]) { int swap = row[a]; row[a] = row[b]; row[b] = swap; }
-        int lens_now = start_pos == 0 ? (t + 1) / ratio : (start_pos + n) / ratio;
         for (int k = 0; k < topk; k++)
-            row[k] = (k < taken && row[k] < lens_now) ? row[k] + offset : -1;
+            row[k] = (k < taken && row[k] < lens) ? row[k] + offset : -1;
     }
     free(q); free(weights); free(score);
+}
+
+/* wo_a is block diagonal over o_groups: each group projects only its own heads, and
+ * only then does wo_b mix the groups. Shared with the DSpark stages, whose attention
+ * differs in what it reads but not in how it comes out. */
+static void attn_project_out(Model *m, Layer *l, const float *heads, float *out) {
+    Cfg *c = &m->c;
+    int per_group = c->n_heads * c->head_dim / c->o_groups;
+    float *grouped = xmalloc((size_t)c->o_groups * c->o_lora * sizeof(float), "grouped");
+    for (int g = 0; g < c->o_groups; g++) {
+        const uint8_t *rows = l->wo_a.q + (size_t)g * c->o_lora * per_group;
+        const uint8_t *scales = l->wo_a.s;
+        int tiles_i = (per_group + FP8_TILE - 1) / FP8_TILE;
+        for (int r = 0; r < c->o_lora; r++) {
+            int o = g * c->o_lora + r;
+            const uint8_t *w = rows + (size_t)r * per_group;
+            const uint8_t *scale_row = scales + (size_t)(o / FP8_TILE) * tiles_i;
+            const float *xg = heads + (size_t)g * per_group;
+            float sum = 0.0f;
+            for (int base = 0; base < per_group; base += FP8_TILE) {
+                int width = per_group - base < FP8_TILE ? per_group - base : FP8_TILE;
+                float tile = ue8m0(scale_row[base / FP8_TILE]);
+                float part = 0.0f;
+                for (int i = 0; i < width; i++) part += e4m3_decode(w[base + i]) * xg[base + i];
+                sum += part * tile;
+            }
+            grouped[o] = sum;
+        }
+    }
+    mv8(out, &l->wo_b, grouped);
+    free(grouped);
 }
 
 /* model.py Attention.forward. `x` is the normalized block input [n, dim]. */
@@ -1162,9 +1355,15 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
             memcpy(l->window + (size_t)cut * hd, tail, (size_t)(win - cut) * hd * sizeof(float));
             memcpy(l->window, tail + (size_t)(win - cut) * hd, (size_t)cut * hd * sizeof(float));
         }
+        /* both branches above leave position p in slot p % win */
+        for (int p = n > win ? n - win : 0; p < n; p++) l->window_pos[p % win] = p;
         window_kv = kv; window_rows = n;
     } else {
-        memcpy(l->window + (size_t)(start_pos % c->window) * hd, kv, (size_t)hd * sizeof(float));
+        /* The ring is written one position at a time, down in the attention loop, and
+         * not here: a step that carries several positions would otherwise overwrite the
+         * oldest slot before the first row has read it. The window a query sees has to
+         * be the window it would have seen alone, which means writing its key, reading,
+         * and only then writing the next one. */
         window_kv = l->window; window_rows = c->window;
     }
 
@@ -1179,7 +1378,7 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
     int *idx = xmalloc((size_t)n * total_idx * sizeof(int), "attention indices");
     for (int t = 0; t < n; t++) {
         int count = 0;
-        window_idxs(c, n, start_pos, t, idx + (size_t)t * total_idx, &count);
+        window_idxs(c, l, n, start_pos, t, idx + (size_t)t * total_idx, &count);
         for (int k = count; k < window_width; k++) idx[(size_t)t * total_idx + k] = -1;
     }
 
@@ -1188,21 +1387,26 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
         /* the compressor runs before the indexer: the indexer scores the latent before
          * RoPE, and the cache write below rotates it in place */
         float *latent = NULL;
+        int *latent_row = NULL;
         int produced = 0;
         if (c->kv_source[layer]) {
-            latent = xmalloc((size_t)(n / (ratio ? ratio : 1) + 1) * hd * sizeof(float), "latents");
-            produced = compressor_run(m, layer, x, n, start_pos, latent);
+            int room = n / (ratio ? ratio : 1) + 1;
+            latent = xmalloc((size_t)room * hd * sizeof(float), "latents");
+            latent_row = xmalloc((size_t)room * sizeof(int), "latent rows");
+            produced = compressor_run(m, layer, x, n, start_pos, latent, latent_row);
             if (produced) {
-                /* index keys first, from the un-rotated latent */
+                /* index keys first, from the un-rotated latent. A latent rotates at the
+                 * FIRST position of the group it pools, which is its row times the
+                 * ratio -- the same value the vendor spells two different ways on the
+                 * prefill and decode paths. */
                 for (int g = 0; g < produced; g++) {
                     float key[512];
                     if (c->index_head_dim > (int)(sizeof(key) / sizeof(key[0]))) {
                         fprintf(stderr, "[indexer] index_head_dim too large\n"); exit(1); }
                     mvb(key, &l->idx_wk, latent + (size_t)g * hd);
-                    float *dest = l->ikey + (size_t)(start_pos / ratio + g) * c->index_head_dim;
+                    float *dest = l->ikey + (size_t)latent_row[g] * c->index_head_dim;
                     rms_into(dest, key, l->idx_knorm.w, c->index_head_dim, c->norm_eps);
-                    int position = start_pos == 0 ? g * ratio : start_pos + 1 - ratio;
-                    rope_apply(dest + c->index_head_dim - rd, rope, position, rd, 0);
+                    rope_apply(dest + c->index_head_dim - rd, rope, latent_row[g] * ratio, rd, 0);
                 }
                 /* publish, as model.py does, only when a group completed */
                 m->published_index_k = l->ikey;
@@ -1244,13 +1448,12 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
         }
         if (produced) {
             for (int g = 0; g < produced; g++) {
-                float *dest = l->ckv + (size_t)(start_pos / ratio + g) * hd;
+                float *dest = l->ckv + (size_t)latent_row[g] * hd;
                 memcpy(dest, latent + (size_t)g * hd, (size_t)hd * sizeof(float));
-                int position = start_pos == 0 ? g * ratio : start_pos + 1 - ratio;
-                rope_apply(dest + hd - rd, rope, position, rd, 0);
+                rope_apply(dest + hd - rd, rope, latent_row[g] * ratio, rd, 0);
             }
         }
-        free(latent);
+        free(latent); free(latent_row);
         kv_all = xmalloc((size_t)(window_rows + compress_len) * hd * sizeof(float), "kv all");
         memcpy(kv_all, window_kv, (size_t)window_rows * hd * sizeof(float));
         memcpy(kv_all + (size_t)window_rows * hd, m->L[owner].ckv,
@@ -1261,6 +1464,22 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
     float *heads = xmalloc((size_t)nh * hd * sizeof(float), "attention output");
     float attn_scale = 1.0f / sqrtf((float)hd);
     for (int t = 0; t < n; t++) {
+        if (start_pos > 0) {
+            int pos = start_pos + t, slot = pos % c->window;
+            if (n > 1) {
+                memcpy(l->ring_save + (size_t)t * hd, l->window + (size_t)slot * hd,
+                       (size_t)hd * sizeof(float));
+                l->ring_save_pos[t] = l->window_pos[slot];
+            }
+            memcpy(l->window + (size_t)slot * hd, kv + (size_t)t * hd, (size_t)hd * sizeof(float));
+            l->window_pos[slot] = pos;
+            /* kv_all holds a copy of the ring, so it takes the same write */
+            if (kv_all) memcpy(kv_all + (size_t)slot * hd, kv + (size_t)t * hd,
+                               (size_t)hd * sizeof(float));
+            int count = 0;
+            window_idxs(c, l, n, start_pos, t, idx + (size_t)t * total_idx, &count);
+            for (int k = count; k < window_width; k++) idx[(size_t)t * total_idx + k] = -1;
+        }
         const int *row = idx + (size_t)t * total_idx;
         #pragma omp parallel for schedule(static)
         for (int h = 0; h < nh; h++)
@@ -1268,31 +1487,7 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
                           kv_read, row, total_idx, nh, hd, l->attn_sink.w[h], attn_scale);
         for (int h = 0; h < nh; h++)
             rope_apply(heads + (size_t)h * hd + hd - rd, rope, start_pos + t, rd, 1);
-        /* wo_a is block diagonal over o_groups: each group projects only its own heads */
-        int per_group = nh * hd / c->o_groups;
-        float *grouped = xmalloc((size_t)c->o_groups * c->o_lora * sizeof(float), "grouped");
-        for (int g = 0; g < c->o_groups; g++) {
-            const uint8_t *rows = l->wo_a.q + (size_t)g * c->o_lora * per_group;
-            const uint8_t *scales = l->wo_a.s;
-            int tiles_i = (per_group + FP8_TILE - 1) / FP8_TILE;
-            for (int r = 0; r < c->o_lora; r++) {
-                int o = g * c->o_lora + r;
-                const uint8_t *w = rows + (size_t)r * per_group;
-                const uint8_t *scale_row = scales + (size_t)(o / FP8_TILE) * tiles_i;
-                const float *xg = heads + (size_t)g * per_group;
-                float sum = 0.0f;
-                for (int base = 0; base < per_group; base += FP8_TILE) {
-                    int width = per_group - base < FP8_TILE ? per_group - base : FP8_TILE;
-                    float tile = ue8m0(scale_row[base / FP8_TILE]);
-                    float part = 0.0f;
-                    for (int i = 0; i < width; i++) part += e4m3_decode(w[base + i]) * xg[base + i];
-                    sum += part * tile;
-                }
-                grouped[o] = sum;
-            }
-        }
-        mv8(out + (size_t)t * dim, &l->wo_b, grouped);
-        free(grouped);
+        attn_project_out(m, l, heads, out + (size_t)t * dim);
     }
     m->t_attn += now_s() - started;
     free(heads); free(kv_all); free(idx); free(scratch); free(kv); free(q); free(qr);
@@ -1353,12 +1548,19 @@ static void shared_ffn(Model *m, Layer *l, const float *x, float *out) {
     free(down); free(up); free(gate);
 }
 
+static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int layer,
+                       int E, int topk, const float *x, float *out);
+
 /* model.py Gate + MoE. The bias steers the choice of experts and nothing else: the
  * weights come from the unbiased scores, which is the whole point of noaux_tc. */
 static void moe_run(Model *m, int layer, const float *x, float *out) {
+    moe_run_at(m, &m->L[layer], &m->cache[layer], "layers", layer,
+               m->c.n_routed, m->c.n_activated, x, out);
+}
+
+static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int layer,
+                       int E, int topk, const float *x, float *out) {
     Cfg *c = &m->c;
-    Layer *l = &m->L[layer];
-    int E = c->n_routed, topk = c->n_activated;
     float *scores = xmalloc((size_t)E * sizeof(float), "gate scores");
     mvb(scores, &l->gate_w, x);
     for (int e = 0; e < E; e++) {
@@ -1391,7 +1593,7 @@ static void moe_run(Model *m, int layer, const float *x, float *out) {
     for (int k = 0; k < topk; k++) weights[k] *= c->route_scale;
     memset(out, 0, (size_t)c->dim * sizeof(float));
     for (int k = 0; k < topk; k++) {
-        Slot *s = expert_slot(m, layer, chosen[k]);
+        Slot *s = expert_slot_at(m, cache, kind, layer, chosen[k]);
         expert_ffn(m, s->w1, s->s1, s->w3, s->s3, s->w2, s->s2, x, out, weights[k]);
     }
     shared_ffn(m, l, x, out);
@@ -1664,25 +1866,340 @@ static void hc_mixes(Model *m, const float *hc_fn, const float *scale, const flo
 /* `image_rows` (or NULL) is the aligner's output for a pending image and `image_at`
  * the position where its span starts; the span's embeddings are replaced rather than
  * looked up. `image_mask` marks those positions for the engram. */
-static void forward_with_image(Model *m, const int *ids, int n, float *logits,
-                               const float *image_rows, int image_at, int image_h, int image_w,
-                               const uint8_t *image_mask);
+/* ---------------------------------------------------------------- DSpark ---- */
+
+static int argmax(const float *values, int n);
+
+static void spec_load(Model *m, int ecap) {
+    Cfg *c = &m->c;
+    Spec *sp = &m->spec;
+    sp->min_accept = getenv("V41_DSPARK_MINACC") ? atoi(getenv("V41_DSPARK_MINACC")) : 30;
+    /* how many of the drafted tokens to put in front of the main model. The head always
+     * writes its whole block; verifying fewer of them trades acceptance for a smaller
+     * bill when a round is rejected early. */
+    sp->max_verify = getenv("V41_DSPARK_MAX") ? atoi(getenv("V41_DSPARK_MAX")) : 0;
+    if (sp->min_accept < 0) sp->min_accept = 0;
+    if (sp->min_accept > 100) sp->min_accept = 100;
+    if (c->n_mtp <= 0) return;
+    const char *flag = getenv("V41_DSPARK");
+    if (flag && !atoi(flag)) {
+        fprintf(stderr, "[v41] DSpark drafts off (V41_DSPARK=0)\n");
+        return;
+    }
+    /* A checkpoint can declare the head in its config and still not ship it -- the
+     * vendor's own converter drops the tied embed and head, and a partial download has
+     * the same shape. Refusing to start over a missing draft head would be absurd, so
+     * say so once and decode without it. */
+    if (!st_find(&m->S, "mtp.0.attn.wq_a.weight")) {
+        fprintf(stderr, "[v41] no DSpark head in this checkpoint: drafts off\n");
+        return;
+    }
+    int dim = c->dim, hd = c->head_dim, nh = c->n_heads, hc = c->hc_mult;
+    sp->stage = xmalloc((size_t)c->n_mtp * sizeof(Layer), "DSpark stages");
+    memset(sp->stage, 0, (size_t)c->n_mtp * sizeof(Layer));
+    sp->cache = xmalloc((size_t)c->n_mtp * sizeof(LCache), "DSpark expert caches");
+    char name[256];
+    #define MNAME(fmt, ...) (snprintf(name, sizeof(name), fmt, __VA_ARGS__), name)
+    for (int i = 0; i < c->n_mtp; i++) {
+        Layer *l = &sp->stage[i];
+        l->engram_index = -1;
+        w8_load(&m->S, &l->wq_a, MNAME("mtp.%d.attn.wq_a.weight", i), c->q_lora, dim);
+        w8_load(&m->S, &l->wq_b, MNAME("mtp.%d.attn.wq_b.weight", i), nh * hd, c->q_lora);
+        w8_load(&m->S, &l->wkv,  MNAME("mtp.%d.attn.wkv.weight", i), hd, dim);
+        w8_load(&m->S, &l->wo_a, MNAME("mtp.%d.attn.wo_a.weight", i),
+                c->o_groups * c->o_lora, nh * hd / c->o_groups);
+        w8_load(&m->S, &l->wo_b, MNAME("mtp.%d.attn.wo_b.weight", i), dim, c->o_groups * c->o_lora);
+        wf_load(&m->S, &l->q_norm,    MNAME("mtp.%d.attn.q_norm.weight", i), c->q_lora);
+        wf_load(&m->S, &l->kv_norm,   MNAME("mtp.%d.attn.kv_norm.weight", i), hd);
+        wf_load(&m->S, &l->attn_sink, MNAME("mtp.%d.attn.attn_sink", i), nh);
+        wf_load(&m->S, &l->attn_norm, MNAME("mtp.%d.attn_norm.weight", i), dim);
+        wf_load(&m->S, &l->ffn_norm,  MNAME("mtp.%d.ffn_norm.weight", i), dim);
+        int mix = (2 + hc) * hc;
+        wf_load(&m->S, &l->hc_attn_fn,    MNAME("mtp.%d.hc_attn_fn", i), (int64_t)mix * hc * dim);
+        wf_load(&m->S, &l->hc_ffn_fn,     MNAME("mtp.%d.hc_ffn_fn", i), (int64_t)mix * hc * dim);
+        wf_load(&m->S, &l->hc_attn_base,  MNAME("mtp.%d.hc_attn_base", i), mix);
+        wf_load(&m->S, &l->hc_ffn_base,   MNAME("mtp.%d.hc_ffn_base", i), mix);
+        wf_load(&m->S, &l->hc_attn_scale, MNAME("mtp.%d.hc_attn_scale", i), 3);
+        wf_load(&m->S, &l->hc_ffn_scale,  MNAME("mtp.%d.hc_ffn_scale", i), 3);
+        wb_load(&m->S, &l->gate_w, MNAME("mtp.%d.ffn.gate.weight", i), c->spec_routed, dim);
+        wf_load(&m->S, &l->gate_bias, MNAME("mtp.%d.ffn.gate.bias", i), c->spec_routed);
+        w8_load(&m->S, &l->sh_w1, MNAME("mtp.%d.ffn.shared_experts.w1.weight", i), c->moe_inter, dim);
+        w8_load(&m->S, &l->sh_w3, MNAME("mtp.%d.ffn.shared_experts.w3.weight", i), c->moe_inter, dim);
+        w8_load(&m->S, &l->sh_w2, MNAME("mtp.%d.ffn.shared_experts.w2.weight", i), dim, c->moe_inter);
+        l->window = xmalloc((size_t)c->window * hd * sizeof(float), "DSpark window ring");
+        memset(l->window, 0, (size_t)c->window * hd * sizeof(float));
+        l->window_pos = xmalloc((size_t)c->window * sizeof(int), "DSpark window positions");
+        for (int k = 0; k < c->window; k++) l->window_pos[k] = -1;
+        cache_init(m, &sp->cache[i], ecap);
+    }
+    w8_load(&m->S, &sp->main_proj, "mtp.0.main_proj.weight", dim, dim * c->n_spec_targets);
+    wf_load(&m->S, &sp->main_norm, "mtp.0.main_norm.weight", dim);
+    int last = c->n_mtp - 1;
+    wf_load(&m->S, &sp->norm, MNAME("mtp.%d.norm.weight", last), dim);
+    wb_load(&m->S, &sp->markov_embed, MNAME("mtp.%d.markov_head.embed.weight", last),
+            c->vocab, c->markov_rank);
+    wb_load(&m->S, &sp->markov_out, MNAME("mtp.%d.markov_head.head.weight", last),
+            c->vocab, c->markov_rank);
+    wb_load(&m->S, &sp->conf_proj, MNAME("mtp.%d.confidence_head.proj.weight", last),
+            1, dim + c->markov_rank);
+    #undef MNAME
+    sp->active = 1;
+    fprintf(stderr, "[v41] DSpark on: %d stages, %d experts (%d routed), %d tokens per "
+                    "draft — V41_DSPARK=0 turns it off\n",
+            c->n_mtp, c->spec_routed, c->spec_activated, c->spec_block);
+}
+
+/* model.py DSparkAttention.forward.
+ *
+ * `main_x` carries the positions the main model has just committed: their keys go into
+ * this stage's ring, which is what makes the draft head see the real sequence rather
+ * than its own guesses. With `out` NULL that is all this does, which is the prefill
+ * call and the catch-up for positions that were accepted from a previous draft.
+ *
+ * The drafts then query that ring plus each other. Every draft row reads every other
+ * one, future included: the vendor hands the same index list to all of them, and it is
+ * right that it does -- the block is one guess, not a sequence anything committed to. */
+static void spec_attention(Model *m, int stage, const float *x, int block, int start_pos,
+                           const float *main_x, int main_rows, float *out) {
+    Cfg *c = &m->c;
+    Layer *l = &m->spec.stage[stage];
+    int dim = c->dim, hd = c->head_dim, nh = c->n_heads, rd = c->rope_dim, win = c->window;
+    const float *rope = m->rope_window;          /* a stage never compresses */
+    double started = now_s();
+    float *scratch = xmalloc((size_t)(nh * hd > dim ? nh * hd : dim) * sizeof(float), "spec scratch");
+
+    for (int t = 0; t < main_rows; t++) {
+        int pos = start_pos + t;
+        float *slot = l->window + (size_t)(pos % win) * hd;
+        mv8(scratch, &l->wkv, main_x + (size_t)t * dim);
+        rms_into(slot, scratch, l->kv_norm.w, hd, c->norm_eps);
+        rope_apply(slot + hd - rd, rope, pos, rd, 0);
+        l->window_pos[pos % win] = pos;
+    }
+    if (!out) { free(scratch); m->t_attn += now_s() - started; return; }
+
+    float *qr = xmalloc((size_t)c->q_lora * sizeof(float), "spec q latent");
+    float *q = xmalloc((size_t)block * nh * hd * sizeof(float), "spec queries");
+    float *kv = xmalloc((size_t)block * hd * sizeof(float), "spec kv");
+    for (int i = 0; i < block; i++) {
+        int pos = start_pos + main_rows + i;
+        mv8(scratch, &l->wq_a, x + (size_t)i * dim);
+        rms_into(qr, scratch, l->q_norm.w, c->q_lora, c->norm_eps);
+        mv8(q + (size_t)i * nh * hd, &l->wq_b, qr);
+        for (int h = 0; h < nh; h++)
+            rope_apply(q + (size_t)i * nh * hd + (size_t)h * hd + hd - rd, rope, pos, rd, 0);
+        mv8(scratch, &l->wkv, x + (size_t)i * dim);
+        rms_into(kv + (size_t)i * hd, scratch, l->kv_norm.w, hd, c->norm_eps);
+        rope_apply(kv + (size_t)i * hd + hd - rd, rope, pos, rd, 0);
+    }
+
+    int filled = start_pos + main_rows;
+    int reach = win < filled ? win : filled;
+    int total = reach + block;
+    int *idx = xmalloc((size_t)total * sizeof(int), "spec indices");
+    for (int j = 0; j < reach; j++) idx[j] = j;
+    for (int j = 0; j < block; j++) idx[reach + j] = win + j;
+    float *kv_all = xmalloc((size_t)(win + block) * hd * sizeof(float), "spec kv all");
+    memcpy(kv_all, l->window, (size_t)win * hd * sizeof(float));
+    memcpy(kv_all + (size_t)win * hd, kv, (size_t)block * hd * sizeof(float));
+
+    float *heads = xmalloc((size_t)nh * hd * sizeof(float), "spec heads");
+    float scale = 1.0f / sqrtf((float)hd);
+    for (int i = 0; i < block; i++) {
+        int pos = start_pos + main_rows + i;
+        #pragma omp parallel for schedule(static)
+        for (int h = 0; h < nh; h++)
+            sparse_attend(heads + (size_t)h * hd, q + (size_t)i * nh * hd + (size_t)h * hd,
+                          kv_all, idx, total, nh, hd, l->attn_sink.w[h], scale);
+        for (int h = 0; h < nh; h++)
+            rope_apply(heads + (size_t)h * hd + hd - rd, rope, pos, rd, 1);
+        attn_project_out(m, l, heads, out + (size_t)i * dim);
+    }
+    m->t_attn += now_s() - started;
+    free(heads); free(kv_all); free(idx); free(kv); free(q); free(qr); free(scratch);
+}
+
+/* One DSpark round. `main_rows` positions have just been committed by the main model,
+ * starting at `start_pos`; `token` is the one it produced from the last of them.
+ *
+ * Returns how many drafts were written, 0 when there is nothing to draft from -- the
+ * prefill call, which exists only to fill the stages' rings from the prompt. */
+static int spec_step(Model *m, int token, int start_pos, int main_rows,
+                     int *draft, float *confidence) {
+    Cfg *c = &m->c;
+    Spec *sp = &m->spec;
+    if (!sp->active || !m->main_hidden || m->main_hidden_rows < main_rows) return 0;
+    int dim = c->dim, hc = c->hc_mult, block = c->spec_block;
+    int targets = c->n_spec_targets, rank = c->markov_rank, vocab = c->vocab;
+    double started = now_s();
+
+    float *scratch = xmalloc((size_t)dim * sizeof(float), "spec projection");
+    float *main_x = xmalloc((size_t)main_rows * dim * sizeof(float), "spec main input");
+    for (int t = 0; t < main_rows; t++) {
+        mv8(scratch, &sp->main_proj, m->main_hidden + (size_t)t * targets * dim);
+        rms_into(main_x + (size_t)t * dim, scratch, sp->main_norm.w, dim, c->norm_eps);
+    }
+    if (start_pos == 0) {
+        for (int stage = 0; stage < c->n_mtp; stage++)
+            spec_attention(m, stage, NULL, 0, 0, main_x, main_rows, NULL);
+        free(main_x); free(scratch);
+        return 0;
+    }
+
+    float *h = xmalloc((size_t)block * hc * dim * sizeof(float), "spec streams");
+    for (int i = 0; i < block; i++) {
+        int id = i == 0 ? token : c->spec_noise;
+        const uint16_t *row = m->embed.w + (size_t)id * dim;
+        for (int copy = 0; copy < hc; copy++)
+            for (int j = 0; j < dim; j++)
+                h[((size_t)i * hc + copy) * dim + j] = bf16_to_f32(row[j]);
+    }
+    float *pre_mix = xmalloc((size_t)block * hc * sizeof(float), "spec pre mix");
+    for (int i = 0; i < block; i++)
+        for (int copy = 0; copy < hc; copy++) pre_mix[(size_t)i * hc + copy] = copy == 0 ? 1.0f : 0.0f;
+
+    float *branch_in = xmalloc((size_t)block * dim * sizeof(float), "spec sublayer in");
+    float *branch_out = xmalloc((size_t)block * dim * sizeof(float), "spec sublayer out");
+    float *residual = xmalloc((size_t)block * hc * dim * sizeof(float), "spec residual");
+    float *pre = xmalloc((size_t)block * hc * sizeof(float), "spec hc pre");
+    float *post = xmalloc((size_t)block * hc * sizeof(float), "spec hc post");
+    float *comb = xmalloc((size_t)block * hc * hc * sizeof(float), "spec hc comb");
+    float *collapsed = xmalloc((size_t)dim * sizeof(float), "spec collapsed");
+
+    for (int stage = 0; stage < c->n_mtp; stage++) {
+        Layer *l = &sp->stage[stage];
+        memcpy(residual, h, (size_t)block * hc * dim * sizeof(float));
+        for (int i = 0; i < block; i++) {
+            hc_mixes(m, l->hc_attn_fn.w, l->hc_attn_scale.w, l->hc_attn_base.w,
+                     h + (size_t)i * hc * dim, pre + (size_t)i * hc,
+                     post + (size_t)i * hc, comb + (size_t)i * hc * hc);
+            const float *mix = pre_mix + (size_t)i * hc;
+            for (int j = 0; j < dim; j++) {
+                float sum = 0.0f;
+                for (int copy = 0; copy < hc; copy++)
+                    sum += mix[copy] * h[((size_t)i * hc + copy) * dim + j];
+                collapsed[j] = sum;
+            }
+            rms_into(branch_in + (size_t)i * dim, collapsed, l->attn_norm.w, dim, c->norm_eps);
+        }
+        spec_attention(m, stage, branch_in, block, start_pos, main_x, main_rows, branch_out);
+        for (int i = 0; i < block; i++)
+            coli_hc_post(h + (size_t)i * hc * dim, branch_out + (size_t)i * dim,
+                         residual + (size_t)i * hc * dim, post + (size_t)i * hc,
+                         comb + (size_t)i * hc * hc, hc, dim);
+        memcpy(pre_mix, pre, (size_t)block * hc * sizeof(float));
+
+        memcpy(residual, h, (size_t)block * hc * dim * sizeof(float));
+        for (int i = 0; i < block; i++) {
+            hc_mixes(m, l->hc_ffn_fn.w, l->hc_ffn_scale.w, l->hc_ffn_base.w,
+                     h + (size_t)i * hc * dim, pre + (size_t)i * hc,
+                     post + (size_t)i * hc, comb + (size_t)i * hc * hc);
+            const float *mix = pre_mix + (size_t)i * hc;
+            for (int j = 0; j < dim; j++) {
+                float sum = 0.0f;
+                for (int copy = 0; copy < hc; copy++)
+                    sum += mix[copy] * h[((size_t)i * hc + copy) * dim + j];
+                collapsed[j] = sum;
+            }
+            rms_into(branch_in + (size_t)i * dim, collapsed, l->ffn_norm.w, dim, c->norm_eps);
+            moe_run_at(m, l, &sp->cache[stage], "mtp", stage, c->spec_routed, c->spec_activated,
+                       branch_in + (size_t)i * dim, branch_out + (size_t)i * dim);
+        }
+        for (int i = 0; i < block; i++)
+            coli_hc_post(h + (size_t)i * hc * dim, branch_out + (size_t)i * dim,
+                         residual + (size_t)i * hc * dim, post + (size_t)i * hc,
+                         comb + (size_t)i * hc * hc, hc, dim);
+        memcpy(pre_mix, pre, (size_t)block * hc * sizeof(float));
+    }
+
+    /* the head, then the Markov chain over the block: each position is biased by the
+     * token drafted for the one before it, which is the only thing tying the block
+     * together -- the stages saw the noise id at every position but the first */
+    float *final_x = xmalloc((size_t)block * dim * sizeof(float), "spec final");
+    float *logits = xmalloc((size_t)block * vocab * sizeof(float), "spec logits");
+    float *bias = xmalloc((size_t)vocab * sizeof(float), "spec markov bias");
+    float *embed = xmalloc((size_t)rank * sizeof(float), "spec markov embed");
+    float *joined = xmalloc((size_t)(dim + rank) * sizeof(float), "spec confidence input");
+    for (int i = 0; i < block; i++) {
+        const float *mix = pre_mix + (size_t)i * hc;
+        float *x = final_x + (size_t)i * dim;
+        for (int j = 0; j < dim; j++) {
+            float sum = 0.0f;
+            for (int copy = 0; copy < hc; copy++)
+                sum += mix[copy] * h[((size_t)i * hc + copy) * dim + j];
+            x[j] = sum;
+        }
+        rms_into(collapsed, x, sp->norm.w, dim, c->norm_eps);
+        mvb(logits + (size_t)i * vocab, &m->head, collapsed);
+    }
+    draft[0] = token;
+    for (int i = 0; i < block; i++) {
+        const uint16_t *row = sp->markov_embed.w + (size_t)draft[i] * rank;
+        for (int j = 0; j < rank; j++) embed[j] = bf16_to_f32(row[j]);
+        mvb(bias, &sp->markov_out, embed);
+        float *row_logits = logits + (size_t)i * vocab;
+        for (int v = 0; v < vocab; v++) row_logits[v] += bias[v];
+        draft[i + 1] = argmax(row_logits, vocab);     /* greedy: the drafts are verified */
+        memcpy(joined, final_x + (size_t)i * dim, (size_t)dim * sizeof(float));
+        memcpy(joined + dim, embed, (size_t)rank * sizeof(float));
+        float score = 0.0f;
+        mvb(&score, &sp->conf_proj, joined);
+        confidence[i] = score;
+    }
+    sp->rounds++;
+    m->t_spec += now_s() - started;
+    free(joined); free(embed); free(bias); free(logits); free(final_x);
+    free(collapsed); free(comb); free(post); free(pre); free(residual);
+    free(branch_out); free(branch_in); free(pre_mix); free(h);
+    free(main_x); free(scratch);
+    return block;
+}
+
+static void forward_full(Model *m, const int *ids, int n, float *logits, int all_logits,
+                         const float *image_rows, int image_at, int image_h, int image_w,
+                         const uint8_t *image_mask);
 
 static void forward(Model *m, const int *ids, int n, float *logits) {
-    forward_with_image(m, ids, n, logits, NULL, -1, 0, 0, NULL);
+    forward_full(m, ids, n, logits, 0, NULL, -1, 0, 0, NULL);
 }
 
 static void forward_with_image(Model *m, const int *ids, int n, float *logits,
                                const float *image_rows, int image_at, int image_h, int image_w,
                                const uint8_t *image_mask) {
+    forward_full(m, ids, n, logits, 0, image_rows, image_at, image_h, image_w, image_mask);
+}
+
+/* Several positions past the prompt, with one row of logits each: what a speculative
+ * step verifies its drafts with. Every piece of per-position state below -- the window
+ * ring's position map, the compressor's group slots, the indexer's reach, the index
+ * keys each row reads -- is written so that this is the same computation as the same
+ * tokens decoded one at a time, because a draft is only worth anything if accepting it
+ * is indistinguishable from having generated it. */
+static void forward_batch(Model *m, const int *ids, int n, float *logits) {
+    forward_full(m, ids, n, logits, 1, NULL, -1, 0, 0, NULL);
+}
+
+static void forward_full(Model *m, const int *ids, int n, float *logits, int all_logits,
+                         const float *image_rows, int image_at, int image_h, int image_w,
+                         const uint8_t *image_mask) {
     Cfg *c = &m->c;
     int dim = c->dim, hc = c->hc_mult;
     int start_pos = m->pos;
+    /* The index-key schedule for a batched step: which layer publishes at each of its
+     * sub-steps. It has to be known before the layers run, because a layer that comes
+     * later in the stack still publishes before this layer's later rows read. */
+    m->pub_before = m->published_index_k;
+    m->pub_before_layer = m->published_index_layer;
+    m->pub_rows = 0;
     if (n > 1 && start_pos > 0) {
-        fprintf(stderr, "[forward] chunked prefill past position 0 is not supported: the "
-                        "indexer's reachability mask is per-position only for the first "
-                        "chunk (model.py Indexer.forward)\n");
-        exit(1);
+        m->pub_layer = realloc(m->pub_layer, (size_t)n * sizeof(int));
+        if (!m->pub_layer) { fprintf(stderr, "OOM sizing the publish schedule\n"); exit(1); }
+        m->pub_rows = n;
+        for (int t = 0; t < n; t++) {
+            m->pub_layer[t] = -1;
+            for (int layer = 0; layer < c->n_layers; layer++)
+                if (layer_publishes(c, layer, start_pos + t)) m->pub_layer[t] = layer;
+        }
     }
     if (start_pos + n > c->max_positions) {
         fprintf(stderr, "CONTEXT_EXCEEDED %d %d\n", start_pos + n, c->max_positions);
@@ -1726,6 +2243,10 @@ static void forward_with_image(Model *m, const int *ids, int n, float *logits,
     for (int t = 0; t < n; t++)
         for (int copy = 0; copy < hc; copy++) pre_mix[(size_t)t * hc + copy] = copy == 0 ? 1.0f : 0.0f;
 
+    /* V41_TRACE=2 follows the FIRST row instead of the last: on a speculative step
+     * that is the position the sequential decode would have run on its own, which is
+     * what a divergence has to be compared against. */
+    int trace_row = (g_trace >= 2 && n > 1) ? 0 : n - 1;
     float *branch_in = xmalloc((size_t)n * dim * sizeof(float), "sublayer input");
     float *branch_out = xmalloc((size_t)n * dim * sizeof(float), "sublayer output");
     float *residual = xmalloc((size_t)n * hc * dim * sizeof(float), "residual copy");
@@ -1734,11 +2255,34 @@ static void forward_with_image(Model *m, const int *ids, int n, float *logits,
     float *comb = xmalloc((size_t)n * hc * hc * sizeof(float), "hc comb");
     float *collapsed = xmalloc((size_t)dim * sizeof(float), "collapsed stream");
 
+    /* What the DSpark head reads: the attention input of its target layers, the hc
+     * copies averaged. Kept even when no draft head is loaded is pointless, so it is
+     * gated on the model actually having one. */
+    int targets = m->spec.active ? c->n_spec_targets : 0;
+    if (targets) {
+        m->main_hidden = realloc(m->main_hidden,
+                                 (size_t)n * targets * dim * sizeof(float));
+        if (!m->main_hidden) { fprintf(stderr, "OOM sizing the DSpark input\n"); exit(1); }
+        m->main_hidden_rows = n;
+    }
+
     for (int layer = 0; layer < c->n_layers; layer++) {
         Layer *l = &m->L[layer];
         if (l->engram_index >= 0) engram_run(m, layer, h, n, start_pos);
+        for (int k = 0; k < targets; k++) {
+            if (c->spec_targets[k] != layer) continue;
+            for (int t = 0; t < n; t++) {
+                float *dest = m->main_hidden + ((size_t)t * targets + k) * dim;
+                for (int i = 0; i < dim; i++) {
+                    float sum = 0.0f;
+                    for (int copy = 0; copy < hc; copy++)
+                        sum += h[((size_t)t * hc + copy) * dim + i];
+                    dest[i] = sum / (float)hc;
+                }
+            }
+        }
 
-        trace("stream", layer, h + (size_t)(n - 1) * hc * dim, hc * dim);
+        trace("stream", layer, h + (size_t)trace_row * hc * dim, hc * dim);
         memcpy(residual, h, (size_t)n * hc * dim * sizeof(float));
         for (int t = 0; t < n; t++) {
             hc_mixes(m, l->hc_attn_fn.w, l->hc_attn_scale.w, l->hc_attn_base.w,
@@ -1753,12 +2297,12 @@ static void forward_with_image(Model *m, const int *ids, int n, float *logits,
             }
             rms_into(branch_in + (size_t)t * dim, collapsed, l->attn_norm.w, dim, c->norm_eps);
         }
-        trace("attn_in", layer, branch_in + (size_t)(n - 1) * dim, dim);
-        trace("attn_pre", layer, pre + (size_t)(n - 1) * hc, hc);
-        trace("attn_post", layer, post + (size_t)(n - 1) * hc, hc);
-        trace("attn_comb", layer, comb + (size_t)(n - 1) * hc * hc, hc * hc);
+        trace("attn_in", layer, branch_in + (size_t)trace_row * dim, dim);
+        trace("attn_pre", layer, pre + (size_t)trace_row * hc, hc);
+        trace("attn_post", layer, post + (size_t)trace_row * hc, hc);
+        trace("attn_comb", layer, comb + (size_t)trace_row * hc * hc, hc * hc);
         attention_run(m, layer, branch_in, n, start_pos, branch_out);
-        trace("attn_out", layer, branch_out + (size_t)(n - 1) * dim, dim);
+        trace("attn_out", layer, branch_out + (size_t)trace_row * dim, dim);
         for (int t = 0; t < n; t++)
             coli_hc_post(h + (size_t)t * hc * dim, branch_out + (size_t)t * dim,
                          residual + (size_t)t * hc * dim, post + (size_t)t * hc,
@@ -1780,7 +2324,7 @@ static void forward_with_image(Model *m, const int *ids, int n, float *logits,
             }
             rms_into(branch_in + (size_t)t * dim, collapsed, l->ffn_norm.w, dim, c->norm_eps);
             moe_run(m, layer, branch_in + (size_t)t * dim, branch_out + (size_t)t * dim);
-            if (t == n - 1) {
+            if (t == trace_row) {
                 trace("ffn_in", layer, branch_in + (size_t)t * dim, dim);
                 trace("ffn_out", layer, branch_out + (size_t)t * dim, dim);
             }
@@ -1793,19 +2337,23 @@ static void forward_with_image(Model *m, const int *ids, int n, float *logits,
     }
 
     /* the last block's FFN mix collapses the stream one final time */
-    const float *mix = pre_mix + (size_t)(n - 1) * hc;
-    for (int i = 0; i < dim; i++) {
-        float sum = 0.0f;
-        for (int copy = 0; copy < hc; copy++)
-            sum += mix[copy] * h[((size_t)(n - 1) * hc + copy) * dim + i];
-        collapsed[i] = sum;
+    for (int t = all_logits ? 0 : n - 1; t < n; t++) {
+        const float *mix = pre_mix + (size_t)t * hc;
+        for (int i = 0; i < dim; i++) {
+            float sum = 0.0f;
+            for (int copy = 0; copy < hc; copy++)
+                sum += mix[copy] * h[((size_t)t * hc + copy) * dim + i];
+            collapsed[i] = sum;
+        }
+        if (t == n - 1) trace("final", -1, collapsed, dim);
+        rms_into(branch_in, collapsed, m->norm.w, dim, c->norm_eps);
+        mvb(logits + (size_t)(all_logits ? t : 0) * c->vocab, &m->head, branch_in);
     }
-    trace("final", -1, collapsed, dim);
-    rms_into(branch_in, collapsed, m->norm.w, dim, c->norm_eps);
-    mvb(logits, &m->head, branch_in);
-    trace("logits", -1, logits, c->vocab);
+    trace("logits", -1, logits + (size_t)(all_logits ? n - 1 : 0) * c->vocab, c->vocab);
 
     m->pos += n;
+    m->last_start = start_pos;
+    m->last_rows = n;
     m->forwards++;
     free(collapsed); free(comb); free(post); free(pre);
     free(residual); free(branch_out); free(branch_in); free(pre_mix); free(h);
@@ -1828,6 +2376,7 @@ static void model_reset(Model *m) {
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
         memset(l->window, 0, (size_t)c->window * c->head_dim * sizeof(float));
+        for (int k = 0; k < c->window; k++) l->window_pos[k] = -1;
         int ratio = c->compress_ratio[i];
         if (c->kv_source[i]) {
             int slots = c->max_positions / (ratio > 0 ? ratio : 1);
@@ -1879,6 +2428,139 @@ static int serve_sample(const float *logits, int vocab, float temperature, float
     for (int i = 0; i < n; i++) { acc += rank[i].p; if (acc >= draw) { pick = rank[i].id; break; } }
     free(rank);
     return pick;
+}
+
+/* The probability `serve_sample` would give this token: the same temperature, the same
+ * top-p truncation, zero if the token falls outside the kept set. A greedy drafter
+ * proposes with probability 1, so accepting with probability p(draft) is exactly the
+ * speculative-sampling rule, and on a rejection the residual distribution is this one
+ * with the rejected token removed -- which is what banning it in the row does. */
+static double spec_accept_prob(const float *logits, int vocab, float temperature,
+                               float top_p, int token) {
+    SampleProb *rank = xmalloc((size_t)vocab * sizeof(SampleProb), "spec sampling");
+    float top = logits[0];
+    for (int i = 1; i < vocab; i++) if (logits[i] > top) top = logits[i];
+    double total = 0.0;
+    for (int i = 0; i < vocab; i++) {
+        float p = expf((logits[i] - top) / temperature);
+        total += p;
+        rank[i].p = p; rank[i].id = i;
+    }
+    qsort(rank, (size_t)vocab, sizeof(SampleProb), sample_desc);
+    double cut = (top_p > 0.0f && top_p < 1.0f) ? top_p * total : total, kept = 0.0;
+    int n = 0;
+    while (n < vocab && kept < cut) kept += rank[n++].p;
+    double probability = 0.0;
+    for (int i = 0; i < n; i++) if (rank[i].id == token) { probability = rank[i].p / kept; break; }
+    free(rank);
+    return probability;
+}
+
+/* Undo the part of a speculative step that was not committed.
+ *
+ * Most of the state needs nothing: the window ring keeps the rejected keys but they
+ * carry positions ahead of every query that follows, the compressed rows sit past what
+ * any query can reach, and the compressor's group slots are addressed by position, so
+ * the token that really lands there overwrites the draft before the group closes.
+ * Three things are not self-healing: how far the sequence has got, the engram history,
+ * and the two slots a layer publishes to -- all three are set here to what they would
+ * be after decoding exactly the committed prefix. */
+static void spec_rollback(Model *m, int start_pos, int committed, int rows) {
+    Cfg *c = &m->c;
+    int hd = c->head_dim;
+    /* Newest first, so a slot two rows touched comes back to what it held before the
+     * first of them -- which is the value the committed prefix left there. */
+    for (int layer = 0; layer < c->n_layers; layer++) {
+        Layer *l = &m->L[layer];
+        for (int t = rows - 1; t >= committed; t--) {
+            int slot = (start_pos + t) % c->window;
+            memcpy(l->window + (size_t)slot * hd, l->ring_save + (size_t)t * hd,
+                   (size_t)hd * sizeof(float));
+            l->window_pos[slot] = l->ring_save_pos[t];
+            if (!l->cstate_save_kv) continue;
+            int group = l->cstate_save_slot[t];
+            memcpy(l->cstate_kv + (size_t)group * hd, l->cstate_save_kv + (size_t)t * hd,
+                   (size_t)hd * sizeof(float));
+            memcpy(l->cstate_score + (size_t)group * hd, l->cstate_save_score + (size_t)t * hd,
+                   (size_t)hd * sizeof(float));
+        }
+    }
+    m->pos = start_pos + committed;
+    m->last_rows = committed;
+    if (m->engram.active && m->engram.history_len > m->pos) m->engram.history_len = m->pos;
+    if (m->pub_rows > 0) {
+        const float *published = m->pub_before;
+        int layer = m->pub_before_layer;
+        for (int t = committed - 1; t >= 0; t--)
+            if (m->pub_layer[t] >= 0) {
+                layer = m->pub_layer[t];
+                published = m->L[layer].ikey;
+                break;
+            }
+        m->published_index_k = published;
+        m->published_index_layer = layer;
+    }
+    /* the index list the layers before the next index source read is the one for the
+     * last committed position, not for the first row of the batch */
+    if (m->shared_topk && m->shared_topk_width > 0 && m->shared_topk_rows > committed - 1) {
+        int keep = committed - 1;
+        if (keep > 0)
+            memmove(m->shared_topk, m->shared_topk + (size_t)keep * m->shared_topk_width,
+                    (size_t)m->shared_topk_width * sizeof(int));
+        m->shared_topk_rows = 1;
+    }
+}
+
+/* Verify a block of drafts in one forward. `ids[0]` is the token the main model
+ * produced and is always committed; `ids[1..n-1]` are the drafts, accepted while they
+ * agree with what this forward says. `logits` comes back holding the continuation of
+ * the last committed position, and the caches are rolled back to it, so the caller can
+ * carry on as if the accepted tokens had been decoded one at a time -- which, position
+ * by position, is what they were. */
+static int spec_verify(Model *m, const int *ids, int n, float *logits,
+                       float temperature, float top_p) {
+    int vocab = m->c.vocab, start_pos = m->pos;
+    float *rows = xmalloc((size_t)n * vocab * sizeof(float), "verification logits");
+    forward_batch(m, ids, n, rows);
+    int accepted = 0, rejected = -1;
+    while (accepted < n - 1) {
+        const float *row = rows + (size_t)accepted * vocab;
+        int proposed = ids[accepted + 1];
+        int ok;
+        if (temperature <= 0.0f) ok = argmax(row, vocab) == proposed;
+        else ok = (double)rand() / RAND_MAX
+                  < spec_accept_prob(row, vocab, temperature, top_p, proposed);
+        if (!ok) { rejected = proposed; break; }
+        accepted++;
+    }
+    memcpy(logits, rows + (size_t)accepted * vocab, (size_t)vocab * sizeof(float));
+    if (rejected >= 0 && temperature > 0.0f) logits[rejected] = -INFINITY;
+    spec_rollback(m, start_pos, accepted + 1, n);
+    free(rows);
+    return accepted;
+}
+
+/* Is it worth drafting right now? Drafting reads the stages' experts whether or not
+ * anything is accepted, so a run of refusals is a disk bill with no token to show for
+ * it. The window is the vendor-independent part of every speculative decoder: measure,
+ * pause, measure again. */
+static int spec_ready(Spec *sp) {
+    if (!sp->active) return 0;
+    if (sp->pause > 0) {
+        if (--sp->pause == 0) sp->window_prop = sp->window_acc = 0;
+        return 0;
+    }
+    if (sp->window_prop >= 24 &&
+        sp->window_acc * 100 < sp->window_prop * (uint64_t)sp->min_accept) {
+        fprintf(stderr, "[v41] DSpark: %.0f%% of the last %llu drafts accepted (under "
+                        "%d%%), pausing for 64 tokens\n",
+                100.0 * (double)sp->window_acc / (double)sp->window_prop,
+                (unsigned long long)sp->window_prop, sp->min_accept);
+        sp->pause = 64;
+        sp->window_prop = sp->window_acc = 0;
+        return 0;
+    }
+    return 1;
 }
 
 static void serve_line(const char *format, ...) {
@@ -2066,9 +2748,15 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
         forward_with_image(m, ids, n_prompt, logits, aligned, image_at, image_h, image_w, image_mask);
         free(aligned); free(image_mask);
 
-        int emitted = 0, limited = 1, cancelled = 0;
+        int emitted = 0, limited = 1, cancelled = 0, done_early = 0;
         char piece[512];
-        for (int step = 0; step < budget; step++) {
+        int block = m->spec.active ? c->spec_block : 0;
+        int *batch = block ? xmalloc((size_t)(block + 1) * sizeof(int), "draft batch") : NULL;
+        float *confidence = block ? xmalloc((size_t)block * sizeof(float), "draft confidence") : NULL;
+        uint64_t proposed0 = m->spec.proposed, accepted0 = m->spec.accepted;
+        /* the prompt seeds the draft head's windows; nothing is drafted from it */
+        if (m->spec.active) spec_step(m, 0, m->last_start, m->last_rows, NULL, NULL);
+        while (emitted < budget && !cancelled && !done_early) {
             int token = serve_sample(logits, c->vocab, command.temperature, command.top_p);
             int stop = 0;
             for (int i = 0; i < n_eos; i++) if (token == eos_ids[i]) stop = 1;
@@ -2083,18 +2771,48 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             while (coli_serve_stdin_ready()) {
                 ColiServeCommand control;
                 ColiServeReadResult inner = coli_serve_read_command(stdin, &v41_wire, &control);
-                if (inner == COLI_SERVE_READ_EOF) { step = budget; break; }
+                if (inner == COLI_SERVE_READ_EOF) { done_early = 1; break; }
                 if (control.kind == COLI_SERVE_COMMAND_CANCEL &&
                     !strcmp(control.id, command.id)) cancelled = 1;
                 else if (control.kind == COLI_SERVE_COMMAND_STOP &&
-                         !strcmp(control.id, command.id)) { limited = 0; step = budget; }
+                         !strcmp(control.id, command.id)) { limited = 0; done_early = 1; }
                 else if (control.kind == COLI_SERVE_COMMAND_SUBMIT)
                     coli_serve_write_error(stdout, control.id, "SLOT_BUSY");
                 coli_serve_command_dispose(&control);
             }
-            if (cancelled) break;
-            if (step + 1 < budget) forward(m, &token, 1, logits);
+            if (cancelled || done_early || emitted >= budget) break;
+
+            /* DSpark: draft the next few tokens, then verify them in ONE forward. What
+             * survives verification is emitted here; what does not costs the round its
+             * remaining drafts and nothing else, because the caches are rolled back to
+             * the last token that agreed. */
+            int drafted = spec_ready(&m->spec)
+                        ? spec_step(m, token, m->last_start, m->last_rows, batch, confidence) : 0;
+            if (m->spec.max_verify > 0 && drafted > m->spec.max_verify) drafted = m->spec.max_verify;
+            if (drafted > budget - emitted) drafted = budget - emitted;
+            if (drafted <= 0) { forward(m, &token, 1, logits); continue; }
+            batch[0] = token;
+            int accepted = spec_verify(m, batch, drafted + 1, logits,
+                                       command.temperature, command.top_p);
+            m->spec.proposed += (uint64_t)drafted;
+            m->spec.accepted += (uint64_t)accepted;
+            m->spec.window_prop += (uint64_t)drafted;
+            m->spec.window_acc += (uint64_t)accepted;
+            for (int i = 0; i < accepted; i++) {
+                int drafted_token = batch[1 + i];
+                int drafted_stop = 0;
+                for (int k = 0; k < n_eos; k++) if (drafted_token == eos_ids[k]) drafted_stop = 1;
+                if (drafted_stop) { limited = 0; done_early = 1; break; }
+                written = tok_decode(tokenizer, &drafted_token, 1, piece, (int)sizeof(piece));
+                if (written > 0) coli_serve_write_data(stdout, command.id, piece, (size_t)written);
+                emitted++;
+            }
         }
+        free(batch); free(confidence);
+        if (m->spec.active && m->spec.proposed > proposed0)
+            fprintf(stderr, "[v41] DSpark: %llu of %llu drafts accepted this turn\n",
+                    (unsigned long long)(m->spec.accepted - accepted0),
+                    (unsigned long long)(m->spec.proposed - proposed0));
         if (cancelled) {
             coli_serve_write_error(stdout, command.id, "CANCELLED");
             coli_serve_command_dispose(&command);
@@ -2135,7 +2853,7 @@ int main(int argc, char **argv) {
     int cap = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 8;
     const char *ref_path = argc > 2 ? argv[2] : NULL;
     int engram_rows = getenv("V41_ENGRAM_ROWS") ? atoi(getenv("V41_ENGRAM_ROWS")) : 65536;
-    g_trace = getenv("V41_TRACE") && atoi(getenv("V41_TRACE"));
+    g_trace = getenv("V41_TRACE") ? atoi(getenv("V41_TRACE")) : 0;
 
     Model m;
     memset(&m, 0, sizeof(m));
@@ -2210,16 +2928,96 @@ int main(int argc, char **argv) {
     float *logits = xmalloc((size_t)c->vocab * sizeof(float), "logits");
     double prefill_started = now_s();
     forward(&m, prompt, n_prompt, logits);
+    if (m.spec.active) spec_step(&m, 0, m.last_start, m.last_rows, NULL, NULL);
     double prefill = now_s() - prefill_started;
+
+    /* DSpark, when the fixture describes it. Two things are checked, and they are
+     * different things: that the draft head produces the vendor's block (the reference
+     * records one per step), and that a block VERIFIED in a single forward emits the
+     * same tokens as decoding them one at a time. The second is what makes accepting a
+     * draft safe, and a tiny fixture's random draft head never proposes anything worth
+     * accepting, so V41_SPEC_FORCE drafts the reference's own next tokens instead:
+     * 1 accepts the whole block, 2 corrupts the last draft so the round is rejected
+     * part way and the rollback runs. */
+    jval *spec_ref = json_get(root, "spec");
+    jval *spec_drafts = spec_ref && spec_ref->t == J_OBJ ? json_get(spec_ref, "drafts") : NULL;
+    jval *spec_conf = spec_ref && spec_ref->t == J_OBJ ? json_get(spec_ref, "confidence") : NULL;
+    int force = getenv("V41_SPEC_FORCE") ? atoi(getenv("V41_SPEC_FORCE")) : 0;
+    int block = m.spec.active ? c->spec_block : 0;
+    int *draft = block ? xmalloc((size_t)(block + 1) * sizeof(int), "drafts") : NULL;
+    float *confidence = block ? xmalloc((size_t)block * sizeof(float), "draft confidence") : NULL;
+    int spec_failed = 0, spec_checked = 0, round = 0;
+    uint64_t forced_prop = 0, forced_acc = 0;
 
     int matched = 0;
     double decode_started = now_s();
-    for (int step = 0; step < n_expected; step++) {
+    for (int step = 0; step < n_expected; ) {
         int token = argmax(logits, c->vocab);
         printf("%s%d", step ? " " : "", token);
         if (token == expected[step]) matched++;
         else fprintf(stderr, "\n[mismatch] step %d: got %d, reference %d\n", step, token, expected[step]);
-        forward(&m, &token, 1, logits);
+        step++;
+        if (step >= n_expected) break;
+
+        int one_at_a_time = m.last_rows == 1;
+        int drafted = m.spec.active
+                    ? spec_step(&m, token, m.last_start, m.last_rows, draft, confidence) : 0;
+        /* The reference drafts after every single-token forward. Once a round has been
+         * accepted the engine is a step ahead of that loop -- it committed several
+         * positions in one forward -- and its next block is a different, equally
+         * correct thing. Compare only where the two loops line up. */
+        if (drafted && one_at_a_time && spec_drafts && round < spec_drafts->len) {
+            jval *want = spec_drafts->kids[round];
+            jval *want_conf = spec_conf && round < spec_conf->len ? spec_conf->kids[round] : NULL;
+            for (int i = 0; i <= drafted && i < want->len; i++) {
+                int reference_id = (int)want->kids[i]->num;
+                if (draft[i] == reference_id) continue;
+                fprintf(stderr, "[dspark] round %d, draft %d: got %d, reference %d\n",
+                        round, i, draft[i], reference_id);
+                spec_failed = 1;
+            }
+            for (int i = 0; want_conf && i < drafted && i < want_conf->len; i++) {
+                double delta = fabs(confidence[i] - want_conf->kids[i]->num);
+                if (delta < 2e-3) continue;
+                fprintf(stderr, "[dspark] round %d, confidence %d: got %.5f, reference %.5f\n",
+                        round, i, confidence[i], want_conf->kids[i]->num);
+                spec_failed = 1;
+            }
+            spec_checked++;
+        }
+        if (drafted > 0 && one_at_a_time) round++;   /* the prefill call drafts nothing */
+
+        if (force && drafted > 0) {
+            if (m.spec.max_verify > 0 && drafted > m.spec.max_verify) drafted = m.spec.max_verify;
+            int room = n_expected - step;
+            if (drafted > room) drafted = room;
+            /* 3 keeps the head's own drafts, which is what serving does; 1 and 2 put
+             * the reference's tokens in their place so the verification path runs at
+             * full width even on a fixture whose draft head is random noise */
+            if (force < 3) {
+                for (int i = 0; i < drafted; i++) draft[1 + i] = expected[step + i];
+                if (force >= 2 && drafted > 0)
+                    draft[drafted] = (draft[drafted] + 1) % c->vocab;   /* one bad draft */
+            }
+        } else {
+            drafted = 0;                       /* the plain oracle decodes one at a time */
+        }
+        if (drafted > 0) {
+            draft[0] = token;
+            int accepted = spec_verify(&m, draft, drafted + 1, logits, 0.0f, 1.0f);
+            forced_prop += (uint64_t)drafted;
+            forced_acc += (uint64_t)accepted;
+            for (int i = 0; i < accepted && step < n_expected; i++) {
+                int drafted_token = draft[1 + i];
+                printf(" %d", drafted_token);
+                if (drafted_token == expected[step]) matched++;
+                else fprintf(stderr, "\n[mismatch] step %d: accepted draft %d, reference %d\n",
+                             step, drafted_token, expected[step]);
+                step++;
+            }
+        } else {
+            forward(&m, &token, 1, logits);
+        }
     }
     double decode = now_s() - decode_started;
     printf("\n");
@@ -2237,6 +3035,19 @@ int main(int argc, char **argv) {
                     (long long)m.engram.table[t].rows,
                     (unsigned long long)m.engram.table[t].hits,
                     (unsigned long long)m.engram.table[t].misses);
+    if (spec_checked)
+        fprintf(stderr, "[v41] DSpark: checked %d draft round%s against the reference%s\n",
+                spec_checked, spec_checked == 1 ? "" : "s", spec_failed ? "  MISMATCH" : "");
+    if (forced_prop)
+        fprintf(stderr, "[v41] DSpark: %llu of %llu forced drafts accepted, %d forwards "
+                        "for %d tokens\n", (unsigned long long)forced_acc,
+                (unsigned long long)forced_prop, (int)m.forwards, n_expected);
+    if (force && !forced_prop) {
+        fprintf(stderr, "[v41] V41_SPEC_FORCE is set but nothing was drafted: the "
+                        "verification path was NOT exercised\n");
+        spec_failed = 1;
+    }
+    free(confidence); free(draft);
     free(logits); free(prompt); free(expected); json_free(root); free(arena); free(text);
-    return (matched == n_expected && !vision_failed) ? 0 : 1;
+    return (matched == n_expected && !vision_failed && !spec_failed) ? 0 : 1;
 }

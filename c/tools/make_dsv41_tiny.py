@@ -89,7 +89,11 @@ def tiny_config() -> dict:
         engram_head_dim=32,
         engram_vocab_size=97,
         engram_pad_id=2,
-        max_seq_len=64,
+        # 256 positions: a chat turn with an image costs about fifty tokens of
+        # template before the span starts, and the gateway refuses a prompt that
+        # does not fit. The reference tokens do not depend on it -- the YaRN
+        # correction reads original_seq_len, and this only sets the table length.
+        max_seq_len=256,
         # the vision tower, at toy dimensions but with the released structure: a
         # full-attention ViT with 2D RoPE, then a ratio x ratio aligner into `dim`
         vision_n_layers=2,
@@ -101,6 +105,16 @@ def tiny_config() -> dict:
         vision_downsample_ratio=3,
         vision_max_n_token=64,
         image_token_id=255,
+        # DSpark, the MTP draft head: its own small stages under the mtp.* namespace,
+        # reading the attention input of the last layers of the backbone. The released
+        # model drafts 5 tokens from 3 stages of 128 experts; here 3 from 2 stages of 4.
+        n_mtp_layers=2,
+        dspark_block_size=3,
+        dspark_noise_token_id=7,
+        dspark_target_layer_ids=[3, 4, 5],
+        dspark_markov_rank=32,
+        dspark_n_routed_experts=4,
+        dspark_n_activated_experts=2,
     )
 
 
@@ -143,6 +157,44 @@ def engram_layout(cfg: dict) -> dict:
         multipliers.append([int(v) * 2 + 1 for v in values])
     return dict(primes=primes, offsets=[[int(o) for o in row] for row in offsets],
                 multipliers=multipliers, num_embeddings=nrows)
+
+
+IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
+
+
+def write_tokenizer(out: Path, cfg: dict) -> None:
+    """A byte tokenizer for the fixture, with the image placeholder as one atomic id.
+
+    The gateway sends the engine text, not ids: an image span is a run of
+    `IMAGE_PLACEHOLDER`, and the engine finds the span by looking for
+    `image_token_id`. That only lines up if the placeholder encodes as exactly one
+    token, so the fixture's tokenizer has to carry it as an added token at that id --
+    a byte vocabulary alone would split it into fifteen and the span would never be
+    found. The id it takes over is the last byte's, which no ASCII prompt reaches.
+    """
+    from make_edge_tiny_tokenizer import byte_symbols
+
+    image_id = cfg["image_token_id"]
+    vocab = {symbol: token for token, symbol in enumerate(byte_symbols()[: cfg["vocab_size"]])}
+    vocab = {symbol: token for symbol, token in vocab.items() if token != image_id}
+    vocab[IMAGE_PLACEHOLDER] = image_id
+    payload = {
+        "version": "1.0", "truncation": None, "padding": None,
+        "added_tokens": [{"id": image_id, "content": IMAGE_PLACEHOLDER, "single_word": False,
+                          "lstrip": False, "rstrip": False, "normalized": False, "special": True}],
+        "normalizer": None,
+        "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": False,
+                          "trim_offsets": True, "use_regex": True},
+        "post_processor": None,
+        "decoder": {"type": "ByteLevel", "add_prefix_space": False,
+                    "trim_offsets": True, "use_regex": True},
+        "model": {"type": "BPE", "dropout": None, "unk_token": None,
+                  "continuing_subword_prefix": "", "end_of_word_suffix": "",
+                  "fuse_unk": False, "byte_fallback": False, "ignore_merges": True,
+                  "vocab": vocab, "merges": []},
+    }
+    (out / "tokenizer.json").write_text(json.dumps(payload, ensure_ascii=False) + "\n",
+                                        encoding="utf-8")
 
 
 def build(out: Path, cfg: dict, ref_path: Path | None, max_new: int, prompt_len: int):
@@ -260,6 +312,61 @@ def build(out: Path, cfg: dict, ref_path: Path | None, max_new: int, prompt_len:
             f32(p + "engram.q_weight", torch.ones(hc, dim) + torch.randn(hc, dim) * 0.05)
             f32(p + "engram.k_weight", torch.ones(hc, dim) + torch.randn(hc, dim) * 0.05)
 
+    # --- DSpark stages (mtp.*) ------------------------------------------------
+    # Same block as the backbone -- hyper-connections, window attention, a routed MoE --
+    # with three differences the engine has to honour: no compressor and no indexer (a
+    # stage is window-only), a smaller expert set, and the extra heads on the last
+    # stage. The token embedding and the output head are the backbone's, tied, which is
+    # why convert.py drops mtp.*.embed.weight and mtp.*.head.weight from the checkpoint.
+    targets = cfg["dspark_target_layer_ids"]
+    rank = cfg["dspark_markov_rank"]
+    for stage in range(cfg["n_mtp_layers"]):
+        p = f"mtp.{stage}."
+        for which in ("attn_norm", "ffn_norm"):
+            t = torch.ones(dim) + torch.randn(dim) * 0.01
+            tensors[p + which + ".weight"] = t.to(torch.bfloat16)
+            dequant[p + which + ".weight"] = tensors[p + which + ".weight"].to(torch.float32)
+        mix_hc = (2 + hc) * hc
+        for which in ("attn", "ffn"):
+            f32(p + f"hc_{which}_fn", torch.randn(mix_hc, hc * dim) * 0.01)
+            f32(p + f"hc_{which}_base", torch.randn(mix_hc) * 0.1)
+            f32(p + f"hc_{which}_scale", torch.ones(3) * 0.5)
+        f32(p + "attn.attn_sink", torch.randn(nh) * 0.1)
+        fp8(p + "attn.wq_a.weight", cfg["q_lora_rank"], dim)
+        bf16(p + "attn.q_norm.weight", cfg["q_lora_rank"], scale=0.0)
+        dequant[p + "attn.q_norm.weight"] += 1.0
+        tensors[p + "attn.q_norm.weight"] = dequant[p + "attn.q_norm.weight"].to(torch.bfloat16)
+        fp8(p + "attn.wq_b.weight", nh * hd, cfg["q_lora_rank"])
+        fp8(p + "attn.wkv.weight", hd, dim)
+        bf16(p + "attn.kv_norm.weight", hd, scale=0.0)
+        dequant[p + "attn.kv_norm.weight"] += 1.0
+        tensors[p + "attn.kv_norm.weight"] = dequant[p + "attn.kv_norm.weight"].to(torch.bfloat16)
+        fp8(p + "attn.wo_a.weight", cfg["o_groups"] * cfg["o_lora_rank"], nh * hd // cfg["o_groups"])
+        fp8(p + "attn.wo_b.weight", dim, cfg["o_groups"] * cfg["o_lora_rank"])
+        bf16(p + "ffn.gate.weight", cfg["dspark_n_routed_experts"], dim, scale=0.05)
+        f32(p + "ffn.gate.bias", torch.randn(cfg["dspark_n_routed_experts"]) * 0.1)
+        for e in range(cfg["dspark_n_routed_experts"]):
+            q = p + f"ffn.experts.{e}."
+            fp4(q + "w1.weight", cfg["moe_inter_dim"], dim)
+            fp4(q + "w3.weight", cfg["moe_inter_dim"], dim)
+            fp4(q + "w2.weight", dim, cfg["moe_inter_dim"])
+        sh = p + "ffn.shared_experts."
+        fp8(sh + "w1.weight", cfg["moe_inter_dim"], dim)
+        fp8(sh + "w3.weight", cfg["moe_inter_dim"], dim)
+        fp8(sh + "w2.weight", dim, cfg["moe_inter_dim"])
+        if stage == 0:
+            fp8(p + "main_proj.weight", dim, dim * len(targets))
+            bf16(p + "main_norm.weight", dim, scale=0.0)
+            dequant[p + "main_norm.weight"] += 1.0
+            tensors[p + "main_norm.weight"] = dequant[p + "main_norm.weight"].to(torch.bfloat16)
+        if stage == cfg["n_mtp_layers"] - 1:
+            bf16(p + "norm.weight", dim, scale=0.0)
+            dequant[p + "norm.weight"] += 1.0
+            tensors[p + "norm.weight"] = dequant[p + "norm.weight"].to(torch.bfloat16)
+            bf16(p + "markov_head.embed.weight", cfg["vocab_size"], rank, scale=0.02)
+            bf16(p + "markov_head.head.weight", cfg["vocab_size"], rank, scale=0.02)
+            bf16(p + "confidence_head.proj.weight", 1, dim + rank, scale=0.05)
+
     # --- vision tower ---------------------------------------------------------
     vdim, vheads, vinter = cfg["vision_dim"], cfg["vision_n_heads"], cfg["vision_inter_dim"]
     patch_in = 3 * cfg["vision_patch_size"] ** 2
@@ -331,6 +438,7 @@ def build(out: Path, cfg: dict, ref_path: Path | None, max_new: int, prompt_len:
                             engram_pad_token_id=cfg["engram_pad_id"]),
     }
     (out / "config.json").write_text(json.dumps(config, indent=2))
+    write_tokenizer(out, cfg)
 
     # the engram sidecar: what the engine cannot derive without sympy and a tokenizer
     (out / "dsv41_engram.json").write_text(json.dumps({
@@ -368,11 +476,25 @@ def build(out: Path, cfg: dict, ref_path: Path | None, max_new: int, prompt_len:
     compressed = [token_map[i] for i in prompt]
     logits = model.forward(prompt, compressed)
     ids, out_ids = list(prompt), []
+    # DSpark rides along: the draft head reads what the main forward just produced, so
+    # every step records the block it would have proposed. The engine has to reproduce
+    # these exactly -- a draft head that drifts costs nothing in correctness (the main
+    # model verifies every token) and everything in speed, which is the failure mode
+    # that hides.
+    spec = {"block_size": cfg["dspark_block_size"], "start_pos": [],
+            "drafts": [], "confidence": []}
+    nxt = int(logits.argmax())
+    model.spec_forward(nxt, model.main_hidden, 0)      # prefill: seeds the stage windows
     for _ in range(max_new):
-        nxt = int(logits.argmax())
         out_ids.append(nxt)
         ids.append(nxt)
+        start_pos = len(ids) - 1
         logits = model.forward([nxt], [token_map[nxt]])
+        nxt = int(logits.argmax())
+        draft, confidence = model.spec_forward(nxt, model.main_hidden, start_pos)
+        spec["start_pos"].append(start_pos)
+        spec["drafts"].append(draft)
+        spec["confidence"].append([round(float(v), 5) for v in confidence])
     # the vision tower gets its own reference: a fixed patch grid in, the aligner's
     # rows out. The engine is held to these, so a ViT that drifts fails here rather
     # than as an image that describes itself slightly wrong.
@@ -386,6 +508,7 @@ def build(out: Path, cfg: dict, ref_path: Path | None, max_new: int, prompt_len:
         "model": "dsv41_tiny", "seed": SEED,
         "prompt_ids": prompt, "output_ids": out_ids,
         "full_ids": prompt + out_ids,
+        "spec": spec,
         "vision": {
             "grid_h": n_h, "grid_w": n_w,
             "patches": [round(float(v), 6) for v in patches.reshape(-1)],
@@ -395,6 +518,7 @@ def build(out: Path, cfg: dict, ref_path: Path | None, max_new: int, prompt_len:
     }, indent=2))
     print(f"ref -> {ref_path}")
     print(f"  prompt {prompt[:8]}...  output {out_ids}")
+    print(f"  dspark drafts {spec['drafts'][0]} ...")
 
 
 def main() -> int:

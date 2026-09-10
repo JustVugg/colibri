@@ -43,10 +43,14 @@ class Dsv41DashboardTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.port = free_port()
+        # Drafts off: one forward per token is what the profile assertion below is
+        # about, and a draft head that got lucky would fold two tokens into one
+        # forward. tests/test_dsv41_dspark_serve.py covers the other path.
         cls.proc = subprocess.Popen(
             [sys.executable, str(HERE / "coli"), "serve", "--model", str(FIXTURE),
              "--port", str(cls.port), "--cap", "4"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            env={**os.environ, "V41_DSPARK": "0"})
         deadline = time.time() + 180
         while time.time() < deadline:
             try:

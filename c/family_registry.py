@@ -726,7 +726,12 @@ def _dsv41_geometry(config, context, _model_dir):
     if not isinstance(sources, list):
         raise ValueError("deepseek_v41: kv_source_layer_ids must be a list")
 
-    fixed = layers * window * head_dim * 4
+    # The DSpark stages keep a window ring each, on the same terms as a layer: their
+    # attention is window-only, and the window holds the main stream's keys.
+    stages = section.get("n_mtp_layers") or 0
+    if not isinstance(stages, int) or isinstance(stages, bool) or stages < 0:
+        raise ValueError("deepseek_v41: n_mtp_layers must be a non-negative integer")
+    fixed = (layers + stages) * window * head_dim * 4
     state = 0
     for layer in sources:
         if not isinstance(layer, int) or isinstance(layer, bool) or not 0 <= layer < layers:
@@ -739,6 +744,9 @@ def _dsv41_geometry(config, context, _model_dir):
 
     workspace = (context * hc_mult * hidden * 2 + context * hidden * 2 + hidden) * 4
     return PlannerGeometry(state, fixed, workspace, experts)
+
+
+_DSV41_MTP_EXPERT = re.compile(r"^mtp\.(\d+)\.ffn\.experts\.(\d+)\.")
 
 
 _GLM_EXPERT = re.compile(
@@ -777,6 +785,30 @@ def _individual_expert_inventory(pattern):
             return ()
         return ((int(match.group(1)), int(match.group(2)), size),)
     return inventory
+
+
+def _dsv41_expert_inventory(name, size, config, _dtype=None):
+    """Routed experts, the backbone's and the DSpark head's alike.
+
+    A draft stage streams its experts exactly as a layer does -- its own LRU, its own
+    smaller set -- so they belong in the expert inventory and not in the resident
+    weights, where three stages of 128 experts would be 7 GB of RAM the engine never
+    holds. They are filed after the last real layer, which is where the vendor's own
+    numbering puts them: `DSparkBlock(args.n_layers + stage_id, args)`. The planner
+    then prices one cache slot per stage, which is what the engine allocates.
+    """
+    match = _V4_EXPERT.search(name)
+    if match is not None:
+        return ((int(match.group(1)), int(match.group(2)), size),)
+    match = _DSV41_MTP_EXPERT.search(name)
+    if match is None:
+        return ()
+    section = config.get("text_config", config)
+    layers = section.get("num_hidden_layers")
+    if not isinstance(layers, int) or isinstance(layers, bool) or layers < 1:
+        raise ValueError("deepseek_v41: num_hidden_layers is required to place the "
+                         "DSpark stages after the backbone")
+    return ((layers + int(match.group(1)), int(match.group(2)), size),)
 
 
 def _inkling_expert_inventory(name, size, config, _dtype=None):
@@ -1269,10 +1301,13 @@ FAMILIES = (
         planner_id="deepseek_v41",
         planner_geometry=_dsv41_geometry,
         planner_unsupported_reason="",
-        expert_inventory=_individual_expert_inventory(_V4_EXPERT),
+        expert_inventory=_dsv41_expert_inventory,
         config_section="text_config",
         limits=FamilyLimits(4096, 1048576, 1024, 16384, 1, 8, "CTX"),
-        capabilities=FamilyCapabilities(True, True, False, True),
+        # tools yes (DSML, see v41_dsml.py), grammars no: the engine reads the six-field
+        # SUBMIT header and has no constrained decoder, so a grammar has to be refused
+        # at the gateway rather than desync the wire.
+        capabilities=FamilyCapabilities(True, False, False, True),
         has_gateway_adapter=True,
         has_cli_adapter=True,
     ),

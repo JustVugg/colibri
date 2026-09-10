@@ -323,6 +323,9 @@ class RefModel:
         # when its own compression group is still filling (latent is None there, and the
         # indexer still needs the key cache the source layer wrote two tokens ago).
         self.shared = {"compress_kv": None, "index_k": None, "topk_idxs": None, "candidates": None}
+        self.main_hidden = None
+        self.spec_window = [torch.zeros(c["window_size"], hd)
+                            for _ in range(c.get("n_mtp_layers") or 0)]
 
     # -- attention -----------------------------------------------------------
 
@@ -460,12 +463,16 @@ class RefModel:
         return (F.silu(gate) * up) @ self.w[prefix + "w2.weight"].T
 
     def moe(self, layer: int, x: torch.Tensor) -> torch.Tensor:
+        return self.moe_at(f"layers.{layer}.ffn.", x, self.c["n_activated_experts"])
+
+    def moe_at(self, p: str, x: torch.Tensor, n_activated: int) -> torch.Tensor:
+        """model.py MoE.forward. `p` is the ffn prefix, so a DSpark stage -- which
+        routes over its own, smaller expert set -- runs the same code."""
         c = self.c
-        p = f"layers.{layer}.ffn."
         scores = F.softplus(x @ self.w[p + "gate.weight"].T).sqrt()
-        idx = (scores + self.w[p + "gate.bias"]).topk(c["n_activated_experts"], dim=-1).indices
+        idx = (scores + self.w[p + "gate.bias"]).topk(n_activated, dim=-1).indices
         weights = scores.gather(1, idx)
-        if c["norm_topk_prob"] and c["n_activated_experts"] > 1:
+        if c["norm_topk_prob"] and n_activated > 1:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         weights = weights * c["route_scale"]
         y = torch.zeros_like(x)
@@ -478,12 +485,15 @@ class RefModel:
     # -- block / forward -----------------------------------------------------
 
     def hc_mixes(self, x, which: str, layer: int):
+        return self.hc_mixes_at(x, which, f"layers.{layer}.")
+
+    def hc_mixes_at(self, x, which: str, p: str):
         c = self.c
         flat = x.reshape(x.shape[0], -1)
         rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + c["norm_eps"])
-        mixes = (flat @ self.w[f"layers.{layer}.hc_{which}_fn"].T) * rsqrt
-        return hc_split_sinkhorn(mixes, self.w[f"layers.{layer}.hc_{which}_scale"],
-                                 self.w[f"layers.{layer}.hc_{which}_base"],
+        mixes = (flat @ self.w[p + f"hc_{which}_fn"].T) * rsqrt
+        return hc_split_sinkhorn(mixes, self.w[p + f"hc_{which}_scale"],
+                                 self.w[p + f"hc_{which}_base"],
                                  self.hc, c["hc_sinkhorn_iters"], c["hc_eps"])
 
     def engram(self, layer: int, x: torch.Tensor, hash_ids: torch.Tensor) -> torch.Tensor:
@@ -514,10 +524,15 @@ class RefModel:
         pre_mix = torch.zeros(h.shape[0], self.hc)
         pre_mix[:, 0] = 1.0
         shared = self.shared
+        targets, mains = c.get("dspark_target_layer_ids") or [], []
         for layer in range(self.nlayers):
             if layer in c["engram_layer_ids"]:
                 which = c["engram_layer_ids"].index(layer)
                 h = self.engram(layer, h, hashes[:, which, :])
+            # model.py: "the MTP head reads the attention input of its target layers,
+            # not their output" -- the hc copies averaged, before the block runs
+            if layer in targets:
+                mains.append(h.mean(dim=1))
             residual = h
             attn_pre, attn_post, attn_comb = self.hc_mixes(h, "attn", layer)
             y = (pre_mix[..., None] * h).sum(dim=1)
@@ -534,8 +549,123 @@ class RefModel:
             pre_mix = ffn_pre
         h = (pre_mix[..., None] * h).sum(dim=1)
         h = rms_norm(h, self.w["norm.weight"], c["norm_eps"])
+        # what forward_spec needs from this forward, kept beside the logits rather than
+        # returned, so every existing caller keeps its one-value signature
+        self.main_hidden = torch.cat(mains, dim=-1) if mains else None
         self.pos += len(ids)
         return (h[-1:] @ self.w["head.weight"].T)[0]
+
+
+    # -- DSpark (the MTP draft head) -----------------------------------------
+
+    def spec_attention(self, stage: int, x: torch.Tensor, start_pos: int,
+                       main_x: torch.Tensor) -> torch.Tensor:
+        """model.py DSparkAttention.forward.
+
+        A DSpark stage never compresses (`assert self.compress_ratio == 0`): it is
+        window-only, and the window holds the MAIN stream's keys. The drafts add their
+        own keys on top for the length of one block, and every draft row reads every
+        other -- `get_dspark_topk_idxs` hands the same index list to all of them, so
+        inside the block attention is not causal. That is the vendor's, not a
+        simplification: the block is one guess, not a sequence the model committed to.
+        """
+        c, w = self.c, self.w
+        p = f"mtp.{stage}.attn."
+        hd, rd, nh, win = c["head_dim"], self.rd, c["n_heads"], c["window_size"]
+        eps = c["norm_eps"]
+        freqs = self.freqs_window                       # compress_ratio 0: window rope
+        seqlen = main_x.shape[0]
+        main_kv = rms_norm(main_x @ w[p + "wkv.weight"].T, w[p + "kv_norm.weight"], eps)
+        main_kv = torch.cat(
+            [main_kv[..., :-rd],
+             apply_rotary(main_kv[..., -rd:], freqs[start_pos : start_pos + seqlen])], dim=-1)
+        ring = self.spec_window[stage]
+        if start_pos == 0:
+            # prefill seeds the ring and nothing else: the block never runs
+            if seqlen <= win:
+                ring[:seqlen] = main_kv
+            else:
+                cut = seqlen % win
+                ring[cut:win], ring[:cut] = main_kv[-win:][: win - cut], main_kv[-win:][win - cut :]
+            return x
+
+        block = x.shape[0]
+        # the drafts sit at the positions AFTER the one the main model just produced
+        bfreqs = freqs[start_pos + seqlen : start_pos + seqlen + block]
+        qr = rms_norm(x @ w[p + "wq_a.weight"].T, w[p + "q_norm.weight"], eps)
+        q = (qr @ w[p + "wq_b.weight"].T).reshape(block, nh, hd)
+        q = torch.cat([q[..., :-rd], apply_rotary(q[..., -rd:], bfreqs)], dim=-1)
+        kv = rms_norm(x @ w[p + "wkv.weight"].T, w[p + "kv_norm.weight"], eps)
+        kv = torch.cat([kv[..., :-rd], apply_rotary(kv[..., -rd:], bfreqs)], dim=-1)
+
+        ring[start_pos % win] = main_kv[0]
+        kv_all = torch.cat([ring, kv], dim=0)
+        reach = min(win, start_pos + 1)
+        idxs = torch.cat([torch.arange(reach), win + torch.arange(block)])
+        idxs = idxs.int().unsqueeze(0).expand(block, -1)
+        o = sparse_attn(q, kv_all, w[p + "attn_sink"], idxs, hd**-0.5)
+        o = torch.cat([o[..., :-rd], apply_rotary(o[..., -rd:], bfreqs, inverse=True)], dim=-1)
+        groups, olora = c["o_groups"], c["o_lora_rank"]
+        o = o.reshape(block, groups, -1)
+        wo_a = w[p + "wo_a.weight"].reshape(groups, olora, -1)
+        o = torch.einsum("sgd,grd->sgr", o, wo_a).reshape(block, groups * olora)
+        return o @ w[p + "wo_b.weight"].T
+
+    def spec_forward(self, token_id: int, main_hidden: torch.Tensor, start_pos: int):
+        """model.py Transformer.forward_spec.
+
+        `token_id` is what the main model just produced and `main_hidden` the hidden
+        states its target layers handed over. Returns (draft_ids, confidence): the
+        token itself followed by `dspark_block_size` guesses, and one confidence score
+        per guess. During prefill (start_pos 0) it returns None -- that call exists
+        only to seed the stages' windows from the whole prompt.
+        """
+        c, w = self.c, self.w
+        stages, block = c["n_mtp_layers"], c["dspark_block_size"]
+        hc, eps = self.hc, c["norm_eps"]
+        main_x = rms_norm(main_hidden @ w["mtp.0.main_proj.weight"].T,
+                          w["mtp.0.main_norm.weight"], eps)
+        # every draft position but the first carries the noise id: the block is
+        # generated in one shot, so there is nothing to put there
+        ids = [token_id] + [c["dspark_noise_token_id"]] * (block - 1)
+        x = w["embed.weight"][torch.tensor(ids)][:, None, :].repeat(1, hc, 1)
+        pre_mix = torch.zeros(block, hc)
+        pre_mix[:, 0] = 1.0
+        for stage in range(stages):
+            p = f"mtp.{stage}."
+            if start_pos == 0:
+                self.spec_attention(stage, x, 0, main_x)
+                continue
+            residual = x
+            attn_pre, attn_post, attn_comb = self.hc_mixes_at(x, "attn", p)
+            y = (pre_mix[..., None] * x).sum(dim=1)
+            y = rms_norm(y, w[p + "attn_norm.weight"], eps)
+            y = self.spec_attention(stage, y, start_pos, main_x)
+            x = attn_post[..., None] * y[:, None, :] + hc_combine(attn_comb, residual)
+
+            residual = x
+            ffn_pre, ffn_post, ffn_comb = self.hc_mixes_at(x, "ffn", p)
+            y = (attn_pre[..., None] * x).sum(dim=1)
+            y = rms_norm(y, w[p + "ffn_norm.weight"], eps)
+            y = self.moe_at(p + "ffn.", y, c["dspark_n_activated_experts"])
+            x = ffn_post[..., None] * y[:, None, :] + hc_combine(ffn_comb, residual)
+            pre_mix = ffn_pre
+        if start_pos == 0:
+            return None
+
+        last = f"mtp.{stages - 1}."
+        x = (pre_mix[..., None] * x).sum(dim=1)                    # [block, dim]
+        logits = rms_norm(x, w[last + "norm.weight"], eps) @ w["head.weight"].T
+        draft = [token_id]
+        embeds = []
+        for i in range(block):
+            row = w[last + "markov_head.embed.weight"][draft[i]]
+            logits[i] = logits[i] + row @ w[last + "markov_head.head.weight"].T
+            embeds.append(row)
+            draft.append(int(logits[i].argmax()))       # greedy: temperature 0
+        markov = torch.stack(embeds, dim=0)
+        confidence = torch.cat([x, markov], dim=-1) @ w[last + "confidence_head.proj.weight"].T
+        return draft, confidence.reshape(-1)
 
 
 def hc_combine(comb: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
