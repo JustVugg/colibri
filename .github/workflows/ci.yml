@@ -822,7 +822,9 @@ jobs:
           make colibri CUDA_DLL=1
           test -f colibri.exe || { echo "colibri CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "colibri.exe built against the DLL loader"
-          make qwen36 CUDA_DLL=1
+          # qwen36.exe, not qwen36: only colibri has a phony alias; the bare
+          # name falls into make's builtin rule and links qwen36.c alone.
+          make qwen36.exe CUDA_DLL=1
           test -f qwen36.exe || { echo "qwen36 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "qwen36.exe built against the DLL loader"
       - name: Collect the runtime the DLL links (cudart64_12.dll)
