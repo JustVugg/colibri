@@ -827,6 +827,12 @@ jobs:
           make qwen36.exe CUDA_DLL=1
           test -f qwen36.exe || { echo "qwen36 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "qwen36.exe built against the DLL loader"
+          # kimi_k3 links the same loader: three engines share coli_cuda.dll.
+          # deepseek_v4 has its own DLL (coli_cuda_dsv4.dll, Makefile.deepseek-v4)
+          # and joins in a later step; inkling's CUDA object has no Windows loader.
+          make kimi_k3.exe CUDA_DLL=1
+          test -f kimi_k3.exe || { echo "kimi_k3 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "kimi_k3.exe built against the DLL loader"
       - name: Collect the runtime the DLL links (cudart64_12.dll)
         shell: bash
         run: |
@@ -846,6 +852,7 @@ jobs:
             c/cudart64_*.dll
             c/colibri.exe
             c/qwen36.exe
+            c/kimi_k3.exe
 
   web:
     name: Web UI
