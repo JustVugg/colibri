@@ -649,6 +649,25 @@ jobs:
             tests.test_inefficiency.TinyEfficiencyTest.test_profile_phases_present_and_nonneg \
             tests.test_inefficiency.TinyEfficiencyTest.test_disk_wait_not_dominant \
             tests.test_inefficiency.TinyEfficiencyTest.test_cpu_vs_cpu_determinism
+      - name: Generate the quantized trunk fixture for #826
+        # TRUNK_RESIDENT_LAYERS views only tensors that carry an on-disk int4
+        # companion (`name.qs`), so the bf16 glm_tiny above cannot exercise the
+        # view path -- every dense tensor would fall back to resident and
+        # `resident dense` would never drop. Convert the oracle to int4 so the
+        # knob has something to stream. Run AFTER the bf16 assertions: --fp8
+        # rewrites glm_tiny in place.
+        run: |
+          cd c
+          python3 tools/make_glm_oracle.py --fp8
+          python3 tools/convert_fp8_to_int4.py --indir glm_tiny --outdir glm_tiny_i4 --ebits 4 --io-bits 4
+          # The converter copies config.json but not ref_glm.json; the engine
+          # needs the ref to enter validation mode.
+          cp ref_glm.json glm_tiny_i4/ref_glm.json
+      - name: TRUNK_RESIDENT_LAYERS opt-in contract (#826)
+        # Identical tokens + lower `resident dense`: the knob trades RAM for page
+        # faults, never answers. Keeps the next loader refactor from silently
+        # breaking -- or silently no-op'ing -- the view path.
+        run: cd c && python3 -m unittest -v tests.test_trunk_resident_layers
 
   # The token-exact parity gate from #7 (c/tests/test_cluster_sharding.py): the
   # engine's local CPU run must already reproduce the transformers oracle

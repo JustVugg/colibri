@@ -2208,10 +2208,10 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
 #endif
     return t;
 }
-/* TRUNK_RESIDENT_LAYERS: carga UN QT del trunk como vista mmap si mmap_ok y el
- * tensor es mmap-able (cuantizado + alineado); si no, path residente clasico.
- * El flag mmap_view del QT resultante distingue ambos casos para planarize,
- * contabilidad y free paths. */
+/* TRUNK_RESIDENT_LAYERS: carica UN QT del trunk come vista mmap se mmap_ok e il
+ * tensore e' mmap-abile (quantizzato + allineato); altrimenti path residente
+ * classico. Il flag mmap_view del QT risultante distingue i due casi per
+ * planarize, contabilita' e free paths. */
 static QT qt_load_ex(Model *m, const char *name, int O, int I, int bits, int mmap_ok){
     if(mmap_ok){
         QT t;
@@ -2347,7 +2347,7 @@ static void metal_fmt_gate_notice(Model *m){
 static void model_init_range(Model *m, const char *snap, int cap,
                              int ebits, int dbits, int layer_begin,
                              int layer_end, int load_boundaries, int load_mtp,
-                             int init_telemetry){
+                             int init_telemetry, int allow_trunk_mmap){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
     load_cfg(&m->c,snap);
     { const char *xd=getenv("COLI_MODEL_DIRS");        /* SPLIT: model shards spread across N drives */
@@ -2402,10 +2402,14 @@ static void model_init_range(Model *m, const char *snap, int cap,
     m->kv_start=m->kv->kv_start=calloc(NR,sizeof(int));
     for(int i=layer_begin;i<layer_end;i++){
         Layer *l=&m->L[i];
-        /* TRUNK_RESIDENT_LAYERS: top-N residente. Las capas fuera del top-N
-         * (i < n_layers - g_trunk_resident) cargan sus tensores densos como
-         * vistas mmap si el tensor lo permite; el resto, residente clasico. */
-        int mmap_ok = (g_trunk_resident < c->n_layers)
+        /* TRUNK_RESIDENT_LAYERS: top-N residente. Le layer fuori dal top-N
+         * (i < n_layers - g_trunk_resident) caricano i tensori densi come vista
+         * mmap se il tensore lo permette; il resto, residente classico.
+         * Solo il path full-model puo' produrre viste (allow_trunk_mmap): un
+         * range/segment load resta residente, cosi' i suoi destroy non liberano
+         * puntatori interni di una mappa di shard (review #1399). */
+        int mmap_ok = allow_trunk_mmap
+                    && (g_trunk_resident < c->n_layers)
                     && (i < c->n_layers - g_trunk_resident);
         l->trunk_mmap = mmap_ok;
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
@@ -2575,7 +2579,7 @@ static void model_init_range(Model *m, const char *snap, int cap,
 
 static void model_init(Model *m, const char *snap, int cap,
                        int ebits, int dbits){
-    model_init_range(m,snap,cap,ebits,dbits,0,0,1,1,1);
+    model_init_range(m,snap,cap,ebits,dbits,0,0,1,1,1,1);   /* #826: full-model path may mmap the trunk */
 }
 
 /* embed: dequantizza la riga del token (scala per-riga) in x[hidden] */
@@ -11557,6 +11561,10 @@ typedef struct {
 
 static void glm_segment_qt_destroy(QT *tensor) {
     if (!tensor) return;
+    /* #826: a file-backed mmap view (mmap_view=1) holds interior pointers into a
+     * shard mapping; free() on q8/q4/s would abort. Segment loads are gated to the
+     * resident path, but keep this guard so the mmap_view contract holds here too. */
+    if (tensor->mmap_view) return;
     free(tensor->qf); free(tensor->q8); free(tensor->q4); free(tensor->s);
     memset(tensor, 0, sizeof(*tensor));
 }
@@ -11748,7 +11756,7 @@ static int glm_segment_engine_open(
     }
     model_init_range(&engine->model, options->model_dir, cap, ebits, dbits,
                      (int)options->layer_begin, (int)options->layer_end,
-                     0, 0, 0);
+                     0, 0, 0, 0);   /* #826: range load stays resident (never a mmap view) */
     engine->base_kv = engine->model.kv;
 
     memset(capabilities, 0, sizeof(*capabilities));
@@ -11993,6 +12001,10 @@ typedef struct {
 
 static void glm_edge_qt_destroy(QT *tensor) {
     if (!tensor) return;
+    /* #826: never free() a file-backed mmap view (interior pointers into a shard
+     * mapping). Edge loads embed/lm_head via the resident path today; this guard
+     * keeps the mmap_view contract true if that ever changes. */
+    if (tensor->mmap_view) return;
     free(tensor->qf); free(tensor->q8); free(tensor->q4); free(tensor->s);
     memset(tensor, 0, sizeof(*tensor));
 }
