@@ -2163,6 +2163,56 @@ class TrailingAssistantTurnTest(unittest.TestCase):
                 resolve_generation_prompt(lone, {})
 
 
+class TrailingAssistantEndToEndTest(unittest.TestCase):
+    """End-to-end, through the real HTTP handler and a fake engine (no model weights): a
+    request whose last message is an `assistant` turn must reach the engine as a CONTINUATION
+    prompt -- ending on the client's own opening, no generation cue appended -- and the text
+    the engine generates must come back as the message `content`.
+
+    The TrailingAssistantTurnTest cases pin the prompt string in isolation; none of them prove
+    the wiring from an HTTP request through resolve_generation_prompt to the engine and back,
+    which a serve() refactor could silently drop. /v1/messages is a translation layer onto the
+    same engine path (not a second one), so /v1/chat/completions covers both endpoints. The
+    generated text arriving as content (not reasoning_content) also shows the continued turn
+    primes the splitter into content mode over the wire -- the third state #1327 fixed."""
+
+    OPEN = {"model": "test-model",
+            "messages": [{"role": "user", "content": "capitale della Francia?"},
+                         {"role": "assistant", "content": "La capitale e'"}]}
+
+    def _server(self, engine):
+        server = APIServer(("127.0.0.1", 0), engine, "test-model")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        return server
+
+    def test_continuation_reaches_the_engine_and_returns_as_content(self):
+        engine = FakeEngine()
+        with patch("openai_server.ARCH", "glm53"), \
+             patch.dict(os.environ, {"COLI_CONTINUE_ASSISTANT": "1"}):
+            server = self._server(engine)
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+            self.addCleanup(conn.close)
+            conn.request("POST", "/v1/chat/completions", body=json.dumps(self.OPEN),
+                         headers={"Content-Type": "application/json"})
+            response = conn.getresponse()
+            status, payload = response.status, response.read()
+        self.assertEqual(status, 200, payload)
+        # the engine saw the continuation prompt: it ends on the client's opening, no cue
+        self.assertEqual(len(engine.calls), 1)
+        prompt = engine.calls[0][0]
+        self.assertTrue(prompt.endswith("La capitale e'"), prompt[-60:])
+        self.assertFalse(prompt.endswith("<|assistant|><think>"))
+        # and the generated text comes back as content, not misfiled as reasoning
+        message = json.loads(payload)["choices"][0]["message"]
+        self.assertEqual(message["content"], "Héllo")
+        self.assertFalse(message.get("reasoning_content"))
+
+
 class AllowedHostsTest(unittest.TestCase):
     """#597: the DNS-rebinding guard must accept operator-trusted reverse-proxy
     Host values, while still rejecting everything else by default."""
