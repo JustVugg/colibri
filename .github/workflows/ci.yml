@@ -144,6 +144,37 @@ jobs:
             echo "FAIL: Vulkan initialised but the expert tier did not activate"; exit 1; }
           echo "OK: shaders compiled, device negotiated, expert tier active"
 
+  musl:
+    name: musl libc (Alpine)
+    runs-on: ubuntu-latest
+    container: alpine:3.21
+    steps:
+      # #1430: colibri did not compile against musl, because malloc_trim is a
+      # glibc extension guarded on __linux__ rather than on __GLIBC__. Nothing in
+      # CI compiled against anything but glibc, so the only way to find out was
+      # to be the user. One build leg closes that whole class.
+      - name: Toolchain
+        run: apk add --no-cache build-base linux-headers python3 git bash
+      - uses: actions/checkout@v4
+      - name: Build the engines musl can build
+        run: |
+          cd c
+          # ARCH=x86-64: the runner's -march=native is not the point here, the
+          # libc is. Engines that need glibc-only interfaces would fail loudly
+          # rather than be excluded quietly, which is the report we want.
+          make colibri ARCH=x86-64
+          make olmoe ARCH=x86-64
+      - name: The RAM guard still trims where it can
+        run: |
+          cd c
+          # The fix skips malloc_trim on musl; on glibc it must still be called.
+          # Here we only assert the build has no reference to it, which is the
+          # half this leg can see.
+          if nm colibri | grep -q malloc_trim; then
+            echo "FAIL: malloc_trim linked in a musl build"; exit 1
+          fi
+          echo "ok: no glibc-only symbol in the musl binary"
+
   engines-all-platforms:
     name: All engines (${{ matrix.name }})
     strategy:
@@ -211,6 +242,20 @@ jobs:
           # the C suite on the Linux job could not see the defect at all.
           make tests/test_compat_env
           ./tests/test_compat_env
+      - name: "C tests that drive the engine through the environment"
+        run: |
+          cd c
+          # `make test-c` runs on the Linux leg only, so every test that sets an
+          # environment variable was unobservable on the platform whose shim it
+          # depends on. That is how fourteen of them ended up carrying a private
+          # _putenv_s helper (#1420, #1429). These two are the cheapest pair that
+          # actually exercises the shim through engine code.
+          for t in tests/test_omp_tune tests/test_qwen36_ctx; do
+            echo "::group::$t"
+            make $t
+            ./$t
+            echo "::endgroup::"
+          done
       - if: matrix.os == 'macos-latest'
         name: Build every Metal-capable engine with METAL=1
         # `make <engine>` above builds the CPU path only: everything behind
