@@ -118,7 +118,109 @@ def _reference(model, prompt_ids, max_new):
     }
 
 
-def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True):
+FP8_BLOCK = 128
+FP8_E4M3_MAX = 448.0
+
+
+def _fp8_block_quant(w):
+    """Quantize a 2-D BF16/F32 matrix to e4m3 with one scale per 128x128 block,
+    the released checkpoint's layout (`weight_block_size [128, 128]`,
+    `weight_scale_inv` = the multiplier that restores the value). Returns
+    (e4m3 tensor, scale_inv tensor [ceil(O/128), ceil(I/128)], dequantized w).
+    The dequantized copy is what goes back into the model, so the reference
+    the fixture emits is the arithmetic of the bytes on disk."""
+    w32 = w.float()
+    O, I = w32.shape
+    nb_o, nb_i = (O + FP8_BLOCK - 1) // FP8_BLOCK, (I + FP8_BLOCK - 1) // FP8_BLOCK
+    scale_inv = torch.empty(nb_o, nb_i, dtype=torch.float32)
+    q = torch.empty(O, I, dtype=torch.float8_e4m3fn)
+    deq = torch.empty(O, I, dtype=torch.float32)
+    for bo in range(nb_o):
+        for bi in range(nb_i):
+            blk = w32[bo * FP8_BLOCK:(bo + 1) * FP8_BLOCK, bi * FP8_BLOCK:(bi + 1) * FP8_BLOCK]
+            amax = blk.abs().max().clamp(min=1e-12)
+            s = (amax / FP8_E4M3_MAX).item()
+            qb = (blk / s).to(torch.float8_e4m3fn)
+            q[bo * FP8_BLOCK:(bo + 1) * FP8_BLOCK, bi * FP8_BLOCK:(bi + 1) * FP8_BLOCK] = qb
+            deq[bo * FP8_BLOCK:(bo + 1) * FP8_BLOCK, bi * FP8_BLOCK:(bi + 1) * FP8_BLOCK] = qb.float() * s
+            scale_inv[bo, bi] = s
+    return q, scale_inv, deq
+
+
+def _fp8_experts_in_model(model):
+    """Fake-quantize every routed expert matrix in place (dequantized values
+    back into the BF16 parameters) and return {saved_name: (q, scale_inv)} for
+    the shard rewrite. In memory the experts are two fused parameters per
+    layer, `mlp.experts.gate_up_proj` [E, 2I, H] and `mlp.experts.down_proj`
+    [E, H, I]; save_pretrained splits them into the per-expert
+    `mlp.experts.<e>.{gate,up,down}_proj.weight` the release ships, so the
+    returned names are the saved ones. Shared expert, router and everything
+    dense stay BF16 like the release."""
+    packed = {}
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name.endswith(".mlp.experts.gate_up_proj"):
+                base = name[: -len("gate_up_proj")]              # ...mlp.experts.
+                E, twoI, H = param.shape; I = twoI // 2
+                for e in range(E):
+                    for kind, sl in (("gate_proj", slice(0, I)), ("up_proj", slice(I, twoI))):
+                        q, scale_inv, deq = _fp8_block_quant(param.data[e, sl, :])
+                        param.data[e, sl, :] = deq.to(param.dtype)
+                        packed[f"{base}{e}.{kind}.weight"] = (q, scale_inv)
+            elif name.endswith(".mlp.experts.down_proj"):
+                base = name[: -len("down_proj")]
+                E = param.shape[0]
+                for e in range(E):
+                    q, scale_inv, deq = _fp8_block_quant(param.data[e])
+                    param.data[e] = deq.to(param.dtype)
+                    packed[f"{base}{e}.down_proj.weight"] = (q, scale_inv)
+    if not packed:
+        raise RuntimeError("no routed expert parameters found to quantize")
+    return packed
+
+
+def _rewrite_shard_fp8(out: Path, packed):
+    """Replace the BF16 expert tensors in model.safetensors with e4m3 bytes and
+    BF16 `weight_scale_inv` sidecars, the way the release ships them. The
+    safetensors writer groups tensors by dtype and sorts by name inside a
+    group, which is what puts gate_proj.weight and up_proj.weight next to each
+    other -- the adjacency the engine's native FP8 path requires."""
+    from safetensors.torch import load_file, save_file
+    path = out / "model.safetensors"
+    tensors = load_file(str(path))
+    for name, (q, scale_inv) in packed.items():
+        assert name in tensors, name
+        tensors[name] = q.contiguous()
+        tensors[name + "_scale_inv"] = scale_inv.to(torch.bfloat16).contiguous()
+    # The release keeps a layer's gate/up expert tensors and its down_proj
+    # tensors in different shards. Because the writer sorts BF16 before F8 and
+    # by name within a dtype, that is what makes every layer's gate/up
+    # weight_scale_inv sidecars one compact byte range and the down sidecars
+    # another -- the invariant behind the engine's resident scale bank
+    # (q38_prepare_expert_scale_bank). One file would interleave
+    # down/gate/up per expert and silently send the engine down the
+    # per-matrix fallback, so the fixture ships two shards plus the index.
+    down = {k: v for k, v in tensors.items() if ".mlp.experts." in k and ".down_proj." in k}
+    rest = {k: v for k, v in tensors.items() if k not in down}
+    shards = {"model-00001-of-00002.safetensors": rest, "model-00002-of-00002.safetensors": down}
+    weight_map = {}
+    for fname, group in shards.items():
+        save_file(group, str(out / fname), metadata={"format": "pt"})
+        for k in group: weight_map[k] = fname
+    path.unlink()
+    (out / "model.safetensors.index.json").write_text(json.dumps(
+        {"metadata": {"total_size": sum(v.numel() * v.element_size() for v in tensors.values())},
+         "weight_map": weight_map}, indent=1), encoding="utf-8")
+    cfg_path = out / "config.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["quantization_config"] = {"quant_method": "fp8", "activation_scheme": "dynamic",
+                                  "weight_block_size": [FP8_BLOCK, FP8_BLOCK],
+                                  "fixture_note": "routed experts only, as in the release"}
+    cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    print(f"fp8 experts: {len(packed)} matrices rewritten as F8_E4M3 + BF16 weight_scale_inv")
+
+
+def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_experts=False):
     if max_new < 1:
         raise ValueError("max_new must be at least 1")
     random.seed(seed)
@@ -190,8 +292,11 @@ def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True):
     # save/load round trip (and follows the production arithmetic path).
     model = model.to(dtype=torch.bfloat16)
     model.eval()
+    packed = _fp8_experts_in_model(model) if fp8_experts else None
     out.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(out), safe_serialization=True)
+    if packed:
+        _rewrite_shard_fp8(out, packed)
 
     if prompt_ids is None:
         prompt_ids = [1, 3, 4, 5, 6]
@@ -204,6 +309,7 @@ def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True):
         "seed": seed,
         "transformers_version": transformers.__version__,
         "text_only": True,
+        "fp8_experts": bool(fp8_experts),
         "naming": "upstream Qwen4ExpForCausalLM (no model.language_model prefix)",
         "config_summary": {
             "hidden_size": config.hidden_size,
@@ -232,9 +338,14 @@ def main():
     parser.add_argument("--max-new", type=int, default=8)
     parser.add_argument("--prompt-ids", help="Comma-separated token IDs")
     parser.add_argument("--no-ref", action="store_true", help="Do not emit ref.json")
+    parser.add_argument("--fp8-experts", action="store_true",
+                        help="routed experts as F8_E4M3 with 128x128 block weight_scale_inv "
+                             "sidecars (the release layout); the reference uses the same "
+                             "quantized values")
     args = parser.parse_args()
     prompt = [int(x) for x in args.prompt_ids.split(",") if x.strip()] if args.prompt_ids else None
-    build(args.out, prompt_ids=prompt, max_new=args.max_new, seed=args.seed, emit_ref=not args.no_ref)
+    build(args.out, prompt_ids=prompt, max_new=args.max_new, seed=args.seed, emit_ref=not args.no_ref,
+          fp8_experts=args.fp8_experts)
 
 
 if __name__ == "__main__":

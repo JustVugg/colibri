@@ -979,6 +979,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     m->kv_len = 0;
     for (int i = 0; i < np; i++) out[i] = prompt[i];
     float *logit = step(m, prompt, np, 0);
+    q38_tm_snapshot_prefill(m);        /* COLI_TIMERS: decode bank starts here */
     int len = np;
     for (int s = 0; s < n_new; s++) {
         int best = 0; float bv = logit[0];
@@ -1769,6 +1770,8 @@ int main(int argc, char **argv) {
     }
 
     Model m; model_init(&m, snap, cap, bits);
+    q38_tier_start(&m, cap);   /* COLI_CUDA=1: hot experts stream to VRAM (qwen36_tier.c) */
+    q38_trunk_cpu_int8(&m);    /* Q38_TRUNK_CPU_INT8=1: the trunk's int8 rows on the CPU (reference) */
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
     q38_telemetry_init(snap, &m);
@@ -1793,6 +1796,7 @@ int main(int argc, char **argv) {
         double dt = now_s() - t;
         double tot = m.hits + m.miss;
         printf("TF-NLL: %.4f nats/token over %d tokens | ppl = %.2f\n", nll, scored, exp(nll));
+        qt_stats();   /* VRAM tier hits/misses/swaps, if on */
         printf("Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
@@ -1868,6 +1872,7 @@ int main(int argc, char **argv) {
     if (g_ttft >= 0) fprintf(stderr, "TTFT: %.2f s (time to first token)\n", g_ttft);
     tm_report(&m);
     fprintf(stderr, "\nPEAK RSS: %.2f GB\n", rss_gb());
+    qt_stats();   /* VRAM tier hits/misses/swaps, if on */
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);

@@ -6,14 +6,14 @@ in RAM, the **hot** ones are promoted into DEVICE_LOCAL VRAM across one or
 more GPUs and computed there through the existing shared CUDA backend
 (`backend_cuda.cu` expert-group API — no new backend).
 
-> **A second mode.** Besides the Qwen3.6 modes below, the tier has an *fp8
-> streaming mode* (`qt_init_fp8`) for an engine whose experts do not all live
-> in RAM: `cap` may be smaller than the expert count, the tier copies each
-> expert's e4m3 slab and block scales when the engine reports it and keeps no
-> pointer into the engine's slot, and promotion happens at report time instead
-> of a warmstart. It is exercised by `tests/test_qwen36_tier_fp8.c`; the
-> Qwen3.8 engine that uses it comes in its own PR. Everything below describes
-> the Qwen3.6 modes unless it says otherwise.
+> **Two engines.** The tier also serves Qwen3.8-Flash-Next (`c/qwen38.c`,
+> [qwen38.md](qwen38.md#gpu-cuda-vram-expert-tier)) in its *fp8 streaming
+> mode* (`qt_init_fp8`): experts do not all live in RAM there, `cap` may be
+> smaller than the expert count, the tier copies each expert's e4m3 slab and
+> block scales when the engine reports it and keeps no pointer into the
+> engine's slot, and promotion happens at report time instead of a warmstart.
+> Everything below describes the Qwen3.6 modes unless it says otherwise.
+
 
 ## How it works
 
@@ -119,6 +119,23 @@ have it written for it.
 
 Peak RSS is ~2 GB higher under `auto`: the host-side int8 copies stay as the
 CPU fallback. Known, not yet addressed.
+
+**Any dense matrix, by name.** The offer table is not limited to `lmhead` and
+`dnproj`: an engine offers whatever it wants placed with `qt_trunk_offer(name,
+layer, bytes)` before `qt_init`, asks `qt_place_of(name, layer)` afterwards,
+and hands the placed matrices over as int8 rows with
+`qt_dense_init(q, scales, I, O, device)`, which returns a handle;
+`qt_dense_matmul(handle, y, x, I, O)` answers one GEMV from VRAM and returns 0
+(CPU from here on) if the backend fails. The qwen36 calls remain thin
+wrappers over the same mechanism. Qwen3.8 uses it for its whole trunk -- 553
+matrices, 4.0 GiB int8 on one card ([qwen38.md](qwen38.md), "GPU") -- and
+that is also where the backend's resident dense matvec got its own staging
+buffers: `coli_cuda_matmul` used to share the `x`/`y` device buffers with the
+expert group, which runs asynchronously on its own stream between `qt_issue`
+and `qt_take`. A dense GEMV issued in that window (Qwen3.8's shared expert)
+overwrote the group's input and output mid-flight -- no CUDA error, only
+wrong numbers. qwen36 never called the dense path inside that window, so its
+outputs were unaffected.
 
 ## Measured (Threadripper 3945WX 12C, RTX 3070 8 GB + Quadro RTX 4000 8 GB, Qwen3.6-35B-A3B int4, 200-token decode)
 

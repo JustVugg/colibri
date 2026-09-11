@@ -1,3 +1,4 @@
+#include "qwen36_tier.h"   /* CUDA VRAM expert tier, shared with qwen36; CPU-only builds get the inline no-op stubs */
 /* Native Qwen3.8-Flash-Next text core.
  *
  * This header is included once by qwen38.c after its tokenizer and protocol
@@ -48,6 +49,8 @@ typedef struct {
     int64_t elements, scale_count;
     Q38WeightKind kind;
     unsigned owns_data:1, owns_scales:1;
+    int gpu;                       /* 0 = CPU; else 1 + tier handle of an int8 copy resident in VRAM (decode, S == 1) */
+    int8_t *q8; float *q8sc;       /* Q38_TRUNK_CPU_INT8=1: the same int8 rows kept on the CPU (reference for the GPU path, no GPU needed) */
 } Q38Weight;
 
 typedef struct { float *norm; Q38Weight down, up, inject; } GatedResidual;
@@ -205,6 +208,7 @@ static void q38_weight_free(Q38Weight *weight) {
     if(!weight)return;
     if(weight->owns_data)free(weight->data);
     if(weight->owns_scales)free(weight->scales);
+    free(weight->q8); free(weight->q8sc);
     memset(weight,0,sizeof(*weight));
 }
 
@@ -262,6 +266,23 @@ static void q38_matmul_bf16(float *y,const float *x,const uint16_t *W,
 
 static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
                               int S,int I,int O) {
+    /* A matrix the tier placed in VRAM (q38_trunk_place) answers a decode
+     * GEMV from there; prefill rows and any failure take the CPU path below,
+     * so the BF16 copy stays the reference for everything but S == 1. */
+    if(S==1&&weight&&weight->gpu&&weight->rows==O&&weight->cols==I&&
+       qt_dense_matmul(weight->gpu-1,y,x,I,O))return;
+    if(S==1&&weight&&weight->q8&&weight->rows==O&&weight->cols==I){
+        /* the int8 rows the GPU would hold, computed here: what the trunk
+         * quantization alone does to the output, GPU or not */
+        const int8_t *q=weight->q8; const float *sc=weight->q8sc;
+        #pragma omp parallel for schedule(static)
+        for(int o=0;o<O;o++){
+            const int8_t *w=q+(size_t)o*I; float a=0.f;
+            for(int i=0;i<I;i++)a+=x[i]*(float)w[i];
+            y[o]=a*sc[o];
+        }
+        return;
+    }
     if(!weight||weight->rows!=O||weight->cols!=I||!weight->data){
         fprintf(stderr,"invalid matmul weight: have [%d,%d] kind=%d, need [%d,%d]\n",
                 weight?weight->rows:0,weight?weight->cols:0,
@@ -1679,6 +1700,166 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
 /* The single-row path is intentionally kept separate from prefill.  Decode is
  * the latency-sensitive steady state and should not pay for route tables or a
  * prompt-sized workspace. */
+/* ---- CUDA VRAM expert tier (qwen36_tier.c, fp8 streaming mode) ------------
+ * The tier keeps its own copies of hot experts in VRAM; the RAM LRU below is
+ * untouched by it. qt_issue() takes the resident experts of a token's route
+ * off the CPU, qt_take() adds their outputs back, and every expert the CPU
+ * did compute is reported with qt_note() so the tier can promote it. The
+ * tier copies what it needs during qt_note; the slot may be recycled by the
+ * next token. Only native FP8 slots are reported: gate.data at the slab start
+ * is what q38_bind_fp8_slot() produces, an expanded slot points elsewhere. */
+static void q38_tier_note(int layer,int eid,const Slot *ex) {
+    if(!qt_ready()||!ex->fp8_slab||ex->gate.data!=ex->fp8_slab)return;
+    qt_note(layer,eid,(const uint8_t*)ex->gate.data,(const uint8_t*)ex->up.data,
+            (const uint8_t*)ex->down.data,ex->gate.scales,ex->up.scales,ex->down.scales);
+}
+
+/* ---- dense trunk on the GPU (R7b, stage 1) ---------------------------------
+ * The BF16 trunk is the largest fixed cost of a decode token here (about a
+ * third), and it is bandwidth-bound. Every matrix of at least 1 MiB is
+ * offered to the tier's placer by name and layer before qt_init; whatever
+ * the placer accepts is quantized to int8 per row at start (scale = max|w| /
+ * 127, the qwen36 dnproj/lmhead format) and uploaded once; the BF16 copy
+ * stays for prefill and as fallback. Q38_TRUNK_GPU=0 keeps the trunk on the
+ * CPU (parity runs against the BF16 reference). */
+typedef struct { Q38Weight *w; char name[16]; int layer; } Q38TrunkItem;
+static Q38TrunkItem *g_trunk; static int g_trunk_n, g_trunk_cap;
+static void q38_trunk_add(Q38Weight *w,const char *name,int layer) {
+    if(!w||!w->data||(w->kind!=Q38_WEIGHT_BF16&&w->kind!=Q38_WEIGHT_F32))return;
+    size_t bytes=(size_t)w->rows*w->cols+(size_t)w->rows*sizeof(float);
+    /* Q38_TRUNK_MIN_KB (default 1024): a round trip costs more than a tiny
+     * GEMV saves; Q38_TRUNK_SKIP=name,name: leave those components on the
+     * CPU (bisecting a numeric difference, or a component that does not pay) */
+    static long min_kb=-1; static const char *skip;
+    if(min_kb<0){ const char *e=getenv("Q38_TRUNK_MIN_KB"); min_kb=e?atol(e):1024; skip=getenv("Q38_TRUNK_SKIP"); }
+    if(bytes<(size_t)min_kb*1024)return;
+    if(skip&&*skip){
+        size_t n=strlen(name); const char *s=skip;
+        while(*s){ const char *c=strchr(s,','); size_t l=c?(size_t)(c-s):strlen(s);
+                   if(l==n&&!strncmp(s,name,n))return; if(!c)break; s=c+1; }
+    }
+    if(g_trunk_n==g_trunk_cap){
+        g_trunk_cap=g_trunk_cap?2*g_trunk_cap:256;
+        g_trunk=(Q38TrunkItem*)realloc(g_trunk,(size_t)g_trunk_cap*sizeof(*g_trunk));
+        if(!g_trunk){fprintf(stderr,"OOM trunk table\n");exit(1);}
+    }
+    Q38TrunkItem *it=&g_trunk[g_trunk_n++]; it->w=w; it->layer=layer;
+    snprintf(it->name,sizeof it->name,"%s",name);
+    qt_trunk_offer(it->name,layer,bytes);
+}
+static int q38_trunk_enabled(void) {
+    const char *e=getenv("Q38_TRUNK_GPU"); return !(e&&e[0]=='0'&&!e[1]);
+}
+/* offers, before qt_init: lm_head first (the placer takes it first), then the
+ * layers in order so a partial placement is a prefix of the layers */
+static void q38_trunk_offer_all(Model *m) {
+    if(!q38_trunk_enabled())return;
+    Cfg *c=&m->c;
+    q38_trunk_add(&m->lm_head,"lmhead",0);
+    for(int l=0;l<c->layers;l++){
+        Layer *L=&m->L[l];
+        if(c->is_attn[l]){
+            q38_trunk_add(&L->q,"attnq",l); q38_trunk_add(&L->k,"attnk",l);
+            q38_trunk_add(&L->v,"attnv",l); q38_trunk_add(&L->o,"attno",l);
+            q38_trunk_add(&L->idx_qk,"qsaidx",l);
+        } else {
+            q38_trunk_add(&L->dn_qkv,"dnqkv",l); q38_trunk_add(&L->dn_z,"dnz",l);
+            q38_trunk_add(&L->dn_out,"dnout",l);
+        }
+        q38_trunk_add(&L->attn_gr.down,"hcad",l); q38_trunk_add(&L->attn_gr.up,"hcau",l);
+        q38_trunk_add(&L->attn_gr.inject,"hcai",l);
+        q38_trunk_add(&L->mlp_gr.down,"hcmd",l); q38_trunk_add(&L->mlp_gr.up,"hcmu",l);
+        q38_trunk_add(&L->mlp_gr.inject,"hcmi",l);
+        q38_trunk_add(&L->sh_g,"shg",l); q38_trunk_add(&L->sh_u,"shu",l); q38_trunk_add(&L->sh_d,"shd",l);
+        q38_trunk_add(&L->router,"router",l);
+    }
+}
+/* int8 per row, scale = max|w| / 127 (the qwen36 dnproj/lmhead format) */
+static void q38_trunk_quantize(const Q38Weight *w,int8_t **qp,float **scp) {
+    int O=w->rows,I=w->cols;
+    int8_t *q=(int8_t*)malloc((size_t)O*I); float *sc=(float*)malloc((size_t)O*sizeof(float));
+    if(!q||!sc){fprintf(stderr,"OOM trunk quantization\n");exit(1);}
+    #pragma omp parallel for schedule(static)
+    for(int r=0;r<O;r++){
+        float row[8192]; float *src=row; float *heap=NULL;
+        if(I>8192){heap=(float*)malloc((size_t)I*sizeof(float)); src=heap;}
+        q38_weight_row(w,r,src);
+        float mx=0.f; for(int k=0;k<I;k++){float a=fabsf(src[k]); if(a>mx)mx=a;}
+        float s=mx>0.f?mx/127.f:1.f, inv=1.f/s; sc[r]=s;
+        int8_t *dst=q+(size_t)r*I;
+        for(int k=0;k<I;k++){int v=(int)lrintf(src[k]*inv); if(v>127)v=127; if(v<-127)v=-127; dst[k]=(int8_t)v;}
+        free(heap);
+    }
+    *qp=q; *scp=sc;
+}
+/* Q38_TRUNK_CPU_INT8=1: keep the int8 rows on the CPU instead (or as well),
+ * so the quantization can be judged without a GPU (PPL, token parity) */
+static void q38_trunk_cpu_int8(Model *m) {
+    const char *e=getenv("Q38_TRUNK_CPU_INT8");
+    if(!e||e[0]!='1'||e[1])return;
+    if(!g_trunk_n) q38_trunk_offer_all(m);
+    double t0=now_s(); size_t bytes=0;
+    for(int i=0;i<g_trunk_n;i++){
+        Q38Weight *w=g_trunk[i].w; if(w->q8)continue;
+        q38_trunk_quantize(w,&w->q8,&w->q8sc); bytes+=(size_t)w->rows*w->cols;
+    }
+    fprintf(stderr,"[qwen38] trunk: %d matrices int8 on the CPU (%.2f GiB) in %.1fs (Q38_TRUNK_CPU_INT8)\n",
+            g_trunk_n,bytes/1073741824.0,now_s()-t0);
+}
+/* after qt_init: quantize and upload what the placer accepted */
+static void q38_trunk_place_all(Model *m) {
+    (void)m;
+    int placed=0; size_t placed_bytes=0; double t0=now_s();
+    for(int i=0;i<g_trunk_n;i++){
+        Q38TrunkItem *it=&g_trunk[i]; Q38Weight *w=it->w;
+        int dev=qt_place_of(it->name,it->layer);
+        if(dev==QT_PLACE_CPU)continue;
+        int O=w->rows,I=w->cols;
+        int8_t *q; float *sc; q38_trunk_quantize(w,&q,&sc);
+        int h=qt_dense_init(q,sc,I,O,dev);
+        if(h>=0&&getenv("Q38_TRUNK_SELFTEST")){
+            /* DIAG: GPU int8 GEMV against the same int8 matrix on the CPU */
+            float *x=(float*)malloc((size_t)I*sizeof(float)),*yg=(float*)malloc((size_t)O*sizeof(float)),*yc=(float*)malloc((size_t)O*sizeof(float));
+            for(int k=0;k<I;k++)x[k]=sinf(0.37f*k)+0.1f*(k%7);
+            for(int r=0;r<O;r++){double a=0; for(int k=0;k<I;k++)a+=(double)q[(size_t)r*I+k]*x[k]; yc[r]=(float)(a*sc[r]);}
+            int ok=qt_dense_matmul(h,yg,x,I,O); double num=0,den=0; int worst=0;
+            for(int r=0;r<O;r++){double d=yg[r]-yc[r]; num+=d*d; den+=(double)yc[r]*yc[r]; if(fabs(d)>fabs(yg[worst]-yc[worst]))worst=r;}
+            fprintf(stderr,"[selftest] %-7s L%-2d [O=%d I=%d] ok=%d rel.err %.2e worst row %d gpu %.5g cpu %.5g\n",it->name,it->layer,O,I,ok,den>0?sqrt(num/den):-1.0,worst,yg[worst],yc[worst]);
+            free(x);free(yg);free(yc);
+        }
+        free(q); free(sc);
+        if(h>=0){ w->gpu=h+1; placed++; placed_bytes+=(size_t)O*I; }
+    }
+    if(g_trunk_n)
+        fprintf(stderr,"[qtier] qwen38 trunk: %d of %d offered matrices resident as int8 (%.2f GiB) in %.1fs; the rest stays BF16 on the CPU\n",
+                placed,g_trunk_n,placed_bytes/1073741824.0,now_s()-t0);
+}
+
+/* Start the tier after the model is loaded. COLI_CUDA=1 turns it on (the
+ * tier reads that itself); it needs every layer's experts in native FP8 with
+ * the block-scale bank resident, because the GPU kernels consume exactly the
+ * checkpoint layout (e4m3 bytes + [ceil(O/128), ceil(I/128)] scales). */
+static void q38_tier_start(Model *m,int cap) {
+    const char *on=getenv("COLI_CUDA");
+    if(!on||on[0]!='1'||on[1])return;
+    Cfg *c=&m->c;
+    if(!m->native_fp8){
+        fprintf(stderr,"[qtier] qwen38: expert tier needs native FP8 experts (Q38_NATIVE_FP8=1); staying on the CPU\n");
+        return;
+    }
+    for(int layer=0;layer<c->layers;layer++)
+        if(!q38_prepare_expert_scale_bank(m,layer)){
+            fprintf(stderr,"[qtier] qwen38: layer %d experts are not native FP8; staying on the CPU\n",layer);
+            return;
+        }
+    q38_trunk_offer_all(m);                        /* sizes only; the placer decides in qt_init */
+    if(qt_init_fp8(c->layers,c->experts,c->hidden,c->inter,cap,c->topk,E4M3_LUT)){
+        atexit(qt_shutdown);
+        fprintf(stderr,"[qtier] qwen38: fp8 expert tier on (RAM LRU %d/layer stays; experts stream to VRAM as they get hot)\n",cap);
+        q38_trunk_place_all(m);
+    }
+}
+
 static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
     Cfg *c=&m->c;int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
     float *logits=falloc(E),*sg=falloc(SI),*su=falloc(SI),*sh=falloc(SI),*shared=falloc(H);
@@ -1693,21 +1874,31 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
         float route_gates[Q38_MAX_TOPK];
         for(int z=0;z<K;z++) route_gates[z]=(float)(val[z]/den);
         rt_route(layer,s,idx,route_gates,K); /* shared counts + post-normalization trace */
-        q38_prefetch_native_fp8_experts(m,layer,idx,K);
+        /* Resident experts run on the GPU from here on (asynchronously); the
+         * CPU only loads and computes the rest, in route order. */
+        uint32_t qmask=qt_issue(layer,idx,K,xs);
+        int cpu_idx[Q38_MAX_TOPK],cpu_rank[Q38_MAX_TOPK],cpu_n=0;
+        for(int z=0;z<K;z++)if(!((qmask>>z)&1u)){cpu_idx[cpu_n]=idx[z];cpu_rank[cpu_n]=z;cpu_n++;}
+        q38_prefetch_native_fp8_experts(m,layer,cpu_idx,cpu_n);
         double phase_started=now_s();
         q38_weight_matmul(sg,xs,&l->sh_g,1,H,SI);q38_weight_matmul(su,xs,&l->sh_u,1,H,SI);
         for(int j=0;j<SI;j++)sh[j]=q38_silu(sg[j])*su[j];q38_weight_matmul(shared,sh,&l->sh_d,1,SI,H);
         float gate=0.f;for(int d=0;d<H;d++)gate+=xs[d]*l->sh_gate[d];gate=q38_sigmoid(gate);
         q38_tm_add(m,Q38_TM_SHARED_EXPERT,phase_started);
         Slot *selected[Q38_MAX_TOPK];
-        int loaded_batch=q38_expert_get_batch(m,layer,idx,K,selected);
-        for(int z=0;z<K;z++){
-            Slot *ex=loaded_batch?selected[z]:q38_expert_get(m,layer,idx[z]);phase_started=now_s();
+        int loaded_batch=q38_expert_get_batch(m,layer,cpu_idx,cpu_n,selected);
+        for(int i=0;i<cpu_n;i++){
+            int z=cpu_rank[i];
+            Slot *ex=loaded_batch?selected[i]:q38_expert_get(m,layer,cpu_idx[i]);phase_started=now_s();
             q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
             for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
             for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
+            q38_tier_note(layer,cpu_idx[i],ex);
         }
+        /* GPU experts land after the CPU ones: same values, one more group in
+         * the float sum (that is the only ordering difference to a CPU run). */
+        qt_take(qmask,route_gates,K,ys);
         for(int d=0;d<H;d++)ys[d]+=gate*shared[d];
     }
     rt_trace_end();
@@ -2040,8 +2231,24 @@ static void q38_tm_report_bank(const Q38Timers *timers,const char *scope) {
                    "expert-read is disk service and fp8-expand is synchronous miss work\n");
 }
 
+/* Snapshot of the timer bank taken when the prompt's forward has finished
+ * (generate() sets it), so a "decode" bank can be reported apart from the
+ * prefill. Without it the per-forward figures of a long prompt are prefill
+ * work divided by decode forwards, which reads like a decode budget and is
+ * not one. */
+static Q38Timers g_tm_prefill_snapshot; static int g_tm_have_snapshot;
+static void q38_tm_snapshot_prefill(const Model *m) {
+    g_tm_prefill_snapshot=m->timers; g_tm_have_snapshot=1;
+}
 static void tm_report(const Model *m) {
     q38_tm_report_bank(&m->timers,"total");
+    if(g_tm_have_snapshot&&q38_tm_enabled()){
+        Q38Timers decode=m->timers;
+        for(int i=0;i<Q38_TM_COUNT;i++)decode.seconds[i]-=g_tm_prefill_snapshot.seconds[i];
+        decode.forwards-=g_tm_prefill_snapshot.forwards;
+        q38_tm_report_bank(&g_tm_prefill_snapshot,"prefill");
+        q38_tm_report_bank(&decode,"decode");
+    }
     if(q38_tm_enabled())
         fprintf(stderr,"[qwen38 expert I/O] weight-ranges=%llu scale-ranges=%llu "
                        "coalesced-gate-up=%llu prefetched=%llu parallel-batches=%llu "

@@ -72,6 +72,14 @@ void qt_trunk_offer(const char *component, int layer, size_t bytes);
 int  qt_dnproj_init(int layer, const int8_t *q, const float *sc,
                     int I, int O, int device);
 int  qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O);
+/* Generic resident dense matrix (int8 per-row, one GEMV per call), addressed
+ * by a handle: the Qwen3.8 trunk uses this for every matrix it places. Offer
+ * the size with qt_trunk_offer(name, layer, bytes) before qt_init, ask
+ * qt_place_of(name, layer) after it, then hand the quantized bytes here.
+ * Returns the handle (>= 0) or -1 (stays on the CPU). */
+int  qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device);
+int  qt_dense_matmul(int handle, float *y, const float *x, int I, int O);
+int  qt_dense_count(void);
 
 /* fp8 streaming mode (Qwen3.8): experts arrive as e4m3 bytes with 128x128
  * block scales and do NOT all fit in RAM. cap may be smaller than n_experts;
@@ -129,6 +137,9 @@ static inline int  qt_place_of(const char*a,int b){(void)a;(void)b;return QT_PLA
 static inline void qt_trunk_offer(const char*a,int b,size_t c){(void)a;(void)b;(void)c;}
 static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
+static inline int  qt_dense_init(const int8_t*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}
+static inline int  qt_dense_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
+static inline int  qt_dense_count(void){return 0;}
 static inline int  qt_ready(void){return 0;}
 static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_shutdown(void){}
