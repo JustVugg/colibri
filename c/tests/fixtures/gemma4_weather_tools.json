@@ -1,0 +1,23 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "description": "Get current weather.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "unit": {
+            "type": "string",
+            "enum": ["celsius", "fahrenheit"]
+          },
+          "city": {
+            "type": "string",
+            "description": "City name"
+          }
+        },
+        "required": ["city"]
+      }
+    }
+  }
+]
