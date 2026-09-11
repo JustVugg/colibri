@@ -33,12 +33,6 @@
 #include "../qwen36.c"
 #undef main
 
-#ifdef _WIN32
-#undef setenv
-#undef unsetenv
-#define unsetenv(name) _putenv_s(name, "")
-#endif
-
 #include "qwen36_fake_cuda.h"
 
 #include "../qwen36_tier.c"

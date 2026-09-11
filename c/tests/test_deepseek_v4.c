@@ -16,21 +16,6 @@
 #include <string.h>
 #include <unistd.h>
 
-/* compat.h maps setenv() onto SetEnvironmentVariableA, which updates the Win32
- * environment block -- but getenv() reads the CRT's own copy of it and never
- * sees the value.  The three ExpertStore tests below set knobs that the engine
- * reads with getenv(), so on Windows the setenv() spelling was a no-op and they
- * ran with the very defaults they meant to override.  The same trap is spelled
- * out in test_qwen36_ctx.c and test_inkling_shared_batch.c; _putenv_s updates
- * the copy getenv() reads. */
-static void env_set(const char *name, const char *value) {
-#ifdef _WIN32
-    _putenv_s(name, value);
-#else
-    setenv(name, value, 1);
-#endif
-}
-
 /* mkdtemp() hands out a scratch directory, the engine appends <snap>/.coli_usage
  * to it whenever it saves its expert history, and rmdir() then fails on a
  * directory that is no longer empty.  Nothing was listening to that failure, so
@@ -642,9 +627,9 @@ static int test_expert_store(void) {
     /* Native MinGW binaries do not resolve the MSYS /tmp mount. */
     char directory[] = "colibri-v4-store-XXXXXX";
     char path[256], error[256];
-    env_set("COLI_V4_AUTOPIN", "0");
-    env_set("COLI_V4_SAVE_USAGE", "0");
-    env_set("COLI_V4_ROWS16", "0");
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
     if (!mkdtemp(directory)) { perror("mkdtemp"); return 1; }
     snprintf(path, sizeof(path), "%s/model.safetensors", directory);
     if (write_fixture(path) != 0) { perror("write_fixture"); return 1; }
@@ -838,9 +823,9 @@ static int test_expert_store_prefill_pool(void) {
     enum { LAYERS = 2, EXPERTS = 8, SLOTS_PER_LAYER = 6 };
     char directory[] = "colibri-v4-pool-XXXXXX";
     char path[256], error[256];
-    env_set("COLI_V4_AUTOPIN", "0");
-    env_set("COLI_V4_SAVE_USAGE", "0");
-    env_set("COLI_V4_ROWS16", "0");
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
     if (!mkdtemp(directory)) { perror("mkdtemp pool"); return 1; }
     snprintf(path, sizeof(path), "%s/model.safetensors", directory);
     if (write_fixture_layers(path, LAYERS, EXPERTS)) {
@@ -1059,9 +1044,9 @@ static int run_expert_miss_scaling_case(const char *directory, int experts,
 static int test_expert_store_miss_scaling(void) {
     char directory[] = "colibri-v4-scaling-XXXXXX";
     char path[256];
-    env_set("COLI_V4_AUTOPIN", "0");
-    env_set("COLI_V4_SAVE_USAGE", "0");
-    env_set("COLI_V4_ROWS16", "0");
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
     if (!mkdtemp(directory)) { perror("mkdtemp scaling"); return 1; }
     snprintf(path, sizeof(path), "%s/model.safetensors", directory);
     if (write_fixture_experts(path, 256)) {

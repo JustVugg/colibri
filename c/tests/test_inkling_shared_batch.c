@@ -13,24 +13,6 @@ static int failures;
     fprintf(stderr,"FAIL %s:%d: ",__FILE__,__LINE__); \
     fprintf(stderr,__VA_ARGS__); fputc('\n',stderr); failures++; } } while (0)
 
-/* compat.h maps setenv() to SetEnvironmentVariableA on Windows, but getenv()
- * reads the CRT environment copy.  Use _putenv_s there so the production
- * getenv("INK_SHARED_BATCH") sees the mode under test. */
-static void env_set(const char *name,const char *value) {
-#ifdef _WIN32
-    _putenv_s(name,value);
-#else
-    setenv(name,value,1);
-#endif
-}
-static void env_unset(const char *name) {
-#ifdef _WIN32
-    _putenv_s(name,"");
-#else
-    unsetenv(name);
-#endif
-}
-
 static float value(int64_t i, int salt) {
     int v = (int)((i * 37 + salt * 17) % 101);
     return (float)(v - 50) / (float)(71 + salt);
@@ -63,7 +45,7 @@ static void compare_paths(const char *format,Model *m,Layer *l,int S,
     size_t out_bytes=(size_t)S*D*sizeof(float);
     float *scalar=falloc((int64_t)S*D),*out=falloc((int64_t)S*D);
     float *g=falloc((int64_t)2*I),*u=g+I,*hh=falloc(D);
-    memcpy(scalar,seed,out_bytes);env_set("INK_SHARED_BATCH","0");
+    memcpy(scalar,seed,out_bytes);setenv("INK_SHARED_BATCH","0",1);
     g_matmul_w_calls=0;shared_experts_cpu(m,l,x,S,scalar,wgt,g,u,hh);
     CHECK(g_matmul_w_calls==(uint64_t)S*ns*3,
           "%s scalar calls=%llu expected=%d",format,
@@ -72,7 +54,7 @@ static void compare_paths(const char *format,Model *m,Layer *l,int S,
     const char *modes[]={NULL,"3"};
     for(int z=0;z<2;z++){
         memcpy(out,seed,out_bytes);
-        if(modes[z])env_set("INK_SHARED_BATCH",modes[z]);else env_unset("INK_SHARED_BATCH");
+        if(modes[z])setenv("INK_SHARED_BATCH",modes[z],1);else unsetenv("INK_SHARED_BATCH");
         g_matmul_w_calls=0;shared_experts_cpu(m,l,x,S,out,wgt,g,u,hh);
         int chunks=modes[z]?(S+2)/3:1,expected=chunks*ns*3;
         CHECK(!memcmp(out,scalar,out_bytes),"%s mode=%s is not scalar bit-exact",
@@ -86,7 +68,7 @@ static void compare_paths(const char *format,Model *m,Layer *l,int S,
     }
 
     /* Decode must remain the original one-row GEMV path. */
-    memcpy(out,seed,(size_t)D*sizeof(float));env_unset("INK_SHARED_BATCH");
+    memcpy(out,seed,(size_t)D*sizeof(float));unsetenv("INK_SHARED_BATCH");
     g_matmul_w_calls=0;shared_experts_cpu(m,l,x,1,out,wgt,g,u,hh);
     CHECK(!memcmp(out,scalar,(size_t)D*sizeof(float)),"%s decode row changed",format);
     CHECK(g_matmul_w_calls==(uint64_t)ns*3,"%s decode used batch shape",format);
@@ -118,7 +100,7 @@ int main(void){
     run_format("f32",0,12,17,13);
     run_format("bf16",1,12,32,16);
     run_format("int4-g64",2,12,64,64);
-    env_unset("INK_SHARED_BATCH");
+    unsetenv("INK_SHARED_BATCH");
     if(failures){fprintf(stderr,"inkling shared batch: %d failure(s)\n",failures);return 1;}
     puts("inkling shared batch: ok");return 0;
 }

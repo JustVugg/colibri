@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../compat.h"   /* setenv/unsetenv: MinGW has neither */
+
 /* ---- backend CUDA finto: le firme vengono da backend_cuda.h, che il tier
    include per conto suo; il corpo (condiviso con gli altri test del tier) e'
    in qwen36_fake_cuda.h. ---- */

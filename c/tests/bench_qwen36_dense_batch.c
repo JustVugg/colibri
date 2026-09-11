@@ -24,26 +24,11 @@ static double batch(float *y,const float *x,const int8_t *q,const float *sc) {
     double t0=now_s();matmul_q_batch(y,x,q,sc,S,I,O);return now_s()-t0;
 }
 
-static void env_set(const char *name,const char *value) {
-#ifdef _WIN32
-    _putenv_s(name,value);
-#else
-    setenv(name,value,1);
-#endif
-}
-static void env_unset(const char *name) {
-#ifdef _WIN32
-    _putenv_s(name,"");
-#else
-    unsetenv(name);
-#endif
-}
-
 static double shared_run(Model *m,Layer *l,const float *x,const float *seed,
                          float *out,const char *mode) {
     float *g=falloc(O),*u=falloc(O),*hh=falloc(I);
-    if(mode){env_set("QWEN_SHARED_BATCH",mode);env_set("QWEN_DENSE_BATCH",mode);}
-    else{env_unset("QWEN_SHARED_BATCH");env_unset("QWEN_DENSE_BATCH");}
+    if(mode){setenv("QWEN_SHARED_BATCH",mode,1);setenv("QWEN_DENSE_BATCH",mode,1);}
+    else{unsetenv("QWEN_SHARED_BATCH");unsetenv("QWEN_DENSE_BATCH");}
     memcpy(out,seed,(size_t)S*I*sizeof(float));double t0=now_s();
     qwen_shared_experts_cpu(m,l,x,S,out,g,u,hh);double dt=now_s()-t0;
     free(g);free(u);free(hh);return dt;
@@ -75,12 +60,12 @@ static int shared_benchmark(void) {
     printf("scalar %.6f s  batch %.6f s  speedup %.2fx  calls %d -> 3\n",ts,tb,ts/tb,S*3);
     for(int i=0;i<g_qdw_n;i++){free(g_qdw[i].q);free(g_qdw[i].sc);}g_qdw_n=0;
     free(l.sh_g);free(l.sh_u);free(l.sh_d);free(l.sh_gate);
-    free(x);free(seed);free(a);free(b);env_unset("QWEN_SHARED_BATCH");env_unset("QWEN_DENSE_BATCH");
+    free(x);free(seed);free(a);free(b);unsetenv("QWEN_SHARED_BATCH");unsetenv("QWEN_DENSE_BATCH");
     return 0;
 }
 
 int main(void) {
-    env_unset("COLI_DENSE_I8");
+    unsetenv("COLI_DENSE_I8");
     float *x=falloc((int64_t)S*I),*a=falloc((int64_t)S*O),*b=falloc((int64_t)S*O);
     int8_t *q=malloc((size_t)O*I);float *sc=falloc(O);
     if(!q){fputs("OOM qwen dense benchmark\n",stderr);return 2;}
