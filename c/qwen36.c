@@ -1595,13 +1595,27 @@ static void slot_ensure_int8(Model *m, Slot *s) {
 /* Segna l'esperto instradato per la bitmap HITS della dashboard. Vive qui,
  * fuori dalla regione QWEN36_NO_MAIN: expert_get la chiama anche nel build
  * del segment adapter, dove il resto della telemetria serve non esiste. */
+static pthread_mutex_t g_ehit_mx = PTHREAD_MUTEX_INITIALIZER;
 static void ehit_mark(Model *m, int layer, int eid){
     const Cfg *c=&m->c;
-    if(!m->ehit){
-        m->ehit=calloc((size_t)c->n_layers,sizeof(uint8_t*));
-        for(int i=0;i<c->n_layers;i++) m->ehit[i]=calloc((size_t)c->n_experts,1);
+    /* The first touch can come from a parallel region (qwen36: the tier
+     * warmstart's omp loop calls expert_get from twelve threads at once):
+     * one thread published m->ehit while it was still filling the rows and
+     * a sibling dereferenced m->ehit[layer] == NULL -- SIGSEGV in about one
+     * run in twelve on a CUDA warmstart. Build the table privately, publish
+     * it once under a lock (double-checked), and read it with acquire order. */
+    uint8_t **ehit=__atomic_load_n(&m->ehit,__ATOMIC_ACQUIRE);
+    if(!ehit){
+        pthread_mutex_lock(&g_ehit_mx);
+        ehit=m->ehit;
+        if(!ehit){
+            ehit=calloc((size_t)c->n_layers,sizeof(uint8_t*));
+            for(int i=0;i<c->n_layers;i++) ehit[i]=calloc((size_t)c->n_experts,1);
+            __atomic_store_n(&m->ehit,ehit,__ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&g_ehit_mx);
     }
-    if(layer>=0&&layer<c->n_layers&&eid>=0&&eid<c->n_experts) m->ehit[layer][eid]=1;
+    if(layer>=0&&layer<c->n_layers&&eid>=0&&eid<c->n_experts) ehit[layer][eid]=1;
 }
 static void expert_get(Model *m, int layer, int eid, Slot **out) {
     ehit_mark(m, layer, eid);   /* tocca solo m->ehit[layer][eid] */
