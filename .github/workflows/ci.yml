@@ -203,6 +203,14 @@ jobs:
             echo "::endgroup::"
           done
           exit $rc
+      - name: "Environment shims: setenv is visible to getenv in-process"
+        run: |
+          cd c
+          # This is the one gate that has to run OFF Linux. compat.h's setenv
+          # used to write only the Win32 block, which getenv never reads, so
+          # the C suite on the Linux job could not see the defect at all.
+          make tests/test_compat_env
+          ./tests/test_compat_env
       - if: matrix.os == 'macos-latest'
         name: Build every Metal-capable engine with METAL=1
         # `make <engine>` above builds the CPU path only: everything behind

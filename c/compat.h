@@ -15,6 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv / _putenv_s, used by the Windows env shims */
 #ifndef _WIN32
 #include <sys/mman.h>
 #include <unistd.h>
@@ -322,16 +323,39 @@ static inline off_t compat_fsize(int fd){
     return (off_t)li.QuadPart;
 }
 
-/* --- setenv -> SetEnvironmentVariableA (POSIX setenv assente su Windows) --- */
+/* --- setenv / unsetenv (assenti su Windows) ---
+ *
+ * A Windows process carries TWO views of its environment and they are not the
+ * same object: the Win32 environment block, which child processes inherit, and
+ * the CRT's own copy, which getenv() reads and which is populated once at
+ * startup. SetEnvironmentVariableA writes the first and leaves the second
+ * alone, so a setenv() followed by getenv() in the same process used to return
+ * the stale value -- silently, which is the worst way to not support
+ * something. Six test files had grown a private _putenv_s helper around it
+ * (#1416, #1417, #1420).
+ *
+ * _putenv_s writes the CRT copy AND keeps the Win32 block in sync, so both
+ * views agree. SetEnvironmentVariableA is kept alongside it so that a CRT that
+ * ever stopped syncing could not quietly break the inheritance the engine
+ * relies on (omp_tune.h's re-exec, inkling's OMP variables): the two calls
+ * write the same value to the two views, which is the invariant that matters.
+ *
+ * One difference from POSIX remains, and cannot be removed: the Windows CRT
+ * has no representation for a variable whose value is the empty string, so
+ * setenv(name, "", 1) REMOVES the variable instead of defining it empty. Code
+ * that distinguishes "" from unset must not rely on it. */
 static inline int compat_setenv(const char *name, const char *value, int overwrite){
     if(!overwrite && getenv(name)) return 0;
-    return SetEnvironmentVariableA(name, value) ? 0 : -1;
+    int rc = _putenv_s(name, value ? value : "");
+    SetEnvironmentVariableA(name, (value && *value) ? value : NULL);
+    return rc == 0 ? 0 : -1;
 }
 #define setenv(name,value,overwrite) compat_setenv(name,value,overwrite)
 
-/* --- unsetenv -> SetEnvironmentVariableA(NULL) --- */
 static inline int compat_unsetenv(const char *name){
-    return SetEnvironmentVariableA(name, NULL) ? 0 : -1;
+    int rc = _putenv_s(name, "");          /* empty value == remove, on Windows */
+    SetEnvironmentVariableA(name, NULL);
+    return rc == 0 ? 0 : -1;
 }
 #define unsetenv(name) compat_unsetenv(name)
 
