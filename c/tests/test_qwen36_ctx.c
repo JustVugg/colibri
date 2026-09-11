@@ -21,6 +21,8 @@
 #include "../qwen36.c"
 #undef main
 
+#include "../compat.h"   /* setenv/unsetenv: MinGW has neither */
+
 static int fails = 0;
 
 static void ck(int cond, const char *what) {

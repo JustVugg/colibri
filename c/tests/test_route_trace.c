@@ -9,9 +9,11 @@
  * easy to break by "tidying" the header into a comment line or moving the engine hash
  * into the second field, so it is asserted here against a literal copy of that loop.
  *
- * This test includes route_trace.h and nothing else: no Model, no Cfg, no st.h. That is
- * the point of the header — any engine can use it — and compiling this file proves it. */
+ * This test includes route_trace.h (plus compat.h) and nothing else: no Model, no Cfg, no st.h.
+ * That is the point of the header — any engine can use it — and compiling this file proves it. */
 #include "../route_trace.h"
+
+#include "../compat.h"   /* setenv/unsetenv: MinGW has neither */
 
 static int g_nfails = 0;
 static void check(int cond, const char *what){

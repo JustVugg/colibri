@@ -23,6 +23,8 @@
 #include "../colibri.c"
 #undef main
 
+#include "../compat.h"   /* setenv/unsetenv: MinGW has neither */
+
 static const char *TOKJSON =
 "{\"model\":{\"vocab\":{\"a\":0,\"b\":1,\"c\":2},\"merges\":[[\"a\",\"b\"]]},"
 " \"added_tokens\":["

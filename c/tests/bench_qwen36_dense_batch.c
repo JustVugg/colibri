@@ -9,6 +9,8 @@
 #include "../qwen36.c"
 #undef main
 
+#include "../compat.h"   /* setenv/unsetenv: MinGW has neither */
+
 enum { S=16, I=2048, O=512, REPS=7 };
 
 static float value(int64_t i, int salt) {
