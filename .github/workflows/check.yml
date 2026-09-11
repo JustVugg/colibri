@@ -128,6 +128,18 @@ jobs:
           python c/tools/make_edge_tiny_tokenizer.py --vocab-size 281 /tmp/glm53_stream-i4
           cd c && COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_dashboard
 
+  linux-musl:
+    name: Linux (Alpine/musl)
+    runs-on: ubuntu-latest
+    container: alpine:3.20
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: apk add build-base python3
+      - name: make check
+        run: make -C c check
+
   macos:
     # clang; libomp for the threaded path (Makefile falls back to
     # single-threaded automatically if it's ever missing).
