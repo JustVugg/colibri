@@ -8455,7 +8455,7 @@ static void rss_guard(Model *m){
     if(dropped)
         fprintf(stderr,"[RAM-GUARD] RSS %.1f GB over the %.1f GB budget (#403): "
                        "dropped %d cached experts, cap -> %d\n", rss, lim, dropped, m->ecap);
-/* musl lacks malloc_trim, but free() returns large slabs to the OS directly */
+/* musl: no malloc_trim, but free() munmaps large expert slabs anyway */
 #ifdef __GLIBC__
     malloc_trim(1024);
 #endif
