@@ -57,6 +57,7 @@
 #include "json.h"
 #include "st.h"
 #include "quant.h"
+#include <pthread.h>   /* ehit_mark publishes the lazy HITS table under a lock */
 #include "hyper_connections.h"
 #include "tok.h"
 #include "serve_codec.h"
@@ -783,16 +784,30 @@ static void expert_read(Model *m, const char *kind, int layer, int eid, Slot *s)
 }
 
 /* One byte per expert: routed in this turn or not, for the dashboard's HITS line. */
+static pthread_mutex_t g_ehit_mx = PTHREAD_MUTEX_INITIALIZER;
 static void ehit_mark(Model *m, int layer, int eid) {
     Cfg *c = &m->c;
-    if (!m->ehit) {
-        m->ehit = xmalloc((size_t)c->n_layers * sizeof(uint8_t *), "expert hit map");
-        for (int i = 0; i < c->n_layers; i++) {
-            m->ehit[i] = xmalloc((size_t)c->n_routed, "expert hit row");
-            memset(m->ehit[i], 0, (size_t)c->n_routed);
+    /* Built privately and published once under a lock, the shape #1423 gave the
+     * other engines: a first touch from inside a parallel region otherwise
+     * publishes the outer array while the rows are still being filled, and a
+     * sibling thread dereferences a NULL row. Nothing here routes from a
+     * parallel region today, but the code is the same code, and the lock costs
+     * one atomic load on the path that matters. */
+    uint8_t **ehit = __atomic_load_n(&m->ehit, __ATOMIC_ACQUIRE);
+    if (!ehit) {
+        pthread_mutex_lock(&g_ehit_mx);
+        ehit = m->ehit;
+        if (!ehit) {
+            ehit = xmalloc((size_t)c->n_layers * sizeof(uint8_t *), "expert hit map");
+            for (int i = 0; i < c->n_layers; i++) {
+                ehit[i] = xmalloc((size_t)c->n_routed, "expert hit row");
+                memset(ehit[i], 0, (size_t)c->n_routed);
+            }
+            __atomic_store_n(&m->ehit, ehit, __ATOMIC_RELEASE);
         }
+        pthread_mutex_unlock(&g_ehit_mx);
     }
-    if (layer >= 0 && layer < c->n_layers && eid >= 0 && eid < c->n_routed) m->ehit[layer][eid] = 1;
+    if (layer >= 0 && layer < c->n_layers && eid >= 0 && eid < c->n_routed) ehit[layer][eid] = 1;
 }
 
 /* `kind` is the checkpoint namespace, "layers" for the backbone and "mtp" for a
