@@ -24,6 +24,7 @@ DEFAULT_ALIGNMENT = 32
 SUPPORTED_VERSIONS = (1, 2, 3)
 
 MAX_METADATA_ITEMS = 1 << 22
+MAX_METADATA_DEPTH = 64
 MAX_TENSORS = 1 << 24
 
 GGML_TYPE_F32 = 0
@@ -242,7 +243,7 @@ class GGUFReader:
         size = struct.calcsize(fmt)
         return cast(struct.unpack("<" + fmt, self._read_exact(size, "metadata value"))[0])
 
-    def _read_metadata_value(self, value_type):
+    def _read_metadata_value(self, value_type, depth=0):
         if value_type == METADATA_STRING:
             return self._read_string("metadata string")
         if value_type == METADATA_BOOL:
@@ -252,6 +253,13 @@ class GGUFReader:
                     "%s: invalid bool metadata value %d" % (self.path, raw))
             return bool(raw)
         if value_type == METADATA_ARRAY:
+            # Arrays may nest (the spec allows it); bound the recursion so a
+            # hostile file cannot drive Python into RecursionError, which would
+            # escape the GGUFError contract every other failure keeps.
+            if depth >= MAX_METADATA_DEPTH:
+                raise GGUFError(
+                    "%s: metadata array nesting exceeds %d levels"
+                    % (self.path, MAX_METADATA_DEPTH))
             element_type = self._read_u32("array element type")
             count = self._read_u64("array length")
             if count > MAX_METADATA_ITEMS:
@@ -263,7 +271,8 @@ class GGUFReader:
                 raise GGUFError(
                     "%s: unknown metadata array element type %d"
                     % (self.path, element_type))
-            return [self._read_metadata_value(element_type) for _ in range(count)]
+            return [self._read_metadata_value(element_type, depth + 1)
+                    for _ in range(count)]
         if value_type in _SCALAR_FORMATS:
             return self._read_scalar(value_type)
         raise GGUFError("%s: unknown metadata value type %d" % (self.path, value_type))

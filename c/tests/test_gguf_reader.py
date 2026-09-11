@@ -50,6 +50,20 @@ def _raw_kv_value_type_only(key, value_type):
     return _encode_string(key) + struct.pack("<I", value_type)
 
 
+def _deep_array_value(depth):
+    """Value bytes for an ARRAY nested `depth` levels, ending in one int32.
+
+    Each level is an array holding a single element; the innermost array holds
+    one int32. Used to exercise the metadata array nesting cap.
+    """
+    payload = (struct.pack("<I", gguf_reader.METADATA_INT32)
+               + struct.pack("<Q", 1) + struct.pack("<i", 0))
+    for _ in range(depth - 1):
+        payload = (struct.pack("<I", gguf_reader.METADATA_ARRAY)
+                   + struct.pack("<Q", 1) + payload)
+    return payload
+
+
 def _raw_kv_string_value(key, raw_bytes):
     """Metadata STRING KV whose value bytes are provided verbatim (for
     malformed strings: oversized length, invalid UTF-8)."""
@@ -255,6 +269,13 @@ class GGUFRefusalTest(unittest.TestCase):
         kv = _raw_kv_array("test.array", 200)
         self._expect_error(_raw_header(kv_count=1) + kv, "unknown_elem_type.gguf",
                            "unknown metadata array element type 200")
+
+    def test_nested_array_beyond_depth_cap_refused(self):
+        kv = (_encode_string("test.deep")
+              + struct.pack("<I", gguf_reader.METADATA_ARRAY)
+              + _deep_array_value(gguf_reader.MAX_METADATA_DEPTH + 1))
+        self._expect_error(_raw_header(kv_count=1) + kv, "deep_meta.gguf",
+                           "array nesting exceeds")
 
     def test_metadata_bool_invalid_value(self):
         kv = _raw_kv("test.bool", METADATA_BOOL, True)[:-1] + b"\x02"

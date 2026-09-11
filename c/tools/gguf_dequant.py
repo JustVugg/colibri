@@ -19,7 +19,10 @@ from gguf_reader import (
     GGML_TYPE_F32,
     GGML_TYPE_Q2_K,
     GGML_TYPE_Q3_K,
+    GGML_TYPE_Q4_K,
+    GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
+    GGML_TYPE_Q8_0,
     GGUFError,
     ggml_block_spec,
     ggml_type_name,
@@ -39,6 +42,80 @@ def _f16_to_f32(pair_bytes):
 def _bf16_to_f32(word_bytes):
     u16 = word_bytes.view("<u2").reshape(-1).astype(np.uint32)
     return (u16 << 16).view(np.float32)
+
+
+def _unpack_scale_min_k4(sc_bytes):
+    """Sixteen 6-bit (scale, min) pairs packed into 12 bytes (get_scale_min_k4).
+
+    ggml-quants.c get_scale_min_k4(): the first four pairs use 6 bits directly
+    (scale in the low 6 bits, min in the high 6 bits of a sibling byte), the
+    remaining pairs are split across three bytes by a bit shuffle.
+    """
+    num_blocks = sc_bytes.shape[0]
+    scale = np.empty((num_blocks, 8), dtype=np.float32)
+    minimum = np.empty((num_blocks, 8), dtype=np.float32)
+    scale[:, 0:4] = sc_bytes[:, 0:4] & 63
+    minimum[:, 0:4] = sc_bytes[:, 4:8] & 63
+    scale[:, 4:8] = (sc_bytes[:, 8:12] & 0x0F) | ((sc_bytes[:, 0:4] >> 6) << 4)
+    minimum[:, 4:8] = (sc_bytes[:, 8:12] >> 4) | ((sc_bytes[:, 4:8] >> 6) << 4)
+    return scale, minimum
+
+
+def dequantize_q4_K(blocks):
+    # Q4_K (ggml-common.h block_q4_K, 144 bytes/256 elems):
+    #   d/dmin (fp16), scales[12] (sixteen 6-bit scale/min pairs),
+    #   qs[128] 4-bit packed quants. 8 sub-blocks of 32 values each.
+    num_blocks = blocks.shape[0]
+    packed_q = blocks[:, 16:144]
+    d = _f16_to_f32(blocks[:, 0:2])
+    dmin = _f16_to_f32(blocks[:, 2:4])
+    scale6, min6 = _unpack_scale_min_k4(blocks[:, 4:16])
+    out = np.empty((num_blocks, QK_K), dtype=np.float32)
+    for group in range(4):
+        d1 = d * scale6[:, 2 * group]
+        m1 = dmin * min6[:, 2 * group]
+        d2 = d * scale6[:, 2 * group + 1]
+        m2 = dmin * min6[:, 2 * group + 1]
+        col = 32 * group + np.arange(32)
+        lo = 64 * group
+        out[:, lo:lo + 32] = d1[:, None] * (packed_q[:, col] & 0xF).astype(np.float32) - m1[:, None]
+        out[:, lo + 32:lo + 64] = d2[:, None] * (packed_q[:, col] >> 4).astype(np.float32) - m2[:, None]
+    return out
+
+
+def dequantize_q5_K(blocks):
+    # Q5_K (ggml-common.h block_q5_K, 176 bytes/256 elems):
+    #   d/dmin (fp16), scales[12] (6-bit pairs), qh[32] high bits, qs[128] 4-bit.
+    #   Same 8x32 structure as Q4_K plus a per-plane high bit that adds 16.
+    num_blocks = blocks.shape[0]
+    ql = blocks[:, 48:176]
+    qh = blocks[:, 16:48]
+    d = _f16_to_f32(blocks[:, 0:2])
+    dmin = _f16_to_f32(blocks[:, 2:4])
+    scale6, min6 = _unpack_scale_min_k4(blocks[:, 4:16])
+    out = np.empty((num_blocks, QK_K), dtype=np.float32)
+    for group in range(4):
+        d1 = d * scale6[:, 2 * group]
+        m1 = dmin * min6[:, 2 * group]
+        d2 = d * scale6[:, 2 * group + 1]
+        m2 = dmin * min6[:, 2 * group + 1]
+        col = 32 * group + np.arange(32)
+        hi_low = ((qh >> (2 * group)) & 1).astype(np.float32)
+        hi_high = ((qh >> (2 * group + 1)) & 1).astype(np.float32)
+        low = (ql[:, col] & 0xF).astype(np.float32)
+        high = (ql[:, col] >> 4).astype(np.float32)
+        lo = 64 * group
+        out[:, lo:lo + 32] = d1[:, None] * (low + 16.0 * hi_low) - m1[:, None]
+        out[:, lo + 32:lo + 64] = d2[:, None] * (high + 16.0 * hi_high) - m2[:, None]
+    return out
+
+
+def dequantize_q8_0(blocks):
+    # Q8_0 (ggml-common.h block_q8_0, 34 bytes/32 elems):
+    #   fp16 scale, then 32 signed int8 values; every value is q * d.
+    d = _f16_to_f32(blocks[:, 0:2])
+    packed_q = blocks[:, 2:34].view(np.int8)
+    return d[:, None] * packed_q.astype(np.float32)
 
 
 def dequantize_q2_K(blocks):
@@ -156,7 +233,10 @@ def dequantize_q6_K(blocks):
 _DEQUANTIZERS = {
     GGML_TYPE_Q2_K: dequantize_q2_K,
     GGML_TYPE_Q3_K: dequantize_q3_K,
+    GGML_TYPE_Q4_K: dequantize_q4_K,
+    GGML_TYPE_Q5_K: dequantize_q5_K,
     GGML_TYPE_Q6_K: dequantize_q6_K,
+    GGML_TYPE_Q8_0: dequantize_q8_0,
 }
 
 

@@ -29,7 +29,10 @@ from gguf_dequant import (
     dequantize,
     dequantize_q2_K,
     dequantize_q3_K,
+    dequantize_q4_K,
+    dequantize_q5_K,
     dequantize_q6_K,
+    dequantize_q8_0,
 )
 
 GOLDEN = Path(__file__).resolve().parent / "fixtures" / "gguf_dequant_golden.npz"
@@ -37,7 +40,10 @@ GOLDEN = Path(__file__).resolve().parent / "fixtures" / "gguf_dequant_golden.npz
 BLOCK_CASES = [
     ("Q2_K", gguf_reader.GGML_TYPE_Q2_K, 84, dequantize_q2_K),
     ("Q3_K", gguf_reader.GGML_TYPE_Q3_K, 110, dequantize_q3_K),
+    ("Q4_K", gguf_reader.GGML_TYPE_Q4_K, 144, dequantize_q4_K),
+    ("Q5_K", gguf_reader.GGML_TYPE_Q5_K, 176, dequantize_q5_K),
     ("Q6_K", gguf_reader.GGML_TYPE_Q6_K, 210, dequantize_q6_K),
+    ("Q8_0", gguf_reader.GGML_TYPE_Q8_0, 34, dequantize_q8_0),
 ]
 
 
@@ -106,16 +112,19 @@ class LiveReferenceTest(unittest.TestCase):
 
         rng = np.random.default_rng(20260825)
         mapping = {
-            "Q2_K": (gguf.GGMLQuantizationType.Q2_K, gguf_reader.GGML_TYPE_Q2_K, 84),
-            "Q3_K": (gguf.GGMLQuantizationType.Q3_K, gguf_reader.GGML_TYPE_Q3_K, 110),
-            "Q6_K": (gguf.GGMLQuantizationType.Q6_K, gguf_reader.GGML_TYPE_Q6_K, 210),
+            "Q2_K": (gguf.GGMLQuantizationType.Q2_K, gguf_reader.GGML_TYPE_Q2_K, 84, 256),
+            "Q3_K": (gguf.GGMLQuantizationType.Q3_K, gguf_reader.GGML_TYPE_Q3_K, 110, 256),
+            "Q4_K": (gguf.GGMLQuantizationType.Q4_K, gguf_reader.GGML_TYPE_Q4_K, 144, 256),
+            "Q5_K": (gguf.GGMLQuantizationType.Q5_K, gguf_reader.GGML_TYPE_Q5_K, 176, 256),
+            "Q6_K": (gguf.GGMLQuantizationType.Q6_K, gguf_reader.GGML_TYPE_Q6_K, 210, 256),
+            "Q8_0": (gguf.GGMLQuantizationType.Q8_0, gguf_reader.GGML_TYPE_Q8_0, 34, 32),
         }
-        for name, (ref_type, our_type, block_bytes) in mapping.items():
+        for name, (ref_type, our_type, block_bytes, block_elems) in mapping.items():
             for _ in range(25):
                 nb = int(rng.integers(1, 5))
                 raw = rng.integers(0, 256, size=nb * block_bytes, dtype=np.uint8)
                 expected = reference(raw.reshape(nb, block_bytes).copy(), ref_type).reshape(-1)
-                got = dequantize(raw.tobytes(), our_type, nb * 256)
+                got = dequantize(raw.tobytes(), our_type, nb * block_elems)
                 np.testing.assert_allclose(got, expected, rtol=0, atol=0, equal_nan=True,
                                            err_msg="%s live mismatch" % name)
 
