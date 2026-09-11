@@ -13,21 +13,6 @@
 
 enum { S = 16, D = 2048, I = 1024, K = 2, NS = 2, REPS = 3 };
 
-static void env_set(const char *name,const char *value) {
-#ifdef _WIN32
-    _putenv_s(name,value);
-#else
-    setenv(name,value,1);
-#endif
-}
-static void env_unset(const char *name) {
-#ifdef _WIN32
-    _putenv_s(name,"");
-#else
-    unsetenv(name);
-#endif
-}
-
 static uint16_t to_bf16(float x) {
     union { float f; uint32_t u; } v = { x };
     return (uint16_t)(v.u >> 16);
@@ -61,8 +46,8 @@ static void init_q4(Wt *w, int rows, int cols, int salt) {
 static double one(Model *m, Layer *l, const float *x, const float *wgt,
                   const float *seed, float *out, const char *mode) {
     float *g = falloc(2 * I), *u = g + I, *hh = falloc(D);
-    if (mode) env_set("INK_SHARED_BATCH", mode);
-    else env_unset("INK_SHARED_BATCH");
+    if (mode) setenv("INK_SHARED_BATCH", mode, 1);
+    else unsetenv("INK_SHARED_BATCH");
     memcpy(out, seed, (size_t)S * D * sizeof(float));
     double t0 = now_s();
     shared_experts_cpu(m, l, x, S, out, wgt, g, u, hh);
@@ -125,7 +110,7 @@ int main(void) {
     qbytes+=(double)(NS*I*((D+63)/64)*2+NS*D*((I+63)/64))*sizeof(float);
     failed|=measure("int4-g64",qbytes/1048576.0,&m,&l,x,wgt,seed,scalar,batch);
 
-    env_unset("INK_SHARED_BATCH");
+    unsetenv("INK_SHARED_BATCH");
     free(l.sh_g.q4);free(l.sh_g.qs);free(l.sh_u.q4);free(l.sh_u.qs);
     free(l.sh_d.q4);free(l.sh_d.qs);
     free(x); free(wgt); free(seed); free(scalar); free(batch);

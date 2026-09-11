@@ -39,6 +39,8 @@
 #include <unistd.h>
 #endif
 
+#include "../compat.h"   /* setenv/unsetenv: MinGW has neither */
+
 #include "qwen36_fake_cuda.h"
 
 #include "../qwen36_tier.c"

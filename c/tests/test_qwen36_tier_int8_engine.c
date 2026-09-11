@@ -31,18 +31,6 @@
 #include "../qwen36.c"
 #undef main
 
-/* compat.h (pulled in by qwen36.c) maps setenv/unsetenv to
- * SetEnvironmentVariableA, which updates the Win32 environment block -- but
- * getenv() reads the CRT's own copy and never sees it, so the tier would
- * silently not get COLI_CUDA here. Drop that mapping before the fake backend
- * installs its _putenv_s version, and unset the same way. Same reasoning as
- * tests/test_qwen36_ctx.c. */
-#ifdef _WIN32
-#undef setenv
-#undef unsetenv
-#define unsetenv(name) _putenv_s(name, "")
-#endif
-
 #include "qwen36_fake_cuda.h"
 
 #include "../qwen36_tier.c"
