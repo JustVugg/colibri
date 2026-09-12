@@ -146,10 +146,49 @@ reading the architecture implies instead -- each layer against its own owner's k
 That is a different model, not a bug fix, and the CI asserts the two disagree so the
 default cannot be "tidied" by accident.
 
+## Streaming the experts
+
+Six of 384 experts are routed per layer per position, and each is 18.8 MB of fp4
+weights plus ue8m0 scales. A turn of 26 prompt tokens and 24 generated ones moves
+88.5 GB through the expert cache on the released checkpoint, so how fast those bytes
+arrive is not a detail of the engine, it is most of the engine.
+
+The reads go out together. A step's routed experts are all resolved to cache slots
+first -- hits stamped, misses given a reserved victim -- and only then are the missing
+tensors read, `V41_READ_DEPTH` of them at a time. Reserving before reading is what
+makes the batch possible: a reserved victim carries the newest clock and a cleared id,
+so a later reservation in the same step neither evicts it again nor mistakes it for a
+hit. The arithmetic is untouched -- the experts are still accumulated in rank order --
+and a cache too small to hold one step's experts (`cap < topk`) keeps the old
+one-at-a-time path, because there the slots genuinely cannot all be live at once.
+
+Measured on the released checkpoint, cold (page cache dropped before every run), same
+prompt, same seed, on a striped pair of Samsung PM9A1:
+
+| read depth | expert I/O | rate | wall | tok/s |
+|---|---|---|---|---|
+| 1 | 35.8 s | 2.47 GB/s | 67.0 s | 0.358 |
+| 4 | 15.0 s | 5.91 GB/s | 45.0 s | 0.533 |
+| 8 (default) | 12.9 / 13.0 s | 6.84 / 6.81 GB/s | 43.1 / 42.4 s | 0.557 / 0.566 |
+| 12 | 13.1 s | 6.77 GB/s | 43.4 s | 0.554 |
+| 16 | 13.5 s | 6.57 GB/s | 47.5 s | 0.506 |
+
+Every row reads the same 88.5 GB in the same 4709 misses and emits the same 24 tokens;
+only the depth changes. Past eight the device stops answering faster and the reader
+threads start taking cores away from the matmuls, which is why the wall turns back up
+while the rate barely moves. The depth-8 row is two independent cold runs, to show how
+much of the wall is run-to-run noise: the I/O figures repeat to within half a percent,
+the compute figures do not.
+
+Prefill is where most of it goes: 54.6 GB of the 88.5, because each of the 26 prompt
+positions routes independently and a 49-slot cache cannot hold what 26 positions ask
+of one layer.
+
 ## Environment
 
 | variable | default | what it does |
 |---|---|---|
+| `V41_READ_DEPTH` | 8 | expert tensors read at once when a step misses the cache (see above). `1` restores the serial read the engine used to do, for an A/B. |
 | `V41_ENGRAM_ROWS` | 65536 | rows of engram cache per table. The traffic is Zipfian: common 2-grams repeat constantly, so a small cache absorbs most of it. 65536 rows is 64 MB per table on the released head_dim. |
 | `V41_INDEX_OWNER` | unset | each layer scores against its own owner's index keys (see above). Changes the model's behaviour. |
 | `V41_MAX_IMAGE_TOKENS` | the checkpoint's `max_image_tokens` | a ceiling on what one image costs in prompt tokens. |

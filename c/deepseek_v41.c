@@ -786,28 +786,81 @@ static void rms_into(float *out, const float *x, const float *weight, int n, flo
 
 /* --------------------------------------------------------- expert cache ---- */
 
-static void expert_read(Model *m, const char *kind, int layer, int eid, Slot *s) {
+/* One tensor still to fetch: which one, and where it lands. An expert is six of
+ * these -- three weight matrices and their three scale sidecars. */
+typedef struct { char name[160]; uint8_t *dest; int64_t size; } ExpertRead;
+
+#define V41_EXPERT_TENSORS 6
+
+/* Fill in the six reads that make up one expert. Naming them into a list instead
+ * of reading them on the spot is the whole point: the list is what lets a layer's
+ * misses go to the device together rather than one behind another. */
+static int expert_read_list(Model *m, const char *kind, int layer, int eid, Slot *s,
+                            ExpertRead *out) {
     Cfg *c = &m->c;
-    char name[256];
     int64_t packed_gate = (int64_t)c->moe_inter * c->dim / 2;
     int64_t packed_down = (int64_t)c->dim * c->moe_inter / 2;
     int64_t scales_gate = (int64_t)c->moe_inter * (c->dim / 32);
     int64_t scales_down = (int64_t)c->dim * (c->moe_inter / 32);
-    double started = now_s();
     struct { const char *suffix; uint8_t *bytes; int64_t size; uint8_t *scale; int64_t scale_size; } part[3] = {
         { "w1", s->w1, packed_gate, s->s1, scales_gate },
         { "w3", s->w3, packed_gate, s->s3, scales_gate },
         { "w2", s->w2, packed_down, s->s2, scales_down },
     };
+    int n = 0;
     for (int i = 0; i < 3; i++) {
-        snprintf(name, sizeof(name), "%s.%d.ffn.experts.%d.%s.weight", kind, layer, eid, part[i].suffix);
-        st_read_raw_cap(&m->S, name, part[i].bytes, part[i].size, 1);
-        snprintf(name, sizeof(name), "%s.%d.ffn.experts.%d.%s.scale", kind, layer, eid, part[i].suffix);
-        st_read_raw_cap(&m->S, name, part[i].scale, part[i].scale_size, 1);
-        m->expert_bytes += part[i].size + part[i].scale_size;
+        snprintf(out[n].name, sizeof(out[n].name), "%s.%d.ffn.experts.%d.%s.weight",
+                 kind, layer, eid, part[i].suffix);
+        out[n].dest = part[i].bytes; out[n].size = part[i].size; n++;
+        snprintf(out[n].name, sizeof(out[n].name), "%s.%d.ffn.experts.%d.%s.scale",
+                 kind, layer, eid, part[i].suffix);
+        out[n].dest = part[i].scale; out[n].size = part[i].scale_size; n++;
     }
-    s->eid = eid;
+    return n;
+}
+
+/* How many expert tensors to keep in flight. One at a time is what the engine did
+ * and it leaves most of the device on the floor: measured on the released
+ * checkpoint, 88.5 GB of expert reads landed at 2.40 GB/s, while the same blocks
+ * through the same page cache go at 6.2 GB/s with one reader and 12.6 GB/s with
+ * four (c/iobench.c, 5.6 MB blocks, caches dropped). A striped NVMe pair answers
+ * several requests at once; a single blocking pread never asks it to.
+ * V41_READ_DEPTH=1 restores the serial path for an A/B. */
+static int expert_read_depth(void) {
+    static int depth = -1;
+    if (depth < 0) {
+        const char *env = getenv("V41_READ_DEPTH");
+        depth = env ? atoi(env) : 8;
+        if (depth < 1) depth = 1;
+    }
+    return depth;
+}
+
+/* Read `n` reserved experts at once. The slot ids are stamped only after every
+ * read has landed, so a slot never advertises an expert it does not yet hold. */
+static void expert_fetch(Model *m, const char *kind, int layer,
+                         Slot *const *slot, const int *eid, int n) {
+    if (n <= 0) return;
+    int total = 0;
+    ExpertRead *list = xmalloc((size_t)n * V41_EXPERT_TENSORS * sizeof(ExpertRead),
+                               "expert read list");
+    for (int i = 0; i < n; i++)
+        total += expert_read_list(m, kind, layer, eid[i], slot[i], list + total);
+    double started = now_s();
+    int threads = expert_read_depth();
+    if (threads > total) threads = total;
+    uint64_t bytes = 0;
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(threads) reduction(+:bytes)
+#endif
+    for (int i = 0; i < total; i++) {
+        st_read_raw_cap(&m->S, list[i].name, list[i].dest, list[i].size, 1);
+        bytes += (uint64_t)list[i].size;
+    }
+    m->expert_bytes += bytes;
     m->t_disk += now_s() - started;
+    for (int i = 0; i < n; i++) slot[i]->eid = eid[i];
+    free(list);
 }
 
 /* One byte per expert: routed in this turn or not, for the dashboard's HITS line. */
@@ -859,13 +912,56 @@ static Slot *expert_slot_at(Model *m, LCache *cache, const char *kind, int layer
             if (cache->slot[i].used < cache->slot[oldest].used) oldest = i;
         victim = &cache->slot[oldest];
     }
-    expert_read(m, kind, layer, eid, victim);
     victim->used = ++m->clock;
+    expert_fetch(m, kind, layer, &victim, &eid, 1);
     return victim;
 }
 
-static Slot *expert_slot(Model *m, int layer, int eid) {
-    return expert_slot_at(m, &m->cache[layer], "layers", layer, eid);
+/* Resolve a whole step's routed experts to slots WITHOUT reading any of them, then
+ * fetch the misses in one batch. Reserving first is what makes the batch possible:
+ * a reserved victim is stamped with the newest clock and its id cleared, so a later
+ * reservation in the same step neither evicts it again nor mistakes it for a hit.
+ *
+ * The argument holds only while the cache has room for the whole step (cap >= topk):
+ * at reservation k at most k slots have been touched, so with cap > k there is
+ * always an untouched one left to evict, and the untouched ones are exactly the
+ * ones with an older clock. A cache smaller than topk has no such slot -- the
+ * caller keeps the one-at-a-time path for that case. */
+static void expert_slots_at(Model *m, LCache *cache, const char *kind, int layer,
+                            const int *chosen, int topk, Slot **out) {
+    int miss_eid[64];
+    Slot *miss_slot[64];
+    int misses = 0;
+    for (int k = 0; k < topk; k++) {
+        int eid = chosen[k];
+        if (!strcmp(kind, "layers")) ehit_mark(m, layer, eid);
+        Slot *found = NULL;
+        for (int i = 0; i < cache->n; i++)
+            if (cache->slot[i].eid == eid) { found = &cache->slot[i]; break; }
+        if (found) {
+            found->used = ++m->clock;
+            m->hits++;
+            out[k] = found;
+            continue;
+        }
+        m->miss++;
+        Slot *victim;
+        if (cache->n < cache->cap) {
+            victim = &cache->slot[cache->n++];
+        } else {
+            int oldest = 0;
+            for (int i = 1; i < cache->n; i++)
+                if (cache->slot[i].used < cache->slot[oldest].used) oldest = i;
+            victim = &cache->slot[oldest];
+        }
+        victim->used = ++m->clock;
+        victim->eid = -1;                  /* not this expert yet: the read is still pending */
+        out[k] = victim;
+        miss_slot[misses] = victim;
+        miss_eid[misses] = eid;
+        misses++;
+    }
+    expert_fetch(m, kind, layer, miss_slot, miss_eid, misses);
 }
 
 /* ------------------------------------------------------------- loading ----- */
@@ -1650,9 +1746,22 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
     }
     for (int k = 0; k < topk; k++) weights[k] *= c->route_scale;
     memset(out, 0, (size_t)c->dim * sizeof(float));
-    for (int k = 0; k < topk; k++) {
-        Slot *s = expert_slot_at(m, cache, kind, layer, chosen[k]);
-        expert_ffn(m, s->w1, s->s1, s->w3, s->s3, s->w2, s->s2, x, out, weights[k]);
+    if (cache->cap >= topk) {
+        /* Reserve every slot first, read the misses together, then compute. The
+         * accumulation into `out` keeps its rank order, so this is the same
+         * arithmetic in the same sequence -- only the reads moved. */
+        Slot *slot[64];
+        expert_slots_at(m, cache, kind, layer, chosen, topk, slot);
+        for (int k = 0; k < topk; k++)
+            expert_ffn(m, slot[k]->w1, slot[k]->s1, slot[k]->w3, slot[k]->s3,
+                       slot[k]->w2, slot[k]->s2, x, out, weights[k]);
+    } else {
+        /* A cache too small to hold one step's experts evicts one of them to make
+         * room for the next, so the slots cannot all be live at once. */
+        for (int k = 0; k < topk; k++) {
+            Slot *s = expert_slot_at(m, cache, kind, layer, chosen[k]);
+            expert_ffn(m, s->w1, s->s1, s->w3, s->s3, s->w2, s->s2, x, out, weights[k]);
+        }
     }
     shared_ffn(m, l, x, out);
     free(scores);
@@ -2799,6 +2908,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
         double turn_started = now_s();
         double disk0 = m->t_disk, expert0 = m->t_expert, attn0 = m->t_attn, engram0 = m->t_engram;
         uint64_t forwards0 = m->forwards, hits0 = m->hits, miss0 = m->miss;
+        uint64_t ebytes0 = m->expert_bytes;
         model_reset(m);
         int n_prompt = tok_encode(tokenizer, (const char *)command.payload,
                                   (int)command.payload_bytes, ids, c->max_positions);
@@ -2847,6 +2957,8 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
         free(pending_image); pending_image = NULL;
         forward_with_image(m, ids, n_prompt, logits, aligned, image_at, image_h, image_w, image_mask);
         free(aligned); free(image_mask);
+        uint64_t prefill_bytes = m->expert_bytes - ebytes0;
+        double prefill_disk = m->t_disk - disk0;
 
         int emitted = 0, limited = 1, cancelled = 0, done_early = 0;
         char piece[512];
@@ -2925,6 +3037,20 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
                         (unsigned long long)tab->misses,
                         tab->misses * (double)(m->engram.head_dim + m->engram.head_dim / 32) / 1e6);
             }
+        }
+        {
+            /* Expert streaming, per turn: how many bytes the LRU had to fetch and
+             * what rate the reads actually achieved. The rate is the number that
+             * matters -- the device is worth several GB/s, so a figure far under
+             * that says the loads are serialised, not that the disk is slow. */
+            uint64_t turn_bytes = m->expert_bytes - ebytes0;
+            double seconds = m->t_disk - disk0;
+            if (turn_bytes)
+                fprintf(stderr, "[v41] expert I/O: %llu misses, %.1f MB in %.2fs (%.2f GB/s); "
+                                "prefill %.1f MB in %.2fs\n",
+                        (unsigned long long)(m->miss - miss0), turn_bytes / 1e6, seconds,
+                        seconds > 0 ? turn_bytes / 1e9 / seconds : 0.0,
+                        prefill_bytes / 1e6, prefill_disk);
         }
         if (m->spec.active && m->spec.proposed > proposed0)
             fprintf(stderr, "[v41] DSpark: %llu of %llu drafts accepted this turn\n",
