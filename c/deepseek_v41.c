@@ -57,6 +57,7 @@
 #include "json.h"
 #include "st.h"
 #include "quant.h"
+#include "sparse_attn.h"
 #include <pthread.h>   /* ehit_mark publishes the lazy HITS table under a lock */
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -355,6 +356,70 @@ static void mv8(float *y, const W8 *w, const float *x) {
             sum += part * tile;
         }
         y[o] = sum;
+    }
+}
+
+/* mv8 and mvb for a block of positions at once.
+ *
+ * The matrix is the thing that does not fit in cache -- wq_b is 42 MB on the
+ * released checkpoint, and so is wo_b -- while a block of positions does. Driving
+ * the block through one pass of the matrix instead of one pass per position turns
+ * prefill's twenty-six trips over 42 MB into a single trip, which is memory
+ * traffic the FMA units were waiting on rather than arithmetic.
+ *
+ * Values are bit-identical to the one-at-a-time kernels, not merely close: each
+ * output still folds the same tiles in the same order, and the decoded weight
+ * being held across the block instead of re-decoded per position does not change
+ * what is multiplied. The block is capped so the positions stay in L2 while the
+ * matrix streams past. */
+#define MV_ROWS_MAX 32
+
+static int mv_block_rows(int I) {
+    int block = (int)((192 * 1024) / ((size_t)I * sizeof(float) + 1));
+    if (block > MV_ROWS_MAX) block = MV_ROWS_MAX;
+    return block < 1 ? 1 : block;
+}
+
+static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
+    int I = w->I, tiles_i = (I + FP8_TILE - 1) / FP8_TILE;
+    int block = mv_block_rows(I);
+    for (int r0 = 0; r0 < rows; r0 += block) {
+        int nr = rows - r0 < block ? rows - r0 : block;
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < w->O; o++) {
+            const uint8_t *row = w->q + (size_t)o * I;
+            const uint8_t *scale = w->s + (size_t)(o / FP8_TILE) * tiles_i;
+            float sum[MV_ROWS_MAX];
+            for (int r = 0; r < nr; r++) sum[r] = 0.0f;
+            for (int base = 0; base < I; base += FP8_TILE) {
+                int width = I - base < FP8_TILE ? I - base : FP8_TILE;
+                float tile = ue8m0(scale[base / FP8_TILE]);
+#if defined(__AVX2__)
+                if (width == FP8_TILE) {
+                    __m256 w0 = e4m3_decode8(row + base);
+                    __m256 w1 = e4m3_decode8(row + base + 8);
+                    __m256 w2 = e4m3_decode8(row + base + 16);
+                    __m256 w3 = e4m3_decode8(row + base + 24);
+                    for (int r = 0; r < nr; r++) {
+                        const float *xr = x + (size_t)(r0 + r) * xstride + base;
+                        __m256 acc = _mm256_mul_ps(w0, _mm256_loadu_ps(xr));
+                        acc = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xr + 8), acc);
+                        acc = _mm256_fmadd_ps(w2, _mm256_loadu_ps(xr + 16), acc);
+                        acc = _mm256_fmadd_ps(w3, _mm256_loadu_ps(xr + 24), acc);
+                        sum[r] += hsum256(acc) * tile;
+                    }
+                    continue;
+                }
+#endif
+                for (int r = 0; r < nr; r++) {
+                    const float *xr = x + (size_t)(r0 + r) * xstride + base;
+                    float part = 0.0f;
+                    for (int i = 0; i < width; i++) part += e4m3_decode(row[base + i]) * xr[i];
+                    sum[r] += part * tile;
+                }
+            }
+            for (int r = 0; r < nr; r++) y[(size_t)(r0 + r) * ystride + o] = sum[r];
+        }
     }
 }
 
@@ -1008,9 +1073,12 @@ static void cache_init(Model *m, LCache *cache, int ecap) {
     }
 }
 
+static void attn_project_check(const Cfg *c);
+
 static void model_load(Model *m, const char *snap, int ecap, int engram_cache_rows) {
     Cfg *c = &m->c;
     cfg_load(c, snap);
+    attn_project_check(c);
     st_init(&m->S, snap);
     engram_load_sidecar(&m->engram, snap);
 
@@ -1178,29 +1246,13 @@ static void window_idxs(const Cfg *c, const Layer *l, int n, int start_pos, int 
 /* kernel.py sparse_attn for one query: `idx` lists the rows of `kv` this query reads,
  * -1 meaning nothing. The sink joins the denominator only, so a query with no readable
  * row comes out zero instead of NaN. */
+/* The kernel itself lives in sparse_attn.h, where a test can reach it. `score` is
+ * the caller's scratch: this runs once per head per position per layer, and a
+ * malloc in that place was costing more than some of the arithmetic. */
 static void sparse_attend(float *out, const float *q, const float *kv, const int *idx,
-                          int count, int nh, int hd, float sink_h, float scale) {
-    float best = -1e30f;
-    float *score = xmalloc((size_t)count * sizeof(float), "attention scores");
-    for (int j = 0; j < count; j++) {
-        if (idx[j] < 0) { score[j] = -INFINITY; continue; }
-        const float *k = kv + (size_t)idx[j] * hd;
-        float dot = 0.0f;
-        for (int i = 0; i < hd; i++) dot += q[i] * k[i];
-        score[j] = dot * scale;
-        if (score[j] > best) best = score[j];
-    }
-    float denom = expf(sink_h - best);
-    for (int i = 0; i < hd; i++) out[i] = 0.0f;
-    for (int j = 0; j < count; j++) {
-        if (!(score[j] > -INFINITY)) continue;
-        float weight = expf(score[j] - best);
-        denom += weight;
-        const float *k = kv + (size_t)idx[j] * hd;
-        for (int i = 0; i < hd; i++) out[i] += weight * k[i];
-    }
-    for (int i = 0; i < hd; i++) out[i] /= denom;
-    free(score);
+                          int count, int nh, int hd, float sink_h, float scale,
+                          float *score) {
+    coli_sparse_attend(out, q, kv, idx, count, hd, sink_h, scale, score);
     (void)nh;
 }
 
@@ -1434,41 +1486,39 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
 /* wo_a is block diagonal over o_groups: each group projects only its own heads, and
  * only then does wo_b mix the groups. Shared with the DSpark stages, whose attention
  * differs in what it reads but not in how it comes out. */
-static void attn_project_out(Model *m, Layer *l, const float *heads, float *out) {
+static void attn_project_out_rows(Model *m, Layer *l, const float *heads, int rows, float *out) {
     Cfg *c = &m->c;
     int per_group = c->n_heads * c->head_dim / c->o_groups;
-    float *grouped = xmalloc((size_t)c->o_groups * c->o_lora * sizeof(float), "grouped");
+    int width = c->o_groups * c->o_lora;
+    int head_stride = c->n_heads * c->head_dim;
+    float *grouped = xmalloc((size_t)rows * width * sizeof(float), "grouped");
     for (int g = 0; g < c->o_groups; g++) {
-        const uint8_t *rows = l->wo_a.q + (size_t)g * c->o_lora * per_group;
-        const uint8_t *scales = l->wo_a.s;
-        int tiles_i = (per_group + FP8_TILE - 1) / FP8_TILE;
-        for (int r = 0; r < c->o_lora; r++) {
-            int o = g * c->o_lora + r;
-            const uint8_t *w = rows + (size_t)r * per_group;
-            const uint8_t *scale_row = scales + (size_t)(o / FP8_TILE) * tiles_i;
-            const float *xg = heads + (size_t)g * per_group;
-            float sum = 0.0f;
-            for (int base = 0; base < per_group; base += FP8_TILE) {
-                int width = per_group - base < FP8_TILE ? per_group - base : FP8_TILE;
-                float tile = ue8m0(scale_row[base / FP8_TILE]);
-                float part = 0.0f;
-#if defined(__AVX2__)
-                if (width == FP8_TILE) {
-                    __m256 acc = _mm256_setzero_ps();
-                    for (int i = 0; i < FP8_TILE; i += 8)
-                        acc = _mm256_fmadd_ps(e4m3_decode8(w + base + i),
-                                              _mm256_loadu_ps(xg + base + i), acc);
-                    part = hsum256(acc);
-                } else
-#endif
-                for (int i = 0; i < width; i++) part += e4m3_decode(w[base + i]) * xg[base + i];
-                sum += part * tile;
-            }
-            grouped[o] = sum;
-        }
+        /* A W8 view of group g's block. The scale array is indexed by the GLOBAL
+         * output row, so the view is only the same matrix when a group's rows start
+         * on a tile boundary -- which o_lora being a multiple of 32 is what makes
+         * true, and what the fallback below covers when it is not. */
+        W8 block;
+        block.q = l->wo_a.q + (size_t)g * c->o_lora * per_group;
+        block.s = l->wo_a.s + (size_t)(g * c->o_lora / FP8_TILE)
+                            * ((per_group + FP8_TILE - 1) / FP8_TILE);
+        block.O = c->o_lora;
+        block.I = per_group;
+        mv8_rows(grouped + (size_t)g * c->o_lora, width, &block,
+                 heads + (size_t)g * per_group, head_stride, rows);
     }
-    mv8(out, &l->wo_b, grouped);
+    mv8_rows(out, c->dim, &l->wo_b, grouped, width, rows);
     free(grouped);
+}
+
+/* wo_a's groups have to start on a scale tile for the block view above to name the
+ * same weights. Checked once at load rather than asserted in the hot path. */
+static void attn_project_check(const Cfg *c) {
+    if (c->o_lora % FP8_TILE != 0) {
+        fprintf(stderr, "[v41] o_lora_rank %d is not a multiple of the %d-wide scale tile: "
+                        "the grouped output projection cannot be read as blocks\n",
+                c->o_lora, FP8_TILE);
+        exit(1);
+    }
 }
 
 /* model.py Attention.forward. `x` is the normalized block input [n, dim]. */
@@ -1483,16 +1533,22 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
     float *qr = xmalloc((size_t)n * c->q_lora * sizeof(float), "q latent");
     float *q = xmalloc((size_t)n * nh * hd * sizeof(float), "queries");
     float *kv = xmalloc((size_t)n * hd * sizeof(float), "kv");
-    float *scratch = xmalloc((size_t)(nh * hd > dim ? nh * hd : dim) * sizeof(float), "scratch");
+    float *scratch = xmalloc((size_t)n * c->q_lora * sizeof(float), "q projection");
+    float *kv_raw = xmalloc((size_t)n * hd * sizeof(float), "kv projection");
 
+    /* One pass of each matrix for the whole block of positions, rather than one
+     * pass per position: wq_b alone is 42 MB, and during prefill this is the
+     * difference between reading it once and reading it once per prompt token. */
+    mv8_rows(scratch, c->q_lora, &l->wq_a, x, dim, n);
+    for (int t = 0; t < n; t++)
+        rms_into(qr + (size_t)t * c->q_lora, scratch + (size_t)t * c->q_lora,
+                 l->q_norm.w, c->q_lora, c->norm_eps);
+    mv8_rows(q, nh * hd, &l->wq_b, qr, c->q_lora, n);
+    mv8_rows(kv_raw, hd, &l->wkv, x, dim, n);
     for (int t = 0; t < n; t++) {
-        mv8(scratch, &l->wq_a, x + (size_t)t * dim);
-        rms_into(qr + (size_t)t * c->q_lora, scratch, l->q_norm.w, c->q_lora, c->norm_eps);
-        mv8(q + (size_t)t * nh * hd, &l->wq_b, qr + (size_t)t * c->q_lora);
         for (int h = 0; h < nh; h++)
             rope_apply(q + (size_t)t * nh * hd + (size_t)h * hd + hd - rd, rope, start_pos + t, rd, 0);
-        mv8(scratch, &l->wkv, x + (size_t)t * dim);
-        rms_into(kv + (size_t)t * hd, scratch, l->kv_norm.w, hd, c->norm_eps);
+        rms_into(kv + (size_t)t * hd, kv_raw + (size_t)t * hd, l->kv_norm.w, hd, c->norm_eps);
         rope_apply(kv + (size_t)t * hd + hd - rd, rope, start_pos + t, rd, 0);
     }
 
@@ -1615,7 +1671,9 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
     }
 
     const float *kv_read = ratio ? kv_all : window_kv;
-    float *heads = xmalloc((size_t)nh * hd * sizeof(float), "attention output");
+    /* every position's heads, so the output projection can run as one block too */
+    float *heads = xmalloc((size_t)n * nh * hd * sizeof(float), "attention output");
+    float *head_score = xmalloc((size_t)nh * total_idx * sizeof(float), "attention scores");
     float attn_scale = 1.0f / sqrtf((float)hd);
     for (int t = 0; t < n; t++) {
         if (start_pos > 0) {
@@ -1635,15 +1693,20 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
             for (int k = count; k < window_width; k++) idx[(size_t)t * total_idx + k] = -1;
         }
         const int *row = idx + (size_t)t * total_idx;
+        float *row_heads = heads + (size_t)t * nh * hd;
         #pragma omp parallel for schedule(static)
         for (int h = 0; h < nh; h++)
-            sparse_attend(heads + (size_t)h * hd, q + (size_t)t * nh * hd + (size_t)h * hd,
-                          kv_read, row, total_idx, nh, hd, l->attn_sink.w[h], attn_scale);
+            sparse_attend(row_heads + (size_t)h * hd, q + (size_t)t * nh * hd + (size_t)h * hd,
+                          kv_read, row, total_idx, nh, hd, l->attn_sink.w[h], attn_scale,
+                          head_score + (size_t)h * total_idx);
         for (int h = 0; h < nh; h++)
-            rope_apply(heads + (size_t)h * hd + hd - rd, rope, start_pos + t, rd, 1);
-        attn_project_out(m, l, heads, out + (size_t)t * dim);
+            rope_apply(row_heads + (size_t)h * hd + hd - rd, rope, start_pos + t, rd, 1);
     }
+    /* The projection reads the heads and writes `out`; it touches no cached state,
+     * so it can wait until every position has its heads and then run once. */
+    attn_project_out_rows(m, l, heads, n, out);
     m->t_attn += now_s() - started;
+    free(head_score); free(kv_raw);
     free(heads); free(kv_all); free(idx); free(scratch); free(kv); free(q); free(qr);
 }
 
@@ -2171,30 +2234,34 @@ static void spec_attention(Model *m, int stage, const float *x, int block, int s
     int dim = c->dim, hd = c->head_dim, nh = c->n_heads, rd = c->rope_dim, win = c->window;
     const float *rope = m->rope_window;          /* a stage never compresses */
     double started = now_s();
-    float *scratch = xmalloc((size_t)(nh * hd > dim ? nh * hd : dim) * sizeof(float), "spec scratch");
+    int scratch_rows = main_rows > block ? main_rows : block;
+    float *scratch = xmalloc((size_t)scratch_rows * (c->q_lora > hd ? c->q_lora : hd)
+                             * sizeof(float), "spec scratch");
 
+    mv8_rows(scratch, hd, &l->wkv, main_x, dim, main_rows);
     for (int t = 0; t < main_rows; t++) {
         int pos = start_pos + t;
         float *slot = l->window + (size_t)(pos % win) * hd;
-        mv8(scratch, &l->wkv, main_x + (size_t)t * dim);
-        rms_into(slot, scratch, l->kv_norm.w, hd, c->norm_eps);
+        rms_into(slot, scratch + (size_t)t * hd, l->kv_norm.w, hd, c->norm_eps);
         rope_apply(slot + hd - rd, rope, pos, rd, 0);
         l->window_pos[pos % win] = pos;
     }
     if (!out) { free(scratch); m->t_attn += now_s() - started; return; }
 
-    float *qr = xmalloc((size_t)c->q_lora * sizeof(float), "spec q latent");
+    float *qr = xmalloc((size_t)block * c->q_lora * sizeof(float), "spec q latent");
     float *q = xmalloc((size_t)block * nh * hd * sizeof(float), "spec queries");
     float *kv = xmalloc((size_t)block * hd * sizeof(float), "spec kv");
+    mv8_rows(scratch, c->q_lora, &l->wq_a, x, dim, block);
+    for (int i = 0; i < block; i++)
+        rms_into(qr + (size_t)i * c->q_lora, scratch + (size_t)i * c->q_lora,
+                 l->q_norm.w, c->q_lora, c->norm_eps);
+    mv8_rows(q, nh * hd, &l->wq_b, qr, c->q_lora, block);
+    mv8_rows(scratch, hd, &l->wkv, x, dim, block);
     for (int i = 0; i < block; i++) {
         int pos = start_pos + main_rows + i;
-        mv8(scratch, &l->wq_a, x + (size_t)i * dim);
-        rms_into(qr, scratch, l->q_norm.w, c->q_lora, c->norm_eps);
-        mv8(q + (size_t)i * nh * hd, &l->wq_b, qr);
         for (int h = 0; h < nh; h++)
             rope_apply(q + (size_t)i * nh * hd + (size_t)h * hd + hd - rd, rope, pos, rd, 0);
-        mv8(scratch, &l->wkv, x + (size_t)i * dim);
-        rms_into(kv + (size_t)i * hd, scratch, l->kv_norm.w, hd, c->norm_eps);
+        rms_into(kv + (size_t)i * hd, scratch + (size_t)i * hd, l->kv_norm.w, hd, c->norm_eps);
         rope_apply(kv + (size_t)i * hd + hd - rd, rope, pos, rd, 0);
     }
 
@@ -2208,19 +2275,23 @@ static void spec_attention(Model *m, int stage, const float *x, int block, int s
     memcpy(kv_all, l->window, (size_t)win * hd * sizeof(float));
     memcpy(kv_all + (size_t)win * hd, kv, (size_t)block * hd * sizeof(float));
 
-    float *heads = xmalloc((size_t)nh * hd * sizeof(float), "spec heads");
+    float *heads = xmalloc((size_t)block * nh * hd * sizeof(float), "spec heads");
+    float *head_score = xmalloc((size_t)nh * total * sizeof(float), "spec scores");
     float scale = 1.0f / sqrtf((float)hd);
     for (int i = 0; i < block; i++) {
         int pos = start_pos + main_rows + i;
+        float *row_heads = heads + (size_t)i * nh * hd;
         #pragma omp parallel for schedule(static)
         for (int h = 0; h < nh; h++)
-            sparse_attend(heads + (size_t)h * hd, q + (size_t)i * nh * hd + (size_t)h * hd,
-                          kv_all, idx, total, nh, hd, l->attn_sink.w[h], scale);
+            sparse_attend(row_heads + (size_t)h * hd, q + (size_t)i * nh * hd + (size_t)h * hd,
+                          kv_all, idx, total, nh, hd, l->attn_sink.w[h], scale,
+                          head_score + (size_t)h * total);
         for (int h = 0; h < nh; h++)
-            rope_apply(heads + (size_t)h * hd + hd - rd, rope, pos, rd, 1);
-        attn_project_out(m, l, heads, out + (size_t)i * dim);
+            rope_apply(row_heads + (size_t)h * hd + hd - rd, rope, pos, rd, 1);
     }
+    attn_project_out_rows(m, l, heads, block, out);
     m->t_attn += now_s() - started;
+    free(head_score);
     free(heads); free(kv_all); free(idx); free(kv); free(q); free(qr); free(scratch);
 }
 

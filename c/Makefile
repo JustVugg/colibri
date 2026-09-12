@@ -1361,6 +1361,9 @@ tests/test_e8_kernel$(EXE): tests/test_e8_kernel.c quant.h
 tests/test_e4m3_vector$(EXE): tests/test_e4m3_vector.c quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_sparse_attn$(EXE): tests/test_sparse_attn.c sparse_attn.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_rans$(EXE): tests/test_rans.c rans.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
