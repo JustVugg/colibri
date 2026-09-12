@@ -26,7 +26,37 @@ Implemented endpoints are `GET /v1/models`, `GET /v1/models/{model}`,
 completion requests support JSON responses, SSE streaming, usage counts,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, and up to four
 custom `stop` sequences. Stop sequences are removed from the response and end
-generation early in both JSON and streaming modes. The extension
+generation early in both JSON and streaming modes.
+
+A trailing `assistant` message *continues* that turn instead of starting a new
+one: the prompt ends inside it, which is the official template rendered with
+`add_generation_prompt=False`. This is on by default — a message list ending in a
+non-empty `assistant` turn continues, the same contract as Anthropic's API — and
+there is no request field for it, because a trailing assistant turn already says
+"continue me" and a body extension would only be reachable by hand-written JSON
+rather than from the clients that want it. The server-side switch
+`COLI_CONTINUE_ASSISTANT=0` restores the old behaviour (fold the turn into a
+completed one and append a fresh cue). Continuation is refused together with
+`tools`/`tool_calls`, because the tool-call parsers read an assistant turn from
+its start, and the turn must carry text not ending in whitespace: the template
+strips trailing whitespace, so the model would resume from different bytes than
+the ones sent. A family whose renderer has no open-turn shape yet falls through
+to the old behaviour rather than erroring — though every shipped family supports
+continuation today, Kimi K3 included (its open turn is framed engine-side, in
+`kimi_k3.c`, not derived in the gateway renderer).
+
+A continuation resumes from the exact bytes you send, which makes the split
+point part of the prompt. Splitting mid-word puts the model at a token boundary
+it would not have produced itself, and the first generated token is conditioned
+on that split: measured on GLM-5.3-Flash, `The capital of France is Par`
+completes to `París`, not `Paris` — deterministically, across every effort level
+and both endpoints. The continuation is real (the model finished the partial
+word rather than restarting, which is the behaviour this feature exists for);
+the spelling is an artefact of where the split fell. This is inherent to
+resuming from an arbitrary byte offset rather than specific to this engine, and
+it is the same hazard as the trailing whitespace above — in the one form that
+cannot be refused, because splitting mid-word is sometimes exactly what the
+caller wants. Split at a token-ish boundary when the spelling matters. The extension
 `x_colibri_ignore_leading_stop: true` discards leading stop sequences until
 the first non-whitespace response content, which is useful for local templates
 that occasionally emit a role marker before the answer; strict OpenAI stop
@@ -132,10 +162,18 @@ tool declarations and choices explicitly instead of feeding another
 architecture's markers to an incompatible tokenizer.
 
 Not supported, and refused explicitly rather than ignored: `stop_sequences`,
-`top_k`, and non-text content blocks (images, documents). Errors use Anthropic's
-own `{"type":"error","error":{...}}` envelope on this path. Architecture-local
+`top_k`, and non-text content blocks (images, documents). Errors use Anthropic's own
+`{"type":"error","error":{...}}` envelope on this path. Architecture-local
 features that have not been wired to this protocol are likewise rejected with
 an explicit error.
+
+A trailing `assistant` message continues that turn by default on both the
+Anthropic- and OpenAI-compatible endpoints (`COLI_CONTINUE_ASSISTANT=0` restores
+the old behavior, where this endpoint appended a fresh cue). Note this changes
+what an existing Anthropic client sees on `/v1/messages`: a trailing assistant
+turn now continues rather than starting fresh — which is the real Anthropic
+contract — and the off-switch is the escape hatch for anyone relying on the old
+behavior.
 
 > The prefill warning below applies here too, and applies *hardest* to Claude Code:
 > its system prompt and tool catalog are large, and on a disk-streaming CPU path

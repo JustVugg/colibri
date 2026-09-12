@@ -13,7 +13,14 @@ con due, con una chiamata e il suo risultato, e con i livelli di ragionamento.
 
 Serve chat_template.jinja del checkpoint. Se non c'e' il test si dichiara
 saltato invece di passare: un test che non ha trovato il suo riferimento non ha
-verificato niente, e dirlo verde sarebbe peggio che non averlo.
+verificato niente, e dirlo verde sarebbe peggio che non averlo -- percio' un
+salto esce con codice 2, distinto dallo 0 di un confronto riuscito.
+
+RIFERIMENTO (scaricato 2026-09-10):
+  repo     zai-org/GLM-5.3-Flash
+  file     chat_template.jinja
+  sha256   34d5ee66b12fa6446cdae131c352b8f68cd85369e0e6fda115583805fada3891
+  hf download zai-org/GLM-5.3-Flash chat_template.jinja
 
 USO:
   python3 tests/test_glm53_chat_template.py --template PATH/chat_template.jinja
@@ -71,7 +78,8 @@ CASES = {
 EFFORTS = {"low": "low", "high": "high", "xhigh": None, None: None}
 
 
-def reference(template_text, *, messages, tools=None, reasoning_effort=None):
+def reference(template_text, *, messages, tools=None, reasoning_effort=None,
+              add_generation_prompt=True):
     import jinja2
     environment = jinja2.Environment(trim_blocks=False, lstrip_blocks=False,
                                      extensions=["jinja2.ext.loopcontrols"])
@@ -81,7 +89,7 @@ def reference(template_text, *, messages, tools=None, reasoning_effort=None):
     environment.filters["tojson"] = (
         lambda value, ensure_ascii=False, **kw: json.dumps(value, ensure_ascii=ensure_ascii))
     rendered = environment.from_string(template_text)
-    arguments = {"messages": messages, "add_generation_prompt": True}
+    arguments = {"messages": messages, "add_generation_prompt": add_generation_prompt}
     if tools:
         arguments["tools"] = tools
     if reasoning_effort:
@@ -97,12 +105,12 @@ def main() -> int:
     if not arguments.template.exists():
         print(f"SKIP: manca {arguments.template}; il riferimento non c'e' e "
               f"questo test non ha verificato nulla")
-        return 0
+        return 2                                  # salto != successo (vedi docstring)
     try:
         import jinja2                              # noqa: F401
     except ImportError:
         print("SKIP: jinja2 non installato; senza non c'e' riferimento")
-        return 0
+        return 2                                  # salto != successo (vedi docstring)
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import openai_server
@@ -166,9 +174,55 @@ def main() -> int:
         return 1
     checked += 1
 
+    # Prosecuzione: l'ultimo turno assistant e' da CONTINUARE, non uno gia' finito. Nel
+    # template e' add_generation_prompt=False -- l'altro ramo dell'`if` che il gateway
+    # ha sempre fissato a True -- e il riferimento qui e' quel ramo reso con jinja2,
+    # non una forma scritta a mano. Il prompt finisce dentro il turno, sull'apertura
+    # del client, e non su un nuovo <|assistant|><think>.
+    #
+    # Nota su #1327: il blocco chiuso <think></think> in fondo al prompt e' fuori
+    # distribuzione, e infatti resta vietato -- ma la posizione qui e' un'altra,
+    # <think></think> seguito da contenuto vero, che e' la forma che il template
+    # scrive davanti a ogni turno passato. Per questo una prosecuzione vuota e'
+    # rifiutata a monte (tests/test_openai_server.py, TrailingAssistantTurnTest).
+    aperto = [{"role": "user", "content": "capitale della Francia?"},
+               {"role": "assistant", "content": "La capitale e'"}]
+    produced = openai_server.render_chat_for_arch(aperto, enable_thinking=True,
+                                                  add_generation_prompt=False)
+    expected = reference(template_text, messages=aperto, add_generation_prompt=False)
+    if produced != expected:
+        print("FAIL prosecuzione: il turno aperto non rende come il template con "
+              "add_generation_prompt=False")
+        for position, (left, right) in enumerate(zip(produced, expected)):
+            if left != right:
+                start = max(0, position - 40)
+                print(f"  primo scostamento a {position}")
+                print(f"  gateway:  ...{produced[start:position + 40]!r}")
+                print(f"  template: ...{expected[start:position + 40]!r}")
+                break
+        else:
+            print(f"  lunghezze diverse: {len(produced)} contro {len(expected)}")
+        return 1
+    if produced.endswith("<|assistant|><think>"):
+        print("FAIL prosecuzione: il prompt finisce su un nuovo turno invece di proseguire "
+              "quello del client")
+        return 1
+    if not produced.endswith("La capitale e'"):
+        print(f"FAIL prosecuzione: il prompt non finisce sull'apertura del client: "
+              f"{produced[-60:]!r}")
+        return 1
+    # Controllo negativo: col ramo True lo stesso scambio DEVE finire sulla cue, o il
+    # confronto qui sopra non starebbe distinguendo niente.
+    if not openai_server.render_chat_for_arch(
+            aperto, enable_thinking=True).endswith("<|assistant|><think>"):
+        print("FAIL prosecuzione: il ramo normale non emette piu' il prompt di generazione")
+        return 1
+    checked += 1
+
     print(f"PASS GLM-5.3 chat template: {checked} rese identiche a "
           f"chat_template.jinja, strumenti e livelli di ragionamento compresi, "
-          f"piu' il livello minimo, che rende come il template con effort low")
+          f"piu' il livello minimo, che rende come il template con effort low, "
+          f"piu' il turno aperto (add_generation_prompt=False)")
     return 0
 
 

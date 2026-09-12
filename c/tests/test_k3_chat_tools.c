@@ -116,6 +116,22 @@ int main(void){
                "G 0\n",want);
     }
 
+    /* C: continuation -- the FINAL assistant turn is left OPEN. The prior turns render as
+     * usual, but the last turn has no <|close|>/<|end_of_msg|> and NO fresh generation cue
+     * is appended (contrast tail_plain/tail_think in every case above). */
+    expect(&T,"C leaves the final assistant turn open, no cue appended",
+           "K3CHAT1\nM user 6\nhello?C 0 2\nhiG 0\n",
+           "<|open|>message role=\"user\"<|sep|>hello?<|close|>message<|sep|><|end_of_msg|>"
+           "<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>hi");
+
+    /* C with reasoning: the think block is closed, the response is left open -- the model
+     * resumes writing its answer, its reasoning already behind it. */
+    expect(&T,"C with reasoning closes think and leaves response open",
+           "K3CHAT1\nM user 6\nhello?C 3 2\nwhyhiG 0\n",
+           "<|open|>message role=\"user\"<|sep|>hello?<|close|>message<|sep|><|end_of_msg|>"
+           "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>why<|close|>think<|sep|>"
+           "<|open|>response<|sep|>hi");
+
     /* Malformed records are refused, not misread. */
     {
         int ids[256], sp[4], thinking=0;
@@ -123,6 +139,8 @@ int main(void){
             "K3CHAT1\nY 200 4\nshortG 0\n",              /* lengths past the payload */
             "K3CHAT1\nO 0 3 2\nfooxxG 0\n",              /* index < 1 */
             "K3CHAT1\nB 0 0 0 1\nX 3 0\nfooG 0\n",       /* unknown call record */
+            "K3CHAT1\nC 0 2\nhiM user 1\nxG 0\n",        /* a turn after the open final turn */
+            "K3CHAT1\nC 0 2\nhiC 0 1\nyG 0\n",           /* two open final turns */
         };
         for(size_t i=0;i<sizeof(bad)/sizeof(*bad);i++){
             int n=chat_build_wire(&T,bad[i],(int)strlen(bad[i]),&thinking,ids,256,sp);
