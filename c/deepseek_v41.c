@@ -1895,6 +1895,27 @@ static void spec_load(Model *m, int ecap) {
     sp->max_verify = getenv("V41_DSPARK_MAX") ? atoi(getenv("V41_DSPARK_MAX")) : 0;
     if (sp->min_accept < 0) sp->min_accept = 0;
     if (sp->min_accept > 100) sp->min_accept = 100;
+    /* The released config.json carries every dspark_* key and NOT n_mtp_layers:
+     * that one lives only in the vendor's inference/config.json, which a user
+     * who downloads the checkpoint never sees. Requiring it meant the draft
+     * head was silently skipped on the real weights while the tiny fixture,
+     * whose config we write ourselves, loaded it fine. Count the stages in the
+     * checkpoint instead, which is the one source that cannot disagree with
+     * itself: they are contiguous from zero. */
+    if (c->n_mtp <= 0 && c->spec_block > 0 && c->n_spec_targets > 0) {
+        char probe[128];
+        int stages = 0;
+        while (stages < 16) {
+            snprintf(probe, sizeof(probe), "mtp.%d.attn.wq_a.weight", stages);
+            if (!st_find(&m->S, probe)) break;
+            stages++;
+        }
+        if (stages > 0) {
+            c->n_mtp = stages;
+            fprintf(stderr, "[v41] n_mtp_layers is absent from config.json; the "
+                            "checkpoint carries %d DSpark stages\n", stages);
+        }
+    }
     if (c->n_mtp <= 0) return;
     const char *flag = getenv("V41_DSPARK");
     if (flag && !atoi(flag)) {
