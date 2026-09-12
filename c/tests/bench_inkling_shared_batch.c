@@ -11,6 +11,8 @@
 #include "../inkling.c"
 #undef main
 
+#include "../compat.h"   /* setenv/unsetenv: MinGW has neither */
+
 enum { S = 16, D = 2048, I = 1024, K = 2, NS = 2, REPS = 3 };
 
 static uint16_t to_bf16(float x) {

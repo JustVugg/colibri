@@ -8,6 +8,8 @@
 #include "../inkling.c"
 #undef main
 
+#include "../compat.h"   /* setenv/unsetenv: MinGW has neither */
+
 static int failures;
 #define CHECK(cond, ...) do { if (!(cond)) { \
     fprintf(stderr,"FAIL %s:%d: ",__FILE__,__LINE__); \
