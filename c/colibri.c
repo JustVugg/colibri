@@ -3696,6 +3696,119 @@ static void *pipe_worker(void *arg){
     }
     return NULL;
 }
+
+/* ---- multi-expert coalesced read (COALESCE=1) ---------------------------
+ * When a PIPE batch contains experts that are contiguous in the SAME shard file,
+ * issue a single pread for the whole run instead of one per expert.
+ * Gated by COALESCE env flag (default 0 = off); zero behavior change when off. */
+static int expert_load_batch(Model *m, int layer, const int *eids, int n, ESlot **slots,
+                             int fatal, int demand){
+    if(n<=1 || !(getenv("COALESCE") && atoi(getenv("COALESCE"))==1)) return -1;  /* fallback to per-expert */
+
+    /* Build list of (eid, slot, replica, fd, first tensor offset/bytes) for gate_proj only.
+     * We'll check contiguity across experts on the SAME shard file. */
+    struct { int eid; ESlot *slot; int rep; int fd; int64_t off; int64_t nbytes; int layer; } items[64];
+    int nitems=0;
+
+    Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden;
+    for(int i=0;i<n && nitems<64;i++){
+        int eid=eids[i];
+        char nm[300];
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.gate_proj.weight",layer,eid);
+        st_tensor *tw=st_find(&m->S,nm);
+        if(!tw) continue;
+        int rep=expert_route(layer,eid);
+        if(rep && st_fd_rep(&m->S,tw->fd,rep)<0) rep=0;
+        items[nitems]=(typeof(items[0])){eid,slots[i],rep,tw->fd,tw->off,tw->nbytes,layer};
+        nitems++;
+    }
+
+    if(nitems<=1) return -1;
+
+    /* Sort by (fd, off) to find contiguous runs on the same file. */
+    for(int a=0;a<nitems;a++)
+        for(int b=a+1;b<nitems;b++)
+            if(items[a].fd > items[b].fd || (items[a].fd==items[b].fd && items[a].off > items[b].off)){
+                auto tmp=items[a]; items[a]=items[b]; items[b]=tmp;
+            }
+
+    /* Scan for contiguous runs: same fd, adjacent offsets. */
+    int start=0;
+    while(start<nitems){
+        int end=start+1;
+        while(end<nitems){
+            if(items[end].fd!=items[start].fd) break;
+            int64_t expected_off = items[end-1].off + items[end-1].nbytes;
+            if(items[end].off != expected_off) break;
+            end++;
+        }
+        int run_len = end - start;
+
+        if(run_len >= 2){
+            /* Single pread for the whole contiguous run (works for both buffered and O_DIRECT
+             * because each expert's tensors are already contiguous in the file; we just read
+             * the combined range). Alignment is handled by reading to each expert's own slab. */
+            int fd = items[start].fd;
+            int rep = items[start].rep;
+            int64_t off0 = items[start].off;
+            int64_t total_bytes = 0;
+            for(int i=start;i<end;i++) total_bytes += items[i].nbytes;
+
+            /* Allocate a temporary buffer for the combined read. */
+            char *tmpbuf = NULL;
+#ifdef COLI_METAL
+            size_t need = ((size_t)total_bytes + 16383) & ~(size_t)16383;
+            if(posix_memalign((void**)&tmpbuf, 16384, need)) { if(fatal) exit(1); return -1; }
+#else
+            tmpbuf = malloc((size_t)total_bytes);
+            if(!tmpbuf) { if(fatal) exit(1); return -1; }
+#endif
+
+            if(mir_pread(&m->S, fd, rep, tmpbuf, total_bytes, off0, "pread coalesced experts")){
+                free(tmpbuf);
+                if(fatal) exit(1);
+                return -1;
+            }
+            atomic_fetch_add_explicit(&g_prof_io, total_bytes, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_mir_bytes[rep], total_bytes, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_mir_nread[rep], 1, memory_order_relaxed);
+
+            /* Copy each expert's data into its own slab and fix QT pointers. */
+            int64_t pos = 0;
+            for(int i=start;i<end;i++){
+                ESlot *s = items[i].slot;
+                memcpy(s->slab, tmpbuf + pos, (size_t)items[i].nbytes);
+                QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
+                for(int k=0;k<3;k++){
+                    qt[k]->q8=(int8_t*)(s->slab); qt[k]->q4=(uint8_t*)(s->slab); qt[k]->planar=0;
+                    pos += items[i].nbytes / 3;
+                    qt_planarize(qt[k]);
+                }
+                s->eid = items[i].eid;
+            }
+            free(tmpbuf);
+
+            /* Mark all experts in run as ready. */
+            for(int i=start;i<end;i++){
+                for(int q=0;q<n;q++) if(eids[q]==items[i].eid){
+                    atomic_store_explicit(&g_pp.ready[q],1,memory_order_release);
+                    break;
+                }
+            }
+        } else {
+            /* Not coalesced: fall back to per-expert loads. */
+            for(int i=start;i<end;i++){
+                expert_load(m, items[i].layer, items[i].eid, items[i].slot, fatal, demand);
+                for(int q=0;q<n;q++) if(eids[q]==items[i].eid){
+                    atomic_store_explicit(&g_pp.ready[q],1,memory_order_release);
+                    break;
+                }
+            }
+        }
+        start = end;
+    }
+    return 0;
+}
 static void pipe_init(Model *m){
     if(g_pp.started) return;
 #ifdef __linux__
@@ -5761,8 +5874,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             if(g_pipe){                            /* PIPE: launch loads async, matmul overlaps them */
                 if(!g_pp.started) pipe_init(m);
                 double t0=now_s();
-                int eids[64]; for(int q=0;q<nmiss;q++) eids[q]=uniq[base+missk[q]];
-                pipe_dispatch(m,layer,eids,nmiss);
+                int eids[64]; ESlot *slots[64];
+                for(int q=0;q<nmiss;q++){
+                    eids[q]=uniq[base+missk[q]];
+                    slots[q]=&m->ws[q];
+                }
+                /* try coalesced batch load first */
+                if(expert_load_batch(m, layer, eids, nmiss, slots, 1, 1) != 0) {
+                    pipe_dispatch(m,layer,eids,nmiss);
+                }
                 m->t_ewait += now_s()-t0;           /* dispatch only; the reads overlap matmul and
                                                      * are timed as service inside expert_load */
             } else { double t0=now_s();             /* ORIGINALE: blocking parallel load */
