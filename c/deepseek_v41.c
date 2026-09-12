@@ -58,6 +58,9 @@
 #include "st.h"
 #include "quant.h"
 #include <pthread.h>   /* ehit_mark publishes the lazy HITS table under a lock */
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include "hyper_connections.h"
 #include "tok.h"
 #include "serve_codec.h"
@@ -321,7 +324,13 @@ static inline float ue8m0(uint8_t byte) {
     return value.f;
 }
 
-/* y[O] = W [O, I] x[I], W in e4m3 with one ue8m0 scale per 32x32 tile. */
+/* y[O] = W [O, I] x[I], W in e4m3 with one ue8m0 scale per 32x32 tile.
+ *
+ * The dense trunk's matvec, and the reason it is worth vectorising: V4.1's
+ * attention projects 64 heads of 512, so wq_b alone is 32768 x 1536 per layer
+ * and forty layers of it are several GFLOP per token. Measured on the released
+ * checkpoint, the attention block was 41% of a turn's wall clock -- more than
+ * the expert reads from disk. A scalar byte-at-a-time decode was most of it. */
 static void mv8(float *y, const W8 *w, const float *x) {
     int I = w->I, tiles_i = (I + FP8_TILE - 1) / FP8_TILE;
     #pragma omp parallel for schedule(static)
@@ -333,6 +342,15 @@ static void mv8(float *y, const W8 *w, const float *x) {
             int width = I - base < FP8_TILE ? I - base : FP8_TILE;
             float tile = ue8m0(scale[base / FP8_TILE]);
             float part = 0.0f;
+#if defined(__AVX2__)
+            if (width == FP8_TILE) {
+                __m256 acc = _mm256_setzero_ps();
+                for (int i = 0; i < FP8_TILE; i += 8)
+                    acc = _mm256_fmadd_ps(e4m3_decode8(row + base + i),
+                                          _mm256_loadu_ps(x + base + i), acc);
+                part = hsum256(acc);
+            } else
+#endif
             for (int i = 0; i < width; i++) part += e4m3_decode(row[base + i]) * x[base + i];
             sum += part * tile;
         }
@@ -346,7 +364,16 @@ static void mvb(float *y, const WB *w, const float *x) {
     for (int o = 0; o < w->O; o++) {
         const uint16_t *row = w->w + (size_t)o * I;
         float sum = 0.0f;
-        for (int i = 0; i < I; i++) sum += bf16_to_f32(row[i]) * x[i];
+        int i = 0;
+#if defined(__AVX2__)
+        /* The lm head is [vocab, dim] in bf16: 129280 x 5120 is 662 million
+         * multiply-adds for one token, and it runs once per position. */
+        __m256 acc = _mm256_setzero_ps();
+        for (; i + 8 <= I; i += 8)
+            acc = _mm256_fmadd_ps(bf16_decode8(row + i), _mm256_loadu_ps(x + i), acc);
+        sum = hsum256(acc);
+#endif
+        for (; i < I; i++) sum += bf16_to_f32(row[i]) * x[i];
         y[o] = sum;
     }
 }
@@ -1329,6 +1356,15 @@ static void attn_project_out(Model *m, Layer *l, const float *heads, float *out)
                 int width = per_group - base < FP8_TILE ? per_group - base : FP8_TILE;
                 float tile = ue8m0(scale_row[base / FP8_TILE]);
                 float part = 0.0f;
+#if defined(__AVX2__)
+                if (width == FP8_TILE) {
+                    __m256 acc = _mm256_setzero_ps();
+                    for (int i = 0; i < FP8_TILE; i += 8)
+                        acc = _mm256_fmadd_ps(e4m3_decode8(w + base + i),
+                                              _mm256_loadu_ps(xg + base + i), acc);
+                    part = hsum256(acc);
+                } else
+#endif
                 for (int i = 0; i < width; i++) part += e4m3_decode(w[base + i]) * xg[base + i];
                 sum += part * tile;
             }
@@ -2873,6 +2909,23 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             }
         }
         free(batch); free(confidence);
+        if (m->engram.active) {
+            /* What the n-gram memory actually cost this turn. Rows are 264
+             * bytes and the traffic is Zipfian, so the useful question is not
+             * how many rows were read but how many of them the cache already
+             * had -- and, on a turn short enough that capacity cannot bind,
+             * what is left is pure repetition within the text. */
+            for (int t = 0; t < m->engram.n_layers; t++) {
+                EngramTable *tab = &m->engram.table[t];
+                uint64_t total = tab->hits + tab->misses;
+                fprintf(stderr, "[v41] engram table %d (layer %d): %llu lookups, "
+                                "%.0f%% cache hits, %llu rows read (%.1f MB)\n",
+                        t, m->engram.layer_of[t], (unsigned long long)total,
+                        total ? 100.0 * (double)tab->hits / (double)total : 0.0,
+                        (unsigned long long)tab->misses,
+                        tab->misses * (double)(m->engram.head_dim + m->engram.head_dim / 32) / 1e6);
+            }
+        }
         if (m->spec.active && m->spec.proposed > proposed0)
             fprintf(stderr, "[v41] DSpark: %llu of %llu drafts accepted this turn\n",
                     (unsigned long long)(m->spec.accepted - accepted0),
