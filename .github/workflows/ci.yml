@@ -596,6 +596,20 @@ jobs:
             SNAP=dsv41_tiny ./deepseek_v41 "$cap" dsv41_tiny/ref.json
             echo "::endgroup::"
           done
+      - name: "A prompt longer than one block, so the block boundary is crossed"
+        run: |
+          cd c
+          # Attention projects a block of positions at a time and the MoE routes one,
+          # both capped at 32. The default fixture's prompt is eight tokens and never
+          # reaches that cap, so a forty-token one is built as well: it crosses the
+          # boundary in both, and has to stay token-exact anyway.
+          python3 tools/make_dsv41_tiny.py --out dsv41_long --emit-ref dsv41_long/ref.json \
+            --prompt-len 40 --max-new 6
+          for cap in 2 8; do
+            echo "::group::long prompt, cap=$cap"
+            SNAP=dsv41_long ./deepseek_v41 "$cap" dsv41_long/ref.json
+            echo "::endgroup::"
+          done
       - name: The published index cache is the vendor's, not the tidy one
         run: |
           cd c

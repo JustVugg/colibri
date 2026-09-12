@@ -1671,8 +1671,12 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
     }
 
     const float *kv_read = ratio ? kv_all : window_kv;
-    /* every position's heads, so the output projection can run as one block too */
-    float *heads = xmalloc((size_t)n * nh * hd * sizeof(float), "attention output");
+    /* A block of positions' heads, so the output projection can run as one block
+     * too. Bounded rather than the whole chunk: at 64 heads of 512 this is 128 KB a
+     * position, and a long prompt would otherwise ask for a quarter of a gigabyte
+     * of it. */
+    int hblock = n < MV_ROWS_MAX ? n : MV_ROWS_MAX;
+    float *heads = xmalloc((size_t)hblock * nh * hd * sizeof(float), "attention output");
     float *head_score = xmalloc((size_t)nh * total_idx * sizeof(float), "attention scores");
     float attn_scale = 1.0f / sqrtf((float)hd);
     for (int t = 0; t < n; t++) {
@@ -1693,7 +1697,7 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
             for (int k = count; k < window_width; k++) idx[(size_t)t * total_idx + k] = -1;
         }
         const int *row = idx + (size_t)t * total_idx;
-        float *row_heads = heads + (size_t)t * nh * hd;
+        float *row_heads = heads + (size_t)(t % hblock) * nh * hd;
         #pragma omp parallel for schedule(static)
         for (int h = 0; h < nh; h++)
             sparse_attend(row_heads + (size_t)h * hd, q + (size_t)t * nh * hd + (size_t)h * hd,
@@ -1701,10 +1705,13 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
                           head_score + (size_t)h * total_idx);
         for (int h = 0; h < nh; h++)
             rope_apply(row_heads + (size_t)h * hd + hd - rd, rope, start_pos + t, rd, 1);
+        /* The projection reads the heads and writes `out`; it touches no cached
+         * state, so it waits until the block is full and then runs once for it. */
+        if (t % hblock == hblock - 1 || t == n - 1) {
+            int first = t - (t % hblock);
+            attn_project_out_rows(m, l, heads, t - first + 1, out + (size_t)first * dim);
+        }
     }
-    /* The projection reads the heads and writes `out`; it touches no cached state,
-     * so it can wait until every position has its heads and then run once. */
-    attn_project_out_rows(m, l, heads, n, out);
     m->t_attn += now_s() - started;
     free(head_score); free(kv_raw);
     free(heads); free(kv_all); free(idx); free(scratch); free(kv); free(q); free(qr);
