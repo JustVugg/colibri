@@ -28,16 +28,34 @@ from resource_plan import (
 def write_shard(path, tensors):
     offset = 0
     header = {}
-    payload = b""
     for tensor in tensors:
         name, size, *metadata = tensor
         dtype = metadata[0] if metadata else "U8"
         header[name] = {"dtype": dtype, "shape": [size],
                         "data_offsets": [offset, offset + size]}
-        payload += b"\0" * size
         offset += size
     raw = json.dumps(header).encode()
-    path.write_bytes(struct.pack("<Q", len(raw)) + raw + payload)
+    # The planner reads headers and file sizes, not tensor values. Extending
+    # the file retains the zero-filled payload without allocating it in Python;
+    # filesystems supporting sparse extension also avoid writing gigabytes.
+    with path.open("wb") as stream:
+        stream.write(struct.pack("<Q", len(raw)))
+        stream.write(raw)
+        stream.truncate(stream.tell() + offset)
+
+
+class ShardFixtureTest(unittest.TestCase):
+    def test_extended_payload_preserves_header_offsets_size_and_zero_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fixture.safetensors"
+            write_shard(path, [("first", 3), ("second", 5)])
+            with path.open("rb") as stream:
+                header_size, = struct.unpack("<Q", stream.read(8))
+                header = json.loads(stream.read(header_size))
+                self.assertEqual(header["first"]["data_offsets"], [0, 3])
+                self.assertEqual(header["second"]["data_offsets"], [3, 8])
+                self.assertEqual(stream.read(), b"\0" * 8)
+            self.assertEqual(path.stat().st_size, 8 + header_size + 8)
 
 
 class ResourcePlanTest(unittest.TestCase):
