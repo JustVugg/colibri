@@ -478,6 +478,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
+TEST_BINS += tests/test_exact_dot$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
@@ -1731,6 +1732,9 @@ tests/test_rss_anon$(EXE): tests/test_rss_anon.c
 # Windows; questo test gira nei tre job e fallisce dove la misura vale 0.
 tests/test_mem_available$(EXE): tests/test_mem_available.c compat.h
 	$(CC) $(CFLAGS) tests/test_mem_available.c -o $@ $(LDFLAGS)
+
+tests/test_exact_dot$(EXE): tests/test_exact_dot.c exact_dot.h
+	$(CC) $(CFLAGS) tests/test_exact_dot.c -o tests/test_exact_dot$(EXE) $(LDFLAGS)
 
 tests/test_798_guards$(EXE): tests/test_798_guards.c st.h json.h compat.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
