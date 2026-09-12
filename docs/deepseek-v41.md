@@ -95,11 +95,28 @@ the oracle drafts the reference's own next tokens (`1`), or corrupts the last of
 so a round is rejected part way (`2`), or keeps the head's own (`3`); all three have to
 reproduce the reference token for token, and CI runs them.
 
-Drafting is on whenever the checkpoint carries the head. It is not always worth it: a
-round that is rejected has still read its stages' experts, so acceptance is measured
-over a window and the drafts pause for 64 tokens when it falls under
-`V41_DSPARK_MINACC`. `V41_DSPARK=0` turns the head off entirely, and it is then not
-even loaded.
+Drafting is **off unless you ask for it**, and the reason is a measurement rather
+than caution. On a 16-thread CPU server holding 68% of the experts, DeepSeek's own
+draft head accepts half of what it proposes, which is a respectable rate, and still
+loses:
+
+| | forwards for 24 tokens | wall |
+|---|---|---|
+| `V41_DSPARK=1` | 9 | 114 s |
+| off | 24 | 86 s |
+
+A six-row verify amortizes the disk almost perfectly, expert reads up 17% for six
+positions, and the per-row dense work not at all, attention up 40%. Six positions
+cost six times the attention projections and buy 2.7 tokens. That balance flips
+where per-row compute is cheap: a GPU, or a machine holding the whole expert set,
+which is exactly where someone would reach for it.
+
+So it is a switch. `V41_DSPARK=1` turns it on, and the guard still watches: a round
+that is rejected has still read its stages' experts, so acceptance is measured over
+ten proposals and the drafts pause for 64 tokens when it falls under
+`V41_DSPARK_MINACC`, whose default of 60% is where the measurement above puts the
+break-even. That is the same crossing colibri.c measured for MTP on GLM-5.2, where
+90% acceptance gains 22% and 19% loses 25%.
 
 ## The index-key slot, and why the default is the odd one
 
@@ -131,9 +148,9 @@ default cannot be "tidied" by accident.
 | `V41_INDEX_OWNER` | unset | each layer scores against its own owner's index keys (see above). Changes the model's behaviour. |
 | `V41_MAX_IMAGE_TOKENS` | the checkpoint's `max_image_tokens` | a ceiling on what one image costs in prompt tokens. |
 | `V41_TRACE` | unset | print a checksum of the tensors the reference prints too, for locating a divergence by diffing two columns. `2` follows the first row of a speculative step instead of the last, which is the row a sequential decode is comparable to. |
-| `V41_DSPARK` | on when the checkpoint carries the head | `0` disables the draft head and does not load it. |
+| `V41_DSPARK` | off | `1` loads the DSpark draft head and verifies its blocks. A net loss on a CPU box at 68% expert residency, a win where per-row compute is cheap; see above. |
 | `V41_DSPARK_MAX` | the checkpoint's `dspark_block_size` | how many of the drafted tokens are put in front of the main model. Fewer means a cheaper rejected round and a lower ceiling on the win. |
-| `V41_DSPARK_MINACC` | 30 | percent of drafts that must be accepted over a window of 24 for drafting to continue; below it, drafts pause for 64 tokens. |
+| `V41_DSPARK_MINACC` | 60 | percent of drafts that must be accepted over a window of ten for drafting to continue; below it, drafts pause for 64 tokens. 60 is the measured break-even, not a guess. |
 | `V41_SPEC_FORCE` | unset | oracle mode only: draft the reference's tokens (`1`), corrupt the last one (`2`), or use the head's own (`3`), to exercise the verification path on a fixture whose draft head is random. |
 
 ## How it is tested

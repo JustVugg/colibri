@@ -497,7 +497,7 @@ COLI_TEMP=0 COLI_METAL=1 DIRECT=1 COLI_NO_OMP_TUNE=1 PIPE=1 PIPE_WORKERS=6 MTP=0
 | `V41_INDEX_OWNER` | unset | DeepSeek V4.1: score each layer against its OWN index keys instead of the last published cache. The default reproduces the released inference code; this changes the model's behaviour, see docs/deepseek-v41.md. |
 | `V41_MAX_IMAGE_TOKENS` | the checkpoint's `max_image_tokens` | DeepSeek V4.1: ceiling on what one image costs in prompt tokens. |
 | `V41_TRACE` | unset | DeepSeek V4.1: print per-sublayer checksums, matching tools/dsv41_ref.py's, to locate a divergence by diffing two columns. `2` follows the first row of a speculative step rather than the last. |
-| `V41_DSPARK` | on when the checkpoint carries the head | DeepSeek V4.1: `0` disables the DSpark draft head, which is then not loaded at all. Drafts never change what a turn produces, only how many forwards it takes. |
+| `V41_DSPARK` | off | DeepSeek V4.1: `1` loads the DSpark draft head. Drafts never change what a turn produces, only how many forwards it takes; measured a net loss on CPU at 68% expert residency (9 forwards instead of 24, but 114 s instead of 86) and a win where per-row compute is cheap. |
 | `V41_DSPARK_MAX` | the checkpoint's `dspark_block_size` | DeepSeek V4.1: how many drafted tokens go in front of the main model per round. Fewer costs less when a round is rejected and caps the win when it is not. |
-| `V41_DSPARK_MINACC` | 30 | DeepSeek V4.1: percent of drafts that must be accepted over a window of 24 before drafting pauses for 64 tokens. |
+| `V41_DSPARK_MINACC` | 60 | DeepSeek V4.1: percent of drafts that must be accepted over a window of ten before drafting pauses for 64 tokens. 60 is the measured break-even. |
 | `V41_SPEC_FORCE` | unset | DeepSeek V4.1, oracle mode only: draft the reference's own tokens (`1`), corrupt the last one (`2`), or keep the head's (`3`), so the verification path runs on a fixture whose draft head is random noise. |
