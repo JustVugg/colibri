@@ -1714,43 +1714,9 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
 
 /* One expert's SwiGLU. The clamps are the training kernel's, and they matter: they
  * are what keeps fp4 activations in range. */
-static void expert_ffn(Model *m, const uint8_t *w1, const uint8_t *s1,
-                       const uint8_t *w3, const uint8_t *s3,
-                       const uint8_t *w2, const uint8_t *s2,
-                       const float *x, float *out, float weight) {
-    Cfg *c = &m->c;
-    int inter = c->moe_inter, dim = c->dim;
-    float *gate = xmalloc((size_t)inter * sizeof(float), "expert gate");
-    float *up = xmalloc((size_t)inter * sizeof(float), "expert up");
-    float *mid = xmalloc((size_t)inter * sizeof(float), "expert mid");
-    double started = now_s();
-    matmul_mxfp4(gate, x, w1, s1, 1, dim, inter);
-    matmul_mxfp4(up,   x, w3, s3, 1, dim, inter);
-    for (int i = 0; i < inter; i++) {
-        float g = gate[i], u = up[i];
-        if (c->swiglu_limit > 0.0f) {
-            if (u >  c->swiglu_limit) u =  c->swiglu_limit;
-            if (u < -c->swiglu_limit) u = -c->swiglu_limit;
-            if (g >  c->swiglu_limit) g =  c->swiglu_limit;
-        }
-        mid[i] = (g / (1.0f + expf(-g))) * u;
-    }
-    float *down = xmalloc((size_t)dim * sizeof(float), "expert down");
-    matmul_mxfp4(down, mid, w2, s2, 1, inter, dim);
-    for (int i = 0; i < dim; i++) out[i] += weight * down[i];
-    m->t_expert += now_s() - started;
-    free(down); free(mid); free(up); free(gate);
-}
-
-/* The shared expert every token pays for; fp8, so it stays resident and never streams. */
-static void shared_ffn(Model *m, Layer *l, const float *x, float *out) {
-    Cfg *c = &m->c;
-    int inter = c->moe_inter, dim = c->dim;
-    float *gate = xmalloc((size_t)inter * sizeof(float), "shared gate");
-    float *up = xmalloc((size_t)inter * sizeof(float), "shared up");
-    mv8(gate, &l->sh_w1, x);
-    mv8(up,   &l->sh_w3, x);
-    for (int i = 0; i < inter; i++) {
+/* silu(gate) * clamp(up), in place over `gate`, for however many rows are in it */
+static void swiglu_into(const Cfg *c, float *gate, const float *up, int64_t count) {
+    for (int64_t i = 0; i < count; i++) {
         float g = gate[i], u = up[i];
         if (c->swiglu_limit > 0.0f) {
             if (u >  c->swiglu_limit) u =  c->swiglu_limit;
@@ -1759,24 +1725,55 @@ static void shared_ffn(Model *m, Layer *l, const float *x, float *out) {
         }
         gate[i] = (g / (1.0f + expf(-g))) * u;
     }
-    float *down = xmalloc((size_t)dim * sizeof(float), "shared down");
-    mv8(down, &l->sh_w2, gate);
-    for (int i = 0; i < dim; i++) out[i] += down[i];
+}
+
+/* One routed expert applied to every position that chose it. The expert is 18.8 MB
+ * on the released checkpoint and matmul_mxfp4 already walks its rows once for a
+ * block of inputs, so a position that shares an expert with another costs the
+ * arithmetic and not a second pass over the weights. Each output row is what the
+ * one-at-a-time call produced, bit for bit: the S loop sits inside the row loop,
+ * so a row's groups fold in the same order whatever else is in the block. */
+static void expert_ffn_rows(Model *m, const uint8_t *w1, const uint8_t *s1,
+                            const uint8_t *w3, const uint8_t *s3,
+                            const uint8_t *w2, const uint8_t *s2,
+                            const float *x, int rows, float *down) {
+    Cfg *c = &m->c;
+    int inter = c->moe_inter, dim = c->dim;
+    float *gate = xmalloc((size_t)rows * inter * sizeof(float), "expert gate");
+    float *up = xmalloc((size_t)rows * inter * sizeof(float), "expert up");
+    double started = now_s();
+    matmul_mxfp4(gate, x, w1, s1, rows, dim, inter);
+    matmul_mxfp4(up,   x, w3, s3, rows, dim, inter);
+    swiglu_into(c, gate, up, (int64_t)rows * inter);
+    matmul_mxfp4(down, gate, w2, s2, rows, inter, dim);
+    m->t_expert += now_s() - started;
+    free(up); free(gate);
+}
+
+/* The shared expert every token pays for; fp8, so it stays resident and never
+ * streams -- but it is still 35 MB of matrices, and reading them once for a block
+ * of positions rather than once per position is the same saving mv8_rows makes in
+ * attention. */
+static void shared_ffn_rows(Model *m, Layer *l, const float *x, int rows, float *out) {
+    Cfg *c = &m->c;
+    int inter = c->moe_inter, dim = c->dim;
+    float *gate = xmalloc((size_t)rows * inter * sizeof(float), "shared gate");
+    float *up = xmalloc((size_t)rows * inter * sizeof(float), "shared up");
+    mv8_rows(gate, inter, &l->sh_w1, x, dim, rows);
+    mv8_rows(up,   inter, &l->sh_w3, x, dim, rows);
+    swiglu_into(c, gate, up, (int64_t)rows * inter);
+    float *down = xmalloc((size_t)rows * dim * sizeof(float), "shared down");
+    mv8_rows(down, dim, &l->sh_w2, gate, inter, rows);
+    for (int64_t i = 0; i < (int64_t)rows * dim; i++) out[i] += down[i];
     free(down); free(up); free(gate);
 }
 
-static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int layer,
-                       int E, int topk, const float *x, float *out);
-
 /* model.py Gate + MoE. The bias steers the choice of experts and nothing else: the
- * weights come from the unbiased scores, which is the whole point of noaux_tc. */
-static void moe_run(Model *m, int layer, const float *x, float *out) {
-    moe_run_at(m, &m->L[layer], &m->cache[layer], "layers", layer,
-               m->c.n_routed, m->c.n_activated, x, out);
-}
-
-static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int layer,
-                       int E, int topk, const float *x, float *out) {
+ * weights come from the unbiased scores, which is the whole point of noaux_tc.
+ * Split out of the MoE proper so a whole block of positions can be routed before
+ * any expert is read -- which is what lets the reads and the matmuls be shared. */
+static void moe_gate(Model *m, Layer *l, int E, int topk, const float *x,
+                     int *chosen, float *weights) {
     Cfg *c = &m->c;
     float *scores = xmalloc((size_t)E * sizeof(float), "gate scores");
     mvb(scores, &l->gate_w, x);
@@ -1786,10 +1783,6 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
         float softplus = value > 20.0f ? value : logf(1.0f + expf(value));
         scores[e] = sqrtf(softplus);
     }
-    int chosen[64];
-    float weights[64];
-    if (topk > (int)(sizeof(chosen) / sizeof(chosen[0]))) {
-        fprintf(stderr, "[moe] n_activated %d exceeds the scratch\n", topk); exit(1); }
     for (int k = 0; k < topk; k++) {
         int best = -1;
         for (int e = 0; e < E; e++) {
@@ -1808,26 +1801,139 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
         for (int k = 0; k < topk; k++) weights[k] /= total;
     }
     for (int k = 0; k < topk; k++) weights[k] *= c->route_scale;
-    memset(out, 0, (size_t)c->dim * sizeof(float));
-    if (cache->cap >= topk) {
-        /* Reserve every slot first, read the misses together, then compute. The
-         * accumulation into `out` keeps its rank order, so this is the same
-         * arithmetic in the same sequence -- only the reads moved. */
-        Slot *slot[64];
-        expert_slots_at(m, cache, kind, layer, chosen, topk, slot);
-        for (int k = 0; k < topk; k++)
-            expert_ffn(m, slot[k]->w1, slot[k]->s1, slot[k]->w3, slot[k]->s3,
-                       slot[k]->w2, slot[k]->s2, x, out, weights[k]);
-    } else {
-        /* A cache too small to hold one step's experts evicts one of them to make
-         * room for the next, so the slots cannot all be live at once. */
-        for (int k = 0; k < topk; k++) {
-            Slot *s = expert_slot_at(m, cache, kind, layer, chosen[k]);
-            expert_ffn(m, s->w1, s->s1, s->w3, s->s3, s->w2, s->s2, x, out, weights[k]);
-        }
-    }
-    shared_ffn(m, l, x, out);
     free(scores);
+}
+
+#define MOE_TOPK_MAX 64
+/* Positions routed together. Bounded so the per-chunk scratch stays a few
+ * megabytes however long the prompt is, and so the experts one chunk asks for
+ * stay a plausible working set for the cache. */
+#define MOE_ROW_CHUNK 32
+
+/* The MoE for a block of positions, expert-major.
+ *
+ * Position-major is the obvious reading and it is what this did: route a
+ * position, read its six experts, multiply, move on. During prefill that reads
+ * the same expert again for the next position that wants it -- 18.8 MB off the
+ * device or out of RAM, for arithmetic that could have ridden along with the
+ * first. Routing the whole block first turns the six-per-position draws into a
+ * list of DISTINCT experts, each read once and applied to every position that
+ * asked for it, with matmul_mxfp4 walking its rows a single time for all of them.
+ *
+ * The arithmetic is unchanged and so are the values. Each expert's contribution
+ * is kept apart and the contributions are summed into the output in rank order
+ * afterwards, exactly as the position-major loop accumulated them; a row's
+ * matmul folds its groups in the same order whatever else shares the block.
+ *
+ * A cache too small to hold one position's experts keeps the old path: there the
+ * slots genuinely cannot all be live at once. */
+static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int layer,
+                       int E, int topk, const float *x, int n, float *out) {
+    Cfg *c = &m->c;
+    int dim = c->dim;
+    if (topk > MOE_TOPK_MAX) {
+        fprintf(stderr, "[moe] n_activated %d exceeds the scratch\n", topk); exit(1); }
+
+    for (int r0 = 0; r0 < n; r0 += MOE_ROW_CHUNK) {
+        int rows = n - r0 < MOE_ROW_CHUNK ? n - r0 : MOE_ROW_CHUNK;
+        const float *xc = x + (size_t)r0 * dim;
+        float *outc = out + (size_t)r0 * dim;
+        int chosen[MOE_ROW_CHUNK * MOE_TOPK_MAX];
+        float weights[MOE_ROW_CHUNK * MOE_TOPK_MAX];
+        for (int r = 0; r < rows; r++)
+            moe_gate(m, l, E, topk, xc + (size_t)r * dim,
+                     chosen + r * topk, weights + r * topk);
+
+        int draws = rows * topk;
+        if (cache->cap < topk) {
+            /* one position at a time, and one expert at a time inside it */
+            for (int r = 0; r < rows; r++) {
+                float *o = outc + (size_t)r * dim;
+                memset(o, 0, (size_t)dim * sizeof(float));
+                float *down = xmalloc((size_t)dim * sizeof(float), "expert down");
+                for (int k = 0; k < topk; k++) {
+                    Slot *s = expert_slot_at(m, cache, kind, layer, chosen[r * topk + k]);
+                    expert_ffn_rows(m, s->w1, s->s1, s->w3, s->s3, s->w2, s->s2,
+                                    xc + (size_t)r * dim, 1, down);
+                    float w = weights[r * topk + k];
+                    for (int i = 0; i < dim; i++) o[i] += w * down[i];
+                }
+                free(down);
+            }
+            shared_ffn_rows(m, l, xc, rows, outc);
+            continue;
+        }
+
+        /* the distinct experts this block asks for, each with the draws that asked */
+        int *uniq = xmalloc((size_t)draws * sizeof(int), "routed expert set");
+        int *head = xmalloc((size_t)draws * sizeof(int), "expert draw list");
+        int *tail = xmalloc((size_t)draws * sizeof(int), "expert draw tail");
+        int *count = xmalloc((size_t)draws * sizeof(int), "expert draw count");
+        int *next = xmalloc((size_t)draws * sizeof(int), "expert draw chain");
+        int n_uniq = 0;
+        for (int d = 0; d < draws; d++) {
+            int eid = chosen[d], at = -1;
+            for (int u = 0; u < n_uniq; u++) if (uniq[u] == eid) { at = u; break; }
+            next[d] = -1;
+            if (at < 0) {
+                at = n_uniq++;
+                uniq[at] = eid; head[at] = d; count[at] = 0;
+            } else {
+                next[tail[at]] = d;
+            }
+            tail[at] = d;
+            count[at]++;
+        }
+
+        float *contrib = xmalloc((size_t)draws * dim * sizeof(float), "expert contributions");
+        float *gathered = xmalloc((size_t)rows * dim * sizeof(float), "expert inputs");
+        float *down = xmalloc((size_t)rows * dim * sizeof(float), "expert outputs");
+        int step = cache->cap < MOE_ROW_CHUNK ? cache->cap : MOE_ROW_CHUNK;
+        /* A readahead hint for the next chunk, issued here while this one is being
+         * multiplied, was tried and measured worse: posix_fadvise(WILLNEED) blocks
+         * against a device that is already saturated by the demand reads, and it
+         * cost four seconds of wall to save one of disk. The same shape was already
+         * measured on the V4 engine. Left as a note so it is not tried a third time. */
+        for (int u0 = 0; u0 < n_uniq; u0 += step) {
+            int ne = n_uniq - u0 < step ? n_uniq - u0 : step;
+            Slot *slot[MOE_ROW_CHUNK];
+            expert_slots_at(m, cache, kind, layer, uniq + u0, ne, slot);
+            for (int u = 0; u < ne; u++) {
+                int cnt = count[u0 + u], at = 0;
+                for (int d = head[u0 + u]; d >= 0; d = next[d], at++)
+                    memcpy(gathered + (size_t)at * dim, xc + (size_t)(d / topk) * dim,
+                           (size_t)dim * sizeof(float));
+                expert_ffn_rows(m, slot[u]->w1, slot[u]->s1, slot[u]->w3, slot[u]->s3,
+                                slot[u]->w2, slot[u]->s2, gathered, cnt, down);
+                at = 0;
+                for (int d = head[u0 + u]; d >= 0; d = next[d], at++) {
+                    float w = weights[d];
+                    float *dst = contrib + (size_t)d * dim;
+                    const float *src = down + (size_t)at * dim;
+                    for (int i = 0; i < dim; i++) dst[i] = w * src[i];
+                }
+                /* the draws after the first found the expert resident, which is what
+                 * the position-major loop would have recorded for them too */
+                m->hits += (uint64_t)(cnt - 1);
+            }
+        }
+        for (int r = 0; r < rows; r++) {
+            float *o = outc + (size_t)r * dim;
+            memset(o, 0, (size_t)dim * sizeof(float));
+            for (int k = 0; k < topk; k++) {
+                const float *cvec = contrib + (size_t)(r * topk + k) * dim;
+                for (int i = 0; i < dim; i++) o[i] += cvec[i];
+            }
+        }
+        shared_ffn_rows(m, l, xc, rows, outc);
+        free(down); free(gathered); free(contrib);
+        free(next); free(count); free(tail); free(head); free(uniq);
+    }
+}
+
+static void moe_run(Model *m, int layer, const float *x, int n, float *out) {
+    moe_run_at(m, &m->L[layer], &m->cache[layer], "layers", layer,
+               m->c.n_routed, m->c.n_activated, x, n, out);
 }
 
 /* --------------------------------------------------------------- engram ---- */
@@ -1840,44 +1946,57 @@ static void engram_run(Model *m, int layer, float *h, int n, int start_pos) {
     Layer *l = &m->L[layer];
     int table = l->engram_index, hc = c->hc_mult, dim = c->dim;
     double started = now_s();
-    float *rows = xmalloc((size_t)e->cols * e->head_dim * sizeof(float), "engram rows");
-    float *kv = xmalloc((size_t)dim * (hc + 1) * sizeof(float), "engram kv");
+    /* Blocked like the rest: the n-gram rows are looked up for a block of positions,
+     * then eng_wkv projects the whole block in one pass. The matrix is 157 MB on the
+     * released head, which is a lot to walk once per position. */
+    int width = e->cols * e->head_dim, kv_width = dim * (hc + 1);
+    int chunk = n < MOE_ROW_CHUNK ? n : MOE_ROW_CHUNK;
+    float *rows = xmalloc((size_t)chunk * width * sizeof(float), "engram rows");
+    float *kv_all = xmalloc((size_t)chunk * kv_width * sizeof(float), "engram kv");
     int64_t ids[V41_MAX_NGRAM * V41_MAX_EHEADS];
-    for (int t = 0; t < n; t++) {
-        engram_hash(e, table, start_pos + t, ids);
-        for (int col = 0; col < e->cols; col++) {
-            const float *row = engram_row(&e->table[table], ids[col], e->head_dim);
-            memcpy(rows + (size_t)col * e->head_dim, row, (size_t)e->head_dim * sizeof(float));
-        }
-        mv8(kv, &l->eng_wkv, rows);
-        const float *value = kv + (size_t)hc * dim;
-        float *stream = h + (size_t)t * hc * dim;
-        for (int copy = 0; copy < hc; copy++) {
-            const float *key = kv + (size_t)copy * dim;
-            const float *qw = l->eng_q.w + (size_t)copy * dim;
-            const float *kw = l->eng_k.w + (size_t)copy * dim;
-            float *stream_copy = stream + (size_t)copy * dim;
-            double stream_square = 0.0, key_square = 0.0;
-            double dot = 0.0;
-            for (int i = 0; i < dim; i++) {
-                stream_square += (double)stream_copy[i] * stream_copy[i];
-                key_square += (double)key[i] * key[i];
-                dot += (double)stream_copy[i] * qw[i] * kw[i] * key[i];
+    for (int t0 = 0; t0 < n; t0 += chunk) {
+        int rows_here = n - t0 < chunk ? n - t0 : chunk;
+        for (int r = 0; r < rows_here; r++) {
+            engram_hash(e, table, start_pos + t0 + r, ids);
+            for (int col = 0; col < e->cols; col++) {
+                const float *row = engram_row(&e->table[table], ids[col], e->head_dim);
+                memcpy(rows + (size_t)r * width + (size_t)col * e->head_dim, row,
+                       (size_t)e->head_dim * sizeof(float));
             }
-            float rstd = (1.0f / sqrtf((float)(stream_square / dim) + c->norm_eps)) *
-                         (1.0f / sqrtf((float)(key_square / dim) + c->norm_eps));
-            float scaled = (float)dot * rstd / sqrtf((float)dim);
-            /* signed square root before the sigmoid, matching the training kernel */
-            float magnitude = fabsf(scaled);
-            if (magnitude < 1e-6f) magnitude = 1e-6f;
-            float signed_root = sqrtf(magnitude);
-            if (scaled < 0.0f) signed_root = -signed_root;
-            float gate = coli_hc_sigmoid(signed_root);
-            for (int i = 0; i < dim; i++) stream_copy[i] += gate * value[i];
+        }
+        mv8_rows(kv_all, kv_width, &l->eng_wkv, rows, width, rows_here);
+        for (int r = 0; r < rows_here; r++) {
+            int t = t0 + r;
+            const float *kv = kv_all + (size_t)r * kv_width;
+            const float *value = kv + (size_t)hc * dim;
+            float *stream = h + (size_t)t * hc * dim;
+            for (int copy = 0; copy < hc; copy++) {
+                const float *key = kv + (size_t)copy * dim;
+                const float *qw = l->eng_q.w + (size_t)copy * dim;
+                const float *kw = l->eng_k.w + (size_t)copy * dim;
+                float *stream_copy = stream + (size_t)copy * dim;
+                double stream_square = 0.0, key_square = 0.0;
+                double dot = 0.0;
+                for (int i = 0; i < dim; i++) {
+                    stream_square += (double)stream_copy[i] * stream_copy[i];
+                    key_square += (double)key[i] * key[i];
+                    dot += (double)stream_copy[i] * qw[i] * kw[i] * key[i];
+                }
+                float rstd = (1.0f / sqrtf((float)(stream_square / dim) + c->norm_eps)) *
+                             (1.0f / sqrtf((float)(key_square / dim) + c->norm_eps));
+                float scaled = (float)dot * rstd / sqrtf((float)dim);
+                /* signed square root before the sigmoid, matching the training kernel */
+                float magnitude = fabsf(scaled);
+                if (magnitude < 1e-6f) magnitude = 1e-6f;
+                float signed_root = sqrtf(magnitude);
+                if (scaled < 0.0f) signed_root = -signed_root;
+                float gate = coli_hc_sigmoid(signed_root);
+                for (int i = 0; i < dim; i++) stream_copy[i] += gate * value[i];
+            }
         }
     }
     trace("engram", layer, h + (size_t)(n - 1) * hc * dim, hc * dim);
-    free(kv); free(rows);
+    free(kv_all); free(rows);
     m->t_engram += now_s() - started;
 }
 
@@ -2378,9 +2497,9 @@ static int spec_step(Model *m, int token, int start_pos, int main_rows,
                 collapsed[j] = sum;
             }
             rms_into(branch_in + (size_t)i * dim, collapsed, l->ffn_norm.w, dim, c->norm_eps);
-            moe_run_at(m, l, &sp->cache[stage], "mtp", stage, c->spec_routed, c->spec_activated,
-                       branch_in + (size_t)i * dim, branch_out + (size_t)i * dim);
         }
+        moe_run_at(m, l, &sp->cache[stage], "mtp", stage, c->spec_routed, c->spec_activated,
+                   branch_in, block, branch_out);
         for (int i = 0; i < block; i++)
             coli_hc_post(h + (size_t)i * hc * dim, branch_out + (size_t)i * dim,
                          residual + (size_t)i * hc * dim, post + (size_t)i * hc,
@@ -2599,11 +2718,13 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int all
                 collapsed[i] = sum;
             }
             rms_into(branch_in + (size_t)t * dim, collapsed, l->ffn_norm.w, dim, c->norm_eps);
-            moe_run(m, layer, branch_in + (size_t)t * dim, branch_out + (size_t)t * dim);
-            if (t == trace_row) {
-                trace("ffn_in", layer, branch_in + (size_t)t * dim, dim);
-                trace("ffn_out", layer, branch_out + (size_t)t * dim, dim);
-            }
+        }
+        /* Every position's FFN input is ready before any expert is read, which is
+         * what lets the block share both the reads and the matmuls. */
+        moe_run(m, layer, branch_in, n, branch_out);
+        if (trace_row >= 0 && trace_row < n) {
+            trace("ffn_in", layer, branch_in + (size_t)trace_row * dim, dim);
+            trace("ffn_out", layer, branch_out + (size_t)trace_row * dim, dim);
         }
         for (int t = 0; t < n; t++)
             coli_hc_post(h + (size_t)t * hc * dim, branch_out + (size_t)t * dim,
@@ -3030,6 +3151,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
         free(aligned); free(image_mask);
         uint64_t prefill_bytes = m->expert_bytes - ebytes0;
         double prefill_disk = m->t_disk - disk0;
+        double prefill_expert = m->t_expert - expert0, prefill_wall = now_s() - turn_started;
 
         int emitted = 0, limited = 1, cancelled = 0, done_early = 0;
         char piece[512];
@@ -3118,10 +3240,10 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             double seconds = m->t_disk - disk0;
             if (turn_bytes)
                 fprintf(stderr, "[v41] expert I/O: %llu misses, %.1f MB in %.2fs (%.2f GB/s); "
-                                "prefill %.1f MB in %.2fs\n",
+                                "prefill %.1f MB, disk %.2fs, matmul %.2fs, wall %.2fs\n",
                         (unsigned long long)(m->miss - miss0), turn_bytes / 1e6, seconds,
                         seconds > 0 ? turn_bytes / 1e9 / seconds : 0.0,
-                        prefill_bytes / 1e6, prefill_disk);
+                        prefill_bytes / 1e6, prefill_disk, prefill_expert, prefill_wall);
         }
         if (m->spec.active && m->spec.proposed > proposed0)
             fprintf(stderr, "[v41] DSpark: %llu of %llu drafts accepted this turn\n",
