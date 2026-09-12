@@ -80,9 +80,19 @@ same or slightly better.
 
 ## `--ram` is not honoured by this engine
 
-`coli --ram` sizes the RAM budget for engines that stream experts from disk on
-demand. qwen36 does not: the CUDA expert tier it is built for (#713) requires
-full RAM residency of the expert set, so the budget is decided by the container,
-not by a flag. The engine reads no `RAM_GB`, and passing `--ram` changes
-nothing. Said here rather than silently ignored, because a flag that appears to
-work and does not is worse than one that is documented as unsupported.
+The engine reads no `RAM_GB`: `grep -c RAM_GB c/qwen36.c` returns 0, and passing
+`--ram` changes nothing. Said here rather than left to be discovered, because a
+flag that appears to work and does not is worse than one documented as
+unsupported.
+
+What sizes the expert cache instead depends on where the experts live. On the
+CPU path they stream from the container on demand, through the LRU described at
+the top of this page, and `--cap N` is the direct lever on how many slots per
+layer that cache holds. On the CUDA expert tier (#713) the hot set is resident
+in VRAM and `CUDA_EXPERT_GB` decides its size. Neither path consults the RAM
+budget.
+
+(Earlier revisions of this section said qwen36 does not stream experts at all,
+which contradicted the description at the top of the page and was wrong for the
+CPU path: `c/qwen36.c` reads experts on demand with `pread` plus
+`posix_fadvise(DONTNEED)` and caches them LRU. Reported in #1444.)
