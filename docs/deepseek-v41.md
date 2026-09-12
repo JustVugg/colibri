@@ -180,9 +180,61 @@ while the rate barely moves. The depth-8 row is two independent cold runs, to sh
 much of the wall is run-to-run noise: the I/O figures repeat to within half a percent,
 the compute figures do not.
 
-Prefill is where most of it goes: 54.6 GB of the 88.5, because each of the 26 prompt
+Prefill is where most of it goes: 52.3 GB of the 87.4, because each of the 26 prompt
 positions routes independently and a 49-slot cache cannot hold what 26 positions ask
 of one layer.
+
+## Blocks of positions, not one position at a time
+
+Everything above the experts used to run one position at a time, which meant a block
+of positions made one full pass over every matrix per position. The matrices are the
+things that do not fit in cache: wq_b is 42 MB on the released checkpoint, so is wo_b,
+the shared expert is 35 MB of them and the engram projection is 157 MB. Prefill of a
+26-token prompt was reading each of those twenty-six times per layer.
+
+So the engine now drives a block of positions through one pass instead. `mv8_rows`
+does it for the fp8 projections, holding the decoded weight tile across the block;
+the output projection waits until every position has its heads, because it reads the
+heads and writes the output and touches no cached state; the MoE routes the whole
+block first, reduces the six-per-position draws to a list of distinct experts, and
+applies each expert to every position that asked for it, which matmul_mxfp4 was
+already able to do for a block of inputs.
+
+None of it moves a value. Each output folds the same tiles in the same order, and
+each expert's contribution is kept apart and summed into the output in rank order
+afterwards, exactly as the position-major loop accumulated it. Blocks are capped at
+32 positions so the scratch stays a few megabytes however long the prompt is.
+
+Cold, same turn, same prompt, same seed, each step measured on the one before it:
+
+| | wall | disk | expert matmul | attention | tok/s |
+|---|---|---|---|---|---|
+| serial reads, scalar kernels | 78.7 s | 36.9 s | 15.0 s | 19.1 s | 0.305 |
+| batched expert reads | 42.4 s | 13.0 s | 8.4 s | 16.1 s | 0.566 |
+| vector attention kernel | 41.1 s | 12.9 s | 7.8 s | 15.9 s | 0.584 |
+| blocked attention matrices | 29.5 s | 12.7 s | 9.1 s | 3.4 s | 0.812 |
+| expert-major MoE | 25.1 s | 10.4 s | 7.6 s | 3.4 s | 0.957 |
+
+Of that last 25.1 s turn, prefill is 10.7 s (5.9 disk, 2.3 matmul) and decode is
+13.8 s (4.5 disk, 4.7 matmul).
+
+## Two ways of hiding the reads that did not work
+
+Both are written down because they are the obvious next ideas and both were built,
+measured cold, and removed.
+
+A `posix_fadvise(WILLNEED)` hint for the next chunk of experts, issued while the
+current one is being multiplied, blocks against a device that the demand reads have
+already saturated. It cost four seconds of wall to save one of disk. The V4 engine
+reached the same conclusion by a different route.
+
+A pool of reader threads, so each expert is multiplied as soon as its own six tensors
+land, does overlap: the main thread's wait on disk falls from 10.4 s to 1.0 s. But the
+expert matmul rises from 7.6 s to 18.1 s and the turn is 7% slower with eight readers,
+25% slower with four and 68% slower with two. A 5.9 MB pread is not free CPU -- it is a kernel-side copy
+competing for the memory bandwidth the matmuls are already bound by -- so moving the
+work off the disk wait and onto the cores that were doing the arithmetic buys nothing
+and costs the contention. Anything that tries again has to start from that.
 
 ## Environment
 

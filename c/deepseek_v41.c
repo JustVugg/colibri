@@ -1889,11 +1889,18 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
         float *gathered = xmalloc((size_t)rows * dim * sizeof(float), "expert inputs");
         float *down = xmalloc((size_t)rows * dim * sizeof(float), "expert outputs");
         int step = cache->cap < MOE_ROW_CHUNK ? cache->cap : MOE_ROW_CHUNK;
-        /* A readahead hint for the next chunk, issued here while this one is being
-         * multiplied, was tried and measured worse: posix_fadvise(WILLNEED) blocks
-         * against a device that is already saturated by the demand reads, and it
-         * cost four seconds of wall to save one of disk. The same shape was already
-         * measured on the V4 engine. Left as a note so it is not tried a third time. */
+        /* Two ways of overlapping these reads with the matmuls were built and
+         * measured here, and both were worse. A posix_fadvise(WILLNEED) hint for the
+         * next chunk blocks against a device already saturated by the demand reads:
+         * four seconds of wall to save one of disk, the same result the V4 engine
+         * got. A pool of reader threads, so each expert is multiplied as soon as its
+         * own six tensors land, does overlap -- the main thread's wait on disk falls
+         * from 10.4 s to 1.0 s -- but the expert matmul rises from 7.6 s to 18.1 s
+         * and the turn is 7% slower, 25% slower at four readers and 68% slower at two. A 5.9 MB pread is
+         * not free CPU: it is a kernel-side copy competing for the same memory
+         * bandwidth the matmuls are already bound by, and the idle disk wait it
+         * removes costs more than it was worth. Both are measurements, not opinions;
+         * they are written down so the third attempt starts from them. */
         for (int u0 = 0; u0 < n_uniq; u0 += step) {
             int ne = n_uniq - u0 < step ? n_uniq - u0 : step;
             Slot *slot[MOE_ROW_CHUNK];
