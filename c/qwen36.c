@@ -2828,14 +2828,28 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
              * slot_ensure_int8() unable to bring the expert back: it returns
              * early without g4, and the CPU fallback in the decode loop then
              * dereferences NULL. Keep it (#1341). COLI_KEEP_INT8 keeps its
-             * meaning for int4. */
-            if (!keep8 && expert_is_int4 && e->g) { free(e->g); e->g = e->u = e->d = NULL; }
+             * meaning for int4.
+             * The condition is ownership, not format: do not free what was
+             * just handed over. int4 handed g4 (wg != e->g), so the int8
+             * copy is spare; int8 handed e->g itself, so it stays. A future
+             * format that also aliases e->g is then correct without anyone
+             * remembering to extend a format check here. */
+            if (!keep8 && e->g && wg != (const uint8_t *)e->g) { free(e->g); e->g = e->u = e->d = NULL; }
         }
     }
     qt_fill_wait();
     free(wpl); free(wpe); free(planned);
-    fprintf(stderr, "[qtier] warmstart (parallel): all %d experts in RAM (int8 only for non-residents), %d in VRAM -- %.1f s\n",
-            cap_total, wn, now_s()-t0);
+    /* The parenthesis used to read "int8 only for non-residents", which was
+     * true only while the int8 copy of every resident was freed. Since #1341
+     * that free is int4-only: on an int8 container every resident keeps its
+     * weights, so the RSS saving the old line implied does not exist there.
+     * Say which container this is instead of promising a saving the reader
+     * will not see. */
+    fprintf(stderr, "[qtier] warmstart (parallel): all %d experts in RAM (%s), %d in VRAM -- %.1f s\n",
+            cap_total,
+            expert_is_int4 ? "int8 copy dropped for residents, kept for non-residents"
+                           : "int8 container: all experts keep their weights in RAM",
+            wn, now_s()-t0);
 }
 
 int main(int argc, char **argv) {
