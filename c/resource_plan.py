@@ -3,6 +3,7 @@
 
 import json
 import os
+import platform
 import re
 import shutil
 import statistics
@@ -328,6 +329,17 @@ def memory_available():
         except (OSError, subprocess.SubprocessError, ValueError):
             pass
     return 0
+
+
+def _host_unified_memory():
+    """Whether the host itself exposes one CPU/GPU physical memory pool.
+
+    This is intentionally separate from accelerator placement.  A CPU-only
+    engine such as glm53 still runs on unified-memory Apple Silicon, but that
+    fact must not fabricate a VRAM tier or make an unrelated GPU steer cache
+    placement.
+    """
+    return sys.platform == "darwin" and platform.machine().lower() in ("arm64", "aarch64")
 
 
 # Strict .coli_ssd grammar -- the byte-for-byte mirror of colibri.c's
@@ -795,11 +807,18 @@ def cpu_socket_count():
     return 1
 
 
-def _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets, plan_has_metal):
+def _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets, plan_has_metal,
+               engine_group=None):
     """Derive tuning knobs from the bottleneck classification."""
     tune = {}
     has_gpu = bool(gpus)
     n_gpu = len(gpus)
+
+    # glm53 has its own loader/cache controls and does not consume the generic
+    # DRAFT/PIPE/PIN/NUMA knobs below. Recommending them is worse than leaving
+    # them unset because `coli tune` then reports changes the engine ignores.
+    if engine_group == "glm53":
+        return tune
 
     # MTP: costs more than it saves when compute-bound (#389 measured 42% loss)
     # or streaming-bound (#467 measured 32% loss under CUDA at 85% hit).
@@ -950,7 +969,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     # plans_placement().
     planning_gpus = [gpu for gpu in gpus if plans_placement(gpu)]
 
-    unified = any(gpu.get("unified_memory", False) for gpu in planning_gpus)
+    placement_unified = any(gpu.get("unified_memory", False)
+                            for gpu in planning_gpus)
+    unified = placement_unified or _host_unified_memory()
     typical = info["typical_expert_bytes"]
     max_expert = info["max_expert_bytes"] or typical
     kv_bytes = (geometry.context_state_bytes + geometry.fixed_state_bytes) * kv_slots
@@ -974,17 +995,17 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     requested_vram = int(vram_gb * GB) if vram_gb > 0 else safe_vram
     requested_vram_before_clamp = requested_vram
     unified_pool = max(0, available_memory - info["dense_bytes"] - runtime_bytes)
-    if unified:
+    if placement_unified:
         # Unified devices expose one physical pool to CUDA and the host. Do not
         # let an expert tier consume pages that the RAM tier also believes are
         # available. Dense/runtime reservations are shared exactly once below.
         requested_vram = min(requested_vram, unified_pool)
-    vram_limit = unified_pool if unified else safe_vram
+    vram_limit = unified_pool if placement_unified else safe_vram
     vram_budget = min(requested_vram, vram_limit, info["expert_bytes"])
     vram_experts = int(vram_budget // typical) if typical else 0
     hot_bytes = min(info["expert_bytes"], vram_experts * typical)
     warnings = []
-    if unified:
+    if placement_unified:
         requested_ram = int(ram_gb * GB) if ram_gb > 0 else int(available_memory * 0.88)
         requested_ram_experts = max(0, requested_ram - info["dense_bytes"] - runtime_bytes)
         ram_expert_bytes = min(requested_ram_experts,
@@ -997,7 +1018,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     else:
         ram_budget = int(ram_gb * GB) if ram_gb > 0 else int(available_memory * 0.88)
     if ram_budget < 4 * GB:
-        ram_budget = 8 * GB if not unified else max(0, ram_budget)
+        ram_budget = 8 * GB if not placement_unified else max(0, ram_budget)
     cache_bytes = max(0, ram_budget - info["dense_bytes"] - runtime_bytes)
     cap = int(cache_bytes // per_cap) if per_cap else 0
     if configured_experts:
@@ -1017,7 +1038,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                 f"GPU {gpu['index']} ({gpu['name']}) was detected but its free memory is "
                 "not qualified as a placement budget on this platform; it is reported "
                 "only and drives no automatic tier")
-    if unified:
+    if placement_unified:
         warnings.append(
             "GPU and RAM share one physical memory pool; budgets were jointly constrained")
     # The plan sizes the hot tier from *free* VRAM, so running it while an engine
@@ -1058,7 +1079,8 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         bottleneck_class = "memory"
 
     tune = _auto_tune(bottleneck_class, projected_hit, planning_gpus, cpu_sockets,
-                      plan_has_metal=False)
+                      plan_has_metal=False,
+                      engine_group=resolved.descriptor.engine_group)
     probe_state, probe_gbs = ssd_probe_state(info["path"])
     actions = _next_actions(bottleneck_class, projected_hit, probe_state,
                             probe_gbs, planning_gpus)

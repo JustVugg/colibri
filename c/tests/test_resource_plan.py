@@ -97,6 +97,32 @@ class ResourcePlanTest(unittest.TestCase):
         # 0 slots/layer. The value must be a sane positive number of bytes.
         self.assertGreater(memory_available(), 0)
 
+    def test_apple_silicon_reports_unified_host_memory_without_fake_vram(self):
+        # Host memory topology is a hardware fact, independent of whether the
+        # selected engine can place anything on the GPU.  In particular glm53
+        # is CPU-only today, but an M-series Mac must not be reported as
+        # memory.unified=false merely because planning_gpus is empty.
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch("resource_plan.platform.machine", return_value="arm64"):
+            plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                              available_disk=1, gpus=[], physical_cpus=8,
+                              cpu_sockets=1)
+        self.assertTrue(plan["memory"]["unified"])
+        self.assertEqual(plan["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertFalse(any("jointly constrained" in warning
+                             for warning in plan["warnings"]))
+
+    def test_glm53_auto_tune_does_not_emit_generic_inert_knobs(self):
+        from resource_plan import _auto_tune
+
+        generic = _auto_tune("disk", 0.50, [], 1, False)
+        self.assertIn("DRAFT", generic)
+        self.assertIn("PIPE", generic)
+
+        glm53 = _auto_tune("disk", 0.50, [], 1, False,
+                           engine_group="glm53")
+        self.assertEqual(glm53, {})
+
     def test_cpu_socket_count_is_positive(self):
         self.assertGreaterEqual(cpu_socket_count(), 1)
 
