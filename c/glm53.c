@@ -88,6 +88,7 @@ static int g_vk_ready = 0;
 #endif
 #include "compat.h"
 #include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
+#include "route_trace.h"
 #include <time.h>
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -122,6 +123,30 @@ typedef struct {
     int image_token, image_start_token, image_end_token;
     int video_token, video_start_token, video_end_token;
 } Cfg;
+
+static char g_glm53_usage[2100];
+
+/* Routing telemetry belongs to the standalone/serve lifecycle. Segment may
+ * host multiple engines in one process, while route_trace.h owns one process-
+ * global stream/counter set, so range-native Segment loads stay detached. */
+static void glm53_telemetry_init(const char *snap, const Cfg *c) {
+    rt_init("glm53", c->n_layers, c->n_experts);
+    for (int i = 0; i < c->first_dense; i++) rt_drop_row(i);
+    rt_drop_row(c->n_layers);                    /* inclusive extra row; no routed MTP here */
+
+    const char *up = getenv("COLI_USAGE");
+    if (up && *up) snprintf(g_glm53_usage, sizeof g_glm53_usage, "%s", up);
+    else snprintf(g_glm53_usage, sizeof g_glm53_usage, "%s/.coli_usage", snap);
+
+    int64_t history = rt_load(g_glm53_usage);
+    if (history > 0)
+        fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n",
+                (long long)history, g_glm53_usage);
+}
+
+static void glm53_telemetry_save(void) {
+    if (g_glm53_usage[0]) rt_save(g_glm53_usage, 0);
+}
 
 static double req_num(jval *object, const char *key) {
     jval *value = json_get(object, key);
@@ -1477,7 +1502,12 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         }
         for (int k = 0; k < topk; k++)
             mine_w[k] = mine_w[k] / (total + 1e-20f) * c->routed_scale;
+
+        /* Record the exact experts and post-normalisation gates applied by
+         * this layer. The shared helper also bumps .coli_usage counters. */
+        rt_route(index, t, mine, mine_w, topk);
     }
+    rt_trace_end();
     free(score);
 
     /* --- secondo e terzo tempo, a blocchi che stanno in cache ---
@@ -2987,6 +3017,7 @@ int main(int argc, char **argv) {
         GModel served;
         memset(&served, 0, sizeof(served));
         model_load(&served, snap);
+        glm53_telemetry_init(snap, &served.c);
         Tok serve_tok;
         char tokenizer_path[1024];
         snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", snap);
@@ -2994,6 +3025,8 @@ int main(int argc, char **argv) {
         const char *batch = getenv("SERVE_BATCH");
         arm_stops(snap, &serve_tok, batch && atoi(batch));
         serve_loop(&served, &serve_tok);
+        glm53_telemetry_save();
+        rt_destroy();
         tok_free(&serve_tok);
         return 0;
     }
@@ -3041,6 +3074,7 @@ int main(int argc, char **argv) {
     memset(&model, 0, sizeof(model));     /* contatori e puntatori opzionali */
     const double load_start = now_s();
     model_load(&model, dir);
+    glm53_telemetry_init(dir, &model.c);
     const double load_seconds = now_s() - load_start;
     if (getenv("GLM53_VERBOSE")) cfg_report(&model.c);
 
@@ -3146,6 +3180,8 @@ int main(int argc, char **argv) {
 #endif
     free(logits);
     session_close(&model, session);
+    glm53_telemetry_save();
+    rt_destroy();
     free(vision);
     free(tokens);
     return 0;
