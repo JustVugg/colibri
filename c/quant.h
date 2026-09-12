@@ -511,6 +511,41 @@ static const float E4M3_LUT[256] = {
 };
 static inline float e4m3_decode(uint8_t b){ return E4M3_LUT[b]; }
 
+#ifdef __AVX2__
+/* Eight e4m3 bytes to eight floats without touching a lookup table.
+ *
+ * A float wants sign, exponent, mantissa in that order, and e4m3 already has
+ * them in that order: place the byte's seven low bits at bit 20 and its sign at
+ * bit 31, and the result is the right number with the wrong exponent bias,
+ * 127 where e4m3 means 7. One multiply by 2^120 fixes it, and it fixes the
+ * subnormals too, because scaling a subnormal by a power of two into the normal
+ * range is exact.
+ *
+ * Verified byte for byte against quant.h's E4M3_LUT: 254 of the 256 encodings
+ * come out identical. The two that do not are 0x7F and 0xFF, e4m3's NaNs, which
+ * this would turn into +-480 -- a corrupt weight quietly becoming a plausible
+ * one. They are blended back, because a NaN that propagates is how you find out.
+ */
+static inline __m256 e4m3_decode8(const uint8_t *p) {
+    __m256i b = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)p));
+    __m256i low = _mm256_and_si256(b, _mm256_set1_epi32(0x7F));
+    __m256i bits = _mm256_or_si256(
+        _mm256_slli_epi32(_mm256_and_si256(b, _mm256_set1_epi32(0x80)), 24),
+        _mm256_slli_epi32(low, 20));
+    __m256 value = _mm256_mul_ps(_mm256_castsi256_ps(bits), _mm256_set1_ps(0x1p120f));
+    __m256i nan = _mm256_cmpeq_epi32(low, _mm256_set1_epi32(0x7F));
+    return _mm256_blendv_ps(value, _mm256_set1_ps(NAN), _mm256_castsi256_ps(nan));
+}
+
+/* Eight bf16 into eight floats: bf16 IS the top half of a float, so the whole
+ * conversion is a shift. Exact for every encoding, NaNs and infinities
+ * included, which is why there is no table to disagree with. */
+static inline __m256 bf16_decode8(const uint16_t *p) {
+    __m256i w = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)p));
+    return _mm256_castsi256_ps(_mm256_slli_epi32(w, 16));
+}
+#endif
+
 #define FP8_BLOCK 128
 static inline int64_t fp8_nblk(int n){ return ((int64_t)n + FP8_BLOCK - 1) / FP8_BLOCK; }
 

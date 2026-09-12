@@ -226,7 +226,7 @@ jobs:
         run: |
           cd c
           rc=0
-          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38"
+          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41"
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
           for t in $ENGINES; do
             echo "::group::$t"
@@ -561,6 +561,103 @@ jobs:
         run: |
           cd c
           OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_dashboard_hits
+
+  dsv41-tiny-check:
+    name: DeepSeek V4.1 tiny oracle (engram + DSA + fp4 experts + vision)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + sympy + Pillow
+        run: |
+          pip install -r c/tools/oracle-requirements.txt
+          pip install sympy pillow
+      - name: Tiny V4.1-shaped container and its reference
+        run: |
+          cd c
+          # The same tensor names, dtypes and block-scale conventions as the released
+          # checkpoint at toy dimensions, so the engine reads the real format: fp8 dense
+          # with 32x32 ue8m0 tiles, fp4 experts with per-32 group scales, an fp8 engram
+          # table read row by row, and a vision tower.
+          python3 tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json
+      - name: Token-exact against the reference, at several cache capacities
+        run: |
+          cd c
+          make deepseek_v41
+          # cap=1 evicts on every routed expert, which is where slot bookkeeping breaks;
+          # cap=8 never would. The engine exits non-zero on any token mismatch, and on a
+          # vision tower that drifts from its reference rows.
+          for cap in 1 2 8; do
+            echo "::group::cap=$cap"
+            SNAP=dsv41_tiny ./deepseek_v41 "$cap" dsv41_tiny/ref.json
+            echo "::endgroup::"
+          done
+      - name: "A prompt longer than one block, so the block boundary is crossed"
+        run: |
+          cd c
+          # Attention projects a block of positions at a time and the MoE routes one,
+          # both capped at 32. The default fixture's prompt is eight tokens and never
+          # reaches that cap, so a forty-token one is built as well: it crosses the
+          # boundary in both, and has to stay token-exact anyway.
+          python3 tools/make_dsv41_tiny.py --out dsv41_long --emit-ref dsv41_long/ref.json \
+            --prompt-len 40 --max-new 6
+          for cap in 2 8; do
+            echo "::group::long prompt, cap=$cap"
+            SNAP=dsv41_long ./deepseek_v41 "$cap" dsv41_long/ref.json
+            echo "::endgroup::"
+          done
+      - name: The published index cache is the vendor's, not the tidy one
+        run: |
+          cd c
+          # model.py republishes shared_attn.index_k only when a layer completes a
+          # compression group, so a decode step with an incomplete group scores against
+          # whichever cache was published last. That is the released behaviour and every
+          # number for this model was produced with it; V41_INDEX_OWNER=1 is the reading
+          # the architecture implies, and it is a DIFFERENT model. Assert they differ, so
+          # nobody "fixes" the default by accident.
+          if SNAP=dsv41_tiny V41_INDEX_OWNER=1 ./deepseek_v41 8 dsv41_tiny/ref.json > /dev/null 2>&1; then
+            echo "FAIL: V41_INDEX_OWNER=1 reproduced the vendor's tokens; one of the two"
+            echo "      paths is not doing what its comment says"
+            exit 1
+          fi
+          echo "the two index-key policies differ, as documented"
+      - name: "DSpark: a verified draft is the token sequential decode would have given"
+        run: |
+          cd c
+          # The fixture's draft head is random, so nothing it proposes would ever be
+          # accepted and the verification path would never run. V41_SPEC_FORCE drafts
+          # the reference's own tokens instead: 1 accepts the whole block, 2 corrupts
+          # the last draft so a round is rejected part way and the rollback runs, 3
+          # keeps the head's drafts, which is what serving does. All three have to
+          # reproduce the reference token for token, at any cache capacity.
+          for force in 1 2 3; do
+            for cap in 1 8; do
+              echo "::group::V41_SPEC_FORCE=$force cap=$cap"
+              SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 "$cap" dsv41_tiny/ref.json
+              echo "::endgroup::"
+            done
+          done
+          # and with only part of the block verified, which is a different rollback
+          SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=2 V41_DSPARK_MAX=1 ./deepseek_v41 8 dsv41_tiny/ref.json
+      - name: "Brain tab: EMAP after READY and STAT, HITS after every turn"
+        run: |
+          cd c
+          COLI_DSV41_FIXTURE=dsv41_tiny python3 -m unittest -v tests.test_dsv41_dashboard
+      - name: "Serving: an image changes the answer, a draft does not"
+        run: |
+          cd c
+          COLI_DSV41_FIXTURE=dsv41_tiny python3 -m unittest -v \
+            tests.test_dsv41_image_serve tests.test_dsv41_dspark_serve
+      - name: "Tool calling: the checkpoint's own encoding cases, byte for byte"
+        run: |
+          cd c
+          # no engine and no fixture here: the mock speaks the SERVE protocol, and the
+          # vendor's encoding cases are checked into tests/fixtures
+          python3 -m unittest -v tests.test_openai_tools_v41_e2e
 
   qwen38-tiny-check:
     name: Qwen3.8 tiny oracle (GDN + QSA + PLE + MoE)

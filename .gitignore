@@ -27,6 +27,8 @@ c/qwen38.exe
 # `git status`.
 c/deepseek_v4
 c/deepseek_v4.exe
+c/deepseek_v41
+c/deepseek_v41.exe
 c/COLI_V4_UNIT_*.o
 # ...and the ownership-test objects, which the same Makefile puts in a build/
 # subdirectory (V4_OWN_DIR) rather than next to the sources. #868 caught the
@@ -122,6 +124,7 @@ c/olmoe_i4/
 .idea
 c/tiny_inkling/
 c/qwen38_tiny/
+c/dsv41_tiny/
 
 # Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
 .claude/

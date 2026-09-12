@@ -689,6 +689,66 @@ def _dsv4_geometry(config, context, _model_dir):
     return PlannerGeometry(state, fixed, workspace, experts)
 
 
+def _dsv41_geometry(config, context, _model_dir):
+    """DeepSeek V4.1 Flash: window ring, compressed KV and index keys, engram rows.
+
+    What the engine keeps resident per layer (deepseek_v41.c model_load):
+
+        window ring   n_layers * window_size * head_dim * 4      (fixed)
+        compressed KV ceil(context / ratio) * head_dim * 4       (per kv source)
+        index keys    ceil(context / ratio) * index_head_dim * 4 (per kv source)
+
+    The engram tables are NOT in here on purpose: 203 GB of the released
+    checkpoint is n-gram memory read row by row from disk (264 bytes per row,
+    at most (max_ngram - 1) * n_heads rows per layer per token), with a small
+    LRU whose size is a runtime knob rather than a function of the context.
+    Counting them as resident would tell a user with 128 GB that this model
+    cannot be served, which is the opposite of true.
+
+    Workspace mirrors forward()'s per-chunk buffers: hc_mult residual copies
+    plus the sublayer scratch, at batch == context.
+    """
+    section = config.get("text_config", config)
+    layers = _required_int(section, "num_hidden_layers", "deepseek_v41")
+    experts = _required_int(section, "n_routed_experts", "deepseek_v41")
+    hidden = _required_int(section, "hidden_size", "deepseek_v41")
+    head_dim = _required_int(section, "head_dim", "deepseek_v41")
+    window = _required_int(section, "sliding_window", "deepseek_v41") \
+        if "sliding_window" in section else _required_int(section, "window_size", "deepseek_v41")
+    index_hd = _required_int(section, "index_head_dim", "deepseek_v41")
+    hc_mult = _required_int(section, "hc_mult", "deepseek_v41")
+
+    ratios = section.get("compress_ratios")
+    if not isinstance(ratios, list) or len(ratios) < layers:
+        raise ValueError("deepseek_v41: compress_ratios must be a list of at least "
+                         "num_hidden_layers entries")
+    sources = section.get("kv_source_layer_ids") or section.get("kv_source_layers") or []
+    if not isinstance(sources, list):
+        raise ValueError("deepseek_v41: kv_source_layer_ids must be a list")
+
+    # The DSpark stages keep a window ring each, on the same terms as a layer: their
+    # attention is window-only, and the window holds the main stream's keys.
+    stages = section.get("n_mtp_layers") or 0
+    if not isinstance(stages, int) or isinstance(stages, bool) or stages < 0:
+        raise ValueError("deepseek_v41: n_mtp_layers must be a non-negative integer")
+    fixed = (layers + stages) * window * head_dim * 4
+    state = 0
+    for layer in sources:
+        if not isinstance(layer, int) or isinstance(layer, bool) or not 0 <= layer < layers:
+            raise ValueError("deepseek_v41: kv_source_layer_ids entries must index a layer")
+        ratio = ratios[layer]
+        if not isinstance(ratio, int) or isinstance(ratio, bool) or ratio < 1:
+            raise ValueError("deepseek_v41: a kv source layer must compress")
+        compressed = (context + ratio - 1) // ratio
+        state += compressed * (head_dim + index_hd) * 4
+
+    workspace = (context * hc_mult * hidden * 2 + context * hidden * 2 + hidden) * 4
+    return PlannerGeometry(state, fixed, workspace, experts)
+
+
+_DSV41_MTP_EXPERT = re.compile(r"^mtp\.(\d+)\.ffn\.experts\.(\d+)\.")
+
+
 _GLM_EXPERT = re.compile(
     r"(?:^|\.)model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
 )
@@ -725,6 +785,47 @@ def _individual_expert_inventory(pattern):
             return ()
         return ((int(match.group(1)), int(match.group(2)), size),)
     return inventory
+
+
+def _dsv41_expert_inventory(name, size, config, _dtype=None):
+    """Routed experts, the backbone's and the DSpark head's alike.
+
+    A draft stage streams its experts exactly as a layer does -- its own LRU, its own
+    smaller set -- so they belong in the expert inventory and not in the resident
+    weights, where three stages of 128 experts would be 7 GB of RAM the engine never
+    holds. They are filed after the last real layer, which is where the vendor's own
+    numbering puts them: `DSparkBlock(args.n_layers + stage_id, args)`. The planner
+    then prices one cache slot per stage, which is what the engine allocates.
+    """
+    match = _V4_EXPERT.search(name)
+    if match is not None:
+        return ((int(match.group(1)), int(match.group(2)), size),)
+    match = _DSV41_MTP_EXPERT.search(name)
+    if match is None:
+        return ()
+    section = config.get("text_config", config)
+    layers = section.get("num_hidden_layers")
+    if not isinstance(layers, int) or isinstance(layers, bool) or layers < 1:
+        raise ValueError("deepseek_v41: num_hidden_layers is required to place the "
+                         "DSpark stages after the backbone")
+    return ((layers + int(match.group(1)), int(match.group(2)), size),)
+
+
+_DSV41_ENGRAM = re.compile(r"^layers\.(\d+)\.engram\.embed\.(weight|scale)$")
+
+
+def _dsv41_resident_inventory(name, size, _config, _dtype=None):
+    """Resident bytes for what the engine actually holds in RAM.
+
+    The two n-gram tables are 203 GB of the released checkpoint, 40% of it, and
+    the engine never holds them: it reads one 264-byte row at a time from disk
+    behind a small LRU whose size is a runtime knob. Counted as dense they turn
+    a 552B model that fits a workstation into one that needs 214 GB of RAM, and
+    the plan then plans nothing: measured against the real checkpoint on a 61 GB
+    box, `coli plan` reported 214.3 GB of dense weights, 0% projected expert
+    residency and a cap of zero, for a model whose resident trunk is 11 GB.
+    """
+    return 0 if _DSV41_ENGRAM.match(name) else size
 
 
 def _inkling_expert_inventory(name, size, config, _dtype=None):
@@ -1196,6 +1297,43 @@ FAMILIES = (
         capabilities=FamilyCapabilities(True, False, False, True),
         has_gateway_adapter=True,
         has_cli_adapter=True,
+    ),
+    FamilyDescriptor(
+        id="deepseek_v41",
+        model_types=("deepseek_v41", "deepseek_v41_text"),
+        display_name="DeepSeek V4.1 Flash",
+        display_scale="552B",
+        # deepseek-ai/DeepSeek-V4.1-Flash: 40 layers, 384 experts, top-6, plus
+        # two 384M-row engram tables that never enter RAM.
+        reference_experts=384,
+        engine_artifact="deepseek_v41",
+        engine_aliases=(),
+        engine_group="deepseek_v41",
+        internal_arch="deepseek_v41",
+        build_target="deepseek_v41",
+        process_names=("deepseek_v41",),
+        default_model_id="deepseek-v4.1-flash-colibri",
+        cli_adapter="deepseek_v41",
+        gateway_adapter="deepseek_v41",
+        planner_id="deepseek_v41",
+        planner_geometry=_dsv41_geometry,
+        planner_unsupported_reason="",
+        expert_inventory=_dsv41_expert_inventory,
+        resident_inventory=_dsv41_resident_inventory,
+        config_section="text_config",
+        limits=FamilyLimits(4096, 1048576, 1024, 16384, 1, 8, "CTX"),
+        # tools yes (DSML, see v41_dsml.py), grammars no: the engine reads the six-field
+        # SUBMIT header and has no constrained decoder, so a grammar has to be refused
+        # at the gateway rather than desync the wire.
+        capabilities=FamilyCapabilities(True, False, False, True),
+        has_gateway_adapter=True,
+        # coli run stays unwired, for the reason qwen36 gives above and one more:
+        # cmd_run dispatches per arch after this gate, and with no deepseek_v41
+        # branch of its own the launcher would fall through to GLM's binary and
+        # GLM's prompt template. The engine speaks the SERVE protocol and nothing
+        # else, so a one-shot has nowhere to go but the gateway -- which is what
+        # coli chat, coli serve and coli web already use.
+        has_cli_adapter=False,
     ),
 )
 
