@@ -13,7 +13,30 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#ifdef __linux__
+#include <unistd.h>
+#endif
+
+/* Thread safety (qwen36 tier): an upload thread may call coli_vk_tensor_ensure while the
+ * decode thread submits expert groups. vkQueueSubmit on one VkQueue from two threads is a
+ * spec violation, and the weight arena is a linked list. Every production submit on
+ * G.queue goes through vk_submit; arena_suballoc takes g_arena_mx. Fence waits are never
+ * taken under either lock. The VK_TEST harness is single-threaded and submits directly. */
+static pthread_mutex_t g_submit_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_arena_mx  = PTHREAD_MUTEX_INITIALIZER;
+static VkResult vk_submit(VkQueue q, const VkSubmitInfo *si, VkFence f) {
+    pthread_mutex_lock(&g_submit_mx);
+    VkResult r = vkQueueSubmit(q, 1, si, f);
+    pthread_mutex_unlock(&g_submit_mx);
+    return r;
+}
 static double vk_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000.0 + t.tv_nsec/1e6; }
+
+/* vk_fence_wait's spin budget (microseconds), set once by coli_vk_init from
+ * COLI_VK_SPIN_US (default 300) so concurrent callers never race a lazy init. */
+static long g_vk_spin_us = 300;
 
 #define VKCHECK(x, what) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "[VK] %s failed: %d\n", what, _r); return 0; } } while (0)
@@ -49,6 +72,14 @@ static struct {
     uint32_t qfam;
     uint32_t memtype;            // HOST_VISIBLE|HOST_COHERENT (prefer DEVICE_LOCAL) — for inputs/weights
     uint32_t memtype_cached;     // HOST_CACHED — for buffers the CPU reads back (outputs)
+    /* Staged weight path: on a discrete card without Resizable BAR the HOST_VISIBLE|
+     * DEVICE_LOCAL type is a ~256 MB window and everything past it silently lands in
+     * system RAM. When staged==1, weight arenas use memtype_dl (DEVICE_LOCAL, not
+     * host-visible) and are filled by vkCmdCopyBuffer from `stage` (memtype_stage,
+     * host-visible, preferably NOT device-local so it never eats the BAR) on the
+     * dedicated up_cmd/up_fence. Scratches, KV mirror and readbacks are unchanged. */
+    int staged; uint32_t memtype_dl, memtype_stage;
+    VkCommandPool up_cpool; VkCommandBuffer up_cmd; VkFence up_fence;
     VkDescriptorSetLayout dsl;
     VkPipelineLayout plyt;
     VkPipeline pipe;
@@ -65,6 +96,7 @@ static struct {
     VkCommandBuffer cmd;
     VkFence fence;
     Scratch x, y, h;   /* h = fused gate+up hidden output */
+    Scratch stage;     /* host staging buffer for the staged weight path (TRANSFER_SRC) */
     /* full expert-group scratch: activations/hidden/output for K experts + per-expert
      * descriptor sets (gate_up: dsl_gu, down: dsl), so gate_up->down runs on-device in
      * one submit with hidden never leaving the GPU. */
@@ -138,9 +170,36 @@ static int pick_memtype_cached(VkPhysicalDevice phys) {
     return pick_memtype(phys);   /* no cached type -> fall back (no worse than before) */
 }
 
-static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
+/* DEVICE_LOCAL and NOT host-visible, on the largest device-local heap: the target of the
+ * staged weight path. -1 when no such type exists (unified-memory APUs, Lavapipe). */
+static int pick_memtype_dl(VkPhysicalDevice phys) {
+    VkPhysicalDeviceMemoryProperties m;
+    vkGetPhysicalDeviceMemoryProperties(phys, &m);
+    int best = -1; VkDeviceSize bestheap = 0;
+    for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
+        if (!(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) || (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
+        VkDeviceSize hs = m.memoryHeaps[m.memoryTypes[i].heapIndex].size;
+        if (hs > bestheap) { bestheap = hs; best = (int)i; }
+    }
+    return best;
+}
+/* Host-visible+coherent type for the staging buffer, preferring one that is NOT
+ * device-local so staging never consumes the BAR window; falls back to G.memtype. */
+static int pick_memtype_stage(VkPhysicalDevice phys) {
+    VkPhysicalDeviceMemoryProperties m;
+    vkGetPhysicalDeviceMemoryProperties(phys, &m);
+    for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
+        if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
+            !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) return (int)i;
+    }
+    return (int)G.memtype;
+}
+
+static int alloc_buf_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype, VkBufferUsageFlags usage) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .size = bytes, .usage = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
@@ -156,6 +215,9 @@ static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, vo
     VKCHECK(vkBindBufferMemory(G.dev, *buf, *mem, 0), "vkBindBufferMemory");
     if (ptr) VKCHECK(vkMapMemory(G.dev, *mem, 0, bytes, 0, ptr), "vkMapMemory");
     return 1;
+}
+static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
+    return alloc_buf_mt(bytes, buf, mem, ptr, memtype, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 }
 /* Priority class of subsequent allocations (VK_EXT_memory_priority; no-op without it).
  * Scratches/KV force 1.0 internally; weight uploads take whatever is current — the
@@ -284,6 +346,11 @@ static void derive_dir_file(const char *spv, const char *fname, char *out, size_
 
 int coli_vk_init(const char *spv_path) {
     if (G.ready) return 1;
+    {
+        const char *e = getenv("COLI_VK_SPIN_US");
+        g_vk_spin_us = e ? atol(e) : 300;
+        if (g_vk_spin_us < 0) g_vk_spin_us = 0;
+    }
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .apiVersion = VK_API_VERSION_1_2};
     VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -380,16 +447,37 @@ int coli_vk_init(const char *spv_path) {
                 mp.memoryHeaps[i].size > dl_max) dl_max = mp.memoryHeaps[i].size;
         VkMemoryPropertyFlags cf = mp.memoryTypes[G.memtype].propertyFlags;
         VkDeviceSize hv_dl = mp.memoryHeaps[mp.memoryTypes[G.memtype].heapIndex].size;
-        if (dl_max && !(cf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+        int small_bar = dl_max && (!(cf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) || hv_dl * 4 < dl_max);
+        /* Staged device-local weights: auto when the host-visible slice is small,
+         * COLI_VK_STAGED=1/0 forces either way (1 lets ReBAR owners validate the path).
+         * Exactly "1" forces on, exactly "0" forces off; anything else (unset, empty,
+         * other text) is auto. */
+        int dl = pick_memtype_dl(G.phys);
+        const char *st = getenv("COLI_VK_STAGED");
+        int staged_off_forced = st && !strcmp(st, "0");
+        int want = st && !strcmp(st, "1") ? 1 : (staged_off_forced ? 0 : small_bar);
+        if (want && dl < 0) {
+            fprintf(stderr, "[VK] COLI_VK_STAGED requested but no device-local-only memory type "
+                    "(unified memory?) — mapped uploads\n");
+            want = 0;
+        }
+        if (want) {
+            G.staged = 1; G.memtype_dl = (uint32_t)dl; G.memtype_stage = (uint32_t)pick_memtype_stage(G.phys);
+            fprintf(stderr, "[VK] weights: staged device-local uploads (host-visible VRAM %llu of %llu MB; "
+                    "memtype %u via staging memtype %u)\n", (unsigned long long)(hv_dl >> 20),
+                    (unsigned long long)(dl_max >> 20), G.memtype_dl, G.memtype_stage);
+        } else if (dl_max && !(cf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
             fprintf(stderr, "[VK] warning: no host-visible+device-local memory type — weight tiers "
                     "will live in system RAM and every access crosses PCIe (expect slower than "
-                    "CPU-only). On a discrete card, enable Resizable BAR in the BIOS.\n");
-        else if (dl_max && hv_dl * 4 < dl_max)
+                    "CPU-only). On a discrete card, enable Resizable BAR in the BIOS or set "
+                    "COLI_VK_STAGED=1.\n");
+        else if (small_bar)
             fprintf(stderr, "[VK] warning: only %llu of %llu MB VRAM is host-visible (Resizable BAR "
                     "appears disabled) — allocations beyond the %llu MB window fall back to system "
-                    "RAM and will be slow. Enable Resizable BAR / Smart Access Memory in the BIOS.\n",
+                    "RAM and will be slow. Enable Resizable BAR / Smart Access Memory in the BIOS.%s\n",
                     (unsigned long long)(hv_dl >> 20), (unsigned long long)(dl_max >> 20),
-                    (unsigned long long)(hv_dl >> 20));
+                    (unsigned long long)(hv_dl >> 20),
+                    staged_off_forced ? " (COLI_VK_STAGED=0 is set; unset it to use staged uploads)" : "");
     }
 
     G.shader = load_spv(G.dev, spv_path);
@@ -438,14 +526,47 @@ int coli_vk_init(const char *spv_path) {
     VKCHECK(vkCreateFence(G.dev, &fi, NULL, &G.fence), "fence");
     VKCHECK(vkCreateFence(G.dev, &fi, NULL, &G.eg_fence), "eg fence");
 
+    if (G.staged) {   /* own pool: command buffers from one pool need external sync too */
+        VkCommandPoolCreateInfo upci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = G.qfam};
+        VKCHECK(vkCreateCommandPool(G.dev, &upci, NULL, &G.up_cpool), "up cmdPool");
+        VkCommandBufferAllocateInfo ubi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = G.up_cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+        VKCHECK(vkAllocateCommandBuffers(G.dev, &ubi, &G.up_cmd), "up cmdBuf");
+        VKCHECK(vkCreateFence(G.dev, &fi, NULL, &G.up_fence), "up fence");
+    }
+
     G.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
-    fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s\n", p.deviceName, G.qfam, G.memtype,
-            G.shader_gu ? ", fused gate+up" : "", G.shader_att ? ", absorb attention" : "");
+    fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s, weights %s\n", p.deviceName, G.qfam, G.memtype,
+            G.shader_gu ? ", fused gate+up" : "", G.shader_att ? ", absorb attention" : "",
+            G.staged ? "staged" : "mapped");
     return 1;
 }
 
 int coli_vk_available(void) { return G.ready; }
+int coli_vk_staged(void) { return G.ready && G.staged; }
+
+const char *coli_vk_default_spv(char *buf, size_t n) {
+    const char *env = getenv("COLI_VK_SHADERS");
+    struct stat st;
+    if (env && *env) {
+        if (!stat(env, &st) && S_ISDIR(st.st_mode)) { snprintf(buf, n, "%s/qmatmul.spv", env); return buf; }
+        return env;
+    }
+#ifdef __linux__
+    ssize_t k = readlink("/proc/self/exe", buf, n - 1);
+    if (k > 0) {
+        buf[k] = 0;
+        char *sl = strrchr(buf, '/');
+        if (sl && (size_t)(sl + 1 - buf) + sizeof("shaders/qmatmul.spv") <= n) {
+            strcpy(sl + 1, "shaders/qmatmul.spv");
+            if (!stat(buf, &st)) return buf;
+        }
+    }
+#endif
+    return "shaders/qmatmul.spv";
+}
 
 void coli_vk_mem_info(size_t *used, size_t *count) {
     if (used) *used = G.used_bytes;
@@ -461,20 +582,26 @@ void coli_vk_mem_info(size_t *used, size_t *count) {
  * in the dozens. Arena slices are never reclaimed per-tensor (registry/dense uploads
  * live for the process; the rare fill-failure free leaks its slice, bounded) — a
  * tensor's mem handle stays VK_NULL_HANDLE, which coli_vk_tensor_free's vkFreeMemory
- * treats as the documented no-op. */
-typedef struct VkWArena { VkDeviceMemory mem; uint8_t *base; size_t cap, off; struct VkWArena *next; } VkWArena;
-static VkWArena *g_warena;
+ * treats as the documented no-op. The staged path keeps a second chain in
+ * DEVICE_LOCAL-only memory (never mapped); slices there are filled by stage_copy. */
+typedef struct VkWArena { VkDeviceMemory mem; uint8_t *base; size_t cap, off; int filled; struct VkWArena *next; } VkWArena;
+static VkWArena *g_warena;      /* mapped host-visible chain (G.memtype) */
+static VkWArena *g_warena_dl;   /* staged device-local chain (G.memtype_dl); base == NULL */
 #define VK_WARENA_BLOCK ((size_t)256 << 20)
-static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
+static VkResult vk_fence_wait(VkDevice dev, VkFence f);
+static int arena_suballoc_locked(size_t bytes, VkBuffer *buf, void **ptr, int dl, VkWArena **ablk) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .size = bytes,
+        .usage = dl ? (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+                    : VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(G.dev, *buf, &req);
-    if (!(req.memoryTypeBits & (1u << G.memtype))) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+    uint32_t mt = dl ? G.memtype_dl : G.memtype; VkWArena **head = dl ? &g_warena_dl : &g_warena;
+    if (!(req.memoryTypeBits & (1u << mt))) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
     size_t align = req.alignment ? req.alignment : 256, off = 0;
-    VkWArena *a = g_warena;
+    VkWArena *a = *head;
     for (; a; a = a->next) {
         off = (a->off + align - 1) & ~(align - 1);
         if (off + req.size <= a->cap) break;
@@ -484,23 +611,137 @@ static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
         a = calloc(1, sizeof(*a));
         if (!a) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
         VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            .allocationSize = cap, .memoryTypeIndex = G.memtype};
+            .allocationSize = cap, .memoryTypeIndex = mt};
 #ifdef VK_EXT_memory_priority
         VkMemoryPriorityAllocateInfoEXT pri = {.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT,
             .priority = G.prio};
         if (G.has_prio) ai.pNext = &pri;
 #endif
         if (vkAllocateMemory(G.dev, &ai, NULL, &a->mem) != VK_SUCCESS ||
-            vkMapMemory(G.dev, a->mem, 0, cap, 0, (void **)&a->base) != VK_SUCCESS) {
+            (!dl && vkMapMemory(G.dev, a->mem, 0, cap, 0, (void **)&a->base) != VK_SUCCESS)) {
             if (a->mem) vkFreeMemory(G.dev, a->mem, NULL);
             free(a); vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0;
         }
-        a->cap = cap; a->next = g_warena; g_warena = a;
+        /* New dl blocks are filled once by the arena_suballoc wrapper, outside
+         * g_arena_mx (fence waits are never taken under a lock — see the file-top
+         * invariant); mapped blocks never need it. */
+        a->filled = dl ? 0 : 1;
+        a->cap = cap; a->next = *head; *head = a;
         off = 0;
     }
     VKCHECK(vkBindBufferMemory(G.dev, *buf, a->mem, off), "vkBindBufferMemory");
-    if (ptr) *ptr = a->base + off;
+    if (ptr) *ptr = dl ? NULL : a->base + off;
     a->off = off + req.size;
+    *ablk = a;
+    return 1;
+}
+static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr, int dl) {
+    VkWArena *a = NULL;
+    pthread_mutex_lock(&g_arena_mx);
+    int r = arena_suballoc_locked(bytes, buf, ptr, dl, &a);
+    pthread_mutex_unlock(&g_arena_mx);
+    if (r && dl && !a->filled) {
+        /* First slice out of a fresh dl block: fill the whole block once, outside
+         * g_arena_mx. Without this fill, expert/matmul results computed from a
+         * freshly created device-local block differ slightly (within the 1e-3
+         * harness gate) and are non-deterministic run to run; filling the block
+         * once here — with ANY value, 0x00 and 0xFF measured identical — makes the
+         * staged path byte-identical to the mapped path across all 50 harness
+         * cases on RX 580 (RADV Polaris). The fill value is irrelevant, so the
+         * mechanism is the first GPU-side write/placement of the allocation, not a
+         * read of filler bytes; the underlying cause is unresolved (no GPU
+         * validation layers on the test host) and is reported upstream as a
+         * finding. Borrowing up_cmd/up_fence here is safe because dl allocations
+         * only happen under g_upload_mx, so no other suballoc can race this block's
+         * `filled` flag. On failure the slice just bound above is destroyed and 0
+         * returned; the block stays linked with filled==0 so the next dl
+         * allocation retries the fill — the lost slice is a bounded leak, like the
+         * existing fill-failure remark above the arena. */
+        VkBuffer zb = VK_NULL_HANDLE;
+        VkBufferCreateInfo zbi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = a->cap, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        VkCommandBufferBeginInfo zbegin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        VkSubmitInfo zsi = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1, .pCommandBuffers = &G.up_cmd};
+        int zok = vkCreateBuffer(G.dev, &zbi, NULL, &zb) == VK_SUCCESS;
+        if (zok) {
+            VkMemoryRequirements zreq;
+            vkGetBufferMemoryRequirements(G.dev, zb, &zreq);
+            zok = zreq.size <= a->cap && (zreq.memoryTypeBits & (1u << G.memtype_dl));
+        }
+        zok = zok &&
+              vkBindBufferMemory(G.dev, zb, a->mem, 0) == VK_SUCCESS &&
+              vkResetCommandBuffer(G.up_cmd, 0) == VK_SUCCESS &&
+              vkBeginCommandBuffer(G.up_cmd, &zbegin) == VK_SUCCESS;
+        if (zok) {
+            vkCmdFillBuffer(G.up_cmd, zb, 0, VK_WHOLE_SIZE, 0);
+            VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
+            vkCmdPipelineBarrier(G.up_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &mb, 0, NULL, 0, NULL);
+            zok = vkEndCommandBuffer(G.up_cmd) == VK_SUCCESS &&
+                  vkResetFences(G.dev, 1, &G.up_fence) == VK_SUCCESS &&
+                  vk_submit(G.queue, &zsi, G.up_fence) == VK_SUCCESS &&
+                  vk_fence_wait(G.dev, G.up_fence) == VK_SUCCESS;
+        }
+        if (zb) vkDestroyBuffer(G.dev, zb, NULL);
+        if (!zok) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+        a->filled = 1;
+    }
+    return r;
+}
+
+/* Grow-on-demand host staging buffer for the staged weight path (4 MB granularity so
+ * the per-expert tier uploads never reallocate). Callers hold g_upload_mx. */
+static int stage_reserve(size_t bytes) {
+    if (G.stage.cap >= bytes) return 1;
+    if (G.stage.buf) { vkDestroyBuffer(G.dev, G.stage.buf, NULL); vkFreeMemory(G.dev, G.stage.mem, NULL); }
+    G.stage.buf = VK_NULL_HANDLE; G.stage.mem = VK_NULL_HANDLE; G.stage.cap = 0; G.stage.ptr = NULL;
+    size_t cap = (bytes + ((size_t)4 << 20) - 1) & ~(((size_t)4 << 20) - 1);
+    if (!alloc_buf_mt(cap, &G.stage.buf, &G.stage.mem, &G.stage.ptr, G.memtype_stage,
+                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
+        G.stage.buf = VK_NULL_HANDLE; G.stage.mem = VK_NULL_HANDLE;
+        return 0;
+    }
+    G.stage.cap = cap;
+    return 1;
+}
+
+/* Staged upload: pack the padded rows and the scale block into the staging buffer, copy
+ * both into the tensor's device-local slices on the upload command buffer, wait. One
+ * upload at a time (g_upload_mx); the submit is serialised with decode by vk_submit. */
+static pthread_mutex_t g_upload_mx = PTHREAD_MUTEX_INITIALIZER;
+static int stage_copy(ColiVkTensor *t, const void *weights, const float *scales,
+                      size_t cpu_rb, size_t stride, size_t sb) {
+    if (!stage_reserve(t->wbytes + sb)) return 0;
+    uint8_t *p = G.stage.ptr;
+    memset(p, 0, t->wbytes);
+    for (int o = 0; o < t->O; o++)
+        memcpy(p + (size_t)o * stride, (const uint8_t *)weights + (size_t)o * cpu_rb, cpu_rb);
+    memcpy(p + t->wbytes, scales, sb);
+    VKCHECK(vkResetCommandBuffer(G.up_cmd, 0), "up resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    VKCHECK(vkBeginCommandBuffer(G.up_cmd, &begin), "up beginCmd");
+    VkBufferCopy cw = {.srcOffset = 0, .dstOffset = 0, .size = t->wbytes};
+    VkBufferCopy cs = {.srcOffset = t->wbytes, .dstOffset = 0, .size = sb};
+    vkCmdCopyBuffer(G.up_cmd, G.stage.buf, t->wbuf, 1, &cw);
+    vkCmdCopyBuffer(G.up_cmd, G.stage.buf, t->sbuf, 1, &cs);
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    vkCmdPipelineBarrier(G.up_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &mb, 0, NULL, 0, NULL);
+    VKCHECK(vkEndCommandBuffer(G.up_cmd), "up endCmd");
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.up_cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.up_fence), "up resetFence");
+    VKCHECK(vk_submit(G.queue, &si, G.up_fence), "up queueSubmit");
+    if (vk_fence_wait(G.dev, G.up_fence) != VK_SUCCESS) {
+        fprintf(stderr, "[VK] staged upload fence wait failed — disabling GPU offload\n");
+        G.ready = 0; return 0;
+    }
     return 1;
 }
 
@@ -517,17 +758,31 @@ static int upload_tensor(ColiVkTensor **out, const void *weights, const float *s
                   : fmt == 5 ? ((size_t)I + 63) / 64 * 24 : (size_t)(I + 1) / 2;
     size_t sfl = scale_floats(fmt, I, O, gs);            // fmt=5: O*ceil(I/64) group scales
     t->wbytes = stride * (size_t)O;
-    void *wptr;
-    if (!arena_suballoc(t->wbytes, &t->wbuf, &wptr)) { free(t); return 0; }
-    memset(wptr, 0, t->wbytes);
-    for (int o = 0; o < O; o++)                        // copy row-by-row into padded layout
-        memcpy((uint8_t *)wptr + (size_t)o * stride,
-               (const uint8_t *)weights + (size_t)o * cpu_rb, cpu_rb);
-    void *sptr;
-    if (!arena_suballoc(sfl * sizeof(float), &t->sbuf, &sptr)) {
-        vkDestroyBuffer(G.dev, t->wbuf, NULL); free(t); return 0;
+    size_t sb = sfl * sizeof(float);
+    if (G.staged) {
+        pthread_mutex_lock(&g_upload_mx);
+        int ok = arena_suballoc(t->wbytes, &t->wbuf, NULL, 1) &&
+                 arena_suballoc(sb, &t->sbuf, NULL, 1) &&
+                 stage_copy(t, weights, scales, cpu_rb, stride, sb);
+        pthread_mutex_unlock(&g_upload_mx);
+        if (!ok) {
+            if (t->wbuf) vkDestroyBuffer(G.dev, t->wbuf, NULL);
+            if (t->sbuf) vkDestroyBuffer(G.dev, t->sbuf, NULL);
+            free(t); return 0;
+        }
+    } else {
+        void *wptr;
+        if (!arena_suballoc(t->wbytes, &t->wbuf, &wptr, 0)) { free(t); return 0; }
+        memset(wptr, 0, t->wbytes);
+        for (int o = 0; o < O; o++)                        // copy row-by-row into padded layout
+            memcpy((uint8_t *)wptr + (size_t)o * stride,
+                   (const uint8_t *)weights + (size_t)o * cpu_rb, cpu_rb);
+        void *sptr;
+        if (!arena_suballoc(sb, &t->sbuf, &sptr, 0)) {
+            vkDestroyBuffer(G.dev, t->wbuf, NULL); free(t); return 0;
+        }
+        memcpy(sptr, scales, sb);
     }
-    memcpy(sptr, scales, sfl * sizeof(float));
     // Counters are touched concurrently: frees run from expert_load under
     // `#pragma omp parallel`, so RMW them atomically (torn counts otherwise).
     __atomic_add_fetch(&G.used_bytes, t->wbytes + sfl * sizeof(float), __ATOMIC_RELAXED);
@@ -549,13 +804,7 @@ int coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const floa
  * a short budget first (the common decode dispatch completes in 0.5-2 ms),
  * then fall back to the blocking wait. The spinning thread is stalled on the
  * GPU result anyway. COLI_VK_SPIN_US=0 restores the pure blocking wait. */
-static long g_vk_spin_us = -1;
 static VkResult vk_fence_wait(VkDevice dev, VkFence f) {
-    if (g_vk_spin_us < 0) {
-        const char *e = getenv("COLI_VK_SPIN_US");
-        g_vk_spin_us = e ? atol(e) : 300;
-        if (g_vk_spin_us < 0) g_vk_spin_us = 0;
-    }
     if (g_vk_spin_us > 0) {
         double t0 = vk_now();
         do {
@@ -633,7 +882,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { tA = vk_now(); p_sub += tA - t0; g_vsub_ms += tA - t0; t0 = tA; }
     // Bounded wait: a GPU hang/TDR must never wedge the process. 10s is orders of
     // magnitude over a single-GEMV dispatch; on timeout/device-loss disable VK for
@@ -692,7 +941,7 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
@@ -796,7 +1045,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.eg_cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.eg_fence), "eg resetFence");
     { double vp0 = G.eg_prof ? vk_now() : 0;
-      VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.eg_fence), "eg queueSubmit");
+      VKCHECK(vk_submit(G.queue, &si, G.eg_fence), "eg queueSubmit");
       if (G.eg_prof) g_vsub_ms += vk_now() - vp0; }
     G.eg_pending_yb = yb; G.eg_inflight = 1;
     return 1;
@@ -1261,7 +1510,7 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
@@ -1320,7 +1569,7 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
@@ -1421,7 +1670,7 @@ int coli_vk_attn_qprep(int layer,
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
@@ -1494,7 +1743,7 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
@@ -1545,6 +1794,9 @@ void coli_vk_shutdown(void) {
     if (G.att_sc.buf) { vkDestroyBuffer(G.dev, G.att_sc.buf, NULL); vkFreeMemory(G.dev, G.att_sc.mem, NULL); }
     if (G.att_ctx.buf) { vkDestroyBuffer(G.dev, G.att_ctx.buf, NULL); vkFreeMemory(G.dev, G.att_ctx.mem, NULL); }
     if (G.y2.buf) { vkDestroyBuffer(G.dev, G.y2.buf, NULL); vkFreeMemory(G.dev, G.y2.mem, NULL); }
+    if (G.stage.buf) { vkDestroyBuffer(G.dev, G.stage.buf, NULL); vkFreeMemory(G.dev, G.stage.mem, NULL); }
+    if (G.up_fence) vkDestroyFence(G.dev, G.up_fence, NULL);
+    if (G.up_cpool) vkDestroyCommandPool(G.dev, G.up_cpool, NULL);
     if (G.pair_pool) vkDestroyDescriptorPool(G.dev, G.pair_pool, NULL);
     coli_vk_kv_reset();
     if (G.eg_pool) vkDestroyDescriptorPool(G.dev, G.eg_pool, NULL);
@@ -2019,8 +2271,11 @@ static int run_qprep(int fmt, int S, int I, int Oqa, int Okva, int Oqb) {
 }
 
 int main(int argc, char **argv) {
-    const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
+    char spvbuf[1024];
+    const char *spv = argc > 1 ? argv[1] : coli_vk_default_spv(spvbuf, sizeof spvbuf);
+    printf("shader: %s\n", spv);
     if (!coli_vk_init(spv)) { printf("vk init failed\n"); return 1; }
+    printf("weights: %s\n", coli_vk_staged() ? "staged device-local" : "mapped host-visible");
     srand(1234);
     int bad = 0;
     /* COLI_VK_TEST_BALLAST=N: allocate N idle 4 MB device buffers before benching.

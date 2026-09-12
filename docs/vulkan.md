@@ -21,20 +21,38 @@ backend picks the most capable physical device (discrete > integrated) and
 degrades to the CPU path on any failure — a wedged GPU can slow a run, never
 corrupt it.
 
+Polaris/gfx803 validated on real hardware (RX 580 8 GB, Mesa 25.2.8 RADV, no
+Resizable BAR, GPU clocks not pinned — no root to set
+`power_dpm_force_performance_level`; commit bb16ab3): the shaders' dynamic
+subgroup sizes ran unmodified, wave64-safe by construction. Qwen3.6-35B-A3B
+int4-gs64, 64-token decode: staged uploads 5.99 tok/s vs the mapped path
+(`COLI_VK_STAGED=0`) 2.44 tok/s; frozen-heat runs were token-identical to
+each other and to the CPU-only baseline.
+
 Set `COLI_NO_OMP_TUNE=1` on multi-core boxes: the engine's OMP self-tune
 (active spin-wait) is skipped under `COLI_CUDA`/`COLI_METAL` but not under
 Vulkan, and spinning worker threads starve the async I/O pool (measured
 CPU expert bandwidth 28 → 5 GB/s without it).
 
-**Discrete cards need Resizable BAR.** The weight tiers allocate
-HOST_VISIBLE|DEVICE_LOCAL memory; with ReBAR disabled that combination only
-exists in a ~256 MB BAR window, and the driver silently places everything
+**Resizable BAR is faster; staged uploads make it optional.** The weight tiers
+prefer HOST_VISIBLE|DEVICE_LOCAL memory. With ReBAR disabled that combination
+only exists in a ~256 MB BAR window, and the driver silently places everything
 beyond it in system RAM — the tier then *reports* resident experts while every
 access crosses PCIe, slower than the CPU path (measured 0.11 vs 0.24 tok/s
-either side of the BIOS toggle on an RX 9070 XT). The engine now warns at init
-when the host-visible slice of VRAM is small; if you see that warning, enable
-Resizable BAR / Smart Access Memory in the BIOS. Unified-memory APUs are
-unaffected.
+either side of the BIOS toggle on an RX 9070 XT). When the backend sees a small
+host-visible slice it now switches to **staged uploads**: resident weights go
+to plain DEVICE_LOCAL memory through a host staging buffer and
+`vkCmdCopyBuffer` (`[VK] weights: staged device-local uploads` in the banner).
+`COLI_VK_STAGED=1` forces the staged path on any card, `=0` forces the mapped
+path. Each new device-local block is filled once on creation: without that
+first GPU-side write, results computed from a fresh block differ slightly and
+non-deterministically (measured on an RX 580; the cause is not yet
+identified). In the correctness harness's batched int4 matmuls, the staged
+path ran roughly 4× faster than the mapped path on the RX 580 (0.17 vs 0.66
+ms/matmul) — a harness-only number for the kernel itself, not end-to-end
+throughput. Enable Resizable BAR / Smart Access Memory in the BIOS when you
+can; it removes the copy at warmstart. Unified-memory APUs have no
+device-local-only memory and are unaffected either way.
 
 The compiled shaders are found via `COLI_VK_SHADERS` (either the
 `qmatmul.spv` file or the directory holding the `.spv` set); unset, the
@@ -107,5 +125,4 @@ hit-rate line is the tier-effectiveness number.
 - DSA top-k selection, ragged multi-slot serving, and quantized-KV caches
   fall back to the CPU attention path.
 - Not yet done: cooperative-matrix (coopmat) prefill kernels, a fully
-  resident-layer pipeline, Polaris/gfx803 validation on real hardware (the
-  shaders use dynamic subgroup sizes and are wave64-safe by construction).
+  resident-layer pipeline.
