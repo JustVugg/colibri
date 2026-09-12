@@ -28,7 +28,14 @@ jobs:
           - os: windows-latest
             name: windows-x86_64
             ext: ".exe"
-            make_args: ""
+            # XDNA=1 compiles the optional AMD Ryzen AI NPU lane into the
+            # ordinary Windows host. It stays OFF unless the user passes
+            # `coli --xdna`, adds no XRT or helper import (the helper is
+            # resolved with LoadLibraryExA at runtime, and only on request),
+            # and needs nothing installed on the runner. The artifacts and
+            # coli_xdna.dll it would use are NOT built here -- they need XRT
+            # and the AIE toolchain -- and ship as a separate optional asset.
+            make_args: "XDNA=1"
             v4: "1"
             # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'
             # (the v1.0.0 tag build failed on exactly this). Same as ci.yml.
