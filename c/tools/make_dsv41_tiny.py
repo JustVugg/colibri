@@ -397,8 +397,15 @@ def build(out: Path, cfg: dict, ref_path: Path | None, max_new: int, prompt_len:
 
     save_file(tensors, str(out / "model.safetensors"))
 
-    # config.json in the released shape: everything under text_config, vision absent
-    text = {k: v for k, v in cfg.items() if k not in ("max_seq_len",)}
+    # config.json in the released shape: everything under text_config, vision
+    # absent -- and n_mtp_layers absent too, because the checkpoint DeepSeek
+    # publishes does not carry it. It lives only in their inference/config.json,
+    # which nobody who downloads the model ever sees. A fixture whose config is
+    # richer than the real one hides exactly the defects that matter: this one
+    # hid a heap overflow for a day, because the engine sized its speculative
+    # rollback buffers from a stage count that is zero until the checkpoint is
+    # probed for it.
+    text = {k: v for k, v in cfg.items() if k not in ("max_seq_len", "n_mtp_layers")}
     config = {
         "architectures": ["DeepseekV41ForCausalLM"],
         "model_type": "deepseek_v41",

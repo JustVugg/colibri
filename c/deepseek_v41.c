@@ -931,7 +931,14 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
         memset(l->window, 0, (size_t)c->window * hd * sizeof(float));
         l->window_pos = xmalloc((size_t)c->window * sizeof(int), "window positions");
         for (int k = 0; k < c->window; k++) l->window_pos[k] = -1;
-        int rows = c->n_mtp > 0 ? c->spec_block + 1 : 1;
+        /* Sized from spec_block, NOT from n_mtp: the released config.json
+         * carries the block size and omits the stage count, so n_mtp is still
+         * zero here and only becomes 3 inside spec_load, which runs after this
+         * loop. Reading it here allocated one row and the first speculative
+         * step then wrote six into it -- a heap overflow that the tiny fixture
+         * could not show, because the config this repository writes for it
+         * does declare n_mtp_layers. The block size is what bounds a batch. */
+        int rows = c->spec_block > 0 ? c->spec_block + 1 : 1;
         l->ring_save = xmalloc((size_t)rows * hd * sizeof(float), "displaced ring keys");
         l->ring_save_pos = xmalloc((size_t)rows * sizeof(int), "displaced ring positions");
         int ratio = c->compress_ratio[i];
