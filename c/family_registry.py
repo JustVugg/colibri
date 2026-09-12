@@ -1090,7 +1090,14 @@ FAMILIES = (
         planner_unsupported_reason="",
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         config_section="root",
-        limits=FamilyLimits(4096, 4096, 1024, 1024, 1, 8, "CTX"),
+        # implicit_cap 0, not 8: the engine sizes its expert cache from the RAM
+        # budget once the dense weights are resident (#1443), so "nobody chose a
+        # number" has to arrive as the sentinel. Eight slots per layer knows
+        # nothing about the model or the machine, and on OLMoE it is five times
+        # slower than the cache the same machine could hold: measured on a
+        # 1204-token prefill, cap 8 gives 22.8% expert hit rate and 0.045 tok/s,
+        # cap 64 gives 99.4% and 0.215 tok/s.
+        limits=FamilyLimits(4096, 4096, 1024, 1024, 1, 0, "CTX"),
         capabilities=FamilyCapabilities(False, False, False, False),
         has_gateway_adapter=True,
         has_cli_adapter=True,

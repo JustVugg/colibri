@@ -1181,10 +1181,14 @@ class CapSentinelShimTest(unittest.TestCase):
             self._spawn_argv("engine", str(model))
 
     def test_cap_for_arch_is_the_single_translation_point(self):
+        # 0 is the "you decide" sentinel, and it goes to the engines that
+        # actually do decide: glm resolves it platform-aware, olmoe sizes its
+        # expert cache from the RAM budget once the dense weights are resident
+        # (#1443). The others still get the legacy eight slots per layer.
         self.assertEqual(cap_for_arch("glm", None), 0)
+        self.assertEqual(cap_for_arch("olmoe", None), 0)
         self.assertEqual(cap_for_arch("inkling", None), 8)
         self.assertEqual(cap_for_arch("kimi", None), 8)
-        self.assertEqual(cap_for_arch("olmoe", None), 8)
         self.assertEqual(cap_for_arch("glm", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 0), 0)   # explicit 0 is explicit

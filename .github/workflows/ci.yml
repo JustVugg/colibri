@@ -549,6 +549,14 @@ jobs:
           SNAP=olmoe_tiny_c ./olmoe 8 8 olmoe_tiny/ref_olmoe.json | tee oracle.log
           # the engine prints the score and exits 0 either way: the gate is here
           grep -qE 'Matching tokens: ([0-9]+)/\1$' oracle.log
+      - name: "Cache cap: the sentinel takes the budget, an explicit cap is left alone"
+        run: |
+          cd c
+          # The cap used to be a constant 8 slots per layer whenever nobody
+          # chose one (#1443). It is now derived from the RAM budget, and the
+          # derivation needs a real container to size: this is the job that has
+          # one.
+          COLI_OLMOE_FIXTURE=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_cap_budget
       - name: "Brain tab: HITS after every turn, on the grid EMAP declared"
         run: |
           cd c
