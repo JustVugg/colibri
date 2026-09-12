@@ -811,6 +811,23 @@ def _dsv41_expert_inventory(name, size, config, _dtype=None):
     return ((layers + int(match.group(1)), int(match.group(2)), size),)
 
 
+_DSV41_ENGRAM = re.compile(r"^layers\.(\d+)\.engram\.embed\.(weight|scale)$")
+
+
+def _dsv41_resident_inventory(name, size, _config, _dtype=None):
+    """Resident bytes for what the engine actually holds in RAM.
+
+    The two n-gram tables are 203 GB of the released checkpoint, 40% of it, and
+    the engine never holds them: it reads one 264-byte row at a time from disk
+    behind a small LRU whose size is a runtime knob. Counted as dense they turn
+    a 552B model that fits a workstation into one that needs 214 GB of RAM, and
+    the plan then plans nothing: measured against the real checkpoint on a 61 GB
+    box, `coli plan` reported 214.3 GB of dense weights, 0% projected expert
+    residency and a cap of zero, for a model whose resident trunk is 11 GB.
+    """
+    return 0 if _DSV41_ENGRAM.match(name) else size
+
+
 def _inkling_expert_inventory(name, size, config, _dtype=None):
     match = _INKLING_EXPERT.fullmatch(name)
     if match is None:
@@ -1302,6 +1319,7 @@ FAMILIES = (
         planner_geometry=_dsv41_geometry,
         planner_unsupported_reason="",
         expert_inventory=_dsv41_expert_inventory,
+        resident_inventory=_dsv41_resident_inventory,
         config_section="text_config",
         limits=FamilyLimits(4096, 1048576, 1024, 16384, 1, 8, "CTX"),
         # tools yes (DSML, see v41_dsml.py), grammars no: the engine reads the six-field
