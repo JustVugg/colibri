@@ -1280,37 +1280,334 @@ static Slot *slot_find(GModel *m, int layer, int eid) {
     return NULL;
 }
 
+
+/* ---------- multi-SSD mirror for streamed experts ----------
+ *
+ * GLM-5.3 has its own expert loader and therefore cannot inherit the mirror
+ * routing used by the other engines.  st.h already owns replica validation
+ * and per-shard replica fds; glm53 only needs to choose a replica
+ * deterministically and use that fd for the actual expert read.
+ *
+ * Determinism matters: every load of (layer,eid) chooses the same drive,
+ * avoiding duplicate page-cache population and making the distribution
+ * reproducible.  Missing shards in a partial mirror fall back to primary.
+ */
+#define GLM53_MIR_REPS (1 + ST_MAX_MIR)
+
+static int glm53_mirror_active = 0;
+static int glm53_mirror_nrep = 1;
+static int glm53_mirror_cut[GLM53_MIR_REPS] = {256};
+
+static int glm53_expert_replica(int layer, int eid) {
+    if (!glm53_mirror_active) return 0;
+
+    uint32_t h = (uint32_t)layer * 2654435761u ^
+                 (uint32_t)eid   * 0x9E3779B9u;
+    h ^= h >> 16;
+    h *= 0x45d9f3bu;
+    h ^= h >> 16;
+
+    int hv = (int)(h & 255);
+    int r = 0;
+    while (r + 1 < glm53_mirror_nrep && hv >= glm53_mirror_cut[r])
+        r++;
+    return r;
+}
+
+
+
+/* Measure one drive with the same kind of large parallel reads used by
+ * streamed experts.  Prefer the direct/non-cached fd when available so the
+ * result reflects storage bandwidth instead of an already-warm page cache.
+ *
+ * The value is only a relative routing weight; absolute MB/s is not exposed
+ * as a performance promise.  A failed probe returns 1 so routing always has
+ * a usable positive weight. */
+static int glm53_mirror_probe_weight(GModel *m, int rep) {
+    enum { NREAD = 8 };
+    const size_t block = 19u * 1024u * 1024u;
+    const int64_t align = 4096;
+
+    int best_i = -1;
+    int64_t best_size = 0;
+
+    for (int i = 0; i < m->S.nfd; i++) {
+        int fd = st_fd_rep(&m->S, m->S.fds[i], rep);
+        if (fd < 0) continue;
+        if (m->S.sizes[i] < (int64_t)block * 2) continue;
+        if (m->S.sizes[i] > best_size) {
+            best_size = m->S.sizes[i];
+            best_i = i;
+        }
+    }
+
+    if (best_i < 0) return 1;
+
+    int primary_fd = m->S.fds[best_i];
+    int fd = st_direct_fd_rep(&m->S, primary_fd, rep);
+    if (fd < 0) fd = st_fd_rep(&m->S, primary_fd, rep);
+    if (fd < 0) return 1;
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    int64_t bytes = 0;
+
+#ifdef _OPENMP
+#pragma omp parallel for reduction(+:bytes)
+#endif
+    for (int j = 0; j < NREAD; j++) {
+        void *buf = NULL;
+        if (posix_memalign(&buf, (size_t)align, block) != 0 || !buf)
+            continue;
+
+        int64_t usable = best_size - (int64_t)block - align;
+        int64_t off = ((int64_t)(j + 1) * usable) / (NREAD + 1);
+        off &= ~(align - 1);
+
+        ssize_t got;
+        do {
+            got = pread(fd, buf, block, off);
+        } while (got < 0 && errno == EINTR);
+
+        if (got > 0) bytes += got;
+        free(buf);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    double sec =
+        (double)(t1.tv_sec - t0.tv_sec) +
+        (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+
+    if (sec <= 0.0 || bytes <= 0) return 1;
+
+    double mib_s = ((double)bytes / (1024.0 * 1024.0)) / sec;
+    int weight = (int)(mib_s + 0.5);
+
+    if (weight < 1) weight = 1;
+    if (weight > 1000000) weight = 1000000;
+
+    fprintf(stderr,
+            "[GLM53 MIRROR] probe drive %d: %.0f MiB/s\n",
+            rep, mib_s);
+
+    return weight;
+}
+
+static void glm53_mirror_setup(GModel *m, const char *primary_dir) {
+    const char *env = getenv("COLI_MODEL_MIRROR");
+    if (!env || !*env) env = getenv("SNAP_MIRROR");
+    if (!env || !*env) return;
+
+    st_mirror_reset(&m->S);
+
+    char dirs[4096];
+    snprintf(dirs, sizeof(dirs), "%s", env);
+
+    int nrep = 1;
+    char *p = dirs;
+
+    while (p && *p) {
+        char *sep = p;
+        while (*sep && *sep != ';' && *sep != ',') sep++;
+
+        int last = (*sep == 0);
+        *sep = 0;
+
+        while (*p == ' ') p++;
+        size_t n = strlen(p);
+        while (n && p[n - 1] == ' ') p[--n] = 0;
+
+        if (*p) {
+            if (!strcmp(p, primary_dir)) {
+                fprintf(stderr,
+                        "[GLM53 MIRROR] %s equals primary model dir -- ignored\n",
+                        p);
+            } else if (nrep >= GLM53_MIR_REPS) {
+                fprintf(stderr,
+                        "[GLM53 MIRROR] too many mirrors; max %d -- %s ignored\n",
+                        ST_MAX_MIR, p);
+            } else {
+                int nf = st_mirror_add(&m->S, p);
+                if (nf > 0) {
+                    fprintf(stderr,
+                            "[GLM53 MIRROR] replica %d: %s (%d/%d shards)\n",
+                            nrep, p, nf, m->S.nfd);
+                    nrep++;
+                } else {
+                    fprintf(stderr,
+                            "[GLM53 MIRROR] %s: no usable shards -- ignored\n",
+                            p);
+                }
+            }
+        }
+
+        p = last ? NULL : sep + 1;
+    }
+
+    if (nrep < 2) return;
+
+    glm53_mirror_nrep = nrep;
+
+    /*
+     * COLI_DISK_WEIGHTS is one positive integer per drive:
+     * primary,mirror1[,mirror2...].
+     *
+     * When it is unset or invalid, measure every active drive at startup
+     * using large parallel reads and derive the deterministic expert-routing
+     * split from the measured relative bandwidth.
+     */
+    int weight[GLM53_MIR_REPS] = {0};
+    int valid = 0;
+    const char *wenv = getenv("COLI_DISK_WEIGHTS");
+
+    if (wenv && *wenv) {
+        char wb[512];
+        snprintf(wb, sizeof(wb), "%s", wenv);
+
+        char *q = wb;
+        int nw = 0;
+        valid = 1;
+
+        while (q && *q && nw < GLM53_MIR_REPS) {
+            char *end = NULL;
+            long v = strtol(q, &end, 10);
+            if (end == q || v <= 0 || v > 1000000) {
+                valid = 0;
+                break;
+            }
+
+            weight[nw++] = (int)v;
+
+            while (*end == ' ') end++;
+            if (!*end) {
+                q = NULL;
+            } else if (*end == ',') {
+                q = end + 1;
+                while (*q == ' ') q++;
+            } else {
+                valid = 0;
+                break;
+            }
+        }
+
+        if (nw != nrep) valid = 0;
+    }
+
+    if (!valid) {
+        if (wenv && *wenv)
+            fprintf(stderr,
+                    "[GLM53 MIRROR] invalid COLI_DISK_WEIGHTS '%s' for %d drives; probing bandwidth\n",
+                    wenv, nrep);
+
+        for (int r = 0; r < nrep; r++)
+            weight[r] = glm53_mirror_probe_weight(m, r);
+    }
+
+    long total = 0;
+    for (int r = 0; r < nrep; r++) total += weight[r];
+
+    long accum = 0;
+    for (int r = 0; r < nrep; r++) {
+        accum += weight[r];
+        int cut = (int)((256L * accum + total / 2) / total);
+        if (cut < 1) cut = 1;
+        if (cut > 256) cut = 256;
+        glm53_mirror_cut[r] = cut;
+    }
+    glm53_mirror_cut[nrep - 1] = 256;
+
+    glm53_mirror_active = 1;
+
+    fprintf(stderr, "[GLM53 MIRROR] %d drives | routing", nrep);
+    int prev = 0;
+    for (int r = 0; r < nrep; r++) {
+        int share = glm53_mirror_cut[r] - prev;
+        fprintf(stderr, "%s%d%%",
+                r ? " / " : " ",
+                (int)((100L * share + 128) / 256));
+        prev = glm53_mirror_cut[r];
+    }
+    fprintf(stderr, "%s\n",
+            valid ? " (COLI_DISK_WEIGHTS)" : " (startup bandwidth probe)");
+}
+
 static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
     const ERef *ref = &m->eref[(size_t)layer * m->c.n_experts + eid];
+    int rep = glm53_expert_replica(layer, eid);
+
+    /* A routed expert is one logical object.  A partial mirror is allowed, but
+     * if even one of its six pieces is absent on the selected replica, route
+     * the WHOLE expert to the primary.  Never mix pieces of one expert across
+     * drives. */
+    if (rep > 0) {
+        for (int p = 0; p < GLM53_EXPERT_PIECES; p++) {
+            if (st_fd_rep(&m->S, ref->fd[p], rep) < 0) {
+                rep = 0;
+                break;
+            }
+        }
+    }
+
+    /* st_map_shard_range() maps the fd it is given, so the mmap fast path can
+     * follow the same deterministic replica routing as pread. */
     int mapped_ok = 1;
-    for (int p = 0; p < GLM53_EXPERT_PIECES && mapped_ok; p++) {
-        const void *pr = st_map_shard_range(ref->fd[p], ref->off[p], m->e_len[p]);
-        if (!pr) { mapped_ok = 0; break; }
+    for (int p = 0; p < GLM53_EXPERT_PIECES; p++) {
+        int fd = rep > 0 ? st_fd_rep(&m->S, ref->fd[p], rep) : ref->fd[p];
+        const void *pr =
+            st_map_shard_range(fd, ref->off[p], m->e_len[p]);
+
+        if (!pr) {
+            mapped_ok = 0;
+            break;
+        }
+
         slot->piece[p] = (uint8_t *)pr;
     }
-    if (mapped_ok) { slot->eid = eid; return; }
-    /* Fallback: si torna a scrivere in memoria NOSTRA, non in una mappatura
-     * di sola lettura che questo slot poteva star usando prima. */
+
+    if (mapped_ok) {
+        slot->eid = eid;
+        return;
+    }
+
+    /* Fallback: use owned memory rather than retaining pointers into a mapping
+     * that may have succeeded for only part of the expert. */
     if (!slot->own) {
         slot->own = malloc((size_t)m->e_slot);
-        if (!slot->own) { fprintf(stderr, "OOM su uno slot esperto\n"); exit(1); }
+        if (!slot->own) {
+            fprintf(stderr, "OOM su uno slot esperto\n");
+            exit(1);
+        }
     }
-    for (int p = 0; p < GLM53_EXPERT_PIECES; p++) slot->piece[p] = slot->own + m->e_at[p];
+
+    for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
+        slot->piece[p] = slot->own + m->e_at[p];
+
     if (ref->contig) {
-        st_pread_full(ref->fd[0], slot->own, m->e_slot, ref->off[0], "expert");
+        int fd = rep > 0 ? st_fd_rep(&m->S, ref->fd[0], rep) : ref->fd[0];
+        st_pread_full(fd, slot->own, m->e_slot, ref->off[0], "expert");
     } else {
-        for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
-            st_pread_full(ref->fd[p], slot->own + m->e_at[p], m->e_len[p],
-                          ref->off[p], "expert piece");
+        for (int p = 0; p < GLM53_EXPERT_PIECES; p++) {
+            int fd = rep > 0 ? st_fd_rep(&m->S, ref->fd[p], rep) : ref->fd[p];
+
+            st_pread_full(fd,
+                          slot->own + m->e_at[p],
+                          m->e_len[p],
+                          ref->off[p],
+                          "expert piece");
+        }
     }
+
     slot->eid = eid;
-    /* expert_read gira dentro a un ciclo parallelo: i contatori sono condivisi
-     * e senza questo sarebbero una corsa, cioe' numeri sbagliati proprio nel
-     * posto in cui si va a guardare per capire se il riuso funziona. */
+
+    /* expert_read runs inside a parallel load loop, so these counters are
+     * shared. */
 #ifdef _OPENMP
 #pragma omp atomic
 #endif
     m->miss++;
+
 #ifdef _OPENMP
 #pragma omp atomic
 #endif
@@ -1530,6 +1827,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
                              int layer_end, int load_io) {
     load_cfg(&m->c, dir);
     st_init(&m->S, dir);
+    glm53_mirror_setup(m, dir);
     /* Il checkpoint reale annida il modello testuale sotto il wrapper vision;
      * un export solo-testo no. Si sceglie una volta, da un tensore che deve
      * esistere in entrambe le forme. */
