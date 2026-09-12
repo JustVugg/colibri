@@ -22,9 +22,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
-#include <cuda_runtime.h>
 
+#include "../backend_gpu_compat.h"
 #include "../backend_cuda.cu"
+
+#ifdef _WIN32
+static int setenv(const char *name,const char *value,int overwrite){
+    (void)overwrite; return _putenv_s(name,value);
+}
+static int unsetenv(const char *name){ return _putenv_s(name,""); }
+#endif
 
 static void cpu_gemv_g4(const uint8_t *q,const float *sc,int K,int O,int gs,
                         const float *x,float *y){
@@ -45,10 +52,20 @@ static void cpu_gemv_g4(const uint8_t *q,const float *sc,int K,int O,int gs,
     }
 }
 
+static float cpu_swiglu(float g,float u,float limit){
+    if(limit>0.0f){
+        if(g>limit)g=limit;
+        if(u>limit)u=limit;
+        if(u<-limit)u=-limit;
+    }
+    return (g/(1.f+expf(-g)))*u;
+}
+
 int main(void){
     srand(7);
     const int D=200, I=96, gs=64;            /* tail group: 200 % 64 = 8 */
     const int COUNT=3;                       /* expert 0,1: fmt4 gs=64; expert 2: per-row (gs=0) */
+    const float swiglu_limit=0.25f;          /* deliberately exercises clamp in raw + public API paths */
     const int rbD=(D+1)/2, rbI=(I+1)/2;
     const int ngD=(D+gs-1)/gs, ngI=(I+gs-1)/gs;
     int trials=50, bad=0;
@@ -87,7 +104,7 @@ int main(void){
         GroupDesc *ddesc; cudaMalloc(&ddesc,sizeof(host));
         cudaMemcpy(ddesc,host,sizeof(host),cudaMemcpyHostToDevice);
         dim3 hgd((unsigned)I,1,(unsigned)COUNT),ogd((unsigned)D,1,(unsigned)COUNT);
-        grouped_hidden_g4_dual<<<hgd,256>>>(gate,up,xs,ddesc,I,D);
+        grouped_hidden_g4_dual<<<hgd,256>>>(gate,up,xs,ddesc,I,D,swiglu_limit);
         grouped_down_g4<<<ogd,256>>>(y,gate,ddesc,D,I);
         if(cudaDeviceSynchronize()!=cudaSuccess){ printf("FAIL cuda\n"); return 1; }
         for(int c=0;c<COUNT;c++){
@@ -96,7 +113,7 @@ int main(void){
             cpu_gemv_g4(hg[c],hgs[c],D,I,cgs,xs+(size_t)c*D,rg);
             cpu_gemv_g4(hu[c],hus[c],D,I,cgs,xs+(size_t)c*D,ru);
             /* fused epilogue (a03c79e): gate[] = silu(g)*u, up[] untouched */
-            for(int o=0;o<I;o++) rh[o]=(rg[o]/(1.f+expf(-rg[o])))*ru[o];
+            for(int o=0;o<I;o++) rh[o]=cpu_swiglu(rg[o],ru[o],swiglu_limit);
             for(int o=0;o<I;o++)
                 if(fabsf(gate[(size_t)c*I+o]-rh[o])>1e-3f*(fabsf(rh[o])+1e-3f)) bad++;
             cpu_gemv_g4(hd[c],hds[c],I,D,cgs,(float*)gate+(size_t)c*I,ry);
@@ -108,8 +125,8 @@ int main(void){
             free(hg[c]);free(hu[c]);free(hd[c]);free(hgs[c]);free(hus[c]);free(hds[c]); }
         cudaFree(ddesc);cudaFree(xs);cudaFree(gate);cudaFree(up);cudaFree(y);
     }
-    printf("grouped-g4 oracle: %d trials x %d experts (gs=64 + tail + per-row member), %d mismatches\n",
-           trials,COUNT,bad);
+    printf("grouped-g4 oracle: %d trials x %d experts (gs=64 + tail + per-row member, clamp %.2f), %d mismatches\n",
+           trials,COUNT,swiglu_limit,bad);
     if(bad){ printf("FAIL\n"); return 1; }
 
     /* ---- Phase 2: public API — upload_g + sync group vs async issue/take ----
@@ -118,6 +135,7 @@ int main(void){
     {
         int devs[1]={0};
         if(!coli_cuda_init(devs,1)){ printf("FAIL cuda init\n"); return 1; }
+        if(setenv("COLI_SWIGLU_LIMIT","0.25",1)){ printf("FAIL setenv\n"); return 1; }
         int rows[COUNT]={1,2,1}, total=4, api_bad=0;
         ColiCudaTensor *tg[COUNT]={},*tu[COUNT]={},*td[COUNT]={};
         uint8_t *hg[COUNT],*hu[COUNT],*hd[COUNT]; float *hgs[COUNT],*hus[COUNT],*hds[COUNT];
@@ -152,7 +170,7 @@ int main(void){
                 const float *xr=x+(size_t)(off+s)*D;
                 cpu_gemv_g4(hg[c],hgs[c],D,I,cgs,xr,rg);
                 cpu_gemv_g4(hu[c],hus[c],D,I,cgs,xr,ru);
-                for(int o=0;o<I;o++) rh[o]=(rg[o]/(1.f+expf(-rg[o])))*ru[o];
+                for(int o=0;o<I;o++) rh[o]=cpu_swiglu(rg[o],ru[o],swiglu_limit);
                 cpu_gemv_g4(hd[c],hds[c],I,D,cgs,rh,ry);
                 for(int o=0;o<D;o++){
                     size_t z=(size_t)(off+s)*D+o;
@@ -162,10 +180,11 @@ int main(void){
             }
             off+=rows[c];
         }
-        printf("grouped-g4 API: sync vs oracle + async(issue/take) vs sync, %d mismatches\n",api_bad);
+        printf("grouped-g4 API: clamped sync vs oracle + async(issue/take) vs sync, %d mismatches\n",api_bad);
         for(int c=0;c<COUNT;c++){ coli_cuda_tensor_free(tg[c]);coli_cuda_tensor_free(tu[c]);coli_cuda_tensor_free(td[c]);
             free(hg[c]);free(hu[c]);free(hd[c]);free(hgs[c]);free(hus[c]);free(hds[c]); }
         free(x);free(ysync);
+        unsetenv("COLI_SWIGLU_LIMIT");
         coli_cuda_shutdown();
         if(api_bad){ printf("FAIL\n"); return 1; }
     }

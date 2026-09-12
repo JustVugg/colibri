@@ -73,10 +73,12 @@ static inline int coli_sparse_index_select_range(int *out, const float *queries,
     const int pools = (sequence + pool - 1) / pool;
     const int wanted = topk / pool;
 
-    float *pooled = calloc((size_t)pools * dim, sizeof(*pooled));
-    float *scores = malloc((size_t)pools * sizeof(*scores));
-    unsigned char *complete = calloc((size_t)pools, 1);
-    unsigned char *taken = calloc((size_t)pools, 1);
+    float *pooled = (float *)calloc((size_t)pools * dim, sizeof(*pooled));
+    float *scores = (float *)malloc((size_t)pools * sizeof(*scores));
+    unsigned char *complete =
+        (unsigned char *)calloc((size_t)pools, 1);
+    unsigned char *taken =
+        (unsigned char *)calloc((size_t)pools, 1);
     if (!pooled || !scores || !complete || !taken) {
         free(taken); free(complete); free(scores); free(pooled);
         return -1;
@@ -189,7 +191,7 @@ static inline int coli_sparse_attention_range(float *out, const float *queries,
     if (!out || !queries || !keys || !values || !indices || sequence < 1 ||
         width < 1 || heads < 1 || key_dim < 1 || value_dim < 1 ||
         q_from < 0 || q_to > sequence || q_from > q_to) return -1;
-    float *scores = malloc((size_t)width * sizeof(*scores));
+    float *scores = (float *)malloc((size_t)width * sizeof(*scores));
     if (!scores) return -1;
     const float scale = 1.0f / sqrtf((float)key_dim);
     for (int q = q_from; q < q_to; q++) {

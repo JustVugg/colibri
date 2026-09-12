@@ -895,7 +895,7 @@ rans: $(RANSLIB)
 $(RANSLIB): tools/rans_ctypes.c rans.h
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
-cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_grouped_g4_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS)
 	./backend_cuda_test$(EXE)
@@ -921,23 +921,25 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# Needs both an oversubscribed grid and a token count in the affected band
 	# (roughly 33..256 per block) to reach the output; the sweep covers both,
 	# and one cell sits above the band on purpose. See the test's header.
-	# Runs AFTER the fp8 test on purpose: this is the most schedule-sensitive
-	# test in the recipe, and it should not cost the broader kernel suites if
-	# it trips. It stays BEFORE MXFP4 so it still runs on the hosts where that
-	# one is expected to fail.
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE)
+	# Runs BEFORE MXFP4 so it still runs on the hosts where that one is
+	# expected to fail.
+	"$(GPUCC)" $(GPUFLAGS) -DCOLI_ABSORB_RACE_STRESS backend_cuda.cu \
+		tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE)
 	./absorb_determinism_test$(EXE)
-	# fmt=8 (fp8-e4m3) kernel oracle + public API (LUT gate, dense, expert
-	# group, byte accounting). Includes backend_cuda.cu itself, so only the
-	# test file is compiled. Also runs BEFORE the MXFP4 test (same reason).
-	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_cuda.cu -o fp8_cuda_test$(EXE) $(ANS_NVCC_LIBS)
-	./fp8_cuda_test$(EXE)
 	# Upload-failure ownership: a failed H2D weight copy must release the
 	# bytes it allocated (weights_owned set by the malloc, not the copy).
 	# Includes backend_cuda.cu itself to plant the memcpy failure, so only
 	# the test file is compiled.
 	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS)
 	./weights_owned_test$(EXE)
+	# grouped int4-gs64 kernels and the public sync/async expert-group path.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_grouped_g4_cuda.cu -o grouped_g4_cuda_test$(EXE) $(ANS_NVCC_LIBS)
+	./grouped_g4_cuda_test$(EXE)
+	# fmt=8 (fp8-e4m3) kernel oracle + public API (LUT gate, dense, expert
+	# group, byte accounting). Includes backend_cuda.cu itself, so only the
+	# test file is compiled. Also runs BEFORE MXFP4 (same reason).
+	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_cuda.cu -o fp8_cuda_test$(EXE) $(ANS_NVCC_LIBS)
+	./fp8_cuda_test$(EXE)
 	# MXFP4 (fmt=7) against the CPU decoder in quant.h. The reference is built
 	# as C on purpose: quant.h uses _Thread_local, which nvcc's C++ front end
 	# rejects, and re-implementing it for the test would defeat the comparison.
@@ -955,7 +957,7 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# below no longer pulls the runtime, and CI could not catch it because CI
 	# never runs cuda-test. -Xclang appears nowhere else in CFLAGS.
 	$(CC) $(filter-out -Xclang -fopenmp,$(CFLAGS)) -fno-openmp -c tests/mxfp4_ref.c -o tests/mxfp4_ref.o
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu -x none tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE)
 	./mxfp4_cuda_test$(EXE)
 	# Allocator footprint (#687): what a cudaMalloc really takes off the card,
 	# which is what the expert tier has to be charged rather than the logical
@@ -983,16 +985,92 @@ tests/test_dsv4_mhc$(EXE): tests/test_dsv4_mhc.c dsv4_mhc.h
 
 tests/test_dsv4_quant$(EXE): tests/test_dsv4_quant.c dsv4_quant.h
 	$(CC) $(CFLAGS) tests/test_dsv4_quant.c -o tests/test_dsv4_quant$(EXE) $(LDFLAGS)
+
+glm53_mhc_cuda_test$(EXE): backend_cuda.cu backend_cuda.h backend_gpu_compat.h \
+		glm53_gpu.c glm53_gpu.h hyper_connections.h tests/test_glm53_mhc_cuda.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) -DCOLI_CUDA backend_cuda.cu glm53_gpu.c \
+		tests/test_glm53_mhc_cuda.cu -o $@ $(ANS_NVCC_LIBS)
+
+glm53-mhc-test: glm53_mhc_cuda_test$(EXE)
+
+glm53_kda_cuda_test$(EXE): backend_cuda.cu backend_cuda.h backend_gpu_compat.h \
+		glm53_gpu.c glm53_gpu.h delta_attention.h tests/test_glm53_kda_cuda.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) -DCOLI_CUDA backend_cuda.cu glm53_gpu.c \
+		tests/test_glm53_kda_cuda.cu -o $@ $(ANS_NVCC_LIBS)
+
+glm53-kda-test: glm53_kda_cuda_test$(EXE)
+
+absorb_determinism_test$(EXE): backend_cuda.cu backend_cuda.h \
+		backend_gpu_compat.h tests/test_absorb_determinism.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) -DCOLI_ABSORB_RACE_STRESS backend_cuda.cu \
+		tests/test_absorb_determinism.cu -o $@
+
+absorb-determinism-test: absorb_determinism_test$(EXE)
+
+glm53_mla_cuda_test$(EXE): backend_cuda.cu backend_cuda.h backend_gpu_compat.h \
+		glm53_gpu.c glm53_gpu.h sparse_index.h tests/test_glm53_mla_cuda.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) -DCOLI_CUDA backend_cuda.cu glm53_gpu.c \
+		tests/test_glm53_mla_cuda.cu -o $@ $(ANS_NVCC_LIBS)
+
+glm53-mla-test: glm53_mla_cuda_test$(EXE)
+
+glm53_moe_cuda_test$(EXE): backend_cuda.cu backend_cuda.h backend_gpu_compat.h \
+		glm53_gpu.c glm53_gpu.h tests/test_glm53_moe_cuda.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) -DCOLI_CUDA backend_cuda.cu glm53_gpu.c \
+		tests/test_glm53_moe_cuda.cu -o $@ $(ANS_NVCC_LIBS)
+
+glm53-moe-test: glm53_moe_cuda_test$(EXE)
+
+glm53_pipeline_test$(EXE): backend_cuda.cu backend_cuda.h backend_gpu_compat.h \
+		glm53_gpu.c glm53_gpu.h tests/test_glm53_pipeline.c
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) -DCOLI_CUDA backend_cuda.cu glm53_gpu.c \
+		tests/test_glm53_pipeline.c -o $@ $(ANS_NVCC_LIBS)
+
+glm53-pipeline-test: glm53_pipeline_test$(EXE)
+
+glm53_request_integration_test$(EXE): backend_cuda.o backend_cuda.h \
+		glm53_gpu.c glm53_gpu.h glm53.c tests/test_glm53_request_integration.c
+	$(CC) $(CFLAGS) tests/test_glm53_request_integration.c glm53_gpu.c \
+		backend_cuda.o -o $@ $(LDFLAGS)
+
+glm53-request-integration-test: glm53_request_integration_test$(EXE)
+
+glm53_quality$(EXE): backend_cuda.o backend_cuda.h glm53_gpu.c glm53_gpu.h \
+		glm53.c tools/glm53_quality.c
+	$(CC) $(CFLAGS) tools/glm53_quality.c glm53_gpu.c backend_cuda.o \
+		-o $@ $(LDFLAGS)
+
+glm53-quality: glm53_quality$(EXE)
+
 # convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
 hip-test:
 	$(MAKE) cuda-test HIP=1
+	$(MAKE) glm53-mhc-test HIP=1 HIP_ARCH="$(HIP_ARCH)"
+	./glm53_mhc_cuda_test$(EXE)
+	$(MAKE) glm53-kda-test HIP=1 HIP_ARCH="$(HIP_ARCH)"
+	./glm53_kda_cuda_test$(EXE)
+	$(MAKE) glm53-mla-test HIP=1 HIP_ARCH="$(HIP_ARCH)"
+	./glm53_mla_cuda_test$(EXE)
+	$(MAKE) glm53-moe-test HIP=1 HIP_ARCH="$(HIP_ARCH)"
+	./glm53_moe_cuda_test$(EXE)
+	$(MAKE) glm53-pipeline-test HIP=1 HIP_ARCH="$(HIP_ARCH)"
+	./glm53_pipeline_test$(EXE)
+	$(MAKE) glm53-request-integration-test HIP=1 HIP_ARCH="$(HIP_ARCH)"
+	./glm53_request_integration_test$(EXE)
 
 # CI: compile the backend and its test binary WITHOUT executing them (for
 # runners with the toolchain but no GPU). Pass CUDA_ARCH/HIP=1+HIP_ARCH.
 gpu-compile: backend_cuda.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE)
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) -DCOLI_ABSORB_RACE_STRESS backend_cuda.cu \
+		tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS)
@@ -1111,11 +1189,11 @@ NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
 NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
                    -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
 
-# GLM-5.3-Flash: CPU puro, esperti in streaming dal contenitore int4 gs64.
-# Nessun oggetto CUDA/Vulkan/Metal fra le dipendenze perche' il motore non ne
-# ha ancora: quando li avra', questa riga somigliera' a quella di kimi_k3.
-glm53$(EXE): glm53.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h serve_poll.h quant.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h backend_vulkan.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(VK_OBJ) $(VK_SPV)
-	$(CC) $(CFLAGS) glm53.c $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
+# GLM-5.3-Flash: experts stream from the int4-gs64 container into a bounded
+# host cache. CUDA/HIP mirrors those same slots in VRAM and runs the fused
+# expert MLP; evicting a host slot evicts its device tensors too.
+glm53$(EXE): glm53.c glm53_gpu.c glm53_gpu.h cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h serve_poll.h quant.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h backend_cuda.h backend_vulkan.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV)
+	$(CC) $(CFLAGS) glm53.c glm53_gpu.c $(CUDA_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
 kimi_k3$(EXE): kimi_k3.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h backend_cuda.h backend_metal.h backend_vulkan.h edge_adapters.h edge_runtime.h edge_tok_internal.h hybrid_split.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
 	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
@@ -1381,6 +1459,16 @@ tests/test_fp8_passthrough$(EXE): tests/test_fp8_passthrough.c quant.h
 tests/test_cuda_fmt_guard$(EXE): tests/test_cuda_fmt_guard.c backend_cuda.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_glm53_gpu$(EXE): tests/test_glm53_gpu.c glm53_gpu.c glm53_gpu.h backend_cuda.h
+	$(CC) $(CFLAGS) tests/test_glm53_gpu.c glm53_gpu.c -o $@ $(LDFLAGS)
+
+tests/test_glm53_request_lock$(EXE): tests/test_glm53_request_lock.c glm53.c glm53_gpu.c glm53_gpu.h
+	$(CC) $(CFLAGS) tests/test_glm53_request_lock.c glm53_gpu.c -o $@ $(LDFLAGS)
+
+gpu-context-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_gpu_context.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_gpu_context.cu -o gpu_context_test$(EXE) $(ANS_NVCC_LIBS)
+
 tests/test_fp8_load$(EXE): tests/test_fp8_load.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -1421,6 +1509,7 @@ SEGMENT_CPU_CFLAGS = $(filter-out -DCOLI_CUDA -DCOLI_ANS -DCOLI_METAL \
 SEGMENT_ENGINE_OBJS = \
 	$(SEGMENT_BUILD_DIR)/glm.o \
 	$(SEGMENT_BUILD_DIR)/glm53.o \
+	$(SEGMENT_BUILD_DIR)/glm53_gpu.o \
 	$(SEGMENT_BUILD_DIR)/inkling.o \
 	$(SEGMENT_BUILD_DIR)/kimi.o \
 	$(SEGMENT_BUILD_DIR)/olmoe.o \
@@ -1448,8 +1537,11 @@ $(SEGMENT_BUILD_DIR)/glm.o: colibri.c segment_runtime.h edge_runtime.h \
 $(SEGMENT_BUILD_DIR)/glm53.o: glm53.c segment_runtime.h edge_runtime.h \
 		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
 		edge_adapter_internal.h st.h quant.h tok.h hyper_connections.h \
-		delta_attention.h sparse_index.h vision_tower.h | $(SEGMENT_BUILD_DIR)
+		delta_attention.h sparse_index.h vision_tower.h glm53_gpu.h | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DGLM53_NO_MAIN -c glm53.c -o $@
+
+$(SEGMENT_BUILD_DIR)/glm53_gpu.o: glm53_gpu.c glm53_gpu.h | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -c glm53_gpu.c -o $@
 
 $(SEGMENT_BUILD_DIR)/inkling.o: inkling.c segment_runtime.h edge_runtime.h \
 		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
@@ -1938,6 +2030,8 @@ bench: iobench$(EXE)
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
 	qwen38-tiny-generate qwen38-tiny-check \
 	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
+	absorb-determinism-test glm53-mhc-test glm53-kda-test glm53-mla-test \
+	glm53-moe-test glm53-pipeline-test glm53-request-integration-test \
 	test-c test-python test check clean install uninstall bench
 
 # Own line: see the TEST_RULES note above on shared .PHONY lines.

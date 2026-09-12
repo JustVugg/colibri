@@ -20,6 +20,34 @@ with a CPU-only binary, an invalid device, or an unavailable runtime fails at
 startup instead of silently falling back. For Windows, see
 [windows.md](windows.md) (runtime DLL path).
 
+GLM-5.3 selects its startup backend with `GLM53_BACKEND=auto|gpu|cpu`.
+`auto` is the default and falls back to the complete CPU backend when the GPU
+probe fails; `gpu` makes startup fail on any GPU initialization or capability
+probe, loaded-model translation, smoke-session, or smoke-forward failure; `cpu`
+does not initialize HIP/CUDA. The complete text pipeline is device-resident:
+embedding, mHC, KDA/MLA state, routing, dense/shared/routed FFNs, final norm and
+LM head remain on one GPU. The required `PIPELINE` capability is advertised
+only after an executable miniature forward succeeds. A runtime fault fails the
+active request; it is never replayed as mixed CPU/GPU work. In `auto`, only a
+later request may open a fresh complete CPU session. `GLM53_HIP=0|1` remains a
+compatibility alias for existing scripts (`0` maps to `cpu`, nonzero to
+`auto`).
+
+On the validated MI350P (gfx950), build for gfx942 and use the runtime
+compatibility override:
+
+```bash
+make -C c glm53 HIP=1 HIP_ARCH=gfx942
+HSA_OVERRIDE_GFX_VERSION=9.4.2 GLM53_BACKEND=gpu \
+GLM53_EXPERT_GB=28 ./c/glm53 --model /path/to/glm53-int4 \
+  --prompt "The key insight about mixture of experts is" --greedy 64
+```
+
+The current GLM-5.3 expert cache is double-banked and retains host copies.
+Automatic sizing therefore OOMed the 123 GB validation host despite free HBM;
+`GLM53_EXPERT_GB=28` completed with 47 slots per sparse layer. This is a
+host-memory limitation of this GLM path, not a recommendation for other hosts.
+
 ## The VRAM expert tier
 
 A measured `PIN` profile promotes its hottest experts into a persistent VRAM

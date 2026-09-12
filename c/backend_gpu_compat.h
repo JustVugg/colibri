@@ -59,7 +59,10 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaDeviceProp           hipDeviceProp_t
 #define cudaGetDeviceProperties  hipGetDeviceProperties
 #define cudaMalloc               hipMalloc
+#define cudaMallocAsync          hipMallocAsync
+#define cudaMallocManaged        hipMallocManaged
 #define cudaFree                 hipFree
+#define cudaFreeAsync            hipFreeAsync
 #define cudaMemcpy               hipMemcpy
 #define cudaMemcpy2D             hipMemcpy2D
 #define cudaMemcpyAsync          hipMemcpyAsync
@@ -81,9 +84,14 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaEventDisableTiming   hipEventDisableTiming
 #define cudaEventDestroy         hipEventDestroy
 #define cudaEventRecord          hipEventRecord
+#define cudaEventQuery           hipEventQuery
 #define cudaEventSynchronize     hipEventSynchronize
+#define cudaErrorNotReady        hipErrorNotReady
 #define cudaEventElapsedTime     hipEventElapsedTime
 #define cudaMallocHost           hipHostMalloc
+#define cudaHostAlloc            hipHostMalloc
+#define cudaHostAllocMapped      hipHostMallocMapped
+#define cudaHostGetDevicePointer hipHostGetDevicePointer
 #define cudaFreeHost             hipHostFree
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define cudaMemcpyPeer           hipMemcpyPeer

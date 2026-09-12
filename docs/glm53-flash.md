@@ -80,8 +80,11 @@ count.
 
 ## Memory and speed
 
-Measured on the real checkpoint, 6 physical cores, 25 GB RAM, model on an
-ordinary disk:
+### CPU streaming baseline
+
+The following historical numbers were measured before the production
+device-resident HIP backend, on the real checkpoint, 6 physical cores, 25 GB
+RAM, and an ordinary disk:
 
 | | |
 |---|---|
@@ -97,8 +100,45 @@ touches 42 sparse layers × 8 experts × 14.2 MB = 4.8 GB. Measured with
 token** on this hardware: what the disk takes to deliver the bytes, with any CPU
 and any GPU. Faster silicon does not move it; fewer bytes would.
 
-That is also why the Vulkan path is offered for machines with enough VRAM to
-hold experts rather than as an accelerator here.
+That is also why GPU paths are most useful on machines with enough memory to
+hold a large expert working set.
+
+### Device-resident HIP text backend
+
+`GLM53_BACKEND=auto|gpu|cpu` selects one complete backend before a request:
+
+- `auto` uses the GPU only after context, capability, model, smoke-session, and
+  smoke-forward checks all pass, otherwise it selects CPU;
+- `gpu` makes any startup or capability failure fatal;
+- `cpu` never initializes HIP/CUDA.
+
+The GPU text path keeps embedding, four mHC residual streams, RMSNorms, KDA
+recurrent state/windows, paged MLA/indexer state, routing, shared/routed/dense
+FFNs, stream collapse, final norm, and LM head on one device. The host retains
+tokenization, sampling, expert file reads, and LRU metadata. Only selected
+expert IDs and final logits cross the production boundary; hidden activations
+do not.
+
+```bash
+make -C c glm53 HIP=1 HIP_ARCH=gfx942
+HSA_OVERRIDE_GFX_VERSION=9.4.2 GLM53_BACKEND=gpu \
+GLM53_EXPERT_GB=28 ./c/glm53 --model /path/to/glm53_i4 \
+  --prompt "The key insight about mixture of experts is" --greedy 64
+```
+
+Validated on one AMD Instinct MI350P (gfx950 exposed as gfx942), 154.6 GB HBM
+and 123 GB host RAM. The 64-token warm run measured 13.5 s/token, 56.3% expert
+hit rate, 151.59 GB expert bytes, and 84.4% mean GPU busy.
+
+This is not comparable to the earlier 1.4 s/token partial-HIP experiment:
+that older path ran experts and some resident matmuls on the GPU while KDA,
+MLA, routing, mHC, and activation flow remained CPU-side.
+
+The present expert cache is double-banked and keeps host copies of GPU slots.
+Automatic sizing attempted roughly 97 slots/layer and was OOM-killed on the
+123 GB host. The completing run used `GLM53_EXPERT_GB=28`, or 47 slots on each
+of 42 sparse layers. A larger host or removal of host mirrors is required for
+a matched-residency benchmark.
 
 ## Vision
 
@@ -152,6 +192,10 @@ measured from available memory when unset), `GLM53_MAX_IMAGE_TOKENS`,
 ## Tests
 
 ```
+HSA_OVERRIDE_GFX_VERSION=9.4.2 make -C c hip-test HIP_ARCH=gfx942
+taskset -c 0 make -C c test
+make -C c glm53-quality HIP=1 HIP_ARCH=gfx942
+
 python3 tools/make_glm53_multimodal_tiny.py --output ~/glm53_mm_tiny
 python3 tools/make_glm53_streaming_pair.py --fixture ~/glm53_mm_tiny --output ~/glm53_stream
 python3 tests/test_glm53_multimodal_tiny.py --binary ./glm53 --fixture ~/glm53_mm_tiny
@@ -162,6 +206,18 @@ python3 tests/test_glm53_vision_serve.py --binary ./glm53 --fixture ~/glm53_mm_t
 python3 tests/test_glm53_chat_template.py --template <model>/chat_template.jinja
 make VK=1 glm53 && python3 tests/test_glm53_vulkan.py --binary ./glm53 --fixture ~/glm53_mm_tiny
 ```
+
+`hip-test` includes the generic backend suite plus GLM-5.3 mHC, KDA,
+MLA/DSA, MoE, full-pipeline, and production request/startup integration.
+The real-checkpoint quality tool compares GPU against the complete CPU engine.
+On the MI350P run, mean NLL changed by `6.65e-6`; all numerical gates passed;
+four greedy tokens matched CPU on three prompts; and repeated GPU hashes were
+bitwise identical.
+
+The first quality attempt is retained as useful negative evidence. It produced
+GPU NLL around 73 because grouped `fmt=4` int4 was incorrectly decoded as a
+signed nibble. Production `fmt=4` is offset binary (`nibble - 8`, packed zero
+`0x88`); legacy `fmt=2` remains signed-nibble after its XOR conversion.
 
 The generators want transformers 5.16.1, pinned because an oracle written by a
 different version is a different oracle. Each test skips with the command that

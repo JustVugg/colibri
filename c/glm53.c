@@ -71,10 +71,16 @@
 #include "st.h"
 #include "quant.h"
 #include "tok.h"
+#include "glm53_gpu.h"
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
 static int g_vk_ready = 0;
 #endif
+#ifdef COLI_CUDA
+#include "backend_cuda.h"
+static int g_cuda_ready = 0;
+#endif
+static ColiGlm53GpuBackend g_glm53_gpu_backend;
 #include "compat.h"
 #include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
 #include <time.h>
@@ -649,7 +655,18 @@ typedef struct {
     float *kda_scratch;
     int filled;                           /* posizioni gia' in cache */
     int cap;
+#ifdef COLI_CUDA
+    ColiGlm53GpuSession *gpu;
+    int gpu_failed;
+#endif
 } GSession;
+
+typedef struct {
+    int kda_layer, mla_layer, dense_layer, moe_layer;
+    float *kda_output, *mla_output, *dense_output, *moe_output, *final_norm;
+} Glm53QualityCapture;
+
+static Glm53QualityCapture *g_glm53_quality_capture = NULL;
 
 typedef struct {
     Cfg c;
@@ -680,6 +697,9 @@ typedef struct {
     int has_vision;
     ColiVisionTower vision;
     ColiVisionBlock *vblocks;
+#ifdef COLI_CUDA
+    ColiGlm53GpuModel *gpu_model;
+#endif
 } GModel;
 
 static const float *load_f32(GModel *m, const char *fmt, ...) {
@@ -707,6 +727,54 @@ static int glm53_dense_bits(void) {
         exit(1);
     }
     return cached;
+}
+
+static ColiGlm53GpuMode glm53_backend_mode_from_env(void) {
+    ColiGlm53GpuMode mode;
+    const char *setting = getenv("GLM53_BACKEND");
+    if (setting && *setting) {
+        if (!coli_glm53_gpu_mode_parse(setting, &mode)) {
+            fprintf(stderr, "GLM53_BACKEND deve essere auto, gpu o cpu (dato: %s)\n", setting);
+            exit(2);
+        }
+        return mode;
+    }
+    setting = getenv("GLM53_HIP");
+    if (setting && *setting) return atoi(setting) ? COLI_GLM53_GPU_MODE_AUTO
+                                                  : COLI_GLM53_GPU_MODE_CPU;
+    return COLI_GLM53_GPU_MODE_AUTO;
+}
+
+#ifdef COLI_CUDA
+static int glm53_gpu_complete_probe(
+    ColiGpuContext *ctx, uint64_t required_caps) {
+    const uint64_t baseline =
+        required_caps & ~(uint64_t)COLI_GPU_CAP_PIPELINE;
+    return coli_gpu_context_probe(ctx, baseline) &&
+           (!(required_caps & COLI_GPU_CAP_PIPELINE) ||
+            coli_glm53_gpu_pipeline_probe(ctx)) &&
+           coli_gpu_context_probe(ctx, required_caps);
+}
+
+static ColiGlm53GpuOps glm53_gpu_ops(void) {
+    ColiGlm53GpuOps ops;
+    ops.context_create = coli_gpu_context_create;
+    ops.context_probe = glm53_gpu_complete_probe;
+    ops.context_destroy = coli_gpu_context_destroy;
+    return ops;
+}
+#endif
+
+static int glm53_backend_requires_gpu(void) {
+    return coli_glm53_gpu_backend_selected(&g_glm53_gpu_backend) == COLI_GLM53_BACKEND_GPU;
+}
+
+static int glm53_request_begin(void) {
+    return coli_glm53_gpu_backend_begin_request(&g_glm53_gpu_backend);
+}
+
+static void glm53_request_end(void) {
+    coli_glm53_gpu_backend_end_request(&g_glm53_gpu_backend);
 }
 
 /* Quantizza [rows, columns] f32 in int4 con una scala ogni `gs` colonne.
@@ -919,6 +987,20 @@ static void mv_rows(float *out, const Mat *w, const float *x, int row0, int rows
  * Il campo `vk` e' una cache dentro a una matrice che il resto del codice
  * tratta come sola lettura: da qui il cast, che riguarda solo lui. */
 static void mv(float *out, const Mat *w, const float *x) {
+#ifdef COLI_CUDA
+    if (g_cuda_ready && (w->fmt == 1 || w->fmt == 4)) {
+        Mat *mutable_w = (Mat *)w;
+        if (coli_cuda_matmul(
+                (ColiCudaTensor **)&mutable_w->vk, out, x,
+                w->fmt == 4 ? (const void *)w->q4 : (const void *)w->q8,
+                w->s, w->fmt, 1, w->columns, w->rows, 0, w->gs))
+            return;
+        if (glm53_backend_requires_gpu()) {
+            fprintf(stderr, "GLM53_BACKEND=gpu: HIP/CUDA matmul fallita\n");
+            exit(1);
+        }
+    }
+#endif
 #ifdef COLI_VULKAN
     if (g_vk_ready && (w->fmt == 1 || w->fmt == 4)) {
         Mat *mutable_w = (Mat *)w;
@@ -926,6 +1008,10 @@ static void mv(float *out, const Mat *w, const float *x) {
                            w->fmt == 4 ? (const void *)w->q4 : (const void *)w->q8,
                            w->s, w->fmt, 1, w->columns, w->rows, w->gs))
             return;
+        if (glm53_backend_requires_gpu()) {
+            fprintf(stderr, "GLM53_BACKEND=gpu: Vulkan matmul fallita\n");
+            exit(1);
+        }
     }
 #endif
     switch (w->fmt) {
@@ -1155,7 +1241,15 @@ typedef struct ERef {
 
 /* I sei pezzi non sono adiacenti nel file, ma non devono esserlo nemmeno in
  * memoria: expert_mats ci costruisce sopra solo tre viste in sola lettura. */
-typedef struct { int eid; uint8_t *piece[GLM53_EXPERT_PIECES]; uint8_t *own; uint64_t used; } Slot;
+typedef struct {
+    int eid;
+    uint8_t *piece[GLM53_EXPERT_PIECES];
+    uint8_t *own;
+    uint64_t used;
+#ifdef COLI_CUDA
+    ColiCudaTensor *gpu[3];              /* gate, up, down; mirrors this slot */
+#endif
+} Slot;
 typedef struct LCache { Slot *s; int n, cap; } LCache;
 
 /* Lunghezze e posizioni dei sei pezzi dentro allo slot. Gate e up sono
@@ -1228,6 +1322,54 @@ static double memory_available_gb(void) {
     return compat_mem_available_gb();
 }
 
+#ifdef COLI_CUDA
+/* The production expert cache is double-banked so a failed asynchronous
+ * publication cannot overwrite the active expert.  CPU cache sizing counts
+ * one logical image per slot; clamp that logical capacity against VRAM before
+ * allocating either side.  Keeping one quarter of currently free VRAM leaves
+ * room for the resident dense tensors, recurrent state, and request arena. */
+static int glm53_gpu_cache_capacity(
+    int requested, int sparse_layers, int64_t slot_bytes,
+    size_t free_bytes) {
+    if (requested < 1 || sparse_layers < 1 || slot_bytes < 1 ||
+        free_bytes < 4)
+        return 0;
+    const size_t expert_budget = free_bytes - free_bytes / 4u;
+    const double physical_slot =
+        2.0 * (double)sparse_layers * (double)slot_bytes;
+    int capacity = (int)((double)expert_budget / physical_slot);
+    if (capacity > requested) capacity = requested;
+    return capacity;
+}
+
+static int glm53_gpu_apply_cache_capacity(
+    GModel *m, size_t free_bytes) {
+    if (!m || !m->streaming) return 1;
+    const int sparse = m->c.n_layers - m->c.first_dense;
+    if (!m->ecache || sparse < 1) return 0;
+    int requested = m->ecache[m->c.first_dense].cap;
+    int capacity = glm53_gpu_cache_capacity(
+        requested, sparse, m->e_slot, free_bytes);
+    if (capacity < m->c.topk) return 0;
+    if (capacity >= requested) return 1;
+    for (int layer = m->c.first_dense; layer < m->c.n_layers; ++layer) {
+        LCache *cache = &m->ecache[layer];
+        if (cache->n != 0 || cache->cap != requested) return 0;
+        Slot *slots =
+            (Slot *)realloc(cache->s, (size_t)capacity * sizeof(*slots));
+        if (!slots) return 0;
+        cache->s = slots;
+        cache->cap = capacity;
+    }
+    if (getenv("GLM53_VERBOSE"))
+        fprintf(stderr,
+                "cache GPU: %d -> %d slot/layer "
+                "(%.1f GB VRAM liberi, doppio banco)\n",
+                requested, capacity, free_bytes / 1e9);
+    return 1;
+}
+#endif
+
 static void expert_cache_init(GModel *m) {
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_EXPERT_GB");
@@ -1280,6 +1422,15 @@ static Slot *slot_find(GModel *m, int layer, int eid) {
         }
     return NULL;
 }
+
+#ifdef COLI_CUDA
+static void expert_gpu_clear(Slot *slot) {
+    for (int p = 0; p < 3; p++) {
+        if (slot->gpu[p]) coli_cuda_tensor_free(slot->gpu[p]);
+        slot->gpu[p] = NULL;
+    }
+}
+#endif
 
 static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
     const ERef *ref = &m->eref[(size_t)layer * m->c.n_experts + eid];
@@ -1341,6 +1492,9 @@ static Slot *expert_slot(GModel *m, int layer, int eid) {
             if (cache->s[j].used < cache->s[lru].used) lru = j;
         slot = &cache->s[lru];
     }
+#ifdef COLI_CUDA
+    expert_gpu_clear(slot);
+#endif
     double t_read0 = now_s();
     expert_read(m, layer, eid, slot);
     m->t_disk += now_s() - t_read0;
@@ -1491,6 +1645,9 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                 victim = &cache->s[lru];
             }
             /* prenotato subito: cosi' la scelta successiva non lo ripesca */
+#ifdef COLI_CUDA
+            expert_gpu_clear(victim);
+#endif
             victim->used = ++m->clock;
             victim->eid = -1;
             slot_of[i] = (int)(victim - cache->s);
@@ -1506,6 +1663,93 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             expert_read(m, index, union_ids[base + i], &cache->s[slot_of[i]]);
         }
         m->t_disk += now_s() - t_batch0;  /* fuori dalla regione omp: e' il muro del batch */
+
+#ifdef COLI_CUDA
+        /* One grouped launch for the whole union: decode's top-8 becomes
+         * three kernels plus one H2D/D2H pair, instead of eight separately
+         * synchronized expert_mlp calls. The backend accepts at most 64
+         * experts per group; a larger prefill block takes the proven CPU path
+         * below rather than silently dropping the tail. */
+        int gpu_done = 0;
+        if (g_cuda_ready && here <= 64) {
+            ColiCudaTensor *gates[64], *ups[64], *downs[64];
+            int rows[64], total_rows = 0, uploads_ok = 1;
+
+            for (int i = 0; i < here; i++) {
+                Slot *slot = &cache->s[slot_of[i]];
+                Mat gate, up, down;
+                expert_mats(m, slot, &gate, &up, &down);
+                uploads_ok = uploads_ok
+                    && coli_cuda_tensor_upload_g(&slot->gpu[0], gate.q4, gate.s,
+                                                 gate.fmt, gate.columns, gate.rows, 0, gate.gs)
+                    && coli_cuda_tensor_upload_g(&slot->gpu[1], up.q4, up.s,
+                                                 up.fmt, up.columns, up.rows, 0, up.gs)
+                    && coli_cuda_tensor_upload_g(&slot->gpu[2], down.q4, down.s,
+                                                 down.fmt, down.columns, down.rows, 0, down.gs);
+                gates[i] = slot->gpu[0];
+                ups[i] = slot->gpu[1];
+                downs[i] = slot->gpu[2];
+                rows[i] = 0;
+                const int eid = union_ids[base + i];
+                for (int t = 0; t < tokens; t++)
+                    for (int k = 0; k < topk; k++)
+                        if (chosen[(size_t)t * topk + k] == eid) {
+                            rows[i]++;
+                            break;
+                        }
+                total_rows += rows[i];
+            }
+
+            float *gx = uploads_ok
+                ? malloc((size_t)total_rows * c->hidden * sizeof(float)) : NULL;
+            float *gy = uploads_ok
+                ? malloc((size_t)total_rows * c->hidden * sizeof(float)) : NULL;
+            int *token_of = uploads_ok
+                ? malloc((size_t)total_rows * sizeof(int)) : NULL;
+            if (gx && gy && token_of) {
+                int off = 0;
+                for (int i = 0; i < here; i++) {
+                    const int eid = union_ids[base + i];
+                    for (int t = 0; t < tokens; t++)
+                        for (int k = 0; k < topk; k++)
+                            if (chosen[(size_t)t * topk + k] == eid) {
+                                memcpy(gx + (size_t)off * c->hidden,
+                                       x + (size_t)t * c->hidden,
+                                       (size_t)c->hidden * sizeof(float));
+                                token_of[off++] = t;
+                                break;
+                            }
+                }
+
+                if (coli_cuda_expert_group(gates, ups, downs, rows, here, gy, gx)) {
+                    off = 0;
+                    for (int i = 0; i < here; i++) {
+                        const int eid = union_ids[base + i];
+                        for (int r = 0; r < rows[i]; r++, off++) {
+                            const int t = token_of[off];
+                            float scale = 0.0f;
+                            for (int k = 0; k < topk; k++)
+                                if (chosen[(size_t)t * topk + k] == eid) {
+                                    scale = weight[(size_t)t * topk + k];
+                                    break;
+                                }
+                            float *dst = out + (size_t)t * c->hidden;
+                            const float *src = gy + (size_t)off * c->hidden;
+                            for (int d = 0; d < c->hidden; d++)
+                                dst[d] += scale * src[d];
+                        }
+                    }
+                    gpu_done = 1;
+                }
+            }
+            free(token_of); free(gy); free(gx);
+        }
+        if (gpu_done) continue;
+        if (glm53_backend_requires_gpu()) {
+            fprintf(stderr, "GLM53_BACKEND=gpu: HIP/CUDA grouped expert path fallita\n");
+            exit(1);
+        }
+#endif
 
         /* Un esperto per volta, e per ognuno tutti i token che lo hanno
          * scelto. Nell'ordine opposto i suoi 12,6 MB di pesi verrebbero
@@ -1535,6 +1779,318 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     free(to_read); free(slot_of); free(union_ids);
     free(tmp); free(su); free(sg); free(weight); free(chosen);
 }
+
+#ifdef COLI_CUDA
+static ColiGlm53GpuWeightDesc glm53_gpu_weight(const Mat *mat) {
+    ColiGlm53GpuWeightDesc out;
+    memset(&out, 0, sizeof(out));
+    out.data = mat->fmt == 0 ? (const void *)mat->f :
+               mat->fmt == 1 ? (const void *)mat->q8 :
+                               (const void *)mat->q4;
+    out.scales = mat->s;
+    out.format = mat->fmt;
+    out.rows = mat->rows;
+    out.columns = mat->columns;
+    out.group_size = mat->gs;
+    return out;
+}
+
+static int glm53_gpu_load_expert(
+    void *user, int pipeline_layer, int expert_id, int *slot_index,
+    ColiGlm53GpuExpertDesc *out) {
+    GModel *m = (GModel *)user;
+    if (!m || !out || !slot_index || pipeline_layer < m->c.first_dense ||
+        pipeline_layer >= m->c.n_layers ||
+        expert_id < 0 || expert_id >= m->c.n_experts)
+        return 0;
+    Mat gate, up, down;
+    if (m->streaming) {
+        Slot *slot = expert_slot(m, pipeline_layer, expert_id);
+        if (!slot) return 0;
+        LCache *cache = &m->ecache[pipeline_layer];
+        *slot_index = (int)(slot - cache->s);
+        expert_mats(m, slot, &gate, &up, &down);
+    } else {
+        GLayer *layer = &m->layer[pipeline_layer];
+        gate = layer->eg[expert_id];
+        up = layer->eu[expert_id];
+        down = layer->ed[expert_id];
+        *slot_index = expert_id;
+    }
+    out->gate = glm53_gpu_weight(&gate);
+    out->up = glm53_gpu_weight(&up);
+    out->down = glm53_gpu_weight(&down);
+    return out->gate.format == 4 && out->up.format == 4 &&
+           out->down.format == 4;
+}
+
+static int glm53_gpu_model_from_loaded(
+    GModel *m, ColiGpuContext *ctx, int max_rows, int max_context) {
+    const Cfg *c = &m->c;
+    if (c->hc_mult != 4 || c->hc_iters != 20) return 0;
+    int nkda = 0, nmla = 0;
+    for (int i = 0; i < c->n_layers; ++i)
+        if (c->is_full[i]) nmla++; else nkda++;
+    const int ndense = c->first_dense;
+    const int nmoe = c->n_layers - c->first_dense;
+    if (!m->streaming) {
+        for (int i = c->first_dense; i < c->n_layers; ++i)
+            for (int expert = 0; expert < c->n_experts; ++expert)
+                if (m->layer[i].eg[expert].fmt != 4 ||
+                    m->layer[i].eu[expert].fmt != 4 ||
+                    m->layer[i].ed[expert].fmt != 4)
+                    return 0;
+    }
+    ColiGlm53GpuMhcSiteDesc *sites = (ColiGlm53GpuMhcSiteDesc *)calloc(
+        (size_t)2 * c->n_layers, sizeof(*sites));
+    ColiGlm53GpuKdaLayerDesc *kda = (ColiGlm53GpuKdaLayerDesc *)calloc(
+        (size_t)nkda, sizeof(*kda));
+    ColiGlm53GpuMlaLayerDesc *mla = (ColiGlm53GpuMlaLayerDesc *)calloc(
+        (size_t)nmla, sizeof(*mla));
+    ColiGlm53GpuDenseLayerDesc *dense =
+        (ColiGlm53GpuDenseLayerDesc *)calloc((size_t)ndense, sizeof(*dense));
+    ColiGlm53GpuMoeLayerDesc *moe =
+        (ColiGlm53GpuMoeLayerDesc *)calloc((size_t)nmoe, sizeof(*moe));
+    ColiGlm53GpuLayerDesc *layers = (ColiGlm53GpuLayerDesc *)calloc(
+        (size_t)c->n_layers, sizeof(*layers));
+    if (!sites || (nkda && !kda) || (nmla && !mla) ||
+        (ndense && !dense) || (nmoe && !moe) || !layers)
+        goto fail;
+    int ikda = 0, imla = 0, idense = 0, imoe = 0;
+    for (int i = 0; i < c->n_layers; ++i) {
+        GLayer *l = &m->layer[i];
+        sites[2 * i] = (ColiGlm53GpuMhcSiteDesc){
+            l->hc_attn_fn, l->hc_attn_base, l->hc_attn_scale, l->in_ln
+        };
+        sites[2 * i + 1] = (ColiGlm53GpuMhcSiteDesc){
+            l->hc_ffn_fn, l->hc_ffn_base, l->hc_ffn_scale, l->post_ln
+        };
+        layers[i].attention_site = 2 * i;
+        layers[i].ffn_site = 2 * i + 1;
+        if (c->is_full[i]) {
+            ColiGlm53GpuMlaLayerDesc *d = &mla[imla];
+            d->q_a_proj_weight = glm53_gpu_weight(&l->qa);
+            d->q_a_norm = l->qa_ln;
+            d->q_b_proj_weight = glm53_gpu_weight(&l->qb);
+            d->kv_a_proj_weight = glm53_gpu_weight(&l->kva);
+            d->kv_a_norm = l->kva_ln;
+            d->kv_b_key_weight = glm53_gpu_weight(&l->kvb_kt);
+            d->kv_b_value_weight = glm53_gpu_weight(&l->kvb_v);
+            d->o_proj_weight = glm53_gpu_weight(&l->o);
+            d->index_q_proj_weight = glm53_gpu_weight(&l->iwq);
+            d->index_k_proj_weight = glm53_gpu_weight(&l->iwk);
+            d->index_weight_proj_weight = glm53_gpu_weight(&l->iwp);
+            d->index_key_norm = l->ik_nw;
+            d->index_key_bias = l->ik_nb;
+            d->index_pool_ape = l->ikpa;
+            d->index_pool_gate_weight = glm53_gpu_weight(&l->ikpg);
+            layers[i].attention_kind = COLI_GLM53_GPU_ATTN_MLA;
+            layers[i].attention_index = imla++;
+        } else {
+            ColiGlm53GpuKdaLayerDesc *d = &kda[ikda];
+            d->q_proj_weight = glm53_gpu_weight(&l->kq);
+            d->k_proj_weight = glm53_gpu_weight(&l->kk);
+            d->v_proj_weight = glm53_gpu_weight(&l->kv);
+            d->o_proj_weight = glm53_gpu_weight(&l->ko);
+            d->gate_a_proj_weight = glm53_gpu_weight(&l->kga);
+            d->gate_b_proj_weight = glm53_gpu_weight(&l->kgb);
+            d->decay_a_proj_weight = glm53_gpu_weight(&l->kfa);
+            d->decay_b_proj_weight = glm53_gpu_weight(&l->kfb);
+            d->beta_proj_weight = glm53_gpu_weight(&l->kb);
+            d->conv = l->conv;
+            d->dt_bias = l->dt;
+            d->a_log = l->alog;
+            d->o_norm = l->onorm;
+            layers[i].attention_kind = COLI_GLM53_GPU_ATTN_KDA;
+            layers[i].attention_index = ikda++;
+        }
+        if (i < c->first_dense) {
+            dense[idense].gate = glm53_gpu_weight(&l->dg);
+            dense[idense].up = glm53_gpu_weight(&l->du);
+            dense[idense].down = glm53_gpu_weight(&l->dd);
+            layers[i].ffn_kind = COLI_GLM53_GPU_FFN_DENSE;
+            layers[i].ffn_index = idense++;
+        } else {
+            moe[imoe].router = l->router;
+            moe[imoe].correction_bias = l->rbias;
+            moe[imoe].shared_gate = glm53_gpu_weight(&l->rg);
+            moe[imoe].shared_up = glm53_gpu_weight(&l->ru);
+            moe[imoe].shared_down = glm53_gpu_weight(&l->rd);
+            layers[i].ffn_kind = COLI_GLM53_GPU_FFN_MOE;
+            layers[i].ffn_index = imoe++;
+        }
+    }
+    int cache_slots = c->n_experts;
+    if (m->streaming && nmoe > 0) {
+        cache_slots = m->ecache[c->first_dense].cap;
+        for (int i = c->first_dense + 1; i < c->n_layers; ++i)
+            if (m->ecache[i].cap < cache_slots)
+                cache_slots = m->ecache[i].cap;
+        if (cache_slots < c->topk) goto fail;
+    }
+    ColiGlm53GpuModelDesc desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.hidden_size = c->hidden;
+    desc.stream_count = c->hc_mult;
+    desc.vocab_size = c->vocab;
+    desc.max_prefill_rows = max_rows;
+    desc.max_context_tokens = max_context;
+    desc.norm_eps = c->eps;
+    desc.hc_eps = c->hc_eps;
+    desc.embedding = m->embed;
+    desc.final_norm = m->final_norm;
+    ColiGlm53GpuWeightDesc head = glm53_gpu_weight(&m->head);
+    desc.lm_head = head.data;
+    desc.lm_head_scales = head.scales;
+    desc.lm_head_format = head.format;
+    desc.lm_head_group_size = head.group_size;
+    desc.sites = sites;
+    desc.site_count = 2 * c->n_layers;
+    desc.kda_heads = c->kda_heads;
+    desc.kda_head_dim = c->kda_hd;
+    desc.kda_kernel = c->conv_k;
+    desc.kda_gate_lower_bound = c->gate_lb;
+    desc.kda_layers = kda;
+    desc.kda_layer_count = nkda;
+    desc.mla_heads = c->n_heads;
+    desc.mla_q_lora = c->q_lora;
+    desc.mla_kv_lora = c->kv_lora;
+    desc.mla_qk_nope = c->qk_nope;
+    desc.mla_qk_rope = c->qk_rope;
+    desc.mla_value_dim = c->v_head;
+    desc.mla_index_heads = c->index_nh;
+    desc.mla_index_dim = c->index_hd;
+    desc.mla_index_pool = c->index_kpool;
+    desc.mla_index_topk = c->index_topk;
+    desc.mla_index_select_tail = c->index_kpool_tail;
+    desc.mla_page_tokens = 64;
+    desc.mla_layers = mla;
+    desc.mla_layer_count = nmla;
+    desc.dense_intermediate = c->dense_inter;
+    desc.swiglu_limit = c->swiglu_limit;
+    desc.dense_layers = dense;
+    desc.dense_layer_count = ndense;
+    desc.moe_experts = c->n_experts;
+    desc.moe_topk = c->topk;
+    desc.moe_intermediate = c->moe_inter;
+    desc.moe_cache_slots = cache_slots;
+    desc.moe_group_size = 64;
+    desc.moe_normalize_topk = 1;
+    desc.moe_routed_scale = c->routed_scale;
+    desc.moe_swiglu_limit = c->swiglu_limit;
+    desc.moe_layers = moe;
+    desc.moe_layer_count = nmoe;
+    desc.layers = layers;
+    desc.layer_count = c->n_layers;
+    desc.expert_loader = glm53_gpu_load_expert;
+    desc.expert_loader_user = m;
+    int ok = coli_glm53_gpu_model_create(&m->gpu_model, ctx, &desc);
+    free(layers); free(moe); free(dense); free(mla); free(kda); free(sites);
+    return ok;
+fail:
+    free(layers); free(moe); free(dense); free(mla); free(kda); free(sites);
+    return 0;
+}
+
+typedef struct {
+    ColiGlm53GpuOps backend;
+    int (*model_from_loaded)(
+        GModel *m, ColiGpuContext *ctx, int max_rows, int max_context);
+    void (*model_destroy)(ColiGlm53GpuModel *model);
+    int (*session_create)(
+        ColiGlm53GpuSession **out, ColiGlm53GpuModel *model,
+        int max_context);
+    void (*session_destroy)(ColiGlm53GpuSession *session);
+    int (*forward)(
+        ColiGlm53GpuSession *session, const int *token_ids, int rows,
+        float *last_logits_host);
+    int (*inject_fault)(
+        ColiGpuContext *ctx, ColiGpuFaultPoint point, int occurrence);
+} Glm53GpuStartupOps;
+
+static Glm53GpuStartupOps glm53_gpu_startup_ops(void) {
+    Glm53GpuStartupOps ops;
+    ops.backend = glm53_gpu_ops();
+    ops.model_from_loaded = glm53_gpu_model_from_loaded;
+    ops.model_destroy = coli_glm53_gpu_model_destroy;
+    ops.session_create = coli_glm53_gpu_session_create;
+    ops.session_destroy = coli_glm53_gpu_session_destroy;
+    ops.forward = coli_glm53_gpu_forward;
+    ops.inject_fault = coli_gpu_context_inject_fault;
+    return ops;
+}
+
+/* One production startup transaction, shared by model loading and integration
+ * tests. The optional post-probe fault is a deterministic test seam: normal
+ * callers pass NONE, while tests can target real descriptor translation,
+ * model ownership, smoke-session creation, and smoke forward without having
+ * the complete-pipeline probe consume the fault first. */
+static int glm53_gpu_startup_loaded(
+    GModel *m, ColiGlm53GpuMode mode, const Glm53GpuStartupOps *ops,
+    int device, int max_rows, int max_context,
+    ColiGpuFaultPoint post_probe_fault, int fault_occurrence,
+    char *err, size_t err_cap) {
+    if (!m || !ops || !ops->model_from_loaded || !ops->model_destroy ||
+        !ops->session_create || !ops->session_destroy || !ops->forward ||
+        !ops->inject_fault)
+        return 0;
+    if (!coli_glm53_gpu_backend_select(
+            &g_glm53_gpu_backend, mode, ops->backend, device,
+            COLI_GLM53_GPU_REQUIRED_CAPS, err, err_cap)) {
+        g_cuda_ready = 0;
+        return 0;
+    }
+    if (coli_glm53_gpu_backend_selected(&g_glm53_gpu_backend) !=
+        COLI_GLM53_BACKEND_GPU) {
+        g_cuda_ready = 0;
+        return 1;
+    }
+
+    ColiGpuContext *ctx =
+        coli_glm53_gpu_backend_context(&g_glm53_gpu_backend);
+    ColiGlm53GpuSession *smoke = NULL;
+    size_t gpu_free_bytes = 0, gpu_total_bytes = 0;
+    float *smoke_logits =
+        (float *)malloc((size_t)m->c.vocab * sizeof(*smoke_logits));
+    const int smoke_token = 0;
+    int ready = smoke_logits != NULL &&
+        coli_gpu_context_memory_info(
+            ctx, &gpu_free_bytes, &gpu_total_bytes) &&
+        glm53_gpu_apply_cache_capacity(m, gpu_free_bytes);
+    (void)gpu_total_bytes;
+    if (ready && post_probe_fault != COLI_GPU_FAULT_NONE)
+        ready = ops->inject_fault(
+            ctx, post_probe_fault, fault_occurrence);
+    if (ready)
+        ready = ops->model_from_loaded(m, ctx, max_rows, max_context);
+    if (ready)
+        ready = ops->session_create(&smoke, m->gpu_model, max_context);
+    if (ready)
+        ready = ops->forward(smoke, &smoke_token, 1, smoke_logits);
+    ops->session_destroy(smoke);
+    free(smoke_logits);
+    if (ready) {
+        g_cuda_ready = 1;
+        return 1;
+    }
+
+    ops->model_destroy(m->gpu_model);
+    m->gpu_model = NULL;
+    coli_glm53_gpu_backend_destroy(&g_glm53_gpu_backend, ops->backend);
+    g_cuda_ready = 0;
+    if (mode == COLI_GLM53_GPU_MODE_GPU) {
+        if (err && err_cap)
+            snprintf(err, err_cap,
+                     "loaded model or smoke-session startup failed");
+        return 0;
+    }
+    coli_glm53_gpu_backend_init(&g_glm53_gpu_backend);
+    return coli_glm53_gpu_backend_select(
+        &g_glm53_gpu_backend, COLI_GLM53_GPU_MODE_CPU,
+        ops->backend, device, COLI_GLM53_GPU_REQUIRED_CAPS,
+        err, err_cap);
+}
+#endif
 
 /* ---------- caricamento ---------- */
 static void vision_load(GModel *m);
@@ -1688,11 +2244,13 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
         }
     }
     vision_load(m);
+    coli_glm53_gpu_backend_init(&g_glm53_gpu_backend);
 #ifdef COLI_VULKAN
     /* Il device si apre dopo i pesi: se non c'e', il motore continua sulla CPU
      * senza dire niente di piu' di una riga, perche' Vulkan qui e' un'opzione
      * e non un requisito. */
-    if (getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN"))) {
+    g_vk_ready = 0;
+    if (glm53_backend_requires_gpu() && getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN"))) {
         /* Il backend vuole il file qmatmul.spv e da li' ricava i fratelli.
          * COLI_VK_SHADERS puo' essere il file o la cartella che lo contiene,
          * come nel resto del progetto; senza, si guarda accanto al binario. */
@@ -1710,6 +2268,51 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
      * da quanto hanno gia' preso i pesi, e prima del ciclo sui layer non
      * l'avevano ancora preso. */
     if (m->streaming) expert_cache_init(m);
+    {
+        ColiGlm53GpuMode mode = glm53_backend_mode_from_env();
+#ifdef COLI_CUDA
+        const int complete_model =
+            load_io && layer_begin == 0 && layer_end == m->c.n_layers;
+        char err[256] = {0};
+        int device = 0;
+        const char *chunk_text = getenv("GLM53_PREFILL_CHUNK");
+        const char *context_text = getenv("GLM53_MAXT");
+        int max_rows = chunk_text ? atoi(chunk_text) : 128;
+        int max_context = context_text ? atoi(context_text) : 8192;
+        Glm53GpuStartupOps startup_ops = glm53_gpu_startup_ops();
+        if (!complete_model) mode = COLI_GLM53_GPU_MODE_CPU;
+        if (max_rows < 1) max_rows = 1;
+        if (max_context < max_rows) max_context = max_rows;
+        if (!glm53_gpu_startup_loaded(
+                m, mode, &startup_ops, device, max_rows, max_context,
+                COLI_GPU_FAULT_NONE, 0, err, sizeof(err))) {
+            fprintf(stderr, "GLM53_BACKEND=%s: %s\n",
+                    coli_glm53_gpu_mode_name(mode), err);
+            exit(1);
+        }
+        if (err[0])
+            fprintf(stderr, "GLM53_BACKEND=%s: backend %s (%s)\n",
+                    coli_glm53_gpu_mode_name(mode),
+                    coli_glm53_backend_name(
+                        coli_glm53_gpu_backend_selected(
+                            &g_glm53_gpu_backend)), err);
+        else
+            fprintf(stderr, "GLM53_BACKEND=%s: backend %s\n",
+                    coli_glm53_gpu_mode_name(mode),
+                    coli_glm53_backend_name(
+                        coli_glm53_gpu_backend_selected(
+                            &g_glm53_gpu_backend)));
+#else
+        if (mode == COLI_GLM53_GPU_MODE_GPU) {
+            fprintf(stderr, "GLM53_BACKEND=gpu richiesto, ma il binario non e' stato compilato con HIP/CUDA\n");
+            exit(1);
+        }
+        (void)coli_glm53_gpu_backend_select(
+            &g_glm53_gpu_backend, COLI_GLM53_GPU_MODE_CPU,
+            (ColiGlm53GpuOps){0}, -1, COLI_GLM53_GPU_REQUIRED_CAPS,
+            NULL, 0);
+#endif
+    }
 }
 
 /* ---------- vision ----------
@@ -1810,6 +2413,18 @@ static GSession *session_open(const GModel *m, int cap) {
     GSession *s = calloc(1, sizeof(*s));
     if (!s) { fprintf(stderr, "OOM sulla sessione\n"); exit(1); }
     s->cap = cap;
+#ifdef COLI_CUDA
+    if (glm53_backend_requires_gpu() && m->gpu_model) {
+        if (coli_glm53_gpu_session_create(&s->gpu, m->gpu_model, cap))
+            return s;
+        s->gpu_failed = 1;
+        coli_gpu_context_mark_unhealthy(
+            coli_glm53_gpu_backend_context(&g_glm53_gpu_backend));
+        (void)coli_glm53_gpu_backend_fail_request(&g_glm53_gpu_backend);
+        g_cuda_ready = 0;
+        return s;
+    }
+#endif
     s->layer = calloc((size_t)c->n_layers, sizeof(*s->layer));
     if (!s->layer) { fprintf(stderr, "OOM sugli stati di layer\n"); exit(1); }
     if (c->kda_proj)
@@ -1846,6 +2461,10 @@ static GSession *session_open(const GModel *m, int cap) {
 
 static void session_close(const GModel *m, GSession *s) {
     if (!s) return;
+#ifdef COLI_CUDA
+    coli_glm53_gpu_session_destroy(s->gpu);
+#endif
+    if (!s->layer) { free(s); return; }
     for (int i = 0; i < m->c.n_layers; i++) {
         GLayerState *st = &s->layer[i];
         free(st->latent); free(st->ikeys); free(st->igates);
@@ -1904,6 +2523,17 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
             /* Un solo paio di letture del clock per sito, il ramo dice a chi
              * va il tempo. */
             *(site ? &m->t_ffn : &m->t_attn) += now_s() - t_phase;
+            if (g_glm53_quality_capture) {
+                Glm53QualityCapture *q = g_glm53_quality_capture;
+                float *capture = NULL;
+                if (!site && i == q->kda_layer) capture = q->kda_output;
+                if (!site && i == q->mla_layer) capture = q->mla_output;
+                if (site && i == q->dense_layer) capture = q->dense_output;
+                if (site && i == q->moe_layer) capture = q->moe_output;
+                if (capture)
+                    memcpy(capture, branch + (size_t)(n - 1) * D,
+                           (size_t)D * sizeof(float));
+            }
             for (int t = 0; t < n; t++)
                 coli_hc_post(next + (size_t)t * H * D, branch + (size_t)t * D,
                              streams + (size_t)t * H * D, post + (size_t)t * H,
@@ -1929,6 +2559,14 @@ static void mat_release(Mat *mat) {
 
 static void model_release(GModel *m) {
     if (!m) return;
+#ifdef COLI_CUDA
+    coli_glm53_gpu_model_destroy(m->gpu_model);
+    m->gpu_model = NULL;
+    if (m->has_io)
+        coli_glm53_gpu_backend_destroy(
+            &g_glm53_gpu_backend, glm53_gpu_ops());
+    g_cuda_ready = 0;
+#endif
     if (m->layer) {
         for (int i = m->layer_begin; i < m->layer_end; i++) {
             GLayer *l = &m->layer[i];
@@ -2013,6 +2651,35 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
         fprintf(stderr, "contesto esaurito: %d posizioni su %d\n", start + n, s->cap);
         exit(1);
     }
+#ifdef COLI_CUDA
+    if (s->gpu_failed) return NULL;
+    if (s->gpu) {
+        if (vision || n_vision) {
+            fprintf(stderr,
+                    "la pipeline GPU testuale non accetta embedding vision\n");
+            coli_glm53_gpu_session_destroy(s->gpu);
+            s->gpu = NULL;
+            s->gpu_failed = 1;
+            (void)coli_glm53_gpu_backend_fail_request(
+                &g_glm53_gpu_backend);
+            g_cuda_ready = 0;
+            return NULL;
+        }
+        float *last = malloc((size_t)c->vocab * sizeof(float));
+        if (!last || !coli_glm53_gpu_forward(s->gpu, tokens, n, last)) {
+            free(last);
+            coli_glm53_gpu_session_destroy(s->gpu);
+            s->gpu = NULL;
+            s->gpu_failed = 1;
+            (void)coli_glm53_gpu_backend_fail_request(
+                &g_glm53_gpu_backend);
+            g_cuda_ready = 0;
+            return NULL;
+        }
+        s->filled = start + n;
+        return last;
+    }
+#endif
     const int H = c->hc_mult, D = c->hidden;
     float *streams = malloc((size_t)n * H * D * sizeof(float));
     float *next = malloc((size_t)n * H * D * sizeof(float));
@@ -2066,6 +2733,11 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
         }
     for (int t = 0; t < n; t++)
         rms(normed + (size_t)t * D, collapsed + (size_t)t * D, m->final_norm, D, c->eps);
+    if (g_glm53_quality_capture &&
+        g_glm53_quality_capture->final_norm)
+        memcpy(g_glm53_quality_capture->final_norm,
+               normed + (size_t)(n - 1) * D,
+               (size_t)D * sizeof(float));
 
     float *logits = malloc((size_t)n * c->vocab * sizeof(float));
     double t_head0 = now_s();
@@ -2102,6 +2774,16 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
     int chunk = setting ? atoi(setting) : 128;
     if (chunk < 1) chunk = 1;
     if (chunk > n) chunk = n;
+#ifdef COLI_CUDA
+    const int gpu_path = s->gpu != NULL;
+    if (gpu_path && keep_all) chunk = 1;
+    if (gpu_path && m->streaming && c->topk > 0) {
+        const int safe_rows = m->ecache[c->first_dense].cap / c->topk;
+        if (chunk > safe_rows) chunk = safe_rows;
+    }
+#else
+    const int gpu_path = 0;
+#endif
 
     float *all = keep_all ? malloc((size_t)n * c->vocab * sizeof(float)) : NULL;
     if (keep_all && !all) { fprintf(stderr, "OOM sui logit del prefill\n"); exit(1); }
@@ -2120,6 +2802,11 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
         float *part = forward_span(m, s, tokens + at, here,
                                    vision ? vision + (size_t)used_vision * c->hidden : NULL,
                                    mine);
+        if (!part) {
+            free(all);
+            free(last);
+            return NULL;
+        }
         used_vision += mine;
         if (keep_all) {
             memcpy(all + (size_t)at * c->vocab, part,
@@ -2128,7 +2815,7 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
         } else {
             free(last);
             last = part;
-            if (here > 1) {
+            if (here > 1 && !gpu_path) {
                 /* si tiene solo l'ultima riga */
                 float *tail = malloc((size_t)c->vocab * sizeof(float));
                 if (!tail) { fprintf(stderr, "OOM sui logit\n"); exit(1); }
@@ -2145,6 +2832,35 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
         exit(1);
     }
     return keep_all ? all : last;
+}
+
+/* Production request/session seam used by both CLI and SERVE. It is the sole
+ * owner of lazy session creation and failed-session release: after a GPU
+ * failure forward_span/session_open has poisoned the context and transitioned
+ * the backend, then this function releases the request session and clears the
+ * caller's handle. A later request through this same function therefore opens
+ * a fresh real CPU GSession and executes the complete CPU forward path. */
+static float *glm53_request_dispatch(
+    GModel *m, GSession **session, int cap, const int *tokens, int n,
+    const float *vision, int n_vision, int prefill, int keep_all) {
+    if (!m || !session || !tokens || n < 1 || cap < 1) return NULL;
+    if (!*session) *session = session_open(m, cap);
+#ifdef COLI_CUDA
+    if ((*session)->gpu_failed) {
+        session_close(m, *session);
+        *session = NULL;
+        return NULL;
+    }
+#endif
+    float *logits = prefill
+        ? forward_prefill(
+              m, *session, tokens, n, vision, n_vision, keep_all)
+        : forward_span(m, *session, tokens, n, vision, n_vision);
+    if (!logits) {
+        session_close(m, *session);
+        *session = NULL;
+    }
+    return logits;
 }
 
 /* Il passaggio senza sessione: apre, macina tutto, chiude. E' quello che usano
@@ -2549,6 +3265,11 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         return 0;
     }
     KVSlot *slot = &g_slots[q->slot];
+#ifdef COLI_CUDA
+    if (!glm53_backend_requires_gpu() && slot->session &&
+        slot->session->gpu)
+        slot_reset(m, slot);
+#endif
     const int room = g_slot_context;
     int *sequence = malloc((size_t)room * sizeof(int));
     if (!sequence) { serve_line("ERROR %llu BAD_REQUEST\n", q->id); return 0; }
@@ -2589,7 +3310,6 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         shared = cached;
     if (shared <= 0) {
         slot_reset(m, slot);
-        slot->session = session_open(m, room);
         shared = 0;
     }
     /* L'immagine annunciata per QUESTA richiesta, se c'e'. Il prefisso in
@@ -2609,7 +3329,6 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         }
         if (shared) {                             /* niente riuso con un'immagine */
             slot_reset(m, slot);
-            slot->session = session_open(m, room);
             shared = 0;
         }
         vision = vision_encode(m, g_pending.patches, g_pending.grid_h,
@@ -2617,10 +3336,24 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         pending_clear();
     }
 
+    if (!glm53_request_begin()) {
+        free(vision);
+        free(sequence);
+        serve_line("ERROR %llu BACKEND_NOT_READY\n", q->id);
+        return 0;
+    }
     const int reused = shared;
-    float *logits = forward_prefill(m, slot->session, sequence + shared,
-                                    total - shared, vision, n_vision, 0);
-    GSession *session = slot->session;
+    float *logits = glm53_request_dispatch(
+        m, &slot->session, room, sequence + shared, total - shared,
+        vision, n_vision, 1, 0);
+    if (!logits) {
+        free(vision);
+        glm53_request_end();
+        slot_reset(m, slot);
+        free(sequence);
+        serve_line("ERROR %llu GPU_BACKEND_FAILED\n", q->id);
+        return 0;
+    }
     int rows = 1, ctl = SERVE_CTL_NONE, input_eof = 0;
     for (int step = 0; step < budget; step++) {
         /* #1332: una guardata a stdin per token. Il costo e' una select con
@@ -2649,11 +3382,21 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         int written = tok_decode(tokenizer, &next, 1, piece, sizeof(piece) - 1);
         serve_data(q->id, piece, written);
         if (step + 1 == budget) { limited = 1; break; }
-        logits = forward_span(m, session, &next, 1, NULL, 0);
+        logits = glm53_request_dispatch(
+            m, &slot->session, room, &next, 1, NULL, 0, 0, 0);
+        if (!logits) {
+            free(vision);
+            glm53_request_end();
+            slot_reset(m, slot);
+            free(sequence);
+            serve_line("ERROR %llu GPU_BACKEND_FAILED\n", q->id);
+            return input_eof ? -1 : 0;
+        }
         rows = 1;
     }
     free(logits);
     free(vision);
+    glm53_request_end();
     /* La sessione resta allo slot per il turno dopo, con la sequenza che ha
      * davvero macinato: prompt piu' quello che ha generato. */
     slot_remember(slot, sequence, total);
@@ -2864,7 +3607,13 @@ int main(int argc, char **argv) {
         const char *batch = getenv("SERVE_BATCH");
         arm_stops(snap, &serve_tok, batch && atoi(batch));
         serve_loop(&served, &serve_tok);
+        for (int i = 0; i < g_n_slots; ++i) {
+            slot_reset(&served, &g_slots[i]);
+            free(g_slots[i].tokens);
+            memset(&g_slots[i], 0, sizeof(g_slots[i]));
+        }
         tok_free(&serve_tok);
+        model_release(&served);
         return 0;
     }
 
@@ -2944,9 +3693,31 @@ int main(int argc, char **argv) {
 
     /* Una sola sessione per tutta la generazione: il prompt si prefilla una
      * volta e ogni token dopo costa un token, non tutto il prefisso. */
-    GSession *session = session_open(&model, count + (greedy > 0 ? greedy : 0) + 1);
+    if (!glm53_request_begin()) {
+        fprintf(stderr, "backend non selezionato prima della richiesta\n");
+        if (has_tokenizer) tok_free(&tokenizer);
+        free(vision);
+        free(tokens);
+        model_release(&model);
+        return 1;
+    }
+    GSession *session = NULL;
+    const int session_cap =
+        count + (greedy > 0 ? greedy : 0) + 1;
     const double prefill_start = now_s();
-    float *logits = forward_prefill(&model, session, tokens, count, vision, n_vision, 1);
+    float *logits = glm53_request_dispatch(
+        &model, &session, session_cap, tokens, count,
+        vision, n_vision, 1, 1);
+    if (!logits) {
+        fprintf(stderr, "richiesta GPU fallita; nessun logit valido\n");
+        session_close(&model, session);
+        glm53_request_end();
+        if (has_tokenizer) tok_free(&tokenizer);
+        free(vision);
+        free(tokens);
+        model_release(&model);
+        return 1;
+    }
     if (getenv("GLM53_VERBOSE"))
         fprintf(stderr, "caricamento %.1fs, prefill %d token in %.1fs\n",
                 load_seconds, count, now_s() - prefill_start);
@@ -2990,7 +3761,20 @@ int main(int argc, char **argv) {
             }
             /* Il token nuovo non e' mai un segnaposto immagine: la torre ha
              * gia' dato i suoi embedding durante il prefill. */
-            logits = forward_span(&model, session, &next, 1, NULL, 0);
+            logits = glm53_request_dispatch(
+                &model, &session, session_cap, &next, 1,
+                NULL, 0, 0, 0);
+            if (!logits) {
+                fprintf(stderr,
+                        "richiesta GPU fallita durante la generazione\n");
+                session_close(&model, session);
+                glm53_request_end();
+                if (has_tokenizer) tok_free(&tokenizer);
+                free(vision);
+                free(tokens);
+                model_release(&model);
+                return 1;
+            }
             rows = 1;
             produced++;
         }
@@ -3006,10 +3790,27 @@ int main(int argc, char **argv) {
     if (model.streaming)
         printf("experts hits %ld miss %ld bytes %llu\n",
                model.hits, model.miss, (unsigned long long)model.ebytes);
+#ifdef COLI_CUDA
+    if (g_cuda_ready && getenv("GLM53_VERBOSE")) {
+        uint64_t calls = 0, experts = 0, rows = 0;
+        double h2d = 0.0, kernel = 0.0, d2h = 0.0;
+        coli_cuda_group_stats(
+            &calls, &experts, &rows, &h2d, &kernel, &d2h
+        );
+        printf("HIP groups %llu experts %llu rows %llu: "
+               "H2D %.1fms kernels %.1fms D2H %.1fms\n",
+               (unsigned long long)calls,
+               (unsigned long long)experts,
+               (unsigned long long)rows,
+               h2d, kernel, d2h);
+    }
+#endif
     free(logits);
     session_close(&model, session);
     free(vision);
+    glm53_request_end();
     free(tokens);
+    model_release(&model);
     return 0;
 }
 #endif /* GLM53_NO_MAIN */

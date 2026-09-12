@@ -17,7 +17,11 @@
 #include <cstring>
 #include <cerrno>
 #include <chrono>
+#include <climits>
+#include <cmath>
+#include <atomic>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #if defined(__linux__)
@@ -159,6 +163,269 @@ static int select_ctx(DeviceContext *ctx) {
     if (!cuda_ok(cudaSetDevice(ctx->device), "select device")) return 0;
     g_current_device = ctx->device;
     return 1;
+}
+
+struct ColiGpuContext {
+    int device;
+    cudaStream_t stream;
+    cudaStream_t upload_stream;
+    int clock_rate_khz;
+    uint64_t caps;
+    int healthy;
+    ColiGpuFaultPoint fault_point;
+    int fault_occurrence;
+    int fault_seen;
+    ColiGpuTelemetry telemetry;
+};
+
+struct ColiGpuTensor {
+    ColiGpuContext *ctx;
+    void *data;
+    float *scales;
+    size_t data_bytes;
+    size_t scale_count;
+    int format;
+    int rows;
+    int columns;
+    int group_size;
+    int groups;
+};
+
+struct ColiGpuArena {
+    ColiGpuContext *ctx;
+    unsigned char *data;
+    size_t capacity;
+};
+
+struct ColiGpuRouter {
+    ColiGpuContext *ctx;
+    ColiGpuRouteConfig config;
+    int max_rows;
+    int rows;
+    float *scores;
+    float *choices;
+    int *selected;
+    float *weights;
+    void *allocation;
+    int *host_selected;
+    volatile int *host_status;
+    int *device_status;
+};
+
+typedef struct ColiGpuExpertTransfer {
+    unsigned char *host_staging;
+    cudaEvent_t ready;
+    int published;
+    struct ColiGpuExpertTransfer *next;
+} ColiGpuExpertTransfer;
+
+typedef struct {
+    unsigned char *allocation;
+    void *gate_data;
+    float *gate_scales;
+    void *up_data;
+    float *up_scales;
+    void *down_data;
+    float *down_scales;
+    cudaEvent_t use_done;
+    int use_recorded;
+} ColiGpuExpertBank;
+
+typedef struct {
+    ColiGpuExpertBank *bank;
+    ColiGpuExpertTransfer *publication;
+} ColiGpuExpertSnapshot;
+
+typedef struct {
+    ColiGpuExpertBank bank[2];
+    int active_bank;
+    int expert_id;
+    uint64_t generation;
+    int published;
+    ColiGpuExpertTransfer *publication;
+} ColiGpuExpertSlot;
+
+struct ColiGpuExpertCache {
+    ColiGpuContext *ctx;
+    ColiGpuExpertCacheConfig config;
+    ColiGpuExpertSlot *slots;
+    ColiGpuExpertSnapshot *snapshots;
+    size_t snapshot_capacity;
+    size_t gate_data_bytes;
+    size_t gate_scale_bytes;
+    size_t down_data_bytes;
+    size_t down_scale_bytes;
+    size_t bank_bytes;
+    ColiGpuExpertFaultPoint fault;
+    int fault_occurrence;
+    unsigned test_delay_ms;
+    std::atomic<int> test_hold_snapshot;
+    std::atomic<int> test_snapshot_entered;
+    ColiGpuExpertTransfer *transfers;
+    std::mutex mutex;
+    int healthy;
+    volatile int *host_status;
+    int *device_status;
+};
+
+struct ColiGpuKdaState {
+    ColiGpuContext *ctx;
+    ColiGpuArena *arena;
+    size_t state_offset;
+    size_t window_offset;
+    ColiGpuKdaConfig config;
+    int position;
+};
+
+typedef struct {
+    float *latent;
+    float *index_keys;
+    float *index_gates;
+    void *allocation;
+} ColiGpuMlaPage;
+
+struct ColiGpuMlaState {
+    ColiGpuContext *ctx;
+    ColiGpuMlaConfig config;
+    ColiGpuMlaPage *pages;
+    ColiGpuMlaPage *device_pages;
+    int page_count;
+    int page_table_capacity;
+    int max_pages;
+    int length;
+    int capacity;
+    uint64_t payload_copy_bytes;
+    ColiGpuMlaFaultPoint fault_point;
+    int fault_occurrence;
+    int fault_seen;
+    volatile int *host_status;
+    int *device_status;
+    ColiGpuMlaLaunchInfo launch_info;
+};
+
+static int select_device_ordinal(int device) {
+    if (g_current_device == device) return 1;
+    if (!cuda_ok(cudaSetDevice(device), "select device")) return 0;
+    g_current_device = device;
+    return 1;
+}
+
+extern "C" int coli_gpu_context_create(ColiGpuContext **out, int device) {
+    int available = 0;
+    cudaDeviceProp prop{};
+    ColiGpuContext *ctx = nullptr;
+    if (!out) return 0;
+    *out = nullptr;
+    if (!cuda_ok(cudaGetDeviceCount(&available), "device discovery")) return 0;
+    if (device < 0 || device >= available) {
+        std::fprintf(stderr, "[CUDA] invalid device %d (available: 0..%d)\n",
+                     device, available - 1);
+        return 0;
+    }
+    if (!select_device_ordinal(device)) return 0;
+    if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) return 0;
+    ctx = static_cast<ColiGpuContext *>(std::calloc(1, sizeof(*ctx)));
+    if (!ctx) return 0;
+    ctx->device = device;
+    ctx->clock_rate_khz = prop.clockRate;
+    ctx->caps = COLI_GPU_CAP_STREAM_ORDERED |
+                COLI_GPU_CAP_INT4_GS64;
+    ctx->healthy = 1;
+    if (!cuda_ok(cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking),
+                 "context stream creation")) {
+        std::free(ctx);
+        return 0;
+    }
+    if (!cuda_ok(cudaStreamCreateWithFlags(
+            &ctx->upload_stream, cudaStreamNonBlocking),
+            "context upload stream creation")) {
+        (void)cudaStreamDestroy(ctx->stream);
+        std::free(ctx);
+        return 0;
+    }
+    *out = ctx;
+    return 1;
+}
+
+extern "C" int coli_gpu_context_probe(ColiGpuContext *ctx, uint64_t required_caps) {
+    if (!ctx || !ctx->healthy) return 0;
+    if ((required_caps & ~ctx->caps) != 0) return 0;
+    return 1;
+}
+
+extern "C" int coli_gpu_context_healthy(const ColiGpuContext *ctx) {
+    return ctx && ctx->healthy;
+}
+
+extern "C" int coli_gpu_context_memory_info(
+    ColiGpuContext *ctx, size_t *free_bytes, size_t *total_bytes) {
+    return ctx && ctx->healthy && free_bytes && total_bytes &&
+           select_device_ordinal(ctx->device) &&
+           cuda_ok(cudaMemGetInfo(free_bytes, total_bytes),
+                   "context memory info");
+}
+
+extern "C" int coli_gpu_context_inject_fault(
+    ColiGpuContext *ctx, ColiGpuFaultPoint point, int occurrence) {
+    if (!ctx || !ctx->healthy || point <= COLI_GPU_FAULT_NONE ||
+        point > COLI_GPU_FAULT_STREAM_SYNC || occurrence < 0)
+        return 0;
+    ctx->fault_point = point;
+    ctx->fault_occurrence = occurrence;
+    ctx->fault_seen = 0;
+    return 1;
+}
+
+extern "C" int coli_gpu_context_consume_fault(
+    ColiGpuContext *ctx, ColiGpuFaultPoint point) {
+    if (!ctx || ctx->fault_point != point) return 0;
+    if (ctx->fault_seen++ != ctx->fault_occurrence) return 0;
+    ctx->fault_point = COLI_GPU_FAULT_NONE;
+    ctx->fault_seen = 0;
+    return 1;
+}
+
+extern "C" int coli_gpu_context_sync(ColiGpuContext *ctx) {
+    if (!ctx || !ctx->healthy) return 0;
+    if (coli_gpu_context_consume_fault(ctx, COLI_GPU_FAULT_STREAM_SYNC)) {
+        ctx->healthy = 0;
+        return 0;
+    }
+    if (!select_device_ordinal(ctx->device)) {
+        ctx->healthy = 0;
+        return 0;
+    }
+    if (!cuda_ok(cudaStreamSynchronize(ctx->stream), "context stream synchronize")) {
+        ctx->healthy = 0;
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" void coli_gpu_context_mark_unhealthy(ColiGpuContext *ctx) {
+    if (ctx) ctx->healthy = 0;
+}
+
+extern "C" int coli_gpu_context_advertise_pipeline(ColiGpuContext *ctx) {
+    if (!ctx || !ctx->healthy) return 0;
+    ctx->caps |= COLI_GPU_CAP_PIPELINE;
+    return 1;
+}
+
+extern "C" void coli_gpu_context_telemetry(const ColiGpuContext *ctx,
+                                            ColiGpuTelemetry *out) {
+    if (!out) return;
+    if (ctx) *out = ctx->telemetry;
+    else std::memset(out, 0, sizeof(*out));
+}
+
+extern "C" void coli_gpu_context_destroy(ColiGpuContext *ctx) {
+    if (!ctx) return;
+    if (select_device_ordinal(ctx->device)) {
+        if (ctx->upload_stream) (void)cudaStreamDestroy(ctx->upload_stream);
+        if (ctx->stream) (void)cudaStreamDestroy(ctx->stream);
+    }
+    std::free(ctx);
 }
 
 /* fmt=6 (E8/IQ3) geometry, mirroring quant.h. A super-block packs 256 weights
@@ -306,9 +573,15 @@ __device__ static float weight_at(const void *weights, int fmt, size_t row, int 
     if (fmt == 0) return reinterpret_cast<const float *>(base)[i];
     if (fmt == 1) return static_cast<float>(reinterpret_cast<const int8_t *>(base)[i]);
     const uint8_t *q = base;
-    if (fmt == 2 || fmt == 4) {                               /* fmt=4: same nibble layout */
+    if (fmt == 2) { /* per-row int4 after offset_to_signed_s4 XOR 0x88 */
         uint8_t v = q[i >> 1];
-        int n=(i&1)?(v>>4):(v&15); return static_cast<float>(n&8?n-16:n);
+        int n = (i & 1) ? (v >> 4) : (v & 15);
+        return static_cast<float>(n & 8 ? n - 16 : n);
+    }
+    if (fmt == 4) { /* Colibri grouped int4 stores level + 8 (0..15). */
+        uint8_t v = q[i >> 1];
+        int n = (i & 1) ? (v >> 4) : (v & 15);
+        return static_cast<float>(n - 8);
     }
     if (fmt == 3) {                                           /* int2 */
         uint8_t v = q[i >> 2];
@@ -627,6 +900,16 @@ __global__ static void silu_mul(float *gate, const float *up, size_t n) {
     }
 }
 
+__global__ static void swiglu_clamped_kernel(
+    float *gate, const float *up, size_t n, float limit) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = fminf(gate[i], limit);
+        float u = fmaxf(-limit, fminf(up[i], limit));
+        gate[i] = (g / (1.0f + expf(-g))) * u;
+    }
+}
+
 /* Four warps share one A tile and compute 16x64 outputs.  This matters for
  * prefill: the first prototype reloaded/converter A once per 16 output cols. */
 __global__ static void w4a16_matmul(float *y,const float *x,const uint8_t *w,
@@ -849,7 +1132,8 @@ __global__ static void grouped_down_w4(float *y,const float *x,const GroupDesc *
  * straddles a group). gs<=0 degrades to per-row (ng=1), so mixed fmt2/fmt4
  * groups run correctly through this one kernel family. */
 __global__ static void grouped_hidden_g4_dual(float *gate,float *up,const float *x,
-                                              const GroupDesc *desc,int I,int D){
+                                              const GroupDesc *desc,int I,int D,
+                                              float swiglu_limit){
     int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
     const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*((D+1)/2);
     const uint8_t *ur=(const uint8_t*)d.u+(size_t)o*((D+1)/2);
@@ -867,6 +1151,10 @@ __global__ static void grouped_hidden_g4_dual(float *gate,float *up,const float 
      * applied inside the accumulation, so silu runs on the raw sums) */
     if(!threadIdx.x){size_t z=(size_t)(d.offset+s)*I+o;
         float g=gp[0],u=upv[0];
+        if(swiglu_limit>0.0f){
+            g=fminf(g,swiglu_limit);
+            u=fminf(fmaxf(u,-swiglu_limit),swiglu_limit);
+        }
         gate[z]=(g/(1.0f+expf(-g)))*u;(void)up;}
 }
 __global__ static void grouped_down_g4(float *y,const float *x,const GroupDesc *desc,int D,int I){
@@ -1032,8 +1320,18 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
     float local=-3.402823466e+38F;for(int t=tid;t<nt;t+=blockDim.x)local=fmaxf(local,scores[t]);
     red[tid]=local;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]=fmaxf(red[tid],red[tid+n]);__syncthreads();}
-    float mx=red[0];local=0;for(int t=tid;t<nt;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
-    __syncthreads(); /* every warp must read red[0] above before red[] is reused below */
+#ifdef COLI_ABSORB_RACE_STRESS
+    if(!tid)red[blockDim.x-1]=(float)((clock64()>>10)&1ull);__syncthreads();
+    int delay_first=(int)red[blockDim.x-1];
+    if((delay_first&&tid<warpSize)||(!delay_first&&tid>=warpSize)){
+        unsigned long long until=clock64()+100000ull;while(clock64()<until){}
+    }
+    float mx=((volatile float *)red)[0];
+#else
+    float mx=red[0];
+#endif
+    local=0;for(int t=tid;t<nt;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
+    __syncthreads(); /* all waves must read the maximum before red[] is reused */
     red[tid]=local;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
     float inv=1.f/red[0];for(int t=tid;t<nt;t+=blockDim.x)scores[t]*=inv;
@@ -1068,8 +1366,18 @@ __global__ static void attention_absorb_ragged_kernel(float *ctx,const float *q,
     float local=-3.402823466e+38F;for(int t=tid;t<nt;t+=blockDim.x)local=fmaxf(local,scores[t]);
     red[tid]=local;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]=fmaxf(red[tid],red[tid+n]);__syncthreads();}
-    float mx=red[0];local=0;for(int t=tid;t<nt;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
-    __syncthreads(); /* every warp must read red[0] above before red[] is reused below */
+#ifdef COLI_ABSORB_RACE_STRESS
+    if(!tid)red[blockDim.x-1]=(float)((clock64()>>10)&1ull);__syncthreads();
+    int delay_first=(int)red[blockDim.x-1];
+    if((delay_first&&tid<warpSize)||(!delay_first&&tid>=warpSize)){
+        unsigned long long until=clock64()+100000ull;while(clock64()<until){}
+    }
+    float mx=((volatile float *)red)[0];
+#else
+    float mx=red[0];
+#endif
+    local=0;for(int t=tid;t<nt;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
+    __syncthreads(); /* all waves must read the maximum before red[] is reused */
     red[tid]=local;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
     float inv=1.f/red[0];for(int t=tid;t<nt;t+=blockDim.x)scores[t]*=inv;
@@ -1983,7 +2291,9 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
         /* grouped-int4 (fmt=4) present: per-group scales (#334). fmt=2 members
          * ride along as the ng=1 special case. silu fused in the dual epilogue. */
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
-        grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        const char *limit_env=getenv("COLI_SWIGLU_LIMIT");
+        float swiglu_limit=limit_env?(float)atof(limit_env):0.0f;
+        grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D,swiglu_limit);
         grouped_down_g4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else{
         /* generic path decodes fmt 0/1/2/3 only — refuse everything else rather
@@ -2138,7 +2448,9 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         /* silu is fused in the dual kernel's epilogue (like the sync path):
          * an extra silu_mul here would re-apply it against the never-written
          * ctx->up buffer. */
-        grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        const char *limit_env=getenv("COLI_SWIGLU_LIMIT");
+        float swiglu_limit=limit_env?(float)atof(limit_env):0.0f;
+        grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D,swiglu_limit);
         grouped_down_g4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     } else {
         /* Fallback runs quant_matmul with gs=0,ng=1 — per-row-scale semantics.
@@ -2527,6 +2839,3420 @@ extern "C" size_t coli_cuda_tensor_vram(const ColiCudaTensor *tensor) {
 
 extern "C" int coli_cuda_tensor_device(const ColiCudaTensor *tensor) {
     return tensor ? tensor->device : -1;
+}
+
+/* ==== explicit-context resident core =====================================
+ * Unlike the older pipe helpers below, these objects are tied to the
+ * ColiGpuContext stream. Their only host synchronization points are upload,
+ * download, and explicit context sync. */
+
+static int gpu_range_ok(const ColiGpuArena *arena, size_t offset, size_t bytes) {
+    return arena && offset <= arena->capacity && bytes <= arena->capacity - offset;
+}
+
+static int gpu_ranges_overlap(size_t a_offset, size_t a_bytes,
+                              size_t b_offset, size_t b_bytes) {
+    if (a_offset <= b_offset) return b_offset - a_offset < a_bytes;
+    return a_offset - b_offset < b_bytes;
+}
+
+__host__ __device__ static size_t gpu_tensor_row_bytes(int format, int columns) {
+    if (format == 0) return (size_t)columns * sizeof(float);
+    if (format == 1) return (size_t)columns;
+    if (format == 2 || format == 4) return (size_t)(columns + 1) / 2;
+    return 0;
+}
+
+static int gpu_tensor_same_context(const ColiGpuArena *arena,
+                                   const ColiGpuTensor *tensor) {
+    return arena && tensor && arena->ctx == tensor->ctx;
+}
+
+extern "C" int coli_gpu_tensor_create(ColiGpuTensor **out,
+                                       ColiGpuContext *ctx,
+                                       const ColiGpuTensorDesc *desc) {
+    if (!out) return 0;
+    *out = nullptr;
+    if (!ctx || !ctx->healthy || !desc || !desc->data ||
+        desc->rows < 1 || desc->columns < 1 ||
+        (desc->format != 0 && desc->format != 1 &&
+         desc->format != 2 && desc->format != 4) ||
+        (desc->format == 4 && desc->group_size < 1) ||
+        (desc->format != 4 && desc->group_size != 0))
+        return 0;
+    if (!select_device_ordinal(ctx->device)) return 0;
+    size_t row = gpu_tensor_row_bytes(desc->format, desc->columns);
+    if (!row || (size_t)desc->rows > SIZE_MAX / row) return 0;
+    if (desc->format == 0) {
+        size_t count = (size_t)desc->rows * (size_t)desc->columns;
+        const float *values = static_cast<const float *>(desc->data);
+        for (size_t i = 0; i < count; ++i)
+            if (!std::isfinite(values[i])) return 0;
+    } else {
+        int groups = desc->format == 4
+            ? (desc->columns + desc->group_size - 1) / desc->group_size : 1;
+        size_t count = (size_t)desc->rows * (size_t)groups;
+        if (!desc->scales) return 0;
+        for (size_t i = 0; i < count; ++i)
+            if (!std::isfinite(desc->scales[i])) return 0;
+    }
+    ColiGpuTensor *tensor =
+        static_cast<ColiGpuTensor *>(std::calloc(1, sizeof(*tensor)));
+    if (!tensor) return 0;
+    tensor->ctx = ctx;
+    tensor->format = desc->format;
+    tensor->rows = desc->rows;
+    tensor->columns = desc->columns;
+    tensor->group_size = desc->group_size;
+    tensor->groups = desc->format == 4
+        ? (desc->columns + desc->group_size - 1) / desc->group_size : 1;
+    tensor->data_bytes = (size_t)desc->rows * row;
+    tensor->scale_count = desc->format == 0 ? 0 :
+        (size_t)desc->rows * tensor->groups;
+    if (!cuda_ok(cudaMalloc(&tensor->data, tensor->data_bytes),
+                 "resident tensor allocation")) {
+        std::free(tensor);
+        return 0;
+    }
+    ctx->telemetry.device_allocations++;
+    if (!cuda_ok(cudaMemcpyAsync(tensor->data, desc->data, tensor->data_bytes,
+                                 cudaMemcpyHostToDevice, ctx->stream),
+                 "resident tensor upload")) {
+        cudaFree(tensor->data);
+        std::free(tensor);
+        return 0;
+    }
+    ctx->telemetry.h2d_copies++;
+    ctx->telemetry.h2d_bytes += tensor->data_bytes;
+    if (tensor->scale_count) {
+        if (!desc->scales ||
+            !cuda_ok(cudaMalloc(&tensor->scales,
+                                tensor->scale_count * sizeof(float)),
+                     "resident tensor scales allocation")) {
+            cudaFree(tensor->data);
+            std::free(tensor);
+            return 0;
+        }
+        ctx->telemetry.device_allocations++;
+        if (!cuda_ok(cudaMemcpyAsync(tensor->scales, desc->scales,
+                                     tensor->scale_count * sizeof(float),
+                                     cudaMemcpyHostToDevice, ctx->stream),
+                     "resident tensor scales upload")) {
+            cudaFree(tensor->scales);
+            cudaFree(tensor->data);
+            std::free(tensor);
+            return 0;
+        }
+        ctx->telemetry.h2d_copies++;
+        ctx->telemetry.h2d_bytes += tensor->scale_count * sizeof(float);
+    }
+    if (!coli_gpu_context_sync(ctx)) {
+        if (tensor->scales) cudaFree(tensor->scales);
+        cudaFree(tensor->data);
+        std::free(tensor);
+        return 0;
+    }
+    *out = tensor;
+    return 1;
+}
+
+extern "C" void coli_gpu_tensor_destroy(ColiGpuTensor *tensor) {
+    if (!tensor) return;
+    ColiGpuContext *ctx = tensor->ctx;
+    if (ctx && select_device_ordinal(ctx->device)) {
+        if (tensor->scales) cudaFree(tensor->scales);
+        if (tensor->data) cudaFree(tensor->data);
+    }
+    std::free(tensor);
+}
+
+extern "C" int coli_gpu_arena_create(ColiGpuArena **out,
+                                      ColiGpuContext *ctx,
+                                      size_t capacity) {
+    if (!out) return 0;
+    *out = nullptr;
+    if (!ctx || !ctx->healthy || !capacity ||
+        !select_device_ordinal(ctx->device))
+        return 0;
+    ColiGpuArena *arena =
+        static_cast<ColiGpuArena *>(std::calloc(1, sizeof(*arena)));
+    if (!arena) return 0;
+    arena->ctx = ctx;
+    arena->capacity = capacity;
+    if (!cuda_ok(cudaMalloc(&arena->data, capacity),
+                 "resident arena allocation")) {
+        std::free(arena);
+        return 0;
+    }
+    ctx->telemetry.device_allocations++;
+    *out = arena;
+    return 1;
+}
+
+extern "C" void coli_gpu_arena_destroy(ColiGpuArena *arena) {
+    if (!arena) return;
+    if (arena->ctx && select_device_ordinal(arena->ctx->device) && arena->data)
+        cudaFree(arena->data);
+    std::free(arena);
+}
+
+extern "C" size_t coli_gpu_arena_capacity(const ColiGpuArena *arena) {
+    return arena ? arena->capacity : 0;
+}
+
+extern "C" int coli_gpu_arena_upload(ColiGpuArena *arena, size_t offset,
+                                      const void *src, size_t bytes) {
+    if (!src || !bytes || !gpu_range_ok(arena, offset, bytes) ||
+        !arena->ctx->healthy || !select_device_ordinal(arena->ctx->device))
+        return 0;
+    if (!cuda_ok(cudaMemcpyAsync(arena->data + offset, src, bytes,
+                                 cudaMemcpyHostToDevice, arena->ctx->stream),
+                 "resident arena upload") ||
+        !coli_gpu_context_sync(arena->ctx))
+        return 0;
+    arena->ctx->telemetry.h2d_copies++;
+    arena->ctx->telemetry.h2d_bytes += bytes;
+    return 1;
+}
+
+extern "C" int coli_gpu_arena_download(ColiGpuArena *arena, size_t offset,
+                                        void *dst, size_t bytes) {
+    if (!dst || !bytes || !gpu_range_ok(arena, offset, bytes) ||
+        !arena->ctx->healthy || !select_device_ordinal(arena->ctx->device))
+        return 0;
+    if (!cuda_ok(cudaMemcpyAsync(dst, arena->data + offset, bytes,
+                                 cudaMemcpyDeviceToHost, arena->ctx->stream),
+                 "resident arena download") ||
+        !coli_gpu_context_sync(arena->ctx))
+        return 0;
+    arena->ctx->telemetry.d2h_copies++;
+    arena->ctx->telemetry.d2h_bytes += bytes;
+    return 1;
+}
+
+extern "C" int coli_gpu_arena_upload_activation(
+    ColiGpuArena *arena, size_t offset, const void *src, size_t bytes) {
+    if (!coli_gpu_arena_upload(arena, offset, src, bytes)) return 0;
+    arena->ctx->telemetry.host_activation_h2d_copies++;
+    return 1;
+}
+
+extern "C" int coli_gpu_arena_download_activation(
+    ColiGpuArena *arena, size_t offset, void *dst, size_t bytes) {
+    if (!coli_gpu_arena_download(arena, offset, dst, bytes)) return 0;
+    arena->ctx->telemetry.host_activation_d2h_copies++;
+    return 1;
+}
+
+__global__ static void gpu_embedding_kernel(float *output, const int32_t *tokens,
+                                             const float *embedding,
+                                             int streams, int hidden) {
+    int row = (int)blockIdx.x;
+    int token = tokens[row];
+    for (int i = (int)threadIdx.x; i < streams * hidden; i += (int)blockDim.x)
+        output[(size_t)row * streams * hidden + i] =
+            embedding[(size_t)token * hidden + i % hidden];
+}
+
+__global__ static void gpu_rmsnorm_kernel(float *output, const float *input,
+                                           const float *weight, int hidden,
+                                           float eps) {
+    int row = (int)blockIdx.x;
+    const float *x = input + (size_t)row * hidden;
+    float *y = output + (size_t)row * hidden;
+    __shared__ double partial[256];
+    double sum = 0.0;
+    for (int d = (int)threadIdx.x; d < hidden; d += (int)blockDim.x)
+        sum += (double)x[d] * x[d];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int width = (int)blockDim.x / 2; width; width >>= 1) {
+        if ((int)threadIdx.x < width)
+            partial[threadIdx.x] += partial[threadIdx.x + width];
+        __syncthreads();
+    }
+    float inverse = rsqrtf((float)(partial[0] / hidden) + eps);
+    for (int d = (int)threadIdx.x; d < hidden; d += (int)blockDim.x)
+        y[d] = x[d] * inverse * weight[d];
+}
+
+__global__ static void gpu_layernorm_kernel(float *output, const float *input,
+                                             const float *weight,
+                                             const float *bias, int hidden,
+                                             float eps) {
+    int row = (int)blockIdx.x;
+    const float *x = input + (size_t)row * hidden;
+    float *y = output + (size_t)row * hidden;
+    __shared__ double partial[256];
+    double sum = 0.0;
+    for (int d = (int)threadIdx.x; d < hidden; d += (int)blockDim.x)
+        sum += x[d];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int width = (int)blockDim.x / 2; width; width >>= 1) {
+        if ((int)threadIdx.x < width)
+            partial[threadIdx.x] += partial[threadIdx.x + width];
+        __syncthreads();
+    }
+    float mean = (float)(partial[0] / hidden);
+    sum = 0.0;
+    for (int d = (int)threadIdx.x; d < hidden; d += (int)blockDim.x) {
+        float centered = x[d] - mean;
+        sum += (double)centered * centered;
+    }
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int width = (int)blockDim.x / 2; width; width >>= 1) {
+        if ((int)threadIdx.x < width)
+            partial[threadIdx.x] += partial[threadIdx.x + width];
+        __syncthreads();
+    }
+    float inverse = rsqrtf((float)(partial[0] / hidden) + eps);
+    for (int d = (int)threadIdx.x; d < hidden; d += (int)blockDim.x)
+        y[d] = (x[d] - mean) * inverse * weight[d] + bias[d];
+}
+
+__device__ static float gpu_stable_sigmoid(float value) {
+    if (value >= 0.0f) {
+        float decay = expf(-value);
+        return 1.0f / (1.0f + decay);
+    }
+    float growth = expf(value);
+    return growth / (1.0f + growth);
+}
+
+__global__ static void gpu_mhc_pre_kernel(
+    float *collapsed, float *post_out, float *comb_out, const float *residual,
+    const float *fn, const float *scale, const float *base,
+    int streams, int hidden, float norm_eps, float hc_eps) {
+    int row = (int)blockIdx.x;
+    int flattened = streams * hidden;
+    int mix_count = (2 + streams) * streams;
+    const float *input = residual + (size_t)row * flattened;
+    __shared__ double partial[256];
+    __shared__ float mixes[80];
+    __shared__ float pre[8];
+    __shared__ float post[8];
+    __shared__ float comb[64];
+    double square = 0.0;
+    for (int i = (int)threadIdx.x; i < flattened; i += (int)blockDim.x)
+        square += (double)input[i] * input[i];
+    partial[threadIdx.x] = square;
+    __syncthreads();
+    for (int width = (int)blockDim.x / 2; width; width >>= 1) {
+        if ((int)threadIdx.x < width)
+            partial[threadIdx.x] += partial[threadIdx.x + width];
+        __syncthreads();
+    }
+    float inverse = rsqrtf((float)(partial[0] / flattened) + norm_eps);
+    for (int mix = 0; mix < mix_count; ++mix) {
+        double sum = 0.0;
+        const float *w = fn + (size_t)mix * flattened;
+        for (int i = (int)threadIdx.x; i < flattened; i += (int)blockDim.x)
+            sum += (double)w[i] * input[i];
+        partial[threadIdx.x] = sum;
+        __syncthreads();
+        for (int width = (int)blockDim.x / 2; width; width >>= 1) {
+            if ((int)threadIdx.x < width)
+                partial[threadIdx.x] += partial[threadIdx.x + width];
+            __syncthreads();
+        }
+        if (!threadIdx.x) mixes[mix] = (float)partial[0] * inverse;
+        __syncthreads();
+    }
+    if (!threadIdx.x) {
+        for (int index = 0; index < streams; ++index) {
+            pre[index] = gpu_stable_sigmoid(
+                mixes[index] * scale[0] + base[index]) + hc_eps;
+            post[index] = 2.0f * gpu_stable_sigmoid(
+                mixes[streams + index] * scale[1] + base[streams + index]);
+        }
+        int matrix_offset = 2 * streams;
+        for (int r = 0; r < streams; ++r) {
+            float maximum = -INFINITY;
+            for (int c = 0; c < streams; ++c) {
+                int index = matrix_offset + r * streams + c;
+                float value = mixes[index] * scale[2] + base[index];
+                comb[r * streams + c] = value;
+                maximum = fmaxf(maximum, value);
+            }
+            float sum = 0.0f;
+            for (int c = 0; c < streams; ++c) {
+                float value = expf(comb[r * streams + c] - maximum);
+                comb[r * streams + c] = value;
+                sum += value;
+            }
+            for (int c = 0; c < streams; ++c)
+                comb[r * streams + c] =
+                    comb[r * streams + c] / sum + hc_eps;
+        }
+        for (int c = 0; c < streams; ++c) {
+            float sum = 0.0f;
+            for (int r = 0; r < streams; ++r)
+                sum += comb[r * streams + c];
+            for (int r = 0; r < streams; ++r)
+                comb[r * streams + c] /= sum + hc_eps;
+        }
+        for (int iteration = 1; iteration < 20; ++iteration) {
+            for (int r = 0; r < streams; ++r) {
+                float sum = 0.0f;
+                for (int c = 0; c < streams; ++c)
+                    sum += comb[r * streams + c];
+                for (int c = 0; c < streams; ++c)
+                    comb[r * streams + c] /= sum + hc_eps;
+            }
+            for (int c = 0; c < streams; ++c) {
+                float sum = 0.0f;
+                for (int r = 0; r < streams; ++r)
+                    sum += comb[r * streams + c];
+                for (int r = 0; r < streams; ++r)
+                    comb[r * streams + c] /= sum + hc_eps;
+            }
+        }
+        for (int i = 0; i < streams; ++i)
+            post_out[(size_t)row * streams + i] = post[i];
+        for (int i = 0; i < streams * streams; ++i)
+            comb_out[(size_t)row * streams * streams + i] = comb[i];
+    }
+    __syncthreads();
+    for (int d = (int)threadIdx.x; d < hidden; d += (int)blockDim.x) {
+        float sum = 0.0f;
+        for (int stream = 0; stream < streams; ++stream)
+            sum += pre[stream] * input[(size_t)stream * hidden + d];
+        collapsed[(size_t)row * hidden + d] = sum;
+    }
+}
+
+__global__ static void gpu_mhc_post_kernel(
+    float *output, const float *branch, const float *residual,
+    const float *post, const float *comb, int streams, int hidden) {
+    int row = (int)blockIdx.x;
+    int total = streams * hidden;
+    for (int i = (int)threadIdx.x; i < total; i += (int)blockDim.x) {
+        int destination = i / hidden;
+        int column = i % hidden;
+        float value = 0.0f;
+        for (int source = 0; source < streams; ++source)
+            value += comb[((size_t)row * streams + source) * streams + destination] *
+                     residual[((size_t)row * streams + source) * hidden + column];
+        value += post[(size_t)row * streams + destination] *
+                 branch[(size_t)row * hidden + column];
+        output[(size_t)row * total + i] = value;
+    }
+}
+
+__global__ static void gpu_collapse_kernel(float *output, const float *input,
+                                            int streams, int hidden) {
+    int row = (int)blockIdx.x;
+    for (int d = (int)threadIdx.x; d < hidden; d += (int)blockDim.x) {
+        float sum = 0.0f;
+        for (int stream = 0; stream < streams; ++stream)
+            sum += input[((size_t)row * streams + stream) * hidden + d];
+        output[(size_t)row * hidden + d] = sum / streams;
+    }
+}
+
+__global__ static void gpu_projection_kernel(
+    float *output, const float *input, const void *weight,
+    const float *scales, int format, int groups, int group_size,
+    int input_size, int output_size) {
+    int out = (int)blockIdx.x;
+    int row_index = (int)blockIdx.y;
+    if (out >= output_size) return;
+    const float *x = input + (size_t)row_index * input_size;
+    size_t packed_row = (size_t)out * gpu_tensor_row_bytes(format, input_size);
+    float sum = 0.0f;
+    for (int i = (int)threadIdx.x; i < input_size; i += (int)blockDim.x) {
+        float value = weight_at(weight, format, packed_row, i);
+        float scale_value = 1.0f;
+        if (format == 1 || format == 2) scale_value = scales[out];
+        else if (format == 4)
+            scale_value = scales[(size_t)out * groups + i / group_size];
+        sum += x[i] * value * scale_value;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int width = (int)blockDim.x / 2; width; width >>= 1) {
+        if ((int)threadIdx.x < width)
+            partial[threadIdx.x] += partial[threadIdx.x + width];
+        __syncthreads();
+    }
+    if (!threadIdx.x)
+        output[(size_t)row_index * output_size + out] = partial[0];
+}
+
+extern "C" int coli_gpu_embedding(ColiGpuArena *arena,
+                                   size_t streams_offset,
+                                   size_t token_ids_offset,
+                                   const ColiGpuTensor *embedding,
+                                   int rows, int streams, int hidden) {
+    size_t output_bytes = (size_t)rows * streams * hidden * sizeof(float);
+    size_t token_bytes = (size_t)rows * sizeof(int32_t);
+    if (rows < 1 || streams < 1 || hidden < 1 ||
+        !gpu_tensor_same_context(arena, embedding) ||
+        embedding->format != 0 || embedding->columns != hidden ||
+        !gpu_range_ok(arena, streams_offset, output_bytes) ||
+        !gpu_range_ok(arena, token_ids_offset, token_bytes) ||
+        !select_device_ordinal(arena->ctx->device))
+        return 0;
+    gpu_embedding_kernel<<<rows, 256, 0, arena->ctx->stream>>>(
+        reinterpret_cast<float *>(arena->data + streams_offset),
+        reinterpret_cast<const int32_t *>(arena->data + token_ids_offset),
+        reinterpret_cast<const float *>(embedding->data), streams, hidden);
+    return cuda_ok(cudaGetLastError(), "resident embedding launch");
+}
+
+extern "C" int coli_gpu_rmsnorm(ColiGpuArena *arena, size_t output_offset,
+                                 size_t input_offset,
+                                 const ColiGpuTensor *weight,
+                                 int rows, int hidden, float eps) {
+    size_t bytes = (size_t)rows * hidden * sizeof(float);
+    if (rows < 1 || hidden < 1 || eps < 0.0f ||
+        !gpu_tensor_same_context(arena, weight) ||
+        weight->format != 0 || weight->rows != 1 ||
+        weight->columns != hidden ||
+        !gpu_range_ok(arena, output_offset, bytes) ||
+        !gpu_range_ok(arena, input_offset, bytes) ||
+        !select_device_ordinal(arena->ctx->device))
+        return 0;
+    gpu_rmsnorm_kernel<<<rows, 256, 0, arena->ctx->stream>>>(
+        reinterpret_cast<float *>(arena->data + output_offset),
+        reinterpret_cast<const float *>(arena->data + input_offset),
+        reinterpret_cast<const float *>(weight->data), hidden, eps);
+    return cuda_ok(cudaGetLastError(), "resident RMSNorm launch");
+}
+
+extern "C" int coli_gpu_layernorm(ColiGpuArena *arena, size_t output_offset,
+                                   size_t input_offset,
+                                   const ColiGpuTensor *weight,
+                                   const ColiGpuTensor *bias,
+                                   int rows, int hidden, float eps) {
+    size_t bytes = (size_t)rows * hidden * sizeof(float);
+    if (rows < 1 || hidden < 1 || eps < 0.0f ||
+        !gpu_tensor_same_context(arena, weight) ||
+        !gpu_tensor_same_context(arena, bias) ||
+        weight->format != 0 || bias->format != 0 ||
+        weight->rows != 1 || bias->rows != 1 ||
+        weight->columns != hidden || bias->columns != hidden ||
+        !gpu_range_ok(arena, output_offset, bytes) ||
+        !gpu_range_ok(arena, input_offset, bytes) ||
+        !select_device_ordinal(arena->ctx->device))
+        return 0;
+    gpu_layernorm_kernel<<<rows, 256, 0, arena->ctx->stream>>>(
+        reinterpret_cast<float *>(arena->data + output_offset),
+        reinterpret_cast<const float *>(arena->data + input_offset),
+        reinterpret_cast<const float *>(weight->data),
+        reinterpret_cast<const float *>(bias->data), hidden, eps);
+    return cuda_ok(cudaGetLastError(), "resident LayerNorm launch");
+}
+
+extern "C" int coli_gpu_mhc_pre_norm(
+    ColiGpuArena *arena, size_t collapsed_offset, size_t normed_offset,
+    size_t post_offset, size_t comb_offset, size_t residual_offset,
+    const ColiGpuTensor *fn, const ColiGpuTensor *scale,
+    const ColiGpuTensor *base, const ColiGpuTensor *norm_weight,
+    int rows, int streams, int hidden, float norm_eps, float hc_eps) {
+    int mix_count = (2 + streams) * streams;
+    size_t residual_bytes = (size_t)rows * streams * hidden * sizeof(float);
+    size_t row_bytes_f = (size_t)rows * hidden * sizeof(float);
+    size_t post_bytes = (size_t)rows * streams * sizeof(float);
+    size_t comb_bytes = (size_t)rows * streams * streams * sizeof(float);
+    if (rows < 1 || streams < 1 || streams > 8 || hidden < 1 ||
+        norm_eps < 0.0f || hc_eps < 0.0f ||
+        !gpu_tensor_same_context(arena, fn) ||
+        !gpu_tensor_same_context(arena, scale) ||
+        !gpu_tensor_same_context(arena, base) ||
+        !gpu_tensor_same_context(arena, norm_weight) ||
+        fn->format != 0 || fn->rows != mix_count ||
+        fn->columns != streams * hidden ||
+        scale->format != 0 || scale->rows != 1 || scale->columns != 3 ||
+        base->format != 0 || base->rows != 1 || base->columns != mix_count ||
+        norm_weight->format != 0 || norm_weight->rows != 1 ||
+        norm_weight->columns != hidden ||
+        !gpu_range_ok(arena, residual_offset, residual_bytes) ||
+        !gpu_range_ok(arena, collapsed_offset, row_bytes_f) ||
+        !gpu_range_ok(arena, normed_offset, row_bytes_f) ||
+        !gpu_range_ok(arena, post_offset, post_bytes) ||
+        !gpu_range_ok(arena, comb_offset, comb_bytes) ||
+        !select_device_ordinal(arena->ctx->device))
+        return 0;
+    gpu_mhc_pre_kernel<<<rows, 256, 0, arena->ctx->stream>>>(
+        reinterpret_cast<float *>(arena->data + collapsed_offset),
+        reinterpret_cast<float *>(arena->data + post_offset),
+        reinterpret_cast<float *>(arena->data + comb_offset),
+        reinterpret_cast<const float *>(arena->data + residual_offset),
+        reinterpret_cast<const float *>(fn->data),
+        reinterpret_cast<const float *>(scale->data),
+        reinterpret_cast<const float *>(base->data),
+        streams, hidden, norm_eps, hc_eps);
+    if (!cuda_ok(cudaGetLastError(), "resident mHC pre launch")) return 0;
+    return coli_gpu_rmsnorm(arena, normed_offset, collapsed_offset, norm_weight,
+                            rows, hidden, norm_eps);
+}
+
+extern "C" int coli_gpu_mhc_post(
+    ColiGpuArena *arena, size_t output_offset, size_t branch_offset,
+    size_t residual_offset, size_t post_offset, size_t comb_offset,
+    int rows, int streams, int hidden) {
+    size_t residual_bytes = (size_t)rows * streams * hidden * sizeof(float);
+    size_t branch_bytes = (size_t)rows * hidden * sizeof(float);
+    size_t post_bytes = (size_t)rows * streams * sizeof(float);
+    size_t comb_bytes = (size_t)rows * streams * streams * sizeof(float);
+    if (rows < 1 || streams < 1 || streams > 8 || hidden < 1 ||
+        !gpu_range_ok(arena, output_offset, residual_bytes) ||
+        !gpu_range_ok(arena, residual_offset, residual_bytes) ||
+        !gpu_range_ok(arena, branch_offset, branch_bytes) ||
+        !gpu_range_ok(arena, post_offset, post_bytes) ||
+        !gpu_range_ok(arena, comb_offset, comb_bytes) ||
+        !select_device_ordinal(arena->ctx->device))
+        return 0;
+    gpu_mhc_post_kernel<<<rows, 256, 0, arena->ctx->stream>>>(
+        reinterpret_cast<float *>(arena->data + output_offset),
+        reinterpret_cast<const float *>(arena->data + branch_offset),
+        reinterpret_cast<const float *>(arena->data + residual_offset),
+        reinterpret_cast<const float *>(arena->data + post_offset),
+        reinterpret_cast<const float *>(arena->data + comb_offset),
+        streams, hidden);
+    return cuda_ok(cudaGetLastError(), "resident mHC post launch");
+}
+
+extern "C" int coli_gpu_mhc_site(
+    ColiGpuArena *arena, size_t output_offset, size_t collapsed_offset,
+    size_t normed_offset, size_t post_offset, size_t comb_offset,
+    size_t residual_offset, size_t branch_offset,
+    const ColiGpuTensor *fn, const ColiGpuTensor *scale,
+    const ColiGpuTensor *base, const ColiGpuTensor *norm_weight,
+    int rows, int streams, int hidden, float norm_eps, float hc_eps) {
+    return coli_gpu_mhc_pre_norm(
+               arena, collapsed_offset, normed_offset, post_offset, comb_offset,
+               residual_offset, fn, scale, base, norm_weight,
+               rows, streams, hidden, norm_eps, hc_eps) &&
+           coli_gpu_mhc_post(
+               arena, output_offset, branch_offset, residual_offset,
+               post_offset, comb_offset, rows, streams, hidden);
+}
+
+extern "C" int coli_gpu_collapse_streams(
+    ColiGpuArena *arena, size_t output_offset, size_t streams_offset,
+    int rows, int streams, int hidden) {
+    size_t output_bytes = (size_t)rows * hidden * sizeof(float);
+    size_t input_bytes = (size_t)rows * streams * hidden * sizeof(float);
+    if (rows < 1 || streams < 1 || hidden < 1 ||
+        !gpu_range_ok(arena, output_offset, output_bytes) ||
+        !gpu_range_ok(arena, streams_offset, input_bytes) ||
+        !select_device_ordinal(arena->ctx->device))
+        return 0;
+    gpu_collapse_kernel<<<rows, 256, 0, arena->ctx->stream>>>(
+        reinterpret_cast<float *>(arena->data + output_offset),
+        reinterpret_cast<const float *>(arena->data + streams_offset),
+        streams, hidden);
+    return cuda_ok(cudaGetLastError(), "resident stream collapse launch");
+}
+
+extern "C" int coli_gpu_projection(
+    ColiGpuArena *arena, size_t output_offset, size_t input_offset,
+    const ColiGpuTensor *weight, int rows, int input_size, int output_size) {
+    size_t input_bytes = (size_t)rows * input_size * sizeof(float);
+    size_t output_bytes = (size_t)rows * output_size * sizeof(float);
+    if (rows < 1 || input_size < 1 || output_size < 1 ||
+        !gpu_tensor_same_context(arena, weight) ||
+        weight->columns != input_size || weight->rows != output_size ||
+        !gpu_range_ok(arena, input_offset, input_bytes) ||
+        !gpu_range_ok(arena, output_offset, output_bytes) ||
+        !select_device_ordinal(arena->ctx->device))
+        return 0;
+    gpu_projection_kernel<<<dim3((unsigned)output_size, (unsigned)rows), 256, 0,
+                                arena->ctx->stream>>>(
+        reinterpret_cast<float *>(arena->data + output_offset),
+        reinterpret_cast<const float *>(arena->data + input_offset),
+        weight->data, weight->scales, weight->format, weight->groups,
+        weight->group_size, input_size, output_size);
+    return cuda_ok(cudaGetLastError(), "resident projection launch");
+}
+
+extern "C" int coli_gpu_dense_mlp(
+    ColiGpuArena *arena, size_t output_offset, size_t input_offset,
+    size_t gate_offset, size_t up_offset,
+    const ColiGpuTensor *gate, const ColiGpuTensor *up,
+    const ColiGpuTensor *down, int rows, int hidden, int intermediate,
+    float swiglu_limit) {
+    if (!arena || rows < 1 || hidden < 1 || intermediate < 1 ||
+        !std::isfinite(swiglu_limit) || swiglu_limit <= 0.0f)
+        return 0;
+    size_t hidden_bytes = (size_t)rows * hidden * sizeof(float);
+    size_t intermediate_bytes =
+        (size_t)rows * intermediate * sizeof(float);
+    if (!gpu_range_ok(arena, input_offset, hidden_bytes) ||
+        !gpu_range_ok(arena, output_offset, hidden_bytes) ||
+        !gpu_range_ok(arena, gate_offset, intermediate_bytes) ||
+        !gpu_range_ok(arena, up_offset, intermediate_bytes) ||
+        gpu_ranges_overlap(input_offset, hidden_bytes,
+                           output_offset, hidden_bytes) ||
+        gpu_ranges_overlap(input_offset, hidden_bytes,
+                           gate_offset, intermediate_bytes) ||
+        gpu_ranges_overlap(input_offset, hidden_bytes,
+                           up_offset, intermediate_bytes) ||
+        gpu_ranges_overlap(output_offset, hidden_bytes,
+                           gate_offset, intermediate_bytes) ||
+        gpu_ranges_overlap(output_offset, hidden_bytes,
+                           up_offset, intermediate_bytes) ||
+        gpu_ranges_overlap(gate_offset, intermediate_bytes,
+                           up_offset, intermediate_bytes))
+        return 0;
+    if (!coli_gpu_projection(arena, gate_offset, input_offset, gate,
+                             rows, hidden, intermediate) ||
+        !coli_gpu_projection(arena, up_offset, input_offset, up,
+                             rows, hidden, intermediate))
+        return 0;
+    size_t values = (size_t)rows * intermediate;
+    swiglu_clamped_kernel<<<(unsigned)((values + 255) / 256), 256, 0,
+                            arena->ctx->stream>>>(
+        reinterpret_cast<float *>(arena->data + gate_offset),
+        reinterpret_cast<const float *>(arena->data + up_offset),
+        values, swiglu_limit);
+    if (!cuda_ok(cudaGetLastError(), "resident dense SwiGLU launch"))
+        return 0;
+    return coli_gpu_projection(arena, output_offset, gate_offset, down,
+                               rows, intermediate, hidden);
+}
+
+__global__ static void gpu_router_score_kernel(
+    const float *input, const float *weight, const float *bias,
+    float *scores, float *choices, int hidden, int experts,
+    int *status) {
+    int expert = (int)blockIdx.x;
+    int row = (int)blockIdx.y;
+    const float *x = input + (size_t)row * hidden;
+    const float *w = weight + (size_t)expert * hidden;
+    __shared__ float partial[256];
+    float sum = 0.0f;
+    for (int column = (int)threadIdx.x; column < hidden;
+         column += (int)blockDim.x) {
+        float xv = x[column];
+        if (!isfinite(xv)) atomicMax(status, 1);
+        sum += xv * w[column];
+    }
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int width = (int)blockDim.x / 2; width; width >>= 1) {
+        if ((int)threadIdx.x < width)
+            partial[threadIdx.x] += partial[threadIdx.x + width];
+        __syncthreads();
+    }
+    if (!threadIdx.x) {
+        float score = 1.0f / (1.0f + expf(-partial[0]));
+        float choice = score + (bias ? bias[expert] : 0.0f);
+        if (!isfinite(score) || !isfinite(choice)) atomicMax(status, 2);
+        scores[(size_t)row * experts + expert] = score;
+        choices[(size_t)row * experts + expert] = choice;
+    }
+}
+
+__global__ static void gpu_router_select_kernel(
+    const float *scores, const float *choices, int *selected, float *weights,
+    int rows, int experts, int topk, int normalize, float routed_scale,
+    int *status) {
+    int row = (int)blockIdx.x;
+    if (threadIdx.x || row >= rows) return;
+    const float *row_scores = scores + (size_t)row * experts;
+    const float *row_choices = choices + (size_t)row * experts;
+    int *row_selected = selected + (size_t)row * topk;
+    float *row_weights = weights + (size_t)row * topk;
+    float total = 0.0f;
+    for (int k = 0; k < topk; ++k) {
+        int best = -1;
+        float best_value = -INFINITY;
+        for (int expert = 0; expert < experts; ++expert) {
+            int used = 0;
+            for (int prior = 0; prior < k; ++prior)
+                if (row_selected[prior] == expert) used = 1;
+            float value = row_choices[expert];
+            if (!used && value > best_value) {
+                best = expert;
+                best_value = value;
+            }
+        }
+        if (best < 0) {
+            atomicMax(status, 2);
+            return;
+        }
+        row_selected[k] = best;
+        row_weights[k] = row_scores[best];
+        total += row_weights[k];
+    }
+    for (int k = 0; k < topk; ++k) {
+        float value = row_weights[k];
+        if (normalize) value /= total + 1e-20f;
+        value *= routed_scale;
+        if (!isfinite(value)) atomicMax(status, 2);
+        row_weights[k] = value;
+    }
+}
+
+static int gpu_route_config_ok(const ColiGpuRouteConfig *config,
+                               int max_rows) {
+    return config && config->hidden > 0 && config->experts > 0 &&
+           config->experts <= 4096 && config->topk > 0 &&
+           config->topk <= config->experts && config->topk <= 64 &&
+           (config->normalize_topk == 0 || config->normalize_topk == 1) &&
+           std::isfinite(config->routed_scale) && max_rows > 0 &&
+           (size_t)max_rows <= SIZE_MAX / (size_t)config->experts &&
+           (size_t)max_rows <= SIZE_MAX / (size_t)config->topk;
+}
+
+extern "C" int coli_gpu_router_create(
+    ColiGpuRouter **out, ColiGpuContext *ctx,
+    const ColiGpuRouteConfig *config, int max_rows) {
+    if (!out) return 0;
+    *out = nullptr;
+    if (!ctx || !ctx->healthy || !gpu_route_config_ok(config, max_rows) ||
+        !select_device_ordinal(ctx->device))
+        return 0;
+    ColiGpuRouter *router =
+        static_cast<ColiGpuRouter *>(std::calloc(1, sizeof(*router)));
+    if (!router) return 0;
+    router->ctx = ctx;
+    router->config = *config;
+    router->max_rows = max_rows;
+    size_t score_count = (size_t)max_rows * config->experts;
+    size_t selected_count = (size_t)max_rows * config->topk;
+    size_t score_bytes = score_count * sizeof(float);
+    size_t selected_bytes = selected_count * sizeof(int);
+    size_t weight_bytes = selected_count * sizeof(float);
+    size_t total = score_bytes * 2 + selected_bytes + weight_bytes;
+    void *mapped = nullptr;
+    void *selected_host = nullptr;
+    if (!cuda_ok(cudaMalloc(&router->allocation, total),
+                 "resident router allocation") ||
+        !cuda_ok(cudaHostAlloc(&selected_host, selected_bytes, 0),
+                 "resident router selected-id staging allocation") ||
+        !cuda_ok(cudaHostAlloc(&mapped, sizeof(int), cudaHostAllocMapped),
+                 "resident router status allocation")) {
+        if (selected_host) (void)cudaFreeHost(selected_host);
+        if (router->allocation) (void)cudaFree(router->allocation);
+        std::free(router);
+        return 0;
+    }
+    router->scores = static_cast<float *>(router->allocation);
+    router->choices = reinterpret_cast<float *>(
+        reinterpret_cast<unsigned char *>(router->allocation) + score_bytes);
+    router->selected = reinterpret_cast<int *>(
+        reinterpret_cast<unsigned char *>(router->allocation) + score_bytes * 2);
+    router->weights = reinterpret_cast<float *>(
+        reinterpret_cast<unsigned char *>(router->selected) + selected_bytes);
+    router->host_selected = static_cast<int *>(selected_host);
+    router->host_status = static_cast<volatile int *>(mapped);
+    if (!cuda_ok(cudaHostGetDevicePointer(
+            reinterpret_cast<void **>(&router->device_status), mapped, 0),
+            "resident router status pointer")) {
+        (void)cudaFreeHost(mapped);
+        (void)cudaFreeHost(selected_host);
+        (void)cudaFree(router->allocation);
+        std::free(router);
+        return 0;
+    }
+    *router->host_status = 0;
+    ctx->telemetry.device_allocations++;
+    *out = router;
+    return 1;
+}
+
+extern "C" void coli_gpu_router_destroy(ColiGpuRouter *router) {
+    if (!router) return;
+    if (router->ctx && select_device_ordinal(router->ctx->device)) {
+        coli_gpu_context_sync(router->ctx);
+        if (router->allocation) (void)cudaFree(router->allocation);
+    }
+    if (router->host_status)
+        (void)cudaFreeHost(const_cast<int *>(router->host_status));
+    if (router->host_selected) (void)cudaFreeHost(router->host_selected);
+    std::free(router);
+}
+
+extern "C" int coli_gpu_router_run(
+    ColiGpuRouter *router, ColiGpuArena *arena, size_t input_offset,
+    const ColiGpuTensor *weight, const ColiGpuTensor *correction_bias,
+    int rows) {
+    if (!router || !arena || router->ctx != arena->ctx ||
+        rows < 1 || rows > router->max_rows ||
+        !gpu_tensor_same_context(arena, weight) || weight->format != 0 ||
+        weight->rows != router->config.experts ||
+        weight->columns != router->config.hidden ||
+        (correction_bias &&
+         (!gpu_tensor_same_context(arena, correction_bias) ||
+          correction_bias->format != 0 || correction_bias->rows != 1 ||
+          correction_bias->columns != router->config.experts)) ||
+        !gpu_range_ok(arena, input_offset,
+                      (size_t)rows * router->config.hidden * sizeof(float)) ||
+        !router->ctx->healthy || !select_device_ordinal(router->ctx->device))
+        return 0;
+    *router->host_status = 0;
+    gpu_router_score_kernel<<<
+        dim3((unsigned)router->config.experts, (unsigned)rows), 256, 0,
+        router->ctx->stream>>>(
+        reinterpret_cast<const float *>(arena->data + input_offset),
+        static_cast<const float *>(weight->data),
+        correction_bias
+            ? static_cast<const float *>(correction_bias->data) : nullptr,
+        router->scores, router->choices, router->config.hidden,
+        router->config.experts, router->device_status);
+    gpu_router_select_kernel<<<rows, 1, 0, router->ctx->stream>>>(
+        router->scores, router->choices, router->selected, router->weights,
+        rows, router->config.experts, router->config.topk,
+        router->config.normalize_topk, router->config.routed_scale,
+        router->device_status);
+    size_t id_bytes =
+        (size_t)rows * router->config.topk * sizeof(int);
+    if (!cuda_ok(cudaGetLastError(), "resident router launch") ||
+        !cuda_ok(cudaMemcpyAsync(
+            router->host_selected, router->selected, id_bytes,
+            cudaMemcpyDeviceToHost, router->ctx->stream),
+            "resident router selected metadata") ||
+        !coli_gpu_context_sync(router->ctx) || *router->host_status)
+        return 0;
+    router->ctx->telemetry.d2h_copies++;
+    router->ctx->telemetry.d2h_bytes += id_bytes;
+    router->rows = rows;
+    router->ctx->telemetry.route_launches++;
+    router->ctx->telemetry.selected_expert_count +=
+        (uint64_t)rows * (uint64_t)router->config.topk;
+    return 1;
+}
+
+extern "C" int coli_gpu_router_download(
+    ColiGpuRouter *router, int *selected_ids, float *routing_weights,
+    size_t selected_count, int rows) {
+    if (!router || !selected_ids || !routing_weights || rows < 1 ||
+        rows != router->rows ||
+        selected_count != (size_t)rows * router->config.topk ||
+        !select_device_ordinal(router->ctx->device))
+        return 0;
+    size_t id_bytes = selected_count * sizeof(int);
+    size_t weight_bytes = selected_count * sizeof(float);
+    std::memcpy(selected_ids, router->host_selected, id_bytes);
+    if (!cuda_ok(cudaMemcpyAsync(routing_weights, router->weights, weight_bytes,
+                                 cudaMemcpyDeviceToHost, router->ctx->stream),
+                 "resident router weights download") ||
+        !coli_gpu_context_sync(router->ctx))
+        return 0;
+    router->ctx->telemetry.d2h_copies++;
+    router->ctx->telemetry.d2h_bytes += weight_bytes;
+    return 1;
+}
+
+static size_t gpu_align256(size_t value) {
+    return (value + 255u) & ~(size_t)255u;
+}
+
+static int gpu_expert_source_ok(const ColiGpuExpertCache *cache,
+                                const ColiGpuExpertSource *source) {
+    if (!cache || !source) return 0;
+    const ColiGpuTensorDesc *all[3] = {
+        &source->gate, &source->up, &source->down
+    };
+    const int rows[3] = {
+        cache->config.intermediate,
+        cache->config.intermediate,
+        cache->config.hidden
+    };
+    const int columns[3] = {
+        cache->config.hidden,
+        cache->config.hidden,
+        cache->config.intermediate
+    };
+    for (int tensor = 0; tensor < 3; ++tensor) {
+        const ColiGpuTensorDesc *desc = all[tensor];
+        if (!desc->data || !desc->scales || desc->format != 4 ||
+            desc->rows != rows[tensor] || desc->columns != columns[tensor] ||
+            desc->group_size != cache->config.group_size)
+            return 0;
+        size_t groups = ((size_t)desc->columns + desc->group_size - 1) /
+                        desc->group_size;
+        size_t scale_count = (size_t)desc->rows * groups;
+        for (size_t index = 0; index < scale_count; ++index)
+            if (!std::isfinite(desc->scales[index])) return 0;
+    }
+    return 1;
+}
+
+static void gpu_expert_bank_layout(ColiGpuExpertCache *cache,
+                                   ColiGpuExpertBank *bank) {
+    size_t gate_data = 0;
+    size_t gate_scales = gpu_align256(
+        gate_data + cache->gate_data_bytes);
+    size_t up_data = gpu_align256(
+        gate_scales + cache->gate_scale_bytes);
+    size_t up_scales = gpu_align256(
+        up_data + cache->gate_data_bytes);
+    size_t down_data = gpu_align256(
+        up_scales + cache->gate_scale_bytes);
+    size_t down_scales = gpu_align256(
+        down_data + cache->down_data_bytes);
+    unsigned char *device = bank->allocation;
+    bank->gate_data = device + gate_data;
+    bank->gate_scales = reinterpret_cast<float *>(device + gate_scales);
+    bank->up_data = device + up_data;
+    bank->up_scales = reinterpret_cast<float *>(device + up_scales);
+    bank->down_data = device + down_data;
+    bank->down_scales = reinterpret_cast<float *>(device + down_scales);
+}
+
+extern "C" int coli_gpu_expert_cache_create(
+    ColiGpuExpertCache **out, ColiGpuContext *ctx,
+    const ColiGpuExpertCacheConfig *config) {
+    if (!out) return 0;
+    *out = nullptr;
+    if (!ctx || !ctx->healthy || !config || config->experts < 1 ||
+        config->experts > 4096 || config->slots < 1 ||
+        config->slots > config->experts || config->hidden < 1 ||
+        config->intermediate < 1 || config->group_size != 64 ||
+        config->max_rows < 1 || !std::isfinite(config->swiglu_limit) ||
+        config->swiglu_limit <= 0.0f ||
+        !select_device_ordinal(ctx->device))
+        return 0;
+    ColiGpuExpertCache *cache = new (std::nothrow) ColiGpuExpertCache{};
+    if (!cache) return 0;
+    cache->ctx = ctx;
+    cache->config = *config;
+    cache->healthy = 1;
+    cache->gate_data_bytes =
+        (size_t)config->intermediate * ((config->hidden + 1u) / 2u);
+    cache->gate_scale_bytes =
+        (size_t)config->intermediate *
+        ((config->hidden + config->group_size - 1u) / config->group_size) *
+        sizeof(float);
+    cache->down_data_bytes =
+        (size_t)config->hidden * ((config->intermediate + 1u) / 2u);
+    cache->down_scale_bytes =
+        (size_t)config->hidden *
+        ((config->intermediate + config->group_size - 1u) /
+         config->group_size) * sizeof(float);
+    size_t cursor = 0;
+    cursor = gpu_align256(cursor + cache->gate_data_bytes);
+    cursor = gpu_align256(cursor + cache->gate_scale_bytes);
+    cursor = gpu_align256(cursor + cache->gate_data_bytes);
+    cursor = gpu_align256(cursor + cache->gate_scale_bytes);
+    cursor = gpu_align256(cursor + cache->down_data_bytes);
+    cache->bank_bytes = gpu_align256(cursor + cache->down_scale_bytes);
+    if (!cache->bank_bytes ||
+        (size_t)config->slots > SIZE_MAX / sizeof(*cache->slots)) {
+        delete cache;
+        return 0;
+    }
+    cache->slots = static_cast<ColiGpuExpertSlot *>(
+        std::calloc((size_t)config->slots, sizeof(*cache->slots)));
+    size_t max_topk =
+        (size_t)(config->experts < 64 ? config->experts : 64);
+    if ((size_t)config->max_rows > SIZE_MAX / max_topk) {
+        std::free(cache->slots);
+        delete cache;
+        return 0;
+    }
+    cache->snapshot_capacity = (size_t)config->max_rows * max_topk;
+    cache->snapshots = static_cast<ColiGpuExpertSnapshot *>(
+        std::calloc(cache->snapshot_capacity, sizeof(*cache->snapshots)));
+    if (!cache->slots || !cache->snapshots) {
+        std::free(cache->snapshots);
+        std::free(cache->slots);
+        delete cache;
+        return 0;
+    }
+    void *mapped_status = nullptr;
+    if (!cuda_ok(cudaHostAlloc(
+            &mapped_status, sizeof(int), cudaHostAllocMapped),
+            "expert cache status allocation") ||
+        !cuda_ok(cudaHostGetDevicePointer(
+            reinterpret_cast<void **>(&cache->device_status),
+            mapped_status, 0), "expert cache status pointer")) {
+        if (mapped_status) (void)cudaFreeHost(mapped_status);
+        std::free(cache->snapshots);
+        std::free(cache->slots);
+        delete cache;
+        return 0;
+    }
+    cache->host_status = static_cast<volatile int *>(mapped_status);
+    *cache->host_status = 0;
+    for (int slot = 0; slot < config->slots; ++slot) {
+        cache->slots[slot].expert_id = -1;
+        for (int copy = 0; copy < 2; ++copy) {
+            ColiGpuExpertBank *bank = &cache->slots[slot].bank[copy];
+            if (!cuda_ok(cudaMalloc(
+                    reinterpret_cast<void **>(&bank->allocation),
+                    cache->bank_bytes), "expert cache bank allocation") ||
+                !cuda_ok(cudaEventCreateWithFlags(
+                    &bank->use_done, cudaEventDisableTiming),
+                    "expert cache bank use event")) {
+                coli_gpu_expert_cache_destroy(cache);
+                return 0;
+            }
+            gpu_expert_bank_layout(cache, bank);
+            ctx->telemetry.device_allocations++;
+        }
+    }
+    *out = cache;
+    return 1;
+}
+
+extern "C" void coli_gpu_expert_cache_destroy(
+    ColiGpuExpertCache *cache) {
+    if (!cache) return;
+    if (cache->ctx && select_device_ordinal(cache->ctx->device)) {
+        coli_gpu_context_sync(cache->ctx);
+        (void)cudaStreamSynchronize(cache->ctx->upload_stream);
+    }
+    if (cache->slots) {
+        for (int slot = 0; slot < cache->config.slots; ++slot) {
+            for (int copy = 0; copy < 2; ++copy) {
+                ColiGpuExpertBank *bank = &cache->slots[slot].bank[copy];
+                if (bank->use_done) (void)cudaEventDestroy(bank->use_done);
+                if (bank->allocation) (void)cudaFree(bank->allocation);
+            }
+        }
+    }
+    if (cache->host_status)
+        (void)cudaFreeHost(const_cast<int *>(cache->host_status));
+    while (cache->transfers) {
+        ColiGpuExpertTransfer *transfer = cache->transfers;
+        cache->transfers = transfer->next;
+        if (transfer->ready) (void)cudaEventDestroy(transfer->ready);
+        if (transfer->host_staging)
+            (void)cudaFreeHost(transfer->host_staging);
+        std::free(transfer);
+    }
+    std::free(cache->slots);
+    std::free(cache->snapshots);
+    delete cache;
+}
+
+__global__ static void gpu_expert_upload_delay_kernel(
+    unsigned long long cycles) {
+    if (blockIdx.x || threadIdx.x) return;
+    unsigned long long start = clock64();
+    while (clock64() - start < cycles) {
+    }
+}
+
+static int gpu_expert_stream_wait_event(
+    ColiGpuExpertCache *cache, cudaStream_t stream, cudaEvent_t event,
+    int inject_error, const char *label) {
+    cache->ctx->telemetry.expert_event_wait_calls++;
+    if (inject_error) {
+        cache->ctx->telemetry.expert_event_wait_failures++;
+        return 0;
+    }
+    cudaError_t status = cudaStreamWaitEvent(stream, event, 0);
+    if (status != cudaSuccess) {
+        cache->ctx->telemetry.expert_event_wait_failures++;
+        (void)cuda_ok(status, label);
+        return 0;
+    }
+    return 1;
+}
+
+static void gpu_expert_retire_transfers_locked(ColiGpuExpertCache *cache) {
+    ColiGpuExpertTransfer **link = &cache->transfers;
+    while (*link) {
+        ColiGpuExpertTransfer *transfer = *link;
+        if (transfer->published) {
+            link = &transfer->next;
+            continue;
+        }
+        cudaError_t status = cudaEventQuery(transfer->ready);
+        if (status == cudaErrorNotReady) {
+            link = &transfer->next;
+            continue;
+        }
+        if (status != cudaSuccess) {
+            cache->healthy = 0;
+            return;
+        }
+        *link = transfer->next;
+        (void)cudaEventDestroy(transfer->ready);
+        (void)cudaFreeHost(transfer->host_staging);
+        std::free(transfer);
+    }
+}
+
+static int gpu_expert_record_retirement(
+    ColiGpuExpertCache *cache, ColiGpuExpertTransfer *transfer) {
+    if (cuda_ok(cudaEventRecord(
+            transfer->ready, cache->ctx->upload_stream),
+            "expert cache failed-transfer retirement"))
+        return 1;
+    if (!cuda_ok(cudaStreamSynchronize(cache->ctx->upload_stream),
+                 "expert cache failed-transfer drain"))
+        cache->healthy = 0;
+    return 0;
+}
+
+extern "C" int coli_gpu_expert_cache_upload(
+    ColiGpuExpertCache *cache, int expert_id, int slot,
+    const ColiGpuExpertSource *source, ColiGpuExpertHandle *out) {
+    if (out) std::memset(out, 0, sizeof(*out));
+    if (!cache || !out || expert_id < 0 ||
+        expert_id >= cache->config.experts || slot < 0 ||
+        slot >= cache->config.slots ||
+        !gpu_expert_source_ok(cache, source) ||
+        !cache->ctx->healthy || !select_device_ordinal(cache->ctx->device))
+        return 0;
+    std::lock_guard<std::mutex> lock(cache->mutex);
+    if (!cache->healthy) {
+        cache->ctx->telemetry.unhealthy_cache_rejections++;
+        return 0;
+    }
+    ColiGpuExpertFaultPoint fault = cache->fault;
+    int fault_occurrence = cache->fault_occurrence;
+    cache->fault = COLI_GPU_EXPERT_FAULT_NONE;
+    cache->fault_occurrence = 0;
+    gpu_expert_retire_transfers_locked(cache);
+    if (!cache->healthy ||
+        fault == COLI_GPU_EXPERT_FAULT_ALLOCATION ||
+        (fault == COLI_GPU_EXPERT_FAULT_UPLOAD && fault_occurrence == 0))
+        return 0;
+    ColiGpuExpertSlot *target = &cache->slots[slot];
+    if (target->generation == UINT64_MAX) {
+        cache->healthy = 0;
+        cache->ctx->telemetry.generation_exhaustions++;
+        return 0;
+    }
+    int bank_index = target->published ? 1 - target->active_bank : 0;
+    ColiGpuExpertBank *bank = &target->bank[bank_index];
+    if (bank->use_recorded &&
+        !gpu_expert_stream_wait_event(
+            cache, cache->ctx->upload_stream, bank->use_done, 0,
+            "expert cache bank reuse wait"))
+        return 0;
+
+    ColiGpuExpertTransfer *transfer =
+        static_cast<ColiGpuExpertTransfer *>(
+            std::calloc(1, sizeof(*transfer)));
+    void *staging = nullptr;
+    if (!transfer ||
+        !cuda_ok(cudaHostAlloc(&staging, cache->bank_bytes, 0),
+                 "expert cache transfer staging allocation") ||
+        !cuda_ok(cudaEventCreateWithFlags(
+            &transfer->ready, cudaEventDisableTiming),
+            "expert cache generation publication event")) {
+        if (staging) (void)cudaFreeHost(staging);
+        std::free(transfer);
+        return 0;
+    }
+    transfer->host_staging = static_cast<unsigned char *>(staging);
+    transfer->next = cache->transfers;
+    cache->transfers = transfer;
+
+    size_t gate_data = 0;
+    size_t gate_scales = gpu_align256(gate_data + cache->gate_data_bytes);
+    size_t up_data = gpu_align256(gate_scales + cache->gate_scale_bytes);
+    size_t up_scales = gpu_align256(up_data + cache->gate_data_bytes);
+    size_t down_data = gpu_align256(up_scales + cache->gate_scale_bytes);
+    size_t down_scales = gpu_align256(down_data + cache->down_data_bytes);
+    std::memcpy(transfer->host_staging + gate_data, source->gate.data,
+                cache->gate_data_bytes);
+    std::memcpy(transfer->host_staging + gate_scales, source->gate.scales,
+                cache->gate_scale_bytes);
+    std::memcpy(transfer->host_staging + up_data, source->up.data,
+                cache->gate_data_bytes);
+    std::memcpy(transfer->host_staging + up_scales, source->up.scales,
+                cache->gate_scale_bytes);
+    std::memcpy(transfer->host_staging + down_data, source->down.data,
+                cache->down_data_bytes);
+    std::memcpy(transfer->host_staging + down_scales, source->down.scales,
+                cache->down_scale_bytes);
+    if (cache->test_delay_ms) {
+        unsigned long long cycles =
+            (unsigned long long)cache->test_delay_ms *
+            (unsigned long long)cache->ctx->clock_rate_khz;
+        gpu_expert_upload_delay_kernel<<<
+            1, 1, 0, cache->ctx->upload_stream>>>(cycles);
+        cache->test_delay_ms = 0;
+        if (!cuda_ok(cudaGetLastError(), "expert cache upload delay")) {
+            gpu_expert_record_retirement(cache, transfer);
+            return 0;
+        }
+    }
+    void *destinations[6] = {
+        bank->gate_data, bank->gate_scales, bank->up_data, bank->up_scales,
+        bank->down_data, bank->down_scales
+    };
+    const size_t offsets[6] = {
+        gate_data, gate_scales, up_data, up_scales, down_data, down_scales
+    };
+    const size_t bytes[6] = {
+        cache->gate_data_bytes, cache->gate_scale_bytes,
+        cache->gate_data_bytes, cache->gate_scale_bytes,
+        cache->down_data_bytes, cache->down_scale_bytes
+    };
+    const char *labels[6] = {
+        "expert cache gate upload", "expert cache gate scales upload",
+        "expert cache up upload", "expert cache up scales upload",
+        "expert cache down upload", "expert cache down scales upload"
+    };
+    for (int copy = 0; copy < 6; ++copy) {
+        if (!cuda_ok(cudaMemcpyAsync(
+                destinations[copy], transfer->host_staging + offsets[copy],
+                bytes[copy], cudaMemcpyHostToDevice,
+                cache->ctx->upload_stream), labels[copy])) {
+            gpu_expert_record_retirement(cache, transfer);
+            return 0;
+        }
+        cache->ctx->telemetry.h2d_copies++;
+        cache->ctx->telemetry.h2d_bytes += bytes[copy];
+        cache->ctx->telemetry.expert_upload_bytes += bytes[copy];
+        if (fault == COLI_GPU_EXPERT_FAULT_UPLOAD &&
+            fault_occurrence == copy + 1) {
+            gpu_expert_record_retirement(cache, transfer);
+            return 0;
+        }
+    }
+    if (fault == COLI_GPU_EXPERT_FAULT_EVENT_RECORD) {
+        gpu_expert_record_retirement(cache, transfer);
+        return 0;
+    }
+    if (!cuda_ok(cudaEventRecord(
+            transfer->ready, cache->ctx->upload_stream),
+                 "expert cache publication record")) {
+        if (!cuda_ok(cudaStreamSynchronize(cache->ctx->upload_stream),
+                     "expert cache publication failure drain"))
+            cache->healthy = 0;
+        return 0;
+    }
+    if (target->published && target->expert_id != expert_id)
+        cache->ctx->telemetry.expert_cache_evictions++;
+    uint64_t generation = target->generation + 1;
+    target->active_bank = bank_index;
+    target->expert_id = expert_id;
+    target->generation = generation;
+    target->published = 1;
+    if (target->publication) target->publication->published = 0;
+    target->publication = transfer;
+    transfer->published = 1;
+    out->expert_id = expert_id;
+    out->slot = slot;
+    out->generation = generation;
+    cache->ctx->telemetry.expert_upload_events++;
+    cache->ctx->telemetry.expert_publications++;
+    return 1;
+}
+
+extern "C" int coli_gpu_expert_cache_lookup(
+    ColiGpuExpertCache *cache, int expert_id, ColiGpuExpertHandle *out) {
+    if (out) std::memset(out, 0, sizeof(*out));
+    if (!cache || !out || expert_id < 0 ||
+        expert_id >= cache->config.experts)
+        return 0;
+    std::lock_guard<std::mutex> lock(cache->mutex);
+    if (!cache->healthy) {
+        cache->ctx->telemetry.unhealthy_cache_rejections++;
+        return 0;
+    }
+    for (int slot = 0; slot < cache->config.slots; ++slot) {
+        ColiGpuExpertSlot *candidate = &cache->slots[slot];
+        if (candidate->published && candidate->expert_id == expert_id) {
+            out->expert_id = expert_id;
+            out->slot = slot;
+            out->generation = candidate->generation;
+            cache->ctx->telemetry.expert_cache_hits++;
+            return 1;
+        }
+    }
+    cache->ctx->telemetry.expert_cache_misses++;
+    return 0;
+}
+
+static int gpu_expert_handle_validate_locked(
+    ColiGpuExpertCache *cache, const ColiGpuExpertHandle *handle) {
+    if (!cache->healthy) {
+        cache->ctx->telemetry.unhealthy_cache_rejections++;
+        return 0;
+    }
+    if (!handle || handle->slot < 0 ||
+        handle->slot >= cache->config.slots) {
+        cache->ctx->telemetry.expert_handle_range_rejections++;
+        return 0;
+    }
+    const ColiGpuExpertSlot *slot = &cache->slots[handle->slot];
+    if (!slot->published) {
+        cache->ctx->telemetry.unpublished_slot_rejections++;
+        return 0;
+    }
+    if (slot->generation != handle->generation) {
+        cache->ctx->telemetry.stale_generation_rejections++;
+        return 0;
+    }
+    if (handle->expert_id < 0 ||
+        handle->expert_id >= cache->config.experts ||
+        slot->expert_id != handle->expert_id) {
+        cache->ctx->telemetry.wrong_expert_rejections++;
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" int coli_gpu_expert_cache_validate(
+    ColiGpuExpertCache *cache, const ColiGpuExpertHandle *handle) {
+    if (!cache) return 0;
+    std::lock_guard<std::mutex> lock(cache->mutex);
+    return gpu_expert_handle_validate_locked(cache, handle);
+}
+
+extern "C" int coli_gpu_expert_cache_slot_info(
+    const ColiGpuExpertCache *cache, int slot, ColiGpuExpertSlotInfo *out) {
+    if (!cache || !out || slot < 0 || slot >= cache->config.slots) return 0;
+    std::lock_guard<std::mutex> lock(
+        const_cast<ColiGpuExpertCache *>(cache)->mutex);
+    std::memset(out, 0, sizeof(*out));
+    out->slot = slot;
+    out->expert_id = cache->slots[slot].expert_id;
+    out->generation = cache->slots[slot].generation;
+    out->published = cache->slots[slot].published;
+    return 1;
+}
+
+extern "C" int coli_gpu_expert_cache_inject_fault(
+    ColiGpuExpertCache *cache, ColiGpuExpertFaultPoint point) {
+    if (!cache || point < COLI_GPU_EXPERT_FAULT_NONE ||
+        point > COLI_GPU_EXPERT_FAULT_LAUNCH)
+        return 0;
+    std::lock_guard<std::mutex> lock(cache->mutex);
+    cache->fault = point;
+    cache->fault_occurrence = 0;
+    return 1;
+}
+
+extern "C" int coli_gpu_expert_cache_inject_fault_at(
+    ColiGpuExpertCache *cache, ColiGpuExpertFaultPoint point,
+    int occurrence) {
+    if (!cache || point < COLI_GPU_EXPERT_FAULT_NONE ||
+        point > COLI_GPU_EXPERT_FAULT_LAUNCH || occurrence < 0)
+        return 0;
+    std::lock_guard<std::mutex> lock(cache->mutex);
+    cache->fault = point;
+    cache->fault_occurrence = occurrence;
+    return 1;
+}
+
+extern "C" int coli_gpu_expert_cache_healthy(
+    const ColiGpuExpertCache *cache) {
+    if (!cache) return 0;
+    std::lock_guard<std::mutex> lock(
+        const_cast<ColiGpuExpertCache *>(cache)->mutex);
+    return cache->healthy;
+}
+
+extern "C" int coli_gpu_expert_cache_test_set_generation(
+    ColiGpuExpertCache *cache, int slot, uint64_t generation) {
+    if (!cache || slot < 0 || slot >= cache->config.slots ||
+        generation == 0)
+        return 0;
+    std::lock_guard<std::mutex> lock(cache->mutex);
+    if (!cache->healthy || !cache->slots[slot].published) return 0;
+    cache->slots[slot].generation = generation;
+    return 1;
+}
+
+extern "C" int coli_gpu_expert_cache_test_delay_upload(
+    ColiGpuExpertCache *cache, unsigned milliseconds) {
+    if (!cache || !milliseconds) return 0;
+    std::lock_guard<std::mutex> lock(cache->mutex);
+    if (!cache->healthy) return 0;
+    cache->test_delay_ms = milliseconds;
+    return 1;
+}
+
+extern "C" int coli_gpu_expert_cache_test_hold_snapshot(
+    ColiGpuExpertCache *cache, int hold) {
+    if (!cache || (hold != 0 && hold != 1)) return 0;
+    cache->test_hold_snapshot.store(hold, std::memory_order_release);
+    if (hold)
+        cache->test_snapshot_entered.store(0, std::memory_order_release);
+    return 1;
+}
+
+extern "C" int coli_gpu_expert_cache_test_snapshot_entered(
+    const ColiGpuExpertCache *cache) {
+    return cache &&
+        cache->test_snapshot_entered.load(std::memory_order_acquire);
+}
+
+typedef struct {
+    const void *data;
+    const float *scales;
+    int format;
+    int columns;
+    int groups;
+    int group_size;
+} ColiGpuMoeWeightView;
+
+__device__ static float gpu_moe_weight(
+    ColiGpuMoeWeightView weight, int row, int column) {
+    size_t packed_row =
+        (size_t)row * gpu_tensor_row_bytes(weight.format, weight.columns);
+    float value = weight_at(weight.data, weight.format, packed_row, column);
+    if (weight.format == 1 || weight.format == 2)
+        value *= weight.scales[row];
+    else if (weight.format == 4)
+        value *= weight.scales[
+            (size_t)row * weight.groups + column / weight.group_size];
+    return value;
+}
+
+__global__ static void gpu_moe_hidden_kernel(
+    float *activated, const float *input,
+    ColiGpuMoeWeightView gate, ColiGpuMoeWeightView up,
+    int intermediate, float swiglu_limit, const int *status) {
+    if (*status) return;
+    int out = (int)blockIdx.x;
+    if (out >= intermediate) return;
+    __shared__ float gate_partial[256];
+    __shared__ float up_partial[256];
+    float gate_sum = 0.0f, up_sum = 0.0f;
+    for (int column = (int)threadIdx.x; column < gate.columns;
+         column += (int)blockDim.x) {
+        float value = input[column];
+        gate_sum += value * gpu_moe_weight(gate, out, column);
+        up_sum += value * gpu_moe_weight(up, out, column);
+    }
+    gate_partial[threadIdx.x] = gate_sum;
+    up_partial[threadIdx.x] = up_sum;
+    __syncthreads();
+    for (int width = (int)blockDim.x / 2; width; width >>= 1) {
+        if ((int)threadIdx.x < width) {
+            gate_partial[threadIdx.x] += gate_partial[threadIdx.x + width];
+            up_partial[threadIdx.x] += up_partial[threadIdx.x + width];
+        }
+        __syncthreads();
+    }
+    if (!threadIdx.x) {
+        float gate_value = gate_partial[0];
+        float up_value = up_partial[0];
+        gate_value = fminf(gate_value, swiglu_limit);
+        up_value = fminf(fmaxf(up_value, -swiglu_limit), swiglu_limit);
+        activated[out] =
+            gate_value / (1.0f + expf(-gate_value)) * up_value;
+    }
+}
+
+__global__ static void gpu_moe_down_kernel(
+    float *output, const float *activated,
+    ColiGpuMoeWeightView down, int hidden, const int *status) {
+    if (*status) return;
+    int out = (int)blockIdx.x;
+    if (out >= hidden) return;
+    __shared__ float partial[256];
+    float sum = 0.0f;
+    for (int column = (int)threadIdx.x; column < down.columns;
+         column += (int)blockDim.x)
+        sum += activated[column] * gpu_moe_weight(down, out, column);
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int width = (int)blockDim.x / 2; width; width >>= 1) {
+        if ((int)threadIdx.x < width)
+            partial[threadIdx.x] += partial[threadIdx.x + width];
+        __syncthreads();
+    }
+    if (!threadIdx.x) output[out] = partial[0];
+}
+
+__global__ static void gpu_moe_accumulate_kernel(
+    float *output, const float *expert, const float *weight, int hidden,
+    const int *status) {
+    if (*status) return;
+    for (int column = (int)threadIdx.x; column < hidden;
+         column += (int)blockDim.x)
+        output[column] += *weight * expert[column];
+}
+
+__global__ static void gpu_moe_clear_kernel(
+    float *output, size_t count, const int *status) {
+    if (*status) return;
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (; index < count; index += stride) output[index] = 0.0f;
+}
+
+__global__ static void gpu_moe_validate_kernel(
+    const float *values, size_t count, int *status) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (; index < count; index += stride)
+        if (!isfinite(values[index])) atomicMax(status, 1);
+}
+
+static ColiGpuMoeWeightView gpu_moe_tensor_view(
+    const ColiGpuTensor *tensor) {
+    ColiGpuMoeWeightView view = {
+        tensor->data, tensor->scales, tensor->format, tensor->columns,
+        tensor->groups, tensor->group_size
+    };
+    return view;
+}
+
+static ColiGpuMoeWeightView gpu_moe_bank_view(
+    const void *data, const float *scales, int columns, int group_size) {
+    ColiGpuMoeWeightView view = {
+        data, scales, 4, columns,
+        (columns + group_size - 1) / group_size, group_size
+    };
+    return view;
+}
+
+static void gpu_moe_launch_expert(
+    ColiGpuContext *ctx, float *activated, float *temporary,
+    const float *input, ColiGpuMoeWeightView gate,
+    ColiGpuMoeWeightView up, ColiGpuMoeWeightView down,
+    int hidden, int intermediate, float swiglu_limit, int *status) {
+    gpu_moe_hidden_kernel<<<intermediate, 256, 0, ctx->stream>>>(
+        activated, input, gate, up, intermediate, swiglu_limit, status);
+    gpu_moe_down_kernel<<<hidden, 256, 0, ctx->stream>>>(
+        temporary, activated, down, hidden, status);
+    ctx->telemetry.moe_compute_launches += 2;
+}
+
+extern "C" size_t coli_gpu_moe_scratch_bytes(
+    const ColiGpuExpertCacheConfig *config) {
+    if (!config || config->hidden < 1 || config->intermediate < 1 ||
+        !std::isfinite(config->swiglu_limit) ||
+        config->swiglu_limit <= 0.0f ||
+        (size_t)config->hidden >
+            SIZE_MAX / sizeof(float) - (size_t)config->intermediate)
+        return 0;
+    return ((size_t)config->hidden + config->intermediate) * sizeof(float);
+}
+
+extern "C" int coli_gpu_expert_primitive(
+    ColiGpuArena *arena, size_t output_offset, size_t input_offset,
+    size_t scratch_offset, ColiGpuExpertCache *cache,
+    const ColiGpuMoeSharedWeights *weights, int rows) {
+    if (!arena || !cache || cache->ctx != arena->ctx || !weights ||
+        rows < 1 || rows > cache->config.max_rows ||
+        !std::isfinite(cache->config.swiglu_limit) ||
+        cache->config.swiglu_limit <= 0.0f || !cache->ctx->healthy ||
+        !select_device_ordinal(cache->ctx->device))
+        return 0;
+    {
+        std::lock_guard<std::mutex> lock(cache->mutex);
+        if (!cache->healthy) {
+            cache->ctx->telemetry.unhealthy_cache_rejections++;
+            return 0;
+        }
+    }
+    const int hidden = cache->config.hidden;
+    const int intermediate = cache->config.intermediate;
+    const ColiGpuTensor *all[3] = {
+        weights->gate, weights->up, weights->down
+    };
+    if (!all[0] || !all[1] || !all[2] ||
+        all[0]->ctx != cache->ctx || all[1]->ctx != cache->ctx ||
+        all[2]->ctx != cache->ctx ||
+        all[0]->rows != intermediate || all[1]->rows != intermediate ||
+        all[0]->columns != hidden || all[1]->columns != hidden ||
+        all[2]->rows != hidden || all[2]->columns != intermediate)
+        return 0;
+    for (int index = 0; index < 3; ++index)
+        if (all[index]->format != 0 && all[index]->format != 1 &&
+            all[index]->format != 2 && all[index]->format != 4)
+            return 0;
+    size_t activation_bytes = (size_t)rows * hidden * sizeof(float);
+    size_t scratch_bytes = coli_gpu_moe_scratch_bytes(&cache->config);
+    if (!gpu_range_ok(arena, input_offset, activation_bytes) ||
+        !gpu_range_ok(arena, output_offset, activation_bytes) ||
+        !gpu_range_ok(arena, scratch_offset, scratch_bytes) ||
+        gpu_ranges_overlap(input_offset, activation_bytes,
+                           output_offset, activation_bytes) ||
+        gpu_ranges_overlap(input_offset, activation_bytes,
+                           scratch_offset, scratch_bytes) ||
+        gpu_ranges_overlap(output_offset, activation_bytes,
+                           scratch_offset, scratch_bytes))
+        return 0;
+    float *input =
+        reinterpret_cast<float *>(arena->data + input_offset);
+    float *output =
+        reinterpret_cast<float *>(arena->data + output_offset);
+    float *activated =
+        reinterpret_cast<float *>(arena->data + scratch_offset);
+    *cache->host_status = 0;
+    int blocks = (int)((activation_bytes / sizeof(float) + 255u) / 256u);
+    if (blocks > 65535) blocks = 65535;
+    gpu_moe_validate_kernel<<<blocks, 256, 0, cache->ctx->stream>>>(
+        input, activation_bytes / sizeof(float), cache->device_status);
+    cache->ctx->telemetry.moe_compute_launches++;
+    if (!cuda_ok(cudaGetLastError(), "expert primitive input validation") ||
+        !coli_gpu_context_sync(cache->ctx) || *cache->host_status)
+        return 0;
+    ColiGpuMoeWeightView gate = gpu_moe_tensor_view(weights->gate);
+    ColiGpuMoeWeightView up = gpu_moe_tensor_view(weights->up);
+    ColiGpuMoeWeightView down = gpu_moe_tensor_view(weights->down);
+    for (int row = 0; row < rows; ++row)
+        gpu_moe_launch_expert(
+            cache->ctx, activated, output + (size_t)row * hidden,
+            input + (size_t)row * hidden, gate, up, down, hidden,
+            intermediate, cache->config.swiglu_limit, cache->device_status);
+    *cache->host_status = 0;
+    gpu_moe_validate_kernel<<<blocks, 256, 0, cache->ctx->stream>>>(
+        output, activation_bytes / sizeof(float), cache->device_status);
+    cache->ctx->telemetry.moe_compute_launches++;
+    return cuda_ok(cudaGetLastError(), "expert primitive launch") &&
+           coli_gpu_context_sync(cache->ctx) && !*cache->host_status;
+}
+
+extern "C" int coli_gpu_moe_site(
+    ColiGpuArena *arena, size_t output_offset, size_t input_offset,
+    size_t scratch_offset, ColiGpuRouter *router,
+    ColiGpuExpertCache *cache, const ColiGpuMoeSharedWeights *shared,
+    const ColiGpuExpertHandle *handles, size_t handle_count, int rows) {
+    if (!arena || !cache || cache->ctx != arena->ctx ||
+        rows < 1 || rows > cache->config.max_rows ||
+        (!router && !shared) || !cache->ctx->healthy ||
+        !select_device_ordinal(cache->ctx->device))
+        return 0;
+    const int hidden = cache->config.hidden;
+    const int intermediate = cache->config.intermediate;
+    size_t activation_bytes = (size_t)rows * hidden * sizeof(float);
+    size_t scratch_bytes = coli_gpu_moe_scratch_bytes(&cache->config);
+    if (!gpu_range_ok(arena, input_offset, activation_bytes) ||
+        !gpu_range_ok(arena, output_offset, activation_bytes) ||
+        !gpu_range_ok(arena, scratch_offset, scratch_bytes) ||
+        gpu_ranges_overlap(input_offset, activation_bytes,
+                           output_offset, activation_bytes) ||
+        gpu_ranges_overlap(input_offset, activation_bytes,
+                           scratch_offset, scratch_bytes) ||
+        gpu_ranges_overlap(output_offset, activation_bytes,
+                           scratch_offset, scratch_bytes))
+        return 0;
+    if (shared) {
+        const ColiGpuTensor *all[3] = {
+            shared->gate, shared->up, shared->down
+        };
+        if (!all[0] || !all[1] || !all[2] ||
+            all[0]->ctx != cache->ctx || all[1]->ctx != cache->ctx ||
+            all[2]->ctx != cache->ctx ||
+            all[0]->rows != intermediate || all[1]->rows != intermediate ||
+            all[0]->columns != hidden || all[1]->columns != hidden ||
+            all[2]->rows != hidden || all[2]->columns != intermediate)
+            return 0;
+        for (int index = 0; index < 3; ++index)
+            if (all[index]->format != 0 && all[index]->format != 1 &&
+                all[index]->format != 2 && all[index]->format != 4)
+                return 0;
+    }
+    size_t required_handles = 0;
+    if (router) {
+        if (router->ctx != cache->ctx || router->rows != rows ||
+            router->config.hidden != hidden ||
+            router->config.experts != cache->config.experts)
+            return 0;
+        required_handles = (size_t)rows * router->config.topk;
+        if (!handles || handle_count != required_handles ||
+            required_handles > cache->snapshot_capacity)
+            return 0;
+    } else if (handles || handle_count) {
+        return 0;
+    }
+
+    float *input = reinterpret_cast<float *>(
+        arena->data + input_offset);
+    float *output = reinterpret_cast<float *>(
+        arena->data + output_offset);
+    float *activated = reinterpret_cast<float *>(
+        arena->data + scratch_offset);
+    float *temporary = activated + intermediate;
+    int blocks = (int)((activation_bytes / sizeof(float) + 255u) / 256u);
+    if (blocks > 65535) blocks = 65535;
+    std::unique_lock<std::mutex> lock(cache->mutex);
+    if (!cache->healthy) {
+        cache->ctx->telemetry.unhealthy_cache_rejections++;
+        return 0;
+    }
+    ColiGpuExpertFaultPoint fault = cache->fault;
+    int fault_occurrence = cache->fault_occurrence;
+    cache->fault = COLI_GPU_EXPERT_FAULT_NONE;
+    cache->fault_occurrence = 0;
+    if (router) {
+        for (size_t index = 0; index < required_handles; ++index) {
+            if (handles[index].expert_id != router->host_selected[index]) {
+                cache->ctx->telemetry.wrong_expert_rejections++;
+                return 0;
+            }
+            if (!gpu_expert_handle_validate_locked(cache, &handles[index]))
+                return 0;
+            ColiGpuExpertSlot *slot =
+                &cache->slots[handles[index].slot];
+            cache->snapshots[index].bank =
+                &slot->bank[slot->active_bank];
+            cache->snapshots[index].publication = slot->publication;
+        }
+        if (cache->test_hold_snapshot.load(std::memory_order_acquire)) {
+            cache->test_snapshot_entered.store(1, std::memory_order_release);
+            while (cache->test_hold_snapshot.load(std::memory_order_acquire))
+                std::this_thread::yield();
+        }
+        for (size_t index = 0; index < required_handles; ++index) {
+            const ColiGpuExpertTransfer *publication =
+                cache->snapshots[index].publication;
+            if (!publication ||
+                !gpu_expert_stream_wait_event(
+                    cache, cache->ctx->stream, publication->ready,
+                    fault == COLI_GPU_EXPERT_FAULT_EVENT_WAIT &&
+                    (fault_occurrence == 0 ||
+                     fault_occurrence == (int)index + 1),
+                    "expert cache wait before use")) {
+                cache->test_snapshot_entered.store(
+                    0, std::memory_order_release);
+                return 0;
+            }
+        }
+    }
+    if (fault == COLI_GPU_EXPERT_FAULT_LAUNCH) {
+        cache->test_snapshot_entered.store(0, std::memory_order_release);
+        return 0;
+    }
+
+    *cache->host_status = 0;
+    gpu_moe_validate_kernel<<<blocks, 256, 0, cache->ctx->stream>>>(
+        input, activation_bytes / sizeof(float), cache->device_status);
+    cache->ctx->telemetry.moe_compute_launches++;
+    if (!shared) {
+        gpu_moe_clear_kernel<<<blocks, 256, 0, cache->ctx->stream>>>(
+            output, activation_bytes / sizeof(float),
+            cache->device_status);
+        cache->ctx->telemetry.moe_compute_launches++;
+    }
+    if (shared) {
+        ColiGpuMoeWeightView gate = gpu_moe_tensor_view(shared->gate);
+        ColiGpuMoeWeightView up = gpu_moe_tensor_view(shared->up);
+        ColiGpuMoeWeightView down = gpu_moe_tensor_view(shared->down);
+        for (int row = 0; row < rows; ++row)
+            gpu_moe_launch_expert(
+                cache->ctx, activated, output + (size_t)row * hidden,
+                input + (size_t)row * hidden, gate, up, down, hidden,
+                intermediate, cache->config.swiglu_limit,
+                cache->device_status);
+    }
+    if (router) {
+        for (size_t index = 0; index < required_handles; ++index) {
+            int row = (int)(index / (size_t)router->config.topk);
+            ColiGpuExpertBank *bank = cache->snapshots[index].bank;
+            gpu_moe_launch_expert(
+                cache->ctx, activated, temporary,
+                input + (size_t)row * hidden,
+                gpu_moe_bank_view(bank->gate_data, bank->gate_scales,
+                                  hidden, cache->config.group_size),
+                gpu_moe_bank_view(bank->up_data, bank->up_scales,
+                                  hidden, cache->config.group_size),
+                gpu_moe_bank_view(bank->down_data, bank->down_scales,
+                                  intermediate, cache->config.group_size),
+                hidden, intermediate, cache->config.swiglu_limit,
+                cache->device_status);
+            gpu_moe_accumulate_kernel<<<1, 256, 0, cache->ctx->stream>>>(
+                output + (size_t)row * hidden, temporary,
+                router->weights + index, hidden, cache->device_status);
+            cache->ctx->telemetry.moe_compute_launches++;
+            if (!cuda_ok(cudaEventRecord(
+                    bank->use_done, cache->ctx->stream),
+                    "expert cache bank use record")) {
+                cache->healthy = 0;
+                return 0;
+            }
+            bank->use_recorded = 1;
+        }
+        cache->test_snapshot_entered.store(0, std::memory_order_release);
+    }
+    lock.unlock();
+    gpu_moe_validate_kernel<<<blocks, 256, 0, cache->ctx->stream>>>(
+        output, activation_bytes / sizeof(float), cache->device_status);
+    cache->ctx->telemetry.moe_compute_launches++;
+    return cuda_ok(cudaGetLastError(), "resident MoE launch") &&
+           coli_gpu_context_sync(cache->ctx) && !*cache->host_status;
+}
+
+static int gpu_kda_config_ok(const ColiGpuKdaConfig *config) {
+    if (!config || config->heads <= 0 || config->head_dim <= 0 ||
+        config->head_dim > 512 || config->kernel <= 0 ||
+        config->kernel > 8 || config->max_rows <= 0 ||
+        config->max_context <= 0 ||
+        config->recurrent_norm_eps < 0.0f ||
+        config->output_norm_eps < 0.0f ||
+        !std::isfinite(config->recurrent_norm_eps) ||
+        !std::isfinite(config->output_norm_eps) ||
+        !std::isfinite(config->gate_lower_bound))
+        return 0;
+    size_t heads = (size_t)config->heads;
+    size_t dim = (size_t)config->head_dim;
+    if (heads > SIZE_MAX / dim) return 0;
+    size_t projection = heads * dim;
+    /* These products are narrowed to int for tensor geometry, loop bounds,
+     * launch counts, and kernel arguments. Reject them before any allocation
+     * or launch rather than relying on a 64-bit byte-range check. */
+    return projection <= (size_t)INT_MAX / 3u &&
+           (size_t)config->max_rows <= (size_t)INT_MAX / projection &&
+           (size_t)config->max_rows <=
+               (size_t)INT_MAX / (size_t)config->heads;
+}
+
+extern "C" size_t coli_gpu_kda_state_bytes(
+    const ColiGpuKdaConfig *config) {
+    if (!gpu_kda_config_ok(config)) return 0;
+    size_t values = (size_t)config->heads * config->head_dim;
+    if (values > SIZE_MAX / (size_t)config->head_dim ||
+        values * (size_t)config->head_dim > SIZE_MAX / sizeof(float))
+        return 0;
+    return values * (size_t)config->head_dim * sizeof(float);
+}
+
+extern "C" size_t coli_gpu_kda_window_bytes(
+    const ColiGpuKdaConfig *config) {
+    if (!gpu_kda_config_ok(config)) return 0;
+    size_t values = (size_t)config->heads * config->head_dim;
+    if (values > SIZE_MAX / 3u ||
+        values * 3u > SIZE_MAX / (size_t)config->kernel ||
+        values * 3u * (size_t)config->kernel > SIZE_MAX / sizeof(float))
+        return 0;
+    return values * 3u * (size_t)config->kernel * sizeof(float);
+}
+
+extern "C" size_t coli_gpu_kda_scratch_bytes(
+    const ColiGpuKdaConfig *config, int rows, int hidden) {
+    if (!gpu_kda_config_ok(config) || rows < 1 || rows > config->max_rows ||
+        hidden < 1)
+        return 0;
+    size_t projection = (size_t)config->heads * config->head_dim;
+    if (projection > (SIZE_MAX - 2u * (size_t)config->head_dim -
+                      (size_t)config->heads) / 7u)
+        return 0;
+    size_t per_row = 7u * projection + 2u * (size_t)config->head_dim +
+                     (size_t)config->heads;
+    if ((size_t)rows > SIZE_MAX / per_row ||
+        (size_t)rows * per_row > SIZE_MAX / sizeof(float))
+        return 0;
+    return (size_t)rows * per_row * sizeof(float);
+}
+
+extern "C" int coli_gpu_kda_state_create(
+    ColiGpuKdaState **out, ColiGpuContext *ctx, ColiGpuArena *arena,
+    size_t state_offset, size_t window_offset,
+    const ColiGpuKdaConfig *config) {
+    if (!out) return 0;
+    *out = nullptr;
+    size_t state_bytes = coli_gpu_kda_state_bytes(config);
+    size_t window_bytes = coli_gpu_kda_window_bytes(config);
+    if (!ctx || !arena || arena->ctx != ctx || !ctx->healthy ||
+        !state_bytes || !window_bytes ||
+        !gpu_range_ok(arena, state_offset, state_bytes) ||
+        !gpu_range_ok(arena, window_offset, window_bytes) ||
+        (state_offset < window_offset + window_bytes &&
+         window_offset < state_offset + state_bytes))
+        return 0;
+    ColiGpuKdaState *state =
+        static_cast<ColiGpuKdaState *>(std::calloc(1, sizeof(*state)));
+    if (!state) return 0;
+    state->ctx = ctx;
+    state->arena = arena;
+    state->state_offset = state_offset;
+    state->window_offset = window_offset;
+    state->config = *config;
+    *out = state;
+    return 1;
+}
+
+extern "C" void coli_gpu_kda_state_destroy(ColiGpuKdaState *state) {
+    std::free(state);
+}
+
+extern "C" int coli_gpu_kda_state_reset(ColiGpuKdaState *state) {
+    if (!state || !state->ctx || !state->arena ||
+        state->arena->ctx != state->ctx || !state->ctx->healthy ||
+        !select_device_ordinal(state->ctx->device))
+        return 0;
+    size_t state_bytes = coli_gpu_kda_state_bytes(&state->config);
+    size_t window_bytes = coli_gpu_kda_window_bytes(&state->config);
+    if (!cuda_ok(cudaMemsetAsync(state->arena->data + state->state_offset, 0,
+                                 state_bytes, state->ctx->stream),
+                 "resident KDA state reset") ||
+        !cuda_ok(cudaMemsetAsync(state->arena->data + state->window_offset, 0,
+                                 window_bytes, state->ctx->stream),
+                 "resident KDA window reset"))
+        return 0;
+    state->position = 0;
+    return 1;
+}
+
+extern "C" int coli_gpu_kda_state_download(
+    ColiGpuKdaState *state, float *matrix, size_t matrix_floats,
+    float *window, size_t window_floats) {
+    if (!state || !matrix || !window) return 0;
+    size_t state_bytes = coli_gpu_kda_state_bytes(&state->config);
+    size_t window_bytes = coli_gpu_kda_window_bytes(&state->config);
+    if (matrix_floats != state_bytes / sizeof(float) ||
+        window_floats != window_bytes / sizeof(float))
+        return 0;
+    return coli_gpu_arena_download(state->arena, state->state_offset,
+                                   matrix, state_bytes) &&
+           coli_gpu_arena_download(state->arena, state->window_offset,
+                                   window, window_bytes);
+}
+
+__global__ static void gpu_kda_transform_decay_kernel(
+    float *decay, const float *dt_bias, const float *a_log,
+    int count, int projection, int dim, float lower_bound) {
+    int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (index >= count) return;
+    int channel = index % projection;
+    int head = channel / dim;
+    decay[index] = lower_bound * gpu_stable_sigmoid(
+        expf(a_log[head]) * (decay[index] + dt_bias[channel]));
+}
+
+__global__ static void gpu_kda_sigmoid_kernel(float *values, int count) {
+    int index = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (index < count) values[index] = gpu_stable_sigmoid(values[index]);
+}
+
+/* qkv is projection-major [3, rows, heads * dim]. One block owns one head,
+ * and one lane deliberately performs that head's token sequence in reference
+ * loop order. Heads are independent, so this is deterministic without
+ * atomics while retaining head-level parallelism. */
+__global__ static void gpu_kda_recurrent_kernel(
+    float *output, float *qkv, const float *decay, const float *beta,
+    float *state, float *window, const float *conv,
+    int rows, int heads, int dim, int kernel, float norm_eps) {
+    int head = (int)blockIdx.x;
+    if (head >= heads || threadIdx.x != 0) return;
+    int projection = heads * dim;
+    extern __shared__ float memory[];
+    float query_scale = 1.0f / sqrtf((float)dim);
+    float *matrix = state + (size_t)head * dim * dim;
+    for (int row = 0; row < rows; ++row) {
+        for (int part = 0; part < 3; ++part)
+            for (int d = 0; d < dim; ++d) {
+                int channel = part * projection + head * dim + d;
+                float *history = window + (size_t)channel * kernel;
+                for (int tap = 0; tap + 1 < kernel; ++tap)
+                    history[tap] = history[tap + 1];
+                float *slot = qkv + ((size_t)part * rows + row) * projection +
+                              head * dim + d;
+                history[kernel - 1] = *slot;
+                float sum = 0.0f;
+                const float *taps = conv + (size_t)channel * kernel;
+                for (int tap = 0; tap < kernel; ++tap)
+                    sum += taps[tap] * history[tap];
+                *slot = sum / (1.0f + expf(-sum));
+            }
+        const float *query = qkv + (size_t)row * projection + head * dim;
+        const float *key = qkv + ((size_t)rows + row) * projection +
+                           head * dim;
+        const float *value = qkv + ((size_t)2 * rows + row) * projection +
+                             head * dim;
+        float query_square = norm_eps;
+        float key_square = norm_eps;
+        for (int d = 0; d < dim; ++d) {
+            query_square += query[d] * query[d];
+            key_square += key[d] * key[d];
+        }
+        float query_norm = query_scale / sqrtf(query_square);
+        float key_norm = 1.0f / sqrtf(key_square);
+        for (int vd = 0; vd < dim; ++vd) memory[vd] = 0.0f;
+        for (int kd = 0; kd < dim; ++kd) {
+            float *matrix_row = matrix + (size_t)kd * dim;
+            float alpha = expf(decay[(size_t)row * projection +
+                                     head * dim + kd]);
+            float scaled_key = key[kd] * key_norm;
+            for (int vd = 0; vd < dim; ++vd) {
+                matrix_row[vd] *= alpha;
+                memory[vd] += scaled_key * matrix_row[vd];
+            }
+        }
+        float *result = output + (size_t)row * projection + head * dim;
+        for (int vd = 0; vd < dim; ++vd) result[vd] = 0.0f;
+        for (int kd = 0; kd < dim; ++kd) {
+            float *matrix_row = matrix + (size_t)kd * dim;
+            float scaled_key = key[kd] * key_norm;
+            float scaled_query = query[kd] * query_norm;
+            for (int vd = 0; vd < dim; ++vd) {
+                matrix_row[vd] += scaled_key * (value[vd] - memory[vd]) *
+                                  beta[(size_t)row * heads + head];
+                result[vd] += scaled_query * matrix_row[vd];
+            }
+        }
+    }
+}
+
+static int gpu_kda_state_call_ok(ColiGpuArena *arena,
+                                 ColiGpuKdaState *state,
+                                 int rows, int start_position) {
+    return arena && state && state->arena == arena &&
+           state->ctx == arena->ctx && rows > 0 &&
+           rows <= state->config.max_rows && start_position >= 0 &&
+           start_position == state->position &&
+           start_position <= state->config.max_context - rows &&
+           arena->ctx->healthy;
+}
+
+typedef struct {
+    size_t offset;
+    size_t bytes;
+} ColiGpuKdaRange;
+
+static int gpu_kda_ranges_overlap(ColiGpuKdaRange a, ColiGpuKdaRange b) {
+    if (a.offset <= b.offset) return b.offset - a.offset < a.bytes;
+    return a.offset - b.offset < b.bytes;
+}
+
+/* All arena ranges participating in one generic KDA call are exclusive.
+ * This intentionally rejects aliases that might happen to be safe for one
+ * current launch order: qkv, scratch, state, and windows are mutated in place,
+ * and the API must not make correctness depend on undocumented ordering. */
+static int gpu_kda_ranges_disjoint(const ColiGpuKdaState *state,
+                                   const ColiGpuKdaRange *ranges,
+                                   int range_count) {
+    if (!state || !ranges || range_count < 1) return 0;
+    ColiGpuKdaRange persistent[2] = {
+        {state->state_offset, coli_gpu_kda_state_bytes(&state->config)},
+        {state->window_offset, coli_gpu_kda_window_bytes(&state->config)}
+    };
+    for (int i = 0; i < range_count; ++i) {
+        if (!ranges[i].bytes) return 0;
+        for (int p = 0; p < 2; ++p)
+            if (gpu_kda_ranges_overlap(ranges[i], persistent[p])) return 0;
+        for (int j = 0; j < i; ++j)
+            if (gpu_kda_ranges_overlap(ranges[i], ranges[j])) return 0;
+    }
+    return 1;
+}
+
+extern "C" int coli_gpu_kda_recurrent(
+    ColiGpuArena *arena, size_t output_offset, size_t qkv_offset,
+    size_t decay_offset, size_t beta_offset, ColiGpuKdaState *state,
+    const ColiGpuTensor *conv, int rows, int start_position) {
+    if (!gpu_kda_state_call_ok(arena, state, rows, start_position))
+        return 0;
+    int heads = state->config.heads;
+    int dim = state->config.head_dim;
+    int projection = heads * dim;
+    size_t output_bytes = (size_t)rows * projection * sizeof(float);
+    size_t qkv_bytes = output_bytes * 3u;
+    size_t decay_bytes = output_bytes;
+    size_t beta_bytes = (size_t)rows * heads * sizeof(float);
+    ColiGpuKdaRange ranges[] = {
+        {output_offset, output_bytes},
+        {qkv_offset, qkv_bytes},
+        {decay_offset, decay_bytes},
+        {beta_offset, beta_bytes}
+    };
+    if (!gpu_tensor_same_context(arena, conv) ||
+        conv->format != 0 || conv->rows != 3 * projection ||
+        conv->columns != state->config.kernel ||
+        !gpu_range_ok(arena, output_offset, output_bytes) ||
+        !gpu_range_ok(arena, qkv_offset, qkv_bytes) ||
+        !gpu_range_ok(arena, decay_offset, decay_bytes) ||
+        !gpu_range_ok(arena, beta_offset, beta_bytes) ||
+        !gpu_kda_ranges_disjoint(
+            state, ranges, (int)(sizeof(ranges) / sizeof(ranges[0]))) ||
+        !select_device_ordinal(arena->ctx->device))
+        return 0;
+    gpu_kda_recurrent_kernel<<<heads, 1, (size_t)dim * sizeof(float),
+                               arena->ctx->stream>>>(
+        reinterpret_cast<float *>(arena->data + output_offset),
+        reinterpret_cast<float *>(arena->data + qkv_offset),
+        reinterpret_cast<const float *>(arena->data + decay_offset),
+        reinterpret_cast<const float *>(arena->data + beta_offset),
+        reinterpret_cast<float *>(arena->data + state->state_offset),
+        reinterpret_cast<float *>(arena->data + state->window_offset),
+        reinterpret_cast<const float *>(conv->data), rows, heads, dim,
+        state->config.kernel, state->config.recurrent_norm_eps);
+    if (!cuda_ok(cudaGetLastError(), "resident KDA recurrence launch"))
+        return 0;
+    state->position += rows;
+    return 1;
+}
+
+__global__ static void gpu_kda_output_norm_gate_kernel(
+    float *output, const float *core, const float *gate,
+    const float *norm, int heads, int dim, float eps) {
+    int row_head = (int)blockIdx.x;
+    if (threadIdx.x != 0) return;
+    (void)heads;
+    int base = row_head * dim;
+    float square = 0.0f;
+    for (int d = 0; d < dim; ++d)
+        square += core[base + d] * core[base + d];
+    float inverse = 1.0f / sqrtf(square / dim + eps);
+    for (int d = 0; d < dim; ++d)
+        output[base + d] = core[base + d] * inverse * norm[d] *
+                           gpu_stable_sigmoid(gate[base + d]);
+}
+
+static int gpu_kda_weight_shape(const ColiGpuArena *arena,
+                                const ColiGpuTensor *tensor,
+                                int rows, int columns, int f32_only) {
+    return gpu_tensor_same_context(arena, tensor) &&
+           tensor->rows == rows && tensor->columns == columns &&
+           (!f32_only || tensor->format == 0);
+}
+
+extern "C" int coli_gpu_kda_site(
+    ColiGpuArena *arena, size_t output_offset, size_t input_offset,
+    size_t scratch_offset, ColiGpuKdaState *state,
+    const ColiGpuKdaWeights *weights, int rows, int start_position,
+    int hidden) {
+    if (!weights || !gpu_kda_state_call_ok(arena, state, rows, start_position) ||
+        hidden < 1)
+        return 0;
+    const int heads = state->config.heads;
+    const int dim = state->config.head_dim;
+    const int projection = heads * dim;
+    size_t input_bytes = (size_t)rows * hidden * sizeof(float);
+    size_t output_bytes = input_bytes;
+    size_t scratch_bytes =
+        coli_gpu_kda_scratch_bytes(&state->config, rows, hidden);
+    ColiGpuKdaRange ranges[] = {
+        {input_offset, input_bytes},
+        {output_offset, output_bytes},
+        {scratch_offset, scratch_bytes}
+    };
+    if (!scratch_bytes ||
+        !gpu_range_ok(arena, input_offset, input_bytes) ||
+        !gpu_range_ok(arena, output_offset, output_bytes) ||
+        !gpu_range_ok(arena, scratch_offset, scratch_bytes) ||
+        !gpu_kda_ranges_disjoint(
+            state, ranges, (int)(sizeof(ranges) / sizeof(ranges[0]))) ||
+        !gpu_kda_weight_shape(arena, weights->q_proj, projection, hidden, 0) ||
+        !gpu_kda_weight_shape(arena, weights->k_proj, projection, hidden, 0) ||
+        !gpu_kda_weight_shape(arena, weights->v_proj, projection, hidden, 0) ||
+        !gpu_kda_weight_shape(arena, weights->o_proj, hidden, projection, 0) ||
+        !gpu_kda_weight_shape(arena, weights->gate_a_proj, dim, hidden, 0) ||
+        !gpu_kda_weight_shape(arena, weights->gate_b_proj, projection, dim, 0) ||
+        !gpu_kda_weight_shape(arena, weights->decay_a_proj, dim, hidden, 0) ||
+        !gpu_kda_weight_shape(arena, weights->decay_b_proj, projection, dim, 0) ||
+        !gpu_kda_weight_shape(arena, weights->beta_proj, heads, hidden, 0) ||
+        !gpu_kda_weight_shape(arena, weights->conv, 3 * projection,
+                              state->config.kernel, 1) ||
+        !gpu_kda_weight_shape(arena, weights->dt_bias, 1, projection, 1) ||
+        !gpu_kda_weight_shape(arena, weights->a_log, 1, heads, 1) ||
+        !gpu_kda_weight_shape(arena, weights->o_norm, 1, dim, 1))
+        return 0;
+
+    size_t cursor = scratch_offset;
+    const size_t qkv = cursor;
+    cursor += (size_t)rows * 3 * projection * sizeof(float);
+    const size_t decay_low = cursor;
+    cursor += (size_t)rows * dim * sizeof(float);
+    const size_t decay = cursor;
+    cursor += (size_t)rows * projection * sizeof(float);
+    const size_t beta = cursor;
+    cursor += (size_t)rows * heads * sizeof(float);
+    const size_t gate_low = cursor;
+    cursor += (size_t)rows * dim * sizeof(float);
+    const size_t gate = cursor;
+    cursor += (size_t)rows * projection * sizeof(float);
+    const size_t core = cursor;
+    cursor += (size_t)rows * projection * sizeof(float);
+    const size_t normed = cursor;
+
+    if (!coli_gpu_projection(arena, qkv, input_offset, weights->q_proj,
+                             rows, hidden, projection) ||
+        !coli_gpu_projection(arena, qkv + (size_t)rows * projection * sizeof(float),
+                             input_offset, weights->k_proj,
+                             rows, hidden, projection) ||
+        !coli_gpu_projection(arena, qkv + (size_t)2 * rows * projection * sizeof(float),
+                             input_offset, weights->v_proj,
+                             rows, hidden, projection) ||
+        !coli_gpu_projection(arena, decay_low, input_offset,
+                             weights->decay_a_proj, rows, hidden, dim) ||
+        !coli_gpu_projection(arena, decay, decay_low, weights->decay_b_proj,
+                             rows, dim, projection) ||
+        !coli_gpu_projection(arena, beta, input_offset, weights->beta_proj,
+                             rows, hidden, heads))
+        return 0;
+    int decay_count = rows * projection;
+    int blocks = 1 + (decay_count - 1) / 256;
+    gpu_kda_transform_decay_kernel<<<blocks, 256, 0, arena->ctx->stream>>>(
+        reinterpret_cast<float *>(arena->data + decay),
+        reinterpret_cast<const float *>(weights->dt_bias->data),
+        reinterpret_cast<const float *>(weights->a_log->data),
+        decay_count, projection, dim, state->config.gate_lower_bound);
+    if (!cuda_ok(cudaGetLastError(), "resident KDA decay transform launch"))
+        return 0;
+    int beta_count = rows * heads;
+    gpu_kda_sigmoid_kernel<<<1 + (beta_count - 1) / 256, 256, 0,
+                              arena->ctx->stream>>>(
+        reinterpret_cast<float *>(arena->data + beta), beta_count);
+    if (!cuda_ok(cudaGetLastError(), "resident KDA beta transform launch") ||
+        !coli_gpu_kda_recurrent(arena, core, qkv, decay, beta, state,
+                                weights->conv, rows, start_position) ||
+        !coli_gpu_projection(arena, gate_low, input_offset,
+                             weights->gate_a_proj, rows, hidden, dim) ||
+        !coli_gpu_projection(arena, gate, gate_low, weights->gate_b_proj,
+                             rows, dim, projection))
+        return 0;
+    gpu_kda_output_norm_gate_kernel<<<rows * heads, 1, 0,
+                                      arena->ctx->stream>>>(
+        reinterpret_cast<float *>(arena->data + normed),
+        reinterpret_cast<const float *>(arena->data + core),
+        reinterpret_cast<const float *>(arena->data + gate),
+        reinterpret_cast<const float *>(weights->o_norm->data),
+        heads, dim, state->config.output_norm_eps);
+    if (!cuda_ok(cudaGetLastError(), "resident KDA output norm/gate launch"))
+        return 0;
+    return coli_gpu_projection(arena, output_offset, normed, weights->o_proj,
+                               rows, projection, hidden);
+}
+
+static int gpu_mla_config_ok(const ColiGpuMlaConfig *config) {
+    if (!config || config->hidden < 1 || config->heads < 1 ||
+        config->q_lora < 1 || config->kv_lora < 1 ||
+        config->qk_nope < 1 || config->qk_rope != 0 ||
+        config->value_dim < 1 || config->index_heads < 1 ||
+        config->index_dim < 1 || config->index_pool < 1 ||
+        config->index_topk < config->index_pool ||
+        config->index_topk % config->index_pool ||
+        (config->index_select_tail != 0 &&
+         config->index_select_tail != 1) ||
+        config->max_rows < 1 || config->max_context < 1 ||
+        config->max_rows > config->max_context ||
+        config->page_tokens < 1 ||
+        config->page_tokens > config->max_context ||
+        config->rms_norm_eps < 0.0f ||
+        config->index_norm_eps < 0.0f ||
+        !std::isfinite(config->rms_norm_eps) ||
+        !std::isfinite(config->index_norm_eps))
+        return 0;
+    size_t heads = (size_t)config->heads;
+    size_t index_heads = (size_t)config->index_heads;
+    return heads <= (size_t)INT_MAX / (size_t)config->qk_nope &&
+           heads <= (size_t)INT_MAX / (size_t)config->kv_lora &&
+           heads <= (size_t)INT_MAX / (size_t)config->value_dim &&
+           index_heads <= (size_t)INT_MAX / (size_t)config->index_dim &&
+           (size_t)config->max_context <=
+               (size_t)INT_MAX / (size_t)config->kv_lora &&
+           (size_t)config->max_context <=
+               (size_t)INT_MAX / (size_t)config->index_dim;
+}
+
+static int gpu_mla_width(const ColiGpuMlaConfig *config) {
+    if (!gpu_mla_config_ok(config)) return 0;
+    if (config->index_select_tail &&
+        config->index_topk > INT_MAX - config->index_pool + 1)
+        return 0;
+    return config->index_topk +
+           (config->index_select_tail ? config->index_pool - 1 : 0);
+}
+
+extern "C" size_t coli_gpu_mla_selected_bytes(
+    const ColiGpuMlaConfig *config, int rows) {
+    int width = gpu_mla_width(config);
+    if (!width || rows < 1 || rows > config->max_rows ||
+        (size_t)rows > SIZE_MAX / (size_t)width ||
+        (size_t)rows * (size_t)width > SIZE_MAX / sizeof(int))
+        return 0;
+    return (size_t)rows * (size_t)width * sizeof(int);
+}
+
+extern "C" size_t coli_gpu_mla_scratch_bytes(
+    const ColiGpuMlaConfig *config) {
+    int width = gpu_mla_width(config);
+    if (!width) return 0;
+    size_t pools = ((size_t)config->max_context +
+                    (size_t)config->index_pool - 1u) /
+                   (size_t)config->index_pool;
+    size_t attention_scores = (size_t)config->heads * (size_t)width;
+    size_t score_count =
+        pools > attention_scores ? pools : attention_scores;
+    size_t values_per_row = (size_t)config->q_lora +
+        (size_t)config->heads * (size_t)config->qk_nope +
+        (size_t)config->heads * (size_t)config->kv_lora +
+        (size_t)config->index_heads * (size_t)config->index_dim +
+        (size_t)config->index_heads + score_count +
+        (size_t)config->heads * (size_t)config->value_dim;
+    if ((size_t)config->max_rows > SIZE_MAX / values_per_row ||
+        (size_t)config->max_rows * values_per_row >
+            SIZE_MAX / sizeof(float))
+        return 0;
+    return (size_t)config->max_rows * values_per_row * sizeof(float);
+}
+
+static size_t gpu_mla_page_bytes(const ColiGpuMlaConfig *config) {
+    return (size_t)config->page_tokens *
+           ((size_t)config->kv_lora + 2u * (size_t)config->index_dim) *
+           sizeof(float);
+}
+
+static int gpu_mla_async_alloc(ColiGpuMlaState *state, void **out,
+                               size_t bytes, const char *what) {
+    *out = nullptr;
+    if (!cuda_ok(cudaMallocAsync(out, bytes, state->ctx->stream), what))
+        return 0;
+    state->ctx->telemetry.device_allocations++;
+    return 1;
+}
+
+static int gpu_mla_async_free(ColiGpuMlaState *state, void *pointer) {
+    return !pointer ||
+           cuda_ok(cudaFreeAsync(pointer, state->ctx->stream),
+                   "resident MLA stream-ordered free");
+}
+
+static void gpu_mla_host_free(void *pointer) {
+    if (!pointer) return;
+    cudaError_t error = cudaFreeHost(pointer);
+    if (error != cudaSuccess)
+        std::fprintf(stderr, "[CUDA] resident MLA host status free: %s\n",
+                     cudaGetErrorString(error));
+}
+
+static int gpu_mla_alloc_page(ColiGpuMlaState *state,
+                              ColiGpuMlaPage *page) {
+    std::memset(page, 0, sizeof(*page));
+    size_t latent_values =
+        (size_t)state->config.page_tokens * state->config.kv_lora;
+    size_t index_values =
+        (size_t)state->config.page_tokens * state->config.index_dim;
+    if (!gpu_mla_async_alloc(
+            state, &page->allocation, gpu_mla_page_bytes(&state->config),
+            "resident MLA page allocation"))
+        return 0;
+    page->latent = static_cast<float *>(page->allocation);
+    page->index_keys = page->latent + latent_values;
+    page->index_gates = page->index_keys + index_values;
+    if (!cuda_ok(cudaMemsetAsync(page->allocation, 0,
+                                 gpu_mla_page_bytes(&state->config),
+                                 state->ctx->stream),
+                 "resident MLA page initialize")) {
+        gpu_mla_async_free(state, page->allocation);
+        std::memset(page, 0, sizeof(*page));
+        return 0;
+    }
+    return 1;
+}
+
+__global__ static void gpu_mla_publish_page_kernel(
+    ColiGpuMlaPage *table, int index, ColiGpuMlaPage page) {
+    if (!blockIdx.x && !threadIdx.x) table[index] = page;
+}
+
+static int gpu_mla_fault(ColiGpuMlaState *state,
+                         ColiGpuMlaFaultPoint point) {
+    if (state->fault_point != point) return 0;
+    int occurrence = state->fault_seen++;
+    if (occurrence != state->fault_occurrence) return 0;
+    state->fault_point = COLI_GPU_MLA_FAULT_NONE;
+    return 1;
+}
+
+extern "C" int coli_gpu_mla_state_create(
+    ColiGpuMlaState **out, ColiGpuContext *ctx,
+    const ColiGpuMlaConfig *config) {
+    if (!out) return 0;
+    *out = nullptr;
+    if (!ctx || !ctx->healthy || !gpu_mla_config_ok(config) ||
+        !coli_gpu_mla_scratch_bytes(config) ||
+        !select_device_ordinal(ctx->device))
+        return 0;
+    ColiGpuMlaState *state =
+        static_cast<ColiGpuMlaState *>(std::calloc(1, sizeof(*state)));
+    if (!state) return 0;
+    state->ctx = ctx;
+    state->config = *config;
+    state->max_pages =
+        (config->max_context + config->page_tokens - 1) /
+        config->page_tokens;
+    state->pages = static_cast<ColiGpuMlaPage *>(
+        std::calloc((size_t)state->max_pages, sizeof(*state->pages)));
+    void *mapped_status = nullptr;
+    if (!state->pages ||
+        !cuda_ok(cudaHostAlloc(&mapped_status, sizeof(int),
+                               cudaHostAllocMapped),
+                 "resident MLA mapped status allocation")) {
+        std::free(state->pages);
+        std::free(state);
+        return 0;
+    }
+    state->host_status = static_cast<volatile int *>(mapped_status);
+    if (!cuda_ok(cudaHostGetDevicePointer(
+            reinterpret_cast<void **>(&state->device_status),
+            mapped_status, 0),
+            "resident MLA mapped status device pointer")) {
+        gpu_mla_host_free(mapped_status);
+        std::free(state->pages);
+        std::free(state);
+        return 0;
+    }
+    *state->host_status = COLI_GPU_MLA_STATUS_OK;
+    if (!gpu_mla_alloc_page(state, &state->pages[0]) ||
+        !gpu_mla_async_alloc(
+            state, reinterpret_cast<void **>(&state->device_pages),
+            sizeof(ColiGpuMlaPage), "resident MLA page-table allocation")) {
+        coli_gpu_mla_state_destroy(state);
+        return 0;
+    }
+    gpu_mla_publish_page_kernel<<<1, 1, 0, ctx->stream>>>(
+        state->device_pages, 0, state->pages[0]);
+    if (!cuda_ok(cudaGetLastError(), "resident MLA initial page publication")) {
+        coli_gpu_mla_state_destroy(state);
+        return 0;
+    }
+    state->page_count = 1;
+    state->page_table_capacity = 1;
+    state->capacity = config->page_tokens < config->max_context
+        ? config->page_tokens : config->max_context;
+    *out = state;
+    return 1;
+}
+
+extern "C" void coli_gpu_mla_state_destroy(ColiGpuMlaState *state) {
+    if (!state) return;
+    if (state->ctx && select_device_ordinal(state->ctx->device)) {
+        for (int page = 0; page < state->page_count; ++page)
+            gpu_mla_async_free(state, state->pages[page].allocation);
+        gpu_mla_async_free(state, state->device_pages);
+        coli_gpu_context_sync(state->ctx);
+    }
+    if (state->host_status)
+        gpu_mla_host_free(const_cast<int *>(state->host_status));
+    std::free(state->pages);
+    std::free(state);
+}
+
+extern "C" int coli_gpu_mla_state_reset(ColiGpuMlaState *state) {
+    if (!state || !state->ctx || !state->ctx->healthy ||
+        !select_device_ordinal(state->ctx->device))
+        return 0;
+    for (int page = 0; page < state->page_count; ++page)
+        if (!cuda_ok(cudaMemsetAsync(
+                state->pages[page].allocation, 0,
+                gpu_mla_page_bytes(&state->config), state->ctx->stream),
+                "resident MLA page reset"))
+            return 0;
+    state->length = 0;
+    *state->host_status = COLI_GPU_MLA_STATUS_OK;
+    return 1;
+}
+
+extern "C" int coli_gpu_mla_state_length(const ColiGpuMlaState *state) {
+    return state ? state->length : 0;
+}
+
+extern "C" int coli_gpu_mla_state_capacity(const ColiGpuMlaState *state) {
+    return state ? state->capacity : 0;
+}
+
+extern "C" int coli_gpu_mla_state_cache_info(
+    const ColiGpuMlaState *state, ColiGpuMlaCacheInfo *out) {
+    if (!state || !out) return 0;
+    out->logical_length = state->length;
+    out->capacity = state->capacity;
+    out->page_count = state->page_count;
+    out->page_table_capacity = state->page_table_capacity;
+    out->payload_copy_bytes = state->payload_copy_bytes;
+    return 1;
+}
+
+extern "C" int coli_gpu_mla_state_inject_growth_fault(
+    ColiGpuMlaState *state, ColiGpuMlaFaultPoint point, int occurrence) {
+    if (!state || point < COLI_GPU_MLA_FAULT_NONE ||
+        point > COLI_GPU_MLA_FAULT_TABLE_PUBLISH || occurrence < 0)
+        return 0;
+    state->fault_point = point;
+    state->fault_occurrence = occurrence;
+    state->fault_seen = 0;
+    return 1;
+}
+
+extern "C" ColiGpuMlaStatus coli_gpu_mla_state_status(
+    const ColiGpuMlaState *state) {
+    return state && state->host_status
+        ? static_cast<ColiGpuMlaStatus>(*state->host_status)
+        : COLI_GPU_MLA_STATUS_NONFINITE_RESULT;
+}
+
+extern "C" int coli_gpu_mla_state_launch_info(
+    const ColiGpuMlaState *state, ColiGpuMlaLaunchInfo *out) {
+    if (!state || !out) return 0;
+    *out = state->launch_info;
+    return 1;
+}
+
+extern "C" int coli_gpu_mla_state_test_corrupt_cache(
+    ColiGpuMlaState *state, ColiGpuMlaCacheKind kind,
+    int position, int channel, float value) {
+    if (!state || position < 0 || position >= state->length ||
+        kind < COLI_GPU_MLA_CACHE_LATENT ||
+        kind > COLI_GPU_MLA_CACHE_INDEX_GATE ||
+        !select_device_ordinal(state->ctx->device))
+        return 0;
+    ColiGpuMlaPage &page = state->pages[position / state->config.page_tokens];
+    int columns = kind == COLI_GPU_MLA_CACHE_LATENT
+        ? state->config.kv_lora : state->config.index_dim;
+    if (channel < 0 || channel >= columns) return 0;
+    float *base = kind == COLI_GPU_MLA_CACHE_LATENT ? page.latent :
+                  kind == COLI_GPU_MLA_CACHE_INDEX_KEY
+                      ? page.index_keys : page.index_gates;
+    float *at = base +
+        (size_t)(position % state->config.page_tokens) * columns + channel;
+    return cuda_ok(cudaMemcpyAsync(
+                       at, &value, sizeof(value), cudaMemcpyHostToDevice,
+                       state->ctx->stream),
+                   "resident MLA test cache corruption") &&
+           coli_gpu_context_sync(state->ctx);
+}
+
+static void gpu_mla_record_launch(
+    ColiGpuMlaState *state, int blocks, int threads) {
+    state->launch_info.kernel_launches++;
+    state->launch_info.total_grid_blocks += (uint64_t)blocks;
+    if (blocks > state->launch_info.max_grid_blocks)
+        state->launch_info.max_grid_blocks = blocks;
+    if (threads > state->launch_info.max_block_threads)
+        state->launch_info.max_block_threads = threads;
+}
+
+static int gpu_mla_reserve(ColiGpuMlaState *state, int required) {
+    if (required <= state->capacity) return 1;
+    if (required > state->config.max_context) return 0;
+    int required_pages =
+        (required + state->config.page_tokens - 1) /
+        state->config.page_tokens;
+    int target_pages = state->page_count;
+    while (target_pages < required_pages) {
+        if (target_pages > state->max_pages / 2) {
+            target_pages = state->max_pages;
+            break;
+        }
+        target_pages *= 2;
+    }
+    if (target_pages < required_pages) target_pages = required_pages;
+    if (gpu_mla_fault(state, COLI_GPU_MLA_FAULT_TABLE_ALLOC))
+        return 0;
+    ColiGpuMlaPage *new_table = nullptr;
+    if (!gpu_mla_async_alloc(
+            state, reinterpret_cast<void **>(&new_table),
+            (size_t)target_pages * sizeof(*new_table),
+            "resident MLA grown page-table allocation"))
+        return 0;
+    if (gpu_mla_fault(state, COLI_GPU_MLA_FAULT_TABLE_COPY) ||
+        !cuda_ok(cudaMemcpyAsync(
+            new_table, state->device_pages,
+            (size_t)state->page_count * sizeof(*new_table),
+            cudaMemcpyDeviceToDevice, state->ctx->stream),
+            "resident MLA page-table copy")) {
+        gpu_mla_async_free(state, new_table);
+        return 0;
+    }
+    std::vector<ColiGpuMlaPage> pending(
+        (size_t)(target_pages - state->page_count));
+    int created = 0;
+    for (int page = state->page_count; page < target_pages; ++page) {
+        if (gpu_mla_fault(state, COLI_GPU_MLA_FAULT_PAGE_ALLOC) ||
+            !gpu_mla_alloc_page(state, &pending[(size_t)created]))
+            goto rollback;
+        created++;
+        if (gpu_mla_fault(state, COLI_GPU_MLA_FAULT_PAGE_PUBLISH))
+            goto rollback;
+        gpu_mla_publish_page_kernel<<<1, 1, 0, state->ctx->stream>>>(
+            new_table, page, pending[(size_t)created - 1]);
+        if (!cuda_ok(cudaGetLastError(),
+                     "resident MLA page publication"))
+            goto rollback;
+    }
+    if (gpu_mla_fault(state, COLI_GPU_MLA_FAULT_TABLE_PUBLISH))
+        goto rollback;
+    if (!gpu_mla_async_free(state, state->device_pages))
+        goto rollback;
+    for (int i = 0; i < created; ++i)
+        state->pages[state->page_count + i] = pending[(size_t)i];
+    state->device_pages = new_table;
+    state->page_count = target_pages;
+    state->page_table_capacity = target_pages;
+    state->capacity = target_pages * state->config.page_tokens;
+    if (state->capacity > state->config.max_context)
+        state->capacity = state->config.max_context;
+    return 1;
+
+rollback:
+    for (int i = 0; i < created; ++i)
+        gpu_mla_async_free(state, pending[(size_t)i].allocation);
+    gpu_mla_async_free(state, new_table);
+    return 0;
+}
+
+extern "C" int coli_gpu_mla_state_reserve(
+    ColiGpuMlaState *state, int required) {
+    return state && required >= 0 && gpu_mla_reserve(state, required);
+}
+
+extern "C" int coli_gpu_mla_state_download(
+    ColiGpuMlaState *state,
+    float *latent, size_t latent_floats,
+    float *index_keys, size_t index_key_floats,
+    float *index_gates, size_t index_gate_floats) {
+    if (!state) return 0;
+    size_t latent_count =
+        (size_t)state->length * state->config.kv_lora;
+    size_t index_count =
+        (size_t)state->length * state->config.index_dim;
+    if (latent_floats != latent_count ||
+        index_key_floats != index_count ||
+        index_gate_floats != index_count ||
+        (latent_count && !latent) || (index_count && (!index_keys || !index_gates)))
+        return 0;
+    if (!latent_count) return 1;
+    if (!select_device_ordinal(state->ctx->device)) return 0;
+    for (int page = 0, copied = 0; copied < state->length; ++page) {
+        int count = state->length - copied;
+        if (count > state->config.page_tokens)
+            count = state->config.page_tokens;
+        size_t latent_bytes =
+            (size_t)count * state->config.kv_lora * sizeof(float);
+        size_t index_bytes =
+            (size_t)count * state->config.index_dim * sizeof(float);
+        if (!cuda_ok(cudaMemcpyAsync(
+                latent + (size_t)copied * state->config.kv_lora,
+                state->pages[page].latent, latent_bytes,
+                cudaMemcpyDeviceToHost, state->ctx->stream),
+                "resident MLA latent page download") ||
+            !cuda_ok(cudaMemcpyAsync(
+                index_keys + (size_t)copied * state->config.index_dim,
+                state->pages[page].index_keys, index_bytes,
+                cudaMemcpyDeviceToHost, state->ctx->stream),
+                "resident MLA index-key page download") ||
+            !cuda_ok(cudaMemcpyAsync(
+                index_gates + (size_t)copied * state->config.index_dim,
+                state->pages[page].index_gates, index_bytes,
+                cudaMemcpyDeviceToHost, state->ctx->stream),
+                "resident MLA index-gate page download"))
+            return 0;
+        state->ctx->telemetry.d2h_copies += 3;
+        state->ctx->telemetry.d2h_bytes +=
+            latent_bytes + 2u * index_bytes;
+        copied += count;
+    }
+    return coli_gpu_context_sync(state->ctx);
+}
+
+typedef struct {
+    const void *data;
+    const float *scales;
+    int format;
+    int columns;
+    int groups;
+    int group_size;
+} ColiGpuMlaWeightView;
+
+__device__ static float gpu_mla_weight(
+    ColiGpuMlaWeightView weight, int row, int column) {
+    size_t row_offset =
+        (size_t)row * gpu_tensor_row_bytes(weight.format, weight.columns);
+    float value = weight_at(weight.data, weight.format, row_offset, column);
+    if (!weight.format) return value;
+    if (weight.format == 4)
+        return value * weight.scales[(size_t)row * weight.groups +
+                                     column / weight.group_size];
+    return value * weight.scales[row];
+}
+
+__device__ static void gpu_mla_matvec(
+    float *out, ColiGpuMlaWeightView weight, const float *input, int rows) {
+    for (int row = 0; row < rows; ++row) {
+        float sum = 0.0f;
+        for (int column = 0; column < weight.columns; ++column)
+            sum += gpu_mla_weight(weight, row, column) * input[column];
+        out[row] = sum;
+    }
+}
+
+__global__ static void gpu_mla_validate_finite_kernel(
+    const float *values, size_t count, int *status, int failure_status) {
+    size_t at = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (; at < count; at += stride)
+        if (!isfinite(values[at])) atomicMax(status, failure_status);
+}
+
+typedef struct {
+    ColiGpuMlaWeightView qa, qan, qb, kva, kvan, kvbk, kvbv, output;
+    ColiGpuMlaWeightView iwq, iwk, iwp, iknw, iknb, ape, gate;
+} ColiGpuMlaKernelWeights;
+
+__device__ static float *gpu_mla_page_row(
+    ColiGpuMlaPage *pages, int page_tokens, int position,
+    int columns, int member) {
+    ColiGpuMlaPage &page = pages[position / page_tokens];
+    float *base = member == 0 ? page.latent :
+                  member == 1 ? page.index_keys : page.index_gates;
+    return base + (size_t)(position % page_tokens) * columns;
+}
+
+__global__ static void gpu_mla_site_kernel(
+    float *output, const float *input, float *scratch, int *selected,
+    ColiGpuMlaPage *pages, int *status,
+    ColiGpuMlaConfig c, ColiGpuMlaKernelWeights w,
+    int rows, int start, int width) {
+    if (blockIdx.x || threadIdx.x) return;
+    if (*status != COLI_GPU_MLA_STATUS_OK) return;
+    float *qn = scratch;
+    float *query = qn + c.q_lora;
+    float *absorbed = query + (size_t)c.heads * c.qk_nope;
+    float *iq = absorbed + (size_t)c.heads * c.kv_lora;
+    float *head_w = iq + (size_t)c.index_heads * c.index_dim;
+    float *pooled_index = head_w + c.index_heads;
+    float *scores = pooled_index + c.index_dim;
+    size_t pools_max =
+        ((size_t)c.max_context + c.index_pool - 1u) / c.index_pool;
+    size_t score_count = pools_max > (size_t)width ? pools_max : (size_t)width;
+    float *pooled = scores + score_count;
+    float *context = pooled + c.kv_lora;
+    const float attention_scale = 1.0f / sqrtf((float)c.qk_nope);
+    const float index_scale = 1.0f / sqrtf((float)c.index_dim);
+    const float head_scale = 1.0f / sqrtf((float)c.index_heads);
+
+    for (int token = 0; token < rows; ++token) {
+        int absolute = start + token;
+        int seen = absolute + 1;
+        const float *x = input + (size_t)token * c.hidden;
+        gpu_mla_matvec(qn, w.qa, x, c.q_lora);
+        float square = 0.0f;
+        for (int d = 0; d < c.q_lora; ++d) square += qn[d] * qn[d];
+        float inverse = rsqrtf(square / c.q_lora + c.rms_norm_eps);
+        for (int d = 0; d < c.q_lora; ++d)
+            qn[d] *= inverse * gpu_mla_weight(w.qan, 0, d);
+        gpu_mla_matvec(query, w.qb, qn, c.heads * c.qk_nope);
+
+        float *latent =
+            gpu_mla_page_row(pages, c.page_tokens, absolute, c.kv_lora, 0);
+        gpu_mla_matvec(latent, w.kva, x, c.kv_lora);
+        square = 0.0f;
+        for (int d = 0; d < c.kv_lora; ++d)
+            square += latent[d] * latent[d];
+        inverse = rsqrtf(square / c.kv_lora + c.rms_norm_eps);
+        for (int d = 0; d < c.kv_lora; ++d)
+            latent[d] *= inverse * gpu_mla_weight(w.kvan, 0, d);
+        for (int h = 0; h < c.heads; ++h)
+            for (int d = 0; d < c.kv_lora; ++d) {
+                float sum = 0.0f;
+                for (int q = 0; q < c.qk_nope; ++q)
+                    sum += gpu_mla_weight(
+                               w.kvbk, h * c.kv_lora + d, q) *
+                           query[(size_t)h * c.qk_nope + q];
+                absorbed[(size_t)h * c.kv_lora + d] = sum;
+            }
+
+        gpu_mla_matvec(iq, w.iwq, qn, c.index_heads * c.index_dim);
+        float *key =
+            gpu_mla_page_row(pages, c.page_tokens, absolute, c.index_dim, 1);
+        gpu_mla_matvec(key, w.iwk, x, c.index_dim);
+        float mean = 0.0f;
+        for (int d = 0; d < c.index_dim; ++d) mean += key[d];
+        mean /= c.index_dim;
+        float variance = 0.0f;
+        for (int d = 0; d < c.index_dim; ++d) {
+            float centered = key[d] - mean;
+            variance += centered * centered;
+        }
+        inverse = rsqrtf(variance / c.index_dim + c.index_norm_eps);
+        for (int d = 0; d < c.index_dim; ++d)
+            key[d] = (key[d] - mean) * inverse *
+                         gpu_mla_weight(w.iknw, 0, d) +
+                     gpu_mla_weight(w.iknb, 0, d);
+        gpu_mla_matvec(
+            gpu_mla_page_row(
+                pages, c.page_tokens, absolute, c.index_dim, 2),
+            w.gate, x, c.index_dim);
+        gpu_mla_matvec(head_w, w.iwp, x, c.index_heads);
+        for (int h = 0; h < c.index_heads; ++h) head_w[h] *= head_scale;
+
+        int *chosen = selected + (size_t)token * width;
+        for (int slot = 0; slot < width; ++slot) chosen[slot] = -1;
+        int pools = seen / c.index_pool;
+        for (int p = 0; p < pools; ++p) {
+            for (int d = 0; d < c.index_dim; ++d) {
+                float maximum = -3.402823466e+38F;
+                for (int j = 0; j < c.index_pool; ++j) {
+                    int position = p * c.index_pool + j;
+                    float logit =
+                        gpu_mla_page_row(
+                            pages, c.page_tokens, position,
+                            c.index_dim, 2)[d] +
+                        gpu_mla_weight(w.ape, j, d);
+                    maximum = fmaxf(maximum, logit);
+                }
+                float total = 0.0f;
+                for (int j = 0; j < c.index_pool; ++j)
+                    total += expf(
+                        gpu_mla_page_row(
+                            pages, c.page_tokens, p * c.index_pool + j,
+                            c.index_dim, 2)[d] +
+                        gpu_mla_weight(w.ape, j, d) - maximum);
+                float mixed = 0.0f;
+                for (int j = 0; j < c.index_pool; ++j) {
+                    int position = p * c.index_pool + j;
+                    float weight = expf(
+                        gpu_mla_page_row(
+                            pages, c.page_tokens, position,
+                            c.index_dim, 2)[d] +
+                        gpu_mla_weight(w.ape, j, d) - maximum) / total;
+                    mixed += weight *
+                        gpu_mla_page_row(
+                            pages, c.page_tokens, position,
+                            c.index_dim, 1)[d];
+                }
+                pooled_index[d] = mixed;
+            }
+            float score = 0.0f;
+            for (int h = 0; h < c.index_heads; ++h) {
+                float dot = 0.0f;
+                for (int d = 0; d < c.index_dim; ++d)
+                    dot += iq[(size_t)h * c.index_dim + d] * pooled_index[d];
+                if (dot > 0.0f) score += head_w[h] * dot * index_scale;
+            }
+            scores[p] = score;
+        }
+        int wanted = c.index_topk / c.index_pool;
+        for (int rank = 0; rank < wanted; ++rank) {
+            int best = -1;
+            for (int p = 0; p < pools; ++p) {
+                int taken = 0;
+                for (int prior = 0; prior < rank; ++prior)
+                    if (chosen[prior * c.index_pool] == p * c.index_pool)
+                        taken = 1;
+                if (!taken && (best < 0 || scores[p] > scores[best])) best = p;
+            }
+            if (best < 0) break;
+            for (int j = 0; j < c.index_pool; ++j)
+                chosen[rank * c.index_pool + j] =
+                    best * c.index_pool + j;
+        }
+        if (c.index_select_tail) {
+            int tail = seen % c.index_pool;
+            int tail_start = seen - tail;
+            for (int j = 0; j < tail; ++j)
+                chosen[c.index_topk + j] = tail_start + j;
+        }
+
+        for (int h = 0; h < c.heads; ++h) {
+            float maximum = -3.402823466e+38F;
+            int used = 0;
+            for (int slot = 0; slot < width; ++slot) {
+                int at = chosen[slot];
+                if (at < 0 || at >= seen) continue;
+                float dot = 0.0f;
+                for (int d = 0; d < c.kv_lora; ++d)
+                    dot += absorbed[(size_t)h * c.kv_lora + d] *
+                           gpu_mla_page_row(
+                               pages, c.page_tokens, at,
+                               c.kv_lora, 0)[d];
+                scores[used] = dot * attention_scale;
+                maximum = fmaxf(maximum, scores[used++]);
+            }
+            for (int v = 0; v < c.value_dim; ++v)
+                context[(size_t)h * c.value_dim + v] = 0.0f;
+            if (!used) continue;
+            double total = 0.0;
+            for (int i = 0; i < used; ++i) {
+                scores[i] = expf(scores[i] - maximum);
+                total += scores[i];
+            }
+            for (int d = 0; d < c.kv_lora; ++d) pooled[d] = 0.0f;
+            int score_index = 0;
+            for (int slot = 0; slot < width; ++slot) {
+                int at = chosen[slot];
+                if (at < 0 || at >= seen) continue;
+                float weight = (float)(scores[score_index++] / total);
+                for (int d = 0; d < c.kv_lora; ++d)
+                    pooled[d] += weight *
+                        gpu_mla_page_row(
+                            pages, c.page_tokens, at,
+                            c.kv_lora, 0)[d];
+            }
+            for (int v = 0; v < c.value_dim; ++v) {
+                float sum = 0.0f;
+                for (int d = 0; d < c.kv_lora; ++d)
+                    sum += gpu_mla_weight(
+                               w.kvbv, h * c.value_dim + v, d) *
+                           pooled[d];
+                context[(size_t)h * c.value_dim + v] = sum;
+            }
+        }
+        gpu_mla_matvec(output + (size_t)token * c.hidden, w.output,
+                       context, c.hidden);
+    }
+}
+
+__device__ static float gpu_mla_dot_row(
+    ColiGpuMlaWeightView weight, int row, const float *input) {
+    float sum = 0.0f;
+    for (int column = 0; column < weight.columns; ++column)
+        sum += gpu_mla_weight(weight, row, column) * input[column];
+    return sum;
+}
+
+__device__ static float gpu_mla_block_sum(float value, float *shared) {
+    shared[threadIdx.x] = value;
+    __syncthreads();
+    for (int step = blockDim.x / 2; step; step >>= 1) {
+        if ((int)threadIdx.x < step)
+            shared[threadIdx.x] += shared[threadIdx.x + step];
+        __syncthreads();
+    }
+    return shared[0];
+}
+
+__global__ static void gpu_mla_prepare_kernel(
+    const float *input, float *scratch, ColiGpuMlaPage *pages, int *status,
+    ColiGpuMlaConfig c, ColiGpuMlaKernelWeights w,
+    int rows, int start, int width) {
+    if (*status != COLI_GPU_MLA_STATUS_OK) return;
+    int token = (int)blockIdx.x;
+    if (token >= rows) return;
+    size_t qn_count = (size_t)rows * c.q_lora;
+    size_t query_count = (size_t)rows * c.heads * c.qk_nope;
+    size_t absorbed_count = (size_t)rows * c.heads * c.kv_lora;
+    size_t iq_count = (size_t)rows * c.index_heads * c.index_dim;
+    size_t head_count = (size_t)rows * c.index_heads;
+    size_t pools_max =
+        ((size_t)c.max_context + c.index_pool - 1u) / c.index_pool;
+    size_t attention_scores = (size_t)c.heads * width;
+    size_t score_stride =
+        pools_max > attention_scores ? pools_max : attention_scores;
+    float *all_qn = scratch;
+    float *all_query = all_qn + qn_count;
+    float *all_absorbed = all_query + query_count;
+    float *all_iq = all_absorbed + absorbed_count;
+    float *all_head = all_iq + iq_count;
+    float *qn = all_qn + (size_t)token * c.q_lora;
+    float *query =
+        all_query + (size_t)token * c.heads * c.qk_nope;
+    float *absorbed =
+        all_absorbed + (size_t)token * c.heads * c.kv_lora;
+    float *iq =
+        all_iq + (size_t)token * c.index_heads * c.index_dim;
+    float *head_w = all_head + (size_t)token * c.index_heads;
+    (void)head_count;
+    (void)score_stride;
+    int absolute = start + token;
+    const float *x = input + (size_t)token * c.hidden;
+    __shared__ float reduction[256];
+
+    for (int d = threadIdx.x; d < c.q_lora; d += blockDim.x)
+        qn[d] = gpu_mla_dot_row(w.qa, d, x);
+    __syncthreads();
+    float partial = 0.0f;
+    for (int d = threadIdx.x; d < c.q_lora; d += blockDim.x)
+        partial += qn[d] * qn[d];
+    float inverse = rsqrtf(
+        gpu_mla_block_sum(partial, reduction) / c.q_lora +
+        c.rms_norm_eps);
+    for (int d = threadIdx.x; d < c.q_lora; d += blockDim.x)
+        qn[d] *= inverse * gpu_mla_weight(w.qan, 0, d);
+    __syncthreads();
+
+    for (int d = threadIdx.x; d < c.heads * c.qk_nope;
+         d += blockDim.x)
+        query[d] = gpu_mla_dot_row(w.qb, d, qn);
+    __syncthreads();
+    for (int d = threadIdx.x; d < c.heads * c.kv_lora;
+         d += blockDim.x) {
+        int h = d / c.kv_lora;
+        int latent_d = d % c.kv_lora;
+        float sum = 0.0f;
+        for (int q = 0; q < c.qk_nope; ++q)
+            sum += gpu_mla_weight(
+                       w.kvbk, h * c.kv_lora + latent_d, q) *
+                   query[(size_t)h * c.qk_nope + q];
+        absorbed[d] = sum;
+    }
+
+    float *latent =
+        gpu_mla_page_row(pages, c.page_tokens, absolute, c.kv_lora, 0);
+    for (int d = threadIdx.x; d < c.kv_lora; d += blockDim.x)
+        latent[d] = gpu_mla_dot_row(w.kva, d, x);
+    __syncthreads();
+    partial = 0.0f;
+    for (int d = threadIdx.x; d < c.kv_lora; d += blockDim.x)
+        partial += latent[d] * latent[d];
+    inverse = rsqrtf(
+        gpu_mla_block_sum(partial, reduction) / c.kv_lora +
+        c.rms_norm_eps);
+    for (int d = threadIdx.x; d < c.kv_lora; d += blockDim.x)
+        latent[d] *= inverse * gpu_mla_weight(w.kvan, 0, d);
+
+    for (int d = threadIdx.x; d < c.index_heads * c.index_dim;
+         d += blockDim.x)
+        iq[d] = gpu_mla_dot_row(w.iwq, d, qn);
+    float *key =
+        gpu_mla_page_row(pages, c.page_tokens, absolute, c.index_dim, 1);
+    for (int d = threadIdx.x; d < c.index_dim; d += blockDim.x)
+        key[d] = gpu_mla_dot_row(w.iwk, d, x);
+    __syncthreads();
+    partial = 0.0f;
+    for (int d = threadIdx.x; d < c.index_dim; d += blockDim.x)
+        partial += key[d];
+    float mean = gpu_mla_block_sum(partial, reduction) / c.index_dim;
+    partial = 0.0f;
+    for (int d = threadIdx.x; d < c.index_dim; d += blockDim.x) {
+        float centered = key[d] - mean;
+        partial += centered * centered;
+    }
+    inverse = rsqrtf(
+        gpu_mla_block_sum(partial, reduction) / c.index_dim +
+        c.index_norm_eps);
+    for (int d = threadIdx.x; d < c.index_dim; d += blockDim.x)
+        key[d] = (key[d] - mean) * inverse *
+                     gpu_mla_weight(w.iknw, 0, d) +
+                 gpu_mla_weight(w.iknb, 0, d);
+    float *gate =
+        gpu_mla_page_row(pages, c.page_tokens, absolute, c.index_dim, 2);
+    for (int d = threadIdx.x; d < c.index_dim; d += blockDim.x)
+        gate[d] = gpu_mla_dot_row(w.gate, d, x);
+    float head_scale = rsqrtf((float)c.index_heads);
+    for (int h = threadIdx.x; h < c.index_heads; h += blockDim.x)
+        head_w[h] = gpu_mla_dot_row(w.iwp, h, x) * head_scale;
+}
+
+__global__ static void gpu_mla_attention_kernel(
+    float *output, float *scratch, int *selected,
+    ColiGpuMlaPage *pages, int *status,
+    ColiGpuMlaConfig c, ColiGpuMlaKernelWeights w,
+    int rows, int start, int width) {
+    if (*status != COLI_GPU_MLA_STATUS_OK) return;
+    int token = (int)blockIdx.x;
+    if (token >= rows) return;
+    size_t qn_count = (size_t)rows * c.q_lora;
+    size_t query_count = (size_t)rows * c.heads * c.qk_nope;
+    size_t absorbed_count = (size_t)rows * c.heads * c.kv_lora;
+    size_t iq_count = (size_t)rows * c.index_heads * c.index_dim;
+    size_t head_count = (size_t)rows * c.index_heads;
+    size_t pools_max =
+        ((size_t)c.max_context + c.index_pool - 1u) / c.index_pool;
+    size_t attention_scores = (size_t)c.heads * width;
+    size_t score_stride =
+        pools_max > attention_scores ? pools_max : attention_scores;
+    float *all_qn = scratch;
+    float *all_query = all_qn + qn_count;
+    float *all_absorbed = all_query + query_count;
+    float *all_iq = all_absorbed + absorbed_count;
+    float *all_head = all_iq + iq_count;
+    float *all_scores = all_head + head_count;
+    float *all_context = all_scores + (size_t)rows * score_stride;
+    float *absorbed =
+        all_absorbed + (size_t)token * c.heads * c.kv_lora;
+    float *iq =
+        all_iq + (size_t)token * c.index_heads * c.index_dim;
+    float *head_w = all_head + (size_t)token * c.index_heads;
+    float *scores = all_scores + (size_t)token * score_stride;
+    float *context =
+        all_context + (size_t)token * c.heads * c.value_dim;
+    int *chosen = selected + (size_t)token * width;
+    int seen = start + token + 1;
+    int pools = seen / c.index_pool;
+    float index_scale = rsqrtf((float)c.index_dim);
+
+    for (int p = threadIdx.x; p < pools; p += blockDim.x) {
+        float score = 0.0f;
+        for (int h = 0; h < c.index_heads; ++h) {
+            float dot = 0.0f;
+            for (int d = 0; d < c.index_dim; ++d) {
+                float maximum = -3.402823466e+38F;
+                for (int j = 0; j < c.index_pool; ++j) {
+                    float logit = gpu_mla_page_row(
+                        pages, c.page_tokens, p * c.index_pool + j,
+                        c.index_dim, 2)[d] +
+                        gpu_mla_weight(w.ape, j, d);
+                    maximum = fmaxf(maximum, logit);
+                }
+                float total = 0.0f;
+                float mixed = 0.0f;
+                for (int j = 0; j < c.index_pool; ++j) {
+                    int position = p * c.index_pool + j;
+                    float weight = expf(
+                        gpu_mla_page_row(
+                            pages, c.page_tokens, position,
+                            c.index_dim, 2)[d] +
+                        gpu_mla_weight(w.ape, j, d) - maximum);
+                    total += weight;
+                    mixed += weight * gpu_mla_page_row(
+                        pages, c.page_tokens, position,
+                        c.index_dim, 1)[d];
+                }
+                dot += iq[(size_t)h * c.index_dim + d] *
+                       (mixed / total);
+            }
+            if (dot > 0.0f) score += head_w[h] * dot * index_scale;
+        }
+        scores[p] = score;
+    }
+    __syncthreads();
+    if (!threadIdx.x) {
+        for (int slot = 0; slot < width; ++slot) chosen[slot] = -1;
+        int wanted = c.index_topk / c.index_pool;
+        for (int rank = 0; rank < wanted; ++rank) {
+            int best = -1;
+            for (int p = 0; p < pools; ++p) {
+                int taken = 0;
+                for (int prior = 0; prior < rank; ++prior)
+                    if (chosen[prior * c.index_pool] ==
+                        p * c.index_pool)
+                        taken = 1;
+                if (!taken && (best < 0 || scores[p] > scores[best]))
+                    best = p;
+            }
+            if (best < 0) break;
+            for (int j = 0; j < c.index_pool; ++j)
+                chosen[rank * c.index_pool + j] =
+                    best * c.index_pool + j;
+        }
+        if (c.index_select_tail) {
+            int tail = seen % c.index_pool;
+            int tail_start = seen - tail;
+            for (int j = 0; j < tail; ++j)
+                chosen[c.index_topk + j] = tail_start + j;
+        }
+    }
+    __syncthreads();
+
+    float attention_scale = rsqrtf((float)c.qk_nope);
+    for (int hs = threadIdx.x; hs < c.heads * width;
+         hs += blockDim.x) {
+        int h = hs / width;
+        int slot = hs % width;
+        int at = chosen[slot];
+        float score = -3.402823466e+38F;
+        if (at >= 0 && at < seen) {
+            float dot = 0.0f;
+            const float *latent = gpu_mla_page_row(
+                pages, c.page_tokens, at, c.kv_lora, 0);
+            for (int d = 0; d < c.kv_lora; ++d)
+                dot += absorbed[(size_t)h * c.kv_lora + d] * latent[d];
+            score = dot * attention_scale;
+        }
+        scores[(size_t)h * width + slot] = score;
+    }
+    __syncthreads();
+    for (int h = threadIdx.x; h < c.heads; h += blockDim.x) {
+        float maximum = -3.402823466e+38F;
+        for (int slot = 0; slot < width; ++slot)
+            maximum = fmaxf(maximum, scores[(size_t)h * width + slot]);
+        double total = 0.0;
+        for (int slot = 0; slot < width; ++slot) {
+            int at = chosen[slot];
+            float value = at >= 0 && at < seen
+                ? expf(scores[(size_t)h * width + slot] - maximum)
+                : 0.0f;
+            scores[(size_t)h * width + slot] = value;
+            total += value;
+        }
+        if (total)
+            for (int slot = 0; slot < width; ++slot)
+                scores[(size_t)h * width + slot] =
+                    (float)(scores[(size_t)h * width + slot] / total);
+    }
+    __syncthreads();
+    for (int hv = threadIdx.x; hv < c.heads * c.value_dim;
+         hv += blockDim.x) {
+        int h = hv / c.value_dim;
+        int v = hv % c.value_dim;
+        float sum = 0.0f;
+        for (int slot = 0; slot < width; ++slot) {
+            int at = chosen[slot];
+            if (at < 0 || at >= seen) continue;
+            const float *latent = gpu_mla_page_row(
+                pages, c.page_tokens, at, c.kv_lora, 0);
+            float expanded = 0.0f;
+            for (int d = 0; d < c.kv_lora; ++d)
+                expanded +=
+                    gpu_mla_weight(w.kvbv, h * c.value_dim + v, d) *
+                    latent[d];
+            sum += scores[(size_t)h * width + slot] * expanded;
+        }
+        context[hv] = sum;
+    }
+    __syncthreads();
+    for (int d = threadIdx.x; d < c.hidden; d += blockDim.x)
+        output[(size_t)token * c.hidden + d] =
+            gpu_mla_dot_row(w.output, d, context);
+}
+
+static ColiGpuMlaWeightView gpu_mla_view(const ColiGpuTensor *tensor) {
+    ColiGpuMlaWeightView view = {};
+    if (tensor) {
+        view.data = tensor->data;
+        view.scales = tensor->scales;
+        view.format = tensor->format;
+        view.columns = tensor->columns;
+        view.groups = tensor->groups;
+        view.group_size = tensor->group_size;
+    }
+    return view;
+}
+
+static int gpu_mla_weight_shape(
+    const ColiGpuArena *arena, const ColiGpuTensor *tensor,
+    int rows, int columns, int f32_only) {
+    return gpu_tensor_same_context(arena, tensor) &&
+           tensor->rows == rows && tensor->columns == columns &&
+           (!f32_only || tensor->format == 0);
+}
+
+static int gpu_mla_validate_range(
+    const float *values, size_t count, int failure_status,
+    ColiGpuMlaState *state) {
+    if (!count) return 1;
+    int blocks = (int)((count + 255u) / 256u);
+    if (blocks > 65535) blocks = 65535;
+    gpu_mla_validate_finite_kernel<<<blocks, 256, 0, state->ctx->stream>>>(
+        values, count, state->device_status, failure_status);
+    return cuda_ok(cudaGetLastError(),
+                   "resident MLA finite validation launch");
+}
+
+extern "C" int coli_gpu_mla_site(
+    ColiGpuArena *arena, size_t output_offset, size_t input_offset,
+    size_t scratch_offset, size_t selected_offset,
+    ColiGpuMlaState *state, const ColiGpuMlaWeights *weights,
+    int rows, int start_position) {
+    if (!arena || !state || !weights || arena->ctx != state->ctx ||
+        !state->ctx->healthy || rows < 1 || rows > state->config.max_rows ||
+        start_position < 0 || start_position != state->length ||
+        start_position > state->config.max_context - rows)
+        return 0;
+    const ColiGpuMlaConfig &c = state->config;
+    int width = gpu_mla_width(&c);
+    size_t row_bytes = (size_t)rows * c.hidden * sizeof(float);
+    size_t scratch_bytes = coli_gpu_mla_scratch_bytes(&c);
+    size_t selected_bytes = coli_gpu_mla_selected_bytes(&c, rows);
+    ColiGpuKdaRange ranges[] = {
+        {output_offset, row_bytes},
+        {input_offset, row_bytes},
+        {scratch_offset, scratch_bytes},
+        {selected_offset, selected_bytes}
+    };
+    if (!gpu_range_ok(arena, output_offset, row_bytes) ||
+        !gpu_range_ok(arena, input_offset, row_bytes) ||
+        !gpu_range_ok(arena, scratch_offset, scratch_bytes) ||
+        !gpu_range_ok(arena, selected_offset, selected_bytes))
+        return 0;
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < i; ++j)
+            if (gpu_kda_ranges_overlap(ranges[i], ranges[j])) return 0;
+    if (!gpu_mla_weight_shape(arena, weights->q_a_proj,
+                              c.q_lora, c.hidden, 0) ||
+        !gpu_mla_weight_shape(arena, weights->q_a_norm, 1, c.q_lora, 1) ||
+        !gpu_mla_weight_shape(arena, weights->q_b_proj,
+                              c.heads * c.qk_nope, c.q_lora, 0) ||
+        !gpu_mla_weight_shape(arena, weights->kv_a_proj,
+                              c.kv_lora, c.hidden, 0) ||
+        !gpu_mla_weight_shape(arena, weights->kv_a_norm, 1, c.kv_lora, 1) ||
+        !gpu_mla_weight_shape(arena, weights->kv_b_key,
+                              c.heads * c.kv_lora, c.qk_nope, 0) ||
+        !gpu_mla_weight_shape(arena, weights->kv_b_value,
+                              c.heads * c.value_dim, c.kv_lora, 0) ||
+        !gpu_mla_weight_shape(arena, weights->o_proj,
+                              c.hidden, c.heads * c.value_dim, 0) ||
+        !gpu_mla_weight_shape(arena, weights->index_q_proj,
+                              c.index_heads * c.index_dim, c.q_lora, 0) ||
+        !gpu_mla_weight_shape(arena, weights->index_k_proj,
+                              c.index_dim, c.hidden, 0) ||
+        !gpu_mla_weight_shape(arena, weights->index_weight_proj,
+                              c.index_heads, c.hidden, 0) ||
+        !gpu_mla_weight_shape(arena, weights->index_key_norm,
+                              1, c.index_dim, 1) ||
+        !gpu_mla_weight_shape(arena, weights->index_key_bias,
+                              1, c.index_dim, 1) ||
+        !gpu_mla_weight_shape(arena, weights->index_pool_ape,
+                              c.index_pool, c.index_dim, 1) ||
+        !gpu_mla_weight_shape(arena, weights->index_pool_gate,
+                              c.index_dim, c.hidden, 0) ||
+        !select_device_ordinal(state->ctx->device) ||
+        !gpu_mla_reserve(state, start_position + rows))
+        return 0;
+    ColiGpuMlaKernelWeights views = {
+        gpu_mla_view(weights->q_a_proj),
+        gpu_mla_view(weights->q_a_norm),
+        gpu_mla_view(weights->q_b_proj),
+        gpu_mla_view(weights->kv_a_proj),
+        gpu_mla_view(weights->kv_a_norm),
+        gpu_mla_view(weights->kv_b_key),
+        gpu_mla_view(weights->kv_b_value),
+        gpu_mla_view(weights->o_proj),
+        gpu_mla_view(weights->index_q_proj),
+        gpu_mla_view(weights->index_k_proj),
+        gpu_mla_view(weights->index_weight_proj),
+        gpu_mla_view(weights->index_key_norm),
+        gpu_mla_view(weights->index_key_bias),
+        gpu_mla_view(weights->index_pool_ape),
+        gpu_mla_view(weights->index_pool_gate)
+    };
+    *state->host_status = COLI_GPU_MLA_STATUS_OK;
+    if (!gpu_mla_validate_range(
+            reinterpret_cast<const float *>(arena->data + input_offset),
+            (size_t)rows * c.hidden, COLI_GPU_MLA_STATUS_NONFINITE_INPUT,
+            state))
+        return 0;
+    for (int page = 0, checked = 0; checked < state->length; ++page) {
+        int count = state->length - checked;
+        if (count > c.page_tokens) count = c.page_tokens;
+        if (!gpu_mla_validate_range(
+                state->pages[page].latent, (size_t)count * c.kv_lora,
+                COLI_GPU_MLA_STATUS_NONFINITE_CACHE, state) ||
+            !gpu_mla_validate_range(
+                state->pages[page].index_keys, (size_t)count * c.index_dim,
+                COLI_GPU_MLA_STATUS_NONFINITE_CACHE, state) ||
+            !gpu_mla_validate_range(
+                state->pages[page].index_gates, (size_t)count * c.index_dim,
+                COLI_GPU_MLA_STATUS_NONFINITE_CACHE, state))
+            return 0;
+        checked += count;
+    }
+    gpu_mla_prepare_kernel<<<rows, 256, 0, state->ctx->stream>>>(
+        reinterpret_cast<const float *>(arena->data + input_offset),
+        reinterpret_cast<float *>(arena->data + scratch_offset),
+        state->device_pages, state->device_status,
+        c, views, rows, start_position, width);
+    gpu_mla_record_launch(state, rows, 256);
+    if (!cuda_ok(cudaGetLastError(), "resident MLA preparation launch"))
+        return 0;
+    int end = start_position + rows;
+    for (int page = start_position / c.page_tokens,
+             checked = start_position;
+         checked < end; ++page) {
+        int offset = checked % c.page_tokens;
+        int count = c.page_tokens - offset;
+        if (count > end - checked) count = end - checked;
+        if (!gpu_mla_validate_range(
+                state->pages[page].latent + (size_t)offset * c.kv_lora,
+                (size_t)count * c.kv_lora,
+                COLI_GPU_MLA_STATUS_NONFINITE_RESULT, state) ||
+            !gpu_mla_validate_range(
+                state->pages[page].index_keys +
+                    (size_t)offset * c.index_dim,
+                (size_t)count * c.index_dim,
+                COLI_GPU_MLA_STATUS_NONFINITE_RESULT, state) ||
+            !gpu_mla_validate_range(
+                state->pages[page].index_gates +
+                    (size_t)offset * c.index_dim,
+                (size_t)count * c.index_dim,
+                COLI_GPU_MLA_STATUS_NONFINITE_RESULT, state))
+            return 0;
+        checked += count;
+    }
+    gpu_mla_attention_kernel<<<rows, 256, 0, state->ctx->stream>>>(
+        reinterpret_cast<float *>(arena->data + output_offset),
+        reinterpret_cast<float *>(arena->data + scratch_offset),
+        reinterpret_cast<int *>(arena->data + selected_offset),
+        state->device_pages, state->device_status,
+        c, views, rows, start_position, width);
+    gpu_mla_record_launch(state, rows, 256);
+    if (!cuda_ok(cudaGetLastError(), "resident MLA attention launch") ||
+        !gpu_mla_validate_range(
+            reinterpret_cast<const float *>(arena->data + output_offset),
+            (size_t)rows * c.hidden, COLI_GPU_MLA_STATUS_NONFINITE_RESULT,
+            state))
+        return 0;
+    if (!coli_gpu_context_sync(state->ctx) ||
+        *state->host_status != COLI_GPU_MLA_STATUS_OK)
+        return 0;
+    state->length += rows;
+    return 1;
 }
 
 /* ==== resident-pipeline primitives (Inc.0, 2026-07-13) ====
@@ -2946,5 +6672,5 @@ extern "C" int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *w,float *ctx,con
 }
 extern "C" int coli_cuda_pipe_sync(int device){
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
-    return cuda_ok(cudaDeviceSynchronize(),"pipe sync");
+    return cuda_ok(cudaStreamSynchronize(ctx->stream),"pipe sync");
 }
