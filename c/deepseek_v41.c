@@ -1895,7 +1895,16 @@ static int argmax(const float *values, int n);
 static void spec_load(Model *m, int ecap) {
     Cfg *c = &m->c;
     Spec *sp = &m->spec;
-    sp->min_accept = getenv("V41_DSPARK_MINACC") ? atoi(getenv("V41_DSPARK_MINACC")) : 30;
+    /* 60%, not 30%, and the number is measured rather than guessed. On a
+     * 16-thread CPU box holding 68% of the experts, DeepSeek's own draft head
+     * accepts 16 of 32 drafts on a 24-token turn -- respectable, and still a
+     * net loss: 9 forwards instead of 24, but 114 s instead of 86, because a
+     * six-row verify costs more than the extra tokens it buys (attention +40%,
+     * expert reads +17%). That is the same break-even colibri.c measured for
+     * MTP on GLM-5.2, where 90% acceptance gains 22% and 19% loses 25%, with
+     * the crossing around half. Half is where this lands, so half must pause.
+     * Above 60% the batch pays for itself; below it the guard stops paying. */
+    sp->min_accept = getenv("V41_DSPARK_MINACC") ? atoi(getenv("V41_DSPARK_MINACC")) : 60;
     /* how many of the drafted tokens to put in front of the main model. The head always
      * writes its whole block; verifying fewer of them trades acceptance for a smaller
      * bill when a round is rejected early. */
@@ -1924,9 +1933,21 @@ static void spec_load(Model *m, int ecap) {
         }
     }
     if (c->n_mtp <= 0) return;
+    /* Off unless asked for, and the reason is measured. On a 16-thread CPU box
+     * holding 68% of the experts, the draft head accepts half its proposals and
+     * still loses: 24 tokens took 114 s with it and 86 s without, because a
+     * six-row verify amortizes the disk well (+17%) and the per-row dense work
+     * not at all (+40% attention). Verifying six positions costs six times the
+     * attention projections and buys 2.7 tokens.
+     *
+     * That balance flips where the per-row compute is cheap -- a GPU, or a
+     * machine holding the whole expert set -- which is exactly where a user
+     * would reach for it. So it is a switch and not a default, with the guard
+     * still watching acceptance for whoever turns it on. */
     const char *flag = getenv("V41_DSPARK");
-    if (flag && !atoi(flag)) {
-        fprintf(stderr, "[v41] DSpark drafts off (V41_DSPARK=0)\n");
+    if (!flag || !atoi(flag)) {
+        fprintf(stderr, "[v41] DSpark drafts off; V41_DSPARK=1 turns them on "
+                        "(worth it when the experts are resident)\n");
         return;
     }
     /* A checkpoint can declare the head in its config and still not ship it -- the
@@ -1987,8 +2008,7 @@ static void spec_load(Model *m, int ecap) {
             1, dim + c->markov_rank);
     #undef MNAME
     sp->active = 1;
-    fprintf(stderr, "[v41] DSpark on: %d stages, %d experts (%d routed), %d tokens per "
-                    "draft — V41_DSPARK=0 turns it off\n",
+    fprintf(stderr, "[v41] DSpark on: %d stages, %d experts (%d routed), %d tokens per draft\n",
             c->n_mtp, c->spec_routed, c->spec_activated, c->spec_block);
 }
 
@@ -2593,7 +2613,11 @@ static int spec_ready(Spec *sp) {
         if (--sp->pause == 0) sp->window_prop = sp->window_acc = 0;
         return 0;
     }
-    if (sp->window_prop >= 24 &&
+    /* Ten proposals, not twenty-four: a round on a streamed model costs
+     * seconds, so a window that needs five rounds to decide spends the whole
+     * turn deciding. Two rounds is enough to see an acceptance rate that is
+     * half of what it needs to be. */
+    if (sp->window_prop >= 10 &&
         sp->window_acc * 100 < sp->window_prop * (uint64_t)sp->min_accept) {
         fprintf(stderr, "[v41] DSpark: %.0f%% of the last %llu drafts accepted (under "
                         "%d%%), pausing for 64 tokens\n",

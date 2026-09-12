@@ -1,5 +1,9 @@
 """Drafting changes the speed of a turn and nothing else.
 
+Off by default since the first measurement on the real checkpoint, where it
+accepted half its proposals and still cost 32% more wall clock; V41_DSPARK=1
+turns it on, and this drives both paths.
+
 DSpark proposes tokens and the main model verifies them in one forward. The whole
 design rests on one property: what comes out has to be what would have come out
 without it. This drives `coli serve` twice over the same prompt, once with drafts on
@@ -47,9 +51,7 @@ def has_draft_head():
 def completion(drafts):
     """One turn through the gateway, with drafting on or off. Returns (text, log)."""
     port = free_port()
-    environment = {**os.environ}
-    if not drafts:
-        environment["V41_DSPARK"] = "0"
+    environment = {**os.environ, "V41_DSPARK": "1" if drafts else "0"}
     process = subprocess.Popen(
         [sys.executable, str(HERE / "coli"), "serve", "--model", str(FIXTURE),
          "--port", str(port), "--cap", "4"],
@@ -100,7 +102,7 @@ class Dsv41DsparkServeTest(unittest.TestCase):
 
     def test_the_engine_says_which_mode_it_is_in(self):
         self.assertIn("DSpark on", self.drafted_log)
-        self.assertIn("V41_DSPARK=0", self.plain_log)
+        self.assertIn("DSpark drafts off", self.plain_log)
 
     def test_drafts_were_actually_proposed(self):
         """Otherwise the comparison above is two identical runs of the same path."""

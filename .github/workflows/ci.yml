@@ -623,12 +623,12 @@ jobs:
           for force in 1 2 3; do
             for cap in 1 8; do
               echo "::group::V41_SPEC_FORCE=$force cap=$cap"
-              SNAP=dsv41_tiny V41_SPEC_FORCE=$force ./deepseek_v41 "$cap" dsv41_tiny/ref.json
+              SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 "$cap" dsv41_tiny/ref.json
               echo "::endgroup::"
             done
           done
           # and with only part of the block verified, which is a different rollback
-          SNAP=dsv41_tiny V41_SPEC_FORCE=2 V41_DSPARK_MAX=1 ./deepseek_v41 8 dsv41_tiny/ref.json
+          SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=2 V41_DSPARK_MAX=1 ./deepseek_v41 8 dsv41_tiny/ref.json
       - name: "Brain tab: EMAP after READY and STAT, HITS after every turn"
         run: |
           cd c
