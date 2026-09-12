@@ -795,6 +795,208 @@ __global__ static void grouped_down_e8(float *y,const float *x,const GroupDesc *
     if(!threadIdx.x)y[(size_t)(d.offset+s)*D+o]=p[0];
 }
 
+/* ---- Warp-per-row fmt=6 expert kernels -----------------------------------
+ * The block-per-output kernels above give a whole 256-thread block to ONE
+ * output element. With COLI_E8_SUB=32 only width/32 threads have a sub-block to
+ * decode, and the single float they produce is folded by an 8-round
+ * __syncthreads tree:
+ *
+ *   kernel                    width  sub-blocks  idle threads  bytes/block
+ *   grouped_hidden_e8_dual    6144      192          25 %         4704
+ *   grouped_down_e8           2048       64          75 %          784
+ *
+ * Measured on GB10 / GLM-5.2 decode: 8.3 GB of expert weights per token in
+ * ~425 ms = ~21 GB/s out of the machine's 273 GB/s, with nvidia-smi reporting
+ * 96 % "utilization" at 40 W -- the signature of a kernel that is always
+ * resident and always synchronizing, not one that is short of bandwidth or of
+ * blocks (grouped_down_e8 launches 49152 blocks per layer).
+ *
+ * Here one WARP owns one output row and folds with __shfl_down_sync: no barrier
+ * and no shared memory in the reduction. COLI_E8_WARPS_PER_BLOCK warps share ONE
+ * staged copy of the activation row, so the activation is read from global
+ * memory once per block instead of once per output.
+ *
+ * The shared copy is PADDED to 33 floats per sub-block. Without the pad, lane L
+ * reads sx[L*32+k]: for a fixed k every lane lands on bank (L*32+k)%32 == k%32,
+ * i.e. a 32-WAY bank conflict that would have made the staging slower than the
+ * global reads it replaces. With stride 33 the bank is (L+k)%32 -- all distinct.
+ *
+ * The tail sub-block is zero-filled instead of clamped, so the inner loop is a
+ * fixed 32 iterations: a zero activation contributes nothing to the dot product.
+ *
+ * ACCUMULATION ORDER DIFFERS from the block-tree version (warp-strided, folded
+ * pairwise across 5 shuffle rounds, instead of block-strided folded across 8
+ * shared-memory rounds). Results are therefore NOT bit-identical. This matters:
+ * an E8 dot product is 6144 fp32 terms, and reordering one can flip an argmax on
+ * a marginal token. Both orders must be checked against a DOUBLE precision
+ * reference, never against each other -- a test is never better than its oracle.
+ *
+ * COLI_E8_WARP=0 restores the block-per-output kernels for A/B without a rebuild. */
+#define COLI_E8_WARPS_PER_BLOCK 8
+#define COLI_E8_SPAD (COLI_E8_SUB+1)
+static_assert(COLI_E8_SUB==32,"the >>5 / &31 sub-block indexing below assumes COLI_E8_SUB==32");
+
+static int e8_warp_kernels(void){
+    static int v=-1;
+    if(v<0){ const char *e=std::getenv("COLI_E8_WARP"); v=e?std::atoi(e):1; }
+    return v;
+}
+
+__device__ __forceinline__ float e8_warp_fold(float v){
+    for(int off=16;off;off>>=1) v+=__shfl_down_sync(0xffffffffu,v,off);
+    return v;
+}
+/* Stage one activation row into padded shared memory; zero-fill the tail. */
+__device__ __forceinline__ void e8_stage_x(float *sx,const float *xs,int n,int nsub){
+    for(int i=threadIdx.x;i<n;i+=blockDim.x)
+        sx[(size_t)(i>>5)*COLI_E8_SPAD+(i&31)]=xs[i];
+    for(int i=n+(int)threadIdx.x;i<nsub*COLI_E8_SUB;i+=blockDim.x)
+        sx[(size_t)(i>>5)*COLI_E8_SPAD+(i&31)]=0.f;
+}
+/* Stage the E8 codebook into shared memory, PRE-SCALED by the 0.5 that
+ * e8_expand_sub_dev applies to every magnitude.
+ *
+ * __constant__ memory is built for BROADCAST -- every thread at one address,
+ * one cycle. Here each lane decodes a different sub-block, so the eight
+ * c_e8_grid[idx] lookups per sub-block are 32 DIVERGENT addresses per warp, and
+ * the constant cache serializes them. Shared memory is banked and takes
+ * divergent addresses in one or two cycles, which is the standard remedy.
+ *
+ * Storing floats rather than the packed bytes also removes an int->float
+ * conversion and a multiply PER WEIGHT, and makes the access a natural 4-byte
+ * bank read instead of a byte extract. Cost: 4 KB of shared memory per block. */
+#define COLI_E8_CB_FLOATS 1024
+__device__ __forceinline__ void e8_stage_codebook(float *cb){
+    for(int i=threadIdx.x;i<COLI_E8_CB_FLOATS;i+=blockDim.x)
+        cb[i]=(float)((const uint8_t*)c_e8_grid)[i]*0.5f;
+}
+/* e8_expand_sub_dev with the codebook in shared memory and the parity computed
+ * in one instruction instead of an 8-step serial XOR chain. The odd-parity bit
+ * that closes each group of 8 is the XOR of the 7 explicit sign bits, i.e.
+ * __popc(seven)&1 -- same value, no dependency chain. Numerically identical to
+ * e8_expand_sub_dev term by term. */
+__device__ __forceinline__ void e8_expand_sub_sm(const uint8_t *blk,int ib,float d,
+                                                 float *out,const float *cb){
+    uint32_t word=e8_ld_u32(blk+COLI_E8_QK/4+ib*4);
+    float db=d*(0.5f+(float)((word>>28)&0xF))*0.5f;
+    const uint8_t *idx=blk+ib*8;
+    for(int l=0;l<4;l++){
+        uint32_t seven=(word>>(7*l))&0x7F;
+        uint32_t signs=seven|((uint32_t)(__popc(seven)&1)<<7);
+        const float *g0=cb+(size_t)idx[l*2+0]*4,*g1=cb+(size_t)idx[l*2+1]*4;
+        for(int j=0;j<8;j++){
+            float mag=(j<4?g0[j]:g1[j-4]);
+            out[l*8+j]=((signs>>j)&1)?-mag*db:mag*db;
+        }
+    }
+}
+
+/* One sub-block's contribution to a dot product, summed locally before it joins
+ * the caller's accumulator: 32 terms then one add, instead of 32 adds onto a
+ * running total.
+ *
+ * COLI_E8_ACCS independent accumulators per lane keep the rounding chain short.
+ * Measured against the double reference at GLM-5.2's decode shape (I=6144,
+ * O=2048, tests/test_backend_cuda.cu with T6_I/T6_O/T6_VERBOSE): one accumulator
+ * per lane gave relative_rms 3.94e-07 against the block kernel's 2.72e-07 --
+ * both far inside the 2e-4 limit, but a 45 % regression bought for nothing. A
+ * warp holds 32 lanes over nsub sub-blocks, so one accumulator means a 192-term
+ * chain at D=6144; four means at most 64. This is the same argument that made
+ * the NEON path MORE accurate than the scalar one it replaced: independent
+ * accumulators break the rounding chain of a long single-precision sum. */
+#define COLI_E8_ACCS 4
+static_assert(COLI_E8_QK/COLI_E8_SUB==8,"the sb>>3 / sb&7 block indexing assumes QK/SUB==8");
+__device__ __forceinline__ void e8_dot_sub(const uint8_t *row,int sb,const float *sx,
+                                           const float *cb,float *acc){
+    const uint8_t *blk=row+(size_t)(sb>>3)*COLI_E8_BBYTES;
+    float w[COLI_E8_SUB]; e8_expand_sub_sm(blk,sb&7,e8_fp16(blk+96),w,cb);
+    const float *xv=sx+(size_t)sb*COLI_E8_SPAD;
+    float s=0; for(int k=0;k<COLI_E8_SUB;k++) s+=xv[k]*w[k];
+    *acc+=s;
+}
+
+__global__ static void grouped_hidden_e8_dual_warp(float *gate,const float *x,
+                                                   const GroupDesc *desc,int I,int D){
+    extern __shared__ float sx[];
+    int lane=threadIdx.x&31,w=threadIdx.x>>5;
+    int s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];
+    int nsub=(D+COLI_E8_SUB-1)/COLI_E8_SUB;
+    float *cb=sx+(size_t)nsub*COLI_E8_SPAD;
+    if(s<d.rows) e8_stage_x(sx,x+(size_t)(d.offset+s)*D,D,nsub);
+    e8_stage_codebook(cb);
+    __syncthreads();                       /* one barrier per BLOCK, not per output */
+    if(s>=d.rows) return;
+    int o=blockIdx.x*COLI_E8_WARPS_PER_BLOCK+w; if(o>=I) return;
+    size_t rb=row_bytes(6,D);
+    const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*rb;
+    const uint8_t *ur=(const uint8_t*)d.u+(size_t)o*rb;
+    float g0=0,g1=0,g2=0,g3=0,u0=0,u1=0,u2=0,u3=0;
+    for(int sb=lane;sb<nsub;sb+=32*COLI_E8_ACCS){
+                            e8_dot_sub(gr,sb,   sx,cb,&g0), e8_dot_sub(ur,sb,   sx,cb,&u0);
+        if(sb+32<nsub)      e8_dot_sub(gr,sb+32,sx,cb,&g1), e8_dot_sub(ur,sb+32,sx,cb,&u1);
+        if(sb+64<nsub)      e8_dot_sub(gr,sb+64,sx,cb,&g2), e8_dot_sub(ur,sb+64,sx,cb,&u2);
+        if(sb+96<nsub)      e8_dot_sub(gr,sb+96,sx,cb,&g3), e8_dot_sub(ur,sb+96,sx,cb,&u3);
+    }
+    float ga=(g0+g1)+(g2+g3),ua=(u0+u1)+(u2+u3);
+    ga=e8_warp_fold(ga); ua=e8_warp_fold(ua);
+    if(!lane) gate[(size_t)(d.offset+s)*I+o]=(ga/(1.f+expf(-ga)))*ua;
+}
+
+__global__ static void grouped_down_e8_warp(float *y,const float *x,
+                                            const GroupDesc *desc,int D,int I){
+    extern __shared__ float sx[];
+    int lane=threadIdx.x&31,w=threadIdx.x>>5;
+    int s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];
+    int nsub=(I+COLI_E8_SUB-1)/COLI_E8_SUB;
+    float *cb=sx+(size_t)nsub*COLI_E8_SPAD;
+    if(s<d.rows) e8_stage_x(sx,x+(size_t)(d.offset+s)*I,I,nsub);
+    e8_stage_codebook(cb);
+    __syncthreads();
+    if(s>=d.rows) return;
+    int o=blockIdx.x*COLI_E8_WARPS_PER_BLOCK+w; if(o>=D) return;
+    size_t rb=row_bytes(6,I);
+    const uint8_t *wr=(const uint8_t*)d.d+(size_t)o*rb;
+    float a0=0,a1=0,a2=0,a3=0;
+    for(int sb=lane;sb<nsub;sb+=32*COLI_E8_ACCS){
+                       e8_dot_sub(wr,sb,   sx,cb,&a0);
+        if(sb+32<nsub) e8_dot_sub(wr,sb+32,sx,cb,&a1);
+        if(sb+64<nsub) e8_dot_sub(wr,sb+64,sx,cb,&a2);
+        if(sb+96<nsub) e8_dot_sub(wr,sb+96,sx,cb,&a3);
+    }
+    float sum=(a0+a1)+(a2+a3);
+    sum=e8_warp_fold(sum);
+    if(!lane) y[(size_t)(d.offset+s)*D+o]=sum;
+}
+/* Shared-memory bytes one warp-kernel block needs: the padded activation row
+ * plus the pre-scaled codebook. D=6144 -> (192*33 + 1024)*4 = 29440 B; I=2048 ->
+ * 12544 B. Both inside the 48 KB a block gets without an opt-in call. */
+static size_t e8_warp_smem(int width){
+    int nsub=(width+COLI_E8_SUB-1)/COLI_E8_SUB;
+    return ((size_t)nsub*COLI_E8_SPAD+COLI_E8_CB_FLOATS)*sizeof(float);
+}
+/* The fmt=6 group, on either kernel family. Both call sites (the synchronous
+ * coli_cuda_expert_group and the issue/take split) go through here so the two
+ * cannot drift -- the rotate between the two matmuls is part of the sequence,
+ * not of either kernel. */
+static int e8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
+                           int max_rows,int count,int total){
+    if(e8_warp_kernels()){
+        unsigned hb=(unsigned)((I+COLI_E8_WARPS_PER_BLOCK-1)/COLI_E8_WARPS_PER_BLOCK);
+        unsigned ob=(unsigned)((D+COLI_E8_WARPS_PER_BLOCK-1)/COLI_E8_WARPS_PER_BLOCK);
+        dim3 hg(hb,(unsigned)max_rows,(unsigned)count),og(ob,(unsigned)max_rows,(unsigned)count);
+        grouped_hidden_e8_dual_warp<<<hg,256,e8_warp_smem(D),ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
+        if(!e8_rot_rows_dev(ctx->gate,total,I,ctx->stream))return 0;
+        grouped_down_e8_warp<<<og,256,e8_warp_smem(I),ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+        return 1;
+    }
+    dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),
+         og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+    grouped_hidden_e8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
+    if(!e8_rot_rows_dev(ctx->gate,total,I,ctx->stream))return 0;
+    grouped_down_e8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    return 1;
+}
+
 __device__ static void unpack_s4(uint8_t v,float *lo,float *hi){
     int a=v&15,b=v>>4; *lo=(float)(a&8?a-16:a); *hi=(float)(b&8?b-16:b);
 }
@@ -1911,10 +2113,7 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
     int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
     for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;
     if(all_e8){
-        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
-        grouped_hidden_e8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
-        if(!e8_rot_rows_dev(ctx->gate,total,I,ctx->stream))return 0;
-        grouped_down_e8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+        if(!e8_group_launch(ctx,dev,I,D,max_rows,count,total)) return 0;
     }else if(all_f8){
         /* fp8-e4m3 groups: silu fused in the dual epilogue, like the w4/g4 duals. */
         f8_group_launch(ctx,dev,I,D,max_rows,count);
@@ -2105,11 +2304,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
                 "expert group issue upload")) return 0;
     if(all_e8){
         GroupDesc *dev=(GroupDesc*)ctx->group_desc;
-        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
-        dim3 og((unsigned)D,(unsigned)max_rows,(unsigned)count);
-        grouped_hidden_e8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
-        if(!e8_rot_rows_dev(ctx->gate,total,I,ctx->stream))return 0;
-        grouped_down_e8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+        if(!e8_group_launch(ctx,dev,I,D,max_rows,count,total)) return 0;
     }else if(all_f8){
         /* fp8-e4m3 groups on the async decode path: same launch helper as the
          * sync dispatch, silu fused in the dual epilogue. */
