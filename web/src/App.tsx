@@ -39,30 +39,13 @@ import { persistPublicSettings, stored } from "@/lib/storage"
 import { Markdown } from "@/components/Markdown"
 import { cn } from "@/lib/utils"
 import { useLocale } from "./i18n"
+import { REASONING_EFFORT, modelForcesReasoning, reasoningLevelsFor, type ReasoningLevel } from "@/lib/reasoning"
 
 const message = (role: ChatMessage["role"], content: string): ChatMessage => {
   let id: string
   try { id = crypto.randomUUID() } catch { id = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16) }) }
   return { id, role, content }
 }
-
-/* Reasoning depth for GLM. The engine renders enable_thinking + reasoning_effort;
-   these levels map onto the words GLM understands (Low/Medium/High/Max), and "off"
-   turns thinking off entirely. GLM 5.3 cannot disable reasoning, so "off" is dropped
-   for it -- the model's own constraint, mirrored in the control rather than sent and
-   silently ignored. */
-type ReasoningLevel = "off" | "low" | "medium" | "high" | "max"
-
-const REASONING_EFFORT: Record<Exclude<ReasoningLevel, "off">, string> = {
-  low: "low", medium: "medium", high: "high", max: "xhigh",
-}
-
-const modelForcesReasoning = (model: string) => /5\.3/.test(model)
-
-const reasoningLevelsFor = (model: string): ReasoningLevel[] =>
-  modelForcesReasoning(model)
-    ? ["low", "medium", "high", "max"]
-    : ["off", "low", "medium", "high", "max"]
 
 export default function App() {
   const { t, locale, setLocale, locales } = useLocale()
@@ -178,11 +161,13 @@ export default function App() {
   // EFFECT #6
   useEffect(() => { setLastRun(null) }, [cacheSlot])
 
-  /* GLM 5.3 cannot turn reasoning off. If the user switches to such a model
-     while "off" is selected, lift it to a sane on-state instead of sending a
-     level the model will ignore. */
+  /* GLM 5.3 cannot turn reasoning off and has no distinct "medium" (it collapses
+     onto High). If the user switches to such a model while "off" or "medium" is
+     selected, lift it to a level the model actually honors instead of leaving the
+     control on a value it no longer offers. */
   useEffect(() => {
-    if (modelForcesReasoning(model)) setReasoning((level) => level === "off" ? "high" : level)
+    if (modelForcesReasoning(model))
+      setReasoning((level) => (level === "off" || level === "medium" ? "high" : level))
   }, [model])
 
   // EFFECT #7
