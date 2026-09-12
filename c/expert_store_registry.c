@@ -17,10 +17,22 @@
  * and call register() from their own constructors, so these symbols must
  * survive LTO inlining. Without this, gcc drops them when the only caller in
  * the current link is inside the same LTO set. */
-#if defined(__GNUC__)
-#define COLI_ESR_EXPORT __attribute__((externally_visible, used))
+#if defined(__has_attribute)
+#  if __has_attribute(externally_visible)
+#    define COLI_ESR_EXTERNALLY_VISIBLE __attribute__((externally_visible))
+#  else
+#    define COLI_ESR_EXTERNALLY_VISIBLE
+#  endif
+#elif defined(__GNUC__)
+#  define COLI_ESR_EXTERNALLY_VISIBLE __attribute__((externally_visible))
 #else
-#define COLI_ESR_EXPORT
+#  define COLI_ESR_EXTERNALLY_VISIBLE
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#  define COLI_ESR_EXPORT COLI_ESR_EXTERNALLY_VISIBLE __attribute__((used))
+#else
+#  define COLI_ESR_EXPORT
 #endif
 
 /* The built-in on-disk/mmap backend, defined in the COLI_V4_UNIT_EXPERT_STORE_AUTO
