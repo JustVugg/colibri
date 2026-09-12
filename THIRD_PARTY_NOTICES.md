@@ -32,6 +32,22 @@ executes an unmodified vLLM checkout (commit
 `ffd46bfab2128bb84146050e98b51a617c6575ab`) as a behavioural oracle for the
 native port; no vLLM code is vendored.
 
+## Swiftlet qpack and MLX affine Metal GEMV
+
+`c/qpack.c` and `c/qpack.h` implement the Swiftlet qpack v1 container schema
+documented by `Sources/SwiftletCore/Qpack.swift` at the commit linked below.
+The reader is a new portable implementation for Colibri and does not copy
+Swift source code.
+
+The MLX affine Q4/Q8 kernels in `c/backend_metal.mm` are adapted from
+`gemv_affine_fast` and `gemv_affine_fast8` in Swiftlet:
+https://github.com/leonickson1/Swiftlet at commit
+`b3a04676748c7597800c5bcc8b80a32508f9f43d`.
+
+Swiftlet is licensed under Apache License 2.0. The kernels were modified for
+Colibri's checked descriptor, batched dispatch, buffer ownership, and fallback
+contract. This repository's `LICENSE` contains the applicable Apache 2.0 text.
+
 ## DeepGEMM sm120 headers (fetched, not vendored: `c/third_party/deepgemm/`)
 
 The DeepSeek V4 CUDA tier's DeepGEMM flavour (`make cuda-dsv4-dg-dll`,
