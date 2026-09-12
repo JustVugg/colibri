@@ -185,6 +185,33 @@ class MirrorPlannerTest(unittest.TestCase):
         self.assertFalse(result["ready"])
         self.assertEqual(result["failures"], ["invalid_receipt_entry"])
 
+    def test_verify_accepts_complete_mirror_without_receipt_or_usage(self):
+        source = self.write_shard(self.model, "model.safetensors", [
+            ("model.layers.0.mlp.experts.0.gate_proj.weight", 32),
+        ])
+        self.mirror.mkdir()
+        target = self.mirror / source.name
+        target.write_bytes(source.read_bytes())
+
+        result = verify_mirror(self.mirror, self.model, [])
+
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["verification_mode"], "full_mirror")
+        self.assertEqual(result["file_count"], 1)
+        self.assertEqual(result["failures"], [])
+
+    def test_verify_rejects_incomplete_full_mirror_without_receipt(self):
+        self.write_shard(self.model, "model.safetensors", [
+            ("model.layers.0.mlp.experts.0.gate_proj.weight", 32),
+        ])
+        self.mirror.mkdir()
+
+        result = verify_mirror(self.mirror, self.model, [])
+
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["verification_mode"], "full_mirror")
+        self.assertEqual(result["failures"], ["model.safetensors (missing)"])
+
     def test_invalid_safetensors_header_fails_closed(self):
         (self.model / "bad.safetensors").write_bytes(struct.pack("<Q", 999) + b"{}")
         with self.assertRaises(MirrorError):
