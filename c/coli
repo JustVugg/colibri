@@ -836,7 +836,10 @@ def env_for(a):
                         # CUDA_DENSE / CUDA_EXPERT_GB from the user always win.
                         dense=int(plan["tiers"].get("ram",{}).get("dense_bytes",0) or 0)
                         room=int(vt.get("budget_bytes",0) or 0)-dense
-                        if dense>0 and room>=4*(1024**3) and "CUDA_DENSE" not in e:
+                        # An explicit expert budget owns the placement decision:
+                        # do not shrink it or add a trunk outside that budget.
+                        if (dense>0 and room>=4*(1024**3) and "CUDA_DENSE" not in e
+                                and "CUDA_EXPERT_GB" not in explicit_env):
                             e["CUDA_DENSE"]="1"
                             if "CUDA_EXPERT_GB" in e:
                                 e["CUDA_EXPERT_GB"]=f"{room/(1024**3):.3f}"

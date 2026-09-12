@@ -231,6 +231,36 @@ class CudaAutoEnableTest(unittest.TestCase):
         self.assertNotIn("CUDA_DENSE", e)          # 0.5 GB left for experts: not worth it
         self.assertAlmostEqual(float(e["CUDA_EXPERT_GB"]), 13.0, places=2)
 
+    def test_win32_preserves_explicit_expert_budget_before_dense_placement(self):
+        """Automatic dense placement must not resize an explicit expert tier.
+
+        Exercise the real environment_for_plan: it preserves the user's value,
+        so env_for must not overwrite it afterwards or add an unbudgeted trunk.
+        Device discovery and the size plan are synthetic; no GPU is required.
+        """
+        import resource_plan
+        GPB = 1024 ** 3
+        gpus = [self._fake_gpu(total_mib=34000, free_mib=33000)]
+        for requested in ("20.000", "auto", "0"):
+            with self.subTest(CUDA_EXPERT_GB=requested):
+                budget = 20.0 if requested == "20.000" else 30.7
+                plan = {"policy": {"name": "quality"},
+                        "cpu": {"physical_cores": 8},
+                        "tiers": {"ram": {"budget_bytes": 120 * GPB,
+                                          "cache_slots_per_layer": 62,
+                                          "dense_bytes": int(12.5 * GPB)},
+                                  "vram": {"budget_bytes": int(budget * GPB),
+                                           "devices": gpus}}}
+                with mock.patch.dict(os.environ, {"CUDA_EXPERT_GB": requested}, clear=True), \
+                     mock.patch.object(sys, "platform", "win32"), \
+                     mock.patch.object(coli, "cuda_binary", return_value=True), \
+                     mock.patch.object(resource_plan, "discover_gpus", return_value=gpus), \
+                     mock.patch.object(resource_plan, "physical_cpu_count", return_value=8), \
+                     mock.patch.object(resource_plan, "build_plan", return_value=plan):
+                    e = coli.env_for(args())
+                self.assertEqual(e["CUDA_EXPERT_GB"], requested)
+                self.assertNotIn("CUDA_DENSE", e)
+
     def test_win32_falls_back_to_cpu_when_nvidia_smi_missing(self):
         # coli_cuda.dll present (cuda=True) but nvidia-smi absent (no GPUs found)
         # -> warn + CPU-only, never crash, never set COLI_CUDA.
