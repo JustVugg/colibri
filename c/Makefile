@@ -1710,6 +1710,13 @@ tests/test_qwen36_tier_shutdown$(EXE): tests/test_qwen36_tier_shutdown.c tests/q
 tests/test_qwen36_tier_invariants$(EXE): tests/test_qwen36_tier_invariants.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# Same fake backend, with uploads that take time: qt_fill_wait must not return
+# until the last enqueued expert is RESIDENT, not merely dequeued -- the engine
+# frees the RAM int8 copies right after it (#1360 saw the gap one run in
+# fifteen; here the slow upload hook makes it every run without the fix).
+tests/test_qwen36_tier_fill_wait$(EXE): tests/test_qwen36_tier_fill_wait.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 # Same fake backend: the automatic placement (COLI_PLACE unset/"auto") puts
 # the offered dense trunk into VRAM by bytes-saved-per-byte, prices displaced
 # experts by heat, keeps the trunk on the CPU when the marginal experts are

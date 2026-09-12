@@ -44,6 +44,10 @@ static struct {
     /* upload ring with staging copies */
     struct { int layer, eid; uint8_t *w; float *s; int v_layer, v_eid; } q[QT_QCAP];
     int qh, qt_, qn;
+    int inflight;   /* enqueued and not yet resident. qn frees the ring slot at
+                     * dequeue, BEFORE the backend copies anything, so "queue
+                     * empty" says nothing about the last expert; qt_fill_wait
+                     * needs this separate completion count (#1360). */
     pthread_cond_t cv;
     /* statistics */
     uint64_t hits[QT_MAX_DEV], miss, uploads, q_full_skips;
@@ -157,7 +161,8 @@ static void *uploader(void *arg){
                  * cleared the victim's resident flag before enqueueing, so
                  * restore it to keep the flag consistent with the tensor it
                  * still holds. */
-                v->resident=1; qs(layer,eid)->queued=0;
+                v->resident=1; qs(layer,eid)->queued=0; G.inflight--;
+                pthread_cond_broadcast(&G.cv_take);
                 pthread_mutex_unlock(&G.mx); free(w); free(sc); continue;
             }
             ColiCudaTensor *a=v->tg,*b=v->tu,*ct=v->td;
@@ -201,6 +206,8 @@ static void *uploader(void *arg){
         else  { int hd=home(eid); G.used[hd]-=G.exp_bytes;
                 G.budget[hd]=G.used[hd];   /* device genuinely full: stop trying */ }
         s->queued=0;
+        G.inflight--;
+        pthread_cond_broadcast(&G.cv_take);          /* this upload is complete */
         pthread_mutex_unlock(&G.mx);
     }
 }
@@ -774,7 +781,7 @@ static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
     stage(w,sc,s->g4,s->u4,s->d4,s->gs,s->us,s->ds);
     G.q[G.qt_].layer=layer; G.q[G.qt_].eid=eid; G.q[G.qt_].w=w; G.q[G.qt_].s=sc;
     G.q[G.qt_].v_layer=v_layer; G.q[G.qt_].v_eid=v_eid;
-    G.qt_=(G.qt_+1)%QT_QCAP; G.qn++;
+    G.qt_=(G.qt_+1)%QT_QCAP; G.qn++; G.inflight++;
     pthread_cond_signal(&G.cv);
     return 1;
 }
@@ -941,11 +948,16 @@ void qt_note_planned(int layer,int eid,
     pthread_mutex_unlock(&G.mx);
 }
 
-/* waits until the upload queue is drained (end of warmstart). */
+/* Blocks until every enqueued upload has COMPLETED (end of warmstart): the
+ * engine frees the RAM int8 copies of the planned experts right after this
+ * returns, so "dequeued" is not enough -- the uploader drops qn before it
+ * calls the backend, and the last expert would still be queued=1 (#1360).
+ * Must not be called with an expert group open: an LFRU swap parks the
+ * uploader on issue_open until qt_take() clears it. */
 void qt_fill_wait(void){
     if(!G.on) return;
     pthread_mutex_lock(&G.mx);
-    while(G.qn>0 && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
+    while(G.inflight>0 && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
     pthread_mutex_unlock(&G.mx);
 }
 

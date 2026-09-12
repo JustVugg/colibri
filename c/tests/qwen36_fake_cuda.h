@@ -6,13 +6,17 @@
  * traffic without a GPU or the CUDA toolkit. A test that only checked
  * "qt_init returns 1" would pass even with the tier fully broken.
  *
- * Two settable hooks beyond plain recording:
+ * Three settable hooks beyond plain recording:
  *   fake_ndev        - device count returned by coli_cuda_available_device_count
  *                       and coli_cuda_device_count (default 1).
  *   fake_issue_hook   - called by coli_cuda_expert_group_issue with the issuing
  *                       device (taken from g[0]->device), the row count and the
  *                       input pointer; its return value is what issue returns.
- *                       NULL (the default) reproduces the old always-0 stub. */
+ *                       NULL (the default) reproduces the old always-0 stub.
+ *   fake_upload_hook  - called at the start of every tensor upload, on the
+ *                       uploader thread, with the tensor's fmt. A test that
+ *                       needs an upload to take TIME (a real cudaMemcpy does)
+ *                       sleeps here; NULL (the default) uploads instantly. */
 #ifndef QWEN36_FAKE_CUDA_H
 #define QWEN36_FAKE_CUDA_H
 
@@ -35,9 +39,11 @@ static size_t captured_len;
 static int fake_ndev = 1;
 static size_t fake_free_bytes = 2ull << 30;    /* what coli_cuda_mem_info reports as free */
 static int (*fake_issue_hook)(int device, int count, const float *x) = NULL;
+static void (*fake_upload_hook)(int fmt) = NULL;
 
 static int upload_common(ColiCudaTensor **t, const void *w, int fmt,
                          int I, int O, int device, int gs) {
+    if (fake_upload_hook) fake_upload_hook(fmt);
     ColiCudaTensor *n = (ColiCudaTensor *)calloc(1, sizeof *n);
     n->fmt = fmt; n->I = I; n->O = O; n->device = device; n->gs = gs; n->w = w;
     *t = n;
