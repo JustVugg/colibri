@@ -198,10 +198,14 @@ static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }  /* macOS: byte */
 #else
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }        /* Linux: KB */
-
+#endif
 /* Quanta RAM il sistema offre ancora, in GB. Serve a dimensionare la cache
  * degli esperti quando nessuno ha scelto un numero: senza questa, il default
- * e' una costante che non sa nulla ne' del modello ne' della macchina. */
+ * e' una costante che non sa nulla ne' del modello ne' della macchina.
+ *
+ * Fuori da Linux e dai sistemi con _SC_AVPHYS_PAGES ritorna 0, il che rende il
+ * budget automatico pari a cio' che il processo gia' tiene: la cache risulta
+ * minima invece che sbagliata, e --ram (o --cap) resta la via esplicita. */
 static double mem_available_gb(void) {
     double avail = 0.0;
 #ifdef __linux__
@@ -218,7 +222,6 @@ static double mem_available_gb(void) {
 #endif
     return avail;
 }
-#endif
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 
 /* chat mode only (main()'s CHAT=1 path): sampling temperature/top-p and the
