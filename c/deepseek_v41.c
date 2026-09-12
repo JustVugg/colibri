@@ -47,7 +47,11 @@
 #include <errno.h>
 #include <time.h>
 #include <stdarg.h>
+/* Windows has no <sys/resource.h>; compat.h supplies getrusage over
+ * GetProcessMemoryInfo, and every other engine guards the include the same way. */
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif
