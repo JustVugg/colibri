@@ -1963,6 +1963,10 @@ static void model_release(GModel *m) {
         }
         free(m->ecache);
     }
+    if (m->ehit) {
+        for (int i = 0; i < m->c.n_layers; i++) free(m->ehit[i]);
+        free(m->ehit);
+    }
     free(m->eref);
     if (m->vblocks) {
         for (int b = 0; b < m->c.vis_layers; b++) {
