@@ -198,6 +198,26 @@ static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }  /* macOS: byte */
 #else
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }        /* Linux: KB */
+
+/* Quanta RAM il sistema offre ancora, in GB. Serve a dimensionare la cache
+ * degli esperti quando nessuno ha scelto un numero: senza questa, il default
+ * e' una costante che non sa nulla ne' del modello ne' della macchina. */
+static double mem_available_gb(void) {
+    double avail = 0.0;
+#ifdef __linux__
+    FILE *mi = fopen("/proc/meminfo", "r");
+    if (mi) {
+        char ln[256]; double v = 0;
+        while (fgets(ln, sizeof(ln), mi))
+            if (sscanf(ln, "MemAvailable: %lf", &v) == 1) { avail = v / 1e6; break; }
+        fclose(mi);
+    }
+#elif defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE)
+    long pages = sysconf(_SC_AVPHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page > 0) avail = (double)pages * (double)page / 1e9;
+#endif
+    return avail;
+}
 #endif
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 
@@ -429,6 +449,54 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         LD(qn,"self_attn.q_norm.weight"); LD(kn,"self_attn.k_norm.weight");
         LD(gate, "mlp.gate.weight");
         #undef LD
+    }
+    /* cap <= 0 is "you decide", the sentinel the launcher sends when nobody
+     * asked for a number (glm53 already reads it that way; #1443 asked for the
+     * same here). Sized HERE rather than in main because the dense weights are
+     * resident by this line: rss_gb() is a measurement, not a projection, which
+     * is what made the same budget in kimi_k3 (#855) the simpler of the two.
+     *
+     * Until now "no explicit choice" arrived as a constant 8 slots per layer,
+     * which knows nothing about the model or the machine. On a 16 GB box whose
+     * entire expert set is 6.5 GB that constant costs a factor of five:
+     * measured on a 1204-token prefill, cap 8 gives 22.8% expert hit rate and
+     * 0.045 tok/s, cap 64 gives 99.4% and 0.215 tok/s. */
+    if (cap <= 0) {
+        double resident = rss_gb();
+        double avail = mem_available_gb();
+        const char *ram_env = getenv("RAM_GB");
+        double ram_arg = ram_env ? atof(ram_env) : 0.0;
+        /* An explicit --ram is a ceiling on the WHOLE process. Without it take
+         * 88% of what the OS still offers and add what we already hold, the
+         * same fraction and the same reason as the sibling engines: overshoot
+         * means an OOM kill mid-generation, which is worse than a small cache. */
+        double budget = ram_arg > 0.0 ? ram_arg : resident + avail * 0.88;
+        /* The KV cache is allocated later, at the first request, so project it:
+         * two tensors per layer of n_heads * max_t * head_dim floats. CTX caps
+         * at 4096 because attention()'s score buffer does. */
+        int max_t = getenv("CTX") ? atoi(getenv("CTX")) : 4096;
+        if (max_t < 1 || max_t > 4096) max_t = 4096;
+        double kv_gb = 2.0 * (double)c->n_layers * c->n_heads * max_t *
+                       c->head_dim * sizeof(float) / 1e9;
+        /* One slot holds one expert: three int8 matrices plus their row scales,
+         * the same arithmetic the Segment adapter uses to turn a memory limit
+         * into a cap. */
+        double slot_gb = ((double)c->hidden * c->inter * 3.0 +
+                          (double)(c->inter * 2 + c->hidden) * sizeof(float)) / 1e9;
+        int layers = layer_end - layer_begin;
+        if (layers < 1) layers = 1;
+        double room = budget - resident - kv_gb - 0.5;   /* 0.5 GB: activations */
+        int derived = room > 0.0 && slot_gb > 0.0
+                    ? (int)(room / slot_gb / (double)layers) : 0;
+        if (derived < 1) derived = 1;
+        if (derived > c->n_experts) derived = c->n_experts;
+        fprintf(stderr, "[cache] %d slots/layer of %d experts: %.1f GB budget "
+                        "(%s), %.1f GB dense resident, %.1f GB projected KV, "
+                        "%.0f MB per expert\n",
+                derived, c->n_experts, budget,
+                ram_arg > 0.0 ? "RAM_GB" : "88% of what the OS still offers",
+                resident, kv_gb, slot_gb * 1000.0);
+        cap = derived;
     }
     m->cache = calloc(c->n_layers, sizeof(LCache));
     for (int i = layer_begin; i < layer_end; i++) {
