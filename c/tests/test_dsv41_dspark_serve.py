@@ -54,7 +54,10 @@ def has_draft_head():
 def completion(drafts):
     """One turn through the gateway, with drafting on or off. Returns (text, log)."""
     port = free_port()
-    environment = {**os.environ, "V41_DSPARK": "1" if drafts else "0"}
+    # V41_STATS: the per-turn "N of M drafts accepted" line is what this test reads,
+    # and it is off by default so that `coli chat` does not print accounting between
+    # the question and the answer. A test that measures asks to be told.
+    environment = {**os.environ, "V41_DSPARK": "1" if drafts else "0", "V41_STATS": "1"}
     process = subprocess.Popen(
         [sys.executable, str(HERE / "coli"), "serve", "--model", str(FIXTURE),
          "--port", str(port), "--cap", "4"],

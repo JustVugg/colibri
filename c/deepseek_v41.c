@@ -247,6 +247,15 @@ typedef struct { float *w; int64_t n; } WF;                /* f32               
 
 #define FP8_TILE 32
 
+/* Per-turn accounting on stderr. Off by default because `coli chat` shows the
+ * engine's stderr right next to the answer; V41_STATS=1 turns it on, which is
+ * what the benchmarks and the server scripts use. */
+static int v41_stats(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("V41_STATS") ? atoi(getenv("V41_STATS")) : 0;
+    return on;
+}
+
 /* V41_TRACE=1 prints a checksum of the tensors the reference prints too, so a
  * divergence is located by diffing two columns rather than by reading two forwards. */
 static int g_trace = 0;
@@ -2967,10 +2976,11 @@ static int spec_ready(Spec *sp) {
      * half of what it needs to be. */
     if (sp->window_prop >= 10 &&
         sp->window_acc * 100 < sp->window_prop * (uint64_t)sp->min_accept) {
-        fprintf(stderr, "[v41] DSpark: %.0f%% of the last %llu drafts accepted (under "
-                        "%d%%), pausing for 64 tokens\n",
-                100.0 * (double)sp->window_acc / (double)sp->window_prop,
-                (unsigned long long)sp->window_prop, sp->min_accept);
+        if (v41_stats())
+            fprintf(stderr, "[v41] DSpark: %.0f%% of the last %llu drafts accepted "
+                            "(under %d%%), pausing for 64 tokens\n",
+                    100.0 * (double)sp->window_acc / (double)sp->window_prop,
+                    (unsigned long long)sp->window_prop, sp->min_accept);
         sp->pause = 64;
         sp->window_prop = sp->window_acc = 0;
         return 0;
@@ -3228,7 +3238,12 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             }
         }
         free(batch); free(confidence);
-        if (m->engram.active) {
+        /* Per-turn accounting goes to stderr, and stderr is what the user reads
+         * their answer next to in `coli chat`: four lines a turn between the
+         * question and the reply is noise, not instrumentation. Off unless asked
+         * for, and the benches ask for it. */
+        int stats = v41_stats();
+        if (stats && m->engram.active) {
             /* What the n-gram memory actually cost this turn. Rows are 264
              * bytes and the traffic is Zipfian, so the useful question is not
              * how many rows were read but how many of them the cache already
@@ -3245,7 +3260,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
                         tab->misses * (double)(m->engram.head_dim + m->engram.head_dim / 32) / 1e6);
             }
         }
-        {
+        if (stats) {
             /* Expert streaming, per turn: how many bytes the LRU had to fetch and
              * what rate the reads actually achieved. The rate is the number that
              * matters -- the device is worth several GB/s, so a figure far under
@@ -3259,7 +3274,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
                         seconds > 0 ? turn_bytes / 1e9 / seconds : 0.0,
                         prefill_bytes / 1e6, prefill_disk, prefill_expert, prefill_wall);
         }
-        if (m->spec.active && m->spec.proposed > proposed0)
+        if (stats && m->spec.active && m->spec.proposed > proposed0)
             fprintf(stderr, "[v41] DSpark: %llu of %llu drafts accepted this turn\n",
                     (unsigned long long)(m->spec.accepted - accepted0),
                     (unsigned long long)(m->spec.proposed - proposed0));

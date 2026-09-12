@@ -1327,7 +1327,13 @@ FAMILIES = (
         # at the gateway rather than desync the wire.
         capabilities=FamilyCapabilities(True, False, False, True),
         has_gateway_adapter=True,
-        has_cli_adapter=True,
+        # coli run stays unwired, for the reason qwen36 gives above and one more:
+        # cmd_run dispatches per arch after this gate, and with no deepseek_v41
+        # branch of its own the launcher would fall through to GLM's binary and
+        # GLM's prompt template. The engine speaks the SERVE protocol and nothing
+        # else, so a one-shot has nowhere to go but the gateway -- which is what
+        # coli chat, coli serve and coli web already use.
+        has_cli_adapter=False,
     ),
 )
 
