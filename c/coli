@@ -69,7 +69,7 @@ except ModuleNotFoundError:
         _version = "unknown"
 
 from family_registry import (FamilyConfigError, UnknownFamilyError, all_families,
-                             family_by_id, family_for_config, resolve_model,
+                             display_for, family_by_id, family_for_config, resolve_model,
                              tuning_replay_prompt)
 
 _TUNE_ROTATION_PROMPT = (
@@ -190,9 +190,16 @@ def model_banner_line(model):
     except (OSError, ValueError, TypeError):
         return generic
     kind = (cfg.get("model_type") or "").lower()
+    geometry = cfg
     try:
-        family = resolve_model(model).descriptor
-        name, scale = family.display_name, family.display_scale
+        resolved = resolve_model(model)
+        family = resolved.descriptor
+        # Size-aware: a family's model_type can span checkpoints an order of
+        # magnitude apart (Qwen3.6-35B and Qwen3.8-2.4T both resolve to
+        # qwen36). display_for names the geometry actually on disk, and
+        # falls back to the model_type when it recognises none.
+        name, scale = display_for(resolved)
+        geometry = resolved.family_config
         # display_scale e' la taglia del checkpoint di riferimento. Un REAP ha
         # lo stesso model_type e meno esperti: "284B" su un 150B e' #1367
         # di nuovo. Quando la geometria non e' quella del riferimento si
@@ -206,10 +213,11 @@ def model_banner_line(model):
         scale = ""
 
     bits = [name]
+    experts = geometry.get("n_routed_experts") or geometry.get("num_experts")
     if scale:
-        bits.append(f"{scale} MoE" if cfg.get("n_routed_experts") else scale)
+        bits.append(f"{scale} MoE" if experts else scale)
     else:
-        layers, experts = cfg.get("num_hidden_layers"), cfg.get("n_routed_experts")
+        layers = geometry.get("num_hidden_layers")
         if layers and experts:
             bits.append(f"{layers}L x {experts}E MoE")
         elif layers:
