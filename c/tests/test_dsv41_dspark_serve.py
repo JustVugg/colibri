@@ -45,7 +45,10 @@ def has_draft_head():
         return False
     text = json.loads((FIXTURE / "config.json").read_text())
     text = text.get("text_config", text)
-    return int(text.get("n_mtp_layers", 0)) > 0
+    # dspark_block_size, not n_mtp_layers: the released checkpoint declares the
+    # first and omits the second, and the fixture now matches it. The engine
+    # counts the stages by probing the shards for the same reason.
+    return int(text.get("dspark_block_size", 0)) > 0
 
 
 def completion(drafts):

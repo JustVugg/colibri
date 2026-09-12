@@ -95,28 +95,34 @@ the oracle drafts the reference's own next tokens (`1`), or corrupts the last of
 so a round is rejected part way (`2`), or keeps the head's own (`3`); all three have to
 reproduce the reference token for token, and CI runs them.
 
-Drafting is **off unless you ask for it**, and the reason is a measurement rather
-than caution. On a 16-thread CPU server holding 68% of the experts, DeepSeek's own
-draft head accepts half of what it proposes, which is a respectable rate, and still
-loses:
+Drafting is on, and the default is a measurement. Three runs of the same
+24-token turn on a 16-thread CPU server holding 68% of the experts, each from a
+dropped page cache:
 
-| | forwards for 24 tokens | wall |
-|---|---|---|
-| `V41_DSPARK=1` | 9 | 114 s |
-| off | 24 | 86 s |
+| | forwards | wall | tok/s |
+|---|---|---|---|
+| drafts off | 24 | 116.6 s | 0.206 |
+| drafts on, guard at 60% | 16 | **99.3 s** | **0.242** |
+| drafts on, guard disabled | 9 | 111.5 s | 0.215 |
 
-A six-row verify amortizes the disk almost perfectly, expert reads up 17% for six
-positions, and the per-row dense work not at all, attention up 40%. Six positions
-cost six times the attention projections and buy 2.7 tokens. That balance flips
-where per-row compute is cheap: a GPU, or a machine holding the whole expert set,
-which is exactly where someone would reach for it.
+Two things in that table are worth more than the 17% it shows.
 
-So it is a switch. `V41_DSPARK=1` turns it on, and the guard still watches: a round
-that is rejected has still read its stages' experts, so acceptance is measured over
-ten proposals and the drafts pause for 64 tokens when it falls under
-`V41_DSPARK_MINACC`, whose default of 60% is where the measurement above puts the
-break-even. That is the same crossing colibri.c measured for MTP on GLM-5.2, where
-90% acceptance gains 22% and 19% loses 25%.
+The first is that **stopping pays as much as starting**. Nine forwards is fewer
+than sixteen and slower: the early rounds push six positions through a cold
+cache and win, the later ones pay six times the per-row attention for a cache
+that is now warm and would have served single tokens cheaply. The acceptance
+guard fires at 53% and turns 111 s into 99. It is not really measuring
+acceptance, it is measuring the moment batching stops being free, and
+acceptance is the signal that moves with it.
+
+The second is that the first comparison I ran said the opposite, that drafting
+cost 32%. It was wrong, because the two runs had not started from the same
+cache state. On an engine that reads its weights from disk, a warm page cache
+is worth more than any optimization in this file. Cold, or it is not a number.
+
+`V41_DSPARK=0` turns the head off entirely and it is then not even loaded;
+`V41_DSPARK_MINACC` moves the guard, whose default of 60% is where these runs
+put it.
 
 ## The index-key slot, and why the default is the odd one
 
@@ -148,7 +154,7 @@ default cannot be "tidied" by accident.
 | `V41_INDEX_OWNER` | unset | each layer scores against its own owner's index keys (see above). Changes the model's behaviour. |
 | `V41_MAX_IMAGE_TOKENS` | the checkpoint's `max_image_tokens` | a ceiling on what one image costs in prompt tokens. |
 | `V41_TRACE` | unset | print a checksum of the tensors the reference prints too, for locating a divergence by diffing two columns. `2` follows the first row of a speculative step instead of the last, which is the row a sequential decode is comparable to. |
-| `V41_DSPARK` | off | `1` loads the DSpark draft head and verifies its blocks. A net loss on a CPU box at 68% expert residency, a win where per-row compute is cheap; see above. |
+| `V41_DSPARK` | on when the checkpoint carries the head | `0` disables the draft head and does not load it. Measured at +17% on the real checkpoint, cold; see above. |
 | `V41_DSPARK_MAX` | the checkpoint's `dspark_block_size` | how many of the drafted tokens are put in front of the main model. Fewer means a cheaper rejected round and a lower ceiling on the win. |
 | `V41_DSPARK_MINACC` | 60 | percent of drafts that must be accepted over a window of ten for drafting to continue; below it, drafts pause for 64 tokens. 60 is the measured break-even, not a guess. |
 | `V41_SPEC_FORCE` | unset | oracle mode only: draft the reference's tokens (`1`), corrupt the last one (`2`), or use the head's own (`3`), to exercise the verification path on a fixture whose draft head is random. |

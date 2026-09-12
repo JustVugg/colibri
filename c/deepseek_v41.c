@@ -1895,15 +1895,20 @@ static int argmax(const float *values, int n);
 static void spec_load(Model *m, int ecap) {
     Cfg *c = &m->c;
     Spec *sp = &m->spec;
-    /* 60%, not 30%, and the number is measured rather than guessed. On a
-     * 16-thread CPU box holding 68% of the experts, DeepSeek's own draft head
-     * accepts 16 of 32 drafts on a 24-token turn -- respectable, and still a
-     * net loss: 9 forwards instead of 24, but 114 s instead of 86, because a
-     * six-row verify costs more than the extra tokens it buys (attention +40%,
-     * expert reads +17%). That is the same break-even colibri.c measured for
-     * MTP on GLM-5.2, where 90% acceptance gains 22% and 19% loses 25%, with
-     * the crossing around half. Half is where this lands, so half must pause.
-     * Above 60% the batch pays for itself; below it the guard stops paying. */
+    /* 60%, and what it buys is not what I expected. The three cold runs:
+     *
+     *     drafts off                 24 forwards   116.6 s
+     *     drafts on, guard at 60     16 forwards    99.3 s
+     *     drafts on, guard disabled   9 forwards   111.5 s
+     *
+     * Speculating pays, and so does stopping. Fewer forwards is not less time:
+     * the early rounds batch six positions through a cold cache and win, the
+     * later ones pay six times the per-row attention for a cache that is now
+     * warm and would have served single tokens cheaply. The guard fires at 53%
+     * acceptance and turns 111 s into 99. It is not really measuring
+     * acceptance, it is measuring the moment batching stops being free -- but
+     * acceptance is the signal that moves with it, and it is the one we have.
+     */
     sp->min_accept = getenv("V41_DSPARK_MINACC") ? atoi(getenv("V41_DSPARK_MINACC")) : 60;
     /* how many of the drafted tokens to put in front of the main model. The head always
      * writes its whole block; verifying fewer of them trades acceptance for a smaller
@@ -1933,27 +1938,19 @@ static void spec_load(Model *m, int ecap) {
         }
     }
     if (c->n_mtp <= 0) return;
-    /* Off unless asked for, and the reason is measured. On a 16-thread CPU box
-     * holding 68% of the experts, the draft head accepts half its proposals and
-     * still loses: 24 tokens took 114 s with it and 86 s without, because a
-     * six-row verify amortizes the disk well (+17%) and the per-row dense work
-     * not at all (+40% attention). Verifying six positions costs six times the
-     * attention projections and buys 2.7 tokens.
+    /* On by default, and the default is a measurement. On a 16-thread CPU
+     * server holding 68% of the experts, from a dropped page cache, the same
+     * 24-token turn takes 116.6 s with no drafting and 99.3 s with it. The
+     * first comparison I ran said the opposite, and it was wrong: the two runs
+     * had not started from the same cache state, which on an engine that reads
+     * its weights from disk decides everything. Cold or it is not a number.
      *
-     * That balance flips where the per-row compute is cheap -- a GPU, or a
-     * machine holding the whole expert set -- which is exactly where a user
-     * would reach for it. So it is a switch and not a default, with the guard
-     * still watching acceptance for whoever turns it on. */
+     * V41_DSPARK=0 turns the head off and does not load it. */
     const char *flag = getenv("V41_DSPARK");
-    if (!flag || !atoi(flag)) {
-        fprintf(stderr, "[v41] DSpark drafts off; V41_DSPARK=1 turns them on "
-                        "(worth it when the experts are resident)\n");
+    if (flag && !atoi(flag)) {
+        fprintf(stderr, "[v41] DSpark drafts off (V41_DSPARK=0)\n");
         return;
     }
-    /* A checkpoint can declare the head in its config and still not ship it -- the
-     * vendor's own converter drops the tied embed and head, and a partial download has
-     * the same shape. Refusing to start over a missing draft head would be absurd, so
-     * say so once and decode without it. */
     if (!st_find(&m->S, "mtp.0.attn.wq_a.weight")) {
         fprintf(stderr, "[v41] no DSpark head in this checkpoint: drafts off\n");
         return;
