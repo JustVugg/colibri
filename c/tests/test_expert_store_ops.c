@@ -67,7 +67,7 @@ int main(void) {
         mock_lookup, mock_release, mock_prefetch, mock_stats, mock_destroy
     };
     MockState state = {0};
-    ColiExpertStore store = {&ops, &state};
+    ColiExpertStore store = {&ops, &state, NULL};
     ColiExpertView view;
     ColiExpertView other;
     ColiExpertKey key = {7, 19};

@@ -2643,10 +2643,16 @@ static int qwen38_edge_select(void *engine_impl,
 }
 
 static const ColiEdgeAdapter qwen38_edge_adapter={
-    sizeof(ColiEdgeAdapter),COLI_EDGE_ABI_VERSION,"qwen38",
-    qwen38_edge_engine_open,qwen38_edge_engine_destroy,
-    qwen38_edge_tokenize,qwen38_edge_detokenize,
-    qwen38_edge_embed,qwen38_edge_select,{0}
+    .struct_size = sizeof(ColiEdgeAdapter),
+    .abi_version = COLI_EDGE_ABI_VERSION,
+    .engine_id = "qwen38",
+    .engine_open = qwen38_edge_engine_open,
+    .engine_destroy = qwen38_edge_engine_destroy,
+    .tokenize = qwen38_edge_tokenize,
+    .detokenize = qwen38_edge_detokenize,
+    .embed = qwen38_edge_embed,
+    .select = qwen38_edge_select,
+    .reserved_fn = {0}
 };
 
 int coli_qwen38_edge_adapter_register(void) {

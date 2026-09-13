@@ -2726,8 +2726,6 @@ int coli_v4_attention_window_batch_ref(
 
 #ifdef COLI_V4_GPU_TIER
     int gpu_batch = coli_v4_gpu_attn_batch_wanted() && batch > 1;
-#else
-    int gpu_batch = 0;
 #endif
     /* Whole-chunk GPU projections for the compressor and the indexer's
      * compressor; the per-token state advance stays on the CPU. NULL means
@@ -3759,7 +3757,9 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     const uint16_t *raw_weights = value(
         state->weights, "attn.indexer.weights_proj.weight", NULL);
     size_t qn = (size_t)heads * dimension;
+#ifdef COLI_V4_GPU_TIER
     size_t cols = (size_t)wq.columns;
+#endif
 
 #define ALIGN32(n) (((size_t)(n) + 31) & ~(size_t)31)
     size_t sz_queries = ALIGN32((size_t)batch * qn * sizeof(float));
@@ -3769,8 +3769,6 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     size_t sz_stoken = ALIGN32((size_t)need * sizeof(int));
     size_t sz_scores = ALIGN32((size_t)need * max_count * sizeof(float));
     size_t sz_ranked = ALIGN32((size_t)max_count * sizeof(IndexScore));
-    size_t sz_scales = ALIGN32((size_t)dimension / 32);
-    size_t sz_qdq = ALIGN32((size_t)dimension * sizeof(float));
 #ifdef COLI_V4_GPU_TIER
     size_t sz_xq = (need <= 1024) ? ALIGN32((size_t)need * cols * sizeof(float)) : 0;
     size_t sz_yq = (need <= 1024) ? ALIGN32((size_t)need * qn * sizeof(float)) : 0;
@@ -3780,7 +3778,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
 #endif
 
     size_t total_scratch = sz_queries + sz_sq + sz_head_weights + sz_scounts + sz_stoken +
-                           sz_scores + sz_ranked + sz_scales + sz_qdq + sz_xq + sz_yq + sz_xs + 256;
+                           sz_scores + sz_ranked + sz_xq + sz_yq + sz_xs + 256;
 
     char *scratch_ptr = (char *)indexer_scratch_alloc(state, total_scratch);
     if (!scratch_ptr || !raw_weights) {
@@ -3797,8 +3795,6 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     int *stoken = (int *)scratch_ptr; scratch_ptr += sz_stoken;
     float *scores = (float *)scratch_ptr; scratch_ptr += sz_scores;
     IndexScore *ranked = (IndexScore *)scratch_ptr; scratch_ptr += sz_ranked;
-    uint8_t *scales = (uint8_t *)scratch_ptr; scratch_ptr += sz_scales;
-    float *qdq = (float *)scratch_ptr; scratch_ptr += sz_qdq;
     int result = 0;
 
     /* Query projection. Preferred: host fp8 activation quantization (the
@@ -4977,11 +4973,15 @@ static int moe_token_pipeline(float *output,
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
     ColiExpertView *views = malloc((size_t)selected * sizeof(*views));
+#ifdef COLI_V4_GPU_TIER
     int gpu_compute = 0;
+#endif
     if (!views) result = -1;
     if (!result) {
         memset(views, 0, (size_t)selected * sizeof(*views));
+#ifdef COLI_V4_GPU_TIER
         gpu_compute = 1;
+#endif
         for (int current = 0; !result && current < selected; current++) {
             int slot = current % dual_loader_lanes();
             if (!loader_active[slot] ||
@@ -5001,9 +5001,11 @@ static int moe_token_pipeline(float *output,
                     coli_v4_gpu_expert_attach(store, &views[current]);
             }
 #endif
+#ifdef COLI_V4_GPU_TIER
             if (!views[current].gate.gpu || !views[current].up.gpu ||
                 !views[current].down.gpu)
                 gpu_compute = 0;
+#endif
 
             int next = current + dual_loader_lanes();
             if (next < selected) {

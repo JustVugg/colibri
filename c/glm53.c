@@ -1408,11 +1408,11 @@ static void expert_mats(const GModel *m, const Slot *slot, Mat *gate, Mat *up, M
     const int hidden = m->c.hidden, inter = m->c.moe_inter;
     const Mat shape[3] = {
         { 4, NULL, NULL, slot->piece[0], (const float *)slot->piece[1],
-          inter, hidden, 64 },
+          inter, hidden, 64, NULL },
         { 4, NULL, NULL, slot->piece[2], (const float *)slot->piece[3],
-          inter, hidden, 64 },
+          inter, hidden, 64, NULL },
         { 4, NULL, NULL, slot->piece[4], (const float *)slot->piece[5],
-          hidden, inter, 64 },
+          hidden, inter, 64, NULL },
     };
     *gate = shape[0]; *up = shape[1]; *down = shape[2];
 }
@@ -2138,12 +2138,13 @@ static void model_load(GModel *m, const char *dir) {
 static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
                            const float *vision, int n_vision) {
     const Cfg *c = &m->c;
+    const int H = c->hc_mult;
     const int start = s->filled;   /* NON 'base': nel ciclo dei layer e' gia' preso */
     if (start + n > s->cap) {
         fprintf(stderr, "contesto esaurito: %d posizioni su %d\n", start + n, s->cap);
         exit(1);
     }
-    const int H = c->hc_mult, D = c->hidden;
+    const int D = c->hidden;
     float *streams = malloc((size_t)n * H * D * sizeof(float));
     float *next = malloc((size_t)n * H * D * sizeof(float));
     /* l'embedding entra replicato in ognuno degli H flussi residui; sui token
@@ -3609,7 +3610,8 @@ static int glm53_edge_embed(void *engine_impl, const ColiEdgeEmbedRequest *reque
 static int glm53_edge_final(const Glm53EdgeEngine *engine, const float *streams,
                             float *logits, float *collapsed, float *normed) {
     const Cfg *c = &engine->model.c;
-    const int H = c->hc_mult, D = c->hidden;
+    const int H = c->hc_mult;
+    const int D = c->hidden;
     for (int d = 0; d < D; d++) {
         float sum = 0.0f;
         for (int h = 0; h < H; h++) sum += streams[(size_t)h * D + d];
@@ -3664,7 +3666,7 @@ static int glm53_edge_select(void *engine_impl, const ColiEdgeSelectRequest *req
         return coli_edge_adapter_error(error, error_size,
                                        "GLM-5.3 Edge select got bad arguments");
     const Cfg *c = &engine->model.c;
-    const int H = c->hc_mult, D = c->hidden;
+    const int D = c->hidden;
     const size_t width = engine->state_width;
     if (request->input_bytes < (size_t)request->rows * width * sizeof(float) ||
         request->token_capacity < request->rows)
