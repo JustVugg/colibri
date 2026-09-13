@@ -150,8 +150,10 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
   }
   acc = simd_sum(acc);
   // fmt==4 (per-group) and fmt==8 (per-block) already folded their scale into acc
-  // above -- do not scale again.
-  if (slane == 0) y[row] = (fmt == 4 || fmt == 8) ? acc : acc * scale[o];
+  // above -- do not scale again. fmt==0 is raw f32 and has NO scale array (see
+  // fmt_scale_bytes): its `scale` binding is a nil buffer, so reading scale[o] here
+  // yielded 0 and zeroed the whole result. Only fmt 1/2/3 carry a per-row scale.
+  if (slane == 0) y[row] = (fmt == 0 || fmt == 4 || fmt == 8) ? acc : acc * scale[o];
 }
 
 // Batched bindless expert GEMV: each row gr belongs to expert erow[gr], whose weight and
@@ -764,10 +766,18 @@ static size_t fmt_bytes(int fmt, int I, int O) {
 // UE8M0 encoding exists at all: qt_resolve_fmt refuses it on the CPU read path before any
 // tensor in that encoding could ever reach this Metal-side sizing helper.
 static size_t fmt_scale_bytes(int fmt, int I, int O, int gs) {
+  // fmt=0 is RAW f32: the weights are already in their final units, so there is no
+  // scale array at all and callers legitimately pass scales == NULL (kimi_k3.c's
+  // k3_matmul_f32 does, for the KDA fa/fb/bp projections). Returning the per-row
+  // size below for fmt=0 made coli_metal_matmul wrap a NULL pointer, which segfaulted
+  // inside newBufferWithBytes' memmove whenever O*4 was not a page multiple, and
+  // silently produced a nil buffer (-> all-zero output) when it was. Must stay 0, and
+  // mm_gemv must correspondingly not apply a scale for fmt=0.
+  if (fmt == 0) return 0;
   if (fmt == 4) return (size_t)O * ((I + gs - 1) / gs) * sizeof(float);
   if (fmt == 6) return (size_t)O * ((I + gs - 1) / gs) * 2; // e8: 2-byte group scales
   if (fmt == 8) return (size_t)((O + 127) / 128) * (size_t)((I + 127) / 128) * sizeof(float); // fp8 block scales
-  return (size_t)O * sizeof(float); // per-row scale, fmt 0/1/2/3 (dev catch-all; #790 rebase must keep this)
+  return (size_t)O * sizeof(float); // per-row scale, fmt 1/2/3 (dev catch-all; #790 rebase must keep this)
 }
 
 // Wrap host memory zero-copy if page-aligned, else copy into a shared buffer.
@@ -958,6 +968,17 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
    * contiguous range check below: it is not adjacent to it. */
   if (!g_dev || fmt < 0 || (fmt > 4 && fmt != 8)) return 0;
   if(!weights||!x||!y) return 0;
+  /* Fail CLOSED to the caller's CPU path if a format that NEEDS a scale array was
+   * handed a NULL one, rather than letting wrap() memmove from address 0. Sized off
+   * fmt_scale_bytes so the two can't drift: any format it reports bytes for must have
+   * a real pointer behind them. (fmt=0 reports 0 bytes and is exempt by construction.) */
+  if (!scales && fmt_scale_bytes(fmt, I, O, gs) != 0) {
+    static bool warned = false;
+    if (!warned) { warned = true;
+      fprintf(stderr, "[metal] matmul: fmt=%d needs a scale array but scales==NULL; "
+                      "falling back to CPU\n", fmt); }
+    return 0;
+  }
   @autoreleasepool {
     ColiMetalTensor *t = *tp;
     if (!t) {
