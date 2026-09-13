@@ -177,3 +177,11 @@ but that **two different images give two different answers**.
 dequantisation of the same bytes. It needs a converted checkpoint, so it does not
 run in CI, and it is the first thing to reach for when the real model answers
 strangely.
+
+## External implementation field report
+
+The [September 4 RTX PRO 6000 field report](experiments/glm53-flash-rtx-pro-6000-2026-09-04.md)
+records a separate, patched llama.cpp experiment with an AJ IQ2 GGUF: four
+concurrent ~90K contexts, numerical and answer-quality checks, and two invalid
+profiling attempts. It is external evidence for implementation and measurement
+review; it does not benchmark or validate Colibri's `c/glm53.c` engine.
