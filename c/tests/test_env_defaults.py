@@ -369,3 +369,37 @@ class Dsv4CudaDetectTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClusterWorkerCapTest(unittest.TestCase):
+    """`coli cluster worker` must hand the engine a number, never "None".
+
+    --cap comes from the shared parser and defaults to None, meaning "auto".
+    The worker used to stringify it straight into argv, so a launch without an
+    explicit --cap died on the engine's own argument check with
+    `cache/layer: expected a whole number, got "None"` (#1452). Every other
+    direct-engine launcher resolves it through cap_for_launch; this one now
+    does too.
+    """
+
+    def _worker_argv(self, cap):
+        captured = {}
+
+        def fake_call(cmd, env=None, **kwargs):
+            captured["cmd"] = cmd
+            return 0
+
+        a = args(cap=cap, ebits=8, dbits=8, port=9100, layers="0-1",
+                 coordinator=None, advertise_host=None, node_id=None)
+        with mock.patch.object(coli, "need_worker_model", return_value="/tmp/engine"), \
+             mock.patch.object(coli.subprocess, "call", fake_call):
+            coli.cmd_cluster_worker(a)
+        return captured["cmd"]
+
+    def test_auto_cap_becomes_a_number(self):
+        argv = self._worker_argv(None)
+        self.assertNotIn("None", argv)
+        int(argv[1])                       # raises if it is not a whole number
+
+    def test_explicit_cap_is_passed_through(self):
+        self.assertEqual(self._worker_argv(24)[1], "24")

@@ -1852,7 +1852,14 @@ def cmd_cluster_worker(a):
               "COLI_MMAP":os.environ.get("COLI_MMAP", "1")})
     print(f"  {C.dim}[CLUSTER] expert worker · {host}:{a.port} · layers {a.layers}{C.r}")
     try:
-        return subprocess.call([engine,str(a.cap),str(a.ebits),str(a.dbits)],env=e)
+        # cap_for_launch, not a.cap: --cap defaults to None and str(None) is the
+        # literal "None", which the engine's argument parser refuses with
+        # `cache/layer: expected a whole number, got "None"` -- so the worker
+        # could only ever start with an explicit --cap (#1452). Fallback 0 is
+        # what the other GLM launch sites pass: the engine resolves its own cap
+        # when the argument is zero.
+        return subprocess.call([engine,str(cap_for_launch(a.cap,e,0)),
+                                str(a.ebits),str(a.dbits)],env=e)
     finally:
         stop_heartbeat.set()
 
