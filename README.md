@@ -18,7 +18,7 @@ parameters** — on consumer and heterogeneous hardware, in pure C with zero
 engine dependencies, by treating storage, RAM, and VRAM as a single inference
 hierarchy (AI memory multitiering).
 
-Eight families run today: **GLM-5.2/5.3** (744B), **GLM-5.3-Flash** (321B, with
+Nine families run today: **GLM-5.2/5.3** (744B), **GLM-5.3-Flash** (321B, with
 vision), **Inkling** (975B), **Kimi K3** (2.8T), **DeepSeek V4 Flash** (284B), **DeepSeek V4.1 Flash** (552B, with vision),
 **Qwen3.8-Flash-Next** (125B + 51B n-gram), **Qwen3.6** (35B-A3B) and
 **OLMoE** (7B) —
@@ -40,7 +40,7 @@ may reduce speed; it must not quietly redefine the model.
 
 ```
 $ ./coli chat
-  🐦 colibri v1.10.2 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.11.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -584,8 +584,8 @@ checkpoint validation, and the generated tiny independent oracle.
   lower cost per useful token. Everything lands the way this project works:
   measured end to end, reviewed, and developed in the open.
 - **More open models.** The tiering algorithm is model-agnostic: any MoE with
-  routed experts can be staged the same way. Eight families run today (GLM-5.2,
-  GLM-5.3-Flash, Inkling, Kimi K3, DeepSeek V4 Flash, Qwen3.8-Flash-Next,
+  routed experts can be staged the same way. Nine families run today (GLM-5.2,
+  GLM-5.3-Flash, Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, Qwen3.8-Flash-Next,
   Qwen3.6, OLMoE); further open-weight families — **MiniMax** among the
   candidates — earn an engine the way the first eight did: when someone
   measures one end to end.
