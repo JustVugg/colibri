@@ -476,7 +476,7 @@ def env_for_engine(a, arch, plan=None):
     # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
     # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
     # user's session ran itself out of memory with the flag apparently set.
-    if arch in ("deepseek_v4", "kimi", "glm53"):
+    if arch in ("deepseek_v4", "kimi", "glm53", "olmoe"):
         if a.ram: env["RAM_GB"] = str(a.ram)
     if arch == "glm53":
         # I densi vanno a int4 di default: sono 9,7 B parametri su 321, e in
@@ -492,7 +492,14 @@ def env_for_engine(a, arch, plan=None):
             except (TypeError, ValueError):
                 pass
     if a.ctx:
-        env[family_by_id(arch).limits.context_env] = str(a.ctx)
+        limits = family_by_id(arch).limits
+        # #1376: the engine clamps silently to its hard ceiling. A flag that is
+        # accepted and then ignored is worse than one refused with the number.
+        if limits.max_context and a.ctx > limits.max_context:
+            sys.exit(f"{C.yel}--ctx {a.ctx} exceeds what {family_by_id(arch).display_name} "
+                     f"supports ({limits.max_context} tokens).{C.r}\n"
+                     f"  Pass --ctx {limits.max_context} or less.")
+        env[limits.context_env] = str(a.ctx)
     if arch == "deepseek_v4":
         # Speculation stays opt-in. Real multi-turn chat measured only 1/15
         # accepted prompt-lookup candidates; recurrent-state replay dominated
@@ -819,6 +826,23 @@ def env_for(a):
                                         kv_slots=requested_kv_slots(a,e))
                         e.update(environment_for_plan(plan,e,cuda_enabled=True))
                         vt=plan["tiers"]["vram"]
+                        # #1409: the dense trunk is read on every token; leaving
+                        # it on the CPU next to a 30 GB expert tier is the
+                        # slowest possible placement of a card that could hold
+                        # it. Put it on the GPU when the plan says it fits with
+                        # room for experts, and take its bytes out of the expert
+                        # budget: dense uploads are lazy, and a tier that already
+                        # filled the card makes them fail (#687). Explicit
+                        # CUDA_DENSE / CUDA_EXPERT_GB from the user always win.
+                        dense=int(plan["tiers"].get("ram",{}).get("dense_bytes",0) or 0)
+                        room=int(vt.get("budget_bytes",0) or 0)-dense
+                        # An explicit expert budget owns the placement decision:
+                        # do not shrink it or add a trunk outside that budget.
+                        if (dense>0 and room>=4*(1024**3) and "CUDA_DENSE" not in e
+                                and "CUDA_EXPERT_GB" not in explicit_env):
+                            e["CUDA_DENSE"]="1"
+                            if "CUDA_EXPERT_GB" in e:
+                                e["CUDA_EXPERT_GB"]=f"{room/(1024**3):.3f}"
                         names=",".join(g["name"].strip() for g in gpus)
                         print(f"  {C.dim}[GPU] auto-enabled CUDA · {names} · "
                               f"{format_bytes(vt['budget_bytes'])} expert tier{C.r}", file=sys.stderr)
@@ -1261,7 +1285,12 @@ def cmd_run(a):
         sys.exit(result)
     if arch=="glm53":
         e=env_for_engine(a,arch)
-        cmd=[engine,"--model",os.path.abspath(a.model),"--prompt",prompt,
+        # GLM53 accepts cache/layer as a positional numeric argument.  Keep the
+        # same cap_for_launch contract used by the persistent gateway so an
+        # explicit `coli run --cap N` reaches the engine instead of being
+        # silently ignored by the one-shot path.
+        cap = cap_for_launch(a.cap, e, 0)
+        cmd=[engine,str(cap),"--model",os.path.abspath(a.model),"--prompt",prompt,
              "--greedy",str(ngen_for(a,interactive=True,family=family))]
         sys.exit(subprocess.call(cmd,env=e))
     if arch=="olmoe":
@@ -1828,7 +1857,14 @@ def cmd_cluster_worker(a):
               "COLI_MMAP":os.environ.get("COLI_MMAP", "1")})
     print(f"  {C.dim}[CLUSTER] expert worker · {host}:{a.port} · layers {a.layers}{C.r}")
     try:
-        return subprocess.call([engine,str(a.cap),str(a.ebits),str(a.dbits)],env=e)
+        # cap_for_launch, not a.cap: --cap defaults to None and str(None) is the
+        # literal "None", which the engine's argument parser refuses with
+        # `cache/layer: expected a whole number, got "None"` -- so the worker
+        # could only ever start with an explicit --cap (#1452). Fallback 0 is
+        # what the other GLM launch sites pass: the engine resolves its own cap
+        # when the argument is zero.
+        return subprocess.call([engine,str(cap_for_launch(a.cap,e,0)),
+                                str(a.ebits),str(a.dbits)],env=e)
     finally:
         stop_heartbeat.set()
 

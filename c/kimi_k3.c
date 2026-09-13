@@ -228,6 +228,7 @@ typedef struct {
     /* experts */
     ERef *eref;                           /* [n_layers][n_experts] (dense rows zeroed) */
     LCache *ecache;
+    uint8_t **ehit;                       /* experts routed this turn, for HITS (dashboard Brain) */
     int64_t e_w1p, e_w1s, e_w2p, e_w2s, e_slot;
     uint64_t clock, hits, miss, ebytes;
     double t_attn, t_moe, t_eload, t_head;
@@ -1508,6 +1509,30 @@ static uint64_t g_slot_index_probes;
 #else
 #define SLOT_INDEX_PROBE() ((void)0)
 #endif
+/* One byte per expert: routed in this turn or not. The dashboard's Brain tab
+ * reads it as the HITS bitmap after every turn (serve_hits), cleared there. */
+static pthread_mutex_t g_ehit_mx = PTHREAD_MUTEX_INITIALIZER;
+static void ehit_mark(Model *m, int li, int eid){
+    Cfg *c=&m->c;
+    /* The first touch can come from a parallel region (qwen36: the tier
+     * warmstart's omp loop calls expert_get from twelve threads at once):
+     * one thread published m->ehit while it was still filling the rows and
+     * a sibling dereferenced m->ehit[layer] == NULL -- SIGSEGV in about one
+     * run in twelve on a CUDA warmstart. Build the table privately, publish
+     * it once under a lock (double-checked), and read it with acquire order. */
+    uint8_t **ehit=__atomic_load_n(&m->ehit,__ATOMIC_ACQUIRE);
+    if(!ehit){
+        pthread_mutex_lock(&g_ehit_mx);
+        ehit=m->ehit;
+        if(!ehit){
+            ehit=calloc((size_t)c->n_layers,sizeof(uint8_t*));
+            for(int i=0;i<c->n_layers;i++) ehit[i]=calloc((size_t)c->n_experts,1);
+            __atomic_store_n(&m->ehit,ehit,__ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&g_ehit_mx);
+    }
+    if(li>=0&&li<c->n_layers&&eid>=0&&eid<c->n_experts) ehit[li][eid]=1;
+}
 static Slot *slot_indexed(Model *m, int li, int eid){
     LCache *lc=&m->ecache[li];
     if(eid<0||eid>=m->c.n_experts||!lc->slot_by_expert) return NULL;
@@ -1786,6 +1811,7 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
         int nb=nu-base<LP_MAX?nu-base:LP_MAX;
         Slot *use[LP_MAX]; int missk[LP_MAX]; int qof[LP_MAX]; int nmiss=0;
         for(int j=0;j<nb;j++){
+            ehit_mark(m,li,uids[base+j]);
             use[j]=slot_find(m,li,uids[base+j]); qof[j]=-1;
             if(!use[j]){ m->miss++; use[j]=&m->ws[nmiss]; qof[j]=nmiss; missk[nmiss++]=j; }
         }
@@ -2868,6 +2894,44 @@ static void serve_tool(const char *id, const char *p, int n){
     coli_serve_write_tool(stdout,id,p,(size_t)n);
 }
 
+/* ---------- dashboard protocol: EMAP / HITS ----------
+ * Same stdout lines colibri.c emits for the web dashboard's Brain tab; the
+ * gateway parses them, nothing else does. Rows are the sparse layers, columns
+ * the experts. EMAP: one byte per expert as two hex digits, tier<<6 | heat
+ * (tier 1 = resident in the layer cache, heat 0: this engine keeps no usage
+ * counter). Printed once after READY and again after every turn, because
+ * the cache fills as the turn runs. HITS: one bit per expert routed in the
+ * turn, packed 8 per hex pair, printed after DONE next to PROF. */
+static void serve_emap(Model *m){
+    Cfg *c=&m->c; int E=c->n_experts, rows=0;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) rows++;
+    char *hex=malloc((size_t)rows*E*2+1); int w=0;
+    for(int i=0;i<c->n_layers;i++){
+        if(!m->L[i].sparse) continue;
+        for(int e=0;e<E;e++){
+            int b=(slot_indexed(m,i,e)?1:0)<<6;
+            hex[w++]="0123456789abcdef"[b>>4]; hex[w++]="0123456789abcdef"[b&15];
+        }
+    }
+    hex[w]=0;
+    printf("EMAP %d %d %s\n",rows,E,hex); fflush(stdout); free(hex);
+}
+static void serve_hits(Model *m){
+    Cfg *c=&m->c; int E=c->n_experts, rows=0;
+    if(!m->ehit) ehit_mark(m,-1,-1);   /* a turn that routed nothing still reports a bitmap: all zero */
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) rows++;
+    int nb=(rows*E+7)/8; uint8_t *bm=calloc((size_t)nb,1); int bit=0;
+    for(int i=0;i<c->n_layers;i++){
+        if(!m->L[i].sparse) continue;
+        for(int e=0;e<E;e++,bit++)
+            if(m->ehit[i][e]){ bm[bit>>3]|=(uint8_t)(1<<(bit&7)); m->ehit[i][e]=0; }
+    }
+    char *hex=malloc((size_t)nb*2+1); int w=0;
+    for(int b=0;b<nb;b++){ hex[w++]="0123456789abcdef"[bm[b]>>4]; hex[w++]="0123456789abcdef"[bm[b]&15]; }
+    hex[w]=0;
+    printf("HITS %d %d %s\n",rows,E,hex); fflush(stdout); free(hex); free(bm);
+}
+
 static int serve_one(Model *m, Tok *T, ServeReq *q){
     int cap=65536, *ids=malloc((size_t)cap*sizeof(int)), np=0;
     if(!ids){ coli_serve_write_error(stdout,q->id,"out of memory"); return 0; }
@@ -2955,6 +3019,7 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
     int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0, xtool=0;
     char buf[512], xtag[320];   /* tool-call open tags carry attributes: call tool="..." index="..." (#1143) */
     double tg=now_s();
+    int forwards=1;                       /* the prefill; decode steps are counted where they run */
     for(int s=0;s<q->max_tok&&!cancelled;s++){
         int tk=sample_tok(lo,m->c.vocab,q->temp,q->top_p);
         free(lo); lo=NULL;
@@ -3003,7 +3068,7 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
         }
         if(cancelled){ limited=0; break; }
         if(eos){ limited=0; break; }
-        if(s+1<q->max_tok) lo=step_chunk(m,&tk,np+s,1);
+        if(s+1<q->max_tok){ lo=step_chunk(m,&tk,np+s,1); forwards++; }
     }
     if(poll.fatal){ free(lo); free(ids); return -1; }
     free(lo); free(ids);
@@ -3019,8 +3084,9 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
     if(done_bytes>0) fwrite(done_line,1,(size_t)done_bytes,stdout);
     double moe=m->t_moe-e0, disk=m->t_eload-d0;
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n",
-           dt,np,gen,disk,0.0,moe>disk?moe-disk:moe,m->t_attn-a0,m->t_head-h0,gen+1);
+           dt,np,gen,disk,0.0,moe>disk?moe-disk:moe,m->t_attn-a0,m->t_head-h0,forwards);
     fflush(stdout);
+    serve_hits(m);
 #ifdef COLI_VULKAN
     if(g_k3_vk){
         if(g_vk_up_auto)
@@ -3043,11 +3109,12 @@ static void serve_loop(Model *m, Tok *T){
      * e' nato senza. */
     coli_serve_stdio_init();
     coli_serve_write_ready(stdout,rss_gb());
+    serve_emap(m);                        /* after READY and STAT: the boot reader discards what precedes them */
     for(;;){
         ServeReq q={0}; int r;
         do r=serve_read_req(stdin,stdout,&q,NULL); while(r==0);
         if(r<0) return;
-        if(r==2){ int fatal=serve_one(m,T,&q); free(q.payload); if(fatal<0) return; }
+        if(r==2){ int fatal=serve_one(m,T,&q); free(q.payload); if(fatal<0) return; serve_emap(m); }
     }
 }
 

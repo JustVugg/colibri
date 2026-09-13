@@ -377,5 +377,39 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
             self.coli.env_for_engine(vram_args, "qwen38")
 
 
+class ContextFlagHonestyTest(unittest.TestCase):
+    """#1376: `--ctx` above what a family supports was accepted, then clamped
+    by the engine in silence. A flag that appears to work and does not is
+    worse than one refused with the number."""
+
+    @classmethod
+    def setUpClass(cls):
+        loader = SourceFileLoader("coli_ctx_under_test", str(CLI))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        cls.coli = importlib.util.module_from_spec(spec)
+        loader.exec_module(cls.coli)
+
+    class Args(types.SimpleNamespace):
+        """env_for_engine reads whatever flags the family cares about; every
+        one not set here reads as "not given", which is what argparse yields."""
+        def __getattr__(self, name):
+            return None
+
+    def args(self, ctx):
+        return self.Args(ctx=ctx, ram=0)
+
+    def test_ctx_above_the_family_maximum_is_refused_with_the_number(self):
+        family = self.coli.family_by_id("qwen36")
+        too_big = family.limits.max_context + 1
+        with self.assertRaises(SystemExit) as stop:
+            self.coli.env_for_engine(self.args(too_big), "qwen36")
+        self.assertIn(str(family.limits.max_context), str(stop.exception))
+
+    def test_ctx_within_the_maximum_reaches_the_engine_variable(self):
+        family = self.coli.family_by_id("qwen36")
+        env = self.coli.env_for_engine(self.args(65536), "qwen36")
+        self.assertEqual(env.get(family.limits.context_env), "65536")
+
+
 if __name__ == "__main__":
     unittest.main()

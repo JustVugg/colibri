@@ -158,6 +158,7 @@ typedef struct {
     LCache *cache;
     int64_t rb13, rb2;                    /* container row-bytes (0 = not container) */
     uint32_t **eusage;                    /* per-layer expert selection counts */
+    uint8_t **ehit;                       /* experts routed this turn, for HITS (dashboard Brain) */
     int npin;                             /* pinned experts per sparse layer */
     uint64_t clock, hits, miss;
     uint64_t ereq, euse;                  /* routed richiesti (topk) vs usati dopo TOPP */
@@ -1158,6 +1159,19 @@ static Slot *slot_indexed(Model *m, int layer, int eid) {
     if (i < 0 || i >= lc->n || lc->slots[i].eid != eid) return NULL;
     return &lc->slots[i];
 }
+/* One byte per expert: routed in this turn or not. The dashboard's Brain tab
+ * reads it as the HITS bitmap after every turn (serve_hits), and it is cleared
+ * there. Lives outside INKLING_NO_MAIN because the routing site that marks it
+ * is compiled into the segment adapter object too. */
+static void ehit_mark(Model *m, int layer, int eid) {
+    Cfg *c = &m->c;
+    if (!m->ehit) {
+        m->ehit = calloc((size_t)c->n_layers, sizeof(uint8_t *));
+        for (int i = 0; i < c->n_layers; i++) m->ehit[i] = calloc((size_t)c->n_experts, 1);
+    }
+    if (layer >= 0 && layer < c->n_layers && eid >= 0 && eid < c->n_experts) m->ehit[layer][eid] = 1;
+}
+
 static Slot *slot_find(Model *m, int layer, int eid) {
     Slot *s = slot_indexed(m, layer, eid);
     if (s) s->used = ++m->clock;
@@ -1628,6 +1642,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             if (kk >= keff[s]) { use[t - base] = NULL; continue; }   /* scartato da TOPP */
             int eid = idx[(int64_t)s*K + kk];
             if (m->eusage && m->eusage[layer]) m->eusage[layer][eid]++;
+            ehit_mark(m, layer, eid);
             Slot *e = slot_find(m, layer, eid);
             if (e) m->hits++;
             else {
@@ -2174,6 +2189,29 @@ static int serve_read_cmd(FILE *input, FILE *output, const char *cur_id) {
     return 0;
 }
 
+/* HITS rows cols hex: which experts this turn routed, one bit each over the
+ * sparse layers (same rows and columns as EMAP), packed 8 per hex pair. Same
+ * line colibri.c emits; the Brain tab lights up from it. A turn that routed
+ * nothing still reports a bitmap, all zero, so the tab shows THIS turn. */
+static void serve_hits(Model *m) {
+    Cfg *c = &m->c; int E = c->n_experts;
+    if (!m->ehit) ehit_mark(m, -1, -1);
+    int nsp = 0;
+    for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) nsp++;
+    int nb = (nsp * E + 7) / 8;
+    uint8_t *bm = calloc((size_t)nb, 1); int bit = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (!c->sparse[i]) continue;
+        for (int e = 0; e < E; e++, bit++)
+            if (m->ehit[i][e]) { bm[bit >> 3] |= (uint8_t)(1 << (bit & 7)); m->ehit[i][e] = 0; }
+    }
+    char *hex = malloc((size_t)nb * 2 + 1); int w = 0;
+    for (int b = 0; b < nb; b++) { hex[w++] = "0123456789abcdef"[bm[b] >> 4]; hex[w++] = "0123456789abcdef"[bm[b] & 15]; }
+    hex[w] = 0;
+    printf("HITS %d %d %s\n", nsp, E, hex);
+    fflush(stdout); free(hex); free(bm);
+}
+
 static int serve_one(Model *m, Tok *T, SReq *q) {
     Cfg *c = &m->c;
     int cap = q->plen + 16;
@@ -2235,6 +2273,7 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     /* `reuse` is the ABSOLUTE position of the first fresh token: attention and
      * the KV slots are position-indexed, so this has to be the real offset. */
     float *logit = step_mm(m, ids + reuse, np - reuse, reuse, NULL, q->audio, naud);
+    int forwards = 1;                      /* il prefill e' il primo forward */
     int len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
     /* repetition-penalty history: prompt tail + emitted tokens, ring of 128 */
@@ -2257,7 +2296,7 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
             if (r > 0) { cancelled = 1; limited = 0; }
         }
         if (cancelled || s == q->max_tok - 1) break;
-        logit = step(m, &tk, 1, len - 1, NULL);
+        logit = step(m, &tk, 1, len - 1, NULL); forwards++;
     }
     free(logit);
     double dt = now_s() - t0;
@@ -2270,8 +2309,9 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     /* PROF: per-turn phase timings for the dashboard (gateway schema — we map
      * expert_wait -> shared-expert compute, lm_head folded into 0). */
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n", dt, np, gen,
-           m->t_fill - f0, m->t_shared - s0, m->t_expert - e0, m->t_attn - a0, 0.0, gen + 1);
+           m->t_fill - f0, m->t_shared - s0, m->t_expert - e0, m->t_attn - a0, 0.0, forwards);
     fflush(stdout);
+    serve_hits(m);
     free(ids);
     return 0;
 }

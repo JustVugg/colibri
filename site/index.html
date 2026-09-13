@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>colibrì — run models bigger than your machine</title>
-<meta name="description" content="An inference engine in pure C that streams Mixture-of-Experts weights from disk. A 2.8-trillion-parameter model runs on a 32 GB box. Six model families, zero dependencies, CPU or GPU.">
+<meta name="description" content="An inference engine in pure C that streams Mixture-of-Experts weights from disk. A 2.8-trillion-parameter model runs on a 32 GB box. Nine model families, zero dependencies, CPU or GPU.">
 <meta property="og:title" content="colibrì — run models bigger than your machine">
-<meta property="og:description" content="Six frontier MoE families, up to 2.8T parameters, on consumer hardware: pure C, zero dependencies, experts tiered across VRAM, RAM and disk. Run it, study it, improve it.">
+<meta property="og:description" content="Nine frontier MoE families, up to 2.8T parameters, on consumer hardware: pure C, zero dependencies, experts tiered across VRAM, RAM and disk. Run it, study it, improve it.">
 <meta property="og:type" content="website">
 <meta property="og:image" content="https://raw.githubusercontent.com/JustVugg/colibri/main/docs/media/colibri-atlas.png">
 <link rel="icon" type="image/svg+xml" href="colibri-icon.svg">
@@ -229,7 +229,7 @@ footer li a:hover{color:var(--on-dark)}
     <div><div class="n">510</div><div class="l">pull requests merged</div></div>
     <div><div class="n">6</div><div class="l">families · 4 backends · 3 platforms</div></div>
     <div class="since">All of it in <b data-gh-age>six weeks</b>, in the open: issues filed from strangers' machines,
-      reproduced and fixed the same day. Currently shipping <b>v1.10.2</b>.</div>
+      reproduced and fixed the same day. Currently shipping <b>v1.11.0</b>.</div>
   </div>
 </section>
 
@@ -285,6 +285,8 @@ footer li a:hover{color:var(--on-dark)}
         <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/inkling.md">Run it &rarr;</a></div>
       <div class="card"><h3>DeepSeek V4 Flash</h3><p class="desc">Sparse attention, multi-token prediction and a trained drafter: the most instrumented engine here.</p>
         <div class="tags"><span class="tag">reasoning</span><span class="tag">tools</span></div>
+      <div class="card"><h3>DeepSeek V4.1 Flash</h3><p class="desc">552B, and 40% of it is an n-gram memory read from disk a few hundred bytes at a time: the model this engine was built for.</p>
+      </div>
         <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">DeepSeek AI</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">284B MoE &middot; from 16 GB</span></div></div>
         <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/deepseek-v4.md">Run it &rarr;</a></div>
       <div class="card"><h3>Qwen3.6</h3><p class="desc">Gated attention plus Gated DeltaNet. Its CUDA tier keeps hot experts in VRAM: 7x faster than CPU on two 8&nbsp;GB cards, output bit-identical.</p>
@@ -366,7 +368,7 @@ footer li a:hover{color:var(--on-dark)}
       <div><h4>Models</h4><ul>
         <li><a href="#models">GLM-5.2/5.3</a></li><li><a href="#models">GLM-5.3-Flash</a></li>
         <li><a href="#models">Qwen3.8-Flash-Next</a></li><li><a href="#models">Kimi K3</a></li>
-        <li><a href="#models">Inkling</a></li><li><a href="#models">DeepSeek V4 Flash</a></li>
+        <li><a href="#models">Inkling</a></li><li><a href="#models">DeepSeek V4 Flash</a></li><li><a href="#models">DeepSeek V4.1 Flash</a></li>
         <li><a href="#models">Qwen3.6</a></li><li><a href="#models">OLMoE</a></li>
       </ul></div>
       <div><h4>Project</h4><ul>

@@ -23,6 +23,7 @@
 #include <string.h>
 #include <stdint.h>
 
+#include "../compat.h"   /* setenv/unsetenv: MinGW has neither */
 #include "../rans.h"
 
 static int failures = 0;
@@ -558,51 +559,40 @@ static void test_arm_identity_suite(void) {
 }
 
 static void test_path_envelope(void) {
-#ifdef _WIN32
-    _putenv_s("RANS_PATH", ""); _putenv_s("RANS_NEON", ""); _putenv_s("RANS_AVX512", "");
-#else
     unsetenv("RANS_PATH"); unsetenv("RANS_NEON"); unsetenv("RANS_AVX512");
-#endif
     /* default selection is never invalid, and its name is real */
     rans_path best = rans_path_select();
     CHECK(best != RANS_PATH_INVALID, "default path select");
     CHECK(strcmp(rans_path_name(best), "invalid") != 0, "best path name");
 
     /* kill-switches force the vector arms out of best-path selection */
-#ifdef _WIN32
-#define SET_ENV(k, v) _putenv_s(k, v)
-#define UNSET_ENV(k) _putenv_s(k, "")
-#else
-#define SET_ENV(k, v) setenv(k, v, 1)
-#define UNSET_ENV(k) unsetenv(k)
-#endif
-    SET_ENV("RANS_NEON", "0");
-    SET_ENV("RANS_AVX512", "0");
+    setenv("RANS_NEON", "0", 1);
+    setenv("RANS_AVX512", "0", 1);
     rans_path p = rans_path_select();
     CHECK(p == RANS_PATH_SCALAR_BF, "kill-switches leave scalar_bf, got %s",
           rans_path_name(p));
 
     /* forcing a killed arm must refuse, not downgrade */
-    SET_ENV("RANS_PATH", "neon");
+    setenv("RANS_PATH", "neon", 1);
     p = rans_path_select();
     CHECK(p == RANS_PATH_INVALID, "forced killed neon: got %s", rans_path_name(p));
-    SET_ENV("RANS_PATH", "avx512");
+    setenv("RANS_PATH", "avx512", 1);
     p = rans_path_select();
     CHECK(p == RANS_PATH_INVALID, "forced killed avx512: got %s", rans_path_name(p));
 
     /* unknown forced name refuses */
-    SET_ENV("RANS_PATH", "warp-drive");
+    setenv("RANS_PATH", "warp-drive", 1);
     p = rans_path_select();
     CHECK(p == RANS_PATH_INVALID, "unknown forced path");
 
     /* forcing scalar always works */
-    SET_ENV("RANS_PATH", "scalar");
+    setenv("RANS_PATH", "scalar", 1);
     p = rans_path_select();
     CHECK(p == RANS_PATH_SCALAR, "forced scalar");
 
-    UNSET_ENV("RANS_PATH");
-    UNSET_ENV("RANS_NEON");
-    UNSET_ENV("RANS_AVX512");
+    unsetenv("RANS_PATH");
+    unsetenv("RANS_NEON");
+    unsetenv("RANS_AVX512");
 
     /* with the switches cleared, any compiled+selftested vector arm is
      * preferred over the scalar twins */
@@ -611,8 +601,6 @@ static void test_path_envelope(void) {
     CHECK(p == RANS_PATH_NEON || p == RANS_PATH_AVX512,
           "vector arm preferred on this build, got %s", rans_path_name(p));
 #endif
-#undef SET_ENV
-#undef UNSET_ENV
 }
 
 /* ---- 5. fix-round hardening regressions ---------------------------------- */

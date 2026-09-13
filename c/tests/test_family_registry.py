@@ -1027,6 +1027,9 @@ class FamilyRegistryTest(unittest.TestCase):
                       "<|im_end|>\n<|im_start|>user\nhello {world}<|im_end|>\n"
                       "<|im_start|>assistant\n<think>\n",
             "deepseek_v4": "hello {world}",
+            # V4.1 ships its chat encoding as a Python module (encoding/encoding.py),
+            # not a jinja template, so the replay prompt stays the bare text like V4.
+            "deepseek_v41": "hello {world}",
         }
         self.assertEqual(
             {family.id: tuning_replay_prompt(family, prompt) for family in FAMILIES},

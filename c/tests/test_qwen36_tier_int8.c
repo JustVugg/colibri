@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../compat.h"   /* setenv/unsetenv: MinGW has neither */
+
 /* ---- backend CUDA finto: le firme vengono da backend_cuda.h, che il tier
    include per conto suo; il corpo (condiviso con gli altri test del tier) e'
    in qwen36_fake_cuda.h. ---- */
@@ -48,7 +50,10 @@ int main(void) {
         return 1;
     }
     check(G.wfmt == 1, "int8 deve usare fmt=1");
-    check(G.exp_bytes > 3ull * D * IH,
+    /* charged at the allocator's granularity: three int8 matrices of D*IH
+     * bytes each plus three per-row scale tables */
+    check(G.exp_bytes == 3 * dev_alloc_footprint((size_t)D * IH)
+                       + 3 * dev_alloc_footprint((2 * G.sc_gu + G.sc_d) / 3 * sizeof(float)),
           "il budget int8 deve contare un byte per elemento, non mezzo");
 
     int layers[8], eids[8];
@@ -91,7 +96,8 @@ int main(void) {
         return 1;
     }
     check(G.wfmt == 4, "int4 deve restare fmt=4");
-    check(G.exp_bytes < 3ull * D * IH + 4096 + (2 * G.sc_gu + G.sc_d) * sizeof(float),
+    check(G.exp_bytes == 3 * dev_alloc_footprint((size_t)D * IH / 2)
+                       + 3 * dev_alloc_footprint((2 * G.sc_gu + G.sc_d) / 3 * sizeof(float)),
           "int4 impacchettato deve contare mezzo byte per elemento");
     qt_shutdown();
 

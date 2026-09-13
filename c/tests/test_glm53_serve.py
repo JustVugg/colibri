@@ -175,11 +175,190 @@ def main() -> int:
                   "quello di prima")
             return 1
 
+        # --- CANCEL a meta' turno (#1332) ---
+        #
+        # Un CANCEL che arriva mentre il turno gira deve fermarlo. Prima
+        # serve_read_req era l'unico posto che leggeva il comando, e serve_loop
+        # la chiama solo fra una richiesta e l'altra: il CANCEL restava nella
+        # pipa fino alla fine dei token chiesti, e il gateway -- che manda
+        # CANCEL e poi aspetta l'ack tenendo l'ammissione dello scheduler --
+        # non liberava niente, quindi un client che si disconnetteva lasciava
+        # le richieste successive in coda dietro una generazione che nessuno
+        # voleva piu'.
+        #
+        # La prova che il turno e' stato interrotto davvero e' il numero di
+        # DATA arrivati: molti meno dei max_tokens chiesti. Un motore che
+        # leggesse il CANCEL solo a fine turno ne emetterebbe `budget`.
+        budget = 512
+        submit(process, 12, prompt, max_tokens=budget)
+        emitted_before = 0
+        while True:
+            line = read_line(process.stdout)
+            if not line.startswith("DATA "):
+                break
+            _, got_id, count = line.split()
+            if int(got_id) != 12:
+                raise AssertionError(f"DATA per {got_id}, atteso 12")
+            process.stdout.read(int(count) + 1)
+            emitted_before += 1
+            if emitted_before == 1:
+                process.stdin.write(b"CANCEL 12\n")
+                process.stdin.flush()
+        if line != "ERROR 12 CANCELLED":
+            print(f"FAIL: CANCEL a meta' turno -> {line!r}, atteso "
+                  f"ERROR 12 CANCELLED (il turno ha emesso {emitted_before} token)")
+            return 1
+        if emitted_before >= budget:
+            print(f"FAIL: il turno ha emesso tutti i {budget} token chiesti prima "
+                  f"di rispondere al CANCEL: non e' stato onorato a meta' turno")
+            return 1
+
+        # Dopo un CANCEL lo stream deve restare allineato come dopo un errore:
+        # il gateway riusa la stessa pipa per la richiesta successiva.
+        submit(process, 13, prompt, max_tokens=1)
+        _, done13, _ = collect(process, 13)
+        if not done13.startswith("DONE 13 "):
+            print(f"FAIL: dopo un CANCEL lo stream si e' disallineato: {done13!r}")
+            return 1
+
+        # --- STOP a meta' turno ---
+        #
+        # STOP non e' CANCEL, e i due non possono finire nello stesso posto. Il
+        # protocollo: "STOP ends generation through the normal successful DONE
+        # path. Statistics, usage history, and KV state are persisted". Il
+        # gateway lo manda quando un template di stop combacia -- cioe' quando
+        # la risposta e' completa e va consegnata -- e dopo averlo mandato
+        # continua a leggere fino al DONE trattandolo come riuscito (alza
+        # ClientCancelled solo se aveva mandato CANCEL). Rispondere
+        # ERROR <id> CANCELLED butterebbe via una risposta che il client ha gia'
+        # ricevuto per intero.
+        stop_budget = 512
+        submit(process, 14, prompt, max_tokens=stop_budget)
+        emitted_stop = 0
+        done14 = None
+        while True:
+            line = read_line(process.stdout)
+            if line.startswith("DATA "):
+                _, got_id, count = line.split()
+                if int(got_id) != 14:
+                    raise AssertionError(f"DATA per {got_id}, atteso 14")
+                process.stdout.read(int(count) + 1)
+                emitted_stop += 1
+                if emitted_stop == 1:
+                    process.stdin.write(b"STOP 14\n")
+                    process.stdin.flush()
+            elif line.startswith("DONE ") or line.startswith("ERROR "):
+                done14 = line
+                break
+            # HITS, PROF e compagnia: si ignorano, come fa il gateway.
+        if not done14.startswith("DONE 14 "):
+            print(f"FAIL: STOP a meta' turno -> {done14!r}, atteso un DONE "
+                  f"(il protocollo vuole il percorso riuscito, non CANCELLED)")
+            return 1
+        if emitted_stop >= stop_budget:
+            print(f"FAIL: il turno ha emesso tutti i {stop_budget} token chiesti "
+                  f"prima di rispondere allo STOP: non e' stato onorato a meta' "
+                  f"turno")
+            return 1
+
+        # --- SUBMIT mentre lo slot e' occupato ---
+        #
+        # Non puo' legalmente arrivare -- il gateway serve una richiesta per
+        # volta e aspetta il DONE -- ma se arriva non lo si tiene in coda: si
+        # risponde SLOT_BUSY, che e' il codice che il protocollo documenta.
+        # `BUSY` non esiste: un gateway che lo ricevesse non saprebbe che farsene
+        # e il suo thread resterebbe appeso su una pipa che nessuno legge.
+        #
+        # La seconda meta' del controllo e' che il payload del SUBMIT rifiutato
+        # venga comunque consumato: e' a byte contati, e lasciarlo nello stream
+        # disallineerebbe tutto quello che segue.
+        busy_budget = 8
+        submit(process, 15, prompt, max_tokens=busy_budget)
+        sent_intruder = False
+        busy = None
+        done15 = None
+        while True:
+            line = read_line(process.stdout)
+            if line.startswith("DATA "):
+                _, got_id, count = line.split()
+                if int(got_id) != 15:
+                    raise AssertionError(f"DATA per {got_id}, atteso 15")
+                process.stdout.read(int(count) + 1)
+                if not sent_intruder:
+                    sent_intruder = True
+                    submit(process, 16, prompt, max_tokens=1)
+            elif line.startswith("ERROR "):
+                busy = line
+            elif line.startswith("DONE "):
+                done15 = line
+                break
+        if busy != "ERROR 16 SLOT_BUSY":
+            print(f"FAIL: SUBMIT a slot occupato -> {busy!r}, atteso "
+                  f"ERROR 16 SLOT_BUSY")
+            return 1
+        if not done15.startswith("DONE 15 "):
+            print(f"FAIL: il turno in volo e' finito con {done15!r}, atteso DONE 15")
+            return 1
+
+        # Il SUBMIT rifiutato non deve aver lasciato il suo payload nella pipa:
+        # se ci fosse ancora, la richiesta dopo leggerebbe i suoi byte come
+        # header e lo stream sarebbe perso.
+        submit(process, 17, prompt, max_tokens=1)
+        _, done17, _ = collect(process, 17)
+        if not done17.startswith("DONE 17 "):
+            print(f"FAIL: dopo un SUBMIT rifiutato lo stream si e' disallineato: "
+                  f"{done17!r}")
+            return 1
+
         process.stdin.close()
         process.wait(timeout=60)
     finally:
         if process.poll() is None:
             process.kill()
+
+    # --- EOF su stdin a meta' turno ---
+    #
+    # "EOF on stdin = graceful shutdown: in-flight requests finish first." La
+    # pipa che si chiude sotto un turno in volo non e' un motivo per troncare la
+    # risposta: il turno finisce, il DONE parte, e solo dopo il motore esce.
+    #
+    # La prova non e' che il DONE arrivi -- arriverebbe anche troncando, perche'
+    # il ciclo esce e il DONE e' la riga dopo -- ma che i token siano gli
+    # STESSI di un turno con la pipa aperta. Greedy e a temperatura zero, quindi
+    # lo stesso prompt deve dare la stessa sequenza: se il turno si fermasse al
+    # primo token, qui si vedrebbe.
+    def turn_with_eof(close_stdin):
+        eof_process = engine(binary, arguments.fixture)
+        try:
+            handshake(eof_process)
+            submit(eof_process, 19, prompt, max_tokens=8)
+            if close_stdin:
+                eof_process.stdin.close()
+            pieces, done, _ = collect(eof_process, 19)
+            if not done.startswith("DONE 19 "):
+                return None, done
+            if close_stdin:
+                eof_process.wait(timeout=60)
+            else:
+                eof_process.stdin.close()
+                eof_process.wait(timeout=60)
+            return pieces, done
+        finally:
+            if eof_process.poll() is None:
+                eof_process.kill()
+
+    control, done_control = turn_with_eof(False)
+    interrupted, done_interrupted = turn_with_eof(True)
+    if control is None or interrupted is None:
+        print(f"FAIL: EOF a meta' turno -> controllo {done_control!r}, "
+              f"con la pipa chiusa {done_interrupted!r}, attesi due DONE")
+        return 1
+    if interrupted != control:
+        print(f"FAIL: la pipa chiusa a meta' turno ha troncato la risposta\n"
+              f"  pipa aperta: {control!r} ({len(control)} byte)\n"
+              f"  pipa chiusa: {interrupted!r} ({len(interrupted)} byte)")
+        return 1
+    emitted_eof = len(control)
 
     # Lo stesso prompt su una sessione pulita: il riuso deve essere esatto, non
     # solo veloce. Se qui la risposta cambia, la cache tenuta fra i turni sta
@@ -218,7 +397,11 @@ def main() -> int:
     print(f"PASS GLM-5.3 serve: handshake, frame a byte contati, {emitted} token "
           f"decodificati identici alla CLI, prompt vuoto rifiutato, stream "
           f"ancora allineato dopo l'errore, {reused} token di prefisso riusati "
-          f"al secondo turno con la stessa risposta di una sessione pulita")
+          f"al secondo turno con la stessa risposta di una sessione pulita, "
+          f"CANCEL onorato a meta' turno dopo {emitted_before} token su {budget}, "
+          f"STOP chiuso col DONE dopo {emitted_stop} token su {stop_budget}, "
+          f"SUBMIT a slot occupato rifiutato con SLOT_BUSY, "
+          f"{emitted_eof} token portati a termine con la pipa gia' chiusa")
     return 0
 
 

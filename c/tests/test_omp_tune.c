@@ -11,6 +11,7 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#include "../compat.h"       /* setenv/unsetenv: MinGW has neither */
 #include "../omp_tune.h"
 
 #ifdef _WIN32
@@ -39,24 +40,6 @@ static int test_windows_variable_records(void)
 }
 #endif
 
-static void env_set(const char *name, const char *value)
-{
-#ifdef _WIN32
-    _putenv_s(name, value);
-#else
-    setenv(name, value, 1);
-#endif
-}
-
-static void env_unset(const char *name)
-{
-#ifdef _WIN32
-    _putenv_s(name, "");
-#else
-    unsetenv(name);
-#endif
-}
-
 int main(void)
 {
 #ifndef _OPENMP
@@ -71,8 +54,8 @@ int main(void)
     fail |= test_windows_variable_records();
 #endif
 
-    env_unset("OMP_NUM_THREADS");
-    env_unset("COLI_NO_OMP_TUNE");
+    unsetenv("OMP_NUM_THREADS");
+    unsetenv("COLI_NO_OMP_TUNE");
     omp_set_num_threads(logical);
     coli_omp_tune_threads("test");
     int got = omp_get_max_threads();
@@ -85,22 +68,22 @@ int main(void)
 
     int sentinel = logical > 1 ? logical - 1 : 1;
     omp_set_num_threads(sentinel);
-    env_set("OMP_NUM_THREADS", "7");
+    setenv("OMP_NUM_THREADS", "7", 1);
     coli_omp_tune_threads("test");
     if (omp_get_max_threads() != sentinel) {
         fprintf(stderr, "explicit OMP_NUM_THREADS override was not preserved\n");
         fail = 1;
     }
-    env_unset("OMP_NUM_THREADS");
+    unsetenv("OMP_NUM_THREADS");
 
     omp_set_num_threads(sentinel);
-    env_set("COLI_NO_OMP_TUNE", "1");
+    setenv("COLI_NO_OMP_TUNE", "1", 1);
     coli_omp_tune_threads("test");
     if (omp_get_max_threads() != sentinel) {
         fprintf(stderr, "COLI_NO_OMP_TUNE kill switch was not preserved\n");
         fail = 1;
     }
-    env_unset("COLI_NO_OMP_TUNE");
+    unsetenv("COLI_NO_OMP_TUNE");
 
     if (fail) {
         puts("test_omp_tune: FAIL");

@@ -16,6 +16,8 @@ from resource_plan import (
     environment_for_plan,
     format_plan,
     memory_available,
+    windows_available_bytes,
+    WINDOWS_MEMORYSTATUSEX_FIELDS,
     parse_ssd_cache,
     physical_cpu_count,
     read_ssd_probe,
@@ -26,16 +28,34 @@ from resource_plan import (
 def write_shard(path, tensors):
     offset = 0
     header = {}
-    payload = b""
     for tensor in tensors:
         name, size, *metadata = tensor
         dtype = metadata[0] if metadata else "U8"
         header[name] = {"dtype": dtype, "shape": [size],
                         "data_offsets": [offset, offset + size]}
-        payload += b"\0" * size
         offset += size
     raw = json.dumps(header).encode()
-    path.write_bytes(struct.pack("<Q", len(raw)) + raw + payload)
+    # The planner reads headers and file sizes, not tensor values. Extending
+    # the file retains the zero-filled payload without allocating it in Python;
+    # filesystems supporting sparse extension also avoid writing gigabytes.
+    with path.open("wb") as stream:
+        stream.write(struct.pack("<Q", len(raw)))
+        stream.write(raw)
+        stream.truncate(stream.tell() + offset)
+
+
+class ShardFixtureTest(unittest.TestCase):
+    def test_extended_payload_preserves_header_offsets_size_and_zero_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fixture.safetensors"
+            write_shard(path, [("first", 3), ("second", 5)])
+            with path.open("rb") as stream:
+                header_size, = struct.unpack("<Q", stream.read(8))
+                header = json.loads(stream.read(header_size))
+                self.assertEqual(header["first"]["data_offsets"], [0, 3])
+                self.assertEqual(header["second"]["data_offsets"], [3, 8])
+                self.assertEqual(stream.read(), b"\0" * 8)
+            self.assertEqual(path.stat().st_size, 8 + header_size + 8)
 
 
 class ResourcePlanTest(unittest.TestCase):
@@ -76,6 +96,32 @@ class ResourcePlanTest(unittest.TestCase):
         # so the Linux-only path returned 0 and the expert cache was sized to
         # 0 slots/layer. The value must be a sane positive number of bytes.
         self.assertGreater(memory_available(), 0)
+
+    def test_apple_silicon_reports_unified_host_memory_without_fake_vram(self):
+        # Host memory topology is a hardware fact, independent of whether the
+        # selected engine can place anything on the GPU.  In particular glm53
+        # is CPU-only today, but an M-series Mac must not be reported as
+        # memory.unified=false merely because planning_gpus is empty.
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch("resource_plan.platform.machine", return_value="arm64"):
+            plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                              available_disk=1, gpus=[], physical_cpus=8,
+                              cpu_sockets=1)
+        self.assertTrue(plan["memory"]["unified"])
+        self.assertEqual(plan["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertFalse(any("jointly constrained" in warning
+                             for warning in plan["warnings"]))
+
+    def test_glm53_auto_tune_does_not_emit_generic_inert_knobs(self):
+        from resource_plan import _auto_tune
+
+        generic = _auto_tune("disk", 0.50, [], 1, False)
+        self.assertIn("DRAFT", generic)
+        self.assertIn("PIPE", generic)
+
+        glm53 = _auto_tune("disk", 0.50, [], 1, False,
+                           engine_group="glm53")
+        self.assertEqual(glm53, {})
 
     def test_cpu_socket_count_is_positive(self):
         self.assertGreaterEqual(cpu_socket_count(), 1)
@@ -982,3 +1028,23 @@ class PhysicalCpuCountTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WindowsCommitLimitTest(unittest.TestCase):
+    """#1375: a 14 MB malloc failing on a 128 GB machine. Free physical memory
+    is not what decides whether malloc succeeds on Windows; grantable commit
+    is, and it can be far lower with a small page file."""
+
+    def test_commit_caps_the_budget_when_lower_than_physical(self):
+        self.assertEqual(windows_available_bytes(110 << 30, 40 << 30), 40 << 30)
+
+    def test_physical_is_used_when_commit_is_larger_or_unknown(self):
+        self.assertEqual(windows_available_bytes(110 << 30, 200 << 30), 110 << 30)
+        self.assertEqual(windows_available_bytes(110 << 30, 0), 110 << 30)
+
+    def test_memorystatusex_layout_is_the_documented_one(self):
+        # Order matters for ctypes: a skipped field shifts every later one.
+        self.assertEqual([n for n, _ in WINDOWS_MEMORYSTATUSEX_FIELDS], [
+            "dwLength", "dwMemoryLoad", "ullTotalPhys", "ullAvailPhys",
+            "ullTotalPageFile", "ullAvailPageFile", "ullTotalVirtual",
+            "ullAvailVirtual", "ullAvailExtendedVirtual"])

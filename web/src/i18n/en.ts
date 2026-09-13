@@ -47,6 +47,11 @@ const en: Record<string, string> = {
   "sidebar.temperature": "Temperature",
   "sidebar.maxTokens": "Max output tokens",
   "sidebar.reasoning": "Reasoning",
+  "sidebar.reasoning.off": "Off",
+  "sidebar.reasoning.low": "Low",
+  "sidebar.reasoning.medium": "Medium",
+  "sidebar.reasoning.high": "High",
+  "sidebar.reasoning.max": "Max",
   "sidebar.transport": "OpenAI-compatible transport",
 
   // top bar
