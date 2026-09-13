@@ -71,6 +71,17 @@
 #include "st.h"
 #include "quant.h"
 #include "tok.h"
+#ifdef COLI_METAL
+#include "backend_metal.h"
+static int g_metal_ready = 0;
+/* Runtime proof for the routed-expert path. These counters intentionally count
+ * cache-sized MoE blocks, not individual matmuls: one successful block means
+ * gate/up/clamped-SwiGLU/down/scatter all completed on Metal. */
+static uint64_t g_metal_moe_attempt = 0;
+static uint64_t g_metal_moe_ok = 0;
+static uint64_t g_metal_moe_fallback = 0;
+static uint64_t g_metal_moe_rows = 0;
+#endif
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
 static int g_vk_ready = 0;
@@ -606,6 +617,8 @@ typedef struct {
     const float *s;
     int rows, columns, gs;
     void *vk;                             /* ColiVkTensor*, caricata alla prima uso */
+    int resident;                         /* eligible for persistent accelerator wrapping */
+    void *metal;                          /* ColiMetalTensor*, created lazily */
 } Mat;
 
 typedef struct {
@@ -747,7 +760,7 @@ static void quantize_i4_grouped(const float *w, uint8_t *q4, float *scale,
  * buffer: o lo tiene com'e' o lo libera dopo averlo quantizzato. */
 static Mat quantize_loaded(float *buffer, int rows, int columns) {
     Mat mat; memset(&mat, 0, sizeof(mat));
-    mat.rows = rows; mat.columns = columns;
+    mat.rows = rows; mat.columns = columns; mat.resident = 1;
     const int bits = glm53_dense_bits();
     if (bits == 32) { mat.fmt = 0; mat.f = buffer; return mat; }
     if (bits == 4 && columns % 64 == 0) {
@@ -873,7 +886,7 @@ static Mat load_mat(GModel *m, const char *fmt, ...) {
         if (!packed || !step) { fprintf(stderr, "OOM su %s\n", name); exit(1); }
         st_read_raw(&m->S, name, packed, 1);
         st_read_f32_cap(&m->S, scales, step, qs->numel, 1);
-        mat.fmt = 4; mat.q4 = packed; mat.s = step; mat.gs = 64;
+        mat.fmt = 4; mat.q4 = packed; mat.s = step; mat.gs = 64; mat.resident = 1;
         return mat;
     }
 
@@ -919,6 +932,15 @@ static void mv_rows(float *out, const Mat *w, const float *x, int row0, int rows
  * Il campo `vk` e' una cache dentro a una matrice che il resto del codice
  * tratta come sola lettura: da qui il cast, che riguarda solo lui. */
 static void mv(float *out, const Mat *w, const float *x) {
+#ifdef COLI_METAL
+    if (g_metal_ready && w->resident && (w->fmt == 1 || w->fmt == 4)) {
+        Mat *mutable_w = (Mat *)w;
+        if (coli_metal_matmul((ColiMetalTensor **)&mutable_w->metal, out, x,
+                              w->fmt == 4 ? (const void *)w->q4 : (const void *)w->q8,
+                              w->s, w->fmt, 1, w->columns, w->rows, w->gs))
+            return;
+    }
+#endif
 #ifdef COLI_VULKAN
     if (g_vk_ready && (w->fmt == 1 || w->fmt == 4)) {
         Mat *mutable_w = (Mat *)w;
@@ -1155,7 +1177,14 @@ typedef struct ERef {
 
 /* I sei pezzi non sono adiacenti nel file, ma non devono esserlo nemmeno in
  * memoria: expert_mats ci costruisce sopra solo tre viste in sola lettura. */
-typedef struct { int eid; uint8_t *piece[GLM53_EXPERT_PIECES]; uint8_t *own; uint64_t used; } Slot;
+typedef struct {
+    int eid;
+    uint8_t *piece[GLM53_EXPERT_PIECES];
+    uint8_t *own;
+    size_t own_len;
+    int metal_registered;
+    uint64_t used;
+} Slot;
 typedef struct LCache { Slot *s; int n, cap; } LCache;
 
 /* Lunghezze e posizioni dei sei pezzi dentro allo slot. Gate e up sono
@@ -1283,23 +1312,49 @@ static Slot *slot_find(GModel *m, int layer, int eid) {
 
 static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
     const ERef *ref = &m->eref[(size_t)layer * m->c.n_experts + eid];
-    int mapped_ok = 1;
-    for (int p = 0; p < GLM53_EXPERT_PIECES && mapped_ok; p++) {
-        const void *pr = st_map_shard_range(ref->fd[p], ref->off[p], m->e_len[p]);
-        if (!pr) { mapped_ok = 0; break; }
-        slot->piece[p] = (uint8_t *)pr;
+    int metal_slot = 0;
+#ifdef COLI_METAL
+    metal_slot = g_metal_ready;
+#endif
+    /* The batched Metal MoE uses resolve() on expert pointers. st_map_shard_range
+     * may return a pointer inside an mmap rather than its 16-KiB-aligned base, so
+     * those views cannot be registered safely. Metal-active slots therefore own
+     * one stable aligned slab; CPU-only runs retain the zero-copy mmap fast path. */
+    if (!metal_slot) {
+        int mapped_ok = 1;
+        for (int p = 0; p < GLM53_EXPERT_PIECES && mapped_ok; p++) {
+            const void *pr = st_map_shard_range(ref->fd[p], ref->off[p], m->e_len[p]);
+            if (!pr) { mapped_ok = 0; break; }
+            slot->piece[p] = (uint8_t *)pr;
+        }
+        if (mapped_ok) { slot->eid = eid; return; }
     }
-    if (mapped_ok) { slot->eid = eid; return; }
-    /* Fallback: si torna a scrivere in memoria NOSTRA, non in una mappatura
-     * di sola lettura che questo slot poteva star usando prima. */
+    /* Fallback/Metal path: write into memory owned by the slot. Metal requires
+     * page alignment and a page-multiple registration length. The base stays
+     * stable across LRU reuse, so registration happens only on first allocation. */
     if (!slot->own) {
-        slot->own = malloc((size_t)m->e_slot);
+        size_t need = ((size_t)m->e_slot + 16383u) & ~(size_t)16383u;
+        void *p = NULL;
+        if (metal_slot) {
+            if (posix_memalign(&p, 16384, need) != 0) p = NULL;
+        } else {
+            p = malloc((size_t)m->e_slot);
+            need = (size_t)m->e_slot;
+        }
+        slot->own = (uint8_t *)p;
+        slot->own_len = need;
         if (!slot->own) {
             fprintf(stderr, "OOM su uno slot esperto (%.1f MB): la cache esperti non ci sta "
                             "in memoria; riduci con --ram N o GLM53_EXPERT_GB=N (#1375)\n",
                     m->e_slot / 1e6);
             exit(1);
         }
+#ifdef COLI_METAL
+        if (metal_slot) {
+            coli_metal_register(slot->own, slot->own_len);
+            slot->metal_registered = 1;
+        }
+#endif
     }
     for (int p = 0; p < GLM53_EXPERT_PIECES; p++) slot->piece[p] = slot->own + m->e_at[p];
     if (ref->contig) {
@@ -1507,28 +1562,85 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         }
         m->t_disk += now_s() - t_batch0;  /* fuori dalla regione omp: e' il muro del batch */
 
-        /* Un esperto per volta, e per ognuno tutti i token che lo hanno
-         * scelto. Nell'ordine opposto i suoi 12,6 MB di pesi verrebbero
-         * ripercorsi da capo per ogni token, e a questa taglia la banda di
-         * memoria e' quanto costa davvero il calcolo. */
-        for (int i = 0; i < here; i++) {
-            const int eid = union_ids[base + i];
-            Slot *slot = &cache->s[slot_of[i]];
-            slot->used = ++m->clock;
-            Mat gate, up, down;
-            expert_mats(m, slot, &gate, &up, &down);
-            for (int t = 0; t < tokens; t++) {
-                float scale = 0.0f;
-                for (int k = 0; k < topk; k++)
-                    if (chosen[(size_t)t * topk + k] == eid) {
-                        scale = weight[(size_t)t * topk + k];
-                        break;
+        /* Try all experts in this cache-sized block as one Metal command buffer.
+         * xg is grouped by expert; rows/rw preserve the exact CPU scatter weights.
+         * On any backend refusal/fault, run the original CPU loop unchanged. */
+        int metal_done = 0;
+#ifdef COLI_METAL
+        if (g_metal_ready) {
+            g_metal_moe_attempt++;
+            const int max_rows = tokens * topk;
+            const void **mg = malloc((size_t)here * sizeof(*mg));
+            const void **mu = malloc((size_t)here * sizeof(*mu));
+            const void **md = malloc((size_t)here * sizeof(*md));
+            const float **mgs = malloc((size_t)here * sizeof(*mgs));
+            const float **mus = malloc((size_t)here * sizeof(*mus));
+            const float **mds = malloc((size_t)here * sizeof(*mds));
+            int *xoff = malloc((size_t)here * sizeof(*xoff));
+            int *nr = calloc((size_t)here, sizeof(*nr));
+            int *rows = malloc((size_t)max_rows * sizeof(*rows));
+            float *rw = malloc((size_t)max_rows * sizeof(*rw));
+            float *xg = malloc((size_t)max_rows * c->hidden * sizeof(*xg));
+            if (mg && mu && md && mgs && mus && mds && xoff && nr && rows && rw && xg) {
+                int R = 0;
+                for (int i = 0; i < here; i++) {
+                    const int eid = union_ids[base + i];
+                    Slot *slot = &cache->s[slot_of[i]];
+                    slot->used = ++m->clock;
+                    Mat gate, up, down;
+                    expert_mats(m, slot, &gate, &up, &down);
+                    mg[i] = gate.q4; mu[i] = up.q4; md[i] = down.q4;
+                    mgs[i] = gate.s; mus[i] = up.s; mds[i] = down.s;
+                    xoff[i] = R;
+                    for (int t = 0; t < tokens; t++) {
+                        float scale = 0.0f;
+                        for (int k = 0; k < topk; k++)
+                            if (chosen[(size_t)t * topk + k] == eid) {
+                                scale = weight[(size_t)t * topk + k];
+                                break;
+                            }
+                        if (scale == 0.0f) continue;
+                        memcpy(xg + (size_t)R * c->hidden,
+                               x + (size_t)t * c->hidden,
+                               (size_t)c->hidden * sizeof(float));
+                        rows[R] = t; rw[R] = scale; nr[i]++; R++;
                     }
-                if (scale == 0.0f) continue;          /* non lo ha scelto */
-                mlp3(tmp, x + (size_t)t * c->hidden, &gate, &up, &down,
-                     c->swiglu_limit, sg, su);
-                float *dst = out + (size_t)t * c->hidden;
-                for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
+                }
+                metal_done = coli_metal_moe_block_clamped(
+                    here, c->hidden, c->moe_inter, 4, 64,
+                    mg, mu, md, mgs, mus, mds, xg, xoff, nr, rows, rw,
+                    out, tokens, c->swiglu_limit);
+                if (metal_done) {
+                    g_metal_moe_ok++;
+                    g_metal_moe_rows += (uint64_t)R;
+                }
+            }
+            if (!metal_done) g_metal_moe_fallback++;
+            free(xg); free(rw); free(rows); free(nr); free(xoff);
+            free(mds); free(mus); free(mgs); free(md); free(mu); free(mg);
+        }
+#endif
+        if (!metal_done) {
+            /* CPU fallback: one expert at a time, then every token that chose it. */
+            for (int i = 0; i < here; i++) {
+                const int eid = union_ids[base + i];
+                Slot *slot = &cache->s[slot_of[i]];
+                slot->used = ++m->clock;
+                Mat gate, up, down;
+                expert_mats(m, slot, &gate, &up, &down);
+                for (int t = 0; t < tokens; t++) {
+                    float scale = 0.0f;
+                    for (int k = 0; k < topk; k++)
+                        if (chosen[(size_t)t * topk + k] == eid) {
+                            scale = weight[(size_t)t * topk + k];
+                            break;
+                        }
+                    if (scale == 0.0f) continue;
+                    mlp3(tmp, x + (size_t)t * c->hidden, &gate, &up, &down,
+                         c->swiglu_limit, sg, su);
+                    float *dst = out + (size_t)t * c->hidden;
+                    for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
+                }
             }
         }
     }
@@ -1688,6 +1800,17 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
         }
     }
     vision_load(m);
+#ifdef COLI_METAL
+    /* Metal is runtime opt-in. Failure is non-fatal: the existing CPU path
+     * remains authoritative and streamed routed experts are deliberately
+     * excluded from this first integration step. */
+    if (getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))) {
+        g_metal_ready = coli_metal_init() && coli_metal_available();
+        fprintf(stderr, g_metal_ready
+                ? "Metal: attivo sulle matrici residenti\n"
+                : "Metal: nessun device utilizzabile, resto su CPU\n");
+    }
+#endif
 #ifdef COLI_VULKAN
     /* Il device si apre dopo i pesi: se non c'e', il motore continua sulla CPU
      * senza dire niente di piu' di una riga, perche' Vulkan qui e' un'opzione
@@ -1922,6 +2045,9 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
  * una perdita per richiesta. Ogni allocazione fatta dal caricamento ha qui il
  * suo rilascio, l'indice dei tensori compreso. */
 static void mat_release(Mat *mat) {
+#ifdef COLI_METAL
+    if (mat->metal) coli_metal_tensor_free((ColiMetalTensor *)mat->metal);
+#endif
     free((void *)mat->f); free((void *)mat->q8);
     free((void *)mat->q4); free((void *)mat->s);
     memset(mat, 0, sizeof(*mat));
@@ -3010,6 +3136,14 @@ int main(int argc, char **argv) {
     if (model.streaming)
         printf("experts hits %ld miss %ld bytes %llu\n",
                model.hits, model.miss, (unsigned long long)model.ebytes);
+#ifdef COLI_METAL
+    if (g_metal_ready && getenv("GLM53_VERBOSE") && atoi(getenv("GLM53_VERBOSE")))
+        printf("metal moe attempts %llu ok %llu fallback %llu rows %llu\n",
+               (unsigned long long)g_metal_moe_attempt,
+               (unsigned long long)g_metal_moe_ok,
+               (unsigned long long)g_metal_moe_fallback,
+               (unsigned long long)g_metal_moe_rows);
+#endif
     free(logits);
     session_close(&model, session);
     free(vision);

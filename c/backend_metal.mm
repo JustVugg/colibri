@@ -263,6 +263,13 @@ kernel void moe_fwht(device float* v [[buffer(0)]], device const uchar* signs [[
 }
 kernel void moe_silu(device float* g [[buffer(0)]], device const float* u [[buffer(1)]],
                      uint i [[thread_position_in_grid]]) { float v=g[i]; g[i]=(v/(1.0f+exp(-v)))*u[i]; }
+kernel void moe_silu_clamped(device float* g [[buffer(0)]], device const float* u [[buffer(1)]],
+                             constant float& limit [[buffer(2)]],
+                             uint i [[thread_position_in_grid]]) {
+  float v=min(g[i], limit);
+  float uv=clamp(u[i], -limit, limit);
+  g[i]=(v/(1.0f+exp(-v)))*uv;
+}
 
 // ===== Fused decode attention (GLM-5.2 dims, S=1) =====
 constant int A_HID=6144, A_H=64, A_QLORA=2048, A_KVL=512, A_NOPE=192, A_ROPE=64, A_VH=256;
@@ -590,7 +597,7 @@ struct ColiMetalTensor {
 
 static id<MTLDevice> g_dev;
 static id<MTLCommandQueue> g_queue;
-static id<MTLComputePipelineState> g_gemv, g_moe_gemv, g_moe_silu, g_moe_fwht;
+static id<MTLComputePipelineState> g_gemv, g_moe_gemv, g_moe_silu, g_moe_silu_clamped, g_moe_fwht;
 
 // fmt=6: sign-bit buffers for the GPU FWHT, one per tile size, cached forever (a
 // handful of sizes). The xorshift64* draw replicates quant.h e8_signs exactly —
@@ -824,6 +831,7 @@ extern "C" int coli_metal_init(void) {
     g_moe_silu = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_silu"] error:&err];
     g_moe_fwht = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_fwht"] error:&err];
     auto P=[&](const char*n){ return [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@(n)] error:&err]; };
+    g_moe_silu_clamped=P("moe_silu_clamped");
     g_a_rms=P("a_rmsnorm"); g_a_rope=P("a_rope"); g_a_copy=P("a_copy");
     g_a_qabs=P("a_qabs"); g_a_score=P("a_score"); g_a_smax=P("a_smax"); g_a_clat=P("a_clat"); g_a_ctx=P("a_ctx");
     g_a_add=P("a_add"); g_r_router=P("r_router"); g_r_top8=P("r_top8"); g_r_top8p=P("r_top8_par");
@@ -846,7 +854,7 @@ extern "C" int coli_metal_init(void) {
                         "r_top8 in use\n", (unsigned long)[g_r_top8p threadExecutionWidth]);
       g_rtop8_par = 0;
     }
-    if (!g_gemv || !g_moe_gemv || !g_moe_silu || !g_moe_fwht || !g_a_rms || !g_a_rope || !g_a_copy ||
+    if (!g_gemv || !g_moe_gemv || !g_moe_silu || !g_moe_silu_clamped || !g_moe_fwht || !g_a_rms || !g_a_rope || !g_a_copy ||
         !g_a_qabs || !g_a_score || !g_a_smax || !g_a_clat || !g_a_ctx) {
       fprintf(stderr, "[metal] pipeline failed\n"); g_dev = nil; return 0; }
     // E5 experiment: COLI_METAL_RESSET=1 -- see g_resset_obj comment above.
@@ -1399,7 +1407,8 @@ extern "C" size_t coli_metal_tensor_bytes(const ColiMetalTensor *t) { return t ?
 // if Metal is off or any expert pointer is not in a registered slab.
 // Encode + commit a MoE block (no wait). Writes hh[R,D] into hh_buf. Returns nil on
 // unresolved slab / bad fmt (caller falls back to CPU).
-static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt, int qgs,
+static id<MTLCommandBuffer> moe_submit_impl(int nb, int D, int Iinter, int fmt, int qgs,
+                         int clamped, float swiglu_limit,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr, int R,
@@ -1474,8 +1483,9 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt, int q
   gemv(bag,bsg,xg_buf,gg_buf,Iinter,D,D);                     // gate
   gemv(bau,bsu,xg_buf,uu_buf,Iinter,D,D);                     // up
   [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
-  [e setComputePipelineState:g_moe_silu];
+  [e setComputePipelineState:clamped ? g_moe_silu_clamped : g_moe_silu];
   [e setBuffer:gg_buf offset:0 atIndex:0];[e setBuffer:uu_buf offset:0 atIndex:1];
+  if (clamped) [e setBytes:&swiglu_limit length:sizeof(float) atIndex:2];
   [e dispatchThreads:MTLSizeMake((size_t)R*Iinter,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
   [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
   if (fmt == 6) {   /* rotate the down-projection input in place: same block-diagonal
@@ -1534,7 +1544,29 @@ extern "C" int coli_metal_moe_block(int nb, int D, int Iinter, int fmt, int qgs,
     g_gg = ensure(g_gg,&g_gg_cap,(size_t)R*Iinter*4);
     g_uu = ensure(g_uu,&g_uu_cap,(size_t)R*Iinter*4);
     g_hh = ensure(g_hh,&g_hh_cap,(size_t)R*D*4);
-    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,qgs,g,u,d,gs,us,ds,xg,xoff,nr,R,g_xg,g_gg,g_uu,g_hh);
+    id<MTLCommandBuffer> cb = moe_submit_impl(nb,D,Iinter,fmt,qgs,0,0.0f,g,u,d,gs,us,ds,xg,xoff,nr,R,g_xg,g_gg,g_uu,g_hh);
+    if (!cb) return 0;
+    return moe_finish(cb,g_hh,nb,R,D,rows,rw,out);
+  }
+}
+
+extern "C" int coli_metal_moe_block_clamped(int nb, int D, int Iinter, int fmt, int qgs,
+                         const void *const *g, const void *const *u, const void *const *d,
+                         const float *const *gs, const float *const *us, const float *const *ds,
+                         const float *xg, const int *xoff, const int *nr,
+                         const int *rows, const float *rw, float *out, int S,
+                         float swiglu_limit) {
+  (void)S;
+  if (!(swiglu_limit > 0.0f)) return 0;
+  @autoreleasepool {
+    int R = 0; for (int e=0;e<nb;e++) R += nr[e];
+    if (R == 0) return 1;
+    g_xg = ensure(g_xg,&g_xg_cap,(size_t)R*D*4);
+    g_gg = ensure(g_gg,&g_gg_cap,(size_t)R*Iinter*4);
+    g_uu = ensure(g_uu,&g_uu_cap,(size_t)R*Iinter*4);
+    g_hh = ensure(g_hh,&g_hh_cap,(size_t)R*D*4);
+    id<MTLCommandBuffer> cb = moe_submit_impl(nb,D,Iinter,fmt,qgs,1,swiglu_limit,
+        g,u,d,gs,us,ds,xg,xoff,nr,R,g_xg,g_gg,g_uu,g_hh);
     if (!cb) return 0;
     return moe_finish(cb,g_hh,nb,R,D,rows,rw,out);
   }
@@ -1559,7 +1591,7 @@ extern "C" ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iin
     id<MTLBuffer> bgg=[g_dev newBufferWithLength:(size_t)R*Iinter*4 options:g_res_opts];
     id<MTLBuffer> buu=[g_dev newBufferWithLength:(size_t)R*Iinter*4 options:g_res_opts];
     id<MTLBuffer> bhh=[g_dev newBufferWithLength:(size_t)R*D*4 options:g_res_opts];
-    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,qgs,g,u,d,gs,us,ds,xg,xoff,nr,R,bxg,bgg,buu,bhh);
+    id<MTLCommandBuffer> cb = moe_submit_impl(nb,D,Iinter,fmt,qgs,0,0.0f,g,u,d,gs,us,ds,xg,xoff,nr,R,bxg,bgg,buu,bhh);
     if (!cb) return nullptr;
     ColiMetalMoeHandle *h = new ColiMetalMoeHandle();
     h->cb=cb; h->hh=bhh; h->rows.assign(rows,rows+R); h->rwv.assign(rw,rw+R);
@@ -1629,6 +1661,27 @@ extern "C" int coli_metal_add(float *y, const float *a, size_t n) {
     [cb commit]; [cb waitUntilCompleted];
     memcpy(y, yb.contents, n*4);
     return cb.status != MTLCommandBufferStatusError;
+  }
+}
+
+extern "C" int coli_metal_silu_mul_clamped(float *g, const float *u, size_t n, float limit) {
+  if (!g_dev || n == 0 || !(limit > 0.0f)) return n == 0 ? 1 : 0;
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLBuffer> gb = cpubuf(g_dev, g, n*4);
+    id<MTLBuffer> ub = cpubuf(g_dev, u, n*4);
+    if (!gb || !ub) return 0;
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:g_moe_silu_clamped];
+    [e setBuffer:gb offset:0 atIndex:0]; [e setBuffer:ub offset:0 atIndex:1];
+    [e setBytes:&limit length:sizeof(float) atIndex:2];
+    [e dispatchThreads:MTLSizeMake((uint32_t)n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding];
+    { id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder]; [bl synchronizeResource:gb]; [bl endEncoding]; }
+    [cb commit]; [cb waitUntilCompleted];
+    if (cb.status == MTLCommandBufferStatusError) return 0;
+    memcpy(g, gb.contents, n*4);
+    return 1;
   }
 }
 
