@@ -1285,7 +1285,12 @@ def cmd_run(a):
         sys.exit(result)
     if arch=="glm53":
         e=env_for_engine(a,arch)
-        cmd=[engine,"--model",os.path.abspath(a.model),"--prompt",prompt,
+        # GLM53 accepts cache/layer as a positional numeric argument.  Keep the
+        # same cap_for_launch contract used by the persistent gateway so an
+        # explicit `coli run --cap N` reaches the engine instead of being
+        # silently ignored by the one-shot path.
+        cap = cap_for_launch(a.cap, e, 0)
+        cmd=[engine,str(cap),"--model",os.path.abspath(a.model),"--prompt",prompt,
              "--greedy",str(ngen_for(a,interactive=True,family=family))]
         sys.exit(subprocess.call(cmd,env=e))
     if arch=="olmoe":
