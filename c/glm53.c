@@ -1408,11 +1408,11 @@ static void expert_mats(const GModel *m, const Slot *slot, Mat *gate, Mat *up, M
     const int hidden = m->c.hidden, inter = m->c.moe_inter;
     const Mat shape[3] = {
         { 4, NULL, NULL, slot->piece[0], (const float *)slot->piece[1],
-          inter, hidden, 64, NULL },
+          inter, hidden, 64, NULL, 0, NULL },
         { 4, NULL, NULL, slot->piece[2], (const float *)slot->piece[3],
-          inter, hidden, 64, NULL },
+          inter, hidden, 64, NULL, 0, NULL },
         { 4, NULL, NULL, slot->piece[4], (const float *)slot->piece[5],
-          hidden, inter, 64, NULL },
+          hidden, inter, 64, NULL, 0, NULL },
     };
     *gate = shape[0]; *up = shape[1]; *down = shape[2];
 }
