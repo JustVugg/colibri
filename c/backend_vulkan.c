@@ -299,7 +299,7 @@ int coli_vk_init(const char *spv_path) {
     // discrete > integrated > virtual > other/cpu. Falls back to devs[0] if all equal.
     G.phys = devs[0];
     int bestrank = -1;
-    for (uint32_t i = 0; i < nd; i++) {
+    for (uint32_t i = nd-1; i > 0; i--) {
         VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(devs[i], &p);
         int rank = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU   ? 4 :
                    p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 3 :
