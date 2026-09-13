@@ -323,7 +323,7 @@ See `docs/glm53-flash.md`.
 | Variable | Default | Effect |
 |---|---|---|
 | `GLM53_BITS` | `4` | Precision of the resident dense weights: 4, 8 or 32. Routed experts are not affected — they arrive already quantized in the container and are never requantized. |
-| `GLM53_EXPERT_GB` | measured | RAM budget (GB) for the expert LRU cache; per-layer slots are derived from it. Unset, it is taken from `MemAvailable` after the weights are loaded, minus a 3 GB margin. A fixed number is wrong in both directions: too small on a large machine leaves memory idle while the disk does all the work. |
+| `GLM53_EXPERT_GB` | measured | RAM budget (GB) for the expert LRU cache; per-layer slots are derived from it. Unset, it is taken from reclaimable physical memory after the weights are loaded (Linux `MemAvailable`, Windows available physical memory, macOS free+inactive+purgeable pages), minus a 3 GB margin. A fixed number is wrong in both directions: too small on a large machine leaves memory idle while the disk does all the work. |
 | `GLM53_MAXT` | `8192` | KV state capacity in tokens, and the session size in serve mode. |
 | `GLM53_PREFILL_CHUNK` | `128` | Prefill chunk size in tokens. Smaller keeps the workspace smaller; too small re-reads experts once per chunk per layer instead of amortizing them. |
 | `GLM53_MAX_IMAGE_TOKENS` | checkpoint's (8000) | Ceiling on tokens per image. Each covers 28×28 pixels, so 256 keeps ordinary text legible and 64 keeps shapes and colours. The image is shrunk, not cropped. Lower it: 8000 is 2691 tokens for a 1080p photo, i.e. a prefill nobody will sit through. |
