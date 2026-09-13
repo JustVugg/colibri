@@ -97,6 +97,10 @@ typedef struct {
     Layer *L;
     LCache *cache;          /* [n_layers] */
     uint64_t clock, hits, miss;
+    /* Nanoseconds spent inside expert reads, summed across threads. The reads
+     * run unlocked and in parallel, so this is an atomic counter rather than a
+     * plain double: a per-turn delta of it is what the PROF line reports. */
+    uint64_t disk_ns;
     float **K, **V; int kv_len, max_t;
     double dense_load_s;
     /* IMPROVEMENT 2: expert frequency heatmap */
@@ -635,8 +639,10 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     if (!ts || ts->numel != want_s) {
         fprintf(stderr, "%s: scale array is %lld elems — expected %lld, refusing (untrusted container)\n",
                 qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1); }
+    double started = now_s();
     st_read_raw(&m->S, nm, s->g, g_expert_drop);
     st_read_f32(&m->S, qsnm, s->gs, 0);  /* scales are F32; use typed reader for dtype safety */
+    __atomic_fetch_add(&m->disk_ns, (uint64_t)((now_s() - started) * 1e9), __ATOMIC_RELAXED);
 }
 
 /* ---------- cache expert: ritorna i pesi quantizzati (q+scale) da cache o disco ---------- */
@@ -1444,6 +1450,7 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     g_temp = q->temp; g_nuc = q->top_p;
     double t0 = now_s();
     uint64_t h0 = m->hits, m0 = m->miss;
+    uint64_t disk0 = __atomic_load_n(&m->disk_ns, __ATOMIC_RELAXED);
     float *logit = step(m, ids, np, 0);
     int hist_len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
@@ -1477,11 +1484,15 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
         .length_limited = limited,
     };
     coli_serve_write_done(stdout, q->id, &done);
-    /* PROF: per-turn phase timings for the dashboard. olmoe.c does not split
-     * its wall time into fill/expert/shared/attn phases the way glm.c and
-     * inkling.c do, so this reports total time only; a real phase breakdown
-     * is future work, not a protocol requirement. */
-    printf("PROF %.3f %d %d 0.0 0.0 0.0 0.0 0.0 %d\n", dt, np, gen, gen + 1);
+    /* PROF: per-turn phase timings for the dashboard. The expert disk field is
+     * measured -- it is the one that dominates a streamed turn, and reporting a
+     * literal zero for it told /profile consumers that the reads cost nothing
+     * (#1449). The remaining four are still unmeasured in this engine: olmoe
+     * does not split the rest of its wall time the way glm.c and inkling.c do.
+     * They stay zero rather than being guessed, and the field order is the
+     * protocol's: disk, wait, matmul, attention, lm_head. */
+    double disk_s = (double)(__atomic_load_n(&m->disk_ns, __ATOMIC_RELAXED) - disk0) / 1e9;
+    printf("PROF %.3f %d %d %.3f 0.0 0.0 0.0 0.0 %d\n", dt, np, gen, disk_s, gen + 1);
     fflush(stdout);
     serve_hits(m);
     free(ids);
