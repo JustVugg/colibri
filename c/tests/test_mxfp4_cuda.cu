@@ -25,8 +25,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
-#include <cuda_runtime.h>
 
+#include "../backend_gpu_compat.h"
 /* quant.h is C (it uses _Thread_local, which nvcc's C++ front end rejects), so
  * the reference is compiled separately as C and reached through this one
  * declaration -- see tests/mxfp4_ref.c. */
@@ -44,6 +44,10 @@ static int fails;
             return 1;                                                                  \
         }                                                                              \
     } while (0)
+
+static int host_isinf(float x) {
+    return __builtin_isinf(x);
+}
 
 static uint64_t rng_state = 0x9E3779B97F4A7C15ull;
 static uint32_t rnd(void) {
@@ -68,8 +72,8 @@ static void compare_case(const char *what, const float *y_cpu, const float *y_gp
             if (std::isnan(a) != std::isnan(b)) bad++;
             continue;
         }
-        if (isinf(a) || isinf(b)) {           /* exponent 255: both must agree it is inf */
-            if (isinf(a) != isinf(b) || (isinf(a) && ((a > 0) != (b > 0)))) bad++;
+        if (host_isinf(a) || host_isinf(b)) { /* exponent 255: both must agree it is inf */
+            if (host_isinf(a) != host_isinf(b) || (host_isinf(a) && ((a > 0) != (b > 0)))) bad++;
             continue;
         }
         double den = fabs(a) > 1e-6 ? fabs(a) : 1e-6;

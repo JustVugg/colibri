@@ -53,6 +53,452 @@ static inline int coli_cuda_weight_at_supported(int fmt) {
 /* Opaque, persistent device copy of one resident quantized tensor. */
 typedef struct ColiCudaTensor ColiCudaTensor;
 
+/* Opaque model-agnostic GPU execution context for startup probes and later
+ * device-resident pipelines. */
+typedef struct ColiGpuContext ColiGpuContext;
+typedef struct ColiGpuTensor ColiGpuTensor;
+typedef struct ColiGpuArena ColiGpuArena;
+typedef struct ColiGpuKdaState ColiGpuKdaState;
+typedef struct ColiGpuMlaState ColiGpuMlaState;
+typedef struct ColiGpuRouter ColiGpuRouter;
+typedef struct ColiGpuExpertCache ColiGpuExpertCache;
+
+typedef struct {
+    const void *data;
+    const float *scales; /* fmt 1/2: [rows]; fmt 4:
+                            [rows, ceil(columns / group_size)] */
+    int format;       /* 0=f32, 1=int8 row, 2=int4 row, 4=int4 grouped */
+    int rows;
+    int columns;
+    int group_size;   /* required for format 4, zero otherwise */
+} ColiGpuTensorDesc;
+
+typedef struct {
+    uint64_t device_allocations;
+    uint64_t h2d_copies;
+    uint64_t h2d_bytes;
+    uint64_t d2h_copies;
+    uint64_t d2h_bytes;
+    uint64_t route_launches;
+    uint64_t expert_upload_bytes;
+    uint64_t expert_upload_events;
+    uint64_t expert_cache_hits;
+    uint64_t expert_cache_misses;
+    uint64_t expert_cache_evictions;
+    uint64_t expert_publications;
+    uint64_t stale_generation_rejections;
+    uint64_t wrong_expert_rejections;
+    uint64_t unpublished_slot_rejections;
+    uint64_t expert_handle_range_rejections;
+    uint64_t generation_exhaustions;
+    uint64_t expert_event_wait_failures;
+    uint64_t expert_event_wait_calls;
+    uint64_t unhealthy_cache_rejections;
+    uint64_t moe_compute_launches;
+    uint64_t selected_expert_count;
+    uint64_t host_activation_h2d_copies;
+    uint64_t host_activation_d2h_copies;
+} ColiGpuTelemetry;
+
+typedef enum {
+    COLI_GPU_FAULT_NONE = 0,
+    COLI_GPU_FAULT_BASE_ALLOCATION,
+    COLI_GPU_FAULT_MODEL_ALLOCATION,
+    COLI_GPU_FAULT_SESSION_ALLOCATION,
+    COLI_GPU_FAULT_TENSOR_UPLOAD,
+    COLI_GPU_FAULT_EXPERT_PUBLICATION,
+    COLI_GPU_FAULT_KERNEL_LAUNCH,
+    COLI_GPU_FAULT_DEVICE_STATUS,
+    COLI_GPU_FAULT_STREAM_SYNC
+} ColiGpuFaultPoint;
+
+typedef struct {
+    int hidden;
+    int experts;
+    int topk;
+    int normalize_topk;
+    float routed_scale;
+} ColiGpuRouteConfig;
+
+typedef struct {
+    int experts;
+    int slots;
+    int hidden;
+    int intermediate;
+    int group_size;
+    int max_rows;
+    float swiglu_limit;
+} ColiGpuExpertCacheConfig;
+
+typedef struct {
+    ColiGpuTensorDesc gate;
+    ColiGpuTensorDesc up;
+    ColiGpuTensorDesc down;
+} ColiGpuExpertSource;
+
+typedef struct {
+    int expert_id;
+    int slot;
+    uint64_t generation;
+} ColiGpuExpertHandle;
+
+typedef struct {
+    int expert_id;
+    int slot;
+    uint64_t generation;
+    int published;
+} ColiGpuExpertSlotInfo;
+
+typedef enum {
+    COLI_GPU_EXPERT_FAULT_NONE = 0,
+    COLI_GPU_EXPERT_FAULT_ALLOCATION,
+    COLI_GPU_EXPERT_FAULT_UPLOAD,
+    COLI_GPU_EXPERT_FAULT_EVENT_RECORD,
+    COLI_GPU_EXPERT_FAULT_EVENT_WAIT,
+    COLI_GPU_EXPERT_FAULT_LAUNCH
+} ColiGpuExpertFaultPoint;
+
+typedef struct {
+    const ColiGpuTensor *gate;
+    const ColiGpuTensor *up;
+    const ColiGpuTensor *down;
+} ColiGpuMoeSharedWeights;
+
+typedef struct {
+    int heads;
+    int head_dim;
+    int kernel;
+    int max_rows;
+    int max_context;
+    float recurrent_norm_eps;
+    float output_norm_eps;
+    float gate_lower_bound;
+} ColiGpuKdaConfig;
+
+typedef struct {
+    const ColiGpuTensor *q_proj;
+    const ColiGpuTensor *k_proj;
+    const ColiGpuTensor *v_proj;
+    const ColiGpuTensor *o_proj;
+    const ColiGpuTensor *gate_a_proj;
+    const ColiGpuTensor *gate_b_proj;
+    const ColiGpuTensor *decay_a_proj;
+    const ColiGpuTensor *decay_b_proj;
+    const ColiGpuTensor *beta_proj;
+    const ColiGpuTensor *conv;
+    const ColiGpuTensor *dt_bias;
+    const ColiGpuTensor *a_log;
+    const ColiGpuTensor *o_norm;
+} ColiGpuKdaWeights;
+
+typedef struct {
+    int hidden;
+    int heads;
+    int q_lora;
+    int kv_lora;
+    int qk_nope;
+    int qk_rope; /* GLM-5.3 currently requires zero (NoPE). */
+    int value_dim;
+    int index_heads;
+    int index_dim;
+    int index_pool;
+    int index_topk;
+    int index_select_tail;
+    int max_rows;
+    int max_context;
+    int page_tokens;
+    float rms_norm_eps;
+    float index_norm_eps;
+} ColiGpuMlaConfig;
+
+typedef struct {
+    const ColiGpuTensor *q_a_proj;          /* [q_lora, hidden] */
+    const ColiGpuTensor *q_a_norm;          /* [1, q_lora] */
+    const ColiGpuTensor *q_b_proj;          /* [heads*qk_nope, q_lora] */
+    const ColiGpuTensor *kv_a_proj;         /* [kv_lora, hidden] */
+    const ColiGpuTensor *kv_a_norm;         /* [1, kv_lora] */
+    const ColiGpuTensor *kv_b_key;          /* [heads*kv_lora, qk_nope] */
+    const ColiGpuTensor *kv_b_value;        /* [heads*value_dim, kv_lora] */
+    const ColiGpuTensor *o_proj;             /* [hidden, heads*value_dim] */
+    const ColiGpuTensor *index_q_proj;       /* [index_heads*index_dim, q_lora] */
+    const ColiGpuTensor *index_k_proj;       /* [index_dim, hidden] */
+    const ColiGpuTensor *index_weight_proj;  /* [index_heads, hidden] */
+    const ColiGpuTensor *index_key_norm;     /* [1, index_dim] */
+    const ColiGpuTensor *index_key_bias;     /* [1, index_dim] */
+    const ColiGpuTensor *index_pool_ape;     /* [index_pool, index_dim] */
+    const ColiGpuTensor *index_pool_gate;    /* [index_dim, hidden] */
+} ColiGpuMlaWeights;
+
+typedef enum {
+    COLI_GPU_MLA_FAULT_NONE = 0,
+    COLI_GPU_MLA_FAULT_TABLE_ALLOC,
+    COLI_GPU_MLA_FAULT_TABLE_COPY,
+    COLI_GPU_MLA_FAULT_PAGE_ALLOC,
+    COLI_GPU_MLA_FAULT_PAGE_PUBLISH,
+    COLI_GPU_MLA_FAULT_TABLE_PUBLISH
+} ColiGpuMlaFaultPoint;
+
+typedef struct {
+    int logical_length;
+    int capacity;
+    int page_count;
+    int page_table_capacity;
+    uint64_t payload_copy_bytes;
+} ColiGpuMlaCacheInfo;
+
+typedef enum {
+    COLI_GPU_MLA_STATUS_OK = 0,
+    COLI_GPU_MLA_STATUS_NONFINITE_INPUT,
+    COLI_GPU_MLA_STATUS_NONFINITE_CACHE,
+    COLI_GPU_MLA_STATUS_NONFINITE_RESULT
+} ColiGpuMlaStatus;
+
+typedef enum {
+    COLI_GPU_MLA_CACHE_LATENT = 0,
+    COLI_GPU_MLA_CACHE_INDEX_KEY,
+    COLI_GPU_MLA_CACHE_INDEX_GATE
+} ColiGpuMlaCacheKind;
+
+typedef struct {
+    uint64_t kernel_launches;
+    uint64_t total_grid_blocks;
+    int max_grid_blocks;
+    int max_block_threads;
+} ColiGpuMlaLaunchInfo;
+
+enum {
+    COLI_GPU_CAP_STREAM_ORDERED = 1ull << 0,
+    COLI_GPU_CAP_INT4_GS64      = 1ull << 1,
+    COLI_GPU_CAP_PIPELINE       = 1ull << 2
+};
+
+COLI_CUDA_DLLEXPORT int coli_gpu_context_create(ColiGpuContext **out, int device);
+COLI_CUDA_DLLEXPORT int coli_gpu_context_probe(ColiGpuContext *ctx, uint64_t required_caps);
+COLI_CUDA_DLLEXPORT int coli_gpu_context_healthy(const ColiGpuContext *ctx);
+COLI_CUDA_DLLEXPORT int coli_gpu_context_memory_info(
+    ColiGpuContext *ctx, size_t *free_bytes, size_t *total_bytes);
+COLI_CUDA_DLLEXPORT int coli_gpu_context_sync(ColiGpuContext *ctx);
+COLI_CUDA_DLLEXPORT void coli_gpu_context_mark_unhealthy(ColiGpuContext *ctx);
+COLI_CUDA_DLLEXPORT int coli_gpu_context_inject_fault(
+    ColiGpuContext *ctx, ColiGpuFaultPoint point, int occurrence);
+COLI_CUDA_DLLEXPORT int coli_gpu_context_consume_fault(
+    ColiGpuContext *ctx, ColiGpuFaultPoint point);
+COLI_CUDA_DLLEXPORT void coli_gpu_context_destroy(ColiGpuContext *ctx);
+COLI_CUDA_DLLEXPORT void coli_gpu_context_telemetry(const ColiGpuContext *ctx,
+                                                    ColiGpuTelemetry *out);
+
+/* Context-owned-stream resident storage. Host transfers synchronize only this
+ * explicit non-blocking stream and are therefore API boundaries. */
+COLI_CUDA_DLLEXPORT int coli_gpu_tensor_create(ColiGpuTensor **out,
+                                               ColiGpuContext *ctx,
+                                               const ColiGpuTensorDesc *desc);
+COLI_CUDA_DLLEXPORT void coli_gpu_tensor_destroy(ColiGpuTensor *tensor);
+COLI_CUDA_DLLEXPORT int coli_gpu_arena_create(ColiGpuArena **out,
+                                              ColiGpuContext *ctx,
+                                              size_t capacity);
+COLI_CUDA_DLLEXPORT void coli_gpu_arena_destroy(ColiGpuArena *arena);
+COLI_CUDA_DLLEXPORT size_t coli_gpu_arena_capacity(const ColiGpuArena *arena);
+COLI_CUDA_DLLEXPORT int coli_gpu_arena_upload(ColiGpuArena *arena, size_t offset,
+                                              const void *src, size_t bytes);
+COLI_CUDA_DLLEXPORT int coli_gpu_arena_download(ColiGpuArena *arena, size_t offset,
+                                                void *dst, size_t bytes);
+COLI_CUDA_DLLEXPORT int coli_gpu_arena_upload_activation(
+    ColiGpuArena *arena, size_t offset, const void *src, size_t bytes);
+COLI_CUDA_DLLEXPORT int coli_gpu_arena_download_activation(
+    ColiGpuArena *arena, size_t offset, void *dst, size_t bytes);
+
+COLI_CUDA_DLLEXPORT int coli_gpu_embedding(ColiGpuArena *arena,
+                                           size_t streams_offset,
+                                           size_t token_ids_offset,
+                                           const ColiGpuTensor *embedding,
+                                           int rows, int streams, int hidden);
+COLI_CUDA_DLLEXPORT int coli_gpu_rmsnorm(ColiGpuArena *arena, size_t output_offset,
+                                         size_t input_offset,
+                                         const ColiGpuTensor *weight,
+                                         int rows, int hidden, float eps);
+COLI_CUDA_DLLEXPORT int coli_gpu_layernorm(ColiGpuArena *arena, size_t output_offset,
+                                           size_t input_offset,
+                                           const ColiGpuTensor *weight,
+                                           const ColiGpuTensor *bias,
+                                           int rows, int hidden, float eps);
+COLI_CUDA_DLLEXPORT int coli_gpu_mhc_pre_norm(
+    ColiGpuArena *arena, size_t collapsed_offset, size_t normed_offset,
+    size_t post_offset, size_t comb_offset, size_t residual_offset,
+    const ColiGpuTensor *fn, const ColiGpuTensor *scale,
+    const ColiGpuTensor *base, const ColiGpuTensor *norm_weight,
+    int rows, int streams, int hidden, float norm_eps, float hc_eps);
+COLI_CUDA_DLLEXPORT int coli_gpu_mhc_post(
+    ColiGpuArena *arena, size_t output_offset, size_t branch_offset,
+    size_t residual_offset, size_t post_offset, size_t comb_offset,
+    int rows, int streams, int hidden);
+COLI_CUDA_DLLEXPORT int coli_gpu_mhc_site(
+    ColiGpuArena *arena, size_t output_offset, size_t collapsed_offset,
+    size_t normed_offset, size_t post_offset, size_t comb_offset,
+    size_t residual_offset, size_t branch_offset,
+    const ColiGpuTensor *fn, const ColiGpuTensor *scale,
+    const ColiGpuTensor *base, const ColiGpuTensor *norm_weight,
+    int rows, int streams, int hidden, float norm_eps, float hc_eps);
+COLI_CUDA_DLLEXPORT int coli_gpu_collapse_streams(
+    ColiGpuArena *arena, size_t output_offset, size_t streams_offset,
+    int rows, int streams, int hidden);
+COLI_CUDA_DLLEXPORT int coli_gpu_projection(
+    ColiGpuArena *arena, size_t output_offset, size_t input_offset,
+    const ColiGpuTensor *weight, int rows, int input_size, int output_size);
+COLI_CUDA_DLLEXPORT int coli_gpu_dense_mlp(
+    ColiGpuArena *arena, size_t output_offset, size_t input_offset,
+    size_t gate_offset, size_t up_offset,
+    const ColiGpuTensor *gate, const ColiGpuTensor *up,
+    const ColiGpuTensor *down, int rows, int hidden, int intermediate,
+    float swiglu_limit);
+
+/* GLM-5.3 routing remains device-resident. Download is a metadata-only
+ * loader/test boundary; no activation is copied by route or MoE compute. */
+COLI_CUDA_DLLEXPORT int coli_gpu_router_create(
+    ColiGpuRouter **out, ColiGpuContext *ctx,
+    const ColiGpuRouteConfig *config, int max_rows);
+COLI_CUDA_DLLEXPORT void coli_gpu_router_destroy(ColiGpuRouter *router);
+COLI_CUDA_DLLEXPORT int coli_gpu_router_run(
+    ColiGpuRouter *router, ColiGpuArena *arena, size_t input_offset,
+    const ColiGpuTensor *weight, const ColiGpuTensor *correction_bias,
+    int rows);
+COLI_CUDA_DLLEXPORT int coli_gpu_router_download(
+    ColiGpuRouter *router, int *selected_ids, float *routing_weights,
+    size_t selected_count, int rows);
+
+/* The caller owns expert bytes and victim selection. A successful upload
+ * records a stream event and returns a generation-bound handle; compute waits
+ * for that event. Failed uploads leave the previous slot mapping publishable. */
+COLI_CUDA_DLLEXPORT int coli_gpu_expert_cache_create(
+    ColiGpuExpertCache **out, ColiGpuContext *ctx,
+    const ColiGpuExpertCacheConfig *config);
+COLI_CUDA_DLLEXPORT void coli_gpu_expert_cache_destroy(
+    ColiGpuExpertCache *cache);
+COLI_CUDA_DLLEXPORT int coli_gpu_expert_cache_upload(
+    ColiGpuExpertCache *cache, int expert_id, int slot,
+    const ColiGpuExpertSource *source, ColiGpuExpertHandle *out);
+COLI_CUDA_DLLEXPORT int coli_gpu_expert_cache_lookup(
+    ColiGpuExpertCache *cache, int expert_id, ColiGpuExpertHandle *out);
+COLI_CUDA_DLLEXPORT int coli_gpu_expert_cache_validate(
+    ColiGpuExpertCache *cache, const ColiGpuExpertHandle *handle);
+COLI_CUDA_DLLEXPORT int coli_gpu_expert_cache_slot_info(
+    const ColiGpuExpertCache *cache, int slot, ColiGpuExpertSlotInfo *out);
+COLI_CUDA_DLLEXPORT int coli_gpu_expert_cache_inject_fault(
+    ColiGpuExpertCache *cache, ColiGpuExpertFaultPoint point);
+COLI_CUDA_DLLEXPORT int coli_gpu_expert_cache_inject_fault_at(
+    ColiGpuExpertCache *cache, ColiGpuExpertFaultPoint point, int occurrence);
+COLI_CUDA_DLLEXPORT int coli_gpu_expert_cache_healthy(
+    const ColiGpuExpertCache *cache);
+/* Deterministic rollover-boundary test hook; requires a published slot. */
+COLI_CUDA_DLLEXPORT int coli_gpu_expert_cache_test_set_generation(
+    ColiGpuExpertCache *cache, int slot, uint64_t generation);
+COLI_CUDA_DLLEXPORT int coli_gpu_expert_cache_test_delay_upload(
+    ColiGpuExpertCache *cache, unsigned milliseconds);
+COLI_CUDA_DLLEXPORT int coli_gpu_expert_cache_test_hold_snapshot(
+    ColiGpuExpertCache *cache, int hold);
+COLI_CUDA_DLLEXPORT int coli_gpu_expert_cache_test_snapshot_entered(
+    const ColiGpuExpertCache *cache);
+COLI_CUDA_DLLEXPORT size_t coli_gpu_moe_scratch_bytes(
+    const ColiGpuExpertCacheConfig *config);
+COLI_CUDA_DLLEXPORT int coli_gpu_expert_primitive(
+    ColiGpuArena *arena, size_t output_offset, size_t input_offset,
+    size_t scratch_offset, ColiGpuExpertCache *cache,
+    const ColiGpuMoeSharedWeights *weights, int rows);
+/* shared or router may be NULL for routed-only/shared-only execution.
+ * Routed handles are row-major [rows, topk] and must match the router result. */
+COLI_CUDA_DLLEXPORT int coli_gpu_moe_site(
+    ColiGpuArena *arena, size_t output_offset, size_t input_offset,
+    size_t scratch_offset, ColiGpuRouter *router,
+    ColiGpuExpertCache *cache, const ColiGpuMoeSharedWeights *shared,
+    const ColiGpuExpertHandle *handles, size_t handle_count, int rows);
+
+/* Stateful KDA storage is bound to caller-reserved persistent arena ranges.
+ * Creation allocates only the opaque host handle; reset and hot-path calls
+ * enqueue work on ctx's non-blocking stream without device allocation or
+ * host transfer. */
+COLI_CUDA_DLLEXPORT size_t coli_gpu_kda_state_bytes(
+    const ColiGpuKdaConfig *config);
+COLI_CUDA_DLLEXPORT size_t coli_gpu_kda_window_bytes(
+    const ColiGpuKdaConfig *config);
+COLI_CUDA_DLLEXPORT size_t coli_gpu_kda_scratch_bytes(
+    const ColiGpuKdaConfig *config, int rows, int hidden);
+COLI_CUDA_DLLEXPORT int coli_gpu_kda_state_create(
+    ColiGpuKdaState **out, ColiGpuContext *ctx, ColiGpuArena *arena,
+    size_t state_offset, size_t window_offset,
+    const ColiGpuKdaConfig *config);
+COLI_CUDA_DLLEXPORT void coli_gpu_kda_state_destroy(ColiGpuKdaState *state);
+COLI_CUDA_DLLEXPORT int coli_gpu_kda_state_reset(ColiGpuKdaState *state);
+COLI_CUDA_DLLEXPORT int coli_gpu_kda_state_download(
+    ColiGpuKdaState *state, float *matrix, size_t matrix_floats,
+    float *window, size_t window_floats);
+/* qkv is [3, rows, heads * head_dim], decay is
+ * [rows, heads * head_dim], beta is [rows, heads], and output is
+ * [rows, heads * head_dim]. The call advances state from start_position.
+ * All four arena ranges and the state's matrix/window ranges must be mutually
+ * non-overlapping; aliases are rejected before any launch. */
+COLI_CUDA_DLLEXPORT int coli_gpu_kda_recurrent(
+    ColiGpuArena *arena, size_t output_offset, size_t qkv_offset,
+    size_t decay_offset, size_t beta_offset, ColiGpuKdaState *state,
+    const ColiGpuTensor *conv, int rows, int start_position);
+/* input, output, scratch, and the state's matrix/window ranges must be
+ * mutually non-overlapping. Any overlap is rejected before state mutation. */
+COLI_CUDA_DLLEXPORT int coli_gpu_kda_site(
+    ColiGpuArena *arena, size_t output_offset, size_t input_offset,
+    size_t scratch_offset, ColiGpuKdaState *state,
+    const ColiGpuKdaWeights *weights, int rows, int start_position,
+    int hidden);
+
+/* Device-resident GLM-5.3 MLA/DSA state. Caches are contiguous geometric
+ * page-capacity arrays with layouts [position, kv_lora] and
+ * [position, index_dim]. Growth preserves the prefix and only synchronizes the
+ * owning context stream before retiring old storage. */
+COLI_CUDA_DLLEXPORT size_t coli_gpu_mla_scratch_bytes(
+    const ColiGpuMlaConfig *config);
+COLI_CUDA_DLLEXPORT size_t coli_gpu_mla_selected_bytes(
+    const ColiGpuMlaConfig *config, int rows);
+COLI_CUDA_DLLEXPORT int coli_gpu_mla_state_create(
+    ColiGpuMlaState **out, ColiGpuContext *ctx,
+    const ColiGpuMlaConfig *config);
+/* Persistent layout: each independently allocated page is
+ * [page_tokens, kv_lora] latent, then [page_tokens, index_dim] index keys,
+ * then [page_tokens, index_dim] index gates. A stream-published device page
+ * table addresses pages; geometric growth replaces only this metadata table
+ * and allocates new pages, never copies an existing cache payload. */
+COLI_CUDA_DLLEXPORT void coli_gpu_mla_state_destroy(ColiGpuMlaState *state);
+COLI_CUDA_DLLEXPORT int coli_gpu_mla_state_reset(ColiGpuMlaState *state);
+COLI_CUDA_DLLEXPORT int coli_gpu_mla_state_length(
+    const ColiGpuMlaState *state);
+COLI_CUDA_DLLEXPORT int coli_gpu_mla_state_capacity(
+    const ColiGpuMlaState *state);
+COLI_CUDA_DLLEXPORT int coli_gpu_mla_state_reserve(
+    ColiGpuMlaState *state, int required);
+COLI_CUDA_DLLEXPORT int coli_gpu_mla_state_cache_info(
+    const ColiGpuMlaState *state, ColiGpuMlaCacheInfo *out);
+/* Deterministic test hook. occurrence is zero-based among boundaries of the
+ * selected type in the next growth attempt. The injected failure is one-shot. */
+COLI_CUDA_DLLEXPORT int coli_gpu_mla_state_inject_growth_fault(
+    ColiGpuMlaState *state, ColiGpuMlaFaultPoint point, int occurrence);
+COLI_CUDA_DLLEXPORT ColiGpuMlaStatus coli_gpu_mla_state_status(
+    const ColiGpuMlaState *state);
+COLI_CUDA_DLLEXPORT int coli_gpu_mla_state_launch_info(
+    const ColiGpuMlaState *state, ColiGpuMlaLaunchInfo *out);
+/* Test-only corruption hook used to prove persistent-cache validation. */
+COLI_CUDA_DLLEXPORT int coli_gpu_mla_state_test_corrupt_cache(
+    ColiGpuMlaState *state, ColiGpuMlaCacheKind kind,
+    int position, int channel, float value);
+COLI_CUDA_DLLEXPORT int coli_gpu_mla_state_download(
+    ColiGpuMlaState *state,
+    float *latent, size_t latent_floats,
+    float *index_keys, size_t index_key_floats,
+    float *index_gates, size_t index_gate_floats);
+/* input/output are [rows, hidden], selected is
+ * [rows, index_topk + (tail ? index_pool - 1 : 0)]. start_position must equal
+ * the state's logical length. All arena ranges must be mutually disjoint. */
+COLI_CUDA_DLLEXPORT int coli_gpu_mla_site(
+    ColiGpuArena *arena, size_t output_offset, size_t input_offset,
+    size_t scratch_offset, size_t selected_offset,
+    ColiGpuMlaState *state, const ColiGpuMlaWeights *weights,
+    int rows, int start_position);
+
 /* Devices are CUDA ordinals, not positions in the input list. */
 COLI_CUDA_DLLEXPORT int coli_cuda_init(const int *devices, int count);
 COLI_CUDA_DLLEXPORT void coli_cuda_shutdown(void);

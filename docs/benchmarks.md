@@ -4,6 +4,44 @@ Everything on this page is a measurement, not a promise. If you run colibrì on
 hardware not listed here, **please open an issue with your numbers** — real
 datapoints are what move this project.
 
+## GLM-5.3-Flash full HIP on MI350P (2026-09-11)
+
+One AMD Instinct MI350P (gfx950, 154.6 GB HBM), exposed as gfx942 with
+`HSA_OVERRIDE_GFX_VERSION=9.4.2`; 123 GB host RAM; Colibri int4-gs64
+checkpoint; prompt `The key insight about mixture of experts is`; greedy 64.
+
+The production `GLM53_BACKEND=gpu` path keeps the complete text forward on
+HIP. CPU responsibilities are tokenization, sampling, expert disk reads, and
+LRU metadata.
+
+Measured completing cell:
+
+| metric | cold | warm second process |
+|---|---:|---:|
+| load | 53.8 s | 39.4 s |
+| prefill, 8 tokens | 62.7 s | 55.6 s |
+| decode, 64 tokens | 890.2 s | 862.4 s |
+| decode | 13.9 s/token | **13.5 s/token** |
+| expert hit rate | 56.3% | 56.3% |
+| mean / peak GPU busy | 80.1% / 100% | 84.4% / 100% |
+| max VRAM | 67.31e9 B | 68.23e9 B |
+
+The run used `GLM53_EXPERT_GB=28`: 47 expert slots on each of 42 sparse
+layers, with a double-banked GPU cache. It read 151.59 GB of expert bytes.
+Automatic sizing attempted roughly 97 GPU slots/layer but retained host copies
+and was OOM-killed on this 123 GB host. The run therefore measures a
+host-memory-constrained expert cache, not full HBM residency.
+
+Quality against the CPU engine passed before publication: relative mean NLL
+change `6.65e-6`, all captured numerical sites within threshold, matching
+four-token greedy outputs on three prompts, and bitwise-stable repeated GPU
+hashes.
+
+The earlier **1.4 s/token / 6.3% mean GPU busy** experiment was a different,
+partial-HIP system (experts and some resident matmuls only). KDA, MLA, routing,
+mHC, and activations were CPU-side. It must not be presented as the performance
+of this complete backend.
+
 ## Reference numbers (the original dev box: WSL2, 12 cores, 25 GB RAM, NVMe via VHDX)
 
 Detailed GPU experiment: [GLM-5.2 on 6× RTX 5090](experiments/glm52-6x5090-2026-07-12.md) —

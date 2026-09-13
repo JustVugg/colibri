@@ -3,6 +3,45 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased — GLM-5.3 device-resident GPU branch
+
+### Added
+
+- A production text-only GLM-5.3-Flash GPU backend selected by
+  `GLM53_BACKEND=auto|gpu|cpu`. Embedding, mHC, KDA, MLA/DSA, routing,
+  dense/shared/routed FFNs, recurrent state, final norm, and LM head remain
+  device-resident for the request.
+- Explicit GPU context health/capability handling and an executable full-pipeline
+  probe. Explicit `gpu` fails closed; `auto` may select the complete CPU backend
+  before serving.
+- Persistent KDA state/windows, paged MLA/indexer caches, deterministic absorb
+  attention, GPU top-8 routing, and an event-published double-banked expert
+  cache.
+- HIP tests for mHC, KDA, MLA/DSA, MoE, full-pipeline, and production
+  request/startup behavior, plus `glm53-quality` for real-checkpoint CPU/GPU
+  numerical, NLL, generation, and determinism gates.
+
+### Fixed
+
+- Grouped `fmt=4` int4 now decodes Colibri's offset-binary nibbles as
+  `nibble - 8`; legacy `fmt=2` retains its signed-nibble path after XOR
+  conversion.
+- GPU request failures cannot publish partial logits or fall back per
+  operation. The active request fails, and only a later request may select CPU
+  in `auto` mode.
+- Expert publication waits for upload completion, validates slot generations,
+  and fails atomically before launching a partially prepared MoE operation.
+
+### Validation
+
+- MI350P real-checkpoint quality passed with relative mean NLL change
+  `6.65e-6`, passing site/logit thresholds, CPU-matching four-token greedy
+  outputs on three prompts, and bitwise-stable repeated GPU hashes.
+- The host-memory-constrained 64-token MI350P cell measured 13.5 s/token warm,
+  56.3% expert hit rate, and 84.4% mean GPU busy at 47 expert slots/layer.
+  This is not comparable to the historical 1.4 s/token partial-HIP result and
+  is not a matched-residency comparison.
+
 ## [1.10.2] — 2026-09-06
 
 Patch release. Three of these fixes answer reports made against 1.10.1 in the

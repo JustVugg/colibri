@@ -1,11 +1,12 @@
 # GPU backends: CUDA and HIP/ROCm
 
-colibrì's GPU expert backend is **one source file** (`c/backend_cuda.cu`) compiled
-for either vendor through `c/backend_gpu_compat.h` — the same one-shim-header
-pattern `compat.h` uses for the Windows port. Compiled by nvcc the shim is a
-pass-through to `cuda_runtime.h` (the NVIDIA path is byte-identical to the
-pre-HIP tree); compiled by hipcc it maps the 14-symbol CUDA runtime surface the
-backend uses onto HIP 1:1. The kernels use only shared syntax
+colibrì's generic GPU kernels are in **one source file** (`c/backend_cuda.cu`)
+compiled for either vendor through `c/backend_gpu_compat.h` — the same
+one-shim-header pattern `compat.h` uses for the Windows port. The backend began
+as an expert tier; GLM-5.3 also composes it into a complete device-resident text
+pipeline through `c/glm53_gpu.c`. Compiled by nvcc the shim is a pass-through
+to `cuda_runtime.h`; compiled by hipcc it maps the CUDA runtime surface the
+backend uses onto HIP. The kernels use shared syntax
 (`__global__`, `__shared__`, `__syncthreads__`, `<<<>>>`), no vendor intrinsics.
 
 **Rule for contributors:** vendor differences go in `backend_gpu_compat.h`
@@ -154,9 +155,23 @@ make -C c hip-test  [HIP_ARCH=...]     # AMD (same test source)
 ```
 
 Covers q8/q4/q2/f32 matmul correctness, multi-device placement/stats, and
-`tensor_update` — the standard upstream suite, unchanged, compiled by hipcc.
-(A companion PR adds failure-path tests for the backend; they are
-vendor-neutral and run under `hip-test` identically.)
+`tensor_update`, plus the GLM-5.3 mHC, KDA, MLA/DSA, MoE, full-pipeline, and
+production request/startup integration suites. The GLM tests include recurrent
+state transitions, paged attention growth, absorb determinism, asynchronous
+expert publication, whole-backend failure semantics, and the executable
+pipeline probe.
+
+Real-checkpoint GLM-5.3 quality is a separate, non-CI gate:
+
+```sh
+make -C c glm53-quality HIP=1 HIP_ARCH=gfx942
+HSA_OVERRIDE_GFX_VERSION=9.4.2 GLM53_EXPERT_GB=8 \
+  ./c/glm53_quality /path/to/glm53-int4 /path/to/quality.json
+```
+
+On the validated MI350P run, mean CPU/GPU NLL changed by `6.65e-6`, all
+captured site oracles passed, four greedy tokens matched the CPU reference on
+three prompts, and repeated GPU hashes were bitwise identical.
 
 ### CI (no GPU required)
 
@@ -170,6 +185,7 @@ on real hardware is for (matrix below).
 
 | environment | result |
 |---|---|
+| AMD Instinct MI350P (gfx950 exposed as gfx942), ROCm, Linux | `hip-test` **pass**, including GLM-5.3 device-resident mHC/KDA/MLA/MoE/pipeline/request integration; real-checkpoint quality **pass**; 64-token `GLM53_BACKEND=gpu` run completed at 13.5 s/token warm with 47 expert slots/layer and 56.3% hit rate. Host-backed auto cache OOMed 123 GB RAM, so this is not a matched-residency engine comparison. |
 | AMD RX 9070 XT (gfx1201), ROCm 7.2.4, Linux 7.0 | `hip-test` **pass** (all cases above); GLM-5.2 end-to-end runs (0.32 tok/s @ 61% expert hit with CUDA_RELEASE_HOST=1); benchmark series in PR #112 |
 | NVIDIA | compile-verified in CI (`sm_80`); nvcc path is a pass-through include — **runtime run of `make cuda-test` on NVIDIA hardware welcomed**, the test source is vendor-neutral |
 

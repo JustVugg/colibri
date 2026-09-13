@@ -27,8 +27,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
-#include <cuda_runtime.h>
 
+#include "../backend_gpu_compat.h"
 #include "../backend_cuda.cu"
 
 static float e4m3_ref(uint8_t b){
