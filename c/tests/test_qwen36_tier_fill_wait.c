@@ -24,6 +24,9 @@
 
 #include "../qwen36_tier.c"
 
+#include "../compat.h"   /* setenv: MinGW has none, and qwen36_tier.c does not
+                          * pull it in the way an engine .c does */
+
 static int fails;
 static void check(int ok, const char *what) {
     if (!ok) { printf("  FAIL: %s\n", what); fails++; }
