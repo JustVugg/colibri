@@ -5,7 +5,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [1.11.0] — 2026-09-13
 
-54 pull requests since v1.10.2. A ninth model family, five real bugs closed
+56 pull requests since v1.10.2. A ninth model family, five real bugs closed
 across four engines, and the two platforms the C tests never built on now
 building them in CI.
 
@@ -99,6 +99,11 @@ building them in CI.
 - **#1447** (@trigger2k20): `coli mirror verify` accepts a complete mirror
   copied by other means, with no receipt, and fails closed on a short or
   corrupt shard.
+- **#1456** (@trigger2k20): the planner reports `memory.unified` from the
+  host, not from whether the selected engine has a placement-capable GPU, so
+  a CPU-only engine on Apple Silicon no longer reads as non-unified; and
+  `coli tune` stops suggesting `DRAFT`/`PIPE`/`PIN`/`NUMA` to glm53, which
+  ignores them.
 - **#1396** (@dmoraesrs): the web reasoning selector drops "Medium" for
   GLM 5.3, which the engine renders identically to "High".
 - **#1428**, **#1435** (@iiEliJas), **#1433** and **#1432** (@texasich),
@@ -117,6 +122,9 @@ building them in CI.
   on an M4 Max: 0.469 to 0.621 tok/s at 32 tokens, up to 2.15 tok/s with
   the expert cache tuned. Also fixes `coli run --cap N` being silently
   ignored on the glm53 one-shot path.
+- **#1457** (@trigger2k20): GLM-5.3-Flash feeds the shared routing telemetry
+  and writes `.coli_usage`, so usage-driven placement and partial-mirror
+  planning have data for it.
 - **#1454** (@yuripourre): the qwen36 GPU tier compiles with `HIP=1`.
 - **#1399** (@SebaWag): `TRUNK_RESIDENT_LAYERS=N` streams the dense trunk
   through mmap (#826).
