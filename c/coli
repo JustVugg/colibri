@@ -1301,6 +1301,10 @@ def cmd_run(a):
         # emits the answer and exits cleanly. No reason to spin up the gateway
         # for a single non-interactive prompt.
         e=env_for_engine(a,arch)
+        # olmoe.c reads its model directory from SNAP and nothing else, and
+        # env_for_engine() sets SNAP only for GLM: without this the engine
+        # answered "started without a model" and `coli run` exited 1.
+        e["SNAP"]=os.path.abspath(a.model)
         result=subprocess.run(
             [engine, str(cap_for_launch(a.cap,e,16)), "8"],
             input=prompt+"\n", text=True, env=e, check=False)

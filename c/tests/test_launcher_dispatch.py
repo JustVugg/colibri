@@ -150,5 +150,49 @@ class ProjectPythonTest(unittest.TestCase):
             self.assertEqual(self.cli.project_python(), sys.executable)
 
 
+class OlmoeRunTest(unittest.TestCase):
+    """`coli run --model <olmoe dir> "prompt"` must tell the engine which model.
+
+    olmoe.c learns its model from SNAP and nothing else; without it the engine
+    prints "started without a model" and exits 1. The one-shot branch built its
+    environment with env_for_engine(), which sets SNAP only for GLM, and passed
+    the model neither in the environment nor on argv. The gateway sets SNAP for
+    chat/serve/web, so only `coli run` was affected.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cli = load_cli()
+
+    def test_the_engine_is_given_the_model_directory(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        model = os.path.join(directory.name, "olmoe")
+        os.mkdir(model)
+        olmoe = next(f for f in all_families() if f.id == "olmoe")
+        launched = mock.Mock(return_value=types.SimpleNamespace(returncode=0))
+        argv = ["coli", "run", "--model", model, "hello"]
+        with mock.patch.dict(self.cli.os.environ):
+            # an exported SNAP would hide the bug: the child inherits it
+            self.cli.os.environ.pop("SNAP", None)
+            with mock.patch.object(self.cli.sys, "argv", argv), \
+                 mock.patch.object(self.cli, "resolve_model",
+                                   return_value=types.SimpleNamespace(descriptor=olmoe)), \
+                 mock.patch.object(self.cli, "engine_for", return_value="olmoe-engine"), \
+                 mock.patch.object(self.cli, "need_model"), \
+                 mock.patch.object(self.cli, "banner"), \
+                 mock.patch.object(self.cli.subprocess, "run", launched):
+                with self.assertRaises(SystemExit) as exited:
+                    self.cli.main()
+        self.assertEqual(exited.exception.code, 0)
+        launched.assert_called_once()
+        command, env = launched.call_args.args[0], launched.call_args.kwargs["env"]
+        self.assertEqual(command[0], "olmoe-engine")
+        self.assertEqual(launched.call_args.kwargs["input"], "hello\n")
+        self.assertEqual(env.get("CHAT"), "1")
+        self.assertEqual(env.get("SNAP"), os.path.abspath(model),
+                         "the engine was launched without its model directory")
+
+
 if __name__ == "__main__":
     unittest.main()
