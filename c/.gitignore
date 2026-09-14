@@ -56,3 +56,5 @@ shaders/rmsnorm.spv
 coli_train
 adapters/
 train_state.bin
+data/m8_tokenized/
+data/tiny_sft/
