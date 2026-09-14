@@ -106,6 +106,8 @@ class V4CliTest(unittest.TestCase):
             self.assertTrue(captured["text"])
             self.assertEqual(captured["env"]["CHAT"], "1")
             self.assertEqual(captured["env"]["MAX_NEW"], "32")
+            # olmoe.c reads its model directory from SNAP and exits without it.
+            self.assertEqual(captured["env"]["SNAP"], str(root))
         finally:
             directory.cleanup()
 
