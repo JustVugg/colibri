@@ -29,6 +29,14 @@ RESUME_ARGS=()
 if [[ -f "$OUT/train_state.bin" ]]; then RESUME_ARGS=(--resume "$OUT"); echo "(resuming $OUT)"
 else echo "(fresh run — no $OUT state)"; fi
 
+# pre-tokenized data is not committed: generate it from the source jsonl on
+# first use (tokenizer comes from the snapshot; needs Python + transformers)
+if [[ ! -f data/m8_tokenized/train.bin ]]; then
+  echo "== tokenizing data/m8_persona.jsonl -> data/m8_tokenized (one-time) =="
+  python3 tools/prepare_sft.py --input data/m8_persona.jsonl \
+    --output data/m8_tokenized --model "$MODEL" --seed 0
+fi
+
 echo "== training: $STEPS steps on data/m8_tokenized (rank 8, lr $LR) =="
 ./coli_train --model "$MODEL" --data data/m8_tokenized --adapter-out "$OUT" \
   "${RESUME_ARGS[@]}" \

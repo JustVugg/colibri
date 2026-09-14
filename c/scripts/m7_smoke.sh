@@ -21,6 +21,14 @@ RAM="${RAM:-36}"   # conservative default: leaves room for your apps + macOS fil
 
 [[ -f "$MODEL/config.json" ]] || { echo "!! no model at $MODEL (set COLI_MODEL)"; exit 1; }
 
+# pre-tokenized data is not committed: generate it from the source jsonl on
+# first use (tokenizer comes from the snapshot; needs Python + transformers)
+if [[ ! -f data/m8_tokenized/train.bin ]]; then
+  echo "== tokenizing data/m8_persona.jsonl -> data/m8_tokenized (one-time) =="
+  python3 tools/prepare_sft.py --input data/m8_persona.jsonl \
+    --output data/m8_tokenized --model "$MODEL" --seed 0
+fi
+
 echo "== stage 0: build =="
 make colibri METAL=1
 make coli_train

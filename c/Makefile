@@ -822,7 +822,7 @@ endif
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c sse41_kernels.h exact_dot.h oracle.h pin_pool.h cli_args.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h abl.h backend_cuda.h backend_metal.h backend_vulkan.h backend_xdna.h decode_batch.h edge_adapters.h edge_runtime.h edge_tok_internal.h evidence_digest.h schema_gbnf.h segment_adapter_internal.h segment_adapters.h segment_runtime.h tier.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) $(XDNA_OBJ) .build-config
+colibri$(EXE): colibri.c lora.h sse41_kernels.h exact_dot.h oracle.h pin_pool.h cli_args.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h abl.h backend_cuda.h backend_metal.h backend_vulkan.h backend_xdna.h decode_batch.h edge_adapters.h edge_runtime.h edge_tok_internal.h evidence_digest.h schema_gbnf.h segment_adapter_internal.h segment_adapters.h segment_runtime.h tier.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) $(XDNA_OBJ) .build-config
 	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(XDNA_OBJ) -o colibri$(EXE) $(LDFLAGS)
 
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
