@@ -62,7 +62,7 @@ def main() -> int:
         # Un traceback su un file che manca fa sembrare rotto il
         # motore; chi arriva per la prima volta non puo' distinguere
         # le due cose. Il generatore vuole transformers 5.16.1.
-        print(f"SKIP: manca {arguments.fixture}; generalo con\n"
+        print(f"SKIP: missing {arguments.fixture}; generate it with\n"
               f"  python3 tools/make_glm53_multimodal_tiny.py --output <dir>")
         return 0
     binary = os.path.abspath(arguments.binary)
@@ -71,10 +71,10 @@ def main() -> int:
     cpu, _ = run(binary, arguments.fixture, reference, False, arguments.shaders)
     gpu, notes = run(binary, arguments.fixture, reference, True, arguments.shaders)
 
-    if "attivo" not in notes:
-        reason = ("il binario non e' costruito con VK=1"
-                  if "Vulkan:" not in notes else "nessun device Vulkan utilizzabile")
-        print(f"SKIP: {reason}; il percorso Vulkan non e' stato verificato")
+    if "Vulkan: active for resident matrices" not in notes:
+        reason = ("binary was not built with VK=1"
+                  if "Vulkan:" not in notes else "no usable Vulkan device")
+        print(f"SKIP: {reason}; Vulkan path was not verified")
         return 0
 
     device = next((line for line in notes.splitlines() if "[VK] ready:" in line), "")
@@ -83,8 +83,8 @@ def main() -> int:
             print(f"FAIL {field}\n  CPU:    {cpu.get(field)}\n  Vulkan: {gpu.get(field)}")
             return 1
 
-    print(f"PASS GLM-5.3 Vulkan: stessi token della CPU su "
-          f"{len(cpu['teacher_forcing'])} posizioni e {len(cpu['greedy'])} passi greedy"
+    print(f"PASS GLM-5.3 Vulkan: same tokens as CPU across "
+          f"{len(cpu['teacher_forcing'])} positions and {len(cpu['greedy'])} greedy steps"
           f"{' — ' + device.split('ready:')[1].split(',')[0].strip() if device else ''}")
     return 0
 

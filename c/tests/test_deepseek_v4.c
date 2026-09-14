@@ -5,6 +5,7 @@
 #include "../native_quant_fp4_rows16.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
@@ -14,6 +15,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+/* mkdtemp() hands out a scratch directory, the engine appends <snap>/.coli_usage
+ * to it whenever it saves its expert history, and rmdir() then fails on a
+ * directory that is no longer empty.  Nothing was listening to that failure, so
+ * a knob that did not arrive left the directory behind and the test still said
+ * ok.  Removing the fixture and checking the rmdir turns that back into a
+ * failure. */
+static int scratch_remove(const char *directory, const char *fixture) {
+    unlink(fixture);
+    if (rmdir(directory) == 0) return 0;
+    fprintf(stderr, "scratch directory %s survived its test (errno=%d): the "
+                    "engine wrote into it, so the knobs this test sets did not "
+                    "reach getenv()\n", directory, errno);
+    return 1;
+}
 
 /* ==== begin test_deepseek_v4_attention_cache.c ==== */
 /* umbrella headers */
@@ -780,8 +796,7 @@ static int test_expert_store(void) {
         return 1;
     }
     store->ops->destroy(store);
-    unlink(path);
-    rmdir(directory);
+    if (scratch_remove(directory, path)) return 1;
     puts("DeepSeek-V4 ExpertStore tests: ok");
     return 0;
 }
@@ -956,8 +971,7 @@ static int test_expert_store_prefill_pool(void) {
         failed = 1;
     }
     store->ops->destroy(store);
-    unlink(path);
-    rmdir(directory);
+    failed |= scratch_remove(directory, path);
     if (failed) return 1;
     puts("DeepSeek-V4 ExpertStore prefill pool: ok "
          "(A/B bytes 816->408, second sweep=0 reads, warm entries + decode reserve retained)");
@@ -1043,8 +1057,7 @@ static int test_expert_store_miss_scaling(void) {
     int result = run_expert_miss_scaling_case(directory, 256, 44) ||
                  run_expert_miss_scaling_case(directory, 256, 104) ||
                  run_expert_miss_scaling_case(directory, 256, 208);
-    unlink(path);
-    rmdir(directory);
+    result |= scratch_remove(directory, path);
     if (result) return 1;
     puts("DeepSeek-V4 ExpertStore miss scaling: ok "
          "(44/104/208 slots=1 probe each)");

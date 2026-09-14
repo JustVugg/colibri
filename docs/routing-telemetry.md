@@ -6,9 +6,9 @@ the header both are implemented in. Background and design discussion in
 
 ## Why one header
 
-Six of colibrì's seven engines use this header: `colibri.c` (GLM-5.2),
-`kimi_k3.c`, `inkling.c`, `olmoe.c`, `deepseek_v4.c`, and `qwen38.c`.
-Qwen3.6 is the one existing exception. The learning cache described in
+Seven of colibrì's eight engines use this header: `colibri.c` (GLM-5.2),
+`kimi_k3.c`, `inkling.c`, `olmoe.c`, `deepseek_v4.c`, `qwen38.c`, and
+`glm53.c`. Qwen3.6 is the one existing exception. The learning cache described in
 [tuning.md](tuning.md) is only as good as the history it reads. Before
 `route_trace.h`, that history was per-engine: `colibri.c` wrote sparse text,
 `inkling.c` wrote a dense binary block with an `IKU1` magic, and the other

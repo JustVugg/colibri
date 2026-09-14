@@ -269,11 +269,12 @@ endif
 deepseek-v4-test-objs: $(TEST_UNIT_OBJS)
 
 # Registry unit test (no engine link — stubs the auto open fn).
+# -D_FILE_OFFSET_BITS=64: compat.h (setenv/unsetenv shims) requires it on Windows.
 deepseek-v4-test-registry: test_expert_store_registry
 	./test_expert_store_registry
 test_expert_store_registry: test_expert_store_registry.c expert_store_registry.c \
-	expert_store_registry.h expert_store.h
-	$(CC) -O2 -Wall -Wextra test_expert_store_registry.c expert_store_registry.c -o $@
+	expert_store_registry.h expert_store.h compat.h
+	$(CC) -O2 -Wall -Wextra -D_FILE_OFFSET_BITS=64 test_expert_store_registry.c expert_store_registry.c -o $@
 
 deepseek-v4-clean:
 	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_HOT_TEST_OBJ) \

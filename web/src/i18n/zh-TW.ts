@@ -41,6 +41,11 @@ const zhTW: Record<string, string> = {
   "sidebar.temperature": "溫度",
   "sidebar.maxTokens": "最大輸出 token 數",
   "sidebar.reasoning": "推理模式",
+  "sidebar.reasoning.off": "關閉",
+  "sidebar.reasoning.low": "低",
+  "sidebar.reasoning.medium": "中",
+  "sidebar.reasoning.high": "高",
+  "sidebar.reasoning.max": "最高",
   "sidebar.transport": "OpenAI 相容協定",
 
   "topbar.activeModel": "目前模型",

@@ -116,6 +116,20 @@ class V4CliTest(unittest.TestCase):
         self.assertEqual(env["RAM_GB"], "64")
         self.assertEqual(env["CTX"], "4096")
 
+    def test_sister_engines_get_snap_from_the_model_flag(self):
+        """#1501: `coli run` handed olmoe (and every non-GLM engine) an
+        environment without SNAP, so the engine exited with "started without
+        a model" while chat and serve, which set it elsewhere, worked."""
+        from family_registry import family_ids
+        for arch in [f for f in family_ids() if f != "glm"]:
+            args = argparse.Namespace(ngen=8, temp=None, ram=0, ctx=None, model="models/demo")
+            env = self.cli.env_for_engine(args, arch)
+            self.assertEqual(env.get("SNAP"), os.path.abspath("models/demo"), arch)
+        # an explicit SNAP in the caller's environment still wins
+        with mock.patch.dict(os.environ, {"SNAP": "/elsewhere"}):
+            args = argparse.Namespace(ngen=8, temp=None, ram=0, ctx=None, model="models/demo")
+            self.assertEqual(self.cli.env_for_engine(args, "olmoe")["SNAP"], "/elsewhere")
+
     def test_kimi_engine_environment_forwards_ram(self):
         """#855: `--ram` reached the environment for deepseek_v4 only, so on Kimi
         K3 it was set and never read -- the flag a user reaches for to bound

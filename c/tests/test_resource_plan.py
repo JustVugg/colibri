@@ -16,6 +16,8 @@ from resource_plan import (
     environment_for_plan,
     format_plan,
     memory_available,
+    windows_available_bytes,
+    WINDOWS_MEMORYSTATUSEX_FIELDS,
     parse_ssd_cache,
     physical_cpu_count,
     read_ssd_probe,
@@ -26,16 +28,34 @@ from resource_plan import (
 def write_shard(path, tensors):
     offset = 0
     header = {}
-    payload = b""
     for tensor in tensors:
         name, size, *metadata = tensor
         dtype = metadata[0] if metadata else "U8"
         header[name] = {"dtype": dtype, "shape": [size],
                         "data_offsets": [offset, offset + size]}
-        payload += b"\0" * size
         offset += size
     raw = json.dumps(header).encode()
-    path.write_bytes(struct.pack("<Q", len(raw)) + raw + payload)
+    # The planner reads headers and file sizes, not tensor values. Extending
+    # the file retains the zero-filled payload without allocating it in Python;
+    # filesystems supporting sparse extension also avoid writing gigabytes.
+    with path.open("wb") as stream:
+        stream.write(struct.pack("<Q", len(raw)))
+        stream.write(raw)
+        stream.truncate(stream.tell() + offset)
+
+
+class ShardFixtureTest(unittest.TestCase):
+    def test_extended_payload_preserves_header_offsets_size_and_zero_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fixture.safetensors"
+            write_shard(path, [("first", 3), ("second", 5)])
+            with path.open("rb") as stream:
+                header_size, = struct.unpack("<Q", stream.read(8))
+                header = json.loads(stream.read(header_size))
+                self.assertEqual(header["first"]["data_offsets"], [0, 3])
+                self.assertEqual(header["second"]["data_offsets"], [3, 8])
+                self.assertEqual(stream.read(), b"\0" * 8)
+            self.assertEqual(path.stat().st_size, 8 + header_size + 8)
 
 
 class ResourcePlanTest(unittest.TestCase):
@@ -76,6 +96,32 @@ class ResourcePlanTest(unittest.TestCase):
         # so the Linux-only path returned 0 and the expert cache was sized to
         # 0 slots/layer. The value must be a sane positive number of bytes.
         self.assertGreater(memory_available(), 0)
+
+    def test_apple_silicon_reports_unified_host_memory_without_fake_vram(self):
+        # Host memory topology is a hardware fact, independent of whether the
+        # selected engine can place anything on the GPU.  In particular glm53
+        # is CPU-only today, but an M-series Mac must not be reported as
+        # memory.unified=false merely because planning_gpus is empty.
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch("resource_plan.platform.machine", return_value="arm64"):
+            plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                              available_disk=1, gpus=[], physical_cpus=8,
+                              cpu_sockets=1)
+        self.assertTrue(plan["memory"]["unified"])
+        self.assertEqual(plan["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertFalse(any("jointly constrained" in warning
+                             for warning in plan["warnings"]))
+
+    def test_glm53_auto_tune_does_not_emit_generic_inert_knobs(self):
+        from resource_plan import _auto_tune
+
+        generic = _auto_tune("disk", 0.50, [], 1, False)
+        self.assertIn("DRAFT", generic)
+        self.assertIn("PIPE", generic)
+
+        glm53 = _auto_tune("disk", 0.50, [], 1, False,
+                           engine_group="glm53")
+        self.assertEqual(glm53, {})
 
     def test_cpu_socket_count_is_positive(self):
         self.assertGreaterEqual(cpu_socket_count(), 1)
@@ -641,7 +687,7 @@ memInfo.free:                     23.50 GB (97%)
         self.assertEqual(plan["tiers"]["vram"]["devices"], [])
         self.assertIn("not detected", plan["warnings"][0])
 
-    def test_qwen38_cpu_only_plan_prices_heterogeneous_cache_and_exports_cap(self):
+    def test_qwen38_plan_prices_heterogeneous_cache_exports_cap_and_plans_vram(self):
         config = {
             "model_type": "qwen4_exp",
             "text_config": {
@@ -666,7 +712,15 @@ memInfo.free:                     23.50 GB (97%)
             },
         }
         (self.model / "config.json").write_text(json.dumps(config))
-        tensors = [("model.embed_tokens.weight", 256, "BF16")]
+        MiB = 1 << 20
+        tensors = [("model.embed_tokens.weight", 256, "BF16"),
+                   # dense matmul matrices the engine offers to the tier: one
+                   # big enough to go (4 MiB BF16 -> 2 MiB int8), one under the
+                   # 1 MiB line that stays on the CPU, one PLE projection that
+                   # is never offered
+                   ("model.layers.0.linear_attn.in_proj_qkv.weight", 4 * MiB, "BF16"),
+                   ("model.layers.0.mlp.gate.weight", 1024, "BF16"),
+                   ("model.layers.1.ple.key_proj.weight", 4 * MiB, "BF16")]
         for projection in ("gate_proj", "up_proj", "down_proj"):
             prefix = f"model.layers.0.mlp.experts.0.{projection}"
             tensors.append((prefix + ".weight", 32, "F8_E4M3"))
@@ -676,7 +730,9 @@ memInfo.free:                     23.50 GB (97%)
             ))
         write_shard(self.model / "model.safetensors", tensors)
         analysis = analyze_model(self.model)
-        self.assertEqual(analysis["dense_bytes"], 256)
+        self.assertEqual(analysis["dense_bytes"], 256 + 4 * MiB + 1024 + 4 * MiB)
+        # The stage-1 trunk offload: int8 bytes of the offered matrices only.
+        self.assertEqual(analysis["trunk_int8_bytes"], 2 * MiB)
         # The three native FP8 sidecars are retained once in the normalized
         # scale bank, not once per cache slot.
         self.assertEqual(analysis["expert_fixed_bytes"], 12)
@@ -689,12 +745,24 @@ memInfo.free:                     23.50 GB (97%)
                "free_bytes": 14 * GB, "unified_memory": True}
         plan = build_plan(self.model, context=64, available_memory=16 * GB,
                           available_disk=16 * GB, gpus=[gpu])
-        self.assertEqual(plan["tiers"]["vram"]["devices"], [])
-        self.assertEqual(plan["tiers"]["vram"]["budget_bytes"], 0)
-        self.assertFalse(any(item["target"] == "VRAM" for item in plan["decisions"]))
+        # Qwen3.8 has the CUDA VRAM expert tier (fp8 streaming mode): a
+        # qualified device is planned, the environment names it, and the RAM
+        # cache cap is still exported -- VRAM is a stage above the LRU, not
+        # a replacement for it.
+        self.assertEqual([device["index"] for device in plan["tiers"]["vram"]["devices"]], [0])
+        self.assertGreater(plan["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertTrue(any(item["target"] == "VRAM" for item in plan["decisions"]))
+        # The trunk goes first, out of the same VRAM, and the plan says so.
+        self.assertEqual(plan["tiers"]["vram"]["trunk_bytes"], 2 * MiB)
+        self.assertTrue(any(item["reason"] == "dense trunk as int8 residents"
+                            for item in plan["decisions"]))
+        self.assertIn("int8 trunk", format_plan(plan))
         cap = plan["tiers"]["ram"]["cache_slots_per_layer"]
         self.assertGreaterEqual(cap, 1)
-        self.assertEqual(environment_for_plan(plan)["COLI_PLAN_CAP"], str(cap))
+        environment = environment_for_plan(plan)
+        self.assertEqual(environment["COLI_PLAN_CAP"], str(cap))
+        self.assertEqual(environment["COLI_CUDA"], "1")
+        self.assertEqual(environment["COLI_GPU"], "0")
         for variable in ("Q38_NATIVE_FP8", "Q38_NATIVE_BF16"):
             with self.subTest(variable=variable), self.assertRaisesRegex(
                     ValueError, "requires native expert storage"):
@@ -702,12 +770,17 @@ memInfo.free:                     23.50 GB (97%)
         plan["tiers"]["ram"]["cache_slots_per_layer"] = 0
         with self.assertRaisesRegex(ValueError, "one expert slot"):
             environment_for_plan(plan)
-        with self.assertRaisesRegex(ValueError, "CPU only"):
-            build_plan(self.model, context=64, gpu_indices=[0], available_memory=16 * GB,
-                       available_disk=16 * GB, gpus=[gpu])
-        with self.assertRaisesRegex(ValueError, "CPU only"):
-            build_plan(self.model, context=64, vram_gb=4, available_memory=16 * GB,
-                       available_disk=16 * GB, gpus=[gpu])
+        selected = build_plan(self.model, context=64, gpu_indices=[0], available_memory=16 * GB,
+                              available_disk=16 * GB, gpus=[gpu])
+        self.assertEqual([device["index"] for device in selected["tiers"]["vram"]["devices"]], [0])
+        capped = build_plan(self.model, context=64, vram_gb=4, available_memory=16 * GB,
+                            available_disk=16 * GB, gpus=[gpu])
+        self.assertLessEqual(capped["tiers"]["vram"]["budget_bytes"], 4 * GB - 2 * MiB)
+        self.assertEqual(capped["tiers"]["vram"]["trunk_bytes"], 2 * MiB)
+        # A budget too small for the trunk leaves it on the CPU: experts only.
+        tiny = build_plan(self.model, context=64, vram_gb=0.001, available_memory=16 * GB,
+                          available_disk=16 * GB, gpus=[gpu])
+        self.assertEqual(tiny["tiers"]["vram"]["trunk_bytes"], 0)
 
     def test_cli_emits_versioned_json(self):
         cli = Path(__file__).parents[1] / "coli"
@@ -982,3 +1055,23 @@ class PhysicalCpuCountTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WindowsCommitLimitTest(unittest.TestCase):
+    """#1375: a 14 MB malloc failing on a 128 GB machine. Free physical memory
+    is not what decides whether malloc succeeds on Windows; grantable commit
+    is, and it can be far lower with a small page file."""
+
+    def test_commit_caps_the_budget_when_lower_than_physical(self):
+        self.assertEqual(windows_available_bytes(110 << 30, 40 << 30), 40 << 30)
+
+    def test_physical_is_used_when_commit_is_larger_or_unknown(self):
+        self.assertEqual(windows_available_bytes(110 << 30, 200 << 30), 110 << 30)
+        self.assertEqual(windows_available_bytes(110 << 30, 0), 110 << 30)
+
+    def test_memorystatusex_layout_is_the_documented_one(self):
+        # Order matters for ctypes: a skipped field shifts every later one.
+        self.assertEqual([n for n, _ in WINDOWS_MEMORYSTATUSEX_FIELDS], [
+            "dwLength", "dwMemoryLoad", "ullTotalPhys", "ullAvailPhys",
+            "ullTotalPageFile", "ullAvailPageFile", "ullTotalVirtual",
+            "ullAvailVirtual", "ullAvailExtendedVirtual"])

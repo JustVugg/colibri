@@ -32,11 +32,66 @@ SAFETENSORS_DTYPES = {
     "F8_E8M0": 1,
     "F8_E8M0FNU": 1,
 }
-REQUIRED_CORE_TENSORS = (
-    "model.embed_tokens.weight",
-    "model.norm.weight",
-    "lm_head.weight",
+def _is_embedding(name):
+    return name.endswith("embed_tokens.weight")
+
+
+def _is_final_norm(name):
+    # Every block has norms too. The final one is the norm that sits OUTSIDE
+    # the layer stack, so exclude anything under `.layers.`, and exclude
+    # `layernorm` outright: GLM-5.3-Flash's vision tower has
+    # `model.visual.post_layernorm.weight`, which would otherwise stand in for
+    # a final norm that is not there.
+    return (name.endswith(".norm.weight")
+            and ".layers." not in name
+            and "layernorm" not in name)
+
+
+def _is_output_head(name):
+    return name.endswith("lm_head.weight")
+
+
+#: What a checkpoint must contain to be a language model at all, stated as
+#: ROLES rather than names.
+#:
+#: #1365: the previous form was three literal names taken from GLM-5.2, and it
+#: reported "2 required core tensor(s) are missing" for every GLM-5.3-Flash
+#: download, converted or pre-converted. Nothing was missing. Flash's root is
+#: the vision wrapper, so the language model is nested and the tensors are
+#: `model.language_model.embed_tokens.weight` and
+#: `model.language_model.norm.weight`. Two of three names did not match, and
+#: the doctor called a healthy model broken.
+#:
+#: Matching on the tail rather than the whole name is what makes this hold for
+#: families nobody has written yet: it is prefix-agnostic, which is exactly
+#: what the engines already are. `qwen38.c` probes
+#: `model.language_model.embed_tokens.weight` and falls back to
+#: `model.embed_tokens.weight`; every engine discovers its prefix at load time.
+#: The doctor was the one place that assumed the prefix was a constant.
+CORE_TENSOR_ROLES = (
+    ("token embedding", _is_embedding),
+    ("final norm", _is_final_norm),
+    ("output head", _is_output_head),
 )
+
+
+def missing_core_roles(tensor_names, config=None):
+    """Which core roles no tensor fills. Empty means the model is complete.
+
+    `tie_word_embeddings` makes the output head legitimately absent: the
+    embedding matrix is reused as the head, and there is no `lm_head.weight`
+    to find. Requiring one anyway would trade this bug for the same bug on a
+    different checkpoint.
+    """
+    tied = bool((config or {}).get("tie_word_embeddings"))
+    missing = []
+    for role, matches in CORE_TENSOR_ROLES:
+        if any(matches(name) for name in tensor_names):
+            continue
+        if role == "output head" and tied:
+            continue
+        missing.append(role)
+    return missing
 
 
 def _check(identifier, status, summary, **details):
@@ -281,16 +336,28 @@ def deep_container_report(model, mirror_dir=None):
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             index = {"status": "fail", "summary": f"model index is invalid: {error}"}
 
-    missing_core = [name for name in REQUIRED_CORE_TENSORS if name not in tensor_sources]
+    # Read here rather than take it as an argument: the signature is used by
+    # callers and tests, and the only thing needed is one optional flag.
+    core_config = {}
+    try:
+        with (model / "config.json").open("rb") as stream:
+            loaded = json.loads(stream.read(MODEL_INDEX_MAX_BYTES))
+        if isinstance(loaded, dict):
+            core_config = loaded
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        pass                      # no config is already its own failed check
+    missing_core = missing_core_roles(tensor_sources, core_config)
     required = {
         "status": "fail" if missing_core else "pass",
         "summary": (
-            f"{len(missing_core)} required core tensor(s) are missing"
+            # Name the roles, not a count. "2 required core tensor(s) are
+            # missing" sent someone to re-download 195 GB twice before asking.
+            "no tensor fills these core roles: " + ", ".join(missing_core)
             if missing_core else "required core tensors are present"
         ),
         "details": {
-            "required_tensors": len(REQUIRED_CORE_TENSORS),
-            "missing_tensors": missing_core,
+            "required_roles": [role for role, _ in CORE_TENSOR_ROLES],
+            "missing_roles": missing_core,
         },
     }
 

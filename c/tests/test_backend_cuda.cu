@@ -398,6 +398,11 @@ int main(int argc, char **argv) {
     }
     setenv("COLI_CUDA_TC_INT4","1",1);
     setenv("COLI_CUDA_TC_MIN_ROWS","1",1);
+    /* #1499: poison the destination first. The device buffer this call writes
+     * still held scalar4 from the call above, so an EMPTY tensor-core kernel
+     * (rocWMMA, or a card below sm_75 with the body compiled out) left it
+     * untouched and the comparison below passed against itself. */
+    for(int i=0;i<64;i++)tensor4[i]=-12345.f;
     if(!coli_cuda_expert_group(gg4,ug4,dg4,group_rows,2,tensor4,gx4)||
        !relative_rms(tensor4,scalar4,64,0.30f))return 1;
     if(!coli_cuda_expert_group_pinned(gg4,ug4,dg4,group_rows,2,pinned4,gx4,1)||

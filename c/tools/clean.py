@@ -33,6 +33,7 @@ FILES = [
     # hipcc emits an import library, export file and PDB alongside the DLL.
     "coli_hip.dll", "coli_hip.lib", "coli_hip.exp", "coli_hip.pdb",
     "deepseek_v4", "deepseek_v4.exe",
+    "deepseek_v41", "deepseek_v41.exe",
     "native_quant.o", "native_quant_parallel.o", "native_quant_dual.o",
     "native_quant_batch_avx512.o", "native_quant_fp4_rows16.o",
 ]
