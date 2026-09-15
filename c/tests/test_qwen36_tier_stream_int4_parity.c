@@ -1,15 +1,15 @@
 /* Real-GPU parity for the int4-gs64 streaming tier (the glm53 path).
  *
  * The fake-backend tests prove the tier's bookkeeping -- staging order, budget
- * neutrality, swap safety. They cannot prove the numbers: the corruption the
- * glm53 acceptance run saw (plausible-looking word fragments in
- * reasoning_content with the tier on, clean output with COLI_CUDA=0) lives
- * somewhere between the XOR-0x88 staging, the upload, offset_to_signed_s4 and
- * the g4 group kernels -- all of which the fake backend replaces with a memcpy.
- * This test runs one expert's six pieces through the engine's own CPU
- * reference (matmul_i4_grouped + the clamped SwiGLU glm53 uses) and through
- * the tier's full note -> upload -> issue -> take round trip on a real device,
- * at glm53-flash geometry, and compares. */
+ * neutrality, swap safety. They cannot prove the numbers: glm53 packs its RAM
+ * nibbles offset-binary (matmul_i4_grouped decodes nibble-8), and a tier that
+ * stages two's-complement (the XOR-0x88 path qwen36's containers need) makes
+ * the upload's offset_to_signed_s4 conversion double-flip every sign bit --
+ * garbage the fake backend's plain memcpy can never see. This test runs one
+ * expert's six pieces through the engine's own CPU reference
+ * (matmul_i4_grouped + the clamped SwiGLU glm53 uses) and through the tier's
+ * full note -> upload -> issue -> take round trip on a real device, at
+ * glm53-flash geometry, and compares. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

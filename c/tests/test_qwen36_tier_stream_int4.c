@@ -112,7 +112,7 @@ int main(void) {
     check(fake_uploads == 3 && last_fmt == 4, "three grouped int4 matrices uploaded");
     int intact = captured_len[0] == MB;
     for (size_t i = 0; intact && i < MB; i++)
-        intact = captured[0][i] == (unsigned char)(original[i] ^ 0x88);
+        intact = captured[0][i] == original[i];
     check(intact, "upload owns the packed bytes before slot reuse");
     int all_pieces = 1;
     const size_t nsc[3] = { SCGU, SCGU, SCD };
@@ -121,7 +121,7 @@ int main(void) {
         all_pieces &= captured_len[p] == MB;
         all_pieces &= captured_scale_count[p] == nsc[p];
         for (size_t i = 0; all_pieces && i < MB; i++)
-            all_pieces &= captured[p][i] == (unsigned char)(original[(size_t)p * MB + i] ^ 0x88);
+            all_pieces &= captured[p][i] == original[(size_t)p * MB + i];
         for (size_t i = 0; all_pieces && i < nsc[p]; i++)
             all_pieces &= captured_scales[p][i] == original_scales[scoff[p] + i];
     }

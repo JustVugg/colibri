@@ -73,13 +73,24 @@ static struct {
 static QSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; }
 static int home(int eid){ return eid % G.ndev; }
 
-/* Staging: packed int4 (g|u|d) two's-complement -> offset-binary (XOR 0x88,
- * the upload format of backend_cuda fmt=2) + copy the scales (gs|us|ds). */
+/* Set by qt_init_stream_int4, read by stage(): the stream tier's caller
+ * (glm53) packs its RAM nibbles offset-binary already — the exact layout
+ * coli_cuda_tensor_upload_g converts (offset_to_signed_s4, XOR 0x88) before
+ * the kernels sign-decode. qwen36's warmstart tier instead feeds
+ * two's-complement container bytes, which DO need the XOR to reach the
+ * upload format. */
+static int G_int4_stream;
+
+/* Staging: copy the packed int4 (g|u|d) bytes and the scales (gs|us|ds).
+ * Two's-complement RAM (qwen36 int4 containers) is XORed into the
+ * offset-binary upload format of backend_cuda fmt=2/4; offset-binary RAM
+ * (glm53 stream, whose CPU matmul_i4_grouped decodes nibble-8) must pass
+ * verbatim or the upload's own conversion double-flips the sign bits. */
 static void stage(uint8_t *dw, float *dsc,
                   const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
                   const float *gs,const float *us,const float *ds){
     size_t mb = (size_t)G.D*G.Ih/(G.wfmt==4?2:1);
-    if(G.wfmt==1 || G.wfmt==8){
+    if(G.wfmt==1 || G.wfmt==8 || G_int4_stream){
         /* int8: il formato del backend e' gia' quello in RAM, si copia e basta.
          * Niente XOR: quello serve a portare i nibble int4 da complemento a due
          * a binario sfalsato, e su byte interi sarebbe corruzione. */
@@ -462,7 +473,7 @@ static void auto_place(int nl, int ne, int topk, const size_t *capacity, const u
  * promotion can therefore only happen when the bytes pass by -- the LFRU
  * decision moves from the periodic tick into qt_note, which asks: is this
  * expert, now in hand, hotter than the coldest resident on its device? */
-static int G_fp8_stream, G_int4_stream;
+static int G_fp8_stream;   /* G_int4_stream declared above stage() */
 static float G_stream_swiglu_limit;
 static const float *G_fp8_lut;
 
