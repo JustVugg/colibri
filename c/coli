@@ -430,6 +430,14 @@ def env_for_engine(a, arch, plan=None):
     env = os.environ.copy()
     env.pop(_PROFILE_CAP_ENV,None)
     env.pop(_PLAN_CAP_ENV,None)
+    # Every engine resolves its weights from SNAP (the gateway sets it at
+    # spawn in openai_server.py; env_for() sets it for GLM). This path never
+    # did, so `coli run` on any non-GLM family died in the engine's "started
+    # without a model" exit. The explicit --model always wins over a stale
+    # exported SNAP. getattr: tests build partial Namespaces (see the note
+    # at the sibling getattr call below).
+    if getattr(a,"model",None):
+        env["SNAP"] = a.model
     family=family_by_id(arch)
     if getattr(a,"ram",0): explicit_env.add("RAM_GB")
     # OMP_NUM_THREADS for the sister engines that do not size their own team.

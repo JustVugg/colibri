@@ -106,8 +106,29 @@ class V4CliTest(unittest.TestCase):
             self.assertTrue(captured["text"])
             self.assertEqual(captured["env"]["CHAT"], "1")
             self.assertEqual(captured["env"]["MAX_NEW"], "32")
+            # The engine resolves its weights from SNAP; without it the run
+            # dies in the engine's "started without a model" exit.
+            self.assertEqual(captured["env"]["SNAP"], str(root))
         finally:
             directory.cleanup()
+
+    def test_env_for_engine_forwards_model_as_snap(self):
+        """env_for_engine must carry --model as SNAP: every non-GLM engine
+        getenv()s it, and the gateway path (openai_server.py) is the only
+        other writer — direct launches (run/bench/chat-spawn) had none."""
+        args = argparse.Namespace(model="/models/olmoe-int8", ngen=8,
+                                  temp=None, ram=0, ctx=0)
+        env = self.cli.env_for_engine(args, "olmoe")
+        self.assertEqual(env["SNAP"], "/models/olmoe-int8")
+
+    def test_explicit_model_wins_over_exported_snap(self):
+        """A stale exported SNAP must not hijack a run aimed at another
+        model directory."""
+        args = argparse.Namespace(model="/models/olmoe-int8", ngen=8,
+                                  temp=None, ram=0, ctx=0)
+        with mock.patch.dict(os.environ, {"SNAP": "/models/stale"}):
+            env = self.cli.env_for_engine(args, "olmoe")
+        self.assertEqual(env["SNAP"], "/models/olmoe-int8")
 
     def test_v4_engine_environment_forwards_ram_and_context(self):
         args = argparse.Namespace(ngen=8, temp=0.0, ram=64, ctx=4096)
