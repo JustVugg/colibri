@@ -22,6 +22,11 @@ Design notes (must stay in sync with c/qwen36.c):
     and weight keys are prefixed `model.language_model.`. Both are handled transparently.
   * The fused expert tensors `mlp.experts.gate_up_proj` / `down_proj` are split per expert
     into the merged_weight layout (gate_up = [gate; up] along dim 0).
+  * Every tensor name is classified against tools/qwen36_tensor_kinds.py before the first
+    shard is read. The `mtp.*` head and the `visual.*` tower are skipped ON PURPOSE and
+    reported with a count; a name the contract does not know stops the conversion. A
+    converter that silently drops what it does not recognise produces a container that
+    loads and is quietly missing a tensor (GLM-5.3 precedent, #1045).
   * Head dims are derived from the actual weight shapes (authoritative), not from config
     heuristics, because Qwen3.6's qk split (q_head_dim=512, k/v_head_dim=256, rope over
     256 dims) does not match naive head_dim=hidden/n_heads.
@@ -188,19 +193,11 @@ def _selftest():
     sys.exit(0 if ok else 1)
 
 
-def resolve_prefix(keys):
-    """Return the layer-weight prefix so that `prefix + "layers.{i}."` matches the
-    actual weight keys.  Handles the common layouts:
-      * 'model.'                for `model.layers.0...`            (standard HF Qwen3 MoE)
-      * 'model.language_model.' for `model.language_model.layers.0...` (some VL checkpoints)
-    """
-    for k in keys:
-        if k.startswith("model.language_model.layers."):
-            return "model.language_model."
-    for k in keys:
-        if k.startswith("model.layers."):
-            return "model."
-    return ""
+# Tensor-name contract: classify() places every name or raises. Kept torch-free
+# in its own module so the test that pins it to the real checkpoint indexes
+# runs wherever the registry tests run.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from qwen36_tensor_kinds import classify, resolve_prefix, skip_reason, UnknownTensor  # noqa: E402
 
 
 def main():
@@ -302,13 +299,46 @@ def main():
                 for k in f.keys():
                     wm[k] = sh.name
 
-    # ---- detect prefix + layer count from weights ----
-    sample_layer_keys = [k for k in wm if ".layers.0." in k or ".layers.0." in k]
-    prefix = resolve_prefix(wm.keys())
-    # find max layer index present
+    # ---- classify every tensor name before touching a shard ----
+    # 5 KB of index settles whether the next hundreds of GB make sense: an
+    # unknown name stops here, a skipped subtree is counted and named.
     import re
-    layer_ids = set(int(m) for m in re.findall(r"\." + re.escape(prefix) + r"layers\.(\d+)\.", " ".join(wm.keys())))
+    prefix = resolve_prefix(wm.keys())
+    layer_map = {}      # layer index -> [keys]
+    global_map = {}     # kind -> key
+    skipped = {}        # group -> count
+    unknown = []
+    for k in wm:
+        try:
+            placed = classify(k, prefix)
+        except UnknownTensor:
+            unknown.append(k)
+            continue
+        if placed[0] == "layer":
+            layer_map.setdefault(placed[1], []).append(k)
+        elif placed[0] == "global":
+            global_map[placed[1]] = k
+        else:
+            skipped[placed[1]] = skipped.get(placed[1], 0) + 1
+    if unknown:
+        shown = "\n  ".join(unknown[:12])
+        more = f"\n  ... and {len(unknown) - 12} more" if len(unknown) > 12 else ""
+        sys.exit(f"ERROR: {len(unknown)} tensor name(s) this converter cannot place "
+                 f"(tools/qwen36_tensor_kinds.py):\n  {shown}{more}\n"
+                 "Refusing to convert: a container missing or blindly carrying a tensor "
+                 "loads and answers wrongly. Extend the contract if the name is legitimate.")
+    for group, count in sorted(skipped.items()):
+        declared = ""
+        if group == "mtp":
+            declared = f", config mtp_num_hidden_layers={mcfg.get('mtp_num_hidden_layers')!r}"
+        print(f"skipping {count} `{group}.*` tensor(s): {skip_reason(group)}{declared}")
+    if mcfg.get("mtp_num_hidden_layers") and "mtp" not in skipped:
+        print(f"note: config declares mtp_num_hidden_layers={mcfg['mtp_num_hidden_layers']} "
+              "but the checkpoint carries no mtp.* tensors")
+    layer_ids = set(layer_map)
     n_layers_weight = (max(layer_ids) + 1) if layer_ids else mcfg.get("num_hidden_layers", 0)
+    print(f"tensor kinds: {sum(len(v) for v in layer_map.values())} in {len(layer_ids)} layers, "
+          f"{len(global_map)} globals, prefix {prefix!r}")
 
     layer_types = mcfg.get("layer_types")
     if layer_types is None:
@@ -327,16 +357,18 @@ def main():
     shard_layers = {}     # shard name -> set of layer ids needing it (-1 = globals)
 
     def layer_keys(i):
-        p = f"{prefix}layers.{i}."
-        return [k for k in wm if k.startswith(p)]
-
+        return layer_map.get(i, [])
     for i in all_idx:
         for k in layer_keys(i):
             shard_layers.setdefault(wm[k], set()).add(i)
-    globals_keys = [k for k in (f"{prefix}embed_tokens.weight",
-                                "lm_head.weight", f"{prefix}lm_head.weight",
-                                f"{prefix}norm.weight")
-                    if k in wm]
+    missing_layers = [i for i in all_idx if i not in layer_map]
+    if missing_layers:
+        sys.exit(f"ERROR: config declares {len(all_idx)} layers but the checkpoint has no "
+                 f"tensors for layer(s) {missing_layers[:8]}")
+    globals_keys = [global_map[kind] for kind in ("embed_tokens.weight", "lm_head.weight",
+                                                  "norm.weight") if kind in global_map]
+    if len(globals_keys) != 3:
+        sys.exit(f"ERROR: expected embed_tokens, lm_head and final norm, found {sorted(global_map)}")
     for k in globals_keys:
         shard_layers.setdefault(wm[k], set()).add(-1)
 
@@ -439,7 +471,8 @@ def main():
         # ---- MoE experts: handle BOTH layouts the source may use ----
         #  (a) FUSED:  model.layers.i.mlp.experts.gate_up_proj [E,2*inter,H]
         #              + model.layers.i.mlp.experts.down_proj    [E,H,inter]
-        #  (b) SEPARATE (standard HF Qwen3 MoE, incl. the real 35B):
+        #  (b) SEPARATE (transformers save_pretrained on the text model, e.g. the tiny fixture;
+        #      the real 35B and 2.4T checkpoints both ship the FUSED layout):
         #              model.layers.i.mlp.experts.{e}.gate_proj [inter,H]
         #              model.layers.i.mlp.experts.{e}.up_proj   [inter,H]
         #              model.layers.i.mlp.experts.{e}.down_proj [H,inter]
