@@ -1739,6 +1739,13 @@ tests/test_qwen36_tier_fp8$(EXE): tests/test_qwen36_tier_fp8.c tests/qwen36_fake
 tests/test_qwen36_tier_stream_int4$(EXE): tests/test_qwen36_tier_stream_int4.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# Real-GPU parity for the streaming int4 tier: same expert bytes through the
+# CPU reference (quant.h) and the tier's upload->issue->take round trip.
+# Builds everywhere (skips at runtime without a device); meaningful only with
+# CUDA=1, where it links backend_cuda.o through $(CUDA_OBJ)/$(QWEN36_LDFLAGS).
+tests/test_qwen36_tier_stream_int4_parity$(EXE): tests/test_qwen36_tier_stream_int4_parity.c qwen36_tier.c qwen36_tier.h backend_cuda.h quant.h compat.h $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< -o $@ $(QWEN36_LDFLAGS)
+
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c tests/qwen36_fake_cuda.h qwen36.c qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
