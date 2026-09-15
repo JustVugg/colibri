@@ -445,6 +445,28 @@ class TestRansRepack(unittest.TestCase):
             self.assertEqual(r.returncode, 1, msg=f"{label}: {r.stdout}")
             self.assertIn("REFUSE", r.stdout, msg=f"{label}: no REFUSE line")
 
+    def test_verifier_survives_a_non_utf8_stdout(self):
+        """On a Korean or Japanese Windows (cp949, cp932) a redirected stdout
+        is encoded in a code page with no U+2014, and the verifier's own
+        `[note] ... no repack-manifest.json — ...` line raised
+        UnicodeEncodeError. Its E_INTERNAL fallback printed the same text and
+        raised again, so a valid shard without a manifest came back as exit 1,
+        a traceback and no verdict. PYTHONIOENCODING stands in for that code
+        page, so this runs the same on every platform, and the output is read
+        back in that code page, the way such a caller would read it."""
+        shard = self.repack(self.root / "codepage")[0]
+        (shard.parent / "repack-manifest.json").unlink()
+        env = dict(os.environ, PYTHONIOENCODING="cp949")
+        r = subprocess.run([sys.executable, str(TOOLS / "rans_verify.py"),
+                            str(shard)], capture_output=True, env=env)
+        out = r.stdout.decode("cp949")
+        err = r.stderr.decode("cp949", "backslashreplace")
+        self.assertNotIn("Traceback", err, msg=err)
+        self.assertEqual(r.returncode, 0, msg=out + err)
+        self.assertIn("no repack-manifest.json", out)
+        self.assertIn("whole-artifact digest check skipped", out)
+        self.assertIn("RESULT: TRUST", out)
+
     def test_partial_output_refusal(self):
         """An outdir already holding repack output is refused (crash
         evidence: an interrupted set must not be papered over); --force

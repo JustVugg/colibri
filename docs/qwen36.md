@@ -66,7 +66,43 @@ Both optimizations are bit-exact and on by default.  For controlled A/Bs,
 Requirements: ~30 GB RAM for comfortable expert caching and NVMe storage for
 the container. The default build is CPU-only; `make -C c qwen36 CUDA=1` adds
 the optional CUDA VRAM expert tier documented in
-[`qwen36-cuda-tier.md`](qwen36-cuda-tier.md).
+[`qwen36-cuda-tier.md`](qwen36-cuda-tier.md). The same tier builds for AMD
+through ROCm with `make -C c qwen36 HIP=1 HIP_ARCH=<gfx>` (for example
+`HIP_ARCH=gfx1151`, with `ROCM_HOME` and `HIPCC` pointing at the toolchain):
+measured on a Ryzen AI MAX+ 395, output bit-identical to the CPU path and 2.4x
+faster than CPU-only (#1502).
+
+## The expert kernel
+
+Routed experts run through `c/expert_ffn.h`, a header shared with the other
+MoE engines rather than a set of GEMVs of this engine's own. Three things
+changed with it, measured on the real gs64 container at full residency on an
+8-core AVX-512 box (61 GB, DDR5-5600, 58 GB/s DRAM read):
+
+- **The int4 stays int4.** The engine used to unpack every expert to int8 at
+  load; the kernel keeps the container's nibbles, repacked once into a planar
+  layout where `and 0x0F` yields 32 elements in order and `srli 4` the other
+  32, so a block costs no unpack instruction. Half the bytes per token and half
+  the expert-cache RSS: peak RSS at cap 256 went from 25 GB to 15 GB.
+- **A layer is a unit of work.** gate+up share one pass over the activation,
+  and threads split (expert, row-chunk) items: two OpenMP regions per layer
+  instead of 3 x top-k. A prompt row routed to an expert another row already
+  used reads that expert from cache, not DRAM.
+- **Same tokens.** Activations stay f32 (the kernel also has an int8
+  activation mode, `mode 1`, not wired in here: same policy as `IDOT`). The
+  only difference from the old path is the accumulation order inside a dot;
+  a 1024-token greedy decode on the real container is byte-identical, and CI
+  pins old vs new on a tiny int4 fixture at caps 1, 2, 8 and 16.
+
+Over a 1024-token greedy decode at cap 256 (same prompt, byte-identical
+text): 12.8 -> 15.7 tok/s, MoE per token 34 -> 20 ms on average and 30 -> 17
+ms in the last windows, peak RSS 29 -> 17 GB. Of the 20 ms, 11 are the kernel
+(the DRAM floor for the int4 bytes is 9) and 6 are the residual misses of a
+97.6% hit rate, fetched one at a time; that fetch is the next thing to
+overlap, not this kernel. `tests/test_expert_ffn` holds the numerics.
+`QWEN_EXPERT_KERNEL=0` restores the int8 path for A/Bs. The CUDA expert tier
+keeps its own path: it uploads the pair-layout int4 and computes misses from
+the int8 copy.
 
 ## Which container?
 
@@ -80,9 +116,19 @@ same or slightly better.
 
 ## `--ram` is not honoured by this engine
 
-`coli --ram` sizes the RAM budget for engines that stream experts from disk on
-demand. qwen36 does not: the CUDA expert tier it is built for (#713) requires
-full RAM residency of the expert set, so the budget is decided by the container,
-not by a flag. The engine reads no `RAM_GB`, and passing `--ram` changes
-nothing. Said here rather than silently ignored, because a flag that appears to
-work and does not is worse than one that is documented as unsupported.
+The engine reads no `RAM_GB`: `grep -c RAM_GB c/qwen36.c` returns 0, and passing
+`--ram` changes nothing. Said here rather than left to be discovered, because a
+flag that appears to work and does not is worse than one documented as
+unsupported.
+
+What sizes the expert cache instead depends on where the experts live. On the
+CPU path they stream from the container on demand, through the LRU described at
+the top of this page, and `--cap N` is the direct lever on how many slots per
+layer that cache holds. On the CUDA expert tier (#713) the hot set is resident
+in VRAM and `CUDA_EXPERT_GB` decides its size. Neither path consults the RAM
+budget.
+
+(Earlier revisions of this section said qwen36 does not stream experts at all,
+which contradicted the description at the top of the page and was wrong for the
+CPU path: `c/qwen36.c` reads experts on demand with `pread` plus
+`posix_fadvise(DONTNEED)` and caches them LRU. Reported in #1444.)

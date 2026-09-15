@@ -46,7 +46,7 @@ jobs:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: UCRT64
           update: false
@@ -114,6 +114,19 @@ jobs:
         run: |
           python c/tools/make_glm53_tiny.py --output /tmp/glm53_tiny
           python c/tools/check_glm53_checkpoint.py --model /tmp/glm53_tiny
+      # The dashboard's Brain and Profile tabs read EMAP/HITS/PROF from the
+      # engine's stdout. GLM-5.3-Flash emitted none of them and both tabs were
+      # blank (Discord, 2026-09-06). This drives the built engine through
+      # `coli serve` and the /experts and /profile endpoints on a streaming
+      # fixture, the same path the dashboard takes, so a family that stops
+      # emitting a line fails here and not on a user's screen.
+      - name: Build glm53 and check the dashboard contract
+        run: |
+          make -C c glm53
+          python c/tools/make_glm53_multimodal_tiny.py --output /tmp/glm53_mm
+          python c/tools/make_glm53_streaming_pair.py --fixture /tmp/glm53_mm --output /tmp/glm53_stream
+          python c/tools/make_edge_tiny_tokenizer.py --vocab-size 281 /tmp/glm53_stream-i4
+          cd c && COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_dashboard
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to

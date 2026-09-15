@@ -2726,8 +2726,6 @@ int coli_v4_attention_window_batch_ref(
 
 #ifdef COLI_V4_GPU_TIER
     int gpu_batch = coli_v4_gpu_attn_batch_wanted() && batch > 1;
-#else
-    int gpu_batch = 0;
 #endif
     /* Whole-chunk GPU projections for the compressor and the indexer's
      * compressor; the per-token state advance stays on the CPU. NULL means
@@ -3759,7 +3757,9 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     const uint16_t *raw_weights = value(
         state->weights, "attn.indexer.weights_proj.weight", NULL);
     size_t qn = (size_t)heads * dimension;
+#ifdef COLI_V4_GPU_TIER
     size_t cols = (size_t)wq.columns;
+#endif
 
 #define ALIGN32(n) (((size_t)(n) + 31) & ~(size_t)31)
     size_t sz_queries = ALIGN32((size_t)batch * qn * sizeof(float));
@@ -3769,8 +3769,6 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     size_t sz_stoken = ALIGN32((size_t)need * sizeof(int));
     size_t sz_scores = ALIGN32((size_t)need * max_count * sizeof(float));
     size_t sz_ranked = ALIGN32((size_t)max_count * sizeof(IndexScore));
-    size_t sz_scales = ALIGN32((size_t)dimension / 32);
-    size_t sz_qdq = ALIGN32((size_t)dimension * sizeof(float));
 #ifdef COLI_V4_GPU_TIER
     size_t sz_xq = (need <= 1024) ? ALIGN32((size_t)need * cols * sizeof(float)) : 0;
     size_t sz_yq = (need <= 1024) ? ALIGN32((size_t)need * qn * sizeof(float)) : 0;
@@ -3780,7 +3778,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
 #endif
 
     size_t total_scratch = sz_queries + sz_sq + sz_head_weights + sz_scounts + sz_stoken +
-                           sz_scores + sz_ranked + sz_scales + sz_qdq + sz_xq + sz_yq + sz_xs + 256;
+                           sz_scores + sz_ranked + sz_xq + sz_yq + sz_xs + 256;
 
     char *scratch_ptr = (char *)indexer_scratch_alloc(state, total_scratch);
     if (!scratch_ptr || !raw_weights) {
@@ -3797,8 +3795,6 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     int *stoken = (int *)scratch_ptr; scratch_ptr += sz_stoken;
     float *scores = (float *)scratch_ptr; scratch_ptr += sz_scores;
     IndexScore *ranked = (IndexScore *)scratch_ptr; scratch_ptr += sz_ranked;
-    uint8_t *scales = (uint8_t *)scratch_ptr; scratch_ptr += sz_scales;
-    float *qdq = (float *)scratch_ptr; scratch_ptr += sz_qdq;
     int result = 0;
 
     /* Query projection. Preferred: host fp8 activation quantization (the
@@ -4169,6 +4165,30 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
 #endif /* COLI_V4_UNIT_SPARSE_ATTENTION */
 
 #ifdef COLI_V4_UNIT_BLOCK_HYBRID
+
+/* Why the MoE step failed, for the block to put in its error string.
+ *
+ * moe_token_pipeline and v4_moe_batch_union can fail in some thirty places
+ * -- an expert that would not read, an upload that would not land, a GPU
+ * expert group that refused, a routing table missing, a plain malloc -- and
+ * every one of them used to return a bare -1. The block then reported
+ * "hybrid batched block failed in MoE", which is true and useless: #1464
+ * spent a day trying flags against a message that could not tell an out-of-
+ * VRAM card from a bad read over /mnt/c. The reason is thread-local because
+ * the pipeline may be driven from more than one thread; it is cleared on
+ * entry so a stale one cannot outlive the call that set it. */
+#include <stdarg.h>   /* this unit has no other variadic helper; set_error lives in another */
+#include <stdio.h>
+static __thread char v4_moe_reason[192];
+static void moe_reason_clear(void) { v4_moe_reason[0] = 0; }
+static const char *moe_reason(void) { return v4_moe_reason; }
+static int moe_fail(const char *format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(v4_moe_reason, sizeof v4_moe_reason, format, arguments);
+    va_end(arguments);
+    return -1;
+}
 /* ######## deepseek_v4_block_hybrid.c ######## */
 /* Accepted decode pipeline plus batched causal attention for prompt prefill. */
 /* ---- begin include deepseek_v4_block_pipeline.c ---- */
@@ -4413,7 +4433,11 @@ static int block_token_impl(float *output_hc,
 
     free(comb); free(post); free(branch); free(normalized);
     free(reduced); free(state); free(residual);
-    return result ? set_error(error, error_size, "block computation failed") : 0;
+    if (!result) return 0;
+    if (moe_reason()[0])
+        return set_error(error, error_size, "block computation failed in MoE: %s",
+                         moe_reason());
+    return set_error(error, error_size, "block computation failed");
 }
 
 int coli_v4_block_token_ref(float *output_hc,
@@ -4869,7 +4893,8 @@ static int moe_token_pipeline(float *output,
         !expert_output || !shared_output) {
         free(shared_output); free(expert_output); free(expert_weights);
         free(expert_ids); free(indices); free(route_weights); free(gate);
-        return -1;
+        return moe_fail("layer %d: out of memory for the routing scratch",
+                        weights->plan.layer);
     }
 #ifdef COLI_V4_DISABLE_BF16_ROUTE
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
@@ -4883,8 +4908,13 @@ static int moe_token_pipeline(float *output,
 #endif
     const int64_t *table = value(weights, "ffn.gate.tid2eid", NULL);
     const float *bias = value(weights, "ffn.gate.bias", NULL);
+    moe_reason_clear();
     int result = token < 0 || token >= config->vocab_size;
-    if (!result && weights->plan.uses_hash_router && !table) result = -1;
+    if (result) moe_fail("layer %d: token %d is outside the vocabulary of %d",
+                         weights->plan.layer, token, config->vocab_size);
+    if (!result && weights->plan.uses_hash_router && !table)
+        result = moe_fail("layer %d: the hash router table ffn.gate.tid2eid is missing",
+                          weights->plan.layer);
     if (!result && weights->plan.uses_hash_router)
         for (int i = 0; i < topk; i++)
             indices[i] = (int)table[(size_t)token * topk + i];
@@ -4920,7 +4950,9 @@ static int moe_token_pipeline(float *output,
             }
         }
     }
-    if (!result && selected != topk) result = -1;
+    if (!result && selected != topk)
+        result = moe_fail("layer %d: routing selected %d experts, wanted %d",
+                          weights->plan.layer, selected, topk);
 
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH
     if (!result && expert_prefetch_enabled() && store->ops->prefetch) {
@@ -4947,7 +4979,8 @@ static int moe_token_pipeline(float *output,
             jobs[i].key = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
             jobs[i].result = -1;
             if (profiled_expert_load_start(&loaders[i], &jobs[i]) != 0) {
-                result = -1;
+                result = moe_fail("layer %d: could not start reading expert %d",
+                                  weights->plan.layer, expert_ids[i]);
                 break;
             }
             loader_active[i] = 1;
@@ -4962,7 +4995,8 @@ static int moe_token_pipeline(float *output,
         job.key = (ColiExpertKey){weights->plan.layer, expert_ids[0]};
         job.result = -1;
         if (profiled_expert_load_start(&loader, &job) != 0)
-            result = -1;
+            result = moe_fail("layer %d: could not start reading expert %d",
+                              weights->plan.layer, expert_ids[0]);
         else
             loader_active = 1;
     }
@@ -4970,26 +5004,39 @@ static int moe_token_pipeline(float *output,
     ColiTensorView w1, w2, w3;
     if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
                     fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
-                    fp8_view(&w3, weights, "ffn.shared_experts.w3"))) result = -1;
+                    fp8_view(&w3, weights, "ffn.shared_experts.w3")))
+        result = moe_fail("layer %d: the shared expert's fp8 tensors are missing",
+                          weights->plan.layer);
     if (!result) result = coli_v4_shared_expert_forward_ref(
         shared_output, &w1, &w2, &w3, input, config->swiglu_limit);
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
     ColiExpertView *views = malloc((size_t)selected * sizeof(*views));
+#ifdef COLI_V4_GPU_TIER
     int gpu_compute = 0;
-    if (!views) result = -1;
+#endif
+    if (!views) result = moe_fail("layer %d: out of memory for %d expert views",
+                                  weights->plan.layer, selected);
     if (!result) {
         memset(views, 0, (size_t)selected * sizeof(*views));
+#ifdef COLI_V4_GPU_TIER
         gpu_compute = 1;
+#endif
         for (int current = 0; !result && current < selected; current++) {
             int slot = current % dual_loader_lanes();
             if (!loader_active[slot] ||
                 profiled_expert_load_finish(&loaders[slot]) != 0) {
-                result = -1; break;
+                result = moe_fail("layer %d: the read of expert %d did not complete",
+                                  weights->plan.layer, jobs[slot].key.expert);
+                break;
             }
             loader_active[slot] = 0;
-            if (jobs[slot].result) { result = -1; break; }
+            if (jobs[slot].result) {
+                result = moe_fail("layer %d: reading expert %d from the expert store failed",
+                                  weights->plan.layer, jobs[slot].key.expert);
+                break;
+            }
             views[current] = jobs[slot].view;
 #ifdef COLI_V4_GPU_TIER
             if (store->gpu) {
@@ -5001,9 +5048,11 @@ static int moe_token_pipeline(float *output,
                     coli_v4_gpu_expert_attach(store, &views[current]);
             }
 #endif
+#ifdef COLI_V4_GPU_TIER
             if (!views[current].gate.gpu || !views[current].up.gpu ||
                 !views[current].down.gpu)
                 gpu_compute = 0;
+#endif
 
             int next = current + dual_loader_lanes();
             if (next < selected) {
@@ -5014,7 +5063,8 @@ static int moe_token_pipeline(float *output,
                 jobs[slot].result = -1;
                 if (profiled_expert_load_start(&loaders[slot],
                                                &jobs[slot]) != 0)
-                    result = -1;
+                    result = moe_fail("layer %d: could not start reading expert %d",
+                                      weights->plan.layer, expert_ids[next]);
                 else
                     loader_active[slot] = 1;
             }
@@ -5093,7 +5143,9 @@ static int moe_token_pipeline(float *output,
         void **gates = malloc((size_t)selected * sizeof(*gates));
         void **ups = malloc((size_t)selected * sizeof(*ups));
         void **downs = malloc((size_t)selected * sizeof(*downs));
-        if (!gates || !ups || !downs) result = -1;
+        if (!gates || !ups || !downs)
+            result = moe_fail("layer %d: out of memory for the GPU expert group of %d",
+                              weights->plan.layer, selected);
         if (!result) {
             for (int i = 0; i < selected; i++) {
                 gates[i] = views[i].gate.gpu;
@@ -5117,7 +5169,11 @@ static int moe_token_pipeline(float *output,
                     float *y, const float *x);
                 if (!dsv4_cuda_expert_group(gates, ups, downs,
                     expert_weights, selected, config->swiglu_limit,
-                    expert_output, input)) result = -1;
+                    expert_output, input))
+                    result = moe_fail("layer %d: the GPU expert group of %d experts "
+                                      "refused (a CUDA allocation or launch failed; "
+                                      "check nvidia-smi for free VRAM)",
+                                      weights->plan.layer, selected);
                 if (!result)
                     for (int i = 0; i < d; i++)
                         expert_output[i] += shared_output[i];
@@ -5259,10 +5315,16 @@ static int moe_token_pipeline(float *output,
 #else
     for (int current = 0; current < selected && loader_active; current++) {
         if (profiled_expert_load_finish(&loader) != 0) {
-            result = -1; loader_active = 0; break;
+            result = moe_fail("layer %d: the read of expert %d did not complete",
+                              weights->plan.layer, job.key.expert);
+            loader_active = 0; break;
         }
         loader_active = 0;
-        if (job.result) { result = -1; break; }
+        if (job.result) {
+            result = moe_fail("layer %d: reading expert %d from the expert store failed",
+                              weights->plan.layer, job.key.expert);
+            break;
+        }
         ColiExpertView expert = job.view;
 #ifdef COLI_V4_GPU_TIER
         if (store->gpu) coli_v4_gpu_expert_attach(store, &expert);
@@ -5275,7 +5337,8 @@ static int moe_token_pipeline(float *output,
                                      expert_ids[current + 1]};
             job.result = -1;
             if (profiled_expert_load_start(&loader, &job) != 0)
-                result = -1;
+                result = moe_fail("layer %d: could not start reading expert %d",
+                                  weights->plan.layer, expert_ids[current + 1]);
             else
                 loader_active = 1;
         }
@@ -5371,7 +5434,11 @@ static int block_token_pipeline(float *output_hc,
 #undef DP_MARK
     free(comb); free(post); free(branch); free(normalized);
     free(reduced); free(state); free(residual);
-    return result ? set_error(error, error_size, "block computation failed") : 0;
+    if (!result) return 0;
+    if (moe_reason()[0])
+        return set_error(error, error_size, "block computation failed in MoE: %s",
+                         moe_reason());
+    return set_error(error, error_size, "block computation failed");
 }
 
 int coli_v4_block_token_ref(float *output_hc,
@@ -5541,6 +5608,7 @@ static int v4_moe_batch_union(
     float *outputs, const ColiDeepSeekV4LayerWeights *weights,
     const ColiDeepSeekV4Config *config, ColiExpertStore *store,
     const float *inputs, const int *tokens, int batch) {
+    moe_reason_clear();
     int d = config->hidden_size;
     int n = config->n_routed_experts;
     int topk = config->num_experts_per_tok;
@@ -5575,7 +5643,8 @@ static int v4_moe_batch_union(
         free(keys); free(used); free(expert_items); free(expert_weights);
         free(expert_outputs); free(expert_inputs); free(shared);
         free(indices); free(route_weights); free(gate);
-        return -1;
+        return moe_fail("layer %d: out of memory for the prefill expert union",
+                        weights->plan.layer);
     }
 #ifdef COLI_V4_DISABLE_BF16_ROUTE
     decode_bf16(gate, value(weights, "ffn.gate.weight", NULL), gate_count);
@@ -5608,7 +5677,8 @@ static int v4_moe_batch_union(
                 if (item_indices[rank] >= 0 && item_indices[rank] < n)
                     used[item_indices[rank]] = 1;
                 else
-                    result = -1;
+                    result = moe_fail("layer %d: routing returned an expert outside "
+                                      "the table", weights->plan.layer);
             }
     }
 
@@ -5617,7 +5687,8 @@ static int v4_moe_batch_union(
         (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
          fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
          fp8_view(&w3, weights, "ffn.shared_experts.w3")))
-        result = -1;
+        result = moe_fail("layer %d: the shared expert's fp8 tensors are missing",
+                          weights->plan.layer);
     if (!result && batch > 1 && v4_shared_batch_enabled())
         result = v4_shared_expert_forward_batch_ref(
             shared, &w1, &w2, &w3, inputs, batch, config->swiglu_limit);
@@ -5647,7 +5718,8 @@ static int v4_moe_batch_union(
         jobs[current].key = keys[current];
         jobs[current].result = -1;
         if (profiled_expert_load_start(&loaders[current], &jobs[current]))
-            result = -1;
+            result = moe_fail("layer %d: could not start reading expert %d",
+                              weights->plan.layer, keys[current].expert);
         else
             active[current] = 1;
     }
@@ -5655,7 +5727,8 @@ static int v4_moe_batch_union(
         int slot = current % dual_loader_lanes();
         if (!active[slot] || profiled_expert_load_finish(&loaders[slot]) ||
             jobs[slot].result) {
-            result = -1;
+            result = moe_fail("layer %d: reading expert %d from the expert store failed",
+                              weights->plan.layer, jobs[slot].key.expert);
             break;
         }
         active[slot] = 0;
@@ -5667,7 +5740,8 @@ static int v4_moe_batch_union(
             jobs[slot].key = keys[next];
             jobs[slot].result = -1;
             if (profiled_expert_load_start(&loaders[slot], &jobs[slot]))
-                result = -1;
+                result = moe_fail("layer %d: could not start reading expert %d",
+                                  weights->plan.layer, keys[next].expert);
             else
                 active[slot] = 1;
         }
@@ -5688,7 +5762,8 @@ static int v4_moe_batch_union(
     for (int current = 0; !result && current < key_count; current++) {
         ColiExpertView view;
         if (coli_expert_lookup(store, keys[current], &view)) {
-            result = -1;
+            result = moe_fail("layer %d: expert %d is not in the expert store",
+                              weights->plan.layer, keys[current].expert);
             break;
         }
         result = v4_apply_expert_batch(
@@ -5879,6 +5954,9 @@ int coli_v4_block_window_batch_ref(
     free(normalized); free(states);
     if (!result) return 0;
     if (error && error_size && error[0]) return -1;
+    if (moe_reason()[0])
+        return set_error(error, error_size, "hybrid batched block failed in %s: %s",
+                         phase, moe_reason());
     return set_error(error, error_size, "hybrid batched block failed in %s", phase);
 }
 #endif /* COLI_V4_UNIT_BLOCK_HYBRID */
@@ -11620,10 +11698,33 @@ static float head_bf16_dot(const uint16_t *weight, const float *hidden,
     return sum;
 }
 
+/* PROF phases beyond the expert store (#1491): a turn's /profile used to show
+ * expert disk and expert matmul and a literal zero for everything else, so a
+ * warm decode on a GPU box read as 98% "other". These accumulate the time
+ * spent in the layer blocks (attention, indexer, dense, mixers and the experts
+ * within), the time in the head, and the positions forwarded; v4_serve_one
+ * reports per-turn deltas. Timing only: no numeric path changes. */
+static double g_v4_prof_block_s = 0.0, g_v4_prof_head_s = 0.0;
+static long long g_v4_prof_forwards = 0;
+static double spec_now(void);   /* defined with the speculative-decode helpers below */
+
+static int head_argmax_impl(ColiV4Engine *engine, const float *hidden,
+                            const ColiSafetensorsIndex *index,
+                            const ColiDeepSeekV4Config *config,
+                            int *best_token, float *best_logit);
 static int head_argmax(ColiV4Engine *engine, const float *hidden,
                        const ColiSafetensorsIndex *index,
                        const ColiDeepSeekV4Config *config,
                        int *best_token, float *best_logit) {
+    double t0 = spec_now();
+    int result = head_argmax_impl(engine, hidden, index, config, best_token, best_logit);
+    g_v4_prof_head_s += spec_now() - t0;
+    return result;
+}
+static int head_argmax_impl(ColiV4Engine *engine, const float *hidden,
+                            const ColiSafetensorsIndex *index,
+                            const ColiDeepSeekV4Config *config,
+                            int *best_token, float *best_logit) {
     const ColiSafetensorsTensor *head = coli_st_find(index, "head.weight");
     int d = config->hidden_size, vocab = config->vocab_size;
     if (!head || head->dtype != COLI_ST_BF16 || d < 1 || vocab < 1)
@@ -12030,7 +12131,31 @@ static int v4_prefill_pool_enabled(void) {
     return enabled;
 }
 
+static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
+                        ColiDeepSeekV4WindowAttentionState **attention,
+                        const ColiSafetensorsIndex *index,
+                        const ColiDeepSeekV4Config *config,
+                        ColiExpertStore *experts, const int *tokens,
+                        int start, int batch, int use_prefill_pool,
+                        ColiV4SessionAbortFn should_abort, void *abort_ctx,
+                        char *error, size_t error_size);
 static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
+                        ColiDeepSeekV4WindowAttentionState **attention,
+                        const ColiSafetensorsIndex *index,
+                        const ColiDeepSeekV4Config *config,
+                        ColiExpertStore *experts, const int *tokens,
+                        int start, int batch, int use_prefill_pool,
+                        ColiV4SessionAbortFn should_abort, void *abort_ctx,
+                        char *error, size_t error_size) {
+    double t0 = spec_now();
+    int result = target_batch_impl(engine, state_ptr, next_ptr, attention, index, config,
+                                   experts, tokens, start, batch, use_prefill_pool,
+                                   should_abort, abort_ctx, error, error_size);
+    g_v4_prof_block_s += spec_now() - t0;
+    if (batch > 0) g_v4_prof_forwards += batch;
+    return result;
+}
+static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                         ColiDeepSeekV4WindowAttentionState **attention,
                         const ColiSafetensorsIndex *index,
                         const ColiDeepSeekV4Config *config,
@@ -12120,7 +12245,26 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
     return 0;
 }
 
+static int target_token_impl(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
+                        ColiDeepSeekV4WindowAttentionState **attention,
+                        const ColiSafetensorsIndex *index,
+                        const ColiDeepSeekV4Config *config,
+                        ColiExpertStore *experts, int token, int position,
+                        char *error, size_t error_size);
 static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
+                        ColiDeepSeekV4WindowAttentionState **attention,
+                        const ColiSafetensorsIndex *index,
+                        const ColiDeepSeekV4Config *config,
+                        ColiExpertStore *experts, int token, int position,
+                        char *error, size_t error_size) {
+    double t0 = spec_now();
+    int result = target_token_impl(engine, state_ptr, next_ptr, attention, index, config,
+                                   experts, token, position, error, error_size);
+    g_v4_prof_block_s += spec_now() - t0;
+    g_v4_prof_forwards += 1;
+    return result;
+}
+static int target_token_impl(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                         ColiDeepSeekV4WindowAttentionState **attention,
                         const ColiSafetensorsIndex *index,
                         const ColiDeepSeekV4Config *config,
@@ -13780,15 +13924,23 @@ static void v4_hwinfo_emit(void) {
 }
 
 /* PROF wall_s prompt_tokens completion_tokens expert_disk_s expert_wait_s
- * expert_matmul_s attention_s lm_head_s forwards — disk (I/O) and matmul
- * (expert-forward compute) are the two phases the runtime tracks per turn
- * (#890); the frontend folds the remainder — attention, head, framing — into
- * "other". Before this the matmul field was hardcoded 0 and every turn read as
- * 100% other whenever the model sat warm in page cache. */
+ * expert_matmul_s attention_s lm_head_s forwards. disk (I/O) and matmul come
+ * from the expert store (#890). attention_s is the layer-block time not
+ * attributed to the expert compute: attention, DSA indexer, dense projections
+ * and hyper-connection mixers, plus any expert wait that blocked the block
+ * (disk seconds are summed across loader lanes and can exceed the wall on
+ * their own, so they are reported as they are and not subtracted; clamped at
+ * zero). lm_head_s is the head matmul; forwards the
+ * positions pushed through the blocks (prefill rows, decode tokens, draft
+ * verifies). Before #1491 the last three were literal zeros and a warm decode
+ * on a GPU box read as 98% "other". The frontend still folds what is left
+ * (sampling, framing) into "other". */
 static void v4_prof_emit(double wall_s, int prompt_tokens, int completion,
-                         double expert_disk_s, double expert_matmul_s) {
-    printf("PROF %.3f %d %d %.3f 0.000 %.3f 0.000 0.000 0\n",
-           wall_s, prompt_tokens, completion, expert_disk_s, expert_matmul_s);
+                         double expert_disk_s, double expert_matmul_s,
+                         double attention_s, double head_s, long long forwards) {
+    printf("PROF %.3f %d %d %.3f 0.000 %.3f %.3f %.3f %lld\n",
+           wall_s, prompt_tokens, completion, expert_disk_s, expert_matmul_s,
+           attention_s, head_s, forwards);
     fflush(stdout);
 }
 
@@ -13975,6 +14127,8 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         engine->experts ? coli_v4_expert_store_disk_sec(engine->experts) : 0.0;
     double matmul_before =
         engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0;
+    double block_before = g_v4_prof_block_s, head_before = g_v4_prof_head_s;
+    long long forwards_before = g_v4_prof_forwards;
     V4ServeStream stream = {session, request->id, 0, 0};
     ColiV4SessionGenerateStats stats = {0};
     char error[512] = {0};
@@ -14020,8 +14174,14 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     double expert_matmul_s = engine->experts
         ? coli_v4_expert_store_matmul_sec(engine->experts) - matmul_before
         : 0.0;
+    /* Block time minus the expert compute measured inside it. The store's disk
+     * seconds are NOT subtracted: summed across loader lanes, they exceeded the
+     * wall on a cold tiny run (0.073 s of disk in a 0.034 s turn). */
+    double attention_s = (g_v4_prof_block_s - block_before) - expert_matmul_s;
+    if (attention_s < 0.0) attention_s = 0.0;
     v4_prof_emit(elapsed, stats.prompt_tokens, completion,
-                 expert_disk_s, expert_matmul_s);
+                 expert_disk_s, expert_matmul_s, attention_s,
+                 g_v4_prof_head_s - head_before, g_v4_prof_forwards - forwards_before);
 #ifdef COLI_V4_GPU_TIER
     if (coli_v4_hybrid_enabled() && (g_v4_hyb_gpu_n + g_v4_hyb_cpu_n +
                            g_v4_hyb_upload_n + g_v4_hyb_skip_n))

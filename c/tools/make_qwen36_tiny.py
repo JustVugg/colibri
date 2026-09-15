@@ -166,6 +166,11 @@ def main():
                     help="full keeps both layer kinds (Phase-2 engine); "
                          "attention_only replaces DeltaNet with identity (Phase 1)")
     ap.add_argument("--max-new", type=int, default=16)
+    ap.add_argument("--hidden", type=int, default=64, help="hidden size (default 64)")
+    ap.add_argument("--inter", type=int, default=32,
+                    help="routed/shared expert width (default 32). The shared "
+                         "expert kernel (expert_ffn.h) needs hidden and inter "
+                         "multiples of 64: --inter 64 exercises it.")
     ap.add_argument("--prompt-ids", default=None,
                     help="Comma-separated token ids for the prompt (default 1,2,3,4,5)")
     args = ap.parse_args()
@@ -175,7 +180,7 @@ def main():
         prompt_ids = [int(x) for x in args.prompt_ids.split(",") if x.strip() != ""]
     emit = args.emit_ref if args.emit_ref else None
 
-    build(Path(args.out), max_new=args.max_new, prompt_ids=prompt_ids, emit_ref=emit,
+    build(Path(args.out), hidden=args.hidden, inter=args.inter, max_new=args.max_new, prompt_ids=prompt_ids, emit_ref=emit,
           ref_mode=args.ref_mode, seed=args.seed)
 
 

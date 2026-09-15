@@ -66,6 +66,17 @@ PIN=stats.txt PIN_GB=20 ./coli chat        # scale PIN_GB to your free RAM
 ./coli bench
 ```
 
+**A GPU-backend datapoint needs a correctness line next to its throughput.**
+Throughput cannot tell a wrong backend from a fast one: a kernel that computes
+garbage runs at full speed and reports no error. Measured in #1502 on gfx1151, a
+HIP build produced perplexity 727 against 7.0 for the same model on the same
+machine, at identical tok/s, and only a quality check caught it. So for any row
+taken with CUDA, HIP, Metal or Vulkan engaged, record one of: a greedy output
+byte-identical to the CPU path on the same prompt (what colibri's tiers promise,
+and what `coli run` with the backend off gives you in one more command), a
+`./coli bench` score within noise of the CPU run, or a perplexity on a fixed text
+alongside the CPU figure. A row without it is a speed claim, not a datapoint.
+
 The default datapoint measures serving behavior, not repeated startup: the same
 engine process and cache slot are used for one cold request, one repeated-prompt
 warm request, and four requests drawn in fixed order from a diverse built-in
@@ -99,6 +110,30 @@ These are estimates, not measurements.
 
 ## Community benchmarks (measured)
 
+### GLM-5.3-Flash Metal expert-cache cap sweep — Apple M4 Max
+
+A 512-token decode sweep on an Apple Mac Studio with M4 Max and 128 GB unified
+memory measured the effect of the GLM-5.3-Flash expert-cache `--cap` while
+keeping the rest of the workload fixed. The model was GLM-5.3-Flash Colibri
+int4-g64 with the Metal routed-MoE path enabled, `--ram 96`, `--ctx 8192`,
+and a two-SSD model mirror routed 60/40 (`COLI_DISK_WEIGHTS=3,2`).
+Usage-history saving was disabled for the isolated benchmark runs.
+
+| `--cap` | resident expert cache | decode | Metal MoE attempts | CPU fallback |
+|---:|---:|---:|---:|---:|
+| 4 | 2.4 GB | 1.850 tok/s | 24,533 | 0 |
+| **8** | **4.8 GB** | **1.895 tok/s** | **24,533** | **0** |
+| 12 | 7.1 GB | 1.887 tok/s | 24,533 | 0 |
+
+For this machine and 512-token workload, `--cap 8` was the best measured point:
+about 2.4% faster than cap 4 while using substantially less resident expert
+cache than cap 12. Cap 12 was about 0.4% slower than cap 8 despite using roughly
+2.3 GB more resident cache. All three runs completed 24,533 Metal routed-MoE
+executions with zero CPU fallback.
+
+This is a workload-specific result, not a universal cap recommendation. Shorter
+runs measured a different scaling curve, so the optimum can move with workload
+length, cache state, storage bandwidth, and available unified memory.
 Real numbers from real machines, stock build (`setup.sh`, gcc 13), greedy decoding, `--ngen 32`, MTP active:
 
 | machine | disk (iobench, 19 MB × 64, 8 threads) | config | measured |
@@ -144,6 +179,9 @@ Real numbers from real machines, stock build (`setup.sh`, gcc 13), greedy decodi
 | 〃 second drive: 200 GB LV on a Crucial P310, 57 interleaved expert shards (139 GB, ~40%) symlinked — **file-level split, not block striping** | 990 Pro 6.44 + P310-LV 4.40 GB/s O_DIRECT, independent controllers | `MTP=0`, `coli serve` mux | N=1 **0.324 (+5.5%)** · N=2 **0.426 (+3.1%)** — see the note below on why this is so much smaller than #1249 |
 | 〃 | 〃 | `MTP=0 REPIN=1`, six consecutive N=2 rounds | **0.461 aggregate** · 0.404 → 0.405 → **0.456** → 0.458 → 0.433 → **0.461**: pins converge in ~3 rounds (~300 tokens) and hold |
 | Apple M4 Pro (8P+4E, 24 GB unified) · macOS 15.6 · libomp, 8 physical-core threads · **OLMoE int8**, fully resident (v1.9.0) | model in page cache; no disk in the loop | 226-token teacher-forced eval (`PPL=1`), `cap` 32 vs 64, **paired** (alternating within one session), 8 pairs | median **19.1 tok/s at cap 32** vs **16.3 at cap 64** · cap 32 wins **7 of 8 pairs** · hit rate 74.1% vs 96.7% — see the note |
+| AMD EPYC 9V45 · Azure D128ads v7 (64 cores / 128 threads, 2 NUMA) · Ubuntu 24.04 · 504 GB · 4x NVMe RAID0 ([#1384](https://github.com/JustVugg/colibri/issues/1384)) | 17.9 GB/s O_DIRECT, flat from 8 to 64 threads | int4 gs64 + int8 MTP · cap 16 · CPU only · v1.10.2 | **2.83 tok/s** rotating median · hit 97% · cold TTFT 13 s; warmed (cap 256, `COLI_NUMA=1`, 100% hit, 512-token runs) **6.91 tok/s** · expert matmul 70 ms/tok + attention 54 ms/tok |
+| AMD EPYC 9V45 · Azure E64ads v7 (32 cores / 64 threads) · Ubuntu 24.04 · 504 GB · 4x NVMe RAID0 ([#1379](https://github.com/JustVugg/colibri/issues/1379)) | 9.0 GB/s O_DIRECT | int4 gs64 + int8 MTP · cap 16 · CPU only · v1.10.2 | **2.34 tok/s** rotating median · hit 97% · CPU-bound (matmul 4.8 s + attention 4.4 s per 32-token request) |
+| Azure E64pds v6 **Arm64** (32 cores) · Ubuntu 24.04 · 504 GB · 4x NVMe RAID0 ([#1380](https://github.com/JustVugg/colibri/issues/1380)) | 2.5 GB/s O_DIRECT at 8 threads, 10.2 GB/s at 64 | int4 gs64 + int8 MTP · cap 16 · CPU only · v1.10.2 | **1.23 tok/s** rotating median · hit 97% · matmul half 2.5x the x86 sibling at equal threads (i8mm status pending) |
 
 ### Two datapoints that are not rows
 
