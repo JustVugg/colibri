@@ -251,12 +251,78 @@ _BOX_RE  = re.compile(re.escape(BOX_START) + r"(.*?)" + re.escape(BOX_END), re.D
 _ARG_RE  = re.compile(r"<arg_key>([^<]*)</arg_key><arg_value>(.*?)</arg_value>", re.DOTALL)
 _NAME_RE = re.compile(r"\s*([A-Za-z0-9_.\-]+)")
 _TAG_RE  = re.compile(r"</?arg_key>|</?arg_value>")
+
+
+def _fallback_tool_preamble(tools):
+    """Tool declaration for a family with no native tool tokens.
+
+    Mirrors the GLM-5.2 block because ``parse_tool_calls`` -- the parser these
+    families fall back to in ``parse_arch_tool_calls`` -- reads exactly that
+    wire format. Asking for a format the parser does not accept would produce
+    tool calls nobody can read back.
+    """
+    out = ["You have access to the following functions. Call one only when it "
+           "is needed to answer the user.\n\n<tools>\n"]
+    for tool in tools:
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        out.append(json.dumps(fn, ensure_ascii=False) + "\n")
+    out.append("</tools>\n\nTo call a function, reply with the call and nothing "
+               "else, in this exact format:\n" + BOX_START + "{function-name}"
+               "<arg_key>{arg-key}</arg_key><arg_value>{arg-value}</arg_value>"
+               + BOX_END)
+    return "".join(out)
+
+
+def _fallback_tool_calls(tool_calls, index):
+    """Render assistant tool_calls in the format parse_tool_calls() reads."""
+    out = []
+    for position, call in enumerate(tool_calls or []):
+        if not isinstance(call, dict):
+            raise APIError(400, "Each tool call must be an object.",
+                           f"messages.{index}.tool_calls.{position}")
+        fn = call.get("function", call)
+        if not isinstance(fn, dict):
+            raise APIError(400, "`function` must be an object.",
+                           f"messages.{index}.tool_calls.{position}.function")
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            raise APIError(400, "`function.name` must be a non-empty string.",
+                           f"messages.{index}.tool_calls.{position}.function.name")
+        args = fn.get("arguments", "{}")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args else {}
+            except (json.JSONDecodeError, TypeError, ValueError):
+                raise APIError(400, "`function.arguments` must be a JSON object.",
+                               f"messages.{index}.tool_calls.{position}.function.arguments")
+        out.append(BOX_START + name)
+        for key, value in (args or {}).items():
+            rendered = value if isinstance(value, str) else json.dumps(
+                value, ensure_ascii=False)
+            out.append(f"<arg_key>{key}</arg_key><arg_value>{rendered}</arg_value>")
+        out.append(BOX_END)
+    return "".join(out)
+
+
+def _fallback_tool_result(message, index):
+    """Render a role:"tool" message as prose these templates can carry."""
+    body = content_text(message.get("content"), f"messages.{index}.content")
+    return TR_OPEN + body + TR_CLOSE
 # A closing tag the model started but never finished ("</tool_cal", "</tool"), at end of reply.
 _PARTIAL_END_RE = re.compile(r"<(?:/(?:t(?:o(?:o(?:l(?:_(?:c(?:a(?:l)?)?)?)?)?)?)?)?)?\Z")
 
 # De-mangler: opt-in recovery for heavily-quantized models that drop the
 # <arg_key>K</arg_key><arg_value> structure. Default OFF (never rewrites well-formed output).
 _SALVAGE = os.environ.get("COLI_TOOL_SALVAGE", "0") == "1"
+
+# Families whose chat template has no tool syntax at all (OLMoE, Qwen3.6) refuse
+# tools[] and role:"tool" rather than invent a format. COLI_TOOL_FALLBACK=1 opts
+# into a prompt-injected translation for them: the declaration block, the prior
+# assistant calls and the tool results are written as ordinary turns, in the
+# same wire format parse_tool_calls() already reads back (#1378). Default OFF --
+# these models were never trained on tool syntax, so this trades a clean 400 for
+# output the parser may or may not recognise.
+_TOOL_FALLBACK = os.environ.get("COLI_TOOL_FALLBACK", "0") == "1"
 
 
 def _tool_param_order(tools):
@@ -1187,17 +1253,25 @@ def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, to
     """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    if tools or tool_choice not in (None, "none"):
-        raise APIError(400, "Tool use is not wired up for the OLMoE engine yet.",
-                       "tools", "unsupported_parameter")
+    if tool_choice == "none":
+        tools = None
+    if (tools or tool_choice not in (None, "none")) and not _TOOL_FALLBACK:
+        raise APIError(400, "Tool use is not wired up for the OLMoE engine yet. "
+                       "Set COLI_TOOL_FALLBACK=1 to opt into prompt-injected "
+                       "tool translation.", "tools", "unsupported_parameter")
     boundary = "|||IP_ADDRESS|||"   # bos_token == eos_token in this tokenizer
     parts = [boundary]
+    if tools and _TOOL_FALLBACK:
+        parts.append(f"<|system|>\n{_fallback_tool_preamble(tools)}\n")
     last = len(messages) - 1
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
-        if role not in ("system", "developer", "user", "assistant"):
+        allowed = ("system", "developer", "user", "assistant")
+        if _TOOL_FALLBACK:
+            allowed += ("tool",)
+        if role not in allowed:
             raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
         raw = message.get("content")
         text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
@@ -1205,8 +1279,13 @@ def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, to
             parts.append(f"<|system|>\n{text}\n")
         elif role == "user":
             parts.append(f"<|user|>\n{text}\n")
+        elif role == "tool":
+            # No tool role in this template: the result rides in as a user turn.
+            parts.append(f"<|user|>\n{_fallback_tool_result(message, index)}\n")
         else:
-            parts.append(f"<|assistant|>\n{text}{boundary}")
+            calls = (_fallback_tool_calls(message.get("tool_calls"), index)
+                     if _TOOL_FALLBACK else "")
+            parts.append(f"<|assistant|>\n{text}{calls}{boundary}")
             if index != last:
                 parts.append("\n")
     parts.append("<|assistant|>\n")
@@ -1224,20 +1303,36 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
     mirrored here byte for byte."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    if tools or tool_choice not in (None, "none"):
-        raise APIError(400, "Tool use is not wired up for the qwen36 engine yet.",
-                       "tools", "unsupported_parameter")
+    if tool_choice == "none":
+        tools = None
+    if (tools or tool_choice not in (None, "none")) and not _TOOL_FALLBACK:
+        raise APIError(400, "Tool use is not wired up for the qwen36 engine yet. "
+                       "Set COLI_TOOL_FALLBACK=1 to opt into prompt-injected "
+                       "tool translation.", "tools", "unsupported_parameter")
     parts = []
+    if tools and _TOOL_FALLBACK:
+        parts.append("<|im_start|>system\n"
+                     + _fallback_tool_preamble(tools) + "<|im_end|>\n")
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
         if role == "developer":
             role = "system"
-        if role not in ("system", "user", "assistant"):
+        allowed = ("system", "user", "assistant")
+        if _TOOL_FALLBACK:
+            allowed += ("tool",)
+        if role not in allowed:
             raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
         raw = message.get("content")
         text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role == "tool":
+            # No tool role in this template: the result rides in as a user turn.
+            parts.append("<|im_start|>user\n"
+                         + _fallback_tool_result(message, index) + "<|im_end|>\n")
+            continue
+        if role == "assistant" and _TOOL_FALLBACK:
+            text += _fallback_tool_calls(message.get("tool_calls"), index)
         parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
     parts.append("<|im_start|>assistant\n")
     parts.append("<think>\n" if enable_thinking else "<think>\n\n</think>\n\n")
