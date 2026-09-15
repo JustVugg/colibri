@@ -764,23 +764,32 @@ int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
  * tier learning its name. The engine offers sizes through qt_trunk_offer(),
  * asks qt_place_of() where each went, and hands the quantized bytes here. */
 #define QT_DENSE_MAX 1024
-static struct { ColiCudaTensor *t; int dev, on; size_t bytes; } G_dense[QT_DENSE_MAX];
+static struct { ColiCudaTensor *t; int dev, on; size_t bytes; int gs; } G_dense[QT_DENSE_MAX];
 static int G_dense_n;
-int qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device){
-    if(device == QT_PLACE_CPU || !q || !sc || I <= 0 || O <= 0) return -1;
+int qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device, int gs){
+    if(device == QT_PLACE_CPU || !q || !sc || I <= 0 || O <= 0 || gs < 0) return -1;
     if(G_dense_n >= QT_DENSE_MAX) return -1;
     int h = G_dense_n;
-    if(!coli_cuda_tensor_upload(&G_dense[h].t, q, sc, 1, I, O, device)){
+    /* gs > 0: one scale per gs weights along I, scales [O][ceil(I/gs)] -- the
+     * backend's grouped fmt 1 (same kernel branch as grouped int4). gs 0 keeps
+     * the per-row format qwen36's dnproj/lmhead use. */
+    int ok = gs > 0 ? coli_cuda_tensor_upload_g(&G_dense[h].t, q, sc, 1, I, O, device, gs)
+                    : coli_cuda_tensor_upload(&G_dense[h].t, q, sc, 1, I, O, device);
+    if(!ok){
         fprintf(stderr,"[dense] upload [%d x %d] to dev %d failed -> stays on CPU\n", O, I, device);
         return -1;
     }
-    G_dense[h].dev = device; G_dense[h].on = 1; G_dense[h].bytes = (size_t)I*O + (size_t)O*sizeof(float);
+    size_t ng = gs > 0 ? ((size_t)I + gs - 1) / gs : 1;
+    G_dense[h].dev = device; G_dense[h].on = 1; G_dense[h].gs = gs; G_dense[h].bytes = (size_t)I*O + (size_t)O*ng*sizeof(float);
     G_dense_n++;
     return h;
 }
 int qt_dense_matmul(int h, float *y, const float *x, int I, int O){
     if(h < 0 || h >= G_dense_n || !G_dense[h].on) return 0;
-    if(coli_cuda_matmul(&G_dense[h].t, y, x, NULL, NULL, 1, 1, I, O, G_dense[h].dev, 0)) return 1;
+    /* the group size travels with the call: the backend's cached-tensor check
+     * compares it against the tensor's, and a grouped upload answered with
+     * gs 0 would be refused as a format mismatch */
+    if(coli_cuda_matmul(&G_dense[h].t, y, x, NULL, NULL, 1, 1, I, O, G_dense[h].dev, G_dense[h].gs)) return 1;
     fprintf(stderr,"[dense] handle %d GPU matmul failed; CPU from here on\n", h);
     G_dense[h].on = 0;
     return 0;

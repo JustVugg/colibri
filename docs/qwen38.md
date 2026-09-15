@@ -240,11 +240,13 @@ matrix of at least 1 MiB to the tier's placer by name and layer (the
 DeltaNet projections `dnqkv`/`dnz`/`dnout`, attention `attnq`/`attnk`/
 `attnv`/`attno`/`qsaidx`, the hyper-connection mixers `hcad`/`hcau`/`hcmd`/
 `hcmu`, the shared expert `shg`/`shu`/`shd`, the `router`, and `lmhead`);
-whatever the placer accepts is quantized to **int8 per row** (scale = max|w|
-/ 127, the qwen36 dnproj/lmhead format) when the tier starts -- about 2 s
-for the 553 matrices, 3.96 GiB on one card -- and answers decode GEMVs from
-there, one round trip per matmul (`x` up, `y` down; activations stay on the
-CPU). Prefill rows (S > 1) and any backend failure take the BF16 CPU path,
+whatever the placer accepts is quantized to **int8 with one scale per 64
+weights** along the input (`Q38_TRUNK_GS`, 0 = one scale per row, the qwen36
+dnproj/lmhead format) when the tier starts -- about 2 s for the 553
+matrices, 4.2 GiB on one card including the scale tables -- and answers
+decode GEMVs from there, one round trip per matmul (`x` up, `y` down;
+activations stay on the CPU). The grouped scales are what keeps the
+perplexity where BF16 has it, see Numerics below. Prefill rows (S > 1) and any backend failure take the BF16 CPU path,
 which stays in RAM. The placer takes the trunk before the experts (it is
 read on every token), so on an 8 GB card about 2 GB remain for hot experts;
 `coli plan` prices it the same way (`4.0 GB int8 trunk + ... hot tier`).
@@ -253,25 +255,41 @@ read on every token), so on an 8 GB card about 2 GB remain for hot experts;
 |---|---|
 | `Q38_TRUNK_GPU=0` | keep the trunk on the CPU (experts-only tier, the behaviour before this) |
 | `Q38_TRUNK_MIN_KB=<n>` | offer matrices of at least n KiB (default 1024; a round trip costs more than a tiny GEMV saves) |
+| `Q38_TRUNK_GS=<n>` | scale group size along the input for the int8 trunk (default 64; 0 = one scale per row). 64 costs 6 % more VRAM than per-row and is perplexity-neutral, per-row is not |
 | `Q38_TRUNK_SKIP=name,name` | leave the named components on the CPU (bisecting, or a component that does not pay) |
 | `QT_UPLOAD_SYNC=1` | the tier's `qt_issue` waits for every in-flight upload first (tests and diagnostics: deterministic residency, no upload/compute overlap) |
 | `Q38_TRUNK_CPU_INT8=1` | the same int8 rows on the CPU instead -- what the quantization alone does to the output, no GPU needed (perplexity, token parity); a matrix the GPU holds is still answered from VRAM |
 | `Q38_TRUNK_SELFTEST=1` | at start, every placed matrix is checked once: GPU GEMV against the same int8 rows on the CPU (relative error printed per matrix) |
 
-**Numerics.** GPU int8 against CPU int8 on the same rows: relative error
-~1e-7 on all 553 matrices (float summation order), greedy tokens identical
-over 30 tokens on the 315-token prompt and 20 on a short one. int8 against
-BF16: the per-row quantization error is 1 - 3 % per matrix (largest on the
-router and the hyper-connection down-mixers), and on the same prompts the
-greedy text is identical to the BF16 run for the 30 tokens compared.
-Perplexity on wikitext-2 (8 chunks of 512, 2048 scored tokens, llama-perplexity
-protocol): 1.880 with the trunk and the expert tier on the GPU against 1.845 for
-the BF16 CPU run, +1.9 %. The expert tier on its own is neutral (+0.0008 nats on
-a 256-token probe), the lm_head contributes nothing, and keeping the 48 routers
-in BF16 on the CPU (`Q38_TRUNK_SKIP=router`) only recovers 0.3 points (1.875):
-the per-row int8 error is spread over the trunk, not concentrated in one class.
-Group scales (gs 64/128) for the trunk are the lever left; that needs a kernel
-format, not a placement change.
+**Numerics.** GPU int8 against CPU int8 on the same rows and scales:
+relative error ~1e-7 on all 553 matrices (float summation order), greedy
+tokens identical over 30 tokens on the 315-token prompt and 20 on a short
+one. Perplexity on wikitext-2 (8 chunks of 512, 2048 scored tokens,
+llama-perplexity protocol), BF16 CPU run 1.845:
+
+| trunk quantization | ppl | |
+|---|---:|---:|
+| int8, one scale per row (`Q38_TRUNK_GS=0`), trunk + tier on the GPU | 1.880 | +1.9 % |
+| int8, one scale per row, CPU reference path | 1.877 | +1.7 % |
+| **int8, one scale per 64 weights (default), CPU reference path** | **1.852** | **+0.4 %** |
+| int8, one scale per 64 weights, trunk + tier on the GPU | 1.852 | +0.4 % (all eight chunks identical to the CPU reference) |
+
+The per-row error (1 - 3 % per matrix, largest on the router and the
+hyper-connection down-mixers) is spread over the trunk: the expert tier on
+its own is neutral (+0.0008 nats on a 256-token probe), the lm_head
+contributes nothing, keeping the 48 routers in BF16 (`Q38_TRUNK_SKIP=router`)
+recovers only 0.3 points, and the GPU's summation order accounts for 0.2 of
+the 1.9. Group scales recover four fifths of it, for 6 % more scale bytes;
+that is why they are the default. Their price on one 8 GB card, same prompt
+and cap as the table below: the trunk grows from 3.96 to 4.21 GiB (40 fewer
+resident experts, 20.6 % instead of 22.3 % VRAM hits), the grouped GEMV
+costs 69 instead of 63 ms of resident-mm per token, decode 1.88 instead of
+1.91 tok/s; greedy text identical to BF16 over 100 tokens, selftest 553/553
+at 1.5e-7 against the CPU reference of the same rows and scales. The trunk
+is a quantization of the dense path, so a greedy run that matches BF16 over
+100 tokens is a measurement, not a guarantee: `Q38_TRUNK_CPU_INT8=1` (the
+same int8 rows and scales on the CPU) and `Q38_TRUNK_GPU=0` (the BF16 trunk)
+are the references to compare a doubtful output against.
 
 **Measured** (same machine and prompt as above, cap 224 so the RAM LRU
 serves 84 % of expert reads, `COLI_TIMERS=1` decode bank, 100 tokens):

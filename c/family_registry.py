@@ -1000,7 +1000,8 @@ _QWEN38_NATIVE_MATRIX_SUFFIXES = (
 def _qwen38_trunk_inventory(name, size, _config, dtype=None):
     """int8 bytes the qwen38 engine's stage-1 trunk offload holds in VRAM for
     this tensor (docs/qwen38.md, "GPU"): the dense matmul matrices of the text
-    model, quantized per row when the tier starts. Matrices under 1 MiB stay
+    model, quantized to int8 with one scale per 64 weights when the tier
+    starts. Matrices under 1 MiB stay
     on the CPU (a round trip costs more than a tiny GEMV saves), and so do
     the PLE projections, the vision tower and everything that is not a matmul
     weight. embed_tokens stands in for the tied lm_head."""
@@ -1016,7 +1017,12 @@ def _qwen38_trunk_inventory(name, size, _config, dtype=None):
     if not element_bytes:
         return 0
     elements = size // element_bytes
-    return elements if elements >= (1 << 20) else 0
+    if elements < (1 << 20):
+        return 0
+    # int8 bytes plus the scale table: one f32 per 64 weights (the engine's
+    # default Q38_TRUNK_GS; every offered matrix has an input width that is a
+    # multiple of 64, so the estimate is exact for the shipped checkpoint).
+    return elements + (elements // 64) * 4
 
 
 def _qwen38_resident_inventory(name, size, _config, dtype=None):

@@ -527,14 +527,22 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
                 sum += ga * mx4_scale_dev(scl[g]);
             }
         }
-    } else if (fmt == 4) {
-        /* Grouped int4: one f32 scale per gs elements along I (ng groups per row).
-         * Scale layout: scales[o*ng + g]. Each thread strides through I, applying
-         * the appropriate group scale as it crosses group boundaries. This matches
-         * the CPU matmul_i4_grouped accumulation exactly. */
+    } else if (fmt == 4 || (fmt == 1 && gs > 0)) {
+        /* Grouped int4, and grouped int8 (fmt 1 uploaded with a gs, the qwen38
+         * dense trunk): one f32 scale per gs elements along I (ng groups per
+         * row). Scale layout: scales[o*ng + g]. Each thread strides through I,
+         * applying the appropriate group scale as it crosses group boundaries.
+         * This matches the CPU matmul_i4_grouped accumulation exactly; for int8
+         * it is the engine's Q38_TRUNK_CPU_INT8 reference loop. */
         const float *scl = scales + (size_t)o * ng;
+        /* i / gs per element is an integer division on the GPU, about a
+         * quarter of this loop's cost at gs 64; every group size in use is a
+         * power of two, so shift instead when it is (the division stays for
+         * an odd gs, same result either way). Measured on the qwen38 trunk,
+         * 553 matrices per token: 75 -> 69 ms resident-mm (per-row: 63). */
+        const int gshift = (gs & (gs - 1)) ? -1 : (__ffs(gs) - 1);
         for (int i = threadIdx.x; i < I; i += blockDim.x) {
-            int g = i / gs;
+            int g = gshift >= 0 ? (i >> gshift) : (i / gs);
             if (g >= ng) g = ng - 1;  /* tail elements in the last (partial) group */
             sum += xs[i] * weight_at(weights, fmt, row, i) * scl[g];
         }
@@ -570,7 +578,7 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
          * Only the per-row formats get the trailing multiply --
          * and for fmt=7 `scales` points at ue8m0 BYTES, so reading it as float
          * here does not merely double-scale, it reads garbage. */
-        y[(size_t)s * O + o] = (fmt && fmt != 4 && fmt != 6 && fmt != 7 && fmt != 8) ? partial[0] * scales[o] : partial[0];
+        y[(size_t)s * O + o] = (fmt && fmt != 4 && fmt != 6 && fmt != 7 && fmt != 8 && !(fmt == 1 && gs > 0)) ? partial[0] * scales[o] : partial[0];
 }
 
 /* fmt=6 activation rotation, y = Q^T x for Q = D*H/sqrt(n) (#452). One block per
@@ -1403,7 +1411,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
          * on such a slot failed here — the GPU tier silently never computed
          * for host-released slab experts. */
         ColiCudaTensor *t = *tensor;
-        int want_gs = (fmt==4 && g_upload_gs>0) ? g_upload_gs : 0;
+        int want_gs = ((fmt==4 || fmt==1) && g_upload_gs>0) ? g_upload_gs : 0;
         return t->fmt == fmt && t->I == I && t->O == O && t->device == device && t->gs == want_gs;
     }
     DeviceContext *ctx = find_ctx(device);
@@ -1416,7 +1424,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;
-    t->gs = (fmt==4 && g_upload_gs>0) ? g_upload_gs : 0;
+    t->gs = ((fmt==4 || fmt==1) && g_upload_gs>0) ? g_upload_gs : 0;   /* fmt 1 + gs: grouped int8 (dense trunk) */
     t->ng = t->gs ? (I + t->gs - 1) / t->gs : 1;
     t->scale_count = t->gs ? (size_t)O * (size_t)t->ng : (size_t)O;
     if (fmt == 8) {   /* per-128x128-block scales: [ceil(O/128), ceil(I/128)] */
