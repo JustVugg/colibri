@@ -1151,6 +1151,10 @@ FAMILIES = (
         planner_geometry=_glm_geometry,
         planner_unsupported_reason="",
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
+        # coli convert routes to convert_olmoe_merged.py (d4d11ef dispatch);
+        # the converter takes no precision flags (--ebits / --group-size etc.).
+        converter="convert_olmoe_merged.py",
+        converter_accepts=(),
         config_section="root",
         limits=FamilyLimits(4096, 1048576, 1024, 16384, 16, 0, "CTX"),
         capabilities=FamilyCapabilities(True, True, False, True),

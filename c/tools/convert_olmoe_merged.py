@@ -268,14 +268,14 @@ def main():
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--repo", help="HuggingFace repo ID (streams+deletes one shard at a time)")
     src.add_argument("--model", help="Local HF checkpoint directory (already fully downloaded)")
-    ap.add_argument("--out", required=True, help="Output directory for merged model")
+    ap.add_argument("--outdir", required=True, help="Output directory for merged model")
     ap.add_argument("--flush-every", type=int, default=512,
                      help="flush an output shard every N converted tensors")
     ap.add_argument("--min-free-gb", type=float, default=5.0,
                      help="--repo only: stop (resumably) if free space drops below this")
     args = ap.parse_args()
 
-    out_dir = Path(args.out)
+    out_dir = Path(args.outdir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.model:
