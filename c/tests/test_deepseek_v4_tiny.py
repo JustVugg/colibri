@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import time
 import subprocess
 import sys
 import tempfile
@@ -205,9 +206,33 @@ def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
                 )
             if stats["prompt_tokens"] != len(case["prompt_ids"]):
                 raise AssertionError(f"serve round {ordinal}: bad prompt stats {stats}")
+            # #1491: the PROF line carries the phases beyond the expert store.
+            # Before, attention_s / lm_head_s / forwards were literal zeros and a
+            # warm turn read as 98% "other" in /profile.
+            # PROF follows DONE on the engine's stdout; generate() returns at
+            # DONE, so give the reader thread a moment to parse the next line.
+            deadline = time.time() + 5.0
+            while len(engine.profile) <= ordinal and time.time() < deadline:
+                time.sleep(0.02)
+            if len(engine.profile) <= ordinal:
+                raise AssertionError(f"serve round {ordinal}: no PROF line")
+            prof = engine.profile[-1]
+            if prof["completion_tokens"] != stats["completion_tokens"]:
+                raise AssertionError(f"serve round {ordinal}: PROF/DONE disagree: {prof} {stats}")
+            if prof["forwards"] < prof["completion_tokens"]:
+                raise AssertionError(f"serve round {ordinal}: forwards {prof['forwards']} below "
+                                     f"the {prof['completion_tokens']} tokens generated")
+            # the tiny head is microseconds and prints as 0.000; the blocks are not
+            if prof["attention_s"] <= 0.0 or prof["lm_head_s"] < 0.0:
+                raise AssertionError(f"serve round {ordinal}: block/head phases not timed: {prof}")
+            # disk seconds are summed across loader lanes and may exceed the wall
+            # on their own; the compute phases must not
+            accounted = prof["expert_matmul_s"] + prof["attention_s"] + prof["lm_head_s"]
+            if accounted > prof["wall_s"] * 1.05 + 0.05:
+                raise AssertionError(f"serve round {ordinal}: phases exceed wall: {prof}")
     finally:
         engine.close()
-    print("PASS target serve: persistent SUBMIT/DATA/DONE protocol is token-exact")
+    print("PASS target serve: persistent SUBMIT/DATA/DONE protocol is token-exact, PROF phases filled")
 
 
 def check_cli_uses_engine_context(binary: Path, model: Path, temporary: Path) -> None:

@@ -7,6 +7,7 @@ Describe the problem and the smallest change that solves it.
 - [ ] `make -C c check`
 - [ ] CUDA changes were tested with `make -C c cuda-test` (if applicable)
 - [ ] Performance claims include hardware, commands, and repeatable measurements
+- [ ] Performance claims include a validated experiment manifest with raw evidence
 
 ## Compatibility
 

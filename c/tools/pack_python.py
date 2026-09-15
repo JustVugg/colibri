@@ -120,6 +120,34 @@ def data_files(path):
     return found
 
 
+def named_tools(path, src):
+    """Gli script sotto tools/ nominati da una stringa, non da una chiamata.
+
+    #1368: i convertitori per famiglia sono dichiarati in family_registry.py
+    come semplici stringhe ("convert_glm53.py"), perche' e' coli a comporre il
+    comando a runtime. Non c'e' nessun `os.path.join(TOOLS, "...")` da trovare,
+    quindi invoked_scripts() non li vede e l'archivio uscirebbe senza il
+    convertitore -- che e' precisamente #1296, un giro piu' tardi.
+
+    Come per i file di dati, si richiede che il file ESISTA sotto tools/: una
+    stringa che somiglia a un nome di script ma non lo e' non produce nulla."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+    except SyntaxError:
+        return set()
+    found = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            continue
+        name = node.value
+        if not re.fullmatch(r"[a-z0-9_]+\.py", name):
+            continue
+        candidate = src / "tools" / name
+        if candidate.is_file():
+            found.add(candidate)
+    return found
+
+
 def needed(src):
     """Tutto cio' che coli raggiunge, come percorsi sotto <c-dir>.
 
@@ -143,6 +171,11 @@ def needed(src):
     while queue:
         path = queue.pop()
         data |= data_files(path)
+        for candidate in named_tools(path, src):
+            if candidate in script_paths:
+                continue
+            script_paths.add(candidate)
+            queue.append(candidate)
         for script in invoked_scripts(path):
             if script in scripts:
                 continue

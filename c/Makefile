@@ -472,9 +472,12 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 # test_uring is Linux-only. V4 engine tests are appended below only on supported
 # x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
 # unconditional rules and therefore remain portable gates.
+# test_qwen38_tier_engine drives qwen38.c over the generated FP8 fixture
+# (qwen38_tiny_fp8, gitignored); it runs from qwen38-tier-engine-check.
 TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
 	test_segment_adapters_registration test_segment_adapters_real \
-	test_edge_adapters_registration test_edge_adapters_real
+	test_edge_adapters_registration test_edge_adapters_real \
+	test_qwen38_tier_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -577,6 +580,10 @@ CUDA_OBJ   = backend_cuda.o
 GPUCC      = $(HIPCC)
 GPUFLAGS   = $(HIPCCFLAGS)
 GPUCC_NAME = hipcc (set ROCM_HOME or HIPCC)
+# The kernel test binaries link the HIP runtime explicitly: hipcc does not add
+# it for a plain link the way nvcc adds cudart (#1499: `make hip-test` failed
+# with undefined hipStreamSynchronize and the suite never ran on ROCm).
+GPU_TEST_LIBS = -L$(ROCM_HOME)/lib -lamdhip64
 # rocWMMA needs matrix cores (MFMA gfx908+ / WMMA gfx11xx); on these archs its
 # headers static_assert (ROCm/TheRock#1944). Compile the WMMA paths out and
 # let backend_gpu_compat.h fall back via COLI_GPU_HAS_WMMA=0. The flag must
@@ -645,6 +652,9 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k3_tiny
 	$(PYTHON) tests/test_kimi_k3_ckpt.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k3_tiny
+	$(PYTHON) tests/test_kimi_k3_dashboard.py \
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k3_tiny
 
@@ -745,6 +755,7 @@ backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
 cuda-dll: backend_cuda.cu backend_cuda.h
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	@cl 2>&1 | grep -q "for x64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
 		backend_cuda.cu -o coli_cuda.dll
@@ -820,6 +831,7 @@ deepgemm-fetch $(DEEPGEMM_STAMP):
 cuda-dsv4-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	@cl 2>&1 | grep -q "for x64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor -shared \
 		-Xlinker /DEF:dsv4.def \
 		-L"$(CUDA_HOME)/lib/x64" -lcublasLt -lcudart -lcuda \
@@ -832,6 +844,7 @@ DEEPGEMM_INC = -I"$(DEEPGEMM_HOME)/deep_gemm/include" -I"$(DEEPGEMM_HOME)/cutlas
 cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def $(DEEPGEMM_STAMP)
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	@cl 2>&1 | grep -q "for x64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
 	"$(NVCC)" -O3 -std=c++20 -ftz=false --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor \
 		-gencode arch=compute_120a,code=sm_120a -DCOLI_DSV4_DEEPGEMM \
 		$(DEEPGEMM_INC) -shared \
@@ -851,6 +864,27 @@ backend_metal.o: backend_metal.mm backend_metal.h
 metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h
 	$(METALXX) tests/test_backend_metal.mm backend_metal.mm -framework Metal -framework Foundation -o backend_metal_test
 	./backend_metal_test
+
+# GLM-5.3 Metal correctness oracles. These exercise the clamped SwiGLU
+
+# primitive and the complete routed gate/up/SwiGLU/down/scatter MoE block
+
+# against their CPU references. Requires real Apple Metal hardware.
+
+.PHONY: glm53-metal-check
+
+glm53-metal-check: backend_metal.o tests/test_glm53_clamped_metal.c tests/test_glm53_moe_block_metal.c
+
+	@test "$(METAL)" = "1" || { echo "usage: make glm53-metal-check METAL=1" >&2; false; }
+
+	$(CC) $(CFLAGS) tests/test_glm53_clamped_metal.c backend_metal.o -o glm53_clamped_metal_test $(LDFLAGS)
+
+	./glm53_clamped_metal_test
+
+	$(CC) $(CFLAGS) tests/test_glm53_moe_block_metal.c backend_metal.o -o glm53_moe_block_metal_test $(LDFLAGS)
+
+	./glm53_moe_block_metal_test
+	$(RM) glm53_clamped_metal_test glm53_moe_block_metal_test
 
 # Standalone large-batch GEMM correctness sweep — reproduces the long-context prefill
 # corruption in seconds (no model). OMP-parallel CPU reference.
@@ -889,25 +923,25 @@ rans: $(RANSLIB)
 $(RANSLIB): tools/rans_ctypes.c rans.h
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
-cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./backend_cuda_test$(EXE)
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE) $(GPU_TEST_LIBS)
 	./ragged_attention_test$(EXE)
 	# weight_at's device-side refusal (the __trap()) on real silicon. The
 	# host-side half is tests/test_cuda_fmt_guard.c, which runs in the CPU
 	# suite and cannot execute device code. Includes backend_cuda.cu itself:
 	# weight_at is file-static, and the trap is unreachable through the public
 	# API by design. Re-execs itself per probe (the trap poisons the context).
-	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./cuda_fmt_trap_test$(EXE)
 	# fmt=8 warp kernels (COLI_CUDA_F8_WARP): decode sweep, census + tail
 	# shapes, S-invariance, NaN/denormal policy. Includes backend_cuda.cu
 	# itself (kernel-level oracle), so only the test file is compiled.
 	# Runs BEFORE the MXFP4 test: that one has a pre-existing exponent-255
 	# failure on some hosts and would otherwise abort the recipe first.
-	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./fp8_warp_test$(EXE)
 	# The batch and ragged absorb kernels must reproduce their own output: they
 	# reduce in a fixed tree order with no atomics, so two identical launches
@@ -919,18 +953,18 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# test in the recipe, and it should not cost the broader kernel suites if
 	# it trips. It stays BEFORE MXFP4 so it still runs on the hosts where that
 	# one is expected to fail.
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE) $(GPU_TEST_LIBS)
 	./absorb_determinism_test$(EXE)
 	# fmt=8 (fp8-e4m3) kernel oracle + public API (LUT gate, dense, expert
 	# group, byte accounting). Includes backend_cuda.cu itself, so only the
 	# test file is compiled. Also runs BEFORE the MXFP4 test (same reason).
-	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_cuda.cu -o fp8_cuda_test$(EXE) $(ANS_NVCC_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_cuda.cu -o fp8_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./fp8_cuda_test$(EXE)
 	# Upload-failure ownership: a failed H2D weight copy must release the
 	# bytes it allocated (weights_owned set by the malloc, not the copy).
 	# Includes backend_cuda.cu itself to plant the memcpy failure, so only
 	# the test file is compiled.
-	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./weights_owned_test$(EXE)
 	# MXFP4 (fmt=7) against the CPU decoder in quant.h. The reference is built
 	# as C on purpose: quant.h uses _Thread_local, which nvcc's C++ front end
@@ -949,8 +983,15 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# below no longer pulls the runtime, and CI could not catch it because CI
 	# never runs cuda-test. -Xclang appears nowhere else in CFLAGS.
 	$(CC) $(filter-out -Xclang -fopenmp,$(CFLAGS)) -fno-openmp -c tests/mxfp4_ref.c -o tests/mxfp4_ref.o
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE) $(GPU_TEST_LIBS)
 	./mxfp4_cuda_test$(EXE)
+	# Allocator footprint (#687): what a cudaMalloc really takes off the card,
+	# which is what the expert tier has to be charged rather than the logical
+	# byte count. Runs LAST on purpose - it is the only test here that
+	# allocates in bulk to measure an amortised cost, so it should not leave
+	# the card fragmented underneath a kernel test that follows it.
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_alloc_footprint_cuda.cu -o alloc_footprint_test$(EXE) $(GPU_TEST_LIBS)
+	./alloc_footprint_test$(EXE)
 
 
 # The DeepSeek V4 kernels on their own: dense, batched attention and routed MoE
@@ -977,12 +1018,12 @@ hip-test:
 # CI: compile the backend and its test binary WITHOUT executing them (for
 # runners with the toolchain but no GPU). Pass CUDA_ARCH/HIP=1+HIP_ARCH.
 gpu-compile: backend_cuda.o
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS)
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE)
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE)
-	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS)
-	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS)
-	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 
 cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tensor_core.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
@@ -1021,19 +1062,31 @@ ifeq ($(CUDA),1)
 QWEN36_TIER_SRC = qwen36_tier.c
 QWEN36_CFLAGS   = $(CFLAGS)
 QWEN36_LDFLAGS  = $(LDFLAGS)
+else ifeq ($(HIP),1)
+QWEN36_TIER_SRC = qwen36_tier.c
+QWEN36_CFLAGS   = $(CFLAGS)
+QWEN36_LDFLAGS  = $(LDFLAGS)
 else
 QWEN36_TIER_SRC =
 QWEN36_CFLAGS   = $(NOCUDA_CFLAGS)
 QWEN36_LDFLAGS  = $(NOCUDA_LDFLAGS)
 endif
-qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h st.h json.h compat.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h st.h json.h compat.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
-# Qwen3.8-Flash-Next text-only sibling. This target is intentionally CPU-only;
-# qwen38.c owns the direct checkpoint loader and SERVE=1 protocol, with no
-# CUDA/Metal tier advertised by the control plane.
-qwen38$(EXE): qwen38.c cli_args.h qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h
-	$(CC) $(NOCUDA_CFLAGS) qwen38.c -o qwen38$(EXE) $(NOCUDA_LDFLAGS)
+# DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
+# stream from the official checkpoint and quant.h's mxfp4 kernel reads them as they
+# are, so there is no conversion target here to go with it.
+deepseek_v41$(EXE): deepseek_v41.c cli_args.h st.h json.h tok.h tok_unicode.h compat.h quant.h \
+	sparse_attn.h hyper_connections.h serve_codec.h serve_poll.h .build-config
+	$(CC) $(CFLAGS) deepseek_v41.c -o deepseek_v41$(EXE) $(LDFLAGS)
+
+# Qwen3.8-Flash-Next text-only sibling. qwen38.c owns the direct checkpoint
+# loader and SERVE=1 protocol. With CUDA=1 it links the same expert tier as
+# qwen36 (fp8 streaming mode: hot experts get VRAM copies, the RAM LRU stays);
+# without it the tier header's inline stubs keep the build toolkit-free.
+qwen38$(EXE): qwen38.c cli_args.h qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) qwen38.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen38$(EXE) $(QWEN36_LDFLAGS)
 
 .PHONY: qwen38-tiny-generate qwen38-tiny-check
 qwen38-tiny-generate:
@@ -1060,23 +1113,40 @@ qwen38-tiny-check: qwen38-tiny-generate qwen38$(EXE)
 	done; \
 	done
 
+# Same oracle with the routed experts as the release ships them: e4m3 bytes
+# plus BF16 128x128 block scales, gate/up and down in separate shards. The
+# native slab path and the expanded path must both reproduce the reference;
+# then the engine runs on the fake CUDA tier (no toolkit, no GPU).
+.PHONY: qwen38-tiny-fp8-generate qwen38-tiny-fp8-check qwen38-tier-engine-check
+qwen38-tiny-fp8-generate:
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_fp8 --fp8-experts
+
+qwen38-tiny-fp8-check: qwen38-tiny-fp8-generate qwen38$(EXE)
+	@for native in 1 0; do for cap in 1 2; do \
+		Q38_NATIVE_FP8=$$native OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_fp8 ./qwen38$(EXE) $$cap 8 ./qwen38_tiny_fp8/ref.json || exit $$?; \
+	done; \
+	done
+
+qwen38-tier-engine-check: qwen38-tiny-fp8-generate tests/test_qwen38_tier_engine$(EXE)
+	./tests/test_qwen38_tier_engine$(EXE)
+
 # Context-size gates: KV layout, growth across requests, and the attention
 # capacity. Includes qwen36.c directly, so no model file is needed.
 # Same tier sources as the engine: the test includes qwen36.c, so with CUDA=1
 # it needs qwen36_tier.c and the backend object too (without CUDA, the header's
 # inline stubs cover it and both are empty).
-tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
-tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # Both tokenizer.json merge spellings ("a b" strings and ["a","b"] pairs)
 # must index the same merge table; the pair form is what Qwen3.6 ships.
-tests/test_qwen36_tok_merges$(EXE): tests/test_qwen36_tok_merges.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+tests/test_qwen36_tok_merges$(EXE): tests/test_qwen36_tok_merges.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # Reproducible local timing evidence; intentionally not a noisy CI perf gate.
@@ -1098,11 +1168,10 @@ NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
 NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
                    -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
 
-# GLM-5.3-Flash: CPU puro, esperti in streaming dal contenitore int4 gs64.
-# Nessun oggetto CUDA/Vulkan/Metal fra le dipendenze perche' il motore non ne
-# ha ancora: quando li avra', questa riga somigliera' a quella di kimi_k3.
-glm53$(EXE): glm53.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h backend_vulkan.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(VK_OBJ) $(VK_SPV)
-	$(CC) $(CFLAGS) glm53.c $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
+# GLM-5.3-Flash: routed experts stream from the int4-gs64 container.
+# METAL=1 accelerates resident matrices and routed MoE; CPU remains fallback.
+glm53$(EXE): glm53.c cli_args.h st.h json.h stop_ids.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h serve_poll.h route_trace.h quant.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h backend_metal.h backend_vulkan.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(METAL_OBJ) $(VK_OBJ) $(VK_SPV)
+	$(CC) $(CFLAGS) glm53.c $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
 kimi_k3$(EXE): kimi_k3.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h backend_cuda.h backend_metal.h backend_vulkan.h edge_adapters.h edge_runtime.h edge_tok_internal.h hybrid_split.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
 	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
@@ -1210,6 +1279,15 @@ tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
 tests/test_st_mirror$(EXE): tests/test_st_mirror.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_st_overlay$(EXE): tests/test_st_overlay.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_compat_mem$(EXE): tests/test_compat_mem.c compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_st_missing$(EXE): tests/test_st_missing.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_tier$(EXE): tests/test_tier.c tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -1280,6 +1358,7 @@ tests/test_inkling_shared_batch$(EXE): tests/test_inkling_shared_batch.c inkling
 # Reproducible local A/B for the shared-expert prefill path.  This is timing
 # evidence, not a CI gate: build and run it explicitly on the target CPU.
 tests/bench_inkling_shared_batch$(EXE): tests/bench_inkling_shared_batch.c inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_inkling_cache_index$(EXE): tests/test_inkling_cache_index.c inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
@@ -1305,7 +1384,7 @@ tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c s
 tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c expert_ffn.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
@@ -1351,7 +1430,19 @@ tests/test_kv_disk$(EXE): tests/test_kv_disk.c colibri.c st.h json.h tok.h tok_u
 tests/test_e8_kernel$(EXE): tests/test_e8_kernel.c quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_rans$(EXE): tests/test_rans.c rans.h
+tests/test_e4m3_vector$(EXE): tests/test_e4m3_vector.c quant.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_stop_ids$(EXE): tests/test_stop_ids.c stop_ids.h json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_sparse_attn$(EXE): tests/test_sparse_attn.c sparse_attn.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_expert_ffn$(EXE): tests/test_expert_ffn.c expert_ffn.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_rans$(EXE): tests/test_rans.c rans.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # Structured-mutation fuzz for the rans record parser/decoder under
@@ -1605,7 +1696,7 @@ V4_TEST_LINK_OBJS += COLI_V4_UNIT_GPU.o backend_loader_dsv4.o
 V4_TEST_EXTRA_TARGETS = COLI_V4_UNIT_GPU.o backend_loader_dsv4.o
 endif
 
-tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4.h \
+tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4.h compat.h \
 		Makefile.deepseek-v4.units Makefile.deepseek-v4
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
 		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
@@ -1657,7 +1748,7 @@ tests/test_v4_serve_framing$(EXE): tests/test_v4_serve_framing.c deepseek_v4.c \
 
 endif
 
-tests/test_route_trace$(EXE): tests/test_route_trace.c route_trace.h
+tests/test_route_trace$(EXE): tests/test_route_trace.c route_trace.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_cli_args$(EXE): tests/test_cli_args.c cli_args.h
@@ -1667,7 +1758,73 @@ tests/test_cli_args$(EXE): tests/test_cli_args.c cli_args.h
 # coli_cuda_* e registra cosa riceve. E' il solo modo di provare in CI che un
 # esperto arriva davvero in VRAM e nel formato giusto (#1331) -- un test che si
 # fermasse a "qt_init ritorna 1" sarebbe passato anche col difetto.
-tests/test_qwen36_tier_int8$(EXE): tests/test_qwen36_tier_int8.c qwen36_tier.c qwen36_tier.h backend_cuda.h
+tests/test_qwen36_tier_int8$(EXE): tests/test_qwen36_tier_int8.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend (tests/qwen36_fake_cuda.h), two devices: proves the tier's
+# per-device input-replica block (G.is_x) is sized and strided so device 1's
+# block cannot run past the end of the buffer or into device 0's (#1339).
+tests/test_qwen36_tier_multidev$(EXE): tests/test_qwen36_tier_multidev.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend, single device: proves qt_shutdown returns (under an
+# alarm(10) watchdog) instead of hanging forever when a group is still open
+# and an LFRU swap is parked waiting for cv_take (#1340).
+tests/test_qwen36_tier_shutdown$(EXE): tests/test_qwen36_tier_shutdown.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend, but driving the ENGINE: the warmstart in qwen36.c hands the
+# tier raw pointers into the RAM expert slots, so only a test that includes
+# qwen36.c can prove the weights behind them are still there afterwards -- on an
+# int8 container there is no packed copy to rebuild them from (#1341). Includes
+# qwen36_tier.c in its own TU like the other tier tests, so nothing else is
+# compiled in and no model file is needed.
+# Same fake backend, the RULES the three regression tests above are instances
+# of: budget accounting balances on every device (reservations are consumed or
+# returned, never leaked), shutdown wakes all four cv_take waiters at once, and
+# issue blocks stay inside, disjoint and at their device's slot under random
+# routing on 1-3 devices. Under test-asan the third doubles as a fuzz for the
+# #1339 class.
+tests/test_qwen36_tier_invariants$(EXE): tests/test_qwen36_tier_invariants.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend, with uploads that take time: qt_fill_wait must not return
+# until the last enqueued expert is RESIDENT, not merely dequeued -- the engine
+# frees the RAM int8 copies right after it (#1360 saw the gap one run in
+# fifteen; here the slow upload hook makes it every run without the fix).
+tests/test_qwen36_tier_fill_wait$(EXE): tests/test_qwen36_tier_fill_wait.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend: the automatic placement (COLI_PLACE unset/"auto") puts
+# the offered dense trunk into VRAM by bytes-saved-per-byte, prices displaced
+# experts by heat, keeps the trunk on the CPU when the marginal experts are
+# hotter, honours an explicit list and "off", and takes placed bytes out of
+# the expert budget -- on one and on two devices.
+tests/test_qwen36_tier_autoplace$(EXE): tests/test_qwen36_tier_autoplace.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend: the fp8 streaming mode a model whose experts do not fit
+# in RAM needs (Qwen3.8) -- cap < n_experts accepted, fmt=8 uploads with
+# 128x128 block scales, bytes staged unchanged, no pointer kept into the
+# engine's recycled slot, promotion decided when the bytes pass by.
+tests/test_qwen36_tier_fp8$(EXE): tests/test_qwen36_tier_fp8.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Generic resident dense matrices (the Qwen3.8 trunk) and per-offer placement.
+tests/test_qwen36_tier_dense$(EXE): tests/test_qwen36_tier_dense.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c tests/qwen36_fake_cuda.h qwen36.c expert_ffn.h qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# #1391: il decode path deve offrire gli esperti int8 al tier, non solo il warmstart
+tests/test_qwen36_tier_int8_decode$(EXE): tests/test_qwen36_tier_int8_decode.c tests/qwen36_fake_cuda.h qwen36.c expert_ffn.h qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# The qwen38 engine through its own main() on the fake backend: tier start
+# from the FP8 fixture, reduced CPU list, qt_note on recycled slots, oracle
+# tokens unchanged. Needs the fixture (qwen38-tiny-fp8-generate).
+tests/test_qwen38_tier_engine$(EXE): tests/test_qwen38_tier_engine.c tests/qwen36_fake_cuda.h qwen38.c qwen38_core.h qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h quant.h route_trace.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
 tests/test_serve_poll$(EXE): tests/test_serve_poll.c serve_poll.h
@@ -1677,6 +1834,11 @@ tests/test_serve_poll$(EXE): tests/test_serve_poll.c serve_poll.h
 # salta da solo dove /proc non esiste.
 tests/test_rss_anon$(EXE): tests/test_rss_anon.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# #1375: la memoria disponibile e' misurata in compat.h per Linux, macOS e
+# Windows; questo test gira nei tre job e fallisce dove la misura vale 0.
+tests/test_mem_available$(EXE): tests/test_mem_available.c compat.h
+	$(CC) $(CFLAGS) tests/test_mem_available.c -o $@ $(LDFLAGS)
 
 tests/test_798_guards$(EXE): tests/test_798_guards.c st.h json.h compat.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1720,6 +1882,11 @@ tests/test_ssd_probe$(EXE): tests/test_ssd_probe.c colibri.c st.h uring.h json.h
 tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# bench_router_select is a microbenchmark (duplicate-prefix scan vs marked-score scan),
+# not a test gate. Build on demand: make tests/bench_router_select.
+tests/bench_router_select$(EXE): tests/bench_router_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 # bench_indexer_allocations: microbenchmark (DeepSeek V4 indexer malloc vs persistent arena scratch), NOT a test gate.
 # Build on demand: make tests/bench_indexer_allocations
 tests/bench_indexer_allocations$(EXE): tests/bench_indexer_allocations.c
@@ -1752,7 +1919,10 @@ tests/test_pilot_ring$(EXE): tests/test_pilot_ring.c colibri.c st.h uring.h json
 tests/test_moe_gs_guard$(EXE): tests/test_moe_gs_guard.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_omp_tune$(EXE): tests/test_omp_tune.c omp_tune.h
+tests/test_omp_tune$(EXE): tests/test_omp_tune.c omp_tune.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_compat_env$(EXE): tests/test_compat_env.c compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_kvb_notice$(EXE): tests/test_kvb_notice.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
@@ -1839,7 +2009,7 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) \
+install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
@@ -1852,6 +2022,7 @@ install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen3
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
 	$(INSTALL) -m 755 qwen36$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen36$(EXE)
 	$(INSTALL) -m 755 qwen38$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen38$(EXE)
+	$(INSTALL) -m 755 deepseek_v41$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v41$(EXE)
 	@if [ -f deepseek_v4$(EXE) ]; then \
 	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
 	fi

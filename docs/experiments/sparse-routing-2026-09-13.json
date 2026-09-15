@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "hypothesis": "Marking selected router scores removes the repeated duplicate-prefix scan without changing finite-score ordering or non-finite fallback behavior.",
+  "commit": "0702319e100151eb213cda901e8637bdfd8942e6",
+  "model": "Synthetic router-selection fixture; E/K/score-shape matrix, no checkpoint",
+  "command": "make -C c tests/bench_router_select && ./c/tests/bench_router_select",
+  "prompt_hash": "sha256: no prompt; deterministic score arrays",
+  "hardware": {
+    "cpu": "Apple M1 Max, 10 cores (8 performance, 2 efficiency)",
+    "ram": "64 GB unified memory",
+    "storage": "Internal APFS volume",
+    "os": "macOS Darwin 25.6.0 arm64; Apple clang 17.0.0"
+  },
+  "warmup_runs": 0,
+  "changed_variables": ["top_k_selection"],
+  "baseline": {
+    "config": {
+      "top_k_selection": "duplicate-prefix scan",
+      "matrix": "E/K/shape cells fixed"
+    },
+    "samples": {
+      "tok_s": [
+        1000000.0,
+        200000.0,
+        13333.333333333334,
+        1000000.0,
+        200000.0,
+        10752.68817204301,
+        1000000.0,
+        200000.0,
+        10204.08163265306
+      ]
+    },
+    "median_tok_s": 200000.0,
+    "quality": {
+      "method": "router finite-ordering and non-finite fallback tests",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/sparse-routing-2026-09-13.txt",
+      "sha256": "9815b4437e0beeb7a2731cf3deadd21f4bf8266cbfc7c83ac558556d7466c3bd"
+    }
+  },
+  "trial": {
+    "config": {
+      "top_k_selection": "marked-score scan",
+      "matrix": "E/K/shape cells fixed"
+    },
+    "samples": {
+      "tok_s": [
+        1000000.0,
+        333333.3333333333,
+        76923.07692307692,
+        1000000.0,
+        250000.0,
+        58823.5294117647,
+        1000000.0,
+        333333.3333333333,
+        62500.0
+      ]
+    },
+    "median_tok_s": 333333.3333333333,
+    "quality": {
+      "method": "router finite-ordering and non-finite fallback tests",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/sparse-routing-2026-09-13.txt",
+      "sha256": "9815b4437e0beeb7a2731cf3deadd21f4bf8266cbfc7c83ac558556d7466c3bd"
+    }
+  },
+  "outcome": "improvement"
+}

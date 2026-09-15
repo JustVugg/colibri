@@ -2,6 +2,7 @@ import http.client
 import io
 import json
 import math
+import os
 import socket
 import tempfile
 import threading
@@ -17,7 +18,7 @@ from pathlib import Path
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
-                           _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
+                           _engine_error, _image_bytes_from_url, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
                            parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
                            read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
@@ -1180,10 +1181,14 @@ class CapSentinelShimTest(unittest.TestCase):
             self._spawn_argv("engine", str(model))
 
     def test_cap_for_arch_is_the_single_translation_point(self):
+        # 0 is the "you decide" sentinel, and it goes to the engines that
+        # actually do decide: glm resolves it platform-aware, olmoe sizes its
+        # expert cache from the RAM budget once the dense weights are resident
+        # (#1443). The others still get the legacy eight slots per layer.
         self.assertEqual(cap_for_arch("glm", None), 0)
+        self.assertEqual(cap_for_arch("olmoe", None), 0)
         self.assertEqual(cap_for_arch("inkling", None), 8)
         self.assertEqual(cap_for_arch("kimi", None), 8)
-        self.assertEqual(cap_for_arch("olmoe", None), 8)
         self.assertEqual(cap_for_arch("glm", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 0), 0)   # explicit 0 is explicit
@@ -2023,6 +2028,21 @@ class ThinkingSplitUnitTest(unittest.TestCase):
         self.assertEqual(split_thinking_reply("plain answer", enable_thinking=False),
                          ("", "plain answer"))
 
+    def test_glm53_starts_in_reasoning_even_with_thinking_off(self):
+        """#1278: render_chat_glm53 opens <think> unconditionally (the template
+        has no switch; "off" only lowers the effort), so the reply always starts
+        inside the block. With the splitter started in text mode the reasoning
+        streamed as `content`, glued in front of the answer. The family, not the
+        client flag, decides where the output starts."""
+        import openai_server as srv
+        with patch("openai_server.ARCH", "glm53"):
+            self.assertTrue(srv.starts_in_reasoning(False))
+            self.assertEqual(split_thinking_reply("why</think>answer", enable_thinking=False),
+                             ("why", "answer"))
+        with patch("openai_server.ARCH", "glm"):
+            self.assertFalse(srv.starts_in_reasoning(False),
+                             "GLM-5.2 closes the block in the prompt when thinking is off")
+
     def test_missing_close_tag_surfaces_reasoning(self):
         self.assertEqual(split_thinking_reply("thought with no end"),
                          ("thought with no end", ""))
@@ -2565,6 +2585,112 @@ class ReasoningEffortTest(unittest.TestCase):
         text = render_chat(self.MESSAGES, enable_thinking=False,
                            reasoning_effort="xhigh")
         self.assertNotIn("Reasoning Effort", text)
+
+
+class ImageUrlPathGuard(unittest.TestCase):
+    """image_url.url naming a local file is read with the server's rights, so
+    it is denied unless the operator sets COLI_IMAGE_ROOT, and then only
+    inside it (GHSA follow-up to #1354, whose guards left every absolute path
+    readable by default). data: URIs are the client's way in. Errors stay
+    generic so a reply never confirms a path or its permissions."""
+
+    def setUp(self):
+        self._saved = os.environ.pop("COLI_IMAGE_ROOT", None)
+
+    def tearDown(self):
+        os.environ.pop("COLI_IMAGE_ROOT", None)
+        if self._saved is not None:
+            os.environ["COLI_IMAGE_ROOT"] = self._saved
+
+    def test_data_uri_is_the_default_way_in(self):
+        import base64
+        payload = base64.b64encode(b"\x89PNG\r\n").decode()
+        self.assertEqual(_image_bytes_from_url("data:image/png;base64," + payload), b"\x89PNG\r\n")
+
+    def test_local_paths_are_denied_by_default(self):
+        with tempfile.TemporaryDirectory() as root:
+            img = Path(root) / "pic.png"
+            img.write_bytes(b"\x89PNG\r\n")
+            for url in (str(img), "file://" + str(img), "/etc/passwd", "file:///etc/passwd", "relative.png"):
+                with self.assertRaises(APIError) as caught:
+                    _image_bytes_from_url(url)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertIn("COLI_IMAGE_ROOT", str(caught.exception))
+                self.assertNotIn("passwd", str(caught.exception))
+
+    def test_image_root_allows_inside_and_refuses_outside(self):
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.NamedTemporaryFile(suffix=".png") as outside:
+            os.environ["COLI_IMAGE_ROOT"] = root
+            inside = Path(root) / "ok.png"
+            inside.write_bytes(b"ok")
+            self.assertEqual(_image_bytes_from_url(str(inside)), b"ok")
+            self.assertEqual(_image_bytes_from_url("file://" + str(inside)), b"ok")
+            for url in (outside.name, "/etc/passwd", str(Path(root) / ".." / Path(outside.name).name)):
+                with self.assertRaises(APIError) as caught:
+                    _image_bytes_from_url(url)
+                self.assertNotIn(Path(outside.name).name, str(caught.exception))
+
+    def test_a_symlink_escaping_the_root_is_refused(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("no symlinks here")
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.NamedTemporaryFile(suffix=".png") as outside:
+            os.environ["COLI_IMAGE_ROOT"] = root
+            link = Path(root) / "link.png"
+            try:
+                os.symlink(outside.name, link)
+            except OSError:
+                self.skipTest("cannot create symlinks here")
+            with self.assertRaises(APIError):
+                _image_bytes_from_url(str(link))
+
+    def test_a_missing_or_file_root_denies_everything(self):
+        with tempfile.TemporaryDirectory() as root:
+            img = Path(root) / "pic.png"
+            img.write_bytes(b"x")
+            os.environ["COLI_IMAGE_ROOT"] = str(Path(root) / "nowhere")
+            with self.assertRaises(APIError):
+                _image_bytes_from_url(str(img))
+            os.environ["COLI_IMAGE_ROOT"] = str(img)
+            with self.assertRaises(APIError):
+                _image_bytes_from_url(str(img))
+
+    def test_error_does_not_leak_the_path(self):
+        os.environ["COLI_IMAGE_ROOT"] = tempfile.gettempdir()
+        with self.assertRaises(APIError) as caught:
+            _image_bytes_from_url("/no/such/secret-name.png")
+        self.assertNotIn("secret-name", str(caught.exception))
+
+
+class ContextExceededMessageTest(unittest.TestCase):
+    """#1376: the engine writes `CONTEXT_EXCEEDED prompt_tokens=N requested=M
+    capacity=C`. The message took fields[2] ("requested=M", the completion
+    budget) as the limit and printed the raw key=value token, so a user with a
+    9000-token prompt on an 8192 ceiling read "maximum context length is
+    requested=4 tokens". The number that mattered, capacity, appeared nowhere."""
+
+    def test_limit_is_capacity_and_used_is_prompt_tokens(self):
+        from openai_server import _engine_error
+        err = _engine_error(["CONTEXT_EXCEEDED", "prompt_tokens=9000", "requested=4",
+                             "capacity=8192"], "ignored")
+        text = str(err)
+        self.assertIn("8192", text)
+        self.assertIn("9000", text)
+        self.assertNotIn("requested=", text)
+        self.assertNotIn("prompt_tokens=", text)
+        self.assertNotIn("capacity=", text)
+
+    def test_the_positional_spelling_of_colibri_and_deepseek_still_reads(self):
+        from openai_server import _engine_error
+        text = str(_engine_error(["CONTEXT_EXCEEDED", "8321", "4094"], "ignored"))
+        self.assertIn("4094", text)
+        self.assertIn("8321", text)
+
+    def test_missing_fields_do_not_crash_the_message(self):
+        from openai_server import _engine_error
+        text = str(_engine_error(["CONTEXT_EXCEEDED"], "ignored"))
+        self.assertIn("the context", text)
 
 
 if __name__ == "__main__":

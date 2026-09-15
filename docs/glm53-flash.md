@@ -102,9 +102,12 @@ hold experts rather than as an accelerator here.
 
 ## Vision
 
-Reachable from every surface: a path pasted in `coli chat`, a file attached or
-dropped in `coli web`, or an OpenAI `image_url` part with a base64 data URI or a
-local path. Remote URLs are refused rather than fetched — a request should not
+Reachable from every surface: a path pasted in `coli chat` (read by the client,
+sent as a data URI), a file attached or dropped in `coli web`, or an OpenAI
+`image_url` part with a base64 data URI. A local path in the request is read
+only under `COLI_IMAGE_ROOT` (see `docs/ENVIRONMENT.md`): a file read by the
+server happens with its own rights, and an inference client is not the
+operator. Remote URLs are refused rather than fetched — a request should not
 make the server open a network connection of the sender's choosing.
 
 `tools/glm53_image.py` does the preprocessing and is pinned against the official
