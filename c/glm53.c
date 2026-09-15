@@ -71,6 +71,7 @@
 #include "st.h"
 #include "quant.h"
 #include "tok.h"
+#include "qwen36_tier.h"
 #ifdef COLI_METAL
 #include "backend_metal.h"
 static int g_metal_ready = 0;
@@ -703,6 +704,7 @@ typedef struct {
     int has_io;                           /* embedding e testa: solo agli estremi */
     /* esperti: o residenti (checkpoint f32) o in streaming (container int4) */
     int streaming;
+    int cuda_tier_owner;                   /* solo il modello pieno possiede il tier globale */
     struct ERef *eref;
     struct LCache *ecache;
     int64_t e_len[6], e_at[6], e_slot;
@@ -1592,12 +1594,58 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         }
         m->t_disk += now_s() - t_batch0;  /* fuori dalla regione omp: e' il muro del batch */
 
+        /* CUDA issues one token's resident routes while the CPU computes its
+         * misses. qt_note owns all six pieces before returning, so the uploader
+         * never observes a RAM slot after GLM recycles it for the next block. */
+        int moe_done = 0;
+        if (m->cuda_tier_owner) {
+            int *eids = malloc((size_t)topk * sizeof(*eids));
+            int *which = malloc((size_t)topk * sizeof(*which));
+            float *vals = malloc((size_t)topk * sizeof(*vals));
+            if (!eids || !which || !vals) { fprintf(stderr, "OOM sul gruppo CUDA MoE\n"); exit(1); }
+            for (int t = 0; t < tokens; t++) {
+                int nr = 0;
+                for (int i = 0; i < here; i++) {
+                    const int eid = union_ids[base + i];
+                    float scale = 0.0f;
+                    for (int k = 0; k < topk; k++)
+                        if (chosen[(size_t)t * topk + k] == eid) {
+                            scale = weight[(size_t)t * topk + k];
+                            break;
+                        }
+                    if (scale == 0.0f) continue;
+                    const Slot *slot = &cache->s[slot_of[i]];
+                    qt_note(index, eid,
+                            slot->piece[0], slot->piece[2], slot->piece[4],
+                            (const float *)slot->piece[1],
+                            (const float *)slot->piece[3],
+                            (const float *)slot->piece[5]);
+                    eids[nr] = eid; which[nr] = i; vals[nr] = scale; nr++;
+                }
+                if (!nr) continue;
+                float *dst = out + (size_t)t * c->hidden;
+                uint32_t mask = qt_issue(index, eids, nr,
+                                         x + (size_t)t * c->hidden);
+                for (int r = 0; r < nr; r++) {
+                    if (mask & (1u << r)) continue;
+                    Slot *slot = &cache->s[slot_of[which[r]]];
+                    Mat gate, up, down;
+                    expert_mats(m, slot, &gate, &up, &down);
+                    mlp3(tmp, x + (size_t)t * c->hidden, &gate, &up, &down,
+                         c->swiglu_limit, sg, su);
+                    for (int d = 0; d < c->hidden; d++) dst[d] += vals[r] * tmp[d];
+                }
+                qt_take(mask, vals, nr, dst);       /* paired even when mask == 0 */
+            }
+            free(vals); free(which); free(eids);
+            moe_done = 1;
+        }
+
         /* Try all experts in this cache-sized block as one Metal command buffer.
          * xg is grouped by expert; rows/rw preserve the exact CPU scatter weights.
          * On any backend refusal/fault, run the original CPU loop unchanged. */
-        int metal_done = 0;
 #ifdef COLI_METAL
-        if (g_metal_ready) {
+        if (!moe_done && g_metal_ready) {
             g_metal_moe_attempt++;
             const int max_rows = tokens * topk;
             const void **mg = malloc((size_t)here * sizeof(*mg));
@@ -1636,21 +1684,21 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                         rows[R] = t; rw[R] = scale; nr[i]++; R++;
                     }
                 }
-                metal_done = coli_metal_moe_block_clamped(
+                moe_done = coli_metal_moe_block_clamped(
                     here, c->hidden, c->moe_inter, 4, 64,
                     mg, mu, md, mgs, mus, mds, xg, xoff, nr, rows, rw,
                     out, tokens, c->swiglu_limit);
-                if (metal_done) {
+                if (moe_done) {
                     g_metal_moe_ok++;
                     g_metal_moe_rows += (uint64_t)R;
                 }
             }
-            if (!metal_done) g_metal_moe_fallback++;
+            if (!moe_done) g_metal_moe_fallback++;
             free(xg); free(rw); free(rows); free(nr); free(xoff);
             free(mds); free(mus); free(mgs); free(md); free(mu); free(mg);
         }
 #endif
-        if (!metal_done) {
+        if (!moe_done) {
             /* CPU fallback: one expert at a time, then every token that chose it. */
             for (int i = 0; i < here; i++) {
                 const int eid = union_ids[base + i];
@@ -2085,6 +2133,11 @@ static void mat_release(Mat *mat) {
 
 static void model_release(GModel *m) {
     if (!m) return;
+    if (m->cuda_tier_owner) {
+        qt_stats();
+        qt_shutdown();
+        m->cuda_tier_owner = 0;
+    }
     if (m->layer) {
         for (int i = m->layer_begin; i < m->layer_end; i++) {
             GLayer *l = &m->layer[i];
@@ -2152,9 +2205,19 @@ static void model_release(GModel *m) {
     memset(m, 0, sizeof(*m));
 }
 
-/* Il caso pieno: tutti i layer, embedding e testa comprese. */
+/* Il caso pieno: tutti i layer, embedding e testa comprese. Solo questo
+ * modello puo' possedere il tier CUDA globale; segment ed edge usano
+ * model_load_range direttamente e restano indipendenti. */
 static void model_load(GModel *m, const char *dir) {
     model_load_range(m, dir, 0, -1, 1);
+    if (m->streaming) {
+        const int first = m->c.first_dense;
+        const int cap = m->ecache && first < m->c.n_layers
+                      ? m->ecache[first].cap : 0;
+        m->cuda_tier_owner = qt_init_stream_int4(
+            m->c.n_layers, m->c.n_experts, m->c.hidden, m->c.moe_inter,
+            cap, m->c.topk, m->c.swiglu_limit);
+    }
 }
 
 /* ---------- il passaggio completo ----------
@@ -2479,6 +2542,16 @@ static void slot_reset(const GModel *m, KVSlot *slot) {
     if (slot->session) session_close(m, slot->session);
     slot->session = NULL;
     slot->n = 0;
+}
+
+static void slots_release(const GModel *m) {
+    for (int i = 0; i < g_n_slots; i++) {
+        slot_reset(m, &g_slots[i]);
+        free(g_slots[i].tokens);
+        g_slots[i].tokens = NULL;
+        g_slots[i].cap = 0;
+    }
+    g_n_slots = 0;
 }
 
 /* Quanti token iniziali lo slot ha gia' in cache e puo' tenere. */
@@ -3026,9 +3099,12 @@ int main(int argc, char **argv) {
         const char *batch = getenv("SERVE_BATCH");
         arm_stops(snap, &serve_tok, batch && atoi(batch));
         serve_loop(&served, &serve_tok);
+        slots_release(&served);
+        pending_clear();
         glm53_telemetry_save();
         rt_destroy();
         tok_free(&serve_tok);
+        model_release(&served);
         return 0;
     }
 
@@ -3185,6 +3261,7 @@ int main(int argc, char **argv) {
     rt_destroy();
     free(vision);
     free(tokens);
+    model_release(&model);
     return 0;
 }
 #endif /* GLM53_NO_MAIN */

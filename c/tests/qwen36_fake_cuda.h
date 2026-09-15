@@ -30,41 +30,64 @@
 
 struct ColiCudaTensor { int fmt, I, O, device, gs; const void *w; };
 
-static int fake_uploads;
+static int fake_uploads, fake_frees, fake_live_tensors;
+static int fake_fail_upload;
 static int last_fmt = -1;
 static size_t last_bytes;
-static unsigned char captured[4096];
-static size_t captured_len;
+static unsigned char captured[3][4096];
+static size_t captured_len[3];
+static float captured_scales[3][4096];
+static size_t captured_scale_count[3];
 
 static int fake_ndev = 1;
 static size_t fake_free_bytes = 2ull << 30;    /* what coli_cuda_mem_info reports as free */
 static int (*fake_issue_hook)(int device, int count, const float *x) = NULL;
 static void (*fake_upload_hook)(int fmt) = NULL;
+static void (*fake_free_hook)(ColiCudaTensor *tensor) = NULL;
+static int fake_plain_issues, fake_clamped_issues, fake_takes;
+static float fake_last_swiglu_limit;
+static float fake_take_output[4096];
+static int fake_take_returns_output;
 
-static int upload_common(ColiCudaTensor **t, const void *w, int fmt,
-                         int I, int O, int device, int gs) {
+static int upload_common(ColiCudaTensor **t, const void *w, const float *s,
+                         int fmt, int I, int O, int device, int gs) {
     if (fake_upload_hook) fake_upload_hook(fmt);
+    const int call = ++fake_uploads;
+    if (fake_fail_upload == call) return 0;
     ColiCudaTensor *n = (ColiCudaTensor *)calloc(1, sizeof *n);
     n->fmt = fmt; n->I = I; n->O = O; n->device = device; n->gs = gs; n->w = w;
     *t = n;
-    fake_uploads++;
+    fake_live_tensors++;
     last_fmt = fmt;
     last_bytes = (size_t)I * O / ((fmt == 1 || fmt == 8) ? 1 : 2);
-    if (fake_uploads == 1) {
-        captured_len = last_bytes < sizeof captured ? last_bytes : sizeof captured;
-        memcpy(captured, w, captured_len);
+    if (call <= 3) {
+        int i = call - 1;
+        captured_len[i] = last_bytes < sizeof captured[i] ? last_bytes : sizeof captured[i];
+        memcpy(captured[i], w, captured_len[i]);
+        size_t ns = fmt == 8 ? (size_t)((O + 127) / 128) * ((I + 127) / 128)
+                             : gs > 0 ? (size_t)O * ((I + gs - 1) / gs)
+                                      : (size_t)O;
+        captured_scale_count[i] = ns < sizeof captured_scales[i] / sizeof captured_scales[i][0]
+                                ? ns : sizeof captured_scales[i] / sizeof captured_scales[i][0];
+        memcpy(captured_scales[i], s, captured_scale_count[i] * sizeof(float));
     }
     return 1;
 }
 int coli_cuda_tensor_upload(ColiCudaTensor **t, const void *w, const float *s,
                             int fmt, int I, int O, int device) {
-    (void)s; return upload_common(t, w, fmt, I, O, device, 0);
+    return upload_common(t, w, s, fmt, I, O, device, 0);
 }
 int coli_cuda_tensor_upload_g(ColiCudaTensor **t, const void *w, const float *s,
                               int fmt, int I, int O, int device, int gs) {
-    (void)s; return upload_common(t, w, fmt, I, O, device, gs);
+    return upload_common(t, w, s, fmt, I, O, device, gs);
 }
-void coli_cuda_tensor_free(ColiCudaTensor *t) { free(t); }
+void coli_cuda_tensor_free(ColiCudaTensor *t) {
+    if (t) {
+        if (fake_free_hook) fake_free_hook(t);
+        fake_frees++; fake_live_tensors--;
+    }
+    free(t);
+}
 int coli_cuda_available_device_count(void) { return fake_ndev; }
 int coli_cuda_device_count(void) { return fake_ndev; }
 int coli_cuda_init(const int *d, int n) { (void)d; (void)n; return 1; }
@@ -80,10 +103,22 @@ int coli_cuda_expert_group_issue(ColiCudaTensor *const *g, ColiCudaTensor *const
                                  ColiCudaTensor *const *d, const int *rows,
                                  int count, const float *x) {
     (void)u; (void)d; (void)rows;
+    fake_plain_issues++;
     if (fake_issue_hook) return fake_issue_hook(count > 0 ? g[0]->device : -1, count, x);
     return 0;
 }
-const float *coli_cuda_expert_group_take(int device) { (void)device; return NULL; }
+int coli_cuda_expert_group_issue_clamped(ColiCudaTensor *const *g, ColiCudaTensor *const *u,
+                                         ColiCudaTensor *const *d, const int *rows,
+                                         int count, const float *x, float limit) {
+    (void)u; (void)d; (void)rows;
+    fake_clamped_issues++; fake_last_swiglu_limit = limit;
+    if (fake_issue_hook) return fake_issue_hook(count > 0 ? g[0]->device : -1, count, x);
+    return 0;
+}
+const float *coli_cuda_expert_group_take(int device) {
+    (void)device; fake_takes++;
+    return fake_take_returns_output ? fake_take_output : NULL;
+}
 void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                            double *h2d, double *kernel, double *d2h) {
     if (calls) *calls = 0; if (experts) *experts = 0; if (rows) *rows = 0;

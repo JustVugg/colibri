@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <pthread.h>
 #ifdef __linux__
 #include <unistd.h>
@@ -63,6 +64,7 @@ static struct {
     /* M3 */
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
     int issue_open;                       /* guard: no tensor_free while a group is in flight */
+    int blocking_calls;                    /* note/fill callers that shutdown must wake and join */
     pthread_cond_t cv_take;               /* signals qt_take done + queue space */
     uint64_t tick, swaps, pf_hits, pf_notes;
     uint32_t *heat0;                      /* heat table loaded from HEAT_FILE */
@@ -205,6 +207,11 @@ static void *uploader(void *arg){
               && coli_cuda_tensor_upload(&td, w+2*mb, sc+2*G.Ih,   2, G.Ih, G.D,  dv);
         }
         free(w); free(sc);
+        if(!ok){
+            if(tg) coli_cuda_tensor_free(tg);
+            if(tu) coli_cuda_tensor_free(tu);
+            if(td) coli_cuda_tensor_free(td);
+        }
         pthread_mutex_lock(&G.mx);
         QSlot *s=qs(layer,eid);
         if(ok){ s->tg=tg; s->tu=tu; s->td=td; s->resident=1; G.uploads++; }
@@ -455,13 +462,21 @@ static void auto_place(int nl, int ne, int topk, const size_t *capacity, const u
  * promotion can therefore only happen when the bytes pass by -- the LFRU
  * decision moves from the periodic tick into qt_note, which asks: is this
  * expert, now in hand, hotter than the coldest resident on its device? */
-static int G_fp8_stream;
+static int G_fp8_stream, G_int4_stream;
+static float G_stream_swiglu_limit;
 static const float *G_fp8_lut;
 
 int qt_init_fp8(int nl, int ne, int D, int Ih, int cap, int topk, const float *e4m3_lut){
     G_fp8_stream = 1; G_fp8_lut = e4m3_lut;
     int ok = qt_init(nl, ne, D, Ih, cap, topk, 0, 0);
     if(!ok) G_fp8_stream = 0;
+    return ok;
+}
+int qt_init_stream_int4(int nl, int ne, int D, int Ih, int cap, int topk, float limit){
+    if(nl<1||ne<1||D<1||Ih<1||cap<1||cap>ne||topk<1||!isfinite(limit)||limit<=0) return 0;
+    G_int4_stream = 1; G_stream_swiglu_limit = limit;
+    int ok = qt_init(nl, ne, D, Ih, cap, topk, 64, 1);
+    if(!ok) G_int4_stream = 0;
     return ok;
 }
 
@@ -487,7 +502,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             int expert_is_int4){
     const char *e=getenv("COLI_CUDA");
     if(!(e && *e=='1')) return 0;
-    if(cap != ne && !G_fp8_stream){
+    if(cap != ne && !G_fp8_stream && !G_int4_stream){
         fprintf(stderr,"[qtier] cap=%d != n_experts=%d -> tier disabled (needs full RAM residency)\n",cap,ne);
         return 0;
     }
@@ -588,16 +603,17 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     for(int i=0;i<G.ndev;i++){
         size_t freeb=0,totb=0; coli_cuda_mem_info(G.dev[i],&freeb,&totb);
         capdev[i] = G.dev[i];
+        size_t headroom = G_int4_stream ? (3ull << 29) : (1ull << 30);
         capacity[i] = (bg && strcmp(bg,"auto") && atof(bg)>0)
                    ? (size_t)(atof(bg)*1024.0*1024.0*1024.0)
-                   : (freeb>(1ull<<30) ? freeb-(1ull<<30) : 0);
+                   : (freeb>headroom ? freeb-headroom : 0);
         fprintf(stderr,"[qtier] dev %d: %.1f GB free, allowance %.1f GB\n",
                 G.dev[i], freeb/1073741824.0, capacity[i]/1073741824.0);
     }
     G.slot=calloc((size_t)nl*ne,sizeof(QSlot));
     if(!G.slot) return 0;
     const char *hf=getenv("HEAT_FILE");
-    if(hf){
+    if(hf && !G_int4_stream){
         FILE *f=fopen(hf,"rb");
         if(f){
             uint32_t hdr[3]={0,0,0};
@@ -769,6 +785,25 @@ int qt_is_resident(int layer,int eid){
     return r;
 }
 
+size_t qt_resident_count(void){
+    if(!G.on) return 0;
+    pthread_mutex_lock(&G.mx);
+    size_t n=0;
+    for(size_t i=0;i<(size_t)G.nl*G.ne;i++) n+=G.slot[i].resident;
+    pthread_mutex_unlock(&G.mx);
+    return n;
+}
+
+size_t qt_resident_bytes(void){
+    if(!G.on) return 0;
+    pthread_mutex_lock(&G.mx);
+    size_t n=0;
+    for(size_t i=0;i<(size_t)G.nl*G.ne;i++) n+=G.slot[i].resident;
+    size_t bytes=n*G.exp_bytes;
+    pthread_mutex_unlock(&G.mx);
+    return bytes;
+}
+
 /* internal, G.mx held: enqueue one upload. victim=-1: plain upload (budget is
  * reserved here); victim>=0: LFRU swap (budget neutral). */
 static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
@@ -831,7 +866,7 @@ void qt_note(int layer,int eid,
     if(!G.on || !g4) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
-    if(G_fp8_stream){
+    if(G_fp8_stream || G_int4_stream){
         if(s->heat<0xFFFFFFFFu) s->heat++;
         stream_point(s,g4,u4,d4,gs,us,ds);
         stream_promote_locked(layer,eid);
@@ -852,11 +887,14 @@ void qt_note_block(int layer,int eid,
     if(!G.on || !g4) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
+    G.blocking_calls++;
     if(G_fp8_stream) stream_point(s,g4,u4,d4,gs,us,ds);
     else if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
     while(G.qn>=QT_QCAP && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
     enqueue_locked(layer,eid,-1,-1,0);
     if(G_fp8_stream) stream_forget(s);
+    G.blocking_calls--;
+    pthread_cond_broadcast(&G.cv_take);
     pthread_mutex_unlock(&G.mx);
 }
 
@@ -935,6 +973,7 @@ void qt_note_planned(int layer,int eid,
     if(!G.on) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
+    G.blocking_calls++;
     if(!g4){
         /* The loader had nothing to hand over. qt_plan_fill reserved budget
          * and set planned=1 for this expert; returning here without undoing
@@ -942,6 +981,8 @@ void qt_note_planned(int layer,int eid,
          * and "if(resident||queued||planned) continue" never reconsiders the
          * expert. #1331 was this leak for every expert of an int8 container. */
         if(s->planned){ G.used[home(eid)]-=G.exp_bytes; s->planned=0; }
+        G.blocking_calls--;
+        pthread_cond_broadcast(&G.cv_take);
         pthread_mutex_unlock(&G.mx);
         return;
     }
@@ -954,6 +995,8 @@ void qt_note_planned(int layer,int eid,
     }
     s->planned=0;
     if(G_fp8_stream) stream_forget(s);
+    G.blocking_calls--;
+    pthread_cond_broadcast(&G.cv_take);
     pthread_mutex_unlock(&G.mx);
 }
 
@@ -966,7 +1009,10 @@ void qt_note_planned(int layer,int eid,
 void qt_fill_wait(void){
     if(!G.on) return;
     pthread_mutex_lock(&G.mx);
+    G.blocking_calls++;
     while(G.inflight>0 && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
+    G.blocking_calls--;
+    pthread_cond_broadcast(&G.cv_take);
     pthread_mutex_unlock(&G.mx);
 }
 
@@ -1024,7 +1070,10 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
         if(!c) continue;
         float *xr=G.is_x + (size_t)di*QT_MAX_ROWS*G.D;     /* per-device input block */
         for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x, (size_t)G.D*sizeof(float));
-        if(!coli_cuda_expert_group_issue(tg[di],tu[di],td[di],rows,c,xr)){
+        int ok = G_int4_stream
+               ? coli_cuda_expert_group_issue_clamped(tg[di],tu[di],td[di],rows,c,xr,G_stream_swiglu_limit)
+               : coli_cuda_expert_group_issue(tg[di],tu[di],td[di],rows,c,xr);
+        if(!ok){
             /* issue failed -> hand these k back to the CPU */
             for(int j=0;j<c;j++) mask &= ~(1u<<G.is_k[di][j]);
             G.is_cnt[di]=0;
@@ -1082,7 +1131,7 @@ void qt_stats(void){
 void qt_shutdown(void){
     if(!G.on) return;
     const char *hf=getenv("HEAT_FILE");
-    if(hf){
+    if(hf && !G_int4_stream){
         FILE *f=fopen(hf,"wb");
         if(f){
             uint32_t hdr[3]={0x51544831u,(uint32_t)G.nl,(uint32_t)G.ne};
@@ -1095,10 +1144,32 @@ void qt_shutdown(void){
     /* Wake cv_take too: the uploader's LFRU victim wait (and qt_note_block /
      * qt_note_planned / qt_fill_wait, all waiting on the same condvar) would
      * otherwise never notice th_stop and pthread_join below would hang (#1340). */
-    pthread_mutex_lock(&G.mx); G.th_stop=1; pthread_cond_signal(&G.cv); pthread_cond_broadcast(&G.cv_take); pthread_mutex_unlock(&G.mx);
+    pthread_mutex_lock(&G.mx);
+    G.th_stop=1; pthread_cond_signal(&G.cv); pthread_cond_broadcast(&G.cv_take);
+    while(G.blocking_calls) pthread_cond_wait(&G.cv_take,&G.mx);
+    pthread_mutex_unlock(&G.mx);
     pthread_join(G.th,NULL);
+    /* The backend queues expert kernels and the output download on its device
+     * streams. Drain every outstanding group before releasing weights those
+     * kernels may still reference. */
+    if(G.issue_open)
+        for(int i=0;i<G.ndev;i++)
+            if(G.is_cnt[i]) (void)coli_cuda_expert_group_take(G.dev[i]);
+    G.issue_open=0;
     G.on=0;
-    G_fp8_stream=0;
+    for(size_t i=0;i<(size_t)G.nl*G.ne;i++){
+        coli_cuda_tensor_free(G.slot[i].tg);
+        coli_cuda_tensor_free(G.slot[i].tu);
+        coli_cuda_tensor_free(G.slot[i].td);
+    }
+    if(G_lmh.t) coli_cuda_tensor_free(G_lmh.t);
+    for(int i=0;i<QT_DN_MAX_LAYERS;i++)
+        if(G_dnp[i].t) coli_cuda_tensor_free(G_dnp[i].t);
+    free(G.fill_order); free(G.heat0); free(G.is_x); free(G.slot);
+    G.fill_order=NULL; G.heat0=NULL; G.is_x=NULL; G.slot=NULL;
+    memset(&G_lmh,0,sizeof G_lmh); memset(G_dnp,0,sizeof G_dnp);
+    pthread_cond_destroy(&G.cv_take); pthread_cond_destroy(&G.cv); pthread_mutex_destroy(&G.mx);
+    G_fp8_stream=G_int4_stream=0;
     coli_cuda_shutdown();
 }
 

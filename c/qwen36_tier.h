@@ -7,10 +7,10 @@
  *
  *  - Every expert has one home device (eid % n_gpus), no duplicates.
  *  - Routing heat decides who earns VRAM (LFRU semantics from tier.h, with
- *    hysteresis); a warmstart pre-fills the budget before the first token,
- *    ordered by a persisted heat table (HEAT_FILE) when available.
+ *    decay and hysteresis). Persistent qwen slots may warmstart from HEAT_FILE;
+ *    recyclable streaming slots promote only from live routing.
  *  - Uploads run on a background thread through staging copies; decode never
- *    blocks on placement. A VRAM miss falls back to the CPU int8 path and
+ *    blocks on placement. A VRAM miss falls back to the engine's CPU path and
  *    overlaps with the in-flight GPU groups.
  *
  * Enable with COLI_CUDA=1 [COLI_GPUS=0,1] [CUDA_EXPERT_GB=<G>|auto]
@@ -24,8 +24,10 @@
 #ifdef COLI_CUDA
 
 /* Init after model load. Returns 1 when the tier is active.
- * cap_experts_per_layer must equal n_experts (full RAM residency): the tier
- * stores raw pointers into the expert slots, which must never be evicted. */
+ * qt_init is the persistent-pointer mode: cap_experts_per_layer must equal
+ * n_experts because the tier retains pointers into the engine's RAM slots.
+ * The streaming initializers below own their staging copy before returning and
+ * therefore allow cap_experts_per_layer < n_experts. */
 /* expert_is_int4: 1 = pesi int4 impacchettati (fmt=4), 0 = int8 (fmt=1). Il
  * chiamante lo determina dalla TAGLIA SU DISCO, non da meta.ebits, che su
  * qualche container mente (cfr. il rilevamento in qwen36.c). */
@@ -80,11 +82,16 @@ int  qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O);
  * to the backend so fmt=8 uploads are accepted. */
 int  qt_init_fp8(int n_layers, int n_experts, int hidden, int inter,
                  int cap_experts_per_layer, int topk, const float *e4m3_lut);
+int  qt_init_stream_int4(int n_layers, int n_experts, int hidden, int inter,
+                         int cap_experts_per_layer, int topk,
+                         float swiglu_limit);
 int  qt_init(int n_layers, int n_experts, int hidden, int inter,
              int cap_experts_per_layer, int topk, int expert_gs,
              int expert_is_int4);
 int  qt_ready(void);
 int  qt_is_resident(int layer, int eid);
+size_t qt_resident_count(void);
+size_t qt_resident_bytes(void);
 void qt_shutdown(void);
 
 /* Call once per routed expert per token (pointers to the RAM slot: packed
@@ -122,6 +129,7 @@ void qt_stats(void);
 
 static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g,int h){(void)h;(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_init_fp8(int a,int b,int c,int d,int e,int f,const float*g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
+static inline int  qt_init_stream_int4(int a,int b,int c,int d,int e,int f,float g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_lmhead_init(const int8_t*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int  qt_lmhead_matmul(float*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 #define QT_PLACE_CPU (-1)
@@ -131,6 +139,8 @@ static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e
 static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_ready(void){return 0;}
 static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
+static inline size_t qt_resident_count(void){return 0;}
+static inline size_t qt_resident_bytes(void){return 0;}
 static inline void qt_shutdown(void){}
 static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}

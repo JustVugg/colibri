@@ -1123,9 +1123,9 @@ NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
                    -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
 
 # GLM-5.3-Flash: routed experts stream from the int4-gs64 container.
-# METAL=1 accelerates resident matrices and routed MoE; CPU remains fallback.
-glm53$(EXE): glm53.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h serve_poll.h route_trace.h quant.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h backend_metal.h backend_vulkan.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(METAL_OBJ) $(VK_OBJ) $(VK_SPV)
-	$(CC) $(CFLAGS) glm53.c $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
+# CUDA/HIP owns promoted staging copies; Metal and CPU remain fallbacks.
+glm53$(EXE): glm53.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h serve_poll.h route_trace.h quant.h qwen36_tier.h backend_cuda.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h backend_metal.h backend_vulkan.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV)
+	$(CC) $(QWEN36_CFLAGS) glm53.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(QWEN36_LDFLAGS)
 
 kimi_k3$(EXE): kimi_k3.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h backend_cuda.h backend_metal.h backend_vulkan.h edge_adapters.h edge_runtime.h edge_tok_internal.h hybrid_split.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
 	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
@@ -1733,6 +1733,10 @@ tests/test_qwen36_tier_autoplace$(EXE): tests/test_qwen36_tier_autoplace.c tests
 # 128x128 block scales, bytes staged unchanged, no pointer kept into the
 # engine's recycled slot, promotion decided when the bytes pass by.
 tests/test_qwen36_tier_fp8$(EXE): tests/test_qwen36_tier_fp8.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# GLM's recyclable RAM cache: owned int4-gs64 staging and clamped SwiGLU.
+tests/test_qwen36_tier_stream_int4$(EXE): tests/test_qwen36_tier_stream_int4.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c tests/qwen36_fake_cuda.h qwen36.c qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
