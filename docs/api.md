@@ -42,10 +42,285 @@ sequences. The extension
 The server serves one generation at a time: the model stays in one persistent
 process, so concurrent HTTP requests queue instead of loading duplicate model
 copies. Tool calling depends on the active engine; see the support matrix below.
-Images, log probabilities, and token penalties return an explicit error rather
-than being silently ignored. Audio is accepted only by Inkling checkpoints with
-audio support. The default bind address is localhost; set `COLI_API_KEY` before
-exposing the server beyond the machine.
+Images and token penalties return an explicit error rather than being silently
+ignored, with one documented exception: `seed` is accepted and ignored rather
+than rejected (see below). Log probabilities are served on the glm engine (see
+below) and refused with a named error on every other engine, never silently
+ignored. Audio is accepted only by Inkling checkpoints with audio support. The
+default bind address is localhost; set `COLI_API_KEY` before exposing the
+server beyond the machine.
+
+### `seed`
+
+`seed` is accepted (not rejected) for OpenAI-API request-shape compatibility.
+It currently has **no effect on any code path, at any temperature**: no
+engine, and no field on the wire protocol, reads a per-request seed. The
+`glm` and `inkling` engines seed their process-global RNG once from the
+`SEED` environment variable at launch, never per request; no other engine
+reads `SEED` or any per-request seed at all. Either way the request's
+`seed` value goes nowhere. At `temperature: 0` this is moot anyway (greedy
+decoding has no distribution to seed), but the same "no effect" is equally
+true at `temperature > 0`, where a client might otherwise expect the value
+to matter. A true per-request seed is out of scope for this build
+regardless.
+
+### Log probabilities and prompt echo (glm engine only)
+
+`/v1/completions` accepts the legacy integer `logprobs` (**0–32**; 0 means no
+log probabilities at all, see below; the upper bound is bound to the
+engine's top-32 read-out interface, and anything above 32 is a named 400)
+and boolean `echo`; `/v1/chat/completions` accepts boolean `logprobs` plus
+integer `top_logprobs` (0–32) and returns
+`choices[].logprobs.content[]` (`{token, logprob, bytes, top_logprobs}` per
+generated token) — chat has no `echo` concept and rejects one with a 400. A
+non-boolean `echo` is a named 400 (`invalid_value`) on both endpoints,
+independent of whether `logprobs` is requested at all. On chat,
+`top_logprobs` is type- and range-checked even when `logprobs` is
+false or absent, so a malformed `top_logprobs` is a named 400 whether or
+not the gate it would feed is open; a valid `top_logprobs` with `logprobs`
+off remains a documented no-op.
+
+The zero semantics are explicit, not a truthiness accident: on
+`/v1/completions`, `logprobs: 0`, `false`, and `null` all mean **no log
+probabilities** (the request succeeds with `choices[].logprobs: null`,
+exactly as if the field were omitted), while boolean `true` is a named 400 —
+the legacy field is an integer count, and a boolean carries no count. On
+`/v1/chat/completions` the field is a boolean gate (`null` behaves like
+`false`; any integer is a named 400).
+
+`/v1/completions` with `echo: true` returns the full legacy `logprobs` object
+(`tokens`, `token_logprobs`, `top_logprobs`, `text_offset`) covering the
+echoed prompt plus any generated tokens, and `text` itself is the
+reconstructed prompt followed by the completion (the standard OpenAI legacy
+behavior for `echo: true`) rather than the completion alone; `echo` without
+`logprobs` is a documented no-op. `text_offset` is a character offset into
+that same returned `text` string, always counted from 0 — including when
+`echo` is false, where `text` holds only the completion and the offsets
+describe only that text, not a position within the (unreturned) prompt. The
+requested top-k table is **unsorted** on the wire — do not assume the first
+entry is the argmax. Per-token values are printed by the engine to six
+decimal digits of precision. Non-finite values (a degenerate all-`-inf`
+logit row, say) serialize as JSON `null`, never a clamped number.
+
+Only the glm engine implements this channel; every other engine returns a
+named 400 rather than silently ignoring the request.
+
+Known limitations, current build:
+
+- **Cost.** Requesting `logprobs` at all — completions or chat, `echo` or
+  not — makes the engine re-run the ENTIRE prompt through a full read-out
+  pass to score every position (the wire has one opt-in bit, not a separate
+  "echo" bit), forfeiting prefix-cache reuse for that request. There is no
+  long-echo cap; a very long prompt pays a correspondingly large one-shot
+  activation buffer.
+- **Cancellation.** `CANCEL` is not honored while a logprobs-opted-in request
+  is inside its prefill read-out — the un-cancellable window widens by the
+  read-out's own wall time on long prompts.
+- **Alternative-token labels.** `top_logprobs` entries for candidate token
+  ids other than the position's own actual token are not decoded text (no
+  server-side tokenizer exists, by design) — they are labeled
+  `<token_id:N>`. Only the position's own token (identified by an exact
+  logprob match, not by id) gets its real decoded text.
+- **The sampled token is not guaranteed to appear in its own
+  `top_logprobs` table.** The engine's numeric channel reports the top-k
+  candidates by its own read-out; if the actually chosen token falls
+  outside that table, no entry represents it, and the response's
+  `token_logprobs`/`logprob` field is still the chosen token's own value
+  read from the DATA/ECHO frame directly, not looked up in the table.
+- **A filtered stop token's own record is dropped; a reasoning/tool-call
+  split's is not.** A matched `stop` sequence is withheld from the
+  returned text, and its own logprob record is dropped along with it, but
+  chat's `<think>`/answer split and tool-call parsing can still remove or
+  rewrite text that a generated-token logprob record continues to
+  describe — the two are not realigned in this build.
+- **An engine build older than this server's per-token logprobs extension
+  is refused, not silently ignored, but only after a bounded wait.** Such
+  an engine rejects the whole opted-in request at the wire level in a way
+  this server cannot see as a rejection of THIS specific request; after
+  `COLI_LOGPROBS_ACCEPT_TIMEOUT` seconds (default 30) with no
+  acknowledgment, the request fails with a named 503 rather than hanging.
+  An opted-in request that never reaches ACCEPT within that window is
+  treated as cancelled — the server stops waiting on it and answers the
+  named 503 — rather than left pending indefinitely.
+- **Server-side buffering.** The gateway holds a logprobs-opted-in request's
+  full echo table in memory for the whole request lifetime (no streaming is
+  allowed together with `logprobs` — the combination is a named 400).
+
+### Array `prompt` intake on `/v1/completions` (glm engine for token ids)
+
+`group_score` (a future opt-in that would change the response shape to
+continuation-only log-probability arrays) is not implemented yet, and on
+`/v1/completions` — flat or array `prompt` alike — is refused outright with
+a named 400 (`param: "group_score"`, `code: "unsupported_value"`) rather
+than silently ignored; `false` and `null` are accepted as absent. This
+guard applies to `/v1/completions` only: `/v1/chat/completions` and
+`/v1/messages` do not read the field, so the same request sent to either
+of those endpoints is accepted and the opt-in is silently ignored.
+
+`prompt` also accepts a flat array of non-negative integers — a single
+pre-tokenized prompt, sent as ASCII decimal token ids straight to the
+engine rather than re-tokenized from text — and, structurally, the two
+OpenAI legacy batch forms: an array of strings, or an array of token-id
+arrays (this is what unmodified `lm-eval` sends for its tokenized
+loglikelihood requests). Token-id prompts, flat or nested, are
+glm-engine-only; every other engine returns a named 400 rather than
+silently mis-tokenizing the decimal digits as literal text. A malformed or
+out-of-vocabulary token id is refused with a named 400 on `prompt` as well
+(the engine itself is the source of truth for its vocabulary; this server
+does not re-validate ids against it before sending them).
+
+A single-member array (one string, or one token-id list) is accepted and
+produces exactly what the same prompt would have produced as a
+single-prompt request — including a nested batch-of-one token-id array,
+which unwraps to the identical flat behavior. Each array is validated
+structurally regardless of size: it must not be empty, and its element
+types must be homogeneous — all strings, all token ids, or all
+token-id arrays, never mixed — each a named 400 on `prompt`.
+
+**A real batch (more than one member) dispatches.** The response carries
+one choice per member, `choices[i].index == i`, in the same order the
+members were sent — each choice holding exactly what a single-prompt
+request for that member alone would have produced (text, the `logprobs`
+object under `echo`/`logprobs`, `finish_reason`), and `usage` summed
+across every member. Members are submitted to the engine one at a time,
+in order; each carries its own independent UTF-8 decoder and its own
+echo-position reassembly, so one member's trailing partial character (or
+its logprobs table) can never leak into another member's text.
+
+A batch is all-or-nothing: every member's shape is validated before the
+first engine submit — array structure, homogeneity, and (for strings)
+non-emptiness — so a malformed member — say, the eighth — is a clean 400
+naming `prompt[7]` with no engine submits made. A member that passes that
+shape check but is rejected by the engine itself (a NUL byte, an
+out-of-vocabulary token id) can still fail after earlier members have
+already been submitted, and that failure is still a clean 400 naming the
+member the same way. A failure that is the engine's own fault rather than
+any one member's content takes one of two shapes. An engine failure the
+server cannot name as a specific typed error (a shutdown, a protocol
+error, a matching-id rejection the engine never turned into an `APIError`)
+is a single un-attributed 500 for the whole batch, the same failure mode
+the flat single-prompt path already uses for the same conditions. A
+failure the engine reports as its own capability gap through a typed
+`APIError` (it did not accept a per-token logprobs or token-id request in
+time, for example) keeps that error's own status, code, and `param`
+unchanged — only its message gains the failing member's index, so the
+client is never told to fix a prompt that was never the problem. Either
+way, nothing is ever written to the client until
+every remaining member has finished, so a request never receives a
+partial or truncated set of choices; a client that disconnects partway
+through a batch stops it at whichever member is in flight, without
+submitting the rest.
+
+A batch holds the engine's scheduler admission — and so the engine
+itself — for the sum of every member's generation time; other clients
+queue behind it exactly as they would behind one long single-prompt
+request. The admission is released before the response is written back to
+this client, so a slow reader does not additionally hold the engine
+hostage on socket I/O.
+
+A batch is capped at `PROMPT_BATCH_CAP` members (128) and at
+`PROMPT_BATCH_TOKEN_BUDGET` total prompt tokens (65,536) summed across
+members — token-id batches count actual tokens, string batches count
+total UTF-8 bytes as an upper bound on tokens (no tokenizer is available
+server-side). This budget bounds the prompt side of the request only.
+The generated side has its own budget, `PROMPT_BATCH_COMPLETION_BUDGET`
+(also 65,536): members multiplied by the request's effective `max_tokens`
+(after the server's own clamp to its configured `--max-tokens`/`--ngen`)
+must not exceed it, or the whole batch is refused before any engine
+submit — a batch's assembled response is held in memory in full until
+its single write, so this bounds the generated side of what that hold
+can grow to. With `echo` and `logprobs` the same hold additionally
+retains every member's echoed prompt positions, bounded instead by
+`PROMPT_BATCH_TOKEN_BUDGET` (65,536) times the per-position top-k table
+(`LOGPROBS_TOP_K_CAP`, 32) — roughly double the generated-side figure
+in the worst case, not covered by `PROMPT_BATCH_COMPLETION_BUDGET`
+alone. Both boundaries apply to real batches only: a length-1 array is
+exempt and
+keeps the flat single-prompt path's own oversize handling (the engine's
+`CONTEXT_EXCEEDED`, and no cap on requested `max_tokens` beyond the
+server's own clamp). `stream: true` and `n` other than 1 are both
+refused with a named 400 when `prompt` is an array with more than one
+member. For `n` this is the same refusal used everywhere else on this
+endpoint. For `stream` it is not: a batch refuses `stream: true`
+outright, `param: "stream"`, where the flat single-prompt path only
+refuses the narrower `logprobs`-plus-`stream` combination, `param:
+"logprobs"` — a client keying off `error.param` to decide which field
+to drop is told to drop a different field depending on which path
+answered. Validation order
+matches the flat path for `stream`, `cache_slot`, and the shape and
+homogeneity checks a malformed array trips, with one exception:
+`generation_options` (`max_tokens`, `n`, `temperature`, `top_p`, `stop`)
+is checked before any member's own shape on a batch, where the flat path
+checks `prompt` first — so a request combining both defects (an empty
+second member and `n: 2`, say) is refused for `n` on a batch and for
+`prompt` on the flat path. The generated-side completion budget (below)
+is checked *after* every member's own shape, the opposite order from
+`generation_options`: a malformed member always wins over an also-over-
+budget batch, so a request combining both defects (an empty second
+member and a `max_tokens` that alone would exceed the budget, say) is
+refused for `prompt[1]`, never for `max_tokens`.
+
+A request that omits both `max_tokens` and `max_completion_tokens` is
+measured against the server's own configured cap (`--max-tokens`/
+`--ngen`), the same value the flat path uses for an omitted `max_tokens`
+— not an arbitrary client-side default — so a large operator cap can
+make an ordinary-sized batch exceed the completion budget with no
+`max_tokens` in the request at all. The refusal message says so and
+tells the client to set an explicit `max_tokens` when that is why the
+batch failed.
+
+Refusals whose `param` is `prompt`, `prompt[i]`, or `max_tokens` carry
+one of the following `code` values, or no code at all (`code: null`),
+plus any client-fault code the engine itself raises for a member (for
+example `context_length_exceeded`, when the engine rejects one member
+mid-batch as too long for its context — `param` is rewritten to
+`prompt[i]` but the engine's own `code` is preserved, so this list is
+not exhaustive): `invalid_value` (a malformed shape, an empty array, or
+a malformed or out-of-vocabulary token-id member — whether the shape
+check catches it before any submit or the engine itself rejects it
+after earlier members have already been submitted — the
+member-specific cases carry `param` set to `prompt[i]`),
+`unsupported_parameter` (a token-id array on a non-glm engine),
+`prompt_batch_cap_exceeded`, `prompt_batch_token_budget_exceeded`,
+`batch_completion_budget_exceeded` (`param: "max_tokens"`, the
+generated-side budget above), and `engine_tok_ids_unsupported` (`param:
+"prompt"`; the engine did not accept a token-id prompt request in time
+— a 503 server-fault code, unlike the others in this list, which are
+400 client-fault refusals). `code: null` — the single-prompt path's own
+code for these conditions — covers an empty STRING member, whether
+caught before any submit or rejected by the engine after earlier
+members have already been submitted (a NUL byte); it is still
+member-attributed as `prompt[i]` even though it carries no code. Other
+refusals on the same request — `stream: true` or `n` other than 1 with
+more than one member, an invalid `cache_slot`, and so on — carry their
+own `param` and `code`, independent of this list.
+
+### Engine protocol contract: checked writes and SIGPIPE
+
+The server↔engine stdio protocol is fail-closed in both directions:
+
+- **Server→engine writes are checked.** Every `SUBMIT`/`CANCEL`/`STOP`
+  frame write is verified; a failed write (the engine died, its stdin pipe
+  broke) surfaces as a named HTTP 500 `engine_error` on the affected
+  request, as long as the response has not already been committed. `CANCEL`
+  and `STOP` writes only ever happen after `SUBMIT` has been written, mid
+  response; for a request whose response is already committed as a stream,
+  a failed write ends the stream instead of producing a 500.
+- **Engine→server frames are strictly validated.** The dispatcher checks
+  the frame grammar of every `ACCEPT`/`DATA`/`ECHO`/`TOOL`/`GRPP`/`GRPG`/
+  `GRPS`/`GRPE`/`ERROR`/`PROF`/`DONE` (and telemetry) line; a malformed
+  frame is a protocol failure that fails every in-flight request with a
+  500 and stops the dispatcher, rather than desynchronizing the stream.
+  No engine in this tree emits `GRPP`/`GRPG`/`GRPS`/`GRPE` yet — the
+  dispatcher validates and drains them for a group-scoring wire channel
+  proposed separately.
+- **Disconnected consumer (frozen POSIX policy).** The engine child runs
+  under the **default** SIGPIPE disposition (the server launches it with
+  signal restoration on, and the engine installs no handler). If the
+  server-side reader goes away, the engine is terminated by signal 13
+  (wait status 141) at its next stdout write — fail-closed: no completion
+  or error "evidence" can be fabricated after the failure point. This
+  policy is pinned by a real fork/pipe test in the server suite.
 
 ### Tool-calling support
 
@@ -136,6 +411,16 @@ Not supported, and refused explicitly rather than ignored: `stop_sequences`,
 own `{"type":"error","error":{...}}` envelope on this path. Architecture-local
 features that have not been wired to this protocol are likewise rejected with
 an explicit error.
+
+Streaming commits its HTTP 200 only once the engine has accepted the prompt,
+the same rule the OpenAI-protocol endpoints follow: a refusal discovered
+before acceptance (an oversized prompt over the context limit, say, which
+is reported as HTTP 400) surfaces with its own mapped HTTP status in the
+Anthropic error envelope, not a committed 200 whose event stream then ends
+abruptly. On a healthy engine nothing observable changes — the SSE framing
+and event order are exactly as documented above. Until the engine accepts,
+no bytes are sent at all — a request queued behind another generation
+waits silently, exactly as the OpenAI-style streaming path already does.
 
 > The prefill warning below applies here too, and applies *hardest* to Claude Code:
 > its system prompt and tool catalog are large, and on a disk-streaming CPU path
