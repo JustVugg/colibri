@@ -25,7 +25,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#if defined(__HIPCC__)
+#include "../backend_gpu_compat.h"   /* this TU links against a separately compiled backend_cuda.cu,
+                                        so it needs the CUDA->HIP mapping itself */
+#else
 #include <cuda_runtime.h>
+#endif
 
 /* quant.h is C (it uses _Thread_local, which nvcc's C++ front end rejects), so
  * the reference is compiled separately as C and reached through this one
@@ -68,8 +73,8 @@ static void compare_case(const char *what, const float *y_cpu, const float *y_gp
             if (std::isnan(a) != std::isnan(b)) bad++;
             continue;
         }
-        if (isinf(a) || isinf(b)) {           /* exponent 255: both must agree it is inf */
-            if (isinf(a) != isinf(b) || (isinf(a) && ((a > 0) != (b > 0)))) bad++;
+        if (std::isinf(a) || std::isinf(b)) {           /* exponent 255: both must agree it is inf */
+            if (std::isinf(a) != std::isinf(b) || (std::isinf(a) && ((a > 0) != (b > 0)))) bad++;
             continue;
         }
         double den = fabs(a) > 1e-6 ? fabs(a) : 1e-6;

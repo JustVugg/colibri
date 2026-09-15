@@ -27,7 +27,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
-#include <cuda_runtime.h>
+#if !defined(__HIPCC__)
+#include <cuda_runtime.h>   /* under HIP, backend_gpu_compat.h (via backend_cuda.cu) provides these */
+#endif
 
 #include "../backend_cuda.cu"
 
