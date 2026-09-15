@@ -787,6 +787,23 @@ def _individual_expert_inventory(pattern):
     return inventory
 
 
+
+def _olmoe_expert_inventory(name, size, _config, _dtype=None):
+    """OLMoE HF expert = gate_proj + up_proj + down_proj (3 separate tensors).
+
+    convert_olmoe_merged.py merges them into a single merged_weight + .qs.
+    GLM regex counts each tensor as a hit (3x overcount). Only down_proj
+    returns one entry sized 3*size to match the merged storage.
+    """
+    m = re.match(
+        r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\.weight$",
+        name,
+    )
+    if m is None:
+        return ()
+    return ((int(m.group(1)), int(m.group(2)), size * 3),)
+
+
 def _dsv41_expert_inventory(name, size, config, _dtype=None):
     """Routed experts, the backbone's and the DSpark head's alike.
 
@@ -1096,7 +1113,10 @@ FAMILIES = (
         planner_id="glm_mla",
         planner_geometry=_glm_geometry,
         planner_unsupported_reason="",
-        expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
+        expert_inventory=_olmoe_expert_inventory,
+        # d4d11ef: coli convert picks converter from checkpoint
+        converter="convert_olmoe_merged.py",
+        converter_accepts=(),
         config_section="root",
         limits=FamilyLimits(4096, 1048576, 1024, 16384, 16, 0, "CTX"),
         capabilities=FamilyCapabilities(True, True, False, True),
