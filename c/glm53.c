@@ -3018,6 +3018,30 @@ static void hits_emit(GModel *m) {
     serve_line("HITS %d %d %s\n", rows, cols, hex); free(hex); free(bm);
 }
 
+/* Dashboard tier telemetry (TIERS): deepseek_v4/inkling/olmoe emit it, glm53 did
+ * not, so the cortex panel counted every expert as on-disk. Tier accounting:
+ * CUDA-resident routed experts (qt tier) = VRAM; LRU cache slots = RAM; the
+ * rest of the routed grid = disk. Measured, never guessed. Emitted at boot and
+ * once per turn (same cadence as deepseek_v4). */
+static void glm53_emit_tiers(const GModel *m) {
+    long vram = 0, ram = 0, disk = 0, total = 0;
+    for (int i = 0; i < m->c.n_layers; i++) if (m->ecache[i].cap > 0) total += m->c.n_experts;
+    if (m->streaming && m->ecache) {
+        for (int i = 0; i < m->c.n_layers; i++) ram += m->ecache[i].n;
+        if (qt_ready())
+            for (int i = 0; i < m->c.n_layers; i++)
+                for (int e = 0; e < m->c.n_experts; e++)
+                    if (qt_is_resident(i, e)) vram++;
+        disk = total - ram - vram;
+    } else {
+        vram = total;
+    }
+    if (ram < 0) ram = 0;
+    if (disk < 0) disk = 0;
+    serve_line("TIERS %ld %ld %ld %.2f %.2f\n", vram, ram, disk,
+               (double)vram * m->e_slot / 1e9, (double)ram * m->e_slot / 1e9);
+    fflush(stdout);
+}
 static void serve_loop(GModel *m, Tok *tokenizer) {
     coli_serve_binary_mode();
     setvbuf(stdin, NULL, _IONBF, 0);
@@ -3027,6 +3051,7 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
     /* La griglia va DOPO READY: il lettore di boot del server scarta tutto
      * fino al sentinel, e colibri.c fa lo stesso (READY, STAT, poi EMAP). */
     emap_emit(m);
+    glm53_emit_tiers(m);
     for (;;) {
         ServeReq q; char verb[16];
         if (!serve_read_req(&q, verb, sizeof(verb))) break;   /* EOF: si esce */
@@ -3037,6 +3062,7 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
              * esce senza riprovare a leggere. */
             int gateway_gone = serve_one(m, tokenizer, &q) < 0;
             free(q.payload);
+            glm53_emit_tiers(m);
             if (gateway_gone) break;
         } else if (!strcmp(verb, "IMAGE")) {
             /* annunciata: nessuna risposta, la si usa al SUBMIT che segue */
