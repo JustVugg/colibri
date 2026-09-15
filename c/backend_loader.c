@@ -1261,11 +1261,12 @@ static int coli_cuda_load(void){
 
 #ifdef COLI_HIP_DLL
     /* No synchronisation here, and that is a traced conclusion rather than an
-     * assumption: coli_cuda_load has exactly two callers, coli_cuda_init and
-     * coli_cuda_attention_project_ragged. colibri.c calls init on the main
+     * assumption: startup discovery (coli_cuda_available_device_count) and
+     * coli_cuda_init run before the tier's worker threads are created.
+     * colibri.c calls init on the main
      * thread before model initialisation and therefore before any worker
      * thread exists, and the ragged path is reachable only after that init
-     * succeeded. If a third caller ever appears, or the guard in colibri.c
+     * succeeded. If a concurrent caller ever appears, or the guard in colibri.c
      * moves, this needs an explicit lock instead. */
     if(!coli_hip_configure(&cfg)) return 0;
     runtime = coli_hip_acquire_runtime(&cfg);
@@ -1429,7 +1430,7 @@ static int coli_cuda_load(void){
      * nothing by this name, and the wrapper's 0 is the engine's own "fall back
      * to CPU" result, so an older DLL still serves GLM and Qwen3.6 (#1405). */
     RESOLVE_OPT(matmul_mxfp4,   fn_matmul_mxfp4)
-    RESOLVE_OPT(available_device_count, fn_available_device_count)   /* qwen36 tier (#1533); older DLLs fall back to device_count */
+    RESOLVE_OPT(available_device_count, fn_available_device_count)   /* older DLLs still support explicit device selection */
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
     /* Optional, same reasoning as e8_set_grid above: a DLL predating #687
@@ -1520,8 +1521,15 @@ int coli_cuda_device_count(void){
  * no wrapper for it, so the first CUDA_DLL build of qwen36 that compiled the
  * tier in failed to link (#1533). */
 int coli_cuda_available_device_count(void){
-    if(!g_cuda.available) return 0;
-    if(!g_cuda.available_device_count) return g_cuda.device_count();   /* a DLL from before the export */
+    /* The tier probes before init when no device list was supplied. */
+    if(!coli_cuda_load()) return 0;
+    if(!g_cuda.available_device_count){
+        /* device_count reports initialized contexts, not visible devices. */
+        fprintf(stderr, COLI_VENDOR_TAG " " COLI_BACKEND_DLL
+                " missing symbol coli_cuda_available_device_count; "
+                "rebuild the backend DLL or select devices with COLI_GPUS\n");
+        return 0;
+    }
     return g_cuda.available_device_count();
 }
 
