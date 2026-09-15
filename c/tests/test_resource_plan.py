@@ -13,6 +13,7 @@ from resource_plan import (
     analyze_model,
     build_plan,
     cpu_socket_count,
+    discover_gpus,
     environment_for_plan,
     format_plan,
     memory_available,
@@ -111,6 +112,28 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(plan["tiers"]["vram"]["budget_bytes"], 0)
         self.assertFalse(any("jointly constrained" in warning
                              for warning in plan["warnings"]))
+
+    def test_macos_discovers_metal_gpu_without_cuda_or_rocm_probes(self):
+        output = json.dumps({"SPDisplaysDataType": [{
+            "_name": "Apple M1 Pro",
+            "sppci_model": "Apple M1 Pro",
+            "spdisplays_mtlgpufamilysupport": "spdisplays_metal4",
+        }]})
+        result = subprocess.CompletedProcess(args=[], returncode=0,
+                                             stdout=output, stderr="")
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch("resource_plan.subprocess.run", return_value=result) as run:
+            devices = discover_gpus()
+        self.assertEqual(devices, [{"index": 0, "name": "Apple M1 Pro",
+                                    "total_bytes": 0, "free_bytes": None,
+                                    "unified_memory": True, "backend": "metal"}])
+        self.assertEqual(run.call_args.args[0],
+                         ["system_profiler", "SPDisplaysDataType", "-json"])
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                  available_disk=1, gpus=devices, physical_cpus=8,
+                  cpu_sockets=1)
+        self.assertIn("Metal  0:Apple M1 Pro · unified memory",
+                  format_plan(plan))
 
     def test_glm53_auto_tune_does_not_emit_generic_inert_knobs(self):
         from resource_plan import _auto_tune

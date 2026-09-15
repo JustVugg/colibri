@@ -427,12 +427,41 @@ SSD_PROBE_PENDING = {
 
 
 def discover_gpus():
+    if sys.platform == "darwin":
+        return _discover_metal_gpus()
     # NVIDIA first; if there are none (or no nvidia-smi), fall back to ROCm/HIP so
     # a working AMD engine isn't planned CPU-only and --gpu N stops failing (#662).
     devices = _discover_nvidia_gpus()
     if devices:
         return devices
     return _discover_amd_gpus()
+
+
+def _discover_metal_gpus():
+    """Return Apple Metal devices without pretending unified RAM is VRAM."""
+    try:
+        result = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType", "-json"],
+            text=True, capture_output=True, check=True, timeout=10)
+        displays = json.loads(result.stdout).get("SPDisplaysDataType", [])
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return []
+    devices = []
+    for index, display in enumerate(displays):
+        if not isinstance(display, dict):
+            continue
+        metal = display.get("spdisplays_mtlgpufamilysupport")
+        if not metal:
+            continue
+        name = display.get("sppci_model") or display.get("_name")
+        if not isinstance(name, str) or not name:
+            continue
+        # Apple Silicon has one unified pool. Its free capacity cannot be used
+        # as an independent VRAM budget, so retain device identity only.
+        devices.append({"index": index, "name": name,
+                        "total_bytes": 0, "free_bytes": None,
+                        "unified_memory": True, "backend": "metal"})
+    return devices
 
 
 def _discover_nvidia_gpus():
@@ -1219,12 +1248,20 @@ def format_plan(plan):
              f"cap {tiers['ram']['cache_slots_per_layer']}/layer"]
     vram = tiers["vram"]
     if vram["devices"]:
-        names = ", ".join(
-            f"{gpu['index']}:{gpu['name']}"
-            + ("" if plans_placement(gpu) else " (identity only)")
-            for gpu in vram["devices"])
-        lines.append(f"VRAM   {format_bytes(vram['budget_bytes'])} hot tier · "
-                     f"~{vram['expert_capacity']} experts · {names}")
+        metal_identity = [gpu for gpu in vram["devices"]
+                          if gpu.get("backend") == "metal"
+                          and gpu.get("free_bytes") is None]
+        if len(metal_identity) == len(vram["devices"]):
+            names = ", ".join(f"{gpu['index']}:{gpu['name']}"
+                              for gpu in metal_identity)
+            lines.append(f"Metal  {names} · unified memory · no independent VRAM budget")
+        else:
+            names = ", ".join(
+                f"{gpu['index']}:{gpu['name']}"
+                + ("" if plans_placement(gpu) else " (identity only)")
+                for gpu in vram["devices"])
+            lines.append(f"VRAM   {format_bytes(vram['budget_bytes'])} hot tier · "
+                         f"~{vram['expert_capacity']} experts · {names}")
     else:
         # Backend-neutral, matching the accelerator wording #903 settled on:
         # an AMD or Intel host that finds nothing is not "no NVIDIA device".
