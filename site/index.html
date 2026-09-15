@@ -13,15 +13,40 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Bytesized&display=swap" rel="stylesheet">
+<script>
+(function(){
+  try{
+    var saved=localStorage.getItem('colibri_theme');
+    var prefersDark=window.matchMedia('(prefers-color-scheme: dark)').matches;
+    var theme=saved?saved:(prefersDark?'dark':'light');
+    document.documentElement.setAttribute('data-theme',theme);
+  }catch(e){}
+})();
+</script>
 <style>
 :root{
   --bg:#FCFCFB; --panel:#F4F4F1; --card:#FFFFFF;
   --ink:#101010; --ink2:#43433F; --gray:#71716B; --faint:#A2A29B;
   --dark:#0E0E0C; --on-dark:#F1F1ED; --on-dark-dim:#9C9C95;
   --hair:#E6E6E2; --line:#D9D9D4; --teal:#087A63;
+  --nav-bg:rgba(252,252,251,.88);
   --sans:'Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
   --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   --maxw:1200px;
+}
+[data-theme="dark"]{
+  --bg:#0E0E0C; --panel:#151513; --card:#191916;
+  --ink:#F1F1ED; --ink2:#A4A49D; --gray:#7B7B74; --faint:#444440;
+  --dark:#070706; --on-dark:#F1F1ED; --on-dark-dim:#9C9C95;
+  --hair:#242420; --line:#30302A; --teal:#12B08D;
+  --nav-bg:rgba(14,14,12,.88);
+}
+html.theme-transition,
+html.theme-transition *,
+html.theme-transition *::before,
+html.theme-transition *::after{
+  transition:background-color .25s ease,border-color .25s ease,color .2s ease,fill .2s ease !important;
+  transition-delay:0s !important;
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth}
@@ -29,16 +54,17 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1
   -webkit-font-smoothing:antialiased;overflow-x:hidden;font-size:17px}
 a{color:inherit;text-decoration:none}
 ::selection{background:rgba(8,122,99,.14)}
+[data-theme="dark"] ::selection{background:rgba(18,176,141,.25)}
 .wrap{max-width:var(--maxw);margin:0 auto;padding:0 clamp(1.3rem,4vw,2.6rem)}
 .mono{font-family:var(--mono)}
 
 /* nav */
-nav{position:fixed;inset:0 0 auto 0;z-index:50;background:rgba(252,252,251,.88);backdrop-filter:blur(10px);transition:border-color .25s;border-bottom:1px solid transparent}
+nav{position:fixed;inset:0 0 auto 0;z-index:50;background:var(--nav-bg);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);transition:border-color .25s,background .25s;border-bottom:1px solid transparent}
 nav.on{border-color:var(--hair)}
 nav .in{max-width:var(--maxw);margin:0 auto;display:flex;align-items:center;padding:.85rem clamp(1.3rem,4vw,2.6rem)}
 nav .brand{display:flex;align-items:center}
-nav .brand .mark{display:flex;transition:transform .4s cubic-bezier(.4,0,.2,1)}
-nav .brand .mark svg{width:40px;height:40px;display:block}
+nav .brand .mark{display:flex;color:var(--ink);transition:transform .4s cubic-bezier(.4,0,.2,1)}
+nav .brand .mark svg{width:40px;height:40px;display:block;fill:currentColor}
 nav.on .brand .mark{transform:scale(1.06)}
 nav .brand .word{font-family:'Bytesized',var(--sans);font-weight:400;font-size:2.3em;letter-spacing:.02em;text-transform:uppercase;line-height:1;margin-left:.6rem;
   max-width:16rem;opacity:1;overflow:hidden;white-space:nowrap;
@@ -49,9 +75,56 @@ nav .nl a:not(.btn){color:var(--ink2)} nav .nl a:not(.btn):hover{color:var(--ink
 .btn{font-family:var(--sans);font-weight:600;font-size:.94rem;display:inline-flex;align-items:center;gap:.45rem;
   background:var(--ink);color:var(--bg);padding:.62rem 1.2rem;border-radius:8px;transition:.15s;border:1.5px solid var(--ink)}
 .btn:hover{background:#000;border-color:#000}
+[data-theme="dark"] .btn:hover{background:#FFF;border-color:#FFF;color:#000}
 .btn.ghost{background:transparent;color:var(--ink);border-color:var(--line)}
-.btn.ghost:hover{background:transparent;border-color:var(--ink)}
-@media(max-width:820px){nav .nl a:not(.btn){display:none}}
+.btn.ghost:hover{background:rgba(128,128,128,.08);border-color:var(--ink)}
+
+/* theme toggle button */
+.theme-toggle{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:38px;height:38px;border-radius:8px;
+  border:1.5px solid var(--line);background:var(--card);color:var(--ink);
+  cursor:pointer;position:relative;overflow:hidden;padding:0;
+  margin-left:-.85rem;
+  transition:border-color .2s ease,background .2s ease,transform .15s ease,box-shadow .2s ease;
+  flex-shrink:0;
+}
+.theme-toggle:hover{
+  border-color:var(--ink);transform:translateY(-1px);
+  box-shadow:0 3px 12px rgba(0,0,0,.08);
+}
+[data-theme="dark"] .theme-toggle:hover{
+  box-shadow:0 4px 14px rgba(0,0,0,.5);
+}
+.theme-toggle:active{transform:scale(.92)}
+.theme-toggle:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
+.theme-toggle-sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border-width:0}
+
+.theme-toggle svg{
+  position:absolute;inset:0;margin:auto;
+  transition:transform .35s cubic-bezier(.34,1.56,.64,1),opacity .22s ease;
+}
+.theme-toggle .moon-icon{transform:rotate(0deg) scale(1);opacity:1}
+.theme-toggle .sun-icon{transform:rotate(-90deg) scale(0);opacity:0}
+
+[data-theme="dark"] .theme-toggle .moon-icon{transform:rotate(90deg) scale(0);opacity:0}
+[data-theme="dark"] .theme-toggle .sun-icon{transform:rotate(0deg) scale(1);opacity:1}
+
+@media(max-width:820px){
+  nav .nl a:not(.btn){display:none}
+  nav .nl{gap:1rem}
+  .theme-toggle{margin-left:0}
+}
+@media(max-width:480px){
+  .btn{padding:.52rem .9rem;font-size:.88rem}
+  .theme-toggle{width:36px;height:36px}
+}
+
+[data-theme="dark"] .card:hover{border-color:var(--ink2);box-shadow:0 12px 28px -12px rgba(0,0,0,.6)}
+[data-theme="dark"] .tag{background:rgba(18,176,141,.08)}
+[data-theme="dark"] .block-dark{border-top:1px solid var(--hair);border-bottom:1px solid var(--hair)}
+[data-theme="dark"] .term{box-shadow:0 18px 40px -20px rgba(0,0,0,.8);border:1px solid var(--line)}
+[data-theme="dark"] footer{border-top:1px solid var(--hair)}
 
 /* hero — centered, one axis, nothing fighting for the eye */
 .hero{padding:10rem 0 5.5rem;text-align:center}
@@ -169,7 +242,7 @@ footer li a:hover{color:var(--on-dark)}
 
 <!-- colibri mark — monochrome, no box -->
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
-  <symbol id="logo" viewBox="0 21 168 126"><g transform="translate(7 21)" shape-rendering="crispEdges" fill="#101010">
+  <symbol id="logo" viewBox="0 21 168 126"><g transform="translate(7 21)" shape-rendering="crispEdges" fill="currentColor">
     <rect x="56" y="0" width="14" height="14"/><rect x="70" y="0" width="14" height="14"/><rect x="84" y="0" width="14" height="14"/>
     <rect x="42" y="14" width="14" height="14"/><rect x="56" y="14" width="14" height="14"/><rect x="70" y="14" width="14" height="14"/><rect x="84" y="14" width="14" height="14"/><rect x="98" y="14" width="14" height="14"/><rect x="140" y="14" width="14" height="14"/>
     <rect x="56" y="28" width="14" height="14"/><rect x="70" y="28" width="14" height="14"/><rect x="84" y="28" width="14" height="14"/><rect x="98" y="28" width="14" height="14"/><rect x="126" y="28" width="14" height="14"/><rect x="140" y="28" width="14" height="14"/>
@@ -201,6 +274,16 @@ footer li a:hover{color:var(--on-dark)}
       <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Benchmarks</a>
       <a href="https://discord.gg/RXV83nSZdk">Discord</a>
       <a class="btn" href="https://github.com/JustVugg/colibri">Star on GitHub</a>
+      <button type="button" class="theme-toggle" id="themeToggle" aria-label="Switch to dark theme" title="Switch to dark theme (Press D)">
+        <span class="theme-toggle-sr">Toggle theme</span>
+        <svg class="sun-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="4.5"/>
+          <path d="M12 2v2.5M12 19.5V22M4.22 4.22l1.77 1.77M18.01 18.01l1.77 1.77M2 12h2.5M19.5 12H22M4.22 19.78l1.77-1.77M18.01 5.99l1.77-1.77"/>
+        </svg>
+        <svg class="moon-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+        </svg>
+      </button>
     </div>
   </div>
 </nav>
@@ -484,6 +567,55 @@ const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
   addEventListener('pointerup',()=>{drag=false;cv.style.cursor='grab';});
   size();addEventListener('resize',()=>{size();if(reduce)draw();},{passive:true});
   if(reduce)draw();else loop();
+})();
+
+/* ---- Theme toggle (Light / Dark mode) ---- */
+(function initTheme(){
+  const btn = document.getElementById('themeToggle');
+  if(!btn) return;
+  
+  function updateToggleUI(theme){
+    const isDark = theme === 'dark';
+    btn.setAttribute('aria-label', isDark ? 'Switch to light theme' : 'Switch to dark theme');
+    btn.setAttribute('title', isDark ? 'Switch to light theme (D)' : 'Switch to dark theme (D)');
+  }
+  
+  function setTheme(theme, persist){
+    document.documentElement.classList.add('theme-transition');
+    document.documentElement.setAttribute('data-theme', theme);
+    if(persist){
+      try { localStorage.setItem('colibri_theme', theme); } catch(e){}
+    }
+    updateToggleUI(theme);
+    setTimeout(()=>{
+      document.documentElement.classList.remove('theme-transition');
+    }, 300);
+  }
+  
+  const currentTheme = document.documentElement.getAttribute('data-theme') || 'light';
+  updateToggleUI(currentTheme);
+  
+  btn.addEventListener('click', ()=>{
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+    setTheme(isDark ? 'light' : 'dark', true);
+  });
+  
+  window.addEventListener('keydown', e=>{
+    if((e.key === 'd' || e.key === 'D') && !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName) && !e.metaKey && !e.ctrlKey && !e.altKey){
+      e.preventDefault();
+      const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+      setTheme(isDark ? 'light' : 'dark', true);
+    }
+  });
+
+  try {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    mq.addEventListener('change', e=>{
+      if(!localStorage.getItem('colibri_theme')){
+        setTheme(e.matches ? 'dark' : 'light', false);
+      }
+    });
+  } catch(e){}
 })();
 </script>
 </body>
