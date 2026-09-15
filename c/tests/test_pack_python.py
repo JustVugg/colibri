@@ -166,6 +166,16 @@ class PackPythonNeededTests(unittest.TestCase):
         self.assertIn(TOOLS / "iq3xxs_grid.json", paths,
                       "reached only as a data file opened next to iq3_pack.py")
 
+    def test_engine_evidence_is_needed_by_the_real_tree(self):
+        """This branch's own new tool, asserted the same way and for the same
+        reason: eval_glm.py is launched by coli as a subprocess and imports
+        engine_evidence, so the module is reachable only across the boundary
+        this suite exists to defend. It is a second real-tree case rather than
+        a replacement for the one above -- that one pins the historical bug,
+        this one pins the edge the branch adds."""
+        paths = PACK.needed(HERE.parent)
+        self.assertIn(TOOLS / "engine_evidence.py", paths)
+
 
 class PackPythonDataFileTests(unittest.TestCase):
     """#1359 left a second edge open after the import one was closed: packaging
@@ -247,6 +257,43 @@ class PackPythonDataFileTests(unittest.TestCase):
         # coli is the walk's root and is copied by the workflow, not by
         # needed(), so the fixture's one packaged module is reader.py.
         self.assertIn("1 Python files and 1 data files", buf.getvalue())
+
+
+class HumanOnlyToolsShipExplicitly(unittest.TestCase):
+    """Tools that only a person invokes are invisible to the import walk.
+
+    `pack_python.py` computes the archive from what `coli` reaches, imports and
+    subprocesses alike. A script whose caller is a person typing argparse
+    arguments is reached by nobody in the code, so static analysis cannot put
+    it in the archive -- `k3_tokenizer.py` has always been in that position and
+    `release.yml` copies it by hand. `check_ablate_evidence.py` joined it: it
+    verifies the ABLATE evidence that the packaged `eval_glm.py` produces, so a
+    release that ships the producer without the verifier is half a tool.
+
+    This pins both halves of that decision on the real tree: the walk does NOT
+    reach the file (if it ever does, the explicit copy became redundant and this
+    test should be retired), and the workflow copies AND gates it, the way it
+    does for the tokenizer helper. A copy without a gate is how v1.10.0 shipped
+    four broken commands green (#1296)."""
+
+    HUMAN_ONLY = ("k3_tokenizer.py", "check_ablate_evidence.py")
+
+    def test_the_walk_does_not_reach_them(self):
+        paths = PACK.needed(HERE.parent)
+        for name in self.HUMAN_ONLY:
+            self.assertTrue((TOOLS / name).is_file(), name)
+            self.assertNotIn(TOOLS / name, paths,
+                             f"{name} is now reached by the walk; drop its "
+                             f"explicit copy from release.yml and this pin")
+
+    def test_release_copies_and_gates_them(self):
+        release = (HERE.parent.parent / ".github" / "workflows"
+                   / "release.yml").read_text(encoding="utf-8")
+        for name in self.HUMAN_ONLY:
+            self.assertIn(f"cp c/tools/{name} dist/tools/", release,
+                          f"release.yml no longer copies {name}")
+            self.assertIn(f"test -f tools/{name} ||", release,
+                          f"release.yml copies {name} but does not gate on it")
 
 
 if __name__ == "__main__":
