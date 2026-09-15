@@ -166,6 +166,16 @@ class PackPythonNeededTests(unittest.TestCase):
         self.assertIn(TOOLS / "iq3xxs_grid.json", paths,
                       "reached only as a data file opened next to iq3_pack.py")
 
+    def test_engine_evidence_is_needed_by_the_real_tree(self):
+        """This branch's own new tool, asserted the same way and for the same
+        reason: eval_glm.py is launched by coli as a subprocess and imports
+        engine_evidence, so the module is reachable only across the boundary
+        this suite exists to defend. It is a second real-tree case rather than
+        a replacement for the one above -- that one pins the historical bug,
+        this one pins the edge the branch adds."""
+        paths = PACK.needed(HERE.parent)
+        self.assertIn(TOOLS / "engine_evidence.py", paths)
+
 
 class PackPythonDataFileTests(unittest.TestCase):
     """#1359 left a second edge open after the import one was closed: packaging
