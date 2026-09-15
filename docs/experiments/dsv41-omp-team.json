@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "hypothesis": "Sizing the OpenMP team to physical cores instead of one thread per logical CPU raises throughput on an SMT host, because ~720 parallel regions per decoded token make the per-region barrier a first-order cost rather than a rounding error.",
+  "commit": "941d5fe944a67ee3bed66a3c9c552199773b39ae",
+  "model": "deepseek-ai/DeepSeek-V4.1-Flash, released checkpoint, 48 shards, 510.3 GB, fp8 dense + fp4 experts, no conversion",
+  "command": "SNAP=/mnt/nvme0/DeepSeek-V4.1-Flash ./deepseek_v41 8 /tmp/ref.json (25 prompt tokens, 16 generated, cap=8, page cache evicted per run; no OMP_NUM_THREADS and no COLI_NO_OMP_TUNE set)",
+  "prompt_hash": "79a5bcf37f1920a530cfee5ab7a484e00a1d6bb7f19d9a7418beaa53c14b454b",
+  "hardware": {
+    "cpu": "2x Intel Xeon Platinum 8555C, 52 cores/socket, 2 threads/core = 104 physical cores, 208 logical CPUs, 4 NUMA nodes",
+    "ram": "1007 GiB",
+    "storage": "Samsung MZQL2960HCJR (nvme0n1, 894 GB), ext4 noatime, /mnt/nvme0",
+    "os": "Ubuntu 24.04, kernel 6.8.0-31-generic, gcc 13.3.0, libgomp, -O3 -march=native -fopenmp"
+  },
+  "warmup_runs": 0,
+  "changed_variables": [
+    "OMP_TEAM_SIZING"
+  ],
+  "baseline": {
+    "config": {
+      "OMP_TEAM_SIZING": "absent (one thread per logical CPU)"
+    },
+    "samples": {
+      "tok_s": [
+        0.038763,
+        0.039144,
+        0.039252
+      ]
+    },
+    "median_tok_s": 0.039144,
+    "quality": {
+      "method": "token-exact vs a 16-token reference stream; the engine exits non-zero on any mismatch. All 6 runs 16/16. tok_s is 16 generated tokens over the whole turn (READY to DONE), prefill included",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/dsv41-omp-team-2026-09-15-raw.txt, section 'before'",
+      "sha256": "e889f14fd59c116ecd9226be003a1ab2d632b1e4e29fbf435b1dc916b0fb061f"
+    }
+  },
+  "trial": {
+    "config": {
+      "OMP_TEAM_SIZING": "coli_omp_tune_threads (physical cores)"
+    },
+    "samples": {
+      "tok_s": [
+        0.369515,
+        0.367816,
+        0.33543
+      ]
+    },
+    "median_tok_s": 0.367816,
+    "quality": {
+      "method": "token-exact vs a 16-token reference stream; the engine exits non-zero on any mismatch. All 6 runs 16/16. tok_s is 16 generated tokens over the whole turn (READY to DONE), prefill included",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/dsv41-omp-team-2026-09-15-raw.txt, section 'after'",
+      "sha256": "74dbb54c1dd9cc6fadfc135b4b1fb8c7d338ae812c74cdaf78367aed7f3945f7"
+    }
+  },
+  "outcome": "improvement"
+}

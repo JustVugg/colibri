@@ -374,6 +374,12 @@ so put it on a disk with the room, ideally a fast one:
 
 **https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
 
+**GLM-5.3** is the same family and loads with the same engine. It has its own
+container, also group-scaled (gs64), about **419 GB**. It ships **without** the
+MTP head, so speculative decoding stays off:
+
+**https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64**
+
 > ⚠️ Use the **gs64** container above, not the older per-row int4 mirrors
 > (`mateogrgic/…`, `jlnsrk/…`): those measure ~9pp worse on quality and are the
 > root cause of the original think-mode loops and never-terminating generations
@@ -408,7 +414,7 @@ the model's `config.json`):
 > | Model | Disk for the weights | RAM | GPU |
 > |---|---|---|---|
 > | **OLMoE** | ~7 GB (int8 container) | 8 GB | not needed |
-> | **GLM-5.2/5.3** | ~372 GB | 16 GB min, 24 GB comfortable | not needed |
+> | **GLM-5.2/5.3** | ~372 GB (5.2) / ~419 GB (5.3) | 16 GB min, 24 GB comfortable | not needed |
 > | **GLM-5.3-Flash** | ~195 GB converted | 25 GB (12 GB weights at int4 + expert cache) | not needed |
 > | **Inkling** | ~469 GB | 25 GB with the int4 dense container, ~120 GB without | not needed |
 > | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed |
@@ -422,7 +428,7 @@ the model's `config.json`):
 
 | Family | Total / active | Weights | Build | Docs |
 |---|---|---|---|---|
-| **GLM-5.2/5.3** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp) (372 GB) | `make -C c glm` | this page |
+| **GLM-5.2/5.3** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp) (372 GB) or [`Justvugg/GLM-5.3-colibri-int4-g64`](https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64) (419 GB) | `make -C c glm` | this page |
 | **Inkling** (Thinking Machines) | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4) (469 GB) | `make -C c inkling` | [inkling.md](docs/inkling.md) |
 | **GLM-5.3-Flash** (Z.ai) | 321B / 40B | [`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash) — converted to **int4-gs64** routed experts, dense stays BF16 and the precision is a load-time choice; vision included | `make -C c glm53` | [glm53-flash.md](docs/glm53-flash.md) |
 | **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
@@ -717,4 +723,4 @@ these is used or reimplemented in the tree today:
 
 ## License
 
-Apache 2.0. GLM-5.2 weights are released by Z.ai under MIT.
+Apache 2.0, Copyright 2026 Vincenzo Fornaro. See [LICENSE](LICENSE) and [NOTICE](NOTICE). GLM-5.2 weights are released by Z.ai under MIT.

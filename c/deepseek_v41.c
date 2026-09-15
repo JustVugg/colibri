@@ -62,6 +62,7 @@
 #include "st.h"
 #include "quant.h"
 #include "sparse_attn.h"
+#include "omp_tune.h"
 #include <pthread.h>   /* ehit_mark publishes the lazy HITS table under a lock */
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -178,6 +179,26 @@ static void cfg_load(Cfg *c, const char *snap) {
     c->hc_iters   = (int)jnum(t, "hc_sinkhorn_iters", 20);
     c->hc_eps     = (float)jnum(t, "hc_eps", 1e-6);
     c->max_positions = (int)jnum(t, "max_seq_len", jnum(t, "max_position_embeddings", 4096));
+    /* CTX caps the context, and with it every buffer sized from it: the compressed
+     * KV and index keys of the four source layers, and both rope tables. Every
+     * other engine in the registry reads its own context variable (CTX, GLM53_MAXT,
+     * CTX_MAX, K3_MAXT, Q36_MAXT, Q38_MAXT); this one read none, so `coli --ctx`
+     * set CTX for the planner and the engine ignored it. The planner sizes those
+     * buffers from the context it was asked for, which at the default 4096 is
+     * 0.02 GiB against the 6.25 GiB the engine allocated for the checkpoint's
+     * 1,048,576 -- 6.23 GiB of unbudgeted allocation, and a machine planned to the
+     * number would not have it. Keeping CTX <= max_positions also means the
+     * checkpoint's own ceiling still wins: this can only ask for less. */
+    const char *ctx_env = getenv("CTX");
+    if (ctx_env && *ctx_env) {
+        int ctx = atoi(ctx_env);
+        if (ctx >= 2 && ctx < c->max_positions) c->max_positions = ctx;
+        else if (ctx >= 2)
+            fprintf(stderr, "[v41] CTX=%d is at or above the checkpoint's own ceiling "
+                            "of %d positions; keeping the ceiling\n", ctx, c->max_positions);
+        else
+            fprintf(stderr, "[v41] CTX=%d is below the 2-position minimum; ignored\n", ctx);
+    }
     /* YaRN, as the vendor spells it: rope_scaling.factor when present */
     jval *scaling = json_get(t, "rope_scaling");
     if (scaling && scaling->t == J_OBJ) {
@@ -663,6 +684,11 @@ static void engram_push(Engram *e, const int *ids, int n, const uint8_t *image) 
 
 /* -------------------------------------------------------------- model ------ */
 
+/* Six tensors make one expert: three packed weight matrices and their three
+ * ue8m0 scale sidecars. expert_read_list emits them in this order and Slot
+ * stores one window per part, so both sides can agree through slot_part(). */
+#define V41_EXPERT_TENSORS 6
+
 /* One routed expert, resident in a cache slot. The three matrices keep the
  * checkpoint's fp4 packing and their ue8m0 group scales: quant.h's matmul_mxfp4
  * consumes exactly this, so nothing is unpacked on the way in. */
@@ -670,8 +696,27 @@ typedef struct {
     int eid;
     uint8_t *w1, *w3, *w2;      /* packed nibbles */
     uint8_t *s1, *s3, *s2;      /* ue8m0, one byte per 32-column group */
+    /* The window each of those six pointers was carved out of. A tensor sits at
+     * an arbitrary file offset, and the O_DIRECT path reads from the enclosing
+     * block boundary (st_read_range_rep takes the slack behind the destination
+     * for exactly this), so the bytes a slot serves begin some way into their
+     * window and the six pointers above are republished from these once the read
+     * lands. Only the read path needs the windows. */
+    uint8_t *base[V41_EXPERT_TENSORS];
     uint64_t used;
 } Slot;
+
+/* The six buffers of a slot, in the order expert_read_list emits them. */
+static uint8_t **slot_part(Slot *s, int part) {
+    switch (part) {
+    case 0: return &s->w1;
+    case 1: return &s->s1;
+    case 2: return &s->w3;
+    case 3: return &s->s3;
+    case 4: return &s->w2;
+    default: return &s->s2;
+    }
+}
 
 typedef struct { Slot *slot; int n, cap; } LCache;
 
@@ -864,35 +909,258 @@ static void rms_into(float *out, const float *x, const float *weight, int n, flo
 
 /* --------------------------------------------------------- expert cache ---- */
 
-/* One tensor still to fetch: which one, and where it lands. An expert is six of
- * these -- three weight matrices and their three scale sidecars. */
-typedef struct { char name[160]; uint8_t *dest; int64_t size; } ExpertRead;
+/* ---- which drive answers for an expert (multi-SSD mirror) ----------------
+ * An expert is what this engine streams: 88.5 GB of them for a 26-token turn on
+ * the released checkpoint, so where those bytes come from is most of the engine.
+ * Two things move them that the sibling engines already have and this one did
+ * not:
+ *
+ *   - COLI_MODEL_MIRROR=<dir>[;<dir>...] registers read-only copies of the
+ *     checkpoint on other drives. st_mirror_add above accepts a copy only when
+ *     its size and safetensors header are byte-identical to the primary's, so
+ *     every data offset matches by construction and each expert can be served
+ *     by any replica. A partial mirror is legal and a shard it does not carry
+ *     simply stays on the primary.
+ *   - the split between replicas follows COLI_DISK_WEIGHTS, or is measured at
+ *     startup with this engine's own access pattern when that is absent.
+ *
+ * Two independent drives answer in parallel; one drive split two ways answers no
+ * faster than itself, which is why the split is a measurement and not an
+ * assumption. */
+#define V41_MIR_REPS (1 + ST_MAX_MIR)
 
-#define V41_EXPERT_TENSORS 6
+static int g_mirror = 0;                 /* 1 = at least one replica accepted */
+static int g_mir_nrep = 1;               /* replicas incl. the primary */
+static int g_mir_cut[V41_MIR_REPS] = {256};   /* cumulative hash cuts of 256 */
+static int g_mir_epl = 384;              /* experts per layer, for the hash */
+static uint64_t g_mir_bytes[V41_MIR_REPS];
+static uint64_t g_mir_nread[V41_MIR_REPS];
+
+/* Replica of one expert. Deterministic: the hash depends on nothing but the
+ * expert's identity, so the same expert always lands on the same drive and a
+ * drive never caches a copy the next read will not ask it for.
+ *
+ * Over the FLAT index, not the two ids apart: deepseek_v4.c records why. An XOR
+ * of layer and eid spread the full 43x256 grid evenly but clustered the twelve
+ * or so experts a decode step actually touches onto one replica; multiplying the
+ * flat index by the golden-ratio constant and taking bits 16..23 inherits the
+ * uniformity of that index, so hot and cold subsets split alike. */
+static inline int expert_route(int layer, int eid) {
+    if (!g_mirror) return 0;
+    uint32_t h = (uint32_t)(layer * g_mir_epl + eid) * 2654435761u;
+    int hv = (int)((h >> 16) & 255), r = 0;
+    while (hv >= g_mir_cut[r]) r++;      /* cut[nrep-1]==256 terminates the scan */
+    return r;
+}
+
+/* Measure one replica's read bandwidth. Uses the engine's own pattern -- the
+ * depth the expert reader uses, and the O_DIRECT twin when there is one -- over
+ * `V41_MIR_PROBE_BLOCKS` blocks of V41_MIR_PROBE_BYTES spread across the largest
+ * shard the replica carries. The probe exists only to weight a split; reading
+ * through the page cache here would weigh the cache instead of the drive, so it
+ * says so when it cannot avoid it. */
+#define V41_MIR_PROBE_BYTES (19 << 20)
+#define V41_MIR_PROBE_BLOCKS 8
+
+static double mirror_probe_bw(shards *S, int rep) {
+    int big = -1;
+    int64_t bsz = 0;
+    for (int i = 0; i < S->nfd; i++) {
+        int fd = st_fd_rep(S, S->fds[i], rep);
+        if (fd < 0) continue;
+        int64_t sz = lseek(fd, 0, SEEK_END);
+        if (sz > bsz) { bsz = sz; big = i; }
+    }
+    const int64_t blk = V41_MIR_PROBE_BYTES;
+    if (big < 0 || bsz < blk * (V41_MIR_PROBE_BLOCKS + 1)) return 0;
+    int dfd = st_direct_fd_rep(S, S->fds[big], rep);
+    int fd = dfd >= 0 ? dfd : st_fd_rep(S, S->fds[big], rep);
+    if (fd < 0) return 0;
+    double t0 = now_s();
+    int64_t total = 0;
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(dynamic, 1) reduction(+:total)
+#endif
+    for (int i = 0; i < V41_MIR_PROBE_BLOCKS; i++) {
+        void *buf = NULL;
+        if (posix_memalign(&buf, ST_DIRECT_ALIGN, (size_t)blk) != 0) continue;
+        int64_t off = (((bsz - blk) / V41_MIR_PROBE_BLOCKS) * i) & ~(int64_t)(4096 - 1);
+        ssize_t r = pread(fd, buf, (size_t)blk, off);
+        if (r > 0) total += r;
+        compat_aligned_free(buf);
+    }
+    double dt = now_s() - t0;
+    return (dt > 0 && total > 0) ? (double)total / 1e9 / dt : 0;
+}
+
+/* Register the replicas and derive the split. Runs after the shard index is
+ * open and before the first expert read, so nothing is already cached from the
+ * primary by the time the split exists. */
+static void mirror_setup(shards *S, const char *model_dir, int experts_per_layer) {
+    if (experts_per_layer > 0) g_mir_epl = experts_per_layer;
+    const char *dirs = getenv("COLI_MODEL_MIRROR");
+    if (!dirs || !*dirs) dirs = getenv("SNAP_MIRROR");
+    if (!dirs || !*dirs) return;
+    st_mirror_reset(S);
+    int nrep = 1;
+    char buf[4096];
+    snprintf(buf, sizeof(buf), "%s", dirs);
+    for (char *p = buf; p && *p; ) {
+        char *sep = p;
+        while (*sep && *sep != ';' && *sep != ',') sep++;
+        int last = (*sep == 0);
+        *sep = 0;
+        while (*p == ' ') p++;
+        size_t len = strlen(p);
+        while (len > 0 && p[len - 1] == ' ') p[--len] = 0;
+        if (*p) {
+            if (model_dir && !strcmp(model_dir, p))
+                fprintf(stderr, "[MIRROR] %s equals the model dir — ignored\n", p);
+            else if (nrep >= V41_MIR_REPS)
+                fprintf(stderr, "[MIRROR] %s: too many mirrors (max %d) — ignored\n", p, ST_MAX_MIR);
+            else {
+                int nf = st_mirror_add(S, p);
+                if (nf <= 0)
+                    fprintf(stderr, "[MIRROR] %s: no usable shard (missing or divergent "
+                                    "copy) — skipped\n", p);
+                else {
+                    fprintf(stderr, "[MIRROR] %s: %d/%d shards (replica %d)\n",
+                            p, nf, S->nfd, nrep);
+                    nrep++;
+                }
+            }
+        }
+        p = last ? NULL : sep + 1;
+    }
+    if (nrep < 2) {
+        fprintf(stderr, "[MIRROR] no usable mirror — reading the primary drive only\n");
+        return;
+    }
+    g_mirror = 1; g_mir_nrep = nrep;
+    double weight[V41_MIR_REPS];
+    int have = 0;
+    const char *spec = getenv("COLI_DISK_WEIGHTS");
+    const char *how = "COLI_DISK_WEIGHTS";
+    if (spec && *spec) {
+        char wb[256];
+        snprintf(wb, sizeof(wb), "%s", spec);
+        int n = 0, bad = 0;
+        for (char *tok = strtok(wb, ", "); tok; tok = strtok(NULL, ", ")) {
+            double v = atof(tok);
+            if (v <= 0 || n >= V41_MIR_REPS) { bad = 1; break; }
+            weight[n++] = v;
+        }
+        if (!bad && n == nrep) have = 1;
+        else
+            fprintf(stderr, "[MIRROR] invalid COLI_DISK_WEIGHTS '%s' (want %d positive "
+                            "comma-separated weights, e.g. 9,3) — probing instead\n", spec, nrep);
+    }
+    if (!have) {
+        how = "measured";
+        have = 1;
+        for (int r = 0; r < nrep; r++) {
+            weight[r] = mirror_probe_bw(S, r);
+            if (weight[r] <= 0) have = 0;
+        }
+        if (have) {
+            fprintf(stderr, "[MIRROR] probe:");
+            for (int r = 0; r < nrep; r++)
+                fprintf(stderr, "%s %s %.2f GB/s", r ? " |" : "",
+                        r ? "mirror" : "primary", weight[r]);
+            fprintf(stderr, "\n");
+        } else {
+            for (int r = 0; r < nrep; r++) weight[r] = 1;
+            how = "fallback 1:1 (probe failed)";
+        }
+    }
+    double sum = 0;
+    for (int r = 0; r < nrep; r++) sum += weight[r];
+    int acc = 0;
+    double cum = 0;
+    for (int r = 0; r < nrep; r++) {
+        cum += weight[r];
+        int cut = (int)(256.0 * cum / sum + 0.5);
+        if (cut <= acc) cut = acc + 1;
+        if (cut > 256) cut = 256;
+        g_mir_cut[r] = cut;
+        acc = cut;
+    }
+    fprintf(stderr, "[MIRROR] %d replicas, split %s:", nrep, how);
+    for (int r = 0; r < nrep; r++) {
+        int share = (r ? g_mir_cut[r] : g_mir_cut[0]) - (r ? g_mir_cut[r - 1] : 0);
+        fprintf(stderr, " %s %d%%", r ? "mirror" : "primary", (share * 100 + 128) / 256);
+    }
+    fprintf(stderr, "\n");
+}
+
+/* The per-drive line ENVIRONMENT.md documents ("Per-drive byte counts are
+ * reported in a MIRROR: stats line"), in the shape colibri.c prints. Counters
+ * are cumulative; passing the values from before a turn reports that turn. On
+ * stderr, because stdout carries the serve protocol. */
+static void mirror_report(const uint64_t *bytes0, const uint64_t *reads0) {
+    if (!g_mirror) return;
+    double per[V41_MIR_REPS], total = 0;
+    for (int r = 0; r < g_mir_nrep; r++) {
+        uint64_t bytes = g_mir_bytes[r] - (bytes0 ? bytes0[r] : 0);
+        per[r] = (double)bytes / 1e9;
+        total += per[r];
+    }
+    fprintf(stderr, "MIRROR: primary %.2f GB (%llu reads)", per[0],
+            (unsigned long long)(g_mir_nread[0] - (reads0 ? reads0[0] : 0)));
+    for (int r = 1; r < g_mir_nrep; r++)
+        fprintf(stderr, " | mirror%d %.2f GB (%llu reads)", r, per[r],
+                (unsigned long long)(g_mir_nread[r] - (reads0 ? reads0[r] : 0)));
+    fprintf(stderr, " — %.0f%% of expert bytes from the mirrors\n",
+            total > 0 ? 100.0 * (total - per[0]) / total : 0.0);
+}
+
+/* One tensor still to fetch: which tensor, which window it lands in, and which
+ * replica answers for it. An expert is six of these -- three weight matrices and
+ * their three scale sidecars. */
+typedef struct {
+    const st_tensor *t;   /* resolved once, so a read is a pread and not a hash lookup */
+    Slot *slot;           /* whose window, and which of the six, to republish after */
+    int part;
+    int rep;
+} ExpertRead;
+
+/* Bytes one part of an expert occupies, from the config rather than the file:
+ * this is the capacity the slot's window was sized for, and the reader refuses a
+ * tensor that declares more than that (see expert_fetch). */
+static int64_t expert_part_bytes(const Cfg *c, int part) {
+    switch (part) {
+    case 0: case 2: return (int64_t)c->moe_inter * c->dim / 2;        /* w1, w3 */
+    case 1: case 3: return (int64_t)c->moe_inter * (c->dim / 32);     /* their scales */
+    case 4: return (int64_t)c->dim * c->moe_inter / 2;                /* w2 */
+    default: return (int64_t)c->dim * (c->moe_inter / 32);            /* its scale */
+    }
+}
 
 /* Fill in the six reads that make up one expert. Naming them into a list instead
  * of reading them on the spot is the whole point: the list is what lets a layer's
- * misses go to the device together rather than one behind another. */
+ * misses go to the device together rather than one behind another. Resolution
+ * happens here too, once per miss, so the read itself is a pread through the
+ * chosen replica's fd rather than a name lookup followed by a primary-drive one. */
 static int expert_read_list(Model *m, const char *kind, int layer, int eid, Slot *s,
-                            ExpertRead *out) {
-    Cfg *c = &m->c;
-    int64_t packed_gate = (int64_t)c->moe_inter * c->dim / 2;
-    int64_t packed_down = (int64_t)c->dim * c->moe_inter / 2;
-    int64_t scales_gate = (int64_t)c->moe_inter * (c->dim / 32);
-    int64_t scales_down = (int64_t)c->dim * (c->moe_inter / 32);
-    struct { const char *suffix; uint8_t *bytes; int64_t size; uint8_t *scale; int64_t scale_size; } part[3] = {
-        { "w1", s->w1, packed_gate, s->s1, scales_gate },
-        { "w3", s->w3, packed_gate, s->s3, scales_gate },
-        { "w2", s->w2, packed_down, s->s2, scales_down },
+                            int rep, ExpertRead *out) {
+    static const struct { const char *suffix; int weight_part, scale_part; } part[3] = {
+        { "w1", 0, 1 }, { "w3", 2, 3 }, { "w2", 4, 5 },
     };
+    static const char *const leaf[2] = { "weight", "scale" };
+    char name[160];
     int n = 0;
     for (int i = 0; i < 3; i++) {
-        snprintf(out[n].name, sizeof(out[n].name), "%s.%d.ffn.experts.%d.%s.weight",
-                 kind, layer, eid, part[i].suffix);
-        out[n].dest = part[i].bytes; out[n].size = part[i].size; n++;
-        snprintf(out[n].name, sizeof(out[n].name), "%s.%d.ffn.experts.%d.%s.scale",
-                 kind, layer, eid, part[i].suffix);
-        out[n].dest = part[i].scale; out[n].size = part[i].scale_size; n++;
+        for (int f = 0; f < 2; f++) {
+            snprintf(name, sizeof(name), "%s.%d.ffn.experts.%d.%s.%s",
+                     kind, layer, eid, part[i].suffix, leaf[f]);
+            const st_tensor *t = st_find(&m->S, name);
+            if (!t) st_die_missing(&m->S, name);
+            out[n].t = t;
+            out[n].slot = s;
+            out[n].part = f ? part[i].scale_part : part[i].weight_part;
+            out[n].rep = rep;
+            n++;
+        }
     }
     return n;
 }
@@ -914,6 +1182,19 @@ static int expert_read_depth(void) {
     return depth;
 }
 
+/* O_DIRECT for the expert reads. On by default, as in the V4 engine, because of
+ * what an expert read is: each is read once and wanted no longer, the engine
+ * tells the kernel so afterwards (drop=1 -> POSIX_FADV_DONTNEED), and a buffered
+ * read of it therefore pays for the bytes twice -- once into the page cache and
+ * once out of it -- to leave the cache exactly as cold as it was. V41_DIRECT=0
+ * restores the buffered path, which is the arm of the A/B and the escape hatch
+ * on a device where the direct path turns out to be slower. */
+static int expert_direct(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("V41_DIRECT") ? atoi(getenv("V41_DIRECT")) : 1;
+    return on != 0;
+}
+
 /* Read `n` reserved experts at once. The slot ids are stamped only after every
  * read has landed, so a slot never advertises an expert it does not yet hold. */
 static void expert_fetch(Model *m, const char *kind, int layer,
@@ -923,7 +1204,20 @@ static void expert_fetch(Model *m, const char *kind, int layer,
     ExpertRead *list = xmalloc((size_t)n * V41_EXPERT_TENSORS * sizeof(ExpertRead),
                                "expert read list");
     for (int i = 0; i < n; i++)
-        total += expert_read_list(m, kind, layer, eid[i], slot[i], list + total);
+        total += expert_read_list(m, kind, layer, eid[i], slot[i],
+                                  expert_route(layer, eid[i]), list + total);
+    /* The window is sized from the config, so a container whose tensor declares
+     * more than that must not be read into it -- same refusal st_read_raw_cap
+     * applied when the read went by name. */
+    for (int i = 0; i < total; i++) {
+        int64_t cap = expert_part_bytes(&m->c, list[i].part);
+        if (list[i].t->nbytes < 0 || list[i].t->nbytes > cap) {
+            fprintf(stderr, "%s: expert tensor declares %lld bytes, the slot holds %lld — "
+                            "refusing (untrusted container)\n", list[i].t->name,
+                    (long long)list[i].t->nbytes, (long long)cap);
+            exit(1);
+        }
+    }
     double started = now_s();
     int threads = expert_read_depth();
     if (threads > total) threads = total;
@@ -932,9 +1226,28 @@ static void expert_fetch(Model *m, const char *kind, int layer,
     #pragma omp parallel for schedule(dynamic, 1) num_threads(threads) reduction(+:bytes)
 #endif
     for (int i = 0; i < total; i++) {
-        st_read_raw_cap(&m->S, list[i].name, list[i].dest, list[i].size, 1);
-        bytes += (uint64_t)list[i].size;
+        const ExpertRead *r = &list[i];
+        int64_t pad = r->t->off % ST_DIRECT_ALIGN;
+        /* The payload pointer carries the slack st_read_range_rep needs to read
+         * from the enclosing block boundary, so an O_DIRECT transfer lands the
+         * data exactly where the slot wants it and nothing is copied afterwards. */
+        st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes,
+                          r->slot->base[r->part] + pad, r->t->nbytes, 1, expert_direct(),
+                          "pread expert");
+        /* Which drive actually answered. A partial mirror leaves shards on the
+         * primary, so the replica the route picked is not always the one that read. */
+        int rep = r->rep;
+        if (st_fd_rep(&m->S, r->t->fd, rep) < 0) rep = 0;
+        __atomic_fetch_add(&g_mir_bytes[rep], (uint64_t)r->t->nbytes, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_mir_nread[rep], 1, __ATOMIC_RELAXED);
+        bytes += (uint64_t)r->t->nbytes;
     }
+    /* Publish the payload pointers only now. A slot that advertises an expert has
+     * to address that expert, and until the read landed the window base was the
+     * only pointer that meant anything. */
+    for (int i = 0; i < total; i++)
+        *slot_part(list[i].slot, list[i].part) =
+            list[i].slot->base[list[i].part] + (list[i].t->off % ST_DIRECT_ALIGN);
     m->expert_bytes += bytes;
     m->t_disk += now_s() - started;
     for (int i = 0; i < n; i++) slot[i]->eid = eid[i];
@@ -1068,21 +1381,26 @@ static void spec_load(Model *m, int ecap);
  * but the experts themselves are the same shape, so the slots are too. */
 static void cache_init(Model *m, LCache *cache, int ecap) {
     Cfg *c = &m->c;
-    int64_t packed_gate = (int64_t)c->moe_inter * c->dim / 2;
-    int64_t packed_down = (int64_t)c->dim * c->moe_inter / 2;
-    int64_t scales_gate = (int64_t)c->moe_inter * (c->dim / 32);
-    int64_t scales_down = (int64_t)c->dim * (c->moe_inter / 32);
     cache->cap = ecap; cache->n = 0;
     cache->slot = xmalloc((size_t)ecap * sizeof(Slot), "expert slots");
     for (int k = 0; k < ecap; k++) {
         Slot *s = &cache->slot[k];
         s->eid = -1; s->used = 0;
-        s->w1 = xmalloc((size_t)packed_gate, "expert w1");
-        s->w3 = xmalloc((size_t)packed_gate, "expert w3");
-        s->w2 = xmalloc((size_t)packed_down, "expert w2");
-        s->s1 = xmalloc((size_t)scales_gate, "expert w1 scale");
-        s->s3 = xmalloc((size_t)scales_gate, "expert w3 scale");
-        s->s2 = xmalloc((size_t)scales_down, "expert w2 scale");
+        /* One window per tensor, page-aligned and with ST_DIRECT_ALIGN of slack
+         * past its payload. The slack is not padding for its own sake: it is what
+         * lets st_read_range_rep turn an unaligned safetensors range into one
+         * aligned O_DIRECT pread, instead of bouncing every expert through a
+         * scratch buffer and copying it again (see the expert reader). */
+        for (int part = 0; part < V41_EXPERT_TENSORS; part++) {
+            size_t bytes = (size_t)expert_part_bytes(c, part) + ST_DIRECT_ALIGN;
+            void *window = NULL;
+            if (posix_memalign(&window, ST_DIRECT_ALIGN, bytes) != 0) {
+                fprintf(stderr, "OOM allocating expert window (%zu bytes)\n", bytes);
+                exit(1);
+            }
+            s->base[part] = window;
+            *slot_part(s, part) = window;   /* until the first read republishes it */
+        }
     }
 }
 
@@ -1092,7 +1410,19 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
     Cfg *c = &m->c;
     cfg_load(c, snap);
     attn_project_check(c);
-    st_init(&m->S, snap);
+    /* COLI_MODEL_DIRS: the container split across drives as DISTINCT shards, so
+     * the 510 GB this engine streams can live on two drives of ~256 GB instead
+     * of one of 512 -- which is the configuration most people can actually
+     * build, and it needs no second copy. The mirror below is the other half of
+     * the same idea: that one duplicates the bytes and splits the reads, this
+     * one splits the bytes and reads each shard from the one drive holding it.
+     * They compose: a mirror dir may copy any subset of the split's shards. */
+    const char *extra_dirs = getenv("COLI_MODEL_DIRS");
+    st_init_multi(&m->S, snap, (extra_dirs && *extra_dirs) ? extra_dirs : NULL);
+    /* DUAL-SSD: register COLI_MODEL_MIRROR copies and settle the read split
+     * before the first expert read, so nothing has been pulled from the primary
+     * by the time the replicas exist. */
+    mirror_setup(&m->S, snap, c->n_routed);
     engram_load_sidecar(&m->engram, snap);
 
     int dim = c->dim, hd = c->head_dim, nh = c->n_heads, hc = c->hc_mult;
@@ -3129,6 +3459,11 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
         double disk0 = m->t_disk, expert0 = m->t_expert, attn0 = m->t_attn, engram0 = m->t_engram;
         uint64_t forwards0 = m->forwards, hits0 = m->hits, miss0 = m->miss;
         uint64_t ebytes0 = m->expert_bytes;
+        uint64_t mir_bytes0[V41_MIR_REPS], mir_reads0[V41_MIR_REPS];
+        for (int r = 0; r < V41_MIR_REPS; r++) {
+            mir_bytes0[r] = g_mir_bytes[r];
+            mir_reads0[r] = g_mir_nread[r];
+        }
         model_reset(m);
         int n_prompt = tok_encode(tokenizer, (const char *)command.payload,
                                   (int)command.payload_bytes, ids, c->max_positions);
@@ -3277,6 +3612,11 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
                         (unsigned long long)(m->miss - miss0), turn_bytes / 1e6, seconds,
                         seconds > 0 ? turn_bytes / 1e9 / seconds : 0.0,
                         prefill_bytes / 1e6, prefill_disk, prefill_expert, prefill_wall);
+            /* Which drive answered, per turn. The split is the whole point of a
+             * mirror and the only honest way to check it is to count: a replica
+             * that was registered but never read from would look like a win in
+             * every number except the one that matters. */
+            if (turn_bytes) mirror_report(mir_bytes0, mir_reads0);
         }
         if (stats && m->spec.active && m->spec.proposed > proposed0)
             fprintf(stderr, "[v41] DSpark: %llu of %llu drafts accepted this turn\n",
@@ -3317,6 +3657,18 @@ static int *load_ids(jval *root, const char *key, int *count) {
 }
 
 int main(int argc, char **argv) {
+    /* Size the team to PHYSICAL cores before anything else touches the model.
+     * This engine issues ~720 OpenMP regions per decoded token -- three per
+     * expert application, 240 applications a token -- and every one of them is
+     * only a few thousand rows wide, so the barrier is a real share of the work
+     * rather than a rounding error. Left at the OpenMP default (one thread per
+     * logical CPU) the region cost dominates: on a 208-logical-CPU host 93% of
+     * all cycles land inside libgomp and the turn runs 18.7x slower than at 32
+     * threads and 11.7x slower than at the 104 physical cores this picks.
+     * colibri/inkling/kimi_k3/olmoe already call it; see
+     * docs/experiments/dsv41-omp-team-2026-09-15.md.
+     * OMP_NUM_THREADS still wins, COLI_NO_OMP_TUNE=1 still disables it. */
+    coli_omp_tune_threads("deepseek-v41");
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "SNAP=<container dir> is required\n"); return 2; }
     int cap = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 8;
@@ -3497,6 +3849,7 @@ int main(int argc, char **argv) {
                     "expert matmul %.2fs, attention %.2fs, engram %.2fs\n",
             (unsigned long long)m.hits, (unsigned long long)m.miss,
             m.expert_bytes / 1e6, m.t_disk, m.t_expert, m.t_attn, m.t_engram);
+    mirror_report(NULL, NULL);
     if (m.engram.active)
         for (int t = 0; t < m.engram.n_layers; t++)
             fprintf(stderr, "[v41] engram table %d (layer %d): %lld rows, %llu cache hits, "

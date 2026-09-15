@@ -629,6 +629,42 @@ jobs:
             SNAP=dsv41_tiny ./deepseek_v41 "$cap" dsv41_tiny/ref.json
             echo "::endgroup::"
           done
+      - name: "Multi-SSD mirror and O_DIRECT change nothing about the answer"
+        run: |
+          cd c
+          # A replica answers the same bytes: the same container in a second directory
+          # must produce the same token stream, on the primary and through the mirror,
+          # with the O_DIRECT window and with the buffered path it replaces. Routing an
+          # expert to a drive is an I/O decision and must not be visible downstream.
+          mkdir -p dsv41_mirror
+          cp dsv41_tiny/model.safetensors dsv41_mirror/
+          SNAP=dsv41_tiny ./deepseek_v41 8 dsv41_tiny/ref.json > primary.txt 2>/dev/null
+          SNAP=dsv41_tiny COLI_MODEL_MIRROR=dsv41_mirror ./deepseek_v41 8 dsv41_tiny/ref.json > mirror.txt 2>/dev/null
+          SNAP=dsv41_tiny COLI_MODEL_MIRROR=dsv41_mirror V41_DIRECT=0 ./deepseek_v41 8 dsv41_tiny/ref.json > buffered.txt 2>/dev/null
+          cmp primary.txt mirror.txt
+          cmp primary.txt buffered.txt
+          # COLI_MODEL_DIRS splits the container as DISTINCT shards -- no second copy,
+          # which is the only multi-drive layout most people can build out of a 510 GB
+          # checkpoint. The shards move; the answer must not.
+          mkdir -p dsv41_split_meta dsv41_split_shard
+          cp dsv41_tiny/config.json dsv41_tiny/tokenizer.json dsv41_tiny/dsv41_engram.json dsv41_split_meta/
+          cp dsv41_tiny/model.safetensors dsv41_split_shard/
+          SNAP=dsv41_split_meta COLI_MODEL_DIRS=dsv41_split_shard ./deepseek_v41 8 dsv41_tiny/ref.json > split.txt 2>split.err
+          cmp primary.txt split.txt
+          grep -q "\[SPLIT\] model across 2 dir(s)" split.err
+          # A copy that is not byte-identical is not a replica: it is refused, and the
+          # run stays on the primary rather than reading someone else's offsets.
+          mkdir -p dsv41_divergent
+          python3 - <<'PY'
+          import pathlib
+          src = pathlib.Path("dsv41_tiny/model.safetensors")
+          data = bytearray(src.read_bytes())
+          data[8] ^= 0x01        # inside the safetensors header
+          pathlib.Path("dsv41_divergent/model.safetensors").write_bytes(bytes(data))
+          PY
+          SNAP=dsv41_tiny COLI_MODEL_MIRROR=dsv41_divergent ./deepseek_v41 8 dsv41_tiny/ref.json > divergent.txt 2>divergent.err
+          cmp primary.txt divergent.txt
+          grep -q "header differs from the primary copy" divergent.err
       - name: "A prompt longer than one block, so the block boundary is crossed"
         run: |
           cd c

@@ -244,6 +244,11 @@ Hugging Face 上已有預先轉換的 **GLM-5.2 int4** 容器——請務必使�
 
 **https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
 
+**GLM-5.3** 屬於同一家族,使用同一引擎載入。它有自己的 group-scaled(gs64)容器,
+約 **419 GB**,且**不含** MTP head,因此推測解碼保持關閉:
+
+**https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64**
+
 > ⚠️ 請使用上面的 **gs64** 容器，不要使用較舊的 per-row int4 鏡像
 >（`mateogrgic/…`、`jlnsrk/…`）：後者品質實測低約 9 個百分點，也是
 > [#455](https://github.com/JustVugg/colibri/issues/455) 最初 think-mode 迴圈與生成不終止的根因。
@@ -341,4 +346,4 @@ docs/                     參考文件、實驗與媒體檔
 
 ## 授權條款
 
-Apache 2.0。GLM-5.2 權重由 Z.ai 以 MIT 授權發布。
+Apache 2.0，Copyright 2026 Vincenzo Fornaro。詳見 [LICENSE](LICENSE) 與 [NOTICE](NOTICE)。GLM-5.2 權重由 Z.ai 以 MIT 授權發布。

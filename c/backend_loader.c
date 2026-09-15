@@ -62,6 +62,7 @@
 typedef int            (*fn_init)(const int *devices, int count);
 typedef void           (*fn_shutdown)(void);
 typedef int            (*fn_device_count)(void);
+typedef int            (*fn_available_device_count)(void);
 typedef int            (*fn_device_at)(int index);
 typedef int            (*fn_mem_info)(int device, size_t *free_bytes, size_t *total_bytes);
 typedef int            (*fn_device_integrated)(int device);
@@ -159,6 +160,7 @@ static struct {
     fn_init            init;
     fn_shutdown        shutdown;
     fn_device_count    device_count;
+    fn_available_device_count available_device_count;
     fn_device_at       device_at;
     fn_mem_info        mem_info;
     fn_device_integrated device_integrated;
@@ -1427,6 +1429,7 @@ static int coli_cuda_load(void){
      * nothing by this name, and the wrapper's 0 is the engine's own "fall back
      * to CPU" result, so an older DLL still serves GLM and Qwen3.6 (#1405). */
     RESOLVE_OPT(matmul_mxfp4,   fn_matmul_mxfp4)
+    RESOLVE_OPT(available_device_count, fn_available_device_count)   /* qwen36 tier (#1533); older DLLs fall back to device_count */
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
     /* Optional, same reasoning as e8_set_grid above: a DLL predating #687
@@ -1511,6 +1514,15 @@ void coli_cuda_shutdown(void){
 int coli_cuda_device_count(void){
     if(!g_cuda.available) return 0;
     return g_cuda.device_count();
+}
+
+/* qwen36_tier.c's device selection asks for the usable count; the loader had
+ * no wrapper for it, so the first CUDA_DLL build of qwen36 that compiled the
+ * tier in failed to link (#1533). */
+int coli_cuda_available_device_count(void){
+    if(!g_cuda.available) return 0;
+    if(!g_cuda.available_device_count) return g_cuda.device_count();   /* a DLL from before the export */
+    return g_cuda.available_device_count();
 }
 
 int coli_cuda_device_at(int index){

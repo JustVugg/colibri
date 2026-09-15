@@ -40,6 +40,16 @@ import time
 
 import numpy as np
 
+# The resume and missing-source lines print U+2014, which a stdout in cp949 or
+# cp932 (a redirected stdout on Korean or Japanese Windows) cannot encode: the
+# print raised and the resume died on the first shard it had already written.
+# Escape what the encoding cannot hold, as CPython already does on stderr; the
+# encoding itself is left alone. A UTF-8 stdout is unaffected.
+try:
+    sys.stdout.reconfigure(errors="backslashreplace")
+except AttributeError:
+    pass
+
 CHUNK_ROWS = 4096          # quantize in row blocks (bounds RAM to ~120 MB)
 COPY_BLOCK = 64 << 20      # passthrough copy block
 
