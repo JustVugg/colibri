@@ -72,6 +72,7 @@
 #include "st.h"
 #include "quant.h"
 #include "tok.h"
+#include "omp_tune.h"
 #ifdef COLI_METAL
 #include "backend_metal.h"
 static int g_metal_ready = 0;
@@ -3006,8 +3007,12 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         return 0;
     }
     if (total >= room) {
+        /* The gateway turns CONTEXT_EXCEEDED into a 400 context_length_exceeded;
+         * BAD_REQUEST reads as an engine fault, a 500 the client cannot act on.
+         * tok_encode stops at `room`, so prompt_tokens is a lower bound. */
         free(sequence);
-        serve_line("ERROR %llu BAD_REQUEST\n", q->id);
+        serve_line("ERROR %llu CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n",
+                   q->id, total, q->max_tokens, room);
         return 0;
     }
 
@@ -3274,6 +3279,12 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
 
 #ifndef GLM53_NO_MAIN
 int main(int argc, char **argv) {
+    /* Physical-core team sizing, the same shared helper colibri/inkling/
+     * kimi_k3/olmoe/deepseek-v41 call. This engine has no OpenMP sizing of its
+     * own, so on an SMT host it ran one thread per logical CPU; #718 measured
+     * +2.3x from this alone on a 16C/32T part and the effect grows with the
+     * logical/core ratio. OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. */
+    coli_omp_tune_threads("glm53");
     const char *dir = NULL, *ids = NULL, *patch_file = NULL, *prompt_text = NULL;
     int greedy = 0, show_logits = 0, grid_h = 0, grid_w = 0;
     for (int i = 1; i < argc; i++) {

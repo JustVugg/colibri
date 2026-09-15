@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "commit": "8eb197e5900e3a30c0ec2e979c48016da6c7ed7e",
+  "model": "deepseek-ai/DeepSeek-V4.1-Flash, released checkpoint, 48 shards, 510.3 GB, fp8 dense + fp4 experts, no conversion",
+  "command": "OMP_NUM_THREADS=32 SNAP=/mnt/nvme0/DeepSeek-V4.1-Flash [ENV] ./deepseek_v41 8 /tmp/ref.json (25 prompt tokens, 16 generated, cap=8, page cache evicted per run, arms interleaved, 3 runs each)",
+  "prompt_hash": "79a5bcf37f1920a530cfee5ab7a484e00a1d6bb7f19d9a7418beaa53c14b454b",
+  "hardware": {
+    "cpu": "2x Intel Xeon Platinum 8555C, 52 cores/socket, 2 threads/core = 104 physical cores, 208 logical CPUs, 4 NUMA nodes",
+    "ram": "1007 GiB",
+    "storage": "A: Samsung MZQL2960HCJR (nvme0n1, 894 GB) ext4 noatime, /mnt/nvme0. B: 2x Samsung MZQLB7T6HMLA (7.6 TB) in RAID0 (md0) ext4, /mdr5. A and B are independent controllers.",
+    "os": "Ubuntu 24.04, kernel 6.8.0-31-generic, gcc 13.3.0, -O3 -march=native -fopenmp"
+  },
+  "warmup_runs": 0,
+  "hypothesis": "Serving the routed experts from a byte-identical copy on an independent controller raises the expert read rate above what one device can deliver.",
+  "changed_variables": [
+    "COLI_MODEL_MIRROR"
+  ],
+  "baseline": {
+    "config": {
+      "COLI_DISK_WEIGHTS": "1,1"
+    },
+    "samples": {
+      "tok_s": [
+        0.422498,
+        0.402111,
+        0.419507
+      ]
+    },
+    "median_tok_s": 0.419507,
+    "quality": {
+      "method": "token-exact vs a 16-token reference stream; the engine exits non-zero on any mismatch. All runs 16/16, in both regimes. tok_s is 16 generated tokens over the whole turn (READY to DONE), prefill included, with the engine's OpenMP team set to 32 threads (OMP_NUM_THREADS=32) so the CPU side is not the bottleneck -- see PR #1517 for why that matters",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/dsv41-expert-io-2026-09-14-raw.txt, section '32-P0'",
+      "sha256": "e0559d2a8ffb7a5cecfa4371264d86a5fb1d1160a8da8661912db266b2fd42fb"
+    }
+  },
+  "trial": {
+    "config": {
+      "COLI_MODEL_MIRROR": "<second byte-identical copy>",
+      "COLI_DISK_WEIGHTS": "1,1"
+    },
+    "samples": {
+      "tok_s": [
+        0.473934,
+        0.470865,
+        0.469346
+      ]
+    },
+    "median_tok_s": 0.470865,
+    "quality": {
+      "method": "token-exact vs a 16-token reference stream; the engine exits non-zero on any mismatch. All runs 16/16, in both regimes. tok_s is 16 generated tokens over the whole turn (READY to DONE), prefill included, with the engine's OpenMP team set to 32 threads (OMP_NUM_THREADS=32) so the CPU side is not the bottleneck -- see PR #1517 for why that matters",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/dsv41-expert-io-2026-09-14-raw.txt, section '32-M3'",
+      "sha256": "682ab4b1b9175f502a96b7e4b8007f4bd00b84fed873e383be74e115b20f5506"
+    }
+  },
+  "outcome": "improvement"
+}

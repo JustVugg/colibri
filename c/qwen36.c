@@ -60,6 +60,7 @@ static int qwen36_max_ctx(void) {
 #include "serve_poll.h"       /* CANCEL a meta' turno (#1332) */
 #include "cli_args.h"
 #include "st.h"
+#include "omp_tune.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
@@ -2966,6 +2967,12 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
 }
 
 int main(int argc, char **argv) {
+    /* Physical-core team sizing, as colibri/inkling/kimi_k3/olmoe/deepseek-v41
+     * do. Without it this engine takes one thread per logical CPU, which on an
+     * SMT host doubles the team for no arithmetic and pays a barrier per tiny
+     * per-expert region (#718 measured +2.3x from the sizing alone on a
+     * 16C/32T part). OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. */
+    coli_omp_tune_threads("qwen36");
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6"); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;

@@ -720,6 +720,11 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     G.on=1;
     fprintf(stderr,"[qtier] CUDA VRAM expert tier active: %d device(s), %.2f MB/expert\n",
             G.ndev, G.exp_bytes/1048576.0);
+    /* The launcher and coli doctor recognise a Windows CUDA_DLL build by this
+     * literal in the binary (they cannot read an import table for a DLL
+     * loaded at run time); without it a working GPU build of this engine read
+     * as CPU-only and --gpu was refused (#1533). */
+    fprintf(stderr,"[CUDA] mode: routed experts (qwen36 VRAM tier)\n");
     return 1;
 }
 
