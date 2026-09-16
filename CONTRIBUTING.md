@@ -51,3 +51,21 @@ samples per arm, medians derived from those samples, hashed raw evidence, a
 passing correctness gate, and exactly one changed configuration variable.
 Negative and no-change results use the same record and remain first-class
 evidence.
+
+## Large File Storage (Git LFS)
+
+Colibri uses Git LFS to track large binary assets and test fixtures without bloating repository history.
+
+- **Install Git LFS**: Ensure Git LFS is initialized locally before working with large fixtures:
+  ```sh
+  git lfs install
+  ```
+- **Lightweight Clones (CPU Core Developers)**: If you are working exclusively on the pure C core and do not need test fixtures, clone without pulling LFS payloads:
+  ```sh
+  GIT_LFS_SKIP_SMUDGE=1 git clone <repo-url>
+  ```
+- **Pulling Fixtures**: When test fixtures or model checkpoints are needed:
+  ```sh
+  git lfs pull
+  ```
+
