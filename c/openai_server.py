@@ -3103,6 +3103,7 @@ class Engine:
                     })
                     self.profile_seq += 1
                 elif kind == "TIERS" and len(fields) >= 6:
+                    print(" ".join(fields), flush=True)
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
                                   "disk": int(fields[3]), "vram_gb": float(fields[4]),
                                   "ram_gb": float(fields[5]),
