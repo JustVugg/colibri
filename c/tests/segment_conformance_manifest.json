@@ -75,6 +75,18 @@
       "real_adapter_required": true
     },
     {
+      "family_id": "qwen3",
+      "state_schema": "fixture/qwen3-kv-v1",
+      "state_components": [
+        "kv"
+      ],
+      "oracle": {
+        "kind": "generated_tiny",
+        "path": "tools/make_qwen3_tiny.py"
+      },
+      "real_adapter_required": true
+    },
+    {
       "family_id": "qwen36",
       "state_schema": "fixture/qwen36-kv-deltanet-conv-v1",
       "state_components": [

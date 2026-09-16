@@ -226,7 +226,7 @@ jobs:
         run: |
           cd c
           rc=0
-          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41"
+          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen3 qwen36 qwen38 deepseek_v41"
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
           for t in $ENGINES; do
             echo "::group::$t"
@@ -393,6 +393,84 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c backend_cuda_ink.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "inkling CUDA syntax check passed"
+
+  qwen3-tiny-check:
+    name: Qwen3 dense tiny oracle (token-exact + ASan/UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + transformers
+        run: pip install -r c/tools/oracle-requirements.txt
+      - name: int4 pack/unpack round-trip
+        run: |
+          cd c
+          # Cheap and first: if the nibble convention drifts from quant.h the
+          # token gate below fails with a hundred layers of indirection in
+          # between, where this prints the offending shape.
+          python3 tools/convert_qwen3_dense.py --selftest
+      - name: Tiny fixture, f16 token-exact, int4 container runs
+        run: |
+          cd c
+          # Same dense layout as Qwen3-8B (GQA + q/k RMSNorm + SwiGLU, full
+          # RoPE) at toy dimensions, so the converter and the engine treat it
+          # exactly like the real checkpoint. The target runs both caps and
+          # both containers; --bits 0 must be token-exact against HF greedy,
+          # --bits 4 only has to load and generate -- int4-gs64 carries ~10%
+          # per-weight L2 error, which is not a token-exactness contract.
+          make qwen3-tiny-check
+      - name: Same run under ASan + UBSan
+        run: |
+          cd c
+          # This step asserts MEMORY SAFETY, not token-exactness: -fsanitize
+          # changes inlining and vectorization, so float reassociation can flip
+          # a token wherever the greedy margin is thin. Same split as the
+          # Qwen3.6 job -- the step above owns exactness, this one owns memory.
+          # detect_leaks=0 for the reason the Makefile's test-asan gives: the
+          # tensor index and parsed config are allocated once and used until
+          # exit, and reporting them would bury an actual overflow.
+          make clean >/dev/null 2>&1 || true
+          make qwen3 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+          for snap in qwen3_tiny_f16 qwen3_tiny_i4; do
+            ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+              OMP_NUM_THREADS=2 SNAP=$snap ./qwen3 4 0 qwen3_tiny/ref.json \
+              > san-$snap.log 2>&1 || true
+            if grep -qE "ERROR: AddressSanitizer|runtime error:" san-$snap.log; then
+              echo "FAIL: sanitizer diagnostic on $snap"; cat san-$snap.log; exit 1
+            fi
+            echo "$snap clean:"; grep -E "Matching tokens" san-$snap.log || true
+          done
+      - name: A container with no rope_theta is refused, not defaulted
+        run: |
+          cd c
+          # The bug this gate exists for: transformers >=5 nests rope_theta
+          # under rope_parameters, both sides read only the top level, and the
+          # engine substituted 1e6 for the fixture's 1e4. Nothing crashed --
+          # the model just answered wrong from generated token 8 on. A default
+          # would make that silent again, so the engine must REFUSE.
+          cp -r qwen3_tiny_f16 qwen3_tiny_notheta
+          python3 - <<'PY'
+          import json
+          for p in ("qwen3_tiny_notheta/config.json",
+                    "qwen3_tiny_notheta/qwen3_meta.json"):
+              cfg = json.load(open(p))
+              cfg.pop("rope_theta", None)
+              cfg.pop("rope_parameters", None)
+              json.dump(cfg, open(p, "w"))
+          PY
+          if SNAP=qwen3_tiny_notheta ./qwen3 0 0 qwen3_tiny/ref.json \
+               > notheta.log 2>&1; then
+            echo "FAIL: engine ran a container with no RoPE base"
+            cat notheta.log; exit 1
+          fi
+          grep -q "rope_theta missing" notheta.log || {
+            echo "FAIL: refused, but not for the reason under test"
+            cat notheta.log; exit 1; }
+          echo "refused as expected:"; grep '^\[cfg\]' notheta.log
 
   qwen36-tiny-check:
     name: Qwen3.6 tiny oracle (token-exact + ASan/UBSan)

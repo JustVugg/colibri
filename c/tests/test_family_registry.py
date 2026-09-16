@@ -1016,6 +1016,11 @@ class FamilyRegistryTest(unittest.TestCase):
             "inkling": "<|user|>hello {world}<|assistant|>",
             "kimi": "K3CHAT1\nM user 13\nhello {world}G 0\n\n",
             "olmoe": "<|user|>\nhello {world}\n<|assistant|>\n",
+            # Dense Qwen3 shares Qwen's ChatML framing but NOT the forced
+            # <think> opener: it is not a reasoning checkpoint, and priming a
+            # thinking block it was never trained to close eats the answer.
+            "qwen3": "<|im_start|>user\nhello {world}<|im_end|>\n"
+                     "<|im_start|>assistant\n",
             # Qwen3.6's generation prompt MUST open <think>: the model was
             # never trained on the bare "assistant\\n" state and greedy argmax
             # there lands on an EOS special (measured gen=0).

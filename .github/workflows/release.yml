@@ -60,10 +60,10 @@ jobs:
       - name: Build engines
         run: |
           cd c
-          for t in colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41; do
+          for t in colibri glm53 inkling kimi_k3 olmoe qwen3 qwen36 qwen38 deepseek_v41; do
             make $t ${{ matrix.make_args }}
           done
-          ls -lh colibri${{ matrix.ext }} glm53${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen36${{ matrix.ext }} qwen38${{ matrix.ext }} deepseek_v41${{ matrix.ext }}
+          ls -lh colibri${{ matrix.ext }} glm53${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen3${{ matrix.ext }} qwen36${{ matrix.ext }} qwen38${{ matrix.ext }} deepseek_v41${{ matrix.ext }}
 
       # DeepSeek V4 has its own Makefile and its own target name (`deepseek-v4`,
       # producing `deepseek_v4`), so it never joined the loop above -- and #858 is
@@ -119,6 +119,10 @@ jobs:
           cp c/inkling${{ matrix.ext }} dist/inkling${{ matrix.ext }}
           cp c/kimi_k3${{ matrix.ext }} dist/kimi_k3${{ matrix.ext }}
           cp c/olmoe${{ matrix.ext }} dist/olmoe${{ matrix.ext }}
+          # qwen3 -- the DENSE Qwen3 engine (Qwen3ForCausalLM), distinct from the
+          # qwen36/qwen38 MoE siblings: engine_for() keys off model_type, so both
+          # binaries have to be present for "qwen" to resolve correctly.
+          cp c/qwen3${{ matrix.ext }} dist/qwen3${{ matrix.ext }}
           # qwen36 -- plain name, like the others: engine_for() resolves "qwen" to
           # a "qwen36" binary next to coli. Unconditional: the engine is portable C
           # with no platform gate, so every archive can carry it.
@@ -179,7 +183,7 @@ jobs:
           # a green build, green tests, and an archive with no engine for the model the
           # user actually had. Presence is not enough -- assert they are executable, and
           # that the launcher's own resolver finds them where it looks (next to coli).
-          SIBLINGS="inkling kimi_k3 olmoe qwen36 qwen38"
+          SIBLINGS="inkling kimi_k3 olmoe qwen3 qwen36 qwen38"
           # deepseek_v4 only where the engine builds (COLI_V4_SUPPORTED); asserting it
           # unconditionally would fail the macos-arm64 archive for shipping an engine
           # that platform cannot have.

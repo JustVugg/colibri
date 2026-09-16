@@ -20,6 +20,7 @@ FILES = [
     # step for as long as it existed (#1262), reporting green while the
     # sanitizer had never run. test_family_registry keeps this list and the
     # registry in step.
+    "qwen3", "qwen3.exe",
     "qwen36", "qwen36.exe",
     "qwen38", "qwen38.exe",
     "glm53", "glm53.exe",

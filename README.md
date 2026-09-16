@@ -428,6 +428,7 @@ the model's `config.json`):
 | **Qwen3.8-Flash-Next** (Alibaba) | 125B + 51B n-gram / 6B | [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) — original checkpoint; PLE stays pageable and experts stay **native block-FP8** | `make -C c qwen38` (CPU only) | [qwen38.md](docs/qwen38.md) |
 | **Qwen3.6** (Alibaba) | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64) (~20 GB, **recommended**) — hybrid Gated Attention + Gated DeltaNet | `make -C c qwen36` (`CUDA=1` for the VRAM expert tier) | [qwen36.md](docs/qwen36.md) |
 | **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` — **int8** container, ~7 GB | `make -C c olmoe` | — |
+| **Qwen3** (Alibaba, dense) | 8B | [`Qwen/Qwen3-8B`](https://huggingface.co/Qwen/Qwen3-8B) and any `Qwen3ForCausalLM` sibling — converted with `c/tools/convert_qwen3_dense.py` to **int4-gs64** matmul weights (~4.5 GB) or f16 passthrough. No experts: every weight is resident | `make -C c qwen3` (CPU only) | [qwen3.md](docs/qwen3.md) |
 
 Qwen3.6 ships three pre-converted containers: **int4-gs64** (recommended — measured
 cosine to the int8 anchor 0.98777 → 0.99313 and KL 0.109 → 0.080 against per-row, i.e.
@@ -614,6 +615,7 @@ c/
 ├── qwen38.c              Qwen3.8-Flash-Next text engine  (make qwen38)
 ├── qwen36.c              Qwen3.6 engine  (make qwen36)
 ├── olmoe.c               OLMoE engine  (make olmoe)
+├── qwen3.c               Qwen3 dense engine  (make qwen3)
 │
 ├── st.h                  safetensors index and range reads
 ├── quant.h               canonical container decoders
