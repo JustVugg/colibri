@@ -216,6 +216,23 @@ int main(void) {
         free_cache(&m);
     }
 
+    /* --- 8. post-refile stamp order (L2b differential): pin insert-scan must see
+     * the FINAL post-publish stamp — refile-then-bump left a stale-ordered pin list
+     * (all-pinned fallback picked used=99 over used=5; legacy scan picked 5). --- */
+    {
+        Model m; init_cache(&m, 6, 3); LCache *lc = &m.cache[0];
+        fill(&m, 3);                       /* used: s0=1, s1=2, s2=3 */
+        lc->slots[1].pinned = 1; victim_refile(lc, &lc->slots[1], 1);
+        m.clock = 50;
+        lc->slots[0].used = 99;            /* final post-publish stamp BEFORE refile (fixed order) */
+        lc->slots[0].pinned = 1; victim_refile(lc, &lc->slots[0], 0);
+        audit_lists(lc, "stamp order");
+        int v = victim_pick(&m, lc);
+        g_victim_scan_mode = 1; int vs = victim_pick(&m, lc); g_victim_scan_mode = 0;
+        CHECK(vs == v, "all-pinned pick %d diverged from scan %d after stamp-order fix", v, vs);
+        free_cache(&m);
+    }
+
     if (failures) { fprintf(stderr,"olmoe victim index: %d failure(s)\n", failures); return 1; }
     puts("olmoe victim index: ok");
     return 0;

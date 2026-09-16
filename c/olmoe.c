@@ -875,8 +875,10 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     pthread_mutex_lock(&g_pilot_mx);
     cache_publish(m, layer, s, eid);
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
+    s->used = ++m->clock;                          /* stamp BEFORE refile: the pin insert-scan
+                                                    * must see the final stamp (L2b differential:
+                                                    * refile-then-bump left a stale-ordered pin list) */
     victim_refile(lc, s, (int)(s - lc->slots));   /* #1050: pin flip re-files */
-    s->used = ++m->clock;
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     *out = s;
     pthread_mutex_unlock(&g_pilot_mx);
