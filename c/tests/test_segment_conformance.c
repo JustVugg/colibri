@@ -7,8 +7,8 @@
  * from this list, not written a second time: a family added to one and not the
  * other is how this test last failed for a reason unrelated to what it checks. */
 static const char *const kExpectedFamilies[] = {
-    "glm", "glm53", "inkling", "kimi", "olmoe", "qwen36", "qwen38", "deepseek_v4",
-    "deepseek_v41",
+    "glm", "glm53", "inkling", "kimi", "olmoe", "qwen3", "qwen36", "qwen38",
+    "deepseek_v4", "deepseek_v41",
 };
 
 static int expected_family(const char *family_id) {

@@ -83,6 +83,13 @@ static const ColiSegmentConformanceFixture g_fixtures[] = {
         1, 6, 4, 32, UINT32_C(0x4f4c4d4f),
     },
     {
+        "qwen3", "Qwen3-8B", "fixture/qwen3-kv-v1",
+        "grouped-query key/value attention cache",
+        "tools/make_qwen3_tiny.py",
+        COLI_SEGMENT_FIXTURE_KV,
+        1, 6, 4, 32, UINT32_C(0x51574e33),
+    },
+    {
         "qwen36", "Qwen3.6", "fixture/qwen36-kv-deltanet-conv-v1",
         "attention KV + DeltaNet recurrent state + convolution ring",
         "tools/make_qwen36_tiny.py",
@@ -374,10 +381,11 @@ DECLARE_OPEN_WRAPPER(glm53, 1)
 DECLARE_OPEN_WRAPPER(inkling, 2)
 DECLARE_OPEN_WRAPPER(kimi, 3)
 DECLARE_OPEN_WRAPPER(olmoe, 4)
-DECLARE_OPEN_WRAPPER(qwen36, 5)
-DECLARE_OPEN_WRAPPER(qwen38, 6)
-DECLARE_OPEN_WRAPPER(deepseek_v4, 7)
-DECLARE_OPEN_WRAPPER(deepseek_v41, 8)
+DECLARE_OPEN_WRAPPER(qwen3, 5)
+DECLARE_OPEN_WRAPPER(qwen36, 6)
+DECLARE_OPEN_WRAPPER(qwen38, 7)
+DECLARE_OPEN_WRAPPER(deepseek_v4, 8)
+DECLARE_OPEN_WRAPPER(deepseek_v41, 9)
 
 #define FIXTURE_ADAPTER(name)                                                  \
     {                                                                          \
@@ -400,6 +408,7 @@ static const ColiSegmentAdapter g_adapters[] = {
     FIXTURE_ADAPTER(inkling),
     FIXTURE_ADAPTER(kimi),
     FIXTURE_ADAPTER(olmoe),
+    FIXTURE_ADAPTER(qwen3),
     FIXTURE_ADAPTER(qwen36),
     FIXTURE_ADAPTER(qwen38),
     FIXTURE_ADAPTER(deepseek_v4),

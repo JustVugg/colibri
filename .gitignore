@@ -124,6 +124,12 @@ c/olmoe_i4/
 .idea
 c/tiny_inkling/
 c/qwen38_tiny/
+# make qwen3-tiny-check builds the fixture (qwen3_tiny/) and both containers it
+# converts to. They are regenerated from tools/make_qwen3_tiny.py on demand and
+# weigh a few MB, so they are an artifact, not a checked-in oracle.
+c/qwen3_tiny/
+c/qwen3_tiny_f16/
+c/qwen3_tiny_i4/
 c/dsv41_tiny/
 
 # Claude Code working directory (agent worktrees, session scratch) — never a repo artifact

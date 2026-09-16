@@ -1056,6 +1056,27 @@ deepseek_v41$(EXE): deepseek_v41.c cli_args.h st.h json.h tok.h tok_unicode.h co
 	sparse_attn.h hyper_connections.h serve_codec.h serve_poll.h .build-config
 	$(CC) $(CFLAGS) deepseek_v41.c -o deepseek_v41$(EXE) $(LDFLAGS)
 
+# Dense Qwen3 (Qwen3ForCausalLM: GQA + q/k RMSNorm + SwiGLU, no MoE). CPU-only,
+# one file, reading a converted container (tools/convert_qwen3_dense.py).
+qwen3$(EXE): qwen3.c serve_poll.h cli_args.h st.h json.h compat.h quant.h .build-config
+	$(CC) $(NOCUDA_CFLAGS) qwen3.c -o qwen3$(EXE) $(NOCUDA_LDFLAGS)
+
+.PHONY: qwen3-tiny-generate qwen3-tiny-check
+qwen3-tiny-generate:
+	$(PYTHON) tools/make_qwen3_tiny.py --out ./qwen3_tiny
+
+# f16 container must be token-exact against the HF reference; the int4 leg only
+# has to load and run, quantized weights are not expected to match token for token.
+qwen3-tiny-check: qwen3-tiny-generate qwen3$(EXE)
+	$(PYTHON) tools/convert_qwen3_dense.py --model ./qwen3_tiny --out ./qwen3_tiny_f16 --bits 0
+	@for cap in 1 4; do \
+		OMP_NUM_THREADS=2 SNAP=./qwen3_tiny_f16 ./qwen3$(EXE) $$cap 0 ./qwen3_tiny/ref.json || exit $$?; \
+	done
+	$(PYTHON) tools/convert_qwen3_dense.py --model ./qwen3_tiny --out ./qwen3_tiny_i4 --bits 4
+	@OMP_NUM_THREADS=2 SNAP=./qwen3_tiny_i4 ./qwen3$(EXE) 4 4 ./qwen3_tiny/ref.json 2>&1 | grep -q '^C engine' || \
+		{ echo "int4 container failed to produce tokens"; exit 1; }
+	@echo "qwen3-tiny-check: f16 token-exact, int4 container runs"
+
 qwen38$(EXE): qwen38.c cli_args.h qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h
 	$(CC) $(NOCUDA_CFLAGS) qwen38.c -o qwen38$(EXE) $(NOCUDA_LDFLAGS)
 
@@ -1919,7 +1940,7 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) \
+install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen3$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
@@ -1930,6 +1951,7 @@ install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen3
 	$(INSTALL) -m 755 inkling$(EXE) $(DESTDIR)$(LIBEXECDIR)/inkling$(EXE)
 	$(INSTALL) -m 755 kimi_k3$(EXE) $(DESTDIR)$(LIBEXECDIR)/kimi_k3$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
+	$(INSTALL) -m 755 qwen3$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen3$(EXE)
 	$(INSTALL) -m 755 qwen36$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen36$(EXE)
 	$(INSTALL) -m 755 qwen38$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen38$(EXE)
 	$(INSTALL) -m 755 deepseek_v41$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v41$(EXE)

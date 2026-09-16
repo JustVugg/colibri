@@ -778,6 +778,11 @@ _QWEN38_FUSED_EXPERT = re.compile(
 )
 
 
+def _dense_expert_inventory(_name, _size, _config, _dtype=None):
+    """Dense family: no tensor ever belongs to a routed expert."""
+    return ()
+
+
 def _individual_expert_inventory(pattern):
     def inventory(name, size, _config, _dtype=None):
         match = pattern.search(name)
@@ -1203,6 +1208,47 @@ FAMILIES = (
         has_gateway_adapter=True,
         has_cli_adapter=True,
         tune_prompt_template="<|user|>\n{prompt}\n<|assistant|>\n",
+    ),
+    FamilyDescriptor(
+        id="qwen3",
+        model_types=("qwen3",),
+        display_name="Qwen3-8B",
+        display_scale="8B",
+        engine_artifact="qwen3",
+        engine_aliases=(),
+        engine_group="qwen3",
+        internal_arch="qwen3",
+        build_target="qwen3",
+        process_names=("qwen3",),
+        default_model_id="qwen3-colibri",
+        cli_adapter="qwen3",
+        gateway_adapter="qwen3",
+        planner_id="qwen3_dense",
+        # Dense: there is no expert to stream, so there is no cache capacity to
+        # plan. The planner's whole output is "how many experts fit in RAM" --
+        # it refuses a zero-expert geometry by design (planner_geometry()) --
+        # and a fabricated expert count would make it answer a question this
+        # model does not ask. The weights are resident or they are not, which
+        # is a subtraction the caller can already do from the container size.
+        planner_geometry=None,
+        planner_unsupported_reason=(
+            "dense model: the planner sizes an expert cache, and Qwen3-8B has "
+            "no routed experts -- its weights are fully resident"),
+        expert_inventory=_dense_expert_inventory,
+        config_section="root",
+        limits=FamilyLimits(4096, 40960, 1024, 8192, 1, 0, "Q3_MAXT"),
+        capabilities=FamilyCapabilities(False, False, False, False),
+        has_gateway_adapter=True,
+        # Same reason as qwen36 below: cmd_run dispatches per arch, and without
+        # a qwen3 branch the engine would silently inherit another family's
+        # prompt template. chat/serve/web all work through the gateway.
+        has_cli_adapter=False,
+        # Left empty on purpose: `coli convert` drives the --ebits/--io-bits
+        # vocabulary, and convert_qwen3_dense.py has its own command line
+        # (--model/--out/--bits). Declaring it here would promise coli a set of
+        # flags the script does not define.
+        tune_prompt_template=(
+            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"),
     ),
     FamilyDescriptor(
         id="qwen36",
