@@ -38,6 +38,8 @@ export interface TiersHealth {
   disk: number
   vram_gb: number
   ram_gb: number
+  rss_gb: number | null
+  ram_cap_gb: number | null
 }
 
 export interface HwinfoHealth {

@@ -119,7 +119,7 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
         }
       }
       let alive = false
-      if (p) for (let i = 0; i < p.length; i++) { if (p[i] > 0.01) { p[i] *= 0.94; alive = true } else p[i] = 0 }
+      if (p) for (let i = 0; i < p.length; i++) { if (p[i] > 0.01) { p[i] *= 0.98; alive = true } else p[i] = 0 }
       if (alive) rafRef.current = requestAnimationFrame(draw)
     }
     draw()

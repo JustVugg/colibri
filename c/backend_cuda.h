@@ -144,6 +144,12 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_issue(ColiCudaTensor *const *gate
                                ColiCudaTensor *const *ups,
                                ColiCudaTensor *const *downs,
                                const int *rows, int count, const float *x);
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_issue_clamped(
+                               ColiCudaTensor *const *gates,
+                               ColiCudaTensor *const *ups,
+                               ColiCudaTensor *const *downs,
+                               const int *rows, int count, const float *x,
+                               float swiglu_limit);
 COLI_CUDA_DLLEXPORT const float *coli_cuda_expert_group_take(int device);
 
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,

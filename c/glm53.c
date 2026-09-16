@@ -71,6 +71,7 @@
 #include "st.h"
 #include "quant.h"
 #include "tok.h"
+#include "qwen36_tier.h"
 #ifdef COLI_METAL
 #include "backend_metal.h"
 static int g_metal_ready = 0;
@@ -703,11 +704,14 @@ typedef struct {
     int has_io;                           /* embedding e testa: solo agli estremi */
     /* esperti: o residenti (checkpoint f32) o in streaming (container int4) */
     int streaming;
+    int cuda_tier_owner;                   /* solo il modello pieno possiede il tier globale */
     struct ERef *eref;
     struct LCache *ecache;
     int64_t e_len[6], e_at[6], e_slot;
     uint64_t clock, ebytes;
     long hits, miss;
+    double ram_budget_gb;                  /* tetto risolto di tutto il processo */
+    long warmstart_reported_miss;
     /* Telemetria per la dashboard (#1376 follow-up: Brain e Profile erano
      * vuoti su Flash perche' il motore non emetteva nulla). Tempi di fase
      * cumulativi dall'avvio; il turno ne prende la differenza. */
@@ -1282,9 +1286,13 @@ static double memory_available_gb(void) {
     return compat_mem_available_gb();
 }
 
+static double rss_gb(void);
+static double anon_rss_gb(void);
+
 static void expert_cache_init(GModel *m) {
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_EXPERT_GB");
+    const char *ram_setting = getenv("RAM_GB");
     /* Il default si misura: quello che resta libero dopo i pesi residenti,
      * meno un margine per lo stato della conversazione, i temporanei del
      * prefill e il resto del sistema. Un numero fisso sbaglia in entrambi i
@@ -1292,7 +1300,16 @@ static void expert_cache_init(GModel *m) {
      * inutilizzata mentre il disco fa tutto il lavoro, che e' esattamente
      * quello che e' successo alla prima esecuzione vera. */
     double budget;
-    if (setting) budget = atof(setting);
+    double ram_cap = ram_setting ? atof(ram_setting) : 0.0;
+    if (ram_cap > 0.0) {
+        /* --ram e' un tetto dell'INTERO processo, non una richiesta per la
+         * cache. I densi sono gia' residenti qui: lascia anche il margine che
+         * il percorso di prefill/sessione usera' dopo il warm-start. */
+        const double resident = rss_gb();
+        budget = ram_cap - resident - 3.0;
+        if (budget < 0.0) budget = 0.0;
+        m->ram_budget_gb = ram_cap;
+    } else if (setting) budget = atof(setting);
     else {
         const double free_now = memory_available_gb();
         budget = free_now - 3.0;
@@ -1304,9 +1321,22 @@ static void expert_cache_init(GModel *m) {
     const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
     int sparse = m->layer_end - from;
     if (sparse < 0) sparse = 0;
+    if (ram_cap > 0.0 && rss_gb() + 3.0 +
+        (double)m->e_slot * sparse / 1e9 > ram_cap) {
+        fprintf(stderr, "[glm53][RAM_GB=%.1f] RSS %.1f GB + reserve 3.0 GB + "
+                        "one expert slot/layer %.1f GB exceeds the whole-process ceiling\n",
+                ram_cap, rss_gb(), (double)m->e_slot * sparse / 1e9);
+        exit(1);
+    }
     int cap = (int)((budget * 1e9) / ((double)m->e_slot * (sparse > 0 ? sparse : 1)));
-    if (g_cap_override > 0) cap = g_cap_override;      /* scelta esplicita: vince */
     if (cap < 1) cap = 1;
+    if (cap > c->n_experts) cap = c->n_experts;
+    if (g_cap_override > 0) {
+        if (ram_cap > 0.0 && g_cap_override > cap)
+            fprintf(stderr, "[glm53][RAM_GB=%.1f] cache request %d/layer clamped to %d/layer\n",
+                    ram_cap, g_cap_override, cap);
+        else cap = g_cap_override;       /* scelta esplicita: vince senza --ram */
+    }
     if (cap > c->n_experts) cap = c->n_experts;
 
     m->ecache = calloc((size_t)c->n_layers, sizeof(*m->ecache));
@@ -1318,7 +1348,12 @@ static void expert_cache_init(GModel *m) {
         if (!cache->s) { fprintf(stderr, "OOM sugli slot del layer %d\n", i); exit(1); }
         for (int j = 0; j < cap; j++) cache->s[j].eid = -1;
     }
-    if (getenv("GLM53_VERBOSE"))
+    if (ram_cap > 0.0)
+        fprintf(stderr, "[glm53][RAM_GB=%.1f] RSS %.1f GB + reserve 3.0 GB -> %.1f GB for experts; "
+                        "cache %d/layer on %d sparse layers (%.1f GB planned)\n",
+                ram_cap, rss_gb(), budget, cap, sparse,
+                (double)cap * sparse * m->e_slot / 1e9);
+    else if (getenv("GLM53_VERBOSE"))
         fprintf(stderr, "esperti: slot da %.1f MB, %d per layer su %d layer sparsi "
                         "(%.1f GB residenti)\n",
                 m->e_slot / 1e6, cap, sparse, (double)cap * sparse * m->e_slot / 1e9);
@@ -1592,12 +1627,68 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         }
         m->t_disk += now_s() - t_batch0;  /* fuori dalla regione omp: e' il muro del batch */
 
+        /* Il warm-start di GLM e' il primo riempimento della LRU, non un
+         * caricamento separato a boot. Un campione ogni 64 miss mostra che il
+         * tetto esplicito continua a valere mentre gli esperti entrano. */
+        if (m->ram_budget_gb > 0.0 && m->miss - m->warmstart_reported_miss >= 64) {
+            m->warmstart_reported_miss = m->miss;
+            fprintf(stderr, "[glm53][warm-start] RAM_GB %.1f GB | RSS %.1f GB | "
+                            "anon RSS %.1f GB | expert loads %ld\n",
+                    m->ram_budget_gb, rss_gb(), anon_rss_gb(), m->miss);
+        }
+
+        /* CUDA issues one token's resident routes while the CPU computes its
+         * misses. qt_note owns all six pieces before returning, so the uploader
+         * never observes a RAM slot after GLM recycles it for the next block. */
+        int moe_done = 0;
+        if (m->cuda_tier_owner) {
+            int *eids = malloc((size_t)topk * sizeof(*eids));
+            int *which = malloc((size_t)topk * sizeof(*which));
+            float *vals = malloc((size_t)topk * sizeof(*vals));
+            if (!eids || !which || !vals) { fprintf(stderr, "OOM sul gruppo CUDA MoE\n"); exit(1); }
+            for (int t = 0; t < tokens; t++) {
+                int nr = 0;
+                for (int i = 0; i < here; i++) {
+                    const int eid = union_ids[base + i];
+                    float scale = 0.0f;
+                    for (int k = 0; k < topk; k++)
+                        if (chosen[(size_t)t * topk + k] == eid) {
+                            scale = weight[(size_t)t * topk + k];
+                            break;
+                        }
+                    if (scale == 0.0f) continue;
+                    const Slot *slot = &cache->s[slot_of[i]];
+                    qt_note(index, eid,
+                            slot->piece[0], slot->piece[2], slot->piece[4],
+                            (const float *)slot->piece[1],
+                            (const float *)slot->piece[3],
+                            (const float *)slot->piece[5]);
+                    eids[nr] = eid; which[nr] = i; vals[nr] = scale; nr++;
+                }
+                if (!nr) continue;
+                float *dst = out + (size_t)t * c->hidden;
+                uint32_t mask = qt_issue(index, eids, nr,
+                                         x + (size_t)t * c->hidden);
+                for (int r = 0; r < nr; r++) {
+                    if (mask & (1u << r)) continue;
+                    Slot *slot = &cache->s[slot_of[which[r]]];
+                    Mat gate, up, down;
+                    expert_mats(m, slot, &gate, &up, &down);
+                    mlp3(tmp, x + (size_t)t * c->hidden, &gate, &up, &down,
+                         c->swiglu_limit, sg, su);
+                    for (int d = 0; d < c->hidden; d++) dst[d] += vals[r] * tmp[d];
+                }
+                qt_take(mask, vals, nr, dst);       /* paired even when mask == 0 */
+            }
+            free(vals); free(which); free(eids);
+            moe_done = 1;
+        }
+
         /* Try all experts in this cache-sized block as one Metal command buffer.
          * xg is grouped by expert; rows/rw preserve the exact CPU scatter weights.
          * On any backend refusal/fault, run the original CPU loop unchanged. */
-        int metal_done = 0;
 #ifdef COLI_METAL
-        if (g_metal_ready) {
+        if (!moe_done && g_metal_ready) {
             g_metal_moe_attempt++;
             const int max_rows = tokens * topk;
             const void **mg = malloc((size_t)here * sizeof(*mg));
@@ -1636,21 +1727,21 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                         rows[R] = t; rw[R] = scale; nr[i]++; R++;
                     }
                 }
-                metal_done = coli_metal_moe_block_clamped(
+                moe_done = coli_metal_moe_block_clamped(
                     here, c->hidden, c->moe_inter, 4, 64,
                     mg, mu, md, mgs, mus, mds, xg, xoff, nr, rows, rw,
                     out, tokens, c->swiglu_limit);
-                if (metal_done) {
+                if (moe_done) {
                     g_metal_moe_ok++;
                     g_metal_moe_rows += (uint64_t)R;
                 }
             }
-            if (!metal_done) g_metal_moe_fallback++;
+            if (!moe_done) g_metal_moe_fallback++;
             free(xg); free(rw); free(rows); free(nr); free(xoff);
             free(mds); free(mus); free(mgs); free(md); free(mu); free(mg);
         }
 #endif
-        if (!metal_done) {
+        if (!moe_done) {
             /* CPU fallback: one expert at a time, then every token that chose it. */
             for (int i = 0; i < here; i++) {
                 const int eid = union_ids[base + i];
@@ -2085,6 +2176,11 @@ static void mat_release(Mat *mat) {
 
 static void model_release(GModel *m) {
     if (!m) return;
+    if (m->cuda_tier_owner) {
+        qt_stats();
+        qt_shutdown();
+        m->cuda_tier_owner = 0;
+    }
     if (m->layer) {
         for (int i = m->layer_begin; i < m->layer_end; i++) {
             GLayer *l = &m->layer[i];
@@ -2152,9 +2248,19 @@ static void model_release(GModel *m) {
     memset(m, 0, sizeof(*m));
 }
 
-/* Il caso pieno: tutti i layer, embedding e testa comprese. */
+/* Il caso pieno: tutti i layer, embedding e testa comprese. Solo questo
+ * modello puo' possedere il tier CUDA globale; segment ed edge usano
+ * model_load_range direttamente e restano indipendenti. */
 static void model_load(GModel *m, const char *dir) {
     model_load_range(m, dir, 0, -1, 1);
+    if (m->streaming) {
+        const int first = m->c.first_dense;
+        const int cap = m->ecache && first < m->c.n_layers
+                      ? m->ecache[first].cap : 0;
+        m->cuda_tier_owner = qt_init_stream_int4(
+            m->c.n_layers, m->c.n_experts, m->c.hidden, m->c.moe_inter,
+            cap, m->c.topk, m->c.swiglu_limit);
+    }
 }
 
 /* ---------- il passaggio completo ----------
@@ -2384,6 +2490,24 @@ static double rss_gb(void) {
     return r.ru_maxrss / 1e6;             /* ru_maxrss e' in KB anche su Windows */
 }
 
+/* smaps_rollup distingue il peso anonimo della cache file. Il primo e' quello
+ * che un malloc degli esperti puo' far crescere fino all'OOM; dove Linux non
+ * offre il contatore, RSS resta comunque il limite conservativo. */
+static double anon_rss_gb(void) {
+#ifdef __linux__
+    FILE *f = fopen("/proc/self/smaps_rollup", "r");
+    char line[128];
+    long kb = 0;
+    if (!f) return rss_gb();
+    while (fgets(line, sizeof(line), f))
+        if (sscanf(line, "Anonymous: %ld kB", &kb) == 1) break;
+    fclose(f);
+    return kb / 1e6;
+#else
+    return rss_gb();
+#endif
+}
+
 static float g_temp = 0.0f, g_topp = 1.0f;
 
 /* Confronto per qsort. Una funzione annidata sarebbe piu' comoda ma e'
@@ -2479,6 +2603,16 @@ static void slot_reset(const GModel *m, KVSlot *slot) {
     if (slot->session) session_close(m, slot->session);
     slot->session = NULL;
     slot->n = 0;
+}
+
+static void slots_release(const GModel *m) {
+    for (int i = 0; i < g_n_slots; i++) {
+        slot_reset(m, &g_slots[i]);
+        free(g_slots[i].tokens);
+        g_slots[i].tokens = NULL;
+        g_slots[i].cap = 0;
+    }
+    g_n_slots = 0;
 }
 
 /* Quanti token iniziali lo slot ha gia' in cache e puo' tenere. */
@@ -2945,6 +3079,42 @@ static void hits_emit(GModel *m) {
     serve_line("HITS %d %d %s\n", rows, cols, hex); free(hex); free(bm);
 }
 
+/* Dashboard tier telemetry (TIERS): deepseek_v4/inkling/olmoe emit it, glm53 did
+ * not, so the cortex panel counted every expert as on-disk. Tier accounting:
+ * CUDA-resident routed experts (qt tier) = VRAM; LRU slots not gia' in VRAM =
+ * RAM; il resto della griglia instradata = disco. Misurato, mai indovinato.
+ * RSS e tetto RAM raccontano invece tutto il processo, senza cambiare le
+ * fasce degli esperti. Emesso al boot e una volta per turno (stessa cadenza
+ * di deepseek_v4). */
+static void glm53_emit_tiers(const GModel *m) {
+    long vram = 0, ram = 0, disk = 0, total = 0;
+    if (m->streaming && m->ecache) {
+        const int tier_ready = qt_ready();
+        for (int i = 0; i < m->c.n_layers; i++)
+            if (m->ecache[i].cap > 0) total += m->c.n_experts;
+        if (tier_ready)
+            for (int i = 0; i < m->c.n_layers; i++)
+                for (int e = 0; e < m->c.n_experts; e++)
+                    if (qt_is_resident(i, e)) vram++;
+        /* Le fasce del pannello sono esclusive: uno slot LRU che il tier ha
+         * gia' promosso e' VRAM, non due esperti. Il resto di ecache e' la
+         * RAM viva, non la sua capienza. */
+        for (int i = 0; i < m->c.n_layers; i++)
+            for (int j = 0; j < m->ecache[i].n; j++)
+                if (!tier_ready || !qt_is_resident(i, m->ecache[i].s[j].eid)) ram++;
+        disk = total - ram - vram;
+    } else {
+        for (int i = m->c.first_dense; i < m->c.n_layers; i++)
+            if (i >= m->layer_begin && i < m->layer_end) total += m->c.n_experts;
+        vram = total;
+    }
+    if (ram < 0) ram = 0;
+    if (disk < 0) disk = 0;
+    serve_line("TIERS %ld %ld %ld %.2f %.2f %.2f %.2f\n", vram, ram, disk,
+               (double)vram * m->e_slot / 1e9, (double)ram * m->e_slot / 1e9,
+               rss_gb(), m->ram_budget_gb);
+    fflush(stdout);
+}
 static void serve_loop(GModel *m, Tok *tokenizer) {
     coli_serve_binary_mode();
     setvbuf(stdin, NULL, _IONBF, 0);
@@ -2954,6 +3124,7 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
     /* La griglia va DOPO READY: il lettore di boot del server scarta tutto
      * fino al sentinel, e colibri.c fa lo stesso (READY, STAT, poi EMAP). */
     emap_emit(m);
+    glm53_emit_tiers(m);
     for (;;) {
         ServeReq q; char verb[16];
         if (!serve_read_req(&q, verb, sizeof(verb))) break;   /* EOF: si esce */
@@ -2964,6 +3135,7 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
              * esce senza riprovare a leggere. */
             int gateway_gone = serve_one(m, tokenizer, &q) < 0;
             free(q.payload);
+            glm53_emit_tiers(m);
             if (gateway_gone) break;
         } else if (!strcmp(verb, "IMAGE")) {
             /* annunciata: nessuna risposta, la si usa al SUBMIT che segue */
@@ -3026,9 +3198,12 @@ int main(int argc, char **argv) {
         const char *batch = getenv("SERVE_BATCH");
         arm_stops(snap, &serve_tok, batch && atoi(batch));
         serve_loop(&served, &serve_tok);
+        slots_release(&served);
+        pending_clear();
         glm53_telemetry_save();
         rt_destroy();
         tok_free(&serve_tok);
+        model_release(&served);
         return 0;
     }
 
@@ -3185,6 +3360,7 @@ int main(int argc, char **argv) {
     rt_destroy();
     free(vision);
     free(tokens);
+    model_release(&model);
     return 0;
 }
 #endif /* GLM53_NO_MAIN */

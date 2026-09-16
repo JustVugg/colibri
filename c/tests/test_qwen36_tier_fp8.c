@@ -99,7 +99,7 @@ int main(void) {
     check(last_fmt == 8, "upload format is 8");
     check(last_bytes == (size_t)D * IH, "fmt 8 carries one byte per element");
     int intact = 1;
-    for (size_t i = 0; i < captured_len; i++) if (captured[i] != slab[5][i]) { intact = 0; break; }
+    for (size_t i = 0; i < captured_len[0]; i++) if (captured[0][i] != slab[5][i]) { intact = 0; break; }
     check(intact, "e4m3 bytes staged unchanged (no XOR)");
     pthread_mutex_lock(&G.mx);
     check(qs(0, 5)->g4 == NULL && qs(0, 5)->gs == NULL, "no pointer into the engine slot survives qt_note");

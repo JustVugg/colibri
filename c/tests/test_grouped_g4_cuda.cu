@@ -163,11 +163,97 @@ int main(void){
             off+=rows[c];
         }
         printf("grouped-g4 API: sync vs oracle + async(issue/take) vs sync, %d mismatches\n",api_bad);
+
+        /* ---- Phase 3: GLM's asymmetric clamped SwiGLU ------------------- */
+        int clamp_bad=0;
+        ColiCudaTensor *nulls[1]={NULL};
+        if(coli_cuda_expert_group_issue_clamped(NULL,tu,td,rows,1,x,10.f)||
+           coli_cuda_expert_group_issue_clamped(tg,NULL,td,rows,1,x,10.f)||
+           coli_cuda_expert_group_issue_clamped(tg,tu,NULL,rows,1,x,10.f)||
+           coli_cuda_expert_group_issue_clamped(tg,tu,td,NULL,1,x,10.f)||
+           coli_cuda_expert_group_issue_clamped(tg,tu,td,rows,1,NULL,10.f)||
+           coli_cuda_expert_group_issue_clamped(tg,tu,td,rows,0,x,10.f)||
+           coli_cuda_expert_group_issue_clamped(tg,tu,td,rows,65,x,10.f)||
+           coli_cuda_expert_group_issue_clamped(nulls,tu,td,rows,1,x,10.f)||
+           coli_cuda_expert_group_issue_clamped(tg,nulls,td,rows,1,x,10.f)||
+           coli_cuda_expert_group_issue_clamped(tg,tu,nulls,rows,1,x,10.f)||
+           coli_cuda_expert_group_issue_clamped(tg,tu,td,rows,1,x,0.f)||
+           coli_cuda_expert_group_issue_clamped(tg,tu,td,rows,1,x,-1.f)||
+           coli_cuda_expert_group_issue_clamped(tg,tu,td,rows,1,x,INFINITY)||
+           coli_cuda_expert_group_issue_clamped(tg,tu,td,rows,1,x,NAN)) clamp_bad++;
+        int saved_fmt=tg[0]->fmt; tg[0]->fmt=2;
+        if(coli_cuda_expert_group_issue_clamped(tg,tu,td,rows,1,x,10.f)) clamp_bad++;
+        tg[0]->fmt=saved_fmt;
+        saved_fmt=tu[0]->fmt; tu[0]->fmt=2;
+        if(coli_cuda_expert_group_issue_clamped(tg,tu,td,rows,1,x,10.f)) clamp_bad++;
+        tu[0]->fmt=saved_fmt;
+        saved_fmt=td[0]->fmt; td[0]->fmt=2;
+        if(coli_cuda_expert_group_issue_clamped(tg,tu,td,rows,1,x,10.f)) clamp_bad++;
+        td[0]->fmt=saved_fmt;
+
+        const float limit=10.f;
+        /* Scale the same random inputs until the deterministic gate row exceeds
+         * the upper limit and the up row exceeds both signs. Ordinary issue was
+         * already checked above, so this mutation belongs only to the clamp. */
+        for(int s=0;s<3;s++) for(int d=0;d<D;d++) x[(size_t)s*D+d]=1.f;
+        for(int c=0;c<2;c++){
+            int cngD=ngD;
+            memset(hg[c],0xff,rbD); memset(hu[c],0xff,rbD);
+            memset(hg[c]+rbD,0xff,rbD); memset(hu[c]+rbD,0x00,rbD);
+            memset(hg[c]+2*rbD,0x00,rbD); memset(hu[c]+2*rbD,0xff,rbD);
+            for(int o=0;o<3;o++) for(int g=0;g<cngD;g++){
+                hgs[c][(size_t)o*cngD+g]=1.f;
+                hus[c][(size_t)o*cngD+g]=1.f;
+            }
+            for(int o=0;o<3;o++){
+                uint8_t *row=hd[c]+(size_t)o*rbI;
+                memset(row,0x88,rbI);
+                if(o&1) row[o>>1]=(uint8_t)((row[o>>1]&15)|0xf0);
+                else row[o>>1]=(uint8_t)((row[o>>1]&0xf0)|15);
+                for(int g=0;g<ngI;g++) hds[c][(size_t)o*ngI+g]=1.f;
+            }
+            cudaMemcpy(tg[c]->weights,hg[c],(size_t)I*rbD,cudaMemcpyHostToDevice);
+            cudaMemcpy(tu[c]->weights,hu[c],(size_t)I*rbD,cudaMemcpyHostToDevice);
+            cudaMemcpy(td[c]->weights,hd[c],(size_t)D*rbI,cudaMemcpyHostToDevice);
+            offset_to_signed_s4<<<64,256>>>((uint8_t*)tg[c]->weights,(size_t)I*rbD);
+            offset_to_signed_s4<<<64,256>>>((uint8_t*)tu[c]->weights,(size_t)I*rbD);
+            offset_to_signed_s4<<<64,256>>>((uint8_t*)td[c]->weights,(size_t)D*rbI);
+            cudaMemcpy(tg[c]->scales,hgs[c],(size_t)I*ngD*4,cudaMemcpyHostToDevice);
+            cudaMemcpy(tu[c]->scales,hus[c],(size_t)I*ngD*4,cudaMemcpyHostToDevice);
+            cudaMemcpy(td[c]->scales,hds[c],(size_t)D*ngI*4,cudaMemcpyHostToDevice);
+        }
+        if(cudaDeviceSynchronize()!=cudaSuccess){ printf("FAIL clamp fixtures\n"); return 1; }
+        if(!coli_cuda_expert_group_issue_clamped(tg,tu,td,rows,2,x,limit)){
+            printf("FAIL clamped async issue\n"); return 1;
+        }
+        const float *yclamp=coli_cuda_expert_group_take(0);
+        if(!yclamp){ printf("FAIL clamped async take\n"); return 1; }
+        off=0;
+        for(int c=0;c<2;c++){
+            for(int s=0;s<rows[c];s++){
+                float rg[512],ru[512],rh[512],ry[512];
+                const float *xr=x+(size_t)(off+s)*D;
+                cpu_gemv_g4(hg[c],hgs[c],D,I,gs,xr,rg);
+                cpu_gemv_g4(hu[c],hus[c],D,I,gs,xr,ru);
+                for(int o=0;o<I;o++){
+                    float g=fminf(rg[o],limit);
+                    float u=fminf(fmaxf(ru[o],-limit),limit);
+                    rh[o]=(g/(1.f+expf(-g)))*u;
+                }
+                cpu_gemv_g4(hd[c],hds[c],I,D,gs,rh,ry);
+                for(int o=0;o<D;o++){
+                    size_t z=(size_t)(off+s)*D+o;
+                    if(fabsf(yclamp[z]-ry[o])>1e-3f*(fabsf(ry[o])+1e-3f)) clamp_bad++;
+                }
+            }
+            off+=rows[c];
+        }
+        printf("grouped-g4 GLM clamp: upper gate + symmetric up, %d mismatches\n",clamp_bad);
         for(int c=0;c<COUNT;c++){ coli_cuda_tensor_free(tg[c]);coli_cuda_tensor_free(tu[c]);coli_cuda_tensor_free(td[c]);
             free(hg[c]);free(hu[c]);free(hd[c]);free(hgs[c]);free(hus[c]);free(hds[c]); }
         free(x);free(ysync);
         coli_cuda_shutdown();
-        if(api_bad){ printf("FAIL\n"); return 1; }
+        if(api_bad||clamp_bad){ printf("FAIL\n"); return 1; }
     }
     printf("OK\n"); return 0;
 }

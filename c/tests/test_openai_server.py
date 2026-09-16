@@ -659,6 +659,25 @@ class FakeProcess:
 
 
 class DispatcherTest(unittest.TestCase):
+    def test_accepts_legacy_and_process_ram_tiers(self):
+        process = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        process.stdout.feed(b"TIERS 10 20 30 1.25 2.50\n")
+        deadline = time.monotonic() + 1
+        while engine.tiers is None and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertEqual(engine.tiers["ram_gb"], 2.5)
+        self.assertIsNone(engine.tiers["rss_gb"])
+        self.assertIsNone(engine.tiers["ram_cap_gb"])
+        process.stdout.feed(b"TIERS 10 20 30 1.25 2.50 17.30 20.00\n")
+        deadline = time.monotonic() + 1
+        while engine.tiers["rss_gb"] is None and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertEqual(engine.tiers["rss_gb"], 17.3)
+        self.assertEqual(engine.tiers["ram_cap_gb"], 20.0)
+        engine.close()
+
     def test_inkling_audio_request_and_response_transcript_is_byte_exact(self):
         prompt = "<|message_user|><|content_audio_input|><|audio|><|end_message|>"
         payload = prompt.encode("utf-8")
@@ -1310,6 +1329,21 @@ class HTTPTest(unittest.TestCase):
         self.assertEqual(scheduler["max_queue"], 8)
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
+
+    def test_experts_reports_process_ram_when_tiers_are_available(self):
+        self.engine.emap = {"rows": 1, "cols": 1, "map": "00"}
+        self.engine.hits = "00"
+        self.engine.hits_seq = 1
+        self.engine.tiers = {"vram": 1, "ram": 2, "disk": 3,
+                             "vram_gb": .1, "ram_gb": .2,
+                             "rss_gb": 17.3, "ram_cap_gb": 20.0}
+        try:
+            with self.request("/experts") as response:
+                experts = json.load(response)
+            self.assertEqual(experts["rss_gb"], 17.3)
+            self.assertEqual(experts["ram_cap_gb"], 20.0)
+        finally:
+            del self.engine.emap, self.engine.hits, self.engine.hits_seq, self.engine.tiers
 
     def test_profile_requires_auth(self):
         """/profile is served before require_auth(), so it needs its own gate.

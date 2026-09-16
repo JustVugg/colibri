@@ -78,8 +78,8 @@ int main(void) {
     /* i byte devono arrivare COME SONO: lo XOR 0x88 serve ai nibble int4 e su
      * byte interi sarebbe corruzione silenziosa */
     int intact = 1;
-    for (size_t i = 0; i < captured_len; i++)
-        if (captured[i] != (unsigned char)(i & 0x7f)) { intact = 0; break; }
+    for (size_t i = 0; i < captured_len[0]; i++)
+        if (captured[0][i] != (unsigned char)(i & 0x7f)) { intact = 0; break; }
     check(intact, "i pesi int8 sono stati alterati durante lo staging (XOR di troppo?)");
 
     qt_shutdown();
