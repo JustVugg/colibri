@@ -3081,20 +3081,29 @@ static void hits_emit(GModel *m) {
 
 /* Dashboard tier telemetry (TIERS): deepseek_v4/inkling/olmoe emit it, glm53 did
  * not, so the cortex panel counted every expert as on-disk. Tier accounting:
- * CUDA-resident routed experts (qt tier) = VRAM; LRU cache slots = RAM; the
- * rest of the routed grid = disk. Measured, never guessed. Emitted at boot and
- * once per turn (same cadence as deepseek_v4). */
+ * CUDA-resident routed experts (qt tier) = VRAM; LRU slots not gia' in VRAM =
+ * RAM; il resto della griglia instradata = disco. Misurato, mai indovinato.
+ * Emesso al boot e una volta per turno (stessa cadenza di deepseek_v4). */
 static void glm53_emit_tiers(const GModel *m) {
     long vram = 0, ram = 0, disk = 0, total = 0;
-    for (int i = 0; i < m->c.n_layers; i++) if (m->ecache[i].cap > 0) total += m->c.n_experts;
     if (m->streaming && m->ecache) {
-        for (int i = 0; i < m->c.n_layers; i++) ram += m->ecache[i].n;
-        if (qt_ready())
+        const int tier_ready = qt_ready();
+        for (int i = 0; i < m->c.n_layers; i++)
+            if (m->ecache[i].cap > 0) total += m->c.n_experts;
+        if (tier_ready)
             for (int i = 0; i < m->c.n_layers; i++)
                 for (int e = 0; e < m->c.n_experts; e++)
                     if (qt_is_resident(i, e)) vram++;
+        /* Le fasce del pannello sono esclusive: uno slot LRU che il tier ha
+         * gia' promosso e' VRAM, non due esperti. Il resto di ecache e' la
+         * RAM viva, non la sua capienza. */
+        for (int i = 0; i < m->c.n_layers; i++)
+            for (int j = 0; j < m->ecache[i].n; j++)
+                if (!tier_ready || !qt_is_resident(i, m->ecache[i].s[j].eid)) ram++;
         disk = total - ram - vram;
     } else {
+        for (int i = m->c.first_dense; i < m->c.n_layers; i++)
+            if (i >= m->layer_begin && i < m->layer_end) total += m->c.n_experts;
         vram = total;
     }
     if (ram < 0) ram = 0;
