@@ -710,6 +710,8 @@ typedef struct {
     int64_t e_len[6], e_at[6], e_slot;
     uint64_t clock, ebytes;
     long hits, miss;
+    double ram_budget_gb;                  /* tetto risolto di tutto il processo */
+    long warmstart_reported_miss;
     /* Telemetria per la dashboard (#1376 follow-up: Brain e Profile erano
      * vuoti su Flash perche' il motore non emetteva nulla). Tempi di fase
      * cumulativi dall'avvio; il turno ne prende la differenza. */
@@ -1284,9 +1286,13 @@ static double memory_available_gb(void) {
     return compat_mem_available_gb();
 }
 
+static double rss_gb(void);
+static double anon_rss_gb(void);
+
 static void expert_cache_init(GModel *m) {
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_EXPERT_GB");
+    const char *ram_setting = getenv("RAM_GB");
     /* Il default si misura: quello che resta libero dopo i pesi residenti,
      * meno un margine per lo stato della conversazione, i temporanei del
      * prefill e il resto del sistema. Un numero fisso sbaglia in entrambi i
@@ -1294,7 +1300,16 @@ static void expert_cache_init(GModel *m) {
      * inutilizzata mentre il disco fa tutto il lavoro, che e' esattamente
      * quello che e' successo alla prima esecuzione vera. */
     double budget;
-    if (setting) budget = atof(setting);
+    double ram_cap = ram_setting ? atof(ram_setting) : 0.0;
+    if (ram_cap > 0.0) {
+        /* --ram e' un tetto dell'INTERO processo, non una richiesta per la
+         * cache. I densi sono gia' residenti qui: lascia anche il margine che
+         * il percorso di prefill/sessione usera' dopo il warm-start. */
+        const double resident = rss_gb();
+        budget = ram_cap - resident - 3.0;
+        if (budget < 0.0) budget = 0.0;
+        m->ram_budget_gb = ram_cap;
+    } else if (setting) budget = atof(setting);
     else {
         const double free_now = memory_available_gb();
         budget = free_now - 3.0;
@@ -1306,9 +1321,22 @@ static void expert_cache_init(GModel *m) {
     const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
     int sparse = m->layer_end - from;
     if (sparse < 0) sparse = 0;
+    if (ram_cap > 0.0 && rss_gb() + 3.0 +
+        (double)m->e_slot * sparse / 1e9 > ram_cap) {
+        fprintf(stderr, "[glm53][RAM_GB=%.1f] RSS %.1f GB + reserve 3.0 GB + "
+                        "one expert slot/layer %.1f GB exceeds the whole-process ceiling\n",
+                ram_cap, rss_gb(), (double)m->e_slot * sparse / 1e9);
+        exit(1);
+    }
     int cap = (int)((budget * 1e9) / ((double)m->e_slot * (sparse > 0 ? sparse : 1)));
-    if (g_cap_override > 0) cap = g_cap_override;      /* scelta esplicita: vince */
     if (cap < 1) cap = 1;
+    if (cap > c->n_experts) cap = c->n_experts;
+    if (g_cap_override > 0) {
+        if (ram_cap > 0.0 && g_cap_override > cap)
+            fprintf(stderr, "[glm53][RAM_GB=%.1f] cache request %d/layer clamped to %d/layer\n",
+                    ram_cap, g_cap_override, cap);
+        else cap = g_cap_override;       /* scelta esplicita: vince senza --ram */
+    }
     if (cap > c->n_experts) cap = c->n_experts;
 
     m->ecache = calloc((size_t)c->n_layers, sizeof(*m->ecache));
@@ -1320,7 +1348,12 @@ static void expert_cache_init(GModel *m) {
         if (!cache->s) { fprintf(stderr, "OOM sugli slot del layer %d\n", i); exit(1); }
         for (int j = 0; j < cap; j++) cache->s[j].eid = -1;
     }
-    if (getenv("GLM53_VERBOSE"))
+    if (ram_cap > 0.0)
+        fprintf(stderr, "[glm53][RAM_GB=%.1f] RSS %.1f GB + reserve 3.0 GB -> %.1f GB for experts; "
+                        "cache %d/layer on %d sparse layers (%.1f GB planned)\n",
+                ram_cap, rss_gb(), budget, cap, sparse,
+                (double)cap * sparse * m->e_slot / 1e9);
+    else if (getenv("GLM53_VERBOSE"))
         fprintf(stderr, "esperti: slot da %.1f MB, %d per layer su %d layer sparsi "
                         "(%.1f GB residenti)\n",
                 m->e_slot / 1e6, cap, sparse, (double)cap * sparse * m->e_slot / 1e9);
@@ -1593,6 +1626,16 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
             expert_read(m, index, union_ids[base + i], &cache->s[slot_of[i]]);
         }
         m->t_disk += now_s() - t_batch0;  /* fuori dalla regione omp: e' il muro del batch */
+
+        /* Il warm-start di GLM e' il primo riempimento della LRU, non un
+         * caricamento separato a boot. Un campione ogni 64 miss mostra che il
+         * tetto esplicito continua a valere mentre gli esperti entrano. */
+        if (m->ram_budget_gb > 0.0 && m->miss - m->warmstart_reported_miss >= 64) {
+            m->warmstart_reported_miss = m->miss;
+            fprintf(stderr, "[glm53][warm-start] RAM_GB %.1f GB | RSS %.1f GB | "
+                            "anon RSS %.1f GB | expert loads %ld\n",
+                    m->ram_budget_gb, rss_gb(), anon_rss_gb(), m->miss);
+        }
 
         /* CUDA issues one token's resident routes while the CPU computes its
          * misses. qt_note owns all six pieces before returning, so the uploader
@@ -2445,6 +2488,24 @@ __attribute__((noinline)) static double now_s(void) {
 static double rss_gb(void) {
     struct rusage r; getrusage(RUSAGE_SELF, &r);
     return r.ru_maxrss / 1e6;             /* ru_maxrss e' in KB anche su Windows */
+}
+
+/* smaps_rollup distingue il peso anonimo della cache file. Il primo e' quello
+ * che un malloc degli esperti puo' far crescere fino all'OOM; dove Linux non
+ * offre il contatore, RSS resta comunque il limite conservativo. */
+static double anon_rss_gb(void) {
+#ifdef __linux__
+    FILE *f = fopen("/proc/self/smaps_rollup", "r");
+    char line[128];
+    long kb = 0;
+    if (!f) return rss_gb();
+    while (fgets(line, sizeof(line), f))
+        if (sscanf(line, "Anonymous: %ld kB", &kb) == 1) break;
+    fclose(f);
+    return kb / 1e6;
+#else
+    return rss_gb();
+#endif
 }
 
 static float g_temp = 0.0f, g_topp = 1.0f;
