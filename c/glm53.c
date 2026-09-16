@@ -3083,7 +3083,9 @@ static void hits_emit(GModel *m) {
  * not, so the cortex panel counted every expert as on-disk. Tier accounting:
  * CUDA-resident routed experts (qt tier) = VRAM; LRU slots not gia' in VRAM =
  * RAM; il resto della griglia instradata = disco. Misurato, mai indovinato.
- * Emesso al boot e una volta per turno (stessa cadenza di deepseek_v4). */
+ * RSS e tetto RAM raccontano invece tutto il processo, senza cambiare le
+ * fasce degli esperti. Emesso al boot e una volta per turno (stessa cadenza
+ * di deepseek_v4). */
 static void glm53_emit_tiers(const GModel *m) {
     long vram = 0, ram = 0, disk = 0, total = 0;
     if (m->streaming && m->ecache) {
@@ -3108,8 +3110,9 @@ static void glm53_emit_tiers(const GModel *m) {
     }
     if (ram < 0) ram = 0;
     if (disk < 0) disk = 0;
-    serve_line("TIERS %ld %ld %ld %.2f %.2f\n", vram, ram, disk,
-               (double)vram * m->e_slot / 1e9, (double)ram * m->e_slot / 1e9);
+    serve_line("TIERS %ld %ld %ld %.2f %.2f %.2f %.2f\n", vram, ram, disk,
+               (double)vram * m->e_slot / 1e9, (double)ram * m->e_slot / 1e9,
+               rss_gb(), m->ram_budget_gb);
     fflush(stdout);
 }
 static void serve_loop(GModel *m, Tok *tokenizer) {

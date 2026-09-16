@@ -3105,7 +3105,9 @@ class Engine:
                 elif kind == "TIERS" and len(fields) >= 6:
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
                                   "disk": int(fields[3]), "vram_gb": float(fields[4]),
-                                  "ram_gb": float(fields[5])}
+                                  "ram_gb": float(fields[5]),
+                                  "rss_gb": float(fields[6]) if len(fields) >= 8 else None,
+                                  "ram_cap_gb": float(fields[7]) if len(fields) >= 8 else None}
                 elif kind == "ERROR" and len(fields) >= 2:
                     request_id = fields[1]
                     message = " ".join(fields[2:]) or "engine request failed"
@@ -3738,6 +3740,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     payload.update(eng.emap)
                     payload["hits"] = eng.hits or ""
                     payload["seq"] = eng.hits_seq
+                    tiers = getattr(eng, "tiers", None)
+                    if tiers:
+                        payload["rss_gb"] = tiers["rss_gb"]
+                        payload["ram_cap_gb"] = tiers["ram_cap_gb"]
                 self.send_json(200, payload, request_id)
                 return
             if path == "/profile":

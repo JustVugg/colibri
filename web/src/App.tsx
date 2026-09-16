@@ -343,6 +343,7 @@ export default function App() {
                   <span><i className="tier-ram" />{t("tier.ram")} <strong>{ti.ram.toLocaleString()}</strong><small>{ti.ram_gb.toFixed(1)} GB</small></span>
                   <span><i className="tier-disk" />{t("tier.disk")} <strong>{ti.disk.toLocaleString()}</strong></span>
                 </div>
+                {ti.rss_gb != null && ti.ram_cap_gb != null && ti.ram_cap_gb > 0 ? <div className="tier-process">Process <strong>{ti.rss_gb.toFixed(1)} / {ti.ram_cap_gb.toFixed(0)} GB</strong></div> : null}
               </div>
             })() : null}
             {totalTokens.prompt + totalTokens.completion > 0 ? <div className="session-stats">
