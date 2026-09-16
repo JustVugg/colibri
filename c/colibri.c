@@ -634,7 +634,10 @@ static int eslot_victim_pick(Model *m,int layer,int ecap){
     }
     if(m->ev_head && m->ev_head[layer]>=0){
         ESlot *s=&Sl[m->ev_head[layer]];
-        if(!eslot_busy(s)) return m->ev_head[layer];   /* list members are never busy */
+        if(!eslot_busy(s)) return m->ev_head[layer];
+        /* NOTE: list members CAN be in-flight (eslots_acquire does not unlink);
+         * the busy check + the LRU scan fallback below keep this O(1) amortized,
+         * degrading to the legacy scan only while the head is busy. */
     }
     return eslot_lru_victim(Sl,nn,ecap);   /* fallback: LRU residents / empty-under-cap */
 }
