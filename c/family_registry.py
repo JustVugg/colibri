@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Authoritative model-family registry for Colibri's Python control plane."""
 
+import os
 from dataclasses import dataclass
 import json
 import math
@@ -44,6 +45,23 @@ class FamilyLimits:
 
 
 @dataclass(frozen=True, slots=True)
+class DisplayVariant:
+    """One checkpoint geometry a family serves, and what to call it.
+
+    A family is keyed by model_type, and one model_type can cover checkpoints
+    of very different size: Qwen3.6-35B-A3B and Qwen3.8-2.4T-A95B both say
+    ``qwen3_5_moe_text``. A single display_name would announce the 2.4T as a
+    35B, which is the kind of banner that costs someone a day (#1045). The
+    ``geometry`` pairs are config keys the family config must match exactly;
+    the first matching variant names the model. No match: the model keeps its
+    own model_type as its name rather than borrowing a sibling's.
+    """
+    geometry: tuple
+    display_name: str
+    display_scale: str
+
+
+@dataclass(frozen=True, slots=True)
 class PlannerGeometry:
     context_state_bytes: int
     fixed_state_bytes: int
@@ -83,6 +101,9 @@ class FamilyDescriptor:
     has_cli_adapter: bool = False
     tune_prompt_template: str = "{prompt}"
     supports_accelerator: bool = True
+    # Size-keyed names for families whose model_type spans several checkpoint
+    # sizes. Empty: display_name/display_scale name every checkpoint.
+    display_variants: tuple = ()
     # Optional model-owned allocations that are neither dense resident
     # tensors nor per-expert cache entries. Qwen3.8 uses this for the
     # normalized FP8 scale bank shared by every cache slot. Keeping this
@@ -173,15 +194,41 @@ def _glm_geometry(config, context, _model_dir):
     return PlannerGeometry(state, 0, workspace, experts)
 
 
+def _qwen36_layer_types(config, layers, model_dir):
+    """The per-layer kinds, from wherever this container wrote them. The HF
+    config carries `layer_types`; older converted containers carry them only in
+    qwen36_meta.json (the engine reads that file, which is why chat worked
+    while doctor and plan refused, #1532); and the upstream class derives them
+    from `full_attention_interval` when neither list is present."""
+    kinds = config.get("layer_types")
+    if isinstance(kinds, list) and len(kinds) == layers:
+        return kinds
+    if model_dir:
+        try:
+            with open(os.path.join(model_dir, "qwen36_meta.json"), encoding="utf-8") as handle:
+                meta = json.load(handle)
+        except (OSError, ValueError):
+            meta = None
+        if isinstance(meta, dict):
+            kinds = meta.get("layer_types")
+            if isinstance(kinds, list) and len(kinds) == layers:
+                return kinds
+    interval = config.get("full_attention_interval")
+    if isinstance(interval, int) and not isinstance(interval, bool) and interval >= 1:
+        return ["full_attention" if (i + 1) % interval == 0 else "linear_attention"
+                for i in range(layers)]
+    raise ValueError("qwen36: missing or invalid planning key 'layer_types' "
+                     "(not in config.json, no qwen36_meta.json with it, and no "
+                     "full_attention_interval to derive it from)")
+
+
 def _qwen36_geometry(config, context, _model_dir):
     """Hybrid: only the full_attention layers hold a KV cache; the linear
     (DeltaNet) layers carry a recurrent state whose size does not depend on the
     context at all. One scaled context term would over-promise on a model where
     30 of 40 layers never grow."""
     layers = _required_int(config, "num_hidden_layers", "qwen36")
-    kinds = config.get("layer_types")
-    if not isinstance(kinds, list) or len(kinds) != layers:
-        raise ValueError("qwen36: missing or invalid planning key 'layer_types'")
+    kinds = _qwen36_layer_types(config, layers, _model_dir)
     full = sum(kind == "full_attention" for kind in kinds)
     kv = (full * context * _required_int(config, "num_key_value_heads", "qwen36") *
           _required_int(config, "head_dim", "qwen36") * 2 * 4)
@@ -1216,6 +1263,10 @@ FAMILIES = (
         planner_id="olmoe_gqa",
         planner_geometry=_olmoe_geometry,
         planner_unsupported_reason="",
+        # CPU-only, and olmoe.c says so in its own serve telemetry: "CPU-only (no
+        # CUDA/Metal backend), so the GPU fields are always empty". The build rule
+        # links NOCUDA_LDFLAGS. Left at the default this advertised a VRAM tier.
+        supports_accelerator=False,
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         config_section="root",
         # implicit_cap 0, not 8: the engine sizes its expert cache from the RAM
@@ -1236,6 +1287,17 @@ FAMILIES = (
         model_types=("qwen3_5_moe", "qwen3_5_moe_text"),
         display_name="Qwen3.6-35B-A3B",
         display_scale="35B",
+        # Both checkpoints declare qwen3_5_moe_text. Keyed on the three
+        # numbers that differ by an order of magnitude, so a config with
+        # any of them off names itself rather than one of these.
+        display_variants=(
+            DisplayVariant((("num_hidden_layers", 40), ("num_experts", 256),
+                            ("hidden_size", 2048)),
+                           "Qwen3.6-35B-A3B", "35B"),
+            DisplayVariant((("num_hidden_layers", 92), ("num_experts", 512),
+                            ("hidden_size", 8192)),
+                           "Qwen3.8-2.4T-A95B", "2.4T"),
+        ),
         engine_artifact="qwen36",
         engine_aliases=(),
         engine_group="qwen36",
@@ -1349,6 +1411,13 @@ FAMILIES = (
         planner_id="deepseek_v41",
         planner_geometry=_dsv41_geometry,
         planner_unsupported_reason="",
+        # CPU-only: the engine links no CUDA/Metal/Vulkan path and its build rule
+        # carries no backend object, so the planner must not offer a VRAM tier it
+        # cannot execute. Left at the default True it wrote "VRAM 296.0 GB hot
+        # tier ... 100% projected expert residency" into `coli plan` for this
+        # model; resource_plan.py:945 is the gate and says the same thing in
+        # words ("a CPU-only engine has no VRAM tier").
+        supports_accelerator=False,
         expert_inventory=_dsv41_expert_inventory,
         resident_inventory=_dsv41_resident_inventory,
         config_section="text_config",
@@ -1394,6 +1463,21 @@ def _build_registry(families):
             family.tune_prompt_template.format(prompt="test", prompt_len=4)
         except (AttributeError, IndexError, KeyError, TypeError, ValueError) as error:
             raise RegistryError(f"invalid tune prompt template: {family.id}") from error
+        for variant in family.display_variants:
+            if (not isinstance(variant, DisplayVariant) or not variant.geometry or
+                    not isinstance(variant.display_name, str) or not variant.display_name or
+                    not isinstance(variant.display_scale, str) or
+                    any(not isinstance(key, str) or not key or isinstance(value, bool) or
+                        not isinstance(value, int) or value < 1
+                        for key, value in variant.geometry)):
+                raise RegistryError(f"invalid display variant: {family.id}")
+        # The static display_name is what the READMEs are held to mention, so
+        # it must be a name some checkpoint actually shows -- a family whose
+        # variants all say something else would document a name no banner
+        # prints.
+        if family.display_variants and family.display_name not in {
+                variant.display_name for variant in family.display_variants}:
+            raise RegistryError(f"display_name is not one of its variants: {family.id}")
         identity = (family.engine_artifact, family.internal_arch)
         if identity in identities:
             raise RegistryError(f"duplicate engine identity: {identity}")
@@ -1472,6 +1556,25 @@ def resolve_model(model_dir):
             raise FamilyConfigError(f"{family.id}: text_config is not an object")
     return ResolvedFamily(family, _normalize_model_type(config.get("model_type")),
                           config, family_config, str(model))
+
+
+def display_for(resolved):
+    """(display_name, display_scale) for what was actually loaded.
+
+    Families without variants keep their static name. With variants, the
+    first whose geometry keys all match the family config wins; a config that
+    matches none is named by its own model_type with an empty scale, so the
+    banner prints the measured geometry instead of a sibling's parameter
+    count.
+    """
+    family = resolved.descriptor
+    if not family.display_variants:
+        return family.display_name, family.display_scale
+    config = resolved.family_config
+    for variant in family.display_variants:
+        if all(config.get(key) == value for key, value in variant.geometry):
+            return variant.display_name, variant.display_scale
+    return resolved.model_type, ""
 
 
 def planner_geometry(resolved, context):
@@ -1561,6 +1664,11 @@ def public_metadata(family):
         "model_types": list(family.model_types),
         "display_name": family.display_name,
         "display_scale": family.display_scale,
+        "display_variants": [
+            {"geometry": dict(variant.geometry),
+             "display_name": variant.display_name,
+             "display_scale": variant.display_scale}
+            for variant in family.display_variants],
         "engine_artifact": family.engine_artifact,
         "engine_aliases": list(family.engine_aliases),
         "engine_group": family.engine_group,

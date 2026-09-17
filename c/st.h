@@ -1100,6 +1100,90 @@ static void st_read_range_raw_cap(shards *S, int fd, int64_t off,
     if(drop&&nbytes>0)posix_fadvise(fd,off,nbytes,POSIX_FADV_DONTNEED);
 }
 
+/* ---- replica-aware range read (multi-SSD streaming) ---------------------
+ * st_read_range_raw_cap serves the range from the primary copy and leaves the
+ * bytes in the page cache on the way through. An engine that streams large
+ * expert tensors wants two more things, and the mirror machinery above already
+ * knows where to find them:
+ *
+ *   - the range served by replica `rep` (0 = primary, 1..nrep = mirrors), so
+ *     independent drives can answer together instead of one behind another;
+ *   - that replica's O_DIRECT twin, because a large transient read that is
+ *     copied into the page cache and out again pays for the same bytes twice,
+ *     and an engine that reads them once does not want them cached at all.
+ *
+ * O_DIRECT constrains buffer address, file offset and length to the logical
+ * block size, and a safetensors range starts wherever the writer put it. The
+ * obvious fix -- bounce the range through an aligned scratch buffer -- adds one
+ * full copy of every expert byte to a workload where the disk is the point, so
+ * this instead expects the caller to reserve `off % ST_DIRECT_ALIGN` bytes of
+ * scratch BEHIND the destination and hand over the payload pointer. The window
+ * starting at the enclosing block boundary is then already aligned: one
+ * O_DIRECT pread carries the block-aligned bulk, one short buffered pread
+ * carries the sub-block tail, and the payload lands exactly where the caller
+ * asked for it with nothing to copy afterwards.
+ *
+ * ST_DIRECT_ALIGN is the slack a caller must add to each such buffer. The
+ * alignment is verified rather than assumed, and a caller that did not reserve
+ * the prefix -- or a platform with no O_DIRECT, or a replica without a twin --
+ * silently gets the buffered path. `direct` is the caller's own switch: 0 forces
+ * that path everywhere, which is what an engine exposes so the choice can be
+ * A/B'd on the hardware in front of it rather than argued about. */
+#define ST_DIRECT_ALIGN 4096
+
+/* One aligned pread, EINTR retried. Returns 0 only on a full transfer: O_DIRECT
+ * wants a block-aligned length, so a short read cannot be finished by simply
+ * asking for the rest -- the caller falls back to the buffered path instead. */
+static int st_pread_aligned_try(int fd, void *buf, int64_t n, int64_t off) {
+    for (;;) {
+        ssize_t r = pread(fd, buf, (size_t)n, (off_t)off);
+        if (r == n) return 0;
+        if (r < 0 && errno == EINTR) continue;
+        return -1;
+    }
+}
+
+static void st_read_range_rep(shards *S, int fd, int rep, int64_t off, int64_t nbytes,
+                              void *out, int64_t cap, int drop, int direct,
+                              const char *tag) {
+    int fidx = S ? st_fidx(S, fd) : -1;
+    if (fidx < 0) { fprintf(stderr, "replica range uses an unindexed shard fd\n"); exit(1); }
+    if (off < 0 || nbytes < 0 || cap < 0 || nbytes > cap ||
+        off > S->sizes[fidx] || nbytes > S->sizes[fidx] - off ||
+        (uint64_t)nbytes > SIZE_MAX) {
+        fprintf(stderr, "replica range [%lld,+%lld) exceeds file/destination bounds "
+                        "(file %lld, cap %lld) — refusing (untrusted container)\n",
+                (long long)off, (long long)nbytes, (long long)S->sizes[fidx], (long long)cap);
+        exit(1);
+    }
+    if (nbytes == 0) return;
+    if (!out) { fprintf(stderr, "replica range has a NULL destination\n"); exit(1); }
+    const char *label = tag && *tag ? tag : "pread replica range";
+    /* A partial mirror leaves this shard on the primary; so does a replica index
+     * that no longer exists. Either way the read is valid, just not split. */
+    int rfd = st_fd_rep(S, fd, rep);
+    if (rfd < 0) { rfd = fd; rep = 0; }
+    int64_t pad = off % ST_DIRECT_ALIGN;
+    uint8_t *window = (uint8_t *)out - pad;      /* the caller's reserved scratch */
+    int dfd = direct ? st_direct_fd_rep(S, fd, rep) : -1;
+    if (dfd >= 0 && ((uintptr_t)window & (uintptr_t)(ST_DIRECT_ALIGN - 1)) == 0 &&
+        pad + nbytes <= (int64_t)ST_PREAD_CHUNK) {
+        int64_t want = pad + nbytes;              /* bytes to fill, window-relative */
+        int64_t left = S->sizes[fidx] - (off - pad);
+        int64_t bulk = want & ~(int64_t)(ST_DIRECT_ALIGN - 1);
+        if (bulk > left) bulk = left & ~(int64_t)(ST_DIRECT_ALIGN - 1);
+        /* A device that refuses O_DIRECT costs the call some speed and never its
+         * correctness: the buffered path below reads exactly the same bytes. */
+        if (bulk > 0 && st_pread_aligned_try(dfd, window, bulk, off - pad) == 0) {
+            int64_t tail = want - bulk;
+            if (tail > 0) st_pread_full(rfd, window + bulk, tail, off - pad + bulk, label);
+            return;
+        }
+    }
+    st_pread_full(rfd, out, nbytes, off, label);
+    if (drop) posix_fadvise(rfd, off, nbytes, POSIX_FADV_DONTNEED);
+}
+
 /* Read-only view of one tensor's exact stored bytes.  Unlike st_read_raw this
  * performs no allocation or copy; unlike a naked mmap pointer it carries the
  * aligned OS view/handle required for cleanup.  Callers must still validate
@@ -1146,20 +1230,42 @@ static int st_map_experts_enabled(void) {
     return on;
 }
 
+/* Reached from parallel regions: glm53.c's `#pragma omp parallel for` over the
+ * batch calls expert_read -> st_map_shard_range -> here from every worker at
+ * once, and qwen38_core.h does the same. Two threads racing the plain version
+ * of this both saw g_st_shard_tried[fd] == 0, both mapped the file, and one
+ * leaked its mapping while a third could read g_st_shard_len[fd] as 0 through
+ * an already-published base -- st_map_shard_range then rejects every range for
+ * that shard. Latent only because COLI_MAP_EXPERTS is opt-in; #1350 proposes
+ * flipping that default.
+ *
+ * Lock-free rather than the mutex qwen38_core.h uses for its lazy HITS table,
+ * because st.h is also compiled into c/tools/check_glm53_container.c, whose
+ * documented build line is plain `gcc -O2 -std=gnu11 -Ic ... -lm` with neither
+ * -pthread nor -fopenmp. */
 static const uint8_t *st_shard_mapped(int fd) {
     if (fd < 0 || fd >= ST_MAX_MAPPED_FD || !st_map_experts_enabled()) return NULL;
-    if (g_st_shard_base[fd]) return g_st_shard_base[fd];
-    if (g_st_shard_tried[fd]) return NULL;
-    g_st_shard_tried[fd] = 1;
+    /* Acquire: a base published below carries g_st_shard_len[fd] with it. */
+    const uint8_t *base = __atomic_load_n(&g_st_shard_base[fd], __ATOMIC_ACQUIRE);
+    if (base) return base;
+    /* Claim the fd exactly once. The losing thread does not block: NULL is the
+     * documented "use pread" answer, so it takes the pread path for this one
+     * call rather than parking an OpenMP worker behind an mmap. */
+    signed char unclaimed = 0;
+    if (!__atomic_compare_exchange_n(&g_st_shard_tried[fd], &unclaimed, (signed char)1,
+                                     0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return __atomic_load_n(&g_st_shard_base[fd], __ATOMIC_ACQUIRE);
     int64_t len = (int64_t)lseek(fd, 0, SEEK_END);
     if (len <= 0) return NULL;
     compat_ro_map map; const void *data;
     if (compat_map_readonly(fd, 0, (size_t)len, &map, &data) != 0) return NULL;
     /* The compat_ro_map itself is intentionally not tracked for unmap: shard
      * mappings live exactly as long as the fd they wrap, i.e. the process. */
-    g_st_shard_base[fd] = (uint8_t *)data;
+    /* Length first, then release-store the base: whoever sees the base through
+     * the acquire load above necessarily sees the length too. */
     g_st_shard_len[fd] = len;
-    return g_st_shard_base[fd];
+    __atomic_store_n(&g_st_shard_base[fd], (uint8_t *)data, __ATOMIC_RELEASE);
+    return (const uint8_t *)data;
 }
 
 /* Serves [off, off+nbytes) of file `fd` directly out of its persistent

@@ -184,6 +184,98 @@ Prefill is where most of it goes: 52.3 GB of the 87.4, because each of the 26 pr
 positions routes independently and a 49-slot cache cannot hold what 26 positions ask
 of one layer.
 
+### Where the bytes come from, and whether they touch the page cache
+
+Two things move expert bytes that the V4 and GLM engines already had and this one did
+not, and both are about the same fact: an expert is read once and never wanted again.
+
+**A second drive.** `COLI_MODEL_MIRROR=<dir>[;<dir>...]` registers read-only copies of
+the checkpoint on other drives; experts are split across the primary and every replica,
+each drive answering for a deterministic subset. A copy is accepted only when its size
+and safetensors header are byte-identical to the primary's, so the data offsets match
+by construction and any expert can be served by any replica -- and a copy that is
+*not* identical is refused rather than trusted, which is the whole reason the check is
+a header compare and not a filename. Partial mirrors are legal: a smaller SSD holding
+only the routed-expert shards is the case this exists for, and a shard a replica does
+not carry simply stays on the primary.
+
+The split follows `COLI_DISK_WEIGHTS`, or is measured at startup with this engine's own
+access pattern. Splitting is the point and also the risk: two independent drives
+answer in parallel, but one drive serving two copies of itself answers no faster than
+one drive, so the split is a measurement rather than an assumption.
+
+The hash is over the flat expert index. `deepseek_v4.c` records why that matters: an
+XOR of layer and expert spread the whole 43x256 grid evenly and still clustered the
+dozen experts a decode step actually touches onto one replica. Multiplying the flat
+index by the golden-ratio constant and taking bits 16..23 inherits the uniformity of
+that index, so a hot subset splits like a cold one.
+
+**Not through the page cache.** The reader already tells the kernel each expert is not
+wanted again (`POSIX_FADV_DONTNEED` after the read), which is the honest admission that
+a buffered read of it pays for the bytes twice -- once into the cache, once out -- in
+order to leave the cache as cold as it was. `V41_DIRECT=1`, the default, reads them
+with `O_DIRECT` instead.
+
+There is a second, cheaper way to put the container on more than one drive, and for a
+510 GB checkpoint it is the one most people can actually build.
+`COLI_MODEL_DIRS=<dir>` names directories holding **distinct** shards -- no
+duplication, combined capacity, each shard read from the one drive that has it -- so
+the same container can live on two 256 GB drives instead of one 512 GB drive. It is
+the same split the GLM, V4 and Kimi K3 engines already accept. It composes with the
+mirror: a mirror directory may copy any subset of the split's shards.
+
+The two mechanisms answer different questions. `COLI_MODEL_DIRS` asks whether the
+bytes can be *stored* across drives; `COLI_MODEL_MIRROR` asks whether they can be
+*read* from more than one place at once. With the CPU side in order -- the OpenMP team
+sized, which `c/coli` already does at launch -- the second one is worth a fifth of the
+expert disk phase and the engine reaches the device's own ceiling; the measurements,
+and the regime in which neither is worth anything, are in
+[the experiment record](experiments/dsv41-expert-io-2026-09-14.md).
+
+### The cheapest resident tier there is
+
+The expert cache has a floor that no cache size can move: a turn's *first* touch of
+each expert it routes. On the released checkpoint a 16-token turn touches 3,371
+distinct experts, and a cache of about 96 slots per layer already sees no capacity
+misses at all -- every miss left is a first read, and only having the bytes resident
+*before the turn starts* removes it.
+
+The engine cannot ask for that, but a filesystem can. Point a partial mirror at RAM:
+
+```sh
+# the 46 non-engram shards carry every routed expert and the dense weights
+mkdir -p /dev/shm/dsv41_ram
+cd <container> && ls model-*.safetensors | grep -v -E -- '-0004[78]-' \
+    | xargs cp -t /dev/shm/dsv41_ram/
+
+COLI_MODEL_MIRROR=/dev/shm/dsv41_ram COLI_DISK_WEIGHTS=1,1000 \
+    SNAP=<container> ./c/deepseek_v41 8 ref.json
+```
+
+Measured on the released checkpoint, 16-token turn, cold cache, `cap=8`: expert disk
+16.05 s -> **4.15 s** (6.19 -> 23.89 GB/s) and the turn 37.3 s -> **25.5 s**, -31.7%,
+token-exact. That is more than a cache four times its size buys -- `cap=384`, which
+holds all 289 GB of experts, still reads 63 GB and spends 11.3 s on disk -- because
+caching during a turn cannot remove a first read and residency before it can. It costs
+287 GiB of RAM for the duration, which is the whole trade; 1,000 is not magic, any
+weight that sends nearly every expert to the RAM copy will do.
+
+That needs the destination and the file offset to be block-aligned, and a safetensors
+range starts wherever the writer put it. The obvious fix is to bounce each transfer
+through an aligned scratch buffer, and it is the wrong one here: an extra copy of every
+expert byte, over a turn that moves 88.5 GB, is most of what the change was for. Each
+slot instead keeps its six buffers in page-aligned windows with `ST_DIRECT_ALIGN` of
+scratch in front, and `st.h`'s `st_read_range_rep` starts the read at the enclosing
+block boundary, carries the block-aligned bulk with one `O_DIRECT` pread and the
+sub-block tail with one short buffered pread, and lands the payload exactly where the
+slot wants it. Nothing is copied afterwards.
+
+The alignment is verified, not assumed. A destination that was not set up that way --
+or a platform without `O_DIRECT`, or a replica whose twin failed to open -- takes the
+buffered path, which reads exactly the same bytes. `V41_DIRECT=0` forces it, both as
+the other arm of the A/B and as the escape hatch on a device where direct I/O turns
+out to be slower.
+
 ## Blocks of positions, not one position at a time
 
 Everything above the experts used to run one position at a time, which meant a block
@@ -240,8 +332,13 @@ and costs the contention. Anything that tries again has to start from that.
 
 | variable | default | what it does |
 |---|---|---|
+| `COLI_KV_PREFIX` | **off on this engine** | `1` reuses the previous turn's state when the new prompt begins with what that state was built from, instead of re-reading the transcript. Off by default here and on nowhere else: see "Reusing a turn" below for what it costs. |
 | `V41_STATS` | off | per-turn accounting on stderr: the n-gram cache, the expert bytes and their rate, and how many drafts were accepted. Off by default because `coli chat` shows the engine's stderr next to the answer. |
 | `V41_READ_DEPTH` | 8 | expert tensors read at once when a step misses the cache (see above). `1` restores the serial read the engine used to do, for an A/B. |
+| `COLI_MODEL_MIRROR` | unset | `;`/`,`-separated read-only copies of the checkpoint on other drives; expert reads split across the primary and every replica (see above). `SNAP_MIRROR` is the legacy alias. |
+| `COLI_MODEL_DIRS` | unset | `;`/`,`-separated directories holding **distinct** shards of the same container, so it can be split across drives with no second copy (see above). |
+| `COLI_DISK_WEIGHTS` | unset (startup probe) | the split ratio, one positive weight per drive (`1,1` for an even pair). Unset measures each drive with the engine's own access pattern. |
+| `V41_DIRECT` | 1 | read experts with `O_DIRECT` instead of through the page cache. `0` is the buffered arm and the escape hatch; the two paths return identical bytes. |
 | `V41_ENGRAM_ROWS` | 65536 | rows of engram cache per table. The traffic is Zipfian: common 2-grams repeat constantly, so a small cache absorbs most of it. 65536 rows is 64 MB per table on the released head_dim. |
 | `V41_INDEX_OWNER` | unset | each layer scores against its own owner's index keys (see above). Changes the model's behaviour. |
 | `V41_MAX_IMAGE_TOKENS` | the checkpoint's `max_image_tokens` | a ceiling on what one image costs in prompt tokens. |
@@ -250,6 +347,50 @@ and costs the contention. Anything that tries again has to start from that.
 | `V41_DSPARK_MAX` | the checkpoint's `dspark_block_size` | how many of the drafted tokens are put in front of the main model. Fewer means a cheaper rejected round and a lower ceiling on the win. |
 | `V41_DSPARK_MINACC` | 60 | percent of drafts that must be accepted over a window of ten for drafting to continue; below it, drafts pause for 64 tokens. 60 is the measured break-even, not a guess. |
 | `V41_SPEC_FORCE` | unset | oracle mode only: draft the reference's tokens (`1`), corrupt the last one (`2`), or use the head's own (`3`), to exercise the verification path on a fixture whose draft head is random. |
+
+## Reusing a turn, and why it is asked for rather than assumed
+
+A chat client resends the whole conversation every turn. Every other engine in
+the tree skips the part it already holds, because for them a reused prefix is
+the same computation as a cold prefill: the reuse changes the time and nothing
+else. Here it is not, and the reason belongs to the model rather than to us.
+
+A query reads one set of index keys when its position is **prefilled** -- its
+layer's own index owner, masked to what the query can reach -- and another when
+the position is **decoded**, namely whatever was published last. Both are the
+vendor's, and neither can be moved to match the other:
+
+| | tiny oracle |
+|---|---|
+| as shipped | 8/8 |
+| the prefill given the decode schedule | 7/8 |
+| the decode given the prefill owner | 1/8 |
+
+So a position generated in an earlier turn does not attend the way the same text
+attends when it is prefilled cold. A resumed conversation and the same
+conversation re-read from scratch can answer differently. The resumed state is
+the sequential one, so it is not the wrong answer -- it is a different one, and
+that is a trade the person running the engine makes, not one the engine makes
+for them. `COLI_KV_PREFIX=1` asks for it.
+
+What is exact, and gated in CI, is a resumed **prefill**: a prompt that grows
+without generated text in between -- an agent resending a document, a tool loop
+-- reuses losslessly. Measured on the tiny fixture, a prefill that resumes 4,
+12, 24 or 48 tokens from the end reproduces the cold prefill's tokens exactly.
+That was not free: the index-key schedule used to be selected by `start_pos > 0`,
+which meant "the speculative verify batch" only because a prefill always started
+at position 0. A resumed prefill matched it too and took the decode schedule,
+reading another layer's keys and choosing a different index top-k. It is now
+selected by the flag that actually distinguishes the two.
+
+Three more things the attempt turned up, all of them unreachable before reuse
+existed and all fixed here: the per-layer undo buffers (`ring_save`,
+`cstate_save_*`) are sized for one draft block and were written on any multi-row
+forward past position 0, which a resumed prefill overflows; `spec_step` decided
+"seed the stages, do not draft" by `start_pos == 0` and seeded them at position
+0, so a resumed prefill fell into the drafting path with no draft buffer; and the
+record follows the speculative rollback, so it never claims rows the caches gave
+back.
 
 ## How it is tested
 

@@ -303,14 +303,14 @@ class Dsv4CudaDetectTest(unittest.TestCase):
     probe there rejected every valid `make deepseek-v4 CUDA=1` build (#1219)."""
 
     def _detect(self, platform, ldd_stdout=None, dll=False, engine_exists=True,
-                ldd_error=None):
+                ldd_error=None, dll_name="coli_cuda_dsv4.dll"):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         eng = Path(tmp.name) / "deepseek"
         if engine_exists:
             eng.write_bytes(b"")
         if dll:
-            (Path(tmp.name) / "coli_cuda_dsv4.dll").write_bytes(b"")
+            (Path(tmp.name) / dll_name).write_bytes(b"")
         fake_run = mock.Mock(return_value=types.SimpleNamespace(stdout=ldd_stdout or ""),
                              side_effect=ldd_error)
         with mock.patch.object(sys, "platform", platform), \
@@ -349,6 +349,16 @@ class Dsv4CudaDetectTest(unittest.TestCase):
 
     def test_win32_dll_detected(self):
         self.assertTrue(self._detect("win32", dll=True))
+
+    def test_win32_deepgemm_dll_alone_detected(self):
+        # backend_loader_dsv4.c tries coli_cuda_dsv4_dg.dll first and
+        # coli_cuda_dsv4.dll second, and `coli doctor` accepts either. --gpu
+        # refused an install that had only the DeepGEMM build next to it.
+        self.assertTrue(self._detect("win32", dll=True,
+                                     dll_name="coli_cuda_dsv4_dg.dll"))
+
+    def test_win32_unrelated_dll_rejected(self):
+        self.assertFalse(self._detect("win32", dll=True, dll_name="coli_cuda.dll"))
 
     def test_win32_missing_dll_rejected(self):
         self.assertFalse(self._detect("win32", dll=False))

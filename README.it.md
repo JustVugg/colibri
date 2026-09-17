@@ -284,6 +284,12 @@ disco che abbia lo spazio, meglio se veloce:
 
 **https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
 
+**GLM-5.3** è la stessa famiglia e si carica con lo stesso motore. Ha il suo
+container group-scaled (gs64), circa **419 GB**, e arriva **senza** la testa MTP,
+quindi la decodifica speculativa resta disattivata:
+
+**https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64**
+
 > ⚠️ Usa il container **gs64** qui sopra, non i vecchi mirror int4 per-row
 > (`mateogrgic/…`, `jlnsrk/…`): misurano circa 9 punti percentuali in meno sulla
 > qualità e causavano i loop in think-mode e le generazioni senza termine originali
@@ -396,4 +402,4 @@ il primo prototipo — i commenti nel codice lo testimoniano ancora.
 
 ## Licenza
 
-Apache 2.0. I pesi di GLM-5.2 sono rilasciati da Z.ai sotto licenza MIT.
+Apache 2.0, Copyright 2026 Vincenzo Fornaro. Vedi [LICENSE](LICENSE) e [NOTICE](NOTICE). I pesi di GLM-5.2 sono rilasciati da Z.ai sotto licenza MIT.

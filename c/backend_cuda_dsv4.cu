@@ -720,6 +720,17 @@ extern "C" long long dsv4_cuda_mem_free_mb(int device){
     return (long long)(free_b>>20);
 }
 
+/* 1 when the device shares its memory with the host (GB10 / DGX Spark, Jetson,
+ * any integrated part): cudaMemGetInfo then reports the system's free memory,
+ * not headroom on a card, so a VRAM reserve compared against it says nothing
+ * about whether one more mirror fits (#1538). */
+extern "C" int dsv4_cuda_device_unified(int device){
+    int integrated=0,host_tables=0;
+    if(cudaDeviceGetAttribute(&integrated,cudaDevAttrIntegrated,device)!=cudaSuccess){cudaGetLastError();integrated=0;}
+    if(cudaDeviceGetAttribute(&host_tables,cudaDevAttrPageableMemoryAccessUsesHostPageTables,device)!=cudaSuccess){cudaGetLastError();host_tables=0;}
+    return (integrated||host_tables)?1:0;
+}
+
 extern "C" int dsv4_cuda_kv_ring_append(int device,int layer,const float*rows,
         int start_pos,int count,int window,int dim){
     Dev*c=ctx(device);

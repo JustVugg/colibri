@@ -38,6 +38,7 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"                    /* shared routing telemetry (#700) */
+#include "kv_prefix.h"   /* riuso del prefisso tra turni (shared) */
 #include "serve_codec.h"
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
@@ -102,6 +103,10 @@ typedef struct {
      * plain double: a per-turn delta of it is what the PROF line reports. */
     uint64_t disk_ns;
     float **K, **V; int kv_len, max_t;
+    /* What the cached keys and values were built from, so a serve turn that
+     * resends the transcript prefills only the new tail. Recorded where the
+     * tokens are fed (see kv_prefix.h), never derived from a counter. */
+    kv_prefix kvp;
     double dense_load_s;
     /* IMPROVEMENT 2: expert frequency heatmap */
     uint32_t **freq;                   /* per-layer expert counts, owned by route_trace.h */
@@ -1009,6 +1014,10 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens)
         pin_hot_experts(m);
     m->kv_len = pos_base + S;
+    /* Recorded HERE, where the tokens entered the cache: fed[0..len-1] are
+     * the ids those positions were built from, and that invariant is the
+     * whole safety argument for reusing them next turn. */
+    kv_prefix_record(&m->kvp, ids, pos_base, S);
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
@@ -1462,6 +1471,10 @@ static void serve_hits(Model *m) {
     fflush(stdout); free(hex); free(bm);
 }
 
+/* COLI_KV_PREFIX=0: never reuse a previous turn's cache. The escape hatch,
+ * and the B arm of the A/B that shows reuse changes nothing but the time. */
+static int kv_prefix_off(void){ const char *e = getenv("COLI_KV_PREFIX"); return e && *e == '0'; }
+
 static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     Cfg *c = &m->c;
     int cap = q->plen + 16;
@@ -1478,12 +1491,38 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
         coli_serve_write_error(stdout, q->id, message); free(ids); return 0;
     }
     g_temp = q->temp; g_nuc = q->top_p;
+    /* A chat client resends the whole transcript every turn. If this prompt
+     * begins with the ids the cache was built from, those keys and values ARE
+     * the state at those positions -- attention is causal, so a row depends on
+     * its prefix and nothing later. Prefill only the tail. Reuse is all or
+     * nothing: nothing here can rewind a cache. COLI_KV_PREFIX=0 turns it off,
+     * COLI_PREFIX_LOG=1 reports the decision and its reason, because "it did
+     * not get faster" is otherwise indistinguishable from "it is not wired up".
+     *
+     * On a miss the record must be CLEARED and not merely overwritten: a
+     * shorter prompt writes fewer positions than the last one recorded, and
+     * kv_prefix_record only ever grows the length, so the stale tail would
+     * claim coverage the cache no longer has. */
+    int reuse = kv_prefix_off() ? 0 : kv_prefix_reuse(&m->kvp, ids, np);
+    if (!reuse) kv_prefix_clear(&m->kvp);
+    if (getenv("COLI_PREFIX_LOG")) {
+        if (reuse)
+            fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
+                    reuse, np, 100.0 * reuse / np);
+        else
+            fprintf(stderr, "[PREFIX] no reuse: held=%d cap=%d prompt=%d\n",
+                    m->kvp.len, m->kvp.cap, np);
+        fflush(stderr);
+    }
     double t0 = now_s();
     uint64_t h0 = m->hits, m0 = m->miss;
     uint64_t disk0 = __atomic_load_n(&m->disk_ns, __ATOMIC_RELAXED);
     double attn0 = g_prof_attn_s, moe0 = g_prof_moe_s, head0 = g_prof_head_s;
     long long fwd0 = g_prof_forwards;
-    float *logit = step(m, ids, np, 0);
+    /* `reuse` is the ABSOLUTE position of the first fresh token: attention
+     * and the KV rows are position-indexed, so this has to be the real
+     * offset, not a count of what is left to do. */
+    float *logit = step(m, ids + reuse, np - reuse, reuse);
     int hist_len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
@@ -1525,7 +1564,8 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
      * zero: this engine has no separate wait phase. */
     double disk_s = (double)(__atomic_load_n(&m->disk_ns, __ATOMIC_RELAXED) - disk0) / 1e9;
     double matmul_s = (g_prof_moe_s - moe0) - disk_s; if (matmul_s < 0.0) matmul_s = 0.0;
-    printf("PROF %.3f %d %d %.3f 0.0 %.3f %.3f %.3f %lld\n", dt, np, gen, disk_s, matmul_s,
+    /* microsecond resolution: see qwen36.c, same reason (a sub-millisecond tiny turn read as unmeasured) */
+    printf("PROF %.6f %d %d %.6f 0.0 %.6f %.6f %.6f %lld\n", dt, np, gen, disk_s, matmul_s,
            g_prof_attn_s - attn0, g_prof_head_s - head0, g_prof_forwards - fwd0);
     fflush(stdout);
     serve_hits(m);
@@ -1662,6 +1702,12 @@ int main(int argc, char **argv) {
             m.K[i] = falloc((int64_t)m.c.n_heads * m.max_t * m.c.head_dim);
             m.V[i] = falloc((int64_t)m.c.n_heads * m.max_t * m.c.head_dim);
         }
+        /* Serve mode only: the record is sized with the cache it describes, and
+         * the cache here is allocated once for ctx_cap and never reallocated,
+         * so a recorded position stays valid for the life of the process. The
+         * CLI paths (generate/run_chat/PPL) leave it unallocated, which makes
+         * every kv_prefix call there a no-op. */
+        kv_prefix_alloc(&m.kvp, m.max_t);
         Tok T;
         char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
         tok_load(&T, tokpath);

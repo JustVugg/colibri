@@ -177,9 +177,10 @@ def save_profile(profile: dict, profile_dir: str | None = None) -> Path:
 def candidate_steps(plan: dict, base_env: dict, arch: str = "glm") -> list[tuple[str, dict]]:
     """Return a bounded coordinate-descent sweep for this topology and engine.
 
-    `arch` gates the knobs that are not universal. OMP_NUM_THREADS and COLI_NUMA
-    are read by every engine (they are OpenMP and NUMA, not engine features), so
-    they are always eligible. PIPE and DIRECT are read by colibri alone --
+    `arch` gates the knobs that are not universal. OMP_NUM_THREADS is read by
+    every engine (it is OpenMP, not an engine feature), so it is always
+    eligible. COLI_NUMA is not: it is colibri.c's own mbind of its expert slabs,
+    and no other engine reads it. PIPE and DIRECT are read by colibri alone --
     `grep -c 'getenv("PIPE")'` is 3 in colibri.c and 0 in the other four -- so
     offering them elsewhere would sweep candidates that cannot differ, spend the
     replay budget proving it, and report a 0% gain as if it were a measurement
@@ -192,10 +193,12 @@ def candidate_steps(plan: dict, base_env: dict, arch: str = "glm") -> list[tuple
             if threads != current_threads:
                 steps.append((f"omp-{threads}", {"OMP_NUM_THREADS": str(threads)}))
     sockets = int(plan.get("cpu", {}).get("sockets", 1))
-    if sockets > 1 and base_env.get("COLI_NUMA") != "1":
+    if sockets > 1 and arch == "glm" and base_env.get("COLI_NUMA") != "1":
         steps.append(("numa-on", {"COLI_NUMA": "1"}))
     has_gpu = bool(plan.get("tiers", {}).get("vram", {}).get("devices"))
-    if has_gpu:
+    # Same rule for the CUDA knobs: COLI_CUDA_PIPE is read in colibri.c only,
+    # and COLI_CUDA_ASYNC only on the grouped-expert call colibri.c makes.
+    if has_gpu and arch == "glm":
         pipe = int(base_env.get("COLI_CUDA_PIPE", "0"))
         for value in (1, 2):
             if value != pipe:
@@ -382,7 +385,12 @@ class OutputDrift(RuntimeError):
 def _run(command: list[str], env: dict, timeout: int) -> subprocess.CompletedProcess:
     if Path(command[0]).suffix.lower() == ".py":
         command = [sys.executable, *command]
-    return subprocess.run(command, env=env, text=True, capture_output=True, timeout=timeout)
+    # The engine writes UTF-8 ("[prefill] layer 1/78 · 12 token", the PROF
+    # verdict's em dash). Decoding in the locale's code page raised in the
+    # reader thread on cp949/cp932 or the C locale, left proc.stdout None, and
+    # killed `coli tune` in calibration with a TypeError.
+    return subprocess.run(command, env=env, capture_output=True, timeout=timeout,
+                          encoding="utf-8", errors="replace")
 
 
 def create_replay(engine: str, cap: int, env: dict, prompt: str, tokens: int,

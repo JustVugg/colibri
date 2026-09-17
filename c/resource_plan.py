@@ -824,7 +824,9 @@ def _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets, plan_has_meta
     # glm53 has its own loader/cache controls and does not consume the generic
     # DRAFT/PIPE/PIN/NUMA knobs below. Recommending them is worse than leaving
     # them unset because `coli tune` then reports changes the engine ignores.
-    if engine_group == "glm53":
+    # The same holds for every engine but colibri.c: DRAFT, PIPE, COLI_CUDA_PIPE,
+    # COLI_NUMA and PIN_GB have no reader anywhere else.
+    if engine_group is not None and engine_group != "colibri-core":
         return tune
 
     # MTP: costs more than it saves when compute-bound (#389 measured 42% loss)

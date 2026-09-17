@@ -10347,7 +10347,22 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
         /* cudaMemGetInfo is a driver round trip; with a large capacity the
          * guard is consulted on every miss (hundreds per token), so re-check
          * free VRAM only every 64 misses and reuse the last answer between. */
-        if (grow && cache->count > 0) {
+        /* On unified memory (GB10, Jetson) cudaMemGetInfo's free is the
+         * system's MemFree, which the page cache holding the model keeps
+         * near zero; measured against a VRAM reserve it froze this cache at
+         * a handful of entries on a 130 GB box (#1538). There is no separate
+         * card to keep headroom on, so the guard does not apply; the
+         * capacity (DSV4_CUDA_EXPERT_MIRRORS) bounds the cache instead. */
+        static int unified = -1;
+        if (unified < 0) {
+            unified = dsv4_cuda_device_unified(cache->device) ? 1 : 0;
+            if (unified)
+                fprintf(stderr, "v4_gpu mirror-cache: unified memory, VRAM reserve "
+                                "guard off (free memory is the system's, not a "
+                                "card's); capacity %d bounds the cache\n",
+                        cache->capacity);
+        }
+        if (grow && cache->count > 0 && !unified) {
             static long long last_free_mb = -1;
             static unsigned probes;
             if (last_free_mb < 0 || (probes++ & 63) == 0)
@@ -10355,6 +10370,24 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
             if (last_free_mb >= 0 && last_free_mb < reserve_mb) grow = 0;
         }
         if (!grow && cache->count == 0) {
+            pthread_mutex_unlock(&cache->mutex);
+            return -1;
+        }
+        /* The "fewer than 8" rule above is about LIVE entries, not the
+         * configured capacity: a cache frozen by the reserve with two or
+         * three mirrors would recycle in place a slot the current token's
+         * earlier view still references, and the output is garbage with no
+         * error (#1538). Stay on the CPU for this expert until it can grow. */
+        if (!grow && cache->count < 8) {
+            static int warned;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "v4_gpu mirror-cache: frozen below the VRAM reserve "
+                                "with %d live entries; a layer attaches up to 8 "
+                                "before computing, so experts stay on the CPU until "
+                                "the cache can grow (raise capacity or lower "
+                                "DSV4_CUDA_VRAM_RESERVE_MB)\n", cache->count);
+            }
             pthread_mutex_unlock(&cache->mutex);
             return -1;
         }

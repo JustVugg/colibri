@@ -102,8 +102,8 @@ class V4CliTest(unittest.TestCase):
                     self.cli.cmd_run(args)
             self.assertEqual(stopped.exception.code, 0)
             self.assertEqual(captured["command"], ["/engines/olmoe", "16", "8"])
-            self.assertEqual(captured["input"], "hello world\n")
-            self.assertTrue(captured["text"])
+            self.assertEqual(captured["input"], b"hello world\n")
+            self.assertNotIn("text", captured)
             self.assertEqual(captured["env"]["CHAT"], "1")
             self.assertEqual(captured["env"]["MAX_NEW"], "32")
         finally:

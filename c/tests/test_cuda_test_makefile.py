@@ -1,15 +1,17 @@
 """Build-contract checks for the real-GPU MXFP4 correctness test."""
+import shutil
 import subprocess
 import unittest
 from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent.parent
+MAKE = shutil.which("make")
 
 
 def cuda_test_recipe(*variables):
     result = subprocess.run(
-        ["make", "-Bn", "cuda-test",
+        [MAKE, "-Bn", "cuda-test",
          "TRIPLET=x86_64-unknown-linux-gnu", *variables],
         cwd=HERE, text=True, capture_output=True, check=False, timeout=120)
     return result.stdout + result.stderr
@@ -38,6 +40,7 @@ def mxfp4_ref_compile_line(recipe):
         "")
 
 
+@unittest.skipUnless(MAKE, "make is required")
 class CudaTestMakefileTest(unittest.TestCase):
     # These three replace the pair that asserted the OpenMP runtime WAS linked.
     # The CPU oracle is now built without OpenMP (#971), because that single
@@ -91,6 +94,10 @@ class CudaTestMakefileTest(unittest.TestCase):
         self.assertTrue(line, "no nvcc compile command in dry-run recipe")
         for flag in ("-ftz=false", "-std=c++17", "sm_86"):
             self.assertIn(flag, line, f"{flag} lost when the override is set")
+
+
+class SetupScriptTest(unittest.TestCase):
+    """Reads setup.sh directly, so it stays runnable without make."""
 
     def test_setup_openmp_probe_does_not_require_tmp(self):
         setup = (HERE / "setup.sh").read_text(encoding="utf-8")

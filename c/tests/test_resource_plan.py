@@ -123,6 +123,56 @@ class ResourcePlanTest(unittest.TestCase):
                            engine_group="glm53")
         self.assertEqual(glm53, {})
 
+    def test_only_the_colibri_engine_gets_its_own_knobs(self):
+        """DRAFT, PIPE, COLI_CUDA_PIPE, COLI_NUMA and PIN_GB are read by
+        colibri.c and by no other engine. glm53 was excluded; every other
+        sibling was still told to set them, in `coli plan`, in `coli doctor`
+        and in the --auto-tier environment."""
+        from family_registry import all_families
+        from resource_plan import _auto_tune
+
+        gpu = [{"index": 0, "name": "GPU", "total_bytes": 24 * GB,
+                "free_bytes": 24 * GB}]
+        cases = (("disk", 0.50, [], 2), ("compute", 1.0, [], 2),
+                 ("compute", 1.0, gpu, 2), ("mixed", 0.80, gpu + gpu, 1))
+        core = [_auto_tune(*case, False, engine_group="colibri-core") for case in cases]
+        self.assertEqual({key for tune in core for key in tune},
+                         {"DRAFT", "PIPE", "COLI_CUDA_PIPE", "COLI_NUMA",
+                          "_numa_hint", "PIN_GB"})
+        groups = {family.engine_group for family in all_families()} - {"colibri-core"}
+        self.assertIn("qwen36", groups)
+        for group in sorted(groups):
+            for case in cases:
+                with self.subTest(engine_group=group, case=case[:2]):
+                    self.assertEqual(_auto_tune(*case, False, engine_group=group), {})
+
+    def test_sibling_plan_advises_no_colibri_knob(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        olmoe = Path(other.name)
+        (olmoe / "config.json").write_text(json.dumps({
+            "model_type": "olmoe", "num_hidden_layers": 2, "hidden_size": 32,
+            "num_attention_heads": 4, "num_key_value_heads": 4,
+            "num_experts": 2, "num_experts_per_tok": 2,
+            "intermediate_size": 16, "vocab_size": 100,
+        }))
+        write_shard(olmoe / "model.safetensors", [
+            ("model.embed_tokens.weight", 100),
+            ("model.layers.0.mlp.experts.0.gate_proj.weight", 30),
+            ("model.layers.0.mlp.experts.1.gate_proj.weight", 30),
+        ])
+        glm = build_plan(self.model, context=32, available_memory=32 * GB,
+                         available_disk=1, gpus=[], cpu_sockets=1)
+        self.assertEqual(set(glm["tune"]), {"DRAFT", "PIN_GB"})
+        plan = build_plan(olmoe, context=32, available_memory=32 * GB,
+                          available_disk=1, gpus=[], cpu_sockets=1)
+        self.assertEqual(plan["bottleneck_class"], glm["bottleneck_class"])
+        self.assertEqual(plan["tune"], {})
+        self.assertNotIn("auto-tune:", format_plan(plan))
+        env = environment_for_plan(plan, {})
+        for key in ("DRAFT", "PIPE", "COLI_CUDA_PIPE", "COLI_NUMA", "PIN_GB"):
+            self.assertNotIn(key, env)
+
     def test_cpu_socket_count_is_positive(self):
         self.assertGreaterEqual(cpu_socket_count(), 1)
 

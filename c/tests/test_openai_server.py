@@ -363,6 +363,16 @@ class TemplateTest(unittest.TestCase):
             generation_options({"response_format": {"type": "yaml"}}, 8)
         with self.assertRaises(APIError):
             generation_options({"response_format": {"type": "json_schema", "json_schema": {}}}, 8)
+        # a json_schema that is not an object is the client's mistake too: a 400
+        # naming the parameter, not an AttributeError the handler turns into a
+        # 500 "engine failed" (which OpenAI SDKs retry)
+        for json_schema in ('{"schema": {}}', [schema], 5, True):
+            with self.subTest(json_schema=json_schema):
+                with self.assertRaises(APIError) as caught:
+                    generation_options({"response_format": {"type": "json_schema",
+                                                            "json_schema": json_schema}}, 8)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.param, "response_format")
         with self.assertRaises(APIError):   # non-dict response_format
             generation_options({"response_format": "json"}, 8)
         with self.assertRaises(APIError):   # empty gbnf
@@ -1505,6 +1515,30 @@ class HTTPTest(unittest.TestCase):
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
 
+    def test_unpaired_surrogate_is_a_client_error(self):
+        """JSON can spell a lone UTF-16 surrogate ("\\ud83d": a client that cut a
+        string between the two halves of an emoji). json.loads accepts it, no
+        UTF-8 can carry it, and Engine.generate's first step, prompt.encode(),
+        raised: HTTP 500 "The colibri engine failed". Invalid UTF-8 in the raw
+        body is already a 400; this is the same invalid text, escaped."""
+        real_generate = self.engine.generate
+
+        def encoding_generate(prompt, *args, **kwargs):
+            prompt.encode("utf-8")          # what Engine.generate does before anything else
+            return real_generate(prompt, *args, **kwargs)
+
+        cut = "emoji \ud83d"
+        cases = (("/v1/chat/completions", {"messages": [{"role": "user", "content": cut}]}),
+                 ("/v1/completions", {"prompt": cut}),
+                 ("/v1/messages", {"max_tokens": 4, "messages": [{"role": "user", "content": cut}]}))
+        with patch.object(self.engine, "generate", side_effect=encoding_generate):
+            for path, body in cases:
+                with self.subTest(path=path):
+                    with self.assertRaises(HTTPError) as caught:
+                        self.request(path, dict(body, model="test-model"))
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+
 
 class ClientHangupTest(unittest.TestCase):
     """A client that disconnects mid-response must not print a traceback.
@@ -2042,6 +2076,44 @@ class ThinkingSplitUnitTest(unittest.TestCase):
         with patch("openai_server.ARCH", "glm"):
             self.assertFalse(srv.starts_in_reasoning(False),
                              "GLM-5.2 closes the block in the prompt when thinking is off")
+
+    def test_glm53_bare_tool_call_turn_matches_what_the_model_wrote(self):
+        """#1576: a replayed assistant turn has to be the tokens the model made.
+
+        The official template writes "\\n<tool_call>" and GLM-5.3 does not: on a
+        turn that is nothing but a tool call it writes "</think><tool_call>".
+        Rendering the newline anyway put one extra token into the replayed
+        prefix, and the reuse gate in glm53.c is all-or-nothing, so the entire
+        cached prefix went and the turn re-prefilled from scratch. The reporter
+        measured twenty minutes of it on a 3k-token agent history.
+
+        The turn that also carries text keeps its newline, and that is not an
+        oversight: there the model's own trailing newline is stripped and put
+        back, the tokens line up, and it is the case that works today.
+        """
+        import openai_server as srv
+        bare = srv.render_chat_glm53([
+            {"role": "user", "content": "list the files"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"type": "function",
+                             "function": {"name": "bash",
+                                          "arguments": '{"command": "ls"}'}}]},
+            {"role": "tool", "content": "a.txt"},
+        ])
+        self.assertIn("</think><tool_call>bash", bare,
+                      "a bare tool call must follow </think> with no newline")
+        self.assertNotIn("</think>\n<tool_call>", bare)
+
+        with_text = srv.render_chat_glm53([
+            {"role": "user", "content": "list the files"},
+            {"role": "assistant", "content": "Let me look.",
+             "tool_calls": [{"type": "function",
+                             "function": {"name": "bash",
+                                          "arguments": '{"command": "ls"}'}}]},
+            {"role": "tool", "content": "a.txt"},
+        ])
+        self.assertIn("Let me look.\n<tool_call>bash", with_text,
+                      "a turn with text keeps the separator it already had")
 
     def test_missing_close_tag_surfaces_reasoning(self):
         self.assertEqual(split_thinking_reply("thought with no end"),

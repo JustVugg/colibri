@@ -69,7 +69,7 @@ except ModuleNotFoundError:
         _version = "unknown"
 
 from family_registry import (FamilyConfigError, UnknownFamilyError, all_families,
-                             family_by_id, family_for_config, resolve_model,
+                             display_for, family_by_id, family_for_config, resolve_model,
                              tuning_replay_prompt)
 
 _TUNE_ROTATION_PROMPT = (
@@ -190,9 +190,16 @@ def model_banner_line(model):
     except (OSError, ValueError, TypeError):
         return generic
     kind = (cfg.get("model_type") or "").lower()
+    geometry = cfg
     try:
-        family = resolve_model(model).descriptor
-        name, scale = family.display_name, family.display_scale
+        resolved = resolve_model(model)
+        family = resolved.descriptor
+        # Size-aware: a family's model_type can span checkpoints an order of
+        # magnitude apart (Qwen3.6-35B and Qwen3.8-2.4T both resolve to
+        # qwen36). display_for names the geometry actually on disk, and
+        # falls back to the model_type when it recognises none.
+        name, scale = display_for(resolved)
+        geometry = resolved.family_config
         # display_scale e' la taglia del checkpoint di riferimento. Un REAP ha
         # lo stesso model_type e meno esperti: "284B" su un 150B e' #1367
         # di nuovo. Quando la geometria non e' quella del riferimento si
@@ -206,10 +213,11 @@ def model_banner_line(model):
         scale = ""
 
     bits = [name]
+    experts = geometry.get("n_routed_experts") or geometry.get("num_experts")
     if scale:
-        bits.append(f"{scale} MoE" if cfg.get("n_routed_experts") else scale)
+        bits.append(f"{scale} MoE" if experts else scale)
     else:
-        layers, experts = cfg.get("num_hidden_layers"), cfg.get("n_routed_experts")
+        layers = geometry.get("num_hidden_layers")
         if layers and experts:
             bits.append(f"{layers}L x {experts}E MoE")
         elif layers:
@@ -544,7 +552,7 @@ def env_for_engine(a, arch, plan=None):
             if arch == "deepseek_v4":
                 if not dsv4_cuda_available(a.model):
                     sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} {dsv4_cuda_build_hint()}")
-            elif not cuda_binary():
+            elif not cuda_binary(engine_for_gpu_check(a)):
                 sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} the engine binary is CPU-only")
             env["COLI_CUDA"] = "1"
             if gpu != "auto":
@@ -554,7 +562,7 @@ def env_for_engine(a, arch, plan=None):
         if arch == "deepseek_v4":
             if not dsv4_cuda_available(a.model):
                 sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} {dsv4_cuda_build_hint()}")
-        elif not cuda_binary():
+        elif not cuda_binary(engine_for_gpu_check(a)):
             sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
         env["COLI_CUDA"] = "1"
         env["CUDA_EXPERT_GB"] = str(vram)
@@ -607,8 +615,11 @@ def dsv4_cuda_available(model=None):
     # not make a CPU engine look GPU-capable.
     eng = engine_for(model) if model else GLM
     if sys.platform == "win32":
-        dll = os.path.join(os.path.dirname(eng), "coli_cuda_dsv4.dll")
-        return os.path.exists(dll)
+        # backend_loader_dsv4.c tries the DeepGEMM build first and the generic
+        # one second, so either next to the engine starts the tier (the same
+        # two names `coli doctor` accepts).
+        return any(os.path.exists(os.path.join(os.path.dirname(eng), name))
+                   for name in ("coli_cuda_dsv4_dg.dll", "coli_cuda_dsv4.dll"))
     if sys.platform == "linux" and os.path.exists(eng):
         try:
             linked = subprocess.run(["ldd", eng], capture_output=True, text=True, timeout=3)
@@ -636,11 +647,24 @@ def need_worker_model(model):
                   build=f"make -C c {family.build_target}")
     return engine
 
-def cuda_binary():
-    if not os.path.exists(GLM): return False
+def engine_for_gpu_check(a):
+    """The family's engine path for cuda_binary(), or None (the GLM default)
+    when the model cannot be resolved here: the check must not turn a missing
+    config.json into a different error than the one need_model() gives."""
+    model = getattr(a, "model", None)
+    if not model: return None
+    try: return engine_for(model)
+    except (FamilyConfigError, UnknownFamilyError, OSError): return None
+
+def cuda_binary(engine=None):
+    """Was `engine` (default: the GLM binary) built with the GPU backend?
+    Callers that know the family pass its engine: checking colibri.exe for a
+    qwen36 run refused --gpu on a correct qwen36 CUDA build (#1533)."""
+    engine = engine or GLM
+    if not os.path.exists(engine): return False
     if sys.platform == "linux":
         try:
-            linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
+            linked=subprocess.run(["ldd",engine],capture_output=True,text=True,timeout=3)
             # Detect both CUDA (libcudart) and HIP (libamdhip64) builds.
             return any(("libcudart" in line or "libamdhip64" in line) and "not found" not in line
                        for line in linked.stdout.splitlines())
@@ -652,9 +676,9 @@ def cuda_binary():
         # marker string baked into glm.c's #ifdef COLI_CUDA block instead, and require
         # coli_cuda.dll to actually sit next to glm.exe (else CUDA init fails at startup).
         try:
-            with open(GLM,"rb") as f: built=b"[CUDA] mode: routed experts" in f.read()
+            with open(engine,"rb") as f: built=b"[CUDA] mode: routed experts" in f.read()
         except OSError: return False
-        return built and os.path.exists(os.path.join(os.path.dirname(GLM),"coli_cuda.dll"))
+        return built and os.path.exists(os.path.join(os.path.dirname(engine),"coli_cuda.dll"))
     return False
 
 def resource_request(a, env):
@@ -1019,7 +1043,7 @@ def engine_diag(p, errlog=None):
         try:
             errlog.flush()
             for _ in range(20):         # il drain thread scrive su errlog quando il child chiude
-                tail=open(errlog.name).read().strip()
+                tail=open(errlog.name, encoding="utf-8", errors="replace").read().strip()
                 if tail: break
                 time.sleep(0.05)
             if tail: print(f"  {C.dgray}" + "\n  ".join(tail.splitlines()[-6:]) + f"{C.r}")
@@ -1322,9 +1346,13 @@ def cmd_run(a):
         # emits the answer and exits cleanly. No reason to spin up the gateway
         # for a single non-interactive prompt.
         e=env_for_engine(a,arch)
+        # The engine tokenizes the bytes it reads as UTF-8. A text-mode pipe
+        # would encode the prompt in the locale's code page instead: a
+        # UnicodeEncodeError on cp949/cp932 or the C locale, garbled bytes on
+        # cp1252. Hand it the bytes, like the V4 path's UTF-8 prompt file.
         result=subprocess.run(
             [engine, str(cap_for_launch(a.cap,e,16)), "8"],
-            input=prompt+"\n", text=True, env=e, check=False)
+            input=(prompt+"\n").encode("utf-8"), env=e, check=False)
         sys.exit(result.returncode)
     # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
     # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
@@ -1664,7 +1692,11 @@ def cmd_chat(a):
     need_model(a.model)
     banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}", model=a.model)
     kv_resume_notice(a.model)
-    errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
+    # UTF-8, not the locale's code page: the engine writes "·" and "—", which
+    # cp932/cp949 and the C locale cannot encode. The drain thread below
+    # caught that UnicodeEncodeError (a ValueError) and stopped, and once
+    # nobody read the pipe the engine blocked on its next [prefill] line.
+    errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False, encoding="utf-8")
     e=env_for(a); e["SERVE"]="1"
     # stderr -> PIPE, NOT stderr=errlog (file). On Windows/MinGW, pointing the
     # child's stderr at a file/DEVNULL handle stalls the CRT so stdout (the byte
@@ -1722,7 +1754,7 @@ def cmd_chat(a):
                     _preamble.decode("utf-8","replace"))
     if mload: print(f"  {C.grn}✓{C.r} ready in {mload.group(1)}s {C.dim}· resident {float(mload.group(2))/1000:.1f} GB · RSS {st.get('rss','?')} GB{C.r}")
     try:
-        elog=open(errlog.name).read()
+        elog=open(errlog.name, encoding="utf-8", errors="replace").read()
         for l in elog.splitlines():                     # una riga di stato per riga, senza path
             # [METAL]/[CUDA] first: the splash tagline (model_banner_line) names the
             # checkpoint, not the backend — this engine line is the only confirmation
@@ -1763,7 +1795,7 @@ def cmd_chat(a):
             state={"first":True}
             def prefill_tick(path=errlog.name):
                 try:
-                    with open(path) as f:
+                    with open(path, encoding="utf-8", errors="replace") as f:
                         f.seek(max(0, os.path.getsize(path)-1500)); tail=f.read()
                     pl=[l for l in tail.splitlines() if l.startswith("[prefill]")]
                     return pl[-1].replace("[prefill] ","prefill ") if pl else ""
