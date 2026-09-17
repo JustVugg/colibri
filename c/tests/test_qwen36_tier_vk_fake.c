@@ -146,6 +146,15 @@ int main(void) {
     check(qt_lmhead_matmul(ly, lx, 16, 8) == 0, "qt_lmhead_matmul must return 0 on Vulkan");
     check(fake_vk_uploads == before, "the trunk refusal must not touch the backend");
 
+    /* Same mechanism, addressed by a handle instead of a name: the generic
+     * dense matrices must refuse here too, or a Vulkan build calls into
+     * backend_cuda. qt_dense_init returns a handle >= 0 on success. */
+    check(qt_dense_init(lmq, lms, 16, 8, 0) < 0, "qt_dense_init must refuse on Vulkan");
+    check(qt_dense_count() == 0, "a refused dense handle must not be registered");
+    float dy[8];
+    check(qt_dense_matmul(0, dy, lx, 16, 8) == 0, "qt_dense_matmul must return 0 on Vulkan");
+    check(fake_vk_uploads == before, "the dense refusal must not touch the backend either");
+
     /* ---- 7. shutdown -------------------------------------------------- */
     qt_shutdown();
     check(fake_vk_shutdowns == 1, "coli_vk_shutdown should be called exactly once");
