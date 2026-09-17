@@ -3,6 +3,7 @@
 
 import json
 import os
+import platform
 import re
 import shutil
 import statistics
@@ -13,6 +14,7 @@ from pathlib import Path
 
 from family_registry import (expert_contributions, planner_geometry,
                              fixed_resident_contribution, resident_contribution,
+                             trunk_contribution,
                              resolve_model)
 
 
@@ -25,7 +27,7 @@ EXPERT_RE = re.compile(r"(?:model\.)?layers\.(\d+)\.(?:mlp|ffn)\.experts\.(\d+)\
 # sidecar and self-invalidate on any change. Best-effort: any read/write failure falls
 # straight back to a full recompute (see analyze_model). Sits alongside .coli_usage/.coli_ssd.
 _ANALYSIS_CACHE_NAME = ".coli_analysis.json"
-_ANALYSIS_CACHE_VERSION = 7
+_ANALYSIS_CACHE_VERSION = 8
 
 
 def _dense_in_ram(descriptor, on_disk_bytes):
@@ -119,6 +121,9 @@ def analyze_model(model):
     # number of per-layer cache slots. Qwen3.8's native FP8 path uses this for
     # its normalized scale bank; fallback accounting remains conservative.
     expert_fixed_bytes = 0
+    # What the engine's GPU trunk offload would put in VRAM (int8), for the
+    # families that have one; taken out of the VRAM budget before experts.
+    trunk_int8_bytes = 0
     expert_groups = {}
     tensor_names = set()
     for shard in shards:
@@ -148,6 +153,8 @@ def analyze_model(model):
                     expert_fixed_bytes += fixed_bytes
                 else:
                     dense_bytes += resident_contribution(
+                        resolved, name, size, dtype)
+                    trunk_int8_bytes += trunk_contribution(
                         resolved, name, size, dtype)
 
     layer_sizes = {}
@@ -191,6 +198,7 @@ def analyze_model(model):
         "dense_bytes": _dense_in_ram(resolved.descriptor, dense_bytes),
         "dense_disk_bytes": dense_bytes,
         "expert_fixed_bytes": expert_fixed_bytes,
+        "trunk_int8_bytes": trunk_int8_bytes,
         "expert_bytes": sum(expert_groups.values()),
         "expert_count": len(expert_groups),
         "expert_layers": len(per_layer),
@@ -328,6 +336,17 @@ def memory_available():
         except (OSError, subprocess.SubprocessError, ValueError):
             pass
     return 0
+
+
+def _host_unified_memory():
+    """Whether the host itself exposes one CPU/GPU physical memory pool.
+
+    This is intentionally separate from accelerator placement.  A CPU-only
+    engine such as glm53 still runs on unified-memory Apple Silicon, but that
+    fact must not fabricate a VRAM tier or make an unrelated GPU steer cache
+    placement.
+    """
+    return sys.platform == "darwin" and platform.machine().lower() in ("arm64", "aarch64")
 
 
 # Strict .coli_ssd grammar -- the byte-for-byte mirror of colibri.c's
@@ -795,11 +814,20 @@ def cpu_socket_count():
     return 1
 
 
-def _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets, plan_has_metal):
+def _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets, plan_has_metal,
+               engine_group=None):
     """Derive tuning knobs from the bottleneck classification."""
     tune = {}
     has_gpu = bool(gpus)
     n_gpu = len(gpus)
+
+    # glm53 has its own loader/cache controls and does not consume the generic
+    # DRAFT/PIPE/PIN/NUMA knobs below. Recommending them is worse than leaving
+    # them unset because `coli tune` then reports changes the engine ignores.
+    # The same holds for every engine but colibri.c: DRAFT, PIPE, COLI_CUDA_PIPE,
+    # COLI_NUMA and PIN_GB have no reader anywhere else.
+    if engine_group is not None and engine_group != "colibri-core":
+        return tune
 
     # MTP: costs more than it saves when compute-bound (#389 measured 42% loss)
     # or streaming-bound (#467 measured 32% loss under CUDA at 85% hit).
@@ -950,7 +978,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     # plans_placement().
     planning_gpus = [gpu for gpu in gpus if plans_placement(gpu)]
 
-    unified = any(gpu.get("unified_memory", False) for gpu in planning_gpus)
+    placement_unified = any(gpu.get("unified_memory", False)
+                            for gpu in planning_gpus)
+    unified = placement_unified or _host_unified_memory()
     typical = info["typical_expert_bytes"]
     max_expert = info["max_expert_bytes"] or typical
     kv_bytes = (geometry.context_state_bytes + geometry.fixed_state_bytes) * kv_slots
@@ -972,19 +1002,29 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         safe_vram += usable
         gpu_plan.append(dict(gpu, reserve_bytes=reserve, usable_bytes=usable))
     requested_vram = int(vram_gb * GB) if vram_gb > 0 else safe_vram
+    # The engine's placer (qwen36_tier.c, COLI_PLACE=auto) takes the dense
+    # trunk first -- it is read every token -- on the first planned device,
+    # if it fits that device's allowance; the experts get what is left.
+    trunk_bytes = int(info.get("trunk_int8_bytes", 0) or 0)
+    trunk_placed = 0
+    if trunk_bytes and gpu_plan and gpu_plan[0]["usable_bytes"] >= trunk_bytes \
+            and requested_vram >= trunk_bytes:
+        trunk_placed = trunk_bytes
+    requested_vram = max(0, requested_vram - trunk_placed)
+    safe_vram = max(0, safe_vram - trunk_placed)
     requested_vram_before_clamp = requested_vram
     unified_pool = max(0, available_memory - info["dense_bytes"] - runtime_bytes)
-    if unified:
+    if placement_unified:
         # Unified devices expose one physical pool to CUDA and the host. Do not
         # let an expert tier consume pages that the RAM tier also believes are
         # available. Dense/runtime reservations are shared exactly once below.
         requested_vram = min(requested_vram, unified_pool)
-    vram_limit = unified_pool if unified else safe_vram
+    vram_limit = unified_pool if placement_unified else safe_vram
     vram_budget = min(requested_vram, vram_limit, info["expert_bytes"])
     vram_experts = int(vram_budget // typical) if typical else 0
     hot_bytes = min(info["expert_bytes"], vram_experts * typical)
     warnings = []
-    if unified:
+    if placement_unified:
         requested_ram = int(ram_gb * GB) if ram_gb > 0 else int(available_memory * 0.88)
         requested_ram_experts = max(0, requested_ram - info["dense_bytes"] - runtime_bytes)
         ram_expert_bytes = min(requested_ram_experts,
@@ -997,7 +1037,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     else:
         ram_budget = int(ram_gb * GB) if ram_gb > 0 else int(available_memory * 0.88)
     if ram_budget < 4 * GB:
-        ram_budget = 8 * GB if not unified else max(0, ram_budget)
+        ram_budget = 8 * GB if not placement_unified else max(0, ram_budget)
     cache_bytes = max(0, ram_budget - info["dense_bytes"] - runtime_bytes)
     cap = int(cache_bytes // per_cap) if per_cap else 0
     if configured_experts:
@@ -1017,7 +1057,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                 f"GPU {gpu['index']} ({gpu['name']}) was detected but its free memory is "
                 "not qualified as a placement budget on this platform; it is reported "
                 "only and drives no automatic tier")
-    if unified:
+    if placement_unified:
         warnings.append(
             "GPU and RAM share one physical memory pool; budgets were jointly constrained")
     # The plan sizes the hot tier from *free* VRAM, so running it while an engine
@@ -1058,7 +1098,8 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         bottleneck_class = "memory"
 
     tune = _auto_tune(bottleneck_class, projected_hit, planning_gpus, cpu_sockets,
-                      plan_has_metal=False)
+                      plan_has_metal=False,
+                      engine_group=resolved.descriptor.engine_group)
     probe_state, probe_gbs = ssd_probe_state(info["path"])
     actions = _next_actions(bottleneck_class, projected_hit, probe_state,
                             probe_gbs, planning_gpus)
@@ -1090,6 +1131,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                     "warm_expert_bytes": warm_bytes, "cache_slots_per_layer": cap},
             "vram": {"role": "hot-experts", "devices": gpu_plan,
                      "budget_bytes": vram_budget, "hot_expert_bytes": hot_bytes,
+                     "trunk_bytes": trunk_placed,
                      "expert_capacity": vram_experts, "requires_host_backing": False},
         },
         "expected_bottleneck": bottleneck,
@@ -1099,7 +1141,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         "next_actions": actions,
         # Un motore solo-CPU non ha un tier VRAM: annunciarlo comunque fa
         # scrivere al piano una riga che nessuno puo' eseguire.
-        "decisions": ([{"target": "VRAM", "reason": "profile-ranked hot experts"}]
+        "decisions": ([{"target": "VRAM", "reason": "dense trunk as int8 residents"}]
+                      if trunk_placed else []) +
+                     ([{"target": "VRAM", "reason": "profile-ranked hot experts"}]
                       if resolved.descriptor.supports_accelerator else []) + [
             {"target": "RAM", "reason": "warm experts execute on CPU without quality loss"},
             {"target": "Disk", "reason": "immutable recovery source for cold experts"},
@@ -1201,7 +1245,9 @@ def format_plan(plan):
             f"{gpu['index']}:{gpu['name']}"
             + ("" if plans_placement(gpu) else " (identity only)")
             for gpu in vram["devices"])
-        lines.append(f"VRAM   {format_bytes(vram['budget_bytes'])} hot tier · "
+        trunk = vram.get("trunk_bytes", 0)
+        lines.append("VRAM   " + (f"{format_bytes(trunk)} int8 trunk + " if trunk else "") +
+                     f"{format_bytes(vram['budget_bytes'])} hot tier · "
                      f"~{vram['expert_capacity']} experts · {names}")
     else:
         # Backend-neutral, matching the accelerator wording #903 settled on:

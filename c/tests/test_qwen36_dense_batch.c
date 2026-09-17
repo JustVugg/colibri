@@ -7,6 +7,8 @@
 #include "../qwen36.c"
 #undef main
 
+#include "../compat.h"   /* setenv/unsetenv: MinGW has neither */
+
 static int failures;
 #define CHECK(cond, ...) do { if (!(cond)) { \
     fprintf(stderr,"FAIL %s:%d: ",__FILE__,__LINE__); \
@@ -46,21 +48,6 @@ static void one_shape(int S, int I, int O) {
     free(x);free(q);free(sc);free(ref);free(got);
 }
 
-static void env_set(const char *name,const char *value) {
-#ifdef _WIN32
-    _putenv_s(name,value);
-#else
-    setenv(name,value,1);
-#endif
-}
-static void env_unset(const char *name) {
-#ifdef _WIN32
-    _putenv_s(name,"");
-#else
-    unsetenv(name);
-#endif
-}
-
 static void clear_qdw(void) {
     for(int i=0;i<g_qdw_n;i++){free(g_qdw[i].q);free(g_qdw[i].sc);}
     g_qdw_n=0;
@@ -81,14 +68,14 @@ static void shared_case(const char *format,int quantized) {
     float *g=falloc(I),*u=falloc(I),*hh=falloc(D);
     for(int64_t i=0;i<(int64_t)S*D;i++){x[i]=input_value(i,6);seed[i]=input_value(i,7);}
 
-    memcpy(ref,seed,(size_t)S*D*sizeof(float));env_set("QWEN_SHARED_BATCH","0");
-    env_set("QWEN_DENSE_BATCH","0");g_qwen_matmul_d_calls=0;
+    memcpy(ref,seed,(size_t)S*D*sizeof(float));setenv("QWEN_SHARED_BATCH","0",1);
+    setenv("QWEN_DENSE_BATCH","0",1);g_qwen_matmul_d_calls=0;
     qwen_shared_experts_cpu(&m,&l,x,S,ref,g,u,hh);
     CHECK(g_qwen_matmul_d_calls==(uint64_t)S*3,"%s scalar calls=%llu expected=%d",format,
           (unsigned long long)g_qwen_matmul_d_calls,S*3);
 
-    memcpy(got,seed,(size_t)S*D*sizeof(float));env_unset("QWEN_SHARED_BATCH");
-    env_unset("QWEN_DENSE_BATCH");g_qwen_matmul_d_calls=0;
+    memcpy(got,seed,(size_t)S*D*sizeof(float));unsetenv("QWEN_SHARED_BATCH");
+    unsetenv("QWEN_DENSE_BATCH");g_qwen_matmul_d_calls=0;
     qwen_shared_experts_cpu(&m,&l,x,S,got,g,u,hh);
     CHECK(!memcmp(ref,got,(size_t)S*D*sizeof(float)),"%s shared batch is not scalar bit-exact",format);
     CHECK(g_qwen_matmul_d_calls==3,"%s batch calls=%llu expected=3",format,
@@ -107,14 +94,14 @@ static void shared_case(const char *format,int quantized) {
 
 int main(void) {
     /* This gate owns the dense-int8 mode regardless of the caller's shell. */
-    env_unset("COLI_DENSE_I8");
+    unsetenv("COLI_DENSE_I8");
     one_shape(1, 17, 13);       /* decode-shaped fallback */
     one_shape(2, 32, 31);       /* one vector block, one row pair */
     one_shape(4, 64, 73);       /* even prompt, serial OpenMP clause */
     one_shape(5, 67, 259);      /* odd prompt + scalar tail + parallel clause */
     shared_case("f32",0);
     shared_case("int8",1);
-    env_unset("QWEN_SHARED_BATCH");env_unset("QWEN_DENSE_BATCH");
+    unsetenv("QWEN_SHARED_BATCH");unsetenv("QWEN_DENSE_BATCH");
     if(failures){fprintf(stderr,"qwen dense batch: %d failure(s)\n",failures);return 1;}
     puts("qwen dense batch: ok");return 0;
 }

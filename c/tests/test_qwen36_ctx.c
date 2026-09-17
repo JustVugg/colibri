@@ -21,28 +21,9 @@
 #include "../qwen36.c"
 #undef main
 
+#include "../compat.h"   /* setenv/unsetenv: MinGW has neither */
+
 static int fails = 0;
-
-/* Same pattern as test_omp_tune.c / test_stops.c, and for the same reason:
- * compat.h maps setenv() to SetEnvironmentVariableA, which updates the Win32
- * environment block -- but getenv() reads the CRT's own copy and never sees
- * it, so the value under test would silently not arrive. _putenv_s updates
- * the copy getenv() reads. */
-static void env_set(const char *name, const char *value) {
-#ifdef _WIN32
-    _putenv_s(name, value);
-#else
-    setenv(name, value, 1);
-#endif
-}
-
-static void env_unset(const char *name) {
-#ifdef _WIN32
-    _putenv_s(name, "");
-#else
-    unsetenv(name);
-#endif
-}
 
 static void ck(int cond, const char *what) {
     if (cond) { printf("  ok   %s\n", what); return; }
@@ -134,12 +115,12 @@ static void case_ceiling(void) {
     ck(1, "every thread's score row holds max_t entries");
 
     /* Q36_MAXT may lower the ceiling but never raise it past the capacity. */
-    env_set("Q36_MAXT", "999999999");
+    setenv("Q36_MAXT", "999999999", 1);
     ck(qwen36_max_ctx() == QWEN36_ATTN_MAX_CTX,
        "Q36_MAXT cannot be raised past the capacity");
-    env_set("Q36_MAXT", "4096");
+    setenv("Q36_MAXT", "4096", 1);
     ck(qwen36_max_ctx() == 4096, "Q36_MAXT can lower the ceiling");
-    env_unset("Q36_MAXT");
+    unsetenv("Q36_MAXT");
     ck(qwen36_max_ctx() == QWEN36_DEFAULT_MAX_CTX,
        "unset Q36_MAXT falls back to the conservative default");
 }

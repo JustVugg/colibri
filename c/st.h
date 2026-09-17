@@ -427,7 +427,70 @@ static const char *st_fmt_stamp(shards *S, const char *name) {
     return NULL;
 }
 
+/* model.safetensors.index.json, consulted only when two indexed shards carry the
+ * same tensor name. Checkpoints distributed with an "overlay" shard (a community
+ * abliteration, say) keep the superseded tensors physically in the base shards
+ * and let the index say which copy is authoritative; HF transformers honours
+ * the index, and refusing the directory outright (#1479) made such checkpoints
+ * unloadable without rewriting their shards. Loaded lazily: a clean container
+ * never pays the parse (the Qwen3.8 index alone is 17 MB), and a container
+ * without an index keeps the old refusal, because then nothing says which
+ * bytes a name should resolve to. */
+typedef struct { jval *root, *map; char *arena; int *h; int hcap; int tried; } st_index;
+
+static const char *st_basename(const char *p) {
+    const char *b = strrchr(p, '/');
+#ifdef _WIN32
+    const char *b2 = strrchr(p, '\\');
+    if (b2 && (!b || b2 > b)) b = b2;
+#endif
+    return b ? b + 1 : p;
+}
+static void st_index_load(st_index *ix, const char *dir) {
+    if (ix->tried) return;
+    ix->tried = 1;
+    char path[1200]; snprintf(path, sizeof(path), "%s/model.safetensors.index.json", dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
+    if (size <= 0 || size > (256l << 20)) { fclose(f); return; }
+    char *text = malloc((size_t)size + 1);
+    if (!text || fread(text, 1, (size_t)size, f) != (size_t)size) { free(text); fclose(f); return; }
+    text[size] = 0; fclose(f);
+    ix->root = json_parse(text, &ix->arena);
+    free(text);
+    jval *map = ix->root ? json_get(ix->root, "weight_map") : NULL;
+    if (!map || map->t != J_OBJ) { json_free(ix->root); ix->root = NULL; free(ix->arena); ix->arena = NULL; return; }
+    ix->map = map;
+    ix->hcap = 1; while (ix->hcap < map->len * 2) ix->hcap <<= 1;
+    ix->h = malloc((size_t)ix->hcap * sizeof(int));
+    if (!ix->h) { fprintf(stderr, "OOM indexing model.safetensors.index.json\n"); exit(1); }
+    for (int i = 0; i < ix->hcap; i++) ix->h[i] = -1;
+    for (int i = 0; i < map->len; i++) {
+        uint64_t hh = st_hash(map->keys[i]) & (ix->hcap - 1);
+        while (ix->h[hh] >= 0) hh = (hh + 1) & (ix->hcap - 1);
+        ix->h[hh] = i;
+    }
+}
+/* the shard basename the index declares for `name`, or NULL (no index, or name absent) */
+static const char *st_index_shard(st_index *ix, const char *name) {
+    if (!ix->map) return NULL;
+    uint64_t hh = st_hash(name) & (ix->hcap - 1);
+    while (ix->h[hh] >= 0) {
+        int i = ix->h[hh];
+        if (!strcmp(ix->map->keys[i], name))
+            return ix->map->kids[i]->t == J_STR ? ix->map->kids[i]->str : NULL;
+        hh = (hh + 1) & (ix->hcap - 1);
+    }
+    return NULL;
+}
+static void st_index_free(st_index *ix) {
+    json_free(ix->root); free(ix->arena); free(ix->h);
+    memset(ix, 0, sizeof(*ix));
+}
+
 /* Scan one directory for *.safetensors shards, appending to files[] (dedup by
+
  * basename, so a list of directories acts as a SEARCH PATH: the same shard
  * present on two drives is taken from the first-listed one only). *added
  * returns how many shards this dir contributed. */
@@ -512,6 +575,8 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
     for (int a = 0; a < nf; a++) for (int b = a+1; b < nf; b++)
         if (strcmp(files[a], files[b]) > 0) { char tmp[1024]; memcpy(tmp, files[a], 1024); memcpy(files[a], files[b], 1024); memcpy(files[b], tmp, 1024); }
 
+    st_index ix; memset(&ix, 0, sizeof(ix));
+    int n_overlay = 0;
     for (int fi = 0; fi < nf; fi++) {
         int fd = st_open_fd(S, files[fi]);
         int fidx = st_fidx(S, fd);
@@ -583,26 +648,45 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
             if (bad_shape) {
                 fprintf(stderr, "%s: tensor '%s' shape overflows int64 — refusing (hostile or corrupt file)\n",
                         files[fi], name); exit(1); }
-            /* Refuse if `name` was already indexed from an earlier shard (see the
-             * detector's block comment near the top of this function). Must run before
-             * this tensor is appended, and is intentionally NOT the same check as
-             * st_fmt_stamp_ingest's -- that one only ever sees the small subset of names a
-             * stamping tool chose to annotate; this one sees every tensor. */
+            /* `name` already indexed from an earlier shard? The checkpoint's own index
+             * decides: the copy the index maps the name to is read, the other one is
+             * ignored (an overlay shard superseding base-shard tensors, #1479). No index,
+             * or an index that names neither shard, keeps the refusal: a directory
+             * holding both would silently read one shard's bytes for this name while
+             * any __metadata__["colibri.fmt"] stamp for it still applies uniformly. This
+             * is intentionally NOT the same check as st_fmt_stamp_ingest's -- that one
+             * only ever sees the small subset of names a stamping tool chose to
+             * annotate; this one sees every tensor. */
+            int replace_idx = -1, skip = 0;
             {
                 uint64_t dh = st_hash(name) & (dup_cap - 1);
                 while (dup_idx[dh] >= 0) {
                     if (!strcmp(S->t[dup_idx[dh]].name, name)) {
-                        int prev_fidx = st_fidx(S, S->t[dup_idx[dh]].fd);
-                        fprintf(stderr, "%s: tensor '%s' is also indexed from shard '%s' -- duplicate "
-                                "tensor name across indexed shards, refusing (a directory holding both "
-                                "would silently read one shard's bytes for this name while any "
-                                "__metadata__[\"colibri.fmt\"] stamp for it still applies uniformly)\n",
-                                files[fi], name, prev_fidx >= 0 ? S->paths[prev_fidx] : "<unknown>");
-                        exit(1);
+                        int prev = dup_idx[dh];
+                        int prev_fidx = st_fidx(S, S->t[prev].fd);
+                        const char *prev_path = prev_fidx >= 0 ? S->paths[prev_fidx] : "<unknown>";
+                        st_index_load(&ix, snap_dir);
+                        const char *auth = st_index_shard(&ix, name);
+                        if (auth && !strcmp(auth, st_basename(files[fi]))) { replace_idx = prev; n_overlay++; }
+                        else if (auth && !strcmp(auth, st_basename(prev_path))) { skip = 1; n_overlay++; }
+                        else {
+                            fprintf(stderr, "%s: tensor '%s' is also indexed from shard '%s' -- duplicate "
+                                    "tensor name across indexed shards, refusing (a directory holding both "
+                                    "would silently read one shard's bytes for this name while any "
+                                    "__metadata__[\"colibri.fmt\"] stamp for it still applies uniformly).\n"
+                                    "  %s\n",
+                                    files[fi], name, prev_path,
+                                    ix.map ? (auth ? "model.safetensors.index.json maps it to a third shard; the index and the files disagree"
+                                                   : "model.safetensors.index.json does not list this tensor, so it cannot say which copy is authoritative")
+                                           : "no model.safetensors.index.json here to say which copy is authoritative; the checkpoint's index would resolve this");
+                            exit(1);
+                        }
+                        break;
                     }
                     dh = (dh + 1) & (dup_cap - 1);
                 }
             }
+            if (skip) continue;
             if (S->n == S->cap) {
                 S->cap *= 2;
                 st_tensor *nt = (st_tensor*)realloc(S->t, S->cap * sizeof(st_tensor));
@@ -623,14 +707,18 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
                 }
                 free(dup_idx); dup_idx = ndup; dup_cap = new_dup_cap;
             }
-            st_tensor *t = &S->t[S->n++];
+            st_tensor *t;
+            if (replace_idx >= 0) { t = &S->t[replace_idx]; free(t->name); }   /* overlay wins: same slot, new bytes */
+            else t = &S->t[S->n++];
             memset(t, 0, sizeof(*t));
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
             t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
             t->rank = shp->len;
             /* Register this name in the duplicate detector now that t->name is
-             * stable, so the next shard's scan (above) sees it. */
-            { uint64_t dh = st_hash(t->name) & (dup_cap - 1);
+             * stable, so the next shard's scan (above) sees it. A replaced entry
+             * is already registered at the same index. */
+            if (replace_idx < 0) {
+              uint64_t dh = st_hash(t->name) & (dup_cap - 1);
               while (dup_idx[dh] >= 0) dh = (dh + 1) & (dup_cap - 1);
               dup_idx[dh] = S->n - 1; }
             for (int k = 0; k < t->rank; k++) t->shape[k] = (int64_t)shp->kids[k]->num;
@@ -649,6 +737,10 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
         free(arena);
         free(hdr);
     }
+    if (n_overlay)
+        fprintf(stderr, "[st] %d tensor name(s) present in two shards, resolved by model.safetensors.index.json "
+                        "(the copy the index maps each name to is read, the other ignored)\n", n_overlay);
+    st_index_free(&ix);
     free(dup_idx);  /* duplicate detector: one-time-startup scratch, superseded by S->hidx below */
     /* indice hash costruito a fine indicizzazione (gli indici restano validi dopo i realloc) */
     S->hcap = 1; while (S->hcap < S->n * 2) S->hcap <<= 1;
@@ -743,6 +835,52 @@ static void st_die_missing(shards *S, const char *name) {
     else if (numbered > 0)
         fprintf(stderr, "  shards numbered %05d..%05d, %d file(s)%s\n", lo, hi, numbered,
                 numbered == hi - lo + 1 ? " (contiguous: a gap would be at the tail)" : " (GAPS in the numbering)");
+    /* The checkpoint's own index says more than a file count can: which shard
+     * should hold this name, whether that shard is here, and whether the name
+     * exists in this checkpoint at all. The last case is the one a file count
+     * gets exactly wrong: every shard present, and the tensor never existed,
+     * because the engine running here is not this checkpoint's engine (a
+     * directory copied without config.json, and the GLM default looking for
+     * model.embed_tokens.weight in a Qwen3.8 that stores it under
+     * model.language_model). */
+    {
+        char dir[1200]; snprintf(dir, sizeof dir, "%s", S->paths[0]);
+        char *slash = strrchr(dir, '/');
+#ifdef _WIN32
+        char *bs = strrchr(dir, '\\'); if (bs && (!slash || bs > slash)) slash = bs;
+#endif
+        if (slash) *slash = 0; else snprintf(dir, sizeof dir, ".");
+        st_index ix; memset(&ix, 0, sizeof ix);
+        st_index_load(&ix, dir);
+        if (ix.map) {
+            const char *auth = st_index_shard(&ix, name);
+            if (!auth) {
+                fprintf(stderr,
+                    "\n  model.safetensors.index.json does not list '%s': this checkpoint never had a\n"
+                    "  tensor by that name. The engine running here expects one, so it is not this\n"
+                    "  checkpoint's engine. coli picks the engine from config.json -- run\n"
+                    "  `coli info --model <dir>` and check the family it names; without a config.json\n"
+                    "  there is no family, and the files to copy next to the shards are config.json,\n"
+                    "  tokenizer.json and model.safetensors.index.json from the model repo.\n", name);
+            } else {
+                int present = 0;
+                for (int i = 0; i < S->nfd && !present; i++) present = !strcmp(st_basename(S->paths[i]), auth);
+                if (!present)
+                    fprintf(stderr,
+                        "\n  model.safetensors.index.json maps '%s' to %s, which is not in this\n"
+                        "  directory: that shard is MISSING. Fetch just that file:\n"
+                        "      hf download <repo> %s --local-dir <model-dir>\n", name, auth, auth);
+                else
+                    fprintf(stderr,
+                        "\n  model.safetensors.index.json maps '%s' to %s, which is here but whose\n"
+                        "  header does not declare it: the file is not the one the index describes (an\n"
+                        "  interrupted transfer that kept the name, or a shard from another revision of\n"
+                        "  the repo). Re-download that one shard and compare its size with the repo's.\n", name, auth);
+            }
+            st_index_free(&ix);
+            exit(1);
+        }
+    }
     /* Follow the evidence: telling someone who already has every declared shard to
      * re-download sends them round a loop that cannot help them. */
     if (complete) {
@@ -962,6 +1100,90 @@ static void st_read_range_raw_cap(shards *S, int fd, int64_t off,
     if(drop&&nbytes>0)posix_fadvise(fd,off,nbytes,POSIX_FADV_DONTNEED);
 }
 
+/* ---- replica-aware range read (multi-SSD streaming) ---------------------
+ * st_read_range_raw_cap serves the range from the primary copy and leaves the
+ * bytes in the page cache on the way through. An engine that streams large
+ * expert tensors wants two more things, and the mirror machinery above already
+ * knows where to find them:
+ *
+ *   - the range served by replica `rep` (0 = primary, 1..nrep = mirrors), so
+ *     independent drives can answer together instead of one behind another;
+ *   - that replica's O_DIRECT twin, because a large transient read that is
+ *     copied into the page cache and out again pays for the same bytes twice,
+ *     and an engine that reads them once does not want them cached at all.
+ *
+ * O_DIRECT constrains buffer address, file offset and length to the logical
+ * block size, and a safetensors range starts wherever the writer put it. The
+ * obvious fix -- bounce the range through an aligned scratch buffer -- adds one
+ * full copy of every expert byte to a workload where the disk is the point, so
+ * this instead expects the caller to reserve `off % ST_DIRECT_ALIGN` bytes of
+ * scratch BEHIND the destination and hand over the payload pointer. The window
+ * starting at the enclosing block boundary is then already aligned: one
+ * O_DIRECT pread carries the block-aligned bulk, one short buffered pread
+ * carries the sub-block tail, and the payload lands exactly where the caller
+ * asked for it with nothing to copy afterwards.
+ *
+ * ST_DIRECT_ALIGN is the slack a caller must add to each such buffer. The
+ * alignment is verified rather than assumed, and a caller that did not reserve
+ * the prefix -- or a platform with no O_DIRECT, or a replica without a twin --
+ * silently gets the buffered path. `direct` is the caller's own switch: 0 forces
+ * that path everywhere, which is what an engine exposes so the choice can be
+ * A/B'd on the hardware in front of it rather than argued about. */
+#define ST_DIRECT_ALIGN 4096
+
+/* One aligned pread, EINTR retried. Returns 0 only on a full transfer: O_DIRECT
+ * wants a block-aligned length, so a short read cannot be finished by simply
+ * asking for the rest -- the caller falls back to the buffered path instead. */
+static int st_pread_aligned_try(int fd, void *buf, int64_t n, int64_t off) {
+    for (;;) {
+        ssize_t r = pread(fd, buf, (size_t)n, (off_t)off);
+        if (r == n) return 0;
+        if (r < 0 && errno == EINTR) continue;
+        return -1;
+    }
+}
+
+static void st_read_range_rep(shards *S, int fd, int rep, int64_t off, int64_t nbytes,
+                              void *out, int64_t cap, int drop, int direct,
+                              const char *tag) {
+    int fidx = S ? st_fidx(S, fd) : -1;
+    if (fidx < 0) { fprintf(stderr, "replica range uses an unindexed shard fd\n"); exit(1); }
+    if (off < 0 || nbytes < 0 || cap < 0 || nbytes > cap ||
+        off > S->sizes[fidx] || nbytes > S->sizes[fidx] - off ||
+        (uint64_t)nbytes > SIZE_MAX) {
+        fprintf(stderr, "replica range [%lld,+%lld) exceeds file/destination bounds "
+                        "(file %lld, cap %lld) — refusing (untrusted container)\n",
+                (long long)off, (long long)nbytes, (long long)S->sizes[fidx], (long long)cap);
+        exit(1);
+    }
+    if (nbytes == 0) return;
+    if (!out) { fprintf(stderr, "replica range has a NULL destination\n"); exit(1); }
+    const char *label = tag && *tag ? tag : "pread replica range";
+    /* A partial mirror leaves this shard on the primary; so does a replica index
+     * that no longer exists. Either way the read is valid, just not split. */
+    int rfd = st_fd_rep(S, fd, rep);
+    if (rfd < 0) { rfd = fd; rep = 0; }
+    int64_t pad = off % ST_DIRECT_ALIGN;
+    uint8_t *window = (uint8_t *)out - pad;      /* the caller's reserved scratch */
+    int dfd = direct ? st_direct_fd_rep(S, fd, rep) : -1;
+    if (dfd >= 0 && ((uintptr_t)window & (uintptr_t)(ST_DIRECT_ALIGN - 1)) == 0 &&
+        pad + nbytes <= (int64_t)ST_PREAD_CHUNK) {
+        int64_t want = pad + nbytes;              /* bytes to fill, window-relative */
+        int64_t left = S->sizes[fidx] - (off - pad);
+        int64_t bulk = want & ~(int64_t)(ST_DIRECT_ALIGN - 1);
+        if (bulk > left) bulk = left & ~(int64_t)(ST_DIRECT_ALIGN - 1);
+        /* A device that refuses O_DIRECT costs the call some speed and never its
+         * correctness: the buffered path below reads exactly the same bytes. */
+        if (bulk > 0 && st_pread_aligned_try(dfd, window, bulk, off - pad) == 0) {
+            int64_t tail = want - bulk;
+            if (tail > 0) st_pread_full(rfd, window + bulk, tail, off - pad + bulk, label);
+            return;
+        }
+    }
+    st_pread_full(rfd, out, nbytes, off, label);
+    if (drop) posix_fadvise(rfd, off, nbytes, POSIX_FADV_DONTNEED);
+}
+
 /* Read-only view of one tensor's exact stored bytes.  Unlike st_read_raw this
  * performs no allocation or copy; unlike a naked mmap pointer it carries the
  * aligned OS view/handle required for cleanup.  Callers must still validate
@@ -1008,20 +1230,42 @@ static int st_map_experts_enabled(void) {
     return on;
 }
 
+/* Reached from parallel regions: glm53.c's `#pragma omp parallel for` over the
+ * batch calls expert_read -> st_map_shard_range -> here from every worker at
+ * once, and qwen38_core.h does the same. Two threads racing the plain version
+ * of this both saw g_st_shard_tried[fd] == 0, both mapped the file, and one
+ * leaked its mapping while a third could read g_st_shard_len[fd] as 0 through
+ * an already-published base -- st_map_shard_range then rejects every range for
+ * that shard. Latent only because COLI_MAP_EXPERTS is opt-in; #1350 proposes
+ * flipping that default.
+ *
+ * Lock-free rather than the mutex qwen38_core.h uses for its lazy HITS table,
+ * because st.h is also compiled into c/tools/check_glm53_container.c, whose
+ * documented build line is plain `gcc -O2 -std=gnu11 -Ic ... -lm` with neither
+ * -pthread nor -fopenmp. */
 static const uint8_t *st_shard_mapped(int fd) {
     if (fd < 0 || fd >= ST_MAX_MAPPED_FD || !st_map_experts_enabled()) return NULL;
-    if (g_st_shard_base[fd]) return g_st_shard_base[fd];
-    if (g_st_shard_tried[fd]) return NULL;
-    g_st_shard_tried[fd] = 1;
+    /* Acquire: a base published below carries g_st_shard_len[fd] with it. */
+    const uint8_t *base = __atomic_load_n(&g_st_shard_base[fd], __ATOMIC_ACQUIRE);
+    if (base) return base;
+    /* Claim the fd exactly once. The losing thread does not block: NULL is the
+     * documented "use pread" answer, so it takes the pread path for this one
+     * call rather than parking an OpenMP worker behind an mmap. */
+    signed char unclaimed = 0;
+    if (!__atomic_compare_exchange_n(&g_st_shard_tried[fd], &unclaimed, (signed char)1,
+                                     0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return __atomic_load_n(&g_st_shard_base[fd], __ATOMIC_ACQUIRE);
     int64_t len = (int64_t)lseek(fd, 0, SEEK_END);
     if (len <= 0) return NULL;
     compat_ro_map map; const void *data;
     if (compat_map_readonly(fd, 0, (size_t)len, &map, &data) != 0) return NULL;
     /* The compat_ro_map itself is intentionally not tracked for unmap: shard
      * mappings live exactly as long as the fd they wrap, i.e. the process. */
-    g_st_shard_base[fd] = (uint8_t *)data;
+    /* Length first, then release-store the base: whoever sees the base through
+     * the acquire load above necessarily sees the length too. */
     g_st_shard_len[fd] = len;
-    return g_st_shard_base[fd];
+    __atomic_store_n(&g_st_shard_base[fd], (uint8_t *)data, __ATOMIC_RELEASE);
+    return (const uint8_t *)data;
 }
 
 /* Serves [off, off+nbytes) of file `fd` directly out of its persistent

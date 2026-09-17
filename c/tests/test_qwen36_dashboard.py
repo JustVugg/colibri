@@ -114,7 +114,12 @@ class Qwen36DashboardTest(unittest.TestCase):
         self.assertEqual(t["completion_tokens"], 3)
         self.assertEqual(t["forwards"], 3, "prefill plus one forward per token after the first")
         phases = t["expert_disk_s"] + t["expert_matmul_s"] + t["attention_s"] + t["lm_head_s"]
-        self.assertGreater(phases, 0.0)
+        # Not > 0: PROF prints milliseconds and a 3-token turn on a tiny model
+        # finishes under a millisecond on a fast runner, so every phase rounds
+        # to 0.000 and the sum is legitimately zero (CI, 2026-09-10). What the
+        # contract holds is that phases never exceed the wall.
+        self.assertGreaterEqual(phases, 0.0)
+        self.assertGreater(t["wall_s"], 0.0)
         self.assertLessEqual(phases, t["wall_s"] * 1.05 + 0.01,
                              "phase timings exceed the wall clock: a timer is double-counting")
 

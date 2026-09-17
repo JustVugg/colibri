@@ -3,6 +3,158 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.11.0] — 2026-09-13
+
+56 pull requests since v1.10.2. A ninth model family, five real bugs closed
+across four engines, and the two platforms the C tests never built on now
+building them in CI.
+
+### A ninth engine: DeepSeek V4.1 Flash
+
+- **#1453**: DeepSeek V4.1 Flash (552B, 510 GB on disk) runs on a CPU box
+  streaming experts from an SSD, with no conversion: the released checkpoint
+  is read natively, fp8 dense with 32x32 ue8m0 tiles and fp4 experts whose
+  layout is byte-identical to the mxfp4 the Kimi K3 engine already reads.
+  Everything in the architecture that is not V4 is in: Engram (two n-gram
+  memories of 384M rows, 203 GB, that never enter RAM), the DSA indexer with
+  its two-level candidate source, hyper-connections, the compressor, the
+  32-layer vision tower with its aligner, DSpark speculative decoding (3
+  stages, blocks of 5, verified in one batched forward with a rollback for
+  the rejected rows) and tool calling in the checkpoint's own DSML format.
+- Held token-exact in CI against a torch-only CPU reference
+  (`c/tools/dsv41_ref.py`, written because the vendor's own forward needs
+  tilelang GPU kernels), at three cache capacities, on a short and a
+  40-token prompt, under all three speculative modes; the vision tower is
+  matched to 5e-06. The CI also asserts that the vendor's index-key
+  republication policy and the tidy reading disagree, so the shipped default
+  cannot be "corrected" by accident (`V41_INDEX_OWNER`).
+- Measured on the released checkpoint, cold, caches dropped before every run,
+  same prompt and seed: a turn went from 78.7 s to 25.1 s during the work
+  (0.305 to 0.957 tok/s) through batched expert reads (`V41_READ_DEPTH`,
+  default 8 is the measured knee), attention matrices read once per block of
+  positions instead of once per token, and an expert-major MoE. Every step
+  is bit-exact against what it replaced. A five-turn chat session runs at
+  1.14 to 1.58 tok/s; an `image_url` part goes through the gateway into the
+  vision tower on the same engine.
+- Two ways of hiding the expert reads behind the matmuls were built,
+  measured worse, and removed; both are written up in `docs/deepseek-v41.md`
+  with the numbers, so the next attempt starts from them.
+- `coli chat`, `coli serve` and `coli web` work; `coli run` is deliberately
+  unwired for this family, as for qwen36 and qwen38. Per-turn accounting is
+  behind `V41_STATS`, off by default, so the chat stays clean.
+
+### Fixed
+
+- **#1390** (@crichalchemist): the qwen36 GPU tier's `qt_fill_wait` returned
+  when the upload queue was empty, but the uploader frees the ring slot at
+  dequeue, before the backend copies anything, so the warmstart freed the RAM
+  int8 copy of experts still in flight. An in-flight count that the uploader
+  decrements only once the slot is resident (#1360).
+- **#1434** (@njloof): `fmt=0` is raw f32 and has no scale array, but the
+  Metal sizing helper returned a per-row scale size for it, so
+  `coli_metal_matmul` wrapped a NULL pointer and segfaulted inside
+  `newBufferWithBytes`, or silently produced all-zero output when the size
+  happened to be a page multiple. The kernel no longer applies a scale for
+  `fmt=0`, and a fail-closed guard sized off the same helper falls back to
+  the CPU path for any format that needs scales and got none.
+- **#1389** (@bherald): GLM-5.3 teardown leaked the lazily allocated dashboard
+  HITS table.
+- **#1461**: `coli cluster worker` could never start without an explicit
+  `--cap`: the default is `None`, and `str(None)` reached the engine's
+  argument check as the literal `"None"` (#1452). The worker now resolves the
+  cap the way every other launcher does.
+- **#1460**: olmoe's serve-mode `PROF` line published five literal zeros, so
+  `/profile` reported `expert_disk_s = 0.0` on turns where the expert reads
+  were the workload. The disk phase is measured now; the other four fields
+  stay zero because they are unmeasured, not because a guess would look
+  better (#1449, half of it).
+- **#1445**: olmoe's `--ram` was inert and "no `--cap`" meant a constant eight
+  slots per layer regardless of memory; the cap is derived from the RAM budget
+  (#1443). On the reporter's box a 2,291-token prompt went from 675 s to 353 s
+  with no flags (#1442).
+- **#1377**: available RAM is measured on every platform (glm53 read
+  `/proc/meminfo` unconditionally, so on Windows and macOS it read 0 and the
+  expert budget collapsed to 1 GB, which is how `coli tune` went OOM in
+  #1375), and the Windows commit limit is respected.
+- **#1381**: the context ceiling is announced, a request that cannot be
+  honoured is refused up front, and the number reported is the right one
+  (#1376).
+- **#1393**: GLM-5.3 replies always start inside the think block (#1278).
+- **#1414** (@dajiaohuang): the GLM-5.3 serve loop honours `CANCEL` while the
+  turn is still running (#1332).
+- **#1423** (@kreuzzelg): the lazy HITS table is built privately and published
+  under a lock in qwen36, kimi_k3, glm53 and qwen38; the parallel warmstart
+  segfaulted on first touch about one run in twelve (#1422).
+- **#1404** (@Petsku01): the qwen36 tier offers int8 experts on the decode
+  path (#1391). **#1388** (@crichalchemist): `QT_MAX_ROWS` replaces seven
+  literal 32s that had to agree, and the int8 copy is freed by ownership
+  rather than by format.
+- **#1421** (@bherald): `coli` no longer overwrites an explicit
+  `CUDA_EXPERT_GB` when it decides to place the dense trunk on the card.
+- **#1244** (@Unknown-Findout): the CUDA expert tier is charged real VRAM, not
+  logical bytes (#687). **#1394**: the VRAM prefix is priced per row, not at
+  the container's widest (#1351). **#1410**, **#1411**: on a single GPU the
+  VRAM prefix is sized from the VRAM budget and the measured headroom, not
+  from the RAM pin plan capped by the LRU reserve (#1409, #1405).
+- **#1447** (@trigger2k20): `coli mirror verify` accepts a complete mirror
+  copied by other means, with no receipt, and fails closed on a short or
+  corrupt shard.
+- **#1456** (@trigger2k20): the planner reports `memory.unified` from the
+  host, not from whether the selected engine has a placement-capable GPU, so
+  a CPU-only engine on Apple Silicon no longer reads as non-unified; and
+  `coli tune` stops suggesting `DRAFT`/`PIPE`/`PIN`/`NUMA` to glm53, which
+  ignores them.
+- **#1396** (@dmoraesrs): the web reasoning selector drops "Medium" for
+  GLM 5.3, which the engine renders identically to "High".
+- **#1428**, **#1435** (@iiEliJas), **#1433** and **#1432** (@texasich),
+  **#1440**, **#1459**, **#1458** (@trigger2k20), **#1463**: `setenv` visible
+  to `getenv` in-process on Windows, `malloc_trim` guarded to glibc so the
+  engines build on musl, a missing bench recipe restored, the per-test
+  `_putenv_s` helpers dropped, tests including `compat.h` directly, and
+  Clang warnings cleaned up.
+
+### Added
+
+- **#1462** (@trigger2k20): an opt-in Metal path for GLM-5.3-Flash's routed
+  experts on Apple Silicon (`COLI_METAL=1`): gate, up, clamped SwiGLU, down
+  and the route-weighted scatter on the GPU, CPU path unchanged when Metal
+  is off. Validated against the CPU implementation to 2.8e-09 and measured
+  on an M4 Max: 0.469 to 0.621 tok/s at 32 tokens, up to 2.15 tok/s with
+  the expert cache tuned. Also fixes `coli run --cap N` being silently
+  ignored on the glm53 one-shot path.
+- **#1457** (@trigger2k20): GLM-5.3-Flash feeds the shared routing telemetry
+  and writes `.coli_usage`, so usage-driven placement and partial-mirror
+  planning have data for it.
+- **#1454** (@yuripourre): the qwen36 GPU tier compiles with `HIP=1`.
+- **#1399** (@SebaWag): `TRUNK_RESIDENT_LAYERS=N` streams the dense trunk
+  through mmap (#826).
+- **#1361**, **#1374** (@kreuzzelg): the qwen36 dense trunk places itself
+  (`COLI_PLACE=auto`, priced in bytes saved per byte of VRAM), fp8 streaming
+  mode, VRAM accounting at allocator granularity, thread affinity, `COLI_GPU`.
+- **#1383**, **#1385**, **#1386**, **#1387**: Brain and Profile tabs (EMAP,
+  HITS, PROF) on every engine. **#1382** (@dmoraesrs): a reasoning depth
+  selector in the web UI (#1311).
+- **#1407**, **#1408**, **#1406**: CI builds the portable Windows CUDA DLL and
+  publishes it as an artifact; the Makefile refuses the 32-bit `cl.exe` before
+  nvcc runs (#1405).
+- **#1436**: CI builds against musl (Alpine) and compiles the environment
+  tests on Windows, the two holes that let #1430 and #1420 ship.
+- **#1360** (@kreuzzelg): tier invariants on the fake backend, and the
+  reservation leak they found. **#1419**, **#1415**, **#1418**
+  (@dajiaohuang): the V4 and fp8 test harnesses build on Windows.
+- **#1439** (@bherald): the planner tests no longer materialise four 3 GB
+  zero-filled payloads. **#1358** (@monotophic): a raw-evidence adapter for
+  the scoring corpus. **#1238** (@ZacharyZcR): reproducible performance
+  records are validated.
+
+### Docs
+
+- **#1446**: the qwen36 `--ram` section said the engine does not stream at
+  all. **#1392**: Azure GLM-5.2 benchmark rows (#1379, #1380, #1384), the rANS
+  cross-reference (#1273), and the int8 probe pinned in CI (#1331).
+- **#1427** (@ZH1995): README.zh-CN formatting. **#1438** (@iiEliJas): the
+  `malloc_trim` comment.
+
 ## [1.10.2] — 2026-09-06
 
 Patch release. Three of these fixes answer reports made against 1.10.1 in the

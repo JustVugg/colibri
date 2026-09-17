@@ -102,8 +102,8 @@ class V4CliTest(unittest.TestCase):
                     self.cli.cmd_run(args)
             self.assertEqual(stopped.exception.code, 0)
             self.assertEqual(captured["command"], ["/engines/olmoe", "16", "8"])
-            self.assertEqual(captured["input"], "hello world\n")
-            self.assertTrue(captured["text"])
+            self.assertEqual(captured["input"], b"hello world\n")
+            self.assertNotIn("text", captured)
             self.assertEqual(captured["env"]["CHAT"], "1")
             self.assertEqual(captured["env"]["MAX_NEW"], "32")
         finally:
@@ -115,6 +115,20 @@ class V4CliTest(unittest.TestCase):
         self.assertEqual(env["NGEN"], "8")
         self.assertEqual(env["RAM_GB"], "64")
         self.assertEqual(env["CTX"], "4096")
+
+    def test_sister_engines_get_snap_from_the_model_flag(self):
+        """#1501: `coli run` handed olmoe (and every non-GLM engine) an
+        environment without SNAP, so the engine exited with "started without
+        a model" while chat and serve, which set it elsewhere, worked."""
+        from family_registry import family_ids
+        for arch in [f for f in family_ids() if f != "glm"]:
+            args = argparse.Namespace(ngen=8, temp=None, ram=0, ctx=None, model="models/demo")
+            env = self.cli.env_for_engine(args, arch)
+            self.assertEqual(env.get("SNAP"), os.path.abspath("models/demo"), arch)
+        # an explicit SNAP in the caller's environment still wins
+        with mock.patch.dict(os.environ, {"SNAP": "/elsewhere"}):
+            args = argparse.Namespace(ngen=8, temp=None, ram=0, ctx=None, model="models/demo")
+            self.assertEqual(self.cli.env_for_engine(args, "olmoe")["SNAP"], "/elsewhere")
 
     def test_kimi_engine_environment_forwards_ram(self):
         """#855: `--ram` reached the environment for deepseek_v4 only, so on Kimi

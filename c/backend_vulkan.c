@@ -1782,6 +1782,19 @@ void coli_vk_tensor_free(ColiVkTensor *t) {
 
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t) { return t ? t->wbytes : 0; }
 
+/* Is the device we picked an integrated GPU? The backend already computes this
+ * at device selection (see the deviceType ranking above) but only uses it to
+ * rank candidates. The RAM planner needs it too: on an integrated GPU our
+ * HOST_VISIBLE|DEVICE_LOCAL allocations are the same physical memory the host
+ * expert cache draws from, so whoever sizes that cache has to know. Mirrors
+ * coli_cuda_device_integrated() (#653) for the Vulkan path. */
+int coli_vk_device_integrated(void) {
+    if (!G.phys) return 0;
+    VkPhysicalDeviceProperties p;
+    vkGetPhysicalDeviceProperties(G.phys, &p);
+    return p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
+}
+
 void coli_vk_shutdown(void) {
     if (!G.ready) return;
     vkDeviceWaitIdle(G.dev);

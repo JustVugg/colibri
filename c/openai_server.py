@@ -21,6 +21,7 @@ import time
 import uuid
 
 import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
+import v41_dsml                     # ...and V4.1's, whose tag names differ by a space
 from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id,
                              family_ids, resolve_model)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -532,10 +533,34 @@ def parse_k3_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
+def parse_dsv41_tool_calls(reply):
+    """Parse DeepSeek V4.1 DSML tool calls out of one assistant reply.
+
+    Same posture as the V4 path: the vendored reference parser decodes the block
+    strictly, and the gateway then cuts an incomplete block out of the visible
+    content so raw DSML never reaches the client, whatever the model did with
+    its token budget.
+    """
+    content, calls = v41_dsml.parse_completion_text(reply)
+    if not calls:
+        cut = len(content)
+        for marker in (v41_dsml.TOOL_CALLS_PREFIX, v41_dsml.TOOL_CALL_PREFIX):
+            pos = content.find(marker)
+            if 0 <= pos < cut:
+                cut = pos
+        if cut < len(content):
+            content = content[:cut]
+    for marker in (v41_dsml.eos_token, THINK_OPEN, THINK_CLOSE):
+        content = content.replace(marker, "")
+    return content.strip(), calls
+
+
 def parse_arch_tool_calls(reply, tools, tool_reply=None):
     """Architecture-appropriate tool-call parser. Returns (content, tool_calls)."""
     if ARCH == "deepseek_v4":
         return parse_dsv4_tool_calls(reply)
+    if ARCH == "deepseek_v41":
+        return parse_dsv41_tool_calls(reply)
     if ARCH == "kimi":
         if tool_reply is not None:
             _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
@@ -550,6 +575,10 @@ def _tool_stream_markers():
     """Marker(s) that open a model tool-call block, in match order (arch-specific)."""
     if ARCH == "deepseek_v4":
         return ("<" + DSV4_DSML + "tool_calls", "<" + DSV4_DSML + "invoke")
+    if ARCH == "deepseek_v41":
+        # V4.1's tag names lead with a space (" calls", " invoke"): building these the
+        # V4 way would suppress nothing and leak the block into delta.content.
+        return (v41_dsml.TOOL_CALLS_PREFIX, v41_dsml.TOOL_CALL_PREFIX)
     if ARCH == "kimi":
         return (K3_TOOLS_OPEN,)
     return (BOX_START,)
@@ -1611,14 +1640,18 @@ GLM53_IMAGE_OPEN, GLM53_IMAGE, GLM53_IMAGE_CLOSE = (
 def _image_bytes_from_url(url):
     """data: URI, file:// o percorso sul disco -> i byte dell'immagine.
 
-    A local path is read with the server process's own permissions. On a
-    server that binds beyond loopback (which already requires an API key),
-    an authenticated client could otherwise read any file the process can
-    reach -- e.g. "file:///etc/passwd". Two guards without breaking the
-    documented loopback single-user case: '..' is refused outright (never
-    needed for a real image path), and if COLI_IMAGE_ROOT is set the resolved
-    path must stay inside it, mirroring serve_static's relative_to() check.
-    Errors stay generic so the reply never confirms a path or its permissions."""
+    A local path is read with the server process's own permissions, and an
+    inference client is not the operator: with the API key it could read any
+    file the process can reach ("file:///etc/passwd", or a bare "/etc/passwd").
+    #1354 refused '..' and confined reads to COLI_IMAGE_ROOT when set, which
+    left every absolute path readable on the default install (the variable is
+    unset out of the box). So local paths are now denied unless the operator
+    sets COLI_IMAGE_ROOT, and then only inside it (resolve() follows symlinks
+    before the relative_to() check, the same one serve_static uses). The
+    clients that used to send paths read the file themselves with the user's
+    own rights and send a data: URI: `coli chat` since this change, `coli web`
+    always did. Errors stay generic so a reply never confirms a path or its
+    permissions."""
     if not isinstance(url, str) or not url:
         raise APIError(400, "image_url.url must be a non-empty string.", "messages")
     if url.startswith("data:"):
@@ -1637,13 +1670,20 @@ def _image_bytes_from_url(url):
                             "as a base64 data: URI or a path on this machine.",
                        "messages")
     raw = url[7:] if url.startswith("file://") else url
+    image_root = os.environ.get("COLI_IMAGE_ROOT")
+    if not image_root:
+        raise APIError(400, "local image paths are disabled on this server: send the image "
+                            "as a base64 data: URI (coli chat and coli web do), or start the "
+                            "server with COLI_IMAGE_ROOT=<dir> to allow files under that "
+                            "directory.", "messages")
     if ".." in Path(raw).parts:
         raise APIError(400, "image path is not allowed.", "messages")
     try:
+        root = Path(image_root).resolve(strict=True)
+        if not root.is_dir():
+            raise ValueError("COLI_IMAGE_ROOT is not a directory")
         target = Path(raw).resolve()
-        image_root = os.environ.get("COLI_IMAGE_ROOT")
-        if image_root:
-            target.relative_to(Path(image_root).resolve())
+        target.relative_to(root)
     except (ValueError, OSError):
         raise APIError(400, "image path is not allowed.", "messages")
     try:
@@ -1740,6 +1780,57 @@ def expand_glm53_images(messages, model_dir):
                 raise APIError(400, f"unsupported content part {kind!r}.", "messages")
         rewritten.append({**message, "content": "".join(pieces)})
     return rewritten, images
+
+
+# DeepSeek V4.1's image placeholder: every position of an image span carries the same
+# id, and what each one MEANS follows from the aligner grid (image_processor.py
+# image_token_types): start, then one newline per row of image tokens, then end. The
+# engine rebuilds that layout from the grid it gets in the IMAGE frame, so the gateway
+# only has to insert the right NUMBER of placeholders -- and getting that number wrong
+# is the one failure the engine cannot paper over, which is why it refuses instead.
+DSV41_IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
+
+
+def expand_dsv41_images(messages, model_dir, max_tokens=None):
+    """Replace image parts with their placeholder span and pull out the patches."""
+    images, rewritten = [], []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            rewritten.append(message)
+            continue
+        pieces = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "text":
+                pieces.append(part.get("text", ""))
+            elif kind in ("image_url", "input_image"):
+                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
+                      else part.get("image_url") or part.get("url")
+                data = _image_bytes_from_url(url)
+                patches, grid_h, grid_w, llm_h, llm_w = _preprocess_dsv41_image(
+                    data, model_dir, max_tokens)
+                span = 1 + (llm_w + 1) * llm_h + 1
+                images.append((patches, grid_h, grid_w))
+                pieces.append(DSV41_IMAGE_PLACEHOLDER * span)
+            else:
+                raise APIError(400, f"unsupported content part {kind!r}.", "messages")
+        rewritten.append({**message, "content": "".join(pieces)})
+    return rewritten, images
+
+
+def _preprocess_dsv41_image(data, model_dir, max_tokens=None):
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
+        from dsv41_image import preprocess
+    except ImportError as problem:
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+                       "messages")
+    return preprocess(data, model_dir, max_tokens)
 
 
 def _preprocess_image(data, model_dir):
@@ -1904,8 +1995,22 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
                 reasoning = content.split("</think>")[0].split("<think>")[-1]
                 content = content.split("</think>")[-1]
             opened = f"<think>{reasoning}</think>" if isinstance(reasoning, str) else "<think></think>"
-            prompt.append(f"<|assistant|>{opened}{content.strip()}"
-                          f"{_glm53_tool_calls(message.get('tool_calls'))}")
+            body = content.strip()
+            calls = _glm53_tool_calls(message.get("tool_calls"))
+            # The template writes "\n<tool_call>". The model, on a turn that is
+            # nothing but a tool call, writes "</think><tool_call>" with no
+            # newline between them, and that one token is enough to throw away
+            # the whole cached prefix: the reuse gate in glm53.c is
+            # all-or-nothing, so the next turn re-prefills from scratch -- on a
+            # 3k-token agent history at 2.3 tok/s, twenty minutes (#1576).
+            #
+            # A turn that also has text is left exactly as it was. There the
+            # model's own trailing newline is stripped by .strip() and put back
+            # by the renderer, so the tokens already line up, and changing that
+            # case would break the one that works today.
+            if calls and not body:
+                calls = calls.lstrip("\n")
+            prompt.append(f"<|assistant|>{opened}{body}{calls}")
         else:
             raise APIError(400, f"unsupported message role {role!r}.", "messages")
 
@@ -1916,6 +2021,182 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     # TURNO PASSATO senza ragionamento. E' vero per un turno passato e falso per il
     # prompt di generazione: la posizione da cui il modello scrive non e' mai quella.
     prompt.append("<|assistant|><think>")
+    return "".join(prompt)
+
+
+# ---- DeepSeek V4.1 Flash -----------------------------------------------------------------
+# The checkpoint ships its chat format as a Python module (encoding/encoding.py), not a
+# jinja template, so this is that module's render_message transcribed for the shapes the
+# gateway sends. Its pieces, with the vendor's own names:
+#
+#   <｜begin▁of▁sentence｜>  once, at the head of a fresh conversation
+#   <｜System｜>             leads the conversation when there is a system message or a
+#                           reasoning-effort line; also precedes a mid-conversation one
+#   Reasoning Effort: N     index 0 only, thinking mode only, N in 1..100
+#   <｜User｜> / <｜Assistant｜>
+#   <think> or </think>     the generation cue: open in thinking mode, closed otherwise
+#   assistant turns end with <｜end▁of▁sentence｜>
+#
+# Two details the reference hides in its control flow, both reproduced below. First,
+# <think> and </think> straddle a turn boundary: the OPENING token is the transition the
+# reference appends after a user turn, the CLOSING one belongs to the assistant turn that
+# follows, so an assistant turn always starts with one or the other and there is no such
+# thing as a past assistant turn without a </think>. Second, the reference drops the
+# reasoning of turns before the last user message -- except when the conversation declares
+# tools, where it keeps every one of them (`if any(m.get("tools") ...)`), because a tool
+# call is only interpretable next to the reasoning that produced it.
+DSV41_BOS = "<｜begin▁of▁sentence｜>"
+DSV41_EOS = "<｜end▁of▁sentence｜>"
+DSV41_SYSTEM = "<｜System｜>"
+DSV41_USER = "<｜User｜>"
+DSV41_ASSISTANT = "<｜Assistant｜>"
+# encoding.py REASONING_EFFORT_MAPPINGS; the default there is "high"
+DSV41_EFFORT = {"minimal": 50, "low": 50, "medium": 75, "high": 75, "xhigh": 100}
+
+
+def _dsv41_tools_block(tools):
+    """V4.1 tool-declaration block, rendered by the vendored reference template."""
+    schemas = []
+    for tool in (tools or []):
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        # Gateway-side scrub: OpenAI clients attach routing hints the model
+        # schema must not carry.
+        clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
+        if isinstance(tool, dict) and tool.get("namespace") is not None:
+            clean = dict(clean, namespace=tool["namespace"])
+        schemas.append(clean)
+    return v41_dsml.render_tools(v41_dsml.tools_from_openai_format(schemas))
+
+
+def _dsv41_merge_turns(messages):
+    """encoding.py merge_tool_messages + sort_tool_results_by_call_order.
+
+    V4.1 has no standalone tool role: a tool result is a <tool_result> block inside the
+    NEXT user turn, and consecutive user-side messages collapse into one turn joined by
+    a blank line. Returns turns of {"role", "parts"/"content", ...}, validating each
+    original message so field-level errors keep pointing at the client's own indices.
+    """
+    turns = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role == "developer":
+            role = "system"
+        if role not in ("system", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role == "assistant":
+            reasoning = message.get("reasoning_content")
+            if reasoning is not None and not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            turns.append({"role": "assistant", "content": text,
+                          "reasoning_content": reasoning,
+                          "tool_calls": message.get("tool_calls")})
+        elif role in ("user", "tool"):
+            block = ({"kind": "tool_result", "id": message.get("tool_call_id") or "",
+                      "text": v41_dsml.render_tool_result(text)} if role == "tool"
+                     else {"kind": "text", "id": "", "text": text})
+            if turns and turns[-1]["role"] == "user":
+                turns[-1]["parts"].append(block)
+            else:
+                turns.append({"role": "user", "parts": [block]})
+        else:
+            turns.append({"role": "system", "content": text})
+    # A parallel-call round trip arrives in whatever order the client's tools finished;
+    # the model reads them positionally, so restore the order it called them in.
+    order = {}
+    for turn in turns:
+        if turn["role"] == "assistant" and turn.get("tool_calls"):
+            order = {}
+            for at, call in enumerate(turn["tool_calls"]):
+                identifier = call.get("id") if isinstance(call, dict) else None
+                if identifier:
+                    order[identifier] = at
+        elif turn["role"] == "user" and order:
+            results = [p for p in turn["parts"] if p["kind"] == "tool_result"]
+            if len(results) > 1:
+                results.sort(key=lambda p: order.get(p["id"], 0))
+                feed = iter(results)
+                turn["parts"] = [next(feed) if p["kind"] == "tool_result" else p
+                                 for p in turn["parts"]]
+    return turns
+
+
+def render_chat_dsv41(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                      tool_choice=None):
+    """encoding.py _encode_messages_text for one turn.
+
+    Tool use follows the checkpoint's own DSML format (encoding/encoding.py, vendored in
+    v41_dsml.py): schemas are declared at the end of the system message, assistant tool
+    calls are <｜DSML｜ calls> blocks, and tool results are <tool_result> blocks merged
+    into the following user turn.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name")
+                  or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None                              # the client forbade tools: do not offer them
+    turns = _dsv41_merge_turns(messages)
+    if tools:
+        tools_text = _dsv41_tools_block(tools)
+        if forced:
+            tools_text += f"\n\nYou must call the function `{forced}`. Do not answer directly."
+        elif tool_choice == "required":
+            tools_text += "\n\nYou must call one of the functions above. Do not answer directly."
+        for turn in turns:
+            if turn["role"] == "system":
+                turn["content"] += "\n\n" + tools_text
+                break
+        else:
+            # No system message: the reference renders tools on an empty one, so the block
+            # arrives as <｜System｜> + "\n\n" + tools. Keep that exact byte layout.
+            turns.insert(0, {"role": "system", "content": "\n\n" + tools_text})
+    budget = DSV41_EFFORT.get(reasoning_effort or "high", 75)
+    effort = (f"Reasoning Effort: {budget} (range 1-100, the higher the value, the more "
+              f"thorough the reasoning)\n\n") if enable_thinking else ""
+    # find_last_user_index: a mid-conversation system message counts as a user turn,
+    # because it is one of the two things the reference puts an assistant header after.
+    last_user = -1
+    for index, turn in enumerate(turns):
+        if turn["role"] == "user" or (turn["role"] == "system" and index > 0):
+            last_user = index
+    # With tools on the table the reference keeps every turn's reasoning; without them it
+    # drops the reasoning of everything before the last user message.
+    drop_thinking = not tools
+    prompt = [DSV41_BOS]
+    for index, turn in enumerate(turns):
+        role = turn["role"]
+        if role == "system":
+            prompt.append(DSV41_SYSTEM)
+            if index == 0:
+                prompt.append(effort)
+            prompt.append(turn["content"])
+        elif role == "user":
+            if index == 0 and effort:
+                prompt.append(DSV41_SYSTEM + effort)
+            prompt.append(DSV41_USER)
+            prompt.append("\n\n".join(part["text"] for part in turn["parts"]))
+        else:
+            keep = enable_thinking and (not drop_thinking or index > last_user)
+            prompt.append(DSV41_ASSISTANT)
+            prompt.append(f"<think>{turn.get('reasoning_content') or ''}</think>"
+                          if keep else "</think>")
+            prompt.append(turn["content"])
+            if turn.get("tool_calls"):
+                prompt.append(v41_dsml.render_tool_calls(turn["tool_calls"]))
+            prompt.append(DSV41_EOS)
+    # the generation cue, exactly as render_message appends it after a user turn
+    prompt.append(DSV41_ASSISTANT)
+    prompt.append("<think>" if enable_thinking and len(turns) - 1 >= last_user else "</think>")
     return "".join(prompt)
 
 
@@ -1930,6 +2211,7 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
                 render_chat_qwen if ARCH == "qwen36" else
                 render_chat_qwen38 if ARCH == "qwen38" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
+                render_chat_dsv41 if ARCH == "deepseek_v41" else
                 render_chat_olmoe if ARCH == "olmoe" else render_chat)
     return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
 
@@ -1950,8 +2232,14 @@ def starts_in_reasoning(enable_thinking):
     dice il suo interruttore: acceso apre il blocco e il modello lo chiude da
     solo, spento lo chiude gia' il prompt e quello che torna e' risposta pura.
     Se le due cose non concordano il ragionamento finisce incollato davanti
-    alla risposta, che e' il difetto che questa funzione esiste per non avere."""
-    return enable_thinking
+    alla risposta, che e' il difetto che questa funzione esiste per non avere.
+
+    GLM-5.3 e' l'eccezione che rende la regola esplicita: il suo template non
+    ha un interruttore, render_chat_glm53 apre <think> SEMPRE, e "thinking
+    spento" vuol dire solo effort Low. L'uscita comincia dentro al blocco in
+    ogni caso; partire in modalita' testo perche' il client ha detto False e'
+    esattamente il ragionamento incollato davanti alla risposta di #1278."""
+    return enable_thinking or ARCH == "glm53"
 
 
 class ThinkingStreamSplit:
@@ -2407,7 +2695,8 @@ def generation_options(body, limit):
         if ftype == "json_object":
             grammar = GENERIC_JSON_GBNF
         elif ftype == "json_schema":
-            schema = (response_format.get("json_schema") or {}).get("schema")
+            json_schema = response_format.get("json_schema")
+            schema = json_schema.get("schema") if isinstance(json_schema, dict) else None
             if not isinstance(schema, dict):
                 raise APIError(400, "`response_format.json_schema.schema` must be an object.",
                                "response_format", "invalid_value")
@@ -3398,6 +3687,14 @@ class APIHandler(BaseHTTPRequestHandler):
             body = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise APIError(400, "Request body must be valid JSON.")
+        try:
+            # An escaped lone surrogate ("\ud83d") parses, but it is the same invalid
+            # text as the undecodable bytes above: no UTF-8 can carry it, and the
+            # engine protocol encodes every prompt as UTF-8.
+            json.dumps(body, ensure_ascii=False).encode("utf-8")
+        except UnicodeEncodeError:
+            raise APIError(400, "Request body contains an unpaired UTF-16 surrogate "
+                                "escape; strings must be valid Unicode.")
         if not isinstance(body, dict):
             raise APIError(400, "Request body must be a JSON object.")
         return body
@@ -3925,6 +4222,15 @@ class APIHandler(BaseHTTPRequestHandler):
         if ARCH == "glm53":
             messages, images = expand_glm53_images(
                 messages, getattr(self.server.engine, "model_dir", None))
+            if len(images) > 1:
+                raise APIError(400, "one image per request for now; the engine "
+                                    "holds a single pending image.", "messages")
+            image = images[0] if images else None
+        elif ARCH == "deepseek_v41":
+            ceiling = os.environ.get("V41_MAX_IMAGE_TOKENS")
+            messages, images = expand_dsv41_images(
+                messages, getattr(self.server.engine, "model_dir", None),
+                int(ceiling) if ceiling else None)
             if len(images) > 1:
                 raise APIError(400, "one image per request for now; the engine "
                                     "holds a single pending image.", "messages")

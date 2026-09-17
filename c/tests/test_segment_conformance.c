@@ -3,17 +3,23 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Every family that must carry a Segment fixture. The count below is derived
+ * from this list, not written a second time: a family added to one and not the
+ * other is how this test last failed for a reason unrelated to what it checks. */
+static const char *const kExpectedFamilies[] = {
+    "glm", "glm53", "inkling", "kimi", "olmoe", "qwen36", "qwen38", "deepseek_v4",
+    "deepseek_v41",
+};
+
 static int expected_family(const char *family_id) {
-    static const char *const expected[] = {
-        "glm", "glm53", "inkling", "kimi", "olmoe", "qwen36", "qwen38", "deepseek_v4",
-    };
-    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++)
-        if (strcmp(expected[i], family_id) == 0) return 1;
+    for (size_t i = 0; i < sizeof(kExpectedFamilies) / sizeof(kExpectedFamilies[0]); i++)
+        if (strcmp(kExpectedFamilies[i], family_id) == 0) return 1;
     return 0;
 }
 
 int main(void) {
-    const size_t required_families = 8;
+    const size_t required_families =
+        sizeof(kExpectedFamilies) / sizeof(kExpectedFamilies[0]);
     size_t count = coli_segment_conformance_fixture_count();
     if (count != required_families) {
         fprintf(stderr, "segment conformance requires %zu families, found %zu\n",

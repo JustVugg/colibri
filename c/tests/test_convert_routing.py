@@ -157,6 +157,51 @@ class ConvertRoutingTest(unittest.TestCase):
             self.assertEqual(command[command.index(flag) + 1], value)
         self.assertNotIn("--xbits", command, "xbits defaults to 0 and is omitted")
 
+    def test_an_output_directory_holding_a_checkpoint_is_refused(self):
+        """`coli convert --model <downloaded checkpoint>` used to start fetching
+        the default repo into that directory. Refuse, and say what the user
+        most likely wanted: nothing for a family that runs its official
+        checkpoint, the family's converter with --indir for one that converts."""
+        cli = self.cli
+        with tempfile.TemporaryDirectory() as out:
+            (Path(out) / "model-00001-of-00002.safetensors").write_bytes(b"\0" * 8)
+            (Path(out) / "config.json").write_text(json.dumps({"model_type": "qwen4_exp", "text_config": {}}))
+            text = cli.convert_output_refusal(out)
+            self.assertIsNotNone(text)
+            self.assertIn("already holds a checkpoint", text)
+            self.assertIn("no conversion needed", text)
+            self.assertIn("coli chat --model", text)
+        with tempfile.TemporaryDirectory() as out:
+            (Path(out) / "config.json").write_text(json.dumps({"model_type": "glm5_next", "text_config": {}}))
+            text = cli.convert_output_refusal(out)
+            self.assertIn("convert_glm53.py --indir", text)
+        with tempfile.TemporaryDirectory() as out:
+            (Path(out) / "model-00001-of-00001.safetensors").write_bytes(b"\0" * 8)
+            text = cli.convert_output_refusal(out)
+            self.assertIn("1 shard(s)", text)
+            self.assertIn("--repo <hf repo> --model <new dir>", text)
+        with tempfile.TemporaryDirectory() as out:
+            self.assertIsNone(cli.convert_output_refusal(out))
+        self.assertIsNone(cli.convert_output_refusal("/nonexistent/dir/for/convert"))
+
+    def test_cmd_convert_stops_before_any_subprocess_on_a_checkpoint_dir(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        (Path(directory.name) / "model-00001-of-00001.safetensors").write_bytes(b"\0" * 8)
+        calls = []
+        with mock.patch.object(self.cli, "subprocess") as subprocess_module, \
+             mock.patch.object(self.cli, "project_python", return_value="python3"), \
+             mock.patch.object(self.cli, "checkpoint_family", return_value=None):
+            subprocess_module.call = lambda command: calls.append(command) or 0
+            with self.assertRaises(SystemExit) as stop:
+                self.cli.cmd_convert(Args(directory.name, repo=None))
+        self.assertIn("already holds a checkpoint", str(stop.exception))
+        self.assertEqual(calls, [])
+
+    def test_the_default_repo_is_applied_when_none_is_written(self):
+        calls = self.run_convert("glm", repo=None)
+        self.assertEqual(calls[0][calls[0].index("--repo") + 1], "zai-org/GLM-5.2-FP8")
+
     def test_an_unresolvable_family_keeps_the_old_command(self):
         """A metadata fetch that fails is not a reason to refuse a conversion
         that would have worked. The converter's own guard downloads the same

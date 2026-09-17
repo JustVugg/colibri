@@ -36,6 +36,13 @@
 #if __has_include(<rocwmma/rocwmma.hpp>)
 #include <rocwmma/rocwmma.hpp>
 #define COLI_GPU_HAS_WMMA        1
+/* rocWMMA has no sub-byte fragments (no s4/int4 precision), and the
+ * grouped_s4_wmma body is guarded by __CUDA_ARCH__ >= 750, which the 700
+ * defined below does not reach: its body is compiled OUT. The host gate
+ * used to test rocWMMA availability alone, took the branch, launched three
+ * empty kernels and returned the previous call's output untouched (#1499).
+ * A second flag for the one kernel that needs more than WMMA. */
+#define COLI_GPU_HAS_S4_WMMA     0
 #define __CUDA_ARCH__            700
 #define __half                  rocwmma::float16_t
 namespace nvcuda { namespace wmma = ::rocwmma; }
@@ -48,6 +55,7 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #else
 /* Arch has no matrix cores: rocWMMA is not needed and not included. */
 #define COLI_GPU_HAS_WMMA        0
+#define COLI_GPU_HAS_S4_WMMA     0
 #define __syncwarp()            __syncthreads()
 #endif
 #define cudaError_t              hipError_t
@@ -101,6 +109,10 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #include <cuda_runtime.h>
 #include <mma.h>
 #define COLI_GPU_HAS_WMMA        1
+/* nvcuda::wmma::experimental::precision::s4 exists here; the kernel body still
+ * needs sm_75+, which the host checks at run time from the device's compute
+ * capability (see the grouped_s4_wmma dispatch in backend_cuda.cu). */
+#define COLI_GPU_HAS_S4_WMMA     1
 #endif
 
 #endif /* COLIBRI_BACKEND_GPU_COMPAT_H */

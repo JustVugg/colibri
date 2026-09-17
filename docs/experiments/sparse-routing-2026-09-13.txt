@@ -1,0 +1,65 @@
+Colibri sparse-routing performance evidence
+============================================
+
+Implementation commit under test:
+0702319e100151eb213cda901e8637bdfd8942e6
+
+Hardware:
+- Apple M1 Max
+- 10 cores (8 performance, 2 efficiency)
+- 64 GB RAM
+- macOS Darwin 25.6.0 arm64
+- Apple clang 17.0.0
+- Internal APFS storage
+
+Correctness gate:
+- ./c/tests/test_router_nan: pass
+- ./c/tests/test_dsa_select: 129 cases, 0 failures
+- Python suite: 861 tests, 0 failures, 78 skipped
+
+Command:
+    make -C c tests/bench_router_select && ./c/tests/bench_router_select
+
+Router benchmark output (11 seeds x 2,000 repetitions per cell):
+
+bench_router_select: old duplicate scan vs marked-score scan (median of 11 seeds x 2000 reps)
+shape        E   K    old ns/call    new ns/call   speedup
+---------------------------------------------------------------------
+random      64   8           1000           1000     1.00x
+random     256   8           5000           3000     1.67x
+random     256  32          75000          13000     5.77x
+peaked      64   8           1000           1000     1.00x
+peaked     256   8           5000           4000     1.25x
+peaked     256  32          93000          17000     5.47x
+plateau     64   8           1000           1000     1.00x
+plateau    256   8           5000           3000     1.67x
+plateau    256  32          98000          16000     6.13x
+bench_router_select: done (lower ns is better; speedup = old/new)
+
+Full DSA benchmark output (11 seeds x 2,000 repetitions per cell):
+
+bench_dsa_select: DSA top-keep, old (qsort) vs new (partial-select)  keep=2048  (median of 11 seeds x 2000 reps)
+shape             nk    old ns/call    new ns/call   speedup
+------------------------------------------------------------------------
+realistic       2049         143000           8000    17.87x
+realistic       4096         279000          12000    23.25x
+realistic       8192         637000          20000    31.85x
+realistic      16384        1386000         107000    12.95x
+realistic      32768        3021000         251000    12.04x
+realistic      65536        6392000         309000    20.69x
+
+uniform         2049         112000           6000    18.67x
+uniform         4096         285000          10000    28.50x
+uniform         8192         632000          26000    24.31x
+uniform        16384        1422000         114000    12.47x
+uniform        32768        2994000         223000    13.43x
+uniform        65536        6465000         513000    12.60x
+
+plateau         2049          30000           6000     5.00x
+plateau         4096          66000           7000     9.43x
+plateau         8192         145000           9000    16.11x
+plateau        16384         314000          16000    19.62x
+plateau        32768         678000          30000    22.60x
+plateau        65536        1458000          58000    25.14x
+
+bench_dsa_select: done (lower ns is better; speedup = old/new)

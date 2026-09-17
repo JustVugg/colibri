@@ -56,6 +56,52 @@ static int run(int fmt, int O, int I, int S, const char *name) {
   return ok?0:1;
 }
 
+// ---- fmt=0 (raw f32) with scales == NULL: own harness -------------------------------
+// run() above CANNOT cover this case, and that gap is why the K3 Metal segfault shipped.
+// run() always hands coli_metal_matmul a non-NULL [O] scale array, filling it with 1.0f
+// for F32 -- so it exercised neither of the two things real fmt=0 callers do:
+//   (a) pass scales == NULL, because raw f32 weights are already in final units, and
+//   (b) expect NO scale multiply to be applied to the result.
+// The 1.0f fill made (b) invisible (1.0 is the identity), and the non-NULL pointer made
+// (a) invisible. kimi_k3.c's k3_matmul_f32 does both, for the KDA fa/fb/bp projections.
+//
+// This harness therefore passes scales == NULL and uses a reference with no scale term.
+// The contract it pins down: for fmt=0, fmt_scale_bytes() must report 0 bytes (so no
+// wrap of the NULL pointer is attempted) and mm_gemv must not apply scale[o].
+//
+// WARNING to whoever reads a failing run: on a build where that contract is broken,
+// the O=12288 case below reports a clean MISMATCH (its O*4 scale size is an exact
+// multiple of the 16384-byte page, so wrap() takes newBufferWithBytesNoCopy and yields
+// a nil buffer -> shader reads scale as 0 -> all-zero output), but the O=128 and O=96
+// cases SEGFAULT the whole test binary rather than returning (their O*4 is not a page
+// multiple, so wrap() falls back to newBufferWithBytes, which memmoves from address 0).
+// A hard crash here is the reproduction, not a broken test -- the printf is flushed
+// before the call so the last line printed names the offending case.
+static int run_f32_noscale(int O, int I, int S, const char *name) {
+  std::vector<float> W((size_t)O*I), x((size_t)S*I), yr((size_t)S*O), yg((size_t)S*O);
+  srand(4242);
+  for(auto&v:W) v=((rand()%2000)-1000)/1000.f;
+  for(auto&v:x) v=((rand()%2000)-1000)/1000.f;
+  // reference: plain y[S,O] = x[S,I] @ W[O,I]^T, NO per-row scale anywhere
+  for(int o=0;o<O;o++) for(int si=0;si<S;si++){
+    const float *xr=&x[(size_t)si*I]; double acc=0;
+    for(int i=0;i<I;i++) acc += (double)W[(size_t)o*I+i]*xr[i];
+    yr[(size_t)si*O+o]=(float)acc;
+  }
+  printf("  %-46s ", name); fflush(stdout);   // flush BEFORE: a segfault must name the case
+  ColiMetalTensor *t=nullptr;
+  if (!coli_metal_matmul(&t, yg.data(), x.data(), W.data(), /*scales=*/nullptr,
+                         F32, S, I, O, 0)) {
+    printf("FAIL (matmul returned 0 -- fmt=0 must not be declined)\n"); return 1; }
+  double maxabs=0, ymax=0;
+  for(size_t i=0;i<(size_t)S*O;i++){ maxabs=fmax(maxabs,fabs(yg[i]-yr[i])); ymax=fmax(ymax,fabs(yr[i])); }
+  double nerr=maxabs/(ymax+1e-9);
+  int ok = nerr < 1e-4;
+  printf("nerr=%.2e  %s\n", nerr, ok?"ok":"*** MISMATCH");
+  coli_metal_tensor_free(t);
+  return ok?0:1;
+}
+
 // ---- fmt=4 (grouped int4): own CPU reference + harness -----------------------------
 // cpu_ref's [O] per-row scale layout can't express fmt=4's [O,ceil(I/gs)] per-group
 // scale, so this is a separate reference rather than a branch of cpu_ref. Mirrors
@@ -813,6 +859,18 @@ int main(void) {
   fail |= run(I8, 2048,6144,4, "int8 gate/up S=4");
   fail |= run(I4, 2048,6144,7, "int4 gate/up S=7 (odd)");
   fail |= run(I4, 2050,6146,3, "int4 non-mult-4 dims");
+  // fmt=0 with scales == NULL -- the real kimi_k3.c k3_matmul_f32 contract. Shapes are
+  // Kimi K3's three KDA projections verbatim (hidden=7168, kda_hd=128, kda_heads=96,
+  // kda_proj=96*128=12288), because the page-alignment of O*sizeof(float) is what selects
+  // between the two failure modes and these are the sizes that occur in practice.
+  // fb (O=12288) is ordered FIRST deliberately: it is the one case that reports a clean
+  // MISMATCH instead of crashing, so on a regressed build the log shows a real diagnostic
+  // before the fa case takes the process down. See run_f32_noscale's header comment.
+  printf("Metal fmt=0 raw-f32 NULL-scale tests (Kimi K3 KDA fa/fb/bp projections):\n");
+  fail |= run_f32_noscale(12288, 128,  1, "f32 no-scale fb O=12288 I=128 (page-mult scale sz)");
+  fail |= run_f32_noscale(128,   7168, 1, "f32 no-scale fa O=128   I=7168 (non-page-mult)");
+  fail |= run_f32_noscale(96,    7168, 1, "f32 no-scale bp O=96    I=7168 (non-page-mult)");
+  fail |= run_f32_noscale(128,   7168, 4, "f32 no-scale fa O=128   I=7168 S=4 (prefill)");
   printf("Metal fmt=4 grouped-int4 tests (coli_metal_matmul vs matmul_i4_grouped semantics):\n");
   // I multiple of gs=64, S=1 and S>1 (real g64-checkpoint shapes: gate/up I=6144, down I=2048)
   fail |= run_grouped(2048,6144,64,1,0, "grouped gate/up I=6144(mult64) S=1");

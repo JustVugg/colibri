@@ -137,6 +137,10 @@ int  coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const f
 void   coli_vk_tensor_free(ColiVkTensor *t);
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t);
 
+/* 1 if the selected device is an integrated GPU (shares physical memory with
+ * the host), 0 otherwise or when no device is selected. */
+int coli_vk_device_integrated(void);
+
 #ifdef __cplusplus
 }
 #endif

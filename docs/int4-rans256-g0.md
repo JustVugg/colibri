@@ -165,7 +165,13 @@ For the existing formats the engine can infer identity from byte arithmetic
 **That inference is structurally impossible here**: entropy-coded size is
 data-dependent — there is no `expected_bytes(O, I)` to compare against. The
 stamp is therefore the **only** signal that a `U8` tensor is entropy-coded
-at all. Data dependence prevents **identity inference**, not extent planning:
+at all. This is a statement about *identity*, not about extent: the
+physical length of every record is still fully determined by its stored
+framing (header, stream offsets, payload, the two `round16()` pads; see the
+validity rules above, "the record's total length equals the derived framing
+exactly"), and is known before decode. Only the payload's content length is
+data-dependent, so page-aligned, fixed-size I/O planning over records remains
+valid (#1273). Data dependence prevents **identity inference**, not extent planning:
 the stored framing determines the record's complete physical length before
 decode, so page-aligned reads (including 4 KiB-padded `O_DIRECT` extents)
 remain possible. The stamp is still mandatory because the format identity,

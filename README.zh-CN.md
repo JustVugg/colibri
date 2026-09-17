@@ -3,19 +3,19 @@
 </p>
 
 <p align="center">
-  <a href="https://discord.gg/FkyrEeJR"><b>Discord</b></a> ·
+  <a href="https://discord.gg/RXV83nSZdk"><b>Discord</b></a> ·
   <a href="README.md">English</a> · 简体中文 · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a>
 </p>
 
 **小巧引擎，庞大模型。**在消费级与异构硬件上运行**前沿 MoE 模型——从 744B 到
 2.8T 参数**——以引擎零依赖的纯 C 实现，将存储、RAM 与 VRAM 视为统一的推理层级。
 
-目前可运行八个模型家族：**GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B，含视觉）、
-**Inkling**（975B）、**Kimi K3**（2.8T）、**DeepSeek V4 Flash**（284B）、
+目前可运行九个模型家族：**GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B，含视觉）、
+**Inkling**（975B）、**Kimi K3**（2.8T）、**DeepSeek V4 Flash**（284B）、**DeepSeek V4.1 Flash**（552B，含视觉）、
 **Qwen3.8-Flash-Next**（125B + 51B n-gram）、**Qwen3.6**（35B-A3B）与 **OLMoE**（7B）
 ——各自一个 C 文件，共用同一套 `coli chat` / `coli serve` / `coli web` 前端。[完整列表](README.md#other-supported-models)
 
-> **Colibrì 既是今天就能运行的推理引擎，也是一个开放的研究平台。**它的首要目标是在
+> **Colibrì 既是今天就能运行的推理引擎，也是一个开放的研究平台**。它的首要目标是在
 > 完整的软硬件边界上追求推理侧性能——模型格式、内存层级、存储 I/O、放置、调度、内核、
 > 推测解码以及 CPU/GPU 重叠执行——让大模型减少对稀缺硬件的依赖，并降低运行成本。
 
@@ -25,7 +25,7 @@ Colibrì 刻意用于验证激进的系统思路——因此**对速度不作 SL
 
 ```
 $ ./coli chat
-  🐦 colibri v1.10.2 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.11.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -70,20 +70,20 @@ VRAM／RAM／磁盘层级条，以及角落的实时迷你大脑。</em></p>
 
 ## 核心技术与实测结论
 
-- **统一层级，而非单一内存门槛。**VRAM、RAM 与 NVMe 是同一份权重的不同放置层级；
+- **统一层级，而非单一内存门槛**。VRAM、RAM 与 NVMe 是同一份权重的不同放置层级；
   高速内存不足只影响速度，不改变模型语义。
-- **权重的 JIT。**实测路由热度驱动逐层 LRU、学习型热门专家固定区和提前一层的预取，
+- **权重的 JIT**。实测路由热度驱动逐层 LRU、学习型热门专家固定区和提前一层的预取，
   无需加载所有专家。它在可重复负载上有收益，但历史可能过拟合，预取在部分主机上也可能
   负优化，因此它们是需要测量的策略，不是性能承诺。
-- **I/O 本身就是引擎的一部分。**专家批次并集、读算重叠、`O_DIRECT` 与加权双 SSD
+- **I/O 本身就是引擎的一部分**。专家批次并集、读算重叠、`O_DIRECT` 与加权双 SSD
   分流直接优化流式路径，而不是假装存储延迟不存在。`O_DIRECT` 取决于磁盘，双 SSD
   仍需要更多社区端到端 A/B。
-- **异构执行。**CPU、CUDA、Metal、NUMA 内存以及专家的部分或全部常驻共用一个运行时，
+- **异构执行**。CPU、CUDA、Metal、NUMA 内存以及专家的部分或全部常驻共用一个运行时，
   可按机器条件组合；最佳组合取决于算力、带宽、驻留率与负载。
-- **压缩状态，不篡改模型。**逐 token 精确的前向验证、缩小 57 倍的 MLA KV 状态、
+- **压缩状态，不篡改模型**。逐 token 精确的前向验证、缩小 57 倍的 MLA KV 状态、
   持久化热会话与忠实 DSA，让优化始终受正确性约束。这些是内存、延迟和正确性属性，
   不是笼统的吞吐承诺。
-- **必须证明收益的推测解码。**原生 MTP 与语法强制草稿均接受端到端测量；
+- **必须证明收益的推测解码**。原生 MTP 与语法强制草稿均接受端到端测量；
   接受率无法覆盖验证成本时可以关闭。
 
 ## 开放猜想、实验与参与方式
@@ -192,13 +192,13 @@ MTP head 必须是 **int8**（int4 head 的接受率会崩塌到 0–4%，见
 同一套引擎、同一个 int4 容器——硬件只会改变专家的存放位置。
 [完整 benchmark 表格](docs/benchmarks.md)中的重点如下：
 
-- **6× RTX 5090，全部常驻：**解码 5.8–6.8 tok/s，TTFT 约 13 秒
+- **6× RTX 5090，全部常驻**：解码 5.8–6.8 tok/s，TTFT 约 13 秒
   （[实验记录](docs/experiments/glm52-6x5090-2026-07-12.md)）；
-- **128 GB、仅使用 CPU 的台式机：**热缓存后约 1.8 tok/s
+- **128 GB、仅使用 CPU 的台式机**：热缓存后约 1.8 tok/s
   （[#200](https://github.com/JustVugg/colibri/issues/200)）；
-- **单张 RTX 5070 Ti 的笔记本级主机：**通过 GPU 常驻管线达到 1.07 tok/s
+- **单张 RTX 5070 Ti 的笔记本级主机**：通过 GPU 常驻管线达到 1.07 tok/s
   （[#273](https://github.com/JustVugg/colibri/issues/273)）；
-- **25 GB 开发机：**冷启动 0.05–0.1 tok/s——这是项目起步时已证实的下限，
+- **25 GB 开发机**：冷启动 0.05–0.1 tok/s——这是项目起步时已证实的下限，
   也仍是诚实的基准。
 
 质量来自测量，而非假设：int4 容器的量化损失，以及 scale granularity／rotation
@@ -242,6 +242,11 @@ Hugging Face 上已有预转换的 **GLM-5.2 int4** 容器——请务必使用
 **含 int8 MTP head 的 group-scaled（gs64）版本**。它约为 **372 GB**，请放在空间足够的磁盘上，最好是快盘：
 
 **https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
+
+**GLM-5.3** 属于同一家族,使用同一引擎加载。它有自己的 group-scaled(gs64)容器,
+约 **419 GB**,且**不含** MTP head,因此推测解码保持关闭:
+
+**https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64**
 
 > ⚠️ 请使用上面的 **gs64** 容器，不要使用较旧的 per-row int4 镜像
 >（`mateogrgic/…`、`jlnsrk/…`）：后者质量实测低约 9 个百分点，也是
@@ -307,11 +312,11 @@ oracle 说明，请参阅[中文版 DeepSeek V4 文档](docs/deepseek-v4.zh-CN.m
 
 ## 下一步
 
-- **推理系统研究就是产品。**当前层级采用 LRU 与学习型固定集；正在研究模型格式、压缩、
+- **推理系统研究就是产品**。当前层级采用 LRU 与学习型固定集；正在研究模型格式、压缩、
   放置、调度、I/O、CPU/GPU 内核、异构重叠、KV 状态与路由感知推测。目标是降低硬件要求
   和每个有效 token 的成本，所有成果都以端到端测量为准、经审查并公开开发。
-- **支持更多开放模型。**层级算法与模型无关，任何带路由专家的 MoE 都能用相同方式分层。
-  目前已有八个模型家族可用（GLM-5.2、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、
+- **支持更多开放模型**。层级算法与模型无关，任何带路由专家的 MoE 都能用相同方式分层。
+  目前已有九个模型家族可用（GLM-5.2、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、
   Qwen3.8-Flash-Next、Qwen3.6、OLMoE）；更多开放权重家族（候选包括 **MiniMax**）将沿用同样的
   规则获得引擎支持：有人完成端到端实测之后。
 
@@ -322,7 +327,7 @@ colibrì 最初由一人使用 12 核心、25 GB RAM 的笔记本开发；
 
 - ⭐ 为仓库加星并分享；
 - 🐛 以 issue 提交你的硬件 benchmark 数据——实测数据比任何其他事都更能推动项目；
-- 💬 加入 [Discord 社区](https://discord.gg/FkyrEeJR)，讨论实验、硬件数据与研究方向；
+- 💬 加入 [Discord 社区](https://discord.gg/RXV83nSZdk)，讨论实验、硬件数据与研究方向；
 - 💬 若想赞助开发或捐赠硬件，请通过 GitHub issues 联系。
 
 ## 仓库结构
@@ -361,4 +366,4 @@ docs/                     参考文档、实验、媒体文件与 DeepSeek V4 �
 
 ## 许可证
 
-Apache 2.0。GLM-5.2 权重由 Z.ai 以 MIT 许可发布。
+Apache 2.0，Copyright 2026 Vincenzo Fornaro。详见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。GLM-5.2 权重由 Z.ai 以 MIT 许可发布。

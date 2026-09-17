@@ -6,13 +6,17 @@
  * traffic without a GPU or the CUDA toolkit. A test that only checked
  * "qt_init returns 1" would pass even with the tier fully broken.
  *
- * Two settable hooks beyond plain recording:
+ * Three settable hooks beyond plain recording:
  *   fake_ndev        - device count returned by coli_cuda_available_device_count
  *                       and coli_cuda_device_count (default 1).
  *   fake_issue_hook   - called by coli_cuda_expert_group_issue with the issuing
  *                       device (taken from g[0]->device), the row count and the
  *                       input pointer; its return value is what issue returns.
- *                       NULL (the default) reproduces the old always-0 stub. */
+ *                       NULL (the default) reproduces the old always-0 stub.
+ *   fake_upload_hook  - called at the start of every tensor upload, on the
+ *                       uploader thread, with the tensor's fmt. A test that
+ *                       needs an upload to take TIME (a real cudaMemcpy does)
+ *                       sleeps here; NULL (the default) uploads instantly. */
 #ifndef QWEN36_FAKE_CUDA_H
 #define QWEN36_FAKE_CUDA_H
 
@@ -22,18 +26,9 @@
 #include <stdint.h>
 #include <time.h>
 
-/* MinGW non ha setenv: il tier legge la sua configurazione dall'ambiente, e il
- * test deve poterla impostare anche su Windows. */
-#if defined(_WIN32)
-#include <stdlib.h>
-static int test_setenv(const char *name, const char *value, int overwrite) {
-    (void)overwrite; return _putenv_s(name, value);
-}
-#define setenv test_setenv
-#endif
 #include "../backend_cuda.h"
 
-struct ColiCudaTensor { int fmt, I, O, device, gs; const void *w; };
+struct ColiCudaTensor { int fmt, I, O, device, gs; const void *w; const float *sc; };
 
 static int fake_uploads;
 static int last_fmt = -1;
@@ -44,11 +39,23 @@ static size_t captured_len;
 static int fake_ndev = 1;
 static size_t fake_free_bytes = 2ull << 30;    /* what coli_cuda_mem_info reports as free */
 static int (*fake_issue_hook)(int device, int count, const float *x) = NULL;
+static void (*fake_upload_hook)(int fmt) = NULL;
 
-static int upload_common(ColiCudaTensor **t, const void *w, int fmt,
+/* fake_dense_compute=1: coli_cuda_matmul really computes fmt 1 (int8 per
+ * row) from the uploaded bytes, so an engine test can put a trunk on the fake
+ * tier and demand the same tokens as the CPU int8 reference. The engine
+ * frees its int8 rows right after qt_dense_init, so the upload keeps a copy. */
+static int fake_dense_compute;
+static int upload_common(ColiCudaTensor **t, const void *w, const float *sc, int fmt,
                          int I, int O, int device, int gs) {
+    if (fake_upload_hook) fake_upload_hook(fmt);
     ColiCudaTensor *n = (ColiCudaTensor *)calloc(1, sizeof *n);
-    n->fmt = fmt; n->I = I; n->O = O; n->device = device; n->gs = gs; n->w = w;
+    n->fmt = fmt; n->I = I; n->O = O; n->device = device; n->gs = gs; n->w = w; n->sc = sc;
+    if (fake_dense_compute && fmt == 1 && w && sc) {
+        int8_t *q = (int8_t *)malloc((size_t)I * O); float *s = (float *)malloc((size_t)O * sizeof(float));
+        if (q && s) { memcpy(q, w, (size_t)I * O); memcpy(s, sc, (size_t)O * sizeof(float)); n->w = q; n->sc = s; }
+        else { free(q); free(s); n->w = NULL; n->sc = NULL; }
+    }
     *t = n;
     fake_uploads++;
     last_fmt = fmt;
@@ -61,13 +68,16 @@ static int upload_common(ColiCudaTensor **t, const void *w, int fmt,
 }
 int coli_cuda_tensor_upload(ColiCudaTensor **t, const void *w, const float *s,
                             int fmt, int I, int O, int device) {
-    (void)s; return upload_common(t, w, fmt, I, O, device, 0);
+    return upload_common(t, w, s, fmt, I, O, device, 0);
 }
 int coli_cuda_tensor_upload_g(ColiCudaTensor **t, const void *w, const float *s,
                               int fmt, int I, int O, int device, int gs) {
-    (void)s; return upload_common(t, w, fmt, I, O, device, gs);
+    return upload_common(t, w, s, fmt, I, O, device, gs);
 }
-void coli_cuda_tensor_free(ColiCudaTensor *t) { free(t); }
+void coli_cuda_tensor_free(ColiCudaTensor *t) {
+    if (t && fake_dense_compute && t->fmt == 1) { free((void *)t->w); free((void *)t->sc); }
+    free(t);
+}
 int coli_cuda_available_device_count(void) { return fake_ndev; }
 int coli_cuda_device_count(void) { return fake_ndev; }
 int coli_cuda_init(const int *d, int n) { (void)d; (void)n; return 1; }
@@ -102,7 +112,17 @@ void coli_cuda_stats(int device, size_t *count, size_t *bytes) {
  * unused on purpose (CFLAGS carry -Wno-unused-parameter). */
 static int fake_matmuls;
 int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x, const void *weights, const float *scales, int fmt, int S, int I, int O, int device, int gs) {
-    fake_matmuls++; return 1;
+    fake_matmuls++;
+    ColiCudaTensor *t = tensor ? *tensor : NULL;
+    if (fake_dense_compute && t && t->fmt == 1 && t->w && t->sc && t->I == I && t->O == O) {
+        const int8_t *q = (const int8_t *)t->w;
+        for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
+            const int8_t *w = q + (size_t)o * I; const float *xs = x + (size_t)s * I; float a = 0.f;
+            for (int i = 0; i < I; i++) a += xs[i] * (float)w[i];
+            y[(size_t)s * O + o] = a * t->sc[o];
+        }
+    }
+    return 1;
 }
 
 #endif /* QWEN36_FAKE_CUDA_H */
