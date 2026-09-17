@@ -351,7 +351,7 @@ jobs:
           gcc --version | Select-Object -First 1
           make --version | Select-Object -First 1
           cd c
-          $out = python -m unittest tests.test_backend_loader -v 2>&1 | Out-String
+          $out = python -m unittest tests.test_backend_loader tests.test_cuda_loader_discovery tests.test_qwen36_device_selection -v 2>&1 | Out-String
           $out
           if ($LASTEXITCODE -ne 0) { throw "loader contract tests failed" }
           # A missing toolchain shows up as setUpClass skips, not failures, so a
