@@ -633,11 +633,18 @@ static int eslot_victim_pick(Model *m,int layer,int ecap){
         }
     }
     if(m->ev_head && m->ev_head[layer]>=0){
-        ESlot *s=&Sl[m->ev_head[layer]];
-        if(!eslot_busy(s)) return m->ev_head[layer];
-        /* NOTE: list members CAN be in-flight (eslots_acquire does not unlink);
-         * the busy check + the LRU scan fallback below keep this O(1) amortized,
-         * degrading to the legacy scan only while the head is busy. */
+        /* #1571 r2 (JustVugg): the legacy scan's growth rule returns an emptied
+         * slot while the row's live-slab count is below capacity; a non-negative
+         * list head used to shadow that rule, permanently evicting live
+         * residents in a growing row. Growth (nn < ecap) is the rare path —
+         * pay the legacy scan there instead of trusting the list head. */
+        if(!(nn<ecap) || nn<=0){
+            ESlot *s=&Sl[m->ev_head[layer]];
+            if(!eslot_busy(s)) return m->ev_head[layer];
+            /* NOTE: list members CAN be in-flight (eslots_acquire does not unlink);
+             * the busy check + the LRU scan fallback below keep this O(1) amortized,
+             * degrading to the legacy scan only while the head is busy. */
+        }
     }
     return eslot_lru_victim(Sl,nn,ecap);   /* fallback: LRU residents / empty-under-cap */
 }
@@ -2439,8 +2446,8 @@ static void model_init_range(Model *m, const char *snap, int cap,
     m->ecache_slot_by_expert=calloc(NR,sizeof(int*));
     m->ev_head=calloc(NR,sizeof(int)); m->ev_tail=calloc(NR,sizeof(int));   /* #1050 recency lists */
     m->ecn_freeslab=calloc(NR,sizeof(int));      /* #1050 free-with-slab counters */
+    if(!m->ev_head||!m->ev_tail||!m->ecn_freeslab){ fprintf(stderr,"OOM expert cache recency list\n"); exit(1); }   /* #1571 r2: check BEFORE the init loop dereferences */
     for(int i=0;i<NR;i++){ m->ev_head[i]=-1; m->ev_tail[i]=-1; }   /* #1050 (Grok-r1 B1): calloc-zero reads as head=0 */
-    if(!m->ev_head||!m->ev_tail||!m->ecn_freeslab){ fprintf(stderr,"OOM expert cache recency list\n"); exit(1); }
     m->kv_dev_L=calloc(NR,sizeof(float*)); m->kv_dev_R=calloc(NR,sizeof(float*));
     m->kv_dev_valid=calloc(NR,sizeof(int));
 #ifdef COLI_VULKAN
@@ -8539,6 +8546,11 @@ static void rss_guard(Model *m){
              * devono restare mutuamente esclusivi finche' il puntatore non e' NULL. */
             compat_aligned_free(s->slab); free(s->fslab);
             s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0;
+            /* #1571 r2 (JustVugg): ecache_hide counted this slab as a #1034
+             * free-with-slab reuse candidate while it was still alive; the free
+             * must cancel it, else the counter drifts and the picker keeps
+             * treating an emptied slot as reusable-slab it is not. */
+            if(m->ecn_freeslab && m->ecn_freeslab[l]>0) m->ecn_freeslab[l]--;
             QT *q[3]={&s->g,&s->u,&s->d};
             for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
             s->used=0;                                    /* primo candidato al riuso */
