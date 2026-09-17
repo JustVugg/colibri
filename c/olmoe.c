@@ -206,13 +206,33 @@ static void victim_touch(LCache *lc, Slot *s, int idx) {
  * newly pinned older slot must slot in before newer-pinned members (Sol-r1 M3:
  * tail-append made the all-pinned fallback pick a newer pinned slot over an
  * older one, diverging from the scan).  Pin-lists are capped by PIN_HOT budget
- * and flips are rare, so the scan is bounded by the pin budget, not by cap. */
+ * and flips are rare, so the scan is bounded by the pin budget, not by cap.
+ * #1571 r2 (JustVugg differential): the same invariant holds on UNPIN — a
+ * pin->ev flip must not tail-append on its old stamp either, or the unpin
+ * promotes an older slot to MRU over genuinely newer ones and the ev-head
+ * diverges from the legacy min-used pick. Unpin re-inserts by `used` from the
+ * ev-head side (rare path, bounded by the pin budget like the pin-list scan). */
 static void victim_refile(LCache *lc, Slot *s, int idx) {
     int want = s->pinned ? 2 : 1;
     if (want == 1) {
-        if (s->rlist == 1 && lc->ev_tail == idx) return;
+        /* #1571 r2: publish-stamped slots carry a fresh stamp (fresher than
+         * every member) -> tail-append O(1). Pin->ev flips keep their OLD
+         * stamp -> splice by `used` from the head, so the ev-list stays in
+         * exact `used` order and ev-head == legacy min-used (rare path,
+         * pin-budget bound). Fresh-publish fast path: tail.used < s->used. */
+        if (lc->ev_tail < 0 || lc->slots[lc->ev_tail].used < s->used) {
+            victim_unlink(lc, s, idx);
+            victim_push_back(lc, s, idx, 1);
+            return;
+        }
+        /* old-stamp insert (pin flip): splice before the first newer member */
         victim_unlink(lc, s, idx);
-        victim_push_back(lc, s, idx, 1);
+        int at = -1;
+        int next = lc->ev_head;
+        while (next >= 0 && lc->slots[next].used <= s->used) { at = next; next = lc->slots[next].rnext; }
+        s->rlist = 1; s->rprev = at; s->rnext = next;
+        if (next >= 0) lc->slots[next].rprev = idx; else lc->ev_tail = idx;
+        if (at >= 0) lc->slots[at].rnext = idx; else lc->ev_head = idx;
         return;
     }
     victim_unlink(lc, s, idx);
@@ -786,6 +806,16 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
     s->pinned = 0;
 }
 
+/* Test-only hook: the randomised differential test (test_olmoe_differential.c)
+ * drives the real expert_get/pilot_realload call sites without a checkpoint.
+ * The stub keeps the ordering (hide/stamp/publish/refile) fully exercised while
+ * replacing only the disk read. Never defined outside the test harness. */
+#ifdef OLMOE_TEST_STUB_LOAD
+static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
+    (void)m; (void)layer; (void)eid;
+    if (s->g) memset(s->g, 0xAB, 16);              /* deterministic payload marker */
+}
+#else
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     char nm[256], qsnm[256];
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.merged_weight", layer, eid);
@@ -814,6 +844,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     st_read_f32(&m->S, qsnm, s->gs, 0);  /* scales are F32; use typed reader for dtype safety */
     __atomic_fetch_add(&m->disk_ns, (uint64_t)((now_s() - started) * 1e9), __ATOMIC_RELAXED);
 }
+#endif /* OLMOE_TEST_STUB_LOAD */
 
 /* ---------- cache expert: ritorna i pesi quantizzati (q+scale) da cache o disco ---------- */
 /* One byte per expert: routed in this turn or not. The dashboard's Brain tab
@@ -1229,8 +1260,10 @@ static void pilot_realload(Model *m, int layer, int eid) {
     pthread_mutex_lock(&g_pilot_mx);
     cache_publish(m, layer, s, eid);
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
+    s->used = ++m->clock;                          /* stamp BEFORE refile: the pin insert-scan
+                                                    * must see the final stamp (L2b differential:
+                                                    * refile-then-bump left a stale-ordered pin list) */
     victim_refile(lc, s, (int)(s - lc->slots));   /* #1050: pin flip re-files */
-    s->used = ++m->clock;
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     m->is_queued[layer * c->n_experts + eid] = 0;
     pthread_mutex_unlock(&g_pilot_mx);
