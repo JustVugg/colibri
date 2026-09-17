@@ -6418,23 +6418,29 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * M/K/N, so an unrelated operation of the same shape cannot inherit this
          * one's qualification. sh_down is deliberately absent below: its
          * orientation (I=sI, O=D) is not what the qualified F3 artifact
-         * computes. Inert without the internal test control; there is no public
-         * switch and no automatic policy in this slice. */
+         * computes. Reached only on an explicit request (coli --xdna / COLI_XDNA);
+         * there is no automatic policy.
+         *
+         * omp_in_parallel() skips the lane, exactly as the GPU dispatches above do:
+         * backend_xdna.c keeps process-wide staging buffers and a wrapped-identity
+         * pair with no locking, so it must never be entered from inside an OpenMP
+         * team. Today this tail runs after the parallel region closes; the guard
+         * keeps that true if it ever changes. Inside a team, matmul_qt runs. */
 #ifdef COLI_XDNA
-        if(!coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &l->sh_gate.xdna,
-                                 l->sh_gate.fmt, l->sh_gate.q4, l->sh_gate.s,
-                                 l->sh_gate.I, l->sh_gate.O, l->sh_gate.gs, l->sh_gate.planar,
-                                 sg, x, S))
+        if(omp_in_parallel() || !coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &l->sh_gate.xdna,
+                                                      l->sh_gate.fmt, l->sh_gate.q4, l->sh_gate.s,
+                                                      l->sh_gate.I, l->sh_gate.O, l->sh_gate.gs, l->sh_gate.planar,
+                                                      sg, x, S))
 #endif
 #ifdef COLI_VULKAN
         if(!vk_matmul_qt(&l->sh_gate, sg, x, S))
 #endif
         matmul_qt(sg, x, &l->sh_gate, S);
 #ifdef COLI_XDNA
-        if(!coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &l->sh_up.xdna,
-                                 l->sh_up.fmt, l->sh_up.q4, l->sh_up.s,
-                                 l->sh_up.I, l->sh_up.O, l->sh_up.gs, l->sh_up.planar,
-                                 su, x, S))
+        if(omp_in_parallel() || !coli_xdna_try_matmul(COLI_XDNA_FAMILY_MOE_SHARED_GATE_UP, &l->sh_up.xdna,
+                                                      l->sh_up.fmt, l->sh_up.q4, l->sh_up.s,
+                                                      l->sh_up.I, l->sh_up.O, l->sh_up.gs, l->sh_up.planar,
+                                                      su, x, S))
 #endif
 #ifdef COLI_VULKAN
         if(!vk_matmul_qt(&l->sh_up, su, x, S))
