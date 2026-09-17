@@ -2199,7 +2199,7 @@ class SeedWireFrameTest(unittest.TestCase):
         with patch("openai_server.subprocess.Popen", return_value=process):
             engine = Engine("glm", "model")
         server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", 16)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
         thread.start()
         try:
             data = json.dumps(body).encode()
@@ -2389,7 +2389,7 @@ class HTTPTest(unittest.TestCase):
     def setUpClass(cls):
         cls.engine = FakeEngine()
         cls.server = APIServer(("127.0.0.1", 0),cls.engine,"test-model","secret",16,kv_slots=2)
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, args=(0.01,), daemon=True)
         cls.thread.start()
         cls.base = f"http://127.0.0.1:{cls.server.server_port}"
 
@@ -2682,7 +2682,7 @@ class ClientHangupTest(unittest.TestCase):
         # assert on it rather than on captured output.
         self.server.handle_error = lambda request, address: self.errors.append(
             sys.exc_info()[1])
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, args=(0.01,), daemon=True)
         self.thread.start()
         self.addCleanup(self.thread.join, 2)
         self.addCleanup(self.server.server_close)
@@ -2769,7 +2769,7 @@ class StaticServingTest(unittest.TestCase):
         self.web_dist = patch.object(APIHandler, "WEB_DIST", dist)
         self.web_dist.start()
         self.server = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model")
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, args=(0.01,), daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
 
@@ -2795,7 +2795,7 @@ class SchedulerHTTPTest(unittest.TestCase):
         self.engine = BlockingEngine()
         self.server = APIServer(("127.0.0.1", 0), self.engine, "test-model",
                                 max_tokens=16, max_queue=0)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, args=(0.01,), daemon=True)
         self.thread.start()
         self.url = f"http://127.0.0.1:{self.server.server_port}/v1/chat/completions"
 
@@ -3095,7 +3095,7 @@ class AllowedHostsTest(unittest.TestCase):
     def _make_server(self, allowed_hosts=()):
         server = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model",
                            allowed_hosts=allowed_hosts)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
         thread.start()
         self.addCleanup(thread.join, 2)
         self.addCleanup(server.server_close)
@@ -3268,7 +3268,7 @@ class GlmReasoningStreamTest(unittest.TestCase):
 
     def _server(self, chunks):
         server = APIServer(("127.0.0.1", 0), _ChunkEngine(chunks), "test-model")
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
         thread.start()
         self.addCleanup(thread.join, 2)
         self.addCleanup(server.server_close)
@@ -3430,7 +3430,7 @@ class StreamingContextRejectTest(unittest.TestCase):
 
     def setUp(self):
         self.server = APIServer(("127.0.0.1", 0), _ContextExceededEngine(), "test-model")
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, args=(0.01,), daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
 
@@ -3476,7 +3476,7 @@ class KeepAliveFramingTest(unittest.TestCase):
 
     def _server(self, engine=None, **kw):
         server = APIServer(("127.0.0.1", 0), engine or FakeEngine(), "test-model", **kw)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
         thread.start()
         self.addCleanup(thread.join, 2)
         self.addCleanup(server.server_close)
@@ -3746,7 +3746,7 @@ class ConnectionLimitTest(unittest.TestCase):
         self.addCleanup(setattr, APIServer, "MAX_CONNECTIONS_PER_IP", 8)
         self.addCleanup(setattr, APIHandler, "READ_DEADLINE", 30)
         self.server = APIServer(("127.0.0.1", 0), self.engine, "m", None, 16, kv_slots=1)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.server.serve_forever, args=(0.01,), daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         self.addCleanup(self.server.scheduler.close)
@@ -3985,7 +3985,7 @@ class LogprobsHTTPTest(unittest.TestCase):
         cls.engine = FakeEngine()
         cls.server = APIServer(("127.0.0.1", 0), cls.engine, "test-model", "secret", 16,
                                kv_slots=2)
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, args=(0.01,), daemon=True)
         cls.thread.start()
         cls.base = f"http://127.0.0.1:{cls.server.server_port}"
 
@@ -4009,12 +4009,12 @@ class LogprobsHTTPTest(unittest.TestCase):
         for the capability-gate negative cases, which must not share
         cls.engine/cls.server with the rest of this class."""
         server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", 16, kv_slots=1)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
         thread.start()
-        self.addCleanup(server.scheduler.close)
-        self.addCleanup(server.shutdown)
-        self.addCleanup(server.server_close)
         self.addCleanup(thread.join, timeout=2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
         return f"http://127.0.0.1:{server.server_port}"
 
     # ---- chat logprobs shape ------------------------------------------------
@@ -4482,7 +4482,7 @@ class LogprobsGoldenResponseRegressionTest(unittest.TestCase):
     def setUp(self):
         self.engine = FakeEngine()
         self.server = APIServer(("127.0.0.1", 0), self.engine, "test-model")
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, args=(0.01,), daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
 
@@ -4609,12 +4609,12 @@ class EchoTextPrependTest(unittest.TestCase):
     def _server(self):
         engine = _DistinctEchoEngine()
         server = APIServer(("127.0.0.1", 0), engine, "test-model")
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
         thread.start()
-        self.addCleanup(server.scheduler.close)
-        self.addCleanup(server.shutdown)
-        self.addCleanup(server.server_close)
         self.addCleanup(thread.join, timeout=2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
         return f"http://127.0.0.1:{server.server_port}"
 
     def test_echo_true_returns_prompt_plus_completion_in_text(self):
@@ -4687,12 +4687,12 @@ class EchoSeamDecodingTest(unittest.TestCase):
     def test_split_codepoint_at_the_seam_decodes_as_one_character(self):
         engine = _SeamSplitEngine()
         server = APIServer(("127.0.0.1", 0), engine, "test-model")
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
         thread.start()
-        self.addCleanup(server.scheduler.close)
-        self.addCleanup(server.shutdown)
-        self.addCleanup(server.server_close)
         self.addCleanup(thread.join, timeout=2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
         base = f"http://127.0.0.1:{server.server_port}"
         req = Request(base + "/v1/completions",
                       data=json.dumps({"model": "test-model", "prompt": "A\u20ac",
@@ -4749,12 +4749,12 @@ class LogprobsDroppedStopTokenTest(unittest.TestCase):
     def test_filtered_stop_token_record_is_dropped(self):
         engine = _StopTokenLogprobsEngine()
         server = APIServer(("127.0.0.1", 0), engine, "test-model")
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
         thread.start()
-        self.addCleanup(server.scheduler.close)
-        self.addCleanup(server.shutdown)
-        self.addCleanup(server.server_close)
         self.addCleanup(thread.join, timeout=2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
         base = f"http://127.0.0.1:{server.server_port}"
         req = Request(base + "/v1/completions",
                       data=json.dumps({"model": "test-model", "prompt": "hi",
@@ -5027,12 +5027,12 @@ def _spawn_test_server(case, engine, kv_slots=1, max_tokens=16):
     generated-side completion budget."""
     server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", max_tokens,
                        kv_slots=kv_slots)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
     thread.start()
-    case.addCleanup(server.scheduler.close)
-    case.addCleanup(server.shutdown)
-    case.addCleanup(server.server_close)
     case.addCleanup(thread.join, timeout=2)
+    case.addCleanup(server.server_close)
+    case.addCleanup(server.shutdown)
+    case.addCleanup(server.scheduler.close)
     return f"http://127.0.0.1:{server.server_port}"
 
 
@@ -5175,7 +5175,7 @@ class BatchCompletionHTTPTest(unittest.TestCase):
         cls.engine = ScriptedEngine()
         cls.server = APIServer(("127.0.0.1", 0), cls.engine, "test-model", "secret", 16,
                                kv_slots=1)
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, args=(0.01,), daemon=True)
         cls.thread.start()
         cls.base = f"http://127.0.0.1:{cls.server.server_port}"
 
@@ -5445,12 +5445,12 @@ class BatchCompletionHTTPTest(unittest.TestCase):
         engine = DisconnectAfterThirdEngine()
         server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", 16,
                            kv_slots=1)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
         thread.start()
-        self.addCleanup(server.scheduler.close)
-        self.addCleanup(server.shutdown)
-        self.addCleanup(server.server_close)
         self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
 
         original_client_disconnected = APIHandler.client_disconnected
 
@@ -6090,6 +6090,14 @@ class EngineWriteCheckingTest(unittest.TestCase):
         with patch("openai_server.subprocess.Popen", return_value=process):
             engine = Engine("glm", "model")
         self.addCleanup(engine.close)
+        # Close the fake's stdout in cleanup, not here: closing it now (while the
+        # dispatcher may still be reading) would race the dispatcher's own EOF
+        # handling against this test's assertions below. Left open for the whole
+        # test body, exactly like a real process's pipe stays open until it
+        # actually exits; registered AFTER engine.close() so it runs FIRST at
+        # teardown (unittest's cleanups are LIFO) and lets the dispatcher see EOF
+        # and exit before engine.close()'s join ever has to wait on it.
+        self.addCleanup(process.stdout.close)
         process.returncode = 1
         raised = self._bounded(engine.generate, "hi", 8, 0.7, 0.9, lambda _: None)
         self.assertIsInstance(raised, RuntimeError)
@@ -6124,6 +6132,13 @@ class EngineWriteCheckingTest(unittest.TestCase):
         with patch("openai_server.subprocess.Popen", return_value=process):
             engine = Engine("glm", "model")
         self.addCleanup(engine.close)
+        # Same reasoning as test_submit_refuses_before_any_write_when_the_process_
+        # has_exited above: leave the pipe open for the whole test body (poll()
+        # here answers non-None from its second call on, so by teardown
+        # engine.close() would otherwise skip terminate() and wait out the full
+        # dispatcher join), and close it only in cleanup, registered after
+        # engine.close() so it runs first (LIFO).
+        self.addCleanup(process.stdout.close)
         raised = self._bounded(engine.generate, "hi", 8, 0.7, 0.9, lambda _: None)
         self.assertIsInstance(raised, RuntimeError)
         self.assertIn("colibri engine is not running", str(raised))
