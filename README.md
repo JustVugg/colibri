@@ -338,6 +338,11 @@ You need two things: **the program** (a few hundred KB) and **the model**
 (372 GB). Step-by-step for every platform in the
 [Quick Start guide](docs/quickstart.md).
 
+Already have Colibri and a model? The optional [desktop launcher](docs/launcher.md)
+provides a saved model library, Web Chat/API Server selection, CPU/CUDA checks,
+and Start/Stop controls on Windows and Linux. Install from this checkout with
+`python -m pip install -e ".[launcher]"`, then open `coli-launcher`.
+
 ### 1. Get colibri
 
 **Download a prebuilt release** — Linux, macOS and Windows, no compiler needed.
