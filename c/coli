@@ -430,6 +430,11 @@ def env_for_engine(a, arch, plan=None):
     env = os.environ.copy()
     env.pop(_PROFILE_CAP_ENV,None)
     env.pop(_PLAN_CAP_ENV,None)
+    # Every engine reads SNAP to locate the model directory; env_for() sets it
+    # for glm, but this path never did, so `coli run` on olmoe/inkling/kimi/
+    # deepseek_v4 always failed with "started without a model" (#1600).
+    if getattr(a, "model", None):
+        env["SNAP"] = str(a.model)
     family=family_by_id(arch)
     if getattr(a,"ram",0): explicit_env.add("RAM_GB")
     # OMP_NUM_THREADS for the sister engines that do not size their own team.
