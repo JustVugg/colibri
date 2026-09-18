@@ -1892,6 +1892,11 @@ tests/bench_indexer_allocations$(EXE): tests/bench_indexer_allocations.c
 tests/bench_idot$(EXE): tests/bench_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# bench_i4p_gidot: microbenchmark (per-row vs multi-row/AMX K1b grouped planar IDOT), NOT a test gate.
+# Build on demand: make tests/bench_i4p_gidot ARCH=native
+tests/bench_i4p_gidot$(EXE): tests/bench_i4p_gidot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 # bench_gemv_stream: microbenchmark (decode-regime GEMV bandwidth vs the read ceiling;
 # frozen-baseline + deinterleaved-x candidate A/B), NOT a test gate.
 # Build on demand: make tests/bench_gemv_stream ARCH=native

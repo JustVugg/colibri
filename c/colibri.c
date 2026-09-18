@@ -1066,16 +1066,21 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
  * i loro consumatori sono esattamente matmul_qt/expert_gate_up, tutti
  * planar-aware. kv_b (letto raw dal path DSA fuso), embedding (dequant
  * per-token) e attenzione restano a coppie PER COSTRUZIONE. Off su build GPU
- * (i backend leggono q4 a coppie), sotto XEXP (dot_i4i8 sulle slab) e su
- * build AVX-512F (il ramo f32 a 512 bit accumula in altro ordine).
- * EN: K1 planar gate. MoE tensors only; GPU builds, XEXP and AVX-512F builds
- * keep the classic pair layout. PLANAR=0 is the kill switch. */
+ * (i backend leggono q4 a coppie) e sotto XEXP (dot_i4i8 sulle slab). Su
+ * build AVX-512F il ramo f32 a 512 bit accumula in altro ordine, quindi il
+ * planare fmt=2 resta SPENTO (vedi qt_planarize); la famiglia K1b (fmt=4,
+ * somme intere, esatte a qualunque larghezza) invece si accende — e' il path
+ * IDOT dei checkpoint gs64 sui server AVX-512/AMX.
+ * EN: K1 planar gate. MoE tensors only; GPU builds and XEXP keep the classic
+ * pair layout. On AVX-512F builds only fmt=2 planarization stays off (the
+ * 512-bit f32 pair arm accumulates in a different order than the planar f32
+ * twin); the integer K1b family (fmt=4) is width-exact and now enabled there,
+ * so IDOT_GS=1 reaches gs64 checkpoints on AVX-512/AMX servers.
+ * PLANAR=0 is the kill switch. */
 static int g_planar=-1;
 static int planar_on(void){
     if(g_planar<0){
 #if defined(COLI_CUDA)||defined(COLI_METAL)||defined(COLI_VULKAN)
-        g_planar=0;
-#elif defined(__AVX512F__)&&defined(__AVX512BW__)
         g_planar=0;
 #elif !defined(__AVX2__)
         g_planar=0;   /* matmul_i4p non ha (ancora) un ramo NEON: su ARM il path
@@ -1109,6 +1114,14 @@ static void qt_planarize(QT *t){
         planarize_i4(t->q4,t->O,t->I); t->planar=1; return;
     }
     if(t->fmt!=2) return;
+#if defined(__AVX512F__)&&defined(__AVX512BW__)
+    /* fmt=2 stays a coppie qui: il gemello f32 planare replica l'ordine di
+     * accumulo AVX2, non quello del ramo dot_i4f_avx512 a 512 bit — il claim
+     * bit-identico della famiglia f32 vale solo dove i gemelli coincidono.
+     * EN: fmt=2 keeps the pair layout on AVX-512 builds; the f32 planar twin
+     * mirrors the AVX2 accumulation order, not the 512-bit f32 arm's. */
+    return;
+#endif
     planarize_i4(t->q4,t->O,t->I); t->planar=1;
     if(atomic_fetch_add_explicit(&g_planar_n,1,memory_order_relaxed)==0)
         fprintf(stderr,"[K1] planar int4 layout active (PLANAR=0 disables)\n");
