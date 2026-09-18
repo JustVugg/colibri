@@ -83,6 +83,10 @@ in the status and log.
 Detected NVIDIA cards are listed even when CPU mode is selected or the model's
 engine cannot use CUDA. The CUDA choice is checked again when selected; choosing
 CPU does not prevent switching back on a compatible installation.
+If an engine supports only one GPU, choose **NVIDIA CUDA**, then select an
+individual card under **GPU devices**. Start stays disabled until that selection
+passes diagnostics. Missing CUDA libraries are reported separately from device
+selection problems; detecting a card does not replace those libraries.
 
 The first launcher version targets CPU and NVIDIA CUDA. Colibri also has HIP and
 Vulkan backends, but their integration is outside this version's simple selector.

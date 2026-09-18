@@ -754,10 +754,10 @@ class LauncherWindow(QMainWindow):
             self._updating_options = False
         cuda_index = self.compute_combo.findData("cuda")
         cuda_item = self.compute_combo.model().item(cuda_index)
-        # CPU diagnostics do not verify CUDA readiness. Allow choosing it when
-        # the engine and devices support it; that choice runs fresh diagnostics.
+        # Let users choose CUDA before correcting a GPU selection (for example,
+        # all GPUs on a single-GPU engine). Fresh diagnostics still gate Start.
         cuda_item.setEnabled(result.cuda_available or
-                             (options.compute == "cpu" and result.plan.get("cuda_capable") is True))
+                             result.plan.get("cuda_capable") is True)
         detected = "\n".join(f"Detected GPU {gpu.index}: {gpu.name}" for gpu in result.gpus)
         self.compute_reason.setText(f"{detected}\n{result.cuda_reason}" if detected else result.cuda_reason)
         explicit_cuda_unavailable = not result.cuda_available and options.compute == "cuda"

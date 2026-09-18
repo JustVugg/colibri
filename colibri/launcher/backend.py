@@ -270,13 +270,14 @@ def inspect_model(
     gpus = tuple(GpuDevice(item["index"], item["name"], float(item["memory_gb"]))
                  for item in metadata["gpus"])
     known_ids = {gpu.index for gpu in gpus}
-    cuda_capable = bool(metadata["family_accelerator"] and metadata["cuda_binary"] and gpus)
+    engine_cuda = metadata["family_accelerator"] and metadata["cuda_binary"]
+    cuda_capable = bool(engine_cuda and gpus)
     cuda_verified = False
     cuda_reason = metadata["cuda_reason"]
     extra: list[Check] = []
     device_reason = _device_reason(model.family, options.gpu_ids, known_ids)
-    if device_reason:
-        cuda_capable = False
+    cuda_configured = cuda_capable and device_reason is None
+    if engine_cuda and device_reason:
         cuda_reason = device_reason
     gpu_ids = options.gpu_ids
     if model.family in _SINGLE_GPU_ENV:
@@ -294,7 +295,7 @@ def inspect_model(
         backend = "cpu"
         report = _run_doctor(installation, path, options, "none", metadata)
         cuda_reason = ("CPU only was selected. Choose NVIDIA CUDA to check GPU readiness."
-                       if cuda_capable else f"CPU only was selected. {cuda_reason}")
+                       if cuda_configured else f"CPU only was selected. {cuda_reason}")
     elif options.compute == "cuda":
         backend = "cuda"
         if not metadata["family_accelerator"]:
@@ -307,12 +308,13 @@ def inspect_model(
         report = _run_doctor(installation, path, options, gpu_value, metadata)
         failure = _accelerator_failure(report)
         if failure:
-            cuda_reason = failure
+            if cuda_configured:
+                cuda_reason = failure
             extra.append(Check("launcher.cuda.verified", "fail", failure))
         else:
-            cuda_verified = cuda_capable
+            cuda_verified = cuda_configured
     else:
-        if cuda_capable:
+        if cuda_configured:
             gpu_report = _run_doctor(installation, path, options, gpu_value, metadata)
             failure = _accelerator_failure(gpu_report)
             if failure is None:
@@ -329,11 +331,8 @@ def inspect_model(
         else:
             backend = "cpu"
             report = _run_doctor(installation, path, options, "none", metadata)
-            reason = device_reason or (metadata["cuda_reason"] if metadata["family_accelerator"] else
-                      f"{model.name} does not support NVIDIA CUDA in this Colibri installation.")
-            cuda_reason = reason
             extra.append(Check("launcher.compute", "warn",
-                               f"Automatic selected CPU because NVIDIA CUDA was not verified: {reason}"))
+                               f"Automatic selected CPU because NVIDIA CUDA was not verified: {cuda_reason}"))
 
     plan = dict(report.get("plan") or {})
     plan.update({

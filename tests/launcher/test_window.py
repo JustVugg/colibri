@@ -549,6 +549,61 @@ class LauncherWindowTests(unittest.TestCase):
             self.assertEqual(window._preflight.plan["backend"], "cuda")
             self.assertEqual(window._options().compute, "cuda")
 
+    def test_cpu_can_switch_to_v4_cuda_and_choose_one_of_two_gpus(self):
+        from tests.launcher.test_adapter import make_model, make_release
+        from colibri.launcher.backend import build_launch, inspect_model as real_inspect_model
+        from colibri.launcher.installation import find_installation as real_find_installation
+
+        release = make_release(self.root / "v4-install")
+        model = make_model(self.root, "DeepSeek V4 Flash", model_type="deepseek_v4")
+        installation = real_find_installation(release, Path(os.sys.executable))
+        environment = {"FAKE_GPU_DATA": json.dumps([
+            {"index": 0, "name": "NVIDIA First", "total_bytes": 16 << 30},
+            {"index": 1, "name": "NVIDIA Second", "total_bytes": 15 << 30},
+        ])}
+        if os.sys.platform == "linux":
+            tools = self.root / "tools"
+            tools.mkdir()
+            ldd = tools / "ldd"
+            ldd.write_text('#!/bin/sh\nif [ -f "$1.dsv4" ]; then\n'
+                           '  echo "libcudart.so => /fixture/libcudart.so (0x1)"\nfi\n',
+                           encoding="utf-8")
+            ldd.chmod(0o755)
+            environment["PATH"] = str(tools) + os.pathsep + os.environ["PATH"]
+        with (
+            patch.dict(os.environ, environment),
+            patch("colibri.launcher.window.find_installation", return_value=installation),
+            patch("colibri.launcher.window.inspect_model", side_effect=real_inspect_model),
+        ):
+            window = self.make_window()
+            wait_until(lambda: window._installation == installation)
+            with patch.object(QFileDialog, "getExistingDirectory", return_value=str(model)):
+                QTest.mouseClick(window.add_model_button, Qt.MouseButton.LeftButton)
+            wait_until(window.start_button.isEnabled)
+            window.compute_combo.setCurrentIndex(window.compute_combo.findData("cpu"))
+            wait_until(window.start_button.isEnabled)
+            self.assertEqual(window._preflight.plan["backend"], "cpu")
+            self.assertEqual(window.gpu_combo.currentData(), ())
+            cuda_index = window.compute_combo.findData("cuda")
+            self.assertTrue(window.compute_combo.model().item(cuda_index).isEnabled())
+
+            window.compute_combo.setCurrentIndex(cuda_index)
+            wait_until(lambda: window._preflight is not None and
+                       window._preflight.plan["backend"] == "cuda")
+            self.assertFalse(window.start_button.isEnabled())
+            self.assertIn("one GPU", window.readiness_label.text())
+            self.assertTrue(window.gpu_combo.isEnabled())
+            self.assertTrue(window.compute_combo.model().item(cuda_index).isEnabled())
+
+            gpu_one_index = next(index for index in range(window.gpu_combo.count())
+                                 if window.gpu_combo.itemData(index) == (1,))
+            window.gpu_combo.setCurrentIndex(gpu_one_index)
+            wait_until(window.start_button.isEnabled)
+            self.assertTrue(window._preflight.cuda_available)
+            spec = build_launch(installation, window._preflight, window._options())
+            self.assertEqual(spec.env["DSV4_CUDA_DEVICE"], "1")
+            self.assertEqual(spec.argv[spec.argv.index("--gpu") + 1], "1")
+
     def test_start_stop_and_ready_states_follow_the_supervisor(self):
         window = self.make_window()
         self.add_model(window)

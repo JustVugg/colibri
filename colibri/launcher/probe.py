@@ -119,6 +119,9 @@ def _cuda_support(namespace, engine, family_id, model=None):
         except (OSError, ValueError, TypeError):
             supported = False
     if not supported:
+        runtime_supported, runtime_reason = _nvidia_runtime(engine, family_id)
+        if not runtime_supported:
+            return False, runtime_reason
         return False, "The selected engine is CPU-only or its CUDA runtime is unavailable."
     return _nvidia_runtime(engine, family_id)
 

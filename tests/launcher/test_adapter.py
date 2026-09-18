@@ -227,6 +227,8 @@ class AdapterTests(unittest.TestCase):
                     result = inspect_model(install, model, options)
                     self.assertFalse(result.can_start)
                     self.assertFalse(result.cuda_available)
+                    if label == "none":
+                        self.assertIn("No NVIDIA CUDA devices", result.cuda_reason)
                     with self.assertRaises(LauncherError):
                         build_launch(install, result, options)
 
@@ -385,6 +387,25 @@ print(json.dumps({name: env.get(name) for name in
                 result = self._native_family_preflight(install, model, family, valid)
                 with self.assertRaisesRegex(LauncherError, "one GPU"):
                     build_launch(install, result, replace(valid, gpu_ids=(0, 1)))
+
+    def test_missing_v4_runtime_is_not_hidden_by_multiple_gpus(self):
+        from colibri.launcher.backend import inspect_model
+        from colibri.launcher.domain import LaunchOptions
+        from colibri.launcher.installation import find_installation
+
+        devices = json.dumps([{"index": index, "name": f"NVIDIA {index}", "total_bytes": 8 << 30}
+                              for index in (0, 1)])
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"FAKE_GPU_DATA": devices}):
+            install = find_installation(make_release(Path(tmp) / "install", cuda=False), PYTHON)
+            model = make_model(tmp, model_type="deepseek_v4")
+            for compute in ("cpu", "auto", "cuda"):
+                with self.subTest(compute=compute):
+                    result = inspect_model(install, model, LaunchOptions(mode="serve", compute=compute))
+                    self.assertIn("CUDA DLL is missing" if sys.platform == "win32" else "runtime",
+                                  result.cuda_reason)
+                    self.assertFalse(result.plan["cuda_capable"])
+                    self.assertFalse(result.cuda_available)
+                    self.assertEqual(result.can_start, compute != "cuda")
 
     def test_v4_cuda_bridge_matches_real_upstream_capability_probe(self):
         # Exercise c/coli's actual dedicated function, without model weights.
