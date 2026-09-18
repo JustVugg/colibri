@@ -1,0 +1,746 @@
+[
+  {
+    "url": "https://raw.githubusercontent.com/openssl/openssl/openssl-3.0.18/LICENSE.txt",
+    "sha256": "7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/python/cpython/v3.12.12/Doc/license.rst",
+    "sha256": "341832873fd316a37927e79385093fbbfd40a467428480835fe435a80cadf4e5"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/python/cpython/v3.12.12/LICENSE",
+    "sha256": "3b2f81fe21d181c499c59a256c8e1968455d6689d269aa85373bfb6af41da3bf"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/AFL-2.1.txt",
+    "sha256": "93bb4f7417aa775bab9026cc3d0af28aeb64451fc5a8ec651876785edd8eaf9b"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/Apache-2.0.txt",
+    "sha256": "e3ba223bb1423f0aad8c3dfce0fe3148db48926d41e6fbc3afbbf5ff9e1c89cb"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/BSD-2-Clause.txt",
+    "sha256": "8fda146749ca071ac9cdce2e24d25444676ea48d1f9dccc2b7c15c054b717db8"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/BSD-3-Clause.txt",
+    "sha256": "9f0490f18656c6f2435bd14f603ef0c96434d1825615363dce43abb42ed1dcce"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/BSD-4-Clause.txt",
+    "sha256": "83faa0d205c316ce3efeafee465b6a165914fb29595968c08dc6437021b7b6fd"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/BSL-1.0.txt",
+    "sha256": "3abd6471b9a9a08d65ce771143f8e278bb4c1aeb10c1c2d476935a6b049653f5"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/Bitstream-Vera.txt",
+    "sha256": "7a083b136e64d064794c3419751e5c7dd10d2f64c108fe5ba161eae5e5958a93"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/CC0-1.0.txt",
+    "sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/FTL.txt",
+    "sha256": "08c135755dd589039470f1fdbb400daaabaaa50d0b366d19cebff4d22986baa1"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/GPL-2.0-only.txt",
+    "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/GPL-2.0-or-later.txt",
+    "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/HPND.txt",
+    "sha256": "67ac968431270291f5e9cd3ed76705e1169f57082ee102093b2543b28cef63cf"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/IJG.txt",
+    "sha256": "1cb448f5e2e6d3aca60943f4eee1a04675628dc0266a074a42bc1560ebc28d61"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/Imlib2.txt",
+    "sha256": "8846f2baba1a7f4c36f7ca19a923a000d8a21afa37cf0fe006f6ce88a6058a89"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/LGPL-2.1-or-later.txt",
+    "sha256": "1ccf09bf2f598308df4bed9cd8e9657dc5cd0973d2800318f2e241486e2edf3f"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/Libpng.txt",
+    "sha256": "58fe669792f9b4e0740bf75ecfe90b5326128bb2ce7e27e1c342abd9db4d8ea6"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/LicenseRef-BSD-3-Clause-with-PCRE2-Binary-Like-Packages-Exception.txt",
+    "sha256": "0526625fcc746a42d3f19a0ab357d3dc8479fdbe3bfd168825498f50215c7a63"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/LicenseRef-ICC-License.txt",
+    "sha256": "9e34ff47b3a44814e183342e7e198d127a6740e29d20e8381fba7688dafc79dd"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/LicenseRef-Lcs-Telegraphics.txt",
+    "sha256": "c10225ebbd5191bfdd761b0d7752c785f2453ab665d6c454473fb12d254668aa"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/LicenseRef-SHA1-Public-Domain.txt",
+    "sha256": "65d86b8ec6b1cd8b8f6e64fd8710274ba00d6a3c520e00dfdcd1c3d2071f3305"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/Linux-syscall-note.txt",
+    "sha256": "3f9e477523febab58de8b716ccfbcf02e6ef1c8e7728953905e8558637abe2a9"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/MIT-open-group.txt",
+    "sha256": "c55d2ab72d8a4f9e9cd8fbd1379268e575e8cfa16874affa5899b75a6d754514"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/MIT.txt",
+    "sha256": "d040359701c01996a017d5c515678929cd1b0625e64cb86db44025fbb6cdf1fc"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/MPL-2.0.txt",
+    "sha256": "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/Unicode-3.0.txt",
+    "sha256": "80bb6294022d8764adb36a9d65ebb6bd94efb1865918a71e31e6c247607d7634"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/X11.txt",
+    "sha256": "e2936c6509784b4f0ec27bac74182393866fad9422b29a70e085ff14aba87193"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/Zlib.txt",
+    "sha256": "d7e3139972874dc8abdbbfce27ec1e6f942b28279dd7d27453630a8b4610e080"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/blessing.txt",
+    "sha256": "592db1199aab67aafe4515db9808b420db122083807c5329b2f061951e79acbe"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/LICENSES/libpng-2.0.txt",
+    "sha256": "7317e078e2d3b5d7ba5a6159e650945153262b44b76f6700f8e9edb261c5143e"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/D3D12MemoryAllocator/LICENSE.txt",
+    "sha256": "1b3941c52b26d42c510afbdf205a8b96a6d64f5a7b8ebff0287979fd91dfd52f"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/D3D12MemoryAllocator/qt_attribution.json",
+    "sha256": "182d7e5ed90dc592b01a50635c85f4039ca6f25f88ec4700b08faf6f07fda09e"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/VulkanMemoryAllocator/LICENSE.txt",
+    "sha256": "846d97c8b74ccaa92b9ad031140a04363b3b3985f318094552f297b8bda1c68e"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/VulkanMemoryAllocator/qt_attribution.json",
+    "sha256": "833626a9e955bdae274f076786ca2cc7c8b50f9e382dff566db89ec69f8178cf"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/android/LICENSE",
+    "sha256": "4a51cf7f724f51bedb5fa4f9583a2762f1db8d05e43a577e2487c7aab2fdce18"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/android/qt_attribution.json",
+    "sha256": "120710d661892ceb44a94556c56998795372334674c79710947282e8279ef415"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/blake2/COPYING",
+    "sha256": "4103f471877ed0bae500752c5fcd7ecca409d4a4a8dc2ad40437daba60f1a2bc"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/blake2/qt_attribution.json",
+    "sha256": "bab552307bdd03ed9a4cf7f8f1397c3d18d4dbee19ee576033284104785245be"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/double-conversion/LICENSE",
+    "sha256": "4af93c12062c58058378de2397dc1c92bbff9ddfb1d583a01c84127557ce97ca"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/double-conversion/qt_attribution.json",
+    "sha256": "4d9c7505a7c12e4e6b57bbee63af926c861abb5515cdf802b8f3491e321146fe"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/easing/LICENSE",
+    "sha256": "92fac99458f1754b73edf50f9c9983e0efaa06ad96e2afd5e538c79f45b4b191"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/easing/qt_attribution.json",
+    "sha256": "77d67a1db5882bb0b9a1278b014885bee45a4c059d1da9f835b6da5bc4b9c93d"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/emoji-segmenter/qt_attribution.json",
+    "sha256": "9a980fc0f9e478d2a7e9a571d4cd234c259aaf8e2ea3fb60a0a7cf02cc3c3700"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/forkfd/LICENSE",
+    "sha256": "d0d683ae18e78fbef90eb41168fb781920da2d12bf80704490f0882915c18ae0"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/forkfd/qt_attribution.json",
+    "sha256": "525fd890017a3966f542da42a9ff0ca2a0d71bc45f80a4871de3e0bd0f612612"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/freetype/BDF-LICENSE.txt",
+    "sha256": "e4e792f29e66750f2e410fd7b50a567652c180f6ee15e1a4dfa0bb5cde524537"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/freetype/LICENSE.txt",
+    "sha256": "bf543cdda11864477b8d2ca2aa9afc2aaa8f9133461b4d962ed6ec73646256a1"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/freetype/LICENSE.txt",
+    "sha256": "bf543cdda11864477b8d2ca2aa9afc2aaa8f9133461b4d962ed6ec73646256a1"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/freetype/PCF-LICENSE.txt",
+    "sha256": "6938597bfdeca0db191a8f9ede52eaf2482c2c71a0094c084747a1235f9958fe"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/freetype/ZLIB-LICENSE.txt",
+    "sha256": "2b1f5d615382a151af3eb71462ad17d89e2efee8fa7664058d35d3d9237ebb19"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/freetype/qt_attribution.json",
+    "sha256": "628b68bf60eb3bc1616342bc3545b63be2392e78bbebbc4c19f49675dd2ac8a7"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/gradle/LICENSE",
+    "sha256": "cf234c4188d773406f640bf89be680d9288f40ff96901c70d643fcea96ad46df"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/gradle/qt_attribution.json",
+    "sha256": "0c8a9faae83c1df704d52a9c320c2e8c0309cda282bf95584bb62b00bb37567e"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/harfbuzz-ng/COPYING",
+    "sha256": "ba8f810f2455c2f08e2d56bb49b72f37fcf68f1f4fade38977cfd7372050ad64"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/harfbuzz-ng/qt_attribution.json",
+    "sha256": "15fb72e213bc590be310de8b453792a0b0a42cfd302b97387abf49252b9dd63f"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/icc/LICENSE.txt",
+    "sha256": "9e34ff47b3a44814e183342e7e198d127a6740e29d20e8381fba7688dafc79dd"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/icc/qt_attribution.json",
+    "sha256": "509da9bd2b3f769c730aa4627b1080d65f39b0ecd4130111c9e1122e13cd35b5"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/libjpeg/qt_attribution.json",
+    "sha256": "ed7cb7abdd9124f664acd26cf552ba821c8cf236c4cd34a6737f202215bd41bc"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/libpng/LICENSE",
+    "sha256": "bdb0a645ea18c60507d0368379b1ac5474b92255fcc2d115e07486a7672ba526"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/libpng/qt_attribution.json",
+    "sha256": "a43ff8e146c949f7cd14e00bd681f4957e27def06ecafec55ccc7231c451d3fa"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/libpsl/PSL-LICENSE.txt",
+    "sha256": "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/libpsl/qt_attribution.json",
+    "sha256": "ae227b5f2cf40511fe1a84d4c752f4005917b7eeb44e7c4495b1403c27cc3647"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/libpsl/src/LICENSE.chromium",
+    "sha256": "1d7f52747a9169751cdf2641a8299c0098e9ecdf9429296ffd55bdb14c9ed5b3"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/md4/qt_attribution.json",
+    "sha256": "34bda63a2fcc23c83f2e5364ccd394553b4baa505b1f79ded9cc2161c56a9b4c"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/md4c/LICENSE.md",
+    "sha256": "d30937367d5413e7eaa218b1640b8946ff76fd34d97152f6979fd96169d5d0fc"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/md4c/qt_attribution.json",
+    "sha256": "7b2bc7be22e4be2a2984119ce3d0bfc210ddd0d8ef6193d66e8479d4c22af4ba"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/md5/qt_attribution.json",
+    "sha256": "20b0f1b17ccd1bd5e8d763b1cdca4b095b8f0c037644b5ee18154536b7d8425e"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/pcre2/LICENCE.md",
+    "sha256": "197d8a73ffee0d6b09adba2f9c677b5f5aede24edf89258a68e48248d010d811"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/pcre2/LICENSE-SLJIT",
+    "sha256": "5f216505c0f6ea3273caec89e766eef93cdeb7bbb0c429f9360116d7c938feeb"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/pcre2/qt_attribution.json",
+    "sha256": "e009f73100ef4aed400257a095cdb25ee31980c4a290f1aca52d147cb3067abc"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/pixman/LICENSE",
+    "sha256": "942c4f2a80394d3f53599b8382e9f27349b95c45d92b69b84f26d404f4dd74a5"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/pixman/qt_attribution.json",
+    "sha256": "f1dc159b63bf84a4c9c367e8ff79aa748b63f5fc622d5080c0a7ddd98ddc7ac7"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/rfc6234/LICENSE",
+    "sha256": "7ccebd514aaabc86192f957d773cebf06577c12fe9f25ecd419c6cac5da7a14c"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/rfc6234/qt_attribution.json",
+    "sha256": "fa24413bdc5015fc7fc84297fa17d4c8a598f8f7c76b9495a6e6b26a77b4a324"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/sha1/qt_attribution.json",
+    "sha256": "53cab2c771f7f7ffbf6a58ff759e5846b746e91d98dfe467d5145edf8cd7d306"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/sha3/BRG_ENDIAN_LICENSE",
+    "sha256": "2fed6f252ca4a7e813811de3cd3cd08183edd4138bdee909410ef6eee394e82c"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/sha3/CC0_LICENSE",
+    "sha256": "1f2786e2c5befeb4dcba6638db6528bf96ef5d2cf24bc85ab5a81ef00abef59d"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/sha3/qt_attribution.json",
+    "sha256": "d904a6c21c150d9cac693c0806a469480306cb4e5879cc13c994fbadba71a56e"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/siphash/qt_attribution.json",
+    "sha256": "8614947dfc0ca1d21aad2f88b4400598262ab8c08aa87c4f7acc0c2de6e5619e"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/sqlite/qt_attribution.json",
+    "sha256": "fcba08e23508524b77ee22186a5ef2d35957979fe9e2a604d994c5e9604c8fb9"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/tinycbor/LICENSE",
+    "sha256": "3c6ba0b5bfa7830505301ffb336a17b0748e0d61c4d34216e9dc98f10e40395e"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/tinycbor/qt_attribution.json",
+    "sha256": "788408509fb7967042640f24ba78b263712e816d886303ba1733f49753d33863"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wasm/DEJAVU-LICENSE",
+    "sha256": "7a083b136e64d064794c3419751e5c7dd10d2f64c108fe5ba161eae5e5958a93"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wasm/qt_attribution.json",
+    "sha256": "2019d37665bfb2ce7d4931d0bdf7427ea178919399cf37c0fef14a229144936b"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/MIT_LICENSE.txt",
+    "sha256": "a8341b9c90ef447a77f55d550e6691e370d3ac15d60edb584def356e348ab828"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/appmenu/LGPL-2.1-or-later.txt",
+    "sha256": "1ccf09bf2f598308df4bed9cd8e9657dc5cd0973d2800318f2e241486e2edf3f"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/appmenu/qt_attribution.json",
+    "sha256": "b7200f7fdfd2223aaecbd9b2ec8e4145eebe4f0b376ffbcb3859154661fb1095"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/color-management/qt_attribution.json",
+    "sha256": "6081490578a0a5ff17e450a3f9a05a36a3433de0832f1b2b497ca3c8ec1f9ba9"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/fractional-scale/qt_attribution.json",
+    "sha256": "bf87b7dc5bf42e91c9d98ad2a109d197141aaebffe563ab247dd771e0b9b07c8"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/fullscreen-shell/qt_attribution.json",
+    "sha256": "24ebba6014034dcf2c9a23a5b1085dc9708eaa81c021dfe51ba3f6b51ba788a7"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/linux-dmabuf/qt_attribution.json",
+    "sha256": "64ea0d933ff0d0868e820b443c14feda5208f90bd02032cdc9a1b6881a05f446"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/pointer-gestures/qt_attribution.json",
+    "sha256": "3c85ce329ccb30c469aa3f3c71596eb915c9cccd645ac1192d94a8fe548556b7"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/pointer-warp/qt_attribution.json",
+    "sha256": "3eb309adae44fe120dab08dca8c4df57a34ac347ecf1764cafdd7542cd0a0a11"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/presentation-time/qt_attribution.json",
+    "sha256": "c3af7f51726c7584d5e8ad74a29813d66cac6a215a9675da7cfc9a42f15c2d0a"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/scaler/qt_attribution.json",
+    "sha256": "8b7751412fc26d70f641d6bad9c6aadd406317cbf17359ffcc58651f58aa2fca"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/session-management/qt_attribution.json",
+    "sha256": "509ab9b7a310628d00ced3a293f4f1e8e9146bde3555eeac483c5d00c07de431"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/tablet/qt_attribution.json",
+    "sha256": "a46626dbac8fc1f57d5b34eb077425fc402fc0767b75ec06578e1465502883b5"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/text-input/v1/qt_attribution.json",
+    "sha256": "882ac88020f0ecaea6d991f7e8d292542c9422592ede0396c4d217f040ef6a54"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/text-input/v2/HPND_LICENSE.txt",
+    "sha256": "8172d52f3b7bba7d10af2f9134c63d0f699ba6b20a47e35f5ac45654c500bfd7"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/text-input/v2/qt_attribution.json",
+    "sha256": "197d9edcc6fb17d7bc2b230f7061ce0d2ef90fa4291c86e87ae2817e8f2809fe"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/text-input/v3/qt_attribution.json",
+    "sha256": "476225d10cb5789d993c38335c6cc442fdc19a8d91f1ceb7a3ddb50414a8e68a"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/viewporter/qt_attribution.json",
+    "sha256": "95139e441967bc289d174078f1ca0485363e8405bd8d06eb9946356c09c0a5e4"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/wayland/qt_attribution.json",
+    "sha256": "d2b263d97853d72128987f55fb912fc197f488de003a8e4bbc53cae2549d0e6e"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/wl-eglstream/qt_attribution.json",
+    "sha256": "2432510e17446887decd1fc58770aeeef060aff5331a8bfec7fb668555f3b347"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/wlr-data-control/qt_attribution.json",
+    "sha256": "433a74149249d01d946d86aa0d88d30bc755523f1a978f640f6142e9c8fa1035"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/wp-primary-selection/qt_attribution.json",
+    "sha256": "14586c06e09439e9c2b7719766f68e219d0ff0231811e13e44f4587dabf52707"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/xdg-activation/qt_attribution.json",
+    "sha256": "8f13cfd4c78a2f116d3e674c329d3d211b647d80190e7a95493528cd6dedbd89"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/xdg-decoration/qt_attribution.json",
+    "sha256": "b8d9102ff3c7eccd840f7d5332d072e41e95eb055a8a9f2e3719a83005879c86"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/xdg-dialog/qt_attribution.json",
+    "sha256": "c7918fb63ad5be29e9a95db3464a7832224c7d904d21617ccfc689e6b0ab04c0"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/xdg-foreign/qt_attribution.json",
+    "sha256": "0ed6fbddba411b647bbe895b6e7a842c2a884905206888c0b4df6b6cd3bb9f79"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/xdg-output/qt_attribution.json",
+    "sha256": "c5e4f132de8d08a75af02682bba3a9349a00f49b773e23ef5543648209b76658"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/xdg-shell/qt_attribution.json",
+    "sha256": "e1367b44fe28fce2eee7656cda75203f4102662bb6aa370b3c9f3eb5a2cc3f82"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/xdg-system-bell/qt_attribution.json",
+    "sha256": "43a10e6b73a26d9c75e99447f5e731d170047ed2e709878e61eb83f6453cb3da"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wayland/protocols/xdg-toplevel-icon/qt_attribution.json",
+    "sha256": "2e022951f22a56051a099b9045f4fb0c569daa896a218d23f47b0dac3e905c04"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/wintab/qt_attribution.json",
+    "sha256": "b879ea91b719531d45e1cfe33d2241d060a9260200bd91a09ada074b16063f9c"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/xcb/LICENSE",
+    "sha256": "82775191bc05f85b40404d77bb69b1edeaeb4033f48387e9e5eab4dd67f5d6f1"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/xcb/qt_attribution.json",
+    "sha256": "8bae8861957bc0168d586d24da6e8e93edceb11796811c5f614d211f4674d437"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/zlib/LICENSE",
+    "sha256": "d7e3139972874dc8abdbbfce27ec1e6f942b28279dd7d27453630a8b4610e080"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/3rdparty/zlib/qt_attribution.json",
+    "sha256": "0346805e9c4048316dbc7c58d560a20c12482ea0218de264282212e9619b6d64"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/corelib/global/qt_attribution.json",
+    "sha256": "64698063a65a1502b986bd61163b5eb9c6bde87f93feb28e4eab43ff07a4f10a"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/corelib/kernel/LICENSE.QEVENTDISPATCHER_CF.txt",
+    "sha256": "e9e5b9f66d21c0e88a4179525ab39cd8d7eac9af78a8404f322c32b0874783d5"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/corelib/kernel/qt_attribution.json",
+    "sha256": "27bb1f28d336f1f8f6d44689f28cb650f0844cc82672e36ae168d0716783fad5"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/corelib/mimetypes/3rdparty/qt_attribution.json",
+    "sha256": "329652c93e6b47663115543cfd746cb56b96a98d774d540d58e64614bd9739eb"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/corelib/text/qt_attribution.json",
+    "sha256": "4e23736600be956e4214849ad8baaa955441656db7324713fab6353c1163b4f5"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/dbus/LICENSE.LIBDBUS-1.txt",
+    "sha256": "ad90aa08bb1a9b7056aa51e2e215b36630855457cde5dffd36aa0faa7b169f24"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/dbus/qt_attribution.json",
+    "sha256": "346532e1fb3bf653bc949408834c305646fc93f96650a2af9b2171d141c107ee"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/gui/opengl/LICENSE.KHRONOS.txt",
+    "sha256": "2e484f3c26ff5008c704a3ca9dd809d43f24a004a1abb6c202660fbff0d19715"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/gui/opengl/qt_attribution.json",
+    "sha256": "d05626e02386f22186b385b3ce2cd5a6431b84e2fc552c68f7133e38da552fc1"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/gui/painting/LICENSE.QIMAGETRANSFORM.txt",
+    "sha256": "46b3cbfa2f2946b93291506351e9be1dd0a28d2a53260f5aa488abd36fbeca9d"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/gui/painting/LICENSE.XCONSORTIUM.txt",
+    "sha256": "a216b01291eb38fc1af93cfccf1fc67b48d9923612e517c2a695e95b3f03c22c"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/gui/painting/qt_attribution.json",
+    "sha256": "8cddd6c73a885f697261c4d6d60e5cd814a2544fcd407504b52a5eb9b7cc3600"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/gui/rhi/LICENSE.MiniEngine.txt",
+    "sha256": "cf248820bf1178370bb4f1670a59f8748d46bc96d0f64080cd631511c6046409"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/gui/rhi/qt_attribution.json",
+    "sha256": "59df3efb041ed346aa797602a76ef8d284e84c3cc6ace30967d6704fc65dbb47"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/gui/text/LICENSE.AGLFN.txt",
+    "sha256": "40818155548ff41c67d3a40edf355e9658992b292c227f4c1147425cedc746c6"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/gui/text/qt_attribution.json",
+    "sha256": "73066a55ff52c6546753e1dc0802d8890d58e93e7efa394565cd8bdd0df0995b"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/gui/vulkan/LICENSE.txt",
+    "sha256": "5f618873b0cdd1e84c611c5529212c2524bfc887bdfd7d1f3b568bad3c649612"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/gui/vulkan/qt_attribution.json",
+    "sha256": "b4beb6ac27b066a6a71408da116fea60131c06ac9799c9763fe9cef28a76e7b9"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/plugins/platforms/cocoa/LICENSE.COCOA.txt",
+    "sha256": "e9e5b9f66d21c0e88a4179525ab39cd8d7eac9af78a8404f322c32b0874783d5"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/plugins/platforms/cocoa/qt_attribution.json",
+    "sha256": "27a435bfea96ca950f4a5ad6a82be7fe2a62bb4db0d8851e7a84fc5dce0c3ff3"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/testinternal/3rdparty/cmake/Copyright.txt",
+    "sha256": "0676e30827684487aa0ea8f72f01e9460a6320fa34a2888df0ad1dd3e8a06eb8"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/testinternal/3rdparty/cmake/qt_attribution.json",
+    "sha256": "f194ea33cf9b0d44615a6fa9eb4d45e7796b50cb0a88cdadf5d9b15745bf52f0"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/testlib/3rdparty/catch2/LICENSE.txt",
+    "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/testlib/3rdparty/catch2/qt_attribution.json",
+    "sha256": "8149331a9f68c529955173cbfb12e3f0193c2e4db23ae4117bcd537ee1eacde0"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/testlib/3rdparty/cycle/LICENSE.txt",
+    "sha256": "cb5aedb296c5246d1f22e9099f925a65146f9f0d6b4eebba97fd27a6cdbbab2d"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/testlib/3rdparty/cycle/qt_attribution.json",
+    "sha256": "5b4c5fc477cd61b935983b93ec6d09b39a8f5644ea4fe5ac787c84583f521c7c"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/testlib/3rdparty/linux/LICENSE.txt",
+    "sha256": "ed71cfca021790f74094e9810f42e31288e7f43cf00c8d9ac8d6f904124bd815"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/testlib/3rdparty/linux/qt_attribution.json",
+    "sha256": "44299f5c08474790c164e73894b81b650463f9e40121041cefdeebd9b5eb734c"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/testlib/3rdparty/valgrind/LICENSE.txt",
+    "sha256": "ec72eebd6326165156787da828caaa18386489387aefaa073c9bd40b8b2a400e"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtbase/v6.11.2/src/testlib/3rdparty/valgrind/qt_attribution.json",
+    "sha256": "202daf86588d8cded6c492d490cec190e5790796fff23ec5065b116b78e70fbc"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtdeclarative/v6.11.2/LICENSES/BSD-2-Clause.txt",
+    "sha256": "8fda146749ca071ac9cdce2e24d25444676ea48d1f9dccc2b7c15c054b717db8"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtdeclarative/v6.11.2/LICENSES/MIT.txt",
+    "sha256": "d040359701c01996a017d5c515678929cd1b0625e64cb86db44025fbb6cdf1fc"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtdeclarative/v6.11.2/src/3rdparty/masm/LICENSE",
+    "sha256": "9ba0c20a2972274f27e975d79ed3582e322d6891338266a52e2d3a9417fc0a72"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtdeclarative/v6.11.2/src/3rdparty/masm/qt_attribution.json",
+    "sha256": "99b383b3e1908b23be11ea197f0ad787112ea2ae36fb9b99ca7a79577c36da11"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtdeclarative/v6.11.2/src/3rdparty/yoga/LICENSE",
+    "sha256": "52412d7bc7ce4157ea628bbaacb8829e0a9cb3c58f57f99176126bc8cf2bfc85"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtdeclarative/v6.11.2/src/3rdparty/yoga/qt_attribution.json",
+    "sha256": "967cc4087ff57f293aa274b849acbf59d4095630b5b618c79991d383cc9ffef5"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtdeclarative/v6.11.2/src/quickcontrols/material/LICENSE.ANGULARJS.txt",
+    "sha256": "a1c1daa9eec4db907907c0ccc42a4843bb996410f888b972a39fe152e829bc3d"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtdeclarative/v6.11.2/src/quickcontrols/material/qt_attribution.json",
+    "sha256": "aa170ef963adf45260131dc4ce537a4d164d6c918044175b47f3c7746dfb9ca6"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtsvg/v6.11.2/LICENSES/HPND-sell-variant.txt",
+    "sha256": "3a946598a9f674d44df764279ca0b85b5d6faba08f3bc75d8e0fcf6cd729a9bd"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtsvg/v6.11.2/src/svg/LICENSE.XSVG.txt",
+    "sha256": "3a946598a9f674d44df764279ca0b85b5d6faba08f3bc75d8e0fcf6cd729a9bd"
+  },
+  {
+    "url": "https://raw.githubusercontent.com/qt/qtsvg/v6.11.2/src/svg/qt_attribution.json",
+    "sha256": "c1b0472511c791561b89ee0d11c11d78a85fbdf5df5ad94c1a4653e192367759"
+  }
+]
