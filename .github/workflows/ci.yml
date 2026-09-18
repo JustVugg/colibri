@@ -923,10 +923,15 @@ jobs:
           /tmp/tike
       - name: Generate the glm_tiny fixture
         run: cd c && python3 tools/make_glm_oracle.py
-      - name: Token-exact oracle (teacher forcing)
-        # The fixture is only trustworthy if the engine reproduces it, so assert
-        # that before reading anything else out of a run.
-        run: cd c && SNAP=./glm_tiny TF=1 COLI_TEMP=0 ./colibri 64 16 16
+      - name: Oracle (30–32/32 teacher forcing + exact greedy)
+        # Preserve CONTRIBUTING.md's two TF near-tie allowance. Greedy remains
+        # exact, and invalid/non-finite results cannot consume the allowance.
+        run: |
+          cd c
+          SNAP=./glm_tiny TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16
+          SNAP=./glm_tiny COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16
+      - name: Oracle allowance and failure regressions
+        run: cd c && python3 tests/test_glm_oracle.py
       - name: Structural efficiency tests
         # test_cpu_vs_cpu_tok_s_stability is NOT in this list: it is a tok/s
         # bound (two runs within 25%) over a ~15 ms tiny replay -- it measured
@@ -1229,7 +1234,7 @@ jobs:
   # This job builds every engine on arm64 (NEON compile coverage), runs the
   # integer-kernel bit-exactness gate with the NEON branches live, and replays
   # the glm_tiny teacher-forcing oracle against a fixture generated on THIS
-  # runner (same-machine torch reference, so no cross-ISA float excuses).
+  # runner. As on x86, allow two TF near ties; greedy remains exact.
   oracle-arm:
     name: ARM (engines + NEON kernel exactness + tiny oracle)
     runs-on: ubuntu-24.04-arm
@@ -1252,5 +1257,10 @@ jobs:
           /tmp/tike
       - name: Generate the glm_tiny fixture on this runner
         run: cd c && python3 tools/make_glm_oracle.py
-      - name: Token-exact oracle on ARM (teacher forcing)
-        run: cd c && SNAP=./glm_tiny TF=1 COLI_TEMP=0 ./colibri 64 16 16
+      - name: Oracle on ARM (30–32/32 teacher forcing + exact greedy)
+        run: |
+          cd c
+          SNAP=./glm_tiny TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16
+          SNAP=./glm_tiny COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16
+      - name: Oracle allowance and failure regressions on ARM
+        run: cd c && python3 tests/test_glm_oracle.py
