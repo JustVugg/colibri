@@ -114,6 +114,19 @@ per-row quantization error concentrates the same way. The gs64 container costs
 ~1.7 GB more on disk and a few percent on cold-start; warm decode speed is the
 same or slightly better.
 
+**Mixed: int8 `down`, int4 gate/up.** `convert_qwen36.py --ebits 4 --gs 64
+--down-bits 8` (`--down-gs` for grouped down scales, 0 = per row) writes one
+slab per expert with `down_proj` in int8 and gate/up as above -- 5.7 bits per
+weight against gs64's 4.5. It is the knob that produced the #1370 numbers on
+wikitext-2 (16 x 512 tokens): gs64 7.325, mixed 7.281, all experts int8 7.153,
+Ollama's Q4_K_M 7.147 -- `down` alone recovers a quarter of the gap to int8,
+the rest sits in gate/up, and at equal bits Q4_K_M's asymmetric quantizer is
+ahead. Keep it as a measurement tool and a middle step for boxes with RAM to
+spare; it is not the answer to the gap. The engine tells the layout apart by
+size and reads each matrix in its own format on the CPU path; the CUDA VRAM
+tier takes one format per expert and refuses a mixed container with a line
+(`COLI_CUDA=1 ignored`), so such a container runs CPU-only for now.
+
 ## Which checkpoints, and what the banner calls them
 
 Two Qwen checkpoints declare `model_type: qwen3_5_moe_text` and resolve to

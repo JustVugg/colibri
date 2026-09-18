@@ -547,6 +547,31 @@ jobs:
             echo "cap=$cap: identical ($(cat ids_${cap}_1.txt))"
           done
           make tests/test_expert_ffn && ./tests/test_expert_ffn
+      - name: Mixed expert layout (int4 gs64 gate/up, int8 down) loads and is cap-independent
+        run: |
+          cd c
+          # The #1370 experiment knob: one slab per expert with int4 gate/up and int8
+          # down (2*inter*hidden bytes). The engine must tell it apart from int4 and
+          # int8 by size, read every matrix in its own format, and give the same ids
+          # at every cache capacity (cap=1 recycles the single slot after each expert,
+          # which is where a wrong slab offset would show). The ids are not compared to
+          # the torch oracle: int4 gate/up drift from f32 by design, as in the A/B above.
+          python3 tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_d8 --ebits 4 --gs 64 --down-bits 8
+          python3 - <<'PY'
+          import json; m = json.load(open("qwen36_tiny64_d8/qwen36_meta.json"))
+          assert m["expert_down_bits"] == 8 and m["expert_down_gs"] == 0 and m["expert_gs"] == 64, m
+          PY
+          for cap in 1 2 8; do
+            COLI_DENSE_I8=0 SNAP=qwen36_tiny64_d8 ./qwen36 "$cap" 4 qwen36_tiny64/ref_full.json > mixed_$cap.log 2>&1 || true
+            grep -q "expert format on disk: int4 gate/up + int8 down" mixed_$cap.log || { echo "FAIL: mixed layout not detected at cap=$cap"; cat mixed_$cap.log; exit 1; }
+            grep -E "^C engine" mixed_$cap.log > mixed_ids_$cap.txt
+            test -s mixed_ids_$cap.txt || { echo "FAIL: no ids at cap=$cap"; cat mixed_$cap.log; exit 1; }
+          done
+          cmp mixed_ids_1.txt mixed_ids_8.txt && cmp mixed_ids_2.txt mixed_ids_8.txt || { echo "FAIL: ids differ across caps"; cat mixed_ids_*.txt; exit 1; }
+          echo "mixed layout: identical ids at cap 1/2/8 ($(cat mixed_ids_8.txt))"
+          # COLI_CUDA=1 on a mixed container is refused with a line, the CPU path stands
+          COLI_CUDA=1 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_d8 ./qwen36 8 4 qwen36_tiny64/ref_full.json > mixed_cuda.log 2>&1 || true
+          grep -q "COLI_CUDA=1 ignored: the VRAM expert tier does not take the mixed layout" mixed_cuda.log || { echo "FAIL: tier refusal line missing"; cat mixed_cuda.log; exit 1; }
       - name: A malformed container is refused, not read
         run: |
           cd c
