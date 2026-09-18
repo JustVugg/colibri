@@ -135,12 +135,13 @@ int main(void) {
     qt_shutdown();
     shutdown_done = 1;
     check(!G.on, "shutdown_returns_while_a_group_is_open");
-    /* The abandoned swap must leave the victim exactly as the open group left
-     * it, and must not have driven the incoming expert's upload after
-     * shutdown began. The uploader is already joined here, so reading G
-     * needs no lock. */
-    check(qs(0, resident_eid)->resident && qs(0, resident_eid)->tg,
-          "shutdown_abandons_the_swap_instead_of_freeing_the_victim");
+    /* The abandoned swap must not have driven the incoming expert's upload
+     * after shutdown began. The victim's tensor is gone too, but released by
+     * qt_shutdown itself with every other resident expert once the uploader
+     * is joined -- not by the swap, which would also have uploaded the
+     * incoming expert. Reading G needs no lock here. */
+    check(!qs(0, resident_eid)->resident && !qs(0, resident_eid)->tg,
+          "shutdown_releases_the_victim_with_every_resident_expert");
     check(!qs(0, 1)->queued && !qs(0, 1)->resident && G.uploads == 1,
           "shutdown_abandons_the_swap_instead_of_uploading_the_incoming_expert");
 

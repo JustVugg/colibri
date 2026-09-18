@@ -1252,6 +1252,15 @@ void qt_shutdown(void){
     pthread_join(G.th,NULL);
     G.on=0;
     G_fp8_stream=0;
+    /* Nothing has freed the resident experts: the Vulkan tier never reclaims a
+     * slice while running, and on CUDA the device reset hid the same omission.
+     * Release them before the backend goes, or vkDestroyDevice reports every
+     * weight buffer as leaked (VUID-vkDestroyDevice-device-05137). */
+    for(size_t i=0;i<(size_t)G.nl*G.ne;i++){
+        QSlot *s=&G.slot[i];
+        if(s->tg)be_free(s->tg); if(s->tu)be_free(s->tu); if(s->td)be_free(s->td);
+        s->tg=s->tu=s->td=NULL; s->resident=0;
+    }
     be_shutdown();
 }
 
