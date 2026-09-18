@@ -423,6 +423,59 @@ static void t_bounded_item_length(Cfg *c){
     remove(STDERR_PATH);
 }
 
+/* "item T n_prompt mode ncells" (mode 0, ncells 0) followed by T real token
+ * values, each within [0, vocab) for this file's CONFIG_JSON fixture
+ * (vocab=64) -- unlike t_bounded_item_length's over-length manifests, this
+ * one is fully well-formed and can actually run to completion.  Caller
+ * frees the result. */
+static char *build_full_item_manifest(int64_t t, int64_t n_prompt){
+    size_t cap=64+(size_t)t*4;
+    char *buf=malloc(cap);
+    if(!buf) return NULL;
+    int off=snprintf(buf,cap,"0 %lld %lld 0 0",(long long)t,(long long)n_prompt);
+    for(int64_t i=0;i<t && off>0;i++)
+        off+=snprintf(buf+off,cap-(size_t)off," %d",(int)(i%60));
+    if(off<=0 || (size_t)off+2>cap){ free(buf); return NULL; }
+    buf[off]='\n'; buf[off+1]=0;
+    return buf;
+}
+
+static void t_ctx_derived_item_limit(Cfg *c){
+    printf("P9 the per-item token limit is derived from CTX, not a bare constant\n");
+    setenv("CTX","4096",1);
+
+    /* cap+1 (4097): refused by name, before the item can contribute to any
+     * of the three allocations the limit exists to gate. */
+    char *over=build_full_item_manifest(4097,2);
+    char *text = over ? refusal_text_of(c,over) : NULL;
+    free(over);
+    CHECK(text && strstr(text,"above the 4096-token limit")!=NULL,
+          "cap+1 (4097 tokens) is refused, naming the CTX=4096-derived limit");
+    free(text);
+
+    /* The real maximum (4096, CTX itself): a well-formed item at exactly the
+     * derived limit is accepted and runs to completion. Without this case, a
+     * limit that simply refused every manifest would also pass the case
+     * above. */
+    char *at_cap=build_full_item_manifest(4096,2);
+    CHECK(at_cap!=NULL, "the at-cap fixture manifest was built");
+    if(at_cap){
+        manifest_write(at_cap);
+        free(at_cap);
+        remove(EVIDENCE_PATH);
+        int rc=run_mode(c,MANIFEST_PATH,EVIDENCE_PATH);
+        CHECK(rc==0, "a manifest at the real CTX-derived maximum (4096) loads and runs");
+        char *ev=slurp(EVIDENCE_PATH,NULL);
+        CHECK(ev && strstr(ev,"\"completed_items\":1")!=NULL &&
+              strstr(ev,"\"completed_targets\":4094")!=NULL,
+              "the accepted 4096-token item completes all 4094 of its targets");
+        free(ev);
+        remove(EVIDENCE_PATH);
+    }
+    remove(STDERR_PATH);
+    unsetenv("CTX");
+}
+
 /* nll must come from a subtraction done wholly in double
  * (logZ - lo[gold]), not from a float-rounded intermediate. A row this
  * wide (max 1.0e7, gold logit 0.25, everything else far below the max)
@@ -611,6 +664,7 @@ int main(int argc, char **argv){
     t_named_refusals(&c);
     t_refusal_names_the_offender(&c);
     t_bounded_item_length(&c);
+    t_ctx_derived_item_limit(&c);
     t_nll_pin(&c);
     t_load_cfg_digest_binding(&c);
     remove(MANIFEST_PATH);
