@@ -639,6 +639,7 @@ static inline void coli_print_launcher_help(const char *engine)
  * 0 = non misurabile; e' il chiamante a decidere il fallback. */
 #ifdef __APPLE__
 #include <mach/mach.h>
+#include <sys/sysctl.h>   /* sysctlbyname("hw.memsize") per compat_mem_total_gb */
 #endif
 #include <unistd.h>
 static inline double compat_mem_available_gb(void){
@@ -659,6 +660,29 @@ static inline double compat_mem_available_gb(void){
     FILE *f = fopen("/proc/meminfo", "r"); if(!f) return 0;
     char ln[256]; double kb = 0;
     while(fgets(ln, sizeof ln, f)) if(sscanf(ln, "MemAvailable: %lf", &kb) == 1) break;
+    fclose(f); return kb / 1e6;
+#endif
+}
+
+/* --- RAM fisica TOTALE, in GB, per tutte le piattaforme -------------------
+ * Serve da denominatore per il plausibility floor di compat_mem_available_gb
+ * e dai motori per distinguere "0 = non misurabile" da "pochissimo". 0 se non
+ * misurabile. macOS: hw.memsize. Windows: ullTotalPhys. Linux: MemTotal.
+ * Aggiunto per #1601: olmoe.c era l'unico motore con una probe Linux-only che
+ * tornava 0 su macOS/Windows. */
+static inline double compat_mem_total_gb(void){
+#ifdef __APPLE__
+    uint64_t ms = 0; size_t sl = sizeof(ms);
+    if(sysctlbyname("hw.memsize", &ms, &sl, NULL, 0) == 0 && ms) return (double)ms / 1e9;
+    return 0;
+#elif defined(_WIN32)
+    double total = 0, avail = 0;
+    compat_meminfo(&total, &avail);
+    return total;
+#else
+    FILE *f = fopen("/proc/meminfo", "r"); if(!f) return 0;
+    char ln[256]; double kb = 0;
+    while(fgets(ln, sizeof ln, f)) if(sscanf(ln, "MemTotal: %lf", &kb) == 1) break;
     fclose(f); return kb / 1e6;
 #endif
 }

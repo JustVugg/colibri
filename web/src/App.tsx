@@ -25,6 +25,8 @@ import {
   Timer,
   Trash2,
   Zap,
+  Moon,
+  Sun,
 } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
@@ -50,6 +52,12 @@ const message = (role: ChatMessage["role"], content: string): ChatMessage => {
 export default function App() {
   const { t, locale, setLocale, locales } = useLocale()
 
+  const [theme, setTheme] = useState<"dark" | "light">(() => {
+  return localStorage.getItem("colibri-theme") === "light"
+    ? "light"
+    : "dark"
+})
+
   const servedByEngine = typeof window !== "undefined" && window.location.port !== "5173" && window.location.protocol.startsWith("http")
   const defaultBase = servedByEngine ? `${window.location.origin}/v1` : "http://127.0.0.1:8000/v1"
   const [baseUrl, setBaseUrl] = useState(() => {
@@ -74,6 +82,12 @@ export default function App() {
      puo' mostrare in anteprima senza inventarsi un percorso su disco. */
   const [attachments, setAttachments] = useState<{ name: string; url: string }[]>([])
   const fileInputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+  document.documentElement.classList.toggle("dark", theme === "dark")
+  document.documentElement.classList.toggle("light", theme === "light")
+  localStorage.setItem("colibri-theme", theme)
+}, [theme])
 
   const attachFiles = async (files: FileList | File[] | null) => {
     if (!files) return
@@ -369,6 +383,20 @@ export default function App() {
 
         <div className="sidebar-foot">
           <div><Cpu className="size-3.5" /><span>{t("sidebar.transport")}</span></div>
+          <button
+            type="button"
+            className="theme-toggle"
+            onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+            aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+            title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+          >
+           {theme === "dark" ? (
+            <Sun className="size-3.5" />
+          ) : (
+            <Moon className="size-3.5" />
+          )}
+          <span>{theme === "dark" ? "Light mode" : "Dark mode"}</span>
+          </button>
           <div className="locale-switcher">
             <Globe className="size-3.5" />
             <select value={locale} onChange={(e) => setLocale(e.target.value)}>

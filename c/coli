@@ -430,6 +430,11 @@ def env_for_engine(a, arch, plan=None):
     env = os.environ.copy()
     env.pop(_PROFILE_CAP_ENV,None)
     env.pop(_PLAN_CAP_ENV,None)
+    # Every engine reads SNAP to locate the model directory; env_for() sets it
+    # for glm, but this path never did, so `coli run` on olmoe/inkling/kimi/
+    # deepseek_v4 always failed with "started without a model" (#1600).
+    if getattr(a, "model", None):
+        env["SNAP"] = str(a.model)
     family=family_by_id(arch)
     if getattr(a,"ram",0): explicit_env.add("RAM_GB")
     # OMP_NUM_THREADS for the sister engines that do not size their own team.
@@ -537,7 +542,7 @@ def env_for_engine(a, arch, plan=None):
             if arch == "deepseek_v4":
                 if not dsv4_cuda_available(a.model):
                     sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} {dsv4_cuda_build_hint()}")
-            elif not cuda_binary():
+            elif not cuda_binary(engine_for_gpu_check(a)):
                 sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} the engine binary is CPU-only")
             env["COLI_CUDA"] = "1"
             if gpu != "auto":
@@ -547,7 +552,7 @@ def env_for_engine(a, arch, plan=None):
         if arch == "deepseek_v4":
             if not dsv4_cuda_available(a.model):
                 sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} {dsv4_cuda_build_hint()}")
-        elif not cuda_binary():
+        elif not cuda_binary(engine_for_gpu_check(a)):
             sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
         env["COLI_CUDA"] = "1"
         env["CUDA_EXPERT_GB"] = str(vram)
@@ -569,7 +574,7 @@ def env_for_engine(a, arch, plan=None):
                                       and (arch == "deepseek_v4"
                                            or env.get("COLI_NO_OMP_TUNE")))
             env=environment_for_plan(plan,env,
-                                     cuda_enabled=env.get("COLI_CUDA") == "1")
+                                     cuda_enabled=env.get("COLI_CUDA") != "0" and cuda_binary(engine_for_gpu_check(a)))
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         if plan_must_not_choose_omp:
@@ -629,11 +634,24 @@ def need_worker_model(model):
                   build=f"make -C c {family.build_target}")
     return engine
 
-def cuda_binary():
-    if not os.path.exists(GLM): return False
+def engine_for_gpu_check(a):
+    """The family's engine path for cuda_binary(), or None (the GLM default)
+    when the model cannot be resolved here: the check must not turn a missing
+    config.json into a different error than the one need_model() gives."""
+    model = getattr(a, "model", None)
+    if not model: return None
+    try: return engine_for(model)
+    except (FamilyConfigError, UnknownFamilyError, OSError): return None
+
+def cuda_binary(engine=None):
+    """Was `engine` (default: the GLM binary) built with the GPU backend?
+    Callers that know the family pass its engine: checking colibri.exe for a
+    qwen36 run refused --gpu on a correct qwen36 CUDA build (#1533)."""
+    engine = engine or GLM
+    if not os.path.exists(engine): return False
     if sys.platform == "linux":
         try:
-            linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
+            linked=subprocess.run(["ldd",engine],capture_output=True,text=True,timeout=3)
             # Detect both CUDA (libcudart) and HIP (libamdhip64) builds.
             return any(("libcudart" in line or "libamdhip64" in line) and "not found" not in line
                        for line in linked.stdout.splitlines())
@@ -645,9 +663,9 @@ def cuda_binary():
         # marker string baked into glm.c's #ifdef COLI_CUDA block instead, and require
         # coli_cuda.dll to actually sit next to glm.exe (else CUDA init fails at startup).
         try:
-            with open(GLM,"rb") as f: built=b"[CUDA] mode: routed experts" in f.read()
+            with open(engine,"rb") as f: built=b"[CUDA] mode: routed experts" in f.read()
         except OSError: return False
-        return built and os.path.exists(os.path.join(os.path.dirname(GLM),"coli_cuda.dll"))
+        return built and os.path.exists(os.path.join(os.path.dirname(engine),"coli_cuda.dll"))
     return False
 
 def resource_request(a, env):

@@ -43,26 +43,41 @@ int  coli_vk_matmul(ColiVkTensor **tensor,
 /* Fused first half of the expert MLP in ONE dispatch (VK equivalent of
  * grouped_hidden_w4_dual): hidden[s,o] = silu(gate(x)) * up(x), reading x once for both
  * projections. D = input (hidden) dim, I = moe_inter. gate/up upload on first call.
- * Returns 0 if unavailable (no gate_up shader) / unsupported fmt so the caller falls back. */
+ * Returns 0 if unavailable (no gate_up shader) / unsupported fmt so the caller falls back.
+ * _clamped variant applies swiglu_limit (#1520: GLM-5.3-Flash 10.0): gate upper-bounded,
+ * up clamped ±limit, limit<=0 means no clamp. */
 int  coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up,
                      float *hidden, const float *x,
                      const void *gw, const float *gs,
                      const void *uw, const float *us,
                      int fmt, int S, int D, int I, int grp);
+int  coli_vk_gate_up_clamped(ColiVkTensor **gate, ColiVkTensor **up,
+                             float *hidden, const float *x,
+                             const void *gw, const float *gs,
+                             const void *uw, const float *us,
+                             int fmt, int S, int D, int I, int grp,
+                             float limit);
 
 /* Full batched expert MLP for `count` experts in ONE submit, hidden staying on-device:
  * for each c, y_c = down_c(silu(gate_c(x_c)) * up_c(x_c)). x/y packed [sum(rows)*D];
  * experts are resident (gate/up: D->I, down: I->D). Mirrors coli_cuda_expert_group.
- * Returns 0 -> caller falls back to CPU. */
+ * Returns 0 -> caller falls back to CPU.
+ * _clamped variant threads swiglu_limit through the gate_up phase (#1520). */
 int  coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                           ColiVkTensor *const *downs, const int *rows, int count,
                           float *y, const float *x);
+int  coli_vk_expert_group_clamped(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                                  ColiVkTensor *const *downs, const int *rows, int count,
+                                  float *y, const float *x, float limit);
 /* Async form: _issue submits the group and returns immediately (one in flight max);
  * the caller computes its CPU share, then _take joins and reads back the packed y.
  * Both return 0 on failure (caller computes those experts on the CPU instead). */
 int  coli_vk_expert_group_issue(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                                 ColiVkTensor *const *downs, const int *rows, int count,
                                 const float *x);
+int  coli_vk_expert_group_issue_clamped(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                                        ColiVkTensor *const *downs, const int *rows, int count,
+                                        const float *x, float limit);
 int  coli_vk_expert_group_take(float *y);
 
 /* Upload a resident tensor without computing (expert tier: gate/up/down uploaded once,
@@ -83,10 +98,16 @@ int  coli_vk_tensor_ensure2(ColiVkTensor **tensor, const void *weights, const fl
 int  coli_vk_expert_group_issue2(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                                  ColiVkTensor *const *downs, const int *rows, int count,
                                  const float *x);
+int  coli_vk_expert_group_issue2_clamped(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                                         ColiVkTensor *const *downs, const int *rows, int count,
+                                         const float *x, float limit);
 int  coli_vk_expert_group_take2(float *y);
 int  coli_vk_expert_group2(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                            ColiVkTensor *const *downs, const int *rows, int count,
                            float *y, const float *x);
+int  coli_vk_expert_group2_clamped(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                                   ColiVkTensor *const *downs, const int *rows, int count,
+                                   float *y, const float *x, float limit);
 
 /* MLA absorb attention core (decode). The KV latent/rope caches live in persistent
  * per-layer device buffers: _ensure allocates a layer's cache at max_rows (once; resize

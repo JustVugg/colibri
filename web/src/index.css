@@ -30,6 +30,28 @@
   --input: #10171a;
   --destructive: #ff766f;
 }
+html.light {
+  color-scheme: light;
+
+  --background: #f5f7f8;
+  --foreground: #172024;
+  --card: #ffffff;
+  --card-foreground: #172024;
+  --popover: #ffffff;
+  --popover-foreground: #172024;
+  --primary: #15966b;
+  --primary-foreground: #ffffff;
+  --secondary: #e8edef;
+  --secondary-foreground: #172024;
+  --muted: #edf1f2;
+  --muted-foreground: #5f6d72;
+  --accent: #e8f5f0;
+  --accent-foreground: #172024;
+  --destructive: #d94b45;
+  --border: #d4dde0;
+  --input: #ffffff;
+  --ring: #15966b;
+}
 
 * { box-sizing: border-box; }
 html, body, #root { min-height: 100%; margin: 0; }
@@ -244,3 +266,130 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   font-size: .7rem; cursor: pointer;
 }
 .attachment button:hover { color: hsl(var(--foreground)); }
+
+.theme-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--muted-foreground);
+  background: var(--input);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  transition: 0.2s;
+}
+
+.theme-toggle:hover {
+  color: var(--foreground);
+  border-color: var(--primary);
+}
+
+html.light body {
+  background: var(--background);
+  color: var(--foreground);
+}
+
+/* Light theme overrides */
+html.light .app-shell {
+  background: var(--background);
+  color: var(--foreground);
+}
+
+html.light .sidebar {
+  background: var(--background);
+  color: var(--foreground);
+  border-color: var(--border);
+}
+
+html.light .chat-panel {
+  background: var(--background);
+  color: var(--foreground);
+}
+
+html.light .topbar {
+  background: var(--background);
+  border-color: var(--border);
+}
+
+html.light .conversation {
+  background: var(--background);
+}
+
+html.light .composer-wrap {
+  background: var(--background);
+}
+
+html.light .composer {
+  background: var(--card);
+  border-color: var(--border);
+}
+
+html.light .side-section {
+  color: var(--foreground);
+}
+
+html.light .section-title {
+  color: var(--muted-foreground);
+}
+
+html.light .sidebar-foot {
+  border-color: var(--border);
+}
+
+html.light .field-help,
+html.light .runtime-unavailable,
+html.light .sidebar-foot {
+  color: var(--muted-foreground);
+}
+
+html.light input,
+html.light textarea,
+html.light select {
+  background: var(--input);
+  color: var(--foreground);
+  border-color: var(--border);
+}
+
+html.light input::placeholder,
+html.light textarea::placeholder {
+  color: var(--muted-foreground);
+}
+
+html.light .theme-toggle {
+  background: var(--input);
+  color: var(--foreground);
+  border-color: var(--border);
+}
+
+html.light .locale-switcher {
+  color: var(--muted-foreground);
+}
+
+html.light .view-tabs {
+  background: var(--card);
+  border-color: var(--border);
+}
+
+html.light .view-tabs button {
+  color: var(--muted-foreground);
+}
+
+html.light .view-tabs button.active {
+  color: var(--foreground);
+}
+
+html.light .suggestions button {
+  background: var(--card);
+  color: var(--foreground);
+  border-color: var(--border);
+}
+
+html.light .message-body {
+  color: var(--foreground);
+}

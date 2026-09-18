@@ -33,7 +33,9 @@ SAFETENSORS_DTYPES = {
     "F8_E8M0FNU": 1,
 }
 def _is_embedding(name):
-    return name.endswith("embed_tokens.weight")
+    # GLM / Qwen / OLMoE: embed_tokens.weight (nested or flat)
+    # DeepSeek V4 / V4-Flash (REAP etc): embed.weight
+    return name.endswith("embed_tokens.weight") or name.endswith("embed.weight")
 
 
 def _is_final_norm(name):
@@ -42,13 +44,20 @@ def _is_final_norm(name):
     # `layernorm` outright: GLM-5.3-Flash's vision tower has
     # `model.visual.post_layernorm.weight`, which would otherwise stand in for
     # a final norm that is not there.
-    return (name.endswith(".norm.weight")
+    # DeepSeek V4 uses a bare `norm.weight` (and `model.norm.weight` in some
+    # conversions) — allow both the dotted suffix and the exact name.
+    return ((name == "norm.weight" or name.endswith(".norm.weight"))
             and ".layers." not in name
             and "layernorm" not in name)
 
 
 def _is_output_head(name):
-    return name.endswith("lm_head.weight")
+    # GLM / Qwen / OLMoE: lm_head.weight
+    # DeepSeek V4 / V4-Flash: head.weight — but hc_head_* must not count
+    # (hc_head_base / fn / scale are not an output head)
+    if "hc_head" in name:
+        return False
+    return name.endswith("lm_head.weight") or name.endswith("head.weight")
 
 
 #: What a checkpoint must contain to be a language model at all, stated as

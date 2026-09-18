@@ -1030,11 +1030,11 @@ olmoe$(EXE): olmoe.c cli_args.h st.h json.h compat.h sample.h tok.h tok_unicode.
 # -DCOLI_CUDA and linking -lcudart for a build that calls neither only made
 # `make qwen36` depend on a toolkit it never touches. With CUDA=1 the tier is
 # real CUDA and takes the normal flags back.
-ifeq ($(CUDA),1)
-QWEN36_TIER_SRC = qwen36_tier.c
-QWEN36_CFLAGS   = $(CFLAGS)
-QWEN36_LDFLAGS  = $(LDFLAGS)
-else ifeq ($(HIP),1)
+# CUDA_DLL=1 / HIP_DLL=1 are the Windows spellings (CUDA=1 is refused there):
+# the tier compiles in through the runtime loader exactly as it does through
+# the direct link, or `make qwen36.exe CUDA_DLL=1` silently produced a CPU-only
+# engine (#1533).
+ifneq (,$(filter 1,$(CUDA) $(CUDA_DLL) $(HIP) $(HIP_DLL)))
 QWEN36_TIER_SRC = qwen36_tier.c
 QWEN36_CFLAGS   = $(CFLAGS)
 QWEN36_LDFLAGS  = $(LDFLAGS)
@@ -1315,7 +1315,22 @@ tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c s
 tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+tests/test_olmoe_victim_index$(EXE): tests/test_olmoe_victim_index.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS) -lm
+
+# Randomised differential test for the recency-list victim selection
+# (#1571 r2 review): drives the REAL expert_get/pilot_realload call sites
+# (with a stubbed checkpoint load) and asserts list pick == legacy scan.
+tests/test_olmoe_differential$(EXE): tests/test_olmoe_differential.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+	$(CC) $(NOCUDA_CFLAGS) -DOLMOE_TEST_STUB_LOAD $< -o $@ $(NOCUDA_LDFLAGS) -lm
+
+# bench_olmoe_victim_index is a microbenchmark (list victim pick vs the legacy
+# O(cap) scan, #1050), NOT a test gate — intentionally absent from TEST_BINS.
+# Build on demand: make tests/bench_olmoe_victim_index
+tests/bench_olmoe_victim_index$(EXE): tests/bench_olmoe_victim_index.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS) -lm
+
+tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c expert_ffn.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h

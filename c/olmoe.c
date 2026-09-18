@@ -82,10 +82,19 @@ typedef struct {
 /* pinned=1 means this slot is strongly preferred to keep (hot expert); it will
  * not be evicted during normal LRU eviction, but may be displaced under extreme
  * cache pressure when all slots are pinned or in-flight. */
-typedef struct { int eid; int pinned; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used; } Slot;
+typedef struct { int eid; int pinned; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used;
+                 /* #1050: recency-list links (slot indices, -1 = none).
+                  * rlist: 0 = unlinked (calloc-zero safe), 1 = ev-list
+                  * (resident && !pinned), 2 = pin-list (resident && pinned). */
+                 int rprev, rnext; int8_t rlist; } Slot;
 typedef struct {
     Slot *slots;
     int *slot_by_expert;                  /* expert id -> resident slot, -1 if absent */
+    /* #1050: intrusive recency lists, least-recent-first (head = LRU victim).
+     * ev-list: resident && !pinned.  pin-list: resident && pinned.
+     * In-flight slots (eid<0) live in neither list, mirroring the linear
+     * scans they replace (which skip eid<0 in every pass). */
+    int ev_head, ev_tail, pin_head, pin_tail;
     int n, cap;
 } LCache;
 
@@ -148,6 +157,165 @@ static void slot_ensure_allocated(Model *m, Slot *s);
 static uint64_t g_slot_index_probes;
 #endif
 
+#ifdef COLI_VICTIM_TEST
+static uint64_t g_victim_scans, g_victim_scan_len;  /* #1050 test probes */
+#endif
+static int g_victim_scan_mode; /* #1050: 1 forces the legacy linear scan (COLI_VICTIM_SCAN=1) */
+
+/* ---------- #1050: intrusive recency lists (LRU victim without the O(n) scan) ----------
+ * All runtime callers hold g_pilot_mx (the lists are touched at exactly the same
+ * points the linear scans were).  ev-list order: least-recently-used at head.
+ * Hit path: victim_touch moves a slot to the tail in O(1) — used stays the
+ * authoritative stamp, the list only mirrors it.
+ * rlist encoding: 0 = unlinked (calloc-zero safe: fresh slots start unlinked),
+ * 1 = ev-list (resident && !pinned), 2 = pin-list (resident && pinned). */
+static void victim_unlink(LCache *lc, Slot *s, int idx) {
+    if (s->rlist == 0) return;
+    int *head = s->rlist == 2 ? &lc->pin_head : &lc->ev_head;
+    int *tail = s->rlist == 2 ? &lc->pin_tail : &lc->ev_tail;
+    if (s->rprev >= 0) lc->slots[s->rprev].rnext = s->rnext; else *head = s->rnext;
+    if (s->rnext >= 0) lc->slots[s->rnext].rprev = s->rprev; else *tail = s->rprev;
+    s->rlist = 0; s->rprev = s->rnext = -1;
+    (void)idx;
+}
+static void victim_push_back(LCache *lc, Slot *s, int idx, int list) {
+    int *head = list == 2 ? &lc->pin_head : &lc->ev_head;
+    int *tail = list == 2 ? &lc->pin_tail : &lc->ev_tail;
+    s->rlist = (int8_t)list; s->rnext = -1; s->rprev = *tail;
+    if (*tail >= 0) lc->slots[*tail].rnext = idx; else *head = idx;
+    *tail = idx;
+}
+/* O(1) on the hit path: re-link to the MRU end of the slot's own list. */
+static void victim_touch(LCache *lc, Slot *s, int idx) {
+    if (s->rlist == 0) return;
+    int list = s->rlist;
+    int cur_tail = list == 2 ? lc->pin_tail : lc->ev_tail;
+    if (cur_tail == idx) return;                    /* already MRU */
+    victim_unlink(lc, s, idx);
+    victim_push_back(lc, s, idx, list);
+}
+/* Re-file a resident slot after a state change (publish / pin flip).
+ * ev-list: O(1) — a fresh publish always carries a fresher `used` stamp than
+ * every list member, so the tail is the correct MRU position.
+ * pin-list: O(k) insert-scan by `used` — pin flips do NOT change `used`, so a
+ * newly pinned older slot must slot in before newer-pinned members (Sol-r1 M3:
+ * tail-append made the all-pinned fallback pick a newer pinned slot over an
+ * older one, diverging from the scan).  Pin-lists are capped by PIN_HOT budget
+ * and flips are rare, so the scan is bounded by the pin budget, not by cap.
+ * #1571 r2 (JustVugg differential): the same invariant holds on UNPIN — a
+ * pin->ev flip must not tail-append on its old stamp either, or the unpin
+ * promotes an older slot to MRU over genuinely newer ones and the ev-head
+ * diverges from the legacy min-used pick. Unpin re-inserts by `used` from the
+ * ev-head side (rare path, bounded by the pin budget like the pin-list scan). */
+static void victim_refile(LCache *lc, Slot *s, int idx) {
+    int want = s->pinned ? 2 : 1;
+    if (want == 1) {
+        /* #1571 r2: publish-stamped slots carry a fresh stamp (fresher than
+         * every member) -> tail-append O(1). Pin->ev flips keep their OLD
+         * stamp -> splice by `used` from the head, so the ev-list stays in
+         * exact `used` order and ev-head == legacy min-used (rare path,
+         * pin-budget bound). Fresh-publish fast path: tail.used < s->used. */
+        if (lc->ev_tail < 0 || lc->slots[lc->ev_tail].used < s->used) {
+            victim_unlink(lc, s, idx);
+            victim_push_back(lc, s, idx, 1);
+            return;
+        }
+        /* old-stamp insert (pin flip): splice before the first newer member */
+        victim_unlink(lc, s, idx);
+        int at = -1;
+        int next = lc->ev_head;
+        while (next >= 0 && lc->slots[next].used <= s->used) { at = next; next = lc->slots[next].rnext; }
+        s->rlist = 1; s->rprev = at; s->rnext = next;
+        if (next >= 0) lc->slots[next].rprev = idx; else lc->ev_tail = idx;
+        if (at >= 0) lc->slots[at].rnext = idx; else lc->ev_head = idx;
+        return;
+    }
+    victim_unlink(lc, s, idx);
+    /* walk from the tail: first member with used <= ours becomes our prev */
+    int at = lc->pin_tail;
+    while (at >= 0 && lc->slots[at].used > s->used) at = lc->slots[at].rprev;
+    if (at == idx) return;                          /* already in place (can't happen post-unlink; belt & braces) */
+    if (at < 0) {                                   /* oldest pinned: become pin head */
+        s->rlist = 2; s->rprev = -1; s->rnext = lc->pin_head;
+        if (lc->pin_head >= 0) lc->slots[lc->pin_head].rprev = idx;
+        lc->pin_head = idx;
+        if (lc->pin_tail < 0) lc->pin_tail = idx;
+    } else {                                        /* insert after `at` */
+        s->rlist = 2; s->rprev = at; s->rnext = lc->slots[at].rnext;
+        if (s->rnext >= 0) lc->slots[s->rnext].rprev = idx; else lc->pin_tail = idx;
+        lc->slots[at].rnext = idx;
+    }
+}
+
+/* #1050: victim selection without the O(n) scan.  Same contract as the three
+ * scan phases it replaces in expert_get/pilot_realload:
+ *   1. oldest unpinned resident slot;  2. if none, oldest non-in-flight slot
+ *   (may be pinned);  3. if all in-flight, -1 (caller waits and rescans).
+ * allow_pinned=false restricts the pick to the unpinned set — the legacy
+ * pilot-speculation scan (Sol-r1 M5) only ever displaced UNPINNED residents;
+ * returning a pin-list slot here would let a speculation evict HOT/RESIDENT
+ * entries the old code never touched.  Demand paths (expert_get) keep the
+ * full 2-phase fallback. */
+static int victim_pick_ex(Model *m, LCache *lc, int allow_pinned) {
+    (void)m;
+    if (g_victim_scan_mode) {   /* kill-switch: legacy scan, pin policy enforced here */
+        int lru = -1;
+        for (int i = 0; i < lc->n; i++) {
+            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
+            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+        }
+        if (lru >= 0 || !allow_pinned) return lru;
+        for (int i = 0; i < lc->n; i++) {
+            if (lc->slots[i].eid < 0) continue;
+            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+        }
+        return lru;
+    }
+    if (lc->ev_head >= 0) return lc->ev_head;
+    if (allow_pinned && lc->pin_head >= 0) return lc->pin_head;
+    return -1;  /* (allow_pinned? all pinned : pinned or in-flight): caller drops/waits */
+}
+static int victim_pick(Model *m, LCache *lc) {
+    if (g_victim_scan_mode) {
+#ifdef COLI_VICTIM_TEST
+        g_victim_scans++;
+#endif
+        int lru = -1;
+        for (int i = 0; i < lc->n; i++) {
+#ifdef COLI_VICTIM_TEST
+            g_victim_scan_len++;
+#endif
+            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
+            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+        }
+        if (lru >= 0) return lru;
+        for (int i = 0; i < lc->n; i++) {
+#ifdef COLI_VICTIM_TEST
+            g_victim_scan_len++;
+#endif
+            if (lc->slots[i].eid < 0) continue;
+            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+        }
+        return lru;
+    }
+    /* List path: ev_head is the LRU unpinned resident slot. */
+    if (lc->ev_head >= 0) return lc->ev_head;
+    /* Phase-2 equivalent: oldest non-in-flight — the pin list head, since
+     * every in-flight slot is list-unlinked.  Order matches the legacy
+     * fallback: oldest by `used`, which the pin list already preserves. */
+    if (lc->pin_head >= 0) return lc->pin_head;
+    return -1;  /* all in-flight: caller sleeps and rescans */
+}
+/* O(cap) only when the caller retries after every slot drained in-flight;
+ * identical to the legacy phase-3 rescan. */
+static void victim_rescan_all(LCache *lc) {
+#ifdef COLI_VICTIM_TEST
+    g_victim_scans++;
+    g_victim_scan_len += (uint64_t)lc->n;
+#endif
+    /* lists are self-maintained; nothing to rebuild — kept for parity */
+}
+
 /* Runtime callers hold g_pilot_mx.  The defensive eid check is intentional:
  * an index bug must degrade to a miss, never serve another expert's weights. */
 static Slot *slot_indexed(Model *m, int layer, int eid) {
@@ -166,6 +334,7 @@ static Slot *slot_indexed(Model *m, int layer, int eid) {
 static void cache_unindex(Model *m, int layer, Slot *s) {
     LCache *lc = &m->cache[layer];
     int eid = s->eid, i = (int)(s - lc->slots);
+    victim_unlink(lc, s, i);              /* #1050: leaving residency drops list links */
     if (lc->slot_by_expert && eid >= 0 && eid < m->c.n_experts &&
         lc->slot_by_expert[eid] == i)
         lc->slot_by_expert[eid] = -1;
@@ -182,6 +351,8 @@ static void cache_publish(Model *m, int layer, Slot *s, int eid) {
     s->eid = eid;
     if (lc->slot_by_expert && eid >= 0 && eid < m->c.n_experts)
         lc->slot_by_expert[eid] = (int)(s - lc->slots);
+    if (eid >= 0)                          /* #1050: residency re-entry at MRU end */
+        victim_refile(lc, s, (int)(s - lc->slots));
 }
 
 static void ensure_pilot_worker_started(Model *m) {
@@ -211,19 +382,32 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
  * budget automatico pari a cio' che il processo gia' tiene: la cache risulta
  * minima invece che sbagliata, e --ram (o --cap) resta la via esplicita. */
 static double mem_available_gb(void) {
-    double avail = 0.0;
-#ifdef __linux__
-    FILE *mi = fopen("/proc/meminfo", "r");
-    if (mi) {
-        char ln[256]; double v = 0;
-        while (fgets(ln, sizeof(ln), mi))
-            if (sscanf(ln, "MemAvailable: %lf", &v) == 1) { avail = v / 1e6; break; }
-        fclose(mi);
+    /* The one cross-platform "RAM available now" probe, shared with every other
+     * engine (colibri.c, glm53.c). This engine used to read /proc/meminfo
+     * directly and had no macOS or Windows branch, so on a Mac or a Windows
+     * box it returned 0.0 and the auto budget collapsed to the dense resident
+     * footprint -- a one-slot-per-layer cache with no warning (#1601). */
+    double avail = compat_mem_available_gb();
+    /* Plausibility floor (#1601): a warm macOS host with no swap can report
+     * free+inactive+purgeable at a fraction of a gigabyte on a 128 GB machine.
+     * That is "unmeasured", not "no room". Below 2% of physical RAM treat it
+     * as unmeasured, warn once, and fall back to half the physical total --
+     * the same documented fallback as the zero case -- rather than sizing the
+     * cache off an implausible number in silence. --ram / --cap stay the
+     * explicit override. */
+    static int warned = 0;
+    double total = compat_mem_total_gb();
+    if (avail <= 0.0 || (total > 0.0 && avail < total * 0.02)) {
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                "[ram] auto-detect read %.2f GB available of %.2f GB physical -- "
+                "implausibly low, treating as unmeasured and sizing from half "
+                "the physical total; pass --ram <GB> to override\n",
+                avail, total);
+        }
+        avail = total * 0.5;
     }
-#elif defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE)
-    long pages = sysconf(_SC_AVPHYS_PAGES), page = sysconf(_SC_PAGESIZE);
-    if (pages > 0 && page > 0) avail = (double)pages * (double)page / 1e9;
-#endif
     return avail;
 }
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
@@ -495,7 +679,14 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         double room = budget - resident - kv_gb - 0.5;   /* 0.5 GB: activations */
         int derived = room > 0.0 && slot_gb > 0.0
                     ? (int)(room / slot_gb / (double)layers) : 0;
-        if (derived < 1) derived = 1;
+        if (derived < 1) {
+            fprintf(stderr,
+                "[cache] no room for even one expert slot/layer (room %.1f GB vs %.0f MB/expert) "
+                "-- the cache will hold 1 slot/layer and decode will be slow; pass --ram <GB> "
+                "or --cap <slots> to size it\n",
+                room, slot_gb * 1000.0);
+            derived = 1;
+        }
         if (derived > c->n_experts) derived = c->n_experts;
         fprintf(stderr, "[cache] %d slots/layer of %d experts: %.1f GB budget "
                         "(%s), %.1f GB dense resident, %.1f GB projected KV, "
@@ -512,6 +703,8 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         m->cache[i].slot_by_expert = malloc((size_t)c->n_experts * sizeof(int));
         if (!m->cache[i].slot_by_expert) { fprintf(stderr,"OOM expert cache index\n"); exit(1); }
         for (int e = 0; e < c->n_experts; e++) m->cache[i].slot_by_expert[e] = -1;
+        m->cache[i].ev_head = m->cache[i].ev_tail = -1;   /* #1050 recency lists */
+        m->cache[i].pin_head = m->cache[i].pin_tail = -1;
     }
     /* IMPROVEMENT 2: frequency heatmap for hot expert pinning */
     if (init_telemetry) {
@@ -616,6 +809,16 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
     s->pinned = 0;
 }
 
+/* Test-only hook: the randomised differential test (test_olmoe_differential.c)
+ * drives the real expert_get/pilot_realload call sites without a checkpoint.
+ * The stub keeps the ordering (hide/stamp/publish/refile) fully exercised while
+ * replacing only the disk read. Never defined outside the test harness. */
+#ifdef OLMOE_TEST_STUB_LOAD
+static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
+    (void)m; (void)layer; (void)eid;
+    if (s->g) memset(s->g, 0xAB, 16);              /* deterministic payload marker */
+}
+#else
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     char nm[256], qsnm[256];
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.merged_weight", layer, eid);
@@ -644,6 +847,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     st_read_f32(&m->S, qsnm, s->gs, 0);  /* scales are F32; use typed reader for dtype safety */
     __atomic_fetch_add(&m->disk_ns, (uint64_t)((now_s() - started) * 1e9), __ATOMIC_RELAXED);
 }
+#endif /* OLMOE_TEST_STUB_LOAD */
 
 /* ---------- cache expert: ritorna i pesi quantizzati (q+scale) da cache o disco ---------- */
 /* One byte per expert: routed in this turn or not. The dashboard's Brain tab
@@ -665,6 +869,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     Slot *hit = slot_indexed(m, layer, eid);
     if (hit) {
         m->hits++; hit->used = ++m->clock; *out = hit;
+        victim_touch(lc, hit, (int)(hit - lc->slots));   /* #1050: O(1) MRU re-link */
         if (m->last_access) m->last_access[layer * m->c.n_experts + eid] = m->clock;
         pthread_mutex_unlock(&g_pilot_mx);
         return;
@@ -676,20 +881,8 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
         s = &lc->slots[lc->n++];
         slot_ensure_allocated(m, s);
     } else {
-        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++) {
-            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
-            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-        }
-        if (lru < 0) {
-            /* All slots are pinned or in-flight; find oldest non-in-flight slot
-             * (may be pinned, but never select one currently being loaded). */
-            for (int i = 0; i < lc->n; i++) {
-                if (lc->slots[i].eid < 0) continue; /* never evict in-flight */
-                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-            }
-        }
+        /* #1050: LRU eviction via recency list (legacy: 3-phase linear scan). */
+        int lru = victim_pick(m, lc);
         while (lru < 0) {
             /* EVERY slot is in flight: each buffer is owned by an unlocked pread
              * in the pilot worker (or a demand load) that will publish into it.
@@ -701,10 +894,8 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
             pthread_mutex_unlock(&g_pilot_mx);
             sleep_ms(1);
             pthread_mutex_lock(&g_pilot_mx);
-            for (int i = 0; i < lc->n; i++) {
-                if (lc->slots[i].eid < 0) continue;
-                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-            }
+            victim_rescan_all(lc);
+            lru = victim_pick(m, lc);
         }
         s = &lc->slots[lru];
         s->pinned = 0;
@@ -718,7 +909,10 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     pthread_mutex_lock(&g_pilot_mx);
     cache_publish(m, layer, s, eid);
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
-    s->used = ++m->clock;
+    s->used = ++m->clock;                          /* stamp BEFORE refile: the pin insert-scan
+                                                    * must see the final stamp (L2b differential:
+                                                    * refile-then-bump left a stale-ordered pin list) */
+    victim_refile(lc, s, (int)(s - lc->slots));   /* #1050: pin flip re-files */
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     *out = s;
     pthread_mutex_unlock(&g_pilot_mx);
@@ -770,7 +964,11 @@ static void pin_hot_experts(Model *m) {
             int found = 0;
             pthread_mutex_lock(&g_pilot_mx);
             Slot *resident = slot_indexed(m, l, eid);
-            if (resident) { resident->pinned = 1; found = 1; }
+            if (resident) {
+                resident->pinned = 1; found = 1;
+                victim_refile(&m->cache[l], resident,   /* #1050: re-file ev->pin */
+                              (int)(resident - m->cache[l].slots));
+            }
             pthread_mutex_unlock(&g_pilot_mx);
             if (!found && g_pilot > 0) {
                 /* Only enqueue when the prefetch worker is active (PILOT>0). */
@@ -1013,12 +1211,10 @@ static void pilot_realload(Model *m, int layer, int eid) {
         s = &lc->slots[lc->n++];
         slot_ensure_allocated(m, s);
     } else {
-        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++) {
-            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
-            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-        }
+        /* #1050: LRU eviction via recency list (legacy: 2-phase linear scan).
+         * allow_pinned=0 (Sol-r1 M5): speculation never displaces pinned slots,
+         * matching the legacy pilot scan exactly. */
+        int lru = victim_pick_ex(m, lc, 0);
         if (lru < 0) {
             m->is_queued[layer * c->n_experts + eid] = 0;
             pthread_mutex_unlock(&g_pilot_mx);
@@ -1048,7 +1244,10 @@ static void pilot_realload(Model *m, int layer, int eid) {
     pthread_mutex_lock(&g_pilot_mx);
     cache_publish(m, layer, s, eid);
     s->pinned = m->is_pinned[layer * c->n_experts + eid];
-    s->used = ++m->clock;
+    s->used = ++m->clock;                          /* stamp BEFORE refile: the pin insert-scan
+                                                    * must see the final stamp (L2b differential:
+                                                    * refile-then-bump left a stale-ordered pin list) */
+    victim_refile(lc, s, (int)(s - lc->slots));   /* #1050: pin flip re-files */
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     m->is_queued[layer * c->n_experts + eid] = 0;
     pthread_mutex_unlock(&g_pilot_mx);
@@ -1523,6 +1722,24 @@ static void serve_hwinfo(Model *m) {
             if (sscanf(ln, "MemTotal: %lf", &v) == 1) rt = v/1e6;
             if (sscanf(ln, "MemAvailable: %lf", &v) == 1) ra = v/1e6;
         } fclose(mi); }
+    /* #1601: neither /proc/cpuinfo nor /proc/meminfo exists on macOS (or
+     * Windows), so both reads above fail silently and this line went out as
+     * "0.0 0.0 ... unknown" -- the /health hwinfo the dashboard renders. Fill
+     * only what /proc could not supply, so the Linux path stays byte-identical
+     * (same shape as deepseek_v4.c's #macos-port HWINFO fix). */
+#if defined(__APPLE__)
+    if (!cpu[0]) {
+        size_t len = sizeof(cpu);
+        if (sysctlbyname("machdep.cpu.brand_string", cpu, &len, NULL, 0) != 0)
+            cpu[0] = 0;
+    }
+    if (rt <= 0.0) rt = compat_mem_total_gb();
+    if (ra <= 0.0) ra = compat_mem_available_gb();
+#elif defined(_WIN32)
+    if (rt <= 0.0 || ra <= 0.0) { double t = 0, a = 0; compat_meminfo(&t, &a);
+        if (rt <= 0.0) rt = t;
+        if (ra <= 0.0) ra = a; }
+#endif
     printf("HWINFO %d %.1f %.1f 0 0.0 %s|\n", cores, rt, ra, cpu[0] ? cpu : "unknown");
     fflush(stdout);
 }
@@ -1585,6 +1802,7 @@ int main(int argc, char **argv) {
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("OLMoE"); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
+    g_victim_scan_mode = getenv("COLI_VICTIM_SCAN") ? atoi(getenv("COLI_VICTIM_SCAN")) : 0;  /* #1050 kill-switch */
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
     g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
     g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 0;
