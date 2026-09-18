@@ -1050,7 +1050,7 @@ olmoe$(EXE): olmoe.c cli_args.h st.h json.h compat.h sample.h tok.h tok_unicode.
 	$(CC) $(NOCUDA_CFLAGS) olmoe.c -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
-# MoE). With CUDA=1 the optional VRAM expert tier (qwen36_tier.c) is compiled
+# MoE). With CUDA=1 or VK=1 the optional VRAM expert tier (qwen36_tier.c) is compiled
 # in and reuses the shared CUDA backend; without it the engine is CPU-only
 # (qwen36_tier.h provides inline stubs).
 #
@@ -1059,6 +1059,8 @@ olmoe$(EXE): olmoe.c cli_args.h st.h json.h compat.h sample.h tok.h tok_unicode.
 # -DCOLI_CUDA and linking -lcudart for a build that calls neither only made
 # `make qwen36` depend on a toolkit it never touches. With CUDA=1 the tier is
 # real CUDA and takes the normal flags back.
+# VK=1 (without CUDA) compiles the same tier against the shared Vulkan backend;
+# NOCUDA_* already carry -DCOLI_VULKAN and -lvulkan when VK=1. CUDA wins if both.
 # CUDA_DLL=1 / HIP_DLL=1 are the Windows spellings (CUDA=1 is refused there):
 # the tier compiles in through the runtime loader exactly as it does through
 # the direct link, or `make qwen36.exe CUDA_DLL=1` silently produced a CPU-only
@@ -1067,13 +1069,17 @@ ifneq (,$(filter 1,$(CUDA) $(CUDA_DLL) $(HIP) $(HIP_DLL)))
 QWEN36_TIER_SRC = qwen36_tier.c
 QWEN36_CFLAGS   = $(CFLAGS)
 QWEN36_LDFLAGS  = $(LDFLAGS)
+else ifeq ($(VK),1)
+QWEN36_TIER_SRC = qwen36_tier.c
+QWEN36_CFLAGS   = $(NOCUDA_CFLAGS)
+QWEN36_LDFLAGS  = $(NOCUDA_LDFLAGS)
 else
 QWEN36_TIER_SRC =
 QWEN36_CFLAGS   = $(NOCUDA_CFLAGS)
 QWEN36_LDFLAGS  = $(NOCUDA_LDFLAGS)
 endif
-qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h st.h json.h compat.h omp_tune.h kv_prefix.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
+qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h st.h json.h compat.h omp_tune.h kv_prefix.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV)
+	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
 # stream from the official checkpoint and quant.h's mxfp4 kernel reads them as they
@@ -1086,8 +1092,8 @@ deepseek_v41$(EXE): deepseek_v41.c cli_args.h st.h json.h tok.h tok_unicode.h co
 # loader and SERVE=1 protocol. With CUDA=1 it links the same expert tier as
 # qwen36 (fp8 streaming mode: hot experts get VRAM copies, the RAM LRU stays);
 # without it the tier header's inline stubs keep the build toolkit-free.
-qwen38$(EXE): qwen38.c cli_args.h qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h omp_tune.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) qwen38.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen38$(EXE) $(QWEN36_LDFLAGS)
+qwen38$(EXE): qwen38.c cli_args.h qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h omp_tune.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV)
+	$(CC) $(QWEN36_CFLAGS) qwen38.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) -o qwen38$(EXE) $(QWEN36_LDFLAGS)
 
 .PHONY: qwen38-tiny-generate qwen38-tiny-check
 qwen38-tiny-generate:
@@ -1136,28 +1142,28 @@ qwen38-tier-engine-check: qwen38-tiny-fp8-generate tests/test_qwen38_tier_engine
 # Same tier sources as the engine: the test includes qwen36.c, so with CUDA=1
 # it needs qwen36_tier.c and the backend object too (without CUDA, the header's
 # inline stubs cover it and both are empty).
-tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
-	$(CC) $(CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(LDFLAGS)
+tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
-tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # Both tokenizer.json merge spellings ("a b" strings and ["a","b"] pairs)
 # must index the same merge table; the pair form is what Qwen3.6 ships.
-tests/test_qwen36_tok_merges$(EXE): tests/test_qwen36_tok_merges.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_qwen36_tok_merges$(EXE): tests/test_qwen36_tok_merges.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # A byte-counted serving payload may end mid-character; the pre-tokenizer must
 # not read past it.  qwen38 already gates this (tests/test_qwen38_tokenizer.c).
-tests/test_qwen36_tok_truncated$(EXE): tests/test_qwen36_tok_truncated.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_qwen36_tok_truncated$(EXE): tests/test_qwen36_tok_truncated.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # Reproducible local timing evidence; intentionally not a noisy CI perf gate.
-tests/bench_qwen36_dense_batch$(EXE): tests/bench_qwen36_dense_batch.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/bench_qwen36_dense_batch$(EXE): tests/bench_qwen36_dense_batch.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 inkling$(EXE): inkling.c cli_args.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h backend_cuda_ink.h backend_metal.h edge_adapters.h edge_runtime.h edge_tok_internal.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
@@ -1379,8 +1385,31 @@ tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c s
 tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c expert_ffn.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c expert_ffn.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# Qwen3.6 Vulkan expert-tier gate: synthetic experts through qwen36_tier.c and the
+# shared Vulkan backend, no model. Compiles to a skip without VK=1 (so it is a
+# portable gate like the rest of TEST_BINS) and skips at runtime without a device.
+tests/test_qwen36_tier_vk$(EXE): tests/test_qwen36_tier_vk.c qwen36_tier.c qwen36_tier.h tier.h backend_vulkan.h $(VK_OBJ) $(VK_SPV)
+	$(CC) $(NOCUDA_CFLAGS) $< qwen36_tier.c $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# Same gate, int8-promoted experts (fmt=1, no packing): #1334 taught the tier to
+# promote int8 containers, and the Vulkan backend cannot be re-initialised
+# in-process, so this is a thin file that #includes test_qwen36_tier_vk.c with
+# TIER_VK_INT8 set rather than a second qt_init() in the same test binary.
+tests/test_qwen36_tier_vk_int8$(EXE): tests/test_qwen36_tier_vk_int8.c tests/test_qwen36_tier_vk.c qwen36_tier.c qwen36_tier.h tier.h backend_vulkan.h $(VK_OBJ) $(VK_SPV)
+	$(CC) $(NOCUDA_CFLAGS) $< qwen36_tier.c $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# The shim's CONTROL FLOW with no device: tests/qwen36_fake_vulkan.h defines
+# every coli_vk_* symbol the tier links against and records what it receives
+# (the Vulkan twin of qwen36_fake_cuda.h), so single-device init, the
+# VK_EXPERT_GB budget and its 4 GB fallback, the upload formats, fill-once,
+# issue/take through ybuf and the fp8/trunk refusals run in make check and
+# under the sanitizers on every platform. The numerics stay in the two gates
+# above. -UCOLI_CUDA because the shim prefers CUDA when both are defined.
+tests/test_qwen36_tier_vk_fake$(EXE): tests/test_qwen36_tier_vk_fake.c tests/qwen36_fake_vulkan.h qwen36_tier.c qwen36_tier.h tier.h backend_vulkan.h
+	$(CC) $(NOCUDA_CFLAGS) -UCOLI_CUDA -DCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

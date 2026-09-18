@@ -985,10 +985,12 @@ static int g_expert_is_int4 = 1;
 
 /* Shared expert kernel (expert_ffn.h): routed experts stay planar int4 in
  * RAM and a layer runs as (expert, row-chunk) items. On by default for an
- * int4 gs=64 container whose widths are multiples of 64, off under the CUDA
- * expert tier (it uploads the pair-layout int4 and computes misses from the
- * int8 copy) and with QWEN_EXPERT_KERNEL=0, which keeps the historical
- * unpack-to-int8 path for A/Bs. Decided once from the container itself. */
+ * int4 gs=64 container whose widths are multiples of 64, off under the
+ * expert tier, CUDA or Vulkan (it uploads the pair-layout int4 and computes
+ * misses from the int8 copy; a pw-only slot gives it nothing to upload and
+ * NULL to fall back on) and with QWEN_EXPERT_KERNEL=0, which keeps the
+ * historical unpack-to-int8 path for A/Bs. Decided once from the container
+ * itself. */
 static int container_layer_is_int4(Model *m, int layer);
 static int xf_mode(Model *m) {
     static int v = -1;
@@ -997,6 +999,12 @@ static int xf_mode(Model *m) {
     int on = !(e && *e == '0');
 #ifdef COLI_CUDA
     { const char *cu = getenv("COLI_CUDA"); if (cu && *cu == '1') on = 0; }
+#endif
+#ifdef COLI_VULKAN
+    /* Same gate as CUDA. Without it every slot was allocated pw-only, the
+     * warmstart offered NULL (0 uploads behind a "N in VRAM" line that counts
+     * the plan) and the first CPU-computed expert dereferenced e->g == NULL. */
+    { const char *vk = getenv("COLI_VULKAN"); if (vk && *vk == '1') on = 0; }
 #endif
     Cfg *c = &m->c;
     if (c->expert_gs != XF_BLOCK || !xf_layout_ok(c->hidden) || !xf_layout_ok(c->inter)) on = 0;
@@ -3176,9 +3184,13 @@ int main(int argc, char **argv) {
                 g_qdw_n, now_s()-tq, freed/1073741824.0);
     }
 
-    /* Optional CUDA VRAM expert tier (COLI_CUDA=1): hot experts live in
-     * DEVICE_LOCAL memory across the configured GPUs, misses fall back to the
-     * CPU int8 path. See qwen36_tier.h. */
+    /* Optional VRAM expert tier (COLI_CUDA=1 or COLI_VULKAN=1): hot experts live in
+     * DEVICE_LOCAL memory, misses fall back to the CPU int8 path. See qwen36_tier.h. */
+#ifndef COLI_VULKAN
+    if (getenv("COLI_VULKAN"))
+        fprintf(stderr, "[qwen36] COLI_VULKAN is set but this binary was built without VK=1 "
+                        "(no Vulkan tier); running on CPU\n");
+#endif
     /* Formato degli esperti dalla TAGLIA SU DISCO del primo, non da meta.ebits:
      * esiste un container i8 il cui meta dichiara ebits=4 (stesso motivo per cui
      * il loader piu' sopra guarda nbytes). Il tier ne ha bisogno prima di
@@ -3218,7 +3230,7 @@ int main(int argc, char **argv) {
     }
     if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_is_int4)) {
-        fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
+        fprintf(stderr, "[gpu] MoE experts -> %s VRAM tier\n", qt_backend_name());
         atexit(qt_shutdown);
         /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The
          * qdw entry keyed by m.lm_head holds the int8 rows + per-row scales

@@ -315,6 +315,7 @@ static void test_shutdown_wakes_everyone(void) {
     check(!t_note_block_done && !t_note_planned_done && !t_fill_wait_done,
           "with a full queue and an open group all three callers must be parked before shutdown");
 
+    uint64_t uploads_before = G.uploads;
     arm_watchdog(10);
     qt_shutdown();
     pthread_join(a, NULL); pthread_join(bth, NULL); pthread_join(c, NULL);
@@ -322,13 +323,15 @@ static void test_shutdown_wakes_everyone(void) {
     check(!G.on, "shutdown_returns_with_four_waiters_parked");
     check(t_note_block_done && t_note_planned_done && t_fill_wait_done,
           "every cv_take waiter must return once shutdown has been requested");
-    /* the abandoned swaps left the books consistent: the victim still holds
-     * its tensor and says so, no queued flag survives */
+    /* the abandoned swaps left the books consistent: none of them drove an
+     * upload, no queued flag survives, and shutdown released the victim's
+     * tensor with every other resident expert */
     pthread_mutex_lock(&G.mx);
     int stale_queued = 0;
     for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++) stale_queued += qs(l, e)->queued;
     pthread_mutex_unlock(&G.mx);
-    check(qs(0, 0)->resident == 1 && qs(0, 0)->tg != NULL, "the victim of an abandoned swap keeps its tensor and its resident flag");
+    check(G.uploads == uploads_before && qs(0, 0)->resident == 0 && qs(0, 0)->tg == NULL,
+          "an abandoned swap uploads nothing and its victim is released by shutdown");
     check(stale_queued == 0, "no expert may still read as queued after shutdown drained or abandoned the queue");
 }
 

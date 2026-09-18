@@ -1,5 +1,5 @@
-/* qwen36_tier.c -- CUDA VRAM expert tier for the qwen36 engine. See header. */
-#ifdef COLI_CUDA
+/* qwen36_tier.c -- VRAM expert tier for the qwen36 engine (CUDA or Vulkan). See header. */
+#if defined(COLI_CUDA) || defined(COLI_VULKAN)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,7 +9,83 @@
 #include <sys/syscall.h>
 #endif
 #include "qwen36_tier.h"
+/* ---- backend shim ------------------------------------------------------------
+ * Everything below the shim is backend-agnostic placement logic; only these
+ * operations differ. CUDA wins when both are compiled in (docs/qwen36-tier.md). */
+#if defined(COLI_CUDA)
 #include "backend_cuda.h"
+#define QT_BACKEND    "CUDA"
+#define QT_SWAPS      1            /* runtime LFRU swaps (backend frees and reuses VRAM) */
+#define QT_SINGLE_DEV 0
+#define QT_BUDGET_ENV "CUDA_EXPERT_GB"
+typedef ColiCudaTensor QtTensor;
+static int  be_enabled(void){ const char *e=getenv("COLI_CUDA"); return e && *e=='1'; }
+static int  be_init(const int *dev,int n){ return coli_cuda_init(dev,n); }
+static int  be_available_device_count(void){ return coli_cuda_available_device_count(); }
+static int  be_device_count(void){ return coli_cuda_device_count(); }
+static void be_mem_info(int dev,size_t *freeb,size_t *totb){ coli_cuda_mem_info(dev,freeb,totb); }
+/* fmt: 1 = per-row int8 (bytes as they are), 2 = per-row int4, 4 = grouped int4
+ * (gs scales per row); int4 nibbles are offset-binary, as stage() leaves them.
+ * Only fmt 4 honours gs -- backend_cuda ignores it elsewhere. */
+static int  be_upload(QtTensor **t,const uint8_t *w,const float *sc,int fmt,int I,int O,int dev,int gs){
+    return fmt==4 ? coli_cuda_tensor_upload_g(t,w,sc,4,I,O,dev,gs)
+                  : coli_cuda_tensor_upload(t,w,sc,fmt,I,O,dev); }
+static void be_free(QtTensor *t){ coli_cuda_tensor_free(t); }
+static int  be_issue(QtTensor *const *g,QtTensor *const *u,QtTensor *const *d,const int *rows,int c,const float *x){
+    return coli_cuda_expert_group_issue(g,u,d,rows,c,x); }
+static const float *be_take(int dev,float *ybuf){ (void)ybuf; return coli_cuda_expert_group_take(dev); }
+static void be_stats(int dev,size_t *tc,size_t *tb){ coli_cuda_stats(dev,tc,tb); }
+static void be_shutdown(void){ coli_cuda_shutdown(); }
+static int  be_fp8_set_lut(const float *lut){ return coli_cuda_fp8_set_lut(lut); }
+/* resident trunk pieces (lm_head, DeltaNet projections): one int8 per-row tensor each */
+static int  be_trunk_upload(QtTensor **t,const int8_t *q,const float *sc,int I,int O,int dev){
+    return coli_cuda_tensor_upload(t,q,sc,1,I,O,dev); }
+static int  be_trunk_matmul(QtTensor **t,float *y,const float *x,int I,int O,int dev){
+    return coli_cuda_matmul(t,y,x,NULL,NULL,1,1,I,O,dev,0); }
+#elif defined(COLI_VULKAN)
+#include "backend_vulkan.h"
+#define QT_BACKEND    "Vulkan"
+#define QT_SWAPS      0            /* fill once: the VK arena never reclaims freed slices */
+#define QT_SINGLE_DEV 1
+#define QT_BUDGET_ENV "VK_EXPERT_GB"
+typedef ColiVkTensor QtTensor;
+static int  be_enabled(void){ const char *e=getenv("COLI_VULKAN"); return e && *e=='1'; }
+static int  be_init(const int *dev,int n){ (void)dev; (void)n;
+    char buf[1024]; return coli_vk_init(coli_vk_default_spv(buf,sizeof buf)); }
+static int  be_available_device_count(void){ return 1; }   /* enumeration happens in coli_vk_init */
+static int  be_device_count(void){ return coli_vk_available() ? 1 : 0; }
+static void be_mem_info(int dev,size_t *freeb,size_t *totb){ (void)dev;
+    double used=0,budget=0;
+    if(coli_vk_mem_budget(&used,&budget)){
+        *totb=(size_t)(budget*1e9); *freeb=budget>used?(size_t)((budget-used)*1e9):0;
+    } else {
+        *totb=*freeb=(size_t)4<<30;
+        fprintf(stderr,"[qtier] VK_EXT_memory_budget absent: assuming 4 GB free (set VK_EXPERT_GB to override)\n");
+    }
+}
+/* fmt: 1 = per-row int8, 2 = per-row int4, 4 = grouped int4 ([O,ceil(I/gs)] scales).
+ * The VK i4() decoder is nibble-8, the same offset-binary layout stage() produces;
+ * i8() reads signed bytes, the layout CUDA fmt 1 takes, so int8 needs no repacking. */
+static int  be_upload(QtTensor **t,const uint8_t *w,const float *sc,int fmt,int I,int O,int dev,int gs){
+    (void)dev; return coli_vk_tensor_ensure(t,w,sc,fmt,I,O,gs); }
+static void be_free(QtTensor *t){ coli_vk_tensor_free(t); }
+static int  be_issue(QtTensor *const *g,QtTensor *const *u,QtTensor *const *d,const int *rows,int c,const float *x){
+    return coli_vk_expert_group_issue(g,u,d,rows,c,x); }
+static const float *be_take(int dev,float *ybuf){ (void)dev; return coli_vk_expert_group_take(ybuf) ? ybuf : NULL; }
+static void be_stats(int dev,size_t *tc,size_t *tb){ (void)dev; coli_vk_mem_info(tb,tc); }
+static void be_shutdown(void){ coli_vk_shutdown(); }
+/* Not on Vulkan yet -- each refusal lands on the existing CPU path:
+ *  - fmt 8 (fp8 streaming, Qwen3.8) needs the e4m3 decode table in the kernels;
+ *  - the resident trunk (COLI_PLACE / COLI_LMHEAD_GPU) needs a matmul on an
+ *    already-uploaded tensor. Both exist in backend_cuda only. */
+static int  be_fp8_set_lut(const float *lut){ (void)lut; return 0; }
+static int  be_trunk_upload(QtTensor **t,const int8_t *q,const float *sc,int I,int O,int dev){
+    (void)t;(void)q;(void)sc;(void)I;(void)O;(void)dev;
+    static int said=0; if(!said){ said=1; fprintf(stderr,"[qtier] trunk placement is CUDA-only; lm_head/projections stay on CPU\n"); }
+    return 0; }
+static int  be_trunk_matmul(QtTensor **t,float *y,const float *x,int I,int O,int dev){
+    (void)t;(void)y;(void)x;(void)I;(void)O;(void)dev; return 0; }
+#endif
 #include "tier.h"
 
 #define QT_MAX_DEV 8
@@ -21,7 +97,7 @@
 #define QT_QCAP 48            /* upload queue depth (staging ~1.6 MB/entry) */
 
 typedef struct {
-    ColiCudaTensor *tg, *tu, *td;
+    QtTensor *tg, *tu, *td;
     uint32_t heat;
     uint8_t resident, queued, planned;
     /* raw RAM pointers (slots are never evicted when cap==n_experts) -- lets
@@ -60,6 +136,7 @@ static struct {
     int is_cnt[QT_MAX_DEV];
     int is_k[QT_MAX_DEV][QT_MAX_ROWS];
     float *is_x; size_t is_x_floats;      /* QT_MAX_ROWS*D input replicas per device */
+    float *ybuf;  /* Vulkan take() target [QT_MAX_ROWS*D]; unused on CUDA */
     /* M3 */
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
     int issue_open;                       /* guard: no tensor_free while a group is in flight */
@@ -170,39 +247,37 @@ static void *uploader(void *arg){
                 pthread_cond_broadcast(&G.cv_take);
                 pthread_mutex_unlock(&G.mx); free(w); free(sc); continue;
             }
-            ColiCudaTensor *a=v->tg,*b=v->tu,*ct=v->td;
+            QtTensor *a=v->tg,*b=v->tu,*ct=v->td;
             v->tg=v->tu=v->td=NULL;
             pthread_mutex_unlock(&G.mx);
-            if(a)coli_cuda_tensor_free(a); if(b)coli_cuda_tensor_free(b); if(ct)coli_cuda_tensor_free(ct);
+            if(a)be_free(a); if(b)be_free(b); if(ct)be_free(ct);
         } else pthread_mutex_unlock(&G.mx);
 
         int dv = G.dev[home(eid)];
         /* passo fra le tre matrici nello staging: int4 impacchettato = mezzo
          * byte per elemento, int8 = uno. */
         size_t mb=(size_t)G.D*G.Ih/(G.wfmt==4?2:1);
-        ColiCudaTensor *tg=NULL,*tu=NULL,*td=NULL;
+        QtTensor *tg=NULL,*tu=NULL,*td=NULL;
         int ok;
         if(G.wfmt==8){
             /* e4m3 bytes as they came from the checkpoint, block scales
              * [ceil(O/128), ceil(I/128)] per matrix -- the layout #817's
              * kernels and tensor_upload(fmt=8) already agree on */
-            ok = coli_cuda_tensor_upload(&tg, w,      sc,            8, G.D,  G.Ih, dv)
-              && coli_cuda_tensor_upload(&tu, w+mb,   sc+G.sc_gu,    8, G.D,  G.Ih, dv)
-              && coli_cuda_tensor_upload(&td, w+2*mb, sc+2*G.sc_gu,  8, G.Ih, G.D,  dv);
+            ok = be_upload(&tg, w,      sc, 8, G.D,  G.Ih, dv, 0)
+              && be_upload(&tu, w+mb,   sc+G.sc_gu, 8, G.D,  G.Ih, dv, 0)
+              && be_upload(&td, w+2*mb, sc+2*G.sc_gu, 8, G.Ih, G.D,  dv, 0);
         } else if(G.wfmt==1){
             /* int8, scale per riga: qt_init ha gia' rifiutato il caso raggruppato,
              * che questo formato non sa esprimere. */
-            ok = coli_cuda_tensor_upload(&tg, w,      sc,          1, G.D,  G.Ih, dv)
-              && coli_cuda_tensor_upload(&tu, w+mb,   sc+G.Ih,     1, G.D,  G.Ih, dv)
-              && coli_cuda_tensor_upload(&td, w+2*mb, sc+2*G.Ih,   1, G.Ih, G.D,  dv);
-        } else if(G.egs){
-            ok = coli_cuda_tensor_upload_g(&tg, w,      sc,             4, G.D,  G.Ih, dv, G.egs)
-              && coli_cuda_tensor_upload_g(&tu, w+mb,   sc+G.sc_gu,     4, G.D,  G.Ih, dv, G.egs)
-              && coli_cuda_tensor_upload_g(&td, w+2*mb, sc+2*G.sc_gu,   4, G.Ih, G.D,  dv, G.egs);
+            ok = be_upload(&tg, w,      sc,          1, G.D,  G.Ih, dv, 0)
+              && be_upload(&tu, w+mb,   sc+G.Ih,     1, G.D,  G.Ih, dv, 0)
+              && be_upload(&td, w+2*mb, sc+2*G.Ih,   1, G.Ih, G.D,  dv, 0);
         } else {
-            ok = coli_cuda_tensor_upload(&tg, w,      sc,          2, G.D,  G.Ih, dv)
-              && coli_cuda_tensor_upload(&tu, w+mb,   sc+G.Ih,     2, G.D,  G.Ih, dv)
-              && coli_cuda_tensor_upload(&td, w+2*mb, sc+2*G.Ih,   2, G.Ih, G.D,  dv);
+            /* grouped (gs64) containers carry [O,ceil(I/gs)] scales, per-row ones [O] */
+            int fmt = G.egs ? 4 : 2;
+            ok = be_upload(&tg, w,      sc,          fmt, G.D,  G.Ih, dv, G.egs)
+              && be_upload(&tu, w+mb,   sc+G.sc_gu,  fmt, G.D,  G.Ih, dv, G.egs)
+              && be_upload(&td, w+2*mb, sc+2*G.sc_gu,fmt, G.Ih, G.D,  dv, G.egs);
         }
         free(w); free(sc);
         pthread_mutex_lock(&G.mx);
@@ -221,7 +296,7 @@ static void *uploader(void *arg){
  * The dense-i8 quantization (engine-side) provides q/sc with the same
  * per-row semantics quant_matmul's fmt=1 applies (y[o] = acc * sc[o]),
  * so CPU and GPU compute the same numbers up to accumulation order. */
-static struct { ColiCudaTensor *t; int dev, dev_ok, on; } G_lmh;
+static struct { QtTensor *t; int dev, dev_ok, on; } G_lmh;
 
 /* ---- placement table (COLI_PLACE) --------------------------------------- */
 /* Parsed lazily on first query and cached: qt_place_of runs per layer during
@@ -289,7 +364,7 @@ static int qt_place_named(const char *component){
 /* One fused qkv++z tensor per DeltaNet layer. Indexed by model layer index,
  * so the array is n_layers wide and the attention slots stay empty. */
 #define QT_DN_MAX_LAYERS 128
-static struct { ColiCudaTensor *t; int dev, on; } G_dnp[QT_DN_MAX_LAYERS];
+static struct { QtTensor *t; int dev, on; } G_dnp[QT_DN_MAX_LAYERS];
 
 /* ---- automatic placement (COLI_PLACE unset or "auto") ------------------ */
 /* The hand-written list above is a measurement tool. Nobody running a 6 GB
@@ -494,8 +569,7 @@ static size_t dev_alloc_footprint(size_t bytes){
 
 int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             int expert_is_int4){
-    const char *e=getenv("COLI_CUDA");
-    if(!(e && *e=='1')) return 0;
+    if(!be_enabled()) return 0;
     if(cap != ne && !G_fp8_stream){
         fprintf(stderr,"[qtier] cap=%d != n_experts=%d -> tier disabled (needs full RAM residency)\n",cap,ne);
         return 0;
@@ -510,6 +584,9 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
      * would otherwise stand in for the current environment. */
     G_place_done = 0; G_place_n = 0; G_auto_on = 0;
 
+#if QT_SINGLE_DEV
+    G.ndev=1; G.dev[0]=0;
+#else
     /* devices: COLI_GPUS="0,1" (default: first two visible devices).
      * COLI_GPU is the singular the planner writes for a one-device plan
      * (resource_plan.py) and colibri.c reads; accept it here as well, or a
@@ -521,7 +598,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         for(char *t=strtok(buf,","); t && G.ndev<QT_MAX_DEV; t=strtok(NULL,","))
             G.dev[G.ndev++]=atoi(t);
     } else {
-        int available=coli_cuda_available_device_count();
+        int available=be_available_device_count();
         int want=available<2?available:2;
         for(int i=0;i<want && i<QT_MAX_DEV;i++) G.dev[G.ndev++]=i;
         fprintf(stderr,"[qtier] COLI_GPUS unset: selecting %d visible device(s)\n",G.ndev);
@@ -542,15 +619,16 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             }
     }
     if(G.ndev<1){ fprintf(stderr,"[qtier] no visible CUDA devices -> CPU path\n"); return 0; }
-    qt_affmask aff; qt_aff_get(&aff); qt_aff_widen(&aff);   /* CUDA's threads are born here */
-    int cuda_ok_=coli_cuda_init(G.dev,G.ndev);
+#endif
+    qt_affmask aff; qt_aff_get(&aff); qt_aff_widen(&aff);   /* the backend's threads are born here */
+    int be_ok_=be_init(G.dev,G.ndev);
     qt_aff_restore(&aff);
-    if(!cuda_ok_){ fprintf(stderr,"[qtier] coli_cuda_init failed -> CPU path\n"); return 0; }
-    int have=coli_cuda_device_count();
+    if(!be_ok_){ fprintf(stderr,"[qtier] %s backend init failed -> CPU path\n",QT_BACKEND); return 0; }
+    int have=be_device_count();
     if(have<G.ndev){ G.ndev=have; }
-    if(G.ndev<1){ fprintf(stderr,"[qtier] no CUDA devices -> CPU path\n"); return 0; }
+    if(G.ndev<1){ fprintf(stderr,"[qtier] no %s devices -> CPU path\n", QT_BACKEND); return 0; }
     if(G_fp8_stream){
-        if(!G_fp8_lut || !coli_cuda_fp8_set_lut(G_fp8_lut)){
+        if(!G_fp8_lut || !be_fp8_set_lut(G_fp8_lut)){
             fprintf(stderr,"[qtier] fmt=8 decode table not published -> CPU path\n");
             return 0;
         }
@@ -590,13 +668,13 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     G.exp_bytes = 3*dev_alloc_footprint(mat_bytes) + 3*dev_alloc_footprint(scl_bytes); /* + allocation slack */
 
     /* Per-device allowance for tier + trunk: CUDA_EXPERT_GB when numeric,
-     * else free minus 1 GB headroom. The heat table is loaded here too (it
+     * (VK_EXPERT_GB on Vulkan), else free minus 1 GB headroom. The heat table is loaded here too (it
      * used to be loaded after the budgets) because the placer prices
      * experts by heat. */
     size_t capacity[QT_MAX_DEV]; int capdev[QT_MAX_DEV]; int ncap = G.ndev;
-    const char *bg=getenv("CUDA_EXPERT_GB");
+    const char *bg=getenv(QT_BUDGET_ENV);
     for(int i=0;i<G.ndev;i++){
-        size_t freeb=0,totb=0; coli_cuda_mem_info(G.dev[i],&freeb,&totb);
+        size_t freeb=0,totb=0; be_mem_info(G.dev[i],&freeb,&totb);
         capdev[i] = G.dev[i];
         capacity[i] = (bg && strcmp(bg,"auto") && atof(bg)>0)
                    ? (size_t)(atof(bg)*1024.0*1024.0*1024.0)
@@ -711,6 +789,10 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
      * (#1339). The stride and G.is_k's row capacity are the same constant. */
     G.is_x_floats=(size_t)G.ndev*QT_MAX_ROWS*D;
     G.is_x=malloc(G.is_x_floats*sizeof(float));
+#if QT_SINGLE_DEV
+    G.ybuf=malloc((size_t)QT_MAX_ROWS*D*sizeof(float));
+    if(!G.ybuf) return 0;
+#endif
     if(!G.is_x) return 0;
     pthread_mutex_init(&G.mx,NULL); pthread_cond_init(&G.cv,NULL); pthread_cond_init(&G.cv_take,NULL);
     qt_aff_get(&aff); qt_aff_widen(&aff);                  /* the uploader inherits this mask */
@@ -718,7 +800,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     qt_aff_restore(&aff);
     if(!th_ok) return 0;
     G.on=1;
-    fprintf(stderr,"[qtier] CUDA VRAM expert tier active: %d device(s), %.2f MB/expert\n",
+    fprintf(stderr,"[qtier] %s VRAM expert tier active: %d device(s), %.2f MB/expert\n", QT_BACKEND,
             G.ndev, G.exp_bytes/1048576.0);
     /* The launcher and coli doctor recognise a Windows CUDA_DLL build by this
      * literal in the binary (they cannot read an import table for a DLL
@@ -729,11 +811,12 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
 }
 
 int qt_ready(void){ return G.on; }
+const char *qt_backend_name(void){ return QT_BACKEND; }
 
 int qt_lmhead_init(const int8_t *q, const float *sc, int I, int O){
     if(!G_lmh.dev_ok||!G.on||!q||!sc) return 0;
     int dev=G_lmh.dev;
-    if(!coli_cuda_tensor_upload(&G_lmh.t,q,sc,1,I,O,dev)){
+    if(!be_trunk_upload(&G_lmh.t,q,sc,I,O,dev)){
         fprintf(stderr,"[lmh] lm_head upload failed -> stays on CPU\n");
         return 0;
     }
@@ -749,7 +832,7 @@ int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
     if(device == QT_PLACE_CPU || !q || !sc) return 0;
     /* No G.on requirement: the projections are independent of the expert tier,
      * so they can be measured on a card that holds no experts at all. */
-    if(!coli_cuda_tensor_upload(&G_dnp[layer].t, q, sc, 1, I, O, device)){
+    if(!be_trunk_upload(&G_dnp[layer].t, q, sc, I, O, device)){
         fprintf(stderr,"[dnp] layer %d upload failed -> stays on CPU\n", layer);
         return 0;
     }
@@ -764,13 +847,13 @@ int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
  * tier learning its name. The engine offers sizes through qt_trunk_offer(),
  * asks qt_place_of() where each went, and hands the quantized bytes here. */
 #define QT_DENSE_MAX 1024
-static struct { ColiCudaTensor *t; int dev, on; size_t bytes; } G_dense[QT_DENSE_MAX];
+static struct { QtTensor *t; int dev, on; size_t bytes; } G_dense[QT_DENSE_MAX];
 static int G_dense_n;
 int qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device){
     if(device == QT_PLACE_CPU || !q || !sc || I <= 0 || O <= 0) return -1;
     if(G_dense_n >= QT_DENSE_MAX) return -1;
     int h = G_dense_n;
-    if(!coli_cuda_tensor_upload(&G_dense[h].t, q, sc, 1, I, O, device)){
+    if(!be_trunk_upload(&G_dense[h].t, q, sc, I, O, device)){
         fprintf(stderr,"[dense] upload [%d x %d] to dev %d failed -> stays on CPU\n", O, I, device);
         return -1;
     }
@@ -780,7 +863,7 @@ int qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device){
 }
 int qt_dense_matmul(int h, float *y, const float *x, int I, int O){
     if(h < 0 || h >= G_dense_n || !G_dense[h].on) return 0;
-    if(coli_cuda_matmul(&G_dense[h].t, y, x, NULL, NULL, 1, 1, I, O, G_dense[h].dev, 0)) return 1;
+    if(be_trunk_matmul(&G_dense[h].t, y, x, I, O, G_dense[h].dev)) return 1;
     fprintf(stderr,"[dense] handle %d GPU matmul failed; CPU from here on\n", h);
     G_dense[h].on = 0;
     return 0;
@@ -789,7 +872,7 @@ int qt_dense_count(void){ return G_dense_n; }
 
 int qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
     if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on) return 0;
-    if(coli_cuda_matmul(&G_dnp[layer].t,y,x,NULL,NULL,1,1,I,O,G_dnp[layer].dev,0))
+    if(be_trunk_matmul(&G_dnp[layer].t,y,x,I,O,G_dnp[layer].dev))
         return 1;
     fprintf(stderr,"[dnp] layer %d GPU matmul failed; CPU from here on\n", layer);
     G_dnp[layer].on = 0;
@@ -799,7 +882,7 @@ int qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
 int qt_lmhead_matmul(float *y, const float *x, int I, int O){
     if(!G_lmh.on) return 0;
     /* cached-tensor path: upload params are ignored once *t exists */
-    if(coli_cuda_matmul(&G_lmh.t,y,x,NULL,NULL,1,1,I,O,G_lmh.dev,0)) return 1;
+    if(be_trunk_matmul(&G_lmh.t,y,x,I,O,G_lmh.dev)) return 1;
     fprintf(stderr,"[lmh] GPU matmul failed; falling back to CPU from here on\n");
     G_lmh.on=0;
     return 0;
@@ -1023,6 +1106,7 @@ static void qt_lfru_tick_locked(void){
     G.tick++;
     if(!(G.tick%1024))
         for(size_t i=0;i<n;i++) G.slot[i].heat=tier_decay_value(G.slot[i].heat);
+#if QT_SWAPS
     if(G.tick%16) return;
     for(int di=0;di<G.ndev;di++){
         int cold=-1, hot=-1; uint32_t ch=0, hh=0;
@@ -1040,12 +1124,13 @@ static void qt_lfru_tick_locked(void){
         if(enqueue_locked(hot/G.ne,hot%G.ne,cold/G.ne,cold%G.ne,0)) G.swaps++;
         else v->resident=1;                               /* queue full: revert */
     }
+#endif
 }
 
 uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     if(!G.on||K>QT_MAX_ROWS) return 0;
     uint32_t mask=0;
-    ColiCudaTensor *tg[QT_MAX_DEV][QT_MAX_ROWS],*tu[QT_MAX_DEV][QT_MAX_ROWS],*td[QT_MAX_DEV][QT_MAX_ROWS];
+    QtTensor *tg[QT_MAX_DEV][QT_MAX_ROWS],*tu[QT_MAX_DEV][QT_MAX_ROWS],*td[QT_MAX_DEV][QT_MAX_ROWS];
     static int rows[QT_MAX_ROWS]={0};
     if(!rows[0]) for(int i=0;i<QT_MAX_ROWS;i++) rows[i]=1;
     for(int i=0;i<G.ndev;i++) G.is_cnt[i]=0;
@@ -1077,7 +1162,7 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
         if(!c) continue;
         float *xr=G.is_x + (size_t)di*QT_MAX_ROWS*G.D;     /* per-device input block */
         for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x, (size_t)G.D*sizeof(float));
-        if(!coli_cuda_expert_group_issue(tg[di],tu[di],td[di],rows,c,xr)){
+        if(!be_issue(tg[di],tu[di],td[di],rows,c,xr)){
             /* issue failed -> hand these k back to the CPU */
             for(int j=0;j<c;j++) mask &= ~(1u<<G.is_k[di][j]);
             G.is_cnt[di]=0;
@@ -1092,8 +1177,16 @@ void qt_take(uint32_t mask,const float *val,int K,float *out){
     if(mask) for(int di=0;di<G.ndev;di++){
         int c=G.is_cnt[di];
         if(!c) continue;
-        const float *y=coli_cuda_expert_group_take(G.dev[di]);
-        if(!y) continue;
+        const float *y=be_take(G.dev[di],G.ybuf);
+        if(!y){
+            static int warned=0;
+            if(!warned){
+                warned=1;
+                fprintf(stderr,"[qtier] %s take failed: those experts were skipped; backend may have disabled itself\n",QT_BACKEND);
+            }
+            G.is_cnt[di]=0;
+            continue;
+        }
         for(int j=0;j<c;j++){
             float w=val[G.is_k[di][j]];
             const float *row=y+(size_t)j*G.D;
@@ -1115,7 +1208,7 @@ void qt_stats(void){
             res, G.nl*G.ne, (unsigned long long)G.uploads,
             (unsigned long long)G.miss, (unsigned long long)G.q_full_skips);
     for(int i=0;i<G.ndev;i++){
-        size_t tc=0,tb=0; coli_cuda_stats(G.dev[i],&tc,&tb);
+        size_t tc=0,tb=0; be_stats(G.dev[i],&tc,&tb);
         hits+=G.hits[i];
         /* tb counts every tensor on the device, trunk included; say how much of
          * it is trunk so "used > budget" does not read like an overrun. */
@@ -1126,14 +1219,16 @@ void qt_stats(void){
     double tot=(double)(hits+G.miss);
     fprintf(stderr,"[qtier] VRAM hit rate: %.1f %% | LFRU swaps %llu\n",
             tot>0? 100.0*hits/tot : 0.0, (unsigned long long)G.swaps);
+#ifdef COLI_CUDA
     { uint64_t calls=0,ex=0,rows=0; double h2d=0,kms=0,d2h=0;
       coli_cuda_group_stats(&calls,&ex,&rows,&h2d,&kms,&d2h);
       if(calls) fprintf(stderr,"[qtier] group_stats: %llu calls, %llu experts | h2d %.0f ms, kernel %.0f ms, d2h %.0f ms\n",
               (unsigned long long)calls,(unsigned long long)ex,h2d,kms,d2h); }
+#endif
 }
 
 static void dense_free_all(void){
-    for(int h = 0; h < G_dense_n; h++){ if(G_dense[h].t) coli_cuda_tensor_free(G_dense[h].t); G_dense[h].t = NULL; G_dense[h].on = 0; }
+    for(int h = 0; h < G_dense_n; h++){ if(G_dense[h].t) be_free(G_dense[h].t); G_dense[h].t = NULL; G_dense[h].on = 0; }
     G_dense_n = 0;
 }
 void qt_shutdown(void){
@@ -1157,7 +1252,16 @@ void qt_shutdown(void){
     pthread_join(G.th,NULL);
     G.on=0;
     G_fp8_stream=0;
-    coli_cuda_shutdown();
+    /* Nothing has freed the resident experts: the Vulkan tier never reclaims a
+     * slice while running, and on CUDA the device reset hid the same omission.
+     * Release them before the backend goes, or vkDestroyDevice reports every
+     * weight buffer as leaked (VUID-vkDestroyDevice-device-05137). */
+    for(size_t i=0;i<(size_t)G.nl*G.ne;i++){
+        QSlot *s=&G.slot[i];
+        if(s->tg)be_free(s->tg); if(s->tu)be_free(s->tu); if(s->td)be_free(s->td);
+        s->tg=s->tu=s->td=NULL; s->resident=0;
+    }
+    be_shutdown();
 }
 
-#endif /* COLI_CUDA */
+#endif /* COLI_CUDA || COLI_VULKAN */
