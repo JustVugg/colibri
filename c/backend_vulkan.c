@@ -132,7 +132,7 @@ static struct {
      * evicts cold tier experts instead of thrashing the per-token attention submits
      * (measured: decode attention 7.8s at 7.6 GB resident -> 17.8s at 15.2 GB).
      * VK_EXT_memory_budget lets the tier fill stop at a reserve instead of guessing. */
-    int has_prio, has_budget;
+    int has_prio, has_budget, has_portability;
     float prio;                  /* priority applied to the NEXT allocations (class knob) */
 } G;
 
@@ -390,7 +390,7 @@ int coli_vk_init(const char *spv_path) {
     /* Pressure-proofing extensions (both optional, detected at runtime):
      * memory_priority ranks allocations for the kernel's eviction order,
      * memory_budget exposes how much VRAM a new allocation can still take. */
-    const char *dext[2]; uint32_t ndext = 0;
+    const char *dext[3]; uint32_t ndext = 0;
     {
         uint32_t ne = 0;
         vkEnumerateDeviceExtensionProperties(G.phys, NULL, &ne, NULL);
@@ -404,6 +404,7 @@ int coli_vk_init(const char *spv_path) {
 #ifdef VK_EXT_memory_budget
                 if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) G.has_budget = 1;
 #endif
+                if (!strcmp(ep[i].extensionName, "VK_KHR_portability_subset")) G.has_portability = 1;
             }
             free(ep);
         }
@@ -419,6 +420,11 @@ int coli_vk_init(const char *spv_path) {
 #ifdef VK_EXT_memory_budget
     if (G.has_budget) dext[ndext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
 #endif
+    /* A portability implementation (MoltenVK) lists VK_KHR_portability_subset,
+     * and the spec then requires it enabled (VUID-VkDeviceCreateInfo-pProperties-
+     * 04451); conformant drivers never list it, so RADV, NVIDIA and Lavapipe are
+     * untouched. Spelled out: the macro sits behind VK_ENABLE_BETA_EXTENSIONS. */
+    if (G.has_portability) dext[ndext++] = "VK_KHR_portability_subset";
     di.enabledExtensionCount = ndext; di.ppEnabledExtensionNames = ndext ? dext : NULL;
     G.prio = 0.75f;                              /* default class: dense/resident weights */
     VKCHECK(vkCreateDevice(G.phys, &di, NULL, &G.dev), "vkCreateDevice");
@@ -1106,7 +1112,7 @@ static struct {
     int inflight; size_t pending_yb;
     VkWArena *arena;
     size_t used_bytes, tensor_count;
-    int has_budget;
+    int has_budget, has_portability;
 } G2;
 
 static int alloc_hostvis_d2(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
@@ -1233,7 +1239,7 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
     float qprio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = G2.qfam, .queueCount = 1, .pQueuePriorities = &qprio};
-    const char *dext[1]; uint32_t ndext = 0;
+    const char *dext[2]; uint32_t ndext = 0;
 #ifdef VK_EXT_memory_budget
     {
         uint32_t ne = 0;
@@ -1241,11 +1247,14 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
         VkExtensionProperties *ep = ne ? malloc(ne * sizeof(*ep)) : NULL;
         if (ep) {
             vkEnumerateDeviceExtensionProperties(G2.phys, NULL, &ne, ep);
-            for (uint32_t i = 0; i < ne; i++)
+            for (uint32_t i = 0; i < ne; i++) {
                 if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) G2.has_budget = 1;
+                if (!strcmp(ep[i].extensionName, "VK_KHR_portability_subset")) G2.has_portability = 1;
+            }
             free(ep);
         }
         if (G2.has_budget) dext[ndext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+        if (G2.has_portability) dext[ndext++] = "VK_KHR_portability_subset";   /* as on the first device */
     }
 #endif
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
