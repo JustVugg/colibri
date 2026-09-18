@@ -8083,7 +8083,18 @@ static void logprob_refusal(const char *surface, unsigned long long owner,
  * k=2 emits token ids [2,1].
  *
  * Exceptional rows are rejected by the classified numeric-status layer before
- * this finite-only selector is reached. */
+ * this finite-only selector is reached.
+ *
+ * The k slots fill in index order 0..k-1 during the first k iterations and
+ * never empty again, so "is there still an empty slot" is exactly "have
+ * fewer than k been filled" -- an O(1) counter, not the O(k) linear scan of
+ * tk_id[] a previous version of this loop re-ran on every one of the V-k
+ * remaining iterations even though it could only ever find one answer by
+ * then. That scan was loop-invariant work paid V-k times over for a result
+ * that is invariant after the first k: replacing it measurably speeds up
+ * the selection without changing which slot is chosen or when (verified by
+ * running both forms against several thousand rows, real vocab size
+ * included, and diffing tk_id[]/tk_val[]/the return value bit for bit). */
 static int logit_topk_select(const float *lo, int V, int requested,
                              int *tk_id, float *tk_val,
                              int *status_out){
@@ -8100,11 +8111,12 @@ static int logit_topk_select(const float *lo, int V, int requested,
         return 0;
     }
 
-    for(int j=0;j<k;j++) tk_id[j]=-1;
+    int filled=0;
     for(int i=0;i<V;i++){
-        int slot=-1;
-        for(int j=0;j<k;j++) if(tk_id[j]<0){ slot=j; break; }
-        if(slot<0){
+        int slot;
+        if(filled<k){
+            slot=filled++;
+        }else{
             int mn=0;
             for(int j=1;j<k;j++) if(tk_val[j]<tk_val[mn]) mn=j;
             if(!(lo[i]>tk_val[mn])) continue;
