@@ -102,8 +102,8 @@ ms in the last windows, peak RSS 29 -> 17 GB. Of the 20 ms, 11 are the kernel
 (the DRAM floor for the int4 bytes is 9) and 6 are the residual misses of a
 97.6% hit rate, fetched one at a time; that fetch is the next thing to
 overlap, not this kernel. `tests/test_expert_ffn` holds the numerics.
-`QWEN_EXPERT_KERNEL=0` restores the int8 path for A/Bs. The CUDA expert tier
-keeps its own path: it uploads the pair-layout int4 and computes misses from
+`QWEN_EXPERT_KERNEL=0` restores the int8 path for A/Bs. The expert tier (CUDA
+or Vulkan) keeps its own path: it uploads the pair-layout int4 and computes misses from
 the int8 copy.
 
 ## Which container?

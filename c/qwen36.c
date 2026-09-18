@@ -985,10 +985,12 @@ static int g_expert_is_int4 = 1;
 
 /* Shared expert kernel (expert_ffn.h): routed experts stay planar int4 in
  * RAM and a layer runs as (expert, row-chunk) items. On by default for an
- * int4 gs=64 container whose widths are multiples of 64, off under the CUDA
- * expert tier (it uploads the pair-layout int4 and computes misses from the
- * int8 copy) and with QWEN_EXPERT_KERNEL=0, which keeps the historical
- * unpack-to-int8 path for A/Bs. Decided once from the container itself. */
+ * int4 gs=64 container whose widths are multiples of 64, off under the
+ * expert tier, CUDA or Vulkan (it uploads the pair-layout int4 and computes
+ * misses from the int8 copy; a pw-only slot gives it nothing to upload and
+ * NULL to fall back on) and with QWEN_EXPERT_KERNEL=0, which keeps the
+ * historical unpack-to-int8 path for A/Bs. Decided once from the container
+ * itself. */
 static int container_layer_is_int4(Model *m, int layer);
 static int xf_mode(Model *m) {
     static int v = -1;
@@ -997,6 +999,12 @@ static int xf_mode(Model *m) {
     int on = !(e && *e == '0');
 #ifdef COLI_CUDA
     { const char *cu = getenv("COLI_CUDA"); if (cu && *cu == '1') on = 0; }
+#endif
+#ifdef COLI_VULKAN
+    /* Same gate as CUDA. Without it every slot was allocated pw-only, the
+     * warmstart offered NULL (0 uploads behind a "N in VRAM" line that counts
+     * the plan) and the first CPU-computed expert dereferenced e->g == NULL. */
+    { const char *vk = getenv("COLI_VULKAN"); if (vk && *vk == '1') on = 0; }
 #endif
     Cfg *c = &m->c;
     if (c->expert_gs != XF_BLOCK || !xf_layout_ok(c->hidden) || !xf_layout_ok(c->inter)) on = 0;
