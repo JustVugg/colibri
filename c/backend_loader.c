@@ -1512,6 +1512,7 @@ void coli_cuda_shutdown(void){
 }
 
 int coli_cuda_device_count(void){
+    if(!g_cuda.available && !coli_cuda_load()) return 0;
     if(!g_cuda.available) return 0;
     return g_cuda.device_count();
 }
@@ -1520,6 +1521,7 @@ int coli_cuda_device_count(void){
  * no wrapper for it, so the first CUDA_DLL build of qwen36 that compiled the
  * tier in failed to link (#1533). */
 int coli_cuda_available_device_count(void){
+    if(!g_cuda.available && !coli_cuda_load()) return 0;
     if(!g_cuda.available) return 0;
     return g_cuda.available_device_count();
 }
