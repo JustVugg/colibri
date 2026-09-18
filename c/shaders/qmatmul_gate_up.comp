@@ -25,6 +25,7 @@ layout(push_constant) uniform P {
     int S, I, O;    // I = input dim (hidden), O = moe_inter
     int rowWords;   // uint32 words per weight row (of the I-dim rows)
     int gs;         // fmt=4 group size (multiple of 8; host gates otherwise)
+    float limit;    // swiglu_limit, 0 = no clamp (#1520: GLM-5.3-Flash has 10.0)
 } p;
 
 shared float xsh[6144];
@@ -99,6 +100,11 @@ void main() {
         }
         float gt = subgroupAdd(g), ut = subgroupAdd(u);
         if (p.fmt != 5 && p.fmt != 4) { gt *= gscale[o]; ut *= uscale[o]; }   // per-row formats only
-        if (lane == 0) hid[s * p.O + o] = (gt / (1.0 + exp(-gt))) * ut;   // silu(gate)*up
+        if (p.limit > 0.0) {
+            if (gt > p.limit) gt = p.limit;
+            if (ut > p.limit) ut = p.limit;
+            if (ut < -p.limit) ut = -p.limit;
+        }
+        if (lane == 0) hid[s * p.O + o] = (gt / (1.0 + exp(-gt))) * ut;   // silu(gate)*up, clamped if limit>0 (#1520)
     }
 }

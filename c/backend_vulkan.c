@@ -104,7 +104,7 @@ static struct {
     float prio;                  /* priority applied to the NEXT allocations (class knob) */
 } G;
 
-struct PC { int fmt, S, I, O, rowWords, gs; };
+struct PC { int fmt, S, I, O, rowWords, gs; float limit; };
 struct PCN { int S, D; float eps; };
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
@@ -600,7 +600,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
             {.buffer = G.x.buf, .range = VK_WHOLE_SIZE},
             {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
             {.buffer = t->sbuf, .range = VK_WHOLE_SIZE},
-            {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
+            {.buffer = G.y.buf, .range = VK_WHOLE_SIZE};
         VkWriteDescriptorSet w[4];
         for (int i = 0; i < 4; i++) w[i] = (VkWriteDescriptorSet){
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset,
@@ -620,7 +620,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
         vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
         vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
-        struct PC pc = {fmt, S, I, O, t->rowWords, t->gs};
+        struct PC pc = {fmt, S, I, O, t->rowWords, t->gs, 0.0f};
         vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         /* Grid-stride shader: one subgroup per output row (~8 rows/workgroup at wave32).
          * Launch ~O/8 workgroups for occupancy; the shader loops to cover any O / wave width. */
@@ -658,9 +658,13 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
 /* Fused first half of the expert MLP: hidden = silu(gate(x)) * up(x), computed in ONE
  * dispatch that reads x once for both projections. gate/up are resident (uploaded on
  * first call). D = input (hidden) dim, I = moe_inter. Returns 0 -> caller falls back. */
-int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const float *x,
+/* Fused first half of the expert MLP: hidden = silu(gate(x)) * up(x), computed in ONE
+ * dispatch that reads x once for both projections. gate/up are resident (uploaded on
+ * first call). D = input (hidden) dim, I = moe_inter. Returns 0 -> caller falls back.
+ * _clamped applies swiglu_limit (#1520). */
+int coli_vk_gate_up_clamped(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const float *x,
                     const void *gw, const float *gs, const void *uw, const float *us,
-                    int fmt, int S, int D, int I, int grp) {
+                    int fmt, int S, int D, int I, int grp, float limit) {
     if (!G.ready || !G.shader_gu || S < 1 || D > 6144) return 0;   /* shader stages x in xsh[6144] */
     if (!upload_tensor(gate, gw, gs, fmt, D, I, grp) || !upload_tensor(up, uw, us, fmt, D, I, grp)) return 0;
     ColiVkTensor *tg = *gate, *tu = *up;
@@ -684,7 +688,7 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.dset_gu, 0, NULL);
-    struct PC pc = {fmt, S, D, I, tg->rowWords, tg->gs};   // PC.I = input D, PC.O = moe_inter I
+    struct PC pc = {fmt, S, D, I, tg->rowWords, tg->gs, limit};   // PC.I = input D, PC.O = moe_inter I
     vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd, (uint32_t)((I + 7) / 8), (uint32_t)S, 1);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
@@ -700,6 +704,12 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
     return 1;
 }
+int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const float *x,
+                    const void *gw, const float *gs, const void *uw, const float *us,
+                    int fmt, int S, int D, int I, int grp) {
+    return coli_vk_gate_up_clamped(gate, up, hidden, x, gw, gs, uw, us, fmt, S, D, I, grp, 0.0f);
+}
+
 
 static void wr_desc_dev(VkDevice dev, VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi) {
     VkWriteDescriptorSet w[6];
@@ -719,9 +729,9 @@ static void wr_desc(VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi
  * overlap the GPU batch with its own CPU share (issue -> CPU rows -> take); the group
  * runs on its OWN command buffer + fence, so in-flight work never collides with the
  * main pipeline (dense matmuls, absorb attention). Returns 0 -> caller falls back. */
-static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+static int eg_prepare_submit_l(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                              ColiVkTensor *const *downs, const int *rows, int count,
-                             const float *x) {
+                             const float *x, float limit) {
     if (!G.ready || !G.shader_gu || count < 1 || count > 64) return 0;
     ColiVkTensor *g0 = gates[0]; if (!g0) return 0;
     int D = g0->I, I = g0->O, fmt = g0->fmt, total = 0, off[64];
@@ -760,11 +770,11 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         VkDescriptorBufferInfo gi[6] = {
             {G.eg_x.buf, xo, (VkDeviceSize)rows[c]*D*4}, {gates[c]->wbuf, 0, VK_WHOLE_SIZE},
             {gates[c]->sbuf, 0, VK_WHOLE_SIZE}, {ups[c]->wbuf, 0, VK_WHOLE_SIZE},
-            {ups[c]->sbuf, 0, VK_WHOLE_SIZE}, {G.eg_h.buf, ho, (VkDeviceSize)rows[c]*I*4}};
+            {ups[c]->sbuf, 0, VK_WHOLE_SIZE}, {G.eg_h.buf, ho, (VkDeviceSize)rows[c]*I*4};
         wr_desc(G.eg_gu[c], 6, gi);
         VkDescriptorBufferInfo di[4] = {
             {G.eg_h.buf, ho, (VkDeviceSize)rows[c]*I*4}, {downs[c]->wbuf, 0, VK_WHOLE_SIZE},
-            {downs[c]->sbuf, 0, VK_WHOLE_SIZE}, {G.eg_y.buf, yo, (VkDeviceSize)rows[c]*D*4}};
+            {downs[c]->sbuf, 0, VK_WHOLE_SIZE}, {G.eg_y.buf, yo, (VkDeviceSize)rows[c]*D*4};
         wr_desc(G.eg_dn[c], 4, di);
     }
     if (G.eg_prof) G.eg_t2 = vk_now();
@@ -776,7 +786,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     /* phase 1: fused gate+up+silu -> hidden (per expert, bound to its x/hidden slices) */
     vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
     for (int c = 0; c < count; c++) {
-        struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
+        struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs, limit};
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), (uint32_t)rows[c], 1);
@@ -785,7 +795,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     /* phase 2: down projection hidden -> y */
     vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
     for (int c = 0; c < count; c++) {
-        struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
+        struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs, 0.0f};
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
@@ -802,6 +812,13 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     return 1;
 }
 
+
+static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                             ColiVkTensor *const *downs, const int *rows, int count,
+                             const float *x) {
+    return eg_prepare_submit_l(gates, ups, downs, rows, count, x, 0.0f);
+}
+
 /* Issue a group asynchronously: submit and return WITHOUT waiting, so the caller
  * computes its CPU share concurrently. Exactly one group may be in flight. */
 int coli_vk_expert_group_issue(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
@@ -810,6 +827,13 @@ int coli_vk_expert_group_issue(ColiVkTensor *const *gates, ColiVkTensor *const *
     if (G.eg_inflight) return 0;
     return eg_prepare_submit(gates, ups, downs, rows, count, x);
 }
+int coli_vk_expert_group_issue_clamped(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                               ColiVkTensor *const *downs, const int *rows, int count,
+                               const float *x, float limit) {
+    if (G.eg_inflight) return 0;
+    return eg_prepare_submit_l(gates, ups, downs, rows, count, x, limit);
+}
+
 
 /* Join the in-flight group and read back the packed outputs. */
 int coli_vk_expert_group_take(float *y) {
@@ -835,6 +859,13 @@ int coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                          float *y, const float *x) {
     if (G.eg_inflight) return 0;
     if (!eg_prepare_submit(gates, ups, downs, rows, count, x)) return 0;
+    return coli_vk_expert_group_take(y);
+}
+int coli_vk_expert_group_clamped(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                         ColiVkTensor *const *downs, const int *rows, int count,
+                         float *y, const float *x, float limit) {
+    if (G.eg_inflight) return 0;
+    if (!eg_prepare_submit_l(gates, ups, downs, rows, count, x, limit)) return 0;
     return coli_vk_expert_group_take(y);
 }
 
@@ -1063,9 +1094,9 @@ int coli_vk_tensor_ensure2(ColiVkTensor **tensor, const void *weights, const flo
 }
 
 /* dev2 mirror of eg_prepare_submit: identical structure on G2's pipelines/scratches. */
-static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+static int eg2_prepare_submit_l(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                               ColiVkTensor *const *downs, const int *rows, int count,
-                              const float *x) {
+                              const float *x, float limit) {
     if (!G2.ready || count < 1 || count > 64) return 0;
     ColiVkTensor *g0 = gates[0]; if (!g0) return 0;
     int D = g0->I, I = g0->O, fmt = g0->fmt, total = 0, off[64];
@@ -1104,11 +1135,11 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
         VkDescriptorBufferInfo gi[6] = {
             {G2.x.buf, xo, (VkDeviceSize)rows[c]*D*4}, {gates[c]->wbuf, 0, VK_WHOLE_SIZE},
             {gates[c]->sbuf, 0, VK_WHOLE_SIZE}, {ups[c]->wbuf, 0, VK_WHOLE_SIZE},
-            {ups[c]->sbuf, 0, VK_WHOLE_SIZE}, {G2.h.buf, ho, (VkDeviceSize)rows[c]*I*4}};
+            {ups[c]->sbuf, 0, VK_WHOLE_SIZE}, {G2.h.buf, ho, (VkDeviceSize)rows[c]*I*4};
         wr_desc_dev(G2.dev, G2.gu[c], 6, gi);
         VkDescriptorBufferInfo di[4] = {
             {G2.h.buf, ho, (VkDeviceSize)rows[c]*I*4}, {downs[c]->wbuf, 0, VK_WHOLE_SIZE},
-            {downs[c]->sbuf, 0, VK_WHOLE_SIZE}, {G2.y.buf, yo, (VkDeviceSize)rows[c]*D*4}};
+            {downs[c]->sbuf, 0, VK_WHOLE_SIZE}, {G2.y.buf, yo, (VkDeviceSize)rows[c]*D*4};
         wr_desc_dev(G2.dev, G2.dn[c], 4, di);
     }
     if (G.eg_prof) { tA = vk_now(); q_desc += tA - t0; t0 = tA; }
@@ -1118,7 +1149,7 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
     vkCmdBindPipeline(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.pipe_gu);
     for (int c = 0; c < count; c++) {
-        struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
+        struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs, limit};
         vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.plyt_gu, 0, 1, &G2.gu[c], 0, NULL);
         vkCmdPushConstants(G2.cmd, G2.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(G2.cmd, (uint32_t)((I + 7) / 8), (uint32_t)rows[c], 1);
@@ -1126,7 +1157,7 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
     vkCmdPipelineBarrier(G2.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     vkCmdBindPipeline(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.pipe);
     for (int c = 0; c < count; c++) {
-        struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
+        struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs, 0.0f};
         vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.plyt, 0, 1, &G2.dn[c], 0, NULL);
         vkCmdPushConstants(G2.cmd, G2.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(G2.cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
@@ -1145,11 +1176,22 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
     return 1;
 }
 
+static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                              ColiVkTensor *const *downs, const int *rows, int count,
+                              const float *x) {
+    return eg2_prepare_submit_l(gates, ups, downs, rows, count, x, 0.0f);
+}
 int coli_vk_expert_group_issue2(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                                 ColiVkTensor *const *downs, const int *rows, int count,
                                 const float *x) {
     if (G2.inflight) return 0;
     return eg2_prepare_submit(gates, ups, downs, rows, count, x);
+}
+int coli_vk_expert_group_issue2_clamped(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                                ColiVkTensor *const *downs, const int *rows, int count,
+                                const float *x, float limit) {
+    if (G2.inflight) return 0;
+    return eg2_prepare_submit_l(gates, ups, downs, rows, count, x, limit);
 }
 int coli_vk_expert_group_take2(float *y) {
     if (!G2.inflight) return 0;
@@ -1166,6 +1208,13 @@ int coli_vk_expert_group2(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                           float *y, const float *x) {
     if (G2.inflight) return 0;
     if (!eg2_prepare_submit(gates, ups, downs, rows, count, x)) return 0;
+    return coli_vk_expert_group_take2(y);
+}
+int coli_vk_expert_group2_clamped(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                          ColiVkTensor *const *downs, const int *rows, int count,
+                          float *y, const float *x, float limit) {
+    if (G2.inflight) return 0;
+    if (!eg2_prepare_submit_l(gates, ups, downs, rows, count, x, limit)) return 0;
     return coli_vk_expert_group_take2(y);
 }
 
@@ -1240,7 +1289,7 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
         {.buffer = t->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = kv->bl, .range = VK_WHOLE_SIZE},
         {.buffer = kv->br, .range = VK_WHOLE_SIZE}, {.buffer = G.att_sc.buf, .range = VK_WHOLE_SIZE},
-        {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = G.y.buf, .range = VK_WHOLE_SIZE};
     VkWriteDescriptorSet wd[7];
     for (int i = 0; i < 7; i++) wd[i] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset_att,
@@ -1296,10 +1345,10 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     }
     VkDescriptorBufferInfo b1[4] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = t1->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = t1->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = t1->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE};
     VkDescriptorBufferInfo b2[4] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = t2->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = t2->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y2.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = t2->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y2.buf, .range = VK_WHOLE_SIZE};
     wr_desc(G.dset, 4, b1);
     wr_desc(G.dset_pair, 4, b2);
 
@@ -1366,16 +1415,16 @@ int coli_vk_attn_qprep(int layer,
 
     VkDescriptorBufferInfo b1[4] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = tqa->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = tqa->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.qp1.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = tqa->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.qp1.buf, .range = VK_WHOLE_SIZE};
     VkDescriptorBufferInfo b2[4] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = tkv->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = tkv->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y2.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = tkv->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y2.buf, .range = VK_WHOLE_SIZE};
     VkDescriptorBufferInfo bn[3] = {
         {.buffer = G.qp1.buf, .range = VK_WHOLE_SIZE}, {.buffer = G.lnbuf[layer], .range = VK_WHOLE_SIZE},
-        {.buffer = G.qp2.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = G.qp2.buf, .range = VK_WHOLE_SIZE};
     VkDescriptorBufferInfo b3[4] = {
         {.buffer = G.qp2.buf, .range = VK_WHOLE_SIZE}, {.buffer = tqb->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = tqb->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = tqb->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE};
     if (!G.pair_pool) {   /* the chain reuses the pair's 2nd matmul set */
         VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4};
         VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1460,7 +1509,7 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
         {.buffer = t->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = kv->bl, .range = VK_WHOLE_SIZE},
         {.buffer = kv->br, .range = VK_WHOLE_SIZE}, {.buffer = G.att_sc.buf, .range = VK_WHOLE_SIZE},
-        {.buffer = G.att_ctx.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = G.att_ctx.buf, .range = VK_WHOLE_SIZE};
     VkWriteDescriptorSet wd[7];
     for (int i = 0; i < 7; i++) wd[i] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset_att,
@@ -1469,7 +1518,7 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
     vkUpdateDescriptorSets(G.dev, 7, wd, 0, NULL);
     VkDescriptorBufferInfo oi[4] = {
         {.buffer = G.att_ctx.buf, .range = VK_WHOLE_SIZE}, {.buffer = to->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = to->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = to->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE};
     wr_desc(G.dset, 4, oi);
 
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
@@ -1689,7 +1738,7 @@ static double bench_batched(ColiVkTensor *t, const float *x, int fmt, int S, int
     vkBeginCommandBuffer(G.cmd, &begin);
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
-    struct PC pc = {fmt, S, I, O, t->rowWords, t->gs};
+    struct PC pc = {fmt, S, I, O, t->rowWords, t->gs, 0.0f};
     vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
@@ -1745,7 +1794,7 @@ static double bench_gu_batched(ColiVkTensor *tg, const float *x, int fmt, int S,
     vkBeginCommandBuffer(G.cmd, &begin);
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.dset_gu, 0, NULL);
-    struct PC pc = {fmt, S, D, I, tg->rowWords, tg->gs};
+    struct PC pc = {fmt, S, D, I, tg->rowWords, tg->gs, 0.0f};
     vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
@@ -1785,7 +1834,7 @@ static double bench_experts_fair(int fmt, int D, int I, int K, int Npass) {
     vkAllocateDescriptorSets(G.dev, &dsa, sets);
     memcpy(G.x.ptr, x, (size_t)D*4);
     for (int c = 0; c < K; c++) {
-        VkDescriptorBufferInfo bi[6] = {{.buffer=G.x.buf,.range=VK_WHOLE_SIZE},{.buffer=tg[c]->wbuf,.range=VK_WHOLE_SIZE},{.buffer=tg[c]->sbuf,.range=VK_WHOLE_SIZE},{.buffer=tu[c]->wbuf,.range=VK_WHOLE_SIZE},{.buffer=tu[c]->sbuf,.range=VK_WHOLE_SIZE},{.buffer=G.h.buf,.range=VK_WHOLE_SIZE}};
+        VkDescriptorBufferInfo bi[6] = {.buffer=G.x.buf,.range=VK_WHOLE_SIZE},{.buffer=tg[c]->wbuf,.range=VK_WHOLE_SIZE},{.buffer=tg[c]->sbuf,.range=VK_WHOLE_SIZE},{.buffer=tu[c]->wbuf,.range=VK_WHOLE_SIZE},{.buffer=tu[c]->sbuf,.range=VK_WHOLE_SIZE},{.buffer=G.h.buf,.range=VK_WHOLE_SIZE};
         VkWriteDescriptorSet w[6]; for (int i = 0; i < 6; i++) w[i] = (VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=sets[c],.dstBinding=(uint32_t)i,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&bi[i]};
         vkUpdateDescriptorSets(G.dev, 6, w, 0, NULL);
     }
@@ -1793,7 +1842,7 @@ static double bench_experts_fair(int fmt, int D, int I, int K, int Npass) {
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(G.cmd, &begin);
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
-    struct PC pc = {fmt, 1, D, I, tg[0]->rowWords, tg[0]->gs};
+    struct PC pc = {fmt, 1, D, I, tg[0]->rowWords, tg[0]->gs, 0.0f};
     vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
     for (int pass = 0; pass < Npass; pass++) for (int c = 0; c < K; c++) {
