@@ -62,6 +62,7 @@
 typedef int            (*fn_init)(const int *devices, int count);
 typedef void           (*fn_shutdown)(void);
 typedef int            (*fn_device_count)(void);
+typedef int            (*fn_available_device_count)(void);
 typedef int            (*fn_device_at)(int index);
 typedef int            (*fn_mem_info)(int device, size_t *free_bytes, size_t *total_bytes);
 typedef int            (*fn_device_integrated)(int device);
@@ -159,6 +160,7 @@ static struct {
     fn_init            init;
     fn_shutdown        shutdown;
     fn_device_count    device_count;
+    fn_available_device_count available_device_count;
     fn_device_at       device_at;
     fn_mem_info        mem_info;
     fn_device_integrated device_integrated;
@@ -1403,6 +1405,7 @@ static int coli_cuda_load(void){
     RESOLVE(init,           fn_init)
     RESOLVE(shutdown,       fn_shutdown)
     RESOLVE(device_count,   fn_device_count)
+    RESOLVE(available_device_count, fn_available_device_count)
     RESOLVE(device_at,      fn_device_at)
     RESOLVE(mem_info,       fn_mem_info)
     /* Optional: a DLL predating #653 leaves this NULL; the wrapper then reports
@@ -1511,6 +1514,14 @@ void coli_cuda_shutdown(void){
 int coli_cuda_device_count(void){
     if(!g_cuda.available) return 0;
     return g_cuda.device_count();
+}
+
+/* qwen36_tier.c's device selection asks for the usable count; the loader had
+ * no wrapper for it, so the first CUDA_DLL build of qwen36 that compiled the
+ * tier in failed to link (#1533). */
+int coli_cuda_available_device_count(void){
+    if(!g_cuda.available) return 0;
+    return g_cuda.available_device_count();
 }
 
 int coli_cuda_device_at(int index){
