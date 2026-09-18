@@ -1608,8 +1608,17 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
                         args = json.loads(args)
                     except (json.JSONDecodeError, TypeError):
                         args = {}
+                if not isinstance(args, dict):
+                    # `arguments` that is valid JSON but not an object ("[1,2]",
+                    # "5", a bare list) reached .items() and raised
+                    # AttributeError, which do_POST answers with HTTP 500. The
+                    # same field is already tolerated when it does not parse at
+                    # all, and every sibling renderer renders the call without
+                    # arguments instead of failing; this is the one branch that
+                    # was never completed.
+                    args = {}
                 prompt.append(BOX_START + (fn.get("name") or ""))
-                for key, value in (args or {}).items():
+                for key, value in args.items():
                     prompt.append(f"<arg_key>{key}</arg_key><arg_value>"
                                   + (value if isinstance(value, str)
                                      else json.dumps(value, ensure_ascii=False)) + "</arg_value>")
@@ -1905,8 +1914,10 @@ def _glm53_tool_calls(calls):
                 arguments = json.loads(arguments)
             except ValueError:
                 arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}                        # same gap as render_chat above
         pieces = [f"<tool_call>{name}"]
-        for key, value in (arguments or {}).items():
+        for key, value in arguments.items():
             rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
             pieces.append(f"<arg_key>{key}</arg_key><arg_value>{rendered}</arg_value>")
         pieces.append("</tool_call>")

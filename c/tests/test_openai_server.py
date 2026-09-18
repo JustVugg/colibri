@@ -255,6 +255,42 @@ class TemplateTest(unittest.TestCase):
                     "name": "fn", "arguments": "not json"}}]}])
         self.assertIn("J 2 8\nfnnot json", prompt)
 
+    def test_glm_renders_a_tool_call_whose_arguments_are_not_an_object(self):
+        """`arguments` that parses but is not an object must not kill the request.
+
+        Both GLM renderers already tolerate `arguments` that does not parse at
+        all -- the except branch sets {} -- and every sibling renderer (Kimi
+        above, Qwen3.8, DeepSeek V4/V4.1) renders the call without arguments
+        rather than failing. Only the "parsed, but not an object" case reached
+        .items(), raised AttributeError, and came back as HTTP 500 "The colibri
+        engine failed to process the request." on a request the engine never
+        saw.
+        """
+        import openai_server as srv
+        for arguments in ('[1, 2]', '"text"', '5', [1, 2], 7):
+            with self.subTest(arguments=arguments):
+                messages = [
+                    {"role": "user", "content": "run it"},
+                    {"role": "assistant", "content": "", "tool_calls": [
+                        {"id": "x", "type": "function",
+                         "function": {"name": "fn", "arguments": arguments}}]},
+                    {"role": "tool", "content": "done"},
+                ]
+                glm = render_chat(list(messages))
+                self.assertIn("fn", glm)
+                self.assertNotIn("<arg_key>", glm)
+                glm53 = srv.render_chat_glm53(list(messages))
+                self.assertIn("<tool_call>fn", glm53)
+                self.assertNotIn("<arg_key>", glm53)
+        # An object still renders its arguments, on both renderers.
+        renders = [{"role": "assistant", "content": "", "tool_calls": [
+            {"id": "x", "type": "function",
+             "function": {"name": "fn", "arguments": '{"city": "Rome"}'}}]}]
+        self.assertIn("<arg_key>city</arg_key><arg_value>Rome</arg_value>",
+                      render_chat(list(renders)))
+        self.assertIn("<arg_key>city</arg_key><arg_value>Rome</arg_value>",
+                      srv.render_chat_glm53(list(renders)))
+
     def test_kimi_still_rejects_unknown_roles(self):
         with self.assertRaisesRegex(APIError, "Unsupported role"):
             render_chat_kimi([{"role": "critic", "content": "hm"}])
@@ -1538,6 +1574,26 @@ class HTTPTest(unittest.TestCase):
                         self.request(path, dict(body, model="test-model"))
                     self.addCleanup(caught.exception.close)
                     self.assertEqual(caught.exception.code, 400)
+
+    def test_tool_call_arguments_that_are_not_an_object_do_not_fail_the_request(self):
+        """A replayed tool call with `arguments: "[1, 2]"` answered HTTP 500.
+
+        render_chat reached `(args or {}).items()` with a parsed list, and the
+        AttributeError became do_POST's catch-all 500 "The colibri engine failed
+        to process the request." -- which OpenAI SDKs retry, against an engine
+        that was never asked anything.
+        """
+        body = {"model": "test-model", "messages": [
+            {"role": "user", "content": "run it"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "x", "type": "function",
+                 "function": {"name": "fn", "arguments": "[1, 2]"}}]},
+            {"role": "tool", "tool_call_id": "x", "content": "done"},
+            {"role": "user", "content": "and now?"},
+        ]}
+        with self.request("/v1/chat/completions", body) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.load(response)["object"], "chat.completion")
 
 
 class ClientHangupTest(unittest.TestCase):
