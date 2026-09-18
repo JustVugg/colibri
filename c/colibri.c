@@ -8053,11 +8053,62 @@ static void run_score(Model *m, const char *snap, const char *path){
  * never leak into the next). NLL/margin/correctness are exact; top-K is for a
  * paired approximate next-token KL on the host. */
 #define ABL_LOGIT_TOPK 32
-/* Upper bound on one manifest item's declared token count.  A teacher-forced
- * ablation item is a prompt plus a short continuation; a million tokens is
- * orders of magnitude above anything a study uses, and it keeps a hostile or
- * corrupt manifest from asking the loader for an arbitrary allocation. */
+/* Backstop ceiling on one manifest item's declared token count T. The
+ * operative bound applied in ablate_manifest_load (below) is
+ * ablate_item_token_limit() = min(CTX, ABLATE_MAX_ITEM_TOKENS): CTX
+ * ("Maximum context length (tokens) the KV cache is sized for",
+ * docs/ENVIRONMENT.md -- the same max_ctx parameter kv_pool_bytes and
+ * expert_avail already take) is an existing engine limit, not an
+ * invented one, and an item longer than the context this engine is
+ * configured to hold cannot be processed regardless of what the
+ * manifest asks for. This constant only bounds CTX itself, in case an
+ * operator sets it to something absurd.
+ *
+ * That check runs before this item is allowed to contribute to any of
+ * THREE allocations, largest first -- naming only the one the maintainer
+ * raised, or getting the ranking backwards, is how an earlier draft of
+ * this comment was wrong twice over:
+ *
+ *   1. kv_alloc's per-layer KV buffers, sized from the manifest-wide
+ *      maxT once parsing finishes (`(n_layers+1)*max_t*(kv_lora+qk_rope)`,
+ *      below; maxT can equal this item's own T).
+ *   2. ablate_model_output_body's prefill buffer `x`, also sized from
+ *      maxT (`falloc((int64_t)maxT*D)`, D = c->hidden, further below).
+ *   3. This loop's own resident bookkeeping: one AblateManifestItem plus
+ *      one AblateItemRef appended per accepted item (both defined
+ *      above) -- bounded per item by this same check, but unbounded in
+ *      ITEM COUNT across a whole manifest, a separate axis this cap
+ *      does not close.
+ *
+ * Worked at the backstop ceiling ABLATE_MAX_ITEM_TOKENS = 2^20 (reachable
+ * only if CTX is itself set that high), with GLM-5.2's real config
+ * (Cfg.hidden=6144, n_layers=78, kv_lora=512, qk_rope=64 -- all loaded
+ * together in load_cfg in this file):
+ *
+ *   1. kv_alloc:  (n_layers+1) * maxT * (kv_lora+qk_rope) * sizeof(float)
+ *               = 79 * 2^20 * 576 * 4 B = 190,857,609,216 B = 177.75 GiB
+ *   2. prefill x: maxT * hidden * sizeof(float)
+ *               = 2^20 * 6144 * 4 B = 25,769,803,776 B = 24.00 GiB
+ *   3. resident:  sizeof(AblateManifestItem) + sizeof(AblateItemRef)
+ *               = 224 B + 16 B = 240 B per item (illustrative only --
+ *                 unbounded in item count, not item length)
+ *
+ * kv_alloc is 7.41x the prefill buffer, not the smaller of the two. */
 #define ABLATE_MAX_ITEM_TOKENS (1<<20)
+
+/* See the comment above: the bound actually applied to one manifest
+ * item's T is the smaller of CTX and ABLATE_MAX_ITEM_TOKENS, not the
+ * backstop constant alone. Reads CTX itself (not a cached max_ctx)
+ * because ablate mode has no serving session to inherit one from; same
+ * default (4096) and same unvalidated-atoi parsing as every other CTX
+ * reader in this file, for one consistent meaning of "context length"
+ * throughout. */
+static int64_t ablate_item_token_limit(void){
+    const char *env=getenv("CTX");
+    int ctx = env ? atoi(env) : 4096;
+    if(ctx<=0) ctx=4096;
+    return ctx<ABLATE_MAX_ITEM_TOKENS ? (int64_t)ctx : (int64_t)ABLATE_MAX_ITEM_TOKENS;
+}
 
 static int logit_topk_count(int V, int requested){
     if(V<=0 || requested<=0) return 0;
@@ -8260,6 +8311,7 @@ static int ablate_manifest_load(FILE *f, const Cfg *c,
     AblateItemRef *item_ids=NULL;
     size_t item_cap=0, item_count=0, row_cap=0;
     int64_t target_count=0;
+    const int64_t item_token_limit=ablate_item_token_limit();
     int maxT=1, rc=0;
     char *line=NULL; size_t cap=0; ssize_t length; int64_t line_no=0, bad_line=0;
     int named=0;                      /* a specific reason was already printed */
@@ -8292,14 +8344,17 @@ static int ablate_manifest_load(FILE *f, const Cfg *c,
             rc=1; break;
         }
         /* A manifest is host input: an item may not ask for an unbounded
-         * allocation by declaring an enormous length.  The cap is far above any
-         * teacher-forced item a study runs -- the engine also allocates
-         * maxT * hidden floats for the prefill -- and it bounds the token array
-         * this loop is about to allocate to a few megabytes. */
-        if(T>ABLATE_MAX_ITEM_TOKENS){
+         * allocation by declaring an enormous length. item_token_limit is
+         * min(CTX, ABLATE_MAX_ITEM_TOKENS) -- see the comment on that
+         * constant above -- and this check runs before the item can
+         * contribute to any of the three allocations named there: this
+         * loop's own resident bookkeeping (just below), and, once maxT is
+         * known, kv_alloc's per-layer buffers and the prefill buffer `x`
+         * (both sized from maxT, which this item's own T feeds). */
+        if(T>item_token_limit){
             fprintf(stderr,"[ablate] INCOMPLETE: line %" PRId64 " declares %" PRId64
-                    " tokens, above the %d-token limit for one item\n",
-                    line_no,T,ABLATE_MAX_ITEM_TOKENS);
+                    " tokens, above the %" PRId64 "-token limit for one item\n",
+                    line_no,T,item_token_limit);
             named=1; rc=1; bad_line=line_no; break;
         }
         if(item<0 || T<2 || T>INT_MAX || np<1 || np>=T ||
