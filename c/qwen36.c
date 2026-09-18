@@ -636,6 +636,14 @@ typedef struct {
     int n, cap;
 } LCache;
 
+/* CACHE_ROUTE telemetry (docs/CACHE_ROUTE.md): the lever changes which experts
+ * run, so it carries its own meters. Only touched when the lever is on. */
+typedef struct {
+    uint64_t slots, swaps, swaps_vram;    /* chosen slots; not in the true top-K; of those, VRAM-resident */
+    uint64_t agree_hit, agree_tot;        /* |chosen ∩ true top-K| summed, K summed */
+    double kl_sum; uint64_t kl_n;         /* mean KL(true top-K mass || chosen mass) */
+} RouteStats;
+
 typedef struct {
     Cfg c;
     shards S;
@@ -647,6 +655,7 @@ typedef struct {
     float **DN_rec;         /* [n_layers] recurrent state S[h]=[kdim,vdim] for DeltaNet layers (NULL for attn) */
     float **DN_conv;        /* [n_layers] conv ring [conv_dim, convk-1] for DeltaNet layers (NULL for attn) */
     uint64_t clock, hits, miss;
+    RouteStats route;          /* CACHE_ROUTE / ROUTE_AGREE meters */
     /* Telemetria per la dashboard (Brain/Profile): tempo di lettura esperti
      * accumulato dall'avvio, e bitmap degli esperti toccati nel turno. */
     double t_disk;
@@ -678,6 +687,13 @@ static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
 static int g_pilot = 0;
 static int g_wide  = 1;
+/* CACHE_ROUTE family, same names and defaults as the GLM engine (docs/CACHE_ROUTE.md). */
+static int   g_cache_route = 0;
+static int   g_route_j     = 2;
+static int   g_route_m     = 12;
+static float g_route_p     = 0.f;
+static float g_route_alpha = 1.f;
+static int   g_route_agree = 0;
 
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
 static void *pilot_worker(void *arg);
@@ -2053,6 +2069,103 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
     free(ex); free(exp); free(ridx); free(rval); free(tmp); free(scratch);
 }
 
+/* ---------- CACHE_ROUTE: residency-aware top-K fill (docs/CACHE_ROUTE.md) ----------
+ * The GLM engine's max-rank lever (arXiv:2412.00099) with one more level: an
+ * expert already in the VRAM tier outranks one that is only in the RAM cache,
+ * which outranks one on disk. The ranking is the same softmax mass the plain
+ * path uses, restricted to `keep`. Selection inside the top-`win` window: the
+ * true top-J first, then VRAM-resident experts in rank order, then RAM-
+ * resident ones, then the true ranking. lvl(ctx, e) answers 2 / 1 / 0 and is
+ * asked only for ranked candidates past J. val[] carries the raw mass, with
+ * substitutes scaled by alpha; moe() renormalises afterwards exactly as it
+ * does for the plain top-K. Callable without a Model so
+ * tests/test_qwen36_cache_route.c can pin the selection against a residency
+ * table. */
+#define ROUTE_RANK_MAX 256
+static void route_select(const float *pr, const uint8_t *keep, int E, int K,
+                         int J, int M, float P, float alpha,
+                         int (*lvl)(void *ctx, int e), void *ctx,
+                         int *idx, float *val, RouteStats *st) {
+    if (K > ROUTE_RANK_MAX) K = ROUTE_RANK_MAX;
+    if (J < 0) J = 0; if (J > K) J = K;
+    int cap = (P > 0.f && P < 1.f) ? (M > 4*K ? M : 4*K) : (M > K ? M : K);
+    if (cap > E) cap = E;
+    if (cap > ROUTE_RANK_MAX) cap = ROUTE_RANK_MAX;
+    int rank[ROUTE_RANK_MAX]; float rw[ROUTE_RANK_MAX]; int8_t rl[ROUTE_RANK_MAX];
+    int n = 0;
+    for (int r = 0; r < cap; r++) {
+        int best = -1; float bv = -1e30f;
+        for (int e = 0; e < E; e++) {
+            if (keep && !keep[e]) continue;
+            int taken = 0; for (int j = 0; j < n; j++) if (rank[j] == e) { taken = 1; break; }
+            if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
+        }
+        if (best < 0) break;
+        rank[n] = best; rw[n] = bv; n++;
+    }
+    int Kt = K < n ? K : n;             /* the true top-K is rank[0..Kt) */
+    int win = n;
+    if (P > 0.f && P < 1.f) {           /* cumulative-mass window: grow past K until P of the ranked mass */
+        float tot = 1e-20f; for (int r = 0; r < n; r++) tot += rw[r] > 0 ? rw[r] : 0;
+        float cum = 0; win = Kt;
+        for (int r = 0; r < n; r++) { cum += rw[r] > 0 ? rw[r] : 0; win = r + 1; if (cum >= P * tot) break; }
+        if (win < Kt) win = Kt;
+    }
+    for (int r = 0; r < n; r++) rl[r] = (r >= J && r < win) ? (int8_t)lvl(ctx, rank[r]) : 0;
+    int chosen = 0, pos[ROUTE_RANK_MAX]; uint8_t used[ROUTE_RANK_MAX] = {0};
+    for (int r = 0; r < J && r < n && chosen < K; r++) { pos[chosen++] = r; used[r] = 1; }
+    for (int level = 2; level >= 1; level--)
+        for (int r = J; r < win && chosen < K; r++)
+            if (!used[r] && rl[r] == level) { pos[chosen++] = r; used[r] = 1; }
+    for (int r = 0; r < n && chosen < K; r++)
+        if (!used[r]) { pos[chosen++] = r; used[r] = 1; }
+    for (int kk = 0; kk < chosen; kk++) {
+        int r = pos[kk]; idx[kk] = rank[r]; val[kk] = rw[r];
+        if (r >= Kt && alpha > 0.f && alpha < 1.f) val[kk] *= alpha;
+    }
+    for (int kk = chosen; kk < K; kk++) { idx[kk] = -1; val[kk] = 0.f; }   /* fewer eligible than K: keep mask */
+    if (!st) return;
+    st->slots += (uint64_t)chosen; st->agree_tot += (uint64_t)chosen;
+    float tsum = 1e-20f, csum = 1e-20f;
+    for (int t = 0; t < Kt; t++) tsum += rw[t] > 0 ? rw[t] : 0;
+    for (int kk = 0; kk < chosen; kk++) {
+        csum += val[kk] > 0 ? val[kk] : 0;
+        if (pos[kk] < Kt) st->agree_hit++;
+        else { st->swaps++; if (rl[pos[kk]] == 2) st->swaps_vram++; }
+    }
+    double kl = 0;                      /* KL(true top-K mass || chosen mass), as the GLM meter */
+    for (int t = 0; t < Kt; t++) {
+        double pt = (rw[t] > 0 ? rw[t] : 0) / tsum; if (pt <= 0) continue;
+        double pc = 1e-12;
+        for (int kk = 0; kk < chosen; kk++) if (pos[kk] == t) { pc = (val[kk] > 0 ? val[kk] : 0) / csum; break; }
+        kl += pt * log(pt / pc);
+    }
+    st->kl_sum += kl; st->kl_n++;
+}
+
+/* Residency levels for route_select: 2 = in the VRAM tier, 1 = in this
+ * layer's RAM cache (pinned or LRU), 0 = would be read from disk. */
+typedef struct { Model *m; int layer; } RouteCtx;
+static int route_level(void *vctx, int e) {
+    RouteCtx *rc = (RouteCtx *)vctx;
+    if (qt_is_resident(rc->layer, e)) return 2;
+    pthread_mutex_lock(&g_pilot_mx);
+    Slot *s = slot_indexed(rc->m, rc->layer, e);
+    pthread_mutex_unlock(&g_pilot_mx);
+    return s ? 1 : 0;
+}
+
+static void route_footer(FILE *f, const Model *m) {
+    if (g_cache_route && m->route.slots)
+        fprintf(f, "CACHE_ROUTE J=%d M=%d P=%.2f alpha=%.2f | swap %.1f%% (%llu/%llu, %llu to VRAM)\n",
+                g_route_j, g_route_m, g_route_p, g_route_alpha,
+                100.0*m->route.swaps/m->route.slots, (unsigned long long)m->route.swaps,
+                (unsigned long long)m->route.slots, (unsigned long long)m->route.swaps_vram);
+    if (m->route.agree_tot)
+        fprintf(f, "route_agree %.1f%% | route_kl %.4f\n", 100.0*m->route.agree_hit/m->route.agree_tot,
+                m->route.kl_n ? m->route.kl_sum/(double)m->route.kl_n : 0.0);
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     float *logits = falloc((int64_t)S*E);
@@ -2100,14 +2213,23 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             for (int e = 0; e < Ec; e++) keep[e] = 1;
         }
         int idx[256]; float val[256];
-        for (int kk = 0; kk < K; kk++) {
-            int best = -1; float bv = -1e30f;
-            for (int e = 0; e < E; e++) {
-                if (!keep[e]) continue;
-                int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
-                if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
+        if (g_cache_route) {
+            RouteCtx rc = { m, layer };
+            route_select(pr, keep, E, K, g_route_j, g_route_m, g_route_p, g_route_alpha,
+                         route_level, &rc, idx, val, &m->route);
+        } else {
+            for (int kk = 0; kk < K; kk++) {
+                int best = -1; float bv = -1e30f;
+                for (int e = 0; e < E; e++) {
+                    if (!keep[e]) continue;
+                    int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
+                    if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
+                }
+                idx[kk] = best; val[kk] = bv;
             }
-            idx[kk] = best; val[kk] = bv;
+            if (g_route_agree) {            /* plain routing: full agreement by construction */
+                m->route.agree_hit += (uint64_t)K; m->route.agree_tot += (uint64_t)K; m->route.kl_n++;
+            }
         }
         if (m->resident_collecting) {
             for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) m->seen[(int64_t)layer * E + idx[kk]] = 1;
@@ -3068,6 +3190,15 @@ int main(int argc, char **argv) {
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
     if (g_wide < 1) g_wide = 1; if (g_wide > 4) g_wide = 4;
+    g_cache_route = getenv("CACHE_ROUTE") ? atoi(getenv("CACHE_ROUTE")) : 0;         /* prefer resident experts (VRAM tier, then RAM cache) inside the top-M window; changes which experts run: docs/CACHE_ROUTE.md */
+    g_route_j     = getenv("ROUTE_J")     ? atoi(getenv("ROUTE_J"))     : 2;         /* true top-J always taken, resident or not, under CACHE_ROUTE=1 */
+    g_route_m     = getenv("ROUTE_M")     ? atoi(getenv("ROUTE_M"))     : 12;        /* rank window inside which a resident expert may replace an unresident one */
+    g_route_p     = getenv("ROUTE_P")     ? (float)atof(getenv("ROUTE_P"))     : 0.f; /* cumulative-mass window for CACHE_ROUTE (0 = fixed M) */
+    g_route_alpha = getenv("ROUTE_ALPHA") ? (float)atof(getenv("ROUTE_ALPHA")) : 1.f; /* scale substituted experts' gate mass before renorm (1 = off) */
+    g_route_agree = getenv("ROUTE_AGREE") ? atoi(getenv("ROUTE_AGREE")) : g_cache_route; /* overlap% + KL vs the true top-K in the footer; auto-on under CACHE_ROUTE=1 */
+    if (g_cache_route)
+        fprintf(stderr, "[qwen36] CACHE_ROUTE=1 J=%d M=%d P=%.2f alpha=%.2f: VRAM tier > RAM cache > disk inside the top-M window (lossy: A/B it)\n",
+                g_route_j, g_route_m, g_route_p, g_route_alpha);
     if (getenv("OPENAI")) g_openai = 1;                       /* OpenAI-compatible output */
     const char *mv = getenv("MODEL"); if (mv && *mv) g_model = mv;
     int hot_n = getenv("HOT") ? atoi(getenv("HOT")) : 0;
@@ -3287,6 +3418,7 @@ int main(int argc, char **argv) {
         printf("TF-NLL: %.4f nats/token over %d tokens | ppl = %.2f\n", nll, scored, exp(nll));
         printf("Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
                (unsigned long long)m.hits, (unsigned long long)m.miss);
+        route_footer(stdout, &m);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
         free(buf); free(arena); return 0;
     }
@@ -3352,6 +3484,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "\nPEAK RSS: %.2f GB\n", rss_gb());
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
+    route_footer(stderr, &m);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
     free(buf); free(arena);
     /* Oracle mode is a gate, not a report: a mismatch must fail the caller.

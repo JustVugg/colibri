@@ -1139,6 +1139,10 @@ qwen38-tier-engine-check: qwen38-tiny-fp8-generate tests/test_qwen38_tier_engine
 tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
+# CACHE_ROUTE: route_select() against a residency table, no model needed.
+tests/test_qwen36_cache_route$(EXE): tests/test_qwen36_cache_route.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(LDFLAGS)
+
 tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 

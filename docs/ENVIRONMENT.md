@@ -15,7 +15,7 @@ what follows, but the sister engines read their own:
 | `colibri` | `c/colibri.c` | everything below except the three sections named for another engine |
 | `kimi_k3` | `c/kimi_k3.c` | the `K3_*` family — see [Kimi K3 engine](#kimi-k3-engine-kimi_k3) |
 | `inkling` | `c/inkling.c` | `INK_*`, plus `CTX_MAX`, `PIN_N`, `REP_PEN`, `GPU_DEV`, `NOGPU` — see [Inkling engine](#inkling-engine-inkling) |
-| `qwen36` | `c/qwen36.c` | `QWEN_*`, `Q36_*`, and its dense/CUDA-tier controls — see [Qwen3.6 engine](#qwen36-engine-qwen36) |
+| `qwen36` | `c/qwen36.c` | `QWEN_*`, `Q36_*`, its dense/CUDA-tier controls, and the `CACHE_ROUTE` family (VRAM tier over RAM cache) — see [Qwen3.6 engine](#qwen36-engine-qwen36) |
 | `qwen38` | `c/qwen38.c` | `Q38_MAXT`, `Q38_EOS`, `Q38_NATIVE_FP8`, `Q38_NATIVE_BF16`, `Q38_PREFILL_BATCH`, `COLI_TIMERS` — see [Qwen3.8 engine](#qwen38-engine-qwen38) |
 | `olmoe` | `c/olmoe.c` | `HOT`, `WIDE`, `SMOOTH`, `CONF_LIMIT`, `MAX_NEW`, `CHAT`, `EXPERT_DROP`, `WARMUP` — see [OLMoE engine](#olmoe-engine-olmoe) |
 | `deepseek_v4` | `c/deepseek_v4.c` | `CTX`, the `V4_*` / `DSV4_*` families and the two `COLI_CUDA_*_BATCH` gates — see [DeepSeek V4 engine](#deepseek-v4-engine-deepseek_v4); note that the CUDA section below describes `colibri.c` knobs (`COLI_CUDA`, `CUDA_DENSE`, ...) which the V4 engine does not read — its GPU switch is `DSV4_CUDA` |
@@ -103,12 +103,12 @@ Format: `VAR` — default — effect.
 | `COUPLE` | unset | Path to a coupling-score file driving cross-layer expert prefetch (#176). When set, `couple_load` reads it. |
 | `COUPLE_K` | `8` | Top-K coupled experts per layer when `COUPLE` is set. |
 | `COUPLE_D` | `1` | Coupling lookahead depth (`1` or `2`) when `COUPLE` is set. |
-| `CACHE_ROUTE` | `0` (off) | Opt-in max-rank cache-aware MoE routing (pin∪LRU prefer within top-M). See [CACHE_ROUTE.md](CACHE_ROUTE.md). |
+| `CACHE_ROUTE` | `0` (off) | Opt-in max-rank cache-aware MoE routing (pin∪LRU prefer within top-M). Also read by `qwen36`, where the VRAM tier outranks the RAM cache. See [CACHE_ROUTE.md](CACHE_ROUTE.md). |
 | `ROUTE_J` | `2` | Sacred top ranks always taken when `CACHE_ROUTE=1`. |
 | `ROUTE_M` | `12` | Max-rank window for resident preference when `CACHE_ROUTE=1`. |
 | `ROUTE_P` | `0` | Cumulative mass window for CACHE_ROUTE (`0` = fixed M). |
 | `ROUTE_ALPHA` | `1` | Scale gate mass of substituted experts before renorm (`1` = off). |
-| `ROUTE_AGREE` | auto | Overlap% + KL vs true top-K; auto-on when `CACHE_ROUTE=1`. |
+| `ROUTE_AGREE` | auto | Overlap% + KL vs true top-K; auto-on when `CACHE_ROUTE=1`. Alone it changes nothing and prints the meters (always 100% / 0). |
 | `ROUTE_TRACE` | unset | If set to a path, logs every routing decision there (testing/analysis). |
 | `ABSORB` | `-1` (auto: absorbed for S≤4) | MLA attention absorption mode. |
 | `IDOT` | `1` | Integer dot-product kernel. `IDOT=0` uses exact f32 kernels (for A/B numerical checks). |
