@@ -555,6 +555,82 @@ static inline int64_t fp8_nblk(int n){ return ((int64_t)n + FP8_BLOCK - 1) / FP8
  * is the GPU one; a vectorized CPU kernel is future work if measured needed).
  * Mirrors matmul_i3's double-accumulate-across-groups / float-within-group
  * convention so cross-block cancellation doesn't cost precision unfairly. */
+/* Two kernels, selected by compiler, because the faster one is only
+   BIT-EXACT under clang.
+
+   The four-accumulator form is algebraically identical to the one-accumulator
+   loop - same operands, same column order - so any difference comes purely
+   from the compiler contracting multiply-adds differently in the four-chain
+   shape, which drifts results by ~1 ulp.  That would break the byte-exact
+   contract tests/test_qwen38_native_weights.c pins against its independent
+   reference, and a one-ulp logit can flip an argmax in the token-exact gates.
+
+   Under GCC that contraction cannot be controlled from source.  Measured on
+   gcc 13.4, clean build per cell, against this kernel's own test:
+     - #pragma GCC optimize ("fp-contract=off")     ignored (no-op)
+     - #pragma GCC optimize ("-ffp-contract=off")   ignored (no-op)
+     - __attribute__((optimize("-ffp-contract=off"))) ignored (no-op)
+     - #pragma STDC FP_CONTRACT OFF                 unimplemented: GCC warns
+                                                    "ignoring '#pragma STDC
+                                                    FP_CONTRACT'"
+   Only the command-line -ffp-contract=off works, and that is a global numerics
+   decision this kernel has no business making for the whole project.  With no
+   guard, the four-row form is exact on -march=znver3 and -march=x86-64-v3 but
+   NOT on -march=haswell, so "it passed on my machine" is not evidence here.
+
+   clang contracts the reference and this kernel identically, so the four-row
+   form is bit-exact there: verified on arm64 (binary byte-identical to the
+   one-row build) and on x86 clang at -march=haswell, znver3 and x86-64-v3.
+   So clang gets the fast kernel and GCC keeps upstream's, which is exact on
+   every arch tested. */
+#if defined(__clang__)
+static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
+                       int S, int I, int O){
+    int64_t nblkI = fp8_nblk(I);
+    /* Four output rows per pass, each with its own accumulator.  Every row's
+       addition sequence is identical to the one-row form - same operands, same
+       column order - so results are bit-identical; only the interleaving of four
+       independent dependency chains differs.  The gain is latency hiding plus one
+       load of xs[i] feeding four rows.  A tail of fewer than four rows clamps the
+       spare indices onto the last valid row and the stores are guarded, which
+       avoids a separate remainder loop. */
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o+=4){
+        int o1=o+1<O ? o+1 : o, o2=o+2<O ? o+2 : o, o3=o+3<O ? o+3 : o;
+        const uint8_t *w0=q8+(int64_t)o*I,  *w1=q8+(int64_t)o1*I;
+        const uint8_t *w2=q8+(int64_t)o2*I, *w3=q8+(int64_t)o3*I;
+        const float *scl0=bscale+((int64_t)o /FP8_BLOCK)*nblkI;
+        const float *scl1=bscale+((int64_t)o1/FP8_BLOCK)*nblkI;
+        const float *scl2=bscale+((int64_t)o2/FP8_BLOCK)*nblkI;
+        const float *scl3=bscale+((int64_t)o3/FP8_BLOCK)*nblkI;
+        for(int s=0;s<S;s++){
+            const float *xs = x + (int64_t)s*I;
+            double a0=0,a1=0,a2=0,a3=0;
+            for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
+                int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
+                float acc0=0,acc1=0,acc2=0,acc3=0;
+                for(int i=base;i<base+blen;i++){
+                    float xv=xs[i];
+                    acc0 += e4m3_decode(w0[i])*xv;
+                    acc1 += e4m3_decode(w1[i])*xv;
+                    acc2 += e4m3_decode(w2[i])*xv;
+                    acc3 += e4m3_decode(w3[i])*xv;
+                }
+                a0 += (double)acc0*scl0[bi];
+                a1 += (double)acc1*scl1[bi];
+                a2 += (double)acc2*scl2[bi];
+                a3 += (double)acc3*scl3[bi];
+            }
+            y[(int64_t)s*O+o]=(float)a0;
+            if(o1!=o) y[(int64_t)s*O+o1]=(float)a1;
+            if(o2!=o) y[(int64_t)s*O+o2]=(float)a2;
+            if(o3!=o) y[(int64_t)s*O+o3]=(float)a3;
+        }
+    }
+}
+#else
+/* GCC and everything else: upstream's one-row kernel, unchanged.  Exact on
+   every -march tested; see the note above for why it is not simply replaced. */
 static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
                        int S, int I, int O){
     int64_t nblkI = fp8_nblk(I);
@@ -576,6 +652,7 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
         }
     }
 }
+#endif
 
 /* ---- IDOT: integer dot kernels (int8-quantized activations) --------------- */
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
