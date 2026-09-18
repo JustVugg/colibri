@@ -819,6 +819,17 @@ extern "C" int coli_metal_init(void) {
     if (e && atoi(e) == 0) g_rtop8_par = 0; }
   @autoreleasepool {
     g_dev = MTLCreateSystemDefaultDevice();
+    /* MTLCreateSystemDefaultDevice() can return nil even when a usable device
+       exists: it resolves the *system default*, which is not always available
+       to a process depending on its session context. Observed on an M2 Ultra
+       (macOS 14.6, Aqua session, WindowServer running) where this call returns
+       nil while MTLCopyAllDevices() returns "Apple M2 Ultra". Without a
+       fallback the backend reports "Metal unavailable" and silently drops to
+       the CPU path on hardware the Metal backend specifically targets. */
+    if (!g_dev) {
+      NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();
+      if ([all count] > 0) g_dev = all[0];
+    }
     if (!g_dev) return 0;
     g_queue = [g_dev newCommandQueue];
     NSError *err = nil;

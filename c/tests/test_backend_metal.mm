@@ -785,6 +785,11 @@ int main(void) {
    * runs, keeping this suite's compile coverage -- the class of bug #940
    * shipped -- while GPU execution is honestly skipped here. (#947 review) */
   id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+  if (!dev) {                       /* match backend_metal.mm's fallback, so the
+                                       suite runs wherever the backend runs */
+    NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();
+    if ([all count] > 0) dev = all[0];
+  }
   if (dev && [[dev name] containsString:@"Apple Paravirtual device"]) {
     printf("SKIPPED: paravirtual device (%s) -- compile-only\n",
            [[dev name] UTF8String]);
