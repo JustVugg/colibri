@@ -111,7 +111,7 @@ static struct {
      * a 3rd matmul set + norm set, GPU-only latent intermediates, per-layer resident
      * norm-weight buffers (tiny, uploaded once like the KV mirror). */
     VkShaderModule shader_nrm; VkDescriptorSetLayout dsl_nrm; VkPipelineLayout plyt_nrm;
-    VkPipeline pipe_nrm; VkDescriptorPool qprep_pool; VkDescriptorSet dset_qp3, dset_nrm;
+    VkPipeline pipe_nrm; VkDescriptorPool dpool_nrm, qprep_pool; VkDescriptorSet dset_qp3, dset_nrm;
     Scratch qp1, qp2;
     VkBuffer lnbuf[VK_KV_LAYERS]; VkDeviceMemory lnmem[VK_KV_LAYERS]; int lnlen[VK_KV_LAYERS];
     Scratch att_sc;              /* attention score scratch (GPU-only) */
@@ -497,10 +497,8 @@ int coli_vk_init(const char *spv_path) {
     char nrm_path[512]; derive_dir_file(spv_path, "rmsnorm.spv", nrm_path, sizeof(nrm_path));
     G.shader_nrm = load_spv(G.dev, nrm_path);
     if (G.shader_nrm) {
-        VkDescriptorPool np; VkDescriptorSet ns;
-        if (!build_pipeline(G.dev, 3, sizeof(struct PCN), G.shader_nrm, &G.dsl_nrm, &G.plyt_nrm, &G.pipe_nrm, &np, &ns))
+        if (!build_pipeline(G.dev, 3, sizeof(struct PCN), G.shader_nrm, &G.dsl_nrm, &G.plyt_nrm, &G.pipe_nrm, &G.dpool_nrm, &G.dset_nrm))
             return 0;
-        G.dset_nrm = ns;
         /* one extra 4-binding matmul set for the chain's 3rd matmul (dset+dset_pair serve 1+2) */
         VkDescriptorPoolSize ps3 = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4};
         VkDescriptorPoolCreateInfo dpi3 = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1834,6 +1832,14 @@ void coli_vk_shutdown(void) {
         vkDestroyPipelineLayout(G.dev, G.plyt_att, NULL);
         vkDestroyDescriptorSetLayout(G.dev, G.dsl_att, NULL);
         vkDestroyShaderModule(G.dev, G.shader_att, NULL);
+    }
+    if (G.pipe_nrm) {   /* the rmsnorm chain: its pool used to be a dropped local */
+        vkDestroyPipeline(G.dev, G.pipe_nrm, NULL);
+        vkDestroyPipelineLayout(G.dev, G.plyt_nrm, NULL);
+        vkDestroyDescriptorSetLayout(G.dev, G.dsl_nrm, NULL);
+        vkDestroyShaderModule(G.dev, G.shader_nrm, NULL);
+        vkDestroyDescriptorPool(G.dev, G.dpool_nrm, NULL);
+        vkDestroyDescriptorPool(G.dev, G.qprep_pool, NULL);
     }
     for (VkWArena *a = g_warena; a;) {   /* weight arenas: unmapped/freed with the device */
         VkWArena *nx = a->next;
