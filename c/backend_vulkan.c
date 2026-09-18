@@ -1840,6 +1840,12 @@ void coli_vk_shutdown(void) {
         vkUnmapMemory(G.dev, a->mem); vkFreeMemory(G.dev, a->mem, NULL);
         free(a); a = nx;
     }
+    for (VkWArena *a = g_warena_dl; a;) {   /* the staged device-local chain is never mapped */
+        VkWArena *nx = a->next;
+        vkFreeMemory(G.dev, a->mem, NULL);
+        free(a); a = nx;
+    }
+    g_warena_dl = NULL;
     g_warena = NULL;
     vkDestroyDevice(G.dev, NULL);
     vkDestroyInstance(G.inst, NULL);
