@@ -633,10 +633,6 @@ static int eslot_victim_pick(Model *m,int layer,int ecap){
         }
     }
     if(m->ev_head && m->ev_head[layer]>=0){
-<<<<<<< HEAD
-        ESlot *s=&Sl[m->ev_head[layer]];
-        if(!eslot_busy(s)) return m->ev_head[layer];   /* list members are never busy */
-=======
         /* #1571 r2 (JustVugg): the legacy scan's growth rule returns an emptied
          * slot while the row's live-slab count is below capacity; a non-negative
          * list head used to shadow that rule, permanently evicting live
@@ -649,7 +645,6 @@ static int eslot_victim_pick(Model *m,int layer,int ecap){
              * the busy check + the LRU scan fallback below keep this O(1) amortized,
              * degrading to the legacy scan only while the head is busy. */
         }
->>>>>>> 9ef81b7 (fix(colibri): three victim-list defects caught by the #1571 r2 review)
     }
     return eslot_lru_victim(Sl,nn,ecap);   /* fallback: LRU residents / empty-under-cap */
 }
