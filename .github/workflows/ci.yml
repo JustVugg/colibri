@@ -1204,6 +1204,30 @@ jobs:
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
 
+  gguf:
+    name: GGUF reader + converter tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-gguf.txt
+      # This job is what makes the numerical GGUF evidence real: without these
+      # deps those tests skip at import, so the generic `python` job alone only
+      # exercises test_gguf_reader.py (pure stdlib).
+      - name: Install GGUF test dependencies
+        run: pip install -r c/tools/requirements-gguf.txt
+      - name: GGUF reader, dequant, profile and converter tests
+        run: |
+          cd c
+          python3 -m unittest -v \
+            tests.test_gguf_reader \
+            tests.test_gguf_dequant \
+            tests.test_gguf_olmoe_profile \
+            tests.test_convert_gguf_to_olmoe
+
   windows-python-focused:
     name: Python tests (Windows focused)
     runs-on: windows-latest
