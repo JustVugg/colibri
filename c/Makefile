@@ -879,10 +879,10 @@ cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def $(DEEPGEMM_S
 dsv4-cuda-loader-test: tests/test_dsv4_decode_cuda.c backend_loader_dsv4.c backend_cuda_dsv4.h
 	$(CC) $(CFLAGS) tests/test_dsv4_decode_cuda.c backend_loader_dsv4.c -o dsv4_decode_loader_test$(EXE)
 	./dsv4_decode_loader_test$(EXE)
-backend_metal.o: backend_metal.mm backend_metal.h
+backend_metal.o: backend_metal.mm backend_metal.h affine_quant.h
 	$(METALXX) -c backend_metal.mm -o $@
 
-metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h
+metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h affine_quant.h
 	$(METALXX) tests/test_backend_metal.mm backend_metal.mm -framework Metal -framework Foundation -o backend_metal_test
 	./backend_metal_test
 
@@ -909,7 +909,7 @@ glm53-metal-check: backend_metal.o tests/test_glm53_clamped_metal.c tests/test_g
 
 # Standalone large-batch GEMM correctness sweep — reproduces the long-context prefill
 # corruption in seconds (no model). OMP-parallel CPU reference.
-gemm-test: tests/test_gemm_largebatch.mm backend_metal.mm backend_metal.h
+gemm-test: tests/test_gemm_largebatch.mm backend_metal.mm backend_metal.h affine_quant.h
 	$(METALXX) $(OMPC) tests/test_gemm_largebatch.mm backend_metal.mm $(OMPL) -framework Metal -framework Foundation -o gemm_largebatch_test
 	./gemm_largebatch_test
 
@@ -1092,7 +1092,7 @@ QWEN36_TIER_SRC =
 QWEN36_CFLAGS   = $(NOCUDA_CFLAGS)
 QWEN36_LDFLAGS  = $(NOCUDA_LDFLAGS)
 endif
-qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h st.h json.h compat.h omp_tune.h kv_prefix.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+qwen36$(EXE): qwen36.c affine_quant.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h st.h json.h compat.h omp_tune.h kv_prefix.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
@@ -1165,6 +1165,14 @@ tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c qwen36.c ex
 tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# Dense-bridge gate: qwen36's loader against an MLX affine
+# model.safetensors (the dense half of a Swiftlet qpack container) --
+# `language_model.` name resolution, U32 triple indexing, checked Q4/Q8
+# expansion, refusals.  With argv it doubles as the round-trip harness for
+# tests/test_make_qwen36_qpack_snap.py.
+tests/test_qwen36_dense_affine$(EXE): tests/test_qwen36_dense_affine.c qwen36.c affine_quant.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 # Both tokenizer.json merge spellings ("a b" strings and ["a","b"] pairs)
 # must index the same merge table; the pair form is what Qwen3.6 ships.
 tests/test_qwen36_tok_merges$(EXE): tests/test_qwen36_tok_merges.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
@@ -1223,6 +1231,9 @@ portable:
 
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
+
+qpack-inspect$(EXE): qpack_inspect.c qpack.c qpack.h affine_quant.h json.h compat.h
+	$(CC) $(CFLAGS) qpack_inspect.c qpack.c -o qpack-inspect$(EXE) $(LDFLAGS)
 
 tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c compat.h serve_codec.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1510,6 +1521,19 @@ tests/test_expert_store_ops$(EXE): tests/test_expert_store_ops.c expert_store.h 
 
 tests/test_native_quant$(EXE): tests/test_native_quant.c deepseek_v4.c native_quant.h tensor.h quant.h
 	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT deepseek_v4.c $< -o $@ $(LDFLAGS)
+
+# Portable MLX affine Q4/Q8 format contract and CPU oracle.  This stays
+# separate from QT fmt=4, whose signed-int4 scale-only layout is incompatible.
+tests/test_affine_quant$(EXE): tests/test_affine_quant.c affine_quant.h backend_metal.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_qpack$(EXE): tests/test_qpack.c qpack.c qpack.h affine_quant.h json.h compat.h
+	$(CC) $(CFLAGS) tests/test_qpack.c qpack.c -o $@ $(LDFLAGS)
+
+# Loader-side expansion oracle for the same MLX affine contract: nibble/byte
+# order, scalar decodings, parity against coli_affine_matmul_ref, refusals.
+tests/test_affine_dequant$(EXE): tests/test_affine_dequant.c affine_quant.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_edge_runtime$(EXE): tests/test_edge_runtime.c edge_runtime.c edge_runtime.h
 	$(CC) $(CFLAGS) tests/test_edge_runtime.c edge_runtime.c -o $@ $(LDFLAGS)
