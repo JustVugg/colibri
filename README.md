@@ -73,7 +73,7 @@ as a 3-D galaxy — 13,260 characterised experts, 1,041 replicated specialists c
 
 With Colibrì, private frontier model access is not limited by availability of hyperscaler-class hardware.
 
-With its multitiering features Colibrì **removes proprietary hardware dependencies aggressively 
+With its multitiering features, Colibrì **removes proprietary hardware dependencies aggressively 
 optimizing functional inference engine pipelines**.
 
 Our operational mission includes changing how weights are represented and moved, deciding what
@@ -98,9 +98,7 @@ that the next useful optimization can come from anyone willing to measure it.
   pinned hot-store, and one-layer-ahead prefetch instead of loading every expert.
   It wins on repeatable workloads; history can overfit, and lookahead can lose on
   some hosts, so both remain measurable policies rather than promises.
-- **I/O is part of the engine.** Batched expert unions, overlapped reads and
-  compute, `O_DIRECT`, and weighted dual-SSD striping attack the streaming path
-  rather than pretending storage latency is free. `O_DIRECT` is drive-dependent,
+- **I/O is part of the engine.** batched expert unions, overlapped reads and compute, O_DIRECT, and weighted dual-SSD striping attack the streaming path rather than pretending storage latency is free. `O_DIRECT` is drive-dependent,
   and dual-SSD still needs broader end-to-end community A/Bs.
 - **Heterogeneous execution.** CPU, CUDA, Metal, NUMA memory, and partial or full
   expert residency share one runtime and can be combined according to the machine;
@@ -117,14 +115,14 @@ that the next useful optimization can come from anyone willing to measure it.
 Colibrì treats an optimization as a hypothesis until a controlled end-to-end A/B
 shows otherwise. These are the main questions now:
 
-| hypothesis | evidence so far | experiment still needed |
+| Hypothesis | Evidence so far | Experiment still needed |
 |---|---|---|
-| Routing history can place experts better than plain LRU | learned pins improve repeated workloads, but can overfit a prompt | held-out, cross-session A/Bs across coding, chat, multilingual, and long-context workloads |
-| Multiple SSDs can turn independent bandwidth into decode speed | weighted mirror/split routing is implemented and validated; the bandwidth model is sound | cold-cache one-drive vs two-drive GLM-5.2 runs on real, independent controllers |
-| A hardware-aware planner can approach each machine's best configuration automatically | RAM/VRAM budgets and several backends are detected today | compare the generated plan with a controlled parameter sweep across laptops, workstations, NUMA hosts, and multi-GPU systems |
-| Lossless or quality-bounded representations can reduce weight movement enough to matter | format and quantization ablations exist, with correctness/quality gates | reproduce quality, bytes moved, latency, and cost per useful token together — not compression ratio alone |
-| Routing-aware speculation can pay before near-full residency | MTP and grammar drafts work, but MTP has also measured a 32% loss around 85% expert hit | map the break-even surface across acceptance, expert hit rate, batch union, and draft depth |
-| CPU/GPU overlap can hide transfer and synchronization rather than merely move the bottleneck | CUDA and Metal wins exist, but fast CPUs and low residency can erase them | per-stage profiles and one-variable A/Bs across PCIe, unified-memory, and full-resident machines |
+| Routing history can place experts better than plain LRU | Learned pins improve repeated workloads, but can overfit a prompt | Held-out, cross-session A/Bs across coding, chat, multilingual, and long-context workloads |
+| Multiple SSDs can turn independent bandwidth into decode speed | Weighted mirror/split routing is implemented and validated; the bandwidth model is sound | Cold-cache one-drive vs two-drive GLM-5.2 runs on real, independent controllers |
+| A hardware-aware planner can approach each machine's best configuration automatically | RAM/VRAM budgets and several backends are detected today | Compare the generated plan with a controlled parameter sweep across laptops, workstations, NUMA hosts, and multi-GPU systems |
+| Lossless or quality-bounded representations can reduce weight movement enough to matter | Format and quantization ablations exist, with correctness/quality gates | Reproduce quality, bytes moved, latency, and cost per useful token together — not compression ratio alone |
+| Routing-aware speculation can pay before near-full residency | MTP and grammar drafts work, but MTP has also measured a 32% loss around 85% expert hit | Map the break-even surface across acceptance, expert hit rate, batch union, and draft depth |
+| CPU/GPU overlap can hide transfer and synchronization rather than merely move the bottleneck | CUDA and Metal wins exist, but fast CPUs and low residency can erase them | Per-stage profiles and one-variable A/Bs across PCIe, unified-memory, and full-resident machines |
 
 Want to help? Pick one row and publish the negative results too. Record the
 hardware, commit, model/container, exact command, prompt, cache state, throughput,
