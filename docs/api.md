@@ -194,6 +194,46 @@ The `"api_key": "local"` dummy is what satisfies clients that demand a key.
 `context_window` is only the client's budget display — set it to whatever your
 KV configuration actually allows.
 
+**pi** — add a custom provider to `~/.pi/agent/models.json` ([pi](https://github.com/earendil-works/pi-coding-agent) loads every OpenAI-compatible server through its `openai-completions` API):
+
+```json
+{
+  "providers": {
+    "colibri": {
+      "baseUrl": "http://localhost:8000/v1",
+      "api": "openai-completions",
+      "apiKey": "local",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false
+      },
+      "models": [
+        {
+          "id": "glm-5.2-colibri",
+          "name": "GLM-5.2 (Colibri)",
+          "contextWindow": 131072,
+          "maxTokens": 1024
+        }
+      ]
+    }
+  }
+}
+```
+
+The `apiKey` dummy satisfies pi's auth requirement; colibri only enforces a
+key if you set `COLI_API_KEY`. The `compat` flags tell pi to send the system
+prompt as a plain `system` message and to omit `reasoning_effort`, which keeps
+the request inside what the gateway accepts by default. If you serve GLM-5.2
+and want its reasoning block, set `"reasoning": true` on the model and drop
+`supportsReasoningEffort` — the standard `reasoning_effort` field enables
+thinking on that engine. Then select the model with `pi --list-models` or the
+`/model` picker (`colibri / GLM-5.2 (Colibri)`).
+
+`contextWindow` is only the client's budget display — set it to whatever your
+KV configuration actually allows. Tool calling in pi works on the engines in
+the [tool-calling matrix](#tool-calling-support) above; on unsupported engines
+pi's tool calls fail the same way any OpenAI `tools` request does.
+
 **Continue, Cline / Roo, `llm`, the OpenAI SDKs, …** — set the provider's base
 URL to `http://localhost:8000/v1`, the model to `glm-5.2-colibri`, and any dummy
 key (`OPENAI_API_KEY` / `OPENAI_BASE_URL` for env-based tools).
