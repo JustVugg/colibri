@@ -781,8 +781,9 @@ memInfo.free:                     23.50 GB (97%)
         write_shard(self.model / "model.safetensors", tensors)
         analysis = analyze_model(self.model)
         self.assertEqual(analysis["dense_bytes"], 256 + 4 * MiB + 1024 + 4 * MiB)
-        # The stage-1 trunk offload: int8 bytes of the offered matrices only.
-        self.assertEqual(analysis["trunk_int8_bytes"], 2 * MiB)
+        # The stage-1 trunk offload: int8 bytes of the offered matrices plus
+        # their gs-64 scale table (one f32 per 64 weights: +1/16).
+        self.assertEqual(analysis["trunk_int8_bytes"], 2 * MiB + 2 * MiB // 16)
         # The three native FP8 sidecars are retained once in the normalized
         # scale bank, not once per cache slot.
         self.assertEqual(analysis["expert_fixed_bytes"], 12)
@@ -803,7 +804,7 @@ memInfo.free:                     23.50 GB (97%)
         self.assertGreater(plan["tiers"]["vram"]["budget_bytes"], 0)
         self.assertTrue(any(item["target"] == "VRAM" for item in plan["decisions"]))
         # The trunk goes first, out of the same VRAM, and the plan says so.
-        self.assertEqual(plan["tiers"]["vram"]["trunk_bytes"], 2 * MiB)
+        self.assertEqual(plan["tiers"]["vram"]["trunk_bytes"], 2 * MiB + 2 * MiB // 16)
         self.assertTrue(any(item["reason"] == "dense trunk as int8 residents"
                             for item in plan["decisions"]))
         self.assertIn("int8 trunk", format_plan(plan))
@@ -825,8 +826,8 @@ memInfo.free:                     23.50 GB (97%)
         self.assertEqual([device["index"] for device in selected["tiers"]["vram"]["devices"]], [0])
         capped = build_plan(self.model, context=64, vram_gb=4, available_memory=16 * GB,
                             available_disk=16 * GB, gpus=[gpu])
-        self.assertLessEqual(capped["tiers"]["vram"]["budget_bytes"], 4 * GB - 2 * MiB)
-        self.assertEqual(capped["tiers"]["vram"]["trunk_bytes"], 2 * MiB)
+        self.assertLessEqual(capped["tiers"]["vram"]["budget_bytes"], 4 * GB - (2 * MiB + 2 * MiB // 16))
+        self.assertEqual(capped["tiers"]["vram"]["trunk_bytes"], 2 * MiB + 2 * MiB // 16)
         # A budget too small for the trunk leaves it on the CPU: experts only.
         tiny = build_plan(self.model, context=64, vram_gb=0.001, available_memory=16 * GB,
                           available_disk=16 * GB, gpus=[gpu])
