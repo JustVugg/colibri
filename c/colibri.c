@@ -545,6 +545,19 @@ typedef struct {
  * than in quant.h: that header is shared by standalone kernel tests and
  * sibling engines, where translation-unit-local copies are unused and trip
  * -Wunused-variable. */
+#include "exact_dot.h"
+/* COLI_EXACT_VERIFY=1 (opt-in, #689): during draft+verify forwards (g_spec_live) the CPU
+ * MLA-absorb attention core accumulates its score and context dots EXACTLY (integer products,
+ * one rounding per dot; exact_dot.h). No summation order, SIMD width or contraction flag can
+ * change those bits, so a verify row decides near-ties the same way on every host. Off by
+ * default: it is an integer path (~7x the float loop on the dot itself at -O3). The default paths
+ * are untouched. */
+static int g_exact_verify=-1;
+static int exact_verify_on(void){
+    if(g_exact_verify<0){ const char *e=getenv("COLI_EXACT_VERIFY"); g_exact_verify=(e&&atoi(e))?1:0;
+        if(g_exact_verify) fprintf(stderr,"[EXACT_VERIFY] draft+verify attention core on the exact (order-independent) dot (#689; COLI_EXACT_VERIFY=0 to disable)\n"); }
+    return g_exact_verify;
+}
 static int g_idot=1;
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 static int g_i4s=1;
@@ -4775,6 +4788,13 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 } else {
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 const float *kr=coli_kv_row(ks->Rc[layer],t,c->qk_rope);
+                if(exact_verify_on()&&g_spec_live){
+                    /* #689 exact verify: one exact accumulator over BOTH partial dots, rounded once */
+                    exd_acc ea; exd_init(&ea);
+                    for(int i=0;i<kvl;i++) exd_add_ff(&ea,qabs[i],Lt[i]);
+                    for(int d=0;d<c->qk_rope;d++) exd_add_ff(&ea,qr[d],kr[d]);
+                    a=exd_finish(&ea);
+                } else {
                 /* MLA-absorb score: dot(qabs, Lt) + dot(qr, kr). #442: the qabs·Lt
                  * reduction is the hot f32 dot at this site (kvl=512 on GLM-5.2,
                  * runs nt times per (s,h), grows with context). SIMD-ify under
@@ -4797,10 +4817,19 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 for(;i<kvl;i++) a+=qabs[i]*Lt[i];
                 for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
                 }
+                }
                 sc[jj]=a*c->attn_scale;
             }
             softmax(sc,nt);
             float clat[512]; memset(clat,0,kvl*sizeof(float));
+            if(exact_verify_on()&&g_spec_live&&!tq1&&!g_tq&&!g_kv8){
+                /* #689 exact verify: clat[i] = sum_t sc[t]*Lt[i] as an exact dot over t per column
+                 * (transposed walk: cache-unfriendly, verify rows only) */
+                for(int i=0;i<kvl;i++){ exd_acc ea; exd_init(&ea);
+                    for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
+                        exd_add_ff(&ea,sc[jj],coli_kv_row(ks->Lc[layer],t,kvl)[i]); }
+                    clat[i]=exd_finish(&ea); }
+            } else
             for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
                 if(tq1){
                     /* accumulate acc = sum_t w_t*std_t*lev[L[t]] in the rotated basis; unrotate
