@@ -134,6 +134,7 @@ the run, and attach raw logs. Start with
 [the benchmark protocol](docs/benchmarking.md), then
 [open an experiment issue](https://github.com/JustVugg/colibri/issues/new).
 A well-controlled failure is more valuable here than an unexplained fast number.
+Documentation fixes, typo corrections, and improvements to the translated READMEs are always welcome and do not require an experiment issue.
 
 ## The idea
 
