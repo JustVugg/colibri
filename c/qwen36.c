@@ -186,7 +186,15 @@ static void build_byte_sym(void){
         g_unmap[cp]=(short)b;   /* reverse: mapped codepoint -> original byte */
     }
 }
-static void push_id(int **ids,int *n,int *cap,int v){ if(*n==*cap){*cap*=2; *ids=realloc(*ids,*cap*sizeof(int));} (*ids)[(*n)++]=v; }
+static void push_id(int **ids,int *n,int *cap,int v){
+    if(*n==*cap){
+        *cap*=2;
+        int *tmp=realloc(*ids,*cap*sizeof(int));
+        if(!tmp){ fprintf(stderr,"qwen36: OOM reallocating token id buffer (%d entries)\n",*cap); exit(1); }
+        *ids=tmp;
+    }
+    (*ids)[(*n)++]=v;
+}
 
 static int try_special(const char *s,int i,int n,int *id_out){
     int best_len=0,best_id=-1;
@@ -234,7 +242,13 @@ static void bpe_piece(const char *piece,int len,int **ids,int *n,int *cap){
     for(int b=0;b<len;b++){
         const char *sym=byte_sym_utf8[(unsigned char)piece[b]];
         int sl=(int)strlen(sym); char *d=malloc(sl+1); memcpy(d,sym,sl); d[sl]=0;
-        if(sc==scap){scap*=2; syms=realloc(syms,scap*sizeof(char*));} syms[sc++]=d;
+        if(sc==scap){
+            scap*=2;
+            char **tmp=realloc(syms,scap*sizeof(char*));
+            if(!tmp){ fprintf(stderr,"qwen36: OOM reallocating BPE symbol buffer (%d entries)\n",scap); exit(1); }
+            syms=tmp;
+        }
+        syms[sc++]=d;
     }
     while(sc>1){
         int best=-1,besti=-1;
