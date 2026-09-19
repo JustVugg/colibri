@@ -51,3 +51,7 @@ qwen36
 shaders/attention_absorb.spv
 shaders/qmatmul_gate_up.spv
 shaders/rmsnorm.spv
+# Optional XDNA test scaffolding that the *.o / *.dll globs above do not cover.
+tests/xdna_exec_fixtures/
+tests/xdna_fail_fixtures/
+tests/xdna_physical_probe
