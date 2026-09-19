@@ -101,24 +101,25 @@ allowlist, :3379), consulted by both gate sites — `attention_rows` (:3448) and
 `layer_forward_rows` (:5792) — and by the load-time notice
 `metal_fmt_gate_notice` (:1866, called from `model_init`).
 
-Sources for all rows (`c/quant.h`/`c/colibri.c` line numbers at this PR
-pair's current restack, base dev `292ed4c`):
+Sources for all rows (`c/quant.h`/`c/colibri.c` line numbers verified at
+this branch's own head -- originally written against base dev `292ed4c`,
+re-anchored here because line numbers rot with the file, not the base):
 
-- **fmt=0/1/2/3** — allocation policy: `qt_alloc`, `c/colibri.c:1105`
+- **fmt=0/1/2/3** — allocation policy: `qt_alloc`, `c/colibri.c:1460`
   (`bits>=16→fmt=0`, `bits>=5→fmt=1`, `bits>=4→fmt=2`, else `fmt=3`).
   Kernels: `matmul_q` (`quant.h:105`, fmt=1), `matmul_i4` (`quant.h:125`,
   fmt=2), `matmul_i2` (`quant.h:251`, fmt=3); pack/quantize helpers
   `quantize_rows` (`quant.h:928`, fmt=1) and `pack_int2` (`quant.h:980`,
-  fmt=3). Byte-count formulas: `qt_bytes`, `c/colibri.c:183`.
+  fmt=3). Byte-count formulas: `qt_bytes`, `c/colibri.c:265`.
 - **fmt=4** (`int4-grouped`) — kernel `matmul_i4_grouped`, `quant.h:168`;
   group size `gs` is per-tensor, not fixed at 64 (contrast fmt=5). Byte-count:
-  `qt_bytes`'s `fmt==4` branch (inside `c/colibri.c:183`); scale-count split:
-  `qt_scale_bytes`, `c/colibri.c:263`.
+  `qt_bytes`'s `fmt==4` branch (inside `c/colibri.c:265`); scale-count split:
+  `qt_scale_bytes`, `c/colibri.c:346`.
 - **fmt=5** (`int3-g64`) — group size is fixed (`I3_GROUP=64`,
   `quant.h:293`; `I3_GBYTES=24`, `quant.h:294`); helpers `i3_groups`
   (`quant.h:295`), `i3_rowbytes` (`quant.h:296`); kernel `matmul_i3`
   (`quant.h:354`); pack helper `pack_int3_g64` (`quant.h:956`). Allocation:
-  `qt_alloc`'s `bits==3` branch (inside `c/colibri.c:1105`).
+  `qt_alloc`'s `bits==3` branch (inside `c/colibri.c:1460`).
 - **fmt=6** (`e8-iq3-lattice`) — upstream's merged code: format section header
   precedes `quant.h:1008`; constants `E8_QK=256` (`quant.h:1008`),
   `E8_SUB=32` (`quant.h:1009`), `E8_BBYTES=98` (`quant.h:1010`); row-byte
@@ -139,8 +140,8 @@ pair's current restack, base dev `292ed4c`):
   CPU (`quant.h`) or Metal kernel exists for it, and `qt_resolve_fmt` has
   no byte-arithmetic branch that returns 7.
 - **fmt=8** (`fp8-e4m3-b128`, this branch) — decode table `E4M3_LUT`
-  (`quant.h:446`) / `e4m3_decode` (`quant.h:480`), block size
-  `FP8_BLOCK=128` (`quant.h:482`), kernel `matmul_fp8` (`quant.h:491`).
+  (`quant.h:478`) / `e4m3_decode` (`quant.h:512`), block size
+  `FP8_BLOCK=128` (`fp8_format.h:28`), kernel `matmul_fp8` (`quant.h:525`).
   Disambiguation from fmt=1 ("THE DESIGN LANDMINE" — the two formats'
   weight bytes are byte-identical and can only be told apart by
   scale-array geometry, which is ambiguous for some small shapes) and the
@@ -152,7 +153,7 @@ pair's current restack, base dev `292ed4c`):
   stamp's role there is instead letting a genuinely-stamped `fmt=8` tensor
   override that default — see "The metadata stamp" below for the exact
   rule in both cases. FMT_NAMES table (`name string` to `fmt int`):
-  `c/colibri.c:1316`.
+  `c/colibri.c:1755`.
 - **no ordinal** (`int4-rans256-g0`, merged tools-only tier — line numbers
   at dev `7fb1159`, post-#671 merge `a3a5a75`, not at this PR pair's
   restack base) — codec + record reader/writer: `c/rans.h`
@@ -169,15 +170,15 @@ pair's current restack, base dev `292ed4c`):
   named refusal classes in its module docstring). Full specification:
   `docs/int4-rans256-g0.md`. Engine-interaction status, stated precisely
   (why the ordinal column is empty, and what still runs): `qt_resolve_fmt`
-  (`c/colibri.c:1374`) has no branch that returns this format, and
+  (`c/colibri.c:1795`) has no branch that returns this format, and
   `c/colibri.c`/`c/quant.h`/`c/st.h` contain no reference to it — no
   decode path, hence no ordinal. But a repacked shard is not invisible to
-  the engine: `st_fmt_stamp_ingest` (`c/st.h:317`, called from
+  the engine: `st_fmt_stamp_ingest` (`c/st.h:326`, called from
   `st_init_multi`'s discovery loop) parses its mandatory `colibri.fmt`
   stamp map at container-discovery time, and the three routed-expert load
   sites — exactly this format's target population — resolve formats by
-  byte arithmetic alone with `stamped_name=NULL` (`c/colibri.c:2217`,
-  `c/colibri.c:2386`, `c/colibri.c:2580`, each marked
+  byte arithmetic alone with `stamped_name=NULL` (`c/colibri.c:2858`,
+  `c/colibri.c:3056`, `c/colibri.c:3516`, each marked
   `/* routed expert: never stamped */`), so the stamp is never consulted
   where it would matter most. A future consumer must wire stamp-gated
   dispatch AHEAD of that inference — `docs/int4-rans256-g0.md`'s
