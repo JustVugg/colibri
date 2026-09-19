@@ -67,6 +67,7 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaDeviceProp           hipDeviceProp_t
 #define cudaGetDeviceProperties  hipGetDeviceProperties
 #define cudaMalloc               hipMalloc
+#define cudaMallocManaged        hipMallocManaged
 #define cudaFree                 hipFree
 #define cudaMemcpy               hipMemcpy
 #define cudaMemcpy2D             hipMemcpy2D

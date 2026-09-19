@@ -1003,8 +1003,13 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# Getting that wrong would leave OpenMP symbols in the object while the link
 	# below no longer pulls the runtime, and CI could not catch it because CI
 	# never runs cuda-test. -Xclang appears nowhere else in CFLAGS.
-	$(CC) $(filter-out -Xclang -fopenmp,$(CFLAGS)) -fno-openmp -c tests/mxfp4_ref.c -o tests/mxfp4_ref.o
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE) $(GPU_TEST_LIBS)
+	$(CC) $(filter-out -Xclang -fopenmp,$(CFLAGS)) -fno-openmp -fPIC -c tests/mxfp4_ref.c -o tests/mxfp4_ref.o
+	# -x none only under HIP: hip-test is `$(MAKE) cuda-test HIP=1`, so this
+	# line also runs under nvcc for CUDA users, and nvcc accepts only c, c++
+	# and cu for -x -- it fails the invocation on anything else. CI never
+	# executes cuda-test, so that breakage would surface only on the next
+	# CUDA box to run the suite.
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu $(if $(filter 1,$(HIP)),-x none) tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE) $(GPU_TEST_LIBS)
 	./mxfp4_cuda_test$(EXE)
 	# Allocator footprint (#687): what a cudaMalloc really takes off the card,
 	# which is what the expert tier has to be charged rather than the logical
