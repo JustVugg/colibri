@@ -59,6 +59,16 @@ _spec.loader.exec_module(PACK)
 
 
 class PackPythonNeededTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # test_the_real_tree_carries_the_case_that_started_this and
+        # test_engine_evidence_is_needed_by_the_real_tree both assert
+        # against the SAME PACK.needed(HERE.parent) result (a real,
+        # non-trivial AST-parsing walk of this checkout's own c/ tree,
+        # ~0.3s each) -- computed once here and shared, rather than
+        # paying for it twice on every run of this suite forever.
+        cls.real_tree_paths = PACK.needed(HERE.parent)
+
     def make_tree(self, root):
         """A minimal coli-shaped tree: coli imports `foo` and invokes
         tools/bar.py as a subprocess; bar.py itself imports tools/baz.py,
@@ -160,11 +170,21 @@ class PackPythonNeededTests(unittest.TestCase):
         iq3_pack opens iq3xxs_grid.json next to itself. Both were absent from
         every published archive. Assert the real pair and the test dies with
         the real bug if either edge is ever dropped again."""
-        paths = PACK.needed(HERE.parent)
+        paths = self.real_tree_paths
         self.assertIn(TOOLS / "iq3_pack.py", paths,
                       "reached only through a subprocess-launched script's import")
         self.assertIn(TOOLS / "iq3xxs_grid.json", paths,
                       "reached only as a data file opened next to iq3_pack.py")
+
+    def test_engine_evidence_is_needed_by_the_real_tree(self):
+        """This branch's own new tool, asserted the same way and for the same
+        reason: eval_glm.py is launched by coli as a subprocess and imports
+        engine_evidence, so the module is reachable only across the boundary
+        this suite exists to defend. It is a second real-tree case rather than
+        a replacement for the one above -- that one pins the historical bug,
+        this one pins the edge the branch adds."""
+        paths = self.real_tree_paths
+        self.assertIn(TOOLS / "engine_evidence.py", paths)
 
 
 class PackPythonDataFileTests(unittest.TestCase):
