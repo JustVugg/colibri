@@ -294,8 +294,8 @@ These are for testing, benchmarking, or internal use — not part of the everyda
 | `TF` | unset | Teacher-forcing mode. |
 | `CHAT_TEMPLATE` | `1` | Apply the GLM chat template (`0` = raw prompt). |
 | `PPL` | off (`olmoe.c` and `qwen38.c` only) | `PPL=1` enters teacher-forced NLL/perplexity meter mode in the OLMoE and Qwen3.8 sister engines. |
-| `ABLATE_SCORE` | unset | Causal-ablation sweep over `ABLATE_SCORE=<file>`, with a per-target-position final-logit read-out. Runs before `SCORE` and exits when done. |
-| `ABLATE_OUT` | unset | Where the ablation sweep writes its logit read-out. Pair with `ABLATE_SCORE`; an optional `ROUTE_TRACE` records the post-ablation router trace. |
+| `ABLATE_SCORE` | unset | Causal-ablation sweep over `ABLATE_SCORE=<file>`, with a per-target-position final-logit read-out. Runs before `SCORE` and exits when done. Same harness in `colibri.c` (GLM) and `olmoe.c` (teacher-forced prefill; the manifest grammar and `coli-ablate/1` JSONL schema are identical). |
+| `ABLATE_OUT` | unset | Where the ablation sweep writes its logit read-out. Pair with `ABLATE_SCORE`; an optional `ROUTE_TRACE` records the post-ablation router trace (GLM engine only — `olmoe.c`'s loss paths emit no route trace and no usage save on this path, matching the harness's measurement-run discipline). |
 | `DEBUG_LOGITS` | unset | In reference-comparison mode, dump per-position logit diagnostics. |
 | `COLI_LOGIT_DUMP` | unset | `=1` prints the top-5 `id:logit` pairs per step to stderr — for comparing two engine configs on identical forced context (backend-exactness triage). |
 | `I3_AVX512` | auto | Force the AVX-512 int3 kernel on (`1`) or off (`0`). |

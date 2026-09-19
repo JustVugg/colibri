@@ -1066,7 +1066,7 @@ fp8-bench: fp8_bench$(EXE)
 # the GPU sits idle. Same guard #783 put on kimi_k3, which since gaining an
 # MXFP4 expert path no longer needs it. tests/test_makefile_cuda_scope.py
 # asserts this shape.
-olmoe$(EXE): olmoe.c cli_args.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h kv_prefix.h route_trace.h serve_codec.h edge_adapters.h edge_runtime.h edge_tok_internal.h fused_simd.h segment_adapter_internal.h segment_adapters.h segment_runtime.h
+olmoe$(EXE): olmoe.c abl.h cli_args.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h kv_prefix.h route_trace.h serve_codec.h edge_adapters.h edge_runtime.h edge_tok_internal.h fused_simd.h segment_adapter_internal.h segment_adapters.h segment_runtime.h
 	$(CC) $(NOCUDA_CFLAGS) olmoe.c -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
