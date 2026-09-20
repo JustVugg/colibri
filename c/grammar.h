@@ -289,6 +289,12 @@ static int gr__normalize(Grammar *G, GrStack *k, GrState *out, int depth){
         if(sy->t==GR_CLS) return gr__set_add(out,k);
         if(depth>=GR_MAX_DEPTH) return 0;                 /* ricorsione sinistra / epsilon-ciclo */
         t->s++;                                           /* il chiamante riprende OLTRE il ref */
+        /* A reference that ends its alternate leaves the caller nothing to resume:
+         * pop the caller now instead of when the callee finishes. Kept on the stack,
+         * it cost one frame per repetition of x* / x+ (R ::= I R), so ~60 repetitions
+         * (the 60th byte of a JSON string, the 52nd NDJSON row) hit GR_MAX_DEPTH and
+         * switched the walker off for the rest of the output. */
+        if(t->s>=A->n) k->n--;
         GrRule *C=&G->r[sy->ref];
         for(int a=0;a<C->n;a++){
             if(k->n>=GR_MAX_DEPTH) return 0;

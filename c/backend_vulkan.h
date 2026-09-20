@@ -20,6 +20,8 @@ int  coli_vk_init(const char *spv_path);
 void coli_vk_shutdown(void);
 int  coli_vk_available(void);
 void coli_vk_mem_info(size_t *used_bytes, size_t *tensor_count);
+/* GLM-5.3 SwiGLU clamp for the fused gate_up kernel. 0 disables (GLM-5.2). */
+void coli_vk_set_swiglu_limit(float limit);
 
 /* VRAM pressure-proofing (both no-ops when the extension is absent):
  * alloc_priority sets the eviction-priority class of SUBSEQUENT weight uploads

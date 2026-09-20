@@ -127,4 +127,23 @@ static inline int kv_prefix_reuse(const kv_prefix *p, const int *ids, int n) {
     return p->len;
 }
 
+/* Il prefisso fotografato (modalita jev, SUBMIT pin=1) e ancora vivo?
+ *
+ * Una fotografia salva lo stato ricorrente e il vettore di logit finale, ma
+ * NON le righe K/V: quelle restano dove sono, indicizzate per posizione. Fra
+ * un'opzione e l'altra pero i banchi possono essere stati ributtati (prompt
+ * piu lungo -> kv_alloc), e allora quelle righe non descrivono piu niente.
+ *
+ * Confrontare la fotografia con la RICHIESTA non basta: direbbe di si anche
+ * quando le righe sono sparite. Il confronto va fatto con cio che lo stato
+ * dichiara di tenere, perche kv_prefix_alloc azzera len ogni volta che i
+ * banchi vengono buttati e kv_prefix_grow conserva solo le posizioni davvero
+ * copiate. Questo e l'unico controllo che distingue "le righe ci sono ancora"
+ * da "gli id si somigliano". */
+static inline int kv_prefix_holds(const kv_prefix *p, const int *pin, int pin_len) {
+    if (!p || !p->fed || !pin || pin_len <= 0) return 0;
+    if (p->tainted || p->len < pin_len || pin_len > p->cap) return 0;
+    return memcmp(p->fed, pin, (size_t)pin_len * sizeof(int)) == 0;
+}
+
 #endif /* KV_PREFIX_H */

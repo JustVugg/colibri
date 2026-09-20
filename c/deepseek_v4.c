@@ -1060,7 +1060,25 @@ uint64_t coli_v4_os_available_memory(void) {
     /* No /proc and no _SC_AVPHYS_PAGES on macOS. "Available" is what the
      * kernel could hand out without swapping: free + inactive pages -- the
      * same approximation Activity Monitor reports, and the closest analogue
-     * of Linux's MemAvailable (which also counts reclaimable cache). */
+     * of Linux's MemAvailable (which also counts reclaimable cache).
+     *
+     * Two things a caller must know before trusting this number.
+     *
+     * It does NOT add purgeable_count, while inkling.c, kimi_k3.c, compat.h and
+     * telemetry.h all do. The same machine therefore reports a smaller figure
+     * here than through any other engine. Keep the two in mind together: they
+     * are not interchangeable.
+     *
+     * And "could hand out without swapping" is not "will keep resident".
+     * macOS answers memory pressure by COMPRESSING anonymous pages rather than
+     * swapping them, so a budget this function accepts can still end up half
+     * compressed, and every cache hit then pays a decompression. Swap stays at
+     * zero throughout, so a swap-based check sees nothing wrong. Reported and
+     * measured in issue #1614: on a 48 GB machine a 32 GiB budget decoded
+     * SLOWER than a 16 GiB one (0.96 vs 1.31 tok/s) while the hit rate rose
+     * monotonically. Sizing a cache from this number alone is therefore
+     * unsafe on Darwin; a fix needs vm.compressor_page_count, which this
+     * function does not read. */
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
     vm_statistics64_data_t vm;
     vm_size_t page = 0;
@@ -13897,9 +13915,14 @@ static void v4_hwinfo_emit(void) {
      * contract the web UI was built against. Hence bytes/1e9, not bytes/2^30.
      *
      * Availability reuses coli_v4_os_available_memory() rather than repeating the detection:
-     * it already carries a Darwin branch (free + inactive + purgeable pages, the MemAvailable
-     * equivalent). Declared extern because the amalgamation compiles this file once per
-     * -DCOLI_V4_UNIT_*, so the definition need not be in this unit. */
+     * it already carries a Darwin branch. Declared extern because the amalgamation compiles
+     * this file once per -DCOLI_V4_UNIT_*, so the definition need not be in this unit.
+     *
+     * That branch returns free + inactive, NOT free + inactive + purgeable: this engine is
+     * deliberately one term more conservative than inkling.c, kimi_k3.c, compat.h and
+     * telemetry.h, which all add purgeable_count. Whoever changes one of the two formulas
+     * should know the other exists, or the same machine will report two different "free RAM"
+     * figures depending on which engine is asked. */
     {
         extern uint64_t coli_v4_os_available_memory(void);
         if (!cpu[0]) {
@@ -13929,9 +13952,14 @@ static void v4_hwinfo_emit(void) {
      * contract the web UI was built against. Hence bytes/1e9, not bytes/2^30.
      *
      * Availability reuses coli_v4_os_available_memory() rather than repeating the detection:
-     * it already carries a Darwin branch (free + inactive + purgeable pages, the MemAvailable
-     * equivalent). Declared extern because the amalgamation compiles this file once per
-     * -DCOLI_V4_UNIT_*, so the definition need not be in this unit. */
+     * it already carries a Darwin branch. Declared extern because the amalgamation compiles
+     * this file once per -DCOLI_V4_UNIT_*, so the definition need not be in this unit.
+     *
+     * That branch returns free + inactive, NOT free + inactive + purgeable: this engine is
+     * deliberately one term more conservative than inkling.c, kimi_k3.c, compat.h and
+     * telemetry.h, which all add purgeable_count. Whoever changes one of the two formulas
+     * should know the other exists, or the same machine will report two different "free RAM"
+     * figures depending on which engine is asked. */
     {
         extern uint64_t coli_v4_os_available_memory(void);
         if (!cpu[0]) {

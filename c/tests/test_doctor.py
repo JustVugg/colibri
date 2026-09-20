@@ -591,6 +591,44 @@ class CoreTensorRoleTest(unittest.TestCase):
         ]
         self.assertEqual(missing_core_roles(vision_only), ["final norm"])
 
+    def test_deepseek_v4_spells_the_roles_its_own_way(self):
+        """#1593: `embed.weight` and `head.weight` are what deepseek_v4.c looks
+        up, at four call sites. Both roles were reported missing for a container
+        the engine loads and generates from, while model.index, scanning the
+        same tensors, came back green."""
+        # Flat names throughout, which is the shape of that container. The
+        # exact final-norm spelling is not in the issue (the report shows that
+        # role already filled), so this asserts the flat form the other two use.
+        v4 = ["embed.weight", "norm.weight", "head.weight"]
+        self.assertEqual(missing_core_roles(v4), [])
+
+    def test_the_v4_head_companions_do_not_stand_in_for_the_head(self):
+        """`hc_head_base`, `hc_head_fn` and `hc_head_scale` sit beside the real
+        head in the same container. A checkpoint carrying them and no head is
+        missing one."""
+        companions = ["embed.weight", "norm.weight",
+                      "hc_head_base", "hc_head_fn", "hc_head_scale"]
+        self.assertEqual(missing_core_roles(companions), ["output head"])
+
+    def test_a_positional_embedding_does_not_stand_in_for_the_token_embedding(self):
+        """The reason the V4 spellings are matched on the component rather than
+        the tail: "pos_embed.weight".endswith("embed.weight") is True, and so is
+        the vision tower's patch_embed.weight. Accepting either would trade this
+        bug for its mirror image, passing a checkpoint that really has no token
+        embedding."""
+        for stand_in in ("pos_embed.weight", "model.visual.patch_embed.weight"):
+            with self.subTest(name=stand_in):
+                self.assertEqual(
+                    missing_core_roles([stand_in, "model.norm.weight", "lm_head.weight"]),
+                    ["token embedding"])
+
+    def test_a_head_inside_the_layer_stack_is_not_the_output_head(self):
+        """Same rule the final norm already applies: what is under `.layers.`
+        belongs to the block, not to the model."""
+        in_stack = ["model.embed_tokens.weight", "model.norm.weight",
+                    "model.layers.0.mlp.head.weight"]
+        self.assertEqual(missing_core_roles(in_stack), ["output head"])
+
     def test_tied_embeddings_need_no_output_head(self):
         tied = [
             "model.embed_tokens.weight",

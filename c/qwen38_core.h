@@ -1373,6 +1373,8 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
         int workers=job_count;
 #ifdef _OPENMP
         int thread_limit=omp_get_max_threads();if(workers>thread_limit)workers=thread_limit;
+#else
+        (void)workers;   /* only the pragma below reads it, and that is gone without OpenMP */
 #endif
         double started=now_s();
         #pragma omp parallel for schedule(static) num_threads(workers) if(job_count>1)
@@ -2172,6 +2174,26 @@ static void q38_layers_forward_range(Model *m,float *hyper,const int *ids,
     free(mixed); free(inject); free(block);
 }
 
+/* Canale logprobs (modalita jev). Qui la fotografia dello stato NON si
+ * aggiunge: questo motore ce l'ha gia, si chiama Q38PrefixCache e salva stato
+ * ricorrente, id e logit finali dopo ogni prompt. Manca solo la lettura, cioe
+ * un passaggio di lm_head per posizione invece che solo sull'ultima, e il
+ * predittore del primo token fresco, che sono i logit gia salvati. */
+static int    g_echo_k = 0;
+static const char *g_echo_id = NULL;
+static const float *g_echo_pin_logit = NULL;   /* logit dell'ultima posizione riusata */
+
+static void q38_echo(const char *id, int pos, int token, const float *lo, int V, int k){
+    char tail[1024]; coli_logprob_tail(tail, sizeof tail, lo, V, token, k);
+    unsigned char *piece=NULL; int n=0;
+    if(decode_id_alloc(token,&piece,&n)) { piece=NULL; n=0; }
+    if(n<0) n=0;
+    printf("ECHO %s %d %d%s\n", id, n, pos, tail);
+    if(n>0) fwrite(piece,1,(size_t)n,stdout);
+    fputc('\n', stdout); fflush(stdout);
+    free(piece);
+}
+
 static float *step(Model *m,const int *ids,int S,int pos_base) {
     Cfg *c=&m->c;int H=c->hidden,W=c->hc_width,C=c->hc_count;
     m->timers.forwards++;
@@ -2205,6 +2227,17 @@ static float *step(Model *m,const int *ids,int S,int pos_base) {
     }
     q38_gr_read(m,&m->final_gr,hyper,S,mixed,NULL);m->kv_len=pos_base+S;
     float *logit=falloc(c->vocab);double phase_started=now_s();
+    /* Lettura del prefill: la posizione p predice il token p+1. Il primo token
+     * fresco lo predice la fotografia del prefisso, quando c'e. Pagata solo da
+     * chi ha chiesto il canale. */
+    if(g_echo_k>0&&g_echo_id&&S>0){
+        if(g_echo_pin_logit)
+            q38_echo(g_echo_id,pos_base,ids[0],g_echo_pin_logit,c->vocab,g_echo_k);
+        for(int p=0;p+1<S;p++){
+            q38_weight_matmul(logit,mixed+(int64_t)p*H,&m->lm_head,1,H,c->vocab);
+            q38_echo(g_echo_id,pos_base+p+1,ids[p+1],logit,c->vocab,g_echo_k);
+        }
+    }
     q38_weight_matmul(logit,mixed+(int64_t)(S-1)*H,&m->lm_head,1,H,c->vocab);
     q38_tm_add(m,Q38_TM_LM_HEAD,phase_started);
     free(hyper);free(mixed);free(inject);free(block);return logit;

@@ -259,6 +259,22 @@ _PARTIAL_END_RE = re.compile(r"<(?:/(?:t(?:o(?:o(?:l(?:_(?:c(?:a(?:l)?)?)?)?)?)?
 _SALVAGE = os.environ.get("COLI_TOOL_SALVAGE", "0") == "1"
 
 
+def _tool_choice_name(tool_choice):
+    """The tool name a dict `tool_choice` forces, or None.
+
+    `.get` is taken only from a dict. Writing the name where the object goes --
+    {"type": "function", "function": "search"} instead of
+    {"function": {"name": "search"}} -- raised AttributeError in the five
+    renderers that read this and in generation_options() itself, and do_POST
+    answered HTTP 500 "The colibri engine failed to process the request." for a
+    payload generation_options() already has a 400 for. Same shape as the
+    json_schema fix (#1587): read the member, then check it.
+    """
+    function = tool_choice.get("function")
+    return ((function if isinstance(function, dict) else {}).get("name")
+            or tool_choice.get("name"))
+
+
 def _tool_param_order(tools):
     """name -> ordered param names (required first) from the request schema, for de-mangling."""
     out = {}
@@ -992,7 +1008,7 @@ def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, too
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     forced = None
     if isinstance(tool_choice, dict):
-        forced = ((tool_choice.get("function") or {}).get("name") or tool_choice.get("name"))
+        forced = _tool_choice_name(tool_choice)
         if forced:
             tools = [t for t in (tools or [])
                      if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
@@ -1083,8 +1099,7 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     forced = None
     if isinstance(tool_choice, dict):
-        forced = ((tool_choice.get("function") or {}).get("name")
-                  or tool_choice.get("name"))
+        forced = _tool_choice_name(tool_choice)
         if forced:
             tools = [t for t in (tools or [])
                      if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
@@ -1554,8 +1569,7 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
         prompt.append(f"<|system|>Reasoning Effort: {effort}")
     forced = None
     if isinstance(tool_choice, dict):
-        forced = ((tool_choice.get("function") or {}).get("name")
-                  or tool_choice.get("name"))
+        forced = _tool_choice_name(tool_choice)
         if forced:
             tools = [t for t in (tools or [])
                      if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
@@ -1938,8 +1952,7 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
 
     forced = None
     if isinstance(tool_choice, dict):
-        forced = ((tool_choice.get("function") or {}).get("name")
-                  or tool_choice.get("name"))
+        forced = _tool_choice_name(tool_choice)
         if forced:
             tools = [t for t in (tools or [])
                      if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
@@ -2138,8 +2151,7 @@ def render_chat_dsv41(messages, enable_thinking=False, reasoning_effort=None, to
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     forced = None
     if isinstance(tool_choice, dict):
-        forced = ((tool_choice.get("function") or {}).get("name")
-                  or tool_choice.get("name"))
+        forced = _tool_choice_name(tool_choice)
         if forced:
             tools = [t for t in (tools or [])
                      if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
@@ -2659,7 +2671,7 @@ def generation_options(body, limit):
                 raise APIError(400, "`tool_choice` must be one of \"auto\", \"none\", \"required\", "
                                     "or a function object.", "tool_choice", "unsupported_value")
         elif isinstance(choice, dict):
-            name = (choice.get("function") or {}).get("name") or choice.get("name")
+            name = _tool_choice_name(choice)
             if not name:
                 raise APIError(400, "`tool_choice` function object must include a name.",
                                "tool_choice", "invalid_value")
@@ -3076,16 +3088,28 @@ class Engine:
                 elif kind == "ECHO" and len(fields) >= 6:
                     # U7a prefill read-out: "ECHO <id> <n> <pos> <lp> <k>
                     # [tid tlp]*k" plus a DATA-framed payload (n bytes + LF).
-                    # Emitted only for opted-in requests; no current request
-                    # path opts in, so the frame is read (to keep the stream
-                    # in sync) and dropped -- U7b delivers it to the response
-                    # assembly when it wires the opt-in.
+                    # Emitted only for opted-in requests. Questo e' U7b: il
+                    # frame non si butta piu', va alla coda della richiesta che
+                    # l'ha chiesto. Chi non ha chiesto logprobs non ne riceve
+                    # nessuno, quindi il percorso della chat non cambia.
                     size = int(fields[2])
                     if not 0 <= size <= 65536:
                         raise RuntimeError("invalid engine DATA size")
-                    self._read_exact(size)
+                    piece = self._read_exact(size)
                     if self._read_exact(1) != b"\n":
                         raise RuntimeError("invalid engine DATA terminator")
+                    request_id = fields[1]
+                    lp = fields[4]
+                    with self.pending_lock:
+                        events = self.pending.get(request_id)
+                    if events is not None:
+                        events.put(("echo", {
+                            "pos": int(fields[3]),
+                            # " nan 0" = niente su cui condizionare: la prima
+                            # posizione assoluta non ha un predittore.
+                            "logprob": None if lp in ("nan", "-nan") else float(lp),
+                            "text": piece.decode("utf-8", "replace"),
+                        }))
                 elif kind == "ACCEPT" and len(fields) >= 3:
                     # #597: the engine validated the submission (fits context) before prefill.
                     # Keep it pending — DATA/DONE still follow — and let generate() commit the
@@ -3148,7 +3172,7 @@ class Engine:
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
-                 on_tool=None, image=None):
+                 on_tool=None, image=None, logprobs=0, pin=False, on_echo=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -3205,9 +3229,18 @@ class Engine:
                       default=0)
             if cut > 0:
                 prefix_field = f" {len(xpayload)} {len(prompt[:cut].encode('utf-8'))}"
+        # Chiavi di estensione (decode_batch.h): logprobs=k accende la lettura
+        # del prefill, pin=1 fotografa lo stato a fine prompt. Una richiesta
+        # che non le manda produce un header identico a prima, byte per byte.
+        ext = ""
+        if logprobs:
+            ext += f" logprobs={int(logprobs)}"
+        if pin:
+            ext += " pin=1"
         header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
                   f"{temperature:.8g} {top_p:.8g}"
                   + (prefix_field if prefix_field else (f" {len(xpayload)}" if xpayload else ""))
+                  + ext
                   + "\n").encode()
         try:
             with self.write_lock:
@@ -3289,6 +3322,13 @@ class Engine:
                         with self.write_lock:
                             self.process.stdin.write(f"CANCEL {request_id}\n".encode())
                             self.process.stdin.flush()
+            elif kind == "echo":
+                # Lettura del prefill: arriva PRIMA di ogni DATA e non e' testo
+                # generato, quindi non passa da decode() e non entra nella
+                # risposta. La consuma chi ha chiesto il canale.
+                _accept({"prompt_tokens": None})
+                if on_echo is not None:
+                    on_echo(value)
             elif kind == "tool":
                 _accept({"prompt_tokens": None})
                 if not cancel_sent and not stop_sent:
@@ -3827,6 +3867,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.chat_completion(body, request_id)
             elif path == "/v1/completions":
                 self.completion(body, request_id)
+            elif path == "/v1/brio":
+                self.brio(body, request_id)
             elif path == "/v1/messages":
                 self.anthropic_messages(body, request_id)
             else:
@@ -3844,6 +3886,155 @@ class APIHandler(BaseHTTPRequestHandler):
                                     None, "engine_error", "server_error"), request_id)
             except OSError:
                 pass
+
+
+    # ---------------------------------------------------------------- modalita brio
+    #
+    # Il modello non genera: si legge il logprob di ogni opzione ammessa e si
+    # normalizza sulle sole opzioni. Torna una distribuzione, non una stringa.
+    #
+    # PERCHE' IL CICLO STA QUI E NON NEL CLIENT. Servono tre cose facili da
+    # sbagliare: fotografare il prefisso condiviso (pin) cosi ogni opzione paga
+    # solo i propri token; NON mettere l'elenco delle opzioni nel prompt (su
+    # qwen36 erano 48 token su 123, meta del risparmio); e normalizzare per
+    # lunghezza, perche' sommare i logprob penalizza le opzioni da piu token --
+    # misurato, la somma diceva "merge" dove la generazione greedy dello stesso
+    # modello diceva "request changes". Un client che rifacesse questo ciclo
+    # sbaglierebbe una di queste tre, e il risultato resterebbe plausibile.
+    #
+    # COSA TORNA. Non solo il vincitore: la probabilita di OGNI opzione e
+    # l'entropia. E' la differenza con la generazione, che una risposta la da
+    # sempre e con la stessa faccia: qui "non lo so" e' un numero.
+    def brio(self, body, request_id):
+        options = body.get("options")
+        if not isinstance(options, list) or not options:
+            raise APIError(400, "`options` must be a non-empty array of strings.", "options")
+        if len(options) > 64:
+            raise APIError(400, "`options` accepts at most 64 entries.", "options")
+        seen = set()
+        for option in options:
+            if not isinstance(option, str) or not option.strip():
+                raise APIError(400, "Every option must be a non-empty string.", "options")
+            if option in seen:
+                raise APIError(400, f"Duplicate option: {option!r}.", "options")
+            seen.add(option)
+        question = body.get("question")
+        if question is not None and not isinstance(question, str):
+            raise APIError(400, "`question` must be a string.", "question")
+        state = body.get("state")
+        messages = body.get("messages")
+        if state is not None and not isinstance(state, str):
+            raise APIError(400, "`state` must be a string.", "state")
+        if state is None and isinstance(messages, list):
+            # La conversazione in corso FA da stato: e' quello che la TUI manda
+            # quando si scrive /brio a meta chat.
+            parts = []
+            for message in messages:
+                if not isinstance(message, dict):
+                    raise APIError(400, "Every message must be an object.", "messages")
+                content = message.get("content")
+                if isinstance(content, list):
+                    content = "".join(piece.get("text", "") for piece in content
+                                      if isinstance(piece, dict))
+                if content:
+                    parts.append(f"{message.get('role', 'user')}: {content}")
+            state = "\n".join(parts)
+        if not state and not question:
+            raise APIError(400, "Provide `state`, `messages` or `question`.", "state")
+        normalize = body.get("normalize", "mean")
+        if normalize not in ("mean", "sum"):
+            raise APIError(400, "`normalize` must be \"mean\" or \"sum\".", "normalize")
+        # Lo slot si sceglie dallo STATO, non dalla domanda: mille domande
+        # diverse sullo stesso contesto devono cadere sullo stesso slot, o la
+        # fotografia del prefisso condiviso non le serve a niente. E' la stessa
+        # regola di conversation_cache_slot per la chat, con la chiave presa
+        # dalla parte che non cambia.
+        cache_slot = body.get("cache_slot")
+        if cache_slot is None:
+            cache_slot = conversation_cache_slot(
+                [{"role": "system", "content": state or ""}], self.server.kv_slots)
+        if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) \
+                or not 0 <= cache_slot < self.server.kv_slots:
+            raise APIError(400, "Invalid cache slot.", "cache_slot")
+
+        prefix = ""
+        if state:
+            prefix += f"Context:\n{state}\n\n"
+        if question:
+            prefix += f"Question: {question}\n"
+        prefix += "Answer:"
+
+        started = time.time()
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+            queue_wait, cache_slot = admission
+
+            def score(text, pin):
+                """Un giro sul motore: niente generazione, solo la lettura.
+
+                max_tokens=0 vale solo con logprobs>0 e vuol dire "leggi il
+                prompt e fermati". Chiedere un token costerebbe un passo di
+                decodifica completo per opzione, buttato via."""
+                echoes = []
+                accepted = {}
+
+                def on_accept(value):
+                    accepted.update(value)
+
+                self.server.engine.generate(
+                    text, 0, 0.0, 1.0, lambda _chunk: None, cache_slot,
+                    self.client_disconnected, logprobs=1, pin=pin,
+                    on_echo=echoes.append, on_accept=on_accept)
+                return accepted.get("prompt_tokens"), echoes
+
+            # 1) il prefisso condiviso, fotografato una volta
+            n_prefix, echoes = score(prefix, True)
+            if n_prefix is None:                     # motore senza ACCEPT (olmoe)
+                n_prefix = max((e["pos"] for e in echoes), default=-1) + 1
+
+            # 2) un giro per opzione: paga solo i propri token
+            scored = []
+            for option in options:
+                # Il cliente se n'e andato: smettere subito invece di macinare
+                # le opzioni restanti per nessuno. Con una sola slot KV un menu
+                # lungo abbandonato la terrebbe occupata per minuti, e le
+                # richieste dietro andrebbero in coda fino al timeout -- e'
+                # cosi che sono usciti i primi 429.
+                if self.client_disconnected():
+                    raise ClientCancelled()
+                _, tail = score(prefix + " " + option, False)
+                rows = [e for e in tail if e["pos"] >= n_prefix and e["logprob"] is not None]
+                total = sum(e["logprob"] for e in rows)
+                count = max(len(rows), 1)
+                scored.append({"option": option, "logprob": total, "tokens": len(rows),
+                               "mean_logprob": total / count})
+
+        if not any(entry["tokens"] for entry in scored):
+            raise APIError(502, "The engine returned no log probabilities for the options.",
+                           None, "engine_error", "server_error")
+        key = "mean_logprob" if normalize == "mean" else "logprob"
+        top = max(entry[key] for entry in scored)
+        weights = [math.exp(entry[key] - top) for entry in scored]
+        total_weight = sum(weights) or 1.0
+        for entry, weight in zip(scored, weights):
+            entry["p"] = weight / total_weight
+        scored.sort(key=lambda entry: -entry["p"])
+        entropy = -sum(e["p"] * math.log(max(e["p"], 1e-12)) for e in scored)
+        entropy /= math.log(max(len(scored), 2))
+
+        self.send_json(200, {
+            "id": "brio-" + uuid.uuid4().hex,
+            "object": "brio.choice",
+            "created": int(time.time()),
+            "model": self.server.model_id,
+            "answer": scored[0]["option"],
+            "entropy": round(entropy, 6),
+            "normalize": normalize,
+            "choices": scored,
+            "usage": {"prompt_tokens": n_prefix, "completion_tokens": 0,
+                      "read_tokens": sum(e["tokens"] for e in scored),
+                      "total_tokens": n_prefix + sum(e["tokens"] for e in scored)},
+        }, request_id, {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000)),
+                        "x-colibri-elapsed-ms": str(round((time.time() - started) * 1000))})
 
     def _fail(self, error, request_id):
         """Report an error, unless the response is already on the wire. Once a streaming 200

@@ -4,6 +4,7 @@ import App from "./App"
 import { ErrorBoundary } from "./ErrorBoundary"
 import { LocaleProvider } from "./i18n"
 import "./index.css"
+import "./chat-design.css"
 
 createRoot(document.getElementById("root")!).render(
   <ErrorBoundary>

@@ -19,7 +19,7 @@
           },
           {
             "group": "Serve models",
-            "pages": ["api-reference/overview", "api", "serve_protocol"]
+            "pages": ["api-reference/overview", "api", "brio", "serve_protocol"]
           },
           {
             "group": "Model engines",

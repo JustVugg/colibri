@@ -819,6 +819,16 @@ extern "C" int coli_metal_init(void) {
     if (e && atoi(e) == 0) g_rtop8_par = 0; }
   @autoreleasepool {
     g_dev = MTLCreateSystemDefaultDevice();
+    // MTLCreateSystemDefaultDevice() resolves the *display* device, so it is nil with no
+    // window-server session (ssh, CI, a launchd job) and on Intel Macs whose GPU is not the
+    // system default -- the card is still there and MTLCopyAllDevices() enumerates it. Prefer
+    // a non-low-power device, the same discrete>integrated ranking backend_vulkan.c applies,
+    // so a dual-GPU Mac does not land on the iGPU.
+    if (!g_dev) {
+      NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();     // NS_RETURNS_RETAINED, ARC releases
+      for (id<MTLDevice> d in all) if (![d isLowPower]) { g_dev = d; break; }
+      if (!g_dev && [all count]) g_dev = [all objectAtIndex:0];
+    }
     if (!g_dev) return 0;
     g_queue = [g_dev newCommandQueue];
     NSError *err = nil;

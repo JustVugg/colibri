@@ -63,7 +63,8 @@
 #include "quant.h"
 #include "sparse_attn.h"
 #include "omp_tune.h"
-#include "kv_prefix.h"   /* riuso del prefisso tra turni (shared) */
+#include "kv_prefix.h"
+#include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
 #include <pthread.h>   /* ehit_mark publishes the lazy HITS table under a lock */
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -2971,18 +2972,46 @@ static int spec_step(Model *m, int token, int start_pos, int main_rows,
     return block;
 }
 
-static void forward_full(Model *m, const int *ids, int n, float *logits, int all_logits,
+/* `spec_batch` dice che queste righe sono un lotto di verifica speculativa, e
+ * cambia il calcolo: schedule di pubblicazione per riga e buffer di rollback.
+ * `keep_rows` dice soltanto di TENERE i logit di ogni posizione invece della
+ * sola ultima, e non cambia niente altro. Erano lo stesso parametro, e usarlo
+ * per leggere il prefill faceva prendere a un prefill lo schedule del decode:
+ * righe diverse dell'indice, top-k diverso, numeri plausibili e sbagliati.
+ * Sul fixture minuscolo uscivano NaN, che e come si e visto. */
+static void forward_full(Model *m, const int *ids, int n, float *logits, int spec_batch,
                          const float *image_rows, int image_at, int image_h, int image_w,
-                         const uint8_t *image_mask);
+                         const uint8_t *image_mask, int keep_rows);
+
+/* Fotografia dello stato e lettura del prefill, per il canale logprobs.
+ *
+ * Qui e piu semplice che su qwen36: questo motore e ad attenzione pura, quindi
+ * non c'e stato ricorrente da salvare. Riavvolgere vuol dire solo dichiarare
+ * che il prefisso tenuto e quello fotografato: le righe KV di quelle posizioni
+ * non sono state toccate da nessuno. Si salvano gli id e il vettore di logit
+ * finale, che e il predittore del primo token fresco. */
+static ColiPinPool g_pins;               /* piu scatti annidati, vedi pin_pool.h */
+static const float *g_pin_logit = NULL;
+static int    g_pin_use_logit = 0;
+
+static void v41_echo(const char *id, int pos, int token, const float *lo, int V, int k,
+                     Tok *tokenizer) {
+    char tail[1024]; coli_logprob_tail(tail, sizeof tail, lo, V, token, k);
+    char piece[512]; int n = tok_decode(tokenizer, &token, 1, piece, (int)sizeof(piece));
+    if (n < 0) n = 0;
+    printf("ECHO %s %d %d%s\n", id, n, pos, tail);
+    if (n > 0) fwrite(piece, 1, (size_t)n, stdout);
+    fputc('\n', stdout); fflush(stdout);
+}
 
 static void forward(Model *m, const int *ids, int n, float *logits) {
-    forward_full(m, ids, n, logits, 0, NULL, -1, 0, 0, NULL);
+    forward_full(m, ids, n, logits, 0, NULL, -1, 0, 0, NULL, 0);
 }
 
 static void forward_with_image(Model *m, const int *ids, int n, float *logits,
                                const float *image_rows, int image_at, int image_h, int image_w,
                                const uint8_t *image_mask) {
-    forward_full(m, ids, n, logits, 0, image_rows, image_at, image_h, image_w, image_mask);
+    forward_full(m, ids, n, logits, 0, image_rows, image_at, image_h, image_w, image_mask, 0);
 }
 
 /* Several positions past the prompt, with one row of logits each: what a speculative
@@ -2992,12 +3021,12 @@ static void forward_with_image(Model *m, const int *ids, int n, float *logits,
  * tokens decoded one at a time, because a draft is only worth anything if accepting it
  * is indistinguishable from having generated it. */
 static void forward_batch(Model *m, const int *ids, int n, float *logits) {
-    forward_full(m, ids, n, logits, 1, NULL, -1, 0, 0, NULL);
+    forward_full(m, ids, n, logits, 1, NULL, -1, 0, 0, NULL, 0);
 }
 
-static void forward_full(Model *m, const int *ids, int n, float *logits, int all_logits,
+static void forward_full(Model *m, const int *ids, int n, float *logits, int spec_batch,
                          const float *image_rows, int image_at, int image_h, int image_w,
-                         const uint8_t *image_mask) {
+                         const uint8_t *image_mask, int keep_rows) {
     Cfg *c = &m->c;
     int dim = c->dim, hc = c->hc_mult;
     int start_pos = m->pos;
@@ -3009,7 +3038,7 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int all
     m->pub_rows = 0;
     /* Only the speculative verify batch is ever rolled back (spec_verify is its
      * only caller), and only it may write the per-layer undo buffers. */
-    m->rollback_save = all_logits;
+    m->rollback_save = spec_batch;
     /* Several positions at once is either the speculative verify batch, which
      * needs this per-row schedule because its rows are consecutive decode steps,
      * or a prefill, which reads its index owner's keys for the whole chunk. The
@@ -3018,9 +3047,9 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int all
      * resumes mid-sequence is many rows past position 0 and is still a prefill:
      * given the decode schedule it reads a different layer's keys than the same
      * positions read when they were prefilled cold, and picks a different
-     * index top-k. `all_logits` is what actually distinguishes the two --
+     * index top-k. `spec_batch` is what actually distinguishes the two --
      * spec_verify is its only caller. */
-    if (n > 1 && all_logits) {
+    if (n > 1 && spec_batch) {
         m->pub_layer = realloc(m->pub_layer, (size_t)n * sizeof(int));
         if (!m->pub_layer) { fprintf(stderr, "OOM sizing the publish schedule\n"); exit(1); }
         m->pub_rows = n;
@@ -3168,7 +3197,8 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int all
     }
 
     /* the last block's FFN mix collapses the stream one final time */
-    for (int t = all_logits ? 0 : n - 1; t < n; t++) {
+    int rows_out = spec_batch || keep_rows;
+    for (int t = rows_out ? 0 : n - 1; t < n; t++) {
         const float *mix = pre_mix + (size_t)t * hc;
         for (int i = 0; i < dim; i++) {
             float sum = 0.0f;
@@ -3178,9 +3208,9 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int all
         }
         if (t == n - 1) trace("final", -1, collapsed, dim);
         rms_into(branch_in, collapsed, m->norm.w, dim, c->norm_eps);
-        mvb(logits + (size_t)(all_logits ? t : 0) * c->vocab, &m->head, branch_in);
+        mvb(logits + (size_t)(rows_out ? t : 0) * c->vocab, &m->head, branch_in);
     }
-    trace("logits", -1, logits + (size_t)(all_logits ? n - 1 : 0) * c->vocab, c->vocab);
+    trace("logits", -1, logits + (size_t)(rows_out ? n - 1 : 0) * c->vocab, c->vocab);
 
     m->pos += n;
     /* Recorded where the tokens entered the state, and only for the MAIN stream:
@@ -3568,6 +3598,29 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
         int reuse = 0;
         if (n_prompt >= 1 && kv_prefix_on() && !pending_image)
             reuse = kv_prefix_reuse(&m->kvp, ids, n_prompt);
+        /* La fotografia si prova sempre: copre anche il caso in cui lo stato
+         * vivo e gia il prompt, dove senza di essa il primo token fresco
+         * resterebbe senza predittore e quindi senza logprob. */
+        g_pin_use_logit = 0; g_pin_logit = NULL;
+        if (n_prompt >= 1 && !pending_image) {
+            /* Il piu profondo degli scatti valido: con due livelli annidati
+             * (istruzioni, istruzioni+domanda) vince il secondo, e se le sue
+             * righe non ci sono piu si ripiega sul primo. */
+            int ps = coli_pin_best(&g_pins, ids, n_prompt);
+            while (ps >= 0) {
+                ColiPin *k = &g_pins.slot[ps];
+                if (kv_prefix_holds(&m->kvp, k->ids, k->len)) {
+                    kv_prefix_clear(&m->kvp);
+                    kv_prefix_record(&m->kvp, k->ids, 0, k->len);
+                    reuse = k->len;
+                    g_pin_logit = k->logit; g_pin_use_logit = k->logit != NULL;
+                    coli_pin_touch(&g_pins, ps);
+                    break;
+                }
+                k->len = 0;
+                ps = coli_pin_best(&g_pins, ids, n_prompt);
+            }
+        }
         if (getenv("COLI_PREFIX_LOG")) {
             if (reuse)
                 fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
@@ -3585,7 +3638,12 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             coli_serve_write_error(stdout, command.id, "EMPTY_PROMPT");
             coli_serve_command_dispose(&command); continue;
         }
-        int budget = command.max_tokens > 0 ? command.max_tokens : 256;
+        /* max_tokens=0 con logprobs>0 vuol dire "leggi e fermati": non e un
+         * valore mancante da rimpiazzare con un default, ed e' proprio il caso
+         * in cui un menu chiuso non vuole pagare un passo di decodifica per
+         * opzione. Senza logprobs 0 resta "non specificato" -> 256, come prima. */
+        int budget = command.max_tokens > 0 ? command.max_tokens
+                   : (command.logprobs > 0 ? 0 : 256);
         if (n_prompt + budget > c->max_positions) {
             char message[128];
             snprintf(message, sizeof(message), "CONTEXT_EXCEEDED %d %d",
@@ -3626,9 +3684,40 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
         free(pending_image); pending_image = NULL;
         /* `reuse` is the ABSOLUTE position of the first fresh token: every cache
          * here is position-indexed, so this has to be the real offset. */
+        int nfresh = n_prompt - reuse;
+        float *all = NULL;
+        int echoed = 0;   /* il prefill l'ha gia fatto il ramo della lettura */
+        if (command.logprobs > 0 && nfresh > 0 && !pending_image) {
+            all = (float *)malloc((size_t)nfresh * (size_t)c->vocab * sizeof(float));
+            if (all) {
+                /* un prefill normale (spec_batch=0) che tiene tutte le righe */
+                forward_full(m, ids + reuse, nfresh, all, 0, NULL, -1, 0, 0, NULL, 1);
+                /* La posizione p predice il token p+1; il primo token fresco e
+                 * predetto dalla fotografia. Cosi ogni token dell'opzione ha il
+                 * suo logprob, anche se non e fra i primi k di nessuna classifica. */
+                if (g_pin_use_logit && g_pin_logit)
+                    v41_echo(command.id, reuse, ids[reuse], g_pin_logit, c->vocab,
+                             command.logprobs, tokenizer);
+                for (int p = 0; p + 1 < nfresh; p++)
+                    v41_echo(command.id, reuse + p + 1, ids[reuse + p + 1],
+                             all + (size_t)p * c->vocab, c->vocab, command.logprobs, tokenizer);
+                memcpy(logits, all + (size_t)(nfresh - 1) * c->vocab,
+                       (size_t)c->vocab * sizeof(float));
+                free(all);
+                echoed = 1;
+            }
+        }
+        if (!echoed)
         forward_with_image(m, ids + reuse, n_prompt - reuse, logits, aligned,
                            image_at, image_h, image_w, image_mask);
         free(aligned); free(image_mask);
+        if (command.pin) {
+            coli_pin_pool_init(&g_pins, c->vocab);
+            if (coli_pin_store(&g_pins, ids, n_prompt, logits)) {
+                fprintf(stderr, "[PIN] scatto a %d token\n", n_prompt);
+                fflush(stderr);
+            }
+        }
         uint64_t prefill_bytes = m->expert_bytes - ebytes0;
         double prefill_disk = m->t_disk - disk0;
         double prefill_expert = m->t_expert - expert0, prefill_wall = now_s() - turn_started;
@@ -3647,7 +3736,15 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             for (int i = 0; i < n_eos; i++) if (token == eos_ids[i]) stop = 1;
             if (stop) { limited = 0; break; }
             int written = tok_decode(tokenizer, &token, 1, piece, (int)sizeof(piece));
-            if (written > 0) coli_serve_write_data(stdout, command.id, piece, (size_t)written);
+            if (written > 0) {
+                if (command.logprobs > 0) {
+                    /* La distribuzione da cui il token e stato estratto e ancora
+                     * quella in `logits`: serve_sample non la modifica. */
+                    char lp[1024];
+                    coli_logprob_tail(lp, sizeof lp, logits, c->vocab, token, command.logprobs);
+                    coli_serve_write_data_lp(stdout, command.id, piece, (size_t)written, lp);
+                } else coli_serve_write_data(stdout, command.id, piece, (size_t)written);
+            }
             emitted++;
             /* #1332: look at stdin once per token so a client that walked away stops
              * paying for a turn nobody wants. A CANCEL aborts, a STOP ends it through
@@ -3689,7 +3786,13 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
                 for (int k = 0; k < n_eos; k++) if (drafted_token == eos_ids[k]) drafted_stop = 1;
                 if (drafted_stop) { limited = 0; done_early = 1; break; }
                 written = tok_decode(tokenizer, &drafted_token, 1, piece, (int)sizeof(piece));
-                if (written > 0) coli_serve_write_data(stdout, command.id, piece, (size_t)written);
+                if (written > 0) {
+                    if (command.logprobs > 0) {
+                        char lp[1024];
+                        coli_logprob_tail(lp, sizeof lp, logits, c->vocab, token, command.logprobs);
+                        coli_serve_write_data_lp(stdout, command.id, piece, (size_t)written, lp);
+                    } else coli_serve_write_data(stdout, command.id, piece, (size_t)written);
+                }
                 emitted++;
             }
         }

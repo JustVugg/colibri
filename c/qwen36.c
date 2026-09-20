@@ -61,7 +61,9 @@ static int qwen36_max_ctx(void) {
 #include "cli_args.h"
 #include "st.h"
 #include "omp_tune.h"
-#include "kv_prefix.h"   /* riuso del prefisso tra turni (shared) */
+#include "kv_prefix.h"
+#include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
+#include "decode_batch.h" /* ColiSubmit + coli_submit_ext: le chiavi key=value di SUBMIT */
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
@@ -2405,6 +2407,42 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
     free(nrm); free(tmp);
 }
 
+/* Fotografia dello stato dopo un prefill "pinnato" (SUBMIT pin=1).
+ *
+ * A cosa serve. Punteggiare un menu chiuso significa mandare N volte
+ * "prompt + opzione_i". Il prefisso condiviso e sempre lo stesso, ma
+ * kv_prefix.h e tutto-o-niente: dopo l'opzione 1 lo stato tenuto e
+ * "prompt + opzione_1", che NON e un prefisso di "prompt + opzione_2", e si
+ * ricomincia da capo. Misurato su qwen36: 0,90 s quando il riuso prende,
+ * 40 s quando non prende.
+ *
+ * Perche una fotografia e non il riuso parziale. Tenere il prefisso comune e
+ * ricalcolare dalla divergenza e corretto per l'attenzione, che guarda solo
+ * indietro, ma NON per gli strati ricorrenti: lo stato di una ricorrenza non
+ * si riavvolge a una posizione arbitraria. qwen36 ha 30 layer lineari su 40.
+ * Una fotografia invece funziona ovunque, perche riporta lo stato a un punto
+ * in cui c'e davvero stato.
+ *
+ * Cosa contiene. Le righe KV delle posizioni del prompt non si copiano: non
+ * sono state toccate, basta riportare indietro kv_len. Si copiano lo stato
+ * ricorrente (DN_rec + DN_conv, ~63 MB su questo modello) e il vettore di
+ * logit finale, cosi il predittore del primo token fresco esiste e la lettura
+ * del prefill copre anche quello. */
+static ColiPinPool g_pins;              /* piu scatti annidati, vedi pin_pool.h */
+static const float *g_pin_logit = NULL; /* logit dello scatto rimesso */
+static int    g_pin_use_logit = 0;   /* 1 quando questa richiesta e ripartita dalla fotografia */
+
+/* Lo stato che questo motore deve fotografare oltre alle righe K/V: la
+ * ricorrenza e la finestra di convoluzione di ogni strato DeltaNet. Sono
+ * decine di MB per scatto, quindi COLI_PIN_SLOTS conta davvero qui. */
+typedef struct { float **rec, **conv; int n_layers; } Q36PinState;
+
+/* Stato della lettura del prefill: dichiarato qui perche step() lo consulta e
+ * step() viene prima del codice di servizio che lo accende. */
+static int   g_echo_k  = 0;      /* 0 = spento */
+static const char *g_echo_id = NULL;
+static void serve_echo(const char *id, int pos, int token, const float *lo, int V, int k);
+
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     if (m->resident_mode && m->first_step) m->resident_collecting = 1;
@@ -2438,6 +2476,27 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens) pin_hot_experts(m);
     m->kv_len = pos_base + S;
+    /* Lettura del prefill: una passata di lm_head per posizione, pagata SOLO
+     * dalle richieste che hanno chiesto il canale. La posizione p predice il
+     * token p+1, quindi si copre l'intero blocco fresco tranne il suo primo
+     * token, il cui predittore sta nello stato precedente. Per questo il
+     * chiamante arretra di uno il riuso del prefisso quando la lettura e
+     * accesa: cosi il primo token dell'opzione ricade sempre qui dentro. */
+    if (g_echo_k > 0 && g_echo_id && S > 0) {
+        float *erow = falloc(D), *elog = falloc(c->vocab);
+        /* Il primo token fresco e predetto dallo stato PRECEDENTE, che dopo un
+         * riavvolgimento e proprio quello fotografato: senza questi logit
+         * l'opzione perderebbe il suo primo token, che spesso e l'unico. */
+        if (g_pin_use_logit && g_pin_logit)
+            serve_echo(g_echo_id, pos_base, ids[0], g_pin_logit, c->vocab, g_echo_k);
+        for (int p = 0; p + 1 < S; p++) {
+            rmsnorm_row(erow, x + (int64_t)p*D, m->final_norm, D, c->eps);
+            if (!qt_lmhead_matmul(elog, erow, D, c->vocab))
+                matmul_d(elog, erow, m->lm_head, 1, D, c->vocab);
+            serve_echo(g_echo_id, pos_base + p + 1, ids[p+1], elog, c->vocab, g_echo_k);
+        }
+        free(erow); free(elog);
+    }
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
@@ -2572,6 +2631,96 @@ static float *g_last_logit = NULL;
 /* Zero the DeltaNet recurrent state so a new request doesn't inherit the
  * previous conversation's hidden state. Must be called at the start of every
  * generation (the CLI runs once, so this is also correct there). */
+static void q36_pin_state_free(void *v){
+    Q36PinState *st = (Q36PinState *)v;
+    if (!st) return;
+    for (int i = 0; i < st->n_layers; i++){
+        if (st->rec)  free(st->rec[i]);
+        if (st->conv) free(st->conv[i]);
+    }
+    free(st->rec); free(st->conv); free(st);
+}
+
+static void pin_drop(void){
+    coli_pin_pool_clear(&g_pins, q36_pin_state_free);
+    g_pin_logit = NULL; g_pin_use_logit = 0;
+}
+
+static Q36PinState *q36_pin_state_save(Model *m, Q36PinState *reuse){
+    Cfg *c = &m->c;
+    size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim;
+    size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
+    Q36PinState *st = reuse;
+    if (st && st->n_layers != c->n_layers) { q36_pin_state_free(st); st = NULL; }
+    if (!st){
+        st = (Q36PinState *)calloc(1, sizeof(*st));
+        if (!st) return NULL;
+        st->n_layers = c->n_layers;
+        st->rec  = (float**)calloc((size_t)c->n_layers, sizeof(float*));
+        st->conv = (float**)calloc((size_t)c->n_layers, sizeof(float*));
+        if (!st->rec || !st->conv) { q36_pin_state_free(st); return NULL; }
+        for (int i = 0; i < c->n_layers; i++){
+            if (c->is_attn[i]) continue;
+            st->rec[i]  = (float*)malloc(nr * sizeof(float));
+            st->conv[i] = (float*)malloc(nc * sizeof(float));
+            if (!st->rec[i] || !st->conv[i]) { q36_pin_state_free(st); return NULL; }
+        }
+    }
+    for (int i = 0; i < c->n_layers; i++){
+        if (c->is_attn[i]) continue;
+        if (m->DN_rec[i]  && st->rec[i])  memcpy(st->rec[i],  m->DN_rec[i],  nr * sizeof(float));
+        if (m->DN_conv[i] && st->conv[i]) memcpy(st->conv[i], m->DN_conv[i], nc * sizeof(float));
+    }
+    return st;
+}
+
+static void pin_save(Model *m, const int *ids, int n, const float *logit){
+    Cfg *c = &m->c;
+    coli_pin_pool_init(&g_pins, c->vocab);
+    ColiPin *k = coli_pin_store(&g_pins, ids, n, logit);
+    if (!k) return;                       /* ottimizzazione, mai un errore */
+    Q36PinState *st = q36_pin_state_save(m, (Q36PinState *)k->state);
+    if (!st) { k->len = 0; return; }      /* senza stato lo scatto sarebbe una bugia */
+    k->state = st;
+    fprintf(stderr, "[PIN] scatto a %d token\n", n); fflush(stderr);
+}
+
+/* Se la fotografia e un prefisso del nuovo prompt, la si rimette e si riparte
+ * da li. Restituisce quanti token sono gia fatti, 0 se non si applica. */
+static int pin_restore(Model *m, const int *ids, int n){
+    Cfg *c = &m->c;
+    size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim;
+    size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
+    g_pin_logit = NULL;
+    /* Il piu profondo degli scatti che sia un prefisso stretto di questo
+     * prompt. Gli strati di attenzione non stanno nella fotografia: le loro
+     * righe K/V restano dove sono, e se i banchi sono stati ributtati quelle
+     * righe non descrivono piu niente -- solo il registro del prefisso lo sa
+     * (kv_prefix_holds). Uno scatto orfano si butta e si riprova col
+     * precedente, invece di rinunciare e rifare tutto da zero. */
+    int s = coli_pin_best(&g_pins, ids, n);
+    while (s >= 0) {
+        ColiPin *k = &g_pins.slot[s];
+        Q36PinState *st = (Q36PinState *)k->state;
+        if (st && kv_prefix_holds(&m->kvp, k->ids, k->len)) {
+            for (int i = 0; i < c->n_layers; i++){
+                if (c->is_attn[i]) continue;
+                if (m->DN_rec[i]  && st->rec[i])  memcpy(m->DN_rec[i],  st->rec[i],  nr * sizeof(float));
+                if (m->DN_conv[i] && st->conv[i]) memcpy(m->DN_conv[i], st->conv[i], nc * sizeof(float));
+            }
+            m->kv_len = k->len;
+            kv_prefix_clear(&m->kvp);
+            kv_prefix_record(&m->kvp, k->ids, 0, k->len);
+            g_pin_logit = k->logit;
+            coli_pin_touch(&g_pins, s);
+            return k->len;
+        }
+        k->len = 0;
+        s = coli_pin_best(&g_pins, ids, n);
+    }
+    return 0;
+}
+
 static void reset_recurrent(Model *m){
     Cfg *c = &m->c;
     /* Paired with the record on purpose: whoever zeroes the state must also
@@ -2747,7 +2896,10 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
  * session hangs forever (#748). compat.h's coli_serve_binary_mode (#749)
  * carries that fix for every engine; see its comment for the full story. */
 
-typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } ServeReq;
+typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen;
+                 int logprobs;   /* SUBMIT logprobs=k: 0 = canale spento (opt-in) */
+                 int pin;        /* SUBMIT pin=1: fotografa lo stato dopo il prefill */
+               } ServeReq;
 
 static int serve_read_req(ServeReq *q){
     char line[512], cmd[16], id[64];
@@ -2757,10 +2909,46 @@ static int serve_read_req(ServeReq *q){
     if(strcmp(cmd,"SUBMIT")) return 0;
     int slot, plen, max_tok; float temp, top_p;
     if(sscanf(line,"%*s %*s %d %d %d %f %f",&slot,&plen,&max_tok,&temp,&top_p)!=5 ||
-       plen<0||plen>(1<<24)||max_tok<1){
+       plen<0||plen>(1<<24)||max_tok<0){   /* 0 = modalita jev, vedi sotto */
         printf("ERROR %s bad submit header\n",id); fflush(stdout); return 0;
     }
     (void)slot;
+    /* Le chiavi key=value stanno dopo i campi fissi. Si riusa il parser
+     * condiviso di decode_batch.h invece di scriverne un secondo: e lo stesso
+     * namespace che colibri.c gia accetta, quindi i due motori non divergono.
+     * Un client vecchio non manda nessuna chiave e finisce a logprobs=0. */
+    q->logprobs = 0;
+    q->pin = 0;
+    {
+        /* Stessa tecnica di coli_submit_parse: %n da l'offset dopo i campi
+         * numerici, e la chiave deve essere separata da spazio (altrimenti
+         * "1logprobs=5" sarebbe un campo malformato, non un opt-in). Qui i
+         * campi fissi sono 6 e non 7, perche questo header non ha gbytes. */
+        int base = 0;
+        int sd, sp_, smt; float st, stp;
+        if (sscanf(line, "%*s %*s %d %d %d %f %f%n", &sd, &sp_, &smt, &st, &stp, &base) == 5 &&
+            base > 0 && (line[base] == ' ' || line[base] == '\t')) {
+            /* coli_submit_ext rifiuta qualunque byte non-spazio dopo il valore,
+             * e fgets lascia il '\n' in fondo: va tolto, o "logprobs=5\n" e
+             * un valore con spazzatura attaccata. Si lavora su una copia per
+             * non toccare la riga che il chiamante ha gia parsato. */
+            char ext_buf[256];
+            snprintf(ext_buf, sizeof ext_buf, "%s", line + base);
+            for (char *e = ext_buf; *e; e++) if (*e == '\n' || *e == '\r') { *e = 0; break; }
+            const char *tail = ext_buf;
+            while (*tail == ' ' || *tail == '\t') tail++;
+            if (*tail) {
+                ColiSubmit ext; memset(&ext, 0, sizeof ext);
+                if (coli_submit_ext(ext_buf, &ext)) { q->logprobs = ext.logprobs; q->pin = ext.pin; }
+                else { printf("ERROR %s bad submit extension\n", id); fflush(stdout); return 0; }
+            }
+        }
+    }
+    /* La convalida di max_tok si chiude QUI, non sopra: 0 e legittimo solo in
+     * modalita jev, e se logprobs c'e si sa solo dopo aver letto le chiavi. */
+    if(max_tok < 1 && !(max_tok == 0 && q->logprobs > 0)){
+        printf("ERROR %s bad submit header\n",id); fflush(stdout); return 0;
+    }
     char *payload=malloc((size_t)plen+1);
     if(!payload){ printf("ERROR %s out of memory\n",id); fflush(stdout); return 0; }
     if(fread(payload,1,(size_t)plen,stdin)!=(size_t)plen){ free(payload); return -1; }
@@ -2769,6 +2957,36 @@ static int serve_read_req(ServeReq *q){
     q->max_tok=max_tok; q->temp=temp; q->top_p=top_p;
     q->payload=payload; q->plen=plen;
     return 2;
+}
+
+/* Coda numerica di un token, formato IDENTICO a logprob_tail di colibri.c:
+ * " <lp> <k> [tid tlp]*k", normalizzata in log-softmax sul vocabolario intero.
+ * Due motori che scrivono lo stesso canale devono scrivere lo stesso formato,
+ * altrimenti il client ne ha due da conoscere. lo==NULL da " nan 0". */
+
+/* Un token -> un frame, con la coda numerica. Si usa SOLO quando il client ha
+ * chiesto logprobs=k: quel client punteggia, non mostra testo, quindi il buffer
+ * UTF-8 (che accorpa i byte di piu token in un DATA) qui sarebbe di intralcio.
+ * Senza logprobs il percorso resta quello di prima, byte per byte. */
+static void serve_data_lp(const char *id, const char *p, int n, const char *tail){
+    printf("DATA %s %d%s\n",id,n,tail);
+    if(n>0) fwrite(p,1,(size_t)n,stdout);
+    fputc('\n',stdout); fflush(stdout);
+}
+
+/* Lettura del prefill (canale logprobs, opt-in). I logit alla posizione p
+ * predicono il token p+1, quindi scorrendo le posizioni fresche si ottiene il
+ * logprob di OGNI token del blocco, non solo dei primi k di una classifica:
+ * e cio che serve a punteggiare un'opzione che non e fra le piu probabili, e
+ * a punteggiarne una di piu token sommando i suoi pezzi.
+ * Vive in variabili globali e non nella firma di step() perche step() e la
+ * matematica: il protocollo non deve entrarci. */
+static void serve_echo(const char *id, int pos, int token, const float *lo, int V, int k){
+    char tail[1024]; coli_logprob_tail(tail,sizeof tail,lo,V,token,k);
+    unsigned char b[256]; int n=0; decode_id_to_bytes(token,b,&n);
+    printf("ECHO %s %d %d%s\n",id,n,pos,tail);
+    if(n>0) fwrite(b,1,(size_t)n,stdout);
+    fputc('\n',stdout); fflush(stdout);
 }
 
 static void serve_data(const char *id, const char *p, int n){
@@ -2906,6 +3124,21 @@ static void serve_one(Model *m, ServeReq *q){
                     (m->kvp.len > 0 && m->kvp.len < np) ? " (diverged)" : "");
         fflush(stderr);
     }
+    /* Con la lettura accesa il riuso arretra di un token: il predittore del
+     * primo token fresco deve ricadere nel blocco che ricalcoliamo, altrimenti
+     * quel token resta senza logprob ed e proprio quello che al chiamante
+     * serve (il primo token dell'opzione). Costa una posizione. */
+    /* La fotografia si prova SEMPRE, non solo quando il riuso vivo fallisce.
+     * Altrimenti la prima opzione (che trova ancora lo stato del prompt e
+     * quindi passa dal riuso normale) resterebbe senza i logit salvati, e il
+     * suo primo token senza logprob: proprio il token che serve. Rimetterla
+     * quando lo stato e gia quello costa una memcpy, non un prefill. */
+    g_pin_use_logit = 0;
+    {
+        int pinned = pin_restore(m, ids, np);
+        if (pinned) { reuse = pinned; g_pin_use_logit = 1; }
+    }
+    g_echo_k = q->logprobs; g_echo_id = q->id;
     if (!reuse) { reset_recurrent(m); m->kv_len = 0; }
     /* Per-REQUEST state, not per-process: without this the server keeps the
      * first request's prefill flag and expert-collection set forever, so
@@ -2919,19 +3152,28 @@ static void serve_one(Model *m, ServeReq *q){
     /* `reuse` is the ABSOLUTE position of the first fresh token: attention and
      * the KV rows are position-indexed, so this has to be the real offset. */
     float *lo = step(m, ids + reuse, np - reuse, reuse);
+    if (q->pin) pin_save(m, ids, np, lo);
     int gen=0, limited=1, forwards=1;   /* il prefill e' il primo forward */
     const double s_disk=m->t_disk, s_attn=tm_sum(0)+tm_sum(1), s_moe=tm_sum(2), s_head=tm_sum(5);
     int eos_ids[4]; int n_eos=serve_eos_ids(eos_ids,4);
     double t0=now_s();
     unsigned char sbuf[16]; int sbn=0;
+    g_echo_k = 0; g_echo_id = NULL;   /* la lettura riguarda il prefill, non la decodifica */
     for(int s=0;s<q->max_tok;s++){
         int tk = serve_sample(lo, m->c.vocab, q->temp, q->top_p);
+        /* La coda si calcola PRIMA della free: dopo, lo non c'e piu. */
+        char lptail[1024]; lptail[0]=0;
+        if(q->logprobs>0) coli_logprob_tail(lptail,sizeof lptail,lo,m->c.vocab,tk,q->logprobs);
         free(lo); lo=NULL;
         int is_eos=0; for(int e=0;e<n_eos;e++) if(tk==eos_ids[e]) is_eos=1;
         if(is_eos){ limited=0; break; }
         unsigned char tmp[256]; int tn=0; decode_id_to_bytes(tk, tmp, &tn);
-        unsigned char chunk[256]; int cn=0; utf8_drain(sbuf,&sbn,tmp,tn,chunk,&cn);
-        if(cn>0) serve_data(q->id,(char*)chunk,cn);
+        if(q->logprobs>0){
+            serve_data_lp(q->id,(char*)tmp,tn,lptail);
+        } else {
+            unsigned char chunk[256]; int cn=0; utf8_drain(sbuf,&sbn,tmp,tn,chunk,&cn);
+            if(cn>0) serve_data(q->id,(char*)chunk,cn);
+        }
         gen++;
         /* #1332: una guardata a stdin per token. Il costo e' una select con
          * timeout zero; il guadagno e' che il gateway smette di aspettare un
@@ -2980,7 +3222,14 @@ static void serve_loop(Model *m){
         ServeReq q={0}; int r;
         do r=serve_read_req(&q); while(r==0);
         if(r<0) return;
-        if(r==2){ serve_one(m,&q); free(q.payload); }
+        /* Resend the grid after EVERY turn, not only after READY: at boot the
+         * expert cache is empty by definition, and that cold snapshot stayed
+         * the only one the dashboard ever saw -- all grey, RAM 0, everything
+         * on disk, forever. HITS was already per turn, which is why the white
+         * "routed now" flash worked while the residency colour never moved.
+         * inkling.c, kimi_k3.c, qwen38.c, deepseek_v41.c and colibri.c
+         * already do this. */
+        if(r==2){ serve_one(m,&q); free(q.payload); emap_emit(m); }
     }
 }
 

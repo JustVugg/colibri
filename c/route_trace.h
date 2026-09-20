@@ -424,4 +424,52 @@ static int rt_router_pick(int best, int kk, int experts, int layer) {
     return kk < experts ? kk : 0;
 }
 
+/* ---- SIGTERM in serve mode: reach rt_save instead of dying before it -------
+ *
+ * The expert history is written once, after the serve loop returns. A server
+ * is not stopped that way: `kill <pid>`, `systemctl stop` and launchd all send
+ * SIGTERM, whose default action kills the process outright. The loop never
+ * returns, rt_save never runs, and a long serving session contributes nothing
+ * to the learned cache -- while one-shot chat mode, which exits on stdin EOF,
+ * saves normally. So the data is collected and then thrown away, which is the
+ * worst of both. Reported in #1629.
+ *
+ * The fix is not a save inside the handler. rt_save() allocates and writes a
+ * file, neither of which is async-signal-safe, and doing it from a handler
+ * that can fire in the middle of the very structures it serialises is how a
+ * good history file becomes a corrupt one. The handler only raises a flag and
+ * lets the blocking read fail; the loop then exits through the SAME path as
+ * stdin EOF, and the existing save at the bottom of main() runs on a quiet
+ * process.
+ *
+ * NO SA_RESTART, deliberately. The serve loop blocks in fgets/getline waiting
+ * for the next request. With SA_RESTART the read silently resumes after the
+ * handler returns, the flag is set and never looked at again, and
+ * `systemctl stop` hangs until its TimeoutStopSec turns into SIGKILL. Without
+ * it the read returns NULL/EINTR, which every serve loop already treats as
+ * "the gateway is gone" -- the path they take on a clean shutdown. colibri.c
+ * carries the same reasoning for its own handler (#810).
+ *
+ * SIGINT is left alone. On these engines it is still the default, immediate
+ * death: making Ctrl-C wait for an in-flight turn, which on a disk-streaming
+ * engine is minutes, would read as a hang. colibri.c can afford a soft SIGINT
+ * because it can end the current turn; these cannot, so they keep the
+ * behaviour their users already expect. */
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#include <signal.h>
+static volatile sig_atomic_t coli_rt_term_flag = 0;
+static void coli_rt_term_handler(int sig) { (void)sig; coli_rt_term_flag = 1; }
+/* Call once, just before entering a serve loop. */
+static inline void coli_rt_term_arm(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = coli_rt_term_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;                       /* see above: SA_RESTART would hang the stop */
+    sigaction(SIGTERM, &sa, NULL);
+}
+#else
+static inline void coli_rt_term_arm(void) {}   /* Windows: no sigaction, behaviour unchanged */
+#endif
+
 #endif /* ROUTE_TRACE_H */

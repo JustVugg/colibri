@@ -38,7 +38,8 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"                    /* shared routing telemetry (#700) */
-#include "kv_prefix.h"   /* riuso del prefisso tra turni (shared) */
+#include "kv_prefix.h"
+#include "pin_pool.h"                       /* piu scatti annidati */   /* riuso del prefisso tra turni (shared) */
 #include "serve_codec.h"
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
@@ -992,6 +993,27 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
     free(nrm); free(tmp);
 }
 
+/* Canale logprobs: coda numerica per token, lettura del prefill, fotografia
+ * dello stato. Questo motore e ad attenzione pura, quindi riavvolgere vuol
+ * dire solo dichiarare che il prefisso tenuto e quello fotografato: le righe
+ * KV di quelle posizioni non le ha toccate nessuno. Si salvano gli id e il
+ * vettore di logit finale, che e il predittore del primo token fresco. */
+static int    g_echo_k = 0;
+static const char *g_echo_id = NULL;
+static ColiPinPool g_pins;             /* piu scatti annidati, vedi pin_pool.h */
+static const float *g_pin_logit = NULL; /* logit dello scatto rimesso, se c'e */
+static int    g_pin_use_logit = 0;
+static Tok   *g_echo_tok = NULL;
+
+static void olmoe_echo(const char *id, int pos, int token, const float *lo, int V, int k){
+    char tail[1024]; coli_logprob_tail(tail, sizeof tail, lo, V, token, k);
+    char piece[512]; int n = g_echo_tok ? tok_decode(g_echo_tok, &token, 1, piece, (int)sizeof piece) : 0;
+    if (n < 0) n = 0;
+    printf("ECHO %s %d %d%s\n", id, n, pos, tail);
+    if (n > 0) fwrite(piece, 1, (size_t)n, stdout);
+    fputc('\n', stdout); fflush(stdout);
+}
+
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     if (g_pilot && m->token_count > 0) {
@@ -1018,6 +1040,21 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
      * the ids those positions were built from, and that invariant is the
      * whole safety argument for reusing them next turn. */
     kv_prefix_record(&m->kvp, ids, pos_base, S);
+    /* Lettura del prefill: un passaggio di lm_head per posizione, pagato solo
+     * da chi ha chiesto il canale. La posizione p predice il token p+1; il
+     * primo token fresco e predetto dalla fotografia. Cosi ogni token di
+     * un'opzione ha il suo logprob, anche fuori dai primi k. */
+    if (g_echo_k > 0 && g_echo_id && S > 0) {
+        float *erow = falloc(D), *elog = falloc(c->vocab);
+        if (g_pin_use_logit && g_pin_logit)
+            olmoe_echo(g_echo_id, pos_base, ids[0], g_pin_logit, c->vocab, g_echo_k);
+        for (int p = 0; p + 1 < S; p++) {
+            rmsnorm_row(erow, x + (int64_t)p*D, m->final_norm, D, c->eps);
+            matmul(elog, erow, m->lm_head, 1, D, c->vocab);
+            olmoe_echo(g_echo_id, pos_base + p + 1, ids[p+1], elog, c->vocab, g_echo_k);
+        }
+        free(erow); free(elog);
+    }
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
@@ -1404,7 +1441,8 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
  * never touched, the same invariant CHAT mode's /reset already relies on
  * (it clears hist_len, not the K/V buffers themselves). */
 
-typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
+typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen;
+                 int logprobs, pin; } SReq;   /* SUBMIT logprobs=k / pin=1 */
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
 static const ColiServeWireProfile olmoe_wire = {
@@ -1441,6 +1479,8 @@ static int serve_read_cmd(FILE *in, FILE *out, const char *cur_id) {
             SReq *q = &g_q[g_qn++];
             snprintf(q->id, sizeof(q->id), "%s", command.id);
             q->max_tok = command.max_tokens;
+            q->logprobs = command.logprobs;
+            q->pin = command.pin;
             q->temp = command.temperature;
             q->top_p = command.top_p;
             q->payload = (char *)coli_serve_command_take_payload(&command);
@@ -1504,6 +1544,31 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
      * kv_prefix_record only ever grows the length, so the stale tail would
      * claim coverage the cache no longer has. */
     int reuse = kv_prefix_off() ? 0 : kv_prefix_reuse(&m->kvp, ids, np);
+    /* La fotografia si prova sempre, non solo quando il riuso vivo fallisce:
+     * altrimenti la prima opzione trova ancora lo stato del prompt, passa dal
+     * riuso normale e il suo primo token resta senza predittore. */
+    g_pin_use_logit = 0; g_pin_logit = NULL;
+    {
+        /* Il piu profondo degli scatti che sia un prefisso di questo prompt.
+         * Con due livelli (istruzioni, istruzioni+domanda) e il secondo a
+         * decidere; se e' morto si ripiega sul primo invece di rifare tutto. */
+        int s = coli_pin_best(&g_pins, ids, np);
+        while (s >= 0) {
+            ColiPin *k = &g_pins.slot[s];
+            if (kv_prefix_holds(&m->kvp, k->ids, k->len)) {
+                kv_prefix_clear(&m->kvp);
+                kv_prefix_record(&m->kvp, k->ids, 0, k->len);
+                m->kv_len = k->len;
+                reuse = k->len;
+                g_pin_logit = k->logit; g_pin_use_logit = k->logit != NULL;
+                coli_pin_touch(&g_pins, s);
+                break;
+            }
+            k->len = 0;                    /* le righe non ci sono piu: scatto orfano */
+            s = coli_pin_best(&g_pins, ids, np);
+        }
+    }
+    g_echo_k = q->logprobs; g_echo_id = q->id; g_echo_tok = T;
     if (!reuse) kv_prefix_clear(&m->kvp);
     if (getenv("COLI_PREFIX_LOG")) {
         if (reuse)
@@ -1525,12 +1590,22 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     float *logit = step(m, ids + reuse, np - reuse, reuse);
     int hist_len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
+    if (q->pin && logit) {
+        coli_pin_pool_init(&g_pins, c->vocab);
+        if (coli_pin_store(&g_pins, ids, np, logit)) {
+            fprintf(stderr, "[PIN] scatto a %d token\n", np); fflush(stderr);
+        }
+    }
+    g_echo_k = 0; g_echo_id = NULL;   /* la lettura riguarda il prefill, non la decodifica */
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
         int nt = pick_tok(logit, c->vocab, -1);
+        char lptail[1024]; lptail[0] = 0;
+        if (q->logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, logit, c->vocab, nt, q->logprobs);
         free(logit); logit = NULL;
         if (is_stop(nt)) { limited = 0; break; }
         int nb = tok_decode(T, &nt, 1, buf, sizeof(buf)-1);
-        coli_serve_write_data(stdout, q->id, buf, (size_t)nb);
+        if (q->logprobs > 0) coli_serve_write_data_lp(stdout, q->id, buf, (size_t)nb, lptail);
+        else coli_serve_write_data(stdout, q->id, buf, (size_t)nb);
         gen++; hist_len++;
         while (coli_stdin_readable()) {
             int r = serve_read_cmd(stdin, stdout, q->id);
@@ -1648,6 +1723,14 @@ static void serve_loop(Model *m, Tok *T, int ctx_cap) {
         int fatal = serve_one(m, T, &q, ctx_cap);
         free(q.payload);
         if (fatal < 0) return;
+        /* Resend the grid after EVERY turn, not only after READY: at boot the
+         * expert cache is empty by definition, and that cold snapshot stayed
+         * the only one the dashboard ever saw -- all grey, RAM 0, everything
+         * on disk, forever. HITS was already per turn, which is why the white
+         * "routed now" flash worked while the residency colour never moved.
+         * inkling.c, kimi_k3.c, qwen38.c, deepseek_v41.c and colibri.c
+         * already do this. */
+        serve_tiers_emap(m);
     }
 }
 
@@ -1711,6 +1794,7 @@ int main(int argc, char **argv) {
         Tok T;
         char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
         tok_load(&T, tokpath);
+        coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&m, &T, ctx_cap);
         { const char *up = getenv("COLI_USAGE");
           if (up && *up) rt_save(up, 0); }

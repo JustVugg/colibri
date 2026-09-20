@@ -32,23 +32,48 @@ SAFETENSORS_DTYPES = {
     "F8_E8M0": 1,
     "F8_E8M0FNU": 1,
 }
+def _core_component(name, spellings):
+    """Does the component immediately before `.weight` name this role?
+
+    Not `endswith`: `"pos_embed.weight".endswith("embed.weight")` is True, and
+    so is the vision tower's `patch_embed.weight`. Either would stand in for a
+    token embedding that is not there, which is this bug with the sign flipped
+    -- a checkpoint genuinely missing its embedding would pass. The component
+    has to BE the role, so the match is on the name between the last two dots.
+
+    `.layers.` is excluded for the reason _is_final_norm excludes it: a head or
+    an embedding inside the layer stack is the block's, not the model's.
+    """
+    parts = name.split(".")
+    return (len(parts) >= 2 and parts[-1] == "weight"
+            and parts[-2] in spellings and ".layers." not in name)
+
+
 def _is_embedding(name):
-    return name.endswith("embed_tokens.weight")
+    return _core_component(name, {"embed_tokens", "embed"})
 
 
 def _is_final_norm(name):
     # Every block has norms too. The final one is the norm that sits OUTSIDE
-    # the layer stack, so exclude anything under `.layers.`, and exclude
-    # `layernorm` outright: GLM-5.3-Flash's vision tower has
-    # `model.visual.post_layernorm.weight`, which would otherwise stand in for
-    # a final norm that is not there.
-    return (name.endswith(".norm.weight")
-            and ".layers." not in name
-            and "layernorm" not in name)
+    # the layer stack, which _core_component's `.layers.` exclusion covers, and
+    # the component test covers the rest: GLM-5.3-Flash's vision tower has
+    # `model.visual.post_layernorm.weight`, whose component is
+    # `post_layernorm`, not `norm`, so it cannot stand in for a final norm that
+    # is not there.
+    #
+    # The component form also accepts a bare `norm.weight` at the root, which
+    # the old `.norm.weight` tail required a prefix for. A container that names
+    # its roles flat, which is exactly what DeepSeek V4 does with `embed.weight`
+    # and `head.weight`, would otherwise fail this third role for the same
+    # reason it failed the other two.
+    return _core_component(name, {"norm"})
 
 
 def _is_output_head(name):
-    return name.endswith("lm_head.weight")
+    # `hc_head_base`, `hc_head_fn` and `hc_head_scale` sit next to the real head
+    # in a DeepSeek V4 container and must not stand in for it. They fall out
+    # here without an exclusion of their own: none of them ends in `.weight`.
+    return _core_component(name, {"lm_head", "head"})
 
 
 #: What a checkpoint must contain to be a language model at all, stated as
@@ -61,6 +86,14 @@ def _is_output_head(name):
 #: `model.language_model.embed_tokens.weight` and
 #: `model.language_model.norm.weight`. Two of three names did not match, and
 #: the doctor called a healthy model broken.
+#:
+#: #1593: the same defect again, one family later. That fix made the predicates
+#: prefix-agnostic but not NAME-agnostic, and DeepSeek V4 spells the roles
+#: `embed.weight` and `head.weight` (deepseek_v4.c looks up exactly those, at
+#: four call sites). Both roles were reported missing for a container the engine
+#: loads and generates from, while `model.index`, scanning the same tensors,
+#: was green. `_is_final_norm` survived only because `.norm.weight` is a
+#: spelling V4 happens to share.
 #:
 #: Matching on the tail rather than the whole name is what makes this hold for
 #: families nobody has written yet: it is prefix-agnostic, which is exactly

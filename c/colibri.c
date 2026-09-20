@@ -70,6 +70,7 @@
 #include "abl.h"                                   /* per-expert causal-ablation harness — inert unless g_abl.mode set (ABLATE_SCORE=<manifest>) */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
+#include "pin_pool.h"   /* piu scatti annidati dello stato */
 #include "route_trace.h"                           /* ROUTE_TRACE + .coli_usage, engine-agnostic (#700) */
 #include "kv_fp8.h"                               /* KV8=1: cache latente in fp8 e4m3 + scala per-riga */
 #include "kv_tq.h"                                /* KV_TQ=3|4: cache latente PolarQuant (rot+polare) */
@@ -8277,6 +8278,106 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
 #endif
 }
 
+/* CONSIST=1: prefill/decode self-consistency. The same positions are evaluated
+ * twice -- arm A pushes the whole sequence through step_all in one batched
+ * prefill, arm B prefills the prompt prefix and then walks the continuation one
+ * token at a time through the KV cache, exactly as generate() does. The two
+ * arms share weights, so any disagreement beyond float accumulation order is a
+ * KV-addressing or masking defect in one of them.
+ *
+ * Unlike TF=1 this needs no oracle file and no reference implementation: it is
+ * the engine against itself, so it runs on any model, any quantization and any
+ * backend -- including the ones no CI runner has a GPU for. It also covers
+ * COLI_PREFILL_CHUNK, which only arm B honours.
+ *
+ * The gate is the largest RELATIVE logit gap, because that is the quantity that
+ * separates the two failure classes: reordered f32 accumulation over the hidden
+ * dim lands near D*eps (~1e-3 at D=7168), a wrong mask or a misaddressed KV row
+ * lands at O(1). Argmax flips are reported but NOT gated: a flip requires
+ * |a[ia]-a[ib]| < 2*gap by construction, so "the flip is explained by the gap"
+ * is true for every flip and would be an assertion that cannot fail. */
+#define CONSIST_MAX_S 512     /* step_all writes S*D floats into m->h_all, sized 512*D */
+
+static void run_consist(Model *m, const int *full, int nfull, int np){
+    Cfg *c=&m->c; int V=c->vocab;
+    if(np<2||nfull<=np){ fprintf(stderr,"CONSIST requires a non-empty prompt and continuation\n"); return; }
+    if(nfull>CONSIST_MAX_S){
+        fprintf(stderr,"CONSIST: %d tokens exceeds the %d-token step_all ceiling\n",nfull,CONSIST_MAX_S); return; }
+
+    int saved_draft=g_draft; g_draft=0;   /* mtp_absorb fires in arm B only; keep the arms comparable */
+
+    kv_alloc(m,nfull+2);
+    float *A=step_all(m,full,nfull,0);                 /* arm A: one batched prefill */
+
+    kv_alloc(m,nfull+2);                               /* arm B: prefix, then one token at a time */
+    float *lo=step(m,full,np-1,0); free(lo);
+
+    double worst=0, worst_abs=0; int worst_pos=-1, flips=0, compared=0;
+    double flip_margin=0; int flip_pos=-1;
+    for(int i=np-1;i<nfull-1;i++){
+        lo=step(m,full+i,1,i);
+        const float *a=A+(int64_t)i*V;
+        double gap=0, scale=0; int ia=0, ib=0;
+        for(int v=0;v<V;v++){
+            double d=fabs((double)a[v]-(double)lo[v]); if(d>gap) gap=d;
+            double s=fabs((double)a[v]);               if(s>scale) scale=s;
+            if(a[v]>a[ia]) ia=v;
+            if(lo[v]>lo[ib]) ib=v;
+        }
+        double rel = scale>0 ? gap/scale : gap;
+        if(rel>worst){ worst=rel; worst_abs=gap; worst_pos=i; }
+        if(ia!=ib){ flips++;
+            double margin=fabs((double)a[ia]-(double)a[ib]);
+            if(margin>flip_margin){ flip_margin=margin; flip_pos=i; } }
+        compared++;
+        free(lo);
+    }
+    free(A);
+    g_draft=saved_draft;
+
+    double tol = getenv("CONSIST_TOL") ? atof(getenv("CONSIST_TOL")) : 1e-2;
+    printf("CONSIST prefill vs decode: %d positions | worst relative gap %.3e (abs %.3e) at pos %d | tol %.1e\n",
+        compared, worst, worst_abs, worst_pos, tol);
+    if(flips) printf("CONSIST argmax flips: %d/%d | widest top1-top2 margin %.3e at pos %d (near-ties: informational)\n",
+        flips, compared, flip_margin, flip_pos);
+    if(worst>tol){
+        fprintf(stderr,"CONSIST FAIL: worst relative gap %.3e exceeds tol %.1e — "
+                       "prefill and decode do not agree on the same positions\n", worst, tol);
+        exit(1);
+    }
+    printf("CONSIST OK\n");
+}
+
+/* CONSIST driven by PROMPT: the prompt's own tokens supply both arms, so the check
+ * needs no ref file at all and runs against any model the engine can load. The split
+ * point is how much of it arm B prefills before stepping the rest one token at a time;
+ * CONSIST_NP overrides the default halfway split. */
+static void run_consist_prompt(Model *m, const char *snap, const char *prompt){
+    char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
+    Tok T; tok_load(&T,tkp);
+    int cap=(int)strlen(prompt)+16; int *ids=malloc(((size_t)cap+4)*sizeof(int));
+    if(!ids){ fprintf(stderr,"CONSIST: out of memory\n"); tok_free(&T); return; }
+    int n=tok_encode(&T,prompt,(int)strlen(prompt),ids,cap);
+    if(n<1){ fprintf(stderr,"CONSIST: prompt is empty after tokenization\n"); free(ids); tok_free(&T); return; }
+    /* The same GLM prefix run_text applies (#108). Without [gMASK]<sop> the sequence is
+     * out-of-distribution; both arms would then agree, but on garbage. */
+    int templ=getenv("CHAT_TEMPLATE")?atoi(getenv("CHAT_TEMPLATE")):1;
+    if(templ){
+        int gmask=tok_id_of(&T,"[gMASK]"), sop=tok_id_of(&T,"<sop>");
+        if(gmask>=0 && sop>=0 && (n<2 || ids[0]!=gmask || ids[1]!=sop)){
+            memmove(ids+2,ids,(size_t)n*sizeof(int)); ids[0]=gmask; ids[1]=sop; n+=2;
+        }
+    }
+    tok_free(&T);                      /* ids is self-contained from here (tok.h pairs load/free) */
+    int np = getenv("CONSIST_NP") ? atoi(getenv("CONSIST_NP")) : n/2;
+    if(np<2) np=2;
+    if(np>=n){ fprintf(stderr,"CONSIST: prefix %d leaves no continuation in %d tokens\n",np,n);
+               free(ids); return; }
+    printf("CONSIST from prompt: %d tokens | prefix %d | continuation %d\n", n, np, n-np);
+    run_consist(m, ids, n, np);
+    free(ids);
+}
+
 /* generazione reale: tokenizza PROMPT, prefill + decode greedy con stop su EOS,
  * detokenizza e stampa il testo in streaming. */
 static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
@@ -8618,7 +8719,17 @@ static void repin_pass_limit(Model *m,int limit){
  * append lascia nrec vecchio = file coerente. La riga KV del layer MTP non si salva:
  * al resume kv_start=-1 e la finestra di draft riparte da sola. */
 
-typedef struct { KVState kv; int *hist, len, first; } ServeCtx;
+/* Scatti dello stato (modalita jev, SUBMIT pin=1), PER SLOT. Qui il
+ * riavvolgimento e gia nativo -- le righe KV sono indicizzate per posizione e
+ * lo slot le tiene -- ma mancava il predittore del PRIMO token fresco, che
+ * senza fotografia costringerebbe a rifare tutto il prompt.
+ *
+ * Sono piu di uno perche i prefissi utili sono annidati: le istruzioni,
+ * condivise da mille richieste, e istruzioni+domanda, condivise dalle
+ * alternative di una sola. Con uno scatto solo si e costretti a scegliere, e
+ * l'altro livello lo si ripaga ogni volta. Vedi pin_pool.h. */
+typedef struct { KVState kv; int *hist, len, first;
+                 ColiPinPool pins; } ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
 
 static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, int maxctx){
@@ -8643,6 +8754,7 @@ static void serve_ctx_free(Model *m, ServeCtx *s){
     if(k->Ic) for(int i=0;i<m->c.n_layers;i++) free(k->Ic[i]);
     free(k->Lc); free(k->Rc); free(k->Lc8); free(k->Rc8); free(k->Lsc); free(k->Rsc);
     free(k->Ic); free(k->kv_start); free(s->hist);
+    coli_pin_pool_clear(&s->pins, NULL);   /* questo motore non ha stato ricorrente */
 }
 
 typedef struct {
@@ -8732,22 +8844,28 @@ static void mux_echo(Tok *T, unsigned long long id, int pos, int token,
  * needs logits at EVERY position, so this path takes no cached-prefix skip
  * and no cross-slot KV adoption (KV rows [0,nt) are rewritten in full). */
 static float *mux_prefill_echo(Model *m, Tok *T, unsigned long long id,
-                               const int *ids, int nt, int topk){
+                               const int *ids, int nt, int topk,
+                               int from, const float *pin_lo){
     Cfg *c=&m->c; int D=c->hidden, V=c->vocab;
-    float *x=falloc((int64_t)nt*D);
-    for(int s=0;s<nt;s++) embed_row(m, ids[s], x+(int64_t)s*D);
-    layers_forward(m,x,nt,0);
-    if(m->hlast) memcpy(m->hlast, x+(int64_t)(nt-1)*D, D*sizeof(float));
-    if(m->has_mtp && nt>=2 && g_draft>0) mtp_absorb(m, ids+1, x, nt-1, 0);  /* same as step() */
+    if(from<0 || from>=nt) from=0;
+    int add=nt-from;
+    float *x=falloc((int64_t)add*D);
+    for(int s=0;s<add;s++) embed_row(m, ids[from+s], x+(int64_t)s*D);
+    layers_forward(m,x,add,from);
+    if(m->hlast) memcpy(m->hlast, x+(int64_t)(add-1)*D, D*sizeof(float));
+    if(m->has_mtp && add>=2 && g_draft>0) mtp_absorb(m, ids+from+1, x, add-1, from);  /* same as step() */
     float *lo=falloc(V), *row=falloc(D);
-    mux_echo(T,id,0,ids[0],NULL,V,0);
+    /* La prima posizione emessa non ha un predittore fra le x appena calcolate:
+     * lo porta la fotografia. Senza (from==0, o nessun pin) resta " nan 0",
+     * esattamente come prima. */
+    mux_echo(T,id,from,ids[from], (from>0?pin_lo:NULL), V, (from>0&&pin_lo)?topk:0);
     double th0=now_s();
-    for(int pos=1; pos<nt; pos++){
-        rmsnorm(row, x+(int64_t)(pos-1)*D, m->final_norm, D, c->eps);
+    for(int pos=from+1; pos<nt; pos++){
+        rmsnorm(row, x+(int64_t)(pos-1-from)*D, m->final_norm, D, c->eps);
         matmul_qt(lo, row, &m->lm_head, 1);
         mux_echo(T,id,pos,ids[pos],lo,V,topk);
     }
-    rmsnorm(row, x+(int64_t)(nt-1)*D, m->final_norm, D, c->eps);
+    rmsnorm(row, x+(int64_t)(add-1)*D, m->final_norm, D, c->eps);
     matmul_qt(lo, row, &m->lm_head, 1);
     m->t_head += now_s()-th0;
     free(x); free(row);
@@ -8969,8 +9087,38 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
      * prompt re-prefills from position 0 -- no cached-prefix skip and no
      * cross-slot adoption below (either would leave positions with no logits). */
     int echo = sub.logprobs>0;
+    /* Il salto del prefisso nell'eco vale quando lo slot PORTA una fotografia,
+     * non quando questa richiesta la richiede: in un menu chiuso la foto la
+     * chiede la passata di riscaldamento e le opzioni che seguono non la
+     * ridichiarano. Legarlo a sub.pin faceva rifare il prompt intero a ogni
+     * opzione -- i numeri restavano giusti e il risparmio spariva, che e' il
+     * modo peggiore di sbagliare.
+     *
+     * Una fotografia esiste solo perche qualcuno l'ha chiesta su QUESTO slot,
+     * e uno slot e' una conversazione: un client OpenAI con echo=true che non
+     * ha mai chiesto niente non ne trova nessuna e rifa tutto da posizione 0,
+     * frame per frame, come prima. */
+    /* Lo scatto piu profondo che sia un prefisso di questo prompt. */
+    int pin_slot = echo ? coli_pin_best(&sc->pins, tmp, nt) : -1;
+    int pin_len  = pin_slot >= 0 ? sc->pins.slot[pin_slot].len : 0;
+    const float *pin_lo = pin_slot >= 0 ? sc->pins.slot[pin_slot].logit : NULL;
+    int echo_pin = echo && pin_len > 0 && pin_lo;
     int prefix=0;
-    if(!echo) while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
+    if(!echo || echo_pin) while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
+    /* L'eco comincia ESATTAMENTE dove finisce la fotografia, non dove finisce
+     * il prefisso condiviso: i soli logit che abbiamo sono quelli della
+     * posizione fotografata, e sono il predittore del token che viene subito
+     * dopo. Se il prefisso condiviso va piu in la -- due opzioni di un menu
+     * condividono anche lo spazio che le precede, quindi capita sempre -- si
+     * torna indietro alla fotografia e si rifanno quei pochi token: si perde
+     * una posizione di riuso e si guadagna che ogni token dell'opzione ha il
+     * suo logprob. Pretendere che i due numeri combaciassero faceva ricadere
+     * ogni opzione dopo la prima sul ricalcolo completo: numeri giusti,
+     * risparmio zero. */
+    if(echo_pin){
+        if(pin_len>0 && pin_len<=prefix){ prefix=pin_len; coli_pin_touch(&sc->pins,pin_slot); }
+        else prefix=0;
+    }
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
         kv_disk_truncate(m,sc->len); }
     /* Cross-slot prefix adoption (COLI_KV_SHARE=1) — RadixAttention's benefit
@@ -9022,10 +9170,17 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     if(add>0) memcpy(sc->hist+sc->len,tmp+sc->len,(size_t)add*sizeof(int));
     fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",sub.slot,sc->len,nt,add);
     free(tmp);
-    float *logit = echo ? mux_prefill_echo(m,T,sub.id,sc->hist,nt,sub.logprobs)
+    float *logit = echo ? mux_prefill_echo(m,T,sub.id,sc->hist,nt,sub.logprobs,
+                                          echo_pin?prefix:0,
+                                          echo_pin?pin_lo:NULL)
                         : add>0 ? step(m,sc->hist+sc->len,add,sc->len)
                                 : step(m,sc->hist+sc->len-1,1,sc->len-1);
     sc->len+=add; sc->first=0;
+    if(sub.pin && logit){
+        coli_pin_pool_init(&sc->pins,m->c.vocab);
+        if(coli_pin_store(&sc->pins,sc->hist,nt,logit))
+            fprintf(stderr,"[PIN] slot %d: scatto a %d token\n",sub.slot,nt);
+    }
     ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
     r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
     r->logprobs=sub.logprobs;
@@ -11658,6 +11813,14 @@ int main(int argc, char **argv){
 
     /* modo testo reale: PROMPT="..." [NGEN=n] -> tokenizza, genera, detokenizza */
     const char *user_prompt = coli_user_prompt();   /* ignores cmd.exe's PROMPT template (#271) */
+    /* CONSIST with a PROMPT takes its tokens from the prompt, so it never reaches the
+     * oracle path below and needs no ref file. */
+    if(user_prompt && getenv("CONSIST")){
+        run_consist_prompt(&m, snap, user_prompt);
+        if(stats) stats_dump(&m,stats);
+        return 0;
+    }
+
     if(user_prompt){
         int ngen=getenv("NGEN")?atoi(getenv("NGEN")):64;
         run_text(&m, snap, user_prompt, ngen);
@@ -11694,6 +11857,12 @@ int main(int argc, char **argv){
 
     if(getenv("REPLAY")){
         run_replay(&m,full,nfull,np);
+        if(stats) stats_dump(&m,stats);
+        return 0;
+    }
+
+    if(getenv("CONSIST")){
+        run_consist(&m,full,nfull,np);
         if(stats) stats_dump(&m,stats);
         return 0;
     }

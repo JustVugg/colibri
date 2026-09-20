@@ -4,15 +4,10 @@ export interface ChatMessage {
   id: string
   role: ChatRole
   content: string
-  /* Immagini allegate al turno, come data: URI. Restano sul messaggio e non
-     dentro `content` perche' la cronologia le deve poter rimandare al server
-     insieme al testo: un secondo turno che parla della foto senza la foto
-     riceverebbe una risposta su niente. */
+  /* Data URIs of the pictures attached to this turn. Kept on the message rather
+     than on the draft, because the transcript is resent on every later turn and
+     the model has to keep seeing what it was shown. */
   images?: string[]
-  /* Reasoning models stream their thinking on a separate delta field before
-     the answer. Kept apart from `content` so it can be rendered as its own
-     block and excluded from what is sent back as conversation history. */
-  reasoning?: string
 }
 
 interface OpenAIError {
@@ -152,14 +147,9 @@ export interface StreamChatOptions {
   temperature: number
   maxTokens: number
   enableThinking: boolean
-  /* GLM reasoning depth when enableThinking is on: low | medium | high | xhigh.
-     The server maps it onto the model's own words (Low/Medium/High/Max); when
-     absent it keeps the server default, so a plain on/off client still works. */
-  reasoningEffort?: string
   cacheSlot?: number
   signal: AbortSignal
   onDelta: (text: string) => void
-  onReasoning?: (text: string) => void
 }
 
 export async function streamChat(options: StreamChatOptions): Promise<StreamChatResult> {
@@ -169,24 +159,18 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
     signal: options.signal,
     body: JSON.stringify({
       model: options.model,
-      /* Un turno con immagini viaggia nella forma a parti dell'API OpenAI;
-         senza, resta la stringa di sempre e nessun server vede una differenza. */
-      messages: options.messages.map(({ role, content, images }) =>
-        images && images.length
-          ? {
-              role,
-              content: [
-                ...(content ? [{ type: "text", text: content }] : []),
-                ...images.map((url) => ({ type: "image_url", image_url: { url } })),
-              ],
-            }
-          : { role, content },
-      ),
+      /* A turn with pictures goes out in the content-array form the API takes;
+         a plain turn stays a string, so a text-only server sees exactly what it
+         saw before this existed. */
+      messages: options.messages.map(({ role, content, images }) => images?.length
+        ? { role, content: [
+            ...(content ? [{ type: "text", text: content }] : []),
+            ...images.map(url => ({ type: "image_url", image_url: { url } })),
+          ] }
+        : { role, content }),
       temperature: options.temperature,
       max_completion_tokens: options.maxTokens,
       enable_thinking: options.enableThinking,
-      ...(options.enableThinking && options.reasoningEffort
-        ? { reasoning_effort: options.reasoningEffort } : {}),
       ...(options.cacheSlot === undefined ? {} : { cache_slot: options.cacheSlot }),
       stream: true,
       stream_options: { include_usage: true },
@@ -204,14 +188,12 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
   const consume = (data: string) => {
     if (data === "[DONE]") return
     const event = JSON.parse(data) as {
-      choices?: Array<{ delta?: { content?: string; reasoning_content?: string }; finish_reason?: string | null }>
+      choices?: Array<{ delta?: { content?: string }; finish_reason?: string | null }>
       usage?: TokenUsage | null
     }
     const choice = event.choices?.[0]
     const text = choice?.delta?.content
     if (text) options.onDelta(text)
-    const reasoning = choice?.delta?.reasoning_content
-    if (reasoning) options.onReasoning?.(reasoning)
     if (choice?.finish_reason) finishReason = choice.finish_reason
     if (event.usage) usage = event.usage
   }
@@ -233,4 +215,43 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
     requestId: response.headers.get("x-request-id"),
     queueWaitMs: parsedQueueWait !== null && Number.isFinite(parsedQueueWait) ? parsedQueueWait : null,
   }
+}
+
+/* Modalita brio: il modello non genera, assegna una probabilita a ogni opzione
+ * ammessa. Il ciclo (fotografia del prefisso condiviso, una lettura per
+ * opzione, normalizzazione per lunghezza) sta nel gateway: qui si manda una
+ * richiesta e si riceve una distribuzione. */
+export interface BrioChoice {
+  option: string
+  p: number
+  logprob: number
+  mean_logprob: number
+  tokens: number
+}
+
+export interface BrioResponse {
+  answer: string
+  entropy: number
+  normalize: "mean" | "sum"
+  choices: BrioChoice[]
+  usage: { prompt_tokens: number; completion_tokens: number; read_tokens: number; total_tokens: number }
+}
+
+export async function askBrio(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  state: string,
+  question: string,
+  options: string[],
+  signal?: AbortSignal,
+): Promise<BrioResponse> {
+  const response = await fetch(endpoint(baseUrl, "brio"), {
+    method: "POST",
+    headers: headers(apiKey),
+    body: JSON.stringify({ model, state, question, options }),
+    signal,
+  })
+  if (!response.ok) throw new Error(await responseError(response))
+  return (await response.json()) as BrioResponse
 }

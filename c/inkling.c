@@ -40,7 +40,8 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"
-#include "kv_prefix.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
+#include "kv_prefix.h"
+#include "pin_pool.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
 #include "serve_codec.h"
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
@@ -1847,6 +1848,88 @@ static void inkling_layers_forward_range(Model *m, float *x, int S, int pos0,
  * non-NULL also writes the per-position argmax (teacher-forcing check).
  * dmel: u8 [naud, mel_bins] frames consumed left-to-right by the <|audio|>
  * placeholder positions in ids (prefill only; decode steps pass NULL). */
+/* Canale logprobs: coda numerica per token, lettura del prefill, fotografia
+ * dello stato. Attenzione: questo motore NON e ad attenzione pura. Oltre alle
+ * righe K/V, che sono indicizzate per posizione e quindi si riavvolgono da
+ * sole, porta quattro stati di convoluzione corta per strato (cs[0..3], gli
+ * ingressi grezzi degli ultimi conv_k-1 passi). Quelli non si riavvolgono: se
+ * non li si fotografa, l'opzione successiva parte con la coda dell'opzione
+ * precedente dentro la convoluzione e i logprob sono sbagliati in modo
+ * silenzioso. Sono piccoli (tre passi per canale), quindi la fotografia costa
+ * poco. */
+static int    g_echo_k = 0;
+static const char *g_echo_id = NULL;
+static ColiPinPool g_pins;               /* piu scatti annidati, vedi pin_pool.h */
+static const float *g_pin_logit = NULL;
+static int    g_pin_use_logit = 0;
+static Tok   *g_echo_tok = NULL;
+
+/* Lo stato che questo motore deve fotografare oltre alle righe K/V: i quattro
+ * banchi di convoluzione corta per strato. Piccoli (conv_k-1 passi per canale)
+ * ma indispensabili: senza, l'alternativa successiva parte con la coda della
+ * precedente dentro la convoluzione. */
+typedef struct { float **cs[4]; int n_layers; } InkPinState;
+
+static void ink_echo(const char *id, int pos, int token, const float *lo, int V, int k){
+    char tail[1024]; coli_logprob_tail(tail, sizeof tail, lo, V, token, k);
+    char piece[512]; int n = g_echo_tok ? tok_decode(g_echo_tok, &token, 1, piece, (int)sizeof piece) : 0;
+    if (n < 0) n = 0;
+    printf("ECHO %s %d %d%s\n", id, n, pos, tail);
+    if (n > 0) fwrite(piece, 1, (size_t)n, stdout);
+    fputc('\n', stdout); fflush(stdout);
+}
+
+/* larghezza in float di uno stato di convoluzione, per strato e per banco */
+static int64_t ink_cs_cells(Cfg *c, int bank, int layer){
+    int kvdim = L_KV(c,layer) * L_HD(c,layer);
+    int C = (bank < 2) ? kvdim : c->hidden;
+    return (int64_t)C * (c->conv_k - 1);
+}
+
+static void ink_pin_state_free(void *v){
+    InkPinState *st = (InkPinState *)v;
+    if (!st) return;
+    for (int j = 0; j < 4; j++){
+        if (!st->cs[j]) continue;
+        for (int i = 0; i < st->n_layers; i++) free(st->cs[j][i]);
+        free(st->cs[j]);
+    }
+    free(st);
+}
+
+static InkPinState *ink_pin_state_save(Model *m, InkPinState *reuse){
+    Cfg *c = &m->c;
+    InkPinState *st = reuse;
+    if (st && st->n_layers != c->n_layers) { ink_pin_state_free(st); st = NULL; }
+    if (!st){
+        st = (InkPinState *)calloc(1, sizeof(*st));
+        if (!st) return NULL;
+        st->n_layers = c->n_layers;
+        for (int j = 0; j < 4; j++){
+            st->cs[j] = (float**)calloc((size_t)c->n_layers, sizeof(float*));
+            if (!st->cs[j]){ ink_pin_state_free(st); return NULL; }
+            for (int i = 0; i < c->n_layers; i++){
+                st->cs[j][i] = (float*)malloc((size_t)ink_cs_cells(c,j,i) * sizeof(float));
+                if (!st->cs[j][i]){ ink_pin_state_free(st); return NULL; }
+            }
+        }
+    }
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < c->n_layers; i++)
+            memcpy(st->cs[j][i], m->cs[j][i],
+                   (size_t)ink_cs_cells(c,j,i) * sizeof(float));
+    return st;
+}
+
+static void ink_pin_state_restore(Model *m, const InkPinState *st){
+    Cfg *c = &m->c;
+    if (!st) return;
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < c->n_layers; i++)
+            memcpy(m->cs[j][i], st->cs[j][i],
+                   (size_t)ink_cs_cells(c,j,i) * sizeof(float));
+}
+
 static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
                       const uint8_t *dmel, int naud) {
     Cfg *c = &m->c; int D = c->hidden;
@@ -1872,6 +1955,19 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
     if (dmel && naud > 0) kv_prefix_taint(&m->kvp);
     float *last = falloc(D);
     float *logit = falloc(c->unpad_vocab);
+    /* Lettura del prefill: un passaggio di lm_head per posizione, pagato solo
+     * da chi ha chiesto il canale. La posizione p predice il token p+1; il
+     * primo token fresco e predetto dalla fotografia. */
+    if (g_echo_k > 0 && g_echo_id && S > 0) {
+        if (g_pin_use_logit && g_pin_logit)
+            ink_echo(g_echo_id, pos0, ids[0], g_pin_logit, c->unpad_vocab, g_echo_k);
+        for (int p = 0; p + 1 < S; p++) {
+            rmsnorm_row(last, x + (int64_t)p*D, m->final_norm, D, c->eps);
+            for (int d = 0; d < D; d++) last[d] /= c->mup;
+            matmul_w(logit, last, m->lm_head, 1, D, c->unpad_vocab);
+            ink_echo(g_echo_id, pos0 + p + 1, ids[p+1], logit, c->unpad_vocab, g_echo_k);
+        }
+    }
     if (tf_out) {
         for (int s = 0; s < S; s++) {
             rmsnorm_row(last, x + (int64_t)s*D, m->final_norm, D, c->eps);
@@ -2118,7 +2214,8 @@ static const char *prompt_reject(int np, int want) {
 }
 
 typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen;
-                 uint8_t *audio; int alen; } SReq;   /* raw DMel bytes after the payload */
+                 uint8_t *audio; int alen;
+                 int logprobs, pin; } SReq;   /* raw DMel bytes after the payload; SUBMIT logprobs=k / pin=1 */
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
 static const ColiServeWireProfile inkling_wire = {
@@ -2186,6 +2283,7 @@ static int serve_read_cmd(FILE *input, FILE *output, const char *cur_id) {
             SReq *q = &g_q[g_qn++];
             snprintf(q->id, sizeof(q->id), "%s", command.id);
             q->max_tok=command.max_tokens; q->temp=command.temperature;
+            q->logprobs=command.logprobs; q->pin=command.pin;
             q->top_p=command.top_p; q->plen=(int)command.payload_bytes;
             q->alen=(int)command.extension_bytes;
             q->audio=coli_serve_command_extension(&command);
@@ -2258,6 +2356,32 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
      * brings its own audio must not match a text-only state either. */
     if (naud > 0) kv_prefix_taint(&m->kvp);
     int reuse = kv_prefix_reuse(&m->kvp, ids, np);
+    /* La fotografia si prova sempre, non solo quando il riuso vivo fallisce:
+     * altrimenti la prima opzione trova ancora lo stato del prompt, passa dal
+     * riuso normale e il suo primo token resta senza predittore. */
+    g_pin_use_logit = 0; g_pin_logit = NULL;
+    if (naud == 0) {
+        /* Il piu profondo degli scatti valido per questo prompt. Uno scatto le
+         * cui righe K/V non ci sono piu si butta e si riprova col precedente,
+         * invece di rinunciare e rifare tutto da zero. */
+        int s = coli_pin_best(&g_pins, ids, np);
+        while (s >= 0) {
+            ColiPin *k = &g_pins.slot[s];
+            if (kv_prefix_holds(&m->kvp, k->ids, k->len)) {
+                ink_pin_state_restore(m, (const InkPinState *)k->state);
+                kv_prefix_clear(&m->kvp);
+                kv_prefix_record(&m->kvp, k->ids, 0, k->len);
+                m->kv_len = k->len;
+                reuse = k->len;
+                g_pin_logit = k->logit; g_pin_use_logit = k->logit != NULL;
+                coli_pin_touch(&g_pins, s);
+                break;
+            }
+            k->len = 0;
+            s = coli_pin_best(&g_pins, ids, np);
+        }
+    }
+    g_echo_k = q->logprobs; g_echo_id = q->id; g_echo_tok = T;
     if (getenv("INK_PREFIX_LOG")) {
         /* Report the decision either way, with the reason when it is no. "It
          * did not get faster" is otherwise indistinguishable from "reuse is not
@@ -2280,6 +2404,17 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     /* `reuse` is the ABSOLUTE position of the first fresh token: attention and
      * the KV slots are position-indexed, so this has to be the real offset. */
     float *logit = step_mm(m, ids + reuse, np - reuse, reuse, NULL, q->audio, naud);
+    if (q->pin && logit && naud == 0) {
+        coli_pin_pool_init(&g_pins, c->unpad_vocab);
+        ColiPin *k = coli_pin_store(&g_pins, ids, np, logit);
+        if (k) {
+            InkPinState *st = ink_pin_state_save(m, (InkPinState *)k->state);
+            if (st) { k->state = st; fprintf(stderr, "[PIN] scatto a %d token\n", np); }
+            else    { k->len = 0; }          /* senza stato lo scatto e' una bugia */
+            fflush(stderr);
+        }
+    }
+    g_echo_k = 0; g_echo_id = NULL;   /* la lettura riguarda il prefill, non la decodifica */
     int forwards = 1;                      /* il prefill e' il primo forward */
     int len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
@@ -2290,12 +2425,15 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
         apply_rep_penalty(logit, c->unpad_vocab, hist, nhist, rep);
         int tk = sample_logits(logit, c->unpad_vocab, q->temp, q->top_p);
+        char lptail[1024]; lptail[0] = 0;
+        if (q->logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, logit, c->unpad_vocab, tk, q->logprobs);
         free(logit); logit = NULL;
         if (tk == c->eos) { limited = 0; break; }
         if (nhist < 128) hist[nhist++] = tk;
         else { memmove(hist, hist+1, 127*sizeof(int)); hist[127] = tk; }
         int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
-        coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
+        if (q->logprobs > 0) coli_serve_write_data_lp(stdout,q->id,buf,(size_t)nb,lptail);
+        else coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
         gen++; len++;
         while (stdin_readable()) {
             int r = serve_read_cmd(stdin, stdout, q->id);
@@ -2529,6 +2667,7 @@ int main(int argc, char **argv) {
         pins_load(&m, snap);
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
+        coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&m, &T);
         usage_save(&m, snap);
         return 0;
