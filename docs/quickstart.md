@@ -189,12 +189,14 @@ Useful first commands:
 ```bash
 COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # read-only check: is everything ready?
 COLI_MODEL=/nvme/glm52_i4 ./coli plan     # shows where the model will live (RAM/disk/GPU)
-COLI_MODEL=/nvme/glm52_i4 ./coli chat --topp 0.85   # faster: reads less from disk, same quality
+COLI_MODEL=/nvme/glm52_i4 ./coli chat --topp 0.85   # faster: reads less from disk, lossy routing
 ```
 
-> **Tip:** `--topp 0.85` is worth adding on a disk-bound machine — it reads
-> fewer expert bytes per token with no quality loss, which directly means more
-> tokens per second.
+> **Tip:** `--topp 0.85` can help on a disk-bound machine by reading fewer
+> expert bytes per token, but it changes expert routing and is lossy. Measure
+> the quality/speed tradeoff on your workload. For quality-preserving tuning,
+> run `./coli tune --model /nvme/glm52_i4`, then launch with `--auto-tier` so
+> Colibrì can apply the measured hardware/model profile.
 
 ---
 
