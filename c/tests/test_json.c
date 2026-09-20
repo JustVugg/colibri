@@ -30,6 +30,30 @@ int main(void) {
     CHECK(values->kids[1]->num == -2.5);
     CHECK(values->kids[2]->num == 300.0);
     CHECK(strcmp(json_get(root, "unicode")->str, "λ 🚀") == 0);
+    json_free(root);
+
+    root = json_parse_exact(" {\"exact\":[0,-2.5,3e2]} \n", NULL);
+    CHECK(root && root->t == J_OBJ);
+    json_free(root);
+
+    static const char *malformed[] = {
+        "{\"a\" 1}",
+        "{\"a\":\"unterminated}",
+        "{\"a\":1",
+        "{\"a\":1} trailing",
+        "{\"a\":1,}",
+        "[1,]",
+        "{\"a\":1e}",
+        "{\"magic\\u0000suffix\":\"QPACK\"}",
+        "{\"a\":1}\v"
+    };
+    for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++)
+        CHECK(json_parse_exact(malformed[i], NULL) == NULL);
+
+    /* The legacy entry point intentionally keeps its historical behavior. */
+    root = json_parse("{\"a\" 1}", NULL);
+    CHECK(root && root->t == J_OBJ);
+    json_free(root);
 
     puts("json tests: ok");
     return 0;
