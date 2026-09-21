@@ -3521,8 +3521,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
         atexit(qt_shutdown);
         /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The
-         * qdw entry keyed by m.lm_head holds the int8 rows + per-row scales
-         * the CPU path uses; the GPU applies the identical semantics. */
+         * QW struct on m.lm_head holds the int8 rows + per-row scales the
+         * CPU path uses; the GPU applies the identical semantics. */
         if (m.lm_head.q)
             qt_lmhead_init(m.lm_head.q, m.lm_head.sc, m.lm_head.I, m.lm_head.O);
         /* R4 step 2: DeltaNet input projections, per layer, wherever
