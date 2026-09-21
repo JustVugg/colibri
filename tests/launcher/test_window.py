@@ -86,7 +86,8 @@ class LauncherWindowTests(unittest.TestCase):
         FakeSupervisor.instances.clear()
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        # Match the launcher's resolved model paths, including Windows 8.3 TEMP aliases.
+        self.root = Path(self.temp.name).resolve()
         self.settings_path = self.root / "launcher.json"
         self.installation = Installation(
             root=self.root,
