@@ -128,7 +128,7 @@ CPU fallback. Known, not yet addressed.
 `dnproj`: an engine offers whatever it wants placed with `qt_trunk_offer(name,
 layer, bytes)` before `qt_init`, asks `qt_place_of(name, layer)` afterwards,
 and hands the placed matrices over as int8 rows with
-`qt_dense_init(q, scales, I, O, device)`, which returns a handle;
+`qt_dense_init(q, scales, I, O, device, gs)` (gs 0: one scale per row; gs > 0: scales `[O][ceil(I/gs)]`, the backend's grouped fmt 1), which returns a handle;
 `qt_dense_matmul(handle, y, x, I, O)` answers one GEMV from VRAM and returns 0
 (CPU from here on) if the backend fails. The qwen36 calls remain thin
 wrappers over the same mechanism. Qwen3.8 uses it for its whole trunk -- 553

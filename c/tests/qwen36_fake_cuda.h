@@ -52,8 +52,9 @@ static int upload_common(ColiCudaTensor **t, const void *w, const float *sc, int
     ColiCudaTensor *n = (ColiCudaTensor *)calloc(1, sizeof *n);
     n->fmt = fmt; n->I = I; n->O = O; n->device = device; n->gs = gs; n->w = w; n->sc = sc;
     if (fake_dense_compute && fmt == 1 && w && sc) {
-        int8_t *q = (int8_t *)malloc((size_t)I * O); float *s = (float *)malloc((size_t)O * sizeof(float));
-        if (q && s) { memcpy(q, w, (size_t)I * O); memcpy(s, sc, (size_t)O * sizeof(float)); n->w = q; n->sc = s; }
+        size_t ng = gs > 0 ? ((size_t)I + gs - 1) / gs : 1;   /* grouped int8: [O][ng] scales */
+        int8_t *q = (int8_t *)malloc((size_t)I * O); float *s = (float *)malloc((size_t)O * ng * sizeof(float));
+        if (q && s) { memcpy(q, w, (size_t)I * O); memcpy(s, sc, (size_t)O * ng * sizeof(float)); n->w = q; n->sc = s; }
         else { free(q); free(s); n->w = NULL; n->sc = NULL; }
     }
     *t = n;
@@ -112,14 +113,26 @@ void coli_cuda_stats(int device, size_t *count, size_t *bytes) {
  * unused on purpose (CFLAGS carry -Wno-unused-parameter). */
 static int fake_matmuls;
 int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x, const void *weights, const float *scales, int fmt, int S, int I, int O, int device, int gs) {
-    fake_matmuls++;
     ColiCudaTensor *t = tensor ? *tensor : NULL;
+    /* The real backend re-validates a cached tensor against the call's format
+     * and group size and refuses a mismatch; a grouped upload answered with
+     * gs 0 (or the other way round) is a matmul that never happens. Mirror
+     * that here so a caller that drops the group size fails on the fake too. */
+    if (t && (t->fmt != fmt || t->gs != (gs > 0 ? gs : 0))) return 0;
+    fake_matmuls++;
     if (fake_dense_compute && t && t->fmt == 1 && t->w && t->sc && t->I == I && t->O == O) {
-        const int8_t *q = (const int8_t *)t->w;
+        const int8_t *q = (const int8_t *)t->w; const int g = t->gs; const int ng = g > 0 ? (I + g - 1) / g : 1;
         for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
             const int8_t *w = q + (size_t)o * I; const float *xs = x + (size_t)s * I; float a = 0.f;
-            for (int i = 0; i < I; i++) a += xs[i] * (float)w[i];
-            y[(size_t)s * O + o] = a * t->sc[o];
+            if (g > 0) {   /* grouped: the engine's Q38_TRUNK_CPU_INT8 loop, group subtotal times its scale */
+                const float *sc = t->sc + (size_t)o * ng;
+                for (int gi = 0; gi < ng; gi++) { int i0 = gi * g, i1 = i0 + g < I ? i0 + g : I; float ag = 0.f;
+                    for (int i = i0; i < i1; i++) ag += xs[i] * (float)w[i]; a += ag * sc[gi]; }
+                y[(size_t)s * O + o] = a;
+            } else {
+                for (int i = 0; i < I; i++) a += xs[i] * (float)w[i];
+                y[(size_t)s * O + o] = a * t->sc[o];
+            }
         }
     }
     return 1;

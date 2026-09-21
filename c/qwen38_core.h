@@ -52,6 +52,12 @@ typedef struct {
     int gpu;                       /* 0 = CPU; else 1 + tier handle of an int8 copy resident in VRAM (decode, S == 1) */
     int8_t *q8; float *q8sc;       /* Q38_TRUNK_CPU_INT8=1: the same int8 rows kept on the CPU (reference for the GPU path, no GPU needed) */
 } Q38Weight;
+/* Q38_TRUNK_GS=<n>: the int8 trunk carries one scale per n weights along I
+ * (scales [O][ceil(I/n)]) instead of one per row. Default 64: on wikitext-2 the
+ * per-row trunk cost +1.9 % perplexity, gs 64 +0.4 % (docs/qwen38.md), for 6 %
+ * more scale bytes. 0 = per row (the qwen36 dnproj/lmhead format). Read once. */
+static int g_trunk_gs=-1;
+static int q38_trunk_gs(void){ if(g_trunk_gs<0){ const char *e=getenv("Q38_TRUNK_GS"); g_trunk_gs=e?atoi(e):64; if(g_trunk_gs<0)g_trunk_gs=0; } return g_trunk_gs; }
 
 typedef struct { float *norm; Q38Weight down, up, inject; } GatedResidual;
 
@@ -274,7 +280,19 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
     if(S==1&&weight&&weight->q8&&weight->rows==O&&weight->cols==I){
         /* the int8 rows the GPU would hold, computed here: what the trunk
          * quantization alone does to the output, GPU or not */
-        const int8_t *q=weight->q8; const float *sc=weight->q8sc;
+        const int8_t *q=weight->q8; const float *sc=weight->q8sc; const int gs=q38_trunk_gs();
+        if(gs>0){
+            /* grouped: one scale per gs weights along I, the same numbers the GPU's grouped fmt 1 produces */
+            const int ng=(I+gs-1)/gs;
+            #pragma omp parallel for schedule(static)
+            for(int o=0;o<O;o++){
+                const int8_t *w=q+(size_t)o*I; const float *s=sc+(size_t)o*ng; float a=0.f;
+                for(int g=0;g<ng;g++){ int i0=g*gs, i1=i0+gs<I?i0+gs:I; float ag=0.f;
+                    for(int i=i0;i<i1;i++)ag+=x[i]*(float)w[i]; a+=ag*s[g]; }
+                y[o]=a;
+            }
+            return;
+        }
         #pragma omp parallel for schedule(static)
         for(int o=0;o<O;o++){
             const int8_t *w=q+(size_t)o*I; float a=0.f;
@@ -1728,7 +1746,9 @@ typedef struct { Q38Weight *w; char name[16]; int layer; } Q38TrunkItem;
 static Q38TrunkItem *g_trunk; static int g_trunk_n, g_trunk_cap;
 static void q38_trunk_add(Q38Weight *w,const char *name,int layer) {
     if(!w||!w->data||(w->kind!=Q38_WEIGHT_BF16&&w->kind!=Q38_WEIGHT_F32))return;
-    size_t bytes=(size_t)w->rows*w->cols+(size_t)w->rows*sizeof(float);
+    int gs=q38_trunk_gs(); size_t ng=gs>0?((size_t)w->cols+gs-1)/gs:1;
+    /* what the tier will hold: int8 bytes plus the scale table */
+    size_t bytes=(size_t)w->rows*w->cols+(size_t)w->rows*ng*sizeof(float);
     /* Q38_TRUNK_MIN_KB (default 1024): a round trip costs more than a tiny
      * GEMV saves; Q38_TRUNK_SKIP=name,name: leave those components on the
      * CPU (bisecting a numeric difference, or a component that does not pay) */
@@ -1776,20 +1796,26 @@ static void q38_trunk_offer_all(Model *m) {
         q38_trunk_add(&L->router,"router",l);
     }
 }
-/* int8 per row, scale = max|w| / 127 (the qwen36 dnproj/lmhead format) */
+/* int8, scale = max|w| / 127 per group of Q38_TRUNK_GS weights along I
+ * (scales [O][ceil(I/gs)]; gs 0 = one scale per row, the qwen36 dnproj/lmhead
+ * format). The GPU path (grouped fmt 1) and the CPU reference path
+ * (Q38_TRUNK_CPU_INT8) consume the same rows and scales. */
 static void q38_trunk_quantize(const Q38Weight *w,int8_t **qp,float **scp) {
-    int O=w->rows,I=w->cols;
-    int8_t *q=(int8_t*)malloc((size_t)O*I); float *sc=(float*)malloc((size_t)O*sizeof(float));
+    int O=w->rows,I=w->cols; const int gs=q38_trunk_gs(); const int ng=gs>0?(I+gs-1)/gs:1;
+    int8_t *q=(int8_t*)malloc((size_t)O*I); float *sc=(float*)malloc((size_t)O*ng*sizeof(float));
     if(!q||!sc){fprintf(stderr,"OOM trunk quantization\n");exit(1);}
     #pragma omp parallel for schedule(static)
     for(int r=0;r<O;r++){
         float row[8192]; float *src=row; float *heap=NULL;
         if(I>8192){heap=(float*)malloc((size_t)I*sizeof(float)); src=heap;}
         q38_weight_row(w,r,src);
-        float mx=0.f; for(int k=0;k<I;k++){float a=fabsf(src[k]); if(a>mx)mx=a;}
-        float s=mx>0.f?mx/127.f:1.f, inv=1.f/s; sc[r]=s;
         int8_t *dst=q+(size_t)r*I;
-        for(int k=0;k<I;k++){int v=(int)lrintf(src[k]*inv); if(v>127)v=127; if(v<-127)v=-127; dst[k]=(int8_t)v;}
+        for(int g=0;g<ng;g++){
+            int k0=gs>0?g*gs:0, k1=gs>0?(k0+gs<I?k0+gs:I):I;
+            float mx=0.f; for(int k=k0;k<k1;k++){float a=fabsf(src[k]); if(a>mx)mx=a;}
+            float s=mx>0.f?mx/127.f:1.f, inv=1.f/s; sc[(size_t)r*ng+g]=s;
+            for(int k=k0;k<k1;k++){int v=(int)lrintf(src[k]*inv); if(v>127)v=127; if(v<-127)v=-127; dst[k]=(int8_t)v;}
+        }
         free(heap);
     }
     *qp=q; *scp=sc;
@@ -1805,8 +1831,8 @@ static void q38_trunk_cpu_int8(Model *m) {
         Q38Weight *w=g_trunk[i].w; if(w->q8)continue;
         q38_trunk_quantize(w,&w->q8,&w->q8sc); bytes+=(size_t)w->rows*w->cols;
     }
-    fprintf(stderr,"[qwen38] trunk: %d matrices int8 on the CPU (%.2f GiB) in %.1fs (Q38_TRUNK_CPU_INT8)\n",
-            g_trunk_n,bytes/1073741824.0,now_s()-t0);
+    fprintf(stderr,"[qwen38] trunk: %d matrices int8 on the CPU (%.2f GiB, %s) in %.1fs (Q38_TRUNK_CPU_INT8)\n",
+            g_trunk_n,bytes/1073741824.0,q38_trunk_gs()>0?"group scales":"per-row scales",now_s()-t0);
 }
 /* after qt_init: quantize and upload what the placer accepted */
 static void q38_trunk_place_all(Model *m) {
@@ -1818,23 +1844,27 @@ static void q38_trunk_place_all(Model *m) {
         if(dev==QT_PLACE_CPU)continue;
         int O=w->rows,I=w->cols;
         int8_t *q; float *sc; q38_trunk_quantize(w,&q,&sc);
-        int h=qt_dense_init(q,sc,I,O,dev);
+        const int gs=q38_trunk_gs(); const int ng=gs>0?(I+gs-1)/gs:1;
+        int h=qt_dense_init(q,sc,I,O,dev,gs);
         if(h>=0&&getenv("Q38_TRUNK_SELFTEST")){
             /* DIAG: GPU int8 GEMV against the same int8 matrix on the CPU */
             float *x=(float*)malloc((size_t)I*sizeof(float)),*yg=(float*)malloc((size_t)O*sizeof(float)),*yc=(float*)malloc((size_t)O*sizeof(float));
             for(int k=0;k<I;k++)x[k]=sinf(0.37f*k)+0.1f*(k%7);
-            for(int r=0;r<O;r++){double a=0; for(int k=0;k<I;k++)a+=(double)q[(size_t)r*I+k]*x[k]; yc[r]=(float)(a*sc[r]);}
+            for(int r=0;r<O;r++){ double a=0;
+                if(gs>0){ for(int g=0;g<ng;g++){ int k0=g*gs,k1=k0+gs<I?k0+gs:I; double ag=0; for(int k=k0;k<k1;k++)ag+=(double)q[(size_t)r*I+k]*x[k]; a+=ag*sc[(size_t)r*ng+g]; } }
+                else { for(int k=0;k<I;k++)a+=(double)q[(size_t)r*I+k]*x[k]; a*=sc[r]; }
+                yc[r]=(float)a; }
             int ok=qt_dense_matmul(h,yg,x,I,O); double num=0,den=0; int worst=0;
             for(int r=0;r<O;r++){double d=yg[r]-yc[r]; num+=d*d; den+=(double)yc[r]*yc[r]; if(fabs(d)>fabs(yg[worst]-yc[worst]))worst=r;}
             fprintf(stderr,"[selftest] %-7s L%-2d [O=%d I=%d] ok=%d rel.err %.2e worst row %d gpu %.5g cpu %.5g\n",it->name,it->layer,O,I,ok,den>0?sqrt(num/den):-1.0,worst,yg[worst],yc[worst]);
             free(x);free(yg);free(yc);
         }
         free(q); free(sc);
-        if(h>=0){ w->gpu=h+1; placed++; placed_bytes+=(size_t)O*I; }
+        if(h>=0){ w->gpu=h+1; placed++; placed_bytes+=(size_t)O*I+(size_t)O*ng*sizeof(float); }
     }
     if(g_trunk_n)
-        fprintf(stderr,"[qtier] qwen38 trunk: %d of %d offered matrices resident as int8 (%.2f GiB) in %.1fs; the rest stays BF16 on the CPU\n",
-                placed,g_trunk_n,placed_bytes/1073741824.0,now_s()-t0);
+        fprintf(stderr,"[qtier] qwen38 trunk: %d of %d offered matrices resident as int8 (%s, %.2f GiB) in %.1fs; the rest stays BF16 on the CPU\n",
+                placed,g_trunk_n,q38_trunk_gs()>0?"group scales":"per-row scales",placed_bytes/1073741824.0,now_s()-t0);
 }
 
 /* Start the tier after the model is loaded. COLI_CUDA=1 turns it on (the
