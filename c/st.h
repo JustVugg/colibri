@@ -138,6 +138,121 @@ static inline float f16_to_f32(uint16_t h) {
     float f; memcpy(&f, &u, 4); return f;
 }
 
+/* ---- bulk BF16/F16 -> F32, AVX2/SSE4.1/scalar tiers --------------------
+ * st_read_f32/st_read_slice_f32 convert whole tensors (up to the embed/
+ * lm_head matrix, vocab*hidden elements) through bf16_to_f32/f16_to_f32 one
+ * halfword at a time; that loop is pure overhead once the read syscall is
+ * off the critical path. The tiers below batch it, same idea and layering
+ * as gsgemv.h's AVX2/SSE4.1 kernels (immintrin.h only under the ISA guard,
+ * sse41_kernels.h not needed here -- no FMA, no shared load helper to reuse).
+ *
+ * BF16 -> F32 is an exact zero-pad widening for every bit pattern (BF16
+ * shares F32's 8-bit exponent field, so there is no special-casing --
+ * zero, normal, subnormal, inf, NaN all take the same `<<16`), so the
+ * vectorized tiers cannot disagree with the scalar reference.
+ *
+ * F16 -> F32's zero/normal/inf-NaN classes are each the same closed-form
+ * bit algebra as the scalar reference above, just run on several lanes at
+ * once -- no reassociation, nothing to round, so still bit-exact. True
+ * subnormals (exp==0, man!=0) need the scalar reference's shift-to-normalize
+ * loop, which does not vectorize; those (rare in real model weights) fall
+ * back to f16_to_f32 per element. Exhaustive verification (all 65536
+ * patterns per format) lives in tests/test_st_f16_bf16_simd.c. */
+#if defined(__AVX2__) || defined(__SSE4_1__)
+#include <immintrin.h>
+#endif
+
+#if defined(__AVX2__)
+static void bf16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m128i h = _mm_loadu_si128((const __m128i*)(src + i));
+        __m256i w = _mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16);
+        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(w));
+    }
+    for (; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+}
+static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+    const __m256i vsign_mask = _mm256_set1_epi32(0x8000);
+    const __m256i vexp_mask  = _mm256_set1_epi32(0x1F);
+    const __m256i vman_mask  = _mm256_set1_epi32(0x3FF);
+    const __m256i v112       = _mm256_set1_epi32(112);
+    const __m256i vinfnan_e  = _mm256_set1_epi32(0x7F800000);
+    const __m256i vzero      = _mm256_setzero_si256();
+    const __m256i v31        = _mm256_set1_epi32(31);
+    for (; i + 8 <= n; i += 8) {
+        __m128i h16 = _mm_loadu_si128((const __m128i*)(src + i));
+        __m256i h    = _mm256_cvtepu16_epi32(h16);
+        __m256i sign = _mm256_slli_epi32(_mm256_and_si256(h, vsign_mask), 16);
+        __m256i exp  = _mm256_and_si256(_mm256_srli_epi32(h, 10), vexp_mask);
+        __m256i man  = _mm256_and_si256(h, vman_mask);
+        __m256i normal_u = _mm256_or_si256(sign, _mm256_or_si256(
+            _mm256_slli_epi32(_mm256_add_epi32(exp, v112), 23), _mm256_slli_epi32(man, 13)));
+        __m256i infnan_u = _mm256_or_si256(sign, _mm256_or_si256(vinfnan_e, _mm256_slli_epi32(man, 13)));
+        __m256i exp_is_zero = _mm256_cmpeq_epi32(exp, vzero);
+        __m256i man_is_zero = _mm256_cmpeq_epi32(man, vzero);
+        __m256i is_zero    = _mm256_and_si256(exp_is_zero, man_is_zero);
+        __m256i is_subnorm = _mm256_andnot_si256(man_is_zero, exp_is_zero);
+        __m256i is_infnan  = _mm256_cmpeq_epi32(exp, v31);
+        __m256i result = _mm256_blendv_epi8(normal_u, sign, is_zero);
+        result = _mm256_blendv_epi8(result, infnan_u, is_infnan);
+        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(result));
+        int m = _mm256_movemask_ps(_mm256_castsi256_ps(is_subnorm));
+        if (m) for (int k = 0; k < 8; k++) if ((m >> k) & 1) dst[i+k] = f16_to_f32(src[i+k]);
+    }
+    for (; i < n; i++) dst[i] = f16_to_f32(src[i]);
+}
+#elif defined(__SSE4_1__)
+static void bf16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        __m128i h = _mm_loadl_epi64((const __m128i*)(src + i));
+        __m128i w = _mm_slli_epi32(_mm_cvtepu16_epi32(h), 16);
+        _mm_storeu_ps(dst + i, _mm_castsi128_ps(w));
+    }
+    for (; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+}
+static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+    const __m128i vsign_mask = _mm_set1_epi32(0x8000);
+    const __m128i vexp_mask  = _mm_set1_epi32(0x1F);
+    const __m128i vman_mask  = _mm_set1_epi32(0x3FF);
+    const __m128i v112       = _mm_set1_epi32(112);
+    const __m128i vinfnan_e  = _mm_set1_epi32(0x7F800000);
+    const __m128i vzero      = _mm_setzero_si128();
+    const __m128i v31        = _mm_set1_epi32(31);
+    for (; i + 4 <= n; i += 4) {
+        __m128i h16 = _mm_loadl_epi64((const __m128i*)(src + i));
+        __m128i h    = _mm_cvtepu16_epi32(h16);
+        __m128i sign = _mm_slli_epi32(_mm_and_si128(h, vsign_mask), 16);
+        __m128i exp  = _mm_and_si128(_mm_srli_epi32(h, 10), vexp_mask);
+        __m128i man  = _mm_and_si128(h, vman_mask);
+        __m128i normal_u = _mm_or_si128(sign, _mm_or_si128(
+            _mm_slli_epi32(_mm_add_epi32(exp, v112), 23), _mm_slli_epi32(man, 13)));
+        __m128i infnan_u = _mm_or_si128(sign, _mm_or_si128(vinfnan_e, _mm_slli_epi32(man, 13)));
+        __m128i exp_is_zero = _mm_cmpeq_epi32(exp, vzero);
+        __m128i man_is_zero = _mm_cmpeq_epi32(man, vzero);
+        __m128i is_zero    = _mm_and_si128(exp_is_zero, man_is_zero);
+        __m128i is_subnorm = _mm_andnot_si128(man_is_zero, exp_is_zero);
+        __m128i is_infnan  = _mm_cmpeq_epi32(exp, v31);
+        __m128i result = _mm_blendv_epi8(normal_u, sign, is_zero);
+        result = _mm_blendv_epi8(result, infnan_u, is_infnan);
+        _mm_storeu_ps(dst + i, _mm_castsi128_ps(result));
+        int m = _mm_movemask_ps(_mm_castsi128_ps(is_subnorm));
+        if (m) for (int k = 0; k < 4; k++) if ((m >> k) & 1) dst[i+k] = f16_to_f32(src[i+k]);
+    }
+    for (; i < n; i++) dst[i] = f16_to_f32(src[i]);
+}
+#else
+static void bf16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    for (int64_t i = 0; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+}
+static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    for (int64_t i = 0; i < n; i++) dst[i] = f16_to_f32(src[i]);
+}
+#endif
+
 static int st_open_fd(shards *S, const char *path) {
     for (int i = 0; i < S->nfd; i++) if (!strcmp(S->paths[i], path)) return S->fds[i];
     int fd = open(path, COMPAT_O_RDONLY);
@@ -954,9 +1069,9 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     if (t->dtype == 2) {
         memcpy(out, raw, t->nbytes);
     } else if (t->dtype == 0) {
-        uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = bf16_to_f32(p[i]);
+        bf16_to_f32_bulk((uint16_t *)raw, out, t->numel);
     } else {
-        uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = f16_to_f32(p[i]);
+        f16_to_f32_bulk((uint16_t *)raw, out, t->numel);
     }
     free(raw);
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
@@ -1342,8 +1457,8 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     if (nb) st_pread_full(t->fd, raw, nb, boff, "pread slice");   /* dev #331: chunked + EINTR + honest short-read */
     if (nb) {
         if (t->dtype == 2) memcpy(out, raw, (size_t)nb);
-        else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
-        else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
+        else if (t->dtype == 0) bf16_to_f32_bulk((uint16_t *)raw, out, n_elems);
+        else f16_to_f32_bulk((uint16_t *)raw, out, n_elems);
     }
     free(raw);
     if (drop && nb) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);

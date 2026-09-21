@@ -503,13 +503,13 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
 	test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real \
-	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_qwen38_tier_engine
+	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 ifneq (,$(X86_64))
-TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE) tests/test_olmoe_dot_i8_16_sse41$(EXE)
+TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE) tests/test_olmoe_dot_i8_16_sse41$(EXE) tests/test_st_f16_bf16_simd_sse41$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
@@ -1197,6 +1197,11 @@ tests/test_qwen36_tok_truncated$(EXE): tests/test_qwen36_tok_truncated.c qwen36.
 tests/test_qwen36_encode_oom$(EXE): tests/test_qwen36_encode_oom.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# slot_ensure_int8's wiring onto #1271's unpack_int4_to_int8: regression check
+# that its output matches the old separate scalar nibble-unpack loop it replaced.
+tests/test_qwen36_slot_int8$(EXE): tests/test_qwen36_slot_int8.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 # Reproducible local timing evidence; intentionally not a noisy CI perf gate.
 tests/bench_qwen36_dense_batch$(EXE): tests/bench_qwen36_dense_batch.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
@@ -1320,6 +1325,28 @@ tests/test_dup_name_refusal$(EXE): tests/test_dup_name_refusal.c st.h json.h com
 
 tests/test_st_shape$(EXE): tests/test_st_shape.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Exhaustive bit-exact gate for st.h's bf16_to_f32_bulk/f16_to_f32_bulk AVX2 tier
+# (all 65536 patterns per format -- see the file for why no tolerance applies).
+tests/test_st_f16_bf16_simd$(EXE): tests/test_st_f16_bf16_simd.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Same gate, forced onto the SSE4.1 tier: overrides the host's default -march
+# so the SSE4.1 body in st.h is actually exercised even on a devbox that
+# would otherwise always pick the AVX2 tier.
+tests/test_st_f16_bf16_simd_sse41$(EXE): tests/test_st_f16_bf16_simd.c st.h json.h compat.h
+	$(CC) $(CFLAGS) -msse4.1 -mno-avx2 -mno-fma $< -o $@ $(LDFLAGS)
+
+# bf16_to_f32_bulk/f16_to_f32_bulk vs the scalar per-element reference, NOT a
+# test gate. Build on demand: make tests/bench_st_f16_bf16_simd ARCH=native
+tests/bench_st_f16_bf16_simd$(EXE): tests/bench_st_f16_bf16_simd.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Synthetic peak-RSS proxy for qwen36.c's dense-int8-during-load change
+# (load_tq vs the old post-hoc qdw_register pass), NOT a test gate. Build on
+# demand: make tests/bench_load_tq_peak_rss
+tests/bench_load_tq_peak_rss$(EXE): tests/bench_load_tq_peak_rss.c
+	$(CC) -O3 -march=native $< -o $@ -lm
 
 tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
