@@ -20,6 +20,7 @@ import {
   MessageSquareText,
   MonitorDot,
   RefreshCw,
+  StepForward,
   SlidersHorizontal,
   Timer,
   Trash2,
@@ -210,19 +211,13 @@ export default function App() {
 
   const canSend = useMemo(() => (draft.trim() || pending.length) && model && !loading, [draft, loading, model, pending])
 
-  /* consumeDraft is false for regenerate so a follow-up already in the composer is not eaten. */
-  const send = async (text = draft, previous = messages, pictures = pending, consumeDraft = true) => {
-    const content = text.trim()
-    if ((!content && !pictures.length) || loading) return
-    const user = message("user", content, pictures)
-    const assistant = message("assistant", "")
-    const history = [...previous, user]
-    if (consumeDraft) {
-      setDraft("")
-      setPending([])
-    }
+  /* The shared streaming core. POSTs `payload` and appends every delta into the
+     message `targetId`, with the same live metrics and abort/error wiring whether
+     the turn is a fresh answer (send) or a continued one (continueTurn). The only
+     difference between the two callers is what they put in `payload` and which
+     bubble they stream into; everything below is identical, so it lives here. */
+  const runStream = async (payload: ChatMessage[], targetId: string) => {
     setError("")
-    updateMessages([...history, assistant])
     setLoading(true)
     setStreamStart(null)
     setTokenCount(0)
@@ -239,7 +234,7 @@ export default function App() {
         baseUrl,
         apiKey,
         model,
-        messages: history,
+        messages: payload,
         temperature,
         maxTokens,
         enableThinking: thinking,
@@ -255,7 +250,7 @@ export default function App() {
           const since = (performance.now() - decodeStart) / 1000
           if (count > 1 && since > 0.2) setTokPerSec((count - 1) / since)
           updateMessages((current) => current.map((item) =>
-            item.id === assistant.id ? { ...item, reasoning: (item.reasoning ?? "") + delta } : item,
+            item.id === targetId ? { ...item, reasoning: (item.reasoning ?? "") + delta } : item,
           ))
         },
         onDelta: (delta) => {
@@ -269,7 +264,7 @@ export default function App() {
           const since = (performance.now() - decodeStart) / 1000
           if (count > 1 && since > 0.2) setTokPerSec((count - 1) / since)
           updateMessages((current) => current.map((item) =>
-            item.id === assistant.id ? { ...item, content: item.content + delta } : item,
+            item.id === targetId ? { ...item, content: item.content + delta } : item,
           ))
         },
       })
@@ -284,16 +279,53 @@ export default function App() {
       setLastRun(result)
       setConnected(true)
     } catch (cause) {
+      /* Drop the target bubble only if it is empty -- a first turn that never got
+         a token. A continued turn already carries the client's opening, so the
+         `|| item.content` keeps it on the screen through an abort or an error. */
       if (controller.signal.aborted) {
-        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content || item.reasoning))
+        updateMessages((current) => current.filter((item) => item.id !== targetId || item.content || item.reasoning))
       } else {
         setError(cause instanceof Error ? cause.message : "status.generationFailed")
-        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content || item.reasoning))
+        updateMessages((current) => current.filter((item) => item.id !== targetId || item.content || item.reasoning))
       }
     } finally {
       abortRef.current = null
       setLoading(false)
     }
+  }
+
+  /* consumeDraft is false for regenerate so a follow-up already in the composer is not eaten. */
+  const send = async (text = draft, previous = messages, pictures = pending, consumeDraft = true) => {
+    const content = text.trim()
+    if ((!content && !pictures.length) || loading) return
+    const user = message("user", content, pictures)
+    const assistant = message("assistant", "")
+    const history = [...previous, user]
+    if (consumeDraft) {
+      setDraft("")
+      setPending([])
+    }
+    updateMessages([...history, assistant])
+    await runStream(history, assistant.id)
+  }
+
+  /* Continue the trailing assistant turn instead of opening a new one: resend the
+     transcript ending on that turn and stream the model's resumption into the same
+     bubble. Needs the server's COLI_CONTINUE_ASSISTANT path (default on across the
+     shipped families) -- an older server folds the turn into a completed one and
+     appends a fresh generation cue, so this reads as an ordinary re-answer there.
+     Trailing whitespace is stripped because the server refuses it (the template
+     strips it, so the model would resume from different bytes than were sent); the
+     UI is set to those exact bytes first, so the bubble shows what it resumes from. */
+  const continueTurn = async () => {
+    if (loading) return
+    const last = messages[messages.length - 1]
+    if (!last || last.role !== "assistant" || !last.content.trim()) return
+    const trimmed = last.content.replace(/\s+$/, "")
+    const history = messages.map((item) =>
+      item.id === last.id ? { ...item, content: trimmed } : item)
+    updateMessages(history)
+    await runStream(history, last.id)
   }
 
   const openSettings = (page = "general") => { setSettingsPage(page); setView("settings") }
@@ -431,7 +463,7 @@ export default function App() {
                   <div className="reasoning-body">{item.reasoning}</div>
                 </details>
               : null}{item.content ? (item.role === "assistant" ? <Markdown text={item.content} /> : item.content) : <span className="typing" aria-label={t("ui.generating")}><i /><i /><i /></span>}</div>
-            {item.role === "assistant" && item.content && <div className="message-actions"><button className="icon-action" aria-label={t("ui.copy")} title={t("ui.copy")} onClick={() => void copyMessage(item)}><Copy /></button>{copied === item.id && <span role="status">{t("ui.copied")}</span>}{index === messages.length - 1 && !loading && <button className="icon-action" aria-label={t("ui.regenerate")} title={t("ui.regenerate")} onClick={() => { const retry = resendFrom(messages, index); if (retry) void send(retry.text, retry.previous, retry.pictures, false) }}><RefreshCw /></button>}</div>}
+            {item.role === "assistant" && item.content && <div className="message-actions"><button className="icon-action" aria-label={t("ui.copy")} title={t("ui.copy")} onClick={() => void copyMessage(item)}><Copy /></button>{copied === item.id && <span role="status">{t("ui.copied")}</span>}{index === messages.length - 1 && !loading && <button className="icon-action" aria-label={t("ui.regenerate")} title={t("ui.regenerate")} onClick={() => { const retry = resendFrom(messages, index); if (retry) void send(retry.text, retry.previous, retry.pictures, false) }}><RefreshCw /></button>}{index === messages.length - 1 && !loading && <button className="icon-action" aria-label={t("ui.continue")} title={t("ui.continue")} onClick={() => void continueTurn()}><StepForward /></button>}</div>}
           </article>)}<div ref={bottomRef} /></div>
         </div>}
         <div className="composer-wrap">
