@@ -477,9 +477,10 @@ def env_for_engine(a, arch, plan=None):
     # sets it for GLM and openai_server.py sets it for the gateway, so `coli
     # chat` and `coli serve` worked while `coli run` handed the sister engines
     # an environment without it: OLMoE exited with "started without a model"
-    # (#1501). Set it here, once, for all of them.
+    # (#1501, #1600). Set it here, once, for all of them. --model is the
+    # directory, same as env_for(): a leftover SNAP must not load another model.
     if getattr(a, "model", None):
-        env.setdefault("SNAP", os.path.abspath(a.model))
+        env["SNAP"] = os.path.abspath(a.model)
     if arch == "olmoe":
         env["CHAT"] = "1"
         env["MAX_NEW"] = str(ngen_for(a, family=arch))

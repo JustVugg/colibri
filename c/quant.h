@@ -555,6 +555,82 @@ static inline int64_t fp8_nblk(int n){ return ((int64_t)n + FP8_BLOCK - 1) / FP8
  * is the GPU one; a vectorized CPU kernel is future work if measured needed).
  * Mirrors matmul_i3's double-accumulate-across-groups / float-within-group
  * convention so cross-block cancellation doesn't cost precision unfairly. */
+/* Two kernels, selected by compiler, because the faster one is only
+   BIT-EXACT under clang.
+
+   The four-accumulator form is algebraically identical to the one-accumulator
+   loop - same operands, same column order - so any difference comes purely
+   from the compiler contracting multiply-adds differently in the four-chain
+   shape, which drifts results by ~1 ulp.  That would break the byte-exact
+   contract tests/test_qwen38_native_weights.c pins against its independent
+   reference, and a one-ulp logit can flip an argmax in the token-exact gates.
+
+   Under GCC that contraction cannot be controlled from source.  Measured on
+   gcc 13.4, clean build per cell, against this kernel's own test:
+     - #pragma GCC optimize ("fp-contract=off")     ignored (no-op)
+     - #pragma GCC optimize ("-ffp-contract=off")   ignored (no-op)
+     - __attribute__((optimize("-ffp-contract=off"))) ignored (no-op)
+     - #pragma STDC FP_CONTRACT OFF                 unimplemented: GCC warns
+                                                    "ignoring '#pragma STDC
+                                                    FP_CONTRACT'"
+   Only the command-line -ffp-contract=off works, and that is a global numerics
+   decision this kernel has no business making for the whole project.  With no
+   guard, the four-row form is exact on -march=znver3 and -march=x86-64-v3 but
+   NOT on -march=haswell, so "it passed on my machine" is not evidence here.
+
+   clang contracts the reference and this kernel identically, so the four-row
+   form is bit-exact there: verified on arm64 (binary byte-identical to the
+   one-row build) and on x86 clang at -march=haswell, znver3 and x86-64-v3.
+   So clang gets the fast kernel and GCC keeps upstream's, which is exact on
+   every arch tested. */
+#if defined(__clang__)
+static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
+                       int S, int I, int O){
+    int64_t nblkI = fp8_nblk(I);
+    /* Four output rows per pass, each with its own accumulator.  Every row's
+       addition sequence is identical to the one-row form - same operands, same
+       column order - so results are bit-identical; only the interleaving of four
+       independent dependency chains differs.  The gain is latency hiding plus one
+       load of xs[i] feeding four rows.  A tail of fewer than four rows clamps the
+       spare indices onto the last valid row and the stores are guarded, which
+       avoids a separate remainder loop. */
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o+=4){
+        int o1=o+1<O ? o+1 : o, o2=o+2<O ? o+2 : o, o3=o+3<O ? o+3 : o;
+        const uint8_t *w0=q8+(int64_t)o*I,  *w1=q8+(int64_t)o1*I;
+        const uint8_t *w2=q8+(int64_t)o2*I, *w3=q8+(int64_t)o3*I;
+        const float *scl0=bscale+((int64_t)o /FP8_BLOCK)*nblkI;
+        const float *scl1=bscale+((int64_t)o1/FP8_BLOCK)*nblkI;
+        const float *scl2=bscale+((int64_t)o2/FP8_BLOCK)*nblkI;
+        const float *scl3=bscale+((int64_t)o3/FP8_BLOCK)*nblkI;
+        for(int s=0;s<S;s++){
+            const float *xs = x + (int64_t)s*I;
+            double a0=0,a1=0,a2=0,a3=0;
+            for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
+                int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
+                float acc0=0,acc1=0,acc2=0,acc3=0;
+                for(int i=base;i<base+blen;i++){
+                    float xv=xs[i];
+                    acc0 += e4m3_decode(w0[i])*xv;
+                    acc1 += e4m3_decode(w1[i])*xv;
+                    acc2 += e4m3_decode(w2[i])*xv;
+                    acc3 += e4m3_decode(w3[i])*xv;
+                }
+                a0 += (double)acc0*scl0[bi];
+                a1 += (double)acc1*scl1[bi];
+                a2 += (double)acc2*scl2[bi];
+                a3 += (double)acc3*scl3[bi];
+            }
+            y[(int64_t)s*O+o]=(float)a0;
+            if(o1!=o) y[(int64_t)s*O+o1]=(float)a1;
+            if(o2!=o) y[(int64_t)s*O+o2]=(float)a2;
+            if(o3!=o) y[(int64_t)s*O+o3]=(float)a3;
+        }
+    }
+}
+#else
+/* GCC and everything else: upstream's one-row kernel, unchanged.  Exact on
+   every -march tested; see the note above for why it is not simply replaced. */
 static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
                        int S, int I, int O){
     int64_t nblkI = fp8_nblk(I);
@@ -576,6 +652,7 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
         }
     }
 }
+#endif
 
 /* ---- IDOT: integer dot kernels (int8-quantized activations) --------------- */
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
@@ -1105,33 +1182,290 @@ static inline int32_t dot_i4p_u(const uint8_t *w4, const int8_t *x, int I){
  * EN: grouped planar IDOT, opt-in. With gs=64 the scale group IS the plane
  * block; per-group unsigned dot minus 8*group-sum, times the group scale.
  * int8 activations: not bit-identical to the f32 grouped kernel, hence the
- * flag until the ablation blesses a default. */
-static void matmul_i4p_grouped_idot(float *y, const int8_t *xq, const float *sx,
-                                    const int32_t *xsg, const uint8_t *q4,
-                                    const float *scale, int S, int I, int O, int gs){
+ * flag until the ablation blesses a default.
+ *
+ * Three execution shapes below, one contract: per (row, output) the float
+ * accumulation is the SAME sequence of fmaf((float)group_int, scale[g], a)
+ * in ascending g, and every group_int is an exact int32 — so the per-row
+ * path, the 1x4 row tile, and the AMX tile are bit-identical to each other
+ * and to the pure-C reference on every ISA. */
+
+/* one planar 64-element block, unpacked once and shared across a row tile:
+ * lo nibbles = elements base..base+31 in order, hi = base+32..base+63. */
+#if defined(coli_dpbusd256)
+static inline void i4p_blk256(const uint8_t *blk, __m256i *lo, __m256i *hi){
+    const __m256i m4=_mm256_set1_epi8(0x0F);
+    __m256i b=_mm256_loadu_si256((const __m256i*)blk);
+    *lo=_mm256_and_si256(b,m4);
+    *hi=_mm256_and_si256(_mm256_srli_epi16(b,4),m4);
+}
+#endif
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+/* whole block in one zmm: lanes 0..31 = lo elements, 32..63 = hi — matches a
+ * straight 64-byte load of the activation block, so ONE dpbusd per block. */
+static inline __m512i i4p_blk512(const uint8_t *blk){
+    const __m256i m4=_mm256_set1_epi8(0x0F);
+    __m256i b=_mm256_loadu_si256((const __m256i*)blk);
+    return _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_and_si256(b,m4)),
+                              _mm256_and_si256(_mm256_srli_epi16(b,4),m4),1);
+}
+#endif
+
+/* ---- K1c: AMX int8 tile kernel (Sapphire Rapids+, opt-in via the same
+ * IDOT_GS=1 family gate; AMX=0 kills it, AMX_S_MIN sets the row threshold).
+ * With gs a multiple of 64, K=64 tile-multiplies cover a scale group exactly:
+ * B tile = 16 output rows' int4 block unpacked once to SIGNED int8 (v-8, so
+ * tdpbssd returns d - 8*sum(x_group) directly — the same int32 the vector
+ * path computes as d_unsigned - 8*xsg), A tile = up to 16 activation rows.
+ * The unpack cost is paid once per (output tile, group) and amortized over
+ * every activation row — the multi-row reuse the pair-layout kernels lack.
+ * Linux-only arming: tile data needs an ARCH_REQ_XCOMP_PERM handshake. */
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__) && defined(__AVX512F__)
+#define COLI_HAVE_AMX_I4P 1
+#if defined(__linux__)
+#include <unistd.h>
+#include <sys/syscall.h>
+#elif defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+static int coli_amx_state=-1;
+static int coli_amx_s_min=8;
+static int coli_amx_ok(void){
+    if(coli_amx_state<0){
+        const char *e=getenv("AMX");
+        const char *sm=getenv("AMX_S_MIN"); if(sm&&atoi(sm)>0) coli_amx_s_min=atoi(sm);
+#if defined(__linux__)
+        /* ARCH_REQ_XCOMP_PERM(XFEATURE_XTILEDATA): kernel >= 5.16 grants tile
+         * state per-process; without it the first tile op SIGILLs. */
+        coli_amx_state=(e&&*e=='0')?0:(syscall(SYS_arch_prctl,0x1023,18)==0);
+#elif defined(_WIN32)
+        /* Windows 11: tile data is an opt-in per-process XState feature.
+         * Dynamic lookup keeps older kernels building/running (arming just
+         * fails closed there). XSTATE_AMX_TILE_DATA = 18. */
+        if(e&&*e=='0') coli_amx_state=0;
+        else {
+            HMODULE k32=GetModuleHandleA("kernel32.dll");
+            typedef BOOL (WINAPI *coli_xstate_fn)(ULONG64);
+            coli_xstate_fn f=k32?(coli_xstate_fn)(void*)GetProcAddress(k32,"EnableProcessOptionalXStateFeatures"):NULL;
+            coli_amx_state=(f && f(1ull<<18))?1:0;
+        }
+#else
+        (void)e; coli_amx_state=0;
+#endif
+        if(coli_amx_state)
+            fprintf(stderr,"[K1c] AMX int8 tile kernel armed for gs64 tensors "
+                           "(AMX=0 disables, engages at S>=%d)\n",coli_amx_s_min);
+    }
+    return coli_amx_state;
+}
+/* ldtilecfg layout (palette 1): tmm0=C [rows x 16 i32], tmm1=A [rows x 64 i8],
+ * tmm2=B [16 x 64 i8 VNNI]. rows<16 reconfigures for the last partial s-tile. */
+struct coli_tilecfg { uint8_t palette,start_row,rsvd[14]; uint16_t colsb[16]; uint8_t rows[16]; };
+static void coli_amx_cfg(int arows){
+    struct coli_tilecfg c; memset(&c,0,sizeof c); c.palette=1;
+    c.rows[0]=(uint8_t)arows; c.colsb[0]=64;
+    c.rows[1]=(uint8_t)arows; c.colsb[1]=64;
+    c.rows[2]=16;             c.colsb[2]=64;
+    _tile_loadconfig(&c);
+}
+static void matmul_i4p_gidot_amx(float *y, const int8_t *xq, const float *sx,
+                                 const uint8_t *q4, const float *scale,
+                                 int S, int I, int O16, int O, int gs){
+    int rb=(I+1)/2, ng=(I+gs-1)/gs, bpg=gs/64;
+    #pragma omp parallel
+    {
+        float *acc=malloc((size_t)S*16*sizeof(float));
+        if(!acc){ fprintf(stderr,"OOM: amx acc\n"); exit(1); }
+        int8_t  bstage[4*1024] __attribute__((aligned(64)));   /* bpg<=4 gated below */
+        int32_t cbuf[16*16]    __attribute__((aligned(64)));
+        float   sclT[16];
+        int cur=16; coli_amx_cfg(16);
+        #pragma omp for schedule(static)
+        for(int ot=0; ot<O16; ot+=16){
+            memset(acc,0,(size_t)S*16*sizeof(float));
+            for(int g=0; g<ng; g++){
+                for(int j=0;j<16;j++) sclT[j]=scale[(int64_t)(ot+j)*ng+g];
+                for(int b=0;b<bpg;b++){
+                    /* B tile, VNNI [k/4][n][4]: element k of output row ot+n
+                     * lands at row k/4, byte n*4+k%4 — signed (v-8) at unpack. */
+                    int8_t *dst=bstage+(size_t)b*1024;
+                    int64_t boff=((int64_t)g*gs+b*64)>>1;
+                    for(int n=0;n<16;n++){
+                        const uint8_t *blk=q4+(int64_t)(ot+n)*rb+boff;
+                        for(int k=0;k<32;k++){
+                            dst[(k>>2)*64+n*4+(k&3)]          =(int8_t)((blk[k]&0xF)-8);
+                            dst[((k+32)>>2)*64+n*4+((k+32)&3)]=(int8_t)((blk[k]>>4)-8);
+                        }
+                    }
+                }
+                for(int st=0; st<S; st+=16){
+                    int rows=S-st<16?S-st:16;
+                    if(rows!=cur){ coli_amx_cfg(rows); cur=rows; }
+                    _tile_zero(0);
+                    for(int b=0;b<bpg;b++){
+                        _tile_loadd(1, xq+(int64_t)st*I+(int64_t)g*gs+b*64, (size_t)I);
+                        _tile_loadd(2, bstage+(size_t)b*1024, 64);
+                        _tile_dpbssd(0,1,2);
+                    }
+                    _tile_stored(0, cbuf, 64);
+                    /* per-lane fmadd == the vector path's per-(s,o) scalar fmaf:
+                     * same values, same ascending-g order, single rounding. */
+                    for(int r=0;r<rows;r++){
+                        __m512 cv=_mm512_cvtepi32_ps(_mm512_load_si512((const void*)(cbuf+(size_t)r*16)));
+                        __m512 av=_mm512_loadu_ps(acc+(int64_t)(st+r)*16);
+                        _mm512_storeu_ps(acc+(int64_t)(st+r)*16,
+                                         _mm512_fmadd_ps(cv,_mm512_loadu_ps(sclT),av));
+                    }
+                }
+            }
+            for(int s=0;s<S;s++)
+                _mm512_storeu_ps(y+(int64_t)s*O+ot,
+                                 _mm512_mul_ps(_mm512_loadu_ps(acc+(int64_t)s*16),
+                                               _mm512_set1_ps(sx[s])));
+        }
+        _tile_release();
+        free(acc);
+    }
+}
+#endif
+
+/* vector body over an output range [o0,o1): the 1x4 row tile pays the weight
+ * block's load+mask once per 4 activation rows (the fmt=2 K2 tile's idea,
+ * brought to the grouped family — the prefill batch-union and the serve mux
+ * deliver exactly these multi-row calls). Integer group dots in any lane
+ * order are exact, and each row keeps its own ascending-g fmaf chain. */
+static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
+                           const int32_t *xsg, const uint8_t *q4,
+                           const float *scale, int S, int I, int O, int gs,
+                           int o0, int o1){
     int rb=(I+1)/2, ng=(I+gs-1)/gs, bpg=gs/64;   /* blocchi-piano per gruppo */
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){
+    for(int o=o0;o<o1;o++){
         const uint8_t *w=q4+(int64_t)o*rb;
         const float *scl=scale+(int64_t)o*ng;
-        for(int s=0;s<S;s++){
+        int s=0;
+        for(; s+4<=S; s+=4){
+            const int8_t  *x0=xq +(int64_t)s*I,  *x1=x0+I,  *x2=x1+I,  *x3=x2+I;
+            const int32_t *g0=xsg+(int64_t)s*ng, *g1=g0+ng, *g2=g1+ng, *g3=g2+ng;
+            float a0=0,a1=0,a2=0,a3=0;
+            int g=0;
+            for(; (g+1)*gs<=I; g++){
+                int32_t d0,d1,d2,d3;
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                __m512i A0=_mm512_setzero_si512(),A1=_mm512_setzero_si512();
+                __m512i A2=_mm512_setzero_si512(),A3=_mm512_setzero_si512();
+                for(int b=0;b<bpg;b++){
+                    int base=g*gs+b*64;
+                    __m512i wz=i4p_blk512(w+(base>>1));
+                    A0=_mm512_dpbusd_epi32(A0,wz,_mm512_loadu_si512((const void*)(x0+base)));
+                    A1=_mm512_dpbusd_epi32(A1,wz,_mm512_loadu_si512((const void*)(x1+base)));
+                    A2=_mm512_dpbusd_epi32(A2,wz,_mm512_loadu_si512((const void*)(x2+base)));
+                    A3=_mm512_dpbusd_epi32(A3,wz,_mm512_loadu_si512((const void*)(x3+base)));
+                }
+                d0=_mm512_reduce_add_epi32(A0); d1=_mm512_reduce_add_epi32(A1);
+                d2=_mm512_reduce_add_epi32(A2); d3=_mm512_reduce_add_epi32(A3);
+#elif defined(coli_dpbusd256)
+                __m256i A0=_mm256_setzero_si256(),A1=_mm256_setzero_si256();
+                __m256i A2=_mm256_setzero_si256(),A3=_mm256_setzero_si256();
+                for(int b=0;b<bpg;b++){
+                    int base=g*gs+b*64; __m256i lo,hi;
+                    i4p_blk256(w+(base>>1),&lo,&hi);
+                    A0=coli_dpbusd256(A0,lo,_mm256_loadu_si256((const __m256i*)(x0+base)));
+                    A0=coli_dpbusd256(A0,hi,_mm256_loadu_si256((const __m256i*)(x0+base+32)));
+                    A1=coli_dpbusd256(A1,lo,_mm256_loadu_si256((const __m256i*)(x1+base)));
+                    A1=coli_dpbusd256(A1,hi,_mm256_loadu_si256((const __m256i*)(x1+base+32)));
+                    A2=coli_dpbusd256(A2,lo,_mm256_loadu_si256((const __m256i*)(x2+base)));
+                    A2=coli_dpbusd256(A2,hi,_mm256_loadu_si256((const __m256i*)(x2+base+32)));
+                    A3=coli_dpbusd256(A3,lo,_mm256_loadu_si256((const __m256i*)(x3+base)));
+                    A3=coli_dpbusd256(A3,hi,_mm256_loadu_si256((const __m256i*)(x3+base+32)));
+                }
+                d0=hsum256_i32(A0); d1=hsum256_i32(A1);
+                d2=hsum256_i32(A2); d3=hsum256_i32(A3);
+#elif defined(__AVX2__)
+                const __m256i ones=_mm256_set1_epi16(1);
+                const __m256i m4=_mm256_set1_epi8(0x0F);
+                __m256i A0=_mm256_setzero_si256(),A1=_mm256_setzero_si256();
+                __m256i A2=_mm256_setzero_si256(),A3=_mm256_setzero_si256();
+                for(int b=0;b<bpg;b++){
+                    int base=g*gs+b*64;
+                    __m256i bb=_mm256_loadu_si256((const __m256i*)(w+(base>>1)));
+                    __m256i lo=_mm256_and_si256(bb,m4);
+                    __m256i hi=_mm256_and_si256(_mm256_srli_epi16(bb,4),m4);
+                    /* maddubs(u8,s8): u<=15, |x|<=127 -> pair <= 3810, int16-safe */
+                    A0=_mm256_add_epi32(A0,_mm256_madd_epi16(_mm256_maddubs_epi16(lo,_mm256_loadu_si256((const __m256i*)(x0+base))),ones));
+                    A0=_mm256_add_epi32(A0,_mm256_madd_epi16(_mm256_maddubs_epi16(hi,_mm256_loadu_si256((const __m256i*)(x0+base+32))),ones));
+                    A1=_mm256_add_epi32(A1,_mm256_madd_epi16(_mm256_maddubs_epi16(lo,_mm256_loadu_si256((const __m256i*)(x1+base))),ones));
+                    A1=_mm256_add_epi32(A1,_mm256_madd_epi16(_mm256_maddubs_epi16(hi,_mm256_loadu_si256((const __m256i*)(x1+base+32))),ones));
+                    A2=_mm256_add_epi32(A2,_mm256_madd_epi16(_mm256_maddubs_epi16(lo,_mm256_loadu_si256((const __m256i*)(x2+base))),ones));
+                    A2=_mm256_add_epi32(A2,_mm256_madd_epi16(_mm256_maddubs_epi16(hi,_mm256_loadu_si256((const __m256i*)(x2+base+32))),ones));
+                    A3=_mm256_add_epi32(A3,_mm256_madd_epi16(_mm256_maddubs_epi16(lo,_mm256_loadu_si256((const __m256i*)(x3+base))),ones));
+                    A3=_mm256_add_epi32(A3,_mm256_madd_epi16(_mm256_maddubs_epi16(hi,_mm256_loadu_si256((const __m256i*)(x3+base+32))),ones));
+                }
+                d0=hsum256_i32(A0); d1=hsum256_i32(A1);
+                d2=hsum256_i32(A2); d3=hsum256_i32(A3);
+#else
+                d0=d1=d2=d3=0;
+                for(int b=0;b<bpg;b++){
+                    int base=g*gs+b*64;
+                    const uint8_t *blk=w+(base>>1);
+                    for(int k=0;k<32;k++){
+                        int32_t ul=(int32_t)(blk[k]&0xF), uh=(int32_t)(blk[k]>>4);
+                        d0+=ul*x0[base+k]+uh*x0[base+k+32];
+                        d1+=ul*x1[base+k]+uh*x1[base+k+32];
+                        d2+=ul*x2[base+k]+uh*x2[base+k+32];
+                        d3+=ul*x3[base+k]+uh*x3[base+k+32];
+                    }
+                }
+#endif
+                a0=fmaf((float)(d0-8*g0[g]),scl[g],a0);
+                a1=fmaf((float)(d1-8*g1[g]),scl[g],a1);
+                a2=fmaf((float)(d2-8*g2[g]),scl[g],a2);
+                a3=fmaf((float)(d3-8*g3[g]),scl[g],a3);
+            }
+            if(g*gs<I){                                  /* coda: gruppo parziale, nibble a coppie */
+                int32_t d0=0,d1=0,d2=0,d3=0;
+                for(int i=g*gs;i<I;i++){
+                    uint8_t byte=w[i>>1];
+                    int32_t u=(int32_t)((i&1)?(byte>>4):(byte&0xF));
+                    d0+=u*x0[i]; d1+=u*x1[i]; d2+=u*x2[i]; d3+=u*x3[i];
+                }
+                a0=fmaf((float)(d0-8*g0[g]),scl[g],a0);
+                a1=fmaf((float)(d1-8*g1[g]),scl[g],a1);
+                a2=fmaf((float)(d2-8*g2[g]),scl[g],a2);
+                a3=fmaf((float)(d3-8*g3[g]),scl[g],a3);
+            }
+            y[(int64_t)s*O+o]    =a0*sx[s];
+            y[(int64_t)(s+1)*O+o]=a1*sx[s+1];
+            y[(int64_t)(s+2)*O+o]=a2*sx[s+2];
+            y[(int64_t)(s+3)*O+o]=a3*sx[s+3];
+        }
+        for(; s<S; s++){
             const int8_t *xr=xq+(int64_t)s*I;
             const int32_t *xg=xsg+(int64_t)s*ng;
             float a=0; int g=0;
             for(; (g+1)*gs<=I; g++){                     /* gruppi interi */
                 int32_t d=0;
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                __m512i acc=_mm512_setzero_si512();
+                for(int b=0;b<bpg;b++){
+                    int base=g*gs+b*64;
+                    acc=_mm512_dpbusd_epi32(acc,i4p_blk512(w+(base>>1)),
+                                            _mm512_loadu_si512((const void*)(xr+base)));
+                }
+                d=_mm512_reduce_add_epi32(acc);
+#else
                 for(int b=0;b<bpg;b++){
                     int base=g*gs+b*64;
                     const uint8_t *blk=w+(base>>1);
                     const int8_t *xb=xr+base;
 #if defined(coli_dpbusd256)
-                    const __m256i m4=_mm256_set1_epi8(0x0F);
-                    __m256i bb=_mm256_loadu_si256((const __m256i*)blk);
+                    __m256i lo,hi; i4p_blk256(blk,&lo,&hi);
                     __m256i acc=_mm256_setzero_si256();
-                    acc=coli_dpbusd256(acc,_mm256_and_si256(bb,m4),
-                                       _mm256_loadu_si256((const __m256i*)xb));
-                    acc=coli_dpbusd256(acc,_mm256_and_si256(_mm256_srli_epi16(bb,4),m4),
-                                       _mm256_loadu_si256((const __m256i*)(xb+32)));
+                    acc=coli_dpbusd256(acc,lo,_mm256_loadu_si256((const __m256i*)xb));
+                    acc=coli_dpbusd256(acc,hi,_mm256_loadu_si256((const __m256i*)(xb+32)));
                     d+=hsum256_i32(acc);
 #elif defined(__AVX2__)
                     const __m256i m4=_mm256_set1_epi8(0x0F);
@@ -1151,6 +1485,7 @@ static void matmul_i4p_grouped_idot(float *y, const int8_t *xq, const float *sx,
                     }
 #endif
                 }
+#endif
                 a=fmaf((float)(d-8*xg[g]),scl[g],a);
             }
             if(g*gs<I){                                  /* coda: gruppo parziale, nibble a coppie */
@@ -1164,6 +1499,24 @@ static void matmul_i4p_grouped_idot(float *y, const int8_t *xq, const float *sx,
             y[(int64_t)s*O+o]=a*sx[s];
         }
     }
+}
+
+static void matmul_i4p_grouped_idot(float *y, const int8_t *xq, const float *sx,
+                                    const int32_t *xsg, const uint8_t *q4,
+                                    const float *scale, int S, int I, int O, int gs){
+#if defined(COLI_HAVE_AMX_I4P)
+    /* AMX takes the aligned bulk (full 16-output tiles, full groups only —
+     * the real gs64 checkpoints have I%gs==0); the vector path finishes any
+     * output remainder. Below the row threshold the B-tile unpack does not
+     * amortize and the vector tile is the better kernel. */
+    if(coli_amx_ok() && S>=coli_amx_s_min && gs%64==0 && gs<=256 && I%gs==0 && O>=16){
+        int O16=O&~15;
+        matmul_i4p_gidot_amx(y,xq,sx,q4,scale,S,I,O16,O,gs);
+        if(O16<O) i4p_gidot_rows(y,xq,sx,xsg,q4,scale,S,I,O,gs,O16,O);
+        return;
+    }
+#endif
+    i4p_gidot_rows(y,xq,sx,xsg,q4,scale,S,I,O,gs,0,O);
 }
 
 /* matmul IDOT planare (fmt=2): y = (dot_u - 8*xsum[s]) * scale[o] * sx[s].

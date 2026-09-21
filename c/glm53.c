@@ -971,7 +971,7 @@ static void mv(float *out, const Mat *w, const float *x) {
     }
 #endif
 #ifdef COLI_VULKAN
-    if (g_vk_ready && (w->fmt == 1 || w->fmt == 4)) {
+    if (g_vk_ready && w->resident && (w->fmt == 1 || w->fmt == 4)) {
         Mat *mutable_w = (Mat *)w;
         if (coli_vk_matmul((ColiVkTensor **)&mutable_w->vk, out, x,
                            w->fmt == 4 ? (const void *)w->q4 : (const void *)w->q8,
@@ -1277,15 +1277,6 @@ static void expert_table_init(GModel *m) {
 /* Quanti slot per layer: il budget diviso i layer sparsi. Il pavimento e' 1 e
  * non topk, perche' un pavimento a topk impegnerebbe topk*layer slot comunque,
  * cioe' molti GB, a dispetto del budget chiesto. */
-/* Quanta RAM il sistema dice di poter dare adesso. MemAvailable e non MemFree:
- * la seconda ignora la page cache riutilizzabile e farebbe stimare molto meno
- * di quello che c'e'. */
-static double memory_available_gb(void) {
-    /* #1375: era una lettura di /proc/meminfo, che su Windows e macOS non
-     * esiste: 0 -> budget 1 GB -> uno slot per layer, in silenzio. */
-    return compat_mem_available_gb();
-}
-
 static void expert_cache_init(GModel *m) {
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_EXPERT_GB");
@@ -1295,19 +1286,39 @@ static void expert_cache_init(GModel *m) {
      * versi -- su una macchina piccola va in OOM, su una grande lascia RAM
      * inutilizzata mentre il disco fa tutto il lavoro, che e' esattamente
      * quello che e' successo alla prima esecuzione vera. */
-    double budget;
-    if (setting) budget = atof(setting);
-    else {
-        const double free_now = memory_available_gb();
-        budget = free_now - 3.0;
-        if (budget < 1.0) budget = 1.0;
-        if (getenv("GLM53_VERBOSE"))
-            fprintf(stderr, "expert budget: %.1f GB (%.1f available, 3 GB reserved)\n",
-                    budget, free_now);
-    }
     const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
     int sparse = m->layer_end - from;
     if (sparse < 0) sparse = 0;
+    double budget;
+    if (setting) budget = atof(setting);
+    else {
+        /* MemAvailable counts reclaimable page cache as free. Sizing this LRU
+         * from it means allocating, as anonymous memory, the very pages the
+         * next slot miss would have been served from: both caches hold the
+         * same bytes, the model is paid for twice, and the cheap copy is the
+         * one that loses. So leave the model room to stay in page cache and
+         * take only what is left over. */
+        double total = 0.0, free_now = 0.0;
+        compat_meminfo_gb(&total, &free_now);      /* one pass, both fields */
+        /* the routed experts dominate; the rest of the weights are ~7% */
+        const double model_gb = (double)sparse * c->n_experts * (double)m->e_slot / 1e9 * 1.07;
+        double margin = total * 0.08;
+        if (margin < 4.0) margin = 4.0;
+        if (total <= 0.0 || model_gb >= total - margin) {
+            /* The model does not fit in RAM anyway, so page cache cannot help:
+             * keep as many slots as possible, exactly as before. `total <= 0`
+             * is "could not measure" and takes the same safe path. */
+            budget = free_now - 3.0;
+        } else {
+            budget = total - model_gb - margin;
+            if (budget > free_now - 3.0) budget = free_now - 3.0;
+        }
+        if (budget < 1.0) budget = 1.0;
+        if (getenv("GLM53_VERBOSE"))
+            fprintf(stderr, "expert budget: %.1f GB (%.1f total, %.1f model, "
+                            "%.1f margin, %.1f available)\n",
+                    budget, total, model_gb, margin, free_now);
+    }
     int cap = (int)((budget * 1e9) / ((double)m->e_slot * (sparse > 0 ? sparse : 1)));
     if (g_cap_override > 0) cap = g_cap_override;      /* scelta esplicita: vince */
     if (cap < 1) cap = 1;
@@ -2376,6 +2387,9 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
 static void mat_release(Mat *mat) {
 #ifdef COLI_METAL
     if (mat->metal) coli_metal_tensor_free((ColiMetalTensor *)mat->metal);
+#endif
+#ifdef COLI_VULKAN
+    if (mat->vk) coli_vk_tensor_free((ColiVkTensor *)mat->vk);
 #endif
     free((void *)mat->f); free((void *)mat->q8);
     free((void *)mat->q4); free((void *)mat->s);

@@ -70,7 +70,10 @@ POST /v1/brio
 | field | required | meaning |
 |---|---|---|
 | `model` | yes | as in every other endpoint |
-| `options` | yes | 2 to 64 distinct non-empty strings |
+| `options` | one of | 2 to 64 distinct non-empty strings: one closed question |
+| `questions` | one of | an array of `{question, options}`: many questions on one state, see below |
+| `schema` | one of | an object `field: [values]`: a JSON object filled one field at a time, see below |
+| `task` | optional | with `schema`, what the object is for |
 | `state` | one of | the text to decide on |
 | `messages` | one of | a chat history used as the context instead of `state` |
 | `question` | optional | what to ask about the state |
@@ -96,6 +99,87 @@ The reply:
 
 `completion_tokens` is always **0**: nothing is generated. `read_tokens` counts the
 option tokens the engine read to score them.
+
+### Many questions on one text: `questions`
+
+The document is photographed once and every question pays only for its own
+words. This is the case where brio mode saves the most (5.7x against the chat,
+measured below), and the server keeps the order of the snapshots itself.
+
+```json
+{
+  "model": "qwen36",
+  "state": "340 lines, 8 files, no tests. CI is green but no coverage on that path.",
+  "questions": [
+    {"question": "What should the reviewer do?", "options": ["merge", "request changes", "close"]},
+    {"question": "Does it need tests?",          "options": ["yes", "no"]},
+    {"question": "How risky is it?",             "options": ["high", "medium", "low"], "normalize": "sum"}
+  ]
+}
+```
+
+The reply is `brio.answers`: an `answers` array in the same order, each entry
+shaped like a single `brio.choice` (`question`, `answer`, `entropy`, `choices`),
+and one `usage` for the whole request. Up to 64 questions, each with 2 to 64
+options; `normalize` can be set per question or once for all of them.
+
+### Fill a JSON object: `schema`
+
+The braces, the quotes and the field names are data the server writes. For
+each field, in the order you give them, the model only picks one of the values
+you allow, with the fields already filled visible to it. The JSON cannot come
+out malformed and no value can be outside your list, because nothing is
+generated.
+
+```json
+{
+  "model": "qwen36",
+  "state": "340 lines, 8 files, no tests. CI is green but no coverage on that path.",
+  "task": "Review this pull request.",
+  "schema": {
+    "decision":    ["merge", "request changes", "close"],
+    "needs_tests": ["yes", "no"],
+    "risk":        ["high", "medium", "low"],
+    "area":        ["engine", "gateway", "docs"]
+  }
+}
+```
+
+The reply is `brio.schema`: `json` is the filled object, ready to use, and
+`fields` carries, per field, the chosen `value`, its `p`, the `entropy` of that
+cell and the full `choices`. The entropy per field is the point: the measured
+run below was sure about `area` (0.17) and not about `needs_tests` and `risk`
+(0.95 and 0.99), and said so, where the chat wrote `"risk": "high"` with the
+same face. `task` is optional. Field names cannot contain quotes, backslashes
+or newlines; values can, they are escaped.
+
+### From your own code
+
+No SDK is needed: it is one JSON request on the same server, with the same
+API key header as the rest.
+
+```python
+import requests
+r = requests.post("http://127.0.0.1:8000/v1/brio", json={
+    "model": "qwen36",
+    "state": open("ticket.txt").read(),
+    "questions": [
+        {"question": "Which queue?", "options": ["billing", "bugs", "sales"]},
+        {"question": "Urgent?",      "options": ["yes", "no"]},
+    ]})
+for a in r.json()["answers"]:
+    print(a["question"], "->", a["answer"], f"(entropy {a['entropy']:.2f})")
+```
+
+```js
+const r = await fetch("http://127.0.0.1:8000/v1/brio", {
+  method: "POST", headers: {"Content-Type": "application/json"},
+  body: JSON.stringify({ model: "qwen36", state: ticket,
+    schema: { queue: ["billing", "bugs", "sales"], urgent: ["yes", "no"] } })
+});
+const { json, fields } = await r.json();
+// json.queue, json.urgent are guaranteed to be values from your lists
+```
 
 ### Do not put the options in the prompt
 

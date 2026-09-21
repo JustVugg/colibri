@@ -3,6 +3,142 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.12.0] — 2026-09-20
+
+81 pull requests since v1.11.0. A new way to ask a model a closed question,
+a redesigned dashboard and landing page, and a long run of small failures
+that used to answer 500 or die on a locale.
+
+### Brio mode: score a closed set instead of generating
+
+- **#1632**: brio mode, on all nine engines. Hand the engine the options an
+  answer is allowed to take and it reports the probability of each one
+  instead of writing the answer: the option tokens are read, not sampled,
+  so `completion_tokens` is 0 and no reply can fall outside the list. It is
+  opt-in per request through two `SUBMIT` keys, `logprobs=k` and `pin=1`;
+  without them every frame is byte-identical to before, which is asserted
+  per engine rather than claimed. `max_tokens=0` became legal, but only
+  together with `logprobs>0`.
+- The shared contract is three headers: `decode_batch.h` for the logprob
+  tail, `serve_codec.h` for the wire, and `pin_pool.h` for nested state
+  snapshots, so a request can keep one photograph of the shared
+  instructions and a deeper one of the instructions plus the question. With
+  one level the question is re-read once per option; with two, four items
+  cost 176 tokens instead of 496.
+- `kv_prefix_holds()` is the guard that makes the snapshots safe: a
+  snapshot is reused only when the prefix record still holds the same ids,
+  because a K/V bank can be dropped between two options.
+- Exactness is measured, not asserted: the logprobs read from a snapshot
+  match a cold recomputation to 0.00e+00 on all nine tiny fixtures, and on
+  the two real checkpoints available (qwen36 at 22 GB and DeepSeek V4.1
+  Flash at 476 GB).
+- Three clients: `POST /v1/brio` on the gateway, `/brio` in `coli chat`,
+  and a page in the dashboard. `docs/brio.md` has the request, the reply,
+  the normalisation choice and the cases where the mode does not help.
+- The endpoint takes three forms. `options` is one closed question.
+  `questions` is many questions on one state, each with its own options,
+  with the state photographed once and the snapshots ordered by the server.
+  `schema` is an object of field to allowed values: the server writes the
+  JSON skeleton and fills it one field at a time, so the object is valid by
+  construction and every value is one the caller allowed, each with its own
+  probability and entropy. Both were measured before they were exposed: the
+  5.7x and the 2.4x above are these two forms.
+
+### The dashboard and the landing page
+
+- **#1633**: the web dashboard is redesigned around a workspace and a
+  navigation dock, with a brio page that reads a document once and asks it
+  several questions, each with its own option set, and a light and dark
+  theme.
+- **#1635**: the landing page lists the models as a searchable list instead
+  of a card grid, gains a brio section, and gets a light and dark theme
+  built on the mechanism proposed in #1551. The shipping version and the
+  family names are generated from `c/version.py` and `c/family_registry.py`,
+  so the page cannot claim eight families again while nine are running.
+  The hero plays a recorded session rather than a mock-up.
+
+### Performance
+
+- **#1477**: one routed-expert kernel, `expert_ffn.h`, shared by the MoE
+  engines and used by qwen36 first: int4 kept planar in RAM instead of
+  unpacked to int8, and two OpenMP regions per layer instead of three per
+  expert. 12.8 to 15.7 tok/s with the resident set down from 29 to 17 GB,
+  output identical.
+- **#1424**: a CUDA VRAM tier for Qwen3.8-Flash-Next, 43 % on one 8 GB card
+  and 60 % on two.
+- **#1553** and **#1558**: the previous turn's KV is reused instead of
+  re-prefilling the transcript, on qwen36, olmoe and DeepSeek V4.1, with a
+  resumed prefill that is exact.
+- **#1521** and **#1524**: the mHC mix and the KDA convolution and head
+  loops run in parallel, bit-identical, for 3.9 % and 3.0 %.
+- **#1517**: the four engines that never sized their OpenMP team now do.
+- **#1522**: the DeepSeek V4.1 expert stream can be read from more than one
+  drive; **#1455** weights glm53 expert reads by disk and honours
+  `COLI_MODEL_MIRROR`; **#1543** fixes the V4 mirror cache on unified memory.
+- **#1495**: less overhead in the sparse router's top-K selection.
+
+### Fixed
+
+- Requests that answered `500 engine failed` and now answer properly:
+  a non-object `json_schema` (**#1587**), an unpaired surrogate escape
+  (**#1589**), a non-object `tool_choice.function` (**#1598**), and a tool
+  call whose arguments are not an object.
+- **#1595**: the grammar draft walker switched itself off after about sixty
+  repetitions. **#1596**: a nested array schema doubled the compiled
+  grammar at every level.
+- **#1483** and **#1514**: olmoe, inkling and glm53 refuse an over-long
+  prompt with `CONTEXT_EXCEEDED` instead of failing late.
+- **#1549**: the lazy shard-mapping table in `st.h` was published without
+  synchronisation and glm53 reached it from an OpenMP region.
+- **#1557**: a truncated multibyte tail made the qwen36 tokenizer read past
+  the prompt. **#1530**: an integer overflow check in `kimi_k3.c`.
+- **#1631**: `coli serve` reaches the expert-history save when it is stopped
+  with SIGTERM, not only on Ctrl-C. **#1628**: the expert grid is resent
+  after every turn, so the dashboard stops showing the cold snapshot
+  forever.
+- **#1608**: `coli doctor` matches core tensor roles by component instead of
+  by one family's spelling.
+- **#1526**, **#1584**, **#1585**, **#1536**: the planner, the auto-tuner
+  and the registry agree about which engine is running, and stop advising
+  GLM-only knobs on every family.
+- **#1489**: `coli bench` ran the GLM engine on any model. **#1503**: every
+  engine is handed its model directory through `SNAP`. **#1486** and
+  **#1488**: a directory without `config.json` names no engine, and
+  `coli convert` refuses an output directory that already holds one.
+
+### Windows, macOS and locales
+
+- **#1515**, **#1560**, **#1561**, **#1562**, **#1516**: the chat, `coli
+  run`, `coli tune` and the datapoint harness no longer die when an engine
+  line, a prompt or a dash does not fit the console code page.
+- **#1537**, **#1579**, **#1535**: the qwen36 CUDA_DLL build on Windows gets
+  its tier, is recognised, and the device probe loads the backend before
+  counting devices. **#1563**: the Inkling dense int4 converter finishes.
+- **#1599**: MacPorts libomp built every macOS engine single-threaded.
+  **#1548**: Metal falls back to `MTLCopyAllDevices` when there is no
+  system default device. **#1504**: olmoe measures available RAM on macOS
+  and Windows too.
+
+### Diagnostics
+
+- **#1494**, **#1506**, **#1512**: `PROF` reports block time, head time,
+  matmul, attention and lm_head, at microsecond resolution, on deepseek_v4,
+  olmoe and qwen36. **#1555**: `CONSIST=1` checks prefill against decode.
+- **#1482**: configurable generation statistics in `coli chat`, with exact
+  token throughput when the server reports it.
+- **#1468**, **#1487**, **#1480**: a failure in the MoE step, a missing core
+  tensor and duplicate tensor names are diagnosed by name instead of by a
+  generic message.
+
+### Docs and licence
+
+- **#1540** and **#1541**: the copyright holder is named and a `NOTICE` file
+  is added.
+- **#1294**: a reproducible benchmarking protocol; **#1508**: a GPU-backend
+  datapoint needs a correctness line to be accepted.
+- **#1471** and **#1473**: the expired Discord invite is replaced in all
+  four READMEs and on the site.
+
 ## [1.11.0] — 2026-09-13
 
 56 pull requests since v1.10.2. A ninth model family, five real bugs closed

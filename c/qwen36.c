@@ -188,7 +188,15 @@ static void build_byte_sym(void){
         g_unmap[cp]=(short)b;   /* reverse: mapped codepoint -> original byte */
     }
 }
-static void push_id(int **ids,int *n,int *cap,int v){ if(*n==*cap){*cap*=2; *ids=realloc(*ids,*cap*sizeof(int));} (*ids)[(*n)++]=v; }
+static void push_id(int **ids,int *n,int *cap,int v){
+    if(*n==*cap){
+        *cap*=2;
+        int *tmp=realloc(*ids,*cap*sizeof(int));
+        if(!tmp){ fprintf(stderr,"qwen36: OOM reallocating token id buffer (%d entries)\n",*cap); exit(1); }
+        *ids=tmp;
+    }
+    (*ids)[(*n)++]=v;
+}
 
 static int try_special(const char *s,int i,int n,int *id_out){
     int best_len=0,best_id=-1;
@@ -236,7 +244,13 @@ static void bpe_piece(const char *piece,int len,int **ids,int *n,int *cap){
     for(int b=0;b<len;b++){
         const char *sym=byte_sym_utf8[(unsigned char)piece[b]];
         int sl=(int)strlen(sym); char *d=malloc(sl+1); memcpy(d,sym,sl); d[sl]=0;
-        if(sc==scap){scap*=2; syms=realloc(syms,scap*sizeof(char*));} syms[sc++]=d;
+        if(sc==scap){
+            scap*=2;
+            char **tmp=realloc(syms,scap*sizeof(char*));
+            if(!tmp){ fprintf(stderr,"qwen36: OOM reallocating BPE symbol buffer (%d entries)\n",scap); exit(1); }
+            syms=tmp;
+        }
+        syms[sc++]=d;
     }
     while(sc>1){
         int best=-1,besti=-1;
@@ -638,6 +652,14 @@ typedef struct {
     int n, cap;
 } LCache;
 
+/* CACHE_ROUTE telemetry (docs/CACHE_ROUTE.md): the lever changes which experts
+ * run, so it carries its own meters. Only touched when the lever is on. */
+typedef struct {
+    uint64_t slots, swaps, swaps_vram;    /* chosen slots; not in the true top-K; of those, VRAM-resident */
+    uint64_t agree_hit, agree_tot;        /* |chosen ∩ true top-K| summed, K summed */
+    double kl_sum; uint64_t kl_n;         /* mean KL(true top-K mass || chosen mass) */
+} RouteStats;
+
 typedef struct {
     Cfg c;
     shards S;
@@ -649,6 +671,7 @@ typedef struct {
     float **DN_rec;         /* [n_layers] recurrent state S[h]=[kdim,vdim] for DeltaNet layers (NULL for attn) */
     float **DN_conv;        /* [n_layers] conv ring [conv_dim, convk-1] for DeltaNet layers (NULL for attn) */
     uint64_t clock, hits, miss;
+    RouteStats route;          /* CACHE_ROUTE / ROUTE_AGREE meters */
     /* Telemetria per la dashboard (Brain/Profile): tempo di lettura esperti
      * accumulato dall'avvio, e bitmap degli esperti toccati nel turno. */
     double t_disk;
@@ -680,6 +703,13 @@ static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
 static int g_pilot = 0;
 static int g_wide  = 1;
+/* CACHE_ROUTE family, same names and defaults as the GLM engine (docs/CACHE_ROUTE.md). */
+static int   g_cache_route = 0;
+static int   g_route_j     = 2;
+static int   g_route_m     = 12;
+static float g_route_p     = 0.f;
+static float g_route_alpha = 1.f;
+static int   g_route_agree = 0;
 
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
 static void *pilot_worker(void *arg);
@@ -810,85 +840,11 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
     }
 }
 
-/* y[1,O] = x[1,I] @ W^T with W quantized: q[O,I] int8 + scale per row. */
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
-    int32x4_t acc = vdupq_n_s32(0);
-    int8x16_t va = vld1q_s8(a), vb = vld1q_s8(b);
-#if defined(__ARM_FEATURE_DOTPROD)
-    acc = vdotq_s32(acc, va, vb);
-#else
-    acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(va),  vget_low_s8(vb)));
-    acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(va), vget_high_s8(vb)));
-#endif
-    return vaddvq_s32(acc);
-}
-#endif
-static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
-#if defined(__ARM_NEON)
-    /* IDOT is opt-in, not default-on: this path quantizes the ACTIVATIONS to
-     * Q8_0 per 16-element block, which the scalar path does not, so the two are
-     * not numerically equivalent. olmoe shipped it default-on and it cost
-     * token-exactness end to end (#1044, fixed in af48fe8 by making it opt-in);
-     * qwen36 inherited the same default from the same family of kernels. The
-     * tiny-oracle gate would not have caught it -- that job runs on x86. */
-    static int idot = -1;
-    if (idot < 0) { const char *e = getenv("IDOT"); idot = (e && atoi(e)); }
-    if (idot && I % 16 == 0 && I <= 4096) {
-        int nb = I / 16; int8_t xi[4096]; float xs[256];
-        for (int b = 0; b < nb; b++) {
-            const float *xb = x + b*16;
-            float am = 0.f; for (int i = 0; i < 16; i++) { float a = fabsf(xb[i]); if (a > am) am = a; }
-            float s = am/127.f; if (s < 1e-12f) s = 1e-12f;
-            xs[b] = s; float inv = 1.f/s;
-            for (int i = 0; i < 16; i++) xi[b*16+i] = (int8_t)lrintf(xb[i]*inv);
-        }
-        #pragma omp parallel for schedule(static)
-        for (int o = 0; o < O; o++) {
-            const int8_t *w = q + (int64_t)o * I;
-            float acc = 0.f;
-            for (int b = 0; b < nb; b++) acc += xs[b]*(float)dot_i8_16(xi+b*16, w+b*16);
-            y[o] = acc * scale[o];
-        }
-        return;
-    }
-#endif
-#if defined(__AVX2__) && defined(__FMA__)
-    /* Hand-vectorized int8->f32 GEMV (gcc does not auto-vectorize the
-     * convert+accumulate chain). 32 weights per iteration, FMA accumulate. */
-    #pragma omp parallel for schedule(static) if(O >= 256)
-    for (int o = 0; o < O; o++) {
-        const int8_t *w = q + (int64_t)o * I;
-        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
-        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
-        int i = 0;
-        for (; i + 32 <= I; i += 32) {
-            __m128i b0 = _mm_loadu_si128((const __m128i*)(w + i));
-            __m128i b1 = _mm_loadu_si128((const __m128i*)(w + i + 16));
-            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i),    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b0)), a0);
-            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+8),  _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b0,8))), a1);
-            a2 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+16), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b1)), a2);
-            a3 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+24), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b1,8))), a3);
-        }
-        a0 = _mm256_add_ps(_mm256_add_ps(a0,a1), _mm256_add_ps(a2,a3));
-        __m128 s = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0,1));
-        s = _mm_add_ps(s, _mm_movehl_ps(s,s));
-        s = _mm_add_ss(s, _mm_shuffle_ps(s,s,1));
-        float acc = _mm_cvtss_f32(s);
-        for (; i < I; i++) acc += x[i] * (float)w[i];
-        y[o] = acc * scale[o];
-    }
-#else
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const int8_t *w = q + (int64_t)o * I;
-        float acc = 0.f;
-        for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
-        y[o] = acc * scale[o];
-    }
-#endif
-}
+/* y[1,O] = x[1,I] @ W^T with W quantized: q[O,I] int8 + scale per row.
+ * matmul_q lives in qgemv.h so tests/test_qgemv.c can link the exact kernel
+ * the engine runs (qwen36.c has a main() and cannot itself be linked into a
+ * test binary). */
+#include "qgemv.h"
 
 /* Multi-row dense-int8 prefill kernel.  matmul_q() above is deliberately kept
  * as the S=1 decode implementation: its four AVX accumulators stay in
@@ -978,8 +934,12 @@ static void matmul_q_batch(float *y, const float *x, const int8_t *q,
 }
 
 /* Group-scaled int8 GEMV: one f32 scale per `gs` input elements per row
- * (gs64 expert containers). Row layout of `scale`: [O][I/gs] row-major. */
+ * (gs64 expert containers). Row layout of `scale`: [O][I/gs] row-major.
+ * matmul_q_gs lives in gsgemv.h so tests/test_gsgemv.c can link the exact
+ * kernel the engine runs. */
 static int g_expert_gs = 0;   /* set from qwen36_meta.json (expert_gs) at load */
+#include "gsgemv.h"
+
 /* 1 = expert container packs int4 (tier fmt=4); 0 = int8 per-row (tier fmt=1).
  * Same signal main's nbytes probe and tier_warmstart receive; the decode path
  * needs it to offer int8 experts (#1391): on an int8 container e->g4 is NULL. */
@@ -1029,49 +989,6 @@ static void tier_offer_slot(int layer, int eid, const Slot *s) {
     else if (!g_expert_is_int4 && s->g)
         qt_note(layer, eid, (const uint8_t *)s->g, (const uint8_t *)s->u,
                 (const uint8_t *)s->d, s->gs, s->us, s->ds);
-}
-static void matmul_q_gs(float *y, const float *x, const int8_t *q, const float *scale,
-                        int I, int O, int gs) {
-    int ng = (I + gs - 1) / gs;
-#if defined(__AVX2__) && defined(__FMA__)
-    if ((gs & 31) == 0) {
-        #pragma omp parallel for schedule(static) if(O >= 256)
-        for (int o = 0; o < O; o++) {
-            const int8_t *w = q + (int64_t)o * I;
-            const float *sc = scale + (int64_t)o * ng;
-            float acc = 0.f;
-            for (int gi = 0; gi < ng; gi++) {
-                __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
-                int base = gi * gs, end = base + gs; if (end > I) end = I;
-                for (int i = base; i + 16 <= end; i += 16) {
-                    __m128i b0 = _mm_loadu_si128((const __m128i*)(w + i));
-                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i),   _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b0)), a0);
-                    a1 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+8), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b0,8))), a1);
-                }
-                a0 = _mm256_add_ps(a0, a1);
-                __m128 s = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0,1));
-                s = _mm_add_ps(s, _mm_movehl_ps(s,s));
-                s = _mm_add_ss(s, _mm_shuffle_ps(s,s,1));
-                acc += _mm_cvtss_f32(s) * sc[gi];
-            }
-            y[o] = acc;
-        }
-        return;
-    }
-#endif
-    #pragma omp parallel for schedule(static) if(O >= 256)
-    for (int o = 0; o < O; o++) {
-        const int8_t *w = q + (int64_t)o * I;
-        const float *sc = scale + (int64_t)o * ng;
-        float acc = 0.f;
-        for (int gi = 0; gi < ng; gi++) {
-            int base = gi * gs, end = base + gs; if (end > I) end = I;
-            float part = 0.f;
-            for (int i = base; i < end; i++) part += x[i] * (float)w[i];
-            acc += part * sc[gi];
-        }
-        y[o] = acc;
-    }
 }
 /* Expert-GEMV dispatch: per-row scales (classic) or grouped (gs64 container). */
 static void matmul_qe(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
@@ -2055,6 +1972,103 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
     free(ex); free(exp); free(ridx); free(rval); free(tmp); free(scratch);
 }
 
+/* ---------- CACHE_ROUTE: residency-aware top-K fill (docs/CACHE_ROUTE.md) ----------
+ * The GLM engine's max-rank lever (arXiv:2412.00099) with one more level: an
+ * expert already in the VRAM tier outranks one that is only in the RAM cache,
+ * which outranks one on disk. The ranking is the same softmax mass the plain
+ * path uses, restricted to `keep`. Selection inside the top-`win` window: the
+ * true top-J first, then VRAM-resident experts in rank order, then RAM-
+ * resident ones, then the true ranking. lvl(ctx, e) answers 2 / 1 / 0 and is
+ * asked only for ranked candidates past J. val[] carries the raw mass, with
+ * substitutes scaled by alpha; moe() renormalises afterwards exactly as it
+ * does for the plain top-K. Callable without a Model so
+ * tests/test_qwen36_cache_route.c can pin the selection against a residency
+ * table. */
+#define ROUTE_RANK_MAX 256
+static void route_select(const float *pr, const uint8_t *keep, int E, int K,
+                         int J, int M, float P, float alpha,
+                         int (*lvl)(void *ctx, int e), void *ctx,
+                         int *idx, float *val, RouteStats *st) {
+    if (K > ROUTE_RANK_MAX) K = ROUTE_RANK_MAX;
+    if (J < 0) J = 0; if (J > K) J = K;
+    int cap = (P > 0.f && P < 1.f) ? (M > 4*K ? M : 4*K) : (M > K ? M : K);
+    if (cap > E) cap = E;
+    if (cap > ROUTE_RANK_MAX) cap = ROUTE_RANK_MAX;
+    int rank[ROUTE_RANK_MAX]; float rw[ROUTE_RANK_MAX]; int8_t rl[ROUTE_RANK_MAX];
+    int n = 0;
+    for (int r = 0; r < cap; r++) {
+        int best = -1; float bv = -1e30f;
+        for (int e = 0; e < E; e++) {
+            if (keep && !keep[e]) continue;
+            int taken = 0; for (int j = 0; j < n; j++) if (rank[j] == e) { taken = 1; break; }
+            if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
+        }
+        if (best < 0) break;
+        rank[n] = best; rw[n] = bv; n++;
+    }
+    int Kt = K < n ? K : n;             /* the true top-K is rank[0..Kt) */
+    int win = n;
+    if (P > 0.f && P < 1.f) {           /* cumulative-mass window: grow past K until P of the ranked mass */
+        float tot = 1e-20f; for (int r = 0; r < n; r++) tot += rw[r] > 0 ? rw[r] : 0;
+        float cum = 0; win = Kt;
+        for (int r = 0; r < n; r++) { cum += rw[r] > 0 ? rw[r] : 0; win = r + 1; if (cum >= P * tot) break; }
+        if (win < Kt) win = Kt;
+    }
+    for (int r = 0; r < n; r++) rl[r] = (r >= J && r < win) ? (int8_t)lvl(ctx, rank[r]) : 0;
+    int chosen = 0, pos[ROUTE_RANK_MAX]; uint8_t used[ROUTE_RANK_MAX] = {0};
+    for (int r = 0; r < J && r < n && chosen < K; r++) { pos[chosen++] = r; used[r] = 1; }
+    for (int level = 2; level >= 1; level--)
+        for (int r = J; r < win && chosen < K; r++)
+            if (!used[r] && rl[r] == level) { pos[chosen++] = r; used[r] = 1; }
+    for (int r = 0; r < n && chosen < K; r++)
+        if (!used[r]) { pos[chosen++] = r; used[r] = 1; }
+    for (int kk = 0; kk < chosen; kk++) {
+        int r = pos[kk]; idx[kk] = rank[r]; val[kk] = rw[r];
+        if (r >= Kt && alpha > 0.f && alpha < 1.f) val[kk] *= alpha;
+    }
+    for (int kk = chosen; kk < K; kk++) { idx[kk] = -1; val[kk] = 0.f; }   /* fewer eligible than K: keep mask */
+    if (!st) return;
+    st->slots += (uint64_t)chosen; st->agree_tot += (uint64_t)chosen;
+    float tsum = 1e-20f, csum = 1e-20f;
+    for (int t = 0; t < Kt; t++) tsum += rw[t] > 0 ? rw[t] : 0;
+    for (int kk = 0; kk < chosen; kk++) {
+        csum += val[kk] > 0 ? val[kk] : 0;
+        if (pos[kk] < Kt) st->agree_hit++;
+        else { st->swaps++; if (rl[pos[kk]] == 2) st->swaps_vram++; }
+    }
+    double kl = 0;                      /* KL(true top-K mass || chosen mass), as the GLM meter */
+    for (int t = 0; t < Kt; t++) {
+        double pt = (rw[t] > 0 ? rw[t] : 0) / tsum; if (pt <= 0) continue;
+        double pc = 1e-12;
+        for (int kk = 0; kk < chosen; kk++) if (pos[kk] == t) { pc = (val[kk] > 0 ? val[kk] : 0) / csum; break; }
+        kl += pt * log(pt / pc);
+    }
+    st->kl_sum += kl; st->kl_n++;
+}
+
+/* Residency levels for route_select: 2 = in the VRAM tier, 1 = in this
+ * layer's RAM cache (pinned or LRU), 0 = would be read from disk. */
+typedef struct { Model *m; int layer; } RouteCtx;
+static int route_level(void *vctx, int e) {
+    RouteCtx *rc = (RouteCtx *)vctx;
+    if (qt_is_resident(rc->layer, e)) return 2;
+    pthread_mutex_lock(&g_pilot_mx);
+    Slot *s = slot_indexed(rc->m, rc->layer, e);
+    pthread_mutex_unlock(&g_pilot_mx);
+    return s ? 1 : 0;
+}
+
+static void route_footer(FILE *f, const Model *m) {
+    if (g_cache_route && m->route.slots)
+        fprintf(f, "CACHE_ROUTE J=%d M=%d P=%.2f alpha=%.2f | swap %.1f%% (%llu/%llu, %llu to VRAM)\n",
+                g_route_j, g_route_m, g_route_p, g_route_alpha,
+                100.0*m->route.swaps/m->route.slots, (unsigned long long)m->route.swaps,
+                (unsigned long long)m->route.slots, (unsigned long long)m->route.swaps_vram);
+    if (m->route.agree_tot)
+        fprintf(f, "route_agree %.1f%% | route_kl %.4f\n", 100.0*m->route.agree_hit/m->route.agree_tot,
+                m->route.kl_n ? m->route.kl_sum/(double)m->route.kl_n : 0.0);
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     float *logits = falloc((int64_t)S*E);
@@ -2102,14 +2116,23 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             for (int e = 0; e < Ec; e++) keep[e] = 1;
         }
         int idx[256]; float val[256];
-        for (int kk = 0; kk < K; kk++) {
-            int best = -1; float bv = -1e30f;
-            for (int e = 0; e < E; e++) {
-                if (!keep[e]) continue;
-                int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
-                if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
+        if (g_cache_route) {
+            RouteCtx rc = { m, layer };
+            route_select(pr, keep, E, K, g_route_j, g_route_m, g_route_p, g_route_alpha,
+                         route_level, &rc, idx, val, &m->route);
+        } else {
+            for (int kk = 0; kk < K; kk++) {
+                int best = -1; float bv = -1e30f;
+                for (int e = 0; e < E; e++) {
+                    if (!keep[e]) continue;
+                    int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
+                    if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
+                }
+                idx[kk] = best; val[kk] = bv;
             }
-            idx[kk] = best; val[kk] = bv;
+            if (g_route_agree) {            /* plain routing: full agreement by construction */
+                m->route.agree_hit += (uint64_t)K; m->route.agree_tot += (uint64_t)K; m->route.kl_n++;
+            }
         }
         if (m->resident_collecting) {
             for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) m->seen[(int64_t)layer * E + idx[kk]] = 1;
@@ -3317,6 +3340,15 @@ int main(int argc, char **argv) {
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
     if (g_wide < 1) g_wide = 1; if (g_wide > 4) g_wide = 4;
+    g_cache_route = getenv("CACHE_ROUTE") ? atoi(getenv("CACHE_ROUTE")) : 0;         /* prefer resident experts (VRAM tier, then RAM cache) inside the top-M window; changes which experts run: docs/CACHE_ROUTE.md */
+    g_route_j     = getenv("ROUTE_J")     ? atoi(getenv("ROUTE_J"))     : 2;         /* true top-J always taken, resident or not, under CACHE_ROUTE=1 */
+    g_route_m     = getenv("ROUTE_M")     ? atoi(getenv("ROUTE_M"))     : 12;        /* rank window inside which a resident expert may replace an unresident one */
+    g_route_p     = getenv("ROUTE_P")     ? (float)atof(getenv("ROUTE_P"))     : 0.f; /* cumulative-mass window for CACHE_ROUTE (0 = fixed M) */
+    g_route_alpha = getenv("ROUTE_ALPHA") ? (float)atof(getenv("ROUTE_ALPHA")) : 1.f; /* scale substituted experts' gate mass before renorm (1 = off) */
+    g_route_agree = getenv("ROUTE_AGREE") ? atoi(getenv("ROUTE_AGREE")) : g_cache_route; /* overlap% + KL vs the true top-K in the footer; auto-on under CACHE_ROUTE=1 */
+    if (g_cache_route)
+        fprintf(stderr, "[qwen36] CACHE_ROUTE=1 J=%d M=%d P=%.2f alpha=%.2f: VRAM tier > RAM cache > disk inside the top-M window (lossy: A/B it)\n",
+                g_route_j, g_route_m, g_route_p, g_route_alpha);
     if (getenv("OPENAI")) g_openai = 1;                       /* OpenAI-compatible output */
     const char *mv = getenv("MODEL"); if (mv && *mv) g_model = mv;
     int hot_n = getenv("HOT") ? atoi(getenv("HOT")) : 0;
@@ -3536,6 +3568,7 @@ int main(int argc, char **argv) {
         printf("TF-NLL: %.4f nats/token over %d tokens | ppl = %.2f\n", nll, scored, exp(nll));
         printf("Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
                (unsigned long long)m.hits, (unsigned long long)m.miss);
+        route_footer(stdout, &m);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
         free(buf); free(arena); return 0;
     }
@@ -3601,6 +3634,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "\nPEAK RSS: %.2f GB\n", rss_gb());
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
+    route_footer(stderr, &m);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
     free(buf); free(arena);
     /* Oracle mode is a gate, not a report: a mismatch must fail the caller.

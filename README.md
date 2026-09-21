@@ -10,7 +10,7 @@
 <p align="center">
   <a href="https://justvugg.github.io/colibri"><b>Website</b></a> ·
   <a href="https://discord.gg/RXV83nSZdk"><b>Discord</b></a> ·
-  English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a>
+  English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a>
 </p>
 
 **Tiny engine, immense model.** Run **frontier MoE models — 744B to 2.8T
@@ -40,7 +40,7 @@ may reduce speed; it must not quietly redefine the model.
 
 ```
 $ ./coli chat
-  🐦 colibri v1.11.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.12.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -51,23 +51,38 @@ $ ./coli chat
 <p align="center">
   <img src="docs/media/colibri-dashboard.png" width="900" alt="colibrì web dashboard — live metrics, hardware panel, expert tiers">
 </p>
-<p align="center"><em>The web dashboard (<code>./coli web</code>): a 744B model at <strong>4 tok/s, TTFT 1.6 s, disk 0</strong> —
-full expert residency on 6× RTX 5090, with live token metrics, the per-turn time breakdown,
-the VRAM/RAM/disk tier bar and the live mini-brain in the corner.</em></p>
+<p align="center"><em>The web dashboard (<code>./coli web</code>), redesigned in 1.12.0: a workspace with a dock for the chat,
+Brio mode, the Brain page and Profiling, in a light or a dark theme. Here Qwen3.6 answering on a CPU box,
+experts streamed from disk.</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brain.png" width="900" alt="the Brain page — 19,456 experts as a live cortex">
+  <img src="docs/media/colibri-brio.png" width="900" alt="the Brio page: a document read once, a probability for every allowed answer, and an entropy">
 </p>
-<p align="center"><em>The <strong>Brain</strong> page: all 19,456 experts as a living cortex — colour is the storage tier,
-brightness is routing heat, and every expert routed in a turn flashes white. Hovering shows the expert's
-<a href="https://github.com/JustVugg/colibri/issues/175">measured topic affinity</a>.</em></p>
+<p align="center"><em><strong>Brio mode</strong>: the same model, told to stop writing. Give it a document and the only answers
+it may pick; it reads the probability of each one, generates nothing, and reports an entropy that says when it is
+not sure. Here: <strong>request changes at 99.9%</strong>, entropy 0.005, 4 tokens read, 0 generated.</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-atlas.png" width="900" alt="the Atlas page — the measured expert atlas as a 3-D galaxy">
+  <img src="docs/media/colibri-brain.png" width="900" alt="the Brain page: the measured expert atlas of GLM-5.2 drawn as a cortex, ten regions to enter">
 </p>
-<p align="center"><em>The <strong>Atlas</strong> page: the <a href="https://github.com/JustVugg/colibri/issues/175">measured expert atlas</a>
-as a 3-D galaxy — 13,260 characterised experts, 1,041 replicated specialists clustering by topic
-(poetry, law, Chinese, SQL…). Position is measured routing affinity, not a learned embedding. Drag to spin.</em></p>
+<p align="center"><em>The <strong>Brain</strong> page, <strong>Explore</strong>: the <a href="https://github.com/JustVugg/colibri/issues/175">measured expert atlas</a> of GLM-5.2
+drawn as a cortex. 13,260 characterised experts in ten regions (Python, SQL, mathematics, poetry, law, Chinese…);
+position is measured routing affinity, not a learned embedding. Choose a region to enter it. <strong>Live routing</strong> switches
+to the model actually running: one cell per expert, colour is the storage tier, and every expert routed in a turn flashes white.</em></p>
+
+<p align="center">
+  <img src="docs/media/colibri-brain-region.png" width="900" alt="inside the Python region: 1,142 experts, one of them selected with its measured affinities">
+</p>
+<p align="center"><em>Inside the <strong>Python</strong> region: 1,142 experts as a constellation, each labelled by layer and index. The panel shows
+one of them, layer 17 expert 178: a generalist with entropy 3.13, whose measured affinity is 20.2% Python, 14.6% JSON,
+14.2% conversation, 13.3% SQL.</em></p>
+
+<p align="center">
+  <img src="docs/media/colibri-profiling.png" width="900" alt="the Profiling page: where the engine spends each turn">
+</p>
+<p align="center"><em>The <strong>Profiling</strong> page: where the engine spends each turn, by phase, with the last 30 turns as a trend.
+Here Qwen3.6 on a CPU box: 19.0 s of wall time for 36 prompt and 55 generated tokens, 2.9 tok/s, 11.4 s of disk
+service overlapped with compute.</em></p>
 
 ## The research mission
 
@@ -120,7 +135,7 @@ shows otherwise. These are the main questions now:
 | hypothesis | evidence so far | experiment still needed |
 |---|---|---|
 | Routing history can place experts better than plain LRU | learned pins improve repeated workloads, but can overfit a prompt | held-out, cross-session A/Bs across coding, chat, multilingual, and long-context workloads |
-| Multiple SSDs can turn independent bandwidth into decode speed | weighted mirror/split routing is implemented and validated; the bandwidth model is sound | cold-cache one-drive vs two-drive GLM-5.2 runs on real, independent controllers |
+| Multiple SSDs can turn independent bandwidth into decode speed | two independent NVMe drives measured +37.5% decode; a slower third drive was neutral after weighted striping ([measurements](docs/multidisk.md#what-has-been-measured)) | reproduce across drive speeds, controller layouts, and cache states |
 | A hardware-aware planner can approach each machine's best configuration automatically | RAM/VRAM budgets and several backends are detected today | compare the generated plan with a controlled parameter sweep across laptops, workstations, NUMA hosts, and multi-GPU systems |
 | Lossless or quality-bounded representations can reduce weight movement enough to matter | format and quantization ablations exist, with correctness/quality gates | reproduce quality, bytes moved, latency, and cost per useful token together — not compression ratio alone |
 | Routing-aware speculation can pay before near-full residency | MTP and grammar drafts work, but MTP has also measured a 32% loss around 85% expert hit | map the break-even surface across acceptance, expert hit rate, batch union, and draft depth |
@@ -217,21 +232,30 @@ precision are the same whether an expert answered from VRAM or from disk.
   <img src="docs/media/tiers.png" width="880" alt="VRAM / RAM / NVMe three-tier expert residency">
 </p>
 
-### Dual-SSD: two copies of the model, twice the read bandwidth
+<a id="dual-ssd-two-copies-of-the-model-twice-the-read-bandwidth"></a>
 
-Decode is disk-bound on most machines, and expert reads are read-only — so if you have a **second SSD**, put a full copy of the model on it and let the engine stream from both drives at once:
+### Multiple SSDs: stream model copies from more than one drive
+
+When decode is disk-bound, a **second SSD** can help: put a copy of the model on
+it and let the engine read from both drives. For GLM-5.2, from `c/` in a source
+checkout (or from an unpacked release):
 
 ```bash
-COLI_MODEL=/fast/glm52_i4 COLI_MODEL_MIRROR=/second/glm52_i4 ./coli chat
-COLI_DISK_WEIGHTS=9,3 ...   # optional: primary,mirror bandwidth ratio (else measured at startup)
+COLI_MODEL_MIRROR=/second/glm52_i4 python3 ./coli chat --model /fast/glm52_i4
 ```
 
-Each expert is routed to one drive by a deterministic hash, weighted by the two drives' measured (or declared) bandwidth, so readahead/PILOT prefetch and the demand read always hit the same drive and nothing is cached twice. The aggregate bandwidth is the sum of both drives — a 9 GB/s + 3 GB/s pair reads experts ~33% faster than the fast drive alone, and the OMP-parallel pin/warmup load streams from both. Details worth knowing:
+The engine measures the drives at startup to weight the read split. Buffered
+reads use deterministic expert routing; eligible direct reads can stripe one
+expert across replicas. Independent drives provide bandwidth headroom, not a
+guaranteed token-rate multiplier: shared controllers, cache hits, and compute
+can limit the gain. See the [multi-disk guide](docs/multidisk.md) for Bash and
+PowerShell examples, measured gains and limits, and a single-drive comparison.
+Details worth knowing:
 
-- the mirror is **validated at startup** (per-file size + safetensors header must be byte-identical to the primary); divergent or missing files silently stay on the primary, so a **partial mirror is fine** — a smaller second SSD holding only some shards still helps;
+- the mirror is **validated at startup** (per-file size + safetensors header must be byte-identical to the primary); divergent or missing files stay on the primary, so a **partial mirror is fine** — a smaller second SSD can serve the shards it holds;
 - the mirror is **never written**: `.coli_usage`, `.coli_kv` and all sidecars stay on the primary;
 - a read error on the mirror falls back to the primary (one warning, no crash), so unplugging the second drive mid-run degrades instead of killing the server;
-- routing never changes tokens — both copies are byte-identical, and the per-run `MIRROR:` stats line shows GB served per drive.
+- routing never changes tokens — both copies are byte-identical; enable `PROF=1` for the `MIRROR:` profile counters showing GB served per drive.
 
 The same engine spans the whole range: on a 25 GB laptop everything streams from
 disk (slow but correct); on a large host the entire expert set becomes resident
@@ -473,6 +497,39 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # measure and save this machine's fast
 ./coli serve --model /nvme/glm52_i4       # API + dashboard, no browser (headless)
 ```
 
+#### Brio mode: ask a closed question
+
+Most of what people ask a model for is a choice, not a paragraph: which queue,
+which verdict, which of the four values a field may take. Brio mode hands the
+engine the options and reads the probability of each one instead of
+generating: `completion_tokens` is 0, no answer can fall outside your list,
+and every answer comes with an entropy, so "the model is not sure" is a
+number you can put a threshold on. It runs on all nine families, on the same
+server, and it is opt-in per request: chat is byte-identical for everyone who
+does not ask for it.
+
+```bash
+# in the TUI: the same model, told to stop writing
+./coli chat --model /nvme/qwen36_i4_gs64
+> /brio merge | request changes | close
+> 340 lines, 8 files, no tests. CI is green but nothing covers that path.
+
+# from anywhere: one JSON request on the running server
+curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
+  "model": "qwen36",
+  "state": "340 lines, 8 files, no tests. CI is green but nothing covers that path.",
+  "question": "What should the reviewer do?",
+  "options": ["merge", "request changes", "close"]}'
+```
+
+`questions` asks many things about one document read once, and `schema` fills
+a JSON object one field at a time, valid by construction. Measured on Qwen3.6
+against generating the same answer on the same CPU box: 2.4x on a four-field
+schema, 5.7x on four questions about one document. The whole mode, the
+request and reply shapes, and where it does not help: [docs/brio.md](docs/brio.md).
+The dashboard has a Brio page as well.
+
+
 On Windows a release archive ships `coli.cmd`: double-click it for the quick
 start, or run `coli.cmd chat --model D:\glm52_i4` from cmd or PowerShell.
 From a source checkout the same commands work with `python coli chat --model
@@ -528,6 +585,7 @@ Two things that differ per model, both documented in the per-model page:
 | Vulkan backend (any GPU: AMD via RADV, incl. cards ROCm dropped) | [docs/vulkan.md](docs/vulkan.md) |
 | Apple Silicon Metal backend | [docs/metal.md](docs/metal.md) |
 | OpenAI-compatible API, KV slots, web dashboard | [docs/api.md](docs/api.md) |
+| Brio mode: score a closed set of options instead of generating | [docs/brio.md](docs/brio.md) |
 | Experimental layer-segment embedding ABI | [docs/segment-runtime.md](docs/segment-runtime.md) |
 | Experimental tokenizer/embedding/head Edge ABI | [docs/edge-runtime.md](docs/edge-runtime.md) |
 | Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |

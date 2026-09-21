@@ -641,28 +641,71 @@ static inline void coli_print_launcher_help(const char *engine)
  * 0 = non misurabile; e' il chiamante a decidere il fallback. */
 #ifdef __APPLE__
 #include <mach/mach.h>
+#include <sys/sysctl.h>
 #endif
 #include <unistd.h>
-static inline double compat_mem_available_gb(void){
+
+/* Total AND available in one call, one pass.
+ *
+ * "Available" alone was consolidated here by #1375 because there were two
+ * copies of it and one was wrong. "Total" is now in the same position: every
+ * caller that wants it hand-rolls its own #ifdef ladder (telemetry.h uses
+ * sysctl hw.memsize on macOS, olmoe.c uses sysconf(_SC_PHYS_PAGES), glm53.c
+ * read /proc/meminfo unconditionally), and those definitions do not agree.
+ * A budget computed from a total and an available that came from two
+ * different definitions is not a budget, it is a coincidence.
+ *
+ * One pass also matters on Linux specifically: MemTotal and MemAvailable are
+ * two lines of the same file, and reading it twice to get them is both a
+ * second open and a second chance to read a file that changed underneath.
+ *
+ * 0 means "not measurable" for either field; the caller decides the fallback. */
+static inline void compat_meminfo_gb(double *total_gb, double *avail_gb){
+    double total = 0, avail = 0;
 #ifdef __APPLE__
+    uint64_t memsize = 0; size_t len = sizeof memsize;
+    if(sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0) total = (double)memsize / 1e9;
     mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
     vm_statistics64_data_t vm;
-    if(host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &cnt) != KERN_SUCCESS) return 0;
-    return ((double)vm.free_count + (double)vm.inactive_count + (double)vm.purgeable_count)
-           * (double)sysconf(_SC_PAGESIZE) / 1e9;
+    if(host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &cnt) == KERN_SUCCESS)
+        avail = ((double)vm.free_count + (double)vm.inactive_count + (double)vm.purgeable_count)
+                * (double)sysconf(_SC_PAGESIZE) / 1e9;
 #elif defined(_WIN32)
     MEMORYSTATUSEX msx = {0};
     msx.dwLength = sizeof(msx);
-    if(!GlobalMemoryStatusEx(&msx)) return 0;
-    double phys = (double)msx.ullAvailPhys / 1e9;
-    double commit = (double)msx.ullAvailPageFile / 1e9;
-    return commit > 0 && commit < phys ? commit : phys;
+    if(GlobalMemoryStatusEx(&msx)){
+        total = (double)msx.ullTotalPhys / 1e9;
+        double phys = (double)msx.ullAvailPhys / 1e9;
+        double commit = (double)msx.ullAvailPageFile / 1e9;
+        avail = commit > 0 && commit < phys ? commit : phys;
+    }
 #else
-    FILE *f = fopen("/proc/meminfo", "r"); if(!f) return 0;
-    char ln[256]; double kb = 0;
-    while(fgets(ln, sizeof ln, f)) if(sscanf(ln, "MemAvailable: %lf", &kb) == 1) break;
-    fclose(f); return kb / 1e6;
+    FILE *f = fopen("/proc/meminfo", "r");
+    if(f){
+        char ln[256]; double kb;
+        /* /proc/meminfo's "kB" is KiB (1024 B), so a GB is kb*1024/1e9, not
+         * kb/1e6. The old kb/1e6 understated by 2.3% -- harmless while the
+         * number was only ever compared against itself, but glm53 now weighs
+         * it against a model size computed from byte counts (/1e9, true GB),
+         * and a budget that subtracts true GB from understated GB is wrong in
+         * the direction that matters: it hands back less than it should. */
+        /* MemTotal precedes MemAvailable in /proc/meminfo, but do not rely on
+         * the order: stop only once both have been seen. */
+        while((total == 0 || avail == 0) && fgets(ln, sizeof ln, f)){
+            if(total == 0 && sscanf(ln, "MemTotal: %lf", &kb) == 1){ total = kb * 1024.0 / 1e9; continue; }
+            if(avail == 0 && sscanf(ln, "MemAvailable: %lf", &kb) == 1) avail = kb * 1024.0 / 1e9;
+        }
+        fclose(f);
+    }
 #endif
+    if(total_gb) *total_gb = total;
+    if(avail_gb) *avail_gb = avail;
+}
+
+static inline double compat_mem_available_gb(void){
+    double avail = 0;
+    compat_meminfo_gb(NULL, &avail);
+    return avail;
 }
 
 #endif /* COMPAT_H */

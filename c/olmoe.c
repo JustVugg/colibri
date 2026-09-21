@@ -18,6 +18,11 @@
  *   PILOT_EVICT_GUARD=0/1 : 1=enable LFRU prefetch eviction guard (default), 0=disable
  *   EXPERT_DROP=0/1: 1=fadvise(DONTNEED) after each expert read (old behaviour,
  *                    for RAM-tight boxes); 0=keep pages cached (default)
+ *   ROUTE_TRACE=<path>: log every routing decision (one line per moe call,
+ *                    position and layer: "<call> <row> <layer> <id>:<gate> ...")
+ *                    for offline analysis — tools/route_pairs.py,
+ *                    tools/route_coupling_report.py, tools/residency_sim.py.
+ *                    Measurement only: it cannot change which experts run.
  *   (expert queue is sorted by eid for SSD read locality)
  */
 #define _GNU_SOURCE
@@ -316,6 +321,29 @@ static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
     __m128i hi32   = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
     __m128i sum32  = _mm_add_epi32(sum64, hi32);
     return _mm_cvtsi128_si32(sum32);
+}
+#define HAVE_FAST_DOT_I8 1
+#elif defined(__SSE4_1__)
+#include <immintrin.h>
+#include "sse41_kernels.h"
+/* Sandy Bridge-EP path: AVX 1.0 only, no FMA, no AVX-2.
+ * 16 int8 dot via two 8-wide SSE2 sign-extend + SSE4.1 madd pairs.
+ * Bit-for-bit identical to the AVX2 version above (just 2x 128-bit ops
+ * instead of 1x 256-bit op). NO FMA here -- this branch targets Sandy Bridge
+ * which has no FMA -- so use explicit mul+add for the inner accumulation. */
+static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
+    __m128i va_lo = _mm_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)a));        /* lower 8 int8 -> 8 int16 */
+    __m128i vb_lo = _mm_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)b));
+    __m128i va_hi = _mm_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(a + 8)));   /* upper 8 int8 -> 8 int16 */
+    __m128i vb_hi = _mm_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(b + 8)));
+    __m128i p_lo = _mm_madd_epi16(va_lo, vb_lo);   /* 4 x int32 from 8 int16 pairs */
+    __m128i p_hi = _mm_madd_epi16(va_hi, vb_hi);   /* 4 x int32 from 8 int16 pairs */
+    __m128i sum = _mm_add_epi32(p_lo, p_hi);
+    /* horizontal reduce 4 x int32 -> 1 x int32 */
+    __m128i hi64   = _mm_unpackhi_epi64(sum, sum);
+    __m128i sum64  = _mm_add_epi32(sum, hi64);
+    __m128i hi32   = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
+    return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
 }
 #define HAVE_FAST_DOT_I8 1
 #endif
@@ -917,11 +945,24 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             idx[kk] = best; val[kk] = pr[best];
         }
         if (c->norm_topk) { float sm=0; for(int kk=0;kk<K;kk++) sm+=val[kk]; for(int kk=0;kk<K;kk++) val[kk]/=sm; }
-        /* IMPROVEMENT 2: update activation heatmap (before pinning activates) */
-        if (!m->hot_pinned && m->freq) {
-            uint32_t *freq_l = m->freq[layer];
-            if (freq_l) for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
-        }
+        /* IMPROVEMENT 2 activation heatmap AND the ROUTE_TRACE stream, in one
+         * call. The counters were the only thing this engine recorded, and it
+         * recorded them HERE, before pinning activates — rt_count keeps that
+         * placement exactly. The trace is the half olmoe never had: it emits a
+         * line per (moe call, position, layer), so tools/route_pairs.py,
+         * route_coupling_report.py and residency_sim.py can read this engine's
+         * routing the same way they read GLM's. Until now olmoe announced
+         * ROUTE_TRACE at startup and then wrote a zero-byte file, because
+         * rt_init() opens the stream but nothing here ever called rt_trace():
+         * every consumer silently saw "no data" instead of an error.
+         *
+         * Only rt_route() is unconditional: it is a no-op for the counts when
+         * this engine has no counter row (the !hot_pinned guard below is
+         * unchanged) and a no-op for the trace when ROUTE_TRACE is unset, so a
+         * run without the variable behaves exactly as before. Measurement only,
+         * never the computation: idx[] and val[] are the ids and the
+         * post-normalisation gates the layer is about to apply. */
+        if (!m->hot_pinned) rt_route(layer, s, idx, val, K);
         const float *xs = x + (int64_t)s*D;
         for (int kk = 0; kk < K; kk++) {
             Slot *e; expert_get(m, layer, idx[kk], &e);
@@ -950,6 +991,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
     }
     free(logits); free(g); free(u); free(hh);
+    /* Advance the trace call counter: once per moe() invocation, after all of
+     * its rows are traced. rt_trace_end() is a no-op when no stream is open.
+     *
+     * Outside the row loop on purpose. A batch of S == 0 traces no rows and
+     * must still consume a call id, or the ids stop being consecutive and
+     * residency_sim.py rejects the trace outright ("trace lacks advancing GLM
+     * call ids") rather than merging two forwards into one position space. GLM
+     * and glm53 advance theirs the same way. */
+    rt_trace_end();
 }
 
 /* PROF phases (#1449): wall time in attention, in the MoE blocks (expert
