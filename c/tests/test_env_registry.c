@@ -17,6 +17,16 @@ int main(void) {
     assert(coli_env_is_ours("V41_DSPAR"));
     assert(!strcmp(coli_env_suggest("V41_DSPAR"), "V41_DSPARK"));
     assert(!coli_env_find("V41_DSPAR"));
+    const char *const typos[] = {"COLI_PREFIL_CHUNK", "COLIBRI_ENGINE_SUFFI",
+        "K3_BIT", "KIMI_DSA_INDEXE", "INK_BIT", "GLM53_BIT", "Q38_TRUNK_GP",
+        "Q36_CTX_MA", "QWEN_EXPERT_KERNL", "DSV4_UNKNOWN", "V4_REPLAY_TRAC", "V41_DSPAR"};
+    for (unsigned i = 0; i < sizeof(typos) / sizeof(typos[0]); ++i)
+        assert(coli_env_is_ours(typos[i]));
+    const char *const unrelated[] = {"EDITOR", "MY_VAR", "CUDA_VISIBLE_DEVICES",
+        "OMP_WAIT_POLICY", "QT_QPA_PLATFORM", "VK_ICD_FILENAMES", "QWEN", "V41", "Q38X_FOO"};
+    for (unsigned i = 0; i < sizeof(unrelated) / sizeof(unrelated[0]); ++i)
+        assert(!coli_env_is_ours(unrelated[i]));
+    assert(!strcmp(coli_env_suggest("QWEN_EXPERT_KERNL"), "QWEN_EXPERT_KERNEL"));
     puts("test_env_registry: ok");
     return 0;
 }

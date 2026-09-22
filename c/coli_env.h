@@ -538,8 +538,13 @@ static const char *coli_env_suggest(const char *name) {
 /* Names we own. An unknown FOO=1 in the environment is not our business, but an
  * unknown COLI_FOO=1 almost certainly is. */
 static int coli_env_is_ours(const char *n) {
-    return !strncmp(n, "COLI_", 5) || !strncmp(n, "K3_", 3) || !strncmp(n, "INK_", 4) ||
-           !strncmp(n, "GLM53_", 6) || !strncmp(n, "Q38_", 4) || !strncmp(n, "V41_", 4);
+    static const char *const prefixes[] = {
+        "COLI_", "COLIBRI_", "K3_", "KIMI_", "INK_", "GLM53_",
+        "Q38_", "Q36_", "QWEN_", "DSV4_", "V4_", "V41_"
+    };
+    for (unsigned i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); ++i)
+        if (!strncmp(n, prefixes[i], strlen(prefixes[i]))) return 1;
+    return 0;
 }
 
 /* Compare the process environment against the table. `self` is the calling

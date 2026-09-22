@@ -63,9 +63,12 @@ knobs:
 | `COLI_ENV_DUMP` | `0` | `=1` prints every variable this engine reads, its type, and whether it is currently set — the fastest answer to "is my export reaching the engine?" |
 
 Variables the engine does not own are left alone: an unrelated `EDITOR` or
-`MY_VAR` in the environment is never reported. Only `COLI_*`, `K3_*`, `INK_*`,
-`GLM53_*`, and `Q38_*` names are checked, since an unrecognised one of those is
-almost certainly meant for us.
+`MY_VAR` in the environment is never reported. Unknown names are checked only
+under `COLI_*`, `COLIBRI_*`, `K3_*`, `KIMI_*`, `INK_*`, `GLM53_*`, `Q38_*`,
+`Q36_*`, `QWEN_*`, `DSV4_*`, `V4_*`, and `V41_*`. These prefixes belong to the
+project. Shared external prefixes such as `CUDA_*`, `OMP_*`, `QT_*`, and `VK_*`
+are not claimed: unregistered names under them are ignored. Registered names
+are still checked for engine ownership regardless of prefix.
 
 
 ---
