@@ -22,10 +22,16 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 Implemented endpoints are `GET /v1/models`, `GET /v1/models/{model}`,
-`POST /v1/chat/completions`, and legacy `POST /v1/completions`. Chat and
+`POST /v1/chat/completions`, legacy `POST /v1/completions`, `POST /v1/brio`
+(closed-set scoring, [brio.md](brio.md)) and `POST /v1/systemone`, the
+request and reply of TypeSafe's Jev API served by the same channel. Chat and
 completion requests support JSON responses, SSE streaming, usage counts,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, and up to four
-custom `stop` sequences. Stop sequences are removed from the response and end
+custom `stop` sequences. `max_tokens` is a ceiling, not a target: when the
+prompt leaves less room than the budget asks for, every engine clamps the
+budget to what the context holds and the reply ends with `finish_reason:
+"length"`; only a prompt that does not fit is refused, with
+`context_length_exceeded` (#260, #1641). Stop sequences are removed from the response and end
 generation early in both JSON and streaming modes. The extension
 `x_colibri_ignore_leading_stop: true` discards leading stop sequences until
 the first non-whitespace response content, which is useful for local templates

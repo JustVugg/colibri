@@ -104,6 +104,52 @@ overlap, not this kernel. `tests/test_expert_ffn` holds the numerics.
 keeps its own path: it uploads the pair-layout int4 and computes misses from
 the int8 copy.
 
+## The dense trunk: integer dot products
+
+Every dense GEMV of a token, the DeltaNet in and out projections, the
+attention q/k/v/o, the shared expert and lm_head, used to multiply int8
+weights by f32 activations: each weight byte converted to f32 and fed to an
+FMA, eight weights per instruction. On a 16-core AVX-512 host lm_head
+(248320 x 2048 int8, 508 MB) ran at 29 GB/s on a memory bus that does 80:
+the kernel was the limit, and the dense part of the token is 1.9 GB of int8
+on the 35B, three times what the routed experts read.
+
+Since 1.12.1 the activation is quantized to int8 once per call (one scale,
+amax/127, the same contract the expert integer kernels use) and the products
+are integer: 32 weights per instruction on AVX2, 64 on AVX-512 VNNI, exact
+int32 sums scaled once per output. The routed experts take the same path for
+their activations. Measured on Qwen3.6-35B-A3B, 8 threads, 300 decoded
+tokens, every expert resident, perplexity on 4 x 512 tokens of English text:
+
+| | tok/s | ms/token: DeltaNet proj / out, attention, lm_head, expert compute | perplexity |
+|---|---|---|---|
+| f32 activations (1.12.0) | 6.71 | 21.9 / 8.6, 9.5, 12.6, 22.7 | 13.79 |
+| int8 activations, dense trunk (`COLI_DENSE_IDOT=1`) | 7.35 | 17.4 / 6.3, 7.7, 10.2, 22.7 | 13.92 (+1.0%) |
+| int8 activations, routed experts (`QWEN_EXPERT_ACT=i8`) | 7.20 | 21.9 / 8.6, 9.5, 12.6, 15.9 | 13.80 (+0.1%) |
+| both (the 1.12.1 default) | **8.23** (+22.6%) | 17.2 / 6.3, 7.5, 10.1, 15.6 | 13.97 (+1.3%) |
+
+Both are the default; `COLI_DENSE_IDOT=0` and `QWEN_EXPERT_ACT=f32`
+restore the f32 kernels, which stay bit-identical to their references.
+
+**int4 for the trunk is opt-in, per component.** `COLI_DENSE_BITS=4` stores
+the dense matrices as int4 in blocks of 64 with one scale per block (the
+planar layout of the grouped expert kernel) and halves the bytes the token
+reads, but the parts of the trunk pay 4 bits very differently, so
+`COLI_DENSE_INT4` picks which ones take it:
+
+| int4 on | tok/s | perplexity |
+|---|---|---|
+| nothing (int8) | 7.35 | 13.92 |
+| `lmhead` | 8.15 (lm_head 10.1 to 8.4 ms; the total is within noise of the cache warming) | 14.13 (+2.4% vs f32) |
+| `lmhead,dnproj,dnout` | | 14.56 (+5.6%) |
+| `lmhead,dnproj,dnout,shexp` | | 14.94 (+8.3%) |
+| everything (`attn` included) | 8.09 | 15.17 (+10%) |
+
+A least-squares refinement of the block scale was tried and changes nothing
+(15.16 against 15.17): the loss is the matrices' sensitivity, not the
+quantizer. If you take one, take `lmhead`: 254 MB less per token for the
+smallest cost.
+
 ## Cache-aware routing (`CACHE_ROUTE`, off by default)
 
 The residual misses above are the lever's target. `CACHE_ROUTE=1` ports the

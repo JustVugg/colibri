@@ -53,6 +53,19 @@ int main(void){
     in=input_with("SUBMIT bad 0 0 1 nan 1\n\n");CHECK(in!=NULL);
     CHECK(serve_read_req(in,out,&q,NULL)==0);
     fclose(in);fclose(out);
-    puts("qwen38 serve framing: mode, decode rate, submit, busy drain, stop, cancel: ok");
+    /* #1641: max_tokens is a ceiling. The gateway's default budget (8192, the
+     * whole default context) used to be refused on every request without
+     * max_tokens and on every `coli chat` message; now it is clamped to what
+     * the context holds, and only a prompt that does not fit is refused. */
+    CHECK(q38_serve_budget(2, 8192, 8192, 0)==8190);      /* clamped to the room left */
+    CHECK(q38_serve_budget(100, 50, 8192, 0)==50);        /* fits: untouched */
+    CHECK(q38_serve_budget(8191, 1, 8192, 0)==1);         /* exactly one token of room */
+    CHECK(q38_serve_budget(8192, 1, 8192, 0)==-1);        /* the prompt leaves no room */
+    CHECK(q38_serve_budget(9000, 1, 8192, 0)==-1);        /* the prompt does not fit */
+    CHECK(q38_serve_budget(0, 1, 8192, 0)==-1);           /* empty prompt */
+    CHECK(q38_serve_budget(8192, 0, 8192, 1)==0);         /* read-only: the prompt may fill the context */
+    CHECK(q38_serve_budget(8193, 0, 8192, 1)==-1);
+    CHECK(q38_serve_budget(10, 0, 8192, 1)==0);
+    puts("qwen38 serve framing: mode, decode rate, submit, busy drain, stop, cancel, max_tokens ceiling: ok");
     return 0;
 }

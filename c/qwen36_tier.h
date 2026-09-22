@@ -65,6 +65,12 @@ int  qt_place_of(const char *component, int layer);
  * bytes come out of that device's expert budget. Sizes only; the tensors
  * follow through qt_lmhead_init / qt_dnproj_init as before. */
 void qt_trunk_offer(const char *component, int layer, size_t bytes);
+/* The automatic placement is a prediction; the engine measures it at startup
+ * (one GEMV both ways, qwen36.c trunk_probe_gpu_wins) and withdraws the whole
+ * trunk when the GPU loses, giving the bytes back to the expert budget. Only
+ * the automatic placement can be withdrawn; a COLI_PLACE list stands. */
+int  qt_place_is_auto(void);
+void qt_trunk_withdraw(const char *why);
 
 /* DeltaNet input projections, qkv ++ z fused into one resident tensor per
  * layer: one GEMV instead of two, and the engine's qkv/z buffers are laid out
@@ -135,6 +141,8 @@ static inline int  qt_lmhead_matmul(float*a,const float*b,int c,int d){(void)a;(
 #define QT_PLACE_CPU (-1)
 static inline int  qt_place_of(const char*a,int b){(void)a;(void)b;return QT_PLACE_CPU;}
 static inline void qt_trunk_offer(const char*a,int b,size_t c){(void)a;(void)b;(void)c;}
+static inline int  qt_place_is_auto(void){return 0;}
+static inline void qt_trunk_withdraw(const char*a){(void)a;}
 static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_init(const int8_t*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}

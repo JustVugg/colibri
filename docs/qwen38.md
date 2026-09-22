@@ -101,7 +101,12 @@ blocks are pooled and scored, the best 512 blocks are retained, and a causal
 tail of up to three tokens is appended. The main 24-head attention then operates
 only on those original tokens. The native model limit is 262,144 tokens;
 `Q38_MAXT` defaults to 8,192 and may raise the server limit up to that native
-ceiling when the required RAM is available.
+ceiling when the required RAM is available. `coli serve --ctx N` (and `coli
+chat --ctx N`) reach the engine as `Q38_MAXT=N`, not as `CTX`: that is the
+variable to look for in the engine process's environment. `max_tokens` is a
+ceiling: a budget the prompt leaves no room for is clamped to the room left
+(one `[serve] max_tokens ... clamped` line on stderr), and only a prompt that
+does not fit is refused.
 
 ## Memory and speed
 

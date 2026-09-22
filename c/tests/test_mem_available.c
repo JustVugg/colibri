@@ -32,9 +32,15 @@ static double total_gb(void){
 int main(void){
     double avail = compat_mem_available_gb();
     /* compat_mem_available_gb() e' ora un wrapper su compat_meminfo_gb(): le
-     * due devono dare lo stesso numero, o il wrapper ha perso qualcosa. */
+     * due devono dare lo stesso numero, o il wrapper ha perso qualcosa. Sono
+     * pero' due letture del sistema a qualche microsecondo di distanza, e la
+     * memoria disponibile si muove fra l'una e l'altra (il runner Windows della
+     * CI ha fallito il confronto esatto sul PR #1656 senza toccare questo
+     * codice): un quarto di GB di tolleranza distingue "il wrapper ha perso
+     * qualcosa" (differenze di GB) dal rumore di due istanti diversi. */
     { double t2 = 0, a2 = 0; compat_meminfo_gb(&t2, &a2);
-      check(a2 == avail, "compat_meminfo_gb e compat_mem_available_gb non concordano"); }
+      double gap = a2 > avail ? a2 - avail : avail - a2;
+      check(gap < 0.25, "compat_meminfo_gb e compat_mem_available_gb non concordano"); }
     printf("  disponibile: %.2f GB\n", avail);
     check(avail > 0.0, "la misura vale 0: la piattaforma non e' coperta (era il bug di Windows)");
     double total = total_gb();

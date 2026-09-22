@@ -125,10 +125,27 @@ static void case_ceiling(void) {
        "unset Q36_MAXT falls back to the conservative default");
 }
 
+/* #1641: max_tokens is a ceiling, not a target. The gateway's default budget
+ * (8192, the whole default context) used to be refused on every request
+ * without max_tokens and on every `coli chat` message; now it is clamped to
+ * the room the context leaves, and only a prompt that does not fit is refused.
+ * A read-only logprobs request (max_tokens 0) may fill the context exactly. */
+static void case_budget(void) {
+    ck(qwen36_serve_budget(2, 8192, 8192, 0) == 8190, "default budget clamped to the room left by the prompt");
+    ck(qwen36_serve_budget(100, 50, 8192, 0) == 50, "a budget that fits is untouched");
+    ck(qwen36_serve_budget(8191, 1, 8192, 0) == 1, "one token of room is enough");
+    ck(qwen36_serve_budget(8192, 1, 8192, 0) == -1, "a prompt that leaves no room is refused");
+    ck(qwen36_serve_budget(9000, 1, 8192, 0) == -1, "a prompt longer than the context is refused");
+    ck(qwen36_serve_budget(0, 1, 8192, 0) == -1, "an empty prompt is refused");
+    ck(qwen36_serve_budget(8192, 0, 8192, 1) == 0, "read-only: the prompt may fill the context");
+    ck(qwen36_serve_budget(8193, 0, 8192, 1) == -1, "read-only: past the context is still refused");
+}
+
 int main(void) {
     case_layout();
     case_growth();
     case_ceiling();
+    case_budget();
     if (fails) { printf("FAILED %d\n", fails); return 1; }
     printf("OK test_qwen36_ctx\n");
     return 0;
