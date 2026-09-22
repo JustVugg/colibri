@@ -2456,13 +2456,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                     xm_ex[kk].gs = e->gs; xm_ex[kk].us = e->us; xm_ex[kk].ds = e->ds;
                     xm_idx[kk] = idx[kk]; xm_exp[kk] = &xm_ex[kk]; nmiss++;
                     if (!batch) {
-                        xf_moe_run(xm_tmp, xs, 1, 1, D, I, &xm_idx[kk], &xm_val[kk], &xm_exp[kk], 0, xm_scratch);
+                        xf_moe_run(xm_tmp, xs, 1, 1, D, I, &xm_idx[kk], &xm_val[kk], &xm_exp[kk], xf_act_mode(), xm_scratch);
                         float *os = out + (int64_t)s*D; for (int d = 0; d < D; d++) os[d] += xm_tmp[d];
                         xm_idx[kk] = -1; xm_exp[kk] = NULL;
                     }
                 }
                 if (batch && nmiss) {
-                    xf_moe_run(xm_tmp, xs, 1, K, D, I, xm_idx, xm_val, xm_exp, 0, xm_scratch);
+                    xf_moe_run(xm_tmp, xs, 1, K, D, I, xm_idx, xm_val, xm_exp, xf_act_mode(), xm_scratch);
                     float *os = out + (int64_t)s*D; for (int d = 0; d < D; d++) os[d] += xm_tmp[d];
                 }
             }
