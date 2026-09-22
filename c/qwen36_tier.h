@@ -24,8 +24,9 @@
 #ifdef COLI_CUDA
 
 /* Init after model load. Returns 1 when the tier is active.
- * cap_experts_per_layer must equal n_experts (full RAM residency): the tier
- * stores raw pointers into the expert slots, which must never be evicted. */
+ * qt_init: cap_experts_per_layer must equal n_experts (full RAM residency):
+ * the tier stores raw pointers into the expert slots, which must never be
+ * evicted. qt_init_stream (below) is the mode for cap < n_experts. */
 /* expert_is_int4: 1 = pesi int4 impacchettati (fmt=4), 0 = int8 (fmt=1). Il
  * chiamante lo determina dalla TAGLIA SU DISCO, non da meta.ebits, che su
  * qualche container mente (cfr. il rilevamento in qwen36.c). */
