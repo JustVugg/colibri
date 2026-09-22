@@ -1,0 +1,106 @@
+[OMP] qwen36: 16 physical-core threads instead of 32 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=16/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248043) from D:/project/colibri/models/qwen36_i4_gs64/tokenizer.json
+[enc] prompt tokens: 30 | generating 64 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 6.2s | RSS after load: 9.23 GB
+[dense-i8] 291 matrices quantized in 0.8 s, 7.2 GB f32 freed
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[timers] window: moe 166 ms/token (last 32)
+
+Generated (64 new tokens):
+Text      : 
+TTFT: 7.50 s (time to first token)
+[timers] decode: 63 tokens  (shared/router are subsets of moe_total)
+[timers]   deltanet      4414.2 ms     70.07 ms/token
+[timers]   attention     1067.4 ms     16.94 ms/token
+[timers]   moe_total     9727.0 ms    154.40 ms/token
+[timers]   (shared)       789.3 ms     12.53 ms/token
+[timers]   (router)       239.3 ms      3.80 ms/token
+[timers]   lm_head       1086.6 ms     17.25 ms/token
+[timers]   TOTAL        16295.2 ms    258.65 ms/token
+[timers]   step() total: 258.9 ms/token (outside the phases: 0.3)
+[timers]   dn-sub: proj 39.8 | conv 10.1 | l2n+rec 4.9 | norm+out 15.1 ms/token
+[timers]   expert kernel: fetch 99.03 | compute 38.04 ms/token
+[timers] prefill: 30 tokens  dn=1252 attn=98 moe=6115(sh=47 rt=6) head=18 ms
+
+PEAK RSS: 11.02 GB
+Expert cache hit rate: 61.9% (hit=18408 miss=11352)
+Speed: 2.69 tok/s (23.8s for 64 tokens)
+대한민국의 수도는 **서울**입니다. 서울의 주요 특징 세 가지는 다음과 같습니다.
+
+1. **역사와 현대의 조화**: 남산, 북촌 한옥마을, 경복궁 등 전통적인 문화유산과 고층 빌딩, 첨단 기술 단지가 공존하여 과거와 미래[OMP] qwen36: 16 physical-core threads instead of 32 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=16/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248043) from D:/project/colibri/models/qwen36_i4_gs64/tokenizer.json
+[enc] prompt tokens: 30 | generating 64 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 6.2s | RSS after load: 9.23 GB
+[dense-i8] 291 matrices quantized in 0.8 s, 7.2 GB f32 freed
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[timers] window: moe 178 ms/token (last 32)
+
+Generated (64 new tokens):
+Text      : 
+TTFT: 7.63 s (time to first token)
+[timers] decode: 63 tokens  (shared/router are subsets of moe_total)
+[timers]   deltanet      4377.0 ms     69.48 ms/token
+[timers]   attention     1052.0 ms     16.70 ms/token
+[timers]   moe_total    10437.8 ms    165.68 ms/token
+[timers]   (shared)       837.0 ms     13.29 ms/token
+[timers]   (router)       262.9 ms      4.17 ms/token
+[timers]   lm_head       1128.1 ms     17.91 ms/token
+[timers]   TOTAL        16994.9 ms    269.76 ms/token
+[timers]   step() total: 270.0 ms/token (outside the phases: 0.3)
+[timers]   dn-sub: proj 38.8 | conv 9.1 | l2n+rec 5.0 | norm+out 16.4 ms/token
+[timers]   expert kernel: fetch 106.14 | compute 41.06 ms/token
+[timers] prefill: 30 tokens  dn=1267 attn=98 moe=6230(sh=46 rt=6) head=18 ms
+
+PEAK RSS: 11.02 GB
+Expert cache hit rate: 61.9% (hit=18408 miss=11352)
+Speed: 2.60 tok/s (24.7s for 64 tokens)
+대한민국의 수도는 **서울**입니다. 서울의 주요 특징 세 가지는 다음과 같습니다.
+
+1. **역사와 현대의 조화**: 남산, 북촌 한옥마을, 경복궁 등 전통적인 문화유산과 고층 빌딩, 첨단 기술 단지가 공존하여 과거와 미래[OMP] qwen36: 16 physical-core threads instead of 32 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=16/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248043) from D:/project/colibri/models/qwen36_i4_gs64/tokenizer.json
+[enc] prompt tokens: 30 | generating 64 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 7.0s | RSS after load: 9.23 GB
+[dense-i8] 291 matrices quantized in 0.9 s, 7.2 GB f32 freed
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[timers] window: moe 181 ms/token (last 32)
+
+Generated (64 new tokens):
+Text      : 
+TTFT: 8.26 s (time to first token)
+[timers] decode: 63 tokens  (shared/router are subsets of moe_total)
+[timers]   deltanet      4470.9 ms     70.97 ms/token
+[timers]   attention     1079.8 ms     17.14 ms/token
+[timers]   moe_total    10747.2 ms    170.59 ms/token
+[timers]   (shared)       857.4 ms     13.61 ms/token
+[timers]   (router)       266.4 ms      4.23 ms/token
+[timers]   lm_head       1124.6 ms     17.85 ms/token
+[timers]   TOTAL        17422.4 ms    276.55 ms/token
+[timers]   step() total: 276.8 ms/token (outside the phases: 0.3)
+[timers]   dn-sub: proj 40.1 | conv 9.2 | l2n+rec 5.1 | norm+out 16.4 ms/token
+[timers]   expert kernel: fetch 110.67 | compute 41.03 ms/token
+[timers] prefill: 30 tokens  dn=1410 attn=98 moe=6715(sh=47 rt=7) head=17 ms
+
+PEAK RSS: 11.02 GB
+Expert cache hit rate: 61.9% (hit=18408 miss=11352)
+Speed: 2.49 tok/s (25.7s for 64 tokens)
+대한민국의 수도는 **서울**입니다. 서울의 주요 특징 세 가지는 다음과 같습니다.
+
+1. **역사와 현대의 조화**: 남산, 북촌 한옥마을, 경복궁 등 전통적인 문화유산과 고층 빌딩, 첨단 기술 단지가 공존하여 과거와 미래

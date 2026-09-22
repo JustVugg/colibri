@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "hypothesis": "With cap < n_experts the qwen36 CUDA expert tier can run in streaming mode (RAM LRU + disk, copy at note) and still beat the CPU path on a box whose RAM cannot hold full residency, because 68-73 % of routed experts are served from VRAM and the rest stay on the shared int4 kernel. COLI_GPUS=0, CUDA_EXPERT_GB=6 and CUDA_DENSE=1 are inert without COLI_CUDA=1; the baseline runs did not set them.",
+  "commit": "75884529408f3bc0766fef8eef12746d666c3412",
+  "model": "Qwen/Qwen3.6-35B-A3B, Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 container (int4 gs64 experts, int8 dense), 23.0 GB",
+  "command": "make qwen36.exe CC=x86_64-w64-mingw32-gcc-posix CUDA_DLL=1 ARCH=native (coli_cuda.dll: build_cuda.bat, CUDA 12.9, MSVC 14.44, sm_120); SNAP=<container> TOK=<container>/tokenizer.json N_NEW=64 NOSTREAM=1 COLI_TIMERS=1 COLI_CUDA=<0|1> [COLI_GPUS=0 CUDA_EXPERT_GB=6 CUDA_DENSE=1] ./qwen36.exe 16 4 prompt.txt; tok_s = 1000 / decode TOTAL ms/token from [timers]",
+  "prompt_hash": "f02d02bcbffbdc12f4b1e41aa36dd8719dc0f58b45042ece01efb17b6930cbba",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 8940HX, 16 cores / 32 threads (OMP team 16), laptop",
+    "ram": "32 GB, ~9-10 GB available during the runs (desktop apps open)",
+    "storage": "KIOXIA KBG60ZNV1T02 NVMe, NTFS, container on the same drive; page cache not dropped between runs",
+    "os": "Windows 11 Home 26200, MinGW-w64 gcc (Debian stable, posix threads), NVIDIA driver 616.56, CUDA 12.9, RTX 5060 Laptop GPU 8 GB"
+  },
+  "warmup_runs": 1,
+  "changed_variables": ["COLI_CUDA"],
+  "baseline": {
+    "config": {"COLI_CUDA": "0", "cap": "16", "N_NEW": "64", "HEAT_FILE": "unset", "COLI_GPUS": "0", "CUDA_EXPERT_GB": "6", "CUDA_DENSE": "1"},
+    "samples": {"tok_s": [3.866, 3.707, 3.616]},
+    "median_tok_s": 3.707,
+    "quality": {"method": "reference arm (CPU path); greedy tokens deterministic across the three runs", "passed": true},
+    "evidence": {"uri": "docs/experiments/qwen36-streaming-tier-2026-09-22-cpu-raw.txt", "sha256": "e6897cff68a2c090ceee68062b5e4c23cae2810db6a45007a41b8753a07f8a7c"}
+  },
+  "trial": {
+    "config": {"COLI_CUDA": "1", "cap": "16", "N_NEW": "64", "HEAT_FILE": "unset", "COLI_GPUS": "0", "CUDA_EXPERT_GB": "6", "CUDA_DENSE": "1"},
+    "samples": {"tok_s": [5.128, 5.116, 4.137]},
+    "median_tok_s": 5.116,
+    "quality": {"method": "greedy byte-identity against the CPU path with QWEN_EXPERT_ACT=f32 COLI_DENSE_IDOT=0, two prompts, separate runs; under the default int8 activations the tokens differ from the CPU path and between runs (see docs/qwen36-cuda-tier.md, Exactness)", "passed": true},
+    "evidence": {"uri": "docs/experiments/qwen36-streaming-tier-2026-09-22-gpu-raw.txt", "sha256": "0bdc95dead22b9752f3509b86c24333735c497b7def078dd568dfcc77bfe373e"}
+  },
+  "outcome": "improvement"
+}

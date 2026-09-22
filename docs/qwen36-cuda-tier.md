@@ -59,12 +59,19 @@ telemetry.
 Streaming is what makes the tier usable on a box whose RAM cannot hold the
 full residency peak (~32 GB of int8 slots on one card). Measured on an RTX
 5060 Laptop (8 GB, `CUDA_EXPERT_GB=6`), 32 GB RAM, cap 16, gs64 container,
-64 greedy tokens: decode 263.7 ms/token on the CPU path, 185.6 with the
-streaming tier cold, 137.2 with a `HEAT_FILE` from a previous run (91.7 %
-VRAM hit rate); a prompt the heat file had not seen ran at 211.1 against 293.2
-on the CPU (62.2 % hit). Peak RSS 11.0 GB in every arm, and the generated
-tokens were byte-identical to the CPU path on both prompts. Single runs, not
-a manifest-grade measurement.
+64 greedy tokens, no `HEAT_FILE`, interleaved runs after one warm-up each:
+decode 3.87 / 3.71 / 3.62 tok/s on the CPU path (median 3.71) against
+5.13 / 5.12 / 4.14 with the streaming tier (median 5.12, +38 %, 68-73 % VRAM
+hit rate); peak RSS 11.0 GB in both arms. A `HEAT_FILE` from an earlier run
+lifts the hit rate further (91.7 % on the prompt it was learned on).
+
+**Exactness.** With f32 activations on both sides (`QWEN_EXPERT_ACT=f32
+COLI_DENSE_IDOT=0`) the generated tokens are byte-identical to the CPU path.
+Under the default int8 activations they are not, and they vary from run to
+run: the GPU expert kernel takes f32 activations while the CPU quantizes them
+to int8, so the result depends on which experts happen to be resident, and
+that follows the asynchronous upload timing. Full residency has the same
+property; streaming only makes the resident set move more.
 
 ## Placement: where the dense trunk goes (`COLI_PLACE`)
 

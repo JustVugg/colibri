@@ -1,0 +1,150 @@
+[CUDA] device 0: NVIDIA GeForce RTX 5060 Laptop GPU, 8.5 GB VRAM, sm_120
+[OMP] qwen36: 16 physical-core threads instead of 32 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=16/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248043) from D:/project/colibri/models/qwen36_i4_gs64/tokenizer.json
+[enc] prompt tokens: 30 | generating 64 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 6.3s | RSS after load: 9.23 GB
+[dense-i8] 291 matrices quantized in 0.8 s, 7.2 GB f32 freed
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qtier] dev 0: 6.9 GB free, allowance 6.0 GB
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 4.21 GB left for experts
+[qtier] dev 0: budget 4.21 GB for experts (~2391 experts) after trunk
+[qtier] CUDA VRAM expert tier active: 1 device(s), 1.80 MB/expert
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[gpu] MoE experts -> CUDA VRAM tier (streaming: RAM LRU + disk, copy at note)
+[place] probe: one [8192 x 2048] int8 GEMV takes 0.168 ms on CUDA dev 0, 0.166 ms on the CPU -> trunk stays on the CPU
+[place] trunk stays on the CPU (measured slower than the CPU): 1.79 GB of VRAM back to the experts
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[qtier] warmstart (streaming): 3404 experts in VRAM, RAM keeps an LRU -- 6.9 s
+[timers] window: moe 108 ms/token (last 32)
+
+Generated (64 new tokens):
+Text      : 
+TTFT: 6.56 s (time to first token)
+[timers] decode: 63 tokens  (shared/router are subsets of moe_total)
+[timers]   deltanet      4198.2 ms     66.64 ms/token
+[timers]   attention      996.8 ms     15.82 ms/token
+[timers]   moe_total     6012.1 ms     95.43 ms/token
+[timers]   (shared)       806.9 ms     12.81 ms/token
+[timers]   (router)       233.9 ms      3.71 ms/token
+[timers]   lm_head       1077.7 ms     17.11 ms/token
+[timers]   TOTAL        12284.8 ms    195.00 ms/token
+[timers]   step() total: 195.3 ms/token (outside the phases: 0.3)
+[timers]   dn-sub: proj 36.7 | conv 9.2 | l2n+rec 4.6 | norm+out 15.9 ms/token
+[timers]   qtier: issue 3.58 | cpu-miss 28.88 | take 6.45 ms/token
+[timers] prefill: 30 tokens  dn=1356 attn=99 moe=5075(sh=357 rt=6) head=18 ms
+[qtier] resident 3404/10240 experts | uploads 4364 | miss(CPU) 8178 | q_skips 0
+[qtier]   dev 0: hits 21582 | 10213 tensors, 5.63 GB VRAM used (0.00 GB trunk + experts, budget 6.00 GB)
+[qtier] VRAM hit rate: 72.5 % | LFRU swaps 960
+[qtier] group_stats: 3536 calls, 21582 experts | h2d 0 ms, kernel 0 ms, d2h 0 ms
+
+PEAK RSS: 11.02 GB
+Expert cache hit rate: 60.7% (hit=12261 miss=7927)
+Speed: 3.39 tok/s (18.9s for 64 tokens)
+대한민국의 수도는 **서울**입니다. 서울의 주요 특징 세 가지는 다음과 같습니다.
+
+1.  **정치·경제·문화의 중심지**: 정부 기관과 주요 기업 본사들이 밀집해 있어 국가의 행정과 경제를 주도하며, K-POP, 드라마 등 한류 문화[CUDA] device 0: NVIDIA GeForce RTX 5060 Laptop GPU, 8.5 GB VRAM, sm_120
+[OMP] qwen36: 16 physical-core threads instead of 32 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=16/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248043) from D:/project/colibri/models/qwen36_i4_gs64/tokenizer.json
+[enc] prompt tokens: 30 | generating 64 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 6.4s | RSS after load: 9.23 GB
+[dense-i8] 291 matrices quantized in 0.8 s, 7.2 GB f32 freed
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qtier] dev 0: 6.9 GB free, allowance 6.0 GB
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 4.21 GB left for experts
+[qtier] dev 0: budget 4.21 GB for experts (~2391 experts) after trunk
+[qtier] CUDA VRAM expert tier active: 1 device(s), 1.80 MB/expert
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[gpu] MoE experts -> CUDA VRAM tier (streaming: RAM LRU + disk, copy at note)
+[place] probe: one [8192 x 2048] int8 GEMV takes 0.178 ms on CUDA dev 0, 0.279 ms on the CPU -> trunk to VRAM
+[lmh] lm_head [248320 x 2048] int8 resident on CUDA dev 0 (0.47 GB)
+[dnp] 30 DeltaNet-Projektionen auf GPU (0.70 GB VRAM)
+[dense] 190 trunk matrices on GPU (dnout/attnproj/shexp, 0.61 GB VRAM)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[qtier] warmstart (streaming): 2391 experts in VRAM, RAM keeps an LRU -- 6.4 s
+[timers] window: moe 146 ms/token (last 32)
+
+Generated (64 new tokens):
+Text      : 
+TTFT: 9.53 s (time to first token)
+[timers] decode: 63 tokens  (shared/router are subsets of moe_total)
+[timers]   deltanet      3069.0 ms     48.71 ms/token
+[timers]   attention      673.5 ms     10.69 ms/token
+[timers]   moe_total     8039.2 ms    127.61 ms/token
+[timers]   (shared)       711.3 ms     11.29 ms/token
+[timers]   (router)       315.6 ms      5.01 ms/token
+[timers]   lm_head        533.2 ms      8.46 ms/token
+[timers]   TOTAL        12314.9 ms    195.47 ms/token
+[timers]   step() total: 195.8 ms/token (outside the phases: 0.4)
+[timers]   dn-sub: proj 21.7 | conv 9.9 | l2n+rec 6.7 | norm+out 10.1 ms/token
+[timers]   qtier: issue 4.16 | cpu-miss 33.99 | take 0.31 ms/token
+[timers] prefill: 30 tokens  dn=1526 attn=101 moe=7861(sh=557 rt=11) head=10 ms
+[qtier] resident 2391/10240 experts | uploads 3520 | miss(CPU) 9335 | q_skips 0
+[qtier]   dev 0: hits 20425 | 7395 tensors, 5.74 GB VRAM used (1.79 GB trunk + experts, budget 4.21 GB)
+[qtier] VRAM hit rate: 68.6 % | LFRU swaps 1129
+[qtier] group_stats: 3517 calls, 20425 experts | h2d 0 ms, kernel 0 ms, d2h 0 ms
+
+PEAK RSS: 11.02 GB
+Expert cache hit rate: 64.2% (hit=13913 miss=7762)
+Speed: 2.93 tok/s (21.9s for 64 tokens)
+대한민국의 수도는 **서울**입니다. 서울의 주요 특징 세 가지는 다음과 같습니다.
+
+1. **현대적 도시와 전통의 조화**: 남산타워, 롯데월드타워 등 첨단 현대 건축물과 경복궁, 창덕궁, 북촌 한옥마을 등 유네스코 세계[CUDA] device 0: NVIDIA GeForce RTX 5060 Laptop GPU, 8.5 GB VRAM, sm_120
+[OMP] qwen36: 16 physical-core threads instead of 32 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=16/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248043) from D:/project/colibri/models/qwen36_i4_gs64/tokenizer.json
+[enc] prompt tokens: 30 | generating 64 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 6.6s | RSS after load: 9.23 GB
+[dense-i8] 291 matrices quantized in 0.9 s, 7.2 GB f32 freed
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qtier] dev 0: 6.9 GB free, allowance 6.0 GB
+[place] auto: dev 0 holds 1828.5 MB of trunk (lmhead yes, 30 dnproj layers), 4.21 GB left for experts
+[qtier] dev 0: budget 4.21 GB for experts (~2391 experts) after trunk
+[qtier] CUDA VRAM expert tier active: 1 device(s), 1.80 MB/expert
+[CUDA] mode: routed experts (qwen36 VRAM tier)
+[gpu] MoE experts -> CUDA VRAM tier (streaming: RAM LRU + disk, copy at note)
+[place] probe: one [8192 x 2048] int8 GEMV takes 0.176 ms on CUDA dev 0, 0.169 ms on the CPU -> trunk stays on the CPU
+[place] trunk stays on the CPU (measured slower than the CPU): 1.79 GB of VRAM back to the experts
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[qtier] warmstart (streaming): 3404 experts in VRAM, RAM keeps an LRU -- 7.5 s
+[timers] window: moe 146 ms/token (last 32)
+
+Generated (64 new tokens):
+Text      : 
+TTFT: 7.50 s (time to first token)
+[timers] decode: 63 tokens  (shared/router are subsets of moe_total)
+[timers]   deltanet      4822.0 ms     76.54 ms/token
+[timers]   attention     1139.3 ms     18.08 ms/token
+[timers]   moe_total     7984.6 ms    126.74 ms/token
+[timers]   (shared)      1000.0 ms     15.87 ms/token
+[timers]   (router)       294.3 ms      4.67 ms/token
+[timers]   lm_head       1282.5 ms     20.36 ms/token
+[timers]   TOTAL        15228.3 ms    241.72 ms/token
+[timers]   step() total: 242.1 ms/token (outside the phases: 0.4)
+[timers]   dn-sub: proj 42.5 | conv 9.6 | l2n+rec 5.9 | norm+out 18.2 ms/token
+[timers]   qtier: issue 4.49 | cpu-miss 34.94 | take 5.90 ms/token
+[timers] prefill: 30 tokens  dn=1515 attn=98 moe=5844(sh=399 rt=7) head=20 ms
+[qtier] resident 3404/10240 experts | uploads 4361 | miss(CPU) 8212 | q_skips 0
+[qtier]   dev 0: hits 21548 | 10213 tensors, 5.63 GB VRAM used (0.00 GB trunk + experts, budget 6.00 GB)
+[qtier] VRAM hit rate: 72.4 % | LFRU swaps 957
+[qtier] group_stats: 3536 calls, 21548 experts | h2d 0 ms, kernel 0 ms, d2h 0 ms
+
+PEAK RSS: 11.02 GB
+Expert cache hit rate: 59.9% (hit=12158 miss=8143)
+Speed: 2.81 tok/s (22.8s for 64 tokens)
+대한민국의 수도는 **서울**입니다. 서울의 주요 특징 세 가지는 다음과 같습니다.
+
+1. **역사와 현대의 조화**: 경복궁, 창덕궁 등 유네스코 세계문화유산으로 지정된 고궁과 왕실 문화유산이 잘 보존되어 있어 전통의 면모
