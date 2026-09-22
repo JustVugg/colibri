@@ -78,10 +78,126 @@ sequences. The extension
 The server serves one generation at a time: the model stays in one persistent
 process, so concurrent HTTP requests queue instead of loading duplicate model
 copies. Tool calling depends on the active engine; see the support matrix below.
-Images, log probabilities, and token penalties return an explicit error rather
-than being silently ignored. Audio is accepted only by Inkling checkpoints with
-audio support. The default bind address is localhost; set `COLI_API_KEY` before
-exposing the server beyond the machine.
+Images and token penalties return an explicit error rather than being silently
+ignored. The OpenAI-compatible endpoints request log probabilities only from a
+glm engine (see below); on every other engine such a request is refused with a
+named error, never silently ignored. Audio is accepted only by Inkling
+checkpoints with audio support. The default bind address is localhost; set
+`COLI_API_KEY` before exposing the server beyond the machine.
+
+### Log probabilities and prompt echo
+
+`/v1/completions` accepts the legacy integer `logprobs` (**0–32**; 0 means no log
+probabilities at all, see below; the upper bound is the engine's top-32 read-out
+interface, and anything above 32 is a named 400) and boolean `echo`;
+`/v1/chat/completions` accepts boolean `logprobs` plus integer `top_logprobs` (0–32) and
+returns `choices[].logprobs.content[]` (`{token, logprob, bytes, top_logprobs}` per
+generated token) — chat has no `echo` concept and rejects one with a 400. Each endpoint
+takes the OpenAI request shape for it and refuses the other's by name. A non-boolean
+`echo` is a named 400 (`invalid_value`) on both endpoints, independent of whether
+`logprobs` is requested at all. On chat, `top_logprobs` is type- and range-checked even
+when `logprobs` is false or absent, so a malformed `top_logprobs` is a named 400 whether
+or not the gate it would feed is open; a valid `top_logprobs` with `logprobs` off remains
+a documented no-op.
+
+The zero semantics are explicit, not a truthiness accident: on `/v1/completions`,
+`logprobs: 0`, `false` and `null` all mean **no log probabilities** (the request succeeds
+with `choices[].logprobs: null`, exactly as if the field were omitted), while boolean
+`true` is a named 400 — the legacy field is an integer count, and a boolean carries no
+count. On `/v1/chat/completions` the field is a boolean gate (`null` behaves like `false`;
+any integer is a named 400). `echo: null` normalises to absent on both endpoints, so a
+client that serialises its whole request model with nulls is never refused for a field it
+did not mean to set. `logprobs` together with `stream` is a named 400: per-delta log
+probabilities are not built.
+
+`/v1/completions` with `echo: true` returns the full legacy `logprobs` object (`tokens`,
+`token_logprobs`, `top_logprobs`, `text_offset`) covering the echoed prompt plus any
+generated tokens, and `text` itself is the reconstructed prompt followed by the completion
+(the standard OpenAI legacy behavior for `echo: true`) rather than the completion alone;
+`echo: true` without an active `logprobs` request is a named 400 (`echo` requires
+`logprobs`): the prompt echo is built out of the engine's per-token records, so without
+them there is nothing to echo, and a request that asks for one is told so rather than
+served without it. Echoing a prompt with no logprobs at all is offered as a separate
+proposal. `text_offset` is a character offset into
+that same returned `text` string, always counted from 0 — including when `echo` is false,
+where `text` holds only the completion and the offsets describe only that text, not a
+position within the (unreturned) prompt.
+
+`"".join(tokens)` is the returned `text`: where a `stop` sequence matches partway through
+a token, that token's `tokens` entry is truncated to the characters actually emitted (a
+`stop` of `"lo"` against a token decoding to `"Hello"` reports `"Hel"`), rather than being
+dropped or reporting characters the client did not receive. On chat, a truncated entry's
+`bytes` — and its `top_logprobs` entries' `bytes` — are truncated with it, to the UTF-8 of
+the characters that entry reports. An entry that was not truncated keeps its frame's own
+payload, which need not be the encoding of its `token`: a frame carrying only part of a
+multi-byte codepoint reports `token: ""` with that frame's bytes.
+
+The requested top-k table is **unsorted** on the wire — do not assume the first entry is
+the argmax. Per-token values are printed by the engine to six decimal digits of precision.
+Non-finite values (a degenerate all-`-inf` logit row, say) serialize as JSON `null`, never
+a clamped number.
+
+These endpoints request the numeric per-token channel only from a glm engine; on every
+other engine the request returns a named 400 rather than being silently ignored. That is a
+statement about what these endpoints request, and about nothing else.
+
+Known limitations, current build:
+
+- **Cost.** Requesting `logprobs` at all — completions or chat, `echo` or not — asks the
+  engine for a full read-out pass over the whole prompt, because the request carries one
+  opt-in and not a separate "echo" one. Such a request normally forfeits prefix-cache
+  reuse. There is no cap on prompt length for it, so a very long prompt pays a
+  correspondingly large one-shot cost.
+- **Waiting.** A logprobs request waits for the engine exactly as any other request waits.
+  An engine that never acknowledges the submission — one older than this extension, or one
+  whose parser disagrees about the header's shape — leaves the request waiting, as it
+  would through a cold prefill. There is no separate bounded wait for the opt-in. A request
+  whose per-token frames could not be read waits the same way: the turn belongs to the
+  engine until it sends a terminal frame, so the refusal below is delivered then rather
+  than the moment the unreadable frame arrives. The engine is sent one stop when that
+  happens, so the turn does not spend the rest of its budget on a response nobody receives.
+- **Cancellation.** A cancel may not take effect until the read-out this request asked for
+  has finished, so the window in which a disconnect goes unnoticed is wider on a long
+  prompt than it is without `logprobs`.
+- **Alternative-token labels.** `top_logprobs` entries for candidate token ids other than
+  the position's own actual token are not decoded text (no server-side tokenizer exists, by
+  design) — they are labeled `<token_id:N>`. Only the position's own token, identified by
+  an exact logprob match rather than by id, gets its real decoded text.
+- **The sampled token is not guaranteed to appear in its own `top_logprobs` table.** The
+  engine's numeric channel reports the top-k candidates by its own read-out; if the chosen
+  token falls outside that table, no entry represents it, and the response's
+  `token_logprobs`/`logprob` field is still the chosen token's own value read from the
+  frame directly, not looked up in the table.
+- **The arrays describe the text the client received, exactly, and nothing beyond it.**
+  Every generated token is located in the returned text by its span in the raw engine
+  stream, so the stage that consumed a character decides how much of that token's entry
+  reaches the array: a token a matched `stop` cut partway through reports the characters
+  that were emitted, and generated text that does not reach `message.content` — reasoning,
+  template markers, tool-call syntax, a swallowed role marker — is not described there.
+  Reasoning, template and tool-call tokens are therefore not described by
+  `logprobs.content`; a separate field for the full stream is proposed separately. On
+  every response that carries logprobs, `"".join(tokens)` is the returned `text` and
+  `"".join` over `logprobs.content` is `message.content`. When the engine's records cannot
+  support that — they stop short of the generated text, or none arrive at all — the
+  request is refused by name rather than answered with arrays describing a prefix.
+- **Engine-side faults are named, not generic.** When the engine's per-token records cannot
+  answer the request, the 5xx body carries a `code` saying what the engine did:
+  `engine_logprob_tail_malformed` (a numeric tail this server cannot read — it fails that
+  one request and no other), `engine_echo_position_malformed` (an unreadable prompt-echo
+  position, which is a different field of the same frame),
+  `engine_duplicate_logprob_candidate` (a top-k table repeating a candidate at one
+  position), `engine_logprob_records_incomplete` (records that stop
+  short of the generated text, none at all, or — under `echo` — no prompt-echo records,
+  any of which would leave the arrays describing a prefix), and
+  `engine_pinned_prefix_not_echoed` (a KV slot holding a pin snapshot, so the echoed
+  positions would not start at 0). No logprobs-bearing response is ever a truncated or
+  half-described 200.
+- **Server-side buffering.** A request that asks to see the echoed prompt (`echo: true` on
+  `/v1/completions`) has its full echo table held in memory for the request's lifetime; no
+  streaming is allowed together with `logprobs`, so that hold is bounded by one
+  non-streaming response. A logprobs request that does not ask for the echo — all of chat,
+  and every `echo: false` completion — retains nothing: the engine still sends an ECHO frame
+  for every prompt position, and they are dropped as they arrive rather than held.
 
 ### Tool-calling support
 
