@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include "decode_batch.h"   /* ColiSubmit, coli_submit_ext, coli_logprob_tail */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +61,11 @@ typedef struct {
     /* IMAGE: la griglia di patch che accompagna il payload. Zero per ogni altro
      * comando. */
     int grid_h, grid_w;
+    /* SUBMIT logprobs=k: emissione top-k per token. 0 = canale spento.
+     * Le chiavi key=value stanno dopo i campi posizionali e usano lo
+     * stesso namespace di decode_batch.h, non un secondo dialetto. */
+    int logprobs;
+    int pin;        /* SUBMIT pin=1, vedi decode_batch.h */
     unsigned char *payload;
 } ColiServeCommand;
 
@@ -262,9 +268,35 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
     int minimum_fields = 7;
     int maximum_fields = minimum_fields + !!profile->allow_extension_bytes +
                          !!profile->allow_prefix_hint;
-    if (nfields < minimum_fields || nfields > maximum_fields ||
-        (nfields >= 8 && !profile->allow_extension_bytes) ||
-        (nfields >= 9 && (!profile->allow_prefix_hint ||
+    /* I token key=value vengono dopo i campi posizionali. Il primo campo che
+     * contiene '=' apre l'estensione: da li in poi il conteggio posizionale si
+     * ferma, e le regole (chiavi note, niente duplicati, valori in campo) sono
+     * quelle di coli_submit_ext, non una seconda copia scritta qui. */
+    int positional = nfields;
+    for (int f = minimum_fields; f < nfields; f++)
+        if (strchr(fields[f], '=')) { positional = f; break; }
+    command->logprobs = 0;
+    command->pin = 0;
+    if (positional < nfields) {
+        char ext[128]; size_t used = 0; ext[0] = 0;
+        for (int f = positional; f < nfields; f++) {
+            size_t need = strlen(fields[f]) + 1;
+            if (used + need + 1 >= sizeof ext) { free(line); return COLI_SERVE_READ_BAD_REQUEST; }
+            ext[used++] = ' ';
+            memcpy(ext + used, fields[f], need);
+            used += need - 1;
+        }
+        {
+            ColiSubmit tmp;
+            memset(&tmp, 0, sizeof tmp);
+            if (!coli_submit_ext(ext, &tmp)) { free(line); return COLI_SERVE_READ_BAD_REQUEST; }
+            command->logprobs = tmp.logprobs;
+            command->pin = tmp.pin;
+        }
+    }
+    if (positional < minimum_fields || positional > maximum_fields ||
+        (positional >= 8 && !profile->allow_extension_bytes) ||
+        (positional >= 9 && (!profile->allow_prefix_hint ||
                           !profile->allow_extension_bytes))) {
         free(line);
         return COLI_SERVE_READ_BAD_REQUEST;
@@ -276,12 +308,19 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
         !coli_serve_parse_i32(fields[4], &command->max_tokens) ||
         !coli_serve_parse_f32(fields[5], &command->temperature) ||
         !coli_serve_parse_f32(fields[6], &command->top_p) ||
-        (nfields >= 8 &&
+        (positional >= 8 &&
          !coli_serve_parse_u64(fields[7], &command->extension_bytes)) ||
-        (nfields >= 9 && !coli_serve_parse_i32(fields[8], &command->prefix_bytes)) ||
+        (positional >= 9 && !coli_serve_parse_i32(fields[8], &command->prefix_bytes)) ||
         command->payload_bytes > profile->max_payload_bytes ||
         command->extension_bytes > profile->max_extension_bytes ||
-        command->max_tokens < 1 ||
+        /* max_tokens=0 vale SOLO in modalita jev (logprobs>0) e vuol dire
+         * "leggi il prompt e fermati", niente generazione. Senza, chi punteggia
+         * un menu chiuso deve chiedere almeno un token, e quel token lo paga:
+         * un passo di decodifica completo per opzione, buttato via. Misurato su
+         * qwen36: raddoppia il costo di un'opzione da un token. Una richiesta
+         * che non chiede logprobs continua a essere rifiutata a 0, come prima. */
+        (command->max_tokens < 1 &&
+         !(command->max_tokens == 0 && command->logprobs > 0)) ||
         (profile->max_tokens && command->max_tokens > profile->max_tokens) ||
         (profile->require_finite_sampling &&
          (!isfinite(command->temperature) || !isfinite(command->top_p)))) {
@@ -337,6 +376,21 @@ static inline int coli_serve_write_data(
     FILE *output, const char *id, const void *data, size_t bytes)
 {
     if (fprintf(output, "DATA %s %zu\n", id, bytes) < 0 ||
+        (bytes && fwrite(data, 1, bytes, output) != bytes) ||
+        fputc('\n', output) == EOF)
+        return 0;
+    return fflush(output) == 0;
+}
+
+/* Come coli_serve_write_data, ma con la coda numerica del canale logprobs
+ * appesa all'intestazione: "DATA <id> <n> <lp> <k> [tid tlp]*k". Un frame per
+ * token, perche un client che punteggia vuole i token, non il testo accorpato.
+ * Si usa SOLO quando la richiesta ha chiesto logprobs=k: senza, il frame resta
+ * quello legacy byte per byte, e un gateway vecchio non vede mai questa forma. */
+static inline int coli_serve_write_data_lp(
+    FILE *output, const char *id, const void *data, size_t bytes, const char *tail)
+{
+    if (fprintf(output, "DATA %s %zu%s\n", id, bytes, tail ? tail : "") < 0 ||
         (bytes && fwrite(data, 1, bytes, output) != bytes) ||
         fputc('\n', output) == EOF)
         return 0;

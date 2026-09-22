@@ -59,6 +59,38 @@ physical-core cap when launched directly; explicit `OMP_NUM_THREADS` and the
 > right before the re-exec, so explicit `OMP_*` pinning works as documented.
 > `COLI_OMP_TUNED=1` remains the escape hatch that skips the re-exec entirely.
 
+### Hybrid CUDA/CPU OpenMP override
+
+The main GLM engine intentionally skips its active-wait OpenMP tuning when
+`COLI_CUDA` is set. Active worker teams have measured severe regressions by
+contending with CUDA dispatch and synchronization, so a CUDA model that still
+routes some experts through RAM is not, by itself, a reason to change that
+default.
+
+On a specific hybrid host where profiling shows the CPU expert window on the
+critical path, the supported experiment is an explicit user-owned OpenMP
+policy:
+
+```bash
+OMP_WAIT_POLICY=active GOMP_SPINCOUNT=200000 KMP_BLOCKTIME=200 \
+OMP_PROC_BIND=close OMP_DYNAMIC=FALSE \
+COLI_CUDA=1 ./coli run --model /models/glm52_i4 "Benchmark prompt"
+```
+
+The OpenMP runtime reads these variables before `main()`, so they must be set
+on the engine invocation rather than exported after startup. The engine uses
+`overwrite=0`; explicit values remain authoritative. `GOMP_SPINCOUNT` applies
+to libgomp and `KMP_BLOCKTIME` to Intel/LLVM OpenMP runtimes, so carrying both
+keeps the command portable across common builds.
+
+Treat this as a measured per-host override, not a recommended CUDA default.
+Compare it against the unchanged command with stable page-cache state and an
+interleaved run order; report CPU expert time, GPU critical time, disk wait,
+and end-to-end throughput. Reject it if GPU time grows or the CPU window was
+already hidden behind the GPU. Do not use active waiting on Apple Silicon: CPU
+spin has measured slower there by stealing the shared CPU/GPU power budget.
+`COLI_NO_OMP_TUNE=1` remains the explicit passive-policy kill switch.
+
 ```bash
 coli plan --model /models/glm52_i4 --policy quality
 coli run --auto-tier --policy quality "Explain MoE offloading"
@@ -170,6 +202,50 @@ family. For byte-exact reproducibility across runs: `DRAFT=0`, plus `IDOT=0
 COLI_CUDA=0` if you also want kernel-family/GPU independence. Acceptance
 percentages are not comparable across engine versions under `--topp`
 ([#163](https://github.com/JustVugg/colibri/issues/163) has the full story).
+
+## Approximate mode: `DEGRADE_ZERO` (opt-in, OLMoE-calibrated)
+
+`DEGRADE_ZERO=1` enables an opt-in degraded inference policy: when a prefetch
+deadline is missed, experts whose per-position gate weight falls below
+`DEGRADE_TAU` (default 0.03) are **zero-filled instead of loaded from disk**.
+The slot contributes nothing to the layer output; the approximation is the
+dropped mass, not a rescaled version of it (renorm is catastrophically worse —
+see issue #865 for the measured A/B).
+
+This reduces blocking disk reads on NVMe-bound workloads at the cost of a small
+quality hit. Measured on OLMoE-1B-7B:
+
+| `DEGRADE_TAU` | slots zeroed | ppl delta |
+|---|---|---|
+| 0.03 | ~22% | +2.9% |
+| 0.05 | ~60% | +41% |
+
+**These numbers are OLMoE-specific.** GLM-5.2 (`norm_topk=1`) and Kimi K3 have
+different router contracts and expert counts — their operating points have not
+been measured. Until they are, treat `tau=0.03` as a starting point and verify
+quality on your model before relying on it.
+
+**These numbers assume a warm expert cache.** Cold-start sessions — where the cache
+begins empty and all experts miss initially — will see higher drop rates until the LRU
+fills. The steady-state perplexity delta above is what was measured; cold-start transient
+behavior has not been separately characterized.
+
+The feature is decode-only (`S≤4` guard, same as `EXPERT_BUDGET`): dropping
+experts during prefill corrupts the KV cache. A rescue rule ensures no token
+position is left with zero routed experts. Resident (pinned or LRU-cached)
+experts are never dropped regardless of weight.
+
+The `[PROF]` footer reports the total zeroed slot count and the top-3 layers by
+drop share when the flag is active, so a miscalibrated tau is visible rather
+than silent.
+
+```bash
+DEGRADE_ZERO=1 DEGRADE_TAU=0.03 COLI_MODEL=/nvme/glm52_i4 ./coli chat
+```
+
+See [ENVIRONMENT.md](ENVIRONMENT.md) for the full variable reference and
+[issue #865](https://github.com/JustVugg/colibri/issues/865) for the
+measurement methodology.
 
 ## Conversations reopen warm
 

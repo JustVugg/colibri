@@ -109,6 +109,7 @@ pacman -S --needed mingw-w64-ucrt-x86_64-gcc make git python
 ```bash
 xcode-select --install          # C compiler (clang)
 brew install libomp git python  # OpenMP for multithreading
+# MacPorts works too: sudo port install libomp   (the Makefile finds either)
 ```
 
 ---
@@ -145,6 +146,12 @@ A pre-converted **GLM-5.2 int4** model is on Hugging Face. Use the
 **group-scaled (gs64)** container with the **int8 MTP head**:
 
 **https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
+
+**GLM-5.3** is the same family and loads with the same engine. Its own
+group-scaled (gs64) container is about **419 GB** and ships **without** the MTP
+head, so speculative decoding stays off:
+
+**https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64**
 
 Group scales matter: the older per-row int4 containers
 (`mateogrgic/…-int4-with-int8-mtp`, `jlnsrk/…`) measure ~9pp worse on quality

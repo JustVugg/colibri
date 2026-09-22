@@ -46,6 +46,8 @@ int coli_metal_add(float *y, const float *a, size_t n);
  * Returns 1 on success, 0 if Metal unavailable.
  */
 int coli_metal_silu_mul(float *g, const float *u, size_t n);
+/* Numerical-oracle hook for GLM-5.3 clamped SwiGLU. */
+int coli_metal_silu_mul_clamped(float *g, const float *u, size_t n, float limit);
 
 /*
  * y[S,O] = (x[S,I] @ W[O,I]^T) * scale[o]. fmt=4 (grouped int4) instead folds a
@@ -186,6 +188,15 @@ int coli_metal_moe_block(int nb, int D, int Iinter, int fmt, int qgs,
                          const float *xg, const int *xoff, const int *nr,
                          const int *rows, const float *rw,
                          float *out, int S);
+
+/* GLM-5.3 routed experts: same batched path, but with its clamped SwiGLU semantics.
+ * gate is upper-clamped to +limit; up is clamped to [-limit,+limit]. */
+int coli_metal_moe_block_clamped(int nb, int D, int Iinter, int fmt, int qgs,
+                         const void *const *g, const void *const *u, const void *const *d,
+                         const float *const *gs, const float *const *us, const float *const *ds,
+                         const float *xg, const int *xoff, const int *nr,
+                         const int *rows, const float *rw,
+                         float *out, int S, float swiglu_limit);
 
 /*
  * Async two-phase variant: begin encodes+commits the block (own scratch, no wait) and

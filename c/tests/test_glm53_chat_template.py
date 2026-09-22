@@ -134,41 +134,41 @@ def main() -> int:
                 return 1
             checked += 1
 
-    # Il ragionamento spento e' una nostra aggiunta: il template non ha quella
-    # forma perche' non prevede di spegnerlo. Non e' pero' inventata -- e'
-    # quello che il template stesso scrive davanti a un turno passato senza
-    # ragionamento -- e va comunque verificata, perche' l'unica cosa che la
-    # tiene giusta e' questo controllo.
+    # Il ragionamento "spento" non e' una forma nostra: e' il livello minimo del
+    # template. GLM-5.3 non sa non ragionare -- `effective_reasoning_effort` ha un
+    # ramo else che vale 'max' e non e' mai none, e il prompt di generazione apre
+    # sempre <think>. Quindi enable_thinking=False deve rendere ESATTAMENTE quello
+    # che il template rende con reasoning_effort='low', e questo lo pretende
+    # confrontando i due, non una forma scritta a mano qui.
+    #
+    # La versione precedente di questo blocco pretendeva l'opposto: nessuna riga di
+    # effort e <think></think> chiuso. Era la mia teoria di #1282, misurata falsa e
+    # ritirata su #1278, e il test la teneva in vita: due deviazioni dal template
+    # trasformate in contratto. Un test puo' proteggere un errore tanto quanto una
+    # correttezza -- per questo qui il riferimento e' il template, mai la mia idea
+    # di cosa dovrebbe uscire.
     off = openai_server.render_chat_for_arch(
         [{"role": "user", "content": "ciao"}], enable_thinking=False)
-    on = openai_server.render_chat_for_arch(
-        [{"role": "user", "content": "ciao"}], enable_thinking=True)
-    if not off.endswith("<|assistant|><think></think>"):
-        print(f"FAIL: col ragionamento spento il prompt finisce con {off[-40:]!r}")
+    expected_off = reference(template_text,
+                             messages=[{"role": "user", "content": "ciao"}],
+                             reasoning_effort="low")
+    if off != expected_off:
+        print("FAIL: col ragionamento al minimo il gateway non rende il template")
+        print(f"  gateway:  {off!r}")
+        print(f"  template: {expected_off!r}")
         return 1
-    # Questa asserzione prima pretendeva che acceso e spento differissero SOLO
-    # per </think>. Era sbagliata, ed e' costata #1278: lasciava "Reasoning
-    # Effort: Max" davanti a un blocco gia' chiuso, cioe' diceva al modello di
-    # riflettere al massimo e insieme che aveva finito. Il modello riapre un
-    # <think>, lo splitter ci rientra e archivia la risposta come pensiero:
-    # l'utente vede riflettere e poi niente.
-    #
-    # Adesso pretende le DUE differenze che devono esserci e nessun'altra: il
-    # blocco chiuso, e nessuna riga di effort. E' la stessa forma che
-    # render_chat (GLM-5.2) produce da sempre.
-    if "Reasoning Effort" in off:
-        print("FAIL: col ragionamento spento il prompt chiede ancora di riflettere")
+    if off.endswith("<think></think>"):
+        print("FAIL: e' tornata la forma col blocco chiuso, che il modello non ha "
+              "mai visto in questa posizione (#1278)")
         return 1
-    stripped = on.replace("[gMASK]<sop>", "", 1)
-    stripped = stripped[stripped.index("<|user|>"):] if "<|user|>" in stripped else stripped
-    if off[:-len("</think>")] != "[gMASK]<sop>" + stripped:
-        print("FAIL: acceso e spento differiscono per piu' della chiusura del blocco "
-              "e della riga di effort")
+    if "Reasoning Effort" not in off:
+        print("FAIL: manca la riga di effort, che il template emette sempre (#1278)")
         return 1
+    checked += 1
 
     print(f"PASS GLM-5.3 chat template: {checked} rese identiche a "
           f"chat_template.jinja, strumenti e livelli di ragionamento compresi, "
-          f"piu' la forma col ragionamento spento")
+          f"piu' il livello minimo, che rende come il template con effort low")
     return 0
 
 

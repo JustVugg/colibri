@@ -27,6 +27,11 @@ static inline uint8_t *coli_kv_row8(uint8_t *base, int position, int width)
 typedef struct {
     unsigned long long id, bytes, gbytes;
     int slot, max_tokens;
+    int pin;        /* SUBMIT pin=1: fotografa lo stato dopo il prefill di questa
+                     * richiesta, cosi le successive che cominciano con lo stesso
+                     * prompt possono riavvolgersi invece di rifarlo. Serve a chi
+                     * punteggia un menu chiuso: lo stato condiviso si calcola una
+                     * volta e ogni opzione paga solo i propri token. */
     float temperature, top_p;
     int logprobs;   /* requested per-token top-k count; 0 = channel off (opt-in) */
     int tok_ids;    /* 1 = payload is ASCII token ids, not raw prompt text */
@@ -52,7 +57,7 @@ typedef struct {
  * undefined behavior (C11 7.21.6.2), so no sscanf ever touches the value. */
 static inline int coli_submit_ext(const char *p, ColiSubmit *s)
 {
-    int seen = 0, seen_logprobs = 0, seen_ids = 0;
+    int seen = 0, seen_logprobs = 0, seen_ids = 0, seen_pin = 0;
     while (*p == ' ' || *p == '\t') p++;
     while (*p) {
         char key[16];
@@ -77,6 +82,10 @@ static inline int coli_submit_ext(const char *p, ColiSubmit *s)
             if (seen_ids || val > 1) return 0;
             seen_ids = 1;
             s->tok_ids = val;
+        } else if (!strcmp(key, "pin")) {        /* fotografa lo stato dopo il prefill */
+            if (seen_pin || val > 1) return 0;
+            seen_pin = 1;
+            s->pin = val;
         } else {
             return 0;                            /* unknown key */
         }
@@ -101,6 +110,7 @@ static inline int coli_submit_parse(const char *line, ColiSubmit *s)
     s->gbytes = 0;
     s->logprobs = 0;
     s->tok_ids = 0;
+    s->pin = 0;
     if (sscanf(line, "SUBMIT %llu %d %llu %d %f %f %llu %c", &s->id, &s->slot,
                &s->bytes, &s->max_tokens, &s->temperature, &s->top_p,
                &s->gbytes, &tail) == 7) ok = 1;
@@ -124,7 +134,9 @@ static inline int coli_submit_parse(const char *line, ColiSubmit *s)
     }
     if (!ok) return 0;
     return s->id > 0 && s->bytes <= (16u << 20) && s->gbytes <= (1u << 20) &&
-           s->slot >= 0 && s->max_tokens >= 1 &&
+           s->slot >= 0 &&
+           /* max_tokens=0: legittimo solo con logprobs>0 (vedi serve_codec.h) */
+           (s->max_tokens >= 1 || (s->max_tokens == 0 && s->logprobs > 0)) &&
            isfinite(s->temperature) && isfinite(s->top_p) &&
            s->temperature >= 0 && s->temperature <= 2 &&
            s->top_p > 0 && s->top_p <= 1;
@@ -158,6 +170,49 @@ static inline int coli_ids_parse(const char *buf, size_t len, int *out,
         }
     }
     return n;
+}
+
+/* Coda numerica di un token: " <lp> <k> [tid tlp]*k", in log-softmax sul
+ * vocabolario intero. Vive qui, accanto a COLI_SUBMIT_TOPK_MAX e al parser
+ * delle chiavi, perche e l'altra meta dello stesso canale: chi lo legge e chi
+ * lo scrive devono concordare sul formato, e un formato concordato in due
+ * copie non e concordato. colibri.c ha la propria logprob_tail dal giorno in
+ * cui il canale e nato; questa ne e la versione condivisa per gli altri motori
+ * e produce gli stessi byte.
+ *
+ * lo==NULL, oppure un token fuori dal vocabolario, danno " nan 0": e il caso
+ * della posizione 0 di un echo, dove non c'e nulla su cui condizionare.
+ * Costo: O(V) per la normalizzazione e O(V*k) per la selezione, pagato solo
+ * dalle richieste che hanno chiesto il canale. */
+static inline int coli_logprob_tail(char *dst, size_t cap, const float *lo,
+                                    int V, int token, int topk)
+{
+    int tk_id[COLI_SUBMIT_TOPK_MAX];
+    float tk_val[COLI_SUBMIT_TOPK_MAX];
+    double se = 0, logZ;
+    float mx;
+    int w, i, k;
+    if (!dst || cap == 0) return 0;
+    if (!lo || token < 0 || token >= V || topk <= 0)
+        return snprintf(dst, cap, " nan 0");
+    if (topk > COLI_SUBMIT_TOPK_MAX) topk = COLI_SUBMIT_TOPK_MAX;
+    if (topk > V) topk = V;
+    mx = lo[0];
+    for (i = 1; i < V; i++) if (lo[i] > mx) mx = lo[i];
+    for (i = 0; i < V; i++) se += exp((double)lo[i] - mx);
+    logZ = (double)mx + log(se);
+    for (k = 0; k < topk; k++) { tk_id[k] = -1; tk_val[k] = -1e30f; }
+    for (i = 0; i < V; i++) {
+        float v = lo[i];
+        int mn = 0;
+        for (k = 1; k < topk; k++) if (tk_val[k] < tk_val[mn]) mn = k;
+        if (v > tk_val[mn]) { tk_val[mn] = v; tk_id[mn] = i; }
+    }
+    w = snprintf(dst, cap, " %.6f %d", (double)lo[token] - logZ, topk);
+    for (k = 0; k < topk && w > 0 && (size_t)w < cap; k++)
+        w += snprintf(dst + w, cap - (size_t)w, " %d %.6f",
+                      tk_id[k], (double)tk_val[k] - logZ);
+    return w;
 }
 
 #endif

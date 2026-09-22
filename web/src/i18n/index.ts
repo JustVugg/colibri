@@ -3,8 +3,8 @@ import { createElement } from "react"
 import en from "./en"
 import zhCN from "./zh-CN"
 import zhTW from "./zh-TW"
-import it from "./it"
 import de from "./de"
+import it from "./it"
 
 const LOCALES = [
   { code: "en", label: "English" },

@@ -15,6 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv / _putenv_s, used by the Windows env shims */
 #ifndef _WIN32
 #include <sys/mman.h>
 #include <unistd.h>
@@ -322,16 +323,39 @@ static inline off_t compat_fsize(int fd){
     return (off_t)li.QuadPart;
 }
 
-/* --- setenv -> SetEnvironmentVariableA (POSIX setenv assente su Windows) --- */
+/* --- setenv / unsetenv (assenti su Windows) ---
+ *
+ * A Windows process carries TWO views of its environment and they are not the
+ * same object: the Win32 environment block, which child processes inherit, and
+ * the CRT's own copy, which getenv() reads and which is populated once at
+ * startup. SetEnvironmentVariableA writes the first and leaves the second
+ * alone, so a setenv() followed by getenv() in the same process used to return
+ * the stale value -- silently, which is the worst way to not support
+ * something. Six test files had grown a private _putenv_s helper around it
+ * (#1416, #1417, #1420).
+ *
+ * _putenv_s writes the CRT copy AND keeps the Win32 block in sync, so both
+ * views agree. SetEnvironmentVariableA is kept alongside it so that a CRT that
+ * ever stopped syncing could not quietly break the inheritance the engine
+ * relies on (omp_tune.h's re-exec, inkling's OMP variables): the two calls
+ * write the same value to the two views, which is the invariant that matters.
+ *
+ * One difference from POSIX remains, and cannot be removed: the Windows CRT
+ * has no representation for a variable whose value is the empty string, so
+ * setenv(name, "", 1) REMOVES the variable instead of defining it empty. Code
+ * that distinguishes "" from unset must not rely on it. */
 static inline int compat_setenv(const char *name, const char *value, int overwrite){
     if(!overwrite && getenv(name)) return 0;
-    return SetEnvironmentVariableA(name, value) ? 0 : -1;
+    int rc = _putenv_s(name, value ? value : "");
+    SetEnvironmentVariableA(name, (value && *value) ? value : NULL);
+    return rc == 0 ? 0 : -1;
 }
 #define setenv(name,value,overwrite) compat_setenv(name,value,overwrite)
 
-/* --- unsetenv -> SetEnvironmentVariableA(NULL) --- */
 static inline int compat_unsetenv(const char *name){
-    return SetEnvironmentVariableA(name, NULL) ? 0 : -1;
+    int rc = _putenv_s(name, "");          /* empty value == remove, on Windows */
+    SetEnvironmentVariableA(name, NULL);
+    return rc == 0 ? 0 : -1;
 }
 #define unsetenv(name) compat_unsetenv(name)
 
@@ -594,10 +618,94 @@ static inline void coli_print_launcher_help(const char *engine)
         "    %s doctor --model <model directory>   check a model is usable\n"
         "\n"
         "The launcher needs Python 3 and picks the right engine for the model.\n"
+        "(Running the engine by hand: it reads the model directory from the\n"
+        "SNAP environment variable, e.g. SNAP=<model directory> ./%s ...)\n"
         "Getting a model, step by step: https://github.com/JustVugg/colibri"
         "/blob/main/docs/quickstart.md\n",
-        engine, run, run, run, run);
+        engine, run, run, run, run, engine);
     coli_hold_console();
+}
+
+/* --- RAM disponibile ADESSO, in GB, per tutte le piattaforme ---------------
+ * "Disponibile" = recuperabile senza swap: MemAvailable su Linux; free +
+ * inactive + purgeable su macOS; su Windows ullAvailPhys MA limitata da
+ * ullAvailPageFile, il commit ancora concedibile: e' quello che decide se
+ * il prossimo malloc riesce, e su una macchina con pagefile piccolo puo'
+ * essere molto meno della RAM fisica libera.
+ *
+ * #1375: glm53.c leggeva /proc/meminfo ovunque, e su Windows quel file non
+ * esiste: la funzione tornava 0, il budget della cache esperti si clampava a
+ * 1 GB, e Flash su Windows girava con uno slot per layer. colibri.c aveva la
+ * versione giusta (macOS + Windows) da mesi, come funzione sua. Due copie di
+ * cui una sbagliata: ora e' una, qui, e i motori la chiamano.
+ * 0 = non misurabile; e' il chiamante a decidere il fallback. */
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#endif
+#include <unistd.h>
+
+/* Total AND available in one call, one pass.
+ *
+ * "Available" alone was consolidated here by #1375 because there were two
+ * copies of it and one was wrong. "Total" is now in the same position: every
+ * caller that wants it hand-rolls its own #ifdef ladder (telemetry.h uses
+ * sysctl hw.memsize on macOS, olmoe.c uses sysconf(_SC_PHYS_PAGES), glm53.c
+ * read /proc/meminfo unconditionally), and those definitions do not agree.
+ * A budget computed from a total and an available that came from two
+ * different definitions is not a budget, it is a coincidence.
+ *
+ * One pass also matters on Linux specifically: MemTotal and MemAvailable are
+ * two lines of the same file, and reading it twice to get them is both a
+ * second open and a second chance to read a file that changed underneath.
+ *
+ * 0 means "not measurable" for either field; the caller decides the fallback. */
+static inline void compat_meminfo_gb(double *total_gb, double *avail_gb){
+    double total = 0, avail = 0;
+#ifdef __APPLE__
+    uint64_t memsize = 0; size_t len = sizeof memsize;
+    if(sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0) total = (double)memsize / 1e9;
+    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vm;
+    if(host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &cnt) == KERN_SUCCESS)
+        avail = ((double)vm.free_count + (double)vm.inactive_count + (double)vm.purgeable_count)
+                * (double)sysconf(_SC_PAGESIZE) / 1e9;
+#elif defined(_WIN32)
+    MEMORYSTATUSEX msx = {0};
+    msx.dwLength = sizeof(msx);
+    if(GlobalMemoryStatusEx(&msx)){
+        total = (double)msx.ullTotalPhys / 1e9;
+        double phys = (double)msx.ullAvailPhys / 1e9;
+        double commit = (double)msx.ullAvailPageFile / 1e9;
+        avail = commit > 0 && commit < phys ? commit : phys;
+    }
+#else
+    FILE *f = fopen("/proc/meminfo", "r");
+    if(f){
+        char ln[256]; double kb;
+        /* /proc/meminfo's "kB" is KiB (1024 B), so a GB is kb*1024/1e9, not
+         * kb/1e6. The old kb/1e6 understated by 2.3% -- harmless while the
+         * number was only ever compared against itself, but glm53 now weighs
+         * it against a model size computed from byte counts (/1e9, true GB),
+         * and a budget that subtracts true GB from understated GB is wrong in
+         * the direction that matters: it hands back less than it should. */
+        /* MemTotal precedes MemAvailable in /proc/meminfo, but do not rely on
+         * the order: stop only once both have been seen. */
+        while((total == 0 || avail == 0) && fgets(ln, sizeof ln, f)){
+            if(total == 0 && sscanf(ln, "MemTotal: %lf", &kb) == 1){ total = kb * 1024.0 / 1e9; continue; }
+            if(avail == 0 && sscanf(ln, "MemAvailable: %lf", &kb) == 1) avail = kb * 1024.0 / 1e9;
+        }
+        fclose(f);
+    }
+#endif
+    if(total_gb) *total_gb = total;
+    if(avail_gb) *avail_gb = avail;
+}
+
+static inline double compat_mem_available_gb(void){
+    double avail = 0;
+    compat_meminfo_gb(NULL, &avail);
+    return avail;
 }
 
 #endif /* COMPAT_H */

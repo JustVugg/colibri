@@ -966,6 +966,20 @@ struct ColiV4Session {
     uint64_t spec_drafted;
     uint64_t spec_accepted;
     int spec_disabled;
+    /* Prompt-end capture for SUBMIT pin=1: the ids fed and the head scores
+     * that predict the token after them. A later prompt that starts with
+     * exactly these ids gets its first fresh token's predictor from here; that
+     * token is the one a closed-set caller asks about (docs/brio.md). The
+     * attention state itself goes to a v4_ckpt slot; this is the part the
+     * snapshot does not hold. */
+    int *pin_ids;
+    int pin_len;
+    float *pin_scores;
+    /* Scratch for the numeric channel, one hidden row and one row of head
+     * scores, allocated on first use and freed with the session so the many
+     * early returns of generate() leave nothing behind. */
+    float *echo_hidden;
+    float *echo_scores;
 };
 
 /* RAM-tiered expert open used by coli_v4_engine_open (replaces ld --wrap).

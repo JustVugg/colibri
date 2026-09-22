@@ -27,6 +27,8 @@ c/qwen38.exe
 # `git status`.
 c/deepseek_v4
 c/deepseek_v4.exe
+c/deepseek_v41
+c/deepseek_v41.exe
 c/COLI_V4_UNIT_*.o
 # ...and the ownership-test objects, which the same Makefile puts in a build/
 # subdirectory (V4_OWN_DIR) rather than next to the sources. #868 caught the
@@ -63,6 +65,8 @@ c/tests/test_*
 !c/tests/test_*.cu
 !c/tests/test_*.mm
 !c/tests/test_*.py
+# scratch fixture directories the test binaries write at run time
+c/tests/tmp_*
 # bench_* and fuzz_* build to extensionless binaries in the same directory and
 # were not covered here, which is how c/tests/bench_omp_grain reached the tree.
 c/tests/bench_*
@@ -120,6 +124,11 @@ c/olmoe_i4/
 .idea
 c/tiny_inkling/
 c/qwen38_tiny/
+c/dsv41_tiny/
+c/qwen36_tiny/
+c/qwen36_tiny_c/
+c/qwen38_2p4t_tiny/
+c/qwen38_2p4t_tiny_c/
 
 # Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
 .claude/
@@ -146,3 +155,4 @@ c/kimi_k3_tiny/.vendor_kimi_k3/
 c/kimi_k3_tiny/.coli_usage
 c/qwen38_vision_tiny/
 c/qwen38_mm_tiny/
+c/qwen38_tiny_fp8/

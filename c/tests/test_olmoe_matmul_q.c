@@ -97,6 +97,7 @@ int main(void) {
     ref_matmul(ref, x, q, scale, I, O);
 
 #if !defined(HAVE_FAST_DOT_I8)
+    (void)failures;   /* every increment lives in the #else branch */
     printf("SKIP: no fast int8 dot compiled in; IDOT path unreachable\n");
     printf("      (build with -mavx2 on x86 or on an ARM NEON target)\n");
     free(x); free(q); free(scale); free(y); free(ref);

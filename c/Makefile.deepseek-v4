@@ -65,12 +65,30 @@ else ifeq ($(UNAME_S),Darwin)
 # ignored). No -march: NEON is baseline on arm64 and the per-feature gates in
 # the sources do the rest. Mirrors the parent Makefile's Darwin block.
 CC = clang
+# An OMPDIR from the command line survives the assignments below; one from the
+# environment would be overwritten by them. Both are the user's choice: record
+# that first, and probe nothing for it.
+OMP_EXPLICIT := $(filter command line environment,$(origin OMPDIR))
+ifeq ($(OMP_EXPLICIT),)
 OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
+ifeq ($(OMPDIR),)
+OMPDIR := $(firstword $(wildcard /opt/homebrew/opt/libomp /usr/local/opt/libomp))
+endif
+endif
 ifneq ($(and $(OMPDIR),$(wildcard $(OMPDIR)/include/omp.h),$(wildcard $(OMPDIR)/lib/libomp.*)),)
-OMPC = -Xclang -fopenmp -I$(OMPDIR)/include
-OMPL = -L$(OMPDIR)/lib -lomp
+OMPINC := $(OMPDIR)/include
+OMPLIB := $(OMPDIR)/lib
+else ifeq ($(OMP_EXPLICIT),)
+ifneq ($(and $(wildcard /opt/local/include/libomp/omp.h),$(wildcard /opt/local/lib/libomp/libomp.*)),)
+OMPINC := /opt/local/include/libomp
+OMPLIB := /opt/local/lib/libomp
+endif
+endif
+ifneq ($(OMPINC),)
+OMPC = -Xclang -fopenmp -I$(OMPINC)
+OMPL = -L$(OMPLIB) -lomp
 else
-$(warning libomp not found: building deepseek_v4 single-threaded. brew install libomp)
+$(warning libomp not found: building deepseek_v4 single-threaded. brew install libomp (or port install libomp))
 OMPC =
 OMPL =
 endif
@@ -269,11 +287,12 @@ endif
 deepseek-v4-test-objs: $(TEST_UNIT_OBJS)
 
 # Registry unit test (no engine link — stubs the auto open fn).
+# -D_FILE_OFFSET_BITS=64: compat.h (setenv/unsetenv shims) requires it on Windows.
 deepseek-v4-test-registry: test_expert_store_registry
 	./test_expert_store_registry
 test_expert_store_registry: test_expert_store_registry.c expert_store_registry.c \
-	expert_store_registry.h expert_store.h
-	$(CC) -O2 -Wall -Wextra test_expert_store_registry.c expert_store_registry.c -o $@
+	expert_store_registry.h expert_store.h compat.h
+	$(CC) -O2 -Wall -Wextra -D_FILE_OFFSET_BITS=64 test_expert_store_registry.c expert_store_registry.c -o $@
 
 deepseek-v4-clean:
 	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_HOT_TEST_OBJ) \

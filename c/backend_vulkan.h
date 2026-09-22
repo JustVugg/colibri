@@ -20,6 +20,8 @@ int  coli_vk_init(const char *spv_path);
 void coli_vk_shutdown(void);
 int  coli_vk_available(void);
 void coli_vk_mem_info(size_t *used_bytes, size_t *tensor_count);
+/* GLM-5.3 SwiGLU clamp for the fused gate_up kernel. 0 disables (GLM-5.2). */
+void coli_vk_set_swiglu_limit(float limit);
 
 /* VRAM pressure-proofing (both no-ops when the extension is absent):
  * alloc_priority sets the eviction-priority class of SUBSEQUENT weight uploads
@@ -126,6 +128,10 @@ int  coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const f
 
 void   coli_vk_tensor_free(ColiVkTensor *t);
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t);
+
+/* 1 if the selected device is an integrated GPU (shares physical memory with
+ * the host), 0 otherwise or when no device is selected. */
+int coli_vk_device_integrated(void);
 
 #ifdef __cplusplus
 }

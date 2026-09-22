@@ -104,6 +104,7 @@
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #endif
+#include "cli_args.h"
 #include "st.h"
 #include "tok.h"
 #include "quant.h"
@@ -114,6 +115,7 @@
 #include "coli_env.h"
 #include "route_trace.h"
 #include "kv_prefix.h"
+#include "pin_pool.h"   /* coli_pin_slots_wanted: quanti scatti tenere */
 #include "hybrid_split.h"                    /* KV prefix reuse (shared) */
 #include "serve_codec.h"
 #ifdef COLI_SEGMENT_ADAPTER
@@ -228,6 +230,7 @@ typedef struct {
     /* experts */
     ERef *eref;                           /* [n_layers][n_experts] (dense rows zeroed) */
     LCache *ecache;
+    uint8_t **ehit;                       /* experts routed this turn, for HITS (dashboard Brain) */
     int64_t e_w1p, e_w1s, e_w2p, e_w2s, e_slot;
     uint64_t clock, hits, miss, ebytes;
     double t_attn, t_moe, t_eload, t_head;
@@ -283,8 +286,12 @@ static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
     return r.ru_maxrss/(1024.0*1024.0);
 #endif
 }
-static float *falloc(int64_t n){ float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM %lld floats\n",(long long)n);exit(1);} return p; }
-static float *fcalloc(int64_t n){ float *p=calloc((size_t)n,sizeof(float)); if(!p){fprintf(stderr,"OOM %lld floats\n",(long long)n);exit(1);} return p; }
+static float *falloc(int64_t n){
+    if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"alloc size overflow: %lld floats\n",(long long)n); exit(1); }
+    float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM %lld floats\n",(long long)n);exit(1);} return p; }
+static float *fcalloc(int64_t n){
+    if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"alloc size overflow: %lld floats\n",(long long)n); exit(1); }
+    float *p=calloc((size_t)n,sizeof(float)); if(!p){fprintf(stderr,"OOM %lld floats\n",(long long)n);exit(1);} return p; }
 /* Aligned + zeroed alloc. Metal's wrap() only takes the zero-copy (newBufferWithBytesNoCopy)
  * path when the pointer AND size are 16384-aligned; otherwise it makes a private GPU copy
  * that is never synced back. Buffers the GPU WRITES and must persist across tokens (KDA
@@ -310,6 +317,28 @@ static void rmsnorm_(float *out, const float *x, const float *w, int D, float ep
 }
 
 /* ---------- DSA (Dictionary Sparse Attention) CPU helpers ---------- */
+/* L'indexer DSA e' COSTRUITO ma non COLLEGATO (#1333): l'unica funzione che
+ * leggerebbe la cache Ic per scegliere le posizioni top-K, dsa_score_single qui
+ * sotto, non ha nessun chiamante -- una grep su tutto il repo trova solo la sua
+ * definizione.
+ *
+ * Finche' resta cosi' l'attenzione e' densa e il sottosistema e' lavoro pagato e
+ * mai letto: CINQUE tensori dal disco per ogni layer DSA (w_k, w_q, w_p, kn_w,
+ * kn_b -- e w_q, w_p, kn_b non sono toccati nemmeno dal codice morto), la cache
+ * Ic da [max_t * index_hd] float per layer, e per ogni token un matmul piu'
+ * rmsnorm piu' rope.
+ *
+ * Spento di default, non cancellato: quel che manca e' collegare
+ * dsa_score_single, e chi lo fara' ha bisogno di questi pesi. KIMI_DSA_INDEXER=1
+ * li ricarica. Avvertenza per chi ci mettera' mano: collegarlo CAMBIA le uscite
+ * -- l'attenzione diventa sparsa dove oggi e' densa -- quindi va fatto contro
+ * l'oracolo token-exact, non a occhio. */
+static int k3_dsa_indexer_on(void){
+    static int cached = -1;
+    if(cached < 0){ const char *e = getenv("KIMI_DSA_INDEXER"); cached = e && *e=='1'; }
+    return cached;
+}
+
 static void dsa_rope(float *v, int pos, int qk_rope, float base_theta){
     int half = qk_rope/2;
     if(qk_rope > 256){ fprintf(stderr,"qk_rope=%d exceeds rope buffer (256)\n",qk_rope); exit(1); }
@@ -920,7 +949,7 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
             a->qa_ln =f32_load(m,NM("model.layers.%d.self_attn.q_a_layernorm.weight",i),c->q_lora);
             a->kva_ln=f32_load(m,NM("model.layers.%d.self_attn.kv_a_layernorm.weight",i),c->kv_lora);
             /* DSA indexer weights – only for "full" layers (idx_type=1) */
-            if(c->index_hd > 0 && c->idx_type[i]){
+            if(c->index_hd > 0 && c->idx_type[i] && k3_dsa_indexer_on()){
                 w_load(m,&a->wk,NM("model.layers.%d.self_attn.w_k.weight",i),(int64_t)c->index_hd,c->hidden,mbits);
                 w_load(m,&a->wq,NM("model.layers.%d.self_attn.w_q.weight",i),(int64_t)c->index_hd,c->q_lora,mbits);
                 w_load(m,&a->wp,NM("model.layers.%d.self_attn.w_p.weight",i),(int64_t)c->index_hd,c->hidden,mbits);
@@ -1427,7 +1456,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         memcpy(Rrow, cv + kvl, qr * sizeof(float));
     }
     /* DSA indexer: prefill — write K portion for full layers */
-    if(c->index_hd > 0 && c->idx_type[li]){
+    if(c->index_hd > 0 && c->idx_type[li] && k3_dsa_indexer_on()){
         for(int t=0;t<C;t++){
             float *ikd = a->Ic + (int64_t)(pos0+t) * c->index_hd;
             const float *xt = x + (int64_t)t * c->hidden;
@@ -1486,6 +1515,30 @@ static uint64_t g_slot_index_probes;
 #else
 #define SLOT_INDEX_PROBE() ((void)0)
 #endif
+/* One byte per expert: routed in this turn or not. The dashboard's Brain tab
+ * reads it as the HITS bitmap after every turn (serve_hits), cleared there. */
+static pthread_mutex_t g_ehit_mx = PTHREAD_MUTEX_INITIALIZER;
+static void ehit_mark(Model *m, int li, int eid){
+    Cfg *c=&m->c;
+    /* The first touch can come from a parallel region (qwen36: the tier
+     * warmstart's omp loop calls expert_get from twelve threads at once):
+     * one thread published m->ehit while it was still filling the rows and
+     * a sibling dereferenced m->ehit[layer] == NULL -- SIGSEGV in about one
+     * run in twelve on a CUDA warmstart. Build the table privately, publish
+     * it once under a lock (double-checked), and read it with acquire order. */
+    uint8_t **ehit=__atomic_load_n(&m->ehit,__ATOMIC_ACQUIRE);
+    if(!ehit){
+        pthread_mutex_lock(&g_ehit_mx);
+        ehit=m->ehit;
+        if(!ehit){
+            ehit=calloc((size_t)c->n_layers,sizeof(uint8_t*));
+            for(int i=0;i<c->n_layers;i++) ehit[i]=calloc((size_t)c->n_experts,1);
+            __atomic_store_n(&m->ehit,ehit,__ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&g_ehit_mx);
+    }
+    if(li>=0&&li<c->n_layers&&eid>=0&&eid<c->n_experts) ehit[li][eid]=1;
+}
 static Slot *slot_indexed(Model *m, int li, int eid){
     LCache *lc=&m->ecache[li];
     if(eid<0||eid>=m->c.n_experts||!lc->slot_by_expert) return NULL;
@@ -1764,6 +1817,7 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
         int nb=nu-base<LP_MAX?nu-base:LP_MAX;
         Slot *use[LP_MAX]; int missk[LP_MAX]; int qof[LP_MAX]; int nmiss=0;
         for(int j=0;j<nb;j++){
+            ehit_mark(m,li,uids[base+j]);
             use[j]=slot_find(m,li,uids[base+j]); qof[j]=-1;
             if(!use[j]){ m->miss++; use[j]=&m->ws[nmiss]; qof[j]=nmiss; missk[nmiss++]=j; }
         }
@@ -2133,6 +2187,30 @@ static int k3_layers_forward_range(Model *m, float *hidden, float *bres,
     return cancelled&&*cancelled?-1:0;
 }
 
+/* Canale logprobs (modalita jev). Anche qui la fotografia dello stato c'e
+ * gia: si chiama K3Ckpt e salva kstate piu le tre finestre di convoluzione di
+ * ogni strato KDA. Mancava la lettura del prefill e, alla fotografia, i logit
+ * finali: senza quelli il primo token fresco di ogni opzione resta senza
+ * predittore.
+ *
+ * Il prefill qui va a blocchi (K3_CHUNK), quindi la posizione che predice il
+ * primo token di un blocco sta nel blocco PRECEDENTE. Il riporto tiene quella
+ * riga di logit fra un blocco e l'altro; all'inizio lo riempie la fotografia. */
+static int    g_echo_k = 0;
+static const char *g_echo_id = NULL;
+static Tok   *g_echo_tok = NULL;
+static float *g_echo_carry = NULL;      /* logit dell'ultima posizione gia fatta */
+static int    g_echo_carry_ok = 0;
+
+static void k3_echo(const char *id, int pos, int token, const float *lo, int V, int k){
+    char tail[1024]; coli_logprob_tail(tail, sizeof tail, lo, V, token, k);
+    char piece[512]; int n = g_echo_tok ? tok_decode(g_echo_tok, &token, 1, piece, (int)sizeof piece) : 0;
+    if(n<0) n=0;
+    printf("ECHO %s %d %d%s\n", id, n, pos, tail);
+    if(n>0) fwrite(piece,1,(size_t)n,stdout);
+    fputc('\n', stdout); fflush(stdout);
+}
+
 static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
                             K3CancelPoll poll_cancel, void *cancel_context,
                             int *cancelled){
@@ -2168,11 +2246,13 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
     float *logits=NULL;
     if((!cancelled||!*cancelled)&&m->has_head){
         double t0=now_s();
+        int echo_on = g_echo_k>0 && g_echo_id;
         for(int t=0;t<C;t++){
             /* head only where needed: the chunk's last token (feeds sampling)
              * and every position when K3_LOGITS dumps teacher-forced logits;
-             * also all positions during Phase 10 validation */
-            if(!g_lfp && !g_k3_val_lfp && t<C-1) continue;
+             * also all positions during Phase 10 validation; and every
+             * position when a request asked for the logprobs channel */
+            if(!g_lfp && !g_k3_val_lfp && !echo_on && t<C-1) continue;
             res_mix(mix,hidden+(int64_t)t*D,bres+(int64_t)t*nbmax*D,nb,D,m->out_sw,c->eps);
             rmsnorm_(mix,mix,m->final_norm,D,c->eps);
             if(m->trace) fwrite(mix,sizeof(float),D,m->trace);
@@ -2180,6 +2260,15 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
             w_matmul(lo,mix,&m->lm_head,1);
             if(g_lfp) fwrite(lo,sizeof(float),(size_t)c->vocab,g_lfp);
             if(g_k3_val_lfp) fwrite(lo,sizeof(float),(size_t)c->vocab,g_k3_val_lfp);
+            if(echo_on){
+                if(t==0) k3_echo(g_echo_id,pos0,ids[0],
+                                 g_echo_carry_ok?g_echo_carry:NULL,c->vocab,g_echo_k);
+                if(t+1<C) k3_echo(g_echo_id,pos0+t+1,ids[t+1],lo,c->vocab,g_echo_k);
+                else if(g_echo_carry){
+                    memcpy(g_echo_carry,lo,(size_t)c->vocab*sizeof(float));
+                    g_echo_carry_ok=1;
+                }
+            }
             if(t==C-1) logits=lo; else free(lo);
         }
         m->t_head+=now_s()-t0;
@@ -2240,7 +2329,7 @@ static void kv_alloc(Model *m, int max_t){
     /* DSA indexer cache — only for full layers (idx_type=1) */
     for(int i=0;i<c->n_layers;i++){
         Mla *a=&m->L[i].m;
-        if(c->index_hd > 0 && c->idx_type[i]){
+        if(c->index_hd > 0 && c->idx_type[i] && k3_dsa_indexer_on()){
             a->Ic = falloc((int64_t)max_t * c->index_hd);
         }
     }
@@ -2525,6 +2614,7 @@ typedef struct {
     float temp, top_p;
     char *payload;
     int plen;
+    int logprobs, pin;   /* SUBMIT logprobs=k / pin=1 */
 } ServeReq;
 
 static const ColiServeWireProfile kimi_wire={
@@ -2602,8 +2692,16 @@ typedef struct {
     int pos;            /* state covers ids[0..pos-1] */
     int *fed;           /* own copy of those ids */
     float *blob;        /* packed kstate + cwq/cwk/cwv of every KDA layer */
+    float *logit;       /* logit dell'ultima posizione coperta: predice il primo
+                         * token fresco. Allocato solo per le foto chieste con
+                         * SUBMIT pin=1, che sono le uniche a cui serve. */
+    int pinned;         /* foto chiesta con pin=1: una foto ordinaria non la
+                         * sfratta. Senza questo, con un solo slot la foto di
+                         * fine risposta cancella quella del prompt e ogni
+                         * opzione del menu rifa tutto da capo -- misurato. */
     uint64_t used;      /* LRU stamp */
 } K3Ckpt;
+static const float *g_k3_restored_logit=NULL;   /* logit della foto appena rimessa */
 static K3Ckpt g_k3_ckpt[K3_CKPT_MAX];
 static uint64_t g_k3_ckpt_clock=0;
 
@@ -2698,7 +2796,7 @@ static int k3_ckpt_slot_full(const K3Ckpt *k){
     return g_k3_ckpt_dir ? k->pos>0 : k->blob!=NULL;
 }
 
-static void k3_ckpt_save(Model *m){
+static void k3_ckpt_save(Model *m, const float *logit){
     if(g_k3_ckpt_slots<1) return;
     int pos=m->kvp.len;
     if(pos<1||m->kvp.tainted||!m->kvp.fed) return;
@@ -2706,13 +2804,21 @@ static void k3_ckpt_save(Model *m){
         K3Ckpt *k=&g_k3_ckpt[s];
         if(k3_ckpt_slot_full(k)&&k->pos==pos&&
            !memcmp(k->fed,m->kvp.fed,(size_t)pos*sizeof(int))){
+            if(logit){
+                if(!k->logit) k->logit=(float*)malloc((size_t)m->c.vocab*sizeof(float));
+                if(k->logit) memcpy(k->logit,logit,(size_t)m->c.vocab*sizeof(float));
+                k->pinned=1;
+            }
             k->used=++g_k3_ckpt_clock; return; }
     }
-    int victim=0;
+    int victim=-1;
     for(int s=0;s<g_k3_ckpt_slots;s++){
-        if(!k3_ckpt_slot_full(&g_k3_ckpt[s])){ victim=s; break; }
-        if(g_k3_ckpt[s].used<g_k3_ckpt[victim].used) victim=s;
+        K3Ckpt *cand=&g_k3_ckpt[s];
+        if(!logit&&cand->pinned) continue;        /* una foto ordinaria non la tocca */
+        if(!k3_ckpt_slot_full(cand)){ victim=s; break; }
+        if(victim<0||cand->used<g_k3_ckpt[victim].used) victim=s;
     }
+    if(victim<0) return;                          /* tutte chieste: la foto ordinaria si salta */
     K3Ckpt *k=&g_k3_ckpt[victim];
     if(!g_k3_ckpt_dir&&!k->blob){
         k->blob=malloc(k3_ckpt_blob_floats(m)*sizeof(float));
@@ -2725,14 +2831,36 @@ static void k3_ckpt_save(Model *m){
     if(g_k3_ckpt_dir){
         if(!k3_ckpt_disk_write(m,victim,pos)){ k->pos=0; return; }
     } else k3_ckpt_copy(k->blob,m,1);
+    if(logit){
+        if(!k->logit) k->logit=(float*)malloc((size_t)m->c.vocab*sizeof(float));
+        if(k->logit) memcpy(k->logit,logit,(size_t)m->c.vocab*sizeof(float));
+    } else { free(k->logit); k->logit=NULL; }
+    k->pinned = logit ? 1 : 0;
     k->pos=pos; k->used=++g_k3_ckpt_clock;
     if(getenv("K3_PREFIX_LOG"))
         fprintf(stderr,"[K3-CKPT] saved pos=%d slot=%d\n",pos,victim);
 }
 
+/* I logit di una foto che copre ESATTAMENTE `pos` token di questo prompt,
+ * senza rimettere niente. Serve quando il riuso vivo ha gia portato lo stato
+ * dove serve: la foto non va ripristinata, ma i suoi logit restano l'unico
+ * predittore del primo token fresco, e senza quelli la prima posizione
+ * dell'opzione esce senza logprob. */
+static const float *k3_ckpt_logit_at(const int *ids, int pos){
+    if(g_k3_ckpt_slots<1||pos<1) return NULL;
+    for(int s=0;s<g_k3_ckpt_slots;s++){
+        const K3Ckpt *k=&g_k3_ckpt[s];
+        if(!k3_ckpt_slot_full(k)||k->pos!=pos||!k->logit) continue;
+        if(memcmp(k->fed,ids,(size_t)pos*sizeof(int))) continue;
+        return k->logit;
+    }
+    return NULL;
+}
+
 /* Deepest valid photo for this prompt; restores it and returns the covered
  * positions (the caller prefills only ids[pos..np)), or 0 when none fits. */
 static int k3_ckpt_restore_best(Model *m, const int *ids, int np){
+    g_k3_restored_logit=NULL;
     if(g_k3_ckpt_slots<1||m->kvp.tainted||!m->kvp.fed) return 0;
     int live=0, lim=m->kvp.len<np?m->kvp.len:np;
     while(live<lim&&m->kvp.fed[live]==ids[live]) live++;
@@ -2744,12 +2872,19 @@ static int k3_ckpt_restore_best(Model *m, const int *ids, int np){
         if(memcmp(k->fed,ids,(size_t)k->pos*sizeof(int))) continue;
         if(best<0||k->pos>g_k3_ckpt[best].pos) best=s;
     }
-    if(best<0) return 0;
+    if(best<0){
+        /* Nessuna foto e servita a questo prompt: se ce n'era una chiesta, ha
+         * smesso di aiutare e si lascia andare, cosi la chat normale ritrova
+         * subito i suoi checkpoint. */
+        for(int s=0;s<g_k3_ckpt_slots;s++) g_k3_ckpt[s].pinned=0;
+        return 0;
+    }
     K3Ckpt *k=&g_k3_ckpt[best];
     if(g_k3_ckpt_dir){
         if(!k3_ckpt_disk_read(m,best,k->pos)){ k->pos=0; return 0; }
     } else k3_ckpt_copy(k->blob,m,0);
     m->kvp.len=k->pos;        /* the record truncates with the state it describes */
+    g_k3_restored_logit=k->logit;
     k->used=++g_k3_ckpt_clock;
     if(getenv("K3_PREFIX_LOG"))
         fprintf(stderr,"[K3-CKPT] restored pos=%d of %d prompt tokens "
@@ -2805,6 +2940,7 @@ static int serve_read_req(FILE *in, FILE *out, ServeReq *q, const char *active){
     }
     snprintf(q->id,sizeof(q->id),"%s",command.id);
     q->max_tok=command.max_tokens; q->temp=command.temperature; q->top_p=command.top_p;
+    q->logprobs=command.logprobs; q->pin=command.pin;
     q->payload=(char*)coli_serve_command_take_payload(&command);
     q->plen=(int)command.payload_bytes;
     coli_serve_command_dispose(&command);
@@ -2841,9 +2977,57 @@ static void serve_data(const char *id, const char *p, int n){
     coli_serve_write_data(stdout,id,p,(size_t)n);
 }
 
+/* Coda del canale logprobs sul frame DATA. La riempie il ciclo di decodifica
+ * per il token appena campionato; resta vuota per chi non ha chiesto nulla,
+ * e allora il frame e quello di sempre, byte per byte. */
+static char g_lp_tail[1024];
+static void serve_data_maybe_lp(const char *id, const char *p, int n){
+    if(n<=0) return;
+    if(g_lp_tail[0]) coli_serve_write_data_lp(stdout,id,p,(size_t)n,g_lp_tail);
+    else coli_serve_write_data(stdout,id,p,(size_t)n);
+}
+
 static void serve_tool(const char *id, const char *p, int n){
     if(n<0) return;
     coli_serve_write_tool(stdout,id,p,(size_t)n);
+}
+
+/* ---------- dashboard protocol: EMAP / HITS ----------
+ * Same stdout lines colibri.c emits for the web dashboard's Brain tab; the
+ * gateway parses them, nothing else does. Rows are the sparse layers, columns
+ * the experts. EMAP: one byte per expert as two hex digits, tier<<6 | heat
+ * (tier 1 = resident in the layer cache, heat 0: this engine keeps no usage
+ * counter). Printed once after READY and again after every turn, because
+ * the cache fills as the turn runs. HITS: one bit per expert routed in the
+ * turn, packed 8 per hex pair, printed after DONE next to PROF. */
+static void serve_emap(Model *m){
+    Cfg *c=&m->c; int E=c->n_experts, rows=0;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) rows++;
+    char *hex=malloc((size_t)rows*E*2+1); int w=0;
+    for(int i=0;i<c->n_layers;i++){
+        if(!m->L[i].sparse) continue;
+        for(int e=0;e<E;e++){
+            int b=(slot_indexed(m,i,e)?1:0)<<6;
+            hex[w++]="0123456789abcdef"[b>>4]; hex[w++]="0123456789abcdef"[b&15];
+        }
+    }
+    hex[w]=0;
+    printf("EMAP %d %d %s\n",rows,E,hex); fflush(stdout); free(hex);
+}
+static void serve_hits(Model *m){
+    Cfg *c=&m->c; int E=c->n_experts, rows=0;
+    if(!m->ehit) ehit_mark(m,-1,-1);   /* a turn that routed nothing still reports a bitmap: all zero */
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) rows++;
+    int nb=(rows*E+7)/8; uint8_t *bm=calloc((size_t)nb,1); int bit=0;
+    for(int i=0;i<c->n_layers;i++){
+        if(!m->L[i].sparse) continue;
+        for(int e=0;e<E;e++,bit++)
+            if(m->ehit[i][e]){ bm[bit>>3]|=(uint8_t)(1<<(bit&7)); m->ehit[i][e]=0; }
+    }
+    char *hex=malloc((size_t)nb*2+1); int w=0;
+    for(int b=0;b<nb;b++){ hex[w++]="0123456789abcdef"[bm[b]>>4]; hex[w++]="0123456789abcdef"[bm[b]&15]; }
+    hex[w]=0;
+    printf("HITS %d %d %s\n",rows,E,hex); fflush(stdout); free(hex); free(bm);
 }
 
 static int serve_one(Model *m, Tok *T, ServeReq *q){
@@ -2893,7 +3077,38 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
      * At least one new token is required, since the state cannot be rewound.
      * Either the reused positions are token-identical or nothing is reused;
      * the emitted tokens are unchanged in both cases. */
+    /* Una richiesta con pin=1 chiede la fotografia anche quando l'operatore non
+     * ha acceso COLI_K3_CKPT: senza almeno uno slot non c'e dove metterla e
+     * ogni opzione rifarebbe il prompt intero. Se la memoria non basta si
+     * resta senza: e un'ottimizzazione, mai il motivo di un errore. */
+    /* Gli scatti utili sono ANNIDATI: le istruzioni, condivise da mille
+     * richieste, e istruzioni+domanda, condivise dalle alternative di una
+     * sola. Con uno solo se ne perde sempre uno e la domanda viene riletta
+     * una volta per opzione. Questo motore il pool ce l'ha gia' (K3Ckpt tiene
+     * il piu' profondo valido); qui si apre solo con quanti slot, con lo
+     * stesso COLI_PIN_SLOTS degli altri. */
+    if(q->pin && g_k3_ckpt_slots<1){
+        int n=coli_pin_slots_wanted(); if(n<1) n=1;
+        if(n>K3_CKPT_MAX) n=K3_CKPT_MAX;
+        g_k3_ckpt_slots=n;
+        fprintf(stderr,"[PIN] %d scatti dello stato ricorrente accesi su richiesta (%.2f GB)\n",
+                n,k3_ckpt_reserve_gb(m,n));
+    }
     int reuse=prepare_request_state(m,ids,np,np+q->max_tok+8);
+    /* Il riporto per il primo token fresco: i logit salvati con la foto che si
+     * e appena rimessa. Senza foto resta spento e la prima posizione esce con
+     * " nan 0", come deve. */
+    g_echo_k=q->logprobs; g_echo_id=q->id; g_echo_tok=T;
+    g_echo_carry_ok=0;
+    if(q->logprobs>0){
+        if(!g_echo_carry) g_echo_carry=(float*)malloc((size_t)m->c.vocab*sizeof(float));
+        const float *pred = g_k3_restored_logit;
+        if(!pred&&reuse>0) pred=k3_ckpt_logit_at(ids,reuse);
+        if(g_echo_carry&&pred&&reuse>0){
+            memcpy(g_echo_carry,pred,(size_t)m->c.vocab*sizeof(float));
+            g_echo_carry_ok=1;
+        }
+    }
     if(getenv("K3_PREFIX_LOG")){
         /* Report the decision either way, with the state behind a "no".
          * "It did not get faster" is otherwise the same observation as
@@ -2929,12 +3144,17 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
     }
     /* Turn boundary: the state now covers exactly the prompt. A photo here is
      * what an agentic edit of the NEXT request restores from. */
-    k3_ckpt_save(m);
+    k3_ckpt_save(m, q->pin ? lo : NULL);
+    if(q->pin) fprintf(stderr,"[PIN] stato fotografato a %d token\n",np);
+    g_echo_k=0; g_echo_id=NULL;   /* la lettura riguarda il prefill, non la decodifica */
     int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0, xtool=0;
     char buf[512], xtag[320];   /* tool-call open tags carry attributes: call tool="..." index="..." (#1143) */
     double tg=now_s();
+    int forwards=1;                       /* the prefill; decode steps are counted where they run */
     for(int s=0;s<q->max_tok&&!cancelled;s++){
         int tk=sample_tok(lo,m->c.vocab,q->temp,q->top_p);
+        g_lp_tail[0]=0;
+        if(q->logprobs>0) coli_logprob_tail(g_lp_tail,sizeof g_lp_tail,lo,m->c.vocab,tk,q->logprobs);
         free(lo); lo=NULL;
         int eos=0; for(int i=0;i<m->c.n_eos;i++) if(tk==m->c.eos[i]) eos=1;
         int show=!eos;
@@ -2966,7 +3186,7 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
         if(show){
             int nb=tok_decode(T,&tk,1,buf,sizeof(buf)-1);
             if(xtool) serve_tool(q->id,buf,nb);
-            else serve_data(q->id,buf,nb);
+            else serve_data_maybe_lp(q->id,buf,nb);
         }
         if(!eos) gen++;
         while(serve_stdin_readable()){
@@ -2981,13 +3201,13 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
         }
         if(cancelled){ limited=0; break; }
         if(eos){ limited=0; break; }
-        if(s+1<q->max_tok) lo=step_chunk(m,&tk,np+s,1);
+        if(s+1<q->max_tok){ lo=step_chunk(m,&tk,np+s,1); forwards++; }
     }
     if(poll.fatal){ free(lo); free(ids); return -1; }
     free(lo); free(ids);
     /* End of the reply: the next turn's transcript extends THIS state, and an
      * edited retry of this turn restores the prompt-boundary photo above. */
-    k3_ckpt_save(m);
+    k3_ckpt_save(m, NULL);
     double dt=now_s()-t0, decode=now_s()-tg;
     uint64_t hits=m->hits-hit0, misses=m->miss-miss0, total=hits+misses;
     ColiServeDone done={gen,decode>0?gen/decode:0.0,
@@ -2997,8 +3217,9 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
     if(done_bytes>0) fwrite(done_line,1,(size_t)done_bytes,stdout);
     double moe=m->t_moe-e0, disk=m->t_eload-d0;
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n",
-           dt,np,gen,disk,0.0,moe>disk?moe-disk:moe,m->t_attn-a0,m->t_head-h0,gen+1);
+           dt,np,gen,disk,0.0,moe>disk?moe-disk:moe,m->t_attn-a0,m->t_head-h0,forwards);
     fflush(stdout);
+    serve_hits(m);
 #ifdef COLI_VULKAN
     if(g_k3_vk){
         if(g_vk_up_auto)
@@ -3021,11 +3242,12 @@ static void serve_loop(Model *m, Tok *T){
      * e' nato senza. */
     coli_serve_stdio_init();
     coli_serve_write_ready(stdout,rss_gb());
+    serve_emap(m);                        /* after READY and STAT: the boot reader discards what precedes them */
     for(;;){
         ServeReq q={0}; int r;
         do r=serve_read_req(stdin,stdout,&q,NULL); while(r==0);
         if(r<0) return;
-        if(r==2){ int fatal=serve_one(m,T,&q); free(q.payload); if(fatal<0) return; }
+        if(r==2){ int fatal=serve_one(m,T,&q); free(q.payload); if(fatal<0) return; serve_emap(m); }
     }
 }
 
@@ -3053,7 +3275,7 @@ int main(int argc, char **argv){
     if(!snap||!*snap){ fprintf(stderr,"set SNAP=<Kimi K3 snapshot directory>\n"); return 1; }
     int ngen=32, chat=0;
     for(int i=serving?1:2;i<argc;i++){
-        if(!strcmp(argv[i],"--ngen")&&i+1<argc) ngen=atoi(argv[++i]);
+        if(!strcmp(argv[i],"--ngen")&&i+1<argc) ngen=coli_arg_int(argv[++i], "--ngen");
         else if(!strcmp(argv[i],"--ids")&&i+1<argc) idstr=argv[++i];
         else if(!strcmp(argv[i],"--chat")) chat=1;
         else if(!strcmp(argv[i],"--system")&&i+1<argc) sysmsg=argv[++i];
@@ -3123,7 +3345,13 @@ int main(int argc, char **argv){
           fprintf(stderr,"[K3] tokenizer.json loaded (family=%s)\n",T.kimi?"kimi":(T.o200k?"o200k":"cl100k")); } }
     if(serving){
         if(!has_tok){ fprintf(stderr,"serve mode needs tokenizer.json\n"); return 1; }
+        coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
          serve_loop(&m,&T);
+        /* Questo ramo non salvava affatto la storia: gli altri motori lo
+         * fanno subito dopo il loop, qui mancava del tutto, quindi la
+         * modalita serve non ha mai contribuito alla cache appresa --
+         * nemmeno uscendo in modo pulito. */
+        if(g_k3_usage[0]) rt_save(g_k3_usage,0);
         if(g_k3_val_fp){ fflush(g_k3_val_fp); fclose(g_k3_val_fp); g_k3_val_fp=NULL; }
         if(g_k3_val_lfp){ fflush(g_k3_val_lfp); fclose(g_k3_val_lfp); g_k3_val_lfp=NULL; }
 #ifdef COLI_METAL

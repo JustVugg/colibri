@@ -3,15 +3,15 @@
 </p>
 
 <p align="center">
-  <a href="https://discord.gg/MAaKtQRc"><b>Discord</b></a> ·
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · 繁體中文 · <a href="README.it.md">Italiano</a>
+  <a href="https://discord.gg/RXV83nSZdk"><b>Discord</b></a> ·
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · 繁體中文 · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a>
 </p>
 
 **小巧引擎，龐大模型。**在消費級與異質硬體上執行**前沿 MoE 模型——從 744B 到
 2.8T 參數**——以引擎零相依套件的純 C 實作，將儲存、RAM 與 VRAM 視為統一的推論階層。
 
-目前可執行八個模型家族：**GLM-5.2**（744B）、**GLM-5.3-Flash**（321B，含視覺）、
-**Inkling**（975B）、**Kimi K3**（2.8T）、**DeepSeek V4 Flash**（284B）、
+目前可執行九個模型家族：**GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B，含視覺）、
+**Inkling**（975B）、**Kimi K3**（2.8T）、**DeepSeek V4 Flash**（284B）、**DeepSeek V4.1 Flash**（552B，含視覺）、
 **Qwen3.8-Flash-Next**（125B + 51B n-gram）、**Qwen3.6**（35B-A3B）與 **OLMoE**（7B）
 ——各自一個 C 檔案，共用同一套 `coli chat` / `coli serve` / `coli web` 前端。[完整清單](README.md#other-supported-models)
 
@@ -25,7 +25,7 @@ Colibrì 刻意用於驗證激進的系統構想——因此**對速度不作 SL
 
 ```
 $ ./coli chat
-  🐦 colibri v1.10.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.12.1 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -36,23 +36,34 @@ $ ./coli chat
 <p align="center">
   <img src="docs/media/colibri-dashboard.png" width="900" alt="colibrì 網頁儀表板——即時指標、硬體面板與專家儲存層級">
 </p>
-<p align="center"><em>網頁儀表板（<code>./coli web</code>）：744B 模型達到 <strong>4 tok/s、TTFT 1.6 秒、硬碟讀取 0</strong>——
-在 6× RTX 5090 上讓所有專家常駐，並即時顯示 token 指標、每輪耗時明細、
-VRAM／RAM／硬碟層級長條，以及角落的即時迷你大腦。</em></p>
+<p align="center"><em>網頁儀表板（<code>./coli web</code>），1.12.0 重新設計：一個工作區，底部停靠列切換聊天、Brio 模式、
+Brain 頁面和效能分析，支援淺色與深色主題。圖中是 Qwen3.6 在純 CPU 機器上作答，專家從硬碟串流讀取。</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brain.png" width="900" alt="大腦頁面——以即時皮質呈現 19,456 個專家">
+  <img src="docs/media/colibri-brio.png" width="900" alt="Brio 頁面：文件只讀一次，每個允許的答案各有一個機率，並給出熵">
 </p>
-<p align="center"><em><strong>大腦（Brain）</strong>頁面：將全部 19,456 個專家呈現為活的皮質——顏色代表儲存層級，
-亮度代表路由熱度，每輪被路由到的專家都會閃白。將游標停在專家上，即可查看其
-<a href="https://github.com/JustVugg/colibri/issues/175">實測主題親和度</a>。</em></p>
+<p align="center"><em><strong>Brio 模式</strong>：同一個模型，只是不再讓它寫。給它一段文件和唯一允許的幾個答案，
+它讀出每個答案的機率，不生成任何 token，並給出一個熵，說明它何時沒有把握。圖中：<strong>request changes，99.9%</strong>，
+熵 0.005，讀取 4 個 token，生成 0 個。</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-atlas.png" width="900" alt="圖譜頁面——以 3D 星系呈現實測專家圖譜">
+  <img src="docs/media/colibri-brain.png" width="900" alt="大腦頁面：GLM-5.2 的實測專家圖譜繪成一塊皮質，十個可進入的區域">
 </p>
-<p align="center"><em><strong>圖譜（Atlas）</strong>頁面：將<a href="https://github.com/JustVugg/colibri/issues/175">實測專家圖譜</a>
-呈現為 3D 星系——共 13,260 個已分析專家，其中 1,041 個可重現的專門專家會按主題聚集
-（詩歌、法律、中文、SQL……）。位置取自實測路由親和度，而非學習出的嵌入向量。拖曳即可旋轉。</em></p>
+<p align="center"><em><strong>大腦（Brain）</strong>頁面的 <strong>Explore</strong> 檢視：將 GLM-5.2 的<a href="https://github.com/JustVugg/colibri/issues/175">實測專家圖譜</a>繪成一塊皮質。
+13,260 個已分析專家分為十個區域（Python、SQL、數學、詩歌、法律、中文……）；位置取自實測路由親和度，而非學習出的嵌入向量。
+選擇一個區域即可進入。<strong>Live routing</strong> 檢視切換到正在執行的模型：每個專家一格，顏色代表儲存層級，每輪被路由到的專家都會閃白。</em></p>
+
+<p align="center">
+  <img src="docs/media/colibri-brain-region.png" width="900" alt="Python 區域內部：1,142 個專家，其中一個被選取並顯示其實測親和度">
+</p>
+<p align="center"><em><strong>Python</strong> 區域內部：1,142 個專家組成的星座，每個都標註了層號和序號。面板顯示其中一個：第 17 層第 178 號專家，
+一個熵為 3.13 的通才，其實測親和度為 Python 20.2%、JSON 14.6%、對話 14.2%、SQL 13.3%。</em></p>
+
+<p align="center">
+  <img src="docs/media/colibri-profiling.png" width="900" alt="效能剖析頁面：引擎在每一輪中的時間去向">
+</p>
+<p align="center"><em><strong>效能剖析（Profiling）</strong>頁面：引擎在每一輪中的時間去向，按階段劃分，並以最近 30 輪作為趨勢。
+此處為 CPU 機器上的 Qwen3.6：36 個提示詞元與 55 個生成詞元共用時 19.0 秒，2.9 tok/s，其中 11.4 秒的磁碟服務與計算重疊。</em></p>
 
 ## 研究使命
 
@@ -244,6 +255,11 @@ Hugging Face 上已有預先轉換的 **GLM-5.2 int4** 容器——請務必使�
 
 **https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
 
+**GLM-5.3** 屬於同一家族,使用同一引擎載入。它有自己的 group-scaled(gs64)容器,
+約 **419 GB**,且**不含** MTP head,因此推測解碼保持關閉:
+
+**https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64**
+
 > ⚠️ 請使用上面的 **gs64** 容器，不要使用較舊的 per-row int4 鏡像
 >（`mateogrgic/…`、`jlnsrk/…`）：後者品質實測低約 9 個百分點，也是
 > [#455](https://github.com/JustVugg/colibri/issues/455) 最初 think-mode 迴圈與生成不終止的根因。
@@ -269,6 +285,33 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # 唯讀就緒檢查
 ./coli serve --model /nvme/glm52_i4       # 僅提供 OpenAI 相容 API
 ```
 
+#### Brio 模式：問一個封閉式問題
+
+人們向模型提出的大多數請求是一次選擇，而不是一段文字：哪個佇列、哪個結論、某個欄位應取四個值中的哪一個。
+Brio 模式把允許的選項交給引擎，讀出每個選項的機率，而不是生成文字：`completion_tokens` 为 0，
+答案不可能落在你的清單之外，並且每個答案都附帶一個熵，"模型沒有把握"因此成為一個可以設門檻的數字。
+它在全部九個模型家族上可用，執行在同一個伺服器上，且按請求可選：不請求它的聊天，輸出逐位元組保持不變。
+
+```bash
+# 在 TUI 中：同一個模型，只是不再讓它寫
+./coli chat --model /nvme/qwen36_i4_gs64
+> /brio merge | request changes | close
+> 340 lines, 8 files, no tests. CI is green but nothing covers that path.
+
+# 從任何程式：向執行中的伺服器傳送一個 JSON 請求
+curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
+  "model": "qwen36",
+  "state": "340 lines, 8 files, no tests. CI is green but nothing covers that path.",
+  "question": "What should the reviewer do?",
+  "options": ["merge", "request changes", "close"]}'
+```
+
+`questions` 可以對只讀一次的文件提出多個問題；`schema` 逐欄位填充一個 JSON 物件，結構上必然合法。
+在 Qwen3.6 上與在同一台 CPU 機器上生成同樣答案相比的實測：四欄位 schema 快 2.4 倍，
+對同一文件的四個問題快 5.7 倍。完整說明、請求與回覆格式、以及它不適用的情形見 [docs/brio.md](docs/brio.md)。
+儀表板中也有 Brio 頁面。
+
+
 在 Windows 上同樣使用這些指令，寫作 `python coli chat --model D:\glm52_i4`。
 引擎執行階段是純 C——python 只供單次轉換工具與選用的 API gateway 使用。
 
@@ -282,6 +325,7 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # 唯讀就緒檢查
 | CUDA 後端、VRAM 專家層級、全部常駐 | [docs/cuda.md](docs/cuda.md) |
 | Apple Silicon Metal 後端 | [docs/metal.md](docs/metal.md) |
 | OpenAI 相容 API、KV slots、網頁儀表板 | [docs/api.md](docs/api.md) |
+| Brio 模式：對封閉的選項集評分而不是生成 | [docs/brio.md](docs/brio.md) |
 | 文法強制草稿（結構化輸出） | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | 環境變數完整清單 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
 
@@ -291,7 +335,7 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # 唯讀就緒檢查
   配置、排程、I/O、CPU/GPU 核心、異質重疊、KV 狀態與路由感知推測。目標是降低硬體要求
   和每個有效 token 的成本，所有成果都以端到端測量為準、經審查並公開開發。
 - **支援更多開放模型。**階層演算法與模型無關，任何帶路由專家的 MoE 都能用相同方式分層。
-  目前已有八個模型家族可用（GLM-5.2、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、
+  目前已有九個模型家族可用（GLM-5.2、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、
   Qwen3.8-Flash-Next、Qwen3.6、OLMoE）；更多開放權重家族（候選包括 **MiniMax**）將沿用同樣的
   規則獲得引擎支援：有人完成端到端實測之後。
 
@@ -302,7 +346,7 @@ colibrì 最初是由一人使用 12 核心、25 GB RAM 的筆電開發；
 
 - ⭐ 為儲存庫加星並分享；
 - 🐛 以 issue 提交你的硬體 benchmark 數據——實測資料比任何其他事都更能推動專案；
-- 💬 加入 [Discord 社群](https://discord.gg/MAaKtQRc)，討論實驗、硬體數據與研究方向；
+- 💬 加入 [Discord 社群](https://discord.gg/RXV83nSZdk)，討論實驗、硬體數據與研究方向；
 - 💬 若想贊助開發或捐贈硬體，請透過 GitHub issues 聯絡。
 
 ## 儲存庫結構
@@ -341,4 +385,4 @@ docs/                     參考文件、實驗與媒體檔
 
 ## 授權條款
 
-Apache 2.0。GLM-5.2 權重由 Z.ai 以 MIT 授權發布。
+Apache 2.0，Copyright 2026 Vincenzo Fornaro。詳見 [LICENSE](LICENSE) 與 [NOTICE](NOTICE)。GLM-5.2 權重由 Z.ai 以 MIT 授權發布。

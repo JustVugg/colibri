@@ -54,6 +54,30 @@ class CliOutputLanguageTest(unittest.TestCase):
         self.assertIn("disk", result.stdout)
         self.assertIn("engine", result.stdout)
 
+    def test_info_without_config_names_no_engine(self):
+        """A directory of shards without config.json used to show the GLM engine
+        as if it were the one to run: the family is unknown, so the engine is
+        unknown, and the line must say what to copy where."""
+        with tempfile.TemporaryDirectory() as model:
+            for i in (1, 2):
+                (Path(model) / f"model-0000{i}-of-00002.safetensors").write_bytes(b"\0" * 8)
+            result = self.run_cli("info", "--model", model)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unknown until config.json is present", result.stdout)
+        self.assertIn("2 shard(s) found here", result.stdout)
+        self.assertIn("model.safetensors.index.json", result.stdout)
+        self.assertNotIn("ready", result.stdout)
+        self.assertNotIn("not built", result.stdout)
+
+    def test_chat_without_config_says_what_to_copy(self):
+        with tempfile.TemporaryDirectory() as model:
+            (Path(model) / "tokenizer.json").write_text("{}", encoding="utf-8")
+            result = self.run_cli("run", "--model", model, "hello")
+        self.assertNotEqual(result.returncode, 0)
+        out = result.stdout + result.stderr
+        self.assertIn("cannot read config.json", out)
+        self.assertIn("coli picks the engine from config.json", out)
+
     def test_info_reads_registered_nested_text_config(self):
         with tempfile.TemporaryDirectory() as model:
             (Path(model) / "config.json").write_text(json.dumps({
@@ -242,6 +266,29 @@ class BannerModelLineTest(unittest.TestCase):
                 line = self.line({"model_type": model_type, "n_routed_experts": 8})
                 self.assertTrue(line.startswith(expected), line)
 
+    def test_qwen_checkpoints_are_named_by_geometry(self):
+        """One model_type, two sizes: the banner must not call a 2.4T a 35B (#1045)."""
+        thirty_five = {"model_type": "qwen3_5_moe_text", "num_hidden_layers": 40,
+                       "num_experts": 256, "hidden_size": 2048}
+        two_point_four = {"model_type": "qwen3_5_moe_text", "num_hidden_layers": 92,
+                          "num_experts": 512, "hidden_size": 8192}
+        self.assertTrue(self.line(thirty_five).startswith("Qwen3.6-35B-A3B · 35B MoE"),
+                        self.line(thirty_five))
+        line = self.line(two_point_four)
+        self.assertTrue(line.startswith("Qwen3.8-2.4T-A95B · 2.4T MoE"), line)
+        self.assertNotIn("35B", line)
+        # the HF repo nests the text config under text_config; the family
+        # config, not the root, is what carries the geometry
+        wrapped = {"model_type": "qwen3_5_moe", "text_config": two_point_four}
+        self.assertTrue(self.line(wrapped).startswith("Qwen3.8-2.4T-A95B"), self.line(wrapped))
+        # a geometry the registry does not recognise names itself, with its
+        # own numbers -- a tiny fixture is not "Qwen3.6-35B-A3B"
+        tiny = {"model_type": "qwen3_5_moe_text", "num_hidden_layers": 8,
+                "num_experts": 8, "hidden_size": 64}
+        line = self.line(tiny)
+        self.assertTrue(line.startswith("qwen3_5_moe_text · 8L x 8E MoE"), line)
+        self.assertNotIn("35B", line)
+
     def test_deepseek_v4_is_not_read_as_glm(self):
         """The regression this exists for: a non-GLM checkpoint said GLM-5.2."""
         line = self.line({"model_type": "deepseek_v4", "n_routed_experts": 256})
@@ -261,12 +308,41 @@ class BannerModelLineTest(unittest.TestCase):
         self.assertIn("unknown model", line)
         self.assertNotIn("GLM-5.2", line)
 
+    def test_a_pruned_checkpoint_is_not_announced_with_the_reference_size(self):
+        """#1310 made the REAP-pruned DeepSeek V4 Flash load: same model_type,
+        same 43 layers, 132 routed experts instead of 256, 150B instead of
+        284B. The family's display_scale is the reference checkpoint's number,
+        so printing it here is #1367 again -- except that this time the config
+        can tell the two apart, so the banner must."""
+        reap = self.line({"model_type": "deepseek_v4", "num_hidden_layers": 43,
+                          "n_routed_experts": 132})
+        self.assertIn("DeepSeek V4 Flash", reap)
+        self.assertNotIn("284B", reap, "a 150B checkpoint announced as 284B")
+        self.assertIn("43L x 132E", reap)
+
+    def test_the_reference_checkpoint_keeps_its_declared_size(self):
+        official = self.line({"model_type": "deepseek_v4", "num_hidden_layers": 43,
+                              "n_routed_experts": 256})
+        self.assertIn("284B", official)
+        self.assertNotIn("43L x 256E", official)
+
     def test_no_model_keeps_the_generic_tagline(self):
-        self.assertIn("GLM-5.2", self.coli.model_banner_line(None))
+        """What matters is that a tagline comes back and that it names no
+        model. It used to assert the substring "GLM-5.2", which pinned the
+        example rather than the property: the tagline named the flagship
+        family, and #1367 renamed that family out from under it."""
+        line = self.coli.model_banner_line(None)
+        self.assertTrue(line.strip())
+        self.assertIn("model families", line)
+        for family in self.coli.all_families():
+            self.assertNotIn(family.display_name, line,
+                             "the generic tagline names a specific model; it is "
+                             "printed when no model was given")
 
     def test_unreadable_model_falls_back_instead_of_raising(self):
         """`coli info` banners before validating the path; it must not crash."""
-        self.assertIn("GLM-5.2", self.coli.model_banner_line("/nonexistent/xyz"))
+        self.assertEqual(self.coli.model_banner_line("/nonexistent/xyz"),
+                         self.coli.model_banner_line(None))
 
     def test_size_is_reported_without_rounding_to_zero(self):
         small = self.line({"model_type": "olmoe"}, shard_bytes=4_200_000_000)
@@ -339,13 +415,53 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
                     "OMP_DYNAMIC", "OMP_PROC_BIND", "OMP_PLACES"):
             self.assertNotIn(key, env)
 
-    def test_qwen38_rejects_gpu_and_vram_flags_before_binary_detection(self):
-        gpu_args = self.args();gpu_args.gpu="0";gpu_args.vram=0
-        with self.assertRaisesRegex(SystemExit, "CPU only.*--gpu"):
-            self.coli.env_for_engine(gpu_args, "qwen38")
-        vram_args = self.args();vram_args.gpu=None;vram_args.vram=4
-        with self.assertRaisesRegex(SystemExit, "CPU only.*--vram"):
-            self.coli.env_for_engine(vram_args, "qwen38")
+    def test_qwen38_gpu_flags_need_the_cuda_build(self):
+        """qwen38 has a GPU path now (expert tier, dense trunk), so --gpu and
+        --vram are no longer refused up front as "CPU only". On a CPU-only
+        binary they fail the way every accelerated engine's do: by asking for
+        the CUDA build. cuda_binary() is mocked so the test does not depend on
+        what happens to be built next to it."""
+        with mock.patch.object(self.coli, "cuda_binary", return_value=None):
+            gpu_args = self.args();gpu_args.gpu="0";gpu_args.vram=0
+            with self.assertRaisesRegex(SystemExit, "--gpu needs the CUDA build"):
+                self.coli.env_for_engine(gpu_args, "qwen38")
+            vram_args = self.args();vram_args.gpu=None;vram_args.vram=4
+            with self.assertRaisesRegex(SystemExit, "--vram needs the CUDA build"):
+                self.coli.env_for_engine(vram_args, "qwen38")
+
+
+class ContextFlagHonestyTest(unittest.TestCase):
+    """#1376: `--ctx` above what a family supports was accepted, then clamped
+    by the engine in silence. A flag that appears to work and does not is
+    worse than one refused with the number."""
+
+    @classmethod
+    def setUpClass(cls):
+        loader = SourceFileLoader("coli_ctx_under_test", str(CLI))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        cls.coli = importlib.util.module_from_spec(spec)
+        loader.exec_module(cls.coli)
+
+    class Args(types.SimpleNamespace):
+        """env_for_engine reads whatever flags the family cares about; every
+        one not set here reads as "not given", which is what argparse yields."""
+        def __getattr__(self, name):
+            return None
+
+    def args(self, ctx):
+        return self.Args(ctx=ctx, ram=0)
+
+    def test_ctx_above_the_family_maximum_is_refused_with_the_number(self):
+        family = self.coli.family_by_id("qwen36")
+        too_big = family.limits.max_context + 1
+        with self.assertRaises(SystemExit) as stop:
+            self.coli.env_for_engine(self.args(too_big), "qwen36")
+        self.assertIn(str(family.limits.max_context), str(stop.exception))
+
+    def test_ctx_within_the_maximum_reaches_the_engine_variable(self):
+        family = self.coli.family_by_id("qwen36")
+        env = self.coli.env_for_engine(self.args(65536), "qwen36")
+        self.assertEqual(env.get(family.limits.context_env), "65536")
 
 
 if __name__ == "__main__":

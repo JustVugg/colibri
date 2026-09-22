@@ -21,6 +21,7 @@ import time
 import uuid
 
 import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
+import v41_dsml                     # ...and V4.1's, whose tag names differ by a space
 from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id,
                              family_ids, resolve_model)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -84,8 +85,20 @@ def _engine_error(fields, message):
     know how to compact a conversation actually get the chance to (previously the engine
     silently truncated the prompt instead, which is #401)."""
     if fields and fields[0] == "CONTEXT_EXCEEDED":
-        limit = fields[2] if len(fields) > 2 else "the context"
-        used = fields[1] if len(fields) > 1 else "?"
+        # Two spellings of the same frame. colibri and deepseek_v4 write the
+        # original `CONTEXT_EXCEEDED <used> <limit>`; qwen36 and qwen38 write
+        # `prompt_tokens=N requested=M capacity=C`. Reading the second by
+        # position took "requested=M" (the completion budget) as the limit and
+        # printed it raw: "maximum context length is requested=4 tokens", with
+        # the real ceiling nowhere (#1376). Unifying the engines' spelling is
+        # a separate change; the server must read both meanwhile.
+        kv = dict(f.split("=", 1) for f in fields[1:] if "=" in f)
+        if kv:
+            limit = kv.get("capacity") or "the context"
+            used = kv.get("prompt_tokens") or "?"
+        else:
+            limit = fields[2] if len(fields) > 2 else "the context"
+            used = fields[1] if len(fields) > 1 else "?"
         return APIError(400,
                         f"This model's maximum context length is {limit} tokens, however your "
                         f"messages resulted in at least {used} tokens. Please shorten the "
@@ -238,12 +251,94 @@ _BOX_RE  = re.compile(re.escape(BOX_START) + r"(.*?)" + re.escape(BOX_END), re.D
 _ARG_RE  = re.compile(r"<arg_key>([^<]*)</arg_key><arg_value>(.*?)</arg_value>", re.DOTALL)
 _NAME_RE = re.compile(r"\s*([A-Za-z0-9_.\-]+)")
 _TAG_RE  = re.compile(r"</?arg_key>|</?arg_value>")
+
+
+def _fallback_tool_preamble(tools):
+    """Tool declaration for a family with no native tool tokens.
+
+    Mirrors the GLM-5.2 block because ``parse_tool_calls`` -- the parser these
+    families fall back to in ``parse_arch_tool_calls`` -- reads exactly that
+    wire format. Asking for a format the parser does not accept would produce
+    tool calls nobody can read back.
+    """
+    out = ["You have access to the following functions. Call one only when it "
+           "is needed to answer the user.\n\n<tools>\n"]
+    for tool in tools:
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        out.append(json.dumps(fn, ensure_ascii=False) + "\n")
+    out.append("</tools>\n\nTo call a function, reply with the call and nothing "
+               "else, in this exact format:\n" + BOX_START + "{function-name}"
+               "<arg_key>{arg-key}</arg_key><arg_value>{arg-value}</arg_value>"
+               + BOX_END)
+    return "".join(out)
+
+
+def _fallback_tool_calls(tool_calls, index):
+    """Render assistant tool_calls in the format parse_tool_calls() reads."""
+    out = []
+    for position, call in enumerate(tool_calls or []):
+        if not isinstance(call, dict):
+            raise APIError(400, "Each tool call must be an object.",
+                           f"messages.{index}.tool_calls.{position}")
+        fn = call.get("function", call)
+        if not isinstance(fn, dict):
+            raise APIError(400, "`function` must be an object.",
+                           f"messages.{index}.tool_calls.{position}.function")
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            raise APIError(400, "`function.name` must be a non-empty string.",
+                           f"messages.{index}.tool_calls.{position}.function.name")
+        args = fn.get("arguments", "{}")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args else {}
+            except (json.JSONDecodeError, TypeError, ValueError):
+                raise APIError(400, "`function.arguments` must be a JSON object.",
+                               f"messages.{index}.tool_calls.{position}.function.arguments")
+        out.append(BOX_START + name)
+        for key, value in (args or {}).items():
+            rendered = value if isinstance(value, str) else json.dumps(
+                value, ensure_ascii=False)
+            out.append(f"<arg_key>{key}</arg_key><arg_value>{rendered}</arg_value>")
+        out.append(BOX_END)
+    return "".join(out)
+
+
+def _fallback_tool_result(message, index):
+    """Render a role:"tool" message as prose these templates can carry."""
+    body = content_text(message.get("content"), f"messages.{index}.content")
+    return TR_OPEN + body + TR_CLOSE
 # A closing tag the model started but never finished ("</tool_cal", "</tool"), at end of reply.
 _PARTIAL_END_RE = re.compile(r"<(?:/(?:t(?:o(?:o(?:l(?:_(?:c(?:a(?:l)?)?)?)?)?)?)?)?)?\Z")
 
 # De-mangler: opt-in recovery for heavily-quantized models that drop the
 # <arg_key>K</arg_key><arg_value> structure. Default OFF (never rewrites well-formed output).
 _SALVAGE = os.environ.get("COLI_TOOL_SALVAGE", "0") == "1"
+
+# Families whose chat template has no tool syntax at all (OLMoE, Qwen3.6) refuse
+# tools[] and role:"tool" rather than invent a format. COLI_TOOL_FALLBACK=1 opts
+# into a prompt-injected translation for them: the declaration block, the prior
+# assistant calls and the tool results are written as ordinary turns, in the
+# same wire format parse_tool_calls() already reads back (#1378). Default OFF --
+# these models were never trained on tool syntax, so this trades a clean 400 for
+# output the parser may or may not recognise.
+_TOOL_FALLBACK = os.environ.get("COLI_TOOL_FALLBACK", "0") == "1"
+
+
+def _tool_choice_name(tool_choice):
+    """The tool name a dict `tool_choice` forces, or None.
+
+    `.get` is taken only from a dict. Writing the name where the object goes --
+    {"type": "function", "function": "search"} instead of
+    {"function": {"name": "search"}} -- raised AttributeError in the five
+    renderers that read this and in generation_options() itself, and do_POST
+    answered HTTP 500 "The colibri engine failed to process the request." for a
+    payload generation_options() already has a 400 for. Same shape as the
+    json_schema fix (#1587): read the member, then check it.
+    """
+    function = tool_choice.get("function")
+    return ((function if isinstance(function, dict) else {}).get("name")
+            or tool_choice.get("name"))
 
 
 def _tool_param_order(tools):
@@ -520,10 +615,34 @@ def parse_k3_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
+def parse_dsv41_tool_calls(reply):
+    """Parse DeepSeek V4.1 DSML tool calls out of one assistant reply.
+
+    Same posture as the V4 path: the vendored reference parser decodes the block
+    strictly, and the gateway then cuts an incomplete block out of the visible
+    content so raw DSML never reaches the client, whatever the model did with
+    its token budget.
+    """
+    content, calls = v41_dsml.parse_completion_text(reply)
+    if not calls:
+        cut = len(content)
+        for marker in (v41_dsml.TOOL_CALLS_PREFIX, v41_dsml.TOOL_CALL_PREFIX):
+            pos = content.find(marker)
+            if 0 <= pos < cut:
+                cut = pos
+        if cut < len(content):
+            content = content[:cut]
+    for marker in (v41_dsml.eos_token, THINK_OPEN, THINK_CLOSE):
+        content = content.replace(marker, "")
+    return content.strip(), calls
+
+
 def parse_arch_tool_calls(reply, tools, tool_reply=None):
     """Architecture-appropriate tool-call parser. Returns (content, tool_calls)."""
     if ARCH == "deepseek_v4":
         return parse_dsv4_tool_calls(reply)
+    if ARCH == "deepseek_v41":
+        return parse_dsv41_tool_calls(reply)
     if ARCH == "kimi":
         if tool_reply is not None:
             _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
@@ -538,6 +657,10 @@ def _tool_stream_markers():
     """Marker(s) that open a model tool-call block, in match order (arch-specific)."""
     if ARCH == "deepseek_v4":
         return ("<" + DSV4_DSML + "tool_calls", "<" + DSV4_DSML + "invoke")
+    if ARCH == "deepseek_v41":
+        # V4.1's tag names lead with a space (" calls", " invoke"): building these the
+        # V4 way would suppress nothing and leak the block into delta.content.
+        return (v41_dsml.TOOL_CALLS_PREFIX, v41_dsml.TOOL_CALL_PREFIX)
     if ARCH == "kimi":
         return (K3_TOOLS_OPEN,)
     return (BOX_START,)
@@ -951,7 +1074,7 @@ def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, too
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     forced = None
     if isinstance(tool_choice, dict):
-        forced = ((tool_choice.get("function") or {}).get("name") or tool_choice.get("name"))
+        forced = _tool_choice_name(tool_choice)
         if forced:
             tools = [t for t in (tools or [])
                      if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
@@ -1042,8 +1165,7 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     forced = None
     if isinstance(tool_choice, dict):
-        forced = ((tool_choice.get("function") or {}).get("name")
-                  or tool_choice.get("name"))
+        forced = _tool_choice_name(tool_choice)
         if forced:
             tools = [t for t in (tools or [])
                      if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
@@ -1146,17 +1268,25 @@ def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, to
     """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    if tools or tool_choice not in (None, "none"):
-        raise APIError(400, "Tool use is not wired up for the OLMoE engine yet.",
-                       "tools", "unsupported_parameter")
+    if tool_choice == "none":
+        tools = None
+    if (tools or tool_choice not in (None, "none")) and not _TOOL_FALLBACK:
+        raise APIError(400, "Tool use is not wired up for the OLMoE engine yet. "
+                       "Set COLI_TOOL_FALLBACK=1 to opt into prompt-injected "
+                       "tool translation.", "tools", "unsupported_parameter")
     boundary = "|||IP_ADDRESS|||"   # bos_token == eos_token in this tokenizer
     parts = [boundary]
+    if tools and _TOOL_FALLBACK:
+        parts.append(f"<|system|>\n{_fallback_tool_preamble(tools)}\n")
     last = len(messages) - 1
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
-        if role not in ("system", "developer", "user", "assistant"):
+        allowed = ("system", "developer", "user", "assistant")
+        if _TOOL_FALLBACK:
+            allowed += ("tool",)
+        if role not in allowed:
             raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
         raw = message.get("content")
         text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
@@ -1164,8 +1294,13 @@ def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, to
             parts.append(f"<|system|>\n{text}\n")
         elif role == "user":
             parts.append(f"<|user|>\n{text}\n")
+        elif role == "tool":
+            # No tool role in this template: the result rides in as a user turn.
+            parts.append(f"<|user|>\n{_fallback_tool_result(message, index)}\n")
         else:
-            parts.append(f"<|assistant|>\n{text}{boundary}")
+            calls = (_fallback_tool_calls(message.get("tool_calls"), index)
+                     if _TOOL_FALLBACK else "")
+            parts.append(f"<|assistant|>\n{text}{calls}{boundary}")
             if index != last:
                 parts.append("\n")
     parts.append("<|assistant|>\n")
@@ -1183,20 +1318,36 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
     mirrored here byte for byte."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    if tools or tool_choice not in (None, "none"):
-        raise APIError(400, "Tool use is not wired up for the qwen36 engine yet.",
-                       "tools", "unsupported_parameter")
+    if tool_choice == "none":
+        tools = None
+    if (tools or tool_choice not in (None, "none")) and not _TOOL_FALLBACK:
+        raise APIError(400, "Tool use is not wired up for the qwen36 engine yet. "
+                       "Set COLI_TOOL_FALLBACK=1 to opt into prompt-injected "
+                       "tool translation.", "tools", "unsupported_parameter")
     parts = []
+    if tools and _TOOL_FALLBACK:
+        parts.append("<|im_start|>system\n"
+                     + _fallback_tool_preamble(tools) + "<|im_end|>\n")
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
         if role == "developer":
             role = "system"
-        if role not in ("system", "user", "assistant"):
+        allowed = ("system", "user", "assistant")
+        if _TOOL_FALLBACK:
+            allowed += ("tool",)
+        if role not in allowed:
             raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
         raw = message.get("content")
         text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role == "tool":
+            # No tool role in this template: the result rides in as a user turn.
+            parts.append("<|im_start|>user\n"
+                         + _fallback_tool_result(message, index) + "<|im_end|>\n")
+            continue
+        if role == "assistant" and _TOOL_FALLBACK:
+            text += _fallback_tool_calls(message.get("tool_calls"), index)
         parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
     parts.append("<|im_start|>assistant\n")
     parts.append("<think>\n" if enable_thinking else "<think>\n\n</think>\n\n")
@@ -1513,8 +1664,7 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
         prompt.append(f"<|system|>Reasoning Effort: {effort}")
     forced = None
     if isinstance(tool_choice, dict):
-        forced = ((tool_choice.get("function") or {}).get("name")
-                  or tool_choice.get("name"))
+        forced = _tool_choice_name(tool_choice)
         if forced:
             tools = [t for t in (tools or [])
                      if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
@@ -1597,7 +1747,20 @@ GLM53_IMAGE_OPEN, GLM53_IMAGE, GLM53_IMAGE_CLOSE = (
 
 
 def _image_bytes_from_url(url):
-    """data: URI, file:// o percorso sul disco -> i byte dell'immagine."""
+    """data: URI, file:// o percorso sul disco -> i byte dell'immagine.
+
+    A local path is read with the server process's own permissions, and an
+    inference client is not the operator: with the API key it could read any
+    file the process can reach ("file:///etc/passwd", or a bare "/etc/passwd").
+    #1354 refused '..' and confined reads to COLI_IMAGE_ROOT when set, which
+    left every absolute path readable on the default install (the variable is
+    unset out of the box). So local paths are now denied unless the operator
+    sets COLI_IMAGE_ROOT, and then only inside it (resolve() follows symlinks
+    before the relative_to() check, the same one serve_static uses). The
+    clients that used to send paths read the file themselves with the user's
+    own rights and send a data: URI: `coli chat` since this change, `coli web`
+    always did. Errors stay generic so a reply never confirms a path or its
+    permissions."""
     if not isinstance(url, str) or not url:
         raise APIError(400, "image_url.url must be a non-empty string.", "messages")
     if url.startswith("data:"):
@@ -1615,12 +1778,28 @@ def _image_bytes_from_url(url):
         raise APIError(400, "remote image URLs are not fetched; send the image "
                             "as a base64 data: URI or a path on this machine.",
                        "messages")
-    path = url[7:] if url.startswith("file://") else url
+    raw = url[7:] if url.startswith("file://") else url
+    image_root = os.environ.get("COLI_IMAGE_ROOT")
+    if not image_root:
+        raise APIError(400, "local image paths are disabled on this server: send the image "
+                            "as a base64 data: URI (coli chat and coli web do), or start the "
+                            "server with COLI_IMAGE_ROOT=<dir> to allow files under that "
+                            "directory.", "messages")
+    if ".." in Path(raw).parts:
+        raise APIError(400, "image path is not allowed.", "messages")
     try:
-        with open(path, "rb") as handle:
+        root = Path(image_root).resolve(strict=True)
+        if not root.is_dir():
+            raise ValueError("COLI_IMAGE_ROOT is not a directory")
+        target = Path(raw).resolve()
+        target.relative_to(root)
+    except (ValueError, OSError):
+        raise APIError(400, "image path is not allowed.", "messages")
+    try:
+        with open(target, "rb") as handle:
             return handle.read()
-    except OSError as problem:
-        raise APIError(400, f"cannot read image {path}: {problem}", "messages")
+    except OSError:
+        raise APIError(400, "cannot read the requested image.", "messages")
 
 
 # Qwen3.8 splices images as <|vision_start|> + N x <|image_pad|> + <|vision_end|>,
@@ -1710,6 +1889,57 @@ def expand_glm53_images(messages, model_dir):
                 raise APIError(400, f"unsupported content part {kind!r}.", "messages")
         rewritten.append({**message, "content": "".join(pieces)})
     return rewritten, images
+
+
+# DeepSeek V4.1's image placeholder: every position of an image span carries the same
+# id, and what each one MEANS follows from the aligner grid (image_processor.py
+# image_token_types): start, then one newline per row of image tokens, then end. The
+# engine rebuilds that layout from the grid it gets in the IMAGE frame, so the gateway
+# only has to insert the right NUMBER of placeholders -- and getting that number wrong
+# is the one failure the engine cannot paper over, which is why it refuses instead.
+DSV41_IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
+
+
+def expand_dsv41_images(messages, model_dir, max_tokens=None):
+    """Replace image parts with their placeholder span and pull out the patches."""
+    images, rewritten = [], []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            rewritten.append(message)
+            continue
+        pieces = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "text":
+                pieces.append(part.get("text", ""))
+            elif kind in ("image_url", "input_image"):
+                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
+                      else part.get("image_url") or part.get("url")
+                data = _image_bytes_from_url(url)
+                patches, grid_h, grid_w, llm_h, llm_w = _preprocess_dsv41_image(
+                    data, model_dir, max_tokens)
+                span = 1 + (llm_w + 1) * llm_h + 1
+                images.append((patches, grid_h, grid_w))
+                pieces.append(DSV41_IMAGE_PLACEHOLDER * span)
+            else:
+                raise APIError(400, f"unsupported content part {kind!r}.", "messages")
+        rewritten.append({**message, "content": "".join(pieces)})
+    return rewritten, images
+
+
+def _preprocess_dsv41_image(data, model_dir, max_tokens=None):
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
+        from dsv41_image import preprocess
+    except ImportError as problem:
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+                       "messages")
+    return preprocess(data, model_dir, max_tokens)
 
 
 def _preprocess_image(data, model_dir):
@@ -1817,8 +2047,7 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
 
     forced = None
     if isinstance(tool_choice, dict):
-        forced = ((tool_choice.get("function") or {}).get("name")
-                  or tool_choice.get("name"))
+        forced = _tool_choice_name(tool_choice)
         if forced:
             tools = [t for t in (tools or [])
                      if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
@@ -1826,22 +2055,30 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
         tools = None                              # il client li ha vietati: non si offrono
 
     prompt = ["[gMASK]<sop>"]
-    if enable_thinking:
-        # SOLO col ragionamento acceso. Con --no-think il prompt chiude gia' il
-        # blocco, e lasciare "Reasoning Effort: Max" davanti a un <think></think>
-        # chiuso dice al modello due cose opposte: rifletti al massimo, e hai
-        # finito di riflettere. Il modello risponde riaprendo un <think>, lo
-        # splitter -- che era partito correttamente in modalita' testo -- lo vede
-        # e ci rientra, e da li' in poi tutta la risposta viene archiviata come
-        # pensiero: l'utente vede riflettere e poi nessuna risposta (#1278).
-        # render_chat (GLM-5.2) mette questa riga sotto la stessa condizione da
-        # sempre, ed e' l'unico dei due che non ha mai avuto questa segnalazione.
-        #
-        # low e high passano, tutto il resto e' Max: e' la scala del template,
-        # non la nostra. `none` non arriva qui, spegne il ragionamento a monte.
-        effort = {"minimal": "Low", "low": "Low", "medium": "High",
-                  "high": "High", "xhigh": "Max"}.get(reasoning_effort, "Max")
-        prompt.append(f"<|system|>Reasoning Effort: {effort}")
+    # La riga di effort esce SEMPRE, come nel template: `effective_reasoning_effort`
+    # ha un ramo else che vale 'max', quindi non e' mai none. GLM-5.3 non ha un modo
+    # "non ragionare" -- in questo template `enable_thinking` non esiste proprio, e
+    # il prompt di generazione APRE sempre <think>.
+    #
+    # Quindi enable_thinking=False qui non puo' voler dire "spegni": vuol dire "il
+    # minimo che il modello supporta", cioe' Low. Il ragionamento avviene comunque;
+    # a nasconderlo e' il gateway, non il prompt.
+    #
+    # La forma che questo sostituisce -- nessuna riga di effort e <think></think>
+    # chiuso -- non esiste nel template e il modello non l'ha mai vista: e' la causa
+    # di #1278. Meta' di quella deviazione l'ho aggiunta io in #1282, giustificandola
+    # con un meccanismo poi misurato falso e ritirato pubblicamente sulla issue.
+    # Reso il template con jinja2 accanto a questo renderer, l'unica forma che sa
+    # produrre e':
+    #     [gMASK]<sop><|system|>Reasoning Effort: {Low|High|Max}<|user|>..<|assistant|><think>
+    #
+    # low e high passano, tutto il resto e' Max: e' la scala del template, non la
+    # nostra. `none` non arriva qui, spegne il ragionamento a monte per le famiglie
+    # che possono davvero spegnerlo.
+    effort = {"minimal": "Low", "low": "Low", "medium": "High",
+              "high": "High", "xhigh": "Max"}.get(reasoning_effort,
+                                                  "Max" if enable_thinking else "Low")
+    prompt.append(f"<|system|>Reasoning Effort: {effort}")
     if tools:
         prompt.append(_glm53_tool_block(tools))
 
@@ -1866,22 +2103,207 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
                 reasoning = content.split("</think>")[0].split("<think>")[-1]
                 content = content.split("</think>")[-1]
             opened = f"<think>{reasoning}</think>" if isinstance(reasoning, str) else "<think></think>"
-            prompt.append(f"<|assistant|>{opened}{content.strip()}"
-                          f"{_glm53_tool_calls(message.get('tool_calls'))}")
+            body = content.strip()
+            calls = _glm53_tool_calls(message.get("tool_calls"))
+            # The template writes "\n<tool_call>". The model, on a turn that is
+            # nothing but a tool call, writes "</think><tool_call>" with no
+            # newline between them, and that one token is enough to throw away
+            # the whole cached prefix: the reuse gate in glm53.c is
+            # all-or-nothing, so the next turn re-prefills from scratch -- on a
+            # 3k-token agent history at 2.3 tok/s, twenty minutes (#1576).
+            #
+            # A turn that also has text is left exactly as it was. There the
+            # model's own trailing newline is stripped by .strip() and put back
+            # by the renderer, so the tokens already line up, and changing that
+            # case would break the one that works today.
+            if calls and not body:
+                calls = calls.lstrip("\n")
+            prompt.append(f"<|assistant|>{opened}{body}{calls}")
         else:
             raise APIError(400, f"unsupported message role {role!r}.", "messages")
 
-    # Il prompt di generazione apre il blocco di ragionamento; con il
-    # ragionamento spento lo chiude subito.
-    #
-    # Il template ufficiale conosce solo la prima forma, perche' per lui il
-    # modello ragiona sempre. La seconda pero' non e' inventata: e' esattamente
-    # quello che il template scrive davanti a un turno passato che ragionamento
-    # non ne aveva (<think></think> seguito dal contenuto), quindi e' uno stato
-    # su cui il modello e' stato addestrato e non una posizione mai vista.
-    # Chi vuole il comportamento ufficiale non tocca niente: acceso e' il caso
-    # che combacia col template, ed e' quello che il test confronta.
-    prompt.append("<|assistant|><think>" if enable_thinking else "<|assistant|><think></think>")
+    # Il prompt di generazione apre il blocco, sempre, come il template:
+    #     {%- if add_generation_prompt -%}<|assistant|>{{- '<think>' -}}{%- endif -%}
+    # Il vecchio commento qui sosteneva che <think></think> chiuso fosse "uno stato
+    # su cui il modello e' addestrato" perche' il template lo scrive davanti a un
+    # TURNO PASSATO senza ragionamento. E' vero per un turno passato e falso per il
+    # prompt di generazione: la posizione da cui il modello scrive non e' mai quella.
+    prompt.append("<|assistant|><think>")
+    return "".join(prompt)
+
+
+# ---- DeepSeek V4.1 Flash -----------------------------------------------------------------
+# The checkpoint ships its chat format as a Python module (encoding/encoding.py), not a
+# jinja template, so this is that module's render_message transcribed for the shapes the
+# gateway sends. Its pieces, with the vendor's own names:
+#
+#   <｜begin▁of▁sentence｜>  once, at the head of a fresh conversation
+#   <｜System｜>             leads the conversation when there is a system message or a
+#                           reasoning-effort line; also precedes a mid-conversation one
+#   Reasoning Effort: N     index 0 only, thinking mode only, N in 1..100
+#   <｜User｜> / <｜Assistant｜>
+#   <think> or </think>     the generation cue: open in thinking mode, closed otherwise
+#   assistant turns end with <｜end▁of▁sentence｜>
+#
+# Two details the reference hides in its control flow, both reproduced below. First,
+# <think> and </think> straddle a turn boundary: the OPENING token is the transition the
+# reference appends after a user turn, the CLOSING one belongs to the assistant turn that
+# follows, so an assistant turn always starts with one or the other and there is no such
+# thing as a past assistant turn without a </think>. Second, the reference drops the
+# reasoning of turns before the last user message -- except when the conversation declares
+# tools, where it keeps every one of them (`if any(m.get("tools") ...)`), because a tool
+# call is only interpretable next to the reasoning that produced it.
+DSV41_BOS = "<｜begin▁of▁sentence｜>"
+DSV41_EOS = "<｜end▁of▁sentence｜>"
+DSV41_SYSTEM = "<｜System｜>"
+DSV41_USER = "<｜User｜>"
+DSV41_ASSISTANT = "<｜Assistant｜>"
+# encoding.py REASONING_EFFORT_MAPPINGS; the default there is "high"
+DSV41_EFFORT = {"minimal": 50, "low": 50, "medium": 75, "high": 75, "xhigh": 100}
+
+
+def _dsv41_tools_block(tools):
+    """V4.1 tool-declaration block, rendered by the vendored reference template."""
+    schemas = []
+    for tool in (tools or []):
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        # Gateway-side scrub: OpenAI clients attach routing hints the model
+        # schema must not carry.
+        clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
+        if isinstance(tool, dict) and tool.get("namespace") is not None:
+            clean = dict(clean, namespace=tool["namespace"])
+        schemas.append(clean)
+    return v41_dsml.render_tools(v41_dsml.tools_from_openai_format(schemas))
+
+
+def _dsv41_merge_turns(messages):
+    """encoding.py merge_tool_messages + sort_tool_results_by_call_order.
+
+    V4.1 has no standalone tool role: a tool result is a <tool_result> block inside the
+    NEXT user turn, and consecutive user-side messages collapse into one turn joined by
+    a blank line. Returns turns of {"role", "parts"/"content", ...}, validating each
+    original message so field-level errors keep pointing at the client's own indices.
+    """
+    turns = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role == "developer":
+            role = "system"
+        if role not in ("system", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role == "assistant":
+            reasoning = message.get("reasoning_content")
+            if reasoning is not None and not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            turns.append({"role": "assistant", "content": text,
+                          "reasoning_content": reasoning,
+                          "tool_calls": message.get("tool_calls")})
+        elif role in ("user", "tool"):
+            block = ({"kind": "tool_result", "id": message.get("tool_call_id") or "",
+                      "text": v41_dsml.render_tool_result(text)} if role == "tool"
+                     else {"kind": "text", "id": "", "text": text})
+            if turns and turns[-1]["role"] == "user":
+                turns[-1]["parts"].append(block)
+            else:
+                turns.append({"role": "user", "parts": [block]})
+        else:
+            turns.append({"role": "system", "content": text})
+    # A parallel-call round trip arrives in whatever order the client's tools finished;
+    # the model reads them positionally, so restore the order it called them in.
+    order = {}
+    for turn in turns:
+        if turn["role"] == "assistant" and turn.get("tool_calls"):
+            order = {}
+            for at, call in enumerate(turn["tool_calls"]):
+                identifier = call.get("id") if isinstance(call, dict) else None
+                if identifier:
+                    order[identifier] = at
+        elif turn["role"] == "user" and order:
+            results = [p for p in turn["parts"] if p["kind"] == "tool_result"]
+            if len(results) > 1:
+                results.sort(key=lambda p: order.get(p["id"], 0))
+                feed = iter(results)
+                turn["parts"] = [next(feed) if p["kind"] == "tool_result" else p
+                                 for p in turn["parts"]]
+    return turns
+
+
+def render_chat_dsv41(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                      tool_choice=None):
+    """encoding.py _encode_messages_text for one turn.
+
+    Tool use follows the checkpoint's own DSML format (encoding/encoding.py, vendored in
+    v41_dsml.py): schemas are declared at the end of the system message, assistant tool
+    calls are <｜DSML｜ calls> blocks, and tool results are <tool_result> blocks merged
+    into the following user turn.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = _tool_choice_name(tool_choice)
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None                              # the client forbade tools: do not offer them
+    turns = _dsv41_merge_turns(messages)
+    if tools:
+        tools_text = _dsv41_tools_block(tools)
+        if forced:
+            tools_text += f"\n\nYou must call the function `{forced}`. Do not answer directly."
+        elif tool_choice == "required":
+            tools_text += "\n\nYou must call one of the functions above. Do not answer directly."
+        for turn in turns:
+            if turn["role"] == "system":
+                turn["content"] += "\n\n" + tools_text
+                break
+        else:
+            # No system message: the reference renders tools on an empty one, so the block
+            # arrives as <｜System｜> + "\n\n" + tools. Keep that exact byte layout.
+            turns.insert(0, {"role": "system", "content": "\n\n" + tools_text})
+    budget = DSV41_EFFORT.get(reasoning_effort or "high", 75)
+    effort = (f"Reasoning Effort: {budget} (range 1-100, the higher the value, the more "
+              f"thorough the reasoning)\n\n") if enable_thinking else ""
+    # find_last_user_index: a mid-conversation system message counts as a user turn,
+    # because it is one of the two things the reference puts an assistant header after.
+    last_user = -1
+    for index, turn in enumerate(turns):
+        if turn["role"] == "user" or (turn["role"] == "system" and index > 0):
+            last_user = index
+    # With tools on the table the reference keeps every turn's reasoning; without them it
+    # drops the reasoning of everything before the last user message.
+    drop_thinking = not tools
+    prompt = [DSV41_BOS]
+    for index, turn in enumerate(turns):
+        role = turn["role"]
+        if role == "system":
+            prompt.append(DSV41_SYSTEM)
+            if index == 0:
+                prompt.append(effort)
+            prompt.append(turn["content"])
+        elif role == "user":
+            if index == 0 and effort:
+                prompt.append(DSV41_SYSTEM + effort)
+            prompt.append(DSV41_USER)
+            prompt.append("\n\n".join(part["text"] for part in turn["parts"]))
+        else:
+            keep = enable_thinking and (not drop_thinking or index > last_user)
+            prompt.append(DSV41_ASSISTANT)
+            prompt.append(f"<think>{turn.get('reasoning_content') or ''}</think>"
+                          if keep else "</think>")
+            prompt.append(turn["content"])
+            if turn.get("tool_calls"):
+                prompt.append(v41_dsml.render_tool_calls(turn["tool_calls"]))
+            prompt.append(DSV41_EOS)
+    # the generation cue, exactly as render_message appends it after a user turn
+    prompt.append(DSV41_ASSISTANT)
+    prompt.append("<think>" if enable_thinking and len(turns) - 1 >= last_user else "</think>")
     return "".join(prompt)
 
 
@@ -1896,6 +2318,7 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
                 render_chat_qwen if ARCH == "qwen36" else
                 render_chat_qwen38 if ARCH == "qwen38" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
+                render_chat_dsv41 if ARCH == "deepseek_v41" else
                 render_chat_olmoe if ARCH == "olmoe" else render_chat)
     return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
 
@@ -1916,8 +2339,14 @@ def starts_in_reasoning(enable_thinking):
     dice il suo interruttore: acceso apre il blocco e il modello lo chiude da
     solo, spento lo chiude gia' il prompt e quello che torna e' risposta pura.
     Se le due cose non concordano il ragionamento finisce incollato davanti
-    alla risposta, che e' il difetto che questa funzione esiste per non avere."""
-    return enable_thinking
+    alla risposta, che e' il difetto che questa funzione esiste per non avere.
+
+    GLM-5.3 e' l'eccezione che rende la regola esplicita: il suo template non
+    ha un interruttore, render_chat_glm53 apre <think> SEMPRE, e "thinking
+    spento" vuol dire solo effort Low. L'uscita comincia dentro al blocco in
+    ogni caso; partire in modalita' testo perche' il client ha detto False e'
+    esattamente il ragionamento incollato davanti alla risposta di #1278."""
+    return enable_thinking or ARCH == "glm53"
 
 
 class ThinkingStreamSplit:
@@ -2337,7 +2766,7 @@ def generation_options(body, limit):
                 raise APIError(400, "`tool_choice` must be one of \"auto\", \"none\", \"required\", "
                                     "or a function object.", "tool_choice", "unsupported_value")
         elif isinstance(choice, dict):
-            name = (choice.get("function") or {}).get("name") or choice.get("name")
+            name = _tool_choice_name(choice)
             if not name:
                 raise APIError(400, "`tool_choice` function object must include a name.",
                                "tool_choice", "invalid_value")
@@ -2373,7 +2802,8 @@ def generation_options(body, limit):
         if ftype == "json_object":
             grammar = GENERIC_JSON_GBNF
         elif ftype == "json_schema":
-            schema = (response_format.get("json_schema") or {}).get("schema")
+            json_schema = response_format.get("json_schema")
+            schema = json_schema.get("schema") if isinstance(json_schema, dict) else None
             if not isinstance(schema, dict):
                 raise APIError(400, "`response_format.json_schema.schema` must be an object.",
                                "response_format", "invalid_value")
@@ -2753,16 +3183,28 @@ class Engine:
                 elif kind == "ECHO" and len(fields) >= 6:
                     # U7a prefill read-out: "ECHO <id> <n> <pos> <lp> <k>
                     # [tid tlp]*k" plus a DATA-framed payload (n bytes + LF).
-                    # Emitted only for opted-in requests; no current request
-                    # path opts in, so the frame is read (to keep the stream
-                    # in sync) and dropped -- U7b delivers it to the response
-                    # assembly when it wires the opt-in.
+                    # Emitted only for opted-in requests. Questo e' U7b: il
+                    # frame non si butta piu', va alla coda della richiesta che
+                    # l'ha chiesto. Chi non ha chiesto logprobs non ne riceve
+                    # nessuno, quindi il percorso della chat non cambia.
                     size = int(fields[2])
                     if not 0 <= size <= 65536:
                         raise RuntimeError("invalid engine DATA size")
-                    self._read_exact(size)
+                    piece = self._read_exact(size)
                     if self._read_exact(1) != b"\n":
                         raise RuntimeError("invalid engine DATA terminator")
+                    request_id = fields[1]
+                    lp = fields[4]
+                    with self.pending_lock:
+                        events = self.pending.get(request_id)
+                    if events is not None:
+                        events.put(("echo", {
+                            "pos": int(fields[3]),
+                            # " nan 0" = niente su cui condizionare: la prima
+                            # posizione assoluta non ha un predittore.
+                            "logprob": None if lp in ("nan", "-nan") else float(lp),
+                            "text": piece.decode("utf-8", "replace"),
+                        }))
                 elif kind == "ACCEPT" and len(fields) >= 3:
                     # #597: the engine validated the submission (fits context) before prefill.
                     # Keep it pending — DATA/DONE still follow — and let generate() commit the
@@ -2825,7 +3267,7 @@ class Engine:
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
-                 on_tool=None, image=None):
+                 on_tool=None, image=None, logprobs=0, pin=False, on_echo=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -2882,9 +3324,18 @@ class Engine:
                       default=0)
             if cut > 0:
                 prefix_field = f" {len(xpayload)} {len(prompt[:cut].encode('utf-8'))}"
+        # Chiavi di estensione (decode_batch.h): logprobs=k accende la lettura
+        # del prefill, pin=1 fotografa lo stato a fine prompt. Una richiesta
+        # che non le manda produce un header identico a prima, byte per byte.
+        ext = ""
+        if logprobs:
+            ext += f" logprobs={int(logprobs)}"
+        if pin:
+            ext += " pin=1"
         header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
                   f"{temperature:.8g} {top_p:.8g}"
                   + (prefix_field if prefix_field else (f" {len(xpayload)}" if xpayload else ""))
+                  + ext
                   + "\n").encode()
         try:
             with self.write_lock:
@@ -2966,6 +3417,13 @@ class Engine:
                         with self.write_lock:
                             self.process.stdin.write(f"CANCEL {request_id}\n".encode())
                             self.process.stdin.flush()
+            elif kind == "echo":
+                # Lettura del prefill: arriva PRIMA di ogni DATA e non e' testo
+                # generato, quindi non passa da decode() e non entra nella
+                # risposta. La consuma chi ha chiesto il canale.
+                _accept({"prompt_tokens": None})
+                if on_echo is not None:
+                    on_echo(value)
             elif kind == "tool":
                 _accept({"prompt_tokens": None})
                 if not cancel_sent and not stop_sent:
@@ -3364,6 +3822,14 @@ class APIHandler(BaseHTTPRequestHandler):
             body = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise APIError(400, "Request body must be valid JSON.")
+        try:
+            # An escaped lone surrogate ("\ud83d") parses, but it is the same invalid
+            # text as the undecodable bytes above: no UTF-8 can carry it, and the
+            # engine protocol encodes every prompt as UTF-8.
+            json.dumps(body, ensure_ascii=False).encode("utf-8")
+        except UnicodeEncodeError:
+            raise APIError(400, "Request body contains an unpaired UTF-16 surrogate "
+                                "escape; strings must be valid Unicode.")
         if not isinstance(body, dict):
             raise APIError(400, "Request body must be a JSON object.")
         return body
@@ -3490,12 +3956,19 @@ class APIHandler(BaseHTTPRequestHandler):
             self._check_host()
             self.require_auth()
             body = self.read_json()
-            self.check_model(body)
             path = urlsplit(self.path).path
+            # A client written for Jev sends "jev-latest": on that route the
+            # served model answers whatever name was asked for.
+            if path != "/v1/systemone":
+                self.check_model(body)
             if path == "/v1/chat/completions":
                 self.chat_completion(body, request_id)
             elif path == "/v1/completions":
                 self.completion(body, request_id)
+            elif path == "/v1/brio":
+                self.brio(body, request_id)
+            elif path == "/v1/systemone":
+                self.systemone(body, request_id)
             elif path == "/v1/messages":
                 self.anthropic_messages(body, request_id)
             else:
@@ -3513,6 +3986,398 @@ class APIHandler(BaseHTTPRequestHandler):
                                     None, "engine_error", "server_error"), request_id)
             except OSError:
                 pass
+
+
+    # ---------------------------------------------------------------- modalita brio
+    #
+    # Il modello non genera: si legge il logprob di ogni opzione ammessa e si
+    # normalizza sulle sole opzioni. Torna una distribuzione, non una stringa.
+    #
+    # PERCHE' IL CICLO STA QUI E NON NEL CLIENT. Servono tre cose facili da
+    # sbagliare: fotografare il prefisso condiviso (pin) cosi ogni opzione paga
+    # solo i propri token; NON mettere l'elenco delle opzioni nel prompt (su
+    # qwen36 erano 48 token su 123, meta del risparmio); e normalizzare per
+    # lunghezza, perche' sommare i logprob penalizza le opzioni da piu token --
+    # misurato, la somma diceva "merge" dove la generazione greedy dello stesso
+    # modello diceva "request changes". Un client che rifacesse questo ciclo
+    # sbaglierebbe una di queste tre, e il risultato resterebbe plausibile.
+    #
+    # COSA TORNA. Non solo il vincitore: la probabilita di OGNI opzione e
+    # l'entropia. E' la differenza con la generazione, che una risposta la da
+    # sempre e con la stessa faccia: qui "non lo so" e' un numero.
+    # TRE FORME, UN ENDPOINT. `options` e' la domanda singola. `questions` e'
+    # un elenco di domande sullo stesso stato, ognuna con le sue opzioni: lo
+    # stato viene fotografato una volta e ogni domanda paga solo se stessa,
+    # che e' dove sta il 5,7x misurato. `schema` e' un oggetto campo -> valori
+    # ammessi: il server scrive lo scheletro JSON, casella per casella, e per
+    # ognuna legge il logprob di ciascun valore. Il JSON non puo' uscire
+    # malformato perche' non lo scrive il modello. Prima queste due forme
+    # esistevano solo come script di misura: chi integrava doveva riscriverle.
+    @staticmethod
+    def _brio_options(options, where, limit=64):
+        if not isinstance(options, list) or not options:
+            raise APIError(400, f"`{where}` must be a non-empty array of strings.", where)
+        if len(options) > limit:
+            raise APIError(400, f"`{where}` accepts at most {limit} entries.", where)
+        seen = set()
+        for option in options:
+            if not isinstance(option, str) or not option.strip():
+                raise APIError(400, f"Every entry of `{where}` must be a non-empty string.", where)
+            if option in seen:
+                raise APIError(400, f"Duplicate option in `{where}`: {option!r}.", where)
+            seen.add(option)
+        if len(options) < 2:
+            raise APIError(400, f"`{where}` needs at least two options to choose between.", where)
+        return options
+
+    def brio(self, body, request_id, send=True):
+        # `send=False` returns the result instead of writing it: /v1/systemone
+        # builds a `questions` request and re-shapes the answer. `_max_options`
+        # is that caller's word too (Jev allows 255 labels); clamped.
+        option_limit = min(int(body.get("_max_options", 64) or 64), 255)
+        forms = [k for k in ("options", "questions", "schema") if body.get(k) is not None]
+        if len(forms) != 1:
+            raise APIError(400, "Provide exactly one of `options`, `questions` or `schema`.",
+                           forms[0] if forms else "options")
+        form = forms[0]
+        question = body.get("question")
+        if question is not None and not isinstance(question, str):
+            raise APIError(400, "`question` must be a string.", "question")
+        options = questions = schema = None
+        if form == "options":
+            options = self._brio_options(body["options"], "options")
+        elif form == "questions":
+            raw = body["questions"]
+            if not isinstance(raw, list) or not raw:
+                raise APIError(400, "`questions` must be a non-empty array.", "questions")
+            if len(raw) > 64:
+                raise APIError(400, "`questions` accepts at most 64 entries.", "questions")
+            questions = []
+            for i, entry in enumerate(raw):
+                if not isinstance(entry, dict):
+                    raise APIError(400, f"`questions[{i}]` must be an object.", "questions")
+                text = entry.get("question")
+                if not isinstance(text, str) or not text.strip():
+                    raise APIError(400, f"`questions[{i}].question` must be a non-empty string.",
+                                   "questions")
+                per = entry.get("normalize", body.get("normalize", "mean"))
+                if per not in ("mean", "sum"):
+                    raise APIError(400, "`normalize` must be \"mean\" or \"sum\".", "normalize")
+                questions.append((text, self._brio_options(entry.get("options"),
+                                                           f"questions[{i}].options",
+                                                           option_limit), per))
+        else:
+            raw = body["schema"]
+            if not isinstance(raw, dict) or not raw:
+                raise APIError(400, "`schema` must be a non-empty object of field: [values].",
+                               "schema")
+            if len(raw) > 64:
+                raise APIError(400, "`schema` accepts at most 64 fields.", "schema")
+            schema = []
+            for field, values in raw.items():
+                if not isinstance(field, str) or not field.strip():
+                    raise APIError(400, "Every `schema` field name must be a non-empty string.",
+                                   "schema")
+                if any(ch in field for ch in '"\\\n'):
+                    raise APIError(400, f"`schema` field {field!r} cannot contain quotes, "
+                                        "backslashes or newlines.", "schema")
+                schema.append((field, self._brio_options(values, f"schema.{field}")))
+            task = body.get("task")
+            if task is not None and not isinstance(task, str):
+                raise APIError(400, "`task` must be a string.", "task")
+        state = body.get("state")
+        messages = body.get("messages")
+        if state is not None and not isinstance(state, str):
+            raise APIError(400, "`state` must be a string.", "state")
+        if state is None and isinstance(messages, list):
+            # La conversazione in corso FA da stato: e' quello che la TUI manda
+            # quando si scrive /brio a meta chat.
+            parts = []
+            for message in messages:
+                if not isinstance(message, dict):
+                    raise APIError(400, "Every message must be an object.", "messages")
+                content = message.get("content")
+                if isinstance(content, list):
+                    content = "".join(piece.get("text", "") for piece in content
+                                      if isinstance(piece, dict))
+                if content:
+                    parts.append(f"{message.get('role', 'user')}: {content}")
+            state = "\n".join(parts)
+        if not state and not question and form == "options":
+            raise APIError(400, "Provide `state`, `messages` or `question`.", "state")
+        if not state and form != "options":
+            raise APIError(400, f"`{form}` needs a `state` (or `messages`) to decide on.", "state")
+        normalize = body.get("normalize", "mean")
+        if normalize not in ("mean", "sum"):
+            raise APIError(400, "`normalize` must be \"mean\" or \"sum\".", "normalize")
+        # Lo slot si sceglie dallo STATO, non dalla domanda: mille domande
+        # diverse sullo stesso contesto devono cadere sullo stesso slot, o la
+        # fotografia del prefisso condiviso non le serve a niente. E' la stessa
+        # regola di conversation_cache_slot per la chat, con la chiave presa
+        # dalla parte che non cambia.
+        cache_slot = body.get("cache_slot")
+        if cache_slot is None:
+            cache_slot = conversation_cache_slot(
+                [{"role": "system", "content": state or ""}], self.server.kv_slots)
+        if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) \
+                or not 0 <= cache_slot < self.server.kv_slots:
+            raise APIError(400, "Invalid cache slot.", "cache_slot")
+
+        state_prefix = f"Context:\n{state}\n\n" if state else ""
+        started = time.time()
+        read_total = 0
+        prompt_max = 0
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+            queue_wait, cache_slot = admission
+
+            def score(text, pin):
+                """Un giro sul motore: niente generazione, solo la lettura.
+
+                max_tokens=0 vale solo con logprobs>0 e vuol dire "leggi il
+                prompt e fermati". Chiedere un token costerebbe un passo di
+                decodifica completo per opzione, buttato via."""
+                echoes = []
+                accepted = {}
+
+                def on_accept(value):
+                    accepted.update(value)
+
+                self.server.engine.generate(
+                    text, 0, 0.0, 1.0, lambda _chunk: None, cache_slot,
+                    self.client_disconnected, logprobs=1, pin=pin,
+                    on_echo=echoes.append, on_accept=on_accept)
+                n = accepted.get("prompt_tokens")
+                if n is None:                        # motore senza ACCEPT (olmoe)
+                    n = max((e["pos"] for e in echoes), default=-1) + 1
+                return n, echoes
+
+            def choose(prefix, choices, norm):
+                """Fotografa `prefix`, poi un giro per opzione: ognuna paga solo
+                i propri token. Torna (scored, entropia, token del prefisso)."""
+                nonlocal read_total, prompt_max
+                n_prefix, _ = score(prefix, True)
+                prompt_max = max(prompt_max, n_prefix)
+                scored = []
+                for option in choices:
+                    # Il cliente se n'e andato: smettere subito invece di
+                    # macinare le opzioni restanti per nessuno. Con una sola
+                    # slot KV un menu lungo abbandonato la terrebbe occupata
+                    # per minuti, e le richieste dietro andrebbero in coda fino
+                    # al timeout -- e' cosi che sono usciti i primi 429.
+                    if self.client_disconnected():
+                        raise ClientCancelled()
+                    _, tail = score(prefix + " " + option, False)
+                    rows = [e for e in tail if e["pos"] >= n_prefix and e["logprob"] is not None]
+                    total = sum(e["logprob"] for e in rows)
+                    count = max(len(rows), 1)
+                    scored.append({"option": option, "logprob": total, "tokens": len(rows),
+                                   "mean_logprob": total / count})
+                if not any(entry["tokens"] for entry in scored):
+                    raise APIError(502, "The engine returned no log probabilities for the "
+                                        "options.", None, "engine_error", "server_error")
+                key = "mean_logprob" if norm == "mean" else "logprob"
+                top = max(entry[key] for entry in scored)
+                weights = [math.exp(entry[key] - top) for entry in scored]
+                total_weight = sum(weights) or 1.0
+                for entry, weight in zip(scored, weights):
+                    entry["p"] = weight / total_weight
+                scored.sort(key=lambda entry: -entry["p"])
+                entropy = -sum(e["p"] * math.log(max(e["p"], 1e-12)) for e in scored)
+                entropy /= math.log(max(len(scored), 2))
+                read_total += sum(e["tokens"] for e in scored)
+                return scored, round(entropy, 6), n_prefix
+
+            # Lo stato da solo, fotografato per primo: e' il livello che tutte
+            # le domande (o tutte le caselle) condividono. Con un livello solo
+            # la domanda si rilegge una volta per opzione; con due, 176 token
+            # invece di 496 su quattro item (misurato).
+            if state_prefix and form != "options":
+                n_state, _ = score(state_prefix, True)
+                prompt_max = max(prompt_max, n_state)
+
+            if form == "options":
+                prefix = state_prefix
+                if question:
+                    prefix += f"Question: {question}\n"
+                prefix += "Answer:"
+                scored, entropy, _ = choose(prefix, options, normalize)
+                result = {"object": "brio.choice", "answer": scored[0]["option"],
+                          "entropy": entropy, "normalize": normalize, "choices": scored}
+
+            elif form == "questions":
+                answers = []
+                for text, choices, norm in questions:
+                    prefix = state_prefix + f"Question: {text}\nAnswer:"
+                    scored, entropy, _ = choose(prefix, choices, norm)
+                    answers.append({"question": text, "answer": scored[0]["option"],
+                                    "entropy": entropy, "normalize": norm,
+                                    "choices": scored})
+                result = {"object": "brio.answers", "answers": answers}
+
+            else:
+                # Lo scheletro JSON e' DATO: parentesi, virgolette e nomi dei
+                # campi li scriviamo noi, il modello sceglie solo il valore. Ogni
+                # casella si fotografa con dentro le scelte gia fatte, cosi il
+                # campo dopo vede quelli prima, come nella generazione.
+                head = state_prefix + (f"Task: {task}\n" if task else "")
+                filled, fields = {}, []
+                for field, values in schema:
+                    skeleton = "{" + "".join(
+                        f'"{k}": {json.dumps(v)}, ' for k, v in filled.items())
+                    prefix = head + skeleton + f'"{field}": "'
+                    scored, entropy, _ = choose(prefix, values, normalize)
+                    filled[field] = scored[0]["option"]
+                    fields.append({"field": field, "value": scored[0]["option"],
+                                   "p": scored[0]["p"], "entropy": entropy,
+                                   "choices": scored})
+                result = {"object": "brio.schema", "json": filled, "fields": fields,
+                          "normalize": normalize}
+
+        result.update({
+            "id": "brio-" + uuid.uuid4().hex,
+            "created": int(time.time()),
+            "model": self.server.model_id,
+            "usage": {"prompt_tokens": prompt_max, "completion_tokens": 0,
+                      "read_tokens": read_total,
+                      "total_tokens": prompt_max + read_total},
+        })
+        headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000)),
+                   "x-colibri-elapsed-ms": str(round((time.time() - started) * 1000))}
+        if not send:
+            result["_headers"] = headers
+            return result
+        self.send_json(200, result, request_id, headers)
+
+    # ------------------------------------------------------------ Jev-compatible
+    #
+    # POST /v1/systemone speaks the request and the reply of TypeSafe's Jev
+    # API (docs.typesafe.ai/api): a client written for it points at colibri
+    # and changes the base URL, nothing else. The three primitives map onto
+    # the `questions` form of /v1/brio, the same channel: the state is
+    # photographed once and every question pays only its own tokens.
+    #
+    #   noul   -> one yes/no question. `noul` is the probability of yes. The
+    #             optional criteria (what true and false mean) go into the
+    #             question text.
+    #   choice -> the labels of `criteria` are the options; their descriptions
+    #             go into the question text, because a label alone ("billing")
+    #             does not say what it means. `confidence` follows their
+    #             documented formula, (n * peak - 1) / (n - 1).
+    #   score  -> the levels of `criteria` are the options "1".."n"; `score`
+    #             is the expected value under the distribution, `legend` the
+    #             levels by number, `confidence` as for choice.
+    #
+    # What differs, stated rather than hidden: `model` echoes the served
+    # model, not "jev-latest"; `usage.output_tokens` counts the option tokens
+    # READ, since this engine generates nothing; validation errors are 422 as
+    # theirs are, with this server's error envelope. docs/brio.md has the
+    # mapping table.
+    _SYSTEMONE_MAX_QUESTIONS = 64
+
+    @staticmethod
+    def _systemone_text(value, where):
+        """Jev's EntryType: a string, or JSON given as an object or an array."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value.strip() or None
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False, indent=2)
+        raise APIError(422, f"`{where}` must be a string, an object or an array.", where)
+
+    @staticmethod
+    def _systemone_confidence(probabilities):
+        """(n * peak - 1) / (n - 1): 1 when all the mass is on one label, 0 when flat."""
+        values = list(probabilities)
+        n = len(values)
+        if n < 2:
+            return 1.0
+        return round(max(0.0, (n * max(values) - 1.0) / (n - 1)), 6)
+
+    def systemone(self, body, request_id):
+        state = self._systemone_text(body.get("state"), "state")
+        if state is None:
+            raise APIError(422, "`state` is required: the content the questions are about.", "state")
+        raw = body.get("questions")
+        if not isinstance(raw, dict) or not raw:
+            raise APIError(422, "`questions` must be a non-empty object of id: question.", "questions")
+        if len(raw) > self._SYSTEMONE_MAX_QUESTIONS:
+            raise APIError(422, f"`questions` accepts at most {self._SYSTEMONE_MAX_QUESTIONS} entries.",
+                           "questions")
+        plan = []                                   # (id, kind, text, options, levels)
+        for qid, question in raw.items():
+            where = f"questions.{qid}"
+            if not isinstance(qid, str) or not qid.strip():
+                raise APIError(422, "Every question id must be a non-empty string.", "questions")
+            if not isinstance(question, dict):
+                raise APIError(422, f"`{where}` must be an object.", where)
+            kind = question.get("type")
+            instructions = self._systemone_text(question.get("instructions"), f"{where}.instructions")
+            criteria = question.get("criteria")
+            if kind == "noul":
+                if criteria is not None and not isinstance(criteria, dict):
+                    raise APIError(422, f"`{where}.criteria` must be an object with `true` and/or `false`.",
+                                   f"{where}.criteria")
+                yes = self._systemone_text((criteria or {}).get("true"), f"{where}.criteria.true")
+                no = self._systemone_text((criteria or {}).get("false"), f"{where}.criteria.false")
+                text = instructions or "Is this true?"
+                if yes:
+                    text += f"\nyes: {yes}"
+                if no:
+                    text += f"\nno: {no}"
+                plan.append((qid, "noul", text + "\nAnswer yes or no.", ["yes", "no"], None))
+            elif kind == "choice":
+                if not isinstance(criteria, dict) or not criteria:
+                    raise APIError(422, f"`{where}.criteria` must be a non-empty object of label: description.",
+                                   f"{where}.criteria")
+                if len(criteria) > 255:
+                    raise APIError(422, f"`{where}.criteria` accepts at most 255 labels.", f"{where}.criteria")
+                labels, lines = [], []
+                for label, description in criteria.items():
+                    if not isinstance(label, str) or not label.strip():
+                        raise APIError(422, f"Every label of `{where}.criteria` must be a non-empty string.",
+                                       f"{where}.criteria")
+                    labels.append(label)
+                    text = self._systemone_text(description, f"{where}.criteria.{label}")
+                    lines.append(f"- {label}: {text}" if text else f"- {label}")
+                if len(labels) < 2:
+                    raise APIError(422, f"`{where}.criteria` needs at least two labels.", f"{where}.criteria")
+                text = (instructions or "Which of the following applies?") + "\nOptions:\n" + "\n".join(lines)
+                plan.append((qid, "choice", text + "\nAnswer with one of the options.", labels, None))
+            elif kind == "score":
+                if not isinstance(criteria, list) or not 2 <= len(criteria) <= 10:
+                    raise APIError(422, f"`{where}.criteria` must be an array of 2 to 10 level descriptions.",
+                                   f"{where}.criteria")
+                levels = [self._systemone_text(c, f"{where}.criteria[{i}]") or f"level {i + 1}"
+                          for i, c in enumerate(criteria)]
+                text = (instructions or "Rate this on the scale below.") + "\nScale:\n" + \
+                    "\n".join(f"{i + 1}: {d}" for i, d in enumerate(levels))
+                plan.append((qid, "score", text + "\nAnswer with the number.",
+                             [str(i + 1) for i in range(len(levels))], levels))
+            else:
+                raise APIError(422, f"`{where}.type` must be \"noul\", \"choice\" or \"score\".", f"{where}.type")
+        inner = {"state": state, "_max_options": 255,
+                 "questions": [{"question": text, "options": options} for _, _, text, options, _ in plan]}
+        result = self.brio(inner, request_id, send=False)
+        answers = {}
+        for (qid, kind, _, options, levels), got in zip(plan, result["answers"]):
+            p = {c["option"]: c["p"] for c in got["choices"]}
+            if kind == "noul":
+                answers[qid] = {"type": "noul", "noul": round(p.get("yes", 0.0), 6)}
+            elif kind == "choice":
+                answers[qid] = {"type": "choice", "choice": got["answer"],
+                                "probabilities": {o: round(p[o], 6) for o in options},
+                                "confidence": self._systemone_confidence(p.values())}
+            else:
+                answers[qid] = {"type": "score",
+                                "score": round(sum(int(k) * v for k, v in p.items()), 6),
+                                "legend": {str(i + 1): d for i, d in enumerate(levels)},
+                                "probabilities": {o: round(p[o], 6) for o in options},
+                                "confidence": self._systemone_confidence(p.values())}
+        reply = {"model": self.server.model_id, "answers": answers,
+                 "usage": {"input_tokens": result["usage"]["prompt_tokens"],
+                           "output_tokens": result["usage"]["read_tokens"]}}
+        self.send_json(200, reply, request_id, result.get("_headers"))
 
     def _fail(self, error, request_id):
         """Report an error, unless the response is already on the wire. Once a streaming 200
@@ -3891,6 +4756,15 @@ class APIHandler(BaseHTTPRequestHandler):
         if ARCH == "glm53":
             messages, images = expand_glm53_images(
                 messages, getattr(self.server.engine, "model_dir", None))
+            if len(images) > 1:
+                raise APIError(400, "one image per request for now; the engine "
+                                    "holds a single pending image.", "messages")
+            image = images[0] if images else None
+        elif ARCH == "deepseek_v41":
+            ceiling = os.environ.get("V41_MAX_IMAGE_TOKENS")
+            messages, images = expand_dsv41_images(
+                messages, getattr(self.server.engine, "model_dir", None),
+                int(ceiling) if ceiling else None)
             if len(images) > 1:
                 raise APIError(400, "one image per request for now; the engine "
                                     "holds a single pending image.", "messages")

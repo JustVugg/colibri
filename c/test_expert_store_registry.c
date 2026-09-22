@@ -11,13 +11,15 @@
  * we stub it here so this test links without the engine. The stub records that
  * it was called and returns a sentinel so we can observe dispatch.
  *
- *   gcc -O2 test_expert_store_registry.c expert_store_registry.c -o test_expert_store_registry
+ *   gcc -O2 -D_FILE_OFFSET_BITS=64 test_expert_store_registry.c expert_store_registry.c -o test_expert_store_registry
  *   ./test_expert_store_registry
  */
 #include "expert_store_registry.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "compat.h"    /* setenv/unsetenv: MinGW has neither */
 
 static int g_auto_called = 0;
 

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { extractSSE, getHealth, getProfile, serverEndpoint, streamChat } from "./api"
+import { askBrio, extractSSE, getHealth, getProfile, serverEndpoint, streamChat } from "./api"
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -80,5 +80,36 @@ describe("chat request extensions", () => {
 
   it("sends cache_slot zero when colibrì advertises KV slots", async () => {
     expect(await requestBody(0)).toMatchObject({ cache_slot: 0 })
+  })
+})
+
+describe("askBrio", () => {
+  /* The options must travel as a field, never folded into the prompt: keeping
+     them out of the text is half of what the mode saves, and a refactor that
+     "helpfully" appended them would be invisible in the answer. */
+  it("sends the options as data and posts to the brio endpoint", async () => {
+    const seen: { url?: string; body?: unknown } = {}
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      seen.url = url
+      seen.body = JSON.parse(String(init.body))
+      return new Response(JSON.stringify({
+        answer: "b", entropy: 0.5, normalize: "mean",
+        choices: [{ option: "b", p: 0.7, logprob: -1, mean_logprob: -1, tokens: 1 }],
+        usage: { prompt_tokens: 9, completion_tokens: 0, read_tokens: 2, total_tokens: 11 },
+      }), { status: 200, headers: { "Content-Type": "application/json" } })
+    }))
+    const out = await askBrio("http://x/v1", "", "m", "state", "q?", ["a", "b"])
+    expect(seen.url).toBe("http://x/v1/brio")
+    expect(seen.body).toMatchObject({ model: "m", state: "state", question: "q?", options: ["a", "b"] })
+    expect(out.answer).toBe("b")
+    expect(out.usage.completion_tokens).toBe(0)
+  })
+
+  it("surfaces the server's own message instead of a bare status", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({ error: { message: "options must be a non-empty array" } }),
+      { status: 400, headers: { "Content-Type": "application/json" } })))
+    await expect(askBrio("http://x/v1", "", "m", "s", "q", ["a"]))
+      .rejects.toThrow("options must be a non-empty array")
   })
 })

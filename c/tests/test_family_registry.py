@@ -1,5 +1,6 @@
 import json
 import re
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -8,6 +9,7 @@ from unittest import mock
 
 from family_registry import (
     FAMILIES,
+    DisplayVariant,
     FamilyCapabilities,
     FamilyConfigError,
     FamilyDescriptor,
@@ -17,6 +19,7 @@ from family_registry import (
     UnknownFamilyError,
     PlannerUnsupportedError,
     _build_registry,
+    display_for,
     expert_contributions,
     fixed_resident_contribution,
     family_for_config,
@@ -117,6 +120,10 @@ class FamilyRegistryTest(unittest.TestCase):
             with self.subTest(family=family.id):
                 json.dumps(public_metadata(family))
                 self.assertIn(family.id, by_id)
+
+    def test_glm53_exposes_engine_kv_slot_limit(self):
+        by_id, _ = _build_registry(FAMILIES)
+        self.assertEqual(by_id["glm53"].limits.max_kv_slots, 16)
 
     def test_unknown_or_invalid_config_never_falls_back_to_glm(self):
         with self.assertRaises(UnknownFamilyError):
@@ -1022,6 +1029,9 @@ class FamilyRegistryTest(unittest.TestCase):
                       "<|im_end|>\n<|im_start|>user\nhello {world}<|im_end|>\n"
                       "<|im_start|>assistant\n<think>\n",
             "deepseek_v4": "hello {world}",
+            # V4.1 ships its chat encoding as a Python module (encoding/encoding.py),
+            # not a jinja template, so the replay prompt stays the bare text like V4.
+            "deepseek_v41": "hello {world}",
         }
         self.assertEqual(
             {family.id: tuning_replay_prompt(family, prompt) for family in FAMILIES},
@@ -1169,6 +1179,108 @@ class FamilyRegistryTest(unittest.TestCase):
                                 f"({family.id}); a reader in that language cannot "
                                 f"tell the family is supported")
 
+    def test_release_ships_everything_coli_reaches(self):
+        """L'archivio deve contenere ogni file Python che coli raggiunge.
+
+        #1296: il pacchetto v1.10.0 aveva quattro comandi rotti. release.yml
+        copiava sette .py scelti a mano piu' un solo file in tools/, e il
+        codice era andato avanti. Mancavano convert_fp8_to_int4.py,
+        eval_glm.py, fetch_benchmarks.py, mirror_plan.py, e i moduli cluster,
+        glm53_image, qwen38_image.
+
+        Ora la lista la calcola c/tools/pack_python.py. Questo test fissa i
+        due punti ciechi che avevano fatto passare il difetto, perche' sono i
+        due modi in cui un file sfugge a chi guarda a occhio:
+
+        - un import dentro una funzione, dopo un sys.path.insert. E' il caso
+          di qwen38_image in openai_server.py, e l'ImportError li' e'
+          catturato e riscritto come "image support needs Pillow and numpy":
+          nel pacchetto pubblicato mandare un'immagine dava la colpa
+          all'ambiente dell'utente per un file che non avevamo spedito.
+        - un sottoprocesso scritto con lo spazio dopo la virgola,
+          os.path.join(TOOLS, "mirror_plan.py"). La mia prima grep cercava
+          TOOLS," senza spazio e non lo vedeva: quattro invocazioni, non tre.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        sys.path.insert(0, str(repo / "c" / "tools"))
+        try:
+            import pack_python
+        finally:
+            sys.path.pop(0)
+
+        reached = {path.name for path in pack_python.needed(repo / "c")}
+
+        # I sette file che mancavano davvero dall'archivio v1.10.0.
+        for name in ("convert_fp8_to_int4.py", "eval_glm.py",
+                     "fetch_benchmarks.py", "mirror_plan.py",
+                     "cluster.py", "glm53_image.py", "qwen38_image.py"):
+            self.assertIn(name, reached,
+                          f"{name} mancava dall'archivio v1.10.0 e il calcolo "
+                          f"non lo ritrova: #1296 si ripeterebbe")
+
+        release = (repo / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8")
+        self.assertIn("pack_python.py c dist", release,
+                      "release.yml non calcola piu' i file da copiare")
+        self.assertIn("--check", release,
+                      "release.yml non verifica piu' l'archivio estratto")
+
+    def test_the_python_job_builds_every_engine_a_test_skips_without(self):
+        """Un test protetto da skipUnless(ENGINE.exists()) sparisce se il job
+        non compila quel motore, e sparisce in silenzio: la classe si salta,
+        il job resta verde, e nessuno distingue "passato" da "mai eseguito".
+
+        E' successo davvero. Il job Python non compilava nessun motore, quindi
+        sette test fra test_kimi_usage_cli e test_inkling_prefix_serve non
+        giravano da sempre, e uno era rosso da quando il messaggio di kimi_k3
+        e' stato riscritto. E' la stessa forma del job dei sanitizer che
+        rieseguiva un binario senza strumentazione: verde perche' vuoto.
+
+        Il controllo va nella direzione che serve. Non chiede che il job
+        compili una certa lista, che sarebbe un'altra costante da tenere
+        allineata a mano: parte dai test, guarda su quale binario si saltano,
+        e pretende che il job lo costruisca.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        tests_dir = repo / "c" / "tests"
+        guard = re.compile(r'ENGINE\s*=\s*HERE\s*/\s*\(?\s*"([a-z0-9_]+)\.exe"'
+                           r'.*?else\s*"([a-z0-9_]+)"', re.S)
+        needed = {}
+        for path in sorted(tests_dir.glob("test_*.py")):
+            text = path.read_text(encoding="utf-8")
+            if "skipUnless" not in text or "ENGINE.exists()" not in text:
+                continue
+            m = guard.search(text)
+            if m:
+                needed[m.group(2)] = path.name
+        self.assertTrue(needed,
+                        "nessun test guardato da ENGINE.exists() trovato: il "
+                        "controllo non sta piu' guardando niente")
+        ci = (repo / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        # Il corpo del job va da "  python:" fino al job successivo, cioe' la
+        # prossima riga indentata di due spazi esatti. Tagliare al primo "\n  "
+        # non funziona: le righe interne sono indentate di quattro e cominciano
+        # anch'esse per due spazi, quindi il corpo verrebbe vuoto e il test
+        # fallirebbe sempre, per la ragione sbagliata.
+        job = re.search(r"(?m)^  python:\n(.*?)(?=^  \S|\Z)", ci, re.S)
+        self.assertIsNotNone(job, "il job 'python:' non esiste piu' in ci.yml")
+        body = job.group(1)
+        # I bersagli veri di make, non il corpo del job: un commento che nomina
+        # "test_inkling_prefix_serve.py" contiene la parola "inkling" e farebbe
+        # passare il controllo senza che nulla venga compilato. Il controllo
+        # negativo di questo test lo ha dimostrato togliendo inkling dalla
+        # riga di build: passava lo stesso.
+        built = set()
+        for run_line in re.findall(r"(?m)^\s*run:\s*(.+)$", body):
+            m = re.search(r"\bmake\b(?:\s+-C\s+\S+)?\s+(.*)", run_line)
+            if m:
+                built.update(tok for tok in m.group(1).split() if not tok.startswith("-"))
+        for engine, where in sorted(needed.items()):
+            self.assertIn(engine, built,
+                          f"{where} si salta se '{engine}' non e' compilato, e il "
+                          f"job Python della CI non lo compila: quei test non "
+                          f"girano mai e il job resta verde perche' e' vuoto")
+
     def test_every_readme_banner_matches_the_declared_version(self):
         """Il banner dei README deve dire la versione che dichiara version.py.
 
@@ -1203,6 +1315,40 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertGreater(seen, 0,
                            "nessun banner 'colibri vX.Y.Z' trovato in alcun "
                            "README: il test non sta piu' controllando niente")
+
+    def test_the_site_shows_the_version_and_every_family(self):
+        """site/index.html deve dire la versione vera e nominare ogni famiglia.
+
+        Trovato fermo a "Currently shipping v1.7.0" con sei famiglie su otto:
+        quattro release e due modelli indietro. E' la sesta copia del numero di
+        versione e la quinta lista di famiglie, e ne' il contratto dei banner
+        (#1288) ne' quello dei README (#1287) la guardavano. Il sito e' la
+        prima cosa che un visitatore vede e l'ultima che ci si ricorda di
+        aggiornare: esattamente il posto per un contratto.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        site = (repo / "site" / "index.html").read_text(encoding="utf-8")
+        declared = re.search(r'__version__\s*=\s*"([^"]+)"',
+                             (repo / "c" / "version.py").read_text(encoding="utf-8"))
+        shown = re.search(r"Currently shipping <b>v([\d.]+)</b>", site)
+        self.assertIsNotNone(shown,
+                             "site/index.html: la riga 'Currently shipping' non "
+                             "c'e' piu'; il contratto non sta controllando niente")
+        self.assertEqual(shown.group(1), declared.group(1),
+                         f"il sito dice v{shown.group(1)} ma version.py dichiara "
+                         f"{declared.group(1)}: il visitatore legge una versione "
+                         f"vecchia")
+        for family in FAMILIES:
+            parts = []
+            for piece in family.display_name.split("-"):
+                if re.fullmatch(r"A?\d+(\.\d+)?B", piece):
+                    break
+                parts.append(piece)
+            token = "-".join(parts) or family.display_name
+            self.assertTrue(token in site,
+                            f"site/index.html non nomina {family.display_name} "
+                            f"({family.id}): il sito mostra meno famiglie di "
+                            f"quante ne girano")
 
     def test_build_install_ci_and_release_cover_registered_engines(self):
         repo = Path(__file__).resolve().parents[2]
@@ -1258,9 +1404,227 @@ class FamilyRegistryTest(unittest.TestCase):
                 else:
                     self.assertIn("deepseek-v4", ci)
                     self.assertIn("cp c/deepseek_v4", release)
-        for text in (makefile, release, docker):
+        for text in (makefile, docker):
             self.assertIn("family_registry.py", text)
+        # release.yml non nomina piu' i singoli .py: da #1296 la lista la
+        # calcola pack_python.py seguendo gli import a partire da coli. Il
+        # contratto qui e' sempre lo stesso -- family_registry.py deve finire
+        # nell'archivio -- ma va verificato alla fonte nuova, se no si
+        # controlla che esista una riga invece che il file venga spedito.
+        sys.path.insert(0, str(repo / "c" / "tools"))
+        try:
+            import pack_python
+        finally:
+            sys.path.pop(0)
+        shipped = {path.name for path in pack_python.needed(repo / "c")}
+        self.assertIn("family_registry.py", shipped,
+                      "l'archivio non spedirebbe family_registry.py")
 
+
+class GlmFamilyNamesBothModelsTest(unittest.TestCase):
+    """#1365 follow-up: a GLM-5.3 container was announced as "GLM-5.2 744B".
+
+    The engine loaded the right weights; only the banner named a different
+    model. The fix is the name, and the reason the name covers two models
+    rather than choosing between them is worth pinning here, because the
+    obvious "improvement" later is to add detection.
+
+    There is nothing to detect. Z.ai say so on GLM-5.3's own card -- "GLM-5.3
+    uses the same base model as GLM-5.2; every gain comes from post-training"
+    -- and the checkpoints agree: diffing the two real config.json leaves one
+    extra key and the transformers_version that wrote the file. If a release
+    ever ships a genuine discriminator, split the family then, on evidence,
+    and this test is where to record it.
+    """
+
+    #: The two configs, reduced to what the registry reads plus the only two
+    #: keys that actually differ between the real files.
+    BASE = {
+        "model_type": "glm_moe_dsa",
+        "num_hidden_layers": 78,
+        "n_routed_experts": 256,
+        "hidden_size": 6144,
+        "moe_intermediate_size": 2048,
+    }
+
+    def test_both_checkpoints_resolve_to_the_same_family(self):
+        v52 = dict(self.BASE, transformers_version="5.12.0")
+        v53 = dict(self.BASE, transformers_version="5.15.0",
+                   moe_router_dtype="float32")
+        self.assertEqual(family_for_config(v52).id, family_for_config(v53).id)
+        self.assertEqual(family_for_config(v53).engine_artifact, "colibri")
+
+    def test_the_only_differences_are_not_discriminators(self):
+        """Neither key can carry the decision, so neither may be read as if it
+        could. `transformers_version` records the library that wrote the file
+        and changes when anyone re-exports; `moe_router_dtype` is a precision
+        hint that a re-export of GLM-5.2 could equally carry."""
+        source = Path(__file__).resolve().parents[1] / "family_registry.py"
+        text = source.read_text(encoding="utf-8")
+        for key in ("transformers_version", "moe_router_dtype"):
+            self.assertNotIn(f'"{key}"', text,
+                             f"{key} is not a version discriminator; naming a "
+                             f"checkpoint from it would be a guess wearing a "
+                             f"rule's clothes")
+
+    def test_the_name_states_both_models(self):
+        family = family_for_config(dict(self.BASE))
+        for model in ("5.2", "5.3"):
+            self.assertIn(model, family.display_name,
+                          "a user running one of the two must not read the "
+                          "name of the other")
+
+
+
+# Planning keys of Qwen/Qwen3.8-2.4T-A95B, config.json (fetched 2026-09-03).
+# Same model_type as the 35B container, an order of magnitude apart on every
+# size that matters -- the case #1045 is about.
+QWEN38_2P4T_CONFIG = {
+    "model_type": "qwen3_5_moe_text",
+    "num_hidden_layers": 92,
+    "num_experts": 512,
+    "num_experts_per_tok": 10,
+    "hidden_size": 8192,
+    "moe_intermediate_size": 2048,
+    "full_attention_interval": 4,
+    "layer_types": ["full_attention" if i % 4 == 3 else "linear_attention"
+                    for i in range(92)],
+    "num_attention_heads": 64,
+    "num_key_value_heads": 4,
+    "head_dim": 256,
+    "linear_num_key_heads": 16,
+    "linear_key_head_dim": 128,
+    "linear_num_value_heads": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "vocab_size": 248320,
+    "max_position_embeddings": 262144,
+    "mtp_num_hidden_layers": 1,
+}
+
+# The 35B container's flattened text config (what the converter writes).
+QWEN36_35B_CONFIG = {
+    "model_type": "qwen3_5_moe_text",
+    "num_hidden_layers": 40,
+    "num_experts": 256,
+    "num_experts_per_tok": 8,
+    "hidden_size": 2048,
+    "layer_types": ["full_attention" if i % 4 == 3 else "linear_attention"
+                    for i in range(40)],
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "linear_num_key_heads": 16,
+    "linear_key_head_dim": 128,
+    "linear_num_value_heads": 32,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+}
+
+
+class DisplayVariantTest(unittest.TestCase):
+    """One model_type, two checkpoint sizes: the banner must name what is on disk."""
+
+    def _resolve(self, config):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            return resolve_model(root)
+
+    def test_35b_container_keeps_its_name(self):
+        self.assertEqual(display_for(self._resolve(QWEN36_35B_CONFIG)),
+                         ("Qwen3.6-35B-A3B", "35B"))
+
+    def test_2p4t_checkpoint_is_not_announced_as_35b(self):
+        resolved = self._resolve(QWEN38_2P4T_CONFIG)
+        self.assertEqual(resolved.descriptor.id, "qwen36")
+        self.assertEqual(display_for(resolved), ("Qwen3.8-2.4T-A95B", "2.4T"))
+
+    def test_35b_vl_checkpoint_resolves_through_text_config(self):
+        # the HF repo nests the text config; the container flattens it
+        wrapped = {"model_type": "qwen3_5_moe", "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                   "text_config": QWEN36_35B_CONFIG}
+        self.assertEqual(display_for(self._resolve(wrapped)), ("Qwen3.6-35B-A3B", "35B"))
+
+    def test_unrecognised_geometry_names_itself(self):
+        # a tiny fixture, or a third sibling: no borrowed parameter count
+        tiny = dict(QWEN36_35B_CONFIG, num_hidden_layers=8, num_experts=8, hidden_size=64)
+        self.assertEqual(display_for(self._resolve(tiny)), ("qwen3_5_moe_text", ""))
+        # every key must match, one off is not "close enough"
+        off = dict(QWEN38_2P4T_CONFIG, hidden_size=4096)
+        self.assertEqual(display_for(self._resolve(off)), ("qwen3_5_moe_text", ""))
+
+    def test_families_without_variants_are_unchanged(self):
+        for family in FAMILIES:
+            if family.display_variants:
+                continue
+            resolved = self._resolve({"model_type": family.model_types[0]})
+            self.assertEqual(display_for(resolved), (family.display_name, family.display_scale))
+
+    def test_variants_are_public(self):
+        meta = public_metadata(next(f for f in FAMILIES if f.id == "qwen36"))
+        self.assertEqual([v["display_name"] for v in meta["display_variants"]],
+                         ["Qwen3.6-35B-A3B", "Qwen3.8-2.4T-A95B"])
+        self.assertEqual(meta["display_variants"][1]["geometry"],
+                         {"num_hidden_layers": 92, "num_experts": 512, "hidden_size": 8192})
+        for family in FAMILIES:
+            json.dumps(public_metadata(family))
+
+    def test_registry_refuses_malformed_variants(self):
+        good = DisplayVariant((("num_hidden_layers", 8),), "Qwen3.6", "")
+        for bad in (
+            DisplayVariant((), "Qwen3.6", ""),                       # matches everything
+            DisplayVariant((("num_hidden_layers", 0),), "Qwen3.6", ""),
+            DisplayVariant((("num_hidden_layers", True),), "Qwen3.6", ""),
+            DisplayVariant((("", 8),), "Qwen3.6", ""),
+            DisplayVariant((("num_hidden_layers", 8),), "", ""),
+            "not a variant",
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RegistryError):
+                    _build_registry((replace(QWEN36_FIXTURE, display_variants=(good, bad)),))
+        # display_name must be one of the variants' names (README contract)
+        with self.assertRaises(RegistryError):
+            _build_registry((replace(QWEN36_FIXTURE, display_variants=(
+                DisplayVariant((("num_hidden_layers", 8),), "Something-Else", ""),)),))
+        _build_registry((replace(QWEN36_FIXTURE, display_variants=(good,)),))
+
+
+class Qwen38_2p4tGeometryTest(unittest.TestCase):
+    """The registered qwen36 planner on the 2.4T config: every guard holds,
+    and the numbers are the ones quoted in #1045."""
+
+    def _resolve(self, config):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            return resolve_model(root)
+
+    def test_planner_geometry_at_8k_and_256k(self):
+        resolved = self._resolve(QWEN38_2P4T_CONFIG)
+        g8 = planner_geometry(resolved, 8192)
+        # 23 attention layers x 8192 x 4 kv heads x 256 x (K+V) x f32 = 1.44 GiB
+        self.assertEqual(g8.context_state_bytes, 23 * 8192 * 4 * 256 * 2 * 4)
+        self.assertAlmostEqual(g8.context_state_bytes / 2**30, 1.4375, places=4)
+        self.assertEqual(g8.configured_experts, 512)
+        # DeltaNet state is context-free: 0.55 GiB at any length
+        g256 = planner_geometry(resolved, 262144)
+        self.assertEqual(g256.fixed_state_bytes, g8.fixed_state_bytes)
+        self.assertAlmostEqual(g256.context_state_bytes / 2**30, 46.0, places=1)
+        self.assertAlmostEqual(g8.fixed_state_bytes / 2**30, 0.55, places=2)
+
+    def test_context_beyond_the_registered_maximum_is_refused(self):
+        resolved = self._resolve(QWEN38_2P4T_CONFIG)
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 262144 + 1)
+
+    def test_expert_inventory_sees_the_container_layout(self):
+        # the container stores experts one tensor each; the 2.4T layer/expert
+        # indices are within what the descriptor claims
+        resolved = self._resolve(QWEN38_2P4T_CONFIG)
+        self.assertEqual(expert_contributions(
+            resolved, "model.layers.91.mlp.experts.511.merged_weight", 1234),
+            ((91, 511, 1234),))
+        self.assertEqual(expert_contributions(resolved, "mtp.layers.0.mlp.experts.0.x", 1), ())
 
 if __name__ == "__main__":
     unittest.main()

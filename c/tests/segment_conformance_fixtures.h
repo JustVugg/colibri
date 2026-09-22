@@ -29,6 +29,9 @@ typedef enum {
     COLI_SEGMENT_FIXTURE_HYPER_RESIDUAL = UINT32_C(1) << 10,
     COLI_SEGMENT_FIXTURE_SPARSE_ATTN    = UINT32_C(1) << 11,
     COLI_SEGMENT_FIXTURE_PLE            = UINT32_C(1) << 12,
+    /* DeepSeek V4.1: the n-gram memory read from disk, and the ViT tower */
+    COLI_SEGMENT_FIXTURE_ENGRAM         = UINT32_C(1) << 13,
+    COLI_SEGMENT_FIXTURE_VISION_TOWER   = UINT32_C(1) << 14,
 } ColiSegmentFixtureState;
 
 typedef struct {

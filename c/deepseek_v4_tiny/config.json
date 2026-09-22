@@ -3,7 +3,7 @@
     "DeepseekV4ForCausalLM"
   ],
   "model_type": "deepseek_v4",
-  "transformers_version": "5.14.1",
+  "transformers_version": "5.12.1",
   "torch_dtype": "bfloat16",
   "expert_dtype": "fp4",
   "scoring_func": "sqrtsoftplus",

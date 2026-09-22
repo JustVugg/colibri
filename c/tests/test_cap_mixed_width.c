@@ -223,6 +223,39 @@ int main(void){
         CHECK(pin_count_for_budget(&m,mixed,1,3,(double)wide+(double)narrow)==2);
         CHECK(pin_count_for_budget(&m,mixed,3,3,1e9)==0);
     }
+    /* ---- C. the VRAM prefix is priced per row too (#1351) ------------------ */
+    /* pin_load bounded the CUDA prefix by budget/expert_bytes_probe(): on the
+     * shipped GLM-5.2 that is the int8 MTP width for every int4 routed expert,
+     * and the single-GPU auto tier placed 3,604 experts in a 136 GB budget and
+     * stopped at 56%. Same ranked list as B: four routed experts' worth of VRAM
+     * must admit four routed experts, not two. */
+    {
+        PinRec ranked[5]={
+            {FIRST_DENSE,0,500}, {FIRST_DENSE+1,0,400},
+            {FIRST_DENSE+2,0,300}, {FIRST_DENSE+3,0,200},
+            {N_LAYERS,0,100}
+        };
+        double four_narrow=4.0*(double)narrow;
+        int per_row=pin_prefix_for_budget(&m,ranked,5,four_narrow,-1);
+        int widest =(int)(four_narrow/(double)probe);
+        printf("C. VRAM budget %.0f B: per-row prefix %d experts, widest-divisor %d\n",
+            four_narrow,per_row,widest);
+        CHECK(per_row==4);
+        CHECK(widest<per_row);                 /* the 56% stop, at this fixture's scale */
+        CHECK(pin_range_bytes(&m,ranked,0,per_row)<=four_narrow);
+        /* The MTP expert at rank 5 costs its own (wide) width: one more wide
+         * expert's worth of budget admits it, one byte less does not. */
+        CHECK(pin_prefix_for_budget(&m,ranked,5,four_narrow+(double)wide-1.0,-1)==4);
+        CHECK(pin_prefix_for_budget(&m,ranked,5,four_narrow+(double)wide,-1)==5);
+        /* COLI_ANS split: the first raw_n go up raw, the rest at 0.80 of their
+         * width. Two raw experts plus 0.80 of two more is 3.6 narrow; 3.7 keeps
+         * the check off the rounding edge. Without the split, 3.7 holds three. */
+        CHECK(pin_prefix_for_budget(&m,ranked,5,3.7*(double)narrow,2)==4);
+        CHECK(pin_prefix_for_budget(&m,ranked,5,3.7*(double)narrow,-1)==3);
+        /* budget that ends inside the raw prefix: no entropy-coded tail is added */
+        CHECK(pin_prefix_for_budget(&m,ranked,5,1.5*(double)narrow,4)==1);
+        CHECK(pin_prefix_for_budget(&m,ranked,5,0.0,-1)==0);
+    }
 
     /* ---- (1) the divisor is the sum of the REAL widths --------------------- */
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m.L[i].sparse) nsp++;

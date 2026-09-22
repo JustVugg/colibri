@@ -26,14 +26,85 @@
 /* Init after model load. Returns 1 when the tier is active.
  * cap_experts_per_layer must equal n_experts (full RAM residency): the tier
  * stores raw pointers into the expert slots, which must never be evicted. */
+/* expert_is_int4: 1 = pesi int4 impacchettati (fmt=4), 0 = int8 (fmt=1). Il
+ * chiamante lo determina dalla TAGLIA SU DISCO, non da meta.ebits, che su
+ * qualche container mente (cfr. il rilevamento in qwen36.c). */
+/* R4 role split: park the dense-i8 lm_head on its own CUDA device
+ * (COLI_LMHEAD_GPU=<dev>). One GEMV per token, at token end — outside the
+ * per-layer latency chain — so a slower second card can host it without
+ * pacing the expert stream. qt_init places no experts on that device. */
+int  qt_lmhead_init(const int8_t *q, const float *sc, int I, int O);
+int  qt_lmhead_matmul(float *y, const float *x, int I, int O);
+
+/* ---- placement table (R4) ------------------------------------------------
+ * Every movable piece of the forward pass can be pinned to the CPU or to a
+ * specific CUDA device, so configurations can be A/B'd instead of argued
+ * about. One variable, not one per component:
+ *
+ *   COLI_PLACE="experts=0,lmhead=0,dnproj=1,dnout=1,attnproj=cpu"
+ *
+ * Target is `cpu` or a CUDA ordinal. A component may also be split across
+ * cards by layer count, joined with '+' so it cannot be confused with the
+ * component separator:
+ *
+ *   COLI_PLACE="dnproj=0:15+1:15"   first 15 DeltaNet layers on dev 0, rest on 1
+ *
+ * Unnamed components keep their default (CPU; experts keep following
+ * COLI_GPUS). Splitting matters because the DeltaNet projections hang
+ * serially in the layer chain anyway -- a slower card delays only its own
+ * layers, never the whole stream, which is what sank asymmetric EXPERT
+ * placement. `layer` is the model layer index; pass 0 for whole-model
+ * components like lmhead. */
+#define QT_PLACE_CPU (-1)
+int  qt_place_of(const char *component, int layer);
+/* Automatic placement (COLI_PLACE unset or "auto"; "off" disables). The
+ * engine offers each trunk component with its byte size BEFORE qt_init --
+ * "lmhead" once (layer 0), "dnproj" per DeltaNet layer -- and qt_init decides
+ * by bytes saved per token per byte of VRAM, pricing displaced experts by
+ * heat. The decision is what qt_place_of() then returns, and the placed
+ * bytes come out of that device's expert budget. Sizes only; the tensors
+ * follow through qt_lmhead_init / qt_dnproj_init as before. */
+void qt_trunk_offer(const char *component, int layer, size_t bytes);
+/* The automatic placement is a prediction; the engine measures it at startup
+ * (one GEMV both ways, qwen36.c trunk_probe_gpu_wins) and withdraws the whole
+ * trunk when the GPU loses, giving the bytes back to the expert budget. Only
+ * the automatic placement can be withdrawn; a COLI_PLACE list stands. */
+int  qt_place_is_auto(void);
+void qt_trunk_withdraw(const char *why);
+
+/* DeltaNet input projections, qkv ++ z fused into one resident tensor per
+ * layer: one GEMV instead of two, and the engine's qkv/z buffers are laid out
+ * contiguously so the result needs no split copy. */
+int  qt_dnproj_init(int layer, const int8_t *q, const float *sc,
+                    int I, int O, int device);
+int  qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O);
+/* Generic resident dense matrix (int8 per-row, one GEMV per call), addressed
+ * by a handle: the Qwen3.8 trunk uses this for every matrix it places. Offer
+ * the size with qt_trunk_offer(name, layer, bytes) before qt_init, ask
+ * qt_place_of(name, layer) after it, then hand the quantized bytes here.
+ * Returns the handle (>= 0) or -1 (stays on the CPU). */
+int  qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device);
+int  qt_dense_matmul(int handle, float *y, const float *x, int I, int O);
+int  qt_dense_count(void);
+
+/* fp8 streaming mode (Qwen3.8): experts arrive as e4m3 bytes with 128x128
+ * block scales and do NOT all fit in RAM. cap may be smaller than n_experts;
+ * the tier copies what it uploads inside the qt_note call and keeps no
+ * pointer into the engine's slot. e4m3_lut is quant.h's E4M3_LUT, published
+ * to the backend so fmt=8 uploads are accepted. */
+int  qt_init_fp8(int n_layers, int n_experts, int hidden, int inter,
+                 int cap_experts_per_layer, int topk, const float *e4m3_lut);
 int  qt_init(int n_layers, int n_experts, int hidden, int inter,
-             int cap_experts_per_layer, int topk, int expert_gs);
+             int cap_experts_per_layer, int topk, int expert_gs,
+             int expert_is_int4);
 int  qt_ready(void);
 int  qt_is_resident(int layer, int eid);
 void qt_shutdown(void);
 
 /* Call once per routed expert per token (pointers to the RAM slot: packed
- * int4 + per-row scales). Updates heat and may enqueue a background upload. */
+ * int4 or, on an int8 container, the live int8 weights -- tier fmt=1 is
+ * accepted since #1334; see also #1391 for the decode-path offer). Updates
+ * heat and may enqueue a background upload. */
 void qt_note(int layer, int eid,
              const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
              const float *gs, const float *us, const float *ds);
@@ -56,14 +127,27 @@ int  qt_fill_next(int *layer, int *eid);
 void qt_note_block(int layer, int eid,
              const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
              const float *gs, const float *us, const float *ds);
-void qt_fill_wait(void);   /* blocks until the upload queue is drained */
+void qt_fill_wait(void);   /* blocks until every enqueued upload is resident (not merely dequeued) */
 
 /* One telemetry block on stderr: residency, hits/misses, uploads per device. */
 void qt_stats(void);
 
 #else /* !COLI_CUDA: inline stubs, engine stays CPU-only */
 
-static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
+static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g,int h){(void)h;(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
+static inline int  qt_init_fp8(int a,int b,int c,int d,int e,int f,const float*g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
+static inline int  qt_lmhead_init(const int8_t*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
+static inline int  qt_lmhead_matmul(float*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
+#define QT_PLACE_CPU (-1)
+static inline int  qt_place_of(const char*a,int b){(void)a;(void)b;return QT_PLACE_CPU;}
+static inline void qt_trunk_offer(const char*a,int b,size_t c){(void)a;(void)b;(void)c;}
+static inline int  qt_place_is_auto(void){return 0;}
+static inline void qt_trunk_withdraw(const char*a){(void)a;}
+static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
+static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
+static inline int  qt_dense_init(const int8_t*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}
+static inline int  qt_dense_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
+static inline int  qt_dense_count(void){return 0;}
 static inline int  qt_ready(void){return 0;}
 static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_shutdown(void){}

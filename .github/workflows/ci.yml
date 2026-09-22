@@ -6,6 +6,11 @@ on:
   push:
     branches: [dev, main]
 
+# CI only reads the tree; no job here writes to the repo. Pin the token to
+# read-only so a compromised step (or action) cannot push, tag or release.
+permissions:
+  contents: read
+
 jobs:
   # The environment-variable registry (c/coli_env.h) against the sources. No
   # build, no model, no GPU -- seconds, so it reports before anything else.
@@ -67,7 +72,7 @@ jobs:
       - name: Lint both Dockerfiles
         # docker/Dockerfile is not built here (see above) but it is still shipped
         # and followed by users, so it gets checked for syntax at least.
-        uses: hadolint/hadolint-action@v3.1.0
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
         with:
           dockerfile: docker/Dockerfile
           failure-threshold: error
@@ -151,6 +156,37 @@ jobs:
             echo "FAIL: Vulkan initialised but the expert tier did not activate"; exit 1; }
           echo "OK: shaders compiled, device negotiated, expert tier active"
 
+  musl:
+    name: musl libc (Alpine)
+    runs-on: ubuntu-latest
+    container: alpine:3.21
+    steps:
+      # #1430: colibri did not compile against musl, because malloc_trim is a
+      # glibc extension guarded on __linux__ rather than on __GLIBC__. Nothing in
+      # CI compiled against anything but glibc, so the only way to find out was
+      # to be the user. One build leg closes that whole class.
+      - name: Toolchain
+        run: apk add --no-cache build-base linux-headers python3 git bash
+      - uses: actions/checkout@v4
+      - name: Build the engines musl can build
+        run: |
+          cd c
+          # ARCH=x86-64: the runner's -march=native is not the point here, the
+          # libc is. Engines that need glibc-only interfaces would fail loudly
+          # rather than be excluded quietly, which is the report we want.
+          make colibri ARCH=x86-64
+          make olmoe ARCH=x86-64
+      - name: The RAM guard still trims where it can
+        run: |
+          cd c
+          # The fix skips malloc_trim on musl; on glibc it must still be called.
+          # Here we only assert the build has no reference to it, which is the
+          # half this leg can see.
+          if nm colibri | grep -q malloc_trim; then
+            echo "FAIL: malloc_trim linked in a musl build"; exit 1
+          fi
+          echo "ok: no glibc-only symbol in the musl binary"
+
   engines-all-platforms:
     name: All engines (${{ matrix.name }})
     strategy:
@@ -182,7 +218,7 @@ jobs:
       - uses: actions/checkout@v4
       - if: matrix.os == 'windows-latest'
         id: msys2
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: UCRT64
           update: false
@@ -202,7 +238,7 @@ jobs:
         run: |
           cd c
           rc=0
-          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38"
+          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41"
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
           for t in $ENGINES; do
             echo "::group::$t"
@@ -210,6 +246,28 @@ jobs:
             echo "::endgroup::"
           done
           exit $rc
+      - name: "Environment shims: setenv is visible to getenv in-process"
+        run: |
+          cd c
+          # This is the one gate that has to run OFF Linux. compat.h's setenv
+          # used to write only the Win32 block, which getenv never reads, so
+          # the C suite on the Linux job could not see the defect at all.
+          make tests/test_compat_env
+          ./tests/test_compat_env
+      - name: "C tests that drive the engine through the environment"
+        run: |
+          cd c
+          # `make test-c` runs on the Linux leg only, so every test that sets an
+          # environment variable was unobservable on the platform whose shim it
+          # depends on. That is how fourteen of them ended up carrying a private
+          # _putenv_s helper (#1420, #1429). These two are the cheapest pair that
+          # actually exercises the shim through engine code.
+          for t in tests/test_omp_tune tests/test_qwen36_ctx; do
+            echo "::group::$t"
+            make $t
+            ./$t
+            echo "::endgroup::"
+          done
       - if: matrix.os == 'macos-latest'
         name: Build every Metal-capable engine with METAL=1
         # `make <engine>` above builds the CPU path only: everything behind
@@ -322,7 +380,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install CUDA toolkit (compiler only)
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@4bd727d5619dc6fa323b1e76c3aa5dca94f5ec6d # v0.2.19
         with:
           # v0.2.19's version table stops at 12.6.2 — 12.6.3 fails the install
           # step with "Version not available" before nvcc is ever reached.
@@ -400,6 +458,39 @@ jobs:
               ./qwen36 "$cap" 8 qwen36_tiny/ref_full.json
             echo "::endgroup::"
           done
+      - name: Qwen3.8-2.4T geometry, fused experts + mtp head (converter contract + token-exact)
+        run: |
+          cd c
+          # The 2.4T checkpoint declares the same model_type as the 35B and
+          # resolves to this engine (#1045). Its structural numbers at toy
+          # widths: 92 layers / interval 4 / 512 experts top-10 / 16:1 attention
+          # heads / 8:1 DeltaNet heads. The shard is rewritten into the layout
+          # the real checkpoints ship -- fused expert tensors and an mtp.* head
+          # -- so the converter is seen splitting the one and skipping the other
+          # ON PURPOSE (it must say so), not by never selecting them.
+          # --seed 3: the default seed collapses this geometry's reference to a
+          # single repeated token, which a shape error could still reproduce.
+          python3 tools/make_qwen36_tiny.py --geometry qwen38-2p4t --seed 3 \
+                  --out qwen38_2p4t_tiny --ref-mode full \
+                  --emit-ref qwen38_2p4t_tiny/ref_full.json
+          python3 tools/convert_qwen36.py --model qwen38_2p4t_tiny \
+                  --out qwen38_2p4t_tiny_c --ebits 8 | tee convert_2p4t.log
+          grep -q "skipping 19 \`mtp.\*\` tensor" convert_2p4t.log
+          grep -q "tensor kinds: 1587 in 92 layers, 3 globals" convert_2p4t.log
+          # the container must not carry the head it skipped
+          python3 - <<'EOF'
+          import glob
+          from safetensors import safe_open
+          for path in glob.glob("qwen38_2p4t_tiny_c/*.safetensors"):
+              with safe_open(path, "pt") as f:
+                  assert not [k for k in f.keys() if k.startswith("mtp.")], path
+          EOF
+          for cap in 1 2 512; do
+            echo "::group::2.4T geometry cap=$cap"
+            COLI_DENSE_I8=0 SNAP=qwen38_2p4t_tiny_c \
+              ./qwen36 "$cap" 8 qwen38_2p4t_tiny/ref_full.json
+            echo "::endgroup::"
+          done
       - name: Same run under ASan + UBSan
         run: |
           cd c
@@ -419,13 +510,55 @@ jobs:
           # diagnostic.
           make clean >/dev/null 2>&1 || true
           make qwen36 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
-          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
-            COLI_DENSE_I8=0 SNAP=qwen36_tiny_c PILOT=1 WIDE=2 \
-            ./qwen36 1 8 qwen36_tiny/ref_full.json > san.log 2>&1 || true
-          if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then
-            echo "FAIL: sanitizer diagnostic under PILOT"; cat san.log; exit 1
-          fi
-          echo "sanitizers clean:"; grep -E "Matching tokens" san.log || true
+          for fx in qwen36_tiny qwen38_2p4t_tiny; do
+            ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+              COLI_DENSE_I8=0 SNAP=${fx}_c PILOT=1 WIDE=2 \
+              ./qwen36 1 8 $fx/ref_full.json > san.log 2>&1 || true
+            if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then
+              echo "FAIL: sanitizer diagnostic under PILOT ($fx)"; cat san.log; exit 1
+            fi
+            echo "sanitizers clean ($fx):"; grep -E "Matching tokens" san.log || true
+          done
+      - name: KV prefix reuse is token-identical (serve, several turns)
+        run: |
+          cd c
+          # Reusing a previous turn's state must change the timing and nothing
+          # else. A wrong reuse length does not crash: it answers from another
+          # conversation's state and still reads plausibly, so this is the only
+          # gate that would catch it. The sanitizer step above rebuilt the
+          # engine, so rebuild the normal one first.
+          make clean >/dev/null 2>&1 || true
+          make qwen36
+          QWEN36_TINY=qwen36_tiny_c python3 -m unittest -v tests.test_qwen36_prefix_serve
+      - name: Expert kernel A/B on an int4 gs64 fixture (old path vs expert_ffn.h, byte-identical ids)
+        run: |
+          cd c
+          make clean >/dev/null 2>&1 || true
+          make qwen36
+          # The int8 gate above never enters the shared kernel (it needs an int4
+          # gs=64 container with widths that are multiples of 64: the default
+          # tiny has inter=32). This fixture does. The reference is the same
+          # torch model, but what this step asserts is not oracle agreement
+          # (int4 experts drift from f32 by design): it is that the kernel and
+          # the unpack-to-int8 path it replaces emit the SAME ids at every cap,
+          # including cap=1 (one expert resident: the per-pair cut) and cap=16
+          # (the whole prompt in one run).
+          python3 tools/make_qwen36_tiny.py --out qwen36_tiny64 --ref-mode full --inter 64 \
+                  --emit-ref qwen36_tiny64/ref_full.json
+          python3 tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_c --ebits 4 --gs 64
+          for cap in 1 2 8 16; do
+            for k in 0 1; do
+              QWEN_EXPERT_KERNEL=$k COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c \
+                ./qwen36 "$cap" 4 qwen36_tiny64/ref_full.json > ab_${cap}_$k.log 2>&1 || true
+              grep -E "^C engine" ab_${cap}_$k.log > ids_${cap}_$k.txt
+            done
+            grep -q "expert kernel: planar int4" ab_${cap}_1.log || { echo "FAIL: kernel did not engage at cap=$cap"; cat ab_${cap}_1.log; exit 1; }
+            grep -q "expert kernel: planar int4" ab_${cap}_0.log && { echo "FAIL: QWEN_EXPERT_KERNEL=0 still engaged the kernel"; exit 1; }
+            test -s ids_${cap}_1.txt || { echo "FAIL: no ids at cap=$cap"; cat ab_${cap}_1.log; exit 1; }
+            cmp ids_${cap}_0.txt ids_${cap}_1.txt || { echo "FAIL: ids differ at cap=$cap"; cat ids_${cap}_0.txt ids_${cap}_1.txt; exit 1; }
+            echo "cap=$cap: identical ($(cat ids_${cap}_1.txt))"
+          done
+          make tests/test_expert_ffn && ./tests/test_expert_ffn
       - name: A malformed container is refused, not read
         run: |
           cd c
@@ -452,6 +585,224 @@ jobs:
           grep -q "config.json says 4 layers" bad.log || {
             echo "FAIL: refused, but not for the reason under test"; cat bad.log; exit 1; }
           echo "refused as expected:"; grep '^\[cfg\]' bad.log
+      - name: Brain and Profile reach the dashboard
+        run: |
+          cd c
+          # The oracle fixture has no tokenizer (weights only); `coli serve`
+          # needs one to encode the prompt. The byte tokenizer is test data
+          # sized to the fixture's vocab, the same as the GLM-5.3 gate uses.
+          python3 tools/make_edge_tiny_tokenizer.py --vocab-size 320 qwen36_tiny_c
+          make qwen36 >/dev/null
+          COLI_QWEN36_FIXTURE=qwen36_tiny_c python3 -m unittest -v tests.test_qwen36_dashboard
+      - name: "The expert format probe reads int8 as int8 and int4 as int4 (#1331)"
+        run: |
+          cd c
+          # #1331 was the CUDA tier receiving fmt=4 for an int8 container: budget
+          # reserved, zero promotions. The probe is decided from the on-disk
+          # size of the first expert and printed once; pin it on both formats
+          # without a GPU. The int4 run is not held to token-exactness here.
+          SNAP=qwen36_tiny_c ./qwen36 1 8 qwen36_tiny/ref_full.json 2> probe8.log >/dev/null || true
+          grep -q 'expert format on disk: int8' probe8.log || { echo "FAIL: int8 container probed as"; grep 'expert format' probe8.log; exit 1; }
+          python3 tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c4 --ebits 4 >/dev/null
+          SNAP=qwen36_tiny_c4 ./qwen36 1 4 qwen36_tiny/ref_full.json 2> probe4.log >/dev/null || true
+          grep -q 'expert format on disk: int4' probe4.log || { echo "FAIL: int4 container probed as"; grep 'expert format' probe4.log; exit 1; }
+          echo "probe: int8 -> fmt=1, int4 -> fmt=4"
+
+  olmoe-tiny-check:
+    name: OLMoE tiny oracle (token-exact + dashboard HITS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + transformers
+        run: pip install -r c/tools/oracle-requirements.txt
+      - name: Tiny OLMoE checkpoint, converted
+        run: |
+          cd c
+          # 4 layers x 8 experts at toy dimensions, greedy reference from the
+          # HF model in ref_olmoe.json. The converter is the real one.
+          python3 tools/make_olmoe_tiny.py --output olmoe_tiny
+          python3 tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
+          # weights only: serve mode needs a tokenizer to encode the prompt
+          python3 tools/make_edge_tiny_tokenizer.py --vocab-size 128 olmoe_tiny_c
+      - name: Token-exact against the reference
+        run: |
+          cd c
+          make olmoe
+          SNAP=olmoe_tiny_c ./olmoe 8 8 olmoe_tiny/ref_olmoe.json | tee oracle.log
+          # the engine prints the score and exits 0 either way: the gate is here
+          grep -qE 'Matching tokens: ([0-9]+)/\1$' oracle.log
+      - name: "Cache cap: the sentinel takes the budget, an explicit cap is left alone"
+        run: |
+          cd c
+          # The cap used to be a constant 8 slots per layer whenever nobody
+          # chose one (#1443). It is now derived from the RAM budget, and the
+          # derivation needs a real container to size: this is the job that has
+          # one.
+          COLI_OLMOE_FIXTURE=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_cap_budget
+      - name: "Brain tab: HITS after every turn, on the grid EMAP declared"
+        run: |
+          cd c
+          OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_dashboard_hits
+      - name: "Over-long prompt: CONTEXT_EXCEEDED, so the gateway answers 400"
+        run: |
+          cd c
+          COLI_OLMOE_FIXTURE=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_context_exceeded
+      - name: KV prefix reuse is token-identical (serve, several turns)
+        run: |
+          cd c
+          # Same contract as the Qwen3.6 job runs, from the same harness: a
+          # reused prefix must produce exactly what a cold engine produces for
+          # the same prompt. Wrong reuse is silent, so the gate is the only
+          # thing between it and a user.
+          OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_prefix_serve
+
+  dsv41-tiny-check:
+    name: DeepSeek V4.1 tiny oracle (engram + DSA + fp4 experts + vision)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + sympy + Pillow
+        run: |
+          pip install -r c/tools/oracle-requirements.txt
+          pip install sympy pillow
+      - name: Tiny V4.1-shaped container and its reference
+        run: |
+          cd c
+          # The same tensor names, dtypes and block-scale conventions as the released
+          # checkpoint at toy dimensions, so the engine reads the real format: fp8 dense
+          # with 32x32 ue8m0 tiles, fp4 experts with per-32 group scales, an fp8 engram
+          # table read row by row, and a vision tower.
+          python3 tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json
+      - name: Token-exact against the reference, at several cache capacities
+        run: |
+          cd c
+          make deepseek_v41
+          # cap=1 evicts on every routed expert, which is where slot bookkeeping breaks;
+          # cap=8 never would. The engine exits non-zero on any token mismatch, and on a
+          # vision tower that drifts from its reference rows.
+          for cap in 1 2 8; do
+            echo "::group::cap=$cap"
+            SNAP=dsv41_tiny ./deepseek_v41 "$cap" dsv41_tiny/ref.json
+            echo "::endgroup::"
+          done
+      - name: "Multi-SSD mirror and O_DIRECT change nothing about the answer"
+        run: |
+          cd c
+          # A replica answers the same bytes: the same container in a second directory
+          # must produce the same token stream, on the primary and through the mirror,
+          # with the O_DIRECT window and with the buffered path it replaces. Routing an
+          # expert to a drive is an I/O decision and must not be visible downstream.
+          mkdir -p dsv41_mirror
+          cp dsv41_tiny/model.safetensors dsv41_mirror/
+          SNAP=dsv41_tiny ./deepseek_v41 8 dsv41_tiny/ref.json > primary.txt 2>/dev/null
+          SNAP=dsv41_tiny COLI_MODEL_MIRROR=dsv41_mirror ./deepseek_v41 8 dsv41_tiny/ref.json > mirror.txt 2>/dev/null
+          SNAP=dsv41_tiny COLI_MODEL_MIRROR=dsv41_mirror V41_DIRECT=0 ./deepseek_v41 8 dsv41_tiny/ref.json > buffered.txt 2>/dev/null
+          cmp primary.txt mirror.txt
+          cmp primary.txt buffered.txt
+          # COLI_MODEL_DIRS splits the container as DISTINCT shards -- no second copy,
+          # which is the only multi-drive layout most people can build out of a 510 GB
+          # checkpoint. The shards move; the answer must not.
+          mkdir -p dsv41_split_meta dsv41_split_shard
+          cp dsv41_tiny/config.json dsv41_tiny/tokenizer.json dsv41_tiny/dsv41_engram.json dsv41_split_meta/
+          cp dsv41_tiny/model.safetensors dsv41_split_shard/
+          SNAP=dsv41_split_meta COLI_MODEL_DIRS=dsv41_split_shard ./deepseek_v41 8 dsv41_tiny/ref.json > split.txt 2>split.err
+          cmp primary.txt split.txt
+          grep -q "\[SPLIT\] model across 2 dir(s)" split.err
+          # A copy that is not byte-identical is not a replica: it is refused, and the
+          # run stays on the primary rather than reading someone else's offsets.
+          mkdir -p dsv41_divergent
+          python3 - <<'PY'
+          import pathlib
+          src = pathlib.Path("dsv41_tiny/model.safetensors")
+          data = bytearray(src.read_bytes())
+          data[8] ^= 0x01        # inside the safetensors header
+          pathlib.Path("dsv41_divergent/model.safetensors").write_bytes(bytes(data))
+          PY
+          SNAP=dsv41_tiny COLI_MODEL_MIRROR=dsv41_divergent ./deepseek_v41 8 dsv41_tiny/ref.json > divergent.txt 2>divergent.err
+          cmp primary.txt divergent.txt
+          grep -q "header differs from the primary copy" divergent.err
+      - name: KV prefix reuse (opt-in here) and the resumed-prefill exactness
+        run: |
+          cd c
+          # Two gates in one file. The first is exactness and is ours: a prefill
+          # that resumes mid-sequence must compute what a cold prefill computes,
+          # which is what the index-key schedule fix is for. The second is the
+          # shared contract, minus the one scenario this engine cannot satisfy --
+          # a prefix holding generated positions, which attend differently from
+          # prefilled ones by the vendor's own design. The override says so.
+          DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefix_serve
+      - name: "A prompt longer than one block, so the block boundary is crossed"
+        run: |
+          cd c
+          # Attention projects a block of positions at a time and the MoE routes one,
+          # both capped at 32. The default fixture's prompt is eight tokens and never
+          # reaches that cap, so a forty-token one is built as well: it crosses the
+          # boundary in both, and has to stay token-exact anyway.
+          python3 tools/make_dsv41_tiny.py --out dsv41_long --emit-ref dsv41_long/ref.json \
+            --prompt-len 40 --max-new 6
+          for cap in 2 8; do
+            echo "::group::long prompt, cap=$cap"
+            SNAP=dsv41_long ./deepseek_v41 "$cap" dsv41_long/ref.json
+            echo "::endgroup::"
+          done
+      - name: The published index cache is the vendor's, not the tidy one
+        run: |
+          cd c
+          # model.py republishes shared_attn.index_k only when a layer completes a
+          # compression group, so a decode step with an incomplete group scores against
+          # whichever cache was published last. That is the released behaviour and every
+          # number for this model was produced with it; V41_INDEX_OWNER=1 is the reading
+          # the architecture implies, and it is a DIFFERENT model. Assert they differ, so
+          # nobody "fixes" the default by accident.
+          if SNAP=dsv41_tiny V41_INDEX_OWNER=1 ./deepseek_v41 8 dsv41_tiny/ref.json > /dev/null 2>&1; then
+            echo "FAIL: V41_INDEX_OWNER=1 reproduced the vendor's tokens; one of the two"
+            echo "      paths is not doing what its comment says"
+            exit 1
+          fi
+          echo "the two index-key policies differ, as documented"
+      - name: "DSpark: a verified draft is the token sequential decode would have given"
+        run: |
+          cd c
+          # The fixture's draft head is random, so nothing it proposes would ever be
+          # accepted and the verification path would never run. V41_SPEC_FORCE drafts
+          # the reference's own tokens instead: 1 accepts the whole block, 2 corrupts
+          # the last draft so a round is rejected part way and the rollback runs, 3
+          # keeps the head's drafts, which is what serving does. All three have to
+          # reproduce the reference token for token, at any cache capacity.
+          for force in 1 2 3; do
+            for cap in 1 8; do
+              echo "::group::V41_SPEC_FORCE=$force cap=$cap"
+              SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 "$cap" dsv41_tiny/ref.json
+              echo "::endgroup::"
+            done
+          done
+          # and with only part of the block verified, which is a different rollback
+          SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=2 V41_DSPARK_MAX=1 ./deepseek_v41 8 dsv41_tiny/ref.json
+      - name: "Brain tab: EMAP after READY and STAT, HITS after every turn"
+        run: |
+          cd c
+          COLI_DSV41_FIXTURE=dsv41_tiny python3 -m unittest -v tests.test_dsv41_dashboard
+      - name: "Serving: an image changes the answer, a draft does not"
+        run: |
+          cd c
+          COLI_DSV41_FIXTURE=dsv41_tiny python3 -m unittest -v \
+            tests.test_dsv41_image_serve tests.test_dsv41_dspark_serve
+      - name: "Tool calling: the checkpoint's own encoding cases, byte for byte"
+        run: |
+          cd c
+          # no engine and no fixture here: the mock speaks the SERVE protocol, and the
+          # vendor's encoding cases are checked into tests/fixtures
+          python3 -m unittest -v tests.test_openai_tools_v41_e2e
 
   qwen38-tiny-check:
     name: Qwen3.8 tiny oracle (GDN + QSA + PLE + MoE)
@@ -467,6 +818,8 @@ jobs:
         run: pip install -r c/tools/requirements-qwen38-tiny.txt
       - name: Generate the upstream text fixture and run the token-and-logit oracle
         run: make -C c qwen38-tiny-check
+      - name: Routed experts as the release ships them (FP8 shards), then the engine on the fake CUDA tier
+        run: make -C c qwen38-tiny-fp8-check qwen38-tier-engine-check
       - name: Repeat the eviction path under ASan and UBSan
         run: |
           cd c
@@ -496,6 +849,15 @@ jobs:
             exit 1
           fi
           grep -qE "elements, expected|gated residual dimensions" qwen38-bad.log
+      - name: "Brain tab: EMAP after READY and STAT, HITS after every turn"
+        run: |
+          cd c
+          # the oracle fixture has no tokenizer; serve mode needs one
+          python3 tools/make_edge_tiny_tokenizer.py --vocab-size "$(python3 -c 'import json;print(json.load(open("qwen38_tiny/config.json"))["vocab_size"])')" qwen38_tiny
+          make qwen38 >/dev/null
+          QWEN38_TINY=qwen38_tiny python3 -m unittest -v tests.test_qwen38_dashboard tests.test_qwen38_brio
+          python3 tools/make_edge_tiny_tokenizer.py --vocab-size 64 qwen38_tiny_fp8
+          QWEN38_TINY=qwen38_tiny_fp8 python3 -m unittest -v tests.test_qwen38_brio
 
   inkling-oracle:
     name: Inkling oracle (token-exact vs transformers)
@@ -534,6 +896,10 @@ jobs:
           # the only gate that would catch it. Needs the fixture above, which is
           # why it runs here and not in `make check`.
           INKLING_TINY=tiny_inkling python3 -m unittest -v tests.test_inkling_prefix_serve
+      - name: "Brain tab: HITS after every turn, on the grid EMAP declared"
+        run: |
+          cd c
+          INKLING_TINY=tiny_inkling python3 -m unittest -v tests.test_inkling_dashboard_hits
 
   # The efficiency suite against the tiny GLM oracle. These 8 tests existed but
   # had never run anywhere: they looked for c/glm.exe, a name that stopped
@@ -590,6 +956,25 @@ jobs:
             tests.test_inefficiency.TinyEfficiencyTest.test_profile_phases_present_and_nonneg \
             tests.test_inefficiency.TinyEfficiencyTest.test_disk_wait_not_dominant \
             tests.test_inefficiency.TinyEfficiencyTest.test_cpu_vs_cpu_determinism
+      - name: Generate the quantized trunk fixture for #826
+        # TRUNK_RESIDENT_LAYERS views only tensors that carry an on-disk int4
+        # companion (`name.qs`), so the bf16 glm_tiny above cannot exercise the
+        # view path -- every dense tensor would fall back to resident and
+        # `resident dense` would never drop. Convert the oracle to int4 so the
+        # knob has something to stream. Run AFTER the bf16 assertions: --fp8
+        # rewrites glm_tiny in place.
+        run: |
+          cd c
+          python3 tools/make_glm_oracle.py --fp8
+          python3 tools/convert_fp8_to_int4.py --indir glm_tiny --outdir glm_tiny_i4 --ebits 4 --io-bits 4
+          # The converter copies config.json but not ref_glm.json; the engine
+          # needs the ref to enter validation mode.
+          cp ref_glm.json glm_tiny_i4/ref_glm.json
+      - name: TRUNK_RESIDENT_LAYERS opt-in contract (#826)
+        # Identical tokens + lower `resident dense`: the knob trades RAM for page
+        # faults, never answers. Keeps the next loader refactor from silently
+        # breaking -- or silently no-op'ing -- the view path.
+        run: cd c && python3 -m unittest -v tests.test_trunk_resident_layers
 
   # The token-exact parity gate from #7 (c/tests/test_cluster_sharding.py): the
   # engine's local CPU run must already reproduce the transformers oracle
@@ -691,22 +1076,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: MSVC environment (puts cl.exe on PATH for nvcc -ccbin)
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
       - name: Install CUDA toolkit (compiler only)
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         with:
-          # Same pin as engine-cuda-syntax: v0.2.19's version table stops at
-          # 12.6.2. This installs to the default "C:\Program Files\NVIDIA GPU
-          # Computing Toolkit\..." path, so CUDA_HOME is space-bearing here —
-          # which is exactly the #314 regression this job would have caught.
-          cuda: '12.6.2'
+          # 12.8 is the floor for sm_120 (RTX 50-series), which the portable
+          # DLL below carries; the 12.x runtime keeps the driver floor where
+          # users already are (#1405). v0.2.19 stopped at 12.6.2, hence the
+          # action bump. This installs to the default "C:\Program Files\NVIDIA
+          # GPU Computing Toolkit\..." path, so CUDA_HOME is space-bearing here
+          # -- which is exactly the #314 regression this job would have caught.
+          cuda: '12.8.1'
           method: network
           # cudart as well as nvcc: unlike the Linux job (which only needs to
           # *compile* backend_cuda.cu), cuda-dll links it, and on Windows the
           # runtime headers/import lib ship as a separate installer component —
           # with '["nvcc"]' alone this fails at `#include <cuda_runtime.h>`.
           sub-packages: '["nvcc", "cudart"]'
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: UCRT64
           update: false
@@ -744,12 +1131,16 @@ jobs:
         shell: msys2 {0}
         run: |
           cd c
-          # CUDA_ARCH is pinned: the default is `native`, which asks the driver
-          # what card is present — there is none here, so it must be explicit.
-          # sm_80 matches engine-cuda-syntax and is supported by the 12.6 pin.
-          make cuda-dll CUDA_ARCH=sm_80
+          # CUDA_ARCH is explicit: the default is `native`, which asks the driver
+          # what card is present, and there is none here. `portable` is the DLL
+          # a Windows user can download and run: SASS for sm_80/86/89/90/120
+          # plus PTX, one file for the 30xx, 40xx and 50xx cards (#1405). The
+          # runner cannot execute it; the artifact below is for the people who
+          # can, until the release ships it.
+          make cuda-dll CUDA_ARCH=portable
           test -f coli_cuda.dll || { echo "cuda-dll reported success but produced no DLL" >&2; exit 1; }
-          echo "coli_cuda.dll built (MSVC host)"
+          ls -l coli_cuda.dll
+          echo "coli_cuda.dll built (MSVC host, portable gencode)"
       - name: make colibri CUDA_DLL=1 (host links backend_loader, not cudart)
         shell: msys2 {0}
         run: |
@@ -757,6 +1148,37 @@ jobs:
           make colibri CUDA_DLL=1
           test -f colibri.exe || { echo "colibri CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "colibri.exe built against the DLL loader"
+          # qwen36.exe, not qwen36: only colibri has a phony alias; the bare
+          # name falls into make's builtin rule and links qwen36.c alone.
+          make qwen36.exe CUDA_DLL=1
+          test -f qwen36.exe || { echo "qwen36 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "qwen36.exe built against the DLL loader"
+          # kimi_k3 links the same loader: three engines share coli_cuda.dll.
+          # deepseek_v4 has its own DLL (coli_cuda_dsv4.dll, Makefile.deepseek-v4)
+          # and joins in a later step; inkling's CUDA object has no Windows loader.
+          make kimi_k3.exe CUDA_DLL=1
+          test -f kimi_k3.exe || { echo "kimi_k3 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "kimi_k3.exe built against the DLL loader"
+      - name: Collect the runtime the DLL links (cudart64_12.dll)
+        shell: bash
+        run: |
+          # coli_cuda.dll links cudart dynamically; without the toolkit on the
+          # user's machine the loader reports "module or one of its dependencies
+          # was not found". Ship the runtime next to it, from this same toolkit.
+          ls "$CUDA_PATH/bin"/cudart64_*.dll
+          cp "$CUDA_PATH/bin"/cudart64_*.dll c/
+      - name: Publish the portable DLL for people with a card (#1405)
+        uses: actions/upload-artifact@v4
+        with:
+          name: coli_cuda-windows-portable
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            c/coli_cuda.dll
+            c/cudart64_*.dll
+            c/colibri.exe
+            c/qwen36.exe
+            c/kimi_k3.exe
 
   web:
     name: Web UI
@@ -785,8 +1207,40 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      # Sette test in tests/test_kimi_usage_cli.py e tests/test_inkling_prefix_serve.py
+      # sono protetti da skipUnless(ENGINE.exists()). Questo job non compilava
+      # nessun motore, quindi si saltavano tutti e sette e il job restava verde
+      # perche' era vuoto -- la stessa forma del job dei sanitizer che
+      # rieseguiva un binario non strumentato. Uno di quei test era rosso da
+      # settimane senza che nessuno potesse vederlo.
+      - name: Build the engines those tests exercise
+        run: make -C c kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
+
+  gguf:
+    name: GGUF reader + converter tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-gguf.txt
+      # This job is what makes the numerical GGUF evidence real: without these
+      # deps those tests skip at import, so the generic `python` job alone only
+      # exercises test_gguf_reader.py (pure stdlib).
+      - name: Install GGUF test dependencies
+        run: pip install -r c/tools/requirements-gguf.txt
+      - name: GGUF reader, dequant, profile and converter tests
+        run: |
+          cd c
+          python3 -m unittest -v \
+            tests.test_gguf_reader \
+            tests.test_gguf_dequant \
+            tests.test_gguf_olmoe_profile \
+            tests.test_convert_gguf_to_olmoe
 
   windows-python-focused:
     name: Python tests (Windows focused)

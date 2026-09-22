@@ -32,11 +32,99 @@ SAFETENSORS_DTYPES = {
     "F8_E8M0": 1,
     "F8_E8M0FNU": 1,
 }
-REQUIRED_CORE_TENSORS = (
-    "model.embed_tokens.weight",
-    "model.norm.weight",
-    "lm_head.weight",
+def _core_component(name, spellings):
+    """Does the component immediately before `.weight` name this role?
+
+    Not `endswith`: `"pos_embed.weight".endswith("embed.weight")` is True, and
+    so is the vision tower's `patch_embed.weight`. Either would stand in for a
+    token embedding that is not there, which is this bug with the sign flipped
+    -- a checkpoint genuinely missing its embedding would pass. The component
+    has to BE the role, so the match is on the name between the last two dots.
+
+    `.layers.` is excluded for the reason _is_final_norm excludes it: a head or
+    an embedding inside the layer stack is the block's, not the model's.
+    """
+    parts = name.split(".")
+    return (len(parts) >= 2 and parts[-1] == "weight"
+            and parts[-2] in spellings and ".layers." not in name)
+
+
+def _is_embedding(name):
+    return _core_component(name, {"embed_tokens", "embed"})
+
+
+def _is_final_norm(name):
+    # Every block has norms too. The final one is the norm that sits OUTSIDE
+    # the layer stack, which _core_component's `.layers.` exclusion covers, and
+    # the component test covers the rest: GLM-5.3-Flash's vision tower has
+    # `model.visual.post_layernorm.weight`, whose component is
+    # `post_layernorm`, not `norm`, so it cannot stand in for a final norm that
+    # is not there.
+    #
+    # The component form also accepts a bare `norm.weight` at the root, which
+    # the old `.norm.weight` tail required a prefix for. A container that names
+    # its roles flat, which is exactly what DeepSeek V4 does with `embed.weight`
+    # and `head.weight`, would otherwise fail this third role for the same
+    # reason it failed the other two.
+    return _core_component(name, {"norm"})
+
+
+def _is_output_head(name):
+    # `hc_head_base`, `hc_head_fn` and `hc_head_scale` sit next to the real head
+    # in a DeepSeek V4 container and must not stand in for it. They fall out
+    # here without an exclusion of their own: none of them ends in `.weight`.
+    return _core_component(name, {"lm_head", "head"})
+
+
+#: What a checkpoint must contain to be a language model at all, stated as
+#: ROLES rather than names.
+#:
+#: #1365: the previous form was three literal names taken from GLM-5.2, and it
+#: reported "2 required core tensor(s) are missing" for every GLM-5.3-Flash
+#: download, converted or pre-converted. Nothing was missing. Flash's root is
+#: the vision wrapper, so the language model is nested and the tensors are
+#: `model.language_model.embed_tokens.weight` and
+#: `model.language_model.norm.weight`. Two of three names did not match, and
+#: the doctor called a healthy model broken.
+#:
+#: #1593: the same defect again, one family later. That fix made the predicates
+#: prefix-agnostic but not NAME-agnostic, and DeepSeek V4 spells the roles
+#: `embed.weight` and `head.weight` (deepseek_v4.c looks up exactly those, at
+#: four call sites). Both roles were reported missing for a container the engine
+#: loads and generates from, while `model.index`, scanning the same tensors,
+#: was green. `_is_final_norm` survived only because `.norm.weight` is a
+#: spelling V4 happens to share.
+#:
+#: Matching on the tail rather than the whole name is what makes this hold for
+#: families nobody has written yet: it is prefix-agnostic, which is exactly
+#: what the engines already are. `qwen38.c` probes
+#: `model.language_model.embed_tokens.weight` and falls back to
+#: `model.embed_tokens.weight`; every engine discovers its prefix at load time.
+#: The doctor was the one place that assumed the prefix was a constant.
+CORE_TENSOR_ROLES = (
+    ("token embedding", _is_embedding),
+    ("final norm", _is_final_norm),
+    ("output head", _is_output_head),
 )
+
+
+def missing_core_roles(tensor_names, config=None):
+    """Which core roles no tensor fills. Empty means the model is complete.
+
+    `tie_word_embeddings` makes the output head legitimately absent: the
+    embedding matrix is reused as the head, and there is no `lm_head.weight`
+    to find. Requiring one anyway would trade this bug for the same bug on a
+    different checkpoint.
+    """
+    tied = bool((config or {}).get("tie_word_embeddings"))
+    missing = []
+    for role, matches in CORE_TENSOR_ROLES:
+        if any(matches(name) for name in tensor_names):
+            continue
+        if role == "output head" and tied:
+            continue
+        missing.append(role)
+    return missing
 
 
 def _check(identifier, status, summary, **details):
@@ -281,16 +369,28 @@ def deep_container_report(model, mirror_dir=None):
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             index = {"status": "fail", "summary": f"model index is invalid: {error}"}
 
-    missing_core = [name for name in REQUIRED_CORE_TENSORS if name not in tensor_sources]
+    # Read here rather than take it as an argument: the signature is used by
+    # callers and tests, and the only thing needed is one optional flag.
+    core_config = {}
+    try:
+        with (model / "config.json").open("rb") as stream:
+            loaded = json.loads(stream.read(MODEL_INDEX_MAX_BYTES))
+        if isinstance(loaded, dict):
+            core_config = loaded
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        pass                      # no config is already its own failed check
+    missing_core = missing_core_roles(tensor_sources, core_config)
     required = {
         "status": "fail" if missing_core else "pass",
         "summary": (
-            f"{len(missing_core)} required core tensor(s) are missing"
+            # Name the roles, not a count. "2 required core tensor(s) are
+            # missing" sent someone to re-download 195 GB twice before asking.
+            "no tensor fills these core roles: " + ", ".join(missing_core)
             if missing_core else "required core tensors are present"
         ),
         "details": {
-            "required_tensors": len(REQUIRED_CORE_TENSORS),
-            "missing_tensors": missing_core,
+            "required_roles": [role for role, _ in CORE_TENSOR_ROLES],
+            "missing_roles": missing_core,
         },
     }
 
@@ -540,9 +640,17 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
     try:
         if resolved is None:
             raise ValueError("placement requires a registered model family")
-        plan = build_plan(model, ram_gb, context, gpu_indices, vram_gb,
+        # The placement report describes this installed engine, not merely the
+        # hardware visible on the host. A CPU-only binary cannot spend VRAM;
+        # passing discovered GPUs through here made doctor contradict its own
+        # accelerator check and emit CUDA-only tuning advice. Keep inventory
+        # details in accelerator.gpu above, but build an executable plan below.
+        plan_gpus = detected_gpus if linkage.get("linked") else []
+        plan_gpu_indices = gpu_indices if linkage.get("linked") else []
+        plan_vram_gb = vram_gb if linkage.get("linked") else 0
+        plan = build_plan(model, ram_gb, context, plan_gpu_indices, plan_vram_gb,
                           available_memory=available_memory, available_disk=available_disk,
-                          gpus=detected_gpus, kv_slots=kv_slots)
+                          gpus=plan_gpus, kv_slots=kv_slots)
         model_info = plan["model"]
         checks.append(_check("model.shards", "pass", "safetensors headers are valid",
                              shards=model_info["shards"], model_bytes=model_info["model_bytes"]))

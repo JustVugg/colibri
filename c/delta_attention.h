@@ -33,11 +33,28 @@
 
 #include <math.h>
 #include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
-/* Scratch needed by coli_kda_step, in floats. */
+/* Scratch needed by coli_kda_step, in floats.
+ *
+ * The `memory` accumulator is per-thread: the head loop below runs in
+ * parallel and each head needs its own, so the tail is v_dim per thread
+ * rather than one v_dim. Sized from omp_get_max_threads() at call time,
+ * which is what the head loop's omp_get_thread_num() indexes into. */
+static inline int coli_kda_threads(void) {
+#ifdef _OPENMP
+    int t = omp_get_max_threads();
+    return t > 0 ? t : 1;
+#else
+    return 1;
+#endif
+}
+
 static inline int coli_kda_scratch_floats(int heads, int k_dim, int v_dim) {
     int mixed = 3 * heads * (k_dim > v_dim ? k_dim : v_dim);
-    return mixed + v_dim;
+    return mixed + coli_kda_threads() * v_dim;
 }
 
 static inline float coli_kda_silu(float value) {
@@ -56,7 +73,15 @@ static inline float coli_kda_silu(float value) {
  *   scratch [coli_kda_scratch_floats()]
  *
  * k_dim and v_dim are equal in every model shipping today; they are separate
- * arguments because the recurrence does not require them to be. */
+ * arguments because the recurrence does not require them to be.
+ *
+ * Two conditions on `scratch`, both satisfied by the one caller today
+ * (glm53.c, which sizes it at session open and calls from serial code):
+ * it must have been sized by coli_kda_scratch_floats() under the same
+ * OpenMP thread count this call will see, and this function must NOT be
+ * called from inside a parallel region -- the head loop indexes the scratch
+ * tail by omp_get_thread_num(), so an outer team's larger ids would run off
+ * the end of the buffer. */
 static inline int coli_kda_step(float *out, float *state, float *window,
                                 const float *qkv, const float *conv_w,
                                 const float *gate, const float *beta,
@@ -68,9 +93,18 @@ static inline int coli_kda_step(float *out, float *state, float *window,
 
     const int width = heads * k_dim;
     float *mixed = scratch;                    /* 3 * width */
-    float *memory = scratch + 3 * width;       /* v_dim */
+    float *memory_pool = scratch + 3 * width;  /* v_dim PER THREAD */
 
-    /* Short causal convolution over each channel's own history, then SiLU. */
+    /* Short causal convolution over each channel's own history, then SiLU.
+     * Channels are independent: each owns its slice of `window` and one
+     * element of `mixed`, and reads `qkv`/`conv_w` without writing them.
+     * This loop carries 3*width SiLU calls -- 24,576 expf per call at GLM's
+     * shape -- which is why it is worth a team of its own: parallelising only
+     * the head loop below leaves coli_kda_step flat at 1.03 ms/call, because
+     * this loop is then the serial half. Both need a team. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int channel = 0; channel < 3 * width; channel++) {
         float *history = window + (size_t)channel * kernel;
         memmove(history, history + 1, (size_t)(kernel - 1) * sizeof(*history));
@@ -82,7 +116,24 @@ static inline int coli_kda_step(float *out, float *state, float *window,
     }
 
     const float query_scale = 1.0f / sqrtf((float)k_dim);
+    /* Heads are independent: each owns its own slice of `state` and of `out`,
+     * and reads `mixed` without writing it. The one thing they would share is
+     * the `memory` accumulator, so each thread takes its own slice of the
+     * pool -- sharing it corrupts every head's read-back while still emitting
+     * plausible tokens -- a teacher-forcing oracle catches it, reading the
+     * output does not. Measured before parallelising: 2.25 ms/call on one of
+     * eight cores. No num_threads() cap here: capping a single kernel's team
+     * inside a larger pool was measured on another engine and rejected, since
+     * the idle pool threads spin on the sibling hyperthreads. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int head = 0; head < heads; head++) {
+#ifdef _OPENMP
+        float *memory = memory_pool + (size_t)omp_get_thread_num() * v_dim;
+#else
+        float *memory = memory_pool;
+#endif
         float *matrix = state + (size_t)head * k_dim * v_dim;
         const float *query = mixed + (size_t)head * k_dim;
         const float *key = mixed + width + (size_t)head * k_dim;

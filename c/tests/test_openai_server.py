@@ -2,6 +2,7 @@ import http.client
 import io
 import json
 import math
+import os
 import socket
 import tempfile
 import threading
@@ -17,7 +18,7 @@ from pathlib import Path
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
-                           _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
+                           _engine_error, _image_bytes_from_url, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
                            parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
                            read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
@@ -362,6 +363,16 @@ class TemplateTest(unittest.TestCase):
             generation_options({"response_format": {"type": "yaml"}}, 8)
         with self.assertRaises(APIError):
             generation_options({"response_format": {"type": "json_schema", "json_schema": {}}}, 8)
+        # a json_schema that is not an object is the client's mistake too: a 400
+        # naming the parameter, not an AttributeError the handler turns into a
+        # 500 "engine failed" (which OpenAI SDKs retry)
+        for json_schema in ('{"schema": {}}', [schema], 5, True):
+            with self.subTest(json_schema=json_schema):
+                with self.assertRaises(APIError) as caught:
+                    generation_options({"response_format": {"type": "json_schema",
+                                                            "json_schema": json_schema}}, 8)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.param, "response_format")
         with self.assertRaises(APIError):   # non-dict response_format
             generation_options({"response_format": "json"}, 8)
         with self.assertRaises(APIError):   # empty gbnf
@@ -372,6 +383,39 @@ class TemplateTest(unittest.TestCase):
         # (draft source only — bad grammar costs the speedup, never the request)
         opts = generation_options({"response_format": {"type": "gbnf", "grammar": "not a grammar ::="}}, 8)
         self.assertEqual(opts[3], "not a grammar ::=")
+
+    def test_tool_choice_function_that_is_not_an_object_is_a_400(self):
+        """The same read, six places: generation_options and five renderers.
+
+        `(tool_choice.get("function") or {}).get("name")` raised AttributeError
+        on {"type": "function", "function": "search"} -- the name written where
+        the object goes -- and that became a 500 "engine failed" instead of the
+        400 generation_options already had two lines further down. The renderers
+        crashed on the identical expression before validation was even reached.
+        """
+        import openai_server as srv
+        tools = [{"type": "function", "function": {"name": "search"}}]
+        messages = [{"role": "user", "content": "hi"}]
+        for function in ("search", ["search"], 5, True):
+            with self.subTest(function=function):
+                choice = {"type": "function", "function": function}
+                with self.assertRaises(APIError) as caught:
+                    generation_options({"tools": tools, "tool_choice": choice}, 8)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.param, "tool_choice")
+                # the renderers must get past the read so that 400 is what runs
+                for render in (render_chat, srv.render_chat_glm53, render_chat_kimi,
+                               render_chat_v4, srv.render_chat_dsv41):
+                    render(list(messages), tools=list(tools), tool_choice=choice)
+        # A well-formed choice, and the legacy {"type": "function", "name": ...}
+        # spelling, still force the tool.
+        for choice in ({"type": "function", "function": {"name": "search"}},
+                       {"type": "function", "name": "search"}):
+            with self.subTest(choice=choice):
+                generation_options({"tools": tools, "tool_choice": choice}, 8)
+                self.assertIn("You must call the function `search`",
+                              render_chat(list(messages), tools=list(tools),
+                                          tool_choice=choice))
 
     def test_coli_temp_is_the_default_for_requests_that_omit_temperature(self):
         with patch.dict("openai_server.os.environ", {"COLI_TEMP": "0.25"}):
@@ -1009,8 +1053,41 @@ class DispatcherTest(unittest.TestCase):
         with patch("openai_server.subprocess.Popen", return_value=process):
             engine = Engine("glm", "model")
         output = []
+        # Il consumatore se ne va DOPO aver ricevuto qualcosa: e' lo scenario che
+        # il nome promette, e va costruito invece che sperato. Con cancelled che
+        # tornava True da subito, la corsa era fra il ramo idle -- che cancella
+        # prima di ogni dato -- e l'arrivo del frame: su Windows vinceva il primo
+        # e l'asserzione su output falliva senza che nulla fosse rotto (#1328).
+        # Qui il flag si alza dentro il sink, e nel ramo "data" decode() consegna
+        # il token PRIMA che cancelled() venga interrogato: l'ordine e' garantito
+        # dal codice, non dallo scheduler.
+        #
+        # Il tetto sui poll non e' decorativo. Senza, un guasto che impedisce la
+        # consegna del token lascerebbe il flag basso per sempre: niente cancel,
+        # niente eccezione, e il test si APPENDE invece di fallire -- misurato
+        # rompendo decode() apposta. Il ramo idle interroga cancelled() ogni 50 ms,
+        # quindi dopo un secondo si cancella comunque e l'asserzione su output
+        # fallisce subito, dicendo la cosa giusta. Deterministico quando funziona,
+        # rapido a fallire quando no.
+        #
+        # Il caso "cancella prima del primo frame" resta coperto, in modo
+        # deterministico, da test_cancels_generation_before_first_frame (#908):
+        # prima i due si sovrapponevano a caso e uno dei due vinceva a sorte.
+        disconnected = False
+        polls = 0
+
+        def sink(text):
+            nonlocal disconnected
+            output.append(text)
+            disconnected = True
+
+        def consumer_gone():
+            nonlocal polls
+            polls += 1
+            return disconnected or polls > 20
+
         with self.assertRaises(ClientCancelled):
-            engine.generate("hello", 8, 0.7, 0.9, output.append, cancelled=lambda: True)
+            engine.generate("hello", 8, 0.7, 0.9, sink, cancelled=consumer_gone)
         engine.close()
         self.assertEqual(output, ["x"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
@@ -1147,10 +1224,14 @@ class CapSentinelShimTest(unittest.TestCase):
             self._spawn_argv("engine", str(model))
 
     def test_cap_for_arch_is_the_single_translation_point(self):
+        # 0 is the "you decide" sentinel, and it goes to the engines that
+        # actually do decide: glm resolves it platform-aware, olmoe sizes its
+        # expert cache from the RAM budget once the dense weights are resident
+        # (#1443). The others still get the legacy eight slots per layer.
         self.assertEqual(cap_for_arch("glm", None), 0)
+        self.assertEqual(cap_for_arch("olmoe", None), 0)
         self.assertEqual(cap_for_arch("inkling", None), 8)
         self.assertEqual(cap_for_arch("kimi", None), 8)
-        self.assertEqual(cap_for_arch("olmoe", None), 8)
         self.assertEqual(cap_for_arch("glm", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 0), 0)   # explicit 0 is explicit
@@ -1466,6 +1547,84 @@ class HTTPTest(unittest.TestCase):
             })
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
+
+    def test_unpaired_surrogate_is_a_client_error(self):
+        """JSON can spell a lone UTF-16 surrogate ("\\ud83d": a client that cut a
+        string between the two halves of an emoji). json.loads accepts it, no
+        UTF-8 can carry it, and Engine.generate's first step, prompt.encode(),
+        raised: HTTP 500 "The colibri engine failed". Invalid UTF-8 in the raw
+        body is already a 400; this is the same invalid text, escaped."""
+        real_generate = self.engine.generate
+
+        def encoding_generate(prompt, *args, **kwargs):
+            prompt.encode("utf-8")          # what Engine.generate does before anything else
+            return real_generate(prompt, *args, **kwargs)
+
+        cut = "emoji \ud83d"
+        cases = (("/v1/chat/completions", {"messages": [{"role": "user", "content": cut}]}),
+                 ("/v1/completions", {"prompt": cut}),
+                 ("/v1/messages", {"max_tokens": 4, "messages": [{"role": "user", "content": cut}]}))
+        with patch.object(self.engine, "generate", side_effect=encoding_generate):
+            for path, body in cases:
+                with self.subTest(path=path):
+                    with self.assertRaises(HTTPError) as caught:
+                        self.request(path, dict(body, model="test-model"))
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+
+    def test_tool_choice_with_a_non_object_function_is_a_client_error(self):
+        """{"type": "function", "function": "search"} answered HTTP 500.
+
+        generation_options() already has the 400 for a `tool_choice` function
+        object with no name, but it -- and the five renderers that read the
+        forced tool the same way -- did `(tool_choice.get("function") or {})
+        .get("name")`, so a `function` that is not an object raised
+        AttributeError first and do_POST answered 500 "The colibri engine failed
+        to process the request." for a request the engine never saw. Every arch
+        and both OpenAI endpoints, because the crash was on the read.
+        """
+        tools = [{"type": "function", "function": {"name": "search"}}]
+        for arch in ("glm", "glm53", "kimi", "deepseek_v4", "deepseek_v41",
+                     "olmoe", "inkling", "qwen36", "qwen38"):
+            for function in ("search", ["search"], 5):
+                with self.subTest(arch=arch, function=function):
+                    with patch("openai_server.ARCH", arch):
+                        with self.assertRaises(HTTPError) as caught:
+                            self.request("/v1/chat/completions", {
+                                "model": "test-model",
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "tools": tools,
+                                "tool_choice": {"type": "function", "function": function}})
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+        # /v1/completions has no renderer in front of generation_options, so it
+        # reached the same read directly.
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/completions", {
+                "model": "test-model", "prompt": "hi", "tools": tools,
+                "tool_choice": {"type": "function", "function": "search"}})
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 400)
+
+    def test_a_well_formed_forced_tool_choice_still_runs(self):
+        """The read above must not change the shape clients actually send."""
+        with self.request("/v1/chat/completions", {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "search"}}],
+                "tool_choice": {"type": "function",
+                                "function": {"name": "search"}}}) as response:
+            self.assertEqual(response.status, 200)
+        self.assertIn("You must call the function `search`", self.engine.calls[-1][0])
+        # The OpenAI-legacy spelling {"type": "function", "name": ...} still
+        # forces the tool: _tool_choice_name keeps that fallback.
+        with self.request("/v1/chat/completions", {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "search"}}],
+                "tool_choice": {"type": "function", "name": "search"}}) as response:
+            self.assertEqual(response.status, 200)
+        self.assertIn("You must call the function `search`", self.engine.calls[-1][0])
 
 
 class ClientHangupTest(unittest.TestCase):
@@ -1989,6 +2148,59 @@ class ThinkingSplitUnitTest(unittest.TestCase):
         # initial_thinking=False: a pure answer with no markers must not be filed as reasoning
         self.assertEqual(split_thinking_reply("plain answer", enable_thinking=False),
                          ("", "plain answer"))
+
+    def test_glm53_starts_in_reasoning_even_with_thinking_off(self):
+        """#1278: render_chat_glm53 opens <think> unconditionally (the template
+        has no switch; "off" only lowers the effort), so the reply always starts
+        inside the block. With the splitter started in text mode the reasoning
+        streamed as `content`, glued in front of the answer. The family, not the
+        client flag, decides where the output starts."""
+        import openai_server as srv
+        with patch("openai_server.ARCH", "glm53"):
+            self.assertTrue(srv.starts_in_reasoning(False))
+            self.assertEqual(split_thinking_reply("why</think>answer", enable_thinking=False),
+                             ("why", "answer"))
+        with patch("openai_server.ARCH", "glm"):
+            self.assertFalse(srv.starts_in_reasoning(False),
+                             "GLM-5.2 closes the block in the prompt when thinking is off")
+
+    def test_glm53_bare_tool_call_turn_matches_what_the_model_wrote(self):
+        """#1576: a replayed assistant turn has to be the tokens the model made.
+
+        The official template writes "\\n<tool_call>" and GLM-5.3 does not: on a
+        turn that is nothing but a tool call it writes "</think><tool_call>".
+        Rendering the newline anyway put one extra token into the replayed
+        prefix, and the reuse gate in glm53.c is all-or-nothing, so the entire
+        cached prefix went and the turn re-prefilled from scratch. The reporter
+        measured twenty minutes of it on a 3k-token agent history.
+
+        The turn that also carries text keeps its newline, and that is not an
+        oversight: there the model's own trailing newline is stripped and put
+        back, the tokens line up, and it is the case that works today.
+        """
+        import openai_server as srv
+        bare = srv.render_chat_glm53([
+            {"role": "user", "content": "list the files"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"type": "function",
+                             "function": {"name": "bash",
+                                          "arguments": '{"command": "ls"}'}}]},
+            {"role": "tool", "content": "a.txt"},
+        ])
+        self.assertIn("</think><tool_call>bash", bare,
+                      "a bare tool call must follow </think> with no newline")
+        self.assertNotIn("</think>\n<tool_call>", bare)
+
+        with_text = srv.render_chat_glm53([
+            {"role": "user", "content": "list the files"},
+            {"role": "assistant", "content": "Let me look.",
+             "tool_calls": [{"type": "function",
+                             "function": {"name": "bash",
+                                          "arguments": '{"command": "ls"}'}}]},
+            {"role": "tool", "content": "a.txt"},
+        ])
+        self.assertIn("Let me look.\n<tool_call>bash", with_text,
+                      "a turn with text keeps the separator it already had")
 
     def test_missing_close_tag_surfaces_reasoning(self):
         self.assertEqual(split_thinking_reply("thought with no end"),
@@ -2532,6 +2744,112 @@ class ReasoningEffortTest(unittest.TestCase):
         text = render_chat(self.MESSAGES, enable_thinking=False,
                            reasoning_effort="xhigh")
         self.assertNotIn("Reasoning Effort", text)
+
+
+class ImageUrlPathGuard(unittest.TestCase):
+    """image_url.url naming a local file is read with the server's rights, so
+    it is denied unless the operator sets COLI_IMAGE_ROOT, and then only
+    inside it (GHSA follow-up to #1354, whose guards left every absolute path
+    readable by default). data: URIs are the client's way in. Errors stay
+    generic so a reply never confirms a path or its permissions."""
+
+    def setUp(self):
+        self._saved = os.environ.pop("COLI_IMAGE_ROOT", None)
+
+    def tearDown(self):
+        os.environ.pop("COLI_IMAGE_ROOT", None)
+        if self._saved is not None:
+            os.environ["COLI_IMAGE_ROOT"] = self._saved
+
+    def test_data_uri_is_the_default_way_in(self):
+        import base64
+        payload = base64.b64encode(b"\x89PNG\r\n").decode()
+        self.assertEqual(_image_bytes_from_url("data:image/png;base64," + payload), b"\x89PNG\r\n")
+
+    def test_local_paths_are_denied_by_default(self):
+        with tempfile.TemporaryDirectory() as root:
+            img = Path(root) / "pic.png"
+            img.write_bytes(b"\x89PNG\r\n")
+            for url in (str(img), "file://" + str(img), "/etc/passwd", "file:///etc/passwd", "relative.png"):
+                with self.assertRaises(APIError) as caught:
+                    _image_bytes_from_url(url)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertIn("COLI_IMAGE_ROOT", str(caught.exception))
+                self.assertNotIn("passwd", str(caught.exception))
+
+    def test_image_root_allows_inside_and_refuses_outside(self):
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.NamedTemporaryFile(suffix=".png") as outside:
+            os.environ["COLI_IMAGE_ROOT"] = root
+            inside = Path(root) / "ok.png"
+            inside.write_bytes(b"ok")
+            self.assertEqual(_image_bytes_from_url(str(inside)), b"ok")
+            self.assertEqual(_image_bytes_from_url("file://" + str(inside)), b"ok")
+            for url in (outside.name, "/etc/passwd", str(Path(root) / ".." / Path(outside.name).name)):
+                with self.assertRaises(APIError) as caught:
+                    _image_bytes_from_url(url)
+                self.assertNotIn(Path(outside.name).name, str(caught.exception))
+
+    def test_a_symlink_escaping_the_root_is_refused(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("no symlinks here")
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.NamedTemporaryFile(suffix=".png") as outside:
+            os.environ["COLI_IMAGE_ROOT"] = root
+            link = Path(root) / "link.png"
+            try:
+                os.symlink(outside.name, link)
+            except OSError:
+                self.skipTest("cannot create symlinks here")
+            with self.assertRaises(APIError):
+                _image_bytes_from_url(str(link))
+
+    def test_a_missing_or_file_root_denies_everything(self):
+        with tempfile.TemporaryDirectory() as root:
+            img = Path(root) / "pic.png"
+            img.write_bytes(b"x")
+            os.environ["COLI_IMAGE_ROOT"] = str(Path(root) / "nowhere")
+            with self.assertRaises(APIError):
+                _image_bytes_from_url(str(img))
+            os.environ["COLI_IMAGE_ROOT"] = str(img)
+            with self.assertRaises(APIError):
+                _image_bytes_from_url(str(img))
+
+    def test_error_does_not_leak_the_path(self):
+        os.environ["COLI_IMAGE_ROOT"] = tempfile.gettempdir()
+        with self.assertRaises(APIError) as caught:
+            _image_bytes_from_url("/no/such/secret-name.png")
+        self.assertNotIn("secret-name", str(caught.exception))
+
+
+class ContextExceededMessageTest(unittest.TestCase):
+    """#1376: the engine writes `CONTEXT_EXCEEDED prompt_tokens=N requested=M
+    capacity=C`. The message took fields[2] ("requested=M", the completion
+    budget) as the limit and printed the raw key=value token, so a user with a
+    9000-token prompt on an 8192 ceiling read "maximum context length is
+    requested=4 tokens". The number that mattered, capacity, appeared nowhere."""
+
+    def test_limit_is_capacity_and_used_is_prompt_tokens(self):
+        from openai_server import _engine_error
+        err = _engine_error(["CONTEXT_EXCEEDED", "prompt_tokens=9000", "requested=4",
+                             "capacity=8192"], "ignored")
+        text = str(err)
+        self.assertIn("8192", text)
+        self.assertIn("9000", text)
+        self.assertNotIn("requested=", text)
+        self.assertNotIn("prompt_tokens=", text)
+        self.assertNotIn("capacity=", text)
+
+    def test_the_positional_spelling_of_colibri_and_deepseek_still_reads(self):
+        from openai_server import _engine_error
+        text = str(_engine_error(["CONTEXT_EXCEEDED", "8321", "4094"], "ignored"))
+        self.assertIn("4094", text)
+        self.assertIn("8321", text)
+
+    def test_missing_fields_do_not_crash_the_message(self):
+        from openai_server import _engine_error
+        text = str(_engine_error(["CONTEXT_EXCEEDED"], "ignored"))
+        self.assertIn("the context", text)
 
 
 if __name__ == "__main__":

@@ -77,7 +77,9 @@ Validity rules every conformant record satisfies (and validators enforce):
   least 4 bytes** — even a stream that encodes zero symbols carries its
   4 flushed state bytes;
 - the record's total length equals the derived framing exactly (no trailing
-  bytes), and every derived padding byte is zero;
+  bytes), and every derived padding byte is zero. That length is the
+  **physical extent**, known from stored framing before decode — not the
+  identity inference the stamp section forbids (`expected_bytes(O, I)`);
 - **amplification bound**: no admissible table can encode more than
   `payload_len * 8 * M_max` symbols into a payload (`M_max = 2^15`, the
   format's largest table size — a symbol's cost is bounded below by
@@ -165,7 +167,13 @@ For the existing formats the engine can infer identity from byte arithmetic
 **That inference is structurally impossible here**: entropy-coded size is
 data-dependent — there is no `expected_bytes(O, I)` to compare against. The
 stamp is therefore the **only** signal that a `U8` tensor is entropy-coded
-at all. Consequences any consumer must respect:
+at all. Data-dependence applies to **identity inference**, not to **extent**:
+the record's physical length is fully determined by the stored framing before
+decode (header, stream offsets, payload, the two `round16()` pads; see the
+validity rules above, "the record's total length equals the derived framing
+exactly"), so page-aligned I/O (4 KiB-padded extents, `O_DIRECT`) remains
+available. The stamp is still mandatory because identity, not size, is what
+cannot be inferred. Consequences any consumer must respect:
 
 - an *unstamped* `U8` tensor must never be presumed entropy-coded by any
   size heuristic;

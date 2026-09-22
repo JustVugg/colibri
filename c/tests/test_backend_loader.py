@@ -40,6 +40,16 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 
 
+# The two device-count exports answer with DISTINCT non-zero values, so a
+# pre-init caller can tell "the DLL answered" from "nothing answered": 0 is
+# both a legitimate count and the value the g_cuda.available gate returned
+# without ever loading anything, which is exactly what #1577 hid behind.
+_AVAILABLE_DEVICE_SYMBOL = "coli_cuda_available_device_count"
+_DEVICE_COUNT_SYMBOL = "coli_cuda_device_count"
+_AVAILABLE_PROBE = 2
+_DEVICE_COUNT_PROBE = 5
+
+
 def _write_shard(path, tensors):
     """Write a minimal safetensors file to *path*."""
     offset = 0
@@ -199,6 +209,11 @@ class _StubFixture:
         self.runtime_a_src = self.src_dir / "runtime_a.c"
         self.runtime_b_src = self.src_dir / "runtime_b.c"
         self.backend_src = self.src_dir / "backend.c"
+        # Same fake backend minus the optional available_device_count export:
+        # the shape of a DLL built before #1533 added it, which the wrapper
+        # must still answer from (#1577).
+        self.cuda_backend_old = self.backend_dir / "coli_cuda_oldvariant.dll"
+        self.backend_old_src = self.src_dir / "backend_old.c"
         # Diagnostic-only artifacts (W1-B2c2).
         self.dep_full = self.dep_full_dir / _DEP_BASENAME
         self.dep_lean = self.dep_lean_dir / _DEP_BASENAME
@@ -332,6 +347,19 @@ int main(int argc, char **argv)
     runtime_inventory("runtime_after_preload");
 
     devices[0] = 0;
+
+    /* Pre-init availability probe (#1577). qwen36_tier.c asks HOW MANY devices
+     * are usable to decide which indices it hands to coli_cuda_init, so the
+     * answer cannot depend on that init having run. The two backend_loaded
+     * readings bracket the call: 0 -> count -> 1 is the loader loading the DLL
+     * on demand, while 0 -> 0 -> 0 is the miss path, and a 0 count with a
+     * loaded backend is the bug this probe exists for. */
+    printf("backend_loaded_before_probe=%d\n",
+           GetModuleHandleW(HARNESS_BACKEND_DLL) != NULL);
+    printf("available_before_init=%d\n", coli_cuda_available_device_count());
+    printf("backend_loaded_after_probe=%d\n",
+           GetModuleHandleW(HARNESS_BACKEND_DLL) != NULL);
+
     rc = coli_cuda_init(devices, 1);          /* the real loader runs here */
     printf("loader_init=%d\n", rc);
 
@@ -585,8 +613,10 @@ int main(int argc, char **argv)
                   "building test dependency " + name)
         return implib
 
-    def _backend_source(self, with_dep=False):
+    def _backend_source(self, with_dep=False, omit=()):
         real = {"coli_cuda_init", "coli_cuda_e8_set_grid"}
+        probed = {_AVAILABLE_DEVICE_SYMBOL: _AVAILABLE_PROBE,
+                  _DEVICE_COUNT_SYMBOL: _DEVICE_COUNT_PROBE}
         lines = [
             "/* generated fake backend: no HIP/ROCm/CUDA header, no GPU work,",
             " * no DllMain. Imports the marker from amdhip64_7.dll by basename",
@@ -621,8 +651,14 @@ int main(int argc, char **argv)
                 "{ return %s(); }" % _DEP_EXTRA,
             ]
         for name in self.exports:
-            if name not in real:
+            if name in real or name in omit:
+                continue
+            value = probed.get(name)
+            if value is None:
                 lines.append("__declspec(dllexport) int %s(void) { return 0; }" % name)
+            else:
+                lines.append("__declspec(dllexport) int %s(void) { return %d; }"
+                             % (name, value))
         return "\n".join(lines) + "\n"
 
     def _build(self):
@@ -665,6 +701,13 @@ int main(int argc, char **argv)
                    "-L" + str(implib_a.parent), "-lamdhip64_7",
                    "-L" + str(dep_implib.parent), "-lcoli_test_dep"],
                   "building the dependency-carrying backend variant")
+        self.backend_old_src.write_text(
+            self._backend_source(omit=(_AVAILABLE_DEVICE_SYMBOL,)),
+            encoding="ascii")
+        self._gcc(["-O0", "-shared", str(self.backend_old_src),
+                   "-o", str(self.cuda_backend_old),
+                   "-L" + str(implib_a.parent), "-lamdhip64_7"],
+                  "building the pre-export backend variant")
 
     def _build_harness(self):
         """Compile the harness together with the repository's backend_loader.c.
@@ -737,6 +780,7 @@ int main(int argc, char **argv)
 
     def generated_paths(self):
         return [self.runtime_a, self.runtime_b, self.backend, self.cuda_backend,
+                self.cuda_backend_old, self.backend_old_src,
                 self.runtime_a_src, self.runtime_b_src, self.backend_src,
                 self.harness_src, self.harness_exe, self.cuda_harness_exe,
                 self.runtime_a_dir / "libamdhip64_7.a",
@@ -874,7 +918,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
             cls.fixture = None
 
     def test_abi_is_derived_from_the_loader_source(self):
-        """47 mandatory + 4 optional, parsed from backend_loader.c.
+        """47 mandatory + 8 optional, parsed from backend_loader.c.
 
         The counts are a deliberate tripwire: adding a RESOLVE to the loader
         widens the ABI every Windows DLL must satisfy, and that should be a
@@ -885,8 +929,8 @@ class LoaderStubFixtureTest(unittest.TestCase):
         """
         f = self.fixture
         self.assertEqual(len(f.mandatory), 47)
-        self.assertEqual(len(f.optional), 4)
-        self.assertEqual(len(f.exports), 51)
+        self.assertEqual(len(f.optional), 8)   # +matmul_mxfp4 (kimi_k3 via the DLL, #1405), +available_device_count (qwen36 tier, #1533)
+        self.assertEqual(len(f.exports), 55)
         self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)
         self.assertIn("coli_cuda_e8_set_grid", f.optional)
@@ -896,6 +940,13 @@ class LoaderStubFixtureTest(unittest.TestCase):
         self.assertIn("coli_cuda_fp8_set_lut", f.optional)
         # expert_group_pinned: old DLLs remain usable outside SPEC_PIN (#689).
         self.assertIn("coli_cuda_expert_group_pinned", f.optional)
+        # tensor_vram / alloc_footprint: allocator padding in the expert-tier
+        # budget (#687). OPTIONAL on purpose - a DLL predating them leaves the
+        # pointers NULL and the wrappers fall back to the logical byte count,
+        # which is what the tier charged before. As mandatory, one older DLL
+        # would take the entire CUDA backend down over a sizing refinement.
+        self.assertIn("coli_cuda_tensor_vram", f.optional)
+        self.assertIn("coli_cuda_alloc_footprint", f.optional)
 
     def test_both_runtimes_exist_with_the_production_basename(self):
         """Same basename, different directories — the conflict precondition."""
@@ -2415,6 +2466,108 @@ class LoaderBackendSelectionTest(unittest.TestCase):
                 # W1-B1: only the loader's own prefix is discriminated here.
                 self.assertIn("[CUDA] requested backend is unavailable", err)
                 self.assertEqual(result.returncode, 2)
+
+
+class LoaderPreInitAvailabilityTest(unittest.TestCase):
+    """The device count qwen36's tier reads BEFORE it calls coli_cuda_init.
+
+    qwen36_tier.c asks how many devices are usable so it knows which indices to
+    hand to coli_cuda_init, so the answer cannot depend on that init having
+    happened. Gating the wrapper on g_cuda.available answered 0 on every
+    Windows host and the tier silently took the CPU path unless COLI_GPUS was
+    set (#1577). Nothing here needs a GPU: the backend is the generated stub.
+    """
+
+    fixture = None
+
+    @classmethod
+    def setUpClass(cls):
+        reason = _fixture_toolchain_skip()
+        if reason:
+            raise unittest.SkipTest(reason)
+        cls.fixture = _StubFixture()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.fixture is not None:
+            cls.fixture.cleanup()
+            cls.fixture = None
+
+    def setUp(self):
+        self.cases = tempfile.TemporaryDirectory(prefix="coli loader probe ")
+        self.addCleanup(self.cases.cleanup)
+
+    def _probe(self, name, **kwargs):
+        """Run the harness with the stub backend's own dependency present.
+
+        The generated backend imports its marker from amdhip64_7.dll by
+        basename, and a CUDA host loads the DLL from the engine's own directory,
+        so the dependency has to sit beside it for the load to succeed at all
+        (otherwise Windows error 126, which is a fixture setup mistake rather
+        than a loader behaviour). The HIP control keeps its sandbox untouched:
+        there the loader refuses on COLI_HIP_RUNTIME_DIR before any load.
+        """
+        if kwargs.get("vendor") == "cuda" and kwargs.get("with_backend", True):
+            kwargs.setdefault("extra_files", (self.fixture.runtime_a,))
+        return self.fixture.run_harness(Path(self.cases.name) / name, "NONE",
+                                        **kwargs)
+
+    @staticmethod
+    def _detail(proc):
+        return "\nstdout:\n%s\nstderr:\n%s" % (proc.stdout, proc.stderr)
+
+    def test_the_probe_loads_the_dll_it_reports_on(self):
+        """No init yet, backend present: the count comes from the DLL itself."""
+        proc, out = self._probe("probe_present", vendor="cuda")
+        detail = self._detail(proc)
+        self.assertEqual(proc.returncode, 0, "harness failed" + detail)
+        self.assertEqual(out.get("backend_loaded_before_probe"), "0",
+                         "the probe was measured with the DLL already loaded"
+                         + detail)
+        self.assertEqual(out.get("available_before_init"),
+                         str(_AVAILABLE_PROBE),
+                         "the pre-init count did not come from the DLL" + detail)
+        self.assertEqual(out.get("backend_loaded_after_probe"), "1",
+                         "the probe never loaded the backend DLL" + detail)
+        # The harness still reaches the normal init afterwards: loading on
+        # demand must not consume the one load the process is allowed.
+        self.assertEqual(out.get("loader_init"), "1", detail)
+
+    def test_the_probe_is_zero_when_no_backend_is_present(self):
+        """The miss path stays a miss: 0 devices, nothing loaded, no crash."""
+        proc, out = self._probe("probe_absent", vendor="cuda",
+                                with_backend=False)
+        detail = self._detail(proc)
+        self.assertEqual(proc.returncode, 0, "harness failed" + detail)
+        self.assertEqual(out.get("available_before_init"), "0", detail)
+        self.assertEqual(out.get("backend_loaded_after_probe"), "0", detail)
+        self.assertEqual(out.get("backend_loaded"), "0", detail)
+        self.assertEqual(out.get("loader_init"), "0", detail)
+
+    def test_the_probe_falls_back_for_a_dll_without_the_export(self):
+        """An older DLL answers through device_count(), not through a crash."""
+        f = self.fixture
+        proc, out = self._probe("probe_older_dll", vendor="cuda",
+                                backend_override=f.cuda_backend_old)
+        detail = self._detail(proc)
+        self.assertEqual(proc.returncode, 0, "harness failed" + detail)
+        self.assertEqual(out.get("backend_loaded_after_probe"), "1", detail)
+        self.assertEqual(out.get("available_before_init"),
+                         str(_DEVICE_COUNT_PROBE),
+                         "the fallback did not reach device_count()" + detail)
+
+    def test_the_probe_keeps_the_hip_refusal_before_init(self):
+        """A HIP host still refuses without a runtime directory, before init.
+
+        The count is asked before init on every host, so the HIP control proves
+        the earlier call neither bypasses COLI_HIP_RUNTIME_DIR validation nor
+        leaves the backend mapped when that validation fails.
+        """
+        proc, out = self._probe("probe_hip_unconfigured", vendor="hip")
+        detail = self._detail(proc)
+        self.assertEqual(proc.returncode, 0, "harness failed" + detail)
+        self.assertEqual(out.get("available_before_init"), "0", detail)
+        self.assertEqual(out.get("backend_loaded_after_probe"), "0", detail)
 
 
 if __name__ == "__main__":
