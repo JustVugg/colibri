@@ -1001,10 +1001,19 @@ static int xf_mode(Model *m) {
     if (v >= 0) return v;
     const char *e = getenv("QWEN_EXPERT_KERNEL");
     int on = !(e && *e == '0');
-#ifdef COLI_CUDA
-    { const char *cu = getenv("COLI_CUDA"); if (cu && *cu == '1') on = 0; }
-#endif
     Cfg *c = &m->c;
+#ifdef COLI_CUDA
+    /* Full residency (cap == n_experts) keeps the int8 path: its warmstart
+     * frees the int8 copies of VRAM residents and rebuilds them from g4 on an
+     * eviction. The streaming tier (cap < n_experts) keeps this kernel for its
+     * CPU misses; the slot then also holds the pair-layout int4 it offers the
+     * tier (load_expert_merged). */
+    { const char *cu = getenv("COLI_CUDA");
+      int cap = -1;
+      for (int l = 0; l < c->n_layers && cap < 0; l++)
+          if (m->cache && m->cache[l].slots) cap = m->cache[l].cap;
+      if (cu && *cu == '1' && (cap < 0 || cap >= c->n_experts)) on = 0; }
+#endif
     if (c->expert_gs != XF_BLOCK || !xf_layout_ok(c->hidden) || !xf_layout_ok(c->inter)) on = 0;
     if (on) {
         int probe = -1;
@@ -1751,6 +1760,21 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
             xf_repack_pairs_signed(s->pw + gp,     raw + gp,     cc->inter,  cc->hidden);
             xf_repack_pairs_signed(s->pw + 2 * gp, raw + 2 * gp, cc->hidden, cc->inter);
             s->is_int4 = 1;
+            /* Streaming CUDA tier (the only tier mode that runs with this
+             * kernel, see xf_mode): the tier uploads the PAIR layout, so the
+             * slot also keeps the bytes as read. Three allocations, like the
+             * int8 branch below, because every teardown frees g4/u4/d4 one by
+             * one. The previous occupant's copy goes first (LRU reuse). */
+            free(s->g4); free(s->u4); free(s->d4); s->g4 = s->u4 = s->d4 = NULL;
+            if (qt_ready()) {
+                s->g4 = (uint8_t *)malloc((size_t)gp);
+                s->u4 = (uint8_t *)malloc((size_t)gp);
+                s->d4 = (uint8_t *)malloc((size_t)gp);
+                if (!s->g4 || !s->u4 || !s->d4) { fprintf(stderr, "OOM int4-packed %s\n", nm); exit(1); }
+                memcpy(s->g4, raw,          (size_t)gp);
+                memcpy(s->u4, raw + gp,     (size_t)gp);
+                memcpy(s->d4, raw + 2 * gp, (size_t)gp);
+            }
             free(raw);
             st_read_f32(&m->S, qsnm, s->gs, 0);
             return;
@@ -2324,6 +2348,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     int use_xf = !use_qt && xf_mode(m);
     int *xidx = use_xf ? malloc(sizeof(int) * (size_t)S * K) : NULL;
     float *xval = use_xf ? falloc((int64_t)S * K) : NULL;
+    /* CPU misses of the streaming tier on the shared int4 kernel (xf_mode is
+     * only on under CUDA when the tier streams). K <= 32: qt_issue refuses more. */
+    int use_xf_miss = use_qt && xf_mode(m) && K <= 32;
+    int xm_idx[32]; float xm_val[32]; XfExpert xm_ex[32]; const XfExpert *xm_exp[32];
+    int64_t xm_gp = (int64_t)I * D / 2;
+    float *xm_tmp = use_xf_miss ? falloc(D) : NULL;
+    void *xm_scratch = use_xf_miss ? malloc(xf_moe_scratch_bytes(1, K, D, I)) : NULL;
+    if (use_xf_miss && (!xm_tmp || !xm_scratch)) { fprintf(stderr, "OOM moe xf misses\n"); exit(1); }
     for (int s = 0; s < S; s++) {
         float *pr = logits + (int64_t)s*E;
         if (m->momentum_logits && m->pilot_smooth > 0.f) {
@@ -2389,7 +2421,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             /* CUDA expert tier: run the resident experts as async groups on
              * all devices, compute the misses on the CPU (overlapped), then
              * collect the GPU results. */
+            int streaming = qt_streaming();
             for (int kk = 0; kk < K; kk++) {
+                /* Streaming: a VRAM-resident expert is not read into the RAM
+                 * LRU at all -- that disk read is what streaming saves. If a
+                 * swap evicts it before qt_issue, the miss loop below loads
+                 * it, so the result does not depend on this shortcut. */
+                if (streaming && qt_is_resident(layer, idx[kk])) { qt_touch(layer, idx[kk]); continue; }
                 Slot *e; expert_get(m, layer, idx[kk], &e);
                 /* Offer whichever format the container actually packed. The old
                  * gate `if (e->g4)` never fired on an int8 container (g4 is
@@ -2401,7 +2439,34 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             double _q0 = tm_now();
             uint32_t qmask = qt_issue(layer, idx, K, xs);
             double _q1 = tm_now();
-            for (int kk = 0; kk < K; kk++) {
+            if (use_xf_miss) {
+                /* Streaming tier: the misses run through the shared int4
+                 * kernel on the planar copy, one xf_moe_run for all of them
+                 * (two OpenMP regions instead of three GEMVs per expert).
+                 * Pointers stay valid across the batch only while the layer's
+                 * LRU holds every miss at once, so a cap below K runs them one
+                 * at a time, as moe_xf_run does. */
+                int batch = m->cache[layer].cap >= K;
+                int nmiss = 0;
+                for (int kk = 0; kk < K; kk++) {
+                    xm_idx[kk] = -1; xm_val[kk] = val[kk]; xm_exp[kk] = NULL;
+                    if (qmask & (1u<<kk)) continue;
+                    Slot *e; expert_get(m, layer, idx[kk], &e);
+                    xm_ex[kk].g4 = e->pw; xm_ex[kk].u4 = e->pw + xm_gp; xm_ex[kk].d4 = e->pw + 2 * xm_gp;
+                    xm_ex[kk].gs = e->gs; xm_ex[kk].us = e->us; xm_ex[kk].ds = e->ds;
+                    xm_idx[kk] = idx[kk]; xm_exp[kk] = &xm_ex[kk]; nmiss++;
+                    if (!batch) {
+                        xf_moe_run(xm_tmp, xs, 1, 1, D, I, &xm_idx[kk], &xm_val[kk], &xm_exp[kk], 0, xm_scratch);
+                        float *os = out + (int64_t)s*D; for (int d = 0; d < D; d++) os[d] += xm_tmp[d];
+                        xm_idx[kk] = -1; xm_exp[kk] = NULL;
+                    }
+                }
+                if (batch && nmiss) {
+                    xf_moe_run(xm_tmp, xs, 1, K, D, I, xm_idx, xm_val, xm_exp, 0, xm_scratch);
+                    float *os = out + (int64_t)s*D; for (int d = 0; d < D; d++) os[d] += xm_tmp[d];
+                }
+            }
+            for (int kk = 0; kk < K && !use_xf_miss; kk++) {
                 if (qmask & (1u<<kk)) continue;
                 Slot *e; expert_get(m, layer, idx[kk], &e);
                 slot_ensure_int8(m, e);
@@ -2452,6 +2517,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
     }
     if (use_xf) { moe_xf_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
+    free(xm_tmp); free(xm_scratch);
     /* The CUDA tier keeps its per-token shared block above because it overlaps
      * resident GPU experts.  CPU prefill instead traverses each shared matrix
      * once per bounded chunk. */
@@ -3643,6 +3709,27 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
     int *wpl = malloc((size_t)cap_total*sizeof(int));
     int *wpe = malloc((size_t)cap_total*sizeof(int));
     int wn = qt_plan_fill(wpl, wpe, cap_total);
+    if (qt_streaming()) {
+        /* Streaming: RAM holds only an LRU of `cap` slots per layer, so
+         * "load all experts" would read the whole container through it for
+         * nothing. Load just the planned VRAM set, one at a time: a slot is
+         * valid only until the next expert_get of its layer may recycle it,
+         * and qt_note_planned copies inside the call, so serial loading keeps
+         * every slot alive exactly as long as the tier reads it. Nothing is
+         * freed here -- the LRU owns every slot. */
+        for (int i = 0; i < wn; i++) {
+            Slot *e; expert_get(m, wpl[i], wpe[i], &e);
+            const uint8_t *wg = expert_is_int4 ? e->g4 : (const uint8_t *)e->g;
+            const uint8_t *wu = expert_is_int4 ? e->u4 : (const uint8_t *)e->u;
+            const uint8_t *wd = expert_is_int4 ? e->d4 : (const uint8_t *)e->d;
+            qt_note_planned(wpl[i], wpe[i], wg, wu, wd, e->gs, e->us, e->ds);
+        }
+        qt_fill_wait();
+        free(wpl); free(wpe);
+        fprintf(stderr, "[qtier] warmstart (streaming): %d experts in VRAM, RAM keeps an LRU -- %.1f s\n",
+                wn, now_s()-t0);
+        return;
+    }
     /* Load ALL experts into RAM, not just the planned (VRAM) set:
      * otherwise the first touch of a CPU-fallback expert triggers a
      * ~12 ms container read in the middle of decode (measured: 139
@@ -3872,9 +3959,18 @@ int main(int argc, char **argv) {
         }
         trunk_offer_dense(&m);   /* dnout, attnproj, shexp: the rest of the per-token dense work */
     }
-    if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
-                m.c.expert_gs, expert_is_int4)) {
-        fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
+    /* cap == n_experts: every expert lives in RAM and the tier keeps pointers
+     * into the slots (the original mode). cap < n_experts: the slots are an
+     * LRU, experts stream from disk, and the tier copies what it uploads at
+     * the moment the bytes pass by -- VRAM, RAM, disk and CPU in one run. */
+    int qt_on = cap == m.c.n_experts
+        ? qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
+                  m.c.expert_gs, expert_is_int4)
+        : qt_init_stream(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
+                         m.c.expert_gs, expert_is_int4);
+    if (qt_on) {
+        fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier%s\n",
+                qt_streaming() ? " (streaming: RAM LRU + disk, copy at note)" : "");
         atexit(qt_shutdown);
         /* The placer predicted; measure before uploading a byte of trunk. */
         if (!trunk_probe_gpu_wins(&m)) qt_trunk_withdraw("measured slower than the CPU");

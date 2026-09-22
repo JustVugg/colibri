@@ -46,9 +46,25 @@ OMP_NUM_THREADS=<physical cores> OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close \
 SNAP=<container> N_NEW=200 ./c/qwen36 256 4 prompt.txt
 ```
 
-`cap` (argv[1]) must equal `n_experts` (full RAM residency). int4 containers
-only (the int8 container keeps the CPU path). `COLI_TIMERS=1` prints
-per-phase timings and tier telemetry.
+`cap` (argv[1]) picks the mode. `cap == n_experts` (256) is **full RAM
+residency**: every expert lives in RAM and the tier keeps pointers into the
+slots. `cap < n_experts` is **streaming**: RAM holds an LRU of `cap` slots per
+layer, the experts stream from disk, and the tier copies each upload at the
+moment the bytes pass by (the lifecycle Qwen3.8's fp8 mode already used),
+promoting a hot expert into VRAM by swapping out the coldest resident. VRAM
+residents are not read into RAM at all; the CPU misses run on the shared int4
+kernel (`expert_ffn.h`). `COLI_TIMERS=1` prints per-phase timings and tier
+telemetry.
+
+Streaming is what makes the tier usable on a box whose RAM cannot hold the
+full residency peak (~32 GB of int8 slots on one card). Measured on an RTX
+5060 Laptop (8 GB, `CUDA_EXPERT_GB=6`), 32 GB RAM, cap 16, gs64 container,
+64 greedy tokens: decode 263.7 ms/token on the CPU path, 185.6 with the
+streaming tier cold, 137.2 with a `HEAT_FILE` from a previous run (91.7 %
+VRAM hit rate); a prompt the heat file had not seen ran at 211.1 against 293.2
+on the CPU (62.2 % hit). Peak RSS 11.0 GB in every arm, and the generated
+tokens were byte-identical to the CPU path on both prompts. Single runs, not
+a manifest-grade measurement.
 
 ## Placement: where the dense trunk goes (`COLI_PLACE`)
 

@@ -486,16 +486,32 @@ static void auto_place(int nl, int ne, int topk, const size_t *capacity, const u
  * promotion can therefore only happen when the bytes pass by -- the LFRU
  * decision moves from the periodic tick into qt_note, which asks: is this
  * expert, now in hand, hotter than the coldest resident on its device? */
+/* G_stream is the lifecycle (copy at note, keep no pointer, promote when the
+ * bytes pass by); G_fp8_stream is only the weight format (fmt=8). They were
+ * one flag while fp8 was the only streamed format. qwen36 with cap < n_experts
+ * streams its int4/int8 experts the same way (qt_init_stream), so a 32 GB box
+ * can mix disk, RAM, CPU and VRAM instead of needing full RAM residency. */
+static int G_stream;
 static int G_fp8_stream;
 static const float *G_fp8_lut;
 static int G_upload_sync;             /* QT_UPLOAD_SYNC=1: qt_issue waits for in-flight uploads first (tests) */
 
 int qt_init_fp8(int nl, int ne, int D, int Ih, int cap, int topk, const float *e4m3_lut){
-    G_fp8_stream = 1; G_fp8_lut = e4m3_lut;
+    G_stream = 1; G_fp8_stream = 1; G_fp8_lut = e4m3_lut;
     int ok = qt_init(nl, ne, D, Ih, cap, topk, 0, 0);
-    if(!ok) G_fp8_stream = 0;
+    if(!ok) G_stream = G_fp8_stream = 0;
     return ok;
 }
+
+int qt_init_stream(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
+                   int expert_is_int4){
+    G_stream = 1; G_fp8_stream = 0;
+    int ok = qt_init(nl, ne, D, Ih, cap, topk, expert_gs, expert_is_int4);
+    if(!ok) G_stream = 0;
+    return ok;
+}
+
+int qt_streaming(void){ return G.on && G_stream; }
 
 /* VRAM an allocation of `bytes` really occupies (cudaMalloc granularity,
  * see the exp_bytes comment in qt_init). */
@@ -519,7 +535,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             int expert_is_int4){
     const char *e=getenv("COLI_CUDA");
     if(!(e && *e=='1')) return 0;
-    if(cap != ne && !G_fp8_stream){
+    if(cap != ne && !G_stream){
         fprintf(stderr,"[qtier] cap=%d != n_experts=%d -> tier disabled (needs full RAM residency)\n",cap,ne);
         return 0;
     }
@@ -899,7 +915,7 @@ void qt_note(int layer,int eid,
     if(!G.on || !g4) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
-    if(G_fp8_stream){
+    if(G_stream){
         if(s->heat<0xFFFFFFFFu) s->heat++;
         stream_point(s,g4,u4,d4,gs,us,ds);
         stream_promote_locked(layer,eid);
@@ -913,6 +929,18 @@ void qt_note(int layer,int eid,
     pthread_mutex_unlock(&G.mx);
 }
 
+/* Streaming mode, a routed expert that is already VRAM-resident: the engine
+ * skips loading it into RAM (that read is what streaming saves), so the heat
+ * qt_note would have added is added here instead. Without it a resident would
+ * look cold to stream_promote_locked and be the first one swapped out. */
+void qt_touch(int layer,int eid){
+    if(!G.on) return;
+    pthread_mutex_lock(&G.mx);
+    QSlot *s=qs(layer,eid);
+    if(s->heat<0xFFFFFFFFu) s->heat++;
+    pthread_mutex_unlock(&G.mx);
+}
+
 /* blocking variant for the warmstart (waits for queue space). */
 void qt_note_block(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
@@ -920,11 +948,11 @@ void qt_note_block(int layer,int eid,
     if(!G.on || !g4) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
-    if(G_fp8_stream) stream_point(s,g4,u4,d4,gs,us,ds);
+    if(G_stream) stream_point(s,g4,u4,d4,gs,us,ds);
     else if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
     while(G.qn>=QT_QCAP && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
     enqueue_locked(layer,eid,-1,-1,0);
-    if(G_fp8_stream) stream_forget(s);
+    if(G_stream) stream_forget(s);
     pthread_mutex_unlock(&G.mx);
 }
 
@@ -1013,7 +1041,7 @@ void qt_note_planned(int layer,int eid,
         pthread_mutex_unlock(&G.mx);
         return;
     }
-    if(G_fp8_stream) stream_point(s,g4,u4,d4,gs,us,ds);
+    if(G_stream) stream_point(s,g4,u4,d4,gs,us,ds);
     else if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
     while(G.qn>=QT_QCAP && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
     if(!enqueue_locked(layer,eid,-1,-1,1)){
@@ -1021,7 +1049,7 @@ void qt_note_planned(int layer,int eid,
         if(s->planned) G.used[home(eid)]-=G.exp_bytes;
     }
     s->planned=0;
-    if(G_fp8_stream) stream_forget(s);
+    if(G_stream) stream_forget(s);
     pthread_mutex_unlock(&G.mx);
 }
 
@@ -1179,7 +1207,7 @@ void qt_shutdown(void){
     pthread_mutex_lock(&G.mx); G.th_stop=1; pthread_cond_signal(&G.cv); pthread_cond_broadcast(&G.cv_take); pthread_mutex_unlock(&G.mx);
     pthread_join(G.th,NULL);
     G.on=0;
-    G_fp8_stream=0;
+    G_stream=0; G_fp8_stream=0;
     coli_cuda_shutdown();
 }
 

@@ -97,6 +97,14 @@ int  qt_init_fp8(int n_layers, int n_experts, int hidden, int inter,
 int  qt_init(int n_layers, int n_experts, int hidden, int inter,
              int cap_experts_per_layer, int topk, int expert_gs,
              int expert_is_int4);
+/* Same streaming lifecycle as qt_init_fp8, for qwen36's own int4/int8
+ * formats: cap < n_experts is accepted, the RAM slots are an LRU the engine
+ * recycles, and the tier copies at qt_note instead of keeping pointers. */
+int  qt_init_stream(int n_layers, int n_experts, int hidden, int inter,
+                    int cap_experts_per_layer, int topk, int expert_gs,
+                    int expert_is_int4);
+int  qt_streaming(void);                  /* tier on AND in streaming mode */
+void qt_touch(int layer, int eid);        /* heat only: resident expert routed, not loaded */
 int  qt_ready(void);
 int  qt_is_resident(int layer, int eid);
 void qt_shutdown(void);
@@ -148,6 +156,9 @@ static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(vo
 static inline int  qt_dense_init(const int8_t*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}
 static inline int  qt_dense_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_count(void){return 0;}
+static inline int  qt_init_stream(int a,int b,int c,int d,int e,int f,int g,int h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
+static inline int  qt_streaming(void){return 0;}
+static inline void qt_touch(int a,int b){(void)a;(void)b;}
 static inline int  qt_ready(void){return 0;}
 static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_shutdown(void){}

@@ -1869,6 +1869,12 @@ tests/test_qwen36_tier_autoplace$(EXE): tests/test_qwen36_tier_autoplace.c tests
 tests/test_qwen36_tier_fp8$(EXE): tests/test_qwen36_tier_fp8.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# The same streaming lifecycle for qwen36's int4 gs64 experts (qt_init_stream):
+# cap < n_experts accepted, fmt 4 XOR-staged, no slot pointer kept, qt_touch
+# keeps routed residents hot, no leak into a later full-residency init.
+tests/test_qwen36_tier_stream$(EXE): tests/test_qwen36_tier_stream.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 # Generic resident dense matrices (the Qwen3.8 trunk) and per-offer placement.
 tests/test_qwen36_tier_dense$(EXE): tests/test_qwen36_tier_dense.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
