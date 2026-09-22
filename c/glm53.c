@@ -3517,7 +3517,7 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
 #ifndef GLM53_NO_MAIN
 int main(int argc, char **argv) {
     coli_env_check(CE_GLM53, "glm53");
-    if (getenv("COLI_ENV_DUMP")) coli_env_dump(CE_GLM53, "glm53");
+    coli_env_dump(CE_GLM53, "glm53");
     /* Physical-core team sizing, the same shared helper colibri/inkling/
      * kimi_k3/olmoe/deepseek-v41 call. This engine has no OpenMP sizing of its
      * own, so on an SMT host it ran one thread per logical CPU; #718 measured

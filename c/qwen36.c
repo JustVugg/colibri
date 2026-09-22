@@ -3656,7 +3656,7 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
 
 int main(int argc, char **argv) {
     coli_env_check(CE_QWEN, "qwen36");
-    if (getenv("COLI_ENV_DUMP")) coli_env_dump(CE_QWEN, "qwen36");
+    coli_env_dump(CE_QWEN, "qwen36");
     /* Physical-core team sizing, as colibri/inkling/kimi_k3/olmoe/deepseek-v41
      * do. Without it this engine takes one thread per logical CPU, which on an
      * SMT host doubles the team for no arithmetic and pays a barrier per tiny

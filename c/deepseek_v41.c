@@ -3879,7 +3879,7 @@ static int *load_ids(jval *root, const char *key, int *count) {
 
 int main(int argc, char **argv) {
     coli_env_check(CE_DSV41, "deepseek-v41");
-    if (getenv("COLI_ENV_DUMP")) coli_env_dump(CE_DSV41, "deepseek-v41");
+    coli_env_dump(CE_DSV41, "deepseek-v41");
     /* Size the team to PHYSICAL cores before anything else touches the model.
      * This engine issues ~720 OpenMP regions per decoded token -- three per
      * expert application, 240 applications a token -- and every one of them is

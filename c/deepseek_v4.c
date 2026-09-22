@@ -11957,7 +11957,7 @@ static int has_sentence_end(const char *text, int length) {
 
 int main(int argc, char **argv) {
     coli_env_check(CE_DSV4, "deepseek-v4");
-    if (getenv("COLI_ENV_DUMP")) coli_env_dump(CE_DSV4, "deepseek-v4");
+    coli_env_dump(CE_DSV4, "deepseek-v4");
     if (argc < 3 || argc > 6) {
         fprintf(stderr, "usage: %s MODEL_DIR INPUT_TOKEN_ID [TOKEN_COUNT]\n"
                         "       %s MODEL_DIR --prompt TEXT [MAX_NEW_TOKENS] [--stop-sentence]\n",
@@ -14540,7 +14540,7 @@ static int v4_omp_reserve_loader_cpus(void) {
 
 int main(int argc, char **argv) {
     coli_env_check(CE_DSV4, "deepseek-v4");
-    if (getenv("COLI_ENV_DUMP")) coli_env_dump(CE_DSV4, "deepseek-v4");
+    coli_env_dump(CE_DSV4, "deepseek-v4");
 #ifdef _OPENMP
     if (!v4_omp_reserve_loader_cpus())
         fprintf(stderr, "[OMP] deepseek-v4: effective team size %d\n",

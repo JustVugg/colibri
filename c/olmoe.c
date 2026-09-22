@@ -1800,7 +1800,7 @@ int main(int argc, char **argv) {
      * otherwise, and the run then reports a plausible number for the WRONG
      * configuration. See coli_env.h. */
     coli_env_check(CE_OLMOE, "olmoe");
-    if (getenv("COLI_ENV_DUMP")) coli_env_dump(CE_OLMOE, "olmoe");
+    coli_env_dump(CE_OLMOE, "olmoe");
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("OLMoE"); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;

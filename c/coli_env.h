@@ -601,6 +601,8 @@ static int coli_env_check(unsigned short self, const char *name) {
 /* Every variable this engine reads, its type, and whether it is set right now.
  * Answers "is my export actually reaching the engine" without a debugger. */
 static void coli_env_dump(unsigned short self, const char *name) {
+    const char *enabled = getenv("COLI_ENV_DUMP");
+    if (!enabled || !atoi(enabled)) return;
     int n = 0;
     for (int i = 0; i < COLI_ENV_N; i++) {
         const ColiEnvVar *v = &coli_env_table[i];

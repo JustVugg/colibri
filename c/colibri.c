@@ -11112,7 +11112,7 @@ int main(int argc, char **argv){
      * otherwise, and the run then reports a plausible number for the WRONG
      * configuration. See coli_env.h. */
     coli_env_check(CE_COLIBRI, "colibri");
-    if (getenv("COLI_ENV_DUMP")) coli_env_dump(CE_COLIBRI, "colibri");
+    coli_env_dump(CE_COLIBRI, "colibri");
     /* #718: the hot-team block above tunes wake latency but historically left
      * GLM at libgomp's logical-CPU default.  Memory-bound quantized matmuls can
      * collapse when SMT siblings share each core, measured 2.3x on a 5950X.

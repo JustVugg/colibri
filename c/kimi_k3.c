@@ -3258,7 +3258,7 @@ int main(int argc, char **argv){
      * otherwise, and the run then reports a plausible number for the WRONG
      * configuration. See coli_env.h. */
     coli_env_check(CE_KIMI, "kimi_k3");
-    if (getenv("COLI_ENV_DUMP")) coli_env_dump(CE_KIMI, "kimi_k3");
+    coli_env_dump(CE_KIMI, "kimi_k3");
     int serving=getenv("SERVE")&&getenv("SERVE")[0]=='1';
     /* Usage was printed only when there were NO arguments, so `--help` fell
      * through as the model directory and the engine went looking for
