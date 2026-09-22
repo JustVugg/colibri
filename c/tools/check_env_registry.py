@@ -22,7 +22,12 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 C_DIR = os.path.dirname(HERE)
 
-GETENV = re.compile(r'(?:q38_env_bool|(?:compat_)?getenv(?:_utf8)?)\(\s*"([A-Z0-9_]+)"')
+GETENV = re.compile(r'\b(?:q38_env_bool|(?:compat_)?getenv(?:_utf8)?)\s*\(\s*"([A-Z0-9_]+)"')
+# Consume literals and comments before looking for calls. This is a lexical
+# scan of literal names, not a C preprocessor or dynamic-name evaluator.
+SOURCE_TOKEN = re.compile(
+    r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|/\*.*?\*/|'
+    + GETENV.pattern, re.DOTALL)
 ROW = re.compile(r'^\s*\{"([A-Z0-9_]+)"\s*,')
 
 
@@ -40,8 +45,10 @@ def scan_sources():
             # reading it.
             path = os.path.join(root, f)
             with open(path, errors="replace") as fh:
-                for n, line in enumerate(fh, 1):
-                    for m in GETENV.finditer(line):
+                source = fh.read()
+                for m in SOURCE_TOKEN.finditer(source):
+                    if m.group(1) is not None:
+                        n = source.count("\n", 0, m.start()) + 1
                         found.setdefault(m.group(1), []).append(
                             "%s:%d" % (os.path.relpath(path, C_DIR), n))
     return found
