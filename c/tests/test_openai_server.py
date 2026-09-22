@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 from pathlib import Path
 
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
-                           CONTINUATION_FAMILIES,
+                           CONTINUATION_FAMILIES, _marker_cuts,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, _image_bytes_from_url, cap_for_arch, conversation_cache_slot, model_arch,
@@ -28,7 +28,10 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            render_chat_qwen38, render_chat_v4, render_chat_dsv41,
                            _dsv4_tool_calls, serve,
                            resolve_generation_prompt, split_thinking_reply,
-                           starts_in_reasoning,
+                           split_thinking_reply_spans, starts_in_reasoning,
+                           parse_tool_calls_spans, parse_arch_tool_calls_spans,
+                           THINK_OPEN, THINK_CLOSE,
+                           _compose_span_maps, _cut_span_map, _project_span,
                            stop_policy, tune_child_env)
 
 
@@ -545,6 +548,244 @@ class StopFilterTest(unittest.TestCase):
         stop_filter.finish()
         self.assertEqual(output, [])
         self.assertEqual(stop_filter.matched, "STOP")
+
+
+class SpanMapPrimitivesTest(unittest.TestCase):
+    """The stage-map algebra, on literal maps written out by hand -- no stage builds any of
+    these, so nothing here can be satisfied by the same code it polices."""
+
+    def test_cut_map_records_the_survivors_around_each_cut(self):
+        # "abcXYdef" minus [3, 5): two survivors, and the second one's output position is 3
+        # because exactly three characters precede it.
+        self.assertEqual(_cut_span_map(8, [(3, 5)]), [(0, 3, 0), (5, 8, 3)])
+
+    def test_adjacent_cuts_leave_one_merged_survivor_not_two(self):
+        # "abcd" minus [1, 2) and [2, 3) is one span on each side, never two abutting ones.
+        self.assertEqual(_cut_span_map(4, [(1, 2), (2, 3)]), [(0, 1, 0), (3, 4, 1)])
+
+    def test_composition_chains_two_stages_into_one_map(self):
+        # Stage one deletes "XY" from "abcXYdef" and hands "abcdef" on; stage two deletes
+        # "cd" from that, leaving "abef". Composed, the map speaks the original string's
+        # coordinates: 'a','b' at 0,1 and 'e','f' at 6,7.
+        first = [(0, 3, 0), (5, 8, 3)]
+        second = [(0, 2, 0), (4, 6, 2)]
+        self.assertEqual(_compose_span_maps(first, second), [(0, 2, 0), (6, 8, 2)])
+
+    def test_composition_is_associative_over_three_stages(self):
+        first, second, third = [(0, 3, 0), (5, 8, 3)], [(0, 2, 0), (4, 6, 2)], [(1, 4, 0)]
+        self.assertEqual(_compose_span_maps(_compose_span_maps(first, second), third),
+                         _compose_span_maps(first, _compose_span_maps(second, third)))
+
+    def test_projection_of_a_fully_deleted_range_is_none_not_zero_zero(self):
+        # The distinction a prefix walk never makes: "deleted" is not "at offset 0".
+        self.assertIsNone(_project_span([(0, 2, 0), (6, 8, 2)], 3, 5))
+
+    def test_projection_spans_a_hole_because_survivors_close_up(self):
+        # Input [1, 7) covers 'b' (survives at 1) and 'e' (survives at 2) with the deleted
+        # middle between them: the image is the contiguous [1, 3).
+        self.assertEqual(_project_span([(0, 2, 0), (6, 8, 2)], 1, 7), (1, 3))
+
+    def test_cuts_out_of_order_produce_the_map_their_deletion_does(self):
+        # The map is the deletion, whatever order the ranges arrive in. Walking an
+        # unordered list as if it were sorted produces a map no deletion corresponds to,
+        # silently, and every stage downstream then reads the wrong coordinates.
+        text = "abcXYdefZW"
+        for cuts in ([(3, 5), (8, 10)], [(8, 10), (3, 5)]):
+            with self.subTest(cuts=cuts):
+                spans = _cut_span_map(len(text), cuts)
+                self.assertEqual(spans, [(0, 3, 0), (5, 8, 3)])
+                self.assertEqual("".join(text[a:b] for a, b, _o in spans), "abcdef")
+
+    def test_an_empty_marker_yields_no_cuts(self):
+        # `str.find("")` returns the cursor forever, so a marker that is somehow empty
+        # would spin rather than fail. Unreachable today -- both markers are non-empty
+        # module constants -- and the guard is one line.
+        self.assertEqual(_marker_cuts("abc", ""), [])
+        self.assertEqual(_marker_cuts("abcabc", "bc"), [(1, 3), (4, 6)])
+
+    def test_projection_clamps_a_range_that_runs_off_the_end(self):
+        # Records outlive the map: after a stop match the engine keeps sending frames the
+        # stop filter never sees, and those must project to nothing.
+        self.assertEqual(_project_span([(0, 3, 0)], 2, 9), (2, 3))
+        self.assertIsNone(_project_span([(0, 3, 0)], 4, 9))
+
+
+class StopFilterSpanAccountingTest(unittest.TestCase):
+    """The stop filter's map, with its own oracle: every expected span below is written out
+    by hand from the chunk sequence, never read back from the filter."""
+
+    def test_normal_flush_spans_the_characters_it_released(self):
+        # "one S" holds back the "S" (a live prefix of "STOP"); the next chunk resolves it.
+        # Both flushes are one contiguous run of the raw stream, so the canonical map is
+        # one span covering "one Swo", not two abutting ones.
+        output = []
+        stop_filter = StopFilter(("STOP",), output.append, track_spans=True)
+        stop_filter.feed("one S")
+        self.assertEqual(stop_filter.spans, [(0, 4, 0)])
+        stop_filter.feed("wo")
+        stop_filter.finish()
+        self.assertEqual("".join(output), "one Swo")
+        self.assertEqual(stop_filter.spans, [(0, 7, 0)])
+
+    def test_finish_spans_the_pending_tail_it_releases(self):
+        # "ST" is still held when the engine stops, so the map must grow at finish().
+        output = []
+        stop_filter = StopFilter(("STOP",), output.append, track_spans=True)
+        stop_filter.feed("tail ST")
+        self.assertEqual(stop_filter.spans, [(0, 5, 0)])
+        stop_filter.finish()
+        self.assertEqual("".join(output), "tail ST")
+        self.assertEqual(stop_filter.spans, [(0, 7, 0)])
+
+    def test_ignored_leading_marker_is_a_hole_in_the_map(self):
+        # "<|user|>" occupies raw [0, 8) and reaches no one, so the map starts at 8 and
+        # "Hello world" lands at output 0. A consumer reading this cannot conclude that
+        # record 0 was emitted.
+        output = []
+        stop_filter = StopFilter(("<|user|>",), output.append, ignore_leading=True,
+                                 track_spans=True)
+        for chunk in ("<|user|>", "Hello", " world"):
+            stop_filter.feed(chunk)
+        stop_filter.finish()
+        self.assertEqual("".join(output), "Hello world")
+        self.assertEqual(stop_filter.spans, [(8, 19, 0)])
+
+    def test_matched_stop_spans_only_the_prefix_it_emitted(self):
+        # "He" then "llo" against stop "lo" emits "Hel" and stops. Raw "Hello" is five
+        # characters; only [0, 3) was ever released.
+        output = []
+        stop_filter = StopFilter(("lo",), output.append, track_spans=True)
+        for chunk in ("He", "llo", "X"):
+            stop_filter.feed(chunk)
+        stop_filter.finish()
+        self.assertEqual("".join(output), "Hel")
+        self.assertEqual(stop_filter.matched, "lo")
+        self.assertEqual(stop_filter.spans, [(0, 3, 0)])
+
+    def test_stop_split_across_two_feeds_closes_the_map_at_the_match(self):
+        # The sequence arrives as "S" / "TO" / "P": the filter holds a growing partial
+        # prefix across three calls and must not count the held characters as emitted. Raw
+        # is "answer STOPignored" (18 characters); the map ends at 7.
+        output = []
+        stop_filter = StopFilter(("STOP",), output.append, track_spans=True)
+        for chunk in ("answer S", "TO", "Pignored"):
+            stop_filter.feed(chunk)
+        stop_filter.finish()
+        self.assertEqual("".join(output), "answer ")
+        self.assertEqual(stop_filter.matched, "STOP")
+        self.assertEqual(stop_filter.spans, [(0, 7, 0)])
+
+    def test_a_swallowed_marker_and_a_match_in_the_same_feed_call(self):
+        # Both events resolve inside a single feed(), where only the loop's local cursor
+        # has advanced past the swallowed marker. Reading the wrong one shifts the whole
+        # map to 0: "answer" would be reported as raw [0, 6) instead of [8, 14).
+        #   "<|user|>" [0,8) ignored - "answer" [8,14) emitted - "<|user|>tail" dropped
+        output = []
+        stop_filter = StopFilter(("<|user|>",), output.append, ignore_leading=True,
+                                 track_spans=True)
+        stop_filter.feed("<|user|>answer<|user|>tail")
+        stop_filter.finish()
+        self.assertEqual("".join(output), "answer")
+        self.assertEqual(stop_filter.matched, "<|user|>")
+        self.assertEqual(stop_filter.leading_matches_ignored, 1)
+        self.assertEqual(stop_filter.spans, [(8, 14, 0)])
+
+    def test_two_ignored_markers_then_a_real_match_leave_both_holes(self):
+        # Raw is
+        #   "<|user|>" "<|user|>" "ok " "STOP" "rest" = [0,8) [8,16) [16,19) [19,23) [23,27)
+        # The map is the single interval [16, 19): everything else was dropped here.
+        output = []
+        stop_filter = StopFilter(("<|user|>", "STOP"), output.append, ignore_leading=True,
+                                 track_spans=True)
+        for chunk in ("<|user|>", "<|user|>", "ok ", "STOPrest"):
+            stop_filter.feed(chunk)
+        stop_filter.finish()
+        self.assertEqual("".join(output), "ok ")
+        self.assertEqual(stop_filter.leading_matches_ignored, 2)
+        self.assertEqual(stop_filter.matched, "STOP")
+        self.assertEqual(stop_filter.spans, [(16, 19, 0)])
+
+    def test_map_survives_arbitrary_chunking_of_the_same_raw_stream(self):
+        # Fed in three-character chunks, so every marker and the stop sequence straddle a
+        # feed() boundary. Two holes, written out by hand from the string:
+        #   [0,  8)  the first "<|user|>"   ignored (leading)
+        #   [8, 10)  the two spaces         emitted at output 0 -- they flush before the
+        #            second marker is visible, and blanks never set useful_content_seen,
+        #            so the marker after them is still leading
+        #   [10,18)  the second "<|user|>"  ignored (leading)
+        #   [18,29)  "alpha beta "          emitted at output 2
+        #   [29,37)  "STOPtail"             dropped at the match
+        raw = "<|user|>  <|user|>alpha beta STOPtail"
+        output = []
+        stop_filter = StopFilter(("<|user|>", "STOP"), output.append, ignore_leading=True,
+                                 track_spans=True)
+        for size in range(0, len(raw), 3):
+            stop_filter.feed(raw[size:size + 3])
+        stop_filter.finish()
+        self.assertEqual(stop_filter.spans, [(8, 10, 0), (18, 29, 2)])
+        self.assertEqual("".join(output), "  alpha beta ")
+        # ...and the relational form the literals above make non-vacuous: slicing the raw
+        # stream by the map rebuilds exactly what the filter emitted.
+        self.assertEqual("".join(raw[start:end] for start, end, _out in stop_filter.spans),
+                         "".join(output))
+
+    def test_spans_are_not_collected_unless_the_caller_asks(self):
+        output = []
+        stop_filter = StopFilter(("STOP",), output.append)
+        stop_filter.feed("plain text")
+        stop_filter.finish()
+        self.assertEqual("".join(output), "plain text")
+        self.assertEqual(stop_filter.spans, [])
+
+
+class StageSpanReportingTest(unittest.TestCase):
+    """The thinking split and the tool-call parse report maps that describe the text they
+    return: slicing the stage's input by its map rebuilds the stage's output exactly."""
+
+    def _assert_map_rebuilds(self, source, produced, span_map):
+        self.assertEqual("".join(source[start:end] for start, end, _out in span_map),
+                         produced)
+
+    def test_thinking_split_maps_both_buckets(self):
+        raw = THINK_OPEN + "why" + THINK_CLOSE + "answer"
+        thinking, answer, (thinking_map, answer_map) = split_thinking_reply_spans(raw)
+        self.assertEqual((thinking, answer), ("why", "answer"))
+        self._assert_map_rebuilds(raw, thinking, thinking_map)
+        self._assert_map_rebuilds(raw, answer, answer_map)
+
+    def test_thinking_split_map_is_empty_when_the_bucket_is(self):
+        raw = "plain answer"
+        thinking, answer, (thinking_map, answer_map) = split_thinking_reply_spans(
+            raw, enable_thinking=False)
+        self.assertEqual((thinking, answer), ("", "plain answer"))
+        self.assertEqual(thinking_map, [])
+        self._assert_map_rebuilds(raw, answer, answer_map)
+
+    def test_tool_call_parse_maps_the_content_it_returns(self):
+        tools = [{"function": {"name": "search",
+                               "parameters": {"properties": {"q": {"type": "string"}}}}}]
+        raw = ("before <tool_call>search<arg_key>q</arg_key><arg_value>x</arg_value>"
+               "</tool_call> after")
+        content, calls, box_map, content_map = parse_tool_calls_spans(raw, tools)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(content, "before  after")
+        self._assert_map_rebuilds(raw, content, content_map)
+        # The box map stops after the tool-call removal, before the strip: it is what tells
+        # a character consumed as tool-call syntax apart from one consumed as markup.
+        self._assert_map_rebuilds(raw, "before  after", box_map)
+
+    def test_tool_call_parse_map_covers_the_thinking_prefix_it_drops(self):
+        raw = "reasoning" + THINK_CLOSE + "  visible  "
+        content, calls, _box_map, content_map = parse_tool_calls_spans(raw, None)
+        self.assertEqual((content, calls), ("visible", []))
+        self._assert_map_rebuilds(raw, content, content_map)
+
+    def test_shims_return_exactly_what_the_span_forms_do(self):
+        raw = THINK_OPEN + "why" + THINK_CLOSE + " answer "
+        self.assertEqual(split_thinking_reply(raw), split_thinking_reply_spans(raw)[:2])
+        self.assertEqual(parse_tool_calls(raw), parse_tool_calls_spans(raw)[:2])
+        self.assertEqual(parse_arch_tool_calls(raw, None),
+                         parse_arch_tool_calls_spans(raw, None)[:2])
 
 
 class ProtocolTest(unittest.TestCase):

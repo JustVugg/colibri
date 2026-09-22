@@ -376,6 +376,100 @@ _SALVAGE = os.environ.get("COLI_TOOL_SALVAGE", "0") == "1"
 _TOOL_FALLBACK = os.environ.get("COLI_TOOL_FALLBACK", "0") == "1"
 
 
+# ---- raw-stream span maps ---------------------------------------------------------------
+# Every transformation between the engine's raw stream and the string a client receives is
+# a DELETION: the stop filter withholds a matched sequence, the thinking split routes each
+# character into one bucket or the other, the tool-call parse removes box syntax. None
+# writes a character its input did not hold and none reorders, so a stage can report what
+# it did as an ordered list of surviving intervals -- [(in_start, in_end, out_start), ...],
+# monotonic and non-overlapping -- in ITS OWN INPUT's coordinates. Output positions are
+# assigned in input order with no gaps, which keeps the image of a contiguous range
+# contiguous and composition associative.
+
+def _append_span(spans, in_start, in_end, out_start):
+    """Append one surviving interval, merging it into the previous one when the two are
+    adjacent on both sides so the map stays canonical."""
+    if in_end <= in_start:
+        return
+    if spans:
+        previous_start, previous_end, previous_out = spans[-1]
+        if previous_end == in_start and previous_out + (previous_end - previous_start) == out_start:
+            spans[-1] = (previous_start, in_end, previous_out)
+            return
+    spans.append((in_start, in_end, out_start))
+
+
+def _cut_span_map(length, cuts):
+    """The deletion map for removing `cuts` -- possibly overlapping [start, end) ranges --
+    from a string of `length` characters.
+
+    The cuts are sorted here rather than required to arrive sorted: every caller today
+    produces them in order, and an out-of-order list silently produced a wrong map, which
+    is the kind of precondition a later caller discovers the expensive way."""
+    spans, cursor, out = [], 0, 0
+    for start, end in sorted(cuts):
+        if start > cursor:
+            _append_span(spans, cursor, start, out)
+            out += start - cursor
+        cursor = max(cursor, end)
+    if cursor < length:
+        _append_span(spans, cursor, length, out)
+    return spans
+
+
+def _apply_cuts(text, cuts):
+    """`(remaining text, deletion map)` for removing `cuts` from `text`. One step of a
+    multi-step stage: the caller composes the steps' maps in the same order it applies
+    them, because each step's cuts are found in the text the previous step produced."""
+    spans = _cut_span_map(len(text), cuts)
+    return "".join(text[start:end] for start, end, _out in spans), spans
+
+
+def _compose_span_maps(first, second):
+    """Chain a stage's map with the map of the stage that consumes its output: `first` is
+    X -> Y, `second` is Y -> Z, and the result is X -> Z."""
+    composed, index = [], 0
+    for in_start, in_end, out_start in first:
+        middle_end = out_start + (in_end - in_start)
+        while index < len(second) and second[index][1] <= out_start:
+            index += 1                      # `first` is monotonic in Y, so this never rewinds
+        probe = index
+        while probe < len(second) and second[probe][0] < middle_end:
+            middle_start, middle_stop, final_out = second[probe]
+            low, high = max(out_start, middle_start), min(middle_end, middle_stop)
+            if low < high:
+                _append_span(composed, in_start + (low - out_start), in_start + (high - out_start),
+                             final_out + (low - middle_start))
+            probe += 1
+    return composed
+
+
+def _project_point(span_map, position):
+    """How many input characters strictly before `position` survive `span_map`."""
+    low, high = 0, len(span_map)
+    while low < high:
+        middle = (low + high) // 2
+        if span_map[middle][0] <= position:
+            low = middle + 1
+        else:
+            high = middle
+    if low == 0:
+        return 0
+    in_start, in_end, out_start = span_map[low - 1]
+    return out_start + min(position, in_end) - in_start
+
+
+def _project_span(span_map, start, end):
+    """Where input range [start, end) lands in the stage's output, or None when every
+    character of it was deleted.
+
+    One interval, not a list: a deletion map assigns output positions in input order with
+    no gaps, so even a deletion inside the range leaves a contiguous image -- the survivors
+    on either side of the hole become adjacent once the hole is gone."""
+    low, high = _project_point(span_map, start), _project_point(span_map, end)
+    return (low, high) if high > low else None
+
+
 def _tool_choice_name(tool_choice):
     """The tool name a dict `tool_choice` forces, or None.
 
@@ -467,9 +561,63 @@ def _unclosed_tail(reply, tools):
     return inner if inner.strip() in declared else None
 
 
+def _marker_cuts(text, marker):
+    """Every non-overlapping occurrence of `marker`, left to right -- what
+    str.replace(marker, "") removes, found as ranges instead of applied as a rewrite."""
+    if not marker:
+        return []                                 # find("") never advances past `index`
+    cuts, index = [], text.find(marker)
+    while index >= 0:
+        cuts.append((index, index + len(marker)))
+        index = text.find(marker, index + len(marker))
+    return cuts
+
+
+def _tool_call_content_spans(reply, tail):
+    """parse_tool_calls' content derivation as `(content, box_map, content_map)`, both maps
+    in `reply`'s own coordinates.
+
+    Every step is a deletion or a slice, so the whole derivation is one composed map. The
+    steps are applied in order and composed in the same order, because each step's cuts are
+    found in the text the previous step produced. `box_map` stops after the tool-call
+    removals, which is what tells a character consumed as tool-call syntax apart from one
+    consumed as thinking markup.
+
+    Both maps are None for inkling, whose marker stripping is not modelled here: an inkling
+    engine does not support the numeric logprobs channel, so no logprobs object can reach
+    this text to be aligned."""
+    cuts = [(match.start(), match.end()) for match in _BOX_RE.finditer(reply)]
+    text, box_map = _apply_cuts(reply, cuts)
+    if tail is not None:                       # drop the recovered tail from the visible content
+        text, step = _apply_cuts(text, [(text.rindex(BOX_START), len(text))])
+        box_map = _compose_span_maps(box_map, step)
+    content_map = box_map
+    if ARCH == "inkling":
+        text = strip_inkling_markers(text)   # thinking is reasoning, not answer
+        box_map = content_map = None
+    if THINK_CLOSE in text:
+        text, step = _apply_cuts(text, [(0, text.index(THINK_CLOSE) + len(THINK_CLOSE))])
+        content_map = content_map and _compose_span_maps(content_map, step)
+    for marker in (THINK_OPEN, THINK_CLOSE):
+        text, step = _apply_cuts(text, _marker_cuts(text, marker))
+        content_map = content_map and _compose_span_maps(content_map, step)
+    stripped = text.strip()
+    head = len(text) - len(text.lstrip())
+    text, step = _apply_cuts(text, [(0, head), (head + len(stripped), len(text))])
+    content_map = content_map and _compose_span_maps(content_map, step)
+    return text, box_map, content_map
+
+
 def parse_tool_calls(reply, tools=None):
     """Return (content, tool_calls). Strict GLM parse; optional de-mangler (COLI_TOOL_SALVAGE=1)
     rescues malformed int4 output by mapping a lone payload onto the tool's primary parameter."""
+    content, calls, _box_map, _content_map = parse_tool_calls_spans(reply, tools)
+    return content, calls
+
+
+def parse_tool_calls_spans(reply, tools=None):
+    """parse_tool_calls plus the tool-call stage's maps: `(content, tool_calls, box_map,
+    content_map)`. One implementation, so the maps cannot drift from the text."""
     param_order = _tool_param_order(tools)
     param_types = _tool_param_types(tools)
     calls, salvaged = [], []
@@ -512,14 +660,7 @@ def parse_tool_calls(reply, tools=None):
         sys.stderr.write("[api] tools declared and tool-call markers present, but no call "
                          "parsed -- output may be quantization-mangled; try COLI_TOOL_SALVAGE=1\n")
         sys.stderr.flush()
-    text = _BOX_RE.sub("", reply)
-    if tail is not None:                       # drop the recovered tail from the visible content
-        text = text[:text.rindex(BOX_START)]
-    if ARCH == "inkling":
-        text = strip_inkling_markers(text)   # thinking is reasoning, not answer
-    if THINK_CLOSE in text:
-        text = text.split(THINK_CLOSE, 1)[1]
-    text = text.replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
+    text, box_map, content_map = _tool_call_content_spans(reply, tail)
     if calls:
         dm, rec = len(salvaged), (1 if tail is not None else 0)
         sys.stderr.write("[api] tool-calls: %d total, %d strict, %d unclosed-recovered, "
@@ -528,7 +669,7 @@ def parse_tool_calls(reply, tools=None):
                             "CLEAN" if dm == 0 and rec == 0 else "RECOVERED",
                             (" -> " + ", ".join(salvaged)) if dm else ""))
         sys.stderr.flush()
-    return text.strip(), calls
+    return text, calls, box_map, content_map
 
 
 # ---- DeepSeek V4 tool calling (DSML) -------------------------------------------------------
@@ -690,18 +831,30 @@ def parse_dsv41_tool_calls(reply):
 
 def parse_arch_tool_calls(reply, tools, tool_reply=None):
     """Architecture-appropriate tool-call parser. Returns (content, tool_calls)."""
+    content, calls, _box_map, _content_map = parse_arch_tool_calls_spans(reply, tools, tool_reply)
+    return content, calls
+
+
+def parse_arch_tool_calls_spans(reply, tools, tool_reply=None):
+    """parse_arch_tool_calls plus the tool-call stage's maps: `(content, tool_calls,
+    box_map, content_map)`.
+
+    Only the glm/default parser reports maps; the others return None for both. A request
+    that opted into the numeric logprobs channel is refused with a named 400 on any other
+    architecture, so no reply reaching those branches can carry a logprobs object for a
+    map to align."""
     if ARCH == "deepseek_v4":
-        return parse_dsv4_tool_calls(reply)
+        return parse_dsv4_tool_calls(reply) + (None, None)
     if ARCH == "deepseek_v41":
-        return parse_dsv41_tool_calls(reply)
+        return parse_dsv41_tool_calls(reply) + (None, None)
     if ARCH == "kimi":
         if tool_reply is not None:
             _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
-            return reply.strip(), calls
-        return parse_k3_tool_calls(reply, tools)  # compatibility with pre-#1147 engines
+            return reply.strip(), calls, None, None
+        return parse_k3_tool_calls(reply, tools) + (None, None)  # pre-#1147 engines
     if ARCH == "qwen38":
-        return parse_qwen38_tool_calls(reply, tools)
-    return parse_tool_calls(reply, tools)
+        return parse_qwen38_tool_calls(reply, tools) + (None, None)
+    return parse_tool_calls_spans(reply, tools)
 
 
 def _tool_stream_markers():
@@ -2636,7 +2789,15 @@ def starts_in_reasoning(enable_thinking, add_generation_prompt=True):
 
 
 class ThinkingStreamSplit:
-    """Split GLM's reasoning marker without leaking markers across stream chunks."""
+    """Split GLM's reasoning marker without leaking markers across stream chunks.
+
+    `thinking_spans` and `text_spans` are this stage's maps, in its own input's
+    coordinates. Every character is routed to exactly one bucket or is marker syntax
+    routed to neither, and which bucket decides which array a token record belongs to.
+
+    Unlike the stop filter's map these are built unconditionally: they cost two list
+    appends and a merge per emitted run, which is not worth a flag and a second code path
+    through the splitter."""
     MARKERS = (THINK_OPEN, THINK_CLOSE)
 
     def __init__(self, on_thinking, on_text, on_thinking_end=None, initial_thinking=True):
@@ -2648,10 +2809,19 @@ class ThinkingStreamSplit:
         # the splitter must start in text mode or it would file the whole answer as reasoning.
         self.thinking = initial_thinking
         self.buf = ""
+        self.thinking_spans = []
+        self.text_spans = []
+        self.consumed = 0                 # input characters resolved, marker or not
 
     def _emit(self, text):
         if text:
             (self.on_thinking if self.thinking else self.on_text)(text)
+            spans = self.thinking_spans if self.thinking else self.text_spans
+            _append_span(spans, self.consumed, self.consumed + len(text),
+                         spans[-1][2] + (spans[-1][1] - spans[-1][0]) if spans else 0)
+        # Every emitted run is a prefix of `buf`, so the run's input start is always
+        # `consumed` and advancing it here keeps that true for the next one.
+        self.consumed += len(text)
 
     def feed(self, chunk):
         self.buf += chunk
@@ -2662,6 +2832,7 @@ class ThinkingStreamSplit:
                 offset, marker = min(hits, key=lambda hit: hit[0])
                 self._emit(self.buf[:offset])
                 self.buf = self.buf[offset + len(marker):]
+                self.consumed += len(marker)      # the marker itself reaches neither bucket
                 if marker == THINK_CLOSE and self.thinking:
                     self.thinking = False
                     if self.on_thinking_end:
@@ -2687,13 +2858,21 @@ class ThinkingStreamSplit:
 
 def split_thinking_reply(text, enable_thinking=True, add_generation_prompt=True):
     """Return the marker-free (thinking, answer) portions of one GLM reply."""
+    thinking, answer, _spans = split_thinking_reply_spans(text, enable_thinking,
+                                                          add_generation_prompt)
+    return thinking, answer
+
+
+def split_thinking_reply_spans(text, enable_thinking=True, add_generation_prompt=True):
+    """split_thinking_reply plus the split's maps: `(thinking, answer, (thinking_map,
+    answer_map))`, both in `text`'s own coordinates."""
     thinking, answer = [], []
     split = ThinkingStreamSplit(thinking.append, answer.append,
                                 initial_thinking=starts_in_reasoning(enable_thinking,
                                                                      add_generation_prompt))
     split.feed(text)
     split.finish()
-    return "".join(thinking), "".join(answer)
+    return "".join(thinking), "".join(answer), (split.thinking_spans, split.text_spans)
 
 
 def _anthropic_block_text(blocks, param):
@@ -2936,8 +3115,13 @@ def stop_policy(body, chat):
 
 
 class StopFilter:
-    """Stream text without exposing a full or partial stop sequence."""
-    def __init__(self, sequences, emit, ignore_leading=False):
+    """Stream text without exposing a full or partial stop sequence.
+
+    `spans` is this stage's map: the intervals of the raw stream -- the concatenation of
+    everything ever fed -- that reached `emit`, each with where it landed in the emitted
+    text. It is built only when `track_spans` is set, so a request that never asked for
+    per-token logprobs pays nothing for it."""
+    def __init__(self, sequences, emit, ignore_leading=False, track_spans=False):
         self.sequences = tuple(sequences)
         self.emit = emit
         self.ignore_leading = ignore_leading
@@ -2945,10 +3129,19 @@ class StopFilter:
         self.matched = None
         self.useful_content_seen = False
         self.leading_matches_ignored = 0
+        self.track_spans = track_spans
+        self.spans = []
+        # Raw offset of self.pending[0], equivalently of feed()'s `text[0]`. Everything the
+        # filter drops is accounted for by advancing this without emitting.
+        self.raw_base = 0
+        self.emitted = 0
 
-    def _emit(self, text):
+    def _emit(self, text, raw_start):
         if text:
             self.emit(text)
+            if self.track_spans:
+                _append_span(self.spans, raw_start, raw_start + len(text), self.emitted)
+            self.emitted += len(text)
             if text.strip():
                 self.useful_content_seen = True
 
@@ -2956,6 +3149,7 @@ class StopFilter:
         if self.matched is not None:
             return
         text = self.pending + chunk
+        base = self.raw_base
         self.pending = ""
         while True:
             match = None
@@ -2972,11 +3166,16 @@ class StopFilter:
                     and not prefix.strip()):
                 self.leading_matches_ignored += 1
                 text = text[offset + len(sequence):]
+                # The ignored marker and the blank prefix in front of it never reach the
+                # client, so no span covers them and a record inside one resolves to
+                # "not emitted" instead of derailing the alignment.
+                base += offset + len(sequence)
                 if not text:
+                    self.raw_base = base
                     return
                 continue
             self.matched = sequence
-            self._emit(prefix)
+            self._emit(prefix, base)
             return
 
         hold = 0
@@ -2987,12 +3186,13 @@ class StopFilter:
                 hold = size
         flush = len(text) - hold
         if flush:
-            self._emit(text[:flush])
+            self._emit(text[:flush], base)
         self.pending = text[flush:]
+        self.raw_base = base + flush
 
     def finish(self):
         if self.matched is None and self.pending:
-            self._emit(self.pending)
+            self._emit(self.pending, self.raw_base)
         self.pending = ""
 
     def stopped(self):
