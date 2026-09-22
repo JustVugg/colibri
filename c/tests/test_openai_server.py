@@ -15,9 +15,11 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from pathlib import Path
 
+import openai_server
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            CONTINUATION_FAMILIES, _marker_cuts,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
+                           LOGPROBS_TOP_K_CAP, logprobs_options,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, _image_bytes_from_url, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
@@ -25,8 +27,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            read_engine_turn, render_chat, render_chat_for_arch,
                            render_chat_glm53, render_chat_inkling, render_chat_kimi,
                            render_chat_olmoe,
-                           render_chat_qwen38, render_chat_v4, render_chat_dsv41,
-                           _dsv4_tool_calls, serve,
+                           render_chat_qwen38, render_chat_v4, render_chat_dsv41, serve,
                            resolve_generation_prompt, split_thinking_reply,
                            split_thinking_reply_spans, starts_in_reasoning,
                            parse_tool_calls_spans, parse_arch_tool_calls_spans,
@@ -35,22 +36,281 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            stop_policy, tune_child_env)
 
 
+def echo_record(pos, data, lp, topk):
+    """One engine ECHO record shaped exactly as Engine._dispatch_stdout builds it:
+    `pos`/`logprob`/`text`, the three keys the closed-set scorer reads with its own
+    None-for-nan convention, plus `bytes`/`lp`/`topk`, the payload and numeric tail the
+    OpenAI logprobs surface reads. Every fixture builds its echo records through this one
+    helper, so none can drift from the shape the dispatcher emits."""
+    return {"pos": pos,
+            "logprob": None if math.isnan(lp) else lp,
+            "text": data.decode("utf-8", "replace"),
+            "bytes": data,
+            "lp": lp,
+            "topk": topk}
+
+
+def _spawn_test_server(case, engine, kv_slots=1, max_tokens=16):
+    """A throwaway APIServer on an ephemeral port, torn down with the test case."""
+    server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", max_tokens,
+                       kv_slots=kv_slots)
+    thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
+    thread.start()
+    # LIFO: the join is registered first so it runs last. Joining a still-serving thread
+    # before shutdown() burns the whole timeout on every test that does it.
+    case.addCleanup(thread.join, timeout=2)
+    case.addCleanup(server.server_close)
+    case.addCleanup(server.shutdown)
+    case.addCleanup(server.scheduler.close)
+    return f"http://127.0.0.1:{server.server_port}"
+
+
+def _post_json(base, path, body):
+    return urlopen(Request(base + path, data=json.dumps(body).encode(),
+                           headers={"Authorization": "Bearer secret",
+                                    "Content-Type": "application/json"}), timeout=5)
+
+
+def _post_completions(base, body):
+    return _post_json(base, "/v1/completions", body)
+
+
+def _post_chat(base, body):
+    return _post_json(base, "/v1/chat/completions", body)
+
+
+def _error_body(case, call):
+    """The status and the parsed `error` object a refused request puts on the wire. Read
+    from the RESPONSE BODY, never from an exception object: a named exception that never
+    reaches the client is the defect, not the fix."""
+    with case.assertRaises(HTTPError) as caught:
+        call()
+    raw = caught.exception.read()
+    caught.exception.close()
+    return caught.exception.code, json.loads(raw)["error"]
+
+
+class ScriptedEngine:
+    """An engine double driven entirely by data: the text chunks it feeds to `on_text`, the
+    per-token numeric records it reports, and the prompt-echo frames it sends.
+
+    Every alignment fixture below is one of these with different data, so the boundary a
+    test describes lives in the test rather than in a subclass of its own."""
+
+    def __init__(self, chunks=("ok",), records="derive", echoes=(), echo_base=0,
+                 prompt_tokens=2, length_limited=False, supports_logprobs_echo=True,
+                 supports_tok_ids=True):
+        self.chunks = tuple(chunks)
+        # "derive" = one record per chunk, carrying that chunk's own bytes. None = the
+        # engine sends no numeric channel at all. A list = exactly those (bytes, lp, topk)
+        # triples, which is how a fixture makes the raw stream and the record bytes
+        # legitimately disagree.
+        self.records = records
+        self.echoes = tuple(echoes)
+        self.echo_base = echo_base            # the first wire `pos`, above 0 for a pin
+        self.prompt_tokens = prompt_tokens
+        self.length_limited = length_limited
+        self.supports_logprobs_echo = supports_logprobs_echo
+        self.supports_tok_ids = supports_tok_ids
+        self.calls = []
+        self.stop_requests = 0
+        self.last_logprobs = 0
+        self.last_echo = False
+        self.last_gbytes = False
+
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
+                 on_tool=None, image=None, logprobs=0, pin=False, on_echo=None,
+                 gbytes_before_ext=False):
+        self.calls.append((prompt, maximum, temperature, top_p, cache_slot, grammar))
+        self.last_logprobs = logprobs
+        self.last_echo = on_echo is not None
+        self.last_gbytes = gbytes_before_ext
+        if on_accept is not None:
+            on_accept({"prompt_tokens": self.prompt_tokens})
+        if logprobs and on_echo is not None:
+            for offset, (data, lp, topk) in enumerate(self.echoes):
+                on_echo(echo_record(self.echo_base + offset, data, lp, topk))
+        for chunk in self.chunks:
+            on_text(chunk)
+            if stopped and stopped():
+                self.stop_requests += 1
+                break
+        stats = {"prompt_tokens": self.prompt_tokens,
+                 "completion_tokens": len(self.chunks),
+                 "length_limited": self.length_limited}
+        if logprobs and self.records is not None:
+            triples = ([(chunk.encode("utf-8"), -0.1, [(1, -0.1)]) for chunk in self.chunks]
+                       if self.records == "derive" else self.records)
+            stats["logprobs"] = {"generated": [(data, {"lp": lp, "topk": topk})
+                                               for data, lp, topk in triples]}
+        return stats
+
+
+NAN = float("nan")
+
+# Three generated frames whose first is the GLM role marker the default chat stop policy
+# swallows. `raw_text` is "Hello world", and the
+# marker's record describes characters the client never received while the other two
+# describe characters it did.
+def _ignored_leading_marker_engine():
+    return ScriptedEngine(
+        chunks=("<|user|>", "Hello", " world"),
+        records=[(b"<|user|>", -0.1, [(0, -0.1)]),
+                 (b"Hello", -0.2, [(1, -0.2)]),
+                 (b" world", -0.30000000000000004, [(2, -0.30000000000000004)])],
+        echoes=[(b"h", NAN, []), (b"i", -0.1, [(1, -0.1)])])
+
+
+# One frame decoding to "Hello" against a `stop` of "lo". The filter emits "Hel" and matches, so the frame's record describes five characters
+# of which the client received three. The prompt echo is "pr" + "ompt".
+def _mid_token_stop_echo_engine():
+    return ScriptedEngine(
+        chunks=("Hello",),
+        records=[(b"Hello", -0.5, [(5, -0.5)])],
+        echoes=[(b"pr", NAN, []), (b"ompt", -0.1, [(1, -0.1)])])
+
+
+# A matched stop sequence withholds its own text and everything after it: neither the
+# "STOP" record nor the " more" record after it may survive into the response.
+def _stop_token_engine():
+    return ScriptedEngine(
+        chunks=("ok ", "STOP", " more"),
+        records=[(b"ok ", -0.1, [(1, -0.1)]),
+                 (b"STOP", -0.2, [(2, -0.2)]),
+                 (b" more", -0.3, [(3, -0.3)])],
+        echoes=[(b"h", NAN, []), (b"i", -0.1, [(1, -0.1)])])
+
+
+# The Euro sign split 1+2 across the prompt/generated seam -- lead byte on the last echo
+# frame -- with a later frame cut by a matched `stop`. A decoder with no leading-byte
+# context reads b"\x82\xac" as two replacement characters, and that is the raw stream the
+# stop filter sees.
+def _seam_split_stop_engine():
+    return ScriptedEngine(
+        chunks=("��", "xSTOPy"),
+        records=[(b"\x82\xac", -0.2, [(2, -0.2)]),
+                 (b"xSTOPy", -0.3, [(3, -0.3)])],
+        echoes=[(b"A", NAN, []), (b"\xe2", -0.1, [(1, -0.1)])])
+
+
+# The seam and the stop on the SAME record: one frame b"\x82\xacHello" whose first two
+# bytes complete a Euro sign whose lead byte rode the last prompt frame, cut after "Hel".
+def _seam_split_same_record_stop_engine():
+    return ScriptedEngine(
+        chunks=("��Hello",),
+        records=[(b"\x82\xacHello", -0.2, [(2, -0.2)])],
+        echoes=[(b"A", NAN, []), (b"\xe2", -0.1, [(1, -0.1)])])
+
+
+# The Euro sign split 1+1+1 across three frames: the first generated frame completes
+# nothing, so its own decoding is "" while the raw stream reads it as a replacement
+# character.
+def _seam_split_across_two_frames_engine():
+    return ScriptedEngine(
+        chunks=("�", "�Hello"),
+        records=[(b"\x82", -0.2, [(2, -0.2)]),
+                 (b"\xacHello", -0.3, [(3, -0.3)])],
+        echoes=[(b"A", NAN, []), (b"\xe2", -0.1, [(1, -0.1)])])
+
+
+# A frame that decodes to nothing, sitting exactly on the boundary of the emitted region,
+# whose bytes go into the `stop` sequence itself: "ok " occupies raw [0, 3), and the next
+# two frames are the halves of "é", which is the stop, so the map ends at 3.
+def _suppressed_stop_byte_engine():
+    return ScriptedEngine(
+        chunks=("ok ", "é"),
+        records=[(b"ok ", -0.1, [(1, -0.1)]),
+                 (b"\xc3", -0.3, [(3, -0.3)]),
+                 (b"\xa9", -0.4, [(4, -0.4)])])
+
+
+# Three generated chunks with a numeric tail for only `covered` of them. The real engine
+# gives an opted-in request a tail on every token, but a dropped frame or a different build
+# can do this, and the echo path rebuilds `text` from the records.
+def _partial_coverage_engine(covered, chunks=("AA", "BB", "CC"), record_bytes=None,
+                             echo_bytes=(b"P", b"Q")):
+    payloads = record_bytes or tuple(c.encode("utf-8") for c in chunks)
+    return ScriptedEngine(
+        chunks=chunks,
+        records=[(payload, -0.2, [(9, -0.2)]) for payload in payloads[:covered]],
+        echoes=[(piece, NAN if pos == 0 else -0.1, [] if pos == 0 else [(1, -0.1)])
+                for pos, piece in enumerate(echo_bytes)])
+
+
+# One generated chunk whose top-k table repeats a candidate id. `duplicate=False` is the
+# control: the same engine, the same shape, distinct ids.
+def _duplicate_candidate_engine(duplicate=True):
+    return ScriptedEngine(
+        chunks=("cat",),
+        records=[(b"cat", -0.5,
+                  [(7, -0.1), (7, -0.2)] if duplicate else [(7, -0.1), (8, -0.2)])])
+
+
+# A pin snapshot covers the first prompt token, so the prefill reads out positions 1..n-1
+# and there is nothing to read out before that.
+def _pinned_prefix_engine():
+    return ScriptedEngine(chunks=("ok",), echo_base=1, prompt_tokens=3,
+                          echoes=[(b"b", -0.1, [(1, -0.1)]), (b"c", -0.2, [(2, -0.2)])])
+
+
 class FakeEngine:
+    # Both capability gates, on: tests run under the module's default ARCH="glm", where
+    # Engine.__init__ sets both from the same arch check. The gate tests set them
+    # explicitly rather than relying on this.
+    supports_logprobs_echo = True
+    supports_tok_ids = True
+
     def __init__(self):
         self.calls = []
         self.stop_requests = 0
+        self.last_logprobs = 0
+        self.last_echo = False
+        self.last_gbytes = False
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None, stopped=None, on_accept=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None, logprobs=0,
+                 pin=False, on_echo=None, gbytes_before_ext=False):
         self.calls.append((prompt, maximum, temperature, top_p, cache_slot, grammar))
+        self.last_logprobs = logprobs
+        self.last_echo = on_echo is not None
+        self.last_gbytes = gbytes_before_ext
         if on_accept is not None:                 # simulate the engine's ACCEPT frame (#597)
             on_accept({"prompt_tokens": 7})
+        if logprobs and on_echo is not None:
+            for record in self.echo_records(logprobs):
+                on_echo(record)
         for chunk in ("Hé", "llo"):
             on_text(chunk)
             if stopped and stopped():
                 self.stop_requests += 1
                 break
-        return {"prompt_tokens": 7, "completion_tokens": 2, "length_limited": False}
+        stats = {"prompt_tokens": 7, "completion_tokens": 2, "length_limited": False}
+        if logprobs:
+            stats["logprobs"] = self.logprobs_channel(logprobs)
+        return stats
+
+    def echo_records(self, engine_k):
+        """A canned prefill read-out, delivered through `on_echo` exactly as
+        Engine.generate() delivers the real thing. Position 0 carries the engine's own
+        "nothing to condition on" sentinel. The tail values are non-dyadic so a fixture
+        rendered at one precision is distinguishable from one rendered at another."""
+        k = min(engine_k, 2)
+        return [echo_record(0, b"H", float("nan"), []),
+                echo_record(1, b"\xc3\xa9", -0.3, [(72, -0.3), (100, -1.7)][:k])]
+
+    def logprobs_channel(self, engine_k):
+        """Canned generated-token records, shaped exactly like Engine.generate()'s return
+        value. Each token's own lp is bit-identical to one of its own top-k entries, which
+        is the engine's logprob_tail invariant. The records cover, byte for byte, the text
+        generate() feeds to on_text: the real engine emits a tail for every token of an
+        opted-in request, so a double that emits text it has no records for would model
+        nothing the engine does."""
+        k = min(engine_k, 2)
+        return {"generated": [
+            (b"H", {"lp": -0.2, "topk": [(72, -0.2), (200, -2.4)][:k]}),
+            (b"\xc3\xa9", {"lp": -0.4, "topk": [(101, -0.4), (300, -3.6)][:k]}),
+            (b"llo", {"lp": -0.6, "topk": [(400, -0.6), (500, -5.2)][:k]})]}
 
 
 class BlockingEngine(FakeEngine):
@@ -60,11 +320,13 @@ class BlockingEngine(FakeEngine):
         self.release = threading.Event()
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None, stopped=None, on_accept=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None, logprobs=0,
+                 pin=False, on_echo=None, gbytes_before_ext=False):
         self.entered.set()
         self.release.wait(2)
         return super().generate(prompt, maximum, temperature, top_p, on_text, cache_slot,
-                                cancelled, grammar, stopped, on_accept)
+                                cancelled, grammar, stopped, on_accept, logprobs, pin,
+                                on_echo, gbytes_before_ext)
 
 
 class TemplateTest(unittest.TestCase):
@@ -3826,6 +4088,1759 @@ class ContextExceededMessageTest(unittest.TestCase):
         from openai_server import _engine_error
         text = str(_engine_error(["CONTEXT_EXCEEDED"], "ignored"))
         self.assertIn("the context", text)
+
+
+class LogprobsOptionsTest(unittest.TestCase):
+    """logprobs_options(): pure validation and translation, no HTTP and no engine."""
+
+    def test_completions_valid_integer_logprobs(self):
+        self.assertEqual(logprobs_options({"logprobs": 3}, False, True), (3, False, 3))
+        self.assertEqual(logprobs_options({"logprobs": 3, "echo": True}, False, True),
+                         (3, True, 3))
+        self.assertEqual(logprobs_options({"logprobs": 1}, False, True), (1, False, 1))
+
+    def test_completions_zero_false_null_mean_no_logprobs(self):
+        # Explicit, never a truthiness accident and never a channel floored on at k=1.
+        for off in ({"logprobs": 0}, {"logprobs": False}, {"logprobs": None}, {}):
+            with self.subTest(off=off):
+                self.assertEqual(logprobs_options(off, False, True), (0, False, 0))
+        # ...and `echo: true` on top of an off `logprobs` is a named 400, not a no-op.
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"logprobs": 0, "echo": True}, False, True)
+        self.assertEqual((caught.exception.param, caught.exception.code),
+                         ("echo", "unsupported_parameter"))
+
+    def test_completions_true_is_a_named_400(self):
+        # The legacy completions field is an integer count; `true` carries no count.
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"logprobs": True}, False, True)
+        self.assertEqual((caught.exception.status, caught.exception.param,
+                          caught.exception.code), (400, "logprobs", "invalid_value"))
+
+    def test_completions_break_it_battery_non_integer_negative_huge(self):
+        for bad in (1.5, "5", -1, 33):
+            with self.subTest(bad=bad):
+                with self.assertRaises(APIError) as caught:
+                    logprobs_options({"logprobs": bad}, False, True)
+                self.assertEqual((caught.exception.status, caught.exception.param,
+                                  caught.exception.code),
+                                 (400, "logprobs", "invalid_value"))
+
+    def test_chat_logprobs_requires_a_boolean(self):
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"logprobs": 1}, True, True)
+        self.assertEqual((caught.exception.param, caught.exception.code),
+                         ("logprobs", "invalid_value"))
+
+    def test_chat_false_and_null_mean_no_logprobs(self):
+        for off in ({"logprobs": False}, {"logprobs": None}, {}):
+            with self.subTest(off=off):
+                self.assertEqual(logprobs_options(off, True, True), (0, False, 0))
+
+    def test_chat_echo_is_always_rejected(self):
+        # Chat has no echo concept at all: a named 400, not a silent ignore, whether or
+        # not logprobs was also requested.
+        for body in ({"echo": True}, {"echo": True, "logprobs": True}):
+            with self.subTest(body=body):
+                with self.assertRaises(APIError) as caught:
+                    logprobs_options(body, True, True)
+                self.assertEqual(caught.exception.param, "echo")
+
+    def test_chat_top_logprobs_default_and_cap(self):
+        self.assertEqual(logprobs_options({"logprobs": True}, True, True), (1, False, 0))
+        self.assertEqual(
+            logprobs_options({"logprobs": True, "top_logprobs": 5}, True, True),
+            (5, False, 5))
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"logprobs": True, "top_logprobs": 33}, True, True)
+        self.assertEqual(caught.exception.param, "top_logprobs")
+
+    def test_cap_boundary_is_thirty_two_on_both_endpoints(self):
+        # Literal 32/33 rather than the constant plus or minus one, so the boundary stays
+        # meaningful if the constant itself ever drifts.
+        self.assertEqual(logprobs_options({"logprobs": 32}, False, True), (32, False, 32))
+        self.assertEqual(
+            logprobs_options({"logprobs": True, "top_logprobs": 32}, True, True),
+            (32, False, 32))
+        for body, chat, param in (({"logprobs": 33}, False, "logprobs"),
+                                  ({"logprobs": True, "top_logprobs": 33}, True,
+                                   "top_logprobs")):
+            with self.subTest(param=param):
+                with self.assertRaises(APIError) as caught:
+                    logprobs_options(body, chat, True)
+                self.assertEqual((caught.exception.param, caught.exception.code),
+                                 (param, "invalid_value"))
+        self.assertEqual(LOGPROBS_TOP_K_CAP, 32)
+
+    def test_capability_gate_rejects_an_engine_that_is_not_asked_for_the_channel(self):
+        # Never a silent downgrade to "no logprobs".
+        for body, chat in (({"logprobs": 1}, False), ({"logprobs": True}, True)):
+            with self.subTest(chat=chat):
+                with self.assertRaises(APIError) as caught:
+                    logprobs_options(body, chat, False)
+                self.assertEqual((caught.exception.status, caught.exception.code),
+                                 (400, "unsupported_parameter"))
+        # Absent or zero logprobs never reaches the capability check at all.
+        self.assertEqual(logprobs_options({}, False, False), (0, False, 0))
+        self.assertEqual(logprobs_options({"logprobs": 0}, False, False), (0, False, 0))
+
+    def test_range_error_precedes_capability_error_and_names_the_cap(self):
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"logprobs": 999}, False, False)
+        self.assertEqual(caught.exception.code, "invalid_value")
+        self.assertIn("32", caught.exception.message)
+
+    def test_chat_top_logprobs_validated_even_when_logprobs_is_off(self):
+        # A malformed `top_logprobs` is a named 400 whether or not the gate that would use
+        # it is open; a valid one with `logprobs` off stays a documented no-op.
+        for bad in ("x", -1, 999):
+            with self.subTest(bad=bad):
+                with self.assertRaises(APIError) as caught:
+                    logprobs_options({"top_logprobs": bad}, True, True)
+                self.assertEqual((caught.exception.status, caught.exception.param,
+                                  caught.exception.code),
+                                 (400, "top_logprobs", "invalid_value"))
+        self.assertEqual(logprobs_options({"top_logprobs": 5}, True, True), (0, False, 0))
+
+    def test_chat_top_logprobs_null_normalizes_to_absent(self):
+        # On both sides of the `logprobs` gate, and it never itself reaches the
+        # type/range check.
+        self.assertEqual(
+            logprobs_options({"logprobs": False, "top_logprobs": None}, True, True),
+            (0, False, 0))
+        self.assertEqual(
+            logprobs_options({"logprobs": True, "top_logprobs": None}, True, True),
+            (1, False, 0))
+
+    def test_echo_null_normalizes_to_absent_both_endpoints(self):
+        # `echo: null` normalises to absent before the type check, exactly like `logprobs`
+        # and `top_logprobs`. An SDK that serialises its whole request model with nulls
+        # must not get a 400 for a field it never meant to set.
+        self.assertEqual(logprobs_options({"echo": None}, False, True), (0, False, 0))
+        self.assertEqual(logprobs_options({"echo": None}, True, True), (0, False, 0))
+
+    def test_echo_non_bool_rejected_the_same_way_on_both_endpoints(self):
+        for bad in (1, "true"):
+            for chat in (False, True):
+                with self.subTest(bad=bad, chat=chat):
+                    with self.assertRaises(APIError) as caught:
+                        logprobs_options({"echo": bad}, chat, True)
+                    self.assertEqual((caught.exception.param, caught.exception.code),
+                                     ("echo", "invalid_value"))
+
+    def test_echo_refusals_stay_distinct(self):
+        # The type refusal and chat's capability refusal must not collapse into each
+        # other: a non-bool `echo` always gets the type message, and only an actual `True`
+        # on chat draws the unsupported one.
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"echo": "yes"}, True, True)
+        self.assertEqual(caught.exception.code, "invalid_value")
+        self.assertIn("must be a boolean", caught.exception.message)
+        with self.assertRaises(APIError) as caught:
+            logprobs_options({"echo": True}, True, True)
+        self.assertEqual(caught.exception.code, "unsupported_parameter")
+        self.assertIn("not supported for chat completions", caught.exception.message)
+
+    def test_completions_ignores_top_logprobs_entirely(self):
+        # A chat-only field in the OpenAI request shape; completions never reads it.
+        self.assertEqual(
+            logprobs_options({"logprobs": 2, "top_logprobs": 999}, False, True),
+            (2, False, 2))
+
+
+class LogprobsHTTPTest(unittest.TestCase):
+    """End-to-end behaviour of `logprobs`/`echo`/`top_logprobs` against a real APIServer,
+    with FakeEngine standing in for the engine subprocess."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = FakeEngine()
+        cls.server = APIServer(("127.0.0.1", 0), cls.engine, "test-model", "secret", 16,
+                               kv_slots=2)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, args=(0.01,),
+                                      daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.scheduler.close()
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def chat(self, body):
+        return _post_chat(self.base, dict({"model": "test-model",
+                                           "messages": [{"role": "user", "content": "Hi"}]},
+                                          **body))
+
+    def completions(self, body):
+        return _post_completions(self.base, dict({"model": "test-model", "prompt": "Hi"},
+                                                 **body))
+
+    # ---- shape -------------------------------------------------------------
+
+    def test_chat_logprobs_content_shape(self):
+        with self.chat({"logprobs": True, "top_logprobs": 2}) as response:
+            body = json.load(response)
+        choice = body["choices"][0]
+        content = choice["logprobs"]["content"]
+        self.assertEqual([entry["token"] for entry in content], ["H", "é", "llo"])
+        self.assertIsNone(choice["logprobs"]["refusal"])
+        for entry in content:
+            self.assertEqual(set(entry), {"token", "logprob", "bytes", "top_logprobs"})
+            for alternative in entry["top_logprobs"]:
+                self.assertEqual(set(alternative), {"token", "logprob", "bytes"})
+        self.assertNotIn("echo", choice)
+
+    def test_chat_content_joins_back_to_the_message(self):
+        with self.chat({"logprobs": True, "top_logprobs": 1}) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertEqual("".join(entry["token"] for entry in choice["logprobs"]["content"]),
+                         choice["message"]["content"])
+
+    def test_chat_top_logprobs_omitted_yields_empty_alternatives(self):
+        with self.chat({"logprobs": True}) as response:
+            content = json.load(response)["choices"][0]["logprobs"]["content"]
+        self.assertTrue(content)
+        for entry in content:
+            self.assertEqual(entry["top_logprobs"], [])
+
+    def test_the_chosen_tokens_logprob_comes_from_its_own_record(self):
+        # The label is found by exact float match against the position's own logprob, and
+        # the table is unsorted on the wire, so this can never be "whatever came first".
+        with self.chat({"logprobs": True, "top_logprobs": 2}) as response:
+            content = json.load(response)["choices"][0]["logprobs"]["content"]
+        # Against the fixture's declared per-record values, not against the alternative
+        # the entry itself labelled -- that comparison holds however the value was sourced.
+        self.assertEqual([entry["logprob"] for entry in content], [-0.2, -0.4, -0.6])
+        for entry in content:
+            own = [a for a in entry["top_logprobs"] if a["token"] == entry["token"]]
+            self.assertEqual(len(own), 1)
+            self.assertEqual(own[0]["logprob"], entry["logprob"])
+            self.assertEqual(own[0]["bytes"], entry["bytes"])
+
+    def test_the_chosen_token_is_found_by_value_not_by_table_rank(self):
+        # The table is unsorted on the wire, so the position's own token can sit anywhere
+        # in it. Labelling by rank would call the first entry the chosen token.
+        base = _spawn_test_server(self, ScriptedEngine(
+            chunks=("cat",), records=[(b"cat", -0.8, [(999, -0.05), (42, -0.8)])]))
+        with _post_chat(base, {"model": "test-model", "logprobs": True, "top_logprobs": 2,
+                               "messages": [{"role": "user", "content": "hi"}]}) as response:
+            entry = json.load(response)["choices"][0]["logprobs"]["content"][0]
+        self.assertEqual([alternative["token"] for alternative in entry["top_logprobs"]],
+                         ["<token_id:999>", "cat"])
+        self.assertEqual(entry["logprob"], -0.8)
+
+    def test_a_tie_on_the_printed_value_is_broken_deterministically(self):
+        # The engine prints six decimal digits, so two candidates can share the chosen
+        # token's printed value. Only the first match in wire order is labelled as the
+        # chosen token; a later one is labelled by its id like any other candidate, which
+        # is also what keeps the two labels distinct.
+        base = _spawn_test_server(self, ScriptedEngine(
+            chunks=("cat",),
+            records=[(b"cat", -0.223144, [(1, -0.223144), (2, -0.223144)])]))
+        with _post_chat(base, {"model": "test-model", "logprobs": True, "top_logprobs": 2,
+                               "messages": [{"role": "user", "content": "hi"}]}) as response:
+            entry = json.load(response)["choices"][0]["logprobs"]["content"][0]
+        self.assertEqual([alternative["token"] for alternative in entry["top_logprobs"]],
+                         ["cat", "<token_id:2>"])
+
+    def test_legacy_token_logprobs_come_from_the_records_own_value(self):
+        # The completions twin of the chat test above: the table is unsorted on the wire,
+        # so `token_logprobs` must be the record's own `lp`, never the first table entry.
+        base = _spawn_test_server(self, ScriptedEngine(
+            chunks=("cat",), records=[(b"cat", -0.8, [(999, -0.05), (42, -0.8)])]))
+        with _post_completions(base, {"model": "test-model", "prompt": "hi",
+                                      "logprobs": 2, "max_tokens": 1}) as response:
+            logprobs = json.load(response)["choices"][0]["logprobs"]
+        self.assertEqual(logprobs["tokens"], ["cat"])
+        self.assertEqual(logprobs["token_logprobs"], [-0.8])
+        self.assertEqual(logprobs["top_logprobs"], [{"<token_id:999>": -0.05, "cat": -0.8}])
+
+    def test_completions_logprobs_object_shape_and_text_offsets(self):
+        with self.completions({"logprobs": 2}) as response:
+            choice = json.load(response)["choices"][0]
+        logprobs = choice["logprobs"]
+        self.assertEqual(set(logprobs),
+                         {"tokens", "token_logprobs", "top_logprobs", "text_offset"})
+        self.assertEqual(logprobs["tokens"], ["H", "é", "llo"])
+        # Characters into `text` from 0, not bytes: "é" is one character and two bytes.
+        self.assertEqual(logprobs["text_offset"], [0, 1, 2])
+        self.assertEqual("".join(logprobs["tokens"]), choice["text"])
+
+    def test_echo_reconstructs_the_prompt_and_counts_offsets_from_zero(self):
+        with self.completions({"logprobs": 2, "echo": True}) as response:
+            choice = json.load(response)["choices"][0]
+        logprobs = choice["logprobs"]
+        self.assertEqual(logprobs["tokens"], ["H", "é", "H", "é", "llo"])
+        self.assertEqual(logprobs["text_offset"], [0, 1, 2, 3, 4])
+        self.assertEqual("".join(logprobs["tokens"]), choice["text"])
+        # The engine's own echo position 0 carries a non-finite sentinel: there is nothing
+        # to condition the first prompt token on.
+        self.assertIsNone(logprobs["token_logprobs"][0])
+
+    def test_nan_logprob_serializes_as_json_null_over_the_wire(self):
+        # Not the invalid-JSON NaN literal, and not clamped to a made-up finite number.
+        with self.completions({"logprobs": 1, "echo": True}) as response:
+            raw = response.read().decode()
+        self.assertNotIn("NaN", raw)
+        self.assertIsNone(json.loads(raw)["choices"][0]["logprobs"]["token_logprobs"][0])
+
+    # ---- normalisation and refusals ----------------------------------------
+
+    def test_zero_false_null_normalize_to_absent(self):
+        # Each endpoint's own shape: `0` is a completions value, `false`/`null` are
+        # accepted on both, and none of them is ever an error.
+        for field, value in (("logprobs", 0), ("logprobs", False), ("logprobs", None),
+                             ("echo", False), ("echo", None)):
+            with self.subTest(endpoint="completions", field=field, value=value):
+                with self.completions({field: value}) as response:
+                    choice = json.load(response)["choices"][0]
+                self.assertIsNone(choice["logprobs"])
+                self.assertEqual(choice["text"], "Héllo")
+        for field, value in (("logprobs", False), ("logprobs", None), ("echo", None),
+                             ("top_logprobs", None), ("top_logprobs", 0)):
+            with self.subTest(endpoint="chat", field=field, value=value):
+                with self.chat({field: value}) as response:
+                    choice = json.load(response)["choices"][0]
+                self.assertIsNone(choice["logprobs"])
+
+    def test_echo_without_logprobs_is_refused_by_name(self):
+        # The prompt echo is built out of the engine's per-token records, so without them
+        # there is nothing to echo. A 200 that quietly drops a requested field is the shape
+        # this surface exists to stop.
+        for body in ({"echo": True}, {"echo": True, "logprobs": 0},
+                     {"echo": True, "logprobs": None}):
+            with self.subTest(body=body):
+                status, error = _error_body(self, lambda: self.completions(body))
+                self.assertEqual(status, 400)
+                self.assertEqual(error["param"], "echo")
+                self.assertEqual(error["code"], "unsupported_parameter")
+
+    def test_echo_false_and_null_stay_absent_without_logprobs(self):
+        # The control: only `true` needs a channel, and the two absent spellings must keep
+        # serving the request they always served.
+        for value in (False, None):
+            with self.subTest(value=value):
+                with self.completions({"echo": value}) as response:
+                    choice = json.load(response)["choices"][0]
+                self.assertIsNone(choice["logprobs"])
+                self.assertEqual(choice["text"], "Héllo")
+
+    def test_each_endpoint_refuses_the_others_request_shape_by_name(self):
+        for post, body, param in ((self.completions, {"logprobs": True}, "logprobs"),
+                                  (self.chat, {"logprobs": 2}, "logprobs"),
+                                  (self.chat, {"echo": True}, "echo")):
+            with self.subTest(body=body):
+                status, error = _error_body(self, lambda: post(body))
+                self.assertEqual(status, 400)
+                self.assertEqual(error["param"], param)
+
+    def test_break_it_logprobs_out_of_range(self):
+        status, error = _error_body(self, lambda: self.completions({"logprobs": 99}))
+        self.assertEqual(status, 400)
+        self.assertEqual(error["code"], "invalid_value")
+
+    def test_break_it_streaming_plus_logprobs_is_named_400(self):
+        for post, body in ((self.completions, {"logprobs": 1, "stream": True}),
+                           (self.chat, {"logprobs": True, "stream": True})):
+            with self.subTest(body=body):
+                status, error = _error_body(self, lambda: post(body))
+                self.assertEqual(status, 400)
+                self.assertEqual(error["param"], "logprobs")
+                self.assertEqual(error["code"], "unsupported_parameter")
+
+    def test_chat_echo_false_normalises_to_absent_over_http(self):
+        # The completions side of this is covered; chat is the half that was only true by
+        # construction. `false` is not `true`, so it never reaches chat's echo refusal:
+        # the request is served exactly as one that never named the field.
+        with self.chat({"echo": False}) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertIsNone(choice["logprobs"])
+        self.assertEqual(choice["message"]["content"], "Héllo")
+        with self.chat({"echo": False, "logprobs": True, "top_logprobs": 1}) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertEqual([entry["token"] for entry in choice["logprobs"]["content"]],
+                         ["H", "é", "llo"])
+
+    def test_a_continued_turn_is_prompt_and_the_arrays_describe_only_what_was_generated(self):
+        """A trailing assistant turn is prefill, not output: the prompt ends inside it. The
+        text the client sent must therefore reach the engine as prompt and must not appear
+        in the arrays, which describe the generated text alone.
+
+        `enable_thinking` is on because that is the axis where the two features meet. A
+        continued turn opens no reasoning block, so the split starts in text mode -- and the
+        span map the arrays are projected through comes from that same split. Primed the
+        other way the split files the whole answer as reasoning, which leaves `content`
+        empty and the arrays describing a string that is no longer there."""
+        opening = "The capital of France is Par"
+        with self.chat({"logprobs": True, "top_logprobs": 2, "enable_thinking": True,
+                        "messages": [{"role": "user", "content": "Where is it?"},
+                                     {"role": "assistant", "content": opening}]}) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertTrue(self.engine.calls[-1][0].endswith(opening),
+                        self.engine.calls[-1][0][-60:])
+        self.assertEqual(choice["message"]["content"], "Héllo")
+        self.assertNotIn("reasoning_content", choice["message"])
+        tokens = [entry["token"] for entry in choice["logprobs"]["content"]]
+        self.assertEqual(tokens, ["H", "é", "llo"])
+        self.assertEqual("".join(tokens), choice["message"]["content"])
+
+    def test_a_continued_turn_does_not_give_chat_an_echo(self):
+        # `echo` is the legacy completions shape and chat refuses it by name. A continued
+        # turn puts client text in the prompt, which is the one thing that could look like
+        # a reason to answer one here; it is not, and the refusal is unchanged.
+        status, error = _error_body(self, lambda: _post_chat(self.base, {
+            "model": "test-model", "logprobs": True, "echo": True,
+            "messages": [{"role": "user", "content": "Where is it?"},
+                         {"role": "assistant", "content": "The capital of France is Par"}]}))
+        self.assertEqual(status, 400)
+        self.assertEqual(error["param"], "echo")
+
+    def test_the_capability_refusal_names_the_gate_not_the_engines_arch(self):
+        # The refusal reads the flag it failed, not the module's ARCH: in production the
+        # two agree, so naming the arch would be a guess that happens to be right, and
+        # under the test module's own ARCH ("glm") it would read "not supported by the glm
+        # engine" for an engine whose flag is off -- which is the wrong sentence.
+        base = _spawn_test_server(self, ScriptedEngine(supports_logprobs_echo=False))
+        status, error = _error_body(self, lambda: _post_completions(base, {
+            "model": "test-model", "prompt": "hi", "logprobs": 1}))
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            error["message"],
+            "Log probabilities are not requested from this engine by these endpoints.")
+        self.assertNotIn(openai_server.ARCH, error["message"])
+        self.assertNotIn("glm", error["message"])
+
+    def test_break_it_logprobs_rejected_for_non_glm_engine(self):
+        # A named 400, never a silent no-op, on an engine these endpoints do not request
+        # the channel from.
+        base = _spawn_test_server(self, ScriptedEngine(supports_logprobs_echo=False))
+        for path, body in (("/v1/completions", {"model": "test-model", "prompt": "hi",
+                                                "logprobs": 1}),
+                           ("/v1/chat/completions",
+                            {"model": "test-model", "logprobs": True,
+                             "messages": [{"role": "user", "content": "hi"}]})):
+            with self.subTest(path=path):
+                status, error = _error_body(self, lambda: _post_json(base, path, body))
+                self.assertEqual(status, 400)
+                self.assertEqual(error["param"], "logprobs")
+                self.assertEqual(error["code"], "unsupported_parameter")
+
+    def test_a_plain_request_never_asks_the_engine_for_the_channel(self):
+        with self.completions({}) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertIsNone(choice["logprobs"])
+        self.assertEqual(self.engine.last_logprobs, 0)
+        self.assertFalse(self.engine.last_echo)
+        self.assertFalse(self.engine.last_gbytes)
+
+    def test_the_echo_sink_is_passed_only_when_echo_was_asked_for(self):
+        # The engine sends an ECHO frame for every prompt position of every opted-in
+        # request, so passing a sink is the retention opt-in.
+        with self.completions({"logprobs": 1}) as response:
+            response.read()
+        self.assertEqual(self.engine.last_logprobs, 1)
+        self.assertFalse(self.engine.last_echo)
+        with self.completions({"logprobs": 1, "echo": True}) as response:
+            response.read()
+        self.assertTrue(self.engine.last_echo)
+
+
+class LogprobsRawStreamAlignmentTest(unittest.TestCase):
+    """The arrays describe the characters the client received, exactly. Every expectation
+    here is written from the engine's own frames and the stop policy, and each test names
+    inline what a build without the span layer returns for it."""
+
+    def _chat(self, base, **extra):
+        body = {"model": "test-model", "max_tokens": 8, "logprobs": True,
+                "top_logprobs": 1, "messages": [{"role": "user", "content": "hi"}]}
+        body.update(extra)
+        with _post_chat(base, body) as response:
+            return json.load(response)["choices"][0]
+
+    def test_swallowed_leading_marker_keeps_the_other_two_records(self):
+        # WITHOUT THE SPAN LAYER: logprobs.content == [] with a 200 and a full message.content. Two of
+        # three, not three: the role marker was genuinely not emitted, so an entry for it
+        # would describe a character the client never received.
+        choice = self._chat(_spawn_test_server(self, _ignored_leading_marker_engine()))
+        self.assertEqual(choice["message"]["content"], "Hello world")
+        entries = choice["logprobs"]["content"]
+        self.assertEqual([entry["token"] for entry in entries], ["Hello", " world"])
+        self.assertEqual([entry["logprob"] for entry in entries],
+                         [-0.2, -0.30000000000000004])
+        self.assertEqual("".join(entry["token"] for entry in entries),
+                         choice["message"]["content"])
+
+    def test_swallowed_leading_marker_offsets_index_the_returned_text(self):
+        # The legacy shape's arm of the same defect: "Hello" at 0 and " world" at 5, both
+        # indexing "Hello world".
+        base = _spawn_test_server(self, _ignored_leading_marker_engine())
+        with _post_completions(base, {"model": "test-model", "prompt": "hi",
+                                      "max_tokens": 8, "logprobs": 1,
+                                      "stop": ["<|user|>"],
+                                      "x_colibri_ignore_leading_stop": True}) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertEqual(choice["text"], "Hello world")
+        self.assertEqual(choice["logprobs"]["tokens"], ["Hello", " world"])
+        self.assertEqual(choice["logprobs"]["text_offset"], [0, 5])
+        self.assertEqual("".join(choice["logprobs"]["tokens"]), choice["text"])
+
+    def test_a_record_the_stop_cut_in_half_keeps_the_emitted_characters(self):
+        # WITHOUT THE SPAN LAYER: text "Hel" with tokens []. The boundary entry carries the emitted
+        # span, so `tokens` is ["Hel"] -- not ["Hello"], and not [].
+        base = _spawn_test_server(self, _mid_token_stop_echo_engine())
+        with _post_completions(base, {"model": "test-model", "prompt": "prompt",
+                                      "max_tokens": 4, "logprobs": 1,
+                                      "stop": ["lo"]}) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertEqual(choice["text"], "Hel")
+        self.assertEqual(choice["logprobs"]["tokens"], ["Hel"])
+        self.assertEqual(choice["logprobs"]["text_offset"], [0])
+        self.assertEqual(choice["logprobs"]["token_logprobs"], [-0.5])
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertEqual("".join(choice["logprobs"]["tokens"]), choice["text"])
+
+    def test_echo_keeps_the_prompt_and_the_emitted_prefix(self):
+        # WITHOUT THE SPAN LAYER: text collapses to "prompt" -- the "Hel" the client earned is deleted
+        # by the echo rebuild.
+        base = _spawn_test_server(self, _mid_token_stop_echo_engine())
+        with _post_completions(base, {"model": "test-model", "prompt": "prompt",
+                                      "max_tokens": 4, "logprobs": 1, "echo": True,
+                                      "stop": ["lo"]}) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertEqual(choice["text"], "promptHel")
+        self.assertEqual(choice["logprobs"]["tokens"], ["pr", "ompt", "Hel"])
+        self.assertEqual(choice["logprobs"]["text_offset"], [0, 2, 6])
+        self.assertEqual("".join(choice["logprobs"]["tokens"]), choice["text"])
+
+    def test_a_truncated_entrys_bytes_do_not_describe_the_withheld_text(self):
+        # `bytes` is `token`'s sibling and is held to the same rule: the record's payload
+        # decodes to "Hello", so leaving it whole would hand the client the "lo" the stop
+        # withheld, one field over.
+        choice = self._chat(_spawn_test_server(self, _mid_token_stop_echo_engine()),
+                            max_tokens=4, stop=["lo"])
+        self.assertEqual(choice["message"]["content"], "Hel")
+        entry = choice["logprobs"]["content"][0]
+        self.assertEqual(entry["token"], "Hel")
+        self.assertEqual(entry["bytes"], [72, 101, 108])
+        self.assertEqual(bytes(entry["bytes"]).decode("utf-8"), entry["token"])
+        for alternative in entry["top_logprobs"]:
+            if alternative["bytes"] is not None:
+                self.assertEqual(bytes(alternative["bytes"]).decode("utf-8"),
+                                 alternative["token"])
+
+    def test_a_matched_stop_drops_its_own_record_and_every_later_one(self):
+        base = _spawn_test_server(self, _stop_token_engine())
+        with _post_completions(base, {"model": "test-model", "prompt": "hi",
+                                      "max_tokens": 8, "stop": ["STOP"],
+                                      "logprobs": 1}) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertEqual(choice["text"], "ok ")
+        self.assertEqual(choice["logprobs"]["tokens"], ["ok "])
+        self.assertEqual(len(choice["logprobs"]["token_logprobs"]), 1)
+        self.assertEqual(len(choice["logprobs"]["top_logprobs"]), 1)
+
+    def test_a_frame_inside_suppressed_text_leaves_no_phantom_entry(self):
+        # A frame that decodes to "" owns no span, so "was it emitted?" has to be asked of
+        # the character its bytes went into, not of its position, which sits on the
+        # boundary of the emitted region and tests true at both ends. A phantom entry here
+        # carries a byte of the suppressed stop sequence out in the one field that is
+        # bytes.
+        base = _spawn_test_server(self, _suppressed_stop_byte_engine())
+        with _post_completions(base, {"model": "test-model", "prompt": "hi",
+                                      "max_tokens": 8, "logprobs": 1,
+                                      "stop": ["é"]}) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertEqual(choice["text"], "ok ")
+        self.assertEqual(choice["logprobs"]["tokens"], ["ok "])
+        self.assertEqual(choice["logprobs"]["text_offset"], [0])
+        self.assertEqual(choice["logprobs"]["token_logprobs"], [-0.1])
+
+    def test_a_frame_that_completes_nothing_at_the_seam_reports_nothing(self):
+        # Both rows of the two-frame seam case. Frame one's bytes finish no character, so
+        # its token is "": reporting the raw stream's replacement character instead puts a
+        # U+FFFD in front of the real one and shifts every later offset.
+        for stop, text, tokens, offsets in (
+                (None, "A€Hello", ["A", "", "", "€Hello"], [0, 1, 1, 1]),
+                (["lo"], "A€Hel", ["A", "", "", "€Hel"], [0, 1, 1, 1])):
+            with self.subTest(stop=stop):
+                base = _spawn_test_server(self, _seam_split_across_two_frames_engine())
+                body = {"model": "test-model", "prompt": "A€", "max_tokens": 8,
+                        "logprobs": 1, "echo": True}
+                if stop is not None:
+                    body["stop"] = stop
+                with _post_completions(base, body) as response:
+                    choice = json.load(response)["choices"][0]
+                self.assertEqual(choice["text"], text)
+                self.assertNotIn("�", choice["text"])
+                self.assertEqual(choice["logprobs"]["tokens"], tokens)
+                self.assertEqual(choice["logprobs"]["text_offset"], offsets)
+                self.assertEqual("".join(choice["logprobs"]["tokens"]), choice["text"])
+
+    def test_seam_codepoint_and_stop_on_the_same_record(self):
+        # The raw-stream decode opens with two replacement characters where the seam
+        # decode has one Euro sign; the stop cuts past that head, so the real character
+        # splices back on and the withheld "lo" stays withheld.
+        base = _spawn_test_server(self, _seam_split_same_record_stop_engine())
+        with _post_completions(base, {"model": "test-model", "prompt": "A€",
+                                      "max_tokens": 4, "logprobs": 1, "echo": True,
+                                      "stop": ["lo"]}) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertEqual(choice["text"], "A€Hel")
+        self.assertNotIn("�", choice["text"])
+        self.assertEqual(choice["logprobs"]["tokens"], ["A", "", "€Hel"])
+        self.assertEqual(choice["logprobs"]["text_offset"], [0, 1, 1])
+        self.assertEqual("".join(choice["logprobs"]["tokens"]), choice["text"])
+
+    def test_seam_codepoint_survives_a_later_stop_truncation(self):
+        # The Euro sign is split across the prompt/generated seam and must decode as one
+        # character while a later frame is cut by the stop. Four positions for four
+        # frames: the echo position carrying the lead byte resolves nothing on its own and
+        # reports "", and the character lands on the frame that completed it.
+        base = _spawn_test_server(self, _seam_split_stop_engine())
+        with _post_completions(base, {"model": "test-model", "prompt": "A€",
+                                      "max_tokens": 4, "logprobs": 1, "echo": True,
+                                      "stop": ["STOP"]}) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertEqual(choice["text"], "A€x")
+        self.assertEqual(choice["text"].count("€"), 1)
+        self.assertNotIn("�", choice["text"])
+        self.assertEqual(choice["logprobs"]["tokens"], ["A", "", "€", "x"])
+        self.assertEqual(choice["logprobs"]["text_offset"], [0, 1, 1, 2])
+        self.assertEqual("".join(choice["logprobs"]["tokens"]), choice["text"])
+
+    def test_an_engine_that_sends_no_records_is_refused_not_half_answered(self):
+        # The opt-in was accepted and the channel came back empty. Answering with the
+        # completion and an empty array is the shape the arrays exist to prevent.
+        base = _spawn_test_server(self, ScriptedEngine(
+            chunks=("AA", "BB"), records=None,
+            echoes=[(b"P", NAN, []), (b"Q", -0.1, [(1, -0.1)])]))
+        status, error = _error_body(self, lambda: _post_completions(base, {
+            "model": "test-model", "prompt": "PQ", "max_tokens": 4, "logprobs": 1,
+            "echo": True}))
+        self.assertEqual(status, 500)
+        self.assertEqual(error["code"], "engine_logprob_records_incomplete")
+
+    def test_a_length_limited_turn_reports_finish_reason_length(self):
+        base = _spawn_test_server(self, ScriptedEngine(chunks=("ok",),
+                                                       length_limited=True))
+        with _post_completions(base, {"model": "test-model", "prompt": "hi",
+                                      "max_tokens": 1, "logprobs": 1}) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertEqual(choice["finish_reason"], "length")
+        self.assertEqual(choice["logprobs"]["tokens"], ["ok"])
+
+    def test_every_response_joins_its_tokens_back_to_the_text_it_returned(self):
+        # The invariant as a test rather than a comment, over every fixture in this file
+        # that can produce a boundary.
+        for name, build in (("leading marker", _ignored_leading_marker_engine),
+                            ("mid-token stop", _mid_token_stop_echo_engine),
+                            ("stop token", _stop_token_engine),
+                            ("seam and stop", _seam_split_stop_engine)):
+            for echo in (False, True):
+                with self.subTest(engine=name, echo=echo):
+                    base = _spawn_test_server(self, build())
+                    with _post_completions(base, {
+                            "model": "test-model", "prompt": "A€", "max_tokens": 8,
+                            "logprobs": 1, "echo": echo,
+                            "stop": ["lo", "STOP", "<|user|>"]}) as response:
+                        choice = json.load(response)["choices"][0]
+                    tokens = choice["logprobs"]["tokens"]
+                    offsets = choice["logprobs"]["text_offset"]
+                    self.assertEqual("".join(tokens), choice["text"])
+                    self.assertEqual(offsets, sorted(offsets))
+                    for offset in offsets:
+                        self.assertLessEqual(offset, len(choice["text"]))
+
+
+class PlainPathSpanWorkTest(unittest.TestCase):
+    """What a request that never asked for per-token logprobs actually pays for the span
+    layer, stage by stage. Counted at a seam -- the primitives each stage would call --
+    rather than against a timing or a golden number, so the assertion is about work done.
+
+    The thinking split builds nothing. The tool-call stage composes and exports nothing,
+    which is the part that was worth gating; it still walks its own cut lists, because
+    those ARE the deletion the content is sliced from rather than a map kept for a later
+    reader. The exact residue is asserted below rather than described, so it cannot drift
+    upward unnoticed."""
+
+    def _counted(self, name):
+        """Replace one span primitive with a counting pass-through for the duration of a
+        request, and return the list its calls are recorded in."""
+        calls = []
+        original = getattr(openai_server, name)
+
+        def counting(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        patcher = patch.object(openai_server, name, counting)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
+    def _chat(self, engine, **extra):
+        base = _spawn_test_server(self, engine)
+        body = {"model": "test-model", "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}]}
+        body.update(extra)
+        with _post_chat(base, body) as response:
+            return json.load(response)["choices"][0]
+
+    THINKING = ScriptedEngine(
+        chunks=("<think>", "why", "</think>", "the ", "answer"),
+        records=[(b"<think>", -0.1, [(1, -0.1)]), (b"why", -0.2, [(2, -0.2)]),
+                 (b"</think>", -0.3, [(3, -0.3)]), (b"the ", -0.4, [(4, -0.4)]),
+                 (b"answer", -0.5, [(5, -0.5)])])
+
+    TOOLS = [{"type": "function",
+              "function": {"name": "search",
+                           "parameters": {"type": "object",
+                                          "properties": {"q": {"type": "string"}}}}}]
+
+    def test_the_thinking_split_records_nothing_on_a_plain_request(self):
+        # No tools, so the thinking split is the only stage that could append a span.
+        appends = self._counted("_append_span")
+        choice = self._chat(self.THINKING, enable_thinking=True)
+        self.assertEqual(choice["message"]["content"], "the answer")
+        self.assertEqual(choice["message"]["reasoning_content"], "why")
+        self.assertEqual(sum(appends), 0)
+
+    def test_the_thinking_split_records_when_logprobs_are_asked_for(self):
+        # The control: the same request with the opt-in builds the map it needs, so the
+        # test above cannot be satisfied by a stage that never records at all.
+        appends = self._counted("_append_span")
+        choice = self._chat(self.THINKING, enable_thinking=True, logprobs=True,
+                            top_logprobs=1)
+        self.assertEqual(choice["message"]["content"], "the answer")
+        self.assertGreater(sum(appends), 0)
+
+    def test_the_tool_call_parse_composes_and_exports_nothing_on_a_plain_request(self):
+        # The composition and the exported maps are what the gate removes. The per-step
+        # cut lists remain: `_apply_cuts` returns the survivors the content is built by
+        # slicing, so removing them would mean a second implementation of the deletion.
+        # Every count is asserted, including the ones that are not zero, so "no span map"
+        # can never quietly become "some span map".
+        engine = ScriptedEngine(
+            chunks=("before ", "<tool_call>search<arg_key>q</arg_key>"
+                    "<arg_value>x</arg_value></tool_call>", " after"))
+        counts = {name: self._counted(name) for name in
+                  ("_compose_span_maps", "_append_span", "_cut_span_map", "_apply_cuts",
+                   "_marker_cuts", "_project_span")}
+        choice = self._chat(engine, tools=self.TOOLS)
+        self.assertEqual(choice["message"]["content"], "before  after")
+        self.assertEqual(len(choice["message"]["tool_calls"]), 1)
+        self.assertEqual({name: sum(calls) for name, calls in counts.items()},
+                         {"_compose_span_maps": 0,     # nothing composed
+                          "_project_span": 0,          # nothing read back
+                          "_append_span": 5,           # inside the cut lists below
+                          "_cut_span_map": 4,
+                          "_apply_cuts": 4,
+                          "_marker_cuts": 2})
+        # ...and no map leaves the stage for anyone to read.
+        _content, _calls, box_map, content_map = openai_server._parse_tool_calls(
+            "before <tool_call>search</tool_call> after", self.TOOLS, False)
+        self.assertIsNone(box_map)
+        self.assertIsNone(content_map)
+
+    def test_the_tool_call_parse_composes_when_logprobs_are_asked_for(self):
+        engine = ScriptedEngine(
+            chunks=("before ", "<tool_call>search<arg_key>q</arg_key>"
+                    "<arg_value>x</arg_value></tool_call>", " after"),
+            records=[(b"before ", -0.1, [(1, -0.1)]),
+                     ("<tool_call>search<arg_key>q</arg_key>"
+                      "<arg_value>x</arg_value></tool_call>".encode(), -0.2, [(2, -0.2)]),
+                     (b" after", -0.3, [(3, -0.3)])])
+        composes = self._counted("_compose_span_maps")
+        choice = self._chat(engine, tools=self.TOOLS, logprobs=True, top_logprobs=1)
+        self.assertEqual(choice["message"]["content"], "before  after")
+        self.assertGreater(sum(composes), 0)
+
+
+class LogprobsStageCompositionTest(unittest.TestCase):
+    """The chat path runs the stop filter, then the thinking split, then the tool-call
+    parse. `logprobs.content` must describe `message.content` after all three."""
+
+    THINKING = ScriptedEngine(
+        chunks=("<think>", "why", "</think>", "the ", "answer"),
+        records=[(b"<think>", -0.1, [(1, -0.1)]),
+                 (b"why", -0.2, [(2, -0.2)]),
+                 (b"</think>", -0.3, [(3, -0.3)]),
+                 (b"the ", -0.4, [(4, -0.4)]),
+                 (b"answer", -0.5, [(5, -0.5)])])
+
+    def _chat(self, engine, **extra):
+        base = _spawn_test_server(self, engine)
+        body = {"model": "test-model", "max_tokens": 16, "logprobs": True,
+                "top_logprobs": 1, "messages": [{"role": "user", "content": "hi"}]}
+        body.update(extra)
+        with _post_chat(base, body) as response:
+            return json.load(response)["choices"][0]
+
+    def test_content_is_a_projection_of_the_stream_not_a_subset(self):
+        # Cardinality first, then absence: a build that returns an empty array satisfies
+        # every "X is not described" assertion trivially, so the count has to be asserted
+        # before anything about what is missing.
+        choice = self._chat(self.THINKING, enable_thinking=True)
+        entries = choice["logprobs"]["content"]
+        self.assertEqual(choice["message"]["content"], "the answer")
+        self.assertEqual(choice["message"]["reasoning_content"], "why")
+        self.assertEqual(len(entries), 2)
+        self.assertEqual([entry["token"] for entry in entries], ["the ", "answer"])
+        # Each entry's logprob is its OWN record's, not the one at the same index in the
+        # raw stream: a chain composed one stage short keeps the count and the text and
+        # still attaches the reasoning tokens' numbers.
+        self.assertEqual([entry["logprob"] for entry in entries], [-0.4, -0.5])
+        self.assertEqual("".join(entry["token"] for entry in entries),
+                         choice["message"]["content"])
+        # ...and the reasoning and the markers are not described as content.
+        self.assertNotIn("why", [entry["token"] for entry in entries])
+
+    def test_tool_call_syntax_is_not_described_as_content(self):
+        engine = ScriptedEngine(
+            chunks=("before ", "<tool_call>search<arg_key>q</arg_key>"
+                    "<arg_value>x</arg_value></tool_call>", " after"),
+            records=[(b"before ", -0.1, [(1, -0.1)]),
+                     ("<tool_call>search<arg_key>q</arg_key>"
+                      "<arg_value>x</arg_value></tool_call>".encode(), -0.2, [(2, -0.2)]),
+                     (b" after", -0.3, [(3, -0.3)])])
+        choice = self._chat(engine, tools=[{
+            "type": "function",
+            "function": {"name": "search",
+                         "parameters": {"type": "object",
+                                        "properties": {"q": {"type": "string"}}}}}])
+        entries = choice["logprobs"]["content"]
+        self.assertEqual(choice["message"]["content"], "before  after")
+        self.assertEqual(len(choice["message"]["tool_calls"]), 1)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual([entry["token"] for entry in entries], ["before ", " after"])
+        self.assertEqual([entry["logprob"] for entry in entries], [-0.1, -0.3])
+        self.assertEqual("".join(entry["token"] for entry in entries),
+                         choice["message"]["content"])
+
+    def test_all_three_stages_compose_in_one_turn(self):
+        # Thinking and tools together: the stop filter, the thinking split and the
+        # tool-call parse each cut something, and the chain has to be composed in that
+        # order. Composed the other way round, or stopped one stage early, the entries
+        # stop joining back to `message.content`.
+        engine = ScriptedEngine(
+            chunks=("<think>", "why", "</think>", "before ",
+                    "<tool_call>search<arg_key>q</arg_key>"
+                    "<arg_value>x</arg_value></tool_call>", " after"),
+            records=[(b"<think>", -0.1, [(1, -0.1)]),
+                     (b"why", -0.2, [(2, -0.2)]),
+                     (b"</think>", -0.3, [(3, -0.3)]),
+                     (b"before ", -0.4, [(4, -0.4)]),
+                     ("<tool_call>search<arg_key>q</arg_key>"
+                      "<arg_value>x</arg_value></tool_call>".encode(), -0.5, [(5, -0.5)]),
+                     (b" after", -0.6, [(6, -0.6)])])
+        choice = self._chat(engine, enable_thinking=True, tools=[{
+            "type": "function",
+            "function": {"name": "search",
+                         "parameters": {"type": "object",
+                                        "properties": {"q": {"type": "string"}}}}}])
+        entries = choice["logprobs"]["content"]
+        self.assertEqual(choice["message"]["reasoning_content"], "why")
+        self.assertEqual(choice["message"]["content"], "before  after")
+        self.assertEqual(len(choice["message"]["tool_calls"]), 1)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual([entry["token"] for entry in entries], ["before ", " after"])
+        self.assertEqual([entry["logprob"] for entry in entries], [-0.4, -0.6])
+        self.assertEqual("".join(entry["token"] for entry in entries),
+                         choice["message"]["content"])
+
+    def test_a_plain_chat_turn_describes_every_token(self):
+        # The control: with no stage cutting anything, nothing is dropped.
+        choice = self._chat(ScriptedEngine(chunks=("the ", "answer")))
+        entries = choice["logprobs"]["content"]
+        self.assertEqual(len(entries), 2)
+        self.assertEqual("".join(entry["token"] for entry in entries),
+                         choice["message"]["content"])
+
+
+class EchoCoverageTest(unittest.TestCase):
+    """`echo: true` rebuilds `text` from the logprob records, because `text` and
+    `text_offset` have to describe the same reconstruction. If the records stop short of
+    the generated stream that rebuild silently drops the uncovered tail and the client gets
+    a truncated completion with a 200 -- the worst shape a fault here can take, because
+    nothing in the response says anything is missing. It is refused by name instead."""
+
+    BODY = {"model": "test-model", "prompt": "PQ", "echo": True,
+            "logprobs": 1, "max_tokens": 3}
+
+    def _post(self, engine, body):
+        return _post_completions(_spawn_test_server(self, engine), body)
+
+    def test_records_short_of_the_stream_are_refused_not_truncated(self):
+        # Unrefused, this is a 200 carrying "PQAA" with the client's "BB" and "CC" gone.
+        status, error = _error_body(
+            self, lambda: self._post(_partial_coverage_engine(covered=1), dict(self.BODY)))
+        self.assertEqual(status, 500)
+        self.assertEqual(error["code"], "engine_logprob_records_incomplete")
+
+    def test_full_coverage_is_served_normally(self):
+        # The control, and it is not optional: without it the check above is satisfied
+        # just as well by refusing every echo request.
+        with self._post(_partial_coverage_engine(covered=3), dict(self.BODY)) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertEqual(choice["text"], "PQAABBCC")
+        self.assertEqual("".join(choice["logprobs"]["tokens"]), choice["text"])
+        self.assertEqual(choice["logprobs"]["text_offset"], [0, 1, 2, 4, 6])
+
+    def test_a_generation_ending_mid_codepoint_is_served(self):
+        # Control 1 of 2. A coverage check written as a string comparison reads an
+        # unflushed incremental decoder as a short generation and turns this valid
+        # response into a 500. Counting in raw-stream coordinates cannot.
+        engine = _partial_coverage_engine(
+            covered=3, chunks=("AA", "BB", "�"),
+            record_bytes=(b"AA", b"BB", b"\xc3"))
+        with self._post(engine, dict(self.BODY)) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertEqual(choice["text"], "PQAABB�")
+        self.assertEqual("".join(choice["logprobs"]["tokens"]), choice["text"])
+
+    def test_a_codepoint_split_across_the_seam_is_served(self):
+        # Control 2 of 2. With `echo` on, the reconstruction decodes the generated half
+        # with the decoder that already consumed the prompt bytes, so a codepoint
+        # straddling the seam reads as one character there and as replacement characters
+        # in the raw stream, on purpose.
+        engine = _partial_coverage_engine(
+            covered=1, chunks=("��",), record_bytes=(b"\x82\xac",),
+            echo_bytes=(b"A", b"\xe2"))
+        with self._post(engine, dict(self.BODY)) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertEqual(choice["text"], "A€")
+        self.assertEqual("".join(choice["logprobs"]["tokens"]), choice["text"])
+
+    def test_echo_false_is_refused_on_the_same_coverage_gap(self):
+        # The arrays have to describe the whole text on every shape that carries them, not
+        # only the one that rebuilds `text` out of them. Without this, `echo: false`
+        # returns "AABBCC" with `tokens == ["AA"]` and a 200.
+        status, error = _error_body(
+            self, lambda: self._post(_partial_coverage_engine(covered=1),
+                                     dict(self.BODY, echo=False)))
+        self.assertEqual(status, 500)
+        self.assertEqual(error["code"], "engine_logprob_records_incomplete")
+        self.assertEqual(error["param"], "logprobs")
+
+    def test_echo_false_full_coverage_is_served(self):
+        # The control for the refusal above: same engine, same shape, every record present.
+        with self._post(_partial_coverage_engine(covered=3),
+                        dict(self.BODY, echo=False)) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertEqual(choice["text"], "AABBCC")
+        self.assertEqual("".join(choice["logprobs"]["tokens"]), choice["text"])
+
+    def test_chat_is_refused_on_the_same_coverage_gap(self):
+        # The worst shape this surface can take, reached by the other door: a 200 with a
+        # full message.content and logprobs.content describing a prefix of it.
+        for covered, tokens in ((1, "short"), (0, "absent")):
+            with self.subTest(records=tokens):
+                base = _spawn_test_server(self, _partial_coverage_engine(covered=covered))
+                status, error = _error_body(self, lambda: _post_chat(base, {
+                    "model": "test-model", "max_tokens": 3, "logprobs": True,
+                    "top_logprobs": 1,
+                    "messages": [{"role": "user", "content": "hi"}]}))
+                self.assertEqual(status, 500)
+                self.assertEqual(error["code"], "engine_logprob_records_incomplete")
+                self.assertEqual(error["param"], "logprobs")
+
+    def test_chat_full_coverage_is_served(self):
+        base = _spawn_test_server(self, _partial_coverage_engine(covered=3))
+        with _post_chat(base, {"model": "test-model", "max_tokens": 3, "logprobs": True,
+                               "top_logprobs": 1,
+                               "messages": [{"role": "user", "content": "hi"}]}) as response:
+            choice = json.load(response)["choices"][0]
+        entries = choice["logprobs"]["content"]
+        self.assertEqual("".join(entry["token"] for entry in entries),
+                         choice["message"]["content"])
+        self.assertEqual(choice["message"]["content"], "AABBCC")
+
+    def test_echo_with_no_prompt_echo_records_is_refused_by_name(self):
+        # The engine answered half the opt-in: every generated record, no ECHO frame. The
+        # prompt echo is the half `echo` asked for.
+        base = _spawn_test_server(self, ScriptedEngine(chunks=("Hi",), echoes=()))
+        status, error = _error_body(self, lambda: _post_completions(base, {
+            "model": "test-model", "prompt": "Hi", "max_tokens": 2, "logprobs": 1,
+            "echo": True}))
+        self.assertEqual(status, 500)
+        self.assertEqual(error["code"], "engine_logprob_records_incomplete")
+        self.assertEqual(error["param"], "echo")
+
+
+class PinnedPrefixEchoTest(unittest.TestCase):
+    """A KV slot holding a pin snapshot echoes prompt positions from the snapshot's length
+    rather than from 0. Re-basing that run would attach every logprob to the wrong prompt
+    token, so it is refused by name."""
+
+    def test_a_pinned_prefix_is_refused_by_name(self):
+        base = _spawn_test_server(self, _pinned_prefix_engine())
+        status, error = _error_body(self, lambda: _post_completions(base, {
+            "model": "test-model", "prompt": "abc", "logprobs": 1, "echo": True,
+            "max_tokens": 2}))
+        self.assertEqual(status, 503)
+        self.assertEqual(error["code"], "engine_pinned_prefix_not_echoed")
+        self.assertEqual(error["param"], "echo")
+
+    def test_an_unpinned_prompt_control_is_served(self):
+        base = _spawn_test_server(self, ScriptedEngine(
+            chunks=("ok",),
+            echoes=[(b"a", NAN, []), (b"b", -0.1, [(1, -0.1)])]))
+        with _post_completions(base, {"model": "test-model", "prompt": "ab",
+                                      "logprobs": 1, "echo": True,
+                                      "max_tokens": 2}) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertEqual(choice["text"], "abok")
+
+
+class ClientVisibleEngineFaultCodeTest(unittest.TestCase):
+    """Each engine-fault path fails closed AND tells the client which fault. Every test
+    reads the code and param out of the response body, because an exception with a good
+    name that never reaches the wire is the defect rather than the fix. Each has a control
+    that must come back 200, so "names the fault" can never be satisfied by a server that
+    refuses everything.
+
+    The codes say what the ENGINE did, never what this gateway did about it, so they
+    survive a change of reaction."""
+
+    def test_duplicate_candidate_names_itself_with_the_callers_own_param(self):
+        # The same engine table is requested by two different parameters, and a client
+        # branching on the code is told which of its own fields went unanswered.
+        for post, body, param in (
+                (_post_completions,
+                 {"model": "test-model", "prompt": "hi", "logprobs": 2, "max_tokens": 1},
+                 "logprobs"),
+                (_post_chat,
+                 {"model": "test-model", "messages": [{"role": "user", "content": "hi"}],
+                  "logprobs": True, "top_logprobs": 2, "max_tokens": 1},
+                 "top_logprobs")):
+            with self.subTest(param=param):
+                base = _spawn_test_server(self, _duplicate_candidate_engine())
+                status, error = _error_body(self, lambda: post(base, body))
+                self.assertEqual(status, 500)
+                self.assertEqual(error["code"], "engine_duplicate_logprob_candidate")
+                self.assertEqual(error["param"], param)
+
+    def test_distinct_candidates_control_is_served_on_both_surfaces(self):
+        base = _spawn_test_server(self, _duplicate_candidate_engine(duplicate=False))
+        with _post_completions(base, {"model": "test-model", "prompt": "hi",
+                                      "logprobs": 2, "max_tokens": 1}) as response:
+            body = json.load(response)
+        self.assertEqual(len(body["choices"][0]["logprobs"]["top_logprobs"][0]), 2)
+        base = _spawn_test_server(self, _duplicate_candidate_engine(duplicate=False))
+        with _post_chat(base, {"model": "test-model",
+                               "messages": [{"role": "user", "content": "hi"}],
+                               "logprobs": True, "top_logprobs": 2,
+                               "max_tokens": 1}) as response:
+            body = json.load(response)
+        self.assertEqual(
+            len(body["choices"][0]["logprobs"]["content"][0]["top_logprobs"]), 2)
+
+    def _tail_engine(self, frame):
+        """A real Engine over a fake process, so the frame is parsed by the dispatcher
+        exactly as it is in production and the named error has to travel from the
+        dispatcher thread to the waiting request thread and out onto the wire."""
+        def respond(process, written):
+            request_id = written.split()[1]
+            process.stdout.feed(frame.replace(b"{id}", request_id))
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 1 1 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        return engine
+
+    def test_malformed_tail_names_itself_to_the_client(self):
+        base = _spawn_test_server(
+            self, self._tail_engine(b"DATA {id} 1 -0.5 1 3\nx\n"))
+        status, error = _error_body(self, lambda: _post_completions(base, {
+            "model": "test-model", "prompt": "hi", "logprobs": 1, "max_tokens": 1}))
+        self.assertEqual(status, 500)
+        self.assertEqual(error["code"], "engine_logprob_tail_malformed")
+        self.assertEqual(error["param"], "logprobs")
+
+    def test_well_formed_tail_control_is_served(self):
+        # The control that matters most here: the relay must carry a good frame through
+        # untouched, or "names the fault" is satisfied by a build that fails every
+        # logprobs request.
+        base = _spawn_test_server(
+            self, self._tail_engine(b"DATA {id} 1 -0.5 1 3 -0.5\nx\n"))
+        with _post_completions(base, {"model": "test-model", "prompt": "hi",
+                                      "logprobs": 1, "max_tokens": 1}) as response:
+            body = json.load(response)
+        self.assertNotIn("error", body)
+        self.assertEqual(body["choices"][0]["text"], "x")
+
+    def test_an_unsupported_engine_names_its_refusal_in_the_body(self):
+        base = _spawn_test_server(self, ScriptedEngine(supports_logprobs_echo=False))
+        status, error = _error_body(self, lambda: _post_completions(base, {
+            "model": "test-model", "prompt": "hi", "logprobs": 1}))
+        self.assertEqual(status, 400)
+        self.assertEqual(error["code"], "unsupported_parameter")
+        self.assertEqual(error["param"], "logprobs")
+
+    def test_the_same_engine_serves_a_plain_request(self):
+        base = _spawn_test_server(self, ScriptedEngine(supports_logprobs_echo=False))
+        with _post_completions(base, {"model": "test-model", "prompt": "hi"}) as response:
+            body = json.load(response)
+        self.assertEqual(body["choices"][0]["text"], "ok")
+        self.assertIsNone(body["choices"][0]["logprobs"])
+
+
+class CapabilitySplitIndependenceTest(unittest.TestCase):
+    """`supports_logprobs_echo` and `supports_tok_ids` gate two unrelated SUBMIT extension
+    keys and must be settable one without the other. Both are `arch == "glm"` today, so
+    nothing short of a double with the two flags set to different values can show the
+    split is real rather than cosmetic."""
+
+    def test_logprobs_is_refused_when_only_token_id_intake_is_available(self):
+        base = _spawn_test_server(self, ScriptedEngine(supports_logprobs_echo=False,
+                                                       supports_tok_ids=True))
+        status, error = _error_body(self, lambda: _post_completions(base, {
+            "model": "test-model", "prompt": "hi", "logprobs": 1}))
+        self.assertEqual(status, 400)
+        self.assertEqual(error["param"], "logprobs")
+
+    def test_logprobs_is_served_when_only_the_numeric_channel_is_available(self):
+        base = _spawn_test_server(self, ScriptedEngine(supports_logprobs_echo=True,
+                                                       supports_tok_ids=False))
+        with _post_completions(base, {"model": "test-model", "prompt": "hi",
+                                      "logprobs": 1}) as response:
+            choice = json.load(response)["choices"][0]
+        self.assertEqual(choice["logprobs"]["tokens"], ["ok"])
+
+    def test_an_engine_sets_the_two_flags_independently_of_each_other(self):
+        # Set from the same arch check today, but each read site checks the one it means:
+        # one flag forced off must not take the other with it.
+        process = FakeProcess(lambda process, written: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        self.assertTrue(engine.supports_logprobs_echo)
+        self.assertTrue(engine.supports_tok_ids)
+        engine.supports_logprobs_echo = False
+        self.assertTrue(engine.supports_tok_ids)
+
+
+class SubmitHeaderExtensionTest(unittest.TestCase):
+    """The SUBMIT header, byte for byte. A request that opts into nothing must produce the
+    header it produced before this channel existed, and an opted-in one must carry the
+    extension keys behind the seventh numeric field."""
+
+    def _engine(self, expected, frames):
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(frames)
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        return engine, process
+
+    def test_a_plain_request_submit_header_is_byte_identical(self):
+        expected = b"SUBMIT 1 0 5 4 0.25 0.9\n" + b"hello\n"
+        engine, process = self._engine(
+            expected, b"DATA 1 2\nok\nDONE 1 STAT 1 2.5 0 1.0 5 0\n")
+        engine.generate("hello", 4, 0.25, 0.9, [].append)
+        engine.close()
+        self.assertEqual(process.writes, [expected])
+
+    def test_an_opted_in_request_carries_the_extension_behind_the_seventh_field(self):
+        # coli_submit_parse reaches its key=value arm only after seven numeric fields, and
+        # sending the extension on every request would make the plain-header test above
+        # fail.
+        expected = b"SUBMIT 1 0 5 4 0.25 0.9 0 logprobs=2\n" + b"hello\n"
+        engine, process = self._engine(
+            expected,
+            b"ACCEPT 1 5\nECHO 1 1 0 nan 0\nh\n"
+            b"DATA 1 2 -0.223144 1 3 -0.223144\nok\nDONE 1 STAT 1 2.5 0 1.0 5 0\n")
+        stats = engine.generate("hello", 4, 0.25, 0.9, [].append, logprobs=2,
+                                gbytes_before_ext=True)
+        engine.close()
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(stats["logprobs"]["generated"],
+                         [(b"ok", {"lp": -0.223144, "topk": [(3, -0.223144)]})])
+
+    def test_the_seventh_field_is_sent_only_when_the_caller_asks_for_it(self):
+        # It is a request, not a rule: engines that parse a header without that field
+        # reject or mis-read one carrying it, so only a caller whose engine uses
+        # coli_submit_parse asks for it. `pin` rides the same request.
+        expected = b"SUBMIT 1 0 5 0 0.25 0.9 logprobs=1 pin=1\n" + b"hello\n"
+        engine, process = self._engine(
+            expected, b"ACCEPT 1 5\nECHO 1 1 0 nan 0\nh\nDONE 1 STAT 0 2.5 0 1.0 5 0\n")
+        engine.generate("hello", 0, 0.25, 0.9, lambda _chunk: None, logprobs=1, pin=True,
+                        on_echo=lambda _record: None)
+        engine.close()
+        self.assertEqual(process.writes, [expected])
+
+
+class EngineExtensionCallSiteTest(unittest.TestCase):
+    """Each of this server's call sites into Engine.generate() applies the same extension
+    profile, so none can be left behind. For each: an opted-in request emits the extended
+    header, and a plain request emits the base header."""
+
+    def _header(self, path, body, engine_frames=None):
+        """The SUBMIT header one HTTP request produces, taken off a fake engine process."""
+        headers = []
+
+        def respond(process, frame):
+            headers.append(frame.split(b"\n", 1)[0])
+            request_id = frame.split()[1]
+            process.stdout.feed(engine_frames.replace(b"{id}", request_id)
+                                if engine_frames else
+                                b"ACCEPT " + request_id + b" 1\n"
+                                b"DATA " + request_id + b" 2\nok\n"
+                                b"DONE " + request_id + b" STAT 1 2.5 0 1.0 5 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        base = _spawn_test_server(self, engine)
+        with _post_json(base, path, body) as response:
+            response.read()
+        return headers[0]
+
+    OPTED_IN_FRAMES = (b"ACCEPT {id} 1\n"
+                       b"DATA {id} 2 -0.5 1 3 -0.5\nok\n"
+                       b"DONE {id} STAT 1 2.5 0 1.0 5 0\n")
+
+    def test_non_streaming_completions_site(self):
+        plain = self._header("/v1/completions", {"model": "test-model", "prompt": "hi"})
+        self.assertNotIn(b"logprobs=", plain)
+        opted = self._header("/v1/completions",
+                             {"model": "test-model", "prompt": "hi", "logprobs": 2},
+                             self.OPTED_IN_FRAMES)
+        self.assertIn(b" 0 logprobs=2", opted)
+
+    def test_non_streaming_chat_site(self):
+        messages = [{"role": "user", "content": "hi"}]
+        plain = self._header("/v1/chat/completions",
+                             {"model": "test-model", "messages": messages})
+        self.assertNotIn(b"logprobs=", plain)
+        opted = self._header("/v1/chat/completions",
+                             {"model": "test-model", "messages": messages,
+                              "logprobs": True, "top_logprobs": 1},
+                             self.OPTED_IN_FRAMES)
+        self.assertIn(b" 0 logprobs=1", opted)
+
+    def test_streaming_plain_site_keeps_the_base_header(self):
+        # Streaming with logprobs is a named 400, so this site can only ever be reached
+        # without the extension -- and must never grow it.
+        header = self._header("/v1/completions",
+                              {"model": "test-model", "prompt": "hi", "stream": True})
+        self.assertNotIn(b"logprobs=", header)
+        status, error = _error_body(self, lambda: self._header(
+            "/v1/completions",
+            {"model": "test-model", "prompt": "hi", "stream": True, "logprobs": 1}))
+        self.assertEqual((status, error["param"]), (400, "logprobs"))
+
+    def test_streaming_chat_with_tools_site_keeps_the_base_header(self):
+        messages = [{"role": "user", "content": "hi"}]
+        tools = [{"type": "function",
+                  "function": {"name": "search",
+                               "parameters": {"type": "object", "properties": {}}}}]
+        header = self._header("/v1/chat/completions",
+                              {"model": "test-model", "messages": messages,
+                               "tools": tools, "stream": True})
+        self.assertNotIn(b"logprobs=", header)
+        status, error = _error_body(self, lambda: self._header(
+            "/v1/chat/completions",
+            {"model": "test-model", "messages": messages, "tools": tools,
+             "stream": True, "logprobs": True}))
+        self.assertEqual((status, error["param"]), (400, "logprobs"))
+
+    def test_the_messages_endpoint_ignores_a_logprobs_field(self):
+        # `logprobs` is not in the Anthropic request shape, and this endpoint builds its
+        # own translated request rather than forwarding the client's body, so the field
+        # never reaches the options parser. A 200 with no logprobs anywhere, for either
+        # endpoint's spelling of the field.
+        for value in (True, 1):
+            with self.subTest(value=value):
+                base = _spawn_test_server(self, ScriptedEngine(chunks=("Hello",)))
+                with _post_json(base, "/v1/messages",
+                                {"model": "test-model", "max_tokens": 4,
+                                 "messages": [{"role": "user", "content": "hi"}],
+                                 "logprobs": value}) as response:
+                    body = json.load(response)
+                self.assertEqual(body["content"], [{"type": "text", "text": "Hello"}])
+                self.assertNotIn("logprobs", json.dumps(body))
+
+    def test_the_messages_endpoint_keeps_the_base_header(self):
+        # /v1/messages sends no extension key, and nothing about this change may give it
+        # one.
+        header = self._header("/v1/messages",
+                              {"model": "test-model", "max_tokens": 4,
+                               "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(header.split(b" ")[:2], [b"SUBMIT", b"1"])
+        self.assertNotIn(b"logprobs=", header)
+        self.assertNotIn(b"=", header)
+
+
+class DispatcherLogprobTailTest(unittest.TestCase):
+    """A numeric tail is parsed only for the request that asked for the channel. A
+    malformed one fails that request alone; a frame carrying fields a request never asked
+    for is tolerated, as it was before the channel existed."""
+
+    def _engine(self, respond):
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        return engine, process
+
+    def test_extra_fields_on_a_plain_requests_frame_are_tolerated(self):
+        # The request never asked for the channel, so the tail is not parsed -- not even
+        # to reject it. This is the base behaviour, restored.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2 garbage fields here\nok\n"
+                                b"DONE " + request_id + b" STAT 1 2.5 0 1.0 5 0\n")
+
+        engine, _process = self._engine(respond)
+        chunks = []
+        stats = engine.generate("hi", 4, 0.25, 0.9, chunks.append)
+        self.assertEqual(chunks, ["ok"])
+        self.assertNotIn("logprobs", stats)
+
+    def _concurrent_fault(self, bad_frame):
+        """Drive one plain request and one opted-in request over the same engine, with the
+        opted-in request's fault arriving while the plain one is still in flight.
+
+        The plain request is submitted first and left waiting for its DONE. The opted-in
+        request's SUBMIT then triggers the bad frame, that request's terminal frame, and
+        finally the plain request's. Returns `(plain result, opted-in exception)`."""
+        first_submitted = threading.Event()
+
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            if b"logprobs=" in frame.split(b"\n", 1)[0]:
+                process.stdout.feed(bad_frame.replace(b"{id}", request_id))
+                process.stdout.feed(b"DONE " + request_id + b" STAT 1 2.5 0 1.0 5 0\n")
+                process.stdout.feed(b"DONE 1 STAT 1 2.5 0 1.0 5 0\n")
+            else:
+                process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+                first_submitted.set()
+
+        engine, _process = self._engine(respond)
+        plain = {}
+
+        def run_plain():
+            chunks = []
+            try:
+                plain["stats"] = engine.generate("hi", 4, 0.25, 0.9, chunks.append)
+                plain["chunks"] = chunks
+            except Exception as error:               # recorded, asserted by the caller
+                plain["error"] = error
+
+        thread = threading.Thread(target=run_plain, daemon=True)
+        thread.start()
+        self.assertTrue(first_submitted.wait(2))
+        with self.assertRaises(APIError) as caught:
+            engine.generate("hi", 4, 0.25, 0.9, [].append, logprobs=1,
+                            gbytes_before_ext=True)
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        return plain, caught.exception
+
+    def test_a_malformed_tail_spares_a_request_that_is_in_flight(self):
+        # The containment rule's whole point: not that the dispatcher survived the fault,
+        # but that the request which never asked for the channel is untouched by it.
+        # Failing every pending request instead leaves the plain request holding an error
+        # it did not earn.
+        plain, error = self._concurrent_fault(b"DATA {id} 2 -0.5 1 3\nok\n")
+        self.assertEqual(error.status, 500)
+        self.assertEqual(error.code, "engine_logprob_tail_malformed")
+        self.assertNotIn("error", plain)
+        self.assertEqual(plain["chunks"], ["ok"])
+        self.assertEqual(plain["stats"]["completion_tokens"], 1)
+
+    def test_a_malformed_echo_logprob_on_a_request_that_never_opted_in(self):
+        # The `lp` field is read for EVERY ECHO frame, opted in or not, because the
+        # closed-set scorer's own `logprob` key comes from it -- so unlike the tail, this
+        # one is reachable by a request with no numeric channel at all. That is the row of
+        # the four that was still reaching the dispatcher's blanket handler, which fails
+        # every request in flight and stops the dispatcher for good. Here the bad frame
+        # goes to the NON-opted-in request and a second request is in flight beside it.
+        second_submitted = threading.Event()
+
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            if b"logprobs=" in frame.split(b"\n", 1)[0]:
+                process.stdout.feed(b"DATA " + request_id + b" 2 -0.5 1 3 -0.5\nok\n")
+                second_submitted.set()
+            else:
+                process.stdout.feed(b"ECHO " + request_id + b" 1 0 zz 0\nh\n")
+                # The fault is delivered on the turn's terminal frame, so the engine has
+                # to end the turn for the request to be answered at all.
+                process.stdout.feed(
+                    b"DONE " + request_id + b" STAT 1 2.5 0 1.0 5 0\n")
+
+        engine, _process = self._engine(respond)
+        opted = {}
+
+        def run_opted():
+            chunks = []
+            try:
+                opted["stats"] = engine.generate(
+                    "hi", 4, 0.25, 0.9, chunks.append, logprobs=1,
+                    gbytes_before_ext=True, on_echo=lambda _r: None)
+                opted["chunks"] = chunks
+            except Exception as error:               # recorded, asserted below
+                opted["error"] = error
+
+        thread = threading.Thread(target=run_opted, daemon=True)
+        thread.start()
+        self.assertTrue(second_submitted.wait(2))
+        with self.assertRaises(APIError) as caught:
+            engine.generate("hi", 4, 0.25, 0.9, [].append, on_echo=lambda _r: None)
+        self.assertEqual(caught.exception.status, 500)
+        self.assertEqual(caught.exception.code, "engine_logprob_tail_malformed")
+        self.assertIsNone(engine.dispatcher_error)
+        # The request beside it never saw the frame and is still being served.
+        self.assertNotIn("error", opted)
+        self.assertTrue(thread.is_alive())
+        thread.join(timeout=0.1)
+
+    def test_a_malformed_echo_position_spares_a_request_that_is_in_flight(self):
+        # The ECHO `pos` field rides the same opted-in frame as the numeric tail and gets
+        # the same containment. Raising inside the dispatcher instead kills it, and every
+        # concurrent request on the engine fails with that request's fault.
+        plain, error = self._concurrent_fault(b"ECHO {id} 1 x nan 0\nh\n")
+        self.assertEqual(error.status, 500)
+        # Its own code: the position and the numeric tail are different fields of the
+        # frame, and a client branching on the code is told which one was unreadable.
+        self.assertEqual(error.code, "engine_echo_position_malformed")
+        self.assertEqual(error.param, "echo")
+        self.assertNotIn("error", plain)
+        self.assertEqual(plain["chunks"], ["ok"])
+
+    def _poll(self, predicate, what):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.005)
+        self.fail(what)
+
+    def test_a_recorded_fault_keeps_the_turn_open_until_its_terminal_frame(self):
+        # The fault is found mid-turn and raised at the end of it. Delivering it when it
+        # is found would unwind the request thread, and with it the scheduler admission,
+        # while the engine is still generating and no CANCEL has been written -- the next
+        # request would then submit into a pipe nobody is reading. The observable form of
+        # "the turn is still the engine's" is that the pending entry is still there.
+        release = threading.Event()
+
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2 -0.5 1 3\nok\n")
+
+            def terminal():
+                release.wait(2)
+                process.stdout.feed(
+                    b"DONE " + request_id + b" STAT 1 2.5 0 1.0 5 0\n")
+
+            threading.Thread(target=terminal, daemon=True).start()
+
+        engine, process = self._engine(respond)
+        result = {}
+
+        def run():
+            try:
+                engine.generate("hi", 4, 0.25, 0.9, [].append, logprobs=1,
+                                gbytes_before_ext=True)
+            except APIError as error:
+                result["error"] = error
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self._poll(lambda: (engine.pending.get("1") is not None
+                            and engine.pending["1"].failed is not None),
+                   "the fault was never recorded")
+        # Recorded, held, and not yet delivered.
+        self.assertIn("1", engine.pending)
+        self.assertNotIn("error", result)
+        self.assertTrue(thread.is_alive())
+        release.set()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["error"].code, "engine_logprob_tail_malformed")
+        self.assertNotIn("1", engine.pending)
+        # No CANCEL was written: the turn was never abandoned.
+        self.assertEqual([w for w in process.writes if w.startswith(b"CANCEL")], [])
+
+    def test_frames_for_a_failed_or_finished_request_are_ignored(self):
+        # While the fault is recorded the entry stays, and that request's later frames are
+        # routed to it and discarded; once its terminal frame has been delivered the entry
+        # is gone, and anything further for that id belongs to no request. Neither may be
+        # treated as a fault of its own: the dispatcher keeps running and the next request
+        # on the same engine completes normally.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            if b"logprobs=" in frame.split(b"\n", 1)[0]:
+                process.stdout.feed(b"DATA " + request_id + b" 2 -0.5 1 3\nok\n")
+                process.stdout.feed(b"DATA " + request_id + b" 2\nxx\n")
+                process.stdout.feed(b"DONE " + request_id + b" STAT 1 2.5 0 1.0 5 0\n")
+                # ...and two frames the engine sends after the turn it already ended,
+                # which belong to no pending entry at all.
+                process.stdout.feed(b"DATA " + request_id + b" 2\nyy\n")
+                process.stdout.feed(b"DONE " + request_id + b" STAT 1 2.5 0 1.0 5 0\n")
+            else:
+                process.stdout.feed(b"DATA " + request_id + b" 2\nok\n"
+                                    b"DONE " + request_id + b" STAT 1 2.5 0 1.0 5 0\n")
+
+        engine, _process = self._engine(respond)
+        with self.assertRaises(APIError) as caught:
+            engine.generate("hi", 4, 0.25, 0.9, [].append, logprobs=1,
+                            gbytes_before_ext=True)
+        self.assertEqual(caught.exception.code, "engine_logprob_tail_malformed")
+        chunks = []
+        stats = engine.generate("hi", 4, 0.25, 0.9, chunks.append)
+        self.assertEqual(chunks, ["ok"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertIsNone(engine.dispatcher_error)
+
+    def _faulted_turn(self, terminal, cancelled=None, settle=1.0):
+        """One opted-in request whose numeric tail is malformed, with `terminal` delivered
+        only once the server answers the fault -- so the turn stays open long enough for
+        the request thread's idle poll to run, which is where that answer is written.
+
+        A timer delivers `terminal` anyway after `settle` seconds, so a build that answers
+        nothing fails an assertion instead of hanging the suite. Returns `(raised exception
+        or None, the frames the server wrote)`."""
+        answered = threading.Event()
+
+        def respond(process, frame):
+            if not frame.startswith(b"SUBMIT"):
+                answered.set()                     # STOP or CANCEL: the turn can end now
+                process.stdout.feed(terminal.replace(b"{id}", frame.split()[1]))
+                return
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2 -0.5 1 3\nok\n")
+
+            def fallback():
+                if not answered.wait(settle):
+                    process.stdout.feed(terminal.replace(b"{id}", request_id))
+
+            threading.Thread(target=fallback, daemon=True).start()
+
+        engine, process = self._engine(respond)
+        raised = None
+        try:
+            engine.generate("hi", 4, 0.25, 0.9, [].append, logprobs=1,
+                            gbytes_before_ext=True, cancelled=cancelled)
+        except Exception as error:                # the class is what the test asserts
+            raised = error
+        return raised, process.writes
+
+    def test_a_cancellation_outranks_the_recorded_fault_on_a_terminal_done(self):
+        # The engine may end a cancelled turn with DONE rather than ERROR CANCELLED. The
+        # client left either way, so the turn is a cancellation, not a server failure --
+        # which is what the scheduler books when anything but ClientCancelled comes out,
+        # and what the metrics then count.
+        raised, writes = self._faulted_turn(b"DONE {id} STAT 1 2.5 0 1.0 5 0\n",
+                                            cancelled=lambda: True)
+        self.assertIsInstance(raised, ClientCancelled)
+        self.assertEqual([w for w in writes if w.startswith(b"CANCEL")], [b"CANCEL 1\n"])
+        self.assertEqual([w for w in writes if w.startswith(b"STOP")], [])
+
+    def test_a_cancellation_outranks_the_recorded_fault(self):
+        # The client left mid-turn on a request that also carries a fault of its own. That
+        # is answered the way it is answered on a healthy turn -- ClientCancelled, not a
+        # 500 written to a socket that is already closed.
+        raised, writes = self._faulted_turn(b"ERROR {id} CANCELLED\n",
+                                            cancelled=lambda: True)
+        self.assertIsInstance(raised, ClientCancelled)
+        # The disconnect is what the engine was told about: CANCEL, not STOP.
+        self.assertEqual([w for w in writes if w.startswith(b"CANCEL")], [b"CANCEL 1\n"])
+        self.assertEqual([w for w in writes if w.startswith(b"STOP")], [])
+
+    def test_any_other_terminal_error_keeps_the_fault_and_carries_the_engines_text(self):
+        # The fault happened first and names the framing defect, so it is what the client
+        # is told; the engine's own parting word is appended rather than dropped. Reporting
+        # the engine's error instead would tell a client with an over-long prompt to
+        # shorten it when the real defect was a frame this server could not read.
+        raised, _writes = self._faulted_turn(b"ERROR {id} CONTEXT_EXCEEDED 9 8\n")
+        self.assertIsInstance(raised, APIError)
+        self.assertEqual(raised.status, 500)
+        self.assertEqual(raised.code, "engine_logprob_tail_malformed")
+        self.assertIn("malformed per-token logprob tail", raised.message)
+        self.assertIn("The engine then reported:", raised.message)
+        self.assertIn("CONTEXT_EXCEEDED", raised.message)
+
+    def test_a_faulted_turn_is_stopped_once_and_then_drained(self):
+        # The turn is doomed but still the engine's: the admission is held to its terminal
+        # frame either way, and one STOP keeps it from spending the rest of the budget on a
+        # response nobody will receive. Exactly one, and no CANCEL.
+        raised, writes = self._faulted_turn(b"DONE {id} STAT 1 2.5 0 1.0 5 0\n")
+        self.assertIsInstance(raised, APIError)
+        self.assertEqual(raised.code, "engine_logprob_tail_malformed")
+        self.assertEqual([w for w in writes if w.startswith(b"STOP")], [b"STOP 1\n"])
+        self.assertEqual([w for w in writes if w.startswith(b"CANCEL")], [])
+
+    def test_a_healthy_slow_turn_is_not_stopped(self):
+        # The control for the fault guard, and it has to IDLE to be one: a fixture that
+        # feeds every frame back to back never reaches the `queue.Empty` branch, which is
+        # the only place the guard lives. This one leaves a gap wider than the 0.05 s poll
+        # between DATA and DONE -- an ordinary inter-token interval on a large model -- so
+        # a build that stops on every idle tick writes a STOP here and also skips the
+        # decode for the rest of the turn, returning a 200 with an empty completion.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2 -0.5 1 3 -0.5\nok\n")
+
+            def terminal():
+                time.sleep(0.15)                  # three idle polls, well under the ceiling
+                process.stdout.feed(
+                    b"DONE " + request_id + b" STAT 1 2.5 0 1.0 5 0\n")
+
+            threading.Thread(target=terminal, daemon=True).start()
+
+        engine, process = self._engine(respond)
+        chunks = []
+        stats = engine.generate("hi", 4, 0.25, 0.9, chunks.append, logprobs=1,
+                                gbytes_before_ext=True)
+        self.assertEqual([w for w in process.writes if w.startswith(b"STOP")], [])
+        self.assertEqual([w for w in process.writes if w.startswith(b"CANCEL")], [])
+        # ...and the turn still delivered, which is what a stray STOP would cost.
+        self.assertEqual(chunks, ["ok"])
+        self.assertEqual(stats["completion_tokens"], 1)
+
+    def test_a_failed_fault_stop_write_answers_by_name_and_keeps_the_connection(self):
+        # The STOP written for a recorded fault can itself fail at the pipe. An engine this
+        # server cannot write to outranks a fault in the stream it cannot read: the request
+        # is answered with a named error rather than having its connection dropped, which
+        # is what an unhandled write error does. Written against this tree's own STOP write
+        # so the pin survives the composition with the checked writer.
+        class DeadOnStop:
+            """The engine's stdin: accepts the SUBMIT, refuses the STOP."""
+            def __init__(self, process):
+                self.process = process
+
+            def write(self, data):
+                if data.startswith(b"STOP"):
+                    raise BrokenPipeError(32, "Broken pipe")
+                return self.process.real_write(data)
+
+            def flush(self):
+                pass
+
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2 -0.5 1 3\nok\n")
+
+            def terminal():
+                time.sleep(0.15)
+                process.stdout.feed(
+                    b"DONE " + request_id + b" STAT 1 2.5 0 1.0 5 0\n")
+
+            threading.Thread(target=terminal, daemon=True).start()
+
+        engine, process = self._engine(respond)
+        process.real_write = process.write
+        process.stdin = DeadOnStop(process)
+        with self.assertRaises(Exception) as caught:
+            engine.generate("hi", 4, 0.25, 0.9, [].append, logprobs=1,
+                            gbytes_before_ext=True)
+        # The turn is over and nothing will ever answer it: the entry must not be left for
+        # the dispatcher to deliver to a caller that has already unwound, nor to hold a
+        # request id the next turn could be given.
+        self.assertNotIn("1", engine.pending)
+        self.assertEqual(engine.pending, {})
+        # Named, and reaching the caller: an unraised write error would instead unwind
+        # through the handler and close the socket with no status line on it.
+        raised = caught.exception
+        self.assertNotIsInstance(raised, BrokenPipeError)
+        named = raised.code if isinstance(raised, APIError) else str(raised)
+        self.assertTrue(named, "the failed STOP write must be reported by name")
+        self.assertIn("STOP", str(raised).upper() + (raised.message.upper()
+                                                     if isinstance(raised, APIError) else ""))
+
+    def test_the_malformed_tail_battery(self):
+        # A required field absent or non-numeric, a k outside the engine's interface, or a
+        # negative token id. Every one of them is a missing or unreadable field, never a
+        # frame that merely carries more than the grammar names.
+        for tail in (b"-0.5", b"-0.5 1 3", b"x 1 3 -0.5", b"-0.5 99 3 -0.5",
+                     b"-0.5 1 -3 -0.5", b"-0.5 x 3 -0.5"):
+            with self.subTest(tail=tail):
+                def respond(process, frame, tail=tail):
+                    request_id = frame.split()[1]
+                    process.stdout.feed(b"DATA " + request_id + b" 2 " + tail + b"\nok\n"
+                                        b"DONE " + request_id + b" STAT 1 2.5 0 1.0 5 0\n")
+
+                engine, _process = self._engine(respond)
+                with self.assertRaises(APIError) as caught:
+                    engine.generate("hi", 4, 0.25, 0.9, [].append, logprobs=1,
+                                    gbytes_before_ext=True)
+                self.assertEqual(caught.exception.code, "engine_logprob_tail_malformed")
+
+    def test_extra_trailing_fields_on_an_opted_in_frame_are_served(self):
+        # The parser consumes the fields the grammar defines and ignores what follows. The
+        # base tolerated a longer frame for every caller, and this parser now runs for
+        # internal consumers of the channel that read only part of the record.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(
+                b"DATA " + request_id + b" 2 -0.5 1 3 -0.5 9 -9.0\nok\n"
+                b"DONE " + request_id + b" STAT 1 2.5 0 1.0 5 0\n")
+
+        engine, _process = self._engine(respond)
+        chunks = []
+        stats = engine.generate("hi", 4, 0.25, 0.9, chunks.append, logprobs=1,
+                                gbytes_before_ext=True)
+        self.assertEqual(chunks, ["ok"])
+        self.assertEqual(stats["logprobs"]["generated"],
+                         [(b"ok", {"lp": -0.5, "topk": [(3, -0.5)]})])
+
+    def test_the_closed_set_scoring_path_keeps_the_bases_frame_tolerance(self):
+        # The other caller of the numeric channel reads `pos`/`logprob`/`text` and nothing
+        # else, and its engine's ECHO frames may carry more than this parser names. Driven
+        # through a real Engine and the real dispatcher, in that caller's own call shape,
+        # because a FakeEngine cannot see a framing change at all.
+        for label, echo_frame in (
+                ("exact", b"ECHO {id} 1 0 nan 0\nh\n"),
+                ("one extra trailing field", b"ECHO {id} 1 0 nan 0 7\nh\n"),
+                ("a populated table plus an extra", b"ECHO {id} 1 0 -0.5 1 3 -0.5 7\nh\n")):
+            with self.subTest(frame=label):
+                def respond(process, frame, echo_frame=echo_frame):
+                    request_id = frame.split()[1]
+                    process.stdout.feed(echo_frame.replace(b"{id}", request_id))
+                    process.stdout.feed(b"DONE " + request_id + b" STAT 0 2.5 0 1.0 5 0\n")
+
+                engine, _process = self._engine(respond)
+                echoes = []
+                engine.generate("hi", 0, 0.0, 1.0, lambda _chunk: None,
+                                logprobs=1, pin=True, on_echo=echoes.append)
+                self.assertEqual(len(echoes), 1)
+                self.assertEqual(echoes[0]["pos"], 0)
+                self.assertEqual(echoes[0]["text"], "h")
+
+    def test_a_well_formed_tail_reaches_the_caller(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(
+                b"ACCEPT " + request_id + b" 1\n"
+                b"ECHO " + request_id + b" 1 0 nan 0\nh\n"
+                b"DATA " + request_id + b" 2 -0.5 2 3 -0.5 4 -1.25\nok\n"
+                b"DONE " + request_id + b" STAT 1 2.5 0 1.0 5 0\n")
+
+        engine, _process = self._engine(respond)
+        echoes = []
+        stats = engine.generate("hi", 4, 0.25, 0.9, [].append, logprobs=2,
+                                gbytes_before_ext=True, on_echo=echoes.append)
+        self.assertEqual(stats["logprobs"]["generated"],
+                         [(b"ok", {"lp": -0.5, "topk": [(3, -0.5), (4, -1.25)]})])
+        # The echo record keeps the scorer's three keys and their meanings, and gains the
+        # payload and the numeric tail the logprobs surface needs.
+        self.assertEqual(echoes[0]["pos"], 0)
+        self.assertIsNone(echoes[0]["logprob"])
+        self.assertEqual(echoes[0]["text"], "h")
+        self.assertEqual(echoes[0]["bytes"], b"h")
+        self.assertTrue(math.isnan(echoes[0]["lp"]))
+        self.assertEqual(echoes[0]["topk"], [])
 
 
 if __name__ == "__main__":
