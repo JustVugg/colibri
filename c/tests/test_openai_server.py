@@ -532,7 +532,107 @@ class ProtocolTest(unittest.TestCase):
             listener.close()
 
 
+class GenerationMetricsTest(unittest.TestCase):
+    def setUp(self):
+        self.server = APIServer(("127.0.0.1", 0), FakeEngine(), "test")
+        self.addCleanup(self.server.server_close)
+
+    def test_records_first_output_once_and_preserves_text_and_stats(self):
+        output = []
+        with patch("openai_server.time.monotonic", side_effect=[10, 10.5, 13]):
+            stats = self.server.generate("prompt", 4, 0, 1, output.append)
+        self.assertEqual(output, ["Hé", "llo"])
+        self.assertEqual(stats["completion_tokens"], 2)
+        metrics = self.server.scheduler.prometheus()
+        self.assertIn("colibri_scheduler_first_output_seconds_sum 0.5\n", metrics)
+        self.assertIn("colibri_scheduler_first_output_seconds_count 1\n", metrics)
+        self.assertIn("colibri_scheduler_engine_call_seconds_sum 3.0\n", metrics)
+        self.assertIn("colibri_scheduler_engine_call_seconds_count 1\n", metrics)
+
+    def test_empty_output_does_not_count_but_tool_output_does(self):
+        text, tools = [], []
+        def generate(prompt, maximum, temperature, top_p, on_text, **kwargs):
+            on_text("")
+            kwargs["on_tool"]("")
+            kwargs["on_tool"]("tool payload")
+            on_text("tail")
+            return {"completion_tokens": 2}
+        with patch.object(self.server.engine, "generate", side_effect=generate), \
+             patch("openai_server.time.monotonic", side_effect=[10, 12, 15]):
+            self.server.generate("prompt", 4, 0, 1, text.append, on_tool=tools.append)
+        self.assertEqual(text, ["", "tail"])
+        self.assertEqual(tools, ["", "tool payload"])
+        metrics = self.server.scheduler.prometheus()
+        self.assertIn("colibri_scheduler_first_output_seconds_sum 2.0\n", metrics)
+        self.assertIn("colibri_scheduler_first_output_seconds_count 1\n", metrics)
+
+    def test_error_and_cancellation_before_output_do_not_invent_first_output(self):
+        for error in (RuntimeError("failed"), ClientCancelled()):
+            with patch.object(self.server.engine, "generate", side_effect=error), \
+                 patch("openai_server.time.monotonic", side_effect=[10, 14]):
+                with self.assertRaises(type(error)):
+                    self.server.generate("prompt", 4, 0, 1, lambda text: None)
+        metrics = self.server.scheduler.prometheus()
+        self.assertIn("colibri_scheduler_first_output_seconds_count 0\n", metrics)
+        self.assertIn("colibri_scheduler_engine_call_seconds_sum 8.0\n", metrics)
+        self.assertIn("colibri_scheduler_engine_call_seconds_count 2\n", metrics)
+
+    def test_failure_after_output_keeps_both_observations(self):
+        def generate(prompt, maximum, temperature, top_p, on_text):
+            on_text("partial")
+            raise RuntimeError("failed after output")
+        with patch.object(self.server.engine, "generate", side_effect=generate), \
+             patch("openai_server.time.monotonic", side_effect=[10, 11, 12]):
+            with self.assertRaises(RuntimeError):
+                self.server.generate("prompt", 4, 0, 1, lambda text: None)
+        metrics = self.server.scheduler.prometheus()
+        self.assertIn("colibri_scheduler_first_output_seconds_count 1\n", metrics)
+        self.assertIn("colibri_scheduler_engine_call_seconds_count 1\n", metrics)
+
+
 class SchedulerTest(unittest.TestCase):
+    def test_engine_failure_is_not_a_completed_request(self):
+        scheduler = GenerationScheduler()
+        with self.assertRaisesRegex(RuntimeError, "engine failed"):
+            with scheduler.admit():
+                raise RuntimeError("engine failed")
+        stats = scheduler.snapshot()
+        self.assertEqual(stats["failed"], 1)
+        self.assertEqual(stats["completed"], 0)
+        self.assertEqual(stats["active"], 0)
+        with scheduler.admit():
+            pass
+        self.assertEqual(scheduler.snapshot()["completed"], 1)
+
+    def test_prometheus_histograms_measure_admission_and_slot_occupancy(self):
+        scheduler = GenerationScheduler()
+        with patch("openai_server.time.monotonic", side_effect=[10, 10.25, 10.25, 12.25]):
+            with scheduler.admit():
+                active = scheduler.prometheus()
+                self.assertIn("colibri_scheduler_active 1\n", active)
+                self.assertIn("colibri_scheduler_slot_duration_seconds_count 0\n", active)
+        metrics = scheduler.prometheus()
+        self.assertIn("# TYPE colibri_scheduler_completed_total counter\n", metrics)
+        self.assertIn("colibri_scheduler_completed_total 1\n", metrics)
+        self.assertIn("colibri_scheduler_queue_wait_seconds_sum 0.25\n", metrics)
+        self.assertIn('colibri_scheduler_queue_wait_seconds_bucket{le="0.1"} 0\n', metrics)
+        self.assertIn('colibri_scheduler_queue_wait_seconds_bucket{le="0.5"} 1\n', metrics)
+        self.assertIn('colibri_scheduler_queue_wait_seconds_bucket{le="+Inf"} 1\n', metrics)
+        self.assertIn("colibri_scheduler_slot_duration_seconds_sum 2.0\n", metrics)
+        self.assertIn("colibri_scheduler_slot_duration_seconds_count 1\n", metrics)
+
+    def test_failed_and_cancelled_admissions_are_timed(self):
+        scheduler = GenerationScheduler()
+        for error in (RuntimeError("failed"), ClientCancelled()):
+            with self.assertRaises(type(error)):
+                with scheduler.admit():
+                    raise error
+        metrics = scheduler.prometheus()
+        self.assertIn("colibri_scheduler_failed_total 1\n", metrics)
+        self.assertIn("colibri_scheduler_cancelled_total 1\n", metrics)
+        self.assertIn("colibri_scheduler_completed_total 0\n", metrics)
+        self.assertIn("colibri_scheduler_slot_duration_seconds_count 2\n", metrics)
+
     def test_admits_up_to_capacity_without_serializing(self):
         scheduler = GenerationScheduler(max_queue=0, queue_timeout=1, capacity=2)
         with scheduler.admit() as first:
@@ -550,6 +650,75 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "queue_full")
         self.assertEqual(scheduler.snapshot()["rejected"], 1)
 
+    def test_any_slot_request_uses_capacity_not_reserved_by_older_waiters(self):
+        scheduler = GenerationScheduler(capacity=2)
+        # State immediately after both slots are released, before the older
+        # slot-0 waiter reacquires the condition lock.
+        older = (object(), 0)
+        scheduler.queue.append(older)
+        with patch.object(scheduler.condition, "wait", side_effect=AssertionError("unused free slot")):
+            with scheduler.admit() as (_, slot):
+                self.assertEqual(slot, 1)
+                self.assertEqual(list(scheduler.queue), [older])
+        self.assertEqual(scheduler.free_slots, {0, 1})
+
+    def test_older_any_slot_and_same_slot_waiters_keep_priority(self):
+        for older_slot, requested in ((None, None), (None, 1), (0, 0)):
+            with self.subTest(older_slot=older_slot, requested=requested):
+                scheduler = GenerationScheduler(capacity=2)
+                older = (object(), older_slot)
+                scheduler.queue.append(older)
+                with patch.object(scheduler.condition, "wait",
+                                  side_effect=lambda _timeout: scheduler.queue.remove(older)) as wait:
+                    with scheduler.admit(slot=requested) as (_, slot):
+                        self.assertEqual(slot, 0 if requested is None else requested)
+                wait.assert_called_once()
+                self.assertEqual(scheduler.snapshot()["queued"], 0)
+
+    def test_full_queue_still_admits_unreserved_free_slot(self):
+        for requested in (None, 1):
+            with self.subTest(requested=requested):
+                scheduler = GenerationScheduler(max_queue=1, capacity=2)
+                with scheduler.admit(slot=0):
+                    older = (object(), 0)
+                    scheduler.queue.append(older)
+                    try:
+                        with scheduler.admit(slot=requested) as (_, slot):
+                            self.assertEqual(slot, 1)
+                            self.assertEqual(scheduler.snapshot()["active"], 2)
+                            self.assertEqual(list(scheduler.queue), [older])
+                    finally:
+                        scheduler.queue.remove(older)
+                self.assertEqual(scheduler.snapshot()["rejected"], 0)
+                self.assertEqual(scheduler.snapshot()["completed"], 2)
+
+    def test_full_queue_does_not_bypass_older_slot_reservations(self):
+        for older_slot, requested in ((None, None), (None, 1), (0, 0)):
+            with self.subTest(older_slot=older_slot, requested=requested):
+                scheduler = GenerationScheduler(max_queue=1, capacity=2)
+                older = (object(), older_slot)
+                scheduler.queue.append(older)
+                with self.assertRaises(APIError) as caught:
+                    with scheduler.admit(slot=requested):
+                        self.fail("bypassed older waiter")
+                self.assertEqual(caught.exception.code, "queue_full")
+                self.assertEqual(list(scheduler.queue), [older])
+                self.assertEqual(scheduler.snapshot()["rejected"], 1)
+
+    def test_zero_queue_rejects_busy_pinned_slot_with_spare_capacity(self):
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=2)
+        with scheduler.admit(slot=0):
+            with self.assertRaises(APIError) as caught:
+                with scheduler.admit(slot=0):
+                    self.fail("busy pinned slot admitted")
+            self.assertEqual(caught.exception.code, "queue_full")
+            with scheduler.admit(slot=1) as (_, slot):
+                self.assertEqual(slot, 1)
+        stats = scheduler.snapshot()
+        self.assertEqual((stats["rejected"], stats["timed_out"], stats["queued"]), (1, 0, 0))
+        self.assertEqual((stats["admitted"], stats["completed"], stats["active"]), (2, 2, 0))
+        self.assertIn("colibri_scheduler_queue_wait_seconds_count 2\n", scheduler.prometheus())
+
     def test_times_out_and_cancels_queued_requests(self):
         scheduler = GenerationScheduler(max_queue=2, queue_timeout=0.02)
         with scheduler.admit():
@@ -563,6 +732,81 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(timed_out.exception.code, "queue_timeout")
         self.assertEqual(stats["timed_out"], 1)
         self.assertEqual(stats["cancelled"], 1)
+
+    def test_queue_deadline_wins_when_slot_becomes_free(self):
+        for released_at in (0.9, 1.0, 1.1):
+            with self.subTest(released_at=released_at):
+                scheduler = GenerationScheduler(queue_timeout=1)
+                now = [0.0]
+                with patch("openai_server.time.monotonic", side_effect=lambda: now[0]):
+                    holder = scheduler.admit()
+                    holder.__enter__()
+                    def release(_timeout):
+                        now[0] = released_at
+                        holder.__exit__(None, None, None)
+                    with patch.object(scheduler.condition, "wait", side_effect=release):
+                        if released_at < 1:
+                            with scheduler.admit():
+                                pass
+                        else:
+                            with self.assertRaises(APIError) as caught:
+                                with scheduler.admit():
+                                    pass
+                            self.assertEqual(caught.exception.code, "queue_timeout")
+                    stats = scheduler.snapshot()
+                    expected = 2 if released_at < 1 else 1
+                    self.assertEqual((stats["admitted"], stats["completed"]), (expected, expected))
+                    self.assertEqual((stats["active"], stats["queued"], stats["timed_out"]),
+                                     (0, 0, int(released_at >= 1)))
+                    self.assertIn(f"colibri_scheduler_slot_duration_seconds_count {expected}\n",
+                                  scheduler.prometheus())
+                    with scheduler.admit():
+                        pass
+
+    def test_cancelled_request_does_not_acquire_a_free_slot(self):
+        scheduler = GenerationScheduler()
+        with self.assertRaises(ClientCancelled):
+            with scheduler.admit(lambda: True):
+                self.fail("cancelled request admitted")
+        stats = scheduler.snapshot()
+        self.assertEqual((stats["active"], stats["queued"], stats["admitted"], stats["cancelled"]),
+                         (0, 0, 0, 1))
+        self.assertIn("colibri_scheduler_queue_wait_seconds_count 0\n", scheduler.prometheus())
+        with scheduler.admit():
+            pass
+
+    def test_cancellation_wins_when_a_waiting_slot_becomes_free(self):
+        scheduler = GenerationScheduler(queue_timeout=1)
+        waiting = threading.Event()
+        cancelled = threading.Event()
+        outcomes = []
+        holder = scheduler.admit()
+        holder.__enter__()
+        def is_cancelled():
+            waiting.set()
+            return cancelled.is_set()
+        def run():
+            try:
+                with scheduler.admit(is_cancelled):
+                    outcomes.append("admitted")
+            except ClientCancelled:
+                outcomes.append("cancelled")
+        thread = threading.Thread(target=run)
+        thread.start()
+        observed = waiting.wait(1)
+        # Publish cancellation and release capacity under the same lock, so
+        # the waiter must observe both on its next scheduling pass.
+        with scheduler.condition:
+            cancelled.set()
+            holder.__exit__(None, None, None)
+        thread.join(2)
+        self.assertTrue(observed)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcomes, ["cancelled"])
+        stats = scheduler.snapshot()
+        self.assertEqual((stats["admitted"], stats["completed"], stats["cancelled"]), (1, 1, 1))
+        self.assertEqual((stats["active"], stats["queued"]), (0, 0))
+        self.assertIn("colibri_scheduler_slot_duration_seconds_count 1\n", scheduler.prometheus())
 
     def test_counts_admitted_client_cancellation_without_completion(self):
         scheduler = GenerationScheduler(max_queue=0, queue_timeout=1)
@@ -1275,6 +1519,40 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertNotIn("COLI_PLAN_CAP", child_env)
         self.assertEqual(child_env["KEEP"], "yes")
 
+    def test_v41_ram_plan_reaches_engine_argv(self):
+        model = self._model("deepseek_v41")
+        for settings, expected_ram in (({"RAM_GB": "120", "CTX": "8192"}, 120),
+                                       ({"CTX": "8192"}, 0),
+                                       ({"RAM_GB": "auto", "CTX": "8192"}, 0)):
+            with self.subTest(settings=settings):
+                process = FakeProcess(lambda _process, _frame: None)
+                with patch("resource_plan.build_plan", return_value={
+                        "tiers": {"ram": {"cache_slots_per_layer": 96}}}) as planner, \
+                        patch("openai_server.subprocess.Popen", return_value=process) as popen:
+                    engine = Engine("deepseek_v41", model, env=settings)
+                    engine.close()
+                planner.assert_called_once_with(model, ram_gb=expected_ram,
+                                                context=8192, gpu_indices=[])
+                self.assertEqual(popen.call_args[0][0], ["deepseek_v41", "96"])
+
+    def test_v41_explicit_and_calibrated_caps_bypass_planning(self):
+        for cap, env, expected in ((7, {}, 7), (0, {}, 0),
+                                   (None, {"COLI_PROFILE_CAP": "12"}, 12),
+                                   (None, {"COLI_PLAN_CAP": "24"}, 24)):
+            with self.subTest(cap=cap, env=env), patch("resource_plan.build_plan") as planner:
+                self.assertEqual(cap_for_arch("deepseek_v41", cap, env, model="model"),
+                                 expected)
+                planner.assert_not_called()
+
+    def test_v41_insufficient_ram_refuses_before_spawning(self):
+        model = self._model("deepseek_v41")
+        with patch("resource_plan.build_plan", return_value={
+                "tiers": {"ram": {"cache_slots_per_layer": 0}}}), \
+                patch("openai_server.subprocess.Popen") as popen:
+            with self.assertRaisesRegex(ValueError, "one expert slot"):
+                Engine("deepseek_v41", model, env={"RAM_GB": "8"})
+            popen.assert_not_called()
+
     def test_model_arch_reads_model_type(self):
         self.assertEqual(model_arch(self._model("glm_moe_dsa")), "glm")
         self.assertEqual(model_arch(self._model("inkling")), "inkling")
@@ -1343,6 +1621,41 @@ class HTTPTest(unittest.TestCase):
             self.assertEqual(json.load(response)["data"][0]["id"], "test-model")
         with self.assertRaises(HTTPError) as caught:
             self.request("/v1/models", key="wrong")
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 401)
+
+    def test_metrics_counts_http_engine_failure_without_success(self):
+        before = self.server.scheduler.snapshot()
+        with patch.object(self.engine, "generate", side_effect=RuntimeError("injected failure")):
+            with self.assertRaises(HTTPError) as caught:
+                self.request("/v1/chat/completions", {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hello"}], "max_tokens": 1})
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 500)
+        after = self.server.scheduler.snapshot()
+        self.assertEqual(after["failed"], before["failed"] + 1)
+        self.assertEqual(after["completed"], before["completed"])
+        with self.request("/metrics") as response:
+            text = response.read().decode()
+        self.assertIn(f'colibri_scheduler_failed_total {after["failed"]}\n', text)
+        self.assertIn("colibri_scheduler_active 0\n", text)
+
+    def test_metrics_exposes_prometheus_text_with_auth(self):
+        with self.request("/metrics") as response:
+            self.assertEqual(response.headers["Content-Type"],
+                             "text/plain; version=0.0.4; charset=utf-8")
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            text = response.read().decode()
+        self.assertIn("colibri_scheduler_capacity 2\n", text)
+        self.assertIn("# TYPE colibri_scheduler_queue_wait_seconds histogram\n", text)
+        for key in ("wrong", ""):
+            with self.assertRaises(HTTPError) as caught:
+                self.request("/metrics", key=key)
+            self.addCleanup(caught.exception.close)
+            self.assertEqual(caught.exception.code, 401)
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(self.base + "/metrics", timeout=2)
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
 
@@ -2579,6 +2892,44 @@ class KeepAliveFramingTest(unittest.TestCase):
         self.assertIn("connection: close", raw.split("\r\n\r\n", 1)[0].lower())
         self.assertIn("event: message_stop", raw)
         self.assertNotIn("<STILL-OPEN>", raw)
+
+    def test_stream_exit_stops_keepalive_before_releasing_slot(self):
+        class CancelledEngine(_ExplodingEngine):
+            def generate(self, *args, **kwargs):
+                try:
+                    return super().generate(*args, **kwargs)
+                except RuntimeError:
+                    raise ClientCancelled()
+
+        original_thread = threading.Thread
+        for path in ("/v1/chat/completions", "/v1/messages"):
+            for engine_type, outcome in ((_ExplodingEngine, "failed"),
+                                         (CancelledEngine, "cancelled")):
+                with self.subTest(path=path, outcome=outcome):
+                    pumps = []
+                    def thread_factory(*args, **kwargs):
+                        thread = original_thread(*args, **kwargs)
+                        target = kwargs.get("target")
+                        if getattr(target, "__name__", "") in ("_keepalive", "keepalive"):
+                            stop = next(cell.cell_contents for cell in target.__closure__
+                                        if isinstance(cell.cell_contents, threading.Event))
+                            pumps.append((thread, stop))
+                        return thread
+                    server = self._server(engine_type())
+                    try:
+                        with patch.object(threading, "Thread", side_effect=thread_factory):
+                            status, _ = self._post(self._conn(server),
+                                dict(self.CHAT, stream=True, max_tokens=16), path=path)
+                        self.assertEqual(status, 200)
+                        self.assertEqual(len(pumps), 1)
+                        self.assertFalse(pumps[0][0].is_alive(), "keepalive survived stream exit")
+                        stats = server.scheduler.snapshot()
+                        self.assertEqual(stats[outcome], 1)
+                        self.assertEqual((stats["active"], stats["completed"]), (0, 0))
+                    finally:
+                        for thread, stop in pumps:
+                            stop.set()
+                            thread.join(2)
 
     def test_engine_failure_after_commit_does_not_splice_a_second_response(self):
         """Once the 200 is out, a 500 status line would land inside the event stream."""

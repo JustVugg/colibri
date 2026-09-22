@@ -14,6 +14,7 @@ int main(void) { puts("test_st_missing: skipped on Windows (fork)"); return 0; }
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <errno.h>
 #include "../st.h"
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #c); return 1; } } while (0)
@@ -82,6 +83,35 @@ int main(void) {
     /* and a present tensor still reads fine with the index around */
     { shards S; memset(&S, 0, sizeof S); st_init(&S, D); float v[8]; CHECK(st_read_f32(&S, "a", v, 0) == 8); st_destroy(&S); }
     wipe(D);
+
+    /* 5. an index path that does not fit the buffer is refused, not opened truncated:
+     * with a 1193-char directory, "<dir>/model" is all snprintf would keep of the name.
+     * The case has to build that directory, so it runs where the file system takes a
+     * path that long: on macOS PATH_MAX is 1024 and mkdir answers ENAMETOOLONG, and
+     * there the case steps aside -- the Linux runs cover the guard. Any other mkdir
+     * failure is a real one and fails the test. */
+    {
+        char dir[1200] = "tmp_st_long", p[1300]; size_t n = strlen(dir);
+        int made = mkdir(dir, 0755) == 0;
+        while (made && n < 1193) {
+            size_t k = 1193 - n - 1 > 200 ? 200 : 1193 - n - 1;
+            dir[n++] = '/'; memset(dir + n, 'd', k); n += k; dir[n] = 0;
+            made = mkdir(dir, 0755) == 0;
+        }
+        int too_long = !made && errno == ENAMETOOLONG, refused = 1;
+        if (made) {
+            snprintf(p, sizeof p, "%s/model", dir);
+            FILE *f = fopen(p, "wb"); CHECK(f != NULL); fputs("{\"weight_map\":{\"a\":\"x\"}}", f); fclose(f);
+            st_index ix; memset(&ix, 0, sizeof ix); st_index_load(&ix, dir);
+            refused = ix.root == NULL && ix.map == NULL;
+            remove(p);
+        }
+        for (char *s; (s = strrchr(dir, '/')) != NULL; *s = 0) rmdir(dir);
+        rmdir(dir);
+        CHECK(made || too_long);
+        CHECK(refused);
+        if (!made) puts("st_index_load long-path guard: skipped, the file system caps the path");
+    }
     puts("st_die_missing diagnosis tests: ok");
     return 0;
 }

@@ -60,6 +60,7 @@
 #include <cpuid.h>                                /* hwinfo_emit: CPU brand string senza /proc */
 #endif
 #include "cli_args.h"
+#include "oracle.h"
 #include "st.h"
 #ifdef __linux__
 #include "uring.h"
@@ -927,7 +928,9 @@ static double edisk_s(void){ return atomic_load_explicit(&g_edisk_ns,memory_orde
  * served that gets labeled cold overstates the cold class, the bucket this line exists to
  * size). */
 static uint32_t g_direct_heat_ticks=0;
+#ifndef COLIBRI_NO_MAIN
 static int g_direct_heat_explicit=0;    /* 1 if COLI_DISKCLASS_WINDOW was set (skip the auto-derive) */
+#endif
 #define DC_COLD 0
 #define DC_WARM 1
 static _Atomic uint64_t g_dc_n[2];              /* [DC_COLD]/[DC_WARM]: loads classified */
@@ -1687,7 +1690,8 @@ static void rope_interleave(float *v, int pos, const Cfg *c){
  * unverified mirrors (see qt_check_fmt threat model); an unbounded ftell->malloc
  * gave a hostile file a load-time OOM or, on malloc failure, a NULL deref via
  * b[got]=0. Cap the size, NULL-check the alloc, require a full read. Returns a
- * malloc'd NUL-terminated buffer, or NULL on any failure. Mirrors tok.h tk_read_file. */
+ * malloc'd NUL-terminated buffer, or NULL on any failure. Embedded NUL bytes are
+ * invalid JSON and must not hide an unchecked suffix. Mirrors tok.h tk_read_file. */
 #define CFG_MAX_BYTES (256ll<<20)   /* config/oracle JSON is KB-MB in practice */
 static char* cfg_slurp(const char *path){
     FILE *f=fopen(path,"rb"); if(!f) return NULL;
@@ -1695,7 +1699,7 @@ static char* cfg_slurp(const char *path){
     if(n<0 || (long long)n>CFG_MAX_BYTES){ fclose(f); return NULL; }
     char *b=malloc((size_t)n+1); if(!b){ fclose(f); return NULL; }
     size_t got=fread(b,1,(size_t)n,f); fclose(f);
-    if((long)got!=n){ free(b); return NULL; }
+    if((long)got!=n || memchr(b,'\0',got)){ free(b); return NULL; }
     b[got]=0; return b;
 }
 static jval* cfg_root(const char *snap, char **arena){
@@ -4005,7 +4009,9 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
     }
 }
 static int g_absorb=-1;
+#if defined(COLI_METAL) || !defined(COLIBRI_NO_MAIN)
 static int g_metal_prefill=0; /* default 0: S>4 prefill attention stays on the CPU (bit-exact). COLI_METAL_PREFILL=1 opts it onto the GPU (~4x, near-tie divergence — see docs/metal.md, #622) */
+#endif
 /* KV8=1: cache latente Lc/Rc in fp8 e4m3 + scala f32 per riga (~4x meno RAM del f32).
  * CPU-only in this PR — sui percorsi CUDA/Metal che leggono righe f32 si spegne da
  * solo (guardie !g_kv8), e forza COLI_CUDA_PIPE=0 (il pipe-prefill legge righe f32).
@@ -7945,6 +7951,15 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
 /* emit callback: accumula in un array (validazione) */
 typedef struct { int *dst; int n; } EmitStore;
 static void emit_store(int t, const float *lo, void *ud){ (void)lo; EmitStore *e=(EmitStore*)ud; e->dst[e->n++]=t; }
+typedef struct { EmitStore tokens; int vocab, finite; } OracleEmit;
+static void emit_oracle(int t, const float *lo, void *ud){
+    OracleEmit *e=(OracleEmit*)ud;
+    if(!oracle_logits_finite(lo,e->vocab)){
+        fprintf(stderr,"[ORACLE] non-finite logits at generated token %d\n",e->tokens.n);
+        e->finite=0;
+    }
+    emit_store(t,lo,&e->tokens);
+}
 /* emit callback: detokenizza e stampa in streaming (chat/run), con heartbeat */
 typedef struct { Tok *T; Model *m; double t0; int count; int quiet; } EmitStream;
 static void emit_stream(int t, const float *lo, void *ud){
@@ -7984,8 +7999,9 @@ static void dump_top5_logits(int pos, const float *lo, int V, int expected, int 
     for(int k=0;k<5&&idx[k]>=0;k++) fprintf(stderr," %d:%.5f", idx[k], (double)val[k]);
     fprintf(stderr,"\n");
 }
-static void forward_all(Model *m, const int *ids, int S, int *pred, const int *ref){
+static int forward_all(Model *m, const int *ids, int S, int *pred, const int *ref){
     Cfg *c=&m->c; int D=c->hidden;
+    int finite=1;
     int dbg = ref && getenv("DEBUG_LOGITS");
     kv_alloc(m,S);
     float *x=falloc((int64_t)S*D);
@@ -7996,11 +8012,16 @@ static void forward_all(Model *m, const int *ids, int S, int *pred, const int *r
     for(int s=0;s<S;s++){
         rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);   /* heap row (#183) */
         matmul_qt(lo, row, &m->lm_head, 1);
+        if(!oracle_logits_finite(lo,c->vocab)){
+            fprintf(stderr,"[ORACLE] non-finite logits at teacher-forcing position %d\n",s);
+            finite=0; pred[s]=-1; continue;
+        }
         int best=0; float bv=lo[0]; for(int i=1;i<c->vocab;i++) if(lo[i]>bv){bv=lo[i];best=i;}
         pred[s]=best;
         if(dbg && pred[s]!=ref[s]) dump_top5_logits(s, lo, c->vocab, ref[s], pred[s]);
     }
     free(x); free(lo); free(row);
+    return finite;
 }
 
 /* log-prob (log-softmax) del token target dato il vettore di logit; *am=1 se e' l'argmax */
@@ -8164,12 +8185,14 @@ static void run_ablate_score(Model *m, const char *path){
     free(ln); free(ids); free(x); free(lo); free(row); fclose(f);
 }
 
-static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
+static int generate(Model *m, const int *prompt, int np, int n_new, int *out, int *finite){
     kv_alloc(m,np+n_new+g_draft+2);
     for(int i=0;i<np;i++) out[i]=prompt[i];
     float *logit=step(m,prompt,np,0);
-    EmitStore es={out+np,0};
-    spec_decode(m,out,np,n_new,-1,logit,emit_store,&es,NULL,NULL);
+    OracleEmit es={{out+np,0},m->c.vocab,1};
+    int emitted=spec_decode(m,out,np,n_new,-1,logit,emit_oracle,&es,NULL,NULL);
+    *finite=es.finite;
+    return emitted;
 }
 
 static void profile_print(Model *m, double elapsed){
@@ -9674,13 +9697,6 @@ static void run_serve(Model *m, const char *snap){
     free(ctx); m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->Lc8=m->Rc8=NULL; m->Lsc=m->Rsc=NULL; m->kv_start=NULL; m->max_t=0;
 }
 
-static int *read_arr(jval*o,const char*k,int*n){
-    jval*a=json_get(o,k);
-    if(!a){ *n=0; return NULL; }
-    int*r=malloc(a->len*sizeof(int));
-    if(!r){ fprintf(stderr,"OOM read_arr\n"); exit(1); }
-    for(int i=0;i<a->len;i++) r[i]=(int)a->kids[i]->num; *n=a->len; return r; }
-
 /* telemetry, stats, usage persistence — moved to telemetry.h */
 
 #ifdef COLI_VULKAN
@@ -11081,6 +11097,19 @@ static int coli_env_on(const char *name)
 
 #ifndef COLIBRI_NO_MAIN
 int main(int argc, char **argv){
+    int strict=coli_env_on("ORACLE_STRICT");
+    if(strict){
+        const char *modes[]={"REPLAY","CONSIST","SERVE","SCORE","ABLATE_SCORE","EXPERT_WORKER",
+                             "I4_ACC512_TEST","I3_AVX512_TEST"};
+        for(size_t i=0;i<sizeof(modes)/sizeof(modes[0]);i++) if(getenv(modes[i])){
+            fprintf(stderr,"[ORACLE] ORACLE_STRICT cannot be combined with %s\n",modes[i]);
+            return 1;
+        }
+        if(coli_user_prompt() || (getenv("COLI_ANS_PACK") && atoi(getenv("COLI_ANS_PACK")))){
+            fprintf(stderr,"[ORACLE] ORACLE_STRICT requires oracle comparison mode\n");
+            return 1;
+        }
+    }
     /* ---- Permanent OpenMP hot-thread tuning. The per-expert matmul regions are
      * tiny and back-to-back; with the default passive wait policy libgomp parks
      * the worker team between regions and the re-wake latency dominates. Keeping
@@ -11943,13 +11972,23 @@ int main(int argc, char **argv){
     }
 
     /* altrimenti: validazione contro l'oracolo (ref_glm.json) */
+    /* Diagnostic modes take precedence over TF and do not read predictions. */
+    int teacher_forcing=getenv("TF")!=NULL && !getenv("REPLAY") && !getenv("CONSIST");
     const char *refpath=getenv("REF")?getenv("REF"):"ref_glm.json";
     char *b=cfg_slurp(refpath);
-    if(!b){ fprintf(stderr,"%s: cannot read oracle file (missing, unreadable, short, or > %lld bytes)\n",refpath,(long long)CFG_MAX_BYTES); return 1; }
-    char *ar=NULL; jval *ref=json_parse(b,&ar);
-    int np=0,nfull=0; int *prompt=read_arr(ref,"prompt_ids",&np); int *full=read_arr(ref,"full_ids",&nfull);
-    if(!prompt||!full||np<1||nfull<np){ fprintf(stderr,"ref file missing prompt_ids/full_ids or empty\n"); return 1; }
+    if(!b){ fprintf(stderr,"%s: cannot read oracle file (missing, unreadable, short, contains NUL, or > %lld bytes)\n",refpath,(long long)CFG_MAX_BYTES); return 1; }
+    OracleRef ref;
+    int valid=oracle_ref_parse(b,m.c.vocab,teacher_forcing,&ref);
+    free(b);
+    if(!valid) return 1;
+    int np=ref.np,nfull=ref.nfull; int *prompt=ref.prompt,*full=ref.full;
     int n_new=nfull-np;
+    int tf_allowed=0;
+    if(strict && teacher_forcing &&
+       !oracle_tf_allowance(getenv("ORACLE_TF_MAX_MISMATCHES"),nfull,&tf_allowed)){
+        fprintf(stderr,"[ORACLE] ORACLE_TF_MAX_MISMATCHES must be an integer in [0,%d)\n",nfull);
+        oracle_ref_free(&ref); return 1;
+    }
     /* L'oracolo (ref_glm.json in repo) e' del modello TINY: contro il 744B da' 0/20
      * garantito su OGNI piattaforma (prompt-token tiny = spazzatura per il modello vero).
      * Non e' un bug del motore — vedi #76. */
@@ -11966,25 +12005,29 @@ int main(int argc, char **argv){
           "  Nessun PROMPT: modo auto-validazione, ma ref_glm.json e' l'oracolo del modello TINY\n"
           "  (token max %d, il tuo vocab e' %d). Usa PROMPT=... per generare davvero (vedi sopra).\n",
           maxid, m.c.vocab, maxid, m.c.vocab);
-        return 1;
+        oracle_ref_free(&ref); return 1;
       } }
 
     if(getenv("REPLAY")){
         run_replay(&m,full,nfull,np);
         if(stats) stats_dump(&m,stats);
+        oracle_ref_free(&ref);
         return 0;
     }
 
     if(getenv("CONSIST")){
         run_consist(&m,full,nfull,np);
         if(stats) stats_dump(&m,stats);
+        oracle_ref_free(&ref);
         return 0;
     }
 
-    if(getenv("TF")){
-        int *tf=read_arr(ref,"tf_pred",&(int){0});
-        int *pred=malloc(nfull*sizeof(int)); double tt=now_s();
-        forward_all(&m, full, nfull, pred, tf); double tdt=now_s()-tt;
+    if(teacher_forcing){
+        int *tf=ref.tf;
+        int *pred=malloc((size_t)nfull*sizeof(int));
+        if(!pred){ oracle_ref_free(&ref); return 1; }
+        double tt=now_s();
+        int finite=forward_all(&m, full, nfull, pred, tf); double tdt=now_s()-tt;
         int ok=0; for(int i=0;i<nfull;i++){
             if(pred[i]==tf[i]) ok++;
             else fprintf(stderr,"[ORACLE] mismatch pos=%d expected=%d got=%d\n",i,tf[i],pred[i]);
@@ -11994,19 +12037,24 @@ int main(int argc, char **argv){
         if(ok<nfull) fprintf(stderr,
             "[ORACLE] %d/%d mismatches — run: TF=1 DEBUG_LOGITS=1 for top-5 logit dump\n",
             nfull-ok,nfull);
+        if(strict) fprintf(stderr,"[ORACLE] teacher-forcing mismatch allowance: %d/%d\n",tf_allowed,nfull);
         profile_print(&m,tdt);
 #ifdef COLI_CUDA
         if(g_cuda_enabled) cuda_stats_print();
 #endif
-        return 0;
+        free(pred); oracle_ref_free(&ref);
+        return strict && (!finite || nfull-ok>tf_allowed);
     }
-    int *out=malloc((np+n_new)*sizeof(int));
+    int *out=malloc((size_t)nfull*sizeof(int));
+    if(!out){ oracle_ref_free(&ref); return 1; }
     ProfBase pb; prof_base(&m,&pb);
-    double t=now_s(); generate(&m,prompt,np,n_new,out); double dt=now_s()-t;
+    int finite=1;
+    double t=now_s(); int emitted=generate(&m,prompt,np,n_new,out,&finite); double dt=now_s()-t;
     int match=0;
     printf("\nReference (oracle): "); for(int i=np;i<nfull;i++) printf("%d ", full[i]);
-    printf("\nGLM C engine      : "); for(int i=np;i<nfull;i++){ printf("%d ", out[i]); if(out[i]==full[i])match++; }
+    printf("\nGLM C engine      : "); for(int i=np;i<np+emitted;i++){ printf("%d ", out[i]); if(out[i]==full[i])match++; }
     printf("\nMatching tokens: %d/%d\n", match, n_new);
+    if(emitted!=n_new) fprintf(stderr,"[ORACLE] incomplete generation: %d/%d tokens\n",emitted,n_new);
     double tot=m.hits+m.miss;
     printf("N-gram speculation (DRAFT=%d): %.2f tokens/forward (%llu forwards per %llu tokens)\n",
         g_draft, m.n_fw?(double)m.n_emit/m.n_fw:1.0, (unsigned long long)m.n_fw, (unsigned long long)m.n_emit);
@@ -12027,7 +12075,8 @@ int main(int argc, char **argv){
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }
     if(stats) stats_dump(&m,stats);
-    return 0;
+    free(out); oracle_ref_free(&ref);
+    return strict && (match!=n_new || emitted!=n_new || !finite);
 }
 #endif /* COLIBRI_NO_MAIN */
 

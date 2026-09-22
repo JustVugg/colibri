@@ -95,9 +95,76 @@ admission queue instead of pretending to run unsafe parallel sequences.
 Configure it with `--max-queue N` (default 8) and `--queue-timeout SECONDS`
 (default 300), or the `COLI_MAX_QUEUE` / `COLI_QUEUE_TIMEOUT` environment
 variables. Saturated and timed-out requests receive OpenAI-shaped HTTP 429
-errors before streaming headers are sent. `GET /health` exposes
+errors before streaming headers are sent. With `--max-queue 0`, a request
+pinned to an occupied KV slot is rejected immediately even if another slot
+is free. Queue deadlines are checked before slot assignment: an expired
+waiter receives `queue_timeout` even if a slot is now available. `GET /health` exposes
 active/queued/completed/rejected counters, and successful generation responses
 include `x-colibri-queue-wait-ms`.
+Requests targeting any slot may use a free slot not reserved by earlier waiters.
+An earlier pinned request keeps priority for its target; an earlier any-slot
+request keeps priority across all slots. A full waiting queue does not reject
+a request that can immediately take an unreserved free slot; the queue limit
+bounds waiting requests, independently of active capacity.
+
+## Prometheus metrics
+
+`GET /metrics` returns Prometheus text exposition (version 0.0.4). When an
+API key is configured, supply the same `Authorization: Bearer ...` or
+`x-api-key` header used for generation; missing or invalid credentials return
+401. Without an API key, the endpoint follows the server's usual unauthenticated
+access policy. Metrics contain no prompts, model paths, or request-ID labels.
+
+All names start with `colibri_scheduler_`:
+
+| Suffix | Type | Meaning |
+|---|---|---|
+| `active`, `queued`, `capacity`, `max_queue` | gauge | Admitted requests, waiters, KV slot capacity, and queue limit |
+| `admitted_total` | counter | Requests admitted to a KV slot |
+| `completed_total` | counter | Admitted requests that returned normally |
+| `failed_total` | counter | Admitted requests that raised an error, excluding `ClientCancelled` |
+| `rejected_total`, `timed_out_total` | counter | Queue-full refusals and queue timeouts |
+| `cancelled_total` | counter | Cancellations detected before admission or during admitted work |
+| `queue_wait_seconds` | histogram | Wait until admission, for admitted requests only |
+| `slot_duration_seconds` | histogram | Slot occupancy until completion, failure, or cancellation |
+| `first_output_seconds` | histogram | Engine-call start to first nonempty text or tool-output callback |
+| `engine_call_seconds` | histogram | Duration of each finished engine generation call, including failure/cancellation |
+
+Histogram buckets are 0.001, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 300 seconds,
+and `+Inf`; each histogram exposes `_bucket`, `_sum`, and `_count`.
+Counters reset when the gateway restarts. Collection does not call the engine
+or consume a generation slot. `failed` is also included in `/health`'s
+authenticated scheduler snapshot; failures no longer increment `completed`.
+
+Cancellation is checked before acquiring an available KV slot, including when a
+waiting request wakes as capacity becomes free. A request cancelled at this
+point increments `cancelled_total`, but not `admitted_total`, and contributes
+no admission-wait or slot-duration sample. Queue-full and scheduler-closed
+checks can still reject a request before the cancellation check is reached.
+
+
+The engine-call histograms exclude admission queue wait and prompt rendering.
+First output is observed before the gateway's stop filtering, reasoning split,
+or HTTP serialization: it can be reasoning or tool data, not necessarily
+user-visible answer text. Empty callbacks, ACCEPT frames, and SSE keepalives do
+not count. Calls that finish or fail without output add no first-output sample;
+a failure after output retains that sample. Engine-call duration includes callback
+processing and response writes during generation. One request can invoke the
+engine multiple times (for example Brio scoring), so these histogram counts are
+engine calls, not HTTP request counts.
+
+These are gateway observations, not end-to-end client TTFT, per-token latency,
+or GPU kernel measurements. Output callbacks need not correspond one-to-one to
+tokens. Slot occupancy includes any response handling while the slot is held. Validation/authentication failures before admission are not counted.
+`completed` means the admitted handler returned normally, not that the client
+received every response byte. Request exceptions can include client input or
+transport errors as well as engine failures.
+
+Example PromQL for the admitted-request queue-wait p95:
+
+```promql
+histogram_quantile(0.95, sum by (le) (rate(colibri_scheduler_queue_wait_seconds_bucket[5m])))
+```
 
 ## Anthropic-protocol endpoint (`/v1/messages`)
 

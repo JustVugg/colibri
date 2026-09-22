@@ -53,7 +53,10 @@ static inline int coli_cuda_weight_at_supported(int fmt) {
 /* Opaque, persistent device copy of one resident quantized tensor. */
 typedef struct ColiCudaTensor ColiCudaTensor;
 
-/* Devices are CUDA ordinals, not positions in the input list. */
+/* Devices are CUDA ordinals, not positions in the input list.
+ * Repeating the same ordered list preserves active contexts. Changing an
+ * active list returns 0 without replacing it; release tensors and shut down
+ * before selecting a different list. Init/shutdown require caller serialization. */
 COLI_CUDA_DLLEXPORT int coli_cuda_init(const int *devices, int count);
 COLI_CUDA_DLLEXPORT void coli_cuda_shutdown(void);
 /* Number of CUDA devices visible to this process, before a device list is
@@ -114,6 +117,15 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul_mxfp4(float *y, const float *x,
                                                const unsigned char *q4,
                                                const unsigned char *e8s,
                                                int S, int I, int O);
+
+/* Streaming Kimi expert: down(SiTU(gate(x), up(x))). Weights are MXFP4
+ * host buffers; intermediate activations remain on device. No weight cache.
+ * Returns 0 on failure; callers must accumulate y only after success. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_mxfp4(float *y, const float *x,
+        const unsigned char *gate_w, const unsigned char *gate_s,
+        const unsigned char *up_w, const unsigned char *up_s,
+        const unsigned char *down_w, const unsigned char *down_s,
+        int S, int D, int I, float b1, float b2);
 
 COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
                      float *y, const float *x,

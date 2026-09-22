@@ -660,6 +660,11 @@ typedef struct {
     /* Gated DeltaNet (linear_attention) dims, read from qwen36_meta.json. */
     int dn_vheads, dn_kheads, dn_kdim, dn_vdim, dn_convk, dn_conv_dim;
     int expert_gs;      /* expert scale group size along input dim; 0 = per-row */
+    /* Mixed expert layout (convert_qwen36.py --down-bits): gate/up stay int4
+     * (ebits, expert_gs), down_proj is int8 with its own group size. One slab
+     * per expert, [gate int4 packed | up int4 packed | down int8], 2*inter*hidden
+     * bytes -- told apart from int4 (1.5x) and int8 (3x) by size, like today. */
+    int expert_down_bits, expert_down_gs;
 } Cfg;
 
 /* ---------- per-layer dense weights ---------- */
@@ -978,6 +983,8 @@ static void matmul_q_batch(float *y, const float *x, const int8_t *q,
 static int g_expert_gs = 0;   /* set from qwen36_meta.json (expert_gs) at load */
 #include "gsgemv.h"
 
+static int g_expert_mixed = 0;   /* mixed layout on disk (int4 gate/up, int8 down) */
+static int g_expert_down_gs = 0; /* down_proj's group size in the mixed layout (0 = per row) */
 /* 1 = expert container packs int4 (tier fmt=4); 0 = int8 per-row (tier fmt=1).
  * Same signal main's nbytes probe and tier_warmstart receive; the decode path
  * needs it to offer int8 experts (#1391): on an int8 container e->g4 is NULL. */
@@ -1039,6 +1046,13 @@ static void matmul_qe(float *y, const float *x, const int8_t *q, const float *sc
     if (g_expert_gs) matmul_q_gs(y, x, q, scale, I, O, g_expert_gs);
     else matmul_q(y, x, q, scale, I, O);
 }
+/* down_proj: in the mixed layout it carries its own scale layout (int8, per
+ * row or expert_down_gs), everywhere else it is matmul_qe. */
+static void matmul_qd(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
+    if (!g_expert_mixed) { matmul_qe(y, x, q, scale, I, O); return; }
+    if (g_expert_down_gs) matmul_q_gs(y, x, q, scale, I, O, g_expert_down_gs);
+    else matmul_q(y, x, q, scale, I, O);
+}
 
 /* ---- Dense int8: per-row quantized copies of the large f32 matrices.
  * matmul_d dispatches via pointer lookup to matmul_q; COLI_DENSE_I8=0 falls
@@ -1075,55 +1089,6 @@ static int g_qdw_n = 0;
  * integer dot (that layout has no f32 kernel). Same gate: measured. */
 static int dense_idot_on(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_IDOT"); v=!(e&&*e=='0'); } return v; }
 static int dense_bits(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_BITS"); v=(e&&atoi(e)==4)?4:8; } return v; }
-
-/* Activation -> int8 with one scale, plus the int32 sum of every block of 64
- * (the K1b kernel subtracts 8*sum per group because its nibbles are unsigned).
- * Vectorized: the scalar lrintf loop was measured at ~7 us for 4096 values,
- * which times ~150 GEMVs per token is a millisecond thrown away. Rounding is
- * to nearest even in both paths, so the vector path equals qrow_i8 bit for bit. */
-static float dense_act_i8(const float *x, int I, int8_t *xq, int32_t *xsg){
-    float amax = 0.f;
-    int i = 0;
-#ifdef __AVX2__
-    {
-        __m256 am = _mm256_setzero_ps();
-        const __m256 sign = _mm256_set1_ps(-0.0f);
-        for (; i + 8 <= I; i += 8) am = _mm256_max_ps(am, _mm256_andnot_ps(sign, _mm256_loadu_ps(x + i)));
-        float tmp[8]; _mm256_storeu_ps(tmp, am);
-        for (int k = 0; k < 8; k++) if (tmp[k] > amax) amax = tmp[k];
-    }
-#endif
-    for (; i < I; i++) { float a = fabsf(x[i]); if (a > amax) amax = a; }
-    float s = amax / 127.f; if (s < 1e-12f) s = 1e-12f;
-    float inv = 1.f / s;
-    i = 0;
-#ifdef __AVX2__
-    {
-        const __m256 vinv = _mm256_set1_ps(inv);
-        for (; i + 32 <= I; i += 32) {
-            __m256i a = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i),      vinv));
-            __m256i b = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 8),  vinv));
-            __m256i c = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 16), vinv));
-            __m256i d = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 24), vinv));
-            /* packs interleave 128-bit lanes: fix the order with one permute */
-            __m256i ab = _mm256_packs_epi32(a, b), cd = _mm256_packs_epi32(c, d);
-            __m256i abcd = _mm256_packs_epi16(ab, cd);
-            abcd = _mm256_permutevar8x32_epi32(abcd, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
-            _mm256_storeu_si256((__m256i *)(xq + i), abcd);
-        }
-    }
-#endif
-    for (; i < I; i++) xq[i] = (int8_t)lrintf(x[i] * inv);
-    if (xsg) {
-        int ng = I / 64;
-        for (int g = 0; g < ng; g++) {
-            int32_t sum = 0;
-            for (int k = 0; k < 64; k++) sum += xq[g * 64 + k];
-            xsg[g] = sum;
-        }
-    }
-    return s;
-}
 
 /* f32 rows -> int4 in blocks of 64 with one f32 scale per block, packed as the
  * K1b planar layout (unsigned nibbles v+8, block b: lo nibbles = elements
@@ -1253,8 +1218,11 @@ static void matmul_d(float *y, const float *x, const float *W, int S, int I, int
     matmul(y, x, W, S, I, O);
 }
 /* A dense matrix the tier placed in VRAM (handle+1 kept in the Layer, 0 = CPU):
- * one GEMV from the device, or 0 and the caller runs matmul_d as before. The
+ * a device matmul, or 0 and the caller runs matmul_d as before. The
  * tier turns a failing handle off itself, so the fallback is permanent. */
+static inline int qtd_batch(int hp1, float *y, const float *x, int S, int I, int O){
+    return hp1 > 0 && qt_dense_matmul_batch(hp1 - 1, y, x, S, I, O);
+}
 static inline int qtd(int hp1, float *y, const float *x, int I, int O){
     return hp1 > 0 && qt_dense_matmul(hp1 - 1, y, x, I, O);
 }
@@ -1420,6 +1388,7 @@ static void load_meta(Cfg *c, const char *snap) {
         G("q_head_dim", q_head_dim); G("k_head_dim", k_head_dim); G("v_head_dim", v_head_dim);
         G("o_in", o_in); G("rope_dim", rope_dim); G("qk_rope_head_dim", rope_dim);
         G("expert_gs", expert_gs);
+        G("expert_down_bits", expert_down_bits); G("expert_down_gs", expert_down_gs);
         G("num_experts", n_experts); G("topk", topk);
         G("moe_inter", inter); G("shared_inter", shared_inter);
         G("n_group", n_group); G("topk_group", topk_group);
@@ -1628,7 +1597,8 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 
 /* scale counts per expert matrix: per-row (gs=0) or grouped along input dim */
 static int64_t scale_count_gu(const Cfg *c){ return c->expert_gs ? (int64_t)c->inter * ((c->hidden + c->expert_gs - 1) / c->expert_gs) : c->inter; }
-static int64_t scale_count_d (const Cfg *c){ return c->expert_gs ? (int64_t)c->hidden * ((c->inter  + c->expert_gs - 1) / c->expert_gs) : c->hidden; }
+static int down_gs_of(const Cfg *c){ return c->expert_down_bits ? c->expert_down_gs : c->expert_gs; }
+static int64_t scale_count_d (const Cfg *c){ int gs = down_gs_of(c); return gs ? (int64_t)c->hidden * ((c->inter + gs - 1) / gs) : c->hidden; }
 
 static void slot_ensure_allocated(Model *m, Slot *s) {
     if (s->g || s->pw) return;
@@ -1726,9 +1696,10 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     int64_t want_w = ng + ng + nd;
     int64_t want_s = 2*scale_count_gu(cc) + scale_count_d(cc);
     st_tensor *tw = st_find(&m->S, nm), *ts = st_find(&m->S, qsnm);
-    if (!tw || (tw->nbytes != want_w && tw->nbytes != want_w / 2)) {
-        fprintf(stderr, "%s: expert weight is %lld bytes — expected %lld (int8) or %lld (int4)\n",
-                nm, (long long)(tw ? tw->nbytes : -1), (long long)want_w, (long long)(want_w / 2)); exit(1); }
+    int64_t want_mixed = ng + nd;   /* gate|up packed int4 (ng bytes) + down int8 (nd bytes) */
+    if (!tw || (tw->nbytes != want_w && tw->nbytes != want_w / 2 && tw->nbytes != want_mixed)) {
+        fprintf(stderr, "%s: expert weight is %lld bytes — expected %lld (int8), %lld (int4) or %lld (int4 gate/up + int8 down)\n",
+                nm, (long long)(tw ? tw->nbytes : -1), (long long)want_w, (long long)(want_w / 2), (long long)want_mixed); exit(1); }
     if (!ts || ts->numel != want_s) {
         fprintf(stderr, "%s: scale array is %lld elems — expected %lld (refusing)\n",
                 qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1); }
@@ -1738,6 +1709,23 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
        rest of the MoE path (matmul_q) is unchanged.  Nibble convention (must match
        c/tools/convert_qwen36.py pack_int4): LOW nibble = element 2k, HIGH nibble = 2k+1;
        each nibble is signed 4-bit (sign-extend if bit3 set). */
+    if (tw->nbytes == want_mixed) {
+        /* mixed layout: unpack gate|up (2*ng int4 elements in ng bytes) into the
+         * slot's g|u block, copy down's int8 rows behind them. No packed copy is
+         * kept: the tier does not take this layout yet (main refuses it). */
+        static int noted_m = 0;
+        if (!noted_m) { fprintf(stderr, "[qwen36] mixed expert layout detected (int4 gate/up, int8 down) — unpacking gate/up to int8 in slot\n"); noted_m = 1; }
+        uint8_t *raw = (uint8_t *)malloc((size_t)want_mixed);
+        if (!raw) { fprintf(stderr, "OOM reading mixed expert %s\n", nm); exit(1); }
+        st_read_raw(&m->S, nm, raw, 1);
+        unpack_int4_to_int8(s->g, raw, ng + ng);          /* 2*ng elements from ng bytes */
+        memcpy(s->d, raw + ng, (size_t)nd);
+        free(raw);
+        s->is_int4 = 0;
+        free(s->g4); free(s->u4); free(s->d4); s->g4 = s->u4 = s->d4 = NULL;
+        st_read_f32(&m->S, qsnm, s->gs, 0);
+        return;
+    }
     if (tw->nbytes == want_w / 2) {
         static int noted = 0;
         if (!noted) { fprintf(stderr, "[qwen36] int4 packed weights detected — %s\n", s->pw ? "kept int4, repacked planar for expert_ffn.h" : "unpacking to int8 in slot"); noted = 1; }
@@ -2033,11 +2021,11 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     float *q = falloc((int64_t)S*q_out);
     float *k = falloc((int64_t)S*kv_out);
     float *vv= falloc((int64_t)S*kv_out);
-    /* Decode (S == 1): the projections the tier placed answer from VRAM,
-     * one GEMV each; a prompt batch keeps the batched CPU matmul. */
-    if (!(S == 1 && qtd(l->qth_q, q, x, D, q_out)))   matmul_d(q, x, l->q, S, D, q_out);
-    if (!(S == 1 && qtd(l->qth_k, k, x, D, kv_out)))  matmul_d(k, x, l->k, S, D, kv_out);
-    if (!(S == 1 && qtd(l->qth_v, vv, x, D, kv_out))) matmul_d(vv, x, l->v, S, D, kv_out);
+    /* The projections the tier placed answer from VRAM for the whole batch,
+     * with one backend call per matrix; unavailable handles use CPU matmul. */
+    if (!qtd_batch(l->qth_q, q, x, S, D, q_out))   matmul_d(q, x, l->q, S, D, q_out);
+    if (!qtd_batch(l->qth_k, k, x, S, D, kv_out))  matmul_d(k, x, l->k, S, D, kv_out);
+    if (!qtd_batch(l->qth_v, vv, x, S, D, kv_out)) matmul_d(vv, x, l->v, S, D, kv_out);
     /* split q into query (first hd) and gate (next gate_dim), both per head */
     float *query = falloc((int64_t)S*H*hd);
     float *gate  = falloc((int64_t)S*H*gate_dim);
@@ -2099,7 +2087,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         float g = gate_dim ? gate[o] : 0.f;
         ag[o] = ctx[o] * (1.f / (1.f + expf(-g)));
     }
-    if (!(S == 1 && qtd(l->qth_o, out, ag, H*hd, D))) matmul_d(out, ag, l->o, S, H*hd, D);
+    if (!qtd_batch(l->qth_o, out, ag, S, H*hd, D)) matmul_d(out, ag, l->o, S, H*hd, D);
     free(q); free(k); free(vv); free(query); free(gate); free(ctx); free(ag);
 }
 
@@ -2408,7 +2396,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 matmul_qe(g, xs, e->g, e->gs, D, I);
                 matmul_qe(u, xs, e->u, e->us, D, I);
                 for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
-                matmul_qe(hh, g, e->d, e->ds, I, D);
+                matmul_qd(hh, g, e->d, e->ds, I, D);
                 float w = val[kk]; float *os = out + (int64_t)s*D;
                 for (int d = 0; d < D; d++) os[d] += w * hh[d];
             }
@@ -2432,7 +2420,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 tm_add(S, 3, tm_now()-_ts2);
             }
             double _q2 = tm_now();
-            qt_take(qmask, val, K, out + (int64_t)s*D);
+            if(!qt_take(qmask, val, K, out + (int64_t)s*D)){
+                fprintf(stderr,"qwen36: CUDA expert collection failed at layer %d; stopping inference\n",layer);
+                exit(1);
+            }
             if (tm_on() && S==1) {
                 extern double g_qt_iss, g_qt_cpu, g_qt_tak;
                 g_qt_iss += _q1-_q0; g_qt_cpu += _q2-_q1; g_qt_tak += tm_now()-_q2;
@@ -2444,7 +2435,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 matmul_qe(g, xs, e->g, e->gs, D, I);
                 matmul_qe(u, xs, e->u, e->us, D, I);
                 for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
-                matmul_qe(hh, g, e->d, e->ds, I, D);
+                matmul_qd(hh, g, e->d, e->ds, I, D);
                 float w = val[kk];
                 float *os = out + (int64_t)s*D;
                 for (int d = 0; d < D; d++) os[d] += w * hh[d];
@@ -2471,6 +2462,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
  *   split conv_out -> q_in/k_in/v_in; repeat_interleave q,k by rep; l2norm
  *   (q scaled by 1/sqrt(kdim)); recurrence S[h]*=exp(g); kv=k@S; delta=(v-kv)*beta;
  *   S+=k (x) delta; out=q@S; per-head Gated RMSNorm (plain weight) -> out_proj. */
+/* Bound both the host result block and device input/output staging. */
+static int dnproj_batch_rows(int S, int H, int O) {
+    int64_t rows = (32LL << 20) / (((int64_t)H + O) * sizeof(float));
+    if (rows < 1) rows = 1;
+    if (rows > 256) rows = 256;
+    return S < rows ? S : (int)rows;
+}
+
 static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     (void)pos_base;
     Cfg *c = &m->c;
@@ -2482,12 +2481,12 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     float scale = 1.f / sqrtf((float)kdim);
     int H = c->hidden;
 
-    /* qkv and z live in ONE buffer: the fused GPU projection writes
-     * [conv_dim ++ value_dim] in a single GEMV, and the CPU fallback fills the
-     * same two regions. Either way the code below reads qkv/z unchanged. */
-    float *qkvz = falloc((int64_t)conv_dim + value_dim);
-    float *qkv = qkvz;
-    float *z   = qkvz + conv_dim;
+    /* Input projections have no recurrent dependency. Keep qkv ++ z for a
+     * bounded block, then consume rows in order through conv and recurrence. */
+    int proj_dim = conv_dim + value_dim;
+    int B = qt_dnproj_ready(layer) ? dnproj_batch_rows(S, H, proj_dim) : 1;
+    float *qkvz = falloc((int64_t)B * proj_dim);
+    int gpu_block = 0;
     float *b   = falloc(vh);
     float *a   = falloc(vh);
     float *beta= falloc(vh);
@@ -2507,9 +2506,13 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
         const float *xs = x + (int64_t)s * H;
         extern double g_dn_sub[4];
         double _d0 = tm_now();
-        /* projections (single-token matmuls). One fused GEMV when this layer's
-         * dnproj is placed on a GPU, the two CPU matmuls otherwise. */
-        if (!qt_dnproj_matmul(layer, qkvz, xs, H, conv_dim + value_dim)) {
+        if (s % B == 0) {
+            int rows = S - s < B ? S - s : B;
+            gpu_block = qt_dnproj_matmul_batch(layer, qkvz, xs, rows, H, proj_dim);
+        }
+        float *qkv = qkvz + (int64_t)(s % B) * proj_dim;
+        float *z = qkv + conv_dim;
+        if (!gpu_block) {
             matmul_d(qkv, xs, l->dn_qkv, 1, H, conv_dim);
             matmul_d(z,   xs, l->dn_z,   1, H, value_dim);
         }
@@ -3840,7 +3843,7 @@ int main(int argc, char **argv) {
      * riservare qualunque budget: e' int4 impacchettato che va in VRAM come
      * fmt=4, int8 come fmt=1. Sbagliare qui era #1331 -- budget riservato,
      * planned=1, e zero promozioni per tutta la vita del processo. */
-    int expert_is_int4 = 1;
+    int expert_is_int4 = 1, expert_mixed = 0;
     {
         char probe[256];
         snprintf(probe, sizeof(probe),
@@ -3848,12 +3851,18 @@ int main(int argc, char **argv) {
         st_tensor *pt = st_find(&m.S, probe);
         int64_t want = 2*(int64_t)m.c.inter*m.c.hidden + (int64_t)m.c.hidden*m.c.inter;
         if (pt && pt->nbytes == want) expert_is_int4 = 0;   /* int8: un byte per elemento */
+        /* mixed (convert_qwen36.py --down-bits): int4 gate/up + int8 down = 2/3 of int8 */
+        if (pt && pt->nbytes == want * 2 / 3) { expert_is_int4 = 0; expert_mixed = 1; }
     }
     /* Una riga, sempre: e' l'unico modo di verificare il probe dall'esterno
      * (CI sul container tiny int8, #1331) senza una scheda. */
     fprintf(stderr, "[qwen36] expert format on disk: %s\n",
-            expert_is_int4 ? "int4 packed (tier fmt=4)" : "int8 (tier fmt=1)");
+            expert_mixed ? "int4 gate/up + int8 down (mixed; CPU path, no VRAM tier yet)"
+                         : expert_is_int4 ? "int4 packed (tier fmt=4)" : "int8 (tier fmt=1)");
     g_expert_is_int4 = expert_is_int4;
+    g_expert_mixed = expert_mixed; g_expert_down_gs = expert_mixed ? m.c.expert_down_gs : 0;
+    if (expert_mixed && m.c.expert_down_bits == 0)
+        fprintf(stderr, "[qwen36] mixed layout on disk but qwen36_meta.json has no expert_down_bits -- down scales assumed per row\n");
     /* Offer the dense trunk to the placer before the tier decides its budget:
      * sizes only, from the same dense-i8 entries the uploads below will use.
      * No entry (dense-i8 off) means nothing to offer, and the CPU path stands. */
@@ -3872,7 +3881,10 @@ int main(int argc, char **argv) {
         }
         trunk_offer_dense(&m);   /* dnout, attnproj, shexp: the rest of the per-token dense work */
     }
-    if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
+    if (expert_mixed && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1')
+        fprintf(stderr, "[qwen36] COLI_CUDA=1 ignored: the VRAM expert tier does not take the mixed layout yet (one format per expert)\n");
+    if (!expert_mixed &&
+        qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
         atexit(qt_shutdown);

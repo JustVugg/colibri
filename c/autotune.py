@@ -466,6 +466,16 @@ def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
                 if proc.returncode:
                     raise RuntimeError(f"{name} failed ({proc.returncode})\n{output[-2000:]}")
                 return parse_replay(output)
+
+            def measure(name, overlay, launch_cap):
+                samples = []
+                for repeat in range(repeats):
+                    progress(f"{name} cap={cap} ({repeat + 1}/{repeats})")
+                    sample = run_once(name, overlay, launch_cap)
+                    sample["ttft_s"] = None
+                    samples.append(sample)
+                recorded_cap = launch_cap if arch in CAP_ARCHES else None
+                return _summarize_measurement(name, overlay, samples, recorded_cap)
         else:
             if engine_cls is None:
                 from openai_server import Engine as engine_cls
@@ -530,17 +540,6 @@ def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
                         })
                 finally:
                     served.close()
-                recorded_cap = launch_cap if arch in CAP_ARCHES else None
-                return _summarize_measurement(name, overlay, samples, recorded_cap)
-
-        if arch == "glm":
-            def measure(name, overlay, launch_cap):
-                samples = []
-                for repeat in range(repeats):
-                    progress(f"{name} cap={cap} ({repeat + 1}/{repeats})")
-                    sample = run_once(name, overlay, launch_cap)
-                    sample["ttft_s"] = None
-                    samples.append(sample)
                 recorded_cap = launch_cap if arch in CAP_ARCHES else None
                 return _summarize_measurement(name, overlay, samples, recorded_cap)
 

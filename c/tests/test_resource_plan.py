@@ -146,6 +146,30 @@ class ResourcePlanTest(unittest.TestCase):
                 with self.subTest(engine_group=group, case=case[:2]):
                     self.assertEqual(_auto_tune(*case, False, engine_group=group), {})
 
+    def test_v41_gateway_sizes_cap_from_ram_without_auto_tier(self):
+        from openai_server import cap_for_arch
+
+        (self.model / "config.json").write_text(json.dumps({
+            "model_type": "deepseek_v41", "num_hidden_layers": 2,
+            "n_routed_experts": 128, "hidden_size": 128, "head_dim": 64,
+            "window_size": 8, "index_head_dim": 32, "hc_mult": 4,
+            "compress_ratios": [0, 2], "kv_source_layers": [1],
+        }))
+        write_shard(self.model / "model.safetensors", [
+            ("embed.weight", GB),
+            *[(f"layers.{layer}.ffn.experts.{expert}.w1.weight", 16 * 1024**2)
+              for layer in range(2) for expert in range(128)],
+        ])
+        with mock.patch("resource_plan.memory_available", return_value=16 * GB):
+            small = cap_for_arch("deepseek_v41", None, {"RAM_GB": "8"}, self.model)
+            large = cap_for_arch("deepseek_v41", None, {"RAM_GB": "12"}, self.model)
+            automatic = cap_for_arch("deepseek_v41", None, {}, self.model)
+        self.assertGreater(small, 8)
+        self.assertGreater(large, small)
+        self.assertEqual(large, 128)
+        self.assertEqual(automatic, 128)
+        self.assertEqual(cap_for_arch("deepseek_v41", 4, {"RAM_GB": "12"}, self.model), 4)
+
     def test_sibling_plan_advises_no_colibri_knob(self):
         other = tempfile.TemporaryDirectory()
         self.addCleanup(other.cleanup)

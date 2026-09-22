@@ -110,6 +110,8 @@ def _engine_error(fields, message):
 class GenerationScheduler:
     """Bounded FIFO admission for the engine's independent KV contexts."""
 
+    _buckets = (0.001, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 300, math.inf)
+
     def __init__(self, max_queue=8, queue_timeout=300, capacity=1):
         if max_queue < 0:
             raise ValueError("max_queue cannot be negative")
@@ -127,9 +129,13 @@ class GenerationScheduler:
         self.closed = False
         self.admitted = 0
         self.completed = 0
+        self.failed = 0
         self.rejected = 0
         self.timed_out = 0
         self.cancelled = 0
+        self.timings = {name: {"sum": 0.0, "buckets": [0] * len(self._buckets)}
+                        for name in ("queue_wait_seconds", "slot_duration_seconds",
+                                     "first_output_seconds", "engine_call_seconds")}
 
     @contextlib.contextmanager
     def admit(self, cancelled=None, slot=None):
@@ -140,7 +146,7 @@ class GenerationScheduler:
             if self.closed:
                 raise APIError(503, "The inference scheduler is shutting down.", None,
                                "scheduler_closed", "server_error")
-            if (self.active >= self.capacity or self.queue) and len(self.queue) >= self.max_queue:
+            if self._available_slot(slot) is None and len(self.queue) >= self.max_queue:
                 self.rejected += 1
                 raise APIError(429, "The inference queue is full.", None, "queue_full",
                                "rate_limit_error", {"Retry-After": "1"})
@@ -152,24 +158,6 @@ class GenerationScheduler:
                     self.condition.notify_all()
                     raise APIError(503, "The inference scheduler is shutting down.", None,
                                    "scheduler_closed", "server_error")
-                available = min(self.free_slots) if slot is None and self.free_slots else slot
-                # (#B2) Admit as soon as our target slot is free AND no strictly-earlier
-                # waiter also wants it (an earlier waiter "wants" it if it is any-slot or
-                # pinned to the same slot). This replaces the old strict FIFO-head rule,
-                # which let a head pinned to a busy slot block every request behind it —
-                # even ones targeting a currently-free slot (head-of-line blocking).
-                # ponytail: O(queue) scan per wakeup — negligible at the default max_queue;
-                # switch to per-slot wait sets if max_queue is ever raised to thousands.
-                can_admit = available in self.free_slots
-                if can_admit:
-                    for t2, s2 in self.queue:
-                        if t2 is ticket:
-                            break
-                        if s2 is None or s2 == available:
-                            can_admit = False
-                            break
-                if can_admit:
-                    break
                 if cancelled and cancelled():
                     self.queue.remove(entry)
                     self.cancelled += 1
@@ -182,36 +170,99 @@ class GenerationScheduler:
                     self.condition.notify_all()
                     raise APIError(429, "Timed out waiting for the inference engine.", None,
                                    "queue_timeout", "rate_limit_error", {"Retry-After": "1"})
+                available = self._available_slot(slot, ticket)
+                if available is not None:
+                    break
                 self.condition.wait(min(remaining, 0.25))
             self.queue.remove(entry)
             self.free_slots.remove(available)
             self.active += 1
             self.admitted += 1
-            wait_seconds = time.monotonic() - queued_at
-        cancelled_after_admission = False
+            admitted_at = time.monotonic()
+            wait_seconds = admitted_at - queued_at
+            self._observe("queue_wait_seconds", wait_seconds)
+        outcome = "failed"
         try:
             yield wait_seconds, available
+            outcome = "completed"
         except ClientCancelled:
-            cancelled_after_admission = True
+            outcome = "cancelled"
             raise
         finally:
             with self.condition:
                 self.active -= 1
                 self.free_slots.add(available)
-                if cancelled_after_admission:
-                    self.cancelled += 1
-                else:
-                    self.completed += 1
+                setattr(self, outcome, getattr(self, outcome) + 1)
+                self._observe("slot_duration_seconds", time.monotonic() - admitted_at)
                 self.condition.notify_all()
+
+    def _available_slot(self, slot, ticket=None):
+        # Caller holds the condition lock. Pinned waiters reserve only their
+        # target; an older any-slot waiter has priority over every free slot.
+        candidates = self.free_slots.copy() if slot is None else self.free_slots & {slot}
+        for earlier_ticket, earlier_slot in self.queue:
+            if earlier_ticket is ticket:
+                break
+            if earlier_slot is None:
+                return None
+            candidates.discard(earlier_slot)
+        return min(candidates, default=None)
 
     def snapshot(self):
         with self.condition:
             return {"active": self.active, "queued": len(self.queue),
                     "capacity": self.capacity,
                     "max_queue": self.max_queue, "queue_timeout_seconds": self.queue_timeout,
-                    "admitted": self.admitted, "completed": self.completed,
+                    "admitted": self.admitted, "completed": self.completed, "failed": self.failed,
                     "rejected": self.rejected, "timed_out": self.timed_out,
                     "cancelled": self.cancelled}
+
+    def _observe(self, name, seconds):
+        # Called with condition held. Cumulative buckets need no request history.
+        timing = self.timings[name]
+        timing["sum"] += seconds
+        for i, bound in enumerate(self._buckets):
+            if seconds <= bound:
+                timing["buckets"][i] += 1
+
+    def observe_timing(self, name, seconds):
+        with self.condition:
+            self._observe(name, seconds)
+
+    def prometheus(self):
+        """One consistent, bounded snapshot; no prompt or request-ID labels."""
+        gauges = {"active": "Currently admitted requests.",
+                  "queued": "Requests waiting for a KV slot.",
+                  "capacity": "Concurrent KV slots configured.",
+                  "max_queue": "Maximum waiting requests configured."}
+        counters = {"admitted": "Requests admitted to a KV slot.",
+                    "completed": "Admitted requests that returned normally.",
+                    "failed": "Admitted requests that raised an error.",
+                    "rejected": "Requests rejected because the queue was full.",
+                    "timed_out": "Requests that timed out waiting for a slot.",
+                    "cancelled": "Requests cancelled while queued or admitted."}
+        lines = []
+        with self.condition:
+            for kind, fields in (("gauge", gauges), ("counter", counters)):
+                for field, help_text in fields.items():
+                    name = "colibri_scheduler_" + field + ("_total" if kind == "counter" else "")
+                    value = len(self.queue) if field == "queued" else getattr(self, field)
+                    lines.extend((f"# HELP {name} {help_text}", f"# TYPE {name} {kind}",
+                                  f"{name} {value}"))
+            for field, help_text in (
+                    ("queue_wait_seconds", "Queue wait of admitted requests only."),
+                    ("slot_duration_seconds", "Slot occupancy of finished admitted requests, including errors and cancellation."),
+                    ("first_output_seconds", "Engine-call start to first nonempty text or tool callback, excluding queue wait."),
+                    ("engine_call_seconds", "Duration of finished engine generation calls, including errors and cancellation.")):
+                name = "colibri_scheduler_" + field
+                timing = self.timings[field]
+                lines.extend((f"# HELP {name} {help_text}", f"# TYPE {name} histogram"))
+                for bound, count in zip(self._buckets, timing["buckets"]):
+                    label = "+Inf" if math.isinf(bound) else str(bound)
+                    lines.append(f'{name}_bucket{{le="{label}"}} {count}')
+                lines.extend((f'{name}_sum {timing["sum"]}',
+                              f'{name}_count {timing["buckets"][-1]}'))
+        return "\n".join(lines) + "\n"
 
     def close(self):
         with self.condition:
@@ -2892,7 +2943,7 @@ def model_arch(model):
     return resolve_model(model).descriptor.id
 
 
-def cap_for_arch(arch, cap, env=None):
+def cap_for_arch(arch, cap, env=None, model=None):
     """Cap-sentinel shim (#379): CURRENT-STATE CALIBRATION, not durable core.
 
     An absent cap (None) means different things across today's engines --
@@ -2931,6 +2982,22 @@ def cap_for_arch(arch, cap, env=None):
             planned = 0
         if planned >= 1:
             return planned
+    if arch == "deepseek_v41" and model is not None:
+        # V4.1 only reads its argv cap, not RAM_GB. Without --auto-tier the
+        # legacy eight slots silently discarded both --ram and RAM_GB (#1666).
+        from resource_plan import build_plan
+        settings = env if env is not None else os.environ
+        ram = settings.get("RAM_GB", "0")
+        limits = family_by_id(arch).limits
+        plan = build_plan(model, ram_gb=0 if ram == "auto" else float(ram),
+                          context=int(settings.get(limits.context_env, limits.default_context)),
+                          gpu_indices=[])
+        slots = plan["tiers"]["ram"]["cache_slots_per_layer"]
+        if slots < 1:
+            raise ValueError("DeepSeek V4.1 RAM budget cannot hold one expert slot per layer")
+        print(f"[v41] RAM plan: {slots} expert cache slots/layer; --cap overrides",
+              file=sys.stderr)
+        return slots
     return family_by_id(arch).limits.implicit_cap
 
 
@@ -3071,7 +3138,7 @@ class Engine:
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
-        resolved_cap = cap_for_arch(arch, cap, child_env)
+        resolved_cap = cap_for_arch(arch, cap, child_env, model=model)
         child_env.pop("COLI_PROFILE_CAP", None)
         child_env.pop("COLI_PLAN_CAP", None)
         self.process = subprocess.Popen(
@@ -3542,6 +3609,27 @@ class APIServer(ThreadingHTTPServer):
         self._conn_by_ip = {}
         self._conn_owner = {}
 
+    def generate(self, prompt, max_tokens, temperature, top_p, on_text, *args, **kwargs):
+        started = time.monotonic()
+        first_output = False
+
+        def measured(callback):
+            def feed(text):
+                nonlocal first_output
+                if text and not first_output:
+                    first_output = True
+                    self.scheduler.observe_timing("first_output_seconds", time.monotonic() - started)
+                return callback(text)
+            return feed
+
+        if kwargs.get("on_tool") is not None:
+            kwargs["on_tool"] = measured(kwargs["on_tool"])
+        try:
+            return self.engine.generate(prompt, max_tokens, temperature, top_p,
+                                        measured(on_text), *args, **kwargs)
+        finally:
+            self.scheduler.observe_timing("engine_call_seconds", time.monotonic() - started)
+
     def process_request(self, request, client_address):
         """Refuse past the caps instead of spawning an unbounded thread."""
         peer = client_address[0] if client_address else "?"
@@ -3886,6 +3974,16 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             self._check_host()
             path = urlsplit(self.path).path
+            if path == "/metrics":
+                self.require_auth()
+                data = self.server.scheduler.prometheus().encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if path == "/health":
                 # Liveness is always public; hardware/scheduler internals only when a
                 # request is authed (or no key set), so a configured key isn't leaked
@@ -4142,7 +4240,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 def on_accept(value):
                     accepted.update(value)
 
-                self.server.engine.generate(
+                self.server.generate(
                     text, 0, 0.0, 1.0, lambda _chunk: None, cache_slot,
                     self.client_disconnected, logprobs=1, pin=pin,
                     on_echo=echoes.append, on_accept=on_accept)
@@ -4444,7 +4542,8 @@ class APIHandler(BaseHTTPRequestHandler):
         completion_id = id_prefix + uuid.uuid4().hex
         created = int(time.time())
 
-        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission, \
+                contextlib.ExitStack() as stream_cleanup:
             queue_wait, cache_slot = admission
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if not stream:
@@ -4456,7 +4555,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 def generation_stopped():
                     return stop_filter.stopped() or sideband.stopped()
 
-                stats = self.server.engine.generate(
+                stats = self.server.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
@@ -4595,6 +4694,8 @@ class APIHandler(BaseHTTPRequestHandler):
                             "logprobs": None, "finish_reason": None}])
                 ka_thread[0] = threading.Thread(target=_keepalive, daemon=True)
                 ka_thread[0].start()
+                stream_cleanup.callback(ka_thread[0].join, timeout=2)
+                stream_cleanup.callback(ka_stop.set)
             if chat and tools:
                 # Suppress tool-call markers from the streamed content and parse the authoritative
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
@@ -4638,7 +4739,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 def generation_stopped():
                     return stop_filter.stopped() or sideband.stopped()
 
-                stats = self.server.engine.generate(
+                stats = self.server.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
@@ -4671,7 +4772,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         sys.stderr.write(chunk); sys.stderr.flush()
                     (content_split.feed if content_split else emit)(chunk)
                 stop_filter = StopFilter(stop_sequences, emit_plain, ignore_leading_stop)
-                stats = self.server.engine.generate(
+                stats = self.server.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
                     on_accept=start_stream, **({"audio": audio} if audio else {}),
@@ -4877,7 +4978,8 @@ class APIHandler(BaseHTTPRequestHandler):
             reason = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
             return content, self.ANTHROPIC_STOP[reason]
 
-        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission, \
+                contextlib.ExitStack() as stream_cleanup:
             queue_wait, cache_slot = admission
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if not stream:
@@ -4889,7 +4991,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 def generation_stopped():
                     return stop_filter.stopped() or sideband.stopped()
 
-                stats = self.server.engine.generate(
+                stats = self.server.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}))
@@ -4958,6 +5060,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                                    "content_block": {"type": "text", "text": ""}})
             ka_thread = threading.Thread(target=keepalive, daemon=True)
             ka_thread.start()
+            stream_cleanup.callback(ka_thread.join, timeout=2)
+            stream_cleanup.callback(ka_stop.set)
 
             raw = []
             sideband = ToolSideband(ARCH == "kimi" and bool(tools), stop_sequences,
@@ -5030,7 +5134,7 @@ class APIHandler(BaseHTTPRequestHandler):
             def generation_stopped():
                 return stop_filter.stopped() or sideband.stopped()
 
-            stats = self.server.engine.generate(
+            stats = self.server.generate(
                 prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                 lambda: not connected[0], grammar=grammar, stopped=generation_stopped,
                 **({"on_tool": sideband.feed} if sideband.enabled else {}))

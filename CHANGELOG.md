@@ -3,9 +3,9 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [1.12.1] — 2026-09-21
+## [1.12.1] — 2026-09-22
 
-30 pull requests since v1.12.0, 22 of them from contributors. Two tokenizers
+54 pull requests since v1.12.0, 42 of them from contributors. Two tokenizers
 brought back to the reference, brio on the ninth engine, `coli chat` working
 again at the default context on two families, and a placement decision that
 is now measured on the card in front of it instead of predicted.
@@ -68,7 +68,7 @@ is now measured on the card in front of it instead of predicted.
 
 ### Performance
 
-- **#PR**: qwen36's dense trunk and routed experts multiply with integer
+- **#1664**: qwen36's dense trunk and routed experts multiply with integer
   dot products. The activation is quantized to int8 once per call and the
   weights, int8 rows or int4 planar blocks, meet it with maddubs / vpdpbusd
   instead of a float conversion per weight; the integer kernels move from
@@ -80,6 +80,18 @@ is now measured on the card in front of it instead of predicted.
   `COLI_DENSE_INT4=<components>` stores part of the trunk as int4 in blocks
   of 64: opt-in, with the perplexity it costs per component in the docs
   (lm_head alone +2.4%, everything +10%).
+- **#1668**: qwen38's dense trunk (553 matrices, 3.6 G weights, 8 GiB of
+  BF16 read on every token, more than the ten routed experts) is kept on the
+  CPU as int8 rows with the BF16 copy released, and multiplied with the same
+  integer kernels; the routed experts' e4m3 blocks are decoded eight at a
+  time in registers and multiplied with FMA instead of one table lookup per
+  weight. Measured on the released Qwen3.8-Flash-Next-FP8, 8 threads, RAM
+  LRU 96 per layer: decode 0.61 to 1.42 tok/s, the trunk 434 to 85 ms/token,
+  lm_head 76 to 13, the expert GEMVs 388 to 140, peak RSS 32.2 to 28.5 GB;
+  prefill of 512 tokens 495 to 149 s. Perplexity on 4 x 512 tokens +0.5%
+  (two chunks lower, two higher); the vector FP8 kernel alone reproduces the
+  BF16 run to four decimals. Both are the default (`Q38_TRUNK_CPU_INT8=0`
+  keeps the BF16 trunk, `Q38_FP8_KERNEL=scalar` the table kernel).
 
 ### Performance, from contributors
 
@@ -96,9 +108,44 @@ is now measured on the card in front of it instead of predicted.
 - **#906**: `DEGRADE_ZERO`, an opt-in policy that zero-fills a missed
   expert slot below a gate-weight threshold instead of blocking on the
   load (#865).
+- **#1677**: qwen36 projects a prompt's DeltaNet inputs (qkv and z) on the
+  card in blocks of up to 256 rows instead of one row at a time; a 259-row
+  prefill makes 2 projection calls instead of 259, with the convolution
+  history and the recurrent state checked against the CPU run. The paired
+  microbenchmark on an RTX 4070 read 4 to 10x per projection.
+- **#1674**: qwen36's attention projections the tier placed in VRAM answer
+  a whole prompt batch with one call per matrix; a failed call turns only
+  that handle off and the prompt continues on the CPU.
+- **#1676**: Kimi K3's streaming CUDA expert keeps the gate, up and SiTU
+  intermediates on the device and applies down there (one fused entry
+  point, optional in the DLL: an older backend keeps the three-call path).
+- **#1673**: the streaming MXFP4 matmul reuses one grow-only device scratch
+  per card instead of allocating and freeing weights and scales on every
+  call.
+- **#1559** (kreuzzelg): `convert_qwen36.py --down-bits 8` writes the mixed
+  expert layout, int4 gs64 gate/up and int8 down in one slab (5.7 bits per
+  weight against gs64's 4.5); the engine tells it apart by size and reads
+  each matrix in its own format on the CPU path, and refuses the VRAM tier
+  with a line. It is the knob behind the #1370 numbers: on wikitext-2 the
+  int8 down alone recovers a quarter of the gap between gs64 and all-int8,
+  the rest sits in gate/up. A measurement tool and a middle step, not the
+  answer to the gap.
+- **#1686** (DebugSultan): qwen38's prefill chunk (`Q38_PREFILL_BATCH_ROWS`)
+  and workspace (`Q38_PREFILL_WORKSPACE_MIB`) are runtime knobs, the expert
+  load batch is no longer capped at top-k, and the QSA ranking and
+  attention run per position in parallel at prefill. Measured on the
+  released checkpoint on top of the int8 trunk: output byte-identical at
+  every chunk width, no speed change on our 16-core server; the knobs are
+  there for hardware where the chunk binds.
 
 ### Fixed
 
+- **#1650** (bokiko): a Qwen3.8 pin snapshots the recurrent and PLE state
+  but reuses the live attention and indexer rows; after an unrelated prompt
+  overwrote those rows, returning to the pin could change brio logprobs
+  without a warning. The engine now records the token identity of the live
+  rows (`kv_prefix.h`) and refuses a stale pin or prefix restore; image rows
+  are tainted. Wire regressions run on the BF16 and FP8 fixtures.
 - **#1626**: `SNAP` is the model directory for every non-GLM engine, so
   `coli run` stops handing them a leftover environment (#1600).
 - **#1604**: glm53 honours `Mat.resident` in the Vulkan gate and frees the
@@ -116,6 +163,41 @@ is now measured on the card in front of it instead of predicted.
 - **#1658**: `test_mem_available` compared two reads of available memory
   with `==` and failed on a busy Windows runner; a quarter of a GB of
   tolerance.
+- **#1670**: DeepSeek V4.1 read only its argv cache cap, so `RAM_GB=120`
+  on a 128 GB box left the engine at eight expert slots per layer and
+  23.8 GB of RSS (#1666). With `--cap` omitted, `coli chat`, `coli serve`
+  and `coli web` now size the cache from the resource plan, with `RAM_GB`
+  or `--ram` as the budget; an explicit `--cap`, a measured profile and an
+  auto-tier plan keep precedence.
+- **#1671**: DeepSeek V4.1 treats `max_tokens` as a ceiling like the other
+  engines (#1641): a fitting prompt with a large request generates what
+  the context leaves, a score-only prompt may fill the context, and a
+  prompt one token over it is refused instead of silently truncated.
+- **#1675**: resident MXFP4 tensors on CUDA carried O float scales where
+  the kernel reads O x ceil(I/32) exponent bytes: short buffers were
+  over-read and long ones truncated. One format-aware size for upload,
+  refresh, accounting and release.
+- **#1678**, **#1679**, **#1680**, **#1682**, **#1683**, **#1684**: the
+  Qwen CUDA tier's lifecycle, end to end. Shutdown releases every resident
+  expert, projection handle and host table after parked callers resume;
+  a failed gate, up or down upload frees what it had already allocated;
+  the expert budget charges the three scale buffers at their own sizes
+  (two experts used to be admitted where one fit); a failed result
+  collection stops inference instead of publishing a partial MoE sum; a
+  failed or explicitly disabled tier start unwinds its storage and
+  synchronization objects, and a second init cannot overwrite a running
+  tier; the CUDA backend validates the whole device list before touching
+  state and keeps live contexts on a repeated init. Fault-injected on the
+  fake backend, then run together on an RTX 4070 under compute-sanitizer
+  with zero errors and zero bytes leaked.
+- **#1669**: `test_systemone_api` imports its scoring engine relative to
+  its package, so an installed `tests` package no longer breaks discovery.
+- **#1691**: the installed launcher invoked as `/bin/coli` or `/sbin/coli`
+  on a merged-/usr system derived `/libexec/colibri` instead of
+  `/usr/libexec/colibri`, because `abspath` kept the alias (#1689,
+  florin65's patch): `realpath` first. A test runs the launcher through
+  such an alias, and another checks that every root module the launcher
+  reaches is in the `make install` list, the gap #1610 closed by hand.
 
 ### Tools and the gateway
 
@@ -128,6 +210,18 @@ is now measured on the card in front of it instead of predicted.
 - **#1355**, **#1357**: durable per-request results and strict stdout
   classification in the eval harness, and the logprob-gap check gated on
   the engine preamble.
+- **#1687**: `GET /metrics` in Prometheus text format, behind the API key:
+  four gauges, six outcome counters and four histograms (queue wait, slot
+  occupancy, first output, engine call), no request labels, no new
+  dependency. The admission scheduler distinguishes completion, failure
+  and cancellation, lets a request use a free slot that no earlier waiter
+  reserved, and joins the keepalive pump before the slot is released.
+- **#1688**: `tools/benchmark_http_serving.py`, a stdlib HTTP streaming
+  benchmark over fixed JSONL conversations: closed-loop or paced arrivals
+  (periodic or Poisson, seeded), warmup separated from measurement,
+  first-output and duration SLOs, latency percentiles and usage-based
+  token throughput; a truncated or malformed stream is a failure, not a
+  sample.
 
 ### Docs
 
@@ -142,6 +236,9 @@ is now measured on the card in front of it instead of predicted.
 - **#1617**: connecting the pi coding agent to `coli serve`.
 - **#1619**: `expected_bytes` identity versus physical extent for
   int4-rans256-g0 (#1273).
+- **#1681** (XBold): the README and `docs/qwen38.md` no longer say Qwen3.8
+  has no GPU backend; the CUDA VRAM expert tier and the int8 trunk in VRAM
+  shipped in 1.12.0.
 
 ## [1.12.0] — 2026-09-20
 

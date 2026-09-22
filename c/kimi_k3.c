@@ -189,7 +189,9 @@ typedef struct {
 
 /* ---------- routed-expert streaming (native MXFP4 from the HF shards) ---- */
 typedef struct { int fd[6]; int64_t off[6]; int contig; } ERef;  /* w1p w1s w2p w2s w3p w3s */
+#ifndef KIMI_K3_NO_MAIN
 static char g_k3_usage[2100];   /* <snap>/.coli_usage, or COLI_USAGE */
+#endif
 typedef struct { int eid; uint8_t *buf, *base; uint64_t used; int pinned; } Slot;
 /* pinned: seeded from .coli_usage at startup and never evicted. The LRU adapts to
  * THIS session; the pin knows the history of every session before it. Capped at
@@ -1612,28 +1614,22 @@ static inline float situf_(float g, float u, float b1, float b2){
 }
 
 #ifdef COLI_CUDA
-/* CUDA apply for one expert, decode only (S==1).
- *
- * Same shape as the Vulkan path below and the CPU expert_apply above -- w1/w3,
- * SiTU-GLU on the host, then w2 down -- but stateless: the routed tier streams,
- * so there is nothing resident to keep a device handle for. Weights ride up
- * with the call.
- *
- * Returns 0 with u untouched on ANY failure, so the caller falls through to the
- * disk+CPU path exactly as it does when Vulkan declines. That is the contract
- * vLLM's MXFP4 backends use too -- FlashInfer/AITER when they can, an emulation
- * path when they cannot -- and it is what makes the fast path safe to attempt
- * unconditionally. */
+/* Keep SiTU-GLU and intermediate activations on the GPU when supported.
+ * Older DLLs lack the optional fused entry point, so retain the three-matmul
+ * path as fallback. Accumulate into u only after a complete expert succeeds. */
 static int cuda_expert_apply(Model *m, const uint8_t *w1p, const uint8_t *w1s,
                              const uint8_t *w2p, const uint8_t *w2s,
                              const uint8_t *w3p, const uint8_t *w3s,
                              const float *z, float wk,
                              float *u, float *gate, float *up, float *hz){
     Cfg *c=&m->c;
-    if(!coli_cuda_matmul_mxfp4(gate,z,w1p,w1s,1,c->latent,c->moe_inter)) return 0;
-    if(!coli_cuda_matmul_mxfp4(up,  z,w3p,w3s,1,c->latent,c->moe_inter)) return 0;
-    for(int i=0;i<c->moe_inter;i++) gate[i]=situf_(gate[i],up[i],c->situ_b1,c->situ_b2);
-    if(!coli_cuda_matmul_mxfp4(hz,gate,w2p,w2s,1,c->moe_inter,c->latent)) return 0;
+    if(!coli_cuda_expert_mxfp4(hz,z,w1p,w1s,w3p,w3s,w2p,w2s,
+                              1,c->latent,c->moe_inter,c->situ_b1,c->situ_b2)) {
+        if(!coli_cuda_matmul_mxfp4(gate,z,w1p,w1s,1,c->latent,c->moe_inter)) return 0;
+        if(!coli_cuda_matmul_mxfp4(up,  z,w3p,w3s,1,c->latent,c->moe_inter)) return 0;
+        for(int i=0;i<c->moe_inter;i++) gate[i]=situf_(gate[i],up[i],c->situ_b1,c->situ_b2);
+        if(!coli_cuda_matmul_mxfp4(hz,gate,w2p,w2s,1,c->moe_inter,c->latent)) return 0;
+    }
     for(int i=0;i<c->latent;i++) u[i]+=wk*hz[i];
     return 1;
 }
