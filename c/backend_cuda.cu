@@ -176,6 +176,15 @@ static int select_ctx(DeviceContext *ctx) {
 #define COLI_E8_SUB      32
 #define COLI_E8_BBYTES   98
 
+/* Formats with no separate scale buffer: fmt=0 (f32) and fmt=9 (bf16) carry
+ * their magnitude in the weights themselves, fmt=6 keeps its scales inside each
+ * block. None of them has a scale array to allocate, upload, charge against the
+ * device budget or refresh -- the rule lives here so the call sites that used to
+ * spell out `fmt && fmt != 6` cannot drift apart as formats are added. */
+__host__ __device__ static int fmt_scale_free(int fmt) {
+    return fmt == 0 || fmt == 6 || fmt == 9;
+}
+
 __host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == 0) return (size_t)I * sizeof(float);
     if (fmt == 1) return (size_t)I;
@@ -185,7 +194,15 @@ __host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == 7) return (size_t)(I + 1) / 2;   /* MXFP4: e2m1 nibbles, 2 per byte */
     if (fmt == 6) return (size_t)(((int64_t)I + COLI_E8_QK - 1) / COLI_E8_QK) * COLI_E8_BBYTES;
     if (fmt == 8) return (size_t)I;             /* fp8-e4m3: raw bytes, layout of fmt=1 */
+    if (fmt == 9) return (size_t)I * 2;         /* bf16: two raw bytes per weight, no scales */
     return 0;
+}
+
+/* fmt=9 (bf16) decode. bf16 -> f32 is the identity on the top 16 bits: no
+ * rounding, no table, no <cuda_bf16.h> dependency. Mirrors the CPU reference
+ * bf16_to_f32 in st.h bit for bit, NaN and Inf patterns included. */
+__device__ static inline float bf16_at(const uint8_t *base, size_t i) {
+    return __uint_as_float((uint32_t)reinterpret_cast<const uint16_t *>(base)[i] << 16);
 }
 
 /* The E8 codebook, uploaded once per device from quant.h's e8_grid so the table
@@ -331,7 +348,7 @@ __device__ static float weight_at(const void *weights, int fmt, size_t row, int 
  * attention absorb kernels apply per-group scales instead of the per-row
  * (fmt=2) semantic that crashed #298's g64 kv_b. */
 __device__ static float absorb_scale(const float *wscale, int fmt, int gs, int ng, int row, int k) {
-    if (!fmt) return 1.f;
+    if (fmt_scale_free(fmt)) return 1.f;
     if (fmt != 4) return wscale[row];
     int g = k / gs; if (g >= ng) g = ng - 1;   /* tail of the last (partial) group */
     return wscale[(size_t)row * ng + g];
@@ -551,6 +568,12 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
         const float *scl = scales + (size_t)(o >> 7) * (size_t)((I + 127) >> 7);
         for (int i = threadIdx.x; i < I; i += blockDim.x)
             sum += xs[i] * c_e4m3[wrow[i]] * scl[i >> 7];
+    } else if (fmt == 9) {
+        /* bf16: the magnitude is in the weight, so there is nothing to apply
+         * before or after the reduce -- see the epilogue's scale-free test. */
+        const uint8_t *wrow = static_cast<const uint8_t *>(weights) + row;
+        for (int i = threadIdx.x; i < I; i += blockDim.x)
+            sum += xs[i] * bf16_at(wrow, (size_t)i);
     } else {
         for (int i = threadIdx.x; i < I; i += blockDim.x)
             sum += xs[i] * weight_at(weights, fmt, row, i);
@@ -569,8 +592,10 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
          * block header, 8 reads a per-128 block scale alongside the weights.
          * Only the per-row formats get the trailing multiply --
          * and for fmt=7 `scales` points at ue8m0 BYTES, so reading it as float
-         * here does not merely double-scale, it reads garbage. */
-        y[(size_t)s * O + o] = (fmt && fmt != 4 && fmt != 6 && fmt != 7 && fmt != 8) ? partial[0] * scales[o] : partial[0];
+         * here does not merely double-scale, it reads garbage. The scale-free
+         * formats (0, 6, 9) are excluded through the shared predicate: they have
+         * no `scales` array at all, so the multiply would dereference NULL. */
+        y[(size_t)s * O + o] = (!fmt_scale_free(fmt) && fmt != 4 && fmt != 7 && fmt != 8) ? partial[0] * scales[o] : partial[0];
 }
 
 /* fmt=6 activation rotation, y = Q^T x for Q = D*H/sqrt(n) (#452). One block per
@@ -1411,7 +1436,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     size_t rb = row_bytes(fmt, I);
     /* fmt=6 keeps its scales inside each 98-byte block, so it is the one
      * quantized format that legitimately arrives with scales == NULL. */
-    if (!rb || (fmt && fmt != 6 && !scales)) return 0;
+    if (!rb || (!fmt_scale_free(fmt) && !scales)) return 0;
     if (fmt == 8 && !g_fp8_lut_ready) return 0;   /* kernels would read a zero LUT */
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t) return 0;
@@ -1438,7 +1463,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     if(fmt==2||fmt==4){ /* same nibble layout: offset-binary -> signed in place */
         offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
-    if (fmt && fmt != 6) {
+    if (!fmt_scale_free(fmt)) {
         if (!cuda_ok(cudaMalloc(&t->scales, t->scale_count * sizeof(float)), "scale allocation") ||
             !cuda_ok(cudaMemcpy(t->scales, scales, t->scale_count * sizeof(float), cudaMemcpyHostToDevice), "scale upload")) {
             coli_cuda_tensor_free(t);
@@ -1448,7 +1473,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     if (fmt == 6) t->scale_count = 0;      /* in-block scales: nothing separate to track */
     t->tracked = 1;
     ctx->tensor_count++;
-    ctx->tensor_bytes += t->weight_bytes + ((fmt && fmt != 6) ? t->scale_count * sizeof(float) : 0);
+    ctx->tensor_bytes += t->weight_bytes + (!fmt_scale_free(fmt) ? t->scale_count * sizeof(float) : 0);
     *tensor = t;
     return 1;
 }
@@ -1621,7 +1646,7 @@ extern "C" int coli_cuda_tensor_upload_compressed(ColiCudaTensor **tensor,
 extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
                                           const void *weights,
                                           const float *scales) {
-    if (!tensor || !weights || (tensor->fmt && tensor->fmt != 6 && !scales)) return 0;
+    if (!tensor || !weights || (!fmt_scale_free(tensor->fmt) && !scales)) return 0;
 #ifdef COLI_ANS
     if(tensor->compressed) return 0;
 #endif
@@ -1634,9 +1659,13 @@ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
             (uint8_t*)tensor->weights,tensor->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight refresh")) return 0;
     }
-    /* fmt=6 has no scale buffer at all (scales live in-block, scale_count 0), and
-     * the fallback below would otherwise copy O floats out of a NULL host pointer. */
-    return !tensor->fmt || tensor->fmt==6 || cuda_ok(cudaMemcpy(tensor->scales,scales,
+    /* Scale-free formats have no scale buffer to refresh: fmt=6 keeps its scales
+     * in-block (scale_count 0), fmt=0 and fmt=9 carry their magnitude in the
+     * weights. The fallback below would otherwise copy O floats out of a NULL
+     * host pointer. Spelled through the shared predicate on purpose: this site
+     * used to say `!fmt || fmt==6`, a second wording of the same rule that the
+     * `fmt && fmt != 6` sweep would not have caught. */
+    return fmt_scale_free(tensor->fmt) || cuda_ok(cudaMemcpy(tensor->scales,scales,
         (tensor->scale_count?tensor->scale_count:(size_t)tensor->O)*sizeof(float),
         cudaMemcpyHostToDevice),"scale refresh");
 }
@@ -2398,7 +2427,7 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
 #endif
             tensor->weight_bytes;
         size_t bytes = storage_bytes +
-            ((tensor->fmt && tensor->fmt != 6) ? tensor->scale_count * sizeof(float) : 0);
+            (!fmt_scale_free(tensor->fmt) ? tensor->scale_count * sizeof(float) : 0);
         if (ctx->tensor_count) ctx->tensor_count--;
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
@@ -2422,7 +2451,7 @@ extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
 #endif
         tensor->weight_bytes;
     return storage_bytes +
-        ((tensor->fmt && tensor->fmt != 6) ? tensor->scale_count * sizeof(float) : 0);
+        (!fmt_scale_free(tensor->fmt) ? tensor->scale_count * sizeof(float) : 0);
 }
 
 /* What a cudaMalloc of `bytes` actually takes off the card.
@@ -2535,7 +2564,7 @@ extern "C" size_t coli_cuda_tensor_vram(const ColiCudaTensor *tensor) {
 #endif
         tensor->weight_bytes;
     size_t total = coli_cuda_alloc_footprint(storage_bytes);
-    if (tensor->fmt && tensor->fmt != 6)
+    if (!fmt_scale_free(tensor->fmt))
         total += coli_cuda_alloc_footprint(tensor->scale_count * sizeof(float));
     return total;
 }
