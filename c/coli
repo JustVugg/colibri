@@ -1642,7 +1642,10 @@ def chat_attached(a, base, model_id):
                 else:
                     print(f"  {C.yel}  /brio needs the options: /brio merge | request changes | close{C.r}\n")
                 continue
-            brio_options=[o.strip() for o in spec.split("|") if o.strip()]
+            # dict.fromkeys deduplica tenendo l'ordine: il server rifiuta due
+            # opzioni uguali con un 400, e "merge | merge | close" e' un refuso
+            # facile da fare a mano, non una domanda a tre opzioni.
+            brio_options=list(dict.fromkeys(o.strip() for o in spec.split("|") if o.strip()))
             if len(brio_options)<2:
                 brio_options=[]
                 print(f"  {C.yel}  at least two options are needed, separated by |{C.r}\n")

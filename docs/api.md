@@ -79,9 +79,16 @@ The server serves one generation at a time: the model stays in one persistent
 process, so concurrent HTTP requests queue instead of loading duplicate model
 copies. Tool calling depends on the active engine; see the support matrix below.
 Images, log probabilities, and token penalties return an explicit error rather
-than being silently ignored. Audio is accepted only by Inkling checkpoints with
+than being silently ignored. `seed` is accepted and ignored (see below).
+Audio is accepted only by Inkling checkpoints with
 audio support. The default bind address is localhost; set `COLI_API_KEY` before
 exposing the server beyond the machine.
+
+### `seed`
+
+`seed` is accepted (not rejected) for OpenAI-API request-shape compatibility;
+the value is not validated. This server sends no per-request seed on the
+wire, so the value has no effect at any temperature.
 
 ### Tool-calling support
 

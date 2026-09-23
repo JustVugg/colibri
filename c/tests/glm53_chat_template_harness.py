@@ -23,7 +23,7 @@ RIFERIMENTO (scaricato 2026-09-10):
   hf download zai-org/GLM-5.3-Flash chat_template.jinja
 
 USO:
-  python3 tests/test_glm53_chat_template.py --template PATH/chat_template.jinja
+  python3 tests/glm53_chat_template_harness.py --template PATH/chat_template.jinja
 """
 import argparse
 import json

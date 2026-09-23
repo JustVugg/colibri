@@ -1054,8 +1054,16 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
                                     const uint8_t *qu, const float *su,
                                     int S, int I, int O, int gs){
     int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+    int o0=0;
+#if defined(__SSE4_1__) && !defined(__AVX2__)
+    if(!(gs&1)){
+        o0=O&~3;
+        if(o0) matmul_i4_grouped_pair_sse41_rows4(yg,yu,x,qg,sg,qu,su,S,I,O,gs,rb,ng,o0);
+        if(o0==O) return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){
+    for(int o=o0;o<O;o++){
         const uint8_t *wg=qg+(int64_t)o*rb; const uint8_t *wu2=qu+(int64_t)o*rb;
         const float *sgl=sg+(int64_t)o*ng;   const float *sul=su+(int64_t)o*ng;
         for(int s=0;s<S;s++){

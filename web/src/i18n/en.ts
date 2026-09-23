@@ -93,6 +93,7 @@ const en: Record<string, string> = {
   "brio.ownOptions": "Allowed options for this question, one per line",
   "brio.needTwo": "a second option is needed, on its own line",
   "brio.scoreAll": "Answer {{n}}",
+  "brio.stop": "Stop",
   "nav.brio": "Brio",
   "brio.sure": "confident",
   "brio.unsure": "unsure",

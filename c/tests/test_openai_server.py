@@ -19,7 +19,8 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            CONTINUATION_FAMILIES,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
-                           _engine_error, _image_bytes_from_url, cap_for_arch, conversation_cache_slot, model_arch,
+                           _engine_error, _image_bytes_from_url, cap_for_arch,
+                           conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
                            parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
                            read_engine_turn, render_chat, render_chat_for_arch,
@@ -992,6 +993,11 @@ class FakeProcess:
         self.returncode = None
 
     def write(self, data):
+        # `_write_all` (production) hands every write a `memoryview` slice,
+        # first write included -- the fakes below pattern-match frame bytes
+        # (`frame.split()`, equality against a literal), so normalise here
+        # rather than asking each one to know about the view.
+        data = bytes(data)
         self.writes.append(data)
         self.on_write(self, data)
         return len(data)
@@ -1471,6 +1477,101 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(output, ["x"])
         self.assertEqual(stats["completion_tokens"], 1)
         self.assertEqual(process.writes[-1].split(), [b"STOP", request_id])
+
+
+def _capture_frames(body, path="/v1/completions"):
+    """Sends `body` to `path` against a FakeProcess-backed Engine/APIServer
+    and returns (status, parsed_response, frames_written_to_the_engine).
+    Shared by the test classes below so the harness lives in one place.
+    """
+    frames = []
+
+    def respond(process, frame):
+        frames.append(frame)
+        rid = frame.split()[1]
+        process.stdout.feed(b"DATA " + rid + b" 5\nHello\n")
+        process.stdout.feed(b"DONE " + rid + b" STAT 1 2.5 0 1.0 4 0\n")
+
+    process = FakeProcess(respond)
+    with patch("openai_server.subprocess.Popen", return_value=process):
+        engine = Engine("glm", "model")
+    server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", 16)
+    thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
+    thread.start()
+    try:
+        data = json.dumps(body).encode()
+        headers = {"Authorization": "Bearer secret", "Content-Type": "application/json"}
+        request = Request(f"http://127.0.0.1:{server.server_port}{path}",
+                          data=data, headers=headers)
+        with urlopen(request, timeout=2) as response:
+            status = response.status
+            parsed = json.load(response)
+    finally:
+        server.scheduler.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        engine.close()
+    return status, parsed, frames
+
+
+class BaseWireContractTest(unittest.TestCase):
+    """Pins the SUBMIT frame written for a request that uses none of the
+    optional fields; any change here is a wire-format change and must be
+    deliberate.
+    """
+
+    def test_no_new_fields_request_emits_the_base_submit_header(self):
+        _, _, frames = _capture_frames(
+            {"model": "test-model", "prompt": "Complete me", "temperature": 0, "max_tokens": 4})
+        self.assertEqual(frames, [b"SUBMIT 1 0 11 4 0 0.9\nComplete me\n"])
+
+
+class SeedOptionTest(unittest.TestCase):
+    """`generation_options()` accepts a `seed` field without raising."""
+
+    def test_seed_is_accepted_by_generation_options(self):
+        generation_options({"seed": 1234, "prompt": "hi"}, 16)   # must not raise
+
+
+class SeedWireFrameTest(unittest.TestCase):
+    """`seed` is accepted and ignored. A stub-response equality check alone
+    is vacuous here (the scripted `respond` closure inside `_capture_frames`
+    always returns the same canned text regardless of any request field) --
+    the real proof is that the byte-exact SUBMIT frames the dispatcher
+    writes to the engine process (see DispatcherTest above) never carry the
+    seed value at all, seeded or not.
+    """
+
+    def test_seed_accepted_and_absent_from_submit_frame(self):
+        base = {"model": "test-model", "prompt": "Complete me", "temperature": 0, "max_tokens": 4}
+        status_plain, body_plain, frames_plain = _capture_frames(base)
+        status_seeded, body_seeded, frames_seeded = _capture_frames({**base, "seed": 1234})
+        self.assertEqual(status_plain, 200)
+        self.assertEqual(status_seeded, 200)
+        self.assertEqual(body_seeded["choices"][0], body_plain["choices"][0])
+        # Each call uses a freshly-constructed Engine, so both first requests are
+        # assigned request id "1" -- the wire frames are directly byte-comparable,
+        # no field needs normalizing. Comparing the whole frame list (not just
+        # the first frame) closes "reaches no wire frame" literally: if `seed`
+        # ever leaked onto any frame, this equality would break.
+        self.assertEqual(frames_seeded, frames_plain)
+
+    def test_seed_accepted_and_absent_from_chat_submit_frame(self):
+        # Same proof as above, on /v1/chat/completions: generation_options()
+        # is shared by both endpoints, but the SUBMIT frame is built from
+        # the chat-rendered prompt, so this is not implied by the completions
+        # case above -- a divergence between the two call sites would only
+        # show up here.
+        base = {"model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+                "temperature": 0, "max_tokens": 4}
+        status_plain, body_plain, frames_plain = _capture_frames(base, path="/v1/chat/completions")
+        status_seeded, body_seeded, frames_seeded = _capture_frames(
+            {**base, "seed": 1234}, path="/v1/chat/completions")
+        self.assertEqual(status_plain, 200)
+        self.assertEqual(status_seeded, 200)
+        self.assertEqual(body_seeded["choices"][0], body_plain["choices"][0])
+        self.assertEqual(frames_seeded, frames_plain)
 
 
 class CapSentinelShimTest(unittest.TestCase):
@@ -3650,6 +3751,476 @@ class ContextExceededMessageTest(unittest.TestCase):
         from openai_server import _engine_error
         text = str(_engine_error(["CONTEXT_EXCEEDED"], "ignored"))
         self.assertIn("the context", text)
+
+
+class _ShortWritingStream:
+    """A fake stdin that hands back at most `chunk` bytes per write() call,
+    forcing `_write_all` to loop -- the production pipe does this on a
+    signal landing mid-write or a full pipe buffer on a large IMAGE frame."""
+
+    def __init__(self, chunk=3):
+        self.chunk = chunk
+        self.received = bytearray()
+
+    def write(self, data):
+        piece = bytes(data)[:self.chunk]
+        self.received.extend(piece)
+        return len(piece)
+
+
+class _ScriptedStream:
+    """A fake stdin whose write() answers each entry in `script` in turn --
+    an int number of bytes actually taken, or `None` for "took nothing" --
+    then takes everything it is offered once the script runs out."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.received = bytearray()
+        self.calls = []
+
+    def write(self, data):
+        data = bytes(data)
+        self.calls.append(data)
+        answer = self.script.pop(0) if self.script else len(data)
+        if answer is None:
+            return None
+        taken = data[:answer]
+        self.received.extend(taken)
+        return len(taken)
+
+
+class _CountingLock:
+    """A `threading.Lock`-alike that counts `with` acquisitions -- used to
+    pin that IMAGE and SUBMIT share exactly one `write_lock` acquisition."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.acquisitions = 0
+
+    def __enter__(self):
+        self.acquisitions += 1
+        return self._lock.__enter__()
+
+    def __exit__(self, *exc_info):
+        return self._lock.__exit__(*exc_info)
+
+
+class WriteAllTest(unittest.TestCase):
+    """`_write_all` (extracted from the inline server->engine stdin writes):
+    loop on a short write until the whole frame is sent, and fail closed --
+    never spin -- on the two shapes that are not progress.
+
+    `_write_all` is imported locally in each test method here, not at module
+    scope: it does not exist on base, and a module-level import of it would
+    make this whole test file fail to collect when overlaid on base product
+    code (the procedure the base-pin tests below rely on)."""
+
+    def test_short_writes_reassemble_to_the_full_frame(self):
+        from openai_server import _write_all
+        stream = _ShortWritingStream(chunk=3)
+        frame = b"SUBMIT 1 0 5 3 0.25 0.9\nHello\n"
+        _write_all(stream, frame, "SUBMIT")
+        self.assertEqual(bytes(stream.received), frame)
+
+    def test_a_short_first_write_still_receives_the_correct_remainder(self):
+        from openai_server import _write_all
+        # The first call must not be special-cased to the unsliced buffer:
+        # every call, including the first, offers a memoryview starting at
+        # the bytes not yet sent.
+        stream = _ScriptedStream([2])
+        _write_all(stream, b"CANCEL 42\n", "CANCEL")
+        self.assertEqual(bytes(stream.received), b"CANCEL 42\n")
+        self.assertEqual(len(stream.calls), 2)   # the short first write forced a second
+
+    def test_none_return_fails_closed_instead_of_spinning(self):
+        from openai_server import _write_all
+        stream = _ScriptedStream([None])
+        with self.assertRaisesRegex(RuntimeError, "failed to write SUBMIT to the engine"):
+            _write_all(stream, b"SUBMIT 1 0 1 1 1 1\nx\n", "SUBMIT")
+
+    def test_zero_return_fails_closed_instead_of_spinning(self):
+        from openai_server import _write_all
+        stream = _ScriptedStream([0])
+        with self.assertRaisesRegex(RuntimeError, "failed to write STOP to the engine"):
+            _write_all(stream, b"STOP 1\n", "STOP")
+
+
+class WriteFailureHTTPTest(unittest.TestCase):
+    """A checked engine-stdin write that fails must reach the client as the
+    named 500 engine_error while the response is still uncommitted, and must
+    never splice anything into a stream that has already committed -- it
+    just ends (#597 item 3's `_fail`, exercised here by a genuine broken
+    pipe on the engine's stdin, through the real `Engine`, rather than by a
+    fake that raises `RuntimeError` directly -- a real `BrokenPipeError` is
+    a `ConnectionError`, and it is exactly that unwrapped subclass that a
+    correct checked write must keep away from do_POST's client-hangup
+    handler)."""
+
+    def _serve(self, process):
+        with patch("openai_server.ARCH", "glm"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        server = APIServer(("127.0.0.1", 0), engine, "test-model", None, 16, kv_slots=1)
+        # A short poll_interval means server.shutdown() (addCleanup, below)
+        # returns almost immediately instead of paying up to the default
+        # 0.5s poll -- these tests do no waiting of their own, so that 0.5s
+        # would be pure teardown overhead, not a wait under test.
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        self.addCleanup(engine.close)
+        return server
+
+    def _raw_post(self, server, path, body):
+        """POST over a plain socket and read until the peer closes, so the
+        literal status line(s) on the wire are visible -- `urlopen` strips
+        the status line into `response.status` before handing back `.read()`,
+        so asserting on `.read()` alone cannot tell "one status line" from
+        "a second one spliced into the body"."""
+        payload = json.dumps(body).encode()
+        request = (f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                  f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+                  f"Connection: close\r\n\r\n").encode() + payload
+        sock = socket.create_connection(("127.0.0.1", server.server_port), 2)
+        sock.sendall(request)
+        sock.settimeout(2)
+        chunks = []
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except socket.timeout:
+            pass
+        sock.close()
+        return b"".join(chunks)
+
+    def test_dead_engine_submit_is_a_named_500_engine_error_not_silence(self):
+        def respond(process, frame):
+            if frame.split()[0] == b"SUBMIT":
+                raise BrokenPipeError("broken pipe")
+
+        server = self._serve(FakeProcess(respond))
+        body = json.dumps({"model": "test-model", "prompt": "hi"}).encode()
+        request = Request(f"http://127.0.0.1:{server.server_port}/v1/completions",
+                          data=body, headers={"Content-Type": "application/json"})
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(request, timeout=2)
+        self.assertEqual(caught.exception.code, 500)
+        payload = json.load(caught.exception)
+        self.assertEqual(payload["error"]["code"], "engine_error")
+
+    def test_dead_engine_submit_is_a_named_500_on_the_chat_streaming_path(self):
+        # Same failure, but through /v1/chat/completions with stream: true --
+        # the tool-sideband/ThinkingStreamSplit wrapping chat streaming builds
+        # around engine.generate() must not swallow or reshape a RuntimeError
+        # that fires before anything is committed (nothing here ever reaches
+        # that wrapping: the SUBMIT write fails before the first ACCEPT/DATA).
+        def respond(process, frame):
+            if frame.split()[0] == b"SUBMIT":
+                raise BrokenPipeError("broken pipe")
+
+        server = self._serve(FakeProcess(respond))
+        body = json.dumps({"model": "test-model", "stream": True,
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+        request = Request(f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+                          data=body, headers={"Content-Type": "application/json"})
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(request, timeout=2)
+        self.assertEqual(caught.exception.code, 500)
+        payload = json.load(caught.exception)
+        self.assertEqual(payload["error"]["code"], "engine_error")
+
+    def test_uncommitted_stop_write_failure_is_a_named_500_engine_error(self):
+        # The dead-SUBMIT tests above cover the write _write_frame never gets
+        # a chance to make (the connection is refused before the first
+        # request even lands). This is the case _write_frame's own docstring
+        # is actually about: a CANCEL/STOP write that fails while the
+        # response is still uncommitted -- non-streaming, so nothing commits
+        # until the whole answer is assembled, and the STOP write happens
+        # well before that.
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 3\nhi \n")
+                process.stdout.feed(b"DATA " + request_id + b" 4\nSTOP\n")
+            elif fields[0] == b"STOP":
+                raise BrokenPipeError("broken pipe")
+
+        server = self._serve(FakeProcess(respond))
+        body = json.dumps({"model": "test-model", "prompt": "hi",
+                           "stop": "STOP"}).encode()
+        request = Request(f"http://127.0.0.1:{server.server_port}/v1/completions",
+                          data=body, headers={"Content-Type": "application/json"})
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(request, timeout=2)
+        self.assertEqual(caught.exception.code, 500)
+        payload = json.load(caught.exception)
+        self.assertEqual(payload["error"]["code"], "engine_error")
+
+    def test_write_failure_reaching_the_committed_stream_ends_it_cleanly(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                # "hi " clears StopFilter's hold and reaches the client; the
+                # stop sequence itself never does -- feeding them as two
+                # frames pins the STOP write to the SECOND one, after the
+                # stream has already committed on the first.
+                process.stdout.feed(b"DATA " + request_id + b" 3\nhi \n")
+                process.stdout.feed(b"DATA " + request_id + b" 4\nSTOP\n")
+            elif fields[0] == b"STOP":
+                raise BrokenPipeError("broken pipe")
+
+        server = self._serve(FakeProcess(respond))
+        raw = self._raw_post(server, "/v1/completions",
+                             {"model": "test-model", "prompt": "hi", "stream": True,
+                              "stop": "STOP"})
+        # Exactly one status line on the whole wire -- the original 200. A
+        # response that spliced a second status line (or any framed error)
+        # into the already-committed SSE body would show up here as 2.
+        self.assertEqual(raw.count(b"HTTP/1.1"), 1)
+        self.assertIn(b"200", raw.split(b"\r\n", 1)[0])
+        # The committed token reached the client...
+        self.assertIn(b'"hi "', raw)
+        # ...and nothing else did: no error object, no terminal [DONE]
+        # (generate() never returned normally).
+        self.assertNotIn(b"engine_error", raw)
+        self.assertNotIn(b"data: [DONE]", raw)
+
+
+class PendingMapCleanupTest(unittest.TestCase):
+    """The pending-map entry is dropped on every failed engine write --
+    SUBMIT, IMAGE, CANCEL or STOP -- including one forced by a checked
+    CANCEL/STOP write that fails closed with no `OSError` (a `None`/zero
+    return). A write that never reached the engine gets no DONE/ERROR back,
+    so nothing else would ever clear the slot; without this it sits behind
+    for `close()`/`_fail_pending` to find stale.
+
+    This is narrower than "every exit": a raise from inside a decode
+    callback (`on_text`/`on_accept`/`on_tool`/`on_echo`), or the duplicate-
+    ACCEPT guard, still leaves the entry behind, as on `dev`; that is not
+    changed here."""
+
+    def test_a_failed_cancel_write_does_not_leave_the_pending_entry_behind(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+            elif fields[0] == b"CANCEL":
+                raise BrokenPipeError("broken pipe")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "failed to write CANCEL to the engine"):
+            engine.generate("hello", 8, 0.7, 0.9, lambda _: None, cancelled=lambda: True)
+        with engine.pending_lock:
+            self.assertEqual(engine.pending, {})
+        engine.close()
+
+    def test_a_failed_stop_write_does_not_leave_the_pending_entry_behind(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+            elif fields[0] == b"STOP":
+                raise BrokenPipeError("broken pipe")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        output = []
+        with self.assertRaisesRegex(RuntimeError, "failed to write STOP to the engine"):
+            engine.generate("hello", 8, 0.7, 0.9, output.append,
+                            stopped=lambda: output == ["x"])
+        with engine.pending_lock:
+            self.assertEqual(engine.pending, {})
+        engine.close()
+
+    def test_a_cancel_write_that_takes_no_bytes_still_drops_the_pending_entry(self):
+        # Not an OSError: the pipe accepts the call and answers 0, the same
+        # "took nothing" shape _write_all treats as a fail-closed write. If
+        # _write_frame's cleanup only ran for OSError, this entry would
+        # survive -- the pop has to be keyed on failure of the write, not on
+        # which failure shape it took.
+        class ZeroOnCancelProcess(FakeProcess):
+            def write(self, data):
+                text = bytes(data)
+                fields = text.split()
+                if fields[:1] == [b"CANCEL"]:
+                    self.writes.append(text)
+                    # Base ignores write()'s return value entirely, so a bare
+                    # `return 0` here would leave base's generate() waiting
+                    # forever for an ERROR/DONE it never actually asked for
+                    # (the CANCEL it believes it sent never reached the
+                    # engine) -- a hang, not a failure, on the base-overlay
+                    # procedure. Feeding the terminal frame here means base
+                    # fails in seconds instead; at head the RuntimeError from
+                    # the zero-byte write fires first, so this frame arrives
+                    # after the pending entry is already gone and is a no-op.
+                    self.stdout.feed(b"ERROR " + fields[1] + b" CANCELLED\n")
+                    return 0
+                return super().write(data)
+
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+
+        process = ZeroOnCancelProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "failed to write CANCEL to the engine"):
+            engine.generate("hello", 8, 0.7, 0.9, lambda _: None, cancelled=lambda: True)
+        with engine.pending_lock:
+            self.assertEqual(engine.pending, {})
+        engine.close()
+
+    def test_a_failed_image_write_names_the_image_frame_and_drops_the_pending_entry(self):
+        # generate()'s outer handler wraps both the IMAGE and the SUBMIT
+        # write with one except OSError -- an OSError on the IMAGE write
+        # specifically must still name "IMAGE", not fall through to the
+        # handler's own default "SUBMIT" label, or one frame kind would
+        # report under two different names depending on failure shape
+        # (_write_all's own None/zero path already says "IMAGE"; an OSError
+        # is the likelier real failure and must match).
+        class BrokenPipeOnImageProcess(FakeProcess):
+            def write(self, data):
+                if bytes(data).split()[:1] == [b"IMAGE"]:
+                    raise BrokenPipeError("broken pipe")
+                return super().write(data)
+
+        process = BrokenPipeOnImageProcess(lambda _process, _frame: None)
+        with patch("openai_server.ARCH", "glm53"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm53", "model")
+
+        class FakePatches:
+            def tobytes(self):
+                return bytes(range(8))
+
+        with self.assertRaisesRegex(RuntimeError, "failed to write IMAGE to the engine"):
+            engine.generate("hello", 8, 0.7, 0.9, lambda _: None, image=(FakePatches(), 2, 2))
+        with engine.pending_lock:
+            self.assertEqual(engine.pending, {})
+        engine.close()
+
+
+class PlainRequestFrameOrderTest(unittest.TestCase):
+    """A request using none of the checked-write machinery's new surface
+    (no image, no grammar, no logprobs, no pin) must still put byte-identical
+    SUBMIT/STOP and SUBMIT/CANCEL frames on the wire, in the same order, as
+    the base module -- literals captured by running the base module's own
+    Engine.generate() against this same FakeProcess harness."""
+
+    def test_stop_flow_matches_base(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+            elif fields[0] == b"STOP":
+                process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 1 2 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "glm"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        output = []
+        engine.generate("hello", 8, 0.7, 0.9, output.append,
+                        stopped=lambda: output == ["x"])
+        engine.close()
+        self.assertEqual(process.writes, [b"SUBMIT 1 0 5 8 0.7 0.9\nhello\n", b"STOP 1\n"])
+
+    def test_cancel_flow_matches_base(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+            elif fields[0] == b"CANCEL":
+                process.stdout.feed(b"ERROR " + request_id + b" CANCELLED\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "glm"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        disconnected = False
+
+        def sink(text):
+            nonlocal disconnected
+            disconnected = True
+
+        with self.assertRaises(ClientCancelled):
+            engine.generate("hello", 8, 0.7, 0.9, sink, cancelled=lambda: disconnected)
+        engine.close()
+        self.assertEqual(process.writes, [b"SUBMIT 1 0 5 8 0.7 0.9\nhello\n", b"CANCEL 1\n"])
+
+    def test_image_and_submit_frames_match_base_under_one_lock_acquisition(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+                process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 1 2 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "glm53"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm53", "model")
+        counting_lock = _CountingLock()
+        engine.write_lock = counting_lock
+
+        blob = bytes(range(12))
+
+        class FakePatches:
+            def tobytes(self):
+                return blob
+
+        output = []
+        engine.generate("hello", 8, 0.7, 0.9, output.append, image=(FakePatches(), 2, 2))
+        engine.close()
+        self.assertEqual(process.writes, [
+            b"IMAGE 1 12 2 2\n" + blob + b"\n",
+            b"SUBMIT 1 0 5 8 0.7 0.9\nhello\n",
+        ])
+        # IMAGE must reach the wire before SUBMIT, and both under the SAME
+        # lock acquisition -- another request's IMAGE could otherwise land
+        # between this one's IMAGE and its SUBMIT.
+        self.assertEqual(counting_lock.acquisitions, 1)
 
 
 if __name__ == "__main__":
