@@ -6399,6 +6399,84 @@ class DispatcherLogprobTailTest(unittest.TestCase):
         self.assertIn("STOP", str(raised).upper() + (raised.message.upper()
                                                      if isinstance(raised, APIError) else ""))
 
+    def test_a_failed_fault_stop_write_by_zero_progress_answers_by_name_and_keeps_the_connection(self):
+        # The sibling test above fails the STOP write with a BrokenPipeError
+        # -- an OSError, which is exactly the shape the pre-#1721 inline form
+        # this branch replaced already caught (`except OSError`). #1721's
+        # checked writer (`_write_all`) treats a write that returns 0 -- the
+        # pipe accepts the call, takes nothing, and raises no exception at
+        # all -- as failing the same way (a fail-closed RuntimeError, per
+        # `WriteAllTest.test_zero_return_fails_closed_instead_of_spinning`).
+        # The raw inline form has no such check: it discards write()'s
+        # return value, so it does not see this shape as a failure at all.
+        # `stop_sent` is set, the branch never fires again, and nothing else
+        # is left to solicit a terminal frame for this turn -- the request
+        # hangs until the engine (or, here, `close()`'s `_fail_pending`)
+        # ends it. That regression -- a named 500 `engine_error` at the head
+        # (do_POST's generic `except Exception` names any uncaught failure
+        # this way, #597 item 3) becoming a silent hang on the raw form -- is
+        # deep audit S1 (AUDIT_S3_devmerge_5a071274.md), and this pins it.
+        # Reuses the sibling's fixture, request shape and assertions; only
+        # the write failure's shape changes.
+        class ZeroOnStop:
+            """The engine's stdin: accepts the SUBMIT, takes 0 bytes on the STOP."""
+            def __init__(self, process):
+                self.process = process
+
+            def write(self, data):
+                # Same memoryview normalisation the sibling's DeadOnStop and
+                # FakeProcess.write both do.
+                data = bytes(data)
+                if data.startswith(b"STOP"):
+                    return 0
+                return self.process.real_write(data)
+
+            def flush(self):
+                pass
+
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2 -0.5 1 3\nok\n")
+
+        engine, process = self._engine(respond)
+        process.real_write = process.write
+        process.stdin = ZeroOnStop(process)
+        result = {}
+
+        def run():
+            try:
+                engine.generate("hi", 4, 0.25, 0.9, [].append, logprobs=1,
+                                gbytes_before_ext=True)
+            except Exception as error:               # recorded, asserted below
+                result["error"] = error
+
+        # Wait under test: at the head, the idle poll (0.05s) finds the
+        # recorded fault and the zero-progress STOP write answers within a
+        # tick or two -- well under the 0.3s per-test budget. Under the
+        # reverted (pre-#1721 inline) form there is nothing left to end the
+        # turn, so this call would hang indefinitely; running it on a daemon
+        # thread and bounding the join is what turns that hang into a
+        # prompt, visible test failure instead of stalling the suite.
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive(),
+                         "the fault-STOP write must answer, not hang")
+        # The turn is over and nothing will ever answer it: the entry must not be
+        # left for the dispatcher to deliver to a caller that has already unwound,
+        # nor to hold a request id the next turn could be given.
+        self.assertNotIn("1", engine.pending)
+        self.assertEqual(engine.pending, {})
+        # Named, and reaching the caller: an unraised write error would instead
+        # leave the request thread blocked with no answer at all.
+        self.assertIn("error", result, "the failed STOP write must answer, not hang")
+        raised = result["error"]
+        self.assertNotIsInstance(raised, BrokenPipeError)
+        named = raised.code if isinstance(raised, APIError) else str(raised)
+        self.assertTrue(named, "the failed STOP write must be reported by name")
+        self.assertIn("STOP", str(raised).upper() + (raised.message.upper()
+                                                     if isinstance(raised, APIError) else ""))
+
     def test_the_malformed_tail_battery(self):
         # A required field absent or non-numeric, a k outside the engine's interface, or a
         # negative token id. Every one of them is a missing or unreadable field, never a
