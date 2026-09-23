@@ -1016,6 +1016,12 @@ extern void (*coli_v4_test_expert_wait_hook)(ColiExpertKey key);
 extern uint64_t coli_v4_test_fp4_batch_calls;
 extern uint64_t coli_v4_test_expert_victim_probes;
 int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key);
+void coli_v4_test_reset_direct_io_stats(void);
+uint64_t coli_v4_test_direct_reads(void);
+uint64_t coli_v4_test_direct_fallbacks(void);
+/* Point missing O_DIRECT twins at a dup of the buffered fd so tests can
+ * exercise the direct-window path on filesystems that refuse O_DIRECT. */
+int coli_v4_test_force_streaming_direct(ColiExpertStore *store);
 
 ColiV4Session *coli_v4_test_session_bare_create(ColiV4Engine *engine);
 void coli_v4_test_session_bare_destroy(ColiV4Session *session);

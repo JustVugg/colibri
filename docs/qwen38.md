@@ -3,9 +3,9 @@
 `c/qwen38.c` runs the language model in
 [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)
 directly from the official safetensors shards. No conversion or second copy of
-the weights is required. This contribution is deliberately **text-only**:
-Colibri does not load or advertise the checkpoint's vision encoder, and it does
-not use the optional MTP layer.
+the weights is required. The engine supports text and images through the
+checkpoint's vision encoder; see **Vision** below. It does not use the optional
+MTP layer.
 
 The upstream language model has 125B ordinary parameters with 6B activated,
 plus a 51B hashed n-gram embedding. It has 48 layers arranged as 12 repetitions
@@ -27,7 +27,7 @@ make -C c qwen38
 COLI_MODEL=~/Models/Qwen3.8-Flash-Next-FP8 ./c/coli chat
 ```
 
-`coli serve` and `coli web` use the same text-only gateway path. Qwen3.8 thinks
+`coli serve` and `coli web` use the same gateway path. Qwen3.8 thinks
 by default; `reasoning_effort` accepts `low`, `medium`, `high`, and `xhigh`, and
 `enable_thinking: false` emits the model's official empty thinking prefix.
 Audio and grammar constraints are rejected explicitly. Images are supported;
@@ -66,7 +66,6 @@ are FP32; BF16 matrices use FP32 accumulation, while native FP8 uses FP32 dot
 products within each 128-column block and FP64 accumulation across the scaled
 blocks. The bounded per-layer cache therefore spends about one quarter of the
 previous memory per FP8 expert. Context state grows by about 54 KiB per token.
-There is currently no Qwen3.8 GPU backend.
 
 ## What stays on disk
 
@@ -437,12 +436,9 @@ checkpoint. They are not redistributed by Colibri.
 
 The released checkpoint is multimodal and the engine already reads its
 `model.language_model` prefix, so the vision tensors are present and reachable.
-The tower itself is not implemented yet; images are still refused rather than
-silently dropped.
-
-What exists today is the half that decides whether vision is *correct* rather
-than nearly correct: `tools/qwen38_image.py`, pinned against the official
-`Qwen2VLImageProcessor` in `tests/test_qwen38_image.py`.
+The tower and gateway image path are implemented; their checks are described
+below. Image preprocessing is checked with `tools/qwen38_image.py`, pinned
+against the official `Qwen2VLImageProcessor` in `tests/test_qwen38_image.py`.
 
 ```
 python3 tests/test_qwen38_image.py --config <model>/preprocessor_config.json

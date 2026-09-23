@@ -32,9 +32,9 @@ import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re,
 # and the console provides its own editing; on FreeBSD Python links libedit,
 # which this activates the same way.
 try:
-    import readline  # noqa: F401 — importing it is the activation
+    import readline
 except ImportError:
-    pass
+    readline = None
 
 # The engine mmaps every shard (144+ files); macOS default RLIMIT_NOFILE is 256.
 if sys.platform != "win32":
@@ -53,7 +53,10 @@ if sys.platform == "win32":
         try: s.reconfigure(encoding="utf-8")
         except (AttributeError, OSError): pass
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# realpath, not abspath: on a merged-/usr system /bin and /sbin are symlinks
+# to /usr/bin, and an installed launcher invoked as /bin/coli would otherwise
+# derive /libexec/colibri instead of /usr/libexec/colibri (#1689).
+HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
 # version.py sits next to this script in a source checkout, but an installed
 # layout puts the launcher in $(PREFIX)/bin while the support modules live in
@@ -492,7 +495,7 @@ def env_for_engine(a, arch, plan=None):
     # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
     # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
     # user's session ran itself out of memory with the flag apparently set.
-    if arch in ("deepseek_v4", "kimi", "glm53", "olmoe"):
+    if arch in ("deepseek_v4", "deepseek_v41", "kimi", "glm53", "olmoe"):
         if a.ram: env["RAM_GB"] = str(a.ram)
     if arch == "glm53":
         # I densi vanno a int4 di default: sono 9,7 B parametri su 321, e in
@@ -1192,7 +1195,7 @@ def cmd_info(a):
         try: n_shards=len([x for x in os.listdir(a.model) if x.endswith('.safetensors')])
         except OSError: n_shards=0
         print(f"   {C.yel}config.json is missing{C.r}: coli picks the engine from it, so nothing can run here yet.")
-        print(f"   Copy the checkpoint's config.json (with tokenizer.json and model.safetensors.index.json)")
+        print("   Copy the checkpoint's config.json (with tokenizer.json and model.safetensors.index.json)")
         print(f"   from the model repo next to the {n_shards} shard(s) found here, then run coli info again.")
     try:
         mi=open('/proc/meminfo').read()
@@ -1512,9 +1515,7 @@ def chat_commands_help():
 
 def install_chat_completer():
     """TAB completa i comandi. Senza readline (Windows) si perde solo il TAB."""
-    try:
-        import readline
-    except ImportError:
+    if readline is None:
         return
     names = [p + n for n in CHAT_COMMANDS for p in ("/", ":")]
     def complete(text, state):

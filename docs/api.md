@@ -32,7 +32,37 @@ prompt leaves less room than the budget asks for, every engine clamps the
 budget to what the context holds and the reply ends with `finish_reason:
 "length"`; only a prompt that does not fit is refused, with
 `context_length_exceeded` (#260, #1641). Stop sequences are removed from the response and end
-generation early in both JSON and streaming modes. The extension
+generation early in both JSON and streaming modes.
+
+A trailing `assistant` message *continues* that turn instead of starting a new
+one: the prompt ends inside it, which is the official template rendered with
+`add_generation_prompt=False`. This is on by default — a message list ending in a
+non-empty `assistant` turn continues, the same contract as Anthropic's API — and
+there is no request field for it, because a trailing assistant turn already says
+"continue me" and a body extension would only be reachable by hand-written JSON
+rather than from the clients that want it. The server-side switch
+`COLI_CONTINUE_ASSISTANT=0` restores the old behaviour (fold the turn into a
+completed one and append a fresh cue). Continuation is refused together with
+`tools`/`tool_calls`, because the tool-call parsers read an assistant turn from
+its start, and the turn must carry text not ending in whitespace: the template
+strips trailing whitespace, so the model would resume from different bytes than
+the ones sent. A family whose renderer has no open-turn shape yet falls through
+to the old behaviour rather than erroring — though every shipped family supports
+continuation today, Kimi K3 included (its open turn is framed engine-side, in
+`kimi_k3.c`, not derived in the gateway renderer).
+
+A continuation resumes from the exact bytes you send, which makes the split
+point part of the prompt. Splitting mid-word puts the model at a token boundary
+it would not have produced itself, and the first generated token is conditioned
+on that split: measured on GLM-5.3-Flash, `The capital of France is Par`
+completes to `París`, not `Paris` — deterministically, across every effort level
+and both endpoints. The continuation is real (the model finished the partial
+word rather than restarting, which is the behaviour this feature exists for);
+the spelling is an artefact of where the split fell. This is inherent to
+resuming from an arbitrary byte offset rather than specific to this engine, and
+it is the same hazard as the trailing whitespace above — in the one form that
+cannot be refused, because splitting mid-word is sometimes exactly what the
+caller wants. Split at a token-ish boundary when the spelling matters. The extension
 `x_colibri_ignore_leading_stop: true` discards leading stop sequences until
 the first non-whitespace response content, which is useful for local templates
 that occasionally emit a role marker before the answer; strict OpenAI stop
@@ -95,9 +125,76 @@ admission queue instead of pretending to run unsafe parallel sequences.
 Configure it with `--max-queue N` (default 8) and `--queue-timeout SECONDS`
 (default 300), or the `COLI_MAX_QUEUE` / `COLI_QUEUE_TIMEOUT` environment
 variables. Saturated and timed-out requests receive OpenAI-shaped HTTP 429
-errors before streaming headers are sent. `GET /health` exposes
+errors before streaming headers are sent. With `--max-queue 0`, a request
+pinned to an occupied KV slot is rejected immediately even if another slot
+is free. Queue deadlines are checked before slot assignment: an expired
+waiter receives `queue_timeout` even if a slot is now available. `GET /health` exposes
 active/queued/completed/rejected counters, and successful generation responses
 include `x-colibri-queue-wait-ms`.
+Requests targeting any slot may use a free slot not reserved by earlier waiters.
+An earlier pinned request keeps priority for its target; an earlier any-slot
+request keeps priority across all slots. A full waiting queue does not reject
+a request that can immediately take an unreserved free slot; the queue limit
+bounds waiting requests, independently of active capacity.
+
+## Prometheus metrics
+
+`GET /metrics` returns Prometheus text exposition (version 0.0.4). When an
+API key is configured, supply the same `Authorization: Bearer ...` or
+`x-api-key` header used for generation; missing or invalid credentials return
+401. Without an API key, the endpoint follows the server's usual unauthenticated
+access policy. Metrics contain no prompts, model paths, or request-ID labels.
+
+All names start with `colibri_scheduler_`:
+
+| Suffix | Type | Meaning |
+|---|---|---|
+| `active`, `queued`, `capacity`, `max_queue` | gauge | Admitted requests, waiters, KV slot capacity, and queue limit |
+| `admitted_total` | counter | Requests admitted to a KV slot |
+| `completed_total` | counter | Admitted requests that returned normally |
+| `failed_total` | counter | Admitted requests that raised an error, excluding `ClientCancelled` |
+| `rejected_total`, `timed_out_total` | counter | Queue-full refusals and queue timeouts |
+| `cancelled_total` | counter | Cancellations detected before admission or during admitted work |
+| `queue_wait_seconds` | histogram | Wait until admission, for admitted requests only |
+| `slot_duration_seconds` | histogram | Slot occupancy until completion, failure, or cancellation |
+| `first_output_seconds` | histogram | Engine-call start to first nonempty text or tool-output callback |
+| `engine_call_seconds` | histogram | Duration of each finished engine generation call, including failure/cancellation |
+
+Histogram buckets are 0.001, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 300 seconds,
+and `+Inf`; each histogram exposes `_bucket`, `_sum`, and `_count`.
+Counters reset when the gateway restarts. Collection does not call the engine
+or consume a generation slot. `failed` is also included in `/health`'s
+authenticated scheduler snapshot; failures no longer increment `completed`.
+
+Cancellation is checked before acquiring an available KV slot, including when a
+waiting request wakes as capacity becomes free. A request cancelled at this
+point increments `cancelled_total`, but not `admitted_total`, and contributes
+no admission-wait or slot-duration sample. Queue-full and scheduler-closed
+checks can still reject a request before the cancellation check is reached.
+
+
+The engine-call histograms exclude admission queue wait and prompt rendering.
+First output is observed before the gateway's stop filtering, reasoning split,
+or HTTP serialization: it can be reasoning or tool data, not necessarily
+user-visible answer text. Empty callbacks, ACCEPT frames, and SSE keepalives do
+not count. Calls that finish or fail without output add no first-output sample;
+a failure after output retains that sample. Engine-call duration includes callback
+processing and response writes during generation. One request can invoke the
+engine multiple times (for example Brio scoring), so these histogram counts are
+engine calls, not HTTP request counts.
+
+These are gateway observations, not end-to-end client TTFT, per-token latency,
+or GPU kernel measurements. Output callbacks need not correspond one-to-one to
+tokens. Slot occupancy includes any response handling while the slot is held. Validation/authentication failures before admission are not counted.
+`completed` means the admitted handler returned normally, not that the client
+received every response byte. Request exceptions can include client input or
+transport errors as well as engine failures.
+
+Example PromQL for the admitted-request queue-wait p95:
+
+```promql
+histogram_quantile(0.95, sum by (le) (rate(colibri_scheduler_queue_wait_seconds_bucket[5m])))
+```
 
 ## Anthropic-protocol endpoint (`/v1/messages`)
 
@@ -138,10 +235,18 @@ tool declarations and choices explicitly instead of feeding another
 architecture's markers to an incompatible tokenizer.
 
 Not supported, and refused explicitly rather than ignored: `stop_sequences`,
-`top_k`, and non-text content blocks (images, documents). Errors use Anthropic's
-own `{"type":"error","error":{...}}` envelope on this path. Architecture-local
+`top_k`, and non-text content blocks (images, documents). Errors use Anthropic's own
+`{"type":"error","error":{...}}` envelope on this path. Architecture-local
 features that have not been wired to this protocol are likewise rejected with
 an explicit error.
+
+A trailing `assistant` message continues that turn by default on both the
+Anthropic- and OpenAI-compatible endpoints (`COLI_CONTINUE_ASSISTANT=0` restores
+the old behavior, where this endpoint appended a fresh cue). Note this changes
+what an existing Anthropic client sees on `/v1/messages`: a trailing assistant
+turn now continues rather than starting fresh — which is the real Anthropic
+contract — and the off-switch is the escape hatch for anyone relying on the old
+behavior.
 
 > The prefill warning below applies here too, and applies *hardest* to Claude Code:
 > its system prompt and tool catalog are large, and on a disk-streaming CPU path

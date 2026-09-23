@@ -190,7 +190,9 @@ typedef struct {
 
 /* ---------- routed-expert streaming (native MXFP4 from the HF shards) ---- */
 typedef struct { int fd[6]; int64_t off[6]; int contig; } ERef;  /* w1p w1s w2p w2s w3p w3s */
+#ifndef KIMI_K3_NO_MAIN
 static char g_k3_usage[2100];   /* <snap>/.coli_usage, or COLI_USAGE */
+#endif
 typedef struct { int eid; uint8_t *buf, *base; uint64_t used; int pinned; } Slot;
 /* pinned: seeded from .coli_usage at startup and never evicted. The LRU adapts to
  * THIS session; the pin knows the history of every session before it. Capped at
@@ -1613,28 +1615,22 @@ static inline float situf_(float g, float u, float b1, float b2){
 }
 
 #ifdef COLI_CUDA
-/* CUDA apply for one expert, decode only (S==1).
- *
- * Same shape as the Vulkan path below and the CPU expert_apply above -- w1/w3,
- * SiTU-GLU on the host, then w2 down -- but stateless: the routed tier streams,
- * so there is nothing resident to keep a device handle for. Weights ride up
- * with the call.
- *
- * Returns 0 with u untouched on ANY failure, so the caller falls through to the
- * disk+CPU path exactly as it does when Vulkan declines. That is the contract
- * vLLM's MXFP4 backends use too -- FlashInfer/AITER when they can, an emulation
- * path when they cannot -- and it is what makes the fast path safe to attempt
- * unconditionally. */
+/* Keep SiTU-GLU and intermediate activations on the GPU when supported.
+ * Older DLLs lack the optional fused entry point, so retain the three-matmul
+ * path as fallback. Accumulate into u only after a complete expert succeeds. */
 static int cuda_expert_apply(Model *m, const uint8_t *w1p, const uint8_t *w1s,
                              const uint8_t *w2p, const uint8_t *w2s,
                              const uint8_t *w3p, const uint8_t *w3s,
                              const float *z, float wk,
                              float *u, float *gate, float *up, float *hz){
     Cfg *c=&m->c;
-    if(!coli_cuda_matmul_mxfp4(gate,z,w1p,w1s,1,c->latent,c->moe_inter)) return 0;
-    if(!coli_cuda_matmul_mxfp4(up,  z,w3p,w3s,1,c->latent,c->moe_inter)) return 0;
-    for(int i=0;i<c->moe_inter;i++) gate[i]=situf_(gate[i],up[i],c->situ_b1,c->situ_b2);
-    if(!coli_cuda_matmul_mxfp4(hz,gate,w2p,w2s,1,c->moe_inter,c->latent)) return 0;
+    if(!coli_cuda_expert_mxfp4(hz,z,w1p,w1s,w3p,w3s,w2p,w2s,
+                              1,c->latent,c->moe_inter,c->situ_b1,c->situ_b2)) {
+        if(!coli_cuda_matmul_mxfp4(gate,z,w1p,w1s,1,c->latent,c->moe_inter)) return 0;
+        if(!coli_cuda_matmul_mxfp4(up,  z,w3p,w3s,1,c->latent,c->moe_inter)) return 0;
+        for(int i=0;i<c->moe_inter;i++) gate[i]=situf_(gate[i],up[i],c->situ_b1,c->situ_b2);
+        if(!coli_cuda_matmul_mxfp4(hz,gate,w2p,w2s,1,c->moe_inter,c->latent)) return 0;
+    }
     for(int i=0;i<c->latent;i++) u[i]+=wk*hz[i];
     return 1;
 }
@@ -2371,7 +2367,8 @@ static int sample_tok(const float *lo, int V, float temp, float top_p){
  * (K3_THINK=0 opens <response> directly = non-thinking mode). The model then
  * closes think, opens response, and finishes with <|end_of_msg|> (the eos). */
 typedef struct { Tok *T; int *ids; int n, cap;
-                 int sp_open, sp_close, sp_sep, sp_eom; } ChatB;
+                 int sp_open, sp_close, sp_sep, sp_eom;
+                 int cont; } ChatB;   /* cont: the final turn was left open (continuation) */
 static void cb_special(ChatB *b, int id){
     if(b->n>=b->cap){ fprintf(stderr,"chat prompt too long\n"); exit(1); }
     b->ids[b->n++]=id;
@@ -2399,7 +2396,7 @@ static int chat_build(Tok *T, const char *sys, const char *user, int thinking,
                       int *ids, int cap, int *sp){
     ChatB b={T,ids,0,cap,
         chat_special(T,"<|open|>"), chat_special(T,"<|close|>"),
-        chat_special(T,"<|sep|>"),  chat_special(T,"<|end_of_msg|>")};
+        chat_special(T,"<|sep|>"),  chat_special(T,"<|end_of_msg|>"), 0};
     if(b.sp_open<0||b.sp_close<0||b.sp_sep<0||b.sp_eom<0){
         fprintf(stderr,"chat: XTML special tokens not in tokenizer.json\n"); exit(1); }
     sp[0]=b.sp_open; sp[1]=b.sp_close; sp[2]=b.sp_sep; sp[3]=b.sp_eom;
@@ -2476,7 +2473,7 @@ static int chat_build_wire(Tok *T, const char *wire, int nwire, int *thinking,
                            int *ids, int cap, int *sp){
     ChatB b={T,ids,0,cap,
         chat_special(T,"<|open|>"), chat_special(T,"<|close|>"),
-        chat_special(T,"<|sep|>"),  chat_special(T,"<|end_of_msg|>")};
+        chat_special(T,"<|sep|>"),  chat_special(T,"<|end_of_msg|>"), 0};
     /* -2, not -1: the caller must be able to tell a bad payload from a snapshot
      * whose tokenizer has no XTML tokens. Serve reported both as "invalid K3
      * chat payload", which sent at least one user hunting through a request
@@ -2490,6 +2487,7 @@ static int chat_build_wire(Tok *T, const char *wire, int nwire, int *thinking,
     while(p<end){
         const char *nl=memchr(p,'\n',(size_t)(end-p));
         if(!nl) return -1;
+        if(b.cont && *p!='G') return -1;  /* the open final turn must be last; only G may follow */
         if(*p=='G'){
             int v=0;
             if(sscanf(p,"G %d",&v)!=1) return -1;
@@ -2503,6 +2501,25 @@ static int chat_build_wire(Tok *T, const char *wire, int nwire, int *thinking,
             memcpy(reason,nl+1,(size_t)nr); reason[nr]=0;
             memcpy(text,nl+1+nr,(size_t)nt); text[nt]=0;
             chat_assistant(&b,reason,text);
+            free(reason); free(text); p=nl+1+nr+nt; continue;
+        }
+        if(*p=='C'){                /* continuation: the FINAL assistant turn, left OPEN.
+                                     * C <reason-len> <text-len>\n<reason><text> -- the same
+                                     * body as A, but rendered as the trailing open turn (no
+                                     * <|close|>, no <|end_of_msg|>, and the caller appends no
+                                     * fresh generation cue). An old engine has no 'C' record:
+                                     * it falls to the 'M' branch below, fails to parse, and
+                                     * rejects the payload -- fail-closed, never miswired. */
+            int nr=-1, nt=-1;
+            if(sscanf(p,"C %d %d",&nr,&nt)!=2||nr<0||nt<0||nl+1+nr+nt>end) return -1;
+            char *reason=malloc((size_t)nr+1), *text=malloc((size_t)nt+1);
+            if(!reason||!text){ fprintf(stderr,"OOM chat continuation\n"); exit(1); }
+            memcpy(reason,nl+1,(size_t)nr); reason[nr]=0;
+            memcpy(text,nl+1+nr,(size_t)nt); text[nt]=0;
+            cb_open(&b,"message","assistant");
+            if(nr){ cb_open(&b,"think",NULL); cb_text(&b,reason); cb_close(&b,"think"); }
+            cb_open(&b,"response",NULL); cb_text(&b,text);   /* OPEN: no close, no eom */
+            b.cont=1;
             free(reason); free(text); p=nl+1+nr+nt; continue;
         }
         if(*p=='Y'){                /* typed system message (#1143): tool-declare / tool-choice */
@@ -2602,8 +2619,10 @@ static int chat_build_wire(Tok *T, const char *wire, int nwire, int *thinking,
         chat_message(&b,r,text,!strcmp(r,"assistant"));
         free(text); p=nl+1+nb;
     }
-    cb_open(&b,"message","assistant");
-    cb_open(&b,*thinking?"think":"response",NULL);
+    if(!b.cont){                 /* a continuation already emitted the open final turn */
+        cb_open(&b,"message","assistant");
+        cb_open(&b,*thinking?"think":"response",NULL);
+    }
     return b.n;
 }
 

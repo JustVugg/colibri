@@ -1386,23 +1386,30 @@ typedef struct {
 static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
                                 Slot **selected) {
     if(!m->expert_parallel_reads||!experts||!selected||count<2||
-       count>Q38_MAX_TOPK)return 0;
+       count>m->cache[layer].cap)return 0;
     LCache *cache=&m->cache[layer];
-    if(cache->cap<count||!q38_prepare_expert_scale_bank(m,layer))return 0;
-    Q38ExpertLoadJob jobs[Q38_MAX_TOPK];
+    if(!q38_prepare_expert_scale_bank(m,layer))return 0;
+    /* The demand set is no longer bounded by the decode top-k: the MoE prefill
+     * hands over the whole chunk union (up to the cache cap) so its loads run
+     * one OMP wave instead of serial groups of Q38_MAX_TOPK.  Load grouping
+     * never touches FP order: routed outputs are written per assignment and
+     * the per-position expert sum follows the router order, so a bigger wave
+     * only changes WHICH slots serve the reads, not the arithmetic. */
+    Q38ExpertLoadJob *jobs=malloc((size_t)count*sizeof(*jobs));
+    if(!jobs)return 0;
     for(int index=0;index<count;index++){
         int expert=experts[index];
-        if(expert<0||expert>=m->c.experts)return 0;
+        if(expert<0||expert>=m->c.experts){free(jobs);return 0;}
         q38_ehit_mark(m,layer,expert);
         for(int previous=0;previous<index;previous++)
-            if(experts[previous]==expert)return 0;
+            if(experts[previous]==expert){free(jobs);return 0;}
         int slot_index=cache->by_expert[expert];
         if(slot_index>=0){
-            if(slot_index>=cache->n||cache->slots[slot_index].eid!=expert)return 0;
+            if(slot_index>=cache->n||cache->slots[slot_index].eid!=expert){free(jobs);return 0;}
             continue;
         }
         st_tensor *weight[3];
-        if(!q38_native_fp8_expert_tensors(m,layer,expert,weight))return 0;
+        if(!q38_native_fp8_expert_tensors(m,layer,expert,weight)){free(jobs);return 0;}
     }
     unsigned char *protected_slots=(unsigned char*)calloc((size_t)cache->cap,1);
     if(!protected_slots){fprintf(stderr,"OOM expert batch reservations\n");exit(1);}
@@ -1463,6 +1470,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
             cache->by_expert[jobs[job].expert]=(int)(slot-cache->slots);
         }
     }
+    free(jobs);
     return 1;
 }
 
@@ -1592,17 +1600,59 @@ static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out)
     q38_tm_add(m,Q38_TM_PLE,phase_started);
 }
 
+/* The chunk ceiling and the workspace budget used to be compile-time only.  An
+ * isolated prefill measurement (274 tokens, one forward) showed that the
+ * ceiling -- not the budget -- is what binds: 32 rows cut the prompt into nine
+ * chunks, each chunk touches ~91 distinct experts, so a loaded expert serves
+ * ~3.3 rows.  That drags 4.69 MiB of FP8 weights in for three rows of
+ * activations, which is decode-grade arithmetic intensity inside a path that is
+ * supposed to be batched, and it shows: 1.29 TFLOP in 48.8 s is 26.5 GFLOP/s,
+ * a few percent of what the cores can do.  Both values are therefore runtime
+ * knobs now.  Widening the chunk cannot change any result -- boundaries alter
+ * neither routing nor accumulation order -- so this is a pure A/B. */
+static int q38_env_positive_int(const char *name,int default_value,
+                                int max_value) {
+    const char *value=getenv(name);
+    if(!value||!*value)return default_value;
+    char *end=NULL;long parsed=strtol(value,&end,10);
+    if(end==value||*end||parsed<1||parsed>(long)max_value){
+        fprintf(stderr,"%s must be an integer in 1..%d\n",name,max_value);
+        exit(1);
+    }
+    return (int)parsed;
+}
+
+static int q38_prefill_batch_rows(void) {
+    static int cached=0;
+    if(!cached)
+        cached=q38_env_positive_int("Q38_PREFILL_BATCH_ROWS",
+                                    Q38_PREFILL_BATCH_ROWS,1<<20);
+    return cached;
+}
+
+/* Expressed in MiB because the byte count is the thing a human gets wrong. */
+static uint64_t q38_prefill_workspace_bytes(void) {
+    static uint64_t cached=0;
+    if(!cached)
+        cached=(uint64_t)q38_env_positive_int(
+                   "Q38_PREFILL_WORKSPACE_MIB",
+                   (int)(Q38_PREFILL_WORKSPACE_BYTES>>20),4096)<<20;
+    return cached;
+}
+
 /* Choose a context-independent prefill chunk whose private workspace fits the
  * common target.  Callers provide exact fixed and per-row byte counts; even a
  * hostile-but-valid geometry gets one row rather than an unbounded allocation. */
 static int q38_bounded_prefill_rows(int requested,uint64_t fixed,
                                     uint64_t per_row) {
-    int rows=requested<Q38_PREFILL_BATCH_ROWS?requested:Q38_PREFILL_BATCH_ROWS;
+    int ceiling=q38_prefill_batch_rows();
+    uint64_t budget=q38_prefill_workspace_bytes();
+    int rows=requested<ceiling?requested:ceiling;
     if(rows<1)return 1;
     for(;rows>1;rows--)
         if(per_row<=UINT64_MAX/(uint64_t)rows&&
            fixed<=UINT64_MAX-per_row*(uint64_t)rows&&
-           fixed+per_row*(uint64_t)rows<=Q38_PREFILL_WORKSPACE_BYTES)
+           fixed+per_row*(uint64_t)rows<=budget)
             return rows;
     return 1;
 }
@@ -1728,6 +1778,11 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
     float *ip=falloc((int64_t)S*(IQ+c->idx_kheads)*ID);
     q38_dense_matmul(m,qp,x,&l->q,S,H,QH*2*D);q38_dense_matmul(m,kp,x,&l->k,S,H,KVH*D);q38_dense_matmul(m,vp,x,&l->v,S,H,KVH*D);
     q38_dense_matmul(m,ip,x,&l->idx_qk,S,H,(IQ+c->idx_kheads)*ID);
+    /* Cause before parallelism: the K/V/IK writes are disjoint per position
+     * (each s writes only its own row) and must be complete before the
+     * ranking, which reads the whole IK[0..pos] prefix.  Guarded on S>1 so
+     * decode keeps the serial path it has today. */
+    #pragma omp parallel for schedule(static) if(S>1)
     for(int s=0;s<S;s++){
         int pos=pos_base+s;
         for(int h=0;h<KVH;h++){
@@ -1737,12 +1792,28 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         }
         memcpy(m->IK[layer]+(int64_t)pos*ID,ip+(int64_t)s*(IQ+1)*ID+(int64_t)IQ*ID,(size_t)ID*sizeof(float));
     }
-    float *heads=falloc((int64_t)S*QH*D),*qidx=falloc((int64_t)IQ*ID),*pool=falloc(ID);
-    int *selected=(int*)malloc((size_t)maxsel*sizeof(int));
-    if(!selected){fprintf(stderr,"OOM QSA selection\n");exit(1);}
+    float *heads=falloc((int64_t)S*QH*D);
+    /* Ranking and attention are independent per position: no shared writes
+     * (heads is row-disjoint, the scratch is per-thread) and no FP order
+     * changes inside a position, so the result is bit-identical to the
+     * serial path. The scheduling is dynamic because the ranking cost grows
+     * with the position (the IK prefix to read is O(pos)). */
+    double index_dt=0,attn_dt=0;
+    /* Wall, not aggregate CPU: the reduction below sums per-thread seconds, so
+     * at prefill these two phases would report ~20x what the clock saw while
+     * every other phase reports wall -- on a 3006-token prompt the phase sum
+     * came to 510 s against a 268 s TTFT, the parts outweighing the whole.
+     * Take the clock across the whole team and split it by CPU share.  At
+     * decode S==1 the loop is serial, cpu_total equals the wall, and the
+     * rescale below is an exact no-op. */
+    double qsa_wall_started=now_s();
+    #pragma omp parallel for schedule(dynamic,8) reduction(+:index_dt,attn_dt) if(S>1)
     for(int s=0;s<S;s++){
         int pos=pos_base+s,visible=pos+1,blocks=visible/R,tail=blocks*R;
         double phase_started=now_s();
+        float *qidx=falloc((int64_t)IQ*ID),*pool=falloc(ID);
+        int *selected=(int*)malloc((size_t)maxsel*sizeof(int));
+        if(!selected){fprintf(stderr,"OOM QSA selection\n");exit(1);}
         for(int h=0;h<IQ;h++){float *qh=qidx+(int64_t)h*ID;memcpy(qh,ip+(int64_t)s*(IQ+1)*ID+(int64_t)h*ID,(size_t)ID*sizeof(float));q38_rms0(qh,qh,l->idx_qn,ID,c->eps);q38_rope(qh,ID,c->rotary_dim,pos,c->theta);}
         int take=blocks<c->idx_budget/R?blocks:c->idx_budget/R,nsel=0;
         Q38Block *rank=blocks?(Q38Block*)malloc((size_t)blocks*sizeof(Q38Block)):NULL;
@@ -1755,7 +1826,7 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         if(blocks)qsort(rank,(size_t)blocks,sizeof(Q38Block),q38_block_desc);
         for(int z=0;z<take;z++)for(int r=0;r<R;r++)selected[nsel++]=rank[z].block*R+r;
         for(int t=tail;t<visible;t++)selected[nsel++]=t;free(rank);
-        q38_tm_add(m,Q38_TM_QSA_INDEX,phase_started); phase_started=now_s();
+        index_dt+=now_s()-phase_started; phase_started=now_s();
         for(int h=0;h<QH;h++){
             float *qraw=qp+(int64_t)s*QH*2*D+(int64_t)h*2*D;
             float *qh=falloc(D);memcpy(qh,qraw,(size_t)D*sizeof(float));q38_rms0(qh,qh,l->qn,D,c->eps);q38_rope(qh,D,c->rotary_dim,pos,c->theta);
@@ -1766,10 +1837,18 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
             for(int j=0;j<nsel;j++){float a=score[j]/den;const float *vh=m->V[layer]+((int64_t)khidx*m->kv_cap+selected[j])*D;for(int d=0;d<D;d++)oh[d]+=a*vh[d];}
             for(int d=0;d<D;d++)oh[d]*=q38_sigmoid(qraw[D+d]);free(qh);free(score);
         }
-        q38_tm_add(m,Q38_TM_QSA_ATTENTION,phase_started);
+        attn_dt+=now_s()-phase_started;
+        free(qidx);free(pool);free(selected);
     }
+    double qsa_wall=now_s()-qsa_wall_started,cpu_total=index_dt+attn_dt;
+    if(cpu_total>0.0){
+        index_dt=qsa_wall*(index_dt/cpu_total);
+        attn_dt =qsa_wall*(attn_dt /cpu_total);
+    }
+    m->timers.seconds[Q38_TM_QSA_INDEX]+=index_dt;
+    m->timers.seconds[Q38_TM_QSA_ATTENTION]+=attn_dt;
     q38_dense_matmul(m,out,heads,&l->o,S,QH*D,H);
-    free(qp);free(kp);free(vp);free(ip);free(heads);free(qidx);free(pool);free(selected);
+    free(qp);free(kp);free(vp);free(ip);free(heads);
 }
 
 /* The single-row path is intentionally kept separate from prefill.  Decode is
@@ -1992,7 +2071,10 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
         }
         /* GPU experts land after the CPU ones: same values, one more group in
          * the float sum (that is the only ordering difference to a CPU run). */
-        qt_take(qmask,route_gates,K,ys);
+        if(!qt_take(qmask,route_gates,K,ys)){
+            fprintf(stderr,"qwen38: CUDA expert collection failed at layer %d; stopping inference\n",layer);
+            exit(1);
+        }
         for(int d=0;d<H;d++)ys[d]+=gate*shared[d];
     }
     rt_trace_end();
@@ -2157,7 +2239,6 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
          * loaded once for this chunk, and a later group may safely reuse its
          * slots because the preceding outputs already live in routed_out. */
         int load_limit=m->cache[layer].cap;
-        if(load_limit>Q38_MAX_TOPK)load_limit=Q38_MAX_TOPK;
         if(load_limit<1)load_limit=1;
         for(int unique_base=0;unique_base<unique_count;) {
             int load_count=unique_count-unique_base;

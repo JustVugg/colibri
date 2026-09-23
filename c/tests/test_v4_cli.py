@@ -135,6 +135,13 @@ class V4CliTest(unittest.TestCase):
                 os.path.abspath(args.model),
             )
 
+    def test_v41_ram_flag_overrides_inherited_budget(self):
+        args = argparse.Namespace(ngen=8, temp=None, ram=96, ctx=4096)
+        with mock.patch.dict(os.environ, {"RAM_GB": "32"}):
+            env = self.cli.env_for_engine(args, "deepseek_v41")
+        self.assertEqual(env["RAM_GB"], "96")
+        self.assertEqual(env["CTX"], "4096")
+
     def test_kimi_engine_environment_forwards_ram(self):
         """#855: `--ram` reached the environment for deepseek_v4 only, so on Kimi
         K3 it was set and never read -- the flag a user reaches for to bound

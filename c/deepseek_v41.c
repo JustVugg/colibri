@@ -3523,6 +3523,16 @@ static int serve_eos(Model *m, const char *snap, int *ids, int cap) {
     return n;
 }
 
+/* max_tokens is a ceiling, as on V4 and Qwen (#1641). A score-only
+ * request may fill the context; generation needs at least one free position. */
+static int serve_budget(int prompt, int requested, int context, int logprobs) {
+    if (prompt < 1 || prompt > context) return -1;
+    int budget = requested > 0 ? requested : (logprobs > 0 ? 0 : 256);
+    int room = context - prompt;
+    if (budget > 0 && room == 0) return -1;
+    return budget < room ? budget : room;
+}
+
 static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
     Cfg *c = &m->c;
     coli_serve_stdio_init();
@@ -3531,7 +3541,9 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
     coli_serve_write_ready(stdout, rss_gb());
     serve_emap(m);
     float *logits = xmalloc((size_t)c->vocab * sizeof(float), "logits");
-    int *ids = xmalloc((size_t)c->max_positions * sizeof(int), "prompt ids");
+    /* tok_encode stops at its output capacity: one extra id distinguishes
+     * a full, valid read-only prompt from a silently truncated one. */
+    int *ids = xmalloc(((size_t)c->max_positions + 1) * sizeof(int), "prompt ids");
     float *pending_image = NULL;
     int pending_h = 0, pending_w = 0;
 
@@ -3587,7 +3599,22 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             mir_reads0[r] = g_mir_nread[r];
         }
         int n_prompt = tok_encode(tokenizer, (const char *)command.payload,
-                                  (int)command.payload_bytes, ids, c->max_positions);
+                                  (int)command.payload_bytes, ids, c->max_positions + 1);
+        int budget = serve_budget(n_prompt, command.max_tokens, c->max_positions,
+                                  command.logprobs);
+        if (budget < 0) {
+            char message[128];
+            snprintf(message, sizeof(message),
+                     "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
+                     n_prompt, command.max_tokens, c->max_positions);
+            coli_serve_write_error(stdout, command.id,
+                                   n_prompt < 1 ? "EMPTY_PROMPT" : message);
+            coli_serve_command_dispose(&command); continue;
+        }
+        if (command.max_tokens > budget)
+            fprintf(stderr, "[serve] max_tokens %d clamped to %d (context %d - prompt %d); "
+                            "raise CTX for longer answers\n",
+                    command.max_tokens, budget, c->max_positions, n_prompt);
         /* Decided BEFORE the reset, because the reset is what it decides about.
          * A chat client resends the whole transcript every turn; if this prompt
          * begins with the ids the state was built from, that state already IS
@@ -3635,23 +3662,6 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             fflush(stderr);
         }
         if (!reuse) model_reset(m);
-        if (n_prompt < 1) {
-            coli_serve_write_error(stdout, command.id, "EMPTY_PROMPT");
-            coli_serve_command_dispose(&command); continue;
-        }
-        /* max_tokens=0 con logprobs>0 vuol dire "leggi e fermati": non e un
-         * valore mancante da rimpiazzare con un default, ed e' proprio il caso
-         * in cui un menu chiuso non vuole pagare un passo di decodifica per
-         * opzione. Senza logprobs 0 resta "non specificato" -> 256, come prima. */
-        int budget = command.max_tokens > 0 ? command.max_tokens
-                   : (command.logprobs > 0 ? 0 : 256);
-        if (n_prompt + budget > c->max_positions) {
-            char message[128];
-            snprintf(message, sizeof(message), "CONTEXT_EXCEEDED %d %d",
-                     n_prompt + budget, c->max_positions);
-            coli_serve_write_error(stdout, command.id, message);
-            coli_serve_command_dispose(&command); continue;
-        }
         coli_serve_write_accept(stdout, command.id, n_prompt);
         float *aligned = NULL;
         uint8_t *image_mask = NULL;

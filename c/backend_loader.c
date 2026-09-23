@@ -102,6 +102,11 @@ typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const flo
                                     int fmt, int S, int I, int O, int device, int gs);
 typedef int            (*fn_matmul_mxfp4)(float *y, const float *x, const unsigned char *q4,
                                           const unsigned char *e8s, int S, int I, int O);
+typedef int (*fn_expert_mxfp4)(float *y, const float *x,
+        const unsigned char *gate_w, const unsigned char *gate_s,
+        const unsigned char *up_w, const unsigned char *up_s,
+        const unsigned char *down_w, const unsigned char *down_s,
+        int S, int D, int I, float b1, float b2);
 typedef void           (*fn_tensor_free)(ColiCudaTensor *tensor);
 typedef size_t         (*fn_tensor_bytes)(const ColiCudaTensor *tensor);
 typedef size_t         (*fn_tensor_vram)(const ColiCudaTensor *tensor);
@@ -179,6 +184,7 @@ static struct {
     fn_fp8_set_lut     fp8_set_lut;
     fn_matmul          matmul;
     fn_matmul_mxfp4    matmul_mxfp4;
+    fn_expert_mxfp4    expert_mxfp4;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
     fn_tensor_vram     tensor_vram;
@@ -1433,6 +1439,7 @@ static int coli_cuda_load(void){
      * nothing by this name, and the wrapper's 0 is the engine's own "fall back
      * to CPU" result, so an older DLL still serves GLM and Qwen3.6 (#1405). */
     RESOLVE_OPT(matmul_mxfp4,   fn_matmul_mxfp4)
+    RESOLVE_OPT(expert_mxfp4,   fn_expert_mxfp4)
     RESOLVE_OPT(available_device_count, fn_available_device_count)   /* qwen36 tier (#1533); older DLLs fall back to device_count */
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
@@ -1654,6 +1661,15 @@ int coli_cuda_matmul_mxfp4(float *y, const float *x, const unsigned char *q4,
                            const unsigned char *e8s, int S, int I, int O){
     if(!g_cuda.available || !g_cuda.matmul_mxfp4) return 0;   /* 0 = CPU path */
     return g_cuda.matmul_mxfp4(y, x, q4, e8s, S, I, O);
+}
+
+int coli_cuda_expert_mxfp4(float *y, const float *x,
+        const unsigned char *gate_w, const unsigned char *gate_s,
+        const unsigned char *up_w, const unsigned char *up_s,
+        const unsigned char *down_w, const unsigned char *down_s,
+        int S, int D, int I, float b1, float b2) {
+    if (!g_cuda.available || !g_cuda.expert_mxfp4) return 0;
+    return g_cuda.expert_mxfp4(y, x, gate_w, gate_s, up_w, up_s, down_w, down_s, S, D, I, b1, b2);
 }
 
 void coli_cuda_tensor_free(ColiCudaTensor *tensor){

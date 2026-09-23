@@ -13,6 +13,7 @@ from resource_plan import (
     analyze_model,
     build_plan,
     cpu_socket_count,
+    discover_gpus,
     environment_for_plan,
     format_plan,
     memory_available,
@@ -112,6 +113,28 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertFalse(any("jointly constrained" in warning
                              for warning in plan["warnings"]))
 
+    def test_macos_discovers_metal_gpu_without_cuda_or_rocm_probes(self):
+        output = json.dumps({"SPDisplaysDataType": [{
+            "_name": "Apple M1 Pro",
+            "sppci_model": "Apple M1 Pro",
+            "spdisplays_mtlgpufamilysupport": "spdisplays_metal4",
+        }]})
+        result = subprocess.CompletedProcess(args=[], returncode=0,
+                                             stdout=output, stderr="")
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch("resource_plan.subprocess.run", return_value=result) as run:
+            devices = discover_gpus()
+        self.assertEqual(devices, [{"index": 0, "name": "Apple M1 Pro",
+                                    "total_bytes": 0, "free_bytes": None,
+                                    "unified_memory": True, "backend": "metal"}])
+        self.assertEqual(run.call_args.args[0],
+                         ["system_profiler", "SPDisplaysDataType", "-json"])
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                  available_disk=1, gpus=devices, physical_cpus=8,
+                  cpu_sockets=1)
+        self.assertIn("Metal  0:Apple M1 Pro · unified memory",
+                  format_plan(plan))
+
     def test_glm53_auto_tune_does_not_emit_generic_inert_knobs(self):
         from resource_plan import _auto_tune
 
@@ -145,6 +168,30 @@ class ResourcePlanTest(unittest.TestCase):
             for case in cases:
                 with self.subTest(engine_group=group, case=case[:2]):
                     self.assertEqual(_auto_tune(*case, False, engine_group=group), {})
+
+    def test_v41_gateway_sizes_cap_from_ram_without_auto_tier(self):
+        from openai_server import cap_for_arch
+
+        (self.model / "config.json").write_text(json.dumps({
+            "model_type": "deepseek_v41", "num_hidden_layers": 2,
+            "n_routed_experts": 128, "hidden_size": 128, "head_dim": 64,
+            "window_size": 8, "index_head_dim": 32, "hc_mult": 4,
+            "compress_ratios": [0, 2], "kv_source_layers": [1],
+        }))
+        write_shard(self.model / "model.safetensors", [
+            ("embed.weight", GB),
+            *[(f"layers.{layer}.ffn.experts.{expert}.w1.weight", 16 * 1024**2)
+              for layer in range(2) for expert in range(128)],
+        ])
+        with mock.patch("resource_plan.memory_available", return_value=16 * GB):
+            small = cap_for_arch("deepseek_v41", None, {"RAM_GB": "8"}, self.model)
+            large = cap_for_arch("deepseek_v41", None, {"RAM_GB": "12"}, self.model)
+            automatic = cap_for_arch("deepseek_v41", None, {}, self.model)
+        self.assertGreater(small, 8)
+        self.assertGreater(large, small)
+        self.assertEqual(large, 128)
+        self.assertEqual(automatic, 128)
+        self.assertEqual(cap_for_arch("deepseek_v41", 4, {"RAM_GB": "12"}, self.model), 4)
 
     def test_sibling_plan_advises_no_colibri_knob(self):
         other = tempfile.TemporaryDirectory()
