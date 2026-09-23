@@ -83,6 +83,39 @@ describe("chat request extensions", () => {
   })
 })
 
+describe("reasoning stream", () => {
+  /* The server puts thinking on delta.reasoning_content (openai_server.py,
+     22 call sites). #1148 / #1153 / #1156 taught the dashboard to read that
+     field. The workspace redesign dropped the callback, so a turn with
+     enable_thinking on streamed thinking tokens that never appeared. */
+  const reasoningStream = () => new Response(
+    'data: {"choices":[{"delta":{"reasoning_content":"think"}}]}\n\n'
+    + 'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n'
+    + "data: [DONE]\n\n",
+    { headers: { "content-type": "text/event-stream" } },
+  )
+
+  it("forwards reasoning_content to onReasoning and keeps it out of content", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(reasoningStream()))
+    const content: string[] = []
+    const reasoning: string[] = []
+    await streamChat({
+      baseUrl: "http://localhost:8000/v1",
+      apiKey: "",
+      model: "test-model",
+      messages: [],
+      temperature: 0,
+      maxTokens: 8,
+      enableThinking: true,
+      signal: new AbortController().signal,
+      onDelta: (text) => content.push(text),
+      onReasoning: (text) => reasoning.push(text),
+    })
+    expect(reasoning).toEqual(["think"])
+    expect(content).toEqual(["answer"])
+  })
+})
+
 describe("askBrio", () => {
   /* The options must travel as a field, never folded into the prompt: keeping
      them out of the text is half of what the mode saves, and a refactor that

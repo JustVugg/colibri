@@ -81,9 +81,16 @@ copies. Tool calling depends on the active engine; see the support matrix below.
 Images and token penalties return an explicit error rather than being silently
 ignored. The OpenAI-compatible endpoints request log probabilities only from a
 glm engine (see below); on every other engine such a request is refused with a
-named error, never silently ignored. Audio is accepted only by Inkling
-checkpoints with audio support. The default bind address is localhost; set
-`COLI_API_KEY` before exposing the server beyond the machine.
+named error, never silently ignored. `seed` is accepted and ignored (see
+below). Audio is accepted only by Inkling checkpoints with audio support. The
+default bind address is localhost; set `COLI_API_KEY` before exposing the
+server beyond the machine.
+
+### `seed`
+
+`seed` is accepted (not rejected) for OpenAI-API request-shape compatibility;
+the value is not validated. This server sends no per-request seed on the
+wire, so the value has no effect at any temperature.
 
 ### Log probabilities and prompt echo
 

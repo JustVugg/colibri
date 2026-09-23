@@ -4,6 +4,10 @@ export interface ChatMessage {
   id: string
   role: ChatRole
   content: string
+  /* Reasoning models stream their thinking on a separate delta field before
+     the answer. Kept apart from `content` so it can be rendered as its own
+     block and excluded from what is sent back as conversation history. */
+  reasoning?: string
   /* Data URIs of the pictures attached to this turn. Kept on the message rather
      than on the draft, because the transcript is resent on every later turn and
      the model has to keep seeing what it was shown. */
@@ -150,6 +154,7 @@ export interface StreamChatOptions {
   cacheSlot?: number
   signal: AbortSignal
   onDelta: (text: string) => void
+  onReasoning?: (text: string) => void
 }
 
 export async function streamChat(options: StreamChatOptions): Promise<StreamChatResult> {
@@ -188,12 +193,14 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
   const consume = (data: string) => {
     if (data === "[DONE]") return
     const event = JSON.parse(data) as {
-      choices?: Array<{ delta?: { content?: string }; finish_reason?: string | null }>
+      choices?: Array<{ delta?: { content?: string; reasoning_content?: string }; finish_reason?: string | null }>
       usage?: TokenUsage | null
     }
     const choice = event.choices?.[0]
     const text = choice?.delta?.content
     if (text) options.onDelta(text)
+    const reasoning = choice?.delta?.reasoning_content
+    if (reasoning) options.onReasoning?.(reasoning)
     if (choice?.finish_reason) finishReason = choice.finish_reason
     if (event.usage) usage = event.usage
   }

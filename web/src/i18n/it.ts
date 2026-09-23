@@ -92,6 +92,7 @@ const it: Record<string, string> = {
   "brio.ownOptions": "Opzioni ammesse per questa domanda, una per riga",
   "brio.needTwo": "serve almeno una seconda opzione, separata da virgola o a capo",
   "brio.scoreAll": "Rispondi a {{n}}",
+  "brio.stop": "Ferma",
   "nav.brio": "Brio",
   "brio.sure": "certo",
   "brio.unsure": "incerto",

@@ -4,9 +4,11 @@
 Captures full HTTP responses for a battery of NON-logprobs requests against a
 RUNNING colibri server, normalizes the volatile fields (ids, timestamps), and
 byte-diffs two capture directories. The engine-channel change (U7a) is opt-in
-and no server request path opts in, so a pre-U7a capture and a post-U7a capture
-of the same battery on the same box/backend/model must be byte-identical --
-this script is the mechanism proving that, not reviewer inspection.
+and no server request path opts in: for the battery's generation-bearing
+cases, which all run at temperature 0, a capture taken before the change
+under test and one taken after it, on the same box/backend/model, must be
+byte-identical after that normalization -- this script is the mechanism
+proving that, not reviewer inspection.
 
 Usage:
     # 1. start the server on the CURRENT (pre-change) build, then:
@@ -22,10 +24,17 @@ Usage:
     python3 tests/golden_fixture_capture.py diff fixtures_pre fixtures_post
 
 Battery: chat, chat+tools, chat streaming, completions without logprobs, the
-logprobs case now served on the glm engine (which a pre-change capture answered
-with a 400, so the two differ there by construction), and the error cases whose
-behavior must not move (seed 400, array-prompt 400, out-of-range temperature
-400) plus /v1/models.
+seed case that is a no-op from #1720 on (accepted-and-ignored, formerly a 400),
+the logprobs case now served on the glm engine (formerly a 400 too), and the
+error cases whose behavior must not move (array-prompt 400, out-of-range
+temperature 400) plus /v1/models.
+
+A pre/post diff spanning these changes prints four MISSING-on-one-side lines
+and exits 1: `err_seed.json` / `seed_accepted.json` for the seed rename, and
+`err_logprobs.json` / `logprobs_served.json` for the logprobs one. Each rename
+means the two captures carry different keys for that one case, so `diff()`
+cannot pair them under either name. Those two pairs are expected across these
+changes and are the only expected differences.
 
 Normalization: every "id"/"created" field (recursively, and per SSE event) is
 replaced with a constant; nothing else is touched. Generation-bearing requests
@@ -78,8 +87,8 @@ def battery(model):
         ("completions_stop", "POST", "/v1/completions",
          {"model": model, "prompt": "Count: one, two,",
           "max_tokens": 16, "temperature": 0, "stop": ["five"]}),
-        ("err_seed", "POST", "/v1/completions",
-         {"model": model, "prompt": "hello", "max_tokens": 1, "seed": 1234}),
+        ("seed_accepted", "POST", "/v1/completions",
+         {"model": model, "prompt": "hello", "max_tokens": 1, "temperature": 0, "seed": 1234}),
         ("err_array_prompt", "POST", "/v1/completions",
          {"model": model, "prompt": [1, 2, 3], "max_tokens": 1}),
         ("logprobs_served", "POST", "/v1/completions",

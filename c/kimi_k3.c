@@ -117,6 +117,7 @@
 #include "pin_pool.h"   /* coli_pin_slots_wanted: quanti scatti tenere */
 #include "hybrid_split.h"                    /* KV prefix reuse (shared) */
 #include "serve_codec.h"
+#include "serve_budget.h"
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -3072,12 +3073,24 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
         np+=tok_encode(T,q->payload,q->plen,ids+np,cap-np);
     }
     int max_ctx=getenv("K3_MAXT")?atoi(getenv("K3_MAXT")):8192;
-    if(np<1||(int64_t)np+q->max_tok>max_ctx){ /* SEC (GHSA-gf38): int64 so np+max_tok can't wrap negative */
-        char message[160];
-        snprintf(message,sizeof(message),
-                 "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
-                 np,q->max_tok,max_ctx);
-        coli_serve_write_error(stdout,q->id,message); free(ids); return 0;
+    int budget=coli_serve_budget(np,q->max_tok,max_ctx,q->logprobs>0);
+    if(budget<0){
+        if(np<1){
+            coli_serve_write_error(stdout,q->id,"EMPTY_PROMPT");
+        }else{
+            char message[160];
+            snprintf(message,sizeof(message),
+                     "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
+                     np,q->max_tok,max_ctx);
+            coli_serve_write_error(stdout,q->id,message);
+        }
+        free(ids); return 0;
+    }
+    if(budget<q->max_tok){
+        fprintf(stderr,"[serve] max_tokens %d clamped to %d (context %d - prompt %d); "
+                       "raise K3_MAXT for longer answers\n",
+                q->max_tok,budget,max_ctx,np);
+        q->max_tok=budget;
     }
     coli_serve_write_accept(stdout,q->id,np);
     /* Declare the structured sideband before any generated DATA. Even an

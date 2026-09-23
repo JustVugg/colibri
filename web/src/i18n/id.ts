@@ -93,6 +93,7 @@ const id: Record<string, string> = {
   "brio.ownOptions": "Opsi yang diizinkan untuk pertanyaan ini, satu per baris",
   "brio.needTwo": "diperlukan opsi kedua, pada baris tersendiri",
   "brio.scoreAll": "Jawab {{n}}",
+  "brio.stop": "Hentikan",
   "nav.brio": "Brio",
   "brio.sure": "yakin",
   "brio.unsure": "tidak yakin",

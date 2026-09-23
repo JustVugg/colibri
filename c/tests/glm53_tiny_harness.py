@@ -60,7 +60,7 @@ def main() -> int:
         print(f"SKIP: manca {arguments.fixture}/ref.json; generalo con\n"
               f"  pip install -r tools/requirements-glm53-tiny.txt\n"
               f"  python3 tools/make_glm53_tiny.py --output {arguments.fixture}")
-        return 0
+        return 2  # un salto non e' un successo
     reference = json.loads((arguments.fixture / "ref.json").read_text())
     prompt = ",".join(str(token) for token in reference["prompt_ids"])
     expected_forcing = reference["teacher_forcing_ids"]

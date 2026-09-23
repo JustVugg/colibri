@@ -538,6 +538,21 @@ def _tool_choice_name(tool_choice):
             or tool_choice.get("name"))
 
 
+def _tool_function(tool):
+    """The function object on a tools[] entry, or {} if it is missing or not an object.
+
+    OpenAI dual spelling: {"function": {"name": ...}} or a bare function object.
+    .items() is taken only from a dict. Writing the name where the object goes
+    ({"type": "function", "function": "search"}) raised AttributeError in the GLM
+    and DeepSeek declaration blocks, and do_POST answered HTTP 500 "The colibri
+    engine failed to process the request." for a payload generation_options()
+    already has a 400 for. Same shape as the tool_choice fix (#1598): read the
+    member, then check it.
+    """
+    fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+    return fn if isinstance(fn, dict) else {}
+
+
 def _tool_param_order(tools):
     """name -> ordered param names (required first) from the request schema, for de-mangling."""
     out = {}
@@ -772,7 +787,7 @@ def _dsv4_tools_block(tools):
     """V4 tool-declaration block, rendered by the vendored reference template."""
     schemas = []
     for tool in (tools or []):
-        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        fn = _tool_function(tool)
         # Gateway-side scrub: OpenAI clients attach routing hints the model
         # schema must not carry.
         schemas.append({k: v for k, v in fn.items() if k not in ("defer_loading", "strict")})
@@ -2024,7 +2039,7 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
                       "user query.\n\nYou are provided with function signatures within <tools></tools> "
                       "XML tags:\n<tools>\n")
         for tool in tools:
-            fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+            fn = _tool_function(tool)
             clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
             prompt.append(json.dumps(clean, ensure_ascii=False) + "\n")
         prompt.append("</tools>\n\nFor each function call, output the function name and arguments "
@@ -2350,8 +2365,7 @@ def _glm53_tool_block(tools):
     somiglia a quello dell'addestramento non e' quello dell'addestramento."""
     body = "".join(f"\n{_glm53_tool_json(tool)}\n\n"
                    for tool in tools
-                   if not (isinstance(tool, dict)
-                           and (tool.get("function", tool) or {}).get("defer_loading")))
+                   if not _tool_function(tool).get("defer_loading"))
     return GLM53_TOOL_PREAMBLE + body + GLM53_TOOL_EPILOGUE
 
 
@@ -2397,7 +2411,7 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     so the existing parser needs nothing added for this family.
 
     The whole thing is pinned byte for byte against chat_template.jinja rendered
-    with jinja2 (tests/test_glm53_chat_template.py). Getting the prompt nearly
+    with jinja2 (tests/glm53_chat_template_harness.py). Getting the prompt nearly
     right is the failure mode worth guarding: the model answers either way.
     """
     if not isinstance(messages, list) or not messages:
@@ -2531,7 +2545,7 @@ def _dsv41_tools_block(tools):
     """V4.1 tool-declaration block, rendered by the vendored reference template."""
     schemas = []
     for tool in (tools or []):
-        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        fn = _tool_function(tool)
         # Gateway-side scrub: OpenAI clients attach routing hints the model
         # schema must not carry.
         clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
@@ -2695,7 +2709,7 @@ def render_chat_dsv41(messages, enable_thinking=False, reasoning_effort=None, to
 #
 # llama.cpp needs no switch for this because it runs the checkpoint's jinja at request time,
 # so `add_generation_prompt=False` costs it nothing. This gateway renders by hand, on purpose
-# and for speed (tests/test_glm53_chat_template.py says why), and the bill for that choice is
+# and for speed (tests/glm53_chat_template_harness.py says why), and the bill for that choice is
 # exactly here: one template flag, one open-turn shape to derive per renderer. Each string
 # renderer derives its own, pinned byte-for-byte against the checkpoint's template;
 # CONTINUATION_FAMILIES is the set that has done so. Kimi K3 differs in WHERE its shape lives:
@@ -3357,8 +3371,8 @@ def generation_options(body, limit):
     stop_sequences = parse_stop_sequences(body)
     if body.get("frequency_penalty", 0) or body.get("presence_penalty", 0):
         raise APIError(400, "Token penalties are not supported yet.", None, "unsupported_parameter")
-    if body.get("seed") is not None:
-        raise APIError(400, "Per-request seeds are not supported yet.", "seed", "unsupported_parameter")
+    # `seed` is accepted for request-shape compatibility and silently discarded:
+    # this server puts no per-request seed on the wire, at any temperature.
     # response_format -> optional per-request grammar for the engine's grammar-forced
     # draft source (#70/#148). NEVER a sampling constraint: drafts are verified, so a
     # schema the engine cannot compile degrades to "no speedup", not to an error and
@@ -4125,6 +4139,35 @@ def _win_kill_on_close_job(pid):
         return None   # never let process bookkeeping break starting the engine
 
 
+def _write_all(stream, data, frame):
+    """Write every byte of `data` to `stream`, looping on short writes.
+
+    The production engine stdin is a raw, unbuffered pipe (bufsize=0 ->
+    io.FileIO), whose write() is a single os.write() and may transfer fewer
+    bytes than it was given (a signal landing mid-write, a full pipe buffer
+    on a large IMAGE frame). Discarding the return value would leave the
+    tail of a frame unsent and desynchronize the engine's stdin framing, so
+    the remainder is re-offered until it is all consumed.
+
+    Neither `None` nor 0 is progress. `RawIOBase.write` answers `None` when
+    the stream is non-blocking and could not take a single byte, and 0 says
+    the same thing with a count; re-offering the buffer after either would
+    spin forever, so both fail closed as the named engine-write error a
+    broken pipe raises."""
+    written = 0
+    total = len(data)
+    view = memoryview(data)
+    while written < total:
+        sent = stream.write(view[written:])
+        # None is RawIOBase's "not one byte went out", not an uncounted
+        # full write, so it fails closed exactly as a zero count does.
+        if sent is None or sent <= 0:
+            raise RuntimeError(
+                f"failed to write {frame} to the engine "
+                f"(stdin took {written} of {total} bytes)")
+        written += sent
+
+
 class _Pending:
     """One in-flight engine request: the queue its frames are delivered on, whether it asked
     for the per-token numeric channel, and any fault the dispatcher has recorded against it.
@@ -4229,6 +4272,32 @@ class Engine:
             self.pending.clear()
         for entry in requests:
             entry.events.put(("error", error))
+
+    def _write_frame(self, request_id, data, frame):
+        """Checked server->engine protocol write for CANCEL/STOP: the write
+        and its flush happen under one write_lock acquisition. Any failure
+        here -- an OSError from the pipe itself, or _write_all's own
+        fail-closed RuntimeError on a None/zero-progress write -- drops this
+        request's pending-map entry: the dispatcher only does that on this
+        id's own DONE/ERROR frame, and neither arrives when the write that
+        would have solicited one never reached the engine. An OSError is
+        additionally re-raised as a named RuntimeError rather than left as
+        itself: BrokenPipeError is a ConnectionError subclass, so an
+        unwrapped failure here would fall into do_POST's client-hangup
+        handler (`except ConnectionError: pass`) and the client would see a
+        silent connection close instead of the 500 engine_error the failure
+        actually is. _write_all's own RuntimeError is already the named
+        error this raises for an OSError, so it is re-raised as-is."""
+        try:
+            with self.write_lock:
+                _write_all(self.process.stdin, data, frame)
+                self.process.stdin.flush()
+        except Exception as error:
+            with self.pending_lock:
+                self.pending.pop(request_id, None)
+            if isinstance(error, OSError):
+                raise RuntimeError(f"failed to write {frame} to the engine ({error})") from error
+            raise
 
     def _read_exact(self, size):
         chunks = []
@@ -4567,14 +4636,21 @@ class Engine:
                 # annunciato subito prima del SUBMIT a cui appartengono. Deve
                 # partire dentro lo stesso lock, o un'altra richiesta potrebbe
                 # infilarsi in mezzo e prendersi l'immagine di questa.
-                if image is not None:
-                    patches, grid_h, grid_w = image
-                    blob = patches.tobytes() if hasattr(patches, "tobytes") else patches
-                    self.process.stdin.write(
-                        f"IMAGE {request_id} {len(blob)} {grid_h} {grid_w}\n".encode()
-                        + blob + b"\n")
-                self.process.stdin.write(header + payload + xpayload + b"\n")
-                self.process.stdin.flush()
+                try:
+                    if image is not None:
+                        patches, grid_h, grid_w = image
+                        blob = patches.tobytes() if hasattr(patches, "tobytes") else patches
+                        try:
+                            _write_all(
+                                self.process.stdin,
+                                f"IMAGE {request_id} {len(blob)} {grid_h} {grid_w}\n".encode()
+                                + blob + b"\n", "IMAGE")
+                        except OSError as error:
+                            raise RuntimeError(f"failed to write IMAGE to the engine ({error})") from error
+                    _write_all(self.process.stdin, header + payload + xpayload + b"\n", "SUBMIT")
+                    self.process.stdin.flush()
+                except OSError as error:
+                    raise RuntimeError(f"failed to write SUBMIT to the engine ({error})") from error
         except Exception:
             with self.pending_lock:
                 self.pending.pop(request_id, None)
@@ -4617,31 +4693,22 @@ class Engine:
                 # DONE frame; ClientCancelled is raised when it arrives.
                 if not cancel_sent and not stop_sent and cancelled and cancelled():
                     cancel_sent = True
-                    with self.write_lock:
-                        self.process.stdin.write(f"CANCEL {request_id}\n".encode())
-                        self.process.stdin.flush()
+                    self._write_frame(request_id, f"CANCEL {request_id}\n".encode(), "CANCEL")
                 elif not cancel_sent and not stop_sent and pending.failed is not None:
                     # A fault was recorded for this request, so nothing it generates from
                     # here can reach the client. The turn is still the engine's -- the
                     # admission is held to its terminal frame either way -- but it should
                     # not run the rest of the budget for a response nobody will get.
+                    #
+                    # The STOP goes out through the checked frame writer (#1721), which
+                    # drops this request's pending-map entry and re-raises an OSError as
+                    # the named engine_error -- exactly the handling this branch carried
+                    # inline before that writer existed. Keeping the entry would be worse
+                    # than losing it: a STOP that never reached the engine is never
+                    # answered with a terminal frame, so the admission would be held for
+                    # the process's lifetime.
                     stop_sent = True
-                    try:
-                        with self.write_lock:
-                            self.process.stdin.write(f"STOP {request_id}\n".encode())
-                            self.process.stdin.flush()
-                    except OSError as error:
-                        # An engine this server cannot write to outranks a fault in the
-                        # stream it cannot read: the request is answered by name instead
-                        # of having the write error unwind through the handler, which
-                        # closes the client's connection with no status line on it. The
-                        # entry goes too -- a STOP that never reached the engine will
-                        # never be answered with a terminal frame, so waiting for one
-                        # would hold the admission for the process's lifetime.
-                        with self.pending_lock:
-                            self.pending.pop(request_id, None)
-                        raise RuntimeError(
-                            f"failed to write STOP to the engine ({error})") from error
+                    self._write_frame(request_id, f"STOP {request_id}\n".encode(), "STOP")
                 continue
             if kind == "accept":
                 if accepted:
@@ -4658,17 +4725,13 @@ class Engine:
                     decode(data)
                     if stopped and stopped():
                         stop_sent = True
-                        with self.write_lock:
-                            self.process.stdin.write(f"STOP {request_id}\n".encode())
-                            self.process.stdin.flush()
+                        self._write_frame(request_id, f"STOP {request_id}\n".encode(), "STOP")
                     elif cancelled and cancelled():
                         # Same admission-holding rule as the idle branch above:
                         # send CANCEL, then keep consuming frames until the
                         # engine acknowledges with ERROR CANCELLED or DONE.
                         cancel_sent = True
-                        with self.write_lock:
-                            self.process.stdin.write(f"CANCEL {request_id}\n".encode())
-                            self.process.stdin.flush()
+                        self._write_frame(request_id, f"CANCEL {request_id}\n".encode(), "CANCEL")
             elif kind == "echo":
                 # Lettura del prefill: arriva PRIMA di ogni DATA e non e' testo
                 # generato, quindi non passa da decode() e non entra nella
@@ -4682,14 +4745,10 @@ class Engine:
                     decode_tool(value)
                     if stopped and stopped():
                         stop_sent = True
-                        with self.write_lock:
-                            self.process.stdin.write(f"STOP {request_id}\n".encode())
-                            self.process.stdin.flush()
+                        self._write_frame(request_id, f"STOP {request_id}\n".encode(), "STOP")
                     elif cancelled and cancelled():
                         cancel_sent = True
-                        with self.write_lock:
-                            self.process.stdin.write(f"CANCEL {request_id}\n".encode())
-                            self.process.stdin.flush()
+                        self._write_frame(request_id, f"CANCEL {request_id}\n".encode(), "CANCEL")
             elif kind == "done":
                 _accept({"prompt_tokens": None})
                 if cancel_sent:
@@ -5485,7 +5544,18 @@ class APIHandler(BaseHTTPRequestHandler):
             # le domande (o tutte le caselle) condividono. Con un livello solo
             # la domanda si rilegge una volta per opzione; con due, 176 token
             # invece di 496 su quattro item (misurato).
-            if state_prefix and form != "options":
+            #
+            # Vale anche per la forma `options`: dentro una singola richiesta lo
+            # stato si legge comunque una volta (lo snapshot dello stato viene
+            # ripristinato quando `choose` fotografa il prefisso completo), ma
+            # il punto di ritorno sullo stato condiviso serve TRA richieste. La
+            # pagina web manda una domanda per richiesta sullo stesso documento;
+            # senza questa fotografia ogni domanda rifarebbe il prefill di tutto
+            # il documento, buttando via il "read once" che e' il senso della
+            # modalita. Con essa, ogni domanda successiva paga solo i propri
+            # token. Il costo e' uno snapshot in piu' su una richiesta one-shot,
+            # riusato o sfrattato.
+            if state_prefix:
                 n_state, _ = score(state_prefix, True)
                 prompt_max = max(prompt_max, n_state)
 
