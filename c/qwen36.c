@@ -2429,7 +2429,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
             double _q2 = tm_now();
             if(!qt_take(qmask, val, K, out + (int64_t)s*D)){
-                fprintf(stderr,"qwen36: CUDA expert collection failed at layer %d; stopping inference\n",layer);
+                fprintf(stderr,"qwen36: %s expert collection failed at layer %d; stopping inference\n",qt_backend_name(),layer);
                 exit(1);
             }
             if (tm_on() && S==1) {
