@@ -1326,8 +1326,8 @@ tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
 tests/test_st_slice$(EXE): tests/test_st_slice.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_qwen38_tokenizer$(EXE): tests/test_qwen38_tokenizer.c sse41_kernels.h qwen38.c qwen38_core.h kv_prefix.h qwen38_nfc.h qwen38_nfc_tables.h edge_runtime.c edge_runtime.h edge_adapters.h edge_adapter_internal.h st.h json.h compat.h quant.h fp8_format.h idot.h route_trace.h tok_unicode.h tok_unicode_o200k.h
-	$(CC) $(NOCUDA_CFLAGS) $< edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
+tests/test_qwen38_tokenizer$(EXE): tests/test_qwen38_tokenizer.c sse41_kernels.h qwen38.c qwen38_core.h kv_prefix.h qwen38_nfc.h qwen38_nfc_tables.h edge_runtime.c edge_runtime.h edge_adapters.h edge_adapter_internal.h st.h json.h compat.h quant.h fp8_format.h idot.h route_trace.h tok_unicode.h tok_unicode_o200k.h $(QWEN36_TIER_SRC) $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< edge_runtime.c $(QWEN36_TIER_SRC) $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c sse41_kernels.h qwen38.c qwen38_core.h kv_prefix.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h fp8_format.h idot.h route_trace.h tok_unicode.h tok_unicode_o200k.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
@@ -1335,8 +1335,8 @@ tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c sse41_kernels.h qwen3
 tests/test_dsv41_serve_budget$(EXE): tests/test_dsv41_serve_budget.c sse41_kernels.h deepseek_v41.c cli_args.h st.h json.h tok.h tok_unicode.h compat.h omp_tune.h kv_prefix.h pin_pool.h quant.h fp8_format.h idot.h sparse_attn.h hyper_connections.h serve_codec.h serve_poll.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c sse41_kernels.h qwen38.c qwen38_core.h kv_prefix.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h fp8_format.h idot.h route_trace.h tok_unicode.h tok_unicode_o200k.h
-	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c sse41_kernels.h qwen38.c qwen38_core.h kv_prefix.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h fp8_format.h idot.h route_trace.h tok_unicode.h tok_unicode_o200k.h $(QWEN36_TIER_SRC) $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(QWEN36_TIER_SRC) $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c sse41_kernels.h qwen38.c qwen38_core.h kv_prefix.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h fp8_format.h idot.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
@@ -1366,8 +1366,8 @@ tests/test_qwen38_prefix$(EXE): tests/test_qwen38_prefix.c sse41_kernels.h qwen3
 tests/test_qwen38_metrics$(EXE): tests/test_qwen38_metrics.c sse41_kernels.h qwen38.c qwen38_core.h kv_prefix.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h fp8_format.h idot.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen38_native_weights$(EXE): tests/test_qwen38_native_weights.c sse41_kernels.h qwen38.c qwen38_core.h kv_prefix.h qwen38_nfc.h qwen38_nfc_tables.h segment_runtime.c segment_runtime.h segment_adapters.h segment_adapter_internal.h st.h json.h compat.h quant.h fp8_format.h idot.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
-	$(CC) $(NOCUDA_CFLAGS) $< segment_runtime.c -o $@ $(NOCUDA_LDFLAGS)
+tests/test_qwen38_native_weights$(EXE): tests/test_qwen38_native_weights.c sse41_kernels.h qwen38.c qwen38_core.h kv_prefix.h qwen38_nfc.h qwen38_nfc_tables.h segment_runtime.c segment_runtime.h segment_adapters.h segment_adapter_internal.h st.h json.h compat.h quant.h fp8_format.h idot.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h $(QWEN36_TIER_SRC) $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< segment_runtime.c $(QWEN36_TIER_SRC) $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_st_map$(EXE): tests/test_st_map.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
