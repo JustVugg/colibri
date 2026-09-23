@@ -3956,14 +3956,19 @@ class APIHandler(BaseHTTPRequestHandler):
             self._check_host()
             self.require_auth()
             body = self.read_json()
-            self.check_model(body)
             path = urlsplit(self.path).path
+            # A client written for Jev sends "jev-latest": on that route the
+            # served model answers whatever name was asked for.
+            if path != "/v1/systemone":
+                self.check_model(body)
             if path == "/v1/chat/completions":
                 self.chat_completion(body, request_id)
             elif path == "/v1/completions":
                 self.completion(body, request_id)
             elif path == "/v1/brio":
                 self.brio(body, request_id)
+            elif path == "/v1/systemone":
+                self.systemone(body, request_id)
             elif path == "/v1/messages":
                 self.anthropic_messages(body, request_id)
             else:
@@ -4009,11 +4014,11 @@ class APIHandler(BaseHTTPRequestHandler):
     # malformato perche' non lo scrive il modello. Prima queste due forme
     # esistevano solo come script di misura: chi integrava doveva riscriverle.
     @staticmethod
-    def _brio_options(options, where):
+    def _brio_options(options, where, limit=64):
         if not isinstance(options, list) or not options:
             raise APIError(400, f"`{where}` must be a non-empty array of strings.", where)
-        if len(options) > 64:
-            raise APIError(400, f"`{where}` accepts at most 64 entries.", where)
+        if len(options) > limit:
+            raise APIError(400, f"`{where}` accepts at most {limit} entries.", where)
         seen = set()
         for option in options:
             if not isinstance(option, str) or not option.strip():
@@ -4025,7 +4030,11 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, f"`{where}` needs at least two options to choose between.", where)
         return options
 
-    def brio(self, body, request_id):
+    def brio(self, body, request_id, send=True):
+        # `send=False` returns the result instead of writing it: /v1/systemone
+        # builds a `questions` request and re-shapes the answer. `_max_options`
+        # is that caller's word too (Jev allows 255 labels); clamped.
+        option_limit = min(int(body.get("_max_options", 64) or 64), 255)
         forms = [k for k in ("options", "questions", "schema") if body.get(k) is not None]
         if len(forms) != 1:
             raise APIError(400, "Provide exactly one of `options`, `questions` or `schema`.",
@@ -4055,7 +4064,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 if per not in ("mean", "sum"):
                     raise APIError(400, "`normalize` must be \"mean\" or \"sum\".", "normalize")
                 questions.append((text, self._brio_options(entry.get("options"),
-                                                           f"questions[{i}].options"), per))
+                                                           f"questions[{i}].options",
+                                                           option_limit), per))
         else:
             raw = body["schema"]
             if not isinstance(raw, dict) or not raw:
@@ -4231,9 +4241,143 @@ class APIHandler(BaseHTTPRequestHandler):
                       "read_tokens": read_total,
                       "total_tokens": prompt_max + read_total},
         })
-        self.send_json(200, result, request_id,
-                       {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000)),
-                        "x-colibri-elapsed-ms": str(round((time.time() - started) * 1000))})
+        headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000)),
+                   "x-colibri-elapsed-ms": str(round((time.time() - started) * 1000))}
+        if not send:
+            result["_headers"] = headers
+            return result
+        self.send_json(200, result, request_id, headers)
+
+    # ------------------------------------------------------------ Jev-compatible
+    #
+    # POST /v1/systemone speaks the request and the reply of TypeSafe's Jev
+    # API (docs.typesafe.ai/api): a client written for it points at colibri
+    # and changes the base URL, nothing else. The three primitives map onto
+    # the `questions` form of /v1/brio, the same channel: the state is
+    # photographed once and every question pays only its own tokens.
+    #
+    #   noul   -> one yes/no question. `noul` is the probability of yes. The
+    #             optional criteria (what true and false mean) go into the
+    #             question text.
+    #   choice -> the labels of `criteria` are the options; their descriptions
+    #             go into the question text, because a label alone ("billing")
+    #             does not say what it means. `confidence` follows their
+    #             documented formula, (n * peak - 1) / (n - 1).
+    #   score  -> the levels of `criteria` are the options "1".."n"; `score`
+    #             is the expected value under the distribution, `legend` the
+    #             levels by number, `confidence` as for choice.
+    #
+    # What differs, stated rather than hidden: `model` echoes the served
+    # model, not "jev-latest"; `usage.output_tokens` counts the option tokens
+    # READ, since this engine generates nothing; validation errors are 422 as
+    # theirs are, with this server's error envelope. docs/brio.md has the
+    # mapping table.
+    _SYSTEMONE_MAX_QUESTIONS = 64
+
+    @staticmethod
+    def _systemone_text(value, where):
+        """Jev's EntryType: a string, or JSON given as an object or an array."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value.strip() or None
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False, indent=2)
+        raise APIError(422, f"`{where}` must be a string, an object or an array.", where)
+
+    @staticmethod
+    def _systemone_confidence(probabilities):
+        """(n * peak - 1) / (n - 1): 1 when all the mass is on one label, 0 when flat."""
+        values = list(probabilities)
+        n = len(values)
+        if n < 2:
+            return 1.0
+        return round(max(0.0, (n * max(values) - 1.0) / (n - 1)), 6)
+
+    def systemone(self, body, request_id):
+        state = self._systemone_text(body.get("state"), "state")
+        if state is None:
+            raise APIError(422, "`state` is required: the content the questions are about.", "state")
+        raw = body.get("questions")
+        if not isinstance(raw, dict) or not raw:
+            raise APIError(422, "`questions` must be a non-empty object of id: question.", "questions")
+        if len(raw) > self._SYSTEMONE_MAX_QUESTIONS:
+            raise APIError(422, f"`questions` accepts at most {self._SYSTEMONE_MAX_QUESTIONS} entries.",
+                           "questions")
+        plan = []                                   # (id, kind, text, options, levels)
+        for qid, question in raw.items():
+            where = f"questions.{qid}"
+            if not isinstance(qid, str) or not qid.strip():
+                raise APIError(422, "Every question id must be a non-empty string.", "questions")
+            if not isinstance(question, dict):
+                raise APIError(422, f"`{where}` must be an object.", where)
+            kind = question.get("type")
+            instructions = self._systemone_text(question.get("instructions"), f"{where}.instructions")
+            criteria = question.get("criteria")
+            if kind == "noul":
+                if criteria is not None and not isinstance(criteria, dict):
+                    raise APIError(422, f"`{where}.criteria` must be an object with `true` and/or `false`.",
+                                   f"{where}.criteria")
+                yes = self._systemone_text((criteria or {}).get("true"), f"{where}.criteria.true")
+                no = self._systemone_text((criteria or {}).get("false"), f"{where}.criteria.false")
+                text = instructions or "Is this true?"
+                if yes:
+                    text += f"\nyes: {yes}"
+                if no:
+                    text += f"\nno: {no}"
+                plan.append((qid, "noul", text + "\nAnswer yes or no.", ["yes", "no"], None))
+            elif kind == "choice":
+                if not isinstance(criteria, dict) or not criteria:
+                    raise APIError(422, f"`{where}.criteria` must be a non-empty object of label: description.",
+                                   f"{where}.criteria")
+                if len(criteria) > 255:
+                    raise APIError(422, f"`{where}.criteria` accepts at most 255 labels.", f"{where}.criteria")
+                labels, lines = [], []
+                for label, description in criteria.items():
+                    if not isinstance(label, str) or not label.strip():
+                        raise APIError(422, f"Every label of `{where}.criteria` must be a non-empty string.",
+                                       f"{where}.criteria")
+                    labels.append(label)
+                    text = self._systemone_text(description, f"{where}.criteria.{label}")
+                    lines.append(f"- {label}: {text}" if text else f"- {label}")
+                if len(labels) < 2:
+                    raise APIError(422, f"`{where}.criteria` needs at least two labels.", f"{where}.criteria")
+                text = (instructions or "Which of the following applies?") + "\nOptions:\n" + "\n".join(lines)
+                plan.append((qid, "choice", text + "\nAnswer with one of the options.", labels, None))
+            elif kind == "score":
+                if not isinstance(criteria, list) or not 2 <= len(criteria) <= 10:
+                    raise APIError(422, f"`{where}.criteria` must be an array of 2 to 10 level descriptions.",
+                                   f"{where}.criteria")
+                levels = [self._systemone_text(c, f"{where}.criteria[{i}]") or f"level {i + 1}"
+                          for i, c in enumerate(criteria)]
+                text = (instructions or "Rate this on the scale below.") + "\nScale:\n" + \
+                    "\n".join(f"{i + 1}: {d}" for i, d in enumerate(levels))
+                plan.append((qid, "score", text + "\nAnswer with the number.",
+                             [str(i + 1) for i in range(len(levels))], levels))
+            else:
+                raise APIError(422, f"`{where}.type` must be \"noul\", \"choice\" or \"score\".", f"{where}.type")
+        inner = {"state": state, "_max_options": 255,
+                 "questions": [{"question": text, "options": options} for _, _, text, options, _ in plan]}
+        result = self.brio(inner, request_id, send=False)
+        answers = {}
+        for (qid, kind, _, options, levels), got in zip(plan, result["answers"]):
+            p = {c["option"]: c["p"] for c in got["choices"]}
+            if kind == "noul":
+                answers[qid] = {"type": "noul", "noul": round(p.get("yes", 0.0), 6)}
+            elif kind == "choice":
+                answers[qid] = {"type": "choice", "choice": got["answer"],
+                                "probabilities": {o: round(p[o], 6) for o in options},
+                                "confidence": self._systemone_confidence(p.values())}
+            else:
+                answers[qid] = {"type": "score",
+                                "score": round(sum(int(k) * v for k, v in p.items()), 6),
+                                "legend": {str(i + 1): d for i, d in enumerate(levels)},
+                                "probabilities": {o: round(p[o], 6) for o in options},
+                                "confidence": self._systemone_confidence(p.values())}
+        reply = {"model": self.server.model_id, "answers": answers,
+                 "usage": {"input_tokens": result["usage"]["prompt_tokens"],
+                           "output_tokens": result["usage"]["read_tokens"]}}
+        self.send_json(200, reply, request_id, result.get("_headers"))
 
     def _fail(self, error, request_id):
         """Report an error, unless the response is already on the wire. Once a streaming 200

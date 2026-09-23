@@ -39,7 +39,7 @@ Colibrì は VRAM・RAM・ストレージを単一のマルチティア階層と
 
 ```
 $ ./coli chat
-  🐦 colibri v1.12.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.12.1 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -55,18 +55,26 @@ $ ./coli chat
 VRAM/RAM/ディスクのティアバー、隅にはライブのミニ脳を表示しています。</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brain.png" width="900" alt="Brain ページ — 19,456 個のエキスパートを生きた皮質として表示">
+  <img src="docs/media/colibri-brain.png" width="900" alt="Brain ページ — GLM-5.2 の計測されたエキスパートアトラスを皮質として描画、入れる 10 の領域">
 </p>
-<p align="center"><em><strong>Brain</strong> ページ: 19,456 個のエキスパートすべてを生きた皮質として表示 — 色はストレージのティア、
-明るさはルーティングの熱量を表し、1 ターンでルーティングされたエキスパートは白く光ります。ホバーするとそのエキスパートの
-<a href="https://github.com/JustVugg/colibri/issues/175">計測されたトピック親和性</a>が表示されます。</em></p>
+<p align="center"><em><strong>Brain</strong> ページの <strong>Explore</strong> 表示: GLM-5.2 の<a href="https://github.com/JustVugg/colibri/issues/175">計測されたエキスパートアトラス</a>を皮質として描画します。
+特性が明らかになった 13,260 個のエキスパートが 10 の領域（Python、SQL、数学、詩、法律、中国語…）に分かれ、位置は学習された埋め込みではなく
+計測されたルーティング親和性です。領域を選ぶとその中に入れます。<strong>Live routing</strong> 表示は実際に動いているモデルに切り替わり、
+エキスパートごとに 1 セル、色はストレージのティア、1 ターンでルーティングされたエキスパートは白く光ります。</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-atlas.png" width="900" alt="Atlas ページ — 計測されたエキスパートアトラスを 3D 銀河として表示">
+  <img src="docs/media/colibri-brain-region.png" width="900" alt="Python 領域の内部 — 1,142 個のエキスパート、選択した 1 つとその計測された親和性">
 </p>
-<p align="center"><em><strong>Atlas</strong> ページ: <a href="https://github.com/JustVugg/colibri/issues/175">計測されたエキスパートアトラス</a>
-を 3D 銀河として表示 — 特性が明らかになった 13,260 個のエキスパートと、トピック（詩、法律、中国語、SQL…）ごとに
-クラスタを形成する再現性のある 1,041 個のスペシャリスト。位置は学習された埋め込みではなく、計測されたルーティング親和性です。ドラッグで回転できます。</em></p>
+<p align="center"><em><strong>Python</strong> 領域の内部: 1,142 個のエキスパートが星座として並び、それぞれにレイヤーと番号のラベルが付きます。パネルはその 1 つ、
+レイヤー 17 のエキスパート 178 を表示しています。エントロピー 3.13 のジェネラリストで、計測された親和性は Python 20.2%、JSON 14.6%、
+会話 14.2%、SQL 13.3% です。</em></p>
+
+<p align="center">
+  <img src="docs/media/colibri-profiling.png" width="900" alt="Profiling ページ — エンジンが各ターンで時間を使う場所">
+</p>
+<p align="center"><em><strong>Profiling</strong> ページ: エンジンが各ターンで時間を使う場所をフェーズごとに示し、直近 30 ターンを推移として表示します。
+ここでは CPU マシン上の Qwen3.6: プロンプト 36 トークンと生成 55 トークンで壁時計時間 19.0 秒、2.9 tok/s、
+ディスクサービス 11.4 秒は計算と重なっています。</em></p>
 
 ## 研究のミッション
 

@@ -3,6 +3,146 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.12.1] — 2026-09-22
+
+32 pull requests since v1.12.0, 22 of them from contributors. Two tokenizers
+brought back to the reference, brio on the ninth engine, `coli chat` working
+again at the default context on two families, and a placement decision that
+is now measured on the card in front of it instead of predicted.
+
+### Tokenizers, measured against the reference
+
+- **#1654**: qwen36 tokenized differently from HF `tokenizers` in two ways.
+  An added token right after punctuation was encoded as text (`X.<|im_end|>`
+  was 7 tokens instead of 3, every chat turn ending in punctuation paid +4,
+  #1653), and a whitespace run followed by a non-space was one piece where
+  the regex's `\s+(?!\S)` leaves the last char to the next one, so every
+  indented line of code tokenized differently. Measured on the real
+  vocabulary: 2,803 lines and blocks of code, Markdown, Chinese and
+  Japanese went from 757 identical to 2,803, with 5.4% fewer tokens.
+- **#1656**: OLMoE's `tokenizer.json` has no Split, a bare ByteLevel with
+  `use_regex`, for which HF runs the original GPT-2 pattern; `tok.h` applied
+  cl100k. A GPT-2 family in `tok.h`: 1,560/1,708 identical before, 1,708/1,708
+  after. The same measurement on GLM-5.2/5.3/5.3-Flash, DeepSeek V4 and V4.1,
+  Inkling and Qwen3.8 came back identical on every case.
+
+### Brio and the serve contract
+
+- **#1662**: `POST /v1/systemone`, the request and the reply of TypeSafe's
+  Jev API, served by the brio channel: a client written for it points at
+  colibri and changes the base URL. `noul` is a yes/no question, `choice`
+  scores the labels with their descriptions in the text, `score` the level
+  numbers with the expected value and the legend; `confidence` by their
+  documented formula. Any `model` name is accepted on that route. Measured on
+  the real Qwen3.6: the three-question example of the docs in 1m46 with the
+  state read once.
+- **#1655**: the DeepSeek V4 engine speaks the numeric channel (`logprobs=k`,
+  `pin=1`, `max_tokens=0`), so `/v1/brio` works on the ninth engine instead
+  of answering 500 (#1648). The head that used to keep only its argmax now
+  returns the whole row; `ECHO` per prompt position during prefill, the
+  prompt-end scores kept with a state snapshot on `pin`, and a logprob tail
+  on every `DATA` frame during generation. The tiny fixture pins that the
+  best `ECHO` token equals the greedy token from the same prefix, and that
+  the pinned predictor equals a cold prefill's.
+- **#1659**: qwen36 and qwen38 refused a request when `prompt + max_tokens`
+  exceeded the context, and the gateway's default budget for these two
+  families is 8192, the whole default context: every request without
+  `max_tokens` and every `coli chat` message answered 400 on a two-token
+  prompt (#1641). `max_tokens` is now a ceiling, clamped to the room the
+  prompt leaves, as GLM and DeepSeek V4 already did; only a prompt that does
+  not fit is refused. `docs/api.md` states the rule, `docs/qwen38.md` names
+  `Q38_MAXT` as the variable `--ctx` becomes.
+
+### The dense trunk in VRAM, measured before it is placed
+
+- **#1657**: qwen36 offers the rest of its dense trunk to the VRAM placer:
+  the DeltaNet out_proj (`dnout`), the attention q/k/v/o (`attnproj`) and
+  the shared expert (`shexp`), about 650 MB more of int8 on the 35B beside
+  `lmhead` and `dnproj`. Measured on four Tesla M10 by the reporter of
+  #1652, every placed component ran slower than the CPU (lm_head 68.8 ms
+  against 41.7), so the engine now times one GEMV both ways at startup and
+  withdraws the whole automatic placement when the GPU loses, giving the
+  VRAM back to the experts: `auto` equals `off` on that box, byte-identical
+  output. A hand-written `COLI_PLACE` stands; `COLI_TRUNK_PROBE=0` trusts
+  the placer.
+
+### Performance
+
+- **#PR**: qwen36's dense trunk and routed experts multiply with integer
+  dot products. The activation is quantized to int8 once per call and the
+  weights, int8 rows or int4 planar blocks, meet it with maddubs / vpdpbusd
+  instead of a float conversion per weight; the integer kernels move from
+  `quant.h` into `idot.h`, shared by every engine. Measured on the 35B, 8
+  threads, every expert resident: decode 6.71 to 8.23 tok/s (+22.6%), lm_head
+  12.6 to 10.1 ms/token, the expert compute 22.7 to 15.6, for +1.3%
+  perplexity on 4 x 512 tokens. Both are the default (`COLI_DENSE_IDOT=0`,
+  `QWEN_EXPERT_ACT=f32` restore the f32 kernels). `COLI_DENSE_BITS=4` with
+  `COLI_DENSE_INT4=<components>` stores part of the trunk as int4 in blocks
+  of 64: opt-in, with the perplexity it costs per component in the docs
+  (lm_head alone +2.4%, everything +10%).
+
+### Performance, from contributors
+
+- **#1606**: the K1b grouped int4 family gets a multi-row tile and AVX-512
+  and AMX arms, and is no longer switched off on AVX-512 builds; exact on
+  all eight engines on a 16-core AVX-512 host.
+- **#1239**: an SSE4.1 tier for the olmoe and qwen36 int8 GEMV, for hosts
+  with SSE4.1 but no AVX2; on the Sandy Bridge of #1652 decode went from
+  2.45 to 3.54 tok/s.
+- **#1313**: `matmul_fp8` computes four output rows per pass under clang,
+  where the contraction makes it bit-exact; GCC keeps the one-row kernel.
+- **#1612**: qwen36 gains the GLM engine's `CACHE_ROUTE` lever, with the
+  VRAM tier as the first residency level, opt-in.
+- **#906**: `DEGRADE_ZERO`, an opt-in policy that zero-fills a missed
+  expert slot below a gate-weight threshold instead of blocking on the
+  load (#865).
+
+### Fixed
+
+- **#1626**: `SNAP` is the model directory for every non-GLM engine, so
+  `coli run` stops handing them a leftover environment (#1600).
+- **#1604**: glm53 honours `Mat.resident` in the Vulkan gate and frees the
+  Vulkan handle in `mat_release`.
+- **#1321**: glm53 sizes its expert cache around the model rather than
+  around `MemAvailable`, which the page cache had been inflating.
+- **#1588**: qwen36 refuses loudly on a failed encode-buffer realloc instead
+  of writing through NULL.
+- **#1546**: `coli convert` routes OLMoE to `convert_olmoe_merged.py`.
+- **#1630**: olmoe emits the `ROUTE_TRACE` records it announced; the stream
+  used to be a zero-byte file.
+- **#1610**: `v41_dsml.py` is staged during installation (and the nix flake
+  bumped).
+- **#1511**: the GPU test suite builds under HIP on gfx1151.
+- **#1658**: `test_mem_available` compared two reads of available memory
+  with `==` and failed on a busy Windows runner; a quarter of a GB of
+  tolerance.
+
+### Tools and the gateway
+
+- **#1425**: a general GGUF reader, pure stdlib, and a converter from GGUF
+  OLMoE checkpoints to a colibri container, with the numerical evidence in
+  its own CI job.
+- **#1497**: opt-in prompt-injected tool calling for the families without
+  native tool tokens (OLMoE, Qwen3.6), behind `COLI_TOOL_FALLBACK=1`, with a
+  two-turn end-to-end test.
+- **#1355**, **#1357**: durable per-request results and strict stdout
+  classification in the eval harness, and the logprob-gap check gated on
+  the engine preamble.
+
+### Docs
+
+- **#1639**, **#1644**: the README shows brio mode and the dashboard as it
+  is: the workspace, the Brain page (the measured expert atlas as a cortex,
+  and a region inside it) and the Profiling page, in four languages;
+  `docs/api.md` describes the four pages instead of the old console.
+- **#1492**, **#1643**: a Japanese README, and its banner at the shipping
+  version, which the banner test now checks in every language.
+- **#1634**: the multi-disk guide states measured gains and limits instead
+  of "twice the bandwidth", with Bash and PowerShell examples.
+- **#1617**: connecting the pi coding agent to `coli serve`.
+- **#1619**: `expected_bytes` identity versus physical extent for
+  int4-rans256-g0 (#1273).
+
 ## [1.12.0] — 2026-09-20
 
 81 pull requests since v1.11.0. A new way to ask a model a closed question,

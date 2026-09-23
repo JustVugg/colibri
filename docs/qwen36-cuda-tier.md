@@ -60,10 +60,42 @@ the trunk on the CPU is why a 6 GB card sees the hit rate stop mattering
 (#1040): the GPU is doing the cheap job.
 
 By default the engine now places the trunk itself. Before the tier decides its
-budget, the engine offers each trunk component with its size (lm_head once, the
-fused DeltaNet projection of every DeltaNet layer), and the tier prices them
-against the experts they would displace, in **bytes saved on the memory bus per
-token, per byte of VRAM**:
+budget, the engine offers each trunk component with its size, and the tier
+prices them against the experts they would displace, in **bytes saved on the
+memory bus per token, per byte of VRAM**. The components, with their int8 size
+on Qwen3.6-35B-A3B (hidden 2048, 30 DeltaNet and 10 attention layers):
+
+| component | what | per layer | total |
+|---|---|---|---|
+| `lmhead` | the output head, once | | 508 MB |
+| `dnproj` | DeltaNet in_proj qkv ++ z, fused | 25.2 MB | 755 MB |
+| `dnout` | DeltaNet out_proj | 8.4 MB | 252 MB |
+| `attnproj` | attention q, k, v, o (one item, four matrices) | 27.3 MB | 273 MB |
+| `shexp` | the shared expert's gate, up, down | 3.1 MB | 126 MB |
+
+Offer order is the placement priority once the budget runs short: `lmhead`,
+then `dnproj`, `dnout`, `attnproj`, `shexp`, each in layer order, so a partial
+placement is whole layers. `dnout`, `attnproj` and `shexp` were added after
+the M10 datapoint in #1652 showed the un-offloaded dense path as the ceiling
+on a CPU without AVX2; measured on a 16-core CPU, of the 37.5 ms a decoded
+token spends in the DeltaNet stack 23.4 are the input projections, 8.3 the
+out_proj and norm, 3.3 the convolution and 2.4 the recurrence -- the matmuls,
+not the recurrence, are what the trunk costs. They are served from VRAM on
+decode (one GEMV each); a prompt batch keeps the batched CPU matmul.
+
+**Measured, not assumed.** The pricing rule below presumes the GPU answers a
+GEMV faster than the CPU does. Four Tesla M10 (sm_50, no tensor cores, four
+GPUs on one PCIe board) said otherwise in #1652: with every expert
+VRAM-resident, placing the trunk made every component slower (lm_head 68.8 ms
+against 41.7 on the CPU, the 30 DeltaNet projections 106 against 66) and
+decode fell from 3.56 to 2.68 tok/s. So the engine measures before it uploads
+a byte of trunk: one DeltaNet input projection is timed both ways on the
+device that would host it (ten GEMVs, best of three rounds, after a warm-up),
+one `[place] probe:` line reports both times, and if the GPU loses the whole
+automatic placement is withdrawn (`[place] trunk stays on the CPU`) and its
+bytes go back to the expert budget before the warmstart. Only the automatic
+placement is questioned: a hand-written `COLI_PLACE` stands, and
+`COLI_TRUNK_PROBE=0` skips the probe. The pricing rule:
 
 - a dense component is read every token: 1.0 per byte;
 - a routed expert is read with the probability a token routes to it -- its heat
@@ -82,6 +114,7 @@ of that device's expert budget, and each decision prints as a `[place]` line.
 | unset or `auto` | automatic, as above |
 | `off` | nothing placed: experts only (the behaviour before this) |
 | `lmhead=0,dnproj=0:20+1:20,experts=0` | hand-written list (the measurement tool); obeyed as written, trunk bytes still charged to the budget |
+| `dnout=0,attnproj=0,shexp=0` | the same list form for the newer components; any of the five names, per layer or split with `+` |
 
 First calibration, one Quadro RTX 4000 (8 GB), per-row int4 container, 200-token
 decode, same prompt, output bit-identical in all four runs:

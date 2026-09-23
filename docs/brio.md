@@ -181,6 +181,74 @@ const { json, fields } = await r.json();
 // json.queue, json.urgent are guaranteed to be values from your lists
 ```
 
+### For code written against Jev: `POST /v1/systemone`
+
+If your application already speaks TypeSafe's Jev API, point it at colibri
+and change the base URL; the request and the reply are the same shape. The
+route accepts any `model` name (a Jev client sends `jev-latest`) and answers
+with the model the server actually runs.
+
+```bash
+curl -s http://127.0.0.1:8000/v1/systemone \
+  -H "Authorization: Bearer $COLI_API_KEY" -H "Content-Type: application/json" \
+  -d '{
+    "state": "Hi, I have been trying to connect my Stripe account for 3 days and the integration keeps failing. I am losing sales. Please help ASAP.",
+    "model": "jev-latest",
+    "questions": {
+      "urgency":    {"type": "noul",   "instructions": "Does this message express urgency?"},
+      "department": {"type": "choice", "instructions": "Which team should handle this?",
+                     "criteria": {"billing": "payments, invoices, Stripe payouts",
+                                  "technical": "bugs, outages, integration errors",
+                                  "sales": "pricing, plans, upgrades"}},
+      "severity":   {"type": "score",  "instructions": "How severe is the customer impact?",
+                     "criteria": ["no impact", "minor inconvenience", "blocked on one task",
+                                  "losing money", "business down"]}
+    }}'
+```
+
+The reply, from Qwen3.6-35B-A3B on a CPU box (1m46 with the experts streamed
+from disk, the state read once for the three questions):
+
+```json
+{"model": "qwen36",
+ "answers": {
+   "urgency":    {"type": "noul", "noul": 0.847606},
+   "department": {"type": "choice", "choice": "technical",
+                  "probabilities": {"billing": 0.059806, "technical": 0.939983, "sales": 0.000211},
+                  "confidence": 0.909974},
+   "severity":   {"type": "score", "score": 3.831772,
+                  "legend": {"1": "no impact", "2": "minor inconvenience", "3": "blocked on one task",
+                             "4": "losing money", "5": "business down"},
+                  "probabilities": {"1": 0.044403, "2": 0.02624, "3": 0.034899, "4": 0.842097, "5": 0.052361},
+                  "confidence": 0.802621}},
+ "usage": {"input_tokens": 86, "output_tokens": 15}}
+```
+
+How the three primitives map onto the `questions` form above, so you know
+what the model is actually asked:
+
+| Jev primitive | what is scored | what goes into the question text | reply |
+|---|---|---|---|
+| `noul` | `yes` / `no` | `instructions`, then `yes: <criteria.true>` and `no: <criteria.false>` when given, then "Answer yes or no." | `noul` = probability of yes |
+| `choice` | the labels of `criteria` (up to 255) | `instructions`, then one line per label with its description | `choice`, `probabilities` by label, `confidence` |
+| `score` | the level numbers `"1".."n"` (2 to 10 levels) | `instructions`, then `k: <description>` per level, then "Answer with the number." | `score` = expected value under the distribution, `legend` by number, `probabilities`, `confidence` |
+
+`state` and `instructions` may be a string, an object or an array; JSON is
+serialized as text. `confidence` is the formula their documentation gives,
+`(n * peak - 1) / (n - 1)`: 1 when all the mass sits on one label, 0 when
+flat; `noul` carries none, as in theirs.
+
+What differs, stated rather than hidden:
+
+- `model` in the reply is the served model, not a Jev version.
+- `usage.output_tokens` counts the option tokens the engine **read**; nothing
+  is generated. `input_tokens` is the longest prompt of the request.
+- Validation errors are `422`, as theirs, with this server's error envelope
+  (`error.message`, `error.param`).
+- The probabilities are this model's, normalised over the options with the
+  `mean` rule above. The numbers will not match Jev's on the same input; the
+  contract is the same, the model is yours.
+
 ### Do not put the options in the prompt
 
 Write the state and the question; leave the option list to the `options` field. On a

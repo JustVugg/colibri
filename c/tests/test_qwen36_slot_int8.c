@@ -38,11 +38,18 @@ static uint8_t *random_packed(int64_t nbytes, uint32_t seed) {
 
 /* inter/hidden chosen so ng=inter*hidden and nd=hidden*inter land on both
  * sides of the AVX2 16-byte (32-element) vector boundary across the three
- * segments (g/u sized ng, d sized nd). */
+ * segments (g/u sized ng, d sized nd). ng/nd must stay even: nibble-packing
+ * always yields ceil(n/2) bytes, and real containers guarantee even
+ * inter*hidden (SIMD/GS64-block-aligned dims), so old_unpack -- a verbatim
+ * copy of the pre-#1271 scalar loop, kept unmodified on purpose -- was never
+ * written to handle an odd total (its last iteration writes dst[i+1]
+ * unconditionally) and shouldn't be, either: that shape cannot occur. */
 static void one_case(int inter, int hidden, const char *label) {
     Model m; memset(&m, 0, sizeof(m));
     m.c.inter = inter; m.c.hidden = hidden;
     int64_t ng = (int64_t)inter * hidden, nd = (int64_t)hidden * inter;
+    CHECK(ng % 2 == 0, "%s: ng must be even (nibble-packed, see one_case)", label);
+    if (ng % 2) return;
 
     Slot s; memset(&s, 0, sizeof(s));
     s.g4 = random_packed(ng / 2, 1001);
@@ -73,7 +80,7 @@ int main(void) {
     one_case(4, 8, "tiny, well under one vector");             /* ng=32, nd=32 */
     one_case(16, 16, "exact AVX2 vector boundary");             /* ng=256, nd=256, /16=16 (mult of 16-byte block) */
     one_case(17, 16, "vector body + scalar tail");              /* ng=272 -> nb=136, not mult of 16 */
-    one_case(37, 41, "odd, real-expert-shaped");                /* ng=1517, nd=1517 */
+    one_case(37, 42, "odd, real-expert-shaped");                /* ng=1554, nd=1554 (even: see one_case) */
     one_case(2048, 512, "large, real Qwen3.6 expert scale");    /* ng=1048576, nd=1048576 */
 
     /* re-entrancy guard: slot_ensure_int8 must no-op when s->g is already set

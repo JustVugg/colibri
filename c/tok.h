@@ -58,6 +58,8 @@ typedef struct {
     int o200k;           /* pre_tokenizer regex family: 0 = cl100k (GLM), 1 = o200k (Inkling) */
     int kimi;            /* 1 = Kimi (K3) family: o200k rules + a leading \p{Han}-run rule,
                           * Han excluded from the letter classes, no '/' tail in the punct rule */
+    int gpt2;            /* 1 = GPT-2 family (OLMoE / GPT-NeoX): a bare ByteLevel pre_tokenizer
+                          * with use_regex and no Split, so HF applies the original GPT-2 pattern */
     int rankbpe;         /* 1 = no merges list (tiktoken-derived vocab): merge the adjacent
                           * pair whose CONCATENATION has the lowest vocab id — exactly
                           * tiktoken's byte_pair_encode, no recovered merges to diverge */
@@ -218,6 +220,13 @@ static void tok_load(Tok *T, const char *path){
      * case-category classes (\p{Lu}...) which cl100k does not use */
     jval *pt=json_get(root,"pre_tokenizer");
     if(pt){
+        /* No Split at all, just ByteLevel with use_regex (the default): HF runs
+         * the original GPT-2 regex, not cl100k. OLMoE's tokenizer.json is this. */
+        jval *pty=json_get(pt,"type");
+        if(pty && pty->t==J_STR && pty->str && !strcmp(pty->str,"ByteLevel")){
+            jval *ur=json_get(pt,"use_regex");
+            if(!ur || (ur->t==J_BOOL && ur->boolean)) T->gpt2=1;
+        }
         jval *ps=json_get(pt,"pretokenizers");
         if(ps&&ps->t==J_ARR) for(int i=0;i<ps->len;i++){
             jval *pat=json_get(ps->kids[i],"pattern");
@@ -532,6 +541,52 @@ static void pretok_chunk_kimi(Tok *T, const unsigned char *p, int a, int b, int 
     free(cp); free(off);
 }
 
+/* ---------- pre-tokenizer GPT-2 (bare ByteLevel with use_regex: OLMoE, GPT-NeoX) ----------
+ * The original GPT-2 pattern, which HF applies when the pre_tokenizer is a
+ * ByteLevel with use_regex=true and no Split in front of it:
+ *   's|'t|'re|'ve|'m|'ll|'d | ?\p{L}+ | ?\p{N}+ | ?[^\s\p{L}\p{N}]+ | \s+(?!\S) | \s+
+ * It differs from cl100k in every rule: the contractions are case-sensitive,
+ * letters and digits take ONE optional leading space (not any non-letter),
+ * digit runs are unbounded, the punctuation run has no newline tail, and
+ * there is no \s*[\r\n]+ rule. Measured on OLMoE against `tokenizers`:
+ * 1560/1708 cases identical under the cl100k rules, every miss a " 4" /
+ * " 20"-style number or a non-space prefix glued to a word. */
+static void pretok_chunk_gpt2(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
+    int nb=b-a; if(nb<=0) return;
+    uint32_t *cp=malloc((nb+1)*sizeof(uint32_t)); int *off=malloc((nb+2)*sizeof(int)); int n=0;
+    for(int i=a;i<b;){ uint32_t c; int k=u8_next(p,b,i,&c); off[n]=i; cp[n]=c; n++; i+=k; }
+    off[n]=b;
+    int i=0;
+    while(i<n){
+        int start=i; uint32_t c=cp[i];
+        /* 1) 's|'t|'re|'ve|'m|'ll|'d  -- case-sensitive, unlike cl100k's (?i:) */
+        if(c=='\'' && i+1<n){
+            uint32_t d=cp[i+1];
+            if(i+2<n){ uint32_t d2=cp[i+2];
+                if((d=='r'&&d2=='e')||(d=='v'&&d2=='e')||(d=='l'&&d2=='l')){ i+=3; bpe_piece(T,p,off[start],off[i],out,no,max); continue; } }
+            if(d=='s'||d=='t'||d=='m'||d=='d'){ i+=2; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        }
+        /* 2) ' ?\p{L}+'  3) ' ?\p{N}+'  4) ' ?[^\s\p{L}\p{N}]+' : one optional space, then a run of one class */
+        {
+            int j=i; if(c==' ' && j+1<n) j++;
+            uint32_t d=cp[j];
+            if(is_L(d)){ while(j<n && is_L(cp[j])) j++; i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+            if(is_N(d)){ while(j<n && is_N(cp[j])) j++; i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+            if(!is_S(d)){ while(j<n && !is_S(cp[j]) && !is_L(cp[j]) && !is_N(cp[j])) j++; i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        }
+        /* 5) \s+(?!\S): a run followed by a non-space keeps its last char for the
+         * next piece (which takes it as its optional space); at the end of the
+         * input the whole run. 6) \s+: a single whitespace before a non-space. */
+        {
+            int r=i; while(r<n && is_S(cp[r])) r++;
+            if(r>i){ int end=(r<n)? r-1 : r; if(end<=i) end=i+1; i=end; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        }
+        i++;  /* unreachable: every codepoint is a letter, a digit, whitespace or none of them */
+        bpe_piece(T,p,off[start],off[i],out,no,max);
+    }
+    free(cp); free(off);
+}
+
 /* ---------- encode: testo -> id (split sugli added token, poi pretok+BPE) ---------- */
 static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
     const unsigned char *p=(const unsigned char*)text; int no=0; int i=0;
@@ -546,7 +601,8 @@ static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
         }
         int chunk_end = (hitpos<0) ? len : hitpos;
         if(chunk_end>i){
-            if(T->kimi)       pretok_chunk_kimi(T,p,i,chunk_end,out,&no,max);
+            if(T->gpt2)       pretok_chunk_gpt2(T,p,i,chunk_end,out,&no,max);
+            else if(T->kimi)  pretok_chunk_kimi(T,p,i,chunk_end,out,&no,max);
             else if(T->o200k) pretok_chunk_o200k(T,p,i,chunk_end,out,&no,max);
             else              pretok_chunk(T,p,i,chunk_end,out,&no,max);
         }

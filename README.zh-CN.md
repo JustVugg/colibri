@@ -25,7 +25,7 @@ Colibrì 刻意用于验证激进的系统思路——因此**对速度不作 SL
 
 ```
 $ ./coli chat
-  🐦 colibri v1.12.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.12.1 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -47,18 +47,23 @@ Brain 页面和性能分析，支持浅色与深色主题。图中是 Qwen3.6 �
 熵 0.005，读取 4 个 token，生成 0 个。</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brain.png" width="900" alt="大脑页面——以实时皮层呈现 19,456 个专家">
+  <img src="docs/media/colibri-brain.png" width="900" alt="大脑页面：GLM-5.2 的实测专家图谱绘成一块皮层，十个可进入的区域">
 </p>
-<p align="center"><em><strong>大脑（Brain）</strong>页面：将全部 19,456 个专家呈现为活的皮层——颜色代表存储层级，
-亮度代表路由热度，每轮被路由到的专家都会闪白。将光标停在专家上，即可查看其
-<a href="https://github.com/JustVugg/colibri/issues/175">实测主题亲和度</a>。</em></p>
+<p align="center"><em><strong>大脑（Brain）</strong>页面的 <strong>Explore</strong> 视图：将 GLM-5.2 的<a href="https://github.com/JustVugg/colibri/issues/175">实测专家图谱</a>绘成一块皮层。
+13,260 个已分析专家分为十个区域（Python、SQL、数学、诗歌、法律、中文……）；位置取自实测路由亲和度，而非学习出的嵌入向量。
+选择一个区域即可进入。<strong>Live routing</strong> 视图切换到正在运行的模型：每个专家一格，颜色代表存储层级，每轮被路由到的专家都会闪白。</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-atlas.png" width="900" alt="图谱页面——以 3D 星系呈现实测专家图谱">
+  <img src="docs/media/colibri-brain-region.png" width="900" alt="Python 区域内部：1,142 个专家，其中一个被选中并显示其实测亲和度">
 </p>
-<p align="center"><em><strong>图谱（Atlas）</strong>页面：将<a href="https://github.com/JustVugg/colibri/issues/175">实测专家图谱</a>
-呈现为 3D 星系——共 13,260 个已分析专家，其中 1,041 个可复现的专门专家会按主题聚集
-（诗歌、法律、中文、SQL……）。位置取自实测路由亲和度，而非学习出的嵌入向量。拖拽即可旋转。</em></p>
+<p align="center"><em><strong>Python</strong> 区域内部：1,142 个专家组成的星座，每个都标注了层号和序号。面板显示其中一个：第 17 层第 178 号专家，
+一个熵为 3.13 的通才，其实测亲和度为 Python 20.2%、JSON 14.6%、对话 14.2%、SQL 13.3%。</em></p>
+
+<p align="center">
+  <img src="docs/media/colibri-profiling.png" width="900" alt="性能剖析页面：引擎在每一轮中的时间去向">
+</p>
+<p align="center"><em><strong>性能剖析（Profiling）</strong>页面：引擎在每一轮中的时间去向，按阶段划分，并以最近 30 轮作为趋势。
+此处为 CPU 机器上的 Qwen3.6：36 个提示词元与 55 个生成词元共用时 19.0 秒，2.9 tok/s，其中 11.4 秒的磁盘服务与计算重叠。</em></p>
 
 ## 研究使命
 

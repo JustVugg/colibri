@@ -75,7 +75,7 @@ static void shared_case(const char *format,int quantized) {
     for(int64_t i=0;i<(int64_t)I*D;i++){((float*)l.sh_g.w)[i]=input_value(i,2);((float*)l.sh_u.w)[i]=input_value(i,3);}
     for(int64_t i=0;i<(int64_t)D*I;i++)((float*)l.sh_d.w)[i]=input_value(i,4);
     for(int i=0;i<D;i++)l.sh_gate[i]=input_value(i,5);
-    if(quantized){qw_quantize(l.sh_g.w,D,I,&l.sh_g);qw_quantize(l.sh_u.w,D,I,&l.sh_u);qw_quantize(l.sh_d.w,I,D,&l.sh_d);}
+    if(quantized){qw_quantize(l.sh_g.w,D,I,NULL,&l.sh_g);qw_quantize(l.sh_u.w,D,I,NULL,&l.sh_u);qw_quantize(l.sh_d.w,I,D,NULL,&l.sh_d);}
     float *x=falloc((int64_t)S*D),*seed=falloc((int64_t)S*D);
     float *ref=falloc((int64_t)S*D),*got=falloc((int64_t)S*D);
     float *g=falloc(I),*u=falloc(I),*hh=falloc(D);

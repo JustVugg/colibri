@@ -34,7 +34,7 @@ ma non ridefinire il modello di nascosto.
 
 ```
 $ ./coli chat
-  🐦 colibri v1.12.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.12.1 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -57,20 +57,27 @@ che può scegliere; legge la probabilità di ciascuna, non genera niente, e ripo
 sicuro. Qui: <strong>request changes al 99.9%</strong>, entropia 0.005, 4 token letti, 0 generati.</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-brain.png" width="900" alt="la pagina Brain — 19.456 expert come una corteccia vivente">
+  <img src="docs/media/colibri-brain.png" width="900" alt="la pagina Brain: l'atlante misurato degli expert di GLM-5.2 disegnato come una corteccia, dieci regioni da esplorare">
 </p>
-<p align="center"><em>La pagina <strong>Brain</strong>: tutti i 19.456 expert come una corteccia vivente — il colore indica
-il livello di archiviazione, la luminosità il calore di routing, e ogni expert instradato in un turno
-lampeggia bianco. Passando il cursore si vede l'<a href="https://github.com/JustVugg/colibri/issues/175">affinità
-tematica misurata</a> dell'expert.</em></p>
+<p align="center"><em>La pagina <strong>Brain</strong>, <strong>Explore</strong>: l'<a href="https://github.com/JustVugg/colibri/issues/175">atlante misurato degli expert</a> di GLM-5.2
+disegnato come una corteccia. 13.260 expert caratterizzati in dieci regioni (Python, SQL, matematica, poesia, legge, cinese…);
+la posizione deriva dall'affinità di routing misurata, non da un embedding appreso. Si sceglie una regione e ci si entra.
+<strong>Live routing</strong> passa al modello in esecuzione: una cella per expert, il colore è il livello di archiviazione, e ogni
+expert instradato in un turno lampeggia bianco.</em></p>
 
 <p align="center">
-  <img src="docs/media/colibri-atlas.png" width="900" alt="la pagina Atlas — l'atlante misurato degli expert come una galassia 3D">
+  <img src="docs/media/colibri-brain-region.png" width="900" alt="dentro la regione Python: 1.142 expert, uno selezionato con le sue affinità misurate">
 </p>
-<p align="center"><em>La pagina <strong>Atlas</strong>: l'<a href="https://github.com/JustVugg/colibri/issues/175">atlante
-misurato degli expert</a> come una galassia 3D — 13.260 expert caratterizzati, 1.041 specialisti
-replicabili che si raggruppano per argomento (poesia, legge, cinese, SQL…). La posizione deriva
-dall'affinità di routing misurata, non da un embedding appreso. Trascinare per ruotare.</em></p>
+<p align="center"><em>Dentro la regione <strong>Python</strong>: 1.142 expert come una costellazione, ciascuno etichettato per layer e indice. Il pannello
+ne mostra uno, layer 17 expert 178: un generalista con entropia 3,13, la cui affinità misurata è 20,2% Python, 14,6% JSON,
+14,2% conversazione, 13,3% SQL.</em></p>
+
+<p align="center">
+  <img src="docs/media/colibri-profiling.png" width="900" alt="la pagina Profiling: dove il motore spende ogni turno">
+</p>
+<p align="center"><em>La pagina <strong>Profiling</strong>: dove il motore spende ogni turno, per fase, con gli ultimi 30 turni come tendenza.
+Qui Qwen3.6 su una macchina CPU: 19,0 s di tempo totale per 36 token di prompt e 55 generati, 2,9 tok/s, 11,4 s di
+servizio disco sovrapposti al calcolo.</em></p>
 
 ## La missione di ricerca
 

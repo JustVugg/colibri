@@ -67,6 +67,7 @@ static int qwen36_max_ctx(void) {
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
+#include "idot.h"          /* integer dot kernels for the dense trunk (COLI_DENSE_IDOT, COLI_DENSE_BITS) */
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -235,7 +236,22 @@ static int pretok_end(const char *s,int i,int n){
         if(s[i]==' '&&i+1<n){ int a1; unsigned c1=utf8_decode(s,i+1,n,&a1); if(uclass(c1)!=U_W&&uclass(c1)!=U_L&&uclass(c1)!=U_N&&c1!='\r'&&c1!='\n'){ k=i+1; while(k<n){int a;unsigned cc=utf8_decode(s,k,n,&a); if(uclass(cc)!=U_W&&uclass(cc)!=U_L&&uclass(cc)!=U_N&&cc!='\r'&&cc!='\n')k+=a; else break;} while(k<n&&(s[k]=='\r'||s[k]=='\n'))k++; return k; } }
         if(uclass(c0)!=U_W&&uclass(c0)!=U_L&&uclass(c0)!=U_N&&c0!='\r'&&c0!='\n'){ int k2=i; while(k2<n){int a;unsigned cc=utf8_decode(s,k2,n,&a); if(uclass(cc)!=U_W&&uclass(cc)!=U_L&&uclass(cc)!=U_N&&cc!='\r'&&cc!='\n')k2+=a; else break;} while(k2<n&&(s[k2]=='\r'||s[k2]=='\n'))k2++; return k2; }
     }
-    if(uclass(c0)==U_W){ int k=i; while(k<n){int a;unsigned cc=utf8_decode(s,k,n,&a); if(uclass(cc)==U_W)k+=a; else break;} return k; }
+    if(uclass(c0)==U_W){
+        /* The three whitespace rules, in the regex's order. `last` is where the
+         * final whitespace char of the run starts, `nl_end` where the last CR/LF
+         * inside the run ends. */
+        int k=i,last=i,nl_end=-1;
+        while(k<n){int a;unsigned cc=utf8_decode(s,k,n,&a); if(uclass(cc)!=U_W) break; last=k; k+=a; if(cc=='\r'||cc=='\n') nl_end=k;}
+        /* rule5: \s*[\r\n]+ -- greedy up to the LAST newline; spaces after it
+         * belong to the next piece ("\n  x" is "\n" then " " then " x"). */
+        if(nl_end>0) return nl_end;
+        /* rule6: \s+(?!\S) -- a run followed by a non-space keeps its last char
+         * for the next piece, which then takes it as " x" or " ." (HF: "  <" is
+         * " " then " <", not "  " then "<"). A single char cannot back off and
+         * falls to rule7, \s+, which takes it whole. */
+        if(k<n && last>i) return last;
+        return k;
+    }
     return i+adv;
 }
 static void bpe_piece(const char *piece,int len,int **ids,int *n,int *cap){
@@ -270,16 +286,33 @@ static void bpe_piece(const char *piece,int len,int **ids,int *n,int *cap){
     for(int k=0;k<sc;k++){ int id=smap_get(&g_rev,syms[k]); if(id<0) id=0; push_id(ids,n,cap,id); free(syms[k]); }
     free(syms);
 }
+/* The next added token at or after i, or n when there is none. HF splits the
+ * added tokens out FIRST and pre-tokenizes only the ordinary text between them.
+ * Looking for the special at the start of each piece is not the same thing: the
+ * punctuation rule ` ?[^\s\p{L}\p{M}\p{N}]+` swallows the `<|` of `<|im_end|>`
+ * together with the `.` before it, so the special was never at a piece start and
+ * got encoded as text (#1653: `X.<|im_end|>` was 7 tokens instead of 3, and
+ * every chat turn ending in punctuation paid +4). qwen38.c already splits this
+ * way; this is the same shape. */
+static int next_special(const char *s,int i,int n){
+    for(int k=i;k<n;k++){ int sid; if(try_special(s,k,n,&sid)>0) return k; }
+    return n;
+}
 static void encode_text(const char *text,int **out_ids,int *out_n){
     int cap=1024,n=0; int *ids=malloc(cap*sizeof(int));
     int tlen=(int)strlen(text); int i=0;
     while(i<tlen){
         int sid; int L=try_special(text,i,tlen,&sid);
         if(L>0){ push_id(&ids,&n,&cap,sid); i+=L; continue; }
-        int j=pretok_end(text,i,tlen); if(j<=i) j=i+utf8_adv(text,i,tlen);
-        if(j>tlen) j=tlen;
-        bpe_piece(text+i,j-i,&ids,&n,&cap);
-        i=j;
+        /* Ordinary text runs to the next added token, and the pre-tokenizer
+         * sees that boundary as the end of its input, exactly as HF's does. */
+        int end=next_special(text,i+1,tlen);
+        while(i<end){
+            int j=pretok_end(text,i,end); if(j<=i) j=i+utf8_adv(text,i,end);
+            if(j>end) j=end;
+            bpe_piece(text+i,j-i,&ids,&n,&cap);
+            i=j;
+        }
     }
     *out_ids=ids; *out_n=n;
 }
@@ -637,8 +670,15 @@ typedef struct {
  * the reference/parity path; freed once `q`/`sc` are populated otherwise
  * (COLI_KEEP_F32=1 keeps it alongside them, for debugging). matmul_d
  * dispatches on q!=NULL directly -- no pointer-keyed scan. */
-typedef struct { const float *w; int8_t *q; float *sc; int I, O; } QW;
-static void qw_free(QW *w) { free((void*)w->w); free(w->q); free(w->sc); w->w = NULL; w->q = NULL; w->sc = NULL; }
+/* q/sc: int8 rows with one scale per row (the classic copy, what the VRAM
+ * tier uploads). q4/sg: the same matrix as int4 planar blocks of 64 with one
+ * scale per group (COLI_DENSE_BITS=4), the layout the K1b grouped kernel
+ * reads; ng = I/64 groups per row. */
+typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng; } QW;
+static void qw_free(QW *w) {
+    free((void*)w->w); free(w->q); free(w->sc); free(w->q4); free(w->sg);
+    w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0;
+}
 
 /* ---------- per-layer dense weights ---------- */
 typedef struct {
@@ -651,6 +691,11 @@ typedef struct {
     float *dn_dtbias, *dn_alog;            /* dt_bias[vh], A_log[vh] */
     float *dn_norm;                        /* RMSNormGated weight [vdim] */
     QW dn_out;                             /* out_proj [hidden, value_dim] */
+    /* VRAM copies the tier placed (qt_dense handle + 1, 0 = stays on the CPU):
+     * the DeltaNet out_proj, the attention q/k/v/o and the shared expert's
+     * three matrices. Offered per layer as "dnout", "attnproj", "shexp";
+     * see trunk_offer_dense / trunk_place_dense. */
+    int qth_dnout, qth_q, qth_k, qth_v, qth_o, qth_shg, qth_shu, qth_shd;
 } Layer;
 
 /* ---------- LRU expert cache (int8 weights + per-row float scales) ---------- */
@@ -965,6 +1010,12 @@ static int g_expert_is_int4 = 1;
  * int8 copy) and with QWEN_EXPERT_KERNEL=0, which keeps the historical
  * unpack-to-int8 path for A/Bs. Decided once from the container itself. */
 static int container_layer_is_int4(Model *m, int layer);
+/* The routed experts take the same integer path as the dense trunk
+ * (expert_ffn.h mode 1: activation to int8 once per row, dpbusd against the
+ * planar nibbles). Measured on the 35B: expert compute 22.7 to 15.9
+ * ms/token for +0.1% perplexity. QWEN_EXPERT_ACT=f32 restores mode 0, f32
+ * activations and the bit-identical contract with the pair kernels. */
+static int xf_act_mode(void){ static int v=-1; if(v<0){ const char *e=getenv("QWEN_EXPERT_ACT"); v=(e&&!strcmp(e,"f32"))?0:1; } return v; }
 static int xf_mode(Model *m) {
     static int v = -1;
     if (v >= 0) return v;
@@ -1013,6 +1064,125 @@ static void matmul_qe(float *y, const float *x, const int8_t *q, const float *sc
  * matmul_d dispatches directly off QW.q (no pointer-keyed scan -- see QW,
  * above Layer); COLI_DENSE_I8=0 falls back to f32 (QW.w, reference path for
  * parity tests). ~4x less memory traffic. */
+/* ---- Dense trunk, integer dot products ------------------------------------
+ *
+ * Every dense GEMV of a token (DeltaNet projections and out_proj, attention
+ * q/k/v/o, the shared expert, lm_head) used to multiply int8 weights by f32
+ * activations: each weight byte converted to f32 and fed to an FMA, eight
+ * weights per instruction. Measured on lm_head (248320 x 2048 int8, 508 MB)
+ * that runs at 29 GB/s on a 16-core AVX-512 host whose memory bus does 80:
+ * the kernel, not the bus, was the limit, and the dense part of a token is
+ * 1.9 GB of int8 on the 35B, three times the routed experts.
+ *
+ * The activation is now quantized to int8 once per call (one scale,
+ * amax/127, the qrow_i8 contract the expert IDOT already uses) and the dot
+ * is integer: 32 weights per instruction on AVX2 (maddubs), 64 on AVX-512
+ * VNNI, exact int32 sums scaled once per output. Not bit-identical to the
+ * f32 path (the activation is rounded): measured on the 35B, +1.0%
+ * perplexity on 4 x 512 tokens, lm_head 12.6 to 10.2 ms/token, decode
+ * 6.71 to 7.35 tok/s alone and 8.23 with the experts' int8 activations.
+ * COLI_DENSE_IDOT=0 restores the f32-activation kernel.
+ *
+ * COLI_DENSE_BITS=4 additionally stores the dense matrices as int4 in blocks
+ * of 64 with one scale per block, the K1b planar layout, halving the bytes
+ * the token reads; lm_head alone goes from 508 to 254 MB. It implies the
+ * integer dot (that layout has no f32 kernel). Same gate: measured. */
+static int dense_idot_on(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_IDOT"); v=!(e&&*e=='0'); } return v; }
+static int dense_bits(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_BITS"); v=(e&&atoi(e)==4)?4:8; } return v; }
+
+/* Activation -> int8 with one scale, plus the int32 sum of every block of 64
+ * (the K1b kernel subtracts 8*sum per group because its nibbles are unsigned).
+ * Vectorized: the scalar lrintf loop was measured at ~7 us for 4096 values,
+ * which times ~150 GEMVs per token is a millisecond thrown away. Rounding is
+ * to nearest even in both paths, so the vector path equals qrow_i8 bit for bit. */
+static float dense_act_i8(const float *x, int I, int8_t *xq, int32_t *xsg){
+    float amax = 0.f;
+    int i = 0;
+#ifdef __AVX2__
+    {
+        __m256 am = _mm256_setzero_ps();
+        const __m256 sign = _mm256_set1_ps(-0.0f);
+        for (; i + 8 <= I; i += 8) am = _mm256_max_ps(am, _mm256_andnot_ps(sign, _mm256_loadu_ps(x + i)));
+        float tmp[8]; _mm256_storeu_ps(tmp, am);
+        for (int k = 0; k < 8; k++) if (tmp[k] > amax) amax = tmp[k];
+    }
+#endif
+    for (; i < I; i++) { float a = fabsf(x[i]); if (a > amax) amax = a; }
+    float s = amax / 127.f; if (s < 1e-12f) s = 1e-12f;
+    float inv = 1.f / s;
+    i = 0;
+#ifdef __AVX2__
+    {
+        const __m256 vinv = _mm256_set1_ps(inv);
+        for (; i + 32 <= I; i += 32) {
+            __m256i a = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i),      vinv));
+            __m256i b = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 8),  vinv));
+            __m256i c = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 16), vinv));
+            __m256i d = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + 24), vinv));
+            /* packs interleave 128-bit lanes: fix the order with one permute */
+            __m256i ab = _mm256_packs_epi32(a, b), cd = _mm256_packs_epi32(c, d);
+            __m256i abcd = _mm256_packs_epi16(ab, cd);
+            abcd = _mm256_permutevar8x32_epi32(abcd, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+            _mm256_storeu_si256((__m256i *)(xq + i), abcd);
+        }
+    }
+#endif
+    for (; i < I; i++) xq[i] = (int8_t)lrintf(x[i] * inv);
+    if (xsg) {
+        int ng = I / 64;
+        for (int g = 0; g < ng; g++) {
+            int32_t sum = 0;
+            for (int k = 0; k < 64; k++) sum += xq[g * 64 + k];
+            xsg[g] = sum;
+        }
+    }
+    return s;
+}
+
+/* f32 rows -> int4 in blocks of 64 with one f32 scale per block, packed as the
+ * K1b planar layout (unsigned nibbles v+8, block b: lo nibbles = elements
+ * b*64..b*64+31, hi = b*64+32..b*64+63). The quantizer is the symmetric
+ * absmax/7 the expert containers use. */
+static void pack_int4_g64_planar(const float *w, uint8_t *q4, float *sg, int O, int I){
+    int rb = I / 2, ng = I / 64;
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const float *wr = w + (int64_t)o * I;
+        uint8_t *row = q4 + (int64_t)o * rb;
+        float *sr = sg + (int64_t)o * ng;
+        for (int g = 0; g < ng; g++) {
+            const float *blk = wr + g * 64;
+            float amax = 0.f;
+            for (int k = 0; k < 64; k++) { float a = fabsf(blk[k]); if (a > amax) amax = a; }
+            /* absmax/7 is where the search starts; the scale is then refined
+             * by least squares against the rounded codes (s = w.q / q.q) and
+             * the candidate with the smallest squared error wins. Three
+             * rounds: measured on the 35B this recovers a third of the
+             * perplexity absmax alone loses at 4 bits. */
+            float best_s = amax / 7.f; if (best_s < 1e-8f) best_s = 1e-8f;
+            int best_q[64]; double best_err = 1e30;
+            float s = best_s;
+            for (int round = 0; round < 4; round++) {
+                int q[64]; double err = 0, wq = 0, qq = 0;
+                float inv = 1.f / s;
+                for (int k = 0; k < 64; k++) {
+                    int v = (int)lrintf(blk[k] * inv); if (v > 7) v = 7; if (v < -8) v = -8;
+                    q[k] = v; double d = (double)blk[k] - (double)v * s; err += d * d;
+                    wq += (double)blk[k] * v; qq += (double)v * v;
+                }
+                if (err < best_err) { best_err = err; best_s = s; memcpy(best_q, q, sizeof q); }
+                if (qq <= 0) break;
+                float ns = (float)(wq / qq);          /* least-squares scale for these codes */
+                if (ns <= 0.f || ns == s) break;
+                s = ns;
+            }
+            sr[g] = best_s;
+            uint8_t *dst = row + g * 32;
+            for (int k = 0; k < 32; k++)
+                dst[k] = (uint8_t)((best_q[k] + 8) | ((best_q[k + 32] + 8) << 4));
+        }
+    }
+}
 #ifdef COLI_QWEN_BATCH_TEST
 static uint64_t g_qwen_matmul_d_calls;
 #endif
@@ -1022,13 +1192,34 @@ static int dense_i8_on(void){ static int v=-1; if(v<0){ const char *e=getenv("CO
  * the time. */
 static int kv_prefix_off(void){ const char *e=getenv("COLI_KV_PREFIX"); return e && *e=='0'; }
 static int dense_batch_on(void){ const char *e=getenv("QWEN_DENSE_BATCH"); return !(e&&*e=='0'); }
+/* COLI_DENSE_INT4 names which components take the int4 copy when
+ * COLI_DENSE_BITS=4: a comma list of lmhead, dnproj, dnout, attn, shexp,
+ * router; unset means all of them. The parts of the trunk pay 4 bits
+ * differently (measured: the attention projections and the DeltaNet input
+ * projections cost the most perplexity, lm_head the least per byte saved),
+ * so the default is chosen per component from the numbers, not for the
+ * whole trunk at once. */
+static int dense_int4_wanted(const char *tag){
+    if (dense_bits() != 4 || !tag) return 0;
+    const char *e = getenv("COLI_DENSE_INT4");
+    if (!e || !*e) return 1;
+    size_t n = strlen(tag);
+    for (const char *p = e; *p; ) {
+        while (*p == ',' || *p == ' ') p++;
+        const char *q = p; while (*q && *q != ',' && *q != ' ') q++;
+        if ((size_t)(q - p) == n && !strncmp(p, tag, n)) return 1;
+        p = q;
+    }
+    return 0;
+}
 /* Per-row max-abs / round-clamp int8 quantization of an in-memory f32 matrix
- * W [O][I] row-major -- same math load_tq used to run post-hoc via qdw_register,
- * factored out so it can also run on a caller-owned buffer directly (tests
- * that synthesize weights in memory, without a shard file to load from). Does
- * not touch out->w -- the caller sets that (or leaves it, e.g. load_tq frees
- * it right after). */
-static void qw_quantize(const float *W, int I, int O, QW *out) {
+ * W [O][I] row-major -- same math load_tq runs during streamed load, factored
+ * out so it can also run on a caller-owned buffer directly (tests that
+ * synthesize weights in memory, without a shard file to load from). Does not
+ * touch out->w -- the caller sets that (or leaves it, e.g. load_tq frees it
+ * right after). `tag` selects the int4 planar copy per dense_int4_wanted
+ * (NULL/COLI_DENSE_BITS!=4: skipped, out->q4 stays NULL). */
+static void qw_quantize(const float *W, int I, int O, const char *tag, QW *out) {
     int8_t *q = malloc((size_t)O*I); float *sc = malloc((size_t)O*sizeof(float));
     if (!q || !sc) { fprintf(stderr, "OOM qw_quantize\n"); exit(1); }
     #pragma omp parallel for schedule(static)
@@ -1040,12 +1231,37 @@ static void qw_quantize(const float *W, int I, int O, QW *out) {
         for (int i = 0; i < I; i++) { int v = (int)lrintf(r[i]*inv); if (v>127) v=127; if (v<-127) v=-127; d[i] = (int8_t)v; }
     }
     out->q = q; out->sc = sc; out->I = I; out->O = O;
+    out->q4 = NULL; out->sg = NULL; out->ng = 0;
+    if (dense_int4_wanted(tag) && I % 64 == 0) {
+        uint8_t *q4 = malloc((size_t)O*(I/2)); float *sg = malloc((size_t)O*(I/64)*sizeof(float));
+        if (q4 && sg) {
+            pack_int4_g64_planar(W, q4, sg, O, I);
+            out->q4 = q4; out->sg = sg; out->ng = I/64;
+        } else { free(q4); free(sg); }
+    }
 }
 static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O){
 #ifdef COLI_QWEN_BATCH_TEST
     g_qwen_matmul_d_calls++;
 #endif
     if (w->q) {
+        if (w->q4 || dense_idot_on()) {
+            /* integer dot: the activation rows to int8 once, then the K1b
+             * grouped kernel (int4 planar) or the per-row int8 kernel */
+            int ng = I / 64;
+            int8_t *xq = malloc((size_t)S * I);
+            float *sx = malloc((size_t)S * sizeof(float));
+            int32_t *xsg = w->q4 ? malloc((size_t)S * ng * sizeof(int32_t)) : NULL;
+            if (xq && sx && (!w->q4 || xsg)) {
+                for (int s = 0; s < S; s++)
+                    sx[s] = dense_act_i8(x + (int64_t)s * I, I, xq + (int64_t)s * I, xsg ? xsg + (int64_t)s * ng : NULL);
+                if (w->q4) matmul_i4p_grouped_idot(y, xq, sx, xsg, w->q4, w->sg, S, I, O, 64);
+                else       matmul_q_idot(y, xq, sx, w->q, w->sc, S, I, O);
+                free(xq); free(sx); free(xsg);
+                return;
+            }
+            free(xq); free(sx); free(xsg);      /* out of memory: the f32 path below */
+        }
         if (S > 1 && dense_batch_on())
             matmul_q_batch(y, x, w->q, w->sc, S, I, O);
         else
@@ -1053,6 +1269,23 @@ static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O)
         return;
     }
     matmul(y, x, w->w, S, I, O);
+}
+/* A dense matrix the tier placed in VRAM (handle+1 kept in the Layer, 0 = CPU):
+ * one GEMV from the device, or 0 and the caller runs matmul_d as before. The
+ * tier turns a failing handle off itself, so the fallback is permanent. */
+static inline int qtd(int hp1, float *y, const float *x, int I, int O){
+    return hp1 > 0 && qt_dense_matmul(hp1 - 1, y, x, I, O);
+}
+/* Bytes of w's dense-i8 copy (int8 rows + per-row scales), 0 when there is
+ * none (COLI_DENSE_I8=0): nothing to offer, the CPU path stands. */
+static size_t qdw_bytes(const QW *w){
+    return w->q ? (size_t)w->I * w->O + (size_t)w->O * sizeof(float) : 0;
+}
+/* Upload w's dense-i8 copy to `dev`; handle+1, or 0 when it stays on the CPU. */
+static int qdw_place(const QW *w, int dev){
+    if (dev == QT_PLACE_CPU || !w->q) return 0;
+    int h = qt_dense_init(w->q, w->sc, w->I, w->O, dev);
+    return h >= 0 ? h + 1 : 0;
 }
 
 /* rmsnorm over a row of length D (in-place capable: out may == x).
@@ -1270,21 +1503,24 @@ static float *load_t_n(Model *m, const char *name, int64_t want) {
     return p;
 }
 
-/* Dense matrix load, quantized to int8 DURING loading rather than in a
- * separate pass over the whole model afterward (see QW, above Layer):
- * reads `name` (I*O elements, same size discipline as load_t_n), and when
- * `quantize` && COLI_DENSE_I8 is on, quantizes it via qw_quantize and frees
- * the f32 staging buffer right away -- so at most one dense matrix's f32 copy
- * is ever resident at a time, not the whole model's. `quantize` is false for
- * loaders that never ran through the old post-hoc qdw_register pass either
- * (the Segment/Edge adapters build partial or auxiliary models straight off
+/* Dense matrix load, quantized to int8 (+ int4 planar per `tag`, see
+ * dense_int4_wanted) DURING loading rather than in a separate pass over the
+ * whole model afterward (see QW, above Layer): reads `name` (I*O elements,
+ * same size discipline as load_t_n), and when `quantize` && COLI_DENSE_I8 is
+ * on, quantizes it via qw_quantize and frees the f32 staging buffer right
+ * away -- so at most one dense matrix's f32 copy is ever resident at a time,
+ * not the whole model's. `quantize` is false for loaders that never ran
+ * through the old post-hoc qdw_register pass either (the Segment/Edge
+ * adapters build partial or auxiliary models straight off
  * model_init_range/load_t_n, never main()'s dense-i8 block) -- passing it
- * through keeps their f32-only behavior exactly as it was. */
-static void load_tq(Model *m, const char *name, int I, int O, int quantize, QW *out) {
+ * through keeps their f32-only behavior exactly as it was; `tag` is unused
+ * on that path. */
+static void load_tq(Model *m, const char *name, int I, int O, int quantize, const char *tag, QW *out) {
     float *p = load_t_n(m, name, (int64_t)I * O);
     out->w = p; out->q = NULL; out->sc = NULL; out->I = I; out->O = O;
+    out->q4 = NULL; out->sg = NULL; out->ng = 0;
     if (!quantize || !dense_i8_on()) return;
-    qw_quantize(p, I, O, out);
+    qw_quantize(p, I, O, tag, out);
     if (getenv("COLI_KEEP_F32")) out->w = p; else { free(p); out->w = NULL; }
 }
 
@@ -1322,7 +1558,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     int qcount = 0; double qfreed = 0;
     if (load_boundaries) {
         m->embed = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
-        load_tq(m, "lm_head.weight", c->hidden, c->vocab, quantize_dense, &m->lm_head);
+        load_tq(m, "lm_head.weight", c->hidden, c->vocab, quantize_dense, "lmhead", &m->lm_head);
         if (m->lm_head.q) { qcount++; qfreed += (double)c->hidden * c->vocab * sizeof(float); }
         m->final_norm = load_t_n(m, "model.norm.weight", c->hidden);
     }
@@ -1344,7 +1580,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         LD(post_ln,"post_attention_layernorm.weight", c->hidden);
         #undef LD
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.weight", ai);
-        load_tq(m, nm, c->hidden, c->n_experts, quantize_dense, &l->gate);
+        load_tq(m, nm, c->hidden, c->n_experts, quantize_dense, "router", &l->gate);
         QCOUNT(l->gate);
         /* q/k norms are per-head [head_dim]; only on attention layers, load if present */
         if (c->has_qk_norm) {
@@ -1359,24 +1595,24 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         else l->gate_bias = NULL;
         /* shared expert (dense, int8-during-load) */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert.gate_proj.weight", ai);
-        load_tq(m, nm, c->hidden, c->shared_inter, quantize_dense, &l->sh_g); QCOUNT(l->sh_g);
+        load_tq(m, nm, c->hidden, c->shared_inter, quantize_dense, "shexp", &l->sh_g); QCOUNT(l->sh_g);
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert.up_proj.weight", ai);
-        load_tq(m, nm, c->hidden, c->shared_inter, quantize_dense, &l->sh_u); QCOUNT(l->sh_u);
+        load_tq(m, nm, c->hidden, c->shared_inter, quantize_dense, "shexp", &l->sh_u); QCOUNT(l->sh_u);
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert.down_proj.weight", ai);
-        load_tq(m, nm, c->shared_inter, c->hidden, quantize_dense, &l->sh_d); QCOUNT(l->sh_d);
+        load_tq(m, nm, c->shared_inter, c->hidden, quantize_dense, "shexp", &l->sh_d); QCOUNT(l->sh_d);
         /* shared_expert_gate: Linear(hidden -> 1), sigmoid-gated shared expert */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert_gate.weight", ai);
         l->sh_gate = st_has(&m->S, nm) ? load_t_n(m, nm, c->hidden) : NULL;
         if (c->is_attn[i]) {
             /* Gated Attention (full_attention) layer, dense projections int8-during-load */
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_proj.weight", ai);
-            load_tq(m, nm, c->hidden, q_out, quantize_dense, &l->q); QCOUNT(l->q);
+            load_tq(m, nm, c->hidden, q_out, quantize_dense, "attn", &l->q); QCOUNT(l->q);
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.k_proj.weight", ai);
-            load_tq(m, nm, c->hidden, kv_out, quantize_dense, &l->k); QCOUNT(l->k);
+            load_tq(m, nm, c->hidden, kv_out, quantize_dense, "attn", &l->k); QCOUNT(l->k);
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.v_proj.weight", ai);
-            load_tq(m, nm, c->hidden, kv_out, quantize_dense, &l->v); QCOUNT(l->v);
+            load_tq(m, nm, c->hidden, kv_out, quantize_dense, "attn", &l->v); QCOUNT(l->v);
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.o_proj.weight", ai);
-            load_tq(m, nm, c->o_in, c->hidden, quantize_dense, &l->o); QCOUNT(l->o);
+            load_tq(m, nm, c->o_in, c->hidden, quantize_dense, "attn", &l->o); QCOUNT(l->o);
             l->dn_qkv=l->dn_z=(QW){0}; l->dn_b=l->dn_a=l->dn_conv=NULL;
             l->dn_dtbias=l->dn_alog=l->dn_norm=NULL; l->dn_out=(QW){0};
         } else {
@@ -1385,9 +1621,9 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             #define LD4(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d.linear_attn." suffix,ai); l->field = load_t_n(m,nm,(want))
             int64_t vdim_tot = (int64_t)c->dn_vheads * c->dn_vdim;
             snprintf(nm,sizeof(nm),"model.layers.%d.linear_attn.in_proj_qkv.weight", ai);
-            load_tq(m, nm, c->hidden, c->dn_conv_dim, quantize_dense, &l->dn_qkv); QCOUNT(l->dn_qkv);
+            load_tq(m, nm, c->hidden, c->dn_conv_dim, quantize_dense, "dnproj", &l->dn_qkv); QCOUNT(l->dn_qkv);
             snprintf(nm,sizeof(nm),"model.layers.%d.linear_attn.in_proj_z.weight", ai);
-            load_tq(m, nm, c->hidden, (int)vdim_tot, quantize_dense, &l->dn_z); QCOUNT(l->dn_z);
+            load_tq(m, nm, c->hidden, (int)vdim_tot, quantize_dense, "dnproj", &l->dn_z); QCOUNT(l->dn_z);
             LD4(dn_b,   "in_proj_b.weight",   (int64_t)c->dn_vheads * c->hidden);
             LD4(dn_a,   "in_proj_a.weight",   (int64_t)c->dn_vheads * c->hidden);
             LD4(dn_conv,"conv1d.weight",      (int64_t)c->dn_conv_dim * c->dn_convk);
@@ -1396,7 +1632,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             LD4(dn_norm, "norm.weight",       c->dn_vdim);
             #undef LD4
             snprintf(nm,sizeof(nm),"model.layers.%d.linear_attn.out_proj.weight", ai);
-            load_tq(m, nm, (int)vdim_tot, c->hidden, quantize_dense, &l->dn_out); QCOUNT(l->dn_out);
+            load_tq(m, nm, (int)vdim_tot, c->hidden, quantize_dense, "dnout", &l->dn_out); QCOUNT(l->dn_out);
         }
     }
     #undef QCOUNT
@@ -1847,9 +2083,11 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     float *q = falloc((int64_t)S*q_out);
     float *k = falloc((int64_t)S*kv_out);
     float *vv= falloc((int64_t)S*kv_out);
-    matmul_d(q, x, &l->q, S, D, q_out);
-    matmul_d(k, x, &l->k, S, D, kv_out);
-    matmul_d(vv, x, &l->v, S, D, kv_out);
+    /* Decode (S == 1): the projections the tier placed answer from VRAM,
+     * one GEMV each; a prompt batch keeps the batched CPU matmul. */
+    if (!(S == 1 && qtd(l->qth_q, q, x, D, q_out)))   matmul_d(q, x, &l->q, S, D, q_out);
+    if (!(S == 1 && qtd(l->qth_k, k, x, D, kv_out)))  matmul_d(k, x, &l->k, S, D, kv_out);
+    if (!(S == 1 && qtd(l->qth_v, vv, x, D, kv_out))) matmul_d(vv, x, &l->v, S, D, kv_out);
     /* split q into query (first hd) and gate (next gate_dim), both per head */
     float *query = falloc((int64_t)S*H*hd);
     float *gate  = falloc((int64_t)S*H*gate_dim);
@@ -1911,7 +2149,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         float g = gate_dim ? gate[o] : 0.f;
         ag[o] = ctx[o] * (1.f / (1.f + expf(-g)));
     }
-    matmul_d(out, ag, &l->o, S, H*hd, D);
+    if (!(S == 1 && qtd(l->qth_o, out, ag, H*hd, D))) matmul_d(out, ag, &l->o, S, H*hd, D);
     free(q); free(k); free(vv); free(query); free(gate); free(ctx); free(ag);
 }
 
@@ -1944,10 +2182,10 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
     if (B == 1) {
         for (int s=0;s<S;s++) {
             const float *xs=x+(int64_t)s*D;
-            matmul_d(g,xs,&l->sh_g,1,D,I);
-            matmul_d(u,xs,&l->sh_u,1,D,I);
+            if(!qtd(l->qth_shg,g,xs,D,I)) matmul_d(g,xs,&l->sh_g,1,D,I);
+            if(!qtd(l->qth_shu,u,xs,D,I)) matmul_d(u,xs,&l->sh_u,1,D,I);
             for(int i=0;i<I;i++){float sv=g[i];g[i]=(sv/(1.f+expf(-sv)))*u[i];}
-            matmul_d(hh,g,&l->sh_d,1,I,D);
+            if(!qtd(l->qth_shd,hh,g,I,D)) matmul_d(hh,g,&l->sh_d,1,I,D);
             float sgate=1.f;
             if(l->sh_gate){float sg=0.f;for(int i=0;i<D;i++)sg+=xs[i]*l->sh_gate[i];sgate=1.f/(1.f+expf(-sg));}
             float *os=out+(int64_t)s*D;
@@ -2012,9 +2250,9 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
                 exp[dst] = &ex[dst];
             }
             double t1 = timed ? tm_now() : 0;
-            if (kper == K) xf_moe_run(out + (int64_t)s0 * D, x + (int64_t)s0 * D, per, K, D, F, ridx, rval, exp, 0, scratch);
+            if (kper == K) xf_moe_run(out + (int64_t)s0 * D, x + (int64_t)s0 * D, per, K, D, F, ridx, rval, exp, xf_act_mode(), scratch);
             else {
-                xf_moe_run(tmp, x + (int64_t)s0 * D, 1, 1, D, F, ridx, rval, exp, 0, scratch);
+                xf_moe_run(tmp, x + (int64_t)s0 * D, 1, 1, D, F, ridx, rval, exp, xf_act_mode(), scratch);
                 float *os = out + (int64_t)s0 * D; for (int d = 0; d < D; d++) os[d] += tmp[d];
             }
             if (timed) { double t2 = tm_now(); g_xf_load += t1 - t0; g_xf_run += t2 - t1; }
@@ -2229,10 +2467,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             {
                 double _ts2 = tm_now();
                 int Ish = c->shared_inter;
-                matmul_d(sh, xs, &l->sh_g, 1, D, Ish);
-                matmul_d(shu, xs, &l->sh_u, 1, D, Ish);
+                if (!qtd(l->qth_shg, sh, xs, D, Ish))  matmul_d(sh, xs, &l->sh_g, 1, D, Ish);
+                if (!qtd(l->qth_shu, shu, xs, D, Ish)) matmul_d(shu, xs, &l->sh_u, 1, D, Ish);
                 for (int i = 0; i < Ish; i++) { float sv = sh[i]; sh[i] = (sv / (1.f + expf(-sv))) * shu[i]; }
-                matmul_d(shd, sh, &l->sh_d, 1, Ish, D);
+                if (!qtd(l->qth_shd, shd, sh, Ish, D)) matmul_d(shd, sh, &l->sh_d, 1, Ish, D);
                 float sgate = 1.f;
                 if (l->sh_gate) {
                     float sg = 0.f; const float *wg = l->sh_gate;
@@ -2421,7 +2659,8 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
                 outr[(int64_t)h * vdim + d] = val * zr[d] / (1.f + expf(-zr[d]));
             }
         }
-        matmul_d(out + (int64_t)s * H, outr, &l->dn_out, 1, value_dim, H);
+        if (!qtd(l->qth_dnout, out + (int64_t)s * H, outr, value_dim, H))
+            matmul_d(out + (int64_t)s * H, outr, &l->dn_out, 1, value_dim, H);
         if (tm_on() && S==1){ g_dn_sub[3]+=tm_now()-_d0; }
         if (layer == 0 && s == 0 && getenv("DN_DBG")) {
             FILE *dbg = fopen(getenv("DN_DBG"), "wb");
@@ -2443,6 +2682,117 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     free(qkvz);   /* qkv and z are regions of this one allocation */
     free(b); free(a); free(beta); free(gg);
     free(conv_out); free(q); free(k); free(outv); free(outr); free(kv); free(delta);
+}
+
+/* The rest of the dense trunk, offered to the placer by name and layer with
+ * the bytes of the dense-i8 copies (docs/qwen36-cuda-tier.md, "Placement"):
+ *   dnout    -- the DeltaNet out_proj, one matrix per DeltaNet layer
+ *   attnproj -- q, k, v, o of every attention layer, offered as one item
+ *   shexp    -- gate, up, down of the shared expert, every layer
+ * Measured on ds (CPU, 8 threads): of the 37.5 ms a DeltaNet layer stack
+ * costs per decoded token, 23.4 are the input projections (already placeable
+ * as "dnproj"), 8.3 the out_proj and norm, 3.3 the convolution and 2.4 the
+ * recurrence -- the matmuls are the cost, not the recurrence, so this is
+ * where the trunk goes. Offer order after lmhead and dnproj: dnout, attnproj,
+ * shexp, each in layer order, so a partial placement is whole layers. A
+ * component is offered only when every matrix of it has a dense-i8 copy. */
+static void trunk_offer_dense(Model *m){
+    Cfg *c = &m->c;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (c->is_attn[i]) continue;
+        size_t b = qdw_bytes(&m->L[i].dn_out);
+        if (b) qt_trunk_offer("dnout", i, b);
+    }
+    for (int i = 0; i < c->n_layers; i++) {
+        if (!c->is_attn[i]) continue;
+        Layer *l = &m->L[i];
+        size_t bq = qdw_bytes(&l->q), bk = qdw_bytes(&l->k), bv = qdw_bytes(&l->v), bo = qdw_bytes(&l->o);
+        if (bq && bk && bv && bo) qt_trunk_offer("attnproj", i, bq + bk + bv + bo);
+    }
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        size_t bg = qdw_bytes(&l->sh_g), bu = qdw_bytes(&l->sh_u), bd = qdw_bytes(&l->sh_d);
+        if (bg && bu && bd) qt_trunk_offer("shexp", i, bg + bu + bd);
+    }
+}
+/* After qt_init decided: upload what was placed, keep the handles in the
+ * Layer. Every matrix falls back on its own, so a failed upload costs one
+ * GEMV on the CPU, never the component. Returns the number of matrices
+ * placed; `vram_bytes` gets their size. */
+static int trunk_place_dense(Model *m, double *vram_bytes){
+    Cfg *c = &m->c; int placed = 0; double vram = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        if (!c->is_attn[i]) {
+            l->qth_dnout = qdw_place(&l->dn_out, qt_place_of("dnout", i));
+            if (l->qth_dnout) { placed++; vram += (double)qdw_bytes(&l->dn_out); }
+        } else {
+            int dev = qt_place_of("attnproj", i);
+            l->qth_q = qdw_place(&l->q, dev); l->qth_k = qdw_place(&l->k, dev);
+            l->qth_v = qdw_place(&l->v, dev); l->qth_o = qdw_place(&l->o, dev);
+            if (l->qth_q) { placed++; vram += (double)qdw_bytes(&l->q); }
+            if (l->qth_k) { placed++; vram += (double)qdw_bytes(&l->k); }
+            if (l->qth_v) { placed++; vram += (double)qdw_bytes(&l->v); }
+            if (l->qth_o) { placed++; vram += (double)qdw_bytes(&l->o); }
+        }
+        int dev = qt_place_of("shexp", i);
+        l->qth_shg = qdw_place(&l->sh_g, dev); l->qth_shu = qdw_place(&l->sh_u, dev); l->qth_shd = qdw_place(&l->sh_d, dev);
+        if (l->qth_shg) { placed++; vram += (double)qdw_bytes(&l->sh_g); }
+        if (l->qth_shu) { placed++; vram += (double)qdw_bytes(&l->sh_u); }
+        if (l->qth_shd) { placed++; vram += (double)qdw_bytes(&l->sh_d); }
+    }
+    if (vram_bytes) *vram_bytes = vram;
+    return placed;
+}
+
+/* Measured, not assumed. The placer prices a trunk component by the bytes it
+ * saves on the CPU's memory bus, which presumes the GPU answers a GEMV faster
+ * than the CPU does. Four Tesla M10 (sm_50) said otherwise: every placed
+ * component ran slower there, lm_head 68.8 ms against 41.7 on the CPU, and
+ * decode fell from 3.56 to 2.68 tok/s (#1652). So before any trunk upload,
+ * one DeltaNet input projection (the most numerous placed matrix) is timed
+ * both ways on the device that would host it, ten GEMVs each, best of three
+ * rounds after a warm-up, and the trunk goes to VRAM only if the GPU wins.
+ * Only the automatic placement is questioned: a hand-written COLI_PLACE
+ * stands. COLI_TRUNK_PROBE=0 skips the probe and trusts the placer. The
+ * probe's copy stays resident (one projection, ~25 MB on the 35B). */
+static int trunk_probe_gpu_wins(Model *m){
+    const char *e = getenv("COLI_TRUNK_PROBE");
+    if (e && *e == '0') return 1;
+    if (!qt_place_is_auto()) return 1;
+    Cfg *c = &m->c;
+    QW *w = NULL; int dev = QT_PLACE_CPU;
+    for (int i = 0; i < c->n_layers && !w; i++) {
+        if (c->is_attn[i]) continue;
+        if (m->L[i].dn_qkv.q) { w = &m->L[i].dn_qkv; dev = qt_place_of("dnproj", i); }
+    }
+    if (!w) return 1;                                /* dense-i8 off: nothing will be placed */
+    if (dev == QT_PLACE_CPU) dev = qt_place_of("lmhead", 0);
+    if (dev == QT_PLACE_CPU) return 1;               /* nothing placed: nothing to measure */
+    int I = w->I, O = w->O;
+    int h = qt_dense_init(w->q, w->sc, I, O, dev);
+    if (h < 0) return 1;                             /* cannot measure: the placer's word stands */
+    float *x = malloc((size_t)I * sizeof(float)), *y = malloc((size_t)O * sizeof(float));
+    if (!x || !y) { free(x); free(y); return 1; }
+    for (int i = 0; i < I; i++) x[i] = sinf(0.37f * (float)i);
+    double gpu = 1e30, cpu = 1e30;
+    for (int r = 0; r < 3; r++) {
+        for (int k = 0; k < 3; k++) if (!qt_dense_matmul(h, y, x, I, O)) { free(x); free(y); return 1; }
+        double t0 = now_s();
+        for (int k = 0; k < 10; k++) if (!qt_dense_matmul(h, y, x, I, O)) { free(x); free(y); return 1; }
+        double tg = (now_s() - t0) / 10;
+        for (int k = 0; k < 3; k++) matmul_q(y, x, w->q, w->sc, I, O);
+        t0 = now_s();
+        for (int k = 0; k < 10; k++) matmul_q(y, x, w->q, w->sc, I, O);
+        double tc = (now_s() - t0) / 10;
+        if (tg < gpu) gpu = tg;
+        if (tc < cpu) cpu = tc;
+    }
+    free(x); free(y);
+    int wins = gpu < cpu;
+    fprintf(stderr, "[place] probe: one [%d x %d] int8 GEMV takes %.3f ms on CUDA dev %d, %.3f ms on the CPU -> trunk %s\n",
+            O, I, gpu * 1e3, dev, cpu * 1e3, wins ? "to VRAM" : "stays on the CPU");
+    return wins;
 }
 
 static void layers_forward_range(Model *m, float *x, int S, int pos_base,
@@ -3166,13 +3516,35 @@ static void hits_emit(Model *m){
 }
 static double tm_sum(int idx){ return (g_tm_dec[idx]+g_tm_pre[idx])/1e3; }   /* ms -> s */
 
+/* The generation budget a request gets. max_tokens is a CEILING, not a
+ * target (#260/#382, the rule GLM and DeepSeek V4 already apply): the prompt
+ * must fit with room for one token (none for a read-only logprobs request,
+ * docs/brio.md), and the budget is then clamped to what the context can hold.
+ * Returns the budget, or -1 when the PROMPT does not fit. Refusing when
+ * prompt + budget exceeded the context (#1641) turned the gateway's default
+ * output budget -- 8192 here, the whole default context -- into a 400 on
+ * every message of `coli chat` and on every request without max_tokens. */
+static int qwen36_serve_budget(int np, int max_tok, int max_ctx, int read_only){
+    if (np < 1) return -1;
+    int room = max_ctx - np;
+    if (read_only) return room < 0 ? -1 : (max_tok < room ? max_tok : room);
+    if (room < 1) return -1;
+    return max_tok > room ? room : max_tok;
+}
+
 static void serve_one(Model *m, ServeReq *q){
     int *ids=NULL, np=0;
     encode_text(q->payload, &ids, &np);          /* payload is raw prompt text; qwen36 adds no BOS */
     int max_ctx = qwen36_max_ctx();
-    if(np<1 || np+q->max_tok>max_ctx){
+    int budget = qwen36_serve_budget(np, q->max_tok, max_ctx, q->logprobs > 0);
+    if(budget < 0){
         printf("ERROR %s CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n",q->id,np,q->max_tok,max_ctx);
         fflush(stdout); free(ids); return;
+    }
+    if(budget < q->max_tok){
+        fprintf(stderr,"[serve] max_tokens %d clamped to %d (context %d - prompt %d); raise Q36_MAXT for longer answers\n",
+                q->max_tok, budget, max_ctx, np);
+        q->max_tok = budget;
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
     m->max_t = np + q->max_tok;
@@ -3477,8 +3849,10 @@ int main(int argc, char **argv) {
     g_expert_gs = m.c.expert_gs;
     if (g_expert_gs) fprintf(stderr, "[qwen36] group-scaled experts: gs=%d\n", g_expert_gs);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
-    /* dense matrices are quantized to int8 during model_init above (COLI_DENSE_I8=0
-     * disables it) -- see load_tq/QW; model_init_range already logged the count. */
+    /* dense matrices are quantized to int8 (+ int4 planar per COLI_DENSE_BITS/
+     * COLI_DENSE_INT4, see dense_int4_wanted) during model_init above
+     * (COLI_DENSE_I8=0 disables it) -- see load_tq/QW; model_init_range
+     * already logged the count and freed bytes. */
 
     /* Optional CUDA VRAM expert tier (COLI_CUDA=1): hot experts live in
      * DEVICE_LOCAL memory across the configured GPUs, misses fall back to the
@@ -3515,11 +3889,14 @@ int main(int argc, char **argv) {
             if (m.L[i].dn_qkv.q && m.L[i].dn_z.q)
                 qt_trunk_offer("dnproj", i, (size_t)(O_qkv + O_z) * m.c.hidden + (size_t)(O_qkv + O_z) * sizeof(float));
         }
+        trunk_offer_dense(&m);   /* dnout, attnproj, shexp: the rest of the per-token dense work */
     }
     if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
         atexit(qt_shutdown);
+        /* The placer predicted; measure before uploading a byte of trunk. */
+        if (!trunk_probe_gpu_wins(&m)) qt_trunk_withdraw("measured slower than the CPU");
         /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The
          * QW struct on m.lm_head holds the int8 rows + per-row scales the
          * CPU path uses; the GPU applies the identical semantics. */
@@ -3555,6 +3932,15 @@ int main(int argc, char **argv) {
             }
             if (placed)
                 fprintf(stderr, "[dnp] %d DeltaNet-Projektionen auf GPU (%.2f GB VRAM)\n",
+                        placed, vram / 1073741824.0);
+        }
+        /* The rest of the trunk, wherever the placer put it: out_proj,
+         * attention projections, shared expert. Handles live in the Layer. */
+        {
+            double vram = 0;
+            int placed = trunk_place_dense(&m, &vram);
+            if (placed)
+                fprintf(stderr, "[dense] %d trunk matrices on GPU (dnout/attnproj/shexp, %.2f GB VRAM)\n",
                         placed, vram / 1073741824.0);
         }
         /* Warmstart: fill the VRAM budget BEFORE the first token (heat order
@@ -4111,7 +4497,7 @@ static int qwen36_edge_engine_open(
     /* quantize=0: this engine never ran the old post-hoc qdw_register pass
      * either (only main()'s static Model did), so lm_head stays f32-only here,
      * exactly as before. */
-    load_tq(&engine->model, "lm_head.weight", config->hidden, config->vocab, 0, &engine->model.lm_head);
+    load_tq(&engine->model, "lm_head.weight", config->hidden, config->vocab, 0, "lmhead", &engine->model.lm_head);
     engine->model.final_norm = load_t_n(
         &engine->model, "model.norm.weight", config->hidden);
     engine->model.quant_bits = container_layer_is_int4(&engine->model, 0) ? 4 : 8;

@@ -44,7 +44,7 @@ static int shared_benchmark(void) {
     for(int64_t i=0;i<(int64_t)O*I;i++){((float*)l.sh_g.w)[i]=value(i,2);((float*)l.sh_u.w)[i]=value(i,3);}
     for(int64_t i=0;i<(int64_t)I*O;i++)((float*)l.sh_d.w)[i]=value(i,4);
     for(int i=0;i<I;i++)l.sh_gate[i]=value(i,5);
-    qw_quantize(l.sh_g.w,I,O,&l.sh_g);qw_quantize(l.sh_u.w,I,O,&l.sh_u);qw_quantize(l.sh_d.w,O,I,&l.sh_d);
+    qw_quantize(l.sh_g.w,I,O,NULL,&l.sh_g);qw_quantize(l.sh_u.w,I,O,NULL,&l.sh_u);qw_quantize(l.sh_d.w,O,I,NULL,&l.sh_d);
     if(!l.sh_g.q||!l.sh_u.q||!l.sh_d.q){fprintf(stderr,"FAIL: expected three dense-int8 copies\n");return 1;}
     float *x=falloc((int64_t)S*I),*seed=falloc((int64_t)S*I);
     float *a=falloc((int64_t)S*I),*b=falloc((int64_t)S*I);
