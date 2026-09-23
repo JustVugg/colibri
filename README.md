@@ -334,6 +334,15 @@ full forensic story). Grammar-forced drafts
 constrained JSON output. Whether speculation is a net win depends on your
 cache temperature — measure, and use `DRAFT=0` when it doesn't pay.
 
+Verify batches can also opt into an **exact attention core** with
+`COLI_EXACT_VERIFY=1` ([#689](https://github.com/JustVugg/colibri/issues/689)):
+the CPU MLA-absorb score and context dots accumulate integer products and round
+once, so a near-tie in a verify row resolves the same way on every host, at
+roughly 0.6x tok/s on a tiny oracle (the dot itself is ~5–7x the float loop).
+Two limits to know: with a quantised KV cache (`tq1`, TQ or int8 KV) the
+context dot keeps the float path, so exactness there is not provided; and a
+real near-tie flip has only been argued, not yet caught on GLM-5.2 at n=64.
+
 ## What it achieves
 
 <p align="center">

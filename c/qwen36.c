@@ -2816,10 +2816,13 @@ static int    g_pin_use_logit = 0;   /* 1 quando questa richiesta e ripartita da
 typedef struct { float **rec, **conv; int n_layers; } Q36PinState;
 
 /* Stato della lettura del prefill: dichiarato qui perche step() lo consulta e
- * step() viene prima del codice di servizio che lo accende. */
+ * step() viene prima del codice di servizio che lo accende. Solo il servizio
+ * lo accende e solo il servizio definisce serve_echo: senza main non esiste. */
+#ifndef QWEN36_NO_MAIN
 static int   g_echo_k  = 0;      /* 0 = spento */
 static const char *g_echo_id = NULL;
 static void serve_echo(const char *id, int pos, int token, const float *lo, int V, int k);
+#endif
 
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
@@ -2860,6 +2863,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
      * token, il cui predittore sta nello stato precedente. Per questo il
      * chiamante arretra di uno il riuso del prefisso quando la lettura e
      * accesa: cosi il primo token dell'opzione ricade sempre qui dentro. */
+#ifndef QWEN36_NO_MAIN
     if (g_echo_k > 0 && g_echo_id && S > 0) {
         float *erow = falloc(D), *elog = falloc(c->vocab);
         /* Il primo token fresco e predetto dallo stato PRECEDENTE, che dopo un
@@ -2875,6 +2879,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         }
         free(erow); free(elog);
     }
+#endif
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);

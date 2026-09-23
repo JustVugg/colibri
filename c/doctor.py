@@ -457,6 +457,26 @@ def deep_container_report(model, mirror_dir=None):
     }
 
 
+def windows_backend_dll(image):
+    """Which GPU backend DLL a Windows host compiled in, or None if CPU-only.
+
+    backend_loader.c bakes exactly one basename: coli_hip.dll under COLI_HIP_DLL
+    and coli_cuda.dll otherwise. That string is the build marker. The GLM/Qwen
+    banner "[CUDA] mode: routed experts" is only printed by those two engines;
+    a Kimi K3 CUDA_DLL host links the same loader and prints [K3-CUDA] instead.
+    DeepSeek V4 has its own pair and is not this function's job.
+    """
+    if not image or b"[DSV4 CUDA]" in image:
+        return None
+    if b"coli_hip.dll" in image:
+        return "coli_hip.dll"
+    if b"coli_cuda.dll" in image:
+        return "coli_cuda.dll"
+    if b"[CUDA] mode: routed experts" in image or b"[K3-CUDA]" in image:
+        return "coli_cuda.dll"
+    return None
+
+
 def cuda_linkage(engine_path):
     """Return CUDA linkage state without loading the executable or CUDA runtime."""
     engine = Path(engine_path)
@@ -484,17 +504,11 @@ def cuda_linkage(engine_path):
     if sys.platform == "win32":
         # Windows DLL-split builds never link the GPU runtime directly: the host
         # LoadLibrary's its backend at runtime (backend_loader.c), so there's no
-        # import-table entry for ldd/dumpbin to see. Detect the GPU build via a
-        # marker string baked into the engine's #ifdef COLI_CUDA block, then
-        # require the backend artifact to sit next to the executable.
-        #
-        # WHICH artifact is not a guess. backend_loader.c compiles exactly one
-        # basename into the host -- COLI_BACKEND_DLL is "coli_hip.dll" under
-        # COLI_HIP_DLL and "coli_cuda.dll" otherwise -- so the binary states
-        # what it will load and we check for that. Asking for coli_cuda.dll
-        # unconditionally failed a working HIP host (a hard error, not a
-        # warning), and accepting either name would have passed a HIP host that
-        # only had a stray CUDA backend beside it.
+        # import-table entry for ldd/dumpbin to see. Detect the GPU build from
+        # the backend basename compiled into the host, then require that file
+        # next to the executable. Asking for coli_cuda.dll unconditionally
+        # failed a working HIP host (a hard error, not a warning), and requiring
+        # the GLM routed-experts banner missed every Kimi K3 CUDA_DLL build.
         try:
             image = engine.read_bytes()
         except OSError:
@@ -506,10 +520,7 @@ def cuda_linkage(engine_path):
             present = any((engine.parent / name).is_file()
                           for name in ("coli_cuda_dsv4_dg.dll", "coli_cuda_dsv4.dll"))
             return {"linked": present, "missing": not present}
-        if b"[CUDA] mode: routed experts" not in image:
-            return {"linked": False, "missing": False}
-        expected = next((name for name in ("coli_hip.dll", "coli_cuda.dll")
-                         if name.encode() in image), None)
+        expected = windows_backend_dll(image)
         if expected is None:
             return {"linked": False, "missing": False}
         dll_present = (engine.parent / expected).is_file()

@@ -46,6 +46,28 @@ OMP_NUM_THREADS=<physical cores> OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close \
 SNAP=<container> N_NEW=200 ./c/qwen36 256 4 prompt.txt
 ```
 
+### Windows (CUDA_DLL=1)
+
+MinGW cannot link CUDA directly, so the backend is built into `coli_cuda.dll`
+with nvcc + MSVC and `qwen36.exe` reaches it through `backend_loader.c`.
+`CUDA=1` is rejected on Windows by design. From an *x64 Native Tools* prompt
+with MSYS2's `mingw64\bin` and `usr\bin` on `PATH`:
+
+```cmd
+cd c
+make cuda-dll CUDA_ARCH=sm_89
+make qwen36.exe CUDA_DLL=1 ARCH=native
+set COLI_CUDA=1
+set COLI_GPUS=0
+set CUDA_EXPERT_GB=auto
+qwen36.exe <same arguments as the CPU build>
+```
+
+Keep `coli_cuda.dll` next to `qwen36.exe`, built from the same checkout, and
+the CUDA toolkit's `bin` directory on `PATH` for `cudart`. A startup line
+`[gpu] MoE experts -> CUDA VRAM tier` confirms the tier is active; without it
+the run is CPU-only.
+
 `cap` (argv[1]) must equal `n_experts` (full RAM residency). int4 containers
 only (the int8 container keeps the CPU path). `COLI_TIMERS=1` prints
 per-phase timings and tier telemetry.

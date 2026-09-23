@@ -223,8 +223,25 @@ REGISTRY_OBJ = expert_store_registry.o
 V4_SERVE_TEST := tests/test_v4_serve_framing$(if $(IS_WIN),.exe,)
 V4_SERVE_TEST_OBJS := $(filter-out COLI_V4_UNIT_GENERATE_STATS.o,$(V4_OBJS))
 
+# The objects are named after the unit, not after the flags they were built
+# with, and three builds share them: this engine (CUDA=1 adds
+# -DCOLI_V4_GPU_TIER), the parent's test-c (no GPU tier) and its test-asan
+# (EXTRA_CFLAGS). Timestamps cannot tell those apart, so make would report
+# "is up to date" and link one build's objects into another (#1702). The
+# compiler line is recorded here and rewritten only when it changes; every
+# object compiled with $(CFLAGS) depends on it. Same scheme as git's GIT-CFLAGS.
+V4_FLAGS_STAMP = deepseek_v4.cflags
+V4_TRACK_FLAGS = $(subst ','\'',$(CC) $(CFLAGS))
+$(V4_FLAGS_STAMP): FORCE
+	@flags='$(V4_TRACK_FLAGS)'; \
+	if test x"$$flags" != x"`cat $@ 2>/dev/null`"; then \
+		test -f $@ && echo "deepseek-v4: build flags changed, rebuilding the units" >&2; \
+		echo "$$flags" > $@; \
+	fi
+FORCE:
+
 .PHONY: deepseek-v4 deepseek-v4-objs deepseek-v4-clean deepseek-v4-test-objs \
-	deepseek-v4-test-registry print-v4-objs
+	deepseek-v4-test-registry print-v4-objs FORCE
 deepseek-v4: $(V4_BINARY)
 
 # Build just the amalgamation unit + registry objects (no link). External
@@ -242,24 +259,25 @@ $(V4_BINARY): $(V4_OBJS)
 
 # Pluggable expert-store backend registry (standalone; not a deepseek_v4.c unit).
 # Linked into the binary so the engine can dispatch COLI_EXPERT_STORE backends.
-$(REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h expert_store.h
+$(REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h expert_store.h \
+	$(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -c expert_store_registry.c -o $@
 
 $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h \
 	route_trace.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
-	native_quant_fp4_rows16.h expert_store_registry.h
+	native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
 
 $(V4_HOT_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
 		st.h json.h compat.h tensor.h quant.h route_trace.h \
-		native_quant.h native_quant_fp4_rows16.h expert_store_registry.h
+		native_quant.h native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS \
 		-DCOLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16 -c deepseek_v4.c -o $@
 
 $(V4_BATCH_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
-		tensor.h quant.h native_quant.h native_quant_batch.h
+		tensor.h quant.h native_quant.h native_quant_batch.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS \
 		-DCOLI_V4_UNIT_NATIVE_QUANT_BATCH -c deepseek_v4.c -o $@
 
@@ -272,7 +290,7 @@ $(V4_SERVE_TEST): tests/test_v4_serve_framing.c deepseek_v4.c deepseek_v4.h \
 # The CUDA tier loader object. Compiled only on Windows, where it is appended
 # to V4_OBJS and resolves the MSVC-built coli_cuda_dsv4.dll at runtime. On
 # Linux it is empty so the engine links without it.
-backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h
+backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -c backend_loader_dsv4.c -o $@
 
 # Linux/macOS CUDA=1: the tier compiled straight into the engine.
@@ -297,4 +315,4 @@ test_expert_store_registry: test_expert_store_registry.c expert_store_registry.c
 deepseek-v4-clean:
 	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_HOT_TEST_OBJ) \
 		$(V4_BATCH_TEST_OBJ) \
-		$(V4_SERVE_TEST) test_expert_store_registry
+		$(V4_SERVE_TEST) test_expert_store_registry $(V4_FLAGS_STAMP)

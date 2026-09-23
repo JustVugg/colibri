@@ -5,7 +5,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [1.12.1] — 2026-09-22
 
-54 pull requests since v1.12.0, 42 of them from contributors. Two tokenizers
+70 pull requests since v1.12.0, 58 of them from contributors. Two tokenizers
 brought back to the reference, brio on the ninth engine, `coli chat` working
 again at the default context on two families, and a placement decision that
 is now measured on the card in front of it instead of predicted.
@@ -192,6 +192,42 @@ is now measured on the card in front of it instead of predicted.
   with zero errors and zero bytes leaked.
 - **#1669**: `test_systemone_api` imports its scoring engine relative to
   its package, so an installed `tests` package no longer breaks discovery.
+- **#1697** (kevin9327): the dashboard redesign had dropped the reasoning
+  stream: thinking tokens arrived on `delta.reasoning_content` and vanished,
+  the bubble stayed empty until the answer and a stop during thinking lost
+  the turn. The stream is read again, rendered as its own folding block,
+  counted in the rate and the time to first token, and a unit test pins the
+  split.
+- **#1693** (namespaceMarcello): with `PILOT` on, OLMoE could read the same
+  expert twice, once from the prefetcher and once from the forward pass,
+  into two slots; a slot being read now keeps a reservation in the index
+  (the `colibri.c` pattern) and the second caller waits for the first read
+  to publish. Three model-free scenarios pin it.
+- **#1695** (namespaceMarcello): the prefill echo state and `serve_echo` sit
+  under the same `QWEN36_NO_MAIN` guard, so the segment build no longer
+  warns about a function it never gets; the full build is byte-identical.
+- **#1622**: DeepSeek V4's REAP checkpoints store each expert as six
+  per-matrix records; the engine read them through buffered pread and
+  counted every one as a direct-I/O fallback (36% of expert reads on the
+  150B, #1615). Each segment now goes through the aligned direct window,
+  with a regression on a generated per-matrix fixture.
+- **#1597**: a replayed tool call whose `arguments` parsed as JSON but was
+  not an object (`"[1, 2]"`, `"5"`) answered HTTP 500 from the GLM renderers
+  before the engine was asked anything; it renders the call without
+  arguments, as every other renderer already did.
+- **#1624**: the five gcc 13 warnings left in `make check` are gone, and
+  `st_index_load` refuses an index path that would not fit its buffer
+  instead of opening a truncated one, with a long-path case in the tests.
+- **#1651**: a `pyflakes` pass over the launcher, autotune, the family
+  registry and the qwen36 converter: a `measure()` defined twice, a
+  `readline` import without a fallback, a stray f-string, dead variables.
+- **#1580**: `make qwen36 CUDA_DLL=1` on Windows reached GNU make's implicit
+  rule and built a CPU-only binary; a bare `qwen36` alias, a `.build-config`
+  prerequisite so a CUDA_DLL change rebuilds, a loader-against-header parity
+  test, and the Windows CUDA tier documented.
+- **#1556**: `coli plan` on macOS said "no supported GPU detected" on every
+  Mac; it now lists the Metal device by name, as identity only, without
+  pretending unified memory is a VRAM budget.
 - **#1691**: the installed launcher invoked as `/bin/coli` or `/sbin/coli`
   on a merged-/usr system derived `/libexec/colibri` instead of
   `/usr/libexec/colibri`, because `abspath` kept the alias (#1689,
@@ -216,6 +252,27 @@ is now measured on the card in front of it instead of predicted.
   dependency. The admission scheduler distinguishes completion, failure
   and cancellation, lets a request use a free slot that no earlier waiter
   reserved, and joins the keepalive pump before the slot is released.
+- **#1402** (enitimeago): a request whose last message is a non-empty
+  `assistant` turn continues that turn instead of answering in a new one, on
+  `/v1/chat/completions` and `/v1/messages`, for all nine families (Kimi K3
+  frames the open turn engine-side); the prompt ends inside the turn as the
+  official template renders it without a generation cue. On by default,
+  `COLI_CONTINUE_ASSISTANT=0` restores the old behaviour; refused together
+  with tools or a turn ending in whitespace, with a 400 that says why. Each
+  renderer is pinned against the vendored template (#1401).
+- **#1605**: `ORACLE_STRICT=1` makes a GLM oracle comparison exit non-zero
+  when it fails, token-exact by default with `ORACLE_TF_MAX_MISMATCHES` for
+  the documented teacher-forcing allowance; references are validated before
+  the comparison and non-finite logits cannot pass. Both oracle CI jobs run
+  real-process regressions against it.
+- **#1705**: `tools/benchmark_baseline.py`, a collection protocol on top of
+  the HTTP harness for a repeated three-engine serving baseline: one frozen
+  manifest (hardware, model and template identity, per-engine launch
+  settings, cache and speculation policy), a rotating plan over a
+  concurrency matrix, one collector per engine and round that manages no
+  server, and a comparison that keeps failed and missing cells visible and
+  distinguishes matched artifacts from deployment comparisons. No results
+  are bundled and no ranking is emitted.
 - **#1688**: `tools/benchmark_http_serving.py`, a stdlib HTTP streaming
   benchmark over fixed JSONL conversations: closed-loop or paced arrivals
   (periodic or Poisson, seeded), warmup separated from measurement,
@@ -236,6 +293,12 @@ is now measured on the card in front of it instead of predicted.
 - **#1617**: connecting the pi coding agent to `coli serve`.
 - **#1619**: `expected_bytes` identity versus physical extent for
   int4-rans256-g0 (#1273).
+- **#1618** (bherald): `docs/qwen38.md` no longer calls the engine text-only;
+  the vision tower and the gateway image path shipped in 1.12.0.
+- **#1649**, **#1647** (Suraj2105-1): the musl CI job runs on Alpine 3.24
+  and the release pipeline on Node.js 22, ahead of the 3.21 and Node 20
+  end of life.
+- **#1568** (Yoruxyv): an Indonesian translation of the dashboard.
 - **#1681** (XBold): the README and `docs/qwen38.md` no longer say Qwen3.8
   has no GPU backend; the CUDA VRAM expert tier and the int8 trunk in VRAM
   shipped in 1.12.0.
