@@ -99,6 +99,7 @@ static inline void omp_set_num_threads(int n){ (void)n; }
 #include "edge_adapters.h"
 #include "edge_tok_internal.h"
 #endif
+#include "coli_env.h"
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
@@ -11136,6 +11137,11 @@ int main(int argc, char **argv){
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
     }
+    /* Registry check: an unknown or wrong-engine variable is silently ignored
+     * otherwise, and the run then reports a plausible number for the WRONG
+     * configuration. See coli_env.h. */
+    coli_env_check(CE_COLIBRI, "colibri");
+    coli_env_dump(CE_COLIBRI, "colibri");
     /* #718: the hot-team block above tunes wake latency but historically left
      * GLM at libgomp's logical-CPU default.  Memory-bound quantized matmuls can
      * collapse when SMT siblings share each core, measured 2.3x on a 5950X.

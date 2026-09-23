@@ -67,6 +67,7 @@ static int qwen38_max_ctx(void) {
 #include "tok_unicode.h"
 #include "tok_unicode_o200k.h"
 #include "qwen38_nfc.h"
+#include "coli_env.h"
 /* quant.h owns Colibri's authoritative E4M3 table.  This engine retains the
  * Qwen sibling's established dense kernels, so rename quant.h's two generic
  * helpers while including it; every format-specific symbol keeps its shared
@@ -1834,6 +1835,8 @@ static int q38_reference_mode(const char *path,int serve_mode){
 
 #ifndef QWEN38_TEST_SERVE
 int main(int argc, char **argv) {
+    coli_env_check(CE_QWEN38, "qwen38");
+    coli_env_dump(CE_QWEN38, "qwen38");
     /* Physical-core team sizing, as colibri/inkling/kimi_k3/olmoe/deepseek-v41
      * do. Without it this engine takes one thread per logical CPU, which on an
      * SMT host doubles the team for no arithmetic and pays a barrier per tiny

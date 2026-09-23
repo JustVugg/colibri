@@ -65,6 +65,7 @@ static int qwen36_max_ctx(void) {
 #include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
 #include "decode_batch.h" /* ColiSubmit + coli_submit_ext: le chiavi key=value di SUBMIT */
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
+#include "coli_env.h"
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
 #include "idot.h"          /* integer dot kernels for the dense trunk (COLI_DENSE_IDOT, COLI_DENSE_BITS) */
@@ -3711,6 +3712,8 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
 }
 
 int main(int argc, char **argv) {
+    coli_env_check(CE_QWEN, "qwen36");
+    coli_env_dump(CE_QWEN, "qwen36");
     /* Physical-core team sizing, as colibri/inkling/kimi_k3/olmoe/deepseek-v41
      * do. Without it this engine takes one thread per logical CPU, which on an
      * SMT host doubles the team for no arithmetic and pays a barrier per tiny

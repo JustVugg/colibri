@@ -112,6 +112,7 @@
 #include "backend_cuda.h"
 #endif
 #include "omp_tune.h"
+#include "coli_env.h"
 #include "route_trace.h"
 #include "kv_prefix.h"
 #include "pin_pool.h"   /* coli_pin_slots_wanted: quanti scatti tenere */
@@ -3272,6 +3273,11 @@ static void serve_loop(Model *m, Tok *T){
 #ifndef KIMI_K3_NO_MAIN
 int main(int argc, char **argv){
     coli_omp_tune_threads("kimi_k3");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
+    /* Registry check: an unknown or wrong-engine variable is silently ignored
+     * otherwise, and the run then reports a plausible number for the WRONG
+     * configuration. See coli_env.h. */
+    coli_env_check(CE_KIMI, "kimi_k3");
+    coli_env_dump(CE_KIMI, "kimi_k3");
     int serving=getenv("SERVE")&&getenv("SERVE")[0]=='1';
     /* Usage was printed only when there were NO arguments, so `--help` fell
      * through as the model directory and the engine went looking for

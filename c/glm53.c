@@ -89,6 +89,7 @@ static uint64_t g_metal_moe_rows = 0;
 static int g_vk_ready = 0;
 #endif
 #include "compat.h"
+#include "coli_env.h"
 #include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
 #include "route_trace.h"
 #include "decode_batch.h"   /* coli_submit_ext, coli_logprob_tail: canale logprobs */
@@ -3515,6 +3516,8 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
 
 #ifndef GLM53_NO_MAIN
 int main(int argc, char **argv) {
+    coli_env_check(CE_GLM53, "glm53");
+    coli_env_dump(CE_GLM53, "glm53");
     /* Physical-core team sizing, the same shared helper colibri/inkling/
      * kimi_k3/olmoe/deepseek-v41 call. This engine has no OpenMP sizing of its
      * own, so on an SMT host it ran one thread per logical CPU; #718 measured
