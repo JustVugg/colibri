@@ -55,6 +55,9 @@ export interface HealthResponse {
   kv_slots?: number
   tiers?: TiersHealth
   hwinfo?: HwinfoHealth
+  /* Whether a message list ending on an assistant turn is continued rather than
+     answered fresh (COLI_CONTINUE_ASSISTANT). Absent on older servers. */
+  continue_assistant?: boolean
 }
 
 export interface ProfileTurn {

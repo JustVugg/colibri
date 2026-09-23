@@ -32,7 +32,7 @@ import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { getHealth, listModels, streamChat, type ChatMessage, type HealthResponse, type StreamChatResult } from "@/lib/api"
 import { resendFrom } from "@/lib/chat"
-import { activeRequests, supportsCacheSlots } from "@/lib/runtime"
+import { activeRequests, supportsCacheSlots, supportsContinuation } from "@/lib/runtime"
 import Brio from "./Brio"
 import { BrainWorkspace } from "./BrainWorkspace"
 import { Brand } from "./components/Brand"
@@ -40,6 +40,7 @@ import { Markdown } from "./components/Markdown"
 import { NavigationDock, type View } from "./components/NavigationDock"
 import { Profiling } from "./Profiling"
 import { persistPublicSettings, stored } from "@/lib/storage"
+import { appendDelta, continuation } from "@/lib/transcript"
 import { cn } from "@/lib/utils"
 import { useLocale } from "./i18n"
 
@@ -255,9 +256,7 @@ export default function App() {
           setTokenCount(count)
           const since = (performance.now() - decodeStart) / 1000
           if (count > 1 && since > 0.2) setTokPerSec((count - 1) / since)
-          updateMessages((current) => current.map((item) =>
-            item.id === targetId ? { ...item, reasoning: (item.reasoning ?? "") + delta } : item,
-          ))
+          updateMessages((current) => appendDelta(current, targetId, "reasoning", delta))
         },
         onDelta: (delta) => {
           if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); decodeStart = performance.now(); firstToken = false }
@@ -269,9 +268,7 @@ export default function App() {
              instead of showing what the engine is doing now. */
           const since = (performance.now() - decodeStart) / 1000
           if (count > 1 && since > 0.2) setTokPerSec((count - 1) / since)
-          updateMessages((current) => current.map((item) =>
-            item.id === targetId ? { ...item, content: item.content + delta } : item,
-          ))
+          updateMessages((current) => appendDelta(current, targetId, "content", delta))
         },
       })
       /* The turn's own figure keeps the same meaning as the live one, so the
@@ -317,23 +314,15 @@ export default function App() {
     await runStream(history, assistant.id)
   }
 
-  /* Continue the trailing assistant turn instead of opening a new one: resend the
-     transcript ending on that turn and stream the model's resumption into the same
-     bubble. Needs the server's COLI_CONTINUE_ASSISTANT path (default on across the
-     shipped families) -- an older server folds the turn into a completed one and
-     appends a fresh generation cue, so this reads as an ordinary re-answer there.
-     Trailing whitespace is stripped because the server refuses it (the template
-     strips it, so the model would resume from different bytes than were sent); the
-     UI is set to those exact bytes first, so the bubble shows what it resumes from. */
+  /* Continue the trailing assistant turn instead of opening a new one. Offered
+     only when /health reports continue_assistant: with COLI_CONTINUE_ASSISTANT=0,
+     or on a server that predates the field, the turn would be answered fresh. */
   const continueTurn = async () => {
     if (loading) return
-    const last = messages[messages.length - 1]
-    if (!last || last.role !== "assistant" || !last.content.trim()) return
-    const trimmed = last.content.replace(/\s+$/, "")
-    const history = messages.map((item) =>
-      item.id === last.id ? { ...item, content: trimmed } : item)
-    updateMessages(history)
-    await runStream(history, last.id)
+    const request = continuation(messages)
+    if (!request) return
+    updateMessages(request.history)
+    await runStream(request.history, request.targetId)
   }
 
   const openSettings = (page = "general") => { setSettingsPage(page); setView("settings") }
@@ -471,7 +460,7 @@ export default function App() {
                   <div className="reasoning-body">{item.reasoning}</div>
                 </details>
               : null}{item.content ? (item.role === "assistant" ? <Markdown text={item.content} /> : item.content) : <span className="typing" aria-label={t("ui.generating")}><i /><i /><i /></span>}</div>
-            {item.role === "assistant" && item.content && <div className="message-actions"><button className="icon-action" aria-label={t("ui.copy")} title={t("ui.copy")} onClick={() => void copyMessage(item)}><Copy /></button>{copied === item.id && <span role="status">{t("ui.copied")}</span>}{index === messages.length - 1 && !loading && <button className="icon-action" aria-label={t("ui.regenerate")} title={t("ui.regenerate")} onClick={() => { const retry = resendFrom(messages, index); if (retry) void send(retry.text, retry.previous, retry.pictures, false) }}><RefreshCw /></button>}{index === messages.length - 1 && !loading && (lastFinish === "length" || lastFinish === "aborted") && <button className="icon-action" aria-label={t("ui.continue")} title={t("ui.continue")} onClick={() => void continueTurn()}><StepForward /></button>}</div>}
+            {item.role === "assistant" && item.content && <div className="message-actions"><button className="icon-action" aria-label={t("ui.copy")} title={t("ui.copy")} onClick={() => void copyMessage(item)}><Copy /></button>{copied === item.id && <span role="status">{t("ui.copied")}</span>}{index === messages.length - 1 && !loading && <button className="icon-action" aria-label={t("ui.regenerate")} title={t("ui.regenerate")} onClick={() => { const retry = resendFrom(messages, index); if (retry) void send(retry.text, retry.previous, retry.pictures, false) }}><RefreshCw /></button>}{index === messages.length - 1 && !loading && supportsContinuation(health) && (lastFinish === "length" || lastFinish === "aborted") && <button className="icon-action" aria-label={t("ui.continue")} title={t("ui.continue")} onClick={() => void continueTurn()}><StepForward /></button>}</div>}
           </article>)}<div ref={bottomRef} /></div>
         </div>}
         <div className="composer-wrap">
