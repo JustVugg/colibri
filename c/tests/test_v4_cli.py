@@ -106,6 +106,7 @@ class V4CliTest(unittest.TestCase):
             self.assertNotIn("text", captured)
             self.assertEqual(captured["env"]["CHAT"], "1")
             self.assertEqual(captured["env"]["MAX_NEW"], "32")
+            self.assertEqual(captured["env"]["SNAP"], os.path.abspath(str(root)))
         finally:
             directory.cleanup()
 
@@ -117,18 +118,29 @@ class V4CliTest(unittest.TestCase):
         self.assertEqual(env["CTX"], "4096")
 
     def test_sister_engines_get_snap_from_the_model_flag(self):
-        """#1501: `coli run` handed olmoe (and every non-GLM engine) an
+        """#1501 / #1600: `coli run` handed olmoe (and every non-GLM engine) an
         environment without SNAP, so the engine exited with "started without
-        a model" while chat and serve, which set it elsewhere, worked."""
+        a model" while chat and serve, which set it elsewhere, worked.
+        SNAP is the model directory, same as env_for() for glm: --model wins
+        over a leftover SNAP in the parent environment."""
         from family_registry import family_ids
         for arch in [f for f in family_ids() if f != "glm"]:
             args = argparse.Namespace(ngen=8, temp=None, ram=0, ctx=None, model="models/demo")
             env = self.cli.env_for_engine(args, arch)
-            self.assertEqual(env.get("SNAP"), os.path.abspath("models/demo"), arch)
-        # an explicit SNAP in the caller's environment still wins
+            self.assertEqual(env.get("SNAP"), os.path.abspath(args.model), arch)
         with mock.patch.dict(os.environ, {"SNAP": "/elsewhere"}):
             args = argparse.Namespace(ngen=8, temp=None, ram=0, ctx=None, model="models/demo")
-            self.assertEqual(self.cli.env_for_engine(args, "olmoe")["SNAP"], "/elsewhere")
+            self.assertEqual(
+                self.cli.env_for_engine(args, "olmoe")["SNAP"],
+                os.path.abspath(args.model),
+            )
+
+    def test_v41_ram_flag_overrides_inherited_budget(self):
+        args = argparse.Namespace(ngen=8, temp=None, ram=96, ctx=4096)
+        with mock.patch.dict(os.environ, {"RAM_GB": "32"}):
+            env = self.cli.env_for_engine(args, "deepseek_v41")
+        self.assertEqual(env["RAM_GB"], "96")
+        self.assertEqual(env["CTX"], "4096")
 
     def test_kimi_engine_environment_forwards_ram(self):
         """#855: `--ram` reached the environment for deepseek_v4 only, so on Kimi

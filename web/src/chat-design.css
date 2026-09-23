@@ -1,0 +1,150 @@
+@font-face{font-family:Bytesized;src:url('/fonts/bytesized.ttf') format('truetype');font-weight:400;font-display:swap}
+:root{--background:#212121;--foreground:#ececec;--card:#262626;--primary:#b2ccbb;--primary-foreground:#15221a;--secondary:#303030;--muted-foreground:#a1a1a1;--border:#383838;--input:#303030;--rail:76px;--rail-bg:#171717}
+:root[data-theme=light]{color-scheme:light;--background:#fafafa;--foreground:#242424;--card:#fff;--primary:#4e705b;--primary-foreground:#fff;--secondary:#f0f0f0;--muted-foreground:#747474;--border:#dfdfdf;--input:#f0f0f0;--rail-bg:#f0f0f0}
+button{color:inherit}button:disabled{cursor:default;opacity:.4}svg.lucide{stroke-width:1.5}fieldset{border:0;margin:0;padding:0;min-width:0}[hidden]{display:none!important}
+.redesigned.app-shell{height:100vh;height:100dvh;min-height:0;grid-template-columns:var(--rail) minmax(0,1fr);background:var(--background);overflow:hidden}
+.rail{height:100%;display:flex;align-items:center;flex-direction:column;gap:14px;padding:18px 0;background:var(--rail-bg);z-index:20}
+.rail button{display:grid;place-items:center;border:0;background:none;color:var(--muted-foreground);border-radius:13px;flex-shrink:0}
+.rail .rail-brand{width:45px;height:39px;color:var(--foreground);margin-bottom:14px}.rail-button{width:42px;height:42px}.rail-button svg{width:20px;height:20px}.rail .rail-button:hover,.rail .rail-button.active{background:var(--secondary);color:var(--foreground)}
+.rail-bottom{margin-top:auto;display:grid;gap:10px}.rail-bottom:before{content:'';width:20px;height:1px;background:var(--border);justify-self:center;margin:10px 0}
+.colibri-brand{display:inline-flex;align-items:center;color:var(--foreground);flex-shrink:0}.colibri-brand>svg{width:31px;height:29px}.colibri-brand.full{gap:20px}.colibri-brand.full>svg{width:67px;height:60px}.colibri-word{font-family:Bytesized,sans-serif;font-size:70px;line-height:1;text-transform:uppercase;letter-spacing:.02em}
+.workspace{min-width:0;min-height:0;height:100%;display:flex;flex-direction:column;padding-bottom:14px}.workspace.brain-workspace{padding-bottom:0}
+.workspace-topbar{height:64px;flex-shrink:0;padding:0 28px;display:flex;align-items:center;justify-content:space-between;gap:12px}.model-button{display:flex;align-items:center;gap:9px;background:none;border:0;color:var(--muted-foreground);min-width:0;font-size:13px}.model-button span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.model-button svg{width:14px;height:14px}.workspace-actions{display:flex;align-items:center;gap:10px;flex-shrink:0}.workspace-actions .connection-state{border:0;background:none;font-size:10px;color:var(--muted-foreground)}.connection-state.connected span{box-shadow:none}
+.icon-action{width:32px;height:32px;display:inline-grid;place-items:center;border:0;border-radius:8px;background:none;color:var(--muted-foreground);flex-shrink:0}.icon-action svg{width:17px;height:17px}.icon-action:hover{background:var(--secondary);color:var(--foreground)}
+.chat-view{display:flex;flex-direction:column;flex:1;min-height:0}.chat-view.empty{justify-content:center;overflow:auto}.welcome-brand{display:flex;justify-content:center;flex-shrink:0;margin-bottom:32px;padding:0 16px}
+.chat-view .composer-wrap{padding:0 32px 12px;background:none;flex-shrink:0}.chat-view .composer{width:min(760px,100%);border:1px solid transparent;border-radius:26px;background:var(--input);box-shadow:none}.chat-view .composer:focus-within{border-color:color-mix(in srgb,var(--foreground) 25%,transparent)}
+.chat-view .composer textarea{display:block;min-height:88px;max-height:190px;font-size:15px;line-height:1.6;padding:19px 21px 9px;outline:none;resize:vertical;box-shadow:none}.chat-view .composer-foot{gap:8px;justify-content:flex-start;padding:6px 13px 12px}
+.reasoning-chip{display:flex;align-items:center;gap:6px;border:1px solid color-mix(in srgb,var(--foreground) 18%,transparent);border-radius:20px;font-size:11px;padding:7px 10px;background:none;color:var(--muted-foreground)}.reasoning-chip svg{width:15px;height:15px}.reasoning-chip[aria-pressed=true]{background:var(--foreground);color:var(--background)}.slot-chip{margin-left:auto;display:flex;align-items:center;gap:5px;font-size:10px;color:var(--muted-foreground);border:0;background:none}.slot-chip svg{width:13px;height:13px}
+.send-button{border:0;display:grid;place-items:center;width:34px;height:34px;flex-shrink:0;border-radius:50%;background:var(--foreground);color:var(--background)}.send-button svg{width:21px;height:21px}
+.chat-view .suggestions{display:flex;justify-content:center;flex-wrap:wrap;gap:8px;width:min(760px,100%);margin:22px auto 0}.chat-view .suggestions button{min-height:0;display:flex;align-items:center;justify-content:center;gap:7px;padding:10px 13px;font-size:11px;color:var(--muted-foreground);background:none;border:1px solid var(--border);border-radius:24px}.chat-view .suggestions button svg{width:15px;height:15px}.chat-view .suggestions button:hover{background:var(--secondary);transform:none;color:var(--foreground)}
+.chat-view .conversation{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain}.chat-view .message-list{width:min(760px,calc(100% - 64px));padding:26px 0 20px}.chat-view .message{display:flex;flex-direction:column;gap:13px;margin-bottom:30px}.chat-view .message.user{align-items:flex-end}.chat-view .message-body{font-size:15px;line-height:1.8;color:var(--foreground)}.chat-view .message.user .message-body{max-width:85%;padding:11px 19px;border-radius:24px;background:var(--input);color:var(--foreground)}.assistant-brand{display:flex;align-items:center;gap:9px;font-size:13px}.assistant-brand .colibri-brand>svg{width:23px;height:22px}.message-actions{display:flex;align-items:center;gap:3px}.message-actions>span{font-size:10px;color:var(--muted-foreground)}.truncation-note{max-width:760px;margin:8px auto 0;font-size:11px;color:var(--muted-foreground)}
+/* Reasoning models stream thinking before the answer. Folded once the answer
+   starts (open={!item.content} in App.tsx) so a long chain of thought does not
+   push the reply off the screen. */
+.chat-view .reasoning{margin-bottom:14px;border-left:2px solid color-mix(in srgb,var(--primary) 45%,transparent);padding-left:12px}
+.chat-view .reasoning>summary{color:var(--muted-foreground);font-size:10px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;cursor:pointer;list-style:none}
+.chat-view .reasoning>summary::-webkit-details-marker{display:none}
+.chat-view .reasoning>summary::before{content:"\25B8 ";display:inline-block;transition:transform .15s}
+.chat-view .reasoning[open]>summary::before{transform:rotate(90deg)}
+.chat-view .reasoning>summary:hover{color:var(--foreground)}
+.chat-view .reasoning-body{margin-top:8px;color:var(--muted-foreground);font-size:13px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere}
+.navigation-dock{position:fixed;left:calc(50% + var(--rail)/2);top:0;transform:translateX(-50%);width:104px;height:27px;z-index:70;display:flex;align-items:center;justify-content:center;border-radius:0 0 14px 14px;background:var(--card);border:1px solid var(--border);border-top:0;transition:width .3s,height .3s,margin .3s,border-radius .3s,background .25s,box-shadow .25s}.navigation-dock.open{width:300px;height:64px;margin-top:11px;border-radius:34px;background:color-mix(in srgb,var(--card) 88%,transparent);backdrop-filter:blur(24px);box-shadow:0 6px 22px #0000002e;border:1px solid color-mix(in srgb,var(--foreground) 12%,transparent)}.navigation-dock nav{display:flex;gap:18px;align-items:center}.navigation-dock nav button{display:grid;place-items:center;position:relative;border:0;background:none;border-radius:50%;width:46px;height:46px;padding:0;color:var(--muted-foreground);font-size:12px}.navigation-dock nav button:hover,.navigation-dock nav button:focus-visible{color:var(--foreground)}.navigation-dock nav button[aria-current]{background:color-mix(in srgb,var(--foreground) 10%,transparent);color:var(--foreground)}.navigation-dock nav button>span{position:absolute;top:calc(100% + 19px);left:50%;white-space:nowrap;font-size:12px;color:var(--muted-foreground);opacity:0;pointer-events:none;transform:translateX(-50%) translateY(-4px);transition:opacity .18s,transform .18s}.navigation-dock nav button:hover>span,.navigation-dock nav button:focus-visible>span{opacity:1;transform:translateX(-50%) translateY(0)}.navigation-dock nav svg{width:21px;height:21px;flex-shrink:0}.dock-handle{position:absolute;inset:0;width:100%;height:27px;background:none;border:0;display:grid;place-items:center;touch-action:none}.dock-handle span{width:13px;height:13px;border-right:2.5px solid var(--foreground);border-bottom:2.5px solid var(--foreground);border-radius:0 0 3px 0;opacity:.8;transform:translateY(-4px) rotate(45deg);transition:transform .3s,opacity .25s}.navigation-dock.open .dock-handle{top:auto;bottom:-14px;height:18px}.navigation-dock.open .dock-handle span{transform:translateY(3px) rotate(225deg);opacity:.45}.dock-busy{width:4px;height:4px;border-radius:50%;background:#b6dac3;position:absolute;right:8px;top:8px}
+.settings-page,.profiling-workspace,.brio-workspace{flex:1;min-height:0;overflow:auto;padding:28px 44px 32px}.page-heading,.settings-tabs,.settings-content{max-width:1080px;margin:0 auto}.page-heading>span{font-size:9px;letter-spacing:1.5px;color:var(--muted-foreground)}.page-heading h1{font-size:32px;letter-spacing:-.9px;font-weight:450;margin:12px 0 10px}.page-heading p{font-size:13px;line-height:1.7;color:var(--muted-foreground);margin:0}.settings-tabs{display:flex;gap:6px;margin:28px auto 25px;border-bottom:1px solid var(--border);padding-bottom:12px}.settings-tabs button{border:0;border-radius:9px;padding:10px 17px;background:none;color:var(--muted-foreground);font-size:12px}.settings-tabs button[aria-current]{background:var(--secondary);color:var(--foreground)}.settings-card{max-width:730px;border:1px solid var(--border);border-radius:20px;padding:26px;background:var(--card)}.settings-card h2{font-size:16px;font-weight:500;margin:0 0 23px}.settings-card .side-section{gap:20px}.settings-card .section-title{color:var(--muted-foreground);font-size:11px}.settings-card .side-section label{color:var(--muted-foreground);font-size:12px;gap:9px}.settings-card .side-section select{font-size:13px}.settings-card .runtime-grid strong{font-size:24px;font-weight:400}.settings-card .field-help{font-size:11px;line-height:1.6}.settings-card .hw-panel{gap:12px}.settings-card .hw-row{font-size:12px}.settings-card .session-stats{margin:15px 0}.settings-help{font-size:11px;margin:25px 0 0;color:var(--muted-foreground)}.theme-choices{display:flex;gap:14px}.theme-choice{width:145px;padding:10px;background:none;border:1px solid var(--border);border-radius:12px;text-align:left}.theme-choice[aria-pressed=true]{border-color:var(--primary)}.theme-choice>span{display:block;height:80px;background:#212121;border:1px solid #ffffff13;border-radius:7px;box-shadow:inset 23px 0 #171717}.theme-choice.light>span{background:#fff;box-shadow:inset 23px 0 #eee;border-color:#ddd}.theme-choice b{display:block;font-size:12px;font-weight:400;margin-top:10px}.language-field{display:flex;align-items:center;gap:10px;margin-top:26px;font-size:12px}.language-field svg{width:16px}.language-field select{margin-left:auto;border:1px solid var(--border);border-radius:8px;padding:9px;background:var(--input);max-width:180px}
+.live-metrics{display:flex;flex-wrap:wrap;gap:9px;max-width:1080px;margin:18px auto}.live-metrics [data-slot=badge]{gap:6px;font-weight:400;padding:8px 12px}.profiling-workspace .prof-page{max-width:1080px;margin:auto;padding:14px 0;overflow:visible}.prof-head .section-title{color:var(--muted-foreground)}.prof-tiles>div,.prof-shares,.prof-chart,.prof-table-wrap{border-radius:17px;padding:20px;background:var(--card)}.prof-tiles strong{font:400 29px ui-sans-serif,system-ui,sans-serif;letter-spacing:-1px}.prof-charts{gap:16px}.prof-chart{padding:24px}.prof-plot svg{height:160px}.prof-table-wrap{padding:0}.prof-table td{color:var(--foreground)}.prof-share-head,.prof-chart-title,.prof-legend{color:var(--muted-foreground)}.prof-plot:focus-visible{outline:2px solid var(--primary);outline-offset:5px}
+.history-dialog{padding:24px;border:1px solid var(--border);border-radius:22px;width:min(560px,calc(100vw - var(--rail) - 24px));max-height:75dvh;background:var(--card);color:var(--foreground);box-shadow:0 24px 80px #0005}.history-dialog::backdrop{background:#0007;backdrop-filter:blur(6px)}.history-dialog header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}.history-dialog h2{font-size:18px;font-weight:500;margin:0}.history-search{display:flex;gap:10px;align-items:center;padding:12px;border:1px solid var(--border);border-radius:12px}.history-search svg{width:16px;flex-shrink:0}.history-search input{border:0;background:none;outline:none;min-width:0;width:100%;font-size:13px}.history-results{display:grid;gap:7px;margin-top:18px}.history-results>button{display:flex;gap:12px;text-align:left;background:var(--secondary);border:0;border-radius:10px;padding:14px;font-size:12px}.history-results svg{width:17px;flex-shrink:0}.history-results span{overflow-wrap:anywhere}.history-results small{display:block;color:var(--muted-foreground);margin-top:6px;font-size:10px}.history-results>p{color:var(--muted-foreground);font-size:11px;line-height:1.6}
+@media(max-width:760px){:root{--rail:60px}.rail{padding:15px 0;gap:10px}.rail-button{width:38px;height:38px}.rail .rail-brand{margin-bottom:12px}.workspace{padding-bottom:12px}.workspace-topbar{height:58px;padding:0 15px}.workspace-actions{gap:2px}.workspace-actions .connection-state{font-size:0;gap:0;padding:8px}.model-button{font-size:11px}.colibri-brand.full{gap:13px}.colibri-brand.full>svg{width:45px;height:40px}.colibri-word{font-size:48px}.welcome-brand{margin-bottom:26px}.chat-view .composer-wrap{padding:0 14px 12px}.chat-view .composer textarea{font-size:16px;padding:16px 16px 8px;min-height:80px}.chat-view .composer-foot{padding:5px 10px 10px;gap:6px}.reasoning-chip{font-size:10px;padding:6px 8px}.slot-chip{font-size:9px}.chat-view .suggestions{gap:7px;margin-top:18px}.chat-view .suggestions button{font-size:10px;padding:9px 11px}.chat-view .suggestions svg{display:none}.chat-view .message-list{width:calc(100% - 30px)}.chat-view .message-body{font-size:14px}.chat-view .message.user .message-body{max-width:93%}.navigation-dock.open{width:min(300px,calc(100vw - var(--rail) - 16px));height:66px;margin-top:9px}.navigation-dock nav{gap:0}.navigation-dock nav button{grid-auto-flow:row;gap:3px;width:60px;height:52px;border-radius:15px;font-size:9px}.navigation-dock nav button>span{position:static;transform:none;opacity:1;font-size:9px;color:inherit;transition:none}.navigation-dock nav svg{width:19px;height:19px}.settings-page,.profiling-workspace,.brio-workspace{padding:20px 16px}.page-heading h1{font-size:26px}.settings-tabs{gap:3px;flex-wrap:wrap;margin:22px auto 18px}.settings-tabs button{font-size:11px;padding:9px}.settings-card{padding:17px}.theme-choice{width:120px;min-width:0}.language-field{flex-wrap:wrap}.language-field select{font-size:16px}.settings-card input:not([type=range]),.settings-card select{font-size:16px}.prof-tiles{gap:8px}.prof-tiles>div{padding:14px}.prof-tiles strong{font-size:24px}.prof-shares,.prof-chart{padding:15px}.prof-legend{font-size:10px;gap:8px}.live-metrics{gap:6px}.live-metrics [data-slot=badge]{font-size:10px;padding:6px 8px}.history-dialog{padding:18px}}
+@media(max-height:600px){.chat-view.empty{justify-content:flex-start;padding-top:20px}.welcome-brand{margin-top:auto}.chat-view.empty .composer-wrap{margin-bottom:auto}}
+
+/* Markdown inside an assistant turn. The model writes fences, lists and links;
+   rendered as React nodes, never as HTML, so nothing here can inject markup. */
+.md>div>*:first-child{margin-top:0}
+.md>div>*:last-child{margin-bottom:0}
+.md p{margin:0 0 .75em}
+.md h2,.md h3,.md h4,.md h5{margin:1.1em 0 .5em;line-height:1.25;font-weight:600}
+.md h2{font-size:1.18em}.md h3{font-size:1.08em}.md h4{font-size:1em}.md h5{font-size:.95em;opacity:.85}
+.md ul,.md ol{margin:0 0 .75em;padding-left:1.35em}
+.md li{margin:.2em 0}
+.md li::marker{color:var(--primary)}
+.md a{color:var(--primary);text-underline-offset:2px}
+.md blockquote{margin:0 0 .75em;padding:.1em 0 .1em .85em;border-left:2px solid var(--primary);opacity:.9}
+.md hr{border:0;border-top:1px solid color-mix(in srgb,var(--foreground) 18%,transparent);margin:1.1em 0}
+.md :not(pre)>code{background:color-mix(in srgb,var(--foreground) 10%,transparent);padding:.12em .36em;border-radius:.35em;font-size:.92em}
+.md-code{margin:0 0 .85em;border:1px solid color-mix(in srgb,var(--foreground) 14%,transparent);border-radius:.6em;overflow:hidden;background:color-mix(in srgb,var(--foreground) 5%,transparent)}
+.md-code figcaption{display:flex;align-items:center;justify-content:space-between;gap:.5em;padding:.35em .5em .35em .75em;font-size:.78em;letter-spacing:.04em;text-transform:uppercase;opacity:.7;border-bottom:1px solid color-mix(in srgb,var(--foreground) 12%,transparent)}
+.md-code figcaption button{display:inline-flex;align-items:center;justify-content:center;width:1.9em;height:1.9em;border-radius:.4em;color:inherit;opacity:.8}
+.md-code figcaption button:hover{opacity:1;background:color-mix(in srgb,var(--foreground) 10%,transparent)}
+.md-code figcaption svg{width:.95em;height:.95em}
+.md-code pre{margin:0;padding:.75em .85em;overflow-x:auto}
+.md-code code{font-size:.9em;line-height:1.55;white-space:pre}
+
+
+/* Attached pictures: thumbnails while composing, full width once sent. */
+.composer-attachments{display:flex;flex-wrap:wrap;gap:.5rem;padding:.6rem .75rem 0}
+.attachment{position:relative;display:inline-flex}
+.attachment img{width:64px;height:64px;object-fit:cover;border-radius:.5rem;border:1px solid color-mix(in srgb,var(--foreground) 16%,transparent)}
+.attachment button{position:absolute;top:-6px;right:-6px;display:inline-flex;align-items:center;justify-content:center;width:1.25rem;height:1.25rem;border-radius:50%;background:var(--card);border:1px solid color-mix(in srgb,var(--foreground) 22%,transparent);color:inherit}
+.attachment button svg{width:.7rem;height:.7rem}
+.attach-chip{display:inline-flex;align-items:center;justify-content:center;width:2rem;height:2rem;border-radius:.6rem;color:inherit;opacity:.75}
+.attach-chip:hover{opacity:1;background:color-mix(in srgb,var(--foreground) 10%,transparent)}
+.attach-chip svg{width:1.05rem;height:1.05rem}
+.message-images{display:flex;flex-wrap:wrap;gap:.5rem;margin:0 0 .5rem}
+.message-images img{max-width:min(320px,100%);border-radius:.6rem;border:1px solid color-mix(in srgb,var(--foreground) 14%,transparent)}
+
+/* ---- modalita brio -------------------------------------------------------
+   Una colonna sola: il documento in alto, le opzioni comuni, poi le domande
+   una sotto l'altra con la propria risposta sotto. La forma segue il motivo
+   per cui la modalita esiste: il documento si legge una volta e le domande
+   sono tante, quindi il documento sta in cima e le domande si accumulano. */
+.brio-page{max-width:1080px;margin:0 auto;display:grid;gap:14px}
+.brio-card{background:var(--card);border-radius:20px;padding:22px 24px}
+.brio-card h2{font-size:14px;font-weight:500;margin:0}
+.brio-card textarea,.brio-card input{width:100%;display:block;background:var(--input);border:1px solid transparent;border-radius:14px;padding:11px 14px;font:inherit;font-size:13px;line-height:1.6;color:var(--foreground);outline:none;resize:vertical}
+.brio-card textarea::placeholder,.brio-card input::placeholder{color:var(--muted-foreground)}
+.brio-card textarea:focus,.brio-card input:focus{border-color:color-mix(in srgb,var(--foreground) 25%,transparent)}
+
+.brio-doc-head{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+.brio-doc-head h2{margin-right:auto}
+.brio-doc-head button{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--border);border-radius:20px;background:none;color:var(--muted-foreground);font-size:11px;padding:7px 13px}
+.brio-doc-head button:hover{color:var(--foreground);border-color:color-mix(in srgb,var(--foreground) 30%,transparent)}
+.brio-doc-head svg{width:14px;height:14px}
+.brio-meta{margin:10px 0 0;font-size:11px;color:var(--muted-foreground)}
+.brio-meta b{color:var(--foreground);font-weight:400}
+
+.brio-shared h2{margin-bottom:12px}
+.brio-chips{display:flex;flex-wrap:wrap;gap:7px;margin-top:11px}
+.brio-chips button{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:20px;background:none;color:var(--muted-foreground);font-size:11px;padding:5px 9px 5px 12px}
+.brio-chips button:hover{color:var(--foreground);border-color:color-mix(in srgb,var(--foreground) 30%,transparent)}
+.brio-chips svg{width:12px;height:12px}
+
+.brio-questions{display:grid;gap:12px}
+.brio-q-head{display:flex;align-items:center;gap:11px}
+.brio-num{width:24px;height:24px;flex-shrink:0;display:grid;place-items:center;border-radius:50%;background:var(--secondary);color:var(--muted-foreground);font-size:11px;font-variant-numeric:tabular-nums}
+.brio-q-head input{font-size:14px}
+.brio-drop{width:30px;height:30px;flex-shrink:0;display:grid;place-items:center;border:0;border-radius:9px;background:none;color:var(--muted-foreground)}
+.brio-drop:hover{background:var(--secondary);color:var(--foreground)}
+.brio-drop svg{width:15px;height:15px}
+.brio-own{margin-top:10px;font-size:12px!important;padding:9px 14px!important;line-height:1.7}
+.brio-warn{margin:8px 0 0;font-size:11px;color:#e0b062}
+
+.brio-running{display:flex;align-items:center;gap:9px;margin:16px 0 0;font-size:12px;color:var(--muted-foreground)}
+.brio-running svg{width:15px;height:15px}
+.brio-spin{animation:brio-turn 1s linear infinite}
+@keyframes brio-turn{to{transform:rotate(360deg)}}
+
+.brio-answer{margin-top:18px;padding-top:16px;border-top:1px solid var(--border)}
+.brio-bars{display:grid;gap:2px}
+.brio-bar{display:grid;grid-template-columns:minmax(0,11rem) minmax(0,1fr) 4.4rem;align-items:center;gap:14px;padding:6px 0}
+.brio-name{font-size:13px;color:var(--muted-foreground);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.brio-bar.top .brio-name{color:var(--foreground)}
+.brio-track{height:8px;border-radius:5px;background:var(--secondary);overflow:hidden}
+.brio-fill{display:block;height:100%;border-radius:5px;background:color-mix(in srgb,var(--foreground) 22%,transparent);transition:width .35s ease}
+.brio-bar.top .brio-fill{background:var(--primary)}
+.brio-pct{text-align:right;font:400 15px ui-sans-serif,system-ui,sans-serif;letter-spacing:-.3px;font-variant-numeric:tabular-nums}
+.brio-pct i{font-style:normal;font-size:10px;color:var(--muted-foreground);margin-left:1px}
+
+.brio-foot{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 14px;margin-top:14px}
+.brio-foot strong{font:450 21px ui-sans-serif,system-ui,sans-serif;letter-spacing:-.5px}
+.brio-foot[data-level=sure] strong{color:var(--primary)}
+.brio-foot[data-level=unsure] strong{color:#e0b062}
+.brio-foot[data-level=unknown] strong{color:var(--muted-foreground)}
+.brio-foot span{font-size:11px;color:var(--muted-foreground)}
+.brio-foot em{margin-left:auto;font-style:normal;font-size:11px;color:var(--muted-foreground)}
+.brio-foot em b{color:var(--primary);font-weight:400}
+
+.brio-actions{display:flex;gap:11px;align-items:center;margin-top:2px}
+.brio-add{display:inline-flex;align-items:center;gap:8px;border:1px dashed var(--border);border-radius:26px;background:none;color:var(--muted-foreground);font-size:12px;padding:13px 18px}
+.brio-add:hover{color:var(--foreground);border-color:color-mix(in srgb,var(--foreground) 30%,transparent)}
+.brio-add svg{width:15px;height:15px}
+.brio-run{flex:1;display:flex;align-items:center;justify-content:center;gap:9px;border:0;border-radius:26px;padding:14px;font-size:13px;background:var(--primary);color:var(--primary-foreground)}
+.brio-run svg{width:16px;height:16px}
+.brio-note,.brio-error{font-size:11px;line-height:1.6;margin:12px 0 0;color:var(--muted-foreground)}
+.brio-error{color:var(--destructive,#ff766f)}
+
+@media(max-width:760px){
+  .brio-card{padding:17px;border-radius:17px}
+  .brio-bar{grid-template-columns:minmax(0,7rem) minmax(0,1fr) 3.8rem;gap:10px}
+  .brio-foot em{margin-left:0;flex-basis:100%}
+  .brio-actions{flex-wrap:wrap}
+  .brio-add,.brio-run{flex:1 1 100%;justify-content:center}
+  .brio-card textarea,.brio-card input{font-size:16px}
+}

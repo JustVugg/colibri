@@ -18,21 +18,29 @@
 static int fails;
 static void check(int ok, const char *what){ if(!ok){ printf("  FAIL: %s\n", what); fails++; } }
 
+/* Il totale arriva ora dalla stessa funzione condivisa della disponibile
+ * (compat_meminfo_gb), su tutte e tre le piattaforme. Prima questo test
+ * tornava 0 su macOS -- "nessun totale a portata senza sysctl" -- e il
+ * vincolo "disponibile <= RAM fisica" saltava proprio sulla piattaforma dove
+ * la disponibile e' una stima. Ora non salta piu' da nessuna parte. */
 static double total_gb(void){
-#ifdef _WIN32
-    double t, a; compat_meminfo(&t, &a); return t;
-#elif defined(__APPLE__)
-    return 0;   /* nessun totale a portata senza sysctl: il vincolo superiore salta */
-#else
-    FILE *f = fopen("/proc/meminfo", "r"); if(!f) return 0;
-    char ln[256]; double kb = 0;
-    while(fgets(ln, sizeof ln, f)) if(sscanf(ln, "MemTotal: %lf", &kb) == 1) break;
-    fclose(f); return kb / 1e6;
-#endif
+    double t = 0, a = 0;
+    compat_meminfo_gb(&t, &a);
+    return t;
 }
 
 int main(void){
     double avail = compat_mem_available_gb();
+    /* compat_mem_available_gb() e' ora un wrapper su compat_meminfo_gb(): le
+     * due devono dare lo stesso numero, o il wrapper ha perso qualcosa. Sono
+     * pero' due letture del sistema a qualche microsecondo di distanza, e la
+     * memoria disponibile si muove fra l'una e l'altra (il runner Windows della
+     * CI ha fallito il confronto esatto sul PR #1656 senza toccare questo
+     * codice): un quarto di GB di tolleranza distingue "il wrapper ha perso
+     * qualcosa" (differenze di GB) dal rumore di due istanti diversi. */
+    { double t2 = 0, a2 = 0; compat_meminfo_gb(&t2, &a2);
+      double gap = a2 > avail ? a2 - avail : avail - a2;
+      check(gap < 0.25, "compat_meminfo_gb e compat_mem_available_gb non concordano"); }
     printf("  disponibile: %.2f GB\n", avail);
     check(avail > 0.0, "la misura vale 0: la piattaforma non e' coperta (era il bug di Windows)");
     double total = total_gb();

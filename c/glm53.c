@@ -91,6 +91,8 @@ static int g_vk_ready = 0;
 #include "compat.h"
 #include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
 #include "route_trace.h"
+#include "decode_batch.h"   /* coli_submit_ext, coli_logprob_tail: canale logprobs */
+#include "pin_pool.h"       /* piu scatti annidati dello stato */
 #include <time.h>
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -969,7 +971,7 @@ static void mv(float *out, const Mat *w, const float *x) {
     }
 #endif
 #ifdef COLI_VULKAN
-    if (g_vk_ready && (w->fmt == 1 || w->fmt == 4)) {
+    if (g_vk_ready && w->resident && (w->fmt == 1 || w->fmt == 4)) {
         Mat *mutable_w = (Mat *)w;
         if (coli_vk_matmul((ColiVkTensor **)&mutable_w->vk, out, x,
                            w->fmt == 4 ? (const void *)w->q4 : (const void *)w->q8,
@@ -1275,15 +1277,6 @@ static void expert_table_init(GModel *m) {
 /* Quanti slot per layer: il budget diviso i layer sparsi. Il pavimento e' 1 e
  * non topk, perche' un pavimento a topk impegnerebbe topk*layer slot comunque,
  * cioe' molti GB, a dispetto del budget chiesto. */
-/* Quanta RAM il sistema dice di poter dare adesso. MemAvailable e non MemFree:
- * la seconda ignora la page cache riutilizzabile e farebbe stimare molto meno
- * di quello che c'e'. */
-static double memory_available_gb(void) {
-    /* #1375: era una lettura di /proc/meminfo, che su Windows e macOS non
-     * esiste: 0 -> budget 1 GB -> uno slot per layer, in silenzio. */
-    return compat_mem_available_gb();
-}
-
 static void expert_cache_init(GModel *m) {
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_EXPERT_GB");
@@ -1293,19 +1286,39 @@ static void expert_cache_init(GModel *m) {
      * versi -- su una macchina piccola va in OOM, su una grande lascia RAM
      * inutilizzata mentre il disco fa tutto il lavoro, che e' esattamente
      * quello che e' successo alla prima esecuzione vera. */
-    double budget;
-    if (setting) budget = atof(setting);
-    else {
-        const double free_now = memory_available_gb();
-        budget = free_now - 3.0;
-        if (budget < 1.0) budget = 1.0;
-        if (getenv("GLM53_VERBOSE"))
-            fprintf(stderr, "expert budget: %.1f GB (%.1f available, 3 GB reserved)\n",
-                    budget, free_now);
-    }
     const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
     int sparse = m->layer_end - from;
     if (sparse < 0) sparse = 0;
+    double budget;
+    if (setting) budget = atof(setting);
+    else {
+        /* MemAvailable counts reclaimable page cache as free. Sizing this LRU
+         * from it means allocating, as anonymous memory, the very pages the
+         * next slot miss would have been served from: both caches hold the
+         * same bytes, the model is paid for twice, and the cheap copy is the
+         * one that loses. So leave the model room to stay in page cache and
+         * take only what is left over. */
+        double total = 0.0, free_now = 0.0;
+        compat_meminfo_gb(&total, &free_now);      /* one pass, both fields */
+        /* the routed experts dominate; the rest of the weights are ~7% */
+        const double model_gb = (double)sparse * c->n_experts * (double)m->e_slot / 1e9 * 1.07;
+        double margin = total * 0.08;
+        if (margin < 4.0) margin = 4.0;
+        if (total <= 0.0 || model_gb >= total - margin) {
+            /* The model does not fit in RAM anyway, so page cache cannot help:
+             * keep as many slots as possible, exactly as before. `total <= 0`
+             * is "could not measure" and takes the same safe path. */
+            budget = free_now - 3.0;
+        } else {
+            budget = total - model_gb - margin;
+            if (budget > free_now - 3.0) budget = free_now - 3.0;
+        }
+        if (budget < 1.0) budget = 1.0;
+        if (getenv("GLM53_VERBOSE"))
+            fprintf(stderr, "expert budget: %.1f GB (%.1f total, %.1f model, "
+                            "%.1f margin, %.1f available)\n",
+                    budget, total, model_gb, margin, free_now);
+    }
     int cap = (int)((budget * 1e9) / ((double)m->e_slot * (sparse > 0 ? sparse : 1)));
     if (g_cap_override > 0) cap = g_cap_override;      /* scelta esplicita: vince */
     if (cap < 1) cap = 1;
@@ -2150,6 +2163,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
         if (given && strstr(given, ".spv")) snprintf(spv, sizeof(spv), "%s", given);
         else snprintf(spv, sizeof(spv), "%s/qmatmul.spv", given ? given : "shaders");
         g_vk_ready = coli_vk_init(spv) && coli_vk_available();
+        if (g_vk_ready) coli_vk_set_swiglu_limit(m->c.swiglu_limit);
         fprintf(stderr, g_vk_ready
                 ? "Vulkan: active for resident matrices\n"
                 : "Vulkan: no usable device (%s), falling back to CPU\n", spv);
@@ -2374,6 +2388,9 @@ static void mat_release(Mat *mat) {
 #ifdef COLI_METAL
     if (mat->metal) coli_metal_tensor_free((ColiMetalTensor *)mat->metal);
 #endif
+#ifdef COLI_VULKAN
+    if (mat->vk) coli_vk_tensor_free((ColiVkTensor *)mat->vk);
+#endif
     free((void *)mat->f); free((void *)mat->q8);
     free((void *)mat->q4); free((void *)mat->s);
     memset(mat, 0, sizeof(*mat));
@@ -2461,6 +2478,34 @@ static void model_load(GModel *m, const char *dir) {
  * `image_token_id`, quindi qui non c'e' nulla da inserire: si sostituisce la
  * riga dell'embedding testuale con quella della torre e le posizioni restano
  * quelle che sono. Prompt di solo testo passano vision=NULL, n_vision=0. */
+/* Canale logprobs (modalita jev). La lettura del prefill qui costa quasi
+ * niente: forward_span calcola gia i logit di OGNI posizione e forward_prefill
+ * li butta via tenendo solo l'ultima riga. Basta non buttarli.
+ *
+ * La fotografia invece serve davvero: 34 layer su 68 sono KDA e portano una
+ * ricorrenza che non si riavvolge, ed e esattamente quello che dice il
+ * commento degli slot piu sotto. Si salvano kda_state e kda_window di ogni
+ * layer KDA; le righe DSA non entrano nella foto perche sono indicizzate per
+ * posizione e restano dove sono finche la sessione vive. */
+static int    g_echo_k = 0;
+static unsigned long long g_echo_id = 0;
+static Tok   *g_echo_tok = NULL;
+static int    g_echo_base = 0;            /* posizione assoluta del primo token letto */
+static const float *g_echo_pin_logit = NULL;
+static float *g_echo_prev = NULL;         /* ultima riga di logit del pezzo precedente: il
+                                           * prefill va a pezzi, e chi predice il primo token
+                                           * di un pezzo sta in quello prima */
+
+static void glm_echo(unsigned long long id, int pos, int token,
+                     const float *lo, int V, int k){
+    char tail[1024]; coli_logprob_tail(tail, sizeof tail, lo, V, token, k);
+    char piece[512]; int n = g_echo_tok ? tok_decode(g_echo_tok, &token, 1, piece, (int)sizeof piece) : 0;
+    if(n<0) n=0;
+    printf("ECHO %llu %d %d%s\n", id, n, pos, tail);
+    if(n>0) fwrite(piece,1,(size_t)n,stdout);
+    putchar('\n'); fflush(stdout);
+}
+
 static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
                            const float *vision, int n_vision) {
     const Cfg *c = &m->c;
@@ -2583,6 +2628,24 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
                    (size_t)here * c->vocab * sizeof(float));
             free(part);
         } else {
+            /* La posizione p predice il token p+1: il predittore del token in
+             * `at+i` sta in `at+i-1`, che e la riga i-1 di questo pezzo, o
+             * l'ultima del pezzo prima, o la fotografia per il primissimo. */
+            if (g_echo_k > 0 && g_echo_id) {
+                for (int i = 0; i < here; i++) {
+                    const float *pred;
+                    if (at + i == 0)   pred = g_echo_pin_logit;
+                    else if (i == 0)   pred = g_echo_prev;
+                    else               pred = part + (size_t)(i - 1) * c->vocab;
+                    glm_echo(g_echo_id, g_echo_base + at + i, tokens[at + i],
+                             pred, c->vocab, pred ? g_echo_k : 0);
+                }
+                if (!g_echo_prev)
+                    g_echo_prev = malloc((size_t)c->vocab * sizeof(float));
+                if (g_echo_prev)
+                    memcpy(g_echo_prev, part + (size_t)(here - 1) * c->vocab,
+                           (size_t)c->vocab * sizeof(float));
+            }
             free(last);
             last = part;
             if (here > 1) {
@@ -2742,7 +2805,18 @@ typedef struct {
     GSession *session;
     int *tokens;                          /* la sequenza che lo slot tiene */
     int n, cap;
+    /* Scatti dello stato (SUBMIT pin=1): la ricorrenza KDA, gli id e i logit
+     * finali. Piu di uno perche i prefissi utili sono annidati: le istruzioni
+     * condivise da mille richieste e istruzioni+domanda condivise dalle
+     * alternative di una sola (pin_pool.h). La sessione ci sta dentro per
+     * identita: se lo slot ne ha aperta un'altra, le righe DSA di quelle
+     * posizioni non esistono piu e gli scatti non valgono niente. */
+    ColiPinPool pins;
+    GSession *pin_session;
 } KVSlot;
+
+/* la ricorrenza KDA di uno scatto: stato e finestra di ogni strato lineare */
+typedef struct { float **state, **window; int n_layers; } Glm53PinState;
 
 static KVSlot g_slots[GLM53_MAX_SLOTS];
 static int g_n_slots = 0;
@@ -2761,7 +2835,93 @@ static void slots_init(const GModel *m) {
     (void)m;
 }
 
+/* Uno scatto muore con la sessione che descrive. */
+static void glm53_pin_state_free(void *v) {
+    Glm53PinState *st = (Glm53PinState *)v;
+    if (!st) return;
+    for (int i = 0; i < st->n_layers; i++) {
+        if (st->state)  free(st->state[i]);
+        if (st->window) free(st->window[i]);
+    }
+    free(st->state); free(st->window); free(st);
+}
+
+static void slot_pin_drop(const GModel *m, KVSlot *slot) {
+    (void)m;
+    coli_pin_pool_clear(&slot->pins, glm53_pin_state_free);
+    slot->pin_session = NULL;
+}
+
+static int slot_pin_save(const GModel *m, KVSlot *slot, const int *tokens, int n,
+                         const float *logit) {
+    const Cfg *c = &m->c;
+    if (!slot->session || n < 1 || !logit) return 0;
+    /* Sessione nuova: gli scatti vecchi parlano di righe DSA che non esistono
+     * piu, e rimetterli risponderebbe da posizioni inventate, in silenzio. */
+    if (slot->pin_session != slot->session) slot_pin_drop(m, slot);
+    coli_pin_pool_init(&slot->pins, c->vocab);
+    ColiPin *k = coli_pin_store(&slot->pins, tokens, n, logit);
+    if (!k) return 0;
+    const size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd;
+    const size_t nw = (size_t)3 * c->kda_proj * c->conv_k;
+    Glm53PinState *st = (Glm53PinState *)k->state;
+    if (st && st->n_layers != c->n_layers) { glm53_pin_state_free(st); st = NULL; }
+    if (!st) {
+        st = (Glm53PinState *)calloc(1, sizeof(*st));
+        if (!st) { k->len = 0; return 0; }
+        st->n_layers = c->n_layers;
+        st->state  = (float **)calloc((size_t)c->n_layers, sizeof(float *));
+        st->window = (float **)calloc((size_t)c->n_layers, sizeof(float *));
+        if (!st->state || !st->window) { glm53_pin_state_free(st); k->len = 0; return 0; }
+        for (int i = 0; i < c->n_layers; i++) {
+            if (c->is_full[i] || !slot->session->layer[i].kda_state) continue;
+            st->state[i]  = (float *)malloc(ns * sizeof(float));
+            st->window[i] = (float *)malloc(nw * sizeof(float));
+            if (!st->state[i] || !st->window[i]) { glm53_pin_state_free(st); k->len = 0; return 0; }
+        }
+    }
+    for (int i = 0; i < c->n_layers; i++) {
+        GLayerState *ls = &slot->session->layer[i];
+        if (c->is_full[i] || !ls->kda_state || !st->state[i]) continue;
+        memcpy(st->state[i],  ls->kda_state,  ns * sizeof(float));
+        memcpy(st->window[i], ls->kda_window, nw * sizeof(float));
+    }
+    k->state = st;
+    slot->pin_session = slot->session;
+    return 1;
+}
+
+/* Rimette lo scatto piu profondo che sia un prefisso stretto di questo prompt,
+ * se la sessione che l'ha prodotto e ancora quella dello slot. Torna quante
+ * posizioni sono gia' fatte, 0 se non si applica. */
+static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, int n) {
+    const Cfg *c = &m->c;
+    if (!slot->session || slot->pin_session != slot->session) return 0;
+    const size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd;
+    const size_t nw = (size_t)3 * c->kda_proj * c->conv_k;
+    int s = coli_pin_best(&slot->pins, tokens, n);
+    while (s >= 0) {
+        ColiPin *k = &slot->pins.slot[s];
+        Glm53PinState *st = (Glm53PinState *)k->state;
+        if (st && k->len <= slot->session->filled) {
+            for (int i = 0; i < c->n_layers; i++) {
+                GLayerState *ls = &slot->session->layer[i];
+                if (c->is_full[i] || !ls->kda_state || !st->state[i]) continue;
+                memcpy(ls->kda_state,  st->state[i],  ns * sizeof(float));
+                memcpy(ls->kda_window, st->window[i], nw * sizeof(float));
+            }
+            slot->session->filled = k->len;
+            coli_pin_touch(&slot->pins, s);
+            return k->len;
+        }
+        k->len = 0;              /* lo scatto pretende posizioni che non ci sono */
+        s = coli_pin_best(&slot->pins, tokens, n);
+    }
+    return 0;
+}
+
 static void slot_reset(const GModel *m, KVSlot *slot) {
+    slot_pin_drop(m, slot);
     if (slot->session) session_close(m, slot->session);
     slot->session = NULL;
     slot->n = 0;
@@ -2812,6 +2972,7 @@ typedef struct {
     float temp, top_p;
     char *payload;
     int plen;
+    int logprobs, pin;   /* SUBMIT logprobs=k / pin=1 */
 } ServeReq;
 
 static int g_stop[16], g_nstop = 0;
@@ -2858,6 +3019,16 @@ static void serve_data(unsigned long long id, const char *text, int n) {
     fflush(stdout);
 }
 
+/* Come serve_data ma con la coda numerica del canale logprobs. Si usa solo se
+ * la richiesta l'ha chiesto: senza, il frame e quello di sempre. */
+static void serve_data_lp(unsigned long long id, const char *text, int n,
+                          const char *tail) {
+    printf("DATA %llu %d%s\n", id, n, tail ? tail : "");
+    if (n > 0) fwrite(text, 1, (size_t)n, stdout);
+    putchar('\n');
+    fflush(stdout);
+}
+
 /* Una richiesta intera, o 0 su EOF. Il payload si legge a byte contati, non a
  * righe: puo' contenerne. */
 static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
@@ -2892,10 +3063,27 @@ static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
         return 1;
     }
     if (strcmp(verb, "SUBMIT")) return 1;
-    if (sscanf(header, "SUBMIT %llu %d %d %d %f %f", &q->id, &q->slot, &q->plen,
-               &q->max_tokens, &q->temp, &q->top_p) != 6) {
+    int header_used = 0;
+    if (sscanf(header, "SUBMIT %llu %d %d %d %f %f%n", &q->id, &q->slot, &q->plen,
+               &q->max_tokens, &q->temp, &q->top_p, &header_used) != 6) {
         strcpy(verb, "BAD_FRAME");
         return 1;
+    }
+    /* Chiavi facoltative dopo i sei campi posizionali (logprobs=k, pin=1): le
+     * legge lo stesso parser degli altri motori, cosi la modalita jev si
+     * chiede allo stesso modo ovunque. Una richiesta che non ne porta resta
+     * identica a prima, byte per byte. */
+    q->logprobs = 0; q->pin = 0;
+    {
+        const char *rest = header + header_used;
+        while (*rest == ' ') rest++;
+        if (*rest && *rest != '\n') {
+            char tailbuf[256];
+            snprintf(tailbuf, sizeof tailbuf, "%s", rest);
+            for (char *w = tailbuf; *w; w++) if (*w == '\n' || *w == '\r') { *w = 0; break; }
+            ColiSubmit ext; memset(&ext, 0, sizeof ext);
+            if (coli_submit_ext(tailbuf, &ext)) { q->logprobs = ext.logprobs; q->pin = ext.pin; }
+        }
     }
     if (q->plen < 0 || q->plen > (1 << 24)) { strcpy(verb, "BAD_FRAME"); return 1; }
     q->payload = malloc((size_t)q->plen + 1);
@@ -2908,6 +3096,18 @@ static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
     q->payload[q->plen] = 0;
     int trailing = fgetc(stdin);
     (void)trailing;                        /* il '\n' di chiusura del frame */
+    /* max_tokens=0 vale solo in modalita jev ("leggi e fermati"), e lo si sa
+     * solo dopo aver letto le chiavi. Il rifiuto sta DOPO che payload e '\n'
+     * sono stati consumati: rifiutare prima lascerebbe i byte del prompt nello
+     * stream e disallineerebbe ogni frame successivo, che e' esattamente il
+     * guaio che il commento di serve_cancel_pending descrive. Questo motore non
+     * passa dal parser condiviso, quindi la regola va ripetuta qui o resta
+     * l'unico ad accettare uno zero che per tutti gli altri e' malformato. */
+    if (q->max_tokens < 1 && !(q->max_tokens == 0 && q->logprobs > 0)) {
+        free(q->payload); q->payload = NULL; q->plen = 0;
+        strcpy(verb, "BAD_FRAME");
+        return 1;
+    }
     return 1;
 }
 
@@ -3020,7 +3220,11 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     const double s_attn = m->t_attn, s_ffn = m->t_ffn, s_disk = m->t_disk, s_head = m->t_head;
     const uint64_t s_fw = m->forwards;
     int emitted = 0, limited = 0;
-    const int budget = q->max_tokens > 0 ? q->max_tokens : 256;
+    /* 0 con logprobs>0 = "leggi e fermati" (modalita jev), non un default da
+     * riempire: e' cosi che un menu chiuso non paga un passo di decodifica per
+     * ogni opzione. Senza logprobs il comportamento e quello di prima. */
+    const int budget = q->max_tokens > 0 ? q->max_tokens
+                     : (q->logprobs > 0 ? 0 : 256);
 
     /* Quanto di questo prompt e' gia' nella sessione.
      *
@@ -3038,6 +3242,12 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     int shared = 0;
     if (cached > 0 && cached < total && slot_shared(slot, sequence, total) >= cached)
         shared = cached;
+    /* La fotografia si prova sempre, non solo quando il riuso in avanti
+     * fallisce: se lo stato vivo e gia il prompt condiviso, il riuso normale
+     * scatterebbe lo stesso ma il primo token fresco resterebbe senza
+     * predittore, e quindi senza logprob, proprio quello che serve. */
+    int pinned = slot_pin_restore(m, slot, sequence, total);
+    if (pinned > 0) shared = pinned;
     if (shared <= 0) {
         slot_reset(m, slot);
         slot->session = session_open(m, room);
@@ -3069,8 +3279,21 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     }
 
     const int reused = shared;
+    g_echo_k = q->logprobs; g_echo_id = q->logprobs > 0 ? q->id : 0;
+    g_echo_tok = tokenizer; g_echo_base = shared;
+    {   /* i logit dello scatto rimesso: predicono il primo token fresco */
+        int ps = coli_pin_best(&slot->pins, sequence, total);
+        g_echo_pin_logit = (pinned > 0 && shared == pinned && ps >= 0)
+                           ? slot->pins.slot[ps].logit : NULL;
+    }
     float *logits = forward_prefill(m, slot->session, sequence + shared,
                                     total - shared, vision, n_vision, 0);
+    g_echo_k = 0; g_echo_id = 0;   /* la lettura riguarda il prefill, non la decodifica */
+    if (q->pin && logits &&
+        !slot_pin_save(m, slot, sequence, total, logits) && getenv("GLM53_VERBOSE"))
+        fprintf(stderr, "[PIN] fotografia non riuscita, si riparte da capo ogni volta\n");
+    else if (q->pin)
+        fprintf(stderr, "[PIN] stato fotografato a %d token\n", total);
     GSession *session = slot->session;
     int rows = 1, ctl = SERVE_CTL_NONE, input_eof = 0;
     for (int step = 0; step < budget; step++) {
@@ -3090,7 +3313,11 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         if (!input_eof) ctl = serve_cancel_pending(q->id, &input_eof);
         if (ctl != SERVE_CTL_NONE) break;
         if (total >= room) { limited = 1; break; }
-        int next = sample_token(logits + (size_t)(rows - 1) * m->c.vocab, m->c.vocab);
+        const float *row = logits + (size_t)(rows - 1) * m->c.vocab;
+        int next = sample_token(row, m->c.vocab);
+        char lptail[1024]; lptail[0] = 0;
+        if (q->logprobs > 0)
+            coli_logprob_tail(lptail, sizeof lptail, row, m->c.vocab, next, q->logprobs);
         free(logits);
         logits = NULL;
         if (is_stop(next)) break;
@@ -3098,7 +3325,8 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         emitted++;
         char piece[512];
         int written = tok_decode(tokenizer, &next, 1, piece, sizeof(piece) - 1);
-        serve_data(q->id, piece, written);
+        if (q->logprobs > 0) serve_data_lp(q->id, piece, written, lptail);
+        else serve_data(q->id, piece, written);
         if (step + 1 == budget) { limited = 1; break; }
         logits = forward_span(m, session, &next, 1, NULL, 0);
         rows = 1;
@@ -3255,6 +3483,14 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
             int gateway_gone = serve_one(m, tokenizer, &q) < 0;
             free(q.payload);
             if (gateway_gone) break;
+            /* La griglia va rimandata DOPO ogni turno, non solo dopo READY: al
+             * boot la cache degli esperti e vuota, e quella fotografia a freddo
+             * restava l'unica che il cruscotto avesse mai visto -- tutto grigio,
+             * RAM 0, tutto su disco, per sempre. Le HITS erano gia' per turno,
+             * ed e' per questo che il lampeggio funzionava e il colore no.
+             * inkling.c, kimi_k3.c, qwen38.c, deepseek_v41.c e colibri.c fanno
+             * gia' cosi'. */
+            emap_emit(m);
         } else if (!strcmp(verb, "IMAGE")) {
             /* annunciata: nessuna risposta, la si usa al SUBMIT che segue */
         } else if (!strcmp(verb, "BAD_FRAME")) {
@@ -3321,6 +3557,7 @@ int main(int argc, char **argv) {
         tok_load(&serve_tok, tokenizer_path);
         const char *batch = getenv("SERVE_BATCH");
         arm_stops(snap, &serve_tok, batch && atoi(batch));
+        coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&served, &serve_tok);
         glm53_telemetry_save();
         rt_destroy();

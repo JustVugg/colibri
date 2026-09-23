@@ -67,6 +67,15 @@ static int wait_for_resident(int layer, int eid, int want, int max_polls) {
     return 0;
 }
 
+static uint32_t stopped_issue_mask;
+static void *waiting_issue(void *arg) {
+    (void)arg;
+    int eid=0;
+    float x[64]={0};
+    stopped_issue_mask=qt_issue(0,&eid,1,x);
+    return NULL;
+}
+
 int main(void) {
     enum { D = 64 };
     setenv("COLI_CUDA", "1", 1);
@@ -135,15 +144,40 @@ int main(void) {
     qt_shutdown();
     shutdown_done = 1;
     check(!G.on, "shutdown_returns_while_a_group_is_open");
-    /* The abandoned swap must not have driven the incoming expert's upload
-     * after shutdown began. The victim's tensor is gone too, but released by
-     * qt_shutdown itself with every other resident expert once the uploader
-     * is joined -- not by the swap, which would also have uploaded the
-     * incoming expert. Reading G needs no lock here. */
-    check(!qs(0, resident_eid)->resident && !qs(0, resident_eid)->tg,
-          "shutdown_releases_the_victim_with_every_resident_expert");
-    check(!qs(0, 1)->queued && !qs(0, 1)->resident && G.uploads == 1,
-          "shutdown_abandons_the_swap_instead_of_uploading_the_incoming_expert");
+    check(!G.slot && !G.is_x, "shutdown_releases_tier_storage");
+    check(G.uploads == 1 && fake_uploads == 3,
+          "shutdown_abandons_the_swap_without_uploading_the_incoming_expert");
+
+    /* A synchronous issue parked behind an upload must not submit new work
+     * after shutdown wakes it. Hold the inflight predicate explicitly so the
+     * stop transition is deterministic, independent of upload timing. */
+    if(!qt_init(1,2,D,32,2,1,0,1)) return 1;
+    qt_note(0,0,g4[0],u4[0],d4[0],sc[0],sc[0]+32,sc[0]+64);
+    qt_fill_wait();
+    G_upload_sync=1;
+    pthread_mutex_lock(&G.mx);
+    G.inflight=1;
+    pthread_mutex_unlock(&G.mx);
+    pthread_t issuer;
+    if(pthread_create(&issuer,NULL,waiting_issue,NULL)) return 1;
+    int waiting=0;
+    for(int i=0;i<500;i++){
+        pthread_mutex_lock(&G.mx);
+        waiting=G.waiters>0;
+        pthread_mutex_unlock(&G.mx);
+        if(waiting) break;
+        struct timespec ts={0,2000000}; nanosleep(&ts,NULL);
+    }
+    check(waiting,"issuer parked before stop");
+    pthread_mutex_lock(&G.mx);
+    G.th_stop=1;
+    pthread_cond_broadcast(&G.cv_take);
+    pthread_cond_signal(&G.cv);
+    pthread_mutex_unlock(&G.mx);
+    pthread_join(issuer,NULL);
+    check(stopped_issue_mask==0,"stopped issuer must return CPU fallback mask");
+    check(!G.issue_open && !G.is_cnt[0],"stopped issuer must not open a GPU group");
+    qt_shutdown();
 
     if (fails) { printf("test_qwen36_tier_shutdown: %d fallimenti\n", fails); return 1; }
     printf("test_qwen36_tier_shutdown: ok\n");

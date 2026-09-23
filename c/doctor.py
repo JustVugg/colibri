@@ -32,23 +32,48 @@ SAFETENSORS_DTYPES = {
     "F8_E8M0": 1,
     "F8_E8M0FNU": 1,
 }
+def _core_component(name, spellings):
+    """Does the component immediately before `.weight` name this role?
+
+    Not `endswith`: `"pos_embed.weight".endswith("embed.weight")` is True, and
+    so is the vision tower's `patch_embed.weight`. Either would stand in for a
+    token embedding that is not there, which is this bug with the sign flipped
+    -- a checkpoint genuinely missing its embedding would pass. The component
+    has to BE the role, so the match is on the name between the last two dots.
+
+    `.layers.` is excluded for the reason _is_final_norm excludes it: a head or
+    an embedding inside the layer stack is the block's, not the model's.
+    """
+    parts = name.split(".")
+    return (len(parts) >= 2 and parts[-1] == "weight"
+            and parts[-2] in spellings and ".layers." not in name)
+
+
 def _is_embedding(name):
-    return name.endswith("embed_tokens.weight")
+    return _core_component(name, {"embed_tokens", "embed"})
 
 
 def _is_final_norm(name):
     # Every block has norms too. The final one is the norm that sits OUTSIDE
-    # the layer stack, so exclude anything under `.layers.`, and exclude
-    # `layernorm` outright: GLM-5.3-Flash's vision tower has
-    # `model.visual.post_layernorm.weight`, which would otherwise stand in for
-    # a final norm that is not there.
-    return (name.endswith(".norm.weight")
-            and ".layers." not in name
-            and "layernorm" not in name)
+    # the layer stack, which _core_component's `.layers.` exclusion covers, and
+    # the component test covers the rest: GLM-5.3-Flash's vision tower has
+    # `model.visual.post_layernorm.weight`, whose component is
+    # `post_layernorm`, not `norm`, so it cannot stand in for a final norm that
+    # is not there.
+    #
+    # The component form also accepts a bare `norm.weight` at the root, which
+    # the old `.norm.weight` tail required a prefix for. A container that names
+    # its roles flat, which is exactly what DeepSeek V4 does with `embed.weight`
+    # and `head.weight`, would otherwise fail this third role for the same
+    # reason it failed the other two.
+    return _core_component(name, {"norm"})
 
 
 def _is_output_head(name):
-    return name.endswith("lm_head.weight")
+    # `hc_head_base`, `hc_head_fn` and `hc_head_scale` sit next to the real head
+    # in a DeepSeek V4 container and must not stand in for it. They fall out
+    # here without an exclusion of their own: none of them ends in `.weight`.
+    return _core_component(name, {"lm_head", "head"})
 
 
 #: What a checkpoint must contain to be a language model at all, stated as
@@ -61,6 +86,14 @@ def _is_output_head(name):
 #: `model.language_model.embed_tokens.weight` and
 #: `model.language_model.norm.weight`. Two of three names did not match, and
 #: the doctor called a healthy model broken.
+#:
+#: #1593: the same defect again, one family later. That fix made the predicates
+#: prefix-agnostic but not NAME-agnostic, and DeepSeek V4 spells the roles
+#: `embed.weight` and `head.weight` (deepseek_v4.c looks up exactly those, at
+#: four call sites). Both roles were reported missing for a container the engine
+#: loads and generates from, while `model.index`, scanning the same tensors,
+#: was green. `_is_final_norm` survived only because `.norm.weight` is a
+#: spelling V4 happens to share.
 #:
 #: Matching on the tail rather than the whole name is what makes this hold for
 #: families nobody has written yet: it is prefix-agnostic, which is exactly
@@ -424,6 +457,26 @@ def deep_container_report(model, mirror_dir=None):
     }
 
 
+def windows_backend_dll(image):
+    """Which GPU backend DLL a Windows host compiled in, or None if CPU-only.
+
+    backend_loader.c bakes exactly one basename: coli_hip.dll under COLI_HIP_DLL
+    and coli_cuda.dll otherwise. That string is the build marker. The GLM/Qwen
+    banner "[CUDA] mode: routed experts" is only printed by those two engines;
+    a Kimi K3 CUDA_DLL host links the same loader and prints [K3-CUDA] instead.
+    DeepSeek V4 has its own pair and is not this function's job.
+    """
+    if not image or b"[DSV4 CUDA]" in image:
+        return None
+    if b"coli_hip.dll" in image:
+        return "coli_hip.dll"
+    if b"coli_cuda.dll" in image:
+        return "coli_cuda.dll"
+    if b"[CUDA] mode: routed experts" in image or b"[K3-CUDA]" in image:
+        return "coli_cuda.dll"
+    return None
+
+
 def cuda_linkage(engine_path):
     """Return CUDA linkage state without loading the executable or CUDA runtime."""
     engine = Path(engine_path)
@@ -451,17 +504,11 @@ def cuda_linkage(engine_path):
     if sys.platform == "win32":
         # Windows DLL-split builds never link the GPU runtime directly: the host
         # LoadLibrary's its backend at runtime (backend_loader.c), so there's no
-        # import-table entry for ldd/dumpbin to see. Detect the GPU build via a
-        # marker string baked into the engine's #ifdef COLI_CUDA block, then
-        # require the backend artifact to sit next to the executable.
-        #
-        # WHICH artifact is not a guess. backend_loader.c compiles exactly one
-        # basename into the host -- COLI_BACKEND_DLL is "coli_hip.dll" under
-        # COLI_HIP_DLL and "coli_cuda.dll" otherwise -- so the binary states
-        # what it will load and we check for that. Asking for coli_cuda.dll
-        # unconditionally failed a working HIP host (a hard error, not a
-        # warning), and accepting either name would have passed a HIP host that
-        # only had a stray CUDA backend beside it.
+        # import-table entry for ldd/dumpbin to see. Detect the GPU build from
+        # the backend basename compiled into the host, then require that file
+        # next to the executable. Asking for coli_cuda.dll unconditionally
+        # failed a working HIP host (a hard error, not a warning), and requiring
+        # the GLM routed-experts banner missed every Kimi K3 CUDA_DLL build.
         try:
             image = engine.read_bytes()
         except OSError:
@@ -473,10 +520,7 @@ def cuda_linkage(engine_path):
             present = any((engine.parent / name).is_file()
                           for name in ("coli_cuda_dsv4_dg.dll", "coli_cuda_dsv4.dll"))
             return {"linked": present, "missing": not present}
-        if b"[CUDA] mode: routed experts" not in image:
-            return {"linked": False, "missing": False}
-        expected = next((name for name in ("coli_hip.dll", "coli_cuda.dll")
-                         if name.encode() in image), None)
+        expected = windows_backend_dll(image)
         if expected is None:
             return {"linked": False, "missing": False}
         dll_present = (engine.parent / expected).is_file()

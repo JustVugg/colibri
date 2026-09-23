@@ -16,14 +16,20 @@ from urllib.request import Request, urlopen
 from pathlib import Path
 
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
+                           CONTINUATION_FAMILIES,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
-                           _engine_error, _image_bytes_from_url, cap_for_arch, conversation_cache_slot, model_arch,
+                           _engine_error, _image_bytes_from_url, cap_for_arch,
+                           conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
                            parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
-                           read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
-                           render_chat_qwen38, render_chat_v4, _dsv4_tool_calls, serve,
-                           split_thinking_reply,
+                           read_engine_turn, render_chat, render_chat_for_arch,
+                           render_chat_glm53, render_chat_inkling, render_chat_kimi,
+                           render_chat_olmoe,
+                           render_chat_qwen38, render_chat_v4, render_chat_dsv41,
+                           _dsv4_tool_calls, serve,
+                           resolve_generation_prompt, split_thinking_reply,
+                           starts_in_reasoning,
                            stop_policy, tune_child_env)
 
 
@@ -255,6 +261,42 @@ class TemplateTest(unittest.TestCase):
                     "name": "fn", "arguments": "not json"}}]}])
         self.assertIn("J 2 8\nfnnot json", prompt)
 
+    def test_glm_renders_a_tool_call_whose_arguments_are_not_an_object(self):
+        """`arguments` that parses but is not an object must not kill the request.
+
+        Both GLM renderers already tolerate `arguments` that does not parse at
+        all -- the except branch sets {} -- and every sibling renderer (Kimi
+        above, Qwen3.8, DeepSeek V4/V4.1) renders the call without arguments
+        rather than failing. Only the "parsed, but not an object" case reached
+        .items(), raised AttributeError, and came back as HTTP 500 "The colibri
+        engine failed to process the request." on a request the engine never
+        saw.
+        """
+        import openai_server as srv
+        for arguments in ('[1, 2]', '"text"', '5', [1, 2], 7):
+            with self.subTest(arguments=arguments):
+                messages = [
+                    {"role": "user", "content": "run it"},
+                    {"role": "assistant", "content": "", "tool_calls": [
+                        {"id": "x", "type": "function",
+                         "function": {"name": "fn", "arguments": arguments}}]},
+                    {"role": "tool", "content": "done"},
+                ]
+                glm = render_chat(list(messages))
+                self.assertIn("fn", glm)
+                self.assertNotIn("<arg_key>", glm)
+                glm53 = srv.render_chat_glm53(list(messages))
+                self.assertIn("<tool_call>fn", glm53)
+                self.assertNotIn("<arg_key>", glm53)
+        # An object still renders its arguments, on both renderers.
+        renders = [{"role": "assistant", "content": "", "tool_calls": [
+            {"id": "x", "type": "function",
+             "function": {"name": "fn", "arguments": '{"city": "Rome"}'}}]}]
+        self.assertIn("<arg_key>city</arg_key><arg_value>Rome</arg_value>",
+                      render_chat(list(renders)))
+        self.assertIn("<arg_key>city</arg_key><arg_value>Rome</arg_value>",
+                      srv.render_chat_glm53(list(renders)))
+
     def test_kimi_still_rejects_unknown_roles(self):
         with self.assertRaisesRegex(APIError, "Unsupported role"):
             render_chat_kimi([{"role": "critic", "content": "hm"}])
@@ -384,6 +426,66 @@ class TemplateTest(unittest.TestCase):
         opts = generation_options({"response_format": {"type": "gbnf", "grammar": "not a grammar ::="}}, 8)
         self.assertEqual(opts[3], "not a grammar ::=")
 
+    def test_tool_choice_function_that_is_not_an_object_is_a_400(self):
+        """The same read, six places: generation_options and five renderers.
+
+        `(tool_choice.get("function") or {}).get("name")` raised AttributeError
+        on {"type": "function", "function": "search"} -- the name written where
+        the object goes -- and that became a 500 "engine failed" instead of the
+        400 generation_options already had two lines further down. The renderers
+        crashed on the identical expression before validation was even reached.
+        """
+        import openai_server as srv
+        tools = [{"type": "function", "function": {"name": "search"}}]
+        messages = [{"role": "user", "content": "hi"}]
+        for function in ("search", ["search"], 5, True):
+            with self.subTest(function=function):
+                choice = {"type": "function", "function": function}
+                with self.assertRaises(APIError) as caught:
+                    generation_options({"tools": tools, "tool_choice": choice}, 8)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.param, "tool_choice")
+                # the renderers must get past the read so that 400 is what runs
+                for render in (render_chat, srv.render_chat_glm53, render_chat_kimi,
+                               render_chat_v4, srv.render_chat_dsv41):
+                    render(list(messages), tools=list(tools), tool_choice=choice)
+        # A well-formed choice, and the legacy {"type": "function", "name": ...}
+        # spelling, still force the tool.
+        for choice in ({"type": "function", "function": {"name": "search"}},
+                       {"type": "function", "name": "search"}):
+            with self.subTest(choice=choice):
+                generation_options({"tools": tools, "tool_choice": choice}, 8)
+                self.assertIn("You must call the function `search`",
+                              render_chat(list(messages), tools=list(tools),
+                                          tool_choice=choice))
+
+    def test_tool_function_that_is_not_an_object_is_a_400(self):
+        """The same slip as tool_choice, on tools[] this time.
+
+        generation_options already has 400 "Tool function must be an object".
+        The GLM and DeepSeek declaration blocks then did fn.items() on
+        {"type": "function", "function": "search"} and raised AttributeError
+        before that 400 ran, so do_POST answered 500 "engine failed".
+        """
+        import openai_server as srv
+        messages = [{"role": "user", "content": "hi"}]
+        for function in ("search", ["search"], 5, True):
+            with self.subTest(function=function):
+                tools = [{"type": "function", "function": function}]
+                with self.assertRaises(APIError) as caught:
+                    generation_options({"tools": tools}, 8)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.param, "tools.0.function")
+                for render in (render_chat, srv.render_chat_glm53, render_chat_kimi,
+                               render_chat_v4, srv.render_chat_dsv41):
+                    try:
+                        render(list(messages), tools=list(tools))
+                    except APIError as error:
+                        self.assertEqual(error.status, 400)
+        well = [{"type": "function", "function": {"name": "search"}}]
+        generation_options({"tools": well}, 8)
+        self.assertIn('"name": "search"', render_chat(list(messages), tools=well))
+
     def test_coli_temp_is_the_default_for_requests_that_omit_temperature(self):
         with patch.dict("openai_server.os.environ", {"COLI_TEMP": "0.25"}):
             self.assertEqual(generation_options({}, 8)[1], 0.25)
@@ -499,7 +601,107 @@ class ProtocolTest(unittest.TestCase):
             listener.close()
 
 
+class GenerationMetricsTest(unittest.TestCase):
+    def setUp(self):
+        self.server = APIServer(("127.0.0.1", 0), FakeEngine(), "test")
+        self.addCleanup(self.server.server_close)
+
+    def test_records_first_output_once_and_preserves_text_and_stats(self):
+        output = []
+        with patch("openai_server.time.monotonic", side_effect=[10, 10.5, 13]):
+            stats = self.server.generate("prompt", 4, 0, 1, output.append)
+        self.assertEqual(output, ["Hé", "llo"])
+        self.assertEqual(stats["completion_tokens"], 2)
+        metrics = self.server.scheduler.prometheus()
+        self.assertIn("colibri_scheduler_first_output_seconds_sum 0.5\n", metrics)
+        self.assertIn("colibri_scheduler_first_output_seconds_count 1\n", metrics)
+        self.assertIn("colibri_scheduler_engine_call_seconds_sum 3.0\n", metrics)
+        self.assertIn("colibri_scheduler_engine_call_seconds_count 1\n", metrics)
+
+    def test_empty_output_does_not_count_but_tool_output_does(self):
+        text, tools = [], []
+        def generate(prompt, maximum, temperature, top_p, on_text, **kwargs):
+            on_text("")
+            kwargs["on_tool"]("")
+            kwargs["on_tool"]("tool payload")
+            on_text("tail")
+            return {"completion_tokens": 2}
+        with patch.object(self.server.engine, "generate", side_effect=generate), \
+             patch("openai_server.time.monotonic", side_effect=[10, 12, 15]):
+            self.server.generate("prompt", 4, 0, 1, text.append, on_tool=tools.append)
+        self.assertEqual(text, ["", "tail"])
+        self.assertEqual(tools, ["", "tool payload"])
+        metrics = self.server.scheduler.prometheus()
+        self.assertIn("colibri_scheduler_first_output_seconds_sum 2.0\n", metrics)
+        self.assertIn("colibri_scheduler_first_output_seconds_count 1\n", metrics)
+
+    def test_error_and_cancellation_before_output_do_not_invent_first_output(self):
+        for error in (RuntimeError("failed"), ClientCancelled()):
+            with patch.object(self.server.engine, "generate", side_effect=error), \
+                 patch("openai_server.time.monotonic", side_effect=[10, 14]):
+                with self.assertRaises(type(error)):
+                    self.server.generate("prompt", 4, 0, 1, lambda text: None)
+        metrics = self.server.scheduler.prometheus()
+        self.assertIn("colibri_scheduler_first_output_seconds_count 0\n", metrics)
+        self.assertIn("colibri_scheduler_engine_call_seconds_sum 8.0\n", metrics)
+        self.assertIn("colibri_scheduler_engine_call_seconds_count 2\n", metrics)
+
+    def test_failure_after_output_keeps_both_observations(self):
+        def generate(prompt, maximum, temperature, top_p, on_text):
+            on_text("partial")
+            raise RuntimeError("failed after output")
+        with patch.object(self.server.engine, "generate", side_effect=generate), \
+             patch("openai_server.time.monotonic", side_effect=[10, 11, 12]):
+            with self.assertRaises(RuntimeError):
+                self.server.generate("prompt", 4, 0, 1, lambda text: None)
+        metrics = self.server.scheduler.prometheus()
+        self.assertIn("colibri_scheduler_first_output_seconds_count 1\n", metrics)
+        self.assertIn("colibri_scheduler_engine_call_seconds_count 1\n", metrics)
+
+
 class SchedulerTest(unittest.TestCase):
+    def test_engine_failure_is_not_a_completed_request(self):
+        scheduler = GenerationScheduler()
+        with self.assertRaisesRegex(RuntimeError, "engine failed"):
+            with scheduler.admit():
+                raise RuntimeError("engine failed")
+        stats = scheduler.snapshot()
+        self.assertEqual(stats["failed"], 1)
+        self.assertEqual(stats["completed"], 0)
+        self.assertEqual(stats["active"], 0)
+        with scheduler.admit():
+            pass
+        self.assertEqual(scheduler.snapshot()["completed"], 1)
+
+    def test_prometheus_histograms_measure_admission_and_slot_occupancy(self):
+        scheduler = GenerationScheduler()
+        with patch("openai_server.time.monotonic", side_effect=[10, 10.25, 10.25, 12.25]):
+            with scheduler.admit():
+                active = scheduler.prometheus()
+                self.assertIn("colibri_scheduler_active 1\n", active)
+                self.assertIn("colibri_scheduler_slot_duration_seconds_count 0\n", active)
+        metrics = scheduler.prometheus()
+        self.assertIn("# TYPE colibri_scheduler_completed_total counter\n", metrics)
+        self.assertIn("colibri_scheduler_completed_total 1\n", metrics)
+        self.assertIn("colibri_scheduler_queue_wait_seconds_sum 0.25\n", metrics)
+        self.assertIn('colibri_scheduler_queue_wait_seconds_bucket{le="0.1"} 0\n', metrics)
+        self.assertIn('colibri_scheduler_queue_wait_seconds_bucket{le="0.5"} 1\n', metrics)
+        self.assertIn('colibri_scheduler_queue_wait_seconds_bucket{le="+Inf"} 1\n', metrics)
+        self.assertIn("colibri_scheduler_slot_duration_seconds_sum 2.0\n", metrics)
+        self.assertIn("colibri_scheduler_slot_duration_seconds_count 1\n", metrics)
+
+    def test_failed_and_cancelled_admissions_are_timed(self):
+        scheduler = GenerationScheduler()
+        for error in (RuntimeError("failed"), ClientCancelled()):
+            with self.assertRaises(type(error)):
+                with scheduler.admit():
+                    raise error
+        metrics = scheduler.prometheus()
+        self.assertIn("colibri_scheduler_failed_total 1\n", metrics)
+        self.assertIn("colibri_scheduler_cancelled_total 1\n", metrics)
+        self.assertIn("colibri_scheduler_completed_total 0\n", metrics)
+        self.assertIn("colibri_scheduler_slot_duration_seconds_count 2\n", metrics)
+
     def test_admits_up_to_capacity_without_serializing(self):
         scheduler = GenerationScheduler(max_queue=0, queue_timeout=1, capacity=2)
         with scheduler.admit() as first:
@@ -517,6 +719,75 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "queue_full")
         self.assertEqual(scheduler.snapshot()["rejected"], 1)
 
+    def test_any_slot_request_uses_capacity_not_reserved_by_older_waiters(self):
+        scheduler = GenerationScheduler(capacity=2)
+        # State immediately after both slots are released, before the older
+        # slot-0 waiter reacquires the condition lock.
+        older = (object(), 0)
+        scheduler.queue.append(older)
+        with patch.object(scheduler.condition, "wait", side_effect=AssertionError("unused free slot")):
+            with scheduler.admit() as (_, slot):
+                self.assertEqual(slot, 1)
+                self.assertEqual(list(scheduler.queue), [older])
+        self.assertEqual(scheduler.free_slots, {0, 1})
+
+    def test_older_any_slot_and_same_slot_waiters_keep_priority(self):
+        for older_slot, requested in ((None, None), (None, 1), (0, 0)):
+            with self.subTest(older_slot=older_slot, requested=requested):
+                scheduler = GenerationScheduler(capacity=2)
+                older = (object(), older_slot)
+                scheduler.queue.append(older)
+                with patch.object(scheduler.condition, "wait",
+                                  side_effect=lambda _timeout: scheduler.queue.remove(older)) as wait:
+                    with scheduler.admit(slot=requested) as (_, slot):
+                        self.assertEqual(slot, 0 if requested is None else requested)
+                wait.assert_called_once()
+                self.assertEqual(scheduler.snapshot()["queued"], 0)
+
+    def test_full_queue_still_admits_unreserved_free_slot(self):
+        for requested in (None, 1):
+            with self.subTest(requested=requested):
+                scheduler = GenerationScheduler(max_queue=1, capacity=2)
+                with scheduler.admit(slot=0):
+                    older = (object(), 0)
+                    scheduler.queue.append(older)
+                    try:
+                        with scheduler.admit(slot=requested) as (_, slot):
+                            self.assertEqual(slot, 1)
+                            self.assertEqual(scheduler.snapshot()["active"], 2)
+                            self.assertEqual(list(scheduler.queue), [older])
+                    finally:
+                        scheduler.queue.remove(older)
+                self.assertEqual(scheduler.snapshot()["rejected"], 0)
+                self.assertEqual(scheduler.snapshot()["completed"], 2)
+
+    def test_full_queue_does_not_bypass_older_slot_reservations(self):
+        for older_slot, requested in ((None, None), (None, 1), (0, 0)):
+            with self.subTest(older_slot=older_slot, requested=requested):
+                scheduler = GenerationScheduler(max_queue=1, capacity=2)
+                older = (object(), older_slot)
+                scheduler.queue.append(older)
+                with self.assertRaises(APIError) as caught:
+                    with scheduler.admit(slot=requested):
+                        self.fail("bypassed older waiter")
+                self.assertEqual(caught.exception.code, "queue_full")
+                self.assertEqual(list(scheduler.queue), [older])
+                self.assertEqual(scheduler.snapshot()["rejected"], 1)
+
+    def test_zero_queue_rejects_busy_pinned_slot_with_spare_capacity(self):
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=2)
+        with scheduler.admit(slot=0):
+            with self.assertRaises(APIError) as caught:
+                with scheduler.admit(slot=0):
+                    self.fail("busy pinned slot admitted")
+            self.assertEqual(caught.exception.code, "queue_full")
+            with scheduler.admit(slot=1) as (_, slot):
+                self.assertEqual(slot, 1)
+        stats = scheduler.snapshot()
+        self.assertEqual((stats["rejected"], stats["timed_out"], stats["queued"]), (1, 0, 0))
+        self.assertEqual((stats["admitted"], stats["completed"], stats["active"]), (2, 2, 0))
+        self.assertIn("colibri_scheduler_queue_wait_seconds_count 2\n", scheduler.prometheus())
+
     def test_times_out_and_cancels_queued_requests(self):
         scheduler = GenerationScheduler(max_queue=2, queue_timeout=0.02)
         with scheduler.admit():
@@ -530,6 +801,81 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(timed_out.exception.code, "queue_timeout")
         self.assertEqual(stats["timed_out"], 1)
         self.assertEqual(stats["cancelled"], 1)
+
+    def test_queue_deadline_wins_when_slot_becomes_free(self):
+        for released_at in (0.9, 1.0, 1.1):
+            with self.subTest(released_at=released_at):
+                scheduler = GenerationScheduler(queue_timeout=1)
+                now = [0.0]
+                with patch("openai_server.time.monotonic", side_effect=lambda: now[0]):
+                    holder = scheduler.admit()
+                    holder.__enter__()
+                    def release(_timeout):
+                        now[0] = released_at
+                        holder.__exit__(None, None, None)
+                    with patch.object(scheduler.condition, "wait", side_effect=release):
+                        if released_at < 1:
+                            with scheduler.admit():
+                                pass
+                        else:
+                            with self.assertRaises(APIError) as caught:
+                                with scheduler.admit():
+                                    pass
+                            self.assertEqual(caught.exception.code, "queue_timeout")
+                    stats = scheduler.snapshot()
+                    expected = 2 if released_at < 1 else 1
+                    self.assertEqual((stats["admitted"], stats["completed"]), (expected, expected))
+                    self.assertEqual((stats["active"], stats["queued"], stats["timed_out"]),
+                                     (0, 0, int(released_at >= 1)))
+                    self.assertIn(f"colibri_scheduler_slot_duration_seconds_count {expected}\n",
+                                  scheduler.prometheus())
+                    with scheduler.admit():
+                        pass
+
+    def test_cancelled_request_does_not_acquire_a_free_slot(self):
+        scheduler = GenerationScheduler()
+        with self.assertRaises(ClientCancelled):
+            with scheduler.admit(lambda: True):
+                self.fail("cancelled request admitted")
+        stats = scheduler.snapshot()
+        self.assertEqual((stats["active"], stats["queued"], stats["admitted"], stats["cancelled"]),
+                         (0, 0, 0, 1))
+        self.assertIn("colibri_scheduler_queue_wait_seconds_count 0\n", scheduler.prometheus())
+        with scheduler.admit():
+            pass
+
+    def test_cancellation_wins_when_a_waiting_slot_becomes_free(self):
+        scheduler = GenerationScheduler(queue_timeout=1)
+        waiting = threading.Event()
+        cancelled = threading.Event()
+        outcomes = []
+        holder = scheduler.admit()
+        holder.__enter__()
+        def is_cancelled():
+            waiting.set()
+            return cancelled.is_set()
+        def run():
+            try:
+                with scheduler.admit(is_cancelled):
+                    outcomes.append("admitted")
+            except ClientCancelled:
+                outcomes.append("cancelled")
+        thread = threading.Thread(target=run)
+        thread.start()
+        observed = waiting.wait(1)
+        # Publish cancellation and release capacity under the same lock, so
+        # the waiter must observe both on its next scheduling pass.
+        with scheduler.condition:
+            cancelled.set()
+            holder.__exit__(None, None, None)
+        thread.join(2)
+        self.assertTrue(observed)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcomes, ["cancelled"])
+        stats = scheduler.snapshot()
+        self.assertEqual((stats["admitted"], stats["completed"], stats["cancelled"]), (1, 1, 1))
+        self.assertEqual((stats["active"], stats["queued"]), (0, 0))
+        self.assertIn("colibri_scheduler_slot_duration_seconds_count 1\n", scheduler.prometheus())
 
     def test_counts_admitted_client_cancellation_without_completion(self):
         scheduler = GenerationScheduler(max_queue=0, queue_timeout=1)
@@ -647,6 +993,11 @@ class FakeProcess:
         self.returncode = None
 
     def write(self, data):
+        # `_write_all` (production) hands every write a `memoryview` slice,
+        # first write included -- the fakes below pattern-match frame bytes
+        # (`frame.split()`, equality against a literal), so normalise here
+        # rather than asking each one to know about the view.
+        data = bytes(data)
         self.writes.append(data)
         self.on_write(self, data)
         return len(data)
@@ -1128,6 +1479,101 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(process.writes[-1].split(), [b"STOP", request_id])
 
 
+def _capture_frames(body, path="/v1/completions"):
+    """Sends `body` to `path` against a FakeProcess-backed Engine/APIServer
+    and returns (status, parsed_response, frames_written_to_the_engine).
+    Shared by the test classes below so the harness lives in one place.
+    """
+    frames = []
+
+    def respond(process, frame):
+        frames.append(frame)
+        rid = frame.split()[1]
+        process.stdout.feed(b"DATA " + rid + b" 5\nHello\n")
+        process.stdout.feed(b"DONE " + rid + b" STAT 1 2.5 0 1.0 4 0\n")
+
+    process = FakeProcess(respond)
+    with patch("openai_server.subprocess.Popen", return_value=process):
+        engine = Engine("glm", "model")
+    server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", 16)
+    thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
+    thread.start()
+    try:
+        data = json.dumps(body).encode()
+        headers = {"Authorization": "Bearer secret", "Content-Type": "application/json"}
+        request = Request(f"http://127.0.0.1:{server.server_port}{path}",
+                          data=data, headers=headers)
+        with urlopen(request, timeout=2) as response:
+            status = response.status
+            parsed = json.load(response)
+    finally:
+        server.scheduler.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        engine.close()
+    return status, parsed, frames
+
+
+class BaseWireContractTest(unittest.TestCase):
+    """Pins the SUBMIT frame written for a request that uses none of the
+    optional fields; any change here is a wire-format change and must be
+    deliberate.
+    """
+
+    def test_no_new_fields_request_emits_the_base_submit_header(self):
+        _, _, frames = _capture_frames(
+            {"model": "test-model", "prompt": "Complete me", "temperature": 0, "max_tokens": 4})
+        self.assertEqual(frames, [b"SUBMIT 1 0 11 4 0 0.9\nComplete me\n"])
+
+
+class SeedOptionTest(unittest.TestCase):
+    """`generation_options()` accepts a `seed` field without raising."""
+
+    def test_seed_is_accepted_by_generation_options(self):
+        generation_options({"seed": 1234, "prompt": "hi"}, 16)   # must not raise
+
+
+class SeedWireFrameTest(unittest.TestCase):
+    """`seed` is accepted and ignored. A stub-response equality check alone
+    is vacuous here (the scripted `respond` closure inside `_capture_frames`
+    always returns the same canned text regardless of any request field) --
+    the real proof is that the byte-exact SUBMIT frames the dispatcher
+    writes to the engine process (see DispatcherTest above) never carry the
+    seed value at all, seeded or not.
+    """
+
+    def test_seed_accepted_and_absent_from_submit_frame(self):
+        base = {"model": "test-model", "prompt": "Complete me", "temperature": 0, "max_tokens": 4}
+        status_plain, body_plain, frames_plain = _capture_frames(base)
+        status_seeded, body_seeded, frames_seeded = _capture_frames({**base, "seed": 1234})
+        self.assertEqual(status_plain, 200)
+        self.assertEqual(status_seeded, 200)
+        self.assertEqual(body_seeded["choices"][0], body_plain["choices"][0])
+        # Each call uses a freshly-constructed Engine, so both first requests are
+        # assigned request id "1" -- the wire frames are directly byte-comparable,
+        # no field needs normalizing. Comparing the whole frame list (not just
+        # the first frame) closes "reaches no wire frame" literally: if `seed`
+        # ever leaked onto any frame, this equality would break.
+        self.assertEqual(frames_seeded, frames_plain)
+
+    def test_seed_accepted_and_absent_from_chat_submit_frame(self):
+        # Same proof as above, on /v1/chat/completions: generation_options()
+        # is shared by both endpoints, but the SUBMIT frame is built from
+        # the chat-rendered prompt, so this is not implied by the completions
+        # case above -- a divergence between the two call sites would only
+        # show up here.
+        base = {"model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+                "temperature": 0, "max_tokens": 4}
+        status_plain, body_plain, frames_plain = _capture_frames(base, path="/v1/chat/completions")
+        status_seeded, body_seeded, frames_seeded = _capture_frames(
+            {**base, "seed": 1234}, path="/v1/chat/completions")
+        self.assertEqual(status_plain, 200)
+        self.assertEqual(status_seeded, 200)
+        self.assertEqual(body_seeded["choices"][0], body_plain["choices"][0])
+        self.assertEqual(frames_seeded, frames_plain)
+
+
 class CapSentinelShimTest(unittest.TestCase):
     # #379 cap-sentinel shim, arch-keyed (#386 r2, F3): an absent cap is
     # "platform-auto" only for the glm engine (colibri.c coli_resolve_cap);
@@ -1242,6 +1688,40 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertNotIn("COLI_PLAN_CAP", child_env)
         self.assertEqual(child_env["KEEP"], "yes")
 
+    def test_v41_ram_plan_reaches_engine_argv(self):
+        model = self._model("deepseek_v41")
+        for settings, expected_ram in (({"RAM_GB": "120", "CTX": "8192"}, 120),
+                                       ({"CTX": "8192"}, 0),
+                                       ({"RAM_GB": "auto", "CTX": "8192"}, 0)):
+            with self.subTest(settings=settings):
+                process = FakeProcess(lambda _process, _frame: None)
+                with patch("resource_plan.build_plan", return_value={
+                        "tiers": {"ram": {"cache_slots_per_layer": 96}}}) as planner, \
+                        patch("openai_server.subprocess.Popen", return_value=process) as popen:
+                    engine = Engine("deepseek_v41", model, env=settings)
+                    engine.close()
+                planner.assert_called_once_with(model, ram_gb=expected_ram,
+                                                context=8192, gpu_indices=[])
+                self.assertEqual(popen.call_args[0][0], ["deepseek_v41", "96"])
+
+    def test_v41_explicit_and_calibrated_caps_bypass_planning(self):
+        for cap, env, expected in ((7, {}, 7), (0, {}, 0),
+                                   (None, {"COLI_PROFILE_CAP": "12"}, 12),
+                                   (None, {"COLI_PLAN_CAP": "24"}, 24)):
+            with self.subTest(cap=cap, env=env), patch("resource_plan.build_plan") as planner:
+                self.assertEqual(cap_for_arch("deepseek_v41", cap, env, model="model"),
+                                 expected)
+                planner.assert_not_called()
+
+    def test_v41_insufficient_ram_refuses_before_spawning(self):
+        model = self._model("deepseek_v41")
+        with patch("resource_plan.build_plan", return_value={
+                "tiers": {"ram": {"cache_slots_per_layer": 0}}}), \
+                patch("openai_server.subprocess.Popen") as popen:
+            with self.assertRaisesRegex(ValueError, "one expert slot"):
+                Engine("deepseek_v41", model, env={"RAM_GB": "8"})
+            popen.assert_not_called()
+
     def test_model_arch_reads_model_type(self):
         self.assertEqual(model_arch(self._model("glm_moe_dsa")), "glm")
         self.assertEqual(model_arch(self._model("inkling")), "inkling")
@@ -1310,6 +1790,41 @@ class HTTPTest(unittest.TestCase):
             self.assertEqual(json.load(response)["data"][0]["id"], "test-model")
         with self.assertRaises(HTTPError) as caught:
             self.request("/v1/models", key="wrong")
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 401)
+
+    def test_metrics_counts_http_engine_failure_without_success(self):
+        before = self.server.scheduler.snapshot()
+        with patch.object(self.engine, "generate", side_effect=RuntimeError("injected failure")):
+            with self.assertRaises(HTTPError) as caught:
+                self.request("/v1/chat/completions", {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hello"}], "max_tokens": 1})
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 500)
+        after = self.server.scheduler.snapshot()
+        self.assertEqual(after["failed"], before["failed"] + 1)
+        self.assertEqual(after["completed"], before["completed"])
+        with self.request("/metrics") as response:
+            text = response.read().decode()
+        self.assertIn(f'colibri_scheduler_failed_total {after["failed"]}\n', text)
+        self.assertIn("colibri_scheduler_active 0\n", text)
+
+    def test_metrics_exposes_prometheus_text_with_auth(self):
+        with self.request("/metrics") as response:
+            self.assertEqual(response.headers["Content-Type"],
+                             "text/plain; version=0.0.4; charset=utf-8")
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            text = response.read().decode()
+        self.assertIn("colibri_scheduler_capacity 2\n", text)
+        self.assertIn("# TYPE colibri_scheduler_queue_wait_seconds histogram\n", text)
+        for key in ("wrong", ""):
+            with self.assertRaises(HTTPError) as caught:
+                self.request("/metrics", key=key)
+            self.addCleanup(caught.exception.close)
+            self.assertEqual(caught.exception.code, 401)
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(self.base + "/metrics", timeout=2)
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
 
@@ -1538,6 +2053,118 @@ class HTTPTest(unittest.TestCase):
                         self.request(path, dict(body, model="test-model"))
                     self.addCleanup(caught.exception.close)
                     self.assertEqual(caught.exception.code, 400)
+
+    def test_tool_choice_with_a_non_object_function_is_a_client_error(self):
+        """{"type": "function", "function": "search"} answered HTTP 500.
+
+        generation_options() already has the 400 for a `tool_choice` function
+        object with no name, but it -- and the five renderers that read the
+        forced tool the same way -- did `(tool_choice.get("function") or {})
+        .get("name")`, so a `function` that is not an object raised
+        AttributeError first and do_POST answered 500 "The colibri engine failed
+        to process the request." for a request the engine never saw. Every arch
+        and both OpenAI endpoints, because the crash was on the read.
+        """
+        tools = [{"type": "function", "function": {"name": "search"}}]
+        for arch in ("glm", "glm53", "kimi", "deepseek_v4", "deepseek_v41",
+                     "olmoe", "inkling", "qwen36", "qwen38"):
+            for function in ("search", ["search"], 5):
+                with self.subTest(arch=arch, function=function):
+                    with patch("openai_server.ARCH", arch):
+                        with self.assertRaises(HTTPError) as caught:
+                            self.request("/v1/chat/completions", {
+                                "model": "test-model",
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "tools": tools,
+                                "tool_choice": {"type": "function", "function": function}})
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+        # /v1/completions has no renderer in front of generation_options, so it
+        # reached the same read directly.
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/completions", {
+                "model": "test-model", "prompt": "hi", "tools": tools,
+                "tool_choice": {"type": "function", "function": "search"}})
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 400)
+
+    def test_a_well_formed_forced_tool_choice_still_runs(self):
+        """The read above must not change the shape clients actually send."""
+        with self.request("/v1/chat/completions", {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "search"}}],
+                "tool_choice": {"type": "function",
+                                "function": {"name": "search"}}}) as response:
+            self.assertEqual(response.status, 200)
+        self.assertIn("You must call the function `search`", self.engine.calls[-1][0])
+        # The OpenAI-legacy spelling {"type": "function", "name": ...} still
+        # forces the tool: _tool_choice_name keeps that fallback.
+        with self.request("/v1/chat/completions", {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "search"}}],
+                "tool_choice": {"type": "function", "name": "search"}}) as response:
+            self.assertEqual(response.status, 200)
+        self.assertIn("You must call the function `search`", self.engine.calls[-1][0])
+
+    def test_tool_with_a_non_object_function_is_a_client_error(self):
+        """{"type": "function", "function": "search"} on tools[] answered HTTP 500.
+
+        generation_options already has the 400, but /v1/chat/completions renders
+        first. GLM, GLM-5.3, DeepSeek V4 and V4.1 did fn.items() on a string
+        and the AttributeError became do_POST's 500 "The colibri engine failed
+        to process the request." for a request the engine never saw.
+        """
+        for arch in ("glm", "glm53", "kimi", "deepseek_v4", "deepseek_v41",
+                     "olmoe", "inkling", "qwen36", "qwen38"):
+            for function in ("search", ["search"], 5):
+                with self.subTest(arch=arch, function=function):
+                    with patch("openai_server.ARCH", arch):
+                        with self.assertRaises(HTTPError) as caught:
+                            self.request("/v1/chat/completions", {
+                                "model": "test-model",
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "tools": [{"type": "function",
+                                           "function": function}]})
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/completions", {
+                "model": "test-model", "prompt": "hi",
+                "tools": [{"type": "function", "function": "search"}]})
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 400)
+
+    def test_a_well_formed_tool_function_still_runs(self):
+        """The read above must not change the shape clients actually send."""
+        with self.request("/v1/chat/completions", {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function",
+                           "function": {"name": "search"}}]}) as response:
+            self.assertEqual(response.status, 200)
+        self.assertIn('"name": "search"', self.engine.calls[-1][0])
+
+    def test_tool_call_arguments_that_are_not_an_object_do_not_fail_the_request(self):
+        """A replayed tool call with `arguments: "[1, 2]"` answered HTTP 500.
+
+        render_chat reached `(args or {}).items()` with a parsed list, and the
+        AttributeError became do_POST's catch-all 500 "The colibri engine failed
+        to process the request." -- which OpenAI SDKs retry, against an engine
+        that was never asked anything.
+        """
+        body = {"model": "test-model", "messages": [
+            {"role": "user", "content": "run it"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "x", "type": "function",
+                 "function": {"name": "fn", "arguments": "[1, 2]"}}]},
+            {"role": "tool", "tool_call_id": "x", "content": "done"},
+            {"role": "user", "content": "and now?"},
+        ]}
+        with self.request("/v1/chat/completions", body) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.load(response)["object"], "chat.completion")
 
 
 class ClientHangupTest(unittest.TestCase):
@@ -1965,6 +2592,329 @@ class ToolChoiceTest(unittest.TestCase):
     def test_rejects_tool_choice_without_tools(self):
         with self.assertRaises(APIError):
             generation_options({"messages": [], "tool_choice": "required"}, 128)
+
+
+class TrailingAssistantTurnTest(unittest.TestCase):
+    """A trailing `assistant` message is a turn to CONTINUE, not one already finished.
+
+    The gateway used to fold it into a completed turn and append a fresh generation cue,
+    so the model wrote a second assistant turn and the client's opening was dropped. These
+    pin what replaced that: the switch that turns continuation on, what the prompt looks
+    like when it is on, and what is refused rather than silently reshaped.
+
+    The switch is COLI_CONTINUE_ASSISTANT and not a request field on purpose -- a body
+    extension would only be reachable by hand-written JSON, and the clients that want this
+    send a message list and nothing else.
+    """
+
+    OPEN_TURN = [{"role": "user", "content": "capitale della Francia?"},
+               {"role": "assistant", "content": "La capitale e'"}]
+
+    @staticmethod
+    def on():
+        return patch.dict(os.environ, {"COLI_CONTINUE_ASSISTANT": "1"})
+
+    @staticmethod
+    def off():
+        return patch.dict(os.environ, {"COLI_CONTINUE_ASSISTANT": "0"})
+
+    def test_switch_on_leaves_the_turn_open(self):
+        with self.on(), patch("openai_server.ARCH", "glm53"):
+            self.assertFalse(resolve_generation_prompt(self.OPEN_TURN, {}))
+            prompt = render_chat_glm53(self.OPEN_TURN, enable_thinking=True,
+                                       add_generation_prompt=False)
+        # ends INSIDE the turn, on the client's opening -- no new cue after it
+        self.assertTrue(prompt.endswith("La capitale e'"), prompt[-60:])
+        self.assertFalse(prompt.endswith("<|assistant|><think>"))
+        self.assertEqual(prompt.count("<|assistant|>"), 1)
+
+    def test_default_is_on(self):
+        """Continuation is the default now: unset (the ordinary deployment) continues a
+        trailing assistant turn. Only COLI_CONTINUE_ASSISTANT=0 turns it off."""
+        with patch.dict(os.environ, {}, clear=False), patch("openai_server.ARCH", "glm53"):
+            os.environ.pop("COLI_CONTINUE_ASSISTANT", None)
+            self.assertFalse(resolve_generation_prompt(self.OPEN_TURN, {}))
+
+    def test_switch_off_restores_old_behaviour(self):
+        """COLI_CONTINUE_ASSISTANT=0 is the off-switch: a deployment that sets it behaves
+        exactly as the gateway did before continuation existed -- append a fresh cue."""
+        with self.off(), patch("openai_server.ARCH", "glm53"):
+            self.assertTrue(resolve_generation_prompt(self.OPEN_TURN, {}))
+            self.assertEqual(render_chat_glm53(self.OPEN_TURN, enable_thinking=True),
+                             render_chat_glm53(self.OPEN_TURN, enable_thinking=True,
+                                               add_generation_prompt=True))
+        self.assertTrue(render_chat_glm53(self.OPEN_TURN,
+                                          enable_thinking=True).endswith("<|assistant|><think>"))
+
+    def test_no_trailing_assistant_turn_is_untouched_either_way(self):
+        messages = [{"role": "user", "content": "a"}]
+        for switch in (self.on(), self.off()):
+            with switch, patch("openai_server.ARCH", "glm53"):
+                self.assertTrue(resolve_generation_prompt(messages, {}))
+
+    def test_rejects_trailing_whitespace(self):
+        """The template strips it, so the model would resume from different bytes than the
+        ones sent -- the same reason Anthropic's own prefill validator refuses it."""
+        messages = [{"role": "user", "content": "a"},
+                    {"role": "assistant", "content": "La capitale e' "}]
+        with self.on(), patch("openai_server.ARCH", "glm53"):
+            with self.assertRaises(APIError):
+                resolve_generation_prompt(messages, {})
+
+    def test_rejects_an_empty_continuation(self):
+        """An empty one ends the prompt on a closed, empty <think></think>: the
+        out-of-distribution position #1327 removed."""
+        for empty in ("", "   ", None):
+            messages = [{"role": "user", "content": "a"},
+                        {"role": "assistant", "content": empty}]
+            with self.on(), patch("openai_server.ARCH", "glm53"):
+                with self.assertRaises(APIError):
+                    resolve_generation_prompt(messages, {})
+
+    def test_rejects_tools_and_tool_calls(self):
+        with self.on(), patch("openai_server.ARCH", "glm53"):
+            with self.assertRaises(APIError):
+                resolve_generation_prompt(self.OPEN_TURN, {"tools": ORDER_TOOL})
+            calls = [{"role": "user", "content": "a"},
+                     {"role": "assistant", "content": "x", "tool_calls": [
+                         {"type": "function", "function": {"name": "f", "arguments": "{}"}}]}]
+            with self.assertRaises(APIError):
+                resolve_generation_prompt(calls, {})
+
+    def test_unimplemented_family_passes_through(self):
+        """Continuation is on by default, so a family whose renderer has no open-turn shape
+        yet must render as before -- append the cue -- not reject a request nobody opted into.
+        Every shipped family is now in CONTINUATION_FAMILIES (Kimi K3 too, via its C `C`
+        record), so the backstop is exercised with a hypothetical future arch: it must pass
+        through, not error, the day a new renderer lands before its open-turn shape does."""
+        self.assertNotIn("future_family", CONTINUATION_FAMILIES)
+        with self.on(), patch("openai_server.ARCH", "future_family"):
+            self.assertTrue(resolve_generation_prompt(self.OPEN_TURN, {}))
+
+    def test_continuation_open_turn_deepseek_v4(self):
+        """deepseek_v4 has no authoritative vendored jinja template to diff against:
+        render_chat_v4 is pinned to the official encoding_dsv4.py, and the community
+        reap-150b template on the Hub diverges on the reasoning-block convention (a bare
+        </think> for a direct answer vs <think></think>). So this is the expected-string
+        pin the maintainer allows for such families -- the open turn is pinned to a literal
+        here, with the past-turn-minus-EOS invariant kept as an added check, in both
+        thinking modes."""
+        EOS = "<｜end▁of▁sentence｜>"
+        ASSISTANT = "<｜Assistant｜>"
+        # The literal open turn, written out so the test does not lean on another renderer
+        # call for its only expected value -- a bug that corrupts render_chat_v4 and the
+        # continuation path identically would slip past the comparison below but not this.
+        # Identical in both thinking modes: the open turn is the shape of the PAST turn,
+        # which carries no generation cue for enable_thinking to steer.
+        EXPECTED_OPEN = ("<｜begin▁of▁sentence｜><｜User｜>capitale della Francia?"
+                         "<｜Assistant｜></think>La capitale e'")
+        for enable_thinking in (True, False):
+            cue = ASSISTANT + ("<think>" if enable_thinking else "</think>")
+            with patch("openai_server.ARCH", "deepseek_v4"):
+                normal = render_chat_v4(self.OPEN_TURN, enable_thinking=enable_thinking)
+                cont = render_chat_for_arch(self.OPEN_TURN, enable_thinking=enable_thinking,
+                                            add_generation_prompt=False)
+            self.assertEqual(cont, EXPECTED_OPEN)
+            # and the invariant tying it to the normal render: past turn without its EOS + cue
+            self.assertEqual(normal, cont + EOS + cue)
+            self.assertTrue(cont.endswith("La capitale e'"), cont[-40:])
+            self.assertFalse(cont.endswith(EOS))
+
+    def test_continuation_open_turn_deepseek_v41(self):
+        """deepseek_v41, like deepseek_v4, is pinned to encoding.py rather than a diffable
+        vendored jinja template, so it gets the same expected-string pin: the open turn is a
+        literal here, with the past-turn-minus-EOS invariant kept as an added check, in both
+        thinking modes.
+
+        Unlike v4, the v41 open turn is NOT identical across the modes: thinking-on carries the
+        <｜System｜> Reasoning Effort line and closes the continued turn's (empty) reasoning as
+        <think></think>; thinking-off has neither. The empty <think></think> is the SAFE
+        position #1327 is about, not the out-of-distribution one -- it is followed by the
+        client's content ('La capitale e''), never left dangling at the end of the prompt,
+        which resolve_generation_prompt guarantees by refusing an empty continuation."""
+        EOS = "<｜end▁of▁sentence｜>"
+        ASSISTANT = "<｜Assistant｜>"
+        EFFORT = ("<｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the "
+                  "more thorough the reasoning)\n\n")
+        # The literal open turns, written out so the test does not lean on another renderer
+        # call for its only expected value (see the deepseek_v4 test), one per thinking mode.
+        EXPECTED_OPEN = {
+            True: ("<｜begin▁of▁sentence｜>" + EFFORT + "<｜User｜>capitale della Francia?"
+                   "<｜Assistant｜><think></think>La capitale e'"),
+            False: ("<｜begin▁of▁sentence｜><｜User｜>capitale della Francia?"
+                    "<｜Assistant｜></think>La capitale e'"),
+        }
+        for enable_thinking in (True, False):
+            cue = ASSISTANT + ("<think>" if enable_thinking else "</think>")
+            with patch("openai_server.ARCH", "deepseek_v41"):
+                normal = render_chat_dsv41(self.OPEN_TURN, enable_thinking=enable_thinking)
+                cont = render_chat_for_arch(self.OPEN_TURN, enable_thinking=enable_thinking,
+                                            add_generation_prompt=False)
+            self.assertEqual(cont, EXPECTED_OPEN[enable_thinking])
+            # and the invariant tying it to the normal render: past turn without its EOS + cue
+            self.assertEqual(normal, cont + EOS + cue)
+            self.assertTrue(cont.endswith("La capitale e'"), cont[-40:])
+            self.assertFalse(cont.endswith(EOS))
+
+    def test_continuation_open_turn_inkling(self):
+        """inkling uses its own markers, and render_chat_inkling deliberately deviates from
+        the template's generation cue (it prefills <|content_text|> in the thinking-off case
+        to force content mode, and defaults thinking off), so it is pinned with an
+        expected-string test: the open turn is pinned to a literal here, with the
+        past-turn-minus-terminators invariant kept as an added check, in both thinking modes."""
+        END = "<|end_message|><|content_model_end_sampling|>"
+        for enable_thinking in (True, False):
+            # eff is 0.9 with thinking on, 0.0 off; the off cue prefills the content channel
+            eff = "0.9" if enable_thinking else "0"
+            cue = "<|message_model|>" + ("" if enable_thinking else "<|content_text|>")
+            # The literal open turn, written out so the test does not lean on another renderer
+            # call for its only expected value (see the deepseek_v4 test). The two modes differ
+            # only in the system effort line; both end on the prefilled content channel.
+            expected = ("<|message_system|><|content_text|>Thinking effort level: " + eff +
+                        "<|end_message|><|message_user|><|content_text|>capitale della Francia?"
+                        "<|end_message|><|message_model|><|content_text|>La capitale e'")
+            with patch("openai_server.ARCH", "inkling"):
+                normal = render_chat_inkling(self.OPEN_TURN, enable_thinking=enable_thinking)
+                cont = render_chat_for_arch(self.OPEN_TURN, enable_thinking=enable_thinking,
+                                            add_generation_prompt=False)
+            self.assertEqual(cont, expected)
+            # and the invariant tying it to the normal render: past turn without terminators + cue
+            self.assertEqual(normal, cont + END + cue)
+            self.assertTrue(cont.endswith("La capitale e'"), cont[-40:])
+            self.assertFalse(cont.endswith("<|end_message|>"))
+
+    def test_only_the_final_assistant_turn_is_opened(self):
+        """Across every continuation family: only the TRAILING assistant turn is opened, and
+        each earlier turn renders exactly as it does in a completed conversation. The
+        single-turn fixtures elsewhere cannot see this -- their assistant turn is trivially
+        last -- but the terminator is dropped by a per-family `index == last` check, written
+        out by hand in each renderer; a family that lost that check would open every assistant
+        turn, and nothing else in the suite would notice.
+
+        Family-agnostic on purpose, because the open-turn SHAPE is not uniform: qwen36 injects
+        an empty <think></think>, GLM carries no per-turn terminator at all, ChatML drops an
+        <|im_end|>. What IS uniform is that the completed render (a fresh generation cue
+        appended) and the open render share their entire prefix up to the final turn -- so the
+        SECOND user turn must survive into their common prefix. If the first assistant turn
+        lost its terminator in the open render, that prefix would break right after it, before
+        this text. Checked in both thinking modes; the set drives the loop so a newly added
+        family is covered the day it joins.
+
+        Kimi K3 is excluded: render_chat_for_arch returns its engine-side K3CHAT1 wire, not a
+        string prompt, so this string-level invariant doesn't apply -- its open turn is pinned
+        at the token level in tests/test_k3_chat_tools.c against the tiny tokenizer instead."""
+        multi = [{"role": "user", "content": "1+1?"},
+                 {"role": "assistant", "content": "2"},
+                 {"role": "user", "content": "capitale della Francia?"},
+                 {"role": "assistant", "content": "La capitale e'"}]
+        for arch in sorted(CONTINUATION_FAMILIES):
+            if arch == "kimi":
+                continue
+            for enable_thinking in (True, False):
+                where = (arch, enable_thinking)
+                with patch("openai_server.ARCH", arch):
+                    completed = render_chat_for_arch(multi, enable_thinking=enable_thinking)
+                    opened = render_chat_for_arch(multi, enable_thinking=enable_thinking,
+                                                  add_generation_prompt=False)
+                common = os.path.commonprefix([opened, completed])
+                # the prior assistant turn (and its terminator) rendered identically: the turn
+                # AFTER it survives into the shared prefix
+                self.assertIn("capitale della Francia?", common, where)
+                # and only the last turn is open -- the prompt ends on the client's opening
+                self.assertTrue(opened.endswith("La capitale e'"), (where, opened[-40:]))
+
+    def test_splitter_starts_in_content_mode_on_a_continued_turn(self):
+        """Measured on glm53 int4, CPU: content '' with reasoning_chars 10 and 109,
+        clean stop, and a byte-correct open turn on the wire. The model was fine; the
+        splitter was primed from enable_thinking alone, so it waited for a </think> the
+        prompt had already passed and filed the whole answer as reasoning.
+
+        starts_in_reasoning's own docstring is about exactly this invariant -- a continued
+        turn is the third state it did not model. Nothing else in the suite covers it:
+        every other thinking test runs against a prompt with the generation cue appended,
+        where enable_thinking really does say where the block was left.
+
+        Pinned to glm53 because that is the only family the switch serves. Left on the
+        module default (ARCH = "glm") this exercised the continuation path on a family
+        resolve_generation_prompt refuses, and passed for the wrong reason.
+
+        The family rule itself -- whether a NEW turn starts inside the block -- belongs to
+        #1278 and is pinned by its own test; asserted here it would only duplicate it. What
+        this test owns is the axis crossing it: a continued turn opens no block, whatever
+        the family rule says."""
+        with patch("openai_server.ARCH", "glm53"):
+            self.assertTrue(starts_in_reasoning(True))                   # cue: block left open
+            self.assertFalse(starts_in_reasoning(True, add_generation_prompt=False))
+            self.assertFalse(starts_in_reasoning(False, add_generation_prompt=False))
+
+            # what the engine actually returns after "...The capital of France is": no
+            # markers, because the turn's <think></think> is already behind it in the prompt
+            emitted = " Paris."
+            reasoning, answer = split_thinking_reply(emitted, enable_thinking=True,
+                                                     add_generation_prompt=False)
+            self.assertEqual(answer, emitted)
+            self.assertEqual(reasoning, "")
+            # and the bug it replaces, so this test fails if the priming is ever reverted
+            reasoning, answer = split_thinking_reply(emitted, enable_thinking=True,
+                                                     add_generation_prompt=True)
+            self.assertEqual(answer, "")
+            self.assertEqual(reasoning, emitted)
+
+    def test_rejects_a_continuation_with_nothing_to_continue_from(self):
+        lone = [{"role": "assistant", "content": "La capitale e'"}]
+        with self.on(), patch("openai_server.ARCH", "glm53"):
+            with self.assertRaises(APIError):
+                resolve_generation_prompt(lone, {})
+
+
+class TrailingAssistantEndToEndTest(unittest.TestCase):
+    """End-to-end, through the real HTTP handler and a fake engine (no model weights): a
+    request whose last message is an `assistant` turn must reach the engine as a CONTINUATION
+    prompt -- ending on the client's own opening, no generation cue appended -- and the text
+    the engine generates must come back as the message `content`.
+
+    The TrailingAssistantTurnTest cases pin the prompt string in isolation; none of them prove
+    the wiring from an HTTP request through resolve_generation_prompt to the engine and back,
+    which a serve() refactor could silently drop. /v1/messages is a translation layer onto the
+    same engine path (not a second one), so /v1/chat/completions covers both endpoints. The
+    generated text arriving as content (not reasoning_content) also shows the continued turn
+    primes the splitter into content mode over the wire -- the third state #1327 fixed."""
+
+    OPEN = {"model": "test-model",
+            "messages": [{"role": "user", "content": "capitale della Francia?"},
+                         {"role": "assistant", "content": "La capitale e'"}]}
+
+    def _server(self, engine):
+        server = APIServer(("127.0.0.1", 0), engine, "test-model")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        return server
+
+    def test_continuation_reaches_the_engine_and_returns_as_content(self):
+        engine = FakeEngine()
+        with patch("openai_server.ARCH", "glm53"), \
+             patch.dict(os.environ, {"COLI_CONTINUE_ASSISTANT": "1"}):
+            server = self._server(engine)
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+            self.addCleanup(conn.close)
+            conn.request("POST", "/v1/chat/completions", body=json.dumps(self.OPEN),
+                         headers={"Content-Type": "application/json"})
+            response = conn.getresponse()
+            status, payload = response.status, response.read()
+        self.assertEqual(status, 200, payload)
+        # the engine saw the continuation prompt: it ends on the client's opening, no cue
+        self.assertEqual(len(engine.calls), 1)
+        prompt = engine.calls[0][0]
+        self.assertTrue(prompt.endswith("La capitale e'"), prompt[-60:])
+        self.assertFalse(prompt.endswith("<|assistant|><think>"))
+        # and the generated text comes back as content, not misfiled as reasoning
+        message = json.loads(payload)["choices"][0]["message"]
+        self.assertEqual(message["content"], "Héllo")
+        self.assertFalse(message.get("reasoning_content"))
 
 
 class AllowedHostsTest(unittest.TestCase):
@@ -2493,6 +3443,44 @@ class KeepAliveFramingTest(unittest.TestCase):
         self.assertIn("event: message_stop", raw)
         self.assertNotIn("<STILL-OPEN>", raw)
 
+    def test_stream_exit_stops_keepalive_before_releasing_slot(self):
+        class CancelledEngine(_ExplodingEngine):
+            def generate(self, *args, **kwargs):
+                try:
+                    return super().generate(*args, **kwargs)
+                except RuntimeError:
+                    raise ClientCancelled()
+
+        original_thread = threading.Thread
+        for path in ("/v1/chat/completions", "/v1/messages"):
+            for engine_type, outcome in ((_ExplodingEngine, "failed"),
+                                         (CancelledEngine, "cancelled")):
+                with self.subTest(path=path, outcome=outcome):
+                    pumps = []
+                    def thread_factory(*args, **kwargs):
+                        thread = original_thread(*args, **kwargs)
+                        target = kwargs.get("target")
+                        if getattr(target, "__name__", "") in ("_keepalive", "keepalive"):
+                            stop = next(cell.cell_contents for cell in target.__closure__
+                                        if isinstance(cell.cell_contents, threading.Event))
+                            pumps.append((thread, stop))
+                        return thread
+                    server = self._server(engine_type())
+                    try:
+                        with patch.object(threading, "Thread", side_effect=thread_factory):
+                            status, _ = self._post(self._conn(server),
+                                dict(self.CHAT, stream=True, max_tokens=16), path=path)
+                        self.assertEqual(status, 200)
+                        self.assertEqual(len(pumps), 1)
+                        self.assertFalse(pumps[0][0].is_alive(), "keepalive survived stream exit")
+                        stats = server.scheduler.snapshot()
+                        self.assertEqual(stats[outcome], 1)
+                        self.assertEqual((stats["active"], stats["completed"]), (0, 0))
+                    finally:
+                        for thread, stop in pumps:
+                            stop.set()
+                            thread.join(2)
+
     def test_engine_failure_after_commit_does_not_splice_a_second_response(self):
         """Once the 200 is out, a 500 status line would land inside the event stream."""
         server = self._server(_ExplodingEngine())
@@ -2763,6 +3751,476 @@ class ContextExceededMessageTest(unittest.TestCase):
         from openai_server import _engine_error
         text = str(_engine_error(["CONTEXT_EXCEEDED"], "ignored"))
         self.assertIn("the context", text)
+
+
+class _ShortWritingStream:
+    """A fake stdin that hands back at most `chunk` bytes per write() call,
+    forcing `_write_all` to loop -- the production pipe does this on a
+    signal landing mid-write or a full pipe buffer on a large IMAGE frame."""
+
+    def __init__(self, chunk=3):
+        self.chunk = chunk
+        self.received = bytearray()
+
+    def write(self, data):
+        piece = bytes(data)[:self.chunk]
+        self.received.extend(piece)
+        return len(piece)
+
+
+class _ScriptedStream:
+    """A fake stdin whose write() answers each entry in `script` in turn --
+    an int number of bytes actually taken, or `None` for "took nothing" --
+    then takes everything it is offered once the script runs out."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.received = bytearray()
+        self.calls = []
+
+    def write(self, data):
+        data = bytes(data)
+        self.calls.append(data)
+        answer = self.script.pop(0) if self.script else len(data)
+        if answer is None:
+            return None
+        taken = data[:answer]
+        self.received.extend(taken)
+        return len(taken)
+
+
+class _CountingLock:
+    """A `threading.Lock`-alike that counts `with` acquisitions -- used to
+    pin that IMAGE and SUBMIT share exactly one `write_lock` acquisition."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.acquisitions = 0
+
+    def __enter__(self):
+        self.acquisitions += 1
+        return self._lock.__enter__()
+
+    def __exit__(self, *exc_info):
+        return self._lock.__exit__(*exc_info)
+
+
+class WriteAllTest(unittest.TestCase):
+    """`_write_all` (extracted from the inline server->engine stdin writes):
+    loop on a short write until the whole frame is sent, and fail closed --
+    never spin -- on the two shapes that are not progress.
+
+    `_write_all` is imported locally in each test method here, not at module
+    scope: it does not exist on base, and a module-level import of it would
+    make this whole test file fail to collect when overlaid on base product
+    code (the procedure the base-pin tests below rely on)."""
+
+    def test_short_writes_reassemble_to_the_full_frame(self):
+        from openai_server import _write_all
+        stream = _ShortWritingStream(chunk=3)
+        frame = b"SUBMIT 1 0 5 3 0.25 0.9\nHello\n"
+        _write_all(stream, frame, "SUBMIT")
+        self.assertEqual(bytes(stream.received), frame)
+
+    def test_a_short_first_write_still_receives_the_correct_remainder(self):
+        from openai_server import _write_all
+        # The first call must not be special-cased to the unsliced buffer:
+        # every call, including the first, offers a memoryview starting at
+        # the bytes not yet sent.
+        stream = _ScriptedStream([2])
+        _write_all(stream, b"CANCEL 42\n", "CANCEL")
+        self.assertEqual(bytes(stream.received), b"CANCEL 42\n")
+        self.assertEqual(len(stream.calls), 2)   # the short first write forced a second
+
+    def test_none_return_fails_closed_instead_of_spinning(self):
+        from openai_server import _write_all
+        stream = _ScriptedStream([None])
+        with self.assertRaisesRegex(RuntimeError, "failed to write SUBMIT to the engine"):
+            _write_all(stream, b"SUBMIT 1 0 1 1 1 1\nx\n", "SUBMIT")
+
+    def test_zero_return_fails_closed_instead_of_spinning(self):
+        from openai_server import _write_all
+        stream = _ScriptedStream([0])
+        with self.assertRaisesRegex(RuntimeError, "failed to write STOP to the engine"):
+            _write_all(stream, b"STOP 1\n", "STOP")
+
+
+class WriteFailureHTTPTest(unittest.TestCase):
+    """A checked engine-stdin write that fails must reach the client as the
+    named 500 engine_error while the response is still uncommitted, and must
+    never splice anything into a stream that has already committed -- it
+    just ends (#597 item 3's `_fail`, exercised here by a genuine broken
+    pipe on the engine's stdin, through the real `Engine`, rather than by a
+    fake that raises `RuntimeError` directly -- a real `BrokenPipeError` is
+    a `ConnectionError`, and it is exactly that unwrapped subclass that a
+    correct checked write must keep away from do_POST's client-hangup
+    handler)."""
+
+    def _serve(self, process):
+        with patch("openai_server.ARCH", "glm"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        server = APIServer(("127.0.0.1", 0), engine, "test-model", None, 16, kv_slots=1)
+        # A short poll_interval means server.shutdown() (addCleanup, below)
+        # returns almost immediately instead of paying up to the default
+        # 0.5s poll -- these tests do no waiting of their own, so that 0.5s
+        # would be pure teardown overhead, not a wait under test.
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        self.addCleanup(engine.close)
+        return server
+
+    def _raw_post(self, server, path, body):
+        """POST over a plain socket and read until the peer closes, so the
+        literal status line(s) on the wire are visible -- `urlopen` strips
+        the status line into `response.status` before handing back `.read()`,
+        so asserting on `.read()` alone cannot tell "one status line" from
+        "a second one spliced into the body"."""
+        payload = json.dumps(body).encode()
+        request = (f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                  f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+                  f"Connection: close\r\n\r\n").encode() + payload
+        sock = socket.create_connection(("127.0.0.1", server.server_port), 2)
+        sock.sendall(request)
+        sock.settimeout(2)
+        chunks = []
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except socket.timeout:
+            pass
+        sock.close()
+        return b"".join(chunks)
+
+    def test_dead_engine_submit_is_a_named_500_engine_error_not_silence(self):
+        def respond(process, frame):
+            if frame.split()[0] == b"SUBMIT":
+                raise BrokenPipeError("broken pipe")
+
+        server = self._serve(FakeProcess(respond))
+        body = json.dumps({"model": "test-model", "prompt": "hi"}).encode()
+        request = Request(f"http://127.0.0.1:{server.server_port}/v1/completions",
+                          data=body, headers={"Content-Type": "application/json"})
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(request, timeout=2)
+        self.assertEqual(caught.exception.code, 500)
+        payload = json.load(caught.exception)
+        self.assertEqual(payload["error"]["code"], "engine_error")
+
+    def test_dead_engine_submit_is_a_named_500_on_the_chat_streaming_path(self):
+        # Same failure, but through /v1/chat/completions with stream: true --
+        # the tool-sideband/ThinkingStreamSplit wrapping chat streaming builds
+        # around engine.generate() must not swallow or reshape a RuntimeError
+        # that fires before anything is committed (nothing here ever reaches
+        # that wrapping: the SUBMIT write fails before the first ACCEPT/DATA).
+        def respond(process, frame):
+            if frame.split()[0] == b"SUBMIT":
+                raise BrokenPipeError("broken pipe")
+
+        server = self._serve(FakeProcess(respond))
+        body = json.dumps({"model": "test-model", "stream": True,
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+        request = Request(f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+                          data=body, headers={"Content-Type": "application/json"})
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(request, timeout=2)
+        self.assertEqual(caught.exception.code, 500)
+        payload = json.load(caught.exception)
+        self.assertEqual(payload["error"]["code"], "engine_error")
+
+    def test_uncommitted_stop_write_failure_is_a_named_500_engine_error(self):
+        # The dead-SUBMIT tests above cover the write _write_frame never gets
+        # a chance to make (the connection is refused before the first
+        # request even lands). This is the case _write_frame's own docstring
+        # is actually about: a CANCEL/STOP write that fails while the
+        # response is still uncommitted -- non-streaming, so nothing commits
+        # until the whole answer is assembled, and the STOP write happens
+        # well before that.
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 3\nhi \n")
+                process.stdout.feed(b"DATA " + request_id + b" 4\nSTOP\n")
+            elif fields[0] == b"STOP":
+                raise BrokenPipeError("broken pipe")
+
+        server = self._serve(FakeProcess(respond))
+        body = json.dumps({"model": "test-model", "prompt": "hi",
+                           "stop": "STOP"}).encode()
+        request = Request(f"http://127.0.0.1:{server.server_port}/v1/completions",
+                          data=body, headers={"Content-Type": "application/json"})
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(request, timeout=2)
+        self.assertEqual(caught.exception.code, 500)
+        payload = json.load(caught.exception)
+        self.assertEqual(payload["error"]["code"], "engine_error")
+
+    def test_write_failure_reaching_the_committed_stream_ends_it_cleanly(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                # "hi " clears StopFilter's hold and reaches the client; the
+                # stop sequence itself never does -- feeding them as two
+                # frames pins the STOP write to the SECOND one, after the
+                # stream has already committed on the first.
+                process.stdout.feed(b"DATA " + request_id + b" 3\nhi \n")
+                process.stdout.feed(b"DATA " + request_id + b" 4\nSTOP\n")
+            elif fields[0] == b"STOP":
+                raise BrokenPipeError("broken pipe")
+
+        server = self._serve(FakeProcess(respond))
+        raw = self._raw_post(server, "/v1/completions",
+                             {"model": "test-model", "prompt": "hi", "stream": True,
+                              "stop": "STOP"})
+        # Exactly one status line on the whole wire -- the original 200. A
+        # response that spliced a second status line (or any framed error)
+        # into the already-committed SSE body would show up here as 2.
+        self.assertEqual(raw.count(b"HTTP/1.1"), 1)
+        self.assertIn(b"200", raw.split(b"\r\n", 1)[0])
+        # The committed token reached the client...
+        self.assertIn(b'"hi "', raw)
+        # ...and nothing else did: no error object, no terminal [DONE]
+        # (generate() never returned normally).
+        self.assertNotIn(b"engine_error", raw)
+        self.assertNotIn(b"data: [DONE]", raw)
+
+
+class PendingMapCleanupTest(unittest.TestCase):
+    """The pending-map entry is dropped on every failed engine write --
+    SUBMIT, IMAGE, CANCEL or STOP -- including one forced by a checked
+    CANCEL/STOP write that fails closed with no `OSError` (a `None`/zero
+    return). A write that never reached the engine gets no DONE/ERROR back,
+    so nothing else would ever clear the slot; without this it sits behind
+    for `close()`/`_fail_pending` to find stale.
+
+    This is narrower than "every exit": a raise from inside a decode
+    callback (`on_text`/`on_accept`/`on_tool`/`on_echo`), or the duplicate-
+    ACCEPT guard, still leaves the entry behind, as on `dev`; that is not
+    changed here."""
+
+    def test_a_failed_cancel_write_does_not_leave_the_pending_entry_behind(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+            elif fields[0] == b"CANCEL":
+                raise BrokenPipeError("broken pipe")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "failed to write CANCEL to the engine"):
+            engine.generate("hello", 8, 0.7, 0.9, lambda _: None, cancelled=lambda: True)
+        with engine.pending_lock:
+            self.assertEqual(engine.pending, {})
+        engine.close()
+
+    def test_a_failed_stop_write_does_not_leave_the_pending_entry_behind(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+            elif fields[0] == b"STOP":
+                raise BrokenPipeError("broken pipe")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        output = []
+        with self.assertRaisesRegex(RuntimeError, "failed to write STOP to the engine"):
+            engine.generate("hello", 8, 0.7, 0.9, output.append,
+                            stopped=lambda: output == ["x"])
+        with engine.pending_lock:
+            self.assertEqual(engine.pending, {})
+        engine.close()
+
+    def test_a_cancel_write_that_takes_no_bytes_still_drops_the_pending_entry(self):
+        # Not an OSError: the pipe accepts the call and answers 0, the same
+        # "took nothing" shape _write_all treats as a fail-closed write. If
+        # _write_frame's cleanup only ran for OSError, this entry would
+        # survive -- the pop has to be keyed on failure of the write, not on
+        # which failure shape it took.
+        class ZeroOnCancelProcess(FakeProcess):
+            def write(self, data):
+                text = bytes(data)
+                fields = text.split()
+                if fields[:1] == [b"CANCEL"]:
+                    self.writes.append(text)
+                    # Base ignores write()'s return value entirely, so a bare
+                    # `return 0` here would leave base's generate() waiting
+                    # forever for an ERROR/DONE it never actually asked for
+                    # (the CANCEL it believes it sent never reached the
+                    # engine) -- a hang, not a failure, on the base-overlay
+                    # procedure. Feeding the terminal frame here means base
+                    # fails in seconds instead; at head the RuntimeError from
+                    # the zero-byte write fires first, so this frame arrives
+                    # after the pending entry is already gone and is a no-op.
+                    self.stdout.feed(b"ERROR " + fields[1] + b" CANCELLED\n")
+                    return 0
+                return super().write(data)
+
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+
+        process = ZeroOnCancelProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "failed to write CANCEL to the engine"):
+            engine.generate("hello", 8, 0.7, 0.9, lambda _: None, cancelled=lambda: True)
+        with engine.pending_lock:
+            self.assertEqual(engine.pending, {})
+        engine.close()
+
+    def test_a_failed_image_write_names_the_image_frame_and_drops_the_pending_entry(self):
+        # generate()'s outer handler wraps both the IMAGE and the SUBMIT
+        # write with one except OSError -- an OSError on the IMAGE write
+        # specifically must still name "IMAGE", not fall through to the
+        # handler's own default "SUBMIT" label, or one frame kind would
+        # report under two different names depending on failure shape
+        # (_write_all's own None/zero path already says "IMAGE"; an OSError
+        # is the likelier real failure and must match).
+        class BrokenPipeOnImageProcess(FakeProcess):
+            def write(self, data):
+                if bytes(data).split()[:1] == [b"IMAGE"]:
+                    raise BrokenPipeError("broken pipe")
+                return super().write(data)
+
+        process = BrokenPipeOnImageProcess(lambda _process, _frame: None)
+        with patch("openai_server.ARCH", "glm53"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm53", "model")
+
+        class FakePatches:
+            def tobytes(self):
+                return bytes(range(8))
+
+        with self.assertRaisesRegex(RuntimeError, "failed to write IMAGE to the engine"):
+            engine.generate("hello", 8, 0.7, 0.9, lambda _: None, image=(FakePatches(), 2, 2))
+        with engine.pending_lock:
+            self.assertEqual(engine.pending, {})
+        engine.close()
+
+
+class PlainRequestFrameOrderTest(unittest.TestCase):
+    """A request using none of the checked-write machinery's new surface
+    (no image, no grammar, no logprobs, no pin) must still put byte-identical
+    SUBMIT/STOP and SUBMIT/CANCEL frames on the wire, in the same order, as
+    the base module -- literals captured by running the base module's own
+    Engine.generate() against this same FakeProcess harness."""
+
+    def test_stop_flow_matches_base(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+            elif fields[0] == b"STOP":
+                process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 1 2 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "glm"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        output = []
+        engine.generate("hello", 8, 0.7, 0.9, output.append,
+                        stopped=lambda: output == ["x"])
+        engine.close()
+        self.assertEqual(process.writes, [b"SUBMIT 1 0 5 8 0.7 0.9\nhello\n", b"STOP 1\n"])
+
+    def test_cancel_flow_matches_base(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+            elif fields[0] == b"CANCEL":
+                process.stdout.feed(b"ERROR " + request_id + b" CANCELLED\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "glm"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        disconnected = False
+
+        def sink(text):
+            nonlocal disconnected
+            disconnected = True
+
+        with self.assertRaises(ClientCancelled):
+            engine.generate("hello", 8, 0.7, 0.9, sink, cancelled=lambda: disconnected)
+        engine.close()
+        self.assertEqual(process.writes, [b"SUBMIT 1 0 5 8 0.7 0.9\nhello\n", b"CANCEL 1\n"])
+
+    def test_image_and_submit_frames_match_base_under_one_lock_acquisition(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+                process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 1 2 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "glm53"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm53", "model")
+        counting_lock = _CountingLock()
+        engine.write_lock = counting_lock
+
+        blob = bytes(range(12))
+
+        class FakePatches:
+            def tobytes(self):
+                return blob
+
+        output = []
+        engine.generate("hello", 8, 0.7, 0.9, output.append, image=(FakePatches(), 2, 2))
+        engine.close()
+        self.assertEqual(process.writes, [
+            b"IMAGE 1 12 2 2\n" + blob + b"\n",
+            b"SUBMIT 1 0 5 8 0.7 0.9\nhello\n",
+        ])
+        # IMAGE must reach the wire before SUBMIT, and both under the SAME
+        # lock acquisition -- another request's IMAGE could otherwise land
+        # between this one's IMAGE and its SUBMIT.
+        self.assertEqual(counting_lock.acquisitions, 1)
 
 
 if __name__ == "__main__":

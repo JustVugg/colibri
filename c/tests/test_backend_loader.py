@@ -918,7 +918,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
             cls.fixture = None
 
     def test_abi_is_derived_from_the_loader_source(self):
-        """47 mandatory + 8 optional, parsed from backend_loader.c.
+        """47 mandatory + 9 optional, parsed from backend_loader.c.
 
         The counts are a deliberate tripwire: adding a RESOLVE to the loader
         widens the ABI every Windows DLL must satisfy, and that should be a
@@ -929,11 +929,12 @@ class LoaderStubFixtureTest(unittest.TestCase):
         """
         f = self.fixture
         self.assertEqual(len(f.mandatory), 47)
-        self.assertEqual(len(f.optional), 8)   # +matmul_mxfp4 (kimi_k3 via the DLL, #1405), +available_device_count (qwen36 tier, #1533)
-        self.assertEqual(len(f.exports), 55)
+        self.assertEqual(len(f.optional), 9)   # +expert_mxfp4: optional Kimi SiTU pipeline
+        self.assertEqual(len(f.exports), 56)
         self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)
         self.assertIn("coli_cuda_e8_set_grid", f.optional)
+        self.assertIn("coli_cuda_expert_mxfp4", f.optional)
         # attention_project_ragged: paged ragged KV runtime (#795).
         self.assertIn("coli_cuda_attention_project_ragged", f.mandatory)
         # fp8_set_lut: fmt=8 e4m3 dense/expert kernels (#817).

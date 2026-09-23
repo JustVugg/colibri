@@ -22,7 +22,7 @@ int main(void) {
     setenv("COLI_CUDA", "1", 1); setenv("COLI_GPUS", "0", 1);
     setenv("QT_NO_WARMSTART", "1", 1); setenv("HEAT_FILE", "", 1);
     setenv("COLI_PLACE", "", 1);                    /* "" == unset == auto; unsetenv has no UCRT64 shim */
-    fake_ndev = 1; fake_uploads = 0;
+    fake_ndev = 1; fake_uploads = 0; fake_dense_compute = 1;
 
     /* room for 8 experts plus a little; each offer is 1 expert worth of bytes */
     size_t exp_bytes = 3 * dev_alloc_footprint((size_t)D * IH / 2) + 3 * dev_alloc_footprint((2 * IH + D) / 3 * sizeof(float));
@@ -65,6 +65,29 @@ int main(void) {
     check(qt_dense_matmul(h, y, x, I, O) == 1 && fake_matmuls == mm + 1, "a placed handle answers through coli_cuda_matmul");
     check(qt_dense_matmul(h2, y, x, I, O) == 1 && fake_matmuls == mm + 2, "so does the second handle");
     check(qt_dense_matmul(99, y, x, I, O) == 0 && qt_dense_matmul(-1, y, x, I, O) == 0 && fake_matmuls == mm + 2, "unknown handles are refused without a backend call");
+
+    {
+        float xb[3 * I], yb[3 * O];
+        for (int i = 0; i < 3 * I; i++) xb[i] = (float)(i % 7 - 3);
+        check(qt_dense_matmul_batch(h, yb, xb, 3, I, O), "batch accepted");
+        check(fake_matmul_rows == 3, "all rows sent in one backend call");
+        int equal = 1;
+        for (int row = 0; row < 3; row++) for (int o = 0; o < O; o++) {
+            float want = 0;
+            for (int i = 0; i < I; i++) want += xb[row * I + i] * q[o * I + i];
+            if (yb[row * O + o] != want * sc[o]) equal = 0;
+        }
+        check(equal, "every batch row uses the resident weights and row scales");
+        int calls = fake_matmuls;
+        check(!qt_dense_matmul_batch(h, yb, xb, 0, I, O) && fake_matmuls == calls,
+              "empty batch declined without a backend call");
+        fake_matmul_fail = 1;
+        check(!qt_dense_matmul_batch(h, yb, xb, 3, I, O), "batch failure requests CPU fallback");
+        fake_matmul_fail = 0;
+        calls = fake_matmuls;
+        check(!qt_dense_matmul(h, yb, xb, I, O) && fake_matmuls == calls,
+              "failed handle remains disabled for decode too");
+    }
 
     printf(" 4. shutdown releases the matrices\n");
     qt_shutdown();

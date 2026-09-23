@@ -702,7 +702,7 @@ def _dsv4_geometry(config, context, _model_dir):
     """
     layers = _required_int(config, "num_hidden_layers", "deepseek_v4")
     experts = _required_int(config, "n_routed_experts", "deepseek_v4")
-    hidden = _required_int(config, "hidden_size", "deepseek_v4")
+    _required_int(config, "hidden_size", "deepseek_v4")
     heads = _required_int(config, "num_attention_heads", "deepseek_v4")
     head_dim = _required_int(config, "head_dim", "deepseek_v4")
     q_rank = _required_int(config, "q_lora_rank", "deepseek_v4")
@@ -1268,6 +1268,10 @@ FAMILIES = (
         # links NOCUDA_LDFLAGS. Left at the default this advertised a VRAM tier.
         supports_accelerator=False,
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
+        # coli convert routes to convert_olmoe_merged.py (d4d11ef dispatch);
+        # the converter takes no precision flags (--ebits / --group-size etc.).
+        converter="convert_olmoe_merged.py",
+        converter_accepts=(),
         config_section="root",
         # implicit_cap 0, not 8: the engine sizes its expert cache from the RAM
         # budget once the dense weights are resident (#1443), so "nobody chose a

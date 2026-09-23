@@ -32,9 +32,9 @@ import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re,
 # and the console provides its own editing; on FreeBSD Python links libedit,
 # which this activates the same way.
 try:
-    import readline  # noqa: F401 — importing it is the activation
+    import readline
 except ImportError:
-    pass
+    readline = None
 
 # The engine mmaps every shard (144+ files); macOS default RLIMIT_NOFILE is 256.
 if sys.platform != "win32":
@@ -53,7 +53,10 @@ if sys.platform == "win32":
         try: s.reconfigure(encoding="utf-8")
         except (AttributeError, OSError): pass
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# realpath, not abspath: on a merged-/usr system /bin and /sbin are symlinks
+# to /usr/bin, and an installed launcher invoked as /bin/coli would otherwise
+# derive /libexec/colibri instead of /usr/libexec/colibri (#1689).
+HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
 # version.py sits next to this script in a source checkout, but an installed
 # layout puts the launcher in $(PREFIX)/bin while the support modules live in
@@ -477,9 +480,10 @@ def env_for_engine(a, arch, plan=None):
     # sets it for GLM and openai_server.py sets it for the gateway, so `coli
     # chat` and `coli serve` worked while `coli run` handed the sister engines
     # an environment without it: OLMoE exited with "started without a model"
-    # (#1501). Set it here, once, for all of them.
+    # (#1501, #1600). Set it here, once, for all of them. --model is the
+    # directory, same as env_for(): a leftover SNAP must not load another model.
     if getattr(a, "model", None):
-        env.setdefault("SNAP", os.path.abspath(a.model))
+        env["SNAP"] = os.path.abspath(a.model)
     if arch == "olmoe":
         env["CHAT"] = "1"
         env["MAX_NEW"] = str(ngen_for(a, family=arch))
@@ -491,7 +495,7 @@ def env_for_engine(a, arch, plan=None):
     # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
     # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
     # user's session ran itself out of memory with the flag apparently set.
-    if arch in ("deepseek_v4", "kimi", "glm53", "olmoe"):
+    if arch in ("deepseek_v4", "deepseek_v41", "kimi", "glm53", "olmoe"):
         if a.ram: env["RAM_GB"] = str(a.ram)
     if arch == "glm53":
         # I densi vanno a int4 di default: sono 9,7 B parametri su 321, e in
@@ -577,16 +581,18 @@ def env_for_engine(a, arch, plan=None):
                 ram,ctx,devices,vram=resource_request(a,env)
                 plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
                                 kv_slots=requested_kv_slots(a,env))
-            # Preserve the existing non-GLM GPU contract: explicit --gpu/--vram
-            # selects a capable build above. Merely asking for auto-tier must not
-            # turn a CPU-only sibling binary into an attempted CUDA launch.
             plan_must_not_choose_omp=("OMP_NUM_THREADS" not in env
                                       and (arch == "deepseek_v4"
                                            or env.get("COLI_NO_OMP_TUNE")))
-            env=environment_for_plan(plan,env,
-                                     cuda_enabled=env.get("COLI_CUDA") == "1")
+            gpu_off_by_request = env.get("COLI_CUDA") == "0"
+            cuda_on = plan_cuda_enabled(a, arch, env)
+            env=environment_for_plan(plan,env,cuda_enabled=cuda_on)
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
+        # Outside the try on purpose: this only prints, and a display helper
+        # that stumbled inside it would be reported as "invalid resource plan"
+        # and take the launch down with it.
+        if not cuda_on: report_unapplied_vram_tier(plan, gpu_off_by_request)
         if plan_must_not_choose_omp:
             # environment_for_plan supplies the physical-core default used by
             # the other engines. V4 deliberately computes logical CPUs minus
@@ -604,6 +610,14 @@ def env_for_engine(a, arch, plan=None):
                 gain=100.0*profile["gain"]
                 print(f"  {C.dim}[TUNE] applied measured profile · +{gain:.1f}% "
                       f"calibration throughput{C.r}",file=sys.stderr)
+    # Kimi's CUDA path is gated on K3_CUDA, not COLI_CUDA. --gpu / --vram /
+    # auto-tier write COLI_CUDA=1 after proving the build; without this copy
+    # the flag was accepted and the experts still stayed on the CPU.
+    if arch == "kimi":
+        if env.get("COLI_CUDA") == "0":
+            env["K3_CUDA"] = "0"
+        elif env.get("COLI_CUDA") == "1" and "K3_CUDA" not in explicit_env:
+            env["K3_CUDA"] = "1"
     return env
 
 def dsv4_cuda_available(model=None):
@@ -670,15 +684,20 @@ def cuda_binary(engine=None):
                        for line in linked.stdout.splitlines())
         except (OSError,subprocess.SubprocessError): return False
     if sys.platform == "win32":
-        # Windows CUDA_DLL=1 builds never link libcudart directly: glm.exe loads
-        # coli_cuda.dll at runtime via LoadLibrary (backend_loader.c), so there's no
-        # import-table entry for ldd/dumpbin to see. Detect the COLI_CUDA build via a
-        # marker string baked into glm.c's #ifdef COLI_CUDA block instead, and require
-        # coli_cuda.dll to actually sit next to glm.exe (else CUDA init fails at startup).
+        # Windows CUDA_DLL/HIP_DLL hosts never link the GPU runtime directly:
+        # the engine LoadLibrary's its backend (backend_loader.c). The host
+        # compiles exactly one basename -- coli_hip.dll or coli_cuda.dll --
+        # and that is the file that must sit next to it. The GLM/Qwen banner
+        # is not a GPU-build marker: Kimi K3 CUDA_DLL builds link the same
+        # loader without printing it, and a HIP host that only had coli_hip.dll
+        # used to be refused as CPU-only.
         try:
-            with open(engine,"rb") as f: built=b"[CUDA] mode: routed experts" in f.read()
+            with open(engine,"rb") as f: image=f.read()
         except OSError: return False
-        return built and os.path.exists(os.path.join(os.path.dirname(engine),"coli_cuda.dll"))
+        from doctor import windows_backend_dll
+        expected=windows_backend_dll(image)
+        if not expected: return False
+        return os.path.exists(os.path.join(os.path.dirname(engine),expected))
     return False
 
 def resource_request(a, env):
@@ -704,6 +723,73 @@ def requested_kv_slots(a, env):
     value=getattr(a,"kv_slots",None)
     if value is None: value=int(env.get("COLI_KV_SLOTS","1"))
     return value
+
+def plan_cuda_enabled(a, arch, env):
+    """Should --auto-tier apply the VRAM tier that `coli plan` printed?
+
+    Yes exactly when the engine that is about to run was built with a GPU
+    backend, which is the question the GLM path has always asked
+    (`has_cuda=cuda_binary()`), and which is what --auto-tier documents: apply
+    the plan.
+
+    The sibling path used to answer a narrower question -- "did the user pass
+    --gpu or --vram" -- and the comment that guarded it was right at the time:
+    cuda_binary() could only inspect the GLM binary, so a perfectly good qwen36
+    CUDA build looked CPU-only to it and auto-tier had to assume the worst
+    rather than risk launching a CPU-only sibling as a CUDA one. Since #1533
+    the check takes the engine that will actually run, so the thing that
+    contract was protecting against can be TESTED instead of assumed, and
+    assuming it costs the user the tier they were just shown. On the box in
+    #1581 that was 11.8 tok/s against 21, with nothing on screen to explain it.
+
+    A CPU-only build still never gets a CUDA launch: that is what the check
+    below says. `--gpu none` (COLI_CUDA=0) is still the off switch, and an
+    explicit --gpu/--vram has already proved the build before we get here.
+    """
+    value = env.get("COLI_CUDA")
+    if value == "1": return True      # --gpu / --vram validated the build above
+    if value == "0": return False     # --gpu none, or the user set it by hand
+    # DeepSeek V4 links its tier differently on each platform, so it has its own
+    # probe; using cuda_binary() here would reject valid V4 CUDA builds (#1219).
+    if arch == "deepseek_v4": return dsv4_cuda_available(getattr(a, "model", None))
+    return cuda_binary(engine_for_gpu_check(a))
+
+
+def report_unapplied_vram_tier(plan, gpu_off_by_request=False):
+    """Say so when a real VRAM tier from the plan is not going into the launch.
+
+    After plan_cuda_enabled() there are only two ways to get here, and the user
+    can act on exactly one of them, so the notice says which: the GPU was turned
+    off by request, or the engine binary has no GPU backend to turn on.
+
+    Being told matters because `coli plan` and `coli doctor` print the VRAM tier
+    as part of the plan and --auto-tier is documented as applying that plan. In
+    #1581 the tier vanished with nothing on screen connecting the two, and the
+    reporter only found it by watching nvidia-smi.
+
+    The test for "real" is the planner's own: a device qualified to drive
+    placement, and a budget above zero. Anything else was not going to be
+    applied with the GPU on either, and saying so would be noise.
+    """
+    try:
+        from resource_plan import plans_placement, GB
+        vram = plan["tiers"]["vram"]
+        devices = [d for d in vram["devices"] if plans_placement(d)]
+        budget = vram["budget_bytes"]
+    except (ImportError, KeyError, TypeError, AttributeError):
+        return
+    if not devices or budget <= 0:
+        return
+    where = ", ".join(f"{d['index']}:{d.get('name') or 'GPU'}" for d in devices)
+    why = ("--gpu none turns the GPU off, so the tier is not applied. Drop it "
+           "to use the plan as printed."
+           if gpu_off_by_request else
+           "the engine binary has no GPU backend, so there is nothing to apply "
+           "it with. Rebuild the engine with CUDA=1 to use it.")
+    print(f"  {C.yel}[PLAN] the plan's VRAM tier is not being applied{C.r}\n"
+          f"  {C.dim}{budget / GB:.1f} GB on {where} stays unused: {why}{C.r}",
+          file=sys.stderr)
+
 
 def env_for(a):
     explicit_env = set(os.environ)
@@ -1122,7 +1208,7 @@ def cmd_info(a):
         try: n_shards=len([x for x in os.listdir(a.model) if x.endswith('.safetensors')])
         except OSError: n_shards=0
         print(f"   {C.yel}config.json is missing{C.r}: coli picks the engine from it, so nothing can run here yet.")
-        print(f"   Copy the checkpoint's config.json (with tokenizer.json and model.safetensors.index.json)")
+        print("   Copy the checkpoint's config.json (with tokenizer.json and model.safetensors.index.json)")
         print(f"   from the model repo next to the {n_shards} shard(s) found here, then run coli info again.")
     try:
         mi=open('/proc/meminfo').read()
@@ -1406,6 +1492,97 @@ def render_gen_stats(st, mode):
     if st["interrupted"]: parts.append("⏹ interrupted")
     return " · ".join(parts)
 
+
+
+# ---- comandi della chat ------------------------------------------------------
+#
+# Stanno in un posto solo perche servono a tre cose che devono restare
+# d'accordo: il completamento col TAB, l'elenco di /help, e il controllo che
+# impedisce a un comando scritto male di partire come messaggio al modello.
+# Quest'ultimo e il motivo per cui esistono: prima "/brio merge" con una lettera
+# sbagliata finiva dritto al modello, che rispondeva educatamente a una riga di
+# comando. Ogni forma si accetta sia con / sia con : -- i comandi storici usano
+# i due punti e non si toglie a nessuno l'abitudine.
+CHAT_COMMANDS = {
+    "brio":  "a | b | c   score the options instead of generating; no options returns to chat",
+    "reset": "            start the conversation again",
+    "help":  "            this list",
+    "quit":  "            leave (also :q)",
+}
+
+def chat_command(message):
+    """(nome, resto) se la riga e un comando, (None, None) se e un messaggio.
+
+    Il nome torna anche quando NON esiste: e il chiamante a decidere che farne,
+    e deve poter distinguere "comando sbagliato" da "testo che comincia con /"."""
+    if not message or message[0] not in "/:":
+        return None, None
+    head, _, rest = message[1:].partition(" ")
+    return head.strip().lower(), rest.strip()
+
+def chat_commands_help():
+    print(f"  {C.dim}commands:{C.r}")
+    for name, what in CHAT_COMMANDS.items():
+        print(f"    {C.teal}/{name}{C.r} {C.dim}{what}{C.r}")
+    print()
+
+def install_chat_completer():
+    """TAB completa i comandi. Senza readline (Windows) si perde solo il TAB."""
+    if readline is None:
+        return
+    names = [p + n for n in CHAT_COMMANDS for p in ("/", ":")]
+    def complete(text, state):
+        hits = [n + " " for n in names if n.startswith(text)]
+        return hits[state] if state < len(hits) else None
+    readline.set_completer_delims(" \t\n")
+    readline.parse_and_bind("set show-all-if-ambiguous on")   # un TAB solo li mostra tutti
+    readline.parse_and_bind("tab: complete")
+    readline.set_completer(complete)
+
+def chat_brio(a, base, model_id, msgs, question, options, w):
+    """Un giro di modalita brio dalla TUI: una richiesta, una distribuzione.
+
+    Il ciclo (fotografia del prefisso, una lettura per opzione, normalizzazione
+    per lunghezza) sta nel gateway, non qui: sono tre cose facili da sbagliare e
+    devono stare in un posto solo. Qui si manda la conversazione come contesto
+    e si disegnano le barre."""
+    import urllib.request, urllib.error
+    body=json.dumps({"model":model_id,"messages":msgs,"question":question,
+                     "options":options}).encode()
+    req=urllib.request.Request(base.rstrip("/")+"/v1/brio", data=body,
+                               headers={"Content-Type":"application/json"})
+    if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
+    print(f"\n  {C.teal}◆ brio{C.r}")
+    sp=Spinner("scoring…"); sp.start(); t0=time.time()
+    try:
+        with urllib.request.urlopen(req) as r:
+            out=json.loads(r.read().decode("utf-8","replace"))
+    except urllib.error.HTTPError as e:
+        sp.stop()
+        try: detail=json.loads(e.read().decode("utf-8","replace")).get("error",{}).get("message","")
+        except Exception: detail=""
+        print(f"  {C.yel}[il server ha rifiutato: HTTP {e.code}{' — '+detail if detail else ''}]{C.r}\n")
+        return
+    except OSError as e:
+        sp.stop(); print(f"  {C.yel}[server irraggiungibile: {e}]{C.r}\n"); return
+    sp.stop()
+    bars=max(10, min(30, w-34))
+    for choice in out.get("choices", []):
+        p=choice.get("p",0.0); filled=int(round(p*bars))
+        colour=C.grn if choice["option"]==out.get("answer") else C.dgray
+        print(f"     {colour}{choice['option'][:22]:<22}{C.r} {colour}{'█'*filled}{C.r}"
+              f"{C.dgray}{'░'*(bars-filled)}{C.r} {p*100:5.1f}%"
+              f"  {C.dim}{choice.get('tokens',0)} tok{C.r}")
+    h=out.get("entropy",1.0)
+    # L'entropia e la parte che la generazione non sa dare: non "qual e la
+    # risposta" ma "quanto il modello sa di saperlo".
+    verdict=(f"{C.grn}sure{C.r}" if h<.4 else
+             f"{C.yel}unsure{C.r}" if h<.8 else f"{C.yel}DOES NOT KNOW{C.r}")
+    usage=out.get("usage",{})
+    print(f"     {C.b}→ {out.get('answer','?')}{C.r}  {C.dim}entropy {h:.3f}{C.r} ({verdict})")
+    print(f"  {C.dim}{time.time()-t0:.2f}s · {usage.get('read_tokens',0)} tokens read · "
+          f"{usage.get('completion_tokens',0)} generated{C.r}\n")
+
 def chat_attached(a, base, model_id):
     """The chat REPL over HTTP against a running `coli serve`.
 
@@ -1418,8 +1595,11 @@ def chat_attached(a, base, model_id):
     OpenAI SSE over localhost, stdlib only."""
     import urllib.request, urllib.error
     print(f"  {C.grn}✦ attached{C.r} {C.dim}to {base} · model {model_id} · the engine stays warm after you quit{C.r}")
-    print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :reset starts a new conversation · :q exits{C.r}\n")
+    print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :reset starts a new conversation · :q exits{C.r}")
+    print(f"  {C.dim}/ for commands · TAB completes · /brio puts the SAME model in brio mode{C.r}\n")
+    install_chat_completer()
     msgs=[]
+    brio_options=[]          # non vuoto = modalita brio accesa
     w=term_w()-4
     while True:
         if TTY:
@@ -1432,9 +1612,48 @@ def chat_attached(a, base, model_id):
             try: msg=input()
             except EOFError: break
         msg=msg.strip("\r\n")
-        if msg in (":q",":quit","exit"): break
+        if msg in (":q","/q","exit"): break
         if not msg.strip(): continue
-        if msg==":reset": msgs=[]; print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
+        # Una riga che comincia con / o : e un COMANDO, giusto o sbagliato che
+        # sia: non finisce mai al modello. Prima un refuso partiva come domanda.
+        name, rest = chat_command(msg)
+        if name is not None and name not in CHAT_COMMANDS:
+            print(f"  {C.yel}  comando sconosciuto: {msg.split()[0]}{C.r}")
+            chat_commands_help(); continue
+        if name in ("quit",): break
+        if name == "help": chat_commands_help(); continue
+        if name == "reset":
+            msgs=[]; brio_options=[]
+            print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
+        # ---- modalita brio -------------------------------------------------
+        # Lo stesso modello con cui stai chattando smette di generare e comincia
+        # a punteggiare: gli si danno le opzioni ammesse e lui dice quanto e
+        # probabile ciascuna. La conversazione fin qui FA da contesto, quindi
+        # /brio a meta chat continua il discorso invece di ricominciarlo.
+        if name == "brio":
+            spec=rest
+            if not spec:
+                if brio_options:
+                    brio_options=[]
+                    print(f"  {C.dim}✦ chat{C.r}\n")
+                else:
+                    print(f"  {C.yel}  /brio needs the options: /brio merge | request changes | close{C.r}\n")
+                continue
+            # dict.fromkeys deduplica tenendo l'ordine: il server rifiuta due
+            # opzioni uguali con un 400, e "merge | merge | close" e' un refuso
+            # facile da fare a mano, non una domanda a tre opzioni.
+            brio_options=list(dict.fromkeys(o.strip() for o in spec.split("|") if o.strip()))
+            if len(brio_options)<2:
+                brio_options=[]
+                print(f"  {C.yel}  at least two options are needed, separated by |{C.r}\n")
+                continue
+            print(f"  {C.grn}✦ brio{C.r} {C.dim}· {len(brio_options)} options · "
+                  f"the model stops generating and scores instead · /brio returns to chat{C.r}\n")
+            continue
+        if brio_options:
+            chat_brio(a, base, model_id, msgs, msg, brio_options, w)
+            continue
+        # --------------------------------------------------------------------
         payload = message_with_images(msg)
         if payload is None: continue          # percorso sbagliato: gia' detto
         msgs.append({"role":"user","content":payload})
@@ -1971,6 +2190,59 @@ def cmd_cluster_worker(a):
     finally:
         stop_heartbeat.set()
 
+def _stop_proc_table(port):
+    """(pid, cmdline, comm) for every process, in /proc's NUL-separated byte format.
+
+    macOS and the BSDs have no /proc, so cmd_stop's scan used to iterate an empty list and
+    report "nothing running" while a live serve and its multi-GB engine kept the box. That is
+    worse than a crash: this command exists to stop the ghost engines that once OOM'd a
+    machine, and a silent success invites the operator to walk away.
+
+    `ps` is asked for everything ONCE rather than per pid, and its space-separated output is
+    normalised to NUL-separated bytes so _serve_cmdline_matches_port keeps working unchanged."""
+    try:
+        pids=[int(d) for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        pids=None
+    if pids is not None:
+        table=[]
+        for pid in pids:
+            try:
+                with open(f"/proc/{pid}/cmdline","rb") as f: cmd=f.read()
+                with open(f"/proc/{pid}/comm") as f: comm=f.read().strip()
+            except (OSError,PermissionError): continue
+            table.append((pid,cmd,comm))
+        return table
+    try:
+        out=subprocess.run(["ps","-Ao","pid=,comm=,command="],capture_output=True,text=True,
+                           timeout=10).stdout
+    except (OSError,subprocess.SubprocessError):
+        return []
+    table=[]
+    for line in out.splitlines():
+        parts=line.strip().split(None,2)
+        if len(parts)<3 or not parts[0].isdigit(): continue
+        pid=int(parts[0]); comm=os.path.basename(parts[1])
+        try: argv=shlex.split(parts[2])
+        except ValueError: argv=parts[2].split()
+        table.append((pid,b"\0".join(a.encode("utf-8","replace") for a in argv)+b"\0",comm))
+    return table
+
+def _stop_environ(pid):
+    """A process's environment as NUL-separated KEY=VAL bytes, /proc or `ps eww`."""
+    try:
+        with open(f"/proc/{pid}/environ","rb") as f: return f.read()
+    except OSError:
+        pass
+    try:
+        out=subprocess.run(["ps","eww","-o","command=","-p",str(pid)],capture_output=True,
+                           text=True,timeout=5).stdout
+    except (OSError,subprocess.SubprocessError):
+        return b""
+    # `ps eww` appends the environment after the command line; keep only KEY=VAL tokens.
+    pairs=[t for t in out.split() if "=" in t and t.split("=",1)[0].replace("_","").isalnum()]
+    return b"\0".join(t.encode("utf-8","replace") for t in pairs)+b"\0"
+
 def cmd_stop(a):
     """Shut down a running `coli serve` AND its engine — one command, no pkill.
     The engine re-execs itself for OMP tuning, so its process is named `exe`,
@@ -1985,22 +2257,14 @@ def cmd_stop(a):
         with open(pf) as f: pid=int(f.read().split()[0])
         if _pid_alive(pid): targets[pid]=f"coli serve (pidfile, port {a.port})"
     except (OSError,ValueError,IndexError): pass
-    try: proc_entries=os.listdir("/proc")
-    except OSError: proc_entries=[]       # native Windows has no /proc; the pidfile still works
-    for pd in proc_entries:
-        if not pd.isdigit(): continue
-        pid=int(pd)
+    process_names={"exe"}
+    for family in all_families(): process_names.update(family.process_names)
+    for pid,cmd,comm in _stop_proc_table(a.port):
         try:
-            with open(f"/proc/{pd}/cmdline","rb") as f: cmd=f.read()
             if pid!=os.getpid() and _serve_cmdline_matches_port(cmd,a.port):
                 targets.setdefault(pid,f"coli serve (cmdline, port {a.port})")
-            with open(f"/proc/{pd}/comm") as f: comm=f.read().strip()
-            process_names={"exe"}
-            for family in all_families(): process_names.update(family.process_names)
-            if comm in process_names:
-                with open(f"/proc/{pd}/environ","rb") as f: env=f.read()
-                if _serve_environ_matches_port(env,a.port):
-                    targets.setdefault(pid,f"engine `{comm}` (port {a.port})")
+            if comm in process_names and _serve_environ_matches_port(_stop_environ(pid),a.port):
+                targets.setdefault(pid,f"engine `{comm}` (port {a.port})")
         except (OSError,PermissionError): continue
     if not targets:
         print(f"  nothing running — no serve on port {a.port}, no SERVE engines"); return

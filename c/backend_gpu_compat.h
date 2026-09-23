@@ -60,6 +60,7 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #endif
 #define cudaError_t              hipError_t
 #define cudaSuccess              hipSuccess
+#define cudaErrorMemoryAllocation hipErrorOutOfMemory
 #define cudaGetErrorString       hipGetErrorString
 #define cudaGetLastError         hipGetLastError
 #define cudaSetDevice            hipSetDevice
@@ -67,6 +68,7 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaDeviceProp           hipDeviceProp_t
 #define cudaGetDeviceProperties  hipGetDeviceProperties
 #define cudaMalloc               hipMalloc
+#define cudaMallocManaged        hipMallocManaged
 #define cudaFree                 hipFree
 #define cudaMemcpy               hipMemcpy
 #define cudaMemcpy2D             hipMemcpy2D

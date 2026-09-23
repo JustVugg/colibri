@@ -109,6 +109,7 @@ pacman -S --needed mingw-w64-ucrt-x86_64-gcc make git python
 ```bash
 xcode-select --install          # C compiler (clang)
 brew install libomp git python  # OpenMP for multithreading
+# MacPorts works too: sudo port install libomp   (the Makefile finds either)
 ```
 
 ---

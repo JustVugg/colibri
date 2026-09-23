@@ -124,12 +124,31 @@ typedef struct {
  * uninterruptible as before. */
 typedef int (*ColiV4SessionAbortFn)(void *user_data);
 
+/* The numeric channel (SUBMIT logprobs=k, docs/brio.md): raw head scores,
+ * vocab_size floats, valid only for the duration of the callback. on_echo
+ * fires once per prompt position whose predictor this call computed, with the
+ * token that actually stands there; on_scores fires right before the on_token
+ * of every generated token, with the scores it was picked from. */
+typedef void (*ColiV4SessionScoresFn)(void *user_data, int position, int token,
+                                      const float *scores, int vocab);
+
 typedef struct {
-    int max_new_tokens;      /* required; clamped by session cap */
+    int max_new_tokens;      /* required; clamped by session cap; 0 only with logprobs > 0 */
     int stop_at_sentence;
     int no_dspark;           /* disable speculative draft/verification */
     ColiV4SessionAbortFn should_abort;  /* optional prefill abort poll */
     void *abort_user_data;
+    /* SUBMIT logprobs=k / pin=1. logprobs > 0 opens the channel above, turns
+     * speculative decoding off for the request (a draft accepted in a block
+     * has no scores of its own) and allows max_new_tokens == 0, "read the
+     * prompt and stop". pin keeps the prompt-end scores and a snapshot of the
+     * attention state, so the prompts that extend this one start from here
+     * with their first fresh token's predictor intact. */
+    int logprobs;
+    int pin;
+    ColiV4SessionScoresFn on_echo;
+    ColiV4SessionScoresFn on_scores;
+    void *scores_user_data;
     /* Optional: byte length of the prompt's stable leading prefix (the
      * rendered system turn). The session snapshots the attention state at
      * that token boundary during this prefill so later conversations that

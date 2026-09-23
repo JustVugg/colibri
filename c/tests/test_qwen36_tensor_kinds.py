@@ -5,6 +5,7 @@ the safetensors indexes of the two shipped checkpoints with the layer/expert
 indices collapsed, so a checkpoint that adds a tensor kind fails here before
 anyone spends a terabyte finding out in the converter.
 """
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -16,6 +17,19 @@ from qwen36_tensor_kinds import (  # noqa: E402
 # Qwen/Qwen3.8-2.4T-A95B, model.safetensors.index.json (1609 tensors, 213
 # shards, fetched 2026-09-03). "N" stands for a layer index; 92 layers, of
 # which 23 (i % 4 == 3) carry self_attn and 69 linear_attn.
+#
+# Provenance, so the transcription can be checked instead of trusted:
+#   sha256 model.safetensors.index.json (Qwen/Qwen3.8-2.4T-A95B):
+#     e36c40d4e99b2714fff821218a0433bda2dec46afdb1ebee8ce96ced997928ee
+#   sha256 model.safetensors.index.json (Qwen/Qwen3.6-35B-A3B):
+#     41b9356101ebf8e7519e150dc811f80c4226e727301fbb032b890f006ed0be83
+# The collapsed list is one line from either index:
+#   python3 -c 'import json,re,sys; print("\n".join(sorted({re.sub(r"\.(\d+)\.", ".N.", n) for n in json.load(open(sys.argv[1]))["weight_map"]})))' model.safetensors.index.json
+# For the 2.4T index that output IS QWEN38_2P4T (46 names). For the 35B index
+# it is the same 46 with `model.` -> `model.language_model.` plus 21 `model.visual.*`
+# names (the 333 vision tensors collapse to 21 kinds; three are listed below,
+# the prefix is what the contract keys on). IndexBackedTest below checks both
+# against real index files when QWEN36_INDEX_DIR points at them.
 QWEN38_2P4T = (
     "lm_head.weight",
     "model.embed_tokens.weight",
@@ -92,6 +106,45 @@ TINY_FIXTURE = tuple(
 
 def _concrete(names):
     return [n.replace("N", "7") for n in names]
+
+
+def _collapsed(index_path):
+    """The one-liner from the header, as a function: layer/expert indices -> N."""
+    import json, re
+    with open(index_path, encoding="utf-8") as f:
+        names = json.load(f)["weight_map"]
+    return sorted({re.sub(r"\.(\d+)\.", ".N.", n) for n in names})
+
+
+@unittest.skipUnless(os.environ.get("QWEN36_INDEX_DIR"),
+                     "set QWEN36_INDEX_DIR to a directory holding the two real index files")
+class IndexBackedTest(unittest.TestCase):
+    """The lists above against the real safetensors indexes (hashes in the header).
+
+    Not in CI (the indexes are not in the tree); anyone with the two files can
+    run it, which turns the hand transcription into a checked one."""
+
+    def _index(self, stem):
+        path = Path(os.environ["QWEN36_INDEX_DIR"]) / f"{stem}.model.safetensors.index.json"
+        if not path.exists():
+            self.skipTest(f"{path} not present")
+        return path
+
+    def test_2p4t_index_collapses_to_the_list(self):
+        self.assertEqual(_collapsed(self._index("Qwen3.8-2.4T-A95B")), sorted(QWEN38_2P4T))
+
+    def test_35b_index_is_the_text_model_under_language_model_plus_visual(self):
+        got = _collapsed(self._index("Qwen3.6-35B-A3B"))
+        text = sorted(n for n in got if not n.startswith("model.visual."))
+        expected_text = sorted(
+            n.replace("model.", "model.language_model.", 1) if n.startswith("model.") else n
+            for n in QWEN38_2P4T)
+        self.assertEqual(text, expected_text)
+        visual = [n for n in got if n.startswith("model.visual.")]
+        self.assertEqual(len(visual), 21)
+        for shown in QWEN36_35B:
+            if shown.startswith("model.visual."):
+                self.assertIn(shown, visual)
 
 
 class TensorKindsTest(unittest.TestCase):

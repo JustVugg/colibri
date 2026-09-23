@@ -149,6 +149,68 @@ int main(void){
         gr_free(&G);
     }
 
+    /* 9. nested arrays: an item that holds an array is emitted once as a rule and
+     *    referenced twice, so the GBNF grows linearly with nesting. Inlined at both
+     *    places it doubled per level: 8 levels overflowed GR_MAX_RULES (no grammar
+     *    at all) and a 567-byte schema of 22 levels compiled to 180 MB. */
+    {
+        char sc[1024], err[160];
+        char *flat = schema_to_gbnf("{\"type\":\"array\",\"items\":{\"type\":\"string\"}}", err, sizeof err);
+        CHECK(flat && !strstr(flat, "jitem"));             /* a scalar item stays inline */
+        free(flat);
+        size_t len[17] = {0};
+        for (int depth = 1; depth <= 16; depth++){
+            sc[0] = 0;
+            for (int i = 0; i < depth; i++) strcat(sc, "{\"type\":\"array\",\"items\":");
+            strcat(sc, "{\"type\":\"string\"}");
+            for (int i = 0; i < depth; i++) strcat(sc, "}");
+            char *g = schema_to_gbnf(sc, err, sizeof err);
+            CHECK(g != NULL);
+            if (g) len[depth] = strlen(g);
+            free(g);
+        }
+        for (int depth = 2; depth <= 16; depth++)       /* one rule line per level */
+            CHECK(len[depth] - len[depth - 1] < 100);
+        CHECK(len[16] < 4096);
+
+        Grammar G; GrState S;
+        unsigned char mask[32]; int can_end = 0;
+        const char *sc8 = "{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":"
+            "{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":"
+            "{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":"
+            "{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":"
+            "{\"type\":\"string\"}}}}}}}}}";
+        int ok = compile(sc8, &G, NULL, 0) == 0;
+        CHECK(ok);
+        if (ok){
+            gr_state_init(&S, &G);
+            const char *inst = "[[[[[[[[\"a\",\"b\"],[]]]]]]]]";
+            CHECK(walk(&S, inst) == (int)strlen(inst));
+            gr_admissible(&S, mask, &can_end);
+            CHECK(can_end == 1);
+            gr_state_init(&S, &G);
+            CHECK(walk(&S, "[[[[[[[\"a\"]]]]]]]") == 7);    /* a string one level too shallow */
+            gr_free(&G);
+        }
+
+        /* array of objects that hold arrays: forced key spans survive the rule */
+        const char *nested = "{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{"
+            "\"tags\":{\"type\":\"array\",\"items\":{\"enum\":[\"x\",\"y\"]}}},\"required\":[\"tags\"]}}";
+        ok = compile(nested, &G, NULL, 0) == 0;
+        CHECK(ok);
+        if (ok){
+            gr_state_init(&S, &G);
+            CHECK(walk(&S, "[{\"") == 3);
+            char f[64]; int n = gr_forced(&S, f, sizeof f);
+            CHECK(n > 0 && strncmp(f, "tags\"", 5) == 0);
+            const char *tail = "tags\":[\"x\",\"y\"]},{\"tags\":[]}]";
+            CHECK(walk(&S, tail) == (int)strlen(tail));
+            gr_admissible(&S, mask, &can_end);
+            CHECK(can_end == 1);
+            gr_free(&G);
+        }
+    }
+
     if (fails){ printf("test_schema_gbnf: %d FAILED\n", fails); return 1; }
     printf("test_schema_gbnf: OK\n");
     return 0;

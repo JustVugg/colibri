@@ -83,6 +83,16 @@ re-pin from history.
   engine token-for-token on the validation prompt.
 - int4 weights decode as offset-binary (nibble−8), byte-identical layout to
   the CPU path — no repacking.
+- Khronos validation layers: the backend never enables them, so the loader
+  does. `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` turns on the core
+  checks; add `VK_LAYER_VALIDATE_SYNC=true` for synchronization validation
+  (or point `VK_LAYER_SETTINGS_PATH` at a directory holding a file named
+  exactly `vk_layer_settings.txt`). The harness above reports no hazards
+  under it. Known layer defect, SDK 1.4.357.1 on MoltenVK: submit-time
+  synchronization validation segfaults inside the layer at `vkDeviceWaitIdle`
+  during shutdown; set `VK_LAYER_SYNCVAL_SUBMIT_TIME_VALIDATION=false`, or
+  read stdout through a pty, since the crash lands in an `atexit` handler
+  before stdio flushes.
 
 ## Measured performance (AMD RX 9070, RDNA4, RADV/Mesa 26.1)
 

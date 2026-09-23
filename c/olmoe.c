@@ -18,6 +18,11 @@
  *   PILOT_EVICT_GUARD=0/1 : 1=enable LFRU prefetch eviction guard (default), 0=disable
  *   EXPERT_DROP=0/1: 1=fadvise(DONTNEED) after each expert read (old behaviour,
  *                    for RAM-tight boxes); 0=keep pages cached (default)
+ *   ROUTE_TRACE=<path>: log every routing decision (one line per moe call,
+ *                    position and layer: "<call> <row> <layer> <id>:<gate> ...")
+ *                    for offline analysis — tools/route_pairs.py,
+ *                    tools/route_coupling_report.py, tools/residency_sim.py.
+ *                    Measurement only: it cannot change which experts run.
  *   (expert queue is sorted by eid for SSD read locality)
  */
 #define _GNU_SOURCE
@@ -38,8 +43,10 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"                    /* shared routing telemetry (#700) */
-#include "kv_prefix.h"   /* riuso del prefisso tra turni (shared) */
+#include "kv_prefix.h"
+#include "pin_pool.h"                       /* piu scatti annidati */   /* riuso del prefisso tra turni (shared) */
 #include "serve_codec.h"
+#include "serve_budget.h"
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -126,6 +133,7 @@ typedef struct {
 } Model;
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pilot_cv = PTHREAD_COND_INITIALIZER; /* broadcast on every publish */
 static struct { int l, e; } pilot_q[4096];
 static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
@@ -187,6 +195,28 @@ static void cache_publish(Model *m, int layer, Slot *s, int eid) {
     s->eid = eid;
     if (lc->slot_by_expert && eid >= 0 && eid < m->c.n_experts)
         lc->slot_by_expert[eid] = (int)(s - lc->slots);
+}
+
+/* A slot being read keeps the index entry of the expert it is loading, marked
+ * -(eid+2) as in colibri.c's ecache_reserve: lookups still miss and eviction
+ * still skips it (eid < 0), but a second loader of the same expert can see the
+ * read in flight instead of starting another one into another slot. */
+static void cache_reserve(Model *m, int layer, Slot *s, int eid) {
+    LCache *lc = &m->cache[layer];
+    cache_hide(m, layer, s);
+    s->eid = -(eid + 2);
+    if (lc->slot_by_expert && eid >= 0 && eid < m->c.n_experts)
+        lc->slot_by_expert[eid] = (int)(s - lc->slots);
+}
+
+/* Caller holds g_pilot_mx. */
+static int slot_in_flight(Model *m, int layer, int eid) {
+    if (layer < 0 || layer >= m->c.n_layers || eid < 0 ||
+        eid >= m->c.n_experts) return 0;
+    LCache *lc = &m->cache[layer];
+    if (!lc->slot_by_expert) return 0;
+    int i = lc->slot_by_expert[eid];
+    return i >= 0 && i < lc->n && lc->slots[i].eid == -(eid + 2);
 }
 
 static void ensure_pilot_worker_started(Model *m) {
@@ -315,6 +345,29 @@ static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
     __m128i hi32   = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
     __m128i sum32  = _mm_add_epi32(sum64, hi32);
     return _mm_cvtsi128_si32(sum32);
+}
+#define HAVE_FAST_DOT_I8 1
+#elif defined(__SSE4_1__)
+#include <immintrin.h>
+#include "sse41_kernels.h"
+/* Sandy Bridge-EP path: AVX 1.0 only, no FMA, no AVX-2.
+ * 16 int8 dot via two 8-wide SSE2 sign-extend + SSE4.1 madd pairs.
+ * Bit-for-bit identical to the AVX2 version above (just 2x 128-bit ops
+ * instead of 1x 256-bit op). NO FMA here -- this branch targets Sandy Bridge
+ * which has no FMA -- so use explicit mul+add for the inner accumulation. */
+static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
+    __m128i va_lo = _mm_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)a));        /* lower 8 int8 -> 8 int16 */
+    __m128i vb_lo = _mm_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)b));
+    __m128i va_hi = _mm_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(a + 8)));   /* upper 8 int8 -> 8 int16 */
+    __m128i vb_hi = _mm_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(b + 8)));
+    __m128i p_lo = _mm_madd_epi16(va_lo, vb_lo);   /* 4 x int32 from 8 int16 pairs */
+    __m128i p_hi = _mm_madd_epi16(va_hi, vb_hi);   /* 4 x int32 from 8 int16 pairs */
+    __m128i sum = _mm_add_epi32(p_lo, p_hi);
+    /* horizontal reduce 4 x int32 -> 1 x int32 */
+    __m128i hi64   = _mm_unpackhi_epi64(sum, sum);
+    __m128i sum64  = _mm_add_epi32(sum, hi64);
+    __m128i hi32   = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
+    return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
 }
 #define HAVE_FAST_DOT_I8 1
 #endif
@@ -633,7 +686,16 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
     s->pinned = 0;
 }
 
+#ifdef COLI_CACHE_INDEX_TEST
+/* Model-free tests stand in for the disk read, so they can hold a load open
+ * and count how many times each expert is read. */
+static void (*g_test_expert_load)(Model *m, int layer, int eid, Slot *s);
+#endif
+
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
+#ifdef COLI_CACHE_INDEX_TEST
+    if (g_test_expert_load) { g_test_expert_load(m, layer, eid, s); return; }
+#endif
     char nm[256], qsnm[256];
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.merged_weight", layer, eid);
     snprintf(qsnm, sizeof(qsnm), "model.layers.%d.mlp.experts.%d.qs", layer, eid);
@@ -680,6 +742,13 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     pthread_mutex_lock(&g_pilot_mx);
     ehit_mark(m, layer, eid);          /* under the lock: the routing loop is parallel */
     Slot *hit = slot_indexed(m, layer, eid);
+    /* The prefetcher usually reads the next layer's experts while this one
+     * computes, so a routed expert is often already on its way: wait for that
+     * read to publish rather than read the same bytes again into another slot. */
+    while (!hit && slot_in_flight(m, layer, eid)) {
+        pthread_cond_wait(&g_pilot_cv, &g_pilot_mx);
+        hit = slot_indexed(m, layer, eid);
+    }
     if (hit) {
         m->hits++; hit->used = ++m->clock; *out = hit;
         if (m->last_access) m->last_access[layer * m->c.n_experts + eid] = m->clock;
@@ -726,7 +795,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
         s = &lc->slots[lru];
         s->pinned = 0;
     }
-    cache_hide(m, layer, s);
+    cache_reserve(m, layer, s, eid);
     s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
 
@@ -738,6 +807,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     s->used = ++m->clock;
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     *out = s;
+    pthread_cond_broadcast(&g_pilot_cv);
     pthread_mutex_unlock(&g_pilot_mx);
 }
 
@@ -916,11 +986,24 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             idx[kk] = best; val[kk] = pr[best];
         }
         if (c->norm_topk) { float sm=0; for(int kk=0;kk<K;kk++) sm+=val[kk]; for(int kk=0;kk<K;kk++) val[kk]/=sm; }
-        /* IMPROVEMENT 2: update activation heatmap (before pinning activates) */
-        if (!m->hot_pinned && m->freq) {
-            uint32_t *freq_l = m->freq[layer];
-            if (freq_l) for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
-        }
+        /* IMPROVEMENT 2 activation heatmap AND the ROUTE_TRACE stream, in one
+         * call. The counters were the only thing this engine recorded, and it
+         * recorded them HERE, before pinning activates — rt_count keeps that
+         * placement exactly. The trace is the half olmoe never had: it emits a
+         * line per (moe call, position, layer), so tools/route_pairs.py,
+         * route_coupling_report.py and residency_sim.py can read this engine's
+         * routing the same way they read GLM's. Until now olmoe announced
+         * ROUTE_TRACE at startup and then wrote a zero-byte file, because
+         * rt_init() opens the stream but nothing here ever called rt_trace():
+         * every consumer silently saw "no data" instead of an error.
+         *
+         * Only rt_route() is unconditional: it is a no-op for the counts when
+         * this engine has no counter row (the !hot_pinned guard below is
+         * unchanged) and a no-op for the trace when ROUTE_TRACE is unset, so a
+         * run without the variable behaves exactly as before. Measurement only,
+         * never the computation: idx[] and val[] are the ids and the
+         * post-normalisation gates the layer is about to apply. */
+        if (!m->hot_pinned) rt_route(layer, s, idx, val, K);
         const float *xs = x + (int64_t)s*D;
         for (int kk = 0; kk < K; kk++) {
             Slot *e; expert_get(m, layer, idx[kk], &e);
@@ -949,6 +1032,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
     }
     free(logits); free(g); free(u); free(hh);
+    /* Advance the trace call counter: once per moe() invocation, after all of
+     * its rows are traced. rt_trace_end() is a no-op when no stream is open.
+     *
+     * Outside the row loop on purpose. A batch of S == 0 traces no rows and
+     * must still consume a call id, or the ids stop being consecutive and
+     * residency_sim.py rejects the trace outright ("trace lacks advancing GLM
+     * call ids") rather than merging two forwards into one position space. GLM
+     * and glm53 advance theirs the same way. */
+    rt_trace_end();
 }
 
 /* PROF phases (#1449): wall time in attention, in the MoE blocks (expert
@@ -992,6 +1084,27 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
     free(nrm); free(tmp);
 }
 
+/* Canale logprobs: coda numerica per token, lettura del prefill, fotografia
+ * dello stato. Questo motore e ad attenzione pura, quindi riavvolgere vuol
+ * dire solo dichiarare che il prefisso tenuto e quello fotografato: le righe
+ * KV di quelle posizioni non le ha toccate nessuno. Si salvano gli id e il
+ * vettore di logit finale, che e il predittore del primo token fresco. */
+static int    g_echo_k = 0;
+static const char *g_echo_id = NULL;
+static ColiPinPool g_pins;             /* piu scatti annidati, vedi pin_pool.h */
+static const float *g_pin_logit = NULL; /* logit dello scatto rimesso, se c'e */
+static int    g_pin_use_logit = 0;
+static Tok   *g_echo_tok = NULL;
+
+static void olmoe_echo(const char *id, int pos, int token, const float *lo, int V, int k){
+    char tail[1024]; coli_logprob_tail(tail, sizeof tail, lo, V, token, k);
+    char piece[512]; int n = g_echo_tok ? tok_decode(g_echo_tok, &token, 1, piece, (int)sizeof piece) : 0;
+    if (n < 0) n = 0;
+    printf("ECHO %s %d %d%s\n", id, n, pos, tail);
+    if (n > 0) fwrite(piece, 1, (size_t)n, stdout);
+    fputc('\n', stdout); fflush(stdout);
+}
+
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     if (g_pilot && m->token_count > 0) {
@@ -1018,6 +1131,21 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
      * the ids those positions were built from, and that invariant is the
      * whole safety argument for reusing them next turn. */
     kv_prefix_record(&m->kvp, ids, pos_base, S);
+    /* Lettura del prefill: un passaggio di lm_head per posizione, pagato solo
+     * da chi ha chiesto il canale. La posizione p predice il token p+1; il
+     * primo token fresco e predetto dalla fotografia. Cosi ogni token di
+     * un'opzione ha il suo logprob, anche fuori dai primi k. */
+    if (g_echo_k > 0 && g_echo_id && S > 0) {
+        float *erow = falloc(D), *elog = falloc(c->vocab);
+        if (g_pin_use_logit && g_pin_logit)
+            olmoe_echo(g_echo_id, pos_base, ids[0], g_pin_logit, c->vocab, g_echo_k);
+        for (int p = 0; p + 1 < S; p++) {
+            rmsnorm_row(erow, x + (int64_t)p*D, m->final_norm, D, c->eps);
+            matmul(elog, erow, m->lm_head, 1, D, c->vocab);
+            olmoe_echo(g_echo_id, pos_base + p + 1, ids[p+1], elog, c->vocab, g_echo_k);
+        }
+        free(erow); free(elog);
+    }
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
@@ -1039,7 +1167,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
         pthread_mutex_unlock(&g_pilot_mx);
         return;
     }
-    if (slot_indexed(m, layer, eid)) {
+    if (slot_indexed(m, layer, eid) || slot_in_flight(m, layer, eid)) {
         m->is_queued[layer * c->n_experts + eid] = 0;
         pthread_mutex_unlock(&g_pilot_mx);
         return;
@@ -1076,7 +1204,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
 
         s = &lc->slots[lru]; s->pinned = 0;
     }
-    cache_hide(m, layer, s); s->used = ++m->clock;
+    cache_reserve(m, layer, s, eid); s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
 
     load_expert_merged(m, layer, eid, s);
@@ -1087,6 +1215,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
     s->used = ++m->clock;
     if (m->last_access) m->last_access[layer * c->n_experts + eid] = m->clock;
     m->is_queued[layer * c->n_experts + eid] = 0;
+    pthread_cond_broadcast(&g_pilot_cv);
     pthread_mutex_unlock(&g_pilot_mx);
 }
 
@@ -1404,7 +1533,8 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
  * never touched, the same invariant CHAT mode's /reset already relies on
  * (it clears hist_len, not the K/V buffers themselves). */
 
-typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
+typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen;
+                 int logprobs, pin; } SReq;   /* SUBMIT logprobs=k / pin=1 */
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
 static const ColiServeWireProfile olmoe_wire = {
@@ -1441,6 +1571,8 @@ static int serve_read_cmd(FILE *in, FILE *out, const char *cur_id) {
             SReq *q = &g_q[g_qn++];
             snprintf(q->id, sizeof(q->id), "%s", command.id);
             q->max_tok = command.max_tokens;
+            q->logprobs = command.logprobs;
+            q->pin = command.pin;
             q->temp = command.temperature;
             q->top_p = command.top_p;
             q->payload = (char *)coli_serve_command_take_payload(&command);
@@ -1481,7 +1613,8 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
     if (np <= 0) { coli_serve_write_error(stdout, q->id, "empty prompt"); free(ids); return 0; }
-    if (np + q->max_tok > ctx_cap) {
+    int budget = coli_serve_budget(np, q->max_tok, ctx_cap, q->logprobs > 0);
+    if (budget < 0) {
         char message[128];
         /* The frame the gateway turns into a 400 context_length_exceeded
          * (#506, #1381). Free text here reached the client as a 500. */
@@ -1489,6 +1622,12 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
                  "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
                  np, q->max_tok, ctx_cap);
         coli_serve_write_error(stdout, q->id, message); free(ids); return 0;
+    }
+    if (budget < q->max_tok) {
+        fprintf(stderr, "[serve] max_tokens %d clamped to %d (context %d - prompt %d); "
+                        "raise CTX for longer answers\n",
+                q->max_tok, budget, ctx_cap, np);
+        q->max_tok = budget;
     }
     g_temp = q->temp; g_nuc = q->top_p;
     /* A chat client resends the whole transcript every turn. If this prompt
@@ -1504,6 +1643,31 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
      * kv_prefix_record only ever grows the length, so the stale tail would
      * claim coverage the cache no longer has. */
     int reuse = kv_prefix_off() ? 0 : kv_prefix_reuse(&m->kvp, ids, np);
+    /* La fotografia si prova sempre, non solo quando il riuso vivo fallisce:
+     * altrimenti la prima opzione trova ancora lo stato del prompt, passa dal
+     * riuso normale e il suo primo token resta senza predittore. */
+    g_pin_use_logit = 0; g_pin_logit = NULL;
+    {
+        /* Il piu profondo degli scatti che sia un prefisso di questo prompt.
+         * Con due livelli (istruzioni, istruzioni+domanda) e il secondo a
+         * decidere; se e' morto si ripiega sul primo invece di rifare tutto. */
+        int s = coli_pin_best(&g_pins, ids, np);
+        while (s >= 0) {
+            ColiPin *k = &g_pins.slot[s];
+            if (kv_prefix_holds(&m->kvp, k->ids, k->len)) {
+                kv_prefix_clear(&m->kvp);
+                kv_prefix_record(&m->kvp, k->ids, 0, k->len);
+                m->kv_len = k->len;
+                reuse = k->len;
+                g_pin_logit = k->logit; g_pin_use_logit = k->logit != NULL;
+                coli_pin_touch(&g_pins, s);
+                break;
+            }
+            k->len = 0;                    /* le righe non ci sono piu: scatto orfano */
+            s = coli_pin_best(&g_pins, ids, np);
+        }
+    }
+    g_echo_k = q->logprobs; g_echo_id = q->id; g_echo_tok = T;
     if (!reuse) kv_prefix_clear(&m->kvp);
     if (getenv("COLI_PREFIX_LOG")) {
         if (reuse)
@@ -1525,12 +1689,22 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     float *logit = step(m, ids + reuse, np - reuse, reuse);
     int hist_len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
+    if (q->pin && logit) {
+        coli_pin_pool_init(&g_pins, c->vocab);
+        if (coli_pin_store(&g_pins, ids, np, logit)) {
+            fprintf(stderr, "[PIN] scatto a %d token\n", np); fflush(stderr);
+        }
+    }
+    g_echo_k = 0; g_echo_id = NULL;   /* la lettura riguarda il prefill, non la decodifica */
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
         int nt = pick_tok(logit, c->vocab, -1);
+        char lptail[1024]; lptail[0] = 0;
+        if (q->logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, logit, c->vocab, nt, q->logprobs);
         free(logit); logit = NULL;
         if (is_stop(nt)) { limited = 0; break; }
         int nb = tok_decode(T, &nt, 1, buf, sizeof(buf)-1);
-        coli_serve_write_data(stdout, q->id, buf, (size_t)nb);
+        if (q->logprobs > 0) coli_serve_write_data_lp(stdout, q->id, buf, (size_t)nb, lptail);
+        else coli_serve_write_data(stdout, q->id, buf, (size_t)nb);
         gen++; hist_len++;
         while (coli_stdin_readable()) {
             int r = serve_read_cmd(stdin, stdout, q->id);
@@ -1648,6 +1822,14 @@ static void serve_loop(Model *m, Tok *T, int ctx_cap) {
         int fatal = serve_one(m, T, &q, ctx_cap);
         free(q.payload);
         if (fatal < 0) return;
+        /* Resend the grid after EVERY turn, not only after READY: at boot the
+         * expert cache is empty by definition, and that cold snapshot stayed
+         * the only one the dashboard ever saw -- all grey, RAM 0, everything
+         * on disk, forever. HITS was already per turn, which is why the white
+         * "routed now" flash worked while the residency colour never moved.
+         * inkling.c, kimi_k3.c, qwen38.c, deepseek_v41.c and colibri.c
+         * already do this. */
+        serve_tiers_emap(m);
     }
 }
 
@@ -1711,6 +1893,7 @@ int main(int argc, char **argv) {
         Tok T;
         char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
         tok_load(&T, tokpath);
+        coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&m, &T, ctx_cap);
         { const char *up = getenv("COLI_USAGE");
           if (up && *up) rt_save(up, 0); }

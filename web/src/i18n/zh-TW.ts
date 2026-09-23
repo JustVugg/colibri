@@ -41,11 +41,6 @@ const zhTW: Record<string, string> = {
   "sidebar.temperature": "溫度",
   "sidebar.maxTokens": "最大輸出 token 數",
   "sidebar.reasoning": "推理模式",
-  "sidebar.reasoning.off": "關閉",
-  "sidebar.reasoning.low": "低",
-  "sidebar.reasoning.medium": "中",
-  "sidebar.reasoning.high": "高",
-  "sidebar.reasoning.max": "最高",
   "sidebar.transport": "OpenAI 相容協定",
 
   "topbar.activeModel": "目前模型",
@@ -68,8 +63,6 @@ const zhTW: Record<string, string> = {
   "chat.colibri": "colibrì",
   "chat.placeholder": "傳送訊息給 colibrì…",
   "chat.inputHint": "Enter 傳送 · Shift+Enter 換行",
-  "chat.attachImage": "附加圖片",
-  "chat.removeImage": "移除圖片",
   "chat.stop": "停止生成",
   "chat.send": "傳送訊息",
 

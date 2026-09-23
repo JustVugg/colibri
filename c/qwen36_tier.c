@@ -40,8 +40,8 @@ static int  be_fp8_set_lut(const float *lut){ return coli_cuda_fp8_set_lut(lut);
 /* resident trunk pieces (lm_head, DeltaNet projections): one int8 per-row tensor each */
 static int  be_trunk_upload(QtTensor **t,const int8_t *q,const float *sc,int I,int O,int dev){
     return coli_cuda_tensor_upload(t,q,sc,1,I,O,dev); }
-static int  be_trunk_matmul(QtTensor **t,float *y,const float *x,int I,int O,int dev){
-    return coli_cuda_matmul(t,y,x,NULL,NULL,1,1,I,O,dev,0); }
+static int  be_trunk_matmul(QtTensor **t,float *y,const float *x,int S,int I,int O,int dev){
+    return coli_cuda_matmul(t,y,x,NULL,NULL,1,S,I,O,dev,0); }
 #elif defined(COLI_VULKAN)
 #include "backend_vulkan.h"
 #define QT_BACKEND    "Vulkan"
@@ -83,8 +83,8 @@ static int  be_trunk_upload(QtTensor **t,const int8_t *q,const float *sc,int I,i
     (void)t;(void)q;(void)sc;(void)I;(void)O;(void)dev;
     static int said=0; if(!said){ said=1; fprintf(stderr,"[qtier] trunk placement is CUDA-only; lm_head/projections stay on CPU\n"); }
     return 0; }
-static int  be_trunk_matmul(QtTensor **t,float *y,const float *x,int I,int O,int dev){
-    (void)t;(void)y;(void)x;(void)I;(void)O;(void)dev; return 0; }
+static int  be_trunk_matmul(QtTensor **t,float *y,const float *x,int S,int I,int O,int dev){
+    (void)t;(void)y;(void)x;(void)S;(void)I;(void)O;(void)dev; return 0; }
 #endif
 #include "tier.h"
 
@@ -121,7 +121,7 @@ static struct {
     QSlot *slot;                          /* [nl*ne] */
     pthread_mutex_t mx;
     pthread_t th;
-    int th_stop;
+    int th_stop, waiters;
     /* upload ring with staging copies */
     struct { int layer, eid; uint8_t *w; float *s; int v_layer, v_eid; } q[QT_QCAP];
     int qh, qt_, qn;
@@ -144,6 +144,13 @@ static struct {
     uint64_t tick, swaps, pf_hits, pf_notes;
     uint32_t *heat0;                      /* heat table loaded from HEAT_FILE */
 } G;
+
+/* Count parked callers so shutdown can reclaim their shared storage safely. */
+static void wait_take_locked(void){
+    G.waiters++;
+    pthread_cond_wait(&G.cv_take,&G.mx);
+    if(--G.waiters==0 && G.th_stop) pthread_cond_broadcast(&G.cv_take);
+}
 
 static QSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; }
 static int home(int eid){ return eid % G.ndev; }
@@ -233,7 +240,7 @@ static void *uploader(void *arg){
         pthread_cond_broadcast(&G.cv_take);          /* queue space available */
         if(ve>=0){
             /* LFRU swap: free the victim only when no group is in flight */
-            while(G.issue_open && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
+            while(G.issue_open && !G.th_stop) wait_take_locked();
             QSlot *v=qs(vl,ve);
             if(G.th_stop && G.issue_open){
                 /* Shutting down with a group still open: qt_take() -- the only
@@ -280,6 +287,11 @@ static void *uploader(void *arg){
               && be_upload(&td, w+2*mb, sc+2*G.sc_gu,fmt, G.Ih, G.D,  dv, G.egs);
         }
         free(w); free(sc);
+        if(!ok){
+            if(tg) be_free(tg);
+            if(tu) be_free(tu);
+            if(td) be_free(td);
+        }
         pthread_mutex_lock(&G.mx);
         QSlot *s=qs(layer,eid);
         if(ok){ s->tg=tg; s->tu=tu; s->td=td; s->resident=1; G.uploads++; }
@@ -483,6 +495,29 @@ static double auto_displaced_value(int di, size_t room, int k, size_t exp_bytes,
     return value;
 }
 
+/* Whether the trunk placement is the automatic one (COLI_PLACE unset or
+ * "auto"): the only decision the engine's startup probe may overturn. A
+ * hand-written list, or "off", is the user's word and stands. */
+int qt_place_is_auto(void){ return G_auto_on && auto_mode(); }
+
+/* Undo the automatic trunk placement: every offer back to the CPU, lm_head and
+ * the DeltaNet projections included, and the bytes it had taken back into each
+ * device's expert budget. The engine calls this BEFORE any trunk upload, when
+ * its startup probe measured the GPU GEMV slower than the CPU's: on four Tesla
+ * M10 every placed component lost, lm_head 68.8 ms against 41.7 on the CPU,
+ * decode 2.68 against 3.56 tok/s (#1652). Nothing to undo when the placement
+ * was not automatic. */
+void qt_trunk_withdraw(const char *why){
+    if(!qt_place_is_auto()) return;
+    size_t back = 0;
+    for(int o = 0; o < G_offer_n; o++) G_offer[o].dev = QT_PLACE_CPU;
+    G_auto_lmh = QT_PLACE_CPU; G_lmh.dev_ok = 0;
+    for(int l = 0; l < QT_DN_MAX_LAYERS; l++) G_auto_dnp[l] = QT_PLACE_CPU;
+    for(int i = 0; i < G.ndev; i++){ back += G_trunk_bytes[i]; G.budget[i] += G_trunk_bytes[i]; G_trunk_bytes[i] = 0; }
+    fprintf(stderr,"[place] trunk stays on the CPU (%s): %.2f GB of VRAM back to the experts\n",
+            why ? why : "withdrawn", back/1073741824.0);
+}
+
 static void auto_place(int nl, int ne, int topk, const size_t *capacity, const uint32_t *heat0){
     size_t room[QT_MAX_DEV];
     for(int i = 0; i < G.ndev; i++){ room[i] = capacity[i]; G_trunk_bytes[i] = 0; }
@@ -543,6 +578,7 @@ static const float *G_fp8_lut;
 static int G_upload_sync;             /* QT_UPLOAD_SYNC=1: qt_issue waits for in-flight uploads first (tests) */
 
 int qt_init_fp8(int nl, int ne, int D, int Ih, int cap, int topk, const float *e4m3_lut){
+    if(G.on) return 0;
     G_fp8_stream = 1; G_fp8_lut = e4m3_lut;
     int ok = qt_init(nl, ne, D, Ih, cap, topk, 0, 0);
     if(!ok) G_fp8_stream = 0;
@@ -569,6 +605,7 @@ static size_t dev_alloc_footprint(size_t bytes){
 
 int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             int expert_is_int4){
+    if(G.on) return 0;
     if(!be_enabled()) return 0;
     if(cap != ne && !G_fp8_stream){
         fprintf(stderr,"[qtier] cap=%d != n_experts=%d -> tier disabled (needs full RAM residency)\n",cap,ne);
@@ -608,7 +645,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
      * the caller repeat every device in COLI_GPUS as well -- forgetting that
      * would silently drop a component back to the CPU mid-A/B. */
     {
-        static const char *comps[] = {"lmhead","dnproj","dnout","attnproj"};
+        static const char *comps[] = {"lmhead","dnproj","dnout","attnproj","shexp"};
         for(size_t ci=0; ci<sizeof comps/sizeof *comps; ci++)
             for(int l=0; l<nl && G.ndev<QT_MAX_DEV; l++){
                 int d=qt_place_of(comps[ci],l);
@@ -664,8 +701,9 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
      * is the resident count. The 22-28 % the granularity costs is real; only
      * pooling experts into one arena per device would win it back (open). */
     size_t mat_bytes = G.wfmt==4 ? (size_t)D*Ih/2 : (size_t)D*Ih;
-    size_t scl_bytes = (2*G.sc_gu+G.sc_d)/3*sizeof(float);
-    G.exp_bytes = 3*dev_alloc_footprint(mat_bytes) + 3*dev_alloc_footprint(scl_bytes); /* + allocation slack */
+    G.exp_bytes = 3*dev_alloc_footprint(mat_bytes)
+                + 2*dev_alloc_footprint(G.sc_gu*sizeof(float))
+                + dev_alloc_footprint(G.sc_d*sizeof(float));
 
     /* Per-device allowance for tier + trunk: CUDA_EXPERT_GB when numeric,
      * (VK_EXPERT_GB on Vulkan), else free minus 1 GB headroom. The heat table is loaded here too (it
@@ -728,7 +766,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             else fprintf(stderr,"[qtier] lm_head-Device %d nicht verfuegbar -> CPU\n",ld);
         }
         /* every other component's devices, deduplicated */
-        static const char *comps[] = {"dnproj","dnout","attnproj"};
+        static const char *comps[] = {"dnproj","dnout","attnproj","shexp"};
         for(size_t ci=0; ci<sizeof comps/sizeof *comps; ci++)
             for(int l=0; l<nl; l++){
                 int d=qt_place_of(comps[ci],l);
@@ -750,7 +788,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             } else fprintf(stderr,"[place] experts=%d nicht verfuegbar -> COLI_GPUS bleibt\n",ed);
         } else if(!G_auto_on && G_place_n && qt_place_named("experts")){
             fprintf(stderr,"[place] experts=cpu -> VRAM-Tier aus\n");
-            return 0;
+            goto fail_storage;
         } else if(nres && !G_auto_on){
             int w=0;
             for(int i=0;i<G.ndev;i++){
@@ -789,25 +827,45 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
      * (#1339). The stride and G.is_k's row capacity are the same constant. */
     G.is_x_floats=(size_t)G.ndev*QT_MAX_ROWS*D;
     G.is_x=malloc(G.is_x_floats*sizeof(float));
+    if(!G.is_x) goto fail_storage;
 #if QT_SINGLE_DEV
     G.ybuf=malloc((size_t)QT_MAX_ROWS*D*sizeof(float));
-    if(!G.ybuf) return 0;
+    if(!G.ybuf) goto fail_storage;
 #endif
-    if(!G.is_x) return 0;
-    pthread_mutex_init(&G.mx,NULL); pthread_cond_init(&G.cv,NULL); pthread_cond_init(&G.cv_take,NULL);
+    if(pthread_mutex_init(&G.mx,NULL)) goto fail_storage;
+    if(pthread_cond_init(&G.cv,NULL)) goto fail_mutex;
+    if(pthread_cond_init(&G.cv_take,NULL)) goto fail_cv;
     qt_aff_get(&aff); qt_aff_widen(&aff);                  /* the uploader inherits this mask */
     int th_ok=pthread_create(&G.th,NULL,uploader,NULL)==0;
     qt_aff_restore(&aff);
-    if(!th_ok) return 0;
+    if(!th_ok) goto fail_cv_take;
     G.on=1;
     fprintf(stderr,"[qtier] %s VRAM expert tier active: %d device(s), %.2f MB/expert\n", QT_BACKEND,
             G.ndev, G.exp_bytes/1048576.0);
     /* The launcher and coli doctor recognise a Windows CUDA_DLL build by this
      * literal in the binary (they cannot read an import table for a DLL
      * loaded at run time); without it a working GPU build of this engine read
-     * as CPU-only and --gpu was refused (#1533). */
+     * as CPU-only and --gpu was refused (#1533). A Vulkan build must not carry
+     * it, or doctor.py would read that binary as a CUDA one. */
+#if defined(COLI_CUDA)
     fprintf(stderr,"[CUDA] mode: routed experts (qwen36 VRAM tier)\n");
+#endif
     return 1;
+
+fail_cv_take:
+    pthread_cond_destroy(&G.cv_take);
+fail_cv:
+    pthread_cond_destroy(&G.cv);
+fail_mutex:
+    pthread_mutex_destroy(&G.mx);
+fail_storage:
+    free(G.is_x); G.is_x=NULL; G.is_x_floats=0;
+    free(G.ybuf); G.ybuf=NULL;
+    free(G.heat0); G.heat0=NULL;
+    free(G.slot); G.slot=NULL;
+    G_lmh.dev_ok=0;
+    /* CUDA contexts may also serve standalone dense projections. */
+    return 0;
 }
 
 int qt_ready(void){ return G.on; }
@@ -861,28 +919,38 @@ int qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device){
     G_dense_n++;
     return h;
 }
-int qt_dense_matmul(int h, float *y, const float *x, int I, int O){
-    if(h < 0 || h >= G_dense_n || !G_dense[h].on) return 0;
-    if(be_trunk_matmul(&G_dense[h].t, y, x, I, O, G_dense[h].dev)) return 1;
+int qt_dense_matmul_batch(int h, float *y, const float *x, int S, int I, int O){
+    if(h < 0 || h >= G_dense_n || !G_dense[h].on || S <= 0) return 0;
+    if(be_trunk_matmul(&G_dense[h].t, y, x, S, I, O, G_dense[h].dev)) return 1;
     fprintf(stderr,"[dense] handle %d GPU matmul failed; CPU from here on\n", h);
     G_dense[h].on = 0;
     return 0;
 }
+int qt_dense_matmul(int h, float *y, const float *x, int I, int O){
+    return qt_dense_matmul_batch(h, y, x, 1, I, O);
+}
 int qt_dense_count(void){ return G_dense_n; }
 
-int qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
-    if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on) return 0;
-    if(be_trunk_matmul(&G_dnp[layer].t,y,x,I,O,G_dnp[layer].dev))
+int qt_dnproj_ready(int layer){
+    return layer >= 0 && layer < QT_DN_MAX_LAYERS && G_dnp[layer].on;
+}
+int qt_dnproj_matmul_batch(int layer, float *y, const float *x, int S, int I, int O){
+    if(!qt_dnproj_ready(layer) || S <= 0) return 0;
+    if(be_trunk_matmul(&G_dnp[layer].t,y,x,S,I,O,G_dnp[layer].dev))
         return 1;
     fprintf(stderr,"[dnp] layer %d GPU matmul failed; CPU from here on\n", layer);
     G_dnp[layer].on = 0;
     return 0;
 }
 
+int qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
+    return qt_dnproj_matmul_batch(layer, y, x, 1, I, O);
+}
+
 int qt_lmhead_matmul(float *y, const float *x, int I, int O){
     if(!G_lmh.on) return 0;
     /* cached-tensor path: upload params are ignored once *t exists */
-    if(be_trunk_matmul(&G_lmh.t,y,x,I,O,G_lmh.dev)) return 1;
+    if(be_trunk_matmul(&G_lmh.t,y,x,1,I,O,G_lmh.dev)) return 1;
     fprintf(stderr,"[lmh] GPU matmul failed; falling back to CPU from here on\n");
     G_lmh.on=0;
     return 0;
@@ -982,7 +1050,7 @@ void qt_note_block(int layer,int eid,
     pthread_mutex_lock(&G.mx);
     if(G_fp8_stream) stream_point(s,g4,u4,d4,gs,us,ds);
     else if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
-    while(G.qn>=QT_QCAP && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
+    while(G.qn>=QT_QCAP && !G.th_stop) wait_take_locked();
     enqueue_locked(layer,eid,-1,-1,0);
     if(G_fp8_stream) stream_forget(s);
     pthread_mutex_unlock(&G.mx);
@@ -1075,7 +1143,7 @@ void qt_note_planned(int layer,int eid,
     }
     if(G_fp8_stream) stream_point(s,g4,u4,d4,gs,us,ds);
     else if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
-    while(G.qn>=QT_QCAP && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
+    while(G.qn>=QT_QCAP && !G.th_stop) wait_take_locked();
     if(!enqueue_locked(layer,eid,-1,-1,1)){
         /* not enqueueable (e.g. already resident): return the reservation */
         if(s->planned) G.used[home(eid)]-=G.exp_bytes;
@@ -1094,7 +1162,7 @@ void qt_note_planned(int layer,int eid,
 void qt_fill_wait(void){
     if(!G.on) return;
     pthread_mutex_lock(&G.mx);
-    while(G.inflight>0 && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
+    while(G.inflight>0 && !G.th_stop) wait_take_locked();
     pthread_mutex_unlock(&G.mx);
 }
 
@@ -1143,7 +1211,8 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
      * did not get scheduled once before the run was over (0 uploads, 0 hits,
      * six entries still queued). No group is open here, so the wait cannot
      * meet a swap parked on issue_open. */
-    if(G_upload_sync) while(G.inflight>0 && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
+    if(G_upload_sync) while(G.inflight>0 && !G.th_stop) wait_take_locked();
+    if(G.th_stop){ pthread_mutex_unlock(&G.mx); return 0; }
     if(layer==0) qt_lfru_tick_locked();
     G.issue_open=1;
     for(int k=0;k<K;k++){
@@ -1171,25 +1240,25 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     return mask;
 }
 
-void qt_take(uint32_t mask,const float *val,int K,float *out){
+int qt_take(uint32_t mask,const float *val,int K,float *out){
     (void)K;
-    if(!G.on) return;
+    if(!G.on) return mask==0;
+    const float *result[QT_MAX_DEV]={0};
+    int ok=1;
+    /* Drain every device before deciding whether this layer is usable. */
     if(mask) for(int di=0;di<G.ndev;di++){
-        int c=G.is_cnt[di];
-        if(!c) continue;
-        const float *y=be_take(G.dev[di],G.ybuf);
-        if(!y){
-            static int warned=0;
-            if(!warned){
-                warned=1;
-                fprintf(stderr,"[qtier] %s take failed: those experts were skipped; backend may have disabled itself\n",QT_BACKEND);
-            }
-            G.is_cnt[di]=0;
-            continue;
+        if(!G.is_cnt[di]) continue;
+        result[di]=be_take(G.dev[di],G.ybuf);
+        if(!result[di]){
+            fprintf(stderr,"[qtier] dev %d: expert group result unavailable\n",G.dev[di]);
+            ok=0;
         }
-        for(int j=0;j<c;j++){
+    }
+    /* Do not publish a partial contribution when any device failed. */
+    for(int di=0;di<G.ndev;di++){
+        if(ok && result[di]) for(int j=0;j<G.is_cnt[di];j++){
             float w=val[G.is_k[di][j]];
-            const float *row=y+(size_t)j*G.D;
+            const float *row=result[di]+(size_t)j*G.D;
             for(int d=0;d<G.D;d++) out[d]+=w*row[d];
         }
         G.is_cnt[di]=0;
@@ -1198,6 +1267,7 @@ void qt_take(uint32_t mask,const float *val,int K,float *out){
     G.issue_open=0;
     pthread_cond_broadcast(&G.cv_take);
     pthread_mutex_unlock(&G.mx);
+    return ok;
 }
 
 void qt_stats(void){
@@ -1230,6 +1300,11 @@ void qt_stats(void){
 static void dense_free_all(void){
     for(int h = 0; h < G_dense_n; h++){ if(G_dense[h].t) be_free(G_dense[h].t); G_dense[h].t = NULL; G_dense[h].on = 0; }
     G_dense_n = 0;
+    if(G_lmh.t) be_free(G_lmh.t);
+    memset(&G_lmh,0,sizeof G_lmh);
+    for(int l=0;l<QT_DN_MAX_LAYERS;l++)
+        if(G_dnp[l].t) be_free(G_dnp[l].t);
+    memset(G_dnp,0,sizeof G_dnp);
 }
 void qt_shutdown(void){
     dense_free_all();
@@ -1250,17 +1325,30 @@ void qt_shutdown(void){
      * otherwise never notice th_stop and pthread_join below would hang (#1340). */
     pthread_mutex_lock(&G.mx); G.th_stop=1; pthread_cond_signal(&G.cv); pthread_cond_broadcast(&G.cv_take); pthread_mutex_unlock(&G.mx);
     pthread_join(G.th,NULL);
-    G.on=0;
-    G_fp8_stream=0;
-    /* Nothing has freed the resident experts: the Vulkan tier never reclaims a
-     * slice while running, and on CUDA the device reset hid the same omission.
-     * Release them before the backend goes, or vkDestroyDevice reports every
-     * weight buffer as leaked (VUID-vkDestroyDevice-device-05137). */
+    pthread_mutex_lock(&G.mx);
+    while(G.waiters) pthread_cond_wait(&G.cv_take,&G.mx);
+    pthread_mutex_unlock(&G.mx);
+    /* The uploader is stopped, but a decode group may still own the tensors. */
+    for(int di=0;di<G.ndev;di++)
+        if(G.is_cnt[di]) be_take(G.dev[di],G.ybuf);
     for(size_t i=0;i<(size_t)G.nl*G.ne;i++){
         QSlot *s=&G.slot[i];
-        if(s->tg)be_free(s->tg); if(s->tu)be_free(s->tu); if(s->td)be_free(s->td);
-        s->tg=s->tu=s->td=NULL; s->resident=0;
+        if(s->tg) be_free(s->tg);
+        if(s->tu) be_free(s->tu);
+        if(s->td) be_free(s->td);
     }
+    free(G.slot); G.slot=NULL;
+    free(G.is_x); G.is_x=NULL; G.is_x_floats=0;
+    free(G.ybuf); G.ybuf=NULL;
+    free(G.fill_order); G.fill_order=NULL;
+    free(G.heat0); G.heat0=NULL;
+    pthread_cond_destroy(&G.cv_take);
+    pthread_cond_destroy(&G.cv);
+    pthread_mutex_destroy(&G.mx);
+    G.issue_open=0;
+    memset(G.is_cnt,0,sizeof G.is_cnt);
+    G.on=0;
+    G_fp8_stream=0;
     be_shutdown();
 }
 

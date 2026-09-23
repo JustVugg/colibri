@@ -1060,7 +1060,25 @@ uint64_t coli_v4_os_available_memory(void) {
     /* No /proc and no _SC_AVPHYS_PAGES on macOS. "Available" is what the
      * kernel could hand out without swapping: free + inactive pages -- the
      * same approximation Activity Monitor reports, and the closest analogue
-     * of Linux's MemAvailable (which also counts reclaimable cache). */
+     * of Linux's MemAvailable (which also counts reclaimable cache).
+     *
+     * Two things a caller must know before trusting this number.
+     *
+     * It does NOT add purgeable_count, while inkling.c, kimi_k3.c, compat.h and
+     * telemetry.h all do. The same machine therefore reports a smaller figure
+     * here than through any other engine. Keep the two in mind together: they
+     * are not interchangeable.
+     *
+     * And "could hand out without swapping" is not "will keep resident".
+     * macOS answers memory pressure by COMPRESSING anonymous pages rather than
+     * swapping them, so a budget this function accepts can still end up half
+     * compressed, and every cache hit then pays a decompression. Swap stays at
+     * zero throughout, so a swap-based check sees nothing wrong. Reported and
+     * measured in issue #1614: on a 48 GB machine a 32 GiB budget decoded
+     * SLOWER than a 16 GiB one (0.96 vs 1.31 tok/s) while the hit rate rose
+     * monotonically. Sizing a cache from this number alone is therefore
+     * unsafe on Darwin; a fix needs vm.compressor_page_count, which this
+     * function does not read. */
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
     vm_statistics64_data_t vm;
     vm_size_t page = 0;
@@ -1350,7 +1368,7 @@ static int build_runtime_plan(ColiV4Engine *engine,
     uint64_t maximum_layer = 0, dense_total = 0;
     for (int layer = 0; layer < config->num_hidden_layers; layer++) {
         ColiDeepSeekV4LayerPlan layer_plan;
-        ColiDeepSeekV4LayerStats stats;
+        ColiDeepSeekV4LayerStats stats = {0};
         if (coli_v4_layer_plan(&layer_plan, config, layer,
                                error, error_size) ||
             coli_v4_layer_validate(&layer_plan, index, &stats,
@@ -8223,8 +8241,9 @@ static size_t hot_slot_index(const V4ExpertStoreState *state,
  *
  * FLOCK-packed checkpoints store [scales][weights] contiguously and need one
  * request.  Standard HF checkpoints keep the ranges apart: weights use direct
- * I/O while the much smaller scales use buffered pread.  Any direct-I/O error
- * falls back to the exact buffered path. */
+ * I/O while the much smaller scales use buffered pread.  REAP-style
+ * per_matrix records issue one window per scale/weight segment.  Any
+ * direct-I/O error falls back to the exact buffered path. */
 static uint64_t v4_direct_reads;
 static uint64_t v4_direct_flock_reads;
 static uint64_t v4_direct_payload_bytes;
@@ -8280,32 +8299,86 @@ static int v4_read_direct_window(const V4ExpertStoreState *state, int shard,
     return 0;
 }
 
+/* Direct window into an interior slab offset.  v4_read_direct_window bounces
+ * at slab[0], so a second per_matrix segment would clobber earlier bytes. */
+static int v4_read_direct_copy(const V4ExpertStoreState *state, int shard,
+                               int rep, unsigned char *destination,
+                               uint64_t offset, size_t length) {
+    if (!destination) return -1;
+    if (!length) return 0;
+    if (length > SIZE_MAX - 8192u) return -1;
+    unsigned char *bounce = NULL;
+    if (posix_memalign((void **)&bounce, 4096, length + 8192u)) return -1;
+    int result = v4_read_direct_window(state, shard, rep, bounce, offset,
+                                       length, 0);
+    if (!result) memcpy(destination, bounce, length);
+    compat_aligned_free(bounce);
+    return result;
+}
+
+static int v4_try_direct_segment(V4ExpertStoreState *state, int shard, int rep,
+                                 V4ExpertSlot *slot, uint64_t dest,
+                                 uint64_t offset, uint64_t bytes) {
+    if (!slot->aligned_slab ||
+        !coli_st_streaming_direct_available_rep(state->index, shard, rep))
+        return -1;
+    size_t length = (size_t)bytes;
+    if (dest == 0)
+        return v4_read_direct_window(state, shard, rep, slot->slab, offset,
+                                     length, 0);
+    return v4_read_direct_copy(state, shard, rep, slot->slab + dest, offset,
+                               length);
+}
+
+static int v4_read_per_matrix_segment(V4ExpertStoreState *state, int shard,
+                                      int rep, V4ExpertSlot *slot,
+                                      uint64_t dest, uint64_t offset,
+                                      uint64_t bytes, int *used_direct,
+                                      int *used_fallback) {
+    if (!v4_try_direct_segment(state, shard, rep, slot, dest, offset, bytes)) {
+        *used_direct = 1;
+        return 0;
+    }
+    if (slot->aligned_slab &&
+        coli_st_streaming_direct_available_rep(state->index, shard, rep))
+        *used_fallback = 1;
+    return coli_st_read_at_rep(state->index, shard, rep, offset, (size_t)bytes,
+                               slot->slab + dest);
+}
+
 static int v4_read_expert_record(V4ExpertStoreState *state,
                                  const V4ExpertRecord *record,
                                  V4ExpertSlot *slot, int rep) {
     if (record->per_matrix) {
-        int direct_available = slot->aligned_slab &&
-            coli_st_streaming_direct_available_rep(state->index, record->m_scale_shard[0], rep);
-        if (direct_available)
-            __atomic_fetch_add(&v4_direct_fallbacks, UINT64_C(1),
-                               __ATOMIC_RELAXED);
+        int used_direct = 0;
+        int used_fallback = 0;
         uint64_t scale_cursor = 0;
         for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
-            if (coli_st_read_at_rep(state->index, record->m_scale_shard[matrix], rep,
-                                    record->m_scale_offset[matrix],
-                                    (size_t)record->m_scale_bytes[matrix],
-                                    slot->slab + scale_cursor) != 0)
+            if (v4_read_per_matrix_segment(
+                    state, record->m_scale_shard[matrix], rep, slot,
+                    scale_cursor, record->m_scale_offset[matrix],
+                    record->m_scale_bytes[matrix], &used_direct,
+                    &used_fallback) != 0)
                 return -1;
             scale_cursor += record->m_scale_bytes[matrix];
         }
         uint64_t weight_cursor = scale_cursor;
         for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
-            if (coli_st_read_at_rep(state->index, record->m_weight_shard[matrix], rep,
-                                    record->m_weight_offset[matrix],
-                                    (size_t)record->m_weight_bytes[matrix],
-                                    slot->slab + weight_cursor) != 0)
+            if (v4_read_per_matrix_segment(
+                    state, record->m_weight_shard[matrix], rep, slot,
+                    weight_cursor, record->m_weight_offset[matrix],
+                    record->m_weight_bytes[matrix], &used_direct,
+                    &used_fallback) != 0)
                 return -1;
             weight_cursor += record->m_weight_bytes[matrix];
+        }
+        if (used_direct && !used_fallback) {
+            __atomic_fetch_add(&v4_direct_reads, UINT64_C(1), __ATOMIC_RELAXED);
+            __atomic_fetch_add(&v4_direct_payload_bytes, record->record_bytes,
+                               __ATOMIC_RELAXED);
+        } else if (used_fallback) {
+            __atomic_fetch_add(&v4_direct_fallbacks, UINT64_C(1),
+                               __ATOMIC_RELAXED);
         }
         return 0;
     }
@@ -8763,6 +8836,37 @@ int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key) {
     int result = slot ? (int)(slot - state->slots) : -1;
     pthread_mutex_unlock(&state->mutex);
     return result;
+}
+
+void coli_v4_test_reset_direct_io_stats(void) {
+    __atomic_store_n(&v4_direct_reads, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&v4_direct_flock_reads, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&v4_direct_payload_bytes, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&v4_direct_fallbacks, 0, __ATOMIC_RELAXED);
+}
+
+uint64_t coli_v4_test_direct_reads(void) {
+    return __atomic_load_n(&v4_direct_reads, __ATOMIC_RELAXED);
+}
+
+uint64_t coli_v4_test_direct_fallbacks(void) {
+    return __atomic_load_n(&v4_direct_fallbacks, __ATOMIC_RELAXED);
+}
+
+int coli_v4_test_force_streaming_direct(ColiExpertStore *store) {
+    if (!store || !store->state) return -1;
+    V4ExpertStoreState *state = store->state;
+    if (!state->index) return -1;
+    int enabled = 0;
+    for (int i = 0; i < state->index->nfd; i++) {
+        if (state->index->dfds[i] < 0 && state->index->fds[i] >= 0) {
+            int twin = dup(state->index->fds[i]);
+            if (twin < 0) return -1;
+            state->index->dfds[i] = twin;
+        }
+        if (state->index->dfds[i] >= 0) enabled = 1;
+    }
+    return enabled ? 0 : -1;
 }
 #endif
 
@@ -11617,6 +11721,7 @@ int coli_v4_prompt_build(char **output, size_t *output_length,
 #include "json.h"
 #include "native_quant.h"
 #include "serve_codec.h"
+#include "decode_batch.h"   /* coli_logprob_tail: the numeric channel's tail, same bytes as the other engines */
 #include "tok.h"
 
 static int load_embedding(float *state, const ColiSafetensorsIndex *index,
@@ -11754,55 +11859,39 @@ static int head_argmax(ColiV4Engine *engine, const float *hidden,
     g_v4_prof_head_s += spec_now() - t0;
     return result;
 }
-static int head_argmax_impl(ColiV4Engine *engine, const float *hidden,
+/* Every head score of one hidden row, in vocabulary order. head_argmax used
+ * to run this matmul and keep only the maximum; the numeric channel (SUBMIT
+ * logprobs=k, docs/brio.md) needs the whole row, so the row is computed here
+ * once and the argmax is a scan over it. Same head_bf16_dot per row, same scan
+ * order: the token picked and its logit do not change. */
+static int head_scores_impl(ColiV4Engine *engine, const float *hidden,
                             const ColiSafetensorsIndex *index,
-                            const ColiDeepSeekV4Config *config,
-                            int *best_token, float *best_logit) {
+                            const ColiDeepSeekV4Config *config, float *scores) {
     const ColiSafetensorsTensor *head = coli_st_find(index, "head.weight");
     int d = config->hidden_size, vocab = config->vocab_size;
-    if (!head || head->dtype != COLI_ST_BF16 || d < 1 || vocab < 1)
+    if (!head || head->dtype != COLI_ST_BF16 || d < 1 || vocab < 1 || !scores)
         return -1;
     int shard = coli_st_tensor_shard(index, head);
     size_t resident_bytes = (size_t)vocab * (size_t)d * sizeof(uint16_t);
     const uint16_t *resident = coli_v4_head_cache_data(
         engine, shard, (uint64_t)head->off, resident_bytes);
-
     /* The normal V4 memory plan keeps the BF16 head resident.  Compute all
      * rows in one OpenMP team directly from that allocation: the old tiled
      * path copied the complete ~1 GiB head and created ~2,000 teams per token.
      * Each row retains the same scalar accumulation order and the final scan
      * retains vocabulary order, so logits/tie-breaking do not change. */
     if (resident) {
-        float *scores = malloc((size_t)vocab * sizeof(*scores));
-        if (!scores) return -1;
         #pragma omp parallel for schedule(static)
         for (int row = 0; row < vocab; row++) {
             const uint16_t *weight = resident + (size_t)row * d;
             scores[row] = head_bf16_dot(weight, hidden, d);
         }
-        int winner = -1;
-        float maximum = -FLT_MAX;
-        for (int row = 0; row < vocab; row++)
-            if (scores[row] > maximum) {
-                maximum = scores[row];
-                winner = row;
-            }
-        free(scores);
-        *best_token = winner;
-        *best_logit = maximum;
-        return winner < 0 ? -1 : 0;
+        return 0;
     }
-
     /* Low-memory fallback: stream small row tiles exactly as before. */
     enum { ROWS = 64 };
     uint16_t *raw = malloc((size_t)ROWS * d * sizeof(*raw));
-    float *scores = malloc((size_t)ROWS * sizeof(*scores));
-    if (!raw || !scores) {
-        free(scores); free(raw);
-        return -1;
-    }
-    int winner = -1;
-    float maximum = -FLT_MAX;
+    if (!raw) return -1;
     for (int start = 0; start < vocab; start += ROWS) {
         int rows = vocab - start < ROWS ? vocab - start : ROWS;
         size_t bytes = (size_t)rows * d * sizeof(*raw);
@@ -11810,26 +11899,54 @@ static int head_argmax_impl(ColiV4Engine *engine, const float *hidden,
                 engine, index, shard,
                 (uint64_t)head->off + (uint64_t)start * d * sizeof(*raw),
                 bytes, raw)) {
-            free(scores); free(raw);
+            free(raw);
             return -1;
         }
         #pragma omp parallel for
         for (int row = 0; row < rows; row++) {
             const uint16_t *weight = raw + (size_t)row * d;
-            scores[row] = head_bf16_dot(weight, hidden, d);
+            scores[start + row] = head_bf16_dot(weight, hidden, d);
         }
-        for (int row = 0; row < rows; row++)
-            if (scores[row] > maximum) {
-                maximum = scores[row];
-                winner = start + row;
-            }
     }
-    free(scores); free(raw);
+    free(raw);
+    return 0;
+}
+/* First maximum in vocabulary order: the tie-break head_argmax always had. */
+static int head_scores_argmax(const float *scores, int vocab,
+                              int *best_token, float *best_logit) {
+    int winner = -1;
+    float maximum = -FLT_MAX;
+    for (int row = 0; row < vocab; row++)
+        if (scores[row] > maximum) {
+            maximum = scores[row];
+            winner = row;
+        }
     *best_token = winner;
     *best_logit = maximum;
     return winner < 0 ? -1 : 0;
 }
-
+static int head_argmax_impl(ColiV4Engine *engine, const float *hidden,
+                            const ColiSafetensorsIndex *index,
+                            const ColiDeepSeekV4Config *config,
+                            int *best_token, float *best_logit) {
+    int vocab = config->vocab_size;
+    if (vocab < 1) return -1;
+    float *scores = malloc((size_t)vocab * sizeof(*scores));
+    if (!scores) return -1;
+    int result = head_scores_impl(engine, hidden, index, config, scores);
+    if (!result) result = head_scores_argmax(scores, vocab, best_token, best_logit);
+    free(scores);
+    return result;
+}
+/* The whole row, under the same head-time meter as head_argmax. */
+static int head_scores(ColiV4Engine *engine, const float *hidden,
+                       const ColiSafetensorsIndex *index,
+                       const ColiDeepSeekV4Config *config, float *scores) {
+    double t0 = spec_now();
+    int result = head_scores_impl(engine, hidden, index, config, scores);
+    g_v4_prof_head_s += spec_now() - t0;
+    return result;
+}
 static int head_argmax_batch(ColiV4Engine *engine, const float *hidden,
                              const ColiSafetensorsIndex *index,
                              const ColiDeepSeekV4Config *config, int batch,
@@ -12633,6 +12750,8 @@ static void session_free_attention(ColiV4Session *session) {
 void coli_v4_session_destroy(ColiV4Session *session) {
     if (!session) return;
     kv_prefix_free(&session->fed);
+    free(session->pin_ids); free(session->pin_scores);
+    free(session->echo_hidden); free(session->echo_scores);
     session_free_attention(session);
     session_free_buffers(session);
     if (session->tokenizer_ready) {
@@ -13117,7 +13236,8 @@ int coli_v4_session_generate(ColiV4Session *session,
                              ColiV4SessionGenerateStats *stats_out,
                              char *error, size_t error_size) {
     if (!session || !session->engine || !prompt || !options ||
-        options->max_new_tokens < 1) {
+        (options->max_new_tokens < 1 &&
+         !(options->max_new_tokens == 0 && options->logprobs > 0))) {
         if (error && error_size)
             snprintf(error, error_size, "invalid V4 session generate arguments");
         return -1;
@@ -13225,6 +13345,34 @@ int coli_v4_session_generate(ColiV4Session *session,
             fprintf(stderr, "[PREFIX] hint boundary at %d tokens\n", ckpt_at);
     }
     session->prefix_reused = reuse;
+    /* The numeric channel (docs/brio.md). Scratch sized to the head, kept on
+     * the session so every early return below leaves nothing behind. */
+    const int vocab = config->vocab_size;
+    const int echo = options->logprobs > 0 && options->on_echo != NULL;
+    const int want_scores = echo || options->pin || options->on_scores != NULL;
+    if (want_scores && (!session->echo_hidden || !session->echo_scores)) {
+        free(session->echo_hidden);
+        free(session->echo_scores);
+        session->echo_hidden = malloc((size_t)config->hidden_size * sizeof(float));
+        session->echo_scores = malloc((size_t)vocab * sizeof(float));
+        if (!session->echo_hidden || !session->echo_scores) {
+            if (error && error_size)
+                snprintf(error, error_size, "out of memory for the logprob channel");
+            return -1;
+        }
+    }
+    /* Position `reuse` is the first fresh token, and its predictor lives in
+     * the state we continue from, which nothing below recomputes. When that
+     * state is the pinned prompt end, its scores were kept for exactly this: a
+     * closed-set caller pins the prompt, then asks about each option, and the
+     * option's first token is usually its only one. Any other reuse has no
+     * predictor to report; the caller sees the position missing, as with the
+     * other engines. */
+    if (echo && reuse > 0 && reuse < prompt_count && session->pin_scores &&
+        session->pin_len == reuse &&
+        !memcmp(session->pin_ids, session->prompt_ids, (size_t)reuse * sizeof(int)))
+        options->on_echo(options->scores_user_data, reuse,
+                         session->prompt_ids[reuse], session->pin_scores, vocab);
     if (reuse && getenv("V4_PREFIX_LOG"))
         fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens\n",
                 reuse, prompt_count);
@@ -13295,6 +13443,25 @@ int coli_v4_session_generate(ColiV4Session *session,
         }
         kv_prefix_record(&session->fed, session->prompt_ids + done_upto,
                          done_upto, seg);
+        /* Read-out of the prefill: row `item` of this segment is position
+         * done_upto+item and predicts the token at the next one. One head pass
+         * per row, paid only by the requests that opened the channel. */
+        if (echo) {
+            for (int item = 0; item < seg; item++) {
+                int at = done_upto + item + 1;
+                if (at >= prompt_count) break;
+                if (final_hidden(session->echo_hidden, state + (size_t)item * hd,
+                                 index, config, error, error_size) ||
+                    head_scores(engine, session->echo_hidden, index, config,
+                                session->echo_scores)) {
+                    kv_prefix_taint(&session->fed);
+                    return -1;
+                }
+                options->on_echo(options->scores_user_data, at,
+                                 session->prompt_ids[at], session->echo_scores,
+                                 vocab);
+            }
+        }
         done_upto += seg;
         session->fed.len = done_upto;
         tail_rows = seg;
@@ -13328,9 +13495,35 @@ int coli_v4_session_generate(ColiV4Session *session,
     int current = 0;
     float current_logit = 0.0f;
     if (final_hidden(hidden, last, index, config, error, error_size) ||
-        head_argmax(engine, hidden, index, config, &current, &current_logit)) {
+        (want_scores
+             ? (head_scores(engine, hidden, index, config, session->echo_scores) ||
+                head_scores_argmax(session->echo_scores, vocab, &current,
+                                   &current_logit))
+             : head_argmax(engine, hidden, index, config, &current,
+                           &current_logit))) {
         kv_prefix_taint(&session->fed);
         return -1;
+    }
+    if (options->pin) {
+        /* Keep what the snapshot cannot: the scores at the prompt end. The
+         * attention state goes to a v4_ckpt slot regardless of the size gate
+         * above: a pinned prompt is short by nature (a document and a
+         * question) and is about to be extended by every option. */
+        int *ids = realloc(session->pin_ids, (size_t)prompt_count * sizeof(int));
+        float *keep = realloc(session->pin_scores, (size_t)vocab * sizeof(float));
+        if (ids) session->pin_ids = ids;
+        if (keep) session->pin_scores = keep;
+        if (ids && keep) {
+            memcpy(session->pin_ids, session->prompt_ids,
+                   (size_t)prompt_count * sizeof(int));
+            memcpy(session->pin_scores, session->echo_scores,
+                   (size_t)vocab * sizeof(float));
+            session->pin_len = prompt_count;
+        } else {
+            session->pin_len = 0;        /* an optimisation, never an error */
+        }
+        if (v4_ckpt_min_tokens() && !v4_ckpt_have(session->prompt_ids, prompt_count))
+            v4_ckpt_store(session, prompt_count, 1);
     }
     /* The prompt is in the attention state from here on; record it before the
      * decode loop so a failure mid-generation still leaves fed describing what
@@ -13339,10 +13532,19 @@ int coli_v4_session_generate(ColiV4Session *session,
     session->fed.len = prompt_count;
     int generated_count = 0;
     int last_processed = prompt_count - 1;
-    generated[generated_count++] = current;
-    int done = session_emit_token(session, on_token, user_data, current,
+    /* max_new == 0 is the read-only request of the numeric channel: the
+     * prompt is in the state, its read-out went through on_echo, nothing is
+     * generated and `done` skips the loop; the tail then reports zero. */
+    int done = 1;
+    if (max_new > 0) {
+        generated[generated_count++] = current;
+        if (options->on_scores)
+            options->on_scores(options->scores_user_data, last_processed, current,
+                               session->echo_scores, vocab);
+        done = session_emit_token(session, on_token, user_data, current,
                                   current_logit, last_processed,
                                   generated_count, options->stop_at_sentence);
+    }
     double first_at = spec_now();
 
     int draft_limit = getenv("V4_DRAFT") ? atoi(getenv("V4_DRAFT")) : 0;
@@ -13354,7 +13556,11 @@ int coli_v4_session_generate(ColiV4Session *session,
 
     while (!done && generated_count < max_new) {
         int remaining = max_new - generated_count;
-        if (!options->no_dspark && !session->spec_disabled && remaining >= 3) {
+        /* A draft block accepts several tokens from one target pass and has
+         * no per-token scores to report, so the numeric channel takes the
+         * plain path: same greedy tokens, one head row each. */
+        if (!options->no_dspark && options->logprobs <= 0 &&
+            !session->spec_disabled && remaining >= 3) {
             int inputs[25] = {0}, drafts[24] = {0};
             int predictions[25] = {0};
             float logits[25] = {0};
@@ -13572,12 +13778,20 @@ int coli_v4_session_generate(ColiV4Session *session,
         session->state = state;
         session->next = next;
         if (final_hidden(hidden, state, index, config, error, error_size) ||
-            head_argmax(engine, hidden, index, config, &current, &current_logit)) {
+            (options->on_scores
+                 ? (head_scores(engine, hidden, index, config, session->echo_scores) ||
+                    head_scores_argmax(session->echo_scores, vocab, &current,
+                                       &current_logit))
+                 : head_argmax(engine, hidden, index, config, &current,
+                               &current_logit))) {
             kv_prefix_taint(&session->fed);
             return -1;
         }
         last_processed = position;
         generated[generated_count++] = current;
+        if (options->on_scores)
+            options->on_scores(options->scores_user_data, last_processed, current,
+                               session->echo_scores, vocab);
         done = session_emit_token(session, on_token, user_data, current,
                                   current_logit, last_processed,
                                   generated_count,
@@ -13792,6 +14006,8 @@ typedef struct {
     float top_p;
     int extension_bytes;
     int prefix_bytes;
+    int logprobs;      /* SUBMIT logprobs=k: 0 = channel closed (opt-in) */
+    int pin;           /* SUBMIT pin=1: keep the prompt end for the next prompts */
 } V4ServeRequest;
 
 typedef struct {
@@ -13799,6 +14015,8 @@ typedef struct {
     const char *request_id;
     int cancelled;
     int fatal;
+    int logprobs;
+    char tail[1024];   /* the next DATA frame's logprob tail, from on_scores */
 } V4ServeStream;
 
 static const ColiServeWireProfile v4_wire = {
@@ -13897,9 +14115,14 @@ static void v4_hwinfo_emit(void) {
      * contract the web UI was built against. Hence bytes/1e9, not bytes/2^30.
      *
      * Availability reuses coli_v4_os_available_memory() rather than repeating the detection:
-     * it already carries a Darwin branch (free + inactive + purgeable pages, the MemAvailable
-     * equivalent). Declared extern because the amalgamation compiles this file once per
-     * -DCOLI_V4_UNIT_*, so the definition need not be in this unit. */
+     * it already carries a Darwin branch. Declared extern because the amalgamation compiles
+     * this file once per -DCOLI_V4_UNIT_*, so the definition need not be in this unit.
+     *
+     * That branch returns free + inactive, NOT free + inactive + purgeable: this engine is
+     * deliberately one term more conservative than inkling.c, kimi_k3.c, compat.h and
+     * telemetry.h, which all add purgeable_count. Whoever changes one of the two formulas
+     * should know the other exists, or the same machine will report two different "free RAM"
+     * figures depending on which engine is asked. */
     {
         extern uint64_t coli_v4_os_available_memory(void);
         if (!cpu[0]) {
@@ -13929,9 +14152,14 @@ static void v4_hwinfo_emit(void) {
      * contract the web UI was built against. Hence bytes/1e9, not bytes/2^30.
      *
      * Availability reuses coli_v4_os_available_memory() rather than repeating the detection:
-     * it already carries a Darwin branch (free + inactive + purgeable pages, the MemAvailable
-     * equivalent). Declared extern because the amalgamation compiles this file once per
-     * -DCOLI_V4_UNIT_*, so the definition need not be in this unit. */
+     * it already carries a Darwin branch. Declared extern because the amalgamation compiles
+     * this file once per -DCOLI_V4_UNIT_*, so the definition need not be in this unit.
+     *
+     * That branch returns free + inactive, NOT free + inactive + purgeable: this engine is
+     * deliberately one term more conservative than inkling.c, kimi_k3.c, compat.h and
+     * telemetry.h, which all add purgeable_count. Whoever changes one of the two formulas
+     * should know the other exists, or the same machine will report two different "free RAM"
+     * figures depending on which engine is asked. */
     {
         extern uint64_t coli_v4_os_available_memory(void);
         if (!cpu[0]) {
@@ -14021,6 +14249,8 @@ static int v4_serve_read_request(FILE *input, FILE *output,
     request->top_p = command.top_p;
     request->extension_bytes = (int)command.extension_bytes;
     request->prefix_bytes = prefix_bytes;
+    request->logprobs = command.logprobs;
+    request->pin = command.pin;
     coli_serve_command_dispose(&command);
     return 2;
 }
@@ -14064,8 +14294,15 @@ static int v4_serve_token(void *user_data, int token, float logit,
         char piece[1024];
         int bytes = tok_decode(&stream->session->tokenizer, &token, 1,
                                piece, (int)sizeof(piece) - 1);
-        v4_serve_data(stdout, stream->request_id, piece, bytes);
+        /* With the channel open the frame carries the tail on_scores left
+         * here: "DATA <id> <n> <lp> <k> [tid tlp]*k", one frame per token. */
+        if (stream->logprobs > 0 && bytes > 0)
+            coli_serve_write_data_lp(stdout, stream->request_id, piece,
+                                     (size_t)bytes, stream->tail);
+        else
+            v4_serve_data(stdout, stream->request_id, piece, bytes);
     }
+    stream->tail[0] = 0;
     if (v4_serve_drain_commands(stream)) {
         stream->cancelled = 1;
         return 1;
@@ -14099,6 +14336,34 @@ static void v4_serve_done(FILE *output, const char *id, int completion,
     ColiServeDone done = {completion, tokens_per_second, hit_rate, rss,
                           prompt_tokens, length_limited};
     coli_serve_write_done_i32_suffix(output, id, &done, &prefix_reused, 1);
+}
+
+/* ECHO frame of the numeric channel, the same bytes the other engines'
+ * serve_echo writes: "ECHO <id> <n> <pos> <lp> <k> [tid tlp]*k" and the
+ * token's bytes DATA-framed after it. `scores` are raw head logits;
+ * coli_logprob_tail does the normalisation and the top-k. */
+static void v4_serve_echo(void *user_data, int position, int token,
+                          const float *scores, int vocab) {
+    V4ServeStream *stream = user_data;
+    char tail[1024], piece[1024];
+    coli_logprob_tail(tail, sizeof tail, scores, vocab, token, stream->logprobs);
+    int bytes = tok_decode(&stream->session->tokenizer, &token, 1, piece,
+                           (int)sizeof(piece) - 1);
+    if (bytes < 0) bytes = 0;
+    printf("ECHO %s %d %d%s\n", stream->request_id, bytes, position, tail);
+    if (bytes > 0) fwrite(piece, 1, (size_t)bytes, stdout);
+    fputc('\n', stdout);
+    fflush(stdout);
+}
+
+/* The tail of the next DATA frame, computed while the scores exist and
+ * written by v4_serve_token right after. */
+static void v4_serve_scores(void *user_data, int position, int token,
+                            const float *scores, int vocab) {
+    (void)position;
+    V4ServeStream *stream = user_data;
+    coli_logprob_tail(stream->tail, sizeof stream->tail, scores, vocab, token,
+                      stream->logprobs);
 }
 
 static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
@@ -14162,7 +14427,7 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0;
     double block_before = g_v4_prof_block_s, head_before = g_v4_prof_head_s;
     long long forwards_before = g_v4_prof_forwards;
-    V4ServeStream stream = {session, request->id, 0, 0};
+    V4ServeStream stream = {session, request->id, 0, 0, request->logprobs, {0}};
     ColiV4SessionGenerateStats stats = {0};
     char error[512] = {0};
     double started = spec_now();
@@ -14175,6 +14440,11 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
             .should_abort = v4_serve_abort,
             .abort_user_data = &stream,
             .prefix_bytes = (size_t)request->prefix_bytes,
+            .logprobs = request->logprobs,
+            .pin = request->pin,
+            .on_echo = request->logprobs > 0 ? v4_serve_echo : NULL,
+            .on_scores = request->logprobs > 0 ? v4_serve_scores : NULL,
+            .scores_user_data = &stream,
         },
         v4_serve_token, &stream, &stats, error, sizeof(error));
     double elapsed = spec_now() - started;
@@ -14191,6 +14461,7 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     int completion = stats.generated_tokens - (stats.eos_stopped ? 1 : 0);
     if (completion < 0) completion = 0;
     int length_limited = !stream.cancelled && !stats.eos_stopped &&
+                         request->max_tokens > 0 &&   /* a read-only request is not cut short */
                          stats.generated_tokens >= request->max_tokens;
     double decode = stats.decode_sec > 0.0 ? stats.decode_sec : elapsed;
     /* Trailing field: prompt tokens served from the previous turn's attention

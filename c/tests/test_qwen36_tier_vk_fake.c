@@ -156,7 +156,14 @@ int main(void) {
     check(fake_vk_uploads == before, "the dense refusal must not touch the backend either");
 
     /* ---- 7. shutdown -------------------------------------------------- */
+    /* every resident expert's three tensors go back through coli_vk_tensor_free
+     * before the device does, or vkDestroyDevice reports them as leaked */
+    int resident = 0;
+    for (size_t i = 0; i < (size_t)G.nl * G.ne; i++) resident += G.slot[i].resident;
+    int frees = fake_vk_frees;
     qt_shutdown();
+    check(resident > 0 && fake_vk_frees - frees == 3 * resident,
+          "shutdown must free every resident expert through the Vulkan backend");
     check(fake_vk_shutdowns == 1, "coli_vk_shutdown should be called exactly once");
     check(G.on == 0, "the tier should be off after shutdown");
 

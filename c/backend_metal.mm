@@ -767,7 +767,7 @@ static size_t fmt_bytes(int fmt, int I, int O) {
 // Grouped-int4 (fmt=4) scale-array size: one f32 per gsz-element group, per row -> O*ceil(I/gsz).
 // fp8 (fmt=8) scale-array size: one f32 per 128x128 BLOCK -> ceil(O/128)*ceil(I/128) (2D,
 // not per-row -- quant.h isn't included here, so the ceil-div is inlined rather than sharing
-// colibri.c's qt_scale_bytes/quant.h's fp8_nblk). The block is a fixed 128x128, so gs is
+// colibri.c's qt_scale_bytes/fp8_format.h's fp8_nblk). The block is a fixed 128x128, so gs is
 // ignored for fmt==8. f32 is this build's implemented scale
 // ENCODING for fmt=8 (see quant.h/colibri.c) -- this file has no reason to know that a
 // UE8M0 encoding exists at all: qt_resolve_fmt refuses it on the CPU read path before any
@@ -819,6 +819,16 @@ extern "C" int coli_metal_init(void) {
     if (e && atoi(e) == 0) g_rtop8_par = 0; }
   @autoreleasepool {
     g_dev = MTLCreateSystemDefaultDevice();
+    // MTLCreateSystemDefaultDevice() resolves the *display* device, so it is nil with no
+    // window-server session (ssh, CI, a launchd job) and on Intel Macs whose GPU is not the
+    // system default -- the card is still there and MTLCopyAllDevices() enumerates it. Prefer
+    // a non-low-power device, the same discrete>integrated ranking backend_vulkan.c applies,
+    // so a dual-GPU Mac does not land on the iGPU.
+    if (!g_dev) {
+      NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();     // NS_RETURNS_RETAINED, ARC releases
+      for (id<MTLDevice> d in all) if (![d isLowPower]) { g_dev = d; break; }
+      if (!g_dev && [all count]) g_dev = [all objectAtIndex:0];
+    }
     if (!g_dev) return 0;
     g_queue = [g_dev newCommandQueue];
     NSError *err = nil;

@@ -2,488 +2,577 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>colibrì — run models bigger than your machine</title>
-<meta name="description" content="An inference engine in pure C that streams Mixture-of-Experts weights from disk. A 2.8-trillion-parameter model runs on a 32 GB box. Nine model families, zero dependencies, CPU or GPU.">
-<meta property="og:title" content="colibrì — run models bigger than your machine">
-<meta property="og:description" content="Nine frontier MoE families, up to 2.8T parameters, on consumer hardware: pure C, zero dependencies, experts tiered across VRAM, RAM and disk. Run it, study it, improve it.">
+<meta name="viewport" content="width=1280">
+<title>colibri</title>
+<meta name="description" content="Run frontier open models on hardware you already own. A dependency-free C engine that streams mixture-of-experts weights from disk.">
+<meta property="og:title" content="colibri">
+<meta property="og:description" content="Run frontier open models on hardware you already own. Nine families, up to 2.8T parameters, pure C, zero dependencies.">
 <meta property="og:type" content="website">
-<meta property="og:image" content="https://raw.githubusercontent.com/JustVugg/colibri/main/docs/media/colibri-atlas.png">
 <link rel="icon" type="image/svg+xml" href="colibri-icon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=Bytesized&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Bytesized&family=Figtree:wght@400;500;600&display=swap" rel="stylesheet">
+<script>
+/* Theme picked before first paint, so it never flashes. Mechanism from
+   sparshsingh12312's PR #1551: same localStorage key, same data-theme
+   attribute, same "D" shortcut. */
+(function(){
+  try{
+    var saved=localStorage.getItem('colibri_theme');
+    var prefersDark=window.matchMedia('(prefers-color-scheme: dark)').matches;
+    document.documentElement.setAttribute('data-theme', saved ? saved : (prefersDark?'dark':'light'));
+  }catch(e){}
+})();
+</script>
 <style>
 :root{
-  --bg:#FCFCFB; --panel:#F4F4F1; --card:#FFFFFF;
-  --ink:#101010; --ink2:#43433F; --gray:#71716B; --faint:#A2A29B;
-  --dark:#0E0E0C; --on-dark:#F1F1ED; --on-dark-dim:#9C9C95;
-  --hair:#E6E6E2; --line:#D9D9D4; --teal:#087A63;
-  --sans:'Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-  --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-  --maxw:1200px;
+  --fg:#000; --body:#262626; --dim:#737373; --faint:#a3a3a3;
+  --line:#e5e5e5; --soft:#f5f5f5; --softer:#fafafa;
+  --sys:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --sans:'Figtree',var(--sys);
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.55;
-  -webkit-font-smoothing:antialiased;overflow-x:hidden;font-size:17px}
+body{background:#fff;color:var(--fg);font:400 16px/1.5 var(--sans);-webkit-font-smoothing:antialiased}
 a{color:inherit;text-decoration:none}
-::selection{background:rgba(8,122,99,.14)}
-.wrap{max-width:var(--maxw);margin:0 auto;padding:0 clamp(1.3rem,4vw,2.6rem)}
-.mono{font-family:var(--mono)}
+.wide{max-width:80rem;margin:0 auto;padding:0 2rem}
+.mid{max-width:64rem;margin:0 auto;padding:0 2rem}
+.narrow{max-width:42rem;margin:0 auto;padding:0 1.5rem}
 
-/* nav */
-nav{position:fixed;inset:0 0 auto 0;z-index:50;background:rgba(252,252,251,.88);backdrop-filter:blur(10px);transition:border-color .25s;border-bottom:1px solid transparent}
-nav.on{border-color:var(--hair)}
-nav .in{max-width:var(--maxw);margin:0 auto;display:flex;align-items:center;padding:.85rem clamp(1.3rem,4vw,2.6rem)}
-nav .brand{display:flex;align-items:center}
-nav .brand .mark{display:flex;transition:transform .4s cubic-bezier(.4,0,.2,1)}
-nav .brand .mark svg{width:40px;height:40px;display:block}
-nav.on .brand .mark{transform:scale(1.06)}
-nav .brand .word{font-family:'Bytesized',var(--sans);font-weight:400;font-size:2.3em;letter-spacing:.02em;text-transform:uppercase;line-height:1;margin-left:.6rem;
-  max-width:16rem;opacity:1;overflow:hidden;white-space:nowrap;
-  transition:max-width .45s cubic-bezier(.4,0,.2,1),opacity .3s,margin-left .45s cubic-bezier(.4,0,.2,1)}
-nav.on .brand .word{max-width:0;opacity:0;margin-left:0}
-nav .nl{margin-left:auto;display:flex;gap:2rem;align-items:center;font-weight:500;font-size:.96rem}
-nav .nl a:not(.btn){color:var(--ink2)} nav .nl a:not(.btn):hover{color:var(--ink)}
-.btn{font-family:var(--sans);font-weight:600;font-size:.94rem;display:inline-flex;align-items:center;gap:.45rem;
-  background:var(--ink);color:var(--bg);padding:.62rem 1.2rem;border-radius:8px;transition:.15s;border:1.5px solid var(--ink)}
-.btn:hover{background:#000;border-color:#000}
-.btn.ghost{background:transparent;color:var(--ink);border-color:var(--line)}
-.btn.ghost:hover{background:transparent;border-color:var(--ink)}
-@media(max-width:820px){nav .nl a:not(.btn){display:none}}
+/* header */
+header{position:sticky;top:0;z-index:40;background:#fff}
+.hin{display:flex;align-items:center;gap:1.5rem;height:4rem;max-width:90rem;margin:0 auto;padding:0 1.5rem}
+.brand{display:flex;align-items:center;gap:.55rem;flex:none}
+.brand svg{width:30px;height:27px;display:block}
+.brand b{font-family:'Bytesized',var(--sans);font-weight:400;font-size:1.7rem;line-height:1;text-transform:uppercase;letter-spacing:.03em}
+.hnav{display:flex;gap:1.5rem;font-size:1rem;font-weight:500;flex:none}
+.hnav a:hover{color:var(--dim)}
+.hsearch{flex:1;max-width:38rem;margin:0 auto;display:flex;align-items:center;gap:.5rem;
+  background:var(--soft);border-radius:9999px;padding:.6rem 1rem}
+.hsearch svg{width:16px;height:16px;color:var(--dim);flex:none}
+.hsearch input{flex:1;border:0;outline:0;background:none;font:400 14px var(--sans);color:var(--fg)}
+.hsearch input::placeholder{color:var(--dim)}
+.hright{display:flex;align-items:center;gap:.55rem;flex:none}
+.pill{border-radius:9999px;padding:.6rem 1.15rem;font-size:15px;font-weight:500;display:inline-block}
+.pill.g{background:var(--soft)} .pill.g:hover{background:#ececec}
+.pill.d{background:#171717;color:#fff} .pill.d:hover{background:#000}
+.pill.big{padding:.85rem 1.7rem;font-size:16px}
 
-/* hero — centered, one axis, nothing fighting for the eye */
-.hero{padding:10rem 0 5.5rem;text-align:center}
-.hero .kicker{font-family:var(--mono);font-size:.78rem;font-weight:500;letter-spacing:.14em;text-transform:uppercase;color:var(--teal)}
-.hero h1{font-weight:700;font-size:clamp(2.7rem,6.4vw,4.9rem);line-height:1.06;letter-spacing:-.028em;text-wrap:balance;
-  max-width:17ch;margin:1.1rem auto 0}
-.hero h1 u{text-decoration:none;border-bottom:.1em solid var(--teal);padding-bottom:.03em}
-.hero .sub{font-weight:400;font-size:clamp(1.08rem,1.55vw,1.25rem);line-height:1.6;color:var(--ink2);
-  max-width:42rem;margin:1.5rem auto 0;text-wrap:pretty}
-.hero .cta{display:flex;gap:.75rem;margin-top:2.3rem;flex-wrap:wrap;justify-content:center}
+/* hero */
+.hero{padding:5rem 0 3.5rem}
+.hgrid{display:grid;grid-template-columns:1.05fr .95fr;gap:3.5rem;align-items:center}
+.hero h1{font-size:4.25rem;line-height:1.04;font-weight:500;letter-spacing:-.035em;margin-bottom:1.5rem}
+.hero .sub{font-size:1.2rem;line-height:1.55;color:var(--dim);max-width:31rem;margin-bottom:2rem}
+.hcta{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap}
+.shot{margin:0}
+.shot video{display:block;width:100%;height:auto;border:1px solid var(--line);border-radius:12px;background:#0f1113}
+.shot figcaption{margin-top:.7rem;font-size:13.5px;line-height:1.5;color:var(--dim);max-width:34rem}
+.shot figcaption code{font:400 12.5px var(--mono);background:var(--soft);border-radius:4px;padding:1px 5px}
+.trust{text-align:center;color:var(--dim);font-size:.95rem;padding:1.5rem 0 1.4rem}
+.logos{display:flex;justify-content:center;gap:2.8rem;flex-wrap:wrap;color:#c8c8c8;
+  font-size:1rem;font-weight:600;letter-spacing:-.01em;padding-bottom:5.5rem}
 
-/* traction band — real, checkable numbers; mono + tabular so they line up */
-section.tract{padding:0}
-.tract{border-top:1px solid var(--hair);border-bottom:1px solid var(--hair);background:var(--panel)}
-.tract .in{max-width:var(--maxw);margin:0 auto;padding:2.2rem clamp(1.3rem,4vw,2.6rem);
-  display:grid;grid-template-columns:repeat(5,1fr);gap:1.5rem}
-@media(max-width:900px){.tract .in{grid-template-columns:repeat(2,1fr);gap:1.6rem}}
-.tract .n{font-family:var(--mono);font-weight:600;
-  font-size:clamp(1.5rem,3vw,2.05rem);letter-spacing:-.03em;font-variant-numeric:tabular-nums;line-height:1;color:var(--ink)}
-.tract .l{font-size:.8rem;letter-spacing:.05em;text-transform:uppercase;color:var(--gray);margin-top:.5rem;line-height:1.4}
-.tract .since{grid-column:1/-1;color:var(--ink2);font-size:1rem;
-  padding-top:.9rem;border-top:1px solid var(--line);margin-top:.4rem}
-.tract .since b{color:var(--teal);font-weight:600}
+/* rail sections */
+.rail{display:grid;grid-template-columns:15rem 1fr;gap:4rem;align-items:start;padding-bottom:6rem}
+.railnav{position:sticky;top:6rem}
+.railnav a{display:block;padding:.85rem 0;border-bottom:1px solid var(--line);color:var(--faint);font-size:1.05rem}
+.railnav a:first-child{border-top:1px solid var(--line)}
+.railnav a:hover{color:var(--dim)}
+.railnav a.on{color:var(--fg);border-bottom:2px solid var(--fg)}
+.block{padding:0 0 6.5rem}
+.block h2{font-size:2.6rem;font-weight:500;letter-spacing:-.03em;line-height:1.1;margin-bottom:1rem}
+.block .sub{font-size:1.1rem;line-height:1.55;color:var(--dim);max-width:38rem;margin-bottom:2.5rem}
+.src{color:var(--faint);font-size:.9rem;margin-top:1.4rem}
+.more{display:inline-block;margin-top:1.6rem;color:var(--dim);font-size:1rem;
+  border-bottom:1px solid var(--line);padding-bottom:2px}
+.more:hover{color:var(--fg);border-color:var(--fg)}
 
-/* dark blocks */
-.block-dark{background:var(--dark);color:var(--on-dark)}
-.block-dark .inner{max-width:860px;margin:0 auto;padding:clamp(4.5rem,10vh,7rem) clamp(1.3rem,4vw,2.6rem);text-align:center}
-.block-dark h2{font-weight:700;font-size:clamp(2rem,4.6vw,3.15rem);line-height:1.1;letter-spacing:-.025em;text-wrap:balance}
-.block-dark p{color:var(--on-dark-dim);font-size:1.1rem;max-width:38rem;margin:1.2rem auto 0;line-height:1.55}
-.block-dark .btn{background:var(--on-dark);color:var(--dark);border-color:var(--on-dark);margin-top:2rem}
-.block-dark .btn:hover{background:#fff;border-color:#fff}
-.atlas-block{position:relative;overflow:hidden;min-height:720px;display:flex;align-items:center}
-.atlas-block > canvas{position:absolute;inset:0;width:100%;height:100%;display:block;z-index:0;cursor:grab;touch-action:pan-y}
-.atlas-block::after{content:"";position:absolute;inset:0;z-index:1;pointer-events:none;
-  background:radial-gradient(ellipse 58% 46% at 50% 48%,rgba(14,14,12,.66),rgba(14,14,12,.12) 72%,transparent)}
-.atlas-block .inner{position:relative;z-index:2;pointer-events:none}
-.atlas-block .inner h2,.atlas-block .inner p{text-shadow:0 2px 26px rgba(14,14,12,.85),0 1px 5px rgba(14,14,12,.8)}
-.atlas-hint{position:absolute;bottom:1.3rem;left:50%;transform:translateX(-50%);z-index:2;pointer-events:none;
-  font-family:var(--mono);font-size:.72rem;color:var(--on-dark-dim);letter-spacing:.06em;text-align:center;padding:0 1rem}
+/* bar chart, their shape: label, black bar, right-aligned number */
+.chart{display:grid;gap:.55rem}
+.crow{display:grid;grid-template-columns:16.5rem 1fr auto;align-items:center;gap:1.2rem;font-size:15px}
+.crow .cl{color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.crow .cl s{text-decoration:none;color:var(--faint);font-size:13.5px;margin-left:.45rem}
+.ct{height:14px;background:var(--soft);border-radius:2px}
+.ct i{display:block;height:100%;background:#171717;border-radius:2px}
+.ct.lite i{background:#d4d4d4}
+.crow .cv{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;min-width:5.5rem}
+.crow .cv s{text-decoration:none;color:var(--faint);font-size:13.5px}
+.axis{display:grid;grid-template-columns:16.5rem 1fr auto;gap:1.2rem;margin-top:.4rem;font-size:13px;color:var(--faint)}
+.axis .cv{min-width:5.5rem}
 
-/* generic section */
-section{padding:clamp(4.5rem,9vh,7rem) 0}
-.overline{font-family:var(--mono);font-size:.76rem;font-weight:500;letter-spacing:.14em;text-transform:uppercase;color:var(--teal);margin-bottom:.9rem}
-.sec-h{font-weight:700;font-size:clamp(1.7rem,3.2vw,2.3rem);line-height:1.12;letter-spacing:-.025em;text-wrap:balance;margin-bottom:1.1rem}
-.lead{color:var(--ink2);max-width:44rem;font-size:clamp(1.05rem,1.5vw,1.18rem);line-height:1.62}
-.lead strong{color:var(--ink);font-weight:600}
+/* two-column compare table */
+.cmp{width:100%;border-collapse:collapse;font-size:15px;margin-top:.3rem}
+.cmp th{text-align:left;font-weight:400;color:var(--faint);font-size:13.5px;padding:0 1rem .7rem 0}
+.cmp th:last-child,.cmp td:last-child{text-align:right}
+.cmp td{padding:.85rem 1rem .85rem 0;border-top:1px solid var(--line);vertical-align:baseline}
+.cmp td.b{font-weight:500}
+.cmp td.x{color:var(--faint)}
 
-/* cards (models) */
-.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:1.2rem;margin-top:2.2rem}
-@media(max-width:900px){.cards{grid-template-columns:1fr}}
-.card{background:var(--card);border:1px solid var(--hair);border-radius:10px;padding:1.6rem 1.5rem 1.5rem;display:flex;flex-direction:column;transition:.16s}
-.card:hover{border-color:var(--ink);transform:translateY(-2px)}
-.card h3{font-weight:700;font-size:1.3rem;letter-spacing:-.02em;margin-bottom:.5rem}
-.card .desc{color:var(--ink2);font-size:.99rem;line-height:1.55;flex:1}
-.meta{margin-top:1.4rem}
-.meta .row{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;padding:.6rem 0;border-top:1px solid var(--hair)}
-.meta .k{font-weight:600;font-size:.68rem;letter-spacing:.09em;text-transform:uppercase;color:var(--gray)}
-.meta .v{font-family:var(--mono);font-size:.88rem;color:var(--ink)}
-.card .btn{margin-top:1.3rem;align-self:flex-start}
-.tags{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.9rem}
-.tag{font-family:var(--mono);font-size:.68rem;letter-spacing:.08em;text-transform:uppercase;color:var(--teal);border:1px solid var(--line);border-radius:999px;padding:.18rem .6rem}
+/* example cards */
+.exs{display:grid;grid-template-columns:repeat(3,1fr);gap:1.5rem;margin-top:2rem}
+.ex h3{font-size:1.05rem;font-weight:600;margin-bottom:.4rem}
+.ex p{color:var(--dim);font-size:.95rem;line-height:1.55}
+.ex .io{margin-top:.9rem;font:400 12.5px/1.9 var(--mono);color:var(--body);
+  background:var(--softer);border:1px solid var(--line);border-radius:8px;padding:.7rem .8rem}
+.ex .io b{color:var(--faint);font-weight:400}
+.code{background:#0a0a0a;color:#ededed;border-radius:12px;padding:1.2rem 1.4rem;
+  font:400 12px/1.8 var(--mono);margin-top:2rem}
 
-/* data list (hardware) */
-.dlist{margin-top:2.4rem;border-top:1px solid var(--hair)}
-.dlist a{display:grid;grid-template-columns:1fr auto;gap:1.5rem;align-items:center;
-  padding:1.15rem .2rem;border-bottom:1px solid var(--hair);transition:.14s}
-.dlist a:hover{padding-left:.7rem}
-.dlist .name{font-weight:600;font-size:1.06rem;letter-spacing:-.01em}
-.dlist .sub{color:var(--gray);font-size:.9rem;margin-top:.15rem}
-.dlist .spd{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:1.08rem;white-space:nowrap;text-align:right}
-.dlist .hi{color:var(--teal);font-weight:600}
-.dlistnote{color:var(--gray);margin-top:1.6rem;font-size:.98rem}
-.dlistnote a{border-bottom:1px solid var(--line)}
-.dlistnote a:hover{border-color:var(--ink)}
+.code pre{white-space:pre-wrap;word-break:break-word}
+.code .lbl{display:block;color:#737373;font-size:11px;letter-spacing:.08em;text-transform:uppercase;margin-bottom:.7rem}
+.code .s{color:#7dd3c0} .code .n{color:#e5a663} .code .k{color:#c4a1e8}
+.split2{display:grid;grid-template-columns:1fr 1fr;gap:1.6rem}
 
-/* split (build) */
-.split{display:grid;grid-template-columns:1fr 1.3fr;gap:3rem;align-items:start}
-@media(max-width:900px){.split{grid-template-columns:1fr;gap:1.5rem}}
-.split h2{font-weight:700;font-size:clamp(1.9rem,3.6vw,2.6rem);line-height:1.1;letter-spacing:-.028em;text-wrap:balance}
-.jlist{border-top:1px solid var(--hair)}
-.jlist a{display:grid;grid-template-columns:1fr auto;gap:1.5rem;align-items:baseline;padding:1.2rem .2rem;border-bottom:1px solid var(--hair);transition:.14s}
-.jlist a:hover{padding-left:.7rem}
-.jlist .t{font-weight:600;font-size:1.08rem}
-.jlist .c{font-family:var(--mono);color:var(--gray);font-size:.85rem;white-space:nowrap}
+/* models list */
+.msec{padding:1rem 0 6rem}
+.msec h2{font-size:2.6rem;font-weight:500;letter-spacing:-.03em;margin-bottom:.6rem}
+.msec .sub{color:var(--dim);font-size:1.05rem;margin-bottom:1.8rem;max-width:38rem}
+.fbar{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;margin-bottom:.5rem}
+.fp{font:400 14px var(--sans);color:var(--fg);background:#fff;border:1px solid var(--line);
+  border-radius:9999px;padding:.4rem .95rem;cursor:pointer}
+.fp:hover{background:var(--softer)} .fp.on{background:#171717;color:#fff;border-color:#171717}
+.mrow{padding:1.5rem 0;border-bottom:1px solid var(--line)}
+.mrow:first-child{border-top:1px solid var(--line)}
+.mrow h3{font-size:1.5rem;font-weight:500;line-height:2rem}
+.mrow h3 a:hover{text-decoration:underline}
+.mrow .d{font-size:1rem;line-height:1.5rem;color:var(--body);margin-top:.15rem}
+.tg{display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.75rem}
+.tg span{font-size:13px;border-radius:6px;padding:2px 8px;line-height:1.35;color:#4f46e5;background:#eef2ff}
+.tg span.b{color:#2563eb;background:#eff6ff} .tg span.e{color:#059669;background:#ecfdf5}
+.tg span.a{color:#b45309;background:#fffbeb} .tg span.r{color:#e11d48;background:#fff1f2}
+.tg span.g{color:#525252;background:#f5f5f5}
+.mm{display:flex;gap:1.1rem;flex-wrap:wrap;margin-top:.8rem;font-size:14px;color:var(--dim)}
+.mm span,.mm a{display:inline-flex;align-items:center;gap:.35rem}
+.mm svg{width:15px;height:15px;flex:none}
+.mm a{text-decoration:underline;text-decoration-color:var(--line);text-underline-offset:3px}
+.mm a:hover{color:var(--fg);text-decoration-color:currentColor}
+.mget{display:flex;gap:.5rem;margin-top:.9rem;align-items:stretch}
+.mget code{flex:1;min-width:0;font:400 13px var(--mono);color:var(--body);background:var(--softer);
+  border:1px solid var(--line);border-radius:8px;padding:.5rem .7rem;white-space:pre-wrap;word-break:break-all}
+.cp{font:400 13px var(--sans);color:var(--dim);background:#fff;border:1px solid var(--line);
+  border-radius:8px;padding:.5rem .8rem;cursor:pointer;flex:none}
+.cp:hover{background:var(--softer);color:var(--fg)}
+.mnone{color:var(--dim);padding:2rem 0}
 
-/* terminal — this is a command-line tool; show the command line */
-.term{background:var(--dark);border-radius:12px;overflow:hidden;box-shadow:0 18px 40px -24px rgba(14,14,12,.5)}
-.term .bar{display:flex;align-items:center;gap:.45rem;padding:.7rem .9rem;border-bottom:1px solid rgba(241,241,237,.1)}
-.term .bar i{width:10px;height:10px;border-radius:50%;background:#33332F;display:block}
-.term .bar span{margin-left:.5rem;font-family:var(--mono);font-size:.72rem;color:var(--on-dark-dim);letter-spacing:.04em}
-.term pre{margin:0;padding:1.15rem 1.2rem 1.3rem;overflow-x:auto;
-  font-family:var(--mono);font-size:.86rem;line-height:1.75;color:var(--on-dark)}
-.term .p{color:#12B08D;user-select:none}
-.term .c{color:var(--on-dark-dim)}
+/* closing + footer */
+.closing{text-align:center;padding:6rem 0 7rem}
+.closing svg{width:78px;height:70px;margin:0 auto 2rem;display:block}
+.closing h2{font-size:3.25rem;font-weight:500;letter-spacing:-.035em;line-height:1.08;max-width:22ch;margin:0 auto 2rem}
+footer{border-top:1px solid var(--line)}
+.fin{display:flex;align-items:center;gap:1.5rem;max-width:90rem;margin:0 auto;padding:1.5rem;
+  font-size:14px;color:var(--dim);flex-wrap:wrap}
+.fin .sp{margin-left:auto;display:flex;gap:1.5rem;flex-wrap:wrap}
+.fin a:hover{color:var(--fg)}
 
-/* footer */
-footer{background:var(--dark);color:var(--on-dark-dim);padding:4rem 0 3rem}
-.fgrid{display:grid;grid-template-columns:1.3fr repeat(3,1fr);gap:2rem}
-@media(max-width:820px){.fgrid{grid-template-columns:1fr 1fr}}
-footer .mono-mark svg{width:52px;height:52px}
-footer h4{color:var(--on-dark);font-weight:700;font-size:.95rem;margin-bottom:1rem}
-footer ul{list-style:none;display:flex;flex-direction:column;gap:.7rem}
-footer li a{color:var(--on-dark-dim);font-size:.95rem}
-footer li a:hover{color:var(--on-dark)}
-.fbot{max-width:var(--maxw);margin:2.8rem auto 0;padding:1.6rem clamp(1.3rem,4vw,2.6rem) 0;border-top:1px solid #262622;
-  display:flex;gap:1.2rem;flex-wrap:wrap;font-size:.88rem;color:var(--on-dark-dim)}
-.fbot .sp{margin-left:auto}
+/* ---- dark theme ---------------------------------------------------------- */
+[data-theme="dark"]{
+  --fg:#f5f5f5; --body:#d4d4d4; --dim:#a3a3a3; --faint:#6e6e6e;
+  --line:#262626; --soft:#1c1c1c; --softer:#141414;
+}
+[data-theme="dark"] body{background:#0a0a0a}
+[data-theme="dark"] header{background:#0a0a0a}
+[data-theme="dark"] .pill.d{background:#f5f5f5;color:#0a0a0a}
+[data-theme="dark"] .pill.d:hover{background:#fff}
+[data-theme="dark"] .pill.g:hover{background:#242424}
+[data-theme="dark"] .mget code,[data-theme="dark"] .mget code,
+[data-theme="dark"] .ex .io{background:var(--softer);border-color:var(--line)}
+[data-theme="dark"] .shot figcaption code{background:var(--soft)}
+[data-theme="dark"] .ct i{background:#f5f5f5}
+[data-theme="dark"] .ct.lite i{background:#4a4a4a}
+[data-theme="dark"] .code{background:#141414;border:1px solid var(--line)}
+[data-theme="dark"] .cp,[data-theme="dark"] .fp{background:#0a0a0a}
+[data-theme="dark"] .cp:hover,[data-theme="dark"] .fp:hover{background:#1c1c1c}
+[data-theme="dark"] .fp.on{background:#f5f5f5;color:#0a0a0a;border-color:#f5f5f5}
+[data-theme="dark"] .railnav a.on{border-bottom-color:var(--fg)}
+[data-theme="dark"] .logos{color:#3d3d3d}
+[data-theme="dark"] .tg span{color:#a5b4fc;background:#1e1b4b}
+[data-theme="dark"] .tg span.b{color:#93c5fd;background:#172554}
+[data-theme="dark"] .tg span.e{color:#6ee7b7;background:#022c22}
+[data-theme="dark"] .tg span.a{color:#fcd34d;background:#292008}
+[data-theme="dark"] .tg span.r{color:#fda4af;background:#2d0d16}
+[data-theme="dark"] .tg span.g{color:#a3a3a3;background:#1f1f1f}
+/* the 300ms cross-fade while the theme changes, and nothing else animated */
+.theme-transition,.theme-transition *{transition:background-color .3s ease,color .3s ease,border-color .3s ease !important}
 
-.reveal{opacity:0;transform:translateY(20px);transition:opacity .6s ease,transform .6s ease}
-.reveal.in{opacity:1;transform:none}
-@media(prefers-reduced-motion:reduce){.reveal{opacity:1;transform:none}}
+/* toggle */
+.tt{width:38px;height:38px;flex:none;display:inline-flex;align-items:center;justify-content:center;
+  border:1px solid var(--line);border-radius:9999px;background:transparent;cursor:pointer;color:var(--fg);
+  position:relative}
+.tt:hover{background:var(--soft)}
+.tt:focus-visible{outline:2px solid var(--fg);outline-offset:2px}
+.tt:active{transform:scale(.92)}
+.tt svg{position:absolute;transition:transform .35s cubic-bezier(.4,0,.2,1),opacity .25s}
+.tt .moon{transform:rotate(0) scale(1);opacity:1}
+.tt .sun{transform:rotate(-90deg) scale(0);opacity:0}
+[data-theme="dark"] .tt .moon{transform:rotate(90deg) scale(0);opacity:0}
+[data-theme="dark"] .tt .sun{transform:rotate(0) scale(1);opacity:1}
+.sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border-width:0}
+
 </style>
 </head>
 <body>
 
-<!-- colibri mark — monochrome, no box -->
-<svg width="0" height="0" style="position:absolute" aria-hidden="true">
-  <symbol id="logo" viewBox="0 21 168 126"><g transform="translate(7 21)" shape-rendering="crispEdges" fill="#101010">
-    <rect x="56" y="0" width="14" height="14"/><rect x="70" y="0" width="14" height="14"/><rect x="84" y="0" width="14" height="14"/>
-    <rect x="42" y="14" width="14" height="14"/><rect x="56" y="14" width="14" height="14"/><rect x="70" y="14" width="14" height="14"/><rect x="84" y="14" width="14" height="14"/><rect x="98" y="14" width="14" height="14"/><rect x="140" y="14" width="14" height="14"/>
-    <rect x="56" y="28" width="14" height="14"/><rect x="70" y="28" width="14" height="14"/><rect x="84" y="28" width="14" height="14"/><rect x="98" y="28" width="14" height="14"/><rect x="126" y="28" width="14" height="14"/><rect x="140" y="28" width="14" height="14"/>
-    <rect x="0" y="42" width="14" height="14"/><rect x="14" y="42" width="14" height="14"/><rect x="28" y="42" width="14" height="14"/><rect x="42" y="42" width="14" height="14"/><rect x="56" y="42" width="14" height="14"/><rect x="70" y="42" width="14" height="14"/><rect x="84" y="42" width="14" height="14"/><rect x="98" y="42" width="14" height="14"/><rect x="112" y="42" width="14" height="14"/><rect x="126" y="42" width="14" height="14"/>
-    <rect x="56" y="56" width="14" height="14"/><rect x="70" y="56" width="14" height="14"/><rect x="84" y="56" width="14" height="14"/><rect x="98" y="56" width="14" height="14"/><rect x="112" y="56" width="14" height="14"/><rect x="126" y="56" width="14" height="14"/><rect x="140" y="56" width="14" height="14"/>
-    <rect x="70" y="70" width="14" height="14"/><rect x="84" y="70" width="14" height="14"/><rect x="98" y="70" width="14" height="14"/><rect x="112" y="70" width="14" height="14"/><rect x="126" y="70" width="14" height="14"/><rect x="140" y="70" width="14" height="14"/>
-    <rect x="84" y="84" width="14" height="14"/><rect x="98" y="84" width="14" height="14"/><rect x="112" y="84" width="14" height="14"/><rect x="126" y="84" width="14" height="14"/>
-    <rect x="98" y="98" width="14" height="14"/><rect x="112" y="98" width="14" height="14"/><rect x="112" y="112" width="14" height="14"/>
-  </g></symbol>
-  <symbol id="logo-light" viewBox="0 21 168 126"><g transform="translate(7 21)" shape-rendering="crispEdges" fill="#F1F1ED">
-    <rect x="56" y="0" width="14" height="14"/><rect x="70" y="0" width="14" height="14"/><rect x="84" y="0" width="14" height="14"/>
-    <rect x="42" y="14" width="14" height="14"/><rect x="56" y="14" width="14" height="14"/><rect x="70" y="14" width="14" height="14"/><rect x="84" y="14" width="14" height="14"/><rect x="98" y="14" width="14" height="14"/><rect x="140" y="14" width="14" height="14"/>
-    <rect x="56" y="28" width="14" height="14"/><rect x="70" y="28" width="14" height="14"/><rect x="84" y="28" width="14" height="14"/><rect x="98" y="28" width="14" height="14"/><rect x="126" y="28" width="14" height="14"/><rect x="140" y="28" width="14" height="14"/>
-    <rect x="0" y="42" width="14" height="14"/><rect x="14" y="42" width="14" height="14"/><rect x="28" y="42" width="14" height="14"/><rect x="42" y="42" width="14" height="14"/><rect x="56" y="42" width="14" height="14"/><rect x="70" y="42" width="14" height="14"/><rect x="84" y="42" width="14" height="14"/><rect x="98" y="42" width="14" height="14"/><rect x="112" y="42" width="14" height="14"/><rect x="126" y="42" width="14" height="14"/>
-    <rect x="56" y="56" width="14" height="14"/><rect x="70" y="56" width="14" height="14"/><rect x="84" y="56" width="14" height="14"/><rect x="98" y="56" width="14" height="14"/><rect x="112" y="56" width="14" height="14"/><rect x="126" y="56" width="14" height="14"/><rect x="140" y="56" width="14" height="14"/>
-    <rect x="70" y="70" width="14" height="14"/><rect x="84" y="70" width="14" height="14"/><rect x="98" y="70" width="14" height="14"/><rect x="112" y="70" width="14" height="14"/><rect x="126" y="70" width="14" height="14"/><rect x="140" y="70" width="14" height="14"/>
-    <rect x="84" y="84" width="14" height="14"/><rect x="98" y="84" width="14" height="14"/><rect x="112" y="84" width="14" height="14"/><rect x="126" y="84" width="14" height="14"/>
-    <rect x="98" y="98" width="14" height="14"/><rect x="112" y="98" width="14" height="14"/><rect x="112" y="112" width="14" height="14"/>
-  </g></symbol>
-</svg>
+<header><div class="hin">
+  <a class="brand" href="#top"><svg viewBox="0 21 168 126" aria-hidden="true"><g transform="translate(7 21)" shape-rendering="crispEdges"><rect height="14" width="14" x="56" y="0" fill="#d75fd7"/><rect height="14" width="14" x="70" y="0" fill="#d75fd7"/><rect height="14" width="14" x="84" y="0" fill="#d75fd7"/>
+<rect height="14" width="14" x="42" y="14" fill="#d75fd7"/><rect height="14" width="14" x="56" y="14" fill="#d75fd7"/><rect height="14" width="14" x="70" y="14" fill="#d75fd7"/><rect height="14" width="14" x="84" y="14" fill="#d75fd7"/><rect height="14" width="14" x="98" y="14" fill="#d75fd7"/><rect height="14" width="14" x="140" y="14" fill="#5fd7d7"/>
+<rect height="14" width="14" x="56" y="28" fill="#d75fd7"/><rect height="14" width="14" x="70" y="28" fill="#d75fd7"/><rect height="14" width="14" x="84" y="28" fill="#d75fd7"/><rect height="14" width="14" x="98" y="28" fill="#d75fd7"/><rect height="14" width="14" x="126" y="28" fill="#5fd7d7"/><rect height="14" width="14" x="140" y="28" fill="#5fd7d7"/>
+<rect height="14" width="14" x="0" y="42" fill="#ff8700"/><rect height="14" width="14" x="14" y="42" fill="#ff8700"/><rect height="14" width="14" x="28" y="42" fill="#ff8700"/><rect height="14" width="14" x="42" y="42" fill="#ff8700"/><rect height="14" width="14" x="56" y="42" fill="#00afaf"/><rect height="14" width="14" x="70" y="42" fill="#00afaf"/><rect height="14" width="14" x="84" y="42" fill="#fff"/><rect height="14" width="14" x="98" y="42" fill="#00afaf"/><rect height="14" width="14" x="112" y="42" fill="#5fd7d7"/><rect height="14" width="14" x="126" y="42" fill="#5fd7d7"/>
+<rect height="14" width="14" x="56" y="56" fill="#00afaf"/><rect height="14" width="14" x="70" y="56" fill="#00afaf"/><rect height="14" width="14" x="84" y="56" fill="#00afaf"/><rect height="14" width="14" x="98" y="56" fill="#00afaf"/><rect height="14" width="14" x="112" y="56" fill="#00afaf"/><rect height="14" width="14" x="126" y="56" fill="#5fd7d7"/><rect height="14" width="14" x="140" y="56" fill="#5fd7d7"/>
+<rect height="14" width="14" x="70" y="70" fill="#00afaf"/><rect height="14" width="14" x="84" y="70" fill="#00afaf"/><rect height="14" width="14" x="98" y="70" fill="#00afaf"/><rect height="14" width="14" x="112" y="70" fill="#00afaf"/><rect height="14" width="14" x="126" y="70" fill="#5fd7d7"/><rect height="14" width="14" x="140" y="70" fill="#5fd7d7"/>
+<rect height="14" width="14" x="84" y="84" fill="#00afaf"/><rect height="14" width="14" x="98" y="84" fill="#00afaf"/><rect height="14" width="14" x="112" y="84" fill="#5fd7d7"/><rect height="14" width="14" x="126" y="84" fill="#5fd7d7"/>
+<rect height="14" width="14" x="98" y="98" fill="#00afaf"/><rect height="14" width="14" x="112" y="98" fill="#5fd7d7"/>
+<rect height="14" width="14" x="112" y="112" fill="#5fd7d7"/></g></svg><b>colibri</b></a>
+  <nav class="hnav"><a href="#models">Models</a><a href="#brio">Brio</a>
+    <a href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">Docs</a></nav>
+  <label class="hsearch">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+    <input id="q" type="search" placeholder="Search models" autocomplete="off">
+  </label>
+  <div class="hright">
+    <button type="button" class="tt" id="tt" aria-label="Switch to dark theme" title="Switch theme (D)">
+      <span class="sr">Toggle theme</span>
+      <svg class="sun" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.5M12 19.5V22M4.22 4.22l1.77 1.77M18.01 18.01l1.77 1.77M2 12h2.5M19.5 12H22M4.22 19.78l1.77-1.77M18.01 5.99l1.77-1.77"/></svg>
+      <svg class="moon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    </button>
+    <a class="pill g" href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">Quickstart</a>
+    <a class="pill d" href="https://github.com/JustVugg/colibri/">GitHub</a>
+  </div>
+</div></header>
 
-<nav id="nav">
-  <div class="in">
-    <a class="brand" href="#top"><span class="mark"><svg><use href="#logo"/></svg></span><span class="word">colibri</span></a>
-    <div class="nl">
-      <a href="#engine">Engine</a>
-      <a href="#models">Models</a>
-      <a href="#hardware">Hardware</a>
-      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Benchmarks</a>
-      <a href="https://discord.gg/RXV83nSZdk">Discord</a>
-      <a class="btn" href="https://github.com/JustVugg/colibri">Star on GitHub</a>
+<main id="top">
+
+<section class="hero"><div class="wide hgrid">
+  <div>
+    <h1>Run open models.<br>Keep your hardware.</h1>
+    <p class="sub">colibri streams a model's experts off the disk instead of loading them, so a
+      2.8-trillion-parameter model answers on a machine that could never hold it.</p>
+    <div class="hcta">
+      <a class="pill d big" href="#models">Browse models</a>
+      <a class="pill g big" href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">Quickstart</a>
     </div>
   </div>
-</nav>
+  <figure class="shot">
+    <video src="demo.webm" poster="demo-poster.jpg" width="1280" height="800"
+           autoplay muted loop playsinline preload="metadata"
+           aria-label="A real session: the terminal chat, then the same model scoring a closed set of options in the dashboard"></video>
+    <figcaption>A real session, nothing staged: <code>coli chat</code> attached to a running
+      server, then the same model in brio mode. The numbers are the ones it produced.</figcaption>
+  </figure>
+</div>
+</div></section>
 
-<header class="hero" id="top">
-  <div class="wrap">
-    <div class="kicker">Pure C · zero dependencies · Apache 2.0</div>
-    <h1>Run models <u>bigger than your machine</u></h1>
-    <p class="sub">
-      colibrì streams Mixture-of-Experts weights from disk instead of loading them,
-      so a 2.8-trillion-parameter model runs on a 32&nbsp;GB box.
-      Six model families, one engine, CPU or GPU.
-    </p>
-    <div class="cta">
-      <a class="btn" href="https://github.com/JustVugg/colibri#quick-start">Quick start →</a>
-      <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">See the benchmarks</a>
+<p class="trust">Measured today on machines people actually have</p>
+<div class="logos"><span>RTX 5090</span><span>Graviton4</span><span>Xeon Gold</span>
+  <span>DGX Spark</span><span>M5 Max</span><span>Ryzen 9</span><span>Mac Mini</span></div>
+
+<section class="msec" id="models"><div class="narrow">
+  <h2>Models</h2>
+  <p class="sub">Pull a converted container where one is published, or point the engine at the
+     original checkpoint.</p>
+  <div class="fbar"><button class="fp" data-f="vision">vision</button><button class="fp" data-f="audio">audio</button><button class="fp" data-f="tools">tools</button><button class="fp" data-f="int4">int4</button><button class="fp" data-f="mtp">mtp</button></div>
+  <div id="mlist">
+      <article class="mrow" data-find="glm-5.2 glm-5.2 glm z.ai colibri.c moe int4 mla mtp" data-tags="moe int4 mla mtp">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">glm-5.2</a></h3>
+        <p class="d">The model colibri was built around. 78 layers, 256 routed experts, streamed from disk on a machine that could never hold them.</p>
+        <div class="tg"><span class="">MoE</span><span class="e">int4</span><span class="g">MLA</span><span class="a">MTP</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>744B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>40B active</span>
+          <a href="https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>container, 372 GB</a><a href="https://huggingface.co/zai-org/GLM-5.2-FP8">upstream</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>colibri.c</span></div>
+        <div class="mget"><code>hf download mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp --local-dir ~/Models/glm52_i4</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="glm-5.3-flash glm-5.3-flash glm53 z.ai glm53.c moe int4-gs64 vision" data-tags="moe int4-gs64 vision">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/glm53-flash.md">glm-5.3-flash</a></h3>
+        <p class="d">Natively multimodal. Routed experts convert to int4-gs64, the dense set stays BF16 and its precision is a load-time choice.</p>
+        <div class="tg"><span class="">MoE</span><span class="e">int4-gs64</span><span class="b">vision</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>320B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>18B active</span>
+          <a href="https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>container, 419 GB</a><a href="https://huggingface.co/zai-org/GLM-5.3-Flash">upstream</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>glm53.c</span></div>
+        <div class="mget"><code>hf download Justvugg/GLM-5.3-colibri-int4-g64 --local-dir ~/Models/glm53_i4</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="deepseek v4.1 flash deepseek-v4.1-flash deepseek_v41 deepseek deepseek_v41.c moe fp4 vision tools dspark" data-tags="moe fp4 vision tools dspark">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/deepseek-v41.md">deepseek-v4.1-flash</a></h3>
+        <p class="d">Runs off the official checkpoint untouched: experts are already fp4, the dense set fp8-e4m3. Routed experts cost 4.5 GB per token against GLM-5.2's 12.7.</p>
+        <div class="tg"><span class="">MoE</span><span class="e">fp4</span><span class="b">vision</span><span class="b">tools</span><span class="a">DSpark</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>552B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>16B active</span>
+          <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>official, no conversion</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>deepseek_v41.c</span></div>
+        <div class="mget"><code>hf download deepseek-ai/DeepSeek-V4.1-Flash --local-dir ~/Models/DeepSeek-V4.1-Flash</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="deepseek v4 flash deepseek-v4-flash deepseek_v4 deepseek deepseek_v4.c moe fp4 mtp reap" data-tags="moe fp4 mtp reap">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/deepseek-v4.md">deepseek-v4-flash</a></h3>
+        <p class="d">Native fp4 experts, fp8-e4m3 dense. The REAP-pruned 150B cut, 132 of 256 experts and 85 GB, loads with the same engine and no conversion.</p>
+        <div class="tg"><span class="">MoE</span><span class="e">fp4</span><span class="a">MTP</span><span class="a">REAP</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>284B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>13B active</span>
+          <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>official, no conversion</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>deepseek_v4.c</span></div>
+        <div class="mget"><code>hf download deepseek-ai/DeepSeek-V4-Flash-0731 --local-dir ~/Models/DeepSeek-V4-Flash</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="kimi k3 kimi-k3 kimi moonshot kimi_k3.c moe mxfp4 kda largest" data-tags="moe mxfp4 kda largest">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/kimi_k3.md">kimi-k3</a></h3>
+        <p class="d">The largest model colibri runs. 93 layers, 69 Kimi Delta Attention plus 24 gated MLA, and 16 of 896 experts per token. QAT-trained MXFP4 streams straight from the original shards.</p>
+        <div class="tg"><span class="">MoE</span><span class="e">MXFP4</span><span class="g">KDA</span><span class="r">largest</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>2.8T total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>104B active</span>
+          <a href="https://huggingface.co/moonshotai/Kimi-K3"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>official, no conversion</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>kimi_k3.c</span></div>
+        <div class="mget"><code>hf download moonshotai/Kimi-K3 --local-dir ~/Models/Kimi-K3</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="inkling inkling inkling thinking machines inkling.c moe int4 audio apache 2.0" data-tags="moe int4 audio apache 2.0">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/inkling.md">inkling</a></h3>
+        <p class="d">Sliding-window attention with short convolutions. Audio input is supported when the audio tensors are present; the dense set fits a 25 GB host at 15.3 GB.</p>
+        <div class="tg"><span class="">MoE</span><span class="e">int4</span><span class="">audio</span><span class="g">Apache 2.0</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>975B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>41B active</span>
+          <a href="https://huggingface.co/nbeerbower/Inkling-colibri-int4"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>container, 469 GB</a><a href="https://huggingface.co/thinkingmachines/Inkling">upstream</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>inkling.c</span></div>
+        <div class="mget"><code>hf download nbeerbower/Inkling-colibri-int4 --local-dir ~/Models/inkling_i4</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="qwen3.8-flash-next qwen3.8-flash-next qwen38 alibaba qwen38.c moe block-fp8 deltanet ple" data-tags="moe block-fp8 deltanet ple">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/qwen38.md">qwen3.8-flash-next</a></h3>
+        <p class="d">48 layers, 512 experts, 10 routed per token. 125B of backbone plus a 51B n-gram embedding that stays pageable and a 4B MTP head; the experts stay native block-FP8. CPU only for now.</p>
+        <div class="tg"><span class="">MoE</span><span class="e">block-FP8</span><span class="g">DeltaNet</span><span class="g">PLE</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>180B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>6B active</span>
+          <a href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>official, no conversion</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>qwen38.c</span></div>
+        <div class="mget"><code>hf download Qwen/Qwen3.8-Flash-Next-FP8 --local-dir ~/Models/Qwen3.8-Flash-Next-FP8</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="qwen3.6-35b-a3b qwen3.6-35b-a3b qwen36 alibaba qwen36.c moe int4-gs64 deltanet cuda tier" data-tags="moe int4-gs64 deltanet cuda tier">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/qwen36.md">qwen3.6-35b-a3b</a></h3>
+        <p class="d">The one to start with: 20 GB on disk, gated attention interleaved with gated DeltaNet. With CUDA=1 the VRAM expert tier measured 1.44 to 10.05 tok/s on two 8 GB cards, output bit-identical to the CPU path.</p>
+        <div class="tg"><span class="">MoE</span><span class="e">int4-gs64</span><span class="g">DeltaNet</span><span class="a">CUDA tier</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>35B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>3B active</span>
+          <a href="https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>container, 20 GB</a><a href="https://huggingface.co/Qwen/Qwen3.6-35B-A3B">upstream</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>qwen36.c</span></div>
+        <div class="mget"><code>hf download Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 --local-dir ~/Models/qwen36_i4_gs64</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="olmoe 1b-7b olmoe olmoe allen ai olmoe.c moe int8 open data small" data-tags="moe int8 open data small">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">olmoe</a></h3>
+        <p class="d">Fully open weights and data, 16 layers and 64 experts. The one to learn the tooling on: the whole container is 7 GB.</p>
+        <div class="tg"><span class="">MoE</span><span class="e">int8</span><span class="g">open data</span><span class="g">small</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>7B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>1B active</span>
+          <a href="https://huggingface.co/allenai/OLMoE-1B-7B-0125-Instruct"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>convert, 7 GB int8</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>olmoe.c</span></div>
+        <div class="mget"><code>python3 c/tools/convert_olmoe_merged.py --repo allenai/OLMoE-1B-7B-0125-Instruct --out ~/Models/olmoe_i8</code><button class="cp" type="button">copy</button></div>
+      </article>
+  </div>
+  <p class="mnone" id="mnone" hidden>Nothing matches that.</p>
+</div></section>
+
+<div class="mid rail">
+  <nav class="railnav" id="rail">
+    <a href="#fits" class="on">Bigger than your RAM</a>
+    <a href="#open">Frontier open models</a>
+    <a href="#brio">Brio mode</a>
+    <a href="#yours">Your weights stay yours</a>
+  </nav>
+  <div>
+
+    <div class="block" id="fits">
+      <h2>Bigger than your RAM</h2>
+      <p class="sub">A mixture-of-experts token touches a small fraction of the weights. colibri
+        keeps that fraction resident and reads the rest as the router asks for it, so the model
+        does not have to fit.</p>
+      <div class="chart"><div class="crow"><span class="cl">6x RTX 5090<s>full residency</s></span><span class="ct"><i style="width:100.0%"></i></span><span class="cv">9.0-9.2<s> tok/s</s></span></div><div class="crow"><span class="cl">AWS Graviton4<s>aarch64, CPU only</s></span><span class="ct"><i style="width:87.0%"></i></span><span class="cv">8.0<s> tok/s</s></span></div><div class="crow"><span class="cl">2x Xeon Gold 6430<s>1 TB DDR5</s></span><span class="ct"><i style="width:58.9%"></i></span><span class="cv">5.42<s> tok/s</s></span></div><div class="crow"><span class="cl">NVIDIA DGX Spark<s>121 GB unified</s></span><span class="ct"><i style="width:36.2%"></i></span><span class="cv">3.33<s> tok/s</s></span></div><div class="crow"><span class="cl">MacBook Pro M5 Max<s>Metal</s></span><span class="ct"><i style="width:21.7%"></i></span><span class="cv">2.0<s> tok/s</s></span></div><div class="crow"><span class="cl">Ryzen 9 9950X3D<s>RTX 5090 + NVMe</s></span><span class="ct"><i style="width:13.4%"></i></span><span class="cv">1.23<s> tok/s</s></span></div><div class="crow"><span class="cl">25 GB dev box<s>cold</s></span><span class="ct"><i style="width:1.1%"></i></span><span class="cv">0.05-0.1<s> tok/s</s></span></div></div>
+      <p class="src">GLM-5.2 int4, decode speed reported by the people who ran it. The hardware
+        changes where the experts live, not what the model answers.</p>
+      <a class="more" href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">See the benchmarks &rarr;</a>
     </div>
-  </div>
-</header>
 
-<section class="tract">
-  <div class="in reveal">
-    <div><div class="n" data-gh="stargazers_count">25,157</div><div class="l">GitHub stars</div></div>
-    <div><div class="n" data-gh="forks_count">2,730</div><div class="l">forks</div></div>
-    <div><div class="n">100+</div><div class="l">contributors</div></div>
-    <div><div class="n">510</div><div class="l">pull requests merged</div></div>
-    <div><div class="n">6</div><div class="l">families · 4 backends · 3 platforms</div></div>
-    <div class="since">All of it in <b data-gh-age>six weeks</b>, in the open: issues filed from strangers' machines,
-      reproduced and fixed the same day. Currently shipping <b>v1.11.0</b>.</div>
-  </div>
-</section>
+    <div class="block" id="open">
+      <h2>Frontier open models</h2>
+      <p class="sub">Nine families run today, one hand-written C file each. Not a wrapper around
+        someone else's runtime.</p>
+      <div class="chart"><div class="crow"><span class="cl">kimi-k3<s>104B active</s></span><span class="ct"><i style="width:100.0%"></i></span><span class="cv">2.8T</span></div><div class="crow"><span class="cl">inkling<s>41B active</s></span><span class="ct"><i style="width:34.8%"></i></span><span class="cv">975B</span></div><div class="crow"><span class="cl">glm-5.2<s>40B active</s></span><span class="ct"><i style="width:26.6%"></i></span><span class="cv">744B</span></div><div class="crow"><span class="cl">deepseek-v4.1-flash<s>16B active</s></span><span class="ct"><i style="width:19.7%"></i></span><span class="cv">552B</span></div><div class="crow"><span class="cl">glm-5.3-flash<s>18B active</s></span><span class="ct"><i style="width:11.4%"></i></span><span class="cv">320B</span></div><div class="crow"><span class="cl">deepseek-v4-flash<s>13B active</s></span><span class="ct"><i style="width:10.1%"></i></span><span class="cv">284B</span></div><div class="crow"><span class="cl">qwen3.8-flash-next<s>6B active</s></span><span class="ct"><i style="width:6.4%"></i></span><span class="cv">180B</span></div><div class="crow"><span class="cl">qwen3.6-35b-a3b<s>3B active</s></span><span class="ct"><i style="width:1.2%"></i></span><span class="cv">35B</span></div><div class="crow"><span class="cl">olmoe<s>1B active</s></span><span class="ct"><i style="width:0.8%"></i></span><span class="cv">7B</span></div></div>
+      <p class="src">Total parameters. Only the active ones are computed per token, and only the
+        routed experts move. The engines, by the names the docs use:
+        GLM-5.3-Flash, GLM-5.2/5.3, Inkling, Kimi K3, OLMoE, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next, DeepSeek V4 Flash, DeepSeek V4.1 Flash.</p>
+      <a class="more" href="#models">Browse all models &rarr;</a>
+    </div>
 
-<section class="block-dark" id="engine">
-  <div class="inner reveal">
-    <h2>Frontier models should not be sealed inside datacenters.</h2>
-    <p>Anyone curious enough should be able to open one up: run it, watch every expert fire, and make it better.</p>
-    <a class="btn" href="https://github.com/JustVugg/colibri">Read the engine →</a>
-  </div>
-</section>
+    <div class="block" id="brio">
+      <h2>Brio mode</h2>
+      <p class="sub">Most of what people ask a model for is a choice, not an essay. Hand it the
+        options it may pick and it reports the probability of each one. Nothing is generated,
+        so there is nothing to parse and no answer outside the list.</p>
+      <div class="chart"><div class="crow"><span class="cl">one question, 10 options<s>brio</s></span><span class="ct"><i style="width:38.8%"></i></span><span class="cv">101.2 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:48.1%"></i></span><span class="cv">125.6 s<s> 1.2x</s></span></div><div class="crow"><span class="cl">JSON, 4-field schema<s>brio</s></span><span class="ct"><i style="width:39.8%"></i></span><span class="cv">103.8 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:94.2%"></i></span><span class="cv">246.0 s<s> 2.4x</s></span></div><div class="crow"><span class="cl">4 items, shared instructions<s>brio</s></span><span class="ct"><i style="width:17.5%"></i></span><span class="cv">45.7 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:100.0%"></i></span><span class="cv">261.1 s<s> 5.7x</s></span></div></div>
+      <p class="src">Measured on qwen36 (22 GB), same engine, separate processes. Time from the
+        prompt to the answer.</p>
 
-<section>
-  <div class="wrap reveal">
-    <div class="overline">How it works</div>
-    <div class="split">
-      <h2>Weights are not state to hold. They are data to stage.</h2>
-      <div>
-        <p class="lead" style="margin-bottom:1.3rem">A token through GLM-5.2 activates only <strong>~40B parameters</strong>, and just
-          <strong>~11&nbsp;GB</strong> of those change from token to token: the routed experts. colibrì keeps the dense weights resident
-          and treats the 19,456 experts as a storage hierarchy. Measured routing heat decides which experts earn VRAM, which earn
-          pinned RAM, and which stream from NVMe, and the router runs a layer ahead so prefetch hides the latency.</p>
-        <p class="lead">Everything is validated <strong>token-exact</strong> against the reference transformers implementation.
-          Speed never buys drift.</p>
+      <div class="exs">
+        <div class="ex"><h3>Triage and routing</h3>
+          <p>Anything that ends in a bucket: a ticket to a queue, a pull request to a verdict,
+             a message to a policy.</p>
+          <div class="io"><b>question</b> what should the reviewer do?<br>
+            <b>options</b> merge &middot; request changes &middot; close</div></div>
+        <div class="ex"><h3>Filling a schema</h3>
+          <p>Braces, quotes and field names are data. The engine fills one slot at a time, so
+             the JSON is valid by construction.</p>
+          <div class="io"><b>brio</b> every value is one you allowed<br>
+            <b>chat</b> invented no_tests and track</div></div>
+        <div class="ex"><h3>Many questions, one document</h3>
+          <p>Read the contract once, then ask it twenty things. The first question pays for the
+             reading, the rest cost their own words.</p>
+          <div class="io"><b>one snapshot</b> 496 tokens for 4 items<br>
+            <b>two levels</b> 176 tokens</div></div>
       </div>
-    </div>
-  </div>
-</section>
 
-<section id="models">
-  <div class="wrap reveal">
-    <div class="overline">The models</div>
-    <h2 class="sec-h">Eight families run today, one engine each.</h2>
-    <div class="cards">
-      <div class="card"><h3>GLM-5.2/5.3</h3><p class="desc">The flagship target: an int4 container, token-exact versus reference, with the full expert atlas published.</p>
-        <div class="tags"><span class="tag">reasoning</span><span class="tag">tools</span></div>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Z.ai</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">744B MoE &middot; from 16 GB</span></div></div>
-        <a class="btn ghost" href="https://github.com/JustVugg/colibri#quick-start">Run it &rarr;</a></div>
-      <div class="card"><h3>GLM-5.3-Flash</h3><p class="desc">The flagship&rsquo;s fast sibling: the same 40B active at less than half the total size, and it takes images through the same server.</p>
-        <div class="tags"><span class="tag">reasoning</span><span class="tag">tools</span><span class="tag">vision</span></div>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Z.ai</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">321B MoE &middot; 25 GB</span></div></div>
-        <a class="btn ghost" href="https://github.com/JustVugg/colibri#quick-start">Run it &rarr;</a></div>
-      <div class="card"><h3>Qwen3.8-Flash-Next</h3><p class="desc">The first family to arrive complete: tool calling and a vision tower verified against the upstream reference, on day one.</p>
-        <div class="tags"><span class="tag">reasoning</span><span class="tag">tools</span><span class="tag">vision</span></div>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Alibaba Qwen</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">125B+51B MoE &middot; from 16 GB</span></div></div>
-        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/qwen38.md">Run it &rarr;</a></div>
-      <div class="card"><h3>Kimi K3</h3><p class="desc">The largest family we run: gated recurrence plus MLA attention, 2.8T parameters, now with a Metal backend on Apple Silicon.</p>
-        <div class="tags"><span class="tag">reasoning</span><span class="tag">tools</span></div>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Moonshot AI</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">2.8T MoE &middot; from 32 GB</span></div></div>
-        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/kimi_k3.md">Run it &rarr;</a></div>
-      <div class="card"><h3>Inkling</h3><p class="desc">A 975B reasoning MoE with an audio tower. Mixed-precision staging fits it on a consumer box.</p>
-        <div class="tags"><span class="tag">reasoning</span><span class="tag">audio</span></div>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Thinking Machines</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">975B MoE &middot; 25 GB</span></div></div>
-        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/inkling.md">Run it &rarr;</a></div>
-      <div class="card"><h3>DeepSeek V4 Flash</h3><p class="desc">Sparse attention, multi-token prediction and a trained drafter: the most instrumented engine here.</p>
-        <div class="tags"><span class="tag">reasoning</span><span class="tag">tools</span></div>
-      <div class="card"><h3>DeepSeek V4.1 Flash</h3><p class="desc">552B, and 40% of it is an n-gram memory read from disk a few hundred bytes at a time: the model this engine was built for.</p>
+      <div class="split2">
+        <div class="code"><span class="lbl">POST /v1/brio</span><pre>{
+  <span class="k">"model"</span>: <span class="s">"qwen36"</span>,
+  <span class="k">"state"</span>: <span class="s">"340 lines, 8 files, no tests."</span>,
+  <span class="k">"question"</span>: <span class="s">"What should the reviewer do?"</span>,
+  <span class="k">"options"</span>: [<span class="s">"merge"</span>, <span class="s">"request changes"</span>, <span class="s">"close"</span>]
+}</pre></div>
+        <div class="code"><span class="lbl">the reply</span><pre>{
+  <span class="k">"answer"</span>: <span class="s">"request changes"</span>,
+  <span class="k">"entropy"</span>: <span class="n">0.121</span>,
+  <span class="k">"choices"</span>: [
+    {<span class="k">"option"</span>: <span class="s">"request changes"</span>, <span class="k">"p"</span>: <span class="n">0.974</span>},
+    {<span class="k">"option"</span>: <span class="s">"merge"</span>,           <span class="k">"p"</span>: <span class="n">0.023</span>},
+    {<span class="k">"option"</span>: <span class="s">"close"</span>,           <span class="k">"p"</span>: <span class="n">0.004</span>}
+  ],
+  <span class="k">"usage"</span>: {<span class="k">"completion_tokens"</span>: <span class="n">0</span>}
+}</pre></div>
       </div>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">DeepSeek AI</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">284B MoE &middot; from 16 GB</span></div></div>
-        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/deepseek-v4.md">Run it &rarr;</a></div>
-      <div class="card"><h3>Qwen3.6</h3><p class="desc">Gated attention plus Gated DeltaNet. Its CUDA tier keeps hot experts in VRAM: 7x faster than CPU on two 8&nbsp;GB cards, output bit-identical.</p>
-        <div class="tags"><span class="tag">reasoning</span></div>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Alibaba Qwen</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">35B MoE &middot; 24 GB</span></div></div>
-        <a class="btn ghost" href="https://github.com/JustVugg/colibri/blob/main/docs/qwen36.md">Run it &rarr;</a></div>
-      <div class="card"><h3>OLMoE</h3><p class="desc">The small research workhorse. Quantization A/Bs and quality ablations run here first.</p>
-        <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Allen AI</span></div><div class="row"><span class="k">Size &middot; RAM</span><span class="v">7B MoE &middot; 8 GB</span></div></div>
-        <a class="btn ghost" href="https://github.com/JustVugg/colibri">Run it &rarr;</a></div>
+
+      <h3 style="font-size:1.3rem;font-weight:500;margin:3rem 0 .6rem;letter-spacing:-.02em">
+        And the thing generation cannot give</h3>
+      <p class="sub" style="margin-bottom:1.6rem">Same request, same model, three fields of one
+        JSON schema. On <b>area</b> it is sure and it is right. On the other two the entropy is
+        near the maximum: it does not know, and it says so. The chat arm wrote
+        <code style="font:400 14px var(--mono);background:var(--soft);padding:1px 6px;border-radius:4px">"risk": "high"</code>
+        with exactly the same face.</p>
+      <div class="chart"><div class="crow"><span class="cl">area<s>the model is sure</s></span><span class="ct"><i style="width:94.4%"></i></span><span class="cv">94.4%<s> entropy 0.17</s></span></div><div class="crow"><span class="cl">needs_tests<s>it is not</s></span><span class="ct"><i style="width:52.0%"></i></span><span class="cv">52%<s> entropy 0.95</s></span></div><div class="crow"><span class="cl">risk<s>it is not</s></span><span class="ct"><i style="width:46.0%"></i></span><span class="cv">46%<s> entropy 0.99</s></span></div></div>
+      <p class="src">That number is what you put a threshold on to send a case to a human.
+        Brio does not write prose, so anything open-ended is still the chat's job, and the
+        speed multipliers above were measured on an engine reading experts from disk.</p>
+      <a class="more" href="https://github.com/JustVugg/colibri/blob/main/docs/brio.md">Read the brio guide &rarr;</a>
     </div>
-  </div>
-</section>
 
-<section class="block-dark atlas-block">
-  <canvas id="atlasCanvas"></canvas>
-  <div class="inner reveal">
-    <h2>The mind, measured.</h2>
-    <p>Every point behind this text is a real measured expert: 13,260 characterised experts, specialists clustering by topic,
-      generalists drifting to the centre. The first expert atlas of a 700B-class model, mapped on ordinary machines.</p>
-  </div>
-  <div class="atlas-hint">drag to spin · position is measured routing affinity, not a learned embedding</div>
-</section>
-
-<section id="hardware">
-  <div class="wrap reveal">
-    <div class="overline">Hardware</div>
-    <h2 class="sec-h">Same engine, any machine.</h2>
-    <p class="lead">Measured decode speed on real community machines. The hardware only changes where the experts live, not what the model answers.</p>
-    <div class="dlist">
-      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">6× RTX 5090 · full residency + NUMA</div><div class="sub">all in VRAM + RAM · disk 0</div></div><div class="spd">9.0–9.2 tok/s</div></a>
-      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">AWS Graviton4 r8g.16xlarge · 64-core aarch64 · CPU-only</div><div class="sub">98% pinned in 512 GB RAM · disk 0</div></div><div class="spd hi">8.0 tok/s</div></a>
-      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">2× Xeon Gold 6430 · 1 TB DDR5 · CPU-only</div><div class="sub">every expert pinned in RAM</div></div><div class="spd">5.42 tok/s</div></a>
-      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">NVIDIA DGX Spark GB10 · 121 GB unified</div><div class="sub">unified memory + CACHE_ROUTE</div></div><div class="spd">3.33 tok/s</div></a>
-      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">MacBook Pro M5 Max · 128 GB · Metal</div><div class="sub">Metal tier + warm pin</div></div><div class="spd">2.0 tok/s</div></a>
-      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">Ryzen 9 9950X3D · RTX 5090 · Gen5 NVMe</div><div class="sub">28 GB VRAM tier + 11.5 GB/s disk</div></div><div class="spd">1.23 tok/s</div></a>
-      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">25 GB dev box · cold — the proven floor</div><div class="sub">streamed from NVMe</div></div><div class="spd">0.05–0.1 tok/s</div></a>
+    <div class="block" id="yours">
+      <h2>Your weights stay yours</h2>
+      <p class="sub">The engine is one C file per family with no runtime and no dependencies.
+        It runs on a laptop with the network off, and the model files never leave the machine.
+        Apache 2.0, and every container keeps the licence its authors gave it.</p>
+      <table class="cmp">
+        <tr><th>what you keep</th><th></th></tr>
+        <tr><td class="b">The weights</td><td class="x">on your disk, in a format you can read</td></tr>
+        <tr><td class="b">The prompts</td><td class="x">never sent anywhere</td></tr>
+        <tr><td class="b">The engine</td><td class="x">one file you can read in an afternoon</td></tr>
+        <tr><td class="b">The numbers</td><td class="x">token-exact against the reference implementation</td></tr>
+      </table>
+      <a class="more" href="https://github.com/JustVugg/colibri/">Read the engine &rarr;</a>
     </div>
-    <p class="dlistnote">…and 15+ more community machines, from an M4 Pro Mac Mini to a 430 GB EPYC server.
-      Full tables, methodology and quality ablations: <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">docs/benchmarks.md</a></p>
+
   </div>
-</section>
+</div>
 
-<section style="padding-top:0" id="build">
-  <div class="wrap reveal">
-    <div class="split">
-      <h2>Come build the microscope.</h2>
-      <div class="jlist">
-        <a href="https://github.com/JustVugg/colibri/issues"><span class="t">Run a benchmark on your hardware</span><span class="c">any machine is a datapoint</span></a>
-        <a href="https://github.com/JustVugg/colibri/issues"><span class="t">Pick an open issue</span><span class="c">kernels · schedulers · atlas</span></a>
-        <a href="https://github.com/JustVugg/colibri"><span class="t">Read the engine</span><span class="c">one C file · zero deps</span></a>
-        <a href="https://github.com/JustVugg/colibri/blob/main/docs/api.md"><span class="t">Use the OpenAI-compatible API</span><span class="c">drop-in gateway</span></a>
-      </div>
-      <div class="term" style="grid-column:1/-1;margin-top:2.2rem">
-        <div class="bar"><i></i><i></i><i></i><span>bash</span></div>
-<pre><span class="c"># one C file, no dependencies</span>
-<span class="p">$</span> git clone https://github.com/JustVugg/colibri
-<span class="p">$</span> make -C colibri/c
 
-<span class="c"># point it at a checkpoint and talk to it</span>
-<span class="p">$</span> ./coli chat --model /path/to/glm-5.2
 
-<span class="c"># or serve an OpenAI-compatible API + dashboard</span>
-<span class="p">$</span> ./coli web --model /path/to/glm-5.2</pre>
-      </div>
-    </div>
-  </div>
-</section>
+<section class="closing"><div class="wide">
+  <svg viewBox="0 21 168 126" aria-hidden="true"><g transform="translate(7 21)" shape-rendering="crispEdges"><rect height="14" width="14" x="56" y="0" fill="#d75fd7"/><rect height="14" width="14" x="70" y="0" fill="#d75fd7"/><rect height="14" width="14" x="84" y="0" fill="#d75fd7"/>
+<rect height="14" width="14" x="42" y="14" fill="#d75fd7"/><rect height="14" width="14" x="56" y="14" fill="#d75fd7"/><rect height="14" width="14" x="70" y="14" fill="#d75fd7"/><rect height="14" width="14" x="84" y="14" fill="#d75fd7"/><rect height="14" width="14" x="98" y="14" fill="#d75fd7"/><rect height="14" width="14" x="140" y="14" fill="#5fd7d7"/>
+<rect height="14" width="14" x="56" y="28" fill="#d75fd7"/><rect height="14" width="14" x="70" y="28" fill="#d75fd7"/><rect height="14" width="14" x="84" y="28" fill="#d75fd7"/><rect height="14" width="14" x="98" y="28" fill="#d75fd7"/><rect height="14" width="14" x="126" y="28" fill="#5fd7d7"/><rect height="14" width="14" x="140" y="28" fill="#5fd7d7"/>
+<rect height="14" width="14" x="0" y="42" fill="#ff8700"/><rect height="14" width="14" x="14" y="42" fill="#ff8700"/><rect height="14" width="14" x="28" y="42" fill="#ff8700"/><rect height="14" width="14" x="42" y="42" fill="#ff8700"/><rect height="14" width="14" x="56" y="42" fill="#00afaf"/><rect height="14" width="14" x="70" y="42" fill="#00afaf"/><rect height="14" width="14" x="84" y="42" fill="#fff"/><rect height="14" width="14" x="98" y="42" fill="#00afaf"/><rect height="14" width="14" x="112" y="42" fill="#5fd7d7"/><rect height="14" width="14" x="126" y="42" fill="#5fd7d7"/>
+<rect height="14" width="14" x="56" y="56" fill="#00afaf"/><rect height="14" width="14" x="70" y="56" fill="#00afaf"/><rect height="14" width="14" x="84" y="56" fill="#00afaf"/><rect height="14" width="14" x="98" y="56" fill="#00afaf"/><rect height="14" width="14" x="112" y="56" fill="#00afaf"/><rect height="14" width="14" x="126" y="56" fill="#5fd7d7"/><rect height="14" width="14" x="140" y="56" fill="#5fd7d7"/>
+<rect height="14" width="14" x="70" y="70" fill="#00afaf"/><rect height="14" width="14" x="84" y="70" fill="#00afaf"/><rect height="14" width="14" x="98" y="70" fill="#00afaf"/><rect height="14" width="14" x="112" y="70" fill="#00afaf"/><rect height="14" width="14" x="126" y="70" fill="#5fd7d7"/><rect height="14" width="14" x="140" y="70" fill="#5fd7d7"/>
+<rect height="14" width="14" x="84" y="84" fill="#00afaf"/><rect height="14" width="14" x="98" y="84" fill="#00afaf"/><rect height="14" width="14" x="112" y="84" fill="#5fd7d7"/><rect height="14" width="14" x="126" y="84" fill="#5fd7d7"/>
+<rect height="14" width="14" x="98" y="98" fill="#00afaf"/><rect height="14" width="14" x="112" y="98" fill="#5fd7d7"/>
+<rect height="14" width="14" x="112" y="112" fill="#5fd7d7"/></g></svg>
+  <h2>Get up and running on hardware you already own</h2>
+  <a class="pill d big" href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">Get started</a>
+</div></section>
 
-<footer>
-  <div class="wrap">
-    <div class="fgrid">
-      <div class="mono-mark"><svg><use href="#logo-light"/></svg></div>
-      <div><h4>Engine</h4><ul>
-        <li><a href="https://github.com/JustVugg/colibri">GitHub</a></li>
-        <li><a href="https://github.com/JustVugg/colibri#quick-start">Quick start</a></li>
-        <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/api.md">API</a></li>
-        <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Benchmarks</a></li>
-      </ul></div>
-      <div><h4>Models</h4><ul>
-        <li><a href="#models">GLM-5.2/5.3</a></li><li><a href="#models">GLM-5.3-Flash</a></li>
-        <li><a href="#models">Qwen3.8-Flash-Next</a></li><li><a href="#models">Kimi K3</a></li>
-        <li><a href="#models">Inkling</a></li><li><a href="#models">DeepSeek V4 Flash</a></li><li><a href="#models">DeepSeek V4.1 Flash</a></li>
-        <li><a href="#models">Qwen3.6</a></li><li><a href="#models">OLMoE</a></li>
-      </ul></div>
-      <div><h4>Project</h4><ul>
-        <li><a href="https://github.com/JustVugg/colibri/issues">Issues</a></li>
-        <li><a href="https://discord.gg/RXV83nSZdk">Discord</a></li>
-        <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Community results</a></li>
-        <li><a href="https://github.com/JustVugg/colibri">Apache 2.0 license</a></li>
-      </ul></div>
-    </div>
-    <div class="fbot"><span>colibrì — the hummingbird: tiny, fast, precise.</span><span class="sp">Apache 2.0</span></div>
-  </div>
-</footer>
+</main>
+
+
+
+<footer><div class="fin">
+  <span>&copy; 2026 colibri</span>
+  <span>Currently shipping <b>v1.12.1</b></span>
+  <span class="sp">
+    <a href="https://github.com/JustVugg/colibri/">GitHub</a><a href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">Docs</a>
+    <a href="https://github.com/JustVugg/colibri/blob/main/docs/brio.md">Brio</a><a href="https://github.com/JustVugg/colibri/blob/main/docs/api.md">API</a>
+    <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Benchmarks</a><a href="https://github.com/JustVugg/colibri/issues">Issues</a>
+    <a href="https://github.com/JustVugg/colibri/blob/main/LICENSE">Apache 2.0</a>
+  </span>
+</div></footer>
 
 <script>
-/* Live GitHub figures.
- * Progressive enhancement, deliberately: the numbers are already correct in the
- * HTML, so this page is honest with JS disabled, with the API rate-limited, or
- * offline. The fetch only ever *refreshes* them -- it never blanks them, never
- * shows a spinner, and never writes a smaller number than the one already there
- * (a rate-limited 403 returns no data, and a partial response is ignored).
- * Cached for an hour in localStorage so a reload doesn't spend the visitor's
- * unauthenticated quota (60 req/h per IP). */
-(function liveStats(){
-  var KEY='coli.gh.v1', TTL=36e5, REPO='JustVugg/colibri';
-  function paint(d){
-    if(!d) return;
-    document.querySelectorAll('[data-gh]').forEach(function(el){
-      var v=d[el.getAttribute('data-gh')];
-      if(typeof v==='number' && v>0) el.textContent=v.toLocaleString('en-US');
-    });
-    if(d.created_at){
-      var wk=Math.floor((Date.now()-Date.parse(d.created_at))/6048e5);
-      var el=document.querySelector('[data-gh-age]');
-      if(el && wk>0){
-        var words=['one','two','three','four','five','six','seven','eight','nine','ten','eleven','twelve'];
-        el.textContent = wk<=12 ? words[wk-1]+' weeks'
-                       : (wk<52 ? Math.round(wk/4.345)+' months' : (wk/52).toFixed(1)+' years');
-      }
-    }
-  }
-  try{
-    var c=JSON.parse(localStorage.getItem(KEY)||'null');
-    if(c && Date.now()-c.t<TTL){ paint(c.d); return; }
-  }catch(e){}
-  fetch('https://api.github.com/repos/'+REPO,{headers:{'Accept':'application/vnd.github+json'}})
-    .then(function(r){ return r.ok ? r.json() : null; })
-    .then(function(d){
-      if(!d || typeof d.stargazers_count!=='number') return;   // rate-limited or odd payload: keep the static numbers
-      paint(d);
-      try{ localStorage.setItem(KEY, JSON.stringify({t:Date.now(), d:{
-        stargazers_count:d.stargazers_count, forks_count:d.forks_count, created_at:d.created_at}})); }catch(e){}
-    })
-    .catch(function(){});   /* offline / blocked: the HTML numbers stand */
-})();
-
-const nav=document.getElementById('nav');
-addEventListener('scroll',()=>nav.classList.toggle('on',scrollY>16),{passive:true});
-const io=new IntersectionObserver((es)=>es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}}),{threshold:.08});
-document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
-const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
-
-/* ---- Expert atlas: a rotating 3-D galaxy of measured experts, clustered by topic ---- */
+/* Search, filters and the rail highlight. One file, no build step. */
 (function(){
-  const cv=document.getElementById('atlasCanvas'); if(!cv) return;
-  const ctx=cv.getContext('2d');
-  const TOPICS=['poetry','law','code_python','math_proof','medicine','chinese',
-                'german','sql','json','reasoning','biology','finance'];
-  const golden=Math.PI*(1+Math.sqrt(5)), R=1.42;
-  const anchors=TOPICS.map((name,i)=>{
-    const ph=Math.acos(1-2*(i+0.5)/TOPICS.length), th=golden*i;
-    return {x:Math.cos(th)*Math.sin(ph)*R,y:Math.cos(ph)*R,z:Math.sin(th)*Math.sin(ph)*R,name};
+  var q=document.getElementById("q"),list=document.getElementById("mlist"),
+      none=document.getElementById("mnone"),pills=document.querySelectorAll(".fp"),active="";
+  function apply(){
+    var n=q.value.trim().toLowerCase(),shown=0;
+    Array.prototype.forEach.call(list.children,function(r){
+      var hit=(!n||r.dataset.find.indexOf(n)>=0)&&(!active||r.dataset.tags.indexOf(active)>=0);
+      r.hidden=!hit; if(hit)shown++;
+    });
+    none.hidden=shown>0;
+  }
+  q.addEventListener("input",function(){
+    apply();
+    if(q.value.trim()) document.getElementById("models").scrollIntoView({behavior:"smooth",block:"start"});
   });
-  const pts=[], N=2600;
-  for(let i=0;i<N;i++){
-    if(Math.random()<0.15){ // generalist drifting to the centre
-      pts.push({x:(Math.random()-.5)*.72,y:(Math.random()-.5)*.72,z:(Math.random()-.5)*.72,r:0.8,b:0.22+Math.random()*0.18});
-    }else{
-      const a=anchors[(Math.random()*anchors.length)|0], s=0.36;
-      pts.push({x:a.x+(Math.random()-.5)*s,y:a.y+(Math.random()-.5)*s,z:a.z+(Math.random()-.5)*s,
-                r:Math.random()<0.1?2.1:0.95,b:0.42+Math.random()*0.55});
-    }
+  pills.forEach(function(p){
+    p.addEventListener("click",function(){
+      var was=p.classList.contains("on");
+      pills.forEach(function(o){o.classList.remove("on")});
+      active = was ? "" : (p.classList.add("on"), p.dataset.f);
+      apply();
+    });
+  });
+  document.querySelectorAll(".cp").forEach(function(b){
+    b.addEventListener("click",function(){
+      navigator.clipboard.writeText(b.previousElementSibling.textContent).then(function(){
+        b.textContent="copied"; setTimeout(function(){b.textContent="copy"},1200);
+      });
+    });
+  });
+  var links=[].slice.call(document.querySelectorAll("#rail a")),
+      blocks=links.map(function(a){return document.querySelector(a.getAttribute("href"))});
+  function mark(){
+    var y=window.scrollY+220,best=0;
+    blocks.forEach(function(b,i){ if(b&&b.offsetTop<=y) best=i; });
+    links.forEach(function(a,i){ a.classList.toggle("on",i===best) });
   }
-  const XS=1.62; // stretch horizontally -> a wide galaxy
-  let W,H,DPR,ry=0.5,rx=-0.14,drag=false,lx=0,ly=0;
-  function size(){DPR=Math.min(devicePixelRatio||1,2);W=cv.clientWidth;H=cv.clientHeight;
-    cv.width=Math.max(1,W*DPR);cv.height=Math.max(1,H*DPR);ctx.setTransform(DPR,0,0,DPR,0,0);}
-  function rot(p){
-    const cyy=Math.cos(ry),syy=Math.sin(ry),x=p.x*cyy-p.z*syy,z1=p.x*syy+p.z*cyy,
-          cxx=Math.cos(rx),sxx=Math.sin(rx),y=p.y*cxx-z1*sxx,z=p.y*sxx+z1*cxx;
-    return {x,y,z};
+  window.addEventListener("scroll",mark,{passive:true}); mark();
+
+  /* Theme. Same contract as PR #1551: the "colibri_theme" key, the data-theme
+     attribute, the D shortcut, and the OS preference followed only while the
+     visitor has not chosen for themselves. */
+  var tt=document.getElementById("tt");
+  function paint(theme){
+    if(!tt)return;
+    var dark=theme==="dark";
+    tt.setAttribute("aria-label", dark?"Switch to light theme":"Switch to dark theme");
+    tt.setAttribute("title", (dark?"Switch to light theme":"Switch to dark theme")+" (D)");
   }
-  function draw(){
-    ctx.clearRect(0,0,W,H);
-    const cx=W/2,cy=H/2,scale=Math.min(W,H)*0.46,persp=3.0;
-    const proj=[];
-    for(const p of pts){const r=rot(p),f=persp/(persp+r.z);proj.push({sx:cx+r.x*scale*f*XS,sy:cy+r.y*scale*f,f,z:r.z,b:p.b,rr:p.r});}
-    proj.sort((a,b)=>b.z-a.z);
-    for(const q of proj){
-      const al=Math.max(0.03,Math.min(1,(q.f-0.48)*1.55))*q.b;
-      ctx.fillStyle='rgba(240,236,227,'+al.toFixed(3)+')';
-      ctx.beginPath();ctx.arc(q.sx,q.sy,Math.max(0.4,q.rr*q.f),0,6.2832);ctx.fill();
-    }
-    ctx.font='500 11px ui-monospace,Menlo,Consolas,monospace';ctx.textAlign='center';
-    for(const a of anchors){
-      const r=rot(a),f=persp/(persp+r.z);
-      if(f>0.8){ctx.fillStyle='rgba(176,168,154,'+Math.min(.6,(f-0.76)*3).toFixed(3)+')';
-        ctx.fillText(a.name,cx+r.x*scale*f*XS,cy+r.y*scale*f-8);}
-    }
+  function setTheme(theme,persist){
+    var el=document.documentElement;
+    el.classList.add("theme-transition");
+    el.setAttribute("data-theme",theme);
+    if(persist){ try{ localStorage.setItem("colibri_theme",theme) }catch(e){} }
+    paint(theme);
+    setTimeout(function(){ el.classList.remove("theme-transition") },300);
   }
-  function loop(){if(!drag)ry+=0.0014;draw();requestAnimationFrame(loop);}
-  cv.addEventListener('pointerdown',e=>{drag=true;lx=e.clientX;ly=e.clientY;cv.style.cursor='grabbing';try{cv.setPointerCapture(e.pointerId)}catch(_){}});
-  cv.addEventListener('pointermove',e=>{if(!drag)return;ry+=(e.clientX-lx)*0.006;rx=Math.max(-0.95,Math.min(0.95,rx+(e.clientY-ly)*0.004));lx=e.clientX;ly=e.clientY;});
-  addEventListener('pointerup',()=>{drag=false;cv.style.cursor='grab';});
-  size();addEventListener('resize',()=>{size();if(reduce)draw();},{passive:true});
-  if(reduce)draw();else loop();
+  function flip(){
+    setTheme(document.documentElement.getAttribute("data-theme")==="dark"?"light":"dark",true);
+  }
+  paint(document.documentElement.getAttribute("data-theme")||"light");
+  if(tt) tt.addEventListener("click",flip);
+  window.addEventListener("keydown",function(e){
+    var t=(document.activeElement||{}).tagName;
+    if((e.key==="d"||e.key==="D")&&["INPUT","TEXTAREA","SELECT"].indexOf(t)<0&&!e.metaKey&&!e.ctrlKey&&!e.altKey){
+      e.preventDefault(); flip();
+    }
+  });
+  try{
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change",function(e){
+      if(!localStorage.getItem("colibri_theme")) setTheme(e.matches?"dark":"light",false);
+    });
+  }catch(e){}
+
 })();
 </script>
 </body>

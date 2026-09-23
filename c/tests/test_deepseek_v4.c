@@ -1063,6 +1063,163 @@ static int test_expert_store_miss_scaling(void) {
          "(44/104/208 slots=1 probe each)");
     return 0;
 }
+
+/* REAP-style layout: per-matrix scale/weight pairs so contiguous_group()
+ * fails and build_record() sets per_matrix=1. Payload is padded past 4 KiB
+ * so an O_DIRECT window has a real aligned pread. */
+static int write_per_matrix_fixture(const char *path, int expert_count) {
+    static const char *matrix_names[3] = {"w1", "w2", "w3"};
+    if (expert_count < 1) return -1;
+    size_t header_capacity = 256 + (size_t)expert_count * 1024;
+    char *header = malloc(header_capacity);
+    size_t payload_size = 8192;
+    unsigned char *payload = malloc(payload_size);
+    if (!header || !payload) {
+        free(payload);
+        free(header);
+        return -1;
+    }
+    size_t used = (size_t)snprintf(header, header_capacity, "{");
+    size_t cursor = 0;
+    for (int expert = 0; expert < expert_count; expert++) {
+        for (int matrix = 0; matrix < 3; matrix++) {
+            size_t scale = cursor;
+            size_t weight = cursor + 1;
+            int count = snprintf(
+                header + used, header_capacity - used,
+                "%s\"layers.0.ffn.experts.%d.%s.scale\":{"
+                "\"dtype\":\"F8_E8M0\",\"shape\":[1,1],"
+                "\"data_offsets\":[%zu,%zu]}",
+                used > 1 ? "," : "", expert, matrix_names[matrix],
+                scale, scale + 1);
+            if (count < 0 || (size_t)count >= header_capacity - used) {
+                free(payload); free(header); return -1;
+            }
+            used += (size_t)count;
+            count = snprintf(
+                header + used, header_capacity - used,
+                ",\"layers.0.ffn.experts.%d.%s.weight\":{"
+                "\"dtype\":\"I8\",\"shape\":[1,16],"
+                "\"data_offsets\":[%zu,%zu]}",
+                expert, matrix_names[matrix], weight, weight + 16);
+            if (count < 0 || (size_t)count >= header_capacity - used) {
+                free(payload); free(header); return -1;
+            }
+            used += (size_t)count;
+            cursor += 17;
+        }
+    }
+    if (used + 1 >= header_capacity) {
+        free(payload); free(header); return -1;
+    }
+    header[used++] = '}';
+    header[used] = '\0';
+    for (size_t i = 0; i < payload_size; i++)
+        payload[i] = (unsigned char)i;
+    uint64_t header_length = used;
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY | COMPAT_O_BINARY, 0600);
+    if (fd < 0) {
+        free(payload); free(header); return -1;
+    }
+    int result = write_all(fd, &header_length, sizeof(header_length)) ||
+                 write_all(fd, header, (size_t)header_length) ||
+                 write_all(fd, payload, payload_size);
+    close(fd);
+    free(payload);
+    free(header);
+    return result ? -1 : 0;
+}
+
+static int expect_per_matrix_expert(const ColiExpertView *view, int expert) {
+    int base = expert * 51;
+    return view->gate.format == COLI_TENSOR_FP4_NATIVE_BLOCK &&
+           view->gate.rows == 1 && view->gate.columns == 32 &&
+           view->gate.data_bytes == 16 && view->gate.scale_bytes == 1 &&
+           view->down.data_bytes == 16 && view->up.data_bytes == 16 &&
+           ((const unsigned char *)view->gate.scales)[0] ==
+               (unsigned char)base &&
+           ((const unsigned char *)view->down.scales)[0] ==
+               (unsigned char)(base + 17) &&
+           ((const unsigned char *)view->up.scales)[0] ==
+               (unsigned char)(base + 34) &&
+           ((const unsigned char *)view->gate.data)[0] ==
+               (unsigned char)(base + 1) &&
+           ((const unsigned char *)view->down.data)[0] ==
+               (unsigned char)(base + 18) &&
+           ((const unsigned char *)view->up.data)[0] ==
+               (unsigned char)(base + 35);
+}
+
+static int test_expert_store_per_matrix_direct(void) {
+    /* Would fail this test: per_matrix always increments v4_direct_fallbacks
+     * and never calls v4_read_direct_window even when a direct twin exists. */
+    char directory[] = "colibri-v4-reap-XXXXXX";
+    char path[256], error[256];
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    setenv("COLI_V4_PREWARM", "0", 1);
+    unsetenv("COLI_V4_DIRECT");
+    if (!mkdtemp(directory)) { perror("mkdtemp per_matrix"); return 1; }
+    snprintf(path, sizeof(path), "%s/model.safetensors", directory);
+    if (write_per_matrix_fixture(path, 2) != 0) {
+        perror("write_per_matrix_fixture");
+        rmdir(directory);
+        return 1;
+    }
+
+    ColiDeepSeekV4ExpertStoreOptions options = {
+        directory, 1, 2, 102, -1, 0, 0
+    };
+    ColiExpertStore *store = NULL;
+    if (coli_deepseek_v4_expert_store_open(&options, &store,
+                                            error, sizeof(error)) != 0) {
+        fprintf(stderr, "%s\n", error);
+        unlink(path); rmdir(directory);
+        return 1;
+    }
+    if (coli_v4_test_force_streaming_direct(store) != 0) {
+        fprintf(stderr, "per_matrix direct: no streaming-direct fd\n");
+        store->ops->destroy(store);
+        unlink(path); rmdir(directory);
+        return 1;
+    }
+    coli_v4_test_reset_direct_io_stats();
+    ColiExpertView view;
+    if (coli_expert_lookup(store, (ColiExpertKey){0, 0}, &view) != 0) {
+        fprintf(stderr, "per_matrix lookup failed\n");
+        store->ops->destroy(store);
+        unlink(path); rmdir(directory);
+        return 1;
+    }
+    if (!expect_per_matrix_expert(&view, 0)) {
+        fprintf(stderr,
+                "per_matrix slab mismatch: scales=%u/%u/%u weights=%u/%u/%u\n",
+                ((const unsigned char *)view.gate.scales)[0],
+                ((const unsigned char *)view.down.scales)[0],
+                ((const unsigned char *)view.up.scales)[0],
+                ((const unsigned char *)view.gate.data)[0],
+                ((const unsigned char *)view.down.data)[0],
+                ((const unsigned char *)view.up.data)[0]);
+        coli_expert_release(store, &view);
+        store->ops->destroy(store);
+        unlink(path); rmdir(directory);
+        return 1;
+    }
+    coli_expert_release(store, &view);
+    uint64_t reads = coli_v4_test_direct_reads();
+    uint64_t fallbacks = coli_v4_test_direct_fallbacks();
+    store->ops->destroy(store);
+    if (scratch_remove(directory, path)) return 1;
+    if (reads < 1 || fallbacks != 0) {
+        fprintf(stderr,
+                "per_matrix direct path unused: reads=%llu fallbacks=%llu\n",
+                (unsigned long long)reads, (unsigned long long)fallbacks);
+        return 1;
+    }
+    puts("DeepSeek-V4 ExpertStore per_matrix direct: ok");
+    return 0;
+}
 /* ==== end test_deepseek_v4_expert_store.c ==== */
 
 /* ==== begin test_deepseek_v4_kv_cache.c ==== */
@@ -1529,6 +1686,10 @@ int main(int argc, char **argv) {
     }
     if (test_expert_store_miss_scaling() != 0) {
         fprintf(stderr, "FAIL: test_expert_store_miss_scaling\n");
+        return 1;
+    }
+    if (test_expert_store_per_matrix_direct() != 0) {
+        fprintf(stderr, "FAIL: test_expert_store_per_matrix_direct\n");
         return 1;
     }
     if (test_kv_cache() != 0) {

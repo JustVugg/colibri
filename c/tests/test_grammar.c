@@ -143,6 +143,34 @@ int main(void){
     CHECK(gr_forced(&S,buf,sizeof buf)==6 && !memcmp(buf,"\"id\":\"",6));
     gr_free(&G);
 
+    /* repetition is not capped by GR_MAX_DEPTH: every repeat of x* / x+ used to keep
+     * one finished caller frame, so the walker switched itself off at the 52nd row of
+     * this NDJSON grammar and at the 62nd byte of the string below, and drafted
+     * nothing after */
+    CHECK(gr_parse(&G,
+        "root ::= riga+\n"
+        "riga ::= \"{\\\"id\\\":\\\"\" chiave \"\\\",\\\"fit_category\\\":\\\"\" cat \"\\\"}\" \"\\n\"\n"
+        "chiave ::= [a-z0-9-]+\n"
+        "cat  ::= \"no_fit\" | \"partial_fit\" | \"good_fit\"\n")==0);
+    gr_state_init(&S,&G);
+    for(int r=0;r<200;r++){
+        char riga[96];
+        int len=snprintf(riga,sizeof riga,"{\"id\":\"ocds-%d\",\"fit_category\":\"good_fit\"}\n",r);
+        CHECK(feed(&S,riga)==len);
+    }
+    CHECK(S.alive && feed(&S,"{")==1);
+    CHECK(gr_forced(&S,buf,sizeof buf)==6 && !memcmp(buf,"\"id\":\"",6));
+    gr_free(&G);
+
+    CHECK(gr_parse(&G,"root ::= \"\\\"\" [a-z ]* \"\\\"\"")==0);
+    gr_state_init(&S,&G);
+    char lungo[402];
+    lungo[0]='\"'; memset(lungo+1,'a',400); lungo[401]=0;
+    CHECK(feed(&S,lungo)==401 && S.alive);
+    CHECK(feed(&S,"\"")==1);
+    CHECK(gr_admissible(&S,m,&end)==0 && end==1);
+    gr_free(&G);
+
     puts("test_grammar: ok");
     return 0;
 }

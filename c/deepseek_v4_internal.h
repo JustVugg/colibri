@@ -966,6 +966,20 @@ struct ColiV4Session {
     uint64_t spec_drafted;
     uint64_t spec_accepted;
     int spec_disabled;
+    /* Prompt-end capture for SUBMIT pin=1: the ids fed and the head scores
+     * that predict the token after them. A later prompt that starts with
+     * exactly these ids gets its first fresh token's predictor from here; that
+     * token is the one a closed-set caller asks about (docs/brio.md). The
+     * attention state itself goes to a v4_ckpt slot; this is the part the
+     * snapshot does not hold. */
+    int *pin_ids;
+    int pin_len;
+    float *pin_scores;
+    /* Scratch for the numeric channel, one hidden row and one row of head
+     * scores, allocated on first use and freed with the session so the many
+     * early returns of generate() leave nothing behind. */
+    float *echo_hidden;
+    float *echo_scores;
 };
 
 /* RAM-tiered expert open used by coli_v4_engine_open (replaces ld --wrap).
@@ -1002,6 +1016,12 @@ extern void (*coli_v4_test_expert_wait_hook)(ColiExpertKey key);
 extern uint64_t coli_v4_test_fp4_batch_calls;
 extern uint64_t coli_v4_test_expert_victim_probes;
 int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key);
+void coli_v4_test_reset_direct_io_stats(void);
+uint64_t coli_v4_test_direct_reads(void);
+uint64_t coli_v4_test_direct_fallbacks(void);
+/* Point missing O_DIRECT twins at a dup of the buffered fd so tests can
+ * exercise the direct-window path on filesystems that refuse O_DIRECT. */
+int coli_v4_test_force_streaming_direct(ColiExpertStore *store);
 
 ColiV4Session *coli_v4_test_session_bare_create(ColiV4Engine *engine);
 void coli_v4_test_session_bare_destroy(ColiV4Session *session);
