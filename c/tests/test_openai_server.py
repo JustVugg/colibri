@@ -1836,6 +1836,17 @@ class HTTPTest(unittest.TestCase):
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
 
+    def test_health_reports_the_continuation_switch(self):
+        """The web UI shows Continue only when this is true: with the switch off a
+        trailing assistant turn is answered fresh, which a Continue button would
+        present as a resumption. Unauthed probes keep the bare liveness shape."""
+        for value, expected in (("1", True), ("0", False)):
+            with patch.dict(os.environ, {"COLI_CONTINUE_ASSISTANT": value}), \
+                 self.request("/health") as response:
+                self.assertIs(json.load(response)["continue_assistant"], expected)
+        with urlopen(self.base + "/health", timeout=2) as response:
+            self.assertNotIn("continue_assistant", json.load(response))
+
     def test_profile_requires_auth(self):
         """/profile is served before require_auth(), so it needs its own gate.
 
