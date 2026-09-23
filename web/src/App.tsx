@@ -40,7 +40,7 @@ import { Markdown } from "./components/Markdown"
 import { NavigationDock, type View } from "./components/NavigationDock"
 import { Profiling } from "./Profiling"
 import { persistPublicSettings, stored } from "@/lib/storage"
-import { appendDelta, continuation } from "@/lib/transcript"
+import { appendDelta, continuable, continuation, setFinish } from "@/lib/transcript"
 import { cn } from "@/lib/utils"
 import { useLocale } from "./i18n"
 
@@ -71,12 +71,6 @@ export default function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [healthError, setHealthError] = useState("")
   const [lastRun, setLastRun] = useState<StreamChatResult | null>(null)
-  /* How the last turn ended, for deciding whether it can be continued: "length"
-     (hit max_tokens) and "aborted" (stopped by hand) are open and continuable;
-     "stop" (the model closed the turn) is complete, and continuing it only makes
-     the model re-emit its stop and add nothing. null before any turn / after a
-     reset. Tracked apart from lastRun because an abort never sets a result. */
-  const [lastFinish, setLastFinish] = useState<string | null>(null)
   const [draft, setDraft] = useState("")
   const [loading, setLoading] = useState(false)
   const [streamStart, setStreamStart] = useState<number | null>(null)
@@ -158,7 +152,7 @@ export default function App() {
   }, [cacheSlot, kvSlots])
 
   // EFFECT #6
-  useEffect(() => { setLastRun(null); setLastFinish(null) }, [cacheSlot])
+  useEffect(() => { setLastRun(null) }, [cacheSlot])
 
   // EFFECT #7
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }) }, [messages])
@@ -280,19 +274,17 @@ export default function App() {
         completion: prev.completion + (result.usage?.completion_tokens || 0),
       }))
       setLastRun(result)
-      setLastFinish(result.finishReason)
+      updateMessages((current) => setFinish(current, targetId, result.finishReason))
       setConnected(true)
     } catch (cause) {
       /* Drop the target bubble only if it is empty -- a first turn that never got
          a token. A continued turn already carries the client's opening, so the
-         `|| item.content` keeps it on the screen through an abort or an error. */
-      if (controller.signal.aborted) {
-        setLastFinish("aborted")
-        updateMessages((current) => current.filter((item) => item.id !== targetId || item.content || item.reasoning))
-      } else {
-        setError(cause instanceof Error ? cause.message : "status.generationFailed")
-        updateMessages((current) => current.filter((item) => item.id !== targetId || item.content || item.reasoning))
-      }
+         `|| item.content` keeps it on the screen through an abort or an error, and
+         `|| item.reasoning` keeps a turn stopped while it was still thinking. */
+      const finish = controller.signal.aborted ? "aborted" : "error"
+      if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : "status.generationFailed")
+      updateMessages((current) => setFinish(current, targetId, finish)
+        .filter((item) => item.id !== targetId || item.content || item.reasoning))
     } finally {
       abortRef.current = null
       setLoading(false)
@@ -326,7 +318,7 @@ export default function App() {
   }
 
   const openSettings = (page = "general") => { setSettingsPage(page); setView("settings") }
-  const clearChat = () => { updateMessages([]); setLastRun(null); setLastFinish(null); setTokPerSec(null); setTtft(null); setTokenCount(0); setTotalTokens({ prompt: 0, completion: 0 }); setError("") }
+  const clearChat = () => { updateMessages([]); setLastRun(null); setTokPerSec(null); setTtft(null); setTokenCount(0); setTotalTokens({ prompt: 0, completion: 0 }); setError("") }
   const newChat = () => {
     if (loading) return
     if (messages.length) setArchives(items => [{ id: message("system", "").id, slot: cacheSlot, messages: [...messages] }, ...items])
@@ -344,7 +336,7 @@ export default function App() {
     const slot = entry.slot < kvSlots ? entry.slot : cacheSlot
     const currentMessages = conversations[slot] || []
     setArchives(items => [...(currentMessages.length ? [{ id: message("system", "").id, slot, messages: currentMessages }] : []), ...items.filter(item => item.id !== entry.id)])
-    setConversations(items => ({ ...items, [slot]: entry.messages })); setCacheSlot(slot); setView("chat"); setHistoryOpen(false); setLastRun(null); setLastFinish(null); setError(""); setDraft("")
+    setConversations(items => ({ ...items, [slot]: entry.messages })); setCacheSlot(slot); setView("chat"); setHistoryOpen(false); setLastRun(null); setError(""); setDraft("")
   }
   const empty = messages.length === 0
   const connectionControls = (<fieldset disabled={loading}><section className="side-section">
@@ -460,7 +452,7 @@ export default function App() {
                   <div className="reasoning-body">{item.reasoning}</div>
                 </details>
               : null}{item.content ? (item.role === "assistant" ? <Markdown text={item.content} /> : item.content) : <span className="typing" aria-label={t("ui.generating")}><i /><i /><i /></span>}</div>
-            {item.role === "assistant" && item.content && <div className="message-actions"><button className="icon-action" aria-label={t("ui.copy")} title={t("ui.copy")} onClick={() => void copyMessage(item)}><Copy /></button>{copied === item.id && <span role="status">{t("ui.copied")}</span>}{index === messages.length - 1 && !loading && <button className="icon-action" aria-label={t("ui.regenerate")} title={t("ui.regenerate")} onClick={() => { const retry = resendFrom(messages, index); if (retry) void send(retry.text, retry.previous, retry.pictures, false) }}><RefreshCw /></button>}{index === messages.length - 1 && !loading && supportsContinuation(health) && (lastFinish === "length" || lastFinish === "aborted") && <button className="icon-action" aria-label={t("ui.continue")} title={t("ui.continue")} onClick={() => void continueTurn()}><StepForward /></button>}</div>}
+            {item.role === "assistant" && item.content && <div className="message-actions"><button className="icon-action" aria-label={t("ui.copy")} title={t("ui.copy")} onClick={() => void copyMessage(item)}><Copy /></button>{copied === item.id && <span role="status">{t("ui.copied")}</span>}{index === messages.length - 1 && !loading && <button className="icon-action" aria-label={t("ui.regenerate")} title={t("ui.regenerate")} onClick={() => { const retry = resendFrom(messages, index); if (retry) void send(retry.text, retry.previous, retry.pictures, false) }}><RefreshCw /></button>}{index === messages.length - 1 && !loading && supportsContinuation(health) && continuable(item) && <button className="icon-action" aria-label={t("ui.continue")} title={t("ui.continue")} onClick={() => void continueTurn()}><StepForward /></button>}</div>}
           </article>)}<div ref={bottomRef} /></div>
         </div>}
         <div className="composer-wrap">

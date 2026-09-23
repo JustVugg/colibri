@@ -7,6 +7,22 @@ export function appendDelta(messages: ChatMessage[], targetId: string, field: "c
     item.id === targetId ? { ...item, [field]: (item[field] ?? "") + delta } : item)
 }
 
+/* Record how the generation streaming into `targetId` ended. A null finish is
+   a stream that closed without a finish_reason: colibri always sends one last,
+   so the reply was cut off, and is recorded as "incomplete", not as done. */
+export function setFinish(messages: ChatMessage[], targetId: string, finish: string | null): ChatMessage[] {
+  return messages.map((item) => item.id === targetId ? { ...item, finish: finish ?? "incomplete" } : item)
+}
+
+/* An assistant turn is open, and worth continuing, when it hit max_tokens or
+   was cut off by a stop, an error, or a stream that closed without saying how
+   it finished. "stop" means the model closed the turn,
+   and continuing it only makes the model re-emit its stop and add nothing. */
+export function continuable(message: ChatMessage): boolean {
+  return message.role === "assistant" && !!message.content.trim()
+    && ["length", "aborted", "error", "incomplete"].includes(message.finish ?? "")
+}
+
 /* The request that continues the trailing assistant turn instead of opening a
    new one: the transcript ending on that turn, streamed back into the same
    bubble. Trailing whitespace is stripped because the server refuses it (the
