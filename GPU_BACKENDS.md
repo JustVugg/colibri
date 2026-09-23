@@ -212,7 +212,10 @@ uses, so output may differ.
 never include or link XRT. `XDNA=1` compiles them into the host and defines
 `COLI_XDNA`; the Windows release build uses it (`.github/workflows/release.yml`),
 because an `XDNA=1` host has the same import table as a default one and starts
-normally on a machine with no NPU.
+normally on a machine with no NPU. CI's Windows engine build uses the same
+`make_args` (`.github/workflows/ci.yml`), so that configuration is compiled on
+every change rather than first at a release tag, and a step there checks the
+binary: the lane is present, and neither XRT nor the helper is imported.
 
 ### Turning it on
 
