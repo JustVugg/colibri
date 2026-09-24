@@ -2483,6 +2483,11 @@ GENERIC_JSON_GBNF = (
 
 DEFAULT_CHAT_STOP_SEQUENCES = ("<|user|>", "<|observation|>")
 
+# Seconds to wait for the engine to exit on its own after stdin EOF (its
+# atexit teardown writes HEAT_FILE). EOF is only observed between turns,
+# so an in-flight generation delays exit; override for impatient scripts.
+_ENGINE_DRAIN_S = float(os.environ.get("COLI_ENGINE_DRAIN_S", "30"))
+
 
 def parse_stop_sequences(body):
     value = body.get("stop")
@@ -2979,9 +2984,15 @@ class Engine:
         resolved_cap = cap_for_arch(arch, cap, child_env)
         child_env.pop("COLI_PROFILE_CAP", None)
         child_env.pop("COLI_PLAN_CAP", None)
+        # Own process group on Windows: a CTRL_BREAK sent to the serve
+        # process group (the graceful stop, handled as SIGBREAK above) must
+        # not reach the engine — the C runtime's default would kill it
+        # before its stdin-EOF teardown (atexit -> HEAT_FILE save) can run.
+        spawn_flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
         self.process = subprocess.Popen(
             [str(executable), str(resolved_cap)], env=child_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
+            creationflags=spawn_flags,
         )
         # Keep the job handle on the instance: KILL_ON_JOB_CLOSE fires when the
         # LAST handle closes, so this reference is what ties the engine (and the
@@ -3370,21 +3381,33 @@ class Engine:
             self.closed = True
         self._fail_pending(RuntimeError("colibri engine is shutting down"))
         if self.process.poll() is None:
-            self.process.terminate()
+            # Graceful drain first: the engine's serve loop reads requests
+            # from stdin, and EOF there is the one portable path to its
+            # atexit teardown (qt_shutdown -> HEAT_FILE save). EOF only
+            # lands between turns, so the drain wait must be generous;
+            # anything else falls through to the hard-stop ladder below.
             try:
-                self.process.wait(timeout=5)
+                self.process.stdin.close()
+            except (OSError, ValueError, AttributeError):
+                pass
+            try:
+                self.process.wait(timeout=_ENGINE_DRAIN_S)
             except subprocess.TimeoutExpired:
-                # A large resident cache (e.g. 111 GB at --memory-gb 126) can
-                # take longer than the grace period to unmap and free on
-                # SIGTERM. SIGKILL cannot be caught, so the process is already
-                # on its way out; a second timeout only means the reap has not
-                # landed yet. Teardown is best-effort: never raise from here, or
-                # a completed measurement is lost to a shutdown that succeeded.
-                self.process.kill()
+                self.process.terminate()
                 try:
                     self.process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    pass
+                    # A large resident cache (e.g. 111 GB at --memory-gb 126) can
+                    # take longer than the grace period to unmap and free on
+                    # SIGTERM. SIGKILL cannot be caught, so the process is already
+                    # on its way out; a second timeout only means the reap has not
+                    # landed yet. Teardown is best-effort: never raise from here, or
+                    # a completed measurement is lost to a shutdown that succeeded.
+                    self.process.kill()
+                    try:
+                        self.process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
         if self.dispatcher is not threading.current_thread():
             self.dispatcher.join(timeout=5)
 
@@ -4887,6 +4910,16 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
         server.engine = runtime
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
+        # On Windows SIGTERM is never delivered (os.kill is TerminateProcess);
+        # CTRL_BREAK — the one console signal a controller CAN target at this
+        # process group — arrives as SIGBREAK. Without this handler it kills
+        # the serve loop outright, skipping the finally that drains the
+        # engine (stdin EOF -> atexit -> HEAT_FILE save). The engine child
+        # runs in its own process group (see Engine.__init__) and does not
+        # receive this event.
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK,
+                          lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
         try:
             server.serve_forever()
         except KeyboardInterrupt:
