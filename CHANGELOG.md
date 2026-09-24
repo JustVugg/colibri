@@ -3,9 +3,9 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [1.12.1] — 2026-09-22
+## [1.12.1] — 2026-09-24
 
-87 pull requests since v1.12.0, 75 of them from contributors. Two tokenizers
+95 pull requests since v1.12.0, 82 of them from contributors. Two tokenizers
 brought back to the reference, brio on the ninth engine, `coli chat` working
 again at the default context on two families, and a placement decision that
 is now measured on the card in front of it instead of predicted.
@@ -130,6 +130,16 @@ is now measured on the card in front of it instead of predicted.
   int8 down alone recovers a quarter of the gap between gs64 and all-int8,
   the rest sits in gate/up. A measurement tool and a middle step, not the
   answer to the gap.
+- **#1730** (mfethe1): DeepSeek V4's FP4 expert kernels, the prefill batch
+  and the decode matvec, get a NEON arm; arm64 used to take the scalar
+  arm, which is why Apple Silicon prefilled at decode speed (#1696). Bit
+  identical to the scalar arm, and the ARM CI job now checks that on every
+  change; 17 to 22x on the kernel at the V4 expert shapes on an M-series
+  Mac, as measured by the author.
+- **#1716** (jtinbergen): qwen36 quantizes its dense weights to int8 while
+  loading instead of keeping an f32 copy first, and converts f16/bf16 with
+  SIMD. On the 35B the resident set after load goes from 9.2 to 4.8 GB;
+  the generated text and the perplexity are identical to before.
 - **#1286** (cameron): the grouped int4 GEMV and the fused gate/up GEMV get
   an SSE4.1 arm for CPUs without AVX2 (Ivy Bridge and older). It vectorizes
   across output rows, so each lane runs the scalar row's exact sequence and
@@ -218,6 +228,20 @@ is now measured on the card in front of it instead of predicted.
   gateway and the whole answer came back as `reasoning_content`. The
   non-special added tokens are decoded now; special ones such as
   `<|im_start|>` still decode to nothing.
+- **#1734** (tarazum): stopping `coli serve` closes the engine's stdin and
+  waits for it to exit on its own before the hard-stop ladder, so the
+  engine's teardown runs; qwen36 never saved its `HEAT_FILE` under `coli
+  serve` (#1733). On Windows the gateway handles SIGBREAK and the engine
+  runs in its own process group.
+- **#1726** (kevin9327): Inkling measured no RAM on Windows and sized its
+  expert cache to 16 per layer; it uses the shared probe now, which on
+  Linux and macOS reads the same numbers as before.
+- **#1735**: on GNU Make 3.81, the system make on macOS, `.build-config`
+  was never written and every build relinked (#1732).
+- **#1731** (bokiko): the DeepSeek V4 CUDA object rebuilds when the nvcc
+  command changes, so a new `CUDA_ARCH` no longer links the old object.
+- **#1728** (crichalchemist): `make test-c VK=1` built 43 test binaries
+  without the Vulkan object; they link it now.
 - **#1712** (kevin9327): Kimi K3, Inkling and OLMoE now treat `max_tokens`
   as a ceiling like the other engines; `coli chat`'s default of 16384
   answered 400 on every Kimi and Inkling message against their 8192-token
@@ -301,6 +325,10 @@ is now measured on the card in front of it instead of predicted.
   dependency. The admission scheduler distinguishes completion, failure
   and cancellation, lets a request use a free slot that no earlier waiter
   reserved, and joins the keepalive pump before the slot is released.
+- **#1717** (enitimeago): the web chat offers Continue on the last
+  assistant message when it stopped at the token limit, by hand or on an
+  error, and only when `/health` says the server continues assistant
+  turns (#1699).
 - **#1402** (enitimeago): a request whose last message is a non-empty
   `assistant` turn continues that turn instead of answering in a new one, on
   `/v1/chat/completions` and `/v1/messages`, for all nine families (Kimi K3
