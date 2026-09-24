@@ -5,7 +5,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [1.12.1] — 2026-09-24
 
-95 pull requests since v1.12.0, 82 of them from contributors. Two tokenizers
+96 pull requests since v1.12.0, 80 of them from contributors. Two tokenizers
 brought back to the reference, brio on the ninth engine, `coli chat` working
 again at the default context on two families, and a placement decision that
 is now measured on the card in front of it instead of predicted.
