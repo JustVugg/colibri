@@ -247,3 +247,12 @@ then completing in 100 ms from meeting a one-second total-latency target.
 Goodput still divides qualifying completions by the entire batch wall time,
 including the drain after the last scheduled arrival. Keep rate, concurrency,
 request count, latency targets and timing basis equal across compared reports.
+
+### Repeated Colibri / SGLang / vLLM baseline
+
+The [three-engine baseline protocol](baselines/README.md) provides a manifest,
+rotating run plan and C1/C4/C8/C16 collector using this HTTP harness. Its comparison
+checks workload/configuration identity, keeps failed and missing cells visible,
+and reports min/median/max across rounds. It distinguishes matched artifacts from
+deployment comparisons with different weight formats. Quality, token-level latency
+and hardware telemetry require separate evidence; no performance ranking is bundled.

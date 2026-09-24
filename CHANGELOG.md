@@ -5,7 +5,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [1.12.1] — 2026-09-22
 
-66 pull requests since v1.12.0, 54 of them from contributors. Two tokenizers
+87 pull requests since v1.12.0, 75 of them from contributors. Two tokenizers
 brought back to the reference, brio on the ninth engine, `coli chat` working
 again at the default context on two families, and a placement decision that
 is now measured on the card in front of it instead of predicted.
@@ -130,6 +130,12 @@ is now measured on the card in front of it instead of predicted.
   int8 down alone recovers a quarter of the gap between gs64 and all-int8,
   the rest sits in gate/up. A measurement tool and a middle step, not the
   answer to the gap.
+- **#1286** (cameron): the grouped int4 GEMV and the fused gate/up GEMV get
+  an SSE4.1 arm for CPUs without AVX2 (Ivy Bridge and older). It vectorizes
+  across output rows, so each lane runs the scalar row's exact sequence and
+  the result is bit-identical; forced-SSE4.1 tests at -O1, -O3 and without
+  FP contraction pin it. 2.2 to 2.7x on the isolated kernel on a dual
+  E5-2680 v2.
 - **#1686** (DebugSultan): qwen38's prefill chunk (`Q38_PREFILL_BATCH_ROWS`)
   and workspace (`Q38_PREFILL_WORKSPACE_MIB`) are runtime knobs, the expert
   load batch is no longer capped at top-k, and the QSA ranking and
@@ -192,6 +198,63 @@ is now measured on the card in front of it instead of predicted.
   with zero errors and zero bytes leaked.
 - **#1669**: `test_systemone_api` imports its scoring engine relative to
   its package, so an installed `tests` package no longer breaks discovery.
+- **#1697** (kevin9327): the dashboard redesign had dropped the reasoning
+  stream: thinking tokens arrived on `delta.reasoning_content` and vanished,
+  the bubble stayed empty until the answer and a stop during thinking lost
+  the turn. The stream is read again, rendered as its own folding block,
+  counted in the rate and the time to first token, and a unit test pins the
+  split.
+- **#1693** (namespaceMarcello): with `PILOT` on, OLMoE could read the same
+  expert twice, once from the prefetcher and once from the forward pass,
+  into two slots; a slot being read now keeps a reservation in the index
+  (the `colibri.c` pattern) and the second caller waits for the first read
+  to publish. Three model-free scenarios pin it.
+- **#1695** (namespaceMarcello): the prefill echo state and `serve_echo` sit
+  under the same `QWEN36_NO_MAIN` guard, so the segment build no longer
+  warns about a function it never gets; the full build is byte-identical.
+- **#1724** (GenericRikka): Qwen3.6 decoded `<think>`, `</think>` and the
+  tool tags to nothing, because they live only in the tokenizer's
+  `added_tokens`; with thinking on, the closing tag never reached the
+  gateway and the whole answer came back as `reasoning_content`. The
+  non-special added tokens are decoded now; special ones such as
+  `<|im_start|>` still decode to nothing.
+- **#1712** (kevin9327): Kimi K3, Inkling and OLMoE now treat `max_tokens`
+  as a ceiling like the other engines; `coli chat`'s default of 16384
+  answered 400 on every Kimi and Inkling message against their 8192-token
+  window.
+- **#1713** (kevin9327): `coli plan`, `doctor` and `--auto-tier` export the
+  variable that actually sizes the expert cache on Kimi K3
+  (`K3_EXPERT_GB`) and GLM-5.3 (`GLM53_EXPERT_GB`); only `RAM_GB` was
+  exported, which neither engine reads as the cache size.
+- **#1711** (kevin9327): on Windows, a Kimi K3 `CUDA_DLL` build and a HIP
+  host were refused by `--gpu` as CPU-only; the probe reads the backend DLL
+  name the host was built with, and the launcher maps `--gpu` onto Kimi's
+  `K3_CUDA`.
+- **#1710** (kevin9327): a `tools[]` entry whose `function` is not an object
+  answered HTTP 500 from the GLM and DeepSeek renderers; it is the 400 that
+  `generation_options` already had.
+- **#1721** (monotophic): every frame the gateway writes to the engine is
+  checked, short writes are completed, and a failed `CANCEL` or `STOP`
+  drops the request's pending entry and answers a named 500 instead of a
+  silent close.
+- **#1714**, **#1719** (benmaster82): the brio options form pins the shared
+  state, so per-question requests on one document read it once; the web
+  page can stop a scoring run, and duplicate options are removed on both
+  clients.
+- **#1709** (kevin9327): regenerating a turn with pictures sends them again
+  and leaves the composer alone.
+- **#1646** (Stamina9): qwen38 says once, on stderr, why the parallel expert
+  read path is not taken (disabled, cache smaller than the route, no FP8
+  scale bank, repeated expert, converted layout).
+- **#1708** (wittchen): every `VK=1` build of glm53 failed to compile on a
+  misplaced parenthesis.
+- **#1707** (namespaceMarcello): the DeepSeek V4 unit objects rebuild when
+  the build flags change, so a CUDA engine build followed by `make test-c`
+  no longer links the wrong objects (#1702).
+- **#1715** (namespaceMarcello): seven GLM-5.3 harnesses matched the
+  unittest glob and counted as zero tests; they are renamed, a skip exits 2,
+  the two tiny oracles run in CI, and a discovery test catches the next
+  empty module (#1700).
 - **#1622**: DeepSeek V4's REAP checkpoints store each expert as six
   per-matrix records; the engine read them through buffered pread and
   counted every one as a direct-I/O fallback (36% of expert reads on the
@@ -246,11 +309,31 @@ is now measured on the card in front of it instead of predicted.
   `COLI_CONTINUE_ASSISTANT=0` restores the old behaviour; refused together
   with tools or a turn ending in whitespace, with a 400 that says why. Each
   renderer is pinned against the vendored template (#1401).
+- **#1102** (monotophic): checkpoint-faithful FP8 containers that store
+  `kv_b_proj` as fmt=8 could load but not decode attention; the absorb path
+  now decodes fmt=8 on CPU (bit-exact against the reference) and CUDA
+  (within the documented tolerance), and the kv_b sharding refuses by name
+  the formats it cannot serve, which also closes two silent misreads of
+  fmt=5 and fmt=6.
+- **#1395** (rybruscoe): `COLI_EXACT_VERIFY=1` makes the speculative verify
+  batch token-exact against sequential decode, at a measured cost on the
+  dot itself; off by default, the default path is unchanged.
+- **#1720** (monotophic): a request carrying `seed` is accepted and the seed
+  ignored, as `docs/api.md` now says, instead of a 400; no determinism is
+  implied.
 - **#1605**: `ORACLE_STRICT=1` makes a GLM oracle comparison exit non-zero
   when it fails, token-exact by default with `ORACLE_TF_MAX_MISMATCHES` for
   the documented teacher-forcing allowance; references are validated before
   the comparison and non-finite logits cannot pass. Both oracle CI jobs run
   real-process regressions against it.
+- **#1705**: `tools/benchmark_baseline.py`, a collection protocol on top of
+  the HTTP harness for a repeated three-engine serving baseline: one frozen
+  manifest (hardware, model and template identity, per-engine launch
+  settings, cache and speculation policy), a rotating plan over a
+  concurrency matrix, one collector per engine and round that manages no
+  server, and a comparison that keeps failed and missing cells visible and
+  distinguishes matched artifacts from deployment comparisons. No results
+  are bundled and no ranking is emitted.
 - **#1688**: `tools/benchmark_http_serving.py`, a stdlib HTTP streaming
   benchmark over fixed JSONL conversations: closed-loop or paced arrivals
   (periodic or Poisson, seeded), warmup separated from measurement,

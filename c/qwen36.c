@@ -317,8 +317,8 @@ static void encode_text(const char *text,int **out_ids,int *out_n){
     *out_ids=ids; *out_n=n;
 }
 
-/* Load Qwen tokenizer.json and build an id->piece table. Only needs the
- * "model.vocab" map (piece string -> id); merges are irrelevant for decoding. */
+/* Load Qwen tokenizer.json and build an id->piece table from model.vocab
+ * and added_tokens. Merges are irrelevant for decoding. */
 static void load_tokenizer(const char *path){
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[tok] cannot open %s\n", path); return; }
@@ -332,17 +332,42 @@ static void load_tokenizer(const char *path){
     jval *vocab = json_get(model, "vocab");
     if (!vocab) vocab = json_get(model, "tokens");
     if (!vocab) { fprintf(stderr, "[tok] no model.vocab/tokens in %s\n", path); free(buf); return; }
+    jval *adds = json_get(root, "added_tokens");
+
     int mx = 0;
     if (vocab->t == J_OBJ){
         for (int i=0;i<vocab->len;i++){ int id=(int)vocab->kids[i]->num; if(id>mx)mx=id; }
     } else {
         mx = vocab->len - 1;
     }
+    if (adds && adds->t==J_ARR){
+        for (int k=0;k<adds->len;k++){
+            jval *t = adds->kids[k];
+            int id = (int)jnum(t,"id");
+            if (id > mx) mx = id;
+        }
+    }
+
     g_tok = calloc((size_t)mx+1, sizeof(char*));
     if (vocab->t == J_OBJ){
         for (int i=0;i<vocab->len;i++){ int id=(int)vocab->kids[i]->num; if(id>=0 && id<=mx) g_tok[id]=strdup(vocab->keys[i]); }
     } else {
         for (int i=0;i<vocab->len;i++){ if(vocab->kids[i] && vocab->kids[i]->t==J_STR) g_tok[i]=strdup(vocab->kids[i]->str); }
+    }
+    if (adds && adds->t==J_ARR){
+        for (int k=0;k<adds->len;k++){
+            jval *t = adds->kids[k];
+            const char *c = jstr(t,"content");
+            int id = (int)jnum(t,"id");
+            /* Only the non-special ones: <think>, </think>, <tool_call>,
+             * <tool_response> are text the gateway parses. Special tokens
+             * (<|im_start|>, <|endoftext|>, ...) keep decoding to nothing,
+             * as reference decoding does with skip_special_tokens. */
+            jval *sp = json_get(t,"special");
+            if (sp && sp->t==J_BOOL && sp->boolean) continue;
+            if (c && id>=0 && id<=mx && !g_tok[id])
+                g_tok[id]=strdup(c);
+        }
     }
     g_tok_n = mx+1;
 
@@ -380,7 +405,6 @@ static void load_tokenizer(const char *path){
             smap_put(&g_merge, key, r);
         }
     }
-    jval *adds = json_get(root, "added_tokens");
     if (adds && adds->t==J_ARR && g_nspecial==0){
         g_nspecial = adds->len;
         g_sp_str = malloc(g_nspecial*sizeof(char*));
@@ -486,7 +510,7 @@ static void sse_chunk(const char *json){
  * <0xXX> byte-fallback tokens emit the raw byte directly. */
 static void decode_id_to_bytes(int id, unsigned char *out, int *outn){
     *outn = 0;
-    if (!g_tok || id<0 || id>=g_tok_n) return;
+    if (!g_tok || id<0 || id>=g_tok_n || !g_tok[id]) return;
     const unsigned char *pc = (const unsigned char*)g_tok[id];
     /* byte-fallback token: <0xXX> -> raw byte */
     if (pc[0]=='<' && pc[1]=='0' && pc[2]=='x' && pc[5]=='>'){
@@ -2816,10 +2840,13 @@ static int    g_pin_use_logit = 0;   /* 1 quando questa richiesta e ripartita da
 typedef struct { float **rec, **conv; int n_layers; } Q36PinState;
 
 /* Stato della lettura del prefill: dichiarato qui perche step() lo consulta e
- * step() viene prima del codice di servizio che lo accende. */
+ * step() viene prima del codice di servizio che lo accende. Solo il servizio
+ * lo accende e solo il servizio definisce serve_echo: senza main non esiste. */
+#ifndef QWEN36_NO_MAIN
 static int   g_echo_k  = 0;      /* 0 = spento */
 static const char *g_echo_id = NULL;
 static void serve_echo(const char *id, int pos, int token, const float *lo, int V, int k);
+#endif
 
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
@@ -2860,6 +2887,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
      * token, il cui predittore sta nello stato precedente. Per questo il
      * chiamante arretra di uno il riuso del prefisso quando la lettura e
      * accesa: cosi il primo token dell'opzione ricade sempre qui dentro. */
+#ifndef QWEN36_NO_MAIN
     if (g_echo_k > 0 && g_echo_id && S > 0) {
         float *erow = falloc(D), *elog = falloc(c->vocab);
         /* Il primo token fresco e predetto dallo stato PRECEDENTE, che dopo un
@@ -2875,6 +2903,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         }
         free(erow); free(elog);
     }
+#endif
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);

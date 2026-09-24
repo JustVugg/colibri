@@ -290,9 +290,10 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
         return (int64_t)t->O*(((int64_t)t->I+255)/256)*98 + 4;
     if(t->fmt==8){ /* fp8-e4m3 passthrough: O*I raw e4m3 bytes (n, byte-identical layout
                     * to fmt=1's weight bytes) + one f32 scale per 128x128 block
-                    * (FP8_BLOCK in quant.h, included below qt_bytes -- keep the
-                    * arithmetic literal here, same discipline as fmt=5's comment
-                    * above). Missing this branch would fall through to the fmt=2
+                    * (FP8_BLOCK in fp8_format.h via quant.h, included below
+                    * qt_bytes -- keep the arithmetic literal here, same
+                    * discipline as fmt=5's comment above). Missing this branch would
+                    * fall through to the fmt=2
                     * default below (packed-nibble formula, ~half the real weight
                     * bytes) and undercount a resident fp8 tensor's byte footprint --
                     * feeds AUTOPIN/RAM-budget math, so this branch is load-bearing
@@ -551,6 +552,19 @@ typedef struct {
  * than in quant.h: that header is shared by standalone kernel tests and
  * sibling engines, where translation-unit-local copies are unused and trip
  * -Wunused-variable. */
+#include "exact_dot.h"
+/* COLI_EXACT_VERIFY=1 (opt-in, #689): during draft+verify forwards (g_spec_live) the CPU
+ * MLA-absorb attention core accumulates its score and context dots EXACTLY (integer products,
+ * one rounding per dot; exact_dot.h). No summation order, SIMD width or contraction flag can
+ * change those bits, so a verify row decides near-ties the same way on every host. Off by
+ * default: it is an integer path (~7x the float loop on the dot itself at -O3). The default paths
+ * are untouched. */
+static int g_exact_verify=-1;
+static int exact_verify_on(void){
+    if(g_exact_verify<0){ const char *e=getenv("COLI_EXACT_VERIFY"); g_exact_verify=(e&&atoi(e))?1:0;
+        if(g_exact_verify) fprintf(stderr,"[EXACT_VERIFY] draft+verify attention core on the exact (order-independent) dot (#689; COLI_EXACT_VERIFY=0 to disable)\n"); }
+    return g_exact_verify;
+}
 static int g_idot=1;
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 static int g_i4s=1;
@@ -1019,8 +1033,16 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
                                     const uint8_t *qu, const float *su,
                                     int S, int I, int O, int gs){
     int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+    int o0=0;
+#if defined(__SSE4_1__) && !defined(__AVX2__)
+    if(!(gs&1)){
+        o0=O&~3;
+        if(o0) matmul_i4_grouped_pair_sse41_rows4(yg,yu,x,qg,sg,qu,su,S,I,O,gs,rb,ng,o0);
+        if(o0==O) return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){
+    for(int o=o0;o<O;o++){
         const uint8_t *wg=qg+(int64_t)o*rb; const uint8_t *wu2=qu+(int64_t)o*rb;
         const float *sgl=sg+(int64_t)o*ng;   const float *sul=su+(int64_t)o*ng;
         for(int s=0;s<S;s++){
@@ -2275,6 +2297,42 @@ static void qt_cuda_colocate(QT *dst,const QT *src){
 }
 static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
     if(!g_cuda_enabled||!g_cuda_dense||g_cuda_ndev<2||l->kv_b.fmt==0)return;
+    /* SHARD FORMAT ALLOWLIST (explicit refusal; this was an ACCIDENTAL fail-safe): the
+     * rb/weights/scale arithmetic below is written for exactly fmt=1 (int8, per-row
+     * scale), fmt=2 (int4 per-row), fmt=3 (int2 per-row) and fmt=4 (int4 grouped).
+     * Any other fmt reaching it computes a wrong row-byte stride, takes l->kv_b.q4 as
+     * the weight pointer (NULL for fmt=8, whose raw e4m3 bytes live in q8 -- see the
+     * QT struct comment), and slices l->kv_b.s with per-row/per-group geometry that
+     * fmt=8's per-128x128-BLOCK scales (and fmt=6's single 4-byte tag) simply do not
+     * have. fmt=8 only ever "worked" here by accident: q4==NULL made
+     * coli_cuda_tensor_upload_g's !weights check reject the upload before anything
+     * dereferenced it -- silent, unnamed, and one refactor away from a misread.
+     * Refuse BY NAME instead, BEFORE any pointer/stride use, and say what happens
+     * instead: the un-sharded kv_b stays whole on its layer home device, where fmt=8
+     * kv_b decode runs the absorb path (qt_addrow/qt_matvec_rows' fmt=8 branches, or
+     * the CUDA absorb kernels via absorb_fmt_ok) -- COLI_CUDA_ATTN_SHARD is a no-op
+     * for it. Same "refuse rather than misread" discipline as qt_addrow/
+     * qt_matvec_rows' guards; notice only (no exit): sharding is an opt-in
+     * optimization and skipping it is the correct, working behavior. Bounded once
+     * per process per fmt, never per layer (metal_fmt_gate_notice, the precedent
+     * for bounded notices, is coarser still: one line per tensor KIND, naming only
+     * the first offending fmt). */
+    if(l->kv_b.fmt!=1&&l->kv_b.fmt!=2&&l->kv_b.fmt!=3&&l->kv_b.fmt!=4){
+        static int refused_fmt[32];
+        if(!refused_fmt[l->kv_b.fmt&31]){ refused_fmt[l->kv_b.fmt&31]=1;
+            if(l->kv_b.fmt==8)
+                fprintf(stderr,"layer_cuda_shard_kvb: kv_b fmt=8 (fp8-e4m3, per-128x128-block "
+                    "scales) has no head-shard layout here -- refusing the shard; fmt=8 kv_b "
+                    "runs the absorb path on the layer home device instead, so "
+                    "COLI_CUDA_ATTN_SHARD is a no-op for it (applies to every layer)\n");
+            else
+                fprintf(stderr,"layer_cuda_shard_kvb: unsupported kv_b fmt=%d for the head-shard "
+                    "upload (only fmt 1/2/3/4 match the per-row byte/scale strides computed "
+                    "here) -- refusing the shard; kv_b stays whole on its layer home device "
+                    "(applies to every layer)\n",l->kv_b.fmt);
+        }
+        return;
+    }
     int rb=l->kv_b.fmt==1?l->kv_b.I:
            (l->kv_b.fmt==2||l->kv_b.fmt==4)?(l->kv_b.I+1)/2:(l->kv_b.I+3)/4;
     const uint8_t *weights=l->kv_b.fmt==1?(const uint8_t*)l->kv_b.q8:l->kv_b.q4;
@@ -3867,6 +3925,32 @@ static void expert_prefetch(Model *m, int layer, int eid){
 
 /* ---- helper per l'ABSORPTION: accesso per-riga ai QT quantizzati ---- */
 /* acc[0..I) += coef * W[row,:] (dequant al volo) */
+/* One fmt=8 block scale, checked before it multiplies anything.
+ *
+ * A NaN scale has no safe interpretation: it poisons the whole block and every
+ * accumulator downstream of it, and this function cannot repair it, so it is
+ * refused by name with the block that carried it -- the same "refuse rather
+ * than misread" discipline the format guards below apply.
+ *
+ * A ZERO scale is NOT refused: it is valid data. Block scales are amax/448, so
+ * a genuinely all-zero block (padding, an unused slice) legitimately produces
+ * zero, and decoding it as zeros is the correct answer. It cannot be confused
+ * with a decode against an unwritten table the way it can on the GPU, because
+ * there is no table here to be unwritten -- the CPU decoder reads its e4m3
+ * values from a compile-time constant table, which is why the LUT-ready gate
+ * exists only on the CUDA side. Do not re-add a zero refusal: it would reject
+ * valid checkpoints.
+ *
+ * The check is per BLOCK, not per element: one branch per FP8_BLOCK columns. */
+static float fp8_block_scale(float sc, int64_t blkO, int64_t bi, const char *who){
+    if(isnan(sc)){
+        fprintf(stderr,"%s: fmt=8 scale block [%lld,%lld] is NaN -- refusing rather than "
+            "propagate it through the absorb accumulator\n",who,(long long)blkO,(long long)bi);
+        exit(1);
+    }
+    return sc;
+}
+
 static void qt_addrow(const QT *t, int row, float coef, float *acc){
     int I=t->I;
     if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=coef*w[i]; return; }
@@ -3890,8 +3974,23 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
             for(int k=0;k<n;k++){ unsigned u=((lo[k>>2]>>((k&3)*2))&3)|(((hi[k>>3]>>(k&7))&1)<<2);
                 acc[base+k]+=cg*(float)((int)u-4); } }
         return; }
+    /* fmt=8 (fp8-e4m3-b128, absorb-path support added here): t->s holds ONE f32 scale
+     * per 128x128 BLOCK (ceil(O/128)*ceil(I/128) entries, block-row-major), not O, and
+     * t->q4 is NULL for this format -- raw e4m3 bytes live in t->q8 instead, same
+     * convention as fmt=1 (see the QT struct comment). Mirrors matmul_fp8's (quant.h)
+     * block-scale indexing exactly: blkO=row/FP8_BLOCK selects the scale row, then one
+     * scale per FP8_BLOCK-wide slice of I. This is the branch that used to be missing
+     * -- see the guard below's history note. */
+    if(t->fmt==8){ const uint8_t *w=(const uint8_t*)t->q8+(int64_t)row*I;
+        int64_t nblkI=fp8_nblk(I), blkO=(int64_t)row/FP8_BLOCK;
+        const float *scl=t->s+blkO*nblkI;
+        for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
+            int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
+            float sc=coef*fp8_block_scale(scl[bi],blkO,bi,"qt_addrow");
+            for(int i=base;i<base+blen;i++) acc[i]+=sc*e4m3_decode(w[i]); }
+        return; }
     /* GUARD (fix round 2, engine defect -- clean-room conformance trial found a real
-     * SIGSEGV, reproduced): fmt 0/4/5 already returned above; everything below this
+     * SIGSEGV, reproduced): fmt 0/4/5/8 already returned above; everything below this
      * point assumes a PER-ROW scale (t->s[row]) followed by fmt=1 (int8, explicit
      * branch), fmt=2 (int4 packed, explicit branch), or the tail's own IMPLICIT fmt=3
      * (int2 packed, the final unconditional block) -- there was no guard stopping any
@@ -3900,20 +3999,16 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
      * a heap OVERREAD, and the untouched fall-through then misreads t->q4's real E8
      * lattice bytes as int2-packed data (same bug SHAPE as #298's CUDA absorb-kernel
      * fix, and the same one this file's own fmt=4/5 branches above were added to
-     * dodge -- fmt=6 was simply missed). fmt=8 (fp8-e4m3-b128): t->s holds
-     * ceil(O/128)*ceil(I/128) per-block floats, not O -- t->s[row] overreads for
-     * row>=nblk (e.g. a [130,130] tensor has nblk=4, so every row past 3 already reads
-     * out of bounds), AND t->q4 is NULL for fmt=8 (raw bytes live in t->q8 instead,
-     * same convention as fmt=1 -- see the QT struct comment), so the fall-through's
-     * `t->q4+(int64_t)row*((I+3)/4)` dereferences NULL-plus-offset: SIGSEGV,
-     * reproduced (see the report's proof-of-bite transcript). Refuse loudly instead --
-     * this function has no byte-count context of its own to validate against (it only
-     * ever sees an already-resolved QT), so "unsupported fmt" is the only check
-     * available, same "refuse rather than misread" discipline qt_resolve_fmt applies
-     * at load time. */
+     * dodge -- fmt=6 was simply missed). fmt=8 previously landed here too (t->s[row]
+     * overreads past row>=nblk, t->q4 is NULL -> SIGSEGV via the int2 fall-through);
+     * it now returns above via its own branch and never reaches this guard. Refuse
+     * loudly instead for anything else -- this function has no byte-count context of
+     * its own to validate against (it only ever sees an already-resolved QT), so
+     * "unsupported fmt" is the only check available, same "refuse rather than
+     * misread" discipline qt_resolve_fmt applies at load time. */
     if(t->fmt!=1 && t->fmt!=2 && t->fmt!=3){
         fprintf(stderr,"qt_addrow: unsupported fmt=%d for the per-row-scale absorb path "
-            "(only fmt 1/2/3 reach this point; fmt 0/4/5 are handled above and return "
+            "(only fmt 1/2/3 reach this point; fmt 0/4/5/8 are handled above and return "
             "before it) -- refusing rather than misread t->s[row]/t->q4\n", t->fmt);
         exit(1);
     }
@@ -3963,18 +4058,35 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
                 for(int k=0;k<n;k++){ unsigned u=((lo[k>>2]>>((k&3)*2))&3)|(((hi[k>>3]>>(k&7))&1)<<2);
                     acc+=(float)((int)u-4)*x[base+k]; }
                 a+=(double)(acc*sr[g]); } }
+        /* fmt=8 (fp8-e4m3-b128, absorb-path support added here): per-128x128-BLOCK f32
+         * scale, block-row-major (ceil(O/128)*ceil(I/128) entries), raw bytes in t->q8
+         * (t->q4 is NULL for this format). Same block-scale indexing as matmul_fp8
+         * (quant.h) and qt_addrow's fmt=8 branch above: blkO=row/FP8_BLOCK picks the
+         * scale row, one scale per FP8_BLOCK-wide slice of I, double-accumulated
+         * across blocks like matmul_fp8 to avoid unfairly penalizing cross-block
+         * cancellation (widen-then-multiply, a+=(double)acc*sc -- the same rounding
+         * as matmul_fp8 and this function's grouped fmt=4 arm; fmt=5's arm rounds
+         * differently, multiplying in float before widening). */
+        else if(t->fmt==8){ const uint8_t *w=(const uint8_t*)t->q8+(int64_t)row*I;
+            int64_t nblkI=fp8_nblk(I), blkO=(int64_t)row/FP8_BLOCK;
+            const float *scl=t->s+blkO*nblkI;
+            for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
+                int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
+                float sc=fp8_block_scale(scl[bi],blkO,bi,"qt_matvec_rows"); float acc=0;
+                for(int i=base;i<base+blen;i++) acc+=e4m3_decode(w[i])*x[i];
+                a+=(double)acc*sc; } }
         /* fmt=3 (int2 packed, per-row scale) is the only fmt this final arm legitimately
-         * handles -- fmt 0/4/5 matched above, fmt 1/2 have their own explicit branches
+         * handles -- fmt 0/4/5/8 matched above, fmt 1/2 have their own explicit branches
          * above too. Same GUARD and same reasoning as qt_addrow's (fix round 2, engine
-         * defect): fmt=6's t->s is a fixed 4-byte tag (t->s[row] overreads for row>0),
-         * fmt=8's t->s holds per-128x128-block floats (t->s[row] overreads for
-         * row>=nblk) and t->q4 is NULL for fmt=8 -- both would have silently misread or
-         * crashed here exactly like qt_addrow did before its own fix; refuse instead. */
+         * defect): fmt=6's t->s is a fixed 4-byte tag (t->s[row] overreads for row>0) --
+         * it would silently misread or crash here exactly like qt_addrow did before its
+         * fix; refuse instead. fmt=8 previously fell into this same trap and now has its
+         * own branch above instead. */
         else if(t->fmt==3){ const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
             for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc+=((int)((b>>((i&3)*2))&3)-2)*x[i]; } a=acc*s; }
         else {
             fprintf(stderr,"qt_matvec_rows: unsupported fmt=%d for the per-row-scale absorb "
-                "path (only fmt 0/1/2/3/4/5 are handled) -- refusing rather than misread "
+                "path (only fmt 0/1/2/3/4/5/8 are handled) -- refusing rather than misread "
                 "t->s[row]/t->q4\n", t->fmt);
             exit(1);
         }
@@ -4812,6 +4924,13 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 } else {
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 const float *kr=coli_kv_row(ks->Rc[layer],t,c->qk_rope);
+                if(exact_verify_on()&&g_spec_live){
+                    /* #689 exact verify: one exact accumulator over BOTH partial dots, rounded once */
+                    exd_acc ea; exd_init(&ea);
+                    for(int i=0;i<kvl;i++) exd_add_ff(&ea,qabs[i],Lt[i]);
+                    for(int d=0;d<c->qk_rope;d++) exd_add_ff(&ea,qr[d],kr[d]);
+                    a=exd_finish(&ea);
+                } else {
                 /* MLA-absorb score: dot(qabs, Lt) + dot(qr, kr). #442: the qabs·Lt
                  * reduction is the hot f32 dot at this site (kvl=512 on GLM-5.2,
                  * runs nt times per (s,h), grows with context). SIMD-ify under
@@ -4834,10 +4953,21 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 for(;i<kvl;i++) a+=qabs[i]*Lt[i];
                 for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
                 }
+                }
                 sc[jj]=a*c->attn_scale;
             }
             softmax(sc,nt);
             float clat[512]; memset(clat,0,kvl*sizeof(float));
+            if(exact_verify_on()&&g_spec_live&&!tq1&&!g_tq&&!g_kv8){
+                /* #689 exact verify: clat[i] = sum_t sc[t]*Lt[i] as an exact dot over t per column
+                 * (transposed walk: cache-unfriendly, verify rows only). NOT taken on the quantised
+                 * KV paths (tq1 / TQ / kv8): those keep the float context dot, so COLI_EXACT_VERIFY
+                 * does not provide exactness for the context dot with a quantised cache (README). */
+                for(int i=0;i<kvl;i++){ exd_acc ea; exd_init(&ea);
+                    for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
+                        exd_add_ff(&ea,sc[jj],coli_kv_row(ks->Lc[layer],t,kvl)[i]); }
+                    clat[i]=exd_finish(&ea); }
+            } else
             for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
                 if(tq1){
                     /* accumulate acc = sum_t w_t*std_t*lev[L[t]] in the rotated basis; unrotate
