@@ -41,6 +41,18 @@ decimal **strings**: they run past a double's 53-bit mantissa, and a rounded
 multiplier would silently hash every n-gram into a different -- and perfectly
 valid-looking -- row.
 
+When `--cap` is omitted, `coli chat`, `coli serve`, and `coli web` size the expert
+cache from the resource plan. `--ram 120` (or `RAM_GB=120`) supplies its RAM budget;
+without either, the planner uses available memory. Dense weights, context state,
+and runtime reserves are subtracted before choosing slots per layer. `--cap N`
+still selects an explicit slot count, and an existing `--auto-tier` plan or measured
+profile retains precedence over this fallback. The startup line reports the chosen
+cap. The budget is a ceiling, not a promise to fill RSS: cache slots fill on demand
+and engram tables continue streaming from disk.
+
+The standalone `deepseek_v41` binary still takes its cap as its first argument;
+`RAM_GB` planning happens in the Python gateway.
+
 ## What the engine implements
 
 Each mechanism mirrors a named piece of the vendor's `inference/model.py`:

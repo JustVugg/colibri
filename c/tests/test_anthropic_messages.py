@@ -11,6 +11,7 @@ is the reference client from the issue — not merely that the handler returns 2
   - the Anthropic error envelope, which is not the OpenAI one.
 """
 import json
+import os
 import re
 import threading
 import unittest
@@ -19,7 +20,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from openai_server import (APIServer, anthropic_to_openai, anthropic_tools, APIError,
-                           render_chat, render_chat_inkling, render_chat_kimi, render_chat_v4)
+                           render_chat, render_chat_glm53, render_chat_inkling,
+                           render_chat_kimi, render_chat_v4)
 
 
 class FakeEngine:
@@ -154,6 +156,24 @@ class MessagesHTTPTest(unittest.TestCase):
         # Anthropic's usage field names, not OpenAI's prompt_tokens/completion_tokens
         self.assertEqual(payload["usage"], {"input_tokens": 11, "output_tokens": 3})
         self.assertTrue(payload["id"].startswith("msg_"))
+
+    def test_trailing_assistant_turn_follows_shared_continuation_switch(self):
+        """Off preserves the existing cue; on continues the turn on both endpoints."""
+        messages = [{"role": "user", "content": "The capital of France is?"},
+                    {"role": "assistant", "content": "The capital is"}]
+        with patch("openai_server.ARCH", "glm53"):
+            with patch.dict(os.environ, {"COLI_CONTINUE_ASSISTANT": "0"}):
+                with self.post(self.base_body(messages=messages)) as response:
+                    self.assertEqual(response.status, 200)
+                self.assertEqual(self.engine.prompts[-1], render_chat_glm53(messages))
+                self.assertTrue(self.engine.prompts[-1].endswith("<|assistant|><think>"))
+
+            with patch.dict(os.environ, {"COLI_CONTINUE_ASSISTANT": "1"}):
+                with self.post(self.base_body(messages=messages)) as response:
+                    self.assertEqual(response.status, 200)
+                self.assertEqual(self.engine.prompts[-1],
+                                 render_chat_glm53(messages, add_generation_prompt=False))
+                self.assertTrue(self.engine.prompts[-1].endswith("The capital is"))
 
     def test_each_architecture_receives_its_native_chat_prompt(self):
         messages = [{"role": "user", "content": "Hi"}]

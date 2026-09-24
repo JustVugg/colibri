@@ -43,6 +43,7 @@
 #include "kv_prefix.h"
 #include "pin_pool.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
 #include "serve_codec.h"
+#include "serve_budget.h"
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -2198,15 +2199,20 @@ static void apply_rep_penalty(float *logit, int n, const int *hist, int nhist, f
     }
 }
 
-/* reject a prompt that would overrun the served KV bound (CTX_MAX, default 8192).
- * The refusal is the frame the gateway turns into a 400 context_length_exceeded
- * (#506, #1381); free text here reached the client as a 500. One request is
- * served at a time, so the returned buffer is only read before the next call. */
+/* Refuse only a prompt that does not fit the served KV bound (CTX_MAX,
+ * default 8192). max_tokens is a ceiling: coli chat's interactive default
+ * (16384) used to 400 every turn because 2 + 16384 > 8192. The refusal is
+ * the frame the gateway turns into a 400 context_length_exceeded (#506,
+ * #1381); free text here reached the client as a 500. One request is served
+ * at a time, so the returned buffer is only read before the next call. */
+static int ink_ctx_max(void) {
+    const char *cm = getenv("CTX_MAX");
+    return cm ? atoi(cm) : 8192;
+}
 static const char *prompt_reject(int np, int want) {
     static char message[96];
-    const char *cm = getenv("CTX_MAX");
-    int ctx_max = cm ? atoi(cm) : 8192;
-    if (np + want <= ctx_max) return NULL;
+    int ctx_max = ink_ctx_max();
+    if (coli_serve_budget(np, want, ctx_max, 0) >= 0) return NULL;
     snprintf(message, sizeof(message),
              "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
              np, want, ctx_max);
@@ -2323,8 +2329,19 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
     if (np <= 0) { coli_serve_write_error(stdout,q->id,"empty prompt"); free(ids); return 0; }
-    const char *bad = prompt_reject(np, q->max_tok);
-    if (bad) { coli_serve_write_error(stdout,q->id,bad); free(ids); return 0; }
+    int ctx_max = ink_ctx_max();
+    int budget = coli_serve_budget(np, q->max_tok, ctx_max, q->logprobs > 0);
+    if (budget < 0) {
+        const char *bad = prompt_reject(np, q->max_tok);
+        coli_serve_write_error(stdout,q->id,bad ? bad : "CONTEXT_EXCEEDED");
+        free(ids); return 0;
+    }
+    if (budget < q->max_tok) {
+        fprintf(stderr, "[serve] max_tokens %d clamped to %d (context %d - prompt %d); "
+                        "raise CTX_MAX for longer answers\n",
+                q->max_tok, budget, ctx_max, np);
+        q->max_tok = budget;
+    }
     /* audio: every <|audio|> placeholder must have exactly one DMel frame */
     int naud = q->alen / m->c.mel_bins;
     if (q->alen % m->c.mel_bins != 0 || audio_tok_count(m, ids, np) != naud) {

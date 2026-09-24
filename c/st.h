@@ -564,7 +564,9 @@ static const char *st_basename(const char *p) {
 static void st_index_load(st_index *ix, const char *dir) {
     if (ix->tried) return;
     ix->tried = 1;
-    char path[1200]; snprintf(path, sizeof(path), "%s/model.safetensors.index.json", dir);
+    char path[1200];
+    int written = snprintf(path, sizeof(path), "%s/model.safetensors.index.json", dir);
+    if (written < 0 || (size_t)written >= sizeof(path)) return;
     FILE *f = fopen(path, "rb");
     if (!f) return;
     fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);

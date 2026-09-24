@@ -1,4 +1,4 @@
-import { useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { FileUp, ListChecks, LoaderCircle, Plus, X } from "lucide-react"
 
 import { askBrio, type BrioResponse } from "@/lib/api"
@@ -20,7 +20,10 @@ import { useLocale } from "./i18n"
  * dare: l'ENTROPIA (quanto il modello sa di sapere) e i TOKEN GENERATI, zero. */
 
 const LEVEL = (h: number) => (h < 0.4 ? "sure" : h < 0.8 ? "unsure" : "unknown")
-const lines = (text: string) => text.split("\n").map((o) => o.trim()).filter(Boolean)
+/* Opzioni dedotte per riga, senza duplicati: il server rifiuta due opzioni
+ * uguali con un 400, e due chip con lo stesso testo darebbero una chiave React
+ * ripetuta e un remove che le toglie entrambe. Deduplicare qui le tre cose. */
+const lines = (text: string) => [...new Set(text.split("\n").map((o) => o.trim()).filter(Boolean))]
 
 interface Row {
   id: number
@@ -44,6 +47,14 @@ export default function Brio({ baseUrl, apiKey, model, connected }: {
   const [rows, setRows] = useState<Row[]>([first()])
   const [running, setRunning] = useState<number | null>(null)
   const file = useRef<HTMLInputElement>(null)
+  const abort = useRef<AbortController | null>(null)
+
+  /* Fermare uno scoring in corso. Su un motore che streamma gli esperti da
+   * disco una domanda dura minuti: senza un modo di annullare, chi cambia idea
+   * o lascia la pagina tiene occupato lo slot KV fino al timeout. L'abort
+   * chiude il fetch, il server vede il client sparito e smette (client
+   * disconnesso -> ClientCancelled). Vale anche allo smontaggio della pagina. */
+  useEffect(() => () => abort.current?.abort(), [])
 
   /* Ogni domanda porta le SUE opzioni: "quanto e rischioso" vuole
    * basso/medio/alto, "si firma" vuole si/no, e un insieme unico per tutte
@@ -66,17 +77,21 @@ export default function Brio({ baseUrl, apiKey, model, connected }: {
   }
 
   const run = async () => {
+    const controller = new AbortController()
+    abort.current = controller
     setRows((all) => all.map((row) => ({ ...row, result: undefined, error: undefined, seconds: undefined })))
     for (const row of asked) {
       setRunning(row.id)
       const started = performance.now()
       try {
-        const result = await askBrio(baseUrl, apiKey, model, state, row.text, lines(row.options))
+        const result = await askBrio(baseUrl, apiKey, model, state, row.text, lines(row.options), controller.signal)
         patch(row.id, { result, seconds: (performance.now() - started) / 1000 })
       } catch (cause) {
+        if (controller.signal.aborted) break   /* fermato apposta: le domande dopo restano intatte */
         patch(row.id, { error: cause instanceof Error ? cause.message : String(cause) })
       }
     }
+    abort.current = null
     setRunning(null)
   }
 
@@ -163,9 +178,12 @@ export default function Brio({ baseUrl, apiKey, model, connected }: {
           <button type="button" className="brio-add" onClick={() => setRows((all) => [...all, blank()])}>
             <Plus />{t("brio.addQuestion")}
           </button>
-          <button type="button" className="brio-run" disabled={!ready} onClick={run}>
-            {running !== null ? <LoaderCircle className="brio-spin" /> : <ListChecks />}
-            {running !== null ? t("brio.scoring") : t("brio.scoreAll", { n: asked.length })}
+          {/* Mentre gira, lo stesso bottone ferma: l'abort chiude il fetch e
+              libera lo slot KV lato server invece di aspettare il timeout. */}
+          <button type="button" className="brio-run" disabled={running === null && !ready}
+                  onClick={running !== null ? () => abort.current?.abort() : run}>
+            {running !== null ? <X /> : <ListChecks />}
+            {running !== null ? t("brio.stop") : t("brio.scoreAll", { n: asked.length })}
           </button>
         </div>
         {!connected ? <p className="brio-note">{t("brio.offline")}</p> : null}

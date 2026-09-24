@@ -21,6 +21,7 @@ tests/fuzz_rans
 tests/bench_omp_grain
 tests/mxfp4_ref.o
 mxfp4_cuda_test
+mxfp4_expert_cuda_test
 absorb_determinism_test
 cuda_fmt_trap_test
 tests/*.dSYM/

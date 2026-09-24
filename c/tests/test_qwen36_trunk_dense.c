@@ -33,7 +33,7 @@ static void ck(int ok, const char *what) {
 }
 
 /* Small but every dimension distinct, so a swapped I/O would show. */
-enum { NL = 2, D = 48, VH = 2, VD = 8, QH = 2, QD = 12, KVH = 1, KD = 8, SH = 20, NE = 4, IH = 16 };
+enum { NL = 2, D = 48, VH = 2, VD = 8, QH = 2, QD = 16, KVH = 1, KD = 8, SH = 20, NE = 4, IH = 16 };
 
 static unsigned g_seed = 12345;
 static float rnd(void) {
@@ -163,6 +163,90 @@ int main(void) {
         int served = 1; float x[D] = {0}, y[SH] = {0};
         served = qtd(at->qth_shd, y, x, SH, D);
         ck(!served, "a matrix with no handle is not served (the caller runs matmul_d)");
+    }
+
+    /* Drive attention itself: this catches an S==1 gate left at any of the
+     * four projection call sites, which a tier-only test cannot detect. */
+    {
+        enum { S = 5 };
+#ifdef _OPENMP
+        omp_set_num_threads(1);
+#endif
+        m.max_t = m.kv_cap = S + 1;
+        m.K = calloc(NL, sizeof(float *)); m.V = calloc(NL, sizeof(float *));
+        m.K[1] = calloc((S + 1) * KVH * KD, sizeof(float));
+        m.V[1] = calloc((S + 1) * KVH * KD, sizeof(float));
+        m.attn_sc = calloc(S + 1, sizeof(float));
+        float *x = rnd_matrix(S + 1, D), gpu[S * D], cpu[S * D], fallback[S * D];
+        Layer host = *at;
+        host.qth_q = host.qth_k = host.qth_v = host.qth_o = 0;
+        attention(&m, &host, 1, x, S, 0, cpu);
+        int calls = fake_matmuls;
+        attention(&m, at, 1, x, S, 0, gpu);
+        ck(fake_matmuls == calls + 4 && fake_matmul_rows == S,
+           "prefill dispatches all four projections as batches");
+        int handles[]={at->qth_q,at->qth_k,at->qth_v,at->qth_o};
+        for(int failure=0;failure<4;failure++){
+            for(int i=0;i<4;i++) G_dense[handles[i]-1].on=1;
+            calls=fake_matmuls;
+            fake_matmul_fail_at=calls+failure+1;
+            attention(&m,at,1,x,S,0,fallback);
+            fake_matmul_fail_at=0;
+            ck(fake_matmuls==calls+4,"each projection attempted once on first failure");
+            for(int i=0;i<4;i++)
+                ck(G_dense[handles[i]-1].on==(i!=failure),"only failed projection disabled");
+            for(int pass=0;pass<2;pass++){
+                double gap=0, scale=1e-6;
+                int finite=1;
+                for(int i=0;i<S*D;i++){
+                    finite &= isfinite(cpu[i]) && isfinite(gpu[i]) && isfinite(fallback[i]);
+                    gap=fmax(gap,fabs((double)gpu[i]-cpu[i]));
+                    gap=fmax(gap,fabs((double)fallback[i]-cpu[i]));
+                    scale=fmax(scale,fabs(cpu[i]));
+                }
+                ck(finite && gap/scale<1e-4,"poisoned GPU output replaced by finite CPU-equivalent output");
+                if(pass==0){
+                    calls=fake_matmuls;
+                    attention(&m,at,1,x,S,0,fallback);
+                    ck(fake_matmuls==calls+3,"disabled handle stays on CPU; healthy projections stay on GPU");
+                }
+            }
+        }
+        /* Split prefill at a nonzero position, then decode another token.
+         * Compare both the observable output and the state consumed next. */
+        float reference[(S+1)*D], continued[(S+1)*D];
+        float keys[(S+1)*KVH*KD], values[(S+1)*KVH*KD];
+        attention(&m,&host,1,x,S+1,0,reference);
+        memcpy(keys,m.K[1],sizeof keys); memcpy(values,m.V[1],sizeof values);
+        for(int failure=-1;failure<4;failure++){
+            for(int i=0;i<4;i++) G_dense[handles[i]-1].on=1;
+            memset(m.K[1],0,sizeof keys); memset(m.V[1],0,sizeof values);
+            calls=fake_matmuls;
+            attention(&m,at,1,x,2,0,continued);
+            if(failure>=0) fake_matmul_fail_at=fake_matmuls+failure+1;
+            attention(&m,at,1,x+2*D,S-2,2,continued+2*D);
+            fake_matmul_fail_at=0;
+            attention(&m,at,1,x+S*D,1,S,continued+S*D);
+            ck(fake_matmuls==calls+(failure<0?12:11),
+               "segmented prefill and decode keep only the failed projection on CPU");
+            double gap=0, scale=1e-6;
+            int finite=1;
+            for(int i=0;i<(S+1)*D;i++){
+                finite &= isfinite(continued[i]) && isfinite(reference[i]);
+                gap=fmax(gap,fabs((double)continued[i]-reference[i]));
+                scale=fmax(scale,fabs(reference[i]));
+            }
+            ck(finite && gap/scale<1e-4,"segmented attention outputs match full CPU prefill");
+            gap=0; scale=1e-6; finite=1;
+            for(int i=0;i<(S+1)*KVH*KD;i++){
+                finite &= isfinite(m.K[1][i]) && isfinite(m.V[1][i]);
+                gap=fmax(gap,fabs((double)m.K[1][i]-keys[i]));
+                gap=fmax(gap,fabs((double)m.V[1][i]-values[i]));
+                scale=fmax(scale,fmax(fabs(keys[i]),fabs(values[i])));
+            }
+            ck(finite && gap/scale<1e-4,"segmented attention preserves CPU-equivalent KV state");
+        }
+        free(x); free(m.K[1]); free(m.V[1]); free(m.K); free(m.V); free(m.attn_sc);
     }
 
     qt_shutdown();

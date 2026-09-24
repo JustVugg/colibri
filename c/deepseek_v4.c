@@ -1368,7 +1368,7 @@ static int build_runtime_plan(ColiV4Engine *engine,
     uint64_t maximum_layer = 0, dense_total = 0;
     for (int layer = 0; layer < config->num_hidden_layers; layer++) {
         ColiDeepSeekV4LayerPlan layer_plan;
-        ColiDeepSeekV4LayerStats stats;
+        ColiDeepSeekV4LayerStats stats = {0};
         if (coli_v4_layer_plan(&layer_plan, config, layer,
                                error, error_size) ||
             coli_v4_layer_validate(&layer_plan, index, &stats,
@@ -8241,8 +8241,9 @@ static size_t hot_slot_index(const V4ExpertStoreState *state,
  *
  * FLOCK-packed checkpoints store [scales][weights] contiguously and need one
  * request.  Standard HF checkpoints keep the ranges apart: weights use direct
- * I/O while the much smaller scales use buffered pread.  Any direct-I/O error
- * falls back to the exact buffered path. */
+ * I/O while the much smaller scales use buffered pread.  REAP-style
+ * per_matrix records issue one window per scale/weight segment.  Any
+ * direct-I/O error falls back to the exact buffered path. */
 static uint64_t v4_direct_reads;
 static uint64_t v4_direct_flock_reads;
 static uint64_t v4_direct_payload_bytes;
@@ -8298,32 +8299,86 @@ static int v4_read_direct_window(const V4ExpertStoreState *state, int shard,
     return 0;
 }
 
+/* Direct window into an interior slab offset.  v4_read_direct_window bounces
+ * at slab[0], so a second per_matrix segment would clobber earlier bytes. */
+static int v4_read_direct_copy(const V4ExpertStoreState *state, int shard,
+                               int rep, unsigned char *destination,
+                               uint64_t offset, size_t length) {
+    if (!destination) return -1;
+    if (!length) return 0;
+    if (length > SIZE_MAX - 8192u) return -1;
+    unsigned char *bounce = NULL;
+    if (posix_memalign((void **)&bounce, 4096, length + 8192u)) return -1;
+    int result = v4_read_direct_window(state, shard, rep, bounce, offset,
+                                       length, 0);
+    if (!result) memcpy(destination, bounce, length);
+    compat_aligned_free(bounce);
+    return result;
+}
+
+static int v4_try_direct_segment(V4ExpertStoreState *state, int shard, int rep,
+                                 V4ExpertSlot *slot, uint64_t dest,
+                                 uint64_t offset, uint64_t bytes) {
+    if (!slot->aligned_slab ||
+        !coli_st_streaming_direct_available_rep(state->index, shard, rep))
+        return -1;
+    size_t length = (size_t)bytes;
+    if (dest == 0)
+        return v4_read_direct_window(state, shard, rep, slot->slab, offset,
+                                     length, 0);
+    return v4_read_direct_copy(state, shard, rep, slot->slab + dest, offset,
+                               length);
+}
+
+static int v4_read_per_matrix_segment(V4ExpertStoreState *state, int shard,
+                                      int rep, V4ExpertSlot *slot,
+                                      uint64_t dest, uint64_t offset,
+                                      uint64_t bytes, int *used_direct,
+                                      int *used_fallback) {
+    if (!v4_try_direct_segment(state, shard, rep, slot, dest, offset, bytes)) {
+        *used_direct = 1;
+        return 0;
+    }
+    if (slot->aligned_slab &&
+        coli_st_streaming_direct_available_rep(state->index, shard, rep))
+        *used_fallback = 1;
+    return coli_st_read_at_rep(state->index, shard, rep, offset, (size_t)bytes,
+                               slot->slab + dest);
+}
+
 static int v4_read_expert_record(V4ExpertStoreState *state,
                                  const V4ExpertRecord *record,
                                  V4ExpertSlot *slot, int rep) {
     if (record->per_matrix) {
-        int direct_available = slot->aligned_slab &&
-            coli_st_streaming_direct_available_rep(state->index, record->m_scale_shard[0], rep);
-        if (direct_available)
-            __atomic_fetch_add(&v4_direct_fallbacks, UINT64_C(1),
-                               __ATOMIC_RELAXED);
+        int used_direct = 0;
+        int used_fallback = 0;
         uint64_t scale_cursor = 0;
         for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
-            if (coli_st_read_at_rep(state->index, record->m_scale_shard[matrix], rep,
-                                    record->m_scale_offset[matrix],
-                                    (size_t)record->m_scale_bytes[matrix],
-                                    slot->slab + scale_cursor) != 0)
+            if (v4_read_per_matrix_segment(
+                    state, record->m_scale_shard[matrix], rep, slot,
+                    scale_cursor, record->m_scale_offset[matrix],
+                    record->m_scale_bytes[matrix], &used_direct,
+                    &used_fallback) != 0)
                 return -1;
             scale_cursor += record->m_scale_bytes[matrix];
         }
         uint64_t weight_cursor = scale_cursor;
         for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
-            if (coli_st_read_at_rep(state->index, record->m_weight_shard[matrix], rep,
-                                    record->m_weight_offset[matrix],
-                                    (size_t)record->m_weight_bytes[matrix],
-                                    slot->slab + weight_cursor) != 0)
+            if (v4_read_per_matrix_segment(
+                    state, record->m_weight_shard[matrix], rep, slot,
+                    weight_cursor, record->m_weight_offset[matrix],
+                    record->m_weight_bytes[matrix], &used_direct,
+                    &used_fallback) != 0)
                 return -1;
             weight_cursor += record->m_weight_bytes[matrix];
+        }
+        if (used_direct && !used_fallback) {
+            __atomic_fetch_add(&v4_direct_reads, UINT64_C(1), __ATOMIC_RELAXED);
+            __atomic_fetch_add(&v4_direct_payload_bytes, record->record_bytes,
+                               __ATOMIC_RELAXED);
+        } else if (used_fallback) {
+            __atomic_fetch_add(&v4_direct_fallbacks, UINT64_C(1),
+                               __ATOMIC_RELAXED);
         }
         return 0;
     }
@@ -8781,6 +8836,37 @@ int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key) {
     int result = slot ? (int)(slot - state->slots) : -1;
     pthread_mutex_unlock(&state->mutex);
     return result;
+}
+
+void coli_v4_test_reset_direct_io_stats(void) {
+    __atomic_store_n(&v4_direct_reads, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&v4_direct_flock_reads, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&v4_direct_payload_bytes, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&v4_direct_fallbacks, 0, __ATOMIC_RELAXED);
+}
+
+uint64_t coli_v4_test_direct_reads(void) {
+    return __atomic_load_n(&v4_direct_reads, __ATOMIC_RELAXED);
+}
+
+uint64_t coli_v4_test_direct_fallbacks(void) {
+    return __atomic_load_n(&v4_direct_fallbacks, __ATOMIC_RELAXED);
+}
+
+int coli_v4_test_force_streaming_direct(ColiExpertStore *store) {
+    if (!store || !store->state) return -1;
+    V4ExpertStoreState *state = store->state;
+    if (!state->index) return -1;
+    int enabled = 0;
+    for (int i = 0; i < state->index->nfd; i++) {
+        if (state->index->dfds[i] < 0 && state->index->fds[i] >= 0) {
+            int twin = dup(state->index->fds[i]);
+            if (twin < 0) return -1;
+            state->index->dfds[i] = twin;
+        }
+        if (state->index->dfds[i] >= 0) enabled = 1;
+    }
+    return enabled ? 0 : -1;
 }
 #endif
 

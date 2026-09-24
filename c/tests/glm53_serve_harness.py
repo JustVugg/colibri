@@ -118,7 +118,7 @@ def main() -> int:
         # le due cose. Il generatore vuole transformers 5.16.1.
         print(f"SKIP: manca {arguments.fixture}; generalo con\n"
               f"  python3 tools/make_glm53_multimodal_tiny.py --output <dir>")
-        return 0
+        return 2  # un salto non e' un successo
     binary = os.path.abspath(arguments.binary)
     prompt, tokens = "gu", 4
 

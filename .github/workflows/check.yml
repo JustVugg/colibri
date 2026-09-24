@@ -128,6 +128,12 @@ jobs:
           python c/tools/make_edge_tiny_tokenizer.py --vocab-size 281 /tmp/glm53_stream-i4
           cd c && COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_dashboard
           COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_context_exceeded
+      # The two stdlib-only oracles used to be argparse scripts that `make
+      # test-python` collected as zero tests (#1700). They run here, on the
+      # fixtures generated above, token-exact against transformers in f32.
+      - name: Run the GLM-5.3 tiny oracles
+        run: |
+          cd c && GLM53_TINY=/tmp/glm53_tiny GLM53_MM_TINY=/tmp/glm53_mm python -m unittest -v tests.test_glm53_oracles
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to

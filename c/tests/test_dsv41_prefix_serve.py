@@ -30,6 +30,55 @@ ENGINE = HERE / ("deepseek_v41.exe" if sys.platform == "win32" else "deepseek_v4
 FIXTURE = Path(os.environ.get("DSV41_TINY", HERE / "dsv41_tiny"))
 
 
+@unittest.skipUnless(ENGINE.exists() and (FIXTURE / "model.safetensors").exists(),
+                     "built V4.1 engine and tiny fixture required")
+class Dsv41ContextTest(unittest.TestCase):
+    def setUp(self):
+        self.engine = ServeEngine(ENGINE, ["8"],
+            {"SNAP": str(FIXTURE), "SERVE": "1", "CTX": "32",
+             "OMP_NUM_THREADS": "2", "V41_DSPARK": "0"}, reuse=False)
+        self.addCleanup(self.engine.p.stdout.close)
+        self.addCleanup(self.engine.p.stderr.close)
+        self.addCleanup(self.engine.close)
+
+    def request(self, size, budget, logprobs=0):
+        prompt = b"a" * size  # the fixture's tokenizer has one id per byte
+        header = f"SUBMIT ctx 0 {size} {budget} 0 1 logprobs={logprobs}\n".encode()
+        self.engine.p.stdin.write(header + prompt + b"\n")
+        self.engine.p.stdin.flush()
+        frames = []
+        while True:
+            line = self.engine.p.stdout.readline()
+            self.assertTrue(line, "engine closed before completing the request")
+            fields = line.decode().split()
+            if fields[0] in ("DATA", "ECHO"):
+                self.engine.p.stdout.read(int(fields[2]))
+                self.engine.p.stdout.readline()
+            frames.append(fields)
+            if fields[0] in ("DONE", "ERROR"):
+                return frames
+
+    def test_output_ceiling_leaves_one_token(self):
+        frames = self.request(31, 5000)
+        self.assertEqual(frames[-1][:4], ["DONE", "ctx", "STAT", "1"])
+        self.assertIn(["ACCEPT", "ctx", "31"], frames)
+
+    def test_full_context_is_valid_only_for_scoring(self):
+        frames = self.request(32, 0, logprobs=1)
+        self.assertEqual(frames[-1][:4], ["DONE", "ctx", "STAT", "0"])
+        self.assertEqual(sum(f[0] == "ECHO" for f in frames), 31)
+        self.assertFalse(any(f[0] == "DATA" for f in frames))
+        frames = self.request(32, 1)
+        self.assertEqual(frames[-1][:3], ["ERROR", "ctx", "CONTEXT_EXCEEDED"])
+
+    def test_oversized_scoring_prompt_is_not_truncated(self):
+        frames = self.request(33, 0, logprobs=1)
+        self.assertEqual(frames[-1][:3], ["ERROR", "ctx", "CONTEXT_EXCEEDED"])
+        self.assertFalse(any(f[0] in ("ACCEPT", "ECHO", "DATA") for f in frames))
+        # Refusal drains the request and leaves the next one usable.
+        self.assertEqual(self.request(4, 1)[-1][:4], ["DONE", "ctx", "STAT", "1"])
+
+
 @unittest.skipUnless(ENGINE.exists(), "deepseek_v41 is not built")
 @unittest.skipUnless((FIXTURE / "model.safetensors").exists(),
                      "tiny dsv41 fixture is absent (tools/make_dsv41_tiny.py)")

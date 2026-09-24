@@ -30,6 +30,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { getHealth, listModels, streamChat, type ChatMessage, type HealthResponse, type StreamChatResult } from "@/lib/api"
+import { resendFrom } from "@/lib/chat"
 import { activeRequests, supportsCacheSlots } from "@/lib/runtime"
 import Brio from "./Brio"
 import { BrainWorkspace } from "./BrainWorkspace"
@@ -209,14 +210,17 @@ export default function App() {
 
   const canSend = useMemo(() => (draft.trim() || pending.length) && model && !loading, [draft, loading, model, pending])
 
-  const send = async (text = draft, previous = messages, pictures = pending) => {
+  /* consumeDraft is false for regenerate so a follow-up already in the composer is not eaten. */
+  const send = async (text = draft, previous = messages, pictures = pending, consumeDraft = true) => {
     const content = text.trim()
     if ((!content && !pictures.length) || loading) return
     const user = message("user", content, pictures)
     const assistant = message("assistant", "")
     const history = [...previous, user]
-    setDraft("")
-    setPending([])
+    if (consumeDraft) {
+      setDraft("")
+      setPending([])
+    }
     setError("")
     updateMessages([...history, assistant])
     setLoading(true)
@@ -241,6 +245,19 @@ export default function App() {
         enableThinking: thinking,
         cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
         signal: controller.signal,
+        /* Reasoning tokens are tokens: they count toward the rate, and the
+           first one is the real time-to-first-token. The answer's first token
+           arrives much later on a reasoning model. */
+        onReasoning: (delta) => {
+          if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); decodeStart = performance.now(); firstToken = false }
+          count++
+          setTokenCount(count)
+          const since = (performance.now() - decodeStart) / 1000
+          if (count > 1 && since > 0.2) setTokPerSec((count - 1) / since)
+          updateMessages((current) => current.map((item) =>
+            item.id === assistant.id ? { ...item, reasoning: (item.reasoning ?? "") + delta } : item,
+          ))
+        },
         onDelta: (delta) => {
           if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); decodeStart = performance.now(); firstToken = false }
           count++
@@ -268,10 +285,10 @@ export default function App() {
       setConnected(true)
     } catch (cause) {
       if (controller.signal.aborted) {
-        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content))
+        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content || item.reasoning))
       } else {
         setError(cause instanceof Error ? cause.message : "status.generationFailed")
-        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content))
+        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content || item.reasoning))
       }
     } finally {
       abortRef.current = null
@@ -408,8 +425,13 @@ export default function App() {
             {item.role !== "user" && <div className="assistant-brand"><Brand /><span>colibrì</span></div>}
             {item.images?.length ? <div className="message-images">{item.images.map((url, at) =>
               <img key={at} src={url} alt={t("ui.attachedImage", { n: at + 1 })} />)}</div> : null}
-            <div className="message-body">{item.content ? (item.role === "assistant" ? <Markdown text={item.content} /> : item.content) : <span className="typing" aria-label={t("ui.generating")}><i /><i /><i /></span>}</div>
-            {item.role === "assistant" && item.content && <div className="message-actions"><button className="icon-action" aria-label={t("ui.copy")} title={t("ui.copy")} onClick={() => void copyMessage(item)}><Copy /></button>{copied === item.id && <span role="status">{t("ui.copied")}</span>}{index === messages.length - 1 && !loading && <button className="icon-action" aria-label={t("ui.regenerate")} title={t("ui.regenerate")} onClick={() => { const userIndex = messages.map((m, i) => m.role === "user" && i < index ? i : -1).reduce((a, b) => Math.max(a, b), -1); if (userIndex >= 0) void send(messages[userIndex].content, messages.slice(0, userIndex)) }}><RefreshCw /></button>}</div>}
+            <div className="message-body">{item.reasoning
+              ? <details className="reasoning" open={!item.content}>
+                  <summary>{t("sidebar.reasoning")}</summary>
+                  <div className="reasoning-body">{item.reasoning}</div>
+                </details>
+              : null}{item.content ? (item.role === "assistant" ? <Markdown text={item.content} /> : item.content) : <span className="typing" aria-label={t("ui.generating")}><i /><i /><i /></span>}</div>
+            {item.role === "assistant" && item.content && <div className="message-actions"><button className="icon-action" aria-label={t("ui.copy")} title={t("ui.copy")} onClick={() => void copyMessage(item)}><Copy /></button>{copied === item.id && <span role="status">{t("ui.copied")}</span>}{index === messages.length - 1 && !loading && <button className="icon-action" aria-label={t("ui.regenerate")} title={t("ui.regenerate")} onClick={() => { const retry = resendFrom(messages, index); if (retry) void send(retry.text, retry.previous, retry.pictures, false) }}><RefreshCw /></button>}</div>}
           </article>)}<div ref={bottomRef} /></div>
         </div>}
         <div className="composer-wrap">

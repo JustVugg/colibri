@@ -17,7 +17,10 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from openai_server import APIServer
-from tests.test_brio_api import ScoringEngine
+if __package__:
+    from .test_brio_api import ScoringEngine
+else:
+    from test_brio_api import ScoringEngine
 
 STATE = ("Hi, I've been trying to connect my Stripe account for 3 days and the "
          "integration keeps failing. I'm losing sales. Please help ASAP.")

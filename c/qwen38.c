@@ -1514,8 +1514,10 @@ static int q38_prefix_cache_save(Model *m,const int *ids,int len,const float *lo
 static int q38_prefix_restore(Model *m,const int *ids,int len){
     if(!m||!ids||len<1||!g_q38_prefix.valid||g_q38_prefix.owner!=m||
        g_q38_prefix.len<1||g_q38_prefix.len>len||
-       memcmp(g_q38_prefix.ids,ids,(size_t)g_q38_prefix.len*sizeof(int)))return 0;
-    q38_prefix_copy_state(m,0);m->kv_len=g_q38_prefix.len;return g_q38_prefix.len;
+       memcmp(g_q38_prefix.ids,ids,(size_t)g_q38_prefix.len*sizeof(int))||
+       !kv_prefix_holds(&m->kvp,g_q38_prefix.ids,g_q38_prefix.len))return 0;
+    q38_prefix_copy_state(m,0);m->kv_len=g_q38_prefix.len;
+    m->kvp.len=g_q38_prefix.len;return g_q38_prefix.len;
 }
 
 static const float *q38_prefix_cached_logits(Model *m){
@@ -1653,13 +1655,20 @@ static int serve_one(Model *m, ServeReq *q){
      * il client ha dichiarato, e battono la cache automatica, che insegue solo
      * l'ultimo prompt. Se nessuno serve, si ricade su quella. */
     int reuse=0; const float *pin_lo=NULL;
+    /* Image embeddings are not described by token identity. */
+    if(m->vis_map && m->vis_rows_n>0){
+        kv_prefix_taint(&m->kvp);q38_prefix_cache_invalidate();
+    }
     {
         int ps=coli_pin_best(&g_q38_pins,ids,np);
         while(ps>=0){
             ColiPin *k=&g_q38_pins.slot[ps];
             Q38PinState *st=(Q38PinState*)k->state;
-            if(st && q38_pin_state_copy(m,&st,0)){
-                m->kv_len=k->len; reuse=k->len; pin_lo=k->logit;
+            /* Pins omit K/V/indexer rows. Reject one whose rows were overwritten. */
+            if(st && kv_prefix_holds(&m->kvp,k->ids,k->len) &&
+               q38_pin_state_copy(m,&st,0)){
+                m->kv_len=k->len; m->kvp.len=k->len;
+                reuse=k->len; pin_lo=k->logit;
                 coli_pin_touch(&g_q38_pins,ps);
                 break;
             }
@@ -1939,7 +1948,7 @@ int main(int argc, char **argv) {
 
     Model m; model_init(&m, snap, cap, bits);
     q38_tier_start(&m, cap);   /* COLI_CUDA=1: hot experts stream to VRAM (qwen36_tier.c) */
-    q38_trunk_cpu_int8(&m);    /* Q38_TRUNK_CPU_INT8=1: the trunk's int8 rows on the CPU (reference) */
+    q38_trunk_cpu_int8(&m);    /* the trunk's int8 rows on the CPU, BF16 released (Q38_TRUNK_CPU_INT8=0 keeps BF16) */
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
     q38_telemetry_init(snap, &m);
