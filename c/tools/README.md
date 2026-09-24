@@ -4,6 +4,40 @@ These scripts support model preparation and offline engineering work. They are
 not runtime dependencies of the C engine.
 
 - `convert_fp8_to_int4.py`, `download_glm52.py`: model preparation
+- `qpack_install_policy.py`: source-bound resume decisions and manifest-last
+  publication primitives for future qpack download/repack frontends. Hold its
+  install session for the full transfer. Qpack v1 has sizes but no content
+  hashes, so frontends must also enforce immutable revisions and any available
+  transport checksum or ETag. It covers manifest-declared container artifacts,
+  not required runtime auxiliaries such as `config.json`. Swiftlet manifests
+  vary: the 35B container declares `packed_experts/layout.json` and its
+  tokenizer files, the production Qwen3-Next-80B container declares only the
+  weights, so `layout.json` is verified when declared and never required
+  here. Directory-fsync crash durability is POSIX-only.
+- `qpack_http_install.py`: dependency-free Hugging Face frontend for that
+  policy. It resolves a branch or tag to an immutable commit before opening the
+  install session, streams manifest-declared files directly into `.part`
+  files, resumes only exact HTTP ranges, and publishes `manifest.json` last.
+  `config.json` is required, and so is `packed_experts/layout.json`, which
+  the reader opens directly: when the manifest does not declare it, it is
+  fetched as a required sidecar. Manifest-declared tokenizer/configuration
+  files use the same resumable artifact path, while undeclared optional files
+  are copied as verified sidecars when present. Strong ETags, documented server
+  SHA-256 values, and a locally computed full-file SHA-256 are persisted in
+  `.qpack-http.json` and checked on resume. `HF_TOKEN` is sent only to the Hub
+  origin and is stripped on cross-origin HTTPS redirects.
+- `qpack_mirror_install.py`: static HTTPS/R2 frontend over the same transfer
+  engine. A strict `hashes.json` is required and fetched before the manifest;
+  it must cover `manifest.json`, `config.json`, `packed_experts/layout.json`,
+  and every manifest artifact.
+  The legacy Swiftlet `{"files":{"path":"sha256"}}` schema and the sized
+  `qpack.hashes.v1` schema are accepted. The normalized mirror URL plus the
+  digest of the exact raw index bytes bind resume state; indexed runtime files receive
+  authoritative full-object SHA-256 values, while other valid indexed
+  sidecars are ignored. The exact raw index is persisted beside the installed
+  container. Mirror installs never inherit
+  `HF_TOKEN`; an explicit bearer token can be read from a named environment
+  variable and is stripped on cross-origin redirects.
 - `convert_fmt4_to_fmt2.py`: fmt=4 (grouped int4) -> fmt=2 (per-row int4)
   re-quant of a GLM-5.2 container, for Metal-backend compatibility
   (see `docs/METAL-M1ULTRA-FMT2-REPORT.md`)
@@ -28,7 +62,29 @@ Run them from `c/`, for example:
 ```sh
 python3 tools/convert_fp8_to_int4.py --selftest
 python3 tools/make_glm_bench_model.py --output /tmp/colibri-bench
+python3 tools/qpack_http_install.py OWNER/REPO \
+  --revision main --output /path/to/model.qpack
+python3 tools/qpack_mirror_install.py \
+  https://models.example/qwen/model.qpack \
+  --output /path/to/model.qpack \
+  --hashes-sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
+
+An interrupted qpack install can be restarted with the same command. Keep the
+source repository and revision unchanged. The installer rejects HTTP range or
+validator inconsistencies instead of appending uncertain bytes. It requires
+`Content-Length` for large artifacts and never stages the original BF16/FP8
+checkpoint, but it does not convert a raw checkpoint into qpack.
+
+Static mirrors must use HTTPS and publish objects first, `manifest.json` next,
+and `hashes.json` last as the remote completion marker. Without
+`--hashes-sha256`, the first valid TLS response is trust on first use: the
+URL-and-index identity prevents a later snapshot from resuming into those
+partials, but it cannot authenticate a mirror that was already compromised on
+the first request. Prefer a versioned mirror prefix and an out-of-band index
+digest for production distribution. The installer uses exact byte ranges and
+`If-Match` when a strong ETag is available; final SHA-256 verification remains
+the authority.
 
 `make_glm_oracle.py` also produces the quantized routed-expert fixtures for the
 fmt=6 (E8/IQ3, rotation-bearing) and fmt=4 (grouped int4, no-rotation control)
