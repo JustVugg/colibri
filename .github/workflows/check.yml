@@ -23,7 +23,9 @@ jobs:
   linux:
     name: Linux
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # make check takes about 14 minutes here now (14.9 at worst this week);
+    # at 15 the job was cut off with nothing failed.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: make check
@@ -140,7 +142,9 @@ jobs:
     # single-threaded automatically if it's ever missing).
     name: macOS (colibri + V4 platform gate)
     runs-on: macos-latest
-    timeout-minutes: 15
+    # `make check` here now takes about 14.5 minutes; at 15 the job was cut
+    # off inside the Python suite with no test failed, and showed as red.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: install libomp
