@@ -19,9 +19,9 @@ SCALAR=""
 AB=1
 case "$(uname -m)" in
     x86_64*|amd64) ARCH=x86-64-v3 ; SCALAR="-mno-avx2" ;;
-    arm64|aarch64) AB=0 ;;   # no SIMD arm in this kernel on NEON yet (#1696):
-                             # arm64 builds only the scalar arm; this is the
-                             # baseline a future NEON arm must beat
+    arm64|aarch64) SCALAR="-march=armv8-a+nosimd" ;;   # +nosimd undefines __ARM_NEON:
+                                                    # the scalar #else arm, against which
+                                                    # the NEON arm must be bit-exact (#1696)
     *) echo "unsupported arch $(uname -m)"; exit 1 ;;
 esac
 
@@ -41,14 +41,15 @@ $CC /tmp/bk_unit_simd.o /tmp/bk_main_simd.o -o /tmp/bk_simd -lm -fopenmp
 REF=/tmp/bk_ref.f32
 rm -f "$REF"
 if [ "$AB" = 1 ]; then
-    echo "== building scalar-arm unit (-mno-avx2) =="
+    echo "== building scalar-arm unit ($SCALAR) =="
     $CC $COMMON -march=$ARCH $SCALAR $UNIT -c deepseek_v4.c -o /tmp/bk_unit_sca.o
     $CC $COMMON -march=$ARCH $SCALAR -c tools/bench_fp4_matmul.c -o /tmp/bk_main_sca.o
     $CC /tmp/bk_unit_sca.o /tmp/bk_main_sca.o -o /tmp/bk_sca -lm -fopenmp
     echo "== SIMD arm (writes reference) =="
     /tmp/bk_simd "$S" "$I" "$O" "$IT" "$REF"
     echo "== scalar arm (compares bit-exactly + times) =="
-    /tmp/bk_sca "$S" "$I" "$O" "$IT" "$REF"
+    /tmp/bk_sca "$S" "$I" "$O" "$IT" "$REF" | tee /tmp/bk_sca.log
+    grep -q "BITEXACT vs .*: IDENTICAL" /tmp/bk_sca.log || { echo "FAIL: SIMD and scalar arms differ"; exit 1; }
     echo "Done. Repeat /tmp/bk_simd ... to re-verify bit-exactness."
 else
     echo "== no SIMD arm on this arch/kernel yet (#1696); scalar baseline only =="
