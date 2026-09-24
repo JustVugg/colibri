@@ -1122,24 +1122,18 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 }
 
 static double mem_avail_bytes(void) {
-#if defined(__linux__)
-    FILE *f = fopen("/proc/meminfo", "r");
-    if (!f) return 0;
-    char ln[256]; double kb = 0;
-    while (fgets(ln, sizeof(ln), f)) if (sscanf(ln, "MemAvailable: %lf", &kb) == 1) break;
-    fclose(f);
-    return kb * 1024.0;
-#elif defined(__APPLE__)
-    /* free + inactive + purgeable ~ Linux MemAvailable. Without this the auto
-     * cap fell back to 16 experts/layer on a 128 GB Mac. */
-    vm_size_t page = 0; host_page_size(mach_host_self(), &page);
-    vm_statistics64_data_t vs; mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &n) != KERN_SUCCESS)
-        return 0;
-    return (double)(vs.free_count + vs.inactive_count + vs.purgeable_count) * page;
-#else
+    /* Shared probe: Linux MemAvailable, macOS free+inactive+purgeable,
+     * Windows ullAvailPhys/commit. The #else here used to return 0, so
+     * Windows auto-cap was always 16 experts/layer and never warned. */
+    double gb = compat_mem_available_gb();
+    if (gb > 0.0) return gb * 1e9;
+    static int noted = 0;
+    if (!noted) {
+        noted = 1;
+        fprintf(stderr, "[inkling] could not measure available RAM on this platform; "
+                        "auto cache falls back to 16 experts/layer. Pass --cap to set it.\n");
+    }
     return 0;
-#endif
 }
 
 /* ---------- routed-expert slots: serial bookkeeping, parallel fills ---------- */
@@ -2499,6 +2493,25 @@ static void serve_hwinfo(Model *m) {
             if (sscanf(ln, "MemTotal: %lf", &v) == 1) rt = v/1e6;
             if (sscanf(ln, "MemAvailable: %lf", &v) == 1) ra = v/1e6;
         } fclose(mi); }
+    if (rt <= 0.0 || ra <= 0.0) {
+        double t2 = 0, a2 = 0;
+        compat_meminfo_gb(&t2, &a2);
+        if (rt <= 0.0) rt = t2;
+        if (ra <= 0.0) ra = a2;
+    }
+#ifdef _WIN32
+    if (cores <= 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        cores = (int)si.dwNumberOfProcessors;
+    }
+#endif
+#ifdef __APPLE__
+    if (!cpu[0]) {
+        size_t sl = sizeof(cpu);
+        if (sysctlbyname("machdep.cpu.brand_string", cpu, &sl, NULL, 0)) cpu[0] = 0;
+    }
+#endif
     int ngpu = 0; double vram = 0;
     const char *gpu = "";
 #ifdef COLI_CUDA

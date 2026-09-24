@@ -198,6 +198,11 @@ jobs:
             # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'.
             shell: "msys2 {0}"
             v4: "1"
+            # The same make_args as release.yml's windows row, so the shipped
+            # configuration is built here before a tag builds it for the first
+            # time. XDNA=1 needs nothing installed on the runner: the lane's host
+            # side links no XRT, and the helper is loaded at runtime on request.
+            make_args: "XDNA=1"
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -230,10 +235,32 @@ jobs:
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
           for t in $ENGINES; do
             echo "::group::$t"
-            make $t || { echo "FAILED: $t"; rc=1; }
+            make $t ${{ matrix.make_args }} || { echo "FAILED: $t"; rc=1; }
             echo "::endgroup::"
           done
           exit $rc
+      - if: matrix.os == 'windows-latest'
+        name: "The release configuration is what got built (XDNA=1)"
+        run: |
+          cd c
+          # A switch that silently did nothing would still leave the loop above
+          # green, so check the binary rather than the command line. Only an
+          # XDNA=1 host carries the helper's name (its LoadLibraryExA argument),
+          # and only a default host carries the "no XDNA support" answer.
+          if ! grep -aq 'coli_xdna.dll' colibri.exe; then
+            echo "FAIL: colibri.exe was built without the XDNA lane"; exit 1
+          fi
+          if grep -aq 'this build has no XDNA support' colibri.exe; then
+            echo "FAIL: colibri.exe is the default build, not XDNA=1"; exit 1
+          fi
+          # The lane must not cost the ordinary download a dependency: XRT and
+          # the helper are resolved at runtime, only when the user asks.
+          imports=$(objdump -p colibri.exe | sed -n 's/.*DLL Name: //p' | tr 'A-Z' 'a-z')
+          echo "$imports"
+          if echo "$imports" | grep -Eq '^(xrt_core|xrt_coreutil|coli_xdna)\.dll'; then
+            echo "FAIL: the XDNA=1 host imports XRT or the helper"; exit 1
+          fi
+          echo "OK: colibri.exe carries the XDNA lane and imports neither XRT nor the helper"
       - name: "Environment shims: setenv is visible to getenv in-process"
         run: |
           cd c
@@ -1301,6 +1328,12 @@ jobs:
         run: pip install -r c/tools/oracle-requirements.txt
       - name: Build every engine (NEON branches must compile)
         run: make -C c colibri inkling kimi_k3 olmoe
+      - name: "DeepSeek V4 FP4 expert kernels: NEON arm bit-exact against the scalar arm (#1696)"
+        run: |
+          cd c
+          # batch (prefill) and S=1 (the matvec the decode uses)
+          bash tools/bench_fp4_matmul.sh 32 256 128 1
+          bash tools/bench_fp4_matmul.sh 1 256 128 1
       - name: Integer-kernel exactness, NEON branches live (#1081)
         run: |
           cd c
