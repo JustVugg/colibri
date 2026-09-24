@@ -31,6 +31,7 @@ c/deepseek_v41
 c/deepseek_v41.exe
 c/COLI_V4_UNIT_*.o
 c/deepseek_v4.cflags
+c/deepseek_v4.cudaflags
 # ...and the ownership-test objects, which the same Makefile puts in a build/
 # subdirectory (V4_OWN_DIR) rather than next to the sources. #868 caught the
 # twelve in c/, not the four in here, so `make check` still left `?? c/build/`.
