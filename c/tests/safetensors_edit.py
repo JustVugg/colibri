@@ -28,6 +28,10 @@ def _shard_of(directory, name):
     raise KeyError(f"{name} is in no shard of {directory}")
 
 
+def shape_of(directory, name):
+    return list(_shard_of(directory, name)[1][name]["shape"])
+
+
 def copy_fixture(source, destination):
     shutil.copytree(source, destination)
     return Path(destination)
@@ -57,3 +61,29 @@ def add_f32(directory, beside, name, count, value=0x41414141):
     encoded += b" " * (-len(encoded) % 8)
     shard.write_bytes(struct.pack("<Q", len(encoded)) + encoded + data
                       + struct.pack("<I", value) * count)
+
+
+def shrink(directory, name, count):
+    """Keep the first `count` elements of tensor `name`, declared as a flat vector.
+
+    The header stays honest: shape and offsets agree, and the tensors stored after
+    it move up so the data section has no hole. Only the length is hostile.
+    """
+    shard, header, start = _shard_of(directory, name)
+    data = shard.read_bytes()[start:]
+    width = len(_NAN[header[name]["dtype"]])
+    tensors = sorted((entry["data_offsets"][0], key) for key, entry in header.items()
+                     if key != "__metadata__")
+    body, at = [], 0
+    for _, key in tensors:
+        entry = header[key]
+        first, last = entry["data_offsets"]
+        if key == name:
+            last = first + width * count
+            entry["shape"] = [count]
+        body.append(data[first:last])
+        entry["data_offsets"] = [at, at + last - first]
+        at += last - first
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    shard.write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"".join(body))
