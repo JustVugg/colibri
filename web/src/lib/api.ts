@@ -12,6 +12,13 @@ export interface ChatMessage {
      than on the draft, because the transcript is resent on every later turn and
      the model has to keep seeing what it was shown. */
   images?: string[]
+  /* How an assistant turn's last generation ended: the server's finish_reason;
+     "aborted" / "error" when the client stopped or lost the stream; or
+     "incomplete" when the stream closed without a finish_reason, which colibri
+     always sends last, so its absence means the reply was cut off. Kept on
+     the message so it travels with the transcript through slot switches and
+     archives; never sent to the server. */
+  finish?: string
 }
 
 interface OpenAIError {
@@ -55,6 +62,9 @@ export interface HealthResponse {
   kv_slots?: number
   tiers?: TiersHealth
   hwinfo?: HwinfoHealth
+  /* Whether a message list ending on an assistant turn is continued rather than
+     answered fresh (COLI_CONTINUE_ASSISTANT). Absent on older servers. */
+  continue_assistant?: boolean
 }
 
 export interface ProfileTurn {

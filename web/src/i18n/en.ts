@@ -28,6 +28,7 @@ const en: Record<string, string> = {
   "ui.copied": "Copied",
   "ui.copyError": "Could not copy the text. Select the response to copy it.",
   "ui.regenerate": "Regenerate response",
+  "ui.continue": "Continue this reply",
   "ui.archived": "Archived conversation",
   "ui.historyMemory": "Conversations are kept for this open session. Export a conversation to save it.",
   "ui.explore": "Explore",

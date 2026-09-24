@@ -1328,6 +1328,12 @@ jobs:
         run: pip install -r c/tools/oracle-requirements.txt
       - name: Build every engine (NEON branches must compile)
         run: make -C c colibri inkling kimi_k3 olmoe
+      - name: "DeepSeek V4 FP4 expert kernels: NEON arm bit-exact against the scalar arm (#1696)"
+        run: |
+          cd c
+          # batch (prefill) and S=1 (the matvec the decode uses)
+          bash tools/bench_fp4_matmul.sh 32 256 128 1
+          bash tools/bench_fp4_matmul.sh 1 256 128 1
       - name: Integer-kernel exactness, NEON branches live (#1081)
         run: |
           cd c

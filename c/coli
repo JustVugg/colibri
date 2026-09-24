@@ -2273,8 +2273,20 @@ def cmd_stop(a):
         print(f"  nothing running — no serve on port {a.port}, no SERVE engines"); return
     for pid,desc in targets.items(): print(f"  {'would stop' if a.dry_run else 'stopping'} {pid}: {desc}")
     if a.dry_run: return
-    for pid in targets:
+    # Graceful first: only the launcher's Engine.close drains the engine
+    # (stdin EOF -> atexit -> HEAT_FILE save). SIGTERM the launchers and
+    # give them the drain window to exit on their own; engine pids left
+    # behind (orphaned, no launcher) get the old treatment after.
+    launchers = [pid for pid, d in targets.items() if d.startswith("coli serve")]
+    strays   = [pid for pid, d in targets.items() if not d.startswith("coli serve")]
+    deadline = time.time() + 30.0
+    for pid in launchers:
         try: os.kill(pid, signal.SIGTERM)
+        except OSError: pass
+    while time.time() < deadline and any(_pid_alive(p) for p in launchers):
+        time.sleep(0.25)
+    for pid in strays:
+        try: os.kill(pid, signal.SIGTERM)   # normally already gone with the launcher
         except OSError: pass
     time.sleep(2.0)
     for pid in targets:

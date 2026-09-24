@@ -81,17 +81,18 @@ int main(void) {
         for (size_t i = 0; i < (size_t)O * I; i++) W[i] = rnd();
         for (size_t i = 0; i < (size_t)S * I; i++) x[i] = rnd() * 2.f;
         ref_matmul(ref, x, W, S, I, O);
-        /* the classic path (no flags): int8 rows, f32 activations */
+        /* the classic path (no flags): int8 rows, f32 activations.
+         * dense_idot_on caches its answer: this TU reads the env once, so
+         * set it before the first call (matmul_d, via qw_quantize below). */
         setenv("COLI_DENSE_IDOT", "0", 1); setenv("COLI_DENSE_BITS", "8", 1);
-        qdw_register(W, I, O);
-        matmul_d(y0, x, W, S, I, O);
+        QW w = {0}; qw_quantize(W, I, O, NULL, &w);
+        matmul_d(y0, x, &w, S, I, O);
         double g0 = rel_gap(y0, ref, S * O);
         ck(g0 < 2e-2, "classic int8 path within 2% of the f32 reference (per-row int8)");
-        matmul_d(y, x, W, 1, I, O);
+        matmul_d(y, x, &w, 1, I, O);
         ck(!memcmp(y, y0, (size_t)O * sizeof(float)), "one row and the first of a batch agree on the classic path");
-        /* the integer path on the same int8 rows */
-        g_qdw_n = 0;
-        /* dense_idot_on caches its answer: this TU reads the env once, so set it before the first call */
+        qw_free(&w);
+        free(W); free(x); free(ref); free(y); free(y0);
     }
     {
         /* fresh process-wide state for the flag readers: emulate by direct calls */

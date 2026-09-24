@@ -54,13 +54,19 @@ int main(void) {
     Model m={0}; Layer l={0};
     m.c.hidden=H; m.c.dn_kheads=KH; m.c.dn_vheads=VH;
     m.c.dn_kdim=KD; m.c.dn_vdim=VD; m.c.dn_convk=CK; m.c.dn_conv_dim=C; m.c.eps=1e-6f;
-    l.dn_qkv=weights(C*H); l.dn_z=weights(Z*H); l.dn_out=weights(H*Z);
+    /* dn_qkv/dn_z: quantized straight into the QW the Layer holds, the same
+     * shape load_tq uses. dn_out stays unquantized (.w only, .q == NULL) --
+     * the pre-QW test never registered it either, so it always took the f32
+     * matmul_d fallback; both deltanet() calls below share this same l.dn_out,
+     * so which path it takes doesn't affect the cpu/gpu comparison. */
+    { float *w = weights(C*H); qw_quantize(w, H, C, NULL, &l.dn_qkv); free(w); }
+    { float *w = weights(Z*H); qw_quantize(w, H, Z, NULL, &l.dn_z); free(w); }
+    l.dn_out.w=weights(H*Z);
     l.dn_b=weights(VH*H); l.dn_a=weights(VH*H); l.dn_conv=weights(C*CK);
     l.dn_alog=weights(VH); l.dn_dtbias=weights(VH); l.dn_norm=weights(VD);
-    qdw_register(l.dn_qkv,H,C); qdw_register(l.dn_z,H,Z);
     int8_t q[O*H]; float sc[O];
-    memcpy(q,g_qdw[0].q,C*H); memcpy(q+C*H,g_qdw[1].q,Z*H);
-    memcpy(sc,g_qdw[0].sc,C*sizeof(float)); memcpy(sc+C,g_qdw[1].sc,Z*sizeof(float));
+    memcpy(q,l.dn_qkv.q,C*H); memcpy(q+C*H,l.dn_z.q,Z*H);
+    memcpy(sc,l.dn_qkv.sc,C*sizeof(float)); memcpy(sc+C,l.dn_z.sc,Z*sizeof(float));
     state(&m);
     enum { S=259 };
     float *x=weights(S*H), cpu[S*H], gpu[S*H], rec[VH*KD*VD], conv[C*(CK-1)];
@@ -126,9 +132,9 @@ int main(void) {
     coli_cuda_shutdown();
 #endif
     free(x); free(m.DN_rec[0]); free(m.DN_conv[0]); free(m.DN_rec); free(m.DN_conv);
-    free(l.dn_qkv); free(l.dn_z); free(l.dn_out); free(l.dn_b); free(l.dn_a); free(l.dn_conv);
+    qw_free(&l.dn_qkv); qw_free(&l.dn_z); free((void*)l.dn_out.w);
+    free(l.dn_b); free(l.dn_a); free(l.dn_conv);
     free(l.dn_alog); free(l.dn_dtbias); free(l.dn_norm);
-    for(int i=0;i<g_qdw_n;i++){free(g_qdw[i].q);free(g_qdw[i].sc);} g_qdw_n=0;
     printf("DeltaNet batch: %s\n",failed?"FAIL":"outputs and recurrent state match; 259 calls -> 2");
     return failed!=0;
 }
