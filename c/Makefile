@@ -771,7 +771,16 @@ ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # cmd.exe, so `make glm.exe` from the VS Native Tools prompt or with scoop MinGW
 # (neither ships sh.exe) failed with "'printf' is not recognized" and left the
 # stamp stale. $(file ...) works regardless of the shell make falls back to. (#478)
+#
+# GNU Make 3.81 -- /usr/bin/make on macOS -- has no $(file ...): it expands to
+# nothing, the stamp is never written, and every build relinks (#1732). Make
+# 3.x is found there and not under cmd.exe (MSYS2 and MinGW ship 4.x), and
+# macOS always has a POSIX printf, so that one case keeps the shell write.
+ifneq ($(filter 3.%,$(MAKE_VERSION)),)
+$(shell printf '%s\n' '$(subst ','\'',$(BUILD_CONFIG))' > .build-config)
+else
 $(file >.build-config,$(BUILD_CONFIG))
+endif
 endif
 .build-config: ;
 
