@@ -77,7 +77,7 @@ POST /v1/brio
 | `state` | one of | the text to decide on |
 | `messages` | one of | a chat history used as the context instead of `state` |
 | `question` | optional | what to ask about the state |
-| `normalize` | optional | `mean` (default) or `sum`, see below |
+| `normalize` | optional | `sum` (default) or `mean`, see below |
 | `cache_slot` | optional | forced KV slot; by default derived from `state` |
 
 The reply:
@@ -87,7 +87,7 @@ The reply:
   "object": "brio.choice",
   "answer": "request changes",
   "entropy": 0.121,
-  "normalize": "mean",
+  "normalize": "sum",
   "choices": [
     {"option": "request changes", "p": 0.974, "logprob": -0.252, "mean_logprob": -0.126, "tokens": 2},
     {"option": "merge",           "p": 0.023, "logprob": -4.007, "mean_logprob": -4.007, "tokens": 1},

@@ -4490,7 +4490,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if not isinstance(text, str) or not text.strip():
                     raise APIError(400, f"`questions[{i}].question` must be a non-empty string.",
                                    "questions")
-                per = entry.get("normalize", body.get("normalize", "mean"))
+                per = entry.get("normalize", body.get("normalize", "sum"))
                 if per not in ("mean", "sum"):
                     raise APIError(400, "`normalize` must be \"mean\" or \"sum\".", "normalize")
                 questions.append((text, self._brio_options(entry.get("options"),
@@ -4537,7 +4537,13 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "Provide `state`, `messages` or `question`.", "state")
         if not state and form != "options":
             raise APIError(400, f"`{form}` needs a `state` (or `messages`) to decide on.", "state")
-        normalize = body.get("normalize", "mean")
+        # "sum" (the joint log-probability of the option as a continuation)
+        # is the default: "mean" compares per-token averages, which silently
+        # favors multi-token options whenever the menu mixes token counts —
+        # e.g. DENY (2 tokens) beating ALLOW (1) on every safe change in a
+        # 30-case benchmark. "mean" stays available for menus whose options
+        # tokenize to the same length, and warns when they do not.
+        normalize = body.get("normalize", "sum")
         if normalize not in ("mean", "sum"):
             raise APIError(400, "`normalize` must be \"mean\" or \"sum\".", "normalize")
         # Lo slot si sceglie dallo STATO, non dalla domanda: mille domande
@@ -4606,6 +4612,15 @@ class APIHandler(BaseHTTPRequestHandler):
                     raise APIError(502, "The engine returned no log probabilities for the "
                                         "options.", None, "engine_error", "server_error")
                 key = "mean_logprob" if norm == "mean" else "logprob"
+                if norm == "mean":
+                    token_counts = {entry["tokens"] for entry in scored if entry["tokens"]}
+                    if len(token_counts) > 1:
+                        counts = ", ".join(f"{entry['option']}={entry['tokens']}"
+                                           for entry in scored)
+                        print(f"[brio] WARNING: normalize=mean with unequal option "
+                              f"token counts ({counts}) — per-token averages favor "
+                              f"multi-token options; consider normalize=sum",
+                              file=sys.stderr)
                 top = max(entry[key] for entry in scored)
                 weights = [math.exp(entry[key] - top) for entry in scored]
                 total_weight = sum(weights) or 1.0
