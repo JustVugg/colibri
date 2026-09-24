@@ -1419,13 +1419,13 @@ tests/test_grammar_cache$(EXE): tests/test_grammar_cache.c sse41_kernels.h colib
 # agreement check against the plain logprob_target the sampling path uses
 # on rows a float subtraction cannot mis-round, and a double-precision
 # check against a second double computation on rows that do.
-tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c oracle.h sample.h evidence_digest.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h kv_persist.h telemetry.h route_trace.h
+tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c sse41_kernels.h exact_dot.h oracle.h sample.h evidence_digest.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # The ablation mode's manifest loader, evidence writer and dispatch contract.
 # The adapter build bypasses only the model computation, so the parser/writer
 # path is exercised for real with no model and no weights.
-tests/test_ablate_mode$(EXE): tests/test_ablate_mode.c colibri.c oracle.h sample.h evidence_digest.h abl.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h kv_persist.h telemetry.h route_trace.h
+tests/test_ablate_mode$(EXE): tests/test_ablate_mode.c colibri.c sse41_kernels.h exact_dot.h oracle.h sample.h evidence_digest.h abl.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # Standalone: drives a faithful miniature of moe()'s routing+accumulate and links
