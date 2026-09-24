@@ -5,7 +5,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [1.12.1] — 2026-09-22
 
-86 pull requests since v1.12.0, 74 of them from contributors. Two tokenizers
+87 pull requests since v1.12.0, 75 of them from contributors. Two tokenizers
 brought back to the reference, brio on the ninth engine, `coli chat` working
 again at the default context on two families, and a placement decision that
 is now measured on the card in front of it instead of predicted.
@@ -212,6 +212,12 @@ is now measured on the card in front of it instead of predicted.
 - **#1695** (namespaceMarcello): the prefill echo state and `serve_echo` sit
   under the same `QWEN36_NO_MAIN` guard, so the segment build no longer
   warns about a function it never gets; the full build is byte-identical.
+- **#1724** (GenericRikka): Qwen3.6 decoded `<think>`, `</think>` and the
+  tool tags to nothing, because they live only in the tokenizer's
+  `added_tokens`; with thinking on, the closing tag never reached the
+  gateway and the whole answer came back as `reasoning_content`. The
+  non-special added tokens are decoded now; special ones such as
+  `<|im_start|>` still decode to nothing.
 - **#1712** (kevin9327): Kimi K3, Inkling and OLMoE now treat `max_tokens`
   as a ceiling like the other engines; `coli chat`'s default of 16384
   answered 400 on every Kimi and Inkling message against their 8192-token

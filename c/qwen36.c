@@ -317,8 +317,8 @@ static void encode_text(const char *text,int **out_ids,int *out_n){
     *out_ids=ids; *out_n=n;
 }
 
-/* Load Qwen tokenizer.json and build an id->piece table. Only needs the
- * "model.vocab" map (piece string -> id); merges are irrelevant for decoding. */
+/* Load Qwen tokenizer.json and build an id->piece table from model.vocab
+ * and added_tokens. Merges are irrelevant for decoding. */
 static void load_tokenizer(const char *path){
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[tok] cannot open %s\n", path); return; }
@@ -332,17 +332,42 @@ static void load_tokenizer(const char *path){
     jval *vocab = json_get(model, "vocab");
     if (!vocab) vocab = json_get(model, "tokens");
     if (!vocab) { fprintf(stderr, "[tok] no model.vocab/tokens in %s\n", path); free(buf); return; }
+    jval *adds = json_get(root, "added_tokens");
+
     int mx = 0;
     if (vocab->t == J_OBJ){
         for (int i=0;i<vocab->len;i++){ int id=(int)vocab->kids[i]->num; if(id>mx)mx=id; }
     } else {
         mx = vocab->len - 1;
     }
+    if (adds && adds->t==J_ARR){
+        for (int k=0;k<adds->len;k++){
+            jval *t = adds->kids[k];
+            int id = (int)jnum(t,"id");
+            if (id > mx) mx = id;
+        }
+    }
+
     g_tok = calloc((size_t)mx+1, sizeof(char*));
     if (vocab->t == J_OBJ){
         for (int i=0;i<vocab->len;i++){ int id=(int)vocab->kids[i]->num; if(id>=0 && id<=mx) g_tok[id]=strdup(vocab->keys[i]); }
     } else {
         for (int i=0;i<vocab->len;i++){ if(vocab->kids[i] && vocab->kids[i]->t==J_STR) g_tok[i]=strdup(vocab->kids[i]->str); }
+    }
+    if (adds && adds->t==J_ARR){
+        for (int k=0;k<adds->len;k++){
+            jval *t = adds->kids[k];
+            const char *c = jstr(t,"content");
+            int id = (int)jnum(t,"id");
+            /* Only the non-special ones: <think>, </think>, <tool_call>,
+             * <tool_response> are text the gateway parses. Special tokens
+             * (<|im_start|>, <|endoftext|>, ...) keep decoding to nothing,
+             * as reference decoding does with skip_special_tokens. */
+            jval *sp = json_get(t,"special");
+            if (sp && sp->t==J_BOOL && sp->boolean) continue;
+            if (c && id>=0 && id<=mx && !g_tok[id])
+                g_tok[id]=strdup(c);
+        }
     }
     g_tok_n = mx+1;
 
@@ -380,7 +405,6 @@ static void load_tokenizer(const char *path){
             smap_put(&g_merge, key, r);
         }
     }
-    jval *adds = json_get(root, "added_tokens");
     if (adds && adds->t==J_ARR && g_nspecial==0){
         g_nspecial = adds->len;
         g_sp_str = malloc(g_nspecial*sizeof(char*));
@@ -486,7 +510,7 @@ static void sse_chunk(const char *json){
  * <0xXX> byte-fallback tokens emit the raw byte directly. */
 static void decode_id_to_bytes(int id, unsigned char *out, int *outn){
     *outn = 0;
-    if (!g_tok || id<0 || id>=g_tok_n) return;
+    if (!g_tok || id<0 || id>=g_tok_n || !g_tok[id]) return;
     const unsigned char *pc = (const unsigned char*)g_tok[id];
     /* byte-fallback token: <0xXX> -> raw byte */
     if (pc[0]=='<' && pc[1]=='0' && pc[2]=='x' && pc[5]=='>'){
