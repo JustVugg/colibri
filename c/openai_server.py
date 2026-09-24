@@ -3384,8 +3384,11 @@ class Engine:
             # Graceful drain first: the engine's serve loop reads requests
             # from stdin, and EOF there is the one portable path to its
             # atexit teardown (qt_shutdown -> HEAT_FILE save). EOF only
-            # lands between turns, so the drain wait must be generous;
-            # anything else falls through to the hard-stop ladder below.
+            # lands between turns, so the drain wait must be generous.
+            # poll() (not the absence of TimeoutExpired) decides whether
+            # the hard-stop ladder below still needs to run: wait() may
+            # simply return None for a process (or test double) that only
+            # "terminates" when asked.
             try:
                 self.process.stdin.close()
             except (OSError, ValueError, AttributeError):
@@ -3393,6 +3396,8 @@ class Engine:
             try:
                 self.process.wait(timeout=_ENGINE_DRAIN_S)
             except subprocess.TimeoutExpired:
+                pass
+            if self.process.poll() is None:
                 self.process.terminate()
                 try:
                     self.process.wait(timeout=5)
