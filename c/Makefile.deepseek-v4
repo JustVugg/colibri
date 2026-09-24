@@ -240,6 +240,29 @@ $(V4_FLAGS_STAMP): FORCE
 	fi
 FORCE:
 
+# The same defect one level down. backend_cuda_dsv4.o is named after its source,
+# but what it contains comes from $(NVCC) $(V4_NVCCFLAGS): -arch=$(CUDA_ARCH)
+# (or the -gencode preset), the -DCOLI_DSV4_NO_TC guard and the DeepGEMM defines
+# all arrive through it. $(CFLAGS) above does not cover it, so without this:
+#
+#   make -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 CUDA_ARCH=sm_86
+#   make -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 CUDA_ARCH=sm_80
+#   -> no output at all, exit 0
+#
+# and the engine that asked for sm_80 links the sm_86 object, in silence. The
+# parent Makefile keeps the same class of state for the same reason, CUDA_ARCH
+# included, in .build-config (#306). Same scheme as $(V4_FLAGS_STAMP) above, so
+# a dry run (make -n) or a clean writes nothing: the file is only touched by the
+# recipe, and only when the command really changed.
+V4_CUDA_FLAGS_STAMP = deepseek_v4.cudaflags
+V4_TRACK_CUDA_FLAGS = $(subst ','\'',$(NVCC) $(V4_NVCCFLAGS))
+$(V4_CUDA_FLAGS_STAMP): FORCE
+	@flags='$(V4_TRACK_CUDA_FLAGS)'; \
+	if test x"$$flags" != x"`cat $@ 2>/dev/null`"; then \
+		test -f $@ && echo "deepseek-v4: CUDA build flags changed, rebuilding backend_cuda_dsv4.o" >&2; \
+		echo "$$flags" > $@; \
+	fi
+
 .PHONY: deepseek-v4 deepseek-v4-objs deepseek-v4-clean deepseek-v4-test-objs \
 	deepseek-v4-test-registry print-v4-objs FORCE
 deepseek-v4: $(V4_BINARY)
@@ -294,7 +317,8 @@ backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h $(V4_FLAGS_STAM
 	$(CC) $(CFLAGS) -c backend_loader_dsv4.c -o $@
 
 # Linux/macOS CUDA=1: the tier compiled straight into the engine.
-backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h $(V4_DEEPGEMM_DEP)
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h $(V4_DEEPGEMM_DEP) \
+	$(V4_CUDA_FLAGS_STAMP)
 	"$(NVCC)" $(V4_NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
 
 ifneq ($(DEEPGEMM_STAMP),)
@@ -315,4 +339,5 @@ test_expert_store_registry: test_expert_store_registry.c expert_store_registry.c
 deepseek-v4-clean:
 	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_HOT_TEST_OBJ) \
 		$(V4_BATCH_TEST_OBJ) \
-		$(V4_SERVE_TEST) test_expert_store_registry $(V4_FLAGS_STAMP)
+		$(V4_SERVE_TEST) test_expert_store_registry $(V4_FLAGS_STAMP) \
+		$(V4_CUDA_FLAGS_STAMP)
