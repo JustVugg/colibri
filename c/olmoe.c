@@ -246,32 +246,38 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
  * budget automatico pari a cio' che il processo gia' tiene: la cache risulta
  * minima invece che sbagliata, e --ram (o --cap) resta la via esplicita. */
 static double mem_available_gb(void) {
-    /* compat.h's probe knows Linux (MemAvailable), macOS (host_statistics64)
-     * and Windows (GlobalMemoryStatusEx). The Linux-only version that lived
-     * here returned 0 on the other two, and 0 sized the expert cache to one
-     * slot per layer: 2.5x slower without --ram, on every Windows and macOS
-     * benchmark taken since (#1500). */
-    double avail = compat_mem_available_gb();
-    if (avail > 0.0) return avail;
-    /* Not measurable here: say so once and fall back to half the physical RAM
-     * where that is known, else to a small fixed budget, rather than to a
-     * cache that streams every expert from disk on every token. */
-    static int noted = 0;
-    double total = 0.0;
-#ifdef _WIN32
-    double a2 = 0.0; compat_meminfo(&total, &a2);
-#elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
-    long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
-    if (pages > 0 && page > 0) total = (double)pages * (double)page / 1e9;
-#endif
-    double fallback = total > 0.0 ? total * 0.5 : 8.0;
-    if (!noted) {
-        noted = 1;
-        fprintf(stderr, "[olmoe] could not measure available RAM on this platform; assuming %.1f GB "
-                        "(%s). Pass --ram <GB> to set the budget explicitly.\n",
-                fallback, total > 0.0 ? "half the physical RAM" : "a fixed default");
+    /* The one cross-platform "RAM available now" probe, shared with every other
+     * engine (colibri.c, glm53.c). This engine used to read /proc/meminfo
+     * directly and had no macOS or Windows branch, so on a Mac or a Windows
+     * box it returned 0.0 and the auto budget collapsed to the dense resident
+     * footprint -- a one-slot-per-layer cache with no warning (#1601).
+     * Dev already had a fallback to half physical (7ed6084), but it missed the
+     * warm-macOS case where free+inactive+purgeable is 0.x GB on a 128 GB box:
+     * not zero, but implausible. The 2% floor treats that as unmeasured too. */
+    double total = 0, avail = 0;
+    compat_meminfo_gb(&total, &avail);
+    static int warned = 0;
+    if (avail <= 0.0 || (total > 0.0 && avail < total * 0.02)) {
+        if (!warned) {
+            warned = 1;
+            if (total > 0.0) {
+                fprintf(stderr,
+                    "[ram] auto-detect read %.2f GB available of %.2f GB physical -- "
+                    "implausibly low, treating as unmeasured and sizing from half "
+                    "the physical total; pass --ram <GB> to override\n",
+                    avail, total);
+                avail = total * 0.5;
+            } else {
+                fprintf(stderr,
+                    "[olmoe] could not measure available RAM on this platform; assuming 8.0 GB "
+                    "(a fixed default). Pass --ram <GB> to set the budget explicitly.\n");
+                avail = 8.0;
+            }
+        } else {
+            avail = total > 0.0 ? total * 0.5 : 8.0;
+        }
     }
-    return fallback;
+    return avail;
 }
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 
@@ -565,7 +571,14 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         double room = budget - resident - kv_gb - 0.5;   /* 0.5 GB: activations */
         int derived = room > 0.0 && slot_gb > 0.0
                     ? (int)(room / slot_gb / (double)layers) : 0;
-        if (derived < 1) derived = 1;
+        if (derived < 1) {
+            fprintf(stderr,
+                "[cache] no room for even one expert slot/layer (room %.1f GB vs %.0f MB/expert) "
+                "-- the cache will hold 1 slot/layer and decode will be slow; pass --ram <GB> "
+                "or --cap <slots> to size it\n",
+                room, slot_gb * 1000.0);
+            derived = 1;
+        }
         if (derived > c->n_experts) derived = c->n_experts;
         fprintf(stderr, "[cache] %d slots/layer of %d experts: %.1f GB budget "
                         "(%s), %.1f GB dense resident, %.1f GB projected KV, "
@@ -1771,11 +1784,34 @@ static void serve_hwinfo(Model *m) {
             if (sscanf(ln, "MemTotal: %lf", &v) == 1) rt = v/1e6;
             if (sscanf(ln, "MemAvailable: %lf", &v) == 1) ra = v/1e6;
         } fclose(mi); }
-    if (ra <= 0.0) ra = compat_mem_available_gb();   /* macOS, Windows: no /proc (#1500) */
-#ifdef _WIN32
-    if (rt <= 0.0) { double a2 = 0.0; compat_meminfo(&rt, &a2); }
-#elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
-    if (rt <= 0.0) { long pg = sysconf(_SC_PHYS_PAGES), ps = sysconf(_SC_PAGESIZE); if (pg > 0 && ps > 0) rt = (double)pg * ps / 1e9; }
+    /* #1601: neither /proc/cpuinfo nor /proc/meminfo exists on macOS (or
+     * Windows), so both reads above fail silently and this line went out as
+     * "0.0 0.0 ... unknown" -- the /health hwinfo the dashboard renders. Fill
+     * only what /proc could not supply, so the Linux path stays byte-identical
+     * (same shape as deepseek_v4.c's #macos-port HWINFO fix).
+     * Dev's 7ed6084 already added a simple fallback (ra=compat_mem_available_gb),
+     * but this version also fills cpu brand on Darwin and total RAM via
+     * compat_mem_total_gb(), which is the full fix for /health. */
+#if defined(__APPLE__)
+    if (!cpu[0]) {
+        size_t len = sizeof(cpu);
+        if (sysctlbyname("machdep.cpu.brand_string", cpu, &len, NULL, 0) != 0)
+            cpu[0] = 0;
+    }
+    if (rt <= 0.0) rt = compat_mem_total_gb();
+    if (ra <= 0.0) ra = compat_mem_available_gb();
+#elif defined(_WIN32)
+    if (rt <= 0.0 || ra <= 0.0) { double t = 0, a = 0; compat_meminfo(&t, &a);
+        if (rt <= 0.0) rt = t;
+        if (ra <= 0.0) ra = a; }
+#else
+    if (ra <= 0.0) ra = compat_mem_available_gb();
+    if (rt <= 0.0) {
+#if defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+        long pg = sysconf(_SC_PHYS_PAGES), ps = sysconf(_SC_PAGESIZE);
+        if (pg > 0 && ps > 0) rt = (double)pg * ps / 1e9;
+#endif
+    }
 #endif
     printf("HWINFO %d %.1f %.1f 0 0.0 %s|\n", cores, rt, ra, cpu[0] ? cpu : "unknown");
     fflush(stdout);
