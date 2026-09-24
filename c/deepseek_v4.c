@@ -16302,6 +16302,9 @@ int coli_v4_config_load(ColiDeepSeekV4Config *config, const char *model_dir,
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 float coli_e8m0_decode(uint8_t value) {
     if (value == 0xff) return NAN;
@@ -16666,6 +16669,87 @@ void coli_fp4_matmul_batch_rows16_order(float *y, const uint8_t *q4,
             _mm256_storeu_ps(y + (int64_t)s * O + tile * 16, sum0[s]);
             _mm256_storeu_ps(y + (int64_t)s * O + tile * 16 + 8, sum1[s]);
         }
+    }
+#elif defined(__ARM_NEON)
+    /* NEON port of the AVX2 arm (issue #1696): same algorithm — vqtbl1q_u8
+     * nibble LUT decode of doubled e2m1 ints with an exact x0.5f un-double,
+     * 4x4 float transposes (vtrnq_f32 + vcombine_f32) making rows column-
+     * major, then strict (x*w)*scale rounding with separate mul/mul/add (no
+     * FMA fusion) so results stay bit-exact with the scalar and AVX2 arms.
+     * Tiles of 16 rows ride four float32x4_t lanes; one x broadcast serves
+     * all 4 columns of a group, keeping 4 independent add chains busy. */
+    #pragma omp parallel for schedule(static)
+    for (int64_t tile = 0; tile < O / 16; tile++) {
+        /* doubled e2m1 codes as uint8: 0,2,4,6,8,12,16,24 / 0,0xFE..0xE8 */
+        static const uint8_t lut2u[16] = {0,1,2,3,4,6,8,12,
+                                          0,0xFF,0xFE,0xFD,0xFC,0xFA,0xF8,0xF4};
+        const uint8x16_t lut2 = vld1q_u8(lut2u);
+        const uint8x16_t m4 = vdupq_n_u8(0x0F);
+        const float32x4_t half = vdupq_n_f32(0.5f);
+        float32x4_t acc[4][128];
+        for (int g = 0; g < 4; g++)
+            for (int s = 0; s < S; s++) acc[g][s] = vdupq_n_f32(0.0f);
+        for (int base = 0; base < I; base += 32) {
+            float sc[16];
+            float32x4_t rowv[16][8];
+            for (int r = 0; r < 16; r++) {
+                int64_t row = tile * 16 + r;
+                sc[r] = e8lut[e8s[row * ng + base / 32]];
+                uint8x16_t by = vld1q_u8(q4 + row * rb + base / 2);
+                uint8x16_t lo = vandq_u8(by, m4);
+                uint8x16_t hi = vandq_u8(vshrq_n_u8(by, 4), m4);
+                uint8x16_t z0 = vzip1q_u8(lo, hi);
+                uint8x16_t z1 = vzip2q_u8(lo, hi);
+                int8x16_t n0 = vreinterpretq_s8_u8(vqtbl1q_u8(lut2, z0));
+                int8x16_t n1 = vreinterpretq_s8_u8(vqtbl1q_u8(lut2, z1));
+                int16x8_t sa = vmovl_s8(vget_low_s8(n0));
+                int16x8_t sb = vmovl_s8(vget_high_s8(n0));
+                int16x8_t sc16 = vmovl_s8(vget_low_s8(n1));
+                int16x8_t sd = vmovl_s8(vget_high_s8(n1));
+                rowv[r][0] = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(sa))), half);
+                rowv[r][1] = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(sa))), half);
+                rowv[r][2] = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(sb))), half);
+                rowv[r][3] = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(sb))), half);
+                rowv[r][4] = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(sc16))), half);
+                rowv[r][5] = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(sc16))), half);
+                rowv[r][6] = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(sd))), half);
+                rowv[r][7] = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(sd))), half);
+            }
+            for (int g = 0; g < 4; g++) {
+                const float32x4_t sc4 = vld1q_f32(sc + g * 4);
+                for (int k = 0; k < 8; k++) {
+                    const float32x4_t a0 = rowv[g*4+0][k], a1 = rowv[g*4+1][k];
+                    const float32x4_t a2 = rowv[g*4+2][k], a3 = rowv[g*4+3][k];
+                    float32x4x2_t t0 = vtrnq_f32(a0, a1);
+                    float32x4x2_t t1 = vtrnq_f32(a2, a3);
+                    /* vcombine, not vzip: vzip yields lane order (r0,r2,r1,r3)
+                     * which would swap columns 1<->2 of each group. */
+                    const float32x4_t colv[4] = {
+                        vcombine_f32(vget_low_f32(t0.val[0]), vget_low_f32(t1.val[0])),
+                        vcombine_f32(vget_low_f32(t0.val[1]), vget_low_f32(t1.val[1])),
+                        vcombine_f32(vget_high_f32(t0.val[0]), vget_high_f32(t1.val[0])),
+                        vcombine_f32(vget_high_f32(t0.val[1]), vget_high_f32(t1.val[1])),
+                    };
+                    for (int s = 0; s < S; s++) {
+                        const float xs0 = x[(int64_t)s * I + base + k * 4 + 0];
+                        const float xs1 = x[(int64_t)s * I + base + k * 4 + 1];
+                        const float xs2 = x[(int64_t)s * I + base + k * 4 + 2];
+                        const float xs3 = x[(int64_t)s * I + base + k * 4 + 3];
+                        float32x4_t xw0 = vmulq_f32(vdupq_n_f32(xs0), colv[0]);
+                        float32x4_t xw1 = vmulq_f32(vdupq_n_f32(xs1), colv[1]);
+                        float32x4_t xw2 = vmulq_f32(vdupq_n_f32(xs2), colv[2]);
+                        float32x4_t xw3 = vmulq_f32(vdupq_n_f32(xs3), colv[3]);
+                        acc[g][s] = vaddq_f32(acc[g][s], vmulq_f32(xw0, sc4));
+                        acc[g][s] = vaddq_f32(acc[g][s], vmulq_f32(xw1, sc4));
+                        acc[g][s] = vaddq_f32(acc[g][s], vmulq_f32(xw2, sc4));
+                        acc[g][s] = vaddq_f32(acc[g][s], vmulq_f32(xw3, sc4));
+                    }
+                }
+            }
+        }
+        for (int s = 0; s < S; s++)
+            for (int g = 0; g < 4; g++)
+                vst1q_f32(y + (int64_t)s * O + tile * 16 + g * 4, acc[g][s]);
     }
 #else
     #pragma omp parallel for schedule(static)

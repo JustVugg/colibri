@@ -35,8 +35,11 @@
 /* Mirrors the kernel's own arm selection (deepseek_v4.c gates on __AVX2__
  * only today): on arm64 the SIMD arm does not exist yet, so the build is the
  * scalar one even though NEON is available. */
+/* Mirrors the kernel's own arm selection; scalar when both/neither. */
 #if defined(__AVX2__)
 #  define BK_ARM_NAME "avx2"
+#elif defined(__ARM_NEON)
+#  define BK_ARM_NAME "neon"
 #else
 #  define BK_ARM_NAME "scalar"
 #endif
