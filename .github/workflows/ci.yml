@@ -507,6 +507,12 @@ jobs:
             fi
             echo "sanitizers clean ($fx):"; grep -E "Matching tokens" san.log || true
           done
+          # Same sanitized binary on hostile weights: an all-NaN router row and an
+          # oversized e_score_correction_bias must degrade or be refused, never
+          # reach the heap.
+          ASAN_OPTIONS=detect_leaks=0 QWEN36_TINY_C=qwen36_tiny_c \
+            QWEN36_TINY_REF=qwen36_tiny/ref_full.json \
+            python3 -m unittest -v tests.test_qwen36_hostile_weights
       - name: KV prefix reuse is token-identical (serve, several turns)
         run: |
           cd c
