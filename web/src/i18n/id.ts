@@ -28,6 +28,7 @@ const id: Record<string, string> = {
   "ui.copied": "Disalin",
   "ui.copyError": "Teks tidak dapat disalin. Pilih respons untuk menyalinnya.",
   "ui.regenerate": "Buat ulang respons",
+  "ui.continue": "Lanjutkan respons ini",
   "ui.archived": "Percakapan diarsipkan",
   "ui.historyMemory": "Percakapan disimpan selama sesi ini terbuka. Ekspor percakapan untuk menyimpannya.",
   "ui.explore": "Jelajahi",
