@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://discord.gg/RXV83nSZdk"><b>Discord</b></a> ·
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · 繁體中文 · <a href="README.it.md">Italiano</a>
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · 繁體中文 · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a>
 </p>
 
 **小巧引擎，龐大模型。**在消費級與異質硬體上執行**前沿 MoE 模型——從 744B 到
@@ -25,7 +25,7 @@ Colibrì 刻意用於驗證激進的系統構想——因此**對速度不作 SL
 
 ```
 $ ./coli chat
-  🐦 colibri v1.12.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.12.1 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?

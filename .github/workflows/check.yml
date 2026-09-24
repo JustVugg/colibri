@@ -23,7 +23,9 @@ jobs:
   linux:
     name: Linux
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # make check takes about 14 minutes here now (14.9 at worst this week);
+    # at 15 the job was cut off with nothing failed.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: make check
@@ -128,13 +130,21 @@ jobs:
           python c/tools/make_edge_tiny_tokenizer.py --vocab-size 281 /tmp/glm53_stream-i4
           cd c && COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_dashboard
           COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_context_exceeded
+      # The two stdlib-only oracles used to be argparse scripts that `make
+      # test-python` collected as zero tests (#1700). They run here, on the
+      # fixtures generated above, token-exact against transformers in f32.
+      - name: Run the GLM-5.3 tiny oracles
+        run: |
+          cd c && GLM53_TINY=/tmp/glm53_tiny GLM53_MM_TINY=/tmp/glm53_mm python -m unittest -v tests.test_glm53_oracles
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to
     # single-threaded automatically if it's ever missing).
     name: macOS (colibri + V4 platform gate)
     runs-on: macos-latest
-    timeout-minutes: 15
+    # `make check` here now takes about 14.5 minutes; at 15 the job was cut
+    # off inside the Python suite with no test failed, and showed as red.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: install libomp

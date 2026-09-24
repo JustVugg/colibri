@@ -1,0 +1,14 @@
+# Dependencies for the GGUF reader / dequant / OLMoE-profile / converter tests
+# (c/tests/test_gguf_reader.py, test_gguf_dequant.py,
+# test_gguf_olmoe_profile.py, test_convert_gguf_to_olmoe.py). Installed only by
+# the ci.yml `gguf` job; the engine-build and generic Python jobs stay lean.
+#
+# gguf is llama.cpp's gguf-py reference: test_gguf_dequant.py cross-checks our
+# dequantization against gguf.quants.dequantize. The committed golden fixture is
+# the frozen pin, so this is a minimum version that lets upstream drift surface.
+# torch is deliberately absent: the quantizer is pinned by the committed golden
+# fixture (tests/fixtures/olmoe_quantize_row_golden.npz) and the torch-based
+# cross-checks stay optional for local runs.
+numpy>=1.26
+safetensors>=0.4
+gguf>=0.19

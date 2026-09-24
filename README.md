@@ -10,7 +10,7 @@
 <p align="center">
   <a href="https://justvugg.github.io/colibri"><b>Website</b></a> ·
   <a href="https://discord.gg/RXV83nSZdk"><b>Discord</b></a> ·
-  English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a>
+  English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a>
 </p>
 
 **Tiny engine, immense model.** Run **frontier MoE models — 744B to 2.8T
@@ -40,7 +40,7 @@ may reduce speed; it must not quietly redefine the model.
 
 ```
 $ ./coli chat
-  🐦 colibri v1.12.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.12.1 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -135,7 +135,7 @@ shows otherwise. These are the main questions now:
 | hypothesis | evidence so far | experiment still needed |
 |---|---|---|
 | Routing history can place experts better than plain LRU | learned pins improve repeated workloads, but can overfit a prompt | held-out, cross-session A/Bs across coding, chat, multilingual, and long-context workloads |
-| Multiple SSDs can turn independent bandwidth into decode speed | weighted mirror/split routing is implemented and validated; the bandwidth model is sound | cold-cache one-drive vs two-drive GLM-5.2 runs on real, independent controllers |
+| Multiple SSDs can turn independent bandwidth into decode speed | two independent NVMe drives measured +37.5% decode; a slower third drive was neutral after weighted striping ([measurements](docs/multidisk.md#what-has-been-measured)) | reproduce across drive speeds, controller layouts, and cache states |
 | A hardware-aware planner can approach each machine's best configuration automatically | RAM/VRAM budgets and several backends are detected today | compare the generated plan with a controlled parameter sweep across laptops, workstations, NUMA hosts, and multi-GPU systems |
 | Lossless or quality-bounded representations can reduce weight movement enough to matter | format and quantization ablations exist, with correctness/quality gates | reproduce quality, bytes moved, latency, and cost per useful token together — not compression ratio alone |
 | Routing-aware speculation can pay before near-full residency | MTP and grammar drafts work, but MTP has also measured a 32% loss around 85% expert hit | map the break-even surface across acceptance, expert hit rate, batch union, and draft depth |
@@ -232,21 +232,30 @@ precision are the same whether an expert answered from VRAM or from disk.
   <img src="docs/media/tiers.png" width="880" alt="VRAM / RAM / NVMe three-tier expert residency">
 </p>
 
-### Dual-SSD: two copies of the model, twice the read bandwidth
+<a id="dual-ssd-two-copies-of-the-model-twice-the-read-bandwidth"></a>
 
-Decode is disk-bound on most machines, and expert reads are read-only — so if you have a **second SSD**, put a full copy of the model on it and let the engine stream from both drives at once:
+### Multiple SSDs: stream model copies from more than one drive
+
+When decode is disk-bound, a **second SSD** can help: put a copy of the model on
+it and let the engine read from both drives. For GLM-5.2, from `c/` in a source
+checkout (or from an unpacked release):
 
 ```bash
-COLI_MODEL=/fast/glm52_i4 COLI_MODEL_MIRROR=/second/glm52_i4 ./coli chat
-COLI_DISK_WEIGHTS=9,3 ...   # optional: primary,mirror bandwidth ratio (else measured at startup)
+COLI_MODEL_MIRROR=/second/glm52_i4 python3 ./coli chat --model /fast/glm52_i4
 ```
 
-Each expert is routed to one drive by a deterministic hash, weighted by the two drives' measured (or declared) bandwidth, so readahead/PILOT prefetch and the demand read always hit the same drive and nothing is cached twice. The aggregate bandwidth is the sum of both drives — a 9 GB/s + 3 GB/s pair reads experts ~33% faster than the fast drive alone, and the OMP-parallel pin/warmup load streams from both. Details worth knowing:
+The engine measures the drives at startup to weight the read split. Buffered
+reads use deterministic expert routing; eligible direct reads can stripe one
+expert across replicas. Independent drives provide bandwidth headroom, not a
+guaranteed token-rate multiplier: shared controllers, cache hits, and compute
+can limit the gain. See the [multi-disk guide](docs/multidisk.md) for Bash and
+PowerShell examples, measured gains and limits, and a single-drive comparison.
+Details worth knowing:
 
-- the mirror is **validated at startup** (per-file size + safetensors header must be byte-identical to the primary); divergent or missing files silently stay on the primary, so a **partial mirror is fine** — a smaller second SSD holding only some shards still helps;
+- the mirror is **validated at startup** (per-file size + safetensors header must be byte-identical to the primary); divergent or missing files stay on the primary, so a **partial mirror is fine** — a smaller second SSD can serve the shards it holds;
 - the mirror is **never written**: `.coli_usage`, `.coli_kv` and all sidecars stay on the primary;
 - a read error on the mirror falls back to the primary (one warning, no crash), so unplugging the second drive mid-run degrades instead of killing the server;
-- routing never changes tokens — both copies are byte-identical, and the per-run `MIRROR:` stats line shows GB served per drive.
+- routing never changes tokens — both copies are byte-identical; enable `PROF=1` for the `MIRROR:` profile counters showing GB served per drive.
 
 The same engine spans the whole range: on a 25 GB laptop everything streams from
 disk (slow but correct); on a large host the entire expert set becomes resident
@@ -324,6 +333,15 @@ full forensic story). Grammar-forced drafts
 ([`GRAMMAR=file.gbnf`](docs/grammar-draft.md)) add ~free acceptance on
 constrained JSON output. Whether speculation is a net win depends on your
 cache temperature — measure, and use `DRAFT=0` when it doesn't pay.
+
+Verify batches can also opt into an **exact attention core** with
+`COLI_EXACT_VERIFY=1` ([#689](https://github.com/JustVugg/colibri/issues/689)):
+the CPU MLA-absorb score and context dots accumulate integer products and round
+once, so a near-tie in a verify row resolves the same way on every host, at
+roughly 0.6x tok/s on a tiny oracle (the dot itself is ~5–7x the float loop).
+Two limits to know: with a quantised KV cache (`tq1`, TQ or int8 KV) the
+context dot keeps the float path, so exactness there is not provided; and a
+real near-tie flip has only been argued, not yet caught on GLM-5.2 at n=64.
 
 ## What it achieves
 
@@ -434,7 +452,7 @@ the model's `config.json`):
 > | **Inkling** | ~469 GB | 25 GB with the int4 dense container, ~120 GB without | not needed |
 > | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed |
 > | **DeepSeek V4 Flash** | ~167 GB (REAP 150B: ~85 GB) | 16 GB min, 32 GB comfortable | optional; any NVIDIA card from the GTX 10 series up (Pascal/Turing via `CUDA_ARCH=portable-pre-ampere NO_TC=1`, best on RTX 50) makes prefill 5-10x and decode ~2.5x faster |
-> | **Qwen3.8-Flash-Next** | ~185.5 GB (official FP8 checkpoint) | 16 GB min, 24 GB comfortable at the default context | not supported; CPU only |
+> | **Qwen3.8-Flash-Next** | ~185.5 GB (official FP8 checkpoint) | 16 GB min, 24 GB comfortable at the default context | optional; the CUDA VRAM expert tier with dense trunk quantized to int8 in VRAM |
 > | **Qwen3.6-35B-A3B** | ~20 GB (int4-gs64 container) | 24 GB (needs full RAM residency) | optional; the CUDA VRAM expert tier measured **1.44 -> 10.05 tok/s (7.0x)** on two 8 GB cards, output bit-identical to CPU |
 >
 > A GPU only ever makes it faster. Speed is set by your disk, because the experts
@@ -449,7 +467,7 @@ the model's `config.json`):
 | **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
 | **DeepSeek V4 Flash** | 284B / 13B | official sharded checkpoint — routed experts stay **native fp4**, dense stays fp8-e4m3; the **REAP-pruned 150B** ([`puwaer/DeepSeek-V4-Flash-0731-reap-150b`](https://huggingface.co/puwaer/DeepSeek-V4-Flash-0731-reap-150b), 85 GB, 132 of 256 experts) loads with the same engine and no conversion | `make -C c deepseek-v4` | [deepseek-v4.md](docs/deepseek-v4.md) |
 | **DeepSeek V4.1 Flash** | 552B / 16B | official checkpoint, **no conversion**: experts are already fp4, dense is fp8-e4m3. 203 GB of it is an n-gram memory read from disk a few hundred bytes at a time, and the routed experts cost **4.5 GB per token** against GLM-5.2's 12.7. Vision, tool calling and the DSpark draft head are all on | `make -C c deepseek_v41` | [deepseek-v41.md](docs/deepseek-v41.md) |
-| **Qwen3.8-Flash-Next** (Alibaba) | 125B + 51B n-gram / 6B | [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) — original checkpoint; PLE stays pageable and experts stay **native block-FP8** | `make -C c qwen38` (CPU only) | [qwen38.md](docs/qwen38.md) |
+| **Qwen3.8-Flash-Next** (Alibaba) | 125B + 51B n-gram / 6B | [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) — original checkpoint; PLE stays pageable and experts stay **native block-FP8** | `make -C c qwen38` (`CUDA=1` for the VRAM expert tier) | [qwen38.md](docs/qwen38.md) |
 | **Qwen3.6** (Alibaba) | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64) (~20 GB, **recommended**) — hybrid Gated Attention + Gated DeltaNet | `make -C c qwen36` (`CUDA=1` for the VRAM expert tier) | [qwen36.md](docs/qwen36.md) |
 | **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` — **int8** container, ~7 GB | `make -C c olmoe` | — |
 

@@ -43,6 +43,7 @@
 #include "kv_prefix.h"
 #include "pin_pool.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
 #include "serve_codec.h"
+#include "serve_budget.h"
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -1121,24 +1122,18 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 }
 
 static double mem_avail_bytes(void) {
-#if defined(__linux__)
-    FILE *f = fopen("/proc/meminfo", "r");
-    if (!f) return 0;
-    char ln[256]; double kb = 0;
-    while (fgets(ln, sizeof(ln), f)) if (sscanf(ln, "MemAvailable: %lf", &kb) == 1) break;
-    fclose(f);
-    return kb * 1024.0;
-#elif defined(__APPLE__)
-    /* free + inactive + purgeable ~ Linux MemAvailable. Without this the auto
-     * cap fell back to 16 experts/layer on a 128 GB Mac. */
-    vm_size_t page = 0; host_page_size(mach_host_self(), &page);
-    vm_statistics64_data_t vs; mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &n) != KERN_SUCCESS)
-        return 0;
-    return (double)(vs.free_count + vs.inactive_count + vs.purgeable_count) * page;
-#else
+    /* Shared probe: Linux MemAvailable, macOS free+inactive+purgeable,
+     * Windows ullAvailPhys/commit. The #else here used to return 0, so
+     * Windows auto-cap was always 16 experts/layer and never warned. */
+    double gb = compat_mem_available_gb();
+    if (gb > 0.0) return gb * 1e9;
+    static int noted = 0;
+    if (!noted) {
+        noted = 1;
+        fprintf(stderr, "[inkling] could not measure available RAM on this platform; "
+                        "auto cache falls back to 16 experts/layer. Pass --cap to set it.\n");
+    }
     return 0;
-#endif
 }
 
 /* ---------- routed-expert slots: serial bookkeeping, parallel fills ---------- */
@@ -2198,15 +2193,20 @@ static void apply_rep_penalty(float *logit, int n, const int *hist, int nhist, f
     }
 }
 
-/* reject a prompt that would overrun the served KV bound (CTX_MAX, default 8192).
- * The refusal is the frame the gateway turns into a 400 context_length_exceeded
- * (#506, #1381); free text here reached the client as a 500. One request is
- * served at a time, so the returned buffer is only read before the next call. */
+/* Refuse only a prompt that does not fit the served KV bound (CTX_MAX,
+ * default 8192). max_tokens is a ceiling: coli chat's interactive default
+ * (16384) used to 400 every turn because 2 + 16384 > 8192. The refusal is
+ * the frame the gateway turns into a 400 context_length_exceeded (#506,
+ * #1381); free text here reached the client as a 500. One request is served
+ * at a time, so the returned buffer is only read before the next call. */
+static int ink_ctx_max(void) {
+    const char *cm = getenv("CTX_MAX");
+    return cm ? atoi(cm) : 8192;
+}
 static const char *prompt_reject(int np, int want) {
     static char message[96];
-    const char *cm = getenv("CTX_MAX");
-    int ctx_max = cm ? atoi(cm) : 8192;
-    if (np + want <= ctx_max) return NULL;
+    int ctx_max = ink_ctx_max();
+    if (coli_serve_budget(np, want, ctx_max, 0) >= 0) return NULL;
     snprintf(message, sizeof(message),
              "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
              np, want, ctx_max);
@@ -2323,8 +2323,19 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
     if (np <= 0) { coli_serve_write_error(stdout,q->id,"empty prompt"); free(ids); return 0; }
-    const char *bad = prompt_reject(np, q->max_tok);
-    if (bad) { coli_serve_write_error(stdout,q->id,bad); free(ids); return 0; }
+    int ctx_max = ink_ctx_max();
+    int budget = coli_serve_budget(np, q->max_tok, ctx_max, q->logprobs > 0);
+    if (budget < 0) {
+        const char *bad = prompt_reject(np, q->max_tok);
+        coli_serve_write_error(stdout,q->id,bad ? bad : "CONTEXT_EXCEEDED");
+        free(ids); return 0;
+    }
+    if (budget < q->max_tok) {
+        fprintf(stderr, "[serve] max_tokens %d clamped to %d (context %d - prompt %d); "
+                        "raise CTX_MAX for longer answers\n",
+                q->max_tok, budget, ctx_max, np);
+        q->max_tok = budget;
+    }
     /* audio: every <|audio|> placeholder must have exactly one DMel frame */
     int naud = q->alen / m->c.mel_bins;
     if (q->alen % m->c.mel_bins != 0 || audio_tok_count(m, ids, np) != naud) {
@@ -2482,6 +2493,25 @@ static void serve_hwinfo(Model *m) {
             if (sscanf(ln, "MemTotal: %lf", &v) == 1) rt = v/1e6;
             if (sscanf(ln, "MemAvailable: %lf", &v) == 1) ra = v/1e6;
         } fclose(mi); }
+    if (rt <= 0.0 || ra <= 0.0) {
+        double t2 = 0, a2 = 0;
+        compat_meminfo_gb(&t2, &a2);
+        if (rt <= 0.0) rt = t2;
+        if (ra <= 0.0) ra = a2;
+    }
+#ifdef _WIN32
+    if (cores <= 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        cores = (int)si.dwNumberOfProcessors;
+    }
+#endif
+#ifdef __APPLE__
+    if (!cpu[0]) {
+        size_t sl = sizeof(cpu);
+        if (sysctlbyname("machdep.cpu.brand_string", cpu, &sl, NULL, 0)) cpu[0] = 0;
+    }
+#endif
     int ngpu = 0; double vram = 0;
     const char *gpu = "";
 #ifdef COLI_CUDA

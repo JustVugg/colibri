@@ -27,7 +27,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
-#include <cuda_runtime.h>
+#if !defined(__HIPCC__)
+#include <cuda_runtime.h>   /* under HIP, backend_gpu_compat.h (via backend_cuda.cu) provides these */
+#endif
 
 #include "../backend_cuda.cu"
 
@@ -332,6 +334,56 @@ int main(void){
             printf("tensor_bytes: fmt=8 dense + fmt=6 + fmt=4 grouped report exact footprint\n");
         }
         coli_cuda_shutdown();
+    }
+
+    /* ---- Phase 3: LUT-gate lifecycle across shutdown/re-init --------------- */
+    {   /* g_fp8_lut_ready is process-wide while the e4m3 table is per-device.
+         * SHUTDOWN is the only site that clears it; coli_cuda_init never writes
+         * it. That is sufficient because init refuses to rebuild contexts while
+         * a set is live: a re-init naming the SAME set returns 1 and leaves the
+         * contexts -- and therefore the published table -- untouched, and one
+         * naming a DIFFERENT set is refused outright. So the device set cannot
+         * widen past what the last publish covered without passing through
+         * shutdown, which clears the flag. This block pins all three edges. */
+        int devs[1]={0};
+        enum { LO=4, LI=128 };
+        uint8_t lw[LO*LI]; float ls[1]={1.f};
+        for(size_t i=0;i<sizeof lw;i++) lw[i]=rnd_e4m3();
+        ColiCudaTensor *lt=nullptr;
+
+        /* Edge 1: after shutdown the flag is clear, so a fmt=8 upload is
+         * refused until this span publishes its own table. */
+        if(!coli_cuda_init(devs,1)){ printf("FAIL lifecycle re-init\n"); return 1; }
+        if(coli_cuda_tensor_upload(&lt,lw,ls,8,LI,LO,0)){ printf("FAIL gate open after shutdown (stale ready flag)\n"); return 1; }
+        if(!coli_cuda_fp8_set_lut(lut)){ printf("FAIL lifecycle set_lut\n"); return 1; }
+        if(!coli_cuda_tensor_upload(&lt,lw,ls,8,LI,LO,0)){ printf("FAIL upload after republish\n"); return 1; }
+        coli_cuda_tensor_free(lt); lt=nullptr;
+
+        /* Edge 2: a SAME-SET re-init returns 1 and does NOT disturb the flag,
+         * so the upload still succeeds -- the table it would decode against is
+         * the one already published to these very contexts. Asserting a refusal
+         * here would assert a republish that buys nothing. */
+        if(coli_cuda_init(devs,1)!=1){ printf("FAIL same-set re-init did not return 1\n"); return 1; }
+        if(coli_cuda_device_count()!=1){ printf("FAIL same-set re-init changed the context count\n"); return 1; }
+        if(!coli_cuda_tensor_upload(&lt,lw,ls,8,LI,LO,0)){ printf("FAIL upload refused after a same-set re-init (flag was disturbed)\n"); return 1; }
+        coli_cuda_tensor_free(lt); lt=nullptr;
+
+        /* Edge 3: a DIFFERENT-SET re-init is refused, and leaves both the
+         * context set and the flag alone -- proven by the upload that follows
+         * still succeeding. With one visible device the only reachable
+         * different set is an out-of-range one, which init's validation refuses
+         * a few lines earlier than the device-list comparison; both return 0
+         * without rebuilding, which is the property under test. */
+        {   int ndev=0; cudaGetDeviceCount(&ndev);
+            int other[2]={0, ndev>1 ? 1 : ndev};   /* {0,1} on a multi-GPU box, else out of range */
+            if(coli_cuda_init(other,2)!=0){ printf("FAIL different-set re-init was not refused\n"); return 1; }
+            if(coli_cuda_device_count()!=1){ printf("FAIL refused re-init still changed the context set\n"); return 1; }
+            if(!coli_cuda_tensor_upload(&lt,lw,ls,8,LI,LO,0)){ printf("FAIL refused re-init disturbed the LUT flag\n"); return 1; }
+            coli_cuda_tensor_free(lt); lt=nullptr;
+        }
+
+        coli_cuda_shutdown();
+        printf("lut-gate lifecycle: shutdown clears; same-set re-init keeps; different-set re-init refused\n");
     }
     printf("OK\n"); return 0;
 }

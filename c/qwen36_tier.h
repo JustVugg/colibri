@@ -65,6 +65,12 @@ int  qt_place_of(const char *component, int layer);
  * bytes come out of that device's expert budget. Sizes only; the tensors
  * follow through qt_lmhead_init / qt_dnproj_init as before. */
 void qt_trunk_offer(const char *component, int layer, size_t bytes);
+/* The automatic placement is a prediction; the engine measures it at startup
+ * (one GEMV both ways, qwen36.c trunk_probe_gpu_wins) and withdraws the whole
+ * trunk when the GPU loses, giving the bytes back to the expert budget. Only
+ * the automatic placement can be withdrawn; a COLI_PLACE list stands. */
+int  qt_place_is_auto(void);
+void qt_trunk_withdraw(const char *why);
 
 /* DeltaNet input projections, qkv ++ z fused into one resident tensor per
  * layer: one GEMV instead of two, and the engine's qkv/z buffers are laid out
@@ -72,6 +78,8 @@ void qt_trunk_offer(const char *component, int layer, size_t bytes);
 int  qt_dnproj_init(int layer, const int8_t *q, const float *sc,
                     int I, int O, int device);
 int  qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O);
+int  qt_dnproj_ready(int layer);
+int  qt_dnproj_matmul_batch(int layer, float *y, const float *x, int S, int I, int O);
 /* Generic resident dense matrix (int8 per-row, one GEMV per call), addressed
  * by a handle: the Qwen3.8 trunk uses this for every matrix it places. Offer
  * the size with qt_trunk_offer(name, layer, bytes) before qt_init, ask
@@ -79,6 +87,8 @@ int  qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O);
  * Returns the handle (>= 0) or -1 (stays on the CPU). */
 int  qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device);
 int  qt_dense_matmul(int handle, float *y, const float *x, int I, int O);
+/* Row-major x[S,I] -> y[S,O], using the same resident int8 tensor. */
+int  qt_dense_matmul_batch(int handle, float *y, const float *x, int S, int I, int O);
 int  qt_dense_count(void);
 
 /* fp8 streaming mode (Qwen3.8): experts arrive as e4m3 bytes with 128x128
@@ -86,6 +96,8 @@ int  qt_dense_count(void);
  * the tier copies what it uploads inside the qt_note call and keeps no
  * pointer into the engine's slot. e4m3_lut is quant.h's E4M3_LUT, published
  * to the backend so fmt=8 uploads are accepted. */
+/* Init returns 0 without changing an active tier. Shut down before reinit;
+ * callers must serialize init/shutdown with new work. */
 int  qt_init_fp8(int n_layers, int n_experts, int hidden, int inter,
                  int cap_experts_per_layer, int topk, const float *e4m3_lut);
 int  qt_init(int n_layers, int n_experts, int hidden, int inter,
@@ -108,8 +120,10 @@ void qt_note(int layer, int eid,
  * the GPU. Compute the misses on the CPU, then call qt_take(). */
 uint32_t qt_issue(int layer, const int *eids, int K, const float *x);
 
-/* Collect the GPU results and accumulate val[k]*y_k into out[hidden]. */
-void qt_take(uint32_t mask, const float *val, int K, float *out);
+/* Collect all GPU results and accumulate val[k]*y_k into out[hidden].
+ * Returns 0 on collection failure, leaving out unchanged. The caller must
+ * stop inference: experts selected by qt_issue were not computed on CPU. */
+int qt_take(uint32_t mask, const float *val, int K, float *out);
 
 /* Warmstart: plan the full fill set (heat order, budget reserved), then any
  * number of loader threads may call qt_note_planned per planned expert. */
@@ -135,17 +149,22 @@ static inline int  qt_lmhead_matmul(float*a,const float*b,int c,int d){(void)a;(
 #define QT_PLACE_CPU (-1)
 static inline int  qt_place_of(const char*a,int b){(void)a;(void)b;return QT_PLACE_CPU;}
 static inline void qt_trunk_offer(const char*a,int b,size_t c){(void)a;(void)b;(void)c;}
+static inline int  qt_place_is_auto(void){return 0;}
+static inline void qt_trunk_withdraw(const char*a){(void)a;}
 static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
+static inline int  qt_dnproj_ready(int a){(void)a;return 0;}
+static inline int  qt_dnproj_matmul_batch(int a,float*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dense_init(const int8_t*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}
 static inline int  qt_dense_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
+static inline int  qt_dense_matmul_batch(int a,float*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dense_count(void){return 0;}
 static inline int  qt_ready(void){return 0;}
 static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_shutdown(void){}
 static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
-static inline void qt_take(uint32_t a,const float*b,int c,float*d){(void)a;(void)b;(void)c;(void)d;}
+static inline int qt_take(uint32_t a,const float*b,int c,float*d){(void)b;(void)c;(void)d;return a==0;}
 static inline int  qt_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
 static inline void qt_note_planned(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline int  qt_fill_next(int*a,int*b){(void)a;(void)b;return 0;}

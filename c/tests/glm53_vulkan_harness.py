@@ -20,7 +20,7 @@ non c'e' nessun device: non ha verificato niente e dirlo verde sarebbe peggio.
 
 USO:
   make VK=1 glm53
-  python3 tests/test_glm53_vulkan.py --binary ./glm53 --fixture ~/glm53_mm_tiny
+  python3 tests/glm53_vulkan_harness.py --binary ./glm53 --fixture ~/glm53_mm_tiny
 """
 import argparse
 import os
@@ -64,7 +64,7 @@ def main() -> int:
         # le due cose. Il generatore vuole transformers 5.16.1.
         print(f"SKIP: missing {arguments.fixture}; generate it with\n"
               f"  python3 tools/make_glm53_multimodal_tiny.py --output <dir>")
-        return 0
+        return 2  # a skip is not a pass
     binary = os.path.abspath(arguments.binary)
     reference = json.loads((arguments.fixture / "ref.json").read_text())
 
@@ -75,7 +75,7 @@ def main() -> int:
         reason = ("binary was not built with VK=1"
                   if "Vulkan:" not in notes else "no usable Vulkan device")
         print(f"SKIP: {reason}; Vulkan path was not verified")
-        return 0
+        return 2  # a skip is not a pass
 
     device = next((line for line in notes.splitlines() if "[VK] ready:" in line), "")
     for field in ("teacher_forcing", "greedy"):

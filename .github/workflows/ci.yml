@@ -147,7 +147,7 @@ jobs:
   musl:
     name: musl libc (Alpine)
     runs-on: ubuntu-latest
-    container: alpine:3.21
+    container: alpine:3.24
     steps:
       # #1430: colibri did not compile against musl, because malloc_trim is a
       # glibc extension guarded on __linux__ rather than on __GLIBC__. Nothing in
@@ -547,6 +547,31 @@ jobs:
             echo "cap=$cap: identical ($(cat ids_${cap}_1.txt))"
           done
           make tests/test_expert_ffn && ./tests/test_expert_ffn
+      - name: Mixed expert layout (int4 gs64 gate/up, int8 down) loads and is cap-independent
+        run: |
+          cd c
+          # The #1370 experiment knob: one slab per expert with int4 gate/up and int8
+          # down (2*inter*hidden bytes). The engine must tell it apart from int4 and
+          # int8 by size, read every matrix in its own format, and give the same ids
+          # at every cache capacity (cap=1 recycles the single slot after each expert,
+          # which is where a wrong slab offset would show). The ids are not compared to
+          # the torch oracle: int4 gate/up drift from f32 by design, as in the A/B above.
+          python3 tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_d8 --ebits 4 --gs 64 --down-bits 8
+          python3 - <<'PY'
+          import json; m = json.load(open("qwen36_tiny64_d8/qwen36_meta.json"))
+          assert m["expert_down_bits"] == 8 and m["expert_down_gs"] == 0 and m["expert_gs"] == 64, m
+          PY
+          for cap in 1 2 8; do
+            COLI_DENSE_I8=0 SNAP=qwen36_tiny64_d8 ./qwen36 "$cap" 4 qwen36_tiny64/ref_full.json > mixed_$cap.log 2>&1 || true
+            grep -q "expert format on disk: int4 gate/up + int8 down" mixed_$cap.log || { echo "FAIL: mixed layout not detected at cap=$cap"; cat mixed_$cap.log; exit 1; }
+            grep -E "^C engine" mixed_$cap.log > mixed_ids_$cap.txt
+            test -s mixed_ids_$cap.txt || { echo "FAIL: no ids at cap=$cap"; cat mixed_$cap.log; exit 1; }
+          done
+          cmp mixed_ids_1.txt mixed_ids_8.txt && cmp mixed_ids_2.txt mixed_ids_8.txt || { echo "FAIL: ids differ across caps"; cat mixed_ids_*.txt; exit 1; }
+          echo "mixed layout: identical ids at cap 1/2/8 ($(cat mixed_ids_8.txt))"
+          # COLI_CUDA=1 on a mixed container is refused with a line, the CPU path stands
+          COLI_CUDA=1 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_d8 ./qwen36 8 4 qwen36_tiny64/ref_full.json > mixed_cuda.log 2>&1 || true
+          grep -q "COLI_CUDA=1 ignored: the VRAM expert tier does not take the mixed layout" mixed_cuda.log || { echo "FAIL: tier refusal line missing"; cat mixed_cuda.log; exit 1; }
       - name: A malformed container is refused, not read
         run: |
           cd c
@@ -843,7 +868,9 @@ jobs:
           # the oracle fixture has no tokenizer; serve mode needs one
           python3 tools/make_edge_tiny_tokenizer.py --vocab-size "$(python3 -c 'import json;print(json.load(open("qwen38_tiny/config.json"))["vocab_size"])')" qwen38_tiny
           make qwen38 >/dev/null
-          QWEN38_TINY=qwen38_tiny python3 -m unittest -v tests.test_qwen38_dashboard
+          QWEN38_TINY=qwen38_tiny python3 -m unittest -v tests.test_qwen38_dashboard tests.test_qwen38_brio
+          python3 tools/make_edge_tiny_tokenizer.py --vocab-size 64 qwen38_tiny_fp8
+          QWEN38_TINY=qwen38_tiny_fp8 python3 -m unittest -v tests.test_qwen38_brio
 
   inkling-oracle:
     name: Inkling oracle (token-exact vs transformers)
@@ -923,10 +950,15 @@ jobs:
           /tmp/tike
       - name: Generate the glm_tiny fixture
         run: cd c && python3 tools/make_glm_oracle.py
-      - name: Token-exact oracle (teacher forcing)
-        # The fixture is only trustworthy if the engine reproduces it, so assert
-        # that before reading anything else out of a run.
-        run: cd c && SNAP=./glm_tiny TF=1 COLI_TEMP=0 ./colibri 64 16 16
+      - name: Oracle (30–32/32 teacher forcing + exact greedy)
+        # Preserve CONTRIBUTING.md's two TF near-tie allowance. Greedy remains
+        # exact, and invalid/non-finite results cannot consume the allowance.
+        run: |
+          cd c
+          SNAP=./glm_tiny TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16
+          SNAP=./glm_tiny COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16
+      - name: Oracle allowance and failure regressions
+        run: cd c && python3 tests/test_glm_oracle.py
       - name: Structural efficiency tests
         # test_cpu_vs_cpu_tok_s_stability is NOT in this list: it is a tok/s
         # bound (two runs within 25%) over a ~15 ms tiny replay -- it measured
@@ -1204,6 +1236,30 @@ jobs:
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
 
+  gguf:
+    name: GGUF reader + converter tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-gguf.txt
+      # This job is what makes the numerical GGUF evidence real: without these
+      # deps those tests skip at import, so the generic `python` job alone only
+      # exercises test_gguf_reader.py (pure stdlib).
+      - name: Install GGUF test dependencies
+        run: pip install -r c/tools/requirements-gguf.txt
+      - name: GGUF reader, dequant, profile and converter tests
+        run: |
+          cd c
+          python3 -m unittest -v \
+            tests.test_gguf_reader \
+            tests.test_gguf_dequant \
+            tests.test_gguf_olmoe_profile \
+            tests.test_convert_gguf_to_olmoe
+
   windows-python-focused:
     name: Python tests (Windows focused)
     runs-on: windows-latest
@@ -1229,7 +1285,7 @@ jobs:
   # This job builds every engine on arm64 (NEON compile coverage), runs the
   # integer-kernel bit-exactness gate with the NEON branches live, and replays
   # the glm_tiny teacher-forcing oracle against a fixture generated on THIS
-  # runner (same-machine torch reference, so no cross-ISA float excuses).
+  # runner. As on x86, allow two TF near ties; greedy remains exact.
   oracle-arm:
     name: ARM (engines + NEON kernel exactness + tiny oracle)
     runs-on: ubuntu-24.04-arm
@@ -1245,6 +1301,12 @@ jobs:
         run: pip install -r c/tools/oracle-requirements.txt
       - name: Build every engine (NEON branches must compile)
         run: make -C c colibri inkling kimi_k3 olmoe
+      - name: "DeepSeek V4 FP4 expert kernels: NEON arm bit-exact against the scalar arm (#1696)"
+        run: |
+          cd c
+          # batch (prefill) and S=1 (the matvec the decode uses)
+          bash tools/bench_fp4_matmul.sh 32 256 128 1
+          bash tools/bench_fp4_matmul.sh 1 256 128 1
       - name: Integer-kernel exactness, NEON branches live (#1081)
         run: |
           cd c
@@ -1252,5 +1314,10 @@ jobs:
           /tmp/tike
       - name: Generate the glm_tiny fixture on this runner
         run: cd c && python3 tools/make_glm_oracle.py
-      - name: Token-exact oracle on ARM (teacher forcing)
-        run: cd c && SNAP=./glm_tiny TF=1 COLI_TEMP=0 ./colibri 64 16 16
+      - name: Oracle on ARM (30–32/32 teacher forcing + exact greedy)
+        run: |
+          cd c
+          SNAP=./glm_tiny TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16
+          SNAP=./glm_tiny COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16
+      - name: Oracle allowance and failure regressions on ARM
+        run: cd c && python3 tests/test_glm_oracle.py

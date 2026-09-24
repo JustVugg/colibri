@@ -105,6 +105,18 @@ class ConvertRoutingTest(unittest.TestCase):
         self.assertTrue(calls, "no converter was launched at all")
         self.assertEqual(self.script_of(calls[0]), "convert_glm53.py")
 
+    def test_olmoe_checkpoint_reaches_convert_olmoe_merged(self):
+        """OLMoE\'s converter is convert_olmoe_merged.py (not GLM-5.2\'s
+        convert_fp8_to_int4.py).  The converter takes no precision flags;
+        the command must carry only --repo and --outdir."""
+        calls = self.run_convert("olmoe")
+        self.assertTrue(calls, "no converter was launched at all")
+        self.assertEqual(self.script_of(calls[0]), "convert_olmoe_merged.py")
+        for flag in ("--ebits", "--io-bits", "--xbits", "--group-size"):
+            self.assertNotIn(flag, calls[0],
+                             f"{flag} was passed to convert_olmoe_merged.py "
+                             f"but that converter does not accept it")
+
     def test_the_flash_command_carries_no_precision_flags(self):
         """convert_glm53.py has no --ebits/--io-bits/--xbits: it keeps the dense
         weights and the embedding wide and the engine picks the precision at
@@ -231,10 +243,14 @@ class ConverterDeclarationTest(unittest.TestCase):
             self.assertTrue(
                 family.converter.endswith(".py"),
                 f"{family.id}: converter must be a script under tools/")
-            self.assertTrue(
-                family.converter_accepts,
-                f"{family.id}: names {family.converter} but says nothing about "
-                f"which coli options it takes, so every one of them is dropped")
+            # An explicit empty tuple is a valid declaration when the converter
+            # genuinely takes none of the four precision flags (ebits / io_bits
+            # / xbits / group_size).  OLMoE\'s convert_olmoe_merged.py is one
+            # such case: it has --flush-every and --min-free-gb, neither of
+            # which is a coli-convert precision flag.
+            self.assertIsInstance(
+                family.converter_accepts, tuple,
+                f"{family.id}: converter_accepts must be a tuple")
 
     def test_declared_converters_exist_on_disk(self):
         for family in FAMILIES:

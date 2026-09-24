@@ -18,7 +18,7 @@ identiche: e' l'unica differenza che distingue una vision collegata da una
 vision finta.
 
 USO:
-  python3 tests/test_glm53_vision_serve.py --binary ./glm53 --fixture ~/glm53_mm_tiny
+  python3 tests/glm53_vision_serve_harness.py --binary ./glm53 --fixture ~/glm53_mm_tiny
 """
 import argparse
 import json
@@ -77,14 +77,14 @@ def main() -> int:
         # le due cose. Il generatore vuole transformers 5.16.1.
         print(f"SKIP: manca {arguments.fixture}; generalo con\n"
               f"  python3 tools/make_glm53_multimodal_tiny.py --output <dir>")
-        return 0
+        return 2  # un salto non e' un successo
 
     try:
         import numpy
         from PIL import Image
     except ImportError as problem:
         print(f"SKIP: servono numpy e Pillow ({problem}); niente e' stato verificato")
-        return 0
+        return 2  # un salto non e' un successo
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
     from glm53_image import preprocess, load_config
 
@@ -99,7 +99,7 @@ def main() -> int:
     tokens = (images[0][1] // merge) * (images[0][2] // merge)
     if images[1][1:] != images[0][1:]:
         print("SKIP: le due immagini di prova hanno griglie diverse")
-        return 0
+        return 2  # un salto non e' un successo
 
     prompt = "gu" + IMAGE_OPEN + IMAGE_TOKEN * tokens + IMAGE_CLOSE + "xy"
     environment = {**os.environ, "SERVE": "1", "SERVE_BATCH": "1",

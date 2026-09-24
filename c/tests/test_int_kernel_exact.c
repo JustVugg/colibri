@@ -117,11 +117,21 @@ int main(void){
      * float (per-gruppo: int esatto -> fmaf con la scala; poi * sx). Il kernel
      * e' opt-in e non-bit-identico al f32 a gruppi; contro il SUO riferimento
      * deve invece essere esatto al bit su ogni ISA. Copre gs=64 e gs=128
-     * (bpg=2) e una coda I%gs!=0. */
+     * (bpg=2), una coda I%gs!=0, e le S che accendono le forme multi-riga:
+     * S=3 (solo per-riga), S=6/9 (tile 1x4 + resto), S=18 (due s-tile AMX,
+     * 16+2, sui build AMX — il gate S>=AMX_S_MIN e' il default 8). O=136
+     * lascia un resto O%16 cosi' il ramo AMX consegna anche la coda di
+     * output al path vettoriale. */
     {
-        int cases[][2]={{64,2048},{128,2048},{64,2000}};
-        for(int t=0;t<3;t++){
-            int gs=cases[t][0], I=cases[t][1], O=128, S=3;
+#ifdef COLI_HAVE_AMX_I4P
+        /* Emulator runs (Intel SDE) cannot take the OS tile-arming path; the
+         * arming is engine POLICY, the tile math is what this gate proves, so
+         * the test may force the state to reach the AMX kernel under SDE. */
+        if(getenv("COLI_TEST_FORCE_AMX")){ coli_amx_state=1; }
+#endif
+        int cases[][3]={{64,2048,3},{64,2048,9},{128,2048,18},{64,2000,6},{64,128,18}};
+        for(int t=0;t<5;t++){
+            int gs=cases[t][0], I=cases[t][1], O=136, S=cases[t][2];
             int rb=(I+1)/2, ng=(I+gs-1)/gs;
             uint8_t *qp=malloc((size_t)O*rb); for(size_t i=0;i<(size_t)O*rb;i++) qp[i]=(uint8_t)rnd();
             uint8_t *ql=malloc((size_t)O*rb); memcpy(ql,qp,(size_t)O*rb); planarize_i4(ql,O,I);

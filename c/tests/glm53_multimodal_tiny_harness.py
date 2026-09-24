@@ -49,9 +49,9 @@ def main() -> int:
         # le due cose. Il generatore vuole transformers 5.16.1.
         print(f"SKIP: manca {arguments.fixture}; generalo con\n"
               f"  python3 tools/make_glm53_multimodal_tiny.py --output <dir>")
-        return 0
+        return 2  # un salto non e' un successo
 
-    # Vedi test_glm53_tiny.py: in f32 si prova che il motore implementa il
+    # Vedi glm53_tiny_harness.py: in f32 si prova che il motore implementa il
     # modello, a bit ridotti che la quantizzazione conserva i token.
     bits = arguments.bits
     if arguments.logit_tolerance is None:

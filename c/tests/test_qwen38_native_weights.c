@@ -7,6 +7,7 @@
 #define COLI_SEGMENT_ADAPTER
 #include <pthread.h>
 #include "../qwen38.c"
+#include "../compat.h"   /* setenv: MinGW has none */
 
 #define CHECK(x) do { if(!(x)){ \
     fprintf(stderr,"%s:%d: check failed: %s\n",__FILE__,__LINE__,#x);return 1; \
@@ -383,7 +384,9 @@ static int check_parallel_batch(const char *directory){
     int result=-1;model.expert_parallel_reads=1;
     int first_ids[2]={1,0};Slot *first[2]={0};
     if(q38_expert_get_batch(&model,0,first_ids,2,first)||model.cache[0].n||
-       model.miss||model.hits)goto cleanup;
+       model.miss||model.hits||
+       model.expert_batch_fallback!=Q38_EXPERT_BATCH_FALLBACK_CACHE_CAPACITY)
+        goto cleanup;
     if(q38_segment_cache_resize(&model,2))goto cleanup;
     if(!q38_expert_get_batch(&model,0,first_ids,2,first)||!first[0]||!first[1]||
        first[0]==first[1]||first[0]->eid!=1||first[1]->eid!=0||
@@ -399,6 +402,74 @@ static int check_parallel_batch(const char *directory){
     result=0;
 cleanup:
     destroy_fixture_model(&model);return result;
+}
+
+static int check_parallel_fallback_reasons(const char *directory){
+    int ids[Q38_MAX_TOPK+1]={0};Slot *selected[Q38_MAX_TOPK+1]={0};
+    Model model;
+
+    if(init_fixture_model(&model,directory,1))return -1;
+    model.expert_parallel_reads=0;
+    if(q38_expert_get_batch(&model,0,ids,2,selected)||
+       model.expert_batch_fallback!=Q38_EXPERT_BATCH_FALLBACK_DISABLED){
+        destroy_fixture_model(&model);return -1;
+    }
+    model.expert_parallel_reads=1;
+    if(q38_expert_get_batch(&model,0,ids,2,selected)||
+       model.expert_batch_fallback!=Q38_EXPERT_BATCH_FALLBACK_DISABLED){
+        destroy_fixture_model(&model);return -1;
+    }
+    destroy_fixture_model(&model);
+
+    if(init_fixture_model(&model,directory,1))return -1;
+    model.expert_parallel_reads=1;
+    /* a route wider than the per-layer cache (the #1686 shape: no top-k ceiling) */
+    if(q38_expert_get_batch(&model,0,ids,2,selected)||
+       model.expert_batch_fallback!=Q38_EXPERT_BATCH_FALLBACK_CACHE_CAPACITY){
+        destroy_fixture_model(&model);return -1;
+    }
+    destroy_fixture_model(&model);
+
+    if(init_fixture_model(&model,directory,0)||q38_segment_cache_resize(&model,2)){
+        destroy_fixture_model(&model);return -1;
+    }
+    model.expert_parallel_reads=1;
+    if(q38_expert_get_batch(&model,0,ids,2,selected)||
+       model.expert_batch_fallback!=Q38_EXPERT_BATCH_FALLBACK_SCALE_BANK){
+        destroy_fixture_model(&model);return -1;
+    }
+    destroy_fixture_model(&model);
+
+    if(init_fixture_model(&model,directory,1)||q38_segment_cache_resize(&model,2)){
+        destroy_fixture_model(&model);return -1;
+    }
+    model.expert_parallel_reads=1;
+    if(q38_expert_get_batch(&model,0,ids,2,selected)||
+       model.expert_batch_fallback!=Q38_EXPERT_BATCH_FALLBACK_DUPLICATE){
+        destroy_fixture_model(&model);return -1;
+    }
+    destroy_fixture_model(&model);
+
+    if(init_fixture_model(&model,directory,1)||q38_segment_cache_resize(&model,2)){
+        destroy_fixture_model(&model);return -1;
+    }
+    model.expert_parallel_reads=1;
+    if(!q38_prepare_expert_scale_bank(&model,0)){
+        destroy_fixture_model(&model);return -1;
+    }
+    char name[320];
+    q38_name(&model,name,sizeof name,0,"mlp.experts.1.gate_proj.weight");
+    st_tensor *weight=st_find(&model.S,name);
+    if(!weight){destroy_fixture_model(&model);return -1;}
+    int original_dtype=weight->dtype;weight->dtype=0;
+    int layout_result=q38_expert_get_batch(&model,0,(int[]){0,1},2,selected);
+    weight->dtype=original_dtype;
+    if(layout_result||
+       model.expert_batch_fallback!=Q38_EXPERT_BATCH_FALLBACK_LAYOUT){
+        destroy_fixture_model(&model);return -1;
+    }
+    destroy_fixture_model(&model);
+    return 0;
 }
 
 static int check_malformed_scale_metadata(const char *directory){
@@ -573,6 +644,9 @@ static int check_segment_failure_outputs(void){
 }
 
 int main(void){
+    /* this file pins storage and dispatch against the table kernel byte for
+     * byte; the vector FP8 kernel has its own tolerance test (test_qwen38_idot) */
+    setenv("Q38_FP8_KERNEL","scalar",1);
     enum { S=2, I=257, O=129 };
     Q38Weight fp8={0};q38_weight_reserve(&fp8,Q38_WEIGHT_FP8,O,I);
     CHECK(fp8.scale_count==6);CHECK(q38_weight_bytes(&fp8)==(uint64_t)O*I+6*sizeof(float));
@@ -635,6 +709,7 @@ int main(void){
     CHECK(check_fixture_mode(adjacent_directory,1,1)==0);
     CHECK(check_fixture_mode(adjacent_directory,0,0)==0);
     CHECK(check_parallel_batch(adjacent_directory)==0);
+    CHECK(check_parallel_fallback_reasons(adjacent_directory)==0);
     CHECK(check_malformed_scale_metadata(adjacent_directory)==0);
     CHECK(check_moe_prefill_parity(adjacent_directory,1,1)==0);
     CHECK(check_moe_prefill_parity(adjacent_directory,1,2)==0);

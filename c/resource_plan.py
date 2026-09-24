@@ -434,12 +434,41 @@ SSD_PROBE_PENDING = {
 
 
 def discover_gpus():
+    if sys.platform == "darwin":
+        return _discover_metal_gpus()
     # NVIDIA first; if there are none (or no nvidia-smi), fall back to ROCm/HIP so
     # a working AMD engine isn't planned CPU-only and --gpu N stops failing (#662).
     devices = _discover_nvidia_gpus()
     if devices:
         return devices
     return _discover_amd_gpus()
+
+
+def _discover_metal_gpus():
+    """Return Apple Metal devices without pretending unified RAM is VRAM."""
+    try:
+        result = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType", "-json"],
+            text=True, capture_output=True, check=True, timeout=10)
+        displays = json.loads(result.stdout).get("SPDisplaysDataType", [])
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return []
+    devices = []
+    for index, display in enumerate(displays):
+        if not isinstance(display, dict):
+            continue
+        metal = display.get("spdisplays_mtlgpufamilysupport")
+        if not metal:
+            continue
+        name = display.get("sppci_model") or display.get("_name")
+        if not isinstance(name, str) or not name:
+            continue
+        # Apple Silicon has one unified pool. Its free capacity cannot be used
+        # as an independent VRAM budget, so retain device identity only.
+        devices.append({"index": index, "name": name,
+                        "total_bytes": 0, "free_bytes": None,
+                        "unified_memory": True, "backend": "metal"})
+    return devices
 
 
 def _discover_nvidia_gpus():
@@ -934,6 +963,26 @@ POLICIES = {
 }
 
 
+def _family_expert_cache_knob(family_id, cache_bytes):
+    """Env var that actually sizes the expert LRU, when it is not RAM_GB.
+
+    Kimi K3 reads K3_EXPERT_GB (default 8) and treats RAM_GB as a ceiling;
+    main() never takes argv as a cap. GLM-5.3 reads GLM53_EXPERT_GB and never
+    RAM_GB. Exporting only RAM_GB therefore left both engines on their own
+    default cache under --auto-tier.
+    """
+    if (not isinstance(cache_bytes, int) or isinstance(cache_bytes, bool)
+            or cache_bytes <= 0):
+        return None
+    if family_id == "kimi":
+        return ("K3_EXPERT_GB",
+                "Kimi K3 sizes the expert LRU from K3_EXPERT_GB; RAM_GB is only a ceiling")
+    if family_id == "glm53":
+        return ("GLM53_EXPERT_GB",
+                "GLM-5.3 sizes the expert LRU from GLM53_EXPERT_GB, not RAM_GB")
+    return None
+
+
 def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                available_memory=None, available_disk=None, gpus=None,
                policy="quality", physical_cpus=None, cpu_sockets=None,
@@ -1100,6 +1149,13 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     tune = _auto_tune(bottleneck_class, projected_hit, planning_gpus, cpu_sockets,
                       plan_has_metal=False,
                       engine_group=resolved.descriptor.engine_group)
+    # DRAFT/PIPE/PIN/NUMA stay colibri.c-only (#1585). These two are the
+    # opposite leftover: the engines that size the expert LRU from their own
+    # *EXPERT_GB variable, which RAM_GB does not set.
+    knob = _family_expert_cache_knob(resolved.descriptor.id, cache_bytes)
+    if knob:
+        name, reason = knob
+        tune[name] = {"value": f"{cache_bytes / GB:.3f}", "reason": reason}
     probe_state, probe_gbs = ssd_probe_state(info["path"])
     actions = _next_actions(bottleneck_class, projected_hit, probe_state,
                             probe_gbs, planning_gpus)
@@ -1184,6 +1240,10 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
         result.setdefault("REPIN", "64")
     ram = plan["tiers"]["ram"]
     result.setdefault("RAM_GB", f"{ram['budget_bytes'] / GB:.3f}")
+    knob = _family_expert_cache_knob(plan.get("model", {}).get("family_id"),
+                                    ram.get("expert_cache_bytes"))
+    if knob:
+        result.setdefault(knob[0], f"{ram['expert_cache_bytes'] / GB:.3f}")
     planned_cap = ram.get("cache_slots_per_layer")
     if (plan.get("model", {}).get("family_id") == "qwen38" and
             (not isinstance(planned_cap, int) or
@@ -1241,14 +1301,22 @@ def format_plan(plan):
              f"cap {tiers['ram']['cache_slots_per_layer']}/layer"]
     vram = tiers["vram"]
     if vram["devices"]:
-        names = ", ".join(
-            f"{gpu['index']}:{gpu['name']}"
-            + ("" if plans_placement(gpu) else " (identity only)")
-            for gpu in vram["devices"])
-        trunk = vram.get("trunk_bytes", 0)
-        lines.append("VRAM   " + (f"{format_bytes(trunk)} int8 trunk + " if trunk else "") +
-                     f"{format_bytes(vram['budget_bytes'])} hot tier · "
-                     f"~{vram['expert_capacity']} experts · {names}")
+        metal_identity = [gpu for gpu in vram["devices"]
+                          if gpu.get("backend") == "metal"
+                          and gpu.get("free_bytes") is None]
+        if len(metal_identity) == len(vram["devices"]):
+            names = ", ".join(f"{gpu['index']}:{gpu['name']}"
+                              for gpu in metal_identity)
+            lines.append(f"Metal  {names} · unified memory · no independent VRAM budget")
+        else:
+            names = ", ".join(
+                f"{gpu['index']}:{gpu['name']}"
+                + ("" if plans_placement(gpu) else " (identity only)")
+                for gpu in vram["devices"])
+            trunk = vram.get("trunk_bytes", 0)
+            lines.append("VRAM   " + (f"{format_bytes(trunk)} int8 trunk + " if trunk else "") +
+                         f"{format_bytes(vram['budget_bytes'])} hot tier · "
+                         f"~{vram['expert_capacity']} experts · {names}")
     else:
         # Backend-neutral, matching the accelerator wording #903 settled on:
         # an AMD or Intel host that finds nothing is not "no NVIDIA device".

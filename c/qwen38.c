@@ -1514,8 +1514,10 @@ static int q38_prefix_cache_save(Model *m,const int *ids,int len,const float *lo
 static int q38_prefix_restore(Model *m,const int *ids,int len){
     if(!m||!ids||len<1||!g_q38_prefix.valid||g_q38_prefix.owner!=m||
        g_q38_prefix.len<1||g_q38_prefix.len>len||
-       memcmp(g_q38_prefix.ids,ids,(size_t)g_q38_prefix.len*sizeof(int)))return 0;
-    q38_prefix_copy_state(m,0);m->kv_len=g_q38_prefix.len;return g_q38_prefix.len;
+       memcmp(g_q38_prefix.ids,ids,(size_t)g_q38_prefix.len*sizeof(int))||
+       !kv_prefix_holds(&m->kvp,g_q38_prefix.ids,g_q38_prefix.len))return 0;
+    q38_prefix_copy_state(m,0);m->kv_len=g_q38_prefix.len;
+    m->kvp.len=g_q38_prefix.len;return g_q38_prefix.len;
 }
 
 static const float *q38_prefix_cached_logits(Model *m){
@@ -1595,6 +1597,22 @@ static void serve_hits(Model *m){
     printf("HITS %d %d %s\n",rows,E,hex); fflush(stdout); free(hex); free(bm);
 }
 
+/* The generation budget a request gets. max_tokens is a CEILING, not a
+ * target (#260/#382, the rule GLM and DeepSeek V4 already apply): the prompt
+ * must fit with room for one token (none for a read-only logprobs request,
+ * docs/brio.md), and the budget is then clamped to what the context can hold.
+ * Returns the budget, or -1 when the PROMPT does not fit. Refusing when
+ * prompt + budget exceeded the context (#1641) turned the gateway's default
+ * output budget -- 8192 here, the whole default context -- into a 400 on
+ * every message of `coli chat` and on every request without max_tokens. */
+static int q38_serve_budget(int np, int max_tok, int max_ctx, int read_only){
+    if (np < 1) return -1;
+    int room = max_ctx - np;
+    if (read_only) return room < 0 ? -1 : (max_tok < room ? max_tok : room);
+    if (room < 1) return -1;
+    return max_tok > room ? room : max_tok;
+}
+
 static int serve_one(Model *m, ServeReq *q){
     int *ids=NULL, np=0;
     encode_text_n(q->payload,(size_t)q->plen,&ids,&np); /* byte-counted prompt; qwen38 adds no BOS */
@@ -1619,10 +1637,15 @@ static int serve_one(Model *m, ServeReq *q){
     }
     int max_ctx=m->kv_cap;
     /* max_tokens=0 in modalita jev: leggere il prompt e fermarsi (serve_codec.h) */
-    int tok_min = (q->logprobs > 0) ? 0 : 1;
-    if(np<1 || np>max_ctx || q->max_tok<tok_min || q->max_tok>max_ctx-np){
+    int budget = q38_serve_budget(np, q->max_tok, max_ctx, q->logprobs > 0);
+    if(budget < 0){
         printf("ERROR %s CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n",q->id,np,q->max_tok,max_ctx);
         fflush(stdout); free(ids); return 0;
+    }
+    if(budget < q->max_tok){
+        fprintf(stderr,"[serve] max_tokens %d clamped to %d (context %d - prompt %d); raise Q38_MAXT for longer answers\n",
+                q->max_tok, budget, max_ctx, np);
+        q->max_tok = budget;
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
     double request_started=now_s();
@@ -1632,13 +1655,20 @@ static int serve_one(Model *m, ServeReq *q){
      * il client ha dichiarato, e battono la cache automatica, che insegue solo
      * l'ultimo prompt. Se nessuno serve, si ricade su quella. */
     int reuse=0; const float *pin_lo=NULL;
+    /* Image embeddings are not described by token identity. */
+    if(m->vis_map && m->vis_rows_n>0){
+        kv_prefix_taint(&m->kvp);q38_prefix_cache_invalidate();
+    }
     {
         int ps=coli_pin_best(&g_q38_pins,ids,np);
         while(ps>=0){
             ColiPin *k=&g_q38_pins.slot[ps];
             Q38PinState *st=(Q38PinState*)k->state;
-            if(st && q38_pin_state_copy(m,&st,0)){
-                m->kv_len=k->len; reuse=k->len; pin_lo=k->logit;
+            /* Pins omit K/V/indexer rows. Reject one whose rows were overwritten. */
+            if(st && kv_prefix_holds(&m->kvp,k->ids,k->len) &&
+               q38_pin_state_copy(m,&st,0)){
+                m->kv_len=k->len; m->kvp.len=k->len;
+                reuse=k->len; pin_lo=k->logit;
                 coli_pin_touch(&g_q38_pins,ps);
                 break;
             }
@@ -1918,7 +1948,7 @@ int main(int argc, char **argv) {
 
     Model m; model_init(&m, snap, cap, bits);
     q38_tier_start(&m, cap);   /* COLI_CUDA=1: hot experts stream to VRAM (qwen36_tier.c) */
-    q38_trunk_cpu_int8(&m);    /* Q38_TRUNK_CPU_INT8=1: the trunk's int8 rows on the CPU (reference) */
+    q38_trunk_cpu_int8(&m);    /* the trunk's int8 rows on the CPU, BF16 released (Q38_TRUNK_CPU_INT8=0 keeps BF16) */
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
     q38_telemetry_init(snap, &m);

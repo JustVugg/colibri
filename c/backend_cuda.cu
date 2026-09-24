@@ -1,6 +1,11 @@
 #include "backend_cuda.h"
+#include "fp8_format.h"   /* FP8_BLOCK: the shared fmt=8 scale-block edge (see that header) */
 
 #include "backend_gpu_compat.h"
+
+static_assert(FP8_BLOCK == 128, "fmt=8 on-disk containers carry ceil(dim/128)-edged scale "
+              "grids (mint tool, docs/FORMATS.md); FP8_BLOCK is container format, not a "
+              "tunable -- an edit here is a format change");
 
 /* Optional fmt=8 decode candidate (COLI_CUDA_F8_WARP=2): cuda_fp8.h maps
  * __nv_cvt_fp8_to_halfraw to an sm_89+ cvt instruction, with a bit-manip
@@ -63,7 +68,7 @@ struct ColiCudaTensor {
     int fmt, I, O, device;
     int gs;                    /* quant group size; 0 = per-row scales (#334) */
     int ng;                    /* number of scale groups per row = ceil(I/gs) for fmt=4 */
-    size_t scale_count;        /* floats in `scales`: O per-row, O*ng grouped */
+    size_t scale_count;        /* scale elements: ue8m0 bytes for fmt=7, floats otherwise */
     int tracked;
     int weights_owned;
 #ifdef COLI_ANS
@@ -74,6 +79,11 @@ struct ColiCudaTensor {
     int ragged_count;
 };
 
+static size_t tensor_scale_bytes(const ColiCudaTensor *t) {
+    if (!t->fmt || t->fmt == 6) return 0;
+    return t->scale_count * (t->fmt == 7 ? sizeof(uint8_t) : sizeof(float));
+}
+
 #ifdef COLI_ANS
 struct AnsArenaChunk { uint8_t *p; size_t used,cap; };
 #endif
@@ -82,6 +92,11 @@ typedef struct {
     int compute_major,compute_minor;
     float *x, *y, *gate, *up;
     size_t x_cap, y_cap, gate_cap, up_cap;
+    /* Streaming MXFP4 weights are refreshed on every call; only storage is reused. */
+    void *mxfp4_weights, *mxfp4_scales;
+    size_t mxfp4_weights_cap, mxfp4_scales_cap;
+    void *mxfp4_expert_weights, *mxfp4_expert_scales;
+    size_t mxfp4_expert_weights_cap, mxfp4_expert_scales_cap;
     /* Staging of the resident dense matvec (coli_cuda_matmul), apart from
      * x/y: the expert group (coli_cuda_expert_group_issue) runs on ctx->stream
      * asynchronously while the engine's thread keeps computing -- qwen38's
@@ -277,13 +292,14 @@ __device__ static inline float mx4_weight_at(const uint8_t *q, int i) {
  * branch and the fall-through is a refusal.
  *
  * It used to be the other way round: int2 was the fall-through, so every format
- * this function does not decode -- fmt=5 (int3-g64), fmt=6 (E8/IQ3), fmt=8
- * (fp8-e4m3), and anything added later -- was read as 2-bit values and returned
- * numbers. Meanwhile the CPU functions doing the same job on the same tensor,
- * qt_addrow and qt_matvec_rows (colibri.c), both exit(1) naming the function and
- * the fmt. Two backends, identical unsupported input, one refusing and one
- * fabricating: that asymmetry is the defect, independent of any particular
- * format's arrival.
+ * this function does not decode -- fmt=5 (int3-g64), fmt=6 (E8/IQ3), and
+ * anything added later -- was read as 2-bit values and returned numbers.
+ * (fmt=8 was in that misread set too, then refused, until it gained its own
+ * explicit branch below for the absorb path.) Meanwhile the CPU functions
+ * doing the same job on the same tensor, qt_addrow and qt_matvec_rows
+ * (colibri.c), both exit(1) naming the function and the fmt. Two backends,
+ * identical unsupported input, one refusing and one fabricating: that
+ * asymmetry is the defect, independent of any particular format's arrival.
  *
  * WHY __trap() AND NOT A DIAGNOSTIC. This is device code inside a running
  * kernel; there is no stderr to name the tensor on and no way to unwind. __trap
@@ -312,6 +328,15 @@ __device__ static float weight_at(const void *weights, int fmt, size_t row, int 
     const uint8_t *base = static_cast<const uint8_t *>(weights) + row;
     if (fmt == 0) return reinterpret_cast<const float *>(base)[i];
     if (fmt == 1) return static_cast<float>(reinterpret_cast<const int8_t *>(base)[i]);
+    /* fmt=8 (fp8-e4m3): raw byte, same layout as fmt=1 (row_bytes(8,I)==I), decoded
+     * through the shared c_e4m3 LUT (same table quant_matmul's fmt==8 branch reads,
+     * uploaded once by coli_cuda_fp8_set_lut). Callers gate on the LUT being live
+     * before a fmt=8 tensor ever reaches this function (coli_cuda_tensor_upload
+     * refuses the upload otherwise), so the table is always populated here. Returns
+     * the decoded WEIGHT only, unscaled -- absorb_scale below applies the
+     * per-128x128-block scale, exactly like every other quantized fmt returns
+     * unscaled through this function. */
+    if (fmt == 8) return c_e4m3[base[i]];
     const uint8_t *q = base;
     if (fmt == 2 || fmt == 4) {                               /* fmt=4: same nibble layout */
         uint8_t v = q[i >> 1];
@@ -325,13 +350,34 @@ __device__ static float weight_at(const void *weights, int fmt, size_t row, int 
     return 0.0f;   /* not reached: __trap() does not return */
 }
 
-/* Scale for output `row`, input element `k`. fmt=4 (grouped int4) stores ng
- * scales per row at scales[row*ng + k/gs]; every other quantized format has
- * one scale per row at scales[row]. Mirrors quant_matmul's fmt==4 branch so the
+/* Scale for output `row`, input element `k`. Three layouts reach this: fmt=4
+ * (grouped int4) stores ng scales per row at scales[row*ng + k/gs]; fmt=8
+ * (fp8-e4m3) stores one scale per 128x128 BLOCK, block-row-major, and is
+ * handled by its own branch below; every OTHER quantized format has one scale
+ * per row at scales[row]. Mirrors quant_matmul's fmt==4 branch so the
  * attention absorb kernels apply per-group scales instead of the per-row
  * (fmt=2) semantic that crashed #298's g64 kv_b. */
 __device__ static float absorb_scale(const float *wscale, int fmt, int gs, int ng, int row, int k) {
     if (!fmt) return 1.f;
+    if (fmt == 8) {
+        /* fp8-e4m3: one f32 scale per 128x128 BLOCK, block-row-major
+         * ([ceil(O/128), ceil(I/128)]), exactly quant_matmul's fmt==8 indexing
+         * (scl[i >> 7] on a scale row selected by o >> 7) and matmul_fp8's CPU
+         * reference (quant.h). `ng` here is coli_cuda_tensor_upload's t->ng,
+         * which for fmt=8 is set to ceil(I/128) specifically (not the fmt=4
+         * group count) -- see the upload-time assignment there. `gs` is unused
+         * for fmt=8 (always 0, only fmt=4 sets it), so the block edge is the
+         * fixed FP8_BLOCK constant (fp8_format.h, shared with the CPU side),
+         * not a caller-supplied group size. Rounding note: the GEOMETRY here
+         * matches quant_matmul_f8w/matmul_fp8, but their fp8 accumulation
+         * convention (f32 partial per block, scale once per partial, double
+         * across blocks) is NOT carried into the absorb kernels -- they apply
+         * the scale per element into a float accumulator, matching their own
+         * fmt=4 arm's long-standing behavior; CPU-vs-CUDA absorb divergence
+         * is an accepted, documented class (#510). */
+        int rowBlk = row / FP8_BLOCK, colBlk = k / FP8_BLOCK;
+        return wscale[(size_t)rowBlk * ng + colBlk];
+    }
     if (fmt != 4) return wscale[row];
     int g = k / gs; if (g >= ng) g = ng - 1;   /* tail of the last (partial) group */
     return wscale[(size_t)row * ng + g];
@@ -548,9 +594,9 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
          * the ORIGINAL dense path, kept for COLI_CUDA_F8_WARP=0; the default
          * routes fmt=8 to quant_matmul_f8w instead (quant_matmul_launch). */
         const uint8_t *wrow = static_cast<const uint8_t *>(weights) + row;
-        const float *scl = scales + (size_t)(o >> 7) * (size_t)((I + 127) >> 7);
+        const float *scl = scales + (size_t)(o / FP8_BLOCK) * (size_t)((I + FP8_BLOCK - 1) / FP8_BLOCK);
         for (int i = threadIdx.x; i < I; i += blockDim.x)
-            sum += xs[i] * c_e4m3[wrow[i]] * scl[i >> 7];
+            sum += xs[i] * c_e4m3[wrow[i]] * scl[i / FP8_BLOCK];
     } else {
         for (int i = threadIdx.x; i < I; i += blockDim.x)
             sum += xs[i] * weight_at(weights, fmt, row, i);
@@ -631,6 +677,14 @@ __global__ static void silu_mul(float *gate, const float *up, size_t n) {
     if (i < n) {
         float v = gate[i];
         gate[i] = (v / (1.0f + expf(-v))) * up[i];
+    }
+}
+
+__global__ static void situ_mul(float *gate, const float *up, size_t n, float b1, float b2) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = gate[i], u = up[i];
+        gate[i] = b1 * tanhf(g / b1) * (1.f / (1.f + expf(-g))) * b2 * tanhf(u / b2);
     }
 }
 
@@ -1242,28 +1296,39 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
     int available = 0;
     if (!devices || count < 1 || count > COLI_CUDA_MAX_DEVICES) return 0;
     if (!cuda_ok(cudaGetDeviceCount(&available), "device discovery")) return 0;
-    g_nctx = 0;
+    /* Validate the whole list before creating resources or replacing state. */
+    for (int i = 0; i < count; i++) {
+        if (devices[i] < 0 || devices[i] >= available) {
+            std::fprintf(stderr, "[CUDA] invalid device %d (available: 0..%d)\n", devices[i], available - 1);
+            return 0;
+        }
+        for (int j = 0; j < i; j++) if (devices[j] == devices[i]) {
+            std::fprintf(stderr, "[CUDA] duplicate device %d\n", devices[i]);
+            return 0;
+        }
+    }
+    if (g_nctx) {
+        /* Same decision as before, routed through the shared predicate in
+         * backend_cuda.h so a host-side test can pin it without nvcc; the
+         * return value is unchanged (1 for the same set, 0 otherwise). */
+        int live[COLI_CUDA_MAX_DEVICES];
+        for (int i = 0; i < g_nctx; i++) live[i] = g_ctx[i].device;
+        int d = coli_cuda_init_disposition(g_nctx, count, devices, live);
+        if (d == COLI_CUDA_INIT_REFUSE)
+            std::fprintf(stderr, "[CUDA] device list change requires shutdown first\n");
+        return d == COLI_CUDA_INIT_ACCEPT;
+    }
     for (int i = 0; i < count; i++) {
         int device = devices[i];
-        if (device < 0 || device >= available) {
-            std::fprintf(stderr, "[CUDA] invalid device %d (available: 0..%d)\n", device, available - 1);
-            g_nctx = 0;
-            return 0;
-        }
-        if (find_ctx(device)) {
-            std::fprintf(stderr, "[CUDA] duplicate device %d\n", device);
-            g_nctx = 0;
-            return 0;
-        }
         DeviceContext *ctx = &g_ctx[g_nctx];
         *ctx = {};
         ctx->device = device;
-        if (!select_ctx(ctx)) { g_nctx = 0; return 0; }
+        if (!select_ctx(ctx)) { coli_cuda_shutdown(); return 0; }
         cudaDeviceProp prop{};
-        if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) { g_nctx = 0; return 0; }
+        if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) { coli_cuda_shutdown(); return 0; }
         ctx->compute_major=prop.major;ctx->compute_minor=prop.minor;
         if(!cuda_ok(cudaStreamCreateWithFlags(&ctx->stream,cudaStreamNonBlocking),"stream creation")){
-            g_nctx=0;return 0;
+            coli_cuda_shutdown();return 0;
         }
 #ifdef COLI_ANS
         if(std::getenv("CUDA_RAW_EXPERTS")){
@@ -1288,6 +1353,10 @@ extern "C" void coli_cuda_shutdown(void) {
     for (int i = 0; i < g_nctx; i++) {
         DeviceContext *ctx = &g_ctx[i];
         if (!select_ctx(ctx)) continue;
+        if (ctx->mxfp4_weights) cudaFree(ctx->mxfp4_weights);
+        if (ctx->mxfp4_scales) cudaFree(ctx->mxfp4_scales);
+        if (ctx->mxfp4_expert_weights) cudaFree(ctx->mxfp4_expert_weights);
+        if (ctx->mxfp4_expert_scales) cudaFree(ctx->mxfp4_expert_scales);
         if (ctx->x) cudaFree(ctx->x);
         if (ctx->y) cudaFree(ctx->y);
         if (ctx->dx) cudaFree(ctx->dx);
@@ -1312,6 +1381,10 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->ans_scratch=nullptr;ctx->ans_chunks=nullptr;ctx->ans_raw=nullptr;ctx->ans_raw_cap=0;
         ctx->ans_host=nullptr;ctx->ans_host_cap=0;ctx->ans_copy_pending=0;
 #endif
+        ctx->mxfp4_weights = ctx->mxfp4_scales = nullptr;
+        ctx->mxfp4_weights_cap = ctx->mxfp4_scales_cap = 0;
+        ctx->mxfp4_expert_weights = ctx->mxfp4_expert_scales = nullptr;
+        ctx->mxfp4_expert_weights_cap = ctx->mxfp4_expert_scales_cap = 0;
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
         ctx->dx = ctx->dy = nullptr; ctx->dx_cap = ctx->dy_cap = 0;
         ctx->qx=nullptr; ctx->qscale=nullptr;
@@ -1324,6 +1397,22 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->group_desc=nullptr; ctx->group_desc_cap=0;
     }
     g_nctx = 0;
+    /* g_fp8_lut_ready is PROCESS-WIDE while the e4m3 table (c_e4m3, a
+     * __constant__ device symbol whose lifetime is the CUDA primary context,
+     * not this file's host-side DeviceContext structs) is PER-DEVICE. A later
+     * coli_cuda_init may select a device the previous span never published to;
+     * without this reset the upload gate (g_fp8_lut_ready, checked in
+     * coli_cuda_tensor_upload) would still be satisfied from the PREVIOUS
+     * boot and admit fmt=8 tensors whose kernels there decode against an
+     * unwritten (zero) table: silent all-zero weights, the exact
+     * fabricated-numbers failure mode the format gates exist to refuse.
+     * Reset so every boot must publish its own LUT (coli_cuda_fp8_set_lut)
+     * before any fmt=8 upload. Shutdown is the ONLY site that needs to clear
+     * the flag: coli_cuda_init refuses a re-init that names a different
+     * device set (it returns early while g_nctx is non-zero, leaving the
+     * existing contexts and their published table untouched), so the device
+     * set can only WIDEN by passing through here first. */
+    g_fp8_lut_ready = 0;
 #ifdef COLI_ANS
     if(g_ans_sidecar){std::fclose(g_ans_sidecar);g_ans_sidecar=nullptr;}
 #if defined(__linux__)
@@ -1412,16 +1501,22 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     /* fmt=6 keeps its scales inside each 98-byte block, so it is the one
      * quantized format that legitimately arrives with scales == NULL. */
     if (!rb || (fmt && fmt != 6 && !scales)) return 0;
-    if (fmt == 8 && !g_fp8_lut_ready) return 0;   /* kernels would read a zero LUT */
+    /* kernels would read a zero LUT; shared predicate, pinned by
+     * tests/test_cuda_lut_gate.c without a CUDA toolchain */
+    if (!coli_cuda_fp8_gate_admits(fmt, g_fp8_lut_ready)) return 0;
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;
     t->gs = (fmt==4 && g_upload_gs>0) ? g_upload_gs : 0;
     t->ng = t->gs ? (I + t->gs - 1) / t->gs : 1;
     t->scale_count = t->gs ? (size_t)O * (size_t)t->ng : (size_t)O;
-    if (fmt == 8) {   /* per-128x128-block scales: [ceil(O/128), ceil(I/128)] */
-        t->ng = (I + 127) / 128;
-        t->scale_count = (size_t)((O + 127) / 128) * (size_t)t->ng;
+    if (fmt == 7) {
+        t->ng = (I + 31) / 32;
+        t->scale_count = (size_t)O * t->ng;
+    }
+    if (fmt == 8) {   /* per-block scales: [ceil(O/FP8_BLOCK), ceil(I/FP8_BLOCK)] (fp8_format.h) */
+        t->ng = (int)fp8_nblk(I);
+        t->scale_count = (size_t)fp8_nblk(O) * (size_t)t->ng;
     }
     if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation")) {
         coli_cuda_tensor_free(t);
@@ -1439,8 +1534,8 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
     if (fmt && fmt != 6) {
-        if (!cuda_ok(cudaMalloc(&t->scales, t->scale_count * sizeof(float)), "scale allocation") ||
-            !cuda_ok(cudaMemcpy(t->scales, scales, t->scale_count * sizeof(float), cudaMemcpyHostToDevice), "scale upload")) {
+        if (!cuda_ok(cudaMalloc(&t->scales, tensor_scale_bytes(t)), "scale allocation") ||
+            !cuda_ok(cudaMemcpy(t->scales, scales, tensor_scale_bytes(t), cudaMemcpyHostToDevice), "scale upload")) {
             coli_cuda_tensor_free(t);
             return 0;
         }
@@ -1448,7 +1543,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     if (fmt == 6) t->scale_count = 0;      /* in-block scales: nothing separate to track */
     t->tracked = 1;
     ctx->tensor_count++;
-    ctx->tensor_bytes += t->weight_bytes + ((fmt && fmt != 6) ? t->scale_count * sizeof(float) : 0);
+    ctx->tensor_bytes += t->weight_bytes + tensor_scale_bytes(t);
     *tensor = t;
     return 1;
 }
@@ -1634,10 +1729,9 @@ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
             (uint8_t*)tensor->weights,tensor->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight refresh")) return 0;
     }
-    /* fmt=6 has no scale buffer at all (scales live in-block, scale_count 0), and
-     * the fallback below would otherwise copy O floats out of a NULL host pointer. */
+    /* fmt=6 stores scales in-block; fmt=7 stores byte exponents separately. */
     return !tensor->fmt || tensor->fmt==6 || cuda_ok(cudaMemcpy(tensor->scales,scales,
-        (tensor->scale_count?tensor->scale_count:(size_t)tensor->O)*sizeof(float),
+        tensor_scale_bytes(tensor),
         cudaMemcpyHostToDevice),"scale refresh");
 }
 
@@ -1728,9 +1822,10 @@ extern "C" int coli_cuda_matmul_mxfp4(float *y, const float *x,
     size_t wb = (size_t)O * rb, sb = (size_t)O * ng;
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
 
-    uint8_t *dw = nullptr, *ds = nullptr;
-    if (!cuda_ok(cudaMalloc(&dw, wb), "mxfp4 weight alloc")) return 0;
-    if (!cuda_ok(cudaMalloc(&ds, sb), "mxfp4 scale alloc")) { cudaFree(dw); return 0; }
+    if (!reserve_bytes(&ctx->mxfp4_weights, &ctx->mxfp4_weights_cap, wb) ||
+        !reserve_bytes(&ctx->mxfp4_scales, &ctx->mxfp4_scales_cap, sb)) return 0;
+    uint8_t *dw = static_cast<uint8_t *>(ctx->mxfp4_weights);
+    uint8_t *ds = static_cast<uint8_t *>(ctx->mxfp4_scales);
 
     int ok = reserve(&ctx->x, &ctx->x_cap, xb) && reserve(&ctx->y, &ctx->y_cap, yb) &&
              cuda_ok(cudaMemcpy(dw, q4, wb, cudaMemcpyHostToDevice), "mxfp4 weight upload") &&
@@ -1743,8 +1838,52 @@ extern "C" int coli_cuda_matmul_mxfp4(float *y, const float *x,
         ok = cuda_ok(cudaGetLastError(), "mxfp4 launch") &&
              cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "mxfp4 output download");
     }
-    cudaFree(dw);
-    cudaFree(ds);
+    return ok;
+}
+
+/* Reuse one weight/scale staging allocation across the three projections.
+ * Default-stream copies are ordered after the previous projection's reads. */
+static int mxfp4_project(float *y, const float *x, uint8_t *dw, uint8_t *ds,
+        const uint8_t *w, const uint8_t *sc, int S, int I, int O) {
+    size_t rb = ((size_t)I + 1) / 2, ng = ((size_t)I + 31) / 32;
+    if (!cuda_ok(cudaMemcpy(dw, w, (size_t)O * rb, cudaMemcpyHostToDevice), "expert weight upload") ||
+        !cuda_ok(cudaMemcpy(ds, sc, (size_t)O * ng, cudaMemcpyHostToDevice), "expert scale upload")) return 0;
+    quant_matmul<<<dim3(O, S), 256>>>(y, x, dw, reinterpret_cast<const float *>(ds),
+                                    7, S, I, O, rb, 32, (int)ng);
+    return cuda_ok(cudaGetLastError(), "MXFP4 expert projection");
+}
+
+extern "C" int coli_cuda_expert_mxfp4(float *y, const float *x,
+        const unsigned char *gate_w, const unsigned char *gate_s,
+        const unsigned char *up_w, const unsigned char *up_s,
+        const unsigned char *down_w, const unsigned char *down_s,
+        int S, int D, int I, float b1, float b2) {
+    if (fault_injected() || !x || !y || !gate_w || !gate_s || !up_w || !up_s ||
+        !down_w || !down_s || S < 1 || S > 65535 || D < 1 || I < 1 ||
+        !(b1 > 0.f) || !(b2 > 0.f) || !std::isfinite(b1) || !std::isfinite(b2)) return 0;
+    DeviceContext *ctx = find_ctx(0);
+    if (!select_ctx(ctx)) return 0;
+    size_t xb = (size_t)S * D * sizeof(float), ib = (size_t)S * I * sizeof(float);
+    if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, xb) ||
+        !reserve(&ctx->gate, &ctx->gate_cap, ib) || !reserve(&ctx->up, &ctx->up_cap, ib)) return 0;
+    size_t gw = (size_t)I * (((size_t)D + 1) / 2), dwb = (size_t)D * (((size_t)I + 1) / 2);
+    size_t gs = (size_t)I * (((size_t)D + 31) / 32), dsb = (size_t)D * (((size_t)I + 31) / 32);
+    /* Grow to the largest projection seen, then reuse across routed experts.
+     * Slot identity is irrelevant: every call refreshes all weight bytes. */
+    if (!reserve_bytes(&ctx->mxfp4_expert_weights, &ctx->mxfp4_expert_weights_cap, gw > dwb ? gw : dwb) ||
+        !reserve_bytes(&ctx->mxfp4_expert_scales, &ctx->mxfp4_expert_scales_cap, gs > dsb ? gs : dsb)) return 0;
+    uint8_t *dw = static_cast<uint8_t *>(ctx->mxfp4_expert_weights);
+    uint8_t *ds = static_cast<uint8_t *>(ctx->mxfp4_expert_scales);
+    int ok = cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "expert input upload") &&
+        mxfp4_project(ctx->gate, ctx->x, dw, ds, gate_w, gate_s, S, D, I) &&
+        mxfp4_project(ctx->up, ctx->x, dw, ds, up_w, up_s, S, D, I);
+    if (ok) {
+        size_t n = (size_t)S * I;
+        situ_mul<<<(unsigned)((n + 255) / 256), 256>>>(ctx->gate, ctx->up, n, b1, b2);
+        ok = cuda_ok(cudaGetLastError(), "SiTU-GLU launch") &&
+            mxfp4_project(ctx->y, ctx->gate, dw, ds, down_w, down_s, S, I, D) &&
+            cuda_ok(cudaMemcpy(y, ctx->y, xb, cudaMemcpyDeviceToHost), "expert output download");
+    }
     return ok;
 }
 
@@ -2198,18 +2337,20 @@ extern "C" const float *coli_cuda_expert_group_take(int device) {
 
 
 /* The absorb kernels decode `w` through weight_at + absorb_scale, which know
- * per-row and fmt=4 group scales only. Refuse anything else (fmt=5/6/8) rather
- * than mis-decode it — the caller keeps its CPU attention path. (`proj`
- * tensors are exempt: they run through quant_matmul, which dispatches every
- * format it uploads.) A dedicated block-scale absorb for fmt=8 is follow-up
- * work, same shape as routing fmt=4 through the grouped kernels was.
+ * per-row scales, fmt=4 group scales, and fmt=8 per-128x128-block scales.
+ * Refuse anything else (fmt=5/6/7) rather than mis-decode it — the caller
+ * keeps its CPU attention path. (`proj` tensors are exempt: they run through
+ * quant_matmul, which dispatches every format it uploads.) fmt=8 support
+ * funnels through this one predicate for all the absorb host wrappers below,
+ * so none of them needed a separate change.
  *
  * The admissible set is weight_at's own, taken from the shared predicate rather
- * than restated as `fmt <= 4`: this gate and weight_at's device-side backstop
- * must not be able to drift apart, and the old inequality also admitted
- * NEGATIVE fmt values, which weight_at would then have fallen through on. Same
- * truth table for every fmt a container can actually carry (0..8), so no
- * existing container changes behaviour here. */
+ * than restated as an inequality: this gate and weight_at's device-side
+ * backstop must not be able to drift apart, and the old `fmt <= 4` also
+ * admitted NEGATIVE fmt values, which weight_at would then have fallen through
+ * on. A fmt=8 tensor implies a live e4m3 LUT (upload refuses it otherwise --
+ * see the predicate's caveat note in backend_cuda.h), so no extra gate is
+ * needed here. */
 static int absorb_fmt_ok(const ColiCudaTensor *w){
     return w && coli_cuda_weight_at_supported(w->fmt);
 }
@@ -2386,19 +2527,14 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     DeviceContext *ctx = find_ctx(tensor->device);
     if (ctx) select_ctx(ctx);
     if (tensor->tracked && ctx) {
-        /* Must mirror the upload's accounting exactly -- literally the same
-         * expression upload uses to charge (scale_count * sizeof(float), gated
-         * on fmt=6 never having a separate scale buffer), so the two can no
-         * longer drift independently. Over-subtracting here trips the >= guard
-         * below, which silently leaves the tensor's bytes on the device counter
-         * forever. */
+        /* Charge and release the same format-specific scale storage. */
         size_t storage_bytes =
 #ifdef COLI_ANS
             tensor->compressed ? tensor->archive_bytes :
 #endif
             tensor->weight_bytes;
         size_t bytes = storage_bytes +
-            ((tensor->fmt && tensor->fmt != 6) ? tensor->scale_count * sizeof(float) : 0);
+            tensor_scale_bytes(tensor);
         if (ctx->tensor_count) ctx->tensor_count--;
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
@@ -2410,19 +2546,14 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
 
 extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
     if (!tensor) return 0;
-    /* Must mirror upload's and free's accounting exactly -- literally the same
-     * expression they use (scale_count * sizeof(float), gated on fmt=6 never
-     * having a separate scale buffer) -- so all three can no longer drift
-     * independently. The prior `O * ng` shape over-reported for fmt=8 (real
-     * footprint is (O+127)/128 * ng block scales, not O * ng) and for fmt=6
-     * (which has no separate scale buffer at all). */
+    /* Logical size uses the same scale layout as upload and free. */
     size_t storage_bytes =
 #ifdef COLI_ANS
         tensor->compressed ? tensor->archive_bytes :
 #endif
         tensor->weight_bytes;
     return storage_bytes +
-        ((tensor->fmt && tensor->fmt != 6) ? tensor->scale_count * sizeof(float) : 0);
+        tensor_scale_bytes(tensor);
 }
 
 /* What a cudaMalloc of `bytes` actually takes off the card.
@@ -2536,7 +2667,7 @@ extern "C" size_t coli_cuda_tensor_vram(const ColiCudaTensor *tensor) {
         tensor->weight_bytes;
     size_t total = coli_cuda_alloc_footprint(storage_bytes);
     if (tensor->fmt && tensor->fmt != 6)
-        total += coli_cuda_alloc_footprint(tensor->scale_count * sizeof(float));
+        total += coli_cuda_alloc_footprint(tensor_scale_bytes(tensor));
     return total;
 }
 
