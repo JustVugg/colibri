@@ -811,7 +811,7 @@ endif
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c sse41_kernels.h exact_dot.h oracle.h pin_pool.h cli_args.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h abl.h backend_cuda.h backend_metal.h backend_vulkan.h backend_xdna.h decode_batch.h edge_adapters.h edge_runtime.h edge_tok_internal.h schema_gbnf.h segment_adapter_internal.h segment_adapters.h segment_runtime.h tier.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) $(XDNA_OBJ) .build-config
+colibri$(EXE): colibri.c sse41_kernels.h exact_dot.h oracle.h pin_pool.h cli_args.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h abl.h backend_cuda.h backend_metal.h backend_vulkan.h backend_xdna.h decode_batch.h edge_adapters.h edge_runtime.h edge_tok_internal.h evidence_digest.h schema_gbnf.h segment_adapter_internal.h segment_adapters.h segment_runtime.h tier.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) $(XDNA_OBJ) .build-config
 	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(XDNA_OBJ) -o colibri$(EXE) $(LDFLAGS)
 
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
@@ -1534,6 +1534,20 @@ tests/test_rope_invfreq$(EXE): tests/test_rope_invfreq.c sse41_kernels.h colibri
 # the GrDraft.src ownership must not leak/double-free. Includes colibri.c.
 tests/test_grammar_cache$(EXE): tests/test_grammar_cache.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# The classified logit-row reduction in sample.h and the digest in
+# evidence_digest.h: no model/weights, published SHA-256 vectors, an
+# agreement check against the plain logprob_target the sampling path uses
+# on rows a float subtraction cannot mis-round, and a double-precision
+# check against a second double computation on rows that do.
+tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c sse41_kernels.h exact_dot.h oracle.h sample.h evidence_digest.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# The ablation mode's manifest loader, evidence writer and dispatch contract.
+# The adapter build bypasses only the model computation, so the parser/writer
+# path is exercised for real with no model and no weights.
+tests/test_ablate_mode$(EXE): tests/test_ablate_mode.c colibri.c sse41_kernels.h exact_dot.h oracle.h sample.h evidence_digest.h abl.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # Standalone: drives a faithful miniature of moe()'s routing+accumulate and links
 # the SAME abl.h the engine links -- no model/weights needed (the ablation-logic gate).
