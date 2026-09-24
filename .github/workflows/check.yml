@@ -23,7 +23,9 @@ jobs:
   linux:
     name: Linux
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # make check takes about 14 minutes here now (14.9 at worst this week);
+    # at 15 the job was cut off with nothing failed.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: make check
