@@ -1804,8 +1804,10 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                 float choice = score[e] + (l->rbias ? l->rbias[e] : 0.0f);
                 if (!used && choice > value) { value = choice; best = e; }
             }
-            mine[k] = best;
-            mine_w[k] = score[best];
+            /* SEC: all-NaN scores leave best at -1, and score[-1] is the very
+             * next read. See rt_router_pick in route_trace.h. */
+            mine[k] = rt_router_pick(best, k, c->n_experts, index);
+            mine_w[k] = score[mine[k]];
             total += mine_w[k];
         }
         for (int k = 0; k < topk; k++)

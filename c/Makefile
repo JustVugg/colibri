@@ -1428,6 +1428,9 @@ tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c sse41_kernels.h qwen3
 tests/test_dsv41_serve_budget$(EXE): tests/test_dsv41_serve_budget.c sse41_kernels.h deepseek_v41.c cli_args.h st.h json.h tok.h tok_unicode.h compat.h omp_tune.h kv_prefix.h pin_pool.h quant.h fp8_format.h idot.h sparse_attn.h hyper_connections.h serve_codec.h serve_poll.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_dsv41_untrusted_load$(EXE): tests/test_dsv41_untrusted_load.c sse41_kernels.h deepseek_v41.c cli_args.h st.h json.h tok.h tok_unicode.h compat.h omp_tune.h kv_prefix.h pin_pool.h quant.h fp8_format.h idot.h sparse_attn.h hyper_connections.h serve_codec.h serve_poll.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c sse41_kernels.h qwen38.c qwen38_core.h kv_prefix.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h fp8_format.h idot.h route_trace.h tok_unicode.h tok_unicode_o200k.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
