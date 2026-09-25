@@ -557,13 +557,15 @@ jobs:
           # (int4 experts drift from f32 by design): it is that the kernel and
           # the unpack-to-int8 path it replaces emit the SAME ids at every cap,
           # including cap=1 (one expert resident: the per-pair cut) and cap=16
-          # (the whole prompt in one run).
+          # (the whole prompt in one run). Within each path the last logits must
+          # be the same bytes at every cap: an id survives a last-bit drift, and
+          # the per-pair cut once rounded twice where an FMA build rounds once.
           python3 tools/make_qwen36_tiny.py --out qwen36_tiny64 --ref-mode full --inter 64 \
                   --emit-ref qwen36_tiny64/ref_full.json
           python3 tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_c --ebits 4 --gs 64
           for cap in 1 2 8 16; do
             for k in 0 1; do
-              QWEN_EXPERT_KERNEL=$k COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c \
+              QWEN_EXPERT_KERNEL=$k COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c DUMP=logits_${cap}_$k.f32 \
                 ./qwen36 "$cap" 4 qwen36_tiny64/ref_full.json > ab_${cap}_$k.log 2>&1 || true
               grep -E "^C engine" ab_${cap}_$k.log > ids_${cap}_$k.txt
             done
@@ -572,6 +574,13 @@ jobs:
             test -s ids_${cap}_1.txt || { echo "FAIL: no ids at cap=$cap"; cat ab_${cap}_1.log; exit 1; }
             cmp ids_${cap}_0.txt ids_${cap}_1.txt || { echo "FAIL: ids differ at cap=$cap"; cat ids_${cap}_0.txt ids_${cap}_1.txt; exit 1; }
             echo "cap=$cap: identical ($(cat ids_${cap}_1.txt))"
+          done
+          for k in 0 1; do
+            for cap in 1 2 8; do
+              test -s logits_${cap}_$k.f32 || { echo "FAIL: no logits dump at cap=$cap kernel=$k"; exit 1; }
+              cmp logits_${cap}_$k.f32 logits_16_$k.f32 || { echo "FAIL: kernel=$k logits at cap=$cap differ from cap=16"; exit 1; }
+            done
+            echo "kernel=$k: identical logits at cap 1/2/8/16"
           done
           make tests/test_expert_ffn && ./tests/test_expert_ffn
       - name: Mixed expert layout (int4 gs64 gate/up, int8 down) loads and is cap-independent
