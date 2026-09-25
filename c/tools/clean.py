@@ -25,7 +25,7 @@ FILES = [
     "glm53", "glm53.exe",
     "glm", "glm.exe",                       # pre-rename name of the colibri engine
     "iobench", "iobench.exe",
-    "backend_cuda.o", "backend_loader.o",
+    "backend_cuda.o", "backend_loader.o", "qwen36_tier.o",
     "backend_cuda_test", "backend_cuda_test.exe",
     "mxfp4_expert_cuda_test", "mxfp4_expert_cuda_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
@@ -59,8 +59,12 @@ FILES = [
 # A stale probe does not just waste space -- it is the owner that PRODUCES
 # physical execution evidence, and a stale one reports PASS for code that is no
 # longer in the tree.
+#
+# *.d are the dependency files -MMD writes beside each binary and object
+# (#1741). A stale one only adds prerequisites, but clean should leave nothing
+# the build made, and removing it forces the rebuild that writes a fresh one.
 ARTIFACT_GLOBS = ["tests/test_*", "tests/bench_*", "tests/fuzz_*",
-                  "tests/*_probe*", "COLI_V4_UNIT_*.o"]
+                  "tests/*_probe*", "COLI_V4_UNIT_*.o", "*.d", "tests/*.d"]
 KEEP_EXT = (".c", ".h", ".cc", ".cpp", ".cu", ".mm", ".py", ".txt", ".json",
             ".md", ".bin", ".sh", ".toml", ".yml", ".yaml")
 # Directories to remove.
