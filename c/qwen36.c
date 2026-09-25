@@ -802,6 +802,9 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
 static void *pilot_worker(void *arg);
 static void ensure_pilot_worker_started(Model *m);
 static void slot_ensure_allocated(Model *m, Slot *s);
+static int qwen36_cap_for_ram(double resident_gb, double avail_gb, double ram_gb_override,
+                               int hidden, int inter, int n_experts, int n_active_layers,
+                               int is_int4, double *slot_gb_out, double *budget_gb_out);
 
 #ifdef COLI_CACHE_INDEX_TEST
 static uint64_t g_slot_index_probes;
@@ -862,6 +865,8 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 #else
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
 #endif
+/* same wrapper convention as colibri.c/olmoe.c/inkling.c/kimi_k3.c/deepseek_v4.c */
+static double mem_available_gb(void) { return compat_mem_available_gb(); }
 
 /* ---- M-PROF (R2): per-phase wall-clock accumulators, COLI_TIMERS=1 ---- */
 static int g_timers = -1;
@@ -1631,6 +1636,31 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     #undef QCOUNT
     if (quantize_dense)
         fprintf(stderr, "[dense-i8] %d matrices quantized during load, %.1f GB f32 freed\n", qcount, qfreed/1073741824.0);
+    if (cap <= 0) {
+        /* cap<=0 sentinel: derive from host RAM, same "0 = auto" convention as
+         * colibri.c/olmoe.c. rss_gb() here reflects all dense weights resident
+         * (this loop just finished) but not yet DN_rec/DN_conv/m->cache
+         * themselves (allocated below) -- a known, small underestimate left
+         * inside the 12% margin rather than reordering allocation here.
+         * xf_mode(m) is resolvable at this point (st_init/active_of already
+         * ran) but is memoized process-globally, not per-Model* -- a
+         * pre-existing, unrelated bug if this process ever builds two models
+         * with different container formats (out of scope here). */
+        double resident = rss_gb();
+        double avail = mem_available_gb();
+        const char *ram_env = getenv("RAM_GB");
+        double ram_override = ram_env ? atof(ram_env) : 0.0;
+        int n_active = layer_end - layer_begin;
+        double slot_gb = 0.0, budget_gb = 0.0;
+        cap = qwen36_cap_for_ram(resident, avail, ram_override,
+                                  c->hidden, c->inter, c->n_experts, n_active,
+                                  xf_mode(m), &slot_gb, &budget_gb);
+        fprintf(stderr, "[qwen36] cache auto-sized: %d slots/layer of %d experts "
+                        "(%.1f GB budget via %s, %.1f GB dense resident, %.0f MB/slot)\n",
+                cap, c->n_experts, budget_gb,
+                ram_override > 0.0 ? "RAM_GB" : "88% of available RAM",
+                resident, slot_gb * 1000.0);
+    }
     m->cache = calloc((size_t)c->n_layers, sizeof(LCache));
     for (int i = layer_begin; i < layer_end; i++) {
         m->cache[i].cap = cap;
@@ -1677,6 +1707,31 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 static int64_t scale_count_gu(const Cfg *c){ return c->expert_gs ? (int64_t)c->inter * ((c->hidden + c->expert_gs - 1) / c->expert_gs) : c->inter; }
 static int down_gs_of(const Cfg *c){ return c->expert_down_bits ? c->expert_down_gs : c->expert_gs; }
 static int64_t scale_count_d (const Cfg *c){ int gs = down_gs_of(c); return gs ? (int64_t)c->hidden * ((c->inter + gs - 1) / gs) : c->hidden; }
+
+/* Pure: no Model pointer, no globals, no I/O, same testability contract as
+ * coli_resolve_cap / k3_cap_for_ram. cap<=0 sentinel ("auto") resolves to
+ * this. Mirrors olmoe.c's cap<=0 budget block (resident + avail*0.88, same
+ * margin as colibri.c's cap_for_ram), extended with the int4/xf_mode slot-size split that
+ * slot_ensure_allocated() above uses (half the int8 bytes) and with
+ * n_active_layers instead of always c->n_layers, for the Segment/Edge
+ * partial-model layer-range builds. Approximates the scale-float block the
+ * same way olmoe.c does (ignores expert_gs grouping precision) -- this is a
+ * budget estimate under a safety margin, not exact accounting. */
+static int qwen36_cap_for_ram(double resident_gb, double avail_gb, double ram_gb_override,
+                               int hidden, int inter, int n_experts, int n_active_layers,
+                               int is_int4, double *slot_gb_out, double *budget_gb_out) {
+    double budget = ram_gb_override > 0.0 ? ram_gb_override : resident_gb + avail_gb * 0.88;
+    if (budget_gb_out) *budget_gb_out = budget;
+    double room = budget - resident_gb;
+    double per_expert = (double)hidden * inter * (is_int4 ? 1.5 : 3.0);
+    double slot_gb = (per_expert + (double)(inter * 2 + hidden) * sizeof(float)) / 1e9;
+    if (slot_gb_out) *slot_gb_out = slot_gb;
+    int layers = n_active_layers < 1 ? 1 : n_active_layers;
+    int derived = room > 0.0 && slot_gb > 0.0 ? (int)(room / slot_gb / (double)layers) : 0;
+    if (derived < 1) derived = 1;
+    if (n_experts > 0 && derived > n_experts) derived = n_experts;
+    return derived;
+}
 
 static void slot_ensure_allocated(Model *m, Slot *s) {
     if (s->g || s->pw) return;
@@ -3807,12 +3862,16 @@ int main(int argc, char **argv) {
     if (getenv("OPENAI")) g_openai = 1;                       /* OpenAI-compatible output */
     const char *mv = getenv("MODEL"); if (mv && *mv) g_model = mv;
     int hot_n = getenv("HOT") ? atoi(getenv("HOT")) : 0;
-    int cap   = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 16;
+    int cap   = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 0;
     int bits  = argc > 2 ? coli_arg_int(argv[2], "expert bits") : 4;
-    /* cap < 1 leaves every layer cache empty, so expert_get finds no slot to
-     * evict and waits for a publish that can never come. The old lru=0 fallback
-     * turned that into a heap OOB instead; neither is a failure mode to ship. */
-    if (cap < 1) { fprintf(stderr, "cache/layer must be >= 1 (got %d)\n", cap); return 1; }
+    /* cap<=0 (explicit 0, or bare omission above) is the "auto-size from host
+     * RAM" sentinel resolved later in model_init_range, once dense weights are
+     * resident and xf_mode is known -- see qwen36_cap_for_ram(). The invariant
+     * that a cap<1 must never reach the per-layer calloc (expert_get would
+     * then find no slot to evict and wait for a publish that can never come;
+     * the old lru=0 fallback turned that into a heap OOB instead) still holds,
+     * just enforced there instead of only here for the auto path. */
+    if (cap < 0) { fprintf(stderr, "cache/layer must be >= 0 (0 = auto; got %d)\n", cap); return 1; }
     if (bits < 2 || bits > 8) { fprintf(stderr, "quant_bits must be 2..8 (got %d)\n", bits); return 1; }
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
 
@@ -3822,8 +3881,11 @@ int main(int argc, char **argv) {
     /* #1376: every capacity knob announced itself here except the one that
      * refuses requests. The context ceiling surfaced only in the
      * CONTEXT_EXCEEDED line, i.e. after a request had already failed. */
-    fprintf(stderr, "== qwen36 Phase-2 engine | cache=%d/layer bits=%d ctx=%d pilot=%d wide=%d hot=%d smooth=%.2f conf=%.2f ==\n",
-           cap, bits, qwen36_max_ctx(), g_pilot, g_wide, hot_n, smooth, conf);
+    char cap_disp[16];
+    if (cap > 0) snprintf(cap_disp, sizeof cap_disp, "%d", cap);
+    else snprintf(cap_disp, sizeof cap_disp, "auto");
+    fprintf(stderr, "== qwen36 Phase-2 engine | cache=%s/layer bits=%d ctx=%d pilot=%d wide=%d hot=%d smooth=%.2f conf=%.2f ==\n",
+           cap_disp, bits, qwen36_max_ctx(), g_pilot, g_wide, hot_n, smooth, conf);
 
 
     int is_ref = 0;
@@ -4163,7 +4225,9 @@ static int qwen36_segment_engine_open(
                                            "Qwen3.6 Segment range exceeds model");
     }
     int range_layers = (int)(options->layer_end - options->layer_begin);
-    int cap = 16;
+    int cap = 0; /* sentinel: model_init_range derives it from host RAM,
+                  * honoring memory_limit_bytes==0's own doc comment ("uses
+                  * the adapter's ordinary automatic budget") */
     if (options->memory_limit_bytes) {
         uint64_t weights = (uint64_t)config.hidden * config.inter * 3u;
         uint64_t per_slot = weights +
