@@ -72,9 +72,61 @@ class ClientCancelled(Exception):
     pass
 
 
+class EchoPrefixPinned(Exception):
+    """The engine echoed a contiguous run of prompt positions that does not start at 0,
+    which is the shape a pin snapshot produces: the snapshot already covers `prefix`
+    tokens, so the prefill reads out `prefix..nt-1` and there is nothing to read out
+    before that.
+
+    This is not corruption and must not be answered as if it were, but it is also not
+    something this surface can serve: `echo: true` promises a logprob and a text offset for
+    every prompt position. Re-basing the run to start at 0 would attach every logprob to
+    the wrong prompt token -- a 200 carrying silently wrong data -- and filling the gap is
+    not available either, since the engine holds no logits for a pinned prefix. So the
+    caller is told by name what the engine could not do. Carries `prefix` so the message
+    can name it."""
+
+    def __init__(self, prefix):
+        super().__init__(f"the engine echoed prompt positions from {prefix}, not 0")
+        self.prefix = prefix
+
+
 def error_object(error):
     return {"error": {"message": error.message, "type": error.error_type,
                       "param": error.param, "code": error.code}}
+
+
+def _malformed_logprob_tail(detail):
+    """The engine's numeric tail did not parse, named for the client.
+
+    Every shape of it is the same event from the client's side: the engine sent a per-token
+    logprob frame this gateway cannot read, so the numbers the request asked for do not
+    exist. `engine_logprob_tail_malformed` says what the engine did rather than naming the
+    reaction to it, so the code stays true if the reaction ever changes."""
+    return APIError(500, "The colibri engine sent a malformed per-token logprob "
+                         "tail: %s" % detail, "logprobs",
+                    "engine_logprob_tail_malformed", "server_error")
+
+
+def _malformed_echo_position(detail):
+    """The `pos` field of an ECHO frame did not parse, named for the client.
+
+    Its own code rather than the numeric tail's: the two are different fields of the frame
+    and a client branching on the code should not be told the tail was unreadable when the
+    position was."""
+    return APIError(500, "The colibri engine sent an unreadable prompt-echo position: %s"
+                         % detail, "echo", "engine_echo_position_malformed", "server_error")
+
+
+def _with_engine_reason(fault, message):
+    """`fault` again, with the engine's own terminal error text appended.
+
+    The recorded fault happened first and names the framing defect, so it is what the client
+    is told; the engine's parting word is kept in the message rather than dropped, because it
+    is often the only account of what the turn did after the frame this server could not
+    read."""
+    return APIError(fault.status, f"{fault.message} The engine then reported: {message}",
+                    fault.param, fault.code, fault.error_type)
 
 
 def _engine_error(fields, message):
@@ -376,6 +428,100 @@ _SALVAGE = os.environ.get("COLI_TOOL_SALVAGE", "0") == "1"
 _TOOL_FALLBACK = os.environ.get("COLI_TOOL_FALLBACK", "0") == "1"
 
 
+# ---- raw-stream span maps ---------------------------------------------------------------
+# Every transformation between the engine's raw stream and the string a client receives is
+# a DELETION: the stop filter withholds a matched sequence, the thinking split routes each
+# character into one bucket or the other, the tool-call parse removes box syntax. None
+# writes a character its input did not hold and none reorders, so a stage can report what
+# it did as an ordered list of surviving intervals -- [(in_start, in_end, out_start), ...],
+# monotonic and non-overlapping -- in ITS OWN INPUT's coordinates. Output positions are
+# assigned in input order with no gaps, which keeps the image of a contiguous range
+# contiguous and composition associative.
+
+def _append_span(spans, in_start, in_end, out_start):
+    """Append one surviving interval, merging it into the previous one when the two are
+    adjacent on both sides so the map stays canonical."""
+    if in_end <= in_start:
+        return
+    if spans:
+        previous_start, previous_end, previous_out = spans[-1]
+        if previous_end == in_start and previous_out + (previous_end - previous_start) == out_start:
+            spans[-1] = (previous_start, in_end, previous_out)
+            return
+    spans.append((in_start, in_end, out_start))
+
+
+def _cut_span_map(length, cuts):
+    """The deletion map for removing `cuts` -- possibly overlapping [start, end) ranges --
+    from a string of `length` characters.
+
+    The cuts are sorted here rather than required to arrive sorted: every caller today
+    produces them in order, and an out-of-order list silently produced a wrong map, which
+    is the kind of precondition a later caller discovers the expensive way."""
+    spans, cursor, out = [], 0, 0
+    for start, end in sorted(cuts):
+        if start > cursor:
+            _append_span(spans, cursor, start, out)
+            out += start - cursor
+        cursor = max(cursor, end)
+    if cursor < length:
+        _append_span(spans, cursor, length, out)
+    return spans
+
+
+def _apply_cuts(text, cuts):
+    """`(remaining text, deletion map)` for removing `cuts` from `text`. One step of a
+    multi-step stage: the caller composes the steps' maps in the same order it applies
+    them, because each step's cuts are found in the text the previous step produced."""
+    spans = _cut_span_map(len(text), cuts)
+    return "".join(text[start:end] for start, end, _out in spans), spans
+
+
+def _compose_span_maps(first, second):
+    """Chain a stage's map with the map of the stage that consumes its output: `first` is
+    X -> Y, `second` is Y -> Z, and the result is X -> Z."""
+    composed, index = [], 0
+    for in_start, in_end, out_start in first:
+        middle_end = out_start + (in_end - in_start)
+        while index < len(second) and second[index][1] <= out_start:
+            index += 1                      # `first` is monotonic in Y, so this never rewinds
+        probe = index
+        while probe < len(second) and second[probe][0] < middle_end:
+            middle_start, middle_stop, final_out = second[probe]
+            low, high = max(out_start, middle_start), min(middle_end, middle_stop)
+            if low < high:
+                _append_span(composed, in_start + (low - out_start), in_start + (high - out_start),
+                             final_out + (low - middle_start))
+            probe += 1
+    return composed
+
+
+def _project_point(span_map, position):
+    """How many input characters strictly before `position` survive `span_map`."""
+    low, high = 0, len(span_map)
+    while low < high:
+        middle = (low + high) // 2
+        if span_map[middle][0] <= position:
+            low = middle + 1
+        else:
+            high = middle
+    if low == 0:
+        return 0
+    in_start, in_end, out_start = span_map[low - 1]
+    return out_start + min(position, in_end) - in_start
+
+
+def _project_span(span_map, start, end):
+    """Where input range [start, end) lands in the stage's output, or None when every
+    character of it was deleted.
+
+    One interval, not a list: a deletion map assigns output positions in input order with
+    no gaps, so even a deletion inside the range leaves a contiguous image -- the survivors
+    on either side of the hole become adjacent once the hole is gone."""
+    low, high = _project_point(span_map, start), _project_point(span_map, end)
+    return (low, high) if high > low else None
+
+
 def _tool_choice_name(tool_choice):
     """The tool name a dict `tool_choice` forces, or None.
 
@@ -482,9 +628,78 @@ def _unclosed_tail(reply, tools):
     return inner if inner.strip() in declared else None
 
 
+def _marker_cuts(text, marker):
+    """Every non-overlapping occurrence of `marker`, left to right -- what
+    str.replace(marker, "") removes, found as ranges instead of applied as a rewrite."""
+    if not marker:
+        return []                                 # find("") never advances past `index`
+    cuts, index = [], text.find(marker)
+    while index >= 0:
+        cuts.append((index, index + len(marker)))
+        index = text.find(marker, index + len(marker))
+    return cuts
+
+
+def _tool_call_content_spans(reply, tail, track_spans=True):
+    """parse_tool_calls' content derivation as `(content, box_map, content_map)`, both maps
+    in `reply`'s own coordinates.
+
+    Every step is a deletion or a slice, so the whole derivation is one composed map. The
+    steps are applied in order and composed in the same order, because each step's cuts are
+    found in the text the previous step produced. `box_map` stops after the tool-call
+    removals, which is what tells a character consumed as tool-call syntax apart from one
+    consumed as thinking markup.
+
+    Both maps are None for inkling, whose marker stripping is not modelled here: an inkling
+    engine does not support the numeric logprobs channel, so no logprobs object can reach
+    this text to be aligned. They are also None when `track_spans` is off, which is how a
+    request that never asked for logprobs skips composing them.
+
+    The per-step survivor lists `_apply_cuts` returns are not gated, because they are the
+    deletion itself -- the text is built by slicing them -- rather than a map kept for a
+    later reader. Only the composition and the exported maps are optional."""
+    def chain(previous, step):
+        return previous and track_spans and _compose_span_maps(previous, step)
+
+    cuts = [(match.start(), match.end()) for match in _BOX_RE.finditer(reply)]
+    text, box_map = _apply_cuts(reply, cuts)
+    if tail is not None:                       # drop the recovered tail from the visible content
+        text, step = _apply_cuts(text, [(text.rindex(BOX_START), len(text))])
+        box_map = chain(box_map, step)
+    content_map = box_map
+    if ARCH == "inkling":
+        text = strip_inkling_markers(text)   # thinking is reasoning, not answer
+        box_map = content_map = None
+    if THINK_CLOSE in text:
+        text, step = _apply_cuts(text, [(0, text.index(THINK_CLOSE) + len(THINK_CLOSE))])
+        content_map = chain(content_map, step)
+    for marker in (THINK_OPEN, THINK_CLOSE):
+        text, step = _apply_cuts(text, _marker_cuts(text, marker))
+        content_map = chain(content_map, step)
+    stripped = text.strip()
+    head = len(text) - len(text.lstrip())
+    text, step = _apply_cuts(text, [(0, head), (head + len(stripped), len(text))])
+    content_map = chain(content_map, step)
+    if not track_spans:
+        return text, None, None
+    return text, box_map, content_map
+
+
 def parse_tool_calls(reply, tools=None):
     """Return (content, tool_calls). Strict GLM parse; optional de-mangler (COLI_TOOL_SALVAGE=1)
     rescues malformed int4 output by mapping a lone payload onto the tool's primary parameter."""
+    content, calls, _box_map, _content_map = _parse_tool_calls(reply, tools, False)
+    return content, calls
+
+
+def parse_tool_calls_spans(reply, tools=None):
+    """parse_tool_calls plus the tool-call stage's maps."""
+    return _parse_tool_calls(reply, tools, True)
+
+
+def _parse_tool_calls(reply, tools, track_spans):
+    """The parse itself: `(content, tool_calls, box_map, content_map)`. One implementation
+    behind both spellings, so the maps cannot drift from the text they describe."""
     param_order = _tool_param_order(tools)
     param_types = _tool_param_types(tools)
     calls, salvaged = [], []
@@ -527,14 +742,7 @@ def parse_tool_calls(reply, tools=None):
         sys.stderr.write("[api] tools declared and tool-call markers present, but no call "
                          "parsed -- output may be quantization-mangled; try COLI_TOOL_SALVAGE=1\n")
         sys.stderr.flush()
-    text = _BOX_RE.sub("", reply)
-    if tail is not None:                       # drop the recovered tail from the visible content
-        text = text[:text.rindex(BOX_START)]
-    if ARCH == "inkling":
-        text = strip_inkling_markers(text)   # thinking is reasoning, not answer
-    if THINK_CLOSE in text:
-        text = text.split(THINK_CLOSE, 1)[1]
-    text = text.replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
+    text, box_map, content_map = _tool_call_content_spans(reply, tail, track_spans)
     if calls:
         dm, rec = len(salvaged), (1 if tail is not None else 0)
         sys.stderr.write("[api] tool-calls: %d total, %d strict, %d unclosed-recovered, "
@@ -543,7 +751,7 @@ def parse_tool_calls(reply, tools=None):
                             "CLEAN" if dm == 0 and rec == 0 else "RECOVERED",
                             (" -> " + ", ".join(salvaged)) if dm else ""))
         sys.stderr.flush()
-    return text.strip(), calls
+    return text, calls, box_map, content_map
 
 
 # ---- DeepSeek V4 tool calling (DSML) -------------------------------------------------------
@@ -705,18 +913,36 @@ def parse_dsv41_tool_calls(reply):
 
 def parse_arch_tool_calls(reply, tools, tool_reply=None):
     """Architecture-appropriate tool-call parser. Returns (content, tool_calls)."""
+    content, calls, _box_map, _content_map = _parse_arch_tool_calls(
+        reply, tools, tool_reply, False)
+    return content, calls
+
+
+def parse_arch_tool_calls_spans(reply, tools, tool_reply=None):
+    """parse_arch_tool_calls plus the tool-call stage's maps."""
+    return _parse_arch_tool_calls(reply, tools, tool_reply, True)
+
+
+def _parse_arch_tool_calls(reply, tools, tool_reply, track_spans):
+    """parse_arch_tool_calls plus the tool-call stage's maps: `(content, tool_calls,
+    box_map, content_map)`.
+
+    Only the glm/default parser reports maps; the others return None for both. A request
+    that opted into the numeric logprobs channel is refused with a named 400 on any other
+    architecture, so no reply reaching those branches can carry a logprobs object for a
+    map to align."""
     if ARCH == "deepseek_v4":
-        return parse_dsv4_tool_calls(reply)
+        return parse_dsv4_tool_calls(reply) + (None, None)
     if ARCH == "deepseek_v41":
-        return parse_dsv41_tool_calls(reply)
+        return parse_dsv41_tool_calls(reply) + (None, None)
     if ARCH == "kimi":
         if tool_reply is not None:
             _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
-            return reply.strip(), calls
-        return parse_k3_tool_calls(reply, tools)  # compatibility with pre-#1147 engines
+            return reply.strip(), calls, None, None
+        return parse_k3_tool_calls(reply, tools) + (None, None)  # pre-#1147 engines
     if ARCH == "qwen38":
-        return parse_qwen38_tool_calls(reply, tools)
-    return parse_tool_calls(reply, tools)
+        return parse_qwen38_tool_calls(reply, tools) + (None, None)
+    return _parse_tool_calls(reply, tools, track_spans)
 
 
 def _tool_stream_markers():
@@ -2650,10 +2876,18 @@ def starts_in_reasoning(enable_thinking, add_generation_prompt=True):
 
 
 class ThinkingStreamSplit:
-    """Split GLM's reasoning marker without leaking markers across stream chunks."""
+    """Split GLM's reasoning marker without leaking markers across stream chunks.
+
+    `thinking_spans` and `text_spans` are this stage's maps, in its own input's
+    coordinates. Every character is routed to exactly one bucket or is marker syntax
+    routed to neither, and which bucket decides which array a token record belongs to.
+
+    Like the stop filter's map they are built only when `track_spans` is set, so a request
+    that never asked for per-token logprobs pays for none of this."""
     MARKERS = (THINK_OPEN, THINK_CLOSE)
 
-    def __init__(self, on_thinking, on_text, on_thinking_end=None, initial_thinking=True):
+    def __init__(self, on_thinking, on_text, on_thinking_end=None, initial_thinking=True,
+                 track_spans=False):
         self.on_thinking = on_thinking
         self.on_text = on_text
         self.on_thinking_end = on_thinking_end
@@ -2662,10 +2896,23 @@ class ThinkingStreamSplit:
         # the splitter must start in text mode or it would file the whole answer as reasoning.
         self.thinking = initial_thinking
         self.buf = ""
+        self.track_spans = track_spans
+        self.thinking_spans = []
+        self.text_spans = []
+        self.consumed = 0                 # input characters resolved, marker or not
 
     def _emit(self, text):
         if text:
             (self.on_thinking if self.thinking else self.on_text)(text)
+        if not self.track_spans:
+            return
+        if text:
+            spans = self.thinking_spans if self.thinking else self.text_spans
+            _append_span(spans, self.consumed, self.consumed + len(text),
+                         spans[-1][2] + (spans[-1][1] - spans[-1][0]) if spans else 0)
+        # Every emitted run is a prefix of `buf`, so the run's input start is always
+        # `consumed` and advancing it here keeps that true for the next one.
+        self.consumed += len(text)
 
     def feed(self, chunk):
         self.buf += chunk
@@ -2676,6 +2923,8 @@ class ThinkingStreamSplit:
                 offset, marker = min(hits, key=lambda hit: hit[0])
                 self._emit(self.buf[:offset])
                 self.buf = self.buf[offset + len(marker):]
+                if self.track_spans:
+                    self.consumed += len(marker)  # the marker itself reaches neither bucket
                 if marker == THINK_CLOSE and self.thinking:
                     self.thinking = False
                     if self.on_thinking_end:
@@ -2701,13 +2950,28 @@ class ThinkingStreamSplit:
 
 def split_thinking_reply(text, enable_thinking=True, add_generation_prompt=True):
     """Return the marker-free (thinking, answer) portions of one GLM reply."""
+    thinking, answer, _spans = _split_thinking(text, enable_thinking, False,
+                                               add_generation_prompt)
+    return thinking, answer
+
+
+def split_thinking_reply_spans(text, enable_thinking=True, add_generation_prompt=True):
+    """split_thinking_reply plus the split's maps: `(thinking, answer, (thinking_map,
+    answer_map))`, both in `text`'s own coordinates."""
+    return _split_thinking(text, enable_thinking, True, add_generation_prompt)
+
+
+def _split_thinking(text, enable_thinking, track_spans, add_generation_prompt=True):
+    """The split itself. One implementation behind both spellings, so the maps can never
+    describe a different routing than the text they came with."""
     thinking, answer = [], []
     split = ThinkingStreamSplit(thinking.append, answer.append,
                                 initial_thinking=starts_in_reasoning(enable_thinking,
-                                                                     add_generation_prompt))
+                                                                     add_generation_prompt),
+                                track_spans=track_spans)
     split.feed(text)
     split.finish()
-    return "".join(thinking), "".join(answer)
+    return "".join(thinking), "".join(answer), (split.thinking_spans, split.text_spans)
 
 
 def _anthropic_block_text(blocks, param):
@@ -2955,8 +3219,14 @@ def stop_policy(body, chat):
 
 
 class StopFilter:
-    """Stream text without exposing a full or partial stop sequence."""
-    def __init__(self, sequences, emit, ignore_leading=False):
+    """Stream text without exposing a full or partial stop sequence.
+
+    `spans` is this stage's map: the intervals of the raw stream -- the concatenation of
+    everything ever fed -- that reached `emit`, each with where it landed in the emitted
+    text. It is built only when `track_spans` is set, and the thinking split and the
+    tool-call parse are gated the same way, so a request that never asked for per-token
+    logprobs has no stage compose or retain a map for it."""
+    def __init__(self, sequences, emit, ignore_leading=False, track_spans=False):
         self.sequences = tuple(sequences)
         self.emit = emit
         self.ignore_leading = ignore_leading
@@ -2964,10 +3234,19 @@ class StopFilter:
         self.matched = None
         self.useful_content_seen = False
         self.leading_matches_ignored = 0
+        self.track_spans = track_spans
+        self.spans = []
+        # Raw offset of self.pending[0], equivalently of feed()'s `text[0]`. Everything the
+        # filter drops is accounted for by advancing this without emitting.
+        self.raw_base = 0
+        self.emitted = 0
 
-    def _emit(self, text):
+    def _emit(self, text, raw_start):
         if text:
             self.emit(text)
+            if self.track_spans:
+                _append_span(self.spans, raw_start, raw_start + len(text), self.emitted)
+            self.emitted += len(text)
             if text.strip():
                 self.useful_content_seen = True
 
@@ -2975,6 +3254,7 @@ class StopFilter:
         if self.matched is not None:
             return
         text = self.pending + chunk
+        base = self.raw_base
         self.pending = ""
         while True:
             match = None
@@ -2991,11 +3271,16 @@ class StopFilter:
                     and not prefix.strip()):
                 self.leading_matches_ignored += 1
                 text = text[offset + len(sequence):]
+                # The ignored marker and the blank prefix in front of it never reach the
+                # client, so no span covers them and a record inside one resolves to
+                # "not emitted" instead of derailing the alignment.
+                base += offset + len(sequence)
                 if not text:
+                    self.raw_base = base
                     return
                 continue
             self.matched = sequence
-            self._emit(prefix)
+            self._emit(prefix, base)
             return
 
         hold = 0
@@ -3006,12 +3291,13 @@ class StopFilter:
                 hold = size
         flush = len(text) - hold
         if flush:
-            self._emit(text[:flush])
+            self._emit(text[:flush], base)
         self.pending = text[flush:]
+        self.raw_base = base + flush
 
     def finish(self):
         if self.matched is None and self.pending:
-            self._emit(self.pending)
+            self._emit(self.pending, self.raw_base)
         self.pending = ""
 
     def stopped(self):
@@ -3088,8 +3374,6 @@ def generation_options(body, limit):
         if choice != "none" and not (body.get("tools") or body.get("functions")):
             raise APIError(400, "`tool_choice` requires `tools`.", "tool_choice", "invalid_value")
     stop_sequences = parse_stop_sequences(body)
-    if body.get("logprobs"):
-        raise APIError(400, "Log probabilities are not supported yet.", "logprobs", "unsupported_parameter")
     if body.get("frequency_penalty", 0) or body.get("presence_penalty", 0):
         raise APIError(400, "Token penalties are not supported yet.", None, "unsupported_parameter")
     # `seed` is accepted for request-shape compatibility and silently discarded:
@@ -3163,6 +3447,494 @@ def generation_options(body, limit):
             not math.isfinite(top_p) or not 0 < top_p <= 1):
         raise APIError(400, "`top_p` must be greater than 0 and at most 1.", "top_p")
     return maximum, float(temperature), float(top_p), grammar, stop_sequences
+
+
+# The per-token top-k emission cap the engine's numeric logprobs channel (the SUBMIT
+# `logprobs=` key) supports, mirrored in c/decode_batch.h as COLI_SUBMIT_TOPK_MAX. The
+# public request range is bound to exactly that interface: 1..32, a named 400 above it.
+LOGPROBS_TOP_K_CAP = 32
+
+
+def logprobs_options(body, chat, engine_supports):
+    """Validate the request's logprobs/echo/top_logprobs fields and translate them into
+    `(engine_k, echo, display_k)`.
+
+    - `engine_k` is the SUBMIT `logprobs=` value to send; 0 leaves the per-token numeric
+      channel off entirely, so no ECHO or extended DATA frames are emitted.
+    - `echo` is whether the response includes the prompt-echo positions. Chat has no echo
+      concept, so it is always False there and `echo: true` on chat is a named 400.
+    - `display_k` is how many `top_logprobs` alternatives the client asked to see, 0 to
+      LOGPROBS_TOP_K_CAP. It can be lower than `engine_k` when a chat request asks for
+      logprobs with `top_logprobs: 0`.
+
+    Completions' `logprobs` is the legacy integer top-k count; chat's is a boolean gate
+    plus a separate `top_logprobs` count. Each endpoint takes its own shape and refuses
+    the other's by name.
+
+    `null`, `false` and `0` all normalise to absent and are never errors: on completions
+    the request then succeeds with `choices[].logprobs: null`, and on chat `true` for
+    `logprobs` is the only value that opens the gate. `top_logprobs` is type- and
+    range-checked even when `logprobs` is off, so a malformed value is never silently
+    ignored because a sibling field made it moot; a valid one with `logprobs` off is a
+    documented no-op. `top_logprobs` is not read at all on completions, where it is not
+    part of the request shape.
+
+    `echo: true` with no active `logprobs` request is a named 400 rather than a silent
+    no-op: the prompt echo is built out of the engine's per-token records, so without them
+    there is nothing to echo, and a 200 that quietly drops a requested field is the shape
+    this surface exists to stop."""
+    def _require_logprobs_for_echo(wanted):
+        if wanted:
+            raise APIError(400, "`echo` requires `logprobs`.", "echo",
+                           "unsupported_parameter")
+
+    echo = body.get("echo", False)
+    if echo is None:
+        echo = False                              # null == absent, same as `logprobs`
+    if not isinstance(echo, bool):
+        raise APIError(400, "`echo` must be a boolean.", "echo", "invalid_value")
+    if chat:
+        if echo:
+            raise APIError(400, "`echo` is not supported for chat completions.",
+                           "echo", "unsupported_parameter")
+        logprobs = body.get("logprobs", False)
+        if logprobs is None:
+            logprobs = False                      # null == absent == no logprobs
+        if not isinstance(logprobs, bool):
+            raise APIError(400, "`logprobs` must be a boolean.", "logprobs", "invalid_value")
+        display_k, param = body.get("top_logprobs", 0), "top_logprobs"
+        if display_k is None:
+            display_k = 0                         # null == absent, same as `logprobs`
+    else:
+        logprobs = body.get("logprobs")
+        if logprobs is None or logprobs is False:
+            _require_logprobs_for_echo(echo)
+            return 0, False, 0
+        display_k, param = logprobs, "logprobs"
+    if (isinstance(display_k, bool) or not isinstance(display_k, int) or
+            not 0 <= display_k <= LOGPROBS_TOP_K_CAP):
+        raise APIError(400, f"`{param}` must be an integer between 0 and "
+                            f"{LOGPROBS_TOP_K_CAP}.", param, "invalid_value")
+    if chat and not logprobs:
+        return 0, False, 0     # top_logprobs validated above; logprobs off is still a no-op
+    if not chat and display_k == 0:
+        _require_logprobs_for_echo(echo)
+        return 0, False, 0                        # 0 = no logprobs, documented
+    if not engine_supports:
+        # A sender-side capability gate: these endpoints request the numeric per-token
+        # channel only from an engine this server has pinned for it, and refusing before
+        # generate() builds the extension header keeps a rejected-SUBMIT payload drain
+        # unreachable. The message names the gate that refused, not the engine's arch.
+        raise APIError(400, "Log probabilities are not requested from this engine by "
+                            "these endpoints.", "logprobs", "unsupported_parameter")
+    return max(1, display_k), echo, display_k
+
+
+def _json_float(value):
+    """A logprob the engine's numeric channel emits as nan/inf/-inf must serialise as JSON
+    `null`, never the invalid-JSON literals json.dumps would otherwise write and never
+    clamped to a made-up finite number."""
+    return value if math.isfinite(value) else None
+
+
+def _order_echo_records(prompt_records):
+    """Place each prompt-echo record at its own wire `pos` index rather than trusting the
+    order the frames arrived in, and return `(payload bytes, record)` pairs -- the same
+    shape generated-token records already arrive in.
+
+    A duplicate, negative, out-of-range or (by pigeonhole) missing position among the N
+    records that must fill slots 0..N-1 raises RuntimeError, the class every other
+    malformed-engine-output path here raises. One shape is told apart from that: a
+    contiguous run starting above 0, which is what a pin snapshot produces rather than a
+    malformed engine. That raises EchoPrefixPinned, which the caller answers by name."""
+    positions = [record["pos"] for record in prompt_records]
+    if (positions and all(isinstance(p, int) and not isinstance(p, bool)
+                          for p in positions)
+            and sorted(positions) == list(range(min(positions),
+                                                min(positions) + len(positions)))
+            and min(positions) > 0):
+        raise EchoPrefixPinned(min(positions))
+    ordered = [None] * len(prompt_records)
+    for record in prompt_records:
+        pos = record["pos"]
+        if (not isinstance(pos, int) or isinstance(pos, bool)
+                or not 0 <= pos < len(ordered) or ordered[pos] is not None):
+            raise RuntimeError(
+                f"invalid engine ECHO position {pos!r} (expected each of "
+                f"0..{len(ordered) - 1} exactly once, got {len(prompt_records)} records)")
+        ordered[pos] = (record["bytes"], record)
+    return ordered
+
+
+def _generated_record_texts(generated_records):
+    """Each generated record's own decoded text, from one stateful incremental UTF-8
+    decoder over the generated sequence alone, with the trailing flush landing on the last
+    record.
+
+    This is the decode the engine's `on_text` callback performed while the stop filter was
+    watching -- same bytes, same fresh decoder, same final flush -- so the running sum of
+    these lengths is the raw-stream character coordinate the filter's span map is expressed
+    in. Nothing else may be used to derive record spans."""
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    texts = [decoder.decode(data) for data, _record in generated_records]
+    tail = decoder.decode(b"", final=True)
+    if tail and texts:
+        texts[-1] += tail
+    return texts
+
+
+def _echo_decoded_texts(prompt_records, generated_records):
+    """`(prompt texts, generated texts)` from a single stateful incremental UTF-8 decoder
+    spanning both halves, prompt-echo positions first.
+
+    A codepoint can arrive split across the prompt/generated seam: its leading byte on the
+    last echo frame, its continuation bytes on the first data frame. One decoder spanning
+    both resolves that into one character; two independent decodes turn each half into
+    replacement characters, and `text` and `text_offset` then disagree about how long that
+    character is. This is therefore not the same decode as _generated_record_texts: the
+    span map is counted in that function's coordinates, while these texts are what the
+    echo reconstruction shows."""
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    prompt_texts = [decoder.decode(data) for data, _record in _order_echo_records(prompt_records)]
+    generated_texts = [decoder.decode(data) for data, _record in generated_records]
+    tail = decoder.decode(b"", final=True)
+    if tail:
+        if generated_texts:
+            generated_texts[-1] += tail
+        elif prompt_texts:
+            prompt_texts[-1] += tail
+    return prompt_texts, generated_texts
+
+
+def _logprob_positions(prompt_records, generated_records, texts=None):
+    """Merge prompt-echo and generated-token records into one ordered list of
+    `{"text", "raw_lp", "topk", "bytes"}` dicts: echoed positions first, reassembled by
+    wire `pos`, then generated tokens in emission order.
+
+    `texts` supplies each position's text when the caller already decoded them -- the
+    response path has, because it needs the generated half truncated to what the stop
+    filter emitted. `bytes` always stays that frame's own raw payload regardless of what
+    text, if any, it decoded to."""
+    raw = _order_echo_records(prompt_records)
+    raw += generated_records
+    if texts is None:
+        prompt_texts, generated_texts = _echo_decoded_texts(prompt_records, generated_records)
+        texts = prompt_texts + generated_texts
+    return [{"text": text, "raw_lp": record["lp"], "topk": record["topk"], "bytes": data}
+            for (data, record), text in zip(raw, texts)]
+
+
+def _own_token_label(entry, topk, idx):
+    """The label for one top-k candidate: the position's own text when the candidate is
+    the chosen token, otherwise `<token_id:N>`.
+
+    The wire's top-k table carries raw candidate token ids and no decoded text, and there
+    is no server-side tokenizer. The one candidate that can be labelled without decoding is
+    the position's own chosen token: its table entry and its `lp` come from the same
+    computation, so an exact float match identifies it without comparing token ids.
+
+    The engine prints logprobs to six decimal digits, so two candidates can legitimately
+    share the chosen token's printed value. With no id to break the tie, only the first
+    table entry in wire order whose value matches is labelled as the chosen token; a later
+    match is labelled by its raw id like any other unidentified candidate. The table is
+    unsorted on the wire, so this never assumes the first entry is the argmax."""
+    tid, tlp = topk[idx]
+    if tlp != entry["raw_lp"]:
+        return f"<token_id:{tid}>"
+    if any(topk[j][1] == entry["raw_lp"] for j in range(idx)):
+        return f"<token_id:{tid}>"
+    return entry["text"]
+
+
+def _refuse_duplicate_candidate(label, seen, requested, param):
+    """Refuse a top-k table that repeats a label within one position.
+
+    The two response shapes would answer it differently: the legacy completions
+    `top_logprobs` is a JSON object, so the second entry overwrites the first and the
+    client silently receives fewer candidates than the engine supplied, while chat's
+    `content[].top_logprobs` is a list and keeps both. Refused on both surfaces, because a
+    client cannot tell the two apart from the outside.
+
+    `engine_duplicate_logprob_candidate` describes the table the engine sent rather than
+    this function's reaction to it. `param` is the caller's own parameter -- `logprobs` on
+    legacy completions, `top_logprobs` on chat -- so a client branching on the code is told
+    which of its fields is unanswerable."""
+    if label in seen:
+        raise APIError(
+            500, f"The colibri engine sent a top-k table carrying the duplicate "
+                 f"candidate {label!r} at a single position ({requested} "
+                 f"requested).", param, "engine_duplicate_logprob_candidate",
+            "server_error")
+    seen.add(label)
+
+
+def _completions_logprobs_object(prompt_records, generated_records, display_k, texts=None):
+    """Build the legacy `/v1/completions` `logprobs` object: `tokens[]`,
+    `token_logprobs[]`, `top_logprobs[]` (one dict per position, keyed by token text) and
+    `text_offset[]` (character offsets into the reconstructed text, counted from 0).
+
+    The first prompt position's `token_logprobs` entry comes out null because the engine's
+    own echo position 0 carries a non-finite sentinel -- there is nothing to condition the
+    first token on. `texts` is each position's text when the caller already has it, and
+    `text_offset` is counted from those same strings, so the offsets always index the text
+    this object's own `tokens` join to."""
+    positions = _logprob_positions(prompt_records, generated_records, texts)
+    tokens = [p["text"] for p in positions]
+    token_logprobs = [_json_float(p["raw_lp"]) for p in positions]
+    top_logprobs = []
+    for p in positions:
+        table = {}
+        displayed = p["topk"][:display_k]
+        seen = set()
+        for idx, (tid, tlp) in enumerate(displayed):
+            label = _own_token_label(p, displayed, idx)
+            _refuse_duplicate_candidate(label, seen, len(displayed), "logprobs")
+            table[label] = _json_float(tlp)
+        top_logprobs.append(table)
+    text_offset = []
+    offset = 0
+    for text in tokens:
+        text_offset.append(offset)
+        offset += len(text)
+    return {"tokens": tokens, "token_logprobs": token_logprobs,
+            "top_logprobs": top_logprobs, "text_offset": text_offset}
+
+
+def _chat_logprobs_content(generated_records, display_k, texts=None):
+    """Build chat completions' `choices[].logprobs.content[]`: one
+    `{token, logprob, bytes, top_logprobs}` entry per generated token, each alternative a
+    `{token, logprob, bytes}`. Chat has no echo concept, so records are used in emission
+    order.
+
+    Every record's text is decoded first, in one pass, including the final flush, before
+    any entry is built: building entries interleaved with decoding would let the last
+    entry's `token` gain the flushed text while its own candidate label stayed stale.
+    `texts` supplies each entry's token text when the caller already has it -- the chat
+    path passes the text each record contributed to `message.content`, which is a slice of
+    that record's own decoding wherever a stop, a thinking split or a tool-call parse cut
+    through the middle of a token."""
+    if texts is None:
+        texts = _generated_record_texts(generated_records)
+    content = []
+    for (data, record), text in zip(generated_records, texts):
+        entry = {"text": text, "raw_lp": record["lp"], "topk": record["topk"]}
+        alternatives = []
+        displayed = record["topk"][:display_k]
+        seen = set()
+        for idx, (tid, tlp) in enumerate(displayed):
+            label = _own_token_label(entry, displayed, idx)
+            _refuse_duplicate_candidate(label, seen, len(displayed), "top_logprobs")
+            alternatives.append({"token": label, "logprob": _json_float(tlp),
+                                 "bytes": list(data) if label == text else None})
+        content.append({"token": text, "logprob": _json_float(record["lp"]),
+                        "bytes": list(data), "top_logprobs": alternatives})
+    return content
+
+
+def _records_cover_stream(generated_records, text, span_map):
+    """True when the generated records account for the whole raw stream the filter emitted
+    from -- the question every logprobs-bearing response must answer before its arrays may
+    claim to describe the text.
+
+    Both sides are character counts in raw-stream coordinates. The records' extent is the
+    running sum _generated_record_texts() produces, which is the coordinate system the span
+    map is expressed in; the filter's reach is the far end of that map. No decoded string
+    is compared against another anywhere here, which is what keeps a legitimately
+    transformed text -- an unflushed decoder, or the echo reconstruction's own seam decode
+    -- from reading as a gap and turning a working request into a 500.
+
+    `text` is read only when the map is empty, where it is the one thing that tells
+    "nothing was emitted" apart from "nothing was recorded". `span_map` takes no default: a
+    degenerate "assume everything was emitted" arm here would be unreachable and therefore
+    untested, which is the worst thing a safety check can contain.
+
+    No records at all is a gap like any other whenever text was emitted: the arrays would
+    describe nothing while the response carries a completion. It is only vacuously covered
+    when nothing was emitted either."""
+    extent = sum(len(piece) for piece in _generated_record_texts(generated_records))
+    if not span_map:
+        # Not vacuously true: an empty map means either that nothing was emitted -- and
+        # `text` is then empty too -- or that a filter was built without `track_spans`
+        # while text was emitted. `text` tells the two apart.
+        return not text
+    # Every span, not just the last: a map can carry a hole, and a run that ends inside the
+    # records while an earlier one runs past them is still a gap.
+    return all(high <= extent for _low, high, _out in span_map)
+
+
+def _align_generated_records(generated_records, text, span_map, display_texts=None):
+    """Locate every generated-token record in `text` by raw-stream span and return
+    `(data, record, emitted_text)` for each record that contributed at least one character
+    to it, in `text` order, which is also record order.
+
+    `span_map` is the composed map from raw-stream coordinates to `text`'s: the stop
+    filter's `spans` alone when `text` is the stop-filtered stream, or that chained with
+    the thinking split's and the tool-call parse's when `text` is `message.content`. Each
+    record occupies `[sum(len(decoded_j) for j < k), + len(decoded_k))`, and where that
+    lands is a lookup rather than a prefix match of decoded bytes against a string the
+    stage has already rewritten.
+
+    A record whose span is fully inside the map is kept whole; fully outside, dropped;
+    partially inside, kept with the characters that were emitted. A kept record's `data` is
+    narrowed to the bytes of the characters it reports whenever it was truncated, so
+    `bytes` can never describe more than `token`.
+
+    `display_texts` is the echo reconstruction's own decode, where the generated half is
+    decoded by the decoder that already consumed the prompt bytes. A record that survives
+    whole reports that reading directly; a record that is both cut and straddling has the
+    real character spliced back onto the raw-stream slice, which is exact because the two
+    decodes differ only over that leading run. A cut falling inside the straddling
+    codepoint itself has no right answer, and keeps the raw slice.
+
+    `span_map` takes no default; None means "every character of `text` was emitted, from
+    the start of the stream", which a caller with no filter in front of it must ask for
+    rather than fall into."""
+    if span_map is None:
+        span_map = [(0, len(text), 0)] if text else []
+    texts = _generated_record_texts(generated_records)
+    aligned, offset = [], 0
+    for index, (data, record) in enumerate(generated_records):
+        piece = texts[index]
+        start, offset = offset, offset + len(piece)
+        if not piece:
+            # A frame that only completes a pending codepoint decodes to "" and owns no
+            # span, so its fate is that of the character its bytes went into. Testing the
+            # position instead keeps the entry even when that character was deleted.
+            if _project_span(span_map, start, start + 1):
+                aligned.append((data, record, ""))
+            continue
+        image = _project_span(span_map, start, offset)
+        if image is None:
+            continue
+        kept = image[1] - image[0]
+        emitted = text[image[0]:image[1]]
+        alternate = display_texts[index] if display_texts is not None else piece
+        if alternate != piece:
+            if kept == len(piece):
+                # Survived whole: the seam decode is this record's text. Continuation
+                # bytes that complete nothing give `alternate == ""`, which is right.
+                emitted = alternate
+            else:
+                # Cut and straddling: the raw-stream decode opens with `head` replacement
+                # characters where the seam decode has one real one, agreeing from there
+                # on. Splice it back only where that is exact.
+                head = len(piece) - len(alternate) + 1
+                if kept >= head and _project_span(span_map, start, start + kept) == image:
+                    emitted = alternate[:1] + emitted[head:]
+        if emitted != piece:
+            # `bytes` must never describe more than `token`, so a truncated entry carries
+            # the bytes it reports; an untruncated one keeps the frame's own payload.
+            data = emitted.encode("utf-8")
+        aligned.append((data, record, emitted))
+    return aligned
+
+
+def _completion_choice_fields(stats, *, raw_text, text, chat, engine_k, echo, display_k,
+                              prompt_echoes, stop_spans, content_spans, cache_slot):
+    """The stop/trim/echo/logprobs tail every non-streaming completion shares, in one
+    place. Returns `(text, logprobs_obj, finish_reason)`.
+
+    Callers differ only in what they do before this point -- the inkling split, the
+    thinking split, the tool-call parse and the tool sideband. After it they differ in
+    nothing, so the stop/trim/echo interaction exists here once instead of once per
+    completion shape.
+
+    `raw_text` is the pre-split, pre-tool-parse text the stop filter emitted; `text` is
+    what the caller intends to return, after whichever splits it applies. They are the same
+    string when no split fired. `chat` selects the chat `content`/`refusal` shape over the
+    legacy completions object; `engine_k`, `echo` and `display_k` come from
+    logprobs_options(). `prompt_echoes` is the echo records the caller collected through
+    its own `on_echo` sink. `cache_slot` is carried only so a pinned prefix can be named in
+    the one error that reports it.
+
+    `stop_spans` is the stop filter's own map, raw stream to `raw_text`; `content_spans` is
+    `(target text, composed map)` chaining it onward to the string the arrays must describe
+    -- `message.content` on the chat path -- or None when no further stage can vouch for
+    one. Every parameter but `stats` is keyword-only, and the span parameters take no
+    default: `raw_text` and `text` are same-typed neighbours whose transposition is silent,
+    and a defaulted span would leave whichever call site forgot to pass one on unaligned
+    behaviour while the other was fixed.
+
+    This holds no state between calls. Every incremental decoder involved is created per
+    call and the span maps arrive as arguments, so a caller that assembles several
+    completions in a row cannot carry one's trailing partial codepoint or coordinates into
+    the next.
+
+    `finish_reason` is the engine's own length/stop reason; a caller that can finish for a
+    reason of its own overrides it."""
+    finish_reason = "length" if stats["length_limited"] else "stop"
+    logprobs_obj = None
+    if engine_k:
+        channel = stats.get("logprobs") or {"generated": []}
+        prompt_records = prompt_echoes if echo else []
+        target, target_spans = ((content_spans[0], content_spans[1]) if content_spans
+                                else (raw_text, stop_spans))
+        # The arrays describe the WHOLE text on every shape that carries them, not only
+        # the one that rebuilds `text` out of them: short records, or none at all, would
+        # otherwise ship a 200 whose arrays describe a prefix and say nothing about it.
+        if not _records_cover_stream(channel["generated"], target, target_spans):
+            raise APIError(
+                500, "The colibri engine sent per-token logprob records that do not "
+                     "cover the generated text, so the logprobs arrays would describe "
+                     "only part of it.", "echo" if echo else "logprobs",
+                "engine_logprob_records_incomplete", "server_error")
+        if echo and not prompt_records:
+            # An engine that sends the generated records and no ECHO frames has answered
+            # half the opt-in, and the prompt echo is the half `echo` asked for.
+            raise APIError(
+                500, "The colibri engine sent no prompt-echo records, so `echo` "
+                     "cannot be answered for this prompt.", "echo",
+                "engine_logprob_records_incomplete", "server_error")
+        try:
+            prompt_texts, seam_texts = _echo_decoded_texts(prompt_records,
+                                                           channel["generated"])
+        except EchoPrefixPinned as pinned:
+            # The engine's own state, not a bad request and not a broken engine: this slot
+            # holds a pin snapshot covering the first `prefix` tokens, which the prefill
+            # never reads out, so `echo` cannot be answered in full for this prompt.
+            raise APIError(
+                503, f"The colibri engine cannot echo this prompt: KV slot "
+                     f"{cache_slot} holds a pinned prefix of {pinned.prefix} "
+                     f"token(s), which the prefill does not read out, so the "
+                     f"echoed positions would start at {pinned.prefix} rather "
+                     f"than 0.", "echo", "engine_pinned_prefix_not_echoed",
+                "server_error") from None
+        aligned = _align_generated_records(channel["generated"], target, target_spans,
+                                           display_texts=seam_texts if echo else None)
+        generated = [(data, record) for data, record, _emitted in aligned]
+        emitted_texts = [emitted for _data, _record, emitted in aligned]
+        if chat:
+            logprobs_obj = {"content": _chat_logprobs_content(generated, display_k,
+                                                              texts=emitted_texts),
+                            "refusal": None}
+        else:
+            logprobs_obj = _completions_logprobs_object(
+                prompt_records, generated, display_k, texts=prompt_texts + emitted_texts)
+        if not chat and echo:
+            # The legacy shape concatenates the prompt and the completion in `text` when
+            # `echo` is true and `text_offset` indexes that concatenation, so `text` is
+            # rebuilt from the reconstruction the offsets are counted from rather than
+            # from two independently decoded halves.
+            text = "".join(logprobs_obj["tokens"])
+    return text, logprobs_obj, finish_reason
+
+
+def _engine_extension_args(engine_k):
+    """The `Engine.generate()` keyword arguments that carry this request's SUBMIT
+    extension, built once from the parsed options and spread at each call site.
+
+    An empty mapping when nothing was requested, which is what keeps a plain request's
+    header byte-identical to one built with no extension at all. When the channel is
+    requested it also asks for the seventh numeric field, which coli_submit_parse expects
+    before the first key=value token.
+
+    That is this helper's decision for THESE endpoints, not a property of the request
+    builder. `gbytes_before_ext` is a per-call-site parameter, and the other caller that
+    sends an extension key -- /v1/brio -- does not pass it and keeps the header it has
+    always sent; changing that endpoint's wire is not this change's to make."""
+    if not engine_k:
+        return {}
+    return {"logprobs": engine_k, "gbytes_before_ext": True}
 
 
 def read_engine_turn(stream, sentinel, on_bytes):
@@ -3401,6 +4173,28 @@ def _write_all(stream, data, frame):
         written += sent
 
 
+class _Pending:
+    """One in-flight engine request: the queue its frames are delivered on, whether it asked
+    for the per-token numeric channel, and any fault the dispatcher has recorded against it.
+
+    The dispatcher parses a frame's numeric tail only for a request that asked for it, so a
+    frame carrying fields a request never requested is tolerated exactly as it was before
+    the channel existed, and a fault in one request's frames can only fail that request.
+
+    `failed` is how that stays true without abandoning the engine's turn. The entry is kept
+    rather than dropped: the request's later frames are routed here and discarded, and the
+    error is delivered on its terminal frame, so the thread holding the scheduler admission
+    keeps holding it until the engine says the turn is over. Dropping the entry instead
+    would free the admission while the engine is still generating, and the next request
+    would submit into a pipe nobody is reading."""
+    __slots__ = ("events", "logprob_channel", "failed")
+
+    def __init__(self, logprob_channel=False):
+        self.events = queue.Queue()
+        self.logprob_channel = logprob_channel
+        self.failed = None
+
+
 class Engine:
     # cap=None = "not explicitly set": a glm-arch model's engine resolves the
     # 0 sentinel (8 historically, 1 on Metal+darwin+fast SSD -- colibri.c
@@ -3420,6 +4214,13 @@ class Engine:
         arch = family.id
         self.family = family
         self.model_dir = str(model)
+        # The extended SUBMIT namespace, gated once at launch rather than per request: an
+        # accepted-but-ignored opt-in is a silently wrong answer rather than an error. Two
+        # flags, not one -- the numeric logprobs/echo channel (`logprobs=`) and
+        # pre-tokenized token-id intake (`ids=`) are unrelated capabilities with separate
+        # coli_submit_ext keys, set from one arch check only because one engine has both.
+        self.supports_logprobs_echo = (arch == "glm")
+        self.supports_tok_ids = (arch == "glm")
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
@@ -3480,8 +4281,8 @@ class Engine:
         with self.pending_lock:
             requests = list(self.pending.values())
             self.pending.clear()
-        for events in requests:
-            events.put(("error", error))
+        for entry in requests:
+            entry.events.put(("error", error))
 
     def _write_frame(self, request_id, data, frame):
         """Checked server->engine protocol write for CANCEL/STOP: the write
@@ -3520,6 +4321,58 @@ class Engine:
             remaining -= len(chunk)
         return b"".join(chunks)
 
+    @staticmethod
+    def _parse_logprob_tail(fields, i):
+        """Parse the numeric tail an opted-in DATA/ECHO frame carries:
+        "<lp> <k> [<tid> <tlp>]*k".
+
+        float() reads the engine's numeric wire tokens directly, "nan"/"inf"/"-inf" and any
+        %g precision alike -- an echo's position 0 has nothing to condition on and carries
+        "nan 0". The table is unsorted on the wire, so callers must not assume the first
+        pair is the argmax. Every malformed shape -- a short or over-long field list,
+        non-numeric fields, an out-of-range k, or a negative token id -- is an APIError
+        carrying `engine_logprob_tail_malformed`, never a silent partial record.
+
+        Fields past the ones the grammar defines are IGNORED, not refused. Tolerating a
+        longer frame is what the base did for every caller, and this parser now runs for
+        internal consumers of the channel that read only part of the record."""
+        if len(fields) < i + 2:
+            raise _malformed_logprob_tail("missing lp/k")
+        try:
+            lp = float(fields[i])
+            k = int(fields[i + 1])
+        except ValueError as error:
+            raise _malformed_logprob_tail(error) from error
+        if not 0 <= k <= LOGPROBS_TOP_K_CAP:
+            raise _malformed_logprob_tail(f"k={k} out of range")
+        if len(fields) < i + 2 + 2 * k:
+            raise _malformed_logprob_tail("fewer candidate fields than k declares")
+        topk = []
+        j = i + 2
+        for _ in range(k):
+            try:
+                tid = int(fields[j])
+                tlp = float(fields[j + 1])
+            except ValueError as error:
+                raise _malformed_logprob_tail(error) from error
+            if tid < 0:
+                raise _malformed_logprob_tail(f"negative token id {tid}")
+            topk.append((tid, tlp))
+            j += 2
+        return {"lp": lp, "topk": topk}
+
+    def _record_fault(self, entry, error):
+        """Record a per-request fault without ending the request here.
+
+        The entry stays in the pending map, so the engine's later frames for it still land
+        somewhere (and are discarded), and `generate()` raises this error when the turn's
+        terminal frame arrives. The first fault wins: a stream that goes bad usually goes
+        bad more than once, and the first reading is the one that describes what happened.
+        The dispatcher itself keeps running, and every other in-flight request is
+        untouched."""
+        if entry.failed is None:
+            entry.failed = error
+
     def _dispatch_stdout(self):
         try:
             while True:
@@ -3546,9 +4399,20 @@ class Engine:
                     if self._read_exact(1) != b"\n":
                         raise RuntimeError("invalid engine DATA terminator")
                     with self.pending_lock:
-                        events = self.pending.get(request_id)
-                    if events is not None:
-                        events.put(("data", data))
+                        entry = self.pending.get(request_id)
+                    if entry is None or entry.failed is not None:
+                        continue
+                    record = None
+                    if entry.logprob_channel and len(fields) > 3:
+                        # Parsed only for a request that asked, with the payload already
+                        # drained, so a malformed tail fails that one request rather than
+                        # stopping the dispatcher.
+                        try:
+                            record = self._parse_logprob_tail(fields, 3)
+                        except APIError as error:
+                            self._record_fault(entry, error)
+                            continue
+                    entry.events.put(("data", data if record is None else (data, record)))
                 elif kind == "TOOL" and len(fields) == 3:
                     # Opaque, request-scoped structured output. K3 emits an
                     # initial zero-byte frame before generation so DATA marker
@@ -3561,9 +4425,9 @@ class Engine:
                     if self._read_exact(1) != b"\n":
                         raise RuntimeError("invalid engine TOOL terminator")
                     with self.pending_lock:
-                        events = self.pending.get(request_id)
-                    if events is not None:
-                        events.put(("tool", data))
+                        entry = self.pending.get(request_id)
+                    if entry is not None and entry.failed is None:
+                        entry.events.put(("tool", data))
                 elif kind == "ECHO" and len(fields) >= 6:
                     # U7a prefill read-out: "ECHO <id> <n> <pos> <lp> <k>
                     # [tid tlp]*k" plus a DATA-framed payload (n bytes + LF).
@@ -3578,33 +4442,71 @@ class Engine:
                     if self._read_exact(1) != b"\n":
                         raise RuntimeError("invalid engine DATA terminator")
                     request_id = fields[1]
-                    lp = fields[4]
                     with self.pending_lock:
-                        events = self.pending.get(request_id)
-                    if events is not None:
-                        events.put(("echo", {
-                            "pos": int(fields[3]),
-                            # " nan 0" = niente su cui condizionare: la prima
-                            # posizione assoluta non ha un predittore.
-                            "logprob": None if lp in ("nan", "-nan") else float(lp),
-                            "text": piece.decode("utf-8", "replace"),
-                        }))
+                        entry = self.pending.get(request_id)
+                    if entry is None or entry.failed is not None:
+                        continue
+                    try:
+                        pos = int(fields[3])
+                    except ValueError:
+                        # Same frame as the numeric tail, so the same containment: this
+                        # request's fault, never a stop for every request in flight.
+                        self._record_fault(entry, _malformed_echo_position(repr(fields[3])))
+                        continue
+                    lp = fields[4]
+                    try:
+                        # `lp` is the numeric tail's own first field, so an unreadable one
+                        # is a malformed tail and carries that name. It is read for every
+                        # ECHO frame, opted in or not, because the closed-set scorer's
+                        # `logprob` key comes from it -- which is why it needs the same
+                        # containment as the position beside it, rather than reaching the
+                        # dispatcher's blanket handler and stopping it for every request.
+                        logprob = None if lp in ("nan", "-nan") else float(lp)
+                    except ValueError:
+                        self._record_fault(entry, _malformed_logprob_tail(
+                            "unreadable prompt-echo log probability %s" % (lp,)))
+                        continue
+                    record = None
+                    if entry.logprob_channel:
+                        try:
+                            record = self._parse_logprob_tail(fields, 4)
+                        except APIError as error:
+                            self._record_fault(entry, error)
+                            continue
+                    entry.events.put(("echo", {
+                        "pos": pos,
+                        # " nan 0" = niente su cui condizionare: la prima
+                        # posizione assoluta non ha un predittore.
+                        "logprob": logprob,
+                        "text": piece.decode("utf-8", "replace"),
+                        # The payload bytes and the numeric tail: the tail is the only
+                        # place the candidate ids exist, and text offsets are rebuilt from
+                        # raw bytes by one decoder spanning the whole sequence. A consumer
+                        # reading only `pos`/`logprob`/`text` is unaffected.
+                        "bytes": piece,
+                        "lp": record["lp"] if record else None,
+                        "topk": record["topk"] if record else [],
+                    }))
                 elif kind == "ACCEPT" and len(fields) >= 3:
                     # #597: the engine validated the submission (fits context) before prefill.
                     # Keep it pending — DATA/DONE still follow — and let generate() commit the
                     # HTTP stream only now, so an earlier CONTEXT_EXCEEDED stays a clean 400.
                     request_id = fields[1]
                     with self.pending_lock:
-                        events = self.pending.get(request_id)
-                    if events is not None:
-                        events.put(("accept", {"prompt_tokens": int(fields[2])}))
+                        entry = self.pending.get(request_id)
+                    if entry is not None and entry.failed is None:
+                        entry.events.put(("accept", {"prompt_tokens": int(fields[2])}))
                 elif kind == "DONE" and len(fields) >= 7:
                     request_id = fields[1]
                     stats = self._stats(fields[2:])
                     with self.pending_lock:
-                        events = self.pending.pop(request_id, None)
-                    if events is not None:
-                        events.put(("done", stats))
+                        entry = self.pending.pop(request_id, None)
+                    if entry is not None:
+                        # The turn is over, so a fault recorded mid-turn is delivered now
+                        # rather than when it was found, which would have freed the
+                        # admission while the engine was still generating.
+                        entry.events.put(("error", entry.failed) if entry.failed
+                                         else ("done", stats))
                 elif kind == "HWINFO" and len(fields) >= 7:
                     parts = " ".join(fields[6:]).split("|")
                     self.hwinfo = {"cores": int(fields[1]), "ram_total_gb": float(fields[2]),
@@ -3639,9 +4541,18 @@ class Engine:
                     request_id = fields[1]
                     message = " ".join(fields[2:]) or "engine request failed"
                     with self.pending_lock:
-                        events = self.pending.pop(request_id, None)
-                    if events is not None:
-                        events.put(("error", _engine_error(fields[2:], message)))
+                        entry = self.pending.pop(request_id, None)
+                    if entry is not None:
+                        reported = _engine_error(fields[2:], message)
+                        if entry.failed is not None and not (
+                                isinstance(reported, RuntimeError)
+                                and str(reported) == "CANCELLED"):
+                            # The recorded fault happened first and names the framing
+                            # defect, so it wins -- except against a cancellation, which
+                            # is the client leaving and is answered here exactly as it is
+                            # on a healthy turn.
+                            reported = _with_engine_reason(entry.failed, message)
+                        entry.events.put(("error", reported))
                 else:
                     raise RuntimeError(f"invalid engine response: {' '.join(fields)}")
         except Exception as error:
@@ -3651,7 +4562,8 @@ class Engine:
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
-                 on_tool=None, image=None, logprobs=0, pin=False, on_echo=None):
+                 on_tool=None, image=None, logprobs=0, pin=False, on_echo=None,
+                 gbytes_before_ext=False):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -3681,7 +4593,8 @@ class Engine:
                 # request's sideband authoritative even when no call follows.
                 on_tool(text)
 
-        events = queue.Queue()
+        pending = _Pending(bool(logprobs))
+        events = pending.events
         with self.pending_lock:
             if self.closed:
                 raise RuntimeError("colibri engine is shutting down")
@@ -3691,7 +4604,7 @@ class Engine:
                 raise RuntimeError("colibri engine is not running")
             request_id = str(self.next_request_id)
             self.next_request_id += 1
-            self.pending[request_id] = events
+            self.pending[request_id] = pending
         xpayload = gpayload or apayload
         # DeepSeek V4 prefix hint (optional 8th header field): the byte length of
         # the rendered prompt up to the first user/assistant turn marker — the
@@ -3716,9 +4629,14 @@ class Engine:
             ext += f" logprobs={int(logprobs)}"
         if pin:
             ext += " pin=1"
+        # `gbytes_before_ext` asks for the 7th numeric field ahead of the extension keys
+        # even with no grammar or audio payload to describe. It defaults to False, so
+        # every caller that does not ask keeps the wire it had.
+        gbytes_field = (f" {len(xpayload)}"
+                        if (xpayload or (ext and gbytes_before_ext)) else "")
         header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
                   f"{temperature:.8g} {top_p:.8g}"
-                  + (prefix_field if prefix_field else (f" {len(xpayload)}" if xpayload else ""))
+                  + (prefix_field if prefix_field else gbytes_field)
                   + ext
                   + "\n").encode()
         try:
@@ -3752,6 +4670,9 @@ class Engine:
         cancel_sent = False
         stop_sent = False
         accepted = False
+        # DATA's numeric tail, in emission order. Stays empty when logprobs is 0, because
+        # the dispatcher never parses a tail for a request that did not ask for one.
+        generated_logprobs = []
 
         def _accept(info):
             # #597: commit exactly once, on the first of ACCEPT / DATA / DONE. A new engine sends
@@ -3784,6 +4705,21 @@ class Engine:
                 if not cancel_sent and not stop_sent and cancelled and cancelled():
                     cancel_sent = True
                     self._write_frame(request_id, f"CANCEL {request_id}\n".encode(), "CANCEL")
+                elif not cancel_sent and not stop_sent and pending.failed is not None:
+                    # A fault was recorded for this request, so nothing it generates from
+                    # here can reach the client. The turn is still the engine's -- the
+                    # admission is held to its terminal frame either way -- but it should
+                    # not run the rest of the budget for a response nobody will get.
+                    #
+                    # The STOP goes out through the checked frame writer (#1721), which
+                    # drops this request's pending-map entry and re-raises an OSError as
+                    # the named engine_error -- exactly the handling this branch carried
+                    # inline before that writer existed. Keeping the entry would be worse
+                    # than losing it: a STOP that never reached the engine is never
+                    # answered with a terminal frame, so the admission would be held for
+                    # the process's lifetime.
+                    stop_sent = True
+                    self._write_frame(request_id, f"STOP {request_id}\n".encode(), "STOP")
                 continue
             if kind == "accept":
                 if accepted:
@@ -3791,8 +4727,13 @@ class Engine:
                 _accept(value)
             elif kind == "data":
                 _accept({"prompt_tokens": None})
+                # The dispatcher wraps the payload in a tuple only when a logprob record
+                # rides along; bare bytes is the non-opted-in shape.
+                data, record = value if isinstance(value, tuple) else (value, None)
+                if record is not None:
+                    generated_logprobs.append((data, record))
                 if not cancel_sent and not stop_sent:
-                    decode(value)
+                    decode(data)
                     if stopped and stopped():
                         stop_sent = True
                         self._write_frame(request_id, f"STOP {request_id}\n".encode(), "STOP")
@@ -3833,8 +4774,19 @@ class Engine:
                 tool_tail = tool_decoder.decode(b"", final=True)
                 if tool_tail and on_tool is not None:
                     on_tool(tool_tail)
+                if logprobs:
+                    value["logprobs"] = {"generated": generated_logprobs}
                 return value
-            elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
+            elif cancel_sent and (value is pending.failed
+                                  or (isinstance(value, RuntimeError)
+                                      and str(value) == "CANCELLED")):
+                # The client left, on the two terminal frames that report nothing else: an
+                # ERROR CANCELLED, which is the engine acknowledging the cancel, and a DONE,
+                # which hands back the fault recorded while nobody was reading. Raising the
+                # fault instead books a departed client as a server failure in the
+                # scheduler's outcome, and tries to write a 500 to a socket that is already
+                # closed. An ERROR carrying any other text is the engine's own account of
+                # why the turn ended; that is news, and it is still reported as a failure.
                 raise ClientCancelled()
             else:
                 raise value
@@ -4857,6 +5809,8 @@ class APIHandler(BaseHTTPRequestHandler):
             # grammar payload extension would desync its stdin framing.
             raise APIError(400, f"`response_format` grammars are not supported by the {ARCH} "
                                 "engine yet.", "response_format", "unsupported_parameter")
+        engine_k, echo, display_k = logprobs_options(
+            body, chat, getattr(self.server.engine, "supports_logprobs_echo", False))
         stop_sequences, ignore_leading_stop = stop_policy(body, chat)
         # tools and tool_choice come from chat_completion() already processed/filtered
         if chat and tool_choice == "none":
@@ -4877,6 +5831,12 @@ class APIHandler(BaseHTTPRequestHandler):
         stream = body.get("stream", False)
         if not isinstance(stream, bool):
             raise APIError(400, "`stream` must be a boolean.", "stream")
+        if engine_k and stream:
+            # A named 400, not a silent drop of the numeric channel: streamed per-delta
+            # logprobs are not built, and nothing below this point threads the channel
+            # into a streaming call.
+            raise APIError(400, "`logprobs` is not supported together with `stream`.",
+                           "logprobs", "unsupported_parameter")
         stream_options = body.get("stream_options") if stream else None
         if stream and stream_options is not None and not isinstance(stream_options, dict):
             raise APIError(400, "`stream_options` must be an object.", "stream_options")
@@ -4892,9 +5852,13 @@ class APIHandler(BaseHTTPRequestHandler):
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if not stream:
                 output = []
-                stop_filter = StopFilter(stop_sequences, output.append, ignore_leading_stop)
+                stop_filter = StopFilter(stop_sequences, output.append, ignore_leading_stop,
+                                         track_spans=bool(engine_k))
                 sideband = ToolSideband(ARCH == "kimi" and chat and bool(tools),
                                         stop_sequences, ignore_leading_stop)
+                # The engine sends an ECHO frame for every prompt position of every
+                # opted-in request, so passing a sink is the retention opt-in.
+                prompt_echoes = []
 
                 def generation_stopped():
                     return stop_filter.stopped() or sideband.stopped()
@@ -4904,36 +5868,73 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
                     **({"audio": audio} if audio else {}),
-                    **({"image": image} if image is not None else {}))
+                    **({"image": image} if image is not None else {}),
+                    **({"on_echo": prompt_echoes.append} if engine_k and echo else {}),
+                    **_engine_extension_args(engine_k))
                 stop_filter.finish()
                 sideband.finish()
                 text = "".join(output)
+                # What the stop filter emitted, before any split or tool-call parse: the
+                # base the rest of the pipeline's maps are chained onto.
+                raw_text = text
                 reasoning = ""
+                answer_spans = tool_spans = None
                 if ARCH == "inkling":
                     text, reasoning = split_inkling(text)
                 elif chat:
                     # #597 item 4: GLM emits reasoning then </think> then the answer. Route the
                     # reasoning to reasoning_content instead of dumping it (or the raw </think>)
                     # into the visible answer / tool-call parser.
-                    reasoning, text = split_thinking_reply(text, enable_thinking,
-                                                           add_generation_prompt)
-                length_finish = "length" if stats["length_limited"] else "stop"
+                    if engine_k:
+                        reasoning, text, (_thinking_spans, answer_spans) = (
+                            split_thinking_reply_spans(text, enable_thinking,
+                                                       add_generation_prompt))
+                    else:
+                        reasoning, text = split_thinking_reply(text, enable_thinking,
+                                                               add_generation_prompt)
+                # The tool-call parse runs before the logprobs tail because the arrays
+                # describe the string it produces. It reads nothing the tail writes.
+                content, calls, content_spans = None, [], None
                 if chat and tools:
-                    content, calls = parse_arch_tool_calls(text, tools, sideband.reply())
+                    if engine_k:
+                        content, calls, _box_spans, tool_spans = parse_arch_tool_calls_spans(
+                            text, tools, sideband.reply())
+                    else:
+                        content, calls = parse_arch_tool_calls(text, tools, sideband.reply())
+                # Compose the stages' maps into one raw-stream to returned-string map;
+                # a stage with no map leaves the chain at the last string it vouches for.
+                if chat and answer_spans is not None and engine_k:
+                    chain = _compose_span_maps(stop_filter.spans, answer_spans)
+                    target = text
+                    if tools:
+                        if tool_spans is None:
+                            chain = None
+                        else:
+                            chain, target = _compose_span_maps(chain, tool_spans), content
+                    if chain is not None:
+                        content_spans = (target, chain)
+                text, logprobs_obj, length_finish = _completion_choice_fields(
+                    stats, raw_text=raw_text, text=text, chat=chat, engine_k=engine_k,
+                    echo=echo, display_k=display_k, prompt_echoes=prompt_echoes,
+                    stop_spans=stop_filter.spans, content_spans=content_spans,
+                    cache_slot=cache_slot)
+                if chat and tools:
                     message = {"role": "assistant", "content": content or None, "refusal": None}
                     if reasoning:
                         message["reasoning_content"] = reasoning
                     if calls:
                         message["tool_calls"] = calls
                     finish = "tool_calls" if calls else length_finish
-                    choice = {"index": 0, "message": message, "logprobs": None, "finish_reason": finish}
+                    choice = {"index": 0, "message": message, "logprobs": logprobs_obj,
+                              "finish_reason": finish}
                 else:
                     _msg = {"role": "assistant", "content": text, "refusal": None}
                     if reasoning:
                         _msg["reasoning_content"] = reasoning
                     choice = ({"index": 0, "message": _msg,
-                               "logprobs": None, "finish_reason": length_finish} if chat else
-                              {"index": 0, "text": text, "logprobs": None, "finish_reason": length_finish})
+                               "logprobs": logprobs_obj, "finish_reason": length_finish} if chat else
+                              {"index": 0, "text": text, "logprobs": logprobs_obj,
+                               "finish_reason": length_finish})
                 self.send_json(200, {"id": completion_id, "object": object_name, "created": created,
                     "model": self.server.model_id, "choices": [choice], "usage": self.usage(stats)},
                     request_id, queue_headers)
@@ -5090,7 +6091,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
                     on_accept=start_stream, **({"audio": audio} if audio else {}),
-                    **({"image": image} if image is not None else {}))
+                    **({"image": image} if image is not None else {}),
+                    **_engine_extension_args(engine_k))
                 stop_filter.finish()
                 sideband.finish()
                 if think:
@@ -5124,7 +6126,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
                     on_accept=start_stream, **({"audio": audio} if audio else {}),
-                    **({"image": image} if image is not None else {}))
+                    **({"image": image} if image is not None else {}),
+                    **_engine_extension_args(engine_k))
                 stop_filter.finish()
                 if content_split:
                     content_split.close()
