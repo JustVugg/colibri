@@ -700,6 +700,14 @@ jobs:
           # the same prompt. Wrong reuse is silent, so the gate is the only
           # thing between it and a user.
           OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_prefix_serve
+      - name: "Brio over serve: snapshot scoring is exact, and invisible to chat"
+        run: |
+          cd c
+          # Closed-set scoring must give the log probabilities a cold recompute
+          # gives, and a request without the keys must stay byte-identical.
+          # Both are silent when wrong; this module was skipping everywhere
+          # until it was named here (#1742).
+          OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_brio_serve
 
   dsv41-tiny-check:
     name: DeepSeek V4.1 tiny oracle (engram + DSA + fp4 experts + vision)
