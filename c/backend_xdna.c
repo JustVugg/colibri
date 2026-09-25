@@ -176,7 +176,7 @@ static int coli_xdna_file_exists(const char *path){
 }
 /* The path always contains a slash, so dlopen takes it literally: no
  * LD_LIBRARY_PATH, no RUNPATH, no ld.so.cache for the helper itself. Its own
- * dependencies (libxrt_coreutil) resolve the normal way, which is the Linux
+ * dependencies (the XRT core library) resolve the normal way, which is the Linux
  * counterpart of LOAD_WITH_ALTERED_SEARCH_PATH. RTLD_LOCAL keeps the helper's
  * symbols out of the global namespace; RTLD_NOW makes an unresolvable
  * dependency a load failure here rather than a crash on first call. */
