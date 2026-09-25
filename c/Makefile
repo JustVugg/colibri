@@ -1024,7 +1024,7 @@ else
 RANSLIB = tools/librans_c.so
 endif
 rans: $(RANSLIB)
-$(RANSLIB): tools/rans_ctypes.c rans.h
+$(RANSLIB): tools/rans_ctypes.c
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
 cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_init_failure.cu
@@ -1312,7 +1312,8 @@ tests/test_qwen36_tokenizer$(EXE): tests/test_qwen36_tokenizer.c qwen36.c $(QWEN
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # Reproducible local timing evidence; intentionally not a noisy CI perf gate.
-tests/bench_qwen36_dense_batch$(EXE): tests/bench_qwen36_dense_batch.c gsgemv.h qgemv.h sse41_kernels.h qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
+tests/bench_qwen36_dense_batch$(EXE): tests/bench_qwen36_dense_batch.c qwen36.c \
+		$(QWEN36_TIER_OBJ) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 inkling$(EXE): inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ)
@@ -1414,8 +1415,8 @@ tests/test_xdna_failure$(EXE): tests/test_xdna_failure.c colibri.c tests/backend
 #
 # M-list defaults to 1,32,64 (the M64 bucket); pass 65,130,256 to qualify
 # the M256 bucket through the same owner.
-tests/xdna_physical_probe$(EXE): tests/xdna_physical_probe.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c -o $@ $(LDFLAGS)
+tests/xdna_physical_probe$(EXE): tests/xdna_physical_probe.c colibri.c tests/backend_xdna_lane.o
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< tests/backend_xdna_lane.o -o $@ $(LDFLAGS)
 
 tests/test_json$(EXE): tests/test_json.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1513,7 +1514,7 @@ tests/test_st_f16_bf16_simd_sse41$(EXE): tests/test_st_f16_bf16_simd.c
 
 # bf16_to_f32_bulk/f16_to_f32_bulk vs the scalar per-element reference, NOT a
 # test gate. Build on demand: make tests/bench_st_f16_bf16_simd ARCH=native
-tests/bench_st_f16_bf16_simd$(EXE): tests/bench_st_f16_bf16_simd.c st.h json.h compat.h
+tests/bench_st_f16_bf16_simd$(EXE): tests/bench_st_f16_bf16_simd.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # Synthetic peak-RSS proxy for qwen36.c's dense-int8-during-load change
@@ -1628,7 +1629,8 @@ tests/test_inkling_shared_batch$(EXE): tests/test_inkling_shared_batch.c inkling
 
 # Reproducible local A/B for the shared-expert prefill path.  This is timing
 # evidence, not a CI gate: build and run it explicitly on the target CPU.
-tests/bench_inkling_shared_batch$(EXE): tests/bench_inkling_shared_batch.c inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
+tests/bench_inkling_shared_batch$(EXE): tests/bench_inkling_shared_batch.c inkling.c \
+		$(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_inkling_cache_index$(EXE): tests/test_inkling_cache_index.c inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ)
@@ -1685,7 +1687,7 @@ tests/test_topp$(EXE): tests/test_topp.c colibri.c $(VK_OBJ)
 
 # bench_topp is a microbenchmark (old qsort vs new heap partial-select, #335), NOT a test
 # gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_topp
-tests/bench_topp$(EXE): tests/bench_topp.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
+tests/bench_topp$(EXE): tests/bench_topp.c colibri.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_sample_nan$(EXE): tests/test_sample_nan.c colibri.c $(VK_OBJ)
@@ -1827,58 +1829,37 @@ SEGMENT_RUNTIME_LIB = $(SEGMENT_BUILD_DIR)/libcolibri_segment_edge.a
 $(SEGMENT_BUILD_DIR):
 	mkdir -p $@
 
-$(SEGMENT_BUILD_DIR)/glm.o: colibri.c sse41_kernels.h oracle.h segment_runtime.h edge_runtime.h \
-		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
-		edge_adapter_internal.h edge_tok_internal.h st.h | $(SEGMENT_BUILD_DIR)
+$(SEGMENT_BUILD_DIR)/glm.o: colibri.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DCOLIBRI_NO_MAIN -c colibri.c -o $@
 
-$(SEGMENT_BUILD_DIR)/glm53.o: glm53.c sse41_kernels.h segment_runtime.h edge_runtime.h \
-		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
-		edge_adapter_internal.h st.h quant.h fp8_format.h tok.h hyper_connections.h \
-		delta_attention.h sparse_index.h vision_tower.h | $(SEGMENT_BUILD_DIR)
+$(SEGMENT_BUILD_DIR)/glm53.o: glm53.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DGLM53_NO_MAIN -c glm53.c -o $@
 
-$(SEGMENT_BUILD_DIR)/inkling.o: inkling.c segment_runtime.h edge_runtime.h \
-		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
-		edge_adapter_internal.h edge_tok_internal.h st.h | $(SEGMENT_BUILD_DIR)
+$(SEGMENT_BUILD_DIR)/inkling.o: inkling.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DINKLING_NO_MAIN -c inkling.c -o $@
 
-$(SEGMENT_BUILD_DIR)/kimi.o: kimi_k3.c sse41_kernels.h segment_runtime.h edge_runtime.h \
-		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
-		edge_adapter_internal.h edge_tok_internal.h st.h | $(SEGMENT_BUILD_DIR)
+$(SEGMENT_BUILD_DIR)/kimi.o: kimi_k3.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DKIMI_K3_NO_MAIN -c kimi_k3.c -o $@
 
-$(SEGMENT_BUILD_DIR)/olmoe.o: olmoe.c sse41_kernels.h segment_runtime.h edge_runtime.h \
-		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
-		edge_adapter_internal.h edge_tok_internal.h st.h | $(SEGMENT_BUILD_DIR)
+$(SEGMENT_BUILD_DIR)/olmoe.o: olmoe.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DOLMOE_NO_MAIN -c olmoe.c -o $@
 
-$(SEGMENT_BUILD_DIR)/qwen36.o: qwen36.c gsgemv.h qgemv.h sse41_kernels.h segment_runtime.h edge_runtime.h \
-		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
-		edge_adapter_internal.h st.h | $(SEGMENT_BUILD_DIR)
+$(SEGMENT_BUILD_DIR)/qwen36.o: qwen36.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DQWEN36_NO_MAIN -c qwen36.c -o $@
 
-$(SEGMENT_BUILD_DIR)/qwen38.o: qwen38.c sse41_kernels.h qwen38_core.h kv_prefix.h segment_runtime.h \
-		segment_adapters.h segment_adapter_internal.h edge_runtime.h \
-		edge_adapters.h edge_adapter_internal.h st.h json.h compat.h quant.h fp8_format.h \
-		qwen38_nfc.h qwen38_nfc_tables.h route_trace.h tok_unicode.h \
-		tok_unicode_o200k.h | $(SEGMENT_BUILD_DIR)
+$(SEGMENT_BUILD_DIR)/qwen38.o: qwen38.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DQWEN38_NO_MAIN -c qwen38.c -o $@
 
-$(SEGMENT_V4_OBJS): $(SEGMENT_BUILD_DIR)/%.o: deepseek_v4.c sse41_kernels.h deepseek_v4.h \
-		deepseek_v4_internal.h segment_runtime.h segment_adapters.h \
-		edge_runtime.h edge_adapters.h segment_adapter_internal.h \
-		edge_adapter_internal.h edge_tok_internal.h st.h | $(SEGMENT_BUILD_DIR)
+$(SEGMENT_V4_OBJS): $(SEGMENT_BUILD_DIR)/%.o: deepseek_v4.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -D$* -c deepseek_v4.c -o $@
 
-$(SEGMENT_V4_REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h \
-		expert_store.h | $(SEGMENT_BUILD_DIR)
+$(SEGMENT_V4_REGISTRY_OBJ): expert_store_registry.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -c expert_store_registry.c -o $@
 
-$(SEGMENT_BUILD_DIR)/segment_runtime.o: segment_runtime.c segment_runtime.h | $(SEGMENT_BUILD_DIR)
+$(SEGMENT_BUILD_DIR)/segment_runtime.o: segment_runtime.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -c segment_runtime.c -o $@
 
-$(SEGMENT_BUILD_DIR)/edge_runtime.o: edge_runtime.c edge_runtime.h | $(SEGMENT_BUILD_DIR)
+$(SEGMENT_BUILD_DIR)/edge_runtime.o: edge_runtime.c | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -c edge_runtime.c -o $@
 
 $(SEGMENT_RUNTIME_LIB): $(SEGMENT_RUNTIME_OBJS) $(SEGMENT_ALL_OBJS)
@@ -2017,22 +1998,22 @@ V4_OWNERSHIP_OBJS = \
 $(V4_OWN_DIR):
 	mkdir -p $(V4_OWN_DIR)
 
-$(V4_OWN_DIR)/COLI_V4_UNIT_RUNTIME.o: deepseek_v4.c sse41_kernels.h deepseek_v4.h deepseek_v4_internal.h | $(V4_OWN_DIR)
+$(V4_OWN_DIR)/COLI_V4_UNIT_RUNTIME.o: deepseek_v4.c | $(V4_OWN_DIR)
 	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_RUNTIME -c deepseek_v4.c -o $@
 
-$(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o: deepseek_v4.c sse41_kernels.h deepseek_v4.h deepseek_v4_internal.h | $(V4_OWN_DIR)
+$(V4_OWN_DIR)/COLI_V4_UNIT_CONFIG.o: deepseek_v4.c | $(V4_OWN_DIR)
 	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_CONFIG -c deepseek_v4.c -o $@
 
-$(V4_OWN_DIR)/COLI_V4_UNIT_ST.o: deepseek_v4.c sse41_kernels.h deepseek_v4.h deepseek_v4_internal.h st.h | $(V4_OWN_DIR)
+$(V4_OWN_DIR)/COLI_V4_UNIT_ST.o: deepseek_v4.c | $(V4_OWN_DIR)
 	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_ST -c deepseek_v4.c -o $@
 
-$(V4_OWN_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o: deepseek_v4.c sse41_kernels.h deepseek_v4.h deepseek_v4_internal.h quant.h fp8_format.h idot.h | $(V4_OWN_DIR)
+$(V4_OWN_DIR)/COLI_V4_UNIT_NATIVE_QUANT.o: deepseek_v4.c | $(V4_OWN_DIR)
 	$(CC) $(V4_OWN_CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT -c deepseek_v4.c -o $@
 
 # The engine (RUNTIME unit) opens its expert store through the pluggable
 # backend registry, so any test linking RUNTIME also links the registry object
 # (which defines coli_expert_store_backend_open_selected + registers "auto").
-$(V4_OWN_DIR)/expert_store_registry.o: expert_store_registry.c expert_store_registry.h expert_store.h | $(V4_OWN_DIR)
+$(V4_OWN_DIR)/expert_store_registry.o: expert_store_registry.c | $(V4_OWN_DIR)
 	$(CC) $(V4_OWN_CFLAGS) -c expert_store_registry.c -o $@
 
 tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c $(V4_OWNERSHIP_OBJS)
@@ -2213,12 +2194,12 @@ tests/test_ssd_probe$(EXE): tests/test_ssd_probe.c colibri.c $(VK_OBJ)
 
 # bench_dsa_select is a microbenchmark (old qsort vs new quickselect partial-select, #356),
 # NOT a test gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_dsa_select
-tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
+tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c colibri.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # bench_router_select is a microbenchmark (duplicate-prefix scan vs marked-score scan),
 # not a test gate. Build on demand: make tests/bench_router_select.
-tests/bench_router_select$(EXE): tests/bench_router_select.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
+tests/bench_router_select$(EXE): tests/bench_router_select.c colibri.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # bench_indexer_allocations: microbenchmark (DeepSeek V4 indexer malloc vs persistent arena scratch), NOT a test gate.
@@ -2228,23 +2209,23 @@ tests/bench_indexer_allocations$(EXE): tests/bench_indexer_allocations.c
 
 # bench_idot: microbenchmark (single-acc vs independent-acc AVX-VNNI idot), NOT a test gate.
 # Build on demand on an AVX-VNNI CPU: make tests/bench_idot ARCH=native
-tests/bench_idot$(EXE): tests/bench_idot.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
+tests/bench_idot$(EXE): tests/bench_idot.c colibri.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # bench_i4p_gidot: microbenchmark (per-row vs multi-row/AMX K1b grouped planar IDOT), NOT a test gate.
 # Build on demand: make tests/bench_i4p_gidot ARCH=native
-tests/bench_i4p_gidot$(EXE): tests/bench_i4p_gidot.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
+tests/bench_i4p_gidot$(EXE): tests/bench_i4p_gidot.c colibri.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # bench_gemv_stream: microbenchmark (decode-regime GEMV bandwidth vs the read ceiling;
 # frozen-baseline + deinterleaved-x candidate A/B), NOT a test gate.
 # Build on demand: make tests/bench_gemv_stream ARCH=native
-tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
+tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c colibri.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # bench_mla_simd: microbenchmark (scalar vs AVX2/NEON MLA-absorb reductions, #442),
 # NOT a test gate. Build on demand: make tests/bench_mla_simd
-tests/bench_mla_simd$(EXE): tests/bench_mla_simd.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
+tests/bench_mla_simd$(EXE): tests/bench_mla_simd.c colibri.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_uring$(EXE): tests/test_uring.c colibri.c $(VK_OBJ)
@@ -2472,8 +2453,9 @@ tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c $(VK_
 #
 # Every rule in AUTODEP_BINS compiles ONE translation unit with $(CFLAGS), so
 # -MMD (added to CFLAGS near the top) leaves a complete <target>.d and the rule
-# does not list headers by hand. The engines and tests are derived the same way
-# TEST_RULES is, so a new rule joins automatically.
+# does not list headers by hand. The engines and everything under tests/ are
+# derived the same way TEST_RULES is, so a new rule joins automatically; the
+# objects and the ctypes library are named here.
 #
 # A command that compiles several .c files writes a .d for the LAST one only,
 # silently dropping the headers of the others. So a helper source a test links
@@ -2483,9 +2465,11 @@ tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c $(VK_
 #
 # AUTODEP_ELSEWHERE keeps its header lists: test_deepseek_v4 and
 # test_v4_serve_framing are built by Makefile.deepseek-v4, and the four
-# segment/edge adapter tests still compile three units in one command. The
-# nvcc, MSVC-hosted CUDA and Metal objects keep theirs too and are not listed
-# here at all.
+# segment/edge adapter tests still compile three units in one command.
+# AUTODEP_OWN_FLAGS does not compile through $(CFLAGS) at all (a GPU compiler,
+# or a benchmark pinned to its own flags), so it writes no .d. The nvcc,
+# MSVC-hosted CUDA, Metal and fuzz targets, and the gcc-built CUDA loader
+# harnesses (dsv4-cuda-*), keep their lists and are not listed here at all.
 #
 # Most rules do not depend on .build-config, so a change to CFLAGS alone would
 # not rebuild a binary made before this change, and it would have no .d. Each
@@ -2495,13 +2479,18 @@ tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c $(VK_
 AUTODEP_ELSEWHERE = test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real test_deepseek_v4 \
 	test_v4_serve_framing
+AUTODEP_OWN_FLAGS = bench_cuda_resident_batch bench_load_tq_peak_rss \
+	bench_indexer_allocations
 ENGINE_RULES := $(foreach n,$(RULE_NAMES),$(if $(findstring /,$(n)),,$(if $(wildcard $(n).c),$(n))))
+AUTODEP_TESTS := $(patsubst tests/%,%,$(filter tests/%,$(RULE_NAMES)))
 AUTODEP_OBJS      = backend_vulkan.o backend_loader.o backend_xdna.o qwen36_tier.o \
 	tests/backend_xdna_lane.o tests/edge_runtime.o tests/edge_runtime_nocuda.o \
 	tests/segment_runtime.o tests/segment_runtime_nocuda.o \
-	tests/segment_conformance_fixtures.o tests/deepseek_v4_native_quant.o
+	tests/segment_conformance_fixtures.o tests/deepseek_v4_native_quant.o \
+	$(SEGMENT_ALL_OBJS) $(SEGMENT_RUNTIME_OBJS) $(V4_OWNERSHIP_OBJS) $(RANSLIB)
 AUTODEP_BINS      = $(addsuffix $(EXE),$(ENGINE_RULES)) \
-	$(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(AUTODEP_ELSEWHERE),$(TEST_RULES)))) \
+	$(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(AUTODEP_ELSEWHERE) \
+		$(AUTODEP_OWN_FLAGS),$(AUTODEP_TESTS)))) \
 	$(AUTODEP_OBJS)
 AUTODEP_DEPS      = $(addsuffix .d,$(basename $(AUTODEP_BINS)))
 $(foreach b,$(AUTODEP_BINS),$(eval $(b): $(basename $(b)).d))

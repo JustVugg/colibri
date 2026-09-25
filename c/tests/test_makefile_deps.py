@@ -110,18 +110,58 @@ def _make(*args):
                               capture_output=True, timeout=600)
 
 
-def _make_var(name):
+def _make_vars(*names):
+    """Makefile variables as make expands them, {name: words}, in one call."""
     # `make --eval` needs GNU Make 3.82; macOS ships 3.81, which does read an
     # extra makefile from stdin.
     with _build_config_kept():
         proc = subprocess.run([MAKE, "-s", "--no-print-directory", "-f", "Makefile",
-                               "-f", "-", f"print-{name}"], cwd=C_DIR, text=True,
-                              input="print-%: ; @echo $($*)\n", capture_output=True,
-                              timeout=300)
+                               "-f", "-", *(f"print-{n}" for n in names)], cwd=C_DIR,
+                              text=True, input="print-%: ; @echo $*=$($*)\n",
+                              capture_output=True, timeout=300)
     if proc.returncode != 0:
-        raise AssertionError(f"could not read {name} from the Makefile:\n"
+        raise AssertionError(f"could not read {' '.join(names)} from the Makefile:\n"
                              f"{proc.stderr}")
-    return proc.stdout.split()
+    values = {}
+    for line in proc.stdout.splitlines():
+        name, sep, value = line.partition("=")
+        if sep and name in names:
+            values[name] = value.split()
+    return values
+
+
+def _make_var(name):
+    return _make_vars(name).get(name, [])
+
+
+RULE_LINE_RE = re.compile(r"(?m)^([^\s#:=][^:=\n]*?):(?![=:])(.*)$")
+VAR_RE = re.compile(r"\$\(([A-Za-z0-9_]+)\)")
+
+
+def _rules_by_target():
+    """Each rule's prerequisites as written, keyed by the file make builds.
+
+    Rules are spelled `colibri$(EXE):`, `$(SEGMENT_BUILD_DIR)/glm.o:`,
+    `$(RANSLIB):` or `$(SEGMENT_V4_OBJS): $(SEGMENT_BUILD_DIR)/%.o: ...`, so
+    the target side is expanded by asking make for those variables, and a
+    static pattern rule gives its prerequisites to each object it names. The
+    prerequisites keep their spelling: a hand-listed header is a plain word.
+    """
+    # `$(foreach b,...,$(eval ...))` lines generate rules; they are not rules.
+    lines = [(t, r) for t, r in RULE_LINE_RE.findall(_joined_makefile())
+             if not re.search(r"\$\([a-z-]+ ", t)]
+    names = sorted({v for target, _ in lines for v in VAR_RE.findall(target)})
+    values = _make_vars(*names)
+    rules = {}
+    for target, rest in lines:
+        prereqs = rest.split("#", 1)[0]
+        pattern, sep, after = prereqs.partition(":")
+        if sep and "%" in pattern:
+            prereqs = after
+        expanded = VAR_RE.sub(lambda m: " ".join(values.get(m.group(1), [])), target)
+        for name in expanded.split():
+            rules.setdefault(name, []).extend(prereqs.split())
+    return rules
 
 
 def _commands(targets, *variables):
@@ -208,21 +248,11 @@ def _unconditional_includes(source):
     return found
 
 
-def _rule_form(target, exe):
-    """How a built target is spelled in the Makefile: colibri.exe -> colibri$(EXE)."""
-    if target.endswith(".o"):
-        return target
-    if exe and target.endswith(exe):
-        return target[:-len(exe)] + "$(EXE)"
-    return target + "$(EXE)"
-
-
-def _source_of(form, rules_text):
+def _source_of(target, rules):
     """The .c a rule compiles: the first source among its prerequisites."""
-    for m in re.finditer(r"(?m)^" + re.escape(form) + r":[ \t]*(.*)$", rules_text):
-        for word in m.group(1).split("#", 1)[0].split():
-            if SOURCE_RE.search(word):
-                return C_DIR / word
+    for word in rules.get(target, []):
+        if SOURCE_RE.search(word):
+            return C_DIR / word
     return None
 
 
@@ -266,16 +296,19 @@ class GeneratedDepsWiringTest(unittest.TestCase):
 
     def test_no_generated_rule_lists_headers_by_hand(self):
         """A hand-listed header on these rules is redundant and brings back the
-        merge conflicts #1741 removed. Bite: add `st.h` to `colibri$(EXE):`."""
-        text = _joined_makefile()
+        merge conflicts #1741 removed. Bite: add `st.h` to `colibri$(EXE):`,
+        or to `$(SEGMENT_BUILD_DIR)/glm.o:`."""
+        rules = _rules_by_target()
         problems = []
         for target in self.bins:
-            form = _rule_form(target, self.exe)
-            for m in re.finditer(r"(?m)^" + re.escape(form) + r":[ \t]*(.*)$", text):
-                listed = [w for w in m.group(1).split("#", 1)[0].split()
-                          if re.search(r"\.(h|inc)$", w) and not w.startswith("$")]
-                if listed:
-                    problems.append(f"{form}: {' '.join(listed)}")
+            if target not in rules:
+                problems.append(f"{target}: no rule found for it, so its prerequisites "
+                                f"cannot be checked")
+                continue
+            listed = [w for w in rules[target]
+                      if re.search(r"\.(h|inc)$", w) and not w.startswith("$")]
+            if listed:
+                problems.append(f"{target}: {' '.join(listed)}")
         self.assertEqual(problems, [],
                          "these rules get their headers from -MMD and should "
                          "not list them by hand:\n  " + "\n  ".join(problems))
@@ -345,7 +378,7 @@ class GeneratedDepsCoverageTest(unittest.TestCase):
                                     "this after `make check`")
 
     def test_every_built_target_has_a_dep_file_covering_its_includes(self):
-        text = _joined_makefile()
+        rules = _rules_by_target()
         problems = []
         for target in self.built:
             dep = _dep_file(target)
@@ -353,7 +386,7 @@ class GeneratedDepsCoverageTest(unittest.TestCase):
                 problems.append(f"{target}: built, but has no {dep.name}; its "
                                 f"headers are untracked until it is rebuilt")
                 continue
-            source = _source_of(_rule_form(target, self.exe), text)
+            source = _source_of(target, rules)
             if source is None:
                 problems.append(f"{target}: no source found in its rule")
                 continue

@@ -67,17 +67,19 @@ FILES = [
 # (#1741). A stale one only adds prerequisites, but clean should leave nothing
 # the build made, and removing it forces the rebuild that writes a fresh one.
 # They land wherever an output does: c/ and tests/ for the engines and tests,
-# tools/ for the ctypes libraries, build/segment/ for the V4 unit objects
-# (build/ownership/ goes as a whole directory below).
+# tools/ for the ctypes library; build/segment/ and build/ownership/ go as
+# whole directories below.
 ARTIFACT_GLOBS = ["tests/test_*", "tests/bench_*", "tests/fuzz_*",
                   "tests/*_probe*", "COLI_V4_UNIT_*.o", "*.d", "tests/*.d",
-                  "tools/*.d", "build/segment/*.d",
+                  "tools/*.d",
                   # helper objects the tests link (#1741), one unit per command
                   "tests/*.o"]
 KEEP_EXT = (".c", ".h", ".cc", ".cpp", ".cu", ".mm", ".py", ".txt", ".json",
             ".md", ".bin", ".sh", ".toml", ".yml", ".yaml")
-# Directories to remove.
-DIRS = ["tests/__pycache__", "build/ownership"]
+# Directories to remove. build/segment/ holds only build output (the
+# segment-library objects, their .d and the archive); an object left there
+# without its .d would be a built target whose headers are untracked (#1741).
+DIRS = ["tests/__pycache__", "build/ownership", "build/segment"]
 
 def clean():
     """Remove everything above, relative to the current directory."""
