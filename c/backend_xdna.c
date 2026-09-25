@@ -30,6 +30,15 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__linux__)
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
+
+/* The loader exists on Windows and Linux: both have a qualified XRT that the
+ * helper can link. Everywhere else the loader compiles and answers ABSENT. */
+#if defined(_WIN32) || defined(__linux__)
+#define COLI_XDNA_HAS_LOADER 1
 #endif
 
 /* Entry points required of a helper at ABI generation 2. Still minimal: exactly
@@ -59,6 +68,8 @@ static struct {
     char            path[1024];      /* test override; empty = default lookup */
 #ifdef _WIN32
     HMODULE         dll;
+#elif defined(__linux__)
+    void           *dll;             /* dlopen handle */
 #endif
     coli_xdna_fn_abi_version    abi_version;
     coli_xdna_fn_open           open;
@@ -118,7 +129,78 @@ const char *coli_xdna_binding_text(ColiXdnaBinding state){
     return "UNKNOWN";
 }
 
+#ifdef COLI_XDNA_HAS_LOADER
+
+/* The four platform primitives the loader needs. Everything above and below
+ * them -- the lookup policy, the handshake, the all-or-nothing binding and the
+ * release order -- is shared, so Windows and Linux cannot drift apart in what
+ * they accept. */
 #ifdef _WIN32
+typedef HMODULE coli_xdna_module;
+#define COLI_XDNA_PATH_SEP '\\'
+
+/* Absolute path of the running executable. */
+static int coli_xdna_exe_path(char *out, size_t cap){
+    DWORD n = GetModuleFileNameA(NULL, out, (DWORD)cap);
+    return n != 0 && n < cap;
+}
+static int coli_xdna_file_exists(const char *path){
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+/* LOAD_WITH_ALTERED_SEARCH_PATH lets the helper's own directory satisfy the
+ * helper's dependencies (it will eventually need the XRT runtime beside it)
+ * without widening the search for the helper itself, which is located by
+ * absolute path. */
+static coli_xdna_module coli_xdna_module_open(const char *path){
+    return LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+}
+static void *coli_xdna_module_symbol(coli_xdna_module m, const char *name){
+    /* GetProcAddress returns FARPROC; casting to the exact exported signature
+     * is the standard LoadLibrary idiom, same as backend_loader.c's RESOLVE. */
+    return (void *)GetProcAddress(m, name);
+}
+static void coli_xdna_module_close(coli_xdna_module m){ FreeLibrary(m); }
+
+#else /* __linux__ */
+typedef void *coli_xdna_module;
+#define COLI_XDNA_PATH_SEP '/'
+
+static int coli_xdna_exe_path(char *out, size_t cap){
+    ssize_t n = readlink("/proc/self/exe", out, cap);
+    if(n <= 0 || (size_t)n >= cap) return 0;       /* error, or truncated */
+    out[n] = '\0';
+    return 1;
+}
+static int coli_xdna_file_exists(const char *path){
+    return access(path, F_OK) == 0;
+}
+/* The path always contains a slash, so dlopen takes it literally: no
+ * LD_LIBRARY_PATH, no RUNPATH, no ld.so.cache for the helper itself. Its own
+ * dependencies (libxrt_coreutil) resolve the normal way, which is the Linux
+ * counterpart of LOAD_WITH_ALTERED_SEARCH_PATH. RTLD_LOCAL keeps the helper's
+ * symbols out of the global namespace; RTLD_NOW makes an unresolvable
+ * dependency a load failure here rather than a crash on first call. */
+static coli_xdna_module coli_xdna_module_open(const char *path){
+    return dlopen(path, RTLD_NOW | RTLD_LOCAL);
+}
+static void *coli_xdna_module_symbol(coli_xdna_module m, const char *name){
+    return dlsym(m, name);
+}
+static void coli_xdna_module_close(coli_xdna_module m){ dlclose(m); }
+#endif
+
+/* <exe-dir><sep><name>, by absolute path. */
+static int coli_xdna_beside_exe(const char *name, char *out, size_t cap){
+    char exe[512];
+    if(!coli_xdna_exe_path(exe, sizeof exe)) return 0;
+    char *slash = strrchr(exe, '\\');
+    char *fwd   = strrchr(exe, '/');
+    if(fwd && (!slash || fwd > slash)) slash = fwd;
+    if(!slash) return 0;
+    *slash = '\0';
+    int written = snprintf(out, cap, "%s%c%s", exe, COLI_XDNA_PATH_SEP, name);
+    return written > 0 && (size_t)written < cap;
+}
 
 /* Where the helper is looked for when no test override is set: beside the
  * running executable, by absolute path. Deliberately NOT a search: no PATH, no
@@ -127,16 +209,7 @@ const char *coli_xdna_binding_text(ColiXdnaBinding state){
  * load, so a search order here would be both unsafe and unpredictable. A helper
  * that is not where we look is simply ABSENT. */
 static int coli_xdna_default_helper_path(char *out, size_t cap){
-    char exe[512];
-    DWORD n = GetModuleFileNameA(NULL, exe, (DWORD)sizeof exe);
-    if(n == 0 || n >= sizeof exe) return 0;
-    char *slash = strrchr(exe, '\\');
-    char *fwd   = strrchr(exe, '/');
-    if(fwd && (!slash || fwd > slash)) slash = fwd;
-    if(!slash) return 0;
-    *slash = '\0';
-    int written = snprintf(out, cap, "%s\\%s", exe, COLI_XDNA_HELPER_DLL);
-    return written > 0 && (size_t)written < cap;
+    return coli_xdna_beside_exe(COLI_XDNA_HELPER_DLL, out, cap);
 }
 
 static void coli_xdna_probe(void){
@@ -154,17 +227,13 @@ static void coli_xdna_probe(void){
     /* Absence is not a load failure, and the difference is worth keeping: one
      * means "this build simply has no optional lane here", the other means "a
      * helper is installed but something about it is wrong". */
-    if(GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES){
+    if(!coli_xdna_file_exists(path)){
         g_xdna.state = COLI_XDNA_ABSENT;
         return;
     }
 
     g_xdna.load_attempts++;
-    /* LOAD_WITH_ALTERED_SEARCH_PATH lets the helper's own directory satisfy the
-     * helper's dependencies (it will eventually need the XRT runtime beside it)
-     * without widening the search for the helper itself, which we located by
-     * absolute path above. */
-    HMODULE dll = LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    coli_xdna_module dll = coli_xdna_module_open(path);
     if(!dll){
         g_xdna.state = COLI_XDNA_LOAD_FAILED;
         return;
@@ -173,25 +242,23 @@ static void coli_xdna_probe(void){
     /* Resolve into locals: nothing becomes callable until the whole set has
      * validated and the ABI generation matches. */
 #if defined(__GNUC__)
-    /* GetProcAddress returns FARPROC; casting to the exact exported signature
-     * is the standard LoadLibrary idiom, same as backend_loader.c's RESOLVE. */
     #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Wcast-function-type"
+    #pragma GCC diagnostic ignored "-Wpedantic"
 #endif
     coli_xdna_fn_abi_version abi_version =
-        (coli_xdna_fn_abi_version)GetProcAddress(dll, "coli_xdna_helper_abi_version");
+        (coli_xdna_fn_abi_version)coli_xdna_module_symbol(dll, "coli_xdna_helper_abi_version");
     coli_xdna_fn_open open_fn =
-        (coli_xdna_fn_open)GetProcAddress(dll, "coli_xdna_helper_open");
+        (coli_xdna_fn_open)coli_xdna_module_symbol(dll, "coli_xdna_helper_open");
     coli_xdna_fn_wrap_weight wrap_fn =
-        (coli_xdna_fn_wrap_weight)GetProcAddress(dll, "coli_xdna_helper_wrap_weight");
+        (coli_xdna_fn_wrap_weight)coli_xdna_module_symbol(dll, "coli_xdna_helper_wrap_weight");
     coli_xdna_fn_execute exec_fn =
-        (coli_xdna_fn_execute)GetProcAddress(dll, "coli_xdna_helper_execute");
+        (coli_xdna_fn_execute)coli_xdna_module_symbol(dll, "coli_xdna_helper_execute");
     coli_xdna_fn_release_weight relw_fn =
-        (coli_xdna_fn_release_weight)GetProcAddress(dll, "coli_xdna_helper_release_weight");
+        (coli_xdna_fn_release_weight)coli_xdna_module_symbol(dll, "coli_xdna_helper_release_weight");
     coli_xdna_fn_shutdown shutdown =
-        (coli_xdna_fn_shutdown)GetProcAddress(dll, "coli_xdna_helper_shutdown");
+        (coli_xdna_fn_shutdown)coli_xdna_module_symbol(dll, "coli_xdna_helper_shutdown");
     coli_xdna_fn_last_error lasterr_fn =
-        (coli_xdna_fn_last_error)GetProcAddress(dll, "coli_xdna_helper_last_error");
+        (coli_xdna_fn_last_error)coli_xdna_module_symbol(dll, "coli_xdna_helper_last_error");
 #if defined(__GNUC__)
     #pragma GCC diagnostic pop
 #endif
@@ -202,7 +269,7 @@ static void coli_xdna_probe(void){
      * A helper that cannot even report its generation is incompatible, not
      * incomplete -- there is no version to compare. */
     if(!abi_version || abi_version() != COLI_XDNA_ABI_VERSION){
-        FreeLibrary(dll);
+        coli_xdna_module_close(dll);
         g_xdna.state = COLI_XDNA_ABI_INCOMPATIBLE;
         return;
     }
@@ -210,7 +277,7 @@ static void coli_xdna_probe(void){
      * partially bound helper would report availability and then fail somewhere
      * further in, where the failure is far harder to attribute. */
     if(!open_fn || !wrap_fn || !exec_fn || !relw_fn || !shutdown || !lasterr_fn){
-        FreeLibrary(dll);
+        coli_xdna_module_close(dll);
         g_xdna.state = COLI_XDNA_SYMBOL_INCOMPLETE;
         return;
     }
@@ -229,22 +296,28 @@ static void coli_xdna_probe(void){
 void coli_xdna_shutdown(void){
     /* Release lane state (which itself calls the helper) BEFORE the module goes
      * away: no helper-owned object may outlive the module that created it, and
-     * no host pointer into it may survive the FreeLibrary. */
+     * no host pointer into it may survive the module release. */
     coli_xdna_execution_shutdown();
     coli_xdna_clear_entry_points();
     if(g_xdna.dll){
-        FreeLibrary(g_xdna.dll);
+        coli_xdna_module_close(g_xdna.dll);
         g_xdna.dll = NULL;      /* released exactly once; repeat calls are no-ops */
     }
     /* The verdict is deliberately NOT reset to UNPROBED: shutting the lane down
      * is not a reason to re-probe it later in the same process. */
 }
 
-#else  /* !_WIN32 */
+void *coli_xdna_test_helper_symbol(const char *name){
+    if(!g_xdna.dll || !name) return NULL;
+    return coli_xdna_module_symbol(g_xdna.dll, name);
+}
 
-/* The qualified XDNA lane is Windows/XDNA2-specific (see the N6 architecture
- * freeze). Elsewhere the loader compiles and answers ABSENT, so the rest of the
- * engine needs no platform branches and the contract stays uniform. */
+#else  /* !COLI_XDNA_HAS_LOADER */
+
+/* The qualified XDNA lane needs an XRT the helper can link, which exists on
+ * Windows and Linux only. Elsewhere the loader compiles and answers ABSENT, so
+ * the rest of the engine needs no platform branches and the contract stays
+ * uniform. */
 static void coli_xdna_probe(void){
     g_xdna.state = COLI_XDNA_ABSENT;
 }
@@ -254,7 +327,12 @@ void coli_xdna_shutdown(void){
     coli_xdna_clear_entry_points();
 }
 
-#endif /* _WIN32 */
+void *coli_xdna_test_helper_symbol(const char *name){
+    (void)name;
+    return NULL;
+}
+
+#endif /* COLI_XDNA_HAS_LOADER */
 
 ColiXdnaBinding coli_xdna_binding(void){
     /* Sticky: probe at most once per path. Everything after the first call is a
@@ -1170,20 +1248,12 @@ ColiXdnaHard coli_xdna_test_last_hard(void){ return g_xdna_last_hard; }
 ColiXdnaExec coli_xdna_test_last_exec(void){ return g_xdna_last_exec; }
 
 void coli_xdna_test_set_force_execution(int on){ g_xdna_force = on ? 1 : 0; }
-/* The product artifact root: <exe-dir>\xdna. Same anchor as the helper, same
- * absolute form, same refusal to search. */
+/* The product artifact root: <exe-dir>\xdna on Windows, <exe-dir>/xdna on
+ * Linux. Same anchor as the helper, same absolute form, same refusal to
+ * search. */
 int coli_xdna_product_artifact_root(char *out, size_t cap){
-#ifdef _WIN32
-    char exe[512];
-    DWORD n = GetModuleFileNameA(NULL, exe, (DWORD)sizeof exe);
-    if(n == 0 || n >= sizeof exe) return 0;
-    char *slash = strrchr(exe, '\\');
-    char *fwd   = strrchr(exe, '/');
-    if(fwd && (!slash || fwd > slash)) slash = fwd;
-    if(!slash) return 0;
-    *slash = '\0';
-    int written = snprintf(out, cap, "%s\\%s", exe, COLI_XDNA_ARTIFACT_DIR);
-    return written > 0 && (size_t)written < cap;
+#ifdef COLI_XDNA_HAS_LOADER
+    return coli_xdna_beside_exe(COLI_XDNA_ARTIFACT_DIR, out, cap);
 #else
     (void)out; (void)cap;
     return 0;

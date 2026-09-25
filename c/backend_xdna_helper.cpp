@@ -24,7 +24,8 @@
 //
 // Build: see GPU_BACKENDS.md. Requires the XRT SDK headers and
 // xrt_coreutil.lib; MSVC needs /Zc:__cplusplus for xrt/detail/any.h to select
-// <any> instead of its boost fallback.
+// <any> instead of its boost fallback. On Linux `make xdna-helper` builds
+// libcoli_xdna.so against libxrt_coreutil.so (XRT_ROOT, default /opt/xilinx/xrt).
 
 #include <cstdint>
 #include <cstring>
@@ -39,7 +40,11 @@
 #include "xrt/experimental/xrt_xclbin.h"
 #include "xrt/experimental/xrt_ext.h"
 
+#ifdef _WIN32
 #define COLI_XDNA_HELPER_API extern "C" __declspec(dllexport)
+#else
+#define COLI_XDNA_HELPER_API extern "C" __attribute__((visibility("default")))
+#endif
 
 // Must equal COLI_XDNA_ABI_VERSION in c/backend_xdna.h. Exact equality: the
 // host refuses any other generation outright.
