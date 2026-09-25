@@ -28,8 +28,11 @@ dependencies really are complete, for three ways they could silently not be:
 3. A .d that does not cover what its source includes. Every unconditional
    `#include "..."` of each built target's source must appear in its .d, and
    for the engines `make -q -W <header>` must actually answer "rebuild".
-   Includes under #if are not required: `uring.h` is read on Linux only, and a
-   Windows build that does not depend on it is correct.
+   Includes under #if are not required here: `uring.h` is read on Linux only,
+   and a Windows build that does not depend on it is correct. What stands
+   behind them instead is point 1, checked in every build flavour the host
+   accepts: a compile that reads a conditional header is a one-unit compile
+   with -MMD, so the header is in that flavour's .d.
 
 The engine list is still DERIVED from the Makefile, never kept here: anything
 matching `NAME$(EXE):` with a `NAME.c` beside it is an engine, and the family
@@ -141,20 +144,34 @@ def _commands(targets, *variables):
     return commands
 
 
-def _gpu_variables(exe):
-    """The make variable that builds the GPU flavour here, or None.
+# Every build switch that changes what a compile reads, with the define that
+# shows it took effect. HIP=1 gets a fixed architecture, as the CI syntax job
+# does, because the default asks for a GPU the host may not have.
+FLAVOURS = ((("CUDA=1",), "-DCOLI_CUDA"),
+            (("CUDA_DLL=1",), "-DCOLI_CUDA"),
+            (("HIP=1", "HIP_ARCH=gfx1100"), "-DCOLI_CUDA"),
+            (("HIP_DLL=1",), "-DCOLI_HIP_DLL"),
+            (("VK=1",), "-DCOLI_VULKAN"),
+            (("XDNA=1",), "-DCOLI_XDNA"),
+            (("METAL=1",), "-DCOLI_METAL"))
 
-    QWEN36_TIER_OBJ only exists with CUDA/HIP, and a GPU build is where a
-    second unit last crept onto a command line, so the one-unit check has to
-    see that configuration too. CUDA=1 is refused off Linux and the wording
-    differs per platform, so test the fact rather than the message, the way
-    test_makefile_cuda_scope does: does colibri then get -DCOLI_CUDA?
+
+def _accepted_flavours(exe):
+    """The build flavours this host's make accepts, as variable tuples.
+
+    Headers under #if are read only in the flavour that turns them on
+    (backend_xdna.h with XDNA=1, backend_vulkan.h with VK=1, qwen36_tier.o
+    only with CUDA or HIP), so the one-unit check has to see each of them.
+    Several are refused off their platform, with wording that differs per
+    platform, so test the fact rather than the message, the way
+    test_makefile_cuda_scope does: does colibri then get the define?
     """
-    for variable in ("CUDA=1", "CUDA_DLL=1"):
-        proc = _make("-Bn", "colibri" + exe, variable)
-        if proc.returncode == 0 and "-DCOLI_CUDA" in proc.stdout:
-            return variable
-    return None
+    accepted = []
+    for variables, define in FLAVOURS:
+        proc = _make("-Bn", "colibri" + exe, *variables)
+        if proc.returncode == 0 and define in proc.stdout:
+            accepted.append(variables)
+    return accepted
 
 
 def _dep_file(target):
@@ -288,27 +305,32 @@ class GeneratedDepsWiringTest(unittest.TestCase):
         problems = self._one_unit_problems()
         self.assertEqual(problems, [], "\n  " + "\n  ".join(problems))
 
-    def test_every_generated_rule_compiles_one_unit_in_the_gpu_build(self):
-        """The same with CUDA/HIP on, where the qwen36 tier joins the build.
-        Bite: put qwen36_tier.c back on qwen36's command line."""
-        variable = _gpu_variables(self.exe)
-        if variable is None:
-            self.skipTest("this host emits no GPU recipe for colibri")
-        problems = self._one_unit_problems(variable)
-        self.assertEqual(problems, [], f"with {variable}:\n  " + "\n  ".join(problems))
+    def test_every_generated_rule_compiles_one_unit_in_every_build_flavour(self):
+        """The same in every flavour this host accepts (VK=1, XDNA=1, the GPU
+        builds, ...). A header under #if reaches a .d only through the compile
+        that reads it, so this is what stands behind the conditional includes
+        the coverage test below cannot require. Bite: put qwen36_tier.c back
+        on qwen36's command line; the GPU flavour then fails."""
+        flavours = _accepted_flavours(self.exe)
+        if not flavours:
+            self.skipTest("this host accepts no build flavour beyond the default")
+        for variables in flavours:
+            with self.subTest(flavour=" ".join(variables)):
+                problems = self._one_unit_problems(*variables)
+                self.assertEqual(problems, [], "\n  " + "\n  ".join(problems))
 
     def test_the_checks_leave_the_build_config_alone(self):
-        """Parsing with CUDA=1 or CUDA_DLL=1 rewrites .build-config; the checks
+        """Parsing with another flavour rewrites .build-config; the checks
         above do exactly that, and must not change which configuration the
         tree says it was built with. Bite: drop the `with _build_config_kept()`
-        from `_make` and this fails whenever a GPU flavour is accepted here."""
+        from `_make` and this fails whenever a flavour is accepted here."""
         path = C_DIR / ".build-config"
         before = (path.read_bytes(), path.stat().st_mtime_ns) if path.exists() else None
-        _gpu_variables(self.exe)
-        _make("-Bn", "colibri" + self.exe, "XDNA=1")
+        _accepted_flavours(self.exe)
         after = (path.read_bytes(), path.stat().st_mtime_ns) if path.exists() else None
         self.assertEqual(after, before, ".build-config was changed by a make call "
                                         "that only meant to read the Makefile")
+
 
 @unittest.skipUnless(MAKE, "make is not installed")
 class GeneratedDepsCoverageTest(unittest.TestCase):
