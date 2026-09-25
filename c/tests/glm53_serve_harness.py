@@ -35,6 +35,18 @@ def reuse_reported():
                if line.startswith("REUSE "))
 
 
+def reuse_line(request_id):
+    """La riga REUSE di una richiesta, spezzata in campi (vuota se non c'e')."""
+    try:
+        text = open(NOTES, "r", errors="replace").read()
+    except OSError:
+        return []
+    for line in text.splitlines():
+        if line.startswith(f"REUSE {request_id} "):
+            return line.split()
+    return []
+
+
 def engine(binary, fixture, extra=None):
     # GLM53_VERBOSE: il riuso del prefisso si racconta solo su richiesta,
     # perche' `coli chat` eredita lo stderr del server e quella riga finirebbe
@@ -174,6 +186,17 @@ def main() -> int:
             print("FAIL: lo slot non ha riusato niente su un prompt che estende "
                   "quello di prima")
             return 1
+        if reuse_line(7)[-1:] != ["cold"] or reuse_line(10)[-1:] != ["extend"]:
+            print(f"FAIL: motivi del riuso {reuse_line(7)!r} / {reuse_line(10)!r}, "
+                  f"attesi cold e extend")
+            return 1
+        # Il turno 7 si e' fermato al limite di token: la storia dello slot ha
+        # un token in piu' di quelli in cache, e il prompt del turno 10 combacia
+        # anche con quello. <in comune> non deve superare <in cache>.
+        if reuse_line(10)[5] != reuse_line(10)[4]:
+            print(f"FAIL: REUSE 10 dice {reuse_line(10)[5]} in comune ma "
+                  f"{reuse_line(10)[4]} in cache: {reuse_line(10)!r}")
+            return 1
 
         # --- CANCEL a meta' turno (#1332) ---
         #
@@ -192,14 +215,17 @@ def main() -> int:
         budget = 512
         submit(process, 12, prompt, max_tokens=budget)
         emitted_before = 0
+        cancelled_text = b""
         while True:
             line = read_line(process.stdout)
-            if not line.startswith("DATA "):
+            if line.startswith("DONE ") or line.startswith("ERROR "):
                 break
+            if not line.startswith("DATA "):
+                continue    # EMAP, HITS, PROF: si ignorano, come fa il gateway
             _, got_id, count = line.split()
             if int(got_id) != 12:
                 raise AssertionError(f"DATA per {got_id}, atteso 12")
-            process.stdout.read(int(count) + 1)
+            cancelled_text += process.stdout.read(int(count) + 1)[:int(count)]
             emitted_before += 1
             if emitted_before == 1:
                 process.stdin.write(b"CANCEL 12\n")
@@ -211,6 +237,46 @@ def main() -> int:
         if emitted_before >= budget:
             print(f"FAIL: il turno ha emesso tutti i {budget} token chiesti prima "
                   f"di rispondere al CANCEL: non e' stato onorato a meta' turno")
+            return 1
+
+        # La riga CANCEL su stderr: e' l'unico modo di sapere, dopo, quanti
+        # token il motore ha mandato e quanti ne tiene in cache. Qui la pipa
+        # non perde niente, quindi `emitted` deve essere esattamente i DATA
+        # letti; e `filled` deve essere prompt piu' emessi, che e' quello che
+        # un Continue dovra' superare per riusare lo slot.
+        notes = open(NOTES, "r", errors="replace").read().splitlines()
+        cancel_lines = [line.split() for line in notes if line.startswith("CANCEL 12 ")]
+        if len(cancel_lines) != 1 or len(cancel_lines[0]) != 5:
+            print(f"FAIL: attesa una riga 'CANCEL 12 <prompt> <emessi> <filled>' "
+                  f"su stderr, trovate {cancel_lines!r}")
+            return 1
+        cancel_prompt, cancel_emitted, cancel_filled = map(int, cancel_lines[0][2:])
+        if cancel_emitted != emitted_before:
+            print(f"FAIL: CANCEL dice {cancel_emitted} token emessi, ne sono "
+                  f"arrivati {emitted_before}")
+            return 1
+        if cancel_filled != cancel_prompt + cancel_emitted:
+            print(f"FAIL: CANCEL con filled {cancel_filled}, atteso prompt "
+                  f"{cancel_prompt} + emessi {cancel_emitted}")
+            return 1
+        if not any(line.startswith("REUSE 12 ") for line in notes):
+            print("FAIL: il turno interrotto non ha lasciato la sua riga REUSE")
+            return 1
+
+        # Il Continue di un client che ha ricevuto tutto: il prompt di prima
+        # piu' esattamente i token arrivati. Coincide con la cache, token per
+        # token, e il riuso salta lo stesso perche' non resta niente da
+        # macinare. La riga REUSE deve dirlo ("equal"), non confonderlo con un
+        # prompt che diverge.
+        submit_bytes(process, 20, prompt.encode() + cancelled_text, max_tokens=1)
+        _, done20, _ = collect(process, 20)
+        if not done20.startswith("DONE 20 "):
+            print(f"FAIL: Continue dopo il CANCEL -> {done20!r}")
+            return 1
+        why20 = reuse_line(20)
+        if why20[3:] != [str(cancel_filled)] * 3 + ["equal"]:
+            print(f"FAIL: Continue identico alla cache -> REUSE {why20!r}, atteso "
+                  f"prompt, cache e comune tutti {cancel_filled} con motivo equal")
             return 1
 
         # Dopo un CANCEL lo stream deve restare allineato come dopo un errore:

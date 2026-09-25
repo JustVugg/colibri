@@ -3246,15 +3246,24 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * e ne ha almeno una in piu': lo stato ricorrente dei layer KDA non si
      * riavvolge, quindi una divergenza a meta' cache obbliga a rifare. */
     const int cached = slot->session ? slot->session->filled : 0;
+    const int common = slot_shared(slot, sequence, total);
     int shared = 0;
-    if (cached > 0 && cached < total && slot_shared(slot, sequence, total) >= cached)
+    if (cached > 0 && cached < total && common >= cached)
         shared = cached;
+    /* Perche' il riuso e' andato com'e' andato, per la riga REUSE: "0 riusati"
+     * da solo non distingue un prompt che diverge (un token perso, uno spazio
+     * tolto dal gateway) da uno identico alla cache, che fallisce solo perche'
+     * non resta nessun token da macinare. */
+    const char *why = cached == 0                        ? "cold"
+                    : total <= cached && common == total ? (total == cached ? "equal" : "shorter")
+                    : common < cached                    ? "diverged"
+                    :                                      "extend";
     /* La fotografia si prova sempre, non solo quando il riuso in avanti
      * fallisce: se lo stato vivo e gia il prompt condiviso, il riuso normale
      * scatterebbe lo stesso ma il primo token fresco resterebbe senza
      * predittore, e quindi senza logprob, proprio quello che serve. */
     int pinned = slot_pin_restore(m, slot, sequence, total);
-    if (pinned > 0) shared = pinned;
+    if (pinned > 0) { shared = pinned; why = "pin"; }
     if (shared <= 0) {
         slot_reset(m, slot);
         slot->session = session_open(m, room);
@@ -3276,6 +3285,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
             return 0;
         }
         if (shared) {                             /* niente riuso con un'immagine */
+            why = "image";
             slot_reset(m, slot);
             slot->session = session_open(m, room);
             shared = 0;
@@ -3343,6 +3353,31 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     /* La sessione resta allo slot per il turno dopo, con la sequenza che ha
      * davvero macinato: prompt piu' quello che ha generato. */
     slot_remember(slot, sequence, total);
+    /* Quanto prefisso lo slot ha risparmiato.
+     *
+     * Su STDERR, non nel protocollo. La specifica dice che un server ignora le
+     * righe che non conosce, ma questo progetto ha scelto il contrario apposta
+     * e lo mette per iscritto in un test: una riga sconosciuta uccide il
+     * dispatcher, cosi' un motore non puo' parlare a un server che non lo
+     * capisce. La regola vera e' quella del test, non quella del documento.
+     *
+     * E dietro GLM53_VERBOSE, perche' `coli chat` eredita lo stderr del server:
+     * senza guardia questa riga compare a schermo dopo ogni risposta, sotto gli
+     * occhi di chi voleva solo la risposta.
+     *
+     * REUSE <id> <riusati> <prompt> <in cache> <in comune> <perche'>: i primi
+     * tre campi sono quelli di sempre, gli altri dicono perche' il riuso non
+     * e' scattato (cold, equal, shorter, diverged, extend, pin, image).
+     * <in comune> si ferma a <in cache>: dopo un limite di token la storia
+     * dello slot ha un token in piu' di quelli macinati, e contarlo farebbe
+     * leggere "combacia piu' di quanto c'e' in cache".
+     *
+     * Prima del ramo del CANCEL, non dopo: anche un turno interrotto ha
+     * riusato (o no) il suo prefisso, e un turno che non lascia righe non si
+     * puo' confrontare con quello che lo riprende. */
+    if (getenv("GLM53_VERBOSE"))
+        fprintf(stderr, "REUSE %llu %d %d %d %d %s\n", q->id, reused, prompt_tokens,
+                cached, common < cached ? common : cached, why);
     /* Il turno e' stato interrotto: si risponde col frame che il gateway
      * aspetta per rilasciare l'ammissione dello scheduler (openai_server.py
      * accetta ERROR <id> CANCELLED oppure un DONE, ma il DONE direbbe al
@@ -3354,6 +3389,14 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * riusare il prefisso. Buttarlo costerebbe un prefill intero per punire
      * un client che ha cambiato idea. */
     if (ctl == SERVE_CTL_CANCEL) {
+        /* Fin dove e' arrivato il motore: il client ne ha ricevuti al massimo
+         * `emitted`, e quanti ne mancano si legge solo dal suo lato. `filled`
+         * sta accanto perche' un Continue riusa solo se ha piu' token di
+         * quelli in cache: oggi filled == prompt + emitted, quindi anche un
+         * client che ha ricevuto tutto rifa' il prefill da capo. */
+        if (getenv("GLM53_VERBOSE"))
+            fprintf(stderr, "CANCEL %llu %d %d %d\n", q->id, prompt_tokens,
+                    emitted, session->filled);
         serve_line("ERROR %llu CANCELLED\n", q->id);
         free(sequence);
         return input_eof ? -1 : 0;
@@ -3364,19 +3407,6 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * stato il limite di token a fermarlo -- e la storia e' gia' stata scritta
      * sopra, quindi lo slot resta quello che e'. */
     const double elapsed = now_s() - started;
-    /* Quanto prefisso lo slot ha risparmiato.
-     *
-     * Su STDERR, non nel protocollo. La specifica dice che un server ignora le
-     * righe che non conosce, ma questo progetto ha scelto il contrario apposta
-     * e lo mette per iscritto in un test: una riga sconosciuta uccide il
-     * dispatcher, cosi' un motore non puo' parlare a un server che non lo
-     * capisce. La regola vera e' quella del test, non quella del documento.
-     *
-     * E dietro GLM53_VERBOSE, perche' `coli chat` eredita lo stderr del server:
-     * senza guardia questa riga compare a schermo dopo ogni risposta, sotto gli
-     * occhi di chi voleva solo la risposta. */
-    if (getenv("GLM53_VERBOSE"))
-        fprintf(stderr, "REUSE %llu %d %d\n", q->id, reused, prompt_tokens);
     hits_emit(m);
     {
         const double disk = m->t_disk - s_disk, ffn = m->t_ffn - s_ffn;
