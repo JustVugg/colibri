@@ -56,3 +56,5 @@ shaders/rmsnorm.spv
 tests/xdna_exec_fixtures/
 tests/xdna_fail_fixtures/
 tests/xdna_physical_probe
+tests/xdna_fake_helper*.so
+libcoli_xdna.so

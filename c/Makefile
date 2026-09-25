@@ -497,12 +497,12 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 # arm64 (e.g. macOS): "unsupported option '-msse4.1' for target arm64-...".
 # Appended back below only on x86-64 hosts, alongside the other conditional
 # platform tests already handled the same way.
-# test_xdna_execution and test_xdna_failure are Windows-only for the same kind
-# of reason: they load tests/xdna_fake_helper.dll through the XDNA loader, which
-# is LoadLibraryExA. Off Windows the loader answers ABSENT by design, so there
-# is nothing for them to bind to, and the synthetic helper is a __declspec DLL
-# that gcc and clang refuse to compile. The other three XDNA owners (registry,
-# prepared state, QT state) touch no loader and stay portable gates.
+# test_xdna_execution and test_xdna_failure run on Windows and Linux: they load
+# the synthetic helper (tests/xdna_fake_helper.dll / .so) through the XDNA
+# loader, which is LoadLibraryExA or dlopen. Elsewhere the loader answers ABSENT
+# by design, so there is nothing for them to bind to. The other three XDNA
+# owners (registry, prepared state, QT state) touch no loader and stay portable
+# gates.
 # test_e8x4g64_loader takes a minted container directory on argv and prints its
 # usage (exit 2) without one, so it is a harness rather than a gate: it has a
 # rule here so it compiles under the suite's own $(CFLAGS) and its warnings are
@@ -523,7 +523,7 @@ ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 TEST_BINS += tests/test_exact_dot$(EXE)
 endif
-ifneq (,$(IS_WIN))
+ifneq (,$(IS_WIN)$(LINUX))
 TEST_BINS += tests/test_xdna_execution$(EXE) tests/test_xdna_failure$(EXE)
 endif
 ifneq (,$(X86_64))
@@ -838,6 +838,20 @@ backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
 xdna-obj: backend_xdna.o
 backend_xdna.o: backend_xdna.c backend_xdna.h .build-config
 	$(CC) $(CFLAGS) -c backend_xdna.c -o $@
+
+# The optional helper on Linux: the ONLY target that compiles against XRT, and
+# never part of `all` or `check`. Needs the XRT SDK (headers + libxrt_coreutil)
+# and a C++17 compiler; the runtime is found through the rpath set here, so the
+# helper can sit beside the executable with no LD_LIBRARY_PATH. On Windows the
+# helper is built with MSVC (see backend_xdna_helper.cpp).
+XRT_ROOT ?= /opt/xilinx/xrt
+CXX      ?= g++
+.PHONY: xdna-helper
+xdna-helper: libcoli_xdna.so
+libcoli_xdna.so: backend_xdna_helper.cpp
+	$(CXX) -std=c++17 -O2 -fPIC -shared -fvisibility=hidden -Wall -Wextra \
+		-I$(XRT_ROOT)/include $< -o $@ \
+		-L$(XRT_ROOT)/lib -Wl,-rpath,$(XRT_ROOT)/lib -lxrt_coreutil
 
 # Windows CUDA DLL: compile backend_cuda.cu with nvcc (+MSVC cl.exe as host
 # compiler, required by nvcc on Windows) into coli_cuda.dll. Run this from a
@@ -1365,15 +1379,23 @@ tests/test_xdna_registry$(EXE): tests/test_xdna_registry.c backend_xdna.c backen
 # Synthetic ABI-2 helpers for the execution tests. Plain C, no XRT, no device:
 # they let the whole execution control flow be qualified on a machine with no
 # NPU. Three variants so the all-or-nothing binding contract is testable.
-XDNA_FAKE_HELPERS = tests/xdna_fake_helper.dll \
-                    tests/xdna_fake_helper_abi1.dll \
-                    tests/xdna_fake_helper_partial.dll
-tests/xdna_fake_helper.dll: tests/xdna_fake_helper.c
-	$(CC) $(CFLAGS) -shared $< -o $@
-tests/xdna_fake_helper_abi1.dll: tests/xdna_fake_helper.c
-	$(CC) $(CFLAGS) -DFAKE_ABI1 -shared $< -o $@
-tests/xdna_fake_helper_partial.dll: tests/xdna_fake_helper.c
-	$(CC) $(CFLAGS) -DFAKE_PARTIAL -shared $< -o $@
+# A .dll on Windows, a position-independent .so elsewhere.
+ifneq (,$(IS_WIN))
+XDNA_DLEXT   = .dll
+XDNA_SHARED  = -shared
+else
+XDNA_DLEXT   = .so
+XDNA_SHARED  = -shared -fPIC
+endif
+XDNA_FAKE_HELPERS = tests/xdna_fake_helper$(XDNA_DLEXT) \
+                    tests/xdna_fake_helper_abi1$(XDNA_DLEXT) \
+                    tests/xdna_fake_helper_partial$(XDNA_DLEXT)
+tests/xdna_fake_helper$(XDNA_DLEXT): tests/xdna_fake_helper.c
+	$(CC) $(CFLAGS) $(XDNA_SHARED) $< -o $@
+tests/xdna_fake_helper_abi1$(XDNA_DLEXT): tests/xdna_fake_helper.c
+	$(CC) $(CFLAGS) -DFAKE_ABI1 $(XDNA_SHARED) $< -o $@
+tests/xdna_fake_helper_partial$(XDNA_DLEXT): tests/xdna_fake_helper.c
+	$(CC) $(CFLAGS) -DFAKE_PARTIAL $(XDNA_SHARED) $< -o $@
 
 tests/test_xdna_execution$(EXE): tests/test_xdna_execution.c backend_xdna.c backend_xdna.h compat.h $(XDNA_FAKE_HELPERS)
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1386,10 +1408,11 @@ tests/test_xdna_failure$(EXE): tests/test_xdna_failure.c colibri.c backend_xdna.
 
 # NOT a test gate -- intentionally absent from TEST_BINS (its name does not match
 # the tests/test_*$(EXE) pattern the gate list is derived from). It needs a real
-# XDNA2 NPU, a working XRT, a built coli_xdna.dll and the qualified artifact
-# bytes, none of which a build machine may assume. Build and run it explicitly:
+# XDNA2 NPU, a working XRT, a built helper (coli_xdna.dll, or libcoli_xdna.so
+# from `make xdna-helper` on Linux) and the qualified artifact bytes, none of
+# which a build machine may assume. Build and run it explicitly:
 #   make tests/xdna_physical_probe$(EXE)
-#   tests/xdna_physical_probe <artifact-root> <path-to-coli_xdna.dll> [M-list]
+#   tests/xdna_physical_probe <artifact-root> <path-to-helper> [M-list]
 #
 # M-list defaults to 1,32,64 (the M64 bucket); pass 65,130,256 to qualify
 # the M256 bucket through the same owner.

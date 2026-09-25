@@ -1,4 +1,4 @@
-# XDNA backend (Windows, AMD Ryzen AI NPU)
+# XDNA backend (Windows and Linux, AMD Ryzen AI NPU)
 
 colibrì includes an **experimental, opt-in** backend that runs some GLM
 operations on an AMD XDNA2 NPU using a **reduced-precision BF16 compute path**.
@@ -95,7 +95,7 @@ Neither is bundled. If either is missing the helper simply will not load, and
 system libraries, with or without the NPU capability compiled in — the external
 dependencies belong to the optional package alone.
 
-Also required: Windows and an XDNA2-class NPU.
+Also required: Windows or Linux (see [Linux](#linux)) and an XDNA2-class NPU.
 
 ## When something is missing
 
@@ -185,6 +185,48 @@ only colibrì's own helper and artifacts.
 To confirm the ordinary download is unaffected, install the core archive on its
 own and run normally: no helper is loaded, no device is opened, and nothing
 about the default path changes.
+
+## Linux
+
+The same lane runs on Linux with AMD's in-tree `amdxdna` driver (kernel 6.14 or
+later) and XRT. It was qualified on a Ryzen AI Max+ 395 (Strix Halo, XDNA2),
+kernel 7.2, XRT 2.26, with the same four artifacts and the same hashes as on
+Windows: `xdna_physical_probe` passes for both buckets, and M above 256 is
+declined with zero dispatches.
+
+Only the helper differs. It is `libcoli_xdna.so`, built from the same
+`backend_xdna_helper.cpp`:
+
+```bash
+make -C c XDNA=1 colibri
+make -C c xdna-helper                # XRT_ROOT defaults to /opt/xilinx/xrt
+```
+
+The helper records XRT's library directory as its rpath, so it needs no
+`LD_LIBRARY_PATH`. The layout is the same as on Windows, resolved from
+`/proc/self/exe`:
+
+```
+<colibri directory>/
+    colibri
+    libcoli_xdna.so
+    xdna/
+        wa_F3_M64_K6144_N2048.xclbin
+        ...
+```
+
+The helper is loaded with `dlopen` by absolute path, so `LD_LIBRARY_PATH` and
+the working directory are never searched for it. Every message above applies
+unchanged, with `libcoli_xdna.so` in place of `coli_xdna.dll`. The MSVC
+redistributable note is Windows-only.
+
+To qualify a machine:
+
+```bash
+make -C c tests/xdna_physical_probe
+c/tests/xdna_physical_probe "$PWD/c/xdna" "$PWD/c/libcoli_xdna.so"             # M64: 1,32,64
+c/tests/xdna_physical_probe "$PWD/c/xdna" "$PWD/c/libcoli_xdna.so" 65,130,256  # M256
+```
 
 ## What this backend does not do
 
