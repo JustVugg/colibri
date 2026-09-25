@@ -33,10 +33,16 @@ class ClusterRegistry:
         role = str(node["role"])
         if role not in ("expert", "dense", "coordinator"):
             raise ValueError("role must be expert, dense, or coordinator")
+        # The registry keys by str(node_id) and heartbeat looks it up the same
+        # way, so a numeric node_id has always registered. Store the string in
+        # the record too, or snapshot() sorts it against a string node_id and
+        # every topology/health request dies with a TypeError.
+        node_id = str(node["node_id"])
         record = dict(node)
-        record.update(protocol_version=PROTOCOL_VERSION, port=port, last_seen=time.time())
+        record.update(node_id=node_id, protocol_version=PROTOCOL_VERSION, port=port,
+                      last_seen=time.time())
         with self._lock:
-            self._nodes[str(node["node_id"])] = record
+            self._nodes[node_id] = record
         return record
 
     def heartbeat(self, node_id):
