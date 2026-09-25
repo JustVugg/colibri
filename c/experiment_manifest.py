@@ -52,6 +52,7 @@ def _run(record, name):
 
 def validate(record):
     """Return a normalized summary or raise ValueError with an exact field."""
+    _object(record, "manifest")
     if record.get("version") != 1:
         raise ValueError("version must be 1")
     for field in ("hypothesis", "commit", "model", "command", "prompt_hash"):
