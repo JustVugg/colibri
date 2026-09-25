@@ -215,6 +215,30 @@ def main() -> int:
                   f"di rispondere al CANCEL: non e' stato onorato a meta' turno")
             return 1
 
+        # La riga CANCEL su stderr: e' l'unico modo di sapere, dopo, quanti
+        # token il motore ha mandato e quanti ne tiene in cache. Qui la pipa
+        # non perde niente, quindi `emitted` deve essere esattamente i DATA
+        # letti; e `filled` deve essere prompt piu' emessi, che e' quello che
+        # un Continue dovra' superare per riusare lo slot.
+        notes = open(NOTES, "r", errors="replace").read().splitlines()
+        cancel_lines = [line.split() for line in notes if line.startswith("CANCEL 12 ")]
+        if len(cancel_lines) != 1 or len(cancel_lines[0]) != 5:
+            print(f"FAIL: attesa una riga 'CANCEL 12 <prompt> <emessi> <filled>' "
+                  f"su stderr, trovate {cancel_lines!r}")
+            return 1
+        cancel_prompt, cancel_emitted, cancel_filled = map(int, cancel_lines[0][2:])
+        if cancel_emitted != emitted_before:
+            print(f"FAIL: CANCEL dice {cancel_emitted} token emessi, ne sono "
+                  f"arrivati {emitted_before}")
+            return 1
+        if cancel_filled != cancel_prompt + cancel_emitted:
+            print(f"FAIL: CANCEL con filled {cancel_filled}, atteso prompt "
+                  f"{cancel_prompt} + emessi {cancel_emitted}")
+            return 1
+        if not any(line.startswith("REUSE 12 ") for line in notes):
+            print("FAIL: il turno interrotto non ha lasciato la sua riga REUSE")
+            return 1
+
         # Dopo un CANCEL lo stream deve restare allineato come dopo un errore:
         # il gateway riusa la stessa pipa per la richiesta successiva.
         submit(process, 13, prompt, max_tokens=1)

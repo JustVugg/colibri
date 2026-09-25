@@ -3343,6 +3343,23 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     /* La sessione resta allo slot per il turno dopo, con la sequenza che ha
      * davvero macinato: prompt piu' quello che ha generato. */
     slot_remember(slot, sequence, total);
+    /* Quanto prefisso lo slot ha risparmiato.
+     *
+     * Su STDERR, non nel protocollo. La specifica dice che un server ignora le
+     * righe che non conosce, ma questo progetto ha scelto il contrario apposta
+     * e lo mette per iscritto in un test: una riga sconosciuta uccide il
+     * dispatcher, cosi' un motore non puo' parlare a un server che non lo
+     * capisce. La regola vera e' quella del test, non quella del documento.
+     *
+     * E dietro GLM53_VERBOSE, perche' `coli chat` eredita lo stderr del server:
+     * senza guardia questa riga compare a schermo dopo ogni risposta, sotto gli
+     * occhi di chi voleva solo la risposta.
+     *
+     * Prima del ramo del CANCEL, non dopo: anche un turno interrotto ha
+     * riusato (o no) il suo prefisso, e un turno che non lascia righe non si
+     * puo' confrontare con quello che lo riprende. */
+    if (getenv("GLM53_VERBOSE"))
+        fprintf(stderr, "REUSE %llu %d %d\n", q->id, reused, prompt_tokens);
     /* Il turno e' stato interrotto: si risponde col frame che il gateway
      * aspetta per rilasciare l'ammissione dello scheduler (openai_server.py
      * accetta ERROR <id> CANCELLED oppure un DONE, ma il DONE direbbe al
@@ -3354,6 +3371,14 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * riusare il prefisso. Buttarlo costerebbe un prefill intero per punire
      * un client che ha cambiato idea. */
     if (ctl == SERVE_CTL_CANCEL) {
+        /* Fin dove e' arrivato il motore: il client ne ha ricevuti al massimo
+         * `emitted`, e quanti ne mancano si legge solo dal suo lato. `filled`
+         * sta accanto perche' un Continue riusa solo se ha piu' token di
+         * quelli in cache: oggi filled == prompt + emitted, quindi anche un
+         * client che ha ricevuto tutto rifa' il prefill da capo. */
+        if (getenv("GLM53_VERBOSE"))
+            fprintf(stderr, "CANCEL %llu %d %d %d\n", q->id, prompt_tokens,
+                    emitted, session->filled);
         serve_line("ERROR %llu CANCELLED\n", q->id);
         free(sequence);
         return input_eof ? -1 : 0;
@@ -3364,19 +3389,6 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * stato il limite di token a fermarlo -- e la storia e' gia' stata scritta
      * sopra, quindi lo slot resta quello che e'. */
     const double elapsed = now_s() - started;
-    /* Quanto prefisso lo slot ha risparmiato.
-     *
-     * Su STDERR, non nel protocollo. La specifica dice che un server ignora le
-     * righe che non conosce, ma questo progetto ha scelto il contrario apposta
-     * e lo mette per iscritto in un test: una riga sconosciuta uccide il
-     * dispatcher, cosi' un motore non puo' parlare a un server che non lo
-     * capisce. La regola vera e' quella del test, non quella del documento.
-     *
-     * E dietro GLM53_VERBOSE, perche' `coli chat` eredita lo stderr del server:
-     * senza guardia questa riga compare a schermo dopo ogni risposta, sotto gli
-     * occhi di chi voleva solo la risposta. */
-    if (getenv("GLM53_VERBOSE"))
-        fprintf(stderr, "REUSE %llu %d %d\n", q->id, reused, prompt_tokens);
     hits_emit(m);
     {
         const double disk = m->t_disk - s_disk, ffn = m->t_ffn - s_ffn;
