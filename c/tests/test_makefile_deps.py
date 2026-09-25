@@ -15,9 +15,10 @@ dependencies really are complete, for three ways they could silently not be:
 
 1. A recipe that compiles more than one .c in one command. GCC then writes
    only the LAST unit's dependencies, so the others' headers are missing from
-   the .d with nothing to show for it. Such recipes keep hand-written lists
-   (AUTODEP_MULTI_TU) and every rule in AUTODEP_BINS is checked to compile
-   exactly one unit, with -MMD, by asking make for the commands it would run.
+   the .d with nothing to show for it. A helper source a test links is
+   therefore its own object (the tests/*.o rules), and every rule in
+   AUTODEP_BINS is checked to compile exactly one unit, with -MMD, by asking
+   make for the commands it would run.
 
 2. A binary built without a .d, e.g. before this change. Most rules do not
    depend on .build-config, so nothing else would force the rebuild that writes
@@ -233,7 +234,6 @@ class GeneratedDepsWiringTest(unittest.TestCase):
     def setUpClass(cls):
         cls.exe = (_make_var("EXE") or [""])[0]
         cls.bins = _make_var("AUTODEP_BINS")
-        cls.multi = _make_var("AUTODEP_MULTI_TU")
         cls.engines = _make_var("ENGINE_RULES")
 
     def test_every_engine_gets_generated_deps(self):
@@ -278,14 +278,13 @@ class GeneratedDepsWiringTest(unittest.TestCase):
             elif len(units) != 1:
                 problems.append(f"{target}: compiles {len(units)} units in one "
                                 f"command ({' '.join(units)}); GCC writes only the "
-                                f"last one's dependencies. Compile to objects, or "
-                                f"add it to AUTODEP_MULTI_TU and list its headers")
+                                f"last one's dependencies. Compile the extra "
+                                f"sources to objects, as the tests/*.o rules do")
         return problems
 
     def test_every_generated_rule_compiles_one_unit_with_mmd(self):
-        """Point 1 of the module docstring, default build. Bite: make a test's
-        recipe compile `$< segment_runtime.c` and leave it out of
-        AUTODEP_MULTI_TU."""
+        """Point 1 of the module docstring, default build. Bite: put
+        segment_runtime.c back on test_segment_runtime's command line."""
         problems = self._one_unit_problems()
         self.assertEqual(problems, [], "\n  " + "\n  ".join(problems))
 
@@ -310,17 +309,6 @@ class GeneratedDepsWiringTest(unittest.TestCase):
         after = (path.read_bytes(), path.stat().st_mtime_ns) if path.exists() else None
         self.assertEqual(after, before, ".build-config was changed by a make call "
                                         "that only meant to read the Makefile")
-
-    def test_multi_unit_exceptions_are_still_multi_unit(self):
-        """An exception that no longer applies should rejoin AUTODEP_BINS."""
-        targets = [f"tests/{n}{self.exe}" for n in self.multi]
-        seen = _commands(targets)
-        stale = [t for t in targets
-                 if len({w for w in seen.get(t, []) if SOURCE_RE.search(w)}) < 2]
-        self.assertEqual(stale, [], "these now compile a single unit; move them "
-                                    "out of AUTODEP_MULTI_TU and drop their "
-                                    "header lists")
-
 
 @unittest.skipUnless(MAKE, "make is not installed")
 class GeneratedDepsCoverageTest(unittest.TestCase):

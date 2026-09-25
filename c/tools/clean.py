@@ -71,7 +71,9 @@ FILES = [
 # (build/ownership/ goes as a whole directory below).
 ARTIFACT_GLOBS = ["tests/test_*", "tests/bench_*", "tests/fuzz_*",
                   "tests/*_probe*", "COLI_V4_UNIT_*.o", "*.d", "tests/*.d",
-                  "tools/*.d", "build/segment/*.d"]
+                  "tools/*.d", "build/segment/*.d",
+                  # helper objects the tests link (#1741), one unit per command
+                  "tests/*.o"]
 KEEP_EXT = (".c", ".h", ".cc", ".cpp", ".cu", ".mm", ".py", ".txt", ".json",
             ".md", ".bin", ".sh", ".toml", ".yml", ".yaml")
 # Directories to remove.

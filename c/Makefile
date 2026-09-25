@@ -1371,8 +1371,12 @@ tests/test_ue8m0$(EXE): tests/test_ue8m0.c
 
 # Compiles the engine with -DCOLI_XDNA so the QT side pointer, its reset helper
 # and the expert-slot wiring are exercised as the engine actually builds them.
-tests/test_xdna_qt_state$(EXE): tests/test_xdna_qt_state.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c -o $@ $(LDFLAGS)
+tests/test_xdna_qt_state$(EXE): tests/test_xdna_qt_state.c colibri.c tests/backend_xdna_lane.o
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< tests/backend_xdna_lane.o -o $@ $(LDFLAGS)
+# backend_xdna.c as its own object, compiled with the flags this test gave it on
+# the same command line before (#1741): one unit per command keeps each .d whole.
+tests/backend_xdna_lane.o: backend_xdna.c .build-config
+	$(CC) $(CFLAGS) -DCOLI_XDNA -c backend_xdna.c -o $@
 tests/test_xdna_prepared_state$(EXE): tests/test_xdna_prepared_state.c backend_xdna.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -1398,8 +1402,8 @@ tests/test_xdna_execution$(EXE): tests/test_xdna_execution.c backend_xdna.c $(XD
 # Failure/fallback owner. Needs BOTH the engine (matmul_qt is the fallback
 # target it verifies against) and the synthetic ABI-2 helpers, which is why it
 # is a separate owner from test_xdna_execution.
-tests/test_xdna_failure$(EXE): tests/test_xdna_failure.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(XDNA_FAKE_HELPERS)
-	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c -o $@ $(LDFLAGS)
+tests/test_xdna_failure$(EXE): tests/test_xdna_failure.c colibri.c tests/backend_xdna_lane.o $(XDNA_FAKE_HELPERS)
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< tests/backend_xdna_lane.o -o $@ $(LDFLAGS)
 
 # NOT a test gate -- intentionally absent from TEST_BINS (its name does not match
 # the tests/test_*$(EXE) pattern the gate list is derived from). It needs a real
@@ -1436,8 +1440,12 @@ tests/test_st_pread$(EXE): tests/test_st_pread.c
 tests/test_st_slice$(EXE): tests/test_st_slice.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_qwen38_tokenizer$(EXE): tests/test_qwen38_tokenizer.c sse41_kernels.h qwen38.c qwen38_core.h kv_prefix.h qwen38_nfc.h qwen38_nfc_tables.h edge_runtime.c edge_runtime.h edge_adapters.h edge_adapter_internal.h st.h json.h compat.h quant.h fp8_format.h idot.h route_trace.h tok_unicode.h tok_unicode_o200k.h
-	$(CC) $(NOCUDA_CFLAGS) $< edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
+tests/test_qwen38_tokenizer$(EXE): tests/test_qwen38_tokenizer.c qwen38.c tests/edge_runtime_nocuda.o
+	$(CC) $(NOCUDA_CFLAGS) $< tests/edge_runtime_nocuda.o -o $@ $(NOCUDA_LDFLAGS)
+# edge_runtime.c as its own object, compiled with the flags this test gave it on
+# the same command line before (#1741): one unit per command keeps each .d whole.
+tests/edge_runtime_nocuda.o: edge_runtime.c .build-config
+	$(CC) $(NOCUDA_CFLAGS) -c edge_runtime.c -o $@
 
 tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c qwen38.c
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
@@ -1476,8 +1484,12 @@ tests/test_qwen38_prefix$(EXE): tests/test_qwen38_prefix.c qwen38.c
 tests/test_qwen38_metrics$(EXE): tests/test_qwen38_metrics.c qwen38.c
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen38_native_weights$(EXE): tests/test_qwen38_native_weights.c sse41_kernels.h qwen38.c qwen38_core.h kv_prefix.h qwen38_nfc.h qwen38_nfc_tables.h segment_runtime.c segment_runtime.h segment_adapters.h segment_adapter_internal.h st.h json.h compat.h quant.h fp8_format.h idot.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
-	$(CC) $(NOCUDA_CFLAGS) $< segment_runtime.c -o $@ $(NOCUDA_LDFLAGS)
+tests/test_qwen38_native_weights$(EXE): tests/test_qwen38_native_weights.c qwen38.c tests/segment_runtime_nocuda.o
+	$(CC) $(NOCUDA_CFLAGS) $< tests/segment_runtime_nocuda.o -o $@ $(NOCUDA_LDFLAGS)
+# segment_runtime.c as its own object, compiled with the flags this test gave it on
+# the same command line before (#1741): one unit per command keeps each .d whole.
+tests/segment_runtime_nocuda.o: segment_runtime.c .build-config
+	$(CC) $(NOCUDA_CFLAGS) -c segment_runtime.c -o $@
 
 tests/test_st_map$(EXE): tests/test_st_map.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1594,11 +1606,19 @@ tests/test_serve_codec$(EXE): tests/test_serve_codec.c
 tests/test_serve_budget$(EXE): tests/test_serve_budget.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_segment_runtime$(EXE): tests/test_segment_runtime.c segment_runtime.c segment_runtime.h
-	$(CC) $(CFLAGS) tests/test_segment_runtime.c segment_runtime.c -o $@ $(LDFLAGS)
+tests/test_segment_runtime$(EXE): tests/test_segment_runtime.c tests/segment_runtime.o
+	$(CC) $(CFLAGS) tests/test_segment_runtime.c tests/segment_runtime.o -o $@ $(LDFLAGS)
+# segment_runtime.c as its own object, compiled with the flags this test gave it on
+# the same command line before (#1741): one unit per command keeps each .d whole.
+tests/segment_runtime.o: segment_runtime.c .build-config
+	$(CC) $(CFLAGS) -c segment_runtime.c -o $@
 
-tests/test_segment_conformance$(EXE): tests/test_segment_conformance.c tests/segment_conformance_fixtures.c tests/segment_conformance_fixtures.h segment_runtime.c segment_runtime.h
-	$(CC) $(CFLAGS) tests/test_segment_conformance.c tests/segment_conformance_fixtures.c segment_runtime.c -o $@ $(LDFLAGS)
+tests/test_segment_conformance$(EXE): tests/test_segment_conformance.c tests/segment_conformance_fixtures.o tests/segment_runtime.o
+	$(CC) $(CFLAGS) tests/test_segment_conformance.c tests/segment_conformance_fixtures.o tests/segment_runtime.o -o $@ $(LDFLAGS)
+# tests/segment_conformance_fixtures.c as its own object, compiled with the flags this test gave it on
+# the same command line before (#1741): one unit per command keeps each .d whole.
+tests/segment_conformance_fixtures.o: tests/segment_conformance_fixtures.c .build-config
+	$(CC) $(CFLAGS) -c tests/segment_conformance_fixtures.c -o $@
 
 tests/test_inkling_serve_framing$(EXE): tests/test_inkling_serve_framing.c inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
@@ -1761,11 +1781,19 @@ tests/test_compat_direct$(EXE): tests/test_compat_direct.c
 tests/test_expert_store_ops$(EXE): tests/test_expert_store_ops.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_native_quant$(EXE): tests/test_native_quant.c sse41_kernels.h deepseek_v4.c native_quant.h tensor.h quant.h fp8_format.h idot.h
-	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT deepseek_v4.c $< -o $@ $(LDFLAGS)
+tests/test_native_quant$(EXE): tests/test_native_quant.c tests/deepseek_v4_native_quant.o
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT tests/deepseek_v4_native_quant.o $< -o $@ $(LDFLAGS)
+# deepseek_v4.c as its own object, compiled with the flags this test gave it on
+# the same command line before (#1741): one unit per command keeps each .d whole.
+tests/deepseek_v4_native_quant.o: deepseek_v4.c .build-config
+	$(CC) $(CFLAGS) -DCOLI_V4_UNIT_NATIVE_QUANT -c deepseek_v4.c -o $@
 
-tests/test_edge_runtime$(EXE): tests/test_edge_runtime.c edge_runtime.c edge_runtime.h
-	$(CC) $(CFLAGS) tests/test_edge_runtime.c edge_runtime.c -o $@ $(LDFLAGS)
+tests/test_edge_runtime$(EXE): tests/test_edge_runtime.c tests/edge_runtime.o
+	$(CC) $(CFLAGS) tests/test_edge_runtime.c tests/edge_runtime.o -o $@ $(LDFLAGS)
+# edge_runtime.c as its own object, compiled with the flags this test gave it on
+# the same command line before (#1741): one unit per command keeps each .d whole.
+tests/edge_runtime.o: edge_runtime.c .build-config
+	$(CC) $(CFLAGS) -c edge_runtime.c -o $@
 
 ifeq ($(COLI_V4_SUPPORTED),1)
 include Makefile.deepseek-v4.units
@@ -2447,30 +2475,32 @@ tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c $(VK_
 # does not list headers by hand. The engines and tests are derived the same way
 # TEST_RULES is, so a new rule joins automatically.
 #
-# Two kinds of rule keep hand-written header lists instead:
-#  - AUTODEP_MULTI_TU compiles more than one .c in a single command. GCC then
-#    writes only the LAST unit's dependencies, so a .d would silently miss the
-#    headers of the others. tests/test_makefile_deps.py fails if a recipe of
-#    that shape appears anywhere in AUTODEP_BINS.
-#  - AUTODEP_ELSEWHERE is built outside this Makefile's own $(CC) recipes
-#    (Makefile.deepseek-v4 and the adapter test targets), as are the nvcc,
-#    MSVC-hosted CUDA and Metal objects, which are not listed here at all.
+# A command that compiles several .c files writes a .d for the LAST one only,
+# silently dropping the headers of the others. So a helper source a test links
+# is its own object (the tests/*.o rules, each next to its test), compiled with
+# the flags that test gives it. tests/test_makefile_deps.py fails if a rule in
+# AUTODEP_BINS ever compiles more than one unit.
+#
+# AUTODEP_ELSEWHERE is built outside this Makefile's own $(CC) recipes
+# (Makefile.deepseek-v4 and the adapter test targets) and keeps its header
+# lists, as do the nvcc, MSVC-hosted CUDA and Metal objects, which are not
+# listed here at all.
 #
 # Most rules do not depend on .build-config, so a change to CFLAGS alone would
 # not rebuild a binary made before this change, and it would have no .d. Each
 # target therefore also depends on its own .d through an empty rule: a missing
 # .d counts as out of date, the target is rebuilt, and that compile writes it.
 # The same covers a .d deleted by hand.
-AUTODEP_MULTI_TU  = test_xdna_qt_state test_xdna_failure test_qwen38_tokenizer \
-	test_qwen38_native_weights test_segment_runtime test_segment_conformance \
-	test_native_quant test_edge_runtime
 AUTODEP_ELSEWHERE = test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real test_deepseek_v4 \
 	test_v4_serve_framing
 ENGINE_RULES := $(foreach n,$(RULE_NAMES),$(if $(findstring /,$(n)),,$(if $(wildcard $(n).c),$(n))))
-AUTODEP_OBJS      = backend_vulkan.o backend_loader.o backend_xdna.o qwen36_tier.o
+AUTODEP_OBJS      = backend_vulkan.o backend_loader.o backend_xdna.o qwen36_tier.o \
+	tests/backend_xdna_lane.o tests/edge_runtime.o tests/edge_runtime_nocuda.o \
+	tests/segment_runtime.o tests/segment_runtime_nocuda.o \
+	tests/segment_conformance_fixtures.o tests/deepseek_v4_native_quant.o
 AUTODEP_BINS      = $(addsuffix $(EXE),$(ENGINE_RULES)) \
-	$(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(AUTODEP_MULTI_TU) $(AUTODEP_ELSEWHERE),$(TEST_RULES)))) \
+	$(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(AUTODEP_ELSEWHERE),$(TEST_RULES)))) \
 	$(AUTODEP_OBJS)
 AUTODEP_DEPS      = $(addsuffix .d,$(basename $(AUTODEP_BINS)))
 $(foreach b,$(AUTODEP_BINS),$(eval $(b): $(basename $(b)).d))
