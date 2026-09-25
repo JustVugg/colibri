@@ -599,6 +599,49 @@ jobs:
           # COLI_CUDA=1 on a mixed container is refused with a line, the CPU path stands
           COLI_CUDA=1 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_d8 ./qwen36 8 4 qwen36_tiny64/ref_full.json > mixed_cuda.log 2>&1 || true
           grep -q "COLI_CUDA=1 ignored: the VRAM expert tier does not take the mixed layout" mixed_cuda.log || { echo "FAIL: tier refusal line missing"; cat mixed_cuda.log; exit 1; }
+      - name: Pinned experts and PILOT prefetch never change the logits (int4 gs64 fixture)
+        run: |
+          cd c
+          # HOT and COLIBRI_RESIDENT pin experts, PILOT loads the next layers' from a
+          # worker thread: they decide which experts stay in RAM, never what is
+          # computed, so the last logits must be the bytes of cap=16 without them.
+          # At a small cap they were not: a moe run read its experts from slots that
+          # nothing marked busy, so the run's own next load (fewer unpinned slots than
+          # topk) or the worker could reload one under the kernel. cap starts at 2 =
+          # topk: this step is about eviction, the cap=1 cut is the A/B step's.
+          B=./qwen36
+          run() {  # tag kernel cap [VAR=value...]
+            local tag=$1 k=$2 cap=$3; shift 3
+            env "$@" QWEN_EXPERT_KERNEL=$k COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c DUMP=pin_$tag.f32 \
+              $B "$cap" 4 qwen36_tiny64/ref_full.json > pin_$tag.log 2>&1 || true
+            test -s pin_$tag.f32 || { echo "FAIL: no logits dump ($tag)"; cat pin_$tag.log; exit 1; }
+          }
+          fail=0
+          for k in 0 1; do
+            run ref_$k $k 16
+            for cap in 2 3 4; do
+              for hot in 1 2 3; do
+                run k${k}_cap${cap}_hot$hot $k $cap HOT=$hot
+                grep -q "^\[HOT\] Pinned [1-9]" pin_k${k}_cap${cap}_hot$hot.log || { echo "FAIL: HOT pinned nothing"; exit 1; }
+              done
+              for r in 1 2; do
+                run k${k}_cap${cap}_res$r $k $cap COLIBRI_RESIDENT=$r
+                grep -q "^\[RESIDENT\] Pinned [1-9]" pin_k${k}_cap${cap}_res$r.log || { echo "FAIL: RESIDENT pinned nothing"; exit 1; }
+              done
+            done
+            # PILOT races a loader thread against the moe run: repeat it
+            for i in $(seq 10); do
+              run k${k}_pilot1_$i $k 2 PILOT=1
+              run k${k}_pilot3_$i $k 2 PILOT=3 WIDE=4
+            done
+            n=0 bad=0
+            for f in pin_k${k}_*.f32; do
+              n=$((n+1)); cmp -s "$f" pin_ref_$k.f32 || { echo "kernel=$k: ${f#pin_k${k}_} differs from cap=16"; bad=$((bad+1)); }
+            done
+            echo "kernel=$k: $((n-bad))/$n runs give the cap=16 logits"
+            [ $bad -eq 0 ] || fail=1
+          done
+          exit $fail
       - name: A malformed container is refused, not read
         run: |
           cd c
