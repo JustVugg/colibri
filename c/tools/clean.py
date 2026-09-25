@@ -26,6 +26,9 @@ FILES = [
     "glm", "glm.exe",                       # pre-rename name of the colibri engine
     "iobench", "iobench.exe",
     "backend_cuda.o", "backend_loader.o", "qwen36_tier.o",
+    # VK=1 and XDNA=1 objects. Left behind once their .d is cleaned, an
+    # object would sit in the tree with no record of the headers it read.
+    "backend_vulkan.o", "backend_xdna.o",
     "backend_cuda_test", "backend_cuda_test.exe",
     "mxfp4_expert_cuda_test", "mxfp4_expert_cuda_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
@@ -63,8 +66,12 @@ FILES = [
 # *.d are the dependency files -MMD writes beside each binary and object
 # (#1741). A stale one only adds prerequisites, but clean should leave nothing
 # the build made, and removing it forces the rebuild that writes a fresh one.
+# They land wherever an output does: c/ and tests/ for the engines and tests,
+# tools/ for the ctypes libraries, build/segment/ for the V4 unit objects
+# (build/ownership/ goes as a whole directory below).
 ARTIFACT_GLOBS = ["tests/test_*", "tests/bench_*", "tests/fuzz_*",
-                  "tests/*_probe*", "COLI_V4_UNIT_*.o", "*.d", "tests/*.d"]
+                  "tests/*_probe*", "COLI_V4_UNIT_*.o", "*.d", "tests/*.d",
+                  "tools/*.d", "build/segment/*.d"]
 KEEP_EXT = (".c", ".h", ".cc", ".cpp", ".cu", ".mm", ".py", ".txt", ".json",
             ".md", ".bin", ".sh", ".toml", ".yml", ".yaml")
 # Directories to remove.

@@ -34,6 +34,7 @@ The engine list is still DERIVED from the Makefile, never kept here: anything
 matching `NAME$(EXE):` with a `NAME.c` beside it is an engine, and the family
 registry is the cross-check that the parse found them all.
 """
+import contextlib
 import os
 import re
 import shlex
@@ -72,24 +73,47 @@ def _engine_rules():
     return rules
 
 
-def _make(*args):
-    """Run make in c/ with the build's own configuration.
+@contextlib.contextmanager
+def _build_config_kept():
+    """Leave .build-config exactly as it was, contents and timestamp.
 
-    Inside `make check` the child inherits MAKEFLAGS, so it parses the same
-    variables the build did and leaves .build-config as it was.
+    The Makefile rewrites .build-config while it parses, whenever the flags
+    differ from the last build's. Every make call below parses, and some pass
+    CUDA=1 or CUDA_DLL=1 on purpose, so without this the suite would switch
+    the tree's recorded configuration and the next `make` would relink
+    everything that depends on it.
     """
-    return subprocess.run([MAKE, "--no-print-directory", *args], cwd=C_DIR,
-                          text=True, encoding="utf-8", errors="replace",
-                          capture_output=True, timeout=600)
+    path = C_DIR / ".build-config"
+    before = path.read_bytes() if path.exists() else None
+    stamp = path.stat() if before is not None else None
+    try:
+        yield
+    finally:
+        if before is None:
+            if path.exists():
+                path.unlink()
+        elif not path.exists() or path.read_bytes() != before or \
+                path.stat().st_mtime_ns != stamp.st_mtime_ns:
+            path.write_bytes(before)
+            os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+
+
+def _make(*args):
+    """Run make in c/, leaving the tree's build configuration untouched."""
+    with _build_config_kept():
+        return subprocess.run([MAKE, "--no-print-directory", *args], cwd=C_DIR,
+                              text=True, encoding="utf-8", errors="replace",
+                              capture_output=True, timeout=600)
 
 
 def _make_var(name):
     # `make --eval` needs GNU Make 3.82; macOS ships 3.81, which does read an
     # extra makefile from stdin.
-    proc = subprocess.run([MAKE, "-s", "--no-print-directory", "-f", "Makefile",
-                           "-f", "-", f"print-{name}"], cwd=C_DIR, text=True,
-                          input="print-%: ; @echo $($*)\n", capture_output=True,
-                          timeout=300)
+    with _build_config_kept():
+        proc = subprocess.run([MAKE, "-s", "--no-print-directory", "-f", "Makefile",
+                               "-f", "-", f"print-{name}"], cwd=C_DIR, text=True,
+                              input="print-%: ; @echo $($*)\n", capture_output=True,
+                              timeout=300)
     if proc.returncode != 0:
         raise AssertionError(f"could not read {name} from the Makefile:\n"
                              f"{proc.stderr}")
@@ -273,6 +297,19 @@ class GeneratedDepsWiringTest(unittest.TestCase):
             self.skipTest("this host emits no GPU recipe for colibri")
         problems = self._one_unit_problems(variable)
         self.assertEqual(problems, [], f"with {variable}:\n  " + "\n  ".join(problems))
+
+    def test_the_checks_leave_the_build_config_alone(self):
+        """Parsing with CUDA=1 or CUDA_DLL=1 rewrites .build-config; the checks
+        above do exactly that, and must not change which configuration the
+        tree says it was built with. Bite: drop the `with _build_config_kept()`
+        from `_make` and this fails whenever a GPU flavour is accepted here."""
+        path = C_DIR / ".build-config"
+        before = (path.read_bytes(), path.stat().st_mtime_ns) if path.exists() else None
+        _gpu_variables(self.exe)
+        _make("-Bn", "colibri" + self.exe, "XDNA=1")
+        after = (path.read_bytes(), path.stat().st_mtime_ns) if path.exists() else None
+        self.assertEqual(after, before, ".build-config was changed by a make call "
+                                        "that only meant to read the Makefile")
 
     def test_multi_unit_exceptions_are_still_multi_unit(self):
         """An exception that no longer applies should rejoin AUTODEP_BINS."""

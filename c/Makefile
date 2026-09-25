@@ -496,7 +496,10 @@ endif
 # in the other direction: it promoted files that deliberately have no rule (a branch's
 # work-in-progress test, test_fse, test_tok, test_tok_kimi, test_vk_mxfp4) into gates, and
 # they fail to link. Having a rule is the honest definition of "this is a gate".
-TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(firstword $(MAKEFILE_LIST)))
+# RULE_NAMES is every `NAME$(EXE):` rule, with its directory; one pass over the
+# Makefile serves both TEST_RULES here and ENGINE_RULES (#1741, end of file).
+RULE_NAMES  := $(shell sed -n 's|^\([a-z0-9_/]*\)\$$(EXE):.*|\1|p' $(firstword $(MAKEFILE_LIST)))
+TEST_RULES  := $(patsubst tests/%,%,$(filter tests/test_%,$(RULE_NAMES)))
 # test_uring is Linux-only. V4 engine tests are appended below only on supported
 # x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
 # unconditional rules and therefore remain portable gates. The six forced
@@ -1206,8 +1209,7 @@ qwen36$(EXE): qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) .build-config
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
 # stream from the official checkpoint and quant.h's mxfp4 kernel reads them as they
 # are, so there is no conversion target here to go with it.
-deepseek_v41$(EXE): deepseek_v41.c \
-	.build-config
+deepseek_v41$(EXE): deepseek_v41.c .build-config
 	$(CC) $(CFLAGS) deepseek_v41.c -o deepseek_v41$(EXE) $(LDFLAGS)
 
 # Qwen3.8-Flash-Next text-only sibling. qwen38.c owns the direct checkpoint
@@ -1266,8 +1268,8 @@ qwen38-tier-engine-check: qwen38-tiny-fp8-generate tests/test_qwen38_tier_engine
 
 # Context-size gates: KV layout, growth across requests, and the attention
 # capacity. Includes qwen36.c directly, so no model file is needed.
-# Same tier sources as the engine: the test includes qwen36.c, so with CUDA=1
-# it needs qwen36_tier.c and the backend object too (without CUDA, the header's
+# Same tier objects as the engine: the test includes qwen36.c, so with CUDA=1
+# it links qwen36_tier.o and the backend object too (without CUDA, the header's
 # inline stubs cover it and both are empty).
 tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
 	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(LDFLAGS)
@@ -2465,7 +2467,7 @@ AUTODEP_MULTI_TU  = test_xdna_qt_state test_xdna_failure test_qwen38_tokenizer \
 AUTODEP_ELSEWHERE = test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real test_deepseek_v4 \
 	test_v4_serve_framing
-ENGINE_RULES := $(foreach n,$(shell sed -n 's|^\([a-z0-9_]*\)\$$(EXE):.*|\1|p' $(firstword $(MAKEFILE_LIST))),$(if $(wildcard $(n).c),$(n)))
+ENGINE_RULES := $(foreach n,$(RULE_NAMES),$(if $(findstring /,$(n)),,$(if $(wildcard $(n).c),$(n))))
 AUTODEP_OBJS      = backend_vulkan.o backend_loader.o backend_xdna.o qwen36_tier.o
 AUTODEP_BINS      = $(addsuffix $(EXE),$(ENGINE_RULES)) \
 	$(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(AUTODEP_MULTI_TU) $(AUTODEP_ELSEWHERE),$(TEST_RULES)))) \
