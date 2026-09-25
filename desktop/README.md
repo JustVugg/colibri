@@ -1,5 +1,13 @@
 # colibrì desktop
 
+For the optional Windows/Linux **process launcher**, see
+[the launcher guide](../docs/launcher.md). It uses its surrounding Colibri folder,
+lets you choose a local model, and starts Web Chat or the API server. Its Python packaging files
+are `launcher.spec` and `launcher_entry.py` in this directory.
+
+The Tauri app described below is the existing desktop **chat client**; the two
+applications have separate entrypoints and dependencies.
+
 Tauri v2 shell for the shared React interface in `../web`.
 
 This directory intentionally contains no second frontend. During development,

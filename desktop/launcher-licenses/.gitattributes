@@ -1,0 +1,2 @@
+# Preserve whitespace in verbatim upstream attribution and license texts.
+THIRD_PARTY_NOTICES.txt -whitespace

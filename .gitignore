@@ -8,6 +8,11 @@ web/dist/
 web/*.tsbuildinfo
 desktop/src-tauri/target/
 desktop/src-tauri/gen/
+desktop/build/
+desktop/dist/
+/build/
+*.egg-info/
+.pytest_cache/
 
 # binari compilati (si rigenerano con make / coli build)
 c/colibri

@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+
+HERE = Path(__file__).resolve().parent
+
+
+def _support_dir():
+    installed = HERE.parent / "libexec" / "colibri"
+    return installed if installed.is_dir() else HERE
+
+
+sys.path.insert(0, str(_support_dir()))
+from family_registry import resolve_model
+
+
+def engine_for(model):
+    family = resolve_model(model).descriptor
+    return str(_support_dir() / family.engine_artifact)
+
+
+def cuda_binary(engine=None):
+    if engine is None:
+        return False
+    return any(Path(str(engine) + suffix).is_file() for suffix in (".cuda", ".hip"))
+
+
+def dsv4_cuda_available(model=None):
+    return Path(engine_for(model) + ".dsv4").is_file()
+
+
+def _argument(name, default=None):
+    try:
+        return sys.argv[sys.argv.index(name) + 1]
+    except (ValueError, IndexError):
+        return default
+
+
+def _doctor():
+    model = Path(_argument("--model", ""))
+    config = json.loads((model / "config.json").read_text(encoding="utf-8"))
+    if config.get("doctor_schema") == "bad":
+        print(json.dumps({"schema_version": 2, "checks": []}))
+        return 0
+    resolved = resolve_model(model)
+    family = resolved.descriptor
+    engine = Path(engine_for(model))
+    checks = [
+        {"id": "model.path", "status": "pass", "summary": "model directory is readable"},
+        {"id": "model.family", "status": "pass", "summary": "family registered",
+         "details": {"family_id": family.id}},
+        {"id": "engine.binary", "status": "pass" if engine.is_file() else "fail",
+         "summary": "engine executable is ready" if engine.is_file() else "engine is not built"},
+    ]
+    gpu = _argument("--gpu", "auto")
+    devices = json.loads(os.environ.get("FAKE_GPU_DATA", "[]"))
+    available = {int(item["index"]) for item in devices}
+    if gpu == "none":
+        checks.append({"id": "accelerator.gpu", "status": "skip",
+                       "summary": "GPU use was explicitly disabled"})
+    else:
+        requested = available if gpu == "auto" else {int(value) for value in gpu.split(",")}
+        if not requested.issubset(available):
+            checks.append({"id": "accelerator.gpu", "status": "fail",
+                           "summary": "one or more requested GPUs were not detected"})
+        elif config.get("gpu_runtime_missing"):
+            checks.append({"id": "accelerator.gpu", "status": "fail",
+                           "summary": "GPU runtime library is missing"})
+        elif family.supports_accelerator and (cuda_binary(engine) or
+                (family.id == "deepseek_v4" and dsv4_cuda_available(model))) and requested:
+            checks.append({"id": "accelerator.gpu", "status": "pass",
+                           "summary": "GPU engine and devices are available"})
+        else:
+            checks.append({"id": "accelerator.gpu", "status": "warn",
+                           "summary": "GPU detected but the engine is CPU-only"})
+    override = config.get("doctor_accelerator")
+    if override:
+        checks = [item for item in checks if item["id"] != "accelerator.gpu"]
+        if override != "omit":
+            checks.append({"id": "accelerator.gpu", "status": override,
+                           "summary": "accelerator diagnostic did not pass"})
+    status_values = {item["status"] for item in checks}
+    status = "error" if "fail" in status_values else "warning" if "warn" in status_values else "ok"
+    print(json.dumps({"schema_version": 1, "status": status, "model": str(model),
+                      "mode": "standard", "checks": checks,
+                      "plan": {"fixture": True, "gpu": gpu, **_runtime_settings(family)}}))
+    return 1 if status == "error" else 0
+
+
+def _runtime_settings(family):
+    # Match the installed CLI precedence used by resource_request/ngen_for.
+    limits = family.limits
+    context_var = getattr(limits, "context_env", "CTX")
+    ram = float(_argument("--ram") or os.environ.get("RAM_GB", "0"))
+    return {
+        "context": int(_argument("--ctx") or os.environ.get(context_var, limits.default_context)),
+        "ram": ram,
+        "output": int(_argument("--ngen") or limits.interactive_max_output),
+        "expert_gb": os.environ.get("GLM53_EXPERT_GB", str(max(2, ram - 8))),
+        "k3_cuda": os.environ.get("K3_CUDA", "0"),
+    }
+
+
+def main():
+    if "--version" in sys.argv:
+        print("colibri 9.9.9")
+        return 0
+    if "--help" in sys.argv or len(sys.argv) == 1:
+        print("usage: coli [--auto-tier] {doctor,web,serve}")
+        return 0
+    if "doctor" in sys.argv:
+        return _doctor()
+    if "serve" in sys.argv or "web" in sys.argv:
+        family = resolve_model(_argument("--model")).descriptor
+        print(json.dumps(_runtime_settings(family)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
