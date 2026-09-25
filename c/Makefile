@@ -2481,10 +2481,11 @@ tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c $(VK_
 # the flags that test gives it. tests/test_makefile_deps.py fails if a rule in
 # AUTODEP_BINS ever compiles more than one unit.
 #
-# AUTODEP_ELSEWHERE is built outside this Makefile's own $(CC) recipes
-# (Makefile.deepseek-v4 and the adapter test targets) and keeps its header
-# lists, as do the nvcc, MSVC-hosted CUDA and Metal objects, which are not
-# listed here at all.
+# AUTODEP_ELSEWHERE keeps its header lists: test_deepseek_v4 and
+# test_v4_serve_framing are built by Makefile.deepseek-v4, and the four
+# segment/edge adapter tests still compile three units in one command. The
+# nvcc, MSVC-hosted CUDA and Metal objects keep theirs too and are not listed
+# here at all.
 #
 # Most rules do not depend on .build-config, so a change to CFLAGS alone would
 # not rebuild a binary made before this change, and it would have no .d. Each
