@@ -231,7 +231,7 @@ jobs:
         run: |
           cd c
           rc=0
-          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41"
+          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 gemma4"
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
           for t in $ENGINES; do
             echo "::group::$t"
@@ -420,6 +420,33 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c backend_cuda_ink.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "inkling CUDA syntax check passed"
+
+  gemma4-tiny-check:
+    name: Gemma 4 tiny oracle (logits + token-exact)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-gemma4-tiny.txt
+      - name: Install NumPy
+        run: pip install -r c/tools/requirements-gemma4-tiny.txt
+      - name: Generate tiny Gemma 4 checkpoint and independent reference
+        run: |
+          cd c
+          python3 tools/make_gemma4_tiny.py --out gemma4_tiny --max-new 6
+      - name: Reference logits and greedy tokens at several expert-cache capacities
+        run: |
+          cd c
+          make gemma4
+          for cap in 1 2 8; do
+            echo "::group::cap=$cap"
+            python3 tests/test_gemma4_tiny.py --exe ./gemma4 \
+              --fixture gemma4_tiny --cache "$cap"
+            echo "::endgroup::"
+          done
 
   qwen36-tiny-check:
     name: Qwen3.6 tiny oracle (token-exact + ASan/UBSan)
