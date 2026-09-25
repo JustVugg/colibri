@@ -40,6 +40,7 @@ class Glm53HarnessSkipTest(unittest.TestCase):
                 "chat_template": ["--template", missing],
                 "tiny": ["--binary", "glm53", "--fixture", missing],
                 "multimodal_tiny": ["--binary", "glm53", "--fixture", missing],
+                "pin_branch": ["--binary", "glm53", "--fixture", missing],
                 "serve": ["--binary", "glm53", "--fixture", missing],
                 "streaming": ["--binary", "glm53", "--quantized", missing,
                               "--dequantized", missing],
