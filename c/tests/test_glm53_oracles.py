@@ -78,6 +78,15 @@ class Glm53TinyOracleTest(unittest.TestCase):
         """The vision tower and the image tokens in the prompt, token-exact."""
         self.run_oracle("multimodal_tiny", "GLM53_MM_TINY")
 
+    def test_serve_harness(self):
+        """REUSE and CANCEL over the serve protocol, including the reason
+        REUSE gives for reusing the slot or not."""
+        self.run_oracle("serve", "GLM53_MM_TINY")
+
+    def test_pin_branch_harness(self):
+        """A pin is not restored over rows another branch rewrote (#1750)."""
+        self.run_oracle("pin_branch", "GLM53_MM_TINY")
+
 
 if __name__ == "__main__":
     unittest.main()
