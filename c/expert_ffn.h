@@ -310,7 +310,12 @@ static inline void xf_down_rows(float *y, const XfExpert *e, const XfAct *h, int
  * S tokens, K routed experts each. idx[s*K+k] is the expert id (or -1), val the
  * router weight, experts[s*K+k] the resident expert (NULL iff idx < 0).
  * out[s][H] = sum_k val[s][k] * expert_k(x[s]) accumulated in k order, as the
- * per-token loops it replaces did. Callers own `scratch` (xf_moe_scratch_bytes).
+ * per-token loops it replaces did. xf_moe_add adds that sum into out instead of
+ * overwriting it: a caller that cuts one layer into several runs (qwen36, when
+ * its cache holds fewer experts than the batch routes to) sends every cut
+ * through the same statement, so the bits cannot depend on where it cut, whether
+ * or not the compiler fuses that multiply-add. xf_moe_run zeroes out first.
+ * Callers own `scratch` (xf_moe_scratch_bytes).
  *
  * Work is split into (expert, row chunk) items twice: gate+up over F rows, then
  * down over H rows. A prompt of S rows routed to the same expert reads that
@@ -324,7 +329,7 @@ static inline size_t xf_moe_scratch_bytes(int S, int K, int H, int F) {
          + n * sizeof(int) * 4 + 4096;
 }
 
-static inline void xf_moe_run(float *out, const float *x, int S, int K, int H, int F,
+static inline void xf_moe_add(float *out, const float *x, int S, int K, int H, int F,
                               const int *idx, const float *val, const XfExpert *const *experts,
                               int mode, void *scratch) {
     const size_t n = (size_t)S * K;
@@ -358,7 +363,7 @@ static inline void xf_moe_run(float *out, const float *x, int S, int K, int H, i
         if (j == nu) { uniq[nu] = idx[i]; head[nu] = i; cnt[nu] = 1; nu++; }
         else { int t = head[j]; while (next[t] >= 0) t = next[t]; next[t] = i; cnt[j]++; }
     }
-    if (nu == 0) { memset(out, 0, (size_t)S * H * sizeof(float)); return; }
+    if (nu == 0) return;
 
     int T = 1;
 #ifdef _OPENMP
@@ -398,17 +403,23 @@ static inline void xf_moe_run(float *out, const float *x, int S, int K, int H, i
             xf_down_rows(ctb + (size_t)i * H, experts[i], &a, F, r0, r1, mode);
         }
     }
-    /* rank-order sum per token: out[s] = sum_k val[s][k] * ctb[s][k] */
+    /* rank-order sum per token: out[s] += sum_k val[s][k] * ctb[s][k] */
     #pragma omp parallel for schedule(static)
     for (int s = 0; s < S; s++) {
         float *os = out + (size_t)s * H;
-        memset(os, 0, (size_t)H * sizeof(float));
         for (int k = 0; k < K; k++) {
             int i = s * K + k; if (idx[i] < 0 || !experts[i]) continue;
             float w = val[i]; const float *c = ctb + (size_t)i * H;
             for (int d = 0; d < H; d++) os[d] += w * c[d];
         }
     }
+}
+
+static inline void xf_moe_run(float *out, const float *x, int S, int K, int H, int F,
+                              const int *idx, const float *val, const XfExpert *const *experts,
+                              int mode, void *scratch) {
+    memset(out, 0, (size_t)S * H * sizeof(float));
+    xf_moe_add(out, x, S, K, H, F, idx, val, experts, mode, scratch);
 }
 
 #endif /* COLI_EXPERT_FFN_H */

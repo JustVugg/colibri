@@ -2232,9 +2232,11 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
  * resident at once, so the batch is cut to what the layer cache can hold:
  * the whole prompt chunk when cap covers S*K slots, one token when it covers
  * K, one (token, expert) pair otherwise (cap=1 in CI evicts on every routed
- * expert). A pair run adds val*expert into out exactly as the per-token loop
- * did: out starts at zero and the kernel's rank-order sum is one fma per
- * element, so the three cuts produce the same bits. */
+ * expert). out starts at zero (moe) and every cut adds into it through the
+ * one xf_moe_add call below, val*expert in rank order, so the three cuts
+ * produce the same bits. A pair run used to go through a zeroed buffer and a
+ * second add: two roundings where the fused multiply-add of an FMA build
+ * does one, and cap=1 moved the logits in their last bits. */
 static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val) {
     Cfg *c = &m->c; int D = c->hidden, K = c->topk, F = c->inter;
     int cap = m->cache[layer].cap;
@@ -2245,7 +2247,6 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
     XfExpert *ex = malloc(sizeof(XfExpert) * (size_t)n);
     const XfExpert **exp = malloc(sizeof(XfExpert *) * (size_t)n);
     int *ridx = malloc(sizeof(int) * (size_t)n); float *rval = falloc(n);
-    float *tmp = kper < K ? falloc(D) : NULL;
     void *scratch = malloc(xf_moe_scratch_bytes(per, kper, D, F));
     if (!ex || !exp || !ridx || !scratch) { fprintf(stderr, "OOM moe_xf_run\n"); exit(1); }
     int timed = tm_on() && S == 1;
@@ -2262,15 +2263,11 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
                 exp[dst] = &ex[dst];
             }
             double t1 = timed ? tm_now() : 0;
-            if (kper == K) xf_moe_run(out + (int64_t)s0 * D, x + (int64_t)s0 * D, per, K, D, F, ridx, rval, exp, xf_act_mode(), scratch);
-            else {
-                xf_moe_run(tmp, x + (int64_t)s0 * D, 1, 1, D, F, ridx, rval, exp, xf_act_mode(), scratch);
-                float *os = out + (int64_t)s0 * D; for (int d = 0; d < D; d++) os[d] += tmp[d];
-            }
+            xf_moe_add(out + (int64_t)s0 * D, x + (int64_t)s0 * D, per, kper, D, F, ridx, rval, exp, xf_act_mode(), scratch);
             if (timed) { double t2 = tm_now(); g_xf_load += t1 - t0; g_xf_run += t2 - t1; }
         }
     }
-    free(ex); free(exp); free(ridx); free(rval); free(tmp); free(scratch);
+    free(ex); free(exp); free(ridx); free(rval); free(scratch);
 }
 
 /* ---------- CACHE_ROUTE: residency-aware top-K fill (docs/CACHE_ROUTE.md) ----------
