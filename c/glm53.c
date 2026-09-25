@@ -2442,6 +2442,27 @@ static void session_close(const GModel *m, GSession *s) {
  * `next` e' il secondo banco, della stessa misura: il passaggio li scambia a
  * ogni sito, quindi alla fine il risultato puo' essere in uno o nell'altro, e
  * la funzione restituisce quale. */
+/* la ricorrenza KDA di uno scatto: stato e finestra di ogni strato lineare */
+typedef struct { float **state, **window; int n_layers; } Glm53PinState;
+static int glm53_state_capture(const GModel *m, Glm53PinState **into, const GSession *s);
+static void glm53_state_restore(const GModel *m, const Glm53PinState *st, GSession *s);
+
+/* Fermare un prefill fra un layer e l'altro, non solo fra un pezzo e l'altro.
+ *
+ * Un pezzo di prefill su CPU e' lungo, e un CANCEL che arriva a inizio pezzo
+ * aspettava tutto il pezzo. Rimpicciolire i pezzi costa a ogni prefill: gli
+ * esperti si rileggono una volta per pezzo e per layer (misure in #1748).
+ * Guardare fra i layer costa una select per layer e basta.
+ *
+ * Un pezzo fermato a meta' ha fatto avanzare solo i layer prima del punto:
+ * forward_prefill lo butta, rimettendo lo stato KDA com'era all'inizio del
+ * pezzo. Le righe DSA dei layer gia' passati sono posizionali e il pezzo dopo
+ * le riscrive. Impostato solo da forward_prefill, per la durata di un pezzo:
+ * la decodifica e gli altri chiamanti di run_layers non lo vedono mai. */
+static int (*g_layer_halt)(void *) = NULL;
+static void *g_layer_halt_arg = NULL;
+static int g_halted_at_layer = -1;
+
 static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                          int n, int start, int begin, int end) {
     const Cfg *c = &m->c;
@@ -2456,6 +2477,11 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
     }
 
     for (int i = begin; i < end; i++) {
+        if (g_layer_halt && i > begin && g_layer_halt(g_layer_halt_arg)) {
+            g_halted_at_layer = i;
+            free(comb); free(post); free(branch); free(normed); free(collapsed);
+            return NULL;          /* i due banchi restano al chiamante */
+        }
         GLayer *l = &m->layer[i];
         for (int site = 0; site < 2; site++) {
             const float *fn = site ? l->hc_ffn_fn : l->hc_attn_fn;
@@ -2672,8 +2698,13 @@ static float *forward_span_rows(GModel *m, GSession *s, const int *tokens, int n
         exit(1);
     }
 
-    streams = run_layers(m, s, streams, next, n, start,
-                         m->layer_begin, m->layer_end);
+    float *through = run_layers(m, s, streams, next, n, start,
+                                m->layer_begin, m->layer_end);
+    if (!through) {                   /* fermato fra i layer: `filled` non avanza */
+        free(next); free(streams);
+        return NULL;
+    }
+    streams = through;
 
     float *collapsed = malloc((size_t)n * D * sizeof(float));
     float *normed = malloc((size_t)n * D * sizeof(float));
@@ -2755,11 +2786,31 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
         if (vision && c->image_token >= 0)
             for (int i = 0; i < here; i++)
                 if (tokens[at + i] == c->image_token) mine++;
+        /* Lo stato KDA di inizio pezzo, per poter buttare un pezzo fermato a
+         * meta'. Una copia per pezzo (~149 MiB su GLM-5.3-Flash), niente in
+         * confronto al pezzo; se non si riesce ad allocarla, per questo pezzo
+         * si guarda solo al confine, come prima. */
+        static Glm53PinState *chunk_start = NULL;
+        if (halt && glm53_state_capture(m, &chunk_start, s)) {
+            g_layer_halt = halt;
+            g_layer_halt_arg = halt_arg;
+        }
         /* senza keep_all e senza echo serve solo l'ultima riga del pezzo */
         const int need = keep_all || (g_echo_k > 0 && g_echo_id) ? here : 1;
         float *part = forward_span_rows(m, s, tokens + at, here,
                                         vision ? vision + (size_t)used_vision * c->hidden : NULL,
                                         mine, need);
+        g_layer_halt = NULL;
+        g_layer_halt_arg = NULL;
+        if (!part) {
+            glm53_state_restore(m, chunk_start, s);
+            if (getenv("GLM53_VERBOSE"))
+                fprintf(stderr, "HALT layer %d of %d, back to %d\n",
+                        g_halted_at_layer, c->n_layers, s->filled);
+            free(all);
+            free(last);
+            return NULL;
+        }
         used_vision += mine;
         if (keep_all) {
             memcpy(all + (size_t)at * c->vocab, part,
@@ -2938,9 +2989,6 @@ static int sample_token(const float *logits, int vocab) {
  * ricorrenza no, e fingere il contrario darebbe risposte sbagliate in silenzio.
  * Se il prompt nuovo non estende quello vecchio, la sessione si rifa'. */
 #define GLM53_MAX_SLOTS 16
-
-/* la ricorrenza KDA di uno scatto: stato e finestra di ogni strato lineare */
-typedef struct { float **state, **window; int n_layers; } Glm53PinState;
 
 typedef struct {
     GSession *session;
