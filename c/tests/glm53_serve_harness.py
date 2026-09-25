@@ -194,8 +194,10 @@ def main() -> int:
         emitted_before = 0
         while True:
             line = read_line(process.stdout)
-            if not line.startswith("DATA "):
+            if line.startswith("DONE ") or line.startswith("ERROR "):
                 break
+            if not line.startswith("DATA "):
+                continue    # EMAP, HITS, PROF: si ignorano, come fa il gateway
             _, got_id, count = line.split()
             if int(got_id) != 12:
                 raise AssertionError(f"DATA per {got_id}, atteso 12")
