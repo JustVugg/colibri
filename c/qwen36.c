@@ -731,7 +731,8 @@ typedef struct {
 /* pw: the expert as expert_ffn.h wants it (planar int4, gate|up|down), the
  * only weight copy a slot holds when the shared kernel is active; g/u/d and
  * g4/u4/d4 are then NULL. */
-typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; uint8_t *pw; float *gs, *us, *ds; uint64_t used; } Slot;
+typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; uint8_t *pw; float *gs, *us, *ds; uint64_t used;
+                 unsigned busy; /* callers computing from this slot (expert_hold): never evicted */ } Slot;
 typedef struct {
     Slot *slots;
     int *slot_by_expert;                  /* expert id -> resident slot, -1 if absent */
@@ -841,6 +842,33 @@ static void cache_publish(Model *m, int layer, Slot *s, int eid) {
     s->eid = eid;
     if (lc->slot_by_expert && eid >= 0 && eid < m->c.n_experts)
         lc->slot_by_expert[eid] = (int)(s - lc->slots);
+}
+
+/* A slot someone is computing from, as colibri.c's ESlot.in_flight: taken
+ * under g_pilot_mx at lookup (expert_hold), dropped without it when the
+ * compute is done. A release without its hold would wrap the count and
+ * leave the slot unevictable for good, so it stops here instead. */
+static void slot_hold(Slot *s)    { __atomic_add_fetch(&s->busy, 1, __ATOMIC_ACQ_REL); }
+static void slot_release(Slot *s) {
+    if (__atomic_fetch_sub(&s->busy, 1, __ATOMIC_ACQ_REL) == 0) {
+        fprintf(stderr, "qwen36: expert slot released more often than held\n"); abort();
+    }
+}
+static int  slot_busy(const Slot *s) { return __atomic_load_n(&s->busy, __ATOMIC_ACQUIRE) != 0; }
+
+/* The slot a full layer cache gives up, caller holds g_pilot_mx: the least
+ * recently used one that is neither being loaded (eid < 0) nor computed from
+ * (busy), unpinned unless allow_pinned. -1 when there is none. The demand
+ * path and the PILOT worker both pick here, so neither can evict an expert a
+ * moe run is still reading. */
+static int slot_victim(const LCache *lc, int allow_pinned) {
+    int lru = -1;
+    for (int i = 0; i < lc->n; i++) {
+        const Slot *s = &lc->slots[i];
+        if (s->eid < 0 || slot_busy(s) || (s->pinned && !allow_pinned)) continue;
+        if (lru < 0 || s->used < lc->slots[lru].used) lru = i;
+    }
+    return lru;
 }
 
 static void ensure_pilot_worker_started(Model *m) {
@@ -1913,31 +1941,33 @@ static void ehit_mark(Model *m, int layer, int eid){
     }
     if(layer>=0&&layer<c->n_layers&&eid>=0&&eid<c->n_experts) ehit[layer][eid]=1;
 }
-static void expert_get(Model *m, int layer, int eid, Slot **out) {
+/* hold=1 marks the slot busy before the lock drops, so nothing can evict it
+ * between this lookup and the caller's slot_release. */
+static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
     ehit_mark(m, layer, eid);   /* tocca solo m->ehit[layer][eid] */
     LCache *lc = &m->cache[layer];
     pthread_mutex_lock(&g_pilot_mx);
     Slot *hit = slot_indexed(m, layer, eid);
     if (hit) {
         m->hits++; hit->used = ++m->clock; *out = hit;
+        if (hold) slot_hold(hit);
         pthread_mutex_unlock(&g_pilot_mx); return;
     }
     m->miss++;
     Cfg *c = &m->c; Slot *s;
     if (lc->n < lc->cap) { s = &lc->slots[lc->n++]; slot_ensure_allocated(m, s); }
     else {
-        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++) {
-            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
-            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-        }
-        if (lru < 0) {
-            /* All slots are pinned or in-flight; find the oldest non-in-flight
-             * slot (may be pinned, but never one currently being loaded). */
-            for (int i = 0; i < lc->n; i++) { if (lc->slots[i].eid < 0) continue; if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i; }
-        }
+        /* LRU eviction: an unpinned slot first, else the oldest pinned one;
+         * never one being loaded or computed from. */
+        int lru = slot_victim(lc, 0);
+        if (lru < 0) lru = slot_victim(lc, 1);
         while (lru < 0) {
+            /* Every slot is held or being loaded. Only this thread holds (the
+             * PILOT worker never does) and a moe run holds fewer slots than
+             * cap, so with nothing loading a hold leaked: say so, don't hang. */
+            int loading = 0;
+            for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid < 0) loading = 1;
+            if (!loading) { fprintf(stderr, "qwen36: layer %d: all %d expert slots held, none loading\n", layer, lc->n); exit(1); }
             /* EVERY slot is in flight: each buffer is owned by an unlocked pread
              * in the pilot worker (or a demand load) that will publish into it.
              * The old last resort (lru=0) stole such a slot mid-load — two writers
@@ -1954,10 +1984,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
             pthread_mutex_unlock(&g_pilot_mx);
             sleep_ms(1);
             pthread_mutex_lock(&g_pilot_mx);
-            for (int i = 0; i < lc->n; i++) {
-                if (lc->slots[i].eid < 0) continue;
-                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-            }
+            lru = slot_victim(lc, 1);
         }
         s = &lc->slots[lru]; s->pinned = 0;
     }
@@ -1969,8 +1996,13 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     pthread_mutex_lock(&g_pilot_mx);
     m->t_disk += t_read;        /* sotto lock: qui arrivano anche i thread del PILOT */
     cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer * c->n_experts + eid]; s->used = ++m->clock;
+    if (hold) slot_hold(s);
     *out = s; pthread_mutex_unlock(&g_pilot_mx);
 }
+static void expert_get(Model *m, int layer, int eid, Slot **out) { expert_fetch(m, layer, eid, out, 0); }
+/* expert_get for a caller that computes from the slot after the lock drops:
+ * it stays resident until slot_release. */
+static Slot *expert_hold(Model *m, int layer, int eid) { Slot *s; expert_fetch(m, layer, eid, &s, 1); return s; }
 
 static void pin_hot_experts(Model *m) {
     Cfg *c = &m->c;
@@ -2229,7 +2261,9 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
  * Mirrors HF Qwen3 MoE: softmax(gate), optional group-limited top-k, normalized
  * weights, sum routed experts, then add the un-gated shared expert. */
 /* One MoE layer through expert_ffn.h. The experts a run holds must all be
- * resident at once, so the batch is cut to what the layer cache can hold:
+ * resident at once: each is held (expert_hold) until the kernel is done with
+ * it, so neither the run's next load nor the PILOT worker can evict it, and
+ * the batch is cut to what the layer cache can hold:
  * the whole prompt chunk when cap covers S*K slots, one token when it covers
  * K, one (token, expert) pair otherwise (cap=1 in CI evicts on every routed
  * expert). A pair run adds val*expert into out exactly as the per-token loop
@@ -2245,18 +2279,19 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
     XfExpert *ex = malloc(sizeof(XfExpert) * (size_t)n);
     const XfExpert **exp = malloc(sizeof(XfExpert *) * (size_t)n);
     int *ridx = malloc(sizeof(int) * (size_t)n); float *rval = falloc(n);
+    Slot **held = malloc(sizeof(Slot *) * (size_t)n);
     float *tmp = kper < K ? falloc(D) : NULL;
     void *scratch = malloc(xf_moe_scratch_bytes(per, kper, D, F));
-    if (!ex || !exp || !ridx || !scratch) { fprintf(stderr, "OOM moe_xf_run\n"); exit(1); }
+    if (!ex || !exp || !ridx || !held || !scratch) { fprintf(stderr, "OOM moe_xf_run\n"); exit(1); }
     int timed = tm_on() && S == 1;
     for (int s0 = 0; s0 < S; s0 += per) {
         for (int k0 = 0; k0 < K; k0 += kper) {
             double t0 = timed ? tm_now() : 0;
             for (int s = 0; s < per; s++) for (int k = 0; k < kper; k++) {
                 int src = (s0 + s) * K + (k0 + k), dst = s * kper + k;
-                ridx[dst] = idx[src]; rval[dst] = val[src]; exp[dst] = NULL;
+                ridx[dst] = idx[src]; rval[dst] = val[src]; exp[dst] = NULL; held[dst] = NULL;
                 if (idx[src] < 0) continue;
-                Slot *e; expert_get(m, layer, idx[src], &e);
+                Slot *e = held[dst] = expert_hold(m, layer, idx[src]);
                 ex[dst].g4 = e->pw; ex[dst].u4 = e->pw + gp; ex[dst].d4 = e->pw + 2 * gp;
                 ex[dst].gs = e->gs; ex[dst].us = e->us; ex[dst].ds = e->ds;
                 exp[dst] = &ex[dst];
@@ -2268,9 +2303,10 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
                 float *os = out + (int64_t)s0 * D; for (int d = 0; d < D; d++) os[d] += tmp[d];
             }
             if (timed) { double t2 = tm_now(); g_xf_load += t1 - t0; g_xf_run += t2 - t1; }
+            for (int i = 0; i < n; i++) if (held[i]) slot_release(held[i]);
         }
     }
-    free(ex); free(exp); free(ridx); free(rval); free(tmp); free(scratch);
+    free(ex); free(exp); free(ridx); free(rval); free(held); free(tmp); free(scratch);
 }
 
 /* ---------- CACHE_ROUTE: residency-aware top-K fill (docs/CACHE_ROUTE.md) ----------
@@ -2465,12 +2501,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             double _q1 = tm_now();
             for (int kk = 0; kk < K; kk++) {
                 if (qmask & (1u<<kk)) continue;
-                Slot *e; expert_get(m, layer, idx[kk], &e);
+                Slot *e = expert_hold(m, layer, idx[kk]);
                 slot_ensure_int8(m, e);
                 matmul_qe(g, xs, e->g, e->gs, D, I);
                 matmul_qe(u, xs, e->u, e->us, D, I);
                 for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
                 matmul_qd(hh, g, e->d, e->ds, I, D);
+                slot_release(e);
                 float w = val[kk]; float *os = out + (int64_t)s*D;
                 for (int d = 0; d < D; d++) os[d] += w * hh[d];
             }
@@ -2504,12 +2541,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
         } else {
             for (int kk = 0; kk < K; kk++) {
-                Slot *e; expert_get(m, layer, idx[kk], &e);
+                Slot *e = expert_hold(m, layer, idx[kk]);   /* the PILOT worker may not evict it mid-matmul */
                 slot_ensure_int8(m, e);
                 matmul_qe(g, xs, e->g, e->gs, D, I);
                 matmul_qe(u, xs, e->u, e->us, D, I);
                 for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
                 matmul_qd(hh, g, e->d, e->ds, I, D);
+                slot_release(e);
                 float w = val[kk];
                 float *os = out + (int64_t)s*D;
                 for (int d = 0; d < D; d++) os[d] += w * hh[d];
@@ -2982,8 +3020,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
     Slot *s;
     if (lc->n < lc->cap) { s = &lc->slots[lc->n++]; slot_ensure_allocated(m, s); }
     else {
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++) { if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue; if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i; }
+        int lru = slot_victim(lc, 0);
         if (lru < 0) { m->is_queued[layer*c->n_experts+eid]=0; pthread_mutex_unlock(&g_pilot_mx); return; }
         s = &lc->slots[lru]; s->pinned = 0;
     }
