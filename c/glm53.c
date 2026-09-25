@@ -724,11 +724,20 @@ typedef struct {
     ColiVisionBlock *vblocks;
 } GModel;
 
-static const float *load_f32(GModel *m, const char *fmt, ...) {
+/* `want` e' quanti valori legge chi usa il tensore, contati dalla config. Il
+ * buffer e' grande quanto dice l'header del file: se dice meno, la prima norma
+ * o il router leggerebbero oltre la fine. Di piu' si accetta, come fa
+ * deepseek_v4 (GHSA-9gjf): un checkpoint col padding resta buono. */
+static const float *load_f32(GModel *m, int64_t want, const char *fmt, ...) {
     char name[512];
     va_list args; va_start(args, fmt); vsnprintf(name, sizeof(name), fmt, args); va_end(args);
     st_tensor *t = st_find(&m->S, name);
     if (!t) { fprintf(stderr, "missing tensor %s\n", name); exit(1); }
+    if (t->numel < want) {
+        fprintf(stderr, "%s: %lld values, the config needs %lld\n", name,
+                (long long)t->numel, (long long)want);
+        exit(1);
+    }
     float *buffer = malloc((size_t)t->numel * sizeof(float));
     if (!buffer) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
     st_read_f32_cap(&m->S, name, buffer, t->numel, 0);
@@ -1804,8 +1813,10 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                 float choice = score[e] + (l->rbias ? l->rbias[e] : 0.0f);
                 if (!used && choice > value) { value = choice; best = e; }
             }
-            mine[k] = best;
-            mine_w[k] = score[best];
+            /* SEC: all-NaN scores leave best at -1, and score[-1] is the very
+             * next read. See rt_router_pick in route_trace.h. */
+            mine[k] = rt_router_pick(best, k, c->n_experts, index);
+            mine_w[k] = score[mine[k]];
             total += mine_w[k];
         }
         for (int k = 0; k < topk; k++)
@@ -2006,6 +2017,10 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
     snprintf(probe, sizeof(probe), "%sembed_tokens.weight", m->prefix);
     if (!st_find(&m->S, probe)) snprintf(m->prefix, sizeof(m->prefix), "model.");
     const char *P = m->prefix;
+    /* Le misure con cui il forward legge i vettori f32 (vedi load_f32). Le
+     * matrici mHC sono [(2+hc)*hc, hc*hidden], come in hyper_connections.h. */
+    const Cfg *c = &m->c;
+    const int64_t D = c->hidden, hc = c->hc_mult, hc_mix = (2 + hc) * hc;
 
     if (layer_end < 0 || layer_end > m->c.n_layers) layer_end = m->c.n_layers;
     if (layer_begin < 0) layer_begin = 0;
@@ -2015,8 +2030,8 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
     m->has_io = load_io;
 
     if (load_io) {
-        m->embed = load_f32(m, "%sembed_tokens.weight", P);
-        m->final_norm = load_f32(m, "%snorm.weight", P);
+        m->embed = load_f32(m, c->vocab * D, "%sembed_tokens.weight", P);
+        m->final_norm = load_f32(m, D, "%snorm.weight", P);
     }
     /* La testa e' l'unica matrice grande fuori dagli esperti: a vocab 154880
      * per hidden 4096 sono 2,5 GB in f32, quindi passa dallo stesso
@@ -2053,20 +2068,20 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
 
     for (int i = layer_begin; i < layer_end; i++) {
         GLayer *l = &m->layer[i];
-        l->in_ln = load_f32(m, "%slayers.%d.input_layernorm.weight", P, i);
-        l->post_ln = load_f32(m, "%slayers.%d.post_attention_layernorm.weight", P, i);
-        l->hc_attn_fn = load_f32(m, "%slayers.%d.hc_attn_fn", P, i);
-        l->hc_attn_base = load_f32(m, "%slayers.%d.hc_attn_base", P, i);
-        l->hc_attn_scale = load_f32(m, "%slayers.%d.hc_attn_scale", P, i);
-        l->hc_ffn_fn = load_f32(m, "%slayers.%d.hc_ffn_fn", P, i);
-        l->hc_ffn_base = load_f32(m, "%slayers.%d.hc_ffn_base", P, i);
-        l->hc_ffn_scale = load_f32(m, "%slayers.%d.hc_ffn_scale", P, i);
+        l->in_ln = load_f32(m, D, "%slayers.%d.input_layernorm.weight", P, i);
+        l->post_ln = load_f32(m, D, "%slayers.%d.post_attention_layernorm.weight", P, i);
+        l->hc_attn_fn = load_f32(m, hc_mix * hc * D, "%slayers.%d.hc_attn_fn", P, i);
+        l->hc_attn_base = load_f32(m, hc_mix, "%slayers.%d.hc_attn_base", P, i);
+        l->hc_attn_scale = load_f32(m, 3, "%slayers.%d.hc_attn_scale", P, i);
+        l->hc_ffn_fn = load_f32(m, hc_mix * hc * D, "%slayers.%d.hc_ffn_fn", P, i);
+        l->hc_ffn_base = load_f32(m, hc_mix, "%slayers.%d.hc_ffn_base", P, i);
+        l->hc_ffn_scale = load_f32(m, 3, "%slayers.%d.hc_ffn_scale", P, i);
         if (m->c.is_full[i]) {
             l->qa = load_mat(m, "%slayers.%d.self_attn.q_a_proj.weight", P, i);
-            l->qa_ln = load_f32(m, "%slayers.%d.self_attn.q_a_layernorm.weight", P, i);
+            l->qa_ln = load_f32(m, c->q_lora, "%slayers.%d.self_attn.q_a_layernorm.weight", P, i);
             l->qb = load_mat(m, "%slayers.%d.self_attn.q_b_proj.weight", P, i);
             l->kva = load_mat(m, "%slayers.%d.self_attn.kv_a_proj_with_mqa.weight", P, i);
-            l->kva_ln = load_f32(m, "%slayers.%d.self_attn.kv_a_layernorm.weight", P, i);
+            l->kva_ln = load_f32(m, c->kv_lora, "%slayers.%d.self_attn.kv_a_layernorm.weight", P, i);
             {
                 char kvb_name[512];
                 snprintf(kvb_name, sizeof(kvb_name),
@@ -2077,10 +2092,11 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
             l->iwq = load_mat(m, "%slayers.%d.self_attn.indexer.wq_b.weight", P, i);
             l->iwk = load_mat(m, "%slayers.%d.self_attn.indexer.wk.weight", P, i);
             l->iwp = load_mat(m, "%slayers.%d.self_attn.indexer.weights_proj.weight", P, i);
-            l->ik_nw = load_f32(m, "%slayers.%d.self_attn.indexer.k_norm.weight", P, i);
-            l->ik_nb = load_f32(m, "%slayers.%d.self_attn.indexer.k_norm.bias", P, i);
+            l->ik_nw = load_f32(m, c->index_hd, "%slayers.%d.self_attn.indexer.k_norm.weight", P, i);
+            l->ik_nb = load_f32(m, c->index_hd, "%slayers.%d.self_attn.indexer.k_norm.bias", P, i);
             if (m->c.index_kpool > 1) {
-                l->ikpa = load_f32(m, "%slayers.%d.self_attn.indexer.index_kpool_compress_ape", P, i);
+                l->ikpa = load_f32(m, (int64_t)c->index_kpool * c->index_hd,
+                                   "%slayers.%d.self_attn.indexer.index_kpool_compress_ape", P, i);
                 l->ikpg = load_mat(m, "%slayers.%d.self_attn.indexer.index_kpool_compress_gate", P, i);
             }
         } else {
@@ -2093,9 +2109,9 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
             l->kfa = load_mat(m, "%slayers.%d.self_attn.f_a_proj.weight", P, i);
             l->kfb = load_mat(m, "%slayers.%d.self_attn.f_b_proj.weight", P, i);
             l->kb = load_mat(m, "%slayers.%d.self_attn.b_proj.weight", P, i);
-            l->dt = load_f32(m, "%slayers.%d.self_attn.dt_bias", P, i);
-            l->alog = load_f32(m, "%slayers.%d.self_attn.A_log", P, i);
-            l->onorm = load_f32(m, "%slayers.%d.self_attn.o_norm.weight", P, i);
+            l->dt = load_f32(m, c->kda_proj, "%slayers.%d.self_attn.dt_bias", P, i);
+            l->alog = load_f32(m, c->kda_heads, "%slayers.%d.self_attn.A_log", P, i);
+            l->onorm = load_f32(m, c->kda_hd, "%slayers.%d.self_attn.o_norm.weight", P, i);
             /* Il checkpoint tiene q/k/v conv separate; la ricorrenza le vuole
              * concatenate nello stesso ordine di qkv. */
             {
@@ -2103,7 +2119,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
                 float *conv = malloc((size_t)3 * width * sizeof(float));
                 const char *parts[3] = { "q_conv1d", "k_conv1d", "v_conv1d" };
                 for (int p = 0; p < 3; p++) {
-                    const float *piece = load_f32(m, "%slayers.%d.self_attn.%s.weight",
+                    const float *piece = load_f32(m, width, "%slayers.%d.self_attn.%s.weight",
                                                   P, i, parts[p]);
                     memcpy(conv + (size_t)p * width, piece, (size_t)width * sizeof(float));
                     free((void *)piece);
@@ -2116,10 +2132,10 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
             l->du = load_mat(m, "%slayers.%d.mlp.up_proj.weight", P, i);
             l->dd = load_mat(m, "%slayers.%d.mlp.down_proj.weight", P, i);
         } else {
-            l->router = load_f32(m, "%slayers.%d.mlp.gate.weight", P, i);
+            l->router = load_f32(m, c->n_experts * D, "%slayers.%d.mlp.gate.weight", P, i);
             l->rbias = st_find(&m->S, (snprintf(probe, sizeof(probe),
                         "%slayers.%d.mlp.gate.e_score_correction_bias", P, i), probe))
-                       ? load_f32(m, "%s", probe) : NULL;
+                       ? load_f32(m, c->n_experts, "%s", probe) : NULL;
             l->rg = load_mat(m, "%slayers.%d.mlp.shared_experts.gate_proj.weight", P, i);
             l->ru = load_mat(m, "%slayers.%d.mlp.shared_experts.up_proj.weight", P, i);
             l->rd = load_mat(m, "%slayers.%d.mlp.shared_experts.down_proj.weight", P, i);
@@ -2195,36 +2211,41 @@ static void vision_load(GModel *m) {
         .eps = c->vis_eps, .swiglu_limit = c->vis_swiglu_limit,
         .rope_theta = 10000.0f,
     };
-    m->vision.patch_w = load_f32(m, "%spatch_embed.proj.weight", V);
-    m->vision.patch_b = load_f32(m, "%spatch_embed.proj.bias", V);
-    m->vision.post_norm = load_f32(m, "%spost_layernorm.weight", V);
-    m->vision.down_w = load_f32(m, "%sdownsample.weight", V);
-    m->vision.down_b = load_f32(m, "%sdownsample.bias", V);
-    m->vision.merger_proj = load_f32(m, "%smerger.proj.weight", V);
-    m->vision.merger_norm_w = load_f32(m, "%smerger.post_projection_norm.weight", V);
-    m->vision.merger_norm_b = load_f32(m, "%smerger.post_projection_norm.bias", V);
-    m->vision.merger_gate = load_f32(m, "%smerger.gate_proj.weight", V);
-    m->vision.merger_up = load_f32(m, "%smerger.up_proj.weight", V);
-    m->vision.merger_down = load_f32(m, "%smerger.down_proj.weight", V);
+    /* Le forme sono quelle scritte accanto ai campi in vision_tower.h. */
+    const ColiVisionConfig *vc = &m->vision.config;
+    const int64_t hidden = vc->hidden, inter = vc->intermediate, out = vc->out_hidden;
+    const int64_t proj = vc->proj_intermediate, merge = vc->merge;
+    const int64_t patch = (int64_t)vc->in_channels * vc->temporal * vc->patch * vc->patch;
+    m->vision.patch_w = load_f32(m, hidden * patch, "%spatch_embed.proj.weight", V);
+    m->vision.patch_b = load_f32(m, hidden, "%spatch_embed.proj.bias", V);
+    m->vision.post_norm = load_f32(m, hidden, "%spost_layernorm.weight", V);
+    m->vision.down_w = load_f32(m, out * hidden * merge * merge, "%sdownsample.weight", V);
+    m->vision.down_b = load_f32(m, out, "%sdownsample.bias", V);
+    m->vision.merger_proj = load_f32(m, out * out, "%smerger.proj.weight", V);
+    m->vision.merger_norm_w = load_f32(m, out, "%smerger.post_projection_norm.weight", V);
+    m->vision.merger_norm_b = load_f32(m, out, "%smerger.post_projection_norm.bias", V);
+    m->vision.merger_gate = load_f32(m, proj * out, "%smerger.gate_proj.weight", V);
+    m->vision.merger_up = load_f32(m, proj * out, "%smerger.up_proj.weight", V);
+    m->vision.merger_down = load_f32(m, out * proj, "%smerger.down_proj.weight", V);
 
     m->vblocks = calloc((size_t)c->vis_layers, sizeof(*m->vblocks));
     if (!m->vblocks) { fprintf(stderr, "OOM allocating vision blocks\n"); exit(1); }
     for (int b = 0; b < c->vis_layers; b++) {
         ColiVisionBlock *vb = &m->vblocks[b];
-        vb->norm1 = load_f32(m, "%sblocks.%d.norm1.weight", V, b);
-        vb->norm2 = load_f32(m, "%sblocks.%d.norm2.weight", V, b);
-        vb->qkv_w = load_f32(m, "%sblocks.%d.attn.qkv.weight", V, b);
-        vb->qkv_b = load_f32(m, "%sblocks.%d.attn.qkv.bias", V, b);
-        vb->q_norm = load_f32(m, "%sblocks.%d.attn.q_norm.weight", V, b);
-        vb->k_norm = load_f32(m, "%sblocks.%d.attn.k_norm.weight", V, b);
-        vb->proj_w = load_f32(m, "%sblocks.%d.attn.proj.weight", V, b);
-        vb->proj_b = load_f32(m, "%sblocks.%d.attn.proj.bias", V, b);
-        vb->gate_w = load_f32(m, "%sblocks.%d.mlp.gate_proj.weight", V, b);
-        vb->gate_b = load_f32(m, "%sblocks.%d.mlp.gate_proj.bias", V, b);
-        vb->up_w = load_f32(m, "%sblocks.%d.mlp.up_proj.weight", V, b);
-        vb->up_b = load_f32(m, "%sblocks.%d.mlp.up_proj.bias", V, b);
-        vb->down_w = load_f32(m, "%sblocks.%d.mlp.down_proj.weight", V, b);
-        vb->down_b = load_f32(m, "%sblocks.%d.mlp.down_proj.bias", V, b);
+        vb->norm1 = load_f32(m, hidden, "%sblocks.%d.norm1.weight", V, b);
+        vb->norm2 = load_f32(m, hidden, "%sblocks.%d.norm2.weight", V, b);
+        vb->qkv_w = load_f32(m, 3 * hidden * hidden, "%sblocks.%d.attn.qkv.weight", V, b);
+        vb->qkv_b = load_f32(m, 3 * hidden, "%sblocks.%d.attn.qkv.bias", V, b);
+        vb->q_norm = load_f32(m, vc->head_dim, "%sblocks.%d.attn.q_norm.weight", V, b);
+        vb->k_norm = load_f32(m, vc->head_dim, "%sblocks.%d.attn.k_norm.weight", V, b);
+        vb->proj_w = load_f32(m, hidden * hidden, "%sblocks.%d.attn.proj.weight", V, b);
+        vb->proj_b = load_f32(m, hidden, "%sblocks.%d.attn.proj.bias", V, b);
+        vb->gate_w = load_f32(m, inter * hidden, "%sblocks.%d.mlp.gate_proj.weight", V, b);
+        vb->gate_b = load_f32(m, inter, "%sblocks.%d.mlp.gate_proj.bias", V, b);
+        vb->up_w = load_f32(m, inter * hidden, "%sblocks.%d.mlp.up_proj.weight", V, b);
+        vb->up_b = load_f32(m, inter, "%sblocks.%d.mlp.up_proj.bias", V, b);
+        vb->down_w = load_f32(m, hidden * inter, "%sblocks.%d.mlp.down_proj.weight", V, b);
+        vb->down_b = load_f32(m, hidden, "%sblocks.%d.mlp.down_proj.bias", V, b);
     }
     m->vision.blocks = m->vblocks;
     m->has_vision = 1;

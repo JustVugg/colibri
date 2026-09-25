@@ -347,8 +347,11 @@ static void wf_load(shards *S, WF *w, const char *name, int64_t n) {
     w->n = n;
     w->w = xmalloc((size_t)n * sizeof(float), name);
     /* st_read_f32 widens bf16/f16 as well, so a checkpoint that stores one of these
-     * small tensors in bf16 rather than f32 still loads. */
-    if (st_read_f32(S, name, w->w, 0) != n) {
+     * small tensors in bf16 rather than f32 still loads.
+     * SEC: capped, because `n` comes from config.json and the element count from the
+     * file. Uncapped, a tensor longer than `n` was copied over the heap first and
+     * refused second, by the count check below, after the damage. */
+    if (st_read_f32_cap(S, name, w->w, n, 0) != n) {
         fprintf(stderr, "%s: expected %lld floats\n", name, (long long)n); exit(1); }
 }
 
@@ -546,6 +549,15 @@ static void engram_load_sidecar(Engram *e, const char *snap) {
     jval *multipliers = json_get(root, "multipliers");
     if (!primes || !offsets || !multipliers) {
         fprintf(stderr, "[engram] sidecar lacks primes/offsets/multipliers\n"); exit(1); }
+    /* SEC: the loop below indexes all three by table, up to the length of layer_ids --
+     * a different number, chosen by the same file. A shorter array was read past its
+     * end, and a key that is not an array has no kids at all. */
+    const jval *per_table[] = { primes, offsets, multipliers };
+    const char *per_table_name[] = { "primes", "offsets", "multipliers" };
+    for (int k = 0; k < 3; k++)
+        if (per_table[k]->t != J_ARR || per_table[k]->len < e->n_layers) {
+            fprintf(stderr, "[engram] %s must be an array with one entry per table (%d)\n",
+                    per_table_name[k], e->n_layers); exit(1); }
     for (int layer = 0; layer < e->n_layers; layer++) {
         jval *rows = primes->kids[layer];
         for (int n = 0; n < rows->len && n < V41_MAX_NGRAM; n++)
