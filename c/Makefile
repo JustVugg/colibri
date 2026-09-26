@@ -1354,8 +1354,8 @@ tests/test_ue8m0$(EXE): tests/test_ue8m0.c st.h json.h compat.h
 
 # Compiles the engine with -DCOLI_XDNA so the QT side pointer, its reset helper
 # and the expert-slot wiring are exercised as the engine actually builds them.
-tests/test_xdna_qt_state$(EXE): tests/test_xdna_qt_state.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c -o $@ $(LDFLAGS)
+tests/test_xdna_qt_state$(EXE): tests/test_xdna_qt_state.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c $(VK_OBJ) -o $@ $(LDFLAGS)
 tests/test_xdna_prepared_state$(EXE): tests/test_xdna_prepared_state.c backend_xdna.c backend_xdna.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -1381,8 +1381,8 @@ tests/test_xdna_execution$(EXE): tests/test_xdna_execution.c backend_xdna.c back
 # Failure/fallback owner. Needs BOTH the engine (matmul_qt is the fallback
 # target it verifies against) and the synthetic ABI-2 helpers, which is why it
 # is a separate owner from test_xdna_execution.
-tests/test_xdna_failure$(EXE): tests/test_xdna_failure.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(XDNA_FAKE_HELPERS)
-	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c -o $@ $(LDFLAGS)
+tests/test_xdna_failure$(EXE): tests/test_xdna_failure.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(XDNA_FAKE_HELPERS) $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # NOT a test gate -- intentionally absent from TEST_BINS (its name does not match
 # the tests/test_*$(EXE) pattern the gate list is derived from). It needs a real
@@ -1393,8 +1393,8 @@ tests/test_xdna_failure$(EXE): tests/test_xdna_failure.c colibri.c backend_xdna.
 #
 # M-list defaults to 1,32,64 (the M64 bucket); pass 65,130,256 to qualify
 # the M256 bucket through the same owner.
-tests/xdna_physical_probe$(EXE): tests/xdna_physical_probe.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c -o $@ $(LDFLAGS)
+tests/xdna_physical_probe$(EXE): tests/xdna_physical_probe.c colibri.c backend_xdna.c backend_xdna.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_XDNA $< backend_xdna.c $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1540,14 +1540,14 @@ tests/test_grammar_cache$(EXE): tests/test_grammar_cache.c sse41_kernels.h colib
 # agreement check against the plain logprob_target the sampling path uses
 # on rows a float subtraction cannot mis-round, and a double-precision
 # check against a second double computation on rows that do.
-tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c sse41_kernels.h exact_dot.h oracle.h sample.h evidence_digest.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c sse41_kernels.h exact_dot.h oracle.h sample.h evidence_digest.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # The ablation mode's manifest loader, evidence writer and dispatch contract.
 # The adapter build bypasses only the model computation, so the parser/writer
 # path is exercised for real with no model and no weights.
-tests/test_ablate_mode$(EXE): tests/test_ablate_mode.c colibri.c sse41_kernels.h exact_dot.h oracle.h sample.h evidence_digest.h abl.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_ablate_mode$(EXE): tests/test_ablate_mode.c colibri.c sse41_kernels.h exact_dot.h oracle.h sample.h evidence_digest.h abl.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # Standalone: drives a faithful miniature of moe()'s routing+accumulate and links
 # the SAME abl.h the engine links -- no model/weights needed (the ablation-logic gate).
@@ -1648,8 +1648,8 @@ tests/test_topp$(EXE): tests/test_topp.c sse41_kernels.h colibri.c oracle.h st.h
 
 # bench_topp is a microbenchmark (old qsort vs new heap partial-select, #335), NOT a test
 # gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_topp
-tests/bench_topp$(EXE): tests/bench_topp.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_topp$(EXE): tests/bench_topp.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_sample_nan$(EXE): tests/test_sample_nan.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -2168,13 +2168,13 @@ tests/test_ssd_probe$(EXE): tests/test_ssd_probe.c sse41_kernels.h colibri.c ora
 
 # bench_dsa_select is a microbenchmark (old qsort vs new quickselect partial-select, #356),
 # NOT a test gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_dsa_select
-tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # bench_router_select is a microbenchmark (duplicate-prefix scan vs marked-score scan),
 # not a test gate. Build on demand: make tests/bench_router_select.
-tests/bench_router_select$(EXE): tests/bench_router_select.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_router_select$(EXE): tests/bench_router_select.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # bench_indexer_allocations: microbenchmark (DeepSeek V4 indexer malloc vs persistent arena scratch), NOT a test gate.
 # Build on demand: make tests/bench_indexer_allocations
@@ -2183,24 +2183,24 @@ tests/bench_indexer_allocations$(EXE): tests/bench_indexer_allocations.c
 
 # bench_idot: microbenchmark (single-acc vs independent-acc AVX-VNNI idot), NOT a test gate.
 # Build on demand on an AVX-VNNI CPU: make tests/bench_idot ARCH=native
-tests/bench_idot$(EXE): tests/bench_idot.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_idot$(EXE): tests/bench_idot.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # bench_i4p_gidot: microbenchmark (per-row vs multi-row/AMX K1b grouped planar IDOT), NOT a test gate.
 # Build on demand: make tests/bench_i4p_gidot ARCH=native
-tests/bench_i4p_gidot$(EXE): tests/bench_i4p_gidot.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_i4p_gidot$(EXE): tests/bench_i4p_gidot.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # bench_gemv_stream: microbenchmark (decode-regime GEMV bandwidth vs the read ceiling;
 # frozen-baseline + deinterleaved-x candidate A/B), NOT a test gate.
 # Build on demand: make tests/bench_gemv_stream ARCH=native
-tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # bench_mla_simd: microbenchmark (scalar vs AVX2/NEON MLA-absorb reductions, #442),
 # NOT a test gate. Build on demand: make tests/bench_mla_simd
-tests/bench_mla_simd$(EXE): tests/bench_mla_simd.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_mla_simd$(EXE): tests/bench_mla_simd.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_uring$(EXE): tests/test_uring.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -2270,8 +2270,8 @@ tests/test_shard_kvb_refuse$(EXE): tests/test_shard_kvb_refuse.c colibri.c st.h 
 # exists so it also compiles under the suite's own $(CFLAGS) rather than only
 # under the driver's hand-copied flag list, and so a warning regression in it
 # fails the normal build.
-tests/test_e8x4g64_loader$(EXE): tests/test_e8x4g64_loader.c st.h quant.h fp8_format.h compat.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_e8x4g64_loader$(EXE): tests/test_e8x4g64_loader.c st.h quant.h fp8_format.h compat.h $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # Reachable build-only entry point for the harness above: `make check` never
 # calls this (it stays out of TEST_BINS/test-c, per TEST_EXCLUDE), so this adds
