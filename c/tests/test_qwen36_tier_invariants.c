@@ -315,6 +315,7 @@ static void test_shutdown_wakes_everyone(void) {
     check(!t_note_block_done && !t_note_planned_done && !t_fill_wait_done,
           "with a full queue and an open group all three callers must be parked before shutdown");
 
+    uint64_t uploads_before = G.uploads;
     arm_watchdog(10);
     qt_shutdown();
     pthread_join(a, NULL); pthread_join(bth, NULL); pthread_join(c, NULL);
@@ -322,6 +323,9 @@ static void test_shutdown_wakes_everyone(void) {
     check(!G.on, "shutdown_returns_with_four_waiters_parked");
     check(t_note_block_done && t_note_planned_done && t_fill_wait_done,
           "every cv_take waiter must return once shutdown has been requested");
+    /* shutdown frees G.slot, so the abandonment is pinned through the upload
+     * counter: none of the abandoned swaps drove an upload */
+    check(G.uploads == uploads_before, "an abandoned swap uploads nothing");
     check(!G.slot && !G.is_x && !G.waiters,
           "shutdown releases storage only after every parked caller has resumed");
 }

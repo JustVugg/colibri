@@ -70,7 +70,9 @@ the optional CUDA VRAM expert tier documented in
 through ROCm with `make -C c qwen36 HIP=1 HIP_ARCH=<gfx>` (for example
 `HIP_ARCH=gfx1151`, with `ROCM_HOME` and `HIPCC` pointing at the toolchain):
 measured on a Ryzen AI MAX+ 395, output bit-identical to the CPU path and 2.4x
-faster than CPU-only (#1502).
+faster than CPU-only (#1502). `make -C c qwen36 VK=1` builds the same tier
+against the shared Vulkan backend; [`qwen36-tier.md`](qwen36-tier.md) covers
+what differs there.
 
 ## The expert kernel
 
@@ -100,8 +102,8 @@ ms in the last windows, peak RSS 29 -> 17 GB. Of the 20 ms, 11 are the kernel
 (the DRAM floor for the int4 bytes is 9) and 6 are the residual misses of a
 97.6% hit rate, fetched one at a time; that fetch is the next thing to
 overlap, not this kernel. `tests/test_expert_ffn` holds the numerics.
-`QWEN_EXPERT_KERNEL=0` restores the int8 path for A/Bs. The CUDA expert tier
-keeps its own path: it uploads the pair-layout int4 and computes misses from
+`QWEN_EXPERT_KERNEL=0` restores the int8 path for A/Bs. The expert tier (CUDA
+or Vulkan) keeps its own path: it uploads the pair-layout int4 and computes misses from
 the int8 copy.
 
 ## The dense trunk: integer dot products
