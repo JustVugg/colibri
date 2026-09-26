@@ -681,7 +681,17 @@ VK_SPV     =
 GLSLC     ?= glslc
 ifeq ($(VK),1)
 CFLAGS   += -DCOLI_VULKAN
+ifneq ($(IS_WIN),)
+# Windows has no libvulkan: the loader is vulkan-1.dll, installed by the GPU
+# driver, and MSYS2's vulkan-loader package ships only its import library,
+# libvulkan-1.dll.a. The -static in the Windows LDFLAGS makes ld skip every
+# .dll.a, so neither -lvulkan nor -lvulkan-1 resolved and VK=1 failed at link
+# time. Search dynamically for this one library, then switch back: libgomp,
+# winpthreads and libgcc stay static, and the only new import is vulkan-1.dll.
+LDFLAGS  += -Wl,-Bdynamic -lvulkan-1 -Wl,-Bstatic
+else
 LDFLAGS  += -lvulkan
+endif
 VK_OBJ    = backend_vulkan.o
 VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv
 endif

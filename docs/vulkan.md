@@ -40,6 +40,34 @@ The compiled shaders are found via `COLI_VK_SHADERS` (either the
 `qmatmul.spv` file or the directory holding the `.spv` set); unset, the
 engine looks in `shaders/` next to the binary, then relative to the CWD.
 
+### Windows (MSYS2)
+
+In the MSYS2 **UCRT64** shell ([quickstart.md](quickstart.md)), add the Vulkan
+headers, the loader's import library and `glslc`, then build:
+
+```bash
+pacman -S --needed mingw-w64-ucrt-x86_64-vulkan-headers \
+  mingw-w64-ucrt-x86_64-vulkan-loader mingw-w64-ucrt-x86_64-shaderc
+cd c
+make colibri.exe VK=1
+```
+
+The binary is statically linked like the default Windows build, plus one
+import: `vulkan-1.dll`, the loader the GPU driver installs in `System32`, so it
+runs outside MSYS2 with nothing added to `PATH`. The next-to-the-binary shader
+lookup above is Linux-only: on Windows run from `c\` or set `COLI_VK_SHADERS`.
+To check the driver before downloading a model, point `SNAP` at a folder
+holding only a `config.json`, as the CI's Lavapipe job does; the backend
+initialises before any weight is read:
+
+```powershell
+# in c\
+New-Item -ItemType Directory -Force $env:TEMP\vkprobe | Out-Null
+'{"model_type":"glm_moe_dsa"}' | Set-Content $env:TEMP\vkprobe\config.json
+$env:SNAP = "$env:TEMP\vkprobe"; $env:COLI_VULKAN = "1"; $env:COLI_NO_OMP_TUNE = "1"
+.\colibri.exe    # prints "[VK] ready: <GPU>", then exits: there is no model
+```
+
 ## What runs on the GPU
 
 | Piece | Env | Mechanism |
