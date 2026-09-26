@@ -151,6 +151,28 @@ static void test_nan_propagation(void){
     CHECK(isnan(y[1]));                        /* contaminated row propagates NaN */
 }
 
+/* matmul_fp8 routes S>=4 through the NEON batch arm on arm64: it must be
+ * bit-identical to the scalar kernel, token by token.  Odd O/I/S cover the
+ * zero-padded row tile, the clamped token lanes and the 64-token chunk edge;
+ * one NaN byte checks the propagation policy survives the tile decode. */
+static void run_batch_exact(int S, int I, int O){
+    uint8_t *q8=malloc((size_t)O*I);
+    int64_t nblk=fp8_nblk(O)*fp8_nblk(I);
+    float *bscale=malloc((size_t)nblk*sizeof(float)), *x=malloc((size_t)S*I*sizeof(float));
+    float *y=malloc((size_t)S*O*sizeof(float)), *y1=malloc((size_t)S*O*sizeof(float));
+    for(int64_t i=0;i<(int64_t)O*I;i++) q8[i]=rndbyte_nonan();
+    q8[(int64_t)(O-1)*I + I/2] = 0x7F;
+    for(int64_t b=0;b<nblk;b++) bscale[b]=rndf();
+    for(int64_t i=0;i<(int64_t)S*I;i++) x[i]=rndf();
+    matmul_fp8(y, x, q8, bscale, S, I, O);
+    matmul_fp8_scalar(y1, x, q8, bscale, S, I, O);
+    int same=1;
+    for(int64_t i=0;i<(int64_t)S*O;i++) same &= isnan(y1[i]) ? isnan(y[i]) : !memcmp(y+i,y1+i,sizeof(float));
+    if(!same) printf("  batch S=%d I=%d O=%d not bit-identical to scalar\n", S, I, O);
+    CHECK(same);
+    free(q8); free(bscale); free(x); free(y); free(y1);
+}
+
 int main(void){
     test_lut();
     run_block_case(2048, 6144, "block gate/up-shaped O=2048 I=6144 (spec example)");
@@ -161,6 +183,8 @@ int main(void){
     run_block_case(1, 1,       "degenerate 1x1 (single sub-block)");
     run_block_case(384, 6144,  "non-square block grid nblkO=3 nblkI=48 (stride audit)");
     test_nan_propagation();
+    int bs[][3]={{4,128,16},{5,200,130},{7,129,37},{64,1000,257},{65,4096,128},{130,2048,512}};
+    for(unsigned k=0;k<sizeof bs/sizeof*bs;k++) run_batch_exact(bs[k][0],bs[k][1],bs[k][2]);
     if(fails){ printf("fp8 passthrough CPU tests: %d FAILED\n", fails); return 1; }
     printf("fp8 passthrough CPU tests: ok\n");
     return 0;
