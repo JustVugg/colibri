@@ -152,13 +152,13 @@ class MakefileVkObjTest(unittest.TestCase):
         stamp = C_DIR / ".build-config"
         saved = (stamp.read_bytes(), stamp.stat()) if stamp.exists() else None
         try:
-            probe = _make("--eval", "vk-obj-probe: ; @echo '$(CC)|$(EXE)'",
-                          "vk-obj-probe", "VK=1")
-            cc, exe = probe.stdout.strip().split("|")
-            cls.cc = cc.split()[0]
-            if not shutil.which(cls.cc):
-                raise unittest.SkipTest(f"{cls.cc} is required")
-            cls.rules = {t.replace("$(EXE)", exe): p
+            # $(EXE) from make's own database. Not --eval: GNU Make 3.81,
+            # macOS's /usr/bin/make, predates it; -p is older than that.
+            database = _make("-pn", "VK=1", ".build-config").stdout
+            exe = re.search(r"(?m)^EXE :?= ?(\S*)", database)
+            if exe is None:
+                raise AssertionError("make -pn printed no EXE variable")
+            cls.rules = {t.replace("$(EXE)", exe.group(1)): p
                          for t, p in _link_rules().items()
                          if "$(" not in t.replace("$(EXE)", "") and "%" not in t}
             dry = _make("-Bnk", "VK=1", *sorted(cls.rules))
@@ -168,12 +168,21 @@ class MakefileVkObjTest(unittest.TestCase):
             else:
                 stamp.write_bytes(saved[0])
                 os.utime(stamp, ns=(saved[1].st_atime_ns, saved[1].st_mtime_ns))
-        cls.links = {}
-        for line in dry.stdout.splitlines():
+        # A link line is any printed command that compiles a .c into an output
+        # without -c -- also for rules that write a differently named file
+        # (fuzz-rans) -- and the compiler is whatever make put first on it.
+        # `make -n` prints recipe continuations as written, so fold them first.
+        lines = {}
+        for line in re.sub(r"\\\n[ \t]*", " ", dry.stdout).splitlines():
             words = line.split()
-            if (words and words[0] == cls.cc and "-c" not in words
-                    and "-o" in words):
-                cls.links[words[words.index("-o") + 1]] = words
+            if ("-o" in words and "-c" not in words
+                    and words.index("-o") + 1 < len(words)
+                    and any(w.endswith(".c") for w in words)):
+                lines[words[words.index("-o") + 1]] = words
+        compilers = {words[0] for words in lines.values()}
+        if lines and not any(shutil.which(c) for c in compilers):
+            raise unittest.SkipTest(f"{', '.join(sorted(compilers))} is required")
+        cls.links = {t: w for t, w in lines.items() if shutil.which(w[0])}
         api = _backend_api()
         with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
             results = dict(zip(cls.links, pool.map(
@@ -214,7 +223,10 @@ class MakefileVkObjTest(unittest.TestCase):
             example = sorted(names)[0]
             if "backend_vulkan.o" not in self.links[target]:
                 missing.append(f"{target}: not on the link line (calls {example})")
-            if "$(VK_OBJ)" not in self.rules.get(target, []):
+            if target not in self.rules:
+                missing.append(f"{target}: its rule is not named after it; "
+                               f"list $(VK_OBJ) as that rule's prerequisite")
+            elif "$(VK_OBJ)" not in self.rules[target]:
                 missing.append(f"{target}: $(VK_OBJ) not a prerequisite")
         self.assertFalse(
             missing,
