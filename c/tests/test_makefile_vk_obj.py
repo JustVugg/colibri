@@ -1,57 +1,67 @@
-"""A rule that compiles a Vulkan-hooked engine must link $(VK_OBJ).
+"""A link that calls the Vulkan backend must link $(VK_OBJ).
 
 Under VK=1, CFLAGS carries -DCOLI_VULKAN. A translation unit that includes an
-engine with `#ifdef COLI_VULKAN` hooks (colibri.c, kimi_k3.c, ...) then calls
-coli_vk_*, and the link fails unless the rule also links $(VK_OBJ). That
-variable is empty unless VK=1, so the default build and every default CI job
-stay green while `make test-c VK=1` is broken. #1728 fixed the 43 rules that
+engine with Vulkan hooks (colibri.c, kimi_k3.c, ...) then calls coli_vk_*, and
+the link fails unless the rule also links $(VK_OBJ). That variable is empty
+unless VK=1, so the default build and every default CI job stay green while
+`make test-c VK=1` is broken. #1728 fixed the 43 rules that
 `make -k test-c VK=1` reported. Four more gates (test_xdna_qt_state,
 test_xdna_failure, test_logprob_status, test_ablate_mode) arrived in pull
 requests merged after it, and nine on-demand rules outside TEST_BINS -- the
 benches, the XDNA physical probe, the e8x4g64 loader harness -- were never
 built by test-c, so no such run could report them.
 
-Nothing here is a hand-kept list. The hooked sources are the files with a
-preprocessor conditional on COLI_VULKAN. A link recipe needs $(VK_OBJ) when a
-.c file it compiles reaches one of them through quoted #includes, and the rule
-must list $(VK_OBJ) as a prerequisite too: otherwise a clean build can reach
-the link before backend_vulkan.o exists (#1728 found six rules like that). Flag
-variables whose definition filters -DCOLI_VULKAN out, such as
-SEGMENT_CPU_CFLAGS, are recognised from that definition, and `-c` compiles
-are not links.
+Whether a link needs the backend is a preprocessor question, not a textual
+one: code can pick CUDA over Vulkan with `#elif`, a hook can be an #ifdef that
+only reads an environment variable, and a test can define the coli_vk_*
+functions itself to fake the device. So nothing here reads #if lines. It asks
+make for the expanded VK=1 link commands (`make -Bn`), preprocesses each .c on
+a line with that line's own flags, and looks at what survives: a link needs
+$(VK_OBJ) when the code calls a function backend_vulkan.h declares and does
+not define it. The rule must then link $(VK_OBJ) and list it as a
+prerequisite, or a clean build can reach the link before backend_vulkan.o
+exists (#1728 found six rules like that). Nothing is hand-listed: the rules
+come from the Makefile and the API from backend_vulkan.h.
 """
+import os
 import re
+import shutil
+import subprocess
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 C_DIR = Path(__file__).resolve().parent.parent
+MAKE = shutil.which("make")
 
-VK_HOOK_RE = re.compile(
-    r"(?m)^[ \t]*#[ \t]*(?:if|ifdef|ifndef|elif)\b.*\bCOLI_VULKAN\b")
-INCLUDE_RE = re.compile(r'(?m)^[ \t]*#[ \t]*include[ \t]*"([^"]+)"')
 ASSIGN_RE = re.compile(
-    r"^(?:override[ \t]+)?([A-Za-z0-9_]+)[ \t]*(?:\+|\?|!|::?)?=[ \t]*(.*)$")
+    r"^(?:override[ \t]+)?[A-Za-z0-9_]+[ \t]*(?:\+|\?|!|::?)?=")
 RULE_RE = re.compile(r"^([^\t#][^=]*?)[ \t]*:(?![=:])[ \t]*(.*)$")
-VAR_RE = re.compile(r"\$\(([A-Za-z0-9_]+)\)")
 # Lines that are not rules even when they contain a colon, e.g.
-# `$(warning mixed HIP_ARCH list: ...)`. A rule may still START with `$(`:
-# `$(SEGMENT_BUILD_DIR)/glm.o: colibri.c ...`.
+# `$(warning mixed HIP_ARCH list: ...)`. A rule may still START with `$(`.
 DIRECTIVE_RE = re.compile(
     r"^(?:ifeq|ifneq|ifdef|ifndef|else|endif|(?:-|s)?include|export"
     r"|unexport|vpath)\b|^\$\((?:error|warning|info|file|shell|eval|call)\b")
+LINEMARKER_RE = re.compile(r'^#\s+\d+\s+"([^"]+)"')
+STRING_RE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'')
+NAME_RE = re.compile(r"\bcoli_vk_\w+")
+DEF_RE = re.compile(r"\b(coli_vk_\w+)\s*\([^;{}()]*\)\s*\{")
+# Link-only and dependency-file arguments; the rest of a link line is what
+# the compile saw. -MMD/-MF would make `-E` write .d files beside the sources.
+SKIP_WORD = re.compile(r"^(-l|-L|-Wl,|-static|-shared|-flto|-fuse-ld|-MMD$|-MD$|-MP$)")
+SKIP_PAIR = {"-o", "-MF", "-MT", "-MQ", "-framework"}
+INPUT_SUFFIXES = (".c", ".o", ".a", ".so", ".dll", ".lib", ".dylib")
 
 
-def _parse_makefile():
-    """(rules, variables) from c/Makefile, continuations folded.
+def _link_rules():
+    """{target: normal prerequisites} for every rule with a $(CC) link recipe.
 
-    rules: [(targets, prerequisites, recipe_lines)], prerequisites being the
-    normal ones only (an order-only $(VK_OBJ) would not relink on change).
-    variables: name -> every value it is assigned anywhere; the union is
-    enough to find .c files and COLI_VULKAN filters, whatever the platform.
+    Prerequisites are the one thing `make -n` does not print. Continuations
+    are folded first, and define/endef bodies skipped.
     """
     text = (C_DIR / "Makefile").read_text(encoding="utf-8")
     text = re.sub(r"\\\n[ \t]*", " ", text)
-    rules, variables, current, in_define = [], {}, None, False
+    rules, current, in_define = {}, None, False
     for line in text.splitlines():
         if in_define:
             in_define = not line.startswith("endef")
@@ -60,145 +70,156 @@ def _parse_makefile():
             in_define, current = True, None
             continue
         if line.startswith("\t"):
-            if current is not None:
-                current[2].append(line.strip())
+            words = line.split()
+            if current and "$(CC)" in words and "-c" not in words:
+                for target in current[0]:
+                    rules[target] = current[1]
             continue
         stripped = line.split("#", 1)[0].strip()
-        if not stripped:
+        if not stripped or DIRECTIVE_RE.match(stripped):
             continue
-        assign = ASSIGN_RE.match(stripped)
-        if assign:
-            variables.setdefault(assign.group(1), []).append(assign.group(2))
+        if ASSIGN_RE.match(stripped):
             current = None
-            continue
-        if DIRECTIVE_RE.match(stripped):
             continue
         rule = RULE_RE.match(stripped)
         if rule:
             prereqs = rule.group(2).split(";", 1)[0].split("|", 1)[0].split()
-            current = (rule.group(1).split(), prereqs, [])
-            rules.append(current)
-    return rules, variables
+            current = (rule.group(1).split(), prereqs)
+    return rules
 
 
-def _expand_words(word, variables, depth=0):
-    """Every word a $(VAR) can stand for, across all its definitions."""
-    match = VAR_RE.fullmatch(word)
-    if not match or depth > 8:
-        return [word]
-    words = []
-    for value in variables.get(match.group(1), []):
-        for part in value.split():
-            words.extend(_expand_words(part, variables, depth + 1))
-    return words
+def _backend_api():
+    text = (C_DIR / "backend_vulkan.h").read_text(encoding="utf-8")
+    return set(re.findall(r"\bcoli_vk_\w+", text))
 
 
-def _vk_stripping_vars(variables):
-    return {name for name, values in variables.items()
-            if any("filter-out" in v and "-DCOLI_VULKAN" in v for v in values)}
+def _make(*args):
+    return subprocess.run([MAKE, "--no-print-directory", *args], cwd=C_DIR,
+                          capture_output=True, text=True, errors="replace",
+                          timeout=600)
 
 
-class _IncludeGraph:
-    """Quoted-#include reachability, reading each file once."""
-
-    def __init__(self):
-        self._files = {}
-
-    def _scan(self, path):
-        if path not in self._files:
-            text = path.read_text(encoding="utf-8", errors="replace")
-            includes = []
-            for name in INCLUDE_RE.findall(text):
-                for base in (path.parent, C_DIR):
-                    candidate = (base / name).resolve()
-                    if candidate.is_file():
-                        includes.append(candidate)
-                        break
-            self._files[path] = (bool(VK_HOOK_RE.search(text)), includes)
-        return self._files[path]
-
-    def reaches_vk_hook(self, source):
-        """True when `source` or anything it quote-includes has a hook."""
-        seen, stack = set(), [source.resolve()]
-        while stack:
-            path = stack.pop()
-            if path in seen or not path.is_file():
-                continue
-            seen.add(path)
-            hooked, includes = self._scan(path)
-            if hooked:
-                return True
-            stack.extend(includes)
-        return False
-
-
-def _rules_needing_vk_obj():
-    """[(target, has_prerequisite, has_link_argument)] for every rule whose
-    link recipe compiles a translation unit that reaches a COLI_VULKAN hook."""
-    rules, variables = _parse_makefile()
-    stripping = _vk_stripping_vars(variables)
-    graph = _IncludeGraph()
-    found = []
-    for targets, prereqs, recipe in rules:
-        for line in recipe:
-            words = line.split()
-            if "$(CC)" not in words or "-c" in words or "-UCOLI_VULKAN" in words:
-                continue
-            if stripping & {m.group(1) for m in map(VAR_RE.fullmatch, words) if m}:
-                continue
-            sources = []
-            for word in words:
-                if word == "$<":
-                    sources.extend(prereqs[:1])
-                elif word == "$^":
-                    sources.extend(prereqs)
-                else:
-                    sources.extend(_expand_words(word, variables))
-            if any(s.endswith(".c") and graph.reaches_vk_hook(C_DIR / s)
-                   for s in sources):
-                found.append((" ".join(targets), "$(VK_OBJ)" in prereqs,
-                              "$(VK_OBJ)" in words or "$^" in words))
-    return found
+def _unresolved(words, api):
+    """Backend functions the link line's sources call without defining them,
+    or None when this host cannot preprocess them (and so cannot build them
+    either; the platforms that can are where the line gets checked)."""
+    cc, flags, sources, i = words[0], [], [], 1
+    while i < len(words):
+        w = words[i]
+        if w in SKIP_PAIR:
+            i += 2
+            continue
+        if w.endswith(INPUT_SUFFIXES):
+            if w.endswith(".c"):
+                sources.append(w)
+        elif w != "-c" and not SKIP_WORD.match(w):
+            flags.append(w)
+        i += 1
+    called, defined = set(), set()
+    for source in sources:
+        r = subprocess.run([cc, "-E", *flags, source], cwd=C_DIR,
+                           capture_output=True, text=True, errors="replace",
+                           timeout=300)
+        if r.returncode != 0:
+            return None
+        # Keep only this tree's own code: system headers cannot call the
+        # backend, and backend_vulkan.h only declares it.
+        kept, keep, own = [], True, {}
+        for line in r.stdout.splitlines():
+            marker = LINEMARKER_RE.match(line)
+            if marker:
+                path = marker.group(1)
+                if path not in own:
+                    resolved = (C_DIR / path).resolve()
+                    own[path] = (not path.startswith("<")
+                                 and resolved.is_relative_to(C_DIR)
+                                 and resolved.name != "backend_vulkan.h")
+                keep = own[path]
+            elif keep:
+                kept.append(line)
+        code = STRING_RE.sub('""', "\n".join(kept))
+        called |= set(NAME_RE.findall(code)) & api
+        defined |= set(DEF_RE.findall(code)) & api
+    return called - defined
 
 
+@unittest.skipUnless(MAKE, "make is required")
 class MakefileVkObjTest(unittest.TestCase):
-    def test_the_scan_is_derived_and_not_vacuous(self):
-        """A parse that matches nothing would pass the check below silently.
+    @classmethod
+    def setUpClass(cls):
+        # A dry run still rewrites .build-config at parse time; put it back so
+        # running this test does not make the next real build relink.
+        stamp = C_DIR / ".build-config"
+        saved = (stamp.read_bytes(), stamp.stat()) if stamp.exists() else None
+        try:
+            probe = _make("--eval", "vk-obj-probe: ; @echo '$(CC)|$(EXE)'",
+                          "vk-obj-probe", "VK=1")
+            cc, exe = probe.stdout.strip().split("|")
+            cls.cc = cc.split()[0]
+            if not shutil.which(cls.cc):
+                raise unittest.SkipTest(f"{cls.cc} is required")
+            cls.rules = {t.replace("$(EXE)", exe): p
+                         for t, p in _link_rules().items()
+                         if "$(" not in t.replace("$(EXE)", "") and "%" not in t}
+            dry = _make("-Bnk", "VK=1", *sorted(cls.rules))
+        finally:
+            if saved is None:
+                stamp.unlink(missing_ok=True)
+            else:
+                stamp.write_bytes(saved[0])
+                os.utime(stamp, ns=(saved[1].st_atime_ns, saved[1].st_mtime_ns))
+        cls.links = {}
+        for line in dry.stdout.splitlines():
+            words = line.split()
+            if (words and words[0] == cls.cc and "-c" not in words
+                    and "-o" in words):
+                cls.links[words[words.index("-o") + 1]] = words
+        api = _backend_api()
+        with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+            results = dict(zip(cls.links, pool.map(
+                lambda words: _unresolved(words, api), cls.links.values())))
+        cls.needs = {t: names for t, names in results.items() if names}
+        cls.unchecked = sorted(t for t, names in results.items() if names is None)
 
-        Cross-check against the engines themselves: every NAME.c carrying a
-        COLI_VULKAN hook that has a `NAME$(EXE):` rule must be found by the
-        same scan, since that rule compiles it directly.
+    def test_the_scan_is_not_vacuous(self):
+        """A broken dry run or preprocess would pass the check below silently.
+
+        Cross-check against the engines: a NAME.c that calls a backend function
+        and has a `NAME$(EXE):` rule compiles that call directly, so the scan
+        must report the rule as calling the backend.
         """
-        hooked = sorted(p.stem for p in C_DIR.glob("*.c")
-                        if VK_HOOK_RE.search(p.read_text(encoding="utf-8",
-                                                         errors="replace")))
-        self.assertTrue(hooked, "no .c file under c/ has a COLI_VULKAN "
-                                "conditional -- the hook syntax changed and "
-                                "this file now checks nothing")
-        rules, _ = _parse_makefile()
-        engine_rules = {name for name in hooked
-                        if any(f"{name}$(EXE)" in t for t, _, _ in rules)}
-        self.assertTrue(engine_rules, f"no `NAME$(EXE):` rule for {hooked}")
-        found = {target for target, _, _ in _rules_needing_vk_obj()}
-        for name in sorted(engine_rules):
-            self.assertIn(f"{name}$(EXE)", found,
-                          f"the scan missed {name}$(EXE), which compiles "
-                          f"{name}.c itself -- the recipe parse is broken")
-        self.assertTrue(any(t.startswith("tests/") for t in found),
-                        "the scan found no test rule including an engine")
+        api = _backend_api()
+        self.assertTrue(api, "backend_vulkan.h declares no coli_vk_*")
+        self.assertTrue(self.links, "make -Bn VK=1 printed no link line")
+        call = re.compile(r"\b(%s)\s*\(" % "|".join(sorted(api)))
+        engines = sorted(
+            t for t in self.links
+            if "/" not in t and (C_DIR / (t.split(".")[0] + ".c")).is_file()
+            and call.search((C_DIR / (t.split(".")[0] + ".c")).read_text(
+                encoding="utf-8", errors="replace")))
+        self.assertTrue(engines, "no engine source calls the Vulkan backend")
+        for target in engines:
+            self.assertNotIn(target, self.unchecked,
+                             f"{target} could not be preprocessed here")
+            self.assertIn(target, self.needs,
+                          f"{target} calls the backend in its source, yet the "
+                          f"scan found no call -- the dry run or preprocess "
+                          f"is broken")
+        self.assertTrue(any(t.startswith("tests/") for t in self.needs),
+                        "the scan found no test that calls the backend")
 
-    def test_every_rule_compiling_a_hooked_engine_links_vk_obj(self):
+    def test_every_link_that_calls_vulkan_links_vk_obj(self):
         missing = []
-        for target, has_prereq, has_link in _rules_needing_vk_obj():
-            if not has_prereq:
+        for target, names in sorted(self.needs.items()):
+            example = sorted(names)[0]
+            if "backend_vulkan.o" not in self.links[target]:
+                missing.append(f"{target}: not on the link line (calls {example})")
+            if "$(VK_OBJ)" not in self.rules.get(target, []):
                 missing.append(f"{target}: $(VK_OBJ) not a prerequisite")
-            if not has_link:
-                missing.append(f"{target}: $(VK_OBJ) not on the link line")
         self.assertFalse(
             missing,
-            "these rules compile a source with COLI_VULKAN hooks, so under "
-            "VK=1 they reference coli_vk_* and must link backend_vulkan.o:\n  "
-            + "\n  ".join(missing))
+            "under VK=1 these links call coli_vk_* without defining it, so they "
+            "must link backend_vulkan.o:\n  " + "\n  ".join(missing))
 
 
 if __name__ == "__main__":
