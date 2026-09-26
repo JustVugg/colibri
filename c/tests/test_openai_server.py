@@ -23,13 +23,15 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
                            parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
-                           read_engine_turn, render_chat, render_chat_for_arch,
+                           parse_qwen_tool_calls,
+                           read_engine_turn, render_chat, render_chat_qwen, render_chat_for_arch,
                            render_chat_glm53, render_chat_inkling, render_chat_kimi,
                            render_chat_olmoe,
                            render_chat_qwen38, render_chat_v4, render_chat_dsv41,
                            _dsv4_tool_calls, serve,
                            resolve_generation_prompt, split_thinking_reply,
                            starts_in_reasoning,
+
                            stop_policy, tune_child_env)
 
 
@@ -162,7 +164,7 @@ class TemplateTest(unittest.TestCase):
         self.assertIn("<|im_start|>user\n<tool_response>\nclear\n</tool_response><|im_end|>",
                       with_text)
 
-        text, calls = parse_qwen38_tool_calls(
+        text, calls = parse_qwen_tool_calls(
             "Sure.\n\n<tool_call>\n<function=weather>\n<parameter=city>\nRome\n"
             "</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>",
             [tool])
@@ -516,6 +518,245 @@ class TemplateTest(unittest.TestCase):
             self.assertEqual(stop_policy({"stop": "END"}, True), (("END",), False))
         with self.assertRaises(APIError):
             stop_policy({"x_colibri_ignore_leading_stop": "yes"}, True)
+
+class Qwen36ToolCallTest(unittest.TestCase):
+    WEATHER = [{
+        "type": "function",
+        "function": {
+            "name": "weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer"},
+                },
+                "required": ["city"],
+            },
+        },
+    }]
+
+    def test_qwen36_renders_tool_declaration(self):
+        prompt = render_chat_qwen(
+            [{"role": "user", "content": "Weather in Rome?"}],
+            tools=self.WEATHER,
+        )
+
+        self.assertIn(
+            "# Tools\n\nYou have access to the following functions:\n\n<tools>",
+            prompt,
+        )
+        self.assertIn('"name": "weather"', prompt)
+        self.assertIn("</tools>", prompt)
+        self.assertIn("<function=example_function_name>", prompt)
+
+    def test_qwen36_tool_choice_none_suppresses_declaration(self):
+        prompt = render_chat_qwen(
+            [{"role": "user", "content": "Weather?"}],
+            tools=self.WEATHER,
+            tool_choice="none",
+        )
+
+        self.assertNotIn("<tools>", prompt)
+
+    def test_qwen36_renders_assistant_tool_call(self):
+        prompt = render_chat_qwen([
+            {"role": "user", "content": "Weather in Rome?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "arguments": '{"city":"Rome","days":3}',
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "sunny",
+            },
+        ], tools=self.WEATHER)
+
+        self.assertIn(
+            "<tool_call>\n"
+            "<function=weather>\n"
+            "<parameter=city>\n"
+            "Rome\n"
+            "</parameter>\n"
+            "<parameter=days>\n"
+            "3\n"
+            "</parameter>\n"
+            "</function>\n"
+            "</tool_call>",
+            prompt,
+        )
+
+        self.assertIn(
+            "<|im_start|>user\n"
+            "<tool_response>\n"
+            "sunny\n"
+            "</tool_response><|im_end|>",
+            prompt,
+        )
+
+    def test_qwen36_consecutive_tool_results_share_user_turn(self):
+        prompt = render_chat_qwen([
+            {"role": "user", "content": "Check both."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "a",
+                        "type": "function",
+                        "function": {
+                            "name": "weather",
+                            "arguments": '{"city":"Rome"}',
+                        },
+                    },
+                    {
+                        "id": "b",
+                        "type": "function",
+                        "function": {
+                            "name": "weather",
+                            "arguments": '{"city":"Berlin"}',
+                        },
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "sunny"},
+            {"role": "tool", "tool_call_id": "b", "content": "cloudy"},
+        ], tools=self.WEATHER)
+
+        self.assertIn(
+            "<|im_start|>user\n"
+            "<tool_response>\n"
+            "sunny\n"
+            "</tool_response>\n"
+            "<tool_response>\n"
+            "cloudy\n"
+            "</tool_response><|im_end|>",
+            prompt,
+        )
+
+    def test_qwen36_parser_accepts_native_call(self):
+        text, calls = parse_qwen_tool_calls(
+            "Checking.\n\n"
+            "<tool_call>\n"
+            "<function=weather>\n"
+            "<parameter=city>\n"
+            "Rome\n"
+            "</parameter>\n"
+            "<parameter=days>\n"
+            "3\n"
+            "</parameter>\n"
+            "</function>\n"
+            "</tool_call>",
+            self.WEATHER,
+        )
+
+        self.assertEqual(text, "Checking.")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "weather")
+
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(args["city"], "Rome")
+        self.assertEqual(args["days"], 3)
+
+    def test_qwen36_parser_preserves_text_around_native_call(self):
+        reply = (
+            "Checking.\n\n"
+            "<tool_call>\n"
+            "<function=weather>\n"
+            "<parameter=city>\n"
+            "Karlsruhe\n"
+            "</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+
+        text, calls = parse_qwen_tool_calls(reply, self.WEATHER)
+
+        self.assertEqual(text, "Checking.")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "weather")
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),
+            {"city": "Karlsruhe"},
+        )
+
+    def test_qwen36_preserves_current_query_reasoning_content(self):
+        prompt = render_chat_qwen([
+            {"role": "user", "content": "Think about this."},
+            {
+                "role": "assistant",
+                "reasoning_content": "current reasoning",
+                "content": "answer",
+            },
+            {"role": "tool", "content": "result"},
+        ])
+
+        self.assertIn(
+            "<|im_start|>assistant\n"
+            "<think>\ncurrent reasoning\n</think>\n\n"
+            "answer<|im_end|>",
+            prompt,
+        )
+
+    def test_qwen36_drops_reasoning_before_last_user_query(self):
+        prompt = render_chat_qwen([
+            {"role": "user", "content": "First question."},
+            {
+                "role": "assistant",
+                "reasoning_content": "old private reasoning",
+                "content": "first answer",
+            },
+            {"role": "user", "content": "Second question."},
+        ])
+
+        self.assertNotIn("old private reasoning", prompt)
+        self.assertIn(
+            "<|im_start|>assistant\nfirst answer<|im_end|>",
+            prompt,
+        )
+
+    def test_qwen36_extracts_native_think_history(self):
+        prompt = render_chat_qwen([
+            {"role": "user", "content": "Think about this."},
+            {
+                "role": "assistant",
+                "content": (
+                    "<think>\n"
+                    "native reasoning\n"
+                    "</think>\n\n"
+                    "visible answer"
+                ),
+            },
+            {"role": "tool", "content": "result"},
+        ])
+
+        self.assertEqual(prompt.count("native reasoning"), 1)
+        self.assertIn(
+            "<|im_start|>assistant\n"
+            "<think>\nnative reasoning\n</think>\n\n"
+            "visible answer<|im_end|>",
+            prompt,
+        )
+
+    def test_qwen36_rejects_non_string_reasoning_content(self):
+        with self.assertRaises(APIError):
+            render_chat_qwen([
+                {"role": "user", "content": "Question."},
+                {
+                    "role": "assistant",
+                    "reasoning_content": {"not": "a string"},
+                    "content": "answer",
+                },
+            ])
 
 
 class StopFilterTest(unittest.TestCase):

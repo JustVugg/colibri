@@ -714,8 +714,8 @@ def parse_arch_tool_calls(reply, tools, tool_reply=None):
             _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
             return reply.strip(), calls
         return parse_k3_tool_calls(reply, tools)  # compatibility with pre-#1147 engines
-    if ARCH == "qwen38":
-        return parse_qwen38_tool_calls(reply, tools)
+    if ARCH in ("qwen36", "qwen38"):
+        return parse_qwen_tool_calls(reply, tools)
     return parse_tool_calls(reply, tools)
 
 
@@ -1403,73 +1403,164 @@ def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, to
 
 def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                      tool_choice=None, add_generation_prompt=True):
-    """Text-only subset of Qwen3.6's chat_template: <|im_start|>role\\n ...
-    <|im_end|>\\n frames, then the generation prompt. The official template
-    opens a mandatory <think> block after `<|im_start|>assistant\\n` — the
-    model was never trained on the bare `assistant\\n` state, and greedy
-    argmax there lands on an EOS special (measured: gen=0). With thinking
-    disabled the template pre-closes the block instead; both branches are
-    mirrored here byte for byte.
+    """Qwen3.6 native chat template, including OpenAI-style tool calling.
 
-    add_generation_prompt=False continues a trailing assistant turn. The template renders an
-    assistant turn AFTER the last user query with its <think></think> block (an earlier one,
-    from history, has it stripped) -- so the open-turn shape is that think-form minus the
-    <|im_end|> terminator and with no cue, not the bare history form the loop emits otherwise.
-    ChatML's per-turn terminator is why the marker has to be dropped explicitly, as on qwen38."""
+    Tool declarations, assistant tool calls, and tool responses follow the
+    checkpoint's chat_template.jinja. The tool wire syntax is shared with
+    Qwen3.8, so both architectures use the common Qwen helpers below.
+    """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
+
     if tool_choice == "none":
         tools = None
-    if (tools or tool_choice not in (None, "none")) and not _TOOL_FALLBACK:
-        raise APIError(400, "Tool use is not wired up for the qwen36 engine yet. "
-                       "Set COLI_TOOL_FALLBACK=1 to opt into prompt-injected "
-                       "tool translation.", "tools", "unsupported_parameter")
+    if tools is not None and not isinstance(tools, list):
+        raise APIError(400, "`tools` must be an array.", "tools")
+
     parts = []
-    if tools and _TOOL_FALLBACK:
-        parts.append("<|im_start|>system\n"
-                     + _fallback_tool_preamble(tools) + "<|im_end|>\n")
+
+    # The checkpoint preserves thinking only for assistant turns belonging to
+    # the current user query.  Older reasoning is intentionally discarded from
+    # history by the official template.
+    last_query_index = -1
     for index, message in enumerate(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            last_query_index = index
+
+    # The official template folds the initial system message into the tool
+    # declaration's system turn when tools are available.
+    first = messages[0]
+    first_role = first.get("role") if isinstance(first, dict) else None
+    if first_role == "developer":
+        first_role = "system"
+
+    system_text = ""
+    start = 0
+    if first_role == "system":
+        raw = first.get("content")
+        system_text = (
+            content_text(raw, "messages.0.content").strip()
+            if raw is not None else ""
+        )
+        start = 1
+
+    if tools:
+        block = _qwen_tool_block(tools)
+        if system_text:
+            block += "\n\n" + system_text
+        parts.append(f"<|im_start|>system\n{block}<|im_end|>\n")
+    elif system_text:
+        parts.append(f"<|im_start|>system\n{system_text}<|im_end|>\n")
+
+    for index, message in enumerate(messages[start:], start=start):
         if not isinstance(message, dict):
-            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+            raise APIError(
+                400,
+                "Each message must be an object.",
+                f"messages.{index}",
+            )
+
         role = message.get("role")
         if role == "developer":
             role = "system"
-        allowed = ("system", "user", "assistant")
-        if _TOOL_FALLBACK:
-            allowed += ("tool",)
-        if role not in allowed:
-            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+
+        if role not in ("system", "user", "assistant", "tool"):
+            raise APIError(
+                400,
+                f"Unsupported role {role!r}.",
+                f"messages.{index}.role",
+            )
+
+        if role == "system":
+            raise APIError(
+                400,
+                "System message must be at the beginning.",
+                f"messages.{index}.role",
+            )
+
         raw = message.get("content")
-        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
-        if not add_generation_prompt and role == "assistant" and index == len(messages) - 1:
-            # Continued turn: the template gives a post-query assistant turn a <think></think>
-            # block, then the model resumes the content. Match it, minus the terminator/cue.
-            reasoning = message.get("reasoning_content", "")
-            if not isinstance(reasoning, str):
-                raise APIError(400, "`reasoning_content` must be a string.",
-                               f"messages.{index}.reasoning_content")
-            parts.append(f"<|im_start|>assistant\n<think>\n{reasoning.strip()}\n</think>\n\n"
-                         f"{text.strip()}")
+        text = (
+            content_text(raw, f"messages.{index}.content").strip()
+            if raw is not None else ""
+        )
+
+        if role == "user":
+            parts.append(f"<|im_start|>user\n{text}<|im_end|>\n")
             continue
+
+        if role == "assistant":
+            parts.append(f"<|im_start|>assistant\n")
+
+            reasoning = message.get("reasoning_content")
+            if reasoning is not None and not isinstance(reasoning, str):
+                raise APIError(
+                    400,
+                    "`reasoning_content` must be a string.",
+                    f"messages.{index}.reasoning_content",
+                )
+
+            # OpenAI-style clients may return reasoning separately.  For
+            # compatibility with native Qwen history, also recover it from a
+            # complete <think>...</think> prefix in assistant content.
+            if reasoning is None and text.startswith("<think>"):
+                close = text.find("</think>")
+                if close >= 0:
+                    reasoning = text[len("<think>"):close].strip()
+                    text = text[close + len("</think>"):].lstrip()
+
+            if index > last_query_index:
+                parts.append(f"<think>\n{(reasoning or '').strip()}\n</think>\n\n")
+
+            parts.append(text)
+
+            tool_calls = message.get("tool_calls")
+            if tool_calls:
+                parts.append(
+                    _qwen_tool_calls(
+                        tool_calls,
+                        bool(text),
+                        index,
+                    )
+                )
+
+            if add_generation_prompt or index != len(messages) - 1:
+                parts.append("<|im_end|>\n")
+            continue
+
+        # The official Qwen3.6 template combines consecutive tool results into
+        # a single user turn containing one or more <tool_response> blocks.
         if role == "tool":
-            # No tool role in this template: the result rides in as a user turn.
-            parts.append("<|im_start|>user\n"
-                         + _fallback_tool_result(message, index) + "<|im_end|>\n")
-            continue
-        if role == "assistant" and _TOOL_FALLBACK:
-            text += _fallback_tool_calls(message.get("tool_calls"), index)
-        parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
+            prev_role = (
+                messages[index - 1].get("role")
+                if index > 0 and isinstance(messages[index - 1], dict)
+                else None
+            )
+            next_role = (
+                messages[index + 1].get("role")
+                if index + 1 < len(messages)
+                and isinstance(messages[index + 1], dict)
+                else None
+            )
+
+            if prev_role != "tool":
+                parts.append("<|im_start|>user")
+
+            parts.append(f"\n<tool_response>\n{text}\n</tool_response>")
+
+            if next_role != "tool":
+                parts.append("<|im_end|>\n")
+
     if add_generation_prompt:
         parts.append("<|im_start|>assistant\n")
         parts.append("<think>\n" if enable_thinking else "<think>\n\n</think>\n\n")
+
+
     return "".join(parts)
 
-
-# Qwen3.8 declares and emits tool calls in an XML-ish form of its own, not the
-# JSON block GLM uses and not DeepSeek's DSML -- so it needs its own renderer and
-# its own parser. Both sides are transcribed from chat_template.jinja rather than
-# paraphrased, because a tool preamble the model has not seen verbatim is a
-# different prompt: the declaration is what teaches it the syntax it must emit.
+# Qwen3.6 and Qwen3.8 declare and emit tool calls using the same XML-ish wire
+# format rather than GLM's JSON block or DeepSeek's DSML. Keep the shared
+# declaration and call syntax transcribed from chat_template.jinja rather than
+# paraphrased: the declaration is what teaches the model the syntax it must emit.
 #
 #   <tool_call>
 #   <function=NAME>
@@ -1478,20 +1569,20 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
 #   </parameter>
 #   </function>
 #   </tool_call>
-QWEN38_TOOL_PREAMBLE = ("\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>")
+QWEN_TOOL_PREAMBLE = ("\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>")
 
 
-def _qwen38_tool_block(tools):
+def _qwen_tool_block(tools):
     """The `# Tools` system section, byte-identical to the template's."""
     lines = ["# Tools\n\nYou have access to the following functions:\n\n<tools>"]
     for tool in tools:
         lines.append("\n" + json.dumps(tool, ensure_ascii=False, separators=(", ", ": ")))
     lines.append("\n</tools>")
-    lines.append(QWEN38_TOOL_PREAMBLE)
+    lines.append(QWEN_TOOL_PREAMBLE)
     return "".join(lines)
 
 
-def _qwen38_tool_calls(tool_calls, has_content, index):
+def _qwen_tool_calls(tool_calls, has_content, index):
     """Render assistant tool_calls. The template separates the FIRST call from
     preceding content with a blank line only when that content is non-empty, and
     every later call with a single newline; getting that wrong changes the prompt
@@ -1529,13 +1620,13 @@ def _qwen38_tool_calls(tool_calls, has_content, index):
     return "".join(out)
 
 
-QWEN38_CALL_RE = re.compile(
+QWEN_CALL_RE = re.compile(
     r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)</function>\s*</tool_call>", re.S)
-QWEN38_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
+QWEN_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
 
 
-def parse_qwen38_tool_calls(reply, tools=None):
-    """Parse Qwen3.8's XML-ish calls back into OpenAI `tool_calls`.
+def parse_qwen_tool_calls(reply, tools=None):
+    """Parse Qwen's XML-ish calls back into OpenAI `tool_calls`.
 
     Values are returned as strings, which is what the template feeds in: it
     writes a str argument unquoted, so the original type is not recoverable from
@@ -1545,14 +1636,15 @@ def parse_qwen38_tool_calls(reply, tools=None):
     schema = {}
     for tool in (tools or []):
         fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        name = fn.get("name")
         params = (fn.get("parameters") or {}).get("properties") or {}
-        if isinstance(params, dict):
-            schema[fn.get("name")] = params
-    calls = []
-    for match in QWEN38_CALL_RE.finditer(reply or ""):
-        name = match.group(1).strip()
+        if isinstance(name, str) and name:
+            if isinstance(params, dict):
+                schema[name] = params
+
+    def make_call(name, body):
         args = {}
-        for key, raw in QWEN38_PARAM_RE.findall(match.group(2)):
+        for key, raw in QWEN_PARAM_RE.findall(body):
             key = key.strip()
             declared = (schema.get(name) or {}).get(key) or {}
             kind = declared.get("type") if isinstance(declared, dict) else None
@@ -1563,18 +1655,36 @@ def parse_qwen38_tool_calls(reply, tools=None):
                     args[key] = json.loads(raw)
                 except (TypeError, ValueError):
                     args[key] = raw
-        calls.append({
+        return {
             "id": f"call_{uuid.uuid4().hex[:24]}",
             "type": "function",
-            "function": {"name": name,
-                         "arguments": json.dumps(args, ensure_ascii=False)},
-        })
-    text = QWEN38_CALL_RE.sub("", reply or "")
-    if not calls and tools and "<tool_call>" in (reply or ""):
-        sys.stderr.write("[api] qwen38 tool markers present but no call parsed -- "
-                         "possibly truncated or mangled output\n")
+            "function": {
+                "name": name,
+                "arguments": json.dumps(args, ensure_ascii=False),
+            },
+        }
+
+    calls = []
+    for match in QWEN_CALL_RE.finditer(reply or ""):
+        name = match.group(1).strip()
+        calls.append(make_call(name, match.group(2)))
+
+    text = QWEN_CALL_RE.sub("", reply or "")
+
+    if not calls and tools and (
+        "<tool_call>" in (reply or "") or "<function=" in (reply or "")
+    ):
+        sys.stderr.write(
+            "[api] qwen tool markers present but no call parsed -- "
+            "possibly truncated or mangled output\n"
+        )
         sys.stderr.flush()
+
     return text.strip(), calls
+
+
+# Backward compatibility for existing Qwen3.8 callers.
+parse_qwen38_tool_calls = parse_qwen_tool_calls
 
 
 def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, tools=None,
@@ -1629,7 +1739,7 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
         # reasoning instruction, then the tool block, then the user's own system
         # text last -- not the other way round.
         head = (instruction + "\n\n") if instruction else ""
-        block = head + _qwen38_tool_block(tools)
+        block = head + _qwen_tool_block(tools)
         if system_text:
             block += "\n\n" + system_text
         parts.append(f"<|im_start|>system\n{block}<|im_end|>\n")
@@ -1676,11 +1786,12 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
             calls = message.get("tool_calls")
             rendered = f"<think>\n{reasoning.strip()}\n</think>\n\n{text}"
             if calls:
-                rendered += _qwen38_tool_calls(calls, bool(text.strip()), index)
+                rendered += _qwen_tool_calls(calls, bool(text.strip()), index)
             # A continued turn is the last message rendered open: no <|im_end|>, no cue.
             terminator = "" if (not add_generation_prompt and index == len(messages) - 1) \
                 else "<|im_end|>\n"
             parts.append(f"<|im_start|>assistant\n{rendered}{terminator}")
+
             continue
         parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
 

@@ -41,6 +41,11 @@ family registry (`qwen3_5_moe` / `qwen3_5_moe_text` — an exact match, so other
 Qwen architectures are not claimed by this engine), picks it, and drives it over the serve protocol — `coli web` and
 `coli serve` (OpenAI-compatible API) work the same way.
 
+Tool calling is supported through the HTTP gateway using Qwen3.6's native
+`<tool_call>` / `<tool_response>` protocol. The gateway translates between
+the native format and the supported API tool representations; see the
+[per-engine API matrix](api.md#tool-calling-support).
+
 Direct invocation without the gateway:
 
 ```sh

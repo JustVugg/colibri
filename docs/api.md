@@ -98,6 +98,7 @@ wire, so the value has no effect at any temperature.
 | DeepSeek V4 | yes | yes | native DSML tool-call blocks |
 | Inkling | no | no | active tool declarations/choices return HTTP 400 |
 | Kimi K3 | yes | yes | native XTML `tools`/`call`/`argument` blocks (#1143) |
+| Qwen3.6 | yes | yes | native `<tool_call>` blocks |
 | Qwen3.8-Flash-Next | no | no | active tool declarations/choices return HTTP 400 |
 | OLMoE | no | no | active tool declarations/choices return HTTP 400 |
 

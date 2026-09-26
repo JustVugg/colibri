@@ -1,15 +1,10 @@
-"""Prompt-injected tool translation for families with no native tool syntax.
+"""End-to-end tool calling for OLMoE and Qwen3.6.
 
-OLMoE and Qwen3.6 have no tool tokens in their chat templates, so the gateway
-answers 400 for `tools[]` and for a `role: "tool"` turn rather than invent a
-format. `COLI_TOOL_FALLBACK=1` opts into a translation that writes the
-declaration, the prior assistant calls and the tool results as ordinary turns,
-in the GLM wire format `parse_tool_calls()` already reads back (#1378).
+OLMoE retains opt-in prompt-injected tool translation, while Qwen3.6
+supports native tool calling without COLI_TOOL_FALLBACK.
 
-These tests pin both halves of that switch: the default still refuses, and with
-the flag set a full two-turn agent loop completes through
-`/v1/chat/completions`. Runs against a mock engine speaking the SERVE wire
-protocol, so no checkpoint is needed.
+Both implementations are exercised through /v1/chat/completions using
+a mock SERVE engine, without requiring a checkpoint.
 """
 import json
 import os
@@ -33,7 +28,7 @@ CALL = ("<tool_call>get_weather"
         "</tool_call>")
 
 MOCK_ENGINE = r'''#!/usr/bin/env python3
-import sys, os
+import sys, os, re
 out, inp = sys.stdout.buffer, sys.stdin.buffer
 out.write(b"\x01\x01READY\x01\x01\n" + b"STAT 0 0 0 0 0\n"); out.flush()
 
@@ -41,6 +36,18 @@ CALL = ("<tool_call>get_weather"
         "<arg_key>location</arg_key><arg_value>Rome</arg_value>"
         "<arg_key>unit</arg_key><arg_value>celsius</arg_value>"
         "</tool_call>")
+
+QWEN_CALL = (
+    "<tool_call>"
+    "<function=get_weather>"
+    "<parameter=location>\nRome\n</parameter>"
+    "<parameter=unit>\ncelsius\n</parameter>"
+    "</function>"
+    "</tool_call>"
+)
+
+NATIVE_QWEN = os.environ.get("MOCK_NATIVE_QWEN") == "1"
+
 
 def reply(rid, text):
     data = text.encode("utf-8")
@@ -57,10 +64,18 @@ while True:
     prompt = inp.read(plen).decode("utf-8", "replace"); inp.read(1)
     with open(os.environ["MOCK_LOG"], "a") as log:
         log.write(prompt + "\n\x00\n")
-    if "<tool_response>" in prompt:
+    if NATIVE_QWEN and re.search(
+        r'<\|im_start\|>user\n'
+        r'<tool_response>\n'
+        r'\s*\{"temp_c"\s*:\s*25\}\s*\n'
+        r'</tool_response><\|im_end\|>',
+        prompt,
+    ):
+        reply(rid, "25 degrees and sunny in Rome.")
+    elif not NATIVE_QWEN and "<tool_response>" in prompt:
         reply(rid, "25 degrees and sunny in Rome.")
     elif "weather in Rome" in prompt:
-        reply(rid, CALL)
+        reply(rid, QWEN_CALL if NATIVE_QWEN else CALL)
     else:
         reply(rid, "Hello from the mock engine.")
 '''
@@ -103,7 +118,8 @@ class _FallbackBase(unittest.TestCase):
             probe.bind(("127.0.0.1", 0))
             cls.port = probe.getsockname()[1]
         env = dict(os.environ, MOCK_LOG=str(cls.mock_log),
-                   COLI_TOOL_FALLBACK=cls.fallback)
+                   COLI_TOOL_FALLBACK=cls.fallback,
+                   MOCK_NATIVE_QWEN="1" if cls.arch == "qwen36" else "0")
         env.pop("COLI_API_KEY", None)
         cls.server = subprocess.Popen(
             [sys.executable, str(SERVER), "--model", cls.tmp.name,
@@ -180,9 +196,71 @@ class OlmoeToolFallbackE2E(_TwoTurnLoop):
     arch = "olmoe"
 
 
-class Qwen36ToolFallbackE2E(_TwoTurnLoop):
+class Qwen36NativeToolsE2E(_TwoTurnLoop):
+    """Native Qwen3.6 tool calling works without the fallback flag."""
+
     arch = "qwen36"
     model_type = "qwen3_5_moe"
+    fallback = "0"
+
+    def test_second_turn_completes(self):
+        mid = self.model_id()
+        msgs = [{"role": "user", "content": "weather in Rome?"}]
+
+        out = self.post({
+            "model": mid,
+            "messages": msgs,
+            "tools": TOOLS,
+            "temperature": 0,
+            "max_tokens": 128,
+        })
+
+        choice = out["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        calls = choice["message"]["tool_calls"]
+        self.assertEqual(len(calls), 1)
+
+        msgs.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": calls,
+        })
+        msgs.append({
+            "role": "tool",
+            "tool_call_id": calls[0]["id"],
+            "content": json.dumps({"temp_c": 25}),
+        })
+
+        out2 = self.post({
+            "model": mid,
+            "messages": msgs,
+            "tools": TOOLS,
+            "temperature": 0,
+            "max_tokens": 128,
+        })
+
+        self.assertEqual(out2["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(
+            out2["choices"][0]["message"]["content"],
+            "25 degrees and sunny in Rome.",
+        )
+
+        prompts = self.mock_log.read_text()
+        second_prompt = prompts.split("\x00")[-2]
+        call_marker = "<function=get_weather>"
+        response_marker = (
+            '<|im_start|>user\n'
+            '<tool_response>\n'
+            '{"temp_c": 25}\n'
+            '</tool_response><|im_end|>'
+        )
+
+        self.assertIn(call_marker, second_prompt)
+        self.assertIn(response_marker, second_prompt)
+        self.assertLess(
+            second_prompt.index(call_marker),
+            second_prompt.index(response_marker),
+        )
 
 
 class _RefusedByDefault(_FallbackBase):
@@ -213,9 +291,74 @@ class OlmoeToolRefusedByDefault(_RefusedByDefault):
     arch = "olmoe"
 
 
-class Qwen36ToolRefusedByDefault(_RefusedByDefault):
+class Qwen36ToolAcceptedByDefault(_FallbackBase):
+    """Qwen3.6 accepts native tools without the fallback flag."""
+
     arch = "qwen36"
     model_type = "qwen3_5_moe"
+    fallback = "0"
+
+    def test_tools_accepted(self):
+        out = self.post({
+            "model": self.model_id(),
+            "messages": [
+                {"role": "user", "content": "weather in Rome?"}
+            ],
+            "tools": TOOLS,
+            "temperature": 0,
+            "max_tokens": 128,
+        })
+
+        choice = out["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+
+        calls = choice["message"]["tool_calls"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0]["function"]["name"],
+            "get_weather",
+        )
+
+    def test_tool_role_accepted(self):
+        out = self.post({
+            "model": self.model_id(),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "weather in Rome?",
+                },
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_test",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": json.dumps({
+                                "location": "Rome",
+                                "unit": "celsius",
+                            }),
+                        },
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_test",
+                    "content": json.dumps({"temp_c": 25}),
+                },
+            ],
+            "tools": TOOLS,
+            "temperature": 0,
+            "max_tokens": 128,
+        })
+
+        choice = out["choices"][0]
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertIn(
+            "25",
+            choice["message"]["content"] or "",
+        )
 
 
 # The shared base classes must not run as tests themselves.

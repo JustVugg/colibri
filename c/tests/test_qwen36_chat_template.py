@@ -5,9 +5,8 @@ Il gateway rende i prompt a mano invece di far girare jinja a ogni richiesta, e
 quella scelta si paga in un modo solo: la copia scritta a mano puo' scostarsi
 dall'originale senza che nessuno se ne accorga, perche' il modello risponde
 comunque. Qui il template vero viene reso con jinja2 e confrontato byte per byte
-con quello che produce il gateway, senza strumenti (che il motore qwen36 non
-espone) e sui due rami del blocco di ragionamento, piu' il turno aperto della
-prosecuzione.
+con quello che produce il gateway, con e senza strumenti, sui due rami del
+blocco di ragionamento, piu' il turno aperto della prosecuzione.
 
 Se manca il template o jinja2, il test si dichiara SALTATO invece di passare: un
 test che non ha trovato il suo riferimento non ha verificato niente, e dirlo
@@ -41,12 +40,35 @@ CASES = {
                      {"role": "assistant", "content": "2"},
                      {"role": "user", "content": "e 2+2?"}],
     },
+    "dichiarazione e chiamata tool": {
+        "messages": [{"role": "user", "content": "Weather in Rome?"},
+                     {"role": "assistant", "content": "", "tool_calls": [{
+                         "type": "function", "function": {
+                             "name": "weather", "arguments": {"city": "Rome"}}}]}],
+        "tools": [{"type": "function", "function": {
+            "name": "weather", "description": "Get weather for a city.",
+            "parameters": {"type": "object", "properties": {
+                "city": {"type": "string"}}, "required": ["city"]}}}],
+    },
+    "risposta tool": {
+        "messages": [{"role": "user", "content": "Weather in Rome?"},
+                     {"role": "assistant", "content": "", "tool_calls": [{
+                         "type": "function", "function": {
+                             "name": "weather", "arguments": {"city": "Rome"}}}]},
+                     {"role": "tool", "content": "sunny", "tool_call_id": "call_1"},
+                     {"role": "assistant", "content": "Sunny."}],
+        "tools": [{"type": "function", "function": {
+            "name": "weather", "description": "Get weather for a city.",
+            "parameters": {"type": "object", "properties": {
+                "city": {"type": "string"}}, "required": ["city"]}}}],
+    },
 }
 
 THINKING = (True, False)
 
 
-def reference(template_text, *, messages, enable_thinking=True, add_generation_prompt=True):
+def reference(template_text, *, messages, tools=None, enable_thinking=True,
+              add_generation_prompt=True):
     import jinja2
 
     def raise_exception(message):
@@ -59,7 +81,7 @@ def reference(template_text, *, messages, enable_thinking=True, add_generation_p
     environment.globals["raise_exception"] = raise_exception
     rendered = environment.from_string(template_text)
     return rendered.render(messages=messages, add_generation_prompt=add_generation_prompt,
-                           enable_thinking=enable_thinking)
+                           enable_thinking=enable_thinking, tools=tools)
 
 
 def show(label, ours, theirs):
@@ -101,8 +123,10 @@ def main() -> int:
         for label, case in CASES.items():
             name = f"{label} [thinking={enable_thinking}]"
             theirs = reference(template_text, messages=case["messages"],
+                               tools=case.get("tools"),
                                enable_thinking=enable_thinking)
             ours = openai_server.render_chat_qwen(case["messages"],
+                                                  tools=case.get("tools"),
                                                   enable_thinking=enable_thinking)
             if ours == theirs:
                 print(f"ok   {name}")
