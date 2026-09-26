@@ -1,0 +1,69 @@
+# =============================================================================
+# docker-compose.amd.yml — Run Colibri LLM inference engine
+#
+# Prereq: the colibri SOURCE checkout must be at /path/to/colibri-src (with
+# c/, Makefile, web/) and this Dockerfile at ./Dockerfile.colibri.
+#   git clone https://github.com/JustVugg/colibri /path/to/colibri-src
+#
+# Usage:
+#   # One-shot test with OLMoE 7B (already downloaded):
+#     COLI_MODEL=/models/colibri-olmoe docker compose -f docker-compose.amd.yml run --rm colibri run "Say hello"
+#
+#   # Interactive chat:
+#     COLI_MODEL=/models/colibri-olmoe docker compose -f docker-compose.amd.yml run --rm colibri chat
+#
+#   # Start persistent OpenAI-compatible API server (background):
+#     COLI_MODEL=/models/colibri-deepseek-v4-flash docker compose -f docker-compose.amd.yml up -d
+#     curl http://localhost:5000/v1/chat/completions \
+#       -H "Content-Type: application/json" \
+#       -d '{"model":"deepseek","messages":[{"role":"user","content":"Hi"}]}'
+#
+#   # Stop / remove:
+#     docker compose -f docker-compose.amd.yml down
+#
+# Environment variables (set before running, or override inline):
+#   COLI_MODEL    — model directory INSIDE the container (default: /models/colibri-olmoe)
+#   MODELS_HOST   — host path of the model storage (default: /mnt/models_storage/llama-cpp-models)
+#   COLI_RAM      — RAM budget in GB for expert cache (default: 0 = auto ~88% free)
+#   COLI_PORT     — host port for API server (default: 5000)
+# =============================================================================
+
+services:
+  colibri:
+    build:
+      context: .                              # the repo root
+      dockerfile: Dockerfile.colibri        # in-repo
+    image: colibri-rocm:latest
+    container_name: colibri-engine
+    # Map the AMD GPU devices into the container
+    devices:
+      - /dev/kfd
+      - /dev/dri/card1
+      - /dev/dri/renderD129    # adjust to your AMD render node
+    group_add:
+      - video
+      - render
+    security_opt:
+      - seccomp:unconfined
+    # Model storage — bind-mounted read-only.
+    volumes:
+      - ${MODELS_HOST:-/mnt/models_storage/}:/models
+    environment:
+      COLI_MODEL: ${COLI_MODEL:-/models/colibri-deepseek-v4-flash}
+      COLI_RAM:   ${COLI_RAM:-0}          # 0 = auto-detect (~88% free RAM)
+      COLI_API_KEY: "coli_api_key"
+      # GPU-specific environment variables
+      COLI_CUDA: "1"          # Enables the GPU backend (HIP via the compat layer)
+      COLI_GPUS: "0"          # device index list
+      V4_LOADER_LANES: "3"          # GPU tier default
+      CUDA_DENSE: "1"               # dense weights → VRAM
+      CUDA_EXPERT_GB: "8"     # VRAM budget for pinned experts (adjust as needed)
+      # Optional: Set to "0" to disable, "1" to enable for debugging
+      HSA_OVERRIDE_GFX_VERSION: 9.0.6
+      HIP_VISIBLE_DEVICES: "0"     # pick the Vega 20 as HIP device 0
+      ROCR_VISIBLE_DEVICES: "0"    # belt-and-braces
+    ports:
+      - "${COLI_PORT:-8080}:8000"         # OpenAI-compatible API
+    command: ["serve", "--host", "0.0.0.0"]
+    shm_size: "2gb"                       # page cache headroom for expert streaming
+    restart: unless-stopped

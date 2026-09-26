@@ -1,0 +1,100 @@
+# syntax=docker/dockerfile:1.4
+# =============================================================================
+# Dockerfile.colibri — Colibri LLM inference engine (AMD ROCm/gfx906 build)
+#
+# The CUDA→HIP shim headers live in ./docker-shims/ next to the build context.
+# Edit them there, not here.
+# =============================================================================
+
+# --------------------------------------------------------------------------
+# Stage 1: build all engine binaries with HIP/ROCm support
+# --------------------------------------------------------------------------
+FROM mixa3607/llama.cpp-gfx906:b9611-rocm-6.3.3-c1c47f6 AS build
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential make python3 ca-certificates git \
+        hip-dev rocm-llvm-dev hipcc && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY c/ ./c/
+COPY Makefile ./Makefile
+COPY web/ ./web/
+COPY docker-shims/ /tmp/cuda_shim/
+
+# --------------------------------------------------------------------------
+# Patch the coli launcher in the SOURCE tree, before make install copies it.
+# The upstream DeepSeek-V4 GPU detection only accepts libcudart (NVIDIA);
+# our HIP build links libamdhip64 instead, so the CPU-only check fires
+# even when the GPU tier is present.
+# --------------------------------------------------------------------------
+RUN sed -i 's|"libcudart" in line and "not found" not in line|("libcudart" in line or "libamdhip64" in line) and "not found" not in line|' \
+        /src/c/coli && \
+    grep -q 'libamdhip64' /src/c/coli
+
+# --------------------------------------------------------------------------
+# Pre-compile the two GPU objects the HIP branch of c/Makefile forgets:
+#   - backend_cuda_ink.o  (inkling engine)
+#   - backend_cuda_dsv4.o (deepseek_v4 engine, cuBLASLt paths stripped via
+#                          -DCOLI_DSV4_NO_TC)
+# --------------------------------------------------------------------------
+RUN cd /src/c && \
+    hipcc -I/tmp/cuda_shim --offload-arch=gfx906 -O3 -fPIC -DCOLI_CUDA \
+          -c backend_cuda_ink.cu  -o backend_cuda_ink.o && \
+    hipcc -I/tmp/cuda_shim --offload-arch=gfx906 -O3 -fPIC -DCOLI_CUDA \
+          -DCOLI_DSV4_NO_TC -c backend_cuda_dsv4.cu -o backend_cuda_dsv4.o
+
+# --------------------------------------------------------------------------
+# Build every other engine via the top-level Makefile, wiring in the
+# inkling GPU object that the HIP branch forgets.
+# --------------------------------------------------------------------------
+RUN make -C /src install PREFIX=/usr/local \
+        HIP=1 HIP_ARCH=gfx906 ROCM_HOME=/opt/rocm \
+        INK_CUDA_OBJ=backend_cuda_ink.o \
+        NVCC=/opt/rocm/bin/hipcc \
+        NVCCFLAGS="-I/tmp/cuda_shim --offload-arch=gfx906 -O3 -fPIC" \
+        -j"$(nproc)"
+
+# --------------------------------------------------------------------------
+# Rebuild deepseek_v4 with the GPU tier enabled. The sub-Makefile has no
+# HIP=1 branch, so we drive its CUDA=1 path with hipcc as NVCC and override
+# the CUDA-only libs with the ROCm ones.
+# --------------------------------------------------------------------------
+RUN cd /src/c && \
+    rm -f COLI_V4_UNIT_*.o expert_store_registry.o deepseek_v4.cflags deepseek_v4 && \
+    make -f Makefile.deepseek-v4 deepseek-v4 \
+        CUDA=1 \
+        CUDA_HOME=/opt/rocm \
+        NVCC=/opt/rocm/bin/hipcc \
+        NO_TC=1 \
+        CFLAGS="-D_GNU_SOURCE -DCOLI_CUDA -DCOLI_V4_GPU_TIER -DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 -DCOLI_V4_PIN_RAMP_REQUESTS=24 -DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER -O3 -march=x86-64-v3 -fopenmp -pthread -include time.h -include pthread.h -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -I/tmp/cuda_shim" \
+        V4_NVCCFLAGS="-O3 -std=c++20 -fPIC -I/tmp/cuda_shim -DCOLI_DSV4_NO_TC --offload-arch=gfx906" \
+        LDFLAGS="-lm -fopenmp -pthread -L/opt/rocm/lib -Wl,-rpath,/opt/rocm/lib -lamdhip64 -lstdc++" \
+        -j"$(nproc)" && \
+    install -Dm755 deepseek_v4 /usr/local/libexec/colibri/deepseek_v4
+
+# --------------------------------------------------------------------------
+# Stage 2: runtime with ROCm support
+# --------------------------------------------------------------------------
+FROM mixa3607/llama.cpp-gfx906:b9611-rocm-6.3.3-c1c47f6
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3 libgomp1 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /usr/local/bin/coli          /usr/local/bin/coli
+COPY --from=build /usr/local/libexec/colibri   /usr/local/libexec/colibri
+
+ENV COLI_MODEL=/models \
+    PYTHONUNBUFFERED=1 \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    COLI_CUDA=1 \
+    COLI_GPU=1
+
+VOLUME ["/models"]
+EXPOSE 5000
+
+WORKDIR /app
+ENTRYPOINT ["coli"]
+CMD ["info"]
