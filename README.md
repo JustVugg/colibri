@@ -590,6 +590,7 @@ Two things that differ per model, both documented in the per-model page:
 | Reproducible benchmark protocol and minimum report | [docs/benchmarking.md](docs/benchmarking.md) |
 | Tuning knobs, policies, the learning cache, prefetch | [docs/tuning.md](docs/tuning.md) |
 | Windows 11 native build (+ CUDA DLL) | [docs/windows.md](docs/windows.md) |
+| AMD Radeon via ROCm/HIP (community recipe) | [docs/amd-rocm.md](docs/amd-rocm.md) |
 | CUDA backend, VRAM expert tier, full residency | [docs/cuda.md](docs/cuda.md) |
 | Vulkan backend (any GPU: AMD via RADV, incl. cards ROCm dropped) | [docs/vulkan.md](docs/vulkan.md) |
 | Apple Silicon Metal backend | [docs/metal.md](docs/metal.md) |
@@ -787,6 +788,12 @@ these is used or reimplemented in the tree today:
 - [rocWMMA](https://github.com/ROCm/rocWMMA) — the HIP backend maps CUDA's
   `nvcuda::wmma` fragment/mma_sync API onto it (`c/backend_gpu_compat.h`), which
   is what lets one .cu source compile for both vendors.
+
+The community AMD/ROCm build path (Dockerfile.colibri, docker-shims/, and
+docs/amd-rocm.md) also thanks **[@mixa3607](https://hub.docker.com/u/mixa3607)**
+for the patched gfx906 ROCm images that keep this class of card alive, and the
+**llama.cpp** and **ROCm/rocWMMA** maintainers for the compatibility layers
+that made a single-.cu HIP build possible.
 
 ## License
 
