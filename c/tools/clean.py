@@ -33,6 +33,7 @@ FILES = [
     "coli_cuda.dll", "coli_cuda.lib", "coli_cuda.exp",
     # hipcc emits an import library, export file and PDB alongside the DLL.
     "coli_hip.dll", "coli_hip.lib", "coli_hip.exp", "coli_hip.pdb",
+    "libcoli_xdna.so",                      # `make xdna-helper` (Linux)
     "deepseek_v4", "deepseek_v4.exe", "deepseek_v4.cflags", "deepseek_v4.cudaflags",
     "deepseek_v41", "deepseek_v41.exe",
     "native_quant.o", "native_quant_parallel.o", "native_quant_dual.o",
@@ -60,7 +61,7 @@ FILES = [
 # physical execution evidence, and a stale one reports PASS for code that is no
 # longer in the tree.
 ARTIFACT_GLOBS = ["tests/test_*", "tests/bench_*", "tests/fuzz_*",
-                  "tests/*_probe*", "COLI_V4_UNIT_*.o"]
+                  "tests/*_probe*", "tests/xdna_fake_helper*", "COLI_V4_UNIT_*.o"]
 KEEP_EXT = (".c", ".h", ".cc", ".cpp", ".cu", ".mm", ".py", ".txt", ".json",
             ".md", ".bin", ".sh", ".toml", ".yml", ".yaml")
 # Directories to remove.
