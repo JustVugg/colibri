@@ -867,6 +867,10 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view);
 /* lookup-only twin: reports residency, never uploads (hybrid q* split) */
 int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view);
+int coli_v4_gpu_resident_route(float *output,
+    const ColiDeepSeekV4LayerWeights *weights, const ColiDeepSeekV4Config *config,
+    ColiExpertStore *store, const float *input, int token);
+/* Preload: 0 ready, 1 insufficient budget/unsupported tier, -1 load failure. */
 int coli_v4_gpu_experts_preload(ColiV4Engine *engine, char *error, size_t size);
 int coli_v4_gpu_experts_resident(ColiExpertStore *store, int layer);
 /* 1: completed; 0: use normal loader; -1: immutable resident table failed.

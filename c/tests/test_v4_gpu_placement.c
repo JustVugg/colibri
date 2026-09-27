@@ -7,6 +7,11 @@
 #include <assert.h>
 
 struct Dsv4CudaTensor { int device; };
+struct Dsv4CudaExpertSet { int device; };
+static int sets_created, sets_freed;
+void dsv4_cuda_expert_set_free(Dsv4CudaExpertSet *set) {
+    if (set) { sets_freed++; free(set); }
+}
 static int initialized, shutdowns, live_tensors, free_queries[16], drained[16];
 static int upload_fail_after = -1, low_memory_device = -1;
 int dsv4_cuda_backend_arch_ok(int device) { return device >= 0 && device < 6; }
@@ -147,7 +152,7 @@ static void test_preload(void) {
     void *original = store.gpu;
     char error[256];
     low_memory_device = 3;
-    assert(coli_v4_gpu_experts_preload(engine, error, sizeof(error)) == -1);
+    assert(coli_v4_gpu_experts_preload(engine, error, sizeof(error)) == 1);
     assert(store.gpu == original && lookups == 0 && !live_tensors);
     low_memory_device = -1;
     upload_fail_after = 20; /* fail on the second device after publishing none */
@@ -189,6 +194,68 @@ static void test_preload(void) {
     v4_gpu_expert_mirrors_free(store.gpu);
     assert(!live_tensors);
     free(engine);
+}
+
+Dsv4CudaExpertSet *dsv4_cuda_expert_set_create(Dsv4CudaTensor *const *g,
+    Dsv4CudaTensor *const *u,Dsv4CudaTensor *const *d,int count,
+    Dsv4CudaTensor *sg,Dsv4CudaTensor *su,Dsv4CudaTensor *sd) {
+    (void)sg; (void)su; (void)sd;
+    assert(count == 256);
+    for (int i=0;i<count;i++) assert(g[i] && u[i] && d[i]);
+    Dsv4CudaExpertSet *set = malloc(sizeof(*set));
+    assert(set); set->device = g[0]->device; sets_created++;
+    return set;
+}
+static int bad_hash, route_ok=1, route_calls;
+const void *coli_v4_layer_data(const ColiDeepSeekV4LayerWeights *weights,
+    const char *name, const ColiDeepSeekV4TensorSpec **spec) {
+    (void)weights; (void)name; (void)spec;
+    static int64_t map[12];
+    for(int i=0;i<12;i++)map[i]=i%6;
+    if(bad_hash)map[0]=256;
+    return map;
+}
+int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *set,Dsv4CudaTensor *gate,
+    Dsv4CudaTensor *bias,const int *fixed,float scale,float limit,float *out,const float *in) {
+    (void)gate; (void)bias; (void)scale; (void)limit;
+    assert(set->device==0);
+    if(fixed)for(int k=0;k<6;k++)assert(fixed[k]==k);
+    route_calls++;
+    if(route_ok)*out=*in;
+    return route_ok;
+}
+static void test_resident_route(void) {
+    V4GpuExpertMirrorCache *cache=v4_gpu_expert_mirrors_create_capacity(0,256);
+    cache->first_layer=7; cache->end_layer=8; cache->experts_per_layer=256;
+    ColiExpertStore store={.gpu=cache};
+    ColiDeepSeekV4LayerWeights weights={0}; weights.plan.layer=7;
+    ColiDeepSeekV4Config config={0}; config.num_experts_per_tok=6; config.vocab_size=2;
+    for(int e=0;e<256;e++) {
+        V4GpuExpertMirror *entry=&cache->entries[cache->count++];
+        entry->layer=7; entry->expert=e;
+        entry->gate=calloc(1,sizeof(Dsv4CudaTensor));
+        entry->up=calloc(1,sizeof(Dsv4CudaTensor));
+        entry->down=calloc(1,sizeof(Dsv4CudaTensor));
+        assert(entry->gate&&entry->up&&entry->down); live_tensors+=3;
+    }
+    float in=7,out=0;
+    setenv("DSV4_CUDA_RESIDENT_ROUTE","0",1);
+    assert(!coli_v4_gpu_resident_route(&out,&weights,&config,&store,&in,0));
+    assert(!sets_created && !route_calls);
+    unsetenv("DSV4_CUDA_RESIDENT_ROUTE"); /* resident routing defaults on */
+    assert(coli_v4_gpu_resident_route(&out,&weights,&config,&store,&in,0)==1 && out==in);
+    weights.plan.uses_hash_router=1;
+    assert(coli_v4_gpu_resident_route(&out,&weights,&config,&store,&in,1)==1);
+    assert(sets_created==1 && route_calls==2);
+    bad_hash=1;
+    assert(coli_v4_gpu_resident_route(&out,&weights,&config,&store,&in,0)==-1);
+    bad_hash=0;
+    assert(coli_v4_gpu_resident_route(&out,&weights,&config,&store,&in,2)==-1);
+    route_ok=0;
+    assert(coli_v4_gpu_resident_route(&out,&weights,&config,&store,&in,0)==0);
+    v4_gpu_expert_mirrors_free(cache);
+    assert(sets_created==sets_freed && !live_tensors);
+    unsetenv("DSV4_CUDA_RESIDENT_ROUTE");
 }
 
 int main(void) {
@@ -236,6 +303,7 @@ int main(void) {
     assert(!store.gpu && shutdowns == 1);
     free(engine);
     test_preload();
+    test_resident_route();
     puts("test_v4_gpu_placement: ok");
     return 0;
 }

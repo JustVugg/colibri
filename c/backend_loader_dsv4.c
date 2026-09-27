@@ -227,6 +227,8 @@ typedef int             (*fn_expert_bank_upload_tp2)(Dsv4CudaExpertSet *set, int
 typedef void            (*fn_expert_set_free)(Dsv4CudaExpertSet *set);
 typedef int             (*fn_expert_set_upload_hash)(Dsv4CudaExpertSet *set, const int64_t *map,
                                                     int vocab, int topk);
+typedef int (*fn_resident_route_moe)(Dsv4CudaExpertSet*,Dsv4CudaTensor*,Dsv4CudaTensor*,
+                                      const int*,float,float,float*,const float*);
 typedef int             (*fn_route_moe)(const Dsv4CudaActivation *input, Dsv4CudaTensor *gate, Dsv4CudaTensor *bias,
                                         int token, float routed_scale, Dsv4CudaExpertSet *experts,
                                         float limit, Dsv4CudaActivation *output);
@@ -332,6 +334,7 @@ static struct {
     fn_expert_bank_upload_aux expert_bank_upload_aux; /* optional (older DLLs) */
     fn_expert_set_free expert_set_free;
     fn_expert_set_upload_hash expert_set_upload_hash;
+    fn_resident_route_moe resident_route_moe;
     fn_route_moe       route_moe;
     fn_route_moe_batch route_moe_batch;
     fn_route_top6_batch route_top6_batch;
@@ -479,6 +482,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     RESOLVE(expert_bank_upload_tp2, fn_expert_bank_upload_tp2);
     RESOLVE(expert_set_free, fn_expert_set_free);
     RESOLVE(expert_set_upload_hash, fn_expert_set_upload_hash);
+    g_dsv4.resident_route_moe = (fn_resident_route_moe)GetProcAddress(g_dsv4.dll, "dsv4_cuda_resident_route_moe");
     RESOLVE(route_moe, fn_route_moe);
     RESOLVE(route_moe_batch, fn_route_moe_batch);
     RESOLVE(route_top6_batch, fn_route_top6_batch);
@@ -980,6 +984,12 @@ void dsv4_cuda_expert_set_free(Dsv4CudaExpertSet *set){
 int dsv4_cuda_expert_set_upload_hash(Dsv4CudaExpertSet *set, const int64_t *map, int vocab, int topk){
     if(!g_dsv4.available) return 0;
     return g_dsv4.expert_set_upload_hash(set, map, vocab, topk);
+}
+
+int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *set,Dsv4CudaTensor *gate,
+    Dsv4CudaTensor *bias,const int *fixed,float scale,float limit,float *out,const float *in){
+    return g_dsv4.available && g_dsv4.resident_route_moe
+        ? g_dsv4.resident_route_moe(set,gate,bias,fixed,scale,limit,out,in) : 0;
 }
 
 int dsv4_cuda_route_moe(const Dsv4CudaActivation *input, Dsv4CudaTensor *gate, Dsv4CudaTensor *bias,

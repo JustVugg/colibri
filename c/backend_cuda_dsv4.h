@@ -213,6 +213,9 @@ int dsv4_cuda_expert_bank_upload_tp2(Dsv4CudaExpertSet *set,int expert,int rank,
                                      const uint8_t *down_weight,const uint8_t *down_scale);
 void dsv4_cuda_expert_set_free(Dsv4CudaExpertSet *set);
 int dsv4_cuda_expert_set_upload_hash(Dsv4CudaExpertSet *set,const int64_t *map,int vocab,int topk);
+int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *experts,
+    Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,const int *fixed,
+    float routed_scale,float limit,float *output,const float *input);
 int dsv4_cuda_route_moe(const Dsv4CudaActivation *input,Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,
                         int token,float routed_scale,Dsv4CudaExpertSet *experts,
                         float limit,Dsv4CudaActivation *output);

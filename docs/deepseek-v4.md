@@ -517,11 +517,14 @@ median decode improvement against an otherwise identical fused-path control.
 Its output matches that control, but differs from the original unfused baseline;
 this is not a claim of numerical equivalence or general model-quality validation.
 
-### Full routed-expert residency (opt-in)
+### Full routed-expert residency (automatic)
 
-With the CUDA build, `DSV4_CUDA_RESIDENT_EXPERTS=1` loads every target routed
-expert onto its layer's owning device at engine open. Dense weights must also
-use the resident runtime tier. The immutable table is indexed directly by layer
+With the CUDA build, the engine automatically loads every target routed expert
+onto its layer's owning device when the resident runtime tier and per-device
+VRAM budgets allow it. `DSV4_CUDA_RESIDENT_EXPERTS=auto` is the default; `0`
+keeps the LRU cache, and `1` requires full residency or rejects engine open.
+Insufficient VRAM or an unsupported tier in automatic mode retains the cache
+path and logs the reason. Other loading failures still reject engine open. The immutable table is indexed directly by layer
 and expert, following Naruto's prebuilt device expert-table approach. Target
 experts are never evicted; MTP experts retain their separate cache.
 
@@ -529,8 +532,8 @@ The loader uploads dense mirrors first, checks every device's available VRAM
 against its complete expert footprint plus `DSV4_CUDA_VRAM_RESERVE_MB` (default
 2800 MiB, minimum 256 MiB), then uploads experts. The setting overrides the LRU
 mirror capacity: the table has exactly one slot per assigned expert. A failed
-budget check, host lookup, unsupported tensor layout or upload aborts engine
-open and releases partial allocations. Publication occurs only when all cards
+host lookup, unsupported tensor layout or upload aborts engine open and releases
+partial allocations. Budget rejection is fatal only in explicitly required mode. Publication occurs only when all cards
 have completed loading. A resident execution failure is reported rather than
 silently loading experts on the CPU.
 
@@ -546,3 +549,25 @@ On six RTX 5090 GPUs, a short 64-token test measured 6.155 token/s median
 Preloading took about 73 seconds and increased total cold-process latency.
 See the [full report and raw results](experiments/dsv4-full-resident-2026-09-27.md)
 for the scope, startup cost, and remaining validation limits.
+
+### Device-resident routing (default with full residency)
+
+For the supported 256-expert/top-6 profile, the resident table also owns a small
+borrowed-weight CUDA descriptor table per layer. Routing, ascending expert-ID
+ordering, descriptor selection and MoE now execute on one device stream: there
+is one activation upload and one result download, without copying top-k results
+back to the host. The existing BF16 rounding and expert accumulation order are
+preserved; no extra input quantization is introduced.
+
+`DSV4_CUDA_RESIDENT_ROUTE=0` selects the previous host-routed path. The default
+uses device routing when the complete table exists. An older Windows DLL can
+decline the optional new entry point and retain the original path. Explicit
+`DSV4_CUDA_BATCHED=0` and builds disabling BF16 routing retain their original
+execution paths. Attention, mHC, layer boundaries and the output head are not
+made device-only by this change.
+
+The [device-routing validation](experiments/dsv4-device-route-2026-09-27.md)
+covers exact kernel parity, six-device default selection, single-device budget
+fallback, and the remaining Attention bottleneck. Measured short-request decode
+remains around 6.1–6.2 token/s; the route-only comparison is too small to claim a
+stable throughput gain.
