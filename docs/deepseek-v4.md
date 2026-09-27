@@ -262,7 +262,8 @@ Where the time goes now: prefill ≈ 35 % expert-bank refill (disk-bound,
 host↔device syncs), ≈ 5 % MoE GEMM, rest indexer/dense/mHC. Decode ≈ 75 %
 routed-expert reads (~230 × 12.6 MB per token from disk at 6 % VRAM hit
 rate), rest GPU stages. More RAM/VRAM (higher expert hit rate) is the only
-lever left below the disk limit; a multi-GPU design exists on paper only.
+lever left below the disk limit; the optional layer placement below spreads
+those caches across multiple GPUs.
 
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
@@ -309,7 +310,46 @@ generic build. It is deliberately independent of what the binary contains: a
 card fails at launch with "no kernel image is available" rather than producing
 a wrong answer. Build with `portable-pre-ampere` for those cards.
 | DeepGEMM DLL / `CUDA=1 DEEPGEMM=1` | compute 12.x | as generic + tensor-core dense/MoE GEMMs | same as generic |
-| multi-GPU | — | single device today (`DSV4_CUDA_DEVICE` selects); expert-parallel design drafted, not implemented | — |
+| multi-GPU layer placement | up to 16 visible CUDA devices | contiguous layer ranges, with dense mirrors and KV on the owning device | per-device expert caches; layers still execute sequentially |
+
+### Multiple GPUs: layer placement
+
+Set `DSV4_CUDA_DEVICES` to opt into contiguous layer placement:
+
+```bash
+DSV4_CUDA_DEVICES=0,1,2,3,4,5 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=1 \
+  python c/coli run --model /path/to/DeepSeek-V4-Flash-0731 --ram 48 --ngen 64 \
+  "Explain why the sky is blue."
+```
+
+Build the CUDA engine first (`make -C c -f Makefile.deepseek-v4 deepseek-v4
+CUDA=1 CUDA_ARCH=sm_120` for RTX 5090). Ordinals refer to the devices visible
+through `CUDA_VISIBLE_DEVICES`, and list order determines layer order. For
+43 layers and six cards, the ranges are 0–6, 7–13, 14–20, 21–27, 28–34 and
+35–42. Startup prints each assignment. Invalid/duplicate lists and unavailable
+multi-device configurations fail startup instead of silently running one card.
+The single-device default is unchanged.
+
+Each layer's dense tensors, attention KV and routed-expert mirrors live on its
+assigned GPU. Cache limits and free-VRAM probes are per device. The transient
+prefill bank moves at device boundaries; double-bank lookahead stays within a
+device's layer range. MTP's separate expert cache stays on the first device.
+
+This increases usable cache capacity, not parallel compute within a layer.
+The engine still executes layers sequentially with CPU-canonical activations;
+there is no six-way TP, EP, or overlapped pipeline. CPU expert-store reads can
+still occur before a GPU cache hit, so RAM budget and disk traffic still matter.
+Do not interpret aggregate VRAM occupancy as a throughput or numerical-parity
+claim. Validate representative prompts against the single-device configuration.
+
+Linux backend lifecycle check (requires at least two GPUs; exercises all listed
+devices, duplicate-list refusal, active-context protection, and reopen with a
+different KV owner):
+
+```bash
+make -C c -f Makefile.deepseek-v4 tests/test_dsv4_multigpu_cuda CUDA=1 CUDA_ARCH=sm_120
+c/tests/test_dsv4_multigpu_cuda 0,1,2,3,4,5
+```
 
 ## Environment reference (V4 engine)
 
@@ -319,12 +359,13 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | var | meaning |
 |---|---|
 | `DSV4_CUDA` (1) | master switch for the V4 GPU tier; `0` = CPU only |
-| `DSV4_CUDA_DEVICE` (0) | CUDA device ordinal |
+| `DSV4_CUDA_DEVICE` (0) | single CUDA device ordinal, used when `DSV4_CUDA_DEVICES` is unset |
+| `DSV4_CUDA_DEVICES` (unset) | ordered comma-separated distinct CUDA ordinals; split contiguous layers across these devices |
 | `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |
 | `COLI_CUDA_ATTN_BATCH` (0) | `1` = GPU batched prefill attention block + GPU decode attention/indexer |
 | `COLI_CUDA_MOE_BATCH` (0) | `1` = prefill MoE on the transient VRAM expert bank |
 | `COLI_CUDA_MOE_BATCH_MIN` (256) | min fresh tokens to engage the bank |
-| `DSV4_CUDA_EXPERT_MIRRORS` (4096) | upper bound on decode VRAM expert mirrors (~8 MB each); free VRAM sizes the cache at run time |
+| `DSV4_CUDA_EXPERT_MIRRORS` (4096) | per-device upper bound on decode VRAM expert mirrors (~8 MB each); each device's free VRAM sizes its cache at run time |
 | `DSV4_CUDA_VRAM_RESERVE_MB` (2800 with the bank, else 600) | VRAM kept free while mirrors grow (bank + attention buffers) |
 | `V4_MTP_GPU_MIRRORS` (16) | separate mirror cache for the MTP drafter |
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
@@ -450,5 +491,5 @@ disabled.
 
 - Non-greedy sampling and more serving slots.
 - Linux CUDA tier: measure on a native Linux box (WSL2 verified), POSIX host pinning.
-- Multi-GPU expert-parallel tier (design draft, untracked until built).
+- Tensor/expert parallel execution within a layer (not provided by layer placement).
 - Shared replacements for the two temporary private quant paths (rows16 cache).

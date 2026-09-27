@@ -9834,7 +9834,11 @@ int coli_v4_engine_open(ColiV4Engine **output,
     engine->summary.expert_cache_bytes =
         engine->runtime.target_expert_cache_bytes;
 #ifdef COLI_V4_GPU_TIER
-    coli_v4_gpu_engine_open(engine);
+    if (coli_v4_gpu_engine_open(engine)) {
+        if (error && error_size)
+            snprintf(error, error_size, "cannot initialize requested CUDA devices");
+        goto fail;
+    }
 #endif
     *output = engine;
     return 0;
@@ -9860,6 +9864,7 @@ fail:
 #if defined(COLI_V4_GPU_TIER)
 #include "deepseek_v4_internal.h"
 #include "backend_cuda_dsv4.h"
+#include "deepseek_v4_gpu_devices.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9880,47 +9885,53 @@ static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache);
 static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                                           ColiExpertView *view, int sync);
 
+static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_devices(
+    const int *devices, int count, int layers);
+
 int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (!engine) return -1;
     engine->gpu.enabled = 0;
     engine->gpu.device = 0;
     if (!v4_gpu_wanted()) return 0;
-    const char *device_setting = getenv("DSV4_CUDA_DEVICE");
-    int device = device_setting ? atoi(device_setting) : 0;
-    if (!dsv4_cuda_init(&device, 1)) {
-        fprintf(stderr, "v4_gpu warning=backend-unavailable; continuing-CPU\n");
-        return 0;
+    const char *setting = getenv("DSV4_CUDA_DEVICES");
+    if (!setting) setting = getenv("DSV4_CUDA_DEVICE");
+    int count = coli_v4_gpu_devices_parse(setting ? setting : "0",
+                                          engine->gpu.devices);
+    if (count < 1 || count > engine->config.num_hidden_layers) {
+        fprintf(stderr, "v4_gpu invalid device list (use distinct CUDA ordinals, at most one per layer)\n");
+        return -1;
     }
-    /* A build whose kernels cannot run on this device (a DeepGEMM sm_120a
-     * binary on an older card — Linux links one flavour, no DLL selection)
-     * says so once here instead of failing kernel by kernel. */
-    if (!dsv4_cuda_backend_arch_ok(device)) {
-        fprintf(stderr, "v4_gpu warning=backend %s does not support device %d; "
-                        "continuing-CPU (rebuild without DEEPGEMM for sm_80+)\n",
-                dsv4_cuda_backend_name(), device);
-        dsv4_cuda_shutdown();
-        return 0;
+    if (!dsv4_cuda_init(engine->gpu.devices, count)) {
+        fprintf(stderr, "v4_gpu warning=backend-unavailable\n");
+        return count > 1 ? -1 : 0;
     }
+    for (int i = 0; i < count; i++) {
+        int device = engine->gpu.devices[i];
+        if (!dsv4_cuda_backend_arch_ok(device)) {
+            fprintf(stderr, "v4_gpu warning=backend %s does not support device %d\n",
+                    dsv4_cuda_backend_name(), device);
+            dsv4_cuda_shutdown();
+            return count > 1 ? -1 : 0;
+        }
+    }
+    engine->gpu.device_count = count;
+    int device = engine->gpu.devices[0];
     engine->gpu.enabled = 1;
     engine->gpu.device = device;
-    /* Routed-expert fp4 mirror cache hangs off the expert store; attach it at
-     * open so moe_token_pipeline can mirror expert weights on demand. Default
-     * capacity covers the pinned (hot) experts per layer so autopin never
-     * forces a mirror eviction mid-generation; override with
-     * DSV4_CUDA_EXPERT_MIRRORS. */
-    int mirror_suggested = engine->config.num_hidden_layers *
-                           COLI_V4_MAX_PIN_SLOTS_PER_LAYER;
-    if (mirror_suggested < 128) mirror_suggested = 128;
-    if (mirror_suggested > 2048) mirror_suggested = 2048;
-    /* The cache grows only while the VRAM reserve stays free (growth guard
-     * in v4_gpu_expert_attach_cached), so the capacity is an upper bound
-     * that free VRAM sizes at run time; a generous default lets bigger cards
-     * fill up. ~8 MB per mirror measured. */
-    mirror_suggested = 4096;
-    if (engine->experts && !engine->experts->gpu)
-        engine->experts->gpu =
-            v4_gpu_expert_mirrors_create(device, mirror_suggested);
-    fprintf(stderr, "v4_gpu tier=dense-matvec device=%d\n", device);
+    if (engine->experts && !engine->experts->gpu) {
+        engine->experts->gpu = v4_gpu_expert_mirrors_create_devices(
+            engine->gpu.devices, count, engine->config.num_hidden_layers);
+        if (!engine->experts->gpu) {
+            coli_v4_gpu_engine_close(engine);
+            return -1;
+        }
+    }
+    fprintf(stderr, "v4_gpu tier=dense-matvec device=%d devices=%d placement=contiguous-layers\n",
+            device, count);
+    for (int i = 0; i < count; i++)
+        fprintf(stderr, "v4_gpu device=%d layers=%d..%d\n", engine->gpu.devices[i],
+                coli_v4_gpu_layer_begin(i, count, engine->config.num_hidden_layers),
+                coli_v4_gpu_layer_begin(i + 1, count, engine->config.num_hidden_layers) - 1);
     return 0;
 }
 
@@ -10152,6 +10163,10 @@ static void *v4_gpu_upload_gate_bias(ColiDeepSeekV4LayerWeights *weights,
 int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
                              ColiDeepSeekV4LayerWeights *weights) {
     if (!engine || !weights || !engine->gpu.enabled) return 0;
+    int owner = coli_v4_gpu_layer_owner(layer, engine->gpu.device_count,
+                                         engine->config.num_hidden_layers);
+    if (owner < 0) return -1;
+    int device = engine->gpu.devices[owner];
     if (layer < 0 || layer >= COLI_V4_RESIDENT_MAX_LAYERS) return 0;
     if (engine->gpu.layer_ready[layer]) return 0;
     static const char *const tensors[] = {
@@ -10167,7 +10182,7 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
          * grouped matvec keeps its historical fmt-8 numerics. */
         int bf16_rounded = coli_v4_gpu_attn_batch_wanted() &&
                            strcmp(tensors[i], "attn.wo_a") == 0;
-        void *handle = v4_gpu_upload_fp8_fmt(weights, engine->gpu.device,
+        void *handle = v4_gpu_upload_fp8_fmt(weights, device,
                                              tensors[i], &bytes, bf16_rounded);
         if (!handle) continue;
         if (coli_v4_layer_gpu_set(weights, tensors[i], handle)) {
@@ -10187,7 +10202,7 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
                 {"attn.compressor.wkv", "attn.compressor.wgate"};
             for (int k = 0; k < 2; k++) {
                 void *handle = v4_gpu_upload_bf16_matrix(
-                    weights, engine->gpu.device, comp_keys[k], comp_rows,
+                    weights, device, comp_keys[k], comp_rows,
                     config->hidden_size, &bytes);
                 if (handle && coli_v4_layer_gpu_set(weights, comp_keys[k],
                                                     handle))
@@ -10200,7 +10215,7 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
                 {"attn.indexer.compressor.wkv", "attn.indexer.compressor.wgate"};
             for (int k = 0; k < 2; k++) {
                 void *handle = v4_gpu_upload_bf16_matrix(
-                    weights, engine->gpu.device, idx_keys[k], idx_rows,
+                    weights, device, idx_keys[k], idx_rows,
                     config->hidden_size, &bytes);
                 if (handle && coli_v4_layer_gpu_set(weights, idx_keys[k],
                                                     handle))
@@ -10218,21 +10233,21 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
             static const char *const norm_keys[2] = {"attn_norm", "ffn_norm"};
             for (int b = 0; b < 2; b++) {
                 void *fn = v4_gpu_upload_f32_tensor(
-                    weights, engine->gpu.device, hc_keys[b][0], mix_rows,
+                    weights, device, hc_keys[b][0], mix_rows,
                     hc * d, &bytes);
                 if (fn && coli_v4_layer_gpu_set(weights, hc_keys[b][0], fn))
                     dsv4_cuda_tensor_free((Dsv4CudaTensor *)fn);
                 void *sc = v4_gpu_upload_f32_tensor(
-                    weights, engine->gpu.device, hc_keys[b][1], 3, 1, &bytes);
+                    weights, device, hc_keys[b][1], 3, 1, &bytes);
                 if (sc && coli_v4_layer_gpu_set(weights, hc_keys[b][1], sc))
                     dsv4_cuda_tensor_free((Dsv4CudaTensor *)sc);
                 void *bs = v4_gpu_upload_f32_tensor(
-                    weights, engine->gpu.device, hc_keys[b][2], mix_rows, 1,
+                    weights, device, hc_keys[b][2], mix_rows, 1,
                     &bytes);
                 if (bs && coli_v4_layer_gpu_set(weights, hc_keys[b][2], bs))
                     dsv4_cuda_tensor_free((Dsv4CudaTensor *)bs);
                 void *nm = v4_gpu_upload_norm_f32(
-                    weights, engine->gpu.device, norm_keys[b], d, &bytes);
+                    weights, device, norm_keys[b], d, &bytes);
                 if (nm && coli_v4_layer_gpu_set(weights, norm_keys[b], nm))
                     dsv4_cuda_tensor_free((Dsv4CudaTensor *)nm);
             }
@@ -10240,12 +10255,12 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
     }
     /* Router mirrors (gate f32, bias f32). Missing/shape-mismatched uploads
      * leave the mirror NULL and moe_token_pipeline falls back to the CPU route. */
-    void *gate = v4_gpu_upload_gate(weights, engine->gpu.device, &bytes);
+    void *gate = v4_gpu_upload_gate(weights, device, &bytes);
     if (gate && coli_v4_layer_gpu_set(weights, "ffn.gate", gate)) {
         dsv4_cuda_tensor_free((Dsv4CudaTensor *)gate);
         gate = NULL;
     }
-    void *bias = v4_gpu_upload_gate_bias(weights, engine->gpu.device, &bytes);
+    void *bias = v4_gpu_upload_gate_bias(weights, device, &bytes);
     if (bias && coli_v4_layer_gpu_set(weights, "ffn.gate.bias", bias)) {
         dsv4_cuda_tensor_free((Dsv4CudaTensor *)bias);
         bias = NULL;
@@ -10369,6 +10384,11 @@ struct V4GpuExpertMirrorCache {
     int count;
     uint64_t clock;
     int device;
+    int first_layer, end_layer;
+    int unified;
+    long long last_free_mb;
+    unsigned probes;
+    struct V4GpuExpertMirrorCache *next;
     pthread_mutex_t mutex;
 };
 
@@ -10383,6 +10403,8 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
     }
     cache->capacity = capacity;
     cache->device = device;
+    cache->unified = -1;
+    cache->last_free_mb = -1;
     pthread_mutex_init(&cache->mutex, NULL);
     return cache;
 }
@@ -10397,6 +10419,7 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
 
 static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
     if (!cache) return;
+    v4_gpu_expert_mirrors_free(cache->next);
     for (int i = 0; i < cache->count; i++) {
         if (cache->entries[i].gate)
             dsv4_cuda_tensor_free(cache->entries[i].gate);
@@ -10408,6 +10431,29 @@ static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
     pthread_mutex_destroy(&cache->mutex);
     free(cache->entries);
     free(cache);
+}
+
+static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_devices(
+    const int *devices, int count, int layers) {
+    V4GpuExpertMirrorCache *head = NULL, **tail = &head;
+    for (int i = 0; i < count; i++) {
+        *tail = v4_gpu_expert_mirrors_create(devices[i], 4096);
+        if (!*tail) {
+            v4_gpu_expert_mirrors_free(head);
+            return NULL;
+        }
+        (*tail)->first_layer = coli_v4_gpu_layer_begin(i, count, layers);
+        (*tail)->end_layer = coli_v4_gpu_layer_begin(i + 1, count, layers);
+        tail = &(*tail)->next;
+    }
+    return head;
+}
+
+static V4GpuExpertMirrorCache *v4_gpu_expert_cache(ColiExpertStore *store,
+                                                 int layer) {
+    for (V4GpuExpertMirrorCache *c = store ? store->gpu : NULL; c; c = c->next)
+        if (layer >= c->first_layer && layer < c->end_layer) return c;
+    return NULL;
 }
 
 static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
@@ -10457,21 +10503,18 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
          * a handful of entries on a 130 GB box (#1538). There is no separate
          * card to keep headroom on, so the guard does not apply; the
          * capacity (DSV4_CUDA_EXPERT_MIRRORS) bounds the cache instead. */
-        static int unified = -1;
-        if (unified < 0) {
-            unified = dsv4_cuda_device_unified(cache->device) ? 1 : 0;
-            if (unified)
+        if (cache->unified < 0) {
+            cache->unified = dsv4_cuda_device_unified(cache->device) ? 1 : 0;
+            if (cache->unified)
                 fprintf(stderr, "v4_gpu mirror-cache: unified memory, VRAM reserve "
                                 "guard off (free memory is the system's, not a "
                                 "card's); capacity %d bounds the cache\n",
                         cache->capacity);
         }
-        if (grow && cache->count > 0 && !unified) {
-            static long long last_free_mb = -1;
-            static unsigned probes;
-            if (last_free_mb < 0 || (probes++ & 63) == 0)
-                last_free_mb = dsv4_cuda_mem_free_mb(cache->device);
-            if (last_free_mb >= 0 && last_free_mb < reserve_mb) grow = 0;
+        if (grow && cache->count > 0 && !cache->unified) {
+            if (cache->last_free_mb < 0 || (cache->probes++ & 63) == 0)
+                cache->last_free_mb = dsv4_cuda_mem_free_mb(cache->device);
+            if (cache->last_free_mb >= 0 && cache->last_free_mb < reserve_mb) grow = 0;
         }
         if (!grow && cache->count == 0) {
             pthread_mutex_unlock(&cache->mutex);
@@ -10590,7 +10633,7 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view) {
     if (!store || !view) return -1;
     return v4_gpu_expert_attach_cached_ex(
-        (V4GpuExpertMirrorCache *)store->gpu, view, 1);
+        v4_gpu_expert_cache(store, view->key.layer), view, 1);
 }
 
 /* Async twin: the upload is ENQUEUED on the device stream and may still be
@@ -10602,14 +10645,16 @@ int coli_v4_gpu_expert_attach_async(ColiExpertStore *store,
                                     ColiExpertView *view) {
     if (!store || !view) return -1;
     return v4_gpu_expert_attach_cached_ex(
-        (V4GpuExpertMirrorCache *)store->gpu, view, 0);
+        v4_gpu_expert_cache(store, view->key.layer), view, 0);
 }
 
 extern int dsv4_cuda_stream_drain(int device);
 int coli_v4_gpu_expert_drain(ColiExpertStore *store) {
     if (!store || !store->gpu) return 0;
-    V4GpuExpertMirrorCache *cache = (V4GpuExpertMirrorCache *)store->gpu;
-    return dsv4_cuda_stream_drain(cache->device) ? 0 : -1;
+    int failed = 0;
+    for (V4GpuExpertMirrorCache *cache = store->gpu; cache; cache = cache->next)
+        if (!dsv4_cuda_stream_drain(cache->device)) failed = 1;
+    return failed ? -1 : 0;
 }
 
 /* Lookup-only twin of attach: report whether {layer, expert} is already
@@ -10619,7 +10664,8 @@ int coli_v4_gpu_expert_drain(ColiExpertStore *store) {
  * miss the moment it is discovered. */
 int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view) {
     if (!store || !view || !store->gpu) return -1;
-    V4GpuExpertMirrorCache *cache = (V4GpuExpertMirrorCache *)store->gpu;
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_cache(store, view->key.layer);
+    if (!cache) return -1;
     pthread_mutex_lock(&cache->mutex);
     for (int i = 0; i < cache->count; i++) {
         if (cache->entries[i].layer == view->key.layer &&
@@ -10708,6 +10754,8 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
 #include "deepseek_v4_bank_pair.h"
 
 static Dsv4CudaExpertSet *v4_moe_bank;
+static int v4_moe_bank_device = -1;
+static Dsv4CudaActivation *v4_moe_in, *v4_moe_out;
 static int v4_moe_bank_layer = -1;
 static int v4_moe_bank_hash_layer = -1;
 static unsigned char v4_moe_bank_valid[256];
@@ -10809,6 +10857,10 @@ void coli_v4_gpu_moe_batch_release(void) {
      * exactly what the next attempt needs. */
     v4_moe_bank_failed = 0;
     v4_bank2_join();
+    dsv4_cuda_activation_free(v4_moe_in);
+    dsv4_cuda_activation_free(v4_moe_out);
+    v4_moe_in = v4_moe_out = NULL;
+    v4_moe_bank_device = -1;
     if (v4_bank2_swaps || v4_bank2_prefetched)
         fprintf(stderr, "v4_gpu moe-double swaps=%llu prefetched=%llu\n",
                 v4_bank2_swaps, v4_bank2_prefetched);
@@ -10837,7 +10889,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
 #define bank_layer v4_moe_bank_layer
 #define hash_layer v4_moe_bank_hash_layer
 #define bank_valid v4_moe_bank_valid
-    static Dsv4CudaActivation *in_mirror, *out_mirror;
+#define in_mirror v4_moe_in
+#define out_mirror v4_moe_out
     static int diagnosed;
 #define bank_failed v4_moe_bank_failed
 #define V4_MOE_BATCH_REFUSE(why) do { \
@@ -10873,6 +10926,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
 #undef V4_MOE_BATCH_REFUSE
     int device = dsv4_cuda_tensor_device(gate);
     if (device < 0) return -1;
+    if (v4_moe_bank_device != device) coli_v4_gpu_moe_batch_release();
+    v4_moe_bank_device = device;
     if (!bank) {
         bank = dsv4_cuda_expert_bank_create(256, 4096, 2048, device, sg, su, sd);
         if (!bank) {
@@ -10913,7 +10968,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         if (double_on) {
             int next = coli_v4_bank_pair_prefetch_target(
                 1, bank_layer, config->num_hidden_layers);
-            if (next >= 0) {
+            V4GpuExpertMirrorCache *next_cache = v4_gpu_expert_cache(store, next);
+            if (next_cache && next_cache->device == device) {
                 if (!v4_moe_bank2) {
                     v4_moe_bank2 = dsv4_cuda_expert_bank_create(
                         256, 4096, 2048, device, sg, su, sd);
@@ -11192,6 +11248,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         !dsv4_cuda_activation_sync(out_mirror))
         return -1;
     return 0;
+#undef in_mirror
+#undef out_mirror
 #undef bank
 #undef bank_layer
 #undef hash_layer

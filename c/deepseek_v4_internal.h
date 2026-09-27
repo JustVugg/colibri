@@ -910,6 +910,8 @@ struct ColiV4Engine {
     struct {
         int enabled;
         int device;
+        int devices[16];
+        int device_count;
         unsigned char layer_ready[COLI_V4_RESIDENT_MAX_LAYERS];
         long long uploaded_bytes;
         /* Optional opaque V4GpuExpertMirrorCache* for the dspark/MTP draft
