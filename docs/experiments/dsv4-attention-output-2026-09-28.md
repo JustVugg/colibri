@@ -28,7 +28,7 @@ CPU，输入端 Q/KV、RoPE、Compressor 状态等也没有在本轮完全迁入
 
 ## 本轮验证
 
-遵循本轮编译交付范围，没有启动模型服务，也没有进行长时间端到端生成或吞吐测试。
+初始提交完成以下编译和短单测；后续真实模型 A/B 记录见下文。所有测试使用独立 CLI 进程，未启动模型服务。
 
 - Linux CPU 完整 engine 构建通过。
 - yuesheng-gpu 上 CUDA `sm_120` 完整 engine 和新测试构建通过。
@@ -56,6 +56,49 @@ CUDA binary SHA256：
 CUDA source SHA256：
 `85e05e110d9f4356e8fa763bc40da152e9209b5018777638c96ef091ad05af1d`。
 
-上一轮的 9.593 token/s 属于 `7019d0af`，不能作为本轮速度。本轮的端到端输出
-一致性和吞吐变化仍待实测。结束检查时六张 GPU 均为 2 MiB，vLLM 容器停止、
-watchdog timer inactive；未恢复 vLLM。
+## 六卡真实模型 A/B
+
+模型 DeepSeek-V4-Flash-0731，六张 RTX 5090，基线 `7019d0af` 对比候选 `371ed4e3`。
+两份二进制分别为 `baseline` 和 `c/deepseek_v4`，SHA256 记录在同名 JSON。
+提示词：`用中文简短解释为什么天空是蓝色的。`，13 prompt tokens。
+
+短测交替执行 A1、B1、A2、B2、A3、B3，每轮重新启动进程并预载专家，最多生成
+64 tokens。decode 定义为 `(generated - 1) / after_first_seconds`，不含加载和首 token。
+
+| 版本 | 三次 decode token/s | 中位数 |
+| --- | --- | --- |
+| 基线 | 9.6081 / 9.7644 / 9.5137 | 9.6081 |
+| 输出投影串联 | 9.7297 / 9.8545 / 9.8100 | 9.8100 |
+
+中位数增加 **2.10%**；六次均成功生成 64 tokens，文本及生成数量完全一致。
+完整进程 wall 中位数从 86.873 秒变为 85.760 秒，包含预载波动，不应等同于 decode 增益。
+三次短测只支持该 fixture 的小幅改善，不足以证明普遍收益，更不能解释与 Naruto 的主要差距。
+
+环境：
+
+```sh
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
+DSV4_CUDA=1 DSV4_CUDA_DEVICES=0,1,2,3,4,5
+OMP_NUM_THREADS=12 CTX=512
+COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=1
+DSV4_CUDA_EXPERT_MIRRORS=2048 V4_LOADER_LANES=3
+COLI_V4_SAVE_USAGE=0 V4_PREFIX_CKPT_DISK=0 COLI_V4_PREWARM=0
+```
+
+命令参数为 `MODEL PROMPT --max-tokens 64 --memory-gb 48`。新旧版都使用相同配置；
+常规候选运行不设置 `DSV4_CUDA_WO_DECODE`，测试默认启用行为。此处沿用已有的
+`COLI_CUDA_ATTN_BATCH=1` 测速配置，并非所有选项都采用默认值。
+
+
+补充验收：
+
+- 上限 192 tokens 的完整回答：基线与候选均在 130 tokens 正常结束，文本和数量相同，
+  覆盖 position=128 压缩边界。单次 decode 分别为 9.6535、9.8767 token/s；不并入短测中位数。
+- 同一候选二进制设置 `DSV4_CUDA_WO_DECODE=0`：64-token 文本和数量与六次短测相同，
+  decode 为 9.5483 token/s。关闭开关保留旧路径。
+- 九次运行均退出 0，均完整驻留 43 层专家，`v4_direct fallbacks=0`。
+- 结束时六张 GPU 均回到 2 MiB；vLLM 容器保持停止，watchdog timer inactive。
+
+[原始结果、环境和二进制指纹](dsv4-attention-output-2026-09-28.json)。远端
+`/data/test/colibri-wo-decode/wo-bench.py`、`results-base1.json`、
+`results-base-long.json` 与各 case 的 `.out` / `.err` 保留复验记录。
