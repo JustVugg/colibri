@@ -32,6 +32,8 @@
 struct ColiCudaTensor { int fmt, I, O, device, gs; const void *w; const float *sc; };
 
 static int fake_uploads;
+static int fake_overwrites;      /* coli_cuda_tensor_overwrite calls (in-place swaps) */
+static int fake_overwrite_fail;  /* 1: refuse overwrites, as a backend without the symbol */
 static int last_fmt = -1;
 static size_t last_bytes;
 static unsigned char captured[4096];
@@ -78,6 +80,15 @@ int coli_cuda_tensor_upload_g(ColiCudaTensor **t, const void *w, const float *s,
 void coli_cuda_tensor_free(ColiCudaTensor *t) {
     if (t && fake_dense_compute && t->fmt == 1) { free((void *)t->w); free((void *)t->sc); }
     free(t);
+}
+int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *w, const float *sc) {
+    if (!t || !w || fake_overwrite_fail) return 0;
+    if (fake_upload_hook) fake_upload_hook(t->fmt);
+    if (fake_dense_compute && t->fmt == 1 && t->w && t->sc) {
+        memcpy((void *)t->w, w, (size_t)t->I * t->O); memcpy((void *)t->sc, sc, (size_t)t->O * sizeof(float));
+    } else { t->w = w; t->sc = sc; }
+    fake_overwrites++;
+    return 1;
 }
 int coli_cuda_available_device_count(void) { return fake_ndev; }
 int coli_cuda_device_count(void) { return fake_ndev; }
