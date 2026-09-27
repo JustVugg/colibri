@@ -540,3 +540,9 @@ expert host reads after preload but does not implement batched resident MoE,
 TP/EP, device-only activations, or SM120 MMA kernels. Startup reads the complete
 expert set; cold-start latency and steady-state decode must be measured
 separately. Host expert-cache memory is still governed by the existing budget.
+
+On six RTX 5090 GPUs, a short 64-token test measured 6.155 token/s median
+(three runs) versus 2.149 with the option off (one run), with identical output.
+Preloading took about 73 seconds and increased total cold-process latency.
+See the [full report and raw results](experiments/dsv4-full-resident-2026-09-27.md)
+for the scope, startup cost, and remaining validation limits.
