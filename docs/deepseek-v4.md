@@ -511,6 +511,8 @@ EP2, SM121 kernels, or graph runtime. Cold loads and partial-hit tokens still
 use host expert storage; this is not full model preloading.
 
 Validation covers six-device cache ownership, full/partial/incomplete residency,
-locking through compute, backend-decline fallback, and CPU compilation. These
-checks do not establish GPU numerical equivalence or a throughput improvement;
-the earlier six-GPU benchmark predates this optimization.
+locking through compute, backend-decline fallback, and CPU compilation. The subsequent
+[six-RTX-5090 test](experiments/dsv4-resident-2026-09-27.md) measured about 3.8%
+median decode improvement against an otherwise identical fused-path control.
+Its output matches that control, but differs from the original unfused baseline;
+this is not a claim of numerical equivalence or general model-quality validation.
