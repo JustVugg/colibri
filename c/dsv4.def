@@ -83,3 +83,6 @@ EXPORTS
     dsv4_cuda_tensor_free
     dsv4_cuda_tensor_bytes
     dsv4_cuda_tensor_device
+    dsv4_cuda_upload_compressor
+    dsv4_cuda_compressor_project
+    dsv4_cuda_indexer_prepare

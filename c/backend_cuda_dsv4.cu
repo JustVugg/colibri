@@ -948,6 +948,32 @@ __global__ void indexer_score_kernel(float*scores,const float*queries,const floa
     scores[(long long)t*count+c]=score;
 }
 
+/* Naruto's indexer tiles keys transposed and splits work across heads.
+ * Store individual head terms here, then fold them in the original order. */
+__global__ void indexer_score_heads(float *scores,const float *queries,const float *keys,
+        const float *head_w,const int *counts,int heads,int dim,int count){
+    constexpr int tile=8;
+    int candidate=blockIdx.x*tile+threadIdx.x%tile,head=threadIdx.x/tile,t=blockIdx.y;
+    extern __shared__ float scratch[];
+    float *ks=scratch,*partial=ks+dim*(tile+1);
+    for(int i=threadIdx.x;i<dim*tile;i+=blockDim.x){
+        int row=i/dim,col=i%dim,idx=blockIdx.x*tile+row;
+        ks[col*(tile+1)+row]=idx<count?keys[(long long)idx*dim+col]:0.f;
+    }
+    __syncthreads();
+    float dot=0.f;
+    if(candidate<count&&candidate<counts[t]){
+        const float *q=queries+((long long)t*heads+head)*dim;
+        for(int d=0;d<dim;d++)dot=__fadd_rn(dot,__fmul_rn(q[d],ks[d*(tile+1)+threadIdx.x%tile]));
+    }
+    partial[head*tile+threadIdx.x%tile]=__fmul_rn(fmaxf(dot,0.f),head_w[(long long)t*heads+head]);
+    __syncthreads();
+    if(head==0&&candidate<count){
+        float score=0.f;
+        if(candidate<counts[t])for(int h=0;h<heads;h++)score=__fadd_rn(score,partial[h*tile+threadIdx.x%tile]);
+        scores[(long long)t*count+candidate]=score;
+    }
+}
 extern "C" int dsv4_cuda_indexer_score_batch(int device,const float*queries,const float*keys,
         const float*head_w,const int*counts,int tokens,int heads,int dim,int count,
         float*scores){
@@ -964,9 +990,16 @@ extern "C" int dsv4_cuda_indexer_score_batch(int device,const float*queries,cons
        !ok(cudaMemcpyAsync(c->p3,keys,kb,cudaMemcpyHostToDevice,c->stream),"indexer key upload")||
        !ok(cudaMemcpyAsync(c->aux1,head_w,wb,cudaMemcpyHostToDevice,c->stream),"indexer head weight upload")||
        !ok(cudaMemcpyAsync(c->aux2,counts,cb,cudaMemcpyHostToDevice,c->stream),"indexer count upload"))return 0;
-    if(sm>48*1024&&cudaFuncSetAttribute(indexer_score_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sm)!=cudaSuccess)return 0;
-    indexer_score_kernel<<<dim3((count+127)/128,tokens),128,sm,c->stream>>>(
-        c->p4,c->p2,c->p3,c->aux1,(int*)c->aux2,heads,dim,count);
+    const char *parallel=getenv("DSV4_CUDA_INDEXER_HEADS");
+    if((!parallel||atoi(parallel))&&heads<=128&&dim<=512){
+        size_t shared=(size_t)(dim*9+heads*8)*4;
+        indexer_score_heads<<<dim3((count+7)/8,tokens),heads*8,shared,c->stream>>>(
+            c->p4,c->p2,c->p3,c->aux1,(int*)c->aux2,heads,dim,count);
+    }else{
+        if(sm>48*1024&&cudaFuncSetAttribute(indexer_score_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sm)!=cudaSuccess)return 0;
+        indexer_score_kernel<<<dim3((count+127)/128,tokens),128,sm,c->stream>>>(
+            c->p4,c->p2,c->p3,c->aux1,(int*)c->aux2,heads,dim,count);
+    }
     return ok(cudaGetLastError(),"indexer score launch")&&
            ok(cudaMemcpyAsync(scores,c->p4,sb,cudaMemcpyDeviceToHost,c->stream),"indexer score download")&&
            ok(cudaStreamSynchronize(c->stream),"indexer score sync");
@@ -1135,6 +1168,84 @@ __global__ void mm_bf16_batch(const __nv_bfloat16*w,const float*x,float*y,int O,
         #pragma unroll
         for(int t=0;t<16;t++)s[t][threadIdx.x]+=s[t][threadIdx.x+n];}__syncthreads();}
     if(!threadIdx.x)for(int t=0;t<tcount;t++)y[(long long)(tbase+t)*O+o]=s[t][0];
+}
+/* One lane owns one output row, preserving the decode reference's column
+ * order and fused fp32 accumulation. Rows32 packing coalesces weight reads. */
+__global__ void compressor_project_exact(const __nv_bfloat16 *kv,const __nv_bfloat16 *gate,
+                                         const float *x,float *out,int O,int I){
+    int row=blockIdx.x*32+threadIdx.x;
+    const __nv_bfloat16 *w=blockIdx.y?gate:kv;
+    float sum=0.f;
+    for(int i=0;i<I;i++)
+        sum=__fmaf_rn(__bfloat162float(w[((long long)blockIdx.x*I+i)*32+threadIdx.x]),x[i],sum);
+    out[(long long)blockIdx.y*O+row]=sum;
+}
+__global__ void indexer_head_project(const __nv_bfloat16 *w,const float *x,float *out,int I,float scale){
+    int row=blockIdx.x*32+threadIdx.x;float sum=0.f;
+    /* Unlike the compressor pair, the reference indexer head projection
+     * rounds the product before adding it to the sequential accumulator. */
+    for(int i=0;i<I;i++)sum=__fadd_rn(sum,__fmul_rn(__bfloat162float(w[((long long)blockIdx.x*I+i)*32+threadIdx.x]),x[i]));
+    out[row]=__fmul_rn(sum,scale);
+}
+/* Keep the CPU butterfly order and its FP4 tie rule (first code wins). */
+__global__ void indexer_hadamard_fp4(float *q,int dim,float norm){
+    extern __shared__ float values[];
+    int d=threadIdx.x;float v=q[(long long)blockIdx.x*dim+d];values[d]=v;
+    __syncthreads();
+    for(int width=1;width<dim;width*=2){
+        float peer=values[d^width];v=values[d];
+        v=(d&width)?__fsub_rn(peer,v):__fadd_rn(v,peer);
+        __syncthreads();values[d]=v;__syncthreads();
+    }
+    v=__bfloat162float(__float2bfloat16(__fmul_rn(v,norm)));
+    float mx=fabsf(v);
+    for(int offset=16;offset;offset>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,offset));
+    mx=fmaxf(mx,6.f*0x1p-126f);
+    int exponent;float fraction=frexpf(__fdiv_rn(mx,6.f),&exponent);
+    if(fraction==.5f)--exponent;
+    exponent=max(-127,min(127,exponent));float scale=ldexpf(1.f,exponent);
+    float x=fmaxf(-6.f,fminf(6.f,__fdiv_rn(v,scale)));
+    int best=0;float distance=fabsf(x);
+    #pragma unroll
+    for(int code=1;code<16;code++){float candidate=fabsf(__fsub_rn(x,f4(code)));if(candidate<distance){best=code;distance=candidate;}}
+    q[(long long)blockIdx.x*dim+d]=__bfloat162float(__float2bfloat16(__fmul_rn(f4(best),scale)));
+}
+extern "C" int dsv4_cuda_indexer_prepare(Dsv4CudaTensor *weights,const float *input,
+                                         float *queries,float *head_weights,int dim){
+    Dev *c=weights?ctx(weights->device):nullptr;
+    if(!c||!input||!queries||!head_weights||weights->fmt!=16||!weights->bf16_cache||
+       weights->O%32||dim<32||dim>512||(dim&(dim-1))||
+       !ok(cudaSetDevice(weights->device),"select indexer prepare device"))return 0;
+    int heads=weights->O;size_t xb=(size_t)weights->I*4,qb=(size_t)heads*dim*4,wb=(size_t)heads*4;
+    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,wb)||
+       !buf((void**)&c->p1,&c->p1cap,qb))return 0;
+    if(!ok(cudaMemcpyAsync(c->dx,input,xb,cudaMemcpyHostToDevice,c->stream),"indexer hidden upload")||
+       !ok(cudaMemcpyAsync(c->p1,queries,qb,cudaMemcpyHostToDevice,c->stream),"indexer prepare upload"))return 0;
+    indexer_head_project<<<heads/32,32,0,c->stream>>>((const __nv_bfloat16*)weights->bf16_cache,c->dx,c->dy,weights->I,1.f/sqrtf((float)(heads*dim)));
+    indexer_hadamard_fp4<<<heads,dim,dim*4,c->stream>>>(c->p1,dim,1.f/sqrtf((float)dim));
+    int good=ok(cudaGetLastError(),"indexer prepare launch")&&
+        ok(cudaMemcpyAsync(queries,c->p1,qb,cudaMemcpyDeviceToHost,c->stream),"indexer prepare download")&&
+        ok(cudaMemcpyAsync(head_weights,c->dy,wb,cudaMemcpyDeviceToHost,c->stream),"indexer head weights download");
+    int synced=ok(cudaStreamSynchronize(c->stream),"indexer prepare sync");return good&&synced;
+}
+extern "C" int dsv4_cuda_compressor_project(Dsv4CudaTensor *kv,Dsv4CudaTensor *gate,
+                                            const float *x,float *v,float *scores){
+    Dev *c=kv?ctx(kv->device):nullptr;
+    if(!c||!gate||!x||!v||!scores||kv->fmt!=16||gate->fmt!=16||
+       kv->device!=gate->device||kv->O!=gate->O||kv->I!=gate->I||
+       !kv->bf16_cache||!gate->bf16_cache||kv->O%32||
+       !ok(cudaSetDevice(kv->device),"select compressor device"))return 0;
+    size_t xb=(size_t)kv->I*4,yb=(size_t)kv->O*4;
+    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,2*yb))return 0;
+    if(!ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyHostToDevice,c->stream),"compressor input upload"))return 0;
+    compressor_project_exact<<<dim3(kv->O/32,2),32,0,c->stream>>>(
+        (const __nv_bfloat16*)kv->bf16_cache,(const __nv_bfloat16*)gate->bf16_cache,c->dx,c->dy,kv->O,kv->I);
+    int good=ok(cudaGetLastError(),"compressor projection launch")&&
+        ok(cudaMemcpyAsync(v,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"compressor values download")&&
+        ok(cudaMemcpyAsync(scores,c->dy+kv->O,yb,cudaMemcpyDeviceToHost,c->stream),"compressor scores download");
+    /* Drain any issued download before the caller overwrites CPU state on fallback. */
+    int synced=ok(cudaStreamSynchronize(c->stream),"compressor projection sync");
+    return good&&synced;
 }
 extern "C" int dsv4_cuda_matmul_bf16_batch(Dsv4CudaTensor*t,const float*x,int tokens,float*y){
     Dev*c=t?ctx(t->device):nullptr;
@@ -1340,6 +1451,34 @@ extern "C" int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t,const uint8_t*w,con
     return 1;
 }
 extern "C" int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t,const uint16_t*w,int O,int I,int d){return upload(t,w,(size_t)O*I*2,nullptr,0,O,I,d,16);}
+__global__ void pack_bf16_rows32(uint16_t *out,const uint16_t *in,int O,int I){
+    long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(p<(long long)O*I){int lane=p%32,col=(p/32)%I,row=(p/(32LL*I))*32+lane;out[p]=in[(long long)row*I+col];}
+}
+extern "C" int dsv4_cuda_upload_compressor(Dsv4CudaTensor **pt,const uint16_t *w,int O,int I,int device){
+    if(!pt||!w||O<1||I<1||O%32)return 0;
+    if(*pt)return (*pt)->fmt==16&&(*pt)->bf16_cache&&(*pt)->O==O&&(*pt)->I==I&&(*pt)->device==device;
+    Dsv4CudaTensor *t=nullptr;
+    if(!dsv4_cuda_upload_bf16(&t,w,O,I,device))return 0;
+    Dev *c=ctx(device);size_t bytes=(size_t)O*I*2;
+    /* upload() uses the default stream; packing runs on a nonblocking stream. */
+    if(!ok(cudaStreamSynchronize(nullptr),"compressor source upload sync")||
+       !ok(cudaMalloc(&t->bf16_cache,bytes),"compressor packed allocation")){dsv4_cuda_tensor_free(t);return 0;}
+    pack_bf16_rows32<<<((long long)O*I+255)/256,256,0,c->stream>>>((uint16_t*)t->bf16_cache,(const uint16_t*)t->w,O,I);
+    if(!ok(cudaGetLastError(),"compressor packing launch")||!ok(cudaStreamSynchronize(c->stream),"compressor packing sync")){dsv4_cuda_tensor_free(t);return 0;}
+    const char *verify=getenv("DSV4_IDX_VERIFY");
+    if(verify&&*verify&&*verify!='0'){
+        std::vector<uint16_t> packed((size_t)O*I);
+        if(!ok(cudaMemcpy(packed.data(),t->bf16_cache,bytes,cudaMemcpyDeviceToHost),"packed verification download")){dsv4_cuda_tensor_free(t);return 0;}
+        for(int row=0;row<O;row++)for(int col=0;col<I;col++)
+            if(packed[((size_t)(row/32)*I+col)*32+row%32]!=w[(size_t)row*I+col]){
+                fprintf(stderr,"packed verification mismatch device=%d O=%d I=%d row=%d col=%d\n",device,O,I,row,col);
+                dsv4_cuda_tensor_free(t);return 0;
+            }
+    }
+    t->bytes+=bytes;*pt=t;return 1;
+}
+
 extern "C" int dsv4_cuda_upload_f32(Dsv4CudaTensor **t,const float*w,int O,int I,int d){return upload(t,w,(size_t)O*I*4,nullptr,0,O,I,d,32);}
 extern "C" int dsv4_cuda_mhc_pre(const Dsv4CudaActivation*r,Dsv4CudaTensor*fn,Dsv4CudaTensor*scale,Dsv4CudaTensor*base,int M,int H,float rms_eps,float pre_eps,float sink_eps,float post_mult,int sink_iters,Dsv4CudaActivation*state,Dsv4CudaActivation*input){
     int N=2*M+M*M,MH=M*H;Dev*c=r?ctx(r->device):nullptr;if(!c||!fn||!scale||!base||!state||!input||fn->fmt!=32||scale->fmt!=32||base->fmt!=32||fn->device!=r->device||scale->device!=r->device||base->device!=r->device||state->device!=r->device||input->device!=r->device||r->elements<MH||fn->O!=N||fn->I!=MH||scale->O*scale->I<3||base->O*base->I<N||state->elements<M+M*M+M||input->elements<H||!ok(cudaSetDevice(r->device),"select mHC device")||!buf((void**)&c->p1,&c->p1cap,(size_t)N*4))return 0;

@@ -823,6 +823,11 @@ int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
  * Every entry returns non-zero on any refusal so the caller can fall back to
  * the CPU reference for the whole chunk. */
 int coli_v4_gpu_attn_batch_wanted(void);
+int coli_v4_gpu_indexer_prepare(const ColiDeepSeekV4LayerWeights *weights,
+    const float *input, float *queries, float *head_weights, int dimension);
+int coli_v4_gpu_compressor_project(
+    const ColiDeepSeekV4LayerWeights *weights, const char *prefix,
+    float *kv, float *gate, const float *input);
 /* Runs both bf16 projection matrices (wkv_key/wgate_key mirrors) over the
  * whole chunk: kv_proj/gate_proj receive [batch][rows-of-mirror]. */
 int coli_v4_gpu_compressor_project_batch(

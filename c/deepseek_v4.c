@@ -3292,6 +3292,15 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
         return set_error(error, error_size, "missing compressor tensor for %s", state->prefix);
     float *kv_row = state->kv_state + (size_t)state_row * projection;
     float *score_row = state->score_state + (size_t)state_row * projection;
+#ifdef COLI_V4_GPU_TIER
+    if (!coli_v4_gpu_compressor_project(state->weights, state->prefix,
+                                         kv_row, score_row, input)) {
+        for (int row = 0; row < projection; row++)
+            score_row[row] += ape[(size_t)slot * projection + row];
+        return compressor_pool_and_emit(state, output, produced, position,
+                                         error, error_size);
+    }
+#endif
     #pragma omp parallel for
     for (int row = 0; row < projection; row++) {
         float kv_sum = 0.0f, gate_sum = 0.0f;
@@ -3899,7 +3908,19 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
         stoken[s] = t;
         s++;
     }
-    if (!result) {
+    int prepared = 0;
+#ifdef COLI_V4_GPU_TIER
+    if (!result && batch == 1 && need == 1 &&
+        coli_v4_layer_gpu(state->weights, "attn.indexer.weights_proj")) {
+        memcpy(sq, queries, qn * sizeof(*sq));
+        coli_bf16_round_array(sq, qn);
+        if (!apply_position_rope(sq, config, start_position) &&
+            !coli_v4_gpu_indexer_prepare(state->weights, inputs, sq,
+                                          head_weights, dimension))
+            prepared = 1;
+    }
+#endif
+    if (!result && !prepared) {
         int prep_failed = 0;
         #pragma omp parallel for schedule(dynamic, 1)
         for (int i = 0; i < need; i++) {
@@ -3921,6 +3942,35 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
         }
         if (prep_failed)
             result = set_error(error, error_size, "indexer query prep failed");
+    }
+    if (!result && prepared && verify) {
+        float *reference = malloc(qn * sizeof(*reference));
+        float *reference_hw = malloc((size_t)heads * sizeof(*reference_hw));
+        float qdq[512];
+        uint8_t scales[16];
+        if (!reference || !reference_hw) result = -1;
+        if (!result) {
+            memcpy(reference, queries, qn * sizeof(*reference));
+            result = indexer_prepare_queries(reference, scales, qdq, config,
+                                               start_position);
+            indexer_head_weights(reference_hw, raw_weights, inputs, config);
+        }
+        size_t query_bad = 0, head_bad = 0;
+        if (!result) {
+            for (size_t i = 0; i < qn; i++) query_bad += reference[i] != sq[i];
+            for (int i = 0; i < heads; i++) {
+                if (reference_hw[i] == head_weights[i]) continue;
+                head_bad++;
+                fprintf(stderr, "idxprepdetail layer=%d head=%d cpu=%a gpu=%a\n",
+                        state->layer, i, (double)reference_hw[i], (double)head_weights[i]);
+            }
+            fprintf(stderr, "idxprepverify layer=%d start=%d query-mismatches=%zu head-mismatches=%zu\n",
+                    state->layer, start_position, query_bad, head_bad);
+            if (query_bad || head_bad)
+                result = set_error(error, error_size, "indexer GPU preparation differs from CPU reference");
+        }
+        free(reference_hw);
+        free(reference);
     }
     IDX_PROF_MARK(t_prep);
     int gpu_scored = 0;
@@ -3972,7 +4022,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     IDX_PROF_MARK(t_sort);
     if (prof)
         fprintf(stderr, "idxprof layer=%d start=%d scored=%d cand=%d "
-                "proj=%.0f prep=%.0f score=%.0f sort=%.0f ms%s\n",
+                "proj=%.3f prep=%.3f score=%.3f sort=%.3f ms%s\n",
                 state->layer, start_position, need, max_count, t_proj * 1e3,
                 t_prep * 1e3, t_score * 1e3, t_sort * 1e3,
                 gpu_scored ? "" : " (cpu-score)");
@@ -6171,6 +6221,15 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
         return set_error(error, error_size, "missing compressor tensor for %s", state->prefix);
     float *kv_row = state->kv_state + (size_t)state_row * projection;
     float *score_row = state->score_state + (size_t)state_row * projection;
+#ifdef COLI_V4_GPU_TIER
+    if (!coli_v4_gpu_compressor_project(state->weights, state->prefix,
+                                         kv_row, score_row, input)) {
+        for (int row = 0; row < projection; row++)
+            score_row[row] += ape[(size_t)slot * projection + row];
+        return compressor_pool_and_emit(state, output, produced, position,
+                                         error, error_size);
+    }
+#endif
     #pragma omp parallel for
     for (int row = 0; row < projection; row++) {
         float kv_sum = 0.0f, gate_sum = 0.0f;
@@ -10164,12 +10223,22 @@ static void *v4_gpu_upload_norm_f32(ColiDeepSeekV4LayerWeights *weights,
     return tensor;
 }
 
+static int v4_gpu_indexer_prepare_wanted(void) {
+    const char *setting = getenv("DSV4_CUDA_INDEXER_PREP");
+    return !setting || atoi(setting) != 0;
+}
+
+static int v4_gpu_compressor_wanted(void) {
+    const char *setting = getenv("DSV4_CUDA_COMPRESSOR");
+    return !setting || atoi(setting) != 0;
+}
+
 /* bf16 projection mirror (compressor / indexer-compressor wkv & wgate).
  * Shape-checked here so the batched projection can trust the mirror. */
 static void *v4_gpu_upload_bf16_matrix(ColiDeepSeekV4LayerWeights *weights,
                                        int device, const char *prefix,
                                        int expected_rows, int expected_columns,
-                                       long long *bytes) {
+                                       int packed_decode, long long *bytes) {
     char name[COLI_V4_MAX_TENSOR_NAME];
     const ColiDeepSeekV4TensorSpec *spec = NULL;
     snprintf(name, sizeof(name), "layers.%d.%s.weight", weights->plan.layer,
@@ -10179,8 +10248,11 @@ static void *v4_gpu_upload_bf16_matrix(ColiDeepSeekV4LayerWeights *weights,
         spec->shape[0] != expected_rows || spec->shape[1] != expected_columns)
         return NULL;
     Dsv4CudaTensor *tensor = NULL;
-    if (!dsv4_cuda_upload_bf16(&tensor, (const uint16_t *)data,
-                               expected_rows, expected_columns, device))
+    if (packed_decode)
+        dsv4_cuda_upload_compressor(&tensor, data, expected_rows,
+                                    expected_columns, device);
+    if (!tensor && !dsv4_cuda_upload_bf16(&tensor, data, expected_rows,
+                                         expected_columns, device))
         return NULL;
     if (bytes) *bytes += dsv4_cuda_tensor_bytes(tensor);
     return tensor;
@@ -10264,43 +10336,53 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
             continue;
         }
     }
-    /* Compressor / indexer-compressor projection mirrors for the batched
-     * attention path (COLI_CUDA_ATTN_BATCH=1). Missing tensors (layers
-     * without compression) simply leave the mirror NULL. */
-    if (coli_v4_gpu_attn_batch_wanted()) {
+    /* Decode compressor projections are resident by default. The CPU owns
+     * their sliding state; missing mirrors retain the reference fallback. */
+    if (coli_v4_gpu_attn_batch_wanted() || v4_gpu_compressor_wanted() ||
+        v4_gpu_indexer_prepare_wanted()) {
         const ColiDeepSeekV4Config *config = coli_v4_engine_config(engine);
-        void *indexer = v4_gpu_upload_indexer(weights, device, &bytes);
+        void *indexer = coli_v4_gpu_attn_batch_wanted()
+            ? v4_gpu_upload_indexer(weights, device, &bytes) : NULL;
         if (indexer && coli_v4_layer_gpu_set(weights, "attn.indexer.wq_b", indexer))
             dsv4_cuda_tensor_free((Dsv4CudaTensor *)indexer);
         int ratio = weights->plan.compression_ratio;
-        if (config && ratio) {
+        if (config && ratio &&
+            (coli_v4_gpu_attn_batch_wanted() || v4_gpu_compressor_wanted())) {
             int comp_rows = (ratio == 4 ? 2 : 1) * config->head_dim;
             static const char *const comp_keys[2] =
                 {"attn.compressor.wkv", "attn.compressor.wgate"};
             for (int k = 0; k < 2; k++) {
                 void *handle = v4_gpu_upload_bf16_matrix(
                     weights, device, comp_keys[k], comp_rows,
-                    config->hidden_size, &bytes);
+                    config->hidden_size, v4_gpu_compressor_wanted(), &bytes);
                 if (handle && coli_v4_layer_gpu_set(weights, comp_keys[k],
                                                     handle))
                     dsv4_cuda_tensor_free((Dsv4CudaTensor *)handle);
             }
         }
-        if (config && weights->plan.has_indexer) {
+        if (config && weights->plan.has_indexer &&
+            (coli_v4_gpu_attn_batch_wanted() || v4_gpu_compressor_wanted())) {
             int idx_rows = 2 * config->index_head_dim;
             static const char *const idx_keys[2] =
                 {"attn.indexer.compressor.wkv", "attn.indexer.compressor.wgate"};
             for (int k = 0; k < 2; k++) {
                 void *handle = v4_gpu_upload_bf16_matrix(
                     weights, device, idx_keys[k], idx_rows,
-                    config->hidden_size, &bytes);
+                    config->hidden_size, v4_gpu_compressor_wanted(), &bytes);
                 if (handle && coli_v4_layer_gpu_set(weights, idx_keys[k],
                                                     handle))
                     dsv4_cuda_tensor_free((Dsv4CudaTensor *)handle);
             }
         }
+        if (config && weights->plan.has_indexer && v4_gpu_indexer_prepare_wanted()) {
+            const char *key = "attn.indexer.weights_proj";
+            void *handle = v4_gpu_upload_bf16_matrix(weights, device, key,
+                config->index_n_heads, config->hidden_size, 1, &bytes);
+            if (handle && coli_v4_layer_gpu_set(weights, key, handle))
+                dsv4_cuda_tensor_free(handle);
+        }
         /* mHC mixing weights + branch norms for the batched mHC kernels. */
-        if (config && config->hc_mult == 4) {
+        if (coli_v4_gpu_attn_batch_wanted() && config && config->hc_mult == 4) {
             int hc = config->hc_mult, d = config->hidden_size;
             int mix_rows = (2 + hc) * hc;
             static const char *const hc_keys[2][3] = {
@@ -11573,6 +11655,25 @@ int coli_v4_gpu_attn_batch_wanted(void) {
         wanted = setting && atoi(setting) != 0;
     }
     return wanted;
+}
+
+int coli_v4_gpu_indexer_prepare(const ColiDeepSeekV4LayerWeights *weights,
+    const float *input, float *queries, float *head_weights, int dimension) {
+    if (!weights || !v4_gpu_indexer_prepare_wanted()) return -1;
+    Dsv4CudaTensor *w = coli_v4_layer_gpu(weights, "attn.indexer.weights_proj");
+    return dsv4_cuda_indexer_prepare(w, input, queries, head_weights, dimension) ? 0 : -1;
+}
+
+int coli_v4_gpu_compressor_project(
+    const ColiDeepSeekV4LayerWeights *weights, const char *prefix,
+    float *kv, float *gate, const float *input) {
+    if (!v4_gpu_compressor_wanted() || !weights || !prefix) return -1;
+    char key[128];
+    snprintf(key, sizeof(key), "%s.wkv", prefix);
+    Dsv4CudaTensor *wkv = coli_v4_layer_gpu(weights, key);
+    snprintf(key, sizeof(key), "%s.wgate", prefix);
+    Dsv4CudaTensor *wgate = coli_v4_layer_gpu(weights, key);
+    return dsv4_cuda_compressor_project(wkv, wgate, input, kv, gate) ? 0 : -1;
 }
 
 int coli_v4_gpu_compressor_project_batch(
