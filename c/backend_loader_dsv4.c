@@ -352,6 +352,7 @@ static struct {
     fn_route_moe_ep2   route_moe_ep2;
     fn_qkv             qkv;
     fn_wo              wo;
+    fn_wo              wo_decode;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
     fn_tensor_device   tensor_device;
@@ -505,6 +506,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     RESOLVE(route_moe_ep2, fn_route_moe_ep2);
     RESOLVE(qkv, fn_qkv);
     RESOLVE(wo, fn_wo);
+    g_dsv4.wo_decode = (fn_wo)GetProcAddress(g_dsv4.dll, "dsv4_cuda_wo_decode");
     RESOLVE(tensor_free, fn_tensor_free);
     RESOLVE(tensor_bytes, fn_tensor_bytes);
     RESOLVE(tensor_device, fn_tensor_device);
@@ -1072,6 +1074,9 @@ int dsv4_cuda_qkv(Dsv4CudaTensor *q_a, Dsv4CudaTensor *q_norm, Dsv4CudaTensor *q
     return g_dsv4.qkv(q_a, q_norm, q_b, kv, eps, q_out, kv_out, x);
 }
 
+int dsv4_cuda_wo_decode(Dsv4CudaTensor *a,Dsv4CudaTensor *b,int groups,float *out,const float *context){
+    return g_dsv4.available && g_dsv4.wo_decode ? g_dsv4.wo_decode(a,b,groups,out,context) : 0;
+}
 int dsv4_cuda_wo(Dsv4CudaTensor *wo_a, Dsv4CudaTensor *wo_b, int groups, float *out, const float *context){
     if(!g_dsv4.available) return 0;
     return g_dsv4.wo(wo_a, wo_b, groups, out, context);

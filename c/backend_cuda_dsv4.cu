@@ -1820,6 +1820,28 @@ extern "C" int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float*x
     else if(t->fmt==32)mv_f32<<<t->O,256,0,c->stream>>>((float*)t->w,c->dx,c->dy,t->O,t->I);
     else mv_bf16<<<t->O,256,0,c->stream>>>((__nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I);
     return ok(cudaGetLastError(),"matvec launch")&&ok(cudaMemcpyAsync(y,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"result download")&&ok(cudaStreamSynchronize(c->stream),"matvec sync");}
+extern "C" int dsv4_cuda_wo_decode(Dsv4CudaTensor *wa,Dsv4CudaTensor *wb,int groups,float *out,const float *context){
+    Dev *c=wa?ctx(wa->device):nullptr;
+    if(!c||!wb||!out||!context||groups<1||wa->O<1||wa->I<1||wb->O<1||wa->O%groups||
+       (wa->fmt!=8&&wa->fmt!=9)||wb->fmt!=8||wb->device!=wa->device||wb->I!=wa->O||
+       !ok(cudaSetDevice(wa->device),"select decode output device"))return 0;
+    size_t cb=(size_t)wa->I*groups*sizeof(float),rb=(size_t)wa->O*sizeof(float),hb=(size_t)wb->O*sizeof(float);
+    if(!buf((void**)&c->dx,&c->xcap,cb)||!buf((void**)&c->p1,&c->p1cap,rb)||
+       !buf((void**)&c->dy,&c->ycap,hb))return 0;
+    int success=ok(cudaMemcpyAsync(c->dx,context,cb,cudaMemcpyHostToDevice,c->stream),"decode output upload");
+    if(success){
+        if(wa->fmt==9)run_mv<9>((uint8_t*)wa->w,wa->scale,c->dx,c->p1,wa->O,wa->I,groups,c->stream);
+        else run_mv<8>((uint8_t*)wa->w,wa->scale,c->dx,c->p1,wa->O,wa->I,groups,c->stream);
+        bf16_round<<<(wa->O+255)/256,256,0,c->stream>>>(c->p1,wa->O);
+        run_mv<8>((uint8_t*)wb->w,wb->scale,c->p1,c->dy,wb->O,wb->I,1,c->stream);
+        bf16_round<<<(wb->O+255)/256,256,0,c->stream>>>(c->dy,wb->O);
+        success=ok(cudaGetLastError(),"decode output launch")&&
+            ok(cudaMemcpyAsync(out,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"decode output download");
+    }
+    // Drain even on failure before the caller reuses host input/output in fallback.
+    int drained=ok(cudaStreamSynchronize(c->stream),"decode output sync");
+    return success&&drained;
+}
 extern "C" int dsv4_cuda_matvec(Dsv4CudaTensor*t,float*y,const float*x){return dsv4_cuda_matvec_grouped(t,y,x,1);}
 extern "C" int dsv4_cuda_matmul_batch(Dsv4CudaTensor*t,const Dsv4CudaActivation*input,int tokens,Dsv4CudaActivation*output){
     Dev*c=t?ctx(t->device):nullptr;if(!c||!input||!output||tokens<1||input->device!=t->device||output->device!=t->device||

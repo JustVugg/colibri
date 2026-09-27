@@ -342,6 +342,10 @@ tests/test_dsv4_indexer_prepare_cuda: tests/test_dsv4_indexer_prepare_cuda.cpp \
         backend_cuda_dsv4.h native_quant.h COLI_V4_UNIT_NATIVE_QUANT.o backend_cuda_dsv4.o
 	$(CXX) -O3 -std=c++20 $< COLI_V4_UNIT_NATIVE_QUANT.o backend_cuda_dsv4.o -o $@ $(LDFLAGS)
 
+tests/test_dsv4_wo_decode_cuda: tests/test_dsv4_wo_decode_cuda.cpp \
+        backend_cuda_dsv4.h backend_cuda_dsv4.o
+	$(CXX) -I$(CUDA_HOME)/include -O3 -std=c++20 $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
+
 tests/test_dsv4_compressor_cuda: tests/test_dsv4_compressor_cuda.cpp \
         backend_cuda_dsv4.h backend_cuda_dsv4.o
 	$(CXX) -O3 -std=c++20 $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
@@ -363,6 +367,6 @@ deepseek-v4-clean:
 		$(V4_BATCH_TEST_OBJ) \
 		$(V4_SERVE_TEST) tests/test_dsv4_multigpu_cuda \
 		tests/test_dsv4_compressor_cuda tests/test_dsv4_compressor_state_cuda \
-		tests/test_dsv4_indexer_prepare_cuda \
+		tests/test_dsv4_indexer_prepare_cuda tests/test_dsv4_wo_decode_cuda \
 		test_expert_store_registry $(V4_FLAGS_STAMP) \
 		$(V4_CUDA_FLAGS_STAMP)

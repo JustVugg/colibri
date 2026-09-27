@@ -817,6 +817,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                                 ColiExpertStore *store,
                                 const float *inputs, const int *tokens,
                                 int batch);
+int coli_v4_gpu_wo_decode(const ColiTensorView *a, const ColiTensorView *b,
+                           float *output, const float *input, int groups);
 int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
                                const float *input, int groups);
 /* Batched GPU attention offloads for prefill (COLI_CUDA_ATTN_BATCH=1).

@@ -45,6 +45,36 @@ int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w,
     return 1;
 }
 
+static int wo_calls, wo_ok = 1;
+int dsv4_cuda_wo_decode(Dsv4CudaTensor *a, Dsv4CudaTensor *b, int groups,
+                        float *output, const float *input) {
+    assert(a && b && groups == 8);
+    wo_calls++;
+    if (wo_ok) *output = *input;
+    return wo_ok;
+}
+static void test_wo_decode(void) {
+    Dsv4CudaTensor a = {0}, b = {0};
+    ColiTensorView wa = {.gpu = &a}, wb = {.gpu = &b};
+    float input = 7, output = -1;
+    unsetenv("DSV4_CUDA_WO_DECODE");
+    assert(!coli_v4_gpu_wo_decode(&wa, &wb, &output, &input, 8));
+    assert(wo_calls == 1 && output == input);
+    setenv("DSV4_CUDA_WO_DECODE", "0", 1);
+    assert(coli_v4_gpu_wo_decode(&wa, &wb, &output, &input, 8) == -1);
+    assert(wo_calls == 1);
+    setenv("DSV4_CUDA_WO_DECODE", "1", 1);
+    wo_ok = 0;
+    assert(coli_v4_gpu_wo_decode(&wa, &wb, &output, &input, 8) == -1);
+    assert(wo_calls == 2);
+    wa.gpu = NULL;
+    assert(coli_v4_gpu_wo_decode(&wa, &wb, &output, &input, 8) == -1);
+    wa.gpu = &a; wb.gpu = NULL;
+    assert(coli_v4_gpu_wo_decode(&wa, &wb, &output, &input, 8) == -1);
+    assert(wo_calls == 2);
+    unsetenv("DSV4_CUDA_WO_DECODE");
+}
+
 static int moe_calls, moe_ok = 1;
 static V4GpuExpertMirrorCache *locked_cache;
 int dsv4_cuda_moe(Dsv4CudaTensor *const *gate, Dsv4CudaTensor *const *up,
@@ -304,6 +334,7 @@ int main(void) {
     free(engine);
     test_preload();
     test_resident_route();
+    test_wo_decode();
     puts("test_v4_gpu_placement: ok");
     return 0;
 }
