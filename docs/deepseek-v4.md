@@ -493,3 +493,24 @@ disabled.
 - Linux CUDA tier: measure on a native Linux box (WSL2 verified), POSIX host pinning.
 - Tensor/expert parallel execution within a layer (not provided by layer placement).
 - Shared replacements for the two temporary private quant paths (rows16 cache).
+
+### Resident decode experts
+
+The CUDA decode pipeline checks the owning device's expert cache before starting
+host expert loaders. If every routed expert and the shared expert are mirrored,
+it runs the fused MoE directly from those device weights. The cache mutex stays
+held until the synchronous backend returns, preventing refill/eviction of the
+selected buffers. Partial or incomplete residency and declined fusion use the
+existing loader/group fallback. Shared expert bindings use w1 (gate), w3 (up),
+and w2 (down).
+
+This adapts Naruto's resident expert-table execution approach
+(`core/model/deepseek_v4_moe.cc`, `DeviceRoutedExpertsInvocation`, revision
+6634772) to Colibri's existing CUDA mirrors. It does not import Naruto's TP2,
+EP2, SM121 kernels, or graph runtime. Cold loads and partial-hit tokens still
+use host expert storage; this is not full model preloading.
+
+Validation covers six-device cache ownership, full/partial/incomplete residency,
+locking through compute, backend-decline fallback, and CPU compilation. These
+checks do not establish GPU numerical equivalence or a throughput improvement;
+the earlier six-GPU benchmark predates this optimization.

@@ -4972,6 +4972,21 @@ static int moe_token_pipeline(float *output,
         result = moe_fail("layer %d: routing selected %d experts, wanted %d",
                           weights->plan.layer, selected, topk);
 
+#if defined(COLI_V4_GPU_TIER) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+    if (!result && store->gpu) {
+        void *sg = coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
+        void *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
+        void *sd = coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
+        int resident = coli_v4_gpu_moe_resident(store, weights->plan.layer,
+            expert_ids, expert_weights, selected, sg, su, sd,
+            config->swiglu_limit, output, input);
+        if (resident) {
+            for (int i = 0; i < d; i++) output[i] = coli_bf16_round(output[i]);
+            goto moe_done;
+        }
+    }
+#endif
+
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH
     if (!result && expert_prefetch_enabled() && store->ops->prefetch) {
         ColiExpertKey *keys = malloc((size_t)selected * sizeof(*keys));
@@ -5155,8 +5170,8 @@ static int moe_token_pipeline(float *output,
     }
     if (!result && gpu_compute && store->gpu) {
         void *sg = coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
-        void *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
-        void *sd = coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
+        void *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
+        void *sd = coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
         int moe_ok = sg && su && sd;
         void **gates = malloc((size_t)selected * sizeof(*gates));
         void **ups = malloc((size_t)selected * sizeof(*ups));
@@ -5376,6 +5391,9 @@ static int moe_token_pipeline(float *output,
         if (!job.result)
             coli_expert_release(store, &job.view);
     }
+#endif
+#if defined(COLI_V4_GPU_TIER) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+moe_done:
 #endif
     free(shared_output); free(expert_output); free(expert_weights);
     free(expert_ids); free(indices); free(route_weights); free(gate);
@@ -10682,6 +10700,43 @@ int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view) {
     }
     pthread_mutex_unlock(&cache->mutex);
     return -1;
+}
+
+/* Reuse resident device weights before starting any host expert loads.
+ * Hold the cache lock through the synchronous kernel so refill cannot
+ * invalidate a selected tensor. A partial hit leaves the normal loader intact. */
+int coli_v4_gpu_moe_resident(ColiExpertStore *store, int layer,
+    const int *ids, const float *weights, int count,
+    void *shared_gate, void *shared_up, void *shared_down,
+    float limit, float *output, const float *input) {
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_cache(store, layer);
+    if (!cache || count < 1 || count > 16 || !ids || !weights ||
+        !shared_gate || !shared_up || !shared_down || !output || !input)
+        return 0;
+    Dsv4CudaTensor *gates[16], *ups[16], *downs[16];
+    pthread_mutex_lock(&cache->mutex);
+    for (int k = 0; k < count; k++) {
+        V4GpuExpertMirror *entry = NULL;
+        for (int i = 0; i < cache->count; i++)
+            if (cache->entries[i].layer == layer && cache->entries[i].expert == ids[k]) {
+                entry = &cache->entries[i];
+                break;
+            }
+        if (!entry || !entry->gate || !entry->up || !entry->down) {
+            pthread_mutex_unlock(&cache->mutex);
+            return 0;
+        }
+        gates[k] = entry->gate;
+        ups[k] = entry->up;
+        downs[k] = entry->down;
+        entry->clock = ++cache->clock;
+    }
+    int ok = dsv4_cuda_moe(gates, ups, downs, weights, count,
+        shared_gate, shared_up, shared_down, limit, output, input);
+    pthread_mutex_unlock(&cache->mutex);
+    /* Older backends may decline fusion; let the existing loader/group
+     * fallback handle that case, including overwriting any partial output. */
+    return ok ? 1 : 0;
 }
 
 int coli_v4_gpu_dspark_expert_attach(void *cache, ColiExpertView *view) {
