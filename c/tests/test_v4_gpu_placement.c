@@ -45,6 +45,50 @@ int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w,
     return 1;
 }
 
+static int head_upload_ok = 1, head_scores_ok = 1, head_uploads;
+long long dsv4_cuda_tensor_bytes(const Dsv4CudaTensor *t) { return t ? 512 : 0; }
+int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **t,const uint16_t *w,int rows,int cols,int device) {
+    assert(w && rows == 32 && cols == 8);
+    head_uploads++;
+    if (!head_upload_ok) return 0;
+    *t = malloc(sizeof(**t)); assert(*t); (*t)->device = device; live_tensors++;
+    return 1;
+}
+int dsv4_cuda_head_scores_exact(Dsv4CudaTensor *t,const float *input,float *scores) {
+    assert(t && input && scores);
+    if (head_scores_ok) scores[0] = input[0];
+    return head_scores_ok;
+}
+static void test_head(void) {
+#if defined(__AVX2__)
+    ColiV4Engine *engine = calloc(1, sizeof(*engine)); assert(engine);
+    engine->gpu.enabled = 1;
+    engine->config.vocab_size = 32; engine->config.hidden_size = 8;
+    uint16_t weights[256] = {0};
+    engine->head_cache.data = (unsigned char *)weights; engine->head_cache.bytes = sizeof(weights);
+    setenv("DSV4_CUDA_HEAD", "0", 1);
+    coli_v4_gpu_head_upload(engine); assert(!engine->gpu.head && !head_uploads);
+    unsetenv("DSV4_CUDA_HEAD"); low_memory_device = 0;
+    coli_v4_gpu_head_upload(engine); assert(!engine->gpu.head && !head_uploads);
+    low_memory_device = -1; head_upload_ok = 0;
+    coli_v4_gpu_head_upload(engine); assert(!engine->gpu.head && head_uploads == 1);
+    head_upload_ok = 1;
+    coli_v4_gpu_head_upload(engine); assert(engine->gpu.head && live_tensors == 1);
+    assert(engine->gpu.uploaded_bytes == 512);
+    coli_v4_gpu_head_upload(engine); assert(head_uploads == 2);
+    float input = 7, scores = -1;
+    assert(!coli_v4_gpu_head_scores(engine, &input, &scores) && scores == input);
+    head_scores_ok = 0;
+    assert(coli_v4_gpu_head_scores(engine, &input, &scores) == -1);
+    int before = shutdowns;
+    coli_v4_gpu_engine_close(engine);
+    assert(!live_tensors && !engine->gpu.head && !engine->gpu.uploaded_bytes && shutdowns == before + 1);
+    assert(coli_v4_gpu_head_scores(engine, &input, &scores) == -1);
+    coli_v4_gpu_engine_close(engine); assert(shutdowns == before + 1);
+    free(engine);
+#endif
+}
+
 static int wo_calls, wo_ok = 1;
 int dsv4_cuda_wo_decode(Dsv4CudaTensor *a, Dsv4CudaTensor *b, int groups,
                         float *output, const float *input) {
@@ -335,6 +379,7 @@ int main(void) {
     test_preload();
     test_resident_route();
     test_wo_decode();
+    test_head();
     puts("test_v4_gpu_placement: ok");
     return 0;
 }

@@ -817,6 +817,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                                 ColiExpertStore *store,
                                 const float *inputs, const int *tokens,
                                 int batch);
+void coli_v4_gpu_head_upload(ColiV4Engine *engine);
+int coli_v4_gpu_head_scores(ColiV4Engine *engine,const float *input,float *scores);
 int coli_v4_gpu_wo_decode(const ColiTensorView *a, const ColiTensorView *b,
                            float *output, const float *input, int groups);
 int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
@@ -937,6 +939,7 @@ struct ColiV4Engine {
          * experts (separate bounded LRU; see dspark_mirrors_ensure). NULL
          * unless V4_MTP_GPU=1 and the tier opened successfully. */
         void *dspark_mirrors;
+        void *head; /* owned packed BF16 vocabulary mirror */
     } gpu;
     struct {
         uint16_t *markov_w1;

@@ -88,6 +88,9 @@ int dsv4_cuda_kv_ring_append(int device,int layer,const float *rows,int start_po
                              int count,int window,int dim);
 int dsv4_cuda_kv_comp_append(int device,int layer,const float *rows,int start_idx,
                              int count,int dim);
+/* Packed BF16 vocabulary head, sequential separately rounded mul/add logits. */
+int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **t,const uint16_t *w,int rows,int cols,int device);
+int dsv4_cuda_head_scores_exact(Dsv4CudaTensor *t,const float *input,float *scores);
 int dsv4_cuda_head_argmax(Dsv4CudaTensor *t,const float *x,int *id,float *value);
 int dsv4_cuda_final_argmax(const Dsv4CudaActivation *residual,Dsv4CudaTensor *fn,Dsv4CudaTensor *scale,
                            Dsv4CudaTensor *base,Dsv4CudaTensor *norm,Dsv4CudaTensor *head,

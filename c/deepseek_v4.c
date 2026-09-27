@@ -9960,6 +9960,7 @@ int coli_v4_engine_open(ColiV4Engine **output,
                     error && error_size ? error : "insufficient budget");
         if (preload && error && error_size) error[0] = '\0';
     }
+    coli_v4_gpu_head_upload(engine);
 #endif
     *output = engine;
     return 0;
@@ -10080,6 +10081,8 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
             (V4GpuExpertMirrorCache *)engine->gpu.dspark_mirrors);
         engine->gpu.dspark_mirrors = NULL;
     }
+    dsv4_cuda_tensor_free((Dsv4CudaTensor *)engine->gpu.head);
+    engine->gpu.head = NULL;
     dsv4_cuda_shutdown();
     engine->gpu.enabled = 0;
     engine->gpu.uploaded_bytes = 0;
@@ -10447,6 +10450,43 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
     fprintf(stderr, "v4_gpu layer=%d uploaded=%.3fMiB in %.3fs wall=%.0f\n", layer,
             bytes / 1048576.0, _dt, _wall);
     return 0;
+}
+
+void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
+#if defined(__AVX2__)
+    const char *enabled = getenv("DSV4_CUDA_HEAD");
+    if (!engine || !engine->gpu.enabled || engine->gpu.head ||
+        !engine->head_cache.data || (enabled && !atoi(enabled))) return;
+    int rows = engine->config.vocab_size, cols = engine->config.hidden_size;
+    if (rows < 1 || rows % 32 || cols < 1 || cols % 8 ||
+        engine->head_cache.bytes != (uint64_t)rows * cols * 2) return;
+    const char *setting = getenv("DSV4_CUDA_VRAM_RESERVE_MB");
+    long long reserve = setting ? atoll(setting) : 2800;
+    if (reserve < 256) reserve = 256;
+    long long need = ((long long)rows * cols * 4 + 1048575) / 1048576;
+    /* After expert preloading: never displace complete banks to fit the head.
+     * Packing temporarily needs both copies; final residency retains one. */
+    int device = engine->gpu.device;
+    long long free_mb = dsv4_cuda_mem_free_mb(device);
+    Dsv4CudaTensor *head = NULL;
+    if (free_mb < reserve + need || !dsv4_cuda_upload_head_exact(
+            &head, (const uint16_t *)engine->head_cache.data, rows, cols, device)) {
+        fprintf(stderr, "v4_gpu head=cpu-fallback device=%d free-MiB=%lld need-MiB=%lld reserve-MiB=%lld\n",
+                device, free_mb, need, reserve);
+        return;
+    }
+    engine->gpu.head = head;
+    long long bytes = dsv4_cuda_tensor_bytes(head);
+    engine->gpu.uploaded_bytes += bytes;
+    fprintf(stderr, "v4_gpu head=resident device=%d bytes=%lld arithmetic=separate-mul-add\n", device, bytes);
+#else
+    (void)engine;
+#endif
+}
+
+int coli_v4_gpu_head_scores(ColiV4Engine *engine,const float *input,float *scores) {
+    if (!engine || !engine->gpu.enabled || !engine->gpu.head) return -1;
+    return dsv4_cuda_head_scores_exact(engine->gpu.head, input, scores) ? 0 : -1;
 }
 
 int coli_v4_gpu_fp8_matvec(const ColiTensorView *w, float *output,
@@ -12366,12 +12406,22 @@ static int head_scores_impl(ColiV4Engine *engine, const float *hidden,
      * Each row retains the same scalar accumulation order and the final scan
      * retains vocabulary order, so logits/tie-breaking do not change. */
     if (resident) {
-        #pragma omp parallel for schedule(static)
+        int gpu_done = 0;
+#ifdef COLI_V4_GPU_TIER
+        gpu_done = !coli_v4_gpu_head_scores(engine, hidden, scores);
+        const char *verify = getenv("DSV4_HEAD_VERIFY");
+        if (gpu_done && (!verify || !atoi(verify))) return 0;
+#endif
+        int mismatches = 0;
+        #pragma omp parallel for schedule(static) reduction(+:mismatches)
         for (int row = 0; row < vocab; row++) {
             const uint16_t *weight = resident + (size_t)row * d;
-            scores[row] = head_bf16_dot(weight, hidden, d);
+            float value = head_bf16_dot(weight, hidden, d);
+            if (gpu_done) mismatches += memcmp(&value, scores + row, sizeof(value)) != 0;
+            else scores[row] = value;
         }
-        return 0;
+        if (gpu_done) fprintf(stderr, "headverify rows=%d mismatches=%d\n", vocab, mismatches);
+        return mismatches ? -1 : 0;
     }
     /* Low-memory fallback: stream small row tiles exactly as before. */
     enum { ROWS = 64 };

@@ -1479,6 +1479,36 @@ extern "C" int dsv4_cuda_upload_compressor(Dsv4CudaTensor **pt,const uint16_t *w
     t->bytes+=bytes;*pt=t;return 1;
 }
 
+extern "C" int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **pt,const uint16_t *w,int O,int I,int device){
+    if(!pt||*pt||I<1||I%8)return 0;
+    Dsv4CudaTensor *t=nullptr;
+    if(!dsv4_cuda_upload_compressor(&t,w,O,I,device))return 0;
+    // The head only consumes the packed copy; discard the upload source.
+    if(!ok(cudaFree(t->w),"head source release")){dsv4_cuda_tensor_free(t);return 0;}
+    t->w=t->bf16_cache;t->bf16_cache=nullptr;t->fmt=12;t->bytes=(long long)O*I*2;
+    *pt=t;return 1;
+}
+__global__ void head_scores_exact(const __nv_bfloat16 *w,const float *x,float *out,int O,int I){
+    int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=O)return;
+    float sum=0.f;long long base=(long long)(row/32)*I*32+row%32;
+    for(int i=0;i<I;i++)sum=__fadd_rn(sum,__fmul_rn(__bfloat162float(w[base+(long long)i*32]),x[i]));
+    out[row]=sum;
+}
+extern "C" int dsv4_cuda_head_scores_exact(Dsv4CudaTensor *t,const float *input,float *scores){
+    Dev *c=t?ctx(t->device):nullptr;
+    if(!c||t->fmt!=12||!input||!scores||!ok(cudaSetDevice(t->device),"select head device"))return 0;
+    size_t xb=(size_t)t->I*sizeof(float),yb=(size_t)t->O*sizeof(float);
+    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,yb))return 0;
+    int success=ok(cudaMemcpyAsync(c->dx,input,xb,cudaMemcpyHostToDevice,c->stream),"head input upload");
+    if(success){
+        head_scores_exact<<<(t->O+127)/128,128,0,c->stream>>>((__nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I);
+        success=ok(cudaGetLastError(),"head scores launch")&&
+            ok(cudaMemcpyAsync(scores,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"head scores download");
+    }
+    int drained=ok(cudaStreamSynchronize(c->stream),"head scores sync");
+    return success&&drained;
+}
+
 extern "C" int dsv4_cuda_upload_f32(Dsv4CudaTensor **t,const float*w,int O,int I,int d){return upload(t,w,(size_t)O*I*4,nullptr,0,O,I,d,32);}
 extern "C" int dsv4_cuda_mhc_pre(const Dsv4CudaActivation*r,Dsv4CudaTensor*fn,Dsv4CudaTensor*scale,Dsv4CudaTensor*base,int M,int H,float rms_eps,float pre_eps,float sink_eps,float post_mult,int sink_iters,Dsv4CudaActivation*state,Dsv4CudaActivation*input){
     int N=2*M+M*M,MH=M*H;Dev*c=r?ctx(r->device):nullptr;if(!c||!fn||!scale||!base||!state||!input||fn->fmt!=32||scale->fmt!=32||base->fmt!=32||fn->device!=r->device||scale->device!=r->device||base->device!=r->device||state->device!=r->device||input->device!=r->device||r->elements<MH||fn->O!=N||fn->I!=MH||scale->O*scale->I<3||base->O*base->I<N||state->elements<M+M*M+M||input->elements<H||!ok(cudaSetDevice(r->device),"select mHC device")||!buf((void**)&c->p1,&c->p1cap,(size_t)N*4))return 0;
