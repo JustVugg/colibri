@@ -203,6 +203,84 @@ overwrote the group's input and output mid-flight -- no CUDA error, only
 wrong numbers. qwen36 never called the dense path inside that window, so its
 outputs were unaffected.
 
+## The residents follow the prompt (`QT_PREFILL_REPLAN=1`)
+
+The warmstart fills VRAM from the heat file, i.e. from what earlier prompts
+routed to, and the LFRU tick then corrects one expert per sixteen tokens and
+device. For a prompt on a new topic that is thousands of tokens of catching up:
+measured on the 35B with a heat file accumulated over six other prompts, a
+fresh prompt's decode hits VRAM 56-63 % of the time at 37 % residency, a cold
+start 38 %, and a heat file from the *same* prompt 89-91 % -- the heat
+warmstart is an oracle for a repeated prompt and a stranger's guess for a new
+one.
+
+The prefill knows better. Its routing is this prompt's routing: offline, a
+static per-layer set of B experts chosen from the prompt's own prefill counts
+covers its decode routing far better than the heat file at the same budget
+(held-out prompts, four topics):
+
+| B per layer (of 256) | heat from other prompts | own prefill counts | oracle (own decode) |
+|---|---|---|---|
+| 32 | 0.217 | **0.421** | 0.566 |
+| 64 | 0.423 | **0.613** | 0.777 |
+| 96 (~the 8 GB card's share) | 0.593 | **0.741** | 0.890 |
+| 128 | 0.725 | **0.825** | 0.952 |
+
+`QT_PREFILL_REPLAN=1` spends that: after each prefill layer's routing the
+engine hands the tier the layer's counts over the prompt rows, and the tier
+swaps residents the prompt never routed to for the prompt's most-routed
+non-residents of that layer -- budget-neutral, through the same victim-first
+swap the LFRU tick uses, in strict count order and only while the newcomer's
+count beats the victim's. The swaps of layer L upload while layers L+1.. still
+compute; whatever the upload queue does not take at once is drained on the
+next layers and, a few per token, on the decode ticks (each swap is a
+`cudaFree` + `cudaMalloc`, which synchronise the device under the async
+groups, so the decode drains slowly on purpose). `QT_PREFILL_REPLAN_MAX`
+caps the swaps per layer (default 256). Placement never changes routing:
+the tokens are the ones the CPU path produces.
+
+Two costs come with an eviction and are handled here rather than paid in the
+miss path: the tier reports evicted experts (`qt_evicted_take`) and the engine
+rebuilds their RAM int8 copies at the next step, in parallel, before the
+layers run -- on the int4 container the warmstart had freed them, and left to
+the miss path 2,000 victims cost ~7 ms/token over the following 300 tokens.
+The `[qtier]` footer also reports the hit rate counted from the first decode
+token (`decode VRAM hit rate`), which is the number that moves.
+
+Measured on the 3070 alone (per-row int4 35B, 200-250-token prompts, 300
+decoded tokens, four held-out prompts, heat file from six other prompts,
+`QT_PREFILL_REPLAN_MAX=24` = 960 swaps per prompt, 12 cores `OMP_PLACES=cores`).
+`off -> on`, decode-only figures from `COLI_TIMERS=1`:
+
+| prompt | trunk | decode VRAM hit rate | MoE ms/token | total ms/token | TTFT |
+|---|---|---|---|---|---|
+| chat | CPU (`COLI_PLACE=off`) | 54.8 -> **72.8 %** | 18.8 -> 15.2 | 67.7 -> 68.5 | 3.9 -> 5.0 s |
+| code | CPU | 59.9 -> **75.1 %** | 18.0 -> 14.5 | 69.5 -> 66.8 | 5.1 -> 5.4 s |
+| Chinese | CPU | 62.7 -> **74.8 %** | 16.8 -> 14.6 | 68.8 -> 65.8 | 4.0 -> 5.0 s |
+| reasoning | CPU | 63.1 -> **75.3 %** | 17.4 -> 15.9 | 70.4 -> 71.6 | 4.4 -> 5.5 s |
+| chat | VRAM (all five components) | 41.8 -> **61.7 %** | 22.9 -> 18.7 | 49.2 -> **45.2** | 6.4 -> 6.6 s |
+| code | VRAM | 45.1 -> **64.8 %** | 22.3 -> 17.5 | 49.0 -> **44.1** | 8.1 -> 8.2 s |
+| Chinese | VRAM | 49.6 -> **60.3 %** | 20.4 -> 20.4 | 46.3 -> 47.8 | 6.2 -> 7.0 s |
+| reasoning | VRAM | 44.5 -> **66.7 %** | 22.4 -> 17.6 | 48.7 -> **44.4** | 7.0 -> 7.5 s |
+
+The hit rate moves as the offline table predicted (+12 to +22 points), the
+MoE phase loses 2 to 5 ms/token, and with the trunk in VRAM that is 8-10 % of
+the token on three prompts of four (the fourth is inside the run-to-run noise
+of about ±2 ms). With the trunk on the CPU the same MoE saving disappears in
+the 50 ms the dense trunk costs there. The price is at the front: the swaps
+upload during the prefill, and each one is six synchronous host-to-device
+copies (three matrices, three scale vectors), about 1 ms on this box, so 960
+swaps add 0.1-1.1 s to the TTFT of a 200-token prompt; the decode saving pays
+that back after 100-250 tokens. Fewer swaps buy most of the gain -- offline at
+B = 96, a cap of 12 per layer (480 swaps) reaches 0.709 of the 0.741 the
+uncapped plan reaches, 24 per layer reaches 0.741 -- which is why the default
+cap is 24. The follow-up that would take the TTFT price away is a pinned,
+asynchronous staging path (or one contiguous device block per expert) so the
+copies stop serialising with the prefill's expert groups; the swap itself
+already writes into the victim's buffers (`coli_cuda_tensor_overwrite`, no
+`cudaFree`/`cudaMalloc`; a backend without the entry point falls back to
+free-then-upload).
+
 ## Measured (Threadripper 3945WX 12C, RTX 3070 8 GB + Quadro RTX 4000 8 GB, Qwen3.6-35B-A3B int4, 200-token decode)
 
 | | 1 GPU (8 GB) | 2 GPUs (16 GB) |
