@@ -220,6 +220,105 @@ class ResourcePlanTest(unittest.TestCase):
         for key in ("DRAFT", "PIPE", "COLI_CUDA_PIPE", "COLI_NUMA", "PIN_GB"):
             self.assertNotIn(key, env)
 
+    def _kimi_model(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        model = Path(other.name)
+        (model / "config.json").write_text(json.dumps({
+            "model_type": "kimi_k3",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "q_lora_rank": 8,
+            "kv_lora_rank": 8,
+            "qk_nope_head_dim": 8,
+            "qk_rope_head_dim": 4,
+            "v_head_dim": 8,
+            "num_experts": 2,
+            "linear_attn_config": {
+                "num_heads": 2,
+                "head_dim": 8,
+                "kda_layers": [1],
+            },
+        }))
+        write_shard(model / "model.safetensors", [
+            ("model.embed_tokens.weight", 100),
+            ("model.layers.0.block_sparse_moe.experts.0.w1.weight", 80),
+            ("model.layers.0.block_sparse_moe.experts.1.w1.weight", 80),
+            ("model.layers.1.block_sparse_moe.experts.0.w1.weight", 80),
+            ("model.layers.1.block_sparse_moe.experts.1.w1.weight", 80),
+        ])
+        return model
+
+    def _glm53_model(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        model = Path(other.name)
+        (model / "config.json").write_text(json.dumps({
+            "model_type": "glm5_next",
+            "text_config": {
+                "num_hidden_layers": 2,
+                "n_routed_experts": 2,
+                "hidden_size": 32,
+                "num_attention_heads": 4,
+                "q_lora_rank": 8,
+                "kv_lora_rank": 8,
+                "qk_nope_head_dim": 8,
+                "v_head_dim": 8,
+                "index_head_dim": 8,
+                "hc_mult": 2,
+                "layer_types": ["linear", "full"],
+                "linear_attn_config": {
+                    "num_heads": 2,
+                    "head_dim": 8,
+                    "short_conv_kernel_size": 2,
+                },
+            },
+        }))
+        write_shard(model / "model.safetensors", [
+            ("model.language_model.embed_tokens.weight", 100),
+            ("model.language_model.layers.1.mlp.experts.0.gate_proj.weight", 80),
+            ("model.language_model.layers.1.mlp.experts.1.gate_proj.weight", 80),
+        ])
+        return model
+
+    def test_kimi_plan_exports_the_expert_cache_knob_the_engine_reads(self):
+        """Kimi K3 sizes the expert LRU from K3_EXPERT_GB (default 8 GB).
+        RAM_GB is only a ceiling, and main() never takes argv as a cap, so
+        --auto-tier that set RAM_GB and COLI_PLAN_CAP left the 8 GB default
+        in place on a machine whose plan had hundreds of GB of warm experts."""
+        plan = build_plan(self._kimi_model(), context=32, available_memory=32 * GB,
+                          available_disk=1, gpus=[], cpu_sockets=1)
+        cache = plan["tiers"]["ram"]["expert_cache_bytes"]
+        self.assertGreater(cache, 0)
+        expected = f"{cache / GB:.3f}"
+        self.assertIn("K3_EXPERT_GB", plan["tune"])
+        self.assertEqual(plan["tune"]["K3_EXPERT_GB"]["value"], expected)
+        self.assertNotIn("GLM53_EXPERT_GB", plan["tune"])
+        self.assertIn("K3_EXPERT_GB=", format_plan(plan))
+        env = environment_for_plan(plan, {})
+        self.assertIn("K3_EXPERT_GB", env)
+        self.assertEqual(env["K3_EXPERT_GB"], expected)
+        kept = environment_for_plan(plan, {"K3_EXPERT_GB": "3.5"})
+        self.assertEqual(kept["K3_EXPERT_GB"], "3.5")
+
+    def test_glm53_plan_exports_the_expert_cache_knob_the_engine_reads(self):
+        """glm53.c reads GLM53_EXPERT_GB, not RAM_GB. --auto-tier exported
+        RAM_GB (inert) and relied on COLI_PLAN_CAP as argv, which a direct
+        engine launch never sees."""
+        plan = build_plan(self._glm53_model(), context=32, available_memory=32 * GB,
+                          available_disk=1, gpus=[], cpu_sockets=1)
+        cache = plan["tiers"]["ram"]["expert_cache_bytes"]
+        self.assertGreater(cache, 0)
+        expected = f"{cache / GB:.3f}"
+        self.assertIn("GLM53_EXPERT_GB", plan["tune"])
+        self.assertEqual(plan["tune"]["GLM53_EXPERT_GB"]["value"], expected)
+        self.assertNotIn("K3_EXPERT_GB", plan["tune"])
+        env = environment_for_plan(plan, {})
+        self.assertIn("GLM53_EXPERT_GB", env)
+        self.assertEqual(env["GLM53_EXPERT_GB"], expected)
+        self.assertNotIn("K3_EXPERT_GB", env)
+
     def test_cpu_socket_count_is_positive(self):
         self.assertGreaterEqual(cpu_socket_count(), 1)
 

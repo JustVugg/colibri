@@ -175,6 +175,14 @@ static void test_bad_frame_stops_before_the_next_command(void)
     fclose(output);
 }
 
+static void test_max_tokens_is_a_ceiling(void)
+{
+    assert(coli_serve_budget(2, 1024, 4096, 0) == 1024);
+    assert(coli_serve_budget(3500, 1024, 4096, 0) == 596);
+    assert(coli_serve_budget(4096, 1, 4096, 0) == -1);
+    assert(coli_serve_budget(4096, 0, 4096, 1) == 0);
+}
+
 int main(void)
 {
     test_submit_moves_exact_payload_into_queue();
@@ -182,6 +190,7 @@ int main(void)
     test_errors_are_byte_exact_and_frames_are_consumed();
     test_invalid_submit_does_not_parse_its_payload_as_control();
     test_bad_frame_stops_before_the_next_command();
+    test_max_tokens_is_a_ceiling();
     puts("olmoe serve framing baseline: ok");
     return 0;
 }

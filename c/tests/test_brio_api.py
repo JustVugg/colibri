@@ -96,9 +96,42 @@ class BrioApi(unittest.TestCase):
         self.assertEqual(out["answer"], "request changes")
         self.assertEqual(out["usage"]["completion_tokens"], 0)
         self.assertTrue(all(c["max_tokens"] == 0 for c in self.engine.calls))
-        # one photograph, of the whole prefix; the options are never pinned
-        self.assertEqual(len(self.pins()), 1)
-        self.assertTrue(self.pins()[0].endswith("Answer:"))
+        # Two photographs and no more: the shared state on its own, then the
+        # whole prefix. The options are never pinned. The state photograph is
+        # the return point that lets a later question on the same document
+        # reuse the snapshot instead of re-reading it (asserted below).
+        pins = self.pins()
+        self.assertEqual(len(pins), 2, pins)
+        self.assertEqual(pins[0], f"Context:\n{STATE}\n\n")
+        self.assertTrue(pins[1].startswith(pins[0]))
+        self.assertTrue(pins[1].endswith("Answer:"))
+
+    def test_options_form_pins_the_shared_state_for_reuse_across_requests(self):
+        # The web asks one question per request on the same document. The state
+        # must be photographed on its own each time, so the engine has a strict
+        # prefix to restore and every question after the first pays only its own
+        # tokens instead of re-reading the whole document -- the "read once" the
+        # mode exists for. A handler that folded the state into the question
+        # prefix only would still answer correctly while re-reading it, so the
+        # pins are asserted, not just the answers.
+        self.serve({"merge": -3.0, "request changes": -0.2, "close": -4.0,
+                    "yes": -0.1, "no": -2.0})
+        self.post({"model": "test-model", "state": STATE,
+                   "question": "What should the reviewer do?",
+                   "options": ["merge", "request changes", "close"]})
+        self.assertEqual([p for p in self.pins() if p == f"Context:\n{STATE}\n\n"],
+                         [f"Context:\n{STATE}\n\n"])
+        self.post({"model": "test-model", "state": STATE,
+                   "question": "Does it need tests?", "options": ["yes", "no"]})
+        # both requests photographed the same shared state prefix: the return
+        # point exists for the second question, not only the first
+        state_pins = [p for p in self.pins() if p == f"Context:\n{STATE}\n\n"]
+        self.assertEqual(len(state_pins), 2, self.pins())
+        # and every question prefix extends that shared state
+        question_pins = [p for p in self.pins() if p.endswith("Answer:")]
+        self.assertEqual(len(question_pins), 2, self.pins())
+        for pin in question_pins:
+            self.assertTrue(pin.startswith(f"Context:\n{STATE}\n\n"))
 
     # ---- questions: many on one state ----------------------------------------
     def test_questions_share_one_state_photograph(self):
@@ -113,7 +146,7 @@ class BrioApi(unittest.TestCase):
         self.assertEqual(out["object"], "brio.answers")
         self.assertEqual([a["answer"] for a in out["answers"]],
                          ["request changes", "yes", "high"])
-        self.assertEqual([a["normalize"] for a in out["answers"]], ["mean", "mean", "sum"])
+        self.assertEqual([a["normalize"] for a in out["answers"]], ["sum", "sum", "sum"])
         for answer in out["answers"]:
             self.assertAlmostEqual(sum(c["p"] for c in answer["choices"]), 1.0, places=6)
             self.assertGreaterEqual(answer["entropy"], 0.0)
@@ -130,6 +163,38 @@ class BrioApi(unittest.TestCase):
         self.assertEqual(out["usage"]["completion_tokens"], 0)
         self.assertEqual(out["usage"]["read_tokens"],
                          sum(c["tokens"] for a in out["answers"] for c in a["choices"]))
+
+    def test_default_normalize_is_sum(self):
+        # The default was "mean", whose per-token averages silently favor
+        # multi-token options on any menu that mixes token counts; "sum" is
+        # the joint log-probability and the only safe default.
+        self.serve({"merge": -3.0, "close": -4.0})
+        out = self.post({"model": "test-model", "state": STATE,
+                         "question": "What should the reviewer do?",
+                         "options": ["merge", "close"]})
+        self.assertEqual(out["normalize"], "sum")
+
+    def test_mean_with_unequal_option_token_counts_warns(self):
+        import contextlib
+        import io
+        self.serve({"merge": -3.0, "request changes": -0.2})
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.post({"model": "test-model", "state": STATE,
+                       "question": "What should the reviewer do?",
+                       "options": ["merge", "request changes"],
+                       "normalize": "mean"})
+        self.assertIn("unequal option token counts", stderr.getvalue())
+        self.assertIn("merge=1", stderr.getvalue())
+        # Equal token counts stay quiet — mean is valid there. (The [api]
+        # request log also lands on stderr; only the bias warning matters.)
+        self.serve({"yes": -0.1, "no": -2.0})
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.post({"model": "test-model", "state": STATE,
+                       "question": "Ship it?", "options": ["yes", "no"],
+                       "normalize": "mean"})
+        self.assertNotIn("unequal option token counts", stderr.getvalue())
 
     # ---- schema: a JSON object filled one cell at a time --------------------
     def test_schema_fills_cells_in_order_and_each_cell_sees_the_ones_before(self):

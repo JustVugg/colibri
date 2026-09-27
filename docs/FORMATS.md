@@ -42,9 +42,9 @@ own verification anchor in its sources bullet): the
 stamp+registry series (#529) stacked directly on the fp8-passthrough series
 (#528), which is in turn based on dev `292ed4c` (post-#465, post-#457
 Metal grouped-GEMV merge, post-#705 Vulkan/Kimi-K3 MXFP4 merge) — no
-cross-tree line-number mixing. Every `c/colibri.c`/`c/quant.h` line number
-in this document reflects that restack; re-verify them again if this branch
-is rebased further. The fmt=6 and fmt=7 rows are upstream's own merged code
+cross-tree mixing. Every `c/colibri.c`/`c/quant.h` symbol named in this
+document is verified present at this branch's own head. The fmt=6 and
+fmt=7 rows are upstream's own merged code
 (this branch's only fmt=6-adjacent change is the collision handling inside
 `qt_resolve_fmt`, `c/colibri.c`; it does not touch fmt=7/MXFP4 at all).
 
@@ -94,39 +94,40 @@ fused path) — AND the other fused-bound tensors (`q_a`, `q_b`, `kv_a`, `o`,
 and on sparse layers `sh_gate`/`sh_up`/`sh_down`) sit on the fmt 1/2/3/4
 allowlist; any other format on any of those tensors makes the affected layers'
 decode take the CPU path instead, announced by a one-line-per-tensor-kind
-`[METAL]` stderr notice at load. Single source of truth (all anchors
-`c/colibri.c` at branch head `kvb/fmt-gate-notice-r4`): the shared per-layer
-predicate `metal_fused_layer_fmt_miss` (:3396, over the `metal_fused_fmt_ok`
-allowlist, :3379), consulted by both gate sites — `attention_rows` (:3448) and
-`layer_forward_rows` (:5792) — and by the load-time notice
-`metal_fmt_gate_notice` (:1866, called from `model_init`).
+`[METAL]` stderr notice at load. Single source of truth in `c/colibri.c`: the
+shared per-layer predicate `metal_fused_layer_fmt_miss`, over the
+`metal_fused_fmt_ok` allowlist, consulted by both gate sites —
+`attention_rows` and `layer_forward_rows` — and by the load-time notice
+`metal_fmt_gate_notice`, called from `model_init`.
 
-Sources for all rows (`c/quant.h`/`c/colibri.c` line numbers at this PR
-pair's current restack, base dev `292ed4c`):
+Sources for all rows (`c/quant.h`/`c/colibri.c` symbols named below,
+verified present at this branch's own head -- originally identified
+against base dev `292ed4c`, reconfirmed here against the current
+restack):
 
-- **fmt=0/1/2/3** — allocation policy: `qt_alloc`, `c/colibri.c:1105`
+- **fmt=0/1/2/3** — allocation policy: `qt_alloc`, `c/colibri.c`
   (`bits>=16→fmt=0`, `bits>=5→fmt=1`, `bits>=4→fmt=2`, else `fmt=3`).
-  Kernels: `matmul_q` (`quant.h:105`, fmt=1), `matmul_i4` (`quant.h:125`,
-  fmt=2), `matmul_i2` (`quant.h:251`, fmt=3); pack/quantize helpers
-  `quantize_rows` (`quant.h:928`, fmt=1) and `pack_int2` (`quant.h:980`,
-  fmt=3). Byte-count formulas: `qt_bytes`, `c/colibri.c:183`.
-- **fmt=4** (`int4-grouped`) — kernel `matmul_i4_grouped`, `quant.h:168`;
+  Kernels: `matmul_q` (`quant.h`, fmt=1), `matmul_i4` (`quant.h`,
+  fmt=2), `matmul_i2` (`quant.h`, fmt=3); pack/quantize helpers
+  `quantize_rows` (`quant.h`, fmt=1) and `pack_int2` (`quant.h`,
+  fmt=3). Byte-count formulas: `qt_bytes`, `c/colibri.c`.
+- **fmt=4** (`int4-grouped`) — kernel `matmul_i4_grouped`, `quant.h`;
   group size `gs` is per-tensor, not fixed at 64 (contrast fmt=5). Byte-count:
-  `qt_bytes`'s `fmt==4` branch (inside `c/colibri.c:183`); scale-count split:
-  `qt_scale_bytes`, `c/colibri.c:263`.
+  `qt_bytes`'s `fmt==4` branch (inside `c/colibri.c`); scale-count split:
+  `qt_scale_bytes`, `c/colibri.c`.
 - **fmt=5** (`int3-g64`) — group size is fixed (`I3_GROUP=64`,
-  `quant.h:293`; `I3_GBYTES=24`, `quant.h:294`); helpers `i3_groups`
-  (`quant.h:295`), `i3_rowbytes` (`quant.h:296`); kernel `matmul_i3`
-  (`quant.h:354`); pack helper `pack_int3_g64` (`quant.h:956`). Allocation:
-  `qt_alloc`'s `bits==3` branch (inside `c/colibri.c:1105`).
+  `quant.h`; `I3_GBYTES=24`, `quant.h`); helpers `i3_groups`
+  (`quant.h`), `i3_rowbytes` (`quant.h`); kernel `matmul_i3`
+  (`quant.h`); pack helper `pack_int3_g64` (`quant.h`). Allocation:
+  `qt_alloc`'s `bits==3` branch (inside `c/colibri.c`).
 - **fmt=6** (`e8-iq3-lattice`) — upstream's merged code: format section header
-  precedes `quant.h:1008`; constants `E8_QK=256` (`quant.h:1008`),
-  `E8_SUB=32` (`quant.h:1009`), `E8_BBYTES=98` (`quant.h:1010`); row-byte
-  helpers `e8_blocks`/`e8_rowbytes` (`quant.h:1011-1012`); rotation contract
-  documented at `quant.h:1305` ("fmt=6 stores W@Q, so activations must be
+  precedes `quant.h`; constants `E8_QK=256` (`quant.h`),
+  `E8_SUB=32` (`quant.h`), `E8_BBYTES=98` (`quant.h`); row-byte
+  helpers `e8_blocks`/`e8_rowbytes` (`quant.h`); rotation contract
+  documented at `quant.h` ("fmt=6 stores W@Q, so activations must be
   transformed before"). Loader discriminator, upstream form (dev, ns==4 tag
   check at the top of `qt_resolve_fmt`): this branch's SECOND DESIGN
-  LANDMINE comment (`qt_resolve_fmt`, `c/colibri.c:1356`) hardens that check
+  LANDMINE comment (`qt_resolve_fmt`, `c/colibri.c`) hardens that check
   against the degenerate collisions below without changing any genuine-fmt=6
   outcome.
 - **fmt=7** (`mxfp4`, upstream's merged code) — Vulkan-only decode: shader
@@ -139,27 +140,27 @@ pair's current restack, base dev `292ed4c`):
   CPU (`quant.h`) or Metal kernel exists for it, and `qt_resolve_fmt` has
   no byte-arithmetic branch that returns 7.
 - **fmt=8** (`fp8-e4m3-b128`, this branch) — decode table `E4M3_LUT`
-  (`quant.h:446`) / `e4m3_decode` (`quant.h:480`), block size
-  `FP8_BLOCK=128` (`quant.h:482`), kernel `matmul_fp8` (`quant.h:491`).
+  (`quant.h`) / `e4m3_decode` (`quant.h`), block size
+  `FP8_BLOCK=128` (`fp8_format.h`), kernel `matmul_fp8` (`quant.h`).
   Disambiguation from fmt=1 ("THE DESIGN LANDMINE" — the two formats'
   weight bytes are byte-identical and can only be told apart by
   scale-array geometry, which is ambiguous for some small shapes) and the
   fmt=6 collision ("SECOND DESIGN LANDMINE") both live in `qt_resolve_fmt`
-  (`c/colibri.c:1356`), which now also consults an optional `stamped_name`
+  (`c/colibri.c`), which now also consults an optional `stamped_name`
   parameter (this PR): for the fmt=6 collision, a stamp resolves what an
   absent stamp still refuses; for the fmt=1-vs-fmt=8 collision, an absent
   stamp already resolves to `int8-row` since the #528 INVERSION, and a
   stamp's role there is instead letting a genuinely-stamped `fmt=8` tensor
   override that default — see "The metadata stamp" below for the exact
   rule in both cases. FMT_NAMES table (`name string` to `fmt int`):
-  `c/colibri.c:1316`.
-- **no ordinal** (`int4-rans256-g0`, merged tools-only tier — line numbers
-  at dev `7fb1159`, post-#671 merge `a3a5a75`, not at this PR pair's
-  restack base) — codec + record reader/writer: `c/rans.h`
-  (`RANS_NSTREAMS 256`, `c/rans.h:93`; the record layout in the file-header
-  comment, `c/rans.h:17-34`; that same header names its engine consumer
-  "a future engine decode stage", `c/rans.h:4` — the format's own statement
-  that none exists yet). Identity constants: `c/tools/rans_format.py:40-46`
+  `c/colibri.c`.
+- **no ordinal** (`int4-rans256-g0`, merged tools-only tier — symbols
+  verified at dev `7fb1159`, post-#671 merge `a3a5a75`, not at this PR
+  pair's restack base) — codec + record reader/writer: `c/rans.h`
+  (`RANS_NSTREAMS 256`, `c/rans.h`; the record layout in the file-header
+  comment, `c/rans.h`; that same header names its engine consumer
+  "a future engine decode stage", `c/rans.h` — the format's own statement
+  that none exists yet). Identity constants: `c/tools/rans_format.py`
   (`FORMAT_NAME = "int4-rans256-g0"`; `METADATA_KEY = "colibri.fmt"` — the
   same key/shape as the fmt=8 stamp convention below, but MANDATORY here
   rather than a cross-check, because there is no byte arithmetic to fall
@@ -169,15 +170,15 @@ pair's current restack, base dev `292ed4c`):
   named refusal classes in its module docstring). Full specification:
   `docs/int4-rans256-g0.md`. Engine-interaction status, stated precisely
   (why the ordinal column is empty, and what still runs): `qt_resolve_fmt`
-  (`c/colibri.c:1374`) has no branch that returns this format, and
+  (`c/colibri.c`) has no branch that returns this format, and
   `c/colibri.c`/`c/quant.h`/`c/st.h` contain no reference to it — no
   decode path, hence no ordinal. But a repacked shard is not invisible to
-  the engine: `st_fmt_stamp_ingest` (`c/st.h:317`, called from
+  the engine: `st_fmt_stamp_ingest` (`c/st.h`, called from
   `st_init_multi`'s discovery loop) parses its mandatory `colibri.fmt`
   stamp map at container-discovery time, and the three routed-expert load
   sites — exactly this format's target population — resolve formats by
-  byte arithmetic alone with `stamped_name=NULL` (`c/colibri.c:2217`,
-  `c/colibri.c:2386`, `c/colibri.c:2580`, each marked
+  byte arithmetic alone with `stamped_name=NULL` (`c/colibri.c`,
+  `c/colibri.c`, `c/colibri.c`, each marked
   `/* routed expert: never stamped */`), so the stamp is never consulted
   where it would matter most. A future consumer must wire stamp-gated
   dispatch AHEAD of that inference — `docs/int4-rans256-g0.md`'s

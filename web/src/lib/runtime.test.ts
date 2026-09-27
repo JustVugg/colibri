@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import type { HealthResponse } from "./api"
-import { activeRequests, supportsCacheSlots } from "./runtime"
+import { activeRequests, supportsCacheSlots, supportsContinuation } from "./runtime"
 
 const healthWithActive = (active: boolean | number): HealthResponse => ({
   status: "ok",
@@ -37,5 +37,12 @@ describe("runtime capability normalization", () => {
     expect(supportsCacheSlots({ status: "ok", kv_slots: 4 })).toBe(true)
     expect(supportsCacheSlots({ status: "ok" })).toBe(false)
     expect(supportsCacheSlots(null)).toBe(false)
+  })
+
+  it("only offers Continue when the server says it continues a trailing assistant turn", () => {
+    expect(supportsContinuation({ status: "ok", continue_assistant: true })).toBe(true)
+    expect(supportsContinuation({ status: "ok", continue_assistant: false })).toBe(false)
+    expect(supportsContinuation({ status: "ok" })).toBe(false)
+    expect(supportsContinuation(null)).toBe(false)
   })
 })

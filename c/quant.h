@@ -15,6 +15,11 @@
 #endif
 
 #include "idot.h"   /* SIMD prelude + the integer dot kernels, shared with qwen36 */
+
+#if defined(__SSE4_1__)
+#include "sse41_kernels.h"
+#endif
+
 /* ---- AVX-512 int4->float accumulator -------------------------------------- */
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 static int g_i4_acc512=1;
@@ -140,8 +145,17 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){
     int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+    int o0=0;
+#if defined(__SSE4_1__) && !defined(__AVX2__)
+    /* Even group sizes keep every group start on a low-nibble boundary. */
+    if(!(gs&1)){
+        o0=O&~3;
+        if(o0) matmul_i4_grouped_sse41_rows4(y,x,q4,scale,S,I,O,gs,rb,ng,o0);
+        if(o0==O) return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){
+    for(int o=o0;o<O;o++){
         const uint8_t *w=q4+(int64_t)o*rb;
         const float *scl=scale+(int64_t)o*ng;
         for(int s=0;s<S;s++){
@@ -518,8 +532,10 @@ static inline __m256 bf16_decode8(const uint16_t *p) {
 }
 #endif
 
-#define FP8_BLOCK 128
-static inline int64_t fp8_nblk(int n){ return ((int64_t)n + FP8_BLOCK - 1) / FP8_BLOCK; }
+/* FP8_BLOCK / fp8_nblk moved to fp8_format.h so the CUDA backend shares the
+ * same named constant instead of restating 128 as literals (see that header's
+ * comment for the drift hazard this closes). */
+#include "fp8_format.h"
 
 /* y[S,O] = x[S,I] @ W^T, W raw e4m3 bytes (byte-identical layout to fmt=1) +
  * per-128x128-BLOCK f32 scale [ceil(O/128),ceil(I/128)]. Scalar reference path

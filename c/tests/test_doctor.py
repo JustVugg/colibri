@@ -242,6 +242,22 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(self._win_linkage(engine),
                          {"linked": False, "missing": False})
 
+    def test_windows_kimi_cuda_host_without_glm_banner(self):
+        """Kimi K3 CUDA_DLL=1 never prints [CUDA] mode: routed experts.
+        The loader still compiles coli_cuda.dll into the host, and that is
+        the artifact doctor must require -- the same pair cuda_binary uses."""
+        engine = self.root / "kimi_k3.exe"
+        engine.write_bytes(b"MZ [K3-CUDA] MXFP4 routed experts coli_cuda.dll")
+        (self.root / "coli_cuda.dll").write_bytes(b"")
+        self.assertEqual(self._win_linkage(engine),
+                         {"linked": True, "missing": False})
+
+    def test_windows_kimi_cuda_host_missing_dll_is_missing(self):
+        engine = self.root / "kimi_k3.exe"
+        engine.write_bytes(b"MZ [K3-CUDA] MXFP4 routed experts coli_cuda.dll")
+        self.assertEqual(self._win_linkage(engine),
+                         {"linked": False, "missing": True})
+
     def test_hip_host_with_its_backend_reports_gpu_available(self):
         # End-to-end: the same host that previously reported a hard error
         # ("GPU runtime library is missing") now passes, with #903's

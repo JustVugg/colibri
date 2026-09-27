@@ -61,7 +61,7 @@ def main() -> int:
         # le due cose. Il generatore vuole transformers 5.16.1.
         print(f"SKIP: manca {arguments.quantized}; generalo con\n"
               f"  python3 tools/make_glm53_streaming_pair.py --fixture <mm> --output <dir>")
-        return 0
+        return 2  # un salto non e' un successo
 
     reference = json.loads((arguments.quantized / "ref.json").read_text())
     grid_h, grid_w = reference.get("grid", (0, 0))

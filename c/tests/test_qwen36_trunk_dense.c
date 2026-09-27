@@ -50,10 +50,10 @@ static float *rnd_matrix(int rows, int cols) {
  * matmul_d. The fake backend computes exactly what a real one does with these
  * bytes (x . int8 row, times the row scale), so the two must agree to float
  * accumulation order. */
-static double gemv_gap(int hp1, const float *W, int I, int O, int *served) {
+static double gemv_gap(int hp1, const QW *w, int I, int O, int *served) {
     float *x = rnd_matrix(1, I), *ya = calloc((size_t)O, sizeof(float)), *yb = calloc((size_t)O, sizeof(float));
     *served = qtd(hp1, ya, x, I, O);
-    matmul_d(yb, x, W, 1, I, O);
+    matmul_d(yb, x, w, 1, I, O);
     double worst = 0, scale = 1e-6;
     for (int o = 0; o < O; o++) {
         double d = fabs((double)ya[o] - yb[o]);
@@ -62,6 +62,15 @@ static double gemv_gap(int hp1, const float *W, int I, int O, int *served) {
     }
     free(x); free(ya); free(yb);
     return worst / scale;
+}
+
+/* Quantize a freshly-built random matrix straight into *out (the QW the
+ * Layer holds), then discard the f32 staging buffer -- the same "quantize
+ * once, free the f32 copy" shape load_tq uses. */
+static void register_qw(int rows, int cols, QW *out) {
+    float *w = rnd_matrix(rows, cols);
+    qw_quantize(w, cols, rows, NULL, out);
+    free(w);
 }
 
 static void build(Model *m) {
@@ -73,20 +82,20 @@ static void build(Model *m) {
     c->is_attn = calloc(NL, 1); c->is_attn[1] = 1;
     m->L = calloc(NL, sizeof(Layer));
     Layer *dn = &m->L[0], *at = &m->L[1];
-    dn->dn_out = rnd_matrix(D, VH * VD);          qdw_register(dn->dn_out, VH * VD, D);
-    dn->sh_g = rnd_matrix(SH, D);                 qdw_register(dn->sh_g, D, SH);
-    dn->sh_u = rnd_matrix(SH, D);                 qdw_register(dn->sh_u, D, SH);
-    dn->sh_d = rnd_matrix(D, SH);                 qdw_register(dn->sh_d, SH, D);
-    at->q = rnd_matrix(QH * QD, D);               qdw_register(at->q, D, QH * QD);
-    at->k = rnd_matrix(KVH * KD, D);              qdw_register(at->k, D, KVH * KD);
-    at->v = rnd_matrix(KVH * KD, D);              qdw_register(at->v, D, KVH * KD);
-    at->o = rnd_matrix(D, QH * KD);               qdw_register(at->o, QH * KD, D);
+    register_qw(D, VH * VD, &dn->dn_out);
+    register_qw(SH, D, &dn->sh_g);
+    register_qw(SH, D, &dn->sh_u);
+    register_qw(D, SH, &dn->sh_d);
+    register_qw(QH * QD, D, &at->q);
+    register_qw(KVH * KD, D, &at->k);
+    register_qw(KVH * KD, D, &at->v);
+    register_qw(D, QH * KD, &at->o);
     /* the attention layer's shared expert is INCOMPLETE on purpose: gate and
      * up have a dense-i8 copy, down does not (never registered), so "shexp"
      * for layer 1 must not be offered and its three handles must stay 0 */
-    at->sh_g = rnd_matrix(SH, D);                 qdw_register(at->sh_g, D, SH);
-    at->sh_u = rnd_matrix(SH, D);                 qdw_register(at->sh_u, D, SH);
-    at->sh_d = rnd_matrix(D, SH);                 /* no qdw_register */
+    register_qw(SH, D, &at->sh_g);
+    register_qw(SH, D, &at->sh_u);
+    /* at->sh_d: left zeroed (q == NULL) -- no dense-i8 copy, never registered */
 }
 
 int main(void) {
@@ -109,17 +118,17 @@ int main(void) {
     trunk_offer_dense(&m);
     /* dnout(layer 0) + attnproj(layer 1) + shexp(layer 0); NOT shexp(layer 1) */
     ck(G_offer_n - before == 3, "three components offered: dnout, attnproj, shexp of the complete layer only");
-    size_t want_attn = qdw_bytes(at->q) + qdw_bytes(at->k) + qdw_bytes(at->v) + qdw_bytes(at->o);
+    size_t want_attn = qdw_bytes(&at->q) + qdw_bytes(&at->k) + qdw_bytes(&at->v) + qdw_bytes(&at->o);
     int seen_attn = 0, seen_dnout = 0, seen_shexp1 = 0;
     for (int o = before; o < G_offer_n; o++) {
         if (!strcmp(G_offer[o].name, "attnproj") && G_offer[o].layer == 1 && G_offer[o].bytes == want_attn) seen_attn = 1;
-        if (!strcmp(G_offer[o].name, "dnout") && G_offer[o].layer == 0 && G_offer[o].bytes == qdw_bytes(dn->dn_out)) seen_dnout = 1;
+        if (!strcmp(G_offer[o].name, "dnout") && G_offer[o].layer == 0 && G_offer[o].bytes == qdw_bytes(&dn->dn_out)) seen_dnout = 1;
         if (!strcmp(G_offer[o].name, "shexp") && G_offer[o].layer == 1) seen_shexp1 = 1;
     }
     ck(seen_dnout, "dnout offered for the DeltaNet layer with the bytes of its dense-i8 copy");
     ck(seen_attn, "attnproj offered for the attention layer as the sum of q, k, v, o");
     ck(!seen_shexp1, "a shared expert missing one dense-i8 copy is not offered");
-    ck(qdw_bytes(at->sh_d) == 0, "a matrix without a dense-i8 copy reports zero bytes");
+    ck(qdw_bytes(&at->sh_d) == 0, "a matrix without a dense-i8 copy reports zero bytes");
 
     printf("placement\n");
     ck(qt_init(NL, NE, D, IH, NE, 1, 0, 1), "tier starts (int4 mode, cap == n_experts)");
@@ -129,7 +138,7 @@ int main(void) {
     double vram = 0;
     int placed = trunk_place_dense(&m, &vram);
     ck(placed == 8, "eight matrices placed: dnout, q k v o, and the complete shared expert");
-    ck(vram == (double)(qdw_bytes(dn->dn_out) + want_attn + qdw_bytes(dn->sh_g) + qdw_bytes(dn->sh_u) + qdw_bytes(dn->sh_d)),
+    ck(vram == (double)(qdw_bytes(&dn->dn_out) + want_attn + qdw_bytes(&dn->sh_g) + qdw_bytes(&dn->sh_u) + qdw_bytes(&dn->sh_d)),
        "placed bytes are the sum of the dense-i8 copies uploaded");
     ck(fake_uploads == 8, "one upload per placed matrix");
     ck(dn->qth_dnout > 0 && at->qth_q > 0 && at->qth_k > 0 && at->qth_v > 0 && at->qth_o > 0, "handles kept in the Layer");
@@ -137,11 +146,11 @@ int main(void) {
     ck(at->qth_shg == 0 && at->qth_shu == 0 && at->qth_shd == 0, "no handle for the shared expert that was not offered");
 
     printf("GEMV from VRAM == matmul_d on the CPU\n");
-    struct { const char *name; int hp1; const float *w; int I, O; } mats[] = {
-        {"dn_out", dn->qth_dnout, dn->dn_out, VH * VD, D},
-        {"q", at->qth_q, at->q, D, QH * QD}, {"k", at->qth_k, at->k, D, KVH * KD},
-        {"v", at->qth_v, at->v, D, KVH * KD}, {"o", at->qth_o, at->o, QH * KD, D},
-        {"sh_g", dn->qth_shg, dn->sh_g, D, SH}, {"sh_u", dn->qth_shu, dn->sh_u, D, SH}, {"sh_d", dn->qth_shd, dn->sh_d, SH, D},
+    struct { const char *name; int hp1; const QW *w; int I, O; } mats[] = {
+        {"dn_out", dn->qth_dnout, &dn->dn_out, VH * VD, D},
+        {"q", at->qth_q, &at->q, D, QH * QD}, {"k", at->qth_k, &at->k, D, KVH * KD},
+        {"v", at->qth_v, &at->v, D, KVH * KD}, {"o", at->qth_o, &at->o, QH * KD, D},
+        {"sh_g", dn->qth_shg, &dn->sh_g, D, SH}, {"sh_u", dn->qth_shu, &dn->sh_u, D, SH}, {"sh_d", dn->qth_shd, &dn->sh_d, SH, D},
     };
     for (size_t i = 0; i < sizeof mats / sizeof mats[0]; i++) {
         int served = 0;

@@ -1,0 +1,73 @@
+{
+  "schema": "colibri.serving-baseline/v1",
+  "experiment": "REPLACE-experiment-id",
+  "comparison": "deployment",
+  "residency": "fully_resident",
+  "workload": "workload.jsonl",
+  "hardware": {
+    "host": "REPLACE-host",
+    "cpu": "REPLACE-cpu",
+    "ram": "REPLACE-ram",
+    "gpu": "REPLACE-gpu",
+    "storage": "REPLACE-storage",
+    "os": "REPLACE-os",
+    "driver": "REPLACE-driver"
+  },
+  "model": {
+    "source_revision": "REPLACE-source_revision",
+    "tokenizer_sha256": "REPLACE-tokenizer_sha256",
+    "chat_template_sha256": "REPLACE-chat_template_sha256"
+  },
+  "cache_policy": "REPLACE-reset-before-round; warm-with-recorded-workload",
+  "reasoning_policy": "REPLACE-explicit-thinking-setting",
+  "speculation_policy": "REPLACE-disabled-for-initial-baseline",
+  "quality_protocol": "REPLACE-quality-dataset-revision-metric-and-acceptance-threshold",
+  "matrix": {
+    "concurrency": [
+      1,
+      4,
+      8,
+      16
+    ],
+    "rounds": 3,
+    "repeats": 8,
+    "warmup_requests": 2,
+    "max_tokens": 128,
+    "temperature": 0,
+    "timeout": 120,
+    "slo_first_output": 5,
+    "slo_duration": 120
+  },
+  "engines": {
+    "colibri": {
+      "base_url": "http://127.0.0.1:8000/v1",
+      "served_model": "REPLACE-model-alias",
+      "revision": "REPLACE-commit-or-image-digest",
+      "launch_command": "REPLACE-exact-command-with-secret-environment-references",
+      "artifact_sha256": "REPLACE-weight-manifest-sha256",
+      "weight_format": "REPLACE-format",
+      "quantization": "REPLACE-weight-and-KV-precision",
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    "sglang": {
+      "base_url": "http://127.0.0.1:8000/v1",
+      "served_model": "REPLACE-model-alias",
+      "revision": "REPLACE-commit-or-image-digest",
+      "launch_command": "REPLACE-exact-command-with-secret-environment-references",
+      "artifact_sha256": "REPLACE-weight-manifest-sha256",
+      "weight_format": "REPLACE-format",
+      "quantization": "REPLACE-weight-and-KV-precision",
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    "vllm": {
+      "base_url": "http://127.0.0.1:8000/v1",
+      "served_model": "REPLACE-model-alias",
+      "revision": "REPLACE-commit-or-image-digest",
+      "launch_command": "REPLACE-exact-command-with-secret-environment-references",
+      "artifact_sha256": "REPLACE-weight-manifest-sha256",
+      "weight_format": "REPLACE-format",
+      "quantization": "REPLACE-weight-and-KV-precision",
+      "api_key_env": "OPENAI_API_KEY"
+    }
+  }
+}

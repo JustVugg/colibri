@@ -154,6 +154,61 @@ int main(int argc, char **argv) {
             "tokenizer round-trip differs");
     free(probe_text); probe_text = NULL;
     free(probe_ids); probe_ids = NULL;
+
+    /* Qwen3.6 stores protocol markers outside model.vocab in tokenizer.json's
+     * added_tokens array. They must participate in both tokenization and
+     * detokenization just like ordinary vocabulary entries. */
+    if (!strcmp(family, "qwen36")) {
+        static const struct {
+            const char *text;
+            int32_t id;
+        } added_token_cases[] = {
+            {"<tool_call>", 248058},
+            {"</tool_call>", 248059},
+            {"<tool_response>", 248066},
+            {"</tool_response>", 248067},
+            {"<think>", 248068},
+            {"</think>", 248069},
+        };
+
+        for (size_t token = 0;
+             token < sizeof(added_token_cases) / sizeof(added_token_cases[0]);
+             token++) {
+            const char *expected = added_token_cases[token].text;
+            size_t expected_bytes = strlen(expected);
+            int32_t encoded = -1;
+            size_t encoded_count = 0;
+
+            REQUIRE(coli_edge_tokenize(edge, expected, expected_bytes,
+                                       &encoded, 1, &encoded_count,
+                                       error, sizeof(error)) == 0,
+                    "Qwen3.6 added token encode failed");
+            REQUIRE(encoded_count == 1 &&
+                    encoded == added_token_cases[token].id,
+                    "Qwen3.6 added token encoded to the wrong ID");
+
+            size_t decoded_bytes = 0;
+            REQUIRE(coli_edge_detokenize(edge, &encoded, 1,
+                                         NULL, 0, &decoded_bytes,
+                                         error, sizeof(error)) == 0,
+                    "Qwen3.6 added token decode sizing failed");
+            REQUIRE(decoded_bytes == expected_bytes,
+                    "Qwen3.6 added token decoded to the wrong size");
+
+            char decoded[64];
+            REQUIRE(decoded_bytes + 1u <= sizeof(decoded),
+                    "Qwen3.6 added token exceeds test buffer");
+            REQUIRE(coli_edge_detokenize(edge, &encoded, 1,
+                                         decoded, sizeof(decoded),
+                                         &decoded_bytes,
+                                         error, sizeof(error)) == 0,
+                    "Qwen3.6 added token decode failed");
+            REQUIRE(decoded_bytes == expected_bytes &&
+                    !memcmp(decoded, expected, expected_bytes),
+                    "Qwen3.6 added token round-trip differs");
+        }
+    }
+
     if (!strcmp(family, "qwen38")) {
         int32_t invalid_ids[] = {-1, (int32_t)edge_cap.vocab_size};
         for (size_t invalid = 0;

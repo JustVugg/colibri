@@ -111,6 +111,15 @@ typedef struct {
     int ready;                     /* 0 unknown, 1 resident, -1 incompatible */
 } Q38ExpertScaleCache;
 
+typedef enum {
+    Q38_EXPERT_BATCH_FALLBACK_NONE = 0,
+    Q38_EXPERT_BATCH_FALLBACK_DISABLED,
+    Q38_EXPERT_BATCH_FALLBACK_CACHE_CAPACITY,
+    Q38_EXPERT_BATCH_FALLBACK_SCALE_BANK,
+    Q38_EXPERT_BATCH_FALLBACK_DUPLICATE,
+    Q38_EXPERT_BATCH_FALLBACK_LAYOUT,
+} Q38ExpertBatchFallback;
+
 typedef struct {
     Cfg c;
     shards S;
@@ -140,6 +149,7 @@ typedef struct {
     int ple_history_len;
     int range_begin, range_end;
     int native_fp8, native_bf16, expert_prefetch, expert_parallel_reads;
+    Q38ExpertBatchFallback expert_batch_fallback;
     int prefill_batch;
     uint64_t resident_weight_bytes;
     int trunk_table_built;         /* q38_trunk_offer_all ran for this load (the table is process-wide, the model is not) */
@@ -1383,12 +1393,43 @@ typedef struct {
  * residents are protected from victim selection, so no worker can overwrite a
  * slot another selected expert will consume.  Smaller caches and heterogeneous
  * layouts retain the serial LRU path. */
+/* Says once per model why the parallel read path is not taken, so a slow
+ * prefill on a small cache or a converted container is not a mystery. */
+static int q38_expert_batch_fallback(Model *m,Q38ExpertBatchFallback reason,
+                                     int layer,int first,int second) {
+    if(m->expert_batch_fallback!=Q38_EXPERT_BATCH_FALLBACK_NONE)return 0;
+    m->expert_batch_fallback=reason;
+    fprintf(stderr,"[qwen38 expert I/O] parallel reads unavailable: ");
+    switch(reason){
+    case Q38_EXPERT_BATCH_FALLBACK_DISABLED:
+        fprintf(stderr,"Q38_EXPERT_PARALLEL_READS=0");break;
+    case Q38_EXPERT_BATCH_FALLBACK_CACHE_CAPACITY:
+        fprintf(stderr,"cache holds %d experts/layer but the route needs %d; "
+                       "lower --ctx/Q38_MAXT or raise --ram",first,second);break;
+    case Q38_EXPERT_BATCH_FALLBACK_SCALE_BANK:
+        fprintf(stderr,"layer %d has no compatible resident FP8 scale bank",layer);break;
+    case Q38_EXPERT_BATCH_FALLBACK_DUPLICATE:
+        fprintf(stderr,"layer %d route repeats expert %d",layer,first);break;
+    case Q38_EXPERT_BATCH_FALLBACK_LAYOUT:
+        fprintf(stderr,"layer %d expert %d is not native block-FP8",layer,first);break;
+    default:
+        fprintf(stderr,"unknown reason");break;
+    }
+    fprintf(stderr,"; using serial expert reads\n");
+    return 0;
+}
+
 static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
                                 Slot **selected) {
-    if(!m->expert_parallel_reads||!experts||!selected||count<2||
-       count>m->cache[layer].cap)return 0;
+    if(!experts||!selected||count<2)return 0;
+    if(!m->expert_parallel_reads)
+        return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_DISABLED,layer,0,0);
     LCache *cache=&m->cache[layer];
-    if(!q38_prepare_expert_scale_bank(m,layer))return 0;
+    if(count>cache->cap)
+        return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_CACHE_CAPACITY,
+                                         layer,cache->cap,count);
+    if(!q38_prepare_expert_scale_bank(m,layer))
+        return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_SCALE_BANK,layer,0,0);
     /* The demand set is no longer bounded by the decode top-k: the MoE prefill
      * hands over the whole chunk union (up to the cache cap) so its loads run
      * one OMP wave instead of serial groups of Q38_MAX_TOPK.  Load grouping
@@ -1402,14 +1443,22 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
         if(expert<0||expert>=m->c.experts){free(jobs);return 0;}
         q38_ehit_mark(m,layer,expert);
         for(int previous=0;previous<index;previous++)
-            if(experts[previous]==expert){free(jobs);return 0;}
+            if(experts[previous]==expert){
+                free(jobs);
+                return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_DUPLICATE,
+                                                 layer,expert,0);
+            }
         int slot_index=cache->by_expert[expert];
         if(slot_index>=0){
             if(slot_index>=cache->n||cache->slots[slot_index].eid!=expert){free(jobs);return 0;}
             continue;
         }
         st_tensor *weight[3];
-        if(!q38_native_fp8_expert_tensors(m,layer,expert,weight)){free(jobs);return 0;}
+        if(!q38_native_fp8_expert_tensors(m,layer,expert,weight)){
+            free(jobs);
+            return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_LAYOUT,
+                                             layer,expert,0);
+        }
     }
     unsigned char *protected_slots=(unsigned char*)calloc((size_t)cache->cap,1);
     if(!protected_slots){fprintf(stderr,"OOM expert batch reservations\n");exit(1);}

@@ -2165,7 +2165,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
         else snprintf(spv, sizeof(spv), "%s/qmatmul.spv", given ? given : "shaders");
         g_vk_ready = coli_vk_init(spv) && coli_vk_available();
         if (g_vk_ready) coli_vk_set_swiglu_limit(m->c.swiglu_limit);
-        fprintf(stderr, g_vk_ready)
+        fprintf(stderr, g_vk_ready
                 ? "Vulkan: active for resident matrices\n"
                 : "Vulkan: no usable device (%s), falling back to CPU\n", spv);
     }
@@ -2904,7 +2904,14 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
     while (s >= 0) {
         ColiPin *k = &slot->pins.slot[s];
         Glm53PinState *st = (Glm53PinState *)k->state;
-        if (st && k->len <= slot->session->filled) {
+        /* Lo scatto porta lo stato KDA, non le righe DSA: quelle sono della
+         * sessione, e un ramo rimesso a una profondita' minore le puo' aver
+         * riscritte con altri token. Che gli id combacino con la RICHIESTA
+         * non basta; devono combaciare con la storia dello slot, che e' la
+         * sola descrizione di cosa le righe tengono davvero (come
+         * kv_prefix_holds per gli altri motori, #1650). */
+        if (st && k->len <= slot->session->filled && k->len <= slot->n &&
+            !memcmp(k->ids, slot->tokens, (size_t)k->len * sizeof(int))) {
             for (int i = 0; i < c->n_layers; i++) {
                 GLayerState *ls = &slot->session->layer[i];
                 if (c->is_full[i] || !ls->kda_state || !st->state[i]) continue;
@@ -2915,7 +2922,7 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
             coli_pin_touch(&slot->pins, s);
             return k->len;
         }
-        k->len = 0;              /* lo scatto pretende posizioni che non ci sono */
+        k->len = 0;   /* posizioni che non ci sono, o righe che non sono piu' sue */
         s = coli_pin_best(&slot->pins, tokens, n);
     }
     return 0;

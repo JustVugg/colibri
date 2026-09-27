@@ -143,7 +143,7 @@ Tool calling is complete. GLM-5.3 declares tools differently from GLM-5.2 (its
 own preamble, its own JSON serialisation, its own spacing inside `<tools>`) but
 emits calls identically, so the existing parser handles them unchanged. The
 whole rendering is pinned byte for byte against `chat_template.jinja`
-(`tests/test_glm53_chat_template.py`).
+(`tests/glm53_chat_template_harness.py`).
 
 ## Environment
 
@@ -157,18 +157,26 @@ measured from available memory when unset), `GLM53_MAX_IMAGE_TOKENS`,
 ```
 python3 tools/make_glm53_multimodal_tiny.py --output ~/glm53_mm_tiny
 python3 tools/make_glm53_streaming_pair.py --fixture ~/glm53_mm_tiny --output ~/glm53_stream
-python3 tests/test_glm53_multimodal_tiny.py --binary ./glm53 --fixture ~/glm53_mm_tiny
-python3 tests/test_glm53_streaming.py --binary ./glm53 \
+python3 tests/glm53_multimodal_tiny_harness.py --binary ./glm53 --fixture ~/glm53_mm_tiny
+python3 tests/glm53_streaming_harness.py --binary ./glm53 \
         --quantized ~/glm53_stream-i4 --dequantized ~/glm53_stream-deq
-python3 tests/test_glm53_serve.py        --binary ./glm53 --fixture ~/glm53_mm_tiny
-python3 tests/test_glm53_vision_serve.py --binary ./glm53 --fixture ~/glm53_mm_tiny
-python3 tests/test_glm53_chat_template.py --template <model>/chat_template.jinja
-make VK=1 glm53 && python3 tests/test_glm53_vulkan.py --binary ./glm53 --fixture ~/glm53_mm_tiny
+python3 tests/glm53_serve_harness.py        --binary ./glm53 --fixture ~/glm53_mm_tiny
+python3 tests/glm53_vision_serve_harness.py --binary ./glm53 --fixture ~/glm53_mm_tiny
+python3 tests/glm53_chat_template_harness.py --template <model>/chat_template.jinja
+make VK=1 glm53 && python3 tests/glm53_vulkan_harness.py --binary ./glm53 --fixture ~/glm53_mm_tiny
 ```
 
 The generators want transformers 5.16.1, pinned because an oracle written by a
-different version is a different oracle. Each test skips with the command that
-builds what it is missing rather than throwing.
+different version is a different oracle. Each harness skips with the command that
+builds what it is missing rather than throwing, and exits 2 when it does: a skip
+verified nothing and must not read as a pass.
+
+The harnesses are named `glm53_*_harness.py` so `make test-python` does not
+collect them as empty unittest modules. `tests/test_glm53_oracles.py` wraps the
+two stdlib-only oracles for unittest; it runs them when `GLM53_TINY`
+(`tools/make_glm53_tiny.py`) and `GLM53_MM_TINY` (the multimodal fixture above)
+point at their fixtures, as the GLM-5.3 CI job does, and skips with that reason
+otherwise.
 
 Two of the generators refuse to write a fixture that cannot fail: one rejects a
 degenerate model that answers the same token everywhere, the other a fixture

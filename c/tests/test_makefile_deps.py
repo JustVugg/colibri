@@ -84,6 +84,58 @@ class MakefileHeaderDepsTest(unittest.TestCase):
                     f"{family.id}: registered family whose build target is not "
                     f"a checkable `{family.build_target}$(EXE):` rule")
 
+    def test_every_engine_rule_lists_fp8_format_h_if_it_reaches_it(self):
+        """A prerequisite reached THROUGH another header is still a prerequisite.
+
+        The check below walks only an engine's own `#include "..."` lines, so a
+        header pulled in transitively is invisible to it. fp8_format.h is
+        exactly that shape: quant.h includes it, no engine .c does, so the
+        direct check stays green whether or not a rule lists it -- while
+        `touch fp8_format.h; make colibri` would report success and leave a
+        stale binary carrying the previous FP8_BLOCK. That is the drift the
+        header's own comment says it exists to prevent, so it is pinned here.
+
+        Bite: delete `fp8_format.h` from `colibri$(EXE):` and this fails naming
+        colibri; the direct check above still passes.
+
+        Scoped to fp8_format.h ON PURPOSE. Running the same closure over every
+        header reports seven rules that predate this change and are unrelated
+        to it -- colibri and deepseek_v41 do not list tok_unicode_o200k.h,
+        five engines do not list decode_batch.h or edge_adapter_internal.h,
+        qwen36 does not list sse41_kernels.h. Those are real instances of the
+        same hazard and worth a separate fix; widening this test to cover them
+        here would make it fail on arrival for reasons this change did not
+        cause.
+        """
+        problems = []
+        for target, (source, prereqs) in sorted(_engine_rules().items()):
+            seen, stack = set(), [source]
+            while stack:
+                cur = stack.pop()
+                try:
+                    text = cur.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                for h in INCLUDE_RE.findall(text):
+                    if h in seen:
+                        continue
+                    path = C_DIR / h
+                    # Only headers that exist in c/ are ours to track; system
+                    # headers and generated files are not prerequisites.
+                    if path.exists():
+                        seen.add(h)
+                        stack.append(path)
+            if "fp8_format.h" in seen and "fp8_format.h" not in prereqs:
+                problems.append(f"{target} ({source.name}) reaches fp8_format.h "
+                                f"through its include graph but does not list it")
+        self.assertEqual(
+            problems, [],
+            "fp8_format.h is reachable from these engines but absent from their "
+            "Makefile prerequisites. Editing it alone will NOT relink them -- "
+            "make reports success and leaves a stale artifact:\n  "
+            + "\n  ".join(problems),
+        )
+
     def test_every_engine_rule_lists_the_headers_its_source_includes(self):
         problems = []
         for target, (source, prereqs) in sorted(_engine_rules().items()):

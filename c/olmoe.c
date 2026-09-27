@@ -47,6 +47,7 @@
 #include "kv_prefix.h"
 #include "pin_pool.h"                       /* piu scatti annidati */   /* riuso del prefisso tra turni (shared) */
 #include "serve_codec.h"
+#include "serve_budget.h"
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -1613,7 +1614,8 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
     if (np <= 0) { coli_serve_write_error(stdout, q->id, "empty prompt"); free(ids); return 0; }
-    if (np + q->max_tok > ctx_cap) {
+    int budget = coli_serve_budget(np, q->max_tok, ctx_cap, q->logprobs > 0);
+    if (budget < 0) {
         char message[128];
         /* The frame the gateway turns into a 400 context_length_exceeded
          * (#506, #1381). Free text here reached the client as a 500. */
@@ -1621,6 +1623,12 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
                  "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
                  np, q->max_tok, ctx_cap);
         coli_serve_write_error(stdout, q->id, message); free(ids); return 0;
+    }
+    if (budget < q->max_tok) {
+        fprintf(stderr, "[serve] max_tokens %d clamped to %d (context %d - prompt %d); "
+                        "raise CTX for longer answers\n",
+                q->max_tok, budget, ctx_cap, np);
+        q->max_tok = budget;
     }
     g_temp = q->temp; g_nuc = q->top_p;
     /* A chat client resends the whole transcript every turn. If this prompt

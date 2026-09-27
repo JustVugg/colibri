@@ -121,12 +121,22 @@ static void test_malformed_submit_cannot_become_a_control(void)
     fclose(in); fclose(out);
 }
 
+static void test_max_tokens_is_a_ceiling(void)
+{
+    /* coli chat sends interactive_max_output=16384 against K3_MAXT=8192. */
+    assert(coli_serve_budget(2,16384,8192,0)==8190);
+    assert(coli_serve_budget(100,50,8192,0)==50);
+    assert(coli_serve_budget(8192,1,8192,0)==-1);
+    assert(coli_serve_budget(8192,0,8192,1)==0);
+}
+
 int main(void)
 {
     test_submit_preserves_k3_wire_bytes();
     test_controls_match_only_active_request();
     test_errors_and_busy_payload_are_byte_exact();
     test_malformed_submit_cannot_become_a_control();
+    test_max_tokens_is_a_ceiling();
     puts("kimi serve framing baseline: ok");
     return 0;
 }
