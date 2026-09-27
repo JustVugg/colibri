@@ -1,0 +1,405 @@
+{
+  "schema": "colibri.engine-gap-classification/1",
+  "about": "Which models on the APIARY #1947 round-7 roster have a working colibri engine, split into what origin/dev ships today and what only works if an unmerged, conflicting PR head lands. Nothing in this file was measured on a GPU; no score, run_id, digest or sha256 is recorded anywhere, by policy.",
+  "references": {
+    "apiary_issue": "https://github.com/Xore/APIARY/issues/3199",
+    "apiary_pr_superseded_in_part": "https://github.com/Xore/APIARY/pull/3433",
+    "roster": {
+      "repo": "Xore/APIARY",
+      "commit": "b2b230cd",
+      "path": "analysis/ghidra/benchmarks/corpus/models_round7.txt",
+      "note": "The roster lives in APIARY, not in this repository. The verbatim tag list is mirrored in roster.tags below so this file is self-contained and so a dropped row is a test failure rather than a silent omission; diff it against the pinned path above to confirm."
+    }
+  },
+  "subject": {
+    "repo": "JustVugg/colibri",
+    "branch": "dev",
+    "commit": "38d853685e68f89671e7c65c4abe53f7c0fd9788",
+    "colibri_version": "1.12.1",
+    "artifacts": ["c/coli", "c/qwen36"],
+    "build": "make -C c qwen36 CUDA=1 CUDA_ARCH=native CUDA_HOME=/usr/local/cuda",
+    "engines_built_on_the_verification_host": ["coli", "qwen36"],
+    "engines_not_built_on_the_verification_host": [
+      "colibri", "glm53", "qwen38", "qwen3", "kimi", "olmoe", "inkling",
+      "deepseek_v4", "deepseek_v41"
+    ],
+    "registry": {
+      "families": 9,
+      "accepted_model_types": 17,
+      "accepted": {
+        "glm5_next": "glm53", "glm5_next_text": "glm53",
+        "glm_moe_dsa": "glm", "glm5_moe": "glm", "glm": "glm",
+        "inkling_mm_model": "inkling", "inkling": "inkling",
+        "kimi_k3": "kimi", "kimi_linear": "kimi",
+        "olmoe": "olmoe",
+        "qwen3_5_moe": "qwen36", "qwen3_5_moe_text": "qwen36",
+        "qwen4_exp": "qwen38", "qwen4_exp_text": "qwen38",
+        "deepseek_v4": "deepseek_v4",
+        "deepseek_v41": "deepseek_v41", "deepseek_v41_text": "deepseek_v41"
+      }
+    }
+  },
+  "decision_surface": "colibri resolves a family from the HuggingFace model_type in the checkpoint's config.json (c/family_registry.py, family_for_config/_normalize_model_type). The families' model_types tuples are the whole compatibility surface: a model_type no family names is refused by the launcher's own dispatcher before any engine is chosen. Everything below is decided on that field alone.",
+  "how_verified": {
+    "runtime_on_built_dev_binaries": "c/coli doctor --model <dir> --gpu none, against the binaries built from dev 38d85368. The refusal for an unaccepted model_type is emitted by the built launcher, not inferred from source. c/doctor.py states it loads no model payload, no engine and no CUDA context; every run used --gpu none, and card VRAM was sampled immediately before and after the whole probe set and was unchanged.",
+    "synthetic_model_type_probes": "A one-file config.json per model_type under /tmp, then the same command. Accepted types clear '[ ok] model.family ... family is registered' and fail later on the missing shards; refused types never reach that line and print '[fail] config.arguments unsupported model_type: <type>' with exit status 2.",
+    "observed_accepted": ["glm5_next", "qwen3_5_moe", "qwen3_5_moe_text", "qwen4_exp"],
+    "observed_refused": ["gpt_oss", "glm4_moe", "gemma4", "mistral", "mistral3", "qwen2", "qwen3", "qwen3_5", "qwen3_moe"],
+    "vram_mib_before_probes": 18610,
+    "vram_mib_after_probes": 18610,
+    "real_checkpoints_probed": [
+      {
+        "path": "/var/benchmarks/colibri/models/src-qwen3-8b",
+        "model_type": "qwen3",
+        "architectures": ["Qwen3ForCausalLM"],
+        "verdict": "[fail] config.arguments unsupported model_type: qwen3 / result error"
+      },
+      {
+        "path": "/var/benchmarks/colibri/models/huihui-qwen36-colibri-i4-gs64",
+        "model_type": "qwen3_5_moe_text",
+        "verdict": "10 checks ok, '[ ok] model.family Qwen3.6-35B-A3B family is registered', 41 shards, 23.0 GB, result ok"
+      }
+    ],
+    "model_type_provenance": "model_type for each row was read from the base checkpoint's own config.json over HTTPS, except where the row says otherwise. Where the base is pinned by a build script, the pinned revision was used.",
+    "pr_heads": "Read-only. Fetched as refs/pull/<n>/head into refs/oc-inspect/*, which are not branches and are not pushable. The fetched object ids matched the live PR head SHAs reported by the API at fetch time, and neither PR was rebased, pushed or otherwise modified. PR head source was read; it was not built and not run."
+  },
+  "conditional_wording": "CONDITIONAL - depends on an UNMERGED, currently CONFLICTING pull request. Not available on origin/dev. Verified by reading the PR head source only: not built, not executed, no score.",
+  "prs": {
+    "1578": {
+      "url": "https://github.com/JustVugg/colibri/pull/1578",
+      "title": "dense Qwen3 family: engine, int4-gs64 converter, tiny-fixture oracle, registry entry",
+      "base": "dev",
+      "state": "OPEN",
+      "mergeable": "CONFLICTING",
+      "merged": false,
+      "head_sha": "52925d755d9f616bc54a99048ddfbc4c257fd463",
+      "read_at": "2026-09-27",
+      "merge_base_with_dev": "a8f2ca623ffe9de9df11d56f34d11d2d501493d3",
+      "adds_family": true,
+      "registry_delta": "one new FamilyDescriptor id='qwen3' with model_types=('qwen3',), plus a _dense_expert_inventory helper. All nine dev families are unchanged.",
+      "engine": "c/qwen3.c (1300 lines added), c/tools/convert_qwen3_dense.py, c/tools/make_qwen3_tiny.py, docs/qwen3.md, Makefile target qwen3",
+      "evidence_width": "The family entry is display_name='Qwen3-8B', display_scale='8B' and the PR ships a tiny 8B fixture oracle. The registry accepts any qwen3 model_type, but the branch carries no 14B evidence.",
+      "not_verified": "The branch conflicts with dev, so the diff above is against its own merge-base a8f2ca62, not against current dev. Nothing on this branch was compiled or run."
+    },
+    "1564": {
+      "url": "https://github.com/JustVugg/colibri/pull/1564",
+      "title": "qt expert tier + expert-cache RAM ceilings (glm53 & qwen36), A3 soak-verified",
+      "base": "dev",
+      "state": "OPEN",
+      "mergeable": "CONFLICTING",
+      "merged": false,
+      "head_sha": "011759c5fcfdc53322200f94a594ebb72d3d3780",
+      "read_at": "2026-09-27",
+      "merge_base_with_dev": "a8f2ca623ffe9de9df11d56f34d11d2d501493d3",
+      "adds_family": false,
+      "registry_delta": "NONE. c/family_registry.py is untouched by this branch: it adds no family and no model_type.",
+      "engine": "c/qwen36.c and c/qwen36_tier.c: expert-cache cap sized from RAM_GB, MemAvailable accounting, eviction-safe tier stream. c/glm53.c: the same RAM_GB ceiling.",
+      "effect_on_this_roster": "None of the roster rows move because of it. It is a conditional behavioural overlay on the two Column A rows, which are qwen3_5_moe checkpoints served by qwen36, plus glm53, which is not a roster row."
+    }
+  },
+  "columns": {
+    "A": "Works on origin/dev today: a colibri family on dev 38d85368 accepts the row's model_type. Verified against the built dev binaries.",
+    "B": "Works ONLY if the PR-head overlay lands. Conditional on unmerged, currently conflicting upstream work.",
+    "neither": "No engine on origin/dev accepts the row's model_type, and no open PR proposes one. Not Column A and not Column B. Listed so that no roster row is dropped."
+  },
+  "roster": {
+    "tag_count": 14,
+    "tags": [
+      "ornith-35b-dyn:q4_k_xl",
+      "qwen3.8-27b-dyn:q4_k_xl",
+      "qwen3.6-27b-dyn:q4_k_xl",
+      "qwen3.6-35b-a3b-dyn:q4_k_xl",
+      "gemma4-31b-dyn:q4_k_xl",
+      "xortron-123b-dyn:q3_k_xl",
+      "glm-4.6-reap-218b-dyn:q3_k_xl",
+      "qwen3:14b",
+      "qwen2.5-coder:7b-instruct-q4_k_m",
+      "rex86-merged:q8_0",
+      "rex86-merged:q4_k_m",
+      "qwen2.5-coder-7b-base:q8_0",
+      "qwen2.5-coder-7b-base:q4_k_m",
+      "hf.co/glyphsoftware/sentinel-r3-gguf:q4_k_m"
+    ]
+  },
+  "entries": [
+    {
+      "roster_tag": "ornith-35b-dyn:q4_k_xl",
+      "model_type": "qwen3_5_moe",
+      "model_type_source": "config.json of llmfan46/Ornith-1.0-35B-uncensored-heretic, the base named in the ladder plan for the ornith-35b-selfquant prefix",
+      "column": "A",
+      "family_on_dev": "qwen36",
+      "conditional_on_pr": null,
+      "conditional_note": null,
+      "measured": false,
+      "score": null,
+      "run_id": null,
+      "runtime_verified": true,
+      "runtime_evidence": "Synthetic probe: model_type qwen3_5_moe clears '[ ok] model.family Qwen3.6-35B-A3B family is registered' on the built c/coli. The same family was verified end to end on a real 41-shard qwen3_5_moe_text checkpoint (result ok).",
+      "blockers_beyond_engine": [
+        "Artefact: the roster tag is an ollama GGUF built by requant_sweep.sh, and no qwen36 converter is declared in the registry, so `coli convert` cannot produce a qwen36 container from it. A safetensors source and external conversion are required.",
+        "Artefact absent: ornith-35b-dyn is not registered in the ghidra-ollama-1 manifest store, so this row was never run here.",
+        "Conditional overlay: #1564 changes how qwen36 sizes its expert cache against RAM_GB. That change is unmerged and conflicting, so the placement this row would get on dev is not the placement it would get on the #1564 head."
+      ]
+    },
+    {
+      "roster_tag": "qwen3.8-27b-dyn:q4_k_xl",
+      "model_type": "qwen3_5",
+      "model_type_source": "config.json of Qwen/Qwen3.8-27B (Qwen3_5ForConditionalGeneration)",
+      "column": "neither",
+      "family_on_dev": null,
+      "conditional_on_pr": null,
+      "conditional_note": null,
+      "measured": false,
+      "score": null,
+      "run_id": null,
+      "runtime_verified": true,
+      "runtime_evidence": "Synthetic probe: model_type qwen3_5 is refused by the built c/coli with '[fail] config.arguments unsupported model_type: qwen3_5', exit 2. Note that the family named 'qwen38' is not this model: it accepts qwen4_exp only, which is Qwen3.8-Flash-Next.",
+      "blockers_beyond_engine": [
+        "Engine: no family on dev accepts dense qwen3_5, and neither #1578 nor #1564 proposes one. #1578 adds dense qwen3, a different model_type.",
+        "Artefact: GGUF tag, and no converter for it."
+      ]
+    },
+    {
+      "roster_tag": "qwen3.6-27b-dyn:q4_k_xl",
+      "model_type": "qwen3_5",
+      "model_type_source": "config.json of Qwen/Qwen3.6-27B (Qwen3_5ForConditionalGeneration)",
+      "column": "neither",
+      "family_on_dev": null,
+      "conditional_on_pr": null,
+      "conditional_note": null,
+      "measured": false,
+      "score": null,
+      "run_id": null,
+      "runtime_verified": true,
+      "runtime_evidence": "Same refusal as the row above: the built c/coli refuses qwen3_5 with exit 2.",
+      "blockers_beyond_engine": [
+        "Engine: dense qwen3_5 is not in any dev family and not in either PR head.",
+        "Artefact: GGUF tag, and no converter for it."
+      ]
+    },
+    {
+      "roster_tag": "qwen3.6-35b-a3b-dyn:q4_k_xl",
+      "model_type": "qwen3_5_moe",
+      "model_type_source": "config.json of Qwen/Qwen3.6-35B-A3B (Qwen3_5MoeForConditionalGeneration)",
+      "column": "A",
+      "family_on_dev": "qwen36",
+      "conditional_on_pr": null,
+      "conditional_note": null,
+      "measured": false,
+      "score": null,
+      "run_id": null,
+      "runtime_verified": true,
+      "runtime_evidence": "Synthetic probe: model_type qwen3_5_moe clears '[ ok] model.family Qwen3.6-35B-A3B family is registered' on the built c/coli.",
+      "blockers_beyond_engine": [
+        "Artefact: GGUF tag, and no qwen36 converter is declared in the registry.",
+        "Artefact absent: qwen3.6-35b-a3b-dyn is not registered in the ghidra-ollama-1 manifest store, so this row was never run here.",
+        "Conditional overlay: #1564, unmerged and conflicting, changes qwen36 expert-cache RAM ceiling behaviour for this row."
+      ]
+    },
+    {
+      "roster_tag": "gemma4-31b-dyn:q4_k_xl",
+      "model_type": "gemma4",
+      "model_type_source": "config.json of google/gemma-4-31b (Gemma4ForConditionalGeneration); the sibling google/gemma-4-26B-A4B is also gemma4",
+      "column": "neither",
+      "family_on_dev": null,
+      "conditional_on_pr": null,
+      "conditional_note": null,
+      "measured": false,
+      "score": null,
+      "run_id": null,
+      "runtime_verified": true,
+      "runtime_evidence": "Synthetic probe: model_type gemma4 is refused by the built c/coli with '[fail] config.arguments unsupported model_type: gemma4', exit 2.",
+      "blockers_beyond_engine": [
+        "Engine: no gemma family exists on dev and neither PR proposes one.",
+        "The exact ladder base for this row was not resolved on disk; the model_type above is from the gemma-4-31B release, and it holds for every gemma4 derivative of it."
+      ]
+    },
+    {
+      "roster_tag": "xortron-123b-dyn:q3_k_xl",
+      "model_type": "mistral",
+      "model_type_source": "config.json of darkc0de/XORTRON.CriminalComputing.LARGE.2026.3 (MistralForCausalLM)",
+      "column": "neither",
+      "family_on_dev": null,
+      "conditional_on_pr": null,
+      "conditional_note": null,
+      "measured": false,
+      "score": null,
+      "run_id": null,
+      "runtime_verified": true,
+      "runtime_evidence": "Synthetic probe: model_type mistral is refused by the built c/coli with '[fail] config.arguments unsupported model_type: mistral', exit 2. mistral3 is refused the same way and is a separate model_type, so a future mistral engine would be two families, not one.",
+      "blockers_beyond_engine": [
+        "Engine: no mistral family on dev, none in either PR head.",
+        "Artefact: GGUF tag, and no converter for it."
+      ]
+    },
+    {
+      "roster_tag": "glm-4.6-reap-218b-dyn:q3_k_xl",
+      "model_type": "glm4_moe",
+      "model_type_source": "config.json of cerebras/GLM-4.6-REAP-218B-A32B (Glm4MoeForCausalLM)",
+      "column": "neither",
+      "family_on_dev": null,
+      "conditional_on_pr": null,
+      "conditional_note": null,
+      "measured": false,
+      "score": null,
+      "run_id": null,
+      "runtime_verified": true,
+      "runtime_evidence": "Synthetic probe: model_type glm4_moe is refused by the built c/coli with '[fail] config.arguments unsupported model_type: glm4_moe', exit 2. The glm family on dev accepts glm_moe_dsa, glm5_moe and glm; glm4_moe is not one of them.",
+      "blockers_beyond_engine": [
+        "Engine: no family accepts glm4_moe on dev or on either PR head.",
+        "Engine unbuildable here regardless: the glm family's engine artifact c/colibri was not built on the verification host, so this row could not have been runtime-checked even if the family matched.",
+        "Artefact: GGUF tag, and no converter for it."
+      ]
+    },
+    {
+      "roster_tag": "qwen3:14b",
+      "model_type": "qwen3",
+      "model_type_source": "config.json of Qwen/Qwen3-14B (Qwen3ForCausalLM); the local checkpoint /var/benchmarks/colibri/models/src-qwen3-8b is the same model_type",
+      "column": "B",
+      "family_on_dev": null,
+      "conditional_on_pr": [1578],
+      "conditional_note": "CONDITIONAL - depends on an UNMERGED, currently CONFLICTING pull request. Not available on origin/dev. Verified by reading the PR head source only: not built, not executed, no score. This row: #1578 only, head 52925d755d9f616bc54a99048ddfbc4c257fd463 as read on 2026-09-27. On origin/dev today the built c/coli refuses it outright, with '[fail] config.arguments unsupported model_type: qwen3'.",
+      "measured": false,
+      "score": null,
+      "run_id": null,
+      "runtime_verified": true,
+      "runtime_evidence": "Dev side: real checkpoint src-qwen3-8b (model_type qwen3) is refused by the built c/coli with '[fail] config.arguments unsupported model_type: qwen3 / result error', and a synthetic qwen3 probe is refused with exit 2. PR side: read from the head source only. The head adds a FamilyDescriptor with model_types=('qwen3',) and c/qwen3.c. Nothing on that branch was built or run.",
+      "blockers_beyond_engine": [
+        "Unmerged and conflicting: #1578's merge base with dev is a8f2ca62, far behind dev 38d85368, and GitHub reports mergeable=CONFLICTING. Landing it is not a given.",
+        "Evidence width: the family entry is sized and named for an 8B checkpoint (display_name 'Qwen3-8B', display_scale '8B') and the PR's oracle is a tiny 8B fixture. The registry would accept this 14B row on model_type alone; no 14B run exists.",
+        "Artefact: ollama library GGUF tag, and #1578's converter (convert_qwen3_dense.py) is not wired into `coli convert` - the family deliberately declares no converter, so it has its own command line."
+      ]
+    },
+    {
+      "roster_tag": "qwen2.5-coder:7b-instruct-q4_k_m",
+      "model_type": "qwen2",
+      "model_type_source": "config.json of Qwen/Qwen2.5-Coder-7B-Instruct (Qwen2ForCausalLM)",
+      "column": "neither",
+      "family_on_dev": null,
+      "conditional_on_pr": null,
+      "conditional_note": null,
+      "measured": false,
+      "score": null,
+      "run_id": null,
+      "runtime_verified": true,
+      "runtime_evidence": "Synthetic probe: model_type qwen2 is refused by the built c/coli with '[fail] config.arguments unsupported model_type: qwen2', exit 2.",
+      "blockers_beyond_engine": [
+        "Engine: no qwen2 family on dev and none in either PR head.",
+        "Artefact: ollama GGUF tag, and no converter for it."
+      ]
+    },
+    {
+      "roster_tag": "rex86-merged:q8_0",
+      "model_type": "qwen2",
+      "model_type_source": "config.json of unsloth/Qwen2.5-Coder-7B at revision 5762507e8ed2132906da60f86a2b23b54673ee81, the BASE_MODEL/BASE_REV that analysis/ghidra/benchmarks/corpus/round7_t0_merge_export.sh pins for this artefact",
+      "column": "neither",
+      "family_on_dev": null,
+      "conditional_on_pr": null,
+      "conditional_note": null,
+      "measured": false,
+      "score": null,
+      "run_id": null,
+      "runtime_verified": true,
+      "runtime_evidence": "Same refusal as the qwen2 row above.",
+      "blockers_beyond_engine": [
+        "Engine: the merge inherits qwen2, which no family accepts.",
+        "Artefact: the local manifest in ghidra-ollama-1 has no template or license layer for this tag - it is a bare GGUF blob, so it carries no config.json and could not be handed to colibri as is."
+      ]
+    },
+    {
+      "roster_tag": "rex86-merged:q4_k_m",
+      "model_type": "qwen2",
+      "model_type_source": "Same pinned base revision as the q8_0 row.",
+      "column": "neither",
+      "family_on_dev": null,
+      "conditional_on_pr": null,
+      "conditional_note": null,
+      "measured": false,
+      "score": null,
+      "run_id": null,
+      "runtime_verified": true,
+      "runtime_evidence": "Same refusal as the qwen2 row above.",
+      "blockers_beyond_engine": [
+        "Engine: qwen2, which no family accepts.",
+        "Artefact: bare GGUF blob with no template layer."
+      ]
+    },
+    {
+      "roster_tag": "qwen2.5-coder-7b-base:q8_0",
+      "model_type": "qwen2",
+      "model_type_source": "config.json of unsloth/Qwen2.5-Coder-7B at the revision pinned by round7_t0_merge_export.sh (Qwen2ForCausalLM)",
+      "column": "neither",
+      "family_on_dev": null,
+      "conditional_on_pr": null,
+      "conditional_note": null,
+      "measured": false,
+      "score": null,
+      "run_id": null,
+      "runtime_verified": true,
+      "runtime_evidence": "Same refusal as the qwen2 row above.",
+      "blockers_beyond_engine": [
+        "Engine: no qwen2 family on dev and none in either PR head.",
+        "Artefact: GGUF tag, and no converter for it."
+      ]
+    },
+    {
+      "roster_tag": "qwen2.5-coder-7b-base:q4_k_m",
+      "model_type": "qwen2",
+      "model_type_source": "Same pinned base revision as the q8_0 row.",
+      "column": "neither",
+      "family_on_dev": null,
+      "conditional_on_pr": null,
+      "conditional_note": null,
+      "measured": false,
+      "score": null,
+      "run_id": null,
+      "runtime_verified": true,
+      "runtime_evidence": "Same refusal as the qwen2 row above.",
+      "blockers_beyond_engine": [
+        "Engine: qwen2, which no family accepts.",
+        "Artefact: GGUF tag, and no converter for it."
+      ]
+    },
+    {
+      "roster_tag": "hf.co/glyphsoftware/sentinel-r3-gguf:q4_k_m",
+      "model_type": null,
+      "model_type_source": "NOT ESTABLISHED. huggingface.co/glyphsoftware/sentinel-r3 returned, today: 'Access to model glyphsoftware/sentinel-r3 is restricted. You must have access to it and be authentic'. No model_type was read and none is asserted here.",
+      "column": "neither",
+      "family_on_dev": null,
+      "conditional_on_pr": null,
+      "conditional_note": null,
+      "measured": false,
+      "score": null,
+      "run_id": null,
+      "runtime_verified": false,
+      "runtime_evidence": "Not probed: the checkpoint is gated, so no model_type could be read and no probe would have been honest. The verdict rests on the gate, not on the architecture.",
+      "blockers_beyond_engine": [
+        "Unmeasured by necessity: the model is behind a signed licence gate, so this row cannot be classified on model_type from here. It is listed so the roster is complete, not as a verdict.",
+        "If an authorised read later shows a base of Qwen3.8-27B, as the APIARY #3199 write-up assumed, the model_type is dense qwen3_5, which no family accepts and neither PR adds. If it shows a Qwen3-30B-A3B base instead, the model_type is qwen3_moe, which is a third thing again and is also accepted by no family. Only a Qwen3-30B-A3B-inheriting-but-named-qwen3 case would reach PR #1578, and there is no evidence for that.",
+        "Artefact: a -GGUF repo, so no config.json is present in the artefact itself either."
+      ]
+    }
+  ],
+  "not_measured": [
+    "No score, throughput, latency or quality number appears anywhere in this file. None was produced: the verification host's card was held at 18.6-19.1 GiB of 20.475 GiB by an in-flight sweep, and no model was loaded on it for this work.",
+    "No run_id, digest or sha256 of any artefact is recorded, because none was computed for this work. The only hashes present are upstream commit ids read from git and the GitHub API, and one pinned HuggingFace revision, all of which are references rather than measurements.",
+    "Neither PR head was built, executed or benchmarked. Column B rests entirely on reading the head source.",
+    "Only c/coli and c/qwen36 are built on the verification host, so no family other than qwen36 could have been executed. That is why the runtime evidence is the launcher's model_type gate, which is the field the verdict is decided on, rather than an inference run."
+  ],
+  "supersedes_in_part": {
+    "pr": "https://github.com/Xore/APIARY/pull/3433",
+    "keeps": [
+      "That colibri dispatches on the HF model_type field, so the families' model_types tuples are the whole compatibility surface. Re-verified on dev 38d85368.",
+      "That the family named qwen38 accepts qwen4_exp only, i.e. Qwen3.8-Flash-Next, and is therefore not an engine for a dense 27B Qwen3.8.",
+      "That GLM-4.6-REAP-218B is glm4_moe rather than glm_moe_dsa. Re-verified independently against cerebras/GLM-4.6-REAP-218B-A32B.",
+      "That the hf.co/glyphsoftware/sentinel-r3 row is a licence-gate problem and is not counted against colibri.",
+      "The live refusal '[fail] config.arguments unsupported model_type: qwen3' for a dense Qwen3 checkpoint. Reproduced on freshly built dev binaries."
+    ],
+    "corrects": [
+      "Its qwen3 conclusion. #3433 recorded dense qwen3 as an engine that does not exist, and listed it among the engines still to be written. A dense Qwen3 engine does exist: PR #1578 adds c/qwen3.c (1300 lines), a converter, a fixture oracle and a registry entry with model_types=('qwen3',). It is unmerged and conflicting, so the honest statement is not 'no engine' but 'no engine on dev, one engine on an unmerged conflicting branch'. That is the difference between a gap and a conditional, and the conditional is the part a reader would otherwise get wrong.",
+      "Its GGUF evidence. #3433 wrote that 'GGUF is not a colibri input at all' and that its grep for gguf across c/*.c, c/*.py and c/tools/*.py 'returns nothing'. On dev 38d85368 that grep returns four files: c/tools/convert_gguf_to_olmoe.py, c/tools/gguf_reader.py, c/tools/gguf_dequant.py and c/tools/gguf_olmoe_profile.py. GGUF is an input, for the olmoe family. The conclusion it drew for the two qwen3_5_moe roster rows is unaffected - no GGUF reader exists for qwen36 - but the stated reason was wrong, and it was wrong in the direction that makes the reader think no GGUF path is possible anywhere."
+    ],
+    "agrees_with": "Its statement that upstream dev carries the same nine families and tuples. Re-verified: 9 families, 17 accepted model_types, no dense qwen3.",
+    "note": "#3433 classified against a checkout that was behind dev. This file classifies against dev 38d85368 built on the verification host, with the PR heads read at the SHAs recorded above."
+  }
+}
