@@ -46,7 +46,7 @@ static struct {
     QSlot *slot;                          /* [nl*ne] */
     pthread_mutex_t mx;
     pthread_t th;
-    int th_stop;
+    int th_stop, waiters;
     /* upload ring with staging copies */
     struct { int layer, eid; uint8_t *w; float *s; int v_layer, v_eid; } q[QT_QCAP];
     int qh, qt_, qn;
@@ -69,6 +69,13 @@ static struct {
     uint64_t tick, swaps, pf_hits, pf_notes;
     uint32_t *heat0;                      /* heat table loaded from HEAT_FILE */
 } G;
+
+/* Count parked callers so shutdown can reclaim their shared storage safely. */
+static void wait_take_locked(void){
+    G.waiters++;
+    pthread_cond_wait(&G.cv_take,&G.mx);
+    if(--G.waiters==0 && G.th_stop) pthread_cond_broadcast(&G.cv_take);
+}
 
 static QSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; }
 static int home(int eid){ return eid % G.ndev; }
@@ -1020,10 +1027,7 @@ void qt_note_planned(int layer,int eid,
 void qt_fill_wait(void){
     if(!G.on) return;
     pthread_mutex_lock(&G.mx);
-    G.blocking_calls++;
-    while(G.inflight>0 && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
-    G.blocking_calls--;
-    pthread_cond_broadcast(&G.cv_take);
+    while(G.inflight>0 && !G.th_stop) wait_take_locked();
     pthread_mutex_unlock(&G.mx);
 }
 
@@ -1158,6 +1162,7 @@ void qt_shutdown(void){
     pthread_mutex_lock(&G.mx);
     G.th_stop=1; pthread_cond_signal(&G.cv); pthread_cond_broadcast(&G.cv_take);
     while(G.blocking_calls) pthread_cond_wait(&G.cv_take,&G.mx);
+    while(G.waiters) pthread_cond_wait(&G.cv_take,&G.mx);
     pthread_mutex_unlock(&G.mx);
     pthread_join(G.th,NULL);
     /* The backend queues expert kernels and the output download on its device

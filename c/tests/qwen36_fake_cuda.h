@@ -19,6 +19,7 @@
  *                       sleeps here; NULL (the default) uploads instantly. */
 #ifndef QWEN36_FAKE_CUDA_H
 #define QWEN36_FAKE_CUDA_H
+#include <math.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,7 +29,7 @@
 
 #include "../backend_cuda.h"
 
-struct ColiCudaTensor { int fmt, I, O, device, gs; const void *w; };
+struct ColiCudaTensor { int fmt, I, O, device, gs; const void *w; const float *sc; };
 
 static int fake_uploads, fake_frees, fake_live_tensors;
 static int fake_fail_upload;
@@ -48,14 +49,24 @@ static int fake_plain_issues, fake_clamped_issues, fake_takes;
 static float fake_last_swiglu_limit;
 static float fake_take_output[4096];
 static int fake_take_returns_output;
+/* fake_dense_compute=1: coli_cuda_matmul really computes fmt 1 (int8 per
+ * row) from the uploaded bytes, so an engine test can put a trunk on the fake
+ * tier and demand the same tokens as the CPU int8 reference. The engine
+ * frees its int8 rows right after qt_dense_init, so the upload keeps a copy. */
+static int fake_dense_compute;
 
-static int upload_common(ColiCudaTensor **t, const void *w, const float *s,
+static int upload_common(ColiCudaTensor **t, const void *w, const float *sc,
                          int fmt, int I, int O, int device, int gs) {
     if (fake_upload_hook) fake_upload_hook(fmt);
     const int call = ++fake_uploads;
     if (fake_fail_upload == call) return 0;
     ColiCudaTensor *n = (ColiCudaTensor *)calloc(1, sizeof *n);
-    n->fmt = fmt; n->I = I; n->O = O; n->device = device; n->gs = gs; n->w = w;
+    n->fmt = fmt; n->I = I; n->O = O; n->device = device; n->gs = gs; n->w = w; n->sc = sc;
+    if (fake_dense_compute && fmt == 1 && w && sc) {
+        int8_t *q = (int8_t *)malloc((size_t)I * O); float *s = (float *)malloc((size_t)O * sizeof(float));
+        if (q && s) { memcpy(q, w, (size_t)I * O); memcpy(s, sc, (size_t)O * sizeof(float)); n->w = q; n->sc = s; }
+        else { free(q); free(s); n->w = NULL; n->sc = NULL; }
+    }
     *t = n;
     fake_live_tensors++;
     last_fmt = fmt;
@@ -69,7 +80,7 @@ static int upload_common(ColiCudaTensor **t, const void *w, const float *s,
                                       : (size_t)O;
         captured_scale_count[i] = ns < sizeof captured_scales[i] / sizeof captured_scales[i][0]
                                 ? ns : sizeof captured_scales[i] / sizeof captured_scales[i][0];
-        memcpy(captured_scales[i], s, captured_scale_count[i] * sizeof(float));
+        memcpy(captured_scales[i], sc, captured_scale_count[i] * sizeof(float));
     }
     return 1;
 }
@@ -85,6 +96,7 @@ void coli_cuda_tensor_free(ColiCudaTensor *t) {
     if (t) {
         if (fake_free_hook) fake_free_hook(t);
         fake_frees++; fake_live_tensors--;
+        if (fake_dense_compute && t->fmt == 1) { free((void *)t->w); free((void *)t->sc); }
     }
     free(t);
 }
@@ -132,9 +144,24 @@ void coli_cuda_stats(int device, size_t *count, size_t *bytes) {
  * device). Counted, never computed: the placement tests check WHERE work
  * went; the arithmetic has its own oracle in the CUDA build. Parameters are
  * unused on purpose (CFLAGS carry -Wno-unused-parameter). */
-static int fake_matmuls;
+static int fake_matmuls, fake_matmul_fail, fake_matmul_rows, fake_matmul_fail_at;
 int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x, const void *weights, const float *scales, int fmt, int S, int I, int O, int device, int gs) {
-    fake_matmuls++; return 1;
+    fake_matmuls++;
+    fake_matmul_rows = S;
+    if (fake_matmul_fail || fake_matmuls == fake_matmul_fail_at) {
+        for(int i=0;i<S*O;i++) y[i]=NAN;
+        return 0;
+    }
+    ColiCudaTensor *t = tensor ? *tensor : NULL;
+    if (fake_dense_compute && t && t->fmt == 1 && t->w && t->sc && t->I == I && t->O == O) {
+        const int8_t *q = (const int8_t *)t->w;
+        for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
+            const int8_t *w = q + (size_t)o * I; const float *xs = x + (size_t)s * I; float a = 0.f;
+            for (int i = 0; i < I; i++) a += xs[i] * (float)w[i];
+            y[(size_t)s * O + o] = a * t->sc[o];
+        }
+    }
+    return 1;
 }
 
 #endif /* QWEN36_FAKE_CUDA_H */
