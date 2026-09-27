@@ -571,3 +571,24 @@ covers exact kernel parity, six-device default selection, single-device budget
 fallback, and the remaining Attention bottleneck. Measured short-request decode
 remains around 6.1–6.2 token/s; the route-only comparison is too small to claim a
 stable throughput gain.
+
+### Native quantization and resident indexer projections
+
+The generic CUDA path uses native E4M3 conversion instead of searching 255
+codes per activation, and bit decoding for E2M1. Ties-to-even, positive zero
+from the old encoder, and the existing activation scaling remain unchanged.
+SM89+ uses hardware E4M3 decoding; older targets use the equivalent bit layout.
+Resident routing uses the existing warp Top-6 kernel, retaining the original
+expert-ID tie break and sequential normalization of the six selected weights.
+
+With batched CUDA attention enabled, indexer query weights now upload once
+during layer loading. These mirrors preserve the original rows8/row-major
+layout, float scales, and exact reference reduction order; they are not generic
+FP8 GEMM mirrors. They count toward dense residency before full expert budget
+checks and are released with their owning layer on the assigned device.
+`DSV4_CUDA_RESIDENT_INDEXER=0` retains per-call weight uploads. Missing optional
+DLL exports or unavailable mirrors retain that original fallback.
+
+These changes are default behavior for the applicable CUDA paths. They do not
+enable speculation, tensor parallelism, or a device-only Attention pipeline.
+See the [Naruto comparison and measurements](experiments/dsv4-naruto-gap-2026-09-28.md).

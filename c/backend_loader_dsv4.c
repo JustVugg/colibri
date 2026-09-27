@@ -169,6 +169,8 @@ typedef int             (*fn_fp8_ref_matmul)(int device, const uint8_t *w, const
                                              int tokens, float *y);
 typedef int             (*fn_tensor_refill_fp4)(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale,
                                                 int O, int I, int sync);
+typedef int (*fn_upload_fp8_ref)(Dsv4CudaTensor**,const uint8_t*,const float*,int,int,int,int);
+typedef int (*fn_fp8_ref_matmul_resident)(Dsv4CudaTensor*,const float*,int,float*);
 typedef int             (*fn_backend_arch_ok)(int device);
 typedef const char     *(*fn_backend_name)(void);
 typedef long long       (*fn_mem_free_mb)(int device);
@@ -310,6 +312,8 @@ static struct {
     fn_sparse_attn_batch_cached_idx sparse_attn_batch_cached_idx;
     fn_indexer_score_batch indexer_score_batch;
     fn_fp8_ref_matmul fp8_ref_matmul;
+    fn_upload_fp8_ref upload_fp8_ref;
+    fn_fp8_ref_matmul_resident fp8_ref_matmul_resident;
     fn_tensor_refill_fp4 tensor_refill_fp4;
     fn_backend_arch_ok backend_arch_ok;   /* optional */
     fn_backend_name backend_name;         /* optional */
@@ -464,6 +468,8 @@ static int dsv4_cuda_resolve(const char *dllname){
     RESOLVE(sparse_attn_batch_cached_idx, fn_sparse_attn_batch_cached_idx);
     RESOLVE(indexer_score_batch, fn_indexer_score_batch);
     RESOLVE(fp8_ref_matmul, fn_fp8_ref_matmul);
+    g_dsv4.upload_fp8_ref = (fn_upload_fp8_ref)GetProcAddress(g_dsv4.dll, "dsv4_cuda_upload_fp8_ref");
+    g_dsv4.fp8_ref_matmul_resident = (fn_fp8_ref_matmul_resident)GetProcAddress(g_dsv4.dll, "dsv4_cuda_fp8_ref_matmul_resident");
     RESOLVE(tensor_refill_fp4, fn_tensor_refill_fp4);
     RESOLVE(mem_free_mb, fn_mem_free_mb);
     RESOLVE(kv_ring_append, fn_kv_ring_append);
@@ -828,6 +834,16 @@ int dsv4_cuda_fp8_ref_matmul(int device, const uint8_t *w, const float *bscale,
                              int tokens, float *y){
     if(!g_dsv4.available) return 0;
     return g_dsv4.fp8_ref_matmul(device, w, bscale, rows, cols, packed_rows8, x, tokens, y);
+}
+
+int dsv4_cuda_upload_fp8_ref(Dsv4CudaTensor **t,const uint8_t *w,const float *s,int rows,int cols,int packed,int device){
+    return g_dsv4.available && g_dsv4.upload_fp8_ref && g_dsv4.fp8_ref_matmul_resident
+        ? g_dsv4.upload_fp8_ref(t,w,s,rows,cols,packed,device) : 0;
+}
+
+int dsv4_cuda_fp8_ref_matmul_resident(Dsv4CudaTensor *t,const float *x,int tokens,float *y){
+    return g_dsv4.available && g_dsv4.fp8_ref_matmul_resident
+        ? g_dsv4.fp8_ref_matmul_resident(t,x,tokens,y) : 0;
 }
 
 int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale, int O, int I, int sync){

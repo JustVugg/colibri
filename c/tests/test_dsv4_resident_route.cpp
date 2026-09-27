@@ -33,23 +33,28 @@ int main() {
         }
         assert(dsv4_cuda_upload_f32(&gate,router.data(),E,H,device));
         assert(dsv4_cuda_upload_f32(&bias,bias_values.data(),E,1,device));
+        std::fill(router.begin(),router.end(),0.f);
+        Dsv4CudaTensor *tie_gate=nullptr;
+        assert(dsv4_cuda_upload_f32(&tie_gate,router.data(),E,H,device));
         auto *set=dsv4_cuda_expert_set_create(g,u,d,E,sg,su,sd);
         auto *input=dsv4_cuda_activation_create(device,H);
         assert(set && input);
         int fixed[]={255,0,127,6,42,19};
-        for(int sample=0;sample<4;sample++) {
+        for(int sample=0;sample<8;sample++) {
             for(int h=0;h<H;h++)x[h]=((h*3+sample*5)%23-11)*.0625f;
             assert(dsv4_cuda_activation_upload(input,x.data(),H));
             int ids[6]; float weights[6];
             const int *forced=sample%2 ? fixed : nullptr;
-            assert(dsv4_cuda_route(input,gate,bias,forced,1.5f,ids,weights));
+            auto *test_gate=sample>=4 ? tie_gate : gate;
+            auto *test_bias=sample&2 ? nullptr : bias;
+            assert(dsv4_cuda_route(input,test_gate,test_bias,forced,1.5f,ids,weights));
             for(int k=1;k<6;k++) for(int j=k;j>0&&ids[j]<ids[j-1];j--) {
                 std::swap(ids[j],ids[j-1]); std::swap(weights[j],weights[j-1]);
             }
             Dsv4CudaTensor *gs[6],*us[6],*ds[6];
             for(int k=0;k<6;k++){gs[k]=g[ids[k]];us[k]=u[ids[k]];ds[k]=d[ids[k]];}
             assert(dsv4_cuda_moe(gs,us,ds,weights,6,sg,su,sd,7.f,expected.data(),x.data()));
-            assert(dsv4_cuda_resident_route_moe(set,gate,bias,forced,1.5f,7.f,actual.data(),x.data()));
+            assert(dsv4_cuda_resident_route_moe(set,test_gate,test_bias,forced,1.5f,7.f,actual.data(),x.data()));
             bool nonzero=false;
             for(int h=0;h<H;h++) {
                 assert(std::isfinite(actual[h]) && actual[h]==expected[h]);
@@ -61,7 +66,7 @@ int main() {
         assert(!dsv4_cuda_resident_route_moe(set,gate,bias,fixed,1.5f,7.f,actual.data(),x.data()));
         dsv4_cuda_activation_free(input); dsv4_cuda_expert_set_free(set);
         for(int e=0;e<E;e++){dsv4_cuda_tensor_free(g[e]);dsv4_cuda_tensor_free(u[e]);dsv4_cuda_tensor_free(d[e]);}
-        for(auto *t:{sg,su,sd,gate,bias})dsv4_cuda_tensor_free(t);
+        for(auto *t:{sg,su,sd,gate,bias,tie_gate})dsv4_cuda_tensor_free(t);
     }
     dsv4_cuda_shutdown();
     puts("resident route: exact parity on two devices, normal and hash routes");

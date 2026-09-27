@@ -1,0 +1,438 @@
+{
+  "baseline_commit": "96d2000e60fbd140742fd768f0b501335a282913",
+  "naruto_reference_commit": "d0a00474a781a623197f24ae875b46d14d943704",
+  "fixture": "13 prompt tokens / 64 generated tokens, target-only, six RTX 5090",
+  "decode_tps_definition": "(generated - 1) / after_first_seconds",
+  "execution_order": "base1,native1,base2,native2,base3,native3,resident1,resident2,resident3",
+  "outputs_equal": true,
+  "summary": {
+    "base": {
+      "decode_tps_median": 6.088721368512613,
+      "ttft_seconds_median": 0.942,
+      "process_wall_seconds_median": 90.16217579133809
+    },
+    "native": {
+      "decode_tps_median": 7.701711491442543,
+      "ttft_seconds_median": 0.637,
+      "process_wall_seconds_median": 87.65120525751263
+    },
+    "resident": {
+      "decode_tps_median": 8.9058524173028,
+      "ttft_seconds_median": 0.621,
+      "process_wall_seconds_median": 86.31919077038765
+    }
+  },
+  "runs": [
+    {
+      "case": "base1",
+      "exit_code": 0,
+      "wall_seconds": 89.57544459123164,
+      "peak_MiB": [
+        24422,
+        24438,
+        24448,
+        24438,
+        24448,
+        27860
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        0.95,
+        10.113
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_gpu resident-budget device=0 experts=1792 bytes=23957864448 free-MiB=30590 reserve-MiB=2800",
+        "v4_gpu resident-budget device=1 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=2 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=3 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=4 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=5 experts=2048 bytes=27380416512 free-MiB=30420 reserve-MiB=2800",
+        "v4_gpu resident-experts=ready layers=43 experts-per-layer=256 preload-seconds=71.595",
+        "v4_gpu resident-route=on device=0",
+        "v4_gpu resident-route=on device=1",
+        "v4_gpu resident-route=on device=2",
+        "v4_gpu resident-route=on device=3",
+        "v4_gpu resident-route=on device=4",
+        "v4_gpu resident-route=on device=5",
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11008 hits=0 misses=11008 hit_rate=0.000 bytes=147169738752 target_only=1",
+        "v4_direct reads=11008 flock_reads=0 fallbacks=0 payload_bytes=138512695296"
+      ],
+      "decode_tps": 6.2296054583209735
+    },
+    {
+      "case": "native1",
+      "exit_code": 0,
+      "wall_seconds": 87.65120525751263,
+      "peak_MiB": [
+        24422,
+        24438,
+        24448,
+        24438,
+        24448,
+        27860
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        0.637,
+        8.423
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_gpu resident-budget device=0 experts=1792 bytes=23957864448 free-MiB=30590 reserve-MiB=2800",
+        "v4_gpu resident-budget device=1 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=2 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=3 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=4 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=5 experts=2048 bytes=27380416512 free-MiB=30420 reserve-MiB=2800",
+        "v4_gpu resident-experts=ready layers=43 experts-per-layer=256 preload-seconds=72.517",
+        "v4_gpu resident-route=on device=0",
+        "v4_gpu resident-route=on device=1",
+        "v4_gpu resident-route=on device=2",
+        "v4_gpu resident-route=on device=3",
+        "v4_gpu resident-route=on device=4",
+        "v4_gpu resident-route=on device=5",
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11008 hits=0 misses=11008 hit_rate=0.000 bytes=147169738752 target_only=1",
+        "v4_direct reads=11008 flock_reads=0 fallbacks=0 payload_bytes=138512695296"
+      ],
+      "decode_tps": 7.479520360916538
+    },
+    {
+      "case": "base2",
+      "exit_code": 0,
+      "wall_seconds": 90.16217579133809,
+      "peak_MiB": [
+        24422,
+        24438,
+        24448,
+        24438,
+        24450,
+        27860
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        0.942,
+        10.466
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_gpu resident-budget device=0 experts=1792 bytes=23957864448 free-MiB=30590 reserve-MiB=2800",
+        "v4_gpu resident-budget device=1 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=2 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=3 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=4 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=5 experts=2048 bytes=27380416512 free-MiB=30420 reserve-MiB=2800",
+        "v4_gpu resident-experts=ready layers=43 experts-per-layer=256 preload-seconds=72.402",
+        "v4_gpu resident-route=on device=0",
+        "v4_gpu resident-route=on device=1",
+        "v4_gpu resident-route=on device=2",
+        "v4_gpu resident-route=on device=3",
+        "v4_gpu resident-route=on device=4",
+        "v4_gpu resident-route=on device=5",
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11008 hits=0 misses=11008 hit_rate=0.000 bytes=147169738752 target_only=1",
+        "v4_direct reads=11008 flock_reads=0 fallbacks=0 payload_bytes=138512695296"
+      ],
+      "decode_tps": 6.019491687368623
+    },
+    {
+      "case": "native2",
+      "exit_code": 0,
+      "wall_seconds": 87.90657890029252,
+      "peak_MiB": [
+        24422,
+        24438,
+        24448,
+        24438,
+        24448,
+        27860
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        0.661,
+        8.162
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_gpu resident-budget device=0 experts=1792 bytes=23957864448 free-MiB=30590 reserve-MiB=2800",
+        "v4_gpu resident-budget device=1 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=2 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=3 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=4 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=5 experts=2048 bytes=27380416512 free-MiB=30420 reserve-MiB=2800",
+        "v4_gpu resident-experts=ready layers=43 experts-per-layer=256 preload-seconds=72.738",
+        "v4_gpu resident-route=on device=0",
+        "v4_gpu resident-route=on device=1",
+        "v4_gpu resident-route=on device=2",
+        "v4_gpu resident-route=on device=3",
+        "v4_gpu resident-route=on device=4",
+        "v4_gpu resident-route=on device=5",
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11008 hits=0 misses=11008 hit_rate=0.000 bytes=147169738752 target_only=1",
+        "v4_direct reads=11008 flock_reads=0 fallbacks=0 payload_bytes=138512695296"
+      ],
+      "decode_tps": 7.71869639794168
+    },
+    {
+      "case": "base3",
+      "exit_code": 0,
+      "wall_seconds": 90.32419571373612,
+      "peak_MiB": [
+        24422,
+        24438,
+        24448,
+        24440,
+        24448,
+        27860
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        0.932,
+        10.347
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_gpu resident-budget device=0 experts=1792 bytes=23957864448 free-MiB=30590 reserve-MiB=2800",
+        "v4_gpu resident-budget device=1 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=2 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=3 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=4 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=5 experts=2048 bytes=27380416512 free-MiB=30420 reserve-MiB=2800",
+        "v4_gpu resident-experts=ready layers=43 experts-per-layer=256 preload-seconds=73.481",
+        "v4_gpu resident-route=on device=0",
+        "v4_gpu resident-route=on device=1",
+        "v4_gpu resident-route=on device=2",
+        "v4_gpu resident-route=on device=3",
+        "v4_gpu resident-route=on device=4",
+        "v4_gpu resident-route=on device=5",
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11008 hits=0 misses=11008 hit_rate=0.000 bytes=147169738752 target_only=1",
+        "v4_direct reads=11008 flock_reads=0 fallbacks=0 payload_bytes=138512695296"
+      ],
+      "decode_tps": 6.088721368512613
+    },
+    {
+      "case": "native3",
+      "exit_code": 0,
+      "wall_seconds": 86.51748604141176,
+      "peak_MiB": [
+        24422,
+        24438,
+        24450,
+        24438,
+        24448,
+        27860
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        0.628,
+        8.18
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_gpu resident-budget device=0 experts=1792 bytes=23957864448 free-MiB=30590 reserve-MiB=2800",
+        "v4_gpu resident-budget device=1 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=2 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=3 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=4 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=5 experts=2048 bytes=27380416512 free-MiB=30420 reserve-MiB=2800",
+        "v4_gpu resident-experts=ready layers=43 experts-per-layer=256 preload-seconds=72.309",
+        "v4_gpu resident-route=on device=0",
+        "v4_gpu resident-route=on device=1",
+        "v4_gpu resident-route=on device=2",
+        "v4_gpu resident-route=on device=3",
+        "v4_gpu resident-route=on device=4",
+        "v4_gpu resident-route=on device=5",
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11008 hits=0 misses=11008 hit_rate=0.000 bytes=147169738752 target_only=1",
+        "v4_direct reads=11008 flock_reads=0 fallbacks=0 payload_bytes=138512695296"
+      ],
+      "decode_tps": 7.701711491442543
+    },
+    {
+      "case": "resident1",
+      "exit_code": 0,
+      "wall_seconds": 86.31919077038765,
+      "peak_MiB": [
+        24438,
+        24454,
+        24474,
+        24454,
+        24474,
+        27884
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        0.621,
+        7.101
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_gpu indexer-resident=on device=0 layer=2 bytes=8390656",
+        "v4_gpu indexer-resident=on device=0 layer=4 bytes=8390656",
+        "v4_gpu indexer-resident=on device=0 layer=6 bytes=8390656",
+        "v4_gpu indexer-resident=on device=1 layer=8 bytes=8390656",
+        "v4_gpu indexer-resident=on device=1 layer=10 bytes=8390656",
+        "v4_gpu indexer-resident=on device=1 layer=12 bytes=8390656",
+        "v4_gpu indexer-resident=on device=2 layer=14 bytes=8390656",
+        "v4_gpu indexer-resident=on device=2 layer=16 bytes=8390656",
+        "v4_gpu indexer-resident=on device=2 layer=18 bytes=8390656",
+        "v4_gpu indexer-resident=on device=2 layer=20 bytes=8390656",
+        "v4_gpu indexer-resident=on device=3 layer=22 bytes=8390656",
+        "v4_gpu indexer-resident=on device=3 layer=24 bytes=8390656",
+        "v4_gpu indexer-resident=on device=3 layer=26 bytes=8390656",
+        "v4_gpu indexer-resident=on device=4 layer=28 bytes=8390656",
+        "v4_gpu indexer-resident=on device=4 layer=30 bytes=8390656",
+        "v4_gpu indexer-resident=on device=4 layer=32 bytes=8390656",
+        "v4_gpu indexer-resident=on device=4 layer=34 bytes=8390656",
+        "v4_gpu indexer-resident=on device=5 layer=36 bytes=8390656",
+        "v4_gpu indexer-resident=on device=5 layer=38 bytes=8390656",
+        "v4_gpu indexer-resident=on device=5 layer=40 bytes=8390656",
+        "v4_gpu indexer-resident=on device=5 layer=42 bytes=8390656",
+        "v4_gpu resident-budget device=0 experts=1792 bytes=23957864448 free-MiB=30566 reserve-MiB=2800",
+        "v4_gpu resident-budget device=1 experts=1792 bytes=23957864448 free-MiB=30550 reserve-MiB=2800",
+        "v4_gpu resident-budget device=2 experts=1792 bytes=23957864448 free-MiB=30530 reserve-MiB=2800",
+        "v4_gpu resident-budget device=3 experts=1792 bytes=23957864448 free-MiB=30550 reserve-MiB=2800",
+        "v4_gpu resident-budget device=4 experts=1792 bytes=23957864448 free-MiB=30530 reserve-MiB=2800",
+        "v4_gpu resident-budget device=5 experts=2048 bytes=27380416512 free-MiB=30388 reserve-MiB=2800",
+        "v4_gpu resident-experts=ready layers=43 experts-per-layer=256 preload-seconds=72.278",
+        "v4_gpu resident-route=on device=0",
+        "v4_gpu resident-route=on device=1",
+        "v4_gpu resident-route=on device=2",
+        "v4_gpu resident-route=on device=3",
+        "v4_gpu resident-route=on device=4",
+        "v4_gpu resident-route=on device=5",
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11008 hits=0 misses=11008 hit_rate=0.000 bytes=147169738752 target_only=1",
+        "v4_direct reads=11008 flock_reads=0 fallbacks=0 payload_bytes=138512695296"
+      ],
+      "decode_tps": 8.871989860583016
+    },
+    {
+      "case": "resident2",
+      "exit_code": 0,
+      "wall_seconds": 85.57695870101452,
+      "peak_MiB": [
+        24438,
+        24454,
+        24476,
+        24454,
+        24474,
+        27884
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        0.603,
+        6.791
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_gpu indexer-resident=on device=0 layer=2 bytes=8390656",
+        "v4_gpu indexer-resident=on device=0 layer=4 bytes=8390656",
+        "v4_gpu indexer-resident=on device=0 layer=6 bytes=8390656",
+        "v4_gpu indexer-resident=on device=1 layer=8 bytes=8390656",
+        "v4_gpu indexer-resident=on device=1 layer=10 bytes=8390656",
+        "v4_gpu indexer-resident=on device=1 layer=12 bytes=8390656",
+        "v4_gpu indexer-resident=on device=2 layer=14 bytes=8390656",
+        "v4_gpu indexer-resident=on device=2 layer=16 bytes=8390656",
+        "v4_gpu indexer-resident=on device=2 layer=18 bytes=8390656",
+        "v4_gpu indexer-resident=on device=2 layer=20 bytes=8390656",
+        "v4_gpu indexer-resident=on device=3 layer=22 bytes=8390656",
+        "v4_gpu indexer-resident=on device=3 layer=24 bytes=8390656",
+        "v4_gpu indexer-resident=on device=3 layer=26 bytes=8390656",
+        "v4_gpu indexer-resident=on device=4 layer=28 bytes=8390656",
+        "v4_gpu indexer-resident=on device=4 layer=30 bytes=8390656",
+        "v4_gpu indexer-resident=on device=4 layer=32 bytes=8390656",
+        "v4_gpu indexer-resident=on device=4 layer=34 bytes=8390656",
+        "v4_gpu indexer-resident=on device=5 layer=36 bytes=8390656",
+        "v4_gpu indexer-resident=on device=5 layer=38 bytes=8390656",
+        "v4_gpu indexer-resident=on device=5 layer=40 bytes=8390656",
+        "v4_gpu indexer-resident=on device=5 layer=42 bytes=8390656",
+        "v4_gpu resident-budget device=0 experts=1792 bytes=23957864448 free-MiB=30566 reserve-MiB=2800",
+        "v4_gpu resident-budget device=1 experts=1792 bytes=23957864448 free-MiB=30550 reserve-MiB=2800",
+        "v4_gpu resident-budget device=2 experts=1792 bytes=23957864448 free-MiB=30530 reserve-MiB=2800",
+        "v4_gpu resident-budget device=3 experts=1792 bytes=23957864448 free-MiB=30550 reserve-MiB=2800",
+        "v4_gpu resident-budget device=4 experts=1792 bytes=23957864448 free-MiB=30530 reserve-MiB=2800",
+        "v4_gpu resident-budget device=5 experts=2048 bytes=27380416512 free-MiB=30388 reserve-MiB=2800",
+        "v4_gpu resident-experts=ready layers=43 experts-per-layer=256 preload-seconds=72.247",
+        "v4_gpu resident-route=on device=0",
+        "v4_gpu resident-route=on device=1",
+        "v4_gpu resident-route=on device=2",
+        "v4_gpu resident-route=on device=3",
+        "v4_gpu resident-route=on device=4",
+        "v4_gpu resident-route=on device=5",
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11008 hits=0 misses=11008 hit_rate=0.000 bytes=147169738752 target_only=1",
+        "v4_direct reads=11008 flock_reads=0 fallbacks=0 payload_bytes=138512695296"
+      ],
+      "decode_tps": 9.276984243852157
+    },
+    {
+      "case": "resident3",
+      "exit_code": 0,
+      "wall_seconds": 86.4054610915482,
+      "peak_MiB": [
+        24438,
+        24454,
+        24474,
+        24454,
+        24474,
+        27884
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        0.621,
+        7.074
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_gpu indexer-resident=on device=0 layer=2 bytes=8390656",
+        "v4_gpu indexer-resident=on device=0 layer=4 bytes=8390656",
+        "v4_gpu indexer-resident=on device=0 layer=6 bytes=8390656",
+        "v4_gpu indexer-resident=on device=1 layer=8 bytes=8390656",
+        "v4_gpu indexer-resident=on device=1 layer=10 bytes=8390656",
+        "v4_gpu indexer-resident=on device=1 layer=12 bytes=8390656",
+        "v4_gpu indexer-resident=on device=2 layer=14 bytes=8390656",
+        "v4_gpu indexer-resident=on device=2 layer=16 bytes=8390656",
+        "v4_gpu indexer-resident=on device=2 layer=18 bytes=8390656",
+        "v4_gpu indexer-resident=on device=2 layer=20 bytes=8390656",
+        "v4_gpu indexer-resident=on device=3 layer=22 bytes=8390656",
+        "v4_gpu indexer-resident=on device=3 layer=24 bytes=8390656",
+        "v4_gpu indexer-resident=on device=3 layer=26 bytes=8390656",
+        "v4_gpu indexer-resident=on device=4 layer=28 bytes=8390656",
+        "v4_gpu indexer-resident=on device=4 layer=30 bytes=8390656",
+        "v4_gpu indexer-resident=on device=4 layer=32 bytes=8390656",
+        "v4_gpu indexer-resident=on device=4 layer=34 bytes=8390656",
+        "v4_gpu indexer-resident=on device=5 layer=36 bytes=8390656",
+        "v4_gpu indexer-resident=on device=5 layer=38 bytes=8390656",
+        "v4_gpu indexer-resident=on device=5 layer=40 bytes=8390656",
+        "v4_gpu indexer-resident=on device=5 layer=42 bytes=8390656",
+        "v4_gpu resident-budget device=0 experts=1792 bytes=23957864448 free-MiB=30566 reserve-MiB=2800",
+        "v4_gpu resident-budget device=1 experts=1792 bytes=23957864448 free-MiB=30550 reserve-MiB=2800",
+        "v4_gpu resident-budget device=2 experts=1792 bytes=23957864448 free-MiB=30530 reserve-MiB=2800",
+        "v4_gpu resident-budget device=3 experts=1792 bytes=23957864448 free-MiB=30550 reserve-MiB=2800",
+        "v4_gpu resident-budget device=4 experts=1792 bytes=23957864448 free-MiB=30530 reserve-MiB=2800",
+        "v4_gpu resident-budget device=5 experts=2048 bytes=27380416512 free-MiB=30388 reserve-MiB=2800",
+        "v4_gpu resident-experts=ready layers=43 experts-per-layer=256 preload-seconds=72.706",
+        "v4_gpu resident-route=on device=0",
+        "v4_gpu resident-route=on device=1",
+        "v4_gpu resident-route=on device=2",
+        "v4_gpu resident-route=on device=3",
+        "v4_gpu resident-route=on device=4",
+        "v4_gpu resident-route=on device=5",
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11008 hits=0 misses=11008 hit_rate=0.000 bytes=147169738752 target_only=1",
+        "v4_direct reads=11008 flock_reads=0 fallbacks=0 payload_bytes=138512695296"
+      ],
+      "decode_tps": 8.9058524173028
+    }
+  ],
+  "profile": {
+    "baseline_8MiB_H2D_count": 1537,
+    "candidate_8MiB_H2D_count": 0,
+    "candidate_indexer_projection_calls": 1134,
+    "candidate_max_H2D_bytes": 131072,
+    "baseline_router_kernel_mean_us": 297.4446,
+    "candidate_router_kernel_mean_us": 4.1727,
+    "candidate_stage_medians_ms": {
+      "samples": 126,
+      "attention": 61,
+      "moe": 16,
+      "mhc": 7
+    },
+    "note": "Delayed CUDA capture includes different token positions/counts; candidate capture includes shutdown. Not a matched-duration throughput comparison."
+  }
+}
