@@ -1141,16 +1141,22 @@ static void replan_drain_locked(int max){
                                 * cudaFree + cudaMalloc, which synchronise the device under the async groups */
 
 static const uint32_t *g_rp_cnt; static int g_rp_base;   /* counts indexed by slot - base */
-static int cmp_rp_cand(const void *a,const void *b){          /* count desc */
-    uint32_t fa=g_rp_cnt[*(const int*)a-g_rp_base], fb=g_rp_cnt[*(const int*)b-g_rp_base];
-    return fa<fb ? 1 : fa>fb ? -1 : 0;
+/* Both orders are total (the slot index breaks the last tie): qsort is not
+ * stable, and glibc's and msvcrt's disagree on ties, so without it the same
+ * counts would pick different victims on Linux and Windows. */
+static int cmp_rp_cand(const void *a,const void *b){          /* count desc, index asc */
+    int ia=*(const int*)a, ib=*(const int*)b;
+    uint32_t fa=g_rp_cnt[ia-g_rp_base], fb=g_rp_cnt[ib-g_rp_base];
+    if(fa!=fb) return fa<fb ? 1 : -1;
+    return ia<ib ? -1 : ia>ib ? 1 : 0;
 }
-static int cmp_rp_vict(const void *a,const void *b){          /* count asc, heat asc */
+static int cmp_rp_vict(const void *a,const void *b){          /* count asc, heat asc, index asc */
     int ia=*(const int*)a, ib=*(const int*)b;
     uint32_t fa=g_rp_cnt[ia-g_rp_base], fb=g_rp_cnt[ib-g_rp_base];
     if(fa!=fb) return fa<fb ? -1 : 1;
     uint32_t ha=G.slot[ia].heat, hb=G.slot[ib].heat;
-    return ha<hb ? -1 : ha>hb ? 1 : 0;
+    if(ha!=hb) return ha<hb ? -1 : 1;
+    return ia<ib ? -1 : ia>ib ? 1 : 0;
 }
 int qt_replan(int layer,const uint32_t *counts,int max_swaps){
     if(!G.on||!counts||G_fp8_stream||max_swaps<=0||layer>=G.nl) return 0;
