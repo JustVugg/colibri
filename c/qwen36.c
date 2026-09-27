@@ -2353,6 +2353,43 @@ static void slot_ensure_int8(Model *m, Slot *s) {
     s->g = w; s->u = w + ng; s->d = w + ng + ng;
 }
 
+/* Experts the VRAM tier evicted since the last token (LFRU and re-plan swaps)
+ * lose their VRAM copy, and on an int4 container their int8 copy went at the
+ * warmstart; the first CPU miss then pays slot_ensure_int8 (a malloc and a
+ * 3 MB unpack) inside the decode step. Rebuilding them here, in parallel and
+ * before the layers run, keeps that out of the miss path: measured on the
+ * 3070, 2,000 re-plan victims cost ~7 ms/token over the next 300 tokens on
+ * the miss path and nothing here. */
+static void expert_get(Model *m, int layer, int eid, Slot **out);
+static void tier_rebuild_evicted(Model *m) {
+    if (!qt_ready()) return;
+    int ls[512], es[512];
+    int n = qt_evicted_take(ls, es, 512);
+    if (n <= 0) return;
+    #pragma omp parallel for schedule(dynamic, 4)
+    for (int i = 0; i < n; i++) {
+        Slot *e; expert_get(m, ls[i], es[i], &e);
+        slot_ensure_int8(m, e);
+    }
+}
+
+/* QT_PREFILL_REPLAN=1: after each prefill layer's routing, hand the tier that
+ * layer's counts over the prompt rows (qt_replan), so residents this prompt
+ * never routes to make way for the ones it routes to most while the rest of
+ * the prefill still computes. Measured on the 3070 (docs/qwen36-cuda-tier.md):
+ * +13..37 points decode hit rate over a heat file from other prompts, at equal
+ * budget, output unchanged (placement never changes routing). */
+static int prefill_replan_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *p = getenv("QT_PREFILL_REPLAN"); on = p && *p == '1'; }
+    return on;
+}
+static int prefill_replan_cap(void) {
+    static int cap = -1;
+    if (cap < 0) { const char *p = getenv("QT_PREFILL_REPLAN_MAX"); cap = p ? atoi(p) : 24; if (cap < 0) cap = 0; }
+    return cap;
+}
+
 /* Segna l'esperto instradato per la bitmap HITS della dashboard. Vive qui,
  * fuori dalla regione QWEN36_NO_MAIN: expert_get la chiama anche nel build
  * del segment adapter, dove il resto della telemetria serve non esiste. */
@@ -3010,6 +3047,8 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
      * (moe_vk_run): the routing is collected first, as for the shared kernel */
     int use_vk = !use_qq && !use_qt && vkt_ready();
     int use_xf = !use_qq && !use_qt && !use_vk && xf_mode(m);
+    /* prefill re-plan: this layer's routing counts over the prompt rows */
+    uint32_t *rp_cnt = (use_qt && S > 1 && prefill_replan_on()) ? calloc((size_t)E, sizeof(uint32_t)) : NULL;
     int *xidx = use_xf || use_vk ? malloc(sizeof(int) * (size_t)S * K) : NULL;
     float *xval = use_xf || use_vk ? falloc((int64_t)S * K) : NULL;
     for (int s = 0; s < S; s++) {
@@ -3087,6 +3126,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
             uint32_t *freq_l = m->freq + (int64_t)layer * E;
             for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
         }
+        if (rp_cnt) for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) rp_cnt[idx[kk]]++;
         const float *xs = x + (int64_t)s*D;
         if (use_qq) {
             /* A failed expert is fatal: once the container owns the routed
@@ -3175,6 +3215,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
             }
         }
     }
+    if (rp_cnt) { qt_replan(layer, rp_cnt, prefill_replan_cap()); free(rp_cnt); }   /* this layer's swaps upload while the next layers compute */
     if (use_xf) { moe_xf_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
     if (use_vk) { moe_vk_run(m, l, layer, x, S, out, xidx, xval, routed_only); free(xidx); free(xval); }
     /* The CUDA tier keeps its per-token shared block above because it overlaps
@@ -3607,6 +3648,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         else
             memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
     }
+    tier_rebuild_evicted(m);
 #ifdef COLI_VULKAN
     /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
      * back only when the prefill read-out below needs every row */
@@ -3999,6 +4041,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     m->kv_len = 0;
     for (int i = 0; i < np; i++) out[i] = prompt[i];
     float *logit = step(m, prompt, np, 0);
+    qt_stats_mark();   /* [qtier] stats also report the hit rate from here on */
     int len = np;
     for (int s = 0; s < n_new; s++) {
         int best = 0; float bv = logit[0];
@@ -4404,6 +4447,7 @@ static void serve_one(Model *m, ServeReq *q){
     /* `reuse` is the ABSOLUTE position of the first fresh token: attention and
      * the KV rows are position-indexed, so this has to be the real offset. */
     float *lo = step(m, ids + reuse, np - reuse, reuse);
+    qt_stats_mark();
     if (q->pin) pin_save(m, ids, np, lo);
     int gen=0, limited=1, forwards=1;   /* il prefill e' il primo forward */
     const double s_disk=m->t_disk, s_attn=tm_sum(0)+tm_sum(1), s_moe=tm_sum(2), s_head=tm_sum(5);
