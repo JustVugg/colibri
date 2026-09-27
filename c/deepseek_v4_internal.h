@@ -867,7 +867,9 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view);
 /* lookup-only twin: reports residency, never uploads (hybrid q* split) */
 int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view);
-/* 1: synchronous resident MoE completed; 0: use the normal loader/fallback.
+int coli_v4_gpu_experts_preload(ColiV4Engine *engine, char *error, size_t size);
+int coli_v4_gpu_experts_resident(ColiExpertStore *store, int layer);
+/* 1: completed; 0: use normal loader; -1: immutable resident table failed.
  * Does not acquire host leases or upload weights. */
 int coli_v4_gpu_moe_resident(ColiExpertStore *store, int layer,
     const int *ids, const float *weights, int count,

@@ -8,6 +8,7 @@
 
 struct Dsv4CudaTensor { int device; };
 static int initialized, shutdowns, live_tensors, free_queries[16], drained[16];
+static int upload_fail_after = -1, low_memory_device = -1;
 int dsv4_cuda_backend_arch_ok(int device) { return device >= 0 && device < 6; }
 const char *dsv4_cuda_backend_name(void) { return "test"; }
 int dsv4_cuda_init(const int *devices, int count) {
@@ -19,12 +20,14 @@ int dsv4_cuda_init(const int *devices, int count) {
 }
 void dsv4_cuda_shutdown(void) { shutdowns++; }
 int dsv4_cuda_device_unified(int device) { (void)device; return 0; }
-long long dsv4_cuda_mem_free_mb(int device) { free_queries[device]++; return 32000; }
+long long dsv4_cuda_mem_free_mb(int device) { free_queries[device]++; return device == low_memory_device ? 0 : 32000; }
 int dsv4_cuda_stream_drain(int device) { drained[device]++; return device != 3; }
 void dsv4_cuda_tensor_free(Dsv4CudaTensor *t) { if (t) { live_tensors--; free(t); } }
 int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t, const uint8_t *w,
                           const uint8_t *scale, int rows, int cols, int device) {
     (void)w; (void)scale; (void)rows; (void)cols;
+    if (upload_fail_after == 0) return 0;
+    if (upload_fail_after > 0) upload_fail_after--;
     *t = malloc(sizeof(**t));
     assert(*t);
     (*t)->device = device;
@@ -93,6 +96,101 @@ static void check_resident(ColiExpertStore *store, int layer, int device) {
     pthread_mutex_unlock(&locked_cache->mutex);
 }
 
+static int lookups, releases, active_leases, lookup_fail_after = -1;
+static int mock_lookup(ColiExpertStore *store, ColiExpertKey key, ColiExpertView *view) {
+    (void)store;
+    if (lookup_fail_after == 0) return -1;
+    if (lookup_fail_after > 0) lookup_fail_after--;
+    static uint8_t bytes[512];
+    memset(view, 0, sizeof(*view));
+    view->key = key;
+    view->lease = bytes;
+    view->gate.data = view->up.data = view->down.data = bytes;
+    view->gate.scales = view->up.scales = view->down.scales = bytes;
+    view->gate.rows = view->up.rows = view->down.rows = 32;
+    view->gate.columns = view->up.columns = view->down.columns = 32;
+    view->gate.block_rows = view->up.block_rows = view->down.block_rows = 1;
+    lookups++; active_leases++;
+    return 0;
+}
+static void mock_release(ColiExpertStore *store, ColiExpertView *view) {
+    (void)store;
+    assert(view->lease && active_leases == 1);
+    releases++; active_leases--;
+}
+int coli_v4_layer_load(ColiV4Engine *engine, ColiDeepSeekV4LayerWeights *weights,
+    const ColiDeepSeekV4Config *config, const ColiSafetensorsIndex *index,
+    int layer, char *error, size_t size) {
+    (void)engine; (void)config; (void)index; (void)error; (void)size;
+    memset(weights, 0, sizeof(*weights));
+    weights->plan.layer = layer;
+    return 0;
+}
+void *coli_v4_layer_gpu(const ColiDeepSeekV4LayerWeights *weights, const char *prefix) {
+    (void)weights; (void)prefix;
+    static Dsv4CudaTensor shared;
+    return &shared;
+}
+static void test_preload(void) {
+    ColiV4Engine *engine = calloc(1, sizeof(*engine));
+    const ColiExpertStoreOps ops = {.lookup = mock_lookup, .release = mock_release};
+    ColiExpertStore store = {.ops = &ops};
+    engine->experts = &store;
+    engine->runtime.dense_resident = 1;
+    engine->config.num_hidden_layers = 6;
+    engine->config.n_routed_experts = 2;
+    engine->config.hidden_size = engine->config.moe_intermediate_size = 32;
+    engine->gpu.enabled = 1;
+    engine->gpu.device_count = 2;
+    engine->gpu.devices[0] = 5; engine->gpu.devices[1] = 3;
+    store.gpu = v4_gpu_expert_mirrors_create_devices(engine->gpu.devices, 2, 6);
+    void *original = store.gpu;
+    char error[256];
+    low_memory_device = 3;
+    assert(coli_v4_gpu_experts_preload(engine, error, sizeof(error)) == -1);
+    assert(store.gpu == original && lookups == 0 && !live_tensors);
+    low_memory_device = -1;
+    upload_fail_after = 20; /* fail on the second device after publishing none */
+    assert(coli_v4_gpu_experts_preload(engine, error, sizeof(error)) == -1);
+    assert(store.gpu == original && !active_leases && !live_tensors && releases == lookups);
+    upload_fail_after = -1;
+    lookup_fail_after = 7;
+    assert(coli_v4_gpu_experts_preload(engine, error, sizeof(error)) == -1);
+    assert(store.gpu == original && !active_leases && !live_tensors && releases == lookups);
+    lookup_fail_after = -1;
+    int before = lookups;
+    assert(coli_v4_gpu_experts_preload(engine, error, sizeof(error)) == 0);
+    assert(store.gpu != original && lookups == before + 12 && releases == lookups);
+    assert(live_tensors == 36 && !active_leases);
+    for (int layer = 0; layer < 6; layer++) {
+        locked_cache = v4_gpu_expert_cache(&store, layer);
+        assert(coli_v4_gpu_experts_resident(&store, layer));
+        assert(v4_gpu_expert_find(locked_cache, layer, -1) == NULL);
+        assert(v4_gpu_expert_find(locked_cache, layer, 2) == NULL);
+        assert(v4_gpu_expert_find(locked_cache, 6, 0) == NULL);
+        for (int expert = 0; expert < 2; expert++) {
+            V4GpuExpertMirror *entry = v4_gpu_expert_find(locked_cache, layer, expert);
+            assert(entry->layer == layer && entry->expert == expert);
+            assert(entry->gate->device == (layer < 3 ? 5 : 3));
+        }
+        int ids[] = {1, 0}; float w[] = {.25f, .75f}, x = 7, y = 0;
+        Dsv4CudaTensor shared = {layer < 3 ? 5 : 3};
+        assert(coli_v4_gpu_moe_resident(&store, layer, ids, w, 2,
+            &shared, &shared, &shared, 0, &y, &x) == 1 && y == x);
+        moe_ok = 0;
+        assert(coli_v4_gpu_moe_resident(&store, layer, ids, w, 2,
+            &shared, &shared, &shared, 0, &y, &x) == -1);
+        moe_ok = 1;
+        ids[1] = 2;
+        assert(coli_v4_gpu_moe_resident(&store, layer, ids, w, 2,
+            &shared, &shared, &shared, 0, &y, &x) == -1);
+    }
+    assert(lookups == before + 12); /* compute never reacquired host weights */
+    v4_gpu_expert_mirrors_free(store.gpu);
+    assert(!live_tensors);
+    free(engine);
+}
+
 int main(void) {
     ColiV4Engine *engine = calloc(1, sizeof(*engine));
     ColiExpertStore store = {0};
@@ -137,6 +235,7 @@ int main(void) {
     assert(coli_v4_gpu_engine_open(engine) == -1);
     assert(!store.gpu && shutdowns == 1);
     free(engine);
+    test_preload();
     puts("test_v4_gpu_placement: ok");
     return 0;
 }
