@@ -310,6 +310,10 @@ $(V4_SERVE_TEST): tests/test_v4_serve_framing.c deepseek_v4.c deepseek_v4.h \
 		deepseek_v4_internal.h serve_codec.h $(V4_SERVE_TEST_OBJS)
 	$(CC) $(CFLAGS) $< $(V4_SERVE_TEST_OBJS) -o $@ $(LDFLAGS)
 
+tools/bench_dsv4_head_batch: tools/bench_dsv4_head_batch.c deepseek_v4.c deepseek_v4.h \
+		deepseek_v4_internal.h deepseek_v4_dspark.inc serve_codec.h $(V4_SERVE_TEST_OBJS)
+	$(CC) $(CFLAGS) $< $(V4_SERVE_TEST_OBJS) -o $@ $(LDFLAGS)
+
 # The CUDA tier loader object. Compiled only on Windows, where it is appended
 # to V4_OBJS and resolves the MSVC-built coli_cuda_dsv4.dll at runtime. On
 # Linux it is empty so the engine links without it.
@@ -368,6 +372,7 @@ endif
 deepseek-v4-clean:
 	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_HOT_TEST_OBJ) \
 		$(V4_BATCH_TEST_OBJ) \
+		tools/bench_dsv4_head_batch \
 		$(V4_SERVE_TEST) tests/test_dsv4_multigpu_cuda \
 		tests/test_dsv4_compressor_cuda tests/test_dsv4_compressor_state_cuda \
 		tests/test_dsv4_indexer_prepare_cuda tests/test_dsv4_wo_decode_cuda tests/test_dsv4_head_cuda \

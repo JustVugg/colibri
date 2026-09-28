@@ -10492,7 +10492,7 @@ int coli_v4_gpu_head_scores(ColiV4Engine *engine,const float *input,float *score
 int coli_v4_gpu_head_batch(ColiV4Engine *engine,const float *input,int batch,
                            float *scores,int *ids,float *values) {
     const char *enabled = getenv("DSV4_CUDA_HEAD_BATCH");
-    if (!enabled || !atoi(enabled) || !engine || !engine->gpu.enabled ||
+    if ((enabled && !atoi(enabled)) || !engine || !engine->gpu.enabled ||
         !engine->gpu.head || !input || batch < 1 || batch > 128) return -1;
     if (scores)
         return dsv4_cuda_head_scores_batch_exact(engine->gpu.head, input, batch, scores) ? 0 : -1;
