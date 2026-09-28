@@ -32,6 +32,11 @@ typedef struct {
 
 static struct {
     int on, nl, ne, D, Ih, topk, ndev;
+    /* Once-only teardown latch (0 = nobody has claimed qt_shutdown yet). Kept
+     * out of the G.mx-protected set on purpose: teardown destroys G.mx, so a
+     * claim taken under that mutex has a window in which a late caller locks a
+     * destroyed mutex. This one is a single atomic test-and-set. */
+    int teardown;
     int egs; size_t sc_gu, sc_d;   /* expert group size + per-matrix scale counts (gs64) */
     /* Formato dei pesi che il tier spedisce in VRAM: 4 = int4 raggruppato
      * (container gs64), 1 = int8 per-riga. Prima era cablato a 4 in ogni punto,
@@ -79,8 +84,31 @@ static struct {
  * hook must return with G.mx held. */
 void (*qt_test_take_wake_hook)(void);
 #define QT_TAKE_WAKE_HOOK() (qt_test_take_wake_hook ? qt_test_take_wake_hook() : (void)0)
+/* Test-only seams either side of the G.waiters drain in qt_shutdown, both
+ * with G.mx held. The claim under test -- teardown must not begin while a
+ * woken caller is still inside qt_fill_wait -- is a NEGATIVE one, and a
+ * timeout can never prove it: delay the shutdown thread past the poll and a
+ * deleted drain still reports success (#1564). So both ends of the drain
+ * report themselves instead.
+ *
+ * WAIT fires from inside `while(G.waiters)`, which the loop only reaches when
+ * it has found a caller to wait for: a shutdown thread that never runs it has
+ * deleted the drain, and its silence is the signal a test can act on.
+ * LEAVE fires after the drain and before any teardown, with G.mx held, so a
+ * test reads G.waiters on the shutdown thread itself -- no wall clock
+ * anywhere, and no scheduling delay can make a teardown that never waited
+ * look like one that did.
+ *
+ * Compiled out of production objects like the hook above; each must return
+ * with G.mx held. */
+void (*qt_test_drain_wait_hook)(void);
+void (*qt_test_drain_leave_hook)(void);
+#define QT_DRAIN_WAIT_HOOK() (qt_test_drain_wait_hook ? qt_test_drain_wait_hook() : (void)0)
+#define QT_DRAIN_LEAVE_HOOK() (qt_test_drain_leave_hook ? qt_test_drain_leave_hook() : (void)0)
 #else
 #define QT_TAKE_WAKE_HOOK() ((void)0)
+#define QT_DRAIN_WAIT_HOOK() ((void)0)
+#define QT_DRAIN_LEAVE_HOOK() ((void)0)
 #endif
 
 /* Count parked callers so shutdown can reclaim their shared storage safely. */
@@ -755,7 +783,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     int th_ok=pthread_create(&G.th,NULL,uploader,NULL)==0;
     qt_aff_restore(&aff);
     if(!th_ok) return 0;
-    G.on=1;
+    G.on=1; __atomic_store_n(&G.teardown, 0, __ATOMIC_RELEASE);
     fprintf(stderr,"[qtier] CUDA VRAM expert tier active: %d device(s), %.2f MB/expert\n",
             G.ndev, G.exp_bytes/1048576.0);
     return 1;
@@ -1158,7 +1186,28 @@ void qt_stats(void){
 }
 
 void qt_shutdown(void){
-    if(!G.on) return;
+    /* Claim the teardown once, then do the work outside the lock. Testing
+     * `if(!G.on) return;` and clearing G.on only at the END of the teardown
+     * is check-then-act with nothing held across the two: two concurrent
+     * callers both read "on" and both ran everything below -- pthread_join
+     * (G.th) twice, coli_cuda_tensor_free on every slot twice, free() of
+     * G.slot/G.is_x/G.fill_order/G.heat0 twice, the condvars and G.mx
+     * destroyed twice (#1564, exit 139). A sequential second shutdown always
+     * passed, which is exactly why this survived: by then the flag is clear.
+     *
+     * The latch is an atomic test-and-set rather than a claim under G.mx
+     * because teardown DESTROYS G.mx: a caller arriving after that would
+     * otherwise take the claim on a destroyed mutex. Here the loser returns
+     * without touching teardown state at all, however late it is.
+     *
+     * Winning the latch also switches the tier off under G.mx, so every
+     * sibling `if(!G.on) return` refuses from here on and no new caller can
+     * walk into the storage this thread is about to free. G.mx is still live
+     * on this path -- only the latch winner ever reaches it. */
+    if(__atomic_exchange_n(&G.teardown, 1, __ATOMIC_ACQ_REL)) return;
+    pthread_mutex_lock(&G.mx);
+    G.on=0;
+    pthread_mutex_unlock(&G.mx);
     const char *hf=getenv("HEAT_FILE");
     if(hf && !G_int4_stream){
         FILE *f=fopen(hf,"wb");
@@ -1176,7 +1225,8 @@ void qt_shutdown(void){
     pthread_mutex_lock(&G.mx);
     G.th_stop=1; pthread_cond_signal(&G.cv); pthread_cond_broadcast(&G.cv_take);
     while(G.blocking_calls) pthread_cond_wait(&G.cv_take,&G.mx);
-    while(G.waiters) pthread_cond_wait(&G.cv_take,&G.mx);
+    while(G.waiters){ QT_DRAIN_WAIT_HOOK(); pthread_cond_wait(&G.cv_take,&G.mx); }
+    QT_DRAIN_LEAVE_HOOK();
     pthread_mutex_unlock(&G.mx);
     pthread_join(G.th,NULL);
     /* The backend queues expert kernels and the output download on its device
@@ -1186,8 +1236,7 @@ void qt_shutdown(void){
         for(int i=0;i<G.ndev;i++)
             if(G.is_cnt[i]) (void)coli_cuda_expert_group_take(G.dev[i]);
     G.issue_open=0;
-    G.on=0;
-    for(size_t i=0;i<(size_t)G.nl*G.ne;i++){
+    for(size_t i=0;i<(size_t)G.nl*G.ne;i++){  /* G.on went to 0 with the claim */
         coli_cuda_tensor_free(G.slot[i].tg);
         coli_cuda_tensor_free(G.slot[i].tu);
         coli_cuda_tensor_free(G.slot[i].td);

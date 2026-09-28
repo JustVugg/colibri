@@ -1713,6 +1713,16 @@ tests/test_qwen36_tier_multidev$(EXE): tests/test_qwen36_tier_multidev.c tests/q
 tests/test_qwen36_tier_shutdown$(EXE): tests/test_qwen36_tier_shutdown.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# Same fake backend, but N threads calling qt_shutdown() at the same barrier on a
+# freshly booted tier: the teardown must happen ONCE (#1564). A bare
+# `if(!G.on) return;` is check-then-act with no lock across it, so concurrent
+# callers both ran the whole teardown and double-freed the expert slots (exit
+# 139) while a sequential second shutdown passed, which is what hid it. The
+# experts are made resident first on purpose: with nothing live there is
+# nothing to double-free and the test would pass against the defect.
+tests/test_qwen36_tier_shutdown_concurrent$(EXE): tests/test_qwen36_tier_shutdown_concurrent.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 # Same fake backend, but driving the ENGINE: the warmstart in qwen36.c hands the
 # tier raw pointers into the RAM expert slots, so only a test that includes
 # qwen36.c can prove the weights behind them are still there afterwards -- on an

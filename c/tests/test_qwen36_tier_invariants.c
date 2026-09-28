@@ -354,6 +354,8 @@ static void test_shutdown_wakes_everyone(void) {
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_cv = PTHREAD_COND_INITIALIZER;
 static int g_gate_closed, g_gate_entered, g_shut_done;
+static int g_drain_entered, g_drain_left;
+static int g_waiters_at_teardown = -1;
 static unsigned g_seq, g_seq_caller, g_seq_shut;
 
 /* the held upload: fake_upload_hook carries no context, so this state is
@@ -390,6 +392,29 @@ static void drain_gate(void) {
     pthread_mutex_unlock(&g_mx);
     pthread_mutex_lock(&G.mx);
 }
+/* Fires on the first trip round `while(G.waiters)`, which the loop only
+ * reaches when the drain has actually found a caller to wait for: a shutdown
+ * thread that never runs this line has deleted the drain, and its silence is
+ * the signal. Unlike the old 2 s poll, a missing announcement FAILS.
+ *
+ * Lock-free on purpose, and it must stay that way. It runs with G.mx held,
+ * and a first draft that parked here (dropping G.mx) opened a lost-wakeup
+ * window between the loop's condition test and its pthread_cond_wait: the
+ * caller could decrement G.waiters and broadcast across the gap, and the
+ * loop then slept on a condition that was already false -- a 10 s hang on
+ * about one run in twenty. A single store cannot do that. */
+static void drain_wait(void) {
+    __atomic_store_n(&g_drain_entered, 1, __ATOMIC_RELEASE);
+}
+/* Fires after the drain and before any teardown, on the shutdown thread with
+ * G.mx held, so G.waiters is read under the lock. Teardown starting with a
+ * woken caller still inside is exactly the defect under test, and reading it
+ * here makes the verdict independent of how late either thread runs. */
+static void drain_leave(void) {
+    g_waiters_at_teardown = G.waiters;
+    __atomic_store_n(&g_drain_left, 1, __ATOMIC_RELEASE);
+}
+
 static void *th_drain_caller(void *a) {
     (void)a;
     qt_fill_wait();
@@ -403,7 +428,11 @@ static void *th_drain_shutdown(void *a) {
     return NULL;
 }
 
-#define DRAIN_SETTLE_MS 2000             /* how long the mutant needs to prove itself */
+/* No timeout is a proof any more. This is only how long the shutdown thread
+ * gets to REACH the drain before the run is declared a hang: a miss fails,
+ * which is the opposite polarity to the poll it replaces, and the verdict
+ * below comes from the shutdown thread either way. */
+#define DRAIN_REACH_MS 5000
 
 static void test_shutdown_waits_for_woken_caller(void) {
     enum { NL = 2, NE = 8 };
@@ -418,8 +447,12 @@ static void test_shutdown_waits_for_woken_caller(void) {
     check(up_entered, "the uploader must sit inside a held upload for a caller to have anything to wait for");
 
     g_gate_closed = 1; g_gate_entered = 0; g_shut_done = 0;
+    g_drain_entered = 0; g_drain_left = 0;
+    g_waiters_at_teardown = -1;
     g_seq = g_seq_caller = g_seq_shut = 0;
     qt_test_take_wake_hook = drain_gate;
+    qt_test_drain_wait_hook = drain_wait;
+    qt_test_drain_leave_hook = drain_leave;
 
     pthread_t c;
     pthread_create(&c, NULL, th_drain_caller, NULL);
@@ -429,28 +462,47 @@ static void test_shutdown_waits_for_woken_caller(void) {
     /* let the upload land: inflight reaches 0, the uploader retires, and the
      * parked caller is woken -- straight into the gate, still inside
      * G.waiters, so shutdown has something left to wait for */
-    arm_watchdog(10);
+    arm_watchdog(30);
     set_upload_held(0);
     wait_flag(&g_mx, &g_gate_entered, 1000);
     check(g_gate_entered, "the woken caller must reach the gate, or the window under test never opened");
 
     pthread_t s;
     pthread_create(&s, NULL, th_drain_shutdown, NULL);
-    wait_flag(&g_mx, &g_shut_done, DRAIN_SETTLE_MS);
+    /* Positive claim, driven from inside qt_shutdown: the drain announces
+     * itself only once it has found the parked caller to wait for. Waiting
+     * for the announcement costs nothing when the drain is present, and when
+     * it is deleted the wait simply runs out and the check below fails --
+     * where the old 2 s poll used to give up and report success. */
+    for (int i = 0; i < DRAIN_REACH_MS; i++) {
+        if (__atomic_load_n(&g_drain_entered, __ATOMIC_ACQUIRE)) break;
+        struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);
+    }
+    int entered = __atomic_load_n(&g_drain_entered, __ATOMIC_ACQUIRE);
+    check(entered,
+          "qt_shutdown must reach the G.waiters drain while an awakened qt_fill_wait caller is still inside it: "
+          "the drain never ran, so teardown was free to proceed under a caller that had not left");
 
-    pthread_mutex_lock(&g_mx); int shut_early = g_shut_done; pthread_mutex_unlock(&g_mx);
-    check(!shut_early,
-          "qt_shutdown must not return while an awakened qt_fill_wait caller is still inside it: "
-          "teardown freed G.slot and destroyed G.mx under a caller that had not left");
-
+    /* The drain is now live and the caller is still parked inside it, so the
+     * only way out for shutdown is to wait. Open the caller's gate and read
+     * the verdict from the shutdown thread once both are home. */
     pthread_mutex_lock(&g_mx); g_gate_closed = 0; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mx);
     pthread_join(c, NULL); pthread_join(s, NULL);
     disarm_watchdog();
     fake_upload_hook = NULL;
+    qt_test_take_wake_hook = NULL;
+    qt_test_drain_wait_hook = NULL;
+    qt_test_drain_leave_hook = NULL;
 
+    int left = __atomic_load_n(&g_drain_left, __ATOMIC_ACQUIRE), waiters = g_waiters_at_teardown;
     pthread_mutex_lock(&g_mx);
     int ordered = g_shut_done && g_seq_caller && g_seq_caller < g_seq_shut;
     pthread_mutex_unlock(&g_mx);
+    check(left, "qt_shutdown must reach the pre-teardown probe after the drain");
+    check(waiters == 0,
+          "qt_shutdown began tearing down while an awakened qt_fill_wait caller was still inside it "
+          "(G.waiters was nonzero at the pre-teardown probe): "
+          "teardown freed G.slot and destroyed G.mx under a caller that had not left");
     check(ordered, "the awakened caller must leave qt_fill_wait before qt_shutdown returns");
     check(!G.on, "the drained shutdown still switches the tier off");
 }
