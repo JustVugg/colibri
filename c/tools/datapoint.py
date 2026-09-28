@@ -423,6 +423,7 @@ def run_persistent_engine(engine, snap, prompt, max_new, warmup_runs, warm_runs,
 def run_fresh_engine(engine, snap, prompt, max_new, runs, cap, bits, memory_gb=None):
     results = []
     engine_name = os.path.basename(engine).lower()
+    qwen_file_cli = engine_name in ("qwen36", "qwen36.exe", "qwen38", "qwen38.exe")
 
     for i in range(runs):
         env = dict(os.environ, CHAT="1", COLI_TEMP="0", MAX_NEW=str(max_new),
@@ -439,8 +440,8 @@ def run_fresh_engine(engine, snap, prompt, max_new, runs, cap, bits, memory_gb=N
             mem_str = str(int(memory_gb)) if memory_gb is not None else "32"
             cmd = [engine, snap, prompt, "--max-tokens", str(max_new), "--memory-gb", mem_str]
             stdin_input = None
-        elif engine_name in ("qwen38", "qwen38.exe"):
-            # Qwen3.8's direct CLI takes a prompt filename at argv[3]; stdin is
+        elif qwen_file_cli:
+            # Qwen3.6/3.8 direct CLIs take a prompt filename at argv[3]; stdin is
             # reserved for its persistent SERVE protocol.  Close the temporary
             # file before launch so this path also works on Windows.
             handle = tempfile.NamedTemporaryFile(
@@ -480,9 +481,9 @@ def run_fresh_engine(engine, snap, prompt, max_new, runs, cap, bits, memory_gb=N
         m = LOAD_RE.search(output)
         if m:
             load_s, rss = float(m.group(1)), float(m.group(2))
-            speed = QWEN38_SPEED_RE.search(output) if engine_name in ("qwen38", "qwen38.exe") else None
-            if engine_name in ("qwen38", "qwen38.exe") and not speed:
-                sys.exit(f"could not parse Qwen3.8 generation count/speed:\n{output[-400:]}")
+            speed = QWEN38_SPEED_RE.search(output) if qwen_file_cli else None
+            if qwen_file_cli and not speed:
+                sys.exit(f"could not parse Qwen generation count/speed:\n{output[-400:]}")
             gen_s = float(speed.group(1)) if speed else wall - load_s
             tok_count = int(speed.group(2)) if speed else max_new
         else:
@@ -500,10 +501,18 @@ def run_fresh_engine(engine, snap, prompt, max_new, runs, cap, bits, memory_gb=N
             load_s = float(m_first.group(1)) if m_first else max(0.0, wall - gen_s)
             rss = float(m_ram.group(1)) if m_ram else (float(memory_gb) if memory_gb is not None else 0.0)
 
+        prompt_tokens, ttft = 0, None
+        if qwen_file_cli:
+            encoded = re.search(r"\[enc\] prompt tokens:\s*(\d+)", output)
+            first = re.search(r"TTFT:\s*([\d.]+)\s*s", output)
+            peak = re.search(r"PEAK RSS:\s*([\d.]+)\s*GB", output)
+            if encoded: prompt_tokens = int(encoded.group(1))
+            if first: ttft = float(first.group(1))
+            if peak: rss = float(peak.group(1))
         tok_s = tok_count / gen_s if gen_s > 0 else 0.0
-        results.append({"tokens": tok_count, "prompt_tokens": 0,
-                        "wall_s": wall, "request_s": max(0.0, wall - load_s),
-                        "ttft_s": None, "gen_s": gen_s, "tok_s": tok_s,
+        results.append({"tokens": tok_count, "prompt_tokens": prompt_tokens,
+                        "wall_s": wall, "request_s": gen_s if qwen_file_cli else max(0.0, wall - load_s),
+                        "ttft_s": ttft, "gen_s": gen_s, "tok_s": tok_s,
                         "hit": None, "rss": rss, "load_s": load_s,
                         "length_limited": tok_count >= max_new, "profile": None})
     return results

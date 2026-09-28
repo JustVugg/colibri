@@ -333,6 +333,41 @@ class PersistentDatapointTest(unittest.TestCase):
 
 
 class FreshDatapointTest(unittest.TestCase):
+    def test_qwen36_file_cli_reports_actual_tokens_ttft_and_final_peak(self):
+        observed = {}
+
+        def fake_run(command, **kwargs):
+            path = Path(command[3])
+            observed.update(path=path, prompt=path.read_text(encoding="utf-8"))
+            self.assertEqual(command[:3], ["/tmp/qwen36", "8", "4"])
+            self.assertIsNone(kwargs["input"])
+            self.assertEqual(kwargs["env"]["N_NEW"], "7")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr=(
+                "[enc] prompt tokens: 11 | generating 7 new tokens\n"
+                "resident weights loaded in 1.5s | RSS after load: 1.0 GB\n"
+                "TTFT: 0.75 s (time to first token)\n"
+                "PEAK RSS: 2.0 GB\n"
+                "Speed: 2.00 tok/s (2.0s for 4 tokens)\n"))
+
+        with mock.patch.object(datapoint.subprocess, "run", side_effect=fake_run):
+            rows = datapoint.run_fresh_engine("/tmp/qwen36", "/model", "hello 世界",
+                                             max_new=7, runs=1, cap=8, bits=4)
+        self.assertEqual(observed["prompt"], "hello 世界")
+        self.assertFalse(observed["path"].exists())
+        self.assertEqual(rows[0]["tokens"], 4)
+        self.assertEqual(rows[0]["prompt_tokens"], 11)
+        self.assertEqual(rows[0]["ttft_s"], 0.75)
+        self.assertEqual(rows[0]["rss"], 2.0)
+        self.assertEqual(rows[0]["request_s"], 2.0)
+        self.assertFalse(rows[0]["length_limited"])
+
+    def test_qwen36_missing_speed_is_not_a_successful_measurement(self):
+        run = subprocess.CompletedProcess([], 0, stdout="", stderr=
+            "resident weights loaded in 1.5s | RSS after load: 1.0 GB\n")
+        with mock.patch.object(datapoint.subprocess, "run", return_value=run), \
+             self.assertRaisesRegex(SystemExit, "could not parse Qwen"):
+            datapoint.run_fresh_engine("/tmp/qwen36", "/model", "hello", 7, 1, 8, 4)
+
     def test_qwen38_receives_a_temporary_prompt_file_and_exact_generation_cap(self):
         observed = {}
 
