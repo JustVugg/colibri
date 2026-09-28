@@ -567,6 +567,18 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         return 0;
     }
     if(topk>QT_MAX_ROWS){ fprintf(stderr,"[qtier] topk>%d unsupported\n",QT_MAX_ROWS); return 0; }
+    /* One tier per process, and this is the last line before the tier state is
+     * rebuilt. A second init while the first is still live used to memset G
+     * over a running uploader: the mutex and both condvars it is parked on,
+     * its thread handle (a second uploader starts, the first is orphaned and
+     * never joined), the slot array and the host allocations behind it, and --
+     * the part that undoes d23b2744 -- G.teardown, which comes back as 0 and
+     * hands the once-only teardown claim straight back. The next qt_shutdown
+     * would then tear the tier down a second time (#1564). G.on is set at the
+     * end of a successful init and cleared by the latch winner, so it is the
+     * one flag that separates "never started / already torn down" from "live".
+     * Refuse: the live tier keeps serving, and qt_ready() still reports it. */
+    if(G.on) return 0;
     memset(&G,0,sizeof G);
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk;
     /* Placement state is re-derived per init: the device fold-in below reads

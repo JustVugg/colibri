@@ -1720,8 +1720,12 @@ tests/test_qwen36_tier_shutdown$(EXE): tests/test_qwen36_tier_shutdown.c tests/q
 # 139) while a sequential second shutdown passed, which is what hid it. The
 # experts are made resident first on purpose: with nothing live there is
 # nothing to double-free and the test would pass against the defect.
+# -DQT_TEST_HOOKS hands the test qt_test_drain_leave_hook, which sits past the
+# once-only claim, so "the teardown ran once" is counted where it is decided
+# instead of being inferred from a 60 s watchdog after a double pthread_join
+# has already wedged the process. Production objects omit the hooks entirely.
 tests/test_qwen36_tier_shutdown_concurrent$(EXE): tests/test_qwen36_tier_shutdown_concurrent.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
-	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) -DCOLI_CUDA -DQT_TEST_HOOKS $< -o $@ $(LDFLAGS)
 
 # Same fake backend, but driving the ENGINE: the warmstart in qwen36.c hands the
 # tier raw pointers into the RAM expert slots, so only a test that includes
