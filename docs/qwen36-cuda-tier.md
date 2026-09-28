@@ -203,6 +203,67 @@ overwrote the group's input and output mid-flight -- no CUDA error, only
 wrong numbers. qwen36 never called the dense path inside that window, so its
 outputs were unaffected.
 
+## The DeltaNet layer on the card (`Q36_DN_GPU=1`)
+
+With the trunk in VRAM the CPU still spent about 8 of 39 ms per token on the
+thirty DeltaNet layers' convolution, L2 norms, recurrence and gated norm
+(`dn-sub: proj 7.9 | conv 3.0 | l2n+rec 2.4 | norm+out 2.8`). None of that is
+arithmetic -- a token's convolution is 33k multiply-adds, the recurrence 32
+outer products of 128 x 128 -- it is the round trip: the in_proj's result
+came down to the host, the recurrence ran there, its output went back up for
+the out_proj, four copies and their synchronisations per layer, thirty layers
+per token.
+
+`Q36_DN_GPU=1` keeps the layer on the card. For every DeltaNet layer whose
+in_proj (`dnproj`) and out_proj (`dnout`) the placer put on the same device,
+the conv ring, the recurrent state (32 x 128 x 128 f32, 2 MB per layer, 63 MB
+for the 35B) and the conv/norm weights go there too, and a decode token runs
+the layer end to end in one device chain (`coli_cuda_dn_step`): x up, in_proj
+GEMV, causal conv + SiLU, per value head the L2 norms (double, eps inside the
+square root as on the CPU), the decay, the delta against the decayed state,
+the write-back, `out = q^T S` over the updated state, the gated RMSNorm with
+`silu(z)`, out_proj GEMV, out down. The two gates (`a`, `b` projections, 32
+outputs each) stay on the CPU and travel as kernel parameters. One upload and
+one download of 8 KB per layer, the state never crosses the bus.
+
+The host arrays remain the state's owner. The card's copy is a cache that is
+either fresh (holds what the host holds) or ahead of it; a CPU step -- a
+prompt (`S > 1` keeps the batched CPU path), a layer whose projections are
+not on one card, a step after a failed GPU step -- pulls the state down
+first, a snapshot for `--pin` pulls all layers, `reset_recurrent` and a pin
+restore invalidate the card's copy. So `--pin`, prefix reuse and the
+`QT_UPLOAD_SYNC`-style diagnostics keep working unchanged. The automatic
+placer now puts a layer's `dnout` on the device its `dnproj` went to when that
+device has the room, so under `auto` every DeltaNet layer qualifies; a
+hand-written list must keep the two on one card itself (note that a split
+such as `dnproj=0:20+1:20` counts *model* layers 0..39, not DeltaNet layers).
+
+Measured on the 3070 alone (per-row int4 35B, 49-token prompt, 200 decoded
+tokens, trunk in VRAM, `COLI_TIMERS=1`):
+
+| | `Q36_DN_GPU=0` | `Q36_DN_GPU=1` |
+|---|---|---|
+| DeltaNet ms/token | 16.2 | **10.8** |
+| token ms | 39.4 / 39.3 | **33.9 / 33.3** |
+| tok/s (engine line, TTFT included) | 21.2 / 21.3 | **24.1 / 24.4** |
+| VRAM hit rate | 82 % | 82 % |
+| layers on the card | 0 | 30 |
+
+Fourteen per cent per token; the 10.8 ms that remain are the two GEMVs (16
+and 8 MB per layer) and the two copies. The output is not byte-identical to
+the CPU path (the GEMVs sum in a different order; two GPU runs are identical
+to each other), same as every other placed component. On two cards the layer
+gains the same 6-7 ms, but this box's second card (Quadro RTX 4000) runs a
+dense GEMV about 65 % slower than the 3070 (lm_head 7.3 against 4.4 ms), and
+at 99-100 % expert residency the MoE phase only drops from 14.0 to 11.2-13.6
+ms -- the expert groups are bound by GPU time and by the slower card's
+`take()`, not by misses -- so the best two-card form (trunk on the 3070,
+`experts=all`) lands at 32.9 ms, level with the 3070 alone.
+
+`COLI_PLACE` gained `experts=all`: the routed experts stay on every
+`COLI_GPUS` card even when a hand-written list reserves some of them for the
+trunk (the default hands a reserved card's experts back to the others, #1361).
+
 ## Measured (Threadripper 3945WX 12C, RTX 3070 8 GB + Quadro RTX 4000 8 GB, Qwen3.6-35B-A3B int4, 200-token decode)
 
 | | 1 GPU (8 GB) | 2 GPUs (16 GB) |
