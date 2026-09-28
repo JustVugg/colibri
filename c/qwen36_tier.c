@@ -118,9 +118,16 @@ void (*qt_test_drain_leave_hook)(void);
 void (*qt_test_gate_block_hook)(void);
 void (*qt_test_gate_freed_hook)(void);
 void (*qt_test_reader_pre_hook)(void);
+/* Test-only, inside qt_lmhead_init, on the last line before the lifecycle
+ * admission -- the window a pre-gate read of G_lmh.dev_ok leaves open, and the
+ * one seam wide enough to walk a caller through a shutdown and a re-init and
+ * land it in a generation that never asked for what it is about to install.
+ * Runs with no lock held and must touch no state. */
+void (*qt_test_lmhead_pre_gate_hook)(void);
 #define QT_GATE_BLOCK_HOOK() (qt_test_gate_block_hook ? qt_test_gate_block_hook() : (void)0)
 #define QT_GATE_FREED_HOOK() (qt_test_gate_freed_hook ? qt_test_gate_freed_hook() : (void)0)
 #define QT_READER_PRE_HOOK() (qt_test_reader_pre_hook ? qt_test_reader_pre_hook() : (void)0)
+#define QT_LMHEAD_PRE_GATE_HOOK() (qt_test_lmhead_pre_gate_hook ? qt_test_lmhead_pre_gate_hook() : (void)0)
 #else
 #define QT_TAKE_WAKE_HOOK() ((void)0)
 #define QT_DRAIN_WAIT_HOOK() ((void)0)
@@ -128,6 +135,7 @@ void (*qt_test_reader_pre_hook)(void);
 #define QT_GATE_BLOCK_HOOK() ((void)0)
 #define QT_GATE_FREED_HOOK() ((void)0)
 #define QT_READER_PRE_HOOK() ((void)0)
+#define QT_LMHEAD_PRE_GATE_HOOK() ((void)0)
 #endif
 
 /* ====================== tier lifecycle gate ===============================
@@ -244,6 +252,27 @@ static void qt_gate_xleave(void){
     qg_x=0; pthread_cond_broadcast(&qg_cv);
     pthread_mutex_unlock(&qg_mx);
 }
+
+/* Trunk-only storage ownership, counted here and not in G for the reason the
+ * lifecycle state is: qt_init memsets G, and an init must not be able to erase
+ * the record of storage a teardown still has to free.
+ *
+ * G_dnp[] is live with the expert tier NEVER started -- the dense projections
+ * are admitted by qt_gate_enter_trunk() at QT_DEAD -- so the state alone does
+ * not say whether anything is still resident. Nothing counted that, and a
+ * qt_shutdown that found the state already DEAD returned at once, so the
+ * projections were never freed: qt_dnproj_matmul kept computing on them
+ * through the trunk gate, and a later qt_dnproj_init of the SAME SHAPE was
+ * answered by the backend's cached path (backend_cuda.cu returns 1 from a
+ * non-NULL *tensor whose fmt/I/O/device/gs match, WITHOUT copying) -- a new
+ * generation running on the previous generation's weights, with nothing
+ * reporting it. A DEAD fast path may only return when there is nothing left
+ * to free.
+ *
+ * G_lmh needs no counter of its own: it is only ever created under the full
+ * gate, so half two of every teardown that can see it also frees it. This is
+ * the trunk's "the expert tier may never start" case, and nothing else. */
+static int qg_trunk;      /* live G_dnp[].t tensors; written under the gate */
 
 /* Count parked callers so shutdown can reclaim their shared storage safely. */
 static void wait_take_locked(void){
@@ -969,17 +998,36 @@ static int qt_init_body(int nl, int ne, int D, int Ih, int cap, int topk,
 int qt_ready(void){ return qg_get()==QT_LIVE; }
 
 int qt_lmhead_init(const int8_t *q, const float *sc, int I, int O){
-    if(!G_lmh.dev_ok||!q||!sc) return 0;
+    /* G_lmh is read ONLY after the lifecycle admits this caller, dev_ok
+     * included (#1564, review of e6c70eb7, HIGH B). It used to be read on the
+     * line above the admission, with nothing held: a caller descheduled in
+     * that window crossed a shutdown and a re-init, was then admitted by the
+     * gate -- which asks only whether a generation is live -- and installed
+     * the PREVIOUS generation's weights, scales and device into a generation
+     * configured with COLI_PLACE=off, which had decided this lm_head belongs
+     * on the CPU. The upload succeeds, so nothing reports it and the new
+     * generation answers tokens with the old model's weights.
+     *
+     * The init path has no NULL rejection to save it the way
+     * qt_lmhead_matmul has: the backend refuses a NULL cached tensor and that
+     * call falls back to the CPU, but here the call CREATES the tensor, so
+     * there is nothing left to refuse. Same guard, two outcomes -- so the
+     * state is read where the lifecycle is, not per function. The caller's own
+     * arguments are not lifecycle state and are still checked up front. */
+    if(!q||!sc) return 0;
+    QT_LMHEAD_PRE_GATE_HOOK();
     if(!qt_gate_enter()) return 0;
     int ok=0;
-    int dev=G_lmh.dev;
-    if(!coli_cuda_tensor_upload(&G_lmh.t,q,sc,1,I,O,dev)){
-        fprintf(stderr,"[lmh] lm_head upload failed -> stays on CPU\n");
-    } else {
-        G_lmh.dev=dev; G_lmh.on=1;
-        fprintf(stderr,"[lmh] lm_head [%d x %d] int8 resident on CUDA dev %d (%.2f GB)\n",
-                O,I,dev,(double)O*I/1073741824.0);
-        ok=1;
+    if(G_lmh.dev_ok){
+        int dev=G_lmh.dev;
+        if(!coli_cuda_tensor_upload(&G_lmh.t,q,sc,1,I,O,dev)){
+            fprintf(stderr,"[lmh] lm_head upload failed -> stays on CPU\n");
+        } else {
+            G_lmh.dev=dev; G_lmh.on=1;
+            fprintf(stderr,"[lmh] lm_head [%d x %d] int8 resident on CUDA dev %d (%.2f GB)\n",
+                    O,I,dev,(double)O*I/1073741824.0);
+            ok=1;
+        }
     }
     qt_gate_leave();
     return ok;
@@ -993,9 +1041,13 @@ int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
      * that holds no experts at all, hence the trunk gate. But qt_shutdown frees
      * G_dnp[].t, so they are counted like every other caller. */
     if(!qt_gate_enter_trunk()) return 0;
+    /* Was this slot already owned? A repeated init of a resident layer is
+     * answered by the backend's cached path and allocates nothing, so the
+     * ownership count may only move when the tensor itself appeared. */
+    int had = G_dnp[layer].t != NULL;
     int ok = coli_cuda_tensor_upload(&G_dnp[layer].t, q, sc, 1, I, O, device);
     if(!ok) fprintf(stderr,"[dnp] layer %d upload failed -> stays on CPU\n", layer);
-    else { G_dnp[layer].dev = device; G_dnp[layer].on = 1; }
+    else { G_dnp[layer].dev = device; G_dnp[layer].on = 1; if(!had) qg_trunk++; }
     qt_gate_leave();
     return ok;
 }
@@ -1441,7 +1493,25 @@ void qt_shutdown(void){
          * QT_DEAD. This thread touches no state on the way out, so it is
          * correct for it to return either way. */
         while(qg_get()==QT_TEARING_DOWN) pthread_cond_wait(&qg_cv,&qg_mx);
+        int state = qg_get(), trunk = qg_trunk;
         pthread_mutex_unlock(&qg_mx);
+        /* Losing the claim is the normal end of a shutdown -- but "already
+         * DEAD" is not proof that the storage is gone. The dense projections
+         * are admitted at QT_DEAD, so a tier that was never started can still
+         * own live G_dnp[].t, and returning here used to leave them resident:
+         * callable after the shutdown, and a same-shaped re-init would inherit
+         * the cached weights instead of copying its own. So the DEAD fast path
+         * may only return when there is nothing left to free -- and a state
+         * that has since moved back to QT_LIVE owns its own teardown, whose
+         * half two frees this as well, so leave that one alone. */
+        if(state==QT_LIVE || !trunk) return;
+        if(!qt_gate_xenter(QT_DEAD)) return;
+        for(int i=0;i<QT_DN_MAX_LAYERS;i++)
+            if(G_dnp[i].t) coli_cuda_tensor_free(G_dnp[i].t);
+        memset(G_dnp,0,sizeof G_dnp);
+        qg_trunk=0;
+        qg_set(QT_DEAD);
+        qt_gate_xleave();
         return;
     }
     qg_set(QT_TEARING_DOWN);
@@ -1494,6 +1564,11 @@ void qt_shutdown(void){
     free(G.fill_order); free(G.heat0); free(G.is_x); free(G.slot);
     G.fill_order=NULL; G.heat0=NULL; G.is_x=NULL; G.slot=NULL;
     memset(&G_lmh,0,sizeof G_lmh); memset(G_dnp,0,sizeof G_dnp);
+    qg_trunk=0;   /* same invariant as the trunk-only teardown: the count is
+                   * what the DEAD fast path reads, so it may not outlive the
+                   * tensors it counts -- a stale positive sends every later
+                   * redundant shutdown through an exclusive section that has
+                   * nothing left to free. */
     /* G.on goes last, and only here. It stayed 1 for the whole of half one on
      * purpose: a caller in that window must not be able to read "torn down"
      * and walk into storage that was still live -- and, symmetrically, a

@@ -1783,6 +1783,28 @@ tests/test_qwen36_tier_dnproj_gate$(EXE): tests/test_qwen36_tier_dnproj_gate.c t
 tests/test_qwen36_tier_refused_init$(EXE): tests/test_qwen36_tier_refused_init.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# Same fake backend with the real backend's CACHED-tensor path enabled
+# (fake_cached_upload): a qt_shutdown that finds the state already QT_DEAD used
+# to return at once, so G_dnp[].t -- which the trunk gate admits with the tier
+# never started -- stayed resident, callable after the shutdown, and a later
+# same-shaped qt_dnproj_init was answered by the backend's cached path with the
+# PREVIOUS generation's weights instead of copying its own (#1564, review of
+# e6c70eb7, HIGH A). The plain fake allocates on every call and would hide
+# exactly that, which is why the switch is part of this target's claim.
+tests/test_qwen36_tier_trunk_teardown$(EXE): tests/test_qwen36_tier_trunk_teardown.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend: qt_lmhead_init read G_lmh.dev_ok with nothing held, one line
+# ABOVE the lifecycle admission, so a caller descheduled in that window was
+# admitted by the NEXT generation and installed the PREVIOUS generation's
+# weights into one that had been configured to keep the lm_head on the CPU --
+# and the upload succeeded, so nothing reported it (#1564, review of e6c70eb7,
+# HIGH B). qt_lmhead_matmul's equivalent read is harmless only because the
+# backend refuses a NULL cached tensor; the init path CREATES the tensor, so
+# there is nothing to refuse it. The pre-gate seam forces the interleaving.
+tests/test_qwen36_tier_lmhead_init_gate$(EXE): tests/test_qwen36_tier_lmhead_init_gate.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA -DQT_TEST_HOOKS $< -o $@ $(LDFLAGS)
+
 # No fake backend and no GPU: this one reads the SOURCE. The claim under test is
 # that the check-and-use guard lives in ONE place -- the reader defect was twelve
 # copies of it, and a behavioural test walks the hot path, not the other eleven.

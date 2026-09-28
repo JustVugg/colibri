@@ -54,10 +54,27 @@ static int fake_take_returns_output;
  * tier and demand the same tokens as the CPU int8 reference. The engine
  * frees its int8 rows right after qt_dense_init, so the upload keeps a copy. */
 static int fake_dense_compute;
+/* fake_cached_upload=1 reproduces the real backend's CACHED path: when the
+ * slot already holds a tensor, coli_cuda_tensor_upload matches the REQUEST
+ * against it and returns 1 WITHOUT copying the new weights in (backend_cuda.cu:
+ * `if (*tensor) return t->fmt==fmt && t->I==I && t->O==O && t->device==device
+ * && t->gs==want_gs;`). So a same-shaped re-upload over a tensor nobody freed
+ * is silently answered with the OLD weights -- and a test whose fake always
+ * allocates would report a fresh upload where the real backend keeps the stale
+ * one, which is the whole class of defect the qwen36 tier tests exist to kill.
+ *
+ * Opt-in, because most tests want a fresh allocation per call. Every cache hit
+ * is counted in fake_cached_hits so a test can assert on it directly. */
+static int fake_cached_upload, fake_cached_hits;
 
 static int upload_common(ColiCudaTensor **t, const void *w, const float *sc,
                          int fmt, int I, int O, int device, int gs) {
     if (fake_upload_hook) fake_upload_hook(fmt);
+    if (fake_cached_upload && t && *t) {
+        fake_cached_hits++;
+        const ColiCudaTensor *c = *t;
+        return c->fmt == fmt && c->I == I && c->O == O && c->device == device && c->gs == gs;
+    }
     const int call = ++fake_uploads;
     if (fake_fail_upload == call) return 0;
     ColiCudaTensor *n = (ColiCudaTensor *)calloc(1, sizeof *n);
