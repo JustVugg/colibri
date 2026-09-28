@@ -26,7 +26,62 @@ static int head_scores_argmax(const float *scores,int rows,int *token,float *log
 
 static unsigned seed = 12345;
 static unsigned next_random(void) { seed = seed * 1664525u + 1013904223u; return seed; }
-int main(void) {
+static void test_batch(Dsv4CudaTensor *head,const uint16_t *weights,int rows,int cols) {
+    enum { MAX_BATCH = 9 };
+    float *inputs = malloc((size_t)MAX_BATCH * cols * sizeof(float));
+    float *cpu = malloc((size_t)MAX_BATCH * rows * sizeof(float));
+    float *gpu = malloc((size_t)MAX_BATCH * rows * sizeof(float));
+    int ids[MAX_BATCH]; float values[MAX_BATCH];
+    assert(inputs && cpu && gpu);
+    for (int item = 0; item < MAX_BATCH; item++)
+        for (int col = 0; col < cols; col++)
+            inputs[(size_t)item * cols + col] = item == 2 ? -0.f
+                : (float)((int)((next_random() >> 8) % 20001) - 10000) / 10003.f;
+    #pragma omp parallel for schedule(static)
+    for (int row = 0; row < rows; row++)
+        for (int item = 0; item < MAX_BATCH; item++)
+            cpu[(size_t)item * rows + row] = head_bf16_dot(
+                weights + (size_t)row * cols, inputs + (size_t)item * cols, cols);
+    assert(!dsv4_cuda_head_scores_batch_exact(head, inputs, 0, gpu));
+    assert(!dsv4_cuda_head_scores_batch_exact(head, inputs, 129, gpu));
+    assert(!dsv4_cuda_head_scores_batch_exact(head, NULL, 3, gpu));
+    assert(!dsv4_cuda_head_scores_batch_exact(head, inputs, 3, NULL));
+    assert(!dsv4_cuda_head_argmax_batch_exact(head, inputs, 3, NULL, values));
+    assert(!dsv4_cuda_head_argmax_batch_exact(head, inputs, 3, ids, NULL));
+    int batches[] = {1, 3, 4, 5, 9, 2};
+    for (size_t b = 0; b < sizeof(batches)/sizeof(*batches); b++) {
+        int batch = batches[b];
+        assert(dsv4_cuda_head_scores_batch_exact(head, inputs, batch, gpu));
+        assert(!memcmp(cpu, gpu, (size_t)batch * rows * sizeof(float)));
+        assert(dsv4_cuda_head_argmax_batch_exact(head, inputs, batch, ids, values));
+        for (int item = 0; item < batch; item++) {
+            int id; float value;
+            assert(!head_scores_argmax(cpu + (size_t)item * rows, rows, &id, &value));
+            assert(ids[item] == id && !memcmp(values + item, &value, sizeof(value)));
+        }
+    }
+    free(gpu); free(cpu); free(inputs);
+}
+
+static void test_nonfinite(int device) {
+    uint16_t weights[32 * 8] = {0};
+    float inputs[3 * 8], scores[3 * 32], values[3]; int ids[3];
+    for (int i = 0; i < 3 * 8; i++) inputs[i] = 1.f;
+    weights[0] = 0x7fc0; weights[8] = 0x7f80; weights[16] = 0x7f80;
+    Dsv4CudaTensor *head = NULL;
+    assert(dsv4_cuda_upload_head_exact(&head, weights, 32, 8, device));
+    assert(dsv4_cuda_head_scores_batch_exact(head, inputs, 3, scores));
+    assert(dsv4_cuda_head_argmax_batch_exact(head, inputs, 3, ids, values));
+    for (int item = 0; item < 3; item++) {
+        assert(isnan(scores[item * 32]) && ids[item] == 1 && values[item] == INFINITY);
+    }
+    for (int i = 0; i < 3 * 8; i++) inputs[i] = NAN;
+    assert(dsv4_cuda_head_argmax_batch_exact(head, inputs, 3, ids, values));
+    for (int item = 0; item < 3; item++) assert(ids[item] == -1 && values[item] == -FLT_MAX);
+    dsv4_cuda_tensor_free(head);
+}
+
+int main(int argc,char **argv) {
 #ifndef __AVX2__
     puts("head CUDA oracle requires the AVX2 head contract");
     return 77;
@@ -34,7 +89,9 @@ int main(void) {
     int devices[] = {0, 5};
     assert(dsv4_cuda_init(devices, 2));
     int shapes[][2] = {{32, 256}, {160, 4104}, {129280, 4096}};
-    for (int dev = 0; dev < 2; dev++) for (int shape = 0; shape < 3; shape++) {
+    int shape_count = argc == 2 && !strcmp(argv[1], "--small") ? 2 : 3;
+    for (int dev = 0; dev < 2; dev++) test_nonfinite(devices[dev]);
+    for (int dev = 0; dev < 2; dev++) for (int shape = 0; shape < shape_count; shape++) {
         int rows = shapes[shape][0], cols = shapes[shape][1];
         uint16_t *weights = malloc((size_t)rows * cols * sizeof(*weights));
         float *input = malloc((size_t)cols * sizeof(*input));
@@ -80,6 +137,8 @@ int main(void) {
         }
         printf("device=%d rows=%d cols=%d logits=exact trials=3 tie=first zero=exact bytes=%lld\n",
                devices[dev], rows, cols, dsv4_cuda_tensor_bytes(head));
+        test_batch(head, weights, rows, cols);
+        puts("batched head: logits and compact argmax exact; batch=1,3,4,5,9,2");
         dsv4_cuda_tensor_free(head);
         free(weights); free(input); free(cpu); free(gpu);
     }

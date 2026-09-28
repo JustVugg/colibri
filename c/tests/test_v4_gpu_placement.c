@@ -59,6 +59,17 @@ int dsv4_cuda_head_scores_exact(Dsv4CudaTensor *t,const float *input,float *scor
     if (head_scores_ok) scores[0] = input[0];
     return head_scores_ok;
 }
+static int head_batch_calls;
+int dsv4_cuda_head_scores_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,float *scores) {
+    assert(t && input && scores && batch == 3);
+    head_batch_calls++;
+    return head_scores_ok;
+}
+int dsv4_cuda_head_argmax_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,int *ids,float *values) {
+    assert(t && input && ids && values && batch == 3);
+    head_batch_calls++;
+    return head_scores_ok;
+}
 static void test_head(void) {
 #if defined(__AVX2__)
     ColiV4Engine *engine = calloc(1, sizeof(*engine)); assert(engine);
@@ -78,12 +89,27 @@ static void test_head(void) {
     coli_v4_gpu_head_upload(engine); assert(head_uploads == 2);
     float input = 7, scores = -1;
     assert(!coli_v4_gpu_head_scores(engine, &input, &scores) && scores == input);
+    int ids[3]; float values[3];
+    unsetenv("DSV4_CUDA_HEAD_BATCH");
+    assert(coli_v4_gpu_head_batch(engine, &input, 3, NULL, ids, values) == -1);
+    setenv("DSV4_CUDA_HEAD_BATCH", "0", 1);
+    assert(coli_v4_gpu_head_batch(engine, &input, 3, NULL, ids, values) == -1);
+    assert(!head_batch_calls);
+    setenv("DSV4_CUDA_HEAD_BATCH", "1", 1);
+    assert(!coli_v4_gpu_head_batch(engine, &input, 3, NULL, ids, values));
+    assert(!coli_v4_gpu_head_batch(engine, &input, 3, &scores, NULL, NULL));
+    assert(coli_v4_gpu_head_batch(engine, &input, 0, &scores, NULL, NULL) == -1);
+    assert(coli_v4_gpu_head_batch(engine, &input, 129, &scores, NULL, NULL) == -1);
+    assert(head_batch_calls == 2);
     head_scores_ok = 0;
     assert(coli_v4_gpu_head_scores(engine, &input, &scores) == -1);
+    assert(coli_v4_gpu_head_batch(engine, &input, 3, NULL, ids, values) == -1);
     int before = shutdowns;
     coli_v4_gpu_engine_close(engine);
     assert(!live_tensors && !engine->gpu.head && !engine->gpu.uploaded_bytes && shutdowns == before + 1);
     assert(coli_v4_gpu_head_scores(engine, &input, &scores) == -1);
+    assert(coli_v4_gpu_head_batch(engine, &input, 3, NULL, ids, values) == -1);
+    unsetenv("DSV4_CUDA_HEAD_BATCH");
     coli_v4_gpu_engine_close(engine); assert(shutdowns == before + 1);
     free(engine);
 #endif

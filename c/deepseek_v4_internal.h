@@ -819,6 +819,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                                 int batch);
 void coli_v4_gpu_head_upload(ColiV4Engine *engine);
 int coli_v4_gpu_head_scores(ColiV4Engine *engine,const float *input,float *scores);
+int coli_v4_gpu_head_batch(ColiV4Engine *engine,const float *input,int batch,
+                           float *scores,int *ids,float *values);
 int coli_v4_gpu_wo_decode(const ColiTensorView *a, const ColiTensorView *b,
                            float *output, const float *input, int groups);
 int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,

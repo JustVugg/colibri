@@ -91,6 +91,10 @@ int dsv4_cuda_kv_comp_append(int device,int layer,const float *rows,int start_id
 /* Packed BF16 vocabulary head, sequential separately rounded mul/add logits. */
 int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **t,const uint16_t *w,int rows,int cols,int device);
 int dsv4_cuda_head_scores_exact(Dsv4CudaTensor *t,const float *input,float *scores);
+/* Batch-major inputs/scores, 1..128 rows. Greedy returns only batch candidates;
+ * ties (including signed zero) retain the first vocabulary index. */
+int dsv4_cuda_head_scores_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,float *scores);
+int dsv4_cuda_head_argmax_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,int *ids,float *values);
 int dsv4_cuda_head_argmax(Dsv4CudaTensor *t,const float *x,int *id,float *value);
 int dsv4_cuda_final_argmax(const Dsv4CudaActivation *residual,Dsv4CudaTensor *fn,Dsv4CudaTensor *scale,
                            Dsv4CudaTensor *base,Dsv4CudaTensor *norm,Dsv4CudaTensor *head,

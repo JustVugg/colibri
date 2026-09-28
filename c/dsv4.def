@@ -58,6 +58,10 @@ EXPORTS
     dsv4_cuda_stream_drain
     dsv4_cuda_kv_comp_append
     dsv4_cuda_head_argmax
+    dsv4_cuda_upload_head_exact
+    dsv4_cuda_head_scores_exact
+    dsv4_cuda_head_scores_batch_exact
+    dsv4_cuda_head_argmax_batch_exact
     dsv4_cuda_final_argmax
     dsv4_cuda_expert_group
     dsv4_cuda_expert_fp8
