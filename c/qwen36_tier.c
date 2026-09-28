@@ -856,6 +856,39 @@ int qt_dnproj_matmul_batch(int layer, float *y, const float *x, int S, int I, in
     return 0;
 }
 
+/* ---- the DeltaNet layer on the device (see qwen36_tier.h) ---------------- */
+static struct { ColiCudaDn *d; int dev, on, dnout; } G_dn[QT_DN_MAX_LAYERS];
+int qt_dn_gpu_ready(int layer){ return layer >= 0 && layer < QT_DN_MAX_LAYERS && G_dn[layer].on; }
+int qt_dn_gpu_init(int layer, int vh, int vk, int kdim, int vdim, int conv_dim, int convk, int hidden,
+                   const float *conv_w, const float *norm_w, float eps, int dnout_handle_plus1){
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS) return 0;
+    if(!qt_dnproj_ready(layer)) return 0;                              /* the in_proj must be on the card */
+    int h = dnout_handle_plus1 - 1;
+    if(h < 0 || h >= G_dense_n || !G_dense[h].on) return 0;             /* and the out_proj */
+    if(G_dense[h].dev != G_dnp[layer].dev) return 0;                    /* on the same card */
+    ColiCudaDn *d = coli_cuda_dn_create(G_dnp[layer].dev, vh, vk, kdim, vdim, conv_dim, convk, hidden, conv_w, norm_w, eps);
+    if(!d) return 0;                                                    /* older backend or no memory: CPU path stands */
+    G_dn[layer].d = d; G_dn[layer].dev = G_dnp[layer].dev; G_dn[layer].dnout = h; G_dn[layer].on = 1;
+    return 1;
+}
+int qt_dn_gpu_set_state(int layer, const float *ring, const float *rec){
+    return qt_dn_gpu_ready(layer) && coli_cuda_dn_set_state(G_dn[layer].d, ring, rec);
+}
+int qt_dn_gpu_get_state(int layer, float *ring, float *rec){
+    /* also after a failed step (on == 0): the object still holds the state */
+    return layer >= 0 && layer < QT_DN_MAX_LAYERS && G_dn[layer].d && coli_cuda_dn_get_state(G_dn[layer].d, ring, rec);
+}
+int qt_dn_gpu_step(int layer, const float *x, float *out, const float *egh, const float *beta){
+    if(!qt_dn_gpu_ready(layer)) return 0;
+    if(coli_cuda_dn_step(G_dn[layer].d, G_dnp[layer].t, G_dense[G_dn[layer].dnout].t, x, out, egh, beta)) return 1;
+    fprintf(stderr,"[dn] layer %d GPU step failed; CPU from here on\n", layer);
+    G_dn[layer].on = 0;
+    return 0;
+}
+static void dn_gpu_free_all(void){
+    for(int l=0;l<QT_DN_MAX_LAYERS;l++){ if(G_dn[l].d) coli_cuda_dn_free(G_dn[l].d); G_dn[l].d=NULL; G_dn[l].on=0; }
+}
+
 int qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
     return qt_dnproj_matmul_batch(layer, y, x, 1, I, O);
 }
@@ -1207,6 +1240,7 @@ void qt_stats(void){
 }
 
 static void dense_free_all(void){
+    dn_gpu_free_all();
     for(int h = 0; h < G_dense_n; h++){ if(G_dense[h].t) coli_cuda_tensor_free(G_dense[h].t); G_dense[h].t = NULL; G_dense[h].on = 0; }
     G_dense_n = 0;
     if(G_lmh.t) coli_cuda_tensor_free(G_lmh.t);
