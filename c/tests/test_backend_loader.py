@@ -918,7 +918,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
             cls.fixture = None
 
     def test_abi_is_derived_from_the_loader_source(self):
-        """47 mandatory + 9 optional, parsed from backend_loader.c.
+        """47 mandatory + 14 optional, parsed from backend_loader.c.
 
         The counts are a deliberate tripwire: adding a RESOLVE to the loader
         widens the ABI every Windows DLL must satisfy, and that should be a
@@ -929,8 +929,8 @@ class LoaderStubFixtureTest(unittest.TestCase):
         """
         f = self.fixture
         self.assertEqual(len(f.mandatory), 47)
-        self.assertEqual(len(f.optional), 9)   # +expert_mxfp4: optional Kimi SiTU pipeline
-        self.assertEqual(len(f.exports), 56)
+        self.assertEqual(len(f.optional), 14)  # +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step
+        self.assertEqual(len(f.exports), 61)
         self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)
         self.assertIn("coli_cuda_e8_set_grid", f.optional)
@@ -948,6 +948,11 @@ class LoaderStubFixtureTest(unittest.TestCase):
         # would take the entire CUDA backend down over a sizing refinement.
         self.assertIn("coli_cuda_tensor_vram", f.optional)
         self.assertIn("coli_cuda_alloc_footprint", f.optional)
+        # dn_*: the DeltaNet layer on the device (conv ring, recurrence, gated
+        # norm). OPTIONAL: a DLL predating them leaves the layer on the CPU.
+        for name in ("coli_cuda_dn_create", "coli_cuda_dn_free", "coli_cuda_dn_set_state",
+                     "coli_cuda_dn_get_state", "coli_cuda_dn_step"):
+            self.assertIn(name, f.optional)
 
     def test_both_runtimes_exist_with_the_production_basename(self):
         """Same basename, different directories — the conflict precondition."""

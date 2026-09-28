@@ -131,4 +131,80 @@ int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x, const vo
     return 1;
 }
 
+
+/* Gated delta layer, host-side reference: the same arithmetic as the CUDA
+ * kernels (and as qwen36.c's deltanet()), so an engine test can put the layer
+ * on the fake tier and demand the same tokens as the CPU path. Matmuls go
+ * through the fake's fmt=1 compute when fake_dense_compute is on. */
+struct ColiCudaDn { int device, vh, vk, kdim, vdim, conv_dim, convk, hidden; float eps;
+                    float *ring, *rec, *conv_w, *norm_w; };
+static int fake_dn_steps, fake_dn_fail;
+static void fake_gemv_i8(float *y, const float *x, const ColiCudaTensor *t) {
+    const int8_t *q = (const int8_t *)t->w;
+    for (int o = 0; o < t->O; o++) { float a = 0.f; const int8_t *w = q + (size_t)o * t->I;
+        for (int i = 0; i < t->I; i++) a += x[i] * (float)w[i]; y[o] = a * t->sc[o]; }
+}
+ColiCudaDn *coli_cuda_dn_create(int device, int vh, int vk, int kdim, int vdim, int conv_dim, int convk, int hidden,
+                                const float *conv_w, const float *norm_w, float eps) {
+    if (fake_dn_fail || vh < 1 || vk < 1 || vh % vk || convk < 2 || conv_dim != 2 * vk * kdim + vh * vdim || !conv_w || !norm_w) return NULL;
+    ColiCudaDn *d = (ColiCudaDn *)calloc(1, sizeof *d);
+    d->device = device; d->vh = vh; d->vk = vk; d->kdim = kdim; d->vdim = vdim; d->conv_dim = conv_dim; d->convk = convk; d->hidden = hidden; d->eps = eps;
+    d->ring = (float *)calloc((size_t)conv_dim * (convk - 1), sizeof(float));
+    d->rec = (float *)calloc((size_t)vh * kdim * vdim, sizeof(float));
+    d->conv_w = (float *)malloc((size_t)conv_dim * convk * sizeof(float)); memcpy(d->conv_w, conv_w, (size_t)conv_dim * convk * sizeof(float));
+    d->norm_w = (float *)malloc((size_t)vdim * sizeof(float)); memcpy(d->norm_w, norm_w, (size_t)vdim * sizeof(float));
+    return d;
+}
+void coli_cuda_dn_free(ColiCudaDn *d) { if (!d) return; free(d->ring); free(d->rec); free(d->conv_w); free(d->norm_w); free(d); }
+int coli_cuda_dn_set_state(ColiCudaDn *d, const float *ring, const float *rec) {
+    if (!d) return 0;
+    size_t rn = (size_t)d->conv_dim * (d->convk - 1), sn = (size_t)d->vh * d->kdim * d->vdim;
+    if (ring) memcpy(d->ring, ring, rn * sizeof(float)); else memset(d->ring, 0, rn * sizeof(float));
+    if (rec) memcpy(d->rec, rec, sn * sizeof(float)); else memset(d->rec, 0, sn * sizeof(float));
+    return 1;
+}
+int coli_cuda_dn_get_state(ColiCudaDn *d, float *ring, float *rec) {
+    if (!d || !ring || !rec) return 0;
+    memcpy(ring, d->ring, (size_t)d->conv_dim * (d->convk - 1) * sizeof(float));
+    memcpy(rec, d->rec, (size_t)d->vh * d->kdim * d->vdim * sizeof(float));
+    return 1;
+}
+int coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *outp, const float *x, float *out, const float *egh, const float *beta) {
+    if (!d || !proj || !outp || !x || !out || fake_dn_fail) return 0;
+    if (!fake_dense_compute || !proj->w || !outp->w) return 0;      /* nothing to compute with: the engine keeps the CPU path */
+    int vh = d->vh, kdim = d->kdim, vdim = d->vdim, rep = vh / d->vk, key_dim_tot = d->vk * kdim, conv_dim = d->conv_dim, convk = d->convk;
+    size_t proj_dim = (size_t)conv_dim + (size_t)vh * vdim;
+    if (proj->fmt != 1 || proj->I != d->hidden || (size_t)proj->O != proj_dim || outp->fmt != 1 || (size_t)outp->I != (size_t)vh * vdim || outp->O != d->hidden) return 0;
+    float *qkvz = (float *)malloc(proj_dim * sizeof(float)), *conv_out = (float *)malloc((size_t)conv_dim * sizeof(float));
+    float *outr = (float *)malloc((size_t)vh * vdim * sizeof(float));
+    fake_gemv_i8(qkvz, x, proj);
+    const float *z = qkvz + conv_dim;
+    for (int cc = 0; cc < conv_dim; cc++) {
+        const float *w = d->conv_w + (size_t)cc * convk; float *rg = d->ring + (size_t)cc * (convk - 1);
+        float acc = 0.f; for (int kk = 0; kk < convk - 1; kk++) acc += w[kk] * rg[kk];
+        acc += w[convk - 1] * qkvz[cc]; conv_out[cc] = acc / (1.f + expf(-acc));
+        for (int kk = 0; kk < convk - 2; kk++) rg[kk] = rg[kk + 1];
+        rg[convk - 2] = qkvz[cc];
+    }
+    float scale = 1.f / sqrtf((float)kdim);
+    for (int h = 0; h < vh; h++) {
+        const float *qs = conv_out + (size_t)(h / rep) * kdim, *ks = conv_out + key_dim_tot + (size_t)(h / rep) * kdim, *vs = conv_out + 2 * (size_t)key_dim_tot + (size_t)h * vdim;
+        float q[256], k[256], delta[256], o[256];
+        double sq = 1e-6, sk = 1e-6;
+        for (int t = 0; t < kdim; t++) { sq += (double)qs[t] * qs[t]; sk += (double)ks[t] * ks[t]; }
+        double nq = sqrt(sq), nk = sqrt(sk);
+        for (int t = 0; t < kdim; t++) { q[t] = (float)((double)qs[t] / nq * scale); k[t] = (float)((double)ks[t] / nk); }
+        float *Sh = d->rec + (size_t)h * kdim * vdim;
+        for (int t = 0; t < vdim; t++) { float kvsum = 0.f; for (int kk = 0; kk < kdim; kk++) kvsum += k[kk] * (Sh[(size_t)kk * vdim + t] * egh[h]); delta[t] = (vs[t] - kvsum) * beta[h]; }
+        for (int t = 0; t < vdim; t++) { float acc = 0.f; for (int kk = 0; kk < kdim; kk++) { float s = Sh[(size_t)kk * vdim + t] * egh[h] + k[kk] * delta[t]; Sh[(size_t)kk * vdim + t] = s; acc += q[kk] * s; } o[t] = acc; }
+        double ms = 0; for (int t = 0; t < vdim; t++) ms += (double)o[t] * o[t];
+        float r = 1.f / sqrtf((float)(ms / vdim) + d->eps);
+        for (int t = 0; t < vdim; t++) { float zz = z[(size_t)h * vdim + t]; outr[(size_t)h * vdim + t] = (o[t] * r * d->norm_w[t]) * zz / (1.f + expf(-zz)); }
+    }
+    fake_gemv_i8(out, outr, outp);
+    free(qkvz); free(conv_out); free(outr);
+    fake_dn_steps++;
+    return 1;
+}
+
 #endif /* QWEN36_FAKE_CUDA_H */
