@@ -15,15 +15,15 @@
  *     (G.on is written twice -- set by a successful init, cleared by the
  *     teardown -- and read by NOTHING);
  *   - there is no once-only teardown claim left to re-arm;
- *   - each of the fourteen entry points that can reach G.slot, G_lmh.t or
- *     G.mx enters the lifecycle gate exactly once, and has no `return` between
+ *   - each of the sixteen entry points that can reach G.slot, G_lmh.t,
+ *     G_dnp[].t or G.mx enters the lifecycle gate exactly once, and has no `return` between
  *     that entry and its leave;
  *   - qt_shutdown clears G.on INSIDE its exclusive section, not at the top,
  *     which is the whole defect 2.
  *
  * This is a source-shape test on purpose. The behavioural reproductions
  * (test_qwen36_tier_reader_race, test_qwen36_tier_reinit_window) walk the
- * interleavings; this one walks the file, so a fourteenth sibling added later
+ * interleavings; this one walks the file, so a seventeenth sibling added later
  * without the gate is a failure here rather than a SIGSEGV in the field.
  *
  * Run from c/ (as the Makefile does); pass a path to override. */
@@ -145,7 +145,9 @@ static int returns_only_outside_the_gate(const char *body, int *enters) {
             if (is_tok(w, n, "return")) {
                 if (pending) pending = 0;              /* refused at the door: legal */
                 else if (held) bad = 1;                /* would skip a leave */
-            } else if (is_tok(w, n, "qt_gate_enter")) { held++; pending = 1; ne++; }
+            } else if (is_tok(w, n, "qt_gate_enter") || is_tok(w, n, "qt_gate_enter_trunk")) {
+                held++; pending = 1; ne++;
+            }
             else if (is_tok(w, n, "qt_gate_leave")) { if (held) held--; }
             continue;
         }
@@ -163,6 +165,7 @@ static const char *SITES[] = {
     "qt_note", "qt_note_block", "qt_note_planned",
     "qt_fill_next", "qt_plan_fill", "qt_fill_wait",
     "qt_issue", "qt_take", "qt_stats",
+    "qt_dnproj_init", "qt_dnproj_matmul",   /* qt_shutdown frees G_dnp[].t */
     NULL
 };
 
@@ -189,7 +192,7 @@ int main(int argc, char **argv) {
     check(count_of(src, "QT_TEARING_DOWN") >= 3,
           "the lifecycle has a TEARING_DOWN state that something reads and moves");
     check(count_of(src, "qt_gate_enter(void)") == 1 &&
-          count_of(src, "qt_gate_xenter(void)") == 1,
+          count_of(src, "qt_gate_xenter(int from)") == 1,
           "there is exactly one shared entry helper and one exclusive entry helper");
 
     /* ---- every sibling goes through it ------------------------------------ */
@@ -213,7 +216,7 @@ int main(int argc, char **argv) {
     char *sd = body_of(src, "qt_shutdown");
     if (!sd) { printf("  FAIL: qt_shutdown definition not found\n"); fails++; }
     else {
-        char *x = strstr(sd, "qt_gate_xenter()");
+        char *x = strstr(sd, "qt_gate_xenter(QT_TEARING_DOWN)");
         char *off = strstr(sd, "G.on=0");
         char *td = strstr(sd, "QT_TEARING_DOWN");
         check(x && off && x < off,
@@ -227,6 +230,6 @@ int main(int argc, char **argv) {
 
     free(src);
     if (fails) { printf("test_qwen36_tier_gate_coverage: %d failure(s)\n", fails); return 1; }
-    printf("test_qwen36_tier_gate_coverage: ok (14 sites, one guard, no latch)\n");
+    printf("test_qwen36_tier_gate_coverage: ok (16 sites, one guard, no latch)\n");
     return 0;
 }

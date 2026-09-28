@@ -145,7 +145,11 @@ void coli_cuda_stats(int device, size_t *count, size_t *bytes) {
  * went; the arithmetic has its own oracle in the CUDA build. Parameters are
  * unused on purpose (CFLAGS carry -Wno-unused-parameter). */
 static int fake_matmuls, fake_matmul_fail, fake_matmul_rows, fake_matmul_fail_at;
+/* fake_matmul_hook: called first, with the tensor the call picked up -- the
+ * point backend_cuda has captured *tensor and is about to use it. */
+static void (*fake_matmul_hook)(ColiCudaTensor *tensor) = NULL;
 int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x, const void *weights, const float *scales, int fmt, int S, int I, int O, int device, int gs) {
+    if (fake_matmul_hook) fake_matmul_hook(tensor ? *tensor : NULL);
     fake_matmuls++;
     fake_matmul_rows = S;
     if (fake_matmul_fail || fake_matmuls == fake_matmul_fail_at) {

@@ -1768,6 +1768,20 @@ tests/test_qwen36_tier_reader_race$(EXE): tests/test_qwen36_tier_reader_race.c t
 # hide.
 tests/test_qwen36_tier_reinit_window$(EXE): tests/test_qwen36_tier_reinit_window.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA -DQT_TEST_HOOKS $< -o $@ $(LDFLAGS)
+# Same fake backend, three refusals that must be ordered and side-effect free:
+# a qt_init issued during TEARING_DOWN is refused before it can queue for the
+# exclusive section (queueing made the teardown's own exclusive entry fail and
+# qt_shutdown return with the storage live); a DeltaNet projection matmul is
+# counted by the gate, so the teardown cannot free G_dnp[].t under it, while the
+# projections still work with the tier never started; and a refused stream/fp8
+# init leaves the live tier's mode untouched. All interleavings are forced
+# through the QT_TEST_HOOKS seams and fake_matmul_hook, never a clock.
+tests/test_qwen36_tier_init_order$(EXE): tests/test_qwen36_tier_init_order.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA -DQT_TEST_HOOKS $< -o $@ $(LDFLAGS)
+tests/test_qwen36_tier_dnproj_gate$(EXE): tests/test_qwen36_tier_dnproj_gate.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA -DQT_TEST_HOOKS $< -o $@ $(LDFLAGS)
+tests/test_qwen36_tier_refused_init$(EXE): tests/test_qwen36_tier_refused_init.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
 # No fake backend and no GPU: this one reads the SOURCE. The claim under test is
 # that the check-and-use guard lives in ONE place -- the reader defect was twelve

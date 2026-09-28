@@ -203,14 +203,36 @@ static void qt_gate_leave(void){
     if(--qg_live==0) pthread_cond_broadcast(&qg_cv);
     pthread_mutex_unlock(&qg_mx);
 }
+/* The dense-trunk variant (qt_dnproj_*): the projections work with the expert
+ * tier never started, so QT_DEAD admits too. What it refuses is what matters --
+ * a teardown in progress, or an exclusive section queued or held -- so the
+ * tensors qt_shutdown frees are counted exactly like the expert slots and
+ * cannot be freed under a matmul the backend has already picked up. */
+static int qt_gate_enter_trunk(void){
+    pthread_mutex_lock(&qg_mx);
+    if(qg_get()==QT_TEARING_DOWN || qg_x || qg_want_x){ pthread_mutex_unlock(&qg_mx); return 0; }
+    qg_live++;
+    pthread_mutex_unlock(&qg_mx);
+    return 1;
+}
 
 /* Exclusive: no caller inside, and none can arrive. 0 if somebody else already
  * has it or is queued for it -- the loser refuses rather than waits, which is
  * what keeps a second init (or an init against a running teardown) from
- * queueing behind work it has no business joining. */
-static int qt_gate_xenter(void){
+ * queueing behind work it has no business joining.
+ *
+ * Admitted only FROM the lifecycle state the caller is entitled to leave --
+ * QT_DEAD for qt_init, QT_TEARING_DOWN for the teardown's second half -- and
+ * that test is made here, under qg_mx, BEFORE qg_want_x is raised. Testing it
+ * after the wait let an init that arrived during TEARING_DOWN take the queue
+ * while a counted caller was still inside; the teardown then found qg_want_x
+ * taken, its own exclusive entry failed, and qt_shutdown returned with the
+ * state stuck at TEARING_DOWN and every tensor still allocated (#1564). The
+ * state cannot move while the queue is held: DEAD and TEARING_DOWN are each
+ * left only by the holder of this section. */
+static int qt_gate_xenter(int from){
     pthread_mutex_lock(&qg_mx);
-    if(qg_x || qg_want_x){ pthread_mutex_unlock(&qg_mx); return 0; }
+    if(qg_get()!=from || qg_x || qg_want_x){ pthread_mutex_unlock(&qg_mx); return 0; }
     qg_want_x=1;
     while(qg_live){ QT_GATE_BLOCK_HOOK(); pthread_cond_wait(&qg_cv,&qg_mx); }
     qg_want_x=0; qg_x=1;
@@ -638,18 +660,14 @@ static int G_fp8_stream;   /* G_int4_stream declared above stage() */
 static float G_stream_swiglu_limit;
 static const float *G_fp8_lut;
 
+static int qt_init_mode(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
+                        int expert_is_int4, int fp8, const float *lut, int int4, float limit);
 int qt_init_fp8(int nl, int ne, int D, int Ih, int cap, int topk, const float *e4m3_lut){
-    G_fp8_stream = 1; G_fp8_lut = e4m3_lut;
-    int ok = qt_init(nl, ne, D, Ih, cap, topk, 0, 0);
-    if(!ok) G_fp8_stream = 0;
-    return ok;
+    return qt_init_mode(nl, ne, D, Ih, cap, topk, 0, 0, 1, e4m3_lut, 0, 0.0f);
 }
 int qt_init_stream_int4(int nl, int ne, int D, int Ih, int cap, int topk, float limit){
     if(nl<1||ne<1||D<1||Ih<1||cap<1||cap>ne||topk<1||!isfinite(limit)||limit<=0) return 0;
-    G_int4_stream = 1; G_stream_swiglu_limit = limit;
-    int ok = qt_init(nl, ne, D, Ih, cap, topk, 64, 1);
-    if(!ok) G_int4_stream = 0;
-    return ok;
+    return qt_init_mode(nl, ne, D, Ih, cap, topk, 64, 1, 0, NULL, 1, limit);
 }
 
 /* VRAM an allocation of `bytes` really occupies (cudaMalloc granularity,
@@ -691,19 +709,26 @@ static size_t dev_alloc_footprint(size_t bytes){
  *     function ever move it.
  *
  * A refused init leaves the running tier exactly as it was: the guard runs
- * before the memset, so there is nothing to undo. */
+ * before the memset AND before the mode globals (stream/fp8 flag, LUT, SwiGLU
+ * limit) are written, so there is nothing to undo. The wrappers used to set
+ * the mode first and clear it on refusal, which switched a live streaming tier
+ * from the clamped to the plain path (#1564). */
 static int qt_init_body(int nl, int ne, int D, int Ih, int cap, int topk,
                         int expert_gs, int expert_is_int4);
 
-int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
-            int expert_is_int4){
-    if(!qt_gate_xenter()) return 0;
-    int r=0;
-    if(qg_get()==QT_DEAD)
-        r=qt_init_body(nl,ne,D,Ih,cap,topk,expert_gs,expert_is_int4);
+static int qt_init_mode(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
+                        int expert_is_int4, int fp8, const float *lut, int int4, float limit){
+    if(!qt_gate_xenter(QT_DEAD)) return 0;
+    G_fp8_stream=fp8; G_fp8_lut=lut; G_int4_stream=int4; G_stream_swiglu_limit=limit;
+    int r=qt_init_body(nl,ne,D,Ih,cap,topk,expert_gs,expert_is_int4);
     if(r) qg_set(QT_LIVE);
+    else G_fp8_stream=G_int4_stream=0;   /* still DEAD: no live tier to disturb */
     qt_gate_xleave();
     return r;
+}
+int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
+            int expert_is_int4){
+    return qt_init_mode(nl,ne,D,Ih,cap,topk,expert_gs,expert_is_int4,0,NULL,0,0.0f);
 }
 
 static int qt_init_body(int nl, int ne, int D, int Ih, int cap, int topk,
@@ -964,23 +989,31 @@ int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
                    int I, int O, int device){
     if(layer < 0 || layer >= QT_DN_MAX_LAYERS) return 0;
     if(device == QT_PLACE_CPU || !q || !sc) return 0;
-    /* No G.on requirement: the projections are independent of the expert tier,
-     * so they can be measured on a card that holds no experts at all. */
-    if(!coli_cuda_tensor_upload(&G_dnp[layer].t, q, sc, 1, I, O, device)){
-        fprintf(stderr,"[dnp] layer %d upload failed -> stays on CPU\n", layer);
-        return 0;
-    }
-    G_dnp[layer].dev = device; G_dnp[layer].on = 1;
-    return 1;
+    /* No expert-tier requirement: the projections can be measured on a card
+     * that holds no experts at all, hence the trunk gate. But qt_shutdown frees
+     * G_dnp[].t, so they are counted like every other caller. */
+    if(!qt_gate_enter_trunk()) return 0;
+    int ok = coli_cuda_tensor_upload(&G_dnp[layer].t, q, sc, 1, I, O, device);
+    if(!ok) fprintf(stderr,"[dnp] layer %d upload failed -> stays on CPU\n", layer);
+    else { G_dnp[layer].dev = device; G_dnp[layer].on = 1; }
+    qt_gate_leave();
+    return ok;
 }
 
 int qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
-    if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on) return 0;
-    if(coli_cuda_matmul(&G_dnp[layer].t,y,x,NULL,NULL,1,1,I,O,G_dnp[layer].dev,0))
-        return 1;
-    fprintf(stderr,"[dnp] layer %d GPU matmul failed; CPU from here on\n", layer);
-    G_dnp[layer].on = 0;
-    return 0;
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS) return 0;
+    /* Refused (a teardown is running) means the CPU path for this call. */
+    if(!qt_gate_enter_trunk()) return 0;
+    int ok = 0;
+    if(G_dnp[layer].on){
+        ok = coli_cuda_matmul(&G_dnp[layer].t,y,x,NULL,NULL,1,1,I,O,G_dnp[layer].dev,0);
+        if(!ok){
+            fprintf(stderr,"[dnp] layer %d GPU matmul failed; CPU from here on\n", layer);
+            G_dnp[layer].on = 0;
+        }
+    }
+    qt_gate_leave();
+    return ok;
 }
 
 int qt_lmhead_matmul(float *y, const float *x, int I, int O){
@@ -1440,7 +1473,8 @@ void qt_shutdown(void){
      * a counted caller is still using cannot be pulled from under it, and a
      * caller that arrives late is refused at the door instead of being let in
      * against a state it never checked. */
-    if(!qt_gate_xenter()) return;   /* unreachable: see qt_init */
+    if(!qt_gate_xenter(QT_TEARING_DOWN)) return;   /* unreachable: qt_init cannot
+                                                     * queue from TEARING_DOWN */
     pthread_join(G.th,NULL);
     /* The backend queues expert kernels and the output download on its device
      * streams. Drain every outstanding group before releasing weights those
