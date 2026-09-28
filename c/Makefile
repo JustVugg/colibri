@@ -1794,6 +1794,21 @@ tests/test_qwen36_tier_refused_init$(EXE): tests/test_qwen36_tier_refused_init.c
 tests/test_qwen36_tier_trunk_teardown$(EXE): tests/test_qwen36_tier_trunk_teardown.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# Same fake backend, and the seam is the UPLOAD hook: 6917c3f6 made the DEAD
+# fast path free resident trunk storage instead of returning at once, but it
+# decided that from `qg_trunk` read OUTSIDE the teardown's exclusive section --
+# and qg_trunk counts trunk TENSORS, not trunk WORK. qt_dnproj_init admits the
+# caller (qg_live++) and only moves the count when the upload RETURNS, so an
+# init parked inside the upload is invisible to it: the shutdown reads 0,
+# returns, and the parked init finishes leaving a live G_dnp[].t behind a
+# completed qt_shutdown (#1564, review of 6917c3f6). A later same-shaped init is
+# then answered by the backend's cached path with the PREVIOUS generation's
+# weights -- HIGH A's class, one interleaving later. fake_cached_upload models
+# that path; the fake's upload hook is where the thread parks.
+tests/test_qwen36_tier_trunk_drain$(EXE): tests/test_qwen36_tier_trunk_drain.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+
 # Same fake backend: qt_lmhead_init read G_lmh.dev_ok with nothing held, one line
 # ABOVE the lifecycle admission, so a caller descheduled in that window was
 # admitted by the NEXT generation and installed the PREVIOUS generation's

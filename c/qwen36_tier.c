@@ -267,12 +267,27 @@ static void qt_gate_xleave(void){
  * non-NULL *tensor whose fmt/I/O/device/gs match, WITHOUT copying) -- a new
  * generation running on the previous generation's weights, with nothing
  * reporting it. A DEAD fast path may only return when there is nothing left
- * to free.
+ * to free -- and "nothing left" is a question about WORK, not about tensors:
+ * see the count's accessors, and the fast path in qt_shutdown, which is where
+ * the two are read as a pair.
  *
  * G_lmh needs no counter of its own: it is only ever created under the full
  * gate, so half two of every teardown that can see it also frees it. This is
  * the trunk's "the expert tier may never start" case, and nothing else. */
-static int qg_trunk;      /* live G_dnp[].t tensors; written under the gate */
+static int qg_trunk;      /* live G_dnp[].t tensors; NOT protected by qg_mx  */
+
+/* __atomic here for the same reason qg_state uses it above, and for one more.
+ * A trunk caller holds its qg_live slot across the ENTRY and the LEAVE only:
+ * the upload, and the increment that follows it, both run with qg_mx
+ * released. Two inits admitted together are therefore inside that stretch at
+ * the same time, and a read-modify-write on a plain int is a lost update, not
+ * a slow one -- which is why the add is a fetch_add and not a load and a
+ * store. The read is the load the teardown's fast path needs to take alongside
+ * qg_live, and the store is how a teardown clears the count under the
+ * exclusive section that has just freed the tensors. */
+static int qg_trunk_get(void){ return __atomic_load_n(&qg_trunk,__ATOMIC_ACQUIRE); }
+static void qg_trunk_set(int n){ __atomic_store_n(&qg_trunk,n,__ATOMIC_RELEASE); }
+static void qg_trunk_add(int n){ (void)__atomic_fetch_add(&qg_trunk,n,__ATOMIC_RELAXED); }
 
 /* Count parked callers so shutdown can reclaim their shared storage safely. */
 static void wait_take_locked(void){
@@ -1047,7 +1062,7 @@ int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
     int had = G_dnp[layer].t != NULL;
     int ok = coli_cuda_tensor_upload(&G_dnp[layer].t, q, sc, 1, I, O, device);
     if(!ok) fprintf(stderr,"[dnp] layer %d upload failed -> stays on CPU\n", layer);
-    else { G_dnp[layer].dev = device; G_dnp[layer].on = 1; if(!had) qg_trunk++; }
+    else { G_dnp[layer].dev = device; G_dnp[layer].on = 1; if(!had) qg_trunk_add(1); }
     qt_gate_leave();
     return ok;
 }
@@ -1493,8 +1508,6 @@ void qt_shutdown(void){
          * QT_DEAD. This thread touches no state on the way out, so it is
          * correct for it to return either way. */
         while(qg_get()==QT_TEARING_DOWN) pthread_cond_wait(&qg_cv,&qg_mx);
-        int state = qg_get(), trunk = qg_trunk;
-        pthread_mutex_unlock(&qg_mx);
         /* Losing the claim is the normal end of a shutdown -- but "already
          * DEAD" is not proof that the storage is gone. The dense projections
          * are admitted at QT_DEAD, so a tier that was never started can still
@@ -1503,13 +1516,57 @@ void qt_shutdown(void){
          * the cached weights instead of copying its own. So the DEAD fast path
          * may only return when there is nothing left to free -- and a state
          * that has since moved back to QT_LIVE owns its own teardown, whose
-         * half two frees this as well, so leave that one alone. */
-        if(state==QT_LIVE || !trunk) return;
+         * half two frees this as well, so leave that one alone. That state is
+         * the only question answerable from out here, and it is re-read under
+         * this same lock rather than carried out of the loop above. */
+        if(qg_get()==QT_LIVE){ pthread_mutex_unlock(&qg_mx); return; }
+        /* "Nothing left to free" is a question about WORK, and a count of
+         * TENSORS cannot answer it from here. qg_trunk moves when an upload
+         * RETURNS, while qt_gate_enter_trunk has been counting the caller in
+         * qg_live since before the upload started -- so for the whole of every
+         * upload there is a trunk caller inside the gate that this line, read
+         * with nothing but the mutex, cannot see. Deciding here therefore let
+         * the shutdown return with a qt_dnproj_init still parked in its upload,
+         * which then finished and left a live G_dnp[].t behind a completed
+         * teardown -- HIGH A again, one interleaving later (#1564, review of
+         * 6917c3f6).
+         *
+         * So the pair is read together, both under qg_mx, and both are needed:
+         *
+         *   qg_live == 0   no trunk caller is between admission and leave, so
+         *                  there is no increment in flight that can appear
+         *                  after this read, and nothing is on its way to make a
+         *                  tensor resident;
+         *   qg_trunk == 0  and nothing is resident now.
+         *
+         * Either one alone is the defect: the count alone misses a caller in
+         * flight (above), qg_live alone misses a tensor whose caller has
+         * already left. Together they are the whole of "nothing left to do",
+         * and they are a consistent pair because qg_mx is what orders the
+         * admission against the read. At QT_DEAD, qg_live counts trunk callers
+         * and nothing else -- qt_gate_enter admits only at QT_LIVE -- so it is
+         * exactly the count of in-flight trunk work.
+         *
+         * Anything else is somebody's own work and is NOT decided here: a
+         * resident tensor, or a trunk caller in flight, both fall through to
+         * the exclusive section below, which is the only place the answer is
+         * true, because it is the only place no caller is inside and none can
+         * arrive. The frees stay driven by the storage itself rather than by
+         * the count that was consulted to get here, so the count can never be
+         * the thing that decides what is freed. */
+        int live = qg_live, trunk = qg_trunk_get();
+        pthread_mutex_unlock(&qg_mx);
+        if(!trunk && !live) return;
+        /* Waiting is the fix, not the exclusive section: a caller in flight has
+         * already been admitted, so refusing to wait for it is what let it
+         * escape. qt_gate_xenter raises qg_want_x first, so a trunk caller that
+         * arrives from here on is refused at the door instead of joining a
+         * teardown in progress. */
         if(!qt_gate_xenter(QT_DEAD)) return;
         for(int i=0;i<QT_DN_MAX_LAYERS;i++)
             if(G_dnp[i].t) coli_cuda_tensor_free(G_dnp[i].t);
         memset(G_dnp,0,sizeof G_dnp);
-        qg_trunk=0;
+        qg_trunk_set(0);
         qg_set(QT_DEAD);
         qt_gate_xleave();
         return;
@@ -1564,11 +1621,11 @@ void qt_shutdown(void){
     free(G.fill_order); free(G.heat0); free(G.is_x); free(G.slot);
     G.fill_order=NULL; G.heat0=NULL; G.is_x=NULL; G.slot=NULL;
     memset(&G_lmh,0,sizeof G_lmh); memset(G_dnp,0,sizeof G_dnp);
-    qg_trunk=0;   /* same invariant as the trunk-only teardown: the count is
-                   * what the DEAD fast path reads, so it may not outlive the
-                   * tensors it counts -- a stale positive sends every later
-                   * redundant shutdown through an exclusive section that has
-                   * nothing left to free. */
+    qg_trunk_set(0);  /* same invariant as the trunk-only teardown: the count is
+                       * what the DEAD fast path reads beside qg_live, so it may
+                       * not outlive the tensors it counts -- a stale positive
+                       * sends every later redundant shutdown through an
+                       * exclusive section that has nothing left to free. */
     /* G.on goes last, and only here. It stayed 1 for the whole of half one on
      * purpose: a caller in that window must not be able to read "torn down"
      * and walk into storage that was still live -- and, symmetrically, a
