@@ -248,6 +248,7 @@ static struct {
 static int G_place_n = 0, G_place_done = 0;
 
 /* one component spec: "cpu" | "<dev>" | "<dev>:<n>+<dev>:<n>..." */
+#define QT_PLACE_ALL (-2)   /* only meaningful for "experts" */
 static void place_add(const char *name, size_t nlen, const char *spec){
     if(G_place_n >= QT_PLACE_MAX) return;
     if(nlen >= sizeof(G_place[0].name)) nlen = sizeof(G_place[0].name)-1;
@@ -258,6 +259,7 @@ static void place_add(const char *name, size_t nlen, const char *spec){
         while(*p==' ') p++;
         int dev, count = -1;
         if(!strncmp(p,"cpu",3)){ dev = QT_PLACE_CPU; p += 3; }
+        else if(!strncmp(p,"all",3)){ dev = QT_PLACE_ALL; p += 3; }   /* experts=all: every COLI_GPUS card, reserved or not */
         else { dev = atoi(p); while(*p && *p!=':' && *p!='+') p++; }
         if(*p==':'){ count = atoi(p+1); p++; while(*p && *p!='+') p++; }
         G_place[G_place_n].seg[ns].dev = dev;
@@ -463,6 +465,11 @@ static void auto_place(int nl, int ne, int topk, const size_t *capacity, const u
             size_t bytes = G_offer[o].bytes;
             int di = 0;
             for(int i = 1; i < G.ndev; i++) if(room[i] > room[di]) di = i;
+            /* a layer's out_proj goes where its in_proj went when that card has
+             * the room: with both on one device the whole DeltaNet layer can run
+             * there (qt_dn_gpu_init), which is worth more than balancing bytes */
+            if(!strcmp(G_offer[o].name, "dnout") && G_offer[o].layer < QT_DN_MAX_LAYERS && G_auto_dnp[G_offer[o].layer] != QT_PLACE_CPU)
+                for(int i = 0; i < G.ndev; i++) if(G.dev[i] == G_auto_dnp[G_offer[o].layer] && room[i] >= bytes) di = i;
             if(room[di] < bytes){ kept++; continue; }
             int k = (int)((bytes + G.exp_bytes - 1) / G.exp_bytes);
             double pm = 0;
@@ -702,7 +709,11 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
          * -- including the slow card, whose take() paces every layer (the
          * measured reason asymmetric expert placement lost). */
         int ed=qt_place_of("experts",0);
-        if(ed!=QT_PLACE_CPU){
+        if(ed==QT_PLACE_ALL){
+            /* experts=all: every COLI_GPUS card keeps its experts, reserved or
+             * not -- the form for "trunk on the fast card, experts on both" */
+            fprintf(stderr,"[place] experts=all -> Experten auf allen %d Karten, auch den reservierten\n",G.ndev);
+        } else if(ed!=QT_PLACE_CPU){
             int present=0; for(int i=0;i<G.ndev;i++) if(G.dev[i]==ed) present=1;
             if(present){
                 G.dev[0]=ed; G.ndev=1;
