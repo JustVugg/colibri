@@ -1741,6 +1741,44 @@ tests/test_qwen36_tier_shutdown_concurrent$(EXE): tests/test_qwen36_tier_shutdow
 # #1339 class.
 # -DQT_TEST_HOOKS gives the test the gate in wait_take_locked() that makes the
 # G.waiters drain observable; production objects omit it, so the hook is inert.
+# Same fake backend: a caller ADMITTED into the tier must never be able to touch
+# storage a teardown has already freed. Twelve entry points read `if(!G.on)` and
+# only THEN took G.mx, so a caller descheduled between the two resumed into a
+# destroyed mutex and a NULL slot array (#1564, SIGSEGV at
+# `int r = qs(layer,eid)->resident`). Reproducing that needs preemption in a
+# sub-millisecond window, so 8x400 is the wrong tool: the interleaving is forced
+# through a seam instead. The reader parks after its admission and before its
+# first storage read, and the test releases it from whichever teardown-side
+# event arrives first -- "the teardown is waiting for the caller inside" (right)
+# or "the teardown freed the storage" (the defect, and the reader dies there).
+# Both are self-reports, so no wall clock decides anything.
+# -DQT_TEST_HOOKS hands the test those three seams; production objects omit them.
+tests/test_qwen36_tier_reader_race$(EXE): tests/test_qwen36_tier_reader_race.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA -DQT_TEST_HOOKS $< -o $@ $(LDFLAGS)
+
+# Same fake backend: no qt_init may be ACCEPTED while a teardown is running, and
+# the shutdown must be SYNCHRONOUS. The old guard was `if(G.on) return 0;` while
+# qt_shutdown cleared G.on at its TOP, so for the whole slow window the guard
+# read "never started" and the re-init memset over the running teardown -- SIGSEGV
+# inside pthread_join, exit 139 (#1564). The rendezvous is the committed
+# qt_test_drain_leave_hook, so the teardown is held inside its own slow window
+# while the re-init is issued: no clock, and a teardown that deleted the window
+# could not park there to be talked to. Also checks that a losing qt_shutdown
+# WAITS, and 400 sequential init/teardown cycles so a re-armable claim cannot
+# hide.
+tests/test_qwen36_tier_reinit_window$(EXE): tests/test_qwen36_tier_reinit_window.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA -DQT_TEST_HOOKS $< -o $@ $(LDFLAGS)
+
+# No fake backend and no GPU: this one reads the SOURCE. The claim under test is
+# that the check-and-use guard lives in ONE place -- the reader defect was twelve
+# copies of it, and a behavioural test walks the hot path, not the other eleven.
+# So it asserts that no G.on admission guard survives anywhere, that no once-only
+# claim is left to re-arm, that all fourteen storage-reaching entry points go
+# through the shared helpers with no `return` between entry and leave, and that
+# qt_shutdown clears G.on inside its exclusive section. Run from c/ like the rest.
+tests/test_qwen36_tier_gate_coverage$(EXE): tests/test_qwen36_tier_gate_coverage.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DQT_GATE_COVERAGE $< -o $@ $(LDFLAGS)
+
 tests/test_qwen36_tier_invariants$(EXE): tests/test_qwen36_tier_invariants.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA -DQT_TEST_HOOKS $< -o $@ $(LDFLAGS)
 

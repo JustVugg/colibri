@@ -32,11 +32,6 @@ typedef struct {
 
 static struct {
     int on, nl, ne, D, Ih, topk, ndev;
-    /* Once-only teardown latch (0 = nobody has claimed qt_shutdown yet). Kept
-     * out of the G.mx-protected set on purpose: teardown destroys G.mx, so a
-     * claim taken under that mutex has a window in which a late caller locks a
-     * destroyed mutex. This one is a single atomic test-and-set. */
-    int teardown;
     int egs; size_t sc_gu, sc_d;   /* expert group size + per-matrix scale counts (gs64) */
     /* Formato dei pesi che il tier spedisce in VRAM: 4 = int4 raggruppato
      * (container gs64), 1 = int8 per-riga. Prima era cablato a 4 in ogni punto,
@@ -105,11 +100,128 @@ void (*qt_test_drain_wait_hook)(void);
 void (*qt_test_drain_leave_hook)(void);
 #define QT_DRAIN_WAIT_HOOK() (qt_test_drain_wait_hook ? qt_test_drain_wait_hook() : (void)0)
 #define QT_DRAIN_LEAVE_HOOK() (qt_test_drain_leave_hook ? qt_test_drain_leave_hook() : (void)0)
+
+/* Test-only, on the teardown thread, and both ends of the exclusive section
+ * below, so "the teardown waited" and "the teardown freed" are read where they
+ * are decided instead of being inferred from a wall clock.
+ *
+ * BLOCK fires on the teardown thread at the moment it is about to WAIT for the
+ * callers still inside the tier, with qg_mx held. A teardown that has nothing
+ * to wait for -- which is exactly the reader defect, where entering the tier is
+ * not counted at all -- never fires it, and that silence is the signal.
+ * FREED fires on the same thread once the storage is gone.
+ *
+ * READER_PRE fires inside a qt_* entry point that has already been admitted
+ * and has not touched the storage yet: the window an `if(!G.on)` test followed
+ * by a lock leaves open. It runs with the gate HELD and G.mx NOT held, and it
+ * must not touch G. */
+void (*qt_test_gate_block_hook)(void);
+void (*qt_test_gate_freed_hook)(void);
+void (*qt_test_reader_pre_hook)(void);
+#define QT_GATE_BLOCK_HOOK() (qt_test_gate_block_hook ? qt_test_gate_block_hook() : (void)0)
+#define QT_GATE_FREED_HOOK() (qt_test_gate_freed_hook ? qt_test_gate_freed_hook() : (void)0)
+#define QT_READER_PRE_HOOK() (qt_test_reader_pre_hook ? qt_test_reader_pre_hook() : (void)0)
 #else
 #define QT_TAKE_WAKE_HOOK() ((void)0)
 #define QT_DRAIN_WAIT_HOOK() ((void)0)
 #define QT_DRAIN_LEAVE_HOOK() ((void)0)
+#define QT_GATE_BLOCK_HOOK() ((void)0)
+#define QT_GATE_FREED_HOOK() ((void)0)
+#define QT_READER_PRE_HOOK() ((void)0)
 #endif
+
+/* ====================== tier lifecycle gate ===============================
+ *
+ * ONE mechanism, and deliberately NOT part of G: qt_init memsets G and
+ * qt_shutdown destroys G.mx, so any claim kept inside G is state the two of
+ * them can wipe out from under a running teardown -- which is precisely how the
+ * once-only latch this replaces was handed straight back by a re-init that
+ * landed in the teardown window (#1564).
+ *
+ *      QT_DEAD  ->  QT_LIVE  ->  QT_TEARING_DOWN  ->  QT_DEAD
+ *
+ * A caller that touches the tier enters through qt_gate_enter() and leaves
+ * through qt_gate_leave(); what it adds to qg_live is what makes the
+ * check-and-use atomic with respect to the teardown:
+ *
+ *   - a caller ALREADY inside is counted, so qt_shutdown cannot free the
+ *     storage under its feet: the exclusive section waits for qg_live to reach
+ *     0, and it is inside that section -- never one line earlier -- that
+ *     G.slot is freed and G.mx, G.cv and G.cv_take are destroyed;
+ *   - a caller arriving AFTER the teardown has started is refused at the door,
+ *     because the state is no longer QT_LIVE, and it never reaches the storage.
+ *
+ * Those are the two things `if(!G.on) return;` before
+ * `pthread_mutex_lock(&G.mx)` could not do. The flag was read with nothing
+ * held, so a caller descheduled between the test and the lock resumed into a
+ * destroyed mutex and a NULL slot array (#1564: SIGSEGV at
+ * `int r = qs(layer,eid)->resident`). The same shape stood in twelve sibling
+ * entry points, so the invariant lives HERE and every sibling calls these two
+ * helpers: there is no per-function guard to get right, and none to get wrong
+ * once. Clearing the flag at the TOP of the teardown is what made the same
+ * window a re-init could walk into -- see qt_shutdown.
+ *
+ * Readers REFUSE while an exclusive section is queued rather than queue behind
+ * it: a decode thread must not park behind a teardown or a model load, and
+ * refusing needs no lock the holder is keeping. Refusal is also what makes the
+ * queue drainable -- qg_want_x is raised BEFORE the wait, so no late caller can
+ * re-inflate qg_live behind the teardown's back. That deadlock is also why
+ * qt_shutdown is split in two and does not hold the gate for its whole run: the
+ * callers parked on G.cv_take hold a gate slot of their own and can only be
+ * woken by the teardown, so a teardown waiting for them while holding the gate
+ * would be waiting for a wake-up only it could send.
+ *
+ * Self-contained on purpose. A pthread_rwlock would want
+ * PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP, which sits behind _GNU_SOURCE,
+ * and this translation unit is #included by tests that pull in <stdio.h> before
+ * it -- far too late to define that here. */
+enum { QT_DEAD = 0, QT_LIVE = 1, QT_TEARING_DOWN = 2 };
+static pthread_mutex_t qg_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  qg_cv = PTHREAD_COND_INITIALIZER;
+static int qg_live;      /* admitted callers inside, not yet out              */
+static int qg_want_x;    /* an exclusive section is queued or held            */
+static int qg_x;         /* exclusive section held                           */
+static int qg_state = QT_DEAD;
+
+/* qg_state is read by qt_ready() off the decode path with no lock held, so it
+ * goes through __atomic everywhere rather than only there: mixing atomic and
+ * plain accesses to one object is not something to leave to chance. */
+static int qg_get(void){ return __atomic_load_n(&qg_state,__ATOMIC_ACQUIRE); }
+static void qg_set(int s){ __atomic_store_n(&qg_state,s,__ATOMIC_RELEASE); }
+
+/* Admit one caller for the whole of its body, or refuse it. On 1 the gate is
+ * held, and the tier storage cannot be freed or rebuilt underneath it. */
+static int qt_gate_enter(void){
+    pthread_mutex_lock(&qg_mx);
+    if(qg_get()!=QT_LIVE){ pthread_mutex_unlock(&qg_mx); return 0; }
+    qg_live++;
+    pthread_mutex_unlock(&qg_mx);
+    return 1;
+}
+static void qt_gate_leave(void){
+    pthread_mutex_lock(&qg_mx);
+    if(--qg_live==0) pthread_cond_broadcast(&qg_cv);
+    pthread_mutex_unlock(&qg_mx);
+}
+
+/* Exclusive: no caller inside, and none can arrive. 0 if somebody else already
+ * has it or is queued for it -- the loser refuses rather than waits, which is
+ * what keeps a second init (or an init against a running teardown) from
+ * queueing behind work it has no business joining. */
+static int qt_gate_xenter(void){
+    pthread_mutex_lock(&qg_mx);
+    if(qg_x || qg_want_x){ pthread_mutex_unlock(&qg_mx); return 0; }
+    qg_want_x=1;
+    while(qg_live){ QT_GATE_BLOCK_HOOK(); pthread_cond_wait(&qg_cv,&qg_mx); }
+    qg_want_x=0; qg_x=1;
+    pthread_mutex_unlock(&qg_mx);
+    return 1;
+}
+static void qt_gate_xleave(void){
+    pthread_mutex_lock(&qg_mx);
+    qg_x=0; pthread_cond_broadcast(&qg_cv);
+    pthread_mutex_unlock(&qg_mx);
+}
 
 /* Count parked callers so shutdown can reclaim their shared storage safely. */
 static void wait_take_locked(void){
@@ -558,8 +670,44 @@ static size_t dev_alloc_footprint(size_t bytes){
     return (b + 8*KiB - 1) / (8*KiB) * (8*KiB);
 }
 
+/* The only other place a generation is built, and where the lifecycle is
+ * entered. The state test and the whole rebuild are ONE exclusive step: the
+ * gate is held from the test to the end of the build, so no reader can be
+ * inside, no teardown can be running, and no second init can start.
+ *
+ * Admit only from QT_DEAD -- "never built" or "the last one is fully torn
+ * down". That single test closes both halves of #1564:
+ *   - a second init while the first is live used to memset G over a running
+ *     uploader: the mutex and both condvars it is parked on, its thread handle
+ *     (a second uploader starts, the first is orphaned and never joined), the
+ *     slot array and the host allocations behind it;
+ *   - an init racing a TEARDOWN used to be ACCEPTED, because the teardown
+ *     cleared G.on at its TOP. For the whole slow window -- the drain, the
+ *     pthread_join, the backend drain, the frees -- `if(G.on) return 0;` read
+ *     "never started", so the init memset over the running teardown, replaced
+ *     the mutex the teardown was about to park on and re-armed the once-only
+ *     claim: SIGSEGV inside pthread_join, exit 139 (#1564). Nothing is re-armed
+ *     here any more; the state is outside G and only qt_shutdown and this
+ *     function ever move it.
+ *
+ * A refused init leaves the running tier exactly as it was: the guard runs
+ * before the memset, so there is nothing to undo. */
+static int qt_init_body(int nl, int ne, int D, int Ih, int cap, int topk,
+                        int expert_gs, int expert_is_int4);
+
 int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             int expert_is_int4){
+    if(!qt_gate_xenter()) return 0;
+    int r=0;
+    if(qg_get()==QT_DEAD)
+        r=qt_init_body(nl,ne,D,Ih,cap,topk,expert_gs,expert_is_int4);
+    if(r) qg_set(QT_LIVE);
+    qt_gate_xleave();
+    return r;
+}
+
+static int qt_init_body(int nl, int ne, int D, int Ih, int cap, int topk,
+            int expert_gs, int expert_is_int4){
     const char *e=getenv("COLI_CUDA");
     if(!(e && *e=='1')) return 0;
     if(cap != ne && !G_fp8_stream && !G_int4_stream){
@@ -567,18 +715,10 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         return 0;
     }
     if(topk>QT_MAX_ROWS){ fprintf(stderr,"[qtier] topk>%d unsupported\n",QT_MAX_ROWS); return 0; }
-    /* One tier per process, and this is the last line before the tier state is
-     * rebuilt. A second init while the first is still live used to memset G
-     * over a running uploader: the mutex and both condvars it is parked on,
-     * its thread handle (a second uploader starts, the first is orphaned and
-     * never joined), the slot array and the host allocations behind it, and --
-     * the part that undoes d23b2744 -- G.teardown, which comes back as 0 and
-     * hands the once-only teardown claim straight back. The next qt_shutdown
-     * would then tear the tier down a second time (#1564). G.on is set at the
-     * end of a successful init and cleared by the latch winner, so it is the
-     * one flag that separates "never started / already torn down" from "live".
-     * Refuse: the live tier keeps serving, and qt_ready() still reports it. */
-    if(G.on) return 0;
+    /* G is wiped here and nowhere else, from inside the exclusive section the
+     * wrapper above holds, so the slot array, the mutex, both condvars, the
+     * thread handle and the host allocations are only ever rebuilt by a caller
+     * already admitted against the lifecycle. */
     memset(&G,0,sizeof G);
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk;
     /* Placement state is re-derived per init: the device fold-in below reads
@@ -795,25 +935,29 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     int th_ok=pthread_create(&G.th,NULL,uploader,NULL)==0;
     qt_aff_restore(&aff);
     if(!th_ok) return 0;
-    G.on=1; __atomic_store_n(&G.teardown, 0, __ATOMIC_RELEASE);
+    G.on=1;
     fprintf(stderr,"[qtier] CUDA VRAM expert tier active: %d device(s), %.2f MB/expert\n",
             G.ndev, G.exp_bytes/1048576.0);
     return 1;
 }
 
-int qt_ready(void){ return G.on; }
+int qt_ready(void){ return qg_get()==QT_LIVE; }
 
 int qt_lmhead_init(const int8_t *q, const float *sc, int I, int O){
-    if(!G_lmh.dev_ok||!G.on||!q||!sc) return 0;
+    if(!G_lmh.dev_ok||!q||!sc) return 0;
+    if(!qt_gate_enter()) return 0;
+    int ok=0;
     int dev=G_lmh.dev;
     if(!coli_cuda_tensor_upload(&G_lmh.t,q,sc,1,I,O,dev)){
         fprintf(stderr,"[lmh] lm_head upload failed -> stays on CPU\n");
-        return 0;
+    } else {
+        G_lmh.dev=dev; G_lmh.on=1;
+        fprintf(stderr,"[lmh] lm_head [%d x %d] int8 resident on CUDA dev %d (%.2f GB)\n",
+                O,I,dev,(double)O*I/1073741824.0);
+        ok=1;
     }
-    G_lmh.dev=dev; G_lmh.on=1;
-    fprintf(stderr,"[lmh] lm_head [%d x %d] int8 resident on CUDA dev %d (%.2f GB)\n",
-            O,I,dev,(double)O*I/1073741824.0);
-    return 1;
+    qt_gate_leave();
+    return ok;
 }
 
 int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
@@ -840,39 +984,46 @@ int qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
 }
 
 int qt_lmhead_matmul(float *y, const float *x, int I, int O){
-    if(!G_lmh.on) return 0;
+    if(!G_lmh.on || !qt_gate_enter()) return 0;
     /* cached-tensor path: upload params are ignored once *t exists */
-    if(coli_cuda_matmul(&G_lmh.t,y,x,NULL,NULL,1,1,I,O,G_lmh.dev,0)) return 1;
-    fprintf(stderr,"[lmh] GPU matmul failed; falling back to CPU from here on\n");
-    G_lmh.on=0;
-    return 0;
+    int ok = coli_cuda_matmul(&G_lmh.t,y,x,NULL,NULL,1,1,I,O,G_lmh.dev,0);
+    if(!ok){
+        fprintf(stderr,"[lmh] GPU matmul failed; falling back to CPU from here on\n");
+        G_lmh.on=0;
+    }
+    qt_gate_leave();
+    return ok;
 }
 
 /* Is (layer,eid) currently VRAM-resident? (used to free RAM-side int8 copies) */
 int qt_is_resident(int layer,int eid){
-    if(!G.on) return 0;
+    if(!qt_gate_enter()) return 0;
+    QT_READER_PRE_HOOK();
     pthread_mutex_lock(&G.mx);
     int r = qs(layer,eid)->resident;
     pthread_mutex_unlock(&G.mx);
+    qt_gate_leave();
     return r;
 }
 
 size_t qt_resident_count(void){
-    if(!G.on) return 0;
+    if(!qt_gate_enter()) return 0;
     pthread_mutex_lock(&G.mx);
     size_t n=0;
     for(size_t i=0;i<(size_t)G.nl*G.ne;i++) n+=G.slot[i].resident;
     pthread_mutex_unlock(&G.mx);
+    qt_gate_leave();
     return n;
 }
 
 size_t qt_resident_bytes(void){
-    if(!G.on) return 0;
+    if(!qt_gate_enter()) return 0;
     pthread_mutex_lock(&G.mx);
     size_t n=0;
     for(size_t i=0;i<(size_t)G.nl*G.ne;i++) n+=G.slot[i].resident;
     size_t bytes=n*G.exp_bytes;
     pthread_mutex_unlock(&G.mx);
+    qt_gate_leave();
     return bytes;
 }
 
@@ -935,8 +1086,8 @@ static void stream_promote_locked(int layer,int eid){
 void qt_note(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
-    if(!G.on || !g4) return;
-    QSlot *s=qs(layer,eid);
+    if(!g4 || !qt_gate_enter()) return;
+    QSlot *s=qs(layer,eid);        /* safe without G.mx: the gate pins the array */
     pthread_mutex_lock(&G.mx);
     if(G_fp8_stream || G_int4_stream){
         if(s->heat<0xFFFFFFFFu) s->heat++;
@@ -944,20 +1095,22 @@ void qt_note(int layer,int eid,
         stream_promote_locked(layer,eid);
         stream_forget(s);
         pthread_mutex_unlock(&G.mx);
+        qt_gate_leave();
         return;
     }
     if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
     if(s->heat<0xFFFFFFFFu) s->heat++;
     enqueue_locked(layer,eid,-1,-1,0);
     pthread_mutex_unlock(&G.mx);
+    qt_gate_leave();
 }
 
 /* blocking variant for the warmstart (waits for queue space). */
 void qt_note_block(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
-    if(!G.on || !g4) return;
-    QSlot *s=qs(layer,eid);
+    if(!g4 || !qt_gate_enter()) return;
+    QSlot *s=qs(layer,eid);        /* safe without G.mx: the gate pins the array */
     pthread_mutex_lock(&G.mx);
     G.blocking_calls++;
     if(G_fp8_stream) stream_point(s,g4,u4,d4,gs,us,ds);
@@ -968,6 +1121,7 @@ void qt_note_block(int layer,int eid,
     G.blocking_calls--;
     pthread_cond_broadcast(&G.cv_take);
     pthread_mutex_unlock(&G.mx);
+    qt_gate_leave();
 }
 
 /* warmstart order -- heat descending (HEAT_FILE) or natural order.
@@ -978,7 +1132,7 @@ static int cmp_heat_desc(const void *a,const void *b){
     return ha<hb ? 1 : ha>hb ? -1 : 0;
 }
 int qt_fill_next(int *layer,int *eid){
-    if(!G.on) return 0;
+    if(!qt_gate_enter()) return 0;
     size_t n=(size_t)G.nl*G.ne;
     pthread_mutex_lock(&G.mx);
     if(!G.fill_order){
@@ -992,15 +1146,17 @@ int qt_fill_next(int *layer,int *eid){
         int l=gi/G.ne, e=gi%G.ne, hd=home(e);
         QSlot *s=qs(l,e);
         int full=1; for(int i=0;i<G.ndev;i++) if(G.used[i]+G.exp_bytes<=G.budget[i]) full=0;
-        if(full){ pthread_mutex_unlock(&G.mx); return 0; }
+        if(full){ pthread_mutex_unlock(&G.mx); qt_gate_leave(); return 0; }
         G.fill_cur++;
         if(s->resident||s->queued) continue;
         if(G.used[hd]+G.exp_bytes>G.budget[hd]) continue;   /* dieses Device voll */
         *layer=l; *eid=e;
         pthread_mutex_unlock(&G.mx);
+        qt_gate_leave();
         return 1;
     }
     pthread_mutex_unlock(&G.mx);
+    qt_gate_leave();
     return 0;
 }
 
@@ -1008,7 +1164,7 @@ int qt_fill_next(int *layer,int *eid){
  * reservation as qt_fill_next, but without loading. The experts are then
  * loaded by any number of threads and handed over via qt_note_planned. */
 int qt_plan_fill(int *layers,int *eids,int max){
-    if(!G.on) return 0;
+    if(!qt_gate_enter()) return 0;
     size_t n=(size_t)G.nl*G.ne;
     int cnt=0;
     pthread_mutex_lock(&G.mx);
@@ -1031,6 +1187,7 @@ int qt_plan_fill(int *layers,int *eids,int max){
         layers[cnt]=l; eids[cnt]=e; cnt++;
     }
     pthread_mutex_unlock(&G.mx);
+    qt_gate_leave();
     return cnt;
 }
 
@@ -1042,8 +1199,8 @@ int qt_plan_fill(int *layers,int *eids,int max){
 void qt_note_planned(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
-    if(!G.on) return;
-    QSlot *s=qs(layer,eid);
+    if(!qt_gate_enter()) return;
+    QSlot *s=qs(layer,eid);        /* safe without G.mx: the gate pins the array */
     pthread_mutex_lock(&G.mx);
     G.blocking_calls++;
     if(!g4){
@@ -1056,6 +1213,7 @@ void qt_note_planned(int layer,int eid,
         G.blocking_calls--;
         pthread_cond_broadcast(&G.cv_take);
         pthread_mutex_unlock(&G.mx);
+        qt_gate_leave();
         return;
     }
     if(G_fp8_stream) stream_point(s,g4,u4,d4,gs,us,ds);
@@ -1070,6 +1228,7 @@ void qt_note_planned(int layer,int eid,
     G.blocking_calls--;
     pthread_cond_broadcast(&G.cv_take);
     pthread_mutex_unlock(&G.mx);
+    qt_gate_leave();
 }
 
 /* Blocks until every enqueued upload has COMPLETED (end of warmstart): the
@@ -1079,10 +1238,11 @@ void qt_note_planned(int layer,int eid,
  * Must not be called with an expert group open: an LFRU swap parks the
  * uploader on issue_open until qt_take() clears it. */
 void qt_fill_wait(void){
-    if(!G.on) return;
+    if(!qt_gate_enter()) return;
     pthread_mutex_lock(&G.mx);
     while(G.inflight>0 && !G.th_stop) wait_take_locked();
     pthread_mutex_unlock(&G.mx);
+    qt_gate_leave();
 }
 
 /* Adaptive swap check (every 16 ticks = tokens): per device, coldest resident
@@ -1113,7 +1273,7 @@ static void qt_lfru_tick_locked(void){
 }
 
 uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
-    if(!G.on||K>QT_MAX_ROWS) return 0;
+    if(K>QT_MAX_ROWS || !qt_gate_enter()) return 0;
     uint32_t mask=0;
     ColiCudaTensor *tg[QT_MAX_DEV][QT_MAX_ROWS],*tu[QT_MAX_DEV][QT_MAX_ROWS],*td[QT_MAX_DEV][QT_MAX_ROWS];
     static int rows[QT_MAX_ROWS]={0};
@@ -1148,12 +1308,13 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
             G.is_cnt[di]=0;
         }
     }
+    qt_gate_leave();
     return mask;
 }
 
 void qt_take(uint32_t mask,const float *val,int K,float *out){
     (void)K;
-    if(!G.on) return;
+    if(!qt_gate_enter()) return;
     if(mask) for(int di=0;di<G.ndev;di++){
         int c=G.is_cnt[di];
         if(!c) continue;
@@ -1170,10 +1331,11 @@ void qt_take(uint32_t mask,const float *val,int K,float *out){
     G.issue_open=0;
     pthread_cond_broadcast(&G.cv_take);
     pthread_mutex_unlock(&G.mx);
+    qt_gate_leave();
 }
 
 void qt_stats(void){
-    if(!G.on) return;
+    if(!qt_gate_enter()) return;
     uint64_t hits=0; size_t res=0;
     for(size_t i=0;i<(size_t)G.nl*G.ne;i++) res += G.slot[i].resident;
     fprintf(stderr,"[qtier] resident %zu/%d experts | uploads %llu | miss(CPU) %llu | q_skips %llu\n",
@@ -1195,31 +1357,62 @@ void qt_stats(void){
       coli_cuda_group_stats(&calls,&ex,&rows,&h2d,&kms,&d2h);
       if(calls) fprintf(stderr,"[qtier] group_stats: %llu calls, %llu experts | h2d %.0f ms, kernel %.0f ms, d2h %.0f ms\n",
               (unsigned long long)calls,(unsigned long long)ex,h2d,kms,d2h); }
+    qt_gate_leave();
 }
 
+/* The teardown is a lifecycle, and the two halves below are load-bearing:
+ *
+ *      QT_LIVE  --(first qt_shutdown)-->  QT_TEARING_DOWN  -->  QT_DEAD
+ *
+ * A concurrent qt_shutdown does not win the claim and walk away: it WAITS for
+ * the teardown to finish and only then returns, so the shutdown is
+ * synchronous -- when qt_shutdown returns to ANY caller, the storage is
+ * already freed and G.mx is already destroyed. Returning straight away is
+ * exactly how a loser came to observe a half-torn-down tier (#1564), and it is
+ * why the once-only claim this replaces was never a lifecycle: a bit says
+ * "somebody started", not "everybody finished".
+ *
+ * HALF ONE runs with the gate OPEN. It stops admitting callers -- the state is
+ * no longer QT_LIVE, so every sibling qt_* entry point refuses from here on --
+ * and it wakes the ones already inside. It cannot hold the gate while it does
+ * that: the callers it has to wake are parked on G.cv_take holding a gate slot
+ * of their own, so a teardown that held the gate while waiting for them would
+ * be waiting for a wake-up only it could send. That is the deadlock in "one
+ * exclusive gate for the whole teardown", and it is why the gate is taken
+ * second rather than first.
+ *
+ * HALF TWO takes the gate EXCLUSIVELY. Only there is it true that no caller is
+ * inside and that no caller can arrive, and only there are the tensors freed
+ * and G.mx/G.cv/G.cv_take destroyed.
+ *
+ * G.on stays 1 for all of half one. Clearing it at the TOP is what turned this
+ * window into a hole: `if(G.on) return 0;` then read "never started" for the
+ * whole drain/join/free stretch, ACCEPTED a re-init, and the memset replaced
+ * the mutex the teardown was about to park on -- SIGSEGV inside pthread_join,
+ * exit 139 (#1564). G.on is now cleared in half two, immediately before the
+ * destroy, and nothing consults it for admission any more: the gate is the
+ * authority and the flag only reports what the lifecycle has already decided. */
 void qt_shutdown(void){
-    /* Claim the teardown once, then do the work outside the lock. Testing
-     * `if(!G.on) return;` and clearing G.on only at the END of the teardown
-     * is check-then-act with nothing held across the two: two concurrent
-     * callers both read "on" and both ran everything below -- pthread_join
-     * (G.th) twice, coli_cuda_tensor_free on every slot twice, free() of
-     * G.slot/G.is_x/G.fill_order/G.heat0 twice, the condvars and G.mx
-     * destroyed twice (#1564, exit 139). A sequential second shutdown always
-     * passed, which is exactly why this survived: by then the flag is clear.
-     *
-     * The latch is an atomic test-and-set rather than a claim under G.mx
-     * because teardown DESTROYS G.mx: a caller arriving after that would
-     * otherwise take the claim on a destroyed mutex. Here the loser returns
-     * without touching teardown state at all, however late it is.
-     *
-     * Winning the latch also switches the tier off under G.mx, so every
-     * sibling `if(!G.on) return` refuses from here on and no new caller can
-     * walk into the storage this thread is about to free. G.mx is still live
-     * on this path -- only the latch winner ever reaches it. */
-    if(__atomic_exchange_n(&G.teardown, 1, __ATOMIC_ACQ_REL)) return;
-    pthread_mutex_lock(&G.mx);
-    G.on=0;
-    pthread_mutex_unlock(&G.mx);
+    /* ---- who tears down, and who waits ---- */
+    pthread_mutex_lock(&qg_mx);
+    if(qg_get()!=QT_LIVE){
+        /* A teardown is already running, or one already finished: this caller
+         * never enters the teardown body at all, however late it is.
+         *
+         * Wait on "no longer TEARING_DOWN", not on "== QT_DEAD": a fresh
+         * qt_init may have moved the state on to QT_LIVE by the time this
+         * thread is scheduled, and waiting for QT_DEAD would then never be
+         * satisfied. Reaching QT_LIVE is itself proof the teardown is over --
+         * the only ways out of TEARING_DOWN are QT_DEAD at the end of this
+         * function and QT_LIVE from qt_init, and qt_init starts only from
+         * QT_DEAD. This thread touches no state on the way out, so it is
+         * correct for it to return either way. */
+        while(qg_get()==QT_TEARING_DOWN) pthread_cond_wait(&qg_cv,&qg_mx);
+        pthread_mutex_unlock(&qg_mx);
+        return;
+    }
+    qg_set(QT_TEARING_DOWN);
+    pthread_mutex_unlock(&qg_mx);
     const char *hf=getenv("HEAT_FILE");
     if(hf && !G_int4_stream){
         FILE *f=fopen(hf,"wb");
@@ -1233,13 +1426,21 @@ void qt_shutdown(void){
     }
     /* Wake cv_take too: the uploader's LFRU victim wait (and qt_note_block /
      * qt_note_planned / qt_fill_wait, all waiting on the same condvar) would
-     * otherwise never notice th_stop and pthread_join below would hang (#1340). */
+     * otherwise never notice th_stop and pthread_join below would hang (#1340).
+     * These are the inside callers the teardown has to let go before it may
+     * take the gate, which is why this half runs without it. */
     pthread_mutex_lock(&G.mx);
     G.th_stop=1; pthread_cond_signal(&G.cv); pthread_cond_broadcast(&G.cv_take);
     while(G.blocking_calls) pthread_cond_wait(&G.cv_take,&G.mx);
     while(G.waiters){ QT_DRAIN_WAIT_HOOK(); pthread_cond_wait(&G.cv_take,&G.mx); }
     QT_DRAIN_LEAVE_HOOK();
     pthread_mutex_unlock(&G.mx);
+    /* ---- half two: exclusive. Nothing is inside, and nothing can arrive. ----
+     * Every free and every destroy below is inside this section, so the storage
+     * a counted caller is still using cannot be pulled from under it, and a
+     * caller that arrives late is refused at the door instead of being let in
+     * against a state it never checked. */
+    if(!qt_gate_xenter()) return;   /* unreachable: see qt_init */
     pthread_join(G.th,NULL);
     /* The backend queues expert kernels and the output download on its device
      * streams. Drain every outstanding group before releasing weights those
@@ -1248,7 +1449,7 @@ void qt_shutdown(void){
         for(int i=0;i<G.ndev;i++)
             if(G.is_cnt[i]) (void)coli_cuda_expert_group_take(G.dev[i]);
     G.issue_open=0;
-    for(size_t i=0;i<(size_t)G.nl*G.ne;i++){  /* G.on went to 0 with the claim */
+    for(size_t i=0;i<(size_t)G.nl*G.ne;i++){
         coli_cuda_tensor_free(G.slot[i].tg);
         coli_cuda_tensor_free(G.slot[i].tu);
         coli_cuda_tensor_free(G.slot[i].td);
@@ -1259,9 +1460,21 @@ void qt_shutdown(void){
     free(G.fill_order); free(G.heat0); free(G.is_x); free(G.slot);
     G.fill_order=NULL; G.heat0=NULL; G.is_x=NULL; G.slot=NULL;
     memset(&G_lmh,0,sizeof G_lmh); memset(G_dnp,0,sizeof G_dnp);
+    /* G.on goes last, and only here. It stayed 1 for the whole of half one on
+     * purpose: a caller in that window must not be able to read "torn down"
+     * and walk into storage that was still live -- and, symmetrically, a
+     * qt_init in that window must be refused by the state rather than accepted
+     * by a flag that is only cleared once the teardown is nearly finished. */
+    G.on=0;
     pthread_cond_destroy(&G.cv_take); pthread_cond_destroy(&G.cv); pthread_mutex_destroy(&G.mx);
     G_fp8_stream=G_int4_stream=0;
     coli_cuda_shutdown();
+    QT_GATE_FREED_HOOK();
+    /* QT_DEAD, still exclusive: a qt_init cannot slip in between the frees and
+     * this line, and the losers parked in the claim above are released by the
+     * broadcast in qt_gate_xleave(). */
+    qg_set(QT_DEAD);
+    qt_gate_xleave();
 }
 
 #endif /* COLI_CUDA */
