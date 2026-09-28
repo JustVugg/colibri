@@ -769,6 +769,12 @@ typedef struct {
     int *active_of;         /* [n_layers] original->active idx (Phase 2: identity for all layers) */
     float **DN_rec;         /* [n_layers] recurrent state S[h]=[kdim,vdim] for DeltaNet layers (NULL for attn) */
     float **DN_conv;        /* [n_layers] conv ring [conv_dim, convk-1] for DeltaNet layers (NULL for attn) */
+    /* DeltaNet layers on the GPU (Q36_DN_GPU=1, qt_dn_gpu_*): the host arrays
+     * above stay canonical; per layer, dn_dev_fresh says the device holds the
+     * newest state (nothing to upload before a GPU step), dn_host_stale says
+     * the device advanced past the host copy (download before any CPU use:
+     * a CPU step, a snapshot, a reset that must not be undone). */
+    uint8_t *dn_dev_fresh, *dn_host_stale; int dn_dev;
     uint64_t clock, hits, miss;
     RouteStats route;          /* CACHE_ROUTE / ROUTE_AGREE meters */
     /* Telemetria per la dashboard (Brain/Profile): tempo di lettura esperti
@@ -1867,6 +1873,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     /* per-layer DeltaNet recurrent + conv state (only for linear_attention layers) */
     m->DN_rec = calloc((size_t)c->n_layers, sizeof(float*));
     m->DN_conv = calloc((size_t)c->n_layers, sizeof(float*));
+    m->dn_dev_fresh = calloc((size_t)c->n_layers, 1); m->dn_host_stale = calloc((size_t)c->n_layers, 1); m->dn_dev = 0;
     for (int i = layer_begin; allocate_state && i < layer_end; i++) {
         if (c->is_attn[i]) { m->DN_rec[i] = NULL; m->DN_conv[i] = NULL; continue; }
         if (c->dn_vheads <= 0) { fprintf(stderr, "layer %d is DeltaNet but dn dims missing from meta\n", i); exit(1); }
@@ -2806,6 +2813,36 @@ static int dnproj_batch_rows(int S, int H, int O) {
     return S < rows ? S : (int)rows;
 }
 
+/* Host/device state hand-over for a DeltaNet layer that runs on the GPU. The
+ * host arrays are canonical: the device copy is a cache that is fresh (holds
+ * what the host holds) or ahead (host_stale: the device advanced). */
+static void dn_gpu_push(Model *m, int layer) {
+    if (!m->dn_dev_fresh[layer]) {
+        if (qt_dn_gpu_set_state(layer, m->DN_conv[layer], m->DN_rec[layer])) m->dn_dev_fresh[layer] = 1;
+    }
+}
+static void dn_gpu_pull(Model *m, int layer) {
+    if (m->dn_host_stale && m->dn_host_stale[layer]) {
+        if (qt_dn_gpu_get_state(layer, m->DN_conv[layer], m->DN_rec[layer])) m->dn_host_stale[layer] = 0;
+        else fprintf(stderr, "[dn] layer %d: could not read the GPU state back; the CPU continues from a stale copy\n", layer);
+    }
+}
+static void dn_gpu_pull_all(Model *m) {
+    if (!m->dn_dev) return;
+    for (int i = 0; i < m->c.n_layers; i++) if (!m->c.is_attn[i]) dn_gpu_pull(m, i);
+}
+/* the host state was rewritten (reset, restore): the device copy is old */
+static void dn_gpu_invalidate(Model *m) {
+    if (!m->dn_dev_fresh) return;
+    memset(m->dn_dev_fresh, 0, (size_t)m->c.n_layers);
+    memset(m->dn_host_stale, 0, (size_t)m->c.n_layers);
+}
+static int dn_gpu_env_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *p = getenv("Q36_DN_GPU"); on = p && *p == '1'; }
+    return on;
+}
+
 static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     (void)pos_base;
     Cfg *c = &m->c;
@@ -2837,6 +2874,36 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
 
     float *rec = m->DN_rec[layer];      /* [vh*kdim*vdim] */
     float *ring = m->DN_conv[layer];    /* [conv_dim*(convk-1)] */
+
+    /* Decode token with the layer on the GPU: gates on the CPU (two tiny
+     * matmuls), everything else -- in_proj, conv, recurrence, gated norm,
+     * out_proj -- in one device chain, host in, host out. The state stays on
+     * the card; the host copy is refreshed only when something on the CPU
+     * asks for it (dn_gpu_pull). */
+    if (S == 1 && m->dn_dev && qt_dn_gpu_ready(layer)) {
+        extern double g_dn_sub[4];
+        double _g0 = tm_now();
+        matmul(b, x, l->dn_b, 1, H, vh);
+        matmul(a, x, l->dn_a, 1, H, vh);
+        for (int h = 0; h < vh; h++) {
+            beta[h] = 1.f / (1.f + expf(-b[h]));
+            gg[h] = expf(-expf(l->dn_alog[h]) * softplus_f(a[h] + l->dn_dtbias[h]));   /* egh */
+        }
+        dn_gpu_push(m, layer);
+        int ok = m->dn_dev_fresh[layer] && qt_dn_gpu_step(layer, x, out, gg, beta);
+        if (ok) {
+            m->dn_host_stale[layer] = 1;
+            if (tm_on()) g_dn_sub[0] += tm_now() - _g0;
+            free(qkvz); free(b); free(a); free(beta); free(gg);
+            free(conv_out); free(q); free(k); free(outv); free(outr); free(kv); free(delta);
+            return;
+        }
+        /* the tier turned the layer off: continue on the CPU from the state
+         * the card still holds (a failed step may or may not have advanced it) */
+        dn_gpu_pull(m, layer);
+    } else if (m->dn_dev) {
+        dn_gpu_pull(m, layer);              /* prefill or a CPU-only layer: the host must be current */
+    }
 
     for (int s = 0; s < S; s++) {
         const float *xs = x + (int64_t)s * H;
@@ -2968,6 +3035,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
             }
         }
     }
+    if (m->dn_dev_fresh) m->dn_dev_fresh[layer] = 0;   /* the host advanced: the device copy is old */
     free(qkvz);   /* qkv and z are regions of this one allocation */
     free(b); free(a); free(beta); free(gg);
     free(conv_out); free(q); free(k); free(outv); free(outr); free(kv); free(delta);
@@ -3389,6 +3457,7 @@ static Q36PinState *q36_pin_state_save(Model *m, Q36PinState *reuse){
             if (!st->rec[i] || !st->conv[i]) { q36_pin_state_free(st); return NULL; }
         }
     }
+    dn_gpu_pull_all(m);   /* the card may be ahead of the host copy */
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]) continue;
         if (m->DN_rec[i]  && st->rec[i])  memcpy(st->rec[i],  m->DN_rec[i],  nr * sizeof(float));
@@ -3431,6 +3500,7 @@ static int pin_restore(Model *m, const int *ids, int n){
                 if (m->DN_rec[i]  && st->rec[i])  memcpy(m->DN_rec[i],  st->rec[i],  nr * sizeof(float));
                 if (m->DN_conv[i] && st->conv[i]) memcpy(m->DN_conv[i], st->conv[i], nc * sizeof(float));
             }
+            dn_gpu_invalidate(m);   /* restored on the host: the card's copy is from another prompt */
             m->kv_len = k->len;
             kv_prefix_clear(&m->kvp);
             kv_prefix_record(&m->kvp, k->ids, 0, k->len);
@@ -3455,6 +3525,7 @@ static void reset_recurrent(Model *m){
         if (m->DN_rec[i])  memset(m->DN_rec[i],  0, (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float));
         if (m->DN_conv[i]) memset(m->DN_conv[i], 0, (size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float));
     }
+    dn_gpu_invalidate(m);   /* zero on the host is the truth now; the card re-loads it before its next step */
 }
 
 /* Allocate (once) or reuse the KV cache across requests. Grows only when a
@@ -4327,6 +4398,26 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[dense] %d trunk matrices on GPU (dnout/attnproj/shexp, %.2f GB VRAM)\n",
                         placed, vram / 1073741824.0);
         }
+        /* Q36_DN_GPU=1: where the in_proj and the out_proj of a DeltaNet layer
+         * both sit on one card, the conv ring, the recurrence and the gated
+         * norm go there too, and a decode token runs the layer end to end on
+         * the device (qt_dn_gpu_step). Measured motivation: with the trunk in
+         * VRAM the CPU still spent ~8 of 39 ms/token on these steps -- not
+         * arithmetic, host round trips, thirty per token. */
+        if (dn_gpu_env_on()) {
+            int n = 0; double vram = 0;
+            for (int i = 0; i < m.c.n_layers; i++) {
+                if (m.c.is_attn[i] || !m.L[i].qth_dnout || !qt_dnproj_ready(i)) continue;
+                if (qt_dn_gpu_init(i, m.c.dn_vheads, m.c.dn_kheads, m.c.dn_kdim, m.c.dn_vdim, m.c.dn_conv_dim, m.c.dn_convk,
+                                   m.c.hidden, m.L[i].dn_conv, m.L[i].dn_norm, m.c.eps, m.L[i].qth_dnout)) {
+                    n++; vram += (double)m.c.dn_vheads * m.c.dn_kdim * m.c.dn_vdim * 4 + (double)m.c.dn_conv_dim * (m.c.dn_convk - 1) * 4;
+                }
+            }
+            m.dn_dev = n > 0;
+            if (n) fprintf(stderr, "[dn] %d DeltaNet layers run on the GPU end to end (conv, recurrence, gated norm; %.0f MB of state in VRAM)\n",
+                           n, vram / 1048576.0);
+            else fprintf(stderr, "[dn] Q36_DN_GPU=1 but no layer has both projections on one card; the CPU path stands\n");
+        }
         /* Warmstart: fill the VRAM budget BEFORE the first token (heat order
          * when HEAT_FILE exists, natural order otherwise), loading all RAM
          * slots along the way. */
@@ -4474,7 +4565,7 @@ static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
     free(model->attn_sc);
     free(model->seen); free(model->is_queued); free(model->is_pinned);
     free(model->momentum_logits); free(model->freq);
-    free(model->DN_conv); free(model->DN_rec);
+    free(model->DN_conv); free(model->DN_rec); free(model->dn_dev_fresh); free(model->dn_host_stale);
     free(model->cache); free(model->active_of); free(model->L);
     free(model->c.is_attn);
     st_destroy(&model->S);
@@ -4536,7 +4627,7 @@ static int qwen36_segment_engine_open(
                      (int)options->layer_begin, (int)options->layer_end, 0, 0);
     engine->model.quant_bits = container_layer_is_int4(
         &engine->model, (int)options->layer_begin) ? 4 : 8;
-    free(engine->model.DN_rec); free(engine->model.DN_conv);
+    free(engine->model.DN_rec); free(engine->model.DN_conv); free(engine->model.dn_dev_fresh); free(engine->model.dn_host_stale);
     engine->model.DN_rec = NULL; engine->model.DN_conv = NULL;
     engine->model.max_t = (int)options->context_tokens;
     engine->model.kv_cap = (int)options->context_tokens;
