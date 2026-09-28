@@ -19,6 +19,11 @@
  *      are parked at the same time, under a portable watchdog, and shutdown
  *      has to bring every one of them home.
  *
+ *   2b. And the waiting is not just "shutdown returns": qt_shutdown must not
+ *      start tearing the shared storage down until the awakened qt_fill_wait
+ *      caller has actually left. Held open by a gate the test owns, because
+ *      pthread_join after the fact hides the difference entirely.
+ *
  *   3. Issue geometry holds under random routing. Random resident sets,
  *      random K up to the row limit, one to three devices, many seeds: every
  *      device block lies inside the replica buffer, blocks of different
@@ -327,6 +332,130 @@ static void test_shutdown_wakes_everyone(void) {
 }
 
 /* ======================================================================== */
+/* 2b. the waiters drain, ordered against the caller it protects            */
+/* ======================================================================== */
+/* qt_shutdown frees G.slot and destroys G.mx only after every parked
+ * qt_fill_wait caller has left. The scenario above shows shutdown RETURNS
+ * with a caller parked; it cannot show shutdown WAITED for one, because the
+ * caller's remaining path after the wake is a mutex hand-back and pthread_join
+ * below covers the difference anyway. Delete `while(G.waiters)` and that test
+ * still passes a hundred times out of a hundred.
+ *
+ * So the caller is held inside the window instead, by a gate the test owns:
+ * qt_test_take_wake_hook fires between the wake and the leave, and parks there
+ * until the test opens it. Handshakes throughout (G.waiters, the upload hook,
+ * the gate) -- no sleep establishes the ordering, and the only bounded waits
+ * are the ones that ask whether an event did NOT happen.
+ *
+ * Holding it also has to leave the uploader able to retire, or the mutant
+ * would block in pthread_join and look like the drain worked. Hence the gate
+ * drops G.mx while it parks: what is under test is a free/destroy race, not a
+ * lock-ordering one. */
+static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_cv = PTHREAD_COND_INITIALIZER;
+static int g_gate_closed, g_gate_entered, g_shut_done;
+static unsigned g_seq, g_seq_caller, g_seq_shut;
+
+/* the held upload: fake_upload_hook carries no context, so this state is
+ * file scope like the rest of the test's */
+static pthread_mutex_t up_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  up_cv = PTHREAD_COND_INITIALIZER;
+static int up_held, up_entered;
+static void hold_upload(int fmt) {
+    (void)fmt;
+    pthread_mutex_lock(&up_mx);
+    up_entered = 1; pthread_cond_broadcast(&up_cv);
+    while (up_held) pthread_cond_wait(&up_cv, &up_mx);
+    pthread_mutex_unlock(&up_mx);
+}
+static void set_upload_held(int h) {
+    pthread_mutex_lock(&up_mx); up_held = h; pthread_cond_broadcast(&up_cv); pthread_mutex_unlock(&up_mx);
+}
+/* bounded wait on a flag, or give up. A negative claim has no event to wait
+ * for, so the bound is the only honest way to phrase one; every other ordering
+ * in this test comes from a handshake. */
+static void wait_flag(pthread_mutex_t *m, volatile int *flag, int max_ms) {
+    for (int i = 0; i < max_ms; i++) {
+        pthread_mutex_lock(m); int v = *flag; pthread_mutex_unlock(m);
+        if (v) return;
+        struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);
+    }
+}
+
+static void drain_gate(void) {
+    pthread_mutex_unlock(&G.mx);        /* wait_take_locked wants it back on the way out */
+    pthread_mutex_lock(&g_mx);
+    g_gate_entered = 1; pthread_cond_broadcast(&g_cv);
+    while (g_gate_closed) pthread_cond_wait(&g_cv, &g_mx);
+    pthread_mutex_unlock(&g_mx);
+    pthread_mutex_lock(&G.mx);
+}
+static void *th_drain_caller(void *a) {
+    (void)a;
+    qt_fill_wait();
+    pthread_mutex_lock(&g_mx); g_seq_caller = ++g_seq; pthread_mutex_unlock(&g_mx);
+    return NULL;
+}
+static void *th_drain_shutdown(void *a) {
+    (void)a;
+    qt_shutdown();
+    pthread_mutex_lock(&g_mx); g_shut_done = 1; g_seq_shut = ++g_seq; pthread_mutex_unlock(&g_mx);
+    return NULL;
+}
+
+#define DRAIN_SETTLE_MS 2000             /* how long the mutant needs to prove itself */
+
+static void test_shutdown_waits_for_woken_caller(void) {
+    enum { NL = 2, NE = 8 };
+    make_weights(NE);
+    if (!start_tier(1, NL, NE, 1, NULL)) { check(0, "tier did not start"); return; }
+
+    /* a dequeued-but-not-yet-uploaded expert is the only state where
+     * qt_fill_wait has a reason to park at all: qn is already back to 0 */
+    up_held = 1; up_entered = 0; fake_upload_hook = hold_upload;
+    NOTE(qt_note_block, 0, 0);
+    wait_flag(&up_mx, &up_entered, 1000);
+    check(up_entered, "the uploader must sit inside a held upload for a caller to have anything to wait for");
+
+    g_gate_closed = 1; g_gate_entered = 0; g_shut_done = 0;
+    g_seq = g_seq_caller = g_seq_shut = 0;
+    qt_test_take_wake_hook = drain_gate;
+
+    pthread_t c;
+    pthread_create(&c, NULL, th_drain_caller, NULL);
+    WAIT_UNTIL(G.waiters == 1, 1000);
+    check(G.waiters == 1, "the caller must be parked inside qt_fill_wait before shutdown is requested");
+
+    /* let the upload land: inflight reaches 0, the uploader retires, and the
+     * parked caller is woken -- straight into the gate, still inside
+     * G.waiters, so shutdown has something left to wait for */
+    arm_watchdog(10);
+    set_upload_held(0);
+    wait_flag(&g_mx, &g_gate_entered, 1000);
+    check(g_gate_entered, "the woken caller must reach the gate, or the window under test never opened");
+
+    pthread_t s;
+    pthread_create(&s, NULL, th_drain_shutdown, NULL);
+    wait_flag(&g_mx, &g_shut_done, DRAIN_SETTLE_MS);
+
+    pthread_mutex_lock(&g_mx); int shut_early = g_shut_done; pthread_mutex_unlock(&g_mx);
+    check(!shut_early,
+          "qt_shutdown must not return while an awakened qt_fill_wait caller is still inside it: "
+          "teardown freed G.slot and destroyed G.mx under a caller that had not left");
+
+    pthread_mutex_lock(&g_mx); g_gate_closed = 0; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mx);
+    pthread_join(c, NULL); pthread_join(s, NULL);
+    disarm_watchdog();
+    fake_upload_hook = NULL;
+
+    pthread_mutex_lock(&g_mx);
+    int ordered = g_shut_done && g_seq_caller && g_seq_caller < g_seq_shut;
+    pthread_mutex_unlock(&g_mx);
+    check(ordered, "the awakened caller must leave qt_fill_wait before qt_shutdown returns");
+    check(!G.on, "the drained shutdown still switches the tier off");
+}
+
+/* ======================================================================== */
 /* 3. issue geometry under random routing                                    */
 /* ======================================================================== */
 enum { MAX_REC = 8 };
@@ -428,6 +557,8 @@ int main(void) {
     printf(" 1. budget accounting, 1 device\n");  test_budget_accounting(1);
     printf(" 1. budget accounting, 2 devices\n"); test_budget_accounting(2);
     printf(" 2. shutdown wakes every waiter\n");  test_shutdown_wakes_everyone();
+    printf(" 2b. shutdown waits for the caller the drain protects\n");
+    test_shutdown_waits_for_woken_caller();
     printf(" 3. issue geometry, random routing, 1/2/3 devices x 200 seeds\n");
     test_issue_geometry(1, 200); test_issue_geometry(2, 200); test_issue_geometry(3, 200);
     if (fails) { printf("test_qwen36_tier_invariants: %d failure(s)\n", fails); return 1; }

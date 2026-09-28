@@ -70,10 +70,24 @@ static struct {
     uint32_t *heat0;                      /* heat table loaded from HEAT_FILE */
 } G;
 
+#ifdef QT_TEST_HOOKS
+/* Test-only gate, called on the wake and BEFORE the waiter leaves G.waiters.
+ * The drain in qt_shutdown is only observable if a test can hold an awakened
+ * caller inside the window, and once woken its whole remaining path is a
+ * mutex hand-back -- there is no seam to widen it from the outside. Compiled
+ * out of production objects, like COLI_V4_TEST_HOOKS in deepseek_v4.c; the
+ * hook must return with G.mx held. */
+void (*qt_test_take_wake_hook)(void);
+#define QT_TAKE_WAKE_HOOK() (qt_test_take_wake_hook ? qt_test_take_wake_hook() : (void)0)
+#else
+#define QT_TAKE_WAKE_HOOK() ((void)0)
+#endif
+
 /* Count parked callers so shutdown can reclaim their shared storage safely. */
 static void wait_take_locked(void){
     G.waiters++;
     pthread_cond_wait(&G.cv_take,&G.mx);
+    QT_TAKE_WAKE_HOOK();
     if(--G.waiters==0 && G.th_stop) pthread_cond_broadcast(&G.cv_take);
 }
 

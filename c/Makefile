@@ -1100,6 +1100,13 @@ qwen38-tiny-check: qwen38-tiny-generate qwen38$(EXE)
 tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
+# CACHE_ROUTE: route_select() against a residency table, no model needed.
+# Explicit rule, not just the tests/test_*.c auto-gate: the test includes
+# qwen36.c, so it has to be rebuilt when the engine's routing changes rather
+# than when the test does.
+tests/test_qwen36_cache_route$(EXE): tests/test_qwen36_cache_route.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(LDFLAGS)
+
 tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
@@ -1718,8 +1725,10 @@ tests/test_qwen36_tier_shutdown$(EXE): tests/test_qwen36_tier_shutdown.c tests/q
 # issue blocks stay inside, disjoint and at their device's slot under random
 # routing on 1-3 devices. Under test-asan the third doubles as a fuzz for the
 # #1339 class.
+# -DQT_TEST_HOOKS gives the test the gate in wait_take_locked() that makes the
+# G.waiters drain observable; production objects omit it, so the hook is inert.
 tests/test_qwen36_tier_invariants$(EXE): tests/test_qwen36_tier_invariants.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
-	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) -DCOLI_CUDA -DQT_TEST_HOOKS $< -o $@ $(LDFLAGS)
 
 # Same fake backend, with uploads that take time: qt_fill_wait must not return
 # until the last enqueued expert is RESIDENT, not merely dequeued -- the engine
