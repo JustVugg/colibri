@@ -65,6 +65,50 @@ static int tier_pick_lfru(const uint32_t *heat, const uint32_t *last, uint32_t c
     *slot=cold; *eid=hot; *gain=(long)((hs-cs)>>8); return 1;
 }
 
+/* ------------------------------------------------------------------------
+ * Phase 3 demand-eviction policy (DEMAND_POLICY=lru|lfru|auto), shared by
+ * every engine with a demand-loaded expert cache.  It ranks VICTIMS ONLY:
+ * routing, weights, logits and KV are never touched.
+ *
+ *   lru  (default): key = the slot's `used` clock — the legacy scan,
+ *                   bit-identical by construction.
+ *   lfru: frequency-primary score; a recent access is worth at most 255
+ *         points while one frequency count is worth 256, so a merely recent
+ *         expert cannot displace a genuinely hotter one.  This is olmoe.c's
+ *         Phase 3a score, verbatim.
+ *   auto: lfru when the per-layer cap <= TIER_DEMAND_AUTO_CAP, lru above:
+ *         the offline route200.txt replay showed LFRU +5.0pp at cap 8 but
+ *         -3.2..-4.1pp at cap 16/24/32, so frequency-primary only wins for
+ *         very small caches.
+ *
+ * Unknown policy values fall back to lru.  A missing heat/recency array is
+ * the caller's guard (it degrades to lru), never this helper's.
+ * ------------------------------------------------------------------------ */
+#define TIER_DEMAND_LRU      0
+#define TIER_DEMAND_LFRU     1
+#define TIER_DEMAND_AUTO     2
+#define TIER_DEMAND_AUTO_CAP 12
+static uint64_t tier_demand_lfru_score(uint32_t heat, uint64_t last, uint64_t clock){
+    uint64_t age = (clock > last) ? (clock - last) : 0;
+    uint64_t recent = (age < 255) ? (255 - age) : 0;
+    return ((uint64_t)heat << 8) | recent;   /* == olmoe.c's LFRU score, verbatim */
+}
+static int tier_demand_use_lfru(int policy, int cap){
+    return policy == TIER_DEMAND_LFRU ||
+           (policy == TIER_DEMAND_AUTO && cap <= TIER_DEMAND_AUTO_CAP);
+}
+static uint64_t tier_demand_victim_key(int policy, int cap, uint32_t heat,
+                                       uint64_t last, uint64_t clock, uint64_t used){
+    if(!tier_demand_use_lfru(policy, cap)) return used;
+    return tier_demand_lfru_score(heat, last, clock);
+}
+static int tier_demand_policy_env(void){          /* DEMAND_POLICY=lru|lfru|auto */
+    const char *dp = getenv("DEMAND_POLICY");
+    if(dp && !strcmp(dp, "lfru")) return TIER_DEMAND_LFRU;
+    if(dp && !strcmp(dp, "auto")) return TIER_DEMAND_AUTO;
+    return TIER_DEMAND_LRU;
+}
+
 static void tier_decay(uint32_t *heat, int nexpert){
     for(int e=0;e<nexpert;e++) heat[e]=tier_decay_value(heat[e]);
 }

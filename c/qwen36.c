@@ -66,6 +66,7 @@ static int qwen36_max_ctx(void) {
 #include "decode_batch.h" /* ColiSubmit + coli_submit_ext: le chiavi key=value di SUBMIT */
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
+#include "tier.h"          /* shared demand-eviction policy (DEMAND_POLICY=lru|lfru|auto) */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
 #include "idot.h"          /* integer dot kernels for the dense trunk (COLI_DENSE_IDOT, COLI_DENSE_BITS) */
 #ifdef COLI_SEGMENT_ADAPTER
@@ -731,7 +732,8 @@ typedef struct {
 /* pw: the expert as expert_ffn.h wants it (planar int4, gate|up|down), the
  * only weight copy a slot holds when the shared kernel is active; g/u/d and
  * g4/u4/d4 are then NULL. */
-typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; uint8_t *pw; float *gs, *us, *ds; uint64_t used; } Slot;
+typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; uint8_t *pw; float *gs, *us, *ds; uint64_t used;
+                 unsigned hold;  /* batched run still holds this slot's pointers: never a victim */ } Slot;
 typedef struct {
     Slot *slots;
     int *slot_by_expert;                  /* expert id -> resident slot, -1 if absent */
@@ -773,6 +775,8 @@ typedef struct {
     int attn_sc_thr;
     double dense_load_s;
     uint32_t *freq;
+    uint64_t *last_access;     /* [n_layers * n_experts] clock of last access (LFRU recency) */
+    int demand_policy;         /* DEMAND_POLICY=lru|lfru|auto (tier.h): victim ranking only */
     int freq_token_count, hot_pinned, hot_n, warmup_tokens, token_count;
     float *momentum_logits;
     float pilot_smooth, pilot_conf_limit;
@@ -842,6 +846,20 @@ static void cache_publish(Model *m, int layer, Slot *s, int eid) {
     if (lc->slot_by_expert && eid >= 0 && eid < m->c.n_experts)
         lc->slot_by_expert[eid] = (int)(s - lc->slots);
 }
+
+/* Batched runs (moe_xf_run) hold several slots' weight pointers across
+ * further expert_get() calls, so a slot already handed to a run must never be
+ * chosen as a victim — under ANY demand policy.  LRU's freshness ordering
+ * happened to guarantee this; frequency-primary LFRU does not (it can prefer
+ * an older, hotter resident over a freshly loaded low-frequency one), so the
+ * hold counter makes the invariant explicit.  Atomic like colibri's
+ * eslot_acquire/eslot_busy; the eviction scans read it with acquire order. */
+static void slot_hold(Slot *s){ __atomic_add_fetch(&s->hold,1,__ATOMIC_ACQ_REL); }
+static void slot_release(Slot *s){
+    unsigned old=__atomic_fetch_sub(&s->hold,1,__ATOMIC_ACQ_REL);
+    if(!old){ fprintf(stderr,"[qwen36] Slot hold underflow\n"); abort(); }
+}
+static int slot_held(const Slot *s){ return __atomic_load_n(&s->hold,__ATOMIC_ACQUIRE)!=0; }
 
 static void ensure_pilot_worker_started(Model *m) {
     if (!pilot_m) {
@@ -1649,6 +1667,8 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         m->DN_conv[i] = calloc((size_t)c->dn_conv_dim * (c->dn_convk - 1), sizeof(float));
     }
     m->freq = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint32_t));
+    m->last_access = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint64_t));
+    m->demand_policy = tier_demand_policy_env();   /* DEMAND_POLICY=lru|lfru|auto (tier.h) */
     m->hot_pinned = 0; m->freq_token_count = 0;
     m->hot_n         = getenv("HOT")    ? atoi(getenv("HOT"))    : 0;
     m->warmup_tokens = getenv("WARMUP") ? atoi(getenv("WARMUP")) : 5;
@@ -1913,6 +1933,18 @@ static void ehit_mark(Model *m, int layer, int eid){
     }
     if(layer>=0&&layer<c->n_layers&&eid>=0&&eid<c->n_experts) ehit[layer][eid]=1;
 }
+/* DEMAND_POLICY (tier.h): victim ranking key inside the LRU tier.  lru (the
+ * default) returns the slot's `used` clock, so the comparison is bit-identical
+ * to the legacy scan; lfru returns the frequency-primary score.  Callers pass
+ * use_lfru only after the freq/last_access NULL-guard below.  Victim choice
+ * only: routing, weights and math are never touched. */
+static uint64_t demand_victim_key(Model *m, int layer, int cap, const Slot *s, int use_lfru) {
+    return tier_demand_victim_key(use_lfru ? TIER_DEMAND_LFRU : TIER_DEMAND_LRU, cap,
+                                  use_lfru ? m->freq[(int64_t)layer * m->c.n_experts + s->eid] : 0,
+                                  use_lfru ? m->last_access[(int64_t)layer * m->c.n_experts + s->eid] : 0,
+                                  m->clock, s->used);
+}
+
 static void expert_get(Model *m, int layer, int eid, Slot **out) {
     ehit_mark(m, layer, eid);   /* tocca solo m->ehit[layer][eid] */
     LCache *lc = &m->cache[layer];
@@ -1920,22 +1952,33 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     Slot *hit = slot_indexed(m, layer, eid);
     if (hit) {
         m->hits++; hit->used = ++m->clock; *out = hit;
+        if (m->last_access) m->last_access[(int64_t)layer * m->c.n_experts + eid] = m->clock;
         pthread_mutex_unlock(&g_pilot_mx); return;
     }
     m->miss++;
     Cfg *c = &m->c; Slot *s;
     if (lc->n < lc->cap) { s = &lc->slots[lc->n++]; slot_ensure_allocated(m, s); }
     else {
-        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
+        /* LRU eviction — skip pinned and in-flight (eid==-1) slots.  Inside
+         * the tier the victim is the slot with the minimum demand_victim_key:
+         * the `used` clock for lru (legacy, bit-identical comparison) or the
+         * frequency-primary LFRU score for lfru; auto resolves per layer
+         * (lfru when cap <= 12).  A missing freq/last_access array falls back
+         * to lru.  Protection (pinned / in-flight) always wins over policy. */
+        int use_lfru = (m->demand_policy == TIER_DEMAND_LFRU) ||
+                       (m->demand_policy == TIER_DEMAND_AUTO && lc->cap <= TIER_DEMAND_AUTO_CAP);
+        if (use_lfru && (!m->freq || !m->last_access)) use_lfru = 0;
         int lru = -1;
         for (int i = 0; i < lc->n; i++) {
-            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
-            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+            if (lc->slots[i].pinned || lc->slots[i].eid < 0 || slot_held(&lc->slots[i])) continue;
+            if (lru < 0 || demand_victim_key(m, layer, lc->cap, &lc->slots[i], use_lfru) <
+                           demand_victim_key(m, layer, lc->cap, &lc->slots[lru], use_lfru)) lru = i;
         }
         if (lru < 0) {
-            /* All slots are pinned or in-flight; find the oldest non-in-flight
-             * slot (may be pinned, but never one currently being loaded). */
-            for (int i = 0; i < lc->n; i++) { if (lc->slots[i].eid < 0) continue; if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i; }
+            /* All slots are pinned, held or in-flight; find the oldest
+             * non-in-flight, non-held slot (may be pinned, but never one
+             * currently being loaded or held by a batched run). */
+            for (int i = 0; i < lc->n; i++) { if (lc->slots[i].eid < 0 || slot_held(&lc->slots[i])) continue; if (lru < 0 || demand_victim_key(m, layer, lc->cap, &lc->slots[i], use_lfru) < demand_victim_key(m, layer, lc->cap, &lc->slots[lru], use_lfru)) lru = i; }
         }
         while (lru < 0) {
             /* EVERY slot is in flight: each buffer is owned by an unlocked pread
@@ -1955,8 +1998,9 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
             sleep_ms(1);
             pthread_mutex_lock(&g_pilot_mx);
             for (int i = 0; i < lc->n; i++) {
-                if (lc->slots[i].eid < 0) continue;
-                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+                if (lc->slots[i].eid < 0 || slot_held(&lc->slots[i])) continue;
+                if (lru < 0 || demand_victim_key(m, layer, lc->cap, &lc->slots[i], use_lfru) <
+                               demand_victim_key(m, layer, lc->cap, &lc->slots[lru], use_lfru)) lru = i;
             }
         }
         s = &lc->slots[lru]; s->pinned = 0;
@@ -1969,6 +2013,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     pthread_mutex_lock(&g_pilot_mx);
     m->t_disk += t_read;        /* sotto lock: qui arrivano anche i thread del PILOT */
     cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer * c->n_experts + eid]; s->used = ++m->clock;
+    if (m->last_access) m->last_access[(int64_t)layer * c->n_experts + eid] = m->clock;
     *out = s; pthread_mutex_unlock(&g_pilot_mx);
 }
 
@@ -2244,19 +2289,22 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
     int n = per * kper;
     XfExpert *ex = malloc(sizeof(XfExpert) * (size_t)n);
     const XfExpert **exp = malloc(sizeof(XfExpert *) * (size_t)n);
+    Slot **held = malloc(sizeof(Slot *) * (size_t)n);
     int *ridx = malloc(sizeof(int) * (size_t)n); float *rval = falloc(n);
     float *tmp = kper < K ? falloc(D) : NULL;
     void *scratch = malloc(xf_moe_scratch_bytes(per, kper, D, F));
-    if (!ex || !exp || !ridx || !scratch) { fprintf(stderr, "OOM moe_xf_run\n"); exit(1); }
+    if (!ex || !exp || !held || !ridx || !scratch) { fprintf(stderr, "OOM moe_xf_run\n"); exit(1); }
     int timed = tm_on() && S == 1;
     for (int s0 = 0; s0 < S; s0 += per) {
         for (int k0 = 0; k0 < K; k0 += kper) {
             double t0 = timed ? tm_now() : 0;
+            int nh = 0;
             for (int s = 0; s < per; s++) for (int k = 0; k < kper; k++) {
                 int src = (s0 + s) * K + (k0 + k), dst = s * kper + k;
                 ridx[dst] = idx[src]; rval[dst] = val[src]; exp[dst] = NULL;
                 if (idx[src] < 0) continue;
                 Slot *e; expert_get(m, layer, idx[src], &e);
+                held[nh++] = e; slot_hold(e);   /* pointers live past further expert_get calls: never a victim */
                 ex[dst].g4 = e->pw; ex[dst].u4 = e->pw + gp; ex[dst].d4 = e->pw + 2 * gp;
                 ex[dst].gs = e->gs; ex[dst].us = e->us; ex[dst].ds = e->ds;
                 exp[dst] = &ex[dst];
@@ -2267,10 +2315,11 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
                 xf_moe_run(tmp, x + (int64_t)s0 * D, 1, 1, D, F, ridx, rval, exp, xf_act_mode(), scratch);
                 float *os = out + (int64_t)s0 * D; for (int d = 0; d < D; d++) os[d] += tmp[d];
             }
+            for (int h = 0; h < nh; h++) slot_release(held[h]);
             if (timed) { double t2 = tm_now(); g_xf_load += t1 - t0; g_xf_run += t2 - t1; }
         }
     }
-    free(ex); free(exp); free(ridx); free(rval); free(tmp); free(scratch);
+    free(ex); free(exp); free(held); free(ridx); free(rval); free(tmp); free(scratch);
 }
 
 /* ---------- CACHE_ROUTE: residency-aware top-K fill (docs/CACHE_ROUTE.md) ----------
@@ -2983,7 +3032,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
     if (lc->n < lc->cap) { s = &lc->slots[lc->n++]; slot_ensure_allocated(m, s); }
     else {
         int lru = -1;
-        for (int i = 0; i < lc->n; i++) { if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue; if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i; }
+        for (int i = 0; i < lc->n; i++) { if (lc->slots[i].pinned || lc->slots[i].eid < 0 || slot_held(&lc->slots[i])) continue; if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i; }
         if (lru < 0) { m->is_queued[layer*c->n_experts+eid]=0; pthread_mutex_unlock(&g_pilot_mx); return; }
         s = &lc->slots[lru]; s->pinned = 0;
     }
@@ -2995,6 +3044,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
     pthread_mutex_lock(&g_pilot_mx);
     m->t_disk += t_read;        /* sotto lock: qui arrivano anche i thread del PILOT */
     cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer*c->n_experts+eid]; s->used = ++m->clock;
+    if (m->last_access) m->last_access[(int64_t)layer*c->n_experts+eid] = m->clock;
     m->is_queued[layer*c->n_experts+eid] = 0; pthread_mutex_unlock(&g_pilot_mx);
 }
 
@@ -4130,7 +4180,7 @@ static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
     }
     free(model->attn_sc);
     free(model->seen); free(model->is_queued); free(model->is_pinned);
-    free(model->momentum_logits); free(model->freq);
+    free(model->momentum_logits); free(model->freq); free(model->last_access);
     free(model->DN_conv); free(model->DN_rec);
     free(model->cache); free(model->active_of); free(model->L);
     free(model->c.is_attn);

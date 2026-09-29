@@ -422,25 +422,6 @@ static void eslot_release(ESlot *s){
 static int eslot_busy(const ESlot *s){ return __atomic_load_n(&s->in_flight,__ATOMIC_ACQUIRE)!=0; }
 static void eslots_acquire(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_acquire(slots[i]); }
 static void eslots_release(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_release(slots[i]); }
-/* Victim per una riga piena (#1034): uno slot svuotato da rss_guard (eid=-1,
- * slab=NULL) e' riusabile SOLO finche' gli slab vivi della riga stanno sotto
- * ecap — riusarlo rialloca uno slab, quindi e' crescita, non eviction. Le
- * prenotazioni in volo (eid<-1) contano come vive: stanno per possederne uno.
- * EN: reusing a slab-less slot re-allocates, so it only counts as eviction
- * EN: while the row's live-slab count is under ecap; else pick a slab owner. */
-static int eslot_lru_victim(ESlot *slots,int n,int ecap){
-    int lru=-1, empty=-1, live=0;
-    for(int i=0;i<n;i++){
-        ESlot *s=&slots[i];
-        if(s->slab || s->eid<-1) live++;
-        if(eslot_busy(s) || s->eid<-1) continue;
-        if(!s->slab){ if(s->eid==-1 && empty<0) empty=i; continue; }
-        if(s->eid==-1) return i;              /* slot libero che possiede ancora lo slab */
-        if(lru<0 || s->used<slots[lru].used) lru=i;
-    }
-    if(empty>=0 && live<ecap) return empty;   /* sotto il tetto: meglio il vuoto che sfrattare */
-    return lru;
-}
 
 typedef struct {
     float **Lc, **Rc, **Ic;
@@ -472,6 +453,7 @@ typedef struct {
     int *kv_start;                               /* prima pos valida nella KV del layer (MTP: parziale) */
     KVState *kv;
     ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
+    int demand_policy;                           /* DEMAND_POLICY=lru|lfru|auto: LRU-tier victim key (tier.h) */
     int **ecache_slot_by_expert;                 /* eid -> LRU slot (resident or PILOT reservation) */
     float **kv_dev_L, **kv_dev_R; int *kv_dev_valid; /* ombra KV su device (decode) */
     float **ln_dev;                              /* in_ln/post_ln cached on device: [layer*2+{0,1}] (Inc.4) */
@@ -541,6 +523,44 @@ typedef struct {
     uint64_t ld_mtp, ld_main;                    /* expert_load per tipo layer (MTP int8 vs main int4) */
     uint64_t bytes_mtp, bytes_main;              /* byte letti da disco per tipo layer */
 } Model;
+
+/* Victim per una riga piena (#1034): uno slot svuotato da rss_guard (eid=-1,
+ * slab=NULL) e' riusabile SOLO finche' gli slab vivi della riga stanno sotto
+ * ecap — riusarlo rialloca uno slab, quindi e' crescita, non eviction. Le
+ * prenotazioni in volo (eid<-1) contano come vive: stanno per possederne uno.
+ * EN: reusing a slab-less slot re-allocates, so it only counts as eviction
+ * EN: while the row's live-slab count is under ecap; else pick a slab owner.
+ *
+ * DEMAND_POLICY (tier.h): the LRU tier ranks victims by the shared demand key
+ * — the `used` clock for lru (default: legacy comparison, bit-identical) or
+ * the frequency-primary LFRU score for lfru; auto = lfru when ecap <= 12.
+ * The free-slab and empty-under-cap tiers are policy-independent.  A missing
+ * heat/recency row falls back to lru.  Victim choice only: no routing, no
+ * weights, no math.  FASE D calls this lock-free by design: eheat/elast are
+ * bumped by the owning moe() thread itself, never by the pilot. */
+static int eslot_lru_victim(Model *m,int layer,ESlot *slots,int n,int ecap){
+    int lru=-1, empty=-1, live=0;
+    int policy=TIER_DEMAND_LRU;
+    const uint32_t *heat=NULL, *last=NULL;
+    if(m && tier_demand_use_lfru(m->demand_policy,ecap) &&
+       m->eheat && m->eheat[layer] && m->elast && m->elast[layer]){
+        policy=TIER_DEMAND_LFRU; heat=m->eheat[layer]; last=m->elast[layer];
+    }
+    uint64_t clock=m?m->eaccess_clock:0;
+    for(int i=0;i<n;i++){
+        ESlot *s=&slots[i];
+        if(s->slab || s->eid<-1) live++;
+        if(eslot_busy(s) || s->eid<-1) continue;
+        if(!s->slab){ if(s->eid==-1 && empty<0) empty=i; continue; }
+        if(s->eid==-1) return i;              /* slot libero che possiede ancora lo slab */
+        if(lru<0){ lru=i; continue; }
+        ESlot *b=&slots[lru];
+        if(tier_demand_victim_key(policy,ecap,heat?heat[s->eid]:0,last?last[s->eid]:0,clock,s->used)<
+           tier_demand_victim_key(policy,ecap,heat?heat[b->eid]:0,last?last[b->eid]:0,clock,b->used)) lru=i;
+    }
+    if(empty>=0 && live<ecap) return empty;   /* sotto il tetto: meglio il vuoto che sfrattare */
+    return lru;
+}
 
 #include "quant.h"
 
@@ -2453,6 +2473,7 @@ static void model_init_range(Model *m, const char *snap, int cap,
     m->L=calloc(c->n_layers,sizeof(Layer));
     int NR=c->n_layers+1;                        /* +1: riga del layer MTP */
     m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
+    m->demand_policy=tier_demand_policy_env();   /* DEMAND_POLICY=lru|lfru|auto (tier.h): LRU-tier victim key */
     m->ecache_slot_by_expert=calloc(NR,sizeof(int*));
     m->kv_dev_L=calloc(NR,sizeof(float*)); m->kv_dev_R=calloc(NR,sizeof(float*));
     m->kv_dev_valid=calloc(NR,sizeof(int));
@@ -6551,7 +6572,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
               if(*nn<m->ecap) dst=&Sl[(*nn)++];
-              else { int lru=eslot_lru_victim(Sl,*nn,m->ecap);
+              else { int lru=eslot_lru_victim(m,layer,Sl,*nn,m->ecap);
                      if(lru<0){ static int warned;
                          if(!warned){ warned=1; fprintf(stderr,"[CUDA] no reusable LRU expert slot (in flight or cap reached); skipping cache promotion\n"); }
                          continue; }
@@ -6748,7 +6769,7 @@ static void pilot_realload(Model *m, int layer, int eid){
     int slot,isnew=0;
     if(nn<m->ecap){ slot=nn; isnew=1; m->ecn[layer]=nn+1; }   /* cresci: pubblica subito lo slot (marcato prenotato) */
     else {
-        slot=eslot_lru_victim(Sl,nn,m->ecap);           /* riusa libero-con-slab, poi LRU; slot svuotati solo sotto ecap (#1034) */
+        slot=eslot_lru_victim(m,layer,Sl,nn,m->ecap);   /* riusa libero-con-slab, poi LRU; slot svuotati solo sotto ecap (#1034) */
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
                     pthread_mutex_unlock(&g_pilot_mx); return; }   /* tutti in volo, o cap raggiunto */
         /* LFRU eviction guard (#441, narrowed by #497 — folded into the SPMC selection):
@@ -6822,7 +6843,7 @@ static void pilot_uring_batch(Model *m){
         if(found){ pthread_mutex_unlock(&g_pilot_mx); continue; }
         int slot;
         if(nn<m->ecap){ slot=nn; m->ecn[layer]=nn+1; }
-        else slot=eslot_lru_victim(Sl,nn,m->ecap);    /* riusa libero-con-slab, poi LRU; slot svuotati solo sotto ecap (#1034) */
+        else slot=eslot_lru_victim(m,layer,Sl,nn,m->ecap);    /* riusa libero-con-slab, poi LRU; slot svuotati solo sotto ecap (#1034) */
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
         /* LFRU eviction guard (#441, narrowed by #497): protect only a genuinely WARM
          * resident (>=2 accesses) that is clearly hotter (see pilot_realload) */

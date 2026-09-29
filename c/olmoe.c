@@ -220,15 +220,19 @@ static uint64_t lfru_score(uint32_t heat, uint64_t last, uint64_t clock) {
 }
 
 /* Ranking key for a victim inside one victim-scan tier: the smallest key wins.
- * LRU returns the `used` clock, so the comparison is bit-identical to the
- * legacy scan.  LFRU returns lfru_score(freq, last_access, clock).  Callers
- * only pass slots that already cleared the tier's pinned/in-flight/recent
- * filters (eid >= 0) and only with use_lfru after the freq/last_access
- * NULL-guard in expert_get. */
+ * Delegates to tier.h's shared demand policy (Phase 3 backport): LRU returns
+ * the `used` clock, so the comparison is bit-identical to the legacy scan;
+ * LFRU returns tier_demand_lfru_score(freq, last_access, clock) — the same
+ * score this engine shipped in Phase 3a, verbatim.  Callers only pass slots
+ * that already cleared the tier's pinned/in-flight/recent filters (eid >= 0)
+ * and only with use_lfru after the freq/last_access NULL-guard in expert_get,
+ * so the arrays are non-NULL exactly when the LFRU branch runs. */
 static uint64_t demand_victim_key(Model *m, int layer, const Slot *s, int use_lfru) {
-    if (!use_lfru) return s->used;
-    return lfru_score(m->freq[layer][s->eid],
-                      m->last_access[layer * m->c.n_experts + s->eid], m->clock);
+    return tier_demand_victim_key(use_lfru ? TIER_DEMAND_LFRU : TIER_DEMAND_LRU,
+                                  m->cache[layer].cap,
+                                  use_lfru ? m->freq[layer][s->eid] : 0,
+                                  use_lfru ? m->last_access[layer * m->c.n_experts + s->eid] : 0,
+                                  m->clock, s->used);
 }
 
 /* Phase 3b GROUP_EVICT: co-routing affinity of a victim candidate.  Sums the
