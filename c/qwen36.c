@@ -1581,10 +1581,19 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     int64_t want_w = ng + ng + nd;
     int64_t want_s = 2*scale_count_gu(cc) + scale_count_d(cc);
     st_tensor *tw = st_find(&m->S, nm), *ts = st_find(&m->S, qsnm);
-    int is_f32 = tw && tw->nbytes == 2 * want_w;
     if (!tw || (tw->nbytes != 2 * want_w && tw->nbytes != want_w && tw->nbytes != want_w / 2)) {
         fprintf(stderr, "%s: expert weight is %lld bytes — expected %lld (f16/bf16), %lld (int8) or %lld (int4)\n",
                 nm, (long long)(tw ? tw->nbytes : -1), (long long)(2 * want_w),
+                (long long)want_w, (long long)(want_w / 2)); exit(1); }
+    int is_f32 = tw->nbytes == 2 * want_w;
+    int valid_format =
+        (is_f32 && (tw->dtype == 0 || tw->dtype == 1) && tw->numel == want_w) ||
+        (tw->nbytes == want_w && tw->dtype == 3 && tw->numel == want_w) ||
+        (tw->nbytes == want_w / 2 && tw->dtype == 3 && tw->numel == want_w / 2);
+    if (!valid_format) {
+        fprintf(stderr, "%s: expert weight is %s with %lld elems — expected BF16/F16 with %lld, "
+                "U8/I8 int8 with %lld, or U8/I8 packed int4 with %lld (refusing)\n",
+                nm, st_dtype_name(tw->dtype), (long long)tw->numel, (long long)want_w,
                 (long long)want_w, (long long)(want_w / 2)); exit(1); }
     if (!is_f32 && (!ts || ts->numel != want_s)) {
         fprintf(stderr, "%s: scale array is %lld elems — expected %lld (refusing)\n",

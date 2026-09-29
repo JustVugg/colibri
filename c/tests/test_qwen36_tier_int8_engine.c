@@ -30,6 +30,9 @@
 #define main qwen36_main_unused
 #include "../qwen36.c"
 #undef main
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 #include "../compat.h"   /* setenv/unsetenv: MinGW has neither */
 
@@ -128,6 +131,34 @@ static void free_model(Model *m) {
     free(m->cache); free(m->active_of); free(m->is_pinned); free(m->is_queued);
 }
 
+#ifndef _WIN32
+/* A byte-count-only format probe mistakes this F32 N/2 tensor for BF16/F16 N
+ * and leaves half of the destination slot uninitialized.  The loader must
+ * reject the declared dtype/cardinality before reading it. */
+static void case_short_f32_refused(void) {
+    Model m = {0}; Slot s = {0}; int active = 0;
+    m.c.hidden = EXP_D; m.c.inter = EXP_IH; m.active_of = &active;
+    int64_t want_w = 3 * (int64_t)EXP_D * EXP_IH;
+    const char *name = "model.layers.0.mlp.experts.0.merged_weight";
+    int fd = open("/dev/zero", O_RDONLY);
+    if (fd < 0) { ck(0, "open /dev/zero for malformed expert fixture"); return; }
+    st_tensor tensor = { .name = (char *)name, .fd = fd, .nbytes = 2 * want_w,
+                         .dtype = 2 /* F32 */, .numel = want_w / 2 };
+    m.S.t = &tensor; m.S.n = 1;
+    slot_ensure_allocated(&m, &s);
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) { load_expert_merged(&m, 0, 0, &s); _exit(0); }
+    int status = -1;
+    if (pid < 0 || waitpid(pid, &status, 0) != pid)
+        ck(0, "run malformed expert fixture");
+    else
+        ck(WIFEXITED(status) && WEXITSTATUS(status) == 1,
+           "F32 tensor with N/2 elements is refused");
+    close(fd); free(s.g); free(s.gs);
+}
+#endif
+
 /* qt_fill_wait() returns when the queue is empty, and the uploader dequeues
  * BEFORE uploading -- so wait on the observable end state instead. */
 static int wait_resident(void) {
@@ -225,6 +256,9 @@ static void case_int4(void) {
 }
 
 int main(void) {
+#ifndef _WIN32
+    case_short_f32_refused();
+#endif
     case_int8();
     case_int4();
     if (fails) { printf("FAILED %d\n", fails); return 1; }
