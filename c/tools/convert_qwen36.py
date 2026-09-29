@@ -14,9 +14,10 @@ Design notes (must stay in sync with c/qwen36.c):
   * Expert weights are stored per-expert as `model.layers.{a}.mlp.experts.{e}.merged_weight`
     + `.qs` (f32 scales). For --ebits >= 5 the merged_weight is int8 (layout [gate|up|down]);
     for --ebits <= 4 it is TRUE 4-bit packed uint8 (2 elements/byte, half size) -- see
-    pack_int4(). The qs layout (per-row f32 scales) is identical either way. This matches
-    what c/qwen36.c's load_expert_merged expects: it detects int4 by ON-DISK SIZE (N/2 bytes)
-    and unpacks in-place to int8, so the rest of the MoE path is unchanged.
+    pack_int4(). With --fp8, merged_weight is F8_E4M3 and qs has one f32 scale per
+    128x128 output/input block, flattened row-major for gate, up, then down. The
+    integer qs layout remains per-row (or grouped with --gs). This matches what
+    c/qwen36.c's load_expert_merged and the fmt=8 CUDA tier expect.
   * Attention + router + shared-expert + norms stay f16 (they are tiny vs experts).
   * Real Qwen3.6 is a vision-language checkpoint: config dims live under `text_config`,
     and weight keys are prefixed `model.language_model.`. Both are handled transparently.
@@ -99,6 +100,31 @@ def quantize_row_grouped(w: "torch.Tensor", bits: int, gs: int):
     scales = g.abs().amax(dim=2, keepdim=True).clamp(min=1e-12) / qmax
     q = (g / scales).round().clamp(-qmax - 1, qmax).to(torch.int8).view(O, -1)[:, :I]
     return q, scales.view(O, ng)
+
+FP8_BLOCK = 128
+FP8_MAX = 448.0
+
+def quantize_fp8_block(w: "torch.Tensor") -> tuple["torch.Tensor", "torch.Tensor"]:
+    """E4M3 weights plus one f32 dequant scale per 128x128 [O,I] block."""
+    w_f32 = w.reshape(w.shape[0], -1).float()
+    O, I = w_f32.shape
+    po = (-O) % FP8_BLOCK
+    pi = (-I) % FP8_BLOCK
+    padded = torch.nn.functional.pad(w_f32, (0, pi, 0, po))
+    nbo, nbi = padded.shape[0] // FP8_BLOCK, padded.shape[1] // FP8_BLOCK
+    blocks = padded.view(nbo, FP8_BLOCK, nbi, FP8_BLOCK).permute(0, 2, 1, 3)
+    scales = blocks.abs().amax(dim=(2, 3)).clamp(min=1e-12) / FP8_MAX
+    expanded = scales.repeat_interleave(FP8_BLOCK, 0).repeat_interleave(FP8_BLOCK, 1)
+    q = (padded / expanded).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    return q[:O, :I].contiguous(), scales.flatten().contiguous().float()
+
+def make_merged_fp8(gate, up, down):
+    """Merge gate/up/down as E4M3 bytes with gate/up/down block-scale tables."""
+    gq, gs = quantize_fp8_block(gate)
+    uq, us = quantize_fp8_block(up)
+    dq, ds = quantize_fp8_block(down)
+    return (torch.cat([gq.flatten(), uq.flatten(), dq.flatten()]).contiguous(),
+            torch.cat([gs, us, ds]).contiguous())
 
 
 def make_merged(gate, up, down, ebits, gs=0):
@@ -210,6 +236,8 @@ def main():
     src.add_argument("--model", help="Local HF checkpoint directory")
     ap.add_argument("--out", required=False, help="Output container directory")
     ap.add_argument("--ebits", type=int, default=4, help="Expert quant bits (2..8, default 4)")
+    ap.add_argument("--fp8", action="store_true",
+                    help="Store experts as E4M3 with fixed 128x128 block scales")
     ap.add_argument("--gs", type=int, default=0,
                     help="Group size for expert scales (e.g. 64). 0 = per-row (default). "
                          "Group-scaled containers need engine support (expert_gs in meta).")
@@ -237,6 +265,8 @@ def main():
 
     if not 2 <= args.ebits <= 8:
         sys.exit(f"--ebits must be 2..8 (got {args.ebits})")
+    if args.fp8 and args.gs:
+        sys.exit("--fp8 uses fixed 128x128 block scales and cannot be combined with --gs")
 
     token = args.hf_token or os.environ.get("HF_TOKEN")
     if args.repo:
@@ -454,7 +484,8 @@ def main():
                 dk = k.replace("gate_up_proj", "down_proj")
                 down = get_tensor(dk).float()        # [E, H, inter]
                 for e in range(E):
-                    mw, qs = make_merged(gate[e], up[e], down[e], args.ebits, gs=args.gs)
+                    mw, qs = (make_merged_fp8(gate[e], up[e], down[e]) if args.fp8 else
+                              make_merged(gate[e], up[e], down[e], args.ebits, gs=args.gs))
                     tens[f"model.layers.{a}.mlp.experts.{e}.merged_weight"] = mw
                     tens[f"model.layers.{a}.mlp.experts.{e}.qs"] = qs
                 continue
@@ -466,7 +497,8 @@ def main():
         for e in sorted(sep):
             d = sep[e]
             if "gate_proj" in d and "up_proj" in d and "down_proj" in d:
-                mw, qs = make_merged(d["gate_proj"], d["up_proj"], d["down_proj"], args.ebits, gs=args.gs)
+                mw, qs = (make_merged_fp8(d["gate_proj"], d["up_proj"], d["down_proj"]) if args.fp8 else
+                          make_merged(d["gate_proj"], d["up_proj"], d["down_proj"], args.ebits, gs=args.gs))
                 tens[f"model.layers.{a}.mlp.experts.{e}.merged_weight"] = mw
                 tens[f"model.layers.{a}.mlp.experts.{e}.qs"] = qs
             else:
@@ -498,7 +530,7 @@ def main():
         "moe_inter": int(mcfg.get("moe_intermediate_size", mcfg.get("intermediate_size", 0) // 2)),
         "shared_inter": int(mcfg.get("shared_expert_intermediate_size", mcfg.get("moe_intermediate_size", 0))),
         "rms_eps": float(mcfg.get("rms_norm_eps", 1e-6)),
-        "ebits": args.ebits,
+        "ebits": 8 if args.fp8 else args.ebits,
         "scoring_func": mcfg.get("scoring_func", "softmax"),
         "n_group": int(mcfg.get("n_group", 1)),
         "topk_group": int(mcfg.get("topk_group", 1)),
@@ -590,7 +622,7 @@ def main():
 
     print(f"\nDone. Container at: {out}")
     print(f"All {len(all_idx)} layers stored (incl. Gated DeltaNet). n_active={len(all_idx)}.")
-    print(f"Run (engine):  SNAP={out} ./qwen36 16 {args.ebits} ref_qwen36.json")
+    print(f"Run (engine):  SNAP={out} ./qwen36 16 {8 if args.fp8 else args.ebits} ref_qwen36.json")
 
 
 if __name__ == "__main__":
