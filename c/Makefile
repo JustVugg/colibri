@@ -785,8 +785,47 @@ endif
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c sse41_kernels.h exact_dot.h oracle.h pin_pool.h cli_args.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h abl.h backend_cuda.h backend_metal.h backend_vulkan.h decode_batch.h edge_adapters.h edge_runtime.h edge_tok_internal.h schema_gbnf.h segment_adapter_internal.h segment_adapters.h segment_runtime.h tier.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+colibri$(EXE): colibri.c sse41_kernels.h exact_dot.h oracle.h pin_pool.h cli_args.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h abl.h backend_cuda.h backend_metal.h backend_vulkan.h decode_batch.h edge_adapters.h edge_runtime.h edge_tok_internal.h schema_gbnf.h segment_adapter_internal.h segment_adapters.h segment_runtime.h tier.h engine.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o colibri$(EXE) $(LDFLAGS)
+
+# ---- Unified engine ABI: reference backend + shared harness --------------
+# engine.h decouples model compute from main()/the pipe loop. This builds the
+# GLM engine as a library TU (COLI_ENGINE_ADAPTER) exposing the engine_* ABI,
+# plus the model-agnostic harness (agent_main) that drives it in-process.
+ENGINE_CFLAGS = $(CFLAGS) -DCOLI_ENGINE_ADAPTER -DCOLIBRI_NO_MAIN
+ifeq ($(LINUX),)
+ENGINE_CFLAGS += -fPIC
+endif
+
+libcolibri_engine.o: colibri.c engine.h .build-config
+	$(CC) $(ENGINE_CFLAGS) -c colibri.c -o $@
+
+engine_registry.o: engine_registry.c engine.h
+	$(CC) $(CFLAGS) -c engine_registry.c -o $@
+
+agent_main: agent_main.c engine_registry.o libcolibri_engine.o
+	$(CC) $(CFLAGS) agent_main.c engine_registry.o libcolibri_engine.o -o agent_main $(LDFLAGS)
+
+# OLMoE backend: same ABI, built from olmoe.c (which already has an
+# OLMOE_NO_MAIN build in the segment targets below). NOCUDA_* because olmoe.c
+# contains no COLI_CUDA code at all (see the olmoe$(EXE) rule).
+libolmoe_engine.o: olmoe.c engine.h .build-config
+	$(CC) $(NOCUDA_CFLAGS) -DCOLI_ENGINE_ADAPTER -DOLMOE_NO_MAIN -c olmoe.c -o $@
+
+agent_main_olmoe: agent_main.c engine_registry.o libolmoe_engine.o
+	$(CC) $(NOCUDA_CFLAGS) agent_main.c engine_registry.o libolmoe_engine.o -o agent_main_olmoe $(NOCUDA_LDFLAGS)
+
+# A/B: pipe transport vs in-process ABI, same engine + model + workload.
+bench_glm: bench_abi_vs_pipe.c engine_registry.o libcolibri_engine.o
+	$(CC) $(CFLAGS) bench_abi_vs_pipe.c engine_registry.o libcolibri_engine.o -o bench_glm $(LDFLAGS)
+
+bench_olmoe: bench_abi_vs_pipe.c engine_registry.o libolmoe_engine.o
+	$(CC) $(NOCUDA_CFLAGS) bench_abi_vs_pipe.c engine_registry.o libolmoe_engine.o -o bench_olmoe $(NOCUDA_LDFLAGS)
+
+.PHONY: engine-clean
+engine-clean:
+	rm -f libcolibri_engine.o libolmoe_engine.o engine_registry.o \
+	      agent_main agent_main_olmoe bench_glm bench_olmoe
 
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
 backend_vulkan.o: backend_vulkan.c backend_vulkan.h .build-config
@@ -1111,7 +1150,7 @@ tests/bench_cuda_resident_batch$(EXE): tests/bench_cuda_resident_batch.cu backen
 # the GPU sits idle. Same guard #783 put on kimi_k3, which since gaining an
 # MXFP4 expert path no longer needs it. tests/test_makefile_cuda_scope.py
 # asserts this shape.
-olmoe$(EXE): olmoe.c cli_args.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h kv_prefix.h pin_pool.h route_trace.h serve_codec.h serve_budget.h edge_adapters.h edge_runtime.h edge_tok_internal.h fused_simd.h segment_adapter_internal.h segment_adapters.h segment_runtime.h sse41_kernels.h
+olmoe$(EXE): olmoe.c cli_args.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h kv_prefix.h pin_pool.h route_trace.h tier.h serve_codec.h serve_budget.h edge_adapters.h edge_runtime.h edge_tok_internal.h fused_simd.h segment_adapter_internal.h segment_adapters.h segment_runtime.h sse41_kernels.h
 	$(CC) $(NOCUDA_CFLAGS) olmoe.c -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
@@ -1511,13 +1550,13 @@ tests/test_k3_chat_tools$(EXE): tests/test_k3_chat_tools.c sse41_kernels.h kimi_
 # olmoe's matmul_q, not colibri's: compares the IDOT path against FP32
 # ACTIVATIONS rather than an integer reference. NOCUDA_* for the same reason
 # the olmoe target uses it -- olmoe.c contains no COLI_CUDA code.
-tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c sse41_kernels.h olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c sse41_kernels.h olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h tier.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c serve_budget.h sse41_kernels.h olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c serve_budget.h sse41_kernels.h olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h tier.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c sse41_kernels.h olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c sse41_kernels.h olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h tier.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c gsgemv.h qgemv.h sse41_kernels.h qwen36.c expert_ffn.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
@@ -1705,7 +1744,7 @@ $(SEGMENT_BUILD_DIR)/kimi.o: kimi_k3.c sse41_kernels.h segment_runtime.h edge_ru
 		edge_adapter_internal.h edge_tok_internal.h st.h | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DKIMI_K3_NO_MAIN -c kimi_k3.c -o $@
 
-$(SEGMENT_BUILD_DIR)/olmoe.o: olmoe.c sse41_kernels.h segment_runtime.h edge_runtime.h \
+$(SEGMENT_BUILD_DIR)/olmoe.o: olmoe.c sse41_kernels.h tier.h segment_runtime.h edge_runtime.h \
 		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
 		edge_adapter_internal.h edge_tok_internal.h st.h | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DOLMOE_NO_MAIN -c olmoe.c -o $@
@@ -2151,13 +2190,13 @@ tests/test_qgemv_sse41$(EXE): tests/test_qgemv.c qgemv.h sse41_kernels.h
 # olmoe's dot_i8_16 (ARM NEON/AVX2/SSE4.1 variants): must be bit-exact against
 # a scalar int8 reference -- pure integer arithmetic, no tolerance needed.
 # NOCUDA_* for the same reason the other olmoe.c-including test rules use it.
-tests/test_olmoe_dot_i8_16$(EXE): tests/test_olmoe_dot_i8_16.c olmoe.c sse41_kernels.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+tests/test_olmoe_dot_i8_16$(EXE): tests/test_olmoe_dot_i8_16.c olmoe.c sse41_kernels.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h tier.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 # Same gate, forced onto the SSE4.1 tier: overrides the host's default -march
 # so the SSE4.1 body in olmoe.c's dot_i8_16 is actually exercised even on a
 # devbox that would otherwise always pick the AVX2 tier.
-tests/test_olmoe_dot_i8_16_sse41$(EXE): tests/test_olmoe_dot_i8_16.c olmoe.c sse41_kernels.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+tests/test_olmoe_dot_i8_16_sse41$(EXE): tests/test_olmoe_dot_i8_16.c olmoe.c sse41_kernels.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h tier.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) -msse4.1 -mno-avx2 -mno-fma $< -o $@ $(NOCUDA_LDFLAGS)
 
 # layer_cuda_shard_kvb's format-allowlist refusal (see the test's file header). The
