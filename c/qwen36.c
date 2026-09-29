@@ -992,7 +992,7 @@ static void matmul_q_batch(float *y, const float *x, const int8_t *q,
  * (gs64 expert containers). Row layout of `scale`: [O][I/gs] row-major. */
 static int g_expert_gs = 0;   /* set from qwen36_meta.json (expert_gs) at load */
 /* 1 = expert container packs int4 (tier fmt=4); 0 = int8 per-row (tier fmt=1).
- * Same signal main's nbytes probe and tier_warmstart receive; the decode path
+ * Same signal main's format probe and tier_warmstart receive; the decode path
  * needs it to offer int8 experts (#1391): on an int8 container e->g4 is NULL. */
 static int g_expert_is_int4 = 1;
 static int g_expert_is_f32;
@@ -1576,6 +1576,19 @@ static void unpack_int4_to_int8(int8_t *out, const uint8_t *raw, int64_t n)
     }
 }
 
+/* Format of one merged expert tensor, decided by dtype + element count, which
+ * are authoritative. Byte count alone is not: it cannot tell an int8 container
+ * from an int4 one whose meta.ebits lies, nor BF16/F16 from any other 2-byte
+ * dtype. Returns 16 (BF16/F16, expanded to f32 in RAM), 8 (int8), 4 (packed
+ * int4), or 0 when the tensor is missing or matches none of them. A genuine
+ * F32 expert tensor is not a supported container format and returns 0. */
+static int expert_weight_bits(const st_tensor *tw, int64_t want_w) {
+    if (!tw) return 0;
+    if ((tw->dtype == 0 || tw->dtype == 1) && tw->numel == want_w && tw->nbytes == 2 * want_w) return 16;
+    if (tw->dtype == 3 && tw->numel == want_w && tw->nbytes == want_w) return 8;
+    if (tw->dtype == 3 && tw->numel == want_w / 2 && tw->nbytes == want_w / 2) return 4;
+    return 0;
+}
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     char nm[256], qsnm[256];
     int la = m->active_of[layer];   /* container stores experts under active index */
@@ -1590,12 +1603,9 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         fprintf(stderr, "%s: expert weight is %lld bytes — expected %lld (f16/bf16), %lld (int8) or %lld (int4)\n",
                 nm, (long long)(tw ? tw->nbytes : -1), (long long)(2 * want_w),
                 (long long)want_w, (long long)(want_w / 2)); exit(1); }
-    int is_f32 = tw->nbytes == 2 * want_w;
-    int valid_format =
-        (is_f32 && (tw->dtype == 0 || tw->dtype == 1) && tw->numel == want_w) ||
-        (tw->nbytes == want_w && tw->dtype == 3 && tw->numel == want_w) ||
-        (tw->nbytes == want_w / 2 && tw->dtype == 3 && tw->numel == want_w / 2);
-    if (!valid_format) {
+    int bits = expert_weight_bits(tw, want_w);
+    int is_f32 = bits == 16;                    /* BF16/F16 on disk, f32 in the slot */
+    if (!bits) {
         fprintf(stderr, "%s: expert weight is %s with %lld elems — expected BF16/F16 with %lld, "
                 "U8/I8 int8 with %lld, or U8/I8 packed int4 with %lld (refusing)\n",
                 nm, st_dtype_name(tw->dtype), (long long)tw->numel, (long long)want_w,
@@ -1603,12 +1613,13 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     if (!is_f32 && (!ts || ts->numel != want_s)) {
         fprintf(stderr, "%s: scale array is %lld elems — expected %lld (refusing)\n",
                 qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1); }
-    /* int4 detection by ON-DISK SIZE (robust against a mislabeled meta.ebits, e.g. the
-       i8 container whose meta says ebits=4 but stores int8).  True int4 packed uint8 is
-       exactly N/2 bytes (N = 3*inter*hidden, always even).  Unpack in-place to int8 so the
-       rest of the MoE path (matmul_q) is unchanged.  Nibble convention (must match
-       c/tools/convert_qwen36.py pack_int4): LOW nibble = element 2k, HIGH nibble = 2k+1;
-       each nibble is signed 4-bit (sign-extend if bit3 set). */
+    /* The format comes from expert_weight_bits (dtype + element count), never from
+       meta.ebits, which can be mislabeled (the i8 container whose meta says ebits=4
+       but stores int8); the byte count only feeds the size error above. BF16/F16 is
+       expanded to f32 slots. Packed int4 (N/2 bytes, N = 3*inter*hidden, always even)
+       is unpacked in-place to int8 so the rest of the MoE path (matmul_q) is unchanged.
+       Nibble convention (must match c/tools/convert_qwen36.py pack_int4): LOW nibble =
+       element 2k, HIGH nibble = 2k+1; each nibble is signed 4-bit (sign-extend if bit3). */
     if (is_f32) {
         static int noted = 0;
         if (!noted) { fprintf(stderr, "[qwen36] f16/bf16 expert weights detected — expanding to f32 slots\n"); noted = 1; }
@@ -1622,7 +1633,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         s->is_int4 = 0;
         free(s->g4); free(s->u4); free(s->d4); s->g4 = s->u4 = s->d4 = NULL;
         st_read_f32(&m->S, nm, (float *)s->g, 1);
-    } else if (tw->nbytes == want_w / 2) {
+    } else if (bits == 4) {
         static int noted = 0;
         if (!noted) { fprintf(stderr, "[qwen36] int4 packed weights detected — unpacking to int8 in slot\n"); noted = 1; }
         uint8_t *raw = (uint8_t *)malloc((size_t)(want_w / 2));
@@ -1658,20 +1669,21 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     if (ts && s->gs) st_read_f32(&m->S, qsnm, s->gs, 0);
 }
 
-/* Robust int4 detection by on-disk size of one expert tensor (ignores a possibly
- * mislabeled meta.ebits — cf. load_expert_merged).  Returns 1 if the container
- * stores true int4 packed weights, 0 otherwise.  Used to pick the Vulkan
- * pipeline at init time. */
-static int container_layer_is_int4(Model *m, int layer) {
+/* Expert weight class of a container for the adapters' numeric_class, from the
+ * same dtype + element-count decision load_expert_merged makes. */
+static const char *container_expert_class(Model *m, int layer) {
     Cfg *cc = &m->c;
-    int64_t ng = (int64_t)cc->inter * cc->hidden, nd = (int64_t)cc->hidden * cc->inter;
-    int64_t want_w = ng + ng + nd;
+    int64_t want_w = 3 * (int64_t)cc->inter * cc->hidden;
     char nm[256];
     snprintf(nm, sizeof(nm),
              "model.layers.%d.mlp.experts.0.merged_weight", layer);
     st_tensor *tw = st_find(&m->S, nm);
-    if (!tw) return 0;
-    return (tw->nbytes == want_w / 2) ? 1 : 0;
+    switch (expert_weight_bits(tw, want_w)) {
+    case 4:  return "int4";
+    case 8:  return "int8";
+    case 16: return tw->dtype == 0 ? "bf16" : "f16";
+    default: return "unknown";
+    }
 }
 
 /* Rematerialize a slot's int8 block from its packed int4 copy on demand
@@ -3226,9 +3238,10 @@ int main(int argc, char **argv) {
     /* Optional CUDA VRAM expert tier (COLI_CUDA=1): hot experts live in
      * DEVICE_LOCAL memory across the configured GPUs, misses fall back to the
      * CPU int8 path. See qwen36_tier.h. */
-    /* Formato degli esperti dalla TAGLIA SU DISCO del primo, non da meta.ebits:
+    /* Formato degli esperti da dtype + numero di elementi del primo
+     * (expert_weight_bits, la stessa decisione di load_expert_merged), non da meta.ebits:
      * esiste un container i8 il cui meta dichiara ebits=4 (stesso motivo per cui
-     * il loader piu' sopra guarda nbytes). Il tier ne ha bisogno prima di
+     * il loader piu' sopra non si fida di meta.ebits). Il tier ne ha bisogno prima di
      * riservare qualunque budget: e' int4 impacchettato che va in VRAM come
      * fmt=4, int8 come fmt=1. Sbagliare qui era #1331 -- budget riservato,
      * planned=1, e zero promozioni per tutta la vita del processo. */
@@ -3239,10 +3252,10 @@ int main(int argc, char **argv) {
         snprintf(probe, sizeof(probe),
                  "model.layers.%d.mlp.experts.0.merged_weight", m.active_of[0]);
         st_tensor *pt = st_find(&m.S, probe);
-        int64_t want = 2*(int64_t)m.c.inter*m.c.hidden + (int64_t)m.c.hidden*m.c.inter;
-        if (pt && pt->nbytes == 2 * want) {
-            expert_is_int4 = 0; expert_is_f32 = 1;          /* f16/bf16 on disk, f32 in RAM */
-        } else if (pt && pt->nbytes == want) {
+        int bits = expert_weight_bits(pt, 3 * (int64_t)m.c.inter * m.c.hidden);
+        if (bits == 16) {
+            expert_is_int4 = 0; expert_is_f32 = 1;         /* f16/bf16 on disk, f32 in RAM */
+        } else if (bits == 8) {
             expert_is_int4 = 0;                             /* int8: one byte per element */
         }
     }
@@ -3523,8 +3536,6 @@ static int qwen36_segment_engine_open(
     free(config.is_attn);
     model_init_range(&engine->model, options->model_dir, cap, 8,
                      (int)options->layer_begin, (int)options->layer_end, 0, 0);
-    engine->model.quant_bits = container_layer_is_int4(
-        &engine->model, (int)options->layer_begin) ? 4 : 8;
     free(engine->model.DN_rec); free(engine->model.DN_conv);
     engine->model.DN_rec = NULL; engine->model.DN_conv = NULL;
     engine->model.max_t = (int)options->context_tokens;
@@ -3565,7 +3576,8 @@ static int qwen36_segment_engine_open(
                                    "qwen36/kv-deltanet-conv-f32-v1");
     snprintf(capabilities->numeric_class,
              sizeof(capabilities->numeric_class),
-             "qwen36/f32-int%d/cpu-v1", engine->model.quant_bits);
+             "qwen36/f32-%s/cpu-v1",
+             container_expert_class(&engine->model, (int)options->layer_begin));
     capabilities->state_dtype = COLI_SEGMENT_DTYPE_F32;
     capabilities->state_width = (uint32_t)engine->model.c.hidden;
     capabilities->max_batch_rows = 128;
@@ -3872,7 +3884,6 @@ static int qwen36_edge_engine_open(
         (int64_t)config->vocab * config->hidden);
     engine->model.final_norm = load_t_n(
         &engine->model, "model.norm.weight", config->hidden);
-    engine->model.quant_bits = container_layer_is_int4(&engine->model, 0) ? 4 : 8;
     char tokenizer_path[4096];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
              options->model_dir);
@@ -3904,7 +3915,7 @@ static int qwen36_edge_engine_open(
                                 "qwen36/kv-deltanet-conv-f32-v1");
     snprintf(capabilities->numeric_class,
              sizeof(capabilities->numeric_class),
-             "qwen36/f32-int%d/cpu-v1", engine->model.quant_bits);
+             "qwen36/f32-%s/cpu-v1", container_expert_class(&engine->model, 0));
     coli_edge_capability_string(capabilities->tokenizer_class,
                                 sizeof(capabilities->tokenizer_class),
                                 "qwen36/hf-byte-bpe-v1");
