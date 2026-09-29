@@ -1443,7 +1443,11 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             double kv_gb = 2.0 * (double)c->n_layers * c->kv_heads * max_t *
                            c->head_dim * sizeof(float) / 1e9;
             double reserve = 1.5 + kv_gb;
-            double slot_gb = ((double)c->hidden * c->inter * 3.0 +
+            /* f16/bf16 experts are expanded to f32 slots, 4 bytes per element;
+             * every other container keeps one byte per element in the slot. */
+            double esz = expert_weight_bits(expert_probe, 3 * (int64_t)c->inter * c->hidden) == 16
+                         ? sizeof(float) : 1.0;
+            double slot_gb = ((double)c->hidden * c->inter * 3.0 * esz +
                               (double)(2 * c->inter + c->hidden) * sizeof(float)) / 1e9;
             double experts = ram_gb - resident - reserve;
             int fit = slot_gb > 0.0 ? (int)(experts / (slot_gb * c->n_layers)) : cap;
