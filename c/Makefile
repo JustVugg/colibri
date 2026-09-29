@@ -940,6 +940,10 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# test file is compiled. Also runs BEFORE the MXFP4 test (same reason).
 	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_cuda.cu -o fp8_cuda_test$(EXE) $(ANS_NVCC_LIBS)
 	./fp8_cuda_test$(EXE)
+	# Engine-tier proof: qt_init_fp8 through staging/upload/issue/take at the
+	# production qwen36 expert shape, linked to the real backend (not the fake).
+	$(MAKE) tests/test_qwen36_tier_fp8_parity$(EXE) CUDA=1
+	./tests/test_qwen36_tier_fp8_parity$(EXE)
 	# Upload-failure ownership: a failed H2D weight copy must release the
 	# bytes it allocated (weights_owned set by the malloc, not the copy).
 	# Includes backend_cuda.cu itself to plant the memcpy failure, so only
@@ -1870,6 +1874,12 @@ tests/test_qwen36_tier_stream_int4$(EXE): tests/test_qwen36_tier_stream_int4.c t
 # Builds everywhere (skips at runtime without a device); meaningful only with
 # CUDA=1, where it links backend_cuda.o through $(CUDA_OBJ)/$(QWEN36_LDFLAGS).
 tests/test_qwen36_tier_stream_int4_parity$(EXE): tests/test_qwen36_tier_stream_int4_parity.c qwen36_tier.c qwen36_tier.h backend_cuda.h quant.h compat.h $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+# Real-GPU parity for qwen36 FP8: production geometry through the tier's
+# staging/upload/group path against quant.h's CPU E4M3 block-scale reference.
+# It builds everywhere and skips without a device; cuda-test runs it with the
+# real backend so fmt=8 cannot remain fake-backend-only.
+tests/test_qwen36_tier_fp8_parity$(EXE): tests/test_qwen36_tier_fp8_parity.c qwen36_tier.c qwen36_tier.h backend_cuda.h quant.h compat.h $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c tests/qwen36_fake_cuda.h qwen36.c qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
