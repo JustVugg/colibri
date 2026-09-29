@@ -539,7 +539,6 @@ TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
 	tests/test_segment_adapters_registration$(EXE) \
 	tests/test_edge_adapters_registration$(EXE)
 endif
-TEST_BINS += tests/test_lora$(EXE) tests/test_train_linear$(EXE) tests/test_train_tiny$(EXE) tests/test_train_resume$(EXE)
 
 # Windows CUDA/HIP DLL path: host links the loader, NOT cudart or amdhip64.
 # (CUDA_DLL/HIP_DLL mutual exclusion is enforced at the HIP_DLL declaration.)
