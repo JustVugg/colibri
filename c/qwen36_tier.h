@@ -28,7 +28,8 @@
  * n_experts because the tier retains pointers into the engine's RAM slots.
  * The streaming initializers below own their staging copy before returning and
  * therefore allow cap_experts_per_layer < n_experts. */
-/* expert_is_int4: 1 = pesi int4 impacchettati (fmt=4), 0 = int8 (fmt=1). Il
+/* expert_is_int4: 1 = pesi int4 impacchettati (fmt=4), 0 = int8 (fmt=1),
+ * 2 = unquantized f32 in RAM (fmt=0, senza scale). Il
  * chiamante lo determina dalla TAGLIA SU DISCO, non da meta.ebits, che su
  * qualche container mente (cfr. il rilevamento in qwen36.c). */
 /* R4 role split: park the dense-i8 lm_head on its own CUDA device

@@ -308,6 +308,11 @@ static int home(int eid){ return eid % G.ndev; }
  * upload format. */
 static int G_int4_stream;
 
+static size_t expert_matrix_bytes(void){
+    size_t n=(size_t)G.D*G.Ih;
+    return G.wfmt==0 ? n*sizeof(float) : G.wfmt==4 ? n/2 : n;
+}
+
 /* Staging: copy the packed int4 (g|u|d) bytes and the scales (gs|us|ds).
  * Two's-complement RAM (qwen36 int4 containers) is XORed into the
  * offset-binary upload format of backend_cuda fmt=2/4; offset-binary RAM
@@ -316,8 +321,8 @@ static int G_int4_stream;
 static void stage(uint8_t *dw, float *dsc,
                   const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
                   const float *gs,const float *us,const float *ds){
-    size_t mb = (size_t)G.D*G.Ih/(G.wfmt==4?2:1);
-    if(G.wfmt==1 || G.wfmt==8 || G_int4_stream){
+    size_t mb = expert_matrix_bytes();
+    if(G.wfmt==0 || G.wfmt==1 || G.wfmt==8 || G_int4_stream){
         /* int8: il formato del backend e' gia' quello in RAM, si copia e basta.
          * Niente XOR: quello serve a portare i nibble int4 da complemento a due
          * a binario sfalsato, e su byte interi sarebbe corruzione. */
@@ -330,9 +335,11 @@ static void stage(uint8_t *dw, float *dsc,
     uint64_t *w0=(uint64_t*)dw,*w1=(uint64_t*)(dw+mb),*w2=(uint64_t*)(dw+2*mb);
     for(size_t i=0;i<mb/8;i++){ w0[i]=sg[i]^X; w1[i]=su[i]^X; w2[i]=sd[i]^X; }
     }
-    memcpy(dsc,                 gs, G.sc_gu*sizeof(float));
-    memcpy(dsc+G.sc_gu,         us, G.sc_gu*sizeof(float));
-    memcpy(dsc+2*G.sc_gu,       ds, G.sc_d *sizeof(float));
+    if(dsc){
+        memcpy(dsc,                 gs, G.sc_gu*sizeof(float));
+        memcpy(dsc+G.sc_gu,         us, G.sc_gu*sizeof(float));
+        memcpy(dsc+2*G.sc_gu,       ds, G.sc_d *sizeof(float));
+    }
 }
 
 /* Thread affinity around the tier's own threads (Linux).
@@ -419,10 +426,14 @@ static void *uploader(void *arg){
         int dv = G.dev[home(eid)];
         /* passo fra le tre matrici nello staging: int4 impacchettato = mezzo
          * byte per elemento, int8 = uno. */
-        size_t mb=(size_t)G.D*G.Ih/(G.wfmt==4?2:1);
+        size_t mb=expert_matrix_bytes();
         ColiCudaTensor *tg=NULL,*tu=NULL,*td=NULL;
         int ok;
-        if(G.wfmt==8){
+        if(G.wfmt==0){
+            ok = coli_cuda_tensor_upload(&tg, w,      NULL, 0, G.D,  G.Ih, dv)
+              && coli_cuda_tensor_upload(&tu, w+mb,   NULL, 0, G.D,  G.Ih, dv)
+              && coli_cuda_tensor_upload(&td, w+2*mb, NULL, 0, G.Ih, G.D,  dv);
+        } else if(G.wfmt==8){
             /* e4m3 bytes as they came from the checkpoint, block scales
              * [ceil(O/128), ceil(I/128)] per matrix -- the layout #817's
              * kernels and tensor_upload(fmt=8) already agree on */
@@ -844,14 +855,17 @@ static int qt_init_body(int nl, int ne, int D, int Ih, int cap, int topk,
 
     /* Weight format and bytes per expert come first now: the automatic
      * placement below needs them to price the experts a trunk item displaces. */
-    G.wfmt = G_fp8_stream ? 8 : (expert_is_int4 ? 4 : 1);
+    /* expert_is_int4=2 extends the old boolean ABI with unquantized f32. */
+    G.wfmt = G_fp8_stream ? 8 : expert_is_int4==2 ? 0 : (expert_is_int4 ? 4 : 1);
     if(G.wfmt==1 && expert_gs>0){
         fprintf(stderr,"[qtier] int8 experts with grouped scales (gs=%d) cannot be "
                        "expressed on the GPU (fmt=1 is per-row only) -> CPU path\n", expert_gs);
         return 0;
     }
     G.egs = expert_gs;
-    if(G.wfmt==8){
+    if(G.wfmt==0){
+        G.sc_gu=G.sc_d=0;
+    } else if(G.wfmt==8){
         /* one f32 scale per 128x128 block of [O,I]: gate/up are [Ih,D], down is
          * [D,Ih] -- the same count either way, kept as two fields for symmetry */
         size_t nbD=(size_t)(D+127)/128, nbI=(size_t)(Ih+127)/128;
@@ -871,9 +885,10 @@ static int qt_init_body(int nl, int ne, int D, int Ih, int cap, int topk,
      * before its stop-trying fallback shrank the budget. Now the planned count
      * is the resident count. The 22-28 % the granularity costs is real; only
      * pooling experts into one arena per device would win it back (open). */
-    size_t mat_bytes = G.wfmt==4 ? (size_t)D*Ih/2 : (size_t)D*Ih;
+    size_t mat_bytes = expert_matrix_bytes();
     size_t scl_bytes = (2*G.sc_gu+G.sc_d)/3*sizeof(float);
-    G.exp_bytes = 3*dev_alloc_footprint(mat_bytes) + 3*dev_alloc_footprint(scl_bytes); /* + allocation slack */
+    G.exp_bytes = 3*dev_alloc_footprint(mat_bytes)
+                + (G.wfmt ? 3*dev_alloc_footprint(scl_bytes) : 0); /* + allocation slack */
 
     /* Per-device allowance for tier + trunk: CUDA_EXPERT_GB when numeric,
      * else free minus 1 GB headroom. The heat table is loaded here too (it
@@ -1140,9 +1155,10 @@ static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
     if(G.qn>=QT_QCAP){ G.q_full_skips++; return 0; }
     int hd=home(eid);
     if(!reserved && v_eid<0 && G.used[hd]+G.exp_bytes>G.budget[hd]) return 0;
-    size_t mb=(size_t)G.D*G.Ih/(G.wfmt==4?2:1);   /* buffer di staging: int8/fp8 = 1 byte/elemento */
-    uint8_t *w=malloc(3*mb); float *sc=malloc((2*G.sc_gu+G.sc_d)*sizeof(float));
-    if(!w||!sc){ free(w); free(sc); return 0; }
+    size_t mb=expert_matrix_bytes();
+    uint8_t *w=malloc(3*mb);
+    float *sc=G.wfmt ? malloc((2*G.sc_gu+G.sc_d)*sizeof(float)) : NULL;
+    if(!w||(G.wfmt&&!sc)){ free(w); free(sc); return 0; }
     if(!reserved && v_eid<0) G.used[hd]+=G.exp_bytes;
     s->queued=1;
     stage(w,sc,s->g4,s->u4,s->d4,s->gs,s->us,s->ds);

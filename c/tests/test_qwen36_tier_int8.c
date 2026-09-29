@@ -102,6 +102,28 @@ int main(void) {
     qt_shutdown();
 
     free(g); free(u); free(d); free(sc);
+    /* ---- 4. unquantized: f32 weights have no scale arrays ---- */
+    fake_uploads = 0;
+    if (!qt_init(NL, NE, D, IH, NE, TOPK, 0 /* no scales */, 2 /* f32 */)) {
+        printf("  FAIL: il tier rifiuta esperti f32 senza scale\n");
+        return 1;
+    }
+    check(G.wfmt == 0, "unquantized deve usare fmt=0");
+    check(G.exp_bytes == 3 * dev_alloc_footprint((size_t)D * IH * sizeof(float)),
+          "il budget f32 deve contare quattro byte per elemento e nessuna scala");
+    float *fg = malloc(mb * sizeof(float));
+    float *fu = malloc(mb * sizeof(float));
+    float *fd = malloc(mb * sizeof(float));
+    for (size_t i = 0; i < mb; i++) { fg[i] = (float)i; fu[i] = 1.f; fd[i] = 2.f; }
+    qt_note(0, 0, (const uint8_t *)fg, (const uint8_t *)fu, (const uint8_t *)fd,
+            NULL, NULL, NULL);
+    drain();
+    check(fake_uploads > 0, "nessun esperto f32 e' arrivato in VRAM");
+    check(last_fmt == 0, "il backend deve ricevere fmt=0 per esperti unquantized");
+    check(last_bytes == mb * sizeof(float), "f32: quattro byte per elemento");
+    qt_shutdown();
+    free(fg); free(fu); free(fd);
+
     if (fails) { printf("test_qwen36_tier_int8: %d fallimenti\n", fails); return 1; }
     printf("test_qwen36_tier_int8: ok\n");
     return 0;

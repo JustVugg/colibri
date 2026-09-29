@@ -990,6 +990,7 @@ static int g_expert_gs = 0;   /* set from qwen36_meta.json (expert_gs) at load *
  * Same signal main's nbytes probe and tier_warmstart receive; the decode path
  * needs it to offer int8 experts (#1391): on an int8 container e->g4 is NULL. */
 static int g_expert_is_int4 = 1;
+static int g_expert_is_f32;
 
 /* The single offer decision the decode path makes for a routed expert: offer
  * whichever format the container actually packed, exactly what tier_warmstart
@@ -1050,6 +1051,7 @@ static void matmul_q_gs(float *y, const float *x, const int8_t *q, const float *
 }
 /* Expert-GEMV dispatch: per-row scales (classic) or grouped (gs64 container). */
 static void matmul_qe(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
+    if (!scale) { matmul(y, x, (const float *)q, 1, I, O); return; }
     if (g_expert_gs) matmul_q_gs(y, x, q, scale, I, O, g_expert_gs);
     else matmul_q(y, x, q, scale, I, O);
 }
@@ -1579,10 +1581,12 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     int64_t want_w = ng + ng + nd;
     int64_t want_s = 2*scale_count_gu(cc) + scale_count_d(cc);
     st_tensor *tw = st_find(&m->S, nm), *ts = st_find(&m->S, qsnm);
-    if (!tw || (tw->nbytes != want_w && tw->nbytes != want_w / 2)) {
-        fprintf(stderr, "%s: expert weight is %lld bytes — expected %lld (int8) or %lld (int4)\n",
-                nm, (long long)(tw ? tw->nbytes : -1), (long long)want_w, (long long)(want_w / 2)); exit(1); }
-    if (!ts || ts->numel != want_s) {
+    int is_f32 = tw && tw->nbytes == 2 * want_w;
+    if (!tw || (tw->nbytes != 2 * want_w && tw->nbytes != want_w && tw->nbytes != want_w / 2)) {
+        fprintf(stderr, "%s: expert weight is %lld bytes — expected %lld (f16/bf16), %lld (int8) or %lld (int4)\n",
+                nm, (long long)(tw ? tw->nbytes : -1), (long long)(2 * want_w),
+                (long long)want_w, (long long)(want_w / 2)); exit(1); }
+    if (!is_f32 && (!ts || ts->numel != want_s)) {
         fprintf(stderr, "%s: scale array is %lld elems — expected %lld (refusing)\n",
                 qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1); }
     /* int4 detection by ON-DISK SIZE (robust against a mislabeled meta.ebits, e.g. the
@@ -1591,7 +1595,20 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
        rest of the MoE path (matmul_q) is unchanged.  Nibble convention (must match
        c/tools/convert_qwen36.py pack_int4): LOW nibble = element 2k, HIGH nibble = 2k+1;
        each nibble is signed 4-bit (sign-extend if bit3 set). */
-    if (tw->nbytes == want_w / 2) {
+    if (is_f32) {
+        static int noted = 0;
+        if (!noted) { fprintf(stderr, "[qwen36] f16/bf16 expert weights detected — expanding to f32 slots\n"); noted = 1; }
+        if (s->gs) {
+            free(s->g); free(s->gs);
+            s->g = (int8_t *)falloc(want_w);
+            s->u = s->g + ng * (int64_t)sizeof(float);
+            s->d = s->u + ng * (int64_t)sizeof(float);
+            s->gs = s->us = s->ds = NULL;
+        }
+        s->is_int4 = 0;
+        free(s->g4); free(s->u4); free(s->d4); s->g4 = s->u4 = s->d4 = NULL;
+        st_read_f32(&m->S, nm, (float *)s->g, 1);
+    } else if (tw->nbytes == want_w / 2) {
         static int noted = 0;
         if (!noted) { fprintf(stderr, "[qwen36] int4 packed weights detected — unpacking to int8 in slot\n"); noted = 1; }
         uint8_t *raw = (uint8_t *)malloc((size_t)(want_w / 2));
@@ -1624,7 +1641,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         free(s->g4); free(s->u4); free(s->d4); s->g4 = s->u4 = s->d4 = NULL;
         st_read_raw(&m->S, nm, s->g, 1);
     }
-    st_read_f32(&m->S, qsnm, s->gs, 0);
+    if (ts && s->gs) st_read_f32(&m->S, qsnm, s->gs, 0);
 }
 
 /* Robust int4 detection by on-disk size of one expert tensor (ignores a possibly
@@ -3063,6 +3080,7 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
     fprintf(stderr, "[qtier] warmstart (parallel): all %d experts in RAM (%s), %d in VRAM -- %.1f s\n",
             cap_total,
             expert_is_int4 ? "int8 copy dropped for residents, kept for non-residents"
+                           : g_expert_is_f32 ? "f32 container: all experts keep their weights in RAM"
                            : "int8 container: all experts keep their weights in RAM",
             wn, now_s()-t0);
 }
@@ -3201,19 +3219,26 @@ int main(int argc, char **argv) {
      * fmt=4, int8 come fmt=1. Sbagliare qui era #1331 -- budget riservato,
      * planned=1, e zero promozioni per tutta la vita del processo. */
     int expert_is_int4 = 1;
+    int expert_is_f32 = 0;
     {
         char probe[256];
         snprintf(probe, sizeof(probe),
                  "model.layers.%d.mlp.experts.0.merged_weight", m.active_of[0]);
         st_tensor *pt = st_find(&m.S, probe);
         int64_t want = 2*(int64_t)m.c.inter*m.c.hidden + (int64_t)m.c.hidden*m.c.inter;
-        if (pt && pt->nbytes == want) expert_is_int4 = 0;   /* int8: un byte per elemento */
+        if (pt && pt->nbytes == 2 * want) {
+            expert_is_int4 = 0; expert_is_f32 = 1;          /* f16/bf16 on disk, f32 in RAM */
+        } else if (pt && pt->nbytes == want) {
+            expert_is_int4 = 0;                             /* int8: one byte per element */
+        }
     }
     /* Una riga, sempre: e' l'unico modo di verificare il probe dall'esterno
      * (CI sul container tiny int8, #1331) senza una scheda. */
     fprintf(stderr, "[qwen36] expert format on disk: %s\n",
+            expert_is_f32 ? "f16/bf16 (tier fmt=0)" :
             expert_is_int4 ? "int4 packed (tier fmt=4)" : "int8 (tier fmt=1)");
     g_expert_is_int4 = expert_is_int4;
+    g_expert_is_f32 = expert_is_f32;
     /* Offer the dense trunk to the placer before the tier decides its budget:
      * sizes only, from the same dense-i8 entries the uploads below will use.
      * No entry (dense-i8 off) means nothing to offer, and the CPU path stands. */
@@ -3232,7 +3257,7 @@ int main(int argc, char **argv) {
         }
     }
     if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
-                m.c.expert_gs, expert_is_int4)) {
+                m.c.expert_gs, expert_is_f32 ? 2 : expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
         atexit(qt_shutdown);
         /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The

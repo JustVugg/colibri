@@ -87,17 +87,20 @@ static int upload_common(ColiCudaTensor **t, const void *w, const float *sc,
     *t = n;
     fake_live_tensors++;
     last_fmt = fmt;
-    last_bytes = (size_t)I * O / ((fmt == 1 || fmt == 8) ? 1 : 2);
+    last_bytes = fmt == 0 ? (size_t)I * O * sizeof(float)
+                          : (size_t)I * O / ((fmt == 1 || fmt == 8) ? 1 : 2);
     if (call <= 3) {
         int i = call - 1;
         captured_len[i] = last_bytes < sizeof captured[i] ? last_bytes : sizeof captured[i];
         memcpy(captured[i], w, captured_len[i]);
-        size_t ns = fmt == 8 ? (size_t)((O + 127) / 128) * ((I + 127) / 128)
+        size_t ns = fmt == 0 ? 0
+                  : fmt == 8 ? (size_t)((O + 127) / 128) * ((I + 127) / 128)
                              : gs > 0 ? (size_t)O * ((I + gs - 1) / gs)
                                       : (size_t)O;
         captured_scale_count[i] = ns < sizeof captured_scales[i] / sizeof captured_scales[i][0]
                                 ? ns : sizeof captured_scales[i] / sizeof captured_scales[i][0];
-        memcpy(captured_scales[i], sc, captured_scale_count[i] * sizeof(float));
+        if (captured_scale_count[i])
+            memcpy(captured_scales[i], sc, captured_scale_count[i] * sizeof(float));
     }
     return 1;
 }
