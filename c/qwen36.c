@@ -1990,7 +1990,15 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     #undef QCOUNT
     if (quantize_dense)
         fprintf(stderr, "[dense-i8] %d matrices quantized during load, %.1f GB f32 freed\n", qcount, qfreed/1073741824.0);
-    if (cap <= 0) {
+    if (cap <= 0 && c->n_experts <= 0) {
+        /* Dense checkpoint (#1757): nothing is ever routed, so the per-layer
+         * expert cache is never touched by moe()/expert_get(). Sizing it
+         * from RAM would be meaningless -- n_experts==0 has nothing to clamp
+         * qwen36_cap_for_ram's derived value against, so an unclamped RAM
+         * budget could otherwise calloc an absurd slot count for a cache
+         * that will sit empty. cap=1 is a harmless placeholder. */
+        cap = 1;
+    } else if (cap <= 0) {
         /* cap<=0 sentinel: derive from host RAM, same "0 = auto" convention as
          * colibri.c/olmoe.c. rss_gb() here reflects all dense weights resident
          * (this loop just finished) but not yet DN_rec/DN_conv/m->cache
