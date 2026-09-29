@@ -426,10 +426,15 @@ static void sse_chunk(const char *json){
  * <0xXX> byte-fallback tokens emit the raw byte directly. */
 static void decode_id_to_bytes(int id, unsigned char *out, int *outn){
     *outn = 0;
-    if (!g_tok || id<0 || id>=g_tok_n) return;
+    /* a vacant slot (an id the vocab never populated) decodes to nothing */
+    if (!g_tok || id<0 || id>=g_tok_n || !g_tok[id]) return;
     const unsigned char *pc = (const unsigned char*)g_tok[id];
-    /* byte-fallback token: <0xXX> -> raw byte */
-    if (pc[0]=='<' && pc[1]=='0' && pc[2]=='x' && pc[5]=='>'){
+    /* byte-fallback token: <0xXX> -> raw byte.
+     * The length is checked first: the && chain only establishes that pc[0..2]
+     * are non-NUL before it reads pc[5], so a 3- or 4-byte piece starting "<0x"
+     * was read past its allocation. Every piece this branch exists to catch is
+     * exactly 6 bytes, so the gate cannot change a correct decode. Matches qwen38. */
+    if (strlen((const char*)pc)==6 && pc[0]=='<' && pc[1]=='0' && pc[2]=='x' && pc[5]=='>'){
         out[(*outn)++] = (unsigned char)(hexnib((char)pc[3])*16 + hexnib((char)pc[4]));
         return;
     }
