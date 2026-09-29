@@ -15,7 +15,7 @@ static int fails;
 static void check(int ok, const char *what) {
     if (!ok) { printf("  FAIL: %s\n", what); fails++; }
 }
-enum { NL = 1, NE = 2, D = 2048, IH = 768, TOPK = 2 };
+enum { NL = 1, NE = 2, D = 2048, IH = 512, TOPK = 2 };
 #define MB ((size_t)D * IH)
 #define NSC ((size_t)((D + 127) / 128) * ((IH + 127) / 128))
 static unsigned char w[NE][3][MB];
