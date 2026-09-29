@@ -1331,6 +1331,7 @@ static float *load_t_n(Model *m, const char *name, int64_t want) {
     return p;
 }
 
+static int expert_weight_bits(const st_tensor *tw, int64_t want_w);
 static void model_init_range(Model *m, const char *snap, int cap, int bits,
                              int layer_begin, int layer_end,
                              int load_boundaries, int allocate_state) {
@@ -1371,7 +1372,11 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.0.merged_weight",
              m->active_of[layer_begin]);
     st_tensor *expert_probe = st_find(&m->S, nm);
-    c->expert_fp8 = expert_probe && expert_probe->dtype == 4;
+    /* Owned here, not in main: the segment adapters build the model through
+     * this function too, and matmul_qe keys the FP8 GEMV on the global. */
+    c->expert_fp8 = expert_weight_bits(expert_probe, 3 * (int64_t)c->inter * c->hidden) == 8
+                    && expert_probe->dtype == 4;
+    g_expert_is_fp8 = c->expert_fp8;
     for (int i = layer_begin; i < layer_end; i++) {
         int ai = m->active_of[i];        /* == i for Phase 2 */
         Layer *l = &m->L[i];
@@ -1640,6 +1645,12 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
                 "U8/I8 int8 or F8_E4M3 with %lld, or U8/I8 packed int4 with %lld (refusing)\n",
                 nm, st_dtype_name(tw->dtype), (long long)tw->numel, (long long)want_w,
                 (long long)want_w, (long long)(want_w / 2)); exit(1); }
+    /* One GEMV serves the whole container (matmul_qe, tier fmt), so an expert
+     * whose dtype disagrees with the container format would be decoded as the
+     * wrong format: I8 bytes read as E4M3, or E4M3 bytes as I8. */
+    if (is_fp8 != cc->expert_fp8) {
+        fprintf(stderr, "%s: expert weight is %s in %s container (refusing)\n",
+                nm, st_dtype_name(tw->dtype), cc->expert_fp8 ? "an FP8" : "a non-FP8"); exit(1); }
     if (!is_half && (!ts || ts->numel != want_s)) {
         fprintf(stderr, "%s: scale array is %lld elems — expected %lld (refusing)\n",
                 qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1); }
@@ -3292,7 +3303,7 @@ int main(int argc, char **argv) {
             expert_is_int4 = 0; expert_is_half = 1;         /* f16/bf16 on disk, f32 in RAM */
         } else if (bits == 8) {
             expert_is_int4 = 0;
-            expert_is_fp8 = pt->dtype == 4;                 /* FP8 and int8 are both one byte */
+            expert_is_fp8 = m.c.expert_fp8;                 /* FP8 and int8 are both one byte */
         }
     }
     /* Una riga, sempre: e' l'unico modo di verificare il probe dall'esterno
@@ -3303,7 +3314,6 @@ int main(int argc, char **argv) {
             expert_is_fp8 ? "F8_E4M3 (tier fmt=8)" : "int8 (tier fmt=1)");
     g_expert_is_int4 = expert_is_int4;
     g_expert_is_half = expert_is_half;
-    g_expert_is_fp8 = expert_is_fp8;
     /* Offer the dense trunk to the placer before the tier decides its budget:
      * sizes only, from the same dense-i8 entries the uploads below will use.
      * No entry (dense-i8 off) means nothing to offer, and the CPU path stands. */
