@@ -109,7 +109,11 @@ typedef struct {
 typedef struct { float *f; uint16_t *h; void *dev;
                  uint8_t *q4;        /* int4 nibble-packed (qbits=4) o int8 (qbits=8) */
                  float *qs;          /* scale: [rows*ng] se qbits=4, [rows] se qbits=8 */
-                 int gs, qbits; int64_t qn; } Wt;   /* qn = byte in q4, per il guard OOB */
+                 int gs, qbits; int64_t qn;   /* qn = byte in q4, per il guard OOB */
+                 int64_t en; } Wt;  /* en = elementi validi in f o h ( mai entrambi ), per il guard OOB */
+
+#define WT_EN_F(T) ((int64_t)(T)->numel)
+#define WT_EN_H(T) ((int64_t)(T)->nbytes / 2)   /* bf16 = 2 byte/elemento */
 
 typedef struct {
     float *in_ln, *post_ln;
@@ -435,6 +439,12 @@ static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
         if (W.qbits == 8) matmul_i8r(y, x, (const int8_t*)W.q4, W.qs, S, I, O);
         else              matmul_i4g(y, x, W.q4, W.qs, S, I, O, W.gs);
         return;
+    }
+    /* un quantizzato: il chiamante passa I/O dalla config, il container puo' essere
+     * piu' corto. q4 ha gia' il suo guard qui sopra; questo copre f e h. */
+    if ((int64_t)O * I > W.en) {
+        fprintf(stderr, "dense: geometria incoerente (serve %lld elementi, ho %lld) I=%d O=%d\n",
+                (long long)((int64_t)O * I), (long long)W.en, I, O); exit(1);
     }
     if (W.f) matmul(y, x, W.f, S, I, O);
     else     matmul_h(y, x, W.h, S, I, O);
@@ -806,6 +816,7 @@ static Wt load_w(Model *m, const char *name, int gpu_ok) {
     if (!t) { fprintf(stderr, "missing %s\n", name); exit(1); }
     if (load_w_quant(m, name, t->numel, &w)) return w;
     if (t->dtype == 0) {
+        w.en = WT_EN_H(t);
         w.h = malloc(t->nbytes); if (!w.h) { fprintf(stderr,"OOM %s\n",name); exit(1); }
         pread_all(t->fd, w.h, t->nbytes, t->off);
 #ifdef COLI_CUDA
@@ -818,6 +829,7 @@ static Wt load_w(Model *m, const char *name, int gpu_ok) {
         (void)gpu_ok;
 #endif
     } else {
+        w.en = WT_EN_F(t);
         w.f = falloc(t->numel);
         st_read_f32(&m->S, name, w.f, 0);
     }
@@ -828,6 +840,7 @@ static Wt load_w(Model *m, const char *name, int gpu_ok) {
  * st_tensor non porta le shape e non voglio indovinarle. */
 static Wt wt_off_i(Wt w, int64_t off, int I) {
     Wt r = w;
+    r.en = w.en > off ? w.en - off : 0;
     r.f = w.f ? w.f + off : NULL;
     r.h = w.h ? w.h + off : NULL;
     r.dev = w.dev ? (char*)w.dev + off*2 : NULL;    /* dev is always bf16 */

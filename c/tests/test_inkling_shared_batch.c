@@ -83,9 +83,11 @@ static void run_format(const char *format,int kind,int S,int D,int I){
     Layer l;memset(&l,0,sizeof(l));int64_t gi=(int64_t)NS*I*D,di=(int64_t)NS*D*I;
     if(kind==0){
         l.sh_g.f=falloc(gi);l.sh_u.f=falloc(gi);l.sh_d.f=falloc(di);
+        l.sh_g.en=gi;l.sh_u.en=gi;l.sh_d.en=di;
         fill(l.sh_g.f,gi,1);fill(l.sh_u.f,gi,2);fill(l.sh_d.f,di,3);
     }else if(kind==1){
         l.sh_g.h=malloc((size_t)gi*2);l.sh_u.h=malloc((size_t)gi*2);l.sh_d.h=malloc((size_t)di*2);
+        l.sh_g.en=gi;l.sh_u.en=gi;l.sh_d.en=di;
         CHECK(l.sh_g.h&&l.sh_u.h&&l.sh_d.h,"bf16 allocation failed");
         if(!l.sh_g.h||!l.sh_u.h||!l.sh_d.h)exit(2);
         fill_h(l.sh_g.h,gi,1);fill_h(l.sh_u.h,gi,2);fill_h(l.sh_d.h,di,3);

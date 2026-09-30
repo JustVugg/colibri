@@ -91,6 +91,7 @@ int main(void) {
     l.sh_g.h = malloc((size_t)NS * I * D * sizeof(uint16_t));
     l.sh_u.h = malloc((size_t)NS * I * D * sizeof(uint16_t));
     l.sh_d.h = malloc((size_t)NS * D * I * sizeof(uint16_t));
+    l.sh_g.en = (int64_t)NS * I * D; l.sh_u.en = (int64_t)NS * I * D; l.sh_d.en = (int64_t)NS * D * I;
     float *x = falloc((int64_t)S * D);
     float *wgt = falloc((int64_t)S * (K + NS));
     float *seed = falloc((int64_t)S * D);
