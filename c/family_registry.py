@@ -798,6 +798,12 @@ def _individual_expert_inventory(pattern):
     return inventory
 
 
+def _no_expert_inventory(_name, _size, _config, _dtype=None):
+    """Dense family: there is no expert subsystem, so no tensor is an expert.
+    planner_geometry() keys the zero-expert rule off this exact function."""
+    return ()
+
+
 def _dsv41_expert_inventory(name, size, config, _dtype=None):
     """Routed experts, the backbone's and the DSpark head's alike.
 
@@ -1266,7 +1272,7 @@ FAMILIES = (
         planner_id="qwen36_hybrid",
         planner_geometry=_qwen35_geometry,
         planner_unsupported_reason="",
-        expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
+        expert_inventory=_no_expert_inventory,
         config_section="text_config",
         limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 8, "Q36_MAXT"),
         capabilities=FamilyCapabilities(False, False, False, True),
@@ -1496,7 +1502,13 @@ def planner_geometry(resolved, context):
             for value in (geometry.context_state_bytes, geometry.fixed_state_bytes,
                           geometry.workspace_bytes, geometry.configured_experts)):
         raise RegistryError(f"invalid planner geometry for {resolved.descriptor.id}")
-    if geometry.configured_experts < 1:
+    # Zero experts is the only valid count for a dense family and never valid
+    # for a MoE one: key the rule off the expert subsystem, not the number.
+    if resolved.descriptor.expert_inventory is _no_expert_inventory:
+        if geometry.configured_experts != 0:
+            raise ValueError(f"{resolved.descriptor.id}: dense family reports "
+                             f"{geometry.configured_experts} configured experts")
+    elif geometry.configured_experts < 1:
         raise ValueError(f"{resolved.descriptor.id}: configured expert count is zero")
     return geometry
 

@@ -169,6 +169,32 @@ class FamilyRegistryTest(unittest.TestCase):
         for model_type in ("qwen2", "qwen3_moe", "my_qwen_model"):
             self.assertNotIn(model_type, by_type)
 
+    def test_qwen35_dense_geometry_validates_and_moe_zero_experts_still_refused(self):
+        config = {
+            "model_type": "qwen3_5_text",
+            "num_hidden_layers": 4, "num_key_value_heads": 2, "head_dim": 16,
+            "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+            "linear_num_value_heads": 8, "linear_num_key_heads": 4,
+            "linear_key_head_dim": 8, "linear_value_head_dim": 8,
+            "linear_conv_kernel_dim": 4,
+        }
+        by_id, by_type = _build_registry(FAMILIES)
+        family = by_type[config["model_type"]]
+        self.assertEqual(family, by_id["qwen35"])
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        self.assertEqual(geometry.configured_experts, 0)
+        self.assertEqual(expert_contributions(
+            resolved, "model.layers.0.mlp.experts.0.gate_proj.weight", 64), ())
+        # The dense exemption must not leak to a MoE family on the same trunk.
+        moe_desc = replace(
+            family, expert_inventory=by_id["qwen36"].expert_inventory)
+        moe = type("R", (), {"descriptor": moe_desc, "family_config": config,
+                             "model_dir": "."})()
+        with self.assertRaisesRegex(ValueError, "configured expert count is zero"):
+            planner_geometry(moe, 32)
+
     def test_qwen38_fixture_resolves_nested_text_config_and_sizes_all_state(self):
         config = {
             "model_type": "qwen4_exp",
