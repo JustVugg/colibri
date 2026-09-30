@@ -1336,6 +1336,26 @@ static float *load_t_n(Model *m, const char *name, int64_t want) {
 }
 
 static int expert_weight_bits(const st_tensor *tw, int64_t want_w);
+/* num_experts == 0 means dense: no router, no experts. A container that says so
+ * and still ships a router or expert tensor contradicts itself, and every
+ * expert-sized buffer is sized from n_experts -- the router bias used to land in
+ * falloc(0) and take the tensor's declared element count as a heap write. Refuse
+ * the container rather than guess which half of it is right. */
+static void refuse_expert_tensors_in_dense(const shards *S) {
+    for (int i = 0; i < S->n; i++) {
+        const char *nm = S->t[i].name, *p = nm + 13;
+        if (strncmp(nm, "model.layers.", 13)) continue;
+        while (*p >= '0' && *p <= '9') p++;
+        if (p == nm + 13 || *p++ != '.') continue;
+        if (!strcmp(p, "mlp.gate.weight") ||
+            !strcmp(p, "mlp.gate.e_score_correction_bias") ||
+            !strncmp(p, "mlp.experts.", 12) || !strncmp(p, "experts.", 8)) {
+            fprintf(stderr, "[cfg] container shape conflict: num_experts is 0 (dense) "
+                    "but the container holds expert tensor %s -- refusing\n", nm);
+            exit(1);
+        }
+    }
+}
 static void model_init_range(Model *m, const char *snap, int cap, int bits,
                              int layer_begin, int layer_end,
                              int load_boundaries, int allocate_state) {
@@ -1352,6 +1372,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         fprintf(stderr, "rotary_dim %d invalid for head_dim %d\n", m->c.rotary_dim, m->c.head_dim); exit(1);
     }
     st_init(&m->S, snap);
+    if (m->c.n_experts == 0) refuse_expert_tensors_in_dense(&m->S);
     Cfg *c = &m->c;
     if (layer_end == 0) layer_end = c->n_layers;
     if (layer_begin < 0 || layer_end > c->n_layers ||
@@ -1400,7 +1421,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         } else { l->qn = NULL; l->kn = NULL; }
         /* router correction bias (optional) */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias", ai);
-        if (st_has(&m->S, nm)) { l->gate_bias = falloc(c->n_experts); st_read_f32(&m->S, nm, l->gate_bias, 0); }
+        if (c->n_experts > 0 && st_has(&m->S, nm)) { l->gate_bias = falloc(c->n_experts); st_read_f32(&m->S, nm, l->gate_bias, 0); }
         else l->gate_bias = NULL;
         /* shared expert (dense f32) */
         #define LD2(field, suffix, want) snprintf(nm,sizeof(nm),c->n_experts ? "model.layers.%d.mlp.shared_expert." suffix : "model.layers.%d.mlp." suffix,ai); l->field = load_t_n(m,nm,(want))
