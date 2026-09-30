@@ -3082,7 +3082,14 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
         long nloads = 0;
         for (int pass = 0; pass < 2; pass++) for (int gi = 0; gi < cap_total; gi++) {
             int l = gi / m->c.n_experts, eidw = gi % m->c.n_experts;
-            if ((pass == 0) != planned[gi] || loads[l] >= m->cache[l].cap) continue;
+            if ((pass == 0) != planned[gi]) continue;
+            if (loads[l] >= m->cache[l].cap) {
+                /* No RAM slot left in this layer: a planned expert skipped here
+                 * never reaches the tier, so hand back the budget qt_plan_fill
+                 * reserved for it (NULL weights = "nothing to upload"). */
+                if (planned[gi]) qt_note_planned(l, eidw, NULL, NULL, NULL, NULL, NULL, NULL);
+                continue;
+            }
             Slot *e; expert_get(m, l, eidw, &e); loads[l]++;
             const uint8_t *wg = expert_is_int4 ? e->g4 : (const uint8_t *)e->g;
             const uint8_t *wu = expert_is_int4 ? e->u4 : (const uint8_t *)e->u;
@@ -3103,8 +3110,8 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
         free(loads);
         qt_fill_wait();
         free(wpl); free(wpe); free(planned);
-        fprintf(stderr, "[qtier] warmstart (RAM_GB): %ld experts in RAM, %d in VRAM -- %.1f s\n",
-                nloads, wn, now_s()-t0);
+        fprintf(stderr, "[qtier] warmstart (RAM_GB): %ld experts in RAM, %zu in VRAM (%d planned) -- %.1f s\n",
+                nloads, qt_resident_count(), wn, now_s()-t0);
         return;
     }
     #pragma omp parallel for schedule(dynamic, 16)
@@ -3152,13 +3159,13 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
      * weights, so the RSS saving the old line implied does not exist there.
      * Say which container this is instead of promising a saving the reader
      * will not see. */
-    fprintf(stderr, "[qtier] warmstart (parallel): all %d experts in RAM (%s), %d in VRAM -- %.1f s\n",
+    fprintf(stderr, "[qtier] warmstart (parallel): all %d experts in RAM (%s), %zu in VRAM (%d planned) -- %.1f s\n",
             cap_total,
             expert_is_int4 ? "int8 copy dropped for residents, kept for non-residents"
                            : g_expert_is_half ? "f16/bf16 container: all experts keep their weights in RAM"
                            : g_expert_is_fp8 ? "FP8 container: all experts keep their bytes in RAM"
                            : "int8 container: all experts keep their weights in RAM",
-            wn, now_s()-t0);
+            qt_resident_count(), wn, now_s()-t0);
 }
 
 int main(int argc, char **argv) {

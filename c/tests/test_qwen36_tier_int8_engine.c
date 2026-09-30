@@ -255,12 +255,50 @@ static void case_int4(void) {
     free_model(&m);
 }
 
+#ifndef _WIN32
+/* --- RAM_GB: a planned expert with no RAM slot left must not keep its VRAM
+ * budget, and the warmstart line must report what is resident, not the plan.
+ * The f16 run planned 1435, got 576 resident: the 859 skipped at the per-layer
+ * RAM cap kept their reservation, so demand uploads found the budget "full". */
+static void case_ram_cap_skip(void) {
+    printf("RAM_GB cap below the VRAM plan\n");
+    Model m; build_model(&m); fill_int8(&m);
+    m.cache[0].cap = 2;                   /* RAM slots for 2 of the 4 planned experts */
+    m.ram_cap_enabled = 1;
+    setenv("RAM_GB", "1", 1);
+    setenv("COLI_CUDA", "1", 1);
+    setenv("COLI_GPUS", "0", 1);
+    unsetenv("QT_NO_WARMSTART");
+    if (!qt_init(NL, NE, EXP_D, EXP_IH, NE, TOPK, 0, 0)) {
+        printf("  FAIL the tier refuses a per-row int8 container\n");
+        fails++; free_model(&m); unsetenv("RAM_GB"); return;
+    }
+    FILE *log = tmpfile();
+    fflush(stderr);
+    int saved = dup(2); dup2(fileno(log), 2);
+    tier_warmstart(&m, 0);
+    fflush(stderr); dup2(saved, 2); close(saved);
+    char buf[4096] = {0}; rewind(log);
+    size_t got = fread(buf, 1, sizeof buf - 1, log); (void)got; fclose(log);
+    size_t res = qt_resident_count();
+    ck(res == 2, "only the experts that got a RAM slot are resident");
+    ck(G.used[0] == res * G.exp_bytes, "skipped planned experts returned their budget");
+    ck(strstr(buf, "2 in VRAM (4 planned)") != NULL,
+       "warmstart line reports resident experts, not the plan");
+    qt_shutdown();
+    free_model(&m);
+    unsetenv("RAM_GB");
+}
+#endif
 int main(void) {
 #ifndef _WIN32
     case_short_f32_refused();
 #endif
     case_int8();
     case_int4();
+#ifndef _WIN32
+    case_ram_cap_skip();
+#endif
     if (fails) { printf("FAILED %d\n", fails); return 1; }
     printf("OK test_qwen36_tier_int8_engine\n");
     return 0;
