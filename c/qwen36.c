@@ -3356,10 +3356,13 @@ int main(int argc, char **argv) {
     }
     /* Una riga, sempre: e' l'unico modo di verificare il probe dall'esterno
      * (CI sul container tiny int8, #1331) senza una scheda. */
-    fprintf(stderr, "[qwen36] expert format on disk: %s\n",
-            expert_is_half ? "f16/bf16 (tier fmt=0)" :
-            expert_is_int4 ? "int4 packed (tier fmt=4)" :
-            expert_is_fp8 ? "F8_E4M3 (tier fmt=8)" : "int8 (tier fmt=1)");
+    if (m.c.n_experts == 0)
+        fprintf(stderr, "[qwen36] dense MLP (num_experts 0): no experts on disk\n");
+    else
+        fprintf(stderr, "[qwen36] expert format on disk: %s\n",
+                expert_is_half ? "f16/bf16 (tier fmt=0)" :
+                expert_is_int4 ? "int4 packed (tier fmt=4)" :
+                expert_is_fp8 ? "F8_E4M3 (tier fmt=8)" : "int8 (tier fmt=1)");
     g_expert_is_int4 = expert_is_int4;
     g_expert_is_half = expert_is_half;
     /* Offer the dense trunk to the placer before the tier decides its budget:
@@ -3385,7 +3388,8 @@ int main(int argc, char **argv) {
         : qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, m.c.n_experts ? cap : 0, m.c.topk,
                   m.c.expert_gs, expert_is_half ? 2 : expert_is_int4);
     if (tier_ready) {
-        fprintf(stderr, expert_is_fp8 ? "[gpu] MoE experts -> CUDA VRAM tier (fmt=8 FP8 E4M3)\n"
+        fprintf(stderr, m.c.n_experts == 0 ? "[gpu] CUDA tier up, dense model: no experts to place\n" :
+                        expert_is_fp8 ? "[gpu] MoE experts -> CUDA VRAM tier (fmt=8 FP8 E4M3)\n"
                                       : "[gpu] MoE experts -> CUDA VRAM tier\n");
         atexit(qt_shutdown);
         /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The
