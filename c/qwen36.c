@@ -1421,7 +1421,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         } else { l->qn = NULL; l->kn = NULL; }
         /* router correction bias (optional) */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias", ai);
-        if (c->n_experts > 0 && st_has(&m->S, nm)) { l->gate_bias = falloc(c->n_experts); st_read_f32(&m->S, nm, l->gate_bias, 0); }
+        if (c->n_experts > 0 && st_has(&m->S, nm)) { l->gate_bias = load_t_n(m, nm, c->n_experts); }
         else l->gate_bias = NULL;
         /* shared expert (dense f32) */
         #define LD2(field, suffix, want) snprintf(nm,sizeof(nm),c->n_experts ? "model.layers.%d.mlp.shared_expert." suffix : "model.layers.%d.mlp." suffix,ai); l->field = load_t_n(m,nm,(want))

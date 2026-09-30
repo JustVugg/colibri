@@ -1131,6 +1131,9 @@ tests/test_qwen36_expert_format$(EXE): tests/test_qwen36_expert_format.c qwen36.
 # dense (num_experts 0) container: loads with no expert index, expert tensors refused.
 tests/test_qwen36_dense_container$(EXE): tests/test_qwen36_dense_container.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+# MoE router bias: exactly n_experts values loads, any other size is refused.
+tests/test_qwen36_router_bias$(EXE): tests/test_qwen36_router_bias.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 # Reproducible local timing evidence; intentionally not a noisy CI perf gate.
 tests/bench_qwen36_dense_batch$(EXE): tests/bench_qwen36_dense_batch.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
