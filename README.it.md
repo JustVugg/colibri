@@ -17,6 +17,9 @@ vision), **Inkling** (975B), **Kimi K3** (2,8T), **DeepSeek V4 Flash** (284B), *
 **Qwen3.8-Flash-Next** (125B + 51B n-gram), **Qwen3.6** (35B-A3B) e
 **OLMoE** (7B) — un
 file C ciascuna, la stessa interfaccia `coli chat` / `coli serve` / `coli web`. [Elenco completo](README.md#other-supported-models)
+Anche immagini: **Qwen-Image-2.1** genera figure da un testo, mostrate dentro al
+terminale da `coli chat` e servite su `POST /v1/images/generations`
+([qwen-image.md](docs/qwen-image.md)).
 
 > **Colibrì è un motore di inferenza che puoi usare oggi, e una piattaforma di
 > ricerca aperta.** Il suo obiettivo principale è migliorare le prestazioni di

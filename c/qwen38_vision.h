@@ -69,14 +69,18 @@ typedef struct {
 
 static void q38v_linear(float *out, const float *in, const Q38Linear *l, int rows)
 {
+    /* Every output is one dot product in a fixed order, so splitting (row, output)
+     * pairs across threads changes the time and not a bit of the result. A real
+     * image is hundreds of rows through 27 blocks: single-threaded it was minutes
+     * per picture (#1757). */
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int r = 0; r < rows; r++) {
-        const float *x = in + (size_t)r * l->in;
-        float *y = out + (size_t)r * l->out;
         for (int o = 0; o < l->out; o++) {
+            const float *x = in + (size_t)r * l->in;
             const float *w = l->w + (size_t)o * l->in;
             float acc = l->b ? l->b[o] : 0.f;
             for (int i = 0; i < l->in; i++) acc += w[i] * x[i];
-            y[o] = acc;
+            out[(size_t)r * l->out + o] = acc;
         }
     }
 }
@@ -226,6 +230,11 @@ static int q38_vision_forward_dbg(const Q38Vision *v, const float *patches,
 
         const float scale = 1.f / sqrtf((float)D);
         memset(att, 0, (size_t)n * H * sizeof(float));
+        /* each (head, query) pair owns its slice of att and its own score row */
+        #pragma omp parallel
+        {
+        float *scores = (float *)malloc((size_t)n * sizeof(float));
+        #pragma omp for collapse(2) schedule(static)
         for (int h = 0; h < nh; h++)
             for (int i = 0; i < n; i++) {
                 const float *q = qkv + (size_t)i * 3 * H + (size_t)h * D;
@@ -247,6 +256,8 @@ static int q38_vision_forward_dbg(const Q38Vision *v, const float *patches,
                     for (int d = 0; d < D; d++) dst[d] += weight * val[d];
                 }
             }
+        free(scores);
+        }
 
         q38v_linear(tmp, att, &blk->proj, n);
         for (size_t i = 0; i < (size_t)n * H; i++) x[i] += tmp[i];

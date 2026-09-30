@@ -59,6 +59,10 @@ class DisplayVariant:
     geometry: tuple
     display_name: str
     display_scale: str
+    # The API model id for this checkpoint, when it must not borrow the family's:
+    # set only where no id was ever announced for it, so existing clients of the
+    # 35B and 2.4T keep the id they were configured with.
+    model_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +71,9 @@ class PlannerGeometry:
     fixed_state_bytes: int
     workspace_bytes: int
     configured_experts: int
+    # A dense checkpoint (no expert count in its config): zero experts is its shape,
+    # not a broken MoE config, and the planner keeps every weight resident (#1757).
+    dense: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +150,15 @@ class FamilyDescriptor:
     # la geometria lo rende visibile. 0 = nessun riferimento dichiarato, il
     # banner stampa display_scale come sempre.
     reference_experts: int = 0
+    # "text" for the chat engines, "image" for a text-to-image pipeline. An
+    # image family has no KV cache, no experts and no chat template: coli
+    # routes it to the image REPL, the image planner and POST
+    # /v1/images/generations, and every text-only invariant (context variable,
+    # segment conformance, tuning) is scoped to modality "text".
+    modality: str = "text"
+    # Where the tokenizer lives, relative to the model directory. A diffusers
+    # pipeline keeps it in processor/, not at the root.
+    tokenizer_file: str = "tokenizer.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +256,10 @@ def _qwen36_geometry(config, context, _model_dir):
     conv_dim = key_heads * key_dim * 2 + value_heads * value_dim
     fixed = (layers - full) * (value_heads * key_dim * value_dim +
                                conv_dim * (conv_k - 1)) * 4
+    # A dense checkpoint of the family (Qwen3.8-27B, #1757) has no num_experts: nothing
+    # to cache, every weight resident.
+    if "num_experts" not in config:
+        return PlannerGeometry(kv, fixed, 0, 0, dense=True)
     return PlannerGeometry(kv, fixed, 0, _required_int(config, "num_experts", "qwen36"))
 
 
@@ -1288,7 +1308,10 @@ FAMILIES = (
     ),
     FamilyDescriptor(
         id="qwen36",
-        model_types=("qwen3_5_moe", "qwen3_5_moe_text"),
+        # qwen3_5 / qwen3_5_text: the dense checkpoints of the same architecture
+        # (Qwen3.8-27B, #1757). The engine loads their MLP as an ungated shared
+        # expert and routes nothing.
+        model_types=("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5", "qwen3_5_text"),
         display_name="Qwen3.6-35B-A3B",
         display_scale="35B",
         # Both checkpoints declare qwen3_5_moe_text. Keyed on the three
@@ -1301,6 +1324,9 @@ FAMILIES = (
             DisplayVariant((("num_hidden_layers", 92), ("num_experts", 512),
                             ("hidden_size", 8192)),
                            "Qwen3.8-2.4T-A95B", "2.4T"),
+            DisplayVariant((("num_hidden_layers", 64), ("hidden_size", 5120),
+                            ("intermediate_size", 17408)),
+                           "Qwen3.8-27B", "27B", model_id="qwen3.8-27b-colibri"),
         ),
         engine_artifact="qwen36",
         engine_aliases=(),
@@ -1439,6 +1465,42 @@ FAMILIES = (
         # coli chat, coli serve and coli web already use.
         has_cli_adapter=False,
     ),
+    FamilyDescriptor(
+        id="qwen_image",
+        # A diffusers pipeline has no config.json at its root: the family is
+        # read from model_index.json's _class_name (see resolve_model), which
+        # is what this entry holds, normalized like every model_type.
+        model_types=("qwenimage21pipeline",),
+        display_name="Qwen-Image-2.1",
+        display_scale="",
+        engine_artifact="qwenimage",
+        engine_aliases=(),
+        engine_group="qwenimage",
+        internal_arch="qwenimage",
+        build_target="qwenimage",
+        process_names=("qwenimage",),
+        default_model_id="qwen-image-2.1-colibri",
+        cli_adapter="qwen_image",
+        gateway_adapter="qwen_image",
+        planner_id="qwen_image",
+        planner_geometry=None,
+        planner_unsupported_reason=(
+            "an image model has no KV cache and no experts; coli plan sizes its "
+            "text encoder, DiT and VAE instead (image_engine.plan_image_model)"),
+        expert_inventory=lambda _name, _size, _config, _dtype=None: (),
+        config_section="root",
+        # One image at a time, and no context or output-token budget: the
+        # limits exist because every descriptor has them. No context variable
+        # either (empty): the launcher refuses --ctx for this modality rather
+        # than inventing a knob the engine does not read.
+        limits=FamilyLimits(1, 1, 1, 1, 1, 0, ""),
+        capabilities=FamilyCapabilities(False, False, False, False),
+        has_gateway_adapter=True,
+        has_cli_adapter=True,
+        supports_accelerator=False,
+        modality="image",
+        tokenizer_file="processor/tokenizer.json",
+    ),
 )
 
 
@@ -1461,7 +1523,9 @@ def _build_registry(families):
                 not isinstance(family.has_gateway_adapter, bool) or
                 not isinstance(family.has_cli_adapter, bool) or
                 not isinstance(family.tune_prompt_template, str) or
-                "{prompt}" not in family.tune_prompt_template):
+                "{prompt}" not in family.tune_prompt_template or
+                family.modality not in ("text", "image") or
+                not isinstance(family.tokenizer_file, str) or not family.tokenizer_file):
             raise RegistryError(f"incomplete family descriptor: {family.id}")
         try:
             family.tune_prompt_template.format(prompt="test", prompt_len=4)
@@ -1526,11 +1590,30 @@ def family_by_id(family_id):
 def family_for_config(config):
     if not isinstance(config, dict):
         raise FamilyConfigError("config.json is not a JSON object")
+    if "model_type" not in config and isinstance(config.get("_class_name"), str):
+        # A diffusers model_index.json: the pipeline class is its model type.
+        return family_for_index(config)
     model_type = _normalize_model_type(config.get("model_type"))
     try:
         return _BY_TYPE[model_type]
     except KeyError as error:
         raise UnknownFamilyError(f"unsupported model_type: {model_type}") from error
+
+
+def family_for_index(index):
+    """The family of a diffusers pipeline, from its model_index.json."""
+    if not isinstance(index, dict):
+        raise FamilyConfigError(f"{MODEL_INDEX} is not a JSON object")
+    name = index.get("_class_name")
+    if not isinstance(name, str) or not name.strip():
+        raise FamilyConfigError(f"{MODEL_INDEX} has no non-empty string _class_name")
+    try:
+        family = _BY_TYPE[_normalize_model_type(name)]
+    except KeyError as error:
+        raise UnknownFamilyError(f"unsupported diffusers pipeline: {name}") from error
+    if family.modality != "image":
+        raise UnknownFamilyError(f"unsupported diffusers pipeline: {name}")
+    return family
 
 
 def tuning_replay_prompt(family, prompt):
@@ -1539,9 +1622,26 @@ def tuning_replay_prompt(family, prompt):
     return family.tune_prompt_template.format(prompt=prompt, prompt_len=len(prompt))
 
 
+MODEL_INDEX = "model_index.json"
+
+
 def resolve_model(model_dir):
     model = Path(model_dir).expanduser().resolve()
     path = model / "config.json"
+    if not path.is_file() and (model / MODEL_INDEX).is_file():
+        # A diffusers pipeline (Qwen-Image): the root carries model_index.json
+        # and each component keeps its own config.json in its own directory.
+        # config.json wins when both exist, so a text checkpoint that happens
+        # to ship an index is never read as an image model.
+        try:
+            index = json.loads((model / MODEL_INDEX).read_text(encoding="utf-8"))
+        except OSError as error:
+            raise FamilyConfigError(f"cannot read {MODEL_INDEX}: {model}") from error
+        except json.JSONDecodeError as error:
+            raise FamilyConfigError(f"invalid {MODEL_INDEX}: {error}") from error
+        family = family_for_index(index)
+        return ResolvedFamily(family, _normalize_model_type(index["_class_name"]),
+                              index, index, str(model))
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
     except OSError as error:
@@ -1549,7 +1649,8 @@ def resolve_model(model_dir):
             f"cannot read config.json: {model}\n"
             "  coli picks the engine from config.json, so nothing runs without it. Copy the\n"
             "  checkpoint's config.json (with tokenizer.json and model.safetensors.index.json)\n"
-            "  from the model repo next to the shards.") from error
+            "  from the model repo next to the shards. An image model (a diffusers pipeline)\n"
+            "  carries model_index.json instead.") from error
     except json.JSONDecodeError as error:
         raise FamilyConfigError(f"invalid config.json: {error}") from error
     family = family_for_config(config)
@@ -1560,6 +1661,17 @@ def resolve_model(model_dir):
             raise FamilyConfigError(f"{family.id}: text_config is not an object")
     return ResolvedFamily(family, _normalize_model_type(config.get("model_type")),
                           config, family_config, str(model))
+
+
+def default_model_id(resolved):
+    """The API model id for what was actually loaded: its display variant's, if it has
+    one of its own, else the family's."""
+    family = resolved.descriptor
+    config = resolved.family_config
+    for variant in family.display_variants:
+        if variant.model_id and all(config.get(key) == value for key, value in variant.geometry):
+            return variant.model_id
+    return family.default_model_id
 
 
 def display_for(resolved):
@@ -1598,7 +1710,7 @@ def planner_geometry(resolved, context):
             for value in (geometry.context_state_bytes, geometry.fixed_state_bytes,
                           geometry.workspace_bytes, geometry.configured_experts)):
         raise RegistryError(f"invalid planner geometry for {resolved.descriptor.id}")
-    if geometry.configured_experts < 1:
+    if geometry.configured_experts < 1 and not geometry.dense:
         raise ValueError(f"{resolved.descriptor.id}: configured expert count is zero")
     return geometry
 
@@ -1684,6 +1796,8 @@ def public_metadata(family):
         "gateway_adapter": family.gateway_adapter,
         "planner_id": family.planner_id,
         "supports_accelerator": family.supports_accelerator,
+        "modality": family.modality,
+        "tokenizer_file": family.tokenizer_file,
         "limits": {
             "default_context": family.limits.default_context,
             "max_context": family.limits.max_context,

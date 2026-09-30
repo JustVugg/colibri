@@ -20,6 +20,43 @@ class ClusterRegistryTests(unittest.TestCase):
         self.assertEqual(registry.expert_endpoints(), ["10.0.0.2:9100"])
         self.assertEqual(registry.snapshot()["protocol_version"], PROTOCOL_VERSION)
 
+    def test_numeric_node_id_does_not_break_discovery(self):
+        # A worker that sends "node_id": 1 registers fine (the registry keys
+        # by str(node_id) and heartbeat looks it up the same way), so the
+        # snapshot must not die sorting an int against a string node_id.
+        registry = ClusterRegistry()
+        record = registry.register({"node_id": 1, "host": "10.0.0.2", "port": 9100,
+                                    "role": "expert"})
+        registry.register({"node_id": "mac-b", "host": "10.0.0.3", "port": 9101,
+                           "role": "expert"})
+        self.assertEqual(registry.expert_endpoints(), ["10.0.0.2:9100", "10.0.0.3:9101"])
+        self.assertEqual(registry.heartbeat(record["node_id"])["host"], "10.0.0.2")
+        self.assertEqual(registry.heartbeat(1)["host"], "10.0.0.2")
+
+    def test_http_topology_survives_a_numeric_node_id(self):
+        server = ClusterServer(("127.0.0.1", 0), ClusterRegistry())
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for node_id in (1, "mac-b"):
+                conn = HTTPConnection(*server.server_address)
+                body = json.dumps({"node_id": node_id, "host": "127.0.0.1",
+                                   "port": 9100, "role": "expert"})
+                conn.request("POST", "/v1/cluster/register", body,
+                             {"Content-Type": "application/json"})
+                self.assertEqual(conn.getresponse().status, 200)
+                conn.close()
+            for path in ("/v1/cluster/topology", "/health"):
+                conn = HTTPConnection(*server.server_address)
+                conn.request("GET", path)
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200, path)
+                self.assertEqual(len(json.loads(response.read())["nodes"]), 2, path)
+                conn.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_http_topology_registration_and_heartbeat(self):
         server = ClusterServer(("127.0.0.1", 0), ClusterRegistry())
         thread = threading.Thread(target=server.serve_forever, daemon=True)

@@ -109,6 +109,16 @@ static void test_layer(int S, int K, int H, int F, int NE, int mode) {
     int bad = 0; for (int i = 0; i < S * H; i++) if (o1[i] != o2[i]) { if (!bad) printf("  first diff at %d: %.9g vs %.9g\n", i, o2[i], o1[i]); bad++; }
     CHECK(bad == 0, "layer S=%d K=%d H=%d F=%d mode=%d: %d of %d outputs differ from the per-token loop", S, K, H, F, mode, bad, S * H);
     printf("layer S=%2d K=%d H=%4d F=%4d mode=%d: bit-identical to the per-token loop\n", S, K, H, F, mode);
+    /* the same batch cut into (token, expert) pairs, each added into out: the cut
+     * qwen36 makes when its cache holds fewer experts than the batch routes to.
+     * Every cut goes through xf_moe_add's one statement, so the bits must match
+     * the whole run whether or not the build fuses the multiply-add. */
+    float *o3 = calloc((size_t)S * H, sizeof(float)); void *sc1 = malloc(xf_moe_scratch_bytes(1, 1, H, F));
+    for (int i = 0; i < S * K; i++) xf_moe_add(o3 + (size_t)(i / K) * H, x + (size_t)(i / K) * H, 1, 1, H, F, idx + i, val + i, ex + i, mode, sc1);
+    bad = 0; for (int i = 0; i < S * H; i++) if (o3[i] != o2[i]) { if (!bad) printf("  first diff at %d: %.9g vs %.9g\n", i, o3[i], o2[i]); bad++; }
+    CHECK(bad == 0, "layer S=%d K=%d H=%d F=%d mode=%d: %d of %d outputs differ when cut into pairs", S, K, H, F, mode, bad, S * H);
+    printf("layer S=%2d K=%d H=%4d F=%4d mode=%d: bit-identical when cut into pairs\n", S, K, H, F, mode);
+    free(o3); free(sc1);
     for (int e = 0; e < NE; e++) { free((void *)E[e].g4); free((void *)E[e].u4); free((void *)E[e].d4); free((void *)E[e].gs); free((void *)E[e].us); free((void *)E[e].ds); }
     free(E); free(tmp); free(vals); free(x); free(idx); free(val); free(ex); free(o1); free(o2); free(scratch);
 }

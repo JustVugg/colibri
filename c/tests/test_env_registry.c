@@ -3,11 +3,14 @@
 
 int main(void) {
     const unsigned short engines[] = {CE_COLIBRI, CE_KIMI, CE_INKLING, CE_OLMOE,
-        CE_DSV4, CE_QWEN, CE_GLM53, CE_QWEN38, CE_DSV41};
+        CE_DSV4, CE_QWEN, CE_GLM53, CE_QWEN38, CE_DSV41, CE_QWENIMAGE};
     for (unsigned i = 0; i < sizeof(engines) / sizeof(engines[0]); ++i) {
         assert(coli_env_find("COLI_ENV_STRICT")->engines & engines[i]);
         assert(coli_env_find("COLI_ENV_DUMP")->engines & engines[i]);
     }
+    assert(coli_env_find("COLI_IMG_BITS")->engines == CE_QWENIMAGE);
+    assert(coli_env_find("QWEN36_QPACK")->engines == CE_QWEN);
+    assert(coli_env_is_ours("QWENIMAGE_PRF"));
     assert(coli_env_find("V41_DSPARK")->engines == CE_DSV41);
     assert(coli_env_find("V41_READ_DEPTH")->engines == CE_DSV41);
     assert(coli_env_find("Q38_TRUNK_GPU")->engines == CE_QWEN38);

@@ -330,6 +330,19 @@ def main():
             print("WARNING: tokenizer.json not found; the engine will need TOK=<path>")
     except Exception as e:
         print(f"WARNING: could not fetch tokenizer.json ({e}); the engine will need TOK=<path>")
+    # The chat template travels with the container: the gateway renders what the
+    # checkpoint was trained on, and a Qwen3.8 template on this engine (Qwen3.8-27B,
+    # #1757) is recognised from this file.
+    for extra in ("chat_template.jinja", "tokenizer_config.json", "generation_config.json",
+                  "preprocessor_config.json"):
+        try:
+            extra_path = (hf_hub_download(args.repo, extra, token=token) if args.repo
+                          else str(src_dir / extra))
+        except Exception:
+            continue
+        if Path(extra_path).is_file():
+            shutil.copy2(extra_path, out / extra)
+            print(f"{extra} -> {out / extra}")
 
     # ---- build weight map (key -> shard file) ----
     if idx_path:
@@ -351,6 +364,7 @@ def main():
     prefix = resolve_prefix(wm.keys())
     layer_map = {}      # layer index -> [keys]
     global_map = {}     # kind -> key
+    vision_map = {}     # name after "visual." -> key
     skipped = {}        # group -> count
     unknown = []
     for k in wm:
@@ -363,6 +377,8 @@ def main():
             layer_map.setdefault(placed[1], []).append(k)
         elif placed[0] == "global":
             global_map[placed[1]] = k
+        elif placed[0] == "vision":
+            vision_map[placed[1]] = k
         else:
             skipped[placed[1]] = skipped.get(placed[1], 0) + 1
     if unknown:
@@ -499,6 +515,23 @@ def main():
             upload_local(gpath)
             gpath.unlink()
 
+    # ---- vision tower as f16, under model.visual.* (#1757) ----
+    # The same ViT in Qwen3.5/3.6/3.8; the engine runs it through qwen38_vision.h.
+    vcfg = cfg_full.get("vision_config") or {}
+    if vision_map and not vcfg:
+        print(f"note: {len(vision_map)} visual.* tensor(s) but no vision_config; the tower is left out")
+    if vision_map and vcfg:
+        if "model-vision.safetensors" in done_files:
+            print("[vision] already on HF, skip")
+        else:
+            v_out = {f"model.visual.{name}": get_tensor(k).half() for name, k in vision_map.items()}
+            vpath = out / "model-vision.safetensors"
+            save_file(v_out, str(vpath))
+            print(f"[vision] {vpath.name} ({len(v_out)} tensors)")
+            if args.stream_upload:
+                upload_local(vpath)
+                vpath.unlink()
+
     # ---- per layer: Gated-Attention (full_attention) AND Gated DeltaNet (linear_attention) ----
     # Every layer also carries its MoE/MLP block. DeltaNet layers export linear_attn.* which
     # the generic f16 copy below handles automatically; the engine implements the recurrence.
@@ -571,10 +604,14 @@ def main():
         "n_layers": int(mcfg["num_hidden_layers"]),
         "n_active": len(all_idx),
         "layer_types": layer_types,
-        "num_experts": int(mcfg["num_experts"]),
-        "topk": int(mcfg["num_experts_per_tok"]),
-        "moe_inter": int(mcfg.get("moe_intermediate_size", mcfg.get("intermediate_size", 0) // 2)),
-        "shared_inter": int(mcfg.get("shared_expert_intermediate_size", mcfg.get("moe_intermediate_size", 0))),
+        # A dense checkpoint of the family (no num_experts: Qwen3.5 / Qwen3.8 27B) routes
+        # nothing; the engine loads its MLP as an ungated shared expert of that width.
+        "num_experts": int(mcfg.get("num_experts", 0)),
+        "topk": int(mcfg.get("num_experts_per_tok", 0)) if mcfg.get("num_experts") else 0,
+        "moe_inter": (int(mcfg.get("moe_intermediate_size", mcfg.get("intermediate_size", 0) // 2))
+                      if mcfg.get("num_experts") else 0),
+        "shared_inter": (int(mcfg.get("shared_expert_intermediate_size", mcfg.get("moe_intermediate_size", 0)))
+                         if mcfg.get("num_experts") else int(mcfg["intermediate_size"])),
         "rms_eps": float(mcfg.get("rms_norm_eps", 1e-6)),
         "ebits": args.ebits,
         "scoring_func": mcfg.get("scoring_func", "softmax"),
@@ -636,6 +673,16 @@ def main():
             h.__exit__(None, None, None)
         except Exception:
             pass
+    if vision_map and vcfg:
+        meta["image_token_id"] = int(cfg_full["image_token_id"])
+        meta["vision"] = {
+            "depth": int(vcfg["depth"]), "hidden": int(vcfg["hidden_size"]),
+            "heads": int(vcfg["num_heads"]), "inter": int(vcfg["intermediate_size"]),
+            "patch": int(vcfg["patch_size"]), "merge": int(vcfg["spatial_merge_size"]),
+            "temporal": int(vcfg["temporal_patch_size"]), "in_ch": int(vcfg["in_channels"]),
+            "out_hidden": int(vcfg["out_hidden_size"]),
+            "num_pos": int(vcfg["num_position_embeddings"]),
+        }
     (out / "qwen36_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"[meta] {out / 'qwen36_meta.json'}")
 

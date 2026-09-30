@@ -71,6 +71,7 @@ typedef enum { CE_BOOL, CE_INT, CE_FLOAT, CE_STR, CE_PATH } ColiEnvType;
 #define CE_GLM53    0x40
 #define CE_QWEN38   0x80
 #define CE_DSV41    0x100
+#define CE_QWENIMAGE 0x200
 /* CE_ALL is retained for declarations shared by the original four engines.
  * New rows use explicit engine masks derived from their actual call sites. */
 #define CE_ALL      (CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE)
@@ -137,13 +138,14 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_DENSE_I8",                    CE_STR   , CE_QWEN                                         , 0             , NULL},
     {"COLI_DENSE_IDOT", CE_BOOL, CE_QWEN, 0, NULL},
     {"COLI_DENSE_INT4", CE_STR, CE_QWEN, 0, NULL},
+    {"COLI_DENSE_KEEP_I8", CE_BOOL, CE_QWEN, 0, NULL},
     {"COLI_DISKCLASS_WINDOW",            CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_DISK_WEIGHTS",                CE_STR   , CE_COLIBRI | CE_DSV4 | CE_DSV41 | CE_GLM53, 0             , NULL},
     {"COLI_DRAFT_CORPUS",                CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_DSA_GATHER",                  CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_DSV4_DLL",                    CE_STR   , CE_DSV4                                         , 0             , NULL},
-    {"COLI_ENV_DUMP",                    CE_BOOL  , CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41, 0             , NULL},
-    {"COLI_ENV_STRICT",                  CE_BOOL  , CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41, 0             , NULL},
+    {"COLI_ENV_DUMP",                    CE_BOOL  , CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE, 0             , NULL},
+    {"COLI_ENV_STRICT",                  CE_BOOL  , CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE, 0             , NULL},
     {"COLI_EXACT_VERIFY",                CE_BOOL  , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_EXPERT_STORE",                CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"COLI_GEMM_CHUNK",                  CE_STR   , CE_ALL                                          , 0             , NULL},
@@ -151,6 +153,9 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_GPUS",                        CE_STR   , CE_COLIBRI | CE_QWEN | CE_QWEN38, 0             , NULL},
     {"COLI_GPU_FAIL_AFTER",              CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_GROUP_ASYNC",                 CE_INT   , CE_COLIBRI                                      , 0             , NULL},
+    {"COLI_IMG_ACT8", CE_BOOL, CE_QWENIMAGE, 0, NULL},
+    {"COLI_IMG_BITS", CE_INT, CE_QWENIMAGE, 0, NULL},
+    {"COLI_IMG_TE", CE_STR, CE_QWENIMAGE, 0, NULL},
     {"COLI_K3_CKPT",                     CE_STR   , CE_KIMI                                         , 0             , NULL},
     {"COLI_K3_CKPT_DIR",                 CE_STR   , CE_KIMI                                         , 0             , NULL},
     {"COLI_KEEP_F32",                    CE_STR   , CE_QWEN                                         , 0             , NULL},
@@ -402,8 +407,14 @@ static const ColiEnvVar coli_env_table[] = {
     {"Q38_TRUNK_SELFTEST", CE_BOOL, CE_QWEN38, 0, NULL},
     {"Q38_TRUNK_SKIP", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_VISION",                       CE_BOOL  , CE_QWEN38                                       , 0             , NULL},
+    {"QIV_PROFILE", CE_STR, CE_QWENIMAGE, 0, NULL},
     {"QT_NO_WARMSTART",                  CE_STR   , CE_QWEN                                         , 0             , NULL},
     {"QT_UPLOAD_SYNC", CE_BOOL, CE_QWEN | CE_QWEN38, 0, NULL},
+    {"QWEN36_QPACK", CE_PATH, CE_QWEN, 0, NULL},
+    {"QWEN36_QPACK_SLOTS", CE_INT, CE_QWEN, 0, NULL},
+    {"QWENIMAGE_ORACLE_TAG", CE_STR, CE_QWENIMAGE, 0, NULL},
+    {"QWENIMAGE_PRINT_TOKENS", CE_STR, CE_QWENIMAGE, 0, NULL},
+    {"QWENIMAGE_PROF", CE_STR, CE_QWENIMAGE, 0, NULL},
     {"QWEN_DENSE_BATCH",                 CE_STR   , CE_QWEN                                         , 0             , NULL},
     {"QWEN_EXPERT_ACT", CE_STR, CE_QWEN, 0, NULL},
     {"QWEN_EXPERT_KERNEL", CE_BOOL, CE_QWEN, 0, NULL},
@@ -543,7 +554,7 @@ static const char *coli_env_suggest(const char *name) {
 static int coli_env_is_ours(const char *n) {
     static const char *const prefixes[] = {
         "COLI_", "COLIBRI_", "K3_", "KIMI_", "INK_", "GLM53_",
-        "Q38_", "Q36_", "QWEN_", "DSV4_", "V4_", "V41_"
+        "Q38_", "Q36_", "QWEN_", "QWEN36_", "QWENIMAGE_", "QIV_", "DSV4_", "V4_", "V41_"
     };
     for (unsigned i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); ++i)
         if (!strncmp(n, prefixes[i], strlen(prefixes[i]))) return 1;
@@ -581,13 +592,14 @@ static int coli_env_check(unsigned short self, const char *name) {
             continue;
         }
         if (!(v->engines & self)) {
-            fprintf(stderr, "[env] %s is not read by %s (it belongs to %s%s%s%s%s%s%s%s%s) -- it will have no effect\n",
+            fprintf(stderr, "[env] %s is not read by %s (it belongs to %s%s%s%s%s%s%s%s%s%s) -- it will have no effect\n",
                     key, name,
                     (v->engines & CE_COLIBRI) ? "colibri " : "", (v->engines & CE_KIMI) ? "kimi_k3 " : "",
                     (v->engines & CE_INKLING) ? "inkling " : "", (v->engines & CE_OLMOE) ? "olmoe " : "",
                     (v->engines & CE_DSV4) ? "deepseek-v4 " : "", (v->engines & CE_QWEN) ? "qwen36 " : "",
                     (v->engines & CE_GLM53) ? "glm53 " : "", (v->engines & CE_QWEN38) ? "qwen38 " : "",
-                    (v->engines & CE_DSV41) ? "deepseek-v41" : "");
+                    (v->engines & CE_DSV41) ? "deepseek-v41 " : "",
+                    (v->engines & CE_QWENIMAGE) ? "qwenimage" : "");
             bad++;
             continue;
         }

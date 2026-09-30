@@ -187,6 +187,8 @@ def model_banner_line(model):
                f"MoE experts streamed from disk · CPU")
     if not model:
         return generic
+    if is_image_model(model):
+        return image_banner_line(model) or generic
     try:
         with open(os.path.join(model, "config.json"), encoding="utf-8") as f:
             cfg = json.load(f)
@@ -237,6 +239,38 @@ def model_banner_line(model):
             bits.append(f"{size/1e6:.0f} MB on disk")
     except OSError:
         pass
+    return " · ".join(bits)
+
+def is_image_model(model):
+    """A diffusers pipeline (model_index.json, no root config.json): the image
+    REPL, the image planner and the images endpoint instead of chat."""
+    try:
+        from image_engine import is_image_model_dir
+    except ImportError:
+        return False
+    try:
+        return is_image_model_dir(model)
+    except (OSError, TypeError):
+        return False
+
+def image_banner_line(model):
+    """Banner line of an image model: name, what it does, bytes on disk. Sizes
+    come from stat() alone; the banner must never parse a header."""
+    try:
+        name = resolve_model(model).descriptor.display_name
+    except (FamilyConfigError, UnknownFamilyError, OSError):
+        return None
+    size = 0
+    for part in ("text_encoder", "transformer", "vae"):
+        folder = os.path.join(model, part)
+        try:
+            size += sum(os.path.getsize(os.path.join(folder, x)) for x in os.listdir(folder)
+                        if x.endswith(".safetensors"))
+        except OSError:
+            pass
+    bits = [name, "text-to-image"]
+    if size >= 1e9: bits.append(f"{size/1e9:.1f} GB on disk")
+    elif size: bits.append(f"{size/1e6:.0f} MB on disk")
     return " · ".join(bits)
 
 def banner(sub="", *, model=None):
@@ -374,10 +408,16 @@ def require_model(model, file="tokenizer.json", engine=None, target="", build="c
 def need_model(model, engine=None):
     # Directory/file checks come FIRST: resolving the family reads config.json,
     # and a missing model dir must say "model not found", not "unsupported model".
-    require_model(model, file="tokenizer.json")
+    # An image pipeline keeps its tokenizer in processor/, not at the root.
+    require_model(model, file=None)
+    tokenizer = "tokenizer.json"
+    if is_image_model(model):
+        try: tokenizer = resolve_model(model).descriptor.tokenizer_file
+        except (FamilyConfigError, UnknownFamilyError): pass   # engine_for says why, below
+    require_model(model, file=tokenizer)
     engine = engine or engine_for(model)
     target = resolve_model(model).descriptor.build_target
-    require_model(model, file="tokenizer.json", engine=engine, target=target,
+    require_model(model, file=tokenizer, engine=engine, target=target,
                   build=f"make -C c {target}")
 
 # One-shot runs keep the historic 1024. Interactive sessions get 16384, because
@@ -442,6 +482,9 @@ def env_for_engine(a, arch, plan=None):
     env.pop(_PROFILE_CAP_ENV,None)
     env.pop(_PLAN_CAP_ENV,None)
     family=family_by_id(arch)
+    if family.modality == "image" and getattr(a, "ctx", None):
+        sys.exit(f"{C.yel}--ctx does not apply to {family.display_name}:{C.r} an image model has "
+                 f"no context window (the prompt goes through its text encoder once)")
     if getattr(a,"ram",0): explicit_env.add("RAM_GB")
     # OMP_NUM_THREADS for the sister engines that do not size their own team.
     #
@@ -570,7 +613,12 @@ def env_for_engine(a, arch, plan=None):
             sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
         env["COLI_CUDA"] = "1"
         env["CUDA_EXPERT_GB"] = str(vram)
-    if getattr(a, "auto_tier", False):
+    if getattr(a, "auto_tier", False) and family.modality == "image":
+        # The tier plan places experts and KV state; an image model has
+        # neither, and build_plan would stop on "no safetensors shards".
+        print(f"  {C.dim}[PLAN] --auto-tier has nothing to place for "
+              f"{family.display_name}; coli plan shows its RAM{C.r}", file=sys.stderr)
+    elif getattr(a, "auto_tier", False):
         # GLM has historically applied both the resource plan and its measured
         # profile inside env_for().  The sibling launcher returned above that
         # code path, so #1196 could measure and save a perfectly valid Kimi,
@@ -1189,6 +1237,9 @@ def cmd_info(a):
             sys.exit(f"{C.yel}unsupported model:{C.r} {error}")
         family=None
     def row(k,v): print(f"   {C.gray}{k:<10}{C.r} {v}")
+    if family is not None and family.modality == "image":
+        info_image_model(a, family, row)
+        return
     if os.path.exists(cfgp):
         c=json.load(open(cfgp))
         # Multimodal wrappers such as Qwen3.8 keep the language architecture
@@ -1199,7 +1250,9 @@ def cmd_info(a):
         experts=arch_c.get("n_routed_experts",arch_c.get("num_experts"))
         row("model", a.model)
         row("arch", f"hidden {arch_c.get('hidden_size')} · {arch_c.get('num_hidden_layers')} layer · "
-                    f"{experts} expert/layer · top-{arch_c.get('num_experts_per_tok')}")
+                    + (f"{experts} expert/layer · top-{arch_c.get('num_experts_per_tok')}"
+                       if experts is not None else
+                       f"dense (MLP {arch_c.get('intermediate_size')}, no experts)"))
         sts=[x for x in os.listdir(a.model) if x.endswith('.safetensors')]
         sz=sum(os.path.getsize(os.path.join(a.model,x)) for x in sts)
         row("shards", f"{len(sts)} files · {sz/1e9:.0f} GB on disk")
@@ -1236,10 +1289,78 @@ def cmd_info(a):
     if knobs: row("tuning", " · ".join(knobs))
     print()
 
+def info_image_model(a, family, row):
+    """`coli info` for a text-to-image pipeline: its parts and their weight on
+    disk, what it produces and where it goes, instead of layers and experts."""
+    from image_engine import inspect_image_model, image_dir, TOKENIZER_FILE
+    try:
+        inv = inspect_image_model(a.model)
+    except (OSError, ValueError) as error:
+        sys.exit(f"{C.yel}cannot read the image model:{C.r} {error}")
+    comps = inv["components"]
+    row("model", a.model)
+    row("type", f"{family.display_name} · text-to-image · diffusers {inv['class']}")
+    labels = (("text_encoder", "text enc."), ("transformer", "DiT"), ("vae", "VAE"))
+    for key, label in labels:
+        comp = comps[key]
+        if not comp["present"]:
+            row(label, f"{C.yel}missing: {key}/ is not in the model directory{C.r}"); continue
+        dtypes = "/".join(d.lower() for d in comp["dtypes"]) or "no weights"
+        extra = ""
+        if key == "text_encoder" and comp.get("unloaded_params"):
+            used = (comp["params"] - comp["unloaded_params"]) / 1e9
+            extra = f" · {used:.1f}B used for prompts (vision tower and lm_head stay on disk)"
+        row(label, f"{comp['class'] or key} · {comp['disk_bytes']/1e9:.1f} GB {dtypes} · "
+                   f"{comp['params']/1e9:.2f}B params{extra}")
+    row("tokenizer", f"{TOKENIZER_FILE} " + ("✓" if inv["tokenizer"] else f"{C.yel}missing{C.r}"))
+    row("scheduler", comps["scheduler"]["class"] or ("present" if comps["scheduler"]["present"] else "missing"))
+    row("on disk", f"{inv['disk_bytes']/1e9:.1f} GB")
+    row("output", f"PNG (RGBA) · saved to {image_dir()} (COLI_IMAGE_DIR)")
+    row("use", "coli chat (TUI, shows the image) · coli run \"prompt\" --out x.png · "
+               "coli serve (POST /v1/images/generations)")
+    if inv["research_license"]:
+        row("license", "Qwen Research License: non-commercial; never redistribute the weights")
+    try:
+        mi=open('/proc/meminfo').read()
+        tot=int(re.search(r'MemTotal:\s+(\d+)',mi).group(1))/1e6
+        av=int(re.search(r'MemAvailable:\s+(\d+)',mi).group(1))/1e6
+        row("RAM", f"{tot:.0f} GB total · {av:.1f} GB available · coli plan sizes the model")
+    except Exception: pass
+    try:
+        row("disk", f"{shutil.disk_usage(a.model).free/1e9:.0f} GB free")
+    except OSError:
+        row("disk", "? GB (unavailable)")
+    engine=engine_for(a.model)
+    row("engine", "ready ✓" if os.path.exists(engine)
+        else f"not built (make -C c {family.build_target})")
+    print()
+
+def plan_image_command(a):
+    """`coli plan` for an image model: weights per component, two schedules."""
+    from image_engine import plan_image_model, format_image_plan
+    from resource_plan import memory_available
+    if getattr(a, "ctx", 0):
+        sys.exit(f"{C.yel}--ctx does not apply to an image model{C.r}")
+    try:
+        disk = shutil.disk_usage(a.model).free
+    except OSError:
+        disk = None
+    try:
+        plan = plan_image_model(a.model, memory_available() or None, disk)
+    except (OSError, ValueError) as error:
+        sys.exit(f"{C.yel}cannot create resource plan:{C.r} {error}")
+    if a.json:
+        print(json.dumps(plan, indent=2)); return
+    banner("plan · RAM for text encoder, DiT and VAE", model=a.model)
+    print(textwrap.indent(format_image_plan(plan), "  "))
+    print()
+
 def cmd_plan(a):
     from resource_plan import build_plan, format_plan
     if not a.model:
         sys.exit(f"{C.yel}no model directory given.{C.r}\n  {NO_MODEL_HINT}")
+    if is_image_model(a.model):
+        return plan_image_command(a)
     try:
         ram,ctx,devices,vram=resource_request(a,os.environ)
         if ctx<1: raise ValueError("--ctx must be positive")
@@ -1284,6 +1405,11 @@ def cmd_doctor(a):
     except (FamilyConfigError,UnknownFamilyError) as error:
         engine=GLM
         engine_error=error
+    if is_image_model(a.model) and engine_error is None:
+        from doctor import run_image_doctor
+        report=run_image_doctor(a.model, engine)
+        print(json.dumps(report,indent=2) if a.json else format_doctor(report))
+        return exit_code(report)
     report=run_doctor(
         # engine_path was hardcoded to GLM, so `coli doctor` inspected colibri
         # no matter which model it was pointed at: a built kimi_k3/inkling was
@@ -1323,6 +1449,9 @@ def cmd_tune(a):
     # family it then mis-dispatched.
     family=resolve_model(a.model).descriptor
     arch=family.id
+    if family.modality=="image":
+        sys.exit(f"{C.yel}coli tune measures text engines;{C.r} {family.display_name} has no "
+                 f"expert cache or decode loop to tune")
     if not family.has_gateway_adapter:
         sys.exit(f"{family.display_name}: gateway adapter is not wired")
     engine=engine_for(a.model)
@@ -1386,6 +1515,8 @@ def cmd_run(a):
     need_model(a.model,engine)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
     banner("run", model=a.model)
+    if family.modality=="image":
+        return run_image(a, family, engine, prompt)
     if not family.has_cli_adapter:
         sys.exit(f"{C.yel}coli run is not wired for {family.display_name};{C.r} "
                  f"use coli chat or coli serve")
@@ -1523,19 +1654,28 @@ def chat_command(message):
     head, _, rest = message[1:].partition(" ")
     return head.strip().lower(), rest.strip()
 
-def chat_commands_help():
+def chat_commands_help(commands=None):
+    commands = CHAT_COMMANDS if commands is None else commands
     print(f"  {C.dim}commands:{C.r}")
-    for name, what in CHAT_COMMANDS.items():
+    for name, what in commands.items():
         print(f"    {C.teal}/{name}{C.r} {C.dim}{what}{C.r}")
     print()
 
-def install_chat_completer():
-    """TAB completa i comandi. Senza readline (Windows) si perde solo il TAB."""
+def install_chat_completer(commands=None, arguments=None):
+    """TAB completa i comandi. Senza readline (Windows) si perde solo il TAB.
+    `arguments` maps a command to the values TAB offers after it (/size 1024x576)."""
     if readline is None:
         return
-    names = [p + n for n in CHAT_COMMANDS for p in ("/", ":")]
+    commands = CHAT_COMMANDS if commands is None else commands
+    arguments = arguments or {}
+    names = [p + n for n in commands for p in ("/", ":")]
     def complete(text, state):
-        hits = [n + " " for n in names if n.startswith(text)]
+        head = readline.get_line_buffer().lstrip()
+        name, _, rest = head[1:].partition(" ") if head[:1] in "/:" else ("", "", "")
+        if _ and name.lower() in arguments:
+            hits = [v + " " for v in arguments[name.lower()] if v.startswith(text)]
+        else:
+            hits = [n + " " for n in names if n.startswith(text)]
         return hits[state] if state < len(hits) else None
     readline.set_completer_delims(" \t\n")
     readline.parse_and_bind("set show-all-if-ambiguous on")   # un TAB solo li mostra tutti
@@ -1856,6 +1996,518 @@ def image_data_uri(path):
         return f"data:{mime};base64," + base64.b64encode(handle.read()).decode("ascii")
 
 
+# ---- image models: the REPL, coli run, and the two ways to reach an engine ----
+#
+# The same loop serves a private engine (coli starts qwenimage itself and
+# speaks its line protocol) and a running `coli serve` (POST
+# /v1/images/generations, streamed): the two backends below return the same
+# thing, so drawing, saving and the commands exist once.
+IMAGE_CHAT_COMMANDS = {
+    "size":   "WxH       image size; /size alone lists the presets (TAB completes them)",
+    "steps":  "N         denoising steps (more is slower and usually cleaner)",
+    "seed":   "N|random  fix the seed to reproduce an image, or a new one each time",
+    "render": "MODE      how images are drawn: kitty | iterm | sixel | blocks | none",
+    "save":   "[PATH]    a copy of the last image: a folder, or a file name (.png is added)",
+    "help":   "          this list",
+    "quit":   "          leave (also :q)",
+}
+
+class LocalImageBackend:
+    """coli owns the engine: spawned here, closed when the REPL ends."""
+    mode = "local engine"
+
+    def __init__(self, a, model, engine):
+        from image_engine import ImageEngine
+        self.log = []
+        def keep(line):
+            self.log.append(line)
+            del self.log[:-40]
+        # stderr is read by a thread from the first byte (see ImageEngine): the
+        # load log would otherwise interleave with the spinner. On Windows the
+        # engine keeps the console's stderr, as the text chat does, because two
+        # child pipes read at once can deadlock CPython's I/O there.
+        sink = keep if sys.platform != "win32" else None
+        self.engine = ImageEngine(engine, model, env=env_for_engine(a, "qwen_image"),
+                                  on_stderr=sink, on_log=keep)
+        self.info = self.engine.info
+
+    def generate(self, prompt, width, height, steps, seed, want_preview, on_progress,
+                 on_preview, on_interrupt):
+        from image_engine import encode_png
+        def preview(meta, pixels):
+            on_preview(meta.get("width"), meta.get("height"), meta.get("channels", 3), pixels)
+        result = self.engine.generate(prompt, width, height, steps, seed, preview=want_preview,
+                                      on_progress=on_progress, on_preview=preview,
+                                      interruptible=True, on_interrupt=on_interrupt)
+        result["png"] = encode_png(result["width"], result["height"], result["rgba"], 4)
+        return result
+
+    @property
+    def alive(self):
+        return self.engine.alive
+
+    def close(self):
+        self.engine.close()
+
+class RemoteImageBackend:
+    """A running `coli serve` with an image model, over its streamed endpoint."""
+    mode = "attached"
+
+    def __init__(self, base, model_id, api_key, info):
+        from image_engine import DEFAULT_INFO
+        self.base, self.model_id, self.api_key = base.rstrip("/"), model_id, api_key
+        self.info = dict(DEFAULT_INFO)
+        self.info.update({k: v for k, v in (info or {}).items() if v is not None})
+        self.alive = True
+
+    def generate(self, prompt, width, height, steps, seed, want_preview, on_progress,
+                 on_preview, on_interrupt):
+        import base64, urllib.request, urllib.error
+        from image_engine import ImageCancelled, ImageEngineError, decode_png
+        body = {"model": self.model_id, "prompt": prompt, "size": f"{width}x{height}",
+                "steps": steps, "seed": seed, "n": 1, "response_format": "b64_json",
+                "stream": True}
+        if not want_preview:
+            body["partial_images"] = 0
+        req = urllib.request.Request(self.base + "/v1/images/generations",
+                                     data=json.dumps(body).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"})
+        if self.api_key: req.add_header("Authorization", f"Bearer {self.api_key}")
+        completed = None
+        try:
+            with urllib.request.urlopen(req) as response:
+                name, data = None, []
+                for raw in response:
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                    if line.startswith(":"):
+                        continue                       # keepalive comment
+                    if line.startswith("event:"):
+                        name = line[6:].strip(); continue
+                    if line.startswith("data:"):
+                        data.append(line[5:].lstrip()); continue
+                    if line or not data:
+                        continue
+                    payload = "\n".join(data); data = []
+                    if payload == "[DONE]":
+                        break
+                    try: event = json.loads(payload)
+                    except ValueError: continue
+                    if name == "image_generation.progress":
+                        on_progress(event)
+                    elif name == "image_generation.partial_image":
+                        try:
+                            w, h, ch, pixels = decode_png(base64.b64decode(event["b64_json"]))
+                            on_preview(w, h, ch, pixels)
+                        except (KeyError, ValueError):
+                            pass
+                    elif name == "image_generation.completed":
+                        completed = event
+                    elif name == "error":
+                        error = event.get("error") or {}
+                        if error.get("type") == "cancelled" or error.get("message") == "cancelled":
+                            raise ImageCancelled()
+                        raise ImageEngineError(error.get("message")
+                                               or "the server reported an error")
+                    name = None
+        except KeyboardInterrupt:
+            # Closing the connection IS the cancel: the gateway notices the
+            # hang-up between frames and sends CANCEL to its engine.
+            raise ImageCancelled() from None
+        except urllib.error.HTTPError as error:
+            try:
+                detail = json.loads(error.read().decode("utf-8", "replace")).get("error", {}).get("message", "")
+            except Exception:
+                detail = ""
+            raise ImageEngineError(f"the server refused: HTTP {error.code}"
+                                   + (f" · {detail}" if detail else "")) from None
+        except OSError as error:
+            self.alive = False
+            raise ImageEngineError(f"server unreachable: {error}") from None
+        if not completed or not completed.get("data"):
+            raise ImageEngineError("the stream ended without an image")
+        png = base64.b64decode(completed["data"][0]["b64_json"])
+        width_out, height_out, channels, pixels = decode_png(png)
+        meta = completed.get("colibri") or {}
+        return {"width": width_out, "height": height_out, "channels": channels, "rgba": pixels,
+                "png": png, "seed": meta.get("seed", seed), "steps": meta.get("steps", steps),
+                "timings": meta.get("timings") or {}}
+
+    def close(self):
+        pass
+
+class ImageProgress:
+    """The live line under a generation, and the preview above it.
+
+        [preview, redrawn in place as half blocks when the engine sends one]
+        ⠹ denoising 3/8 · 41s · seed 1234
+
+    One lock serialises the spinner thread and the frames arriving from the
+    engine, so an escape sequence is never cut in half by the other writer."""
+    FRAMES = Spinner.FRAMES
+    STAGES = {"encode": "encoding the prompt", "denoise": "denoising", "decode": "decoding"}
+
+    def __init__(self, stream, seed, steps, previews=True, protocol="blocks"):
+        self.out = stream
+        # With sixel the preview is drawn as a picture, smoothly enlarged, in an
+        # area reserved once: the cursor is saved at its top (DECSC) and every
+        # step is drawn over the last one from there. kitty and iTerm2 place
+        # images by their own rules, so they keep the half blocks for previews
+        # (the finished picture is full resolution in every graphics protocol).
+        self.protocol = protocol
+        self.area = 0
+        self.live = bool(stream) and (stream.isatty() or os.environ.get("COLI_COLOR") == "1")
+        self.previews = previews and self.live
+        self.seed, self.steps = seed, steps
+        self.stage, self.step, self.note = "starting", 0, ""
+        self.rows = 0
+        self.t0 = time.time()
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.tick = 0
+
+    def _status(self):
+        stage = self.STAGES.get(self.stage, self.stage)
+        count = f" {self.step}/{self.steps}" if self.stage == "denoise" else ""
+        note = f" · {C.yel}{self.note}{C.r}" if self.note else ""
+        frame = self.FRAMES[self.tick % len(self.FRAMES)]
+        return (f"\r  {C.teal}{frame}{C.r} {C.dim}{stage}{count} · {time.time()-self.t0:.0f}s · "
+                f"seed {self.seed}{C.r}{note}\033[K")
+
+    def _draw(self):
+        if self.live:
+            self.out.write(self._status()); self.out.flush()
+
+    def start(self):
+        if not self.live:
+            return
+        def spin():
+            while not self.stop_event.wait(0.12):
+                with self.lock:
+                    self.tick += 1
+                    self._draw()
+        with self.lock:
+            self._draw()
+        self.thread = threading.Thread(target=spin, daemon=True)
+        self.thread.start()
+
+    def progress(self, frame):
+        with self.lock:
+            self.stage = frame.get("stage") or self.stage
+            step = frame.get("step")
+            if isinstance(step, int): self.step = step
+            steps = frame.get("steps")
+            if isinstance(steps, int) and steps > 0: self.steps = steps
+            self._draw()
+
+    def preview(self, width, height, channels, pixels):
+        if not self.previews or not width or not height:
+            return
+        import term_image
+        if self.protocol == "sixel":
+            self._preview_sixel(term_image, width, height, channels, pixels)
+            return
+        try:
+            text = term_image.render_blocks(pixels, width, height, channels,
+                                            max_columns=min(64, term_w() - 6), max_rows=16,
+                                            colour24=term_image.truecolor())
+        except (ValueError, IndexError):
+            return
+        with self.lock:
+            self.out.write(f"\r\033[{self.rows}A" if self.rows else "\r\033[K")
+            self.out.write(text)
+            self.rows = text.count("\n")
+            self._draw()
+
+    def _preview_sixel(self, term_image, width, height, channels, pixels):
+        columns, rows, cell_w, cell_h = term_image.terminal_geometry(self.out)
+        w_px = max(64, min(512, (columns - 6) * cell_w))
+        h_px = round(height * w_px / width)
+        cap = max(4, min(18, rows - 8)) * cell_h
+        if h_px > cap:
+            h_px, w_px = cap, max(64, round(width * cap / height))
+        try:
+            big = term_image.upscale_smooth(pixels, width, height, channels, w_px, h_px)
+            text = term_image.render_sixel(big, w_px, h_px, channels, w_px, h_px, "  ")
+        except (ValueError, IndexError):
+            return
+        # rows the picture covers, with a margin for a terminal whose real cells
+        # are smaller than the ones it reported (or than the 8x16 guess)
+        lines = -(-h_px // max(8, cell_h - 2)) + 1
+        with self.lock:
+            if not self.area:
+                # reserve the lines now, so the terminal scrolls here and never
+                # under a saved cursor
+                self.out.write("\r\033[K" + "\n" * lines + f"\033[{lines}A\r\0337")
+                self.area = lines
+            self.out.write("\0338" + text)
+            self.out.write(f"\0338\033[{self.area}B")
+            self._draw()
+
+    def interrupted(self):
+        with self.lock:
+            self.note = "stopping… (Ctrl-C again to quit)"
+            self._draw()
+
+    def stop(self):
+        if self.stop_event.is_set():
+            return
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=0.5)
+        if self.live:
+            with self.lock:
+                self.out.write("\r\033[K")
+                if self.area:
+                    self.out.write("\0338\033[J")          # the preview area, image and all
+                elif self.rows:
+                    self.out.write(f"\033[{self.rows}A\r\033[J")
+                self.out.flush()
+            self.rows = 0
+            self.area = 0
+
+def image_settings(a, info):
+    """Size, steps and seed for the first image: the flags when given, the
+    engine's defaults otherwise. Exits with the engine's rule on a bad flag."""
+    from image_engine import parse_size, check_size, check_steps, check_seed, ImageRequestError
+    width, height = info["default_width"], info["default_height"]
+    if getattr(a, "size", None):
+        try: width, height = parse_size(a.size)
+        except ImageRequestError as error: sys.exit(f"{C.yel}--size: {error}{C.r}")
+        problem = check_size(width, height, info)
+        if problem: sys.exit(f"{C.yel}--size: {problem}{C.r}")
+    steps = getattr(a, "steps", None) or info["default_steps"]
+    problem = check_steps(steps)
+    if problem: sys.exit(f"{C.yel}--steps: {problem}{C.r}")
+    seed = getattr(a, "seed", None)
+    if seed is not None:
+        problem = check_seed(seed)
+        if problem: sys.exit(f"{C.yel}--seed: {problem}{C.r}")
+    return {"width": width, "height": height, "steps": steps, "seed": seed}
+
+def generate_image(backend, prompt, settings, protocol, out=None, stream=None, last=None):
+    """One image: progress, the picture drawn in the terminal, the PNG on disk.
+    Returns the saved path, or None when it was cancelled or failed (said).
+    `last`, when given, is filled with the PNG and where it went, for /save."""
+    import term_image
+    from image_engine import (ImageCancelled, ImageEngineError, random_seed, save_png,
+                              image_dir)
+    stream = stream or sys.stdout
+    seed = settings["seed"] if settings["seed"] is not None else random_seed()
+    previews = protocol != "none" and os.environ.get("COLI_IMAGE_PREVIEW", "1") != "0"
+    progress = ImageProgress(stream, seed, settings["steps"], previews, protocol)
+    progress.start()
+    t0 = time.time()
+    try:
+        result = backend.generate(prompt, settings["width"], settings["height"],
+                                  settings["steps"], seed, previews, progress.progress,
+                                  progress.preview, progress.interrupted)
+    except ImageCancelled:
+        progress.stop()
+        print(f"  {C.yel}■ cancelled{C.r}\n", file=stream)
+        return None
+    except ImageEngineError as error:
+        progress.stop()
+        print(f"  {C.yel}✗ {error}{C.r}\n", file=stream)
+        return None
+    finally:
+        progress.stop()
+    elapsed = time.time() - t0
+    try:
+        if out:
+            os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+            with open(out, "wb") as handle: handle.write(result["png"])
+            path = out
+        else:
+            path = save_png(result["png"], prompt, result["seed"], image_dir())
+    except OSError as error:
+        print(f"  {C.yel}✗ cannot save the image: {error}{C.r}", file=stream)
+        path = None
+    if protocol != "none":
+        try:
+            stream.write(term_image.render(result["rgba"], result["width"], result["height"],
+                                           result.get("channels", 4), protocol,
+                                           png=result["png"], stream=stream))
+            stream.flush()
+        except (OSError, ValueError) as error:
+            print(f"  {C.yel}(cannot draw the image here: {error}){C.r}", file=stream)
+    timings = result.get("timings") or {}
+    parts = " · ".join(f"{k} {v:.1f}s" for k, v in timings.items()
+                       if isinstance(v, (int, float)))
+    print(f"  {C.dgray}└─ {result['width']}x{result['height']} · seed {result['seed']} · "
+          f"{result['steps']} steps · {elapsed:.0f}s{(' (' + parts + ')') if parts else ''}{C.r}",
+          file=stream)
+    if last is not None:
+        last.update(png=result["png"], path=path, prompt=prompt, seed=result["seed"])
+    if path:
+        print(f"  {C.grn}✓{C.r} saved {path}\n", file=stream)
+    return path
+
+
+def save_last_image(last, where):
+    """/save: the last image, where the user says. A folder keeps the automatic
+    name, a name gets .png when it has no extension, a Windows path pasted into
+    WSL is translated like an attachment's, and an existing file is never
+    overwritten: the images folder already holds every picture, so /save only
+    ever adds a copy. Returns (path, None) or (None, why)."""
+    if not last.get("png"):
+        return None, "no image yet: describe one first"
+    if not where:
+        return (last["path"], None) if last.get("path") else (None, "give a path: /save PATH")
+    target = to_local_path(where)
+    if os.path.isdir(target):
+        name = os.path.basename(last["path"]) if last.get("path") else f"colibri-s{last['seed']}.png"
+        target = os.path.join(target, name)
+    elif not os.path.splitext(target)[1]:
+        target += ".png"
+    if os.path.exists(target):
+        return None, f"{target} already exists: choose another name"
+    folder = os.path.dirname(os.path.abspath(target))
+    if not os.path.isdir(folder):
+        return None, f"no such folder: {folder}"
+    try:
+        with open(target, "xb") as handle:
+            handle.write(last["png"])
+    except OSError as error:
+        return None, f"cannot write {target}: {error}"
+    return target, None
+
+def image_repl(a, backend, model_id):
+    """coli chat for an image model: every line is a prompt, every answer a picture."""
+    import term_image
+    from image_engine import (parse_size, check_size, nearest_size, check_steps, check_seed,
+                              ImageRequestError, image_dir, SIZE_PRESETS)
+    info = backend.info
+    settings = image_settings(a, info)
+    protocol, why = term_image.detect(query=TTY and sys.stdin.isatty())
+    print(f"  {C.grn}✦ {model_id}{C.r} {C.dim}· {backend.mode} · images are saved to "
+          f"{image_dir()}{C.r}")
+    print(f"  {C.dim}describe an image and press Enter · Ctrl-C stops it · /size /steps /seed · "
+          f"/save · /help · :q exits{C.r}")
+    print(f"  {C.dim}{settings['width']}x{settings['height']} · {settings['steps']} steps · seed "
+          f"{settings['seed'] if settings['seed'] is not None else 'random'} · drawn with "
+          f"{protocol} ({why}){C.r}\n")
+    presets = ["x".join(map(str, preset)) for preset in SIZE_PRESETS]
+    install_chat_completer(IMAGE_CHAT_COMMANDS,
+                           {"size": presets, "seed": ["random"],
+                            "render": list(term_image.PROTOCOLS)})
+    w = term_w() - 4
+    last = {}                                  # the last image, for /save
+    while True:
+        if TTY:
+            print(f"  {C.dgray}╭{'─'*w}╮{C.r}")
+            try: msg = read_prompt(f"  {C.dgray}│{C.r} {C.teal}{C.b}›{C.r} ")
+            except EOFError: print(); break
+            except KeyboardInterrupt: print(); break
+            try: msg = redraw_prompt_box(msg, w)
+            except Exception: print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
+        else:
+            try: msg = input()
+            except EOFError: break
+        msg = msg.strip("\r\n")
+        if msg in (":q", "/q", "exit"): break
+        if not msg.strip(): continue
+        name, rest = chat_command(msg)
+        if name is not None and name not in IMAGE_CHAT_COMMANDS:
+            print(f"  {C.yel}  unknown command: {msg.split()[0]}{C.r}")
+            chat_commands_help(IMAGE_CHAT_COMMANDS); continue
+        if name == "quit": break
+        if name == "help": chat_commands_help(IMAGE_CHAT_COMMANDS); continue
+        if name == "size":
+            if not rest:
+                current = f"{settings['width']}x{settings['height']}"
+                listed = "  ".join(f"{C.b}{p}{C.r}{C.dim}" if p == current else p for p in presets)
+                print(f"  {C.dim}sizes: {listed} · now {current} · any WxH in multiples of "
+                      f"{info['multiple']} from {info['min_side']} to {info['max_side']}{C.r}\n")
+                continue
+            try:
+                width, height = parse_size(rest)
+            except ImageRequestError:
+                print(f"  {C.yel}  /size WxH, one of: {' '.join(presets)}{C.r}\n"); continue
+            problem = check_size(width, height, info)
+            if problem:
+                hint = "x".join(map(str, nearest_size(width, height, info)))
+                print(f"  {C.yel}  {problem} (closest: /size {hint}){C.r}\n"); continue
+            settings["width"], settings["height"] = width, height
+            print(f"  {C.dim}✦ size {width}x{height}{C.r}\n"); continue
+        if name == "steps":
+            try: steps = int(rest)
+            except ValueError: steps = None
+            problem = check_steps(steps)
+            if problem: print(f"  {C.yel}  {problem}{C.r}\n"); continue
+            settings["steps"] = steps
+            print(f"  {C.dim}✦ {steps} steps{C.r}\n"); continue
+        if name == "seed":
+            if rest.lower() in ("", "random", "rand", "none", "off"):
+                settings["seed"] = None
+                print(f"  {C.dim}✦ a new random seed for every image{C.r}\n"); continue
+            try: seed = int(rest)
+            except ValueError: seed = None
+            problem = check_seed(seed)
+            if problem: print(f"  {C.yel}  {problem}, or /seed random{C.r}\n"); continue
+            settings["seed"] = seed
+            print(f"  {C.dim}✦ seed {seed}: the same prompt now gives the same image{C.r}\n"); continue
+        if name == "save":
+            path, why = save_last_image(last, rest.strip())
+            if why: print(f"  {C.yel}  {why}{C.r}\n")
+            elif rest.strip(): print(f"  {C.grn}✓{C.r} saved {path}\n")
+            else: print(f"  {C.dim}✦ the last image is at {path} (/save PATH for a copy elsewhere){C.r}\n")
+            continue
+        if name == "render":
+            choice = rest.strip().lower()
+            if choice not in term_image.PROTOCOLS:
+                print(f"  {C.yel}  /render {' | '.join(term_image.PROTOCOLS)}{C.r}\n"); continue
+            protocol = choice
+            print(f"  {C.dim}✦ images drawn with {protocol}{C.r}\n"); continue
+        print(f"\n  {C.teal}◆ colibri{C.r}")
+        generate_image(backend, msg, settings, protocol, last=last)
+        if not backend.alive:
+            print(f"  {C.yel}the engine is gone; start coli chat again{C.r}"); break
+
+def start_local_image_backend(a, family, engine):
+    """Spawn the engine with a spinner; the load reads tens of GB."""
+    from image_engine import ImageEngineError
+    sp = Spinner(f"loading {family.display_name}…"); sp.start()
+    try:
+        backend = LocalImageBackend(a, a.model, engine)
+    except ImageEngineError as error:
+        sp.stop()
+        sys.exit(f"{C.yel}{error}{C.r}")
+    except KeyboardInterrupt:
+        sp.stop(); sys.exit(130)
+    sp.stop()
+    return backend
+
+def run_image(a, family, engine, prompt):
+    """coli run on an image model: one picture, written to --out (or the
+    images folder), drawn inline when stdout is a terminal."""
+    import term_image
+    backend = start_local_image_backend(a, family, engine)
+    try:
+        settings = image_settings(a, backend.info)
+        interactive = sys.stdout.isatty()
+        protocol = term_image.detect(query=interactive and sys.stdin.isatty())[0] if interactive else "none"
+        stream = sys.stdout if interactive else sys.stderr
+        path = generate_image(backend, prompt, settings, protocol, out=getattr(a, "out", None),
+                              stream=stream)
+        if path and not interactive:
+            print(path)                            # the one line a script wants
+        return 0 if path else 1
+    finally:
+        backend.close()
+
+def server_model_entry(base, api_key=None, timeout=1.5):
+    """The first /v1/models entry of a running server, or {}."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(base.rstrip("/") + "/v1/models")
+        if api_key: req.add_header("Authorization", f"Bearer {api_key}")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "replace")).get("data") or []
+        return data[0] if data and isinstance(data[0], dict) else {}
+    except Exception:
+        return {}
+
 def cmd_chat(a):
     # ATTACH: a running `coli serve` beats a private engine every time — the load
     # (34-136 s) and the cache warmth survive between sessions. Explicit --attach
@@ -1865,19 +2517,49 @@ def cmd_chat(a):
         base=getattr(a,"attach",None) or "http://127.0.0.1:8000"
         mid=server_probe(base, getattr(a,"api_key",None))
         if mid:
-            banner(f"chat · {mid} · attached")
-            chat_attached(a, base, mid); return
-        if getattr(a,"attach",None):
+            entry=server_model_entry(base, getattr(a,"api_key",None))
+            serves_images="image_generation" in (entry.get("capabilities") or [])
+            wants_images=bool(a.model) and is_image_model(a.model)
+            # A server of the other kind is not the model asked for: an image
+            # --model must not end up chatting with a text server (or the other
+            # way round) just because something listens on the port. An
+            # explicit --attach still means "that server, whatever it is".
+            if getattr(a,"attach",None) or not a.model or serves_images==wants_images:
+                if serves_images:
+                    banner(f"images · {mid} · attached")
+                    image_repl(a, RemoteImageBackend(base, mid, getattr(a,"api_key",None),
+                                                     entry.get("image")), mid)
+                    print(f"  {C.dim}goodbye: the engine keeps running for the next session{C.r}")
+                    return
+                banner(f"chat · {mid} · attached")
+                chat_attached(a, base, mid); return
+            print(f"  {C.dim}{base} serves {mid}, not an "
+                  f"{'image' if wants_images else 'text'} model: starting a private engine{C.r}")
+        elif getattr(a,"attach",None):
             sys.exit(f"--attach: no coli serve answering at {base} (start one with: coli serve --model <dir>)")
     need_model(a.model)
-    family=resolve_model(a.model).descriptor
+    resolved=resolve_model(a.model); family=resolved.descriptor
     arch=family.id
     if not family.has_gateway_adapter:
         sys.exit(f"{family.display_name}: gateway adapter is not wired")
+    if family.modality=="image":
+        engine=engine_for(a.model)
+        need_model(a.model,engine)
+        banner(f"images · {family.default_model_id} · local engine", model=a.model)
+        backend=start_local_image_backend(a, family, engine)
+        try:
+            image_repl(a, backend, family.default_model_id)
+        except KeyboardInterrupt:
+            print(f"\n  {C.dim}interrupted{C.r}")
+        finally:
+            backend.close()
+        print(f"  {C.teal}goodbye{C.r} {C.dim}the hummingbird returns to its nest{C.r}\n")
+        return
     if arch!="glm":
         engine=engine_for(a.model)
         need_model(a.model,engine)
-        model_id=family.default_model_id
+        from family_registry import default_model_id
+        model_id=default_model_id(resolved)
         banner(f"chat · {model_id} · local server", model=a.model)
         import openai_server
         # --cap rides along so an explicit `coli chat --cap N` reaches the
@@ -2634,7 +3316,14 @@ def main():
                     help="minimum fractional throughput gain required to accept a candidate")
     pt.add_argument("--profile-dir",default=None,help=argparse.SUPPRESS)
     pr=sub.add_parser("run", parents=[common]);  pr.add_argument("prompt", nargs="*")
+    # Image models: what to draw and where to put it. Ignored by text models.
+    image_flags=(("--size",dict(default=None,help="image size WxH (image models; default: the engine's)")),
+                 ("--steps",dict(type=int,default=None,help="denoising steps (image models)")),
+                 ("--seed",dict(type=int,default=None,help="image seed (image models; default: random)")))
+    for flag,kw in image_flags: pr.add_argument(flag,**kw)
+    pr.add_argument("--out",default=None,help="PNG path for an image model (default: the images folder)")
     pc=sub.add_parser("chat", parents=[common])
+    for flag,kw in image_flags: pc.add_argument(flag,**kw)
     pc.add_argument("--attach", nargs="?", const="http://127.0.0.1:8000", default=None,
                     help="chat against a running `coli serve` instead of spawning an engine "
                          "(keeps the model loaded and the expert cache warm across chat sessions). "

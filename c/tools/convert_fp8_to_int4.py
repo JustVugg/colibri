@@ -56,6 +56,8 @@ OTHER_FAMILY_PATHS = {
                        "directly; see docs/qwen38.md and issue #1304",
     "qwen3_5_moe":     "Qwen3.6: use tools/convert_qwen36.py",
     "qwen3_5_moe_text":"Qwen3.6: use tools/convert_qwen36.py",
+    "qwen3_5":         "Qwen3.8-27B (dense): use tools/convert_qwen36.py, see docs/qwen36.md",
+    "qwen3_5_text":    "Qwen3.8-27B (dense): use tools/convert_qwen36.py, see docs/qwen36.md",
     "inkling_mm_model":"Inkling: use tools/convert_inkling_int4.py",
     "inkling":         "Inkling: use tools/convert_inkling_int4.py",
     "olmoe":           "OLMoE: use tools/convert_olmoe.py",
@@ -64,6 +66,8 @@ OTHER_FAMILY_PATHS = {
     "deepseek_v4":     "DeepSeek V4: see docs/deepseek-v4.md, section Download",
     "deepseek_v41":    "DeepSeek V4.1: no conversion needed -- its experts already ship fp4 and its dense fp8; run tools/prepare_dsv41.py once, see docs/deepseek-v41.md",
     "deepseek_v41_text": "DeepSeek V4.1: no conversion needed -- see docs/deepseek-v41.md",
+    "qwenimage21pipeline": "Qwen-Image-2.1 is NOT converted: the image engine reads the "
+                           "diffusers checkpoint as downloaded; see docs/qwen-image.md",
 }
 
 

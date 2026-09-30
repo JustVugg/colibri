@@ -72,11 +72,32 @@ static int i4_acc512_selftest(void){
 #endif
 
 /* ---- y[S,O] = x[S,I] @ W^T, W[O,I] f32 ---------------------------------- */
+#if defined(__FMA__) || defined(__ARM_FEATURE_FMA)
+/* Every output is one fmaf chain over i in order, so the bits are the same on
+ * any FMA target and at any vector width. The scalar `a+=x*w` form they replace
+ * had toolchain-dependent bits: gcc and Apple clang vectorize the multiply and
+ * keep the adds in order (unfused), fusing only the tail; x86 clang fuses all.
+ * Eight rows per pass give eight independent chains instead of one (#442). */
+static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
+    int O8=O&~7;
+    #pragma omp parallel for schedule(static)
+    for (int o=0;o<O8;o+=8){ const float *w0=W+(int64_t)o*I, *w1=w0+I, *w2=w1+I, *w3=w2+I, *w4=w3+I, *w5=w4+I, *w6=w5+I, *w7=w6+I;
+        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;
+            for(int i=0;i<I;i++){ float xi=xs[i];
+                a0=fmaf(xi,w0[i],a0); a1=fmaf(xi,w1[i],a1); a2=fmaf(xi,w2[i],a2); a3=fmaf(xi,w3[i],a3);
+                a4=fmaf(xi,w4[i],a4); a5=fmaf(xi,w5[i],a5); a6=fmaf(xi,w6[i],a6); a7=fmaf(xi,w7[i],a7); }
+            float *ys=y+(int64_t)s*O+o; ys[0]=a0; ys[1]=a1; ys[2]=a2; ys[3]=a3; ys[4]=a4; ys[5]=a5; ys[6]=a6; ys[7]=a7; } }
+    for (int o=O8;o<O;o++){ const float *w=W+(int64_t)o*I;
+        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; for(int i=0;i<I;i++) a=fmaf(xs[i],w[i],a); y[(int64_t)s*O+o]=a; } }
+}
+#else
+/* No hardware FMA: fmaf would be a libm call, so keep the plain loop. */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
     #pragma omp parallel for schedule(static)
     for (int o=0;o<O;o++){ const float *w=W+(int64_t)o*I;
         for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; for(int i=0;i<I;i++) a+=xs[i]*w[i]; y[(int64_t)s*O+o]=a; } }
 }
+#endif
 
 /* ---- y[S,O] = x[S,I] @ W^T, W int8 per-row + scale[O] ------------------- */
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int S, int I, int O){

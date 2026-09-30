@@ -22,6 +22,8 @@
 **Qwen3.8-Flash-Next**（125B + 51B n-gram）、**Qwen3.6**（35B-A3B）、そして
 **OLMoE**（7B）——
 それぞれが C ファイル 1 つで、同じ `coli chat` / `coli serve` / `coli web` フロントエンドを共有します。
+画像生成も可能です: **Qwen-Image-2.1** がテキストから画像を生成し、`coli chat` はそれをターミナル内に
+直接表示、`coli serve` は `POST /v1/images/generations` で提供します（[qwen-image.md](docs/qwen-image.md)）。
 [全モデル一覧 ↓](#other-supported-models)
 
 > **Colibrì は今日すぐに動かせる推論エンジンであり、同時にオープンな研究

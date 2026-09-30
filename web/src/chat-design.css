@@ -148,3 +148,69 @@ button{color:inherit}button:disabled{cursor:default;opacity:.4}svg.lucide{stroke
   .brio-add,.brio-run{flex:1 1 100%;justify-content:center}
   .brio-card textarea,.brio-card input{font-size:16px}
 }
+
+/* ---- text-to-image -------------------------------------------------------
+   An image model's turn is a picture in a frame the size of the request, with
+   the stage and a thin bar under it while it runs, then the parameters and
+   three actions. The composer trades the chat's chips for size, steps and
+   seed chips of the same shape. */
+.image-turn{display:grid;gap:10px;min-width:0;max-width:100%}
+.image-frame{position:relative;width:100%;overflow:hidden;border-radius:16px;background:var(--input)}
+.image-frame>img{position:absolute;inset:0;display:block;width:100%;height:100%;object-fit:cover}
+.image-frame.pending{border:1px solid color-mix(in srgb,var(--foreground) 8%,transparent)}
+/* A preview is a few dozen pixels of an unfinished latent: blown up, pixelated
+   and blurred it reads as "taking shape", not as a broken picture. The scale
+   hides the soft edge the blur leaves at the border. */
+.image-frame>img.image-preview{image-rendering:pixelated;filter:blur(7px) saturate(1.15);transform:scale(1.08);transition:opacity .3s}
+.image-shimmer{position:absolute;inset:0;background:linear-gradient(100deg,transparent 30%,color-mix(in srgb,var(--foreground) 7%,transparent) 50%,transparent 70%);background-size:220% 100%;animation:image-shimmer 1.8s linear infinite}
+@keyframes image-shimmer{from{background-position:130% 0}to{background-position:-130% 0}}
+.image-status{display:flex;align-items:center;gap:10px;min-width:0;font-size:12px;color:var(--muted-foreground)}
+.image-stage{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--foreground)}
+.image-clock{font-variant-numeric:tabular-nums}
+.image-cancel{display:inline-flex;align-items:center;gap:5px;flex-shrink:0;border:1px solid color-mix(in srgb,var(--foreground) 18%,transparent);border-radius:20px;background:none;color:var(--muted-foreground);font-size:11px;padding:5px 10px}
+.image-cancel svg{width:13px;height:13px}
+.image-cancel:hover{color:var(--foreground);background:var(--secondary)}
+.image-bar{height:4px;border-radius:4px;background:var(--secondary);overflow:hidden}
+.image-bar>span{display:block;height:100%;border-radius:4px;background:var(--primary);transition:width .45s ease}
+.image-bar.waiting>span{width:28%!important;animation:image-wait 1.5s ease-in-out infinite}
+@keyframes image-wait{from{transform:translateX(-110%)}to{transform:translateX(370%)}}
+.image-meta{display:flex;flex-wrap:wrap;gap:3px 14px;margin:0;font-size:11px;color:var(--muted-foreground);font-variant-numeric:tabular-nums}
+.image-meta>span[title]{text-decoration:underline dotted color-mix(in srgb,var(--foreground) 30%,transparent);text-underline-offset:3px;cursor:help}
+.image-actions{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.image-actions>span{font-size:10px;color:var(--muted-foreground)}
+.image-action{display:inline-flex;align-items:center;gap:6px;border:1px solid color-mix(in srgb,var(--foreground) 18%,transparent);border-radius:20px;background:none;color:var(--muted-foreground);font-size:11px;padding:6px 11px}
+.image-action svg{width:14px;height:14px;flex-shrink:0}
+.image-action:hover:not(:disabled){color:var(--foreground);background:var(--secondary)}
+.image-action.primary{color:var(--foreground)}
+.image-stopped{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding:11px 12px 11px 15px;border:1px dashed var(--border);border-radius:14px;font-size:12px;color:var(--muted-foreground)}
+.image-stopped>span{color:var(--foreground)}
+.image-stopped>button{margin-left:auto}
+.composer.image-mode .composer-foot{align-items:flex-end}
+.image-controls{display:flex;flex-wrap:wrap;align-items:center;gap:6px;flex:1;min-width:0}
+.image-chip{position:relative;display:inline-flex;align-items:center;gap:6px;height:31px;min-width:0;border:1px solid color-mix(in srgb,var(--foreground) 18%,transparent);border-radius:20px;padding:0 10px;font-size:11px;color:var(--muted-foreground)}
+.image-chip>svg{width:14px;height:14px;flex-shrink:0}
+.image-chip:focus-within{border-color:color-mix(in srgb,var(--foreground) 40%,transparent);color:var(--foreground)}
+.image-chip select,.image-chip input{min-width:0;padding:0;border:0;outline:none;background:none;color:var(--foreground);font:inherit;font-variant-numeric:tabular-nums}
+.image-chip input::placeholder{color:var(--muted-foreground)}
+.image-chip select{appearance:none;padding-right:15px;margin-right:-15px;cursor:pointer}
+.image-chip option,.image-chip optgroup{background:var(--card);color:var(--foreground)}
+.image-chip>.image-caret{width:12px;height:12px;pointer-events:none}
+.image-steps{width:2.6ch;text-align:right}
+.image-seed{width:10ch}
+.image-custom{gap:4px}
+.image-custom input{width:4.4ch;text-align:center}
+.image-chip.invalid,.image-custom input.invalid{border-color:color-mix(in srgb,var(--destructive,#ff766f) 60%,transparent);color:var(--destructive,#ff766f)}
+/* Where the browser can, each field is as wide as what it shows, so the size
+   chip is not stretched to fit "Custom size" while it says 768x512. */
+@supports (field-sizing:content){.image-chip select,.image-chip input{field-sizing:content;width:auto}.image-steps{min-width:1ch}.image-seed{min-width:4ch}.image-custom input{min-width:3ch}}
+.image-clear{display:grid;place-items:center;width:18px;height:18px;margin-right:-5px;padding:0;border:0;border-radius:50%;background:none;color:var(--muted-foreground)}
+.image-clear:hover{background:var(--secondary);color:var(--foreground)}
+.image-clear svg{width:11px;height:11px}
+@media(max-width:760px){
+  /* 16px keeps a phone from zooming into the field it focuses */
+  .image-chip select,.image-chip input{font-size:16px}
+  .image-chip{height:34px;padding:0 9px}
+  .image-seed{width:7.5ch}
+  .image-actions>.image-action:not(.primary)>span{display:none}
+  .image-actions>.image-action:not(.primary){padding:6px 9px}
+}

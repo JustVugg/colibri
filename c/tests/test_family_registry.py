@@ -1032,6 +1032,9 @@ class FamilyRegistryTest(unittest.TestCase):
             # V4.1 ships its chat encoding as a Python module (encoding/encoding.py),
             # not a jinja template, so the replay prompt stays the bare text like V4.
             "deepseek_v41": "hello {world}",
+            # An image model has no chat template and nothing to tune; the
+            # template is the identity and `coli tune` refuses the modality.
+            "qwen_image": "hello {world}",
         }
         self.assertEqual(
             {family.id: tuning_replay_prompt(family, prompt) for family in FAMILIES},
@@ -1563,7 +1566,9 @@ class DisplayVariantTest(unittest.TestCase):
     def test_variants_are_public(self):
         meta = public_metadata(next(f for f in FAMILIES if f.id == "qwen36"))
         self.assertEqual([v["display_name"] for v in meta["display_variants"]],
-                         ["Qwen3.6-35B-A3B", "Qwen3.8-2.4T-A95B"])
+                         ["Qwen3.6-35B-A3B", "Qwen3.8-2.4T-A95B", "Qwen3.8-27B"])
+        self.assertEqual(meta["display_variants"][2]["geometry"],
+                         {"num_hidden_layers": 64, "hidden_size": 5120, "intermediate_size": 17408})
         self.assertEqual(meta["display_variants"][1]["geometry"],
                          {"num_hidden_layers": 92, "num_experts": 512, "hidden_size": 8192})
         for family in FAMILIES:

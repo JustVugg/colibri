@@ -14,6 +14,8 @@
 **Inkling**（975B）、**Kimi K3**（2.8T）、**DeepSeek V4 Flash**（284B）、**DeepSeek V4.1 Flash**（552B，含视觉）、
 **Qwen3.8-Flash-Next**（125B + 51B n-gram）、**Qwen3.6**（35B-A3B）与 **OLMoE**（7B）
 ——各自一个 C 文件，共用同一套 `coli chat` / `coli serve` / `coli web` 前端。[完整列表](README.md#other-supported-models)
+也能生成图像：**Qwen-Image-2.1** 根据文字生成图片，`coli chat` 直接在终端中显示，
+`coli serve` 通过 `POST /v1/images/generations` 提供（[qwen-image.md](docs/qwen-image.md)）。
 
 > **Colibrì 既是今天就能运行的推理引擎，也是一个开放的研究平台**。它的首要目标是在
 > 完整的软硬件边界上追求推理侧性能——模型格式、内存层级、存储 I/O、放置、调度、内核、

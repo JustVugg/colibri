@@ -6,21 +6,22 @@ Reference for the environment variables read by the colibrì engine.
 
 ## Which program reads these?
 
-**There are eight engine binaries, and they do not share a knob set.** The main
+**There are ten engine binaries, and they do not share a knob set.** The main
 engine `c/colibri` (built from `c/colibri.c`, formerly `glm.c`) reads most of
 what follows, but the sister engines read their own:
 
 | Engine | Source | Its own variables |
 |---|---|---|
 | `colibri` | `c/colibri.c` | everything below except the three sections named for another engine |
+| `glm53` | `c/glm53.c` | the `GLM53_*` family and `COLI_MAP_EXPERTS`: see [GLM-5.3-Flash engine](#glm-53-flash-engine-glm53) |
 | `kimi_k3` | `c/kimi_k3.c` | the `K3_*` family — see [Kimi K3 engine](#kimi-k3-engine-kimi_k3) |
 | `inkling` | `c/inkling.c` | `INK_*`, plus `CTX_MAX`, `PIN_N`, `REP_PEN`, `GPU_DEV`, `NOGPU` — see [Inkling engine](#inkling-engine-inkling) |
 | `qwen36` | `c/qwen36.c` | `QWEN_*`, `Q36_*`, its dense/CUDA-tier controls, and the `CACHE_ROUTE` family (VRAM tier over RAM cache) — see [Qwen3.6 engine](#qwen36-engine-qwen36) |
 | `qwen38` | `c/qwen38.c` | `Q38_MAXT`, `Q38_EOS`, `Q38_NATIVE_FP8`, `Q38_NATIVE_BF16`, `Q38_PREFILL_BATCH`, `Q38_TRUNK_CPU_INT8`, `Q38_FP8_KERNEL`, `COLI_TIMERS` — see [Qwen3.8 engine](#qwen38-engine-qwen38) |
-| `glm53` | `c/glm53.c` | the `GLM53_*` family plus its Vulkan, serving, and KV-slot controls — see [GLM-5.3 engine](#glm-53-flash-engine-glm53) |
-| `deepseek-v41` | `c/deepseek_v41.c` | `V41_*`, plus shared streaming, KV-prefix and serving controls |
 | `olmoe` | `c/olmoe.c` | `HOT`, `WIDE`, `SMOOTH`, `CONF_LIMIT`, `MAX_NEW`, `CHAT`, `EXPERT_DROP`, `WARMUP` — see [OLMoE engine](#olmoe-engine-olmoe) |
 | `deepseek_v4` | `c/deepseek_v4.c` | `CTX`, the `V4_*` / `DSV4_*` families and the two `COLI_CUDA_*_BATCH` gates — see [DeepSeek V4 engine](#deepseek-v4-engine-deepseek_v4); note that the CUDA section below describes `colibri.c` knobs (`COLI_CUDA`, `CUDA_DENSE`, ...) which the V4 engine does not read — its GPU switch is `DSV4_CUDA` |
+| `qwenimage` | `c/qwenimage.c` | `COLI_IMG_*`, `QWENIMAGE_*` and `QIV_PROFILE` |
+| `deepseek_v41` | `c/deepseek_v41.c` | the `V41_*` family: see [DeepSeek V4.1 engine](#deepseek-v41-engine-deepseek_v41) |
 
 Setting an `INK_*` variable while running `colibri` does nothing, and vice
 versa; the startup registry warns about that mismatch. A few variables are genuinely shared because
@@ -128,7 +129,8 @@ are still checked for engine ownership regardless of prefix.
 | `CAP_RAISE` | `1` (on); `0` on Metal + macOS + fast model volume (#379) | Let the engine raise the expert-cache cap above `topk` when RAM allows (bigger batches). `0` fixes the cap. When the platform-aware Metal cache default engages (F_NOCACHE probe measured the model volume fast), the *default* flips to `0` — auto-raise re-creates the Metal residency churn the minimal cache avoids. An explicit `CAP_RAISE` always wins. |
 | `COLI_SSD_FAST_GBS` | `4.0` | Threshold (GB/s, measured F_NOCACHE, cached in `<model>/.coli_ssd` — see [The `.coli_ssd` probe cache](#the-coli_ssd-probe-cache) below) at or above which the model volume counts as "fast" for the platform-aware Metal cache defaults (#379). |
 | `PREFETCH` | `0` | Prefetch depth for streamed experts. |
-| `COLI_MMAP` | `0` | `mmap` the weights instead of read()-ing into slabs. |
+| `COLI_MMAP` | `0` | colibri: serve the routed experts as read-only `mmap` views of their shards instead of copying each one into a cache slab, so the page cache is the expert cache. Experts only; for the dense weights see `TRUNK_RESIDENT_LAYERS`. Linux, macOS and FreeBSD: elsewhere (Windows) the experts are read into slabs as without it. Incompatible with `URING=1`. See [Weights from disk instead of RAM](#weights-from-disk-instead-of-ram). |
+| `TRUNK_RESIDENT_LAYERS` | unset (the whole trunk resident) | colibri: keep the dense tensors of only the top N layers resident. In the layers below, the attention projections, the dense MLP and the shared expert become read-only `mmap` views of the shards, paged in from disk when the OS has evicted them; `0` maps every layer. Embeddings, LM head, norms, router, MTP layer and DSA indexer stay resident, and so does a tensor without its `.qs` companion (a bf16 checkpoint maps nothing). CPU-only: exits 2 with `COLI_METAL`, `COLI_VULKAN` or `COLI_CUDA` set. Linux, macOS and FreeBSD; on Windows the trunk stays resident. The RAM it frees goes to the expert cache: lower `RAM_GB` or `CAP` to lower the total (#1399). |
 | `PIN` | unset | Path to a `.coli_usage`/stats file; pins the hottest experts into a resident "hot store" at startup. **`PIN=auto`** seeds from the model dir's live `.coli_usage` (appended after every turn, so each restart's pin placement follows the accumulated real workload) with `stats.txt` as the fallback for a virgin model dir; neither present → no pin this run. |
 | `PIN_GB` | `10.0` | Size budget (GB) for the pinned hot store when `PIN` is set. |
 | `AUTOPIN` | `1` (on) | Auto-pin the hot store from usage history once ≥5000 selections are recorded. Automatic pinning is capped so it cannot reduce the adaptive LRU capacity that fits before pinning; explicit `PIN`/`PIN_GB` settings remain authoritative. |
@@ -159,6 +161,29 @@ are still checked for engine ownership regardless of prefix.
 | `AMX_S_MIN` | `8` | Row threshold for the AMX tile kernel: below it the B-tile unpack does not amortize and the vector 1×4 tile is the better kernel. Measure on your host — the break-even depends on cache level and core count. |
 | `SPEC_PIN` | `1` (on) | Speculation gate mode. `0` reverts to the legacy S-dependent speculation gates (#163). |
 | `COLI_RAM_OVERCOMMIT` | off | `=1` overrides the "projected peak > MemAvailable → exit(2)" guard so a run that risks kernel OOM-kill is allowed to proceed. |
+
+## Weights from disk instead of RAM
+
+Every engine streams the routed experts from disk and keeps a cache of them in
+RAM. Some can also leave weights on disk instead of copying them, which is the
+lever when a model does not fit even with the smallest expert cache (#1764).
+What each engine can do:
+
+| Engine | Dense weights | Routed experts |
+|---|---|---|
+| `colibri` (GLM-5.2) | `TRUNK_RESIDENT_LAYERS=0`: attention, dense MLP and shared expert of every layer mapped from disk. CPU only; Linux, macOS, FreeBSD. | `COLI_MMAP=1`: mapped, the page cache is the cache. Linux, macOS, FreeBSD. |
+| `kimi_k3` | `K3_MMAP=1`: every prepared matrix mapped, LM head included. The embedding is read one row per token in any case. CPU only. | Cache of at least one slot per layer (`K3_EXPERT_GB`). |
+| `deepseek_v4` | Automatic: when the dense trunk or the BF16 head does not fit in `RAM_GB`, it is read from disk again on every use. The `ram_tiers` line on stderr says `dense=streamed`. | Cache of at least the top-k slots per layer. |
+| `glm53` | Resident (`GLM53_BITS` picks 4, 8 or 32 bits). | `COLI_MAP_EXPERTS=1`: views of a per-shard mapping, CPU runs only. |
+| `qwen38` | Resident (`Q38_TRUNK_CPU_INT8` keeps it as int8). | `COLI_MAP_EXPERTS=1`, native FP8 experts. |
+| `qwen36`, `inkling`, `deepseek_v41`, `olmoe` | Resident. | Cache of at least one slot per layer. |
+
+A mapped weight costs a disk read whenever the OS has evicted it, so in the
+worst case every token reads every mapped byte: this is how a model runs at
+all, not how it runs fast. Mapped bytes also do not count as resident, and the
+engine hands the RAM they free to the expert cache; to lower the total, lower
+`RAM_GB` (`coli --ram`) or `CAP` too. For GLM-5.2 on a machine where not even
+the trunk fits: `TRUNK_RESIDENT_LAYERS=0 COLI_MMAP=1 RAM_GB=2`.
 
 ## The `.coli_ssd` probe cache
 
@@ -368,10 +393,11 @@ See `docs/glm53-flash.md`.
 | `GLM53_BITS` | `4` | Precision of the resident dense weights: 4, 8 or 32. Routed experts are not affected — they arrive already quantized in the container and are never requantized. |
 | `GLM53_EXPERT_GB` | measured | RAM budget (GB) for the expert LRU cache; per-layer slots are derived from it. Unset, it is taken from reclaimable physical memory after the weights are loaded (Linux `MemAvailable`, Windows available physical memory, macOS free+inactive+purgeable pages), minus a 3 GB margin. A fixed number is wrong in both directions: too small on a large machine leaves memory idle while the disk does all the work. |
 | `GLM53_MAXT` | `8192` | KV state capacity in tokens, and the session size in serve mode. |
-| `GLM53_PREFILL_CHUNK` | `128` | Prefill chunk size in tokens. Smaller keeps the workspace smaller; too small re-reads experts once per chunk per layer instead of amortizing them. |
+| `GLM53_PREFILL_CHUNK` | `128` | Prefill chunk size in tokens. Smaller keeps the workspace smaller; too small re-reads experts once per chunk per layer instead of amortizing them. In serve mode, CANCEL is checked before each prefill chunk. Cancellation waits for any chunk already running to finish. |
 | `GLM53_MAX_IMAGE_TOKENS` | checkpoint's (8000) | Ceiling on tokens per image. Each covers 28×28 pixels, so 256 keeps ordinary text legible and 64 keeps shapes and colours. The image is shrunk, not cropped. Lower it: 8000 is 2691 tokens for a 1080p photo, i.e. a prefill nobody will sit through. |
 | `GLM53_VERBOSE` | unset | Print the parsed geometry, the expert budget and the per-token cache cost to stderr. |
 | `GLM53_DUMP_INDEX` | unset | Print the rows the sparse indexer selected. The first place to look when the engine diverges only at certain lengths. |
+| `COLI_MAP_EXPERTS` | `0` | Serve the routed-expert pieces as read-only views of a per-shard mapping instead of copying each miss into a slab. CPU runs only: with Metal active the slots keep owned slabs, because the batched Metal MoE cannot register a view that does not start on its mapping's base. Also read by `qwen38`. See [Weights from disk instead of RAM](#weights-from-disk-instead-of-ram). |
 | `COLI_VULKAN` | `0` | Route the resident matrices through the shared Vulkan backend. Needs a `VK=1` build and the compiled shaders (`COLI_VK_SHADERS`). Experts stay on the CPU: they arrive from disk on every use, so uploading one costs what reading it costs. |
 
 ## Kimi K3 engine (`kimi_k3`)
@@ -433,6 +459,8 @@ and the CPU/GPU execution split.
 | `COLI_DENSE_IDOT` | `1` (on) | The dense trunk's GEMVs (DeltaNet projections and out_proj, attention q/k/v/o, shared expert, lm_head) quantize the activation to int8 once per call and run integer dot products (maddubs on AVX2, vpdpbusd on AVX-VNNI / AVX-512 VNNI) instead of converting every int8 weight to f32. Not bit-identical to the f32 path; measured +1.0% perplexity, lm_head 12.6 to 10.2 ms/token. `=0` restores the f32-activation kernel. |
 | `QWEN_EXPERT_ACT` | `i8` | The routed experts' activation quantized to int8 once per row (expert_ffn.h mode 1). Measured +0.1% perplexity, expert compute 22.7 to 15.9 ms/token. `=f32` restores f32 activations and the bit-identical contract with the pair kernels. |
 | `COLI_DENSE_BITS` | `8` | `=4` stores the dense trunk as int4 in blocks of 64 with one scale per block (the K1b planar layout, half the bytes), served by the grouped integer kernel; implies the integer dot. Opt-in: on the 35B it costs +10% perplexity on the whole trunk, +2.4% on lm_head alone (see `COLI_DENSE_INT4`). |
+| `Q36_MAX_IMAGE_TOKENS` | the checkpoint's preprocessor ceiling | Gateway, qwen36 containers with a vision tower (Qwen3.8-27B): ceiling on the tokens one image costs. The image is shrunk, not cropped. Without one a 1080p photo is about 2000 tokens of tower and prefill on the CPU. |
+| `COLI_DENSE_KEEP_I8` | `0` (off) | qwen36: a matrix that got its int4 copy (`COLI_DENSE_BITS=4`) frees its int8 copy, which only the CUDA placer reads; `=1` keeps both. With `COLI_CUDA=1` both are kept anyway. Measured on Qwen3.8-27B: 42.4 GB resident with both copies, 18.8 GB without. |
 | `COLI_DENSE_INT4` | all components | With `COLI_DENSE_BITS=4`, a comma list of the components that take int4: `lmhead`, `dnproj`, `dnout`, `attn`, `shexp`, `router`. Measured on the 35B: `lmhead` +2.4% perplexity for 254 MB less per token; `lmhead,dnproj,dnout` +5.6%; everything +10%. |
 | `QWEN_EXPERT_KERNEL` | `1` (on) | Routed experts run through the shared `expert_ffn.h` kernel: the int4 stays packed in RAM (planar layout, half the expert-cache RSS of the int8 unpack), gate+up are one pass, and a layer is two OpenMP regions over (expert, row-chunk) items instead of 3 x top-k GEMV regions. Takes effect on an int4 gs=64 container whose hidden and expert widths are multiples of 64, and not under the CUDA expert tier. `=0` restores the unpack-to-int8 path; the two produce the same tokens (1024-token decode on the real container byte-identical; pinned on the tiny int4 fixture in CI), only the f32 accumulation order inside a dot differs. Measured at cap 256 on the real container: 12.8 -> 15.7 tok/s, peak RSS 29 -> 17 GB. |
 | `QWEN_DENSE_BATCH` | `1` (on) | On AVX2/FMA, reuse each dense-int8 weight decode across two prompt rows. `=0` restores one GEMV call per row. Decode `S=1` is unchanged. |
@@ -452,6 +480,7 @@ checkpoint layout and the text-only capability boundary.
 | `Q38_NATIVE_BF16` | `1` (on) | Keep resident and routed BF16 matrices in two-byte storage while retaining FP32 activations/accumulation. `=0` restores the expanded-FP32 reference. |
 | `Q38_PREFILL_BATCH` | `1` (on) | Route prompt rows in bounded expert-major chunks and batch resident shared-expert/DeltaNet projections. `=0` restores row-at-a-time prompt execution for A/B diagnosis; decode is unchanged. |
 | `Q38_TRUNK_CPU_INT8` | `1` (on) | The dense trunk (DeltaNet and attention projections, hyper-connection mixers, shared expert, router, lm_head; every matrix of at least `Q38_TRUNK_MIN_KB`) is kept on the CPU as int8 rows with one scale per row and the BF16 copy is released; `q38_weight_matmul` quantizes the activation to int8 and uses the integer kernels of `idot.h` for decode and prefill. `=0` keeps the BF16 rows and the f32 kernel (the numeric reference). See [qwen38.md](qwen38.md#the-trunk-on-the-cpu-int8-rows). |
+| `COLI_MAP_EXPERTS` | `0` | Point the native-FP8 routed-expert slots at a read-only mapping of their shard instead of copying 14 MB per miss into a slab. Same variable as in `glm53`. |
 | `Q38_FP8_KERNEL` | vector | The routed experts' e4m3 blocks are decoded eight at a time in registers and multiplied with FMA (AVX2 builds); `scalar` restores `quant.h`'s table kernel, which differs only by float summation order inside a block. |
 | `COLI_TIMERS` | `0` (off) | Set to `1` for the detailed Qwen3.8 phase breakdown on stderr. The shared per-request `PROF` frame is emitted regardless. |
 
@@ -483,6 +512,21 @@ byte-identical output across runs, either freeze the history (`USAGE_SAVE=0`,
 after seeding it once) or remove the variable entirely
 (`COLI_V4_ROWS16=0 COLI_V4_AUTOPIN=0 USAGE_SAVE=0`: reference kernels only, no
 history). Details in [deepseek-v4.md — CPU-only behaviour](deepseek-v4.md).
+
+## DeepSeek V4.1 engine (`deepseek_v41`)
+
+Read **only** by `c/deepseek_v41.c`. See [deepseek-v41.md](deepseek-v41.md).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `V41_ENGRAM_ROWS` | 65536 | DeepSeek V4.1: rows of engram cache per table. The n-gram traffic is Zipfian, so a small cache absorbs most of it; 65536 rows is 64 MB per table on the released head_dim. |
+| `V41_INDEX_OWNER` | unset | DeepSeek V4.1: score each layer against its OWN index keys instead of the last published cache. The default reproduces the released inference code; this changes the model's behaviour, see docs/deepseek-v41.md. |
+| `V41_MAX_IMAGE_TOKENS` | the checkpoint's `max_image_tokens` | DeepSeek V4.1: ceiling on what one image costs in prompt tokens. |
+| `V41_TRACE` | unset | DeepSeek V4.1: print per-sublayer checksums, matching tools/dsv41_ref.py's, to locate a divergence by diffing two columns. `2` follows the first row of a speculative step rather than the last. |
+| `V41_DSPARK` | on when the checkpoint carries the head | DeepSeek V4.1: `0` disables the DSpark draft head, which is then not loaded. Drafts never change what a turn produces, only how many forwards it takes: measured +17% on the real checkpoint from a cold cache (24 tokens in 99.3 s against 116.6). |
+| `V41_DSPARK_MAX` | the checkpoint's `dspark_block_size` | DeepSeek V4.1: how many drafted tokens go in front of the main model per round. Fewer costs less when a round is rejected and caps the win when it is not. |
+| `V41_DSPARK_MINACC` | 60 | DeepSeek V4.1: percent of drafts that must be accepted over a window of ten before drafting pauses for 64 tokens. 60 is the measured break-even. |
+| `V41_SPEC_FORCE` | unset | DeepSeek V4.1, oracle mode only: draft the reference's own tokens (`1`), corrupt the last one (`2`), keep the head's (`3`), corrupt the first one (`4`) or a different one each round (`5`), so the verification path runs on a fixture whose draft head is random noise. |
 
 ## OLMoE engine (`olmoe`)
 
@@ -548,11 +592,3 @@ COLI_METAL=1 DIRECT=1 COLI_NO_OMP_TUNE=1 PIPE=1 PIPE_WORKERS=6 MTP=0 \
 COLI_TEMP=0 COLI_METAL=1 DIRECT=1 COLI_NO_OMP_TUNE=1 PIPE=1 PIPE_WORKERS=6 MTP=0 \
   ./coli run --model /path/to/model --ram 113 "your prompt"
 ```
-| `V41_ENGRAM_ROWS` | 65536 | DeepSeek V4.1: rows of engram cache per table. The n-gram traffic is Zipfian, so a small cache absorbs most of it; 65536 rows is 64 MB per table on the released head_dim. |
-| `V41_INDEX_OWNER` | unset | DeepSeek V4.1: score each layer against its OWN index keys instead of the last published cache. The default reproduces the released inference code; this changes the model's behaviour, see docs/deepseek-v41.md. |
-| `V41_MAX_IMAGE_TOKENS` | the checkpoint's `max_image_tokens` | DeepSeek V4.1: ceiling on what one image costs in prompt tokens. |
-| `V41_TRACE` | unset | DeepSeek V4.1: print per-sublayer checksums, matching tools/dsv41_ref.py's, to locate a divergence by diffing two columns. `2` follows the first row of a speculative step rather than the last. |
-| `V41_DSPARK` | on when the checkpoint carries the head | DeepSeek V4.1: `0` disables the DSpark draft head, which is then not loaded. Drafts never change what a turn produces, only how many forwards it takes: measured +17% on the real checkpoint from a cold cache (24 tokens in 99.3 s against 116.6). |
-| `V41_DSPARK_MAX` | the checkpoint's `dspark_block_size` | DeepSeek V4.1: how many drafted tokens go in front of the main model per round. Fewer costs less when a round is rejected and caps the win when it is not. |
-| `V41_DSPARK_MINACC` | 60 | DeepSeek V4.1: percent of drafts that must be accepted over a window of ten before drafting pauses for 64 tokens. 60 is the measured break-even. |
-| `V41_SPEC_FORCE` | unset | DeepSeek V4.1, oracle mode only: draft the reference's own tokens (`1`), corrupt the last one (`2`), or keep the head's (`3`), so the verification path runs on a fixture whose draft head is random noise. |

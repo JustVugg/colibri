@@ -67,7 +67,7 @@ jobs:
       - name: Build engines
         run: |
           cd c
-          for t in colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41; do
+          for t in colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 qwenimage; do
             make $t ${{ matrix.make_args }}
           done
           ls -lh colibri${{ matrix.ext }} glm53${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen36${{ matrix.ext }} qwen38${{ matrix.ext }} deepseek_v41${{ matrix.ext }}
@@ -131,6 +131,7 @@ jobs:
           # with no platform gate, so every archive can carry it.
           cp c/qwen36${{ matrix.ext }} dist/qwen36${{ matrix.ext }}
           cp c/qwen38${{ matrix.ext }} dist/qwen38${{ matrix.ext }}
+          cp c/qwenimage${{ matrix.ext }} dist/qwenimage${{ matrix.ext }}
           cp c/deepseek_v41${{ matrix.ext }} dist/deepseek_v41${{ matrix.ext }}
           # deepseek_v4 -- underscore, not the hyphen of the make target: engine_for()
           # looks for "deepseek_v4" next to coli. Guarded, not unconditional, because
