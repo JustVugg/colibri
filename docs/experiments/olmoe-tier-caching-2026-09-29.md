@@ -110,6 +110,76 @@ cold 1.9-4.0 ms). Under this true-disk regime the PILOT verdict flips:
   contention); Markov chains are the decisive win once misses cost device latency.
 All 11 cold runs token-exact (one SHA; 12/12 standalone golds 200/200).
 
+### Kitchen-sink combination (lfru + groups + direct I/O + Markov)
+
+The full combination — `DEMAND_POLICY=lfru + GROUP_EVICT=1 + EXPERT_DIRECT=1 +
+PILOT=2 + MARKOV=1 MARKOV_TOP=2` — had never been tested together; this run
+tests it against `demand` and the previous cold winner `pilot2_markov2`, plus
+the optional `kitchen_sink_w2` (`PILOT_WORKERS=2`).
+
+Method (`ab_cold_kitchen_sink`, 2026-09-30 12:13–12:39; ablation
+`ab_cold_kitchen_sink_ablate`, 12:39–12:44): the machine carried pre-existing
+pressure (active Ollama llama-server PID 55014, 6.1→8.5 GB RSS, 49–194% CPU
+throughout; swap ~20.4/21.5 GB used at start), so a controlled
+anonymous-memory ballast was added to pin the regime instead of waiting for
+natural pressure: python mmap, 8 KiB urandom + 8 KiB zeros per 16 KiB page,
+target 4.0 GiB in 512 MiB chunks, swap-free floor 400 MB. It stopped at
+1.00 GiB (swap free fell 702→353 MB) and stayed alive for every run
+(`load_cold_kitchen_sink.log`; ballast PIDs 59845/59881, never GONE). Regime
+gate with `c/iobench` (6.3 MB × 64 reads × 8 threads, buffered): fresh
+first-run reads on untouched shards 4.0 / 2.8 / 3.3 / 3.2 / 3.2 ms/block
+(median 3.2 ≥ 1.5 ms; warm repeats of the same offsets 0.8–1.3 ms). The
+ballast measurably evicted previously-warm pages: the shard-0 offsets first
+measured at 1.2 ms (warm) read 3.2 ms after ballast. File-backed cache across
+the run window: 0.74–2.55 GB (median 2.02 GB) vs the 6.3 GB expert working
+set; 1-min load 3.7–16.4 (median 7.8). Post-run re-check (fresh offsets,
+6.5 MB, shard 3): 1.6 ms — regime held.
+
+| config | decode tok/s (med) | P50 ms | P90 ms | P99 ms | hit% | disk ms/step | per-rep tok/s |
+|---|---|---|---|---|---|---|---|
+| demand (LRU, no prefetch) | 3.962 | 217.5 | 348.6 | 885.6 | 27.8 | 194.2 | 3.130 / 5.135 / 3.962 |
+| pilot2_markov2 (LRU + PILOT=2 + MARKOV_TOP=2) | 4.380 | 223.6 | 279.7 | 411.9 | 28.2 | 235.1 | 3.410 / 4.380 / 4.731 |
+| **kitchen_sink** (lfru + GROUP_EVICT + PILOT=2 + MARKOV_TOP=2 + EXPERT_DIRECT) | **4.817** | 181.4 | 286.8 | 594.0 | 33.3 | 149.5 | 3.989 / 4.817 / 5.187 |
+| kitchen_sink_w2 (+ PILOT_WORKERS=2) | 4.218 | 202.3 | 297.0 | 710.0 | 33.3 | 171.2 | 4.218 / 3.640 / 4.767 |
+
+Deltas: kitchen_sink vs demand +21.6% (median; per-rep +27.4 / −6.2 / +30.9);
+kitchen_sink vs pilot2_markov2 +10.0% (median; +17.0 / +10.0 / +9.6 — all
+three reps, so not within noise); pilot2_markov2 vs demand +10.6% (median;
++8.9 / −14.7 / +19.4). The demand rep-2 outlier (5.135 tok/s, P99 291.9 ms) is
+a fast window — within-rep interleaving is the trustworthy signal.
+`PILOT_WORKERS=2` regresses (median −12.4% vs kitchen_sink; 1/3 reps wins),
+consistent with the workers=4 result — keep the single loader.
+
+Deterministic miss counts (standalone golds, all 200/200): demand 10249/26743
+(27.7%), pilot2_markov2 10425/26567 (28.2%), kitchen_sink and kitchen_sink_w2
+12324/24668 (33.3%). All 12 serve runs share SHA-256[:16] 88e4d132afc16539.
+
+**Interaction finding — the combination helps, but LFRU neutralizes the
+prefetch's own hits.** Ablation `lfru_group_only` (lfru+GROUP_EVICT,
+PILOT=0/MARKOV=0) interleaved against kitchen_sink, reps=2: 4.985 / 4.927 vs
+4.876 / 2.986 tok/s (clean pair −2.2%; the rep-2 kitchen_sink outlier, P99
+2745 ms, coincided with swap free dipping to 354 MB at 12:45 while swap total
+ballooned to 33.8 GB — machine event, not config). Both ablation golds are
+12324/24668. Hit-count fingerprint: PILOT+MARKOV adds +176 hits under LRU
+(10425/26567 vs 10249/26743, with ~±13 run jitter) and **+0 under lfru+group**
+(12324/24668 with prefetch, identical to the warm `best_demand_group` run
+without it and to `p3_full`; five lfru+group golds, all exactly 12324/24668).
+Mechanism: the LFRU victim key is `(heat<<8)|recent`, so a freshly staged
+heat-0 slot (max score 255) is the preferred victim over any heat≥1 resident
+(≥256) on the next demand miss (~92 misses/token) — staged slots do not
+survive to be used; `PILOT_EVICT_GUARD` guards pilot-vs-resident only, not
+demand-vs-staged. `MARKOV_STATS=1` diagnostics agree with the changed staging
+pattern: staged candidates 9173 (lfru+group) vs 10323 (LRU) — fewer staged
+because more predictions are already resident and dropped as duplicates —
+48.5% vs 42.7% later routed (routing precision unchanged; the stat counts
+routing, not slot survival). Net: the deterministic +5.1pp demand-hit gain of
+lfru+group (−2075 misses) dominates the lost +176 prefetch hits, so the
+kitchen sink is the best of the four configs in the main cold run — but it is
+effectively lfru+group demand-only plus overlapped-but-hitless prefetch I/O,
+and its median P99 (594.0 ms) is mixed vs pilot2_markov2 (411.9). Artifacts:
+`c/bench_tier/ab_cold_kitchen_sink{,_ablate}.jsonl` / `_summary.md`,
+`c/bench_tier/load_cold_kitchen_sink.log`.
+
 ## Backport to core engines (commit de1682fd)
 Shared demand-eviction key promoted to c/tier.h (`tier_demand_victim_key`,
 `tier_demand_policy_env`, auto cap 12) and wired into c/colibri.c (GLM) and
