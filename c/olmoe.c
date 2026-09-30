@@ -415,11 +415,17 @@ static void load_cfg(Cfg *c, const char *snap) {
     free(buf); free(arena);
 }
 
-static float *load_t(Model *m, const char *name) {
+/* `want` is the element count the forward pass indexes with (config dims); a
+ * short tensor used to be read past its end at inference (see qwen36 load_t_n). */
+static float *load_t(Model *m, const char *name, int64_t want) {
     int64_t n = st_numel(&m->S, name);
     if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    if (n != want) {
+        fprintf(stderr, "%s: %lld elements, config implies %lld -- refusing\n",
+                name, (long long)n, (long long)want); exit(1);
+    }
     float *p = falloc(n);
-    st_read_f32(&m->S, name, p, 0);   /* densa: niente DONTNEED, resta residente */
+    st_read_f32_cap(&m->S, name, p, want, 0);   /* densa: niente DONTNEED, resta residente */
     return p;
 }
 
@@ -440,21 +446,22 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     }
     double t0 = now_s();
     if (load_boundaries) {
-        m->embed      = load_t(m, "model.embed_tokens.weight");
-        m->lm_head    = load_t(m, "lm_head.weight");
-        m->final_norm = load_t(m, "model.norm.weight");
+        m->embed      = load_t(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
+        m->lm_head    = load_t(m, "lm_head.weight", (int64_t)c->vocab * c->hidden);
+        m->final_norm = load_t(m, "model.norm.weight", c->hidden);
     }
     m->L = calloc(c->n_layers, sizeof(Layer));
     char nm[256];
     for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
-        #define LD(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
-        LD(in_ln,  "input_layernorm.weight");
-        LD(post_ln,"post_attention_layernorm.weight");
-        LD(q, "self_attn.q_proj.weight"); LD(k, "self_attn.k_proj.weight");
-        LD(v, "self_attn.v_proj.weight"); LD(o, "self_attn.o_proj.weight");
-        LD(qn,"self_attn.q_norm.weight"); LD(kn,"self_attn.k_norm.weight");
-        LD(gate, "mlp.gate.weight");
+        #define LD(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm,want)
+        int64_t D = c->hidden;
+        LD(in_ln,  "input_layernorm.weight", D);
+        LD(post_ln,"post_attention_layernorm.weight", D);
+        LD(q, "self_attn.q_proj.weight", D*D); LD(k, "self_attn.k_proj.weight", D*D);
+        LD(v, "self_attn.v_proj.weight", D*D); LD(o, "self_attn.o_proj.weight", D*D);
+        LD(qn,"self_attn.q_norm.weight", D); LD(kn,"self_attn.k_norm.weight", D);
+        LD(gate, "mlp.gate.weight", (int64_t)c->n_experts * D);
         #undef LD
     }
     /* cap <= 0 is "you decide", the sentinel the launcher sends when nobody
@@ -2119,9 +2126,11 @@ static int olmoe_edge_engine_open(
                                        "out of memory opening OLMoE Edge");
     load_cfg(&engine->model.c, options->model_dir);
     st_init(&engine->model.S, options->model_dir);
-    engine->model.embed = load_t(&engine->model, "model.embed_tokens.weight");
-    engine->model.lm_head = load_t(&engine->model, "lm_head.weight");
-    engine->model.final_norm = load_t(&engine->model, "model.norm.weight");
+    int64_t vd = (int64_t)engine->model.c.vocab * engine->model.c.hidden;
+    engine->model.embed = load_t(&engine->model, "model.embed_tokens.weight", vd);
+    engine->model.lm_head = load_t(&engine->model, "lm_head.weight", vd);
+    engine->model.final_norm = load_t(&engine->model, "model.norm.weight",
+                                      engine->model.c.hidden);
     char tokenizer_path[4096];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
              options->model_dir);

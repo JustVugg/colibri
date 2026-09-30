@@ -2134,3 +2134,10 @@ tests/test_v41_size_trust$(EXE): tests/test_v41_size_trust.c tests/st_fixture.h 
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_inkling_scalar$(EXE): tests/test_inkling_scalar.c tests/st_fixture.h inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
+# Read side of the same class: buffer sized from the tensor, read with config dims.
+tests/test_colibri_read_trust$(EXE): tests/test_colibri_read_trust.c tests/st_fixture.h colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_inkling_read_trust$(EXE): tests/test_inkling_read_trust.c tests/st_fixture.h inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
+tests/test_olmoe_read_trust$(EXE): tests/test_olmoe_read_trust.c tests/st_fixture.h olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
