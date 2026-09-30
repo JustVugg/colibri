@@ -239,6 +239,9 @@ int dsv4_cuda_expert_set_upload_hash(Dsv4CudaExpertSet *set,const int64_t *map,i
 int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *experts,
     Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,const int *fixed,
     float routed_scale,float limit,float *output,const float *input);
+int dsv4_cuda_dspark_attention(int device,float *out,const float *q,
+    const float *past,const int64_t *positions,const float *block,const float *sinks,
+    int64_t position,int past_rows,int block_rows,int heads,int dim);
 int dsv4_cuda_resident_route_moe_batch(Dsv4CudaExpertSet *experts,
     Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,const int *fixed,
     float routed_scale,float limit,float *output,const float *input,int tokens);

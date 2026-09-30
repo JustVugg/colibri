@@ -2,6 +2,7 @@
 
 本轮从 PR #1766 的 `dbe79f77fbaf056f6e5807f21425ba58115bd1fb` 独立开发。
 目标是定位 Colibri 与 Naruto 的单流差距，并在 Colibri 内实现可验证的改进。
+后续结果见[延迟 indexer 与 CUDA drafter attention](dsv4-device-attention-2026-10-01.md)，本文保留本轮原始数据。
 **尚未达到 Naruto 历史记录的 77.97 token/s。**
 
 ## 比较口径

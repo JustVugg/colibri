@@ -753,8 +753,18 @@ static int v4_ds_attention(float *out, V4DSparkStage *stage,
         v4_ds_bf16(row + head_dim - rope_dim, (size_t)rope_dim);
     }
 
+    int gpu_attention = 0;
+#ifdef COLI_V4_GPU_TIER
+    const char *gpu_attn = getenv("V4_MTP_GPU_ATTN");
+    if (g_v4ds_gpu_engine && (!gpu_attn || atoi(gpu_attn)))
+        gpu_attention = coli_v4_gpu_dspark_attention(g_v4ds_gpu_engine,
+            attended, query, stage->kv, stage->kv_abs, block_kv,
+            stage->attn_sink.data, query_position, V4_DSPARK_WIN, block_count,
+            heads, head_dim);
+#endif
+    if (!gpu_attention) memset(attended, 0, (size_t)heads * head_dim * sizeof(float));
     float softmax_scale = 1.0f / sqrtf((float)head_dim);
-    for (int head = 0; head < heads; head++) {
+    for (int head = 0; !gpu_attention && head < heads; head++) {
         const float *q = query + (size_t)head * head_dim;
         const float *keys[V4_DSPARK_WIN + V4_DSPARK_BLOCK];
         float scores[V4_DSPARK_WIN + V4_DSPARK_BLOCK];
@@ -792,6 +802,9 @@ static int v4_ds_attention(float *out, V4DSparkStage *stage,
                 result[d] += probability * keys[item][d];
         }
         v4_ds_bf16(result, (size_t)head_dim);
+    }
+    for (int head = 0; head < heads; head++) {
+        float *result = attended + (size_t)head * head_dim;
         coli_v4_rope_apply(result + head_dim - rope_dim, 1, rope_dim,
                            cosines + (size_t)query_position * pairs,
                            sines + (size_t)query_position * pairs, 1);

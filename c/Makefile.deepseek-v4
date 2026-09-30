@@ -342,6 +342,13 @@ test_expert_store_registry: test_expert_store_registry.c expert_store_registry.c
 
 ifeq ($(CUDA),1)
 ifeq ($(IS_WIN),)
+tests/test_dsv4_dspark_attention: tests/test_dsv4_dspark_attention.cpp backend_cuda_dsv4.h backend_cuda_dsv4.o
+	$(CXX) -O3 -std=c++20 $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
+
+tests/test_dsv4_indexer_lazy: tests/test_dsv4_indexer_lazy.c deepseek_v4.c \
+        deepseek_v4_attention_trial.inc deepseek_v4_internal.h $(V4_SERVE_TEST_OBJS)
+	$(CC) $(CFLAGS) $< $(filter-out COLI_V4_UNIT_ATTENTION_BATCH.o,$(V4_SERVE_TEST_OBJS)) -o $@ $(LDFLAGS)
+
 tests/test_dsv4_resident_route: tests/test_dsv4_resident_route.cpp backend_cuda_dsv4.h backend_cuda_dsv4.o
 	$(CXX) -O3 -std=c++20 $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
 
@@ -378,6 +385,7 @@ deepseek-v4-clean:
 		tools/bench_dsv4_head_batch \
 		$(V4_SERVE_TEST) tests/test_dsv4_multigpu_cuda \
 		tests/test_dsv4_attention_trial tests/test_dsv4_resident_route \
+		tests/test_dsv4_indexer_lazy tests/test_dsv4_dspark_attention \
 		tests/test_dsv4_compressor_cuda tests/test_dsv4_compressor_state_cuda \
 		tests/test_dsv4_indexer_prepare_cuda tests/test_dsv4_wo_decode_cuda tests/test_dsv4_head_cuda \
 		test_expert_store_registry $(V4_FLAGS_STAMP) \

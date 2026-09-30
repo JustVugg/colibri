@@ -812,6 +812,62 @@ __global__ void sparse_attn_batch_cached_kernel(float*out,const float*q,const fl
     }
 }
 
+/* DSpark keeps full-precision probabilities, unlike target MLA's BF16
+ * probability contract. Absolute tags mask invalid/future past slots;
+ * every query can see the entire bidirectional proposal block. */
+__global__ void dspark_attention_kernel(float *out,const float *q,const float *kv,
+    const int64_t *positions,const float *sinks,int64_t query_position,
+    int past,int block,int heads,int dim) {
+    int h=blockIdx.x, total=past+block, warp=threadIdx.x/32, lane=threadIdx.x%32;
+    __shared__ float scores[256];
+    for(int item=warp;item<total;item+=8) {
+        bool visible=item>=past || (positions[item]>=0 && positions[item]<query_position);
+        float dot=0.f;
+        if(visible) for(int d=lane;d<dim;d+=32) dot+=q[(long long)h*dim+d]*kv[(long long)item*dim+d];
+        for(int n=16;n;n>>=1) dot+=__shfl_down_sync(0xffffffff,dot,n);
+        if(!lane) scores[item]=visible?dot/sqrtf((float)dim):-INFINITY;
+    }
+    __syncthreads();
+    if(!threadIdx.x) {
+        float maximum=sinks[h];
+        for(int i=0;i<total;i++) maximum=fmaxf(maximum,scores[i]);
+        float denominator=expf(sinks[h]-maximum);
+        for(int i=0;i<total;i++){scores[i]=expf(scores[i]-maximum);denominator+=scores[i];}
+        for(int i=0;i<total;i++) scores[i]/=denominator;
+    }
+    __syncthreads();
+    for(int d=threadIdx.x;d<dim;d+=blockDim.x) {
+        float sum=0.f;
+        for(int i=0;i<total;i++) if(scores[i]!=0.f) sum+=scores[i]*kv[(long long)i*dim+d];
+        out[(long long)h*dim+d]=__bfloat162float(__float2bfloat16(sum));
+    }
+}
+extern "C" int dsv4_cuda_dspark_attention(int device,float *out,const float *q,
+    const float *past,const int64_t *positions,const float *block,const float *sinks,
+    int64_t position,int past_rows,int block_rows,int heads,int dim) {
+    Dev *c=ctx(device);
+    if(!c||!out||!q||!block||!sinks||position<0||past_rows<0||past_rows>128||
+       block_rows<1||block_rows>25||heads<1||heads>128||dim<1||dim>1024||
+       (past_rows&&(!past||!positions))||!ok(cudaSetDevice(device),"select DSpark attention device"))return 0;
+    size_t qb=(size_t)heads*dim*4,pb=(size_t)past_rows*dim*4,bb=(size_t)block_rows*dim*4;
+    if(!buf((void**)&c->p2,&c->p2cap,qb)||!buf((void**)&c->p3,&c->p3cap,pb+bb)||
+       !buf((void**)&c->p4,&c->p4cap,qb)||
+       !buf((void**)&c->aux1,&c->aux1cap,(size_t)(past_rows?past_rows:1)*sizeof(int64_t))||
+       !buf((void**)&c->aux2,&c->aux2cap,(size_t)heads*4))return 0;
+    int good=ok(cudaMemcpyAsync(c->p2,q,qb,cudaMemcpyHostToDevice,c->stream),"DSpark query upload")&&
+        ok(cudaMemcpyAsync(c->p3+(size_t)past_rows*dim,block,bb,cudaMemcpyHostToDevice,c->stream),"DSpark block upload")&&
+        ok(cudaMemcpyAsync(c->aux2,sinks,(size_t)heads*4,cudaMemcpyHostToDevice,c->stream),"DSpark sink upload");
+    if(good&&past_rows)good=ok(cudaMemcpyAsync(c->p3,past,pb,cudaMemcpyHostToDevice,c->stream),"DSpark history upload")&&
+        ok(cudaMemcpyAsync(c->aux1,positions,(size_t)past_rows*sizeof(int64_t),cudaMemcpyHostToDevice,c->stream),"DSpark positions upload");
+    if(good){
+        dspark_attention_kernel<<<heads,256,0,c->stream>>>(c->p4,c->p2,c->p3,(int64_t*)c->aux1,c->aux2,position,past_rows,block_rows,heads,dim);
+        good=ok(cudaGetLastError(),"DSpark attention launch")&&
+            ok(cudaMemcpyAsync(out,c->p4,qb,cudaMemcpyDeviceToHost,c->stream),"DSpark attention download");
+    }
+    int drained=ok(cudaStreamSynchronize(c->stream),"DSpark attention sync");
+    return good&&drained;
+}
+
 extern "C" int dsv4_cuda_sparse_attn_batch_cached(int device,int layer,const float*q,
         const float*chunk,int chunk_start,const float*sinks,const int*meta,int abs_base,
         int comp_limit,int heads,int dim,int tokens,float scale,float*out){

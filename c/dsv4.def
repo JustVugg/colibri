@@ -78,6 +78,7 @@ EXPORTS
     dsv4_cuda_expert_set_upload_hash
     dsv4_cuda_resident_route_moe
     dsv4_cuda_resident_route_moe_batch
+    dsv4_cuda_dspark_attention
     dsv4_cuda_route_moe
     dsv4_cuda_route_moe_batch
     dsv4_cuda_route_top6_batch

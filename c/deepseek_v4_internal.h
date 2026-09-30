@@ -920,6 +920,9 @@ int coli_v4_gpu_dspark_mirrors_ensure(ColiV4Engine *engine);
 int coli_v4_gpu_dspark_expert_attach(void *cache, ColiExpertView *view);
 int coli_v4_gpu_dspark_expert_group(void *mirrors, int stage, const int *ids,
     const float *weights, int count, float limit, float *output, const float *input);
+int coli_v4_gpu_dspark_attention(ColiV4Engine *engine,float *out,const float *q,
+    const float *past,const int64_t *positions,const float *block,const float *sinks,
+    int64_t position,int past_rows,int block_rows,int heads,int dim);
 int coli_v4_gpu_dspark_dense_attach(ColiV4Engine *engine, ColiTensorView *view);
 #endif
 

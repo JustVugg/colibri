@@ -2863,16 +2863,30 @@ int coli_v4_attention_window_batch_ref(
             V4_ATTN_PROF_MARK(prof_idx);
         }
     }
+    int deferred_selection = 0;
+    int *visible = NULL;
     if (!result && weights->plan.compression_ratio && state->indexer &&
         idx_batch) {
-        int *visible = v4_attn_scratch(23, (size_t)batch * sizeof(*visible), 0);
+        visible = v4_attn_scratch(23, (size_t)batch * sizeof(*visible), 0);
         if (!visible) result = -1;
         else {
             memcpy(visible, selected_counts, (size_t)batch * sizeof(*visible));
-            result = coli_v4_indexer_select_batch(
-                state->indexer, compressed_indices, config->index_topk, qa,
-                inputs, start_position, batch, visible, selected_counts,
-                error, error_size);
+#ifdef COLI_V4_GPU_TIER
+            /* Full-set CUDA attention consumes candidates in cache order,
+             * independently of indexer scores. Keep advancing indexer state,
+             * but score only if the GPU path actually needs a subset or fails. */
+            const char *lazy = getenv("DSV4_CUDA_INDEXER_LAZY");
+            deferred_selection = gpu_batch && (!lazy || atoi(lazy) != 0);
+            for (int item = 0; deferred_selection && item < batch; item++)
+                if (visible[item] != compressed_counts[item] ||
+                    visible[item] > config->index_topk)
+                    deferred_selection = 0;
+#endif
+            if (!deferred_selection)
+                result = coli_v4_indexer_select_batch(
+                    state->indexer, compressed_indices, config->index_topk, qa,
+                    inputs, start_position, batch, visible, selected_counts,
+                    error, error_size);
         }
         V4_ATTN_PROF_MARK(prof_idx);
     }
@@ -3041,6 +3055,13 @@ int coli_v4_attention_window_batch_ref(
         }
     }
 #endif
+    /* CPU attention accumulates in score order. Reconstruct that exact order
+     * on GPU failure; identity selection would silently change its numerics. */
+    if (!result && deferred_selection && !gpu_attn_done)
+        result = coli_v4_indexer_select_batch(
+            state->indexer, compressed_indices, config->index_topk, qa,
+            inputs, start_position, batch, visible, selected_counts,
+            error, error_size);
     if (!gpu_attn_done)
     for (int item = 0; !result && item < batch; item++) {
         int position = start_position + item;
@@ -10079,6 +10100,14 @@ typedef struct {
     int count;
     V4GpuDraftDenseEntry entries[128];
 } V4GpuDraftDense;
+
+int coli_v4_gpu_dspark_attention(ColiV4Engine *engine,float *out,const float *q,
+    const float *past,const int64_t *positions,const float *block,const float *sinks,
+    int64_t position,int past_rows,int block_rows,int heads,int dim) {
+    return engine && engine->gpu.enabled && dsv4_cuda_dspark_attention(
+        engine->gpu.device,out,q,past,positions,block,sinks,position,
+        past_rows,block_rows,heads,dim);
+}
 
 int coli_v4_gpu_dspark_dense_attach(ColiV4Engine *engine, ColiTensorView *view) {
     if (!engine || !engine->gpu.enabled || !view ||
