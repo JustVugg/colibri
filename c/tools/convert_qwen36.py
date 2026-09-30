@@ -445,6 +445,11 @@ def main():
             arr = get_tensor(k).half()
             newk = k.replace("model.language_model.", "model.")
             g_out[newk] = arr
+        # Tied checkpoints (dense Qwen3.5 small sizes) ship no lm_head; the engine
+        # reads lm_head.weight, so materialize the tie. Exact, costs one copy.
+        if "lm_head.weight" not in g_out and mcfg.get("tie_word_embeddings", cfg_full.get("tie_word_embeddings")):
+            g_out["lm_head.weight"] = g_out["model.embed_tokens.weight"].clone()
+            print("[globals] tie_word_embeddings: lm_head.weight = embed_tokens.weight")
         gpath = out / "model-globals.safetensors"
         save_file(g_out, str(gpath))
         print(f"[globals] {gpath.name} ({len(g_out)} tensors)")
@@ -525,10 +530,13 @@ def main():
         "n_layers": int(mcfg["num_hidden_layers"]),
         "n_active": len(all_idx),
         "layer_types": layer_types,
-        "num_experts": int(mcfg["num_experts"]),
-        "topk": int(mcfg["num_experts_per_tok"]),
-        "moe_inter": int(mcfg.get("moe_intermediate_size", mcfg.get("intermediate_size", 0) // 2)),
-        "shared_inter": int(mcfg.get("shared_expert_intermediate_size", mcfg.get("moe_intermediate_size", 0))),
+        # num_experts == 0 marks dense Qwen3.5 (model_type qwen3_5): the per-layer
+        # mlp.{gate,up,down}_proj is copied as f16 above and the engine runs it on
+        # the shared-expert path.
+        "num_experts": int(mcfg.get("num_experts", 0)),
+        "topk": int(mcfg.get("num_experts_per_tok", 0)),
+        "moe_inter": int(mcfg.get("moe_intermediate_size", mcfg.get("intermediate_size", 0) // 2)) if mcfg.get("num_experts") else 0,
+        "shared_inter": int(mcfg.get("shared_expert_intermediate_size", mcfg.get("moe_intermediate_size", 0))) if mcfg.get("num_experts") else int(mcfg["intermediate_size"]),
         "rms_eps": float(mcfg.get("rms_norm_eps", 1e-6)),
         "ebits": 8 if args.fp8 else args.ebits,
         "scoring_func": mcfg.get("scoring_func", "softmax"),

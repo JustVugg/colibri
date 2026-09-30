@@ -93,6 +93,18 @@ static const ColiSegmentConformanceFixture g_fixtures[] = {
         4, 8, 8, 64, UINT32_C(0x5157454e),
     },
     {
+        /* Dense Qwen3.5: the Qwen3.6 state topology (no expert state), and a
+         * real-checkpoint oracle -- the full-mode generator run on Qwen3.5-4B. */
+        "qwen35", "Qwen3.5", "fixture/qwen35-kv-deltanet-conv-v1",
+        "attention KV + DeltaNet recurrent state + convolution ring (dense MLP)",
+        "tools/make_qwen36_oracle.py",
+        COLI_SEGMENT_FIXTURE_KV |
+            COLI_SEGMENT_FIXTURE_RECURRENT |
+            COLI_SEGMENT_FIXTURE_CONVOLUTION |
+            COLI_SEGMENT_FIXTURE_SLIDING_RING,
+        4, 8, 8, 64, UINT32_C(0x51333335),
+    },
+    {
         "qwen38", "Qwen3.8-Flash-Next", "fixture/qwen38-hyper-qsa-ple-v1",
         "four-stream hyper-residual + GDN recurrent/conv + QSA sparse indexer + PLE",
         "tools/make_qwen38_tiny.py",
@@ -375,9 +387,10 @@ DECLARE_OPEN_WRAPPER(inkling, 2)
 DECLARE_OPEN_WRAPPER(kimi, 3)
 DECLARE_OPEN_WRAPPER(olmoe, 4)
 DECLARE_OPEN_WRAPPER(qwen36, 5)
-DECLARE_OPEN_WRAPPER(qwen38, 6)
-DECLARE_OPEN_WRAPPER(deepseek_v4, 7)
-DECLARE_OPEN_WRAPPER(deepseek_v41, 8)
+DECLARE_OPEN_WRAPPER(qwen35, 6)
+DECLARE_OPEN_WRAPPER(qwen38, 7)
+DECLARE_OPEN_WRAPPER(deepseek_v4, 8)
+DECLARE_OPEN_WRAPPER(deepseek_v41, 9)
 
 #define FIXTURE_ADAPTER(name)                                                  \
     {                                                                          \
@@ -401,6 +414,7 @@ static const ColiSegmentAdapter g_adapters[] = {
     FIXTURE_ADAPTER(kimi),
     FIXTURE_ADAPTER(olmoe),
     FIXTURE_ADAPTER(qwen36),
+    FIXTURE_ADAPTER(qwen35),
     FIXTURE_ADAPTER(qwen38),
     FIXTURE_ADAPTER(deepseek_v4),
     FIXTURE_ADAPTER(deepseek_v41),

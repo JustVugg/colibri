@@ -89,6 +89,20 @@
       "real_adapter_required": true
     },
     {
+      "family_id": "qwen35",
+      "state_schema": "fixture/qwen35-kv-deltanet-conv-v1",
+      "state_components": [
+        "attention_kv",
+        "deltanet_recurrent",
+        "convolution_ring"
+      ],
+      "oracle": {
+        "kind": "real_checkpoint",
+        "path": "tools/make_qwen36_oracle.py"
+      },
+      "real_adapter_required": true
+    },
+    {
       "family_id": "qwen38",
       "state_schema": "fixture/qwen38-hyper-qsa-ple-v1",
       "state_components": [

@@ -12,9 +12,9 @@ miliardi a 2,8 mila miliardi di parametri** — su hardware consumer ed eterogen
 in C puro e senza dipendenze del motore, trattando storage, RAM e VRAM come
 un'unica gerarchia di inferenza.
 
-Oggi girano nove famiglie: **GLM-5.2/5.3** (744B), **GLM-5.3-Flash** (321B, con
+Oggi girano dieci famiglie: **GLM-5.2/5.3** (744B), **GLM-5.3-Flash** (321B, con
 vision), **Inkling** (975B), **Kimi K3** (2,8T), **DeepSeek V4 Flash** (284B), **DeepSeek V4.1 Flash** (552B, con visione),
-**Qwen3.8-Flash-Next** (125B + 51B n-gram), **Qwen3.6** (35B-A3B) e
+**Qwen3.8-Flash-Next** (125B + 51B n-gram), **Qwen3.6** (35B-A3B), **Qwen3.5** (4B/9B densi) e
 **OLMoE** (7B) — un
 file C ciascuna, la stessa interfaccia `coli chat` / `coli serve` / `coli web`. [Elenco completo](README.md#other-supported-models)
 
@@ -338,8 +338,8 @@ e per il gateway API opzionale.
   end-to-end, revisionati e sviluppati apertamente.
 - **Più modelli aperti.** L'algoritmo di tiering è indipendente dal modello:
   qualsiasi MoE con expert instradati può essere organizzato allo stesso modo.
-  Nove famiglie funzionano già (GLM-5.2, GLM-5.3-Flash con la vision,
-  Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, Qwen3.8-Flash-Next, Qwen3.6, OLMoE);
+  Dieci famiglie funzionano già (GLM-5.2, GLM-5.3-Flash con la vision,
+  Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, Qwen3.8-Flash-Next, Qwen3.6, Qwen3.5, OLMoE);
   altre famiglie open-weight, **MiniMax** tra le candidate, si guadagnano un
   engine come le prime otto: quando qualcuno le misura end-to-end.
 

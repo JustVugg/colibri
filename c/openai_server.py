@@ -2183,7 +2183,7 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
                                     tool_choice, audio_out=audio_out)
     renderer = (render_chat_glm53 if ARCH == "glm53" else
                 render_chat_kimi if ARCH == "kimi" else
-                render_chat_qwen if ARCH == "qwen36" else
+                render_chat_qwen if ARCH in ("qwen35", "qwen36") else
                 render_chat_qwen38 if ARCH == "qwen38" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
                 render_chat_dsv41 if ARCH == "deepseek_v41" else

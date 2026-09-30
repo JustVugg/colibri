@@ -1204,14 +1204,18 @@ static void validate_cfg(const Cfg *c, int n_layers_from_config) {
              n_layers_from_config, c->n_layers);
     CFG_NEED(c->hidden > 0 && c->hidden <= 65536, "hidden %d out of range", c->hidden);
     CFG_NEED(c->vocab > 0, "vocab %d must be positive", c->vocab);
-    CFG_NEED(c->n_experts > 0 && c->n_experts <= 1024,
-             "num_experts %d out of range 1..1024 (keep[] in moe())", c->n_experts);
-    CFG_NEED(c->topk > 0 && c->topk <= 256,
-             "topk %d out of range 1..256 (idx[]/val[] in moe())", c->topk);
-    CFG_NEED(c->topk <= c->n_experts, "topk %d exceeds num_experts %d",
-             c->topk, c->n_experts);
-    CFG_NEED(c->inter > 0 && c->shared_inter > 0,
-             "moe_inter %d / shared_inter %d must be positive", c->inter, c->shared_inter);
+    /* num_experts == 0 is dense Qwen3.5 (model_type qwen3_5): same hybrid trunk,
+     * one plain MLP per layer, run on the shared-expert path in moe(). */
+    CFG_NEED(c->n_experts >= 0 && c->n_experts <= 1024,
+             "num_experts %d out of range 0..1024 (keep[] in moe())", c->n_experts);
+    if (c->n_experts > 0) {
+        CFG_NEED(c->topk > 0 && c->topk <= 256,
+                 "topk %d out of range 1..256 (idx[]/val[] in moe())", c->topk);
+        CFG_NEED(c->topk <= c->n_experts, "topk %d exceeds num_experts %d",
+                 c->topk, c->n_experts);
+        CFG_NEED(c->inter > 0, "moe_inter %d must be positive", c->inter);
+    }
+    CFG_NEED(c->shared_inter > 0, "shared_inter %d must be positive", c->shared_inter);
     CFG_NEED(c->q_heads > 0 && c->kv_heads > 0 && c->head_dim > 0,
              "attention dims q_heads=%d kv_heads=%d head_dim=%d must be positive",
              c->q_heads, c->kv_heads, c->head_dim);
@@ -1384,7 +1388,8 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         #define LD(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,ai); l->field = load_t_n(m,nm,(want))
         LD(in_ln,  "input_layernorm.weight", c->hidden);
         LD(post_ln,"post_attention_layernorm.weight", c->hidden);
-        LD(gate, "mlp.gate.weight", (int64_t)c->n_experts * c->hidden);
+        if (c->n_experts > 0) { LD(gate, "mlp.gate.weight", (int64_t)c->n_experts * c->hidden); }
+        else l->gate = NULL;
         #undef LD
         /* q/k norms are per-head [head_dim]; only on attention layers, load if present */
         if (c->has_qk_norm) {
@@ -1398,7 +1403,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         if (st_has(&m->S, nm)) { l->gate_bias = falloc(c->n_experts); st_read_f32(&m->S, nm, l->gate_bias, 0); }
         else l->gate_bias = NULL;
         /* shared expert (dense f32) */
-        #define LD2(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert." suffix,ai); l->field = load_t_n(m,nm,(want))
+        #define LD2(field, suffix, want) snprintf(nm,sizeof(nm),c->n_experts ? "model.layers.%d.mlp.shared_expert." suffix : "model.layers.%d.mlp." suffix,ai); l->field = load_t_n(m,nm,(want))
         LD2(sh_g, "gate_proj.weight", (int64_t)c->shared_inter * c->hidden);
         LD2(sh_u, "up_proj.weight",   (int64_t)c->shared_inter * c->hidden);
         LD2(sh_d, "down_proj.weight", (int64_t)c->hidden * c->shared_inter);
@@ -2197,6 +2202,13 @@ static void route_footer(FILE *f, const Model *m) {
  * weights, sum routed experts, then add the un-gated shared expert. */
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
+    if (E == 0) {   /* dense Qwen3.5: the ungated shared MLP is the whole block */
+        float *sh = falloc(c->shared_inter), *shu = falloc(c->shared_inter), *shd = falloc(D);
+        memset(out, 0, (int64_t)S*D*sizeof(float));
+        qwen_shared_experts_cpu(m, l, x, S, out, sh, shu, shd);
+        free(sh); free(shu); free(shd);
+        return;
+    }
     float *logits = falloc((int64_t)S*E);
     double _tr = tm_now();
     matmul_d(logits, x, l->gate, S, D, E);
@@ -2638,7 +2650,7 @@ static void *pilot_worker(void *arg) {
 }
 
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
-    if (lnext < 0 || lnext >= m->c.n_layers) return;
+    if (lnext < 0 || lnext >= m->c.n_layers || m->c.n_experts == 0) return;
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts;
     ensure_pilot_worker_started(m);
     float *logits = falloc((int64_t)S * E);
@@ -3345,7 +3357,7 @@ int main(int argc, char **argv) {
     int tier_ready = expert_is_fp8
         ? qt_init_fp8(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter,
                       cap, m.c.topk, E4M3_LUT)
-        : qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
+        : qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, m.c.n_experts ? cap : 0, m.c.topk,
                   m.c.expert_gs, expert_is_half ? 2 : expert_is_int4);
     if (tier_ready) {
         fprintf(stderr, expert_is_fp8 ? "[gpu] MoE experts -> CUDA VRAM tier (fmt=8 FP8 E4M3)\n"

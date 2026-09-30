@@ -1021,6 +1021,8 @@ class FamilyRegistryTest(unittest.TestCase):
             # there lands on an EOS special (measured gen=0).
             "qwen36": "<|im_start|>user\nhello {world}<|im_end|>\n"
                       "<|im_start|>assistant\n<think>\n",
+            "qwen35": "<|im_start|>user\nhello {world}<|im_end|>\n"
+                      "<|im_start|>assistant\n<think>\n",
             "qwen38": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully "
                       "through the task, validate key assumptions, consider plausible alternatives, "
                       "and prioritize correctness, consistency, and clarity in the final answer."

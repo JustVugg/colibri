@@ -168,27 +168,38 @@ def _glm_geometry(config, context, _model_dir):
     return PlannerGeometry(state, 0, workspace, experts)
 
 
-def _qwen36_geometry(config, context, _model_dir):
+def _qwen_hybrid_state(config, context, family):
     """Hybrid: only the full_attention layers hold a KV cache; the linear
     (DeltaNet) layers carry a recurrent state whose size does not depend on the
     context at all. One scaled context term would over-promise on a model where
     30 of 40 layers never grow."""
-    layers = _required_int(config, "num_hidden_layers", "qwen36")
+    layers = _required_int(config, "num_hidden_layers", family)
     kinds = config.get("layer_types")
     if not isinstance(kinds, list) or len(kinds) != layers:
-        raise ValueError("qwen36: missing or invalid planning key 'layer_types'")
+        raise ValueError(f"{family}: missing or invalid planning key 'layer_types'")
     full = sum(kind == "full_attention" for kind in kinds)
-    kv = (full * context * _required_int(config, "num_key_value_heads", "qwen36") *
-          _required_int(config, "head_dim", "qwen36") * 2 * 4)
-    key_heads = _required_int(config, "linear_num_key_heads", "qwen36")
-    key_dim = _required_int(config, "linear_key_head_dim", "qwen36")
-    value_heads = _required_int(config, "linear_num_value_heads", "qwen36")
-    value_dim = _required_int(config, "linear_value_head_dim", "qwen36")
-    conv_k = _required_int(config, "linear_conv_kernel_dim", "qwen36", 2)
+    kv = (full * context * _required_int(config, "num_key_value_heads", family) *
+          _required_int(config, "head_dim", family) * 2 * 4)
+    key_heads = _required_int(config, "linear_num_key_heads", family)
+    key_dim = _required_int(config, "linear_key_head_dim", family)
+    value_heads = _required_int(config, "linear_num_value_heads", family)
+    value_dim = _required_int(config, "linear_value_head_dim", family)
+    conv_k = _required_int(config, "linear_conv_kernel_dim", family, 2)
     conv_dim = key_heads * key_dim * 2 + value_heads * value_dim
     fixed = (layers - full) * (value_heads * key_dim * value_dim +
                                conv_dim * (conv_k - 1)) * 4
+    return kv, fixed
+
+
+def _qwen36_geometry(config, context, _model_dir):
+    kv, fixed = _qwen_hybrid_state(config, context, "qwen36")
     return PlannerGeometry(kv, fixed, 0, _required_int(config, "num_experts", "qwen36"))
+
+
+def _qwen35_geometry(config, context, _model_dir):
+    """Dense Qwen3.5: the Qwen3.6 hybrid trunk with one plain MLP per layer."""
+    kv, fixed = _qwen_hybrid_state(config, context, "qwen35")
+    return PlannerGeometry(kv, fixed, 0, 0)
 
 
 _QWEN38_PREFILL_BATCH_ROWS = 32
@@ -1231,6 +1242,35 @@ FAMILIES = (
         # prompt template -- a wrong template does not fail loudly, it degrades
         # the answer. False gives the user "use coli chat or coli serve", which
         # is true and actionable; chat/serve/web all work through the gateway.
+        has_cli_adapter=False,
+        tune_prompt_template=(
+            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"),
+    ),
+    FamilyDescriptor(
+        # Dense Qwen3.5 (4B/9B): same Gated DeltaNet + gated-attention trunk as
+        # Qwen3.6, with a dense MLP instead of the MoE block. qwen36.c runs it
+        # (num_experts == 0 in qwen36_meta.json); convert with convert_qwen36.py.
+        id="qwen35",
+        model_types=("qwen3_5", "qwen3_5_text"),
+        display_name="Qwen3.5-4B",
+        display_scale="4B",
+        engine_artifact="qwen36",
+        engine_aliases=(),
+        engine_group="qwen36",
+        internal_arch="qwen35",
+        build_target="qwen36",
+        process_names=("qwen36",),
+        default_model_id="qwen3.5-colibri",
+        cli_adapter="qwen36",
+        gateway_adapter="qwen36",
+        planner_id="qwen36_hybrid",
+        planner_geometry=_qwen35_geometry,
+        planner_unsupported_reason="",
+        expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
+        config_section="text_config",
+        limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 8, "Q36_MAXT"),
+        capabilities=FamilyCapabilities(False, False, False, True),
+        has_gateway_adapter=True,
         has_cli_adapter=False,
         tune_prompt_template=(
             "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"),
