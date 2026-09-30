@@ -20,7 +20,7 @@ int dsv4_cuda_init(const int *devices, int count) {
     for (int i = 0; i < count; i++)
         if (devices[i] < 0 || devices[i] >= 6) return 0;
     initialized = count;
-    assert(devices[0] == 5);
+    assert(count == 1 || devices[0] == 5);
     return 1;
 }
 void dsv4_cuda_shutdown(void) { shutdowns++; }
@@ -231,10 +231,11 @@ int coli_v4_layer_load(ColiV4Engine *engine, ColiDeepSeekV4LayerWeights *weights
     weights->plan.layer = layer;
     return 0;
 }
+static int shared_missing;
 void *coli_v4_layer_gpu(const ColiDeepSeekV4LayerWeights *weights, const char *prefix) {
     (void)weights; (void)prefix;
     static Dsv4CudaTensor shared;
-    return &shared;
+    return shared_missing ? NULL : &shared;
 }
 static void test_preload(void) {
     ColiV4Engine *engine = calloc(1, sizeof(*engine));
@@ -251,6 +252,19 @@ static void test_preload(void) {
     store.gpu = v4_gpu_expert_mirrors_create_devices(engine->gpu.devices, 2, 6);
     void *original = store.gpu;
     char error[256];
+    shared_missing = 1;
+    unsetenv("DSV4_CUDA_RESIDENT_EXPERTS");
+    assert(coli_v4_gpu_experts_init(engine, error, sizeof(error)) == 0);
+    assert(store.gpu == original && !live_tensors && !error[0]);
+    setenv("DSV4_CUDA_RESIDENT_EXPERTS", "1", 1);
+    assert(coli_v4_gpu_experts_init(engine, error, sizeof(error)) == -1);
+    assert(store.gpu == original && !live_tensors && error[0]);
+    setenv("DSV4_CUDA_RESIDENT_EXPERTS", "0", 1);
+    int calls = lookups;
+    assert(coli_v4_gpu_experts_init(engine, error, sizeof(error)) == 0);
+    assert(lookups == calls && store.gpu == original);
+    unsetenv("DSV4_CUDA_RESIDENT_EXPERTS");
+    shared_missing = 0;
     low_memory_device = 3;
     assert(coli_v4_gpu_experts_preload(engine, error, sizeof(error)) == 1);
     assert(store.gpu == original && lookups == 0 && !live_tensors);
@@ -258,6 +272,18 @@ static void test_preload(void) {
     upload_fail_after = 20; /* fail on the second device after publishing none */
     assert(coli_v4_gpu_experts_preload(engine, error, sizeof(error)) == -1);
     assert(store.gpu == original && !active_leases && !live_tensors && releases == lookups);
+    setenv("DSV4_CUDA_RESIDENT_EXPERTS", "auto", 1);
+    upload_fail_after = 20;
+    assert(coli_v4_gpu_experts_init(engine, error, sizeof(error)) == 0);
+    assert(store.gpu == original && !live_tensors && !error[0]);
+    setenv("DSV4_CUDA_RESIDENT_EXPERTS", "1", 1);
+    upload_fail_after = 20;
+    assert(coli_v4_gpu_experts_init(engine, error, sizeof(error)) == -1);
+    assert(store.gpu == original && !live_tensors && error[0]);
+    unsetenv("DSV4_CUDA_RESIDENT_EXPERTS");
+    upload_fail_after = 20;
+    assert(coli_v4_gpu_experts_init(engine, error, sizeof(error)) == 0);
+    assert(store.gpu == original && !live_tensors && !error[0]);
     upload_fail_after = -1;
     lookup_fail_after = 7;
     assert(coli_v4_gpu_experts_preload(engine, error, sizeof(error)) == -1);
@@ -401,6 +427,15 @@ int main(void) {
     setenv("DSV4_CUDA_DEVICES", "0,99", 1);
     assert(coli_v4_gpu_engine_open(engine) == -1);
     assert(!store.gpu && shutdowns == 1);
+    unsetenv("DSV4_CUDA_DEVICES");
+    setenv("DSV4_CUDA_DEVICE", "not-a-number", 1);
+    assert(coli_v4_gpu_engine_open(engine) == 0);
+    assert(engine->gpu.enabled && engine->gpu.device == 0);
+    coli_v4_gpu_engine_close(engine);
+    setenv("DSV4_CUDA_DEVICE", "99", 1);
+    assert(coli_v4_gpu_engine_open(engine) == 0);
+    assert(!engine->gpu.enabled && !store.gpu);
+    unsetenv("DSV4_CUDA_DEVICE");
     free(engine);
     test_preload();
     test_resident_route();

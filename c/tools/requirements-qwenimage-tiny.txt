@@ -1,0 +1,13 @@
+# Pinned dependencies for the Qwen-Image-2.1 tiny oracle (tools/make_qwenimage_tiny.py,
+# tools/make_qwenimage_vae_tiny.py). QwenImage21Pipeline is not in a diffusers
+# release yet, so diffusers is pinned to the commit the reference was built with.
+# No torchvision: the fixture builds the processor without the video part, which
+# text-to-image never calls.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu; sys_platform != "darwin"
+torch==2.14.0; sys_platform == "darwin"
+safetensors==0.8.0
+transformers==5.17.0
+numpy
+pillow
+diffusers @ git+https://github.com/huggingface/diffusers@80c7ed262aeffbeb43ef13ae04baeb9b84515a69

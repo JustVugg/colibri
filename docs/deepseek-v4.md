@@ -303,14 +303,13 @@ is no software path to fall back to.
 | CPU only (no DLL / `DSV4_CUDA=0` / Linux default) | — | CPU reference | CPU reference |
 | generic DLL / `CUDA=1` | any sm_80+ | GPU attention block, indexer, generic batched MoE on the VRAM bank | GPU attention, indexer, expert mirrors |
 | generic, pre-Ampere / `CUDA=1 CUDA_ARCH=portable-pre-ampere NO_TC=1` | sm_61 (Pascal), sm_75 (Turing) | as generic | as generic |
+| multi-GPU layer placement | up to 16 visible CUDA devices | contiguous layer ranges, with dense mirrors and KV on the owning device | per-device expert caches; layers still execute sequentially |
 
 The runtime check `dsv4_cuda_backend_arch_ok` admits sm_60 and up for the
 generic build. It is deliberately independent of what the binary contains: a
 `CUDA_ARCH=portable` build has no sm_61/sm_75 cubin, and running it on such a
-card fails at launch with "no kernel image is available" rather than producing
+card fails at launch with `"no kernel image is available"` rather than producing
 a wrong answer. Build with `portable-pre-ampere` for those cards.
-| DeepGEMM DLL / `CUDA=1 DEEPGEMM=1` | compute 12.x | as generic + tensor-core dense/MoE GEMMs | same as generic |
-| multi-GPU layer placement | up to 16 visible CUDA devices | contiguous layer ranges, with dense mirrors and KV on the owning device | per-device expert caches; layers still execute sequentially |
 
 ### Multiple GPUs: layer placement
 

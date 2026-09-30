@@ -5,9 +5,9 @@ Il gateway rende i prompt a mano invece di far girare jinja a ogni richiesta, e
 quella scelta si paga in un modo solo: la copia scritta a mano puo' scostarsi
 dall'originale senza che nessuno se ne accorga, perche' il modello risponde
 comunque. Qui il template vero viene reso con jinja2 e confrontato byte per byte
-con quello che produce il gateway, senza strumenti (che il motore qwen36 non
-espone) e sui due rami del blocco di ragionamento, piu' il turno aperto della
-prosecuzione.
+con quello che produce il gateway, con e senza strumenti, sui due rami del
+blocco di ragionamento, per ciascuno con e senza preserve_thinking (#1759),
+piu' il turno aperto della prosecuzione.
 
 Se manca il template o jinja2, il test si dichiara SALTATO invece di passare: un
 test che non ha trovato il suo riferimento non ha verificato niente, e dirlo
@@ -41,12 +41,87 @@ CASES = {
                      {"role": "assistant", "content": "2"},
                      {"role": "user", "content": "e 2+2?"}],
     },
+    # Il ragionamento rimandato dal client: il template lo scrive solo con
+    # preserve_thinking, altrimenti lo toglie.
+    "ragionamento in cronologia": {
+        "messages": [{"role": "user", "content": "1+1?"},
+                     {"role": "assistant", "content": "2", "reasoning_content": "uno piu' uno"},
+                     {"role": "user", "content": "e 2+2?"}],
+    },
+    # Un client che rimanda la risposta grezza: il template separa il blocco dal
+    # contenuto a </think>.
+    "risposta grezza in cronologia": {
+        "messages": [{"role": "user", "content": "1+1?"},
+                     {"role": "assistant", "content": "<think>\nuno piu' uno\n</think>\n\n2"},
+                     {"role": "user", "content": "e 2+2?"}],
+    },
+    # Un turno assistant DOPO l'ultima domanda tiene il blocco anche senza
+    # preserve_thinking (last_query_index del template).
+    "assistant dopo l'ultima domanda": {
+        "messages": [{"role": "user", "content": "1+1?"},
+                     {"role": "assistant", "content": "2"}],
+    },
+    "dichiarazione e chiamata tool": {
+        "messages": [{"role": "user", "content": "Weather in Rome?"},
+                     {"role": "assistant", "content": "", "tool_calls": [{
+                         "type": "function", "function": {
+                             "name": "weather", "arguments": {"city": "Rome"}}}]}],
+        "tools": [{"type": "function", "function": {
+            "name": "weather", "description": "Get weather for a city.",
+            "parameters": {"type": "object", "properties": {
+                "city": {"type": "string"}}, "required": ["city"]}}}],
+    },
+    "risposta tool": {
+        "messages": [{"role": "user", "content": "Weather in Rome?"},
+                     {"role": "assistant", "content": "", "tool_calls": [{
+                         "type": "function", "function": {
+                             "name": "weather", "arguments": {"city": "Rome"}}}]},
+                     {"role": "tool", "content": "sunny", "tool_call_id": "call_1"},
+                     {"role": "assistant", "content": "Sunny."}],
+        "tools": [{"type": "function", "function": {
+            "name": "weather", "description": "Get weather for a city.",
+            "parameters": {"type": "object", "properties": {
+                "city": {"type": "string"}}, "required": ["city"]}}}],
+    },
+    # Un giro d'agente completo: sistema piegato nel blocco strumenti, ragionamento e
+    # testo prima di due chiamate parallele (argomenti non stringa: tojson), due risposte
+    # nello stesso turno utente, poi una domanda nuova che fa perdere il blocco ai turni
+    # vecchi (senza preserve_thinking).
+    "giro d'agente con chiamate parallele": {
+        "messages": [{"role": "system", "content": "  Sei un agente.  "},
+                     {"role": "user", "content": "Meteo a Roma e Milano?"},
+                     {"role": "assistant", "content": "Controllo.",
+                      "reasoning_content": "servono due chiamate",
+                      "tool_calls": [
+                          {"type": "function", "function": {
+                              "name": "weather",
+                              "arguments": {"city": "Roma", "days": 2, "metric": True}}},
+                          {"type": "function", "function": {
+                              "name": "weather",
+                              "arguments": {"city": "Milano", "opts": {"a": [1, 2]}}}}]},
+                     {"role": "tool", "content": "sole", "tool_call_id": "c1"},
+                     {"role": "tool", "content": "pioggia", "tool_call_id": "c2"},
+                     {"role": "assistant", "content": "Roma sole, Milano pioggia."},
+                     {"role": "user", "content": "grazie"}],
+        "tools": [{"type": "function", "function": {
+            "name": "weather", "description": "Get weather for a city.",
+            "parameters": {"type": "object", "properties": {
+                "city": {"type": "string"}, "days": {"type": "integer"}},
+                "required": ["city"]}}}],
+    },
+    # Un turno di sistema vuoto senza strumenti: il template lo scrive lo stesso.
+    "sistema vuoto": {
+        "messages": [{"role": "system", "content": ""},
+                     {"role": "user", "content": "ciao"}],
+    },
 }
 
 THINKING = (True, False)
+PRESERVE = (False, True)
 
 
-def reference(template_text, *, messages, enable_thinking=True, add_generation_prompt=True):
+def reference(template_text, *, messages, tools=None, enable_thinking=True,
+              add_generation_prompt=True, preserve_thinking=False):
     import jinja2
 
     def raise_exception(message):
@@ -59,7 +134,8 @@ def reference(template_text, *, messages, enable_thinking=True, add_generation_p
     environment.globals["raise_exception"] = raise_exception
     rendered = environment.from_string(template_text)
     return rendered.render(messages=messages, add_generation_prompt=add_generation_prompt,
-                           enable_thinking=enable_thinking)
+                           enable_thinking=enable_thinking, tools=tools,
+                           preserve_thinking=preserve_thinking)
 
 
 def show(label, ours, theirs):
@@ -98,17 +174,23 @@ def main() -> int:
 
     failures = 0
     for enable_thinking in THINKING:
-        for label, case in CASES.items():
-            name = f"{label} [thinking={enable_thinking}]"
-            theirs = reference(template_text, messages=case["messages"],
-                               enable_thinking=enable_thinking)
-            ours = openai_server.render_chat_qwen(case["messages"],
-                                                  enable_thinking=enable_thinking)
-            if ours == theirs:
-                print(f"ok   {name}")
-            else:
-                show(name, ours, theirs)
-                failures += 1
+        for preserve_thinking in PRESERVE:
+            for label, case in CASES.items():
+                name = (f"{label} [thinking={enable_thinking} "
+                        f"preserve_thinking={preserve_thinking}]")
+                theirs = reference(template_text, messages=case["messages"],
+                                   tools=case.get("tools"),
+                                   enable_thinking=enable_thinking,
+                                   preserve_thinking=preserve_thinking)
+                ours = openai_server.render_chat_qwen(case["messages"],
+                                                      tools=case.get("tools"),
+                                                      enable_thinking=enable_thinking,
+                                                      preserve_thinking=preserve_thinking)
+                if ours == theirs:
+                    print(f"ok   {name}")
+                else:
+                    show(name, ours, theirs)
+                    failures += 1
 
     # Prosecuzione: l'ultimo turno assistant e' da CONTINUARE. Come qwen38, ChatML chiude
     # ogni turno con <|im_end|> e il template non ha un ramo di continuazione, quindi la

@@ -3998,7 +3998,7 @@ int main(int argc, char **argv) {
     int *draft = block ? xmalloc((size_t)(block + 1) * sizeof(int), "drafts") : NULL;
     float *confidence = block ? xmalloc((size_t)block * sizeof(float), "draft confidence") : NULL;
     int spec_failed = 0, spec_checked = 0, round = 0;
-    uint64_t forced_prop = 0, forced_acc = 0;
+    uint64_t forced_prop = 0, forced_acc = 0, forced_rounds = 0;
 
     int matched = 0;
     double decode_started = now_s();
@@ -4045,10 +4045,16 @@ int main(int argc, char **argv) {
             /* 3 keeps the head's own drafts, which is what serving does; 1 and 2 put
              * the reference's tokens in their place so the verification path runs at
              * full width even on a fixture whose draft head is random noise */
-            if (force < 3) {
+            if (force != 3) {
                 for (int i = 0; i < drafted; i++) draft[1 + i] = expected[step + i];
-                if (force >= 2 && drafted > 0)
-                    draft[drafted] = (draft[drafted] + 1) % c->vocab;   /* one bad draft */
+                /* 2 rejects the last draft, 4 the first -- every drafted row is
+                 * rolled back, which is what serving at 10-30% acceptance does most
+                 * of the time -- and 5 a different one each round */
+                int bad = force == 2 ? drafted : force == 4 ? 1
+                        : force == 5 ? 1 + (int)(forced_rounds % (uint64_t)drafted) : 0;
+                if (bad > 0 && drafted > 0)
+                    draft[bad] = (draft[bad] + 1) % c->vocab;             /* one bad draft */
+                forced_rounds++;
             }
         } else {
             drafted = 0;                       /* the plain oracle decodes one at a time */

@@ -19,10 +19,17 @@ export interface ChatMessage {
      the message so it travels with the transcript through slot switches and
      archives; never sent to the server. */
   finish?: string
+  /* Both turns of a text-to-image exchange, the prompt and its picture, carry
+     mode "image". They stay in the conversation on screen but are never sent to
+     a text model, which would read a question followed by an empty answer. */
+  mode?: "image"
+  /* The picture of an image turn: the request while it runs, then the result.
+     `url` appears only once the image is finished. */
+  generated?: GeneratedImage
 }
 
 interface OpenAIError {
-  error?: { message?: string }
+  error?: { message?: string; param?: string | null }
 }
 
 export interface SchedulerHealth {
@@ -122,11 +129,28 @@ async function responseError(response: Response) {
   }
 }
 
-export async function listModels(baseUrl: string, apiKey: string, signal?: AbortSignal) {
+export interface ModelInfo {
+  id: string
+  /* What a model does beyond chat. colibri marks an image model with
+     "image_generation": it answers /v1/images/generations and refuses chat. */
+  capabilities?: string[]
+}
+
+export async function listModelInfo(baseUrl: string, apiKey: string, signal?: AbortSignal): Promise<ModelInfo[]> {
   const response = await fetch(endpoint(baseUrl, "models"), { headers: headers(apiKey), signal })
   if (!response.ok) throw new Error(await responseError(response))
-  const body = (await response.json()) as { data?: Array<{ id: string }> }
-  return (body.data || []).map((model) => model.id)
+  const body = (await response.json()) as { data?: Array<{ id: string; capabilities?: unknown }> }
+  return (body.data || []).map(({ id, capabilities }) => Array.isArray(capabilities)
+    ? { id, capabilities: capabilities.filter((item): item is string => typeof item === "string") }
+    : { id })
+}
+
+export async function listModels(baseUrl: string, apiKey: string, signal?: AbortSignal) {
+  return (await listModelInfo(baseUrl, apiKey, signal)).map((model) => model.id)
+}
+
+export function generatesImages(model: ModelInfo | undefined) {
+  return !!model?.capabilities?.includes("image_generation")
 }
 
 export async function getHealth(baseUrl: string, apiKey = "", signal?: AbortSignal): Promise<HealthResponse> {
@@ -151,6 +175,32 @@ export function extractSSE(buffer: string) {
       .map((line) => line.slice(5).trimStart()),
   )
   return { data, rest }
+}
+
+export interface SSEEvent {
+  event: string
+  data: string
+}
+
+/* extractSSE with the event names kept. The image endpoint tells progress,
+   previews and the result apart by the `event:` line, not by the payload, so the
+   name has to survive parsing. A frame without an event line is a "message" (the
+   SSE default), which is how `data: [DONE]` arrives; comment lines such as
+   ": keepalive" and frames without data are dropped, as the spec says. */
+export function extractSSEEvents(buffer: string): { events: SSEEvent[]; rest: string } {
+  const frames = buffer.split(/\r?\n\r?\n/)
+  const rest = frames.pop() || ""
+  const events: SSEEvent[] = []
+  for (const frame of frames) {
+    let event = "message"
+    const data: string[] = []
+    for (const line of frame.split(/\r?\n/)) {
+      if (line.startsWith("event:")) event = line.slice(6).trim() || "message"
+      else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""))
+    }
+    if (data.length) events.push({ event, data: data.join("\n") })
+  }
+  return { events, rest }
 }
 
 export interface StreamChatOptions {
@@ -271,4 +321,202 @@ export async function askBrio(
   })
   if (!response.ok) throw new Error(await responseError(response))
   return (await response.json()) as BrioResponse
+}
+
+/* ---- text-to-image ----------------------------------------------------------
+ * POST /v1/images/generations, in the OpenAI shape plus colibri's `steps`,
+ * `seed` and the `colibri` block of the answer. With `stream: true` the gateway
+ * sends named SSE events: progress while the engine works, partial_image when
+ * it has a preview, completed with the same object the plain request returns. */
+
+export type ImageStage = "encode" | "denoise" | "decode"
+
+export interface ImageProgress {
+  stage: ImageStage
+  step: number
+  steps: number
+  elapsed: number
+}
+
+export interface ImageTimings {
+  encode?: number
+  denoise?: number
+  decode?: number
+}
+
+export interface ImageGenerationResponse {
+  created: number
+  data: Array<{ b64_json?: string; url?: string; revised_prompt?: string | null }>
+  colibri?: { width: number; height: number; seed: number; steps: number; timings?: ImageTimings }
+}
+
+/* One picture of the conversation. The request fields are known from the
+   start; url, seconds and timings arrive with the result, and seed becomes the
+   one the engine reports having used. */
+export interface GeneratedImage {
+  prompt: string
+  width: number
+  height: number
+  steps: number
+  seed: number
+  url?: string
+  seconds?: number
+  timings?: ImageTimings
+}
+
+export interface GenerateImageOptions {
+  baseUrl: string
+  apiKey: string
+  model: string
+  prompt: string
+  width: number
+  height: number
+  steps: number
+  seed: number
+  signal: AbortSignal
+  onProgress?: (progress: ImageProgress) => void
+  /* A preview as a data URI, small and noisy: the latent of the step so far. */
+  onPartial?: (url: string, index: number) => void
+  /* Streaming was not available and the picture is being made by one plain
+     request: nothing more will arrive until it is done. */
+  onPlainRequest?: () => void
+}
+
+/* The stream did not work as a stream (no body, or a close before the first
+   event), so the same request is worth making once without it. Not raised for
+   an HTTP error, an abort or a stream that broke halfway: those would only
+   start the same generation over, or hide the server's own message. */
+class StreamUnavailable extends Error {}
+
+const IMAGE_EVENT = {
+  progress: "image_generation.progress",
+  partial: "image_generation.partial_image",
+  completed: "image_generation.completed",
+}
+
+function imageRequest(options: GenerateImageOptions, stream: boolean) {
+  return {
+    method: "POST",
+    headers: headers(options.apiKey),
+    signal: options.signal,
+    body: JSON.stringify({
+      model: options.model,
+      prompt: options.prompt,
+      size: `${options.width}x${options.height}`,
+      n: 1,
+      response_format: "b64_json",
+      steps: options.steps,
+      seed: options.seed,
+      stream,
+    }),
+  }
+}
+
+async function imageError(response: Response) {
+  const fallback = `${response.status} ${response.statusText}`
+  try {
+    const body = (await response.json()) as OpenAIError
+    if (response.status === 400 && body.error?.param === "stream") return new StreamUnavailable(body.error.message || fallback)
+    return new Error(body.error?.message || fallback)
+  } catch {
+    return new Error(fallback)
+  }
+}
+
+function streamError(data: string) {
+  try {
+    const body = JSON.parse(data) as OpenAIError & { message?: string }
+    return new Error(body.error?.message || body.message || data)
+  } catch {
+    return new Error(data)
+  }
+}
+
+async function streamImage(options: GenerateImageOptions): Promise<ImageGenerationResponse> {
+  const response = await fetch(endpoint(options.baseUrl, "images/generations"), imageRequest(options, true))
+  if (!response.ok) throw await imageError(response)
+  /* A server that ignores `stream` answers with the plain object: that is the
+     result, not a failure, and asking again would generate a second picture. */
+  if ((response.headers.get("content-type") || "").includes("application/json")) {
+    return (await response.json()) as ImageGenerationResponse
+  }
+  if (!response.body) throw new StreamUnavailable("The server returned an empty stream.")
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  let seen = false
+  let finished = false
+  let result: ImageGenerationResponse | null = null
+
+  const consume = ({ event, data }: SSEEvent) => {
+    seen = true
+    if (data === "[DONE]") { finished = true; return }
+    if (event === "error") throw streamError(data)
+    const payload = JSON.parse(data) as Record<string, unknown>
+    if (payload.error) throw streamError(data)
+    if (event === IMAGE_EVENT.progress) options.onProgress?.(payload as unknown as ImageProgress)
+    else if (event === IMAGE_EVENT.partial && typeof payload.b64_json === "string") {
+      options.onPartial?.(`data:image/png;base64,${payload.b64_json}`, Number(payload.partial_image_index) || 0)
+    } else if (event === IMAGE_EVENT.completed) result = payload as unknown as ImageGenerationResponse
+  }
+
+  /* [DONE] ends the read even if the connection stays open; an error event
+     cancels the body so the gateway sees the client leave. */
+  try {
+    while (!finished) {
+      const { value, done } = await reader.read()
+      const before = buffer.length
+      buffer += decoder.decode(value, { stream: !done })
+      /* A frame ends at a blank line. A chunk that brings none cannot complete
+         one, so the pending frame (the finished image is megabytes of base64)
+         is not split again: re-splitting it on every chunk was quadratic. The
+         three characters before the chunk catch a boundary cut in half. */
+      if (done || /\r?\n\r?\n/.test(buffer.slice(Math.max(0, before - 3)))) {
+        const parsed = extractSSEEvents(buffer)
+        buffer = parsed.rest
+        parsed.events.forEach(consume)
+      }
+      if (done) break
+    }
+  } catch (cause) {
+    reader.cancel().catch(() => undefined)
+    throw cause
+  }
+  if (finished) reader.cancel().catch(() => undefined)
+  if (result) return result
+  if (!seen) throw new StreamUnavailable("The server closed the stream without sending anything.")
+  throw new Error("The server closed the stream before the image was finished.")
+}
+
+async function requestImage(options: GenerateImageOptions): Promise<ImageGenerationResponse> {
+  const response = await fetch(endpoint(options.baseUrl, "images/generations"), imageRequest(options, false))
+  if (!response.ok) throw await imageError(response)
+  return (await response.json()) as ImageGenerationResponse
+}
+
+/* Streams when it can, so the page can show the stage and the previews; falls
+   back to one plain request when streaming is not available. */
+export async function generateImage(options: GenerateImageOptions): Promise<GeneratedImage> {
+  let answer: ImageGenerationResponse
+  try {
+    answer = await streamImage(options)
+  } catch (cause) {
+    if (!(cause instanceof StreamUnavailable) || options.signal.aborted) throw cause
+    options.onPlainRequest?.()
+    answer = await requestImage(options)
+  }
+  const picture = answer.data?.[0]
+  const url = picture?.b64_json ? `data:image/png;base64,${picture.b64_json}` : picture?.url
+  if (!url) throw new Error("The server answered without an image.")
+  const info = answer.colibri
+  return {
+    prompt: options.prompt,
+    width: info?.width ?? options.width,
+    height: info?.height ?? options.height,
+    steps: info?.steps ?? options.steps,
+    seed: info?.seed ?? options.seed,
+    url,
+    ...(info?.timings ? { timings: info.timings } : {}),
+  }
 }

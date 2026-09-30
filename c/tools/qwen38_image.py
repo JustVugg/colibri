@@ -169,6 +169,11 @@ def preprocess(source, model_dir=None, max_tokens=None):
         max_pixels = min(max_pixels, ceiling)
         min_pixels = min(min_pixels, max_pixels)
 
+    # The gateway hands over the bytes of a data: URI; Image.open would read
+    # them as a file name ("embedded null byte"), as glm53_image already knew.
+    if isinstance(source, (bytes, bytearray)):
+        import io
+        source = io.BytesIO(source)
     image = Image.open(source) if not hasattr(source, "mode") else source
     image = image.convert("RGB")
     width, height = image.size

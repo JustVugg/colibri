@@ -104,6 +104,59 @@ TINY_FIXTURE = tuple(
 )
 
 
+# Qwen/Qwen3.8-27B, model.safetensors.index.json (1199 tensors, fetched 2026-09-27): the
+# DENSE checkpoint of the same architecture (#1757). No router, no experts: each layer
+# carries one SwiGLU MLP under mlp.{gate,up,down}_proj. 38 text/mtp names plus 21
+# model.visual.* kinds (three listed).
+#   sha256 model.safetensors.index.json (Qwen/Qwen3.8-27B):
+#     77042094076611b69791a610065f28b7013b8c621795fa86ddccc8bac7d1b9df
+QWEN38_27B = (
+    "lm_head.weight",
+    "model.language_model.embed_tokens.weight",
+    "model.language_model.layers.N.input_layernorm.weight",
+    "model.language_model.layers.N.linear_attn.A_log",
+    "model.language_model.layers.N.linear_attn.conv1d.weight",
+    "model.language_model.layers.N.linear_attn.dt_bias",
+    "model.language_model.layers.N.linear_attn.in_proj_a.weight",
+    "model.language_model.layers.N.linear_attn.in_proj_b.weight",
+    "model.language_model.layers.N.linear_attn.in_proj_qkv.weight",
+    "model.language_model.layers.N.linear_attn.in_proj_z.weight",
+    "model.language_model.layers.N.linear_attn.norm.weight",
+    "model.language_model.layers.N.linear_attn.out_proj.weight",
+    "model.language_model.layers.N.mlp.down_proj.weight",
+    "model.language_model.layers.N.mlp.gate_proj.weight",
+    "model.language_model.layers.N.mlp.up_proj.weight",
+    "model.language_model.layers.N.post_attention_layernorm.weight",
+    "model.language_model.layers.N.self_attn.k_norm.weight",
+    "model.language_model.layers.N.self_attn.k_proj.weight",
+    "model.language_model.layers.N.self_attn.o_proj.weight",
+    "model.language_model.layers.N.self_attn.q_norm.weight",
+    "model.language_model.layers.N.self_attn.q_proj.weight",
+    "model.language_model.layers.N.self_attn.v_proj.weight",
+    "model.language_model.norm.weight",
+    "mtp.fc.weight",
+    "mtp.layers.N.input_layernorm.weight",
+    "mtp.layers.N.mlp.down_proj.weight",
+    "mtp.layers.N.mlp.gate_proj.weight",
+    "mtp.layers.N.mlp.up_proj.weight",
+    "mtp.layers.N.post_attention_layernorm.weight",
+    "mtp.layers.N.self_attn.k_norm.weight",
+    "mtp.layers.N.self_attn.k_proj.weight",
+    "mtp.layers.N.self_attn.o_proj.weight",
+    "mtp.layers.N.self_attn.q_norm.weight",
+    "mtp.layers.N.self_attn.q_proj.weight",
+    "mtp.layers.N.self_attn.v_proj.weight",
+    "mtp.norm.weight",
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.pre_fc_norm_hidden.weight",
+    "model.visual.blocks.N.attn.proj.bias",
+    "model.visual.blocks.N.attn.proj.weight",
+    "model.visual.blocks.N.attn.qkv.bias",
+)
+
+DENSE_MLP_KINDS = {"mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"}
+
+
 def _concrete(names):
     return [n.replace("N", "7") for n in names]
 
@@ -160,12 +213,26 @@ class TensorKindsTest(unittest.TestCase):
         self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"mtp"})
         self.assertEqual({p[1] for p in placed if p[0] == "global"}, set(GLOBAL_KINDS))
         self.assertEqual({p[2] for p in placed if p[0] == "layer"},
-                         set(LAYER_KINDS) - set())
+                         set(LAYER_KINDS) - DENSE_MLP_KINDS)
+
+    def test_every_27b_tensor_is_placed(self):
+        """The dense checkpoint: the MoE kinds are absent, the dense MLP is placed, the
+        vision tower is converted (#1757) and the mtp head is skipped."""
+        prefix, placed = self._classify_all(_concrete(QWEN38_27B))
+        self.assertEqual(prefix, "model.language_model.")
+        self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"mtp"})
+        vision = [p[1] for p in placed if p[0] == "vision"]
+        self.assertEqual(len(vision), 3)                       # the three listed kinds
+        self.assertTrue(all(not v.startswith("visual.") for v in vision), vision)
+        layer = {p[2] for p in placed if p[0] == "layer"}
+        self.assertTrue(DENSE_MLP_KINDS <= layer)
+        self.assertFalse({k for k in layer if k.startswith("mlp.") and k not in DENSE_MLP_KINDS})
 
     def test_every_35b_tensor_is_placed(self):
         prefix, placed = self._classify_all(_concrete(QWEN36_35B))
         self.assertEqual(prefix, "model.language_model.")
-        self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"mtp", "visual"})
+        self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"mtp"})
+        self.assertTrue(any(p[0] == "vision" for p in placed))
         self.assertEqual(sum(p[0] == "layer" for p in placed),
                          sum(p[0] == "layer" for p in self._classify_all(
                              _concrete(QWEN38_2P4T))[1]))
@@ -200,8 +267,7 @@ class TensorKindsTest(unittest.TestCase):
                     classify(name, "model.")
 
     def test_skip_groups_have_a_stated_reason(self):
-        for group in ("mtp", "visual"):
-            self.assertTrue(skip_reason(group))
+        self.assertTrue(skip_reason("mtp"))
         self.assertEqual(skip_reason("nope"), "")
 
     def test_layer_kinds_are_exact_suffixes(self):

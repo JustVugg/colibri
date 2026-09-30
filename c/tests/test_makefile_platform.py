@@ -60,6 +60,24 @@ class MakefilePlatformTests(unittest.TestCase):
                 result = self._dry_run("portable", triplet)
                 self.assertIn(expected_flag, result.stdout)
 
+    def test_vk_links_the_platform_vulkan_loader(self):
+        # Windows links -static, and ld skips import libraries under it: MSYS2
+        # ships the Vulkan loader only as libvulkan-1.dll.a, so -lvulkan never
+        # resolved. Dynamic lookup for that one library, then back to static.
+        cases = (
+            ("x86_64-unknown-linux-gnu", "-o colibri ", ["-pthread", "-lvulkan"]),
+            ("x86_64-w64-mingw32", "-o colibri.exe ",
+             ["-static", "-lpsapi", "-Wl,-Bdynamic", "-lvulkan-1", "-Wl,-Bstatic"]),
+        )
+
+        for triplet, output, tail in cases:
+            with self.subTest(triplet=triplet):
+                result = self._dry_run("colibri", triplet, VK=1)
+                link = next(
+                    line for line in result.stdout.splitlines() if output in line
+                )
+                self.assertEqual(link.split()[-len(tail):], tail)
+
     def test_darwin_portable_build_does_not_force_x86_architecture(self):
         missing_libomp = "/colibri-test/missing-libomp"
         result = self._dry_run(

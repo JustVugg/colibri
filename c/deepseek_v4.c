@@ -9950,16 +9950,7 @@ int coli_v4_engine_open(ColiV4Engine **output,
     }
 #endif
 #ifdef COLI_V4_GPU_TIER
-    const char *resident_experts = getenv("DSV4_CUDA_RESIDENT_EXPERTS");
-    int resident_auto = !resident_experts || strcmp(resident_experts, "auto") == 0;
-    if (resident_auto || atoi(resident_experts)) {
-        int preload = coli_v4_gpu_experts_preload(engine, error, error_size);
-        if (preload < 0 || (preload && !resident_auto)) goto fail;
-        if (preload && engine->gpu.enabled)
-            fprintf(stderr, "v4_gpu resident-experts=cache-fallback (%s)\n",
-                    error && error_size ? error : "insufficient budget");
-        if (preload && error && error_size) error[0] = '\0';
-    }
+    if (coli_v4_gpu_experts_init(engine, error, error_size)) goto fail;
     coli_v4_gpu_head_upload(engine);
 #endif
     *output = engine;
@@ -10016,9 +10007,13 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     engine->gpu.device = 0;
     if (!v4_gpu_wanted()) return 0;
     const char *setting = getenv("DSV4_CUDA_DEVICES");
-    if (!setting) setting = getenv("DSV4_CUDA_DEVICE");
-    int count = coli_v4_gpu_devices_parse(setting ? setting : "0",
-                                          engine->gpu.devices);
+    int count = 1;
+    if (setting) {
+        count = coli_v4_gpu_devices_parse(setting, engine->gpu.devices);
+    } else {
+        const char *device = getenv("DSV4_CUDA_DEVICE");
+        engine->gpu.devices[0] = device ? atoi(device) : 0;
+    }
     if (count < 1 || count > engine->config.num_hidden_layers) {
         fprintf(stderr, "v4_gpu invalid device list (use distinct CUDA ordinals, at most one per layer)\n");
         return -1;
@@ -10746,6 +10741,20 @@ static int v4_gpu_experts_load(V4GpuExpertMirrorCache *cache,
                 cache->device, layer, experts);
     }
     cache->experts_per_layer = experts;
+    return 0;
+}
+
+int coli_v4_gpu_experts_init(ColiV4Engine *engine, char *error, size_t error_size) {
+    const char *resident_experts = getenv("DSV4_CUDA_RESIDENT_EXPERTS");
+    int resident_auto = !resident_experts || strcmp(resident_experts, "auto") == 0;
+    if (resident_auto || atoi(resident_experts)) {
+        int preload = coli_v4_gpu_experts_preload(engine, error, error_size);
+        if (preload && !resident_auto) return -1;
+        if (preload && engine->gpu.enabled)
+            fprintf(stderr, "v4_gpu resident-experts=cache-fallback (%s)\n",
+                    error && error_size ? error : "insufficient budget");
+        if (preload && error && error_size) error[0] = '\0';
+    }
     return 0;
 }
 

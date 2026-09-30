@@ -1,0 +1,206 @@
+# GLM-5.3 batched prefill, raw evidence (2026-09-27)
+# Every run of experiment A, in execution order: the bench log line, then the run's full stderr and stdout.
+# Coordinator binaries (sha256):
+#   f90ba5fa398ca08aeed4d44f06a5cd5bcc1b8aba9dd50e111d46386acf8bf7b2  baseline (d762a9dc, no batching)
+#   c263678fd44a0599c91500cd128ecef7841edc25ac154d9a887368435f9e1408  trial (e3b6756f, this change on top)
+# Expert workers, both arms (sha256, ghost and home): 7c986868acd1dc1361c9c10f511fff7f90c1ca29a1cb0272688964c7f3fff395
+# Prompt sha256: 50d8aaa383c093165cd3913e2051f340bb7cd2dc1312f7cc28c76e9f2dd02179
+
+===== warmup-A-013809
+2026-09-27T02:18:53Z warmup-A-013809 rc=0 prefill 241 tokens in 2158.6s de8dba3b5b94
+----- stderr
+expert budget: 5.2 GB (33.4 total, 183.2 model, 4.0 margin, 8.2 available)
+experts: 14.2 MB slots, 8 per layer across 42 sparse layers (4.8 GB resident)
+[CLUSTER] coordinator connected to 2 expert worker(s) | routing worker-a:9100 52% / worker-b:9100 48% (COLI_CLUSTER_WEIGHTS)
+[USAGE] expert history: 1008336 selections (<model>/.coli_usage)
+GLM-5.3-Flash: 45 layers (34 KDA + 11 full) + 1 MTP, hidden 4096, vocab 154880
+  MoE      : 288 routed (top-8) + 1 shared, inter 2048, from layer 3, scale 2.50
+  KDA      : 64 heads x 128, conv 4, gate floor -5.0
+  MLA      : q_lora 1536, kv_lora 512, qk 256 (nope, NoPE), v 256, 64 heads
+  indexer  : top-2048, 32 heads x 128, kpool 4 (+tail)
+  mHC      : mult 4, 20 Sinkhorn iterations
+  vision   : yes
+  routed experts: 311.7 B parameters (175 GB at int4-g64)
+             24 blocks x 1024, 16 heads, patch 14, 448px, merge 2 -> 4096
+cache: 33.0 KB per token across 11 DSA layers (0.01 GB at 243 positions)
+load 257.2s, prefill 241 tokens in 2158.6s
+[glm53] 3 stop id(s) from generation_config.json
+[STATS] 1089648 selections across 11877 distinct experts -> <model>/.coli_usage
+[CLUSTER] worker-a:9100: 126 requests, 41885 rows, 6453.1 ms mean reply
+[CLUSTER] worker-b:9100: 126 requests, 39427 rows, 9351.7 ms mean reply
+----- stdout
+teacher_forcing 154822 1588 6203 304 17821 13 4766 264 15010 8314 4573 13 4615 525 279 448 26483 2038 11 15652 11288 11 323 2038 11 323 21776 501 2038 13 1446 1447 220 63141 323 14497 1590 11 990 2038 12710 9352 11 56136 448 3542 11 323 17355 10730 22560 7354 916 323 2677 7683 7032 1273 476 3259 2038 979 3197 27610 3383 14515 11 1349 279 1465 15504 323 5046 279 3704 1573 35076 264 13 3197 646 458 6203 10817 17821 10345 4766 264 10817 8314 32262 13 1446 1492 3847 553 5290 3542 11 30103 11288 11 15652 2038 11 323 4378 501 3542 13 47136 25 387 63141 304 697 14497 11 1473 1034 12710 9352 979 3238 448 3542 11 10697 2613 2739 22560 7354 11 323 2677 1598 279 7032 1283 264 2297 13 3197 264 3210 14515 11 1349 279 1465 15504 323 10334 279 5240 1573 4460 1549 13 1446 525 458 6203 10817 17821 10345 4766 264 10817 8314 32262 13 1446 1492 3847 553 5290 3542 11 30103 11288 11 15652 2038 11 323 4378 501 3542 13 47136 25 387 63141 304 697 14497 11 1473 1034 12710 9352 979 3238 448 3542 11 10697 2613 2739 22560 7354 11 323 2677 1598 279 7032 1283 264 2297 13 3197 264 3210 14515 11 1349 279 1465 15504 323 10334 279 5240 1573 4460 1549 13 1446 1446
+ You
+decode 1 token in 23.0s = 0.043 tok/s (23.0 s/token)
+experts hits 0 miss 0 bytes 0
+
+===== A-base1-021853
+2026-09-27T03:18:06Z A-base1-021853 rc=0 prefill 241 tokens in 3257.7s de8dba3b5b94
+----- stderr
+expert budget: 7.9 GB (33.4 total, 183.2 model, 4.0 margin, 10.9 available)
+experts: 14.2 MB slots, 13 per layer across 42 sparse layers (7.7 GB resident)
+[CLUSTER] coordinator connected to 2 expert worker(s) | routing worker-a:9100 52% / worker-b:9100 48% (COLI_CLUSTER_WEIGHTS)
+[USAGE] expert history: 1089648 selections (<model>/.coli_usage)
+GLM-5.3-Flash: 45 layers (34 KDA + 11 full) + 1 MTP, hidden 4096, vocab 154880
+  MoE      : 288 routed (top-8) + 1 shared, inter 2048, from layer 3, scale 2.50
+  KDA      : 64 heads x 128, conv 4, gate floor -5.0
+  MLA      : q_lora 1536, kv_lora 512, qk 256 (nope, NoPE), v 256, 64 heads
+  indexer  : top-2048, 32 heads x 128, kpool 4 (+tail)
+  mHC      : mult 4, 20 Sinkhorn iterations
+  vision   : yes
+  routed experts: 311.7 B parameters (175 GB at int4-g64)
+             24 blocks x 1024, 16 heads, patch 14, 448px, merge 2 -> 4096
+cache: 33.0 KB per token across 11 DSA layers (0.01 GB at 243 positions)
+load 262.5s, prefill 241 tokens in 3257.7s
+[glm53] 3 stop id(s) from generation_config.json
+[STATS] 1170960 selections across 11877 distinct experts -> <model>/.coli_usage
+[CLUSTER] worker-a:9100: 126 requests, 41885 rows, 7364.5 ms mean reply
+[CLUSTER] worker-b:9100: 126 requests, 39427 rows, 10335.5 ms mean reply
+----- stdout
+teacher_forcing 154822 1588 6203 304 17821 13 4766 264 15010 8314 4573 13 4615 525 279 448 26483 2038 11 15652 11288 11 323 2038 11 323 21776 501 2038 13 1446 1447 220 63141 323 14497 1590 11 990 2038 12710 9352 11 56136 448 3542 11 323 17355 10730 22560 7354 916 323 2677 7683 7032 1273 476 3259 2038 979 3197 27610 3383 14515 11 1349 279 1465 15504 323 5046 279 3704 1573 35076 264 13 3197 646 458 6203 10817 17821 10345 4766 264 10817 8314 32262 13 1446 1492 3847 553 5290 3542 11 30103 11288 11 15652 2038 11 323 4378 501 3542 13 47136 25 387 63141 304 697 14497 11 1473 1034 12710 9352 979 3238 448 3542 11 10697 2613 2739 22560 7354 11 323 2677 1598 279 7032 1283 264 2297 13 3197 264 3210 14515 11 1349 279 1465 15504 323 10334 279 5240 1573 4460 1549 13 1446 525 458 6203 10817 17821 10345 4766 264 10817 8314 32262 13 1446 1492 3847 553 5290 3542 11 30103 11288 11 15652 2038 11 323 4378 501 3542 13 47136 25 387 63141 304 697 14497 11 1473 1034 12710 9352 979 3238 448 3542 11 10697 2613 2739 22560 7354 11 323 2677 1598 279 7032 1283 264 2297 13 3197 264 3210 14515 11 1349 279 1465 15504 323 10334 279 5240 1573 4460 1549 13 1446 1446
+ You
+decode 1 token in 26.7s = 0.037 tok/s (26.7 s/token)
+experts hits 0 miss 0 bytes 0
+
+===== A-trial1-031806
+2026-09-27T03:55:37Z A-trial1-031806 rc=0 prefill 241 tokens in 1894.7s de8dba3b5b94
+----- stderr
+expert budget: 5.5 GB (33.4 total, 183.2 model, 4.0 margin, 8.5 available)
+experts: 14.2 MB slots, 9 per layer across 42 sparse layers (5.4 GB resident)
+[CLUSTER] coordinator connected to 2 expert worker(s) | routing worker-a:9100 52% / worker-b:9100 48% (COLI_CLUSTER_WEIGHTS)
+[USAGE] expert history: 1170960 selections (<model>/.coli_usage)
+GLM-5.3-Flash: 45 layers (34 KDA + 11 full) + 1 MTP, hidden 4096, vocab 154880
+  MoE      : 288 routed (top-8) + 1 shared, inter 2048, from layer 3, scale 2.50
+  KDA      : 64 heads x 128, conv 4, gate floor -5.0
+  MLA      : q_lora 1536, kv_lora 512, qk 256 (nope, NoPE), v 256, 64 heads
+  indexer  : top-2048, 32 heads x 128, kpool 4 (+tail)
+  mHC      : mult 4, 20 Sinkhorn iterations
+  vision   : yes
+  routed experts: 311.7 B parameters (175 GB at int4-g64)
+             24 blocks x 1024, 16 heads, patch 14, 448px, merge 2 -> 4096
+cache: 33.0 KB per token across 11 DSA layers (0.01 GB at 243 positions)
+load 315.6s, prefill 241 tokens in 1894.7s
+prefill profile: attention 374.1s, ffn 1367.5s (disk 0.0s), head 16.8s
+[glm53] 3 stop id(s) from generation_config.json
+[STATS] 1252272 selections across 11877 distinct experts -> <model>/.coli_usage
+[CLUSTER] worker-a:9100: 126 requests, 41885 rows, 7129.4 ms mean reply
+[CLUSTER] worker-b:9100: 126 requests, 39427 rows, 10090.8 ms mean reply
+----- stdout
+teacher_forcing 154822 1588 6203 304 17821 13 4766 264 15010 8314 4573 13 4615 525 279 448 26483 2038 11 15652 11288 11 323 2038 11 323 21776 501 2038 13 1446 1447 220 63141 323 14497 1590 11 990 2038 12710 9352 11 56136 448 3542 11 323 17355 10730 22560 7354 916 323 2677 7683 7032 1273 476 3259 2038 979 3197 27610 3383 14515 11 1349 279 1465 15504 323 5046 279 3704 1573 35076 264 13 3197 646 458 6203 10817 17821 10345 4766 264 10817 8314 32262 13 1446 1492 3847 553 5290 3542 11 30103 11288 11 15652 2038 11 323 4378 501 3542 13 47136 25 387 63141 304 697 14497 11 1473 1034 12710 9352 979 3238 448 3542 11 10697 2613 2739 22560 7354 11 323 2677 1598 279 7032 1283 264 2297 13 3197 264 3210 14515 11 1349 279 1465 15504 323 10334 279 5240 1573 4460 1549 13 1446 525 458 6203 10817 17821 10345 4766 264 10817 8314 32262 13 1446 1492 3847 553 5290 3542 11 30103 11288 11 15652 2038 11 323 4378 501 3542 13 47136 25 387 63141 304 697 14497 11 1473 1034 12710 9352 979 3238 448 3542 11 10697 2613 2739 22560 7354 11 323 2677 1598 279 7032 1283 264 2297 13 3197 264 3210 14515 11 1349 279 1465 15504 323 10334 279 5240 1573 4460 1549 13 1446 1446
+ You
+decode 1 token in 24.2s = 0.041 tok/s (24.2 s/token)
+experts hits 0 miss 0 bytes 0
+
+===== A-trial2-035537
+2026-09-27T04:27:07Z A-trial2-035537 rc=0 prefill 241 tokens in 1516.8s de8dba3b5b94
+----- stderr
+expert budget: 6.4 GB (33.4 total, 183.2 model, 4.0 margin, 9.4 available)
+experts: 14.2 MB slots, 10 per layer across 42 sparse layers (5.9 GB resident)
+[CLUSTER] coordinator connected to 2 expert worker(s) | routing worker-a:9100 52% / worker-b:9100 48% (COLI_CLUSTER_WEIGHTS)
+[USAGE] expert history: 1252272 selections (<model>/.coli_usage)
+GLM-5.3-Flash: 45 layers (34 KDA + 11 full) + 1 MTP, hidden 4096, vocab 154880
+  MoE      : 288 routed (top-8) + 1 shared, inter 2048, from layer 3, scale 2.50
+  KDA      : 64 heads x 128, conv 4, gate floor -5.0
+  MLA      : q_lora 1536, kv_lora 512, qk 256 (nope, NoPE), v 256, 64 heads
+  indexer  : top-2048, 32 heads x 128, kpool 4 (+tail)
+  mHC      : mult 4, 20 Sinkhorn iterations
+  vision   : yes
+  routed experts: 311.7 B parameters (175 GB at int4-g64)
+             24 blocks x 1024, 16 heads, patch 14, 448px, merge 2 -> 4096
+cache: 33.0 KB per token across 11 DSA layers (0.01 GB at 243 positions)
+load 349.5s, prefill 241 tokens in 1516.8s
+prefill profile: attention 219.7s, ffn 1242.1s (disk 0.0s), head 11.9s
+[glm53] 3 stop id(s) from generation_config.json
+[STATS] 1333584 selections across 11877 distinct experts -> <model>/.coli_usage
+[CLUSTER] worker-a:9100: 126 requests, 41885 rows, 6476.7 ms mean reply
+[CLUSTER] worker-b:9100: 126 requests, 39427 rows, 9317.2 ms mean reply
+----- stdout
+teacher_forcing 154822 1588 6203 304 17821 13 4766 264 15010 8314 4573 13 4615 525 279 448 26483 2038 11 15652 11288 11 323 2038 11 323 21776 501 2038 13 1446 1447 220 63141 323 14497 1590 11 990 2038 12710 9352 11 56136 448 3542 11 323 17355 10730 22560 7354 916 323 2677 7683 7032 1273 476 3259 2038 979 3197 27610 3383 14515 11 1349 279 1465 15504 323 5046 279 3704 1573 35076 264 13 3197 646 458 6203 10817 17821 10345 4766 264 10817 8314 32262 13 1446 1492 3847 553 5290 3542 11 30103 11288 11 15652 2038 11 323 4378 501 3542 13 47136 25 387 63141 304 697 14497 11 1473 1034 12710 9352 979 3238 448 3542 11 10697 2613 2739 22560 7354 11 323 2677 1598 279 7032 1283 264 2297 13 3197 264 3210 14515 11 1349 279 1465 15504 323 10334 279 5240 1573 4460 1549 13 1446 525 458 6203 10817 17821 10345 4766 264 10817 8314 32262 13 1446 1492 3847 553 5290 3542 11 30103 11288 11 15652 2038 11 323 4378 501 3542 13 47136 25 387 63141 304 697 14497 11 1473 1034 12710 9352 979 3238 448 3542 11 10697 2613 2739 22560 7354 11 323 2677 1598 279 7032 1283 264 2297 13 3197 264 3210 14515 11 1349 279 1465 15504 323 10334 279 5240 1573 4460 1549 13 1446 1446
+ You
+decode 1 token in 18.2s = 0.055 tok/s (18.2 s/token)
+experts hits 0 miss 0 bytes 0
+
+===== A-base2-042707
+2026-09-27T05:10:12Z A-base2-042707 rc=0 prefill 241 tokens in 2279.7s de8dba3b5b94
+----- stderr
+expert budget: 6.2 GB (33.4 total, 183.2 model, 4.0 margin, 9.2 available)
+experts: 14.2 MB slots, 10 per layer across 42 sparse layers (5.9 GB resident)
+[CLUSTER] coordinator connected to 2 expert worker(s) | routing worker-a:9100 52% / worker-b:9100 48% (COLI_CLUSTER_WEIGHTS)
+[USAGE] expert history: 1333584 selections (<model>/.coli_usage)
+GLM-5.3-Flash: 45 layers (34 KDA + 11 full) + 1 MTP, hidden 4096, vocab 154880
+  MoE      : 288 routed (top-8) + 1 shared, inter 2048, from layer 3, scale 2.50
+  KDA      : 64 heads x 128, conv 4, gate floor -5.0
+  MLA      : q_lora 1536, kv_lora 512, qk 256 (nope, NoPE), v 256, 64 heads
+  indexer  : top-2048, 32 heads x 128, kpool 4 (+tail)
+  mHC      : mult 4, 20 Sinkhorn iterations
+  vision   : yes
+  routed experts: 311.7 B parameters (175 GB at int4-g64)
+             24 blocks x 1024, 16 heads, patch 14, 448px, merge 2 -> 4096
+cache: 33.0 KB per token across 11 DSA layers (0.01 GB at 243 positions)
+load 282.7s, prefill 241 tokens in 2279.7s
+[glm53] 3 stop id(s) from generation_config.json
+[STATS] 1414896 selections across 11877 distinct experts -> <model>/.coli_usage
+[CLUSTER] worker-a:9100: 126 requests, 41885 rows, 6483.9 ms mean reply
+[CLUSTER] worker-b:9100: 126 requests, 39427 rows, 9380.2 ms mean reply
+----- stdout
+teacher_forcing 154822 1588 6203 304 17821 13 4766 264 15010 8314 4573 13 4615 525 279 448 26483 2038 11 15652 11288 11 323 2038 11 323 21776 501 2038 13 1446 1447 220 63141 323 14497 1590 11 990 2038 12710 9352 11 56136 448 3542 11 323 17355 10730 22560 7354 916 323 2677 7683 7032 1273 476 3259 2038 979 3197 27610 3383 14515 11 1349 279 1465 15504 323 5046 279 3704 1573 35076 264 13 3197 646 458 6203 10817 17821 10345 4766 264 10817 8314 32262 13 1446 1492 3847 553 5290 3542 11 30103 11288 11 15652 2038 11 323 4378 501 3542 13 47136 25 387 63141 304 697 14497 11 1473 1034 12710 9352 979 3238 448 3542 11 10697 2613 2739 22560 7354 11 323 2677 1598 279 7032 1283 264 2297 13 3197 264 3210 14515 11 1349 279 1465 15504 323 10334 279 5240 1573 4460 1549 13 1446 525 458 6203 10817 17821 10345 4766 264 10817 8314 32262 13 1446 1492 3847 553 5290 3542 11 30103 11288 11 15652 2038 11 323 4378 501 3542 13 47136 25 387 63141 304 697 14497 11 1473 1034 12710 9352 979 3238 448 3542 11 10697 2613 2739 22560 7354 11 323 2677 1598 279 7032 1283 264 2297 13 3197 264 3210 14515 11 1349 279 1465 15504 323 10334 279 5240 1573 4460 1549 13 1446 1446
+ You
+decode 1 token in 18.9s = 0.053 tok/s (18.9 s/token)
+experts hits 0 miss 0 bytes 0
+
+===== A-base3-051012
+2026-09-27T05:53:37Z A-base3-051012 rc=0 prefill 241 tokens in 2371.8s de8dba3b5b94
+----- stderr
+expert budget: 5.4 GB (33.4 total, 183.2 model, 4.0 margin, 8.4 available)
+experts: 14.2 MB slots, 9 per layer across 42 sparse layers (5.4 GB resident)
+[CLUSTER] coordinator connected to 2 expert worker(s) | routing worker-a:9100 52% / worker-b:9100 48% (COLI_CLUSTER_WEIGHTS)
+[USAGE] expert history: 1414896 selections (<model>/.coli_usage)
+GLM-5.3-Flash: 45 layers (34 KDA + 11 full) + 1 MTP, hidden 4096, vocab 154880
+  MoE      : 288 routed (top-8) + 1 shared, inter 2048, from layer 3, scale 2.50
+  KDA      : 64 heads x 128, conv 4, gate floor -5.0
+  MLA      : q_lora 1536, kv_lora 512, qk 256 (nope, NoPE), v 256, 64 heads
+  indexer  : top-2048, 32 heads x 128, kpool 4 (+tail)
+  mHC      : mult 4, 20 Sinkhorn iterations
+  vision   : yes
+  routed experts: 311.7 B parameters (175 GB at int4-g64)
+             24 blocks x 1024, 16 heads, patch 14, 448px, merge 2 -> 4096
+cache: 33.0 KB per token across 11 DSA layers (0.01 GB at 243 positions)
+load 211.1s, prefill 241 tokens in 2371.8s
+[glm53] 3 stop id(s) from generation_config.json
+[STATS] 1496208 selections across 11877 distinct experts -> <model>/.coli_usage
+[CLUSTER] worker-a:9100: 126 requests, 41885 rows, 6471.4 ms mean reply
+[CLUSTER] worker-b:9100: 126 requests, 39427 rows, 9409.7 ms mean reply
+----- stdout
+teacher_forcing 154822 1588 6203 304 17821 13 4766 264 15010 8314 4573 13 4615 525 279 448 26483 2038 11 15652 11288 11 323 2038 11 323 21776 501 2038 13 1446 1447 220 63141 323 14497 1590 11 990 2038 12710 9352 11 56136 448 3542 11 323 17355 10730 22560 7354 916 323 2677 7683 7032 1273 476 3259 2038 979 3197 27610 3383 14515 11 1349 279 1465 15504 323 5046 279 3704 1573 35076 264 13 3197 646 458 6203 10817 17821 10345 4766 264 10817 8314 32262 13 1446 1492 3847 553 5290 3542 11 30103 11288 11 15652 2038 11 323 4378 501 3542 13 47136 25 387 63141 304 697 14497 11 1473 1034 12710 9352 979 3238 448 3542 11 10697 2613 2739 22560 7354 11 323 2677 1598 279 7032 1283 264 2297 13 3197 264 3210 14515 11 1349 279 1465 15504 323 10334 279 5240 1573 4460 1549 13 1446 525 458 6203 10817 17821 10345 4766 264 10817 8314 32262 13 1446 1492 3847 553 5290 3542 11 30103 11288 11 15652 2038 11 323 4378 501 3542 13 47136 25 387 63141 304 697 14497 11 1473 1034 12710 9352 979 3238 448 3542 11 10697 2613 2739 22560 7354 11 323 2677 1598 279 7032 1283 264 2297 13 3197 264 3210 14515 11 1349 279 1465 15504 323 10334 279 5240 1573 4460 1549 13 1446 1446
+ You
+decode 1 token in 18.4s = 0.054 tok/s (18.4 s/token)
+experts hits 0 miss 0 bytes 0
+
+===== A-trial3-055337
+2026-09-27T06:24:18Z A-trial3-055337 rc=0 prefill 241 tokens in 1612.5s de8dba3b5b94
+----- stderr
+expert budget: 4.6 GB (33.4 total, 183.2 model, 4.0 margin, 7.6 available)
+experts: 14.2 MB slots, 7 per layer across 42 sparse layers (4.2 GB resident)
+[CLUSTER] coordinator connected to 2 expert worker(s) | routing worker-a:9100 52% / worker-b:9100 48% (COLI_CLUSTER_WEIGHTS)
+[USAGE] expert history: 1496208 selections (<model>/.coli_usage)
+GLM-5.3-Flash: 45 layers (34 KDA + 11 full) + 1 MTP, hidden 4096, vocab 154880
+  MoE      : 288 routed (top-8) + 1 shared, inter 2048, from layer 3, scale 2.50
+  KDA      : 64 heads x 128, conv 4, gate floor -5.0
+  MLA      : q_lora 1536, kv_lora 512, qk 256 (nope, NoPE), v 256, 64 heads
+  indexer  : top-2048, 32 heads x 128, kpool 4 (+tail)
+  mHC      : mult 4, 20 Sinkhorn iterations
+  vision   : yes
+  routed experts: 311.7 B parameters (175 GB at int4-g64)
+             24 blocks x 1024, 16 heads, patch 14, 448px, merge 2 -> 4096
+cache: 33.0 KB per token across 11 DSA layers (0.01 GB at 243 positions)
+load 206.5s, prefill 241 tokens in 1612.5s
+prefill profile: attention 289.7s, ffn 1240.8s (disk 0.0s), head 12.5s
+[glm53] 3 stop id(s) from generation_config.json
+[STATS] 1577520 selections across 11877 distinct experts -> <model>/.coli_usage
+[CLUSTER] worker-a:9100: 126 requests, 41885 rows, 6441.0 ms mean reply
+[CLUSTER] worker-b:9100: 126 requests, 39427 rows, 9245.5 ms mean reply
+----- stdout
+teacher_forcing 154822 1588 6203 304 17821 13 4766 264 15010 8314 4573 13 4615 525 279 448 26483 2038 11 15652 11288 11 323 2038 11 323 21776 501 2038 13 1446 1447 220 63141 323 14497 1590 11 990 2038 12710 9352 11 56136 448 3542 11 323 17355 10730 22560 7354 916 323 2677 7683 7032 1273 476 3259 2038 979 3197 27610 3383 14515 11 1349 279 1465 15504 323 5046 279 3704 1573 35076 264 13 3197 646 458 6203 10817 17821 10345 4766 264 10817 8314 32262 13 1446 1492 3847 553 5290 3542 11 30103 11288 11 15652 2038 11 323 4378 501 3542 13 47136 25 387 63141 304 697 14497 11 1473 1034 12710 9352 979 3238 448 3542 11 10697 2613 2739 22560 7354 11 323 2677 1598 279 7032 1283 264 2297 13 3197 264 3210 14515 11 1349 279 1465 15504 323 10334 279 5240 1573 4460 1549 13 1446 525 458 6203 10817 17821 10345 4766 264 10817 8314 32262 13 1446 1492 3847 553 5290 3542 11 30103 11288 11 15652 2038 11 323 4378 501 3542 13 47136 25 387 63141 304 697 14497 11 1473 1034 12710 9352 979 3238 448 3542 11 10697 2613 2739 22560 7354 11 323 2677 1598 279 7032 1283 264 2297 13 3197 264 3210 14515 11 1349 279 1465 15504 323 10334 279 5240 1573 4460 1549 13 1446 1446
+ You
+decode 1 token in 18.0s = 0.055 tok/s (18.0 s/token)
+experts hits 0 miss 0 bytes 0

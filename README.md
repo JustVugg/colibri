@@ -23,6 +23,9 @@ vision), **Inkling** (975B), **Kimi K3** (2.8T), **DeepSeek V4 Flash** (284B), *
 **Qwen3.8-Flash-Next** (125B + 51B n-gram), **Qwen3.6** (35B-A3B) and
 **OLMoE** (7B) —
 one C file each, the same `coli chat` / `coli serve` / `coli web` front end.
+Images too: **Qwen-Image-2.1** generates pictures from text, shown inline in
+the terminal by `coli chat` and served at `POST /v1/images/generations`
+([qwen-image.md](docs/qwen-image.md)).
 [Full roster ↓](#other-supported-models)
 
 > **Colibrì is an inference engine you can run today, and an open research
@@ -453,6 +456,7 @@ the model's `config.json`):
 > | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed |
 > | **DeepSeek V4 Flash** | ~167 GB (REAP 150B: ~85 GB) | 16 GB min, 32 GB comfortable | optional; any NVIDIA card from the GTX 10 series up (Pascal/Turing via `CUDA_ARCH=portable-pre-ampere NO_TC=1`, best on RTX 50) makes prefill 5-10x and decode ~2.5x faster |
 > | **Qwen3.8-Flash-Next** | ~185.5 GB (official FP8 checkpoint) | 16 GB min, 24 GB comfortable at the default context | optional; the CUDA VRAM expert tier with dense trunk quantized to int8 in VRAM |
+> | **Qwen3.8-27B** (dense, text and images) | ~51 GB converted (f16) | 20 GB with int4 dense weights, 30 GB in int8 | not used yet (CPU) |
 > | **Qwen3.6-35B-A3B** | ~20 GB (int4-gs64 container) | 24 GB (needs full RAM residency) | optional; the CUDA VRAM expert tier measured **1.44 -> 10.05 tok/s (7.0x)** on two 8 GB cards, output bit-identical to CPU |
 >
 > A GPU only ever makes it faster. Speed is set by your disk, because the experts

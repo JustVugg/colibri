@@ -48,6 +48,11 @@ def engine_rule(artifact: str) -> str:
 class RegistryEngineAgreementTest(unittest.TestCase):
     def test_every_engine_reads_its_declared_context_variable(self):
         for family in fr.FAMILIES:
+            if family.modality != "text":
+                # No context window to cap: the launcher refuses --ctx for an
+                # image model instead of setting a variable (coli, env_for_engine).
+                self.assertEqual(family.limits.context_env, "", family.id)
+                continue
             with self.subTest(family=family.id):
                 env = family.limits.context_env
                 source = (ROOT / f"{family.engine_artifact}.c").read_text(

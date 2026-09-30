@@ -46,6 +46,10 @@ LAYER_KINDS = frozenset((
     "mlp.shared_expert.up_proj.weight",
     "mlp.shared_expert.down_proj.weight",
     "mlp.shared_expert_gate.weight",
+    # dense checkpoints of the family (Qwen3.5 / Qwen3.8 27B): the whole MLP, no router
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "mlp.down_proj.weight",
     # routed experts, fused layout (real checkpoints): one tensor per layer
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
@@ -57,14 +61,16 @@ _EXPERT_SEPARATE = re.compile(r"^mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_pr
 
 GLOBAL_KINDS = frozenset(("embed_tokens.weight", "norm.weight", "lm_head.weight"))
 
-# Whole subtrees the text engine does not implement. Skipped deliberately,
+# Whole subtrees the engine does not implement. Skipped deliberately,
 # counted, and reported -- never silently.
 SKIP_PREFIXES = (
     ("mtp.", "mtp", "multi-token-prediction head (mtp_num_hidden_layers); "
                     "the engine predicts one token per step and never reads it"),
-    ("model.visual.", "visual", "vision tower; the engine is text-only"),
-    ("visual.", "visual", "vision tower; the engine is text-only"),
 )
+
+# The vision tower, converted since #1757: the same ViT in Qwen3.5/3.6/3.8, run by
+# the engine through qwen38_vision.h. Placed as ("vision", <name after visual.>).
+VISION_PREFIXES = ("model.visual.", "visual.")
 
 _LAYER = re.compile(r"^layers\.(\d+)\.(.+)$")
 
@@ -85,7 +91,8 @@ def classify(name, prefix):
     """Return one of
          ("global", kind)            embed / final norm / lm_head
          ("layer", index, kind)      a tensor of transformer layer <index>
-         ("skip", group)             mtp / visual, deliberately not converted
+         ("vision", name)            the vision tower, name after "visual."
+         ("skip", group)             mtp, deliberately not converted
        or raise UnknownTensor.
 
     ``kind`` for a layer is the suffix after ``layers.<i>.``; for the
@@ -95,6 +102,9 @@ def classify(name, prefix):
     for skip_prefix, group, _why in SKIP_PREFIXES:
         if name.startswith(skip_prefix):
             return ("skip", group)
+    for vision_prefix in VISION_PREFIXES:
+        if name.startswith(vision_prefix):
+            return ("vision", name[len(vision_prefix):])
     if name == "lm_head.weight" or name == prefix + "lm_head.weight":
         return ("global", "lm_head.weight")
     if name.startswith(prefix):

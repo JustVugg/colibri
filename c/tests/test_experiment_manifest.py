@@ -1,7 +1,11 @@
+import contextlib
 import copy
+import io
+import tempfile
 import unittest
+from pathlib import Path
 
-from experiment_manifest import validate
+from experiment_manifest import main, validate
 
 
 def run(config, speeds):
@@ -61,6 +65,23 @@ class ExperimentManifestTest(unittest.TestCase):
         record["baseline"]["evidence"]["sha256"] = "unknown"
         with self.assertRaisesRegex(ValueError, "64 hex"):
             validate(record)
+
+    def test_rejects_a_document_that_is_not_an_object(self):
+        # A list, string, or null document escaped as AttributeError, which
+        # main() does not report by name.
+        for record in ([manifest()], "manifest", None):
+            with self.assertRaisesRegex(ValueError, "manifest must be an object"):
+                validate(record)
+
+    def test_cli_names_a_document_that_is_not_an_object(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "result.json"
+            path.write_text("[]\n", encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                status = main([str(path)])
+        self.assertEqual(status, 1)
+        self.assertEqual(out.getvalue(), f"{path}: manifest must be an object\n")
 
 
 if __name__ == "__main__":

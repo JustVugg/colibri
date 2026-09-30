@@ -24,18 +24,26 @@ import {
   SlidersHorizontal,
   Timer,
   Trash2,
-  Zap, ImagePlus} from "lucide-react"
+  Zap, ImagePlus, Camera, Grid3x3, Palette} from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
-import { getHealth, listModels, streamChat, type ChatMessage, type HealthResponse, type StreamChatResult } from "@/lib/api"
+import {
+  generateImage, generatesImages, getHealth, listModelInfo, streamChat,
+  type ChatMessage, type GeneratedImage, type HealthResponse, type StreamChatResult,
+} from "@/lib/api"
+import {
+  DEFAULT_SIZE, DEFAULT_STEPS, chatTurns, clampSteps, dataUrlBlob, imageFileName, parseSeed, parseSize,
+  presetOf, randomSeed, sizeKey, validSide, type ImageSize,
+} from "@/lib/images"
 import { resendFrom } from "@/lib/chat"
 import { activeRequests, supportsCacheSlots, supportsContinuation } from "@/lib/runtime"
 import Brio from "./Brio"
 import { BrainWorkspace } from "./BrainWorkspace"
 import { Brand } from "./components/Brand"
+import { ImageControls, ImageProgressCard, ImageResultCard, ImageStoppedCard, type ImageRun } from "./components/ImageTurn"
 import { Markdown } from "./components/Markdown"
 import { NavigationDock, type View } from "./components/NavigationDock"
 import { Profiling } from "./Profiling"
@@ -62,6 +70,9 @@ export default function App() {
   })
   const [apiKey, setApiKey] = useState("")
   const [models, setModels] = useState<string[]>([])
+  /* Models the server marks with the image_generation capability. With one of
+     them selected the conversation generates pictures instead of text. */
+  const [imageModels, setImageModels] = useState<string[]>([])
   const [model, setModel] = useState(() => stored(localStorage, "colibri.model", "glm-5.2-colibri"))
   const [temperature, setTemperature] = useState(0.7)
   const [maxTokens, setMaxTokens] = useState(4096)
@@ -91,6 +102,13 @@ export default function App() {
   const fileRef = useRef<HTMLInputElement>(null)
   /* Pictures wait here until the turn is sent, then travel on the message. */
   const [pending, setPending] = useState<string[]>([])
+  /* Size and steps are remembered like the endpoint; the seed is not, because
+     a remembered seed would silently draw the same picture again. */
+  const [imageSize, setImageSize] = useState<ImageSize>(() => parseSize(stored(localStorage, "colibri.imageSize", "")) || DEFAULT_SIZE)
+  const [customSize, setCustomSize] = useState(() => !presetOf(parseSize(stored(localStorage, "colibri.imageSize", "")) || DEFAULT_SIZE))
+  const [imageSteps, setImageSteps] = useState(() => clampSteps(Number(stored(localStorage, "colibri.imageSteps", String(DEFAULT_STEPS)))))
+  const [seedText, setSeedText] = useState("")
+  const [imageRun, setImageRun] = useState<ImageRun | null>(null)
   const historyDialog = useRef<HTMLDialogElement>(null)
   useEffect(() => { document.documentElement.dataset.theme = theme; try { localStorage.setItem("colibri.theme", theme) } catch {} }, [theme])
   useEffect(() => { if (historyOpen) historyDialog.current?.showModal(); else historyDialog.current?.close() }, [historyOpen])
@@ -104,6 +122,8 @@ export default function App() {
   const active = activeRequests(health)
   const capacity = health?.scheduler?.capacity || kvSlots
   const failures = health?.scheduler ? health.scheduler.rejected + health.scheduler.timed_out + health.scheduler.cancelled : 0
+  const imageMode = imageModels.includes(model)
+  const seed = parseSeed(seedText)
 
   const updateMessages = (next: ChatMessage[] | ((current: ChatMessage[]) => ChatMessage[])) =>
     setConversations((current) => ({
@@ -115,6 +135,9 @@ export default function App() {
   useEffect(() => {
     persistPublicSettings(localStorage, baseUrl, model)
   }, [baseUrl, model])
+  useEffect(() => {
+    try { localStorage.setItem("colibri.imageSize", sizeKey(imageSize)); localStorage.setItem("colibri.imageSteps", String(imageSteps)) } catch { /* restricted storage mode */ }
+  }, [imageSize, imageSteps])
 
   // EFFECT #2
   useEffect(() => {
@@ -164,8 +187,10 @@ export default function App() {
     setConnecting(true)
     setError("")
     try {
-      const found = await listModels(baseUrl, apiKey, controller.signal)
+      const info = await listModelInfo(baseUrl, apiKey, controller.signal)
+      const found = info.map((item) => item.id)
       setModels(found)
+      setImageModels(info.filter(generatesImages).map((item) => item.id))
       if (found.length && !found.includes(model)) setModel(found[0])
       setConnected(true)
       try {
@@ -210,7 +235,9 @@ export default function App() {
     } catch { setError("status.serverError") }
   }
 
-  const canSend = useMemo(() => (draft.trim() || pending.length) && model && !loading, [draft, loading, model, pending])
+  const canSend = useMemo(() => imageMode
+    ? Boolean(draft.trim() && model && !loading && seed !== undefined && validSide(imageSize.width) && validSide(imageSize.height))
+    : (draft.trim() || pending.length) && model && !loading, [draft, imageMode, imageSize, loading, model, pending, seed])
 
   /* The shared streaming core. POSTs `payload` and appends every delta into the
      message `targetId`, with the same live metrics and abort/error wiring whether
@@ -235,7 +262,7 @@ export default function App() {
         baseUrl,
         apiKey,
         model,
-        messages: payload,
+        messages: chatTurns(payload),
         temperature,
         maxTokens,
         enableThinking: thinking,
@@ -317,6 +344,84 @@ export default function App() {
     await runStream(request.history, request.targetId)
   }
 
+  /* The image counterpart of runStream: generates into the assistant turn
+     `targetId`, whose `generated` field already holds the request. Progress and
+     previews live in imageRun, outside the transcript; the finished picture is
+     written onto the turn. Cancel is the same abortRef as the chat's Stop. */
+  const runImage = async (targetId: string, request: GeneratedImage) => {
+    setError("")
+    setLoading(true)
+    const controller = new AbortController()
+    abortRef.current = controller
+    const started = performance.now()
+    setImageRun({ targetId, started: Date.now(), progress: null, preview: null })
+    const update = (change: Partial<ImageRun>) => setImageRun((run) => run && run.targetId === targetId ? { ...run, ...change } : run)
+    try {
+      const image = await generateImage({
+        baseUrl, apiKey, model, ...request, signal: controller.signal,
+        onProgress: (progress) => update({ progress }),
+        onPartial: (preview) => update({ preview }),
+        onPlainRequest: () => update({ plain: true }),
+      })
+      const seconds = (performance.now() - started) / 1000
+      updateMessages((current) => current.map((item) => item.id === targetId
+        ? { ...item, finish: "stop", generated: { ...image, seconds } } : item))
+      setConnected(true)
+    } catch (cause) {
+      const finish = controller.signal.aborted ? "aborted" : "error"
+      if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : "status.generationFailed")
+      updateMessages((current) => setFinish(current, targetId, finish))
+    } finally {
+      abortRef.current = null
+      setImageRun(null)
+      setLoading(false)
+    }
+  }
+
+  const imageTurn = (request: GeneratedImage): ChatMessage => ({ ...message("assistant", ""), mode: "image", generated: request })
+
+  const sendImage = async () => {
+    const prompt = draft.trim()
+    if (!prompt || loading || seed === undefined) return
+    const request = { prompt, width: imageSize.width, height: imageSize.height, steps: imageSteps, seed: seed ?? randomSeed() }
+    const assistant = imageTurn(request)
+    setDraft("")
+    updateMessages((current) => [...current, { ...message("user", prompt), mode: "image" }, assistant])
+    await runImage(assistant.id, request)
+  }
+
+  /* Same prompt, size and steps, a seed never used before: a new picture
+     under the old one, so the two can be compared. */
+  const imageAgain = async (image: GeneratedImage) => {
+    if (loading) return
+    const { prompt, width, height, steps } = image
+    const assistant = imageTurn({ prompt, width, height, steps, seed: randomSeed() })
+    updateMessages((current) => [...current, assistant])
+    await runImage(assistant.id, assistant.generated!)
+  }
+
+  const imageRetry = async (item: ChatMessage) => {
+    if (loading || !item.generated) return
+    const { prompt, width, height, steps, seed: previous } = item.generated
+    const request = { prompt, width, height, steps, seed: previous }
+    updateMessages((current) => current.map((turn) => turn.id === item.id ? { ...turn, finish: undefined, generated: request } : turn))
+    await runImage(item.id, request)
+  }
+
+  const downloadImage = (image: GeneratedImage) => {
+    if (!image.url) return
+    const url = image.url.startsWith("data:") ? URL.createObjectURL(dataUrlBlob(image.url)) : image.url
+    const anchor = document.createElement("a"); anchor.href = url; anchor.download = imageFileName(image.prompt, image.seed); anchor.click()
+    if (url !== image.url) setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+
+  const copySeed = async (item: ChatMessage) => {
+    if (!item.generated) return
+    try { await navigator.clipboard.writeText(String(item.generated.seed)); setCopied(`${item.id}:seed`) } catch { setError(t("ui.copyError")) }
+  }
+
+  const submit = () => { if (imageMode) void sendImage(); else void send() }
+
   const openSettings = (page = "general") => { setSettingsPage(page); setView("settings") }
   const clearChat = () => { updateMessages([]); setLastRun(null); setTokPerSec(null); setTtft(null); setTokenCount(0); setTotalTokens({ prompt: 0, completion: 0 }); setError("") }
   const newChat = () => {
@@ -352,6 +457,7 @@ export default function App() {
   const inferenceControls = (<fieldset disabled={loading}><section className="side-section">
           <div className="section-title"><SlidersHorizontal className="size-3.5" /> {t("sidebar.inference")}</div>
           <label>{t("sidebar.model")}<select id="model-select" value={model} onChange={(event) => setModel(event.target.value)}>{models.length ? models.map((id) => <option key={id}>{id}</option>) : <option>{model}</option>}</select></label>
+          {imageMode ? <p className="field-help">{t("image.modelNote")}</p> : <>
           {health?.kv_slots && health.kv_slots > 1 ? <label>{t("sidebar.kvSession")}<select id="kv-slot" value={cacheSlot} onChange={(event) => setCacheSlot(Number(event.target.value))} disabled={loading}>
             {Array.from({ length: kvSlots }, (_, slot) => <option key={slot} value={slot}>{t("sidebar.sessionLabel", { slot: slot + 1 })}</option>)}
           </select><span className="field-help">{t("sidebar.kvSessionHelp")}</span></label> : null}
@@ -360,6 +466,7 @@ export default function App() {
           <button type="button" className={cn("toggle-row", thinking && "active")} aria-pressed={thinking} onClick={() => setThinking((value) => !value)}>
             <span><BrainCircuit className="size-4" /> {t("sidebar.reasoning")}</span><i><b /></i>
           </button>
+          </>}
         </section></fieldset>)
   const runtimeControls = (<><section className="side-section runtime-section" aria-live="polite">
           <div className="section-title"><Activity className="size-3.5" /> {t("sidebar.runtime")}</div>
@@ -404,8 +511,19 @@ export default function App() {
               {!loading && lastRun?.usage ? <Badge><Layers className="size-3" /> {lastRun.usage.prompt_tokens}→{lastRun.usage.completion_tokens}</Badge> : null}
               {!loading && lastRun?.finishReason === "length" ? <Badge className="badge-warn" title={t("topbar.truncatedHelp")}><AlertTriangle className="size-3" /> {t("topbar.truncated")}</Badge> : null}
               {lastRun?.queueWaitMs != null ? <Badge><Clock className="size-3" /> queue {Math.round(lastRun.queueWaitMs)}ms</Badge> : null}
-              <Badge><MonitorDot className="size-3" /> {t("topbar.slot", { n: cacheSlot + 1 })}</Badge>
+              {!imageMode && <Badge><MonitorDot className="size-3" /> {t("topbar.slot", { n: cacheSlot + 1 })}</Badge>}
 </div>)
+
+  const imageCard = (item: ChatMessage) => {
+    const image = item.generated!
+    if (image.url) return <ImageResultCard image={image} copied={copied === `${item.id}:seed`} busy={loading || !imageMode}
+      onDownload={() => downloadImage(image)} onCopySeed={() => void copySeed(item)} onAgain={() => void imageAgain(image)} />
+    if (imageRun?.targetId === item.id) return <ImageProgressCard request={image} run={imageRun} onCancel={() => abortRef.current?.abort()} />
+    return <ImageStoppedCard request={image} finish={item.finish} busy={loading || !imageMode} onRetry={() => void imageRetry(item)} />
+  }
+  const suggestions = imageMode
+    ? [{ key: "image.prompt.photo", Icon: Camera, label: "image.suggest.photo" }, { key: "image.prompt.pixel", Icon: Grid3x3, label: "image.suggest.pixel" }, { key: "image.prompt.poster", Icon: Palette, label: "image.suggest.poster" }]
+    : [{ key: "prompts.routing", Icon: BrainCircuit, label: "ui.idea" }, { key: "prompts.benchmark", Icon: Code2, label: "ui.code" }, { key: "prompts.caching", Icon: Database, label: "ui.analyze" }]
 
   return <div className="app-shell redesigned">
     <aside className="rail" aria-label={t("ui.sidebar")}>
@@ -446,40 +564,43 @@ export default function App() {
             {item.role !== "user" && <div className="assistant-brand"><Brand /><span>colibrì</span></div>}
             {item.images?.length ? <div className="message-images">{item.images.map((url, at) =>
               <img key={at} src={url} alt={t("ui.attachedImage", { n: at + 1 })} />)}</div> : null}
-            <div className="message-body">{item.reasoning
+            {item.role === "assistant" && item.generated ? imageCard(item) : <div className="message-body">{item.reasoning
               ? <details className="reasoning" open={!item.content}>
                   <summary>{t("sidebar.reasoning")}</summary>
                   <div className="reasoning-body">{item.reasoning}</div>
                 </details>
-              : null}{item.content ? (item.role === "assistant" ? <Markdown text={item.content} /> : item.content) : <span className="typing" aria-label={t("ui.generating")}><i /><i /><i /></span>}</div>
-            {item.role === "assistant" && item.content && <div className="message-actions"><button className="icon-action" aria-label={t("ui.copy")} title={t("ui.copy")} onClick={() => void copyMessage(item)}><Copy /></button>{copied === item.id && <span role="status">{t("ui.copied")}</span>}{index === messages.length - 1 && !loading && <button className="icon-action" aria-label={t("ui.regenerate")} title={t("ui.regenerate")} onClick={() => { const retry = resendFrom(messages, index); if (retry) void send(retry.text, retry.previous, retry.pictures, false) }}><RefreshCw /></button>}{index === messages.length - 1 && !loading && supportsContinuation(health) && continuable(item) && <button className="icon-action" aria-label={t("ui.continue")} title={t("ui.continue")} onClick={() => void continueTurn()}><StepForward /></button>}</div>}
+              : null}{item.content ? (item.role === "assistant" ? <Markdown text={item.content} /> : item.content) : <span className="typing" aria-label={t("ui.generating")}><i /><i /><i /></span>}</div>}
+            {item.role === "assistant" && item.content && <div className="message-actions"><button className="icon-action" aria-label={t("ui.copy")} title={t("ui.copy")} onClick={() => void copyMessage(item)}><Copy /></button>{copied === item.id && <span role="status">{t("ui.copied")}</span>}{index === messages.length - 1 && !loading && !imageMode && <button className="icon-action" aria-label={t("ui.regenerate")} title={t("ui.regenerate")} onClick={() => { const retry = resendFrom(messages, index); if (retry) void send(retry.text, retry.previous, retry.pictures, false) }}><RefreshCw /></button>}{index === messages.length - 1 && !loading && !imageMode && supportsContinuation(health) && continuable(item) && <button className="icon-action" aria-label={t("ui.continue")} title={t("ui.continue")} onClick={() => void continueTurn()}><StepForward /></button>}</div>}
           </article>)}<div ref={bottomRef} /></div>
         </div>}
         <div className="composer-wrap">
           {error && <div className="error-banner" role="alert">{t(error)}</div>}
-          <form className="composer" onSubmit={e => { e.preventDefault(); void send() }}
-            onDragOver={e => { if (e.dataTransfer.types.includes("Files")) e.preventDefault() }}
-            onDrop={e => { if (e.dataTransfer.files.length) { e.preventDefault(); void attach(e.dataTransfer.files) } }}>
-            {pending.length > 0 && <div className="composer-attachments">
+          <form className={cn("composer", imageMode && "image-mode")} onSubmit={e => { e.preventDefault(); submit() }}
+            onDragOver={e => { if (!imageMode && e.dataTransfer.types.includes("Files")) e.preventDefault() }}
+            onDrop={e => { if (!imageMode && e.dataTransfer.files.length) { e.preventDefault(); void attach(e.dataTransfer.files) } }}>
+            {!imageMode && pending.length > 0 && <div className="composer-attachments">
               {pending.map((url, at) => <span key={at} className="attachment">
                 <img src={url} alt={t("ui.attachedImage", { n: at + 1 })} />
                 <button type="button" aria-label={t("ui.removeImage")} title={t("ui.removeImage")}
                   onClick={() => setPending(list => list.filter((_, index) => index !== at))}><X /></button>
               </span>)}
             </div>}
-            <Textarea ref={draftRef} id="draft" aria-label={t("chat.placeholder")} value={draft} onChange={e => setDraft(e.target.value)} placeholder={t("chat.placeholder")} onPaste={event => { const files = Array.from(event.clipboardData.files || []); if (files.length) { event.preventDefault(); void attach(files) } }} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send() } }} />
+            <Textarea ref={draftRef} id="draft" aria-label={imageMode ? t("image.placeholder") : t("chat.placeholder")} value={draft} onChange={e => setDraft(e.target.value)} placeholder={imageMode ? t("image.placeholder") : t("chat.placeholder")} onPaste={event => { if (imageMode) return; const files = Array.from(event.clipboardData.files || []); if (files.length) { event.preventDefault(); void attach(files) } }} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); submit() } }} />
             <div className="composer-foot">
+              {imageMode ? <ImageControls size={imageSize} custom={customSize} steps={imageSteps} seed={seedText} seedValid={seed !== undefined}
+                onSize={setImageSize} onCustom={setCustomSize} onSteps={setImageSteps} onSeed={setSeedText} /> : <>
               <input ref={fileRef} type="file" accept="image/*" multiple hidden
                 onChange={e => { void attach(e.target.files); e.target.value = "" }} />
               <button type="button" className="attach-chip" aria-label={t("ui.attachImage")} title={t("ui.attachImage")}
                 onClick={() => fileRef.current?.click()}><ImagePlus /></button>
               <button type="button" className="reasoning-chip" aria-pressed={thinking} onClick={() => setThinking(value => !value)}><BrainCircuit />{t("sidebar.reasoning")}</button>
               <button type="button" className="slot-chip" onClick={() => openSettings("model")}><Database />{t("topbar.slot", { n: cacheSlot + 1 })}</button>
-              {loading ? <button type="button" className="send-button" aria-label={t("chat.stop")} onClick={() => abortRef.current?.abort()}><CircleStop /></button> : <button type="submit" className="send-button" aria-label={t("chat.send")} disabled={!canSend}><ArrowUp /></button>}
+              </>}
+              {loading ? <button type="button" className="send-button" aria-label={imageMode ? t("image.cancel") : t("chat.stop")} onClick={() => abortRef.current?.abort()}><CircleStop /></button> : <button type="submit" className="send-button" aria-label={imageMode ? t("image.generate") : t("chat.send")} disabled={!canSend}><ArrowUp /></button>}
             </div>
           </form>
-          {empty && <div className="suggestions">{[{ key: "routing", Icon: BrainCircuit, label: "idea" }, { key: "benchmark", Icon: Code2, label: "code" }, { key: "caching", Icon: Database, label: "analyze" }].map(({ key, Icon, label }) => <button key={key} onClick={() => { setDraft(t(`prompts.${key}`)); draftRef.current?.focus() }}><Icon />{t(`ui.${label}`)}</button>)}</div>}
-          {!empty && lastRun?.finishReason === "length" && <p className="truncation-note">{t("topbar.truncatedHelp")}</p>}
+          {empty && <div className="suggestions">{suggestions.map(({ key, Icon, label }) => <button key={key} onClick={() => { setDraft(t(key)); draftRef.current?.focus() }}><Icon />{t(label)}</button>)}</div>}
+          {!empty && !imageMode && lastRun?.finishReason === "length" && <p className="truncation-note">{t("topbar.truncatedHelp")}</p>}
         </div>
       </section>}
       <section className="brio-workspace" hidden={view !== "brio"}>

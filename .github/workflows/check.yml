@@ -136,6 +136,7 @@ jobs:
       - name: Run the GLM-5.3 tiny oracles
         run: |
           cd c && GLM53_TINY=/tmp/glm53_tiny GLM53_MM_TINY=/tmp/glm53_mm python -m unittest -v tests.test_glm53_oracles
+          GLM53_TINY=/tmp/glm53_tiny COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_prefill_batch
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to
