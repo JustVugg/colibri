@@ -1031,6 +1031,11 @@ fp8-bench: fp8_bench$(EXE)
 # asserts this shape.
 olmoe$(EXE): olmoe.c cli_args.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h edge_adapters.h edge_runtime.h edge_tok_internal.h fused_simd.h segment_adapter_internal.h segment_adapters.h segment_runtime.h
 	$(CC) $(NOCUDA_CFLAGS) olmoe.c -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
+# llama: dense Llama decoder (llama.c). Unlike olmoe it has a COLI_CUDA tier --
+# CUDA=1 links backend_cuda.o and COLI_CUDA=1 at run time moves every projection
+# and the LM head to the GPU -- so it takes the full CFLAGS, not NOCUDA_*.
+llama$(EXE): llama.c st.h json.h compat.h backend_cuda.h $(CUDA_OBJ)
+	$(CC) $(CFLAGS) llama.c $(CUDA_OBJ) -o llama$(EXE) $(LDFLAGS)
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
 # MoE). With CUDA=1 the optional VRAM expert tier (qwen36_tier.c) is compiled
@@ -1988,6 +1993,8 @@ tests/test_omp_tune$(EXE): tests/test_omp_tune.c omp_tune.h compat.h
 tests/test_compat_env$(EXE): tests/test_compat_env.c compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_llama_read_trust$(EXE): tests/test_llama_read_trust.c tests/st_fixture.h llama.c st.h json.h compat.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 tests/test_kvb_notice$(EXE): tests/test_kvb_notice.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -2072,7 +2079,7 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) \
+install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) llama$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
@@ -2083,6 +2090,7 @@ install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen3
 	$(INSTALL) -m 755 inkling$(EXE) $(DESTDIR)$(LIBEXECDIR)/inkling$(EXE)
 	$(INSTALL) -m 755 kimi_k3$(EXE) $(DESTDIR)$(LIBEXECDIR)/kimi_k3$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
+	$(INSTALL) -m 755 llama$(EXE) $(DESTDIR)$(LIBEXECDIR)/llama$(EXE)
 	$(INSTALL) -m 755 qwen36$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen36$(EXE)
 	$(INSTALL) -m 755 qwen38$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen38$(EXE)
 	$(INSTALL) -m 755 deepseek_v41$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v41$(EXE)
@@ -2140,4 +2148,8 @@ tests/test_colibri_read_trust$(EXE): tests/test_colibri_read_trust.c tests/st_fi
 tests/test_inkling_read_trust$(EXE): tests/test_inkling_read_trust.c tests/st_fixture.h inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
 tests/test_olmoe_read_trust$(EXE): tests/test_olmoe_read_trust.c tests/st_fixture.h olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+# inkling dense load path: refuse a window shorter than the config geometry.
+tests/test_inkling_en$(EXE): tests/test_inkling_en.c inkling.c st.h json.h compat.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)

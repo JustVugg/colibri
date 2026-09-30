@@ -390,6 +390,21 @@ def _olmoe_geometry(config, context, _model_dir):
 
 
 
+def _llama_geometry(config, context, _model_dir):
+    """Dense GQA: llama.c keeps one fp32 K and one fp32 V row per KV head per
+    position per layer (kv_alloc: n_kv * max_t * head_dim each). head_dim is the
+    config's explicit value when present, else hidden_size // num_attention_heads,
+    exactly as load_cfg derives it. No recurrent state, no experts."""
+    layers = _required_int(config, "num_hidden_layers", "llama")
+    heads = _required_int(config, "num_attention_heads", "llama")
+    kv = _optional_int(config, "num_key_value_heads", heads, 1)
+    head_dim = _optional_int(config, "head_dim", 0) or (
+        _required_int(config, "hidden_size", "llama") // heads)
+    if head_dim < 1 or heads % kv:
+        raise ValueError("llama: invalid attention geometry")
+    return PlannerGeometry(layers * context * kv * head_dim * 2 * 4, 0, 0, 0)
+
+
 def _kimi_geometry(config, context, _model_dir):
     """Kimi K3: hybrid -- 69 KDA (recurrent) + 24 gated MLA layers.
 
@@ -1379,6 +1394,36 @@ FAMILIES = (
         # GLM's prompt template. The engine speaks the SERVE protocol and nothing
         # else, so a one-shot has nowhere to go but the gateway -- which is what
         # coli chat, coli serve and coli web already use.
+        has_cli_adapter=False,
+    ),
+    FamilyDescriptor(
+        # Dense Llama (LlamaForCausalLM): RMSNorm, RoPE (+ llama3/linear
+        # scaling), GQA, SwiGLU, optional tied embeddings. llama.c reads the HF
+        # safetensors directly; tools/convert_llama.py validates and stages them.
+        id="llama",
+        model_types=("llama",),
+        display_name="Llama",
+        display_scale="1B",
+        engine_artifact="llama",
+        engine_aliases=(),
+        engine_group="llama",
+        internal_arch="llama",
+        build_target="llama",
+        process_names=("llama",),
+        default_model_id="llama-colibri",
+        cli_adapter="llama",
+        gateway_adapter="llama",
+        planner_id="llama_gqa",
+        planner_geometry=_llama_geometry,
+        planner_unsupported_reason="",
+        expert_inventory=_no_expert_inventory,
+        config_section="root",
+        limits=FamilyLimits(4096, 131072, 1024, 1024, 1, 0, "CTX"),
+        capabilities=FamilyCapabilities(False, False, False, False),
+        # The engine speaks only the ref.json harness today: no SERVE protocol,
+        # no chat template. Gateway and `coli run` stay unwired rather than
+        # falling through to another family's binary or template.
+        has_gateway_adapter=False,
         has_cli_adapter=False,
     ),
 )
