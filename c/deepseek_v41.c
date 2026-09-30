@@ -305,6 +305,10 @@ static void w8_load(shards *S, W8 *w, const char *name, int O, int I) {
     w->O = O; w->I = I;
     w->q = xmalloc((size_t)O * I, name);
     w->s = xmalloc((size_t)tiles, scale_name);
+    const st_tensor *ts = st_find(S, scale_name);
+    if (ts && ts->nbytes != tiles) {   /* short sidecar = uninitialised scales */
+        fprintf(stderr, "%s: %lld bytes, expected %d tiles -- refusing\n",
+                scale_name, (long long)ts->nbytes, tiles); exit(1); }
     st_read_raw_cap(S, name, w->q, (int64_t)O * I, 0);
     st_read_raw_cap(S, scale_name, w->s, tiles, 0);
 }
@@ -325,7 +329,7 @@ static void wf_load(shards *S, WF *w, const char *name, int64_t n) {
     w->w = xmalloc((size_t)n * sizeof(float), name);
     /* st_read_f32 widens bf16/f16 as well, so a checkpoint that stores one of these
      * small tensors in bf16 rather than f32 still loads. */
-    if (st_read_f32(S, name, w->w, 0) != n) {
+    if (st_read_f32_cap(S, name, w->w, n, 0) != n) {
         fprintf(stderr, "%s: expected %lld floats\n", name, (long long)n); exit(1); }
 }
 
@@ -893,6 +897,14 @@ static int expert_read_list(Model *m, const char *kind, int layer, int eid, Slot
         snprintf(out[n].name, sizeof(out[n].name), "%s.%d.ffn.experts.%d.%s.scale",
                  kind, layer, eid, part[i].suffix);
         out[n].dest = part[i].scale; out[n].size = part[i].scale_size; n++;
+    }
+    /* st_read_raw_cap only bounds from above: a shorter tensor would leave the
+     * slot tail holding the previous expert's bytes. */
+    for (int i = 0; i < n; i++) {
+        const st_tensor *t = st_find(&m->S, out[i].name);
+        if (t && t->nbytes != out[i].size) {
+            fprintf(stderr, "%s: %lld bytes, expected %lld -- refusing\n",
+                    out[i].name, (long long)t->nbytes, (long long)out[i].size); exit(1); }
     }
     return n;
 }

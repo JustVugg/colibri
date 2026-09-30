@@ -2124,7 +2124,7 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
              * not a new class; noted rather than silent. fmt=5's group scales (just
              * below) still use falloc and so remain Metal-inert -- pre-existing,
              * inconsistent after this change, a candidate for whoever wires fmt=5. */
-            if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=(float*)qalloc((size_t)O*(size_t)ng*sizeof(float)); }
+            if(t->fmt!=4||!t->q4||t->gs!=gs){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=(float*)qalloc((size_t)O*(size_t)ng*sizeof(float)); }
             st_read_raw(&m->S,name,t->q4,drop); }
         else if(fmt==5){ int64_t ng=i3_groups(I);   /* int3-g64: 24B/group weights + O*ng group scales */
             if(t->fmt!=5||!t->q4){ t->fmt=5; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
@@ -2163,6 +2163,10 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
                         fmt==5 ? (int64_t)O*i3_groups(I)  :
                         fmt==6 ? (int64_t)1               : (int64_t)O, drop);
     } else {
+        int64_t n=st_numel(&m->S,name);
+        if(n>=0 && n!=(int64_t)O*I){
+            fprintf(stderr,"%s: %lld elements, [%d,%d] implies %lld -- refusing (untrusted container)\n",
+                    name,(long long)n,O,I,(long long)O*I); exit(1); }
         if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
         if(t->fmt==0) st_read_f32_cap(&m->S,name,t->qf,(int64_t)O*I,drop);
         else { float *tmp=falloc((int64_t)O*I); st_read_f32_cap(&m->S,name,tmp,(int64_t)O*I,drop); qt_fill(t,tmp,bits); free(tmp); }
@@ -2963,6 +2967,14 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
             s->eid=eid; return 0;
         }
     }
+    /* Resolve (and so validate) every declared byte count BEFORE the reads: fslab
+     * holds sum(.qs bytes)/4 floats, and a U8/E8M0 sidecar (st_init skips its
+     * numel*esz check) whose byte count is not whole floats wrote past it before
+     * the resolve below this used to wait for ever refused it. */
+    int efmt[3], egs[3];
+    { int OO[3]={I,I,D}, II[3]={D,D,I};
+      for(int k=0;k<3;k++){ egs[k]=0;
+          efmt[k]=qt_resolve_fmt(tw[k]->name,OO[k],II[k],tw[k]->nbytes,tq[k]->nbytes,&egs[k],NULL); } }
     int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
     int64_t ftot=(tq[0]->nbytes+tq[1]->nbytes+tq[2]->nbytes)/4;
     /* rialloca se lo slot (riusato tra layer) e' troppo piccolo per QUESTO expert:
@@ -3126,9 +3138,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     }
     QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
     for(int k=0;k<3;k++){
-        int64_t nb=tw[k]->nbytes;
-        int gs=0;
-        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,NULL);   /* routed expert: never stamped */
+        int gs=egs[k], fmt=efmt[k];   /* resolved before the reads, above */
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
         /* K1: slab di proprieta' (pread, riscritta a ogni fill) -> planarizza.

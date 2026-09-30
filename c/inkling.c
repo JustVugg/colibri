@@ -737,7 +737,10 @@ static float load_scalar(Model *m, const char *name, float dflt) {
      * A scalar's capacity is 1. Anything larger is a hostile or corrupt file
      * and stops the load, which is the behaviour every other bounds check in
      * st.h already has. */
-    float v; st_read_f32_cap(&m->S, name, &v, 1, 0); return v;
+    float v;
+    if (st_read_f32_cap(&m->S, name, &v, 1, 0) != 1) {
+        fprintf(stderr, "%s: scalar tensor holds no value -- refusing\n", name); exit(1); }
+    return v;
 }
 
 /* chunked pread: a single pread caps at ~2.1 GB on Linux, and the bf16

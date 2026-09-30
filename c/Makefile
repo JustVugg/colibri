@@ -2127,3 +2127,10 @@ tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 
 tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
 	$(CC) $(NOCUDA_CFLAGS) tests/test_kimi_request_state.c $(VK_OBJ) -o tests/test_kimi_request_state$(EXE) $(NOCUDA_LDFLAGS)
+# Destinations sized from config/one count, filled from the tensor's declared count.
+tests/test_colibri_size_trust$(EXE): tests/test_colibri_size_trust.c tests/st_fixture.h colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_v41_size_trust$(EXE): tests/test_v41_size_trust.c tests/st_fixture.h deepseek_v41.c cli_args.h st.h json.h tok.h tok_unicode.h compat.h quant.h sparse_attn.h hyper_connections.h serve_codec.h serve_poll.h .build-config
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_inkling_scalar$(EXE): tests/test_inkling_scalar.c tests/st_fixture.h inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
