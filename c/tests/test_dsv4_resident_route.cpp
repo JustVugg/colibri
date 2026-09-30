@@ -6,10 +6,11 @@
 #include <cstring>
 #include <vector>
 
-int main() {
+int main(int argc, char **) {
     int devices[] = {0, 5};
     assert(dsv4_cuda_init(devices, 2));
-    constexpr int H = 128, I = 128, E = 256;
+    const int H = argc > 1 ? 4096 : 128, I = argc > 1 ? 2048 : 128;
+    constexpr int E = 256;
     for (int device : devices) {
         Dsv4CudaTensor *g[E] = {}, *u[E] = {}, *d[E] = {};
         std::vector<unsigned char> w(H*I/2), s(H*I/32, 120);
@@ -21,7 +22,7 @@ int main() {
             for (auto &v : w) v ^= 0x32;
             assert(dsv4_cuda_upload_fp4(&d[e],w.data(),s.data(),H,I,device));
         }
-        std::vector<unsigned char> sw(H*I,0x28), ss(1,124);
+        std::vector<unsigned char> sw(H*I,0x28), ss(((H+127)/128)*((I+127)/128),124);
         Dsv4CudaTensor *sg=nullptr,*su=nullptr,*sd=nullptr,*gate=nullptr,*bias=nullptr;
         assert(dsv4_cuda_upload_fp8(&sg,sw.data(),ss.data(),I,H,device));
         assert(dsv4_cuda_upload_fp8(&su,sw.data(),ss.data(),I,H,device));
@@ -62,6 +63,25 @@ int main() {
             }
             assert(nonzero);
         }
+        for (int count : {1, 2, 5, 17, 128}) for (int hash = 0; hash < 2; hash++) {
+            std::vector<float> bx(count * H), want(count * H), got(count * H);
+            std::vector<int> forced(count * 6);
+            for (int t = 0; t < count; t++) {
+                for (int h = 0; h < H; h++) bx[t * H + h] = ((h * 3 + t * 5) % 23 - 11) * .0625f;
+                for (int k = 0; k < 6; k++) forced[t * 6 + k] = (fixed[k] + 17 * t) % E;
+                assert(dsv4_cuda_resident_route_moe(set, gate, bias,
+                    hash ? forced.data() + t * 6 : nullptr, 1.5f, 7.f,
+                    want.data() + t * H, bx.data() + t * H));
+            }
+            assert(dsv4_cuda_resident_route_moe_batch(set, gate, bias,
+                hash ? forced.data() : nullptr, 1.5f, 7.f, got.data(), bx.data(), count));
+            assert(!std::memcmp(want.data(), got.data(), got.size() * sizeof(float)));
+            forced.back() = E;
+            assert(!dsv4_cuda_resident_route_moe_batch(set, gate, bias,
+                forced.data(), 1.5f, 7.f, got.data(), bx.data(), count));
+            printf("device=%d batch=%d hash=%d: exact scalar parity\n", device, count, hash);
+        }
+        assert(!dsv4_cuda_resident_route_moe_batch(set,gate,bias,nullptr,1.5f,7.f,actual.data(),x.data(),129));
         fixed[0]=256;
         assert(!dsv4_cuda_resident_route_moe(set,gate,bias,fixed,1.5f,7.f,actual.data(),x.data()));
         dsv4_cuda_activation_free(input); dsv4_cuda_expert_set_free(set);

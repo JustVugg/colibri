@@ -621,7 +621,7 @@ __global__ void expert_act_rows1(float *a,const float *g,const float *u,float li
 __global__ void moe_combine(float *routed,const float *shared,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)
     routed[i]=__bfloat162float(__float2bfloat16(routed[i]+__bfloat162float(__float2bfloat16(shared[i]))));}
 __global__ void ep2_localize(int *ids,float *weights,int base){int k=threadIdx.x;if(k<6){int id=ids[k]-base;if(id<0||id>=128){ids[k]=-1;weights[k]=0.f;}else ids[k]=id;}}
-__global__ void sort_routes6(int*ids,float*weights){if(threadIdx.x||blockIdx.x)return;for(int i=1;i<6;i++){int id=ids[i],j=i-1;float w=weights[i];while(j>=0&&ids[j]>id){ids[j+1]=ids[j];weights[j+1]=weights[j];j--;}ids[j+1]=id;weights[j+1]=w;}}
+__global__ void sort_routes6(int*ids,float*weights){if(threadIdx.x)return;ids+=blockIdx.x*6;weights+=blockIdx.x*6;for(int i=1;i<6;i++){int id=ids[i],j=i-1;float w=weights[i];while(j>=0&&ids[j]>id){ids[j+1]=ids[j];weights[j+1]=weights[j];j--;}ids[j+1]=id;weights[j+1]=w;}}
 __global__ void add_peer(float *out,const float *peer,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=__bfloat162float(__float2bfloat16(out[i]+peer[i]));}
 __global__ void bf16_round(float *x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)x[i]=__bfloat162float(__float2bfloat16(x[i]));}
 __device__ __forceinline__ float warp_sum_f32(float v){for(int d=16;d;d>>=1)v+=__shfl_down_sync(0xffffffff,v,d);return v;}
@@ -1177,7 +1177,20 @@ __global__ void compressor_project_exact(const __nv_bfloat16 *kv,const __nv_bflo
     int row=blockIdx.x*32+threadIdx.x;
     const __nv_bfloat16 *w=blockIdx.y?gate:kv;
     float sum=0.f;
-    for(int i=0;i<I;i++)
+    int i=0;
+    // Prefetch independent columns before the ordered accumulation. This
+    // hides load latency without changing a single rounding operation.
+    for(;i+32<=I;i+=32){
+        float values[32],inputs[32];
+        #pragma unroll
+        for(int k=0;k<32;k++){
+            values[k]=__bfloat162float(w[((long long)blockIdx.x*I+i+k)*32+threadIdx.x]);
+            inputs[k]=x[i+k];
+        }
+        #pragma unroll
+        for(int k=0;k<32;k++)sum=__fmaf_rn(values[k],inputs[k],sum);
+    }
+    for(;i<I;i++)
         sum=__fmaf_rn(__bfloat162float(w[((long long)blockIdx.x*I+i)*32+threadIdx.x]),x[i],sum);
     out[(long long)blockIdx.y*O+row]=sum;
 }
@@ -1185,7 +1198,16 @@ __global__ void indexer_head_project(const __nv_bfloat16 *w,const float *x,float
     int row=blockIdx.x*32+threadIdx.x;float sum=0.f;
     /* Unlike the compressor pair, the reference indexer head projection
      * rounds the product before adding it to the sequential accumulator. */
-    for(int i=0;i<I;i++)sum=__fadd_rn(sum,__fmul_rn(__bfloat162float(w[((long long)blockIdx.x*I+i)*32+threadIdx.x]),x[i]));
+    int i=0;
+    for(;i+32<=I;i+=32){
+        float products[32];
+        #pragma unroll
+        for(int k=0;k<32;k++)
+            products[k]=__fmul_rn(__bfloat162float(w[((long long)blockIdx.x*I+i+k)*32+threadIdx.x]),x[i+k]);
+        #pragma unroll
+        for(int k=0;k<32;k++)sum=__fadd_rn(sum,products[k]);
+    }
+    for(;i<I;i++)sum=__fadd_rn(sum,__fmul_rn(__bfloat162float(w[((long long)blockIdx.x*I+i)*32+threadIdx.x]),x[i]));
     out[row]=__fmul_rn(sum,scale);
 }
 /* Keep the CPU butterfly order and its FP4 tie rule (first code wins). */
@@ -1288,7 +1310,7 @@ __global__ void attention_window_dynamic(float*context,const float*q,const float
 /* Adapted from ds4_cuda.cu (MIT, Copyright 2026 ds4.c authors). */
 __device__ __forceinline__ bool route_better(float av,unsigned ai,float bv,unsigned bi){return av>bv||(av==bv&&ai<bi);}
 __device__ __forceinline__ float route_prob(float x){return sqrtf(log1pf(expf(-fabsf(x)))+fmaxf(x,0.f));}
-__global__ void route_top6(int *selected,float *weights,const float *bias,const float *logits,int fixed,float scale){unsigned lane=threadIdx.x;if(lane>=32)return;float prob[8],score[8];
+__global__ void route_top6(int *selected,float *weights,const float *bias,const float *logits,int fixed,float scale){unsigned lane=threadIdx.x;if(lane>=32)return;selected+=blockIdx.x*6;weights+=blockIdx.x*6;logits+=blockIdx.x*256;float prob[8],score[8];
     #pragma unroll
     for(unsigned j=0;j<8;j++){unsigned e=lane+j*32;prob[j]=route_prob(logits[e]);score[j]=prob[j]+(bias?bias[e]:0.f);}
     if(fixed){__shared__ float all[256];for(unsigned j=0;j<8;j++)all[lane+j*32]=prob[j];__syncwarp();if(!lane){float sum=0;for(int k=0;k<6;k++){weights[k]=all[selected[k]];sum+=weights[k];}sum=fmaxf(sum,6.103515625e-5f);for(int k=0;k<6;k++)weights[k]=weights[k]/sum*scale;}return;}
@@ -1307,7 +1329,7 @@ __global__ void route_top6_serial(int *selected,float *weights,const float *bias
 __global__ void route_fixed6(int *selected,float *weights,const float *logits,float scale){int k=threadIdx.x;__shared__ float prob[6];if(k<6)prob[k]=route_prob(logits[selected[k]]);__syncthreads();if(!k){float sum=0;for(int i=0;i<6;i++)sum+=prob[i];sum=fmaxf(sum,6.103515625e-5f);for(int i=0;i<6;i++)weights[i]=prob[i]/sum*scale;}}
 __global__ void build_moe_desc(MvDesc *desc,const ExpertPtr *table,const int *ids,const float *x,
                                float *gate,float *up,float *act,float *down,int count,int experts,int H,int I){
-    int k=threadIdx.x;if(k>=count)return;int e=ids[k];if(e<0||e>=experts)return;
+    int k=threadIdx.x;if(k>=count)return;k+=blockIdx.x*count;x+=(long long)blockIdx.x*H;count*=gridDim.x;int e=ids[k];if(e<0||e>=experts)return;
     ExpertPtr g=table[e],u=table[experts+e],d=table[2*experts+e];
     desc[2*k]={g.w,g.scale,x,gate+(long long)k*I};desc[2*k+1]={u.w,u.scale,x,up+(long long)k*I};
     desc[2*count+k]={d.w,d.scale,act+(long long)k*I,down+(long long)k*H};
@@ -2358,42 +2380,56 @@ extern "C" int dsv4_cuda_expert_set_upload_hash(Dsv4CudaExpertSet*set,const int6
 }
 /* The host-routed resident path's exact operation/rounding order, with routes
  * and descriptors retained on device. One activation upload and one download. */
-extern "C" int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *set,
+static int resident_route_moe(Dsv4CudaExpertSet *set,
         Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,const int *fixed,
-        float scale,float limit,float *out,const float *in){
+        float scale,float limit,float *out,const float *in,int tokens){
     Dev *c=set?ctx(set->device):nullptr;
-    if(!c||!gate||!in||!out||set->count!=256||!set->table||!set->sg||!set->su||!set->sd||
+    if(tokens<1||tokens>128||!c||!gate||!in||!out||set->count!=256||!set->table||!set->sg||!set->su||!set->sd||
        gate->device!=set->device||gate->fmt!=32||gate->O!=256||gate->I!=set->H||
        (bias&&(bias->device!=set->device||bias->fmt!=32||bias->O*bias->I<256)))return 0;
-    if(fixed)for(int k=0;k<6;k++)if(fixed[k]<0||fixed[k]>=256)return 0;
+    if(fixed)for(int k=0;k<6*tokens;k++)if(fixed[k]<0||fixed[k]>=256)return 0;
     if(!ok(cudaSetDevice(set->device),"select resident route device"))return 0;
-    int H=set->H,I=set->I,K=6;size_t hb=(size_t)H*4,ib=(size_t)K*I*4;
-    if(!buf((void**)&c->dx,&c->xcap,hb)||!buf((void**)&c->dy,&c->ycap,H>256?hb:256*4)||
+    int H=set->H,I=set->I,K=6,R=K*tokens;size_t hb=(size_t)tokens*H*4,ib=(size_t)R*I*4;
+    if(!buf((void**)&c->dx,&c->xcap,hb)||!buf((void**)&c->dy,&c->ycap,H>256?hb:(size_t)tokens*256*4)||
        !buf((void**)&c->p1,&c->p1cap,ib)||!buf((void**)&c->p2,&c->p2cap,ib)||
-       !buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,(size_t)K*H*4)||
-       !buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)3*K*sizeof(MvDesc))||
-       !buf((void**)&c->expert_weights,&c->expert_weightscap,K*sizeof(float))||
-       !buf((void**)&c->expert_ids,&c->expert_idcap,K*sizeof(int))||
+       !buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,(size_t)R*H*4)||
+       !buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)3*R*sizeof(MvDesc))||
+       !buf((void**)&c->expert_weights,&c->expert_weightscap,R*sizeof(float))||
+       !buf((void**)&c->expert_ids,&c->expert_idcap,R*sizeof(int))||
        !ok(cudaMemcpyAsync(c->dx,in,hb,cudaMemcpyHostToDevice,c->stream),"resident MoE input"))return 0;
-    mv_f32<<<256,256,0,c->stream>>>((float*)gate->w,c->dx,c->dy,256,H);
-    if(fixed&&!ok(cudaMemcpyAsync(c->expert_ids,fixed,K*sizeof(int),cudaMemcpyHostToDevice,c->stream),"resident fixed routes"))return 0;
-    route_top6<<<1,32,0,c->stream>>>(c->expert_ids,c->expert_weights,bias?(float*)bias->w:nullptr,c->dy,fixed!=nullptr,scale);
-    sort_routes6<<<1,1,0,c->stream>>>(c->expert_ids,c->expert_weights);
-    build_moe_desc<<<1,K,0,c->stream>>>(c->mvdesc,set->table,c->expert_ids,c->dx,c->p1,c->p2,c->p3,c->p4,K,256,H,I);
-    mv_fp4_grouped<4><<<dim3((I+3)/4,2*K),256,0,c->stream>>>(c->mvdesc,2*K,I,H);
-    expert_act_grouped<<<(K*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,K,I);
-    fp8_sim<<<K*((I+127)/128),128,0,c->stream>>>(c->p3,K,I);
-    mv_fp4_grouped<4><<<dim3((H+3)/4,K),256,0,c->stream>>>(c->mvdesc+2*K,K,H,I);
-    expert_reduce<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,K,H);
-    run_mv<8>((uint8_t*)set->sg->w,set->sg->scale,c->dx,c->p1,I,H,1,c->stream);
-    run_mv<8>((uint8_t*)set->su->w,set->su->scale,c->dx,c->p2,I,H,1,c->stream);
-    expert_act<<<(I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,1.f,limit,I);
-    fp8_sim<<<(I+127)/128,128,0,c->stream>>>(c->p3,1,I);
-    run_mv<8>((uint8_t*)set->sd->w,set->sd->scale,c->p3,c->p4,H,I,1,c->stream);
-    moe_combine<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,H);
+    route_logits_batch<<<tokens*256,256,0,c->stream>>>((float*)gate->w,c->dx,c->dy,tokens,256,H);
+    if(fixed&&!ok(cudaMemcpyAsync(c->expert_ids,fixed,R*sizeof(int),cudaMemcpyHostToDevice,c->stream),"resident fixed routes"))return 0;
+    route_top6<<<tokens,32,0,c->stream>>>(c->expert_ids,c->expert_weights,bias?(float*)bias->w:nullptr,c->dy,fixed!=nullptr,scale);
+    sort_routes6<<<tokens,1,0,c->stream>>>(c->expert_ids,c->expert_weights);
+    build_moe_desc<<<tokens,K,0,c->stream>>>(c->mvdesc,set->table,c->expert_ids,c->dx,c->p1,c->p2,c->p3,c->p4,K,256,H,I);
+    mv_fp4_grouped<4><<<dim3((I+3)/4,2*R),256,0,c->stream>>>(c->mvdesc,2*R,I,H);
+    expert_act_grouped<<<(R*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,R,I);
+    fp8_sim<<<R*((I+127)/128),128,0,c->stream>>>(c->p3,R,I);
+    mv_fp4_grouped<4><<<dim3((H+3)/4,R),256,0,c->stream>>>(c->mvdesc+2*R,R,H,I);
+    expert_reduce_rows<<<(tokens*H+255)/256,256,0,c->stream>>>(c->dy,c->p4,tokens,K,H);
+    if(tokens==1)run_mv<8>((uint8_t*)set->sg->w,set->sg->scale,c->dx,c->p1,I,H,1,c->stream);
+    else run_mm_batch(set->sg,c->dx,c->p1,tokens,c->stream);
+    if(tokens==1)run_mv<8>((uint8_t*)set->su->w,set->su->scale,c->dx,c->p2,I,H,1,c->stream);
+    else run_mm_batch(set->su,c->dx,c->p2,tokens,c->stream);
+    expert_act<<<(tokens*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,1.f,limit,tokens*I);
+    fp8_sim<<<tokens*((I+127)/128),128,0,c->stream>>>(c->p3,tokens,I);
+    if(tokens==1)run_mv<8>((uint8_t*)set->sd->w,set->sd->scale,c->p3,c->p4,H,I,1,c->stream);
+    else run_mm_batch(set->sd,c->p3,c->p4,tokens,c->stream);
+    moe_combine<<<(tokens*H+255)/256,256,0,c->stream>>>(c->dy,c->p4,tokens*H);
     return ok(cudaGetLastError(),"resident MoE launch")&&
         ok(cudaMemcpyAsync(out,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"resident MoE output")&&
         ok(cudaStreamSynchronize(c->stream),"resident MoE sync");
+}
+
+extern "C" int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *set,
+        Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,const int *fixed,
+        float scale,float limit,float *out,const float *in){
+    return resident_route_moe(set,gate,bias,fixed,scale,limit,out,in,1);
+}
+extern "C" int dsv4_cuda_resident_route_moe_batch(Dsv4CudaExpertSet *set,
+        Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,const int *fixed,
+        float scale,float limit,float *out,const float *in,int tokens){
+    return resident_route_moe(set,gate,bias,fixed,scale,limit,out,in,tokens);
 }
 
 extern "C" int dsv4_cuda_route_moe(const Dsv4CudaActivation*input,Dsv4CudaTensor*gate,Dsv4CudaTensor*bias,

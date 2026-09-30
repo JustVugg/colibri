@@ -398,6 +398,17 @@ int coli_v4_attention_window_batch_ref(
 
 typedef struct ColiV4AttentionSnapshot ColiV4AttentionSnapshot;
 
+/* A speculative batch records projected state updates. After restoring its
+ * base snapshot, retain only the accepted rows without rerunning the model. */
+int coli_v4_unified_decode_wanted(void);
+int coli_v4_attention_trial_begin(ColiDeepSeekV4WindowAttentionState *state,
+                                  int start, int batch);
+int coli_v4_attention_trial_ready(const ColiDeepSeekV4WindowAttentionState *state);
+int coli_v4_attention_trial_retain(ColiDeepSeekV4WindowAttentionState *state,
+    const ColiDeepSeekV4LayerWeights *weights, const ColiDeepSeekV4Config *config,
+    int retained, char *error, size_t error_size);
+void coli_v4_attention_trial_discard(ColiDeepSeekV4WindowAttentionState *state);
+
 int coli_v4_attention_snapshot_create(
     const ColiDeepSeekV4WindowAttentionState *state,
     ColiV4AttentionSnapshot **output);
@@ -907,6 +918,9 @@ extern unsigned long long g_v4_hyb_upload_n, g_v4_hyb_skip_n;
  * block_rows==1 fp4 expert view into it (returns non-zero to stay on CPU). */
 int coli_v4_gpu_dspark_mirrors_ensure(ColiV4Engine *engine);
 int coli_v4_gpu_dspark_expert_attach(void *cache, ColiExpertView *view);
+int coli_v4_gpu_dspark_expert_group(void *mirrors, int stage, const int *ids,
+    const float *weights, int count, float limit, float *output, const float *input);
+int coli_v4_gpu_dspark_dense_attach(ColiV4Engine *engine, ColiTensorView *view);
 #endif
 
 struct ColiV4Engine {
@@ -942,6 +956,7 @@ struct ColiV4Engine {
          * experts (separate bounded LRU; see dspark_mirrors_ensure). NULL
          * unless V4_MTP_GPU=1 and the tier opened successfully. */
         void *dspark_mirrors;
+        void *dspark_dense; /* owned immutable draft FP8 mirrors */
         void *head; /* owned packed BF16 vocabulary mirror */
     } gpu;
     struct {

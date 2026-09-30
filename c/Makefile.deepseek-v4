@@ -287,7 +287,7 @@ $(REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h expert_store.h 
 	$(CC) $(CFLAGS) -c expert_store_registry.c -o $@
 
 $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
-	deepseek_v4_internal.h deepseek_v4_gpu_devices.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
+	deepseek_v4_internal.h deepseek_v4_gpu_devices.h deepseek_v4_dspark.inc deepseek_v4_attention_trial.inc st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
 	route_trace.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
 	native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP)
@@ -311,7 +311,7 @@ $(V4_SERVE_TEST): tests/test_v4_serve_framing.c deepseek_v4.c deepseek_v4.h \
 	$(CC) $(CFLAGS) $< $(V4_SERVE_TEST_OBJS) -o $@ $(LDFLAGS)
 
 tools/bench_dsv4_head_batch: tools/bench_dsv4_head_batch.c deepseek_v4.c deepseek_v4.h \
-		deepseek_v4_internal.h deepseek_v4_dspark.inc serve_codec.h $(V4_SERVE_TEST_OBJS)
+		deepseek_v4_internal.h deepseek_v4_dspark.inc deepseek_v4_attention_trial.inc serve_codec.h $(V4_SERVE_TEST_OBJS)
 	$(CC) $(CFLAGS) $< $(V4_SERVE_TEST_OBJS) -o $@ $(LDFLAGS)
 
 # The CUDA tier loader object. Compiled only on Windows, where it is appended
@@ -342,6 +342,9 @@ test_expert_store_registry: test_expert_store_registry.c expert_store_registry.c
 
 ifeq ($(CUDA),1)
 ifeq ($(IS_WIN),)
+tests/test_dsv4_resident_route: tests/test_dsv4_resident_route.cpp backend_cuda_dsv4.h backend_cuda_dsv4.o
+	$(CXX) -O3 -std=c++20 $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
+
 tests/test_dsv4_indexer_prepare_cuda: tests/test_dsv4_indexer_prepare_cuda.cpp \
         backend_cuda_dsv4.h native_quant.h COLI_V4_UNIT_NATIVE_QUANT.o backend_cuda_dsv4.o
 	$(CXX) -O3 -std=c++20 $< COLI_V4_UNIT_NATIVE_QUANT.o backend_cuda_dsv4.o -o $@ $(LDFLAGS)
@@ -374,7 +377,12 @@ deepseek-v4-clean:
 		$(V4_BATCH_TEST_OBJ) \
 		tools/bench_dsv4_head_batch \
 		$(V4_SERVE_TEST) tests/test_dsv4_multigpu_cuda \
+		tests/test_dsv4_attention_trial tests/test_dsv4_resident_route \
 		tests/test_dsv4_compressor_cuda tests/test_dsv4_compressor_state_cuda \
 		tests/test_dsv4_indexer_prepare_cuda tests/test_dsv4_wo_decode_cuda tests/test_dsv4_head_cuda \
 		test_expert_store_registry $(V4_FLAGS_STAMP) \
 		$(V4_CUDA_FLAGS_STAMP)
+
+tests/test_dsv4_attention_trial: tests/test_dsv4_attention_trial.c deepseek_v4.c \
+        deepseek_v4_attention_trial.inc deepseek_v4_internal.h $(V4_SERVE_TEST_OBJS)
+	$(CC) $(CFLAGS) $< $(filter-out COLI_V4_UNIT_ATTENTION_BATCH.o,$(V4_SERVE_TEST_OBJS)) -o $@ $(LDFLAGS)

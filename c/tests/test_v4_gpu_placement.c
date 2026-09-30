@@ -8,6 +8,27 @@
 
 struct Dsv4CudaTensor { int device; };
 struct Dsv4CudaExpertSet { int device; };
+struct Dsv4CudaActivation { int device; long long elements; };
+static int activations_created, activations_freed;
+Dsv4CudaActivation *dsv4_cuda_activation_create(int device, long long elements) {
+    Dsv4CudaActivation *a = malloc(sizeof(*a)); assert(a);
+    a->device = device; a->elements = elements; activations_created++; return a;
+}
+void dsv4_cuda_activation_free(Dsv4CudaActivation *a) {
+    if (a) { activations_freed++; free(a); }
+}
+static void test_batch_scratch(void) {
+    Dsv4CudaActivation *a = v4_gpu_batch_scratch(V4_BATCH_FP8_IN, 0, 128);
+    Dsv4CudaActivation *b = v4_gpu_batch_scratch(V4_BATCH_FP8_IN, 5, 256);
+    assert(a && b && a != b && a->device == 0 && b->device == 5);
+    assert(v4_gpu_batch_scratch(V4_BATCH_FP8_IN, 0, 64) == a);
+    assert(activations_created == 2 && activations_freed == 0);
+    assert(v4_gpu_batch_scratch(V4_BATCH_FP8_IN, 0, 512)->elements == 512);
+    assert(activations_created == 3 && activations_freed == 1);
+    assert(v4_gpu_batch_scratch(V4_BATCH_FP8_IN, 5, 256) == b);
+    v4_gpu_batch_scratch_release();
+    assert(activations_created == activations_freed && !v4_batch_devices);
+}
 static int sets_created, sets_freed;
 void dsv4_cuda_expert_set_free(Dsv4CudaExpertSet *set) {
     if (set) { sets_freed++; free(set); }
@@ -350,6 +371,14 @@ int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *set,Dsv4CudaTensor *gate,
     if(route_ok)*out=*in;
     return route_ok;
 }
+int dsv4_cuda_resident_route_moe_batch(Dsv4CudaExpertSet *set,Dsv4CudaTensor *gate,
+    Dsv4CudaTensor *bias,const int *fixed,float scale,float limit,float *out,const float *in,int tokens) {
+    int ok = 1;
+    for (int t = 0; t < tokens; t++)
+        ok &= dsv4_cuda_resident_route_moe(set,gate,bias,fixed ? fixed + t*6 : NULL,
+                                          scale,limit,out+t,in+t);
+    return ok;
+}
 static void test_resident_route(void) {
     V4GpuExpertMirrorCache *cache=v4_gpu_expert_mirrors_create_capacity(0,256);
     cache->first_layer=7; cache->end_layer=8; cache->experts_per_layer=256;
@@ -377,11 +406,63 @@ static void test_resident_route(void) {
     assert(coli_v4_gpu_resident_route(&out,&weights,&config,&store,&in,0)==-1);
     bad_hash=0;
     assert(coli_v4_gpu_resident_route(&out,&weights,&config,&store,&in,2)==-1);
+    int batch_tokens[2] = {0, 1};
+    float batch_input[2] = {3, 7}, batch_output[2] = {0};
+    assert(v4_gpu_resident_route_batch(batch_output, &weights, &config, &store,
+                                      batch_input, batch_tokens, 2) == 1);
+    assert(batch_output[0] == 3 && batch_output[1] == 7);
     route_ok=0;
     assert(coli_v4_gpu_resident_route(&out,&weights,&config,&store,&in,0)==0);
     v4_gpu_expert_mirrors_free(cache);
     assert(sets_created==sets_freed && !live_tensors);
     unsetenv("DSV4_CUDA_RESIDENT_ROUTE");
+}
+
+static unsigned char expected_dense[8 * 128];
+static int dense_uploads, dense_fail;
+int dsv4_cuda_upload_fp8(Dsv4CudaTensor **t, const uint8_t *w, const uint8_t *scale,
+                         int rows, int cols, int device) {
+    assert(rows == 8 && cols == 128 && scale[0] == 125);
+    assert(!memcmp(w, expected_dense, sizeof(expected_dense)));
+    dense_uploads++;
+    if (dense_fail) return 0;
+    *t = malloc(sizeof(**t)); assert(*t); (*t)->device = device; live_tensors++;
+    return 1;
+}
+static void test_draft_cache(void) {
+    ColiV4Engine *engine = calloc(1, sizeof(*engine)); assert(engine);
+    engine->gpu.enabled = 1; engine->gpu.device_count = 6;
+    for (int i = 0; i < 6; i++) engine->gpu.devices[i] = i;
+    unsigned char packed[8 * 128], copy[8 * 128];
+    for (int r = 0; r < 8; r++) for (int c = 0; c < 128; c++) {
+        expected_dense[r * 128 + c] = (r * 17 + c) & 255;
+        packed[c * 8 + r] = expected_dense[r * 128 + c];
+    }
+    memcpy(copy, packed, sizeof(copy));
+    float scale = .25f;
+    ColiTensorView view = {.format=COLI_TENSOR_FP8_E4M3_BLOCK, .scale_format=COLI_SCALE_F32,
+        .data=packed, .scales=&scale, .rows=8, .columns=128, .block_rows=8};
+    assert(!coli_v4_gpu_dspark_dense_attach(engine, &view));
+    assert(view.gpu && dense_uploads == 1 && live_tensors == 1);
+    void *first = view.gpu;
+    view.gpu = NULL;
+    assert(!coli_v4_gpu_dspark_dense_attach(engine, &view) && view.gpu == first);
+    assert(dense_uploads == 1);
+    view.data = copy; view.gpu = NULL; dense_fail = 1;
+    assert(coli_v4_gpu_dspark_dense_attach(engine, &view) < 0 && !view.gpu);
+    assert(coli_v4_gpu_dspark_dense_attach(engine, &view) < 0 && dense_uploads == 2);
+    dense_fail = 0;
+    setenv("V4_MTP_GPU_DENSE", "1", 1); setenv("V4_MTP_GPU_MIRRORS", "25", 1);
+    assert(!coli_v4_gpu_dspark_mirrors_ensure(engine));
+    V4GpuExpertMirrorCache *cache = engine->gpu.dspark_mirrors;
+    for (int stage = 0; stage < 3; stage++, cache = cache->next) {
+        assert(cache && cache->device == stage + 1 && cache->first_layer == stage && cache->end_layer == stage + 1);
+        assert(cache->capacity == (stage == 0 ? 9 : 8));
+    }
+    assert(!cache);
+    coli_v4_gpu_engine_close(engine);
+    assert(!live_tensors && !engine->gpu.dspark_dense && !engine->gpu.dspark_mirrors);
+    free(engine); unsetenv("V4_MTP_GPU_DENSE"); unsetenv("V4_MTP_GPU_MIRRORS");
 }
 
 int main(void) {
@@ -441,6 +522,8 @@ int main(void) {
     test_resident_route();
     test_wo_decode();
     test_head();
+    test_draft_cache();
+    test_batch_scratch();
     puts("test_v4_gpu_placement: ok");
     return 0;
 }

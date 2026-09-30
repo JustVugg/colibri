@@ -1775,6 +1775,7 @@ struct ColiDeepSeekV4WindowAttentionState {
     float *compressed;
     int compressed_count;
     int compressed_capacity;
+    struct ColiV4AttentionTrial *trial;
 };
 
 int coli_v4_window_attention_create(ColiDeepSeekV4WindowAttentionState **output,
@@ -1807,6 +1808,7 @@ void coli_v4_window_attention_reset(ColiDeepSeekV4WindowAttentionState *state) {
 
 void coli_v4_window_attention_destroy(ColiDeepSeekV4WindowAttentionState *state) {
     if (!state) return;
+    coli_v4_attention_trial_discard(state);
     coli_v4_indexer_destroy(state->indexer);
     coli_v4_compressor_destroy(state->compressor);
     free(state->compressed);
@@ -2253,6 +2255,7 @@ struct ColiDeepSeekV4WindowAttentionState {
     float *compressed;
     int compressed_count;
     int compressed_capacity;
+    struct ColiV4AttentionTrial *trial;
 };
 
 int coli_v4_window_attention_create(ColiDeepSeekV4WindowAttentionState **output,
@@ -2285,6 +2288,7 @@ void coli_v4_window_attention_reset(ColiDeepSeekV4WindowAttentionState *state) {
 
 void coli_v4_window_attention_destroy(ColiDeepSeekV4WindowAttentionState *state) {
     if (!state) return;
+    coli_v4_attention_trial_discard(state);
     coli_v4_indexer_destroy(state->indexer);
     coli_v4_compressor_destroy(state->compressor);
     free(state->compressed);
@@ -2678,6 +2682,13 @@ static void *v4_attn_scratch(int slot, size_t bytes, int zero) {
     return arena[slot];
 }
 
+#include "deepseek_v4_attention_trial.inc"
+
+int coli_v4_unified_decode_wanted(void) {
+    const char *enabled = getenv("V4_UNIFIED_DECODE");
+    return enabled && atoi(enabled) != 0;
+}
+
 int coli_v4_attention_window_batch_ref(
     float *outputs, ColiDeepSeekV4WindowAttentionState *state,
     const ColiDeepSeekV4LayerWeights *weights,
@@ -2753,7 +2764,8 @@ int coli_v4_attention_window_batch_ref(
     V4_ATTN_PROF_MARK(prof_qa);
 
 #ifdef COLI_V4_GPU_TIER
-    int gpu_batch = coli_v4_gpu_attn_batch_wanted() && batch > 1;
+    int gpu_batch = coli_v4_gpu_attn_batch_wanted() &&
+                    (batch > 1 || coli_v4_unified_decode_wanted());
 #endif
     /* Whole-chunk GPU projections for the compressor and the indexer's
      * compressor; the per-token state advance stays on the CPU. NULL means
@@ -3146,6 +3158,10 @@ int coli_v4_attention_window_batch_ref(
                 weights->plan.layer, start_position, batch, prof_qa * 1e3,
                 prof_comp * 1e3, prof_idx * 1e3, prof_qb * 1e3, prof_kv * 1e3,
                 prof_rope * 1e3, prof_attn * 1e3, prof_wo * 1e3);
+    if (!result)
+        v4_attention_trial_record(state, config, inputs, kv, start_position,
+                                  batch, comp_kv_proj, comp_gate_proj,
+                                  comp_rows, idx_kv_proj, idx_gate_proj, idx_rows);
 #undef V4_ATTN_PROF_MARK
 
     free(inputs_act_scales); free(inputs_act);
@@ -5962,7 +5978,7 @@ int coli_v4_block_window_batch_ref(
      * back in the CPU layout so any later stage can still fall back. */
     int gpu_hc1 = 0;
 #ifdef COLI_V4_GPU_TIER
-    if (!result && batch > 1 &&
+    if (!result && (batch > 1 || coli_v4_unified_decode_wanted()) &&
         coli_v4_gpu_mhc_pre_norm_batch(weights, "attn", "attn_norm",
                                        posts, combs, normalized,
                                        inputs_hc, hc, d, batch) == 0)
@@ -5985,7 +6001,7 @@ int coli_v4_block_window_batch_ref(
     if (!result) phase = "attention post / FFN hyper-connection";
     int gpu_hc2 = 0;
 #ifdef COLI_V4_GPU_TIER
-    if (!result && batch > 1 &&
+    if (!result && (batch > 1 || coli_v4_unified_decode_wanted()) &&
         coli_v4_gpu_mhc_post_batch(weights, states, branches, inputs_hc,
                                    posts, combs, hc, d, batch) == 0 &&
         coli_v4_gpu_mhc_pre_norm_batch(weights, "ffn", "ffn_norm",
@@ -6015,7 +6031,7 @@ int coli_v4_block_window_batch_ref(
     /* Whole-chunk GPU MoE (expert bank; COLI_CUDA_MOE_BATCH=1). The backend
      * sums routed + shared like the CPU union; only the final bf16 rounding
      * happens here. Any refusal falls through to the CPU paths below. */
-    if (!result && batch > 1 &&
+    if (!result && (batch > 1 || coli_v4_unified_decode_wanted()) &&
         coli_v4_gpu_moe_batch_union(ffn_branch, weights, config, experts,
                                     ffn_normalized, tokens, batch) == 0)
         coli_bf16_round_array(ffn_branch, (size_t)batch * d);
@@ -6038,7 +6054,7 @@ int coli_v4_block_window_batch_ref(
     if (!result) phase = "FFN hyper-connection post";
     int gpu_hc3 = 0;
 #ifdef COLI_V4_GPU_TIER
-    if (!result && batch > 1 &&
+    if (!result && (batch > 1 || coli_v4_unified_decode_wanted()) &&
         coli_v4_gpu_mhc_post_batch(weights, outputs_hc, ffn_branch, states,
                                    ffn_post, ffn_comb, hc, d, batch) == 0)
         gpu_hc3 = 1;
@@ -6912,6 +6928,7 @@ struct ColiDeepSeekV4WindowAttentionState {
     float *compressed;
     int compressed_count;
     int compressed_capacity;
+    struct ColiV4AttentionTrial *trial;
 };
 
 int coli_v4_window_attention_create(ColiDeepSeekV4WindowAttentionState **output,
@@ -6944,6 +6961,7 @@ void coli_v4_window_attention_reset(ColiDeepSeekV4WindowAttentionState *state) {
 
 void coli_v4_window_attention_destroy(ColiDeepSeekV4WindowAttentionState *state) {
     if (!state) return;
+    coli_v4_attention_trial_discard(state);
     coli_v4_indexer_destroy(state->indexer);
     coli_v4_compressor_destroy(state->compressor);
     free(state->compressed);
@@ -10052,8 +10070,108 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     return 0;
 }
 
+typedef struct {
+    const void *source;
+    int64_t rows, columns;
+    Dsv4CudaTensor *tensor;
+} V4GpuDraftDenseEntry;
+typedef struct {
+    int count;
+    V4GpuDraftDenseEntry entries[128];
+} V4GpuDraftDense;
+
+int coli_v4_gpu_dspark_dense_attach(ColiV4Engine *engine, ColiTensorView *view) {
+    if (!engine || !engine->gpu.enabled || !view ||
+        view->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
+        view->scale_format != COLI_SCALE_F32 || !view->data || !view->scales ||
+        view->rows < 1 || view->rows > INT_MAX || view->columns < 1 || view->columns > INT_MAX ||
+        view->columns % 128 || (view->block_rows == 8 && view->rows % 8)) return -1;
+    V4GpuDraftDense *cache = engine->gpu.dspark_dense;
+    if (!cache) {
+        cache = calloc(1, sizeof(*cache));
+        if (!cache) return -1;
+        engine->gpu.dspark_dense = cache;
+    }
+    for (int i = 0; i < cache->count; i++) {
+        V4GpuDraftDenseEntry *entry = &cache->entries[i];
+        if (entry->source == view->data && entry->rows == view->rows && entry->columns == view->columns) {
+            view->gpu = entry->tensor;
+            return entry->tensor ? 0 : -1;
+        }
+    }
+    if (cache->count == 128) return -1;
+    V4GpuDraftDenseEntry *entry = &cache->entries[cache->count++];
+    entry->source = view->data; entry->rows = view->rows; entry->columns = view->columns;
+    size_t rows = (size_t)view->rows, cols = (size_t)view->columns;
+    size_t blocks = ((rows + 127) / 128) * (cols / 128);
+    uint8_t *scales = malloc(blocks), *unpacked = NULL;
+    const uint8_t *data = view->data;
+    if (!scales) return -1;
+    for (size_t i = 0; i < blocks; i++) {
+        float value = ((const float *)view->scales)[i];
+        scales[i] = isfinite(value) && value > 0 ? (uint8_t)(ilogbf(value) + 127) : 255;
+    }
+    if (view->block_rows == 8) {
+        unpacked = malloc(rows * cols);
+        if (!unpacked) { free(scales); return -1; }
+        for (size_t row = 0; row < rows; row++)
+            for (size_t col = 0; col < cols; col++)
+                unpacked[row * cols + col] = data[((row / 8) * cols + col) * 8 + row % 8];
+        data = unpacked;
+    }
+    int ok = dsv4_cuda_upload_fp8(&entry->tensor, data, scales, (int)rows, (int)cols, engine->gpu.device);
+    free(unpacked); free(scales);
+    view->gpu = entry->tensor;
+    return ok ? 0 : -1;
+}
+
+enum { V4_BATCH_FP8_IN, V4_BATCH_FP8_OUT, V4_BATCH_WO_IN, V4_BATCH_WO_OUT,
+       V4_BATCH_MHC, V4_BATCH_SLOTS = V4_BATCH_MHC + 4 };
+static struct {
+    int device;
+    Dsv4CudaActivation *slots[V4_BATCH_SLOTS];
+    long long capacity[V4_BATCH_SLOTS];
+} v4_batch_scratch[16];
+static int v4_batch_devices;
+static void v4_gpu_mhc_tags_clear(void);
+
+static Dsv4CudaActivation *v4_gpu_batch_scratch(int slot, int device, long long elements) {
+    if (slot < 0 || slot >= V4_BATCH_SLOTS || device < 0 || elements < 1) return NULL;
+    int i = 0;
+    while (i < v4_batch_devices && v4_batch_scratch[i].device != device) i++;
+    if (i == v4_batch_devices) {
+        if (v4_batch_devices == 16) return NULL;
+        v4_batch_scratch[i].device = device;
+        v4_batch_devices++;
+    }
+    if (v4_batch_scratch[i].capacity[slot] < elements) {
+        v4_gpu_mhc_tags_clear();
+        dsv4_cuda_activation_free(v4_batch_scratch[i].slots[slot]);
+        Dsv4CudaActivation *act = dsv4_cuda_activation_create(device, elements);
+        v4_batch_scratch[i].slots[slot] = act;
+        v4_batch_scratch[i].capacity[slot] = act ? elements : 0;
+    }
+    return v4_batch_scratch[i].slots[slot];
+}
+
+static void v4_gpu_batch_scratch_release(void) {
+    v4_gpu_mhc_tags_clear();
+    for (int i = 0; i < v4_batch_devices; i++)
+        for (int slot = 0; slot < V4_BATCH_SLOTS; slot++)
+            dsv4_cuda_activation_free(v4_batch_scratch[i].slots[slot]);
+    memset(v4_batch_scratch, 0, sizeof(v4_batch_scratch));
+    v4_batch_devices = 0;
+}
+
 void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
     if (!engine || !engine->gpu.enabled) return;
+    v4_gpu_batch_scratch_release();
+    V4GpuDraftDense *draft = engine->gpu.dspark_dense;
+    if (draft) {
+        for (int i = 0; i < draft->count; i++) dsv4_cuda_tensor_free(draft->entries[i].tensor);
+        free(draft);
+        engine->gpu.dspark_dense = NULL;
+    }
     for (int layer = 0; layer < COLI_V4_RESIDENT_MAX_LAYERS; layer++) {
         if (!engine->gpu.layer_ready[layer]) continue;
         ColiDeepSeekV4LayerWeights *weights =
@@ -10525,31 +10643,13 @@ int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
  * per-device scratch buffers. */
 int coli_v4_gpu_fp8_matmul_batch(const ColiTensorView *w, float *outputs,
                                  const float *inputs, int batch) {
-    static Dsv4CudaActivation *input_mirror, *output_mirror;
-    static long long input_capacity, output_capacity;
-    static int mirror_device = -1;
     Dsv4CudaTensor *tensor = (Dsv4CudaTensor *)w->gpu;
     if (!tensor || batch < 1) return -1;
     int device = dsv4_cuda_tensor_device(tensor);
     long long in_elements = (long long)batch * w->columns;
     long long out_elements = (long long)batch * w->rows;
-    if (mirror_device != device) {
-        if (input_mirror) dsv4_cuda_activation_free(input_mirror);
-        if (output_mirror) dsv4_cuda_activation_free(output_mirror);
-        input_mirror = output_mirror = NULL;
-        input_capacity = output_capacity = 0;
-        mirror_device = device;
-    }
-    if (input_capacity < in_elements) {
-        if (input_mirror) dsv4_cuda_activation_free(input_mirror);
-        input_mirror = dsv4_cuda_activation_create(device, in_elements);
-        input_capacity = input_mirror ? in_elements : 0;
-    }
-    if (output_capacity < out_elements) {
-        if (output_mirror) dsv4_cuda_activation_free(output_mirror);
-        output_mirror = dsv4_cuda_activation_create(device, out_elements);
-        output_capacity = output_mirror ? out_elements : 0;
-    }
+    Dsv4CudaActivation *input_mirror = v4_gpu_batch_scratch(V4_BATCH_FP8_IN, device, in_elements);
+    Dsv4CudaActivation *output_mirror = v4_gpu_batch_scratch(V4_BATCH_FP8_OUT, device, out_elements);
     if (!input_mirror || !output_mirror) return -1;
     if (!dsv4_cuda_activation_upload(input_mirror, inputs, in_elements) ||
         !dsv4_cuda_matmul_batch(tensor, input_mirror, batch, output_mirror) ||
@@ -11089,9 +11189,9 @@ int coli_v4_gpu_moe_resident(ColiExpertStore *store, int layer,
 }
 
 /* Keep routing, sorted expert descriptors and MoE on the same device stream. */
-int coli_v4_gpu_resident_route(float *output,
+static int v4_gpu_resident_route_batch(float *output,
     const ColiDeepSeekV4LayerWeights *weights, const ColiDeepSeekV4Config *config,
-    ColiExpertStore *store, const float *input, int token) {
+    ColiExpertStore *store, const float *input, const int *tokens, int batch) {
     const char *setting = getenv("DSV4_CUDA_RESIDENT_ROUTE");
     if ((setting && !atoi(setting)) || !weights || !config || !output || !input)
         return 0;
@@ -11100,21 +11200,23 @@ int coli_v4_gpu_resident_route(float *output,
     V4GpuExpertMirrorCache *cache = v4_gpu_expert_cache(store, weights->plan.layer);
     if (!cache || cache->experts_per_layer != 256 || config->num_experts_per_tok != 6)
         return 0;
-    if (token < 0 || token >= config->vocab_size) return -1;
+    if (!tokens || batch < 1 || batch > 128) return -1;
+    for (int i = 0; i < batch; i++)
+        if (tokens[i] < 0 || tokens[i] >= config->vocab_size) return -1;
     Dsv4CudaTensor *gate = coli_v4_layer_gpu(weights, "ffn.gate");
     Dsv4CudaTensor *bias = coli_v4_layer_gpu(weights, "ffn.gate.bias");
     Dsv4CudaTensor *sg = coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
     Dsv4CudaTensor *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
     Dsv4CudaTensor *sd = coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
     if (!gate || !sg || !su || !sd) return 0;
-    int fixed[6], *forced = NULL;
+    int fixed[128 * 6], *forced = NULL;
     if (weights->plan.uses_hash_router) {
         char key[96];
         snprintf(key, sizeof(key), "layers.%d.ffn.gate.tid2eid", weights->plan.layer);
         const int64_t *map = coli_v4_layer_data(weights, key, NULL);
         if (!map) return -1;
-        for (int k = 0; k < 6; k++) {
-            int64_t id = map[(size_t)token * 6 + k];
+        for (int k = 0; k < batch * 6; k++) {
+            int64_t id = map[(size_t)tokens[k / 6] * 6 + k % 6];
             if (id < 0 || id >= 256) return -1;
             fixed[k] = (int)id;
         }
@@ -11134,9 +11236,11 @@ int coli_v4_gpu_resident_route(float *output,
         }
         cache->route_sets[layer] = dsv4_cuda_expert_set_create(g, u, d, 256, sg, su, sd);
     }
-    int ok = cache->route_sets[layer] && dsv4_cuda_resident_route_moe(
-        cache->route_sets[layer], gate, bias, forced, config->routed_scaling_factor,
-        config->swiglu_limit, output, input);
+    int ok = cache->route_sets[layer] && (batch == 1
+        ? dsv4_cuda_resident_route_moe(cache->route_sets[layer], gate, bias, forced,
+            config->routed_scaling_factor, config->swiglu_limit, output, input)
+        : dsv4_cuda_resident_route_moe_batch(cache->route_sets[layer], gate, bias, forced,
+            config->routed_scaling_factor, config->swiglu_limit, output, input, batch));
     if (ok && !cache->route_announced) {
         fprintf(stderr, "v4_gpu resident-route=on device=%d\n", cache->device);
         cache->route_announced = 1;
@@ -11146,9 +11250,38 @@ int coli_v4_gpu_resident_route(float *output,
     return ok ? 1 : 0;
 }
 
+int coli_v4_gpu_resident_route(float *output,
+    const ColiDeepSeekV4LayerWeights *weights, const ColiDeepSeekV4Config *config,
+    ColiExpertStore *store, const float *input, int token) {
+    return v4_gpu_resident_route_batch(output, weights, config, store, input, &token, 1);
+}
+
 int coli_v4_gpu_dspark_expert_attach(void *cache, ColiExpertView *view) {
     if (!view) return -1;
-    return v4_gpu_expert_attach_cached_ex((V4GpuExpertMirrorCache *)cache, view, 1);
+    for (V4GpuExpertMirrorCache *entry = cache; entry; entry = entry->next)
+        if (view->key.layer >= entry->first_layer && view->key.layer < entry->end_layer)
+            return v4_gpu_expert_attach_cached_ex(entry, view, 1);
+    return -1;
+}
+
+int coli_v4_gpu_dspark_expert_group(void *mirrors, int stage, const int *ids,
+    const float *weights, int count, float limit, float *output, const float *input) {
+    if (!ids || !weights || count < 1 || count > 16) return 0;
+    V4GpuExpertMirrorCache *cache = mirrors;
+    while (cache && !(stage >= cache->first_layer && stage < cache->end_layer)) cache = cache->next;
+    if (!cache) return 0;
+    Dsv4CudaTensor *g[16], *u[16], *d[16];
+    int ready = 1;
+    pthread_mutex_lock(&cache->mutex);
+    for (int i = 0; i < count; i++) {
+        V4GpuExpertMirror *entry = v4_gpu_expert_find(cache, stage, ids[i]);
+        if (!entry || !entry->gate || !entry->up || !entry->down) { ready = 0; break; }
+        entry->clock = ++cache->clock;
+        g[i] = entry->gate; u[i] = entry->up; d[i] = entry->down;
+    }
+    int ok = ready && dsv4_cuda_expert_group(g, u, d, weights, count, limit, output, input);
+    pthread_mutex_unlock(&cache->mutex);
+    return ok;
 }
 
 /* Lazy dspark mirror cache. Kept separate from the target model's expert
@@ -11161,11 +11294,22 @@ int coli_v4_gpu_dspark_mirrors_ensure(ColiV4Engine *engine) {
     const char *setting = getenv("V4_MTP_GPU_MIRRORS");
     int capacity = setting ? atoi(setting) : 16;
     if (capacity < 1) capacity = 1;
-    engine->gpu.dspark_mirrors =
-        v4_gpu_expert_mirrors_create_capacity(engine->gpu.device, capacity);
-    if (!engine->gpu.dspark_mirrors) return -1;
-    fprintf(stderr, "v4_gpu dspark-mirrors device=%d cap=%d\n",
-            engine->gpu.device, capacity);
+    const char *dense = getenv("V4_MTP_GPU_DENSE");
+    int partitions = dense && atoi(dense) && engine->gpu.device_count >= 3 && capacity >= 24 ? 3 : 1;
+    V4GpuExpertMirrorCache *head = NULL, **tail = &head;
+    for (int stage = 0; stage < partitions; stage++) {
+        int device = partitions == 1 ? engine->gpu.device
+            : engine->gpu.devices[(stage + 1) % engine->gpu.device_count];
+        int slots = capacity / partitions + (stage < capacity % partitions);
+        *tail = v4_gpu_expert_mirrors_create_capacity(device, slots);
+        if (!*tail) { v4_gpu_expert_mirrors_free(head); return -1; }
+        (*tail)->first_layer = partitions == 1 ? 0 : stage;
+        (*tail)->end_layer = partitions == 1 ? 3 : stage + 1;
+        fprintf(stderr, "v4_gpu dspark-mirrors device=%d cap=%d stages=%d..%d\n",
+                device, slots, (*tail)->first_layer, (*tail)->end_layer - 1);
+        tail = &(*tail)->next;
+    }
+    engine->gpu.dspark_mirrors = head;
     return 0;
 }
 
@@ -11363,8 +11507,11 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         return -1; \
     } while (0)
     /* Resident tables use the token pipeline, without a second streaming bank. */
-    if (store && weights && coli_v4_gpu_experts_resident(store, weights->plan.layer))
-        return -1;
+    if (store && weights && coli_v4_gpu_experts_resident(store, weights->plan.layer)) {
+        const char *enabled = getenv("V4_RESIDENT_MOE_BATCH");
+        if (!enabled || !atoi(enabled)) return -1;
+        return v4_gpu_resident_route_batch(outputs, weights, config, store, inputs, tokens, batch) == 1 ? 0 : -1;
+    }
     if (!coli_v4_gpu_moe_batch_wanted() || bank_failed) return -1;
     {
         static int minimum = -1;
@@ -11981,9 +12128,6 @@ int coli_v4_gpu_indexer_score_batch(
 int coli_v4_gpu_attention_wo_batch(
     const ColiDeepSeekV4LayerWeights *weights, float *outputs,
     const float *attended, int groups, int q_width, int hidden, int batch) {
-    static Dsv4CudaActivation *context_mirror, *output_mirror;
-    static long long context_capacity, output_capacity;
-    static int mirror_device = -1;
     if (!coli_v4_gpu_attn_batch_wanted() || !weights || !outputs ||
         !attended || groups < 1 || q_width < 1 || hidden < 1 || batch < 1)
         return -1;
@@ -11994,23 +12138,8 @@ int coli_v4_gpu_attention_wo_batch(
     if (device < 0) return -1;
     long long in_elements = (long long)batch * q_width;
     long long out_elements = (long long)batch * hidden;
-    if (mirror_device != device) {
-        if (context_mirror) dsv4_cuda_activation_free(context_mirror);
-        if (output_mirror) dsv4_cuda_activation_free(output_mirror);
-        context_mirror = output_mirror = NULL;
-        context_capacity = output_capacity = 0;
-        mirror_device = device;
-    }
-    if (context_capacity < in_elements) {
-        if (context_mirror) dsv4_cuda_activation_free(context_mirror);
-        context_mirror = dsv4_cuda_activation_create(device, in_elements);
-        context_capacity = context_mirror ? in_elements : 0;
-    }
-    if (output_capacity < out_elements) {
-        if (output_mirror) dsv4_cuda_activation_free(output_mirror);
-        output_mirror = dsv4_cuda_activation_create(device, out_elements);
-        output_capacity = output_mirror ? out_elements : 0;
-    }
+    Dsv4CudaActivation *context_mirror = v4_gpu_batch_scratch(V4_BATCH_WO_IN, device, in_elements);
+    Dsv4CudaActivation *output_mirror = v4_gpu_batch_scratch(V4_BATCH_WO_OUT, device, out_elements);
     if (!context_mirror || !output_mirror) return -1;
     if (!dsv4_cuda_activation_upload(context_mirror, attended, in_elements) ||
         !dsv4_cuda_attention_output_batch(context_mirror, wa, wb, groups,
@@ -12023,30 +12152,11 @@ int coli_v4_gpu_attention_wo_batch(
 
 /* Shared activation mirrors for the batched mHC offload. Grow-only, single
  * generation thread (same contract as the other prefill mirrors). */
-static void v4_gpu_mhc_tags_clear(void);
 
 static Dsv4CudaActivation *v4_gpu_mhc_mirror(int slot, int device,
                                              long long elements) {
-    static Dsv4CudaActivation *mirrors[4];
-    static long long capacity[4];
-    static int mirror_device = -1;
     if (slot < 0 || slot > 3) return NULL;
-    if (mirror_device != device || capacity[slot] < elements)
-        v4_gpu_mhc_tags_clear();    /* a freed activation address can recycle */
-    if (mirror_device != device) {
-        for (int i = 0; i < 4; i++) {
-            if (mirrors[i]) dsv4_cuda_activation_free(mirrors[i]);
-            mirrors[i] = NULL;
-            capacity[i] = 0;
-        }
-        mirror_device = device;
-    }
-    if (capacity[slot] < elements) {
-        if (mirrors[slot]) dsv4_cuda_activation_free(mirrors[slot]);
-        mirrors[slot] = dsv4_cuda_activation_create(device, elements);
-        capacity[slot] = mirrors[slot] ? elements : 0;
-    }
-    return mirrors[slot];
+    return v4_gpu_batch_scratch(V4_BATCH_MHC + slot, device, elements);
 }
 
 /* Residency tags: a successful pre call leaves the hc residual (slot 0) and
@@ -13009,6 +13119,9 @@ static int target_token_impl(ColiV4Engine *engine, float **state_ptr, float **ne
                         char *error, size_t error_size) {
     float *state = *state_ptr, *next = *next_ptr;
     if (load_embedding(state, index, config, token)) return -1;
+    if (coli_v4_unified_decode_wanted())
+        return target_batch_impl(engine, state_ptr, next_ptr, attention, index,
+            config, experts, &token, position, 1, 0, NULL, NULL, error, error_size);
     for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
@@ -13056,11 +13169,13 @@ static int spec_attention_restore(
     return 0;
 }
 
-static void spec_attention_free(ColiV4AttentionSnapshot **snapshots,
-                                int layers) {
+static void spec_attention_free(ColiDeepSeekV4WindowAttentionState **attention,
+                                ColiV4AttentionSnapshot **snapshots, int layers) {
     if (!snapshots) return;
-    for (int layer = 0; layer < layers; layer++)
+    for (int layer = 0; layer < layers; layer++) {
+        coli_v4_attention_trial_discard(attention[layer]);
         coli_v4_attention_snapshot_destroy(snapshots[layer]);
+    }
     free(snapshots);
 }
 
@@ -14211,10 +14326,15 @@ int coli_v4_session_generate(ColiV4Session *session,
                     session->spec_disabled = 1;
                 } else {
                     int old_last = last_processed;
+                    const char *retain_env = getenv("V4_SPEC_RETAIN");
+                    int retain_trial = retain_env && atoi(retain_env) != 0;
+                    for (int layer = 0; retain_trial && layer < config->num_hidden_layers; layer++)
+                        if (coli_v4_attention_trial_begin(attention[layer], old_last + 1, batch))
+                            retain_trial = 0;
                     for (int item = 0; item < batch; item++)
                         if (load_embedding(state + (size_t)item * hd, index,
                                            config, inputs[item])) {
-                            spec_attention_free(snapshots,
+                            spec_attention_free(attention, snapshots,
                                                 config->num_hidden_layers);
                             kv_prefix_taint(&session->fed);
                             if (error && error_size)
@@ -14227,7 +14347,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                                      batch, 0, NULL, NULL, error, error_size)) {
                         (void)spec_attention_restore(
                             attention, snapshots, config->num_hidden_layers);
-                        spec_attention_free(snapshots,
+                        spec_attention_free(attention, snapshots,
                                             config->num_hidden_layers);
                         kv_prefix_taint(&session->fed);
                         return -1;
@@ -14248,7 +14368,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                     if (!heads_ok) {
                         (void)spec_attention_restore(
                             attention, snapshots, config->num_hidden_layers);
-                        spec_attention_free(snapshots,
+                        spec_attention_free(attention, snapshots,
                                             config->num_hidden_layers);
                         kv_prefix_taint(&session->fed);
                         if (error && error_size && !error[0])
@@ -14301,11 +14421,13 @@ int coli_v4_session_generate(ColiV4Session *session,
                      * Restore the exact snapshot and replay only inputs that
                      * really correspond to emitted outputs. */
                     if (retained < batch) {
+                        for (int layer = 0; retain_trial && layer < config->num_hidden_layers; layer++)
+                            if (!coli_v4_attention_trial_ready(attention[layer])) retain_trial = 0;
                         if (spec_attention_restore(
                                 attention, snapshots,
                                 config->num_hidden_layers)) {
                             spec_attention_free(
-                                snapshots, config->num_hidden_layers);
+                                attention, snapshots, config->num_hidden_layers);
                             kv_prefix_taint(&session->fed);
                             if (error && error_size)
                                 snprintf(error, error_size,
@@ -14313,29 +14435,47 @@ int coli_v4_session_generate(ColiV4Session *session,
                             return -1;
                         }
                         if (coli_v4_full_dspark_wanted)
-                            v4_ds_invalidate_from(old_last + 1);
-                        for (int item = 0; item < retained; item++)
-                            if (load_embedding(state + (size_t)item * hd,
-                                               index, config, inputs[item])) {
+                            v4_ds_invalidate_from(old_last + 1 + (retain_trial ? retained : 0));
+                        if (retain_trial) {
+                            for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
+                                ColiDeepSeekV4LayerWeights layer;
+                                int rc = coli_v4_layer_load(engine, &layer, config, index,
+                                                            layer_id, error, error_size);
+                                if (!rc) {
+                                    rc = coli_v4_attention_trial_retain(attention[layer_id],
+                                            &layer, config, retained, error, error_size);
+                                    coli_v4_layer_free(engine, &layer);
+                                }
+                                if (rc) {
+                                    spec_attention_free(attention, snapshots, config->num_hidden_layers);
+                                    kv_prefix_taint(&session->fed);
+                                    return -1;
+                                }
+                            }
+                        } else {
+                            for (int item = 0; item < retained; item++)
+                                if (load_embedding(state + (size_t)item * hd,
+                                                   index, config, inputs[item])) {
+                                    spec_attention_free(
+                                        attention, snapshots, config->num_hidden_layers);
+                                    kv_prefix_taint(&session->fed);
+                                    if (error && error_size)
+                                        snprintf(error, error_size,
+                                                 "cannot replay speculative input");
+                                    return -1;
+                                }
+                            if (retained > 0 && target_batch(
+                                    engine, &state, &next, attention, index,
+                                    config, experts, inputs, old_last + 1,
+                                    retained, 0, NULL, NULL, error, error_size)) {
                                 spec_attention_free(
-                                    snapshots, config->num_hidden_layers);
+                                    attention, snapshots, config->num_hidden_layers);
                                 kv_prefix_taint(&session->fed);
-                                if (error && error_size)
-                                    snprintf(error, error_size,
-                                             "cannot replay speculative input");
                                 return -1;
                             }
-                        if (retained > 0 && target_batch(
-                                engine, &state, &next, attention, index,
-                                config, experts, inputs, old_last + 1,
-                                retained, 0, NULL, NULL, error, error_size)) {
-                            spec_attention_free(
-                                snapshots, config->num_hidden_layers);
-                            kv_prefix_taint(&session->fed);
-                            return -1;
                         }
                     }
-                    spec_attention_free(snapshots,
+                    spec_attention_free(attention, snapshots,
                                         config->num_hidden_layers);
                     if (retained > 0) {
                         kv_prefix_record(&session->fed, inputs, old_last + 1,
