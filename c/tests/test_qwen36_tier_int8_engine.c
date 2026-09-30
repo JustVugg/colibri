@@ -289,6 +289,20 @@ static void case_ram_cap_skip(void) {
     free_model(&m);
     unsetenv("RAM_GB");
 }
+/* Dense (num_experts 0): no expert subsystem. The tier still comes up for the
+ * trunk, with no slot table at all -- calloc(0) may return NULL, which used to
+ * read as OOM and disable the tier; glibc returns a live pointer, so this pins
+ * the NULL instead of trusting the allocator. */
+static void case_dense_zero_experts(void) {
+    printf("dense model, zero experts\n");
+    setenv("COLI_CUDA", "1", 1);
+    setenv("COLI_GPUS", "0", 1);
+    int ready = qt_init(NL, 0, EXP_D, EXP_IH, 0, 0, 0, 0);
+    ck(ready, "the tier comes up for a model with no experts");
+    ck(G.slot == NULL, "no expert slot table is allocated");
+    ck(qt_resident_count() == 0, "nothing is resident");
+    if (ready) qt_shutdown();
+}
 #endif
 int main(void) {
 #ifndef _WIN32
@@ -299,6 +313,7 @@ int main(void) {
 #ifndef _WIN32
     case_ram_cap_skip();
 #endif
+    case_dense_zero_experts();
     if (fails) { printf("FAILED %d\n", fails); return 1; }
     printf("OK test_qwen36_tier_int8_engine\n");
     return 0;

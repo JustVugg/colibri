@@ -1491,6 +1491,10 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     for (int i = layer_begin; i < layer_end; i++) {
         m->cache[i].cap = cap;
         m->cache[i].slots = calloc((size_t)cap, sizeof(Slot));
+        /* Dense (n_experts 0) has no expert subsystem: the index stays NULL,
+         * which slot_indexed/cache_publish already read as "never resident".
+         * malloc(0) may legally return NULL, which this used to call OOM. */
+        if (c->n_experts == 0) continue;
         m->cache[i].slot_by_expert = malloc((size_t)c->n_experts * sizeof(int));
         if (!m->cache[i].slot_by_expert) { fprintf(stderr,"OOM expert cache index\n"); exit(1); }
         for (int e = 0; e < c->n_experts; e++) m->cache[i].slot_by_expert[e] = -1;

@@ -906,8 +906,13 @@ static int qt_init_body(int nl, int ne, int D, int Ih, int cap, int topk,
         fprintf(stderr,"[qtier] dev %d: %.1f GB free, allowance %.1f GB\n",
                 G.dev[i], freeb/1073741824.0, capacity[i]/1073741824.0);
     }
-    G.slot=calloc((size_t)nl*ne,sizeof(QSlot));
-    if(!G.slot) return 0;
+    /* ne == 0 is dense: no expert slots, G.slot stays NULL (G was wiped above)
+     * and every nl*ne walk over it is empty. calloc(0) may return NULL, which
+     * used to disable the whole tier as if the host were out of memory. */
+    if(ne>0){
+        G.slot=calloc((size_t)nl*ne,sizeof(QSlot));
+        if(!G.slot) return 0;
+    }
     const char *hf=getenv("HEAT_FILE");
     if(hf && !G_int4_stream){
         FILE *f=fopen(hf,"rb");
