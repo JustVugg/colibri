@@ -1,0 +1,115 @@
+{
+  "base_commit": "dbe79f77fbaf056f6e5807f21425ba58115bd1fb",
+  "samples": 48,
+  "exact_to_target_samples": 48,
+  "metric": "1536 generated tokens / full six-session wall time; prefill included, model load excluded",
+  "modes": {
+    "t": {
+      "runs": [
+        {
+          "round": 1,
+          "tokens": 1536,
+          "wall_s": 128.485936645,
+          "tok_s": 11.954615735447284,
+          "decode_tok_s": 12.692699470692698,
+          "drafted": 0,
+          "accepted": 0
+        },
+        {
+          "round": 2,
+          "tokens": 1536,
+          "wall_s": 128.53913991,
+          "tok_s": 11.949667634896812,
+          "decode_tok_s": 12.68980001942083,
+          "drafted": 0,
+          "accepted": 0
+        },
+        {
+          "round": 3,
+          "tokens": 1536,
+          "wall_s": 130.528338047,
+          "tok_s": 11.767559619482205,
+          "decode_tok_s": 12.46767521248904,
+          "drafted": 0,
+          "accepted": 0
+        }
+      ],
+      "median_tok_s": 11.949667634896812
+    },
+    "d": {
+      "runs": [
+        {
+          "round": 1,
+          "tokens": 1536,
+          "wall_s": 112.399393781,
+          "tok_s": 13.66555413094804,
+          "decode_tok_s": 14.630742131054133,
+          "drafted": 1744,
+          "accepted": 1167
+        },
+        {
+          "round": 2,
+          "tokens": 1536,
+          "wall_s": 112.916360195,
+          "tok_s": 13.602988949939736,
+          "decode_tok_s": 14.565114602155314,
+          "drafted": 1744,
+          "accepted": 1167
+        },
+        {
+          "round": 3,
+          "tokens": 1536,
+          "wall_s": 114.666438791,
+          "tok_s": 13.395375457675401,
+          "decode_tok_s": 14.353294788081778,
+          "drafted": 1744,
+          "accepted": 1167
+        }
+      ],
+      "median_tok_s": 13.602988949939736
+    }
+  },
+  "baseline_target_tok_s": 12.307021535036041,
+  "naruto_historical_tok_s": 77.9746887088,
+  "gain_over_baseline": 0.10530309150872053,
+  "fixture_sha256": "a977dec01cfd310d37b47fe16b884f9cacc56c00c9534a81a741e7cf8dcad87e",
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5",
+    "DSV4_CUDA": "1",
+    "DSV4_CUDA_DEVICES": "0,1,2,3,4,5",
+    "OMP_NUM_THREADS": "12",
+    "CTX": "512",
+    "COLI_CUDA_ATTN_BATCH": "1",
+    "COLI_CUDA_MOE_BATCH": "1",
+    "DSV4_CUDA_EXPERT_MIRRORS": "2048",
+    "V4_LOADER_LANES": "3",
+    "COLI_V4_PREWARM": "0",
+    "V4_MTP": "1",
+    "V4_MTP_GPU": "1",
+    "V4_MTP_GPU_DENSE": "1",
+    "DSV4_CUDA_PIN_HOST": "0",
+    "V4_MTP_GPU_MIRRORS": "768",
+    "V4_MTP_GB": "4",
+    "V4_MTP_CONF": "0",
+    "V4_MTP_DRAFT": "5",
+    "V4_NGRAM": "0",
+    "V4_DRAFT": "5",
+    "V4_MTP_PARTIAL_KEEP": "1",
+    "V4_SPEC_RETAIN": "1",
+    "V4_RESIDENT_MOE_BATCH": "1",
+    "V4_UNIFIED_DECODE": "1",
+    "V4_MTP_LOG": "1"
+  },
+  "source_sha256": {
+    "c/deepseek_v4.c": "9deacf82a01299f044a26cbf6a0f64e97be29e8873d4038d0a2ab3b2eb2d3056",
+    "c/backend_cuda_dsv4.cu": "29d380f1cd66c75203e043f69d491bba53dbe5d4a05c57e74c6b922e0e16f7e6",
+    "c/deepseek_v4_dspark.inc": "348be581b1d9fd4d3a9fea656ff3e14bea76a2f9f34f53b04b38588b4f7c6c9d",
+    "c/deepseek_v4_internal.h": "6a4c06733b8b0e0edcc0c90b13568a786e93060d1e0fd6a511832ee68da9d476",
+    "c/deepseek_v4_attention_trial.inc": "f3020585213cc4ce0c0e35f7207d2746eae3cf0c02d74fff3d62b34d32e68cab",
+    "c/tools/bench_dsv4_fixtures": "f4350f4c7eeb4d22113874ca8cf80e9778b4af3fea4140fbd57bf41703f56055",
+    "c/tools/bench_dsv4_fixtures.c": "3fb5688649a1ee67c28863ea3260426b026e064dd29dadebb757f1a316e7156d",
+    "c/Makefile.experiment": "384c12867c867c189cfb8bd71840ede0306b4b885a58340f6d87e378b3d4628b",
+    "long6.prompts": "a977dec01cfd310d37b47fe16b884f9cacc56c00c9534a81a741e7cf8dcad87e",
+    "/data/models/DeepSeek-V4-Flash-0731/model.safetensors.index.json": "98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b"
+  }
+}

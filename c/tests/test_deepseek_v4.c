@@ -2,6 +2,8 @@
 #include "../deepseek_v4_internal.h"
 #include "../compat.h"
 #include "../native_quant.h"
+#include "../native_quant_batch.h"
+#include "../native_quant_dual.h"
 #include "../native_quant_fp4_rows16.h"
 
 #include <assert.h>
@@ -1655,7 +1657,126 @@ static int test_sparse_attention(void) {
 }
 /* ==== end test_deepseek_v4_sparse_attention.c ==== */
 
+static int test_fp8_grouped_projection(void) {
+#ifdef __AVX512F__
+    enum { GROUPS = 4, ROWS = 128, COLS = 256 };
+    uint8_t packed[GROUPS * ROWS * COLS];
+    float scales[GROUPS * 2], inputs[GROUPS * COLS];
+    float expected[GROUPS * ROWS], actual[GROUPS * ROWS];
+    for (int i = 0; i < GROUPS * ROWS * COLS; i++)
+        packed[i] = (uint8_t)((i * 17 % 126) | (i % 3 ? 128 : 0));
+    for (int i = 0; i < GROUPS * COLS; i++) inputs[i] = (i % 31 - 15) * 0.039f;
+    for (int i = 0; i < GROUPS * 2; i++) scales[i] = (i + 1) * 0.027f;
+    ColiTensorView weight = {COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32,
+        packed, scales, sizeof(packed), sizeof(scales), GROUPS * ROWS, COLS, 8, 128, NULL};
+    for (int group = 0; group < GROUPS; group++) {
+        ColiTensorView part = weight;
+        part.rows = ROWS; part.data = packed + (size_t)group * ROWS * COLS;
+        part.scales = scales + group * 2;
+        part.data_bytes = ROWS * COLS; part.scale_bytes = 2 * sizeof(float);
+        if (coli_fp8_matmul_batch_ref(expected + group * ROWS, &part,
+                                       inputs + group * COLS, 1)) return 1;
+    }
+    if (coli_fp8_grouped_matvec_ref(actual, &weight, inputs, GROUPS) ||
+        memcmp(expected, actual, sizeof(expected)) ||
+        !coli_fp8_grouped_matvec_ref(actual, &weight, inputs, 3)) return 1;
+#endif
+    return 0;
+}
+
+static int test_route_bf16_parallel_order(void) {
+    enum { EXPERTS = 32, DIM = 128, TOPK = 6 };
+    float gate[EXPERTS * DIM], hidden[DIM], bias[EXPERTS];
+    uint16_t packed[EXPERTS * DIM];
+    float expected[TOPK], actual[TOPK]; int expected_ids[TOPK], actual_ids[TOPK];
+    int forced[TOPK] = {5, 1, 7, 19, 5, 31};
+    for (int i = 0; i < EXPERTS * DIM; i++) {
+        gate[i] = (i % 23 - 11) * 0.03125f;
+        uint32_t bits; memcpy(&bits, &gate[i], sizeof(bits)); packed[i] = (uint16_t)(bits >> 16);
+    }
+    for (int i = 0; i < DIM; i++) hidden[i] = (i % 17 - 8) * 0.01371f;
+    for (int i = 0; i < EXPERTS; i++) bias[i] = i * 0.015625f;
+    for (int mode = 0; mode < 2; mode++) {
+        const int *ids = mode ? forced : NULL;
+        if (coli_v4_route(expected, expected_ids, hidden, gate, bias, ids,
+                EXPERTS, DIM, TOPK, 1.5f) ||
+            coli_v4_route_bf16(actual, actual_ids, hidden, packed, bias, ids,
+                EXPERTS, DIM, TOPK, 1.5f) ||
+            memcmp(expected_ids, actual_ids, sizeof(expected_ids)) ||
+            memcmp(expected, actual, sizeof(expected))) return 1;
+    }
+    return 0;
+}
+
+static int test_sparse_attention_parallel_order(void) {
+    enum { HEADS = 7, DIM = 32, KV = 19, TOPK = 17 };
+    float query[HEADS * DIM], kv[KV * DIM], sinks[HEADS];
+    float serial[HEADS * DIM], parallel[HEADS * DIM];
+    int indices[TOPK];
+    for (int i = 0; i < HEADS * DIM; i++) query[i] = (i % 11 - 5) * 0.125f;
+    for (int i = 0; i < KV * DIM; i++) kv[i] = (i % 13 - 6) * 0.0625f;
+    for (int i = 0; i < TOPK; i++) indices[i] = i % 5 ? i : -1;
+    for (int head = 0; head < HEADS; head++) {
+        sinks[head] = head * 0.25f;
+        if (coli_v4_sparse_attention_ref(serial + head * DIM, query + head * DIM,
+                kv, sinks + head, indices, 1, DIM, KV, TOPK, 0.125f)) return 1;
+    }
+    if (coli_v4_sparse_attention_ref(parallel, query, kv, sinks, indices,
+            HEADS, DIM, KV, TOPK, 0.125f) ||
+        memcmp(serial, parallel, sizeof(serial))) return 1;
+    indices[0] = KV;
+    if (!coli_v4_sparse_attention_ref(parallel, query, kv, sinks, indices,
+            HEADS, DIM, KV, TOPK, 0.125f)) return 1;
+    for (int i = 0; i < TOPK; i++) indices[i] = -1;
+    if (!coli_v4_sparse_attention_ref(parallel, query, kv, sinks, indices,
+            HEADS, DIM, KV, TOPK, 0.125f)) return 1;
+    return 0;
+}
+
+static int test_fp8_decode_batch_order(void) {
+    enum { ROWS = 144, COLS = 256 };
+    uint8_t packed[ROWS * COLS];
+    float scales[4] = {0.037f, 0.13f, 1.71f, 0.0049f};
+    float inputs[2 * COLS], single[ROWS], batched[2 * ROWS];
+    for (int i = 0; i < ROWS * COLS; i++)
+        packed[i] = (uint8_t)((i * 37 % 126) | (i & 1 ? 128 : 0));
+    for (int column = 0; column < COLS; column++)
+        inputs[column] = inputs[COLS + column] = (column % 19 - 9) * 0.03125f;
+    ColiTensorView weight = {
+        COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32,
+        packed, scales, sizeof(packed), sizeof(scales),
+        ROWS, COLS, 8, 128, NULL
+    };
+    for (int rows = 136; rows <= ROWS; rows += 8) {
+        weight.rows = rows; weight.data_bytes = (size_t)rows * COLS;
+        if (coli_fp8_matmul_batch_ref(single, &weight, inputs, 1) ||
+        coli_fp8_matmul_batch_ref(batched, &weight, inputs, 2) ||
+        memcmp(single, batched, (size_t)rows * sizeof(float)) ||
+        memcmp(single, batched + rows, (size_t)rows * sizeof(float))) return 1;
+    }
+    float reference[136], reference_dual[136], other[ROWS];
+    float other_scales[4] = {0.21f, 0.007f, 0.91f, 1.03f};
+    ColiTensorView second = weight;
+    second.scales = other_scales;
+    for (int rows = 136; rows <= ROWS; rows += 8) {
+        weight.rows = second.rows = rows;
+        weight.data_bytes = second.data_bytes = (size_t)rows * COLS;
+        if (coli_fp8_matvec_ref(single, &weight, inputs) ||
+            coli_fp8_dual_matvec_ref(batched, other, &weight, &second, inputs) ||
+            memcmp(single, batched, (size_t)rows * sizeof(float))) return 1;
+        if (rows == 136) {
+            memcpy(reference, single, sizeof(reference));
+            memcpy(reference_dual, other, sizeof(reference_dual));
+        } else if (memcmp(reference, single, sizeof(reference)) ||
+                   memcmp(reference_dual, other, sizeof(reference_dual))) return 1;
+    }
+    puts("DeepSeek-V4 FP8 decode: batch-exact bits");
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (test_fp8_decode_batch_order() || test_sparse_attention_parallel_order() ||
+        test_route_bf16_parallel_order() || test_fp8_grouped_projection()) return 1;
     if (test_attention_cache() != 0) {
         fprintf(stderr, "FAIL: test_attention_cache\n");
         return 1;

@@ -9,7 +9,95 @@ static int close_enough(float left, float right) {
     return fabsf(left - right) <= 1e-6f * fmaxf(1.0f, fabsf(right));
 }
 
+static int test_fp8_qdq_simd(void) {
+    float input[4097], output[4097]; uint8_t scales[4097];
+    uint32_t random = 1;
+    for (int i = 0; i < 4097; i++) {
+        random = random * 1664525u + 1013904223u;
+        input[i] = (int32_t)random * (448.0f / 2147483648.0f);
+    }
+    for (int i = 0; i < 128; i++) {
+        float a = coli_e4m3fn_decode((uint8_t)(i % 126));
+        float b = coli_e4m3fn_decode((uint8_t)(i % 126 + 1));
+        input[i] = (a + b) * 0.5f;
+    }
+    input[0] = -0.0f; input[128] = NAN; input[255] = 448.0f;
+    const size_t blocks[] = {20, 128, 257};
+    for (size_t k = 0; k < sizeof(blocks) / sizeof(blocks[0]); k++) {
+        size_t block = blocks[k];
+        if (coli_fp8_activation_qdq_ref(output, scales, input, 4097, block)) return 1;
+        for (size_t base = 0; base < 4097; base += block) {
+            size_t count = 4097 - base < block ? 4097 - base : block;
+            float maximum = 1e-4f;
+            for (size_t i = 0; i < count; i++) maximum = fmaxf(maximum, fabsf(input[base+i]));
+            int exponent; float fraction = frexpf(maximum / 448.0f, &exponent);
+            if (fraction == 0.5f) exponent--;
+            float scale = ldexpf(1.0f, exponent);
+            if (scales[base / block] != exponent + 127) return 1;
+            for (size_t i = 0; i < count; i++) {
+                float normalized = fmaxf(-448.0f, fminf(448.0f, input[base+i] / scale));
+                float expected = coli_e4m3fn_decode(coli_e4m3fn_encode(normalized)) * scale;
+                if (memcmp(output + base + i, &expected, sizeof(expected))) return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 int main(void) {
+    if (test_fp8_qdq_simd()) return 1;
+#ifdef __AVX2__
+    for (int base = 0; base < 256; base += 8) {
+        int codes[8]; float decoded[8];
+        for (int lane = 0; lane < 8; lane++) codes[lane] = base + lane;
+        _mm256_storeu_ps(decoded, v4_fp8_decode8(
+            _mm256_loadu_si256((const __m256i *)codes)));
+        for (int lane = 0; lane < 8; lane++) {
+            float expected = coli_e4m3fn_decode((uint8_t)codes[lane]);
+            if (isnan(expected) ? !isnan(decoded[lane]) :
+                memcmp(&expected, &decoded[lane], sizeof(float)) != 0) return 1;
+        }
+    }
+#endif
+#ifdef __AVX512F__
+    for (int base = 0; base < 256; base += 16) {
+        int codes[16]; float decoded[16];
+        for (int lane = 0; lane < 16; lane++) codes[lane] = base + lane;
+        _mm512_storeu_ps(decoded, v4_fp8_decode16(
+            _mm512_loadu_si512((const void *)codes)));
+        for (int lane = 0; lane < 16; lane++) {
+            float expected = coli_e4m3fn_decode((uint8_t)codes[lane]);
+            if (isnan(expected) ? !isnan(decoded[lane]) :
+                memcmp(&expected, &decoded[lane], sizeof(float)) != 0) return 1;
+        }
+    }
+#endif
+#ifdef __AVX2__
+    unsigned previous_mxcsr = _mm_getcsr();
+    for (int flush = 0; flush < 2; flush++) {
+        _mm_setcsr(flush ? previous_mxcsr | 0x8040u : previous_mxcsr & ~0x8040u);
+        for (int base = 0; base < 256; base += 16) {
+            uint8_t codes[16]; float decoded[16];
+            for (int lane = 0; lane < 16; lane++) codes[lane] = (uint8_t)(base + lane);
+            _mm256_storeu_ps(decoded, v4_fp8_decode8_bytes(_mm_loadl_epi64((const __m128i *)codes)));
+            _mm256_storeu_ps(decoded + 8, v4_fp8_decode8_bytes(_mm_loadl_epi64((const __m128i *)(codes + 8))));
+            for (int lane = 0; lane < 16; lane++) {
+                float expected = coli_e4m3fn_decode(codes[lane]);
+                if (isnan(expected) ? !isnan(decoded[lane]) :
+                    memcmp(&expected, &decoded[lane], sizeof(float))) return 1;
+            }
+#ifdef __AVX512F__
+            _mm512_storeu_ps(decoded, v4_fp8_decode16_bytes(_mm_loadu_si128((const __m128i *)codes)));
+            for (int lane = 0; lane < 16; lane++) {
+                float expected = coli_e4m3fn_decode(codes[lane]);
+                if (isnan(expected) ? !isnan(decoded[lane]) :
+                    memcmp(&expected, &decoded[lane], sizeof(float))) return 1;
+            }
+#endif
+        }
+    }
+    _mm_setcsr(previous_mxcsr);
+#endif
     if (coli_bf16_round(1.00390625f) != 1.0f ||
         coli_bf16_round(1.01171875f) != 1.015625f)
         return 1;

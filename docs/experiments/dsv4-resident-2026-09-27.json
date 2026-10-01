@@ -1,0 +1,202 @@
+{
+  "results-base1.json": [
+    {
+      "case": "base1",
+      "exit_code": 0,
+      "wall_seconds": 47.71567715983838,
+      "peak_MiB": [
+        12090,
+        7912,
+        8026,
+        7440,
+        7198,
+        7624
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 短波长的光更容易被空气分子散射（这叫“瑞利散射”）。\n3. 蓝光",
+      "timing": [
+        12.66,
+        30.202
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=17995 hits=13591 misses=4404 hit_rate=75.527 bytes=58878590976 target_only=1",
+        "v4_direct reads=4404 flock_reads=0 fallbacks=0 payload_bytes=55415144448"
+      ],
+      "decode_tps": 2.0859545725448645
+    },
+    {
+      "case": "new1",
+      "exit_code": 0,
+      "wall_seconds": 45.899202407337725,
+      "peak_MiB": [
+        12116,
+        7988,
+        7874,
+        7122,
+        6764,
+        7128
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        12.536,
+        29.415
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11299 hits=7105 misses=4194 hit_rate=62.882 bytes=56071028736 target_only=1",
+        "v4_direct reads=4194 flock_reads=0 fallbacks=0 payload_bytes=52772732928"
+      ],
+      "decode_tps": 2.1417644059153496
+    }
+  ],
+  "results-fused1.json": [
+    {
+      "case": "fused1",
+      "exit_code": 0,
+      "wall_seconds": 49.09033196978271,
+      "peak_MiB": [
+        12268,
+        7874,
+        7734,
+        7046,
+        6700,
+        7052
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        13.203,
+        31.17
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=17995 hits=13669 misses=4326 hit_rate=75.960 bytes=57835782144 target_only=1",
+        "v4_direct reads=4326 flock_reads=0 fallbacks=0 payload_bytes=54433677312"
+      ],
+      "decode_tps": 2.021174205967276
+    },
+    {
+      "case": "new2",
+      "exit_code": 0,
+      "wall_seconds": 45.84201629180461,
+      "peak_MiB": [
+        12268,
+        7988,
+        7822,
+        7046,
+        6700,
+        7052
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        12.414,
+        29.187
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11299 hits=7104 misses=4195 hit_rate=62.873 bytes=56084398080 target_only=1",
+        "v4_direct reads=4195 flock_reads=0 fallbacks=0 payload_bytes=52785315840"
+      ],
+      "decode_tps": 2.158495220474869
+    }
+  ],
+  "results-new-arithmetic.json": [
+    {
+      "case": "new-arithmetic",
+      "exit_code": 0,
+      "wall_seconds": 17.290313354693353,
+      "peak_MiB": [
+        2112,
+        2128,
+        2140,
+        2128,
+        2140,
+        2370
+      ],
+      "answer": "4<｜end▁of▁sentence｜>",
+      "timing": [
+        13.322,
+        0.977
+      ],
+      "generated": 2,
+      "diagnostics": [
+        "v4_tokens prompt=18 generated=2 total=20 expert_requests=2119 hits=204 misses=1915 hit_rate=9.627 bytes=25602293760 target_only=1",
+        "v4_direct reads=1915 flock_reads=0 fallbacks=0 payload_bytes=24096276480"
+      ],
+      "decode_tps": 1.0235414534288638
+    }
+  ],
+  "results-new3.json": [
+    {
+      "case": "new3",
+      "exit_code": 0,
+      "wall_seconds": 44.65077507868409,
+      "peak_MiB": [
+        12268,
+        7988,
+        7874,
+        7122,
+        6764,
+        7128
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        11.359,
+        28.767
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11299 hits=7105 misses=4194 hit_rate=62.882 bytes=56071028736 target_only=1",
+        "v4_direct reads=4194 flock_reads=0 fallbacks=0 payload_bytes=52772732928"
+      ],
+      "decode_tps": 2.1900093857545104
+    },
+    {
+      "case": "fused2",
+      "exit_code": 0,
+      "wall_seconds": 48.69871065951884,
+      "peak_MiB": [
+        12268,
+        7964,
+        7734,
+        7046,
+        6700,
+        7052
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        13.55,
+        30.286
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=17995 hits=13668 misses=4327 hit_rate=75.954 bytes=57849151488 target_only=1",
+        "v4_direct reads=4327 flock_reads=0 fallbacks=0 payload_bytes=54446260224"
+      ],
+      "decode_tps": 2.080169055008915
+    },
+    {
+      "case": "fused3",
+      "exit_code": 0,
+      "wall_seconds": 48.54933218192309,
+      "peak_MiB": [
+        12268,
+        7988,
+        7874,
+        7058,
+        6700,
+        7052
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        13.536,
+        30.175
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=17995 hits=13668 misses=4327 hit_rate=75.954 bytes=57849151488 target_only=1",
+        "v4_direct reads=4327 flock_reads=0 fallbacks=0 payload_bytes=54446260224"
+      ],
+      "decode_tps": 2.087821043910522
+    }
+  ]
+}
