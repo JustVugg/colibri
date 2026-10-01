@@ -34,7 +34,7 @@ import family_registry as fr  # noqa: E402
 
 
 BACKEND_OBJECTS = ("CUDA_OBJ", "METAL_OBJ", "VK_OBJ", "VK_SPV", "INK_CUDA_OBJ",
-                   "QWEN36_TIER_SRC")
+                   "QWEN36_TIER_OBJ")
 
 
 def engine_rule(artifact: str) -> str:

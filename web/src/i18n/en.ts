@@ -24,7 +24,7 @@ const en: Record<string, string> = {
   "ui.copy": "Copy response",
   "ui.attachImage": "Attach an image",
   "ui.removeImage": "Remove image",
-  "ui.attachedImage": "Attached image {n}",
+  "ui.attachedImage": "Attached image {{n}}",
   "ui.copied": "Copied",
   "ui.copyError": "Could not copy the text. Select the response to copy it.",
   "ui.regenerate": "Regenerate response",

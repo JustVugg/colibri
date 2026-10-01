@@ -31,6 +31,11 @@ class FamilyCapabilities:
     grammar_payload: bool
     audio_payload: bool
     thinking: bool
+    # The gateway has a placeholder expansion for this family's pictures. Whether
+    # the checkpoint being served loaded its tower is the engine's word (the CAPS
+    # handshake line, openai_server.Engine.vision), never this bit's: a glm53
+    # export can carry vision_config and no model.visual.* tensors.
+    image: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -818,6 +823,61 @@ def _dsv41_geometry(config, context, _model_dir):
     return PlannerGeometry(state, fixed, workspace, experts)
 
 
+def _mimo_geometry(config, context, _model_dir):
+    """MiMo-V2.6: what mimo.c allocates per context (kv_alloc), in f32.
+
+        full-attention layers  context * kv_heads * (head_dim + v_head_dim) * 4
+        sliding-window layers  min(window, context) * swa_kv_heads * (swa_head_dim +
+                               swa_v_head_dim) * 4, a ring that never grows (fixed)
+
+    hybrid_layer_pattern says which is which (1 = sliding window). On Flash 39 of
+    the 48 layers are windowed, so a 1M context costs the KV of 9 layers.
+    Workspace mirrors forward()'s per-block buffers at the default 64-row block,
+    plus the full-attention score row per head.
+    """
+    layers = _required_int(config, "num_hidden_layers", "mimo")
+    experts = _required_int(config, "n_routed_experts", "mimo")
+    hidden = _required_int(config, "hidden_size", "mimo")
+    kv = _required_int(config, "num_key_value_heads", "mimo")
+    head_dim = _required_int(config, "head_dim", "mimo")
+    v_dim = config.get("v_head_dim", head_dim)
+    swa_kv = config.get("swa_num_key_value_heads", kv)
+    swa_hd = config.get("swa_head_dim", head_dim)
+    swa_vd = config.get("swa_v_head_dim", v_dim)
+    heads = _required_int(config, "num_attention_heads", "mimo")
+    for name, value in (("v_head_dim", v_dim), ("swa_num_key_value_heads", swa_kv),
+                        ("swa_head_dim", swa_hd), ("swa_v_head_dim", swa_vd)):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"mimo: {name} must be a positive integer")
+    pattern = config.get("hybrid_layer_pattern")
+    if not isinstance(pattern, list) or len(pattern) != layers:
+        raise ValueError("mimo: hybrid_layer_pattern must list every layer")
+    windowed = sum(1 for kind in pattern if kind == 1)
+    window = _required_int(config, "sliding_window", "mimo") if windowed else 0
+    state = (layers - windowed) * context * kv * (head_dim + v_dim) * 4
+    fixed = windowed * min(window, context) * swa_kv * (swa_hd + swa_vd) * 4
+    block = 64
+    workspace = (block * hidden * 6 + block * heads * (head_dim + v_dim) * 2
+                 + heads * context) * 4
+    return PlannerGeometry(state, fixed, workspace, experts)
+
+
+# What the checkpoint carries and mimo.c never loads: the three MTP layers (no
+# speculative decoding yet) and the audio encoder (text and images only).
+_MIMO_NOT_LOADED = re.compile(r"^(?:model\.mtp\.|audio_encoder\.|speech_embeddings\.)")
+
+
+def _mimo_expert_inventory(name, size, _config, _dtype=None):
+    match = _GLM_EXPERT.search(name)
+    if match is None or name.startswith("model.mtp."):
+        return ()
+    return ((int(match.group(1)), int(match.group(2)), size),)
+
+
+def _mimo_resident_inventory(name, size, _config, _dtype=None):
+    return 0 if _MIMO_NOT_LOADED.match(name) else size
+
+
 _DSV41_MTP_EXPERT = re.compile(r"^mtp\.(\d+)\.ffn\.experts\.(\d+)\.")
 
 
@@ -1147,7 +1207,7 @@ FAMILIES = (
         # share COMMON_CAP, which says otherwise -- the flag is descriptive
         # (it only feeds the capability dict) so nothing broke, but a client
         # reading it programmatically was told the opposite of the truth.
-        capabilities=FamilyCapabilities(True, False, False, True),
+        capabilities=FamilyCapabilities(True, False, False, True, image=True),
         has_gateway_adapter=True,
         has_cli_adapter=True,
         # Dal chat_template.jinja del checkpoint: nessun a capo, e <think>
@@ -1343,7 +1403,7 @@ FAMILIES = (
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         config_section="text_config",
         limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 8, "Q36_MAXT"),
-        capabilities=FamilyCapabilities(False, False, False, True),
+        capabilities=FamilyCapabilities(False, False, False, True, image=True),
         has_gateway_adapter=True,
         # coli run stays unwired on purpose: cmd_run dispatches per arch after
         # this gate, and without a qwen36 branch the engine would inherit GLM's
@@ -1376,7 +1436,7 @@ FAMILIES = (
         fixed_resident_inventory=_qwen38_fixed_resident_inventory,
         config_section="text_config",
         limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 1, "Q38_MAXT"),
-        capabilities=FamilyCapabilities(True, False, False, True),
+        capabilities=FamilyCapabilities(True, False, False, True, image=True),
         has_gateway_adapter=True,
         # Like Qwen3.6, direct `coli run` is intentionally not exposed until
         # an engine-specific CLI prompt path exists; chat/serve use the gateway.
@@ -1455,7 +1515,7 @@ FAMILIES = (
         # tools yes (DSML, see v41_dsml.py), grammars no: the engine reads the six-field
         # SUBMIT header and has no constrained decoder, so a grammar has to be refused
         # at the gateway rather than desync the wire.
-        capabilities=FamilyCapabilities(True, False, False, True),
+        capabilities=FamilyCapabilities(True, False, False, True, image=True),
         has_gateway_adapter=True,
         # coli run stays unwired, for the reason qwen36 gives above and one more:
         # cmd_run dispatches per arch after this gate, and with no deepseek_v41
@@ -1464,6 +1524,52 @@ FAMILIES = (
         # else, so a one-shot has nowhere to go but the gateway -- which is what
         # coli chat, coli serve and coli web already use.
         has_cli_adapter=False,
+    ),
+    FamilyDescriptor(
+        id="mimo",
+        model_types=("mimo_v2",),
+        display_name="MiMo-V2.6 Flash",
+        display_scale="309B",
+        # XiaomiMiMo/MiMo-V2.6-{Flash,Pro}: same architecture, two sizes.
+        reference_experts=256,
+        display_variants=(
+            DisplayVariant((("hidden_size", 4096), ("num_hidden_layers", 48),
+                            ("n_routed_experts", 256)),
+                           "MiMo-V2.6 Flash", "309B"),
+            DisplayVariant((("hidden_size", 6144), ("num_hidden_layers", 70),
+                            ("n_routed_experts", 384)),
+                           "MiMo-V2.6 Pro", "1.02T", model_id="mimo-v2.6-pro"),
+        ),
+        engine_artifact="mimo",
+        engine_aliases=(),
+        engine_group="mimo",
+        internal_arch="mimo",
+        build_target="mimo",
+        process_names=("mimo",),
+        default_model_id="mimo-v2.6-flash",
+        cli_adapter="mimo",
+        gateway_adapter="mimo",
+        planner_id="mimo",
+        planner_geometry=_mimo_geometry,
+        planner_unsupported_reason="",
+        # CPU-only: mimo.c links no accelerator backend (see deepseek_v41 above for
+        # why the planner must not offer a VRAM tier the engine cannot use).
+        supports_accelerator=False,
+        expert_inventory=_mimo_expert_inventory,
+        resident_inventory=_mimo_resident_inventory,
+        config_section="root",
+        # top-8 routing: the engine raises any smaller cache to one routing step
+        limits=FamilyLimits(8192, 1048576, 1024, 16384, 1, 16, "CTX"),
+        # tools (the XML call form, parse_mimo_tool_calls), thinking (on by default,
+        # as the template has it); no grammars, no audio in or out
+        capabilities=FamilyCapabilities(True, False, False, True, image=True),
+        has_gateway_adapter=True,
+        # the engine is driven through the gateway (SERVE); coli run has no mimo
+        # branch and would fall through to GLM's binary, as for deepseek_v41
+        has_cli_adapter=False,
+        # the gateway's cue with thinking on (render_chat_mimo): the template's
+        # ChatML with no newline after <|im_end|>, and the <think> the model writes
+        tune_prompt_template="<|im_start|>user\n{prompt}<|im_end|><|im_start|>assistant\n<think>",
     ),
     FamilyDescriptor(
         id="qwen_image",
@@ -1812,5 +1918,6 @@ def public_metadata(family):
             "grammar_payload": family.capabilities.grammar_payload,
             "audio_payload": family.capabilities.audio_payload,
             "thinking": family.capabilities.thinking,
+            "image": family.capabilities.image,
         },
     }

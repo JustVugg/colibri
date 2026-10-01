@@ -38,6 +38,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            parse_tool_calls_spans, parse_arch_tool_calls_spans,
                            THINK_OPEN, THINK_CLOSE,
                            _compose_span_maps, _cut_span_map, _project_span,
+                           _keepalive_choice,
                            stop_policy, tune_child_env)
 
 
@@ -886,6 +887,22 @@ class TemplateTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(APIError):
                 generation_options({"stop": value}, 8)
 
+    def test_keepalive_choice_matches_the_endpoint_chunk_shape(self):
+        # Chat chunks carry a `delta`; the diagnostic marker rides reasoning_content,
+        # off the visible answer.
+        chat = _keepalive_choice(True, False)
+        self.assertEqual(chat["delta"], {"reasoning_content": ""})
+        self.assertNotIn("text", chat)
+        self.assertEqual(_keepalive_choice(True, True)["delta"],
+                         {"reasoning_content": "."})
+        # Legacy /v1/completions chunks carry `text`, never `delta`, or a strict
+        # client (OpenAI SDK: CompletionChoice.text is required) rejects the ping.
+        # No side channel, so the marker never appears: a "." would land in the text.
+        for visible in (False, True):
+            comp = _keepalive_choice(False, visible)
+            self.assertEqual(comp["text"], "")
+            self.assertNotIn("delta", comp)
+
     def test_glm_chat_defaults_role_stops_without_changing_other_policies(self):
         with patch("openai_server.ARCH", "glm"):
             self.assertEqual(stop_policy({}, True), (DEFAULT_CHAT_STOP_SEQUENCES, True))
@@ -1494,6 +1511,19 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(b"".join(chunks), b"hello")
         self.assertEqual(stats["prompt_tokens"], 7)
         self.assertTrue(stats["length_limited"])
+
+    def test_reads_caps_between_ready_and_stat(self):
+        # A vision engine says what it loaded BEFORE its status line, so the gateway
+        # knows the served modalities before it answers its first request. An engine
+        # that says nothing leaves the dict empty and the status parse untouched.
+        caps = {}
+        stream = io.BytesIO(READY + b"CAPS vision=1 other=x\nSTAT 0 0 0 0\n")
+        stats = read_engine_turn(stream, READY, lambda _: None, caps)
+        self.assertEqual(caps, {"vision": "1", "other": "x"})
+        self.assertEqual(stats["completion_tokens"], 0)
+        caps = {}
+        read_engine_turn(io.BytesIO(READY + b"STAT 0 0 0 0\n"), READY, lambda _: None, caps)
+        self.assertEqual(caps, {})
 
     def test_rejects_invalid_kv_pool_before_engine_start(self):
         with self.assertRaisesRegex(ValueError, "kv_slots"):
@@ -2747,6 +2777,43 @@ class HTTPTest(unittest.TestCase):
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
 
+    def test_a_malformed_tools_or_messages_is_a_client_error_on_every_family(self):
+        """`tools: 5` or `messages: null` answered HTTP 500 on most families.
+
+        generation_options() validates `tools`, but chat_completion() renders the prompt (and
+        runs the image expanders) before it calls generation(), and those iterate `tools` and
+        `messages` without checking them, so the TypeError reached do_POST's catch-all. A
+        `parameters` that is not an object got past every check and failed in
+        parse_tool_calls() after the whole generation had run.
+        """
+        import family_registry
+
+        cases = [
+            ({"tools": 5}, "tools"),
+            ({"tools": True}, "tools"),
+            ({"tools": [{"type": "function", "function": {"name": "f", "parameters": "x"}}]},
+             "tools.0.function.parameters"),
+            ({"tools": [{"type": "function", "function": {
+                "name": "f", "parameters": {"type": "object", "properties": "x"}}}]},
+             "tools.0.function.parameters.properties"),
+            ({"tools": [{"type": "function", "function": {
+                "name": "f", "parameters": {"type": "object", "required": "a"}}}]},
+             "tools.0.function.parameters.required"),
+            ({"messages": None}, "messages"),
+            ({"messages": 5}, "messages"),
+        ]
+        for arch in family_registry.family_ids():
+            for extra, param in cases:
+                with self.subTest(arch=arch, param=param, value=next(iter(extra.values()))):
+                    body = {"model": "test-model",
+                            "messages": [{"role": "user", "content": "hi"}], **extra}
+                    with patch("openai_server.ARCH", arch):
+                        with self.assertRaises(HTTPError) as caught:
+                            self.request("/v1/chat/completions", body)
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(json.loads(caught.exception.read())["error"]["param"], param)
+
     def test_metrics_counts_http_engine_failure_without_success(self):
         before = self.server.scheduler.snapshot()
         with patch.object(self.engine, "generate", side_effect=RuntimeError("injected failure")):
@@ -2786,6 +2853,8 @@ class HTTPTest(unittest.TestCase):
         with self.request("/health") as response:
             health = json.load(response)
             scheduler = health["scheduler"]
+        # the family, for coli chat's per-family defaults (authed probes only)
+        self.assertEqual(health["arch"], openai_server.ARCH)
         self.assertEqual(scheduler["max_queue"], 8)
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
@@ -3622,6 +3691,66 @@ class UnclosedToolCallTest(unittest.TestCase):
                                      "</tool_call>")
         self.assertEqual(len(calls), 1)
         self.assertEqual(content, "Done.")
+
+
+class StrictGLMToolCallTest(unittest.TestCase):
+    """Opt-in calls must be complete before a client can execute them."""
+
+    CALL = ("<tool_call>lookup_order<arg_key>order_id</arg_key>"
+            "<arg_value>00123</arg_value></tool_call>")
+
+    def test_complete_call_preserves_declared_string(self):
+        content, calls = openai_server.parse_glm_tool_calls_strict("Checking. " + self.CALL,
+                                                                   ORDER_TOOL)
+        self.assertEqual(content, "Checking.")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"order_id": "00123"})
+
+    def test_incomplete_duplicate_undeclared_and_invalid_calls_fail_closed(self):
+        bad = (self.CALL[:-len("</tool_call>")],
+               self.CALL.replace("</tool_call>",
+                                 "<arg_key>order_id</arg_key><arg_value>other</arg_value></tool_call>"),
+               self.CALL.replace("lookup_order", "other_function"),
+               self.CALL.replace("</tool_call>",
+                                 "<arg_key>qty</arg_key><arg_value>many</arg_value></tool_call>"),
+               self.CALL.replace("order_id", "other_key"),
+               "<tool_call>lookup_order</tool_call>")
+        for reply in bad:
+            with self.subTest(reply=reply), self.assertRaises(APIError) as caught:
+                openai_server.parse_glm_tool_calls_strict(reply, ORDER_TOOL)
+            self.assertEqual(caught.exception.code, "invalid_model_tool_call")
+
+    def test_http_refuses_length_limited_tool_and_unsupported_stream_before_dispatch(self):
+        engine = ScriptedEngine(chunks=(self.CALL,), length_limited=True)
+        base = _spawn_test_server(self, engine)
+        body = {"model": "test-model", "messages": [{"role": "user", "content": "order?"}],
+                "tools": ORDER_TOOL, "strict_tool_calls": True}
+        with patch.object(openai_server, "ARCH", "glm"):
+            status, error = _error_body(self, lambda: _post_chat(base, body))
+            self.assertEqual((status, error["code"]), (502, "invalid_model_tool_call"))
+            self.assertEqual(len(engine.calls), 1)
+            status, error = _error_body(self, lambda: _post_chat(base, {**body, "stream": True}))
+            self.assertEqual((status, error["code"]), (400, "unsupported_parameter"))
+            self.assertEqual(len(engine.calls), 1)
+            status, error = _error_body(self, lambda: _post_chat(base, {**body,
+                                                 "strict_tool_calls": "true"}))
+            self.assertEqual((status, error["param"]), (400, "strict_tool_calls"))
+            self.assertEqual(len(engine.calls), 1)
+            status, error = _error_body(self, lambda: _post_chat(base, {**body, "tools": []}))
+            self.assertEqual((status, error["param"]), (400, "strict_tool_calls"))
+            self.assertEqual(len(engine.calls), 1)
+
+    def test_http_complete_call_finishes_with_tool_calls(self):
+        engine = ScriptedEngine(chunks=(self.CALL,))
+        base = _spawn_test_server(self, engine)
+        body = {"model": "test-model", "messages": [{"role": "user", "content": "order?"}],
+                "tools": ORDER_TOOL, "strict_tool_calls": True}
+        with patch.object(openai_server, "ARCH", "glm"):
+            with _post_chat(base, body) as response:
+                result = json.load(response)
+        choice = result["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertEqual(json.loads(choice["message"]["tool_calls"][0]["function"]["arguments"]),
+                         {"order_id": "00123"})
 
 
 class ToolChoiceTest(unittest.TestCase):
@@ -7206,6 +7335,100 @@ class DispatcherLogprobTailTest(unittest.TestCase):
         self.assertEqual(echoes[0]["bytes"], b"h")
         self.assertTrue(math.isnan(echoes[0]["lp"]))
         self.assertEqual(echoes[0]["topk"], [])
+
+
+class EngineCapsTest(unittest.TestCase):
+    def test_engine_learns_its_vision_tower_from_the_handshake(self):
+        # CAPS vision=<0|1> sits between READY and STAT; an engine that predates the
+        # line (or has no tower to speak of) leaves the flag unknown, not False.
+        for line, expected in ((b"CAPS vision=1\n", True), (b"CAPS vision=0\n", False),
+                               (b"", None)):
+            with self.subTest(line=line):
+                process = FakeProcess(lambda _process, _frame: None)
+                process.stdout = BlockingStream(READY + line + b"STAT 0 0 0 0\n")
+                with patch("openai_server.ARCH", "glm53"), \
+                     patch("openai_server.subprocess.Popen", return_value=process):
+                    engine = Engine("glm53", "model")
+                try:
+                    self.assertIs(engine.vision, expected)
+                finally:
+                    engine.close()
+
+
+class ServedModalityTest(unittest.TestCase):
+    """What /v1/models says it accepts is what the engine loaded. The tower is a
+    property of the checkpoint (a glm53 export can carry vision_config and no
+    model.visual.* tensors), not of the family, so the card follows the engine's
+    handshake, and a picture sent to an engine that announced no tower is refused
+    by name at the gateway instead of dying in the engine as a bare BAD_REQUEST."""
+
+    def serve(self, vision):
+        engine = FakeEngine()
+        if vision is not None:
+            engine.vision = vision
+        server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", 16, kv_slots=1)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop():
+            server.scheduler.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        self.addCleanup(stop)
+        return engine, f"http://127.0.0.1:{server.server_port}"
+
+    def request(self, base, path, body=None):
+        headers = {"Authorization": "Bearer secret"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        return urlopen(Request(base + path, data=data, headers=headers), timeout=2)
+
+    def test_card_and_health_report_the_live_tower(self):
+        with patch("openai_server.ARCH", "glm53"):
+            for vision, expected in ((True, ["text", "image"]), (False, ["text"]),
+                                     (None, ["text"])):
+                with self.subTest(vision=vision):
+                    _engine, base = self.serve(vision)
+                    with self.request(base, "/v1/models") as response:
+                        card = json.load(response)["data"][0]
+                    self.assertEqual(card["input_modalities"], expected)
+                    with self.request(base, "/v1/models/test-model") as response:
+                        self.assertEqual(json.load(response)["input_modalities"], expected)
+                    with self.request(base, "/health") as response:
+                        self.assertEqual(json.load(response)["input_modalities"], expected)
+
+    def test_a_family_without_an_image_path_never_claims_images(self):
+        # Even an engine that announces a tower is text-only to its clients when
+        # the gateway has no placeholder expansion for the family.
+        with patch("openai_server.ARCH", "glm"):
+            _engine, base = self.serve(True)
+            with self.request(base, "/v1/models") as response:
+                self.assertEqual(json.load(response)["data"][0]["input_modalities"], ["text"])
+
+    def test_tower_less_engine_refuses_a_picture_by_name(self):
+        picture = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        with patch("openai_server.ARCH", "glm53"):
+            engine, base = self.serve(False)
+            with self.assertRaises(HTTPError) as caught:
+                self.request(base, "/v1/chat/completions", {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "what is this?"}, picture]}]})
+            self.addCleanup(caught.exception.close)
+            self.assertEqual(caught.exception.code, 400)
+            error = json.load(caught.exception)["error"]
+            self.assertIn("vision tower", error["message"])
+            self.assertEqual(error["param"], "messages")
+            self.assertEqual(engine.calls, [])            # refused before the engine
+            # the same engine still serves text
+            with self.request(base, "/v1/chat/completions", {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hello"}]}) as response:
+                self.assertEqual(response.status, 200)
+            self.assertEqual(len(engine.calls), 1)
 
 
 if __name__ == "__main__":

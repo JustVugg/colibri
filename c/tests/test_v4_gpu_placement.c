@@ -9,6 +9,30 @@
 struct Dsv4CudaTensor { int device; };
 struct Dsv4CudaExpertSet { int device; };
 struct Dsv4CudaActivation { int device; long long elements; };
+static int workspaces_freed, target_layers_freed, draft_heads_freed;
+void dsv4_cuda_target_workspace_free(Dsv4CudaTargetWorkspace *workspace) {
+    if (workspace) { workspaces_freed++; free(workspace); }
+}
+void dsv4_cuda_target_layer_free(Dsv4CudaTargetLayer *layer) {
+    if (layer) { target_layers_freed++; free(layer); }
+}
+void dsv4_cuda_draft_head_free(Dsv4CudaDraftHead *head) {
+    if (head) { draft_heads_freed++; free(head); }
+}
+static void test_prepared_cleanup(void) {
+    ColiV4Engine *engine = calloc(1, sizeof(*engine)); assert(engine);
+    V4DeviceTarget *target = calloc(1, sizeof(*target)); assert(target);
+    target->work[5] = malloc(1); assert(target->work[5]);
+    target->layers[42].layer = malloc(1); assert(target->layers[42].layer);
+    engine->gpu.device_target = target;
+    engine->gpu.draft_head = malloc(1); assert(engine->gpu.draft_head);
+    coli_v4_gpu_engine_close(engine);
+    assert(!engine->gpu.device_target && !engine->gpu.draft_head);
+    assert(workspaces_freed == 1 && target_layers_freed == 1 && draft_heads_freed == 1);
+    coli_v4_gpu_engine_close(engine);
+    assert(workspaces_freed == 1 && target_layers_freed == 1 && draft_heads_freed == 1);
+    free(engine);
+}
 static int activations_created, activations_freed;
 Dsv4CudaActivation *dsv4_cuda_activation_create(int device, long long elements) {
     Dsv4CudaActivation *a = malloc(sizeof(*a)); assert(a);
@@ -524,6 +548,7 @@ int main(void) {
     test_head();
     test_draft_cache();
     test_batch_scratch();
+    test_prepared_cleanup();
     puts("test_v4_gpu_placement: ok");
     return 0;
 }

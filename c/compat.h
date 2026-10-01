@@ -708,4 +708,5 @@ static inline double compat_mem_available_gb(void){
     return avail;
 }
 
+
 #endif /* COMPAT_H */
