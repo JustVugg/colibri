@@ -1771,6 +1771,19 @@ fuzz-rans: tests/fuzz_rans.c rans.h
 	  tests/fuzz_rans.c -o tests/fuzz_rans -lm
 	./tests/fuzz_rans
 
+# Structured-mutation fuzz for the GLM-5.3 expert worker's wire parser under
+# ASan+UBSan: glm53_worker_serve_one() over a socketpair with the int4 tiny
+# fixture loaded, well-formed traffic mutated at the byte and field level,
+# well-formed requests checked for a well-formed reply. Seeded and bounded
+# (FUZZ_ITERS, default 3000). NOT a test gate; build+run on demand:
+#   make fuzz-glm53-worker GLM53_FUZZ_FIXTURE=/tmp/glm53_stream-i4
+fuzz-glm53-worker: tests/fuzz_glm53_worker.c glm53.c
+	$(CC) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+	  -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+	  -Wno-misleading-indentation -Wno-format-truncation \
+	  tests/fuzz_glm53_worker.c -o tests/fuzz_glm53_worker -lm
+	ASAN_OPTIONS=detect_leaks=0 ./tests/fuzz_glm53_worker $(GLM53_FUZZ_FIXTURE)
+
 tests/test_int3$(EXE): tests/test_int3.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 

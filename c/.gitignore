@@ -18,6 +18,7 @@ tools/librans_c.so
 tools/librans_c.dylib
 tools/rans_c.dll
 tests/fuzz_rans
+tests/fuzz_glm53_worker
 tests/bench_omp_grain
 tests/mxfp4_ref.o
 mxfp4_cuda_test

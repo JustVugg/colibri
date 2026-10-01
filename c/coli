@@ -541,6 +541,10 @@ def env_for_engine(a, arch, plan=None):
     if arch in ("deepseek_v4", "deepseek_v41", "kimi", "glm53", "olmoe"):
         if a.ram: env["RAM_GB"] = str(a.ram)
     if arch == "glm53":
+        # Expert workers: env_for() wires these for glm; glm53 goes through
+        # here, and without them `serve --cluster-workers` ran on one machine.
+        if getattr(a, "cluster_workers", None): env["CLUSTER_WORKERS"] = a.cluster_workers
+        if getattr(a, "cluster_coordinator", None): env["CLUSTER_COORDINATOR"] = a.cluster_coordinator
         # I densi vanno a int4 di default: sono 9,7 B parametri su 321, e in
         # BF16 sono 19 GB che nessuno recupera. Chi vuole la precisione piena
         # mette GLM53_BITS=32, e questo setdefault gli lascia la scelta.
@@ -698,11 +702,14 @@ def dsv4_cuda_build_hint():
         return "make deepseek-v4 CUDA=1 (this binary is CPU-only)"
     return "the DeepSeek V4 CUDA tier is supported only on Linux and Windows"
 
+# Engines that implement EXPERT_WORKER / CLUSTER_WORKERS: colibri.c and glm53.c.
+WORKER_FAMILIES = ("glm", "glm53")
+
 def need_worker_model(model):
     require_model(model, file="config.json")
     family = resolve_model(model).descriptor
-    if family.id != "glm":
-        sys.exit(f"{C.yel}cluster expert workers currently support the GLM engine only;{C.r} "
+    if family.id not in WORKER_FAMILIES:
+        sys.exit(f"{C.yel}cluster expert workers currently support the GLM and GLM-5.3 engines only;{C.r} "
                  f"{family.display_name} models cannot serve experts")
     engine = engine_for(model)
     require_model(model, file="config.json", engine=engine, target=family.build_target,
@@ -2859,7 +2866,8 @@ def cmd_cluster_worker(a):
                 try: heartbeat(coordinator, node_id)
                 except OSError: pass
         threading.Thread(target=keep_registered, name="colibri-cluster-heartbeat", daemon=True).start()
-    e=env_for(a)
+    glm53 = resolve_model(a.model).descriptor.id == "glm53"
+    e=env_for_engine(a,"glm53") if glm53 else env_for(a)
     e.update({"EXPERT_WORKER":"1", "CLUSTER_WORKER_PORT":str(a.port),
               "COLI_MMAP":os.environ.get("COLI_MMAP", "1")})
     print(f"  {C.dim}[CLUSTER] expert worker · {host}:{a.port} · layers {a.layers}{C.r}")
@@ -2870,6 +2878,12 @@ def cmd_cluster_worker(a):
         # could only ever start with an explicit --cap (#1452). Fallback 0 is
         # what the other GLM launch sites pass: the engine resolves its own cap
         # when the argument is zero.
+        if glm53:
+            # glm53 takes only the cache/layer cap positionally (every number
+            # is read as a cap), and the model from --model; its expert bits
+            # come from the checkpoint.
+            return subprocess.call([engine,str(cap_for_launch(a.cap,e,0)),
+                                    "--model",os.path.abspath(a.model)],env=e)
         return subprocess.call([engine,str(cap_for_launch(a.cap,e,0)),
                                 str(a.ebits),str(a.dbits)],env=e)
     finally:
