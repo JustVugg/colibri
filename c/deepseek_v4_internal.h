@@ -832,6 +832,9 @@ void coli_v4_gpu_head_upload(ColiV4Engine *engine);
 int coli_v4_gpu_head_scores(ColiV4Engine *engine,const float *input,float *scores);
 int coli_v4_gpu_head_batch(ColiV4Engine *engine,const float *input,int batch,
                            float *scores,int *ids,float *values);
+int coli_v4_gpu_draft_head(ColiV4Engine *engine,const float *input,int batch,int anchor,
+    const uint16_t *markov1,const uint16_t *markov2,const float *confidence_weights,
+    int rank,int *ids,float *confidence);
 int coli_v4_gpu_wo_decode(const ColiTensorView *a, const ColiTensorView *b,
                            float *output, const float *input, int groups);
 int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
@@ -924,6 +927,12 @@ int coli_v4_gpu_dspark_attention(ColiV4Engine *engine,float *out,const float *q,
     const float *past,const int64_t *positions,const float *block,const float *sinks,
     int64_t position,int past_rows,int block_rows,int heads,int dim);
 int coli_v4_gpu_dspark_dense_attach(ColiV4Engine *engine, ColiTensorView *view);
+int coli_v4_gpu_device_target(ColiV4Engine *engine, const void *owner, float *output,
+    float *taps, const float *input, const int *tokens, int start, int batch,
+    ColiV4SessionAbortFn abort_fn, void *abort_context, char *error, size_t error_size);
+int coli_v4_gpu_device_target_retain(ColiV4Engine *engine, const void *owner, int position);
+int coli_v4_gpu_dspark_resident_device(void *mirrors,int stage);
+void *coli_v4_gpu_dspark_resident_set(void *mirrors,int stage,void *gate,void *up,void *down);
 #endif
 
 struct ColiV4Engine {
@@ -960,6 +969,10 @@ struct ColiV4Engine {
          * unless V4_MTP_GPU=1 and the tier opened successfully. */
         void *dspark_mirrors;
         void *dspark_dense; /* owned immutable draft FP8 mirrors */
+        void *device_target; /* owned prepared multirow target and histories */
+        void *draft_head;
+        void *device_draft;
+        void (*device_draft_free)(ColiV4Engine *engine);
         void *head; /* owned packed BF16 vocabulary mirror */
     } gpu;
     struct {

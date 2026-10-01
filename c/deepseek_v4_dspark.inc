@@ -912,12 +912,18 @@ static int v4_ds_moe(float *out, V4DSparkStage *stage,
 /* One complete MTP transformer stage over all five positions.  Attention is
  * split into prepare/all-KV then query phases so every position can see the
  * entire block, exactly as the parallel reference does. */
+#include "deepseek_v4_device_draft.inc"
 static int v4_ds_stage_forward(float *state, V4DSparkStage *stage,
                                int64_t first_position,
                                const ColiSafetensorsIndex *index,
                                const ColiDeepSeekV4Config *config,
                                const float *cosines, const float *sines,
                                int *miss_budget, void *gpu_mirrors) {
+#if defined(COLI_V4_GPU_TIER) && !defined(_WIN32)
+    const char *device=getenv("V4_MTP_DEVICE");
+    if(device && atoi(device) && g_v4ds_gpu_engine && gpu_mirrors)
+        return v4_ds_device_stage(g_v4ds_gpu_engine,state,stage,first_position,index,config,gpu_mirrors);
+#endif
     int hidden = config->hidden_size;
     int hc = config->hc_mult;
     int head_dim = config->head_dim;
@@ -1073,6 +1079,13 @@ static int v4_ds_heads(ColiV4Engine *engine,
 
     int gpu_head = 0;
 #ifdef COLI_V4_GPU_TIER
+    const char *device_head=getenv("V4_MTP_GPU_HEAD");
+    if (g_v4ds_gpu_engine && device_head && atoi(device_head)) {
+        int rc=coli_v4_gpu_draft_head(engine,hiddens,V4_DSPARK_BLOCK,anchor_token,
+            g_v4ds_core.markov_w1,g_v4ds_core.markov_w2,g_v4ds_core.confidence_proj.data,
+            V4_DSPARK_RANK,draft,confidence);
+        free(logits);free(hiddens);return rc;
+    }
     if (g_v4ds_gpu_engine && !coli_v4_gpu_head_batch(engine, hiddens,
             V4_DSPARK_BLOCK, logits, NULL, NULL)) gpu_head = 1;
 #endif

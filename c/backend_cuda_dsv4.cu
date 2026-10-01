@@ -817,7 +817,10 @@ __global__ void sparse_attn_batch_cached_kernel(float*out,const float*q,const fl
  * every query can see the entire bidirectional proposal block. */
 __global__ void dspark_attention_kernel(float *out,const float *q,const float *kv,
     const int64_t *positions,const float *sinks,int64_t query_position,
-    int past,int block,int heads,int dim) {
+    int past,int block,int heads,int dim,const int *control=nullptr) {
+    int row=blockIdx.y;
+    if(control)query_position=control[0]+row;
+    q+=(long long)row*heads*dim;out+=(long long)row*heads*dim;
     int h=blockIdx.x, total=past+block, warp=threadIdx.x/32, lane=threadIdx.x%32;
     __shared__ float scores[256];
     for(int item=warp;item<total;item+=8) {
@@ -2436,9 +2439,12 @@ extern "C" int dsv4_cuda_expert_set_upload_hash(Dsv4CudaExpertSet*set,const int6
 }
 /* The host-routed resident path's exact operation/rounding order, with routes
  * and descriptors retained on device. One activation upload and one download. */
+__global__ void target_hash(int *, const int64_t *, const int *, int);
+__global__ void target_fp4_vec(const MvDesc *,int,int,int);
 static int resident_route_moe(Dsv4CudaExpertSet *set,
         Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,const int *fixed,
-        float scale,float limit,float *out,const float *in,int tokens){
+        float scale,float limit,float *out,const float *in,int tokens,
+        bool device_io=false,const int *device_tokens=nullptr){
     Dev *c=set?ctx(set->device):nullptr;
     if(tokens<1||tokens>128||!c||!gate||!in||!out||set->count!=256||!set->table||!set->sg||!set->su||!set->sd||
        gate->device!=set->device||gate->fmt!=32||gate->O!=256||gate->I!=set->H||
@@ -2446,22 +2452,27 @@ static int resident_route_moe(Dsv4CudaExpertSet *set,
     if(fixed)for(int k=0;k<6*tokens;k++)if(fixed[k]<0||fixed[k]>=256)return 0;
     if(!ok(cudaSetDevice(set->device),"select resident route device"))return 0;
     int H=set->H,I=set->I,K=6,R=K*tokens;size_t hb=(size_t)tokens*H*4,ib=(size_t)R*I*4;
+    const char *vec_env=device_io?getenv("V4_DEVICE_FP4_VEC"):nullptr;
+    bool vectorized=vec_env && atoi(vec_env)!=0;
     if(!buf((void**)&c->dx,&c->xcap,hb)||!buf((void**)&c->dy,&c->ycap,H>256?hb:(size_t)tokens*256*4)||
        !buf((void**)&c->p1,&c->p1cap,ib)||!buf((void**)&c->p2,&c->p2cap,ib)||
        !buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,(size_t)R*H*4)||
        !buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)3*R*sizeof(MvDesc))||
        !buf((void**)&c->expert_weights,&c->expert_weightscap,R*sizeof(float))||
        !buf((void**)&c->expert_ids,&c->expert_idcap,R*sizeof(int))||
-       !ok(cudaMemcpyAsync(c->dx,in,hb,cudaMemcpyHostToDevice,c->stream),"resident MoE input"))return 0;
+       !ok(cudaMemcpyAsync(c->dx,in,hb,device_io?cudaMemcpyDeviceToDevice:cudaMemcpyHostToDevice,c->stream),"resident MoE input"))return 0;
     route_logits_batch<<<tokens*256,256,0,c->stream>>>((float*)gate->w,c->dx,c->dy,tokens,256,H);
     if(fixed&&!ok(cudaMemcpyAsync(c->expert_ids,fixed,R*sizeof(int),cudaMemcpyHostToDevice,c->stream),"resident fixed routes"))return 0;
-    route_top6<<<tokens,32,0,c->stream>>>(c->expert_ids,c->expert_weights,bias?(float*)bias->w:nullptr,c->dy,fixed!=nullptr,scale);
+    if(device_io&&set->hash)target_hash<<<(R+255)/256,256,0,c->stream>>>(c->expert_ids,set->hash,device_tokens,tokens);
+    route_top6<<<tokens,32,0,c->stream>>>(c->expert_ids,c->expert_weights,bias?(float*)bias->w:nullptr,c->dy,fixed!=nullptr||(device_io&&set->hash),scale);
     sort_routes6<<<tokens,1,0,c->stream>>>(c->expert_ids,c->expert_weights);
     build_moe_desc<<<tokens,K,0,c->stream>>>(c->mvdesc,set->table,c->expert_ids,c->dx,c->p1,c->p2,c->p3,c->p4,K,256,H,I);
-    mv_fp4_grouped<4><<<dim3((I+3)/4,2*R),256,0,c->stream>>>(c->mvdesc,2*R,I,H);
+    if(vectorized)target_fp4_vec<<<dim3((I+7)/8,2*R),256,0,c->stream>>>(c->mvdesc,2*R,I,H);
+    else mv_fp4_grouped<4><<<dim3((I+3)/4,2*R),256,0,c->stream>>>(c->mvdesc,2*R,I,H);
     expert_act_grouped<<<(R*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,R,I);
     fp8_sim<<<R*((I+127)/128),128,0,c->stream>>>(c->p3,R,I);
-    mv_fp4_grouped<4><<<dim3((H+3)/4,R),256,0,c->stream>>>(c->mvdesc+2*R,R,H,I);
+    if(vectorized)target_fp4_vec<<<dim3((H+7)/8,R),256,0,c->stream>>>(c->mvdesc+2*R,R,H,I);
+    else mv_fp4_grouped<4><<<dim3((H+3)/4,R),256,0,c->stream>>>(c->mvdesc+2*R,R,H,I);
     expert_reduce_rows<<<(tokens*H+255)/256,256,0,c->stream>>>(c->dy,c->p4,tokens,K,H);
     if(tokens==1)run_mv<8>((uint8_t*)set->sg->w,set->sg->scale,c->dx,c->p1,I,H,1,c->stream);
     else run_mm_batch(set->sg,c->dx,c->p1,tokens,c->stream);
@@ -2472,6 +2483,8 @@ static int resident_route_moe(Dsv4CudaExpertSet *set,
     if(tokens==1)run_mv<8>((uint8_t*)set->sd->w,set->sd->scale,c->p3,c->p4,H,I,1,c->stream);
     else run_mm_batch(set->sd,c->p3,c->p4,tokens,c->stream);
     moe_combine<<<(tokens*H+255)/256,256,0,c->stream>>>(c->dy,c->p4,tokens*H);
+    if(device_io)return ok(cudaGetLastError(),"resident MoE launch")&&
+        ok(cudaMemcpyAsync(out,c->dy,hb,cudaMemcpyDeviceToDevice,c->stream),"resident MoE device output");
     return ok(cudaGetLastError(),"resident MoE launch")&&
         ok(cudaMemcpyAsync(out,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"resident MoE output")&&
         ok(cudaStreamSynchronize(c->stream),"resident MoE sync");
@@ -2809,3 +2822,5 @@ extern "C" int dsv4_cuda_wo(Dsv4CudaTensor *wa,Dsv4CudaTensor *wb,int groups,flo
 extern "C" void dsv4_cuda_tensor_free(Dsv4CudaTensor*t){if(!t)return;cudaSetDevice(t->device);if(t->own_w&&t->w)cudaFree(t->w);if(t->bf16_cache)cudaFree(t->bf16_cache);if(t->own_scale&&t->scale)cudaFree(t->scale);if(t->own_dg_scale&&t->dg_scale)cudaFree(t->dg_scale);free(t);}
 extern "C" long long dsv4_cuda_tensor_bytes(const Dsv4CudaTensor*t){return t?t->bytes:0;}
 extern "C" int dsv4_cuda_tensor_device(const Dsv4CudaTensor*t){return t?t->device:-1;}
+
+#include "backend_cuda_dsv4_target.inc"

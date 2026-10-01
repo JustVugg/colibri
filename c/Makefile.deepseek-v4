@@ -272,6 +272,10 @@ deepseek-v4: $(V4_BINARY)
 # alternative-backend deepseek_v4 binary without recompiling the units themselves.
 deepseek-v4-objs: $(V4_OBJS)
 
+tools/bench_dsv4_fixtures: tools/bench_dsv4_fixtures.c deepseek_v4.c deepseek_v4.h \
+        deepseek_v4_internal.h deepseek_v4_dspark.inc deepseek_v4_device_draft.inc $(V4_SERVE_TEST_OBJS)
+	$(CC) $(CFLAGS) $< $(V4_SERVE_TEST_OBJS) -o $@ $(LDFLAGS)
+
 # Echo the object list (target units + registry) for external linkers that need
 # to link exactly what the plain deepseek_v4 binary links, no more.
 print-v4-objs:
@@ -287,7 +291,7 @@ $(REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h expert_store.h 
 	$(CC) $(CFLAGS) -c expert_store_registry.c -o $@
 
 $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
-	deepseek_v4_internal.h deepseek_v4_gpu_devices.h deepseek_v4_dspark.inc deepseek_v4_attention_trial.inc st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
+	deepseek_v4_internal.h deepseek_v4_gpu_devices.h deepseek_v4_dspark.inc deepseek_v4_device_draft.inc deepseek_v4_device_target.inc deepseek_v4_attention_trial.inc st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
 	route_trace.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
 	native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP)
@@ -321,7 +325,7 @@ backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h $(V4_FLAGS_STAM
 	$(CC) $(CFLAGS) -c backend_loader_dsv4.c -o $@
 
 # Linux/macOS CUDA=1: the tier compiled straight into the engine.
-backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh $(V4_DEEPGEMM_DEP) \
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4_target.inc backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh $(V4_DEEPGEMM_DEP) \
 	$(V4_CUDA_FLAGS_STAMP)
 	"$(NVCC)" $(V4_NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
 
@@ -373,6 +377,17 @@ tests/test_dsv4_compressor_state_cuda: tests/test_dsv4_compressor_state_cuda.c \
 	$(CC) $(CFLAGS) $< COLI_V4_UNIT_NATIVE_QUANT.o COLI_V4_UNIT_MATH.o \
 		backend_cuda_dsv4.o -o $@ $(LDFLAGS)
 
+tests/dsv4_target_reference.o: tests/dsv4_target_reference.c deepseek_v4.c deepseek_v4_internal.h $(V4_FLAGS_STAMP)
+	$(CC) $(filter-out -DCOLI_V4_GPU_TIER,$(CFLAGS)) -c $< -o $@
+
+tests/test_dsv4_target_state.o: tests/test_dsv4_target_state.cu backend_cuda_dsv4.cu \
+        backend_cuda_dsv4_target.inc backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh $(V4_CUDA_FLAGS_STAMP)
+	"$(NVCC)" $(V4_NVCCFLAGS) -c $< -o $@
+
+tests/test_dsv4_target_state: tests/test_dsv4_target_state.o tests/dsv4_target_reference.o \
+        COLI_V4_UNIT_NATIVE_QUANT.o COLI_V4_UNIT_MATH.o
+	$(CC) $^ -o $@ $(LDFLAGS)
+
 tests/test_dsv4_multigpu_cuda: tests/test_dsv4_multigpu_cuda.c \
 		backend_cuda_dsv4.h deepseek_v4_gpu_devices.h backend_cuda_dsv4.o
 	$(CC) $(CFLAGS) $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
@@ -383,6 +398,7 @@ deepseek-v4-clean:
 	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_HOT_TEST_OBJ) \
 		$(V4_BATCH_TEST_OBJ) \
 		tools/bench_dsv4_head_batch \
+		tools/bench_dsv4_fixtures tests/test_dsv4_target_state tests/test_dsv4_target_state.o tests/dsv4_target_reference.o \
 		$(V4_SERVE_TEST) tests/test_dsv4_multigpu_cuda \
 		tests/test_dsv4_attention_trial tests/test_dsv4_resident_route \
 		tests/test_dsv4_indexer_lazy tests/test_dsv4_dspark_attention \
