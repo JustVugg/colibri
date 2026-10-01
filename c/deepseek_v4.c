@@ -10022,6 +10022,12 @@ fail:
 #include <stdlib.h>
 #include <math.h>
 
+/* Experimental contiguous GPU prefix; remaining layers keep CPU weights/state. */
+int coli_v4_gpu_layer_count(const ColiV4Engine *engine) {
+    const char *value = getenv("V4_GPU_LAYERS");
+    return value ? atoi(value) : engine->config.num_hidden_layers;
+}
+
 static int v4_gpu_wanted(void) {
     const char *setting = getenv("DSV4_CUDA");
     if (setting && atoi(setting) == 0) return 0;
@@ -10046,6 +10052,8 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     engine->gpu.enabled = 0;
     engine->gpu.device = 0;
     if (!v4_gpu_wanted()) return 0;
+    int gpu_layers = coli_v4_gpu_layer_count(engine);
+    if (gpu_layers < 1 || gpu_layers > engine->config.num_hidden_layers) return -1;
     const char *setting = getenv("DSV4_CUDA_DEVICES");
     int count = 1;
     if (setting) {
@@ -10054,7 +10062,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
         const char *device = getenv("DSV4_CUDA_DEVICE");
         engine->gpu.devices[0] = device ? atoi(device) : 0;
     }
-    if (count < 1 || count > engine->config.num_hidden_layers) {
+    if (count < 1 || count > gpu_layers) {
         fprintf(stderr, "v4_gpu invalid device list (use distinct CUDA ordinals, at most one per layer)\n");
         return -1;
     }
@@ -10077,7 +10085,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     engine->gpu.device = device;
     if (engine->experts && !engine->experts->gpu) {
         engine->experts->gpu = v4_gpu_expert_mirrors_create_devices(
-            engine->gpu.devices, count, engine->config.num_hidden_layers);
+            engine->gpu.devices, count, gpu_layers);
         if (!engine->experts->gpu) {
             coli_v4_gpu_engine_close(engine);
             return -1;
@@ -10087,8 +10095,8 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
             device, count);
     for (int i = 0; i < count; i++)
         fprintf(stderr, "v4_gpu device=%d layers=%d..%d\n", engine->gpu.devices[i],
-                coli_v4_gpu_layer_begin(i, count, engine->config.num_hidden_layers),
-                coli_v4_gpu_layer_begin(i + 1, count, engine->config.num_hidden_layers) - 1);
+                coli_v4_gpu_layer_begin(i, count, gpu_layers),
+                coli_v4_gpu_layer_begin(i + 1, count, gpu_layers) - 1);
     return 0;
 }
 
@@ -10475,8 +10483,9 @@ static void *v4_gpu_upload_gate_bias(ColiDeepSeekV4LayerWeights *weights,
 int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
                              ColiDeepSeekV4LayerWeights *weights) {
     if (!engine || !weights || !engine->gpu.enabled) return 0;
+    if (layer >= coli_v4_gpu_layer_count(engine)) return 0;
     int owner = coli_v4_gpu_layer_owner(layer, engine->gpu.device_count,
-                                         engine->config.num_hidden_layers);
+                                         coli_v4_gpu_layer_count(engine));
     if (owner < 0) return -1;
     int device = engine->gpu.devices[owner];
     if (layer < 0 || layer >= COLI_V4_RESIDENT_MAX_LAYERS) return 0;
@@ -10899,7 +10908,7 @@ int coli_v4_gpu_experts_preload(ColiV4Engine *engine, char *error, size_t size) 
     if (error && size) snprintf(error, size, "cannot preload resident CUDA experts");
     if (!engine || !engine->gpu.enabled || !engine->experts ||
         !engine->runtime.dense_resident) return 1;
-    int layers = engine->config.num_hidden_layers;
+    int layers = coli_v4_gpu_layer_count(engine);
     int experts = engine->config.n_routed_experts;
     int hidden = engine->config.hidden_size;
     int intermediate = engine->config.moe_intermediate_size;
@@ -13014,6 +13023,14 @@ static int v4_prefill_pool_enabled(void) {
     return enabled;
 }
 
+static int v4_device_target_layers(const ColiV4Engine *engine) {
+#ifdef COLI_V4_GPU_TIER
+    return engine->gpu.enabled ? coli_v4_gpu_layer_count(engine) : 0;
+#else
+    (void)engine; return 0;
+#endif
+}
+
 static int v4_device_target_wanted(void) {
     const char *value=getenv("V4_DEVICE_TARGET");
     return value && atoi(value)!=0;
@@ -13059,21 +13076,24 @@ static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **ne
     }
     float *state = *state_ptr, *next = *next_ptr;
     size_t hd = (size_t)config->hc_mult * config->hidden_size;
+    int first_layer = 0;
     if (v4_device_target_wanted()) {
 #ifdef COLI_V4_GPU_TIER
-        float *taps=coli_v4_full_dspark_wanted?malloc(3*128*hd*sizeof(float)):NULL;
-        if (coli_v4_full_dspark_wanted && !taps) return -1;
+        first_layer = v4_device_target_layers(engine);
+        int need_taps = coli_v4_full_dspark_wanted && first_layer > config->num_hidden_layers-3;
+        float *taps=need_taps?malloc(3*128*hd*sizeof(float)):NULL;
+        if (need_taps && !taps) return -1;
         int rc=0;
         for (int offset=0;offset<batch && !rc;offset+=128) {
             int n=batch-offset; if (n>128) n=128;
             rc=coli_v4_gpu_device_target(engine,attention,next+(size_t)offset*hd,taps,
                 state+(size_t)offset*hd,tokens+offset,start+offset,n,should_abort,abort_ctx,error,error_size);
-            if (!rc && taps) for (int l=0;l<3;l++) for (int t=0;t<n;t++)
+            if (!rc && taps) for (int l=0;l<first_layer-(config->num_hidden_layers-3);l++) for (int t=0;t<n;t++)
                 v4_mainh_tap(config,config->num_hidden_layers-3+l,taps+((size_t)l*n+t)*hd,start+offset+t);
         }
         free(taps);
-        if (!rc) {*state_ptr=next; *next_ptr=state;}
-        return rc;
+        if (rc) return rc;
+        float *swap=state; state=next; next=swap;
 #else
         snprintf(error,error_size,"V4_DEVICE_TARGET requires the CUDA tier"); return -1;
 #endif
@@ -13082,7 +13102,7 @@ static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **ne
      * does not change the caller's semantic distinction: speculative decode
      * always passes use_prefill_pool=0. */
     int pool_experts = use_prefill_pool && v4_prefill_pool_enabled();
-    for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
+    for (int layer_id = first_layer; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
                                error, error_size)) {
@@ -14397,8 +14417,10 @@ int coli_v4_session_generate(ColiV4Session *session,
                 } else {
                     int old_last = last_processed;
                     const char *retain_env = getenv("V4_SPEC_RETAIN");
-                    int retain_trial = v4_device_target_wanted()?2:retain_env && atoi(retain_env) != 0;
-                    for (int layer = 0; retain_trial==1 && layer < config->num_hidden_layers; layer++)
+                    int device_layers = v4_device_target_wanted() ? v4_device_target_layers(engine) : 0;
+                    int retain_trial = device_layers == config->num_hidden_layers ? 2 :
+                        retain_env && atoi(retain_env) != 0;
+                    for (int layer = device_layers; retain_trial==1 && layer < config->num_hidden_layers; layer++)
                         if (coli_v4_attention_trial_begin(attention[layer], old_last + 1, batch))
                             retain_trial = 0;
                     for (int item = 0; item < batch; item++)
@@ -14491,7 +14513,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                      * Restore the exact snapshot and replay only inputs that
                      * really correspond to emitted outputs. */
                     if (retained < batch) {
-                        for (int layer = 0; retain_trial==1 && layer < config->num_hidden_layers; layer++)
+                        for (int layer = device_layers; retain_trial==1 && layer < config->num_hidden_layers; layer++)
                             if (!coli_v4_attention_trial_ready(attention[layer])) retain_trial = 0;
                         if (spec_attention_restore(
                                 attention, snapshots,
@@ -14506,15 +14528,16 @@ int coli_v4_session_generate(ColiV4Session *session,
                         }
                         if (coli_v4_full_dspark_wanted)
                             v4_ds_invalidate_from(old_last + 1 + (retain_trial ? retained : 0));
-                        if (retain_trial==2) {
+                        if (device_layers) {
 #ifdef COLI_V4_GPU_TIER
-                            if (coli_v4_gpu_device_target_retain(engine,attention,old_last+1+retained)) {
+                            if (coli_v4_gpu_device_target_retain(engine,attention,old_last+1+(retain_trial?retained:0))) {
                                 spec_attention_free(attention,snapshots,config->num_hidden_layers);
                                 kv_prefix_taint(&session->fed); return -1;
                             }
 #endif
-                        } else if (retain_trial) {
-                            for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
+                        }
+                        if (retain_trial) {
+                            for (int layer_id = device_layers; layer_id < config->num_hidden_layers; layer_id++) {
                                 ColiDeepSeekV4LayerWeights layer;
                                 int rc = coli_v4_layer_load(engine, &layer, config, index,
                                                             layer_id, error, error_size);

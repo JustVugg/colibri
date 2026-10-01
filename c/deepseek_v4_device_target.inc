@@ -110,12 +110,13 @@ int coli_v4_gpu_device_target(ColiV4Engine *engine, const void *owner, float *ou
     for (int t=0;t<batch;t++) if (tokens[t]<0 || tokens[t]>=engine->config.vocab_size) return -1;
     s->owner=owner; s->cursor=start; /* Never expose a partially written suffix. */
     int previous=-1, total=engine->config.num_hidden_layers;
+    int gpu_layers=coli_v4_gpu_layer_count(engine);
     const char *graph_env=getenv("V4_DEVICE_GRAPH");
     int graph=graph_env && atoi(graph_env)!=0;
-    for (int first=0;first<total;) {
+    for (int first=0;first<gpu_layers;) {
         if (abort_fn && abort_fn(abort_context)) {snprintf(error,error_size,"CANCELLED");goto fail;}
-        int slot=coli_v4_gpu_layer_owner(first,engine->gpu.device_count,total), end=first+1;
-        while (end<total && coli_v4_gpu_layer_owner(end,engine->gpu.device_count,total)==slot) ++end;
+        int slot=coli_v4_gpu_layer_owner(first,engine->gpu.device_count,gpu_layers), end=first+1;
+        while (end<gpu_layers && coli_v4_gpu_layer_owner(end,engine->gpu.device_count,gpu_layers)==slot) ++end;
         if (!s->work[slot]) s->work[slot]=dsv4_cuda_target_workspace_create(engine->gpu.devices[slot],128);
         if (!s->work[slot]) goto fail;
         Dsv4CudaTargetLayer *layers[COLI_V4_RESIDENT_MAX_LAYERS];

@@ -778,6 +778,7 @@ extern double g_v4_open_index_seconds;
 /* Provided by the COLI_V4_UNIT_GPU translation unit. Compiled in only on the
  * Windows CUDA build; every call site elsewhere is guarded by COLI_V4_GPU_TIER
  * so non-GPU objects never reference these symbols. */
+int coli_v4_gpu_layer_count(const ColiV4Engine *engine);
 int coli_v4_gpu_engine_open(ColiV4Engine *engine);
 void coli_v4_gpu_engine_close(ColiV4Engine *engine);
 int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,

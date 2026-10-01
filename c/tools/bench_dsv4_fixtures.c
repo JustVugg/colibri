@@ -40,6 +40,17 @@ int main(int argc, char **argv) {
     if (coli_v4_engine_open(&engine,&options,error,sizeof(error))) {
         fprintf(stderr,"open: %s\n",error); return 1;
     }
+    if (getenv("BENCH_WARMUP")) {
+        ColiV4Session *session=NULL; Tokens tokens={0};
+        ColiV4SessionCreateOptions create={.max_prompt_tokens=512,.max_new_tokens_cap=16};
+        ColiV4SessionGenerateOptions generate={.max_new_tokens=16,.no_dspark=*modes=='t'};
+        ColiV4SessionGenerateStats stats={0};
+        int rc=coli_v4_session_create(&session,engine,&create,error,sizeof(error));
+        if (!rc) rc=coli_v4_session_generate(session,prompts[0],lengths[0],&generate,record,&tokens,&stats,error,sizeof(error));
+        coli_v4_session_destroy(session);
+        fprintf(stderr,"warmup tokens=%d result=%d error=%s\n",tokens.count,rc,error);
+        if (rc || tokens.count!=16) {coli_v4_engine_destroy(engine);return 1;}
+    }
     Tokens refs[2][6]={0}; int result=0;
     for (int round=0; !result && round<rounds; round++) {
         for (size_t m=0; !result && m<strlen(modes); m++) {
