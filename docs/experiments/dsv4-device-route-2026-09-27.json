@@ -1,0 +1,130 @@
+{
+  "results-default1.json": [
+    {
+      "case": "default1",
+      "exit_code": 0,
+      "wall_seconds": 90.11413876246661,
+      "peak_MiB": [
+        24422,
+        24438,
+        24448,
+        24440,
+        24448,
+        27860
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        0.934,
+        10.361
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_gpu resident-budget device=0 experts=1792 bytes=23957864448 free-MiB=30590 reserve-MiB=2800",
+        "v4_gpu resident-budget device=1 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=2 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=3 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=4 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=5 experts=2048 bytes=27380416512 free-MiB=30420 reserve-MiB=2800",
+        "v4_gpu resident-experts=ready layers=43 experts-per-layer=256 preload-seconds=72.574",
+        "v4_gpu resident-route=on device=0",
+        "v4_gpu resident-route=on device=1",
+        "v4_gpu resident-route=on device=2",
+        "v4_gpu resident-route=on device=3",
+        "v4_gpu resident-route=on device=4",
+        "v4_gpu resident-route=on device=5",
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11008 hits=0 misses=11008 hit_rate=0.000 bytes=147169738752 target_only=1",
+        "v4_direct reads=11008 flock_reads=0 fallbacks=0 payload_bytes=138512695296"
+      ],
+      "decode_tps": 6.08049416079529
+    },
+    {
+      "case": "single-arithmetic",
+      "exit_code": 0,
+      "wall_seconds": 15.889653985388577,
+      "peak_MiB": [
+        10198,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "answer": "4<｜end▁of▁sentence｜>",
+      "timing": [
+        6.727,
+        1.074
+      ],
+      "generated": 2,
+      "diagnostics": [
+        "v4_gpu resident-experts=cache-fallback (resident experts exceed device 0 budget (free=25262 MiB reserve=2800 MiB))",
+        "v4_tokens prompt=18 generated=2 total=20 expert_requests=2119 hits=204 misses=1915 hit_rate=9.627 bytes=25602293760 target_only=1",
+        "v4_direct reads=1915 flock_reads=0 fallbacks=0 payload_bytes=24096276480"
+      ],
+      "decode_tps": 0.9310986964618249
+    }
+  ],
+  "results-route1.json": [
+    {
+      "case": "route1",
+      "exit_code": 0,
+      "wall_seconds": 91.42291588056833,
+      "peak_MiB": [
+        24422,
+        24438,
+        24448,
+        24440,
+        24448,
+        27860
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        0.921,
+        10.145
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_gpu resident-budget device=0 experts=1792 bytes=23957864448 free-MiB=30590 reserve-MiB=2800",
+        "v4_gpu resident-budget device=1 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=2 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=3 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=4 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=5 experts=2048 bytes=27380416512 free-MiB=30420 reserve-MiB=2800",
+        "v4_gpu resident-experts=ready layers=43 experts-per-layer=256 preload-seconds=73.466",
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11008 hits=0 misses=11008 hit_rate=0.000 bytes=147169738752 target_only=1",
+        "v4_direct reads=11008 flock_reads=0 fallbacks=0 payload_bytes=138512695296"
+      ],
+      "decode_tps": 6.209955643173978
+    },
+    {
+      "case": "off1",
+      "exit_code": 0,
+      "wall_seconds": 89.629448720254,
+      "peak_MiB": [
+        24422,
+        24438,
+        24448,
+        24438,
+        24450,
+        27860
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        0.94,
+        10.304
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_gpu resident-budget device=0 experts=1792 bytes=23957864448 free-MiB=30590 reserve-MiB=2800",
+        "v4_gpu resident-budget device=1 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=2 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=3 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=4 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=5 experts=2048 bytes=27380416512 free-MiB=30420 reserve-MiB=2800",
+        "v4_gpu resident-experts=ready layers=43 experts-per-layer=256 preload-seconds=72.724",
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11008 hits=0 misses=11008 hit_rate=0.000 bytes=147169738752 target_only=1",
+        "v4_direct reads=11008 flock_reads=0 fallbacks=0 payload_bytes=138512695296"
+      ],
+      "decode_tps": 6.114130434782608
+    }
+  ]
+}

@@ -1,0 +1,1377 @@
+{
+  "manifest": {
+    "base_commit": "b258eddb2296bbc782e063e2bc4dd1a478e3f8a4",
+    "branch": "experiment/dsv4-offload-sweep",
+    "host": "rs-yuesheng-gpu",
+    "model": "/data/models/DeepSeek-V4-Flash-0731",
+    "gpus": "6 x NVIDIA RTX 5090 32GB",
+    "cpu": "2 x Intel Xeon Silver 4510; 24 physical cores / 48 logical CPUs",
+    "omp_threads": 12,
+    "ram_total": "251 GiB",
+    "policy": "contiguous GPU prefix, remaining layers computed on CPU; 0 GPUs is pure CPU",
+    "workload": "long6, C1, 64 output tokens each, one target-only then one MTP pass",
+    "warmup": "16-token target-only warmup, then fixture 0 excluded for each mode to remove lazy-load cost",
+    "measurement": "320 generated tokens across fixtures 1-5 per mode; sum generation wall times, including prefill, excluding engine/model load and warmup",
+    "repetitions": 1,
+    "fixture_sha256": "a977dec01cfd310d37b47fe16b884f9cacc56c00c9534a81a741e7cf8dcad87e",
+    "runner_sha256": "faeca9dcac26262fa5e2fef2c010728adbaaad33e7d31b7fabcf3f276508e888",
+    "caveats": [
+      "Different from previous 256-token formal campaign.",
+      "GPU FP8/FP4 and CPU arithmetic differ; cross-placement exact output is not promised.",
+      "Require exact target/MTP IDs within each placement.",
+      "Layer allocation uses 8 layers per GPU where feasible, adjusted for head and MTP workspace; this is not an exhaustive maximum-capacity search.",
+      "Only 12 OMP threads, no CPU thread/NUMA tuning.",
+      "Engine RSS excludes the separate constant 155.425 GiB locked checkpoint mapping; it is not total machine RAM usage."
+    ],
+    "storage_policy": "All 48 checkpoint shards are shared-read-only mmap + mlock in the campaign parent; COLI_V4_DIRECT=0. Lock setup excluded from measurements.",
+    "locked_checkpoint_gib": 155.425,
+    "rejected_runs": [
+      "rejected-stale-binary: aborted during load after a build error",
+      "rejected-direct-io: default expert O_DIRECT read SSD; excluded from RAM-offload results",
+      "placement-probe: seven-layers-per-device policy left unnecessary headroom; six-GPU baseline retained, partial five-GPU results excluded"
+    ],
+    "primary_curve": "target-first",
+    "target_first_gpu_layers": {
+      "6": 43,
+      "5": 43,
+      "4": 35,
+      "3": 26,
+      "2": 17,
+      "1": 8,
+      "0": 0
+    },
+    "target_first_mtp_device": "GPU stages on 6 GPUs; CPU stages on 0-5 GPUs",
+    "target_first_reused_points": [
+      6,
+      2,
+      1,
+      0
+    ],
+    "reserve_mib": {
+      "6": 2800,
+      "0-5": 600
+    },
+    "source_verified": true,
+    "six_gpu_prior_prefix_matches": 12,
+    "five_gpu_full_target_matches_six_gpu": 12,
+    "gpu_drafter_first_layers": {
+      "6": 43,
+      "5": 40,
+      "4": 32,
+      "3": 23,
+      "2": 17,
+      "1": 8,
+      "0": 0
+    },
+    "gpu_drafter_first_mtp_device": "GPU stages on 3-6 GPUs; CPU stages on 0-2 GPUs",
+    "validated_requests": 120,
+    "validated_primary_requests": 84,
+    "final_state": {
+      "gpu_memory_mib": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "gpu_utilization_percent": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "mlocked_kib": 0,
+      "vllm": "exited",
+      "watchdog_timer": "disabled/inactive",
+      "watchdog_service": "inactive"
+    }
+  },
+  "primary_curve": [
+    {
+      "gpus": 6,
+      "gpu_layers": 43,
+      "status": {
+        "returncode": 0,
+        "wall_s": 98.0600597858429
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 7.384808742,
+        "tokens_per_s": 43.33219873116654
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 4.340767615,
+        "tokens_per_s": 73.71968010777744
+      },
+      "complete": true,
+      "accepted": 231,
+      "drafted": 337,
+      "gpu_peak_mib": [
+        25930.0,
+        28172.0,
+        28214.0,
+        28172.0,
+        24810.0,
+        28238.0
+      ],
+      "rss_peak_gib": 47.91291809082031,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 0.0208282470703125,
+      "min_available_gib": 32.67063522338867,
+      "source_dir": "offload-results"
+    },
+    {
+      "gpus": 5,
+      "gpu_layers": 43,
+      "status": {
+        "returncode": 0,
+        "wall_s": 120.48072862625122
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 7.324855532,
+        "tokens_per_s": 43.686868444301766
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 24.147631201,
+        "tokens_per_s": 13.251817428234874
+      },
+      "complete": true,
+      "accepted": 231,
+      "drafted": 333,
+      "gpu_peak_mib": [
+        29174.0,
+        31704.0,
+        28236.0,
+        31662.0,
+        31704.0,
+        2.0
+      ],
+      "rss_peak_gib": 47.77793502807617,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 9.918212890625e-05,
+      "min_available_gib": 31.664993286132812,
+      "source_dir": "target-first-results"
+    },
+    {
+      "gpus": 4,
+      "gpu_layers": 35,
+      "status": {
+        "returncode": 0,
+        "wall_s": 262.1206338405609
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 66.457412431,
+        "tokens_per_s": 4.815113744192837
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 89.00362242,
+        "tokens_per_s": 3.5953592820070748
+      },
+      "complete": true,
+      "accepted": 234,
+      "drafted": 328,
+      "gpu_peak_mib": [
+        29184.0,
+        31714.0,
+        31672.0,
+        31714.0,
+        2.0,
+        2.0
+      ],
+      "rss_peak_gib": 47.829124450683594,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 0.0,
+      "min_available_gib": 31.224349975585938,
+      "source_dir": "target-first-results"
+    },
+    {
+      "gpus": 3,
+      "gpu_layers": 26,
+      "status": {
+        "returncode": 0,
+        "wall_s": 408.17612314224243
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 133.876011373,
+        "tokens_per_s": 2.3902713915522082
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 159.9964434,
+        "tokens_per_s": 2.0000444584882566
+      },
+      "complete": true,
+      "accepted": 236,
+      "drafted": 331,
+      "gpu_peak_mib": [
+        29182.0,
+        31712.0,
+        31670.0,
+        2.0,
+        2.0,
+        2.0
+      ],
+      "rss_peak_gib": 47.62579345703125,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 0.060604095458984375,
+      "min_available_gib": 32.715843200683594,
+      "source_dir": "target-first-results"
+    },
+    {
+      "gpus": 2,
+      "gpu_layers": 17,
+      "status": {
+        "returncode": 0,
+        "wall_s": 558.0017490386963
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 203.718873111,
+        "tokens_per_s": 1.570792117162567
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 208.537860023,
+        "tokens_per_s": 1.5344935445520858
+      },
+      "complete": true,
+      "accepted": 241,
+      "drafted": 302,
+      "gpu_peak_mib": [
+        29182.0,
+        31712.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0
+      ],
+      "rss_peak_gib": 47.543453216552734,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 0.0,
+      "min_available_gib": 31.842185974121094,
+      "source_dir": "offload-results"
+    },
+    {
+      "gpus": 1,
+      "gpu_layers": 8,
+      "status": {
+        "returncode": 0,
+        "wall_s": 721.2739207744598
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 265.951591189,
+        "tokens_per_s": 1.2032264915933149
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 299.841455986,
+        "tokens_per_s": 1.0672306767845379
+      },
+      "complete": true,
+      "accepted": 233,
+      "drafted": 342,
+      "gpu_peak_mib": [
+        29182.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0
+      ],
+      "rss_peak_gib": 47.47483825683594,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 0.005931854248046875,
+      "min_available_gib": 32.56047821044922,
+      "source_dir": "offload-results"
+    },
+    {
+      "gpus": 0,
+      "gpu_layers": 0,
+      "status": {
+        "returncode": 0,
+        "wall_s": 851.9997277259827
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 320.542265247,
+        "tokens_per_s": 0.9983082878428461
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 337.562258069,
+        "tokens_per_s": 0.9479732770794235
+      },
+      "complete": true,
+      "accepted": 237,
+      "drafted": 307,
+      "gpu_peak_mib": [
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0
+      ],
+      "rss_peak_gib": 47.303993225097656,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 8.0108642578125e-05,
+      "min_available_gib": 32.122772216796875,
+      "source_dir": "offload-results"
+    }
+  ],
+  "gpu_drafter_first_curve": [
+    {
+      "gpus": 6,
+      "gpu_layers": 43,
+      "status": {
+        "returncode": 0,
+        "wall_s": 98.0600597858429
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 7.384808742,
+        "tokens_per_s": 43.33219873116654
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 4.340767615,
+        "tokens_per_s": 73.71968010777744
+      },
+      "complete": true,
+      "accepted": 231,
+      "drafted": 337,
+      "gpu_peak_mib": [
+        25930.0,
+        28172.0,
+        28214.0,
+        28172.0,
+        24810.0,
+        28238.0
+      ],
+      "rss_peak_gib": 47.91291809082031,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 0.0208282470703125,
+      "min_available_gib": 32.67063522338867
+    },
+    {
+      "gpus": 5,
+      "gpu_layers": 40,
+      "status": {
+        "returncode": 0,
+        "wall_s": 141.5385558605194
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 30.556374624,
+        "tokens_per_s": 10.47244654961984
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 29.648363397,
+        "tokens_per_s": 10.79317585645822
+      },
+      "complete": true,
+      "accepted": 232,
+      "drafted": 327,
+      "gpu_peak_mib": [
+        29366.0,
+        31650.0,
+        31650.0,
+        31650.0,
+        28246.0,
+        2.0
+      ],
+      "rss_peak_gib": 47.9512825012207,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 0.0,
+      "min_available_gib": 30.897624969482422
+    },
+    {
+      "gpus": 4,
+      "gpu_layers": 32,
+      "status": {
+        "returncode": 0,
+        "wall_s": 293.09765625
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 89.055406004,
+        "tokens_per_s": 3.5932686667626546
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 91.916795141,
+        "tokens_per_s": 3.481409458512139
+      },
+      "complete": true,
+      "accepted": 234,
+      "drafted": 336,
+      "gpu_peak_mib": [
+        29366.0,
+        31650.0,
+        31650.0,
+        31650.0,
+        2.0,
+        2.0
+      ],
+      "rss_peak_gib": 47.83565902709961,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 0.0,
+      "min_available_gib": 31.1732177734375
+    },
+    {
+      "gpus": 3,
+      "gpu_layers": 23,
+      "status": {
+        "returncode": 0,
+        "wall_s": 414.86257338523865
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 151.407042454,
+        "tokens_per_s": 2.1135080298343545
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 144.061325094,
+        "tokens_per_s": 2.2212762501747085
+      },
+      "complete": true,
+      "accepted": 239,
+      "drafted": 303,
+      "gpu_peak_mib": [
+        29336.0,
+        31644.0,
+        31644.0,
+        2.0,
+        2.0,
+        2.0
+      ],
+      "rss_peak_gib": 47.70722961425781,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 0.0,
+      "min_available_gib": 31.408710479736328
+    },
+    {
+      "gpus": 2,
+      "gpu_layers": 17,
+      "status": {
+        "returncode": 0,
+        "wall_s": 558.0017490386963
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 203.718873111,
+        "tokens_per_s": 1.570792117162567
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 208.537860023,
+        "tokens_per_s": 1.5344935445520858
+      },
+      "complete": true,
+      "accepted": 241,
+      "drafted": 302,
+      "gpu_peak_mib": [
+        29182.0,
+        31712.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0
+      ],
+      "rss_peak_gib": 47.543453216552734,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 0.0,
+      "min_available_gib": 31.842185974121094
+    },
+    {
+      "gpus": 1,
+      "gpu_layers": 8,
+      "status": {
+        "returncode": 0,
+        "wall_s": 721.2739207744598
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 265.951591189,
+        "tokens_per_s": 1.2032264915933149
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 299.841455986,
+        "tokens_per_s": 1.0672306767845379
+      },
+      "complete": true,
+      "accepted": 233,
+      "drafted": 342,
+      "gpu_peak_mib": [
+        29182.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0
+      ],
+      "rss_peak_gib": 47.47483825683594,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 0.005931854248046875,
+      "min_available_gib": 32.56047821044922
+    },
+    {
+      "gpus": 0,
+      "gpu_layers": 0,
+      "status": {
+        "returncode": 0,
+        "wall_s": 851.9997277259827
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 320.542265247,
+        "tokens_per_s": 0.9983082878428461
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 337.562258069,
+        "tokens_per_s": 0.9479732770794235
+      },
+      "complete": true,
+      "accepted": 237,
+      "drafted": 307,
+      "gpu_peak_mib": [
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        2.0
+      ],
+      "rss_peak_gib": 47.303993225097656,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 8.0108642578125e-05,
+      "min_available_gib": 32.122772216796875
+    }
+  ],
+  "target_first_controls": [
+    {
+      "gpus": 5,
+      "gpu_layers": 43,
+      "status": {
+        "returncode": 0,
+        "wall_s": 120.48072862625122
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 7.324855532,
+        "tokens_per_s": 43.686868444301766
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 24.147631201,
+        "tokens_per_s": 13.251817428234874
+      },
+      "complete": true,
+      "accepted": 231,
+      "drafted": 333,
+      "gpu_peak_mib": [
+        29174.0,
+        31704.0,
+        28236.0,
+        31662.0,
+        31704.0,
+        2.0
+      ],
+      "rss_peak_gib": 47.77793502807617,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 9.918212890625e-05,
+      "min_available_gib": 31.664993286132812
+    },
+    {
+      "gpus": 4,
+      "gpu_layers": 35,
+      "status": {
+        "returncode": 0,
+        "wall_s": 262.1206338405609
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 66.457412431,
+        "tokens_per_s": 4.815113744192837
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 89.00362242,
+        "tokens_per_s": 3.5953592820070748
+      },
+      "complete": true,
+      "accepted": 234,
+      "drafted": 328,
+      "gpu_peak_mib": [
+        29184.0,
+        31714.0,
+        31672.0,
+        31714.0,
+        2.0,
+        2.0
+      ],
+      "rss_peak_gib": 47.829124450683594,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 0.0,
+      "min_available_gib": 31.224349975585938
+    },
+    {
+      "gpus": 3,
+      "gpu_layers": 26,
+      "status": {
+        "returncode": 0,
+        "wall_s": 408.17612314224243
+      },
+      "samples": 12,
+      "t": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 133.876011373,
+        "tokens_per_s": 2.3902713915522082
+      },
+      "d": {
+        "samples": 5,
+        "tokens": 320,
+        "wall_s": 159.9964434,
+        "tokens_per_s": 2.0000444584882566
+      },
+      "complete": true,
+      "accepted": 236,
+      "drafted": 331,
+      "gpu_peak_mib": [
+        29182.0,
+        31712.0,
+        31670.0,
+        2.0,
+        2.0,
+        2.0
+      ],
+      "rss_peak_gib": 47.62579345703125,
+      "swap_peak_mib": 0.0,
+      "physical_read_gib": 0.060604095458984375,
+      "min_available_gib": 32.715843200683594
+    }
+  ],
+  "sources": {
+    "c/deepseek_v4.c": "9d6980ab43d019a995f186038a40d3d720bc1b5ea515ecea5333a4c38045630b",
+    "c/deepseek_v4_internal.h": "eadebab3b6ddda28e21e2b9f85242ff20a85a35ad008239a801dd98416f93c42",
+    "c/deepseek_v4_device_target.inc": "d5ac72fe5576db296c06f554beb3fda59312269bfefe0a35d455e27a1586ec5e",
+    "c/deepseek_v4_device_draft.inc": "61e17dd1e3ce09292fe43acc26e1f74a50b7ef7d060bafbee70afc2a0509818d",
+    "c/deepseek_v4_dspark.inc": "85a56c0348b97bb0e1e2fa8bee09b1cd4591f04d5758f01759a55b79b1cfb44b",
+    "c/backend_cuda_dsv4.cu": "691cb76cf0b021b22a09b0a8da4a45daeb690dc1fc617e85333eb67bb161892e",
+    "c/backend_cuda_dsv4.h": "64046915df2d9b4d6f4e1f2cc565fbad631477a4f1d308e4815446a684b26c26",
+    "c/backend_cuda_dsv4_target.inc": "bdc2b5d474bd1e8b04e8b4c519234b4a4c3352c7e2ed98b389890bfa2969f871",
+    "c/st.h": "dcbe53f4dc1a1178f424959c10151a25c8ad93af49816693405b27af3a098d2a",
+    "c/Makefile.deepseek-v4": "da692d60d1909bba94754c0077f8044dbdee6c8fd2689dca5115d3ea4670b21c",
+    "c/tools/bench_dsv4_fixtures.c": "c34d4e9c21fc00adb4193063fcf8d8d2d53674259372ec89572441dd91a28510",
+    "c/tools/bench_dsv4_fixtures": "faeca9dcac26262fa5e2fef2c010728adbaaad33e7d31b7fabcf3f276508e888",
+    "long6.prompts": "a977dec01cfd310d37b47fe16b884f9cacc56c00c9534a81a741e7cf8dcad87e",
+    "offload_campaign.py": "385bfdea627f7aa5bea00ca7b2abc52a187a9c6bd8603fc0beb40fb23f225790",
+    "offload_target_first.py": "bd83f13d023e885cf1fe51b814314b0e1958bfcc0f7abaf88eb15974d9b6681f"
+  },
+  "output_times": {
+    "offload-results/gpu0.jsonl": {
+      "last_output_unix": 1790820958.4160523,
+      "status_file_unix": 1790820959.6880283,
+      "read_bytes_sampled_before_last_output": 86016,
+      "read_bytes_sampled_after_last_output": 0
+    },
+    "offload-results/gpu1.jsonl": {
+      "last_output_unix": 1790820105.592113,
+      "status_file_unix": 1790820107.6880734,
+      "read_bytes_sampled_before_last_output": 6369280,
+      "read_bytes_sampled_after_last_output": 0
+    },
+    "offload-results/gpu2.jsonl": {
+      "last_output_unix": 1790819383.6857517,
+      "status_file_unix": 1790819386.4137,
+      "read_bytes_sampled_before_last_output": 0,
+      "read_bytes_sampled_after_last_output": 0
+    },
+    "offload-results/gpu3.jsonl": {
+      "last_output_unix": 1790818825.9643314,
+      "status_file_unix": 1790818828.408285,
+      "read_bytes_sampled_before_last_output": 0,
+      "read_bytes_sampled_after_last_output": 0
+    },
+    "offload-results/gpu4.jsonl": {
+      "last_output_unix": 1790818410.0202215,
+      "status_file_unix": 1790818413.5441546,
+      "read_bytes_sampled_before_last_output": 0,
+      "read_bytes_sampled_after_last_output": 0
+    },
+    "offload-results/gpu5.jsonl": {
+      "last_output_unix": 1790818116.6497865,
+      "status_file_unix": 1790818120.4497144,
+      "read_bytes_sampled_before_last_output": 0,
+      "read_bytes_sampled_after_last_output": 0
+    },
+    "offload-results/gpu6.jsonl": {
+      "last_output_unix": 1790817926.2853975,
+      "status_file_unix": 1790817926.2853975,
+      "read_bytes_sampled_before_last_output": 22364160,
+      "read_bytes_sampled_after_last_output": 0
+    },
+    "target-first-results/gpu3.jsonl": {
+      "last_output_unix": 1790821800.8402026,
+      "status_file_unix": 1790821804.1641417,
+      "read_bytes_sampled_before_last_output": 12288,
+      "read_bytes_sampled_after_last_output": 65073152
+    },
+    "target-first-results/gpu4.jsonl": {
+      "last_output_unix": 1790821392.2398825,
+      "status_file_unix": 1790821395.9838119,
+      "read_bytes_sampled_before_last_output": 0,
+      "read_bytes_sampled_after_last_output": 0
+    },
+    "target-first-results/gpu5.jsonl": {
+      "last_output_unix": 1790821079.3217754,
+      "status_file_unix": 1790821083.693693,
+      "read_bytes_sampled_before_last_output": 106496,
+      "read_bytes_sampled_after_last_output": 106496
+    }
+  },
+  "configurations": {
+    "offload-results/gpu0.config.json": {
+      "gpus": 0,
+      "gpu_layers": 0,
+      "cpu_layers": 43,
+      "environment": {
+        "V4_GPU_LAYERS": "0",
+        "V4_LOADER_LANES": "3",
+        "V4_DRAFT": "5",
+        "DSV4_CUDA_INDEXER_LAZY": "1",
+        "V4_DEVICE_GRAPH": "0",
+        "V4_DEVICE_MMA": "1",
+        "V4_IDX_IDENTITY": "0",
+        "V4_NGRAM": "0",
+        "V4_MTP_GPU_DENSE": "0",
+        "V4_MTP": "1",
+        "OMP_NUM_THREADS": "12",
+        "DSV4_CUDA_EXPERT_MIRRORS": "2048",
+        "CUDA_VISIBLE_DEVICES": "",
+        "DSV4_CUDA_PIN_HOST": "0",
+        "COLI_V4_DIRECT": "0",
+        "DSV4_CUDA_VRAM_RESERVE_MB": "600",
+        "V4_MTP_GPU_MIRRORS": "768",
+        "DSV4_CUDA": "0",
+        "V4_MTP_LOG": "1",
+        "V4_DEVICE_FP4_VEC": "1",
+        "V4_MTP_GPU_ATTN": "0",
+        "V4_UNIFIED_DECODE": "1",
+        "CTX": "512",
+        "V4_MTP_CONF": "0",
+        "V4_MTP_DEVICE": "0",
+        "COLI_CUDA_MOE_BATCH": "1",
+        "COLI_CUDA_ATTN_BATCH": "1",
+        "BENCH_WARMUP": "1",
+        "V4_MTP_PARTIAL_KEEP": "1",
+        "V4_SPEC_RETAIN": "1",
+        "DSV4_CUDA_RESIDENT_EXPERTS": "0",
+        "DSV4_CUDA_DEVICES": "",
+        "V4_MTP_GB": "4",
+        "V4_MTP_DRAFT": "5",
+        "V4_DEVICE_TARGET": "0",
+        "V4_MTP_GPU": "0",
+        "COLI_V4_PREWARM": "0",
+        "V4_MTP_GPU_HEAD": "0",
+        "V4_RESIDENT_MOE_BATCH": "1"
+      },
+      "command": [
+        "timeout",
+        "-k",
+        "10",
+        "7200",
+        "c/tools/bench_dsv4_fixtures",
+        "/data/models/DeepSeek-V4-Flash-0731",
+        "long6.prompts",
+        "64",
+        "1",
+        "td"
+      ]
+    },
+    "offload-results/gpu1.config.json": {
+      "gpus": 1,
+      "gpu_layers": 8,
+      "cpu_layers": 35,
+      "environment": {
+        "V4_GPU_LAYERS": "8",
+        "V4_LOADER_LANES": "3",
+        "V4_DRAFT": "5",
+        "DSV4_CUDA_INDEXER_LAZY": "1",
+        "V4_DEVICE_GRAPH": "1",
+        "V4_DEVICE_MMA": "1",
+        "V4_IDX_IDENTITY": "0",
+        "V4_NGRAM": "0",
+        "V4_MTP_GPU_DENSE": "0",
+        "V4_MTP": "1",
+        "OMP_NUM_THREADS": "12",
+        "DSV4_CUDA_EXPERT_MIRRORS": "2048",
+        "CUDA_VISIBLE_DEVICES": "0",
+        "DSV4_CUDA_PIN_HOST": "0",
+        "COLI_V4_DIRECT": "0",
+        "DSV4_CUDA_VRAM_RESERVE_MB": "600",
+        "V4_MTP_GPU_MIRRORS": "768",
+        "DSV4_CUDA": "1",
+        "V4_MTP_LOG": "1",
+        "V4_DEVICE_FP4_VEC": "1",
+        "V4_MTP_GPU_ATTN": "0",
+        "V4_UNIFIED_DECODE": "1",
+        "CTX": "512",
+        "V4_MTP_CONF": "0",
+        "V4_MTP_DEVICE": "0",
+        "COLI_CUDA_MOE_BATCH": "1",
+        "COLI_CUDA_ATTN_BATCH": "1",
+        "BENCH_WARMUP": "1",
+        "V4_MTP_PARTIAL_KEEP": "1",
+        "V4_SPEC_RETAIN": "1",
+        "DSV4_CUDA_RESIDENT_EXPERTS": "1",
+        "DSV4_CUDA_DEVICES": "0",
+        "V4_MTP_GB": "4",
+        "V4_MTP_DRAFT": "5",
+        "V4_DEVICE_TARGET": "1",
+        "V4_MTP_GPU": "0",
+        "COLI_V4_PREWARM": "0",
+        "V4_MTP_GPU_HEAD": "1",
+        "V4_RESIDENT_MOE_BATCH": "1"
+      },
+      "command": [
+        "timeout",
+        "-k",
+        "10",
+        "7200",
+        "c/tools/bench_dsv4_fixtures",
+        "/data/models/DeepSeek-V4-Flash-0731",
+        "long6.prompts",
+        "64",
+        "1",
+        "td"
+      ]
+    },
+    "offload-results/gpu2.config.json": {
+      "gpus": 2,
+      "gpu_layers": 17,
+      "cpu_layers": 26,
+      "environment": {
+        "V4_GPU_LAYERS": "17",
+        "V4_LOADER_LANES": "3",
+        "V4_DRAFT": "5",
+        "DSV4_CUDA_INDEXER_LAZY": "1",
+        "V4_DEVICE_GRAPH": "1",
+        "V4_DEVICE_MMA": "1",
+        "V4_IDX_IDENTITY": "0",
+        "V4_NGRAM": "0",
+        "V4_MTP_GPU_DENSE": "0",
+        "V4_MTP": "1",
+        "OMP_NUM_THREADS": "12",
+        "DSV4_CUDA_EXPERT_MIRRORS": "2048",
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "DSV4_CUDA_PIN_HOST": "0",
+        "COLI_V4_DIRECT": "0",
+        "DSV4_CUDA_VRAM_RESERVE_MB": "600",
+        "V4_MTP_GPU_MIRRORS": "768",
+        "DSV4_CUDA": "1",
+        "V4_MTP_LOG": "1",
+        "V4_DEVICE_FP4_VEC": "1",
+        "V4_MTP_GPU_ATTN": "0",
+        "V4_UNIFIED_DECODE": "1",
+        "CTX": "512",
+        "V4_MTP_CONF": "0",
+        "V4_MTP_DEVICE": "0",
+        "COLI_CUDA_MOE_BATCH": "1",
+        "COLI_CUDA_ATTN_BATCH": "1",
+        "BENCH_WARMUP": "1",
+        "V4_MTP_PARTIAL_KEEP": "1",
+        "V4_SPEC_RETAIN": "1",
+        "DSV4_CUDA_RESIDENT_EXPERTS": "1",
+        "DSV4_CUDA_DEVICES": "0,1",
+        "V4_MTP_GB": "4",
+        "V4_MTP_DRAFT": "5",
+        "V4_DEVICE_TARGET": "1",
+        "V4_MTP_GPU": "0",
+        "COLI_V4_PREWARM": "0",
+        "V4_MTP_GPU_HEAD": "1",
+        "V4_RESIDENT_MOE_BATCH": "1"
+      },
+      "command": [
+        "timeout",
+        "-k",
+        "10",
+        "7200",
+        "c/tools/bench_dsv4_fixtures",
+        "/data/models/DeepSeek-V4-Flash-0731",
+        "long6.prompts",
+        "64",
+        "1",
+        "td"
+      ]
+    },
+    "offload-results/gpu3.config.json": {
+      "gpus": 3,
+      "gpu_layers": 23,
+      "cpu_layers": 20,
+      "environment": {
+        "V4_GPU_LAYERS": "23",
+        "V4_LOADER_LANES": "3",
+        "V4_DRAFT": "5",
+        "DSV4_CUDA_INDEXER_LAZY": "1",
+        "V4_DEVICE_GRAPH": "1",
+        "V4_DEVICE_MMA": "1",
+        "V4_IDX_IDENTITY": "0",
+        "V4_NGRAM": "0",
+        "V4_MTP_GPU_DENSE": "1",
+        "V4_MTP": "1",
+        "OMP_NUM_THREADS": "12",
+        "DSV4_CUDA_EXPERT_MIRRORS": "2048",
+        "CUDA_VISIBLE_DEVICES": "0,1,2",
+        "DSV4_CUDA_PIN_HOST": "0",
+        "COLI_V4_DIRECT": "0",
+        "DSV4_CUDA_VRAM_RESERVE_MB": "600",
+        "V4_MTP_GPU_MIRRORS": "768",
+        "DSV4_CUDA": "1",
+        "V4_MTP_LOG": "1",
+        "V4_DEVICE_FP4_VEC": "1",
+        "V4_MTP_GPU_ATTN": "1",
+        "V4_UNIFIED_DECODE": "1",
+        "CTX": "512",
+        "V4_MTP_CONF": "0",
+        "V4_MTP_DEVICE": "1",
+        "COLI_CUDA_MOE_BATCH": "1",
+        "COLI_CUDA_ATTN_BATCH": "1",
+        "BENCH_WARMUP": "1",
+        "V4_MTP_PARTIAL_KEEP": "1",
+        "V4_SPEC_RETAIN": "1",
+        "DSV4_CUDA_RESIDENT_EXPERTS": "1",
+        "DSV4_CUDA_DEVICES": "0,1,2",
+        "V4_MTP_GB": "4",
+        "V4_MTP_DRAFT": "5",
+        "V4_DEVICE_TARGET": "1",
+        "V4_MTP_GPU": "1",
+        "COLI_V4_PREWARM": "0",
+        "V4_MTP_GPU_HEAD": "1",
+        "V4_RESIDENT_MOE_BATCH": "1"
+      },
+      "command": [
+        "timeout",
+        "-k",
+        "10",
+        "7200",
+        "c/tools/bench_dsv4_fixtures",
+        "/data/models/DeepSeek-V4-Flash-0731",
+        "long6.prompts",
+        "64",
+        "1",
+        "td"
+      ]
+    },
+    "offload-results/gpu4.config.json": {
+      "gpus": 4,
+      "gpu_layers": 32,
+      "cpu_layers": 11,
+      "environment": {
+        "V4_GPU_LAYERS": "32",
+        "V4_LOADER_LANES": "3",
+        "V4_DRAFT": "5",
+        "DSV4_CUDA_INDEXER_LAZY": "1",
+        "V4_DEVICE_GRAPH": "1",
+        "V4_DEVICE_MMA": "1",
+        "V4_IDX_IDENTITY": "0",
+        "V4_NGRAM": "0",
+        "V4_MTP_GPU_DENSE": "1",
+        "V4_MTP": "1",
+        "OMP_NUM_THREADS": "12",
+        "DSV4_CUDA_EXPERT_MIRRORS": "2048",
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+        "DSV4_CUDA_PIN_HOST": "0",
+        "COLI_V4_DIRECT": "0",
+        "DSV4_CUDA_VRAM_RESERVE_MB": "600",
+        "V4_MTP_GPU_MIRRORS": "768",
+        "DSV4_CUDA": "1",
+        "V4_MTP_LOG": "1",
+        "V4_DEVICE_FP4_VEC": "1",
+        "V4_MTP_GPU_ATTN": "1",
+        "V4_UNIFIED_DECODE": "1",
+        "CTX": "512",
+        "V4_MTP_CONF": "0",
+        "V4_MTP_DEVICE": "1",
+        "COLI_CUDA_MOE_BATCH": "1",
+        "COLI_CUDA_ATTN_BATCH": "1",
+        "BENCH_WARMUP": "1",
+        "V4_MTP_PARTIAL_KEEP": "1",
+        "V4_SPEC_RETAIN": "1",
+        "DSV4_CUDA_RESIDENT_EXPERTS": "1",
+        "DSV4_CUDA_DEVICES": "0,1,2,3",
+        "V4_MTP_GB": "4",
+        "V4_MTP_DRAFT": "5",
+        "V4_DEVICE_TARGET": "1",
+        "V4_MTP_GPU": "1",
+        "COLI_V4_PREWARM": "0",
+        "V4_MTP_GPU_HEAD": "1",
+        "V4_RESIDENT_MOE_BATCH": "1"
+      },
+      "command": [
+        "timeout",
+        "-k",
+        "10",
+        "7200",
+        "c/tools/bench_dsv4_fixtures",
+        "/data/models/DeepSeek-V4-Flash-0731",
+        "long6.prompts",
+        "64",
+        "1",
+        "td"
+      ]
+    },
+    "offload-results/gpu5.config.json": {
+      "gpus": 5,
+      "gpu_layers": 40,
+      "cpu_layers": 3,
+      "environment": {
+        "V4_GPU_LAYERS": "40",
+        "V4_LOADER_LANES": "3",
+        "V4_DRAFT": "5",
+        "DSV4_CUDA_INDEXER_LAZY": "1",
+        "V4_DEVICE_GRAPH": "1",
+        "V4_DEVICE_MMA": "1",
+        "V4_IDX_IDENTITY": "0",
+        "V4_NGRAM": "0",
+        "V4_MTP_GPU_DENSE": "1",
+        "V4_MTP": "1",
+        "OMP_NUM_THREADS": "12",
+        "DSV4_CUDA_EXPERT_MIRRORS": "2048",
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3,4",
+        "DSV4_CUDA_PIN_HOST": "0",
+        "COLI_V4_DIRECT": "0",
+        "DSV4_CUDA_VRAM_RESERVE_MB": "600",
+        "V4_MTP_GPU_MIRRORS": "768",
+        "DSV4_CUDA": "1",
+        "V4_MTP_LOG": "1",
+        "V4_DEVICE_FP4_VEC": "1",
+        "V4_MTP_GPU_ATTN": "1",
+        "V4_UNIFIED_DECODE": "1",
+        "CTX": "512",
+        "V4_MTP_CONF": "0",
+        "V4_MTP_DEVICE": "1",
+        "COLI_CUDA_MOE_BATCH": "1",
+        "COLI_CUDA_ATTN_BATCH": "1",
+        "BENCH_WARMUP": "1",
+        "V4_MTP_PARTIAL_KEEP": "1",
+        "V4_SPEC_RETAIN": "1",
+        "DSV4_CUDA_RESIDENT_EXPERTS": "1",
+        "DSV4_CUDA_DEVICES": "0,1,2,3,4",
+        "V4_MTP_GB": "4",
+        "V4_MTP_DRAFT": "5",
+        "V4_DEVICE_TARGET": "1",
+        "V4_MTP_GPU": "1",
+        "COLI_V4_PREWARM": "0",
+        "V4_MTP_GPU_HEAD": "1",
+        "V4_RESIDENT_MOE_BATCH": "1"
+      },
+      "command": [
+        "timeout",
+        "-k",
+        "10",
+        "7200",
+        "c/tools/bench_dsv4_fixtures",
+        "/data/models/DeepSeek-V4-Flash-0731",
+        "long6.prompts",
+        "64",
+        "1",
+        "td"
+      ]
+    },
+    "offload-results/gpu6.config.json": {
+      "gpus": 6,
+      "gpu_layers": 43,
+      "cpu_layers": 0,
+      "environment": {
+        "V4_MTP_GB": "4",
+        "V4_MTP_CONF": "0",
+        "COLI_V4_PREWARM": "0",
+        "V4_IDX_IDENTITY": "0",
+        "V4_MTP_GPU_MIRRORS": "768",
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5",
+        "CTX": "512",
+        "DSV4_CUDA_DEVICES": "0,1,2,3,4,5",
+        "OMP_NUM_THREADS": "12",
+        "V4_DEVICE_MMA": "1",
+        "V4_DEVICE_TARGET": "1",
+        "COLI_CUDA_ATTN_BATCH": "1",
+        "V4_MTP_GPU_DENSE": "1",
+        "COLI_V4_DIRECT": "0",
+        "V4_LOADER_LANES": "3",
+        "V4_MTP": "1",
+        "DSV4_CUDA_PIN_HOST": "0",
+        "V4_MTP_GPU_HEAD": "1",
+        "V4_DEVICE_GRAPH": "1",
+        "V4_MTP_DRAFT": "5",
+        "DSV4_CUDA_EXPERT_MIRRORS": "2048",
+        "V4_UNIFIED_DECODE": "1",
+        "COLI_CUDA_MOE_BATCH": "1",
+        "V4_MTP_PARTIAL_KEEP": "1",
+        "V4_NGRAM": "0",
+        "V4_RESIDENT_MOE_BATCH": "1",
+        "DSV4_CUDA": "1",
+        "DSV4_CUDA_RESIDENT_EXPERTS": "1",
+        "V4_MTP_GPU_ATTN": "1",
+        "V4_MTP_LOG": "1",
+        "DSV4_CUDA_INDEXER_LAZY": "1",
+        "BENCH_WARMUP": "1",
+        "V4_MTP_DEVICE": "1",
+        "V4_GPU_LAYERS": "43",
+        "V4_SPEC_RETAIN": "1",
+        "V4_DRAFT": "5",
+        "V4_MTP_GPU": "1",
+        "V4_DEVICE_FP4_VEC": "1"
+      },
+      "command": [
+        "timeout",
+        "-k",
+        "10",
+        "7200",
+        "c/tools/bench_dsv4_fixtures",
+        "/data/models/DeepSeek-V4-Flash-0731",
+        "long6.prompts",
+        "64",
+        "1",
+        "td"
+      ]
+    },
+    "target-first-results/gpu3.config.json": {
+      "gpus": 3,
+      "gpu_layers": 26,
+      "cpu_layers": 17,
+      "environment": {
+        "V4_MTP_GPU_ATTN": "0",
+        "BENCH_WARMUP": "1",
+        "OMP_NUM_THREADS": "12",
+        "CUDA_VISIBLE_DEVICES": "0,1,2",
+        "V4_DEVICE_GRAPH": "1",
+        "V4_RESIDENT_MOE_BATCH": "1",
+        "DSV4_CUDA": "1",
+        "V4_MTP_LOG": "1",
+        "DSV4_CUDA_INDEXER_LAZY": "1",
+        "V4_DEVICE_TARGET": "1",
+        "V4_MTP_PARTIAL_KEEP": "1",
+        "V4_MTP_CONF": "0",
+        "V4_SPEC_RETAIN": "1",
+        "V4_LOADER_LANES": "3",
+        "V4_MTP_DRAFT": "5",
+        "COLI_CUDA_ATTN_BATCH": "1",
+        "DSV4_CUDA_PIN_HOST": "0",
+        "COLI_V4_DIRECT": "0",
+        "V4_UNIFIED_DECODE": "1",
+        "V4_IDX_IDENTITY": "0",
+        "V4_MTP_GPU_HEAD": "1",
+        "COLI_V4_PREWARM": "0",
+        "V4_MTP": "1",
+        "V4_MTP_GPU": "0",
+        "V4_NGRAM": "0",
+        "V4_DEVICE_MMA": "1",
+        "V4_GPU_LAYERS": "26",
+        "DSV4_CUDA_EXPERT_MIRRORS": "2048",
+        "DSV4_CUDA_RESIDENT_EXPERTS": "1",
+        "V4_MTP_DEVICE": "0",
+        "DSV4_CUDA_DEVICES": "0,1,2",
+        "V4_MTP_GB": "4",
+        "COLI_CUDA_MOE_BATCH": "1",
+        "V4_MTP_GPU_DENSE": "0",
+        "V4_DEVICE_FP4_VEC": "1",
+        "DSV4_CUDA_VRAM_RESERVE_MB": "600",
+        "V4_DRAFT": "5",
+        "CTX": "512",
+        "V4_MTP_GPU_MIRRORS": "768"
+      },
+      "command": [
+        "timeout",
+        "-k",
+        "10",
+        "7200",
+        "c/tools/bench_dsv4_fixtures",
+        "/data/models/DeepSeek-V4-Flash-0731",
+        "long6.prompts",
+        "64",
+        "1",
+        "td"
+      ]
+    },
+    "target-first-results/gpu4.config.json": {
+      "gpus": 4,
+      "gpu_layers": 35,
+      "cpu_layers": 8,
+      "environment": {
+        "V4_MTP_GPU_ATTN": "0",
+        "BENCH_WARMUP": "1",
+        "OMP_NUM_THREADS": "12",
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+        "V4_DEVICE_GRAPH": "1",
+        "V4_RESIDENT_MOE_BATCH": "1",
+        "DSV4_CUDA": "1",
+        "V4_MTP_LOG": "1",
+        "DSV4_CUDA_INDEXER_LAZY": "1",
+        "V4_DEVICE_TARGET": "1",
+        "V4_MTP_PARTIAL_KEEP": "1",
+        "V4_MTP_CONF": "0",
+        "V4_SPEC_RETAIN": "1",
+        "V4_LOADER_LANES": "3",
+        "V4_MTP_DRAFT": "5",
+        "COLI_CUDA_ATTN_BATCH": "1",
+        "DSV4_CUDA_PIN_HOST": "0",
+        "COLI_V4_DIRECT": "0",
+        "V4_UNIFIED_DECODE": "1",
+        "V4_IDX_IDENTITY": "0",
+        "V4_MTP_GPU_HEAD": "1",
+        "COLI_V4_PREWARM": "0",
+        "V4_MTP": "1",
+        "V4_MTP_GPU": "0",
+        "V4_NGRAM": "0",
+        "V4_DEVICE_MMA": "1",
+        "V4_GPU_LAYERS": "35",
+        "DSV4_CUDA_EXPERT_MIRRORS": "2048",
+        "DSV4_CUDA_RESIDENT_EXPERTS": "1",
+        "V4_MTP_DEVICE": "0",
+        "DSV4_CUDA_DEVICES": "0,1,2,3",
+        "V4_MTP_GB": "4",
+        "COLI_CUDA_MOE_BATCH": "1",
+        "V4_MTP_GPU_DENSE": "0",
+        "V4_DEVICE_FP4_VEC": "1",
+        "DSV4_CUDA_VRAM_RESERVE_MB": "600",
+        "V4_DRAFT": "5",
+        "CTX": "512",
+        "V4_MTP_GPU_MIRRORS": "768"
+      },
+      "command": [
+        "timeout",
+        "-k",
+        "10",
+        "7200",
+        "c/tools/bench_dsv4_fixtures",
+        "/data/models/DeepSeek-V4-Flash-0731",
+        "long6.prompts",
+        "64",
+        "1",
+        "td"
+      ]
+    },
+    "target-first-results/gpu5.config.json": {
+      "gpus": 5,
+      "gpu_layers": 43,
+      "cpu_layers": 0,
+      "environment": {
+        "V4_RESIDENT_MOE_BATCH": "1",
+        "V4_MTP_GPU": "0",
+        "V4_MTP_DRAFT": "5",
+        "DSV4_CUDA_PIN_HOST": "0",
+        "V4_MTP_GPU_MIRRORS": "768",
+        "OMP_NUM_THREADS": "12",
+        "V4_MTP_GPU_HEAD": "1",
+        "V4_DRAFT": "5",
+        "COLI_CUDA_ATTN_BATCH": "1",
+        "V4_IDX_IDENTITY": "0",
+        "V4_MTP_DEVICE": "0",
+        "V4_MTP_GPU_ATTN": "0",
+        "BENCH_WARMUP": "1",
+        "DSV4_CUDA_INDEXER_LAZY": "1",
+        "V4_MTP_LOG": "1",
+        "V4_MTP_CONF": "0",
+        "V4_SPEC_RETAIN": "1",
+        "V4_MTP_PARTIAL_KEEP": "1",
+        "V4_DEVICE_GRAPH": "1",
+        "COLI_V4_DIRECT": "0",
+        "COLI_V4_PREWARM": "0",
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3,4",
+        "DSV4_CUDA": "1",
+        "V4_UNIFIED_DECODE": "1",
+        "V4_MTP_GB": "4",
+        "V4_GPU_LAYERS": "43",
+        "V4_DEVICE_MMA": "1",
+        "V4_MTP_GPU_DENSE": "0",
+        "V4_LOADER_LANES": "3",
+        "V4_NGRAM": "0",
+        "CTX": "512",
+        "V4_DEVICE_TARGET": "1",
+        "COLI_CUDA_MOE_BATCH": "1",
+        "DSV4_CUDA_VRAM_RESERVE_MB": "600",
+        "V4_MTP": "1",
+        "V4_DEVICE_FP4_VEC": "1",
+        "DSV4_CUDA_RESIDENT_EXPERTS": "1",
+        "DSV4_CUDA_EXPERT_MIRRORS": "2048",
+        "DSV4_CUDA_DEVICES": "0,1,2,3,4"
+      },
+      "command": [
+        "timeout",
+        "-k",
+        "10",
+        "7200",
+        "c/tools/bench_dsv4_fixtures",
+        "/data/models/DeepSeek-V4-Flash-0731",
+        "long6.prompts",
+        "64",
+        "1",
+        "td"
+      ]
+    }
+  }
+}
