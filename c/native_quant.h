@@ -32,6 +32,55 @@ static inline __m256 v4_fp8_decode8(__m256i codes) {
     return _mm256_castsi256_ps(
         _mm256_blendv_epi8(sbits, _mm256_set1_epi32(0x7FC00000), is_nan));
 }
+/* E4M3 -> FP16 with its exponent left unbiased, then an exact 2^8 scale.
+ * F16C handles FP16 subnormals without a scalar FP32 denormal assist. */
+static inline __m256 v4_fp8_decode8_bytes(__m128i bytes) {
+#ifdef __F16C__
+    __m128i codes = _mm_cvtepu8_epi16(bytes);
+    __m128i magnitude = _mm_and_si128(codes, _mm_set1_epi16(127));
+    __m128i half = _mm_or_si128(_mm_slli_epi16(magnitude, 7),
+        _mm_slli_epi16(_mm_and_si128(codes, _mm_set1_epi16(128)), 8));
+    __m256 values = _mm256_mul_ps(_mm256_cvtph_ps(half), _mm256_set1_ps(256.0f));
+    __m256i nan = _mm256_cvtepi16_epi32(_mm_cmpeq_epi16(magnitude, _mm_set1_epi16(127)));
+    return _mm256_castsi256_ps(_mm256_blendv_epi8(_mm256_castps_si256(values),
+        _mm256_set1_epi32(0x7fc00000), nan));
+#else
+    return v4_fp8_decode8(_mm256_cvtepu8_epi32(bytes));
+#endif
+}
+
+#endif
+
+#ifdef __AVX512F__
+static inline __m512 v4_fp8_decode16(__m512i codes) {
+    __m512i magnitude = _mm512_and_si512(codes, _mm512_set1_epi32(127));
+    __m512i bits = _mm512_add_epi32(_mm512_slli_epi32(magnitude, 20),
+                                    _mm512_set1_epi32(120 << 23));
+    __m512 values = _mm512_mask_mul_ps(_mm512_castsi512_ps(bits),
+        _mm512_cmplt_epi32_mask(magnitude, _mm512_set1_epi32(8)),
+        _mm512_cvtepi32_ps(magnitude), _mm512_set1_ps(1.0f / 512.0f));
+    __m512i sign = _mm512_slli_epi32(
+        _mm512_and_si512(codes, _mm512_set1_epi32(128)), 24);
+    bits = _mm512_or_si512(_mm512_castps_si512(values), sign);
+    return _mm512_castsi512_ps(_mm512_mask_mov_epi32(bits,
+        _mm512_cmpeq_epi32_mask(magnitude, _mm512_set1_epi32(127)),
+        _mm512_set1_epi32(0x7fc00000)));
+}
+static inline __m512 v4_fp8_decode16_bytes(__m128i bytes) {
+#if defined(__AVX512BW__) && defined(__AVX512VL__)
+    __m256i codes = _mm256_cvtepu8_epi16(bytes);
+    __m256i magnitude = _mm256_and_si256(codes, _mm256_set1_epi16(127));
+    __m256i half = _mm256_or_si256(_mm256_slli_epi16(magnitude, 7),
+        _mm256_slli_epi16(_mm256_and_si256(codes, _mm256_set1_epi16(128)), 8));
+    __m512 values = _mm512_mul_ps(_mm512_cvtph_ps(half), _mm512_set1_ps(256.0f));
+    return _mm512_castsi512_ps(_mm512_mask_mov_epi32(_mm512_castps_si512(values),
+        _mm256_cmpeq_epi16_mask(magnitude, _mm256_set1_epi16(127)),
+        _mm512_set1_epi32(0x7fc00000)));
+#else
+    return v4_fp8_decode16(_mm512_cvtepu8_epi32(bytes));
+#endif
+}
+
 #endif
 
 #ifdef __cplusplus

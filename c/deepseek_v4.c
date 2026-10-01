@@ -3135,10 +3135,15 @@ int coli_v4_attention_window_batch_ref(
         gpu_wo_done = 1;
     }
 #endif
+    int wo_a_done = gpu_wo_done;
+    if (!result && !wo_a_done && batch == 1 &&
+        wo_a.rows == (int64_t)groups * o_rank && wo_a.columns == group_width &&
+        coli_fp8_grouped_matvec_ref(oa, &wo_a, attended, groups) == 0)
+        wo_a_done = 1;
     float *group_inputs = v4_attn_scratch(11, (size_t)batch * group_width * sizeof(*group_inputs), 0);
     float *group_outputs = v4_attn_scratch(12, (size_t)batch * o_rank * sizeof(*group_outputs), 0);
-    if (!gpu_wo_done && (!group_inputs || !group_outputs)) result = -1;
-    for (int group = 0; !result && !gpu_wo_done && group < groups; group++) {
+    if (!wo_a_done && (!group_inputs || !group_outputs)) result = -1;
+    for (int group = 0; !result && !wo_a_done && group < groups; group++) {
         for (int item = 0; item < batch; item++)
             memcpy(group_inputs + (size_t)item * group_width,
                    attended + (size_t)item * q_width + (size_t)group * group_width,
@@ -4231,9 +4236,14 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
     if (!output || !queries || !kv || !sinks || !indices || heads < 1 ||
         head_dimension < 1 || kv_count < 1 || topk < 1 || !(softmax_scale > 0.0f))
         return -1;
-    float *scores = malloc((size_t)topk * sizeof(*scores));
-    if (!scores) return -1;
+    for (int rank = 0; rank < topk; rank++)
+        if (indices[rank] >= kv_count) return -1;
+    float *all_scores = calloc((size_t)heads, (size_t)topk * sizeof(*all_scores));
+    if (!all_scores) return -1;
+    int failed = 0;
+    #pragma omp parallel for schedule(static) reduction(|:failed) if(heads > 1)
     for (int head = 0; head < heads; head++) {
+        float *scores = all_scores + (size_t)head * topk;
         const float *query = queries + (size_t)head * head_dimension;
         float maximum = -INFINITY;
         for (int rank = 0; rank < topk; rank++) {
@@ -4241,10 +4251,6 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
             if (index < 0) {
                 scores[rank] = -INFINITY;
                 continue;
-            }
-            if (index >= kv_count) {
-                free(scores);
-                return -1;
             }
             const float *key = kv + (size_t)index * head_dimension;
             float score = 0.0f;
@@ -4255,8 +4261,8 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
             if (score > maximum) maximum = score;
         }
         if (!isfinite(maximum)) {
-            free(scores);
-            return -1;
+            failed = 1;
+            continue;
         }
         float denominator = expf(sinks[head] - maximum);
         float *head_output = output + (size_t)head * head_dimension;
@@ -4274,8 +4280,8 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
         for (int column = 0; column < head_dimension; column++)
             head_output[column] = coli_bf16_round(head_output[column] / denominator);
     }
-    free(scores);
-    return 0;
+    free(all_scores);
+    return failed ? -1 : 0;
 }
 #endif /* COLI_V4_UNIT_SPARSE_ATTENTION */
 
@@ -8843,6 +8849,9 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         memset(view, 0, sizeof(*view));
         return -1;
     }
+    const char *tail_cache_env = getenv("V4_CPU_TAIL_CACHE");
+    int tail_cache = tail_cache_env && atoi(tail_cache_env) != 0 &&
+        store->gpu && !hot_layer_on_gpu(store, key.layer);
     pthread_mutex_lock(&state->mutex);
     state->stats.requests++;
     policy->usage[(size_t)key.layer * state->experts_per_layer + key.expert]++;
@@ -8876,7 +8885,7 @@ retry_lookup:
         state->active_leases++;
         slot->used = ++state->clock; state->stats.hits++;
         touch_lru_slot(state, slot);
-        if (hot_is_pinned(policy, key.layer, key.expert) && !hot_layer_on_gpu(store, key.layer))
+        if ((tail_cache || hot_is_pinned(policy, key.layer, key.expert)) && !hot_layer_on_gpu(store, key.layer))
             hot_pack_slot_locked(policy, state, record, slot);
         memset(view, 0, sizeof(*view)); view->key = key;
         hot_fill_view(&view->gate, record, slot, V4_W1, policy, state);
@@ -8901,7 +8910,7 @@ retry_lookup:
         }
         goto retry_lookup;
     }
-    int pooled = state->pool_layer == key.layer;
+    int pooled = tail_cache || state->pool_layer == key.layer;
     slot = pooled ? next_pooled_empty_slot(state, key.layer)
                   : next_empty_slot(state, key.layer);
     if (!slot)
@@ -8950,7 +8959,7 @@ retry_lookup:
     /* GPU-owned layers need uploadable row-major slabs. CPU-only tail
      * layers can use the same packed kernels as a CPU-only engine. */
     if (!read_result &&
-        hot_is_pinned(policy, key.layer, key.expert) && !hot_layer_on_gpu(store, key.layer))
+        (tail_cache || hot_is_pinned(policy, key.layer, key.expert)) && !hot_layer_on_gpu(store, key.layer))
         v4_pack_buf = hot_pack_slot_prepare(record, slot);
     pthread_mutex_lock(&state->mutex);
     state->disk_sec +=
@@ -9026,6 +9035,73 @@ int coli_v4_test_force_streaming_direct(ColiExpertStore *store) {
     return enabled ? 0 : -1;
 }
 #endif
+
+/* Called after GPU residency is complete, before requests start. */
+int coli_v4_expert_store_preload_cpu_tail(ColiExpertStore *store,
+                                         char *error, size_t error_size) {
+#ifndef COLI_V4_GPU_TIER
+    (void)store; (void)error; (void)error_size;
+    return 0;
+#else
+    const char *preload = getenv("V4_CPU_TAIL_PRELOAD");
+    const char *cache = getenv("V4_CPU_TAIL_CACHE");
+    if (!preload || !atoi(preload) || !cache || !atoi(cache) ||
+        !store || !store->gpu || !store->state) return 0;
+    V4HotPolicy *policy = hot_find(store);
+    if (!policy) return 0;
+    V4ExpertStoreState *state = store->state;
+    int cpu_layers = 0;
+    for (int layer = 0; layer < state->layers; layer++) {
+        if (!hot_layer_on_gpu(store, layer)) cpu_layers++;
+        else if (!coli_v4_gpu_experts_resident(store, layer)) return 0;
+    }
+    if (!cpu_layers) return 0;
+    int reserve = policy->pin_count > state->pool_reserve_per_layer
+        ? policy->pin_count : state->pool_reserve_per_layer;
+    size_t required = (size_t)cpu_layers * state->experts_per_layer +
+                      (size_t)(state->layers - cpu_layers) * reserve;
+    size_t capacity = (size_t)state->layers * state->slots_per_layer;
+    if (required > capacity) {
+        fprintf(stderr, "v4_cpu_tail_preload skipped=cache-budget required=%zu capacity=%zu\n",
+                required, capacity);
+        return 0;
+    }
+    struct timespec started, ended;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    for (int layer = 0; layer < state->layers; layer++) {
+        if (hot_layer_on_gpu(store, layer)) continue;
+        for (int expert = 0; expert < state->experts_per_layer; expert++) {
+            ColiExpertView view;
+            if (coli_expert_lookup(store, (ColiExpertKey){layer, expert}, &view)) {
+                if (error && error_size) snprintf(error, error_size,
+                    "cannot preload CPU expert layer=%d expert=%d", layer, expert);
+                return -1;
+            }
+            coli_expert_release(store, &view);
+        }
+    }
+    size_t resident = 0;
+    pthread_mutex_lock(&state->mutex);
+    for (int layer = 0; layer < state->layers; layer++) {
+        if (hot_layer_on_gpu(store, layer)) continue;
+        for (int expert = 0; expert < state->experts_per_layer; expert++) {
+            V4ExpertSlot *slot = indexed_expert_slot(state, (ColiExpertKey){layer, expert});
+            if (slot && slot->slab && slot->expert == expert) resident++;
+        }
+    }
+    pthread_mutex_unlock(&state->mutex);
+    if (resident != (size_t)cpu_layers * state->experts_per_layer) {
+        if (error && error_size) snprintf(error, error_size,
+            "CPU expert preload exceeded protected cache capacity");
+        return -1;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &ended);
+    fprintf(stderr, "v4_cpu_tail_preload ready layers=%d experts=%zu seconds=%.3f\n",
+            cpu_layers, resident, (double)(ended.tv_sec - started.tv_sec) +
+            (ended.tv_nsec - started.tv_nsec) * 1e-9);
+    return 0;
+#endif
+}
 
 /* Let the layer currently sweeping a batched CPU prefill borrow the complete
  * cache capacity.  Slots retain an explicit logical owner and stay indexed, so
@@ -9567,6 +9643,7 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
         if (!on_stack) { free(selected); free(selection); free(scores); }
         return -1;
     }
+    #pragma omp parallel for schedule(static) if(experts >= 32 && dimension >= 128)
     for (int expert = 0; expert < experts; expert++) {
         float sum = 0.0f;
         const uint16_t *row = gate + (size_t)expert * dimension;
@@ -10000,6 +10077,7 @@ int coli_v4_engine_open(ColiV4Engine **output,
 #ifdef COLI_V4_GPU_TIER
     if (coli_v4_gpu_experts_init(engine, error, error_size)) goto fail;
     coli_v4_gpu_head_upload(engine);
+    if (coli_v4_expert_store_preload_cpu_tail(engine->experts, error, error_size)) goto fail;
 #endif
     *output = engine;
     return 0;
@@ -17286,7 +17364,33 @@ int coli_fp8_activation_qdq_ref(float *output, uint8_t *scales,
         uint8_t encoded_scale = (uint8_t)(scale_exponent + 127);
         float scale = coli_e8m0_decode(encoded_scale);
         scales[base / block_size] = encoded_scale;
-        for (size_t i = 0; i < count; i++) {
+        size_t i = 0;
+#ifdef __AVX2__
+        __m256 scale8 = _mm256_set1_ps(scale);
+        for (; i + 8 <= count; i += 8) {
+            __m256 normalized = _mm256_max_ps(_mm256_set1_ps(-448.0f),
+                _mm256_min_ps(_mm256_div_ps(_mm256_loadu_ps(input + base + i), scale8),
+                              _mm256_set1_ps(448.0f)));
+            __m256i bits = _mm256_castps_si256(normalized);
+            __m256i sign = _mm256_and_si256(bits, _mm256_set1_epi32((int)0x80000000u));
+            __m256i magnitude = _mm256_and_si256(bits, _mm256_set1_epi32(0x7fffffff));
+            __m256i rounded = _mm256_add_epi32(magnitude, _mm256_add_epi32(
+                _mm256_set1_epi32(0x7ffff),
+                _mm256_and_si256(_mm256_srli_epi32(magnitude, 20), _mm256_set1_epi32(1))));
+            __m256 normal = _mm256_castsi256_ps(_mm256_and_si256(rounded,
+                _mm256_set1_epi32((int)0xfff00000u)));
+            __m256 absolute = _mm256_castsi256_ps(magnitude);
+            __m256 subnormal = _mm256_mul_ps(_mm256_round_ps(
+                _mm256_mul_ps(absolute, _mm256_set1_ps(512.0f)),
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC), _mm256_set1_ps(1.0f / 512.0f));
+            __m256 quantized = _mm256_blendv_ps(normal, subnormal,
+                _mm256_cmp_ps(absolute, _mm256_set1_ps(0.015625f), _CMP_LT_OQ));
+            quantized = _mm256_castsi256_ps(_mm256_or_si256(
+                _mm256_castps_si256(quantized), sign));
+            _mm256_storeu_ps(output + base + i, _mm256_mul_ps(quantized, scale8));
+        }
+#endif
+        for (; i < count; i++) {
             float normalized = fmaxf(-448.0f,
                                      fminf(448.0f, input[base + i] / scale));
             output[base + i] = coli_e4m3fn_decode(
@@ -17907,6 +18011,31 @@ static int fp8_matvec_compute(float *output, const ColiTensorView *weight,
         }
         const uint8_t *data = weight->data;
         const float *scales = weight->scales;
+#ifdef __AVX512F__
+        if (rows % 16 == 0) {
+            #pragma omp parallel for schedule(static)
+            for (int64_t tile = 0; tile < weight->rows / 16; tile++) {
+                __m512 sum = _mm512_setzero_ps();
+                size_t scale_row = ((size_t)tile * 16) / 128;
+                const uint8_t *low = data + (size_t)tile * columns * 16;
+                const uint8_t *high = low + columns * 8;
+                for (size_t base = 0; base < columns; base += 128) {
+                    __m512 scale = _mm512_set1_ps(
+                        scales[scale_row * scale_columns + base / 128]);
+                    for (size_t column = base; column < base + 128; column++) {
+                        __m128i bytes = _mm_unpacklo_epi64(
+                            _mm_loadl_epi64((const __m128i *)(low + column * 8)),
+                            _mm_loadl_epi64((const __m128i *)(high + column * 8)));
+                        __m512 values = v4_fp8_decode16_bytes(bytes);
+                        sum = _mm512_add_ps(sum, _mm512_mul_ps(_mm512_mul_ps(
+                            _mm512_set1_ps(activation[column]), values), scale));
+                    }
+                }
+                _mm512_storeu_ps(output + (size_t)tile * 16, sum);
+            }
+            return 0;
+        }
+#endif
         #pragma omp parallel for schedule(static)
         for (int64_t tile = 0; tile < weight->rows / 8; tile++) {
             __m256 sum = _mm256_setzero_ps();
@@ -17918,8 +18047,7 @@ static int fp8_matvec_compute(float *output, const ColiTensorView *weight,
                     size_t column = base + offset;
                     __m128i bytes = _mm_loadl_epi64((const __m128i *)(data +
                         ((size_t)tile * columns + column) * 8));
-                    __m256i codes = _mm256_cvtepu8_epi32(bytes);
-                    __m256 values = v4_fp8_decode8(codes);
+                    __m256 values = v4_fp8_decode8_bytes(bytes);
                     __m256 x = _mm256_set1_ps(activation[column]);
                     sum = _mm256_add_ps(sum, _mm256_mul_ps(
                         _mm256_mul_ps(x, values), scale));
@@ -18093,6 +18221,38 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
         }
         const uint8_t *data_a = a->data, *data_b = b->data;
         const float *scales_a = a->scales, *scales_b = b->scales;
+#ifdef __AVX512F__
+        if (rows % 16 == 0) {
+            #pragma omp parallel for schedule(static)
+            for (int64_t tile = 0; tile < a->rows / 16; tile++) {
+                __m512 sum_a = _mm512_setzero_ps(), sum_b = _mm512_setzero_ps();
+                size_t scale_row = ((size_t)tile * 16) / 128;
+                const uint8_t *low_a = data_a + (size_t)tile * columns * 16;
+                const uint8_t *low_b = data_b + (size_t)tile * columns * 16;
+                for (size_t base = 0; base < columns; base += 128) {
+                    size_t scale_index = scale_row * scale_columns + base / 128;
+                    __m512 scale_a = _mm512_set1_ps(scales_a[scale_index]);
+                    __m512 scale_b = _mm512_set1_ps(scales_b[scale_index]);
+                    for (size_t column = base; column < base + 128; column++) {
+                        __m128i bytes_a = _mm_unpacklo_epi64(
+                            _mm_loadl_epi64((const __m128i *)(low_a + column * 8)),
+                            _mm_loadl_epi64((const __m128i *)(low_a + (columns + column) * 8)));
+                        __m128i bytes_b = _mm_unpacklo_epi64(
+                            _mm_loadl_epi64((const __m128i *)(low_b + column * 8)),
+                            _mm_loadl_epi64((const __m128i *)(low_b + (columns + column) * 8)));
+                        __m512 x = _mm512_set1_ps(activation[column]);
+                        sum_a = _mm512_add_ps(sum_a, _mm512_mul_ps(_mm512_mul_ps(x,
+                            v4_fp8_decode16_bytes(bytes_a)), scale_a));
+                        sum_b = _mm512_add_ps(sum_b, _mm512_mul_ps(_mm512_mul_ps(x,
+                            v4_fp8_decode16_bytes(bytes_b)), scale_b));
+                    }
+                }
+                _mm512_storeu_ps(output_a + (size_t)tile * 16, sum_a);
+                _mm512_storeu_ps(output_b + (size_t)tile * 16, sum_b);
+            }
+            return 0;
+        }
+#endif
         #pragma omp parallel for schedule(static)
         for (int64_t tile = 0; tile < a->rows / 8; tile++) {
             __m256 sum_a = _mm256_setzero_ps();
@@ -18105,12 +18265,10 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
                 for (size_t offset = 0; offset < 128; offset++) {
                     size_t column = base + offset;
                     size_t packed = ((size_t)tile * columns + column) * 8;
-                    __m256i codes_a = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                    __m256 values_a = v4_fp8_decode8_bytes(_mm_loadl_epi64(
                         (const __m128i *)(data_a + packed)));
-                    __m256i codes_b = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                    __m256 values_b = v4_fp8_decode8_bytes(_mm_loadl_epi64(
                         (const __m128i *)(data_b + packed)));
-                    __m256 values_a = v4_fp8_decode8(codes_a);
-                    __m256 values_b = v4_fp8_decode8(codes_b);
                     __m256 x = _mm256_set1_ps(activation[column]);
                     sum_a = _mm256_add_ps(sum_a, _mm256_mul_ps(
                         _mm256_mul_ps(x, values_a), scale_a));
@@ -18239,6 +18397,56 @@ static int fp8_batch_compute(float *outputs, const ColiTensorView *weight,
         }
         const uint8_t *data = weight->data;
         const float *scales = weight->scales;
+#ifdef __AVX512F__
+        if (batch == 1 && rows % 16 == 0) {
+            #pragma omp parallel for schedule(static)
+            for (int64_t tile = 0; tile < weight->rows / 16; tile++) {
+                __m512 sum = _mm512_setzero_ps();
+                size_t scale_row = ((size_t)tile * 16) / 128;
+                const uint8_t *low = data + (size_t)tile * columns * 16;
+                const uint8_t *high = low + columns * 8;
+                for (size_t base = 0; base < columns; base += 128) {
+                    __m512 scale = _mm512_set1_ps(
+                        scales[scale_row * scale_columns + base / 128]);
+                    for (size_t column = base; column < base + 128; column++) {
+                        __m128i bytes = _mm_unpacklo_epi64(
+                            _mm_loadl_epi64((const __m128i *)(low + column * 8)),
+                            _mm_loadl_epi64((const __m128i *)(high + column * 8)));
+                        __m512 values = _mm512_mul_ps(
+                            v4_fp8_decode16_bytes(bytes), scale);
+                        sum = _mm512_add_ps(sum, _mm512_mul_ps(
+                            _mm512_set1_ps(activations[column]), values));
+                    }
+                }
+                _mm512_storeu_ps(outputs + (size_t)tile * 16, sum);
+            }
+            return 0;
+        }
+#endif
+        /* Keep the decode accumulator in a register instead of indexing the
+         * runtime batch array in the OpenMP worker. Preserve batch arithmetic. */
+        if (batch == 1) {
+            #pragma omp parallel for schedule(static)
+            for (int64_t tile = 0; tile < weight->rows / 8; tile++) {
+                __m256 sum = _mm256_setzero_ps();
+                size_t scale_row = ((size_t)tile * 8) / 128;
+                for (size_t base = 0; base < columns; base += 128) {
+                    __m256 scale = _mm256_set1_ps(
+                        scales[scale_row * scale_columns + base / 128]);
+                    for (size_t offset = 0; offset < 128; offset++) {
+                        size_t column = base + offset;
+                        __m128i bytes = _mm_loadl_epi64((const __m128i *)(data +
+                            ((size_t)tile * columns + column) * 8));
+                        __m256 values = _mm256_mul_ps(
+                            v4_fp8_decode8_bytes(bytes), scale);
+                        sum = _mm256_add_ps(sum, _mm256_mul_ps(
+                            _mm256_set1_ps(activations[column]), values));
+                    }
+                }
+                _mm256_storeu_ps(outputs + (size_t)tile * 8, sum);
+            }
+            return 0;
+        }
         #pragma omp parallel for schedule(static)
         for (int64_t tile = 0; tile < weight->rows / 8; tile++) {
             __m256 sums[128];
@@ -18252,9 +18460,8 @@ static int fp8_batch_compute(float *outputs, const ColiTensorView *weight,
                     size_t column = base + offset;
                     __m128i bytes = _mm_loadl_epi64((const __m128i *)(data +
                         ((size_t)tile * columns + column) * 8));
-                    __m256i codes = _mm256_cvtepu8_epi32(bytes);
                     __m256 values = _mm256_mul_ps(
-                        v4_fp8_decode8(codes), scale);
+                        v4_fp8_decode8_bytes(bytes), scale);
                     for (int item = 0; item < batch; item++) {
                         __m256 x = _mm256_set1_ps(
                             activations[(size_t)item * columns + column]);
@@ -18273,6 +18480,48 @@ static int fp8_batch_compute(float *outputs, const ColiTensorView *weight,
     matmul_fp8(outputs, activations, weight->data, weight->scales,
                batch, (int)columns, (int)rows);
     return 0;
+}
+
+/* Grouped wo_a has independent input slices. One team spans every group,
+ * avoiding a separate small OpenMP launch for each output projection. */
+int coli_fp8_grouped_matvec_ref(float *outputs, const ColiTensorView *weight,
+                                const float *inputs, int groups) {
+#ifndef __AVX512F__
+    (void)outputs; (void)weight; (void)inputs; (void)groups;
+    return -1;
+#else
+    if (!outputs || !inputs || groups < 1 || fp8_batch_validate(weight, 1) ||
+        weight->block_rows != 8 || weight->rows % groups ||
+        (weight->rows / groups) % 128) return -1;
+    size_t columns = (size_t)weight->columns, group_rows = (size_t)weight->rows / groups;
+    size_t scale_columns = columns / 128;
+    float *activations; uint8_t *activation_scales;
+    if (coli_v4_qdq_scratch((size_t)groups * columns, (size_t)groups * scale_columns,
+                            &activations, &activation_scales) ||
+        coli_fp8_activation_qdq_ref(activations, activation_scales, inputs,
+                                     (size_t)groups * columns, 128)) return -1;
+    const uint8_t *data = weight->data;
+    const float *scales = weight->scales;
+    #pragma omp parallel for schedule(static)
+    for (int64_t tile = 0; tile < weight->rows / 16; tile++) {
+        size_t row = (size_t)tile * 16;
+        const float *input = activations + (row / group_rows) * columns;
+        const uint8_t *low = data + row * columns, *high = low + columns * 8;
+        __m512 sum = _mm512_setzero_ps();
+        for (size_t base = 0; base < columns; base += 128) {
+            __m512 scale = _mm512_set1_ps(scales[(row / 128) * scale_columns + base / 128]);
+            for (size_t column = base; column < base + 128; column++) {
+                __m128i bytes = _mm_unpacklo_epi64(
+                    _mm_loadl_epi64((const __m128i *)(low + column * 8)),
+                    _mm_loadl_epi64((const __m128i *)(high + column * 8)));
+                __m512 values = _mm512_mul_ps(v4_fp8_decode16_bytes(bytes), scale);
+                sum = _mm512_add_ps(sum, _mm512_mul_ps(_mm512_set1_ps(input[column]), values));
+            }
+        }
+        _mm512_storeu_ps(outputs + row, sum);
+    }
+    return 0;
+#endif
 }
 
 int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,

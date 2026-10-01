@@ -171,6 +171,10 @@ int coli_v4_route(float *weights, int *indices, const float *hidden,
                   const float *gate, const float *bias,
                   const int *forced_indices, int experts, int dimension,
                   int topk, float route_scale);
+int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
+                       const uint16_t *gate, const float *bias,
+                       const int *forced_indices, int experts, int dimension,
+                       int topk, float route_scale);
 
 int coli_v4_swiglu(float *output, const float *gate, const float *up,
                    int dimension, float limit);
@@ -638,6 +642,8 @@ int coli_deepseek_v4_expert_store_open_base(
  * a negative value restores ordinary per-layer miss allocation for decode.
  * Alternative registered ExpertStore backends safely ignore the request. */
 void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer);
+int coli_v4_expert_store_preload_cpu_tail(ColiExpertStore *store,
+                                         char *error, size_t error_size);
 
 #ifdef __cplusplus
 }

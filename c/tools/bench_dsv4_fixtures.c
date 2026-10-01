@@ -6,11 +6,27 @@
 #include "../backend_cuda_dsv4.h"
 #endif
 
-typedef struct { int ids[512], count; } Tokens;
+extern double coli_v4_expert_store_disk_sec(ColiExpertStore *);
+extern double coli_v4_expert_store_matmul_sec(ColiExpertStore *);
+typedef struct {
+    int ids[512], count;
+    ColiV4Engine *engine;
+    double disk_s, matmul_s, block_s, head_s;
+    ColiExpertStoreStats store;
+} Tokens;
+static void snapshot(Tokens *t) {
+    t->disk_s = coli_v4_expert_store_disk_sec(t->engine->experts);
+    t->matmul_s = coli_v4_expert_store_matmul_sec(t->engine->experts);
+    t->block_s = g_v4_prof_block_s;
+    t->head_s = g_v4_prof_head_s;
+    if (t->engine->experts && t->engine->experts->ops->stats)
+        t->engine->experts->ops->stats(t->engine->experts, &t->store);
+}
 static int record(void *data, int token, float logit, int position, int ordinal) {
     (void)logit; (void)position; (void)ordinal;
     Tokens *t = data;
     if (t->count == 512) return 1;
+    if (!t->count && t->engine) snapshot(t);
     t->ids[t->count++] = token;
     return 0;
 }
@@ -41,7 +57,7 @@ int main(int argc, char **argv) {
         fprintf(stderr,"open: %s\n",error); return 1;
     }
     if (getenv("BENCH_WARMUP")) {
-        ColiV4Session *session=NULL; Tokens tokens={0};
+        ColiV4Session *session=NULL; Tokens tokens={.engine=engine};
         ColiV4SessionCreateOptions create={.max_prompt_tokens=512,.max_new_tokens_cap=16};
         ColiV4SessionGenerateOptions generate={.max_new_tokens=16,.no_dspark=*modes=='t'};
         ColiV4SessionGenerateStats stats={0};
@@ -58,7 +74,7 @@ int main(int argc, char **argv) {
             double batch_start=spec_now(); int total=0;
             for (int i=0; !result && i<count; i++) {
                 for (int k=0;k<V4_DSPARK_BLOCK;k++) g_v4ds_core.accept_ewma[k]=0.5;
-                ColiV4Session *session=NULL; Tokens tokens={0};
+                ColiV4Session *session=NULL; Tokens tokens={.engine=engine};
                 ColiV4SessionCreateOptions create={.max_prompt_tokens=512,.max_new_tokens_cap=maximum};
                 ColiV4SessionGenerateOptions generate={.max_new_tokens=maximum,.no_dspark=mode=='t'};
                 ColiV4SessionGenerateStats stats={0};
@@ -74,6 +90,14 @@ int main(int argc, char **argv) {
                 if(profile)dsv4_cuda_profiler_stop();
 #endif
                 double wall=spec_now()-start;
+                Tokens end={.engine=engine}; snapshot(&end);
+                fprintf(stderr, "decode_profile round=%d fixture=%d disk_s=%.9f matmul_s=%.9f block_s=%.9f head_s=%.9f requests=%llu hits=%llu misses=%llu bytes=%llu\n",
+                    round, i, end.disk_s-tokens.disk_s, end.matmul_s-tokens.matmul_s,
+                    end.block_s-tokens.block_s, end.head_s-tokens.head_s,
+                    (unsigned long long)(end.store.requests-tokens.store.requests),
+                    (unsigned long long)(end.store.hits-tokens.store.hits),
+                    (unsigned long long)(end.store.misses-tokens.store.misses),
+                    (unsigned long long)(end.store.bytes_read-tokens.store.bytes_read));
                 Tokens *ref=&refs[mode=='t' ? 0 : 1][i];
                 if (!ref->count) *ref=tokens;
                 int exact=tokens.count==ref->count && !memcmp(tokens.ids,ref->ids,(size_t)tokens.count*sizeof(int));
