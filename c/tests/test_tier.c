@@ -27,6 +27,37 @@ int main(void){
     int live[2]={0,1};
     if(!tier_pick_lfru(freq,last,100,5,live,2,&slot,&eid,&gain)) return fail("LFRU promotion");
     if(slot!=0||eid!=4) return fail("LFRU did not prefer recent ties");
+
+    /* Phase 3 demand-eviction policy: the LRU key is the slot's `used` clock,
+     * verbatim; the LFRU key is the hand-computed score (heat<<8 | recent,
+     * recent = 255 - age clamped); auto switches at cap 12/13; unknown
+     * policies fall back to lru. */
+    if(tier_demand_victim_key(TIER_DEMAND_LRU,8,7,90,100,42)!=42)
+        return fail("lru demand key is not the used clock");
+    if(tier_demand_lfru_score(3,90,100)!=(((uint64_t)3<<8)|245))
+        return fail("LFRU demand score (age 10 -> recent 245)");
+    if(tier_demand_victim_key(TIER_DEMAND_LFRU,8,3,90,100,42)!=(((uint64_t)3<<8)|245))
+        return fail("LFRU demand key is not the hand-computed score");
+    if(tier_demand_lfru_score(0,200,100)!=255)
+        return fail("last_access in the future must clamp age to 0");
+    if(tier_demand_lfru_score(1,0,255)!=((uint64_t)1<<8))
+        return fail("age >= 255 must contribute no recency");
+    if(tier_demand_victim_key(TIER_DEMAND_AUTO,12,3,90,100,42)!=(((uint64_t)3<<8)|245))
+        return fail("auto at cap 12 must use LFRU");
+    if(tier_demand_victim_key(TIER_DEMAND_AUTO,13,3,90,100,42)!=42)
+        return fail("auto at cap 13 must use LRU");
+    if(tier_demand_use_lfru(7,8) || tier_demand_victim_key(7,8,3,90,100,42)!=42)
+        return fail("unknown policy must fall back to lru");
+#if defined(__unix__) || defined(__APPLE__)
+    setenv("DEMAND_POLICY","lfru",1);
+    if(tier_demand_policy_env()!=TIER_DEMAND_LFRU) return fail("DEMAND_POLICY=lfru not parsed");
+    setenv("DEMAND_POLICY","auto",1);
+    if(tier_demand_policy_env()!=TIER_DEMAND_AUTO) return fail("DEMAND_POLICY=auto not parsed");
+    setenv("DEMAND_POLICY","bogus",1);
+    if(tier_demand_policy_env()!=TIER_DEMAND_LRU) return fail("unknown DEMAND_POLICY must fall back to lru");
+    unsetenv("DEMAND_POLICY");
+    if(tier_demand_policy_env()!=TIER_DEMAND_LRU) return fail("unset DEMAND_POLICY must default to lru");
+#endif
     puts("tier tests: ok");
     return 0;
 }

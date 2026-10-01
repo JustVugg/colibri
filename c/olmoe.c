@@ -18,6 +18,31 @@
  *   PILOT_EVICT_GUARD=0/1 : 1=enable LFRU prefetch eviction guard (default), 0=disable
  *   EXPERT_DROP=0/1: 1=fadvise(DONTNEED) after each expert read (old behaviour,
  *                    for RAM-tight boxes); 0=keep pages cached (default)
+ *   DEMAND_POLICY=lru|lfru|auto : demand-eviction victim ranking (default lru,
+ *                    the legacy behaviour).  lfru = frequency-primary LFRU score
+ *                    inside each victim tier; auto = lfru when cap<=12, else
+ *                    lru (see model_init_range for the replay evidence).  Policy
+ *                    only: routing, weights and math are untouched.
+ *   ALIGN_SLOTS=0/1: 1=allocate slot weight blocks 2 MiB-aligned (default 0,
+ *                    plain malloc).  Staging only: bytes and math unchanged.
+ *   PILOT_WORKERS=N: 1..8 pilot loader threads over the SPMC pilot ring
+ *                    (default 1 = the historic single loader, byte-identical).
+ *                    >1 pipelines N concurrent expert preads; each worker
+ *                    claims a unique ring index with fetch_add and never runs
+ *                    past pilot_w.  I/O scheduling only.
+ *   EXPERT_DIRECT=0/1: 1=read the expert merged_weight bytes through the
+ *                    shard's no-cache twin fd (O_DIRECT on Linux, F_NOCACHE on
+ *                    macOS, NO_BUFFERING on Windows) with an aligned bounce
+ *                    buffer; falls back to the buffered read whenever no twin
+ *                    exists or the transfer cannot be aligned.  Scales stay
+ *                    buffered.  I/O path only: the bytes read are identical.
+ *   GROUP_EVICT=0/1: 1=co-routing group eviction: a per-layer E*E uint16
+ *                    co-occurrence table (updated on decode routing) adds a
+ *                    bounded affinity term to the demand victim key, so an
+ *                    expert that co-routes with other resident experts is a
+ *                    less attractive victim.  Allocated only when enabled
+ *                    (16x64 -> 128 KB; refused above 8 MB or E>512).
+ *                    Eviction policy only: never routing, weights or math.
  *   ROUTE_TRACE=<path>: log every routing decision (one line per moe call,
  *                    position and layer: "<call> <row> <layer> <id>:<gate> ...")
  *                    for offline analysis — tools/route_pairs.py,
@@ -43,6 +68,7 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"                    /* shared routing telemetry (#700) */
+#include "tier.h"                           /* Phase 1 temporal-locality guards */
 #include "kv_prefix.h"
 #include "pin_pool.h"                       /* piu scatti annidati */   /* riuso del prefisso tra turni (shared) */
 #include "serve_codec.h"
@@ -57,6 +83,10 @@
 #include "edge_adapters.h"
 #include "tok.h"
 #include "edge_tok_internal.h"
+#endif
+#ifdef COLI_ENGINE_ADAPTER
+#include "engine.h"
+#include <limits.h>   /* INT_MAX: clamp token/text counts to int */
 #endif
 
 #ifdef _WIN32
@@ -130,6 +160,34 @@ typedef struct {
     uint8_t *is_queued;     /* [n_layers * n_experts], 1 if expert is currently in the prefetch queue */
     float pilot_conf_limit; /* CONF_LIMIT env: cumulative gate probability threshold (e.g. 0.92) */
     uint64_t *last_access;  /* [n_layers * n_experts], clock time when expert was last accessed */
+    /* Phase 1 memory tiering: temporal-locality guards (RECENT_RING /
+     * RECENT_BLOOM env).  Eviction policy only: they make recently-routed
+     * experts less attractive victims, never touch routing or math. */
+    TierRecent recent;
+    int recent_ring, recent_bloom;  /* env flags; both 0 = guards off */
+    /* Phase 2 memory tiering: inter-layer routing transition chains (MARKOV
+     * env).  Staging only: the table predicts which experts layer L+1 routes
+     * right after layer L's routing is known, and the PILOT worker stages
+     * those reads.  It never touches routing, weights, logits or KV. */
+    TierMarkov markov;
+    uint8_t *route_bits;    /* [(n_experts+7)/8] routed set of the last completed moe() */
+    int route_layer;        /* layer that routed route_bits; -1 = none yet */
+    int markov_on;          /* MARKOV=1: table live */
+    int markov_top;         /* MARKOV_TOP: successors per routed expert (default 2) */
+    int markov_stats;       /* MARKOV_STATS=1: accuracy counters (measurement only) */
+    int markov_next_decay;  /* token_count threshold for the next decay */
+    uint8_t *markov_cand;   /* [n_layers * ((E+7)/8)] staged-candidate bitmap (stats) */
+    uint64_t *markov_hit;   /* [n_layers] staged candidates later routed (stats) */
+    uint64_t *markov_total; /* [n_layers] staged candidates evaluated (stats) */
+    /* Phase 3a tier caching: demand-eviction policy and slot alignment.  Both
+     * are policy/staging only — they never touch routing, weights or math. */
+    int demand_policy;      /* DEMAND_LRU (default) / DEMAND_LFRU / DEMAND_AUTO */
+    int align_slots;        /* ALIGN_SLOTS=1: 2 MiB-aligned slot weight blocks */
+    /* Phase 3b tier caching: direct expert I/O and co-routing group eviction.
+     * Same contract as 3a: I/O path / eviction policy only. */
+    int expert_direct;      /* EXPERT_DIRECT=1: read weights via no-cache twin fd */
+    int group_evict;        /* GROUP_EVICT=1: co-routing table live */
+    uint16_t *coc;          /* [n_layers * E * E] co-routing counts, saturating */
 } Model;
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -138,6 +196,9 @@ static struct { int l, e; } pilot_q[4096];
 static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
 static int g_pilot = 0;
+/* PILOT_WORKERS: SPMC pilot-loader fan-out (1 = the historic single loader).
+ * Parsed in model_init_range, clamped to [1,8]. */
+static int g_pilot_nw = 1;
 static int g_wide  = 1;  /* IMPROVEMENT 4: top-K * g_wide candidates prefetched */
 static int g_pilot_evict_guard = 1; /* PILOT_EVICT_GUARD=0 to disable LFRU prefetch eviction guard */
 static int g_expert_drop = 0;       /* EXPERT_DROP=1 restores fadvise(DONTNEED) after expert reads */
@@ -146,16 +207,77 @@ static int g_fused3 = 0;            /* FUSED3=1: AVX2 activation quant + gate/up
                                      * matmul_q_idot_pair_v3). Exact integer arithmetic only —
                                      * bit-identical to the stock matmul_q path; OFF by default. */
 
+/* Phase 3a demand-eviction policy (DEMAND_POLICY env): victim ranking only,
+ * it never changes routing, weights or math. */
+#define DEMAND_LRU  0   /* default: min `used` clock inside each tier (legacy) */
+#define DEMAND_LFRU 1   /* min LFRU score inside each tier */
+#define DEMAND_AUTO 2   /* lfru when cap <= 12, lru above (per layer) */
+
 static uint64_t lfru_score(uint32_t heat, uint64_t last, uint64_t clock) {
     uint64_t age = (clock > last) ? (clock - last) : 0;
     uint64_t recent = (age < 255) ? (255 - age) : 0;
     return ((uint64_t)heat << 8) | recent;
 }
 
+/* Ranking key for a victim inside one victim-scan tier: the smallest key wins.
+ * Delegates to tier.h's shared demand policy (Phase 3 backport): LRU returns
+ * the `used` clock, so the comparison is bit-identical to the legacy scan;
+ * LFRU returns tier_demand_lfru_score(freq, last_access, clock) — the same
+ * score this engine shipped in Phase 3a, verbatim.  Callers only pass slots
+ * that already cleared the tier's pinned/in-flight/recent filters (eid >= 0)
+ * and only with use_lfru after the freq/last_access NULL-guard in expert_get,
+ * so the arrays are non-NULL exactly when the LFRU branch runs. */
+static uint64_t demand_victim_key(Model *m, int layer, const Slot *s, int use_lfru) {
+    return tier_demand_victim_key(use_lfru ? TIER_DEMAND_LFRU : TIER_DEMAND_LRU,
+                                  m->cache[layer].cap,
+                                  use_lfru ? m->freq[layer][s->eid] : 0,
+                                  use_lfru ? m->last_access[layer * m->c.n_experts + s->eid] : 0,
+                                  m->clock, s->used);
+}
+
+/* Phase 3b GROUP_EVICT: co-routing affinity of a victim candidate.  Sums the
+ * same-layer co-occurrence counts between the candidate's expert and every
+ * OTHER resident expert of that layer's cache, scales them to heat units
+ * (>>6), clamps at 64 and shifts into score units (<<8) so the term composes
+ * with demand_victim_key's units.  GROUP_EVICT=0, no table, or a non-resident
+ * candidate returns 0: the victim key is then bit-identical to today.
+ * Called only from the demand victim scan (under g_pilot_mx), so it may read
+ * the slot array; O(cap) per candidate, O(cap^2) per eviction (64 ops at
+ * cap=8). */
+static uint64_t group_affinity_score(Model *m, int layer, const Slot *s) {
+    if (!m->group_evict || !m->coc) return 0;
+    int E = m->c.n_experts;
+    if (layer < 0 || layer >= m->c.n_layers || s->eid < 0 || s->eid >= E) return 0;
+    const uint16_t *row = m->coc + ((size_t)layer * E + s->eid) * E;
+    const LCache *lc = &m->cache[layer];
+    uint64_t sum = 0;
+    for (int j = 0; j < lc->n; j++) {
+        int e2 = lc->slots[j].eid;
+        if (e2 < 0 || e2 >= E || e2 == s->eid) continue;
+        sum += row[e2];
+    }
+    uint64_t heat = sum >> 6;
+    if (heat > 64) heat = 64;
+    return heat << 8;
+}
+
+/* Composite victim key: the base demand key plus the affinity term, with the
+ * base returned separately so callers can break composite ties by the existing
+ * key.  With GROUP_EVICT=0 the affinity term is 0 and composite == base. */
+static uint64_t demand_victim_key2(Model *m, int layer, const Slot *s,
+                                   int use_lfru, uint64_t *base_out) {
+    uint64_t base = demand_victim_key(m, layer, s, use_lfru);
+    if (base_out) *base_out = base;
+    return base + group_affinity_score(m, layer, s);
+}
+
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
 static void *pilot_worker(void *arg);
 static void ensure_pilot_worker_started(Model *m);
 static void slot_ensure_allocated(Model *m, Slot *s);
+static int pilot_enqueue(Model *m, int layer, int eid);
+static void markov_prefetch(Model *m, int layer_done);
+static void markov_stats_eval(Model *m, int layer, const int *idx, int K);
 
 #ifdef COLI_CACHE_INDEX_TEST
 static uint64_t g_slot_index_probes;
@@ -219,15 +341,151 @@ static int slot_in_flight(Model *m, int layer, int eid) {
     return i >= 0 && i < lc->n && lc->slots[i].eid == -(eid + 2);
 }
 
+/* Queue one speculative expert read unless it is already resident or queued.
+ * This is exactly the insertion block that used to live inline in
+ * pilot_prefetch(): same slot_indexed / is_queued checks, same 4096-entry
+ * bound, no double-enqueue, and a full queue drops the entry (never blocks).
+ * Callers hold no locks.  Returns 1 when the entry was pushed onto pilot_q. */
+static int pilot_enqueue(Model *m, int layer, int eid) {
+    Cfg *c = &m->c; int E = c->n_experts;
+    if (layer < 0 || layer >= c->n_layers || eid < 0 || eid >= E) return 0;
+    int found = 0;
+    pthread_mutex_lock(&g_pilot_mx);
+    found = slot_indexed(m, layer, eid) != NULL;
+    pthread_mutex_unlock(&g_pilot_mx);
+    if (found) return 0;
+    int gidx = layer * E + eid;
+    pthread_mutex_lock(&g_pilot_mx);
+    int already_queued = m->is_queued[gidx];
+    if (!already_queued) m->is_queued[gidx] = 1;
+    pthread_mutex_unlock(&g_pilot_mx);
+    if (already_queued) return 0;
+    unsigned w2 = __atomic_load_n(&pilot_w, __ATOMIC_RELAXED);
+    unsigned r2 = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
+    if (w2 - r2 < 4096) {
+        pilot_q[w2 & 4095].l = layer;
+        pilot_q[w2 & 4095].e = eid;
+        __atomic_store_n(&pilot_w, w2 + 1, __ATOMIC_RELEASE);
+        return 1;
+    }
+    pthread_mutex_lock(&g_pilot_mx);
+    m->is_queued[gidx] = 0;
+    pthread_mutex_unlock(&g_pilot_mx);
+    return 0;
+}
+
+/* MARKOV_STATS: for every candidate markov_prefetch() staged for this layer
+ * during this token, count whether moe() actually routed it, then clear the
+ * layer's staging bits.  Measurement only: reads idx[], touches no routing. */
+static void markov_stats_eval(Model *m, int layer, const int *idx, int K) {
+    if (!m->markov_cand) return;
+    int E = m->c.n_experts, w = (E + 7) / 8;
+    uint8_t *bits = m->markov_cand + (size_t)layer * w;
+    for (int i = 0; i < w; i++) {
+        unsigned b = bits[i];
+        while (b) {
+            int bit = 0;
+#if defined(__GNUC__) || defined(__clang__)
+            bit = __builtin_ctz(b);
+#else
+            { unsigned t = b; while (!(t & 1u)) { t >>= 1; bit++; } }
+#endif
+            int e = (i << 3) | bit;
+            b &= b - 1;
+            if (e >= E) continue;
+            int routed = 0;
+            for (int kk = 0; kk < K; kk++) if (idx[kk] == e) { routed = 1; break; }
+            m->markov_total[layer]++;
+            if (routed) m->markov_hit[layer]++;
+        }
+    }
+    memset(bits, 0, (size_t)w);
+}
+
+/* Phase 2 memory tiering: stage the Markov-predicted successor reads the
+ * moment layer_done's routing is known.  For every expert routed at
+ * layer_done (route_bits, just set by moe()), enqueue up to markov_top
+ * predicted successors for layer_done+1, then one chained step: for each of
+ * those successors, the single best successor into layer_done+2.  Queue
+ * staging only: pilot_enqueue drops duplicates and never blocks. */
+static void markov_prefetch(Model *m, int layer_done) {
+    if (!m->markov_on || g_pilot <= 0 || !m->route_bits) return;
+    Cfg *c = &m->c; int E = c->n_experts;
+    if (layer_done < 0 || layer_done >= c->n_layers) return;
+    if (m->route_layer != layer_done) return;      /* route_bits is stale */
+    if (layer_done + 1 >= c->n_layers) return;     /* nothing after the last layer */
+    int top = m->markov_top;
+    if (top < 1) top = 1;
+    if (top > TIER_MARKOV_TOP_MAX) top = TIER_MARKOV_TOP_MAX;
+    int succ[TIER_MARKOV_TOP_MAX];
+    for (int e = 0; e < E; e++) {
+        if (!(m->route_bits[e >> 3] & (1u << (e & 7)))) continue;
+        int n = tier_markov_top(&m->markov, layer_done + 1, e, succ, top);
+        for (int j = 0; j < n; j++) {
+            int e2 = succ[j];
+            if (pilot_enqueue(m, layer_done + 1, e2)) {
+                if (m->markov_stats && m->markov_cand) {
+                    size_t w = ((size_t)E + 7) / 8;
+                    m->markov_cand[(size_t)(layer_done + 1) * w + (size_t)(e2 >> 3)] |=
+                        (uint8_t)(1u << (e2 & 7));
+                }
+            }
+            if (layer_done + 2 < c->n_layers) {
+                int e3[1];
+                if (tier_markov_top(&m->markov, layer_done + 2, e2, e3, 1) == 1 &&
+                    pilot_enqueue(m, layer_done + 2, e3[0])) {
+                    if (m->markov_stats && m->markov_cand) {
+                        size_t w = ((size_t)E + 7) / 8;
+                        m->markov_cand[(size_t)(layer_done + 2) * w +
+                                       (size_t)(e3[0] >> 3)] |=
+                            (uint8_t)(1u << (e3[0] & 7));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* MARKOV_STATS: one per-layer accuracy summary for the standalone harness,
+ * printed after generate().  "Staged" counts candidates markov_prefetch()
+ * actually enqueued for that layer; "routed" counts those moe() later routed
+ * in the same token.  Measurement only: reads counters, never routing. */
+static void markov_stats_report(const Model *m) {
+    if (!m || !m->markov_stats || !m->markov_total) return;
+    uint64_t th = 0, tt = 0;
+    for (int l = 0; l < m->c.n_layers; l++) {
+        th += m->markov_hit[l]; tt += m->markov_total[l];
+    }
+    fprintf(stderr, "[MARKOV] staged candidates: %llu, later routed: %llu (%.1f%%)\n",
+            (unsigned long long)tt, (unsigned long long)th,
+            tt ? 100.0 * (double)th / (double)tt : 0.0);
+    for (int l = 0; l < m->c.n_layers; l++) {
+        if (!m->markov_total[l]) continue;
+        fprintf(stderr, "[MARKOV]   layer %2d: staged %6llu, routed %6llu (%.1f%%)\n",
+                l, (unsigned long long)m->markov_total[l],
+                (unsigned long long)m->markov_hit[l],
+                100.0 * (double)m->markov_hit[l] / (double)m->markov_total[l]);
+    }
+}
+
 static void ensure_pilot_worker_started(Model *m) {
     if (!pilot_m) {
         pilot_m = m;
-        pthread_t t;
-        if (pthread_create(&t, NULL, pilot_worker, NULL) != 0) {
-            fprintf(stderr, "Error: Failed to create pilot prefetch worker thread\n");
-            exit(1);
+        int nw = g_pilot_nw;
+        if (nw < 1) nw = 1;
+        if (nw > 8) nw = 8;
+        for (int i = 0; i < nw; i++) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, pilot_worker, NULL) != 0) {
+                fprintf(stderr, "Error: Failed to create pilot prefetch worker thread\n");
+                exit(1);
+            }
+            pthread_detach(t);
         }
-        pthread_detach(t);
+        /* Banner only when the fan-out is active: PILOT_WORKERS=1 stays
+         * silent, exactly as before. */
+        if (nw > 1)
+            fprintf(stderr, "[PILOT] %d loader threads (PILOT_WORKERS)\n", nw);
     }
 }
 
@@ -621,6 +879,140 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     float cl = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
     if (cl < 0.1f) cl = 0.1f; if (cl > 1.0f) cl = 1.0f;
     m->pilot_conf_limit = cl;
+    /* Phase 1 memory tiering: temporal-locality guards.  Off by default; when
+     * off, nothing is allocated and every guard accessor returns "not
+     * protected", so eviction behaves byte-identically to before.  Allocation
+     * happens once here, never in the hot paths. */
+    m->recent_ring  = getenv("RECENT_RING")  ? atoi(getenv("RECENT_RING"))  : 0;
+    m->recent_bloom = getenv("RECENT_BLOOM") ? atoi(getenv("RECENT_BLOOM")) : 0;
+    if (m->recent_ring || m->recent_bloom) {
+        int bloom_window = getenv("BLOOM_WINDOW") ? atoi(getenv("BLOOM_WINDOW")) : 64;
+        if (bloom_window < 1) bloom_window = 64;
+        if (tier_recent_init(&m->recent, c->n_layers, c->n_experts,
+                             m->recent_ring  ? TIER_RECENT_DEPTH : 0,
+                             m->recent_bloom ? bloom_window : 0) != 0) {
+            fprintf(stderr, "OOM allocating recent-routing guards\n");
+            exit(1);
+        }
+        const char *rb = getenv("RECENT_BONUS");
+        m->recent.bonus = rb ? strtoull(rb, NULL, 10) : 1;
+    }
+    /* Phase 2 memory tiering: inter-layer routing transition chains (MARKOV).
+     * Off by default: no table, no route_bits, and the PILOT prefetch path is
+     * byte-identical to before.  MARKOV=1 allocates (n_layers-1)*E*E uint16
+     * counters — 122,880 bytes for OLMoE 16x64 — and refuses (stays off)
+     * above the 8 MB cap or E > 512, so small-RAM budgets are honoured.
+     * MARKOV_TOP caps successors per routed expert (default 2, clamp 1..8);
+     * MARKOV_DECAY=N halves the table every N tokens (default 512; 0 = never);
+     * MARKOV_STATS=1 adds measurement-only accuracy counters. */
+    m->markov_on    = getenv("MARKOV") ? atoi(getenv("MARKOV")) : 0;
+    m->markov_top   = getenv("MARKOV_TOP") ? atoi(getenv("MARKOV_TOP")) : 2;
+    if (m->markov_top < 1) m->markov_top = 1;
+    if (m->markov_top > TIER_MARKOV_TOP_MAX) m->markov_top = TIER_MARKOV_TOP_MAX;
+    m->markov_stats = getenv("MARKOV_STATS") ? atoi(getenv("MARKOV_STATS")) : 0;
+    m->route_layer  = -1;
+    if (m->markov_on) {
+        int decay_every = getenv("MARKOV_DECAY") ? atoi(getenv("MARKOV_DECAY")) : 512;
+        if (decay_every < 0) decay_every = 0;
+        if (tier_markov_init(&m->markov, c->n_layers, c->n_experts, decay_every) != 0) {
+            fprintf(stderr, "[MARKOV] disabled: (n_layers-1)*E*E=%lld entries "
+                            "exceeds the %zu-entry cap or E=%d > %d\n",
+                    (long long)((int64_t)(c->n_layers - 1) * c->n_experts * c->n_experts),
+                    TIER_MARKOV_MAX_ENTRIES, c->n_experts, TIER_MARKOV_MAX_EXPERTS);
+            m->markov_on = 0;
+        } else {
+            size_t rbytes = ((size_t)c->n_experts + 7) / 8;
+            m->route_bits = calloc(rbytes, 1);
+            if (!m->route_bits) {
+                fprintf(stderr, "[MARKOV] disabled: OOM route_bits\n");
+                tier_markov_free(&m->markov);
+                m->markov_on = 0;
+            } else if (m->markov_stats) {
+                m->markov_cand  = calloc((size_t)c->n_layers * rbytes, 1);
+                m->markov_hit   = calloc((size_t)c->n_layers, sizeof(uint64_t));
+                m->markov_total = calloc((size_t)c->n_layers, sizeof(uint64_t));
+                if (!m->markov_cand || !m->markov_hit || !m->markov_total) {
+                    fprintf(stderr, "[MARKOV] stats disabled: OOM counters\n");
+                    free(m->markov_cand); free(m->markov_hit); free(m->markov_total);
+                    m->markov_cand = NULL; m->markov_hit = NULL; m->markov_total = NULL;
+                    m->markov_stats = 0;
+                }
+            }
+            if (m->markov_on) {
+                m->markov_next_decay = m->markov.decay_every;
+                fprintf(stderr, "[MARKOV] enabled: %d layers x %d experts, top=%d, "
+                                "decay=%d tokens, table %.1f KB%s\n",
+                        c->n_layers, c->n_experts, m->markov_top,
+                        m->markov.decay_every,
+                        (double)((int64_t)(c->n_layers - 1) * c->n_experts *
+                                 c->n_experts) * 2.0 / 1024.0,
+                        m->markov_stats ? ", stats on" : "");
+            }
+        }
+    }
+    /* Phase 3a: demand-eviction policy.  lru keeps the legacy victim ranking by
+     * the `used` clock (default).  lfru ranks victims by the frequency-primary
+     * LFRU score inside each tier.  auto = lfru when cap <= 12, lru above: the
+     * offline replay of the real route200.txt routing shows LFRU +5.0pp over
+     * LRU at cap 8, but -3.2..-4.1pp at cap 16/24/32 — frequency-primary only
+     * wins for very small caches.  Unknown values fall back to lru, and a NULL
+     * freq/last_access array falls back at eviction time (expert_get). */
+    m->demand_policy = DEMAND_LRU;
+    {
+        const char *dp = getenv("DEMAND_POLICY");
+        if (dp && !strcmp(dp, "lfru"))      m->demand_policy = DEMAND_LFRU;
+        else if (dp && !strcmp(dp, "auto")) m->demand_policy = DEMAND_AUTO;
+    }
+    /* Phase 3a: ALIGN_SLOTS=1 allocates each slot's weight block 2 MiB-aligned
+     * via posix_memalign (compat.h maps it to _aligned_malloc on Windows, where
+     * the matching deallocator is compat_aligned_free); 0 keeps plain malloc,
+     * byte-identical to today.  Alignment moves addresses, never weights. */
+    m->align_slots = getenv("ALIGN_SLOTS") ? atoi(getenv("ALIGN_SLOTS")) : 0;
+    if (m->align_slots) m->align_slots = 1;
+    /* Phase 3b: EXPERT_DIRECT selects the no-cache twin-fd read in
+     * load_expert_merged (any failure falls back to st_read_raw); the banner
+     * below reports how many shards actually expose a twin, so a host without
+     * one is visible at startup instead of silently buffered. */
+    m->expert_direct = getenv("EXPERT_DIRECT") ? atoi(getenv("EXPERT_DIRECT")) : 0;
+    if (m->expert_direct) m->expert_direct = 1;
+    if (m->expert_direct) {
+        int have = 0;
+        for (int i = 0; i < m->S.nfd; i++) if (m->S.dfds[i] >= 0) have++;
+        fprintf(stderr, "[EXPERT_DIRECT] enabled: %d/%d shards expose a no-cache twin fd "
+                        "(ST_DIRECT_ALIGN=%d)%s\n",
+                have, m->S.nfd, ST_DIRECT_ALIGN,
+                have ? "" : " — every read falls back to buffered");
+    }
+    /* Phase 3b: GROUP_EVICT allocates the n_layers * E * E co-routing table
+     * only when enabled, and refuses (stays off) above the 8 MB cap or E > 512
+     * so small-RAM budgets are honoured; calloc zeroes it, which is the
+     * neutral table (affinity 0 -> legacy victim ranking). */
+    m->group_evict = getenv("GROUP_EVICT") ? atoi(getenv("GROUP_EVICT")) : 0;
+    if (m->group_evict) {
+        int64_t cells = (int64_t)c->n_layers * c->n_experts * c->n_experts;
+        if (c->n_experts > 512 ||
+            cells > (int64_t)(8u << 20) / (int64_t)sizeof(uint16_t)) {
+            fprintf(stderr, "[GROUP_EVICT] disabled: %d layers x %d experts exceeds "
+                            "the 8 MB table cap or E>512\n", c->n_layers, c->n_experts);
+            m->group_evict = 0;
+        } else {
+            m->coc = calloc((size_t)cells, sizeof(uint16_t));
+            if (!m->coc) {
+                fprintf(stderr, "[GROUP_EVICT] disabled: OOM for %lld cells\n",
+                        (long long)cells);
+                m->group_evict = 0;
+            } else {
+                fprintf(stderr, "[GROUP_EVICT] enabled: %d layers x %d experts, "
+                                "table %.1f KB\n",
+                        c->n_layers, c->n_experts, (double)cells * 2.0 / 1024.0);
+            }
+        }
+    }
+    /* PILOT_WORKERS: SPMC loader fan-out for the pilot ring.  Clamped to
+     * [1,8]; 1 keeps the historic single-loader loop, byte-identical. */
+    g_pilot_nw = getenv("PILOT_WORKERS") ? atoi(getenv("PILOT_WORKERS")) : 1;
+    if (g_pilot_nw < 1) g_pilot_nw = 1;
+    if (g_pilot_nw > 8) g_pilot_nw = 8;
     m->dense_load_s = now_s() - t0;
 
     /* Persistent hot pinning belongs to the standalone runtime. A Segment
@@ -670,15 +1062,35 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
 }
 
+/* Free one slot weight block with the deallocator matching its allocation:
+ * ALIGN_SLOTS=1 blocks come from posix_memalign and must go through
+ * compat_aligned_free (which is _aligned_free on Windows); the default path
+ * is plain malloc/free.  The scales block (gs) is always falloc/malloc. */
+static void slot_free_weights(Model *m, void *block) {
+    if (!block) return;
+    if (m->align_slots) compat_aligned_free(block);
+    else free(block);
+}
+
 static void slot_ensure_allocated(Model *m, Slot *s) {
     if (s->g) return;
     Cfg *c = &m->c;
     int64_t ng = (int64_t)c->inter * c->hidden;
     int64_t nd = (int64_t)c->hidden * c->inter;
-    int8_t *w_block = malloc(ng + ng + nd);
-    if (!w_block) {
-        fprintf(stderr, "Error: Out of memory allocating slot weights block\n");
-        exit(1);
+    int8_t *w_block;
+    if (m->align_slots) {
+        /* 2 MiB alignment: posix_memalign via compat.h on Windows. */
+        if (posix_memalign((void **)&w_block, (size_t)2 << 20,
+                           (size_t)(ng + ng + nd)) != 0 || !w_block) {
+            fprintf(stderr, "Error: Out of memory allocating aligned slot weights block\n");
+            exit(1);
+        }
+    } else {
+        w_block = malloc(ng + ng + nd);
+        if (!w_block) {
+            fprintf(stderr, "Error: Out of memory allocating slot weights block\n");
+            exit(1);
+        }
     }
     s->g = w_block;
     s->u = w_block + ng;
@@ -695,6 +1107,66 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
  * and count how many times each expert is read. */
 static void (*g_test_expert_load)(Model *m, int layer, int eid, Slot *s);
 #endif
+
+/* Phase 3b EXPERT_DIRECT: one aligned bounce buffer per loader thread.  The
+ * direct path reads the ST_DIRECT_ALIGN block window enclosing the tensor
+ * through the no-cache twin fd and copies the payload out of it; the buffer is
+ * allocated once per thread and reused (regrown on demand, reclaimed at
+ * process exit), so the hot path has no per-read allocation.  The pointers are
+ * thread-local because the demand path and the pilot workers read experts
+ * concurrently, each outside g_pilot_mx. */
+static _Thread_local uint8_t *g_edirect_buf;
+static _Thread_local int64_t g_edirect_cap;
+
+/* Full pread loop used by the direct path: returns 0 only on a full transfer,
+ * -1 otherwise.  Unlike st_pread_full this never exits, because a failed
+ * direct read must degrade to the buffered path, not kill the engine. */
+static int edirect_pread_try(int fd, void *buf, int64_t n, int64_t off) {
+    uint8_t *p = (uint8_t *)buf;
+    int64_t got = 0;
+    while (got < n) {
+        ssize_t r = pread(fd, p + got, (size_t)(n - got), (off_t)(off + got));
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r == 0) return -1;
+        got += r;
+    }
+    return 0;
+}
+
+/* Direct (no-cache) read of a tensor's raw bytes into `out`.  The block-aligned
+ * bulk of the enclosing [off - off%ALIGN, +pad+nbytes) window goes through the
+ * twin fd, the sub-block tail through the buffered fd (O_DIRECT requires an
+ * aligned length, so a short aligned read is never extended in place), and the
+ * payload is copied out of the aligned window into `out`.  Returns 0 on
+ * success, -1 when the caller must use the buffered read: EXPERT_DIRECT off,
+ * no twin fd, offset/length out of the supported range, allocation failure or
+ * any short/failed direct transfer. */
+static int edirect_read_tensor(Model *m, const st_tensor *t, void *out) {
+    if (!m->expert_direct || !t || t->nbytes <= 0 || t->off < 0) return -1;
+    int dfd = st_direct_fd(&m->S, t->fd);
+    if (dfd < 0) return -1;
+    int64_t pad = t->off % ST_DIRECT_ALIGN;
+    int64_t need = pad + t->nbytes;
+    if (need > (int64_t)ST_PREAD_CHUNK || (uint64_t)need > SIZE_MAX) return -1;
+    if (g_edirect_cap < need) {
+        uint8_t *nb = NULL;
+        if (posix_memalign((void **)&nb, ST_DIRECT_ALIGN, (size_t)need) != 0 || !nb)
+            return -1;
+        free(g_edirect_buf);
+        g_edirect_buf = nb;
+        g_edirect_cap = need;
+    }
+    int64_t bulk = need & ~(int64_t)(ST_DIRECT_ALIGN - 1);
+    if (bulk <= 0) return -1;   /* tensor smaller than one block: buffered */
+    if (edirect_pread_try(dfd, g_edirect_buf, bulk, t->off - pad) != 0) return -1;
+    int64_t tail = need - bulk;
+    if (tail > 0 &&
+        edirect_pread_try(t->fd, g_edirect_buf + bulk, tail,
+                          t->off - pad + bulk) != 0)
+        return -1;
+    memcpy(out, g_edirect_buf + pad, (size_t)t->nbytes);
+    return 0;
+}
 
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
 #ifdef COLI_CACHE_INDEX_TEST
@@ -723,7 +1195,18 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         fprintf(stderr, "%s: scale array is %lld elems — expected %lld, refusing (untrusted container)\n",
                 qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1); }
     double started = now_s();
-    st_read_raw(&m->S, nm, s->g, g_expert_drop);
+    /* EXPERT_DIRECT=1 tries the no-cache twin fd first; any failure (no twin,
+     * unaligned transfer, short read) degrades to the exact legacy call, noted
+     * once so a silently-buffered host is visible instead of just slower. */
+    if (edirect_read_tensor(m, tw, s->g) != 0) {
+        static int warned = 0;
+        if (m->expert_direct && !warned) {
+            warned = 1;
+            fprintf(stderr, "[EXPERT_DIRECT] direct read unavailable (%s); "
+                            "falling back to buffered I/O\n", nm);
+        }
+        st_read_raw(&m->S, nm, s->g, g_expert_drop);
+    }
     st_read_f32(&m->S, qsnm, s->gs, 0);  /* scales are F32; use typed reader for dtype safety */
     __atomic_fetch_add(&m->disk_ns, (uint64_t)((now_s() - started) * 1e9), __ATOMIC_RELAXED);
 }
@@ -766,18 +1249,61 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
         s = &lc->slots[lc->n++];
         slot_ensure_allocated(m, s);
     } else {
-        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
+        /* Demand eviction — skip pinned and in-flight (eid==-1) slots.  With
+         * the Phase 1 guards on, prefer victims that were NOT routed recently:
+         * (1) unpinned, not in-flight, not recently routed; (2) unpinned, not
+         * in-flight (the original scan); (3) any non-in-flight slot.  Victim
+         * selection only — never the math — and with the guards off pass (1)
+         * degenerates to exactly the original scan.
+         *
+         * Phase 3a DEMAND_POLICY: inside every tier the victim is the slot with
+         * the minimum demand_victim_key — the `used` clock for lru (legacy,
+         * bit-identical comparison) or the frequency-primary LFRU score for
+         * lfru.  auto resolves per layer: lfru when cap <= 12, lru above (see
+         * model_init_range for the route200.txt replay evidence).  The tier
+         * order is unchanged: protection (pinned / in-flight / recent) always
+         * wins over the policy.
+         *
+         * Phase 3b GROUP_EVICT: with the table live, every tier ranks slots by
+         * demand_victim_key2 = demand_victim_key + affinity (see
+         * group_affinity_score), so an expert co-routing with other residents
+         * is a less attractive victim; composite ties fall back to the existing
+         * key.  With GROUP_EVICT=0 the affinity term is 0 and the comparison is
+         * bit-identical to the legacy scan. */
         int lru = -1;
+        uint64_t best_key = 0, best_base = 0;
+        int guards = m->recent_ring || m->recent_bloom;
+        int use_lfru = (m->demand_policy == DEMAND_LFRU) ||
+                       (m->demand_policy == DEMAND_AUTO && lc->cap <= 12);
+        if (use_lfru && (!m->freq || !m->freq[layer] || !m->last_access))
+            use_lfru = 0;   /* deterministic fallback: missing arrays -> lru */
         for (int i = 0; i < lc->n; i++) {
             if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
-            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+            if (guards && tier_recent_protected(&m->recent, layer, lc->slots[i].eid)) continue;
+            uint64_t kb, k = demand_victim_key2(m, layer, &lc->slots[i], use_lfru, &kb);
+            if (lru < 0 || k < best_key || (k == best_key && kb < best_base)) {
+                lru = i; best_key = k; best_base = kb;
+            }
         }
         if (lru < 0) {
-            /* All slots are pinned or in-flight; find oldest non-in-flight slot
-             * (may be pinned, but never select one currently being loaded). */
+            for (int i = 0; i < lc->n; i++) {
+                if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
+                uint64_t kb, k = demand_victim_key2(m, layer, &lc->slots[i], use_lfru, &kb);
+                if (lru < 0 || k < best_key || (k == best_key && kb < best_base)) {
+                    lru = i; best_key = k; best_base = kb;
+                }
+            }
+        }
+        if (lru < 0) {
+            /* All slots are pinned or in-flight; find the oldest non-in-flight
+             * slot (may be pinned, but never select one currently being
+             * loaded). */
             for (int i = 0; i < lc->n; i++) {
                 if (lc->slots[i].eid < 0) continue; /* never evict in-flight */
-                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+                uint64_t kb, k = demand_victim_key2(m, layer, &lc->slots[i], use_lfru, &kb);
+                if (lru < 0 || k < best_key || (k == best_key && kb < best_base)) {
+                    lru = i; best_key = k; best_base = kb;
+                }
             }
         }
         while (lru < 0) {
@@ -793,7 +1319,10 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
             pthread_mutex_lock(&g_pilot_mx);
             for (int i = 0; i < lc->n; i++) {
                 if (lc->slots[i].eid < 0) continue;
-                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+                uint64_t kb, k = demand_victim_key2(m, layer, &lc->slots[i], use_lfru, &kb);
+                if (lru < 0 || k < best_key || (k == best_key && kb < best_base)) {
+                    lru = i; best_key = k; best_base = kb;
+                }
             }
         }
         s = &lc->slots[lru];
@@ -989,6 +1518,55 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             best = rt_router_pick(best, kk, E, layer);
             idx[kk] = best; val[kk] = pr[best];
         }
+        /* Phase 2 memory tiering: record the decode transition L-1 -> L and
+         * refresh the routed set the PILOT thread reads for Markov staging.
+         * Decode only (S == 1): prefill rows would fold position-level
+         * statistics into a table the worker reads as token-to-token
+         * structure.  Staging only; idx[] and val[] are untouched. */
+        if (m->markov_on) {
+            if (S == 1 && m->route_layer == layer - 1)
+                tier_markov_observe(&m->markov, layer, m->route_bits, idx, K);
+            if (m->markov_stats && S == 1)
+                markov_stats_eval(m, layer, idx, K);
+            memset(m->route_bits, 0, ((size_t)E + 7) / 8);
+            for (int kk = 0; kk < K; kk++) {
+                int e = idx[kk];
+                if (e >= 0 && e < E)
+                    m->route_bits[e >> 3] |= (uint8_t)(1u << (e & 7));
+            }
+            m->route_layer = layer;
+        }
+        /* Phase 1 memory tiering: record this row's routed set in the
+         * temporal-locality guards.  idx[] is final here; the guards only
+         * bias eviction victims later, they cannot change what runs.  The
+         * pilot worker reads the same state from pilot_realload(), so the
+         * push serialises on g_pilot_mx. */
+        if (m->recent_ring || m->recent_bloom) {
+            pthread_mutex_lock(&g_pilot_mx);
+            tier_recent_push(&m->recent, layer, idx, K);
+            pthread_mutex_unlock(&g_pilot_mx);
+        }
+        /* Phase 3b GROUP_EVICT: same-layer co-routing counts, decode only
+         * (S == 1), after idx[] is final.  Both directions are incremented and
+         * self-pairs skipped, saturating at UINT16_MAX.  The table only biases
+         * eviction victims later (expert_get): it never touches routing,
+         * weights, logits or KV.  Decode-only for the same reason as MARKOV:
+         * prefill rows would fold position-level statistics into a table read
+         * as token-to-token co-routing structure. */
+        if (m->group_evict && m->coc && S == 1) {
+            for (int a = 0; a < K; a++) {
+                int e = idx[a];
+                if (e < 0 || e >= E) continue;
+                uint16_t *row = m->coc + ((size_t)layer * E + e) * E;
+                for (int b = 0; b < K; b++) {
+                    int e2 = idx[b];
+                    if (e2 < 0 || e2 >= E || e2 == e) continue;
+                    if (row[e2] < 0xFFFF) row[e2]++;
+                    uint16_t *row2 = m->coc + ((size_t)layer * E + e2) * E;
+                    if (row2[e] < 0xFFFF) row2[e]++;
+                }
+            }
+        }
         if (c->norm_topk) { float sm=0; for(int kk=0;kk<K;kk++) sm+=val[kk]; for(int kk=0;kk<K;kk++) val[kk]/=sm; }
         /* IMPROVEMENT 2 activation heatmap AND the ROUTE_TRACE stream, in one
          * call. The counters were the only thing this engine recorded, and it
@@ -1077,6 +1655,12 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         g_prof_moe_s += now_s() - t_moe;
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
 
+        /* Phase 2 memory tiering: layer i's routing is known now, so stage the
+         * Markov-predicted successor reads for i+1 (and one chained step into
+         * i+2).  Decode only, same as the table statistics. */
+        if (allow_prefetch && S == 1 && g_pilot > 0 && m->markov_on)
+            markov_prefetch(m, i);
+
         /* PREDICTION IMPROVEMENT C (Residual gate trick):
          * PILOT=2 -> prefetch layer i+2 using completed state x (containing MoE residual). */
         if (allow_prefetch && g_pilot >= 2 && S <= 8 && i + 2 < c->n_layers)
@@ -1128,6 +1712,14 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1);
     /* count actual tokens processed (S>1 during prefill) */
     m->token_count += S; m->freq_token_count += S;
+    /* Phase 2: fade stale Markov transitions on the token clock (MARKOV_DECAY,
+     * default 512; 0 = never).  O(table) shifts, no allocation, no routing. */
+    if (m->markov_on && m->markov.decay_every > 0) {
+        while (m->token_count >= m->markov_next_decay) {
+            tier_markov_decay(&m->markov);
+            m->markov_next_decay += m->markov.decay_every;
+        }
+    }
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens)
         pin_hot_experts(m);
     m->kv_len = pos_base + S;
@@ -1197,8 +1789,14 @@ static void pilot_realload(Model *m, int layer, int eid) {
         if (g_pilot_evict_guard && m->freq && m->freq[layer] && m->last_access &&
             lc->slots[lru].eid >= 0) {
             int vid = lc->slots[lru].eid;
-            uint64_t vs = lfru_score(m->freq[layer][vid], m->last_access[layer * c->n_experts + vid], m->clock);
-            uint64_t cs = lfru_score(m->freq[layer][eid], m->last_access[layer * c->n_experts + eid], m->clock);
+            /* Phase 1: a recently-routed resident (victim) or candidate earns
+             * RECENT_BONUS heat units, in the same units as freq so the score
+             * and the existing hysteresis formula are unchanged.  Zero when
+             * the guards are off, so the comparison is bit-identical. */
+            uint64_t vs = lfru_score(m->freq[layer][vid], m->last_access[layer * c->n_experts + vid], m->clock)
+                        + (tier_recent_bonus(&m->recent, layer, vid) << 8);
+            uint64_t cs = lfru_score(m->freq[layer][eid], m->last_access[layer * c->n_experts + eid], m->clock)
+                        + (tier_recent_bonus(&m->recent, layer, eid) << 8);
             if (cs <= vs + (vs >> 2) + (4u << 8)) {
                 m->is_queued[layer * c->n_experts + eid] = 0;
                 pthread_mutex_unlock(&g_pilot_mx);
@@ -1223,6 +1821,16 @@ static void pilot_realload(Model *m, int layer, int eid) {
     pthread_mutex_unlock(&g_pilot_mx);
 }
 
+/* Pilot loader.  PILOT_WORKERS=1 keeps the historic loop exactly: load r/w,
+ * process pilot_q[r], publish r+1.  With N>1 the consumers become SPMC: a
+ * worker that sees r < w claims one unique index with fetch_add and processes
+ * it only after confirming the claimed index is below the current pilot_w; a
+ * claim that loses the race for the tail entry (idx >= w) is given back with
+ * fetch_sub before backing off, so pilot_r never runs past pilot_w and the
+ * producer's w-r<4096 capacity check stays valid.  pilot_realload() itself is
+ * unchanged and idempotent under concurrent duplicate claims (resident /
+ * in-flight / is_queued early exits), so an entry is never read twice into two
+ * slots.  Ring size and 4096 bound unchanged. */
 static void *pilot_worker(void *arg) {
     (void)arg;
     while (1) {
@@ -1232,10 +1840,22 @@ static void *pilot_worker(void *arg) {
             sleep_ms(1);
             continue;
         }
-        int layer = pilot_q[r & 4095].l;
-        int eid = pilot_q[r & 4095].e;
+        unsigned idx;
+        if (g_pilot_nw <= 1) {
+            idx = r;                      /* single loader: today's pop */
+        } else {
+            idx = __atomic_fetch_add(&pilot_r, 1, __ATOMIC_ACQ_REL);
+            if (idx >= __atomic_load_n(&pilot_w, __ATOMIC_ACQUIRE)) {
+                __atomic_fetch_sub(&pilot_r, 1, __ATOMIC_ACQ_REL);
+                sleep_ms(1);
+                continue;
+            }
+        }
+        int layer = pilot_q[idx & 4095].l;
+        int eid = pilot_q[idx & 4095].e;
         pilot_realload(pilot_m, layer, eid);
-        __atomic_store_n(&pilot_r, r + 1, __ATOMIC_RELEASE);
+        if (g_pilot_nw <= 1)
+            __atomic_store_n(&pilot_r, idx + 1, __ATOMIC_RELEASE);
     }
     return NULL;
 }
@@ -1325,33 +1945,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
         for (int kk = 0; kk < cand; kk++) {
             int eid = idx[kk];
             if (eid < 0) continue;
-            int found = 0;
-            pthread_mutex_lock(&g_pilot_mx);
-            found = slot_indexed(m, lnext, eid) != NULL;
-            pthread_mutex_unlock(&g_pilot_mx);
-            if (!found) {
-                int gidx = lnext * E + eid;
-                pthread_mutex_lock(&g_pilot_mx);
-                int already_queued = m->is_queued[gidx];
-                if (!already_queued) {
-                    m->is_queued[gidx] = 1;
-                }
-                pthread_mutex_unlock(&g_pilot_mx);
-
-                if (!already_queued) {
-                    unsigned w2 = __atomic_load_n(&pilot_w, __ATOMIC_RELAXED);
-                    unsigned r2 = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
-                    if (w2 - r2 < 4096) {
-                        pilot_q[w2 & 4095].l = lnext;
-                        pilot_q[w2 & 4095].e = eid;
-                        __atomic_store_n(&pilot_w, w2 + 1, __ATOMIC_RELEASE);
-                    } else {
-                        pthread_mutex_lock(&g_pilot_mx);
-                        m->is_queued[gidx] = 0;
-                        pthread_mutex_unlock(&g_pilot_mx);
-                    }
-                }
-            }
+            pilot_enqueue(m, lnext, eid);   /* same insertion contract as before */
         }
     }
     free(logits);
@@ -2008,6 +2602,7 @@ int main(int argc, char **argv) {
     printf("\nReference: ");  for (int i=np;i<nfull;i++) printf("%d ", full[i]);
     printf("\nC engine : ");  for (int i=np;i<nfull;i++) { printf("%d ", out[i]); if (out[i]==full[i]) match++; }
     printf("\nMatching tokens: %d/%d\n", match, n_new);
+    markov_stats_report(&m);   /* MARKOV_STATS: measurement-only accuracy summary */
     double tot = m.hits + m.miss;
     printf("\nPEAK RSS: %.2f GB\n", rss_gb());
     printf("Expert cache hit rate: %.1f%%  (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
@@ -2075,7 +2670,7 @@ static void olmoe_segment_model_destroy(OlmoeSegmentEngine *engine) {
         free(weights->qn); free(weights->kn); free(weights->gate);
         LCache *cache = &model->cache[layer];
         for (int slot = 0; slot < cache->n; slot++) {
-            free(cache->slots[slot].g);
+            slot_free_weights(model, cache->slots[slot].g);
             free(cache->slots[slot].gs);
         }
         free(cache->slot_by_expert);
@@ -2084,6 +2679,11 @@ static void olmoe_segment_model_destroy(OlmoeSegmentEngine *engine) {
     free(model->last_access); free(model->is_queued); free(model->is_pinned);
     free(model->freq);
     free(model->momentum_logits);
+    tier_recent_free(&model->recent);   /* safe if never initialised */
+    tier_markov_free(&model->markov);   /* safe if never initialised */
+    free(model->route_bits);
+    free(model->markov_cand); free(model->markov_hit); free(model->markov_total);
+    free(model->coc);                   /* NULL unless GROUP_EVICT=1 */
     free(model->cache); free(model->L);
     st_destroy(&model->S);
 }
@@ -2394,6 +2994,12 @@ static void olmoe_edge_engine_destroy(void *engine_impl) {
     free(engine->model.embed);
     free(engine->model.lm_head);
     free(engine->model.final_norm);
+    tier_recent_free(&engine->model.recent);   /* zeroed if never initialised */
+    tier_markov_free(&engine->model.markov);   /* zeroed if never initialised */
+    free(engine->model.route_bits);
+    free(engine->model.markov_cand);
+    free(engine->model.markov_hit); free(engine->model.markov_total);
+    free(engine->model.coc);            /* NULL unless GROUP_EVICT=1 */
     st_destroy(&engine->model.S);
     tok_free(&engine->tokenizer);
     free(engine);
@@ -2567,3 +3173,260 @@ int coli_olmoe_edge_adapter_register(void) {
     return coli_edge_adapter_register(&olmoe_edge_adapter);
 }
 #endif /* COLI_EDGE_ADAPTER */
+
+#ifdef COLI_ENGINE_ADAPTER
+/* ---------- unified engine ABI (engine.h): OLMoE backend --------------- */
+/* The full-token engine contract for OLMoE. Mirrors the GLM backend in
+ * colibri.c: model_init + KV allocation, then prefill/decode through the
+ * engine's own step(), tokenize/detokenize through tok.h, sampling through
+ * sample.h, and a position cursor for O(1) KV rollback.
+ *
+ * KV position model: OLMoE's step() writes rows at absolute positions and
+ * records m->kv_len = pos_base + S, so kv_len IS the cursor. Rollback is a
+ * cursor rewind; the next prefill at that position overwrites the stale rows.
+ * The kv_prefix record is cleared on rollback so it can never disagree with
+ * the engine's own KV state (see kv_prefix.h). */
+
+typedef struct {
+    Model model;
+    Tok tokenizer;
+} OlmoeEngineRef;
+
+static int olmoe_engine_error(char *error, size_t error_size, const char *message) {
+    if (error && error_size) snprintf(error, error_size, "%s", message);
+    return -1;
+}
+
+static void olmoe_engine_cap_string(char *out, size_t cap, const char *value) {
+    if (!out || !cap) return;
+    size_t n = strlen(value);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, value, n);
+    out[n] = '\0';
+}
+
+static void olmoe_engine_model_destroy(OlmoeEngineRef *engine) {
+    if (!engine) return;
+    Model *model = &engine->model;
+    int nl = model->c.n_layers;
+    for (int layer = 0; layer < nl; layer++) {
+        Layer *w = &model->L[layer];
+        free(w->in_ln); free(w->post_ln);
+        free(w->q); free(w->k); free(w->v); free(w->o);
+        free(w->qn); free(w->kn); free(w->gate);
+        LCache *cache = &model->cache[layer];
+        for (int slot = 0; slot < cache->n; slot++) {
+            slot_free_weights(model, cache->slots[slot].g); /* one block holds g+u+d */
+            free(cache->slots[slot].gs);   /* one block holds gs+us+ds */
+        }
+        free(cache->slot_by_expert);
+        free(cache->slots);
+    }
+    free(model->embed); free(model->lm_head); free(model->final_norm);
+    if (model->K) { for (int i = 0; i < nl; i++) free(model->K[i]); free(model->K); }
+    if (model->V) { for (int i = 0; i < nl; i++) free(model->V[i]); free(model->V); }
+    if (model->ehit) { for (int i = 0; i < nl; i++) free(model->ehit[i]); free(model->ehit); }
+    free(model->last_access); free(model->is_queued); free(model->is_pinned);
+    free(model->freq); free(model->momentum_logits);
+    tier_recent_free(&model->recent);
+    tier_markov_free(&model->markov);   /* safe if never initialised */
+    free(model->route_bits);
+    free(model->markov_cand); free(model->markov_hit); free(model->markov_total);
+    free(model->coc);                   /* NULL unless GROUP_EVICT=1 */
+    kv_prefix_free(&model->kvp);
+    free(model->cache); free(model->L);
+    st_destroy(&model->S);
+}
+
+static void olmoe_engine_destroy(void *engine_impl) {
+    OlmoeEngineRef *engine = (OlmoeEngineRef *)engine_impl;
+    if (!engine) return;
+    olmoe_engine_model_destroy(engine);
+    tok_free(&engine->tokenizer);
+    free(engine);
+}
+
+static int olmoe_engine_open(void **engine_impl, ColiEngineCapabilities *capabilities,
+                             const ColiEngineOptions *options,
+                             char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return olmoe_engine_error(error, error_size, "invalid OLMoE engine open");
+    *engine_impl = NULL;
+    if (options->backend_mask && (options->backend_mask & ~COLI_ENGINE_CAP_CPU))
+        return olmoe_engine_error(error, error_size,
+                                  "OLMoE engine currently supports CPU");
+    int bits = getenv("COLI_ENGINE_BITS") ? atoi(getenv("COLI_ENGINE_BITS")) : 8;
+    if (bits < 2 || bits > 8)
+        return olmoe_engine_error(error, error_size,
+                                  "OLMoE expert bits must be 2..8");
+    int cap = getenv("COLI_ENGINE_CAP") ? atoi(getenv("COLI_ENGINE_CAP")) : 16;
+    int maxctx = getenv("COLI_ENGINE_CTX") ? atoi(getenv("COLI_ENGINE_CTX")) : 4096;
+    if (maxctx < 1) maxctx = 1;
+    if (maxctx > 4096) maxctx = 4096;   /* attention()'s sc[4096] score buffer */
+
+    OlmoeEngineRef *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return olmoe_engine_error(error, error_size,
+                                  "out of memory opening OLMoE engine");
+    /* main() calls this first; OLMOE_NO_MAIN removes that call, so the library
+     * consumer would otherwise run at the OpenMP default thread count. */
+    coli_omp_tune_threads("olmoe");
+    model_init(&engine->model, options->model_dir, cap, bits);
+
+    /* KV allocation, exactly as the serve path in main() does it: the buffers
+     * are sized once for the whole process and never reallocated, so a recorded
+     * position stays valid for the engine's lifetime. */
+    Model *m = &engine->model;
+    m->max_t = maxctx;
+    m->K = calloc((size_t)m->c.n_layers, sizeof(float *));
+    m->V = calloc((size_t)m->c.n_layers, sizeof(float *));
+    for (int i = 0; i < m->c.n_layers; i++) {
+        m->K[i] = falloc((int64_t)m->c.n_heads * maxctx * m->c.head_dim);
+        m->V[i] = falloc((int64_t)m->c.n_heads * maxctx * m->c.head_dim);
+    }
+    kv_prefix_alloc(&m->kvp, maxctx);
+    m->kv_len = 0;
+
+    char tokenizer_path[4096];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
+             options->model_dir);
+    tok_load(&engine->tokenizer, tokenizer_path);
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_ENGINE_ABI_VERSION;
+    capabilities->flags = COLI_ENGINE_CAP_PREFILL | COLI_ENGINE_CAP_DECODE |
+                          COLI_ENGINE_CAP_KV_SURGERY | COLI_ENGINE_CAP_CPU;
+    olmoe_engine_cap_string(capabilities->engine_id,
+                            sizeof(capabilities->engine_id), "olmoe");
+    olmoe_engine_cap_string(capabilities->state_schema,
+                            sizeof(capabilities->state_schema),
+                            "olmoe/mha-rope-kv-v1");
+    snprintf(capabilities->numeric_class, sizeof(capabilities->numeric_class),
+             "olmoe/e%d/cpu-v1", bits);
+    olmoe_engine_cap_string(capabilities->tokenizer_class,
+                            sizeof(capabilities->tokenizer_class),
+                            "olmoe/gpt2-byte-bpe-v1");
+    capabilities->vocab_size = (uint32_t)m->c.vocab;
+    capabilities->hidden_size = (uint32_t)m->c.hidden;
+    capabilities->num_layers = (uint32_t)m->c.n_layers;
+    capabilities->max_context_tokens = (uint32_t)maxctx;
+    capabilities->bos_token_id = -1;
+    capabilities->eos_token_id = -1;
+    capabilities->resident_bytes = 0;
+    *engine_impl = engine;
+    return 0;
+}
+
+static int olmoe_engine_tokenize(void *engine_impl, const char *text, size_t text_bytes,
+                                 int32_t *token_ids, size_t token_capacity,
+                                 size_t *token_count, char *error, size_t error_size) {
+    OlmoeEngineRef *engine = (OlmoeEngineRef *)engine_impl;
+    if (!text || !token_count || (!!token_ids != !!token_capacity))
+        return olmoe_engine_error(error, error_size, "invalid OLMoE tokenize request");
+    int max = token_capacity > INT_MAX ? INT_MAX : (int)token_capacity;
+    int n = tok_encode(&engine->tokenizer, text, (int)text_bytes,
+                       (int *)token_ids, max);
+    *token_count = (size_t)n;
+    return 0;
+}
+
+static int olmoe_engine_detokenize(void *engine_impl, const int32_t *token_ids,
+                                   size_t token_count, char *text, size_t text_capacity,
+                                   size_t *text_bytes, char *error, size_t error_size) {
+    OlmoeEngineRef *engine = (OlmoeEngineRef *)engine_impl;
+    if (!token_ids || !token_count || !text_bytes || (!!text != !!text_capacity))
+        return olmoe_engine_error(error, error_size, "invalid OLMoE detokenize request");
+    int max = text_capacity > INT_MAX ? INT_MAX : (int)text_capacity;
+    int n = tok_decode(&engine->tokenizer, (const int *)token_ids,
+                       (int)token_count, text, max);
+    *text_bytes = (size_t)n;
+    return 0;
+}
+
+static int olmoe_engine_prefill(void *engine_impl, const int32_t *tokens, size_t n_tokens,
+                                float **logits, char *error, size_t error_size) {
+    OlmoeEngineRef *engine = (OlmoeEngineRef *)engine_impl;
+    if (!tokens || !n_tokens || !logits)
+        return olmoe_engine_error(error, error_size, "invalid OLMoE prefill request");
+    int n = n_tokens > INT_MAX ? INT_MAX : (int)n_tokens;
+    if (engine->model.kv_len + n > engine->model.max_t)
+        return olmoe_engine_error(error, error_size,
+                                  "OLMoE prefill exceeds the allocated context");
+    *logits = step(&engine->model, (const int *)tokens, n, engine->model.kv_len);
+    return 0;
+}
+
+static int olmoe_engine_decode_step(void *engine_impl, int32_t token_id, float **logits,
+                                    char *error, size_t error_size) {
+    OlmoeEngineRef *engine = (OlmoeEngineRef *)engine_impl;
+    if (!logits || token_id < 0 || token_id >= engine->model.c.vocab)
+        return olmoe_engine_error(error, error_size, "invalid OLMoE decode request");
+    if (engine->model.kv_len >= engine->model.max_t)
+        return olmoe_engine_error(error, error_size,
+                                  "OLMoE decode exceeds the allocated context");
+    int tok = token_id;
+    *logits = step(&engine->model, &tok, 1, engine->model.kv_len);
+    return 0;
+}
+
+static int olmoe_engine_sample(void *engine_impl, const float *logits,
+                               const ColiSampleConfig *cfg, int32_t *token_id,
+                               char *error, size_t error_size) {
+    OlmoeEngineRef *engine = (OlmoeEngineRef *)engine_impl;
+    (void)error; (void)error_size;
+    if (!logits || !cfg || !token_id)
+        return olmoe_engine_error(error, error_size, "invalid OLMoE sample request");
+    int V = engine->model.c.vocab;
+    g_temp = (cfg->temperature > 0.0f) ? cfg->temperature : 0.0f;
+    g_nuc  = (cfg->top_p > 0.0f && cfg->top_p < 1.0f) ? cfg->top_p : 0.0f;
+    int next = pick_tok(logits, V, cfg->ban);
+    /* A stop is a normal control signal: *token_id = -1 with success. The caller
+     * owns logits and frees it in every case. */
+    for (size_t i = 0; i < cfg->n_stop_tokens; i++)
+        if (cfg->stop_tokens[i] == next) { next = -1; break; }
+    *token_id = next;
+    return 0;
+}
+
+static int olmoe_engine_kv_get_len(void *engine_impl, int *len,
+                                   char *error, size_t error_size) {
+    OlmoeEngineRef *engine = (OlmoeEngineRef *)engine_impl;
+    if (!len)
+        return olmoe_engine_error(error, error_size, "invalid kv_get_len request");
+    *len = engine->model.kv_len;
+    return 0;
+}
+
+static int olmoe_engine_kv_rollback(void *engine_impl, int target_len,
+                                    char *error, size_t error_size) {
+    OlmoeEngineRef *engine = (OlmoeEngineRef *)engine_impl;
+    if (target_len < 0 || target_len > engine->model.kv_len)
+        return olmoe_engine_error(error, error_size, "invalid kv_rollback target");
+    /* Position-addressed KV: the cursor rewind is O(1); the next prefill at
+     * target_len overwrites the stale rows. Clear the prefix record so it can
+     * never claim positions the engine no longer holds. */
+    engine->model.kv_len = target_len;
+    kv_prefix_clear(&engine->model.kvp);
+    return 0;
+}
+
+static const ColiEngineAdapter olmoe_engine_adapter = {
+    sizeof(ColiEngineAdapter), COLI_ENGINE_ABI_VERSION, "olmoe",
+    olmoe_engine_open, olmoe_engine_destroy,
+    olmoe_engine_tokenize, olmoe_engine_detokenize,
+    olmoe_engine_prefill, olmoe_engine_decode_step, olmoe_engine_sample,
+    olmoe_engine_kv_get_len, olmoe_engine_kv_rollback, {0}
+};
+
+int coli_olmoe_engine_adapter_register(void) {
+    return coli_engine_adapter_register(&olmoe_engine_adapter);
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((constructor))
+static void olmoe_engine_adapter_ctor(void) {
+    coli_engine_adapter_register(&olmoe_engine_adapter);
+}
+#endif
+#endif /* COLI_ENGINE_ADAPTER */
