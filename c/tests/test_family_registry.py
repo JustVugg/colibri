@@ -121,6 +121,23 @@ class FamilyRegistryTest(unittest.TestCase):
                 json.dumps(public_metadata(family))
                 self.assertIn(family.id, by_id)
 
+    def test_capabilities_carry_the_image_bit_for_families_with_an_image_path(self):
+        # The bit says the gateway has a placeholder expansion for the family. Whether
+        # the checkpoint being served actually loaded its tower is the engine's word
+        # (the CAPS handshake line), never the family's: a glm53 export can carry
+        # vision_config and no model.visual.* tensors.
+        by_id, _ = _build_registry(FAMILIES)
+        for family_id, expected in (("glm53", True), ("qwen38", True), ("qwen36", True),
+                                    ("deepseek_v41", True), ("mimo", True), ("glm", False), ("kimi", False),
+                                    ("inkling", False), ("olmoe", False),
+                                    ("deepseek_v4", False), ("qwen_image", False)):
+            with self.subTest(family=family_id):
+                self.assertIs(by_id[family_id].capabilities.image, expected)
+                self.assertIs(public_metadata(by_id[family_id])["capabilities"]["image"],
+                              expected)
+        # the four positional flags keep their meaning for every existing caller
+        self.assertFalse(FamilyCapabilities(True, False, False, True).image)
+
     def test_glm53_exposes_engine_kv_slot_limit(self):
         by_id, _ = _build_registry(FAMILIES)
         self.assertEqual(by_id["glm53"].limits.max_kv_slots, 16)
@@ -1032,6 +1049,8 @@ class FamilyRegistryTest(unittest.TestCase):
             # V4.1 ships its chat encoding as a Python module (encoding/encoding.py),
             # not a jinja template, so the replay prompt stays the bare text like V4.
             "deepseek_v41": "hello {world}",
+            # MiMo-V2.6: render_chat_mimo's cue with thinking on (its template's default)
+            "mimo": "<|im_start|>user\nhello {world}<|im_end|><|im_start|>assistant\n<think>",
             # An image model has no chat template and nothing to tune; the
             # template is the identity and `coli tune` refuses the modality.
             "qwen_image": "hello {world}",

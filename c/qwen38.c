@@ -1811,6 +1811,9 @@ static void serve_loop(Model *m){
         fprintf(stderr,"[serve] unable to allocate QSA state\n");return;
     }
     fputs("\x01\x01READY\x01\x01\n",stdout);
+    /* between READY and STAT: the gateway reads it in the handshake, so it knows
+     * the served modalities before the first request (docs/serve_protocol.md) */
+    printf("CAPS vision=%d\n",m->vis_ready?1:0);
     printf("STAT 0 0.00 0.0 %.2f\n",rss_gb());
     fflush(stdout);
     serve_emap(m);                       /* after READY and STAT: the boot reader discards what precedes them */

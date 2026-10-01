@@ -974,19 +974,7 @@ static void tm_report(void){
 }
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 
-/* y[S,O] = x[S,I] @ W^T,  W is [O,I] row-major */
-static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const float *w = W + (int64_t)o * I;
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s * I;
-            float acc = 0.f;
-            for (int i = 0; i < I; i++) acc += xs[i] * w[i];
-            y[(int64_t)s * O + o] = acc;
-        }
-    }
-}
+#include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
 
 /* y[1,O] = x[1,I] @ W^T with W quantized: q[O,I] int8 + scale per row.
  * matmul_q lives in qgemv.h so tests/test_qgemv.c can link the exact kernel
@@ -2841,6 +2829,23 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 m->route.agree_hit += (uint64_t)K; m->route.agree_tot += (uint64_t)K; m->route.kl_n++;
             }
         }
+        /* SEC: an all-NaN router row (a corrupt tile, an fp overflow) leaves best at
+         * -1 above -- NaN > bv is false for every expert -- and route_select pads
+         * with -1 when fewer than K experts rank. Every consumer below takes the id
+         * as an index and a file offset: expert_get() went looking for experts.-1.
+         * Same degradation as rt_router_pick in route_trace.h, which this engine
+         * does not include: the slot's own index, in range because topk <=
+         * n_experts is a config check, at weight 0 so the slot adds nothing. */
+        for (int kk = 0; kk < K; kk++) {
+            if (idx[kk] >= 0) continue;
+            static int warned;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "[router] non-finite logits at layer %d, or fewer than top-k "
+                                "experts eligible: selection degraded\n", layer);
+            }
+            idx[kk] = kk; val[kk] = 0.f;
+        }
         if (m->resident_collecting) {
             for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) m->seen[(int64_t)layer * E + idx[kk]] = 1;
         }
@@ -4170,6 +4175,9 @@ static void serve_loop(Model *m){
     coli_serve_binary_mode();
     setvbuf(stdin,NULL,_IONBF,0);
     fputs("\x01\x01READY\x01\x01\n",stdout);
+    /* fra READY e STAT: il gateway lo legge nella stretta di mano, quindi sa che
+     * modalita' serve prima della prima richiesta (docs/serve_protocol.md) */
+    printf("CAPS vision=%d\n",m->vis_ready?1:0);
     printf("STAT 0 0.00 0.0 %.2f\n",rss_gb());
     fflush(stdout);
     emap_emit(m);          /* dopo READY e STAT: il boot reader legge STAT dopo il sentinel */
