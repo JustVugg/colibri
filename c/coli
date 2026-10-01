@@ -538,7 +538,7 @@ def env_for_engine(a, arch, plan=None):
     # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
     # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
     # user's session ran itself out of memory with the flag apparently set.
-    if arch in ("deepseek_v4", "deepseek_v41", "kimi", "glm53", "olmoe"):
+    if arch in ("deepseek_v4", "deepseek_v41", "kimi", "glm53", "olmoe", "mimo"):
         if a.ram: env["RAM_GB"] = str(a.ram)
     if arch == "glm53":
         # I densi vanno a int4 di default: sono 9,7 B parametri su 321, e in
@@ -1651,6 +1651,13 @@ def chat_command(message):
     e deve poter distinguere "comando sbagliato" da "testo che comincia con /"."""
     if not message or message[0] not in "/:":
         return None, None
+    # A picture's path is not a command. A file dragged into the terminal pastes
+    # "/home/me/photo.png" at the start of the line, and that line is a question
+    # about the picture; read as a command it got "comando sconosciuto" and the
+    # picture never left the prompt.
+    # The first word decides: "/save /tmp/x.png" is still the /save command.
+    if IMAGE_PATH.fullmatch(message.split()[0]):
+        return None, None
     head, _, rest = message[1:].partition(" ")
     return head.strip().lower(), rest.strip()
 
@@ -1726,6 +1733,24 @@ def chat_brio(a, base, model_id, msgs, question, options, w):
     print(f"  {C.dim}{time.time()-t0:.2f}s · {usage.get('read_tokens',0)} tokens read · "
           f"{usage.get('completion_tokens',0)} generated{C.r}\n")
 
+# Families whose template thinks by default but that coli chat starts with thinking
+# OFF. On a model that streams its experts from disk at about 1 tok/s, the default
+# reasoning of MiMo-V2.6's template is minutes of tokens before the first word of the
+# answer, and a terminal that shows a spinner for that long looks hung. The API and
+# the web keep the template's default; here `--think` turns it on.
+CHAT_THINK_OFF = {"mimo"}
+
+def server_arch(base, api_key=None, timeout=1.5):
+    """The family a coli serve runs, from /health; None when it does not say."""
+    import urllib.request
+    try:
+        req=urllib.request.Request(base.rstrip("/")+"/health")
+        if api_key: req.add_header("Authorization", f"Bearer {api_key}")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8","replace")).get("arch")
+    except Exception:
+        return None
+
 def chat_attached(a, base, model_id):
     """The chat REPL over HTTP against a running `coli serve`.
 
@@ -1741,6 +1766,9 @@ def chat_attached(a, base, model_id):
     print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :reset starts a new conversation · :q exits{C.r}")
     print(f"  {C.dim}/ for commands · TAB completes · /brio puts the SAME model in brio mode{C.r}\n")
     install_chat_completer()
+    arch=server_arch(base, getattr(a,"api_key",None))
+    if arch in CHAT_THINK_OFF and getattr(a,"think",None) is None:
+        print(f"  {C.dim}thinking is off here (--think turns it on){C.r}\n")
     msgs=[]
     brio_options=[]          # non vuoto = modalita brio accesa
     w=term_w()-4
@@ -1808,6 +1836,8 @@ def chat_attached(a, base, model_id):
                    "stream_options":{"include_usage":True}}   # exact completion_tokens in the last chunk
         if getattr(a,"effort",None): request["reasoning_effort"]=a.effort
         if getattr(a,"think",None) is not None: request["enable_thinking"]=a.think
+        elif arch in CHAT_THINK_OFF:
+            request["enable_thinking"]=False   # --think turns it back on
         body=json.dumps(request).encode()
         req=urllib.request.Request(base.rstrip("/")+"/v1/chat/completions", data=body,
                                    headers={"Content-Type":"application/json"})

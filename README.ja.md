@@ -17,8 +17,8 @@
 （AI メモリのマルチティア化）ことで、**744B から 2.8T パラメータのフロンティア MoE モデル**を、
 コンシューマー向けや異種混在のハードウェア上で、エンジン依存ゼロの純粋な C で実行します。
 
-現在動作するのは 9 つのファミリーです: **GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B、
-ビジョン対応）、**Inkling**（975B）、**Kimi K3**（2.8T）、**DeepSeek V4 Flash**（284B）、**DeepSeek V4.1 Flash**（552B、ビジョン対応）、
+現在動作するのは 10 のファミリーです: **GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B、
+ビジョン対応）、**Inkling**（975B）、**Kimi K3**（2.8T）、**DeepSeek V4 Flash**（284B）、**DeepSeek V4.1 Flash**（552B、ビジョン対応）、**MiMo-V2.6 Flash**（309B、ビジョン対応）、
 **Qwen3.8-Flash-Next**（125B + 51B n-gram）、**Qwen3.6**（35B-A3B）、そして
 **OLMoE**（7B）——
 それぞれが C ファイル 1 つで、同じ `coli chat` / `coli serve` / `coli web` フロントエンドを共有します。
@@ -425,6 +425,7 @@ GLM-5.2 がリファレンスモデルですが、同じストリーミング手
 | **GLM-5.3-Flash**（Z.ai） | 321B / 40B | [`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash) — ルーティングエキスパートを **int4-gs64** に変換、密部分は BF16 のままで精度はロード時に選択。ビジョン対応 | `make -C c glm53` | [glm53-flash.md](docs/glm53-flash.md) |
 | **Kimi K3**（Moonshot） | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — オリジナルのチェックポイント、ルーティングエキスパートは **ネイティブ MXFP4** のまま | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
 | **DeepSeek V4 Flash** | 284B / 13B | 公式のシャード化チェックポイント — ルーティングエキスパートは **ネイティブ fp4**、密部分は fp8-e4m3 のまま。**REAP で枝刈りした 150B**（[`puwaer/DeepSeek-V4-Flash-0731-reap-150b`](https://huggingface.co/puwaer/DeepSeek-V4-Flash-0731-reap-150b)、85 GB、256 個中 132 個のエキスパート）も同じエンジンで変換なしにロード可能 | `make -C c deepseek-v4` | [deepseek-v4.md](docs/deepseek-v4.md) |
+| **MiMo-V2.6 Flash**（Xiaomi） | 309B / 15B | [`XiaomiMiMo/MiMo-V2.6-Flash-MOPD`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-MOPD)（178 GB）、公式チェックポイント、**変換不要**: ルーティングエキスパートは **ネイティブ MXFP4** のまま、密部分は FP8/BF16。48 層のうち 39 層は 128 トークンのウィンドウを参照するため、長いコンテキストでも KV は 9 層分だけ。ビジョンとツール呼び出しに対応 | `make -C c mimo` | [mimo.md](docs/mimo.md) |
 | **DeepSeek V4.1 Flash** | 552B / 16B | 公式チェックポイント、**変換不要**: エキスパートはすでに fp4、密部分は fp8-e4m3。そのうち 203 GB は一度に数百バイトずつディスクから読まれる n-gram メモリで、ルーティングエキスパートのコストは GLM-5.2 の 12.7 GB に対して **1 トークンあたり 4.5 GB**。ビジョン、ツール呼び出し、DSpark ドラフトヘッドはすべて有効 | `make -C c deepseek_v41` | [deepseek-v41.md](docs/deepseek-v41.md) |
 | **Qwen3.8-Flash-Next**（Alibaba） | 125B + 51B n-gram / 6B | [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) — オリジナルのチェックポイント。PLE はページング可能なまま、エキスパートは **ネイティブのブロック FP8** のまま | `make -C c qwen38`（CPU のみ） | [qwen38.md](docs/qwen38.md) |
 | **Qwen3.6**（Alibaba） | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64)（約 20 GB、**推奨**）— Gated Attention + Gated DeltaNet のハイブリッド | `make -C c qwen36`（VRAM エキスパートティアには `CUDA=1`） | [qwen36.md](docs/qwen36.md) |
@@ -581,8 +582,8 @@ CUDA ティア（ビルド、DLL の選択、GPU の対応範囲）、環境変�
   目的はハードウェア要件と有用トークンあたりのコストを下げることです。すべてはこのプロジェクトの
   やり方で取り込まれます: エンドツーエンドで計測され、レビューされ、オープンに開発されます。
 - **より多くのオープンモデル。** ティアリングアルゴリズムはモデルに依存しません。ルーティング
-  エキスパートを持つ MoE であれば、どれも同じ方法でステージングできます。現在 9 つのファミリーが
-  動作しています（GLM-5.2、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、
+  エキスパートを持つ MoE であれば、どれも同じ方法でステージングできます。現在 10 のファミリーが
+  動作しています（GLM-5.2、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6 Flash、
   Qwen3.8-Flash-Next、Qwen3.6、OLMoE）。さらなるオープンウェイトのファミリー — 候補には
   **MiniMax** も含まれます — は、最初の 8 つと同じ方法でエンジンを獲得します:
   誰かがエンドツーエンドで計測したときにです。

@@ -129,6 +129,11 @@ def load_config(model_dir):
             settings["min_pixels"] = size["shortest_edge"]
         if "longest_edge" in size:
             settings["max_pixels"] = size["longest_edge"]
+        # The older Qwen2-VL spelling (MiMo-V2.6 ships it): the same window as
+        # top-level keys. `size` wins when both are there, as in the processor.
+        for key in ("min_pixels", "max_pixels"):
+            if key in raw:
+                settings.setdefault(key, raw[key])
     config = root / "config.json"
     if config.exists():
         vision = json.loads(config.read_text()).get("vision_config") or {}

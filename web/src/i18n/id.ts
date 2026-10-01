@@ -24,7 +24,7 @@ const id: Record<string, string> = {
   "ui.copy": "Salin respons",
   "ui.attachImage": "Lampirkan gambar",
   "ui.removeImage": "Hapus gambar",
-  "ui.attachedImage": "Gambar terlampir {n}",
+  "ui.attachedImage": "Gambar terlampir {{n}}",
   "ui.copied": "Disalin",
   "ui.copyError": "Teks tidak dapat disalin. Pilih respons untuk menyalinnya.",
   "ui.regenerate": "Buat ulang respons",

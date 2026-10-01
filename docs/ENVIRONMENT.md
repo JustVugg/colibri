@@ -6,7 +6,7 @@ Reference for the environment variables read by the colibrì engine.
 
 ## Which program reads these?
 
-**There are nine engine binaries, and they do not share a knob set.** The main
+**There are ten engine binaries, and they do not share a knob set.** The main
 engine `c/colibri` (built from `c/colibri.c`, formerly `glm.c`) reads most of
 what follows, but the sister engines read their own:
 
@@ -21,6 +21,7 @@ what follows, but the sister engines read their own:
 | `olmoe` | `c/olmoe.c` | `HOT`, `WIDE`, `SMOOTH`, `CONF_LIMIT`, `MAX_NEW`, `CHAT`, `EXPERT_DROP`, `WARMUP` — see [OLMoE engine](#olmoe-engine-olmoe) |
 | `deepseek_v4` | `c/deepseek_v4.c` | `CTX`, the `V4_*` / `DSV4_*` families and the two `COLI_CUDA_*_BATCH` gates — see [DeepSeek V4 engine](#deepseek-v4-engine-deepseek_v4); note that the CUDA section below describes `colibri.c` knobs (`COLI_CUDA`, `CUDA_DENSE`, ...) which the V4 engine does not read — its GPU switch is `DSV4_CUDA` |
 | `deepseek_v41` | `c/deepseek_v41.c` | the `V41_*` family: see [DeepSeek V4.1 engine](#deepseek-v41-engine-deepseek_v41) |
+| `mimo` | `c/mimo.c` | the `MIMO_*` family: see [MiMo-V2.6 engine](#mimo-v26-engine-mimo) |
 
 Setting an `INK_*` variable while running `colibri` does nothing, and vice
 versa; nothing warns you about it. A few variables are genuinely shared because
@@ -358,6 +359,7 @@ See `docs/glm53-flash.md`.
 | `GLM53_EXPERT_GB` | measured | RAM budget (GB) for the expert LRU cache; per-layer slots are derived from it. Unset, it is taken from reclaimable physical memory after the weights are loaded (Linux `MemAvailable`, Windows available physical memory, macOS free+inactive+purgeable pages), minus a 3 GB margin. A fixed number is wrong in both directions: too small on a large machine leaves memory idle while the disk does all the work. |
 | `GLM53_MAXT` | `8192` | KV state capacity in tokens, and the session size in serve mode. |
 | `GLM53_PREFILL_CHUNK` | `128` | Prefill chunk size in tokens. Smaller keeps the workspace smaller; too small re-reads experts once per chunk per layer instead of amortizing them. In serve mode, CANCEL is checked before each prefill chunk. Cancellation waits for any chunk already running to finish. |
+| `GLM53_REWIND` | `0` | Avoid reprocessing the prompt when a continue request trims cached trailing whitespace, by rewinding recurrent state with a snapshot (~149 MiB per slot, outside the `GLM53_EXPERT_GB` budget), allocated on first use, retained across slot resets, and copied once per generated whitespace run, whether or not the reply is ever continued. Off by default for that reason; exact-match continuations need no snapshot and reuse the cache either way. |
 | `GLM53_MAX_IMAGE_TOKENS` | checkpoint's (8000) | Ceiling on tokens per image. Each covers 28×28 pixels, so 256 keeps ordinary text legible and 64 keeps shapes and colours. The image is shrunk, not cropped. Lower it: 8000 is 2691 tokens for a 1080p photo, i.e. a prefill nobody will sit through. |
 | `GLM53_VERBOSE` | unset | Print the parsed geometry, the expert budget and the per-token cache cost to stderr. |
 | `GLM53_DUMP_INDEX` | unset | Print the rows the sparse indexer selected. The first place to look when the engine diverges only at certain lengths. |
@@ -491,6 +493,25 @@ Read **only** by `c/deepseek_v41.c`. See [deepseek-v41.md](deepseek-v41.md).
 | `V41_DSPARK_MAX` | the checkpoint's `dspark_block_size` | DeepSeek V4.1: how many drafted tokens go in front of the main model per round. Fewer costs less when a round is rejected and caps the win when it is not. |
 | `V41_DSPARK_MINACC` | 60 | DeepSeek V4.1: percent of drafts that must be accepted over a window of ten before drafting pauses for 64 tokens. 60 is the measured break-even. |
 | `V41_SPEC_FORCE` | unset | DeepSeek V4.1, oracle mode only: draft the reference's own tokens (`1`), corrupt the last one (`2`), keep the head's (`3`), corrupt the first one (`4`) or a different one each round (`5`), so the verification path runs on a fixture whose draft head is random noise. |
+
+## MiMo-V2.6 engine (`mimo`)
+
+Read **only** by `c/mimo.c` (and `MIMO_MAX_IMAGE_TOKENS` by the gateway). See [mimo.md](mimo.md).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MIMO_DENSE_BITS` | 0 | MiMo: 0 keeps the dense weights as released (FP8, BF16), exact; 8 is int8 per row, less RAM, not exact; 32 is f32, the oracle's configuration. |
+| `MIMO_IDOT` | 0 | MiMo: 1 quantizes the expert matmuls' activations to int8 per 32 (faster, not exact). |
+| `MIMO_DIRECT` | 1 | MiMo: 0 reads experts through the page cache instead of `O_DIRECT`. |
+| `MIMO_READ_THREADS` | 8 | MiMo: parallel expert reads per layer. |
+| `MIMO_CHUNK` | 64 | MiMo: prompt tokens per prefill block. |
+| `MIMO_CTX` | `CTX`, else 8192 | MiMo: context the KV cache is sized for, capped by the checkpoint. |
+| `MIMO_CAP` | 64 | MiMo: expert cache slots per layer when no argument gives one; never below one routing step. |
+| `MIMO_MAX_IMAGE_TOKENS` | unset | MiMo, gateway: ceiling on what one picture costs in prompt tokens. |
+| `MIMO_LOGITS` | unset | MiMo, oracle: dump every prompt position's logits (f32) to this file. |
+| `MIMO_TRACE` | unset | MiMo, oracle: dump the residual after every sublayer of the first block. |
+| `MIMO_DIRS` | unset | MiMo: extra directories holding shards. |
+| `MIMO_STATS` | unset | MiMo: report the vision tower's time per picture. |
 
 ## OLMoE engine (`olmoe`)
 

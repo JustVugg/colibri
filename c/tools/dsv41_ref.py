@@ -16,6 +16,12 @@ vendor's line is quoted. Deviations that are deliberate:
   (`fp8_dequant` / `fp4_dequant` below). The oracle therefore validates the engine's
   arithmetic, not its ability to guess a rounding mode.
 - no distributed anything: world_size == 1, so the parallel/sharded classes collapse.
+- top-k selections break ties by the lowest index (`topk_lowest`), and the indexer
+  never keeps a -inf position. `torch.topk` leaves both unspecified: the relu makes
+  exact 0.0 ties, and a candidate mask can leave fewer finite scores than `index_topk`.
+  Which tied index torch returns differs between its x86 and arm64 kernels, so the
+  reference generated on macOS arm64 disagreed with the one generated on Linux. The
+  engine takes the lowest index and marks an empty slot -1, and so does this file.
 """
 from __future__ import annotations
 
@@ -194,6 +200,24 @@ def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, iters, eps):
         comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
         comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
     return pre, post, comb
+
+
+def topk_lowest(scores: torch.Tensor, k: int) -> torch.Tensor:
+    """Indices of the k largest scores along the last dim, ties to the lowest index.
+    A stable descending sort keeps equal scores in index order; `torch.topk` does
+    not promise any order among ties."""
+    return scores.sort(dim=-1, descending=True, stable=True).indices[..., :k]
+
+
+def indexer_pick(score: torch.Tensor, topk: int, lens, offset: int) -> torch.Tensor:
+    """Indexer.forward's last step: the best `topk` positions of each row, in position
+    order, shifted by `offset`, -1 for an empty slot. A -inf position (masked by `lens`
+    or by the candidate blocks) is an empty slot, not a pick: it is parked past the end
+    so it sorts last and becomes -1."""
+    idxs = topk_lowest(score, topk)
+    idxs = torch.where(score.gather(-1, idxs) > -float("inf"), idxs, score.shape[-1])
+    idxs = idxs.sort(dim=-1).values
+    return torch.where(idxs < lens, idxs + offset, torch.tensor(-1)).int()
 
 
 def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
@@ -394,9 +418,7 @@ class RefModel:
                 score, lens, c["candidate_topk_blocks"], c["candidate_block_size"])
         elif 0 <= c["candidate_source_layer"] < layer:
             score = score.masked_fill(~shared["candidates"], -float("inf"))
-        topk = min(c["index_topk"], end_pos // ratio)
-        idxs = score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
-        return torch.where(idxs < lens, idxs + offset, torch.tensor(-1)).int()
+        return indexer_pick(score, min(c["index_topk"], end_pos // ratio), lens, offset)
 
     def attention(self, layer: int, x: torch.Tensor, start_pos: int, shared: dict) -> torch.Tensor:
         c = self.c
@@ -699,8 +721,8 @@ def select_candidate_blocks(logits, compress_lens, topk_blocks, block_size):
     num_blocks = scores.shape[-1]
     last = (compress_lens - 1) // block_size
     scores = scores.masked_fill(torch.arange(num_blocks) == last, float("inf"))
-    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top.indices, top.values > -float("inf"))
+    top = topk_lowest(scores, min(topk_blocks, num_blocks))
+    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top, scores.gather(-1, top) > -float("inf"))
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 
 
