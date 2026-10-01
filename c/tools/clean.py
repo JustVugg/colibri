@@ -14,6 +14,7 @@ FILES = [
     "inkling", "inkling.exe",
     "kimi_k3", "kimi_k3.exe",
     "olmoe", "olmoe.exe",
+    "llama", "llama.exe",
     # Missing here means `make clean` leaves the binary in place, and a rebuild
     # with different EXTRA_CFLAGS then reports "up to date". That is how the
     # `Qwen3.6 tiny oracle` job re-ran an UN-INSTRUMENTED binary from its ASan

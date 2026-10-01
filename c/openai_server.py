@@ -1738,6 +1738,42 @@ def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, to
     return "".join(parts)
 
 
+def render_chat_llama(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                      tool_choice=None, add_generation_prompt=True):
+    """Base Llama checkpoints ship no chat template, so the prompt is the plain
+    text of the turns, one per line. `enable_thinking` and `reasoning_effort` are
+    accepted and unused (the registry advertises neither), and tool use is refused
+    unless COLI_TOOL_FALLBACK=1 opts into prompt-injected translation -- the same
+    contract as OLMoE."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tool_choice == "none":
+        tools = None
+    if (tools or tool_choice not in (None, "none")) and not _TOOL_FALLBACK:
+        raise APIError(400, "Tool use is not wired up for the Llama engine yet. "
+                       "Set COLI_TOOL_FALLBACK=1 to opt into prompt-injected "
+                       "tool translation.", "tools", "unsupported_parameter")
+    parts = []
+    if tools and _TOOL_FALLBACK:
+        parts.append(_fallback_tool_preamble(tools) + "\n")
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        allowed = ("system", "developer", "user", "assistant")
+        if _TOOL_FALLBACK:
+            allowed += ("tool",)
+        if role not in allowed:
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        if role == "tool" and _TOOL_FALLBACK:
+            parts.append(_fallback_tool_result(message, index) + "\n")
+            continue
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        parts.append(text + "\n")
+    return "".join(parts)
+
+
 def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                      tool_choice=None, add_generation_prompt=True, preserve_thinking=False):
     """Qwen3.6's chat_template, tool calling included: <|im_start|>role\\n ...
@@ -3244,6 +3280,9 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
                            tool_choice, add_generation_prompt)
     if ARCH == "olmoe":
         return render_chat_olmoe(messages, enable_thinking, reasoning_effort, tools,
+                                 tool_choice, add_generation_prompt)
+    if ARCH == "llama":
+        return render_chat_llama(messages, enable_thinking, reasoning_effort, tools,
                                  tool_choice, add_generation_prompt)
     if ARCH == "deepseek_v4":
         return render_chat_v4(messages, enable_thinking, reasoning_effort, tools,

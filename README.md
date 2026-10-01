@@ -18,11 +18,11 @@ parameters** — on consumer and heterogeneous hardware, in pure C with zero
 engine dependencies, by treating storage, RAM, and VRAM as a single inference
 hierarchy (AI memory multitiering).
 
-Ten families run today: **GLM-5.2/5.3** (744B), **GLM-5.3-Flash** (321B, with
+Eleven families run today: **GLM-5.2/5.3** (744B), **GLM-5.3-Flash** (321B, with
 vision), **Inkling** (975B), **Kimi K3** (2.8T), **DeepSeek V4 Flash** (284B), **DeepSeek V4.1 Flash** (552B, with vision),
 **MiMo-V2.6 Flash** (309B, with vision),
-**Qwen3.8-Flash-Next** (125B + 51B n-gram), **Qwen3.6** (35B-A3B) and
-**OLMoE** (7B) —
+**Qwen3.8-Flash-Next** (125B + 51B n-gram), **Qwen3.6** (35B-A3B), **OLMoE** (7B)
+and **Llama** (1B) —
 one C file each, the same `coli chat` / `coli serve` / `coli web` front end.
 Images too: **Qwen-Image-2.1** generates pictures from text, shown inline in
 the terminal by `coli chat` and served at `POST /v1/images/generations`
@@ -476,6 +476,7 @@ the model's `config.json`):
 | **Qwen3.8-Flash-Next** (Alibaba) | 125B + 51B n-gram / 6B | [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) — original checkpoint; PLE stays pageable and experts stay **native block-FP8** | `make -C c qwen38` (`CUDA=1` for the VRAM expert tier) | [qwen38.md](docs/qwen38.md) |
 | **Qwen3.6** (Alibaba) | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64) (~20 GB, **recommended**) — hybrid Gated Attention + Gated DeltaNet | `make -C c qwen36` (`CUDA=1` for the VRAM expert tier) | [qwen36.md](docs/qwen36.md) |
 | **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` — **int8** container, ~7 GB | `make -C c olmoe` | — |
+| **Llama** (Meta) | 1B / 1B | official HF safetensors, **no conversion**: `c/tools/convert_llama.py` validates and stages them, BF16/F16/F32 read straight to f32 | `make -C c llama` (`CUDA=1` for the opt-in GPU path) | — |
 
 Qwen3.6 ships three pre-converted containers: **int4-gs64** (recommended — measured
 cosine to the int8 anchor 0.98777 → 0.99313 and KL 0.109 → 0.080 against per-row, i.e.
@@ -667,9 +668,9 @@ checkpoint validation, and the generated tiny independent oracle.
   lower cost per useful token. Everything lands the way this project works:
   measured end to end, reviewed, and developed in the open.
 - **More open models.** The tiering algorithm is model-agnostic: any MoE with
-  routed experts can be staged the same way. Ten families run today (GLM-5.2,
+  routed experts can be staged the same way. Eleven families run today (GLM-5.2,
   GLM-5.3-Flash, Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6 Flash,
-  Qwen3.8-Flash-Next, Qwen3.6, OLMoE); further open-weight families — **MiniMax** among the
+  Qwen3.8-Flash-Next, Qwen3.6, OLMoE, Llama); further open-weight families — **MiniMax** among the
   candidates — earn an engine the way the first eight did: when someone
   measures one end to end.
 

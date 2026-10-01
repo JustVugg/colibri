@@ -1184,6 +1184,12 @@ tests/bench_cuda_resident_batch$(EXE): tests/bench_cuda_resident_batch.cu backen
 olmoe$(EXE): olmoe.c
 	$(CC) $(NOCUDA_CFLAGS) olmoe.c -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
 
+# llama: dense Llama decoder (llama.c). Unlike olmoe it has a COLI_CUDA tier --
+# CUDA=1 links backend_cuda.o and COLI_CUDA=1 at run time moves every projection
+# and the LM head to the GPU -- so it takes the full CFLAGS, not NOCUDA_*.
+llama$(EXE): llama.c $(CUDA_OBJ)
+	$(CC) $(CFLAGS) llama.c $(CUDA_OBJ) -o llama$(EXE) $(LDFLAGS)
+
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
 # MoE). With CUDA=1 the optional VRAM expert tier (qwen36_tier.c) is compiled
 # in and reuses the shared CUDA backend; without it the engine is CPU-only
@@ -2375,6 +2381,11 @@ tests/test_omp_tune$(EXE): tests/test_omp_tune.c
 tests/test_compat_env$(EXE): tests/test_compat_env.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# llama.c's load_t cardinality contract. Compiles llama.c itself, so it runs on
+# the CPU tier (NOCUDA_*) even when CUDA=1 is set globally.
+tests/test_llama_read_trust$(EXE): tests/test_llama_read_trust.c llama.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_kvb_notice$(EXE): tests/test_kvb_notice.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
@@ -2518,7 +2529,7 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) mimo$(EXE) qwenimage$(EXE) \
+install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) llama$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) mimo$(EXE) qwenimage$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
@@ -2529,6 +2540,7 @@ install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen3
 	$(INSTALL) -m 755 inkling$(EXE) $(DESTDIR)$(LIBEXECDIR)/inkling$(EXE)
 	$(INSTALL) -m 755 kimi_k3$(EXE) $(DESTDIR)$(LIBEXECDIR)/kimi_k3$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
+	$(INSTALL) -m 755 llama$(EXE) $(DESTDIR)$(LIBEXECDIR)/llama$(EXE)
 	$(INSTALL) -m 755 qwen36$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen36$(EXE)
 	$(INSTALL) -m 755 qwen38$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen38$(EXE)
 	$(INSTALL) -m 755 qwenimage$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwenimage$(EXE)

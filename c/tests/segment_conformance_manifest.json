@@ -75,6 +75,18 @@
       "real_adapter_required": true
     },
     {
+      "family_id": "llama",
+      "state_schema": "fixture/llama-kv-v1",
+      "state_components": [
+        "kv"
+      ],
+      "oracle": {
+        "kind": "real_checkpoint",
+        "path": "tools/make_llama_oracle.py"
+      },
+      "real_adapter_required": true
+    },
+    {
       "family_id": "qwen36",
       "state_schema": "fixture/qwen36-kv-deltanet-conv-v1",
       "state_components": [

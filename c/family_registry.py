@@ -455,6 +455,22 @@ def _olmoe_geometry(config, context, _model_dir):
     return PlannerGeometry(state, 0, 0, experts)
 
 
+def _llama_geometry(config, context, _model_dir):
+    """Dense GQA: llama.c keeps one fp32 K and one fp32 V row per KV head per
+    position per layer (kv_alloc: n_kv * max_t * head_dim each). head_dim is the
+    config's explicit value when present, else hidden_size // num_attention_heads,
+    exactly as load_cfg derives it. No recurrent state, no experts -- and it is
+    dense, so the zero expert count is the shape of the model and not a broken
+    MoE config (#1757)."""
+    layers = _required_int(config, "num_hidden_layers", "llama")
+    heads = _required_int(config, "num_attention_heads", "llama")
+    kv = _optional_int(config, "num_key_value_heads", heads, 1)
+    head_dim = _optional_int(config, "head_dim", 0) or (
+        _required_int(config, "hidden_size", "llama") // heads)
+    if head_dim < 1 or heads % kv:
+        raise ValueError("llama: invalid attention geometry")
+    return PlannerGeometry(layers * context * kv * head_dim * 2 * 4, 0, 0, 0, dense=True)
+
 
 def _kimi_geometry(config, context, _model_dir):
     """Kimi K3: hybrid -- 69 KDA (recurrent) + 24 gated MLA layers.
@@ -1365,6 +1381,39 @@ FAMILIES = (
         has_gateway_adapter=True,
         has_cli_adapter=True,
         tune_prompt_template="<|user|>\n{prompt}\n<|assistant|>\n",
+    ),
+    FamilyDescriptor(
+        # Dense Llama (LlamaForCausalLM): RMSNorm, RoPE (+ llama3/linear
+        # scaling), GQA, SwiGLU, optional tied embeddings. llama.c reads the HF
+        # safetensors directly; tools/convert_llama.py validates and stages them.
+        id="llama",
+        model_types=("llama",),
+        display_name="Llama",
+        display_scale="1B",
+        engine_artifact="llama",
+        engine_aliases=(),
+        engine_group="llama",
+        internal_arch="llama",
+        build_target="llama",
+        process_names=("llama",),
+        default_model_id="llama-colibri",
+        cli_adapter="llama",
+        gateway_adapter="llama",
+        planner_id="llama_gqa",
+        planner_geometry=_llama_geometry,
+        planner_unsupported_reason="",
+        # No expert tensors at all: every weight is dense and resident, so the
+        # inventory is empty rather than a cache (the dense planner flag above
+        # is what tells the planner the zero is real).
+        expert_inventory=lambda _name, _size, _config, _dtype=None: (),
+        config_section="root",
+        limits=FamilyLimits(4096, 131072, 1024, 1024, 1, 0, "CTX"),
+        capabilities=FamilyCapabilities(False, False, False, False),
+        # The gateway's persistent adapter is a registry invariant (every
+        # registered family exposes one, test_datapoint); llama.c implements the
+        # same READY/SUBMIT/DATA/DONE protocol the other engines share.
+        has_gateway_adapter=True,
+        has_cli_adapter=False,
     ),
     FamilyDescriptor(
         id="qwen36",

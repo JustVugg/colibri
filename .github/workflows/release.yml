@@ -67,7 +67,7 @@ jobs:
       - name: Build engines
         run: |
           cd c
-          for t in colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage; do
+          for t in colibri glm53 inkling kimi_k3 olmoe llama qwen36 qwen38 deepseek_v41 mimo qwenimage; do
             make $t ${{ matrix.make_args }}
           done
           ls -lh colibri${{ matrix.ext }} glm53${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen36${{ matrix.ext }} qwen38${{ matrix.ext }} deepseek_v41${{ matrix.ext }} mimo${{ matrix.ext }}
@@ -126,6 +126,7 @@ jobs:
           cp c/inkling${{ matrix.ext }} dist/inkling${{ matrix.ext }}
           cp c/kimi_k3${{ matrix.ext }} dist/kimi_k3${{ matrix.ext }}
           cp c/olmoe${{ matrix.ext }} dist/olmoe${{ matrix.ext }}
+          cp c/llama${{ matrix.ext }} dist/llama${{ matrix.ext }}
           # qwen36 -- plain name, like the others: engine_for() resolves "qwen" to
           # a "qwen36" binary next to coli. Unconditional: the engine is portable C
           # with no platform gate, so every archive can carry it.

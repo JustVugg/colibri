@@ -468,6 +468,33 @@ class FamilyRegistryTest(unittest.TestCase):
                     0)
 
 
+    def test_llama_resolves_exactly_and_sizes_gqa_kv_cache(self):
+        # Llama-3.2-1B shape: 16 layers, 32 q / 8 kv heads, explicit head_dim 64.
+        config = {"model_type": "llama", "hidden_size": 2048, "num_hidden_layers": 16,
+                  "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 64}
+        by_id, by_type = _build_registry(FAMILIES)
+        family = by_type["llama"]
+        self.assertEqual(family, by_id["llama"])
+        self.assertEqual(family.engine_artifact, "llama")
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        # llama.c kv_alloc: K and V, n_kv * max_t * head_dim fp32 each, per layer.
+        self.assertEqual(geometry.context_state_bytes, 16 * 32 * 8 * 64 * 2 * 4)
+        self.assertEqual((geometry.fixed_state_bytes, geometry.workspace_bytes,
+                          geometry.configured_experts), (0, 0, 0))
+        # A dense checkpoint: the zero expert count is the shape, not a broken MoE
+        # config, so the planner keeps every weight resident (#1757).
+        self.assertTrue(geometry.dense)
+        # head_dim absent: derived from hidden_size // num_attention_heads.
+        del config["head_dim"]
+        self.assertEqual(planner_geometry(resolved, 32).context_state_bytes,
+                         16 * 32 * 8 * 64 * 2 * 4)
+        # Closed set: no aliasing of llama-like types onto the llama engine.
+        for other in ("llama4", "mistral", "llama_text", "mllama"):
+            with self.subTest(model_type=other), self.assertRaises(UnknownFamilyError):
+                family_for_config({"model_type": other})
+
     def test_olmoe_geometry_matches_engine_kv_allocation(self):
         # OLMoE config shaped like the real 1B-7B model (AI2), but small.
         config = {
@@ -1054,6 +1081,8 @@ class FamilyRegistryTest(unittest.TestCase):
             # An image model has no chat template and nothing to tune; the
             # template is the identity and `coli tune` refuses the modality.
             "qwen_image": "hello {world}",
+            # Base Llama checkpoints ship no chat template: bare text.
+            "llama": "hello {world}",
         }
         self.assertEqual(
             {family.id: tuning_replay_prompt(family, prompt) for family in FAMILIES},

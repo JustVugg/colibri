@@ -136,6 +136,13 @@ static const ColiSegmentConformanceFixture g_fixtures[] = {
             COLI_SEGMENT_FIXTURE_VISION_TOWER,
         3, 8, 6, 64, UINT32_C(0x4d494d4f),
     },
+    {
+        "llama", "Llama-3.2-1B", "fixture/llama-kv-v1",
+        "conventional grouped-query key/value attention cache",
+        "tools/make_llama_oracle.py",
+        COLI_SEGMENT_FIXTURE_KV,
+        1, 4, 4, 32, UINT32_C(0x4c4c414d),
+    },
 };
 
 static int fail(char *error, size_t error_size, const char *message) {
@@ -388,6 +395,7 @@ DECLARE_OPEN_WRAPPER(qwen38, 6)
 DECLARE_OPEN_WRAPPER(deepseek_v4, 7)
 DECLARE_OPEN_WRAPPER(deepseek_v41, 8)
 DECLARE_OPEN_WRAPPER(mimo, 9)
+DECLARE_OPEN_WRAPPER(llama, 10)
 
 #define FIXTURE_ADAPTER(name)                                                  \
     {                                                                          \
@@ -415,6 +423,7 @@ static const ColiSegmentAdapter g_adapters[] = {
     FIXTURE_ADAPTER(deepseek_v4),
     FIXTURE_ADAPTER(deepseek_v41),
     FIXTURE_ADAPTER(mimo),
+    FIXTURE_ADAPTER(llama),
 };
 
 int coli_segment_conformance_register_fixtures(void) {

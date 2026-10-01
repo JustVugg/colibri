@@ -17,10 +17,10 @@
 （AI メモリのマルチティア化）ことで、**744B から 2.8T パラメータのフロンティア MoE モデル**を、
 コンシューマー向けや異種混在のハードウェア上で、エンジン依存ゼロの純粋な C で実行します。
 
-現在動作するのは 10 のファミリーです: **GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B、
+現在動作するのは 11 のファミリーです: **GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B、
 ビジョン対応）、**Inkling**（975B）、**Kimi K3**（2.8T）、**DeepSeek V4 Flash**（284B）、**DeepSeek V4.1 Flash**（552B、ビジョン対応）、**MiMo-V2.6 Flash**（309B、ビジョン対応）、
-**Qwen3.8-Flash-Next**（125B + 51B n-gram）、**Qwen3.6**（35B-A3B）、そして
-**OLMoE**（7B）——
+**Qwen3.8-Flash-Next**（125B + 51B n-gram）、**Qwen3.6**（35B-A3B）、**OLMoE**（7B）、そして
+**Llama**（1B）——
 それぞれが C ファイル 1 つで、同じ `coli chat` / `coli serve` / `coli web` フロントエンドを共有します。
 画像生成も可能です: **Qwen-Image-2.1** がテキストから画像を生成し、`coli chat` はそれをターミナル内に
 直接表示、`coli serve` は `POST /v1/images/generations` で提供します（[qwen-image.md](docs/qwen-image.md)）。
@@ -430,6 +430,7 @@ GLM-5.2 がリファレンスモデルですが、同じストリーミング手
 | **Qwen3.8-Flash-Next**（Alibaba） | 125B + 51B n-gram / 6B | [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) — オリジナルのチェックポイント。PLE はページング可能なまま、エキスパートは **ネイティブのブロック FP8** のまま | `make -C c qwen38`（CPU のみ） | [qwen38.md](docs/qwen38.md) |
 | **Qwen3.6**（Alibaba） | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64)（約 20 GB、**推奨**）— Gated Attention + Gated DeltaNet のハイブリッド | `make -C c qwen36`（VRAM エキスパートティアには `CUDA=1`） | [qwen36.md](docs/qwen36.md) |
 | **OLMoE**（AI2） | 7B / 1B | `c/tools/convert_olmoe_merged.py` で変換 — **int8** コンテナ、約 7 GB | `make -C c olmoe` | — |
+| **Llama**（Meta） | 1B / 1B | 公式 HF safetensors、**変換不要**: `c/tools/convert_llama.py` が検証してステージング。BF16/F16/F32 をそのまま f32 で読み込み | `make -C c llama`（GPU は `CUDA=1` でオプトイン） | — |
 
 Qwen3.6 には変換済みコンテナが 3 つあります: **int4-gs64**（推奨 — int8 のアンカーに対するコサイン類似度は
 行単位と比べて 0.98777 → 0.99313、KL は 0.109 → 0.080 と計測されており、量子化誤差が約 44% 少ない）、
@@ -582,9 +583,9 @@ CUDA ティア（ビルド、DLL の選択、GPU の対応範囲）、環境変�
   目的はハードウェア要件と有用トークンあたりのコストを下げることです。すべてはこのプロジェクトの
   やり方で取り込まれます: エンドツーエンドで計測され、レビューされ、オープンに開発されます。
 - **より多くのオープンモデル。** ティアリングアルゴリズムはモデルに依存しません。ルーティング
-  エキスパートを持つ MoE であれば、どれも同じ方法でステージングできます。現在 10 のファミリーが
+  エキスパートを持つ MoE であれば、どれも同じ方法でステージングできます。現在 11 のファミリーが
   動作しています（GLM-5.2、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6 Flash、
-  Qwen3.8-Flash-Next、Qwen3.6、OLMoE）。さらなるオープンウェイトのファミリー — 候補には
+  Qwen3.8-Flash-Next、Qwen3.6、OLMoE、Llama）。さらなるオープンウェイトのファミリー — 候補には
   **MiniMax** も含まれます — は、最初の 8 つと同じ方法でエンジンを獲得します:
   誰かがエンドツーエンドで計測したときにです。
 
