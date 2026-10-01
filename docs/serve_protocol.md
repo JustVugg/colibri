@@ -19,6 +19,7 @@ summarized at the end. Line formats below are quoted from the emitting `printf`s
 
 ```
 \x01\x01READY\x01\x01
+CAPS vision=<0|1>
 STAT 0 0.00 0.0 <rss_gb>
 HWINFO <cores> <ram_total_gb> <ram_avail_gb> <ngpu> <vram_total_gb> <cpu_name>|<gpu_name>
 TIERS <vram_experts> <ram_experts> <disk_experts> <vram_gb> <ram_gb>
@@ -28,6 +29,14 @@ EMAP <rows> <cols> <hex>
 The server must not send requests before `READY`. `HWINFO`/`TIERS`/`EMAP` are
 telemetry (see below) and may grow — **servers must ignore line kinds they do not
 recognize**; that is the protocol's forward-compatibility rule.
+
+`CAPS key=value ...` is optional and sits *between* `READY` and `STAT`: it says what
+the engine actually loaded, and the server reads it while waiting for `STAT`, so the
+served modalities are known before the first request. Today the one key is `vision`
+(`1`: a vision tower is loaded; `0`: none — a text-only checkpoint, or a config that
+declares a tower whose tensors are not in the container). Engines that say nothing
+leave the server's flag unknown. glm53, qwen38, qwen36 and deepseek_v41 emit it;
+`openai_server.py` derives `/v1/models` `input_modalities` from it.
 
 ## Requests (server → engine)
 
@@ -98,6 +107,7 @@ turn: `HWINFO`, `PERF`, `ENTROPY`, `GPUS`, `TIERS`, `EMAP`, `HITS` (formats belo
 |---|---|---|
 | `TIERS` | `TIERS <vram> <ram> <disk> <vram_gb> <ram_gb>` | expert count per tier + resident bytes |
 | `HWINFO` | `HWINFO <cores> <ram_total> <ram_avail> <ngpu> <vram_total> <cpu>\|<gpu>` | host snapshot (GBs are floats) |
+| `CAPS` | `CAPS key=value ...` | handshake only, between `READY` and `STAT`: what the engine loaded (`vision=0\|1`) |
 | `EMAP` | `EMAP <rows> <cols> <hex>` | one byte per expert, row-major over `rows×cols` (sparse layers +MTP × experts): `byte = (tier<<6) \| heat` — 2-bit tier (0 disk / 1 RAM / 2 VRAM), 6-bit log₂-bucketed usage heat |
 | `HITS` | `HITS <rows> <cols> <hex>` | 1 bit per expert, experts routed since the previous `HITS` |
 | `PERF` | `PERF <id> <dt> <t_edisk> <t_ewait> <t_emm> <t_attn> <t_kvb> <t_head>` | this turn's PROFILO deltas, seconds |

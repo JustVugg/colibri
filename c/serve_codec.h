@@ -358,12 +358,23 @@ static inline ColiServeReadResult coli_serve_read_command(
     return coli_serve_read_command_alloc(input, profile, command, malloc);
 }
 
-static inline int coli_serve_write_ready(FILE *output, double rss_gb)
+/* The handshake, with an optional CAPS line between READY and STAT: what the
+ * engine loaded, as "key=value ..." (today `vision=0|1`). It sits BEFORE the
+ * status line on purpose: the server reads it while it waits for STAT, so it
+ * knows what it serves before the first request arrives. NULL writes the
+ * handshake exactly as coli_serve_write_ready() always has. */
+static inline int coli_serve_write_ready_caps(FILE *output, double rss_gb, const char *caps)
 {
     if (fputs("\x01\x01READY\x01\x01\n", output) == EOF ||
+        (caps && fprintf(output, "CAPS %s\n", caps) < 0) ||
         fprintf(output, "STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb) < 0)
         return 0;
     return fflush(output) == 0;
+}
+
+static inline int coli_serve_write_ready(FILE *output, double rss_gb)
+{
+    return coli_serve_write_ready_caps(output, rss_gb, NULL);
 }
 
 static inline int coli_serve_write_accept(FILE *output, const char *id, int prompt_tokens)

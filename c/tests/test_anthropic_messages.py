@@ -30,11 +30,13 @@ class FakeEngine:
         self.script = script
         self.length_limited = length_limited
         self.prompts = []
+        self.images = []
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None,
-                 on_tool=None):
+                 on_tool=None, image=None):
         self.prompts.append(prompt)
+        self.images.append(image)
         self.emitted = 0
         for chunk in self.script:
             on_text(chunk)
@@ -116,6 +118,99 @@ class TranslationTest(unittest.TestCase):
         # system turn only when the upstream rejection matches this contract.
         self.assertIn("not supported", error.message)
         self.assertRegex(error.message, re.compile(r"role .{0,2}system", re.IGNORECASE))
+
+    # ---- image blocks -------------------------------------------------------------------
+    # An Anthropic client sends a picture as {"type": "image", "source": {"type": "base64",
+    # "media_type": ..., "data": ...}}; the OpenAI endpoint already takes the same picture
+    # as an image_url data: URI, and expand_*_images() turns that into the engine's
+    # placeholders. The translation must produce exactly that part, in place, so the two
+    # endpoints cannot disagree about where a picture sits in the conversation.
+    PNG = {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                       "data": "iVBORw0KGgo="}}
+    PNG_PART = {"type": "image_url",
+                "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+
+    def test_image_block_becomes_an_image_url_part_in_place(self):
+        messages = anthropic_to_openai({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "What is this?"},
+                                         self.PNG,
+                                         {"type": "text", "text": "Be brief."}]}]})
+        self.assertEqual(messages, [{"role": "user", "content": [
+            {"type": "text", "text": "What is this?"}, self.PNG_PART,
+            {"type": "text", "text": "Be brief."}]}])
+
+    def test_text_only_content_still_collapses_to_a_string(self):
+        # Every existing renderer and test relies on this shape; a picture-free
+        # message must not start arriving as a parts list.
+        messages = anthropic_to_openai({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "a"},
+                                         {"type": "text", "text": "b"}]}]})
+        self.assertEqual(messages, [{"role": "user", "content": "ab"}])
+
+    def test_tool_result_image_rides_the_following_user_turn(self):
+        # Claude Code's Read tool on a .png returns the picture INSIDE the tool_result.
+        # The tool role carries text only, so the picture is carried onto the user
+        # turn that follows the results -- the model still sees it right after the
+        # tool answered, which is where the client put it.
+        messages = anthropic_to_openai({"messages": [
+            {"role": "user", "content": "look at it"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"p": "x.png"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": [{"type": "text", "text": "(image)"}, self.PNG]},
+                {"type": "text", "text": "and?"}]},
+        ]})
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "tool", "user"])
+        self.assertEqual(messages[2]["content"], "(image)")
+        self.assertEqual(messages[3]["content"],
+                         [self.PNG_PART, {"type": "text", "text": "and?"}])
+
+    def test_tool_result_image_alone_still_makes_a_user_turn(self):
+        # ...even when the tool_result is the whole message (no user text): dropping
+        # the picture here is exactly the silent loss this exists to prevent.
+        messages = anthropic_to_openai({"messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [self.PNG]}]},
+        ]})
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "tool", "user"])
+        self.assertEqual(messages[2]["content"], "")
+        self.assertEqual(messages[3]["content"], [self.PNG_PART])
+
+    def test_image_in_an_assistant_message_is_refused(self):
+        for content in ([self.PNG],
+                        [{"type": "tool_result", "tool_use_id": "t1", "content": [self.PNG]}]):
+            with self.assertRaises(APIError) as caught:
+                anthropic_to_openai({"messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": content}]})
+            self.assertEqual(caught.exception.status, 400)
+            self.assertIn("user messages", caught.exception.message)
+            self.assertEqual(caught.exception.param, "messages.1.content.0")
+
+    def test_image_source_is_validated(self):
+        for source in ({"type": "base64", "media_type": "image/png"},          # no data
+                       {"type": "base64", "data": "abc"},                       # no media_type
+                       {"type": "file", "file_id": "f1"},                       # not supported
+                       "not-an-object"):
+            with self.assertRaises(APIError) as caught:
+                anthropic_to_openai({"messages": [{"role": "user", "content": [
+                    {"type": "image", "source": source}]}]})
+            self.assertEqual(caught.exception.status, 400)
+            self.assertTrue(caught.exception.param.startswith("messages.0.content.0.source"),
+                            caught.exception.param)
+
+    def test_url_source_is_handed_to_the_same_refusal_as_the_openai_path(self):
+        # The OpenAI endpoint refuses to fetch a remote URL by policy; the same URL
+        # arriving as an Anthropic `url` source must reach that same refusal, not a
+        # different one and not a fetch.
+        messages = anthropic_to_openai({"messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}}]}]})
+        self.assertEqual(messages[0]["content"],
+                         [{"type": "image_url", "image_url": {"url": "https://x/y.png"}}])
 
 
 class MessagesHTTPTest(unittest.TestCase):
@@ -345,6 +440,44 @@ class MessagesHTTPTest(unittest.TestCase):
             {"type": "text", "text": "answer"},
         ])
 
+    def test_glm53_reasoning_without_thinking_is_kept_out_of_the_answer(self):
+        """GLM-5.3 opens <think> even with thinking off (#1278): the reasoning it writes
+        must not be glued to the answer, and a request that did not ask for thinking
+        gets no thinking block, so content[0] is the answer."""
+        self.engine.script = ("Let me think", "</think>", "Paris.")
+        with patch("openai_server.ARCH", "glm53"):
+            with self.post(self.base_body()) as response:
+                payload = json.load(response)
+            self.assertEqual(payload["content"], [{"type": "text", "text": "Paris."}])
+
+    def test_streamed_glm53_reasoning_without_thinking_is_kept_out_of_the_answer(self):
+        self.engine.script = ("Let me think", "</think>", "Paris.")
+        with patch("openai_server.ARCH", "glm53"):
+            with self.post(self.base_body(stream=True)) as response:
+                raw = response.read().decode()
+        payloads = [json.loads(line[len("data: "):]) for line in raw.splitlines()
+                    if line.startswith("data: ")]
+        starts = [p for p in payloads if p["type"] == "content_block_start"]
+        self.assertEqual([(p["index"], p["content_block"]["type"]) for p in starts],
+                         [(0, "text")])
+        deltas = [p for p in payloads if p["type"] == "content_block_delta"]
+        self.assertEqual({(p["index"], p["delta"]["type"]) for p in deltas},
+                         {(0, "text_delta")})
+        self.assertEqual("".join(p["delta"]["text"] for p in deltas), "Paris.")
+        self.assertNotIn("</think>", raw)
+        self.assertNotIn("Let me think", raw)
+
+    def test_glm53_reasoning_with_thinking_gets_its_own_block(self):
+        self.engine.script = ("Let me think", "</think>", "Paris.")
+        with patch("openai_server.ARCH", "glm53"):
+            with self.post(self.base_body(thinking={"type": "enabled",
+                                                    "budget_tokens": 1024})) as response:
+                payload = json.load(response)
+            self.assertEqual(payload["content"], [
+                {"type": "thinking", "thinking": "Let me think", "signature": "colibri-local"},
+                {"type": "text", "text": "Paris."},
+            ])
+
     def test_inkling_thinking_uses_inkling_content_markers(self):
         self.engine.script = ("<|content_thinking|>reason", "ing<|content_text|>answer",)
         with patch("openai_server.ARCH", "inkling"):
@@ -443,6 +576,63 @@ class MessagesHTTPTest(unittest.TestCase):
             self.addCleanup(caught.exception.close)
             self.assertEqual(caught.exception.code, 400)
             self.assertIn(field, json.load(caught.exception)["error"]["message"])
+
+    # ---- images end to end -----------------------------------------------------------
+    # The translation alone is not the contract: the picture has to reach the engine.
+    # The OpenAI path expands image parts into the family's placeholders and hands the
+    # patches to Engine.generate(image=...) beside the prompt; /v1/messages goes
+    # through the same expansion, so the placeholder count and the patches cannot
+    # disagree between the two endpoints.
+    IMAGE = {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                         "data": "iVBORw0KGgo="}}
+
+    def fake_preprocess(self, data, model_dir):
+        self.preprocessed.append(data)
+        return b"\x00" * 16, 4, 4                 # 2x2 = 4 placeholders after merging
+
+    def test_image_block_reaches_the_glm53_engine(self):
+        self.preprocessed = []
+        messages = [{"role": "user", "content": [{"type": "text", "text": "what is this?"},
+                                                 self.IMAGE]}]
+        with patch("openai_server.ARCH", "glm53"), \
+             patch("openai_server._preprocess_image", self.fake_preprocess):
+            with self.post(self.base_body(messages=messages)) as response:
+                self.assertEqual(response.status, 200)
+        self.assertEqual(self.preprocessed, [b"\x89PNG\r\n\x1a\n"])
+        self.assertEqual(self.engine.images, [(b"\x00" * 16, 4, 4)])
+        self.assertIn("<|user|>what is this?<|begin_of_image|>" + "<|image|>" * 4
+                      + "<|end_of_image|><|assistant|>", self.engine.prompts[-1])
+
+    def test_tool_result_image_reaches_the_glm53_engine_after_the_observation(self):
+        self.preprocessed = []
+        messages = [
+            {"role": "user", "content": "read it"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"p": "x.png"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [self.IMAGE]}]},
+        ]
+        with patch("openai_server.ARCH", "glm53"), \
+             patch("openai_server._preprocess_image", self.fake_preprocess):
+            with self.post(self.base_body(messages=messages)) as response:
+                self.assertEqual(response.status, 200)
+        self.assertEqual(self.engine.images, [(b"\x00" * 16, 4, 4)])
+        prompt = self.engine.prompts[-1]
+        self.assertLess(prompt.index("<|observation|>"), prompt.index("<|begin_of_image|>"))
+        self.assertIn("<|user|><|begin_of_image|>" + "<|image|>" * 4 + "<|end_of_image|>",
+                      prompt)
+
+    def test_two_images_are_refused_like_the_openai_path(self):
+        self.preprocessed = []
+        messages = [{"role": "user", "content": [self.IMAGE, self.IMAGE]}]
+        with patch("openai_server.ARCH", "glm53"), \
+             patch("openai_server._preprocess_image", self.fake_preprocess):
+            with self.assertRaises(HTTPError) as caught:
+                self.post(self.base_body(messages=messages))
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 400)
+        self.assertIn("one image per request", json.load(caught.exception)["error"]["message"])
+        self.assertEqual(self.engine.images, [])
 
 
 if __name__ == "__main__":

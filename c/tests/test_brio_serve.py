@@ -14,9 +14,17 @@ byte-identical frames it produced before the channel existed. Chat is the mode
 everyone uses; the scoring channel is opt-in and must stay that way. The check
 is a byte diff of the frames, not a reading of the text.
 
-Runs against the tiny olmoe fixture the oracle job already builds
-(tools/make_olmoe_tiny.py + convert_olmoe_merged.py), so it needs no
-checkpoint. Skipped when the fixture is absent, like the other serve tests.
+Runs against the CONVERTED tiny olmoe fixture, olmoe_tiny_c, that the
+`olmoe-tiny-check` CI job builds and runs this module on, so it needs no
+checkpoint. From c/:
+
+    python3 tools/make_olmoe_tiny.py --output olmoe_tiny
+    python3 tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
+    python3 tools/make_edge_tiny_tokenizer.py --vocab-size 128 olmoe_tiny_c
+
+olmoe_tiny is the HF source checkpoint the engine cannot load, and it has a
+config.json too: the guard below looks for the tokenizer, which only the
+converted fixture has, so a missing fixture skips instead of failing (#1742).
 """
 import json
 import os
@@ -27,7 +35,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
 ENGINE = HERE / ("olmoe.exe" if sys.platform == "win32" else "olmoe")
-FIXTURE = Path(os.environ.get("OLMOE_TINY", HERE / "olmoe_tiny"))
+FIXTURE = Path(os.environ.get("OLMOE_TINY", HERE / "olmoe_tiny_c"))
 PROMPT = "Context: the release is late and the tests are red.\nQuestion: ship?\nAnswer:"
 OPTION = " no"
 
@@ -102,8 +110,10 @@ def strip_volatile(frames):
             if not f.startswith(("STAT", "PROF", "DONE", "TIERS", "HWINFO", "EMAP", "HITS"))]
 
 
-@unittest.skipUnless((FIXTURE / "config.json").is_file(),
-                     "tiny olmoe fixture is absent (tools/make_olmoe_tiny.py)")
+@unittest.skipUnless((FIXTURE / "tokenizer.json").is_file(),
+                     "converted tiny olmoe fixture is absent: see the module "
+                     "docstring (make_olmoe_tiny.py, convert_olmoe_merged.py, "
+                     "make_edge_tiny_tokenizer.py)")
 @unittest.skipUnless(ENGINE.is_file(), "olmoe engine is not built")
 class BrioServe(unittest.TestCase):
     def test_a_snapshot_scores_exactly_like_a_cold_recompute(self):

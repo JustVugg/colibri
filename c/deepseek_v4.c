@@ -5155,8 +5155,8 @@ static int moe_token_pipeline(float *output,
     }
     if (!result && gpu_compute && store->gpu) {
         void *sg = coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
-        void *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
-        void *sd = coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
+        void *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
+        void *sd = coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
         int moe_ok = sg && su && sd;
         void **gates = malloc((size_t)selected * sizeof(*gates));
         void **ups = malloc((size_t)selected * sizeof(*ups));

@@ -67,6 +67,27 @@ int main(void) {
         }
     }
 
+    /* The qpack reader goes through json_parse_checked: exact grammar, no
+     * trailing input, no NUL inside an object key. */
+    root = json_parse_checked(" {\"exact\":[0,-2.5,3e2]} \n");
+    CHECK(root && root->t == J_OBJ);
+    json_free(root);
+
+    static const char *malformed[] = {
+        "{\"a\" 1}",
+        "{\"a\":\"unterminated}",
+        "{\"a\":1",
+        "{\"a\":1} trailing",
+        "{\"a\":1,}",
+        "[1,]",
+        "{\"a\":1e}",
+        "{\"magic\\u0000suffix\":\"QPACK\"}",
+        "{\"a\":1}\v"
+    };
+    for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++)
+        CHECK(json_parse_checked(malformed[i]) == NULL);
+
+
     puts("json tests: ok");
     return 0;
 }

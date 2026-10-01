@@ -71,12 +71,8 @@ static int i4_acc512_selftest(void){
 }
 #endif
 
-/* ---- y[S,O] = x[S,I] @ W^T, W[O,I] f32 ---------------------------------- */
-static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
-    #pragma omp parallel for schedule(static)
-    for (int o=0;o<O;o++){ const float *w=W+(int64_t)o*I;
-        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; for(int i=0;i<I;i++) a+=xs[i]*w[i]; y[(int64_t)s*O+o]=a; } }
-}
+/* ---- y[S,O] = x[S,I] @ W^T, W[O,I] f32: matmul_f32.h ------------------- */
+#include "matmul_f32.h"
 
 /* ---- y[S,O] = x[S,I] @ W^T, W int8 per-row + scale[O] ------------------- */
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int S, int I, int O){
@@ -572,8 +568,8 @@ static inline __m256 bf16_decode8(const uint16_t *p) {
    So clang gets the fast kernel and GCC keeps upstream's, which is exact on
    every arch tested. */
 #if defined(__clang__)
-static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
-                       int S, int I, int O){
+static void matmul_fp8_scalar(float *y, const float *x, const uint8_t *q8, const float *bscale,
+                              int S, int I, int O){
     int64_t nblkI = fp8_nblk(I);
     /* Four output rows per pass, each with its own accumulator.  Every row's
        addition sequence is identical to the one-row form - same operands, same
@@ -599,10 +595,20 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
                 float acc0=0,acc1=0,acc2=0,acc3=0;
                 for(int i=base;i<base+blen;i++){
                     float xv=xs[i];
+#if defined(__aarch64__)
+                    /* SVE review: explicit fma pins the chain FUSED regardless of
+                       -ffp-contract or the auto-vectoriser (gcc on SVE lowers a
+                       plain acc += w*x to unfused fadda and diverges from vfmaq). */
+                    acc0 = __builtin_fmaf(e4m3_decode(w0[i]),xv,acc0);
+                    acc1 = __builtin_fmaf(e4m3_decode(w1[i]),xv,acc1);
+                    acc2 = __builtin_fmaf(e4m3_decode(w2[i]),xv,acc2);
+                    acc3 = __builtin_fmaf(e4m3_decode(w3[i]),xv,acc3);
+#else
                     acc0 += e4m3_decode(w0[i])*xv;
                     acc1 += e4m3_decode(w1[i])*xv;
                     acc2 += e4m3_decode(w2[i])*xv;
                     acc3 += e4m3_decode(w3[i])*xv;
+#endif
                 }
                 a0 += (double)acc0*scl0[bi];
                 a1 += (double)acc1*scl1[bi];
@@ -619,8 +625,8 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
 #else
 /* GCC and everything else: upstream's one-row kernel, unchanged.  Exact on
    every -march tested; see the note above for why it is not simply replaced. */
-static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
-                       int S, int I, int O){
+static void matmul_fp8_scalar(float *y, const float *x, const uint8_t *q8, const float *bscale,
+                              int S, int I, int O){
     int64_t nblkI = fp8_nblk(I);
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){
@@ -633,7 +639,12 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
             for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
                 int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
                 float sc=scl[bi]; float acc=0;
+#if defined(__aarch64__)
+                /* see the SVE note in the clang arm above */
+                for(int i=base;i<base+blen;i++) acc = __builtin_fmaf(e4m3_decode(w[i]),xs[i],acc);
+#else
                 for(int i=base;i<base+blen;i++) acc += e4m3_decode(w[i])*xs[i];
+#endif
                 a += (double)acc*sc;
             }
             y[(int64_t)s*O+o]=(float)a;
@@ -641,6 +652,72 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
     }
 }
 #endif
+
+#ifdef __ARM_NEON
+/* Batched (prefill) NEON arm: 16 output rows x 4 tokens per pass.  Each block's
+   16 rows are decoded once into a column-major tile; each row's per-block sum is
+   then one vfmaq chain over i = base..base+blen-1 from zero -- the same fused
+   multiply-adds, in the same order, that clang (-ffp-contract=on) and GCC
+   (-ffp-contract=fast, the arm64 default) emit for the scalar form -- and the
+   double-precision block combine is unchanged, so the output is bit-identical to
+   matmul_fp8_scalar (test_fp8_passthrough checks it).  A 16-row tile never
+   straddles a FP8_BLOCK row block.  Rows past O are zero-padded and never
+   stored; token lanes past S clamp onto the last token and are never summed.
+   S < 4 stays scalar: one token cannot amortise the tile decode. */
+static void matmul_fp8_neon(float *y, const float *x, const uint8_t *q8, const float *bscale,
+                            int S, int I, int O){
+    int64_t nblkI = fp8_nblk(I);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o+=16){
+        int rn = O-o<16 ? O-o : 16;
+        const uint8_t *w = q8 + (int64_t)o*I;
+        const float *scl = bscale + ((int64_t)o/FP8_BLOCK)*nblkI;
+        float wt[FP8_BLOCK*16];                       /* wt[i*16+r] */
+        double a[64*16];
+        for(int s0=0;s0<S;s0+=64){
+            int sn = S-s0<64 ? S-s0 : 64;
+            memset(a,0,sizeof(double)*16*sn);
+            for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
+                int base=(int)(bi*FP8_BLOCK), blen=I-base<FP8_BLOCK ? I-base : FP8_BLOCK;
+                double sc=scl[bi];
+                for(int r=0;r<16;r++) for(int i=0;i<blen;i++)
+                    wt[i*16+r] = r<rn ? e4m3_decode(w[(int64_t)r*I+base+i]) : 0.f;
+                for(int s=0;s<sn;s+=4){
+                    const float *xt[4];
+                    float32x4_t c[4][4];
+                    for(int t=0;t<4;t++){
+                        xt[t] = x + (int64_t)(s0+(s+t<sn ? s+t : sn-1))*I + base;
+                        for(int k=0;k<4;k++) c[t][k]=vdupq_n_f32(0.f);
+                    }
+                    for(int i=0;i<blen;i++){
+                        const float *p = wt+i*16;
+                        float32x4_t w0=vld1q_f32(p),w1=vld1q_f32(p+4),w2=vld1q_f32(p+8),w3=vld1q_f32(p+12);
+                        for(int t=0;t<4;t++){
+                            float32x4_t xv=vdupq_n_f32(xt[t][i]);
+                            c[t][0]=vfmaq_f32(c[t][0],w0,xv); c[t][1]=vfmaq_f32(c[t][1],w1,xv);
+                            c[t][2]=vfmaq_f32(c[t][2],w2,xv); c[t][3]=vfmaq_f32(c[t][3],w3,xv);
+                        }
+                    }
+                    for(int t=0;t<4 && s+t<sn;t++){
+                        float acc[16]; double *as=a+(s+t)*16;
+                        for(int k=0;k<4;k++) vst1q_f32(acc+4*k,c[t][k]);
+                        for(int r=0;r<16;r++) as[r] += (double)acc[r]*sc;
+                    }
+                }
+            }
+            for(int s=0;s<sn;s++) for(int r=0;r<rn;r++) y[(int64_t)(s0+s)*O+o+r]=(float)a[s*16+r];
+        }
+    }
+}
+#endif
+
+static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
+                       int S, int I, int O){
+#ifdef __ARM_NEON
+    if(S>=4){ matmul_fp8_neon(y,x,q8,bscale,S,I,O); return; }
+#endif
+    matmul_fp8_scalar(y,x,q8,bscale,S,I,O);
+}
 
 
 /* f32 planare (fmt=2): stesso ordine di accumulazione di matmul_i4 (sequenza

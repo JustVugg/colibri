@@ -347,8 +347,11 @@ static void wf_load(shards *S, WF *w, const char *name, int64_t n) {
     w->n = n;
     w->w = xmalloc((size_t)n * sizeof(float), name);
     /* st_read_f32 widens bf16/f16 as well, so a checkpoint that stores one of these
-     * small tensors in bf16 rather than f32 still loads. */
-    if (st_read_f32(S, name, w->w, 0) != n) {
+     * small tensors in bf16 rather than f32 still loads.
+     * SEC: capped, because `n` comes from config.json and the element count from the
+     * file. Uncapped, a tensor longer than `n` was copied over the heap first and
+     * refused second, by the count check below, after the damage. */
+    if (st_read_f32_cap(S, name, w->w, n, 0) != n) {
         fprintf(stderr, "%s: expected %lld floats\n", name, (long long)n); exit(1); }
 }
 
@@ -546,6 +549,15 @@ static void engram_load_sidecar(Engram *e, const char *snap) {
     jval *multipliers = json_get(root, "multipliers");
     if (!primes || !offsets || !multipliers) {
         fprintf(stderr, "[engram] sidecar lacks primes/offsets/multipliers\n"); exit(1); }
+    /* SEC: the loop below indexes all three by table, up to the length of layer_ids --
+     * a different number, chosen by the same file. A shorter array was read past its
+     * end, and a key that is not an array has no kids at all. */
+    const jval *per_table[] = { primes, offsets, multipliers };
+    const char *per_table_name[] = { "primes", "offsets", "multipliers" };
+    for (int k = 0; k < 3; k++)
+        if (per_table[k]->t != J_ARR || per_table[k]->len < e->n_layers) {
+            fprintf(stderr, "[engram] %s must be an array with one entry per table (%d)\n",
+                    per_table_name[k], e->n_layers); exit(1); }
     for (int layer = 0; layer < e->n_layers; layer++) {
         jval *rows = primes->kids[layer];
         for (int n = 0; n < rows->len && n < V41_MAX_NGRAM; n++)
@@ -3537,7 +3549,10 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
     coli_serve_stdio_init();
     int eos_ids[8];
     int n_eos = serve_eos(m, snap, eos_ids, 8);
-    coli_serve_write_ready(stdout, rss_gb());
+    /* CAPS between READY and STAT: the gateway reads it in the handshake, so it
+     * knows the served modalities before the first request. m->vision is NULL
+     * for a text-only container and for a VL config whose tower is missing. */
+    coli_serve_write_ready_caps(stdout, rss_gb(), m->vision ? "vision=1" : "vision=0");
     serve_emap(m);
     float *logits = xmalloc((size_t)c->vocab * sizeof(float), "logits");
     /* tok_encode stops at its output capacity: one extra id distinguishes
@@ -3998,7 +4013,7 @@ int main(int argc, char **argv) {
     int *draft = block ? xmalloc((size_t)(block + 1) * sizeof(int), "drafts") : NULL;
     float *confidence = block ? xmalloc((size_t)block * sizeof(float), "draft confidence") : NULL;
     int spec_failed = 0, spec_checked = 0, round = 0;
-    uint64_t forced_prop = 0, forced_acc = 0;
+    uint64_t forced_prop = 0, forced_acc = 0, forced_rounds = 0;
 
     int matched = 0;
     double decode_started = now_s();
@@ -4045,10 +4060,16 @@ int main(int argc, char **argv) {
             /* 3 keeps the head's own drafts, which is what serving does; 1 and 2 put
              * the reference's tokens in their place so the verification path runs at
              * full width even on a fixture whose draft head is random noise */
-            if (force < 3) {
+            if (force != 3) {
                 for (int i = 0; i < drafted; i++) draft[1 + i] = expected[step + i];
-                if (force >= 2 && drafted > 0)
-                    draft[drafted] = (draft[drafted] + 1) % c->vocab;   /* one bad draft */
+                /* 2 rejects the last draft, 4 the first -- every drafted row is
+                 * rolled back, which is what serving at 10-30% acceptance does most
+                 * of the time -- and 5 a different one each round */
+                int bad = force == 2 ? drafted : force == 4 ? 1
+                        : force == 5 ? 1 + (int)(forced_rounds % (uint64_t)drafted) : 0;
+                if (bad > 0 && drafted > 0)
+                    draft[bad] = (draft[bad] + 1) % c->vocab;             /* one bad draft */
+                forced_rounds++;
             }
         } else {
             drafted = 0;                       /* the plain oracle decodes one at a time */

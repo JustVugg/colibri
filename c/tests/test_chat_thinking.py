@@ -33,6 +33,8 @@ from types import SimpleNamespace
 CLI = Path(__file__).resolve().parent.parent / "coli"
 
 SEEN_MESSAGES = []
+SEEN_BODIES = []
+SERVER_ARCH = {"value": None}   # what the fake /health reports as the family
 
 # The child is spawned with fork+EXEC, never bare fork: this test process is
 # multi-threaded (the fake SSE server runs in a thread), and pty.fork() from a
@@ -50,7 +52,8 @@ try:
     loader.exec_module(module)
 except SystemExit:
     pass
-module.chat_attached(SimpleNamespace(ngen=32, api_key=None),
+think = {"1": True, "0": False}.get(os.environ.get("COLI_TEST_THINK", ""))
+module.chat_attached(SimpleNamespace(ngen=32, api_key=None, think=think),
                      os.environ["COLI_TEST_BASE"], "fake-model")
 """
 
@@ -59,9 +62,21 @@ class FakeSSE(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def do_GET(self):
+        payload = {"status": "ok"}
+        if SERVER_ARCH["value"]:
+            payload["arch"] = SERVER_ARCH["value"]
+        data = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         SEEN_MESSAGES.append(body["messages"])
+        SEEN_BODIES.append(body)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -156,6 +171,27 @@ class ChatThinkingTest(unittest.TestCase):
 
     def setUp(self):
         SEEN_MESSAGES.clear()
+        SEEN_BODIES.clear()
+        SERVER_ARCH["value"] = None
+
+    def test_mimo_starts_with_thinking_off(self):
+        """MiMo's template thinks by default; at ~1 tok/s that is minutes of
+        reasoning before the answer, so coli chat asks for it off unless --think."""
+        SERVER_ARCH["value"] = "mimo"
+        out = run_chat(self.base, {"COLI_SHOW_THINK": "1"})
+        self.assertIn("thinking is off here", out)
+        self.assertTrue(SEEN_BODIES)
+        self.assertIs(SEEN_BODIES[0].get("enable_thinking"), False)
+
+    def test_mimo_think_flag_turns_it_on(self):
+        SERVER_ARCH["value"] = "mimo"
+        run_chat(self.base, {"COLI_SHOW_THINK": "1", "COLI_TEST_THINK": "1"})
+        self.assertIs(SEEN_BODIES[0].get("enable_thinking"), True)
+
+    def test_other_families_keep_the_server_default(self):
+        SERVER_ARCH["value"] = "glm"
+        run_chat(self.base, {"COLI_SHOW_THINK": "1"})
+        self.assertNotIn("enable_thinking", SEEN_BODIES[0])
 
     def test_thinking_is_shown_by_default(self):
         out = run_chat(self.base, {"COLI_SHOW_THINK": "1"})

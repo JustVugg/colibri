@@ -104,8 +104,10 @@ be clobbered by a draft several positions ahead:
 
 Each row saves what it displaced, and a rejected row puts it back. `V41_SPEC_FORCE` in
 the oracle drafts the reference's own next tokens (`1`), or corrupts the last of them
-so a round is rejected part way (`2`), or keeps the head's own (`3`); all three have to
-reproduce the reference token for token, and CI runs them.
+so a round is rejected part way (`2`), or keeps the head's own (`3`), or corrupts the
+first (`4`: every drafted row is rolled back, the common case at low acceptance) or a
+different one each round (`5`); all of them have to reproduce the reference token for
+token, and CI runs them.
 
 Drafting is on, and the default is a measurement. Three runs of the same
 24-token turn on a 16-thread CPU server holding 68% of the experts, each from a
@@ -358,7 +360,7 @@ and costs the contention. Anything that tries again has to start from that.
 | `V41_DSPARK` | on when the checkpoint carries the head | `0` disables the draft head and does not load it. Measured at +17% on the real checkpoint, cold; see above. |
 | `V41_DSPARK_MAX` | the checkpoint's `dspark_block_size` | how many of the drafted tokens are put in front of the main model. Fewer means a cheaper rejected round and a lower ceiling on the win. |
 | `V41_DSPARK_MINACC` | 60 | percent of drafts that must be accepted over a window of ten for drafting to continue; below it, drafts pause for 64 tokens. 60 is the measured break-even, not a guess. |
-| `V41_SPEC_FORCE` | unset | oracle mode only: draft the reference's tokens (`1`), corrupt the last one (`2`), or use the head's own (`3`), to exercise the verification path on a fixture whose draft head is random. |
+| `V41_SPEC_FORCE` | unset | oracle mode only: draft the reference's tokens (`1`), corrupt the last one (`2`), use the head's own (`3`), corrupt the first one (`4`) or a different one each round (`5`), to exercise the verification path on a fixture whose draft head is random. |
 
 ## Reusing a turn, and why it is asked for rather than assumed
 

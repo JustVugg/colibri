@@ -31,6 +31,11 @@ class FamilyCapabilities:
     grammar_payload: bool
     audio_payload: bool
     thinking: bool
+    # The gateway has a placeholder expansion for this family's pictures. Whether
+    # the checkpoint being served loaded its tower is the engine's word (the CAPS
+    # handshake line, openai_server.Engine.vision), never this bit's: a glm53
+    # export can carry vision_config and no model.visual.* tensors.
+    image: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +64,10 @@ class DisplayVariant:
     geometry: tuple
     display_name: str
     display_scale: str
+    # The API model id for this checkpoint, when it must not borrow the family's:
+    # set only where no id was ever announced for it, so existing clients of the
+    # 35B and 2.4T keep the id they were configured with.
+    model_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +76,9 @@ class PlannerGeometry:
     fixed_state_bytes: int
     workspace_bytes: int
     configured_experts: int
+    # A dense checkpoint (no expert count in its config): zero experts is its shape,
+    # not a broken MoE config, and the planner keeps every weight resident (#1757).
+    dense: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +155,15 @@ class FamilyDescriptor:
     # la geometria lo rende visibile. 0 = nessun riferimento dichiarato, il
     # banner stampa display_scale come sempre.
     reference_experts: int = 0
+    # "text" for the chat engines, "image" for a text-to-image pipeline. An
+    # image family has no KV cache, no experts and no chat template: coli
+    # routes it to the image REPL, the image planner and POST
+    # /v1/images/generations, and every text-only invariant (context variable,
+    # segment conformance, tuning) is scoped to modality "text".
+    modality: str = "text"
+    # Where the tokenizer lives, relative to the model directory. A diffusers
+    # pipeline keeps it in processor/, not at the root.
+    tokenizer_file: str = "tokenizer.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +261,10 @@ def _qwen36_geometry(config, context, _model_dir):
     conv_dim = key_heads * key_dim * 2 + value_heads * value_dim
     fixed = (layers - full) * (value_heads * key_dim * value_dim +
                                conv_dim * (conv_k - 1)) * 4
+    # A dense checkpoint of the family (Qwen3.8-27B, #1757) has no num_experts: nothing
+    # to cache, every weight resident.
+    if "num_experts" not in config:
+        return PlannerGeometry(kv, fixed, 0, 0, dense=True)
     return PlannerGeometry(kv, fixed, 0, _required_int(config, "num_experts", "qwen36"))
 
 
@@ -798,6 +823,61 @@ def _dsv41_geometry(config, context, _model_dir):
     return PlannerGeometry(state, fixed, workspace, experts)
 
 
+def _mimo_geometry(config, context, _model_dir):
+    """MiMo-V2.6: what mimo.c allocates per context (kv_alloc), in f32.
+
+        full-attention layers  context * kv_heads * (head_dim + v_head_dim) * 4
+        sliding-window layers  min(window, context) * swa_kv_heads * (swa_head_dim +
+                               swa_v_head_dim) * 4, a ring that never grows (fixed)
+
+    hybrid_layer_pattern says which is which (1 = sliding window). On Flash 39 of
+    the 48 layers are windowed, so a 1M context costs the KV of 9 layers.
+    Workspace mirrors forward()'s per-block buffers at the default 64-row block,
+    plus the full-attention score row per head.
+    """
+    layers = _required_int(config, "num_hidden_layers", "mimo")
+    experts = _required_int(config, "n_routed_experts", "mimo")
+    hidden = _required_int(config, "hidden_size", "mimo")
+    kv = _required_int(config, "num_key_value_heads", "mimo")
+    head_dim = _required_int(config, "head_dim", "mimo")
+    v_dim = config.get("v_head_dim", head_dim)
+    swa_kv = config.get("swa_num_key_value_heads", kv)
+    swa_hd = config.get("swa_head_dim", head_dim)
+    swa_vd = config.get("swa_v_head_dim", v_dim)
+    heads = _required_int(config, "num_attention_heads", "mimo")
+    for name, value in (("v_head_dim", v_dim), ("swa_num_key_value_heads", swa_kv),
+                        ("swa_head_dim", swa_hd), ("swa_v_head_dim", swa_vd)):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"mimo: {name} must be a positive integer")
+    pattern = config.get("hybrid_layer_pattern")
+    if not isinstance(pattern, list) or len(pattern) != layers:
+        raise ValueError("mimo: hybrid_layer_pattern must list every layer")
+    windowed = sum(1 for kind in pattern if kind == 1)
+    window = _required_int(config, "sliding_window", "mimo") if windowed else 0
+    state = (layers - windowed) * context * kv * (head_dim + v_dim) * 4
+    fixed = windowed * min(window, context) * swa_kv * (swa_hd + swa_vd) * 4
+    block = 64
+    workspace = (block * hidden * 6 + block * heads * (head_dim + v_dim) * 2
+                 + heads * context) * 4
+    return PlannerGeometry(state, fixed, workspace, experts)
+
+
+# What the checkpoint carries and mimo.c never loads: the three MTP layers (no
+# speculative decoding yet) and the audio encoder (text and images only).
+_MIMO_NOT_LOADED = re.compile(r"^(?:model\.mtp\.|audio_encoder\.|speech_embeddings\.)")
+
+
+def _mimo_expert_inventory(name, size, _config, _dtype=None):
+    match = _GLM_EXPERT.search(name)
+    if match is None or name.startswith("model.mtp."):
+        return ()
+    return ((int(match.group(1)), int(match.group(2)), size),)
+
+
+def _mimo_resident_inventory(name, size, _config, _dtype=None):
+    return 0 if _MIMO_NOT_LOADED.match(name) else size
+
+
 _DSV41_MTP_EXPERT = re.compile(r"^mtp\.(\d+)\.ffn\.experts\.(\d+)\.")
 
 
@@ -1127,7 +1207,7 @@ FAMILIES = (
         # share COMMON_CAP, which says otherwise -- the flag is descriptive
         # (it only feeds the capability dict) so nothing broke, but a client
         # reading it programmatically was told the opposite of the truth.
-        capabilities=FamilyCapabilities(True, False, False, True),
+        capabilities=FamilyCapabilities(True, False, False, True, image=True),
         has_gateway_adapter=True,
         has_cli_adapter=True,
         # Dal chat_template.jinja del checkpoint: nessun a capo, e <think>
@@ -1288,7 +1368,10 @@ FAMILIES = (
     ),
     FamilyDescriptor(
         id="qwen36",
-        model_types=("qwen3_5_moe", "qwen3_5_moe_text"),
+        # qwen3_5 / qwen3_5_text: the dense checkpoints of the same architecture
+        # (Qwen3.8-27B, #1757). The engine loads their MLP as an ungated shared
+        # expert and routes nothing.
+        model_types=("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5", "qwen3_5_text"),
         display_name="Qwen3.6-35B-A3B",
         display_scale="35B",
         # Both checkpoints declare qwen3_5_moe_text. Keyed on the three
@@ -1301,6 +1384,9 @@ FAMILIES = (
             DisplayVariant((("num_hidden_layers", 92), ("num_experts", 512),
                             ("hidden_size", 8192)),
                            "Qwen3.8-2.4T-A95B", "2.4T"),
+            DisplayVariant((("num_hidden_layers", 64), ("hidden_size", 5120),
+                            ("intermediate_size", 17408)),
+                           "Qwen3.8-27B", "27B", model_id="qwen3.8-27b-colibri"),
         ),
         engine_artifact="qwen36",
         engine_aliases=(),
@@ -1317,7 +1403,7 @@ FAMILIES = (
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         config_section="text_config",
         limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 8, "Q36_MAXT"),
-        capabilities=FamilyCapabilities(False, False, False, True),
+        capabilities=FamilyCapabilities(False, False, False, True, image=True),
         has_gateway_adapter=True,
         # coli run stays unwired on purpose: cmd_run dispatches per arch after
         # this gate, and without a qwen36 branch the engine would inherit GLM's
@@ -1350,7 +1436,7 @@ FAMILIES = (
         fixed_resident_inventory=_qwen38_fixed_resident_inventory,
         config_section="text_config",
         limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 1, "Q38_MAXT"),
-        capabilities=FamilyCapabilities(True, False, False, True),
+        capabilities=FamilyCapabilities(True, False, False, True, image=True),
         has_gateway_adapter=True,
         # Like Qwen3.6, direct `coli run` is intentionally not exposed until
         # an engine-specific CLI prompt path exists; chat/serve use the gateway.
@@ -1429,7 +1515,7 @@ FAMILIES = (
         # tools yes (DSML, see v41_dsml.py), grammars no: the engine reads the six-field
         # SUBMIT header and has no constrained decoder, so a grammar has to be refused
         # at the gateway rather than desync the wire.
-        capabilities=FamilyCapabilities(True, False, False, True),
+        capabilities=FamilyCapabilities(True, False, False, True, image=True),
         has_gateway_adapter=True,
         # coli run stays unwired, for the reason qwen36 gives above and one more:
         # cmd_run dispatches per arch after this gate, and with no deepseek_v41
@@ -1438,6 +1524,88 @@ FAMILIES = (
         # else, so a one-shot has nowhere to go but the gateway -- which is what
         # coli chat, coli serve and coli web already use.
         has_cli_adapter=False,
+    ),
+    FamilyDescriptor(
+        id="mimo",
+        model_types=("mimo_v2",),
+        display_name="MiMo-V2.6 Flash",
+        display_scale="309B",
+        # XiaomiMiMo/MiMo-V2.6-{Flash,Pro}: same architecture, two sizes.
+        reference_experts=256,
+        display_variants=(
+            DisplayVariant((("hidden_size", 4096), ("num_hidden_layers", 48),
+                            ("n_routed_experts", 256)),
+                           "MiMo-V2.6 Flash", "309B"),
+            DisplayVariant((("hidden_size", 6144), ("num_hidden_layers", 70),
+                            ("n_routed_experts", 384)),
+                           "MiMo-V2.6 Pro", "1.02T", model_id="mimo-v2.6-pro"),
+        ),
+        engine_artifact="mimo",
+        engine_aliases=(),
+        engine_group="mimo",
+        internal_arch="mimo",
+        build_target="mimo",
+        process_names=("mimo",),
+        default_model_id="mimo-v2.6-flash",
+        cli_adapter="mimo",
+        gateway_adapter="mimo",
+        planner_id="mimo",
+        planner_geometry=_mimo_geometry,
+        planner_unsupported_reason="",
+        # CPU-only: mimo.c links no accelerator backend (see deepseek_v41 above for
+        # why the planner must not offer a VRAM tier the engine cannot use).
+        supports_accelerator=False,
+        expert_inventory=_mimo_expert_inventory,
+        resident_inventory=_mimo_resident_inventory,
+        config_section="root",
+        # top-8 routing: the engine raises any smaller cache to one routing step
+        limits=FamilyLimits(8192, 1048576, 1024, 16384, 1, 16, "CTX"),
+        # tools (the XML call form, parse_mimo_tool_calls), thinking (on by default,
+        # as the template has it); no grammars, no audio in or out
+        capabilities=FamilyCapabilities(True, False, False, True, image=True),
+        has_gateway_adapter=True,
+        # the engine is driven through the gateway (SERVE); coli run has no mimo
+        # branch and would fall through to GLM's binary, as for deepseek_v41
+        has_cli_adapter=False,
+        # the gateway's cue with thinking on (render_chat_mimo): the template's
+        # ChatML with no newline after <|im_end|>, and the <think> the model writes
+        tune_prompt_template="<|im_start|>user\n{prompt}<|im_end|><|im_start|>assistant\n<think>",
+    ),
+    FamilyDescriptor(
+        id="qwen_image",
+        # A diffusers pipeline has no config.json at its root: the family is
+        # read from model_index.json's _class_name (see resolve_model), which
+        # is what this entry holds, normalized like every model_type.
+        model_types=("qwenimage21pipeline",),
+        display_name="Qwen-Image-2.1",
+        display_scale="",
+        engine_artifact="qwenimage",
+        engine_aliases=(),
+        engine_group="qwenimage",
+        internal_arch="qwenimage",
+        build_target="qwenimage",
+        process_names=("qwenimage",),
+        default_model_id="qwen-image-2.1-colibri",
+        cli_adapter="qwen_image",
+        gateway_adapter="qwen_image",
+        planner_id="qwen_image",
+        planner_geometry=None,
+        planner_unsupported_reason=(
+            "an image model has no KV cache and no experts; coli plan sizes its "
+            "text encoder, DiT and VAE instead (image_engine.plan_image_model)"),
+        expert_inventory=lambda _name, _size, _config, _dtype=None: (),
+        config_section="root",
+        # One image at a time, and no context or output-token budget: the
+        # limits exist because every descriptor has them. No context variable
+        # either (empty): the launcher refuses --ctx for this modality rather
+        # than inventing a knob the engine does not read.
+        limits=FamilyLimits(1, 1, 1, 1, 1, 0, ""),
+        capabilities=FamilyCapabilities(False, False, False, False),
+        has_gateway_adapter=True,
+        has_cli_adapter=True,
+        supports_accelerator=False,
+        modality="image",
+        tokenizer_file="processor/tokenizer.json",
     ),
 )
 
@@ -1461,7 +1629,9 @@ def _build_registry(families):
                 not isinstance(family.has_gateway_adapter, bool) or
                 not isinstance(family.has_cli_adapter, bool) or
                 not isinstance(family.tune_prompt_template, str) or
-                "{prompt}" not in family.tune_prompt_template):
+                "{prompt}" not in family.tune_prompt_template or
+                family.modality not in ("text", "image") or
+                not isinstance(family.tokenizer_file, str) or not family.tokenizer_file):
             raise RegistryError(f"incomplete family descriptor: {family.id}")
         try:
             family.tune_prompt_template.format(prompt="test", prompt_len=4)
@@ -1526,11 +1696,30 @@ def family_by_id(family_id):
 def family_for_config(config):
     if not isinstance(config, dict):
         raise FamilyConfigError("config.json is not a JSON object")
+    if "model_type" not in config and isinstance(config.get("_class_name"), str):
+        # A diffusers model_index.json: the pipeline class is its model type.
+        return family_for_index(config)
     model_type = _normalize_model_type(config.get("model_type"))
     try:
         return _BY_TYPE[model_type]
     except KeyError as error:
         raise UnknownFamilyError(f"unsupported model_type: {model_type}") from error
+
+
+def family_for_index(index):
+    """The family of a diffusers pipeline, from its model_index.json."""
+    if not isinstance(index, dict):
+        raise FamilyConfigError(f"{MODEL_INDEX} is not a JSON object")
+    name = index.get("_class_name")
+    if not isinstance(name, str) or not name.strip():
+        raise FamilyConfigError(f"{MODEL_INDEX} has no non-empty string _class_name")
+    try:
+        family = _BY_TYPE[_normalize_model_type(name)]
+    except KeyError as error:
+        raise UnknownFamilyError(f"unsupported diffusers pipeline: {name}") from error
+    if family.modality != "image":
+        raise UnknownFamilyError(f"unsupported diffusers pipeline: {name}")
+    return family
 
 
 def tuning_replay_prompt(family, prompt):
@@ -1539,9 +1728,26 @@ def tuning_replay_prompt(family, prompt):
     return family.tune_prompt_template.format(prompt=prompt, prompt_len=len(prompt))
 
 
+MODEL_INDEX = "model_index.json"
+
+
 def resolve_model(model_dir):
     model = Path(model_dir).expanduser().resolve()
     path = model / "config.json"
+    if not path.is_file() and (model / MODEL_INDEX).is_file():
+        # A diffusers pipeline (Qwen-Image): the root carries model_index.json
+        # and each component keeps its own config.json in its own directory.
+        # config.json wins when both exist, so a text checkpoint that happens
+        # to ship an index is never read as an image model.
+        try:
+            index = json.loads((model / MODEL_INDEX).read_text(encoding="utf-8"))
+        except OSError as error:
+            raise FamilyConfigError(f"cannot read {MODEL_INDEX}: {model}") from error
+        except json.JSONDecodeError as error:
+            raise FamilyConfigError(f"invalid {MODEL_INDEX}: {error}") from error
+        family = family_for_index(index)
+        return ResolvedFamily(family, _normalize_model_type(index["_class_name"]),
+                              index, index, str(model))
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
     except OSError as error:
@@ -1549,7 +1755,8 @@ def resolve_model(model_dir):
             f"cannot read config.json: {model}\n"
             "  coli picks the engine from config.json, so nothing runs without it. Copy the\n"
             "  checkpoint's config.json (with tokenizer.json and model.safetensors.index.json)\n"
-            "  from the model repo next to the shards.") from error
+            "  from the model repo next to the shards. An image model (a diffusers pipeline)\n"
+            "  carries model_index.json instead.") from error
     except json.JSONDecodeError as error:
         raise FamilyConfigError(f"invalid config.json: {error}") from error
     family = family_for_config(config)
@@ -1560,6 +1767,17 @@ def resolve_model(model_dir):
             raise FamilyConfigError(f"{family.id}: text_config is not an object")
     return ResolvedFamily(family, _normalize_model_type(config.get("model_type")),
                           config, family_config, str(model))
+
+
+def default_model_id(resolved):
+    """The API model id for what was actually loaded: its display variant's, if it has
+    one of its own, else the family's."""
+    family = resolved.descriptor
+    config = resolved.family_config
+    for variant in family.display_variants:
+        if variant.model_id and all(config.get(key) == value for key, value in variant.geometry):
+            return variant.model_id
+    return family.default_model_id
 
 
 def display_for(resolved):
@@ -1598,7 +1816,7 @@ def planner_geometry(resolved, context):
             for value in (geometry.context_state_bytes, geometry.fixed_state_bytes,
                           geometry.workspace_bytes, geometry.configured_experts)):
         raise RegistryError(f"invalid planner geometry for {resolved.descriptor.id}")
-    if geometry.configured_experts < 1:
+    if geometry.configured_experts < 1 and not geometry.dense:
         raise ValueError(f"{resolved.descriptor.id}: configured expert count is zero")
     return geometry
 
@@ -1684,6 +1902,8 @@ def public_metadata(family):
         "gateway_adapter": family.gateway_adapter,
         "planner_id": family.planner_id,
         "supports_accelerator": family.supports_accelerator,
+        "modality": family.modality,
+        "tokenizer_file": family.tokenizer_file,
         "limits": {
             "default_context": family.limits.default_context,
             "max_context": family.limits.max_context,
@@ -1698,5 +1918,6 @@ def public_metadata(family):
             "grammar_payload": family.capabilities.grammar_payload,
             "audio_payload": family.capabilities.audio_payload,
             "thinking": family.capabilities.thinking,
+            "image": family.capabilities.image,
         },
     }

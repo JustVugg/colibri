@@ -23,16 +23,18 @@ Usage:
     # 3. compare (exit 0 = byte-identical modulo normalized fields):
     python3 tests/golden_fixture_capture.py diff fixtures_pre fixtures_post
 
-Battery: chat, chat+tools, chat streaming, completions without logprobs, and
-the error cases whose behavior must not move (array-prompt 400, logprobs 400,
-out-of-range temperature 400), plus one case that is a no-op from this change
-on (seed accepted-and-ignored), plus /v1/models.
+Battery: chat, chat+tools, chat streaming, completions without logprobs, the
+seed case that is a no-op from #1720 on (accepted-and-ignored, formerly a 400),
+the logprobs case now served on the glm engine (formerly a 400 too), and the
+error cases whose behavior must not move (array-prompt 400, out-of-range
+temperature 400) plus /v1/models.
 
-A pre/post diff spanning this change prints `err_seed.json: MISSING on one
-side` and `seed_accepted.json: MISSING on one side`, then exits 1: the
-rename means the two captures carry different keys for this one case, so
-`diff()` cannot pair them under either name. That pair is expected across
-this change and is the only expected difference.
+A pre/post diff spanning these changes prints four MISSING-on-one-side lines
+and exits 1: `err_seed.json` / `seed_accepted.json` for the seed rename, and
+`err_logprobs.json` / `logprobs_served.json` for the logprobs one. Each rename
+means the two captures carry different keys for that one case, so `diff()`
+cannot pair them under either name. Those two pairs are expected across these
+changes and are the only expected differences.
 
 Normalization: every "id"/"created" field (recursively, and per SSE event) is
 replaced with a constant; nothing else is touched. Generation-bearing requests
@@ -89,8 +91,9 @@ def battery(model):
          {"model": model, "prompt": "hello", "max_tokens": 1, "temperature": 0, "seed": 1234}),
         ("err_array_prompt", "POST", "/v1/completions",
          {"model": model, "prompt": [1, 2, 3], "max_tokens": 1}),
-        ("err_logprobs", "POST", "/v1/completions",
-         {"model": model, "prompt": "hello", "max_tokens": 1, "logprobs": 1}),
+        ("logprobs_served", "POST", "/v1/completions",
+         {"model": model, "prompt": "The capital of France is",
+          "max_tokens": 4, "temperature": 0, "logprobs": 1}),
         ("err_bad_temperature", "POST", "/v1/chat/completions",
          {"model": model, "messages": chat_messages,
           "max_tokens": 1, "temperature": 9}),

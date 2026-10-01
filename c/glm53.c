@@ -724,11 +724,20 @@ typedef struct {
     ColiVisionBlock *vblocks;
 } GModel;
 
-static const float *load_f32(GModel *m, const char *fmt, ...) {
+/* `want` e' quanti valori legge chi usa il tensore, contati dalla config. Il
+ * buffer e' grande quanto dice l'header del file: se dice meno, la prima norma
+ * o il router leggerebbero oltre la fine. Di piu' si accetta, come fa
+ * deepseek_v4 (GHSA-9gjf): un checkpoint col padding resta buono. */
+static const float *load_f32(GModel *m, int64_t want, const char *fmt, ...) {
     char name[512];
     va_list args; va_start(args, fmt); vsnprintf(name, sizeof(name), fmt, args); va_end(args);
     st_tensor *t = st_find(&m->S, name);
     if (!t) { fprintf(stderr, "missing tensor %s\n", name); exit(1); }
+    if (t->numel < want) {
+        fprintf(stderr, "%s: %lld values, the config needs %lld\n", name,
+                (long long)t->numel, (long long)want);
+        exit(1);
+    }
     float *buffer = malloc((size_t)t->numel * sizeof(float));
     if (!buffer) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
     st_read_f32_cap(&m->S, name, buffer, t->numel, 0);
@@ -986,6 +995,52 @@ static void mv(float *out, const Mat *w, const float *x) {
     }
 }
 
+/* mv for S rows at once: out[S, rows] = x[S, columns] W^T. The kernels compute
+ * each (row, output) pair exactly as the one-row call does, so every token
+ * gets the same bits as S separate mv calls. What changes is the traffic: W is
+ * read once for the whole batch instead of once per token, which is the whole
+ * cost of a prefill, since at one token the dense matrices are bandwidth-bound.
+ * Matrices that live on a GPU keep the per-row path they already have. */
+static void mm(float *out, const Mat *w, const float *x, int S) {
+    int gpu = 0;
+#ifdef COLI_METAL
+    gpu |= g_metal_ready && w->resident && (w->fmt == 1 || w->fmt == 4);
+#endif
+#ifdef COLI_VULKAN
+    gpu |= g_vk_ready && w->resident && (w->fmt == 1 || w->fmt == 4);
+#endif
+    if (S == 1 || gpu) {
+        for (int t = 0; t < S; t++)
+            mv(out + (size_t)t * w->rows, w, x + (size_t)t * w->columns);
+        return;
+    }
+    switch (w->fmt) {
+    case 4: matmul_i4_grouped(out, x, w->q4, w->s, S, w->columns, w->rows, w->gs); break;
+    case 1: matmul_q(out, x, w->q8, w->s, S, w->columns, w->rows); break;
+    default: matmul(out, x, w->f, S, w->columns, w->rows); break;
+    }
+}
+
+/* mv_rows for S rows: out[S, rows] from x[S, columns] and W's rows
+ * [row0, row0 + rows). */
+static void mm_rows(float *out, const Mat *w, const float *x, int S, int row0, int rows) {
+    switch (w->fmt) {
+    case 4: {
+        const int packed = (w->columns + 1) / 2, groups = w->columns / w->gs;
+        matmul_i4_grouped(out, x, w->q4 + (size_t)row0 * packed,
+                          w->s + (size_t)row0 * groups, S, w->columns, rows, w->gs);
+        break;
+    }
+    case 1:
+        matmul_q(out, x, w->q8 + (size_t)row0 * w->columns, w->s + row0,
+                 S, w->columns, rows);
+        break;
+    default:
+        matmul(out, x, w->f + (size_t)row0 * w->columns, S, w->columns, rows);
+        break;
+    }
+}
+
 static void rms(float *out, const float *x, const float *w, int n, float eps) {
     float square = 0.0f;
     for (int i = 0; i < n; i++) square += x[i] * x[i];
@@ -1029,50 +1084,74 @@ static void mlp3(float *out, const float *x, const Mat *g, const Mat *u, const M
     mv(out, d, sg);
 }
 
+/* mlp3 for S rows: sg and su hold S * g->rows floats each. */
+static void mlp3_rows(float *out, const float *x, int S, const Mat *g, const Mat *u,
+                      const Mat *d, float limit, float *sg, float *su) {
+    mm(sg, g, x, S); mm(su, u, x, S);
+    for (int t = 0; t < S; t++)
+        swiglu_clamped(sg + (size_t)t * g->rows, su + (size_t)t * g->rows, g->rows, limit);
+    mm(out, d, sg, S);
+}
+
 /* ---------- KDA: proiezioni, gate, ricorrenza ---------- */
 static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                       float *out, float *state, float *window, float *scratch) {
     const int P = c->kda_proj, H = c->kda_heads, D = c->kda_hd;
+    const size_t T = (size_t)tokens;
+    /* Every projection reads only its own token's row, so they all run
+     * batched over the block; only the recurrence walks token by token. */
+    float *q = malloc(T * P * sizeof(float));
+    float *k = malloc(T * P * sizeof(float));
+    float *v = malloc(T * P * sizeof(float));
+    float *low = malloc(T * D * sizeof(float));
+    float *decay = malloc(T * P * sizeof(float));
+    float *beta = malloc(T * H * sizeof(float));
+    float *gate = malloc(T * P * sizeof(float));
+    float *normed = malloc(T * P * sizeof(float));
     float *qkv = malloc((size_t)3 * P * sizeof(float));
-    float *gate = malloc((size_t)P * sizeof(float));
-    float *decay = malloc((size_t)P * sizeof(float));
-    float *beta = malloc((size_t)H * sizeof(float));
-    float *low = malloc((size_t)D * sizeof(float));
     float *core = malloc((size_t)P * sizeof(float));
-    for (int t = 0; t < tokens; t++) {
-        const float *row = x + (size_t)t * c->hidden;
-        mv(qkv, &l->kq, row);
-        mv(qkv + P, &l->kk, row);
-        mv(qkv + 2 * P, &l->kv, row);
-        /* decadimento: gate_lower_bound * sigmoid(exp(A_log[h]) * (W_fb W_fa x + dt_bias)) */
-        mv(low, &l->kfa, row);
-        mv(decay, &l->kfb, low);
+    if (!q || !k || !v || !low || !decay || !beta || !gate || !normed || !qkv || !core) {
+        fprintf(stderr, "OOM in KDA\n"); exit(1);
+    }
+    mm(q, &l->kq, x, tokens);
+    mm(k, &l->kk, x, tokens);
+    mm(v, &l->kv, x, tokens);
+    /* decadimento: gate_lower_bound * sigmoid(exp(A_log[h]) * (W_fb W_fa x + dt_bias)) */
+    mm(low, &l->kfa, x, tokens);
+    mm(decay, &l->kfb, low, tokens);
+    mm(beta, &l->kb, x, tokens);
+    /* il gate low-rank dell'uscita: stessa forma, altri pesi */
+    mm(low, &l->kga, x, tokens);
+    mm(gate, &l->kgb, low, tokens);
+    for (size_t t = 0; t < T; t++) {
+        float *dk = decay + t * P, *bt = beta + t * H;
         for (int h = 0; h < H; h++)
             for (int d = 0; d < D; d++) {
                 int i = h * D + d;
-                decay[i] = c->gate_lb * sigmoidf_(expf(l->alog[h]) * (decay[i] + l->dt[i]));
+                dk[i] = c->gate_lb * sigmoidf_(expf(l->alog[h]) * (dk[i] + l->dt[i]));
             }
-        mv(beta, &l->kb, row);
-        for (int h = 0; h < H; h++) beta[h] = sigmoidf_(beta[h]);
-        coli_kda_step(core, state, window, qkv, l->conv, decay, beta,
+        for (int h = 0; h < H; h++) bt[h] = sigmoidf_(bt[h]);
+        memcpy(qkv, q + t * P, (size_t)P * sizeof(float));
+        memcpy(qkv + P, k + t * P, (size_t)P * sizeof(float));
+        memcpy(qkv + 2 * P, v + t * P, (size_t)P * sizeof(float));
+        coli_kda_step(core, state, window, qkv, l->conv, dk, bt,
                       H, D, D, c->conv_k, 1e-6f, scratch);
         /* uscita: RMSNorm per testa, pesata da o_norm, moltiplicata dal gate
-         * low-rank, poi la proiezione di uscita. */
-        mv(low, &l->kga, row);
-        mv(gate, &l->kgb, low);
-        float *normed = qkv;                         /* riuso: 3P >= P */
+         * low-rank, poi la proiezione di uscita (dopo il ciclo, in blocco). */
+        const float *gt = gate + t * P;
         for (int h = 0; h < H; h++) {
             const float *src = core + (size_t)h * D;
-            float *dst = normed + (size_t)h * D;
+            float *dst = normed + t * P + (size_t)h * D;
             float square = 0.0f;
             for (int d = 0; d < D; d++) square += src[d] * src[d];
             float inverse = 1.0f / sqrtf(square / D + c->eps);
             for (int d = 0; d < D; d++)
-                dst[d] = src[d] * inverse * l->onorm[d] * sigmoidf_(gate[(size_t)h * D + d]);
+                dst[d] = src[d] * inverse * l->onorm[d] * sigmoidf_(gt[(size_t)h * D + d]);
         }
-        mv(out + (size_t)t * c->hidden, &l->ko, normed);
     }
-    free(core); free(low); free(beta); free(decay); free(gate); free(qkv);
+    mm(out, &l->ko, normed, tokens);
+    free(core); free(qkv); free(normed); free(gate); free(beta); free(decay);
+    free(low); free(v); free(k); free(q);
 }
 
 /* ---------- MLA + indexer con k-pool ---------- */
@@ -1093,31 +1172,48 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     unsigned char *valid = malloc((size_t)seen);
     memset(valid, 1, (size_t)seen);
 
+    /* Le proiezioni leggono solo la riga del proprio token: tutte in blocco. */
+    mm(qa, &l->qa, x, tokens);
     for (int t = 0; t < tokens; t++) {
-        const int at = base + t;          /* posizione assoluta nella cache */
-        const float *row = x + (size_t)t * c->hidden;
         float *qn = qa + (size_t)t * c->q_lora;
-        mv(qn, &l->qa, row);
         rms(qn, qn, l->qa_ln, c->q_lora, c->eps);
-        mv(queries + (size_t)t * H * QK, &l->qb, qn);
-        float *here = latent + (size_t)at * L;
-        mv(here, &l->kva, row);
-        rms(here, here, l->kva_ln, L, c->eps);
-        /* la query entra nello spazio del latente una volta per testa, invece
-         * che il latente nello spazio della query una volta per posizione */
-        for (int h = 0; h < H; h++)
-            mv_rows(absorbed + ((size_t)t * H + h) * L, &l->kvb_kt,
-                    queries + ((size_t)t * H + h) * QK, h * L, L);
-        /* indexer: le query vengono dal q_a normalizzato, le chiavi dall'hidden
-         * con LayerNorm (con bias), e i pesi per testa sono scalati da IH^-0.5 */
-        mv(iq + (size_t)t * IH * ID, &l->iwq, qn);
-        float *kraw = ik + (size_t)at * ID;
-        mv(kraw, &l->iwk, row);
-        layer_norm(kraw, kraw, l->ik_nw, l->ik_nb, ID, 1e-5f);
-        mv(gates + (size_t)at * ID, &l->ikpg, row);
-        mv(head_w + (size_t)t * IH, &l->iwp, row);
-        for (int h = 0; h < IH; h++) head_w[(size_t)t * IH + h] /= sqrtf((float)IH);
     }
+    mm(queries, &l->qb, qa, tokens);
+    mm(latent + (size_t)base * L, &l->kva, x, tokens);
+    for (int t = 0; t < tokens; t++) {
+        float *here = latent + (size_t)(base + t) * L;
+        rms(here, here, l->kva_ln, L, c->eps);
+    }
+    /* la query entra nello spazio del latente una volta per testa, invece
+     * che il latente nello spazio della query una volta per posizione; in
+     * blocco, una testa alla volta, raccogliendo la sua fetta di ogni token */
+    {
+        float *qh = malloc((size_t)tokens * QK * sizeof(float));
+        float *ah = malloc((size_t)tokens * L * sizeof(float));
+        if (!qh || !ah) { fprintf(stderr, "OOM in MLA\n"); exit(1); }
+        for (int h = 0; h < H; h++) {
+            for (int t = 0; t < tokens; t++)
+                memcpy(qh + (size_t)t * QK, queries + ((size_t)t * H + h) * QK,
+                       (size_t)QK * sizeof(float));
+            mm_rows(ah, &l->kvb_kt, qh, tokens, h * L, L);
+            for (int t = 0; t < tokens; t++)
+                memcpy(absorbed + ((size_t)t * H + h) * L, ah + (size_t)t * L,
+                       (size_t)L * sizeof(float));
+        }
+        free(ah); free(qh);
+    }
+    /* indexer: le query vengono dal q_a normalizzato, le chiavi dall'hidden
+     * con LayerNorm (con bias), e i pesi per testa sono scalati da IH^-0.5 */
+    mm(iq, &l->iwq, qa, tokens);
+    mm(ik + (size_t)base * ID, &l->iwk, x, tokens);
+    for (int t = 0; t < tokens; t++) {
+        float *kraw = ik + (size_t)(base + t) * ID;
+        layer_norm(kraw, kraw, l->ik_nw, l->ik_nb, ID, 1e-5f);
+    }
+    mm(gates + (size_t)base * ID, &l->ikpg, x, tokens);
+    mm(head_w, &l->iwp, x, tokens);
+    for (int t = 0; t < tokens; t++)
+        for (int h = 0; h < IH; h++) head_w[(size_t)t * IH + h] /= sqrtf((float)IH);
 
     const int width = coli_sparse_index_width(c->index_topk, c->index_kpool, c->index_kpool_tail);
     int *selected = malloc((size_t)tokens * width * sizeof(int));
@@ -1137,14 +1233,18 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     }
     /* Attenzione nello spazio del latente. La scala resta 1/sqrt(qk_nope):
      * il prodotto e' lo stesso numero di prima, calcolato in un altro ordine. */
-    float *context = malloc((size_t)H * V * sizeof(float));
-    float *pooled = malloc((size_t)L * sizeof(float));
+    /* La media pesata dei latenti e' per token e per testa; le due
+     * proiezioni che la seguono (kvb_v per testa, poi o) vanno in blocco. */
+    float *pooled = malloc((size_t)tokens * H * L * sizeof(float));
+    unsigned char *attended = malloc((size_t)tokens * H);
     float *score = malloc((size_t)width * sizeof(float));
+    if (!pooled || !attended || !score) { fprintf(stderr, "OOM in MLA\n"); exit(1); }
     const float scale = 1.0f / sqrtf((float)QK);
     for (int t = 0; t < tokens; t++) {
         const int *chosen = selected + (size_t)t * width;
         for (int h = 0; h < H; h++) {
             const float *q = absorbed + ((size_t)t * H + h) * L;
+            float *pool = pooled + ((size_t)t * H + h) * L;
             float top = -INFINITY;
             int used = 0;
             for (int i = 0; i < width; i++) {
@@ -1157,25 +1257,39 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                 if (score[used] > top) top = score[used];
                 used++;
             }
-            float *result = context + (size_t)h * V;
-            memset(result, 0, (size_t)V * sizeof(float));
+            memset(pool, 0, (size_t)L * sizeof(float));
+            attended[(size_t)t * H + h] = used > 0;
             if (!used) continue;
             double total = 0.0;
             for (int i = 0; i < used; i++) { score[i] = expf(score[i] - top); total += score[i]; }
-            memset(pooled, 0, (size_t)L * sizeof(float));
             int seen_slot = 0;
             for (int i = 0; i < width; i++) {
                 const int at = chosen[i];
                 if (at < 0 || at >= seen) continue;
                 const float weight = (float)(score[seen_slot++] / total);
                 const float *c_j = latent + (size_t)at * L;
-                for (int d = 0; d < L; d++) pooled[d] += weight * c_j[d];
+                for (int d = 0; d < L; d++) pool[d] += weight * c_j[d];
             }
-            mv_rows(result, &l->kvb_v, pooled, h * V, V);
         }
-        mv(out + (size_t)t * c->hidden, &l->o, context);
     }
-    free(score); free(pooled);
+    float *context = malloc((size_t)tokens * H * V * sizeof(float));
+    float *ph = malloc((size_t)tokens * L * sizeof(float));
+    float *vh = malloc((size_t)tokens * V * sizeof(float));
+    if (!context || !ph || !vh) { fprintf(stderr, "OOM in MLA\n"); exit(1); }
+    for (int h = 0; h < H; h++) {
+        for (int t = 0; t < tokens; t++)
+            memcpy(ph + (size_t)t * L, pooled + ((size_t)t * H + h) * L, (size_t)L * sizeof(float));
+        mm_rows(vh, &l->kvb_v, ph, tokens, h * V, V);
+        for (int t = 0; t < tokens; t++) {
+            float *result = context + (size_t)t * H * V + (size_t)h * V;
+            if (attended[(size_t)t * H + h])
+                memcpy(result, vh + (size_t)t * V, (size_t)V * sizeof(float));
+            else
+                memset(result, 0, (size_t)V * sizeof(float));   /* nessuna posizione: zero, come prima */
+        }
+    }
+    mm(out, &l->o, context, tokens);
+    free(vh); free(ph); free(score); free(attended); free(pooled);
 
     free(context); free(selected); free(valid); free(head_w);
     free(iq); free(absorbed); free(queries); free(qa);
@@ -1766,11 +1880,10 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     const int wide = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
 
     if (index < c->first_dense) {                 /* layer denso: nessun router */
-        float *sg = malloc((size_t)wide * sizeof(float));
-        float *su = malloc((size_t)wide * sizeof(float));
-        for (int t = 0; t < tokens; t++)
-            mlp3(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden,
-                 &l->dg, &l->du, &l->dd, c->swiglu_limit, sg, su);
+        float *sg = malloc((size_t)tokens * wide * sizeof(float));
+        float *su = malloc((size_t)tokens * wide * sizeof(float));
+        if (!sg || !su) { fprintf(stderr, "OOM in dense FFN\n"); exit(1); }
+        mlp3_rows(out, x, tokens, &l->dg, &l->du, &l->dd, c->swiglu_limit, sg, su);
         free(su); free(sg);
         return;
     }
@@ -1804,8 +1917,10 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                 float choice = score[e] + (l->rbias ? l->rbias[e] : 0.0f);
                 if (!used && choice > value) { value = choice; best = e; }
             }
-            mine[k] = best;
-            mine_w[k] = score[best];
+            /* SEC: all-NaN scores leave best at -1, and score[-1] is the very
+             * next read. See rt_router_pick in route_trace.h. */
+            mine[k] = rt_router_pick(best, k, c->n_experts, index);
+            mine_w[k] = score[mine[k]];
             total += mine_w[k];
         }
         for (int k = 0; k < topk; k++)
@@ -1827,15 +1942,18 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
      * che non da' errore, da' numeri sbagliati. Quindi si lavora a blocchi
      * grandi al piu' quanto la cache: si legge il blocco in parallelo, si
      * applica a tutti i token, si passa al prossimo. */
-    float *sg = malloc((size_t)wide * sizeof(float));
-    float *su = malloc((size_t)wide * sizeof(float));
-    float *tmp = malloc((size_t)c->hidden * sizeof(float));
-    if (!sg || !su || !tmp) { fprintf(stderr, "OOM in MoE\n"); exit(1); }
+    /* sg/su/tmp/xg hold a whole block's rows: the shared expert runs on every
+     * token, and a routed expert on every token that chose it, batched. */
+    float *sg = malloc((size_t)tokens * wide * sizeof(float));
+    float *su = malloc((size_t)tokens * wide * sizeof(float));
+    float *tmp = malloc((size_t)tokens * c->hidden * sizeof(float));
+    float *xg = malloc((size_t)tokens * c->hidden * sizeof(float));
+    int *row_t = malloc((size_t)tokens * sizeof(int));
+    float *row_w = malloc((size_t)tokens * sizeof(float));
+    if (!sg || !su || !tmp || !xg || !row_t || !row_w) { fprintf(stderr, "OOM in MoE\n"); exit(1); }
 
     /* l'esperto condiviso e' sempre attivo e non passa dalla cache */
-    for (int t = 0; t < tokens; t++)
-        mlp3(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden,
-             &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
+    mlp3_rows(out, x, tokens, &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
 
     if (!m->streaming) {
         for (int t = 0; t < tokens; t++)
@@ -1847,7 +1965,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                 float *dst = out + (size_t)t * c->hidden;
                 for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
             }
-        free(tmp); free(su); free(sg); free(weight); free(chosen);
+        free(row_w); free(row_t); free(xg); free(tmp); free(su); free(sg); free(weight); free(chosen);
         return;
     }
 
@@ -1959,13 +2077,15 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
         }
 #endif
         if (!metal_done) {
-            /* CPU fallback: one expert at a time, then every token that chose it. */
+            /* CPU fallback: one expert at a time, all the tokens that chose it
+             * in one batch, then added back in token order. */
             for (int i = 0; i < here; i++) {
                 const int eid = union_ids[base + i];
                 Slot *slot = &cache->s[slot_of[i]];
                 slot->used = ++m->clock;
                 Mat gate, up, down;
                 expert_mats(m, slot, &gate, &up, &down);
+                int R = 0;
                 for (int t = 0; t < tokens; t++) {
                     float scale = 0.0f;
                     for (int k = 0; k < topk; k++)
@@ -1974,16 +2094,23 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                             break;
                         }
                     if (scale == 0.0f) continue;
-                    mlp3(tmp, x + (size_t)t * c->hidden, &gate, &up, &down,
-                         c->swiglu_limit, sg, su);
-                    float *dst = out + (size_t)t * c->hidden;
-                    for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
+                    memcpy(xg + (size_t)R * c->hidden, x + (size_t)t * c->hidden,
+                           (size_t)c->hidden * sizeof(float));
+                    row_t[R] = t; row_w[R] = scale; R++;
+                }
+                if (!R) continue;
+                mlp3_rows(tmp, xg, R, &gate, &up, &down, c->swiglu_limit, sg, su);
+                for (int r = 0; r < R; r++) {
+                    const float *src = tmp + (size_t)r * c->hidden;
+                    float *dst = out + (size_t)row_t[r] * c->hidden;
+                    const float scale = row_w[r];
+                    for (int d = 0; d < c->hidden; d++) dst[d] += scale * src[d];
                 }
             }
         }
     }
     free(to_read); free(slot_of); free(union_ids);
-    free(tmp); free(su); free(sg); free(weight); free(chosen);
+    free(row_w); free(row_t); free(xg); free(tmp); free(su); free(sg); free(weight); free(chosen);
 }
 
 /* ---------- caricamento ---------- */
@@ -2006,6 +2133,10 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
     snprintf(probe, sizeof(probe), "%sembed_tokens.weight", m->prefix);
     if (!st_find(&m->S, probe)) snprintf(m->prefix, sizeof(m->prefix), "model.");
     const char *P = m->prefix;
+    /* Le misure con cui il forward legge i vettori f32 (vedi load_f32). Le
+     * matrici mHC sono [(2+hc)*hc, hc*hidden], come in hyper_connections.h. */
+    const Cfg *c = &m->c;
+    const int64_t D = c->hidden, hc = c->hc_mult, hc_mix = (2 + hc) * hc;
 
     if (layer_end < 0 || layer_end > m->c.n_layers) layer_end = m->c.n_layers;
     if (layer_begin < 0) layer_begin = 0;
@@ -2015,8 +2146,8 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
     m->has_io = load_io;
 
     if (load_io) {
-        m->embed = load_f32(m, "%sembed_tokens.weight", P);
-        m->final_norm = load_f32(m, "%snorm.weight", P);
+        m->embed = load_f32(m, c->vocab * D, "%sembed_tokens.weight", P);
+        m->final_norm = load_f32(m, D, "%snorm.weight", P);
     }
     /* La testa e' l'unica matrice grande fuori dagli esperti: a vocab 154880
      * per hidden 4096 sono 2,5 GB in f32, quindi passa dallo stesso
@@ -2053,20 +2184,20 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
 
     for (int i = layer_begin; i < layer_end; i++) {
         GLayer *l = &m->layer[i];
-        l->in_ln = load_f32(m, "%slayers.%d.input_layernorm.weight", P, i);
-        l->post_ln = load_f32(m, "%slayers.%d.post_attention_layernorm.weight", P, i);
-        l->hc_attn_fn = load_f32(m, "%slayers.%d.hc_attn_fn", P, i);
-        l->hc_attn_base = load_f32(m, "%slayers.%d.hc_attn_base", P, i);
-        l->hc_attn_scale = load_f32(m, "%slayers.%d.hc_attn_scale", P, i);
-        l->hc_ffn_fn = load_f32(m, "%slayers.%d.hc_ffn_fn", P, i);
-        l->hc_ffn_base = load_f32(m, "%slayers.%d.hc_ffn_base", P, i);
-        l->hc_ffn_scale = load_f32(m, "%slayers.%d.hc_ffn_scale", P, i);
+        l->in_ln = load_f32(m, D, "%slayers.%d.input_layernorm.weight", P, i);
+        l->post_ln = load_f32(m, D, "%slayers.%d.post_attention_layernorm.weight", P, i);
+        l->hc_attn_fn = load_f32(m, hc_mix * hc * D, "%slayers.%d.hc_attn_fn", P, i);
+        l->hc_attn_base = load_f32(m, hc_mix, "%slayers.%d.hc_attn_base", P, i);
+        l->hc_attn_scale = load_f32(m, 3, "%slayers.%d.hc_attn_scale", P, i);
+        l->hc_ffn_fn = load_f32(m, hc_mix * hc * D, "%slayers.%d.hc_ffn_fn", P, i);
+        l->hc_ffn_base = load_f32(m, hc_mix, "%slayers.%d.hc_ffn_base", P, i);
+        l->hc_ffn_scale = load_f32(m, 3, "%slayers.%d.hc_ffn_scale", P, i);
         if (m->c.is_full[i]) {
             l->qa = load_mat(m, "%slayers.%d.self_attn.q_a_proj.weight", P, i);
-            l->qa_ln = load_f32(m, "%slayers.%d.self_attn.q_a_layernorm.weight", P, i);
+            l->qa_ln = load_f32(m, c->q_lora, "%slayers.%d.self_attn.q_a_layernorm.weight", P, i);
             l->qb = load_mat(m, "%slayers.%d.self_attn.q_b_proj.weight", P, i);
             l->kva = load_mat(m, "%slayers.%d.self_attn.kv_a_proj_with_mqa.weight", P, i);
-            l->kva_ln = load_f32(m, "%slayers.%d.self_attn.kv_a_layernorm.weight", P, i);
+            l->kva_ln = load_f32(m, c->kv_lora, "%slayers.%d.self_attn.kv_a_layernorm.weight", P, i);
             {
                 char kvb_name[512];
                 snprintf(kvb_name, sizeof(kvb_name),
@@ -2077,10 +2208,11 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
             l->iwq = load_mat(m, "%slayers.%d.self_attn.indexer.wq_b.weight", P, i);
             l->iwk = load_mat(m, "%slayers.%d.self_attn.indexer.wk.weight", P, i);
             l->iwp = load_mat(m, "%slayers.%d.self_attn.indexer.weights_proj.weight", P, i);
-            l->ik_nw = load_f32(m, "%slayers.%d.self_attn.indexer.k_norm.weight", P, i);
-            l->ik_nb = load_f32(m, "%slayers.%d.self_attn.indexer.k_norm.bias", P, i);
+            l->ik_nw = load_f32(m, c->index_hd, "%slayers.%d.self_attn.indexer.k_norm.weight", P, i);
+            l->ik_nb = load_f32(m, c->index_hd, "%slayers.%d.self_attn.indexer.k_norm.bias", P, i);
             if (m->c.index_kpool > 1) {
-                l->ikpa = load_f32(m, "%slayers.%d.self_attn.indexer.index_kpool_compress_ape", P, i);
+                l->ikpa = load_f32(m, (int64_t)c->index_kpool * c->index_hd,
+                                   "%slayers.%d.self_attn.indexer.index_kpool_compress_ape", P, i);
                 l->ikpg = load_mat(m, "%slayers.%d.self_attn.indexer.index_kpool_compress_gate", P, i);
             }
         } else {
@@ -2093,9 +2225,9 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
             l->kfa = load_mat(m, "%slayers.%d.self_attn.f_a_proj.weight", P, i);
             l->kfb = load_mat(m, "%slayers.%d.self_attn.f_b_proj.weight", P, i);
             l->kb = load_mat(m, "%slayers.%d.self_attn.b_proj.weight", P, i);
-            l->dt = load_f32(m, "%slayers.%d.self_attn.dt_bias", P, i);
-            l->alog = load_f32(m, "%slayers.%d.self_attn.A_log", P, i);
-            l->onorm = load_f32(m, "%slayers.%d.self_attn.o_norm.weight", P, i);
+            l->dt = load_f32(m, c->kda_proj, "%slayers.%d.self_attn.dt_bias", P, i);
+            l->alog = load_f32(m, c->kda_heads, "%slayers.%d.self_attn.A_log", P, i);
+            l->onorm = load_f32(m, c->kda_hd, "%slayers.%d.self_attn.o_norm.weight", P, i);
             /* Il checkpoint tiene q/k/v conv separate; la ricorrenza le vuole
              * concatenate nello stesso ordine di qkv. */
             {
@@ -2103,7 +2235,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
                 float *conv = malloc((size_t)3 * width * sizeof(float));
                 const char *parts[3] = { "q_conv1d", "k_conv1d", "v_conv1d" };
                 for (int p = 0; p < 3; p++) {
-                    const float *piece = load_f32(m, "%slayers.%d.self_attn.%s.weight",
+                    const float *piece = load_f32(m, width, "%slayers.%d.self_attn.%s.weight",
                                                   P, i, parts[p]);
                     memcpy(conv + (size_t)p * width, piece, (size_t)width * sizeof(float));
                     free((void *)piece);
@@ -2116,10 +2248,10 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
             l->du = load_mat(m, "%slayers.%d.mlp.up_proj.weight", P, i);
             l->dd = load_mat(m, "%slayers.%d.mlp.down_proj.weight", P, i);
         } else {
-            l->router = load_f32(m, "%slayers.%d.mlp.gate.weight", P, i);
+            l->router = load_f32(m, c->n_experts * D, "%slayers.%d.mlp.gate.weight", P, i);
             l->rbias = st_find(&m->S, (snprintf(probe, sizeof(probe),
                         "%slayers.%d.mlp.gate.e_score_correction_bias", P, i), probe))
-                       ? load_f32(m, "%s", probe) : NULL;
+                       ? load_f32(m, c->n_experts, "%s", probe) : NULL;
             l->rg = load_mat(m, "%slayers.%d.mlp.shared_experts.gate_proj.weight", P, i);
             l->ru = load_mat(m, "%slayers.%d.mlp.shared_experts.up_proj.weight", P, i);
             l->rd = load_mat(m, "%slayers.%d.mlp.shared_experts.down_proj.weight", P, i);
@@ -2183,7 +2315,14 @@ static void vision_load(GModel *m) {
     const Cfg *c = &m->c;
     m->has_vision = 0;
     if (c->vis_layers <= 0) return;
-    if (!st_find(&m->S, "model.visual.patch_embed.proj.weight")) return;
+    if (!st_find(&m->S, "model.visual.patch_embed.proj.weight")) {
+        /* La config annuncia una torre che il checkpoint non porta: si serve
+         * solo testo, e lo si dice qui e al gateway (CAPS vision=0), invece di
+         * lasciarlo scoprire a chi manda una foto. */
+        fprintf(stderr, "vision_config present but model.visual.* tensors absent: "
+                        "serving text only, images will be refused\n");
+        return;
+    }
     const char *V = "model.visual.";
 
     m->vision.config = (ColiVisionConfig){
@@ -2195,36 +2334,41 @@ static void vision_load(GModel *m) {
         .eps = c->vis_eps, .swiglu_limit = c->vis_swiglu_limit,
         .rope_theta = 10000.0f,
     };
-    m->vision.patch_w = load_f32(m, "%spatch_embed.proj.weight", V);
-    m->vision.patch_b = load_f32(m, "%spatch_embed.proj.bias", V);
-    m->vision.post_norm = load_f32(m, "%spost_layernorm.weight", V);
-    m->vision.down_w = load_f32(m, "%sdownsample.weight", V);
-    m->vision.down_b = load_f32(m, "%sdownsample.bias", V);
-    m->vision.merger_proj = load_f32(m, "%smerger.proj.weight", V);
-    m->vision.merger_norm_w = load_f32(m, "%smerger.post_projection_norm.weight", V);
-    m->vision.merger_norm_b = load_f32(m, "%smerger.post_projection_norm.bias", V);
-    m->vision.merger_gate = load_f32(m, "%smerger.gate_proj.weight", V);
-    m->vision.merger_up = load_f32(m, "%smerger.up_proj.weight", V);
-    m->vision.merger_down = load_f32(m, "%smerger.down_proj.weight", V);
+    /* Le forme sono quelle scritte accanto ai campi in vision_tower.h. */
+    const ColiVisionConfig *vc = &m->vision.config;
+    const int64_t hidden = vc->hidden, inter = vc->intermediate, out = vc->out_hidden;
+    const int64_t proj = vc->proj_intermediate, merge = vc->merge;
+    const int64_t patch = (int64_t)vc->in_channels * vc->temporal * vc->patch * vc->patch;
+    m->vision.patch_w = load_f32(m, hidden * patch, "%spatch_embed.proj.weight", V);
+    m->vision.patch_b = load_f32(m, hidden, "%spatch_embed.proj.bias", V);
+    m->vision.post_norm = load_f32(m, hidden, "%spost_layernorm.weight", V);
+    m->vision.down_w = load_f32(m, out * hidden * merge * merge, "%sdownsample.weight", V);
+    m->vision.down_b = load_f32(m, out, "%sdownsample.bias", V);
+    m->vision.merger_proj = load_f32(m, out * out, "%smerger.proj.weight", V);
+    m->vision.merger_norm_w = load_f32(m, out, "%smerger.post_projection_norm.weight", V);
+    m->vision.merger_norm_b = load_f32(m, out, "%smerger.post_projection_norm.bias", V);
+    m->vision.merger_gate = load_f32(m, proj * out, "%smerger.gate_proj.weight", V);
+    m->vision.merger_up = load_f32(m, proj * out, "%smerger.up_proj.weight", V);
+    m->vision.merger_down = load_f32(m, out * proj, "%smerger.down_proj.weight", V);
 
     m->vblocks = calloc((size_t)c->vis_layers, sizeof(*m->vblocks));
     if (!m->vblocks) { fprintf(stderr, "OOM allocating vision blocks\n"); exit(1); }
     for (int b = 0; b < c->vis_layers; b++) {
         ColiVisionBlock *vb = &m->vblocks[b];
-        vb->norm1 = load_f32(m, "%sblocks.%d.norm1.weight", V, b);
-        vb->norm2 = load_f32(m, "%sblocks.%d.norm2.weight", V, b);
-        vb->qkv_w = load_f32(m, "%sblocks.%d.attn.qkv.weight", V, b);
-        vb->qkv_b = load_f32(m, "%sblocks.%d.attn.qkv.bias", V, b);
-        vb->q_norm = load_f32(m, "%sblocks.%d.attn.q_norm.weight", V, b);
-        vb->k_norm = load_f32(m, "%sblocks.%d.attn.k_norm.weight", V, b);
-        vb->proj_w = load_f32(m, "%sblocks.%d.attn.proj.weight", V, b);
-        vb->proj_b = load_f32(m, "%sblocks.%d.attn.proj.bias", V, b);
-        vb->gate_w = load_f32(m, "%sblocks.%d.mlp.gate_proj.weight", V, b);
-        vb->gate_b = load_f32(m, "%sblocks.%d.mlp.gate_proj.bias", V, b);
-        vb->up_w = load_f32(m, "%sblocks.%d.mlp.up_proj.weight", V, b);
-        vb->up_b = load_f32(m, "%sblocks.%d.mlp.up_proj.bias", V, b);
-        vb->down_w = load_f32(m, "%sblocks.%d.mlp.down_proj.weight", V, b);
-        vb->down_b = load_f32(m, "%sblocks.%d.mlp.down_proj.bias", V, b);
+        vb->norm1 = load_f32(m, hidden, "%sblocks.%d.norm1.weight", V, b);
+        vb->norm2 = load_f32(m, hidden, "%sblocks.%d.norm2.weight", V, b);
+        vb->qkv_w = load_f32(m, 3 * hidden * hidden, "%sblocks.%d.attn.qkv.weight", V, b);
+        vb->qkv_b = load_f32(m, 3 * hidden, "%sblocks.%d.attn.qkv.bias", V, b);
+        vb->q_norm = load_f32(m, vc->head_dim, "%sblocks.%d.attn.q_norm.weight", V, b);
+        vb->k_norm = load_f32(m, vc->head_dim, "%sblocks.%d.attn.k_norm.weight", V, b);
+        vb->proj_w = load_f32(m, hidden * hidden, "%sblocks.%d.attn.proj.weight", V, b);
+        vb->proj_b = load_f32(m, hidden, "%sblocks.%d.attn.proj.bias", V, b);
+        vb->gate_w = load_f32(m, inter * hidden, "%sblocks.%d.mlp.gate_proj.weight", V, b);
+        vb->gate_b = load_f32(m, inter, "%sblocks.%d.mlp.gate_proj.bias", V, b);
+        vb->up_w = load_f32(m, inter * hidden, "%sblocks.%d.mlp.up_proj.weight", V, b);
+        vb->up_b = load_f32(m, inter, "%sblocks.%d.mlp.up_proj.bias", V, b);
+        vb->down_w = load_f32(m, hidden * inter, "%sblocks.%d.mlp.down_proj.weight", V, b);
+        vb->down_b = load_f32(m, hidden, "%sblocks.%d.mlp.down_proj.bias", V, b);
     }
     m->vision.blocks = m->vblocks;
     m->has_vision = 1;
@@ -2506,8 +2650,12 @@ static void glm_echo(unsigned long long id, int pos, int token,
     putchar('\n'); fflush(stdout);
 }
 
-static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
-                           const float *vision, int n_vision) {
+/* `need`: how many of the last rows get logits. The head is the largest
+ * matrix outside the experts (vocab x hidden), and a prefill that keeps only
+ * its last row used to compute it for every token anyway. Rows before
+ * n - need are left unset. */
+static float *forward_span_rows(GModel *m, GSession *s, const int *tokens, int n,
+                                const float *vision, int n_vision, int need) {
     const Cfg *c = &m->c;
     const int H = c->hc_mult;
     const int start = s->filled;   /* NON 'base': nel ciclo dei layer e' gia' preso */
@@ -2571,8 +2719,8 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
 
     float *logits = malloc((size_t)n * c->vocab * sizeof(float));
     double t_head0 = now_s();
-    for (int t = 0; t < n; t++)
-        mv(logits + (size_t)t * c->vocab, &m->head, normed + (size_t)t * D);
+    if (need < 1 || need > n) need = n;
+    mm(logits + (size_t)(n - need) * c->vocab, &m->head, normed + (size_t)(n - need) * D, need);
     m->t_head += now_s() - t_head0;
     m->forwards++;
 
@@ -2580,6 +2728,11 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
     free(next); free(streams);
     s->filled = start + n;
     return logits;
+}
+
+static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
+                           const float *vision, int n_vision) {
+    return forward_span_rows(m, s, tokens, n, vision, n_vision, n);
 }
 
 /* Prefill a pezzi.
@@ -2596,9 +2749,15 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
  *
  * Con `keep_all` si tengono i logit di ogni posizione, che serve solo al
  * confronto con l'oracolo; altrimenti si tiene l'ultima riga, che e' l'unica
- * che decide il token successivo. */
+ * che decide il token successivo.
+ *
+ * `halt`, se c'e', si chiede prima di ogni pezzo: un client che se n'e' andato
+ * a meta' di un prompt lungo non deve tenere il motore occupato fino in fondo.
+ * Se dice di fermarsi si torna NULL a un confine di pezzo, dove ogni layer e'
+ * avanzato e `filled` dice esattamente quanti token la sessione ha macinato. */
 static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
-                              const float *vision, int n_vision, int keep_all) {
+                              const float *vision, int n_vision, int keep_all,
+                              int (*halt)(void *), void *halt_arg) {
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_PREFILL_CHUNK");
     int chunk = setting ? atoi(setting) : 128;
@@ -2611,6 +2770,11 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
     int used_vision = 0;
 
     for (int at = 0; at < n; at += chunk) {
+        if (halt && halt(halt_arg)) {
+            free(all);
+            free(last);
+            return NULL;
+        }
         const int here = at + chunk <= n ? chunk : n - at;
         /* Gli embedding dell'immagine vanno divisi come i token: a ogni pezzo
          * quelli dei segnaposto che contiene, altrimenti il conto non torna e
@@ -2619,9 +2783,11 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
         if (vision && c->image_token >= 0)
             for (int i = 0; i < here; i++)
                 if (tokens[at + i] == c->image_token) mine++;
-        float *part = forward_span(m, s, tokens + at, here,
-                                   vision ? vision + (size_t)used_vision * c->hidden : NULL,
-                                   mine);
+        /* senza keep_all e senza echo serve solo l'ultima riga del pezzo */
+        const int need = keep_all || (g_echo_k > 0 && g_echo_id) ? here : 1;
+        float *part = forward_span_rows(m, s, tokens + at, here,
+                                        vision ? vision + (size_t)used_vision * c->hidden : NULL,
+                                        mine, need);
         used_vision += mine;
         if (keep_all) {
             memcpy(all + (size_t)at * c->vocab, part,
@@ -2801,6 +2967,9 @@ static int sample_token(const float *logits, int vocab) {
  * Se il prompt nuovo non estende quello vecchio, la sessione si rifa'. */
 #define GLM53_MAX_SLOTS 16
 
+/* la ricorrenza KDA di uno scatto: stato e finestra di ogni strato lineare */
+typedef struct { float **state, **window; int n_layers; } Glm53PinState;
+
 typedef struct {
     GSession *session;
     int *tokens;                          /* la sequenza che lo slot tiene */
@@ -2813,10 +2982,26 @@ typedef struct {
      * posizioni non esistono piu e gli scatti non valgono niente. */
     ColiPinPool pins;
     GSession *pin_session;
+    /* Dove riprendere il turno appena finito, se il prossimo prompt e' la
+     * sua storia esatta (un Continue dopo una disconnessione) o la sua storia
+     * senza gli spazi finali (lo stesso Continue, dopo che il gateway ha
+     * tolto gli spazi in coda). Valgono solo per il turno subito dopo: ogni
+     * turno li decide, li azzera, e li riscrive alla fine.
+     *
+     * tail_logit: la riga che predice la posizione `filled`, cioe' lo stato
+     * finale della sessione. Senza, un prompt uguale alla cache non avrebbe
+     * niente da macinare e quindi nessun logit, e si rifarebbe da capo.
+     *
+     * blank: lo stato KDA com'era prima del primo token di spazi dell'ultima
+     * corsa generata, con la riga che quel token l'ha scelto. E' il solo
+     * riavvolgimento che serve: il gateway toglie gli spazi in coda a un turno
+     * da continuare, quindi il Continue arriva corto di quella corsa. */
+    float *tail_logit;
+    int tail_len;
+    Glm53PinState *blank;
+    float *blank_logit;
+    int blank_len;
 } KVSlot;
-
-/* la ricorrenza KDA di uno scatto: stato e finestra di ogni strato lineare */
-typedef struct { float **state, **window; int n_layers; } Glm53PinState;
 
 static KVSlot g_slots[GLM53_MAX_SLOTS];
 static int g_n_slots = 0;
@@ -2903,7 +3088,14 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
     while (s >= 0) {
         ColiPin *k = &slot->pins.slot[s];
         Glm53PinState *st = (Glm53PinState *)k->state;
-        if (st && k->len <= slot->session->filled) {
+        /* Lo scatto porta lo stato KDA, non le righe DSA: quelle sono della
+         * sessione, e un ramo rimesso a una profondita' minore le puo' aver
+         * riscritte con altri token. Che gli id combacino con la RICHIESTA
+         * non basta; devono combaciare con la storia dello slot, che e' la
+         * sola descrizione di cosa le righe tengono davvero (come
+         * kv_prefix_holds per gli altri motori, #1650). */
+        if (st && k->len <= slot->session->filled && k->len <= slot->n &&
+            !memcmp(k->ids, slot->tokens, (size_t)k->len * sizeof(int))) {
             for (int i = 0; i < c->n_layers; i++) {
                 GLayerState *ls = &slot->session->layer[i];
                 if (c->is_full[i] || !ls->kda_state || !st->state[i]) continue;
@@ -2914,10 +3106,52 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
             coli_pin_touch(&slot->pins, s);
             return k->len;
         }
-        k->len = 0;              /* lo scatto pretende posizioni che non ci sono */
+        k->len = 0;   /* posizioni che non ci sono, o righe che non sono piu' sue */
         s = coli_pin_best(&slot->pins, tokens, n);
     }
     return 0;
+}
+
+/* Lo stato KDA della sessione, dentro o fuori da uno scatto. Il buffer si
+ * alloca la prima volta e poi si riusa (~149 MiB), 34 strati lineari da
+ * 64x128x128 piu' la finestra della convoluzione. */
+static int glm53_state_capture(const GModel *m, Glm53PinState **into, const GSession *s) {
+    const Cfg *c = &m->c;
+    const size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd;
+    const size_t nw = (size_t)3 * c->kda_proj * c->conv_k;
+    Glm53PinState *st = *into;
+    if (!st) {
+        st = (Glm53PinState *)calloc(1, sizeof(*st));
+        if (!st) return 0;
+        st->n_layers = c->n_layers;
+        st->state  = (float **)calloc((size_t)c->n_layers, sizeof(float *));
+        st->window = (float **)calloc((size_t)c->n_layers, sizeof(float *));
+        if (!st->state || !st->window) { glm53_pin_state_free(st); return 0; }
+        for (int i = 0; i < c->n_layers; i++) {
+            if (c->is_full[i] || !s->layer[i].kda_state) continue;
+            st->state[i]  = (float *)malloc(ns * sizeof(float));
+            st->window[i] = (float *)malloc(nw * sizeof(float));
+            if (!st->state[i] || !st->window[i]) { glm53_pin_state_free(st); return 0; }
+        }
+        *into = st;
+    }
+    for (int i = 0; i < c->n_layers; i++) {
+        if (c->is_full[i] || !s->layer[i].kda_state || !st->state[i]) continue;
+        memcpy(st->state[i],  s->layer[i].kda_state,  ns * sizeof(float));
+        memcpy(st->window[i], s->layer[i].kda_window, nw * sizeof(float));
+    }
+    return 1;
+}
+
+static void glm53_state_restore(const GModel *m, const Glm53PinState *st, GSession *s) {
+    const Cfg *c = &m->c;
+    const size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd;
+    const size_t nw = (size_t)3 * c->kda_proj * c->conv_k;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (c->is_full[i] || !s->layer[i].kda_state || !st->state[i]) continue;
+        memcpy(s->layer[i].kda_state,  st->state[i],  ns * sizeof(float));
+        memcpy(s->layer[i].kda_window, st->window[i], nw * sizeof(float));
+    }
 }
 
 static void slot_reset(const GModel *m, KVSlot *slot) {
@@ -2925,6 +3159,10 @@ static void slot_reset(const GModel *m, KVSlot *slot) {
     if (slot->session) session_close(m, slot->session);
     slot->session = NULL;
     slot->n = 0;
+    free(slot->tail_logit);
+    slot->tail_logit = NULL;
+    slot->tail_len = 0;
+    slot->blank_len = 0;          /* il buffer resta: si riusa alla prossima corsa */
 }
 
 /* Quanti token iniziali lo slot ha gia' in cache e puo' tenere. */
@@ -2941,7 +3179,7 @@ static void slot_remember(KVSlot *slot, const int *tokens, int n) {
         if (!slot->tokens) { fprintf(stderr, "OOM allocating slot history\n"); exit(1); }
         slot->cap = n;
     }
-    memcpy(slot->tokens, tokens, (size_t)n * sizeof(int));
+    if (n > 0) memcpy(slot->tokens, tokens, (size_t)n * sizeof(int));
     slot->n = n;
 }
 
@@ -3182,6 +3420,24 @@ static int serve_cancel_pending(unsigned long long id, int *input_eof) {
     return stopped ? SERVE_CTL_STOP : SERVE_CTL_NONE;
 }
 
+/* La stessa guardata, fra un pezzo di prefill e l'altro.
+ *
+ * Senza, un client che se ne va a meta' di un prompt lungo lascia il motore a
+ * macinarlo fino in fondo per nessuno: misurato su una macchina di prova, un
+ * prompt di 281 token disconnesso a 20 s ha tenuto il motore fino a 211.7 s.
+ * Si ferma solo un CANCEL. Uno STOP si ricorda e decide al primo passo di
+ * decodifica, come avrebbe fatto arrivando li'; un CANCEL dopo vince lo
+ * stesso. EOF non ferma niente, e da li' non si legge piu'. */
+typedef struct { unsigned long long id; int *ctl, *input_eof; } PrefillWatch;
+
+static int prefill_should_halt(void *arg) {
+    PrefillWatch *w = (PrefillWatch *)arg;
+    if (*w->input_eof) return 0;
+    const int seen = serve_cancel_pending(w->id, w->input_eof);
+    if (seen != SERVE_CTL_NONE && *w->ctl != SERVE_CTL_CANCEL) *w->ctl = seen;
+    return *w->ctl == SERVE_CTL_CANCEL;
+}
+
 /* Genera per una richiesta e chiude col suo DONE.
  *
  * Ritorna -1 se stdin ha raggiunto EOF durante il turno, 0 altrimenti: il turno
@@ -3239,15 +3495,48 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * e ne ha almeno una in piu': lo stato ricorrente dei layer KDA non si
      * riavvolge, quindi una divergenza a meta' cache obbliga a rifare. */
     const int cached = slot->session ? slot->session->filled : 0;
+    const int common = slot_shared(slot, sequence, total);
     int shared = 0;
-    if (cached > 0 && cached < total && slot_shared(slot, sequence, total) >= cached)
+    if (cached > 0 && cached < total && common >= cached)
         shared = cached;
+    /* Perche' il riuso e' andato com'e' andato, per la riga REUSE: "0 riusati"
+     * da solo non distingue un prompt che diverge (un token perso, uno spazio
+     * tolto dal gateway) da uno identico alla cache, che fallisce solo perche'
+     * non resta nessun token da macinare. */
+    const char *why = cached == 0                        ? "cold"
+                    : total <= cached && common == total ? (total == cached ? "equal" : "shorter")
+                    : common < cached                    ? "diverged"
+                    :                                      "extend";
+    /* Riprendere il turno appena finito senza macinare niente: il prompt e'
+     * la sua storia esatta (tail) o la sua storia fino all'inizio dell'ultima
+     * corsa di spazi (blank). Tutti e due valgono solo col turno subito
+     * prima, e il controllo sugli id e' contro la storia dello slot, cioe'
+     * contro quello che le righe tengono davvero. Non con un'immagine (gli
+     * id non la descrivono) e non con logprobs: la lettura ECHO vuole
+     * macinare le posizioni che riporta. Si decide prima della fotografia,
+     * che cambierebbe lo stato sotto. */
+    float *resume = NULL;
+    const int plain = !(g_pending.patches && g_pending.id == q->id) && q->logprobs == 0;
+    if (plain && cached > 0 && common == total) {
+        if (total == cached && slot->tail_logit && slot->tail_len == cached) {
+            resume = slot->tail_logit;
+            slot->tail_logit = NULL;
+        } else if (slot->blank && slot->blank_len == total && total < cached &&
+                   (resume = malloc((size_t)m->c.vocab * sizeof(float)))) {
+            memcpy(resume, slot->blank_logit, (size_t)m->c.vocab * sizeof(float));
+            glm53_state_restore(m, slot->blank, slot->session);
+            slot->session->filled = total;
+        }
+        if (resume) shared = total;
+    }
+    slot->tail_len = 0;
+    slot->blank_len = 0;
     /* La fotografia si prova sempre, non solo quando il riuso in avanti
      * fallisce: se lo stato vivo e gia il prompt condiviso, il riuso normale
      * scatterebbe lo stesso ma il primo token fresco resterebbe senza
      * predittore, e quindi senza logprob, proprio quello che serve. */
-    int pinned = slot_pin_restore(m, slot, sequence, total);
-    if (pinned > 0) shared = pinned;
+    int pinned = resume ? 0 : slot_pin_restore(m, slot, sequence, total);
+    if (pinned > 0) { shared = pinned; why = "pin"; }
     if (shared <= 0) {
         slot_reset(m, slot);
         slot->session = session_open(m, room);
@@ -3269,6 +3558,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
             return 0;
         }
         if (shared) {                             /* niente riuso con un'immagine */
+            why = "image";
             slot_reset(m, slot);
             slot->session = session_open(m, room);
             shared = 0;
@@ -3286,16 +3576,34 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         g_echo_pin_logit = (pinned > 0 && shared == pinned && ps >= 0)
                            ? slot->pins.slot[ps].logit : NULL;
     }
-    float *logits = forward_prefill(m, slot->session, sequence + shared,
-                                    total - shared, vision, n_vision, 0);
+    int rows = 1, ctl = SERVE_CTL_NONE, input_eof = 0;
+    PrefillWatch watch = { q->id, &ctl, &input_eof };
+    float *logits = resume ? resume
+                  : forward_prefill(m, slot->session, sequence + shared,
+                                    total - shared, vision, n_vision, 0,
+                                    prefill_should_halt, &watch);
     g_echo_k = 0; g_echo_id = 0;   /* la lettura riguarda il prefill, non la decodifica */
-    if (q->pin && logits &&
+    /* Interrotto a meta' prefill: la sessione ha macinato solo `filled` token,
+     * e da qui in poi `total` dice quello, cosi' la storia che slot_remember
+     * scrive sotto e la riga CANCEL descrivono la cache vera. Un nuovo tentativo
+     * dello stesso prompt ne e' allora un'estensione stretta e riusa il pezzo
+     * gia' fatto. Il ciclo sotto esce al primo giro, senza toccare `logits`. */
+    if (ctl == SERVE_CTL_CANCEL)
+        total = slot->session->filled;      /* e niente fotografia di un prompt a meta' */
+    else if (q->pin && logits &&
         !slot_pin_save(m, slot, sequence, total, logits) && getenv("GLM53_VERBOSE"))
         fprintf(stderr, "[PIN] fotografia non riuscita, si riparte da capo ogni volta\n");
     else if (q->pin)
         fprintf(stderr, "[PIN] stato fotografato a %d token\n", total);
     GSession *session = slot->session;
-    int rows = 1, ctl = SERVE_CTL_NONE, input_eof = 0;
+    /* GLM53_REWIND=1 accende lo scatto della corsa di spazi, che costa un
+     * buffer grande quanto lo stato KDA (~149 MiB, fuori da GLM53_EXPERT_GB)
+     * e una sua copia per ogni corsa, non per ogni token. Spento di
+     * default: lo pagherebbe ogni risposta, anche di chi non fa mai Continue. */
+    const char *rewind_setting = getenv("GLM53_REWIND");
+    const int keep_blank = q->logprobs == 0 && n_vision == 0 &&
+                           rewind_setting && atoi(rewind_setting);
+    int in_blank = 0;
     for (int step = 0; step < budget; step++) {
         /* #1332: una guardata a stdin per token. Il costo e' una select con
          * timeout zero; il guadagno e' che il gateway smette di aspettare un
@@ -3310,7 +3618,14 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
          * pagherebbe una select e una fgets a vuoto. Il turno finisce qui sotto
          * e il DONE parte lo stesso; e' serve_one a dire a serve_loop, col
          * valore di ritorno, che dopo non c'e' piu' nessuno. */
-        if (!input_eof) ctl = serve_cancel_pending(q->id, &input_eof);
+        /* Un CANCEL visto durante il prefill decide qui senza guardare di
+         * nuovo. Uno STOP invece si guarda lo stesso: un CANCEL arrivato dopo
+         * l'ultima guardata del prefill deve vincere, come vinceva quando
+         * arrivavano insieme a questo punto. */
+        if (ctl != SERVE_CTL_CANCEL && !input_eof) {
+            const int seen = serve_cancel_pending(q->id, &input_eof);
+            if (seen != SERVE_CTL_NONE) ctl = seen;
+        }
         if (ctl != SERVE_CTL_NONE) break;
         if (total >= room) { limited = 1; break; }
         const float *row = logits + (size_t)(rows - 1) * m->c.vocab;
@@ -3318,8 +3633,9 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         char lptail[1024]; lptail[0] = 0;
         if (q->logprobs > 0)
             coli_logprob_tail(lptail, sizeof lptail, row, m->c.vocab, next, q->logprobs);
-        free(logits);
-        logits = NULL;
+        /* `logits` resta finche' non ne arriva uno nuovo: a ogni uscita dal
+         * ciclo descrive la posizione `filled`, ed e' quello che il turno dopo
+         * riprende se il suo prompt e' questa storia esatta. */
         if (is_stop(next)) break;
         sequence[total++] = next;
         emitted++;
@@ -3328,14 +3644,70 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         if (q->logprobs > 0) serve_data_lp(q->id, piece, written, lptail);
         else serve_data(q->id, piece, written);
         if (step + 1 == budget) { limited = 1; break; }
-        logits = forward_span(m, session, &next, 1, NULL, 0);
+        /* Il primo token di soli spazi di una corsa: lo stato di adesso e la
+         * riga che l'ha scelto sono dove un Continue riprende se il gateway
+         * gli toglie la corsa in coda. Solo spazi ASCII: quello che
+         * str.rstrip() toglie in piu' (spazi Unicode, o spazi dentro un token
+         * con del testo) ritokenizza diverso e si rifa' da capo lo stesso. */
+        int blank = written > 0;
+        for (int i = 0; i < written && blank; i++)
+            blank = piece[i] == ' ' || piece[i] == '\n' || piece[i] == '\t' ||
+                    piece[i] == '\r' || piece[i] == '\v' || piece[i] == '\f';
+        if (keep_blank && blank && !in_blank) {
+            if (!slot->blank_logit)
+                slot->blank_logit = malloc((size_t)m->c.vocab * sizeof(float));
+            if (slot->blank_logit && glm53_state_capture(m, &slot->blank, session)) {
+                memcpy(slot->blank_logit, row, (size_t)m->c.vocab * sizeof(float));
+                slot->blank_len = session->filled;
+            }
+        }
+        in_blank = blank;
+        float *fed = forward_span(m, session, &next, 1, NULL, 0);
+        free(logits);
+        logits = fed;
         rows = 1;
     }
-    free(logits);
     free(vision);
+    /* Il turno dopo riprende da qui se il suo prompt e' questa storia esatta.
+     * Dopo un prefill interrotto `logits` e' NULL e non c'e' niente da
+     * riprendere: il nuovo tentativo estende quello che e' stato macinato.
+     * Non dopo un turno con un'immagine: il controllo del turno dopo e' sugli
+     * id, e gli id dei segnaposto non dicono quale immagine ha fatto queste
+     * righe. Una richiesta senza IMAGE e con gli stessi id riprenderebbe da
+     * embedding che non ha mandato. */
+    free(slot->tail_logit);
+    slot->tail_logit = n_vision == 0 ? logits : NULL;
+    slot->tail_len = slot->tail_logit ? session->filled : 0;
+    if (!slot->tail_logit) free(logits);
+    logits = NULL;
     /* La sessione resta allo slot per il turno dopo, con la sequenza che ha
      * davvero macinato: prompt piu' quello che ha generato. */
     slot_remember(slot, sequence, total);
+    /* Quanto prefisso lo slot ha risparmiato.
+     *
+     * Su STDERR, non nel protocollo. La specifica dice che un server ignora le
+     * righe che non conosce, ma questo progetto ha scelto il contrario apposta
+     * e lo mette per iscritto in un test: una riga sconosciuta uccide il
+     * dispatcher, cosi' un motore non puo' parlare a un server che non lo
+     * capisce. La regola vera e' quella del test, non quella del documento.
+     *
+     * E dietro GLM53_VERBOSE, perche' `coli chat` eredita lo stderr del server:
+     * senza guardia questa riga compare a schermo dopo ogni risposta, sotto gli
+     * occhi di chi voleva solo la risposta.
+     *
+     * REUSE <id> <riusati> <prompt> <in cache> <in comune> <perche'>: i primi
+     * tre campi sono quelli di sempre, gli altri dicono perche' il riuso non
+     * e' scattato (cold, equal, shorter, diverged, extend, pin, image).
+     * <in comune> si ferma a <in cache>: dopo un limite di token la storia
+     * dello slot ha un token in piu' di quelli macinati, e contarlo farebbe
+     * leggere "combacia piu' di quanto c'e' in cache".
+     *
+     * Prima del ramo del CANCEL, non dopo: anche un turno interrotto ha
+     * riusato (o no) il suo prefisso, e un turno che non lascia righe non si
+     * puo' confrontare con quello che lo riprende. */
+    if (getenv("GLM53_VERBOSE"))
+        fprintf(stderr, "REUSE %llu %d %d %d %d %s\n", q->id, reused, prompt_tokens,
+                cached, common < cached ? common : cached, why);
     /* Il turno e' stato interrotto: si risponde col frame che il gateway
      * aspetta per rilasciare l'ammissione dello scheduler (openai_server.py
      * accetta ERROR <id> CANCELLED oppure un DONE, ma il DONE direbbe al
@@ -3347,6 +3719,19 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * riusare il prefisso. Buttarlo costerebbe un prefill intero per punire
      * un client che ha cambiato idea. */
     if (ctl == SERVE_CTL_CANCEL) {
+        /* Fin dove e' arrivato il motore: il client ne ha ricevuti al massimo
+         * `emitted`, e quanti ne mancano si legge solo dal suo lato. Durante il
+         * prefill `filled` conta solo il prefisso completato; durante la decodifica
+         * filled == prompt + emitted. Un nuovo tentativo riusa la cache solo se
+         * il prompt ne contiene tutto il prefisso e almeno un token in piu'. */
+        if (getenv("GLM53_VERBOSE"))
+            fprintf(stderr, "CANCEL %llu %d %d %d\n", q->id, prompt_tokens,
+                    emitted, session->filled);
+        /* Un turno con un'immagine interrotto a meta' prefill lascerebbe nella
+         * storia solo gli id dei segnaposto, e gli id non dicono quale
+         * immagine: una richiesta dopo con gli stessi id e senza IMAGE
+         * riuserebbe righe fatte da embedding che non ha mandato. Si butta. */
+        if (n_vision > 0) slot_reset(m, slot);
         serve_line("ERROR %llu CANCELLED\n", q->id);
         free(sequence);
         return input_eof ? -1 : 0;
@@ -3357,19 +3742,6 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * stato il limite di token a fermarlo -- e la storia e' gia' stata scritta
      * sopra, quindi lo slot resta quello che e'. */
     const double elapsed = now_s() - started;
-    /* Quanto prefisso lo slot ha risparmiato.
-     *
-     * Su STDERR, non nel protocollo. La specifica dice che un server ignora le
-     * righe che non conosce, ma questo progetto ha scelto il contrario apposta
-     * e lo mette per iscritto in un test: una riga sconosciuta uccide il
-     * dispatcher, cosi' un motore non puo' parlare a un server che non lo
-     * capisce. La regola vera e' quella del test, non quella del documento.
-     *
-     * E dietro GLM53_VERBOSE, perche' `coli chat` eredita lo stderr del server:
-     * senza guardia questa riga compare a schermo dopo ogni risposta, sotto gli
-     * occhi di chi voleva solo la risposta. */
-    if (getenv("GLM53_VERBOSE"))
-        fprintf(stderr, "REUSE %llu %d %d\n", q->id, reused, prompt_tokens);
     hits_emit(m);
     {
         const double disk = m->t_disk - s_disk, ffn = m->t_ffn - s_ffn;
@@ -3468,6 +3840,9 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
     setvbuf(stdin, NULL, _IONBF, 0);
     slots_init(m);
     serve_line("\x01\x01READY\x01\x01\n");
+    /* Fra READY e STAT: il gateway lo legge nella stretta di mano, quindi sa
+     * che modalita' serve prima della prima richiesta (docs/serve_protocol.md). */
+    serve_line("CAPS vision=%d\n", m->has_vision ? 1 : 0);
     serve_line("STAT 0 0.00 0.0 %.1f\n", rss_gb());
     /* La griglia va DOPO READY: il lettore di boot del server scarta tutto
      * fino al sentinel, e colibri.c fa lo stesso (READY, STAT, poi EMAP). */
@@ -3644,10 +4019,14 @@ int main(int argc, char **argv) {
      * volta e ogni token dopo costa un token, non tutto il prefisso. */
     GSession *session = session_open(&model, count + (greedy > 0 ? greedy : 0) + 1);
     const double prefill_start = now_s();
-    float *logits = forward_prefill(&model, session, tokens, count, vision, n_vision, 1);
-    if (getenv("GLM53_VERBOSE"))
+    float *logits = forward_prefill(&model, session, tokens, count, vision, n_vision, 1,
+                                    NULL, NULL);
+    if (getenv("GLM53_VERBOSE")) {
         fprintf(stderr, "load %.1fs, prefill %d tokens in %.1fs\n",
                 load_seconds, count, now_s() - prefill_start);
+        fprintf(stderr, "prefill profile: attention %.1fs, ffn %.1fs (disk %.1fs), "
+                        "head %.1fs\n", model.t_attn, model.t_ffn, model.t_disk, model.t_head);
+    }
     printf("teacher_forcing");
     for (int t = 0; t < count; t++)
         printf(" %d", argmax(logits + (size_t)t * model.c.vocab, model.c.vocab));

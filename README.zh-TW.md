@@ -10,10 +10,12 @@
 **小巧引擎，龐大模型。**在消費級與異質硬體上執行**前沿 MoE 模型——從 744B 到
 2.8T 參數**——以引擎零相依套件的純 C 實作，將儲存、RAM 與 VRAM 視為統一的推論階層。
 
-目前可執行九個模型家族：**GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B，含視覺）、
-**Inkling**（975B）、**Kimi K3**（2.8T）、**DeepSeek V4 Flash**（284B）、**DeepSeek V4.1 Flash**（552B，含視覺）、
+目前可執行十個模型家族：**GLM-5.2/5.3**（744B）、**GLM-5.3-Flash**（321B，含視覺）、
+**Inkling**（975B）、**Kimi K3**（2.8T）、**DeepSeek V4 Flash**（284B）、**DeepSeek V4.1 Flash**（552B，含視覺）、**MiMo-V2.6 Flash**（309B，含視覺）、
 **Qwen3.8-Flash-Next**（125B + 51B n-gram）、**Qwen3.6**（35B-A3B）與 **OLMoE**（7B）
 ——各自一個 C 檔案，共用同一套 `coli chat` / `coli serve` / `coli web` 前端。[完整清單](README.md#other-supported-models)
+也能生成圖像：**Qwen-Image-2.1** 依據文字生成圖片，`coli chat` 直接在終端機中顯示，
+`coli serve` 透過 `POST /v1/images/generations` 提供（[qwen-image.md](docs/qwen-image.md)）。
 
 > **Colibrì 既是今天就能執行的推論引擎，也是一個開放的研究平台。**它的首要目標是在
 > 完整的軟硬體邊界上追求推論側效能——模型格式、記憶體階層、儲存 I/O、配置、排程、核心、
@@ -335,7 +337,7 @@ curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
   配置、排程、I/O、CPU/GPU 核心、異質重疊、KV 狀態與路由感知推測。目標是降低硬體要求
   和每個有效 token 的成本，所有成果都以端到端測量為準、經審查並公開開發。
 - **支援更多開放模型。**階層演算法與模型無關，任何帶路由專家的 MoE 都能用相同方式分層。
-  目前已有九個模型家族可用（GLM-5.2、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、
+  目前已有十個模型家族可用（GLM-5.2、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6 Flash、
   Qwen3.8-Flash-Next、Qwen3.6、OLMoE）；更多開放權重家族（候選包括 **MiniMax**）將沿用同樣的
   規則獲得引擎支援：有人完成端到端實測之後。
 

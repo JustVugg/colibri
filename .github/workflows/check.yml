@@ -83,6 +83,28 @@ jobs:
       - name: Generate fixture and run vendor oracle
         run: make -C c kimi-k3-tiny-check
 
+  mimo-tiny:
+    name: Linux (generated tiny MiMo-V2.6 vendor oracle, text + vision)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-mimo-tiny.txt
+      - name: Install pinned tiny-fixture dependencies
+        run: python -m pip install -r c/tools/requirements-mimo-tiny.txt
+      - name: Generate fixture and run vendor oracle
+        run: make -C c mimo-tiny-check
+      - name: Same oracle under ASan and UBSan
+        run: |
+          make -C c clean >/dev/null
+          make -C c mimo EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            python c/tests/mimo_tiny_harness.py --binary c/mimo --fixture c/mimo_tiny
+
   v4-tiny:
     name: Linux (generated tiny V4 target oracle)
     runs-on: ubuntu-latest
@@ -130,12 +152,14 @@ jobs:
           python c/tools/make_edge_tiny_tokenizer.py --vocab-size 281 /tmp/glm53_stream-i4
           cd c && COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_dashboard
           COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_context_exceeded
+          COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_hostile_weights
       # The two stdlib-only oracles used to be argparse scripts that `make
       # test-python` collected as zero tests (#1700). They run here, on the
       # fixtures generated above, token-exact against transformers in f32.
       - name: Run the GLM-5.3 tiny oracles
         run: |
           cd c && GLM53_TINY=/tmp/glm53_tiny GLM53_MM_TINY=/tmp/glm53_mm python -m unittest -v tests.test_glm53_oracles
+          GLM53_TINY=/tmp/glm53_tiny COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_prefill_batch
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to

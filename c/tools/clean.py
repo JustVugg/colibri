@@ -25,7 +25,11 @@ FILES = [
     "glm53", "glm53.exe",
     "glm", "glm.exe",                       # pre-rename name of the colibri engine
     "iobench", "iobench.exe",
-    "backend_cuda.o", "backend_loader.o",
+    "backend_cuda.o", "backend_loader.o", "qwen36_tier.o",
+    # VK=1, XDNA=1 and METAL=1 (qwen36's qpack) objects. Left behind once
+    # their .d is cleaned, an object would sit in the tree with no record of
+    # the headers it read.
+    "backend_vulkan.o", "backend_xdna.o", "qwen36_qpack.o", "qpack.o",
     "backend_cuda_test", "backend_cuda_test.exe",
     "mxfp4_expert_cuda_test", "mxfp4_expert_cuda_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
@@ -35,6 +39,8 @@ FILES = [
     "coli_hip.dll", "coli_hip.lib", "coli_hip.exp", "coli_hip.pdb",
     "deepseek_v4", "deepseek_v4.exe", "deepseek_v4.cflags", "deepseek_v4.cudaflags",
     "deepseek_v41", "deepseek_v41.exe",
+    "mimo", "mimo.exe",
+    "qwenimage", "qwenimage.exe",
     "native_quant.o", "native_quant_parallel.o", "native_quant_dual.o",
     "native_quant_batch_avx512.o", "native_quant_fp4_rows16.o",
 ]
@@ -52,28 +58,56 @@ FILES = [
 # repo tracks under tests/ carries one of these extensions, and directories
 # (tests/fixtures/) are skipped by the isfile() check. Object files are not in
 # it, so COLI_V4_UNIT_*.o is removed by the same rule rather than a second one.
+#
+# tests/*_probe* is here for the same reason. The XDNA physical qualification
+# probe is built by an explicit `make tests/xdna_physical_probe$(EXE)` and
+# matched none of the test_/bench_/fuzz_ prefixes, so it survived every clean.
+# A stale probe does not just waste space -- it is the owner that PRODUCES
+# physical execution evidence, and a stale one reports PASS for code that is no
+# longer in the tree.
+#
+# *.d are the dependency files -MMD writes beside each binary and object
+# (#1741). A stale one only adds prerequisites, but clean should leave nothing
+# the build made, and removing it forces the rebuild that writes a fresh one.
+# They land wherever an output does: c/ and tests/ for the engines and tests,
+# tools/ for the ctypes library; build/segment/ and build/ownership/ go as
+# whole directories below.
 ARTIFACT_GLOBS = ["tests/test_*", "tests/bench_*", "tests/fuzz_*",
-                  "COLI_V4_UNIT_*.o"]
+                  "tests/*_probe*", "COLI_V4_UNIT_*.o", "*.d", "tests/*.d",
+                  "tools/*.d",
+                  # helper objects the tests link (#1741), one unit per command
+                  "tests/*.o"]
 KEEP_EXT = (".c", ".h", ".cc", ".cpp", ".cu", ".mm", ".py", ".txt", ".json",
             ".md", ".bin", ".sh", ".toml", ".yml", ".yaml")
-# Directories to remove.
-DIRS = ["tests/__pycache__", "build/ownership"]
+# Directories to remove. build/segment/ holds only build output (the
+# segment-library objects, their .d and the archive); an object left there
+# without its .d would be a built target whose headers are untracked (#1741).
+DIRS = ["tests/__pycache__", "build/ownership", "build/segment"]
 
-removed = 0
-for f in FILES:
-    if os.path.exists(f):
-        os.remove(f)
-        removed += 1
-for pattern in ARTIFACT_GLOBS:
-    for f in glob.glob(pattern):
-        if not os.path.isfile(f):          # tests/fixtures/ and friends
-            continue
-        if f.endswith(KEEP_EXT):           # never a source file
-            continue
-        os.remove(f)
-        removed += 1
-for d in DIRS:
-    if os.path.isdir(d):
-        shutil.rmtree(d)
-        removed += 1
-print(f"clean: removed {removed} files/dirs")
+def clean():
+    """Remove everything above, relative to the current directory."""
+    removed = 0
+    for f in FILES:
+        if os.path.exists(f):
+            os.remove(f)
+            removed += 1
+    for pattern in ARTIFACT_GLOBS:
+        for f in glob.glob(pattern):
+            if not os.path.isfile(f):      # tests/fixtures/ and friends
+                continue
+            if f.endswith(KEEP_EXT):       # never a source file
+                continue
+            os.remove(f)
+            removed += 1
+    for d in DIRS:
+        if os.path.isdir(d):
+            shutil.rmtree(d)
+            removed += 1
+    return removed
+
+
+# Guarded, so that reading FILES -- which tests/test_clean_ownership.py does, to
+# check it against the release registry -- cannot delete the build products the
+# rest of the suite is running against. Importing this module must be inert.
+if __name__ == "__main__":
+    print(f"clean: removed {clean()} files/dirs")

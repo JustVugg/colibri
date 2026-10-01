@@ -18,11 +18,15 @@ parameters** — on consumer and heterogeneous hardware, in pure C with zero
 engine dependencies, by treating storage, RAM, and VRAM as a single inference
 hierarchy (AI memory multitiering).
 
-Nine families run today: **GLM-5.2/5.3** (744B), **GLM-5.3-Flash** (321B, with
+Ten families run today: **GLM-5.2/5.3** (744B), **GLM-5.3-Flash** (321B, with
 vision), **Inkling** (975B), **Kimi K3** (2.8T), **DeepSeek V4 Flash** (284B), **DeepSeek V4.1 Flash** (552B, with vision),
+**MiMo-V2.6 Flash** (309B, with vision),
 **Qwen3.8-Flash-Next** (125B + 51B n-gram), **Qwen3.6** (35B-A3B) and
 **OLMoE** (7B) —
 one C file each, the same `coli chat` / `coli serve` / `coli web` front end.
+Images too: **Qwen-Image-2.1** generates pictures from text, shown inline in
+the terminal by `coli chat` and served at `POST /v1/images/generations`
+([qwen-image.md](docs/qwen-image.md)).
 [Full roster ↓](#other-supported-models)
 
 > **Colibrì is an inference engine you can run today, and an open research
@@ -453,6 +457,7 @@ the model's `config.json`):
 > | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed |
 > | **DeepSeek V4 Flash** | ~167 GB (REAP 150B: ~85 GB) | 16 GB min, 32 GB comfortable | optional; any NVIDIA card from the GTX 10 series up (Pascal/Turing via `CUDA_ARCH=portable-pre-ampere NO_TC=1`, best on RTX 50) makes prefill 5-10x and decode ~2.5x faster |
 > | **Qwen3.8-Flash-Next** | ~185.5 GB (official FP8 checkpoint) | 16 GB min, 24 GB comfortable at the default context | optional; the CUDA VRAM expert tier with dense trunk quantized to int8 in VRAM |
+> | **Qwen3.8-27B** (dense, text and images) | ~51 GB converted (f16) | 20 GB with int4 dense weights, 30 GB in int8 | not used yet (CPU) |
 > | **Qwen3.6-35B-A3B** | ~20 GB (int4-gs64 container) | 24 GB (needs full RAM residency) | optional; the CUDA VRAM expert tier measured **1.44 -> 10.05 tok/s (7.0x)** on two 8 GB cards, output bit-identical to CPU |
 >
 > A GPU only ever makes it faster. Speed is set by your disk, because the experts
@@ -467,6 +472,7 @@ the model's `config.json`):
 | **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
 | **DeepSeek V4 Flash** | 284B / 13B | official sharded checkpoint — routed experts stay **native fp4**, dense stays fp8-e4m3; the **REAP-pruned 150B** ([`puwaer/DeepSeek-V4-Flash-0731-reap-150b`](https://huggingface.co/puwaer/DeepSeek-V4-Flash-0731-reap-150b), 85 GB, 132 of 256 experts) loads with the same engine and no conversion | `make -C c deepseek-v4` | [deepseek-v4.md](docs/deepseek-v4.md) |
 | **DeepSeek V4.1 Flash** | 552B / 16B | official checkpoint, **no conversion**: experts are already fp4, dense is fp8-e4m3. 203 GB of it is an n-gram memory read from disk a few hundred bytes at a time, and the routed experts cost **4.5 GB per token** against GLM-5.2's 12.7. Vision, tool calling and the DSpark draft head are all on | `make -C c deepseek_v41` | [deepseek-v41.md](docs/deepseek-v41.md) |
+| **MiMo-V2.6 Flash** (Xiaomi) | 309B / 15B | [`XiaomiMiMo/MiMo-V2.6-Flash-MOPD`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-MOPD) (178 GB), official checkpoint, **no conversion**: routed experts stay **native MXFP4**, dense stays FP8/BF16. 39 of its 48 layers attend a 128-token window, so a long context costs the KV of 9. Vision and tool calling on | `make -C c mimo` | [mimo.md](docs/mimo.md) |
 | **Qwen3.8-Flash-Next** (Alibaba) | 125B + 51B n-gram / 6B | [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) — original checkpoint; PLE stays pageable and experts stay **native block-FP8** | `make -C c qwen38` (`CUDA=1` for the VRAM expert tier) | [qwen38.md](docs/qwen38.md) |
 | **Qwen3.6** (Alibaba) | 35B / 3B | [`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64`](https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64) (~20 GB, **recommended**) — hybrid Gated Attention + Gated DeltaNet | `make -C c qwen36` (`CUDA=1` for the VRAM expert tier) | [qwen36.md](docs/qwen36.md) |
 | **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` — **int8** container, ~7 GB | `make -C c olmoe` | — |
@@ -661,9 +667,9 @@ checkpoint validation, and the generated tiny independent oracle.
   lower cost per useful token. Everything lands the way this project works:
   measured end to end, reviewed, and developed in the open.
 - **More open models.** The tiering algorithm is model-agnostic: any MoE with
-  routed experts can be staged the same way. Nine families run today (GLM-5.2,
-  GLM-5.3-Flash, Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, Qwen3.8-Flash-Next,
-  Qwen3.6, OLMoE); further open-weight families — **MiniMax** among the
+  routed experts can be staged the same way. Ten families run today (GLM-5.2,
+  GLM-5.3-Flash, Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6 Flash,
+  Qwen3.8-Flash-Next, Qwen3.6, OLMoE); further open-weight families — **MiniMax** among the
   candidates — earn an engine the way the first eight did: when someone
   measures one end to end.
 

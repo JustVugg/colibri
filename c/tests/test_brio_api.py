@@ -64,8 +64,8 @@ class BrioApi(unittest.TestCase):
     def serve(self, table):
         self.engine = ScoringEngine(table)
         self.server = APIServer(("127.0.0.1", 0), self.engine, "test-model")
-        self.addCleanup(self.server.shutdown)
         self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
         import threading
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
@@ -146,7 +146,7 @@ class BrioApi(unittest.TestCase):
         self.assertEqual(out["object"], "brio.answers")
         self.assertEqual([a["answer"] for a in out["answers"]],
                          ["request changes", "yes", "high"])
-        self.assertEqual([a["normalize"] for a in out["answers"]], ["mean", "mean", "sum"])
+        self.assertEqual([a["normalize"] for a in out["answers"]], ["sum", "sum", "sum"])
         for answer in out["answers"]:
             self.assertAlmostEqual(sum(c["p"] for c in answer["choices"]), 1.0, places=6)
             self.assertGreaterEqual(answer["entropy"], 0.0)
@@ -163,6 +163,38 @@ class BrioApi(unittest.TestCase):
         self.assertEqual(out["usage"]["completion_tokens"], 0)
         self.assertEqual(out["usage"]["read_tokens"],
                          sum(c["tokens"] for a in out["answers"] for c in a["choices"]))
+
+    def test_default_normalize_is_sum(self):
+        # The default was "mean", whose per-token averages silently favor
+        # multi-token options on any menu that mixes token counts; "sum" is
+        # the joint log-probability and the only safe default.
+        self.serve({"merge": -3.0, "close": -4.0})
+        out = self.post({"model": "test-model", "state": STATE,
+                         "question": "What should the reviewer do?",
+                         "options": ["merge", "close"]})
+        self.assertEqual(out["normalize"], "sum")
+
+    def test_mean_with_unequal_option_token_counts_warns(self):
+        import contextlib
+        import io
+        self.serve({"merge": -3.0, "request changes": -0.2})
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.post({"model": "test-model", "state": STATE,
+                       "question": "What should the reviewer do?",
+                       "options": ["merge", "request changes"],
+                       "normalize": "mean"})
+        self.assertIn("unequal option token counts", stderr.getvalue())
+        self.assertIn("merge=1", stderr.getvalue())
+        # Equal token counts stay quiet — mean is valid there. (The [api]
+        # request log also lands on stderr; only the bias warning matters.)
+        self.serve({"yes": -0.1, "no": -2.0})
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.post({"model": "test-model", "state": STATE,
+                       "question": "Ship it?", "options": ["yes", "no"],
+                       "normalize": "mean"})
+        self.assertNotIn("unequal option token counts", stderr.getvalue())
 
     # ---- schema: a JSON object filled one cell at a time --------------------
     def test_schema_fills_cells_in_order_and_each_cell_sees_the_ones_before(self):
@@ -230,6 +262,22 @@ class BrioApi(unittest.TestCase):
                                       "questions": [{"question": "q?", "options": ["a", "b"]}]})
         self.assertEqual(code, 400)
         self.assertIn("state", body["error"]["message"])
+
+    def test_non_string_message_text_is_a_client_error(self):
+        self.serve({})
+        code, body = self.post_error({
+            "model": "test-model", "options": ["yes", "no"],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": 7}]}],
+        })
+        self.assertEqual(code, 400)
+        self.assertEqual(body["error"]["param"], "messages.0.content.0.text")
+        self.assertEqual(self.engine.calls, [])
+        out = self.post({
+            "model": "test-model", "options": ["yes", "no"],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "Ship it?"}]}],
+        })
+        self.assertEqual(out["object"], "brio.choice")
+        self.assertEqual(self.pins()[0], "Context:\nuser: Ship it?\n\n")
 
     def test_schema_field_names_that_would_break_the_skeleton_are_refused(self):
         self.serve({})

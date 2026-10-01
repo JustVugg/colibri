@@ -32,6 +32,22 @@ executes an unmodified vLLM checkout (commit
 `ffd46bfab2128bb84146050e98b51a617c6575ab`) as a behavioural oracle for the
 native port; no vLLM code is vendored.
 
+## Swiftlet qpack and MLX affine Metal GEMV
+
+`c/qpack.c` and `c/qpack.h` implement the Swiftlet qpack v1 container schema
+documented by `Sources/SwiftletCore/Qpack.swift` at the commit linked below.
+The reader is a new portable implementation for Colibri and does not copy
+Swift source code.
+
+The MLX affine Q4/Q8 kernels in `c/backend_metal.mm` are adapted from
+`gemv_affine_fast` and `gemv_affine_fast8` in Swiftlet:
+https://github.com/leonickson1/Swiftlet at commit
+`b3a04676748c7597800c5bcc8b80a32508f9f43d`.
+
+Swiftlet is licensed under Apache License 2.0. The kernels were modified for
+Colibri's checked descriptor, batched dispatch, buffer ownership, and fallback
+contract. This repository's `LICENSE` contains the applicable Apache 2.0 text.
+
 ## DeepGEMM sm120 headers (fetched, not vendored: `c/third_party/deepgemm/`)
 
 The DeepSeek V4 CUDA tier's DeepGEMM flavour (`make cuda-dsv4-dg-dll`,
@@ -48,3 +64,24 @@ What that checkout contains, and the licences that apply when you build with it:
 - NVIDIA CUTLASS / CuTe (BSD-3-Clause), the `third-party/cutlass` submodule of
   that commit @ f3fde58372d33e9a5650ba7b80fc48b3b49d40c8. License text:
   `c/third_party/deepgemm/third-party/cutlass/LICENSE.txt` after the fetch.
+
+## Swiftlet qpack installers (`c/tools/qpack_*install*.py`)
+
+Swiftlet (https://github.com/leonickson1/Swiftlet) is licensed under Apache
+License 2.0. This repository's `LICENSE` contains the applicable Apache 2.0
+text.
+
+`c/tools/qpack_install_policy.py` adapts the source-bound resume and
+manifest-last completion policy from Swiftlet's `StreamingInstaller.swift` at
+commit `86246618ba2af30334227e09ff84a6a7182c2a40`. It is a new
+transport-neutral Python implementation and does not copy Swift source code.
+
+`c/tools/qpack_http_install.py` is a new Python HTTP frontend over that policy.
+It interoperates with Hugging Face-hosted Swiftlet qpack repositories but does
+not copy Swiftlet or huggingface_hub source code.
+
+`c/tools/qpack_mirror_install.py` and the static-mirror support in
+`c/tools/qpack_http_install.py` interoperate with the `hashes.json` schema
+emitted by Swiftlet's `scripts/verify_container.py`. They are new Python
+implementations with stricter path, transport, credential, resume, and digest
+validation; no Swiftlet source code is copied.

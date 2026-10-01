@@ -47,7 +47,7 @@ except ImportError as exc:
     sys.exit(f"Missing deps: {exc}. Run: pip install torch transformers")
 
 
-def get_classes():
+def get_classes(dense=False):
     """Resolve the Qwen3-MoE model/config classes across transformers versions.
 
     Uses each model class's declared `config_class` (NOT a name guess): in
@@ -55,7 +55,7 @@ def get_classes():
     same-named `Qwen3_5MoeConfig` is the vision-language wrapper and lacks the
     text fields (vocab_size, head_dim, ...). Guessing by name picks the wrong one.
     """
-    candidates = [
+    candidates = ["Qwen3_5ForCausalLM"] if dense else [
         "Qwen3_5MoeForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextMoeForCausalLM",
@@ -67,7 +67,8 @@ def get_classes():
             cc = getattr(mc, "config_class", None)
             if cc is not None:
                 return mc, cc
-    sys.exit("No Qwen3-MoE model class found in this transformers build. Upgrade transformers.")
+    sys.exit(f"No {'dense Qwen3.5' if dense else 'Qwen3-MoE'} model class found in this "
+             "transformers build. Upgrade transformers.")
 
 
 class Zero(nn.Module):
@@ -92,6 +93,13 @@ GEOMETRIES = {
                         rope_dim=8, n_experts=512, topk=10, inter=16,
                         dn_key_heads=2, dn_value_heads=16,
                         fused_experts=True, mtp=True),
+    # Qwen/Qwen3.8-27B, config.json: Qwen3_5ForConditionalGeneration, a DENSE model of
+    # the same family -- 64 layers / full_attention_interval 4 / 24:4 attention heads /
+    # 16:48 DeltaNet heads / one SwiGLU MLP per layer, no router (#1757).
+    "qwen38-27b-dense": dict(hidden=64, n_layers=8, q_heads=6, kv_heads=1, head_dim=16,
+                             rope_dim=8, n_experts=0, topk=0, inter=128,
+                             dn_key_heads=2, dn_value_heads=6,
+                             fused_experts=False, mtp=False, dense=True),
 }
 
 
@@ -150,7 +158,7 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
           vocab=320, max_new=16, prompt_ids=None, emit_ref=None,
           ref_mode="attention_only", seed=20260817,
           dn_key_heads=None, dn_value_heads=None,
-          fused_experts=False, mtp=False):
+          fused_experts=False, mtp=False, dense=False):
     if dn_key_heads is None:
         dn_key_heads = q_heads
     if dn_value_heads is None:
@@ -159,7 +167,7 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
     # three local draws passed, one CI draw failed at 11/16, with identical
     # code. A gate that reddens at random gets muted within a week.
     torch.manual_seed(seed)
-    ModelCls, ConfigCls = get_classes()
+    ModelCls, ConfigCls = get_classes(dense)
     layer_types = ["full_attention" if i % 4 == 3 else "linear_attention"
                    for i in range(n_layers)]
     base = dict(
@@ -176,6 +184,12 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
         attention_bias=False, attention_dropout=0.0, use_cache=True,
         rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
     )
+    if dense:
+        # the dense text config has no router: one MLP of intermediate_size per layer
+        for key in ("num_experts", "num_experts_per_tok", "moe_intermediate_size",
+                    "shared_expert_intermediate_size"):
+            base.pop(key)
+        base["intermediate_size"] = inter
     # Qwen3_5MoeConfig uses **kwargs, so pass everything; fall back to filtered
     # only if a build rejects an unknown key.
     try:
