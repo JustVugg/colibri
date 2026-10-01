@@ -8821,6 +8821,15 @@ static V4ExpertSlot *hot_oldest_pool_victim(
     return last_resort;
 }
 
+static int hot_layer_on_gpu(ColiExpertStore *store, int layer) {
+#ifdef COLI_V4_GPU_TIER
+    return coli_v4_gpu_expert_layer_owned(store, layer);
+#else
+    (void)layer;
+    return store->gpu != NULL;
+#endif
+}
+
 static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
                       ColiExpertView *view) {
     if (!store || !store->state || !view) {
@@ -8867,7 +8876,7 @@ retry_lookup:
         state->active_leases++;
         slot->used = ++state->clock; state->stats.hits++;
         touch_lru_slot(state, slot);
-        if (hot_is_pinned(policy, key.layer, key.expert) && !store->gpu)
+        if (hot_is_pinned(policy, key.layer, key.expert) && !hot_layer_on_gpu(store, key.layer))
             hot_pack_slot_locked(policy, state, record, slot);
         memset(view, 0, sizeof(*view)); view->key = key;
         hot_fill_view(&view->gate, record, slot, V4_W1, policy, state);
@@ -8938,10 +8947,10 @@ retry_lookup:
      * stable, and the heavy FP4 rows16 work must not serialise other
      * fetches (issue #900). Committed under the lock below. */
     unsigned char *v4_pack_buf = NULL;
-    /* Not when the GPU tier mirrors experts: pinned experts run from their
-     * fp4 mirror, and a rows16-repacked slab could not be uploaded. */
+    /* GPU-owned layers need uploadable row-major slabs. CPU-only tail
+     * layers can use the same packed kernels as a CPU-only engine. */
     if (!read_result &&
-        hot_is_pinned(policy, key.layer, key.expert) && !store->gpu)
+        hot_is_pinned(policy, key.layer, key.expert) && !hot_layer_on_gpu(store, key.layer))
         v4_pack_buf = hot_pack_slot_prepare(record, slot);
     pthread_mutex_lock(&state->mutex);
     state->disk_sec +=
@@ -10832,6 +10841,10 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_cache(ColiExpertStore *store,
     for (V4GpuExpertMirrorCache *c = store ? store->gpu : NULL; c; c = c->next)
         if (layer >= c->first_layer && layer < c->end_layer) return c;
     return NULL;
+}
+
+int coli_v4_gpu_expert_layer_owned(ColiExpertStore *store, int layer) {
+    return v4_gpu_expert_cache(store, layer) != NULL;
 }
 
 static V4GpuExpertMirror *v4_gpu_expert_find(V4GpuExpertMirrorCache *cache,
@@ -17880,32 +17893,6 @@ static int fp8_matvec_validate(const ColiTensorView *weight) {
 
 /* Compute CPU su attivazione GIA' qdq (estratto invariato da matvec_ref).
  * EN: CPU compute on an already-qdq'd activation, extracted verbatim. */
-#ifdef __AVX2__
-/* Branchless SIMD decode of 8 E4M3FN codes -> 8 f32, byte-identical to
- * coli_e4m3fn_decode for all 256 inputs (exhaustively verified). Replaces a
- * slow per-element _mm256_i32gather_ps from a 256-float LUT. E4M3FN values are
- * exact, so the f32 bit pattern is built directly: normals via integer field
- * assembly, subnormals as (float)mantissa*2^-9 (exact), NaN (code&0x7F==0x7F)
- * as canonical qNaN overwriting the sign. */
-static inline __m256 v4_fp8_decode8(__m256i codes) {
-    __m256i man = _mm256_and_si256(codes, _mm256_set1_epi32(7));
-    __m256i exp = _mm256_and_si256(_mm256_srli_epi32(codes, 3), _mm256_set1_epi32(0xF));
-    __m256i sgn = _mm256_slli_epi32(_mm256_srli_epi32(codes, 7), 31);
-    __m256i nbits = _mm256_or_si256(
-        _mm256_slli_epi32(_mm256_add_epi32(exp, _mm256_set1_epi32(120)), 23),
-        _mm256_slli_epi32(man, 20));
-    __m256 nval = _mm256_castsi256_ps(nbits);
-    float man_factor = 1.0f / (float)(1 << 9);
-    __m256 sval = _mm256_mul_ps(_mm256_cvtepi32_ps(man), _mm256_set1_ps(man_factor));
-    __m256 is_sub = _mm256_castsi256_ps(_mm256_cmpeq_epi32(exp, _mm256_setzero_si256()));
-    __m256i sbits = _mm256_or_si256(
-        _mm256_castps_si256(_mm256_blendv_ps(nval, sval, is_sub)), sgn);
-    __m256i is_nan = _mm256_cmpeq_epi32(
-        _mm256_and_si256(codes, _mm256_set1_epi32(0x7F)), _mm256_set1_epi32(0x7F));
-    return _mm256_castsi256_ps(
-        _mm256_blendv_epi8(sbits, _mm256_set1_epi32(0x7FC00000), is_nan));
-}
-#endif
 
 static int fp8_matvec_compute(float *output, const ColiTensorView *weight,
                               const float *activation) {
@@ -18104,9 +18091,6 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
         if (rows % 8) {
             return -1;
         }
-        float fp8[256];
-        for (int code = 0; code < 256; code++)
-            fp8[code] = coli_e4m3fn_decode((uint8_t)code);
         const uint8_t *data_a = a->data, *data_b = b->data;
         const float *scales_a = a->scales, *scales_b = b->scales;
         #pragma omp parallel for schedule(static)
@@ -18125,8 +18109,8 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
                         (const __m128i *)(data_a + packed)));
                     __m256i codes_b = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
                         (const __m128i *)(data_b + packed)));
-                    __m256 values_a = _mm256_i32gather_ps(fp8, codes_a, 4);
-                    __m256 values_b = _mm256_i32gather_ps(fp8, codes_b, 4);
+                    __m256 values_a = v4_fp8_decode8(codes_a);
+                    __m256 values_b = v4_fp8_decode8(codes_b);
                     __m256 x = _mm256_set1_ps(activation[column]);
                     sum_a = _mm256_add_ps(sum_a, _mm256_mul_ps(
                         _mm256_mul_ps(x, values_a), scale_a));
@@ -18253,9 +18237,6 @@ static int fp8_batch_compute(float *outputs, const ColiTensorView *weight,
         if (rows % 8) {
             return -1;
         }
-        float fp8[256];
-        for (int code = 0; code < 256; code++)
-            fp8[code] = coli_e4m3fn_decode((uint8_t)code);
         const uint8_t *data = weight->data;
         const float *scales = weight->scales;
         #pragma omp parallel for schedule(static)
@@ -18273,7 +18254,7 @@ static int fp8_batch_compute(float *outputs, const ColiTensorView *weight,
                         ((size_t)tile * columns + column) * 8));
                     __m256i codes = _mm256_cvtepu8_epi32(bytes);
                     __m256 values = _mm256_mul_ps(
-                        _mm256_i32gather_ps(fp8, codes, 4), scale);
+                        v4_fp8_decode8(codes), scale);
                     for (int item = 0; item < batch; item++) {
                         __m256 x = _mm256_set1_ps(
                             activations[(size_t)item * columns + column]);

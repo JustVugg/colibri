@@ -6,6 +6,34 @@
 
 #include "tensor.h"
 
+#ifdef __AVX2__
+#include <immintrin.h>
+/* Branchless SIMD decode of 8 E4M3FN codes -> 8 f32, byte-identical to
+ * coli_e4m3fn_decode for all 256 inputs (exhaustively verified). Replaces a
+ * slow per-element _mm256_i32gather_ps from a 256-float LUT. E4M3FN values are
+ * exact, so the f32 bit pattern is built directly: normals via integer field
+ * assembly, subnormals as (float)mantissa*2^-9 (exact), NaN (code&0x7F==0x7F)
+ * as canonical qNaN overwriting the sign. */
+static inline __m256 v4_fp8_decode8(__m256i codes) {
+    __m256i man = _mm256_and_si256(codes, _mm256_set1_epi32(7));
+    __m256i exp = _mm256_and_si256(_mm256_srli_epi32(codes, 3), _mm256_set1_epi32(0xF));
+    __m256i sgn = _mm256_slli_epi32(_mm256_srli_epi32(codes, 7), 31);
+    __m256i nbits = _mm256_or_si256(
+        _mm256_slli_epi32(_mm256_add_epi32(exp, _mm256_set1_epi32(120)), 23),
+        _mm256_slli_epi32(man, 20));
+    __m256 nval = _mm256_castsi256_ps(nbits);
+    float man_factor = 1.0f / (float)(1 << 9);
+    __m256 sval = _mm256_mul_ps(_mm256_cvtepi32_ps(man), _mm256_set1_ps(man_factor));
+    __m256 is_sub = _mm256_castsi256_ps(_mm256_cmpeq_epi32(exp, _mm256_setzero_si256()));
+    __m256i sbits = _mm256_or_si256(
+        _mm256_castps_si256(_mm256_blendv_ps(nval, sval, is_sub)), sgn);
+    __m256i is_nan = _mm256_cmpeq_epi32(
+        _mm256_and_si256(codes, _mm256_set1_epi32(0x7F)), _mm256_set1_epi32(0x7F));
+    return _mm256_castsi256_ps(
+        _mm256_blendv_epi8(sbits, _mm256_set1_epi32(0x7FC00000), is_nan));
+}
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

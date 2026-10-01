@@ -900,6 +900,7 @@ int coli_v4_gpu_resident_route(float *output,
 int coli_v4_gpu_experts_init(ColiV4Engine *engine, char *error, size_t error_size);
 int coli_v4_gpu_experts_preload(ColiV4Engine *engine, char *error, size_t size);
 int coli_v4_gpu_experts_resident(ColiExpertStore *store, int layer);
+int coli_v4_gpu_expert_layer_owned(ColiExpertStore *store, int layer);
 /* 1: completed; 0: use normal loader; -1: immutable resident table failed.
  * Does not acquire host leases or upload weights. */
 int coli_v4_gpu_moe_resident(ColiExpertStore *store, int layer,

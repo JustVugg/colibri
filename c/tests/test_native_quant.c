@@ -10,6 +10,19 @@ static int close_enough(float left, float right) {
 }
 
 int main(void) {
+#ifdef __AVX2__
+    for (int base = 0; base < 256; base += 8) {
+        int codes[8]; float decoded[8];
+        for (int lane = 0; lane < 8; lane++) codes[lane] = base + lane;
+        _mm256_storeu_ps(decoded, v4_fp8_decode8(
+            _mm256_loadu_si256((const __m256i *)codes)));
+        for (int lane = 0; lane < 8; lane++) {
+            float expected = coli_e4m3fn_decode((uint8_t)codes[lane]);
+            if (isnan(expected) ? !isnan(decoded[lane]) :
+                memcmp(&expected, &decoded[lane], sizeof(float)) != 0) return 1;
+        }
+    }
+#endif
     if (coli_bf16_round(1.00390625f) != 1.0f ||
         coli_bf16_round(1.01171875f) != 1.015625f)
         return 1;
