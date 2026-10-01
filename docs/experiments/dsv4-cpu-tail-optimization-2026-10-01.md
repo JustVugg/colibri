@@ -44,7 +44,7 @@ Single-round screening controls (not repeated confidence estimates):
 ## Protocol and evidence
 
 - Official DeepSeek-V4-Flash-0731, 48 shards / 155.425 GiB; six available RTX 5090 32 GB cards with only four visible to the runner; 2 × Xeon Silver 4510, 251 GiB RAM.
-- Concurrency one, existing `long6` fixtures, 48 prompt tokens and 64 output tokens per request, one initial 16-token target warmup per process.
+- Concurrency one, existing `long6` fixtures, 48–49 prompt tokens (fixture 3 has 49; all others have 48) and 64 output tokens per request, one initial 16-token target warmup per process.
 - Per-round throughput is 320 outputs / sum of request wall times for fixtures 1–5. Decode rate is 315 intervals / summed recorded decode duration; small generation-end bookkeeping remains in that duration.
 - The campaign parent locks all checkpoint shards read-only with `mmap`/`mlock`; `COLI_V4_DIRECT=0`. Locking is outside timing. All sampled benchmark-process swap is zero. Small process physical reads, if any, are retained in `validated-results.json`, rather than claiming zero I/O.
 - Configurations run sequentially, without randomization or statistical confidence intervals. Primary medians combine the original screening pass and two confirmation passes; raw round ranges are shown above.
