@@ -45,25 +45,80 @@ static void check_lookup_scaling(int cap) {
 static void check_victim(void) {
     Model m; init_cache(&m, 6, 3); LCache *lc = &m.cache[0]; lc->n = 3;
     for (int i = 0; i < 3; i++) { cache_publish(&m, 0, &lc->slots[i], i); lc->slots[i].used = (uint64_t)(i + 1); }
-    CHECK(slot_victim(lc, 0) == 0, "LRU victim is not the oldest slot");
+    CHECK(slot_victim(&m, 0, lc, 0) == 0, "LRU victim is not the oldest slot");
 
     Slot *h = expert_hold(&m, 0, 0);      /* a resident expert: the hit path holds too */
     CHECK(h == &lc->slots[0] && slot_busy(h), "expert_hold did not hold the resident slot");
-    CHECK(slot_victim(lc, 0) == 1 && slot_victim(lc, 1) == 1, "a held slot was chosen for eviction");
+    CHECK(slot_victim(&m, 0, lc, 0) == 1 && slot_victim(&m, 0, lc, 1) == 1, "a held slot was chosen for eviction");
 
     lc->slots[1].pinned = 1; slot_hold(&lc->slots[2]); slot_hold(&lc->slots[2]);   /* routed twice in one run */
-    CHECK(slot_victim(lc, 0) == -1, "an unpinned victim came from pinned and held slots");
-    CHECK(slot_victim(lc, 1) == 1, "the pinned fallback missed the one pinned free slot");
+    CHECK(slot_victim(&m, 0, lc, 0) == -1, "an unpinned victim came from pinned and held slots");
+    CHECK(slot_victim(&m, 0, lc, 1) == 1, "the pinned fallback missed the one pinned free slot");
     cache_hide(&m, 0, &lc->slots[1]);    /* now being loaded */
-    CHECK(slot_victim(lc, 1) == -1, "a slot being loaded was chosen for eviction");
+    CHECK(slot_victim(&m, 0, lc, 1) == -1, "a slot being loaded was chosen for eviction");
 
     slot_release(&lc->slots[2]);
-    CHECK(slot_victim(lc, 1) == -1, "one release freed a slot held twice");
+    CHECK(slot_victim(&m, 0, lc, 1) == -1, "one release freed a slot held twice");
     slot_release(&lc->slots[2]);
-    CHECK(slot_victim(lc, 1) == 2, "a fully released slot stayed unevictable");
+    CHECK(slot_victim(&m, 0, lc, 1) == 2, "a fully released slot stayed unevictable");
     slot_release(h);
-    CHECK(slot_victim(lc, 1) == 0, "the released oldest slot is not the victim");
+    CHECK(slot_victim(&m, 0, lc, 1) == 0, "the released oldest slot is not the victim");
     free_cache(&m);
+}
+
+/* dev's slot_victim before DEMAND_POLICY, verbatim. */
+static int legacy_slot_victim(const LCache *lc, int allow_pinned) {
+    int lru = -1;
+    for (int i = 0; i < lc->n; i++) {
+        const Slot *s = &lc->slots[i];
+        if (s->eid < 0 || slot_busy(s) || (s->pinned && !allow_pinned)) continue;
+        if (lru < 0 || s->used < lc->slots[lru].used) lru = i;
+    }
+    return lru;
+}
+
+/* Default output unchanged: with DEMAND_POLICY unset the victim matches the
+ * legacy scan on every random row, even with live freq/last_access rows that
+ * would make LFRU disagree. Under lfru it does disagree somewhere, and never
+ * picks a held, loading, or (without allow_pinned) pinned slot. */
+static void check_demand_policy(void) {
+    enum { NE = 64, CAP = 12 };
+    Model m; init_cache(&m, NE, CAP); LCache *lc = &m.cache[0];
+    m.freq = calloc(NE, sizeof(uint32_t)); m.last_access = calloc(NE, sizeof(uint64_t));
+    unsetenv("DEMAND_POLICY");
+    m.demand_policy = tier_demand_policy_env();
+    CHECK(m.demand_policy == TIER_DEMAND_LRU, "DEMAND_POLICY unset did not resolve to lru");
+    uint32_t rng = 777u; int lfru_differs = 0, mismatches = 0, bad_lfru = 0;
+    #define RND() ((rng = rng * 1103515245u + 12345u) >> 8)
+    for (int it = 0; it < 20000; it++) {
+        memset(lc->slots, 0, CAP * sizeof(Slot));
+        lc->n = 1 + (int)(RND() % CAP);
+        m.clock = 1000;
+        for (int e = 0; e < NE; e++) { m.freq[e] = RND() % 32; m.last_access[e] = RND() % 1000; }
+        for (int i = 0; i < lc->n; i++) {
+            uint32_t r = RND();
+            lc->slots[i].eid = (r % 9 == 0) ? -1 : (int)((r >> 4) % NE);
+            lc->slots[i].used = (r >> 10) % 997;
+            lc->slots[i].pinned = (r % 7 == 0);
+            if (r % 5 == 0) slot_hold(&lc->slots[i]);
+        }
+        for (int ap = 0; ap < 2; ap++) {
+            int want = legacy_slot_victim(lc, ap);
+            m.demand_policy = TIER_DEMAND_LRU;
+            if (slot_victim(&m, 0, lc, ap) != want) mismatches++;
+            m.demand_policy = TIER_DEMAND_LFRU;
+            int got = slot_victim(&m, 0, lc, ap);
+            if (got != want) lfru_differs = 1;
+            if ((got < 0) != (want < 0)) bad_lfru++;
+            if (got >= 0) { const Slot *s = &lc->slots[got];
+                if (s->eid < 0 || slot_busy(s) || (s->pinned && !ap)) bad_lfru++; }
+        }
+    }
+    #undef RND
+    CHECK(mismatches == 0, "default policy diverged from the legacy victim on %d rows", mismatches);
+    CHECK(lfru_differs, "lfru never changed a victim: policy not engaged");
+    CHECK(bad_lfru == 0, "lfru picked an ineligible slot on %d rows", bad_lfru);
+    free(m.freq); free(m.last_access); free_cache(&m);
 }
 
 int main(void) {
@@ -87,6 +142,7 @@ int main(void) {
 
     free_cache(&m);
     check_victim();
+    check_demand_policy();
     check_lookup_scaling(44);
     check_lookup_scaling(219);
     if (failures) { fprintf(stderr,"qwen36 cache index: %d failure(s)\n", failures); return 1; }
