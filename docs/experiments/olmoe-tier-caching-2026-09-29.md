@@ -176,18 +176,12 @@ routing, not slot survival). Net: the deterministic +5.1pp demand-hit gain of
 lfru+group (−2075 misses) dominates the lost +176 prefetch hits, so the
 kitchen sink is the best of the four configs in the main cold run — but it is
 effectively lfru+group demand-only plus overlapped-but-hitless prefetch I/O,
-and its median P99 (594.0 ms) is mixed vs pilot2_markov2 (411.9). Artifacts:
-`c/bench_tier/ab_cold_kitchen_sink{,_ablate}.jsonl` / `_summary.md`,
-`c/bench_tier/load_cold_kitchen_sink.log`.
+and its median P99 (594.0 ms) is mixed vs pilot2_markov2 (411.9). Raw run
+artifacts (JSONL, summaries, load logs) are not committed; `c/bench_tier/bench_ab.py`
+regenerates them as `c/bench_tier/ab_<label>.jsonl` / `ab_<label>_summary.md`.
 
-## Backport to core engines (commit de1682fd)
-Shared demand-eviction key promoted to c/tier.h (`tier_demand_victim_key`,
-`tier_demand_policy_env`, auto cap 12) and wired into c/colibri.c (GLM) and
-c/qwen36.c (Qwen3.6; gained last_access). Default DEMAND_POLICY=lru is
-bit-identical to prior victim choice in every engine. qwen36 required a new
-Slot.hold guard: the planar-int4 path keeps slot pointers across further
-expert_get calls, and frequency-primary LFRU can otherwise evict a
-freshly-loaded low-frequency slot. Verified: model-free cache-index tests pass
-under lru/lfru/auto; OLMoE ref200 keeps 10249/26743 (lru) and 12315/24677 (lfru),
-200/200; qwen36 emits identical token ids under lru/lfru/auto while hit rates
-differ (policy engaged, output invariant).
+## Backport to core engines (split out)
+The shared demand-eviction key lives in c/tier.h (`tier_demand_victim_key`,
+`tier_demand_policy_env`, auto cap 12) and is used by olmoe here. Wiring it
+into c/colibri.c (GLM) and c/qwen36.c (Qwen3.6) is proposed separately, with a
+check that the default DEMAND_POLICY=lru output is unchanged.

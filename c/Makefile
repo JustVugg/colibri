@@ -785,47 +785,8 @@ endif
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c sse41_kernels.h exact_dot.h oracle.h pin_pool.h cli_args.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h abl.h backend_cuda.h backend_metal.h backend_vulkan.h decode_batch.h edge_adapters.h edge_runtime.h edge_tok_internal.h schema_gbnf.h segment_adapter_internal.h segment_adapters.h segment_runtime.h tier.h engine.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+colibri$(EXE): colibri.c sse41_kernels.h exact_dot.h oracle.h pin_pool.h cli_args.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h abl.h backend_cuda.h backend_metal.h backend_vulkan.h decode_batch.h edge_adapters.h edge_runtime.h edge_tok_internal.h schema_gbnf.h segment_adapter_internal.h segment_adapters.h segment_runtime.h tier.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o colibri$(EXE) $(LDFLAGS)
-
-# ---- Unified engine ABI: reference backend + shared harness --------------
-# engine.h decouples model compute from main()/the pipe loop. This builds the
-# GLM engine as a library TU (COLI_ENGINE_ADAPTER) exposing the engine_* ABI,
-# plus the model-agnostic harness (agent_main) that drives it in-process.
-ENGINE_CFLAGS = $(CFLAGS) -DCOLI_ENGINE_ADAPTER -DCOLIBRI_NO_MAIN
-ifeq ($(LINUX),)
-ENGINE_CFLAGS += -fPIC
-endif
-
-libcolibri_engine.o: colibri.c engine.h .build-config
-	$(CC) $(ENGINE_CFLAGS) -c colibri.c -o $@
-
-engine_registry.o: engine_registry.c engine.h
-	$(CC) $(CFLAGS) -c engine_registry.c -o $@
-
-agent_main: agent_main.c engine_registry.o libcolibri_engine.o
-	$(CC) $(CFLAGS) agent_main.c engine_registry.o libcolibri_engine.o -o agent_main $(LDFLAGS)
-
-# OLMoE backend: same ABI, built from olmoe.c (which already has an
-# OLMOE_NO_MAIN build in the segment targets below). NOCUDA_* because olmoe.c
-# contains no COLI_CUDA code at all (see the olmoe$(EXE) rule).
-libolmoe_engine.o: olmoe.c engine.h .build-config
-	$(CC) $(NOCUDA_CFLAGS) -DCOLI_ENGINE_ADAPTER -DOLMOE_NO_MAIN -c olmoe.c -o $@
-
-agent_main_olmoe: agent_main.c engine_registry.o libolmoe_engine.o
-	$(CC) $(NOCUDA_CFLAGS) agent_main.c engine_registry.o libolmoe_engine.o -o agent_main_olmoe $(NOCUDA_LDFLAGS)
-
-# A/B: pipe transport vs in-process ABI, same engine + model + workload.
-bench_glm: bench_abi_vs_pipe.c engine_registry.o libcolibri_engine.o
-	$(CC) $(CFLAGS) bench_abi_vs_pipe.c engine_registry.o libcolibri_engine.o -o bench_glm $(LDFLAGS)
-
-bench_olmoe: bench_abi_vs_pipe.c engine_registry.o libolmoe_engine.o
-	$(CC) $(NOCUDA_CFLAGS) bench_abi_vs_pipe.c engine_registry.o libolmoe_engine.o -o bench_olmoe $(NOCUDA_LDFLAGS)
-
-.PHONY: engine-clean
-engine-clean:
-	rm -f libcolibri_engine.o libolmoe_engine.o engine_registry.o \
-	      agent_main agent_main_olmoe bench_glm bench_olmoe
 
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
 backend_vulkan.o: backend_vulkan.c backend_vulkan.h .build-config
