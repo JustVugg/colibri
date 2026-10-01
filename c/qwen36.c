@@ -816,6 +816,7 @@ typedef struct {
     float *vis_rows; int vis_rows_n;
     int *vis_map, vis_map_len;
     int *mpos, mpos_len, rope_delta;
+    double ram_gb;
 } Model;
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -923,6 +924,23 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 #else
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
 #endif
+
+/* Pure clamp for the RAM_GB planner: a whole-process budget minus what is
+ * already resident and what later allocations reserve, divided evenly over
+ * the per-layer expert caches. It may lower a requested cap, never raise it. */
+static int qwen36_cap_for_ram(double budget_gb, double resident_gb,
+                              double reserve_gb, double slot_gb, int layers,
+                              int requested, int n_experts,
+                              double *for_experts_out) {
+    double for_experts = budget_gb - resident_gb - reserve_gb;
+    if (for_experts_out) *for_experts_out = for_experts;
+    if (layers < 1) layers = 1;
+    if (!(slot_gb > 0.0)) return requested;
+    int fits = for_experts > 0.0
+             ? (int)(for_experts / (slot_gb * (double)layers)) : 0;
+    if (fits > n_experts) fits = n_experts;
+    return fits < requested ? fits : requested;
+}
 
 /* ---- M-PROF (R2): per-phase wall-clock accumulators, COLI_TIMERS=1 ---- */
 static int g_timers = -1;
@@ -1985,6 +2003,51 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     #undef QCOUNT
     if (quantize_dense)
         fprintf(stderr, "[dense-i8] %d matrices quantized during load, %.1f GB f32 freed\n", qcount, qfreed/1073741824.0);
+    if (load_boundaries && c->n_experts > 0) {
+        const char *ram = getenv("RAM_GB");
+        double ram_gb = ram ? atof(ram) : 0.0;
+        if (ram_gb > 0.0) {
+            double resident = rss_gb();
+            int max_t = qwen36_max_ctx();
+            int nkv = 0;
+            for (int i = 0; i < c->n_layers; i++) if (c->is_attn[i]) nkv++;
+            double kv_gb = 2.0 * (double)nkv * c->kv_heads * max_t *
+                           c->k_head_dim * sizeof(float) / 1e9;
+            double reserve = 1.5 + kv_gb;
+            double slot_gb = ((double)c->hidden * c->inter * 3.0 +
+                              (double)(2 * c->inter + c->hidden) * sizeof(float)) / 1e9;
+            double experts = 0.0;
+            int fit = qwen36_cap_for_ram(ram_gb, resident, reserve, slot_gb,
+                                         c->n_layers, cap, c->n_experts, &experts);
+            if (fit < cap) {
+                int shown = fit > 0 ? fit : 1;
+                fprintf(stderr, "[qwen36][RAM_GB=%.1f] resident %.1f GB + reserve %.1f GB "
+                        "(activations 1.5, KV %dx%d %.1f) -> %.1f GB for experts; "
+                        "cache %d->%d/layer (%.1f MB/slot, %d layers; projected peak %.1f GB)\n",
+                        ram_gb, resident, reserve, nkv, max_t, kv_gb,
+                        experts > 0.0 ? experts : 0.0, cap, shown, slot_gb * 1000.0,
+                        c->n_layers, resident + reserve + (double)shown * slot_gb * c->n_layers);
+                cap = fit;
+            }
+            if (cap < 1) {
+                double peak = resident + reserve + slot_gb * c->n_layers;
+                double avail = compat_mem_available_gb();
+                fprintf(stderr, "[qwen36] WARNING: cap=1 is the floor and the projected peak is %.1f GB, %.1f GB over RAM_GB.\n",
+                        peak, peak - ram_gb);
+                if (avail > 0.0 && peak > resident + avail &&
+                    !(getenv("COLI_RAM_OVERCOMMIT") && atoi(getenv("COLI_RAM_OVERCOMMIT")))) {
+                    fprintf(stderr, "[qwen36] refusing to start: that peak also exceeds the %.1f GB this machine actually has left. "
+                            "Lower Q36_MAXT, raise RAM_GB if the box really has it, or set COLI_RAM_OVERCOMMIT=1 to override.\n",
+                            resident + avail);
+                    exit(2);
+                }
+                cap = 1;
+            }
+            m->ram_gb = ram_gb;
+            fprintf(stderr, "[qwen36][warm-start] RAM_GB %.1f GB | RSS %.1f GB | loads 0.\n",
+                    ram_gb, resident);
+        }
+    }
     m->cache = calloc((size_t)c->n_layers, sizeof(LCache));
     for (int i = layer_begin; i < layer_end; i++) {
         m->cache[i].cap = cap;
@@ -4217,6 +4280,38 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
     uint8_t *planned = calloc((size_t)cap_total, 1);
     for (int i = 0; i < wn; i++) planned[wpl[i]*m->c.n_experts + wpe[i]] = 1;
     int keep8 = getenv("COLI_KEEP_INT8") != NULL;
+    if (m->ram_gb > 0.0) {
+        /* The VRAM plan goes first. Then fill only unused cache slots; every
+         * other expert stays in the container for ordinary LRU demand. */
+        int *loads = calloc((size_t)m->c.n_layers, sizeof(int));
+        long nloads = 0;
+        for (int pass = 0; pass < 2; pass++) for (int gi = 0; gi < cap_total; gi++) {
+            int l = gi / m->c.n_experts, eidw = gi % m->c.n_experts;
+            if ((pass == 0) != planned[gi] || loads[l] >= m->cache[l].cap) continue;
+            Slot *e; expert_get(m, l, eidw, &e); loads[l]++;
+            const uint8_t *wg = expert_is_int4 ? e->g4 : (const uint8_t *)e->g;
+            const uint8_t *wu = expert_is_int4 ? e->u4 : (const uint8_t *)e->u;
+            const uint8_t *wd = expert_is_int4 ? e->d4 : (const uint8_t *)e->d;
+            if (planned[gi]) {
+                qt_note_planned(l, eidw, wg, wu, wd, e->gs, e->us, e->ds);
+                if (!wg) continue;
+                if (!keep8 && e->g && wg != (const uint8_t *)e->g) {
+                    free(e->g); e->g = e->u = e->d = NULL;
+                }
+            }
+            if (++nloads % 64 == 0)
+                fprintf(stderr, "[qwen36][warm-start] RAM_GB %.1f GB | RSS %.1f GB | loads %ld.\n",
+                        m->ram_gb, rss_gb(), nloads);
+        }
+        fprintf(stderr, "[qwen36][warm-start] RAM_GB %.1f GB | RSS %.1f GB | loads %ld.\n",
+                m->ram_gb, rss_gb(), nloads);
+        free(loads);
+        qt_fill_wait();
+        free(wpl); free(wpe); free(planned);
+        fprintf(stderr, "[qtier] warmstart (RAM_GB): %ld experts in RAM, %d in VRAM -- %.1f s\n",
+                nloads, wn, now_s()-t0);
+        return;
+    }
     #pragma omp parallel for schedule(dynamic, 16)
     for (int gi = 0; gi < cap_total; gi++) {
         int l = gi / m->c.n_experts, eidw = gi % m->c.n_experts;
