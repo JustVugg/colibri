@@ -1067,25 +1067,26 @@ static int v4_ds_heads(ColiV4Engine *engine,
     int hc = config->hc_mult;
     size_t flat = (size_t)hc * hidden;
     float *hiddens = malloc((size_t)V4_DSPARK_BLOCK * hidden * sizeof(float));
-    float *logits = malloc((size_t)V4_DSPARK_BLOCK * vocab * sizeof(float));
-    if (!hiddens || !logits) {
-        free(logits); free(hiddens); return -1;
-    }
+    if (!hiddens) return -1;
     for (int item = 0; item < V4_DSPARK_BLOCK; item++)
         if (v4_ds_final_hidden(hiddens + (size_t)item * hidden,
                                state + (size_t)item * flat, config)) {
-            free(logits); free(hiddens); return -1;
+            free(hiddens); return -1;
         }
 
     int gpu_head = 0;
 #ifdef COLI_V4_GPU_TIER
     const char *device_head=getenv("V4_MTP_GPU_HEAD");
-    if (g_v4ds_gpu_engine && device_head && atoi(device_head)) {
+    if (engine->gpu.enabled && device_head && atoi(device_head)) {
         int rc=coli_v4_gpu_draft_head(engine,hiddens,V4_DSPARK_BLOCK,anchor_token,
             g_v4ds_core.markov_w1,g_v4ds_core.markov_w2,g_v4ds_core.confidence_proj.data,
             V4_DSPARK_RANK,draft,confidence);
-        free(logits);free(hiddens);return rc;
+        free(hiddens);return rc;
     }
+#endif
+    float *logits = malloc((size_t)V4_DSPARK_BLOCK * vocab * sizeof(float));
+    if (!logits) { free(hiddens); return -1; }
+#ifdef COLI_V4_GPU_TIER
     if (g_v4ds_gpu_engine && !coli_v4_gpu_head_batch(engine, hiddens,
             V4_DSPARK_BLOCK, logits, NULL, NULL)) gpu_head = 1;
 #endif
@@ -1098,8 +1099,9 @@ static int v4_ds_heads(ColiV4Engine *engine,
     if (!resident && !raw) {
         free(logits); free(hiddens); return -1;
     }
-    for (int start = 0; start < vocab; start += ROWS) {
-        int rows = vocab - start < ROWS ? vocab - start : ROWS;
+    int chunk = resident ? vocab : ROWS;
+    for (int start = 0; start < vocab; start += chunk) {
+        int rows = vocab - start < chunk ? vocab - start : chunk;
         const uint16_t *weights = resident
             ? resident + (size_t)start * hidden : raw;
         if (!resident) {
@@ -1110,7 +1112,7 @@ static int v4_ds_heads(ColiV4Engine *engine,
             }
             weights = raw;
         }
-        #pragma omp parallel for
+        #pragma omp parallel for schedule(static)
         for (int row = 0; row < rows; row++) {
             const uint16_t *weight = weights + (size_t)row * hidden;
             float sums[V4_DSPARK_BLOCK] = {0};
