@@ -62,6 +62,8 @@ There is not yet a calibrated optimized 6-to-0 GPU curve. The earlier sweep used
 
 These coefficients describe the previously measured isolated prototype, not the integrated 15.5838-tokens/s implementation or the subsequently merged CI-fix head. This revision uses existing records only; no new runtime experiment was performed.
 
+For the later **conditional optimized decode curve** (4/3/2/1/0 GPUs), see [the projection and memory constraints](dsv4-offload-projection-2026-10-02.md). Only its four-GPU anchor is measured; the historical results here are unchanged.
+
 ## Screening results
 
 All rows below are one-round screening measurements, not confidence intervals or stable multi-run guarantees. Fixture 0 is excluded from each round. The baseline contains the earlier CPU-tail optimization; it is not the original unoptimized engine.

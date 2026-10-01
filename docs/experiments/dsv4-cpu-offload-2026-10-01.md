@@ -34,6 +34,8 @@ The engine RSS column excludes a constant **155.425 GiB** read-only checkpoint m
 The 62.06 MiB physical-read total for the three-GPU target-first run was first sampled 3.034 seconds after the last output, during teardown; the last pre-output sample recorded only 12 KiB. See `output-times.json` and the raw monitor trace. Expert direct-read counters are zero. Small startup/metadata/library reads are reported rather than hidden.
 GPU memory includes the idle driver baseline of approximately 2 MiB per device, including the zero-GPU run.
 
+For the later **conditional optimized decode curve** (4/3/2/1/0 GPUs), see [the projection and memory constraints](dsv4-offload-projection-2026-10-02.md). Only its four-GPU anchor is measured; the historical results here are unchanged.
+
 ## Interpretation
 
 Moving even a few layers to CPU introduces serial CPU execution into every target step. MTP acceptance alone does not guarantee throughput gains: batched verification still executes the CPU tail. In the primary curve, all configurations below six GPUs move the drafter stages to CPU. The target-only column helps separate that policy change from the target offload curve.

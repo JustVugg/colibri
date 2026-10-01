@@ -1,0 +1,89 @@
+{
+  "scope": "Conditional C1 target-only short-context decode projection; CPU execution offload",
+  "source": "Existing hardware-roofline weight inventory and attention-detail-profile24; no new inference",
+  "equation": "T_ms = C4 * Wcpu/Wcpu4 + F + (R4-F) * Wgpu/Wgpu4; 0 <= F <= R4",
+  "cpu_ms_4": 28.146735857142847,
+  "residual_ms_4": 13.215792657142867,
+  "uninstrumented_four_GPU_decode_tps": [
+    24.1431982552,
+    24.2722
+  ],
+  "assumptions": [
+    "CPU elapsed cost scales with active weight bytes at unchanged optimized efficiency",
+    "Residual allocation ranges between fully fixed and proportional to remaining GPU weight bytes",
+    "Neither assumption is independently calibrated at other placements",
+    "Scenario spread is not a statistical confidence interval or guaranteed bound",
+    "NUMA ownership and cache behavior must be preserved or redesigned at each placement",
+    "Pure CPU needs a separate vocabulary-head calibration and cache path"
+  ],
+  "current_cache_slots": 2838,
+  "constraints": [
+    "Current full-tail preload slot budget is insufficient for three or fewer GPUs",
+    "One and zero GPUs exceed approximately 251 GiB RAM with the locked checkpoint plus full private CPU expert copies alone",
+    "Memory lower bounds exclude dense weights, extra packing, KV, scratch, allocator overhead and the OS",
+    "Advanced prototype optimizations are not all integrated into the PR implementation",
+    "Historical prefill-inclusive offload results are not revised or plotted as decode results"
+  ],
+  "rows": [
+    {
+      "gpus": 4,
+      "gpu_layers": 35,
+      "cpu_layers": 8,
+      "cpu_active_weight_GB": 1.895102144,
+      "gpu_active_weight_GB": 9.32219956,
+      "fixed_residual_scenario_decode_tps": 24.176471698402622,
+      "scaled_residual_scenario_decode_tps": 24.176471698402622,
+      "measured": true,
+      "minimum_full_preload_slots": 2608,
+      "locked_checkpoint_plus_CPU_experts_lower_bound_GiB": 180.925
+    },
+    {
+      "gpus": 3,
+      "gpu_layers": 26,
+      "cpu_layers": 17,
+      "cpu_active_weight_GB": 4.037719512,
+      "gpu_active_weight_GB": 7.179582192,
+      "fixed_residual_scenario_decode_tps": 13.663918330693138,
+      "scaled_residual_scenario_decode_tps": 14.255588750459971,
+      "measured": false,
+      "minimum_full_preload_slots": 4768,
+      "locked_checkpoint_plus_CPU_experts_lower_bound_GiB": 209.6125
+    },
+    {
+      "gpus": 2,
+      "gpu_layers": 17,
+      "cpu_layers": 26,
+      "cpu_active_weight_GB": 6.159081968,
+      "gpu_active_weight_GB": 5.058219736,
+      "fixed_residual_scenario_decode_tps": 9.55176579633658,
+      "scaled_residual_scenario_decode_tps": 10.137076335258813,
+      "measured": false,
+      "minimum_full_preload_slots": 6928,
+      "locked_checkpoint_plus_CPU_experts_lower_bound_GiB": 238.3
+    },
+    {
+      "gpus": 1,
+      "gpu_layers": 8,
+      "cpu_layers": 35,
+      "cpu_active_weight_GB": 8.301699336,
+      "gpu_active_weight_GB": 2.915602368,
+      "fixed_residual_scenario_decode_tps": 7.325169905320448,
+      "scaled_residual_scenario_decode_tps": 7.847250380921852,
+      "measured": false,
+      "minimum_full_preload_slots": 9088,
+      "locked_checkpoint_plus_CPU_experts_lower_bound_GiB": 266.9875
+    },
+    {
+      "gpus": 0,
+      "gpu_layers": 0,
+      "cpu_layers": 43,
+      "cpu_active_weight_GB": 11.217301704,
+      "gpu_active_weight_GB": 0.0,
+      "fixed_residual_scenario_decode_tps": 5.561142169717544,
+      "scaled_residual_scenario_decode_tps": 6.002279081715846,
+      "measured": false,
+      "minimum_full_preload_slots": 11008,
+      "locked_checkpoint_plus_CPU_experts_lower_bound_GiB": 292.4875
+    }
+  ]
+}
