@@ -1,0 +1,160 @@
+{
+  "base_commit": "094030b87436a1c6b92f7edb17e75f429d823c99",
+  "samples": 48,
+  "exact_to_target_samples": 48,
+  "metric": "1536 generated tokens / full six-session wall time; prefill included, model load excluded",
+  "modes": {
+    "t": {
+      "runs": [
+        {
+          "round": 1,
+          "tokens": 1536,
+          "wall_s": 116.918695323,
+          "tok_s": 13.13733441650748,
+          "decode_tok_s": 13.943849987365548,
+          "drafted": 0,
+          "accepted": 0
+        },
+        {
+          "round": 2,
+          "tokens": 1536,
+          "wall_s": 116.396743116,
+          "tok_s": 13.196245520969908,
+          "decode_tok_s": 13.994471976743696,
+          "drafted": 0,
+          "accepted": 0
+        },
+        {
+          "round": 3,
+          "tokens": 1536,
+          "wall_s": 116.590500257,
+          "tok_s": 13.174315202475338,
+          "decode_tok_s": 13.975964325839957,
+          "drafted": 0,
+          "accepted": 0
+        }
+      ],
+      "median_tok_s": 13.174315202475338
+    },
+    "d": {
+      "runs": [
+        {
+          "round": 1,
+          "tokens": 1536,
+          "wall_s": 95.905317062,
+          "tok_s": 16.015796069023168,
+          "decode_tok_s": 17.255881631820436,
+          "drafted": 1734,
+          "accepted": 1169
+        },
+        {
+          "round": 2,
+          "tokens": 1536,
+          "wall_s": 95.428952174,
+          "tok_s": 16.09574416367205,
+          "decode_tok_s": 17.337176881893356,
+          "drafted": 1734,
+          "accepted": 1169
+        },
+        {
+          "round": 3,
+          "tokens": 1536,
+          "wall_s": 93.647223725,
+          "tok_s": 16.401981168289034,
+          "decode_tok_s": 17.68715375833069,
+          "drafted": 1734,
+          "accepted": 1169
+        }
+      ],
+      "median_tok_s": 16.09574416367205
+    }
+  },
+  "baseline_target_tok_s": 12.307021535036041,
+  "previous_candidate_tok_s": 13.602988949939736,
+  "naruto_historical_tok_s": 77.9746887088,
+  "gain_over_baseline": 0.3078504915141449,
+  "gain_over_previous_candidate": 0.18325055051547023,
+  "exact_to_previous_candidate_samples": 48,
+  "stage_timings": [
+    {
+      "round": 0,
+      "mode": "d",
+      "block": 76.236807697,
+      "head": 0.35810324499999996,
+      "draft": 22.41500000000005,
+      "draft_stages": 17.116000000000003,
+      "draft_head": 4.461999999999987,
+      "draft_calls": 348
+    },
+    {
+      "round": 0,
+      "mode": "t",
+      "block": 118.134263703,
+      "head": 1.389013223,
+      "draft": 0.0,
+      "draft_stages": 0.0,
+      "draft_head": 0.0,
+      "draft_calls": 0
+    },
+    {
+      "round": 1,
+      "mode": "d",
+      "block": 76.507071536,
+      "head": 0.35632758699999995,
+      "draft": 16.016999999999996,
+      "draft_stages": 11.171999999999992,
+      "draft_head": 4.467999999999985,
+      "draft_calls": 348
+    },
+    {
+      "round": 1,
+      "mode": "t",
+      "block": 114.984562729,
+      "head": 1.341285648,
+      "draft": 0.0,
+      "draft_stages": 0.0,
+      "draft_head": 0.0,
+      "draft_calls": 0
+    },
+    {
+      "round": 2,
+      "mode": "d",
+      "block": 76.090585581,
+      "head": 0.35602169899999997,
+      "draft": 15.950999999999981,
+      "draft_stages": 11.182999999999991,
+      "draft_head": 4.381999999999986,
+      "draft_calls": 348
+    },
+    {
+      "round": 2,
+      "mode": "t",
+      "block": 114.49550836699999,
+      "head": 1.3313880139999998,
+      "draft": 0.0,
+      "draft_stages": 0.0,
+      "draft_head": 0.0,
+      "draft_calls": 0
+    },
+    {
+      "round": 3,
+      "mode": "d",
+      "block": 74.854973913,
+      "head": 0.35700789199999994,
+      "draft": 15.700999999999995,
+      "draft_stages": 10.975000000000012,
+      "draft_head": 4.329999999999985,
+      "draft_calls": 348
+    },
+    {
+      "round": 3,
+      "mode": "t",
+      "block": 114.67696423999999,
+      "head": 1.330824278,
+      "draft": 0.0,
+      "draft_stages": 0.0,
+      "draft_head": 0.0,
+      "draft_calls": 0
+    }
+  ]
+}

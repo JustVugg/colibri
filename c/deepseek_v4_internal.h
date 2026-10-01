@@ -398,6 +398,17 @@ int coli_v4_attention_window_batch_ref(
 
 typedef struct ColiV4AttentionSnapshot ColiV4AttentionSnapshot;
 
+/* A speculative batch records projected state updates. After restoring its
+ * base snapshot, retain only the accepted rows without rerunning the model. */
+int coli_v4_unified_decode_wanted(void);
+int coli_v4_attention_trial_begin(ColiDeepSeekV4WindowAttentionState *state,
+                                  int start, int batch);
+int coli_v4_attention_trial_ready(const ColiDeepSeekV4WindowAttentionState *state);
+int coli_v4_attention_trial_retain(ColiDeepSeekV4WindowAttentionState *state,
+    const ColiDeepSeekV4LayerWeights *weights, const ColiDeepSeekV4Config *config,
+    int retained, char *error, size_t error_size);
+void coli_v4_attention_trial_discard(ColiDeepSeekV4WindowAttentionState *state);
+
 int coli_v4_attention_snapshot_create(
     const ColiDeepSeekV4WindowAttentionState *state,
     ColiV4AttentionSnapshot **output);
@@ -817,12 +828,26 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                                 ColiExpertStore *store,
                                 const float *inputs, const int *tokens,
                                 int batch);
+void coli_v4_gpu_head_upload(ColiV4Engine *engine);
+int coli_v4_gpu_head_scores(ColiV4Engine *engine,const float *input,float *scores);
+int coli_v4_gpu_head_batch(ColiV4Engine *engine,const float *input,int batch,
+                           float *scores,int *ids,float *values);
+int coli_v4_gpu_draft_head(ColiV4Engine *engine,const float *input,int batch,int anchor,
+    const uint16_t *markov1,const uint16_t *markov2,const float *confidence_weights,
+    int rank,int *ids,float *confidence);
+int coli_v4_gpu_wo_decode(const ColiTensorView *a, const ColiTensorView *b,
+                           float *output, const float *input, int groups);
 int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
                                const float *input, int groups);
 /* Batched GPU attention offloads for prefill (COLI_CUDA_ATTN_BATCH=1).
  * Every entry returns non-zero on any refusal so the caller can fall back to
  * the CPU reference for the whole chunk. */
 int coli_v4_gpu_attn_batch_wanted(void);
+int coli_v4_gpu_indexer_prepare(const ColiDeepSeekV4LayerWeights *weights,
+    const float *input, float *queries, float *head_weights, int dimension);
+int coli_v4_gpu_compressor_project(
+    const ColiDeepSeekV4LayerWeights *weights, const char *prefix,
+    float *kv, float *gate, const float *input);
 /* Runs both bf16 projection matrices (wkv_key/wgate_key mirrors) over the
  * whole chunk: kv_proj/gate_proj receive [batch][rows-of-mirror]. */
 int coli_v4_gpu_compressor_project_batch(
@@ -867,6 +892,19 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view);
 /* lookup-only twin: reports residency, never uploads (hybrid q* split) */
 int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view);
+int coli_v4_gpu_resident_route(float *output,
+    const ColiDeepSeekV4LayerWeights *weights, const ColiDeepSeekV4Config *config,
+    ColiExpertStore *store, const float *input, int token);
+/* Preload: 0 ready, 1 insufficient budget/unsupported tier, -1 load failure. */
+int coli_v4_gpu_experts_init(ColiV4Engine *engine, char *error, size_t error_size);
+int coli_v4_gpu_experts_preload(ColiV4Engine *engine, char *error, size_t size);
+int coli_v4_gpu_experts_resident(ColiExpertStore *store, int layer);
+/* 1: completed; 0: use normal loader; -1: immutable resident table failed.
+ * Does not acquire host leases or upload weights. */
+int coli_v4_gpu_moe_resident(ColiExpertStore *store, int layer,
+    const int *ids, const float *weights, int count,
+    void *shared_gate, void *shared_up, void *shared_down,
+    float limit, float *output, const float *input);
 /* DSV4_HYBRID=1 gate plus its cross-unit counters/EMAs: defined in the block
  * unit, read by the serve unit's per-turn stderr line. */
 int coli_v4_hybrid_enabled(void);
@@ -883,6 +921,18 @@ extern unsigned long long g_v4_hyb_upload_n, g_v4_hyb_skip_n;
  * block_rows==1 fp4 expert view into it (returns non-zero to stay on CPU). */
 int coli_v4_gpu_dspark_mirrors_ensure(ColiV4Engine *engine);
 int coli_v4_gpu_dspark_expert_attach(void *cache, ColiExpertView *view);
+int coli_v4_gpu_dspark_expert_group(void *mirrors, int stage, const int *ids,
+    const float *weights, int count, float limit, float *output, const float *input);
+int coli_v4_gpu_dspark_attention(ColiV4Engine *engine,float *out,const float *q,
+    const float *past,const int64_t *positions,const float *block,const float *sinks,
+    int64_t position,int past_rows,int block_rows,int heads,int dim);
+int coli_v4_gpu_dspark_dense_attach(ColiV4Engine *engine, ColiTensorView *view);
+int coli_v4_gpu_device_target(ColiV4Engine *engine, const void *owner, float *output,
+    float *taps, const float *input, const int *tokens, int start, int batch,
+    ColiV4SessionAbortFn abort_fn, void *abort_context, char *error, size_t error_size);
+int coli_v4_gpu_device_target_retain(ColiV4Engine *engine, const void *owner, int position);
+int coli_v4_gpu_dspark_resident_device(void *mirrors,int stage);
+void *coli_v4_gpu_dspark_resident_set(void *mirrors,int stage,void *gate,void *up,void *down);
 #endif
 
 struct ColiV4Engine {
@@ -910,12 +960,20 @@ struct ColiV4Engine {
     struct {
         int enabled;
         int device;
+        int devices[16];
+        int device_count;
         unsigned char layer_ready[COLI_V4_RESIDENT_MAX_LAYERS];
         long long uploaded_bytes;
         /* Optional opaque V4GpuExpertMirrorCache* for the dspark/MTP draft
          * experts (separate bounded LRU; see dspark_mirrors_ensure). NULL
          * unless V4_MTP_GPU=1 and the tier opened successfully. */
         void *dspark_mirrors;
+        void *dspark_dense; /* owned immutable draft FP8 mirrors */
+        void *device_target; /* owned prepared multirow target and histories */
+        void *draft_head;
+        void *device_draft;
+        void (*device_draft_free)(ColiV4Engine *engine);
+        void *head; /* owned packed BF16 vocabulary mirror */
     } gpu;
     struct {
         uint16_t *markov_w1;

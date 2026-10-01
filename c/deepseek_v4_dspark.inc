@@ -208,6 +208,10 @@ static int v4_ds_load_f32_suffix(ColiFloatTensor *output,
     return 0;
 }
 
+#ifdef COLI_V4_GPU_TIER
+static ColiV4Engine *g_v4ds_gpu_engine;
+#endif
+
 static void v4_ds_fp8_view(ColiTensorView *view,
                            const uint8_t *weight, const float *scale,
                            int64_t rows, int64_t columns) {
@@ -227,6 +231,10 @@ static void v4_ds_fp8_view(ColiTensorView *view,
     view->block_rows = 128;
 #endif
     view->block_columns = 128;
+#ifdef COLI_V4_GPU_TIER
+    if (g_v4ds_gpu_engine)
+        coli_v4_gpu_dspark_dense_attach(g_v4ds_gpu_engine, view);
+#endif
 }
 
 /* Official FP8 linears quantize activations to E4M3/UE8M0 first.  Reusing the
@@ -745,8 +753,18 @@ static int v4_ds_attention(float *out, V4DSparkStage *stage,
         v4_ds_bf16(row + head_dim - rope_dim, (size_t)rope_dim);
     }
 
+    int gpu_attention = 0;
+#ifdef COLI_V4_GPU_TIER
+    const char *gpu_attn = getenv("V4_MTP_GPU_ATTN");
+    if (g_v4ds_gpu_engine && (!gpu_attn || atoi(gpu_attn)))
+        gpu_attention = coli_v4_gpu_dspark_attention(g_v4ds_gpu_engine,
+            attended, query, stage->kv, stage->kv_abs, block_kv,
+            stage->attn_sink.data, query_position, V4_DSPARK_WIN, block_count,
+            heads, head_dim);
+#endif
+    if (!gpu_attention) memset(attended, 0, (size_t)heads * head_dim * sizeof(float));
     float softmax_scale = 1.0f / sqrtf((float)head_dim);
-    for (int head = 0; head < heads; head++) {
+    for (int head = 0; !gpu_attention && head < heads; head++) {
         const float *q = query + (size_t)head * head_dim;
         const float *keys[V4_DSPARK_WIN + V4_DSPARK_BLOCK];
         float scores[V4_DSPARK_WIN + V4_DSPARK_BLOCK];
@@ -784,6 +802,9 @@ static int v4_ds_attention(float *out, V4DSparkStage *stage,
                 result[d] += probability * keys[item][d];
         }
         v4_ds_bf16(result, (size_t)head_dim);
+    }
+    for (int head = 0; head < heads; head++) {
+        float *result = attended + (size_t)head * head_dim;
         coli_v4_rope_apply(result + head_dim - rope_dim, 1, rope_dim,
                            cosines + (size_t)query_position * pairs,
                            sines + (size_t)query_position * pairs, 1);
@@ -846,6 +867,28 @@ static int v4_ds_moe(float *out, V4DSparkStage *stage,
 
     float *branch = malloc((size_t)hidden * sizeof(float));
     if (!branch) return -1;
+#ifdef COLI_V4_GPU_TIER
+    if (gpu_mirrors && g_v4ds_gpu_engine && stage->cap_slots >= topk) {
+        int ready = coli_v4_gpu_dspark_expert_group(gpu_mirrors, stage->stage,
+            experts, weights, topk, config->swiglu_limit, branch, input);
+        if (!ready) {
+            for (int rank = 0; rank < topk; rank++) {
+                ColiExpertView expert;
+                if (!v4_ds_expert(index, stage, experts[rank], &expert, miss_budget, gpu_mirrors)) {
+                    free(branch); return 1;
+                }
+            }
+            ready = coli_v4_gpu_dspark_expert_group(gpu_mirrors, stage->stage,
+                experts, weights, topk, config->swiglu_limit, branch, input);
+        }
+        if (ready) {
+            for (int i = 0; i < hidden; i++) out[i] += branch[i];
+            v4_ds_bf16(out, (size_t)hidden);
+            free(branch);
+            return 0;
+        }
+    }
+#endif
     for (int rank = 0; rank < topk; rank++) {
         ColiExpertView expert;
         if (!v4_ds_expert(index, stage, experts[rank], &expert, miss_budget,
@@ -869,12 +912,18 @@ static int v4_ds_moe(float *out, V4DSparkStage *stage,
 /* One complete MTP transformer stage over all five positions.  Attention is
  * split into prepare/all-KV then query phases so every position can see the
  * entire block, exactly as the parallel reference does. */
+#include "deepseek_v4_device_draft.inc"
 static int v4_ds_stage_forward(float *state, V4DSparkStage *stage,
                                int64_t first_position,
                                const ColiSafetensorsIndex *index,
                                const ColiDeepSeekV4Config *config,
                                const float *cosines, const float *sines,
                                int *miss_budget, void *gpu_mirrors) {
+#if defined(COLI_V4_GPU_TIER) && !defined(_WIN32)
+    const char *device=getenv("V4_MTP_DEVICE");
+    if(device && atoi(device) && g_v4ds_gpu_engine && gpu_mirrors)
+        return v4_ds_device_stage(g_v4ds_gpu_engine,state,stage,first_position,index,config,gpu_mirrors);
+#endif
     int hidden = config->hidden_size;
     int hc = config->hc_mult;
     int head_dim = config->head_dim;
@@ -1028,6 +1077,19 @@ static int v4_ds_heads(ColiV4Engine *engine,
             free(logits); free(hiddens); return -1;
         }
 
+    int gpu_head = 0;
+#ifdef COLI_V4_GPU_TIER
+    const char *device_head=getenv("V4_MTP_GPU_HEAD");
+    if (g_v4ds_gpu_engine && device_head && atoi(device_head)) {
+        int rc=coli_v4_gpu_draft_head(engine,hiddens,V4_DSPARK_BLOCK,anchor_token,
+            g_v4ds_core.markov_w1,g_v4ds_core.markov_w2,g_v4ds_core.confidence_proj.data,
+            V4_DSPARK_RANK,draft,confidence);
+        free(logits);free(hiddens);return rc;
+    }
+    if (g_v4ds_gpu_engine && !coli_v4_gpu_head_batch(engine, hiddens,
+            V4_DSPARK_BLOCK, logits, NULL, NULL)) gpu_head = 1;
+#endif
+    if (!gpu_head) {
     const uint16_t *resident = coli_v4_head_cache_data(
         engine, head_shard, head_offset, (size_t)head->nbytes);
     enum { ROWS = 64 };
@@ -1062,6 +1124,7 @@ static int v4_ds_heads(ColiV4Engine *engine,
         }
     }
     free(raw);
+    }
 
     int previous = anchor_token;
     for (int item = 0; item < V4_DSPARK_BLOCK; item++) {
@@ -1113,7 +1176,7 @@ static int v4_ds_heads(ColiV4Engine *engine,
     return 0;
 }
 
-static int v4_dspark_draft(ColiV4Engine *engine,
+static int v4_dspark_draft_impl(ColiV4Engine *engine,
                            const ColiSafetensorsIndex *index,
                            const ColiDeepSeekV4Config *config,
                            int anchor_token, int64_t first_position,
@@ -1236,6 +1299,23 @@ static int v4_dspark_draft(ColiV4Engine *engine,
                     stage_seconds[2],
                 headed - began);
     }
+    return count;
+}
+
+static int v4_dspark_draft(ColiV4Engine *engine,
+                           const ColiSafetensorsIndex *index,
+                           const ColiDeepSeekV4Config *config,
+                           int anchor_token, int64_t first_position,
+                           int *draft, int max_out) {
+#ifdef COLI_V4_GPU_TIER
+    const char *enabled = getenv("V4_MTP_GPU_DENSE");
+    g_v4ds_gpu_engine = enabled && atoi(enabled) && engine->gpu.enabled ? engine : NULL;
+#endif
+    int count = v4_dspark_draft_impl(engine, index, config, anchor_token,
+                                    first_position, draft, max_out);
+#ifdef COLI_V4_GPU_TIER
+    g_v4ds_gpu_engine = NULL;
+#endif
     return count;
 }
 

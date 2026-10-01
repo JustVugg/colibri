@@ -8,7 +8,38 @@ typedef struct Dsv4CudaTensor Dsv4CudaTensor;
 typedef struct Dsv4CudaActivation Dsv4CudaActivation;
 typedef struct Dsv4CudaKvCache Dsv4CudaKvCache;
 typedef struct Dsv4CudaExpertSet Dsv4CudaExpertSet;
+typedef struct Dsv4CudaTargetWorkspace Dsv4CudaTargetWorkspace;
+typedef struct Dsv4CudaTargetLayer Dsv4CudaTargetLayer;
+typedef struct {
+    Dsv4CudaTensor *hc_fn[2], *hc_scale[2], *hc_base[2], *norm[2];
+    Dsv4CudaTensor *qa, *qb, *kv, *wa, *wb, *qnorm, *kvnorm, *sink;
+    Dsv4CudaTensor *comp_kv, *comp_gate, *comp_norm, *ape, *gate, *bias;
+    Dsv4CudaExpertSet *experts;
+    int hidden, rank, heads, dim, rope, groups, window, ratio, capacity, draft;
+    float eps, routed_scale, swiglu_limit;
+} Dsv4CudaTargetWeights;
 typedef struct Dsv4CudaGraph Dsv4CudaGraph;
+/* Prepared device target. Weights are borrowed; workspace and history are owned.
+ * Every operation is stream ordered. No host activation transfer inside a layer. */
+Dsv4CudaTargetWorkspace *dsv4_cuda_target_workspace_create(int device, int max_rows);
+void dsv4_cuda_target_workspace_free(Dsv4CudaTargetWorkspace *workspace);
+int dsv4_cuda_target_input(Dsv4CudaTargetWorkspace *workspace, const float *input,
+                          const int *tokens, int start, int rows);
+int dsv4_cuda_target_transfer(Dsv4CudaTargetWorkspace *dst, Dsv4CudaTargetWorkspace *src, int rows);
+int dsv4_cuda_target_output(Dsv4CudaTargetWorkspace *workspace, float *output, int rows);
+Dsv4CudaTargetLayer *dsv4_cuda_target_layer_create(const Dsv4CudaTargetWeights *weights,
+                                                const float *cosines, const float *sines);
+void dsv4_cuda_target_layer_free(Dsv4CudaTargetLayer *layer);
+int dsv4_cuda_target_past(Dsv4CudaTargetLayer *layer,const float *past,const int64_t *positions);
+int dsv4_cuda_target_layer_forward(Dsv4CudaTargetLayer *layer, Dsv4CudaTargetWorkspace *workspace, int rows);
+int dsv4_cuda_target_stage(Dsv4CudaTargetWorkspace *workspace, Dsv4CudaTargetLayer *const *layers,
+    int count, int first_tap, int rows, int graph);
+int dsv4_cuda_target_taps(Dsv4CudaTargetWorkspace *workspace, float *output, int rows, int first, int count);
+typedef struct Dsv4CudaDraftHead Dsv4CudaDraftHead;
+Dsv4CudaDraftHead *dsv4_cuda_draft_head_create(Dsv4CudaTensor *head,
+    const uint16_t *markov1,const uint16_t *markov2,const float *confidence,int rank);
+void dsv4_cuda_draft_head_free(Dsv4CudaDraftHead *head);
+int dsv4_cuda_draft_head(Dsv4CudaDraftHead *head,const float *hidden,int rows,int anchor,int *ids,float *confidence);
 typedef struct {
     Dsv4CudaTensor *attn_norm,*q_a,*qkv,*q_norm,*q_b,*wkv,*kv_norm,*sink,*wo_a,*wo_b;
     Dsv4CudaTensor *compress_wkv,*compress_wgate,*compress_ape,*compress_norm;
@@ -60,6 +91,18 @@ int dsv4_cuda_indexer_score_batch(int device,const float *queries,const float *k
 int dsv4_cuda_fp8_ref_matmul(int device,const uint8_t *w,const float *bscale,
                              int rows,int cols,int packed_rows8,const float *x,
                              int tokens,float *y);
+int dsv4_cuda_upload_fp8_ref(Dsv4CudaTensor **tensor,const uint8_t *w,
+                            const float *scales,int rows,int cols,int packed_rows8,int device);
+int dsv4_cuda_fp8_ref_matmul_resident(Dsv4CudaTensor *tensor,const float *x,
+                                     int tokens,float *y);
+/* Resident BF16 compressor pair; decode preserves sequential fused sums. */
+int dsv4_cuda_upload_compressor(Dsv4CudaTensor **tensor,const uint16_t *w,
+                                int rows,int cols,int device);
+int dsv4_cuda_compressor_project(Dsv4CudaTensor *kv,Dsv4CudaTensor *gate,
+                                 const float *x,float *values,float *scores);
+/* In-place post-RoPE Hadamard/FP4 queries plus resident BF16 head weights. */
+int dsv4_cuda_indexer_prepare(Dsv4CudaTensor *weights,const float *input,
+                              float *queries,float *head_weights,int dimension);
 /* Build/GPU compatibility (loader DLL selection). */
 int dsv4_cuda_backend_arch_ok(int device);
 const char *dsv4_cuda_backend_name(void);
@@ -76,11 +119,22 @@ int dsv4_cuda_kv_ring_append(int device,int layer,const float *rows,int start_po
                              int count,int window,int dim);
 int dsv4_cuda_kv_comp_append(int device,int layer,const float *rows,int start_idx,
                              int count,int dim);
+/* Packed BF16 vocabulary head, sequential separately rounded mul/add logits. */
+int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **t,const uint16_t *w,int rows,int cols,int device);
+int dsv4_cuda_head_scores_exact(Dsv4CudaTensor *t,const float *input,float *scores);
+/* Batch-major inputs/scores, 1..128 rows. Greedy returns only batch candidates;
+ * ties (including signed zero) retain the first vocabulary index. */
+int dsv4_cuda_head_scores_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,float *scores);
+int dsv4_cuda_head_argmax_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,int *ids,float *values);
 int dsv4_cuda_head_argmax(Dsv4CudaTensor *t,const float *x,int *id,float *value);
 int dsv4_cuda_final_argmax(const Dsv4CudaActivation *residual,Dsv4CudaTensor *fn,Dsv4CudaTensor *scale,
                            Dsv4CudaTensor *base,Dsv4CudaTensor *norm,Dsv4CudaTensor *head,
                            int M,int H,float eps,float pre_eps,int *id,float *value);
 int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float *x,int groups);
+/* Decode wo_a -> BF16 -> wo_b -> BF16, preserving raw-input matvec arithmetic.
+ * Unlike dsv4_cuda_wo, this does not FP8-quantize the intermediate activation. */
+int dsv4_cuda_wo_decode(Dsv4CudaTensor *wa,Dsv4CudaTensor *wb,int groups,
+                        float *out,const float *context);
 int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,
                            Dsv4CudaTensor *const *down,const float *weights,int count,
                            float limit,float *y,const float *x);
@@ -213,6 +267,15 @@ int dsv4_cuda_expert_bank_upload_tp2(Dsv4CudaExpertSet *set,int expert,int rank,
                                      const uint8_t *down_weight,const uint8_t *down_scale);
 void dsv4_cuda_expert_set_free(Dsv4CudaExpertSet *set);
 int dsv4_cuda_expert_set_upload_hash(Dsv4CudaExpertSet *set,const int64_t *map,int vocab,int topk);
+int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *experts,
+    Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,const int *fixed,
+    float routed_scale,float limit,float *output,const float *input);
+int dsv4_cuda_dspark_attention(int device,float *out,const float *q,
+    const float *past,const int64_t *positions,const float *block,const float *sinks,
+    int64_t position,int past_rows,int block_rows,int heads,int dim);
+int dsv4_cuda_resident_route_moe_batch(Dsv4CudaExpertSet *experts,
+    Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,const int *fixed,
+    float routed_scale,float limit,float *output,const float *input,int tokens);
 int dsv4_cuda_route_moe(const Dsv4CudaActivation *input,Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,
                         int token,float routed_scale,Dsv4CudaExpertSet *experts,
                         float limit,Dsv4CudaActivation *output);

@@ -59,7 +59,7 @@ class DeepSeekV4DSparkSourceTest(unittest.TestCase):
 
     def test_rejected_suffix_invalidates_hidden_taps(self):
         restore = self.engine.index("if (spec_attention_restore(")
-        invalidate = self.engine.index("v4_ds_invalidate_from(old_last + 1)")
+        invalidate = self.engine.index("v4_ds_invalidate_from(old_last + 1 + (retain_trial ? retained : 0))")
         replay = self.engine.index("if (retained > 0 && target_batch(", invalidate)
         self.assertLess(restore, invalidate)
         self.assertLess(invalidate, replay)

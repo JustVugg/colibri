@@ -1,0 +1,123 @@
+{
+  "results-full1.json": [
+    {
+      "case": "full1",
+      "exit_code": 0,
+      "wall_seconds": 94.09511476568878,
+      "peak_MiB": [
+        24424,
+        24438,
+        24448,
+        24438,
+        24452,
+        27860
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        0.947,
+        10.279
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_gpu resident-budget device=0 experts=1792 bytes=23957864448 free-MiB=30590 reserve-MiB=2800",
+        "v4_gpu resident-budget device=1 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=2 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=3 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=4 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=5 experts=2048 bytes=27380416512 free-MiB=30420 reserve-MiB=2800",
+        "v4_gpu resident-experts=ready layers=43 experts-per-layer=256 preload-seconds=75.771",
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11008 hits=0 misses=11008 hit_rate=0.000 bytes=147169738752 target_only=1",
+        "v4_direct reads=11008 flock_reads=0 fallbacks=0 payload_bytes=138512695296"
+      ],
+      "decode_tps": 6.1290008755715535
+    }
+  ],
+  "results-full2.json": [
+    {
+      "case": "full2",
+      "exit_code": 0,
+      "wall_seconds": 91.09387484379113,
+      "peak_MiB": [
+        24422,
+        24440,
+        24448,
+        24438,
+        24448,
+        27860
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        0.927,
+        10.227
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_gpu resident-budget device=0 experts=1792 bytes=23957864448 free-MiB=30590 reserve-MiB=2800",
+        "v4_gpu resident-budget device=1 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=2 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=3 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=4 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=5 experts=2048 bytes=27380416512 free-MiB=30420 reserve-MiB=2800",
+        "v4_gpu resident-experts=ready layers=43 experts-per-layer=256 preload-seconds=73.442",
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11008 hits=0 misses=11008 hit_rate=0.000 bytes=147169738752 target_only=1",
+        "v4_direct reads=11008 flock_reads=0 fallbacks=0 payload_bytes=138512695296"
+      ],
+      "decode_tps": 6.160164271047227
+    },
+    {
+      "case": "off1",
+      "exit_code": 0,
+      "wall_seconds": 46.16453139577061,
+      "peak_MiB": [
+        12268,
+        7988,
+        7874,
+        7122,
+        6764,
+        7090
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        12.276,
+        29.319
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11299 hits=7105 misses=4194 hit_rate=62.882 bytes=56071028736 target_only=1",
+        "v4_direct reads=4194 flock_reads=0 fallbacks=0 payload_bytes=52772732928"
+      ],
+      "decode_tps": 2.148777243425765
+    },
+    {
+      "case": "full3",
+      "exit_code": 0,
+      "wall_seconds": 89.695791374892,
+      "peak_MiB": [
+        24422,
+        24440,
+        24448,
+        24438,
+        24448,
+        27860
+      ],
+      "answer": "天空是蓝色的，主要是因为**太阳光中的蓝光被空气分子和微小颗粒散射得最厉害**。\n\n具体来说：\n\n1. 太阳光包含所有颜色，其中蓝紫光波长最短。\n2. 当阳光穿过大气层时，波长越短的光越容易被空气分子散射（这叫“",
+      "timing": [
+        0.934,
+        10.235
+      ],
+      "generated": 64,
+      "diagnostics": [
+        "v4_gpu resident-budget device=0 experts=1792 bytes=23957864448 free-MiB=30590 reserve-MiB=2800",
+        "v4_gpu resident-budget device=1 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=2 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=3 experts=1792 bytes=23957864448 free-MiB=30574 reserve-MiB=2800",
+        "v4_gpu resident-budget device=4 experts=1792 bytes=23957864448 free-MiB=30562 reserve-MiB=2800",
+        "v4_gpu resident-budget device=5 experts=2048 bytes=27380416512 free-MiB=30420 reserve-MiB=2800",
+        "v4_gpu resident-experts=ready layers=43 experts-per-layer=256 preload-seconds=73.115",
+        "v4_tokens prompt=13 generated=64 total=77 expert_requests=11008 hits=0 misses=11008 hit_rate=0.000 bytes=147169738752 target_only=1",
+        "v4_direct reads=11008 flock_reads=0 fallbacks=0 payload_bytes=138512695296"
+      ],
+      "decode_tps": 6.155349291646312
+    }
+  ]
+}
