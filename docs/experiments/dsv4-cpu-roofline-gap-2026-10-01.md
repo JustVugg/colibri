@@ -28,6 +28,40 @@ Total: 18.6617 ms/token -> 53.5858 tokens/s
 
 The CPU denominator uses four populated 64 GB DIMMs configured at 4400 MT/s. GPU layers execute serially for one request, so the calculation does not multiply a card's bandwidth by four. This simplified model omits quantization/dequantization, arithmetic, activation/KV traffic, scheduling, synchronization, and bandwidth loss from access patterns and NUMA placement. It is not a universal maximum: cache reuse or a different execution algorithm would change its assumptions.
 
+## Revised offload timing model (2026-10-02)
+
+Keep the ideal streaming roof separate from the calibrated execution model. For concurrency-one target-only decode, use actual layer placement rather than GPU count alone:
+
+```text
+T_decode(P, context, configuration)
+    = sum(CPU-layer elapsed times)
+    + sum(GPU-layer elapsed times)
+    + remaining non-overlapping execution time
+R_decode = 1000 / T_decode_ms
+```
+
+Here `P` identifies which layers execute on CPU and on each GPU. A per-layer elapsed time already contains that layer's computation, weight/KV access, quantization and internal waits; do not add those costs again. Charge transfers, scheduling and output-head time only where they are not already included in an enclosing timer. This is a serial single-request accounting model, not a formula for concurrent serving or MTP. Counts of GPUs do not multiply single-request bandwidth across sequential layers.
+
+The fine diagnostic supplies the following non-overlapping calibration for the selected isolated four-GPU prototype, 24 physical CPU cores, ACTIVE waiting and the fixed short-context fixtures:
+
+| Component | ms per decode token |
+| --- | ---: |
+| CPU attention, eight layers | 15.897127 |
+| CPU MoE, eight layers | 11.042019 |
+| CPU hyperconnection phases, eight layers | 1.207590 |
+| GPU and all remaining execution time | 13.215793 |
+| Total | 41.362529 |
+
+Thus `1000 / (28.146736 + 13.215793) = 24.1765 tokens/s`, consistent with the separate uninstrumented 24.1432 and 24.2722 screens. This is a one-point calibration, not independent predictive validation. In particular, **13.215793 ms is a residual, not a directly measured GPU-only duration**, and must not be converted into a GPU bandwidth efficiency. The CPU tail averages 3.518342 ms/layer at this placement; this average is not a transferable cost for every model layer.
+
+The ideal equation remains `13.4595 + 5.2021 = 18.6616 ms/token`, approximately 53.59 tokens/s (the more precise byte-based calculation above is authoritative). Actual CPU block time is about 2.091 times its ideal weight-streaming term, but that ratio includes computation and synchronization and is not a DRAM efficiency measurement. The empirical model explains the gap without redefining the ideal roof or treating implementation overhead as a hardware constant.
+
+At this calibrated point, reaching 26.8 tokens/s requires reducing elapsed time to **37.313433 ms/token**, a **4.049096 ms/token** reduction. If the GPU/other residual stays fixed, CPU block time must fall from 28.146736 to 24.097640 ms, approximately **14.39% less CPU time**. This is a budget calculation, not a promise that the savings are achievable.
+
+There is not yet a calibrated optimized 6-to-0 GPU curve. The earlier sweep used a different implementation/thread policy and reported prefill-inclusive output throughput; those rates cannot be fitted together with these decode-only points. For another placement, the CPU/GPU layer sets, cache fit, NUMA traffic, context-dependent attention and scheduling costs must be recalibrated. Do not extrapolate the tail's average linearly to pure CPU or use one constant efficiency multiplier for all GPU counts.
+
+These coefficients describe the previously measured isolated prototype, not the integrated 15.5838-tokens/s implementation or the subsequently merged CI-fix head. This revision uses existing records only; no new runtime experiment was performed.
+
 ## Screening results
 
 All rows below are one-round screening measurements, not confidence intervals or stable multi-run guarantees. Fixture 0 is excluded from each round. The baseline contains the earlier CPU-tail optimization; it is not the original unoptimized engine.

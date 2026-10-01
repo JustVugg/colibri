@@ -1915,5 +1915,39 @@
     },
     "raw_artifacts": "/home/Kei/colibri/result/dsv4-roofline-20261001",
     "isolated_worktree": "/tmp/colibri-dsv4-roofline"
+  },
+  "revised_offload_model": {
+    "kind": "single_request_target_only_non_overlapping_elapsed_time",
+    "placement": {
+      "gpu_layers": [
+        0,
+        34
+      ],
+      "cpu_layers": [
+        35,
+        42
+      ]
+    },
+    "calibration_source": "phase-summary-attention-detail.json",
+    "calibration_scope": "Previously measured isolated prototype; 24 physical cores; ACTIVE waiting; fixed short-context fixtures. Not the integrated implementation or the CI-fix head.",
+    "cpu_attention_ms": 15.897127053968246,
+    "cpu_moe_ms": 11.042018930158727,
+    "cpu_hyperconnection_ms": 1.2075898730158727,
+    "cpu_total_ms": 28.146735857142847,
+    "gpu_and_other_residual_ms": 13.215792657142867,
+    "total_ms": 41.362528514285714,
+    "calibrated_decode_tps": 24.176471698402622,
+    "target_ms": 37.3134328358209,
+    "required_reduction_ms": 4.049095678464816,
+    "cpu_time_reduction_percent_if_residual_fixed": 14.385666952700202,
+    "optimized_other_placements_validated": false,
+    "new_experiment_performed": false,
+    "limitations": [
+      "One-point calibration, not independent prediction validation",
+      "Residual is not GPU-only time",
+      "CPU layer average is not transferable to all layers",
+      "Historical prefill-inclusive sweep cannot be mixed with decode-only timing",
+      "No universal bandwidth efficiency inferred"
+    ]
   }
 }
