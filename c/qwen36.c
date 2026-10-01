@@ -836,6 +836,24 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
 static void *pilot_worker(void *arg);
 static void ensure_pilot_worker_started(Model *m);
 static void slot_ensure_allocated(Model *m, Slot *s);
+/* The cap main() must hand to qt_init.
+ *
+ * model_init_range resolves the cap<=0 "auto" sentinel into its own local copy
+ * and writes the result to every layer's cache; main()'s variable keeps the
+ * sentinel. qt_init refuses the VRAM expert tier for any cap != n_experts
+ * outside fp8-stream mode (qwen36_tier.c:536), so passing the unresolved 0
+ * switched the tier off under COLI_CUDA=1 even when auto-sizing had picked
+ * every expert. Found by review on #1747, not by a run: the guard sits behind
+ * COLI_CUDA and the CPU build links the inline stub.
+ *
+ * Pure on purpose, same convention as qwen36_cap_for_ram below: no Model
+ * pointer, no globals, no I/O, so test_qwen36_cap_precedence.c can pin it
+ * without a container. */
+static int qwen36_resolved_cap(int cap, const LCache *cache, int n_layers) {
+    if (cap > 0 || !cache || n_layers < 1) return cap;
+    return cache[0].cap;
+}
+
 static int qwen36_cap_for_ram(double resident_gb, double avail_gb, double ram_gb_override,
                                int hidden, int inter, int n_experts, int n_active_layers,
                                int is_int4, double *slot_gb_out, double *budget_gb_out);
@@ -4560,6 +4578,8 @@ int main(int argc, char **argv) {
     }
     if (expert_mixed && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1')
         fprintf(stderr, "[qwen36] COLI_CUDA=1 ignored: the VRAM expert tier does not take the mixed layout yet (one format per expert)\n");
+    /* The sentinel never leaves main() unresolved: see qwen36_resolved_cap. */
+    cap = qwen36_resolved_cap(cap, m.cache, m.c.n_layers);
     if (!qq_active() && !expert_mixed && m.c.n_experts > 0 &&
         qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_is_int4)) {

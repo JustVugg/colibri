@@ -100,6 +100,34 @@ int main(void) {
         CHECK(qwen36_cap_for_ram(0.0, 0.0, 0.0, HIDDEN, INTER, N_EXPERTS, 40, 0, NULL, NULL) >= 1);
     }
 
+    /* qwen36_resolved_cap: the sentinel must never leave main() unresolved.
+     *
+     * model_init_range resolves cap<=0 into its own local copy and writes the
+     * result to every layer's cache; main()'s variable keeps the sentinel.
+     * qt_init refuses the VRAM expert tier for any cap != n_experts outside
+     * fp8-stream mode, so handing it the unresolved 0 switched the tier off
+     * under COLI_CUDA=1 even when auto-sizing had picked every expert. Found by
+     * review on #1747, not by a run: the guard lives behind COLI_CUDA and the
+     * CPU build links the inline stub, so no CPU-only test can observe it. */
+    {
+        LCache cache[2];
+        cache[0].cap = N_EXPERTS; cache[1].cap = N_EXPERTS;
+
+        /* the sentinel resolves to what model_init_range stored */
+        CHECK(qwen36_resolved_cap(0, cache, 2) == N_EXPERTS);
+        CHECK(qwen36_resolved_cap(-1, cache, 2) == N_EXPERTS);
+
+        /* an explicit cap is passed through untouched -- the byte-identical
+         * guarantee for existing invocations (#1747's first fixed decision) */
+        CHECK(qwen36_resolved_cap(4, cache, 2) == 4);
+        CHECK(qwen36_resolved_cap(N_EXPERTS, cache, 2) == N_EXPERTS);
+
+        /* degenerate: nothing to read back, hand the sentinel on unchanged
+         * rather than invent a value or dereference a null cache */
+        CHECK(qwen36_resolved_cap(0, NULL, 2) == 0);
+        CHECK(qwen36_resolved_cap(0, cache, 0) == 0);
+    }
+
     printf(fails ? "test_qwen36_cap_precedence: FAIL (%d)\n" : "test_qwen36_cap_precedence: PASS\n", fails);
     return fails != 0;
 }
