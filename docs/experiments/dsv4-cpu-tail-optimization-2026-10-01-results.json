@@ -1,0 +1,172 @@
+{
+  "validation": {
+    "profile-12": {
+      "requests": 6,
+      "token_matches": 6,
+      "max_process_swap_kib": 0,
+      "max_process_read_bytes": 0
+    },
+    "baseline-12": {
+      "requests": 6,
+      "token_matches": 6,
+      "max_process_swap_kib": 0,
+      "max_process_read_bytes": 0
+    },
+    "decode-12": {
+      "requests": 6,
+      "token_matches": 6,
+      "max_process_swap_kib": 0,
+      "max_process_read_bytes": 0
+    },
+    "decode-node0-12": {
+      "requests": 6,
+      "token_matches": 6,
+      "max_process_swap_kib": 0,
+      "max_process_read_bytes": 40960
+    },
+    "decode-24": {
+      "requests": 6,
+      "token_matches": 6,
+      "max_process_swap_kib": 0,
+      "max_process_read_bytes": 0
+    },
+    "packed-12": {
+      "requests": 6,
+      "token_matches": 6,
+      "max_process_swap_kib": 0,
+      "max_process_read_bytes": 24576
+    },
+    "packed-24": {
+      "requests": 6,
+      "token_matches": 6,
+      "max_process_swap_kib": 0,
+      "max_process_read_bytes": 73728
+    },
+    "baseline-confirm": {
+      "requests": 12,
+      "token_matches": 12,
+      "max_process_swap_kib": 0,
+      "max_process_read_bytes": 8716288
+    },
+    "packed12-confirm": {
+      "requests": 12,
+      "token_matches": 12,
+      "max_process_swap_kib": 0,
+      "max_process_read_bytes": 18829312
+    },
+    "packed24-confirm": {
+      "requests": 12,
+      "token_matches": 12,
+      "max_process_swap_kib": 0,
+      "max_process_read_bytes": 40960
+    }
+  },
+  "total_requests": 78,
+  "groups": {
+    "baseline-12": {
+      "runs": [
+        "baseline-12",
+        "baseline-confirm"
+      ],
+      "rounds": [
+        {
+          "round": 0,
+          "tps": 4.759784378967689,
+          "decode_tps": 6.1920216535662425,
+          "ttft_s": 3.2260495942
+        },
+        {
+          "round": 0,
+          "tps": 4.656911892807151,
+          "decode_tps": 6.08901513068484,
+          "ttft_s": 3.3465721522000003
+        },
+        {
+          "round": 1,
+          "tps": 4.760572347200635,
+          "decode_tps": 6.257826890814403,
+          "ttft_s": 3.3273818886
+        }
+      ],
+      "medians": {
+        "tps": 4.759784378967689,
+        "decode_tps": 6.1920216535662425,
+        "ttft_s": 3.3273818886
+      },
+      "range_tps": [
+        4.656911892807151,
+        4.760572347200635
+      ]
+    },
+    "optimized-12": {
+      "runs": [
+        "packed-12",
+        "packed12-confirm"
+      ],
+      "rounds": [
+        {
+          "round": 0,
+          "tps": 5.184366850291099,
+          "decode_tps": 6.84786082466582,
+          "ttft_s": 3.1016526644000004
+        },
+        {
+          "round": 0,
+          "tps": 5.232669804195126,
+          "decode_tps": 6.9329750462214905,
+          "ttft_s": 3.1008263478
+        },
+        {
+          "round": 1,
+          "tps": 5.266995749750574,
+          "decode_tps": 6.962126663113762,
+          "ttft_s": 3.0570868908
+        }
+      ],
+      "medians": {
+        "tps": 5.232669804195126,
+        "decode_tps": 6.9329750462214905,
+        "ttft_s": 3.1008263478
+      },
+      "range_tps": [
+        5.184366850291099,
+        5.266995749750574
+      ]
+    },
+    "optimized-24": {
+      "runs": [
+        "packed-24",
+        "packed24-confirm"
+      ],
+      "rounds": [
+        {
+          "round": 0,
+          "tps": 5.270858760346504,
+          "decode_tps": 7.6676550009043325,
+          "ttft_s": 3.8763044278
+        },
+        {
+          "round": 0,
+          "tps": 5.246148828416789,
+          "decode_tps": 7.621870403858348,
+          "ttft_s": 3.8861795993999997
+        },
+        {
+          "round": 1,
+          "tps": 5.024612224341754,
+          "decode_tps": 7.326855824561553,
+          "ttft_s": 4.0904070642
+        }
+      ],
+      "medians": {
+        "tps": 5.246148828416789,
+        "decode_tps": 7.621870403858348,
+        "ttft_s": 3.8861795993999997
+      },
+      "range_tps": [
+        5.024612224341754,
+        5.270858760346504
+      ]
+    }
+  }
+}
