@@ -1,5 +1,7 @@
 # DeepSeek V4 GPU-to-CPU offload results
 
+**Measured follow-up (2026-10-02):** [The four-to-zero GPU sweep](dsv4-offload-measured-2026-10-02.md) records **24.25 / 11.13 / 4.90 / 3.06 / 2.94 decode tokens/s** for the frozen prototype. Low-GPU projections did not hold under the existing cache limits; the CPU-only point uses the documented compatible expert path. Historical results below are preserved.
+
 The target-first 6-to-0 GPU curve passed within-placement target/MTP token checks. Five GPUs retain all 43 target layers and reach 43.6869 tokens/s with MTP disabled; CPU MTP reaches 13.2518 tokens/s. Placement policy matters, not only GPU count.
 
 | GPUs | GPU / CPU target layers | Target-only tokens/s | MTP tokens/s | MTP vs 6 GPUs | Sum of sampled GPU peaks GiB | Sampled engine RSS GiB |

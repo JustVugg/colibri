@@ -1,5 +1,7 @@
 # Four-GPU CPU offload: the gap to the streaming roof
 
+**Measured follow-up (2026-10-02):** [The four-to-zero GPU sweep](dsv4-offload-measured-2026-10-02.md) records **24.25 / 11.13 / 4.90 / 3.06 / 2.94 decode tokens/s** for the frozen prototype. Low-GPU projections did not hold under the existing cache limits; the CPU-only point uses the documented compatible expert path. Historical results below are preserved.
+
 ## Review scope and final result
 
 This change builds on the CPU-offload study in #1816. The integrated implementation adds opt-in CPU-tail cache pooling/preload, wider exact FP8 decoding, SIMD activation QDQ, parallel sparse-attention heads and BF16 routing, grouped CPU output projection, regression tests, and decode-only fixture counters. The branch also carries the intervening CPU-tail packing and offloaded-head work documented in the companion reports.

@@ -1,5 +1,7 @@
 # Optimized CPU offload: conditional four-to-zero GPU curve
 
+**Measured follow-up (2026-10-02):** [The four-to-zero GPU sweep](dsv4-offload-measured-2026-10-02.md) records **24.25 / 11.13 / 4.90 / 3.06 / 2.94 decode tokens/s** for the frozen prototype. Low-GPU projections did not hold under the existing cache limits; the CPU-only point uses the documented compatible expert path. Historical results below are preserved.
+
 This is a **projection from existing records**, not a new benchmark. It answers how the four-GPU prototype's efficiency might translate to smaller GPU prefixes if CPU cache behavior and NUMA locality can be preserved. It does not claim that changing `V4_GPU_LAYERS` alone achieves these rates. No inference experiment was run for this update.
 
 ![Conditional optimized decode curve](dsv4-offload-projection-2026-10-02.svg)
