@@ -567,6 +567,10 @@ What you get is one workspace with a dock to switch page:
   allowed; the engine reads the probability of each answer, generates nothing,
   and reports an entropy that says when it is not sure. Same thing as
   `POST /v1/brio` (see [brio.md](brio.md));
+- **FlappyBri**: colibri's hummingbird between pipes, flown by you or by the
+  loaded model, which reads each step as a short description and answers
+  `POST /v1/systemone` live; the panel shows its latency, decisions per second
+  and how sure it was (see [web/README.md](../web/README.md#flappybri));
 - **Brain**, two views. *Explore* draws the
   [measured expert atlas](https://github.com/JustVugg/colibri/issues/175) of GLM-5.2 as a cortex with ten regions to
   enter (publish `experts.json` from `tools/expert_atlas/analyze.py --web`).
