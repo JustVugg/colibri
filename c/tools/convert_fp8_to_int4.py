@@ -48,12 +48,14 @@ GLM52_MODEL_TYPES = {"glm_moe_dsa", "glm5_moe", "glm"}
 OTHER_FAMILY_PATHS = {
     "glm5_next":       "GLM-5.3-Flash: use tools/convert_glm53.py",
     "glm5_next_text":  "GLM-5.3-Flash: use tools/convert_glm53.py",
-    "qwen4_exp":       "Qwen3.8-Flash-Next is NOT converted: download the official "
-                       "FP8 checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) and run it "
-                       "directly; see docs/qwen38.md and issue #1304",
-    "qwen4_exp_text":  "Qwen3.8-Flash-Next is NOT converted: download the official "
-                       "FP8 checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) and run it "
-                       "directly; see docs/qwen38.md and issue #1304",
+    "qwen4_exp":       "Qwen3.8-Flash-Next is NOT converted by this tool: download the "
+                       "official FP8 checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) and run it "
+                       "directly, optionally adding int4-g64 experts with "
+                       "tools/convert_qwen38_experts_int4.py; see docs/qwen38.md",
+    "qwen4_exp_text":  "Qwen3.8-Flash-Next is NOT converted by this tool: download the "
+                       "official FP8 checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) and run it "
+                       "directly, optionally adding int4-g64 experts with "
+                       "tools/convert_qwen38_experts_int4.py; see docs/qwen38.md",
     "qwen3_5_moe":     "Qwen3.6: use tools/convert_qwen36.py",
     "qwen3_5_moe_text":"Qwen3.6: use tools/convert_qwen36.py",
     "qwen3_5":         "Qwen3.8-27B (dense): use tools/convert_qwen36.py, see docs/qwen36.md",

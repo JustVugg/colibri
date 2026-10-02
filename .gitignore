@@ -158,17 +158,7 @@ c/kimi_k3_tiny/.coli_usage
 c/qwen38_vision_tiny/
 c/qwen38_mm_tiny/
 c/qwen38_tiny_fp8/
-c/tests/test_lora
-c/tests/test_lora.exe
-c/tests/test_train_linear
-c/tests/test_train_linear.exe
-c/tests/test_train_tiny
-c/tests/test_train_tiny.exe
-c/tests/test_train_resume
-c/tests/test_train_resume.exe
-c/glm_tiny/
-c/coli_train
-c/coli_train.exe
+c/qwen38_tiny_int4/
 # MiMo tiny fixture: config.json and ref.json are committed, the rest is regenerated
 c/mimo_tiny/*.safetensors
 c/mimo_tiny/model.safetensors.index.json

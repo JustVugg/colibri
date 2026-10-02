@@ -10,6 +10,7 @@
 #ifndef COLI_QWEN38_CORE_H
 #define COLI_QWEN38_CORE_H
 #include "kv_prefix.h"
+#include "expert_ffn.h"   /* the int4-g64 routed experts (experts-int4g64/ sidecar) run through its f32 kernel */
 #include <pthread.h>   /* q38_ehit_mark publishes the lazy HITS table under a lock */
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h" /* COLI_VULKAN=1: the int8 trunk on a Vulkan device */
@@ -44,12 +45,17 @@ typedef enum {
     Q38_WEIGHT_NONE = 0,
     Q38_WEIGHT_F32,
     Q38_WEIGHT_BF16,
-    Q38_WEIGHT_FP8
+    Q38_WEIGHT_FP8,
+    Q38_WEIGHT_INT4G64             /* routed experts from the experts-int4g64/ sidecar */
 } Q38WeightKind;
+
+/* int4-g64 rows: ceil(cols/2) bytes of codes and one f32 scale per 64 inputs */
+static inline int64_t q38_int4_row_bytes(int cols){ return ((int64_t)cols+1)/2; }
+static inline int64_t q38_int4_groups(int cols){ return ((int64_t)cols+XF_BLOCK-1)/XF_BLOCK; }
 
 typedef struct {
     void *data;
-    float *scales;                 /* block-FP8 only */
+    float *scales;                 /* block-FP8: per 128x128 block; int4-g64: per row and 64 inputs */
     int rows, cols;
     int64_t elements, scale_count;
     Q38WeightKind kind;
@@ -108,6 +114,8 @@ typedef struct {
     uint64_t used;
     void *fp8_slab;
     int64_t fp8_slab_bytes;
+    void *int4_slab;               /* one experts-int4g64/ record: codes, then scales */
+    int64_t int4_slab_bytes;
 } Slot;
 typedef struct { Slot *slots; int *by_expert, n, cap; } LCache;
 
@@ -116,6 +124,16 @@ typedef struct {
     int64_t scale_count;
     int ready;                     /* 0 unknown, 1 resident, -1 incompatible */
 } Q38ExpertScaleCache;
+
+/* The routed experts as int4-g64 (q38_expert_int4_attach): where every
+ * expert's record sits in the sidecar's layer files, and its geometry. */
+typedef struct {
+    shards S;                      /* <snap>/experts-int4g64/, one file per layer */
+    int *fd;                       /* [layer] the file holding that layer's records */
+    int64_t *off;                  /* [layer*experts + expert] where the record starts */
+    int64_t code_bytes[3], scale_count[3];   /* gate, up, down */
+    int64_t scale_off, record_bytes;
+} Q38Int4Experts;
 
 typedef enum {
     Q38_EXPERT_BATCH_FALLBACK_NONE = 0,
@@ -136,6 +154,7 @@ typedef struct {
     LCache *cache;
     uint8_t **ehit;                    /* experts routed this turn, for HITS (dashboard Brain) */
     Q38ExpertScaleCache *expert_scales;
+    Q38Int4Experts *x4;                /* routed experts from experts-int4g64/, NULL = the snapshot's own */
     uint64_t clock, hits, miss;
     uint64_t expert_weight_reads, expert_scale_reads, expert_pair_reads;
     uint64_t expert_prefetch_ranges, expert_parallel_batches;
@@ -263,6 +282,9 @@ static void q38_weight_reserve(Q38Weight *weight,Q38WeightKind kind,int rows,int
 }
 
 static uint64_t q38_weight_bytes(const Q38Weight *weight) {
+    if(weight->kind==Q38_WEIGHT_INT4G64)
+        return (uint64_t)weight->rows*(uint64_t)q38_int4_row_bytes(weight->cols)+
+               (uint64_t)weight->scale_count*sizeof(float);
     uint64_t element_size=weight->kind==Q38_WEIGHT_F32?sizeof(float):
                           weight->kind==Q38_WEIGHT_BF16?sizeof(uint16_t):
                           weight->kind==Q38_WEIGHT_FP8?sizeof(uint8_t):0;
@@ -355,6 +377,35 @@ static void q38_matmul_fp8(float *y,const float *x,const uint8_t *q8,const float
     matmul_fp8(y,x,q8,bscale,S,I,O);
 }
 
+/* The int4-g64 routed experts (q38_expert_int4_attach) through expert_ffn.h's
+ * f32 kernel: every code is exact in f32, one fma per element and one per
+ * block for its scale, and the activations stay f32 as on the FP8 path. A row
+ * is planar blocks of 64; a width that is not a multiple of 64 (only the tiny
+ * fixtures) keeps its tail in pairs and finishes with the last group's scale.
+ * Each output row is computed the same way whatever S is, so decode and the
+ * prefill batch give the same bits. */
+static void q38_matmul_int4g64(float *y,const float *x,const uint8_t *codes,
+                               const float *scales,int S,int I,int O) {
+    int64_t row_bytes=q38_int4_row_bytes(I),groups=q38_int4_groups(I);
+    int body=I/XF_BLOCK*XF_BLOCK;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=codes+(int64_t)o*row_bytes;
+        const float *sc=scales+(int64_t)o*groups;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I;
+            float a=body?xf_dot_f32(w,sc,xs,body):0.f;
+            if(body<I){
+                float tail=0.f;
+                for(int i=body;i<I;i++)
+                    tail+=(float)((int)((w[i>>1]>>((i&1)*4))&15)-8)*xs[i];
+                a=fmaf(tail,sc[groups-1],a);
+            }
+            y[(int64_t)s*O+o]=a;
+        }
+    }
+}
+
 #ifdef COLI_VULKAN
 /* COLI_VULKAN=1: a resident matrix answers from the Vulkan device, decode and
  * prefill alike, with the weights the CPU would read and in the order
@@ -436,6 +487,8 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
         q38_matmul_bf16(y,x,(const uint16_t*)weight->data,S,I,O);
     else if(weight->kind==Q38_WEIGHT_FP8&&weight->scales)
         q38_matmul_fp8(y,x,(const uint8_t*)weight->data,weight->scales,S,I,O);
+    else if(weight->kind==Q38_WEIGHT_INT4G64&&weight->scales)
+        q38_matmul_int4g64(y,x,(const uint8_t*)weight->data,weight->scales,S,I,O);
     else {fprintf(stderr,"unsupported matmul weight kind %d\n",(int)weight->kind);exit(1);}
 }
 
@@ -1298,11 +1351,22 @@ static int q38_try_load_native_fp8_expert(Model *m,int layer,int expert,Slot *sl
     return 1;
 }
 
-static void q38_prefetch_native_fp8_experts(Model *m,int layer,
-                                            const int *experts,int count) {
-    if(!m->expert_prefetch||!m->native_fp8||!experts||count<1||
-       !q38_prepare_expert_scale_bank(m,layer))return;
+/* Advise the kernel of the experts a route is about to miss: the int4
+ * sidecar's one record each, or the native FP8 pair and down ranges. */
+static void q38_prefetch_experts(Model *m,int layer,const int *experts,int count) {
+    if(!m->expert_prefetch||!experts||count<1)return;
     LCache *cache=&m->cache[layer];
+    if(m->x4){
+        for(int index=0;index<count;index++){
+            int expert=experts[index];
+            if(expert<0||expert>=m->c.experts||cache->by_expert[expert]>=0)continue;
+            posix_fadvise(m->x4->fd[layer],m->x4->off[(int64_t)layer*m->c.experts+expert],
+                          m->x4->record_bytes,POSIX_FADV_WILLNEED);
+            m->expert_prefetch_ranges++;
+        }
+        return;
+    }
+    if(!m->native_fp8||!q38_prepare_expert_scale_bank(m,layer))return;
     for(int index=0;index<count;index++){
         int expert=experts[index];st_tensor *weight[3];
         if(expert<0||expert>=m->c.experts||cache->by_expert[expert]>=0||
@@ -1381,8 +1445,211 @@ static void q38_load_expert_slice(Model *m,const char *name,const st_tensor *ten
     q38_tm_add(m,Q38_TM_EXPERT_READ,started);m->expert_weight_reads++;
 }
 
+/* ---- routed experts from the int4-g64 sidecar -------------------------------
+ * tools/convert_qwen38_experts_int4.py writes <snap>/experts-int4g64/: one
+ * safetensors file per layer and an index.json that says what is in them.
+ * The release's FP8 shards are only read by it and stay usable as they are.
+ * Every expert is one contiguous record, so a miss is one read:
+ *
+ *   gate codes [I][H/2] | up codes [I][H/2] | down codes [H][I/2] |
+ *   gate scales [I][H/64] | up scales [I][H/64] | down scales [H][I/64]
+ *
+ * named like the release's tensors (...experts.E.gate_proj.weight, and the
+ * same name + ".qs" for its f32 scales). The codes are expert_ffn.h's planar
+ * int4 (a row is blocks of 64, byte k holding element k in its low nibble
+ * and element k+32 in its high one, both as v+8; a width that is not a
+ * multiple of 64 keeps its tail in pairs, as idot.h's planarize_i4 leaves
+ * it), one scale per 64 inputs, quantized as tools/convert_qwen36.py --ebits
+ * 4 --gs 64 does. On the release an expert is 2.76 MB, 56% of its 4.92 MB
+ * in FP8: the same RAM holds 1.78x the experts and a miss reads 56% of the
+ * bytes.
+ * Attached by the CLI/serve engine only: the Segment and Edge adapters keep
+ * the snapshot's experts, the representation their numeric class names. */
+#define Q38_INT4_DIR "experts-int4g64"
+#define Q38_INT4_FORMAT "colibri.qwen38.experts-int4g64"
+#define Q38_INT4_VERSION 1
+
+/* Q38_EXPERT_INT4: unset = the sidecar when there is one, 0 = never (the
+ * snapshot's FP8), 1 = refuse to start without it (a benchmark that must not
+ * quietly measure FP8). */
+static int q38_expert_int4_wanted(void) {
+    const char *value=getenv("Q38_EXPERT_INT4");
+    if(!value||!*value)return -1;
+    if(value[0]=='0'&&!value[1])return 0;
+    if(value[0]=='1'&&!value[1])return 1;
+    fprintf(stderr,"Q38_EXPERT_INT4 must be exactly 0 or 1\n");exit(1);
+}
+
+static void q38_int4_refuse(const char *dir,const char *why) {
+    fprintf(stderr,"[qwen38] %s: %s -- refusing (Q38_EXPERT_INT4=0 ignores the sidecar)\n",dir,why);
+    exit(1);
+}
+
+static int64_t q38_json_int(jval *object,const char *key) {
+    jval *value=json_get(object,key);
+    if(!value||value->t!=J_NUM||!isfinite(value->num)||floor(value->num)!=value->num||
+       value->num<0||value->num>(double)INT64_MAX/2)return -1;
+    return (int64_t)value->num;
+}
+
+/* The six tensors of one expert must be the record the index describes:
+ * right dtype and shape, one file, back to back in record order, at an
+ * offset that keeps the f32 scales aligned in a mapping. */
+static int q38_int4_record_at(Model *m,Q38Int4Experts *x,int layer,int expert,
+                              int *fd,int64_t *start) {
+    Cfg *c=&m->c;const char *projection[3]={"gate_proj","up_proj","down_proj"};
+    int rows[3]={c->inter,c->inter,c->hidden},cols[3]={c->hidden,c->hidden,c->inter};
+    char suffix[192],name[320];int64_t at=0;
+    for(int part=0;part<6;part++){
+        int k=part%3,is_scale=part>=3;
+        int length=snprintf(suffix,sizeof suffix,"mlp.experts.%d.%s.weight%s",
+                            expert,projection[k],is_scale?".qs":"");
+        if(length<0||(size_t)length>=sizeof suffix)return -1;
+        q38_name(m,name,sizeof name,layer,suffix);
+        st_tensor *t=st_find(&x->S,name);
+        int64_t width=is_scale?q38_int4_groups(cols[k]):q38_int4_row_bytes(cols[k]);
+        int64_t bytes=is_scale?x->scale_count[k]*(int64_t)sizeof(float):x->code_bytes[k];
+        if(!t||t->dtype!=(is_scale?2:3)||t->rank!=2||t->shape[0]!=rows[k]||
+           t->shape[1]!=width||t->nbytes!=bytes)return -1;
+        if(!part){
+            if(t->off%(int64_t)sizeof(float))return -1;
+            *fd=t->fd;*start=t->off;
+        }else if(t->fd!=*fd||t->off!=*start+at)return -1;
+        at+=bytes;
+    }
+    return 0;
+}
+
+/* Read <snap>/experts-int4g64/index.json and, if it describes a complete
+ * conversion of this model, index every record of the loaded layers. A
+ * sidecar for another geometry or format, or whose files disagree with the
+ * index, is refused rather than ignored; one still being written is skipped
+ * with a line saying so (or refused under Q38_EXPERT_INT4=1). */
+static void q38_expert_int4_attach(Model *m,const char *snap) {
+    int wanted=q38_expert_int4_wanted();
+    if(!wanted)return;
+    Cfg *c=&m->c;char dir[2100],path[2200];
+    snprintf(dir,sizeof dir,"%s/%s",snap,Q38_INT4_DIR);
+    snprintf(path,sizeof path,"%s/index.json",dir);
+    FILE *f=fopen(path,"rb");
+    if(!f){
+        if(wanted>0){
+            fprintf(stderr,"Q38_EXPERT_INT4=1 but %s cannot be opened "
+                           "(tools/convert_qwen38_experts_int4.py writes it)\n",path);exit(1);
+        }
+        return;
+    }
+    char *text=NULL,*arena=NULL;long size=-1;
+    if(!fseek(f,0,SEEK_END))size=ftell(f);
+    if(size<0||size>(16L<<20)||fseek(f,0,SEEK_SET)||!(text=(char*)malloc((size_t)size+1))||
+       fread(text,1,(size_t)size,f)!=(size_t)size){
+        fclose(f);q38_int4_refuse(dir,"index.json cannot be read");
+    }
+    fclose(f);text[size]=0;
+    jval *root=json_parse(text,&arena);
+    if(!root||root->t!=J_OBJ)q38_int4_refuse(dir,"index.json is not a JSON object");
+    const char *format=jstr(root,"format"),*codes=jstr(root,"codes"),*scales=jstr(root,"scales");
+    if(!format||strcmp(format,Q38_INT4_FORMAT)||q38_json_int(root,"version")!=Q38_INT4_VERSION||
+       !codes||strcmp(codes,"planar64-v8")||!scales||strcmp(scales,"f32-per-64")||
+       q38_json_int(root,"group_size")!=XF_BLOCK)
+        q38_int4_refuse(dir,"index.json is not format " Q38_INT4_FORMAT " version 1, int4 codes v+8 "
+                            "in planar blocks of 64 with f32 scales per 64");
+    Q38Int4Experts *x=(Q38Int4Experts*)calloc(1,sizeof(*x));
+    if(!x){fprintf(stderr,"OOM int4 expert index\n");exit(1);}
+    int rows[3]={c->inter,c->inter,c->hidden},cols[3]={c->hidden,c->hidden,c->inter};
+    for(int k=0;k<3;k++){
+        x->code_bytes[k]=(int64_t)rows[k]*q38_int4_row_bytes(cols[k]);
+        x->scale_count[k]=(int64_t)rows[k]*q38_int4_groups(cols[k]);
+        x->scale_off+=x->code_bytes[k];
+    }
+    x->record_bytes=x->scale_off+
+        (x->scale_count[0]+x->scale_count[1]+x->scale_count[2])*(int64_t)sizeof(float);
+    if(q38_json_int(root,"layers")!=c->layers||q38_json_int(root,"experts")!=c->experts||
+       q38_json_int(root,"hidden_size")!=c->hidden||
+       q38_json_int(root,"moe_intermediate_size")!=c->inter||
+       q38_json_int(root,"record_bytes")!=x->record_bytes||x->scale_off%(int64_t)sizeof(float))
+        q38_int4_refuse(dir,"index.json was written for another geometry than config.json's");
+    jval *complete=json_get(root,"complete"),*done=json_get(root,"done");
+    if(!complete||complete->t!=J_BOOL||!complete->boolean){
+        int layers_done=done&&done->t==J_ARR?done->len:0;
+        if(wanted>0){
+            fprintf(stderr,"[qwen38] %s: conversion incomplete (%d of %d layers); "
+                           "Q38_EXPERT_INT4=1 refuses to fall back to FP8\n",dir,layers_done,c->layers);exit(1);
+        }
+        fprintf(stderr,"[qwen38] %s: conversion incomplete (%d of %d layers); "
+                       "the routed experts stay as the snapshot has them\n",dir,layers_done,c->layers);
+        json_free(root);free(arena);free(text);free(x);
+        return;
+    }
+    json_free(root);free(arena);free(text);
+    st_init(&x->S,dir);
+    x->fd=(int*)malloc((size_t)c->layers*sizeof(int));
+    x->off=(int64_t*)malloc((size_t)c->layers*(size_t)c->experts*sizeof(int64_t));
+    if(!x->fd||!x->off){fprintf(stderr,"OOM int4 expert index\n");exit(1);}
+    for(int layer=0;layer<c->layers;layer++){
+        x->fd[layer]=-1;
+        for(int expert=0;expert<c->experts;expert++)x->off[(int64_t)layer*c->experts+expert]=-1;
+    }
+    for(int layer=m->range_begin;layer<m->range_end;layer++)
+        for(int expert=0;expert<c->experts;expert++){
+            int fd=-1;int64_t start=-1;
+            if(q38_int4_record_at(m,x,layer,expert,&fd,&start)||
+               (x->fd[layer]>=0&&fd!=x->fd[layer])){
+                char why[160];
+                snprintf(why,sizeof why,"layer %d expert %d is missing or is not one int4-g64 "
+                         "record of %lld bytes",layer,expert,(long long)x->record_bytes);
+                q38_int4_refuse(dir,why);
+            }
+            x->fd[layer]=fd;x->off[(int64_t)layer*c->experts+expert]=start;
+        }
+    m->x4=x;
+}
+
+/* Point a slot's three matrices into one record (a slab or a mapping). */
+static void q38_bind_int4_record(Model *m,Slot *slot,uint8_t *record) {
+    Cfg *c=&m->c;const Q38Int4Experts *x=m->x4;
+    int rows[3]={c->inter,c->inter,c->hidden},cols[3]={c->hidden,c->hidden,c->inter};
+    Q38Weight *dst[3]={&slot->gate,&slot->up,&slot->down};
+    uint8_t *codes=record;float *scales=(float*)(record+x->scale_off);
+    for(int k=0;k<3;k++){
+        Q38Weight *weight=dst[k];q38_weight_free(weight);
+        weight->data=codes;weight->scales=scales;weight->rows=rows[k];weight->cols=cols[k];
+        weight->elements=(int64_t)rows[k]*cols[k];weight->scale_count=x->scale_count[k];
+        weight->kind=Q38_WEIGHT_INT4G64;
+        codes+=x->code_bytes[k];scales+=x->scale_count[k];
+    }
+}
+
+/* One read per miss, into the slot's own slab; with COLI_MAP_EXPERTS=1 the
+ * slot points into the mapped file instead, as the FP8 path does. Safe from
+ * the parallel batch loader: every job owns a distinct slot. */
+static void q38_load_int4_record(Model *m,int layer,int expert,Slot *slot) {
+    Q38Int4Experts *x=m->x4;
+    int fd=x->fd[layer];int64_t off=x->off[(int64_t)layer*m->c.experts+expert];
+    const uint8_t *mapped=(const uint8_t*)st_map_shard_range(fd,off,x->record_bytes);
+    if(mapped){
+        q38_bind_int4_record(m,slot,(uint8_t*)mapped);
+        free(slot->int4_slab);slot->int4_slab=NULL;slot->int4_slab_bytes=0;
+        return;
+    }
+    if(!slot->int4_slab||slot->int4_slab_bytes!=x->record_bytes){
+        void *replacement=realloc(slot->int4_slab,(size_t)x->record_bytes);
+        if(!replacement){fprintf(stderr,"OOM int4 expert record\n");exit(1);}
+        slot->int4_slab=replacement;slot->int4_slab_bytes=x->record_bytes;
+    }
+    q38_bind_int4_record(m,slot,(uint8_t*)slot->int4_slab);
+    st_read_range_raw_cap(&x->S,fd,off,x->record_bytes,slot->int4_slab,
+                          slot->int4_slab_bytes,1,"pread Qwen3.8 int4 expert");
+}
+
 static void q38_load_expert(Model *m,int layer,int eid,Slot *s) {
     Cfg *c=&m->c; int H=c->hidden,I=c->inter; char nm[320],sn[340];
+    if(m->x4){
+        double started=now_s();
+        q38_load_int4_record(m,layer,eid,s);
+        q38_tm_add(m,Q38_TM_EXPERT_READ,started);m->expert_weight_reads++;
+        return;
+    }
     q38_name(m,nm,sizeof nm,layer,"mlp.experts.gate_up_proj");
     if(st_has(&m->S,nm)){
         st_tensor *t=st_find(&m->S,nm);
@@ -1490,7 +1757,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
     if(count>cache->cap)
         return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_CACHE_CAPACITY,
                                          layer,cache->cap,count);
-    if(!q38_prepare_expert_scale_bank(m,layer))
+    if(!m->x4&&!q38_prepare_expert_scale_bank(m,layer))
         return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_SCALE_BANK,layer,0,0);
     /* The demand set is no longer bounded by the decode top-k: the MoE prefill
      * hands over the whole chunk union (up to the cache cap) so its loads run
@@ -1516,7 +1783,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
             continue;
         }
         st_tensor *weight[3];
-        if(!q38_native_fp8_expert_tensors(m,layer,expert,weight)){
+        if(!m->x4&&!q38_native_fp8_expert_tensors(m,layer,expert,weight)){
             free(jobs);
             return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_LAYOUT,
                                              layer,expert,0);
@@ -1551,7 +1818,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
                 if(slot->eid>=0)cache->by_expert[slot->eid]=-1;
             }
             slot->eid=-1;jobs[job_count].expert=expert;jobs[job_count].slot=slot;
-            if(!q38_native_fp8_expert_tensors(m,layer,expert,jobs[job_count].weight)){
+            if(!m->x4&&!q38_native_fp8_expert_tensors(m,layer,expert,jobs[job_count].weight)){
                 fprintf(stderr,"Qwen3.8 expert layout changed during batch reservation\n");exit(1);
             }
             job_count++;
@@ -1569,12 +1836,14 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
 #endif
         double started=now_s();
         #pragma omp parallel for schedule(static) num_threads(workers) if(job_count>1)
-        for(int job=0;job<job_count;job++)
-            q38_load_native_fp8_ranges(m,layer,jobs[job].expert,jobs[job].slot,
-                                        jobs[job].weight);
+        for(int job=0;job<job_count;job++){
+            if(m->x4)q38_load_int4_record(m,layer,jobs[job].expert,jobs[job].slot);
+            else q38_load_native_fp8_ranges(m,layer,jobs[job].expert,jobs[job].slot,
+                                            jobs[job].weight);
+        }
         q38_tm_add(m,Q38_TM_EXPERT_READ,started);
-        m->expert_weight_reads+=(uint64_t)job_count*2;
-        m->expert_pair_reads+=(uint64_t)job_count;
+        m->expert_weight_reads+=(uint64_t)job_count*(m->x4?1:2);
+        if(!m->x4)m->expert_pair_reads+=(uint64_t)job_count;
         if(job_count>1)m->expert_parallel_batches++;
         for(int job=0;job<job_count;job++){
             Slot *slot=jobs[job].slot;slot->eid=jobs[job].expert;
@@ -2127,6 +2396,13 @@ static void q38_tier_start(Model *m,int cap) {
     const char *on=getenv("COLI_CUDA");
     if(!on||on[0]!='1'||on[1])return;
     Cfg *c=&m->c;
+    if(m->x4){
+        /* The tier streams e4m3 bytes (fmt 8) and copies them at qt_note; its
+         * int4 mode wants every expert resident in RAM. Neither is this. */
+        fprintf(stderr,"[qtier] qwen38: the expert tier streams native FP8 experts only; the int4-g64 "
+                       "experts stay on the CPU and the tier stays off (Q38_EXPERT_INT4=0 gives it the FP8 ones)\n");
+        return;
+    }
     if(!m->native_fp8){
         fprintf(stderr,"[qtier] qwen38: expert tier needs native FP8 experts (Q38_NATIVE_FP8=1); staying on the CPU\n");
         return;
@@ -2163,7 +2439,7 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
         uint32_t qmask=qt_issue(layer,idx,K,xs);
         int cpu_idx[Q38_MAX_TOPK],cpu_rank[Q38_MAX_TOPK],cpu_n=0;
         for(int z=0;z<K;z++)if(!((qmask>>z)&1u)){cpu_idx[cpu_n]=idx[z];cpu_rank[cpu_n]=z;cpu_n++;}
-        q38_prefetch_native_fp8_experts(m,layer,cpu_idx,cpu_n);
+        q38_prefetch_experts(m,layer,cpu_idx,cpu_n);
         double phase_started=now_s();
         q38_weight_matmul(sg,xs,&l->sh_g,1,H,SI);q38_weight_matmul(su,xs,&l->sh_u,1,H,SI);
         for(int j=0;j<SI;j++)sh[j]=q38_silu(sg[j])*su[j];q38_weight_matmul(shared,sh,&l->sh_d,1,SI,H);
@@ -2318,7 +2594,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
         }
 
         /* One advice range per distinct expert is enough for this chunk. */
-        q38_prefetch_native_fp8_experts(m,layer,unique,unique_count);
+        q38_prefetch_experts(m,layer,unique,unique_count);
 
         /* Shared expert work is independent across rows and remains resident;
          * batching it here also keeps its cost out of the routed groups. */
@@ -2610,6 +2886,7 @@ static void q38_model_free(Model *m) {
                     q38_weight_free(&m->cache[i].slots[s].up);
                     q38_weight_free(&m->cache[i].slots[s].down);
                     free(m->cache[i].slots[s].fp8_slab);
+                    free(m->cache[i].slots[s].int4_slab);
                 }
             }
             free(m->cache[i].slots); free(m->cache[i].by_expert);
@@ -2618,6 +2895,7 @@ static void q38_model_free(Model *m) {
         free(m->DN_rec ? m->DN_rec[i] : NULL); free(m->DN_conv ? m->DN_conv[i] : NULL);
         free(m->K ? m->K[i] : NULL); free(m->V ? m->V[i] : NULL); free(m->IK ? m->IK[i] : NULL);
     }
+    if(m->x4){st_destroy(&m->x4->S);free(m->x4->fd);free(m->x4->off);free(m->x4);}
     free(m->L); free(m->cache); free(m->expert_scales); free(m->DN_rec); free(m->DN_conv); free(m->K); free(m->V); free(m->IK);
     q38_weight_free(&m->embed);q38_weight_free(&m->lm_head);
     free(m->final_gr.norm);q38_weight_free(&m->final_gr.down);q38_weight_free(&m->final_gr.up);q38_weight_free(&m->final_gr.inject);

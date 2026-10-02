@@ -1336,6 +1336,60 @@ qwen38-tiny-fp8-check: qwen38-tiny-fp8-generate qwen38$(EXE)
 qwen38-tier-engine-check: qwen38-tiny-fp8-generate tests/test_qwen38_tier_engine$(EXE)
 	./tests/test_qwen38_tier_engine$(EXE)
 
+# The routed experts as int4-g64: tools/convert_qwen38_experts_int4.py writes
+# the experts-int4g64/ sidecar next to the FP8 shards and qwen38 picks it up.
+# The fixture is the FP8 one with its experts scaled by 3 (at the default
+# initialization zeroing every expert moves the logits less than the oracle's
+# tolerance), converted; ref_int4.json is the float32 reference of the
+# dequantized sidecar. Gates:
+#  (a) the int4 matmul equals a dequantized f32 reference, and every expert the
+#      single and the batch path load holds the sidecar's bytes
+#      (tests/test_qwen38_int4_experts);
+#  (b) the converter's round trip against the FP8 source, per matrix, and the
+#      engine refusing a sidecar its index does not describe
+#      (tests/test_qwen38_int4_convert.py);
+#  (c) the engine on the sidecar reproduces ref_int4.json through the single,
+#      batched, prefill-batch and mapped paths at caps 1, 2 and 4, with the
+#      last logits identical to the bit across them; the FP8 experts still
+#      reproduce ref.json and not ref_int4.json, so the gate tells them apart;
+#  (d) under COLI_CUDA=1 on the fake backend the tier declines the int4
+#      experts (it streams FP8 only) and the CPU still reproduces ref_int4.json.
+.PHONY: qwen38-tiny-int4-generate qwen38-tiny-int4-check
+qwen38-tiny-int4-generate:
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_int4 --fp8-experts --int4-experts --expert-gain 3
+
+qwen38-tiny-int4-check: qwen38-tiny-int4-generate qwen38-tiny-fp8-generate qwen38$(EXE) \
+		tests/test_qwen38_int4_experts$(EXE) tests/test_qwen38_tier_engine$(EXE)
+	OMP_NUM_THREADS=2 ./tests/test_qwen38_int4_experts$(EXE) ./qwen38_tiny_int4
+	$(PYTHON) tests/test_qwen38_int4_convert.py --model ./qwen38_tiny_int4 --engine ./qwen38$(EXE)
+	@d=./qwen38_tiny_int4/logits; rm -rf $$d; mkdir -p $$d; n=0; \
+	for trunk in 1024 0; do for cap in 1 2 4; do for mode in single batched prefill prefill-serial mapped; do \
+		case $$mode in \
+			single) e="Q38_PREFILL_BATCH=0 Q38_EXPERT_PARALLEL_READS=0";; \
+			batched) e="Q38_PREFILL_BATCH=0";; \
+			prefill) e="Q38_PREFILL_BATCH=1";; \
+			prefill-serial) e="Q38_PREFILL_BATCH=1 Q38_EXPERT_PARALLEL_READS=0";; \
+			mapped) e="COLI_MAP_EXPERTS=1";; \
+		esac; \
+		env $$e Q38_EXPERT_INT4=1 Q38_TRUNK_MIN_KB=$$trunk DUMP=$$d/t$$trunk-c$$cap-$$mode.f32 OMP_NUM_THREADS=2 \
+			SNAP=./qwen38_tiny_int4 ./qwen38$(EXE) $$cap 8 ./qwen38_tiny_int4/ref_int4.json > $$d/run.log 2>&1 \
+			|| { cat $$d/run.log; echo "FAIL int4 experts, trunk=$$trunk cap=$$cap $$mode"; exit 1; }; \
+		n=$$((n+1)); \
+	done; done; \
+	for f in $$d/t$$trunk-*.f32; do cmp -s $$f $$d/t$$trunk-c1-single.f32 \
+		|| { echo "FAIL $$f: last logits differ from the single path"; exit 1; }; done; done; \
+	for trunk in 1024 0; do \
+		Q38_EXPERT_INT4=0 Q38_TRUNK_MIN_KB=$$trunk OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_int4 \
+			./qwen38$(EXE) 2 8 ./qwen38_tiny_int4/ref.json > $$d/run.log 2>&1 \
+			|| { cat $$d/run.log; echo "FAIL FP8 experts of the int4 fixture, trunk=$$trunk"; exit 1; }; \
+		if Q38_EXPERT_INT4=0 Q38_TRUNK_MIN_KB=$$trunk OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_int4 \
+			./qwen38$(EXE) 2 8 ./qwen38_tiny_int4/ref_int4.json > $$d/run.log 2>&1 \
+			|| ! grep -q '^Matching tokens' $$d/run.log; then \
+			cat $$d/run.log; echo "FAIL the FP8 experts pass the int4 reference: the gate cannot tell them apart"; exit 1; fi; \
+	done; \
+	echo "qwen38 int4-g64 experts: ref_int4.json reproduced in $$n configurations, last logits identical across paths; FP8 control ok"
+	./tests/test_qwen38_tier_engine$(EXE) ./qwen38_tiny_int4
+
 # Context-size gates: KV layout, growth across requests, and the attention
 # capacity. Includes qwen36.c directly, so no model file is needed.
 # Same tier objects as the engine: the test includes qwen36.c, so with CUDA=1
@@ -1554,6 +1608,11 @@ tests/test_dsv41_untrusted_load$(EXE): tests/test_dsv41_untrusted_load.c deepsee
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# The int4-g64 expert matmul with no model (part of test-c); given a converted
+# snapshot on argv it checks the sidecar's loaders too (qwen38-tiny-int4-check).
+tests/test_qwen38_int4_experts$(EXE): tests/test_qwen38_int4_experts.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c $(VK_OBJ)

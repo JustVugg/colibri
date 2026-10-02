@@ -1838,6 +1838,8 @@ static int q38_reference_mode(const char *path,int serve_mode){
     return length>=5&&!strcmp(path+length-5,".json");
 }
 
+static void q38_expert_report(Model *m, int cap);   /* below, beside the expert layout accounting */
+
 #ifndef QWEN38_TEST_SERVE
 int main(int argc, char **argv) {
     /* Physical-core team sizing, as colibri/inkling/kimi_k3/olmoe/deepseek-v41
@@ -1953,8 +1955,10 @@ int main(int argc, char **argv) {
     }
 
     Model m; model_init(&m, snap, cap, bits);
+    q38_expert_int4_attach(&m, snap);   /* <snap>/experts-int4g64/ when present (Q38_EXPERT_INT4) */
     q38_tier_start(&m, cap);   /* COLI_CUDA=1: hot experts stream to VRAM (qwen36_tier.c) */
     q38_trunk_cpu_int8(&m);    /* the trunk's int8 rows on the CPU, BF16 released (Q38_TRUNK_CPU_INT8=0 keeps BF16) */
+    q38_expert_report(&m, cap);         /* expert format, bytes per expert, what the cache costs */
 #ifdef COLI_VULKAN
     /* After the trunk is int8: those rows upload at their first matmul. No
      * device (or COLI_VULKAN unset) leaves g_vk_ready 0, the CPU path. */
@@ -2246,6 +2250,52 @@ static int q38_segment_expert_layout(Model *m,uint32_t begin,uint32_t end,
     }
     *bytes_per_capacity=range_bytes;*fixed_scale_bytes=range_scales;
     *numeric_kinds=kinds;return 0;
+}
+
+/* Said once at startup: the representation the routed-expert cache holds,
+ * what one expert costs in it, what the cache costs full at this cap, and
+ * how many experts per layer the RAM still available now (resident weights
+ * loaded, cache empty) would hold at that size -- the number a cap is chosen
+ * against, and the one the int4-g64 sidecar moves. */
+static void q38_expert_report(Model *m, int cap) {
+    Cfg *c = &m->c;
+    int layers = m->range_end - m->range_begin;
+    uint64_t per_capacity = 0, fixed = 0, snapshot_expert = 0;
+    unsigned kinds = 0;
+    if (layers < 1) return;
+    if (!q38_segment_expert_layout(m, (uint32_t)m->range_begin, (uint32_t)m->range_end,
+                                   &per_capacity, &fixed, &kinds))
+        snapshot_expert = per_capacity / (uint64_t)layers;
+    const char *what = kinds == Q38_EXPERT_FP8_BLOCK ? "native FP8" :
+                       kinds == Q38_EXPERT_FP8_EXPANDED ? "FP8 expanded to f32 (Q38_NATIVE_FP8=0)" :
+                       kinds == Q38_EXPERT_BF16 ? (m->native_bf16 ? "BF16" : "BF16 expanded to f32") :
+                       kinds == Q38_EXPERT_F16 || kinds == Q38_EXPERT_F32 ? "f32" : "mixed";
+    uint64_t per_expert = snapshot_expert;
+    char extra[160] = "";
+    if (m->x4) {
+        per_expert = (uint64_t)m->x4->record_bytes;
+        snprintf(extra, sizeof extra, " (the snapshot's %s: %llu bytes)", what,
+                 (unsigned long long)snapshot_expert);
+        what = "int4-g64 from " Q38_INT4_DIR "/";   /* and no FP8 scale bank is built */
+    } else if (fixed) {
+        snprintf(extra, sizeof extra, " + %.1f MiB resident scale bank", fixed / 1048576.0);
+    }
+    if (!per_expert) {
+        fprintf(stderr, "[qwen38] routed experts: %s, size unknown; cache %d/layer\n", what, cap);
+        return;
+    }
+    double full = (double)per_expert * (double)cap * (double)layers;
+    fprintf(stderr, "[qwen38] routed experts: %s, %llu bytes (%.2f MiB) per expert%s; "
+                    "cache %d/layer x %d layers = %.2f GiB full",
+            what, (unsigned long long)per_expert, per_expert / 1048576.0, extra,
+            cap, layers, full / 1073741824.0);
+    double available = compat_mem_available_gb() * 1e9;
+    if (available > 0) {
+        double room = available / ((double)per_expert * (double)layers);
+        int holds = room > (double)c->experts ? c->experts : (int)room;
+        fprintf(stderr, "; %.1f GB available now holds %d/layer", available / 1e9, holds);
+    }
+    fprintf(stderr, "\n");
 }
 
 static int q38_segment_cache_capacity(uint64_t bytes_per_capacity,

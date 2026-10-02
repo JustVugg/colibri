@@ -1033,6 +1033,8 @@ jobs:
         run: make -C c qwen38-tiny-check
       - name: Routed experts as the release ships them (FP8 shards), then the engine on the fake CUDA tier
         run: make -C c qwen38-tiny-fp8-check qwen38-tier-engine-check
+      - name: Routed experts as int4-g64 from the converter's sidecar
+        run: make -C c qwen38-tiny-int4-check
       - name: Repeat the eviction path under ASan and UBSan
         run: |
           cd c
@@ -1040,11 +1042,16 @@ jobs:
           ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
             OMP_NUM_THREADS=2 SNAP=./qwen38_tiny \
             ./qwen38 1 8 ./qwen38_tiny/ref.json > qwen38-san.log 2>&1
-          if grep -qE "ERROR: AddressSanitizer|runtime error:" qwen38-san.log; then
-            cat qwen38-san.log
+          # the int4-g64 sidecar's load and matmul, evicting at cap 1
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+            Q38_EXPERT_INT4=1 OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_int4 \
+            ./qwen38 1 8 ./qwen38_tiny_int4/ref_int4.json > qwen38-san-int4.log 2>&1
+          if grep -qE "ERROR: AddressSanitizer|runtime error:" qwen38-san.log qwen38-san-int4.log; then
+            cat qwen38-san.log qwen38-san-int4.log
             exit 1
           fi
           grep -q "Matching tokens: 8/8" qwen38-san.log
+          grep -q "Matching tokens: 8/8" qwen38-san-int4.log
       - name: Refuse config and tensor-shape disagreement
         run: |
           cd c

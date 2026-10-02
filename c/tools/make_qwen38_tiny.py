@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import json
 import random
+import shutil
 import sys
 from pathlib import Path
 
@@ -220,7 +221,45 @@ def _rewrite_shard_fp8(out: Path, packed):
     print(f"fp8 experts: {len(packed)} matrices rewritten as F8_E4M3 + BF16 weight_scale_inv")
 
 
-def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_experts=False):
+def _int4_experts_in_model(model, out: Path):
+    """Write the int4-g64 sidecar of the fixture just saved, with the converter
+    the real model goes through (tools/convert_qwen38_experts_int4.py), then read its bytes
+    back and put the dequantized experts into the model in place, in float32:
+    every int4 value (code times an f32 scale) is exact there, and the other
+    BF16 weights widen exactly, so the reference computed afterwards is the
+    arithmetic of the sidecar with nothing rounded on the way. In BF16 the
+    reference's own rounding would be larger than the gap it has to see."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import convert_qwen38_experts_int4 as int4
+    from safetensors.numpy import load_file
+    sidecar = Path(int4.convert(str(out), workers=1))
+    model.float()
+    stored = {}
+    for path in sorted(sidecar.glob("*.safetensors")):
+        stored.update(load_file(str(path)))
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name.endswith(".mlp.experts.gate_up_proj"):
+                base = name[: -len("gate_up_proj")]
+                E, twoI, H = param.shape; I = twoI // 2
+                parts = (("gate_proj", slice(0, I), H), ("up_proj", slice(I, twoI), H))
+            elif name.endswith(".mlp.experts.down_proj"):
+                base = name[: -len("down_proj")]
+                E, H, I = param.shape
+                parts = (("down_proj", slice(0, H), I),)
+            else:
+                continue
+            for e in range(E):
+                for kind, rows, cols in parts:
+                    key = f"{base}{e}.{kind}.weight"
+                    codes = int4.unpack_planar(stored[key], cols)
+                    values = int4.dequantize(codes, stored[key + ".qs"])
+                    param.data[e, rows, :] = torch.from_numpy(values)
+    print(f"int4 experts: {sidecar} written, the model now holds its dequantized values")
+
+
+def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_experts=False,
+          int4_experts=False, expert_gain=1.0):
     if max_new < 1:
         raise ValueError("max_new must be at least 1")
     random.seed(seed)
@@ -292,8 +331,25 @@ def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_e
     # save/load round trip (and follows the production arithmetic path).
     model = model.to(dtype=torch.bfloat16)
     model.eval()
+    if expert_gain != 1.0:
+        # At the default initialization the routed experts barely reach the
+        # logits: zeroing them all moves the final logits less than the
+        # oracle's tolerance (cosine 0.99994), so no end-to-end check can see
+        # their arithmetic. With a gain of 3 (applied before any quantization,
+        # so the scaled values simply are the fixture's experts) the int4
+        # fixture's FP8 and int4 references part after the third generated
+        # token, and the token gate itself tells one representation from the
+        # other. At 4 a routing near-tie flips between the C engine and the
+        # reference.
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if ".mlp.experts." in name:
+                    param.mul_(expert_gain)
     packed = _fp8_experts_in_model(model) if fp8_experts else None
     out.mkdir(parents=True, exist_ok=True)
+    # A sidecar left by an earlier run belongs to the weights it was converted
+    # from, and qwen38 picks it up by itself: regenerating the fixture drops it.
+    shutil.rmtree(out / "experts-int4g64", ignore_errors=True)
     model.save_pretrained(str(out), safe_serialization=True)
     if packed:
         _rewrite_shard_fp8(out, packed)
@@ -310,6 +366,7 @@ def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_e
         "transformers_version": transformers.__version__,
         "text_only": True,
         "fp8_experts": bool(fp8_experts),
+        **({"expert_gain": expert_gain} if expert_gain != 1.0 else {}),
         "naming": "upstream Qwen4ExpForCausalLM (no model.language_model prefix)",
         "config_summary": {
             "hidden_size": config.hidden_size,
@@ -326,6 +383,15 @@ def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_e
         ref_path = out / "ref.json"
         ref_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         print(f"Reference written to {ref_path}")
+    if int4_experts:
+        _int4_experts_in_model(model, out)
+        payload["int4_experts"] = True
+        payload["reference_dtype"] = "float32"
+        payload.update(_reference(model, prompt_ids, max_new))
+        if emit_ref:
+            ref_path = out / "ref_int4.json"
+            ref_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            print(f"int4 reference written to {ref_path}")
     print(f"Tiny Qwen3.8 fixture written to {out}")
     print(f"prompt_ids={payload['prompt_ids']}")
     print(f"full_ids={payload['full_ids']}")
@@ -342,10 +408,17 @@ def main():
                         help="routed experts as F8_E4M3 with 128x128 block weight_scale_inv "
                              "sidecars (the release layout); the reference uses the same "
                              "quantized values")
+    parser.add_argument("--expert-gain", type=float, default=1.0,
+                        help="scale the routed experts so they visibly move the logits "
+                             "(the int4 fixture uses 3)")
+    parser.add_argument("--int4-experts", action="store_true",
+                        help="also convert the routed experts to the experts-int4g64/ sidecar "
+                             "and write ref_int4.json, the reference of the dequantized sidecar")
     args = parser.parse_args()
     prompt = [int(x) for x in args.prompt_ids.split(",") if x.strip()] if args.prompt_ids else None
     build(args.out, prompt_ids=prompt, max_new=args.max_new, seed=args.seed, emit_ref=not args.no_ref,
-          fp8_experts=args.fp8_experts)
+          fp8_experts=args.fp8_experts, int4_experts=args.int4_experts,
+          expert_gain=args.expert_gain)
 
 
 if __name__ == "__main__":
