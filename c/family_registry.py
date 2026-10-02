@@ -234,6 +234,9 @@ def _qwen36_layer_types(config, layers, model_dir):
             kinds = meta.get("layer_types")
             if isinstance(kinds, list) and len(kinds) == layers:
                 return kinds
+    if config.get("model_type") == "qwen3_moe":
+        # Qwen3 MoE (Qwen3-Coder-30B-A3B): every layer is attention, no DeltaNet.
+        return ["full_attention"] * layers
     interval = config.get("full_attention_interval")
     if isinstance(interval, int) and not isinstance(interval, bool) and interval >= 1:
         return ["full_attention" if (i + 1) % interval == 0 else "linear_attention"
@@ -253,6 +256,11 @@ def _qwen36_geometry(config, context, _model_dir):
     full = sum(kind == "full_attention" for kind in kinds)
     kv = (full * context * _required_int(config, "num_key_value_heads", "qwen36") *
           _required_int(config, "head_dim", "qwen36") * 2 * 4)
+    if full == layers:
+        # all attention (qwen3_moe): no recurrent state, and no linear_* keys to read
+        if "num_experts" not in config:
+            return PlannerGeometry(kv, 0, 0, 0, dense=True)
+        return PlannerGeometry(kv, 0, 0, _required_int(config, "num_experts", "qwen36"))
     key_heads = _required_int(config, "linear_num_key_heads", "qwen36")
     key_dim = _required_int(config, "linear_key_head_dim", "qwen36")
     value_heads = _required_int(config, "linear_num_value_heads", "qwen36")
@@ -1371,7 +1379,9 @@ FAMILIES = (
         # qwen3_5 / qwen3_5_text: the dense checkpoints of the same architecture
         # (Qwen3.8-27B, #1757). The engine loads their MLP as an ungated shared
         # expert and routes nothing.
-        model_types=("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5", "qwen3_5_text"),
+        # qwen3_moe: Qwen3-Coder-30B-A3B and its REAP prunes, every layer attention,
+        # no shared expert (tools/convert_qwen36.py writes their container).
+        model_types=("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5", "qwen3_5_text", "qwen3_moe"),
         display_name="Qwen3.6-35B-A3B",
         display_scale="35B",
         # Both checkpoints declare qwen3_5_moe_text. Keyed on the three
@@ -1387,6 +1397,13 @@ FAMILIES = (
             DisplayVariant((("num_hidden_layers", 64), ("hidden_size", 5120),
                             ("intermediate_size", 17408)),
                            "Qwen3.8-27B", "27B", model_id="qwen3.8-27b-colibri"),
+            DisplayVariant((("num_hidden_layers", 48),
+                            ("num_experts", 128), ("hidden_size", 2048)),
+                           "Qwen3-Coder-30B-A3B", "30B", model_id="qwen3-coder-30b-a3b-colibri"),
+            DisplayVariant((("num_hidden_layers", 48),
+                            ("num_experts", 103), ("hidden_size", 2048)),
+                           "Qwen3-Coder-REAP-25B-A3B", "25B",
+                           model_id="qwen3-coder-reap-25b-a3b-colibri"),
         ),
         engine_artifact="qwen36",
         engine_aliases=(),

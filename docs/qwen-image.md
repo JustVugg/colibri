@@ -260,6 +260,18 @@ Measured on a server with 8 Zen 4 cores (AVX-512, 8 OpenMP threads), 768x512,
   scores 30.1 dB with them and 35.6 dB without, and by eye the two cannot be
   told apart.
 
+On a GPU, a `make qwenimage VK=1` build with `COLI_VULKAN=1` runs every
+matrix of the transformer through the shared Vulkan backend, in the storage
+`COLI_IMG_BITS` gave it (int8 by default, bf16 or f32) and with every image
+token of a product in one call: the blocks, the prompt's input layers, the
+timestep embedding, the modulation and the output layers. The activations
+stay f32 there, so `COLI_IMG_ACT8` does not apply to those matrices and the
+result is the CPU's `COLI_IMG_ACT8=0` run up to summation order. The text
+encoder (run once per prompt), the VAE and attention stay on the CPU. The
+run ends with one line saying how many products the GPU took. No GPU timing has been measured yet: the path has
+been checked on Lavapipe, a software driver, which tests the numbers and not
+the speed.
+
 Every stage of the engine is checked against the diffusers pipeline: on the
 real checkpoint in f32 the text encoder, all eight denoising steps and the VAE
 agree to about one part in a million, and of the million bytes of the final

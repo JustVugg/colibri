@@ -74,6 +74,10 @@ static int qwen36_max_ctx(void) {
 #ifdef COLI_METAL
 #include "backend_metal.h" /* coli_metal_init: affine pipelines for the store */
 #endif
+#ifdef COLI_VULKAN
+#include "backend_vulkan.h" /* COLI_VULKAN=1: the resident dense trunk on a Vulkan device */
+static int g_vk_ready = 0;
+#endif
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -727,9 +731,17 @@ typedef struct {
 /* q/sc: int8 rows with one scale per row (the classic copy, what the VRAM
  * tier uploads). q4/sg: the same matrix as int4 planar blocks of 64 with one
  * scale per group (COLI_DENSE_BITS=4), the layout the K1b grouped kernel
- * reads; ng = I/64 groups per row. */
-typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng; } QW;
+ * reads; ng = I/64 groups per row.
+ * vk/vk_off: the Vulkan device copy (COLI_VULKAN=1) of whichever of q4, q or w
+ * matmul_d reads, uploaded at the first matmul_d and kept; vk_off = the upload
+ * failed once, this matrix stays on the CPU. Both stay zero without VK=1. */
+typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng;
+                 void *vk; int vk_off; } QW;
 static void qw_free(QW *w) {
+#ifdef COLI_VULKAN
+    if (w->vk) coli_vk_tensor_free((ColiVkTensor *)w->vk);
+    w->vk = NULL; w->vk_off = 0;
+#endif
     free((void*)w->w); free(w->q); free(w->sc); free(w->q4); free(w->sg);
     w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0;
 }
@@ -1294,9 +1306,76 @@ static void qw_quantize(const float *W, int I, int O, const char *tag, QW *out) 
         } else { free(q4); free(sg); }
     }
 }
+#ifdef COLI_VULKAN
+/* COLI_VULKAN=1: a resident dense matrix answers from the Vulkan device, with
+ * the weights the CPU would read, in the order matmul_d picks them: the int4
+ * copy when there is one, else the int8 rows (fmt 1, one scale per row), else
+ * the f32 matrix (fmt 10, COLI_DENSE_I8=0: the reference path). The planar
+ * int4 blocks are not the shader's layout (fmt 4: low nibble = even column),
+ * so they are repacked once at upload, nibble for nibble: the same codes v+8
+ * and the same per-64 scales, nothing requantized. For the quantized copies
+ * only the activation differs from the CPU's default: it stays f32 on the
+ * device, where the integer dot rounds it to int8 (COLI_DENSE_IDOT=0 is the
+ * CPU arm with the same arithmetic); the f32 matrix differs from the CPU only
+ * in the order of the sums. The device copy lives in w->vk from the first
+ * call; a failed upload sets vk_off and the matrix stays on the CPU.
+ * The backend has one command buffer: never from a parallel region. */
+static void vk_q4_planar_to_fmt4(const QW *w, uint8_t *dst) {
+    const int I = w->I, rb = I / 2, ng = I / 64;
+    for (int o = 0; o < w->O; o++) {
+        const uint8_t *src = w->q4 + (size_t)o * rb;
+        uint8_t *row = dst + (size_t)o * rb;
+        for (int g = 0; g < ng; g++)
+            for (int p = 0; p < 32; p++) {
+                int lo = 2 * p, hi = 2 * p + 1;   /* columns g*64+lo, g*64+hi */
+                uint8_t a = lo < 32 ? (src[g * 32 + lo] & 15) : (src[g * 32 + lo - 32] >> 4);
+                uint8_t b = hi < 32 ? (src[g * 32 + hi] & 15) : (src[g * 32 + hi - 32] >> 4);
+                row[g * 32 + p] = (uint8_t)(a | (b << 4));
+            }
+    }
+}
+static unsigned g_vk_placed[3];   /* uploads by format: int8 rows, int4, f32 */
+static int vk_dense_matmul(float *y, const float *x, const QW *w, int S, int I, int O) {
+#ifdef _OPENMP
+    if (omp_in_parallel()) return 0;
+#endif
+    if (w->vk_off || w->I != I || w->O != O || S < 1 || S > 65535) return 0;
+    QW *mw = (QW *)w;   /* vk is a cache in a matrix the forward pass treats as read-only */
+    ColiVkTensor **t = (ColiVkTensor **)&mw->vk;
+    int fmt = w->q4 ? 4 : w->q ? 1 : 10, gs = w->q4 ? 64 : 0;
+    const void *wq = w->q4 ? (const void *)w->q4 : w->q ? (const void *)w->q : (const void *)w->w;
+    const float *sc = w->q4 ? w->sg : w->q ? w->sc : NULL;   /* fmt 10: no scales */
+    if (!wq) return 0;
+    if (!*t) {
+        int ok;
+        if (w->q4) {
+            uint8_t *packed = malloc((size_t)O * (I / 2));
+            if (packed) vk_q4_planar_to_fmt4(w, packed);
+            ok = packed && coli_vk_tensor_ensure(t, packed, sc, fmt, I, O, gs);
+            free(packed);
+        } else ok = coli_vk_tensor_ensure(t, wq, sc, fmt, I, O, gs);
+        if (!ok) { mw->vk_off = 1; return 0; }
+        g_vk_placed[fmt == 1 ? 0 : fmt == 4 ? 1 : 2]++;
+    }
+    return coli_vk_matmul(t, y, x, wq, sc, fmt, S, I, O, gs);
+}
+/* One line at the end of a run or a serve turn: how many matmuls the device
+ * really answered, so a test can tell a used path from an initialised one. */
+static void vk_report(void) {
+    if (!g_vk_ready) return;
+    size_t bytes = 0, tensors = 0;
+    coli_vk_mem_info(&bytes, &tensors);
+    fprintf(stderr, "[VK] qwen36: %llu matmuls on the GPU (%zu matrices resident, %.1f MiB; placed int8 %u, int4 %u, f32 %u)\n",
+            coli_vk_matmul_calls(), tensors, bytes / 1048576.0,
+            g_vk_placed[0], g_vk_placed[1], g_vk_placed[2]);
+}
+#endif
 static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O){
 #ifdef COLI_QWEN_BATCH_TEST
     g_qwen_matmul_d_calls++;
+#endif
+#ifdef COLI_VULKAN
+    if (g_vk_ready && (w->q || w->q4 || w->w) && vk_dense_matmul(y, x, w, S, I, O)) return;
 #endif
     if (w->q || w->q4) {
         if (w->q4 || dense_idot_on()) {
@@ -1449,8 +1528,10 @@ static void validate_cfg(const Cfg *c, int n_layers_from_config) {
                  "topk %d out of range 1..256 (idx[]/val[] in moe())", c->topk);
         CFG_NEED(c->topk <= c->n_experts, "topk %d exceeds num_experts %d",
                  c->topk, c->n_experts);
-        CFG_NEED(c->inter > 0 && c->shared_inter > 0,
-                 "moe_inter %d / shared_inter %d must be positive", c->inter, c->shared_inter);
+        /* shared_inter 0: no shared expert (Qwen3 MoE, qwen3_moe); Qwen3.5/3.6 carry one. */
+        CFG_NEED(c->inter > 0 && c->shared_inter >= 0 && c->shared_inter <= 1 << 20,
+                 "moe_inter %d must be positive and shared_inter %d in 0..1048576",
+                 c->inter, c->shared_inter);
     }
     if (c->vis_depth) {
         CFG_NEED(c->vis_depth > 0 && c->vis_depth <= 64, "vision depth %d out of range", c->vis_depth);
@@ -1731,6 +1812,7 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
     float *p = load_t_n(m, name, (int64_t)I * O);
     out->w = p; out->q = NULL; out->sc = NULL; out->I = I; out->O = O;
     out->q4 = NULL; out->sg = NULL; out->ng = 0;
+    out->vk = NULL; out->vk_off = 0;
     if (!quantize || !dense_i8_on()) return;
     qw_quantize(p, I, O, tag, out);
     if (getenv("COLI_KEEP_F32")) out->w = p; else { free(p); out->w = NULL; }
@@ -1941,15 +2023,17 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         /* shared expert (dense, int8-during-load). A dense model's MLP is the same
          * SwiGLU under mlp.{gate,up,down}_proj, with no gate in front of it. */
         const char *shp = c->n_experts ? "mlp.shared_expert." : "mlp.";
+        if (c->shared_inter > 0) {   /* Qwen3 MoE has none: its sh_* stay empty */
         snprintf(nm,sizeof(nm),"model.layers.%d.%sgate_proj.weight", ai, shp);
         load_tq(m, nm, c->hidden, c->shared_inter, quantize_dense, "shexp", &l->sh_g); QCOUNT(l->sh_g);
         snprintf(nm,sizeof(nm),"model.layers.%d.%sup_proj.weight", ai, shp);
         load_tq(m, nm, c->hidden, c->shared_inter, quantize_dense, "shexp", &l->sh_u); QCOUNT(l->sh_u);
         snprintf(nm,sizeof(nm),"model.layers.%d.%sdown_proj.weight", ai, shp);
         load_tq(m, nm, c->shared_inter, c->hidden, quantize_dense, "shexp", &l->sh_d); QCOUNT(l->sh_d);
+        }
         /* shared_expert_gate: Linear(hidden -> 1), sigmoid-gated shared expert */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert_gate.weight", ai);
-        l->sh_gate = c->n_experts && dense_has(m, nm) ? load_t_n(m, nm, c->hidden) : NULL;
+        l->sh_gate = c->n_experts && c->shared_inter > 0 && dense_has(m, nm) ? load_t_n(m, nm, c->hidden) : NULL;
         if (c->is_attn[i]) {
             /* Gated Attention (full_attention) layer, dense projections int8-during-load */
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_proj.weight", ai);
@@ -2480,7 +2564,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     if (!qtd_batch(l->qth_v, vv, x, S, D, kv_out)) matmul_d(vv, x, &l->v, S, D, kv_out);
     /* split q into query (first hd) and gate (next gate_dim), both per head */
     float *query = falloc((int64_t)S*H*hd);
-    float *gate  = falloc((int64_t)S*H*gate_dim);
+    float *gate  = gate_dim ? falloc((int64_t)S*H*gate_dim) : NULL;   /* qwen3_moe: no gate */
     for (int s = 0; s < S; s++) {
         for (int hh = 0; hh < H; hh++) {
             const float *qs = q + (int64_t)s*q_out + hh*qdim;
@@ -2534,12 +2618,12 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             }
         }
     }
-    /* apply attn_output_gate: attn_out *= sigmoid(gate) */
+    /* apply attn_output_gate: attn_out *= sigmoid(gate). Without a gate (Qwen3 MoE)
+     * the output passes as it is: a missing gate is not sigmoid(0) = 0.5. */
     float *ag = falloc((int64_t)S*H*hd);
     for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) for (int dd = 0; dd < hd; dd++) {
         int o = ((int64_t)s*H + hh)*hd + dd;
-        float g = gate_dim ? gate[o] : 0.f;
-        ag[o] = ctx[o] * (1.f / (1.f + expf(-g)));
+        ag[o] = gate_dim ? ctx[o] * (1.f / (1.f + expf(-gate[o]))) : ctx[o];
     }
     if (!qtd_batch(l->qth_o, out, ag, S, H*hd, D)) matmul_d(out, ag, &l->o, S, H*hd, D);
     free(q); free(k); free(vv); free(query); free(gate); free(ctx); free(ag);
@@ -2569,6 +2653,7 @@ static int qwen_shared_batch_rows(int S, int D, int I) {
 static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
                                     float *out, float *g, float *u, float *hh) {
     Cfg *c=&m->c; int D=c->hidden, I=c->shared_inter;
+    if (I <= 0) return;   /* no shared expert (qwen3_moe) */
     int B=qwen_shared_batch_rows(S,D,I);
     double _ts=tm_now();
     if (B == 1) {
@@ -2901,7 +2986,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
             /* Compute the shared expert NOW so it overlaps with the GPU
              * groups; the common block below is skipped. */
-            {
+            if (c->shared_inter > 0) {
                 double _ts2 = tm_now();
                 int Ish = c->shared_inter;
                 if (!qtd(l->qth_shg, sh, xs, D, Ish))  matmul_d(sh, xs, &l->sh_g, 1, D, Ish);
@@ -4169,6 +4254,9 @@ static void serve_one(Model *m, ServeReq *q){
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n",q->id,gen,
            dt>0?gen/dt:0.0,0.0,rss_gb(),np,limited);
     fflush(stdout);
+#ifdef COLI_VULKAN
+    vk_report();   /* stderr: the wire protocol on stdout is untouched */
+#endif
 }
 
 static void serve_loop(Model *m){
@@ -4369,6 +4457,11 @@ int main(int argc, char **argv) {
     g_expert_gs = m.c.expert_gs;
     if (g_expert_gs) fprintf(stderr, "[qwen36] group-scaled experts: gs=%d\n", g_expert_gs);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
+#ifdef COLI_VULKAN
+    /* After the weights: the dense matrices upload at their first matmul_d.
+     * No device (or COLI_VULKAN unset) leaves g_vk_ready 0, the CPU path. */
+    g_vk_ready = coli_vk_init_env("qwen36");
+#endif
     if (ref_image && ref_image->t == J_OBJ) {
         jval *gh = json_get(ref_image, "grid_h"), *gw = json_get(ref_image, "grid_w");
         jval *pv = json_get(ref_image, "patches");
@@ -4569,6 +4662,9 @@ int main(int argc, char **argv) {
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         route_footer(stdout, &m);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
+#ifdef COLI_VULKAN
+        vk_report();
+#endif
         free(buf); free(arena); return 0;
     }
 
@@ -4651,6 +4747,9 @@ int main(int argc, char **argv) {
            (unsigned long long)m.hits, (unsigned long long)m.miss);
     route_footer(stderr, &m);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
+#ifdef COLI_VULKAN
+    vk_report();
+#endif
     free(buf); free(arena);
     /* Oracle mode is a gate, not a report: a mismatch must fail the caller.
      * inkling.c does the same (`return (match == ngen) ? 0 : 1;`) and its CI

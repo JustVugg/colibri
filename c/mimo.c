@@ -64,6 +64,15 @@
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
+#ifdef COLI_VULKAN
+/* VK=1 and COLI_VULKAN=1: the dense matrices of the trunk and of the vision
+ * tower run on the GPU in whatever form MIMO_DENSE_BITS gave them (FP8, BF16,
+ * int8 or f32), and with MIMO_VK_EXPERTS=N up to N routed experts are kept
+ * there as MXFP4. The router, and every matrix whose upload fails, stays on
+ * the CPU path below. The backend has one command buffer: main thread only. */
+#include "backend_vulkan.h"
+static int g_vk_ready;
+#endif
 
 #define MIMO_MAX_LAYERS 128
 #define MIMO_MAX_TOPK 16
@@ -249,6 +258,8 @@ typedef struct {
     int fmt, O, I, nblk;
     void *w;           /* f32 / bf16 / e4m3 / int8 */
     float *s;          /* FP8: [O][nblk]; I8: [O] */
+    void *vk;          /* COLI_VULKAN: the device copy, uploaded at start-up */
+    int vk_off;        /* its upload failed: this matrix stays on the CPU */
 } DW;
 
 /* 0 (default): the checkpoint's own FP8 and BF16 bytes, exact.
@@ -303,7 +314,57 @@ static void matmul_fp8_rows(float *y, const float *x, const uint8_t *q8, const f
     }
 }
 
+#ifdef COLI_VULKAN
+/* Each form is one of the shader's formats as it is stored, so nothing is
+ * converted on the way up:
+ *   DW_F32   fmt 10, f32 [O, I], no scales
+ *   DW_BF16  fmt 11, bf16 [O, I] (the low half of a word is the even column)
+ *   DW_FP8   fmt 12, e4m3 [O, I] with the per-(row, 128-column block) scales
+ *            rs[O][nblk] that dw_load_fp8 expanded: a group size of 128
+ *   DW_I8    fmt 1, int8 [O, I] and one f32 scale per row after the sum
+ * Every one is f32 weights times f32 activations, as on the CPU; what differs
+ * is the order of the sums (the CPU's FP8 kernel adds its blocks in double). */
+static int vk_main_thread(void) {
+#ifdef _OPENMP
+    return !omp_in_parallel();
+#else
+    return 1;
+#endif
+}
+
+static int dw_vk_fmt(const DW *d, int *gs, const float **sc) {
+    *gs = 0; *sc = NULL;
+    switch (d->fmt) {
+    case DW_F32:  return 10;
+    case DW_BF16: return 11;
+    case DW_FP8:  *gs = 128; *sc = d->s; return 12;
+    case DW_I8:   *sc = d->s; return 1;
+    }
+    return -1;
+}
+
+static int dw_upload(DW *d) {
+    int gs; const float *sc;
+    int fmt = dw_vk_fmt(d, &gs, &sc);
+    if (d->vk || d->vk_off || !d->w) return d->vk != NULL;
+    if (fmt < 0 || !coli_vk_tensor_ensure((ColiVkTensor **)&d->vk, d->w, sc, fmt, d->I, d->O, gs)) d->vk_off = 1;
+    return d->vk != NULL;
+}
+
+static int dw_matmul_vk(float *y, const float *x, int S, const DW *d) {
+    if (!g_vk_ready || d->vk_off || !vk_main_thread()) return 0;
+    DW *dev = (DW *)d;     /* the device copy is a cache inside a read-only matrix */
+    if (!dw_upload(dev)) return 0;
+    int gs; const float *sc;
+    int fmt = dw_vk_fmt(d, &gs, &sc);
+    return coli_vk_matmul((ColiVkTensor **)&dev->vk, y, x, d->w, sc, fmt, S, d->I, d->O, gs);
+}
+#endif
+
 static void dw_matmul(float *y, const float *x, int S, const DW *d) {
+#ifdef COLI_VULKAN
+    if (dw_matmul_vk(y, x, S, d)) return;
+#endif
     switch (d->fmt) {
     case DW_F32:  matmul(y, x, (const float *)d->w, S, d->I, d->O); break;
     case DW_BF16: matmul_bf16(y, x, (const uint16_t *)d->w, S, d->I, d->O); break;
@@ -828,6 +889,106 @@ static void dense_mlp(Model *m, Layer *l, const float *xn, int n, float *out) {
     (void)m;
 }
 
+#ifdef COLI_VULKAN
+/* MIMO_VK_EXPERTS=N (off by default): up to N routed experts are copied to the
+ * GPU the first time they are computed out of the RAM cache, and stay there for
+ * the run. The release's MXFP4 is the shader's fmt 7 byte for byte (e2m1
+ * nibbles, the low nibble the even column, bit 3 the sign, one group per 32
+ * columns); only the e8m0 group exponents widen, to the f32 scales the shader
+ * reads, 2^(e-127) as mx4_scale gives the CPU kernel. The tier never evicts:
+ * the backend's weight arena does not take a freed tensor's memory back, so a
+ * device copy that followed the LRU would leak device memory at every miss.
+ * An expert runs on the GPU only while it is also in the RAM cache, so the CPU
+ * can always take over a call the device refuses. */
+typedef struct { ColiVkTensor *down, *gate, *up; } VkExpert;
+static VkExpert *g_vkx;              /* [layer * n_experts + expert], NULL when off */
+static int g_vkx_left;               /* uploads the budget still allows */
+static int g_vkx_full;               /* an upload failed or the budget is reached: no more */
+static long g_vkx_resident;
+static unsigned long long g_vkx_calls;
+
+/* the device's own budget, when it reports one, with half a GB left over */
+static int vk_budget_full(void) {
+    double used = 0, budget = 0;
+    return coli_vk_mem_budget(&used, &budget) && used >= budget - 0.5;
+}
+
+static VkExpert *vk_expert(Model *m, int li, int eid, const uint8_t *buf) {
+    VkExpert *v = &g_vkx[(int64_t)li * m->c.n_experts + eid];
+    if (v->down) return v;
+    if (g_vkx_full || g_vkx_left <= 0) return NULL;
+    if (vk_budget_full()) {
+        g_vkx_full = 1;
+        fprintf(stderr, "[VK] mimo: device memory budget reached, %ld experts resident\n", g_vkx_resident);
+        return NULL;
+    }
+    int H = m->c.hidden, MI = m->c.moe_inter;
+    const uint8_t *dq = buf, *ds = dq + m->part[0], *gq = ds + m->part[1], *gs = gq + m->part[2],
+                  *uq = gs + m->part[3], *us = uq + m->part[4];
+    int64_t ns = m->part[1] > m->part[3] ? m->part[1] : m->part[3];
+    float *sc = xmalloc((size_t)ns * sizeof(float), "expert scales");
+    for (int64_t i = 0; i < m->part[1]; i++) sc[i] = mx4_scale(ds[i]);
+    int ok = coli_vk_tensor_ensure(&v->down, dq, sc, 7, MI, H, 32);
+    if (ok) {
+        for (int64_t i = 0; i < m->part[3]; i++) sc[i] = mx4_scale(gs[i]);
+        ok = coli_vk_tensor_ensure(&v->gate, gq, sc, 7, H, MI, 32);
+    }
+    if (ok) {
+        for (int64_t i = 0; i < m->part[5]; i++) sc[i] = mx4_scale(us[i]);
+        ok = coli_vk_tensor_ensure(&v->up, uq, sc, 7, H, MI, 32);
+    }
+    free(sc);
+    if (!ok) {
+        coli_vk_tensor_free(v->down); coli_vk_tensor_free(v->gate); coli_vk_tensor_free(v->up);
+        v->down = v->gate = v->up = NULL;
+        g_vkx_full = 1;
+        fprintf(stderr, "[VK] mimo: no room for more experts on the GPU, %ld resident\n", g_vkx_resident);
+        return NULL;
+    }
+    g_vkx_left--;
+    g_vkx_resident++;
+    return v;
+}
+
+/* gate and up of the experts of one group that can run on the GPU; on[j] says
+ * which did, and the CPU tasks skip those */
+static void vk_experts_gate_up(Model *m, int li, const int *eids, int nb, Slot **slots, const int *first,
+                               const float *xg, float *g, float *u, unsigned char *on) {
+    for (int j = 0; j < nb; j++) on[j] = 0;
+    if (!g_vkx || !g_vk_ready || !vk_main_thread()) return;
+    int H = m->c.hidden, MI = m->c.moe_inter;
+    for (int j = 0; j < nb; j++) {
+        int r = first[j + 1] - first[j];
+        if (!r) continue;
+        VkExpert *v = vk_expert(m, li, eids[j], slots[j]->buf);
+        if (!v) continue;
+        const float *x = xg + (size_t)first[j] * H;
+        if (coli_vk_matmul(&v->gate, g + (size_t)first[j] * MI, x, NULL, NULL, 7, r, H, MI, 32) &&
+            coli_vk_matmul(&v->up, u + (size_t)first[j] * MI, x, NULL, NULL, 7, r, H, MI, 32)) {
+            on[j] = 1;
+            g_vkx_calls += 2;
+        }
+    }
+}
+
+/* down of the experts whose gate and up ran on the GPU */
+static void vk_experts_down(Model *m, int li, const int *eids, int nb, const int *first,
+                            const float *g, float *y, const unsigned char *gate_up, unsigned char *on) {
+    for (int j = 0; j < nb; j++) on[j] = 0;
+    int H = m->c.hidden, MI = m->c.moe_inter;
+    for (int j = 0; j < nb; j++) {
+        if (!gate_up[j]) continue;
+        VkExpert *v = &g_vkx[(int64_t)li * m->c.n_experts + eids[j]];
+        int r = first[j + 1] - first[j];
+        if (coli_vk_matmul(&v->down, y + (size_t)first[j] * H, g + (size_t)first[j] * MI, NULL, NULL,
+                           7, r, MI, H, 32)) {
+            on[j] = 1;
+            g_vkx_calls++;
+        }
+    }
+}
+#endif
+
 /* Route every row, then run each chosen expert once over the rows that chose it.
  * `out` [n, H] receives the weighted sum. */
 static void moe(Model *m, int li, const float *xn, int n, float *out) {
@@ -900,11 +1061,18 @@ static void moe(Model *m, int li, const float *xn, int n, float *out) {
         for (int i = 0; i < total; i++) memcpy(xg + (size_t)i * H, xn + (size_t)row[i] * H, (size_t)H * sizeof(float));
         int up_blocks = (MI + BLOCK_ROWS - 1) / BLOCK_ROWS, down_blocks = (H + BLOCK_ROWS - 1) / BLOCK_ROWS;
         int rb_mi = MI / 2, gb_mi = MI / 32, rb_h = H / 2, gb_h = H / 32;
+#ifdef COLI_VULKAN
+        unsigned char vk_gu[4096], vk_dn[4096];
+        vk_experts_gate_up(m, li, uni + b, nb, slots, first, xg, g, u, vk_gu);
+#endif
         #pragma omp parallel for schedule(dynamic, 1)
         for (int task = 0; task < nb * 2 * up_blocks; task++) {
             int j = task / (2 * up_blocks), which = (task / up_blocks) % 2, blk = task % up_blocks;
             int r = first[j + 1] - first[j];
             if (!r) continue;
+#ifdef COLI_VULKAN
+            if (vk_gu[j]) continue;
+#endif
             int o0 = blk * BLOCK_ROWS, rows = MI - o0 < BLOCK_ROWS ? MI - o0 : BLOCK_ROWS;
             const uint8_t *buf = slots[j]->buf;
             const uint8_t *q = buf + m->part[0] + m->part[1] + (which ? m->part[2] + m->part[3] : 0);
@@ -921,11 +1089,17 @@ static void moe(Model *m, int li, const float *xn, int n, float *out) {
             if (scratch != tmp) free(scratch);
         }
         for (size_t i = 0; i < (size_t)total * MI; i++) g[i] = silu(g[i]) * u[i];
+#ifdef COLI_VULKAN
+        vk_experts_down(m, li, uni + b, nb, first, g, y, vk_gu, vk_dn);
+#endif
         #pragma omp parallel for schedule(dynamic, 1)
         for (int task = 0; task < nb * down_blocks; task++) {
             int j = task / down_blocks, blk = task % down_blocks;
             int r = first[j + 1] - first[j];
             if (!r) continue;
+#ifdef COLI_VULKAN
+            if (vk_dn[j]) continue;
+#endif
             int o0 = blk * BLOCK_ROWS, rows = H - o0 < BLOCK_ROWS ? H - o0 : BLOCK_ROWS;
             const uint8_t *dq = slots[j]->buf, *ds = dq + m->part[0];
             float tmp[4 * 256];
@@ -1034,6 +1208,29 @@ static void prefill(Model *m, const int *ids, int n, float *logits, float *all_l
 typedef struct Vision Vision;
 static Vision *g_vision;
 #include "mimo_vision.h"
+
+#ifdef COLI_VULKAN
+/* The dense matrices go up first, at start-up, the trunk before the tower, so
+ * the experts take only what they leave; one that does not fit stays on the
+ * CPU. Returns how many went up. */
+static int vk_dense_upload(Model *m) {
+    int n = 0;
+    for (int li = 0; li < m->c.n_layers; li++) {
+        Layer *l = &m->L[li];
+        n += dw_upload(&l->qkv) + dw_upload(&l->o);
+        if (!m->c.moe[li]) n += dw_upload(&l->gate) + dw_upload(&l->up) + dw_upload(&l->down);
+    }
+    n += dw_upload(&m->head);
+    if (g_vision) {
+        Vision *v = g_vision;
+        n += dw_upload(&v->embed) + dw_upload(&v->fc1) + dw_upload(&v->fc2);
+        for (int i = 0; i < v->depth; i++)
+            n += dw_upload(&v->b[i].qkv) + dw_upload(&v->b[i].proj) + dw_upload(&v->b[i].gate) +
+                 dw_upload(&v->b[i].up) + dw_upload(&v->b[i].down);
+    }
+    return n;
+}
+#endif
 
 /* --------------------------------------------------------------- sampling ---- */
 
@@ -1280,6 +1477,18 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
 
 /* ------------------------------------------------------------------- main ---- */
 
+/* Once, at the end: how many products the GPU actually took, so a run that
+ * asked for Vulkan and quietly stayed on the CPU says so. */
+static void vk_report(void) {
+#ifdef COLI_VULKAN
+    if (!g_vk_ready) return;
+    fprintf(stderr, "[VK] mimo: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
+    if (g_vkx)
+        fprintf(stderr, "[VK] mimo: %ld experts resident on the GPU, %llu of those matmuls were theirs\n",
+                g_vkx_resident, g_vkx_calls);
+#endif
+}
+
 static int parse_ids(const char *text, int *out, int cap) {
     int n = 0;
     const char *p = text;
@@ -1330,6 +1539,21 @@ int main(int argc, char **argv) {
     model_load(m, dir, cap);
     Cfg *c = &m->c;
     g_vision = vision_load(m, dir);
+#ifdef COLI_VULKAN
+    /* after the weights, so a missing device costs one line and nothing else */
+    g_vk_ready = coli_vk_init_env("mimo");
+    if (g_vk_ready) {
+        int up = vk_dense_upload(m);
+        size_t used = 0, count = 0;
+        coli_vk_mem_info(&used, &count);
+        fprintf(stderr, "[VK] mimo: %d dense matrices on the GPU (%.2f GB)\n", up, used / 1e9);
+    }
+    int vk_experts = env_int("MIMO_VK_EXPERTS", 0);
+    if (g_vk_ready && vk_experts > 0) {
+        g_vkx = xcalloc((size_t)c->n_layers * c->n_experts, sizeof(VkExpert), "GPU experts");
+        g_vkx_left = vk_experts;
+    }
+#endif
     int swa = 0, shown_cap = 0;
     for (int i = 0; i < c->n_layers; i++) { swa += c->swa[i]; if (c->moe[i] && !shown_cap) shown_cap = m->cache[i].cap; }
     fprintf(stderr, "[mimo] %d layers (%d sliding window %d, %d full), %d experts top-%d, cache %d/layer, "
@@ -1349,6 +1573,7 @@ int main(int argc, char **argv) {
     if (env_int("SERVE", 0)) {
         if (!have_tok) { fprintf(stderr, "[mimo] SERVE needs %s\n", tok_path); return 1; }
         serve_loop(m, &tokenizer, dir);
+        vk_report();
         return 0;
     }
     int *ids = xmalloc(((size_t)m->ctx + 1) * sizeof(int), "ids");
@@ -1424,5 +1649,6 @@ int main(int argc, char **argv) {
             (unsigned long long)m->hits, (unsigned long long)m->miss, m->bytes_read / 1e6, rss_gb(),
             m->t_disk, m->t_disk > 0 ? m->bytes_read / 1e9 / m->t_disk : 0.0, m->t_expert, m->t_attn,
             total - m->t_disk - m->t_expert - m->t_attn);
+    vk_report();
     return 0;
 }

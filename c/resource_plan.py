@@ -295,6 +295,48 @@ def analyze_model(model):
     return result
 
 
+QWEN38_INT4_SIDECAR = "experts-int4g64"
+
+
+def qwen38_int4_sidecar(info):
+    """Price Qwen3.8's routed experts as qwen38 will hold them.
+
+    tools/convert_qwen38_experts_int4.py writes <model>/experts-int4g64/, and
+    the engine loads every routed expert from it instead of the FP8 shards
+    when its index says it is complete (Q38_EXPERT_INT4=0 keeps FP8). One of
+    its records is 56% of an FP8 expert, so pricing the cache with FP8 bytes
+    would hand the engine a cap for half the RAM it was given. Only the index
+    is read here; the engine validates the files themselves and refuses a
+    sidecar that disagrees with it. Returns the analysis unchanged when the
+    sidecar does not apply, otherwise a copy priced with its records and
+    marked `qwen38_int4_experts`: no FP8 scale bank is built either.
+    """
+    resolved = info["resolved_family"]
+    if resolved.descriptor.id != "qwen38" or os.environ.get("Q38_EXPERT_INT4") == "0":
+        return info
+    try:
+        index = json.loads((Path(info["path"]) / QWEN38_INT4_SIDECAR / "index.json")
+                           .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return info
+    config = info["config"]
+    text = config.get("text_config", config) if isinstance(config, dict) else {}
+    want = {"format": "colibri.qwen38.experts-int4g64", "version": 1, "complete": True,
+            "layers": text.get("num_hidden_layers"), "experts": text.get("num_experts"),
+            "hidden_size": text.get("hidden_size"),
+            "moe_intermediate_size": text.get("moe_intermediate_size")}
+    record = index.get("record_bytes") if isinstance(index, dict) else None
+    if (any(index.get(key) != value for key, value in want.items()) or
+            isinstance(record, bool) or not isinstance(record, int) or record < 1):
+        return info
+    per_layer = {layer: record for layer in info["expert_bytes_by_layer"]}
+    return dict(info,
+                expert_bytes=record * want["experts"] * len(per_layer),
+                typical_expert_bytes=record, max_expert_bytes=record,
+                expert_bytes_by_layer=per_layer, per_cap_bytes=record * len(per_layer),
+                expert_fixed_bytes=0, qwen38_int4_experts=True)
+
+
 #: MEMORYSTATUSEX as Windows defines it, in order. Kept as data so a test can
 #: pin the order without a Windows machine.
 WINDOWS_MEMORYSTATUSEX_FIELDS = (
@@ -1489,10 +1531,18 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                kv_slots=1):
     if policy not in POLICIES:
         raise ValueError(f"unknown policy: {policy}")
-    info = analyze_model(model)
+    info = qwen38_int4_sidecar(analyze_model(model))
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
     cpu_sockets = cpu_socket_count() if cpu_sockets is None else cpu_sockets
     resolved = info["resolved_family"]
+    if info.get("qwen38_int4_experts"):
+        # qwen38's CUDA tier streams FP8 experts only and stays off when the
+        # int4-g64 sidecar is in use (trunk included): plan the CPU.
+        if gpu_indices or vram_gb > 0:
+            raise ValueError(
+                "Qwen3.8 int4-g64 experts (experts-int4g64/) run on the CPU; "
+                "Q38_EXPERT_INT4=0 gives the GPU tier the FP8 experts")
+        gpus = []
     if not resolved.descriptor.supports_accelerator:
         if gpu_indices:
             raise ValueError(

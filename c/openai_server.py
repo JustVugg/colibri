@@ -1023,7 +1023,7 @@ def _parse_arch_tool_calls(reply, tools, tool_reply, track_spans):
             _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
             return reply.strip(), calls, None, None
         return parse_k3_tool_calls(reply, tools) + (None, None)  # pre-#1147 engines
-    if chat_flavor() in ("qwen36", "qwen38"):
+    if chat_flavor() in ("qwen36", "qwen38", "qwen3_coder"):
         return parse_qwen_tool_calls(reply, tools) + (None, None)
     if ARCH == "mimo":
         return parse_mimo_tool_calls(reply, tools) + (None, None)
@@ -1085,6 +1085,9 @@ def detect_chat_flavor(family_id, model_dir):
         # the line that makes a template Qwen3.8's: reasoning is on by default, at xhigh
         if "reasoning_effort|default('xhigh')" in text:
             return "qwen38"
+        # Qwen3-Coder (qwen3_moe): its own XML tool block, no thinking
+        if "interact with a computer to solve tasks" in text:
+            return "qwen3_coder"
     return None
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
@@ -1932,6 +1935,162 @@ def _qwen_tool_calls(tool_calls, has_content, index):
     return "".join(out)
 
 
+QWEN3_CODER_SYSTEM = ("You are Qwen, a helpful AI assistant that can interact with a computer "
+                      "to solve tasks.")
+QWEN3_CODER_TOOL_RULES = (
+    "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:"
+    "\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\n"
+    "value_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second "
+    "parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n"
+    "<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner "
+    "<function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+    "- Required parameters MUST be specified\n- You may provide optional reasoning for your "
+    "function call in natural language BEFORE the function call, but NOT after\n- If there is "
+    "no function call available, answer the question like normal with your current knowledge "
+    "and do not tell the user about function calls\n</IMPORTANT>")
+
+
+def _jinja_string(value):
+    """jinja's `string` filter: a str as it is, anything else through str()."""
+    return value if isinstance(value, str) else str(value)
+
+
+def _qwen3_coder_extra_keys(fields, handled):
+    """The template's render_extra_keys macro: every key it does not name, in order."""
+    if not isinstance(fields, dict):
+        return ""
+    out = []
+    for key, value in fields.items():
+        if key in handled:
+            continue
+        shown = (json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list, tuple))
+                 else _jinja_string(value))
+        out.append(f"\n<{key}>{shown}</{key}>")
+    return "".join(out)
+
+
+def _qwen3_coder_tool_block(tools):
+    """Qwen3-Coder's `# Tools` section: each function as XML, its parameters one by one."""
+    out = ["\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>"]
+    for index, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise APIError(400, "Each tool must be an object.", f"tools.{index}")
+        fn = tool["function"] if isinstance(tool.get("function"), dict) else tool
+        out.append(f"\n<function>\n<name>{_jinja_string(fn.get('name', ''))}</name>")
+        if "description" in fn:
+            out.append(f"\n<description>{_jinja_string(fn['description']).strip()}</description>")
+        out.append("\n<parameters>")
+        params = fn.get("parameters")
+        if isinstance(params, dict) and isinstance(params.get("properties"), dict):
+            for name, field in params["properties"].items():
+                out.append(f"\n<parameter>\n<name>{name}</name>")
+                if isinstance(field, dict) and "type" in field:
+                    out.append(f"\n<type>{_jinja_string(field['type'])}</type>")
+                if isinstance(field, dict) and "description" in field:
+                    out.append(f"\n<description>{_jinja_string(field['description']).strip()}"
+                               "</description>")
+                out.append(_qwen3_coder_extra_keys(field, ("name", "type", "description")))
+                out.append("\n</parameter>")
+        out.append(_qwen3_coder_extra_keys(params, ("type", "properties")))
+        out.append("\n</parameters>")
+        out.append(_qwen3_coder_extra_keys(fn, ("type", "name", "description", "parameters")))
+        out.append("\n</function>")
+    out.append("\n</tools>")
+    out.append(QWEN3_CODER_TOOL_RULES)
+    return "".join(out)
+
+
+def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generation_prompt=True):
+    """Qwen3-Coder's chat_template (qwen3_moe), byte for byte: ChatML with a newline after
+    every <|im_end|>, no thinking at all, the system turn carrying the client's system text
+    and then the XML `# Tools` block (with the template's own system line when the client
+    sent none), assistant calls as <tool_call><function=...><parameter=...>, and runs of
+    `tool` messages sharing one user turn of <tool_response> blocks.
+
+    Tool-call arguments sent as a JSON string, the OpenAI shape, are read as the object the
+    template expects. add_generation_prompt=False leaves a trailing assistant turn open."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tool_choice == "none":
+        tools = None
+    if tools is not None and not isinstance(tools, list):
+        raise APIError(400, "`tools` must be an array.", "tools")
+    parts = []
+    first = messages[0]
+    start = 0
+    system = None
+    if isinstance(first, dict) and first.get("role") in ("system", "developer"):
+        raw = first.get("content")
+        system = content_text(raw, "messages.0.content") if raw is not None else ""
+        start = 1
+    if system is not None:
+        parts.append("<|im_start|>system\n" + system)
+    elif tools:
+        parts.append("<|im_start|>system\n" + QWEN3_CODER_SYSTEM)
+    if tools:
+        parts.append(_qwen3_coder_tool_block(tools))
+    if system is not None or tools:
+        parts.append("<|im_end|>\n")
+    loop = messages[start:]
+    for offset, message in enumerate(loop):
+        index = start + offset
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role == "developer":
+            role = "system"
+        if role not in ("system", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        calls = message.get("tool_calls") if role == "assistant" else None
+        if calls is not None and not isinstance(calls, list):
+            raise APIError(400, "`tool_calls` must be an array.", f"messages.{index}.tool_calls")
+        if not add_generation_prompt and role == "assistant" and not calls and \
+                offset == len(loop) - 1:
+            parts.append(f"<|im_start|>assistant\n{text}")     # continued, still open
+            continue
+        if calls:
+            parts.append("<|im_start|>assistant")
+            if text.strip():
+                parts.append("\n" + text.strip() + "\n")
+            for position, call in enumerate(calls):
+                where = f"messages.{index}.tool_calls.{position}"
+                fn = call.get("function", call) if isinstance(call, dict) else None
+                if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+                    raise APIError(400, "Each tool call needs a `function.name`.", where)
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args) if args.strip() else {}
+                    except ValueError:
+                        raise APIError(400, "`function.arguments` must be a JSON object.",
+                                       f"{where}.function.arguments")
+                if not isinstance(args, dict):
+                    raise APIError(400, "`function.arguments` must be a JSON object.",
+                                   f"{where}.function.arguments")
+                parts.append(f"\n<tool_call>\n<function={fn['name']}>\n")
+                for key, value in args.items():
+                    shown = (json.dumps(value, ensure_ascii=False)
+                             if isinstance(value, (dict, list, tuple)) else _jinja_string(value))
+                    parts.append(f"<parameter={key}>\n{shown}\n</parameter>\n")
+                parts.append("</function>\n</tool_call>")
+            parts.append("<|im_end|>\n")
+        elif role == "tool":
+            previous = loop[offset - 1] if offset > 0 else None
+            if isinstance(previous, dict) and previous.get("role") != "tool":
+                parts.append("<|im_start|>user\n")
+            parts.append(f"<tool_response>\n{text}\n</tool_response>\n")
+            following = loop[offset + 1] if offset + 1 < len(loop) else None
+            if following is None or (isinstance(following, dict) and following.get("role") != "tool"):
+                parts.append("<|im_end|>\n")
+        else:
+            parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
+    if add_generation_prompt:
+        parts.append("<|im_start|>assistant\n")
+    return "".join(parts)
+
+
 QWEN_CALL_RE = re.compile(
     r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)</function>\s*</tool_call>", re.S)
 QWEN_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
@@ -1962,6 +2121,10 @@ def parse_qwen_tool_calls(reply, tools=None):
             kind = declared.get("type") if isinstance(declared, dict) else None
             if kind in (None, "string"):
                 args[key] = raw
+            elif kind == "boolean" and raw.strip().lower() in ("true", "false"):
+                # The templates print a bool through jinja's `string`, so the model
+                # writes `True`; Qwen's own parser reads it case-insensitively.
+                args[key] = raw.strip().lower() == "true"
             else:
                 try:
                     args[key] = json.loads(raw)
@@ -3236,6 +3399,8 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if chat_flavor() == "qwen38":
         return render_chat_qwen38(messages, enable_thinking, reasoning_effort, tools,
                                   tool_choice, add_generation_prompt)
+    if chat_flavor() == "qwen3_coder":
+        return render_chat_qwen3_coder(messages, tools, tool_choice, add_generation_prompt)
     if ARCH == "qwen36":
         return render_chat_qwen(messages, enable_thinking, reasoning_effort, tools,
                                 tool_choice, add_generation_prompt, preserve_thinking)
@@ -7001,7 +7166,8 @@ class APIHandler(BaseHTTPRequestHandler):
         enable_thinking = body.get("enable_thinking", reasoning_effort not in (None, "none"))
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
-        if ARCH == "olmoe" and enable_thinking:
+        if (ARCH == "olmoe" or chat_flavor() == "qwen3_coder") and enable_thinking:
+            # Qwen3-Coder's template has no thinking mode either (no <think> anywhere).
             # OLMoE's template has no thinking mode (render_chat_olmoe: "accepted
             # but unused"), so the engine never emits <think>/</think>. Left on,
             # the reasoning splitter files the ENTIRE answer as reasoning_content
@@ -7115,7 +7281,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 enable_thinking = True
             elif os.environ.get("COLI_THINK", "0") == "1":
                 enable_thinking = True
-        if ARCH == "olmoe":
+        if ARCH == "olmoe" or chat_flavor() == "qwen3_coder":
             enable_thinking = False   # #984: OLMoE has no thinking mode (see the OpenAI path)
         if body.get("max_tokens") is None:
             raise APIError(400, "`max_tokens` is required.", "max_tokens")

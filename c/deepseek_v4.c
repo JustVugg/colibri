@@ -3292,6 +3292,18 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
         return set_error(error, error_size, "missing compressor tensor for %s", state->prefix);
     float *kv_row = state->kv_state + (size_t)state_row * projection;
     float *score_row = state->score_state + (size_t)state_row * projection;
+#ifdef COLI_VULKAN
+    /* wkv and wgate on the Vulkan device (bf16, fmt 11) when it takes both; the
+     * ape bias is added here exactly as the loop below adds it. */
+    if (coli_v4_vk_matmul &&
+        coli_v4_vk_matmul(11, wkv, NULL, 0, projection, hidden, kv_row, input, 1) == 0 &&
+        coli_v4_vk_matmul(11, wgate, NULL, 0, projection, hidden, score_row, input, 1) == 0) {
+        for (int row = 0; row < projection; row++)
+            score_row[row] += ape[(size_t)slot * projection + row];
+        return compressor_pool_and_emit(state, output, produced, position,
+                                        error, error_size);
+    }
+#endif
     #pragma omp parallel for
     for (int row = 0; row < projection; row++) {
         float kv_sum = 0.0f, gate_sum = 0.0f;
@@ -6136,6 +6148,18 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
         return set_error(error, error_size, "missing compressor tensor for %s", state->prefix);
     float *kv_row = state->kv_state + (size_t)state_row * projection;
     float *score_row = state->score_state + (size_t)state_row * projection;
+#ifdef COLI_VULKAN
+    /* wkv and wgate on the Vulkan device (bf16, fmt 11) when it takes both; the
+     * ape bias is added here exactly as the loop below adds it. */
+    if (coli_v4_vk_matmul &&
+        coli_v4_vk_matmul(11, wkv, NULL, 0, projection, hidden, kv_row, input, 1) == 0 &&
+        coli_v4_vk_matmul(11, wgate, NULL, 0, projection, hidden, score_row, input, 1) == 0) {
+        for (int row = 0; row < projection; row++)
+            score_row[row] += ape[(size_t)slot * projection + row];
+        return compressor_pool_and_emit(state, output, produced, position,
+                                        error, error_size);
+    }
+#endif
     #pragma omp parallel for
     for (int row = 0; row < projection; row++) {
         float kv_sum = 0.0f, gate_sum = 0.0f;
@@ -9380,6 +9404,9 @@ int coli_v4_expert_forward_batch_ref(float *outputs,
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef COLI_VULKAN
+#include "native_quant.h"   /* coli_v4_vk_matmul */
+#endif
 
 static float route_bf16_decode(uint16_t value) {
     uint32_t bits = (uint32_t)value << 16;
@@ -9410,9 +9437,20 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
         if (!on_stack) { free(selected); free(selection); free(scores); }
         return -1;
     }
+#ifdef COLI_VULKAN
+    /* The gate's logits on the Vulkan device when it takes them (bf16, fmt 11):
+     * they land in `scores` and each is read back before it is overwritten. */
+    int on_device = coli_v4_vk_matmul &&
+                    coli_v4_vk_matmul(11, gate, NULL, 0, experts, dimension,
+                                      scores, hidden, 1) == 0;
+#endif
     for (int expert = 0; expert < experts; expert++) {
         float sum = 0.0f;
         const uint16_t *row = gate + (size_t)expert * dimension;
+#ifdef COLI_VULKAN
+        if (on_device) sum = scores[expert];
+        else
+#endif
         for (int column = 0; column < dimension; column++)
             sum += route_bf16_decode(row[column]) * hidden[column];
         scores[expert] = sqrtf(route_softplus(sum));
@@ -11807,6 +11845,196 @@ static int final_hidden(float *output, const float *state,
     return 0;
 }
 
+/* Vulkan for the engine binary (Makefile.deepseek-v4 VK=1, COLI_VULKAN=1 at run
+ * time). The backend is touched from this unit only: it is the one the binary and
+ * its serve test link, while the parent Makefile links other units into its own
+ * tests without backend_vulkan. The units that multiply reach the device through
+ * the coli_v4_vk_matmul pointer (native_quant.h), which v4_vk_open sets.
+ *
+ * What goes up: the matrices the engine keeps for its whole life. Dense layers in
+ * resident mode, fp8 as fmt 12 (rows unpacked from the AVX2 rows8 tiles, each
+ * 128x128 block scale written out for its 128 rows) and bf16 as fmt 11, and the
+ * resident bf16 head. A weight is looked up by its pointer, and a pointer is taken
+ * only when it lies inside one of those allocations: the reference loader's
+ * per-forward copies (the --oracle path, any non-resident run), the DSpark stages'
+ * own buffers and the streamed routed experts stay on the CPU, so a freed buffer can
+ * never be mistaken for a cached one. The indexer's weights_proj (bf16, heads x
+ * hidden) is multiplied inline inside per-token OpenMP loops and stays there too.
+ * One command buffer: calls come from the thread that opened the device and never
+ * from inside an OpenMP region. */
+#ifdef COLI_VULKAN
+#include "backend_vulkan.h"
+#include <pthread.h>
+
+static int g_v4_vk_ready = 0;
+static const ColiV4Engine *g_v4_vk_engine;
+static pthread_t g_v4_vk_thread;
+typedef struct {
+    const void *data;
+    int fmt, rows, columns, refused;
+    ColiVkTensor *tensor;
+} V4VkEntry;
+static V4VkEntry *g_v4_vk_map;
+static size_t g_v4_vk_cap, g_v4_vk_used;
+
+static size_t v4_vk_hash(const void *data, size_t cap) {
+    uint64_t h = (uint64_t)(uintptr_t)data * 0x9E3779B97F4A7C15ull;
+    return (size_t)(h >> 20) & (cap - 1);
+}
+
+static V4VkEntry *v4_vk_find(const void *data, int fmt, int rows, int columns) {
+    if (!g_v4_vk_cap) return NULL;
+    for (size_t at = v4_vk_hash(data, g_v4_vk_cap);; at = (at + 1) & (g_v4_vk_cap - 1)) {
+        V4VkEntry *e = &g_v4_vk_map[at];
+        if (!e->data) return NULL;
+        if (e->data == data && e->fmt == fmt && e->rows == rows && e->columns == columns)
+            return e;
+    }
+}
+
+static V4VkEntry *v4_vk_insert(const void *data, int fmt, int rows, int columns) {
+    if ((g_v4_vk_used + 1) * 2 > g_v4_vk_cap) {
+        size_t cap = g_v4_vk_cap ? g_v4_vk_cap * 2 : 256;
+        V4VkEntry *map = calloc(cap, sizeof(*map));
+        if (!map) return NULL;
+        for (size_t i = 0; i < g_v4_vk_cap; i++) {
+            if (!g_v4_vk_map[i].data) continue;
+            size_t at = v4_vk_hash(g_v4_vk_map[i].data, cap);
+            while (map[at].data) at = (at + 1) & (cap - 1);
+            map[at] = g_v4_vk_map[i];
+        }
+        free(g_v4_vk_map);
+        g_v4_vk_map = map;
+        g_v4_vk_cap = cap;
+    }
+    size_t at = v4_vk_hash(data, g_v4_vk_cap);
+    while (g_v4_vk_map[at].data) at = (at + 1) & (g_v4_vk_cap - 1);
+    g_v4_vk_map[at] = (V4VkEntry){data, fmt, rows, columns, 0, NULL};
+    g_v4_vk_used++;
+    return &g_v4_vk_map[at];
+}
+
+/* Bytes a resident layer tensor occupies (E8M0 scales are held as f32). */
+static size_t v4_vk_spec_bytes(const ColiDeepSeekV4TensorSpec *spec) {
+    size_t count = 1;
+    for (int axis = 0; axis < spec->rank; axis++) count *= (size_t)spec->shape[axis];
+    switch (spec->dtype) {
+    case COLI_ST_BF16: return count * 2;
+    case COLI_ST_F8_E4M3: return count;
+    case COLI_ST_F8_E8M0:
+    case COLI_ST_F32: return count * 4;
+    default: return 0;
+    }
+}
+
+static int v4_vk_within(const void *data, size_t bytes, const void *base, size_t size) {
+    uintptr_t p = (uintptr_t)data, b = (uintptr_t)base;
+    return base && p >= b && bytes <= size && p - b <= size - bytes;
+}
+
+/* 1 when [data, data + bytes) lies in memory the engine keeps until it closes. */
+static int v4_vk_resident(const void *data, size_t bytes) {
+    const ColiV4Engine *e = g_v4_vk_engine;
+    if (!e) return 0;
+    if (v4_vk_within(data, bytes, e->head_cache.data, (size_t)e->head_cache.bytes))
+        return 1;
+    for (int layer = 0; layer < COLI_V4_RESIDENT_MAX_LAYERS; layer++) {
+        if (!e->dense_resident.ready[layer]) continue;
+        const ColiDeepSeekV4LayerWeights *w = &e->dense_resident.layers[layer];
+        for (size_t i = 0; i < w->plan.tensor_count; i++)
+            if (v4_vk_within(data, bytes, w->data[i],
+                             v4_vk_spec_bytes(&w->plan.tensors[i])))
+                return 1;
+    }
+    return 0;
+}
+
+static int v4_vk_matmul_impl(int fmt, const void *data, const float *scales,
+                             int rows8, int rows, int columns, float *output,
+                             const float *input, int batch) {
+    if (!g_v4_vk_ready || !data || batch < 1 || rows < 1 || columns < 1 ||
+        !pthread_equal(pthread_self(), g_v4_vk_thread)) return -1;
+#ifdef _OPENMP
+    if (omp_in_parallel()) return -1;
+#endif
+    if (fmt != 11 && fmt != 12) return -1;
+    if (fmt == 12 && (!scales || columns % 128 || (rows8 && rows % 8))) return -1;
+    V4VkEntry *e = v4_vk_find(data, fmt, rows, columns);
+    if (e && e->refused) return -1;
+    if (e && e->tensor)
+        return coli_vk_matmul(&e->tensor, output, input, NULL, NULL, fmt, batch,
+                              columns, rows, fmt == 12 ? 128 : 0) ? 0 : -1;
+    size_t bytes = (size_t)rows * columns * (fmt == 11 ? 2 : 1);
+    if (!v4_vk_resident(data, bytes)) return -1;
+    if (!e && !(e = v4_vk_insert(data, fmt, rows, columns))) return -1;
+    /* First use: the device copy is made from a row-major matrix and one f32
+     * scale per 128 inputs of every row, the layout fmt 12 reads. */
+    const unsigned char *weights = data;
+    unsigned char *unpacked = NULL;
+    float *expanded = NULL;
+    if (fmt == 12) {
+        int groups = columns / 128;
+        expanded = malloc((size_t)rows * groups * sizeof(float));
+        if (rows8) unpacked = malloc((size_t)rows * columns);
+        if (!expanded || (rows8 && !unpacked)) {
+            free(expanded); free(unpacked);
+            return -1;
+        }
+        for (int row = 0; row < rows; row++)
+            memcpy(expanded + (size_t)row * groups,
+                   scales + (size_t)(row / 128) * groups, (size_t)groups * sizeof(float));
+        if (rows8) {
+            const unsigned char *packed = data;
+            for (int tile = 0; tile < rows / 8; tile++)
+                for (int column = 0; column < columns; column++)
+                    for (int lane = 0; lane < 8; lane++)
+                        unpacked[((size_t)tile * 8 + lane) * columns + column] =
+                            packed[((size_t)tile * columns + column) * 8 + lane];
+            weights = unpacked;
+        }
+    }
+    int ok = coli_vk_matmul(&e->tensor, output, input, weights, expanded, fmt, batch,
+                            columns, rows, fmt == 12 ? 128 : 0);
+    free(unpacked);
+    free(expanded);
+    if (!ok && !e->tensor) e->refused = 1;   /* no device room: CPU from now on */
+    return ok ? 0 : -1;
+}
+#endif
+
+static void v4_vk_open(const ColiV4Engine *engine) {
+#ifdef COLI_VULKAN
+    g_v4_vk_thread = pthread_self();
+    g_v4_vk_engine = engine;
+    g_v4_vk_ready = coli_vk_init_env("deepseek_v4");
+    if (g_v4_vk_ready) coli_v4_vk_matmul = v4_vk_matmul_impl;
+#else
+    (void)engine;
+#endif
+}
+
+/* Once, at the end: what ran on the device, then the device copies go before the
+ * engine frees the weights they mirror. */
+static void v4_vk_close(void) {
+#ifdef COLI_VULKAN
+    if (!g_v4_vk_ready) return;
+    size_t bytes = 0, tensors = 0;
+    coli_vk_mem_info(&bytes, &tensors);
+    fprintf(stderr, "[VK] deepseek_v4: %llu matmuls on the GPU\n",
+            coli_vk_matmul_calls());
+    fprintf(stderr, "[VK] deepseek_v4: %zu resident matrices on the device, %.1f MiB "
+                    "(fp8 as fmt 12, bf16 as fmt 11)\n", tensors, bytes / 1048576.0);
+    coli_v4_vk_matmul = NULL;
+    for (size_t i = 0; i < g_v4_vk_cap; i++)
+        coli_vk_tensor_free(g_v4_vk_map[i].tensor);
+    free(g_v4_vk_map);
+    g_v4_vk_map = NULL;
+    g_v4_vk_cap = g_v4_vk_used = 0;
+    g_v4_vk_engine = NULL;
+    g_v4_vk_ready = 0;
+#endif
+}
+
 static float head_bf16_dot(const uint16_t *weight, const float *hidden,
                            int dimension) {
     float sum = 0.0f;
@@ -11881,6 +12109,11 @@ static int head_scores_impl(ColiV4Engine *engine, const float *hidden,
      * Each row retains the same scalar accumulation order and the final scan
      * retains vocabulary order, so logits/tie-breaking do not change. */
     if (resident) {
+#ifdef COLI_VULKAN
+        if (coli_v4_vk_matmul &&
+            coli_v4_vk_matmul(11, resident, NULL, 0, vocab, d, scores, hidden, 1) == 0)
+            return 0;
+#endif
         #pragma omp parallel for schedule(static)
         for (int row = 0; row < vocab; row++) {
             const uint16_t *weight = resident + (size_t)row * d;
@@ -11971,6 +12204,13 @@ static int head_argmax_batch(ColiV4Engine *engine, const float *hidden,
     }
     float *scores = malloc((size_t)vocab * batch * sizeof(*scores));
     if (!scores) return -1;
+#ifdef COLI_VULKAN
+    /* scores is [batch][vocab], which is the device's y[S, O]. */
+    int on_device = coli_v4_vk_matmul &&
+                    coli_v4_vk_matmul(11, resident, NULL, 0, vocab, d, scores,
+                                      hidden, batch) == 0;
+    if (!on_device)
+#endif
     #pragma omp parallel for schedule(static)
     for (int row = 0; row < vocab; row++) {
         const uint16_t *weight = resident + (size_t)row * d;
@@ -14546,6 +14786,7 @@ static int v4_serve_main(void) {
         fprintf(stderr, "%s\n", error);
         return 1;
     }
+    v4_vk_open(engine);
     context = engine->runtime.context_tokens;
     if (coli_v4_session_create(
             &session, engine,
@@ -14590,6 +14831,7 @@ static int v4_serve_main(void) {
             if (fatal < 0) break;
         }
     }
+    v4_vk_close();
     coli_v4_session_destroy(session);
     coli_v4_engine_destroy(engine);
     return 0;
@@ -14682,6 +14924,7 @@ int main(int argc, char **argv) {
             goto cleanup;
         }
     }
+    v4_vk_open(engine);
     config = *coli_v4_engine_config(engine);
     index = coli_v4_engine_target_index(engine);
     experts = coli_v4_engine_expert_store(engine);
@@ -14941,6 +15184,7 @@ int main(int argc, char **argv) {
     }
     result = 0;
 cleanup:
+    v4_vk_close();
     v4_generate_cleanup(session, prompt_storage, engine, attention,
                         layers, prompt_ids, generated, state, next, hidden,
                         text, full_ids, tf_pred, tf_state,
@@ -17121,6 +17365,14 @@ static int fp8_matvec_compute(float *output, const ColiTensorView *weight,
     return 0;
 }
 
+#ifdef COLI_VULKAN
+/* NULL until the engine binary opens a Vulkan device (see native_quant.h). The
+ * fp8 entries below try it after the CUDA tier and after the activation has been
+ * rounded to E4M3 per 128, so the device multiplies exactly what the CPU kernel
+ * would; only the order of the sums differs. */
+ColiV4VkMatmul coli_v4_vk_matmul;
+#endif
+
 int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input) {
     if (!output || !input || fp8_matvec_validate(weight))
@@ -17143,6 +17395,9 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
                                     input, columns, 128) != 0) {
         return -1;
     }
+#ifdef COLI_VULKAN
+    if (coli_v4_vk_fp8(output, weight, activation, 1)) return 0;
+#endif
     return fp8_matvec_compute(output, weight, activation);
 }
 
@@ -17161,6 +17416,9 @@ int coli_fp8_matvec_pre(float *output, const ColiTensorView *weight,
 #ifdef COLI_V4_GPU_TIER
     if (weight->gpu && coli_v4_gpu_fp8_matvec(weight, output, input) == 0)
         return 0;
+#endif
+#ifdef COLI_VULKAN
+    if (coli_v4_vk_fp8(output, weight, activation, 1)) return 0;
 #endif
     return fp8_matvec_compute(output, weight, activation);
 }
@@ -17272,6 +17530,10 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
                                     input, columns, 128) != 0) {
         return -1;
     }
+#ifdef COLI_VULKAN
+    if (coli_v4_vk_fp8(output_a, a, activation, 1) &&
+        coli_v4_vk_fp8(output_b, b, activation, 1)) return 0;
+#endif
 #ifdef __AVX2__
     if (a->block_rows == 8) {
         if (rows % 8) {
@@ -17392,6 +17654,9 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                 inputs + (size_t)item * columns, columns, 128) != 0) {
             return -1;
         }
+#ifdef COLI_VULKAN
+    if (coli_v4_vk_fp8(outputs, weight, activations, batch)) return 0;
+#endif
     return fp8_batch_compute(outputs, weight, activations, batch);
 }
 
@@ -17410,6 +17675,9 @@ int coli_fp8_matmul_batch_pre(float *outputs, const ColiTensorView *weight,
     if (weight->gpu &&
         coli_v4_gpu_fp8_matmul_batch(weight, outputs, inputs, batch) == 0)
         return 0;
+#endif
+#ifdef COLI_VULKAN
+    if (coli_v4_vk_fp8(outputs, weight, activations, batch)) return 0;
 #endif
     return fp8_batch_compute(outputs, weight, activations, batch);
 }

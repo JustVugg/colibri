@@ -17,7 +17,7 @@ what follows, but the sister engines read their own:
 | `kimi_k3` | `c/kimi_k3.c` | the `K3_*` family — see [Kimi K3 engine](#kimi-k3-engine-kimi_k3) |
 | `inkling` | `c/inkling.c` | `INK_*`, plus `CTX_MAX`, `PIN_N`, `REP_PEN`, `GPU_DEV`, `NOGPU` — see [Inkling engine](#inkling-engine-inkling) |
 | `qwen36` | `c/qwen36.c` | `QWEN_*`, `Q36_*`, its dense/CUDA-tier controls, and the `CACHE_ROUTE` family (VRAM tier over RAM cache) — see [Qwen3.6 engine](#qwen36-engine-qwen36) |
-| `qwen38` | `c/qwen38.c` | `Q38_MAXT`, `Q38_EOS`, `Q38_NATIVE_FP8`, `Q38_NATIVE_BF16`, `Q38_PREFILL_BATCH`, `Q38_TRUNK_CPU_INT8`, `Q38_FP8_KERNEL`, `COLI_TIMERS` — see [Qwen3.8 engine](#qwen38-engine-qwen38) |
+| `qwen38` | `c/qwen38.c` | `Q38_MAXT`, `Q38_EOS`, `Q38_NATIVE_FP8`, `Q38_NATIVE_BF16`, `Q38_EXPERT_INT4`, `Q38_PREFILL_BATCH`, `Q38_TRUNK_CPU_INT8`, `Q38_FP8_KERNEL`, `COLI_TIMERS` — see [Qwen3.8 engine](#qwen38-engine-qwen38) |
 | `olmoe` | `c/olmoe.c` | `HOT`, `WIDE`, `SMOOTH`, `CONF_LIMIT`, `MAX_NEW`, `CHAT`, `EXPERT_DROP`, `WARMUP` — see [OLMoE engine](#olmoe-engine-olmoe) |
 | `deepseek_v4` | `c/deepseek_v4.c` | `CTX`, the `V4_*` / `DSV4_*` families and the two `COLI_CUDA_*_BATCH` gates — see [DeepSeek V4 engine](#deepseek-v4-engine-deepseek_v4); note that the CUDA section below describes `colibri.c` knobs (`COLI_CUDA`, `CUDA_DENSE`, ...) which the V4 engine does not read — its GPU switch is `DSV4_CUDA` |
 | `deepseek_v41` | `c/deepseek_v41.c` | the `V41_*` family: see [DeepSeek V4.1 engine](#deepseek-v41-engine-deepseek_v41) |
@@ -140,7 +140,7 @@ What each engine can do:
 | `kimi_k3` | `K3_MMAP=1`: every prepared matrix mapped, LM head included. The embedding is read one row per token in any case. CPU only. | Cache of at least one slot per layer (`K3_EXPERT_GB`). |
 | `deepseek_v4` | Automatic: when the dense trunk or the BF16 head does not fit in `RAM_GB`, it is read from disk again on every use. The `ram_tiers` line on stderr says `dense=streamed`. | Cache of at least the top-k slots per layer. |
 | `glm53` | Resident (`GLM53_BITS` picks 4, 8 or 32 bits). | `COLI_MAP_EXPERTS=1`: views of a per-shard mapping, CPU runs only. |
-| `qwen38` | Resident (`Q38_TRUNK_CPU_INT8` keeps it as int8). | `COLI_MAP_EXPERTS=1`, native FP8 experts. |
+| `qwen38` | Resident (`Q38_TRUNK_CPU_INT8` keeps it as int8). | `COLI_MAP_EXPERTS=1`, native FP8 experts or the int4-g64 sidecar's records. |
 | `qwen36`, `inkling`, `deepseek_v41`, `olmoe` | Resident. | Cache of at least one slot per layer. |
 
 A mapped weight costs a disk read whenever the OS has evicted it, so in the
@@ -214,7 +214,7 @@ Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRE
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_VULKAN` | off | Enable the Vulkan backend. Requires a `make VK=1` build; fails at startup (no silent fallback) if libvulkan or the compiled shaders are missing. |
+| `COLI_VULKAN` | off | Enable the Vulkan backend. Requires a `make VK=1` build. The GLM engine fails at startup (no silent fallback) if libvulkan or the compiled shaders are missing. The other engines (qwen36, qwen38, inkling, olmoe, deepseek_v41, deepseek_v4, mimo, qwenimage) print one line and run on the CPU. What each one puts on the device: [vulkan.md](vulkan.md#the-other-engines). |
 | `COLI_VK_DEV` | unset | Select the primary Vulkan physical-device enumeration index. Without it, the backend prefers a discrete GPU, then integrated/virtual devices. |
 | `COLI_VK_SHADERS` | auto | Path to the compiled `qmatmul.spv` **or** the directory holding the `.spv` set; the other shaders are found next to it. Unset: `shaders/` next to the binary, then CWD-relative `shaders/qmatmul.spv`. |
 | `COLI_VK_EXPERTS` | `320` | Pinned VRAM expert tier size: top-N experts by `.coli_usage` heat uploaded once at startup and served from VRAM with no RAM slot or disk read. `0` disables the tier (experts stay on the CPU path). ~19 MB VRAM per int4 expert. |
@@ -444,9 +444,10 @@ checkpoint layout and the text-only capability boundary.
 | `Q38_EOS` | tokenizer/config stop IDs | Override the served end-of-sequence token ID for controlled experiments. Normally the engine stops on the tokenizer's `<|im_end|>` / `<|endoftext|>` IDs, falling back to `eos_token_id`. |
 | `Q38_NATIVE_FP8` | `1` (on) | Keep routed E4M3 expert bytes and their F32 128×128 block scales native in the LRU. `=0` restores expanded-FP32 slots for A/B validation. |
 | `Q38_NATIVE_BF16` | `1` (on) | Keep resident and routed BF16 matrices in two-byte storage while retaining FP32 activations/accumulation. `=0` restores the expanded-FP32 reference. |
+| `Q38_EXPERT_INT4` | auto | Routed experts from `<snap>/experts-int4g64/`, the int4-g64 sidecar `tools/convert_qwen38_experts_int4.py` writes next to the FP8 shards: 2.76 MB per expert instead of 4.92 MB, so the same RAM holds 1.78x the experts and a miss reads 56% of the bytes. Unset: used when its `index.json` says the conversion is complete (an incomplete one is skipped with a line on stderr; one that disagrees with the model is refused). `=0` keeps the snapshot's FP8 experts; `=1` refuses to start without a complete sidecar. The CUDA expert tier streams FP8 only and stays off with int4 experts; `coli plan` / `--auto-tier` size the cap with the sidecar's records. See [qwen38.md](qwen38.md#routed-experts-as-int4-g64). |
 | `Q38_PREFILL_BATCH` | `1` (on) | Route prompt rows in bounded expert-major chunks and batch resident shared-expert/DeltaNet projections. `=0` restores row-at-a-time prompt execution for A/B diagnosis; decode is unchanged. |
 | `Q38_TRUNK_CPU_INT8` | `1` (on) | The dense trunk (DeltaNet and attention projections, hyper-connection mixers, shared expert, router, lm_head; every matrix of at least `Q38_TRUNK_MIN_KB`) is kept on the CPU as int8 rows with one scale per row and the BF16 copy is released; `q38_weight_matmul` quantizes the activation to int8 and uses the integer kernels of `idot.h` for decode and prefill. `=0` keeps the BF16 rows and the f32 kernel (the numeric reference). See [qwen38.md](qwen38.md#the-trunk-on-the-cpu-int8-rows). |
-| `COLI_MAP_EXPERTS` | `0` | Point the native-FP8 routed-expert slots at a read-only mapping of their shard instead of copying 14 MB per miss into a slab. Same variable as in `glm53`. |
+| `COLI_MAP_EXPERTS` | `0` | Point the native-FP8 routed-expert slots (or the int4-g64 sidecar's records) at a read-only mapping of their shard instead of copying 14 MB per miss into a slab. Same variable as in `glm53`. |
 | `Q38_FP8_KERNEL` | vector | The routed experts' e4m3 blocks are decoded eight at a time in registers and multiplied with FMA (AVX2 builds); `scalar` restores `quant.h`'s table kernel, which differs only by float summation order inside a block. |
 | `COLI_TIMERS` | `0` (off) | Set to `1` for the detailed Qwen3.8 phase breakdown on stderr. The shared per-request `PROF` frame is emitted regardless. |
 
@@ -512,6 +513,8 @@ Read **only** by `c/mimo.c` (and `MIMO_MAX_IMAGE_TOKENS` by the gateway). See [m
 | `MIMO_TRACE` | unset | MiMo, oracle: dump the residual after every sublayer of the first block. |
 | `MIMO_DIRS` | unset | MiMo: extra directories holding shards. |
 | `MIMO_STATS` | unset | MiMo: report the vision tower's time per picture. |
+| `COLI_VULKAN` | `0` | MiMo, `VK=1` build: the dense matrices of the trunk and of the vision tower run on the GPU in their `MIMO_DENSE_BITS` form (FP8 and BF16, int8 or f32). The router stays on the CPU. |
+| `MIMO_VK_EXPERTS` | `0` | MiMo, with `COLI_VULKAN=1`: keep up to this many routed experts (MXFP4) on the GPU once they have run from the RAM cache; never evicted, capped by the device's memory budget. |
 
 ## OLMoE engine (`olmoe`)
 

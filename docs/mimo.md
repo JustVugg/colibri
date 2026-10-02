@@ -29,6 +29,16 @@ make -C c mimo
 coli chat --model ~/Models/MiMo-V2.6-Flash
 ```
 
+Pro is the same engine and the same commands. Three files of the release are never
+loaded (the DFlash drafter, the audio tokenizer and the MTP layer, 9.9 GB together),
+so the download can skip them, 563.6 GB instead of 573.5:
+
+```sh
+hf download XiaomiMiMo/MiMo-V2.6-Pro-MOPD --local-dir ~/Models/MiMo-V2.6-Pro \
+  --exclude "dflash/*" --exclude "audio_tokenizer/*" --exclude "model_mtp.safetensors"
+coli chat --model ~/Models/MiMo-V2.6-Pro --ram 54
+```
+
 `coli chat`, `coli serve` and `coli web` size the expert cache from the resource plan
 when `--cap` is omitted; `--ram N` gives it a budget. The standalone engine takes the
 cache (experts per layer) as its first argument, and never goes below one routing
@@ -109,6 +119,19 @@ Measured on MiMo-V2.6-Flash-MOPD:
 The ViT's 252 output rows for that picture differ from Xiaomi's by at most 3.7e-5
 (relative 1.6e-5), and the gateway's patches equal the official processor's exactly.
 
+On MiMo-V2.6-Pro-MOPD, with the same tool and the same 25-token prompt:
+
+| | argmax | max logit difference | max KL |
+|---|---|---|---|
+| 2 layers | 25/25 | 1.2e-6 of the logit range | 7.3e-11 |
+| 8 layers | 25/25 | 1.3e-6 of the logit range | 8.9e-11 |
+| 16 layers | 25/25 | 2.2e-6 of the logit range | 3.9e-10 |
+| 32 layers | 25/25 | 4.9e-6 of the logit range | 1.5e-10 |
+
+The reference holds the dense weights in f32, which for all 70 layers of Pro is about
+80 GiB, so the comparison stops at 32 of the 70 layers, which fit in the 61 GiB of
+the test machine.
+
 ## Measured
 
 Ryzen 7 PRO 8700GE (8 cores, 16 threads), 64 GB DDR5, NVMe RAID, Linux, with nothing
@@ -146,6 +169,43 @@ colibri's Qwen-Image the model answers with its text, word for word. The same in
 
 ![MiMo-V2.6 Flash in coli web, reading a picture made by Qwen-Image](media/mimo-web.png)
 
+### Pro
+
+The dense weights stay resident; from the checkpoint headers, what the engine holds:
+
+| | as released (exact) | int8 (`MIMO_DENSE_BITS=8`) | f32 |
+|---|---|---|---|
+| attention output projection (BF16) | 13.1 GiB | 6.6 GiB | 26.3 GiB |
+| attention qkv (FP8) | 11.2 GiB | 10.9 GiB | 43.5 GiB |
+| embeddings, head, vision tower, router, layer-0 MLP | 5.8 GiB | 4.2 GiB | 9.8 GiB |
+| **total** | **30.2 GiB** | **21.7 GiB** | **79.6 GiB** |
+
+Each cached expert is 18.9 MiB, so one slot per layer over the 69 MoE layers is
+1.27 GiB. The KV cache covers only the 10 full-attention layers (the other 60 keep a
+ring of 128 positions): 0.78 GiB at an 8k context.
+
+The same machine, prompt and 128 tokens as the Flash table above:
+
+| experts cached per layer | dense weights | decode | last 64 tokens | resident | expert reads |
+|---|---|---|---|---|---|
+| 12 | as released (exact) | 0.66 tok/s | 0.66 tok/s | 48.0 GB | 1,056 GB |
+| 20 | int8 (`MIMO_DENSE_BITS=8`) | 0.79 tok/s | 0.79 tok/s | 50.7 GB | 955 GB |
+
+- Loading takes 16.5 s with the dense weights as released and 39 s in int8 (they are
+  quantized at load); the 33-token prompt from a cold cache about 32 s.
+- Expert reads run at 10 GB/s, and they are most of the time: with 12 to 20 of 384
+  experts cached per layer only 32 to 39% of the routed experts are already resident,
+  so a token reads about 6 GB. Attention comes next, because every token reads all
+  the dense weights; int8 shortens both, with fewer dense bytes and more RAM left
+  for the cache.
+
+Through the gateway (`coli serve --ram 54`, which plans 11 experts per layer), on the
+real Pro: thinking off and on, the same tool call with the integer typed as declared,
+streaming, and the Qwen-Image picture read back word for word; `coli chat` with the
+picture's path at the start of the line, and `coli web` with the upload button:
+
+![MiMo-V2.6 Pro in coli web, reading a picture made by Qwen-Image](media/mimo-pro-web.png)
+
 ## Environment
 
 | Variable | Default | Effect |
@@ -161,3 +221,5 @@ colibri's Qwen-Image the model answers with its text, word for word. The same in
 | `MIMO_LOGITS` | unset | Oracle: dump every prompt position's logits (f32) to this file. |
 | `MIMO_TRACE` | unset | Oracle: dump the residual after every sublayer of the first block. |
 | `MIMO_DIRS` | unset | Extra directories holding shards (multi-disk). |
+| `COLI_VULKAN` | 0 | 1, in a `make mimo VK=1` build: the dense matrices (qkv, o_proj, the dense MLP, lm_head, and the vision tower's) are uploaded at start-up and run on the GPU in the form `MIMO_DENSE_BITS` gave them: FP8 with its 128-column block scales and BF16 by default, int8 with 8, f32 with 32. The router stays on the CPU, so the experts chosen and read from disk are the CPU's. A matrix that does not fit stays on the CPU. |
+| `MIMO_VK_EXPERTS` | 0 | With `COLI_VULKAN=1`: up to this many routed experts are copied to the GPU, as the release's MXFP4, the first time they run from the RAM cache, and stay there for the rest of the run; uploads stop at this count or when the device's memory budget (less half a GB) is reached. 0 keeps every expert on the CPU. |

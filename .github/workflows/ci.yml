@@ -143,6 +143,50 @@ jobs:
           grep -q "expert tier active" vk.log || {
             echo "FAIL: Vulkan initialised but the expert tier did not activate"; exit 1; }
           echo "OK: shaders compiled, device negotiated, expert tier active"
+      - name: Every qmatmul weight format against a CPU reference
+        run: |
+          cd c
+          # int8, int4, grouped int4, int3, f32, bf16 and fp8-e4m3, through the staged,
+          # batched and unstaged paths and odd widths, before any engine is involved.
+          bash tests/vulkan_engines.sh shader
+
+  # Every engine with a Vulkan hook, run twice on its tiny fixture: on the CPU and on
+  # Lavapipe, with the same snapshot and settings. The gate is the CPU's tokens (and
+  # the engine's own oracle where the configuration is the one it was built for) plus
+  # a non-zero "[VK] <engine>: N matmuls on the GPU": a hook that declined every
+  # matrix would otherwise pass. One leg per family keeps each under its timeout.
+  vulkan-engines:
+    name: Vulkan engines (${{ matrix.family }}, Lavapipe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - family: qwen
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: inkling-olmoe
+            req: c/tools/oracle-requirements.txt
+          - family: mimo-qwenimage
+            req: c/tools/requirements-qwenimage-tiny.txt
+          - family: deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow   # the V4.1 fixture's reference and its vision tower
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: ${{ matrix.req }}
+      - name: Install the Vulkan toolchain, Lavapipe and the fixture dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan-dev glslc mesa-vulkan-drivers
+          pip install -r ${{ matrix.req }} ${{ matrix.extra }}
+      - name: CPU against Vulkan, engine by engine
+        run: bash c/tests/vulkan_engines.sh ${{ matrix.family }}
 
   musl:
     name: musl libc (Alpine)
@@ -504,6 +548,28 @@ jobs:
             echo "::group::2.4T geometry cap=$cap"
             COLI_DENSE_I8=0 SNAP=qwen38_2p4t_tiny_c \
               ./qwen36 "$cap" 8 qwen38_2p4t_tiny/ref_full.json
+            echo "::endgroup::"
+          done
+      - name: "Qwen3-Coder geometry: qwen3_moe, every layer attention, no shared expert"
+        run: |
+          cd c
+          # Qwen/Qwen3-Coder-30B-A3B-Instruct is Qwen3MoeForCausalLM: no DeltaNet, no
+          # attention output gate, no shared expert, full rotary and plain RMSNorm
+          # weights. The fixture draws its norms around 1 so a container that applied
+          # them zero-centered could not pass, and the converter has to say so in the
+          # meta; the engine runs it token for token against transformers.
+          python3 tools/make_qwen36_tiny.py --geometry qwen3-coder-30b \
+                  --out qwen3_coder_tiny --ref-mode full \
+                  --emit-ref qwen3_coder_tiny/ref_full.json
+          python3 tools/convert_qwen36.py --model qwen3_coder_tiny \
+                  --out qwen3_coder_tiny_c --ebits 8
+          python3 -c "import json; m = json.load(open('qwen3_coder_tiny_c/qwen36_meta.json')); \
+                      assert (m['shared_inter'], m['zero_centered_norms'], m['partial_rotary_factor'], \
+                              set(m['layer_types'])) == (0, False, 1.0, {'full_attention'}), m"
+          for cap in 1 8; do
+            echo "::group::Qwen3-Coder geometry cap=$cap"
+            COLI_DENSE_I8=0 SNAP=qwen3_coder_tiny_c \
+              ./qwen36 "$cap" 8 qwen3_coder_tiny/ref_full.json
             echo "::endgroup::"
           done
       - name: "Qwen3.8-27B geometry: a dense checkpoint of the same architecture (#1757)"
@@ -967,6 +1033,8 @@ jobs:
         run: make -C c qwen38-tiny-check
       - name: Routed experts as the release ships them (FP8 shards), then the engine on the fake CUDA tier
         run: make -C c qwen38-tiny-fp8-check qwen38-tier-engine-check
+      - name: Routed experts as int4-g64 from the converter's sidecar
+        run: make -C c qwen38-tiny-int4-check
       - name: Repeat the eviction path under ASan and UBSan
         run: |
           cd c
@@ -974,11 +1042,16 @@ jobs:
           ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
             OMP_NUM_THREADS=2 SNAP=./qwen38_tiny \
             ./qwen38 1 8 ./qwen38_tiny/ref.json > qwen38-san.log 2>&1
-          if grep -qE "ERROR: AddressSanitizer|runtime error:" qwen38-san.log; then
-            cat qwen38-san.log
+          # the int4-g64 sidecar's load and matmul, evicting at cap 1
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+            Q38_EXPERT_INT4=1 OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_int4 \
+            ./qwen38 1 8 ./qwen38_tiny_int4/ref_int4.json > qwen38-san-int4.log 2>&1
+          if grep -qE "ERROR: AddressSanitizer|runtime error:" qwen38-san.log qwen38-san-int4.log; then
+            cat qwen38-san.log qwen38-san-int4.log
             exit 1
           fi
           grep -q "Matching tokens: 8/8" qwen38-san.log
+          grep -q "Matching tokens: 8/8" qwen38-san-int4.log
       - name: Refuse config and tensor-shape disagreement
         run: |
           cd c

@@ -979,7 +979,7 @@ memInfo.free:                     23.50 GB (97%)
         self.assertEqual(plan["tiers"]["vram"]["devices"], [])
         self.assertIn("not detected", plan["warnings"][0])
 
-    def test_qwen38_plan_prices_heterogeneous_cache_exports_cap_and_plans_vram(self):
+    def write_qwen38(self):
         config = {
             "model_type": "qwen4_exp",
             "text_config": {
@@ -1021,6 +1021,10 @@ memInfo.free:                     23.50 GB (97%)
                 f"model.layers.0.mlp.experts.1.{projection}.weight", 128, "F32"
             ))
         write_shard(self.model / "model.safetensors", tensors)
+
+    def test_qwen38_plan_prices_heterogeneous_cache_exports_cap_and_plans_vram(self):
+        self.write_qwen38()
+        MiB = 1 << 20
         analysis = analyze_model(self.model)
         self.assertEqual(analysis["dense_bytes"], 256 + 4 * MiB + 1024 + 4 * MiB)
         # The stage-1 trunk offload: int8 bytes of the offered matrices only.
@@ -1073,6 +1077,46 @@ memInfo.free:                     23.50 GB (97%)
         tiny = build_plan(self.model, context=64, vram_gb=0.001, available_memory=16 * GB,
                           available_disk=16 * GB, gpus=[gpu])
         self.assertEqual(tiny["tiers"]["vram"]["trunk_bytes"], 0)
+
+    def test_qwen38_int4_sidecar_prices_the_cache_with_its_records(self):
+        # tools/convert_qwen38_experts_int4.py's index for this geometry
+        # (2 layers, 2 experts, hidden 8, moe_intermediate 4): codes 16+16+16
+        # bytes, scales (4+4+8) floats -> 112 bytes per expert.
+        self.write_qwen38()
+        sidecar = self.model / "experts-int4g64"
+        sidecar.mkdir()
+        index = {"format": "colibri.qwen38.experts-int4g64", "version": 1, "complete": True,
+                 "layers": 2, "experts": 2, "hidden_size": 8, "moe_intermediate_size": 4,
+                 "record_bytes": 112}
+        (sidecar / "index.json").write_text(json.dumps(index))
+        gpu = {"index": 0, "name": "unrelated", "total_bytes": 16 * GB,
+               "free_bytes": 14 * GB, "unified_memory": True}
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("Q38_EXPERT_INT4", None)
+            plan = build_plan(self.model, context=64, available_memory=16 * GB,
+                              available_disk=16 * GB, gpus=[gpu])
+            model = plan["model"]
+            self.assertTrue(model["qwen38_int4_experts"])
+            self.assertEqual((model["per_cap_bytes"], model["expert_bytes"],
+                              model["expert_fixed_bytes"]), (112, 224, 0))
+            # the engine's tier declines int4 experts, so nothing is planned on the GPU
+            self.assertEqual(plan["tiers"]["vram"]["devices"], [])
+            self.assertNotIn("COLI_CUDA", environment_for_plan(plan))
+            with self.assertRaisesRegex(ValueError, "run on the CPU"):
+                build_plan(self.model, context=64, gpu_indices=[0], available_memory=16 * GB,
+                           available_disk=16 * GB, gpus=[gpu])
+            # what the engine would not use is not priced: FP8 forced, or a
+            # conversion still running
+            os.environ["Q38_EXPERT_INT4"] = "0"
+            forced = build_plan(self.model, context=64, available_memory=16 * GB,
+                                available_disk=16 * GB, gpus=[])
+            self.assertEqual(forced["model"]["per_cap_bytes"], 384)
+            os.environ.pop("Q38_EXPERT_INT4")
+            (sidecar / "index.json").write_text(json.dumps(dict(index, complete=False)))
+            partial = build_plan(self.model, context=64, available_memory=16 * GB,
+                                 available_disk=16 * GB, gpus=[])
+            self.assertNotIn("qwen38_int4_experts", partial["model"])
+            self.assertEqual(partial["model"]["per_cap_bytes"], 384)
 
     def test_cli_emits_versioned_json(self):
         cli = Path(__file__).parents[1] / "coli"

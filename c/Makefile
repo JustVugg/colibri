@@ -1011,9 +1011,12 @@ gemm-test: tests/test_gemm_largebatch.mm backend_metal.mm backend_metal.h affine
 # the tiny hybrid stack. Needs QWEN36_QPACK_FIXTURE=<dir> pointing at a real
 # swiftlet-repack output of tiny-model-q4; without it the binary skips with a
 # distinct marker instead of pretending to pass.
-qwen36-metal-test: tests/test_qwen36_qpack_metal.c qwen36.c qwen36_qpack.c qwen36_qpack.h qpack.c qpack.h affine_quant.h qwen36_tier.h st.h json.h compat.h backend_metal.o
-	$(CC) $(CFLAGS) -DCOLI_METAL -DQWEN36_QPACK tests/test_qwen36_qpack_metal.c qwen36_qpack.c qpack.c backend_metal.o -o qwen36_qpack_metal_test -framework Metal -framework Foundation -lc++ $(LDFLAGS)
+# The binary has a rule of its own, named after it, so VK=1 can list $(VK_OBJ) as
+# a prerequisite of the link that needs it (qwen36.c calls the backend).
+qwen36-metal-test: qwen36_qpack_metal_test
 	./qwen36_qpack_metal_test
+qwen36_qpack_metal_test: tests/test_qwen36_qpack_metal.c qwen36.c qwen36_qpack.c qwen36_qpack.h qpack.c qpack.h affine_quant.h qwen36_tier.h st.h json.h compat.h backend_metal.o $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_METAL -DQWEN36_QPACK tests/test_qwen36_qpack_metal.c qwen36_qpack.c qpack.c backend_metal.o $(VK_OBJ) -o qwen36_qpack_metal_test -framework Metal -framework Foundation -lc++ $(LDFLAGS)
 
 # fmt=6 (E8/IQ3) encoder for tools/convert_fp8_to_int4.py. OPTIONAL: iq3_pack.py
 # falls back to its numpy path when the library is absent, producing the same
@@ -1181,8 +1184,8 @@ tests/bench_cuda_resident_batch$(EXE): tests/bench_cuda_resident_batch.cu backen
 # the GPU sits idle. Same guard #783 put on kimi_k3, which since gaining an
 # MXFP4 expert path no longer needs it. tests/test_makefile_cuda_scope.py
 # asserts this shape.
-olmoe$(EXE): olmoe.c
-	$(CC) $(NOCUDA_CFLAGS) olmoe.c -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
+olmoe$(EXE): olmoe.c $(VK_OBJ) $(VK_SPV)
+	$(CC) $(NOCUDA_CFLAGS) olmoe.c $(VK_OBJ) -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
 # MoE). With CUDA=1 the optional VRAM expert tier (qwen36_tier.c) is compiled
@@ -1236,8 +1239,8 @@ qpack.o: qpack.c .build-config
 	$(CC) $(QWEN36_CFLAGS) -c qpack.c -o $@
 # Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
 # be reported as up to date despite selecting the Windows CUDA DLL tier.
-qwen36$(EXE): qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) .build-config
-	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
+qwen36$(EXE): qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # Qwen-Image-2.1 text-to-image (docs/qwen-image.md). It reads the diffusers
 # checkpoint as it is: no conversion step. qi_gemm.h is its one matrix kernel.
@@ -1245,8 +1248,8 @@ ifneq ($(EXE),)
 .PHONY: qwenimage
 qwenimage: qwenimage$(EXE)
 endif
-qwenimage$(EXE): qwenimage.c .build-config
-	$(CC) $(CFLAGS) qwenimage.c -o qwenimage$(EXE) $(LDFLAGS)
+qwenimage$(EXE): qwenimage.c $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) qwenimage.c $(VK_OBJ) -o qwenimage$(EXE) $(LDFLAGS)
 
 # In make check: every format and ragged edges against the naive product, and
 # the int8 x int8 VNNI path against the exact integer sum.
@@ -1256,8 +1259,8 @@ tests/test_qi_gemm$(EXE): tests/test_qi_gemm.c
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
 # stream from the official checkpoint and quant.h's mxfp4 kernel reads them as they
 # are, so there is no conversion target here to go with it.
-deepseek_v41$(EXE): deepseek_v41.c .build-config
-	$(CC) $(CFLAGS) deepseek_v41.c -o deepseek_v41$(EXE) $(LDFLAGS)
+deepseek_v41$(EXE): deepseek_v41.c $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) deepseek_v41.c $(VK_OBJ) -o deepseek_v41$(EXE) $(LDFLAGS)
 
 # Xiaomi MiMo-V2.6 (Flash 309B, Pro 1.02T): one file plus its ViT header, reading the
 # release as it is -- MXFP4 experts streamed per layer, FP8/BF16 dense resident.
@@ -1265,8 +1268,8 @@ ifneq ($(EXE),)
 .PHONY: mimo
 mimo: mimo$(EXE)
 endif
-mimo$(EXE): mimo.c .build-config
-	$(CC) $(CFLAGS) mimo.c -o mimo$(EXE) $(LDFLAGS)
+mimo$(EXE): mimo.c $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) mimo.c $(VK_OBJ) -o mimo$(EXE) $(LDFLAGS)
 
 # Tiny MiMo fixture + vendor oracle, the Kimi K3 pattern: the generator is numpy (and
 # Pillow for the test picture) and deterministic; ref.json is committed and comes from
@@ -1283,8 +1286,8 @@ mimo-tiny-check: mimo-tiny-generate mimo$(EXE)
 # loader and SERVE=1 protocol. With CUDA=1 it links the same expert tier as
 # qwen36 (fp8 streaming mode: hot experts get VRAM copies, the RAM LRU stays);
 # without it the tier header's inline stubs keep the build toolkit-free.
-qwen38$(EXE): qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o qwen38$(EXE) $(QWEN36_LDFLAGS)
+qwen38$(EXE): qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV)
+	$(CC) $(QWEN36_CFLAGS) qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o qwen38$(EXE) $(QWEN36_LDFLAGS)
 
 .PHONY: qwen38-tiny-generate qwen38-tiny-check
 qwen38-tiny-generate:
@@ -1333,27 +1336,81 @@ qwen38-tiny-fp8-check: qwen38-tiny-fp8-generate qwen38$(EXE)
 qwen38-tier-engine-check: qwen38-tiny-fp8-generate tests/test_qwen38_tier_engine$(EXE)
 	./tests/test_qwen38_tier_engine$(EXE)
 
+# The routed experts as int4-g64: tools/convert_qwen38_experts_int4.py writes
+# the experts-int4g64/ sidecar next to the FP8 shards and qwen38 picks it up.
+# The fixture is the FP8 one with its experts scaled by 3 (at the default
+# initialization zeroing every expert moves the logits less than the oracle's
+# tolerance), converted; ref_int4.json is the float32 reference of the
+# dequantized sidecar. Gates:
+#  (a) the int4 matmul equals a dequantized f32 reference, and every expert the
+#      single and the batch path load holds the sidecar's bytes
+#      (tests/test_qwen38_int4_experts);
+#  (b) the converter's round trip against the FP8 source, per matrix, and the
+#      engine refusing a sidecar its index does not describe
+#      (tests/test_qwen38_int4_convert.py);
+#  (c) the engine on the sidecar reproduces ref_int4.json through the single,
+#      batched, prefill-batch and mapped paths at caps 1, 2 and 4, with the
+#      last logits identical to the bit across them; the FP8 experts still
+#      reproduce ref.json and not ref_int4.json, so the gate tells them apart;
+#  (d) under COLI_CUDA=1 on the fake backend the tier declines the int4
+#      experts (it streams FP8 only) and the CPU still reproduces ref_int4.json.
+.PHONY: qwen38-tiny-int4-generate qwen38-tiny-int4-check
+qwen38-tiny-int4-generate:
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_int4 --fp8-experts --int4-experts --expert-gain 3
+
+qwen38-tiny-int4-check: qwen38-tiny-int4-generate qwen38-tiny-fp8-generate qwen38$(EXE) \
+		tests/test_qwen38_int4_experts$(EXE) tests/test_qwen38_tier_engine$(EXE)
+	OMP_NUM_THREADS=2 ./tests/test_qwen38_int4_experts$(EXE) ./qwen38_tiny_int4
+	$(PYTHON) tests/test_qwen38_int4_convert.py --model ./qwen38_tiny_int4 --engine ./qwen38$(EXE)
+	@d=./qwen38_tiny_int4/logits; rm -rf $$d; mkdir -p $$d; n=0; \
+	for trunk in 1024 0; do for cap in 1 2 4; do for mode in single batched prefill prefill-serial mapped; do \
+		case $$mode in \
+			single) e="Q38_PREFILL_BATCH=0 Q38_EXPERT_PARALLEL_READS=0";; \
+			batched) e="Q38_PREFILL_BATCH=0";; \
+			prefill) e="Q38_PREFILL_BATCH=1";; \
+			prefill-serial) e="Q38_PREFILL_BATCH=1 Q38_EXPERT_PARALLEL_READS=0";; \
+			mapped) e="COLI_MAP_EXPERTS=1";; \
+		esac; \
+		env $$e Q38_EXPERT_INT4=1 Q38_TRUNK_MIN_KB=$$trunk DUMP=$$d/t$$trunk-c$$cap-$$mode.f32 OMP_NUM_THREADS=2 \
+			SNAP=./qwen38_tiny_int4 ./qwen38$(EXE) $$cap 8 ./qwen38_tiny_int4/ref_int4.json > $$d/run.log 2>&1 \
+			|| { cat $$d/run.log; echo "FAIL int4 experts, trunk=$$trunk cap=$$cap $$mode"; exit 1; }; \
+		n=$$((n+1)); \
+	done; done; \
+	for f in $$d/t$$trunk-*.f32; do cmp -s $$f $$d/t$$trunk-c1-single.f32 \
+		|| { echo "FAIL $$f: last logits differ from the single path"; exit 1; }; done; done; \
+	for trunk in 1024 0; do \
+		Q38_EXPERT_INT4=0 Q38_TRUNK_MIN_KB=$$trunk OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_int4 \
+			./qwen38$(EXE) 2 8 ./qwen38_tiny_int4/ref.json > $$d/run.log 2>&1 \
+			|| { cat $$d/run.log; echo "FAIL FP8 experts of the int4 fixture, trunk=$$trunk"; exit 1; }; \
+		if Q38_EXPERT_INT4=0 Q38_TRUNK_MIN_KB=$$trunk OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_int4 \
+			./qwen38$(EXE) 2 8 ./qwen38_tiny_int4/ref_int4.json > $$d/run.log 2>&1 \
+			|| ! grep -q '^Matching tokens' $$d/run.log; then \
+			cat $$d/run.log; echo "FAIL the FP8 experts pass the int4 reference: the gate cannot tell them apart"; exit 1; fi; \
+	done; \
+	echo "qwen38 int4-g64 experts: ref_int4.json reproduced in $$n configurations, last logits identical across paths; FP8 control ok"
+	./tests/test_qwen38_tier_engine$(EXE) ./qwen38_tiny_int4
+
 # Context-size gates: KV layout, growth across requests, and the attention
 # capacity. Includes qwen36.c directly, so no model file is needed.
 # Same tier objects as the engine: the test includes qwen36.c, so with CUDA=1
 # it links qwen36_tier.o and the backend object too (without CUDA, the header's
 # inline stubs cover it and both are empty).
-tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
-	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(LDFLAGS)
+tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # CACHE_ROUTE: route_select() against a residency table, no model needed.
-tests/test_qwen36_cache_route$(EXE): tests/test_qwen36_cache_route.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
-	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(LDFLAGS)
+tests/test_qwen36_cache_route$(EXE): tests/test_qwen36_cache_route.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # CPU gate: the qpack MLX-affine routed-expert glue (qwen36_qpack.c)
 # against the portable affine reference, on a synthesized container -- no
 # GPU, every platform. The Apple parity twin (Metal vs CPU reference on a
 # real Swiftlet-generated fixture) is the qwen36-metal-test target.
-tests/test_qwen36_qpack$(EXE): tests/test_qwen36_qpack.c qwen36.c tests/qwen36_qpack.o tests/qpack_qwen36.o $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(METAL_OBJ)
-	$(CC) $(QWEN36_CFLAGS) -DQWEN36_QPACK $< tests/qwen36_qpack.o tests/qpack_qwen36.o $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(METAL_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_qwen36_qpack$(EXE): tests/test_qwen36_qpack.c qwen36.c tests/qwen36_qpack.o tests/qpack_qwen36.o $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) -DQWEN36_QPACK $< tests/qwen36_qpack.o tests/qpack_qwen36.o $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 # qwen36_qpack.c and qpack.c as objects, compiled with the flags this test gave
 # them on the same command line before (#1741): one unit per command.
 tests/qwen36_qpack.o: qwen36_qpack.c .build-config
@@ -1361,51 +1418,51 @@ tests/qwen36_qpack.o: qwen36_qpack.c .build-config
 tests/qpack_qwen36.o: qpack.c .build-config
 	$(CC) $(QWEN36_CFLAGS) -DQWEN36_QPACK -c qpack.c -o $@
 
-tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # Dense-bridge gate: qwen36's loader against an MLX affine
 # model.safetensors (the dense half of a Swiftlet qpack container) --
 # `language_model.` name resolution, U32 triple indexing, checked Q4/Q8
 # expansion, refusals.  With argv it doubles as the round-trip harness for
 # tests/test_make_qwen36_qpack_snap.py.
-tests/test_qwen36_dense_affine$(EXE): tests/test_qwen36_dense_affine.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_qwen36_dense_affine$(EXE): tests/test_qwen36_dense_affine.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # Both tokenizer.json merge spellings ("a b" strings and ["a","b"] pairs)
 # must index the same merge table; the pair form is what Qwen3.6 ships.
-tests/test_qwen36_tok_merges$(EXE): tests/test_qwen36_tok_merges.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_qwen36_tok_merges$(EXE): tests/test_qwen36_tok_merges.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # A byte-counted serving payload may end mid-character; the pre-tokenizer must
 # not read past it.  qwen38 already gates this (tests/test_qwen38_tokenizer.c).
-tests/test_qwen36_tok_truncated$(EXE): tests/test_qwen36_tok_truncated.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_qwen36_tok_truncated$(EXE): tests/test_qwen36_tok_truncated.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # push_id / bpe_piece must refuse loudly, not crash, on a failed realloc during growth.
-tests/test_qwen36_encode_oom$(EXE): tests/test_qwen36_encode_oom.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_qwen36_encode_oom$(EXE): tests/test_qwen36_encode_oom.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # slot_ensure_int8's wiring onto #1271's unpack_int4_to_int8: regression check
 # that its output matches the old separate scalar nibble-unpack loop it replaced.
-tests/test_qwen36_slot_int8$(EXE): tests/test_qwen36_slot_int8.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_qwen36_slot_int8$(EXE): tests/test_qwen36_slot_int8.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # the dense trunk's integer path: quantizer contract, int4 planar packing, dispatch.
-tests/test_qwen36_dense_idot$(EXE): tests/test_qwen36_dense_idot.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_qwen36_dense_idot$(EXE): tests/test_qwen36_dense_idot.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # #1653: added tokens are split out before the regex pre-tokenizer, HF-style.
-tests/test_qwen36_tokenizer$(EXE): tests/test_qwen36_tokenizer.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_qwen36_tokenizer$(EXE): tests/test_qwen36_tokenizer.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # Reproducible local timing evidence; intentionally not a noisy CI perf gate.
 tests/bench_qwen36_dense_batch$(EXE): tests/bench_qwen36_dense_batch.c qwen36.c \
-		$(QWEN36_TIER_OBJ) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+		$(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
-inkling$(EXE): inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ)
-	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
+inkling$(EXE): inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV)
+	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
 # ENGINES WITHOUT A CUDA BACKEND (#783).
 # kimi_k3.c contains no COLI_CUDA code at all — its GPU path is Vulkan. But
@@ -1534,27 +1591,32 @@ tests/test_st_pread$(EXE): tests/test_st_pread.c
 tests/test_st_slice$(EXE): tests/test_st_slice.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_qwen38_tokenizer$(EXE): tests/test_qwen38_tokenizer.c qwen38.c tests/edge_runtime_nocuda.o
-	$(CC) $(NOCUDA_CFLAGS) $< tests/edge_runtime_nocuda.o -o $@ $(NOCUDA_LDFLAGS)
+tests/test_qwen38_tokenizer$(EXE): tests/test_qwen38_tokenizer.c qwen38.c tests/edge_runtime_nocuda.o $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< tests/edge_runtime_nocuda.o $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 # edge_runtime.c as its own object, compiled with the flags this test gave it on
 # the same command line before (#1741): one unit per command keeps each .d whole.
 tests/edge_runtime_nocuda.o: edge_runtime.c .build-config
 	$(CC) $(NOCUDA_CFLAGS) -c edge_runtime.c -o $@
 
-tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c qwen38.c
-	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_dsv41_serve_budget$(EXE): tests/test_dsv41_serve_budget.c deepseek_v41.c
-	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_dsv41_serve_budget$(EXE): tests/test_dsv41_serve_budget.c deepseek_v41.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_dsv41_untrusted_load$(EXE): tests/test_dsv41_untrusted_load.c deepseek_v41.c
-	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_dsv41_untrusted_load$(EXE): tests/test_dsv41_untrusted_load.c deepseek_v41.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c qwen38.c
-	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c
-	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+# The int4-g64 expert matmul with no model (part of test-c); given a converted
+# snapshot on argv it checks the sidecar's loaders too (qwen38-tiny-int4-check).
+tests/test_qwen38_int4_experts$(EXE): tests/test_qwen38_int4_experts.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_vision$(EXE): tests/test_qwen38_vision.c
 	$(CC) $(CFLAGS) -Wno-unused-function $< -o $@ $(LDFLAGS)
@@ -1584,14 +1646,14 @@ qwen38-vision-serve-check: qwen38$(EXE)
 	$(PYTHON) tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_mm_tiny
 	$(PYTHON) tests/test_qwen38_vision_serve.py --binary ./qwen38$(EXE) --fixture ./qwen38_mm_tiny
 
-tests/test_qwen38_prefix$(EXE): tests/test_qwen38_prefix.c qwen38.c
-	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_qwen38_prefix$(EXE): tests/test_qwen38_prefix.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen38_metrics$(EXE): tests/test_qwen38_metrics.c qwen38.c
-	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_qwen38_metrics$(EXE): tests/test_qwen38_metrics.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen38_native_weights$(EXE): tests/test_qwen38_native_weights.c qwen38.c tests/segment_runtime_nocuda.o
-	$(CC) $(NOCUDA_CFLAGS) $< tests/segment_runtime_nocuda.o -o $@ $(NOCUDA_LDFLAGS)
+tests/test_qwen38_native_weights$(EXE): tests/test_qwen38_native_weights.c qwen38.c tests/segment_runtime_nocuda.o $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< tests/segment_runtime_nocuda.o $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 # segment_runtime.c as its own object, compiled with the flags this test gave it on
 # the same command line before (#1741): one unit per command keeps each .d whole.
 tests/segment_runtime_nocuda.o: segment_runtime.c .build-config
@@ -1726,20 +1788,20 @@ tests/test_segment_conformance$(EXE): tests/test_segment_conformance.c tests/seg
 tests/segment_conformance_fixtures.o: tests/segment_conformance_fixtures.c .build-config
 	$(CC) $(CFLAGS) -c tests/segment_conformance_fixtures.c -o $@
 
-tests/test_inkling_serve_framing$(EXE): tests/test_inkling_serve_framing.c inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ)
-	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
+tests/test_inkling_serve_framing$(EXE): tests/test_inkling_serve_framing.c inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_inkling_shared_batch$(EXE): tests/test_inkling_shared_batch.c inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ)
-	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
+tests/test_inkling_shared_batch$(EXE): tests/test_inkling_shared_batch.c inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # Reproducible local A/B for the shared-expert prefill path.  This is timing
 # evidence, not a CI gate: build and run it explicitly on the target CPU.
 tests/bench_inkling_shared_batch$(EXE): tests/bench_inkling_shared_batch.c inkling.c \
-		$(INK_CUDA_OBJ) $(METAL_OBJ)
-	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
+		$(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_inkling_cache_index$(EXE): tests/test_inkling_cache_index.c inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ)
-	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
+tests/test_inkling_cache_index$(EXE): tests/test_inkling_cache_index.c inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_kimi_serve_framing$(EXE): tests/test_kimi_serve_framing.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
@@ -1753,17 +1815,17 @@ tests/test_k3_chat_tools$(EXE): tests/test_k3_chat_tools.c kimi_k3.c $(VK_OBJ)
 # olmoe's matmul_q, not colibri's: compares the IDOT path against FP32
 # ACTIVATIONS rather than an integer reference. NOCUDA_* for the same reason
 # the olmoe target uses it -- olmoe.c contains no COLI_CUDA code.
-tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c olmoe.c
-	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c
-	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c olmoe.c
-	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 tests/test_idot$(EXE): tests/test_idot.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -2237,29 +2299,29 @@ tests/test_qwen36_tier_dense$(EXE): tests/test_qwen36_tier_dense.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
 # DeltaNet input projection batching, state parity and block failure fallback.
-tests/test_qwen36_dnproj_batch$(EXE): tests/test_qwen36_dnproj_batch.c qwen36.c qwen36_tier.c
-	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+tests/test_qwen36_dnproj_batch$(EXE): tests/test_qwen36_dnproj_batch.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # the automatic trunk placement can be withdrawn after the startup probe (fake backend).
 tests/test_qwen36_tier_withdraw$(EXE): tests/test_qwen36_tier_withdraw.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
-tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c qwen36.c qwen36_tier.c
-	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # dnout / attnproj / shexp offered, placed and served from VRAM (fake backend).
-tests/test_qwen36_trunk_dense$(EXE): tests/test_qwen36_trunk_dense.c qwen36.c qwen36_tier.c
-	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+tests/test_qwen36_trunk_dense$(EXE): tests/test_qwen36_trunk_dense.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # #1391: il decode path deve offrire gli esperti int8 al tier, non solo il warmstart
-tests/test_qwen36_tier_int8_decode$(EXE): tests/test_qwen36_tier_int8_decode.c qwen36.c qwen36_tier.c
-	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+tests/test_qwen36_tier_int8_decode$(EXE): tests/test_qwen36_tier_int8_decode.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # The qwen38 engine through its own main() on the fake backend: tier start
 # from the FP8 fixture, reduced CPU list, qt_note on recycled slots, oracle
 # tokens unchanged. Needs the fixture (qwen38-tiny-fp8-generate).
-tests/test_qwen38_tier_engine$(EXE): tests/test_qwen38_tier_engine.c qwen38.c qwen36_tier.c
-	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+tests/test_qwen38_tier_engine$(EXE): tests/test_qwen38_tier_engine.c qwen38.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_serve_poll$(EXE): tests/test_serve_poll.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -2405,14 +2467,14 @@ tests/test_qgemv_sse41$(EXE): tests/test_qgemv.c
 # olmoe's dot_i8_16 (ARM NEON/AVX2/SSE4.1 variants): must be bit-exact against
 # a scalar int8 reference -- pure integer arithmetic, no tolerance needed.
 # NOCUDA_* for the same reason the other olmoe.c-including test rules use it.
-tests/test_olmoe_dot_i8_16$(EXE): tests/test_olmoe_dot_i8_16.c olmoe.c
-	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_olmoe_dot_i8_16$(EXE): tests/test_olmoe_dot_i8_16.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 # Same gate, forced onto the SSE4.1 tier: overrides the host's default -march
 # so the SSE4.1 body in olmoe.c's dot_i8_16 is actually exercised even on a
 # devbox that would otherwise always pick the AVX2 tier.
-tests/test_olmoe_dot_i8_16_sse41$(EXE): tests/test_olmoe_dot_i8_16.c olmoe.c
-	$(CC) $(NOCUDA_CFLAGS) -msse4.1 -mno-avx2 -mno-fma $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_olmoe_dot_i8_16_sse41$(EXE): tests/test_olmoe_dot_i8_16.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) -msse4.1 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 # layer_cuda_shard_kvb's format-allowlist refusal (see the test's file header). The
 # function only exists under -DCOLI_CUDA, so on a default (CPU) build the binary is a

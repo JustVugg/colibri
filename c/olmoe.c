@@ -87,6 +87,13 @@
 #ifdef COLI_ENGINE_ADAPTER
 #include "engine.h"
 #include <limits.h>   /* INT_MAX: clamp token/text counts to int */
+#ifdef COLI_VULKAN
+/* Vulkan (opt-in, VK=1 build + COLI_VULKAN=1): the resident f32 matrices --
+ * attention q/k/v/o, the router and lm_head -- through the shader's fmt 10, the
+ * same f32 weights times f32 activations the CPU computes, uploaded on first use.
+ * Routed experts, which arrive from disk, and the embedding lookup stay on the CPU. */
+#include "backend_vulkan.h"
+static int g_vk_ready = 0;
 #endif
 
 #ifdef _WIN32
@@ -111,6 +118,9 @@ typedef struct {
 /* ---------- pesi densi per-layer ---------- */
 typedef struct {
     float *in_ln, *post_ln, *q, *k, *v, *o, *qn, *kn, *gate;
+#ifdef COLI_VULKAN
+    void *vk_q, *vk_k, *vk_v, *vk_o, *vk_gate;   /* device copies, on first use */
+#endif
 } Layer;
 
 /* ---------- cache LRU degli expert (pesi QUANTIZZATI) ----------
@@ -132,6 +142,9 @@ typedef struct {
     shards S;
     int quant_bits;
     float *embed, *lm_head, *final_norm;
+#ifdef COLI_VULKAN
+    void *vk_lm_head;
+#endif
     Layer *L;
     LCache *cache;          /* [n_layers] */
     uint64_t clock, hits, miss;
@@ -552,6 +565,37 @@ static float g_nuc  = 0.95f;  /* NUCLEUS env overrides */
 #include "sample.h"
 
 #include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
+
+/* matmul for a RESIDENT f32 matrix W [O,I], with *vk caching its device copy:
+ * on Vulkan when the device is up, the CPU's matmul otherwise. The backend has one
+ * command buffer, so only from the main thread and never inside a parallel region;
+ * an upload the device refused leaves the matrix on the CPU for good. Without
+ * COLI_VULKAN it is the plain matmul call it replaces. */
+#ifdef COLI_VULKAN
+static char g_vk_refused;                  /* *vk == &g_vk_refused: stays on the CPU */
+static void matmul_res(float *y, const float *x, const float *W, void **vk, int S, int I, int O) {
+    int serial = 1;
+#ifdef _OPENMP
+    serial = !omp_in_parallel();
+#endif
+    if (g_vk_ready && serial && *vk != (void *)&g_vk_refused) {
+        if (coli_vk_matmul((ColiVkTensor **)vk, y, x, W, NULL, 10, S, I, O, 0)) return;
+        if (!*vk) *vk = &g_vk_refused;
+    }
+    matmul(y, x, W, S, I, O);
+}
+static void vk_res_free(void **vk) {
+    if (*vk && *vk != (void *)&g_vk_refused) coli_vk_tensor_free((ColiVkTensor *)*vk);
+    *vk = NULL;
+}
+static void olmoe_vk_report(void) {
+    if (g_vk_ready)
+        fprintf(stderr, "[VK] olmoe: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
+}
+#define MATMUL_RES(y, x, W, vk, S, I, O) matmul_res(y, x, W, &(vk), S, I, O)
+#else
+#define MATMUL_RES(y, x, W, vk, S, I, O) matmul(y, x, W, S, I, O)
+#endif
 
 /* y[1,O] = x[1,I] @ W^T con W quantizzato: q[O,I] int8 + scala per riga.
  * W[o,i] ~= q[o,i]*scale[o]  ->  y[o] = scale[o] * sum_i x[i]*q[o,i].
@@ -1060,6 +1104,16 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
 
 static void model_init(Model *m, const char *snap, int cap, int bits) {
     model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
+#ifdef COLI_VULKAN
+    /* After the weights, for the standalone engine only (Segment ranges stay on
+     * the CPU). The host copies stay: they are the fallback, so on a GPU that
+     * shares RAM with the CPU the dense set is held twice. */
+    if (!g_vk_ready) g_vk_ready = coli_vk_init_env("olmoe");
+    if (g_vk_ready)
+        fprintf(stderr, "[VK] olmoe: %d resident f32 matrices (attention q/k/v/o, router, lm_head) "
+                "go to the GPU on first use; routed experts and the embedding lookup stay on the CPU\n",
+                5 * m->c.n_layers + 1);
+#endif
 }
 
 /* Free one slot weight block with the deallocator matching its allocation:
@@ -1436,9 +1490,9 @@ static void rope_head(float *x, int pos, const Cfg *c) {
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     Cfg *c = &m->c; int H = c->n_heads, hd = c->head_dim, D = c->hidden;
     float *q = falloc((int64_t)S*D), *k = falloc((int64_t)S*D), *vv = falloc((int64_t)S*D);
-    matmul(q, x, l->q, S, D, D);
-    matmul(k, x, l->k, S, D, D);
-    matmul(vv, x, l->v, S, D, D);
+    MATMUL_RES(q, x, l->q, l->vk_q, S, D, D);
+    MATMUL_RES(k, x, l->k, l->vk_k, S, D, D);
+    MATMUL_RES(vv, x, l->v, l->vk_v, S, D, D);
     /* qk-norm sull'intero vettore hidden, poi RoPE per testa */
     for (int s = 0; s < S; s++) {
         rmsnorm_row(q + (int64_t)s*D, q + (int64_t)s*D, l->qn, D, c->eps);
@@ -1477,7 +1531,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
     }
     (void)Tk;
-    matmul(out, ctx, l->o, S, D, D);
+    MATMUL_RES(out, ctx, l->o, l->vk_o, S, D, D);
     free(q); free(k); free(vv); free(ctx);
 }
 
@@ -1485,7 +1539,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     float *logits = falloc((int64_t)S*E);
-    matmul(logits, x, l->gate, S, D, E);
+    MATMUL_RES(logits, x, l->gate, l->vk_gate, S, D, E);
     memset(out, 0, (int64_t)S*D*sizeof(float));
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
     for (int s = 0; s < S; s++) {
@@ -1737,7 +1791,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
             olmoe_echo(g_echo_id, pos_base, ids[0], g_pin_logit, c->vocab, g_echo_k);
         for (int p = 0; p + 1 < S; p++) {
             rmsnorm_row(erow, x + (int64_t)p*D, m->final_norm, D, c->eps);
-            matmul(elog, erow, m->lm_head, 1, D, c->vocab);
+            MATMUL_RES(elog, erow, m->lm_head, m->vk_lm_head, 1, D, c->vocab);
             olmoe_echo(g_echo_id, pos_base + p + 1, ids[p+1], elog, c->vocab, g_echo_k);
         }
         free(erow); free(elog);
@@ -1746,7 +1800,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
     double t_head = now_s();
-    matmul(logit, last, m->lm_head, 1, D, c->vocab);
+    MATMUL_RES(logit, last, m->lm_head, m->vk_lm_head, 1, D, c->vocab);
     g_prof_head_s += now_s() - t_head;
     g_prof_forwards += 1;   /* forward passes, not positions: a prefill of S rows is one */
     free(x); free(last);
@@ -1874,7 +1928,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
         rmsnorm_row(nrm_x + (int64_t)s * D, x + (int64_t)s * D, l->post_ln, D, c->eps);
     }
 
-    matmul(logits, nrm_x, l->gate, S, D, E);
+    MATMUL_RES(logits, nrm_x, l->gate, l->vk_gate, S, D, E);
     free(nrm_x);
 
     for (int s = 0; s < S; s++) {
@@ -2106,6 +2160,9 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
         outbuf[outn] = 0;
         printf("%s\n", outbuf);
         fflush(stdout);
+#ifdef COLI_VULKAN
+        olmoe_vk_report();
+#endif
     }
     free(line); free(turn); free(newids); free(gen); free(outbuf); free(hist);
 }
@@ -2340,6 +2397,9 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     printf("PROF %.6f %d %d %.6f 0.0 %.6f %.6f %.6f %lld\n", dt, np, gen, disk_s, matmul_s,
            g_prof_attn_s - attn0, g_prof_head_s - head0, g_prof_forwards - fwd0);
     fflush(stdout);
+#ifdef COLI_VULKAN
+    olmoe_vk_report();
+#endif
     serve_hits(m);
     free(ids);
     return 0;
@@ -2588,6 +2648,9 @@ int main(int argc, char **argv) {
         printf("Expert cache hit rate: %.1f%%  (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
+#ifdef COLI_VULKAN
+        fflush(stdout); olmoe_vk_report();
+#endif
         free(buf); free(arena);
         return 0;      /* PPL is a measurement run: no rt_save on purpose, so a loss
                         * sweep cannot fold its own tokens into the persisted ranking */
@@ -2639,6 +2702,9 @@ int main(int argc, char **argv) {
      * precision (#852 -- two decimals of tok/s is one significant digit at the
      * rates this engine runs at). */
     printf("TUNE decode: %d tokens in %.3fs\n", n_new, dt);
+#ifdef COLI_VULKAN
+    fflush(stdout); olmoe_vk_report();
+#endif
     free(buf); free(arena);
     return 0;
 }
@@ -2665,6 +2731,10 @@ static void olmoe_segment_model_destroy(OlmoeSegmentEngine *engine) {
     for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
          layer++) {
         Layer *weights = &model->L[layer];
+#ifdef COLI_VULKAN
+        vk_res_free(&weights->vk_q); vk_res_free(&weights->vk_k); vk_res_free(&weights->vk_v);
+        vk_res_free(&weights->vk_o); vk_res_free(&weights->vk_gate);
+#endif
         free(weights->in_ln); free(weights->post_ln);
         free(weights->q); free(weights->k); free(weights->v); free(weights->o);
         free(weights->qn); free(weights->kn); free(weights->gate);

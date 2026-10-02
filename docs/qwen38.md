@@ -118,7 +118,7 @@ prompt:
 | | |
 |---|---|
 | resident weights (native BF16) | 9.2 GiB, fixed |
-| routed-expert cache | 4.7 MiB per slot per layer over 48 layers: cap 16 is 3.5 GiB, cap 32 is 7.0 GiB, cap 64 is 14.1 GiB |
+| routed-expert cache | 4.7 MiB per slot per layer over 48 layers: cap 16 is 3.5 GiB, cap 32 is 7.0 GiB, cap 64 is 14.1 GiB (2.6 MiB with the [int4-g64 sidecar](#routed-experts-as-int4-g64): cap 64 is 7.9 GiB) |
 | FP8 scale bank | 28 MiB, fixed; every expert's block scales stay resident so a miss is one FP8 read |
 | context state | 54 KiB per token, allocated for the whole `Q38_MAXT` ceiling before `READY`: 432 MiB at the 8,192 default |
 | recurrent and PLE state, prefix snapshot, cached logits | 226 MiB, fixed |
@@ -156,6 +156,110 @@ of 512 experts in each of 48 layers, 4.7 MiB each: 2.2 GiB of expert weights
 when nothing is cached and roughly half that at the cap-32 hit rate, so at this
 cache size the engine spends about two thirds of every request waiting on the
 disk, and the planner labels cold expert reads as the expected bottleneck.
+
+## Routed experts as int4-g64
+
+Optional. Decode waits on routed experts: a miss is a disk read, and how many
+experts fit in the cache decides how often that happens.
+`tools/convert_qwen38_experts_int4.py` rewrites them as int4 with one f32 scale
+per 64 inputs into `<model>/experts-int4g64/`, next to the FP8 shards, which it
+only reads; qwen38 picks the directory up by itself.
+
+```sh
+python3 c/tools/convert_qwen38_experts_int4.py --model ~/Models/Qwen3.8-Flash-Next-FP8 --plan
+python3 c/tools/convert_qwen38_experts_int4.py --model ~/Models/Qwen3.8-Flash-Next-FP8
+```
+
+| | FP8 (release) | int4-g64 sidecar |
+|---|---|---|
+| bytes per expert | 4,915,200 (scales in the 28 MiB resident bank) | 2,764,800: codes 2,457,600, scales 307,200 |
+| experts per GiB of cache | 218 | 388 |
+| cap per GiB of cache, 48 layers | 4.5 | 8.1 |
+| all routed experts on disk | 120.8 GB | 68.0 GB, in addition to the FP8 shards |
+
+The values are the ones the engine computes from the release (e4m3 byte times
+its block's `weight_scale_inv`), quantized as `tools/convert_qwen36.py --ebits 4
+--gs 64` does: per 64 inputs, scale = absmax / 7, code = round half to even of
+w / scale, clamped to [-8, 7]. The codes are stored as v+8 in `expert_ffn.h`'s
+planar layout and multiplied by its f32 kernel, activations staying f32 as on
+the FP8 path. On synthetic Gaussian weights at the release's geometry the
+relative L2 error is 10.9% per matrix; the converter prints the mean and the
+worst per layer on the real weights, where it measured 11-12% per layer and
+17.5% for the worst single matrix.
+
+Measured on the release (Ryzen 7 PRO 8700GE, 16 threads, 61 GiB, NVMe; the
+same binary with `Q38_EXPERT_INT4=0` and `=1`, `OMP_NUM_THREADS=8`). Perplexity,
+teacher-forced over four 504-token chunks at cap 96:
+
+| chunk | FP8 | int4-g64 |
+|---|---|---|
+| 0 | 4.23 | 4.20 |
+| 1 | 11.64 | 11.74 |
+| 2 | 10.94 | 11.04 |
+| 3 | 16.04 | 16.97 |
+
+On average +0.017 nats per token. Three chunks move by under 1%; chunk 3 moves
+by 5.8%. Greedy answers stay on the same reasoning with a few words changed.
+
+Decode, 100 tokens of one prompt, the model's files dropped from the page cache
+before every run, load average under 2.5:
+
+| cap | FP8 | int4-g64 |
+|---|---|---|
+| 32 | 1.91 tok/s, 14.4 GB RSS, 45.8% hits | 2.87 tok/s, 11.6 GB, 46.4% |
+| 64 | 2.27 tok/s, 21.4 GB, 59.1% | 3.25 tok/s, 15.2 GB, 59.4% |
+| 96 | 2.56 tok/s, 28.5 GB, 68.0% | 3.55 tok/s, 19.2 GB, 67.8% |
+| 170 | | 3.99 tok/s, 28.0 GB, 79.2% |
+
+At the same cap int4 is 1.4-1.5x faster, because each miss reads 56% of the
+bytes and the routed-expert compute halves (55 to 31 ms per decode forward at
+cap 96). At the same RAM, FP8 at cap 96 (28.5 GB) against int4 at cap 170
+(28.0 GB), it is 1.56x faster: the RAM that held 96 experts per layer holds 170.
+
+The converter streams: one expert per worker in flight, so peak RAM is a few
+hundred MB for the writer (records queue there while the disk catches up; at
+most one layer, 1.4 GB) plus 0.11 GB per worker, whatever the model size. On a 12-thread laptop
+CPU (i7-1355U) and a synthetic snapshot of the release's expert geometry a
+layer is 22 s of compute with 12 workers; the disk sets the rest. It is
+resumable: a layer is written to a `.part` file and renamed when whole, and
+`index.json` lists the layers done, so a second run continues where the first
+stopped. A run against a snapshot whose `config.json` or expert shards changed
+is refused.
+
+Layout: one safetensors file per layer (`layer-NNN.safetensors`) and
+`index.json`. Every expert is one record, so a miss is one read:
+
+```
+gate codes U8 [I, H/2] | up codes U8 [I, H/2] | down codes U8 [H, I/2] |
+gate scales F32 [I, H/64] | up scales F32 [I, H/64] | down scales F32 [H, I/64]
+```
+
+named like the release's tensors (`...experts.E.gate_proj.weight`, and the same
+name plus `.qs` for its scales). The data region of each file starts on a
+4096-byte boundary; at the release's geometry a record is 675 pages, so every
+record is page aligned. `index.json` carries the format name and version, the
+geometry, the group size, the record size, the layers done and `complete`;
+the engine refuses a sidecar whose index or files disagree with `config.json`
+and skips (with a line on stderr) one still being written.
+
+`Q38_EXPERT_INT4=0` keeps the snapshot's FP8 experts; `=1` refuses to start
+without a complete sidecar. Every expert path reads the sidecar: the single LRU
+load, the parallel batch reads (`Q38_EXPERT_PARALLEL_READS`), the prefetch, the
+prefill batch and `COLI_MAP_EXPERTS=1`. The startup line names the expert
+representation, the bytes of one expert, what the cache costs full at the
+given cap, and how many experts per layer the RAM available at that moment
+would hold. `coli plan` and `--auto-tier` size the cache cap with the
+sidecar's records and plan no VRAM for them: the CUDA expert tier streams FP8
+experts only, and with int4 experts it stays off, trunk included. The Segment and Edge adapters keep the snapshot's
+experts.
+
+`make -C c qwen38-tiny-int4-check` converts the FP8 tiny fixture (experts
+scaled by 3, so that they move the logits beyond the oracle's tolerance) and
+gates on the int4 matmul against a dequantized f32 reference, the converter's
+round trip against the FP8 source, the engine reproducing the float32
+reference of the dequantized sidecar through every expert path with the last
+logits identical to the bit across them, and the CUDA tier declining the int4
+experts on the fake backend.
 
 ## GPU: CUDA VRAM expert tier
 
@@ -414,6 +518,8 @@ eviction. The gate checks both greedy token IDs and the final upstream logit
 vector, and runs both native-BF16 and expanded-FP32 resident modes at cache
 capacities one and four. CI repeats the capacity-one path under ASan and UBSan
 and verifies that a config/tensor shape disagreement is refused.
+`make -C c qwen38-tiny-int4-check` gates the optional int4-g64 experts (see
+[Routed experts as int4-g64](#routed-experts-as-int4-g64)).
 
 ## Supported checkpoint layouts
 

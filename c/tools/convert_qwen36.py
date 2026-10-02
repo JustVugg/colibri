@@ -306,6 +306,10 @@ def main():
     cfg_full = json.load(open(cfg_path, encoding="utf-8"))
     # VL checkpoints nest dims under text_config
     mcfg = cfg_full.get("text_config", cfg_full)
+    # transformers 5 writes qwen3_moe's expert count as num_local_experts; the released
+    # checkpoints (written by 4.x) say num_experts. Read either.
+    if "num_experts" not in mcfg and "num_local_experts" in mcfg:
+        mcfg = dict(mcfg, num_experts=mcfg["num_local_experts"])
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     import shutil
@@ -401,11 +405,18 @@ def main():
     print(f"tensor kinds: {sum(len(v) for v in layer_map.values())} in {len(layer_ids)} layers, "
           f"{len(global_map)} globals, prefix {prefix!r}")
 
+    # Qwen3 MoE (qwen3_moe, e.g. Qwen3-Coder-30B-A3B): every layer is plain attention,
+    # full rotary, ordinary RMSNorm weights and no shared expert. Qwen3.5/3.6 differ on
+    # each of those, so the defaults below branch on it.
+    plain_qwen3 = cfg_full.get("model_type") == "qwen3_moe"
     layer_types = mcfg.get("layer_types")
     if layer_types is None:
-        # infer: every 4th layer is full_attention (Qwen3.5/3.6 convention)
         n = mcfg.get("num_hidden_layers", n_layers_weight)
-        layer_types = ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(n)]
+        if plain_qwen3:
+            layer_types = ["full_attention"] * n
+        else:
+            # infer: every 4th layer is full_attention (Qwen3.5/3.6 convention)
+            layer_types = ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(n)]
     full_idx = [i for i, lt in enumerate(layer_types) if lt == "full_attention"]
     all_idx = list(range(len(layer_types)))
     print(f"layers: {len(layer_types)} total, {len(full_idx)} full_attention (Phase 2: all {len(all_idx)} stored)")
@@ -610,7 +621,8 @@ def main():
         "topk": int(mcfg.get("num_experts_per_tok", 0)) if mcfg.get("num_experts") else 0,
         "moe_inter": (int(mcfg.get("moe_intermediate_size", mcfg.get("intermediate_size", 0) // 2))
                       if mcfg.get("num_experts") else 0),
-        "shared_inter": (int(mcfg.get("shared_expert_intermediate_size", mcfg.get("moe_intermediate_size", 0)))
+        "shared_inter": (0 if plain_qwen3 else
+                         int(mcfg.get("shared_expert_intermediate_size", mcfg.get("moe_intermediate_size", 0)))
                          if mcfg.get("num_experts") else int(mcfg["intermediate_size"])),
         "rms_eps": float(mcfg.get("rms_norm_eps", 1e-6)),
         "ebits": args.ebits,
@@ -619,10 +631,13 @@ def main():
         "topk_group": int(mcfg.get("topk_group", 1)),
         "norm_topk_prob": bool(mcfg.get("norm_topk_prob", False)),
         "attn_output_gate": bool(mcfg.get("attn_output_gate", False)),
-        "rope_theta": float((mcfg.get("rope_parameters") or {}).get("rope_theta", 10000000.0)),
+        "rope_theta": float((mcfg.get("rope_parameters") or {}).get(
+            "rope_theta", mcfg.get("rope_theta", 10000000.0))),
         "mrope_section": (mcfg.get("rope_parameters") or {}).get("mrope_section", [16, 16, 16]),
-        "partial_rotary_factor": float(mcfg.get("partial_rotary_factor", 0.25)),
+        "partial_rotary_factor": float(mcfg.get("partial_rotary_factor", 1.0 if plain_qwen3 else 0.25)),
     }
+    if plain_qwen3:
+        meta["zero_centered_norms"] = False
     # derive head dims from first full-attention layer weights (authoritative).
     # Read from SOURCE (not local output) so this works even when layer 0 was
     # skipped during a resume and its local shard was already stream-deleted.
@@ -659,6 +674,11 @@ def main():
             meta["expert_down_gs"] = args.down_gs
         meta["head_dim"] = meta.get("k_head_dim", meta.get("q_head_dim", 256))
         meta["rope_dim"] = meta.get("qk_rope_head_dim", meta["head_dim"] // 4)
+        if plain_qwen3:
+            # One position per token, so M-RoPE over sections that cover the whole
+            # rotary half is ordinary 1D RoPE; the engine needs the sections to add up.
+            half = int(meta["rope_dim"] * meta["partial_rotary_factor"]) // 2
+            meta["mrope_section"] = [half - 2 * (half // 3), half // 3, half // 3]
     # ---- DeltaNet (linear_attention) dims. From config (authoritative for dn; unlike the
     #      attention qk split, dn dims are explicit in config and never evicted shards). ----
     meta["dn_vheads"] = int(mcfg.get("linear_num_value_heads", mcfg.get("num_value_heads", 0)))
@@ -687,7 +707,15 @@ def main():
     print(f"[meta] {out / 'qwen36_meta.json'}")
 
     # ---- README ----
-    if not args.no_readme:
+    if not args.no_readme and plain_qwen3:
+        lines = ["---", "tags:", "  - colibri", "  - qwen3_moe", "  - moe",
+                 "library_name: colibri", "---", "",
+                 "colibri container for a Qwen3 MoE checkpoint (qwen3_moe, e.g. Qwen3-Coder-30B-A3B):",
+                 f"{len(all_idx)} attention layers, no DeltaNet and no shared expert, routed experts",
+                 f"at {args.ebits} bits" + (f" with a scale per {args.gs} inputs." if args.gs else " with a scale per row."),
+                 "", "Engine: https://github.com/JustVugg/colibri (c/qwen36.c, docs/qwen36.md)"]
+        (out / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    elif not args.no_readme:
         lines = ["---", "tags:", "  - colibri", "  - qwen3.6", "  - qwen3.6-35b-a3b", "  - moe",
                  "library_name: colibri", "---", "",
                  "colibri container for Qwen3.6-35B-A3B (Phase 2: all layers, incl. Gated DeltaNet).",
@@ -718,7 +746,8 @@ def main():
         pass
 
     print(f"\nDone. Container at: {out}")
-    print(f"All {len(all_idx)} layers stored (incl. Gated DeltaNet). n_active={len(all_idx)}.")
+    n_linear = sum(kind == "linear_attention" for kind in layer_types)
+    print(f"All {len(all_idx)} layers stored ({n_linear} Gated DeltaNet). n_active={len(all_idx)}.")
     print(f"Run (engine):  SNAP={out} ./qwen36 16 {args.ebits} ref_qwen36.json")
 
 

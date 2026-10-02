@@ -144,7 +144,7 @@ class FamilyRegistryTest(unittest.TestCase):
 
     def test_unknown_or_invalid_config_never_falls_back_to_glm(self):
         with self.assertRaises(UnknownFamilyError):
-            family_for_config({"model_type": "qwen3_moe"})
+            family_for_config({"model_type": "mixtral"})
         for config in ({}, {"model_type": ""}, {"model_type": []}, None):
             with self.subTest(config=config), self.assertRaises(FamilyConfigError):
                 family_for_config(config)
@@ -185,7 +185,7 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertEqual(geometry.configured_experts, 8)
         self.assertEqual(geometry.context_state_bytes, 16_384)
         self.assertEqual(geometry.fixed_state_bytes, 6 * (8 * 8 * 8 + 128 * 3) * 4)
-        for model_type in ("qwen2", "qwen3_moe", "my_qwen_model"):
+        for model_type in ("qwen2", "qwen3", "my_qwen_model"):
             self.assertNotIn(model_type, by_type)
 
     def test_qwen38_fixture_resolves_nested_text_config_and_sizes_all_state(self):
@@ -1080,7 +1080,7 @@ class FamilyRegistryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "config.json").write_text(
-                json.dumps({"model_type": "qwen3_moe"}), encoding="utf-8")
+                json.dumps({"model_type": "mixtral"}), encoding="utf-8")
             (root / "tokenizer.json").write_text("{}", encoding="utf-8")
             report = run_doctor(root, engine_path=root / "colibri",
                                 available_memory=16_000_000_000,
@@ -1585,7 +1585,10 @@ class DisplayVariantTest(unittest.TestCase):
     def test_variants_are_public(self):
         meta = public_metadata(next(f for f in FAMILIES if f.id == "qwen36"))
         self.assertEqual([v["display_name"] for v in meta["display_variants"]],
-                         ["Qwen3.6-35B-A3B", "Qwen3.8-2.4T-A95B", "Qwen3.8-27B"])
+                         ["Qwen3.6-35B-A3B", "Qwen3.8-2.4T-A95B", "Qwen3.8-27B",
+                          "Qwen3-Coder-30B-A3B", "Qwen3-Coder-REAP-25B-A3B"])
+        self.assertEqual(meta["display_variants"][3]["geometry"],
+                         {"num_hidden_layers": 48, "num_experts": 128, "hidden_size": 2048})
         self.assertEqual(meta["display_variants"][2]["geometry"],
                          {"num_hidden_layers": 64, "hidden_size": 5120, "intermediate_size": 17408})
         self.assertEqual(meta["display_variants"][1]["geometry"],

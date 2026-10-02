@@ -2800,6 +2800,15 @@ def _serve_engine_env(a, arch):
     env["COLI_SERVE_PORT"]=str(a.port)
     return env
 
+def serve_model_id(a):
+    """The API model id `coli serve` announces: --model-id if given, else the id of
+    what was actually loaded. A family can serve checkpoints of different size
+    (MiMo-V2.6 Flash and Pro, Qwen3.6 and Qwen3.8-27B), and the family's default
+    named the larger sibling as the smaller one. `coli chat` already asks the
+    registry the same way."""
+    from family_registry import default_model_id
+    return a.model_id or default_model_id(resolve_model(a.model))
+
 def cmd_serve(a):
     need_model(a.model)
     family=resolve_model(a.model).descriptor
@@ -2817,7 +2826,7 @@ def cmd_serve(a):
     except OSError: pass
     import openai_server
     openai_server.ARCH=arch
-    model_id=a.model_id or family.default_model_id
+    model_id=serve_model_id(a)
     try:
         if a.temp is not None: os.environ["COLI_TEMP"] = str(a.temp)
         env=_serve_engine_env(a,arch)

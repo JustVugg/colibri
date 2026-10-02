@@ -158,6 +158,7 @@ c/kimi_k3_tiny/.coli_usage
 c/qwen38_vision_tiny/
 c/qwen38_mm_tiny/
 c/qwen38_tiny_fp8/
+c/qwen38_tiny_int4/
 # MiMo tiny fixture: config.json and ref.json are committed, the rest is regenerated
 c/mimo_tiny/*.safetensors
 c/mimo_tiny/model.safetensors.index.json
