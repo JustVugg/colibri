@@ -213,8 +213,12 @@ describe("the pilot", () => {
     const { calls } = deferredFetch()
     const time = clock()
     const applied: number[] = []
+    const answered: number[] = []
     const world = playing()
-    const pilot = new Pilot({ baseUrl: "http://x/v1", apiKey: "", model: "m", now: time.now, onApply: (d) => applied.push(d.stepsLate) })
+    const pilot = new Pilot({
+      baseUrl: "http://x/v1", apiKey: "", model: "m", now: time.now,
+      onAnswer: (d) => answered.push(d.latencyMs), onApply: (d) => applied.push(d.stepsLate),
+    })
     const asked = pilot.poll(world)!
     const seen = calls[0].body.state
 
@@ -224,6 +228,9 @@ describe("the pilot", () => {
     time.advance(83)
     calls[0].release(json(noulReply(0.9)))
     await asked
+    /* known on arrival, before any step applies it: pacing can react at once */
+    expect(answered).toEqual([83])
+    expect(applied).toEqual([])
 
     const decision = pilot.take(world)!
     expect(decision.flap).toBe(true)

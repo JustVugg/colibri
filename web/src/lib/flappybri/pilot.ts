@@ -220,6 +220,9 @@ export interface PilotOptions {
   threshold?: number
   window?: number
   now?: () => number
+  /* An answer has arrived (not yet applied): what pacing should react to. */
+  onAnswer?: (decision: Decision) => void
+  /* An answer has been applied to the step about to run. */
   onApply?: (decision: Decision) => void
   onFailure?: (failure: PilotFailure) => void
 }
@@ -235,6 +238,7 @@ export class Pilot {
   last: Decision | null = null
   lastState = ""
   private readonly now: () => number
+  private readonly onAnswer?: (decision: Decision) => void
   private readonly onApply?: (decision: Decision) => void
   private readonly onFailure?: (failure: PilotFailure) => void
   private controller: AbortController | null = null
@@ -250,6 +254,7 @@ export class Pilot {
     this.threshold = options.threshold ?? 0.5
     this.latency = new LatencyWindow(options.window ?? 100)
     this.now = options.now ?? (() => performance.now())
+    this.onAnswer = options.onAnswer
     this.onApply = options.onApply
     this.onFailure = options.onFailure
   }
@@ -320,6 +325,7 @@ export class Pilot {
         engineMs: reply.engineMs, askedTick, stepsLate: 0,
         model: typeof reply.response.model === "string" && reply.response.model ? reply.response.model : this.model,
       }
+      this.onAnswer?.(this.arrived)
     } catch (cause) {
       if (generation !== this.generation || controller.signal.aborted) return
       this.failure = classify(cause)
