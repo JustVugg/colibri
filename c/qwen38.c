@@ -1811,6 +1811,9 @@ static void serve_loop(Model *m){
         fprintf(stderr,"[serve] unable to allocate QSA state\n");return;
     }
     fputs("\x01\x01READY\x01\x01\n",stdout);
+    /* between READY and STAT: the gateway reads it in the handshake, so it knows
+     * the served modalities before the first request (docs/serve_protocol.md) */
+    printf("CAPS vision=%d\n",m->vis_ready?1:0);
     printf("STAT 0 0.00 0.0 %.2f\n",rss_gb());
     fflush(stdout);
     serve_emap(m);                       /* after READY and STAT: the boot reader discards what precedes them */
@@ -1820,6 +1823,9 @@ static void serve_loop(Model *m){
         if(r<0){q38_prefix_cache_release(m);return;}
         if(r==2){
             int status=serve_one(m,&q);free(q.payload);
+#ifdef COLI_VULKAN
+            q38_vk_report();   /* stderr: the wire protocol on stdout is untouched */
+#endif
             if(status<0){q38_prefix_cache_release(m);return;}
             serve_emap(m);
         }
@@ -1949,6 +1955,11 @@ int main(int argc, char **argv) {
     Model m; model_init(&m, snap, cap, bits);
     q38_tier_start(&m, cap);   /* COLI_CUDA=1: hot experts stream to VRAM (qwen36_tier.c) */
     q38_trunk_cpu_int8(&m);    /* the trunk's int8 rows on the CPU, BF16 released (Q38_TRUNK_CPU_INT8=0 keeps BF16) */
+#ifdef COLI_VULKAN
+    /* After the trunk is int8: those rows upload at their first matmul. No
+     * device (or COLI_VULKAN unset) leaves g_vk_ready 0, the CPU path. */
+    g_vk_ready=coli_vk_init_env("qwen38");
+#endif
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
     q38_telemetry_init(snap, &m);
@@ -1978,6 +1989,9 @@ int main(int argc, char **argv) {
         printf("Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
+#ifdef COLI_VULKAN
+        q38_vk_report();
+#endif
         rt_save(g_q38_usage,0);
         q38_model_free(&m); free(prompt); free(full); json_free(ref_root);
         free(buf); free(arena); free_tokenizer(); rt_destroy(); return 0;
@@ -2054,6 +2068,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
+#ifdef COLI_VULKAN
+    q38_vk_report();
+#endif
     rt_save(g_q38_usage, 0);
     free(g_last_logit); g_last_logit=NULL;
     q38_model_free(&m); free(out); free(prompt); free(full); json_free(ref_root);

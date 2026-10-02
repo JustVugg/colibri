@@ -58,6 +58,14 @@
 #include "tok.h"
 #include "edge_tok_internal.h"
 #endif
+#ifdef COLI_VULKAN
+/* Vulkan (opt-in, VK=1 build + COLI_VULKAN=1): the resident f32 matrices --
+ * attention q/k/v/o, the router and lm_head -- through the shader's fmt 10, the
+ * same f32 weights times f32 activations the CPU computes, uploaded on first use.
+ * Routed experts, which arrive from disk, and the embedding lookup stay on the CPU. */
+#include "backend_vulkan.h"
+static int g_vk_ready = 0;
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -81,6 +89,9 @@ typedef struct {
 /* ---------- pesi densi per-layer ---------- */
 typedef struct {
     float *in_ln, *post_ln, *q, *k, *v, *o, *qn, *kn, *gate;
+#ifdef COLI_VULKAN
+    void *vk_q, *vk_k, *vk_v, *vk_o, *vk_gate;   /* device copies, on first use */
+#endif
 } Layer;
 
 /* ---------- cache LRU degli expert (pesi QUANTIZZATI) ----------
@@ -102,6 +113,9 @@ typedef struct {
     shards S;
     int quant_bits;
     float *embed, *lm_head, *final_norm;
+#ifdef COLI_VULKAN
+    void *vk_lm_head;
+#endif
     Layer *L;
     LCache *cache;          /* [n_layers] */
     uint64_t clock, hits, miss;
@@ -246,32 +260,42 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
  * budget automatico pari a cio' che il processo gia' tiene: la cache risulta
  * minima invece che sbagliata, e --ram (o --cap) resta la via esplicita. */
 static double mem_available_gb(void) {
-    /* compat.h's probe knows Linux (MemAvailable), macOS (host_statistics64)
-     * and Windows (GlobalMemoryStatusEx). The Linux-only version that lived
-     * here returned 0 on the other two, and 0 sized the expert cache to one
-     * slot per layer: 2.5x slower without --ram, on every Windows and macOS
-     * benchmark taken since (#1500). */
-    double avail = compat_mem_available_gb();
-    if (avail > 0.0) return avail;
-    /* Not measurable here: say so once and fall back to half the physical RAM
-     * where that is known, else to a small fixed budget, rather than to a
-     * cache that streams every expert from disk on every token. */
-    static int noted = 0;
-    double total = 0.0;
-#ifdef _WIN32
-    double a2 = 0.0; compat_meminfo(&total, &a2);
-#elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
-    long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
-    if (pages > 0 && page > 0) total = (double)pages * (double)page / 1e9;
+    /* The one cross-platform "RAM available now" probe, shared with every other
+     * engine (colibri.c, glm53.c). This engine used to read /proc/meminfo
+     * directly and had no macOS or Windows branch, so on a Mac or a Windows
+     * box it returned 0.0 and the auto budget collapsed to the dense resident
+     * footprint -- a one-slot-per-layer cache with no warning (#1601).
+     * Dev already had a fallback to half physical (7ed6084), but it missed the
+     * warm-macOS case where free+inactive+purgeable is 0.x GB on a 128 GB box:
+     * not zero, but implausible. The 2% floor treats that as unmeasured too. */
+    double total = 0, avail = 0;
+    compat_meminfo_gb(&total, &avail);
+    static int warned = 0;
+    if (avail <= 0.0
+#ifdef __APPLE__
+        || (total > 0.0 && avail < total * 0.02)
 #endif
-    double fallback = total > 0.0 ? total * 0.5 : 8.0;
-    if (!noted) {
-        noted = 1;
-        fprintf(stderr, "[olmoe] could not measure available RAM on this platform; assuming %.1f GB "
-                        "(%s). Pass --ram <GB> to set the budget explicitly.\n",
-                fallback, total > 0.0 ? "half the physical RAM" : "a fixed default");
+    ) {
+        if (!warned) {
+            warned = 1;
+            if (total > 0.0) {
+                fprintf(stderr,
+                    "[ram] auto-detect read %.2f GB available of %.2f GB physical -- "
+                    "implausibly low, treating as unmeasured and sizing from half "
+                    "the physical total; pass --ram <GB> to override\n",
+                    avail, total);
+                avail = total * 0.5;
+            } else {
+                fprintf(stderr,
+                    "[olmoe] could not measure available RAM on this platform; assuming 8.0 GB "
+                    "(a fixed default). Pass --ram <GB> to set the budget explicitly.\n");
+                avail = 8.0;
+            }
+        } else {
+            avail = total > 0.0 ? total * 0.5 : 8.0;
+        }
     }
-    return fallback;
+    return avail;
 }
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 
@@ -283,20 +307,38 @@ static float g_temp = 0.7f;   /* TEMP env overrides */
 static float g_nuc  = 0.95f;  /* NUCLEUS env overrides */
 #include "sample.h"
 
-/* y[S,O] = x[S,I] @ W^T,  W e' [O,I] row-major */
-static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const float *w = W + (int64_t)o * I;
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s * I;
-            float acc = 0.f;
-            #pragma omp simd reduction(+:acc)
-            for (int i = 0; i < I; i++) acc += xs[i] * w[i];
-            y[(int64_t)s * O + o] = acc;
-        }
+#include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
+
+/* matmul for a RESIDENT f32 matrix W [O,I], with *vk caching its device copy:
+ * on Vulkan when the device is up, the CPU's matmul otherwise. The backend has one
+ * command buffer, so only from the main thread and never inside a parallel region;
+ * an upload the device refused leaves the matrix on the CPU for good. Without
+ * COLI_VULKAN it is the plain matmul call it replaces. */
+#ifdef COLI_VULKAN
+static char g_vk_refused;                  /* *vk == &g_vk_refused: stays on the CPU */
+static void matmul_res(float *y, const float *x, const float *W, void **vk, int S, int I, int O) {
+    int serial = 1;
+#ifdef _OPENMP
+    serial = !omp_in_parallel();
+#endif
+    if (g_vk_ready && serial && *vk != (void *)&g_vk_refused) {
+        if (coli_vk_matmul((ColiVkTensor **)vk, y, x, W, NULL, 10, S, I, O, 0)) return;
+        if (!*vk) *vk = &g_vk_refused;
     }
+    matmul(y, x, W, S, I, O);
 }
+static void vk_res_free(void **vk) {
+    if (*vk && *vk != (void *)&g_vk_refused) coli_vk_tensor_free((ColiVkTensor *)*vk);
+    *vk = NULL;
+}
+static void olmoe_vk_report(void) {
+    if (g_vk_ready)
+        fprintf(stderr, "[VK] olmoe: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
+}
+#define MATMUL_RES(y, x, W, vk, S, I, O) matmul_res(y, x, W, &(vk), S, I, O)
+#else
+#define MATMUL_RES(y, x, W, vk, S, I, O) matmul(y, x, W, S, I, O)
+#endif
 
 /* y[1,O] = x[1,I] @ W^T con W quantizzato: q[O,I] int8 + scala per riga.
  * W[o,i] ~= q[o,i]*scale[o]  ->  y[o] = scale[o] * sum_i x[i]*q[o,i].
@@ -565,7 +607,14 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         double room = budget - resident - kv_gb - 0.5;   /* 0.5 GB: activations */
         int derived = room > 0.0 && slot_gb > 0.0
                     ? (int)(room / slot_gb / (double)layers) : 0;
-        if (derived < 1) derived = 1;
+        if (derived < 1) {
+            fprintf(stderr,
+                "[cache] no room for even one expert slot/layer (room %.1f GB vs %.0f MB/expert) "
+                "-- the cache will hold 1 slot/layer and decode will be slow; pass --ram <GB> "
+                "or --cap <slots> to size it\n",
+                room, slot_gb * 1000.0);
+            derived = 1;
+        }
         if (derived > c->n_experts) derived = c->n_experts;
         fprintf(stderr, "[cache] %d slots/layer of %d experts: %.1f GB budget "
                         "(%s), %.1f GB dense resident, %.1f GB projected KV, "
@@ -664,6 +713,16 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
 
 static void model_init(Model *m, const char *snap, int cap, int bits) {
     model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
+#ifdef COLI_VULKAN
+    /* After the weights, for the standalone engine only (Segment ranges stay on
+     * the CPU). The host copies stay: they are the fallback, so on a GPU that
+     * shares RAM with the CPU the dense set is held twice. */
+    if (!g_vk_ready) g_vk_ready = coli_vk_init_env("olmoe");
+    if (g_vk_ready)
+        fprintf(stderr, "[VK] olmoe: %d resident f32 matrices (attention q/k/v/o, router, lm_head) "
+                "go to the GPU on first use; routed experts and the embedding lookup stay on the CPU\n",
+                5 * m->c.n_layers + 1);
+#endif
 }
 
 static void slot_ensure_allocated(Model *m, Slot *s) {
@@ -903,9 +962,9 @@ static void rope_head(float *x, int pos, const Cfg *c) {
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     Cfg *c = &m->c; int H = c->n_heads, hd = c->head_dim, D = c->hidden;
     float *q = falloc((int64_t)S*D), *k = falloc((int64_t)S*D), *vv = falloc((int64_t)S*D);
-    matmul(q, x, l->q, S, D, D);
-    matmul(k, x, l->k, S, D, D);
-    matmul(vv, x, l->v, S, D, D);
+    MATMUL_RES(q, x, l->q, l->vk_q, S, D, D);
+    MATMUL_RES(k, x, l->k, l->vk_k, S, D, D);
+    MATMUL_RES(vv, x, l->v, l->vk_v, S, D, D);
     /* qk-norm sull'intero vettore hidden, poi RoPE per testa */
     for (int s = 0; s < S; s++) {
         rmsnorm_row(q + (int64_t)s*D, q + (int64_t)s*D, l->qn, D, c->eps);
@@ -944,7 +1003,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
     }
     (void)Tk;
-    matmul(out, ctx, l->o, S, D, D);
+    MATMUL_RES(out, ctx, l->o, l->vk_o, S, D, D);
     free(q); free(k); free(vv); free(ctx);
 }
 
@@ -952,7 +1011,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     float *logits = falloc((int64_t)S*E);
-    matmul(logits, x, l->gate, S, D, E);
+    MATMUL_RES(logits, x, l->gate, l->vk_gate, S, D, E);
     memset(out, 0, (int64_t)S*D*sizeof(float));
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
     for (int s = 0; s < S; s++) {
@@ -1141,7 +1200,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
             olmoe_echo(g_echo_id, pos_base, ids[0], g_pin_logit, c->vocab, g_echo_k);
         for (int p = 0; p + 1 < S; p++) {
             rmsnorm_row(erow, x + (int64_t)p*D, m->final_norm, D, c->eps);
-            matmul(elog, erow, m->lm_head, 1, D, c->vocab);
+            MATMUL_RES(elog, erow, m->lm_head, m->vk_lm_head, 1, D, c->vocab);
             olmoe_echo(g_echo_id, pos_base + p + 1, ids[p+1], elog, c->vocab, g_echo_k);
         }
         free(erow); free(elog);
@@ -1150,7 +1209,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
     double t_head = now_s();
-    matmul(logit, last, m->lm_head, 1, D, c->vocab);
+    MATMUL_RES(logit, last, m->lm_head, m->vk_lm_head, 1, D, c->vocab);
     g_prof_head_s += now_s() - t_head;
     g_prof_forwards += 1;   /* forward passes, not positions: a prefill of S rows is one */
     free(x); free(last);
@@ -1250,7 +1309,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
         rmsnorm_row(nrm_x + (int64_t)s * D, x + (int64_t)s * D, l->post_ln, D, c->eps);
     }
 
-    matmul(logits, nrm_x, l->gate, S, D, E);
+    MATMUL_RES(logits, nrm_x, l->gate, l->vk_gate, S, D, E);
     free(nrm_x);
 
     for (int s = 0; s < S; s++) {
@@ -1508,6 +1567,9 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
         outbuf[outn] = 0;
         printf("%s\n", outbuf);
         fflush(stdout);
+#ifdef COLI_VULKAN
+        olmoe_vk_report();
+#endif
     }
     free(line); free(turn); free(newids); free(gen); free(outbuf); free(hist);
 }
@@ -1742,6 +1804,9 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     printf("PROF %.6f %d %d %.6f 0.0 %.6f %.6f %.6f %lld\n", dt, np, gen, disk_s, matmul_s,
            g_prof_attn_s - attn0, g_prof_head_s - head0, g_prof_forwards - fwd0);
     fflush(stdout);
+#ifdef COLI_VULKAN
+    olmoe_vk_report();
+#endif
     serve_hits(m);
     free(ids);
     return 0;
@@ -1771,11 +1836,35 @@ static void serve_hwinfo(Model *m) {
             if (sscanf(ln, "MemTotal: %lf", &v) == 1) rt = v/1e6;
             if (sscanf(ln, "MemAvailable: %lf", &v) == 1) ra = v/1e6;
         } fclose(mi); }
-    if (ra <= 0.0) ra = compat_mem_available_gb();   /* macOS, Windows: no /proc (#1500) */
-#ifdef _WIN32
-    if (rt <= 0.0) { double a2 = 0.0; compat_meminfo(&rt, &a2); }
-#elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
-    if (rt <= 0.0) { long pg = sysconf(_SC_PHYS_PAGES), ps = sysconf(_SC_PAGESIZE); if (pg > 0 && ps > 0) rt = (double)pg * ps / 1e9; }
+    /* #1601: neither /proc/cpuinfo nor /proc/meminfo exists on macOS (or
+     * Windows), so both reads above fail silently and this line went out as
+     * "0.0 0.0 ... unknown" -- the /health hwinfo the dashboard renders. Fill
+     * only what /proc could not supply, so the Linux path stays byte-identical.
+     * Use the shared one-pass probe on the other platforms too: besides keeping
+     * total and available RAM from different definitions, this avoids calling
+     * platform-specific helpers that are not available in every build. */
+#if defined(__APPLE__)
+    if (!cpu[0]) {
+        size_t len = sizeof(cpu);
+        if (sysctlbyname("machdep.cpu.brand_string", cpu, &len, NULL, 0) != 0)
+            cpu[0] = 0;
+    }
+#endif
+#if defined(__APPLE__) || defined(_WIN32)
+    if (rt <= 0.0 || ra <= 0.0) {
+        double t = 0, a = 0;
+        compat_meminfo_gb(&t, &a);
+        if (rt <= 0.0) rt = t;
+        if (ra <= 0.0) ra = a;
+    }
+#else
+    if (ra <= 0.0) ra = compat_mem_available_gb();
+    if (rt <= 0.0) {
+#if defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+        long pg = sysconf(_SC_PHYS_PAGES), ps = sysconf(_SC_PAGESIZE);
+        if (pg > 0 && ps > 0) rt = (double)pg * ps / 1e9;
+#endif
+    }
 #endif
     printf("HWINFO %d %.1f %.1f 0 0.0 %s|\n", cores, rt, ra, cpu[0] ? cpu : "unknown");
     fflush(stdout);
@@ -1966,6 +2055,9 @@ int main(int argc, char **argv) {
         printf("Expert cache hit rate: %.1f%%  (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
+#ifdef COLI_VULKAN
+        fflush(stdout); olmoe_vk_report();
+#endif
         free(buf); free(arena);
         return 0;      /* PPL is a measurement run: no rt_save on purpose, so a loss
                         * sweep cannot fold its own tokens into the persisted ranking */
@@ -2016,6 +2108,9 @@ int main(int argc, char **argv) {
      * precision (#852 -- two decimals of tok/s is one significant digit at the
      * rates this engine runs at). */
     printf("TUNE decode: %d tokens in %.3fs\n", n_new, dt);
+#ifdef COLI_VULKAN
+    fflush(stdout); olmoe_vk_report();
+#endif
     free(buf); free(arena);
     return 0;
 }
@@ -2042,6 +2137,10 @@ static void olmoe_segment_model_destroy(OlmoeSegmentEngine *engine) {
     for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
          layer++) {
         Layer *weights = &model->L[layer];
+#ifdef COLI_VULKAN
+        vk_res_free(&weights->vk_q); vk_res_free(&weights->vk_k); vk_res_free(&weights->vk_v);
+        vk_res_free(&weights->vk_o); vk_res_free(&weights->vk_gate);
+#endif
         free(weights->in_ln); free(weights->post_ln);
         free(weights->q); free(weights->k); free(weights->v); free(weights->o);
         free(weights->qn); free(weights->kn); free(weights->gate);

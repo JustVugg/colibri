@@ -13,6 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 static double vk_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000.0 + t.tv_nsec/1e6; }
 
 #define VKCHECK(x, what) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
@@ -210,17 +214,24 @@ static int scratch_reserve_mt(Scratch *s, size_t bytes, uint32_t memtype) {
 }
 static int scratch_reserve(Scratch *s, size_t bytes) { return scratch_reserve_mt(s, bytes, G.memtype); }
 
+/* Bytes of one weight row on the CPU side. fmt 10 (f32) and 11 (bf16) are the plain
+ * float weights the newer engines keep resident; they carry no scales. */
+static size_t cpu_row_bytes(int fmt, int I) {
+    return fmt == 1 || fmt == 12 ? (size_t)I                // int8, fp8: one byte per weight
+         : fmt == 5  ? ((size_t)I + 63) / 64 * 24            // int3-g64: 24B per 64-group
+         : fmt == 10 ? (size_t)I * 4
+         : fmt == 11 ? (size_t)I * 2
+         : (size_t)(I + 1) / 2;
+}
 static int rowwords(int fmt, int I) {
-    size_t rb = fmt == 1 ? (size_t)I                         // bytes/row on CPU side
-              : fmt == 5 ? ((size_t)I + 63) / 64 * 24        // int3-g64: 24B per 64-group
-              : (size_t)(I + 1) / 2;
-    return (int)((rb + 3) / 4);                              // padded to uint32 (24|4: exact)
+    return (int)((cpu_row_bytes(fmt, I) + 3) / 4);           // padded to uint32 (24|4: exact)
 }
 /* Scale floats per tensor: per-row formats carry O, int3-g64 carries O*ceil(I/64)
  * (one f32 per 64-input group). upload_tensor and tensor_free must agree on this. */
 static size_t scale_floats(int fmt, int I, int O, int gs) {
+    if (fmt == 10 || fmt == 11) return 1;                 // unused by the shader; bound anyway
     if (fmt == 5) return (size_t)O * (((size_t)I + 63) / 64);
-    if (fmt == 4 || fmt == 7)
+    if (fmt == 4 || fmt == 7 || fmt == 12)
         return (size_t)O * (((size_t)I + gs - 1) / gs);   // per-group [O,ng]
     return (size_t)O;
 }
@@ -516,14 +527,15 @@ static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
 static int upload_tensor(ColiVkTensor **out, const void *weights, const float *scales,
                          int fmt, int I, int O, int gs) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
-    if (fmt != 1 && fmt != 2 && fmt != 5 &&              /* fmt=4/7: word-aligned groups only */
-        !((fmt == 4 || fmt == 7) && gs >= 8 && gs % 8 == 0)) return 0;
+    if (fmt != 1 && fmt != 2 && fmt != 5 && fmt != 10 && fmt != 11 &&   /* fmt=4/7: word-aligned groups only */
+        !((fmt == 4 || fmt == 7) && gs >= 8 && gs % 8 == 0) &&
+        !(fmt == 12 && gs >= 4 && gs % 4 == 0)) return 0;              /* fp8: 4 per word */
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return 0;
-    t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I); t->gs = (fmt == 4 || fmt == 7) ? gs : 0;
+    t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I);
+    t->gs = (fmt == 4 || fmt == 7 || fmt == 12) ? gs : 0;
     size_t stride = (size_t)t->rowWords * 4;         // padded row bytes
-    size_t cpu_rb = fmt == 1 ? (size_t)I
-                  : fmt == 5 ? ((size_t)I + 63) / 64 * 24 : (size_t)(I + 1) / 2;
+    size_t cpu_rb = cpu_row_bytes(fmt, I);
     size_t sfl = scale_floats(fmt, I, O, gs);            // fmt=5: O*ceil(I/64) group scales
     t->wbytes = stride * (size_t)O;
     void *wptr;
@@ -536,7 +548,8 @@ static int upload_tensor(ColiVkTensor **out, const void *weights, const float *s
     if (!arena_suballoc(sfl * sizeof(float), &t->sbuf, &sptr)) {
         vkDestroyBuffer(G.dev, t->wbuf, NULL); free(t); return 0;
     }
-    memcpy(sptr, scales, sfl * sizeof(float));
+    if (fmt == 10 || fmt == 11) ((float *)sptr)[0] = 1.0f;   /* float weights: no scales */
+    else memcpy(sptr, scales, sfl * sizeof(float));
     // Counters are touched concurrently: frees run from expert_load under
     // `#pragma omp parallel`, so RMW them atomically (torn counts otherwise).
     __atomic_add_fetch(&G.used_bytes, t->wbytes + sfl * sizeof(float), __ATOMIC_RELAXED);
@@ -583,6 +596,8 @@ static void vkprof_tick(void) {
     if ((++g_vsub_n & 2047) == 0)
         fprintf(stderr, "[VK_PROF sub] n=%ld | submit %.0f | wait %.0f ms\n", g_vsub_n, g_vsub_ms, g_vwait_ms);
 }
+
+static unsigned long long g_vk_matmul_calls;   /* successful coli_vk_matmul calls */
 
 int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
                    const void *weights, const float *scales,
@@ -661,7 +676,46 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
             fprintf(stderr, "[VK_PROF dense] n=%ld | memcpy_x %.0f | desc %.0f | record %.0f | submit %.0f | wait %.0f | memcpy_y %.0f ms\n",
                     p_n, p_x, p_desc, p_rec, p_sub, p_wait, p_y);
     }
+    g_vk_matmul_calls++;
     return 1;
+}
+
+unsigned long long coli_vk_matmul_calls(void) { return g_vk_matmul_calls; }
+
+/* The shader path every engine resolves the same way (#523): COLI_VK_SHADERS may be the
+ * qmatmul.spv file or the directory holding it; unset, the shaders/ directory next to the
+ * binary (the build layout), then the historical path relative to the working directory. */
+const char *coli_vk_shader_path(char *buf, size_t n) {
+    const char *env = getenv("COLI_VK_SHADERS");
+    struct stat st;
+    if (env && *env) {
+        if (!stat(env, &st) && S_ISDIR(st.st_mode)) { snprintf(buf, n, "%s/qmatmul.spv", env); return buf; }
+        return env;
+    }
+#ifdef __linux__
+    ssize_t k = readlink("/proc/self/exe", buf, n - 1);
+    if (k > 0) {
+        buf[k] = 0;
+        char *sl = strrchr(buf, '/');
+        if (sl && (size_t)(sl + 1 - buf) + sizeof("shaders/qmatmul.spv") <= n) {
+            strcpy(sl + 1, "shaders/qmatmul.spv");
+            if (!stat(buf, &st)) return buf;
+        }
+    }
+#endif
+    return "shaders/qmatmul.spv";
+}
+
+int coli_vk_init_env(const char *engine) {
+    const char *on = getenv("COLI_VULKAN");
+    if (!on || !atoi(on)) return 0;
+    char buf[1024];
+    const char *spv = coli_vk_shader_path(buf, sizeof buf);
+    int ok = coli_vk_init(spv) && coli_vk_available();
+    if (ok) fprintf(stderr, "[VK] %s: device ready\n", engine);
+    else fprintf(stderr, "[VK] %s: no usable Vulkan device (shaders %s), running on the CPU\n",
+                 engine, spv);
+    return ok;
 }
 
 /* Fused first half of the expert MLP: hidden = silu(gate(x)) * up(x), computed in ONE
@@ -1617,15 +1671,24 @@ static double now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts
 
 static int g_ref_gs = 64;   /* fmt=4 group size the harness cases use */
 static size_t ref_rowbytes(int fmt, int I) {
-    return fmt == 1 ? (size_t)I : fmt == 5 ? (size_t)((I + 63) / 64) * 24 : (size_t)(I + 1) / 2;
+    return fmt == 1 || fmt == 12 ? (size_t)I : fmt == 5 ? (size_t)((I + 63) / 64) * 24
+         : fmt == 10 ? (size_t)I * 4 : fmt == 11 ? (size_t)I * 2 : (size_t)(I + 1) / 2;
 }
 static size_t ref_scales(int fmt, int I, int O) {   // scale COUNT (per-group for fmt 4/5)
+    if (fmt == 10 || fmt == 11) return 1;
     if (fmt == 5) return (size_t)O * (size_t)((I + 63) / 64);
-    if (fmt == 4) return (size_t)O * (size_t)((I + g_ref_gs - 1) / g_ref_gs);
+    if (fmt == 4 || fmt == 12) return (size_t)O * (size_t)((I + g_ref_gs - 1) / g_ref_gs);
     return (size_t)O;
 }
 static float deq(const uint8_t *row, int fmt, int i) {
     if (fmt == 1) { int b = ((const int8_t *)row)[i]; return (float)b; }
+    if (fmt == 10) { float f; memcpy(&f, row + (size_t)i * 4, 4); return f; }
+    if (fmt == 12) { uint8_t b = row[i]; int e = (b >> 3) & 15, m = b & 7;   /* E4M3_LUT semantics */
+                     if ((b & 0x7f) == 0x7f) return NAN;
+                     float v = e == 0 ? m / 512.0f : ldexpf(1.0f + m / 8.0f, e - 7);
+                     return (b & 0x80) ? -v : v; }
+    if (fmt == 11) { uint16_t h; memcpy(&h, row + (size_t)i * 2, 2); uint32_t u = (uint32_t)h << 16;
+                     float f; memcpy(&f, &u, 4); return f; }
     if (fmt == 5) {   // int3-g64: 16B low plane (2 bits) + 8B high plane (1 bit), v+4
         const uint8_t *lo = row + (size_t)(i >> 6) * 24, *hi = lo + 16; int j = i & 63;
         unsigned u = ((lo[j >> 2] >> ((j & 3) * 2)) & 3u) | (((hi[j >> 3] >> (j & 7)) & 1u) << 2);
@@ -1636,10 +1699,10 @@ static float deq(const uint8_t *row, int fmt, int i) {
 static void cpu_ref(float *y, const float *x, const uint8_t *w, const float *sc,
                     int fmt, int S, int I, int O) {
     size_t rb = ref_rowbytes(fmt, I);
-    int gw2 = fmt == 4 ? g_ref_gs : 64, ng = (I + gw2 - 1) / gw2;
+    int gw2 = (fmt == 4 || fmt == 12) ? g_ref_gs : 64, ng = (I + gw2 - 1) / gw2;
     for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
         double sum = 0; const uint8_t *row = w + (size_t)o * rb;
-        if (fmt == 5 || fmt == 4) {   // per-group scales fold inside the sum
+        if (fmt == 5 || fmt == 4 || fmt == 12) {   // per-group scales fold inside the sum
             for (int g = 0; g < ng; g++) {
                 double a = 0; int end = (g + 1) * gw2 < I ? (g + 1) * gw2 : I;
                 for (int i = g * gw2; i < end; i++) a += x[s * I + i] * deq(row, fmt, i);
@@ -1648,7 +1711,7 @@ static void cpu_ref(float *y, const float *x, const uint8_t *w, const float *sc,
             y[s * O + o] = (float)sum;
         } else {
             for (int i = 0; i < I; i++) sum += x[s * I + i] * deq(row, fmt, i);
-            y[s * O + o] = (float)(sum * sc[o]);
+            y[s * O + o] = (float)(fmt == 10 || fmt == 11 ? sum : sum * sc[o]);
         }
     }
 }
@@ -1680,6 +1743,14 @@ static int run_case(int fmt, int S, int I, int O, int iters) {
     float *yc = malloc((size_t)S * O * sizeof(float));
     for (int i = 0; i < S * I; i++) x[i] = (float)((rand() % 200 - 100) / 100.0);
     for (size_t i = 0; i < rb * O; i++) w[i] = rand() & 0xff;
+    if (fmt == 12)                         /* no NaN bytes: they would poison the comparison */
+        for (size_t i = 0; i < rb * O; i++) if ((w[i] & 0x7f) == 0x7f) w[i] ^= 1;
+    if (fmt == 10 || fmt == 11)            /* float weights: random bytes could be NaN/Inf */
+        for (size_t i = 0; i < (size_t)I * O; i++) {
+            float f = (float)((rand() % 2001 - 1000) / 1000.0);
+            if (fmt == 10) memcpy(w + i * 4, &f, 4);
+            else { uint32_t u; memcpy(&u, &f, 4); uint16_t h = (uint16_t)(u >> 16); memcpy(w + i * 2, &h, 2); }
+        }
     for (size_t o = 0; o < nsc; o++) sc[o] = 0.01f + (rand() % 100) / 10000.0f;
 
     ColiVkTensor *t = NULL;
@@ -2085,6 +2156,30 @@ int main(int argc, char **argv) {
     bad |= run_case(5, 8, 6144, 2048, 20);   // int3 batch
     bad |= run_case(5, 1, 100, 64, 20);      // partial tail group (I%64 != 0)
     bad |= run_case(5, 1, 16384, 6144, 20);  // int3 o_proj shape (unstaged path)
+    /* f32 (fmt=10) and bf16 (fmt=11) weights: staged, batched, unstaged, odd widths */
+    bad |= run_case(10, 1, 6144, 1536, 20);
+    bad |= run_case(10, 8, 2048, 512, 10);
+    bad |= run_case(10, 1, 16384, 512, 5);
+    bad |= run_case(10, 3, 37, 5, 5);
+    bad |= run_case(11, 1, 6144, 1536, 20);
+    bad |= run_case(11, 8, 2048, 512, 10);
+    bad |= run_case(11, 1, 16384, 512, 5);
+    bad |= run_case(11, 3, 37, 5, 5);      // odd I: the last word holds one bf16
+    /* fp8 e4m3 (fmt=12), grouped scales: 64 (harness default), then 32 and 128 below */
+    bad |= run_case(12, 1, 6144, 1536, 20);
+    bad |= run_case(12, 8, 2048, 512, 10);
+    bad |= run_case(12, 1, 16384, 512, 5);
+    bad |= run_case(12, 3, 100, 5, 5);     // partial tail group
+    g_ref_gs = 32;  bad |= run_case(12, 2, 4096, 256, 5);
+    g_ref_gs = 128; bad |= run_case(12, 2, 4096, 256, 5);
+    g_ref_gs = 64;
+    /* COLI_VK_TEST_MATMUL_ONLY=1: stop after the per-format matmul cases above. CI runs
+     * this on Lavapipe, where the benches below say nothing and take most of the time. */
+    if (getenv("COLI_VK_TEST_MATMUL_ONLY") && atoi(getenv("COLI_VK_TEST_MATMUL_ONLY"))) {
+        printf(bad ? "FAIL\n" : "PASS\n");
+        coli_vk_shutdown();
+        return bad;
+    }
     /* Batched (amortized) throughput on the int4 expert shapes — the real expert-tier pattern. */
     {
         int I = 6144, O = 2048;   /* our gate/up dims */

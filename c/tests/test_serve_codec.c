@@ -197,6 +197,26 @@ static void test_writer_golden_bytes(void)
     fclose(output);
 }
 
+/* The handshake with a CAPS line: what the engine loaded, said between READY
+ * and STAT so the server knows it before it takes a request. NULL caps must
+ * produce the handshake byte for byte as before. */
+static void test_ready_caps_golden_bytes(void)
+{
+    FILE *output = tmpfile();
+    assert(output);
+    binary_stream(output);
+    assert(coli_serve_write_ready_caps(output, 1.25, "vision=1"));
+    assert(coli_serve_write_ready_caps(output, 1.25, NULL));
+    static const unsigned char expected[] =
+        "\x01\x01READY\x01\x01\nCAPS vision=1\nSTAT 0 0.0 0.0 1.25 0 0\n"
+        "\x01\x01READY\x01\x01\nSTAT 0 0.0 0.0 1.25 0 0\n";
+    unsigned char actual[sizeof(expected) + 16];
+    size_t count = read_output(output, actual, sizeof(actual));
+    assert(count == sizeof(expected) - 1);
+    assert(memcmp(actual, expected, count) == 0);
+    fclose(output);
+}
+
 static void test_allocation_failures_are_fatal_to_the_caller(void)
 {
     static const char frame[] = "SUBMIT req 0 1 1 0.7 0.95\nx\n";
@@ -219,6 +239,7 @@ int main(void)
     test_submit_and_controls();
     test_invalid_headers_and_bodies();
     test_writer_golden_bytes();
+    test_ready_caps_golden_bytes();
     test_allocation_failures_are_fatal_to_the_caller();
     puts("serve codec tests: ok");
     return 0;

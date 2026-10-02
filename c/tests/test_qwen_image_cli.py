@@ -130,6 +130,11 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(set(self.cli.IMAGE_CHAT_COMMANDS),
                          {"size", "steps", "seed", "render", "save", "help", "quit"})
         self.assertEqual(self.cli.chat_command("/size 1024x576"), ("size", "1024x576"))
+        # a picture's path at the start of a line is a message, not a command
+        self.assertEqual(self.cli.chat_command("/home/me/foto.png cosa vedi?"), (None, None))
+        self.assertEqual(self.cli.chat_command("~/Desktop/a.JPG"), (None, None))
+        self.assertEqual(self.cli.chat_command("/brio a | b"), ("brio", "a | b"))
+        self.assertEqual(self.cli.chat_command("/save /tmp/x/nome.png"), ("save", "/tmp/x/nome.png"))
 
 
 def run_coli(args, env, stdin=None, timeout=60):

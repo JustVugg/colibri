@@ -81,6 +81,62 @@ registry holds the same hot experts a RAM pin would, so the pin's RAM is
 better spent on the adaptive LRU cache. Keep `PIN` set so AUTOPIN does not
 re-pin from history.
 
+## The other engines
+
+Every engine links the same backend in a `VK=1` build (`make <engine> VK=1`;
+`make deepseek-v4 VK=1` for DeepSeek V4) and opens it with `COLI_VULKAN=1` once its
+weights are loaded. Kimi K3 has its own expert tier (`K3_VK`, see
+[ENVIRONMENT.md](ENVIRONMENT.md)) and glm53 its own section in
+[glm53-flash.md](glm53-flash.md). For the engines below, a missing device or missing
+shaders prints `[VK] <engine>: no usable Vulkan device ..., running on the CPU` and
+the run continues on the CPU. That differs from the GLM engine above, which exits.
+
+What these engines put on the device is their **resident** matrices, in the form
+they already hold in RAM, uploaded at the first multiply (MiMo uploads them at
+startup). Routed experts arrive from disk on every miss and stay on the CPU, with
+one opt-in exception for MiMo.
+
+| Engine | On the device | Weight formats | Stays on the CPU |
+|---|---|---|---|
+| qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) | the dense trunk | int8 rows; int4-g64 with `COLI_DENSE_BITS=4`; f32 with `COLI_DENSE_I8=0` | DeltaNet `dn_a`/`dn_b`, vision tower, routed experts |
+| qwen38 (Qwen3.8 Flash Next) | the trunk | int8 trunk rows, bf16, f32 (`Q38_NATIVE_BF16=0`) | routed FP8 experts |
+| inkling | dense and shared-expert matrices | int8 and int4-g64 (dense-int4g64 container), f32, bf16 | routed experts, embedding and audio lookups, CUDA residents; bf16 on CPUs with the AVX512-BF16 dot (see below) |
+| olmoe | attention q/k/v/o, router, lm_head | f32 | routed experts, embedding |
+| deepseek_v41 | the trunk, vision included | fp8 in 32x32 ue8m0 tiles, bf16 | routed experts |
+| deepseek_v4 | resident dense layers, head, router, compressors | fp8 in 128x128 blocks, bf16 | routed experts, the indexer's `weights_proj`, DSpark stages, the `--oracle` path |
+| mimo | trunk and vision tower; up to `MIMO_VK_EXPERTS=N` routed experts | native fp8/bf16, int8, f32 (`MIMO_DENSE_BITS`); experts as MXFP4 | router |
+| qwenimage | the DiT's matrices | int8, bf16, f32 (`COLI_IMG_BITS`) | text encoder, VAE, attention |
+
+Each engine ends a run, and each serve turn, with
+`[VK] <engine>: N matmuls on the GPU`. That count is how you tell a path that ran
+from one that only initialised.
+
+**Arithmetic.** The device reads the same weights the CPU reads and multiplies
+them by f32 activations.
+- Where the CPU's default kernel also uses f32 activations, the two differ only in
+  the order of the sums.
+- Where the CPU kernel rounds activations first, the device result instead matches
+  the CPU's f32-activation setting, so tokens can drift from the CPU default after
+  a few steps. These kernels are:
+  - qwen36's int8 dot (`COLI_DENSE_IDOT`, on by default);
+  - qwen38's int8 trunk;
+  - qwenimage's `COLI_IMG_ACT8`.
+- Two engines keep the CPU's exact arithmetic instead:
+  - deepseek_v4 rounds activations to E4M3 on the host before the call, as its CPU
+    kernel does.
+  - inkling leaves its bf16 matrices on the CPU when the build has the AVX512-BF16
+    dot (Zen 4/5, Sapphire Rapids), because that dot rounds activations to bf16.
+
+**Memory.** The host copy stays as the CPU fallback. On an integrated GPU or APU,
+which shares RAM with the CPU, the resident set is therefore held twice: size
+`RAM_GB`/caps with that in mind. The weight arena does not return freed tensors'
+memory, which is also why MiMo's expert tier never evicts.
+
+**Status.** CI checks every engine above on Lavapipe (`tests/vulkan_engines.sh`, the
+`vulkan-engines` job): each configuration gives the CPU run's tokens, and its matmul
+count is above zero. That proves correctness, not speed. None of these engines has
+been measured on a real GPU yet.
+
 ## Correctness
 
 - `gcc -O3 -DVK_TEST backend_vulkan.c -o test_vk -lvulkan -lm && ./test_vk

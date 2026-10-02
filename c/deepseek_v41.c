@@ -73,6 +73,11 @@
 #include "tok.h"
 #include "serve_codec.h"
 #include "serve_poll.h"
+#ifdef COLI_VULKAN
+#include "backend_vulkan.h"
+/* 1 once COLI_VULKAN=1 opened a device, after the weights load (a VK=1 build). */
+static int g_vk_ready = 0;
+#endif
 
 #define V41_MAX_LAYERS 64
 #define V41_MAX_ENGRAM 4
@@ -347,8 +352,11 @@ static void wf_load(shards *S, WF *w, const char *name, int64_t n) {
     w->n = n;
     w->w = xmalloc((size_t)n * sizeof(float), name);
     /* st_read_f32 widens bf16/f16 as well, so a checkpoint that stores one of these
-     * small tensors in bf16 rather than f32 still loads. */
-    if (st_read_f32(S, name, w->w, 0) != n) {
+     * small tensors in bf16 rather than f32 still loads.
+     * SEC: capped, because `n` comes from config.json and the element count from the
+     * file. Uncapped, a tensor longer than `n` was copied over the heap first and
+     * refused second, by the count check below, after the damage. */
+    if (st_read_f32_cap(S, name, w->w, n, 0) != n) {
         fprintf(stderr, "%s: expected %lld floats\n", name, (long long)n); exit(1); }
 }
 
@@ -361,6 +369,96 @@ static inline float ue8m0(uint8_t byte) {
     return value.f;
 }
 
+#ifdef COLI_VULKAN
+/* The resident trunk on the Vulkan device (COLI_VULKAN=1 in a VK=1 build), in the
+ * checkpoint's own formats: a W8 goes up as fmt 12, e4m3 with one f32 scale per 32
+ * inputs, each 32x32 tile's ue8m0 written out for its 32 rows; a WB as fmt 11, bf16.
+ * The CPU kernels multiply the same f32 activations, with no rounding of their own,
+ * so the device computes the same products and only sums them in another order.
+ * The routed experts stay on the CPU: they come from disk into an LRU slot and leave
+ * it again.
+ *
+ * The device copy is found by the weight pointer rather than kept in the matrix:
+ * wo_a's per-group blocks are W8 views built on the stack at every call, and a field
+ * there would upload them again each time. Every W8 and WB this engine multiplies
+ * lives as long as the model, so a pointer names the same bytes for the whole run.
+ * One command buffer: calls come from the thread that opened the device and never
+ * from inside an OpenMP region; anything else stays on the CPU. */
+typedef struct { const void *data; int fmt, O, I, refused; ColiVkTensor *t; } VkEntry;
+static VkEntry *g_vk_map;
+static size_t g_vk_cap, g_vk_used;
+static pthread_t g_vk_thread;
+
+static size_t vk_hash(const void *data, size_t cap) {
+    uint64_t h = (uint64_t)(uintptr_t)data * 0x9E3779B97F4A7C15ull;
+    return (size_t)(h >> 20) & (cap - 1);
+}
+
+static VkEntry *vk_entry(const void *data, int fmt, int O, int I) {
+    if ((g_vk_used + 1) * 2 > g_vk_cap) {
+        size_t cap = g_vk_cap ? g_vk_cap * 2 : 256;
+        VkEntry *map = calloc(cap, sizeof(*map));
+        if (!map) return NULL;
+        for (size_t i = 0; i < g_vk_cap; i++) {
+            if (!g_vk_map[i].data) continue;
+            size_t at = vk_hash(g_vk_map[i].data, cap);
+            while (map[at].data) at = (at + 1) & (cap - 1);
+            map[at] = g_vk_map[i];
+        }
+        free(g_vk_map);
+        g_vk_map = map; g_vk_cap = cap;
+    }
+    size_t at = vk_hash(data, g_vk_cap);
+    for (;; at = (at + 1) & (g_vk_cap - 1)) {
+        VkEntry *e = &g_vk_map[at];
+        if (!e->data) {
+            *e = (VkEntry){data, fmt, O, I, 0, NULL};
+            g_vk_used++;
+            return e;
+        }
+        if (e->data == data && e->fmt == fmt && e->O == O && e->I == I) return e;
+    }
+}
+
+/* y = W x for `rows` positions on the device; 0 sends the caller to its CPU kernel.
+ * x and y may be strided (wo_a's blocks read and write inside wider rows): the
+ * device wants them packed, so they are packed here. */
+static int vk_mul(int fmt, const void *data, const uint8_t *tiles, int O, int I,
+                  float *y, int ystride, const float *x, int xstride, int rows) {
+    if (!g_vk_ready || rows < 1 || !pthread_equal(pthread_self(), g_vk_thread)) return 0;
+#ifdef _OPENMP
+    if (omp_in_parallel()) return 0;
+#endif
+    VkEntry *e = vk_entry(data, fmt, O, I);
+    if (!e || e->refused) return 0;
+    float *scales = NULL;
+    if (!e->t && fmt == 12) {
+        int groups = (I + FP8_TILE - 1) / FP8_TILE;
+        scales = malloc((size_t)O * groups * sizeof(float));
+        if (!scales) return 0;
+        for (int o = 0; o < O; o++)
+            for (int g = 0; g < groups; g++)
+                scales[(size_t)o * groups + g] = ue8m0(tiles[(size_t)(o / FP8_TILE) * groups + g]);
+    }
+    int pack_x = rows > 1 && xstride != I, pack_y = rows > 1 && ystride != O;
+    float *xp = pack_x ? malloc((size_t)rows * I * sizeof(float)) : NULL;
+    float *yp = pack_y ? malloc((size_t)rows * O * sizeof(float)) : NULL;
+    int ok = 0;
+    if ((!pack_x || xp) && (!pack_y || yp)) {
+        for (int r = 0; pack_x && r < rows; r++)
+            memcpy(xp + (size_t)r * I, x + (size_t)r * xstride, (size_t)I * sizeof(float));
+        int had = e->t != NULL;
+        ok = coli_vk_matmul(&e->t, pack_y ? yp : y, pack_x ? xp : x, data, scales,
+                            fmt, rows, I, O, fmt == 12 ? FP8_TILE : 0);
+        if (!ok && !had && !e->t) e->refused = 1;   /* no device room: CPU from now on */
+        for (int r = 0; ok && pack_y && r < rows; r++)
+            memcpy(y + (size_t)r * ystride, yp + (size_t)r * O, (size_t)O * sizeof(float));
+    }
+    free(xp); free(yp); free(scales);
+    return ok;
+}
+#endif
+
 /* y[O] = W [O, I] x[I], W in e4m3 with one ue8m0 scale per 32x32 tile.
  *
  * The dense trunk's matvec, and the reason it is worth vectorising: V4.1's
@@ -369,6 +467,9 @@ static inline float ue8m0(uint8_t byte) {
  * checkpoint, the attention block was 41% of a turn's wall clock -- more than
  * the expert reads from disk. A scalar byte-at-a-time decode was most of it. */
 static void mv8(float *y, const W8 *w, const float *x) {
+#ifdef COLI_VULKAN
+    if (vk_mul(12, w->q, w->s, w->O, w->I, y, w->O, x, w->I, 1)) return;
+#endif
     int I = w->I, tiles_i = (I + FP8_TILE - 1) / FP8_TILE;
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < w->O; o++) {
@@ -417,6 +518,9 @@ static int mv_block_rows(int I) {
 }
 
 static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
+#ifdef COLI_VULKAN
+    if (vk_mul(12, w->q, w->s, w->O, w->I, y, ystride, x, xstride, rows)) return;
+#endif
     int I = w->I, tiles_i = (I + FP8_TILE - 1) / FP8_TILE;
     int block = mv_block_rows(I);
     for (int r0 = 0; r0 < rows; r0 += block) {
@@ -460,6 +564,9 @@ static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xst
 }
 
 static void mvb(float *y, const WB *w, const float *x) {
+#ifdef COLI_VULKAN
+    if (vk_mul(11, w->w, NULL, w->O, w->I, y, w->O, x, w->I, 1)) return;
+#endif
     int I = w->I;
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < w->O; o++) {
@@ -546,6 +653,15 @@ static void engram_load_sidecar(Engram *e, const char *snap) {
     jval *multipliers = json_get(root, "multipliers");
     if (!primes || !offsets || !multipliers) {
         fprintf(stderr, "[engram] sidecar lacks primes/offsets/multipliers\n"); exit(1); }
+    /* SEC: the loop below indexes all three by table, up to the length of layer_ids --
+     * a different number, chosen by the same file. A shorter array was read past its
+     * end, and a key that is not an array has no kids at all. */
+    const jval *per_table[] = { primes, offsets, multipliers };
+    const char *per_table_name[] = { "primes", "offsets", "multipliers" };
+    for (int k = 0; k < 3; k++)
+        if (per_table[k]->t != J_ARR || per_table[k]->len < e->n_layers) {
+            fprintf(stderr, "[engram] %s must be an array with one entry per table (%d)\n",
+                    per_table_name[k], e->n_layers); exit(1); }
     for (int layer = 0; layer < e->n_layers; layer++) {
         jval *rows = primes->kids[layer];
         for (int n = 0; n < rows->len && n < V41_MAX_NGRAM; n++)
@@ -3537,7 +3653,10 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
     coli_serve_stdio_init();
     int eos_ids[8];
     int n_eos = serve_eos(m, snap, eos_ids, 8);
-    coli_serve_write_ready(stdout, rss_gb());
+    /* CAPS between READY and STAT: the gateway reads it in the handshake, so it
+     * knows the served modalities before the first request. m->vision is NULL
+     * for a text-only container and for a VL config whose tower is missing. */
+    coli_serve_write_ready_caps(stdout, rss_gb(), m->vision ? "vision=1" : "vision=0");
     serve_emap(m);
     float *logits = xmalloc((size_t)c->vocab * sizeof(float), "logits");
     /* tok_encode stops at its output capacity: one extra id distinguishes
@@ -3886,6 +4005,20 @@ static int *load_ids(jval *root, const char *key, int *count) {
     return out;
 }
 
+/* One line at the end of a run with COLI_VULKAN=1: how many matmuls the device ran.
+ * coli_vk_matmul_calls() counts only calls that completed there, so a path that
+ * initialised and never ran cannot pass for one that did. */
+static void vk_report(void) {
+#ifdef COLI_VULKAN
+    if (!g_vk_ready) return;
+    size_t bytes = 0, tensors = 0;
+    coli_vk_mem_info(&bytes, &tensors);
+    fprintf(stderr, "[VK] deepseek_v41: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
+    fprintf(stderr, "[VK] deepseek_v41: %zu resident matrices on the device, %.1f MiB "
+                    "(fp8 as fmt 12, bf16 as fmt 11)\n", tensors, bytes / 1048576.0);
+#endif
+}
+
 int main(int argc, char **argv) {
     /* Size the team to PHYSICAL cores before anything else touches the model.
      * This engine issues ~720 OpenMP regions per decoded token -- three per
@@ -3915,6 +4048,12 @@ int main(int argc, char **argv) {
                     "window %d, engram %s — loaded in %.2fs\n",
             c->n_layers, c->n_routed, c->n_activated, c->dim, c->hc_mult, c->window,
             m.engram.active ? "on" : "off", now_s() - started);
+#ifdef COLI_VULKAN
+    /* After the weights, as in glm53: the device is an option, never a requirement.
+     * The matrices go up on their first multiply (see vk_mul), from this thread. */
+    g_vk_thread = pthread_self();
+    g_vk_ready = coli_vk_init_env("deepseek_v41");
+#endif
 
     if (getenv("SERVE") && atoi(getenv("SERVE"))) {
         char path[1024];
@@ -3924,6 +4063,7 @@ int main(int argc, char **argv) {
         const char *seed = getenv("SEED");
         srand(seed ? (unsigned)strtoul(seed, NULL, 10) : (unsigned)time(NULL));
         serve_loop(&m, &tokenizer, snap);
+        vk_report();
         return 0;
     }
     if (!ref_path) {
@@ -4105,6 +4245,7 @@ int main(int argc, char **argv) {
                         "verification path was NOT exercised\n");
         spec_failed = 1;
     }
+    vk_report();
     free(confidence); free(draft);
     free(logits); free(prompt); free(expected); json_free(root); free(arena); free(text);
     return (matched == n_expected && !vision_failed && !spec_failed) ? 0 : 1;

@@ -100,6 +100,12 @@ GEOMETRIES = {
                              rope_dim=8, n_experts=0, topk=0, inter=128,
                              dn_key_heads=2, dn_value_heads=6,
                              fused_experts=False, mtp=False, dense=True),
+    # Qwen/Qwen3-Coder-30B-A3B-Instruct, config.json: Qwen3MoeForCausalLM (qwen3_moe),
+    # 48 attention layers (no DeltaNet), 32:4 heads of 128, 128 experts top-8,
+    # norm_topk_prob, no shared expert, full rotary, rope_theta 1e7, plain RMSNorm.
+    "qwen3-coder-30b": dict(hidden=64, n_layers=6, q_heads=8, kv_heads=1, head_dim=16,
+                            rope_dim=16, n_experts=16, topk=4, inter=32,
+                            fused_experts=False, mtp=False, plain_qwen3=True),
 }
 
 
@@ -158,7 +164,7 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
           vocab=320, max_new=16, prompt_ids=None, emit_ref=None,
           ref_mode="attention_only", seed=20260817,
           dn_key_heads=None, dn_value_heads=None,
-          fused_experts=False, mtp=False, dense=False):
+          fused_experts=False, mtp=False, dense=False, plain_qwen3=False):
     if dn_key_heads is None:
         dn_key_heads = q_heads
     if dn_value_heads is None:
@@ -167,6 +173,11 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
     # three local draws passed, one CI draw failed at 11/16, with identical
     # code. A gate that reddens at random gets muted within a week.
     torch.manual_seed(seed)
+    if plain_qwen3:
+        model = _plain_qwen3(hidden, n_layers, q_heads, kv_heads, head_dim, n_experts,
+                             topk, inter, vocab)
+        return _save_and_reference(model, out, n_layers, max_new, prompt_ids, emit_ref,
+                                   "full", fused_experts, mtp, hidden, seed, "qwen3_moe_tiny")
     ModelCls, ConfigCls = get_classes(dense)
     layer_types = ["full_attention" if i % 4 == 3 else "linear_attention"
                    for i in range(n_layers)]
@@ -209,6 +220,46 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
                 pass
 
     model = ModelCls(cfg)
+    return _save_and_reference(model, out, n_layers, max_new, prompt_ids, emit_ref,
+                               ref_mode, fused_experts, mtp, hidden, seed, "qwen36_tiny")
+
+
+def _plain_qwen3(hidden, n_layers, q_heads, kv_heads, head_dim, n_experts, topk, inter,
+                 vocab):
+    """Qwen3-MoE as transformers ships it (Qwen3MoeForCausalLM). The RMSNorm weights
+    are drawn around 1 instead of left at 1, so a container that applied them as
+    zero-centered (1 + w), the Qwen3.5/3.6 convention, could not pass."""
+    import transformers
+    ModelCls = getattr(transformers, "Qwen3MoeForCausalLM", None)
+    if ModelCls is None:
+        sys.exit("this transformers build has no Qwen3MoeForCausalLM")
+    ConfigCls = ModelCls.config_class
+    base = dict(
+        vocab_size=vocab, hidden_size=hidden, intermediate_size=hidden * 2,
+        num_hidden_layers=n_layers, num_attention_heads=q_heads,
+        num_key_value_heads=kv_heads, head_dim=head_dim, num_experts=n_experts,
+        num_experts_per_tok=topk, moe_intermediate_size=inter, norm_topk_prob=True,
+        decoder_sparse_step=1, mlp_only_layers=[], max_position_embeddings=512,
+        rms_norm_eps=1e-6, rope_theta=10000000.0, tie_word_embeddings=False,
+        attention_bias=False, use_sliding_window=False, hidden_act="silu",
+        rope_parameters={"rope_type": "default", "rope_theta": 10000000.0},
+        pad_token_id=0, bos_token_id=1, eos_token_id=vocab - 1)
+    try:
+        cfg = ConfigCls(**base)
+    except TypeError:
+        import inspect
+        allowed = set(inspect.signature(ConfigCls.__init__).parameters) - {"self"}
+        cfg = ConfigCls(**{k: v for k, v in base.items() if k in allowed})
+    model = ModelCls(cfg)
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name.endswith("norm.weight"):
+                param.copy_(1.0 + 0.2 * torch.randn_like(param))
+    return model
+
+
+def _save_and_reference(model, out, n_layers, max_new, prompt_ids, emit_ref, ref_mode,
+                        fused_experts, mtp, hidden, seed, label):
     model.eval()
     out.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(out))
@@ -225,7 +276,7 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
         # script encodes a text prompt through AutoTokenizer.from_pretrained(),
         # and this fixture is synthetic: it has weights and no tokenizer. The
         # oracle script stays the tool for real checkpoints.
-        if ref_mode == "attention_only":
+        if ref_mode == "attention_only" and label == "qwen36_tiny":
             replaced = 0
             for i in range(n_layers):
                 if i % 4 != 3:
@@ -243,7 +294,7 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
                                      use_cache=True)
         full = out_ids[0].tolist()
         payload = {"prompt_ids": prompt_ids, "full_ids": full,
-                   "mode": ref_mode, "model": "qwen36_tiny"}
+                   "mode": ref_mode, "model": label}
         Path(emit_ref).write_text(json.dumps(payload, indent=2))
         print(f"ref.json -> {emit_ref}")
         print(f"  prompt_ids={prompt_ids}")

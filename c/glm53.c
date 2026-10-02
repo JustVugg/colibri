@@ -724,11 +724,20 @@ typedef struct {
     ColiVisionBlock *vblocks;
 } GModel;
 
-static const float *load_f32(GModel *m, const char *fmt, ...) {
+/* `want` e' quanti valori legge chi usa il tensore, contati dalla config. Il
+ * buffer e' grande quanto dice l'header del file: se dice meno, la prima norma
+ * o il router leggerebbero oltre la fine. Di piu' si accetta, come fa
+ * deepseek_v4 (GHSA-9gjf): un checkpoint col padding resta buono. */
+static const float *load_f32(GModel *m, int64_t want, const char *fmt, ...) {
     char name[512];
     va_list args; va_start(args, fmt); vsnprintf(name, sizeof(name), fmt, args); va_end(args);
     st_tensor *t = st_find(&m->S, name);
     if (!t) { fprintf(stderr, "missing tensor %s\n", name); exit(1); }
+    if (t->numel < want) {
+        fprintf(stderr, "%s: %lld values, the config needs %lld\n", name,
+                (long long)t->numel, (long long)want);
+        exit(1);
+    }
     float *buffer = malloc((size_t)t->numel * sizeof(float));
     if (!buffer) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
     st_read_f32_cap(&m->S, name, buffer, t->numel, 0);
@@ -1908,8 +1917,10 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                 float choice = score[e] + (l->rbias ? l->rbias[e] : 0.0f);
                 if (!used && choice > value) { value = choice; best = e; }
             }
-            mine[k] = best;
-            mine_w[k] = score[best];
+            /* SEC: all-NaN scores leave best at -1, and score[-1] is the very
+             * next read. See rt_router_pick in route_trace.h. */
+            mine[k] = rt_router_pick(best, k, c->n_experts, index);
+            mine_w[k] = score[mine[k]];
             total += mine_w[k];
         }
         for (int k = 0; k < topk; k++)
@@ -2122,6 +2133,10 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
     snprintf(probe, sizeof(probe), "%sembed_tokens.weight", m->prefix);
     if (!st_find(&m->S, probe)) snprintf(m->prefix, sizeof(m->prefix), "model.");
     const char *P = m->prefix;
+    /* Le misure con cui il forward legge i vettori f32 (vedi load_f32). Le
+     * matrici mHC sono [(2+hc)*hc, hc*hidden], come in hyper_connections.h. */
+    const Cfg *c = &m->c;
+    const int64_t D = c->hidden, hc = c->hc_mult, hc_mix = (2 + hc) * hc;
 
     if (layer_end < 0 || layer_end > m->c.n_layers) layer_end = m->c.n_layers;
     if (layer_begin < 0) layer_begin = 0;
@@ -2131,8 +2146,8 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
     m->has_io = load_io;
 
     if (load_io) {
-        m->embed = load_f32(m, "%sembed_tokens.weight", P);
-        m->final_norm = load_f32(m, "%snorm.weight", P);
+        m->embed = load_f32(m, c->vocab * D, "%sembed_tokens.weight", P);
+        m->final_norm = load_f32(m, D, "%snorm.weight", P);
     }
     /* La testa e' l'unica matrice grande fuori dagli esperti: a vocab 154880
      * per hidden 4096 sono 2,5 GB in f32, quindi passa dallo stesso
@@ -2169,20 +2184,20 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
 
     for (int i = layer_begin; i < layer_end; i++) {
         GLayer *l = &m->layer[i];
-        l->in_ln = load_f32(m, "%slayers.%d.input_layernorm.weight", P, i);
-        l->post_ln = load_f32(m, "%slayers.%d.post_attention_layernorm.weight", P, i);
-        l->hc_attn_fn = load_f32(m, "%slayers.%d.hc_attn_fn", P, i);
-        l->hc_attn_base = load_f32(m, "%slayers.%d.hc_attn_base", P, i);
-        l->hc_attn_scale = load_f32(m, "%slayers.%d.hc_attn_scale", P, i);
-        l->hc_ffn_fn = load_f32(m, "%slayers.%d.hc_ffn_fn", P, i);
-        l->hc_ffn_base = load_f32(m, "%slayers.%d.hc_ffn_base", P, i);
-        l->hc_ffn_scale = load_f32(m, "%slayers.%d.hc_ffn_scale", P, i);
+        l->in_ln = load_f32(m, D, "%slayers.%d.input_layernorm.weight", P, i);
+        l->post_ln = load_f32(m, D, "%slayers.%d.post_attention_layernorm.weight", P, i);
+        l->hc_attn_fn = load_f32(m, hc_mix * hc * D, "%slayers.%d.hc_attn_fn", P, i);
+        l->hc_attn_base = load_f32(m, hc_mix, "%slayers.%d.hc_attn_base", P, i);
+        l->hc_attn_scale = load_f32(m, 3, "%slayers.%d.hc_attn_scale", P, i);
+        l->hc_ffn_fn = load_f32(m, hc_mix * hc * D, "%slayers.%d.hc_ffn_fn", P, i);
+        l->hc_ffn_base = load_f32(m, hc_mix, "%slayers.%d.hc_ffn_base", P, i);
+        l->hc_ffn_scale = load_f32(m, 3, "%slayers.%d.hc_ffn_scale", P, i);
         if (m->c.is_full[i]) {
             l->qa = load_mat(m, "%slayers.%d.self_attn.q_a_proj.weight", P, i);
-            l->qa_ln = load_f32(m, "%slayers.%d.self_attn.q_a_layernorm.weight", P, i);
+            l->qa_ln = load_f32(m, c->q_lora, "%slayers.%d.self_attn.q_a_layernorm.weight", P, i);
             l->qb = load_mat(m, "%slayers.%d.self_attn.q_b_proj.weight", P, i);
             l->kva = load_mat(m, "%slayers.%d.self_attn.kv_a_proj_with_mqa.weight", P, i);
-            l->kva_ln = load_f32(m, "%slayers.%d.self_attn.kv_a_layernorm.weight", P, i);
+            l->kva_ln = load_f32(m, c->kv_lora, "%slayers.%d.self_attn.kv_a_layernorm.weight", P, i);
             {
                 char kvb_name[512];
                 snprintf(kvb_name, sizeof(kvb_name),
@@ -2193,10 +2208,11 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
             l->iwq = load_mat(m, "%slayers.%d.self_attn.indexer.wq_b.weight", P, i);
             l->iwk = load_mat(m, "%slayers.%d.self_attn.indexer.wk.weight", P, i);
             l->iwp = load_mat(m, "%slayers.%d.self_attn.indexer.weights_proj.weight", P, i);
-            l->ik_nw = load_f32(m, "%slayers.%d.self_attn.indexer.k_norm.weight", P, i);
-            l->ik_nb = load_f32(m, "%slayers.%d.self_attn.indexer.k_norm.bias", P, i);
+            l->ik_nw = load_f32(m, c->index_hd, "%slayers.%d.self_attn.indexer.k_norm.weight", P, i);
+            l->ik_nb = load_f32(m, c->index_hd, "%slayers.%d.self_attn.indexer.k_norm.bias", P, i);
             if (m->c.index_kpool > 1) {
-                l->ikpa = load_f32(m, "%slayers.%d.self_attn.indexer.index_kpool_compress_ape", P, i);
+                l->ikpa = load_f32(m, (int64_t)c->index_kpool * c->index_hd,
+                                   "%slayers.%d.self_attn.indexer.index_kpool_compress_ape", P, i);
                 l->ikpg = load_mat(m, "%slayers.%d.self_attn.indexer.index_kpool_compress_gate", P, i);
             }
         } else {
@@ -2209,9 +2225,9 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
             l->kfa = load_mat(m, "%slayers.%d.self_attn.f_a_proj.weight", P, i);
             l->kfb = load_mat(m, "%slayers.%d.self_attn.f_b_proj.weight", P, i);
             l->kb = load_mat(m, "%slayers.%d.self_attn.b_proj.weight", P, i);
-            l->dt = load_f32(m, "%slayers.%d.self_attn.dt_bias", P, i);
-            l->alog = load_f32(m, "%slayers.%d.self_attn.A_log", P, i);
-            l->onorm = load_f32(m, "%slayers.%d.self_attn.o_norm.weight", P, i);
+            l->dt = load_f32(m, c->kda_proj, "%slayers.%d.self_attn.dt_bias", P, i);
+            l->alog = load_f32(m, c->kda_heads, "%slayers.%d.self_attn.A_log", P, i);
+            l->onorm = load_f32(m, c->kda_hd, "%slayers.%d.self_attn.o_norm.weight", P, i);
             /* Il checkpoint tiene q/k/v conv separate; la ricorrenza le vuole
              * concatenate nello stesso ordine di qkv. */
             {
@@ -2219,7 +2235,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
                 float *conv = malloc((size_t)3 * width * sizeof(float));
                 const char *parts[3] = { "q_conv1d", "k_conv1d", "v_conv1d" };
                 for (int p = 0; p < 3; p++) {
-                    const float *piece = load_f32(m, "%slayers.%d.self_attn.%s.weight",
+                    const float *piece = load_f32(m, width, "%slayers.%d.self_attn.%s.weight",
                                                   P, i, parts[p]);
                     memcpy(conv + (size_t)p * width, piece, (size_t)width * sizeof(float));
                     free((void *)piece);
@@ -2232,10 +2248,10 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
             l->du = load_mat(m, "%slayers.%d.mlp.up_proj.weight", P, i);
             l->dd = load_mat(m, "%slayers.%d.mlp.down_proj.weight", P, i);
         } else {
-            l->router = load_f32(m, "%slayers.%d.mlp.gate.weight", P, i);
+            l->router = load_f32(m, c->n_experts * D, "%slayers.%d.mlp.gate.weight", P, i);
             l->rbias = st_find(&m->S, (snprintf(probe, sizeof(probe),
                         "%slayers.%d.mlp.gate.e_score_correction_bias", P, i), probe))
-                       ? load_f32(m, "%s", probe) : NULL;
+                       ? load_f32(m, c->n_experts, "%s", probe) : NULL;
             l->rg = load_mat(m, "%slayers.%d.mlp.shared_experts.gate_proj.weight", P, i);
             l->ru = load_mat(m, "%slayers.%d.mlp.shared_experts.up_proj.weight", P, i);
             l->rd = load_mat(m, "%slayers.%d.mlp.shared_experts.down_proj.weight", P, i);
@@ -2299,7 +2315,14 @@ static void vision_load(GModel *m) {
     const Cfg *c = &m->c;
     m->has_vision = 0;
     if (c->vis_layers <= 0) return;
-    if (!st_find(&m->S, "model.visual.patch_embed.proj.weight")) return;
+    if (!st_find(&m->S, "model.visual.patch_embed.proj.weight")) {
+        /* La config annuncia una torre che il checkpoint non porta: si serve
+         * solo testo, e lo si dice qui e al gateway (CAPS vision=0), invece di
+         * lasciarlo scoprire a chi manda una foto. */
+        fprintf(stderr, "vision_config present but model.visual.* tensors absent: "
+                        "serving text only, images will be refused\n");
+        return;
+    }
     const char *V = "model.visual.";
 
     m->vision.config = (ColiVisionConfig){
@@ -2311,36 +2334,41 @@ static void vision_load(GModel *m) {
         .eps = c->vis_eps, .swiglu_limit = c->vis_swiglu_limit,
         .rope_theta = 10000.0f,
     };
-    m->vision.patch_w = load_f32(m, "%spatch_embed.proj.weight", V);
-    m->vision.patch_b = load_f32(m, "%spatch_embed.proj.bias", V);
-    m->vision.post_norm = load_f32(m, "%spost_layernorm.weight", V);
-    m->vision.down_w = load_f32(m, "%sdownsample.weight", V);
-    m->vision.down_b = load_f32(m, "%sdownsample.bias", V);
-    m->vision.merger_proj = load_f32(m, "%smerger.proj.weight", V);
-    m->vision.merger_norm_w = load_f32(m, "%smerger.post_projection_norm.weight", V);
-    m->vision.merger_norm_b = load_f32(m, "%smerger.post_projection_norm.bias", V);
-    m->vision.merger_gate = load_f32(m, "%smerger.gate_proj.weight", V);
-    m->vision.merger_up = load_f32(m, "%smerger.up_proj.weight", V);
-    m->vision.merger_down = load_f32(m, "%smerger.down_proj.weight", V);
+    /* Le forme sono quelle scritte accanto ai campi in vision_tower.h. */
+    const ColiVisionConfig *vc = &m->vision.config;
+    const int64_t hidden = vc->hidden, inter = vc->intermediate, out = vc->out_hidden;
+    const int64_t proj = vc->proj_intermediate, merge = vc->merge;
+    const int64_t patch = (int64_t)vc->in_channels * vc->temporal * vc->patch * vc->patch;
+    m->vision.patch_w = load_f32(m, hidden * patch, "%spatch_embed.proj.weight", V);
+    m->vision.patch_b = load_f32(m, hidden, "%spatch_embed.proj.bias", V);
+    m->vision.post_norm = load_f32(m, hidden, "%spost_layernorm.weight", V);
+    m->vision.down_w = load_f32(m, out * hidden * merge * merge, "%sdownsample.weight", V);
+    m->vision.down_b = load_f32(m, out, "%sdownsample.bias", V);
+    m->vision.merger_proj = load_f32(m, out * out, "%smerger.proj.weight", V);
+    m->vision.merger_norm_w = load_f32(m, out, "%smerger.post_projection_norm.weight", V);
+    m->vision.merger_norm_b = load_f32(m, out, "%smerger.post_projection_norm.bias", V);
+    m->vision.merger_gate = load_f32(m, proj * out, "%smerger.gate_proj.weight", V);
+    m->vision.merger_up = load_f32(m, proj * out, "%smerger.up_proj.weight", V);
+    m->vision.merger_down = load_f32(m, out * proj, "%smerger.down_proj.weight", V);
 
     m->vblocks = calloc((size_t)c->vis_layers, sizeof(*m->vblocks));
     if (!m->vblocks) { fprintf(stderr, "OOM allocating vision blocks\n"); exit(1); }
     for (int b = 0; b < c->vis_layers; b++) {
         ColiVisionBlock *vb = &m->vblocks[b];
-        vb->norm1 = load_f32(m, "%sblocks.%d.norm1.weight", V, b);
-        vb->norm2 = load_f32(m, "%sblocks.%d.norm2.weight", V, b);
-        vb->qkv_w = load_f32(m, "%sblocks.%d.attn.qkv.weight", V, b);
-        vb->qkv_b = load_f32(m, "%sblocks.%d.attn.qkv.bias", V, b);
-        vb->q_norm = load_f32(m, "%sblocks.%d.attn.q_norm.weight", V, b);
-        vb->k_norm = load_f32(m, "%sblocks.%d.attn.k_norm.weight", V, b);
-        vb->proj_w = load_f32(m, "%sblocks.%d.attn.proj.weight", V, b);
-        vb->proj_b = load_f32(m, "%sblocks.%d.attn.proj.bias", V, b);
-        vb->gate_w = load_f32(m, "%sblocks.%d.mlp.gate_proj.weight", V, b);
-        vb->gate_b = load_f32(m, "%sblocks.%d.mlp.gate_proj.bias", V, b);
-        vb->up_w = load_f32(m, "%sblocks.%d.mlp.up_proj.weight", V, b);
-        vb->up_b = load_f32(m, "%sblocks.%d.mlp.up_proj.bias", V, b);
-        vb->down_w = load_f32(m, "%sblocks.%d.mlp.down_proj.weight", V, b);
-        vb->down_b = load_f32(m, "%sblocks.%d.mlp.down_proj.bias", V, b);
+        vb->norm1 = load_f32(m, hidden, "%sblocks.%d.norm1.weight", V, b);
+        vb->norm2 = load_f32(m, hidden, "%sblocks.%d.norm2.weight", V, b);
+        vb->qkv_w = load_f32(m, 3 * hidden * hidden, "%sblocks.%d.attn.qkv.weight", V, b);
+        vb->qkv_b = load_f32(m, 3 * hidden, "%sblocks.%d.attn.qkv.bias", V, b);
+        vb->q_norm = load_f32(m, vc->head_dim, "%sblocks.%d.attn.q_norm.weight", V, b);
+        vb->k_norm = load_f32(m, vc->head_dim, "%sblocks.%d.attn.k_norm.weight", V, b);
+        vb->proj_w = load_f32(m, hidden * hidden, "%sblocks.%d.attn.proj.weight", V, b);
+        vb->proj_b = load_f32(m, hidden, "%sblocks.%d.attn.proj.bias", V, b);
+        vb->gate_w = load_f32(m, inter * hidden, "%sblocks.%d.mlp.gate_proj.weight", V, b);
+        vb->gate_b = load_f32(m, inter, "%sblocks.%d.mlp.gate_proj.bias", V, b);
+        vb->up_w = load_f32(m, inter * hidden, "%sblocks.%d.mlp.up_proj.weight", V, b);
+        vb->up_b = load_f32(m, inter, "%sblocks.%d.mlp.up_proj.bias", V, b);
+        vb->down_w = load_f32(m, hidden * inter, "%sblocks.%d.mlp.down_proj.weight", V, b);
+        vb->down_b = load_f32(m, hidden, "%sblocks.%d.mlp.down_proj.bias", V, b);
     }
     m->vision.blocks = m->vblocks;
     m->has_vision = 1;
@@ -2939,6 +2967,9 @@ static int sample_token(const float *logits, int vocab) {
  * Se il prompt nuovo non estende quello vecchio, la sessione si rifa'. */
 #define GLM53_MAX_SLOTS 16
 
+/* la ricorrenza KDA di uno scatto: stato e finestra di ogni strato lineare */
+typedef struct { float **state, **window; int n_layers; } Glm53PinState;
+
 typedef struct {
     GSession *session;
     int *tokens;                          /* la sequenza che lo slot tiene */
@@ -2951,10 +2982,26 @@ typedef struct {
      * posizioni non esistono piu e gli scatti non valgono niente. */
     ColiPinPool pins;
     GSession *pin_session;
+    /* Dove riprendere il turno appena finito, se il prossimo prompt e' la
+     * sua storia esatta (un Continue dopo una disconnessione) o la sua storia
+     * senza gli spazi finali (lo stesso Continue, dopo che il gateway ha
+     * tolto gli spazi in coda). Valgono solo per il turno subito dopo: ogni
+     * turno li decide, li azzera, e li riscrive alla fine.
+     *
+     * tail_logit: la riga che predice la posizione `filled`, cioe' lo stato
+     * finale della sessione. Senza, un prompt uguale alla cache non avrebbe
+     * niente da macinare e quindi nessun logit, e si rifarebbe da capo.
+     *
+     * blank: lo stato KDA com'era prima del primo token di spazi dell'ultima
+     * corsa generata, con la riga che quel token l'ha scelto. E' il solo
+     * riavvolgimento che serve: il gateway toglie gli spazi in coda a un turno
+     * da continuare, quindi il Continue arriva corto di quella corsa. */
+    float *tail_logit;
+    int tail_len;
+    Glm53PinState *blank;
+    float *blank_logit;
+    int blank_len;
 } KVSlot;
-
-/* la ricorrenza KDA di uno scatto: stato e finestra di ogni strato lineare */
-typedef struct { float **state, **window; int n_layers; } Glm53PinState;
 
 static KVSlot g_slots[GLM53_MAX_SLOTS];
 static int g_n_slots = 0;
@@ -3065,11 +3112,57 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
     return 0;
 }
 
+/* Lo stato KDA della sessione, dentro o fuori da uno scatto. Il buffer si
+ * alloca la prima volta e poi si riusa (~149 MiB), 34 strati lineari da
+ * 64x128x128 piu' la finestra della convoluzione. */
+static int glm53_state_capture(const GModel *m, Glm53PinState **into, const GSession *s) {
+    const Cfg *c = &m->c;
+    const size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd;
+    const size_t nw = (size_t)3 * c->kda_proj * c->conv_k;
+    Glm53PinState *st = *into;
+    if (!st) {
+        st = (Glm53PinState *)calloc(1, sizeof(*st));
+        if (!st) return 0;
+        st->n_layers = c->n_layers;
+        st->state  = (float **)calloc((size_t)c->n_layers, sizeof(float *));
+        st->window = (float **)calloc((size_t)c->n_layers, sizeof(float *));
+        if (!st->state || !st->window) { glm53_pin_state_free(st); return 0; }
+        for (int i = 0; i < c->n_layers; i++) {
+            if (c->is_full[i] || !s->layer[i].kda_state) continue;
+            st->state[i]  = (float *)malloc(ns * sizeof(float));
+            st->window[i] = (float *)malloc(nw * sizeof(float));
+            if (!st->state[i] || !st->window[i]) { glm53_pin_state_free(st); return 0; }
+        }
+        *into = st;
+    }
+    for (int i = 0; i < c->n_layers; i++) {
+        if (c->is_full[i] || !s->layer[i].kda_state || !st->state[i]) continue;
+        memcpy(st->state[i],  s->layer[i].kda_state,  ns * sizeof(float));
+        memcpy(st->window[i], s->layer[i].kda_window, nw * sizeof(float));
+    }
+    return 1;
+}
+
+static void glm53_state_restore(const GModel *m, const Glm53PinState *st, GSession *s) {
+    const Cfg *c = &m->c;
+    const size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd;
+    const size_t nw = (size_t)3 * c->kda_proj * c->conv_k;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (c->is_full[i] || !s->layer[i].kda_state || !st->state[i]) continue;
+        memcpy(s->layer[i].kda_state,  st->state[i],  ns * sizeof(float));
+        memcpy(s->layer[i].kda_window, st->window[i], nw * sizeof(float));
+    }
+}
+
 static void slot_reset(const GModel *m, KVSlot *slot) {
     slot_pin_drop(m, slot);
     if (slot->session) session_close(m, slot->session);
     slot->session = NULL;
     slot->n = 0;
+    free(slot->tail_logit);
+    slot->tail_logit = NULL;
+    slot->tail_len = 0;
+    slot->blank_len = 0;          /* il buffer resta: si riusa alla prossima corsa */
 }
 
 /* Quanti token iniziali lo slot ha gia' in cache e puo' tenere. */
@@ -3414,11 +3507,35 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
                     : total <= cached && common == total ? (total == cached ? "equal" : "shorter")
                     : common < cached                    ? "diverged"
                     :                                      "extend";
+    /* Riprendere il turno appena finito senza macinare niente: il prompt e'
+     * la sua storia esatta (tail) o la sua storia fino all'inizio dell'ultima
+     * corsa di spazi (blank). Tutti e due valgono solo col turno subito
+     * prima, e il controllo sugli id e' contro la storia dello slot, cioe'
+     * contro quello che le righe tengono davvero. Non con un'immagine (gli
+     * id non la descrivono) e non con logprobs: la lettura ECHO vuole
+     * macinare le posizioni che riporta. Si decide prima della fotografia,
+     * che cambierebbe lo stato sotto. */
+    float *resume = NULL;
+    const int plain = !(g_pending.patches && g_pending.id == q->id) && q->logprobs == 0;
+    if (plain && cached > 0 && common == total) {
+        if (total == cached && slot->tail_logit && slot->tail_len == cached) {
+            resume = slot->tail_logit;
+            slot->tail_logit = NULL;
+        } else if (slot->blank && slot->blank_len == total && total < cached &&
+                   (resume = malloc((size_t)m->c.vocab * sizeof(float)))) {
+            memcpy(resume, slot->blank_logit, (size_t)m->c.vocab * sizeof(float));
+            glm53_state_restore(m, slot->blank, slot->session);
+            slot->session->filled = total;
+        }
+        if (resume) shared = total;
+    }
+    slot->tail_len = 0;
+    slot->blank_len = 0;
     /* La fotografia si prova sempre, non solo quando il riuso in avanti
      * fallisce: se lo stato vivo e gia il prompt condiviso, il riuso normale
      * scatterebbe lo stesso ma il primo token fresco resterebbe senza
      * predittore, e quindi senza logprob, proprio quello che serve. */
-    int pinned = slot_pin_restore(m, slot, sequence, total);
+    int pinned = resume ? 0 : slot_pin_restore(m, slot, sequence, total);
     if (pinned > 0) { shared = pinned; why = "pin"; }
     if (shared <= 0) {
         slot_reset(m, slot);
@@ -3461,7 +3578,8 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     }
     int rows = 1, ctl = SERVE_CTL_NONE, input_eof = 0;
     PrefillWatch watch = { q->id, &ctl, &input_eof };
-    float *logits = forward_prefill(m, slot->session, sequence + shared,
+    float *logits = resume ? resume
+                  : forward_prefill(m, slot->session, sequence + shared,
                                     total - shared, vision, n_vision, 0,
                                     prefill_should_halt, &watch);
     g_echo_k = 0; g_echo_id = 0;   /* la lettura riguarda il prefill, non la decodifica */
@@ -3478,6 +3596,14 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     else if (q->pin)
         fprintf(stderr, "[PIN] stato fotografato a %d token\n", total);
     GSession *session = slot->session;
+    /* GLM53_REWIND=1 accende lo scatto della corsa di spazi, che costa un
+     * buffer grande quanto lo stato KDA (~149 MiB, fuori da GLM53_EXPERT_GB)
+     * e una sua copia per ogni corsa, non per ogni token. Spento di
+     * default: lo pagherebbe ogni risposta, anche di chi non fa mai Continue. */
+    const char *rewind_setting = getenv("GLM53_REWIND");
+    const int keep_blank = q->logprobs == 0 && n_vision == 0 &&
+                           rewind_setting && atoi(rewind_setting);
+    int in_blank = 0;
     for (int step = 0; step < budget; step++) {
         /* #1332: una guardata a stdin per token. Il costo e' una select con
          * timeout zero; il guadagno e' che il gateway smette di aspettare un
@@ -3507,8 +3633,9 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         char lptail[1024]; lptail[0] = 0;
         if (q->logprobs > 0)
             coli_logprob_tail(lptail, sizeof lptail, row, m->c.vocab, next, q->logprobs);
-        free(logits);
-        logits = NULL;
+        /* `logits` resta finche' non ne arriva uno nuovo: a ogni uscita dal
+         * ciclo descrive la posizione `filled`, ed e' quello che il turno dopo
+         * riprende se il suo prompt e' questa storia esatta. */
         if (is_stop(next)) break;
         sequence[total++] = next;
         emitted++;
@@ -3517,11 +3644,42 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         if (q->logprobs > 0) serve_data_lp(q->id, piece, written, lptail);
         else serve_data(q->id, piece, written);
         if (step + 1 == budget) { limited = 1; break; }
-        logits = forward_span(m, session, &next, 1, NULL, 0);
+        /* Il primo token di soli spazi di una corsa: lo stato di adesso e la
+         * riga che l'ha scelto sono dove un Continue riprende se il gateway
+         * gli toglie la corsa in coda. Solo spazi ASCII: quello che
+         * str.rstrip() toglie in piu' (spazi Unicode, o spazi dentro un token
+         * con del testo) ritokenizza diverso e si rifa' da capo lo stesso. */
+        int blank = written > 0;
+        for (int i = 0; i < written && blank; i++)
+            blank = piece[i] == ' ' || piece[i] == '\n' || piece[i] == '\t' ||
+                    piece[i] == '\r' || piece[i] == '\v' || piece[i] == '\f';
+        if (keep_blank && blank && !in_blank) {
+            if (!slot->blank_logit)
+                slot->blank_logit = malloc((size_t)m->c.vocab * sizeof(float));
+            if (slot->blank_logit && glm53_state_capture(m, &slot->blank, session)) {
+                memcpy(slot->blank_logit, row, (size_t)m->c.vocab * sizeof(float));
+                slot->blank_len = session->filled;
+            }
+        }
+        in_blank = blank;
+        float *fed = forward_span(m, session, &next, 1, NULL, 0);
+        free(logits);
+        logits = fed;
         rows = 1;
     }
-    free(logits);
     free(vision);
+    /* Il turno dopo riprende da qui se il suo prompt e' questa storia esatta.
+     * Dopo un prefill interrotto `logits` e' NULL e non c'e' niente da
+     * riprendere: il nuovo tentativo estende quello che e' stato macinato.
+     * Non dopo un turno con un'immagine: il controllo del turno dopo e' sugli
+     * id, e gli id dei segnaposto non dicono quale immagine ha fatto queste
+     * righe. Una richiesta senza IMAGE e con gli stessi id riprenderebbe da
+     * embedding che non ha mandato. */
+    free(slot->tail_logit);
+    slot->tail_logit = n_vision == 0 ? logits : NULL;
+    slot->tail_len = slot->tail_logit ? session->filled : 0;
+    if (!slot->tail_logit) free(logits);
+    logits = NULL;
     /* La sessione resta allo slot per il turno dopo, con la sequenza che ha
      * davvero macinato: prompt piu' quello che ha generato. */
     slot_remember(slot, sequence, total);
@@ -3682,6 +3840,9 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
     setvbuf(stdin, NULL, _IONBF, 0);
     slots_init(m);
     serve_line("\x01\x01READY\x01\x01\n");
+    /* Fra READY e STAT: il gateway lo legge nella stretta di mano, quindi sa
+     * che modalita' serve prima della prima richiesta (docs/serve_protocol.md). */
+    serve_line("CAPS vision=%d\n", m->has_vision ? 1 : 0);
     serve_line("STAT 0 0.00 0.0 %.1f\n", rss_gb());
     /* La griglia va DOPO READY: il lettore di boot del server scarta tutto
      * fino al sentinel, e colibri.c fa lo stesso (READY, STAT, poi EMAP). */

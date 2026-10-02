@@ -212,13 +212,39 @@ LDFLAGS += -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib64/stubs -Wl,-rpath,$(CUDA_HOM
 endif
 endif
 
+# ---- Vulkan (opt-in): VK=1 ---------------------------------------------------
+# The parent Makefile's VK=1, for this engine: -DCOLI_VULKAN, the backend object
+# and the SPIR-V shaders it loads at run time (COLI_VK_SHADERS, else shaders/ next
+# to the binary). `make deepseek-v4 VK=1` in the parent reaches here through
+# MAKEFLAGS. The object has its own name because the parent builds
+# backend_vulkan.o with its own CFLAGS while these carry -flto and the units'
+# flags stamp: one file written by two builds is #1702 again. Independent of
+# CUDA=1, whose tier keeps running first when both are built.
+VK ?= 0
+GLSLC ?= glslc
+V4_VK_OBJ =
+V4_VK_SPV =
+ifeq ($(VK),1)
+CFLAGS += -DCOLI_VULKAN
+ifneq ($(IS_WIN),)
+# As in the parent: the loader is vulkan-1.dll, and -static would skip its
+# import library, so search dynamically for this one library only.
+LDFLAGS += -Wl,-Bdynamic -lvulkan-1 -Wl,-Bstatic
+else
+LDFLAGS += -lvulkan
+endif
+V4_VK_OBJ = backend_vulkan_v4.o
+V4_VK_SPV = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \
+	shaders/attention_absorb.spv shaders/rmsnorm.spv
+endif
+
 include Makefile.deepseek-v4.units
 
 TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
 V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
 V4_BATCH_TEST_OBJ = COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
-V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ)
+V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ) $(V4_VK_OBJ)
 REGISTRY_OBJ = expert_store_registry.o
 V4_SERVE_TEST := tests/test_v4_serve_framing$(if $(IS_WIN),.exe,)
 V4_SERVE_TEST_OBJS := $(filter-out COLI_V4_UNIT_GENERATE_STATS.o,$(V4_OBJS))
@@ -277,8 +303,15 @@ deepseek-v4-objs: $(V4_OBJS)
 print-v4-objs:
 	@echo $(V4_OBJS)
 
-$(V4_BINARY): $(V4_OBJS)
+$(V4_BINARY): $(V4_OBJS) $(V4_VK_SPV)
 	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
+
+# VK=1: the Vulkan backend compiled with this engine's flags, and the shaders.
+backend_vulkan_v4.o: backend_vulkan.c backend_vulkan.h $(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
+shaders/%.spv: shaders/%.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@
 
 # Pluggable expert-store backend registry (standalone; not a deepseek_v4.c unit).
 # Linked into the binary so the engine can dispatch COLI_EXPERT_STORE backends.
@@ -340,4 +373,4 @@ deepseek-v4-clean:
 	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_HOT_TEST_OBJ) \
 		$(V4_BATCH_TEST_OBJ) \
 		$(V4_SERVE_TEST) test_expert_store_registry $(V4_FLAGS_STAMP) \
-		$(V4_CUDA_FLAGS_STAMP)
+		$(V4_CUDA_FLAGS_STAMP) backend_vulkan_v4.o

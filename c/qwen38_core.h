@@ -11,6 +11,10 @@
 #define COLI_QWEN38_CORE_H
 #include "kv_prefix.h"
 #include <pthread.h>   /* q38_ehit_mark publishes the lazy HITS table under a lock */
+#ifdef COLI_VULKAN
+#include "backend_vulkan.h" /* COLI_VULKAN=1: the int8 trunk on a Vulkan device */
+static int g_vk_ready = 0;
+#endif
 
 #define Q38_MAX_LAYERS 512
 #define Q38_MAX_EXPERTS 1024
@@ -52,6 +56,8 @@ typedef struct {
     unsigned owns_data:1, owns_scales:1;
     int gpu;                       /* 0 = CPU; else 1 + tier handle of an int8 copy resident in VRAM (decode, S == 1) */
     int8_t *q8; float *q8sc;       /* the trunk's int8 rows on the CPU (default; Q38_TRUNK_CPU_INT8=0 keeps BF16): the same rows the GPU holds, met by an int8 activation in idot.h */
+    void *vk; int vk_off;          /* COLI_VULKAN=1: device copy of q8, or of the BF16/F32 rows (uploaded at the first matmul), vk_off = upload failed, stays on the CPU */
+    int vk_res;                    /* COLI_VULKAN=1: a resident matrix (q38_load_weight), never an expert slot that is refilled in place */
 } Q38Weight;
 
 typedef struct { float *norm; Q38Weight down, up, inject; } GatedResidual;
@@ -222,6 +228,9 @@ static void q38_weight_free(Q38Weight *weight) {
     if(weight->owns_data)free(weight->data);
     if(weight->owns_scales)free(weight->scales);
     free(weight->q8); free(weight->q8sc);
+#ifdef COLI_VULKAN
+    if(weight->vk)coli_vk_tensor_free((ColiVkTensor*)weight->vk);
+#endif
     memset(weight,0,sizeof(*weight));
 }
 
@@ -346,6 +355,52 @@ static void q38_matmul_fp8(float *y,const float *x,const uint8_t *q8,const float
     matmul_fp8(y,x,q8,bscale,S,I,O);
 }
 
+#ifdef COLI_VULKAN
+/* COLI_VULKAN=1: a resident matrix answers from the Vulkan device, decode and
+ * prefill alike, with the weights the CPU would read and in the order
+ * q38_weight_matmul picks them: the trunk's int8 rows when there are (q8, one
+ * scale per row, fmt 1), else the rows as loaded, BF16 (fmt 11) or F32
+ * (fmt 10, Q38_NATIVE_BF16=0), times the f32 activation like
+ * q38_matmul_bf16 / q38_matmul. For the int8 rows the activation stays f32
+ * on the device where the CPU's integer kernel rounds it to int8; the float
+ * rows differ from the CPU only in the order of the sums. Only matrices
+ * loaded by q38_load_weight (vk_res) qualify: the routed experts' slots are
+ * refilled in place, so a copy cached in them would go stale, and they stay
+ * on the CPU in every format. The device copy lives in weight->vk from the
+ * first call; a failed upload sets vk_off and the matrix stays on the CPU.
+ * The backend has one command buffer: never from a parallel region. */
+static int q38_vk_eligible(const Q38Weight *w) {
+    return w->q8 || (w->vk_res && w->data &&
+                     (w->kind==Q38_WEIGHT_BF16 || w->kind==Q38_WEIGHT_F32));
+}
+static unsigned g_q38_vk_placed[3];   /* uploads by format: int8 rows, bf16, f32 */
+static int q38_vk_matmul(float *y,const float *x,const Q38Weight *weight,int S,int I,int O) {
+#ifdef _OPENMP
+    if(omp_in_parallel())return 0;
+#endif
+    if(weight->vk_off||S<1||S>65535)return 0;
+    Q38Weight *w=(Q38Weight*)weight;   /* vk is a cache in a weight the forward pass treats as read-only */
+    ColiVkTensor **t=(ColiVkTensor**)&w->vk;
+    int fmt=w->q8?1:w->kind==Q38_WEIGHT_BF16?11:10;
+    const void *wq=w->q8?(const void*)w->q8:(const void*)w->data;
+    const float *sc=w->q8?w->q8sc:NULL;   /* fmt 10/11: no scales */
+    if(!*t){
+        if(!coli_vk_tensor_ensure(t,wq,sc,fmt,I,O,0)){w->vk_off=1;return 0;}
+        g_q38_vk_placed[fmt==1?0:fmt==11?1:2]++;
+    }
+    return coli_vk_matmul(t,y,x,wq,sc,fmt,S,I,O,0);
+}
+/* One line at the end of a run or a serve turn: how many matmuls the device
+ * really answered, so a test can tell a used path from an initialised one. */
+static void q38_vk_report(void) {
+    if(!g_vk_ready)return;
+    size_t bytes=0,tensors=0;
+    coli_vk_mem_info(&bytes,&tensors);
+    fprintf(stderr,"[VK] qwen38: %llu matmuls on the GPU (%zu matrices resident, %.1f MiB; placed int8 %u, bf16 %u, f32 %u)\n",
+            coli_vk_matmul_calls(),tensors,bytes/1048576.0,
+            g_q38_vk_placed[0],g_q38_vk_placed[1],g_q38_vk_placed[2]);
+}
+#endif
 static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
                               int S,int I,int O) {
     /* A matrix the tier placed in VRAM (q38_trunk_place) answers a decode
@@ -353,6 +408,10 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
      * so the BF16 copy stays the reference for everything but S == 1. */
     if(S==1&&weight&&weight->gpu&&weight->rows==O&&weight->cols==I&&
        qt_dense_matmul(weight->gpu-1,y,x,I,O))return;
+#ifdef COLI_VULKAN
+    if(g_vk_ready&&weight&&weight->rows==O&&weight->cols==I&&q38_vk_eligible(weight)&&
+       q38_vk_matmul(y,x,weight,S,I,O))return;
+#endif
     if(weight&&weight->q8&&weight->rows==O&&weight->cols==I){
         /* the trunk's int8 rows (the same the GPU holds) meet an int8
          * activation in the integer kernel: x quantized once per row with one
@@ -709,6 +768,9 @@ static Q38Weight q38_load_weight(Model *m,const char *name,int rows,int cols) {
         st_read_f32(&m->S,name,(float*)weight.data,1);
     }
     m->resident_weight_bytes+=q38_weight_bytes(&weight);
+#ifdef COLI_VULKAN
+    weight.vk_res=1;   /* resident for the life of the model: its rows may live on the device */
+#endif
     return weight;
 }
 

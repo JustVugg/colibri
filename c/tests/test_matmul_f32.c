@@ -1,10 +1,11 @@
 /* f32 matmul exactness gate (#442).
  *
- * On FMA targets quant.h's matmul computes each output as one fmaf chain over
- * i in order, eight rows at a time. The row blocking must not change a single
- * bit: this compares it with memcmp against the one-row fmaf chain, over shapes
- * that exercise the eight-row blocks, the leftover rows and short rows. Without
- * FMA matmul keeps the plain `a+=x*w` loop, and the reference follows it.
+ * matmul_f32.h computes each output in MATMUL_F32_LANES fixed lanes (lane j
+ * takes i == j mod lanes, in order) and sums the lanes in a halving tree. The
+ * vectorized loop must give exactly the bits of that definition written out
+ * one element at a time: this compares them with memcmp over shapes that
+ * exercise full lane blocks, a partial last block and rows shorter than one
+ * block. With FMA every lane step is an fmaf, without it `a+x*w`.
  *
  * Build: make -C c tests/test_matmul_f32 */
 #include <stdio.h>
@@ -19,17 +20,20 @@ static float rnd_f(void){ rng^=rng<<13; rng^=rng>>7; rng^=rng<<17; return (float
 
 static void ref_matmul(float *y, const float *x, const float *W, int S, int I, int O){
     for (int o=0;o<O;o++){ const float *w=W+(int64_t)o*I;
-        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0;
+        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; volatile float a[MATMUL_F32_LANES]={0};
+            for (int i=0;i<I;i++){ int j=i%MATMUL_F32_LANES;
 #if defined(__FMA__) || defined(__ARM_FEATURE_FMA)
-            for(int i=0;i<I;i++) a=fmaf(xs[i],w[i],a);
+                a[j]=fmaf(xs[i],w[i],a[j]);
 #else
-            for(int i=0;i<I;i++) a+=xs[i]*w[i];
+                a[j]=a[j]+xs[i]*w[i];
 #endif
-            y[(int64_t)s*O+o]=a; } }
+            }
+            for (int h=MATMUL_F32_LANES/2;h>0;h>>=1) for (int j=0;j<h;j++) a[j]=a[j]+a[j+h];
+            y[(int64_t)s*O+o]=a[0]; } }
 }
 
 int main(void){
-    static const int shapes[][3]={ {1,1,1}, {1,5,8}, {1,7,13}, {3,33,17}, {2,1027,41},
+    static const int shapes[][3]={ {1,1,1}, {1,5,8}, {1,7,13}, {1,31,3}, {1,32,3}, {3,33,17}, {2,1027,41}, {1,2048,32},
                                    {1,2048,64}, {4,2048,64}, {5,6144,256}, {1,6144,257} };
     int fails=0;
     for (size_t k=0;k<sizeof shapes/sizeof shapes[0];k++){

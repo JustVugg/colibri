@@ -72,6 +72,8 @@ def handshake(process):
     if "READY" not in ready:
         raise AssertionError(f"prima riga {ready!r}, atteso il sentinello READY")
     stat = read_line(process.stdout)
+    while stat.startswith("CAPS "):        # CAPS vision=<0|1> sits between READY and STAT
+        stat = read_line(process.stdout)
     if not stat.startswith("STAT "):
         raise AssertionError(f"seconda riga {stat!r}, atteso STAT")
 
@@ -103,6 +105,24 @@ def collect(process, request_id):
             pieces.append(payload[:int(count)])
         elif line.startswith("DONE ") or line.startswith("ERROR "):
             return b"".join(pieces), line, reuse_reported()
+
+
+def fresh_answer(binary, fixture, body, tokens):
+    """La risposta di un motore appena partito: il riferimento per ogni riuso.
+    Un motore suo, perche' lo slot di un altro potrebbe riusare qualcosa."""
+    reference = engine(binary, fixture)
+    try:
+        handshake(reference)
+        submit_bytes(reference, 1, body, max_tokens=tokens)
+        answer, done, _ = collect(reference, 1)
+        reference.stdin.close()
+        reference.wait(timeout=60)
+    finally:
+        if reference.poll() is None:
+            reference.kill()
+    if not done.startswith("DONE 1 "):
+        raise AssertionError(f"il riferimento ha chiuso con {done!r}")
+    return answer
 
 
 def cli_answer(binary, fixture, prompt, tokens):
@@ -265,18 +285,23 @@ def main() -> int:
 
         # Il Continue di un client che ha ricevuto tutto: il prompt di prima
         # piu' esattamente i token arrivati. Coincide con la cache, token per
-        # token, e il riuso salta lo stesso perche' non resta niente da
-        # macinare. La riga REUSE deve dirlo ("equal"), non confonderlo con un
-        # prompt che diverge.
-        submit_bytes(process, 20, prompt.encode() + cancelled_text, max_tokens=1)
-        _, done20, _ = collect(process, 20)
+        # token, quindi non resta niente da macinare: il motore riprende dai
+        # logit tenuti alla fine del turno interrotto, senza rifare il
+        # prefill, e deve rispondere come un motore appena partito.
+        continued = prompt.encode() + cancelled_text
+        submit_bytes(process, 20, continued, max_tokens=1)
+        resumed20, done20, _ = collect(process, 20)
         if not done20.startswith("DONE 20 "):
             print(f"FAIL: Continue dopo il CANCEL -> {done20!r}")
             return 1
         why20 = reuse_line(20)
-        if why20[3:] != [str(cancel_filled)] * 3 + ["equal"]:
+        if why20[2:] != [str(cancel_filled)] * 4 + ["equal"]:
             print(f"FAIL: Continue identico alla cache -> REUSE {why20!r}, atteso "
-                  f"prompt, cache e comune tutti {cancel_filled} con motivo equal")
+                  f"{cancel_filled} riusati su {cancel_filled}, motivo equal")
+            return 1
+        if resumed20 != fresh_answer(binary, arguments.fixture, continued, 1):
+            print(f"FAIL: ripreso dai logit tenuti, il Continue risponde "
+                  f"{resumed20!r} e un motore appena partito no")
             return 1
 
         # Dopo un CANCEL lo stream deve restare allineato come dopo un errore:
@@ -452,6 +477,109 @@ def main() -> int:
               f"  da sessione pulita: {clean!r}")
         return 1
 
+    # --- Continue senza la corsa di spazi finale ---
+    #
+    # Il gateway rifiuta un turno da continuare che finisce con spazi (il
+    # template li toglie), e il client li toglie prima di mandarlo: il
+    # Continue arriva corto della corsa di spazi che il motore ha generato e
+    # gia' in cache. Il motore tiene lo stato di prima di quella corsa e
+    # riprende da li'.
+    #
+    # Serve una risposta con testo e poi almeno due token di soli spazi. Il
+    # modello a pesi casuali non si sceglie, quindi si cerca un prompt che la
+    # dia. Il budget ferma il turno prima di macinare il suo ultimo token, e
+    # si prova due volte:
+    # - fino al secondo spazio compreso: il primo e' macinato, quindi la cache
+    #   ha un token piu' del Continue tagliato e si deve davvero riavvolgere;
+    # - un token dopo: sono macinati tutti e due, come dopo un client che se
+    #   ne va, e il secondo passa anche lui dal punto dove si scatta. Lo
+    #   scatto deve restare quello del primo. Un motore che scattasse a ogni
+    #   spazio riprenderebbe solo dal secondo, il Continue non combacerebbe e
+    #   si rifarebbe il prefill: giusto ma lento, e nessun altro caso se ne
+    #   accorgerebbe. (Tre spazi di fila la fixture non li da' in 400 prompt.)
+    spaces = set(b" \t\n\r\x0b\x0c")
+    scout = engine(binary, arguments.fixture)
+    found = None
+    try:
+        handshake(scout)
+        for attempt in range(400):
+            candidate = f"gu{attempt}".encode()
+            submit_bytes(scout, 100 + attempt, candidate, max_tokens=48)
+            pieces = []
+            while True:
+                line = read_line(scout.stdout)
+                if line.startswith("DATA "):
+                    count = int(line.split()[2])
+                    pieces.append(scout.stdout.read(count + 1)[:count])
+                elif line.startswith("DONE ") or line.startswith("ERROR "):
+                    break
+            for k in range(1, len(pieces) - 1):
+                head = pieces[:k + 2]
+                if all(len(piece) == 1 for piece in head) \
+                        and head[k - 1][0] not in spaces \
+                        and head[k][0] in spaces and head[k + 1][0] in spaces:
+                    found = (candidate, pieces[:k], k)
+                    break
+            if found:
+                break
+        scout.stdin.close()
+        scout.wait(timeout=60)
+    finally:
+        if scout.poll() is None:
+            scout.kill()
+    if not found:
+        print("FAIL: nessun prompt fra 400 da' testo seguito da due spazi; la "
+              "fixture e' cambiata e il caso del riavvolgimento non si prova")
+        return 1
+    blank_prompt, kept, k = found
+    trimmed = blank_prompt + b"".join(kept)
+    for fed, first in ((1, 40), (2, 44)):
+        rewound = engine(binary, arguments.fixture, {"GLM53_REWIND": "1"})
+        try:
+            handshake(rewound)
+            submit_bytes(rewound, first, blank_prompt, max_tokens=k + fed + 1)
+            _, done_run, _ = collect(rewound, first)
+            submit_bytes(rewound, first + 1, trimmed, max_tokens=4)
+            from_rewind, done_continue, _ = collect(rewound, first + 1)
+            rewound.stdin.close()
+            rewound.wait(timeout=60)
+        finally:
+            if rewound.poll() is None:
+                rewound.kill()
+        if not done_run.startswith(f"DONE {first} ") \
+                or not done_continue.startswith(f"DONE {first + 1} "):
+            print(f"FAIL: riavvolgimento -> {done_run!r} / {done_continue!r}")
+            return 1
+        expected = [str(len(trimmed)), str(len(trimmed)), str(len(blank_prompt) + k + fed),
+                    str(len(trimmed)), "shorter"]
+        if reuse_line(first + 1)[2:] != expected:
+            print(f"FAIL: il Continue senza i {fed} spazi finali in cache doveva "
+                  f"riprendere dai {len(trimmed)} token prima della corsa: "
+                  f"{reuse_line(first + 1)!r}")
+            return 1
+        if from_rewind != fresh_answer(binary, arguments.fixture, trimmed, 4):
+            print(f"FAIL: riavvolto di {fed} spazi, il Continue risponde "
+                  f"{from_rewind!r} e un motore appena partito no")
+            return 1
+    # Lo stesso senza GLM53_REWIND, cioe' il default: niente scatto, prefill
+    # da capo.
+    unwound = engine(binary, arguments.fixture)
+    try:
+        handshake(unwound)
+        submit_bytes(unwound, 42, blank_prompt, max_tokens=k + 2)
+        collect(unwound, 42)
+        submit_bytes(unwound, 43, trimmed, max_tokens=4)
+        collect(unwound, 43)
+        unwound.stdin.close()
+        unwound.wait(timeout=60)
+    finally:
+        if unwound.poll() is None:
+            unwound.kill()
+    if reuse_line(43)[2] != "0":
+        print(f"FAIL: senza GLM53_REWIND il Continue non doveva riusare: "
+              f"{reuse_line(43)!r}")
+        return 1
+
     # --- CANCEL durante il prefill ---
     #
     # Il CANCEL si guarda anche fra un pezzo di prefill e l'altro: prima un
@@ -552,6 +680,7 @@ def main() -> int:
           f"al secondo turno con la stessa risposta di una sessione pulita, "
           f"CANCEL onorato a meta' turno dopo {emitted_before} token su {budget}, "
           f"STOP chiuso col DONE dopo {emitted_stop} token su {stop_budget}, "
+          f"Continue senza gli spazi finali ripreso a {len(trimmed)} token, "
           f"CANCEL durante il prefill fermo a 10 token su {len(body)} e riusato "
           f"dal nuovo tentativo, "
           f"SUBMIT a slot occupato rifiutato con SLOT_BUSY, "

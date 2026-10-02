@@ -68,6 +68,15 @@ static int g_cuda = 0;
 #include "backend_metal.h"
 static int g_metal = 0;
 #endif
+#ifdef COLI_VULKAN
+/* Vulkan (opt-in, VK=1 build + COLI_VULKAN=1): the RESIDENT matrices, in the form
+ * they are kept in RAM, uploaded on first use -- the dense-int4g64 container's int8
+ * (fmt 1) and int4-g64 (fmt 4), and the f32 (fmt 10) and bf16 (fmt 11) residents of
+ * an unconverted snapshot. Routed experts, which arrive from disk, and the embedding
+ * row lookups stay on the CPU; CUDA keeps its own bf16 residents. */
+#include "backend_vulkan.h"
+static int g_vk_ready = 0;
+#endif
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <sys/sysctl.h>
@@ -111,7 +120,12 @@ typedef struct {
 typedef struct { float *f; uint16_t *h; void *dev;
                  uint8_t *q4;        /* int4 nibble-packed (qbits=4) o int8 (qbits=8) */
                  float *qs;          /* scale: [rows*ng] se qbits=4, [rows] se qbits=8 */
-                 int gs, qbits; int64_t qn; } Wt;   /* qn = byte in q4, per il guard OOB */
+                 int gs, qbits; int64_t qn;   /* qn = byte in q4, per il guard OOB */
+#ifdef COLI_VULKAN
+                 void *vk;           /* InkVk of the loaded tensor, shared by its wt_off_i
+                                      * views (NULL = CPU only) */
+#endif
+               } Wt;
 
 typedef struct {
     float *in_ln, *post_ln;
@@ -187,19 +201,7 @@ static float siluf(float x) { return x / (1.f + expf(-x)); }
  * cumulato p. 0 = spento (default): tutti i topk, calcolo invariato. */
 static float g_topp = 0.f;
 
-/* y[S,O] = x[S,I] @ W^T, W row-major [O,I] */
-static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const float *w = W + (int64_t)o * I;
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s * I;
-            float acc = 0.f;
-            for (int i = 0; i < I; i++) acc += xs[i] * w[i];
-            y[(int64_t)s * O + o] = acc;
-        }
-    }
-}
+#include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
 
 #if defined(__AVX512BF16__) && defined(__AVX512F__)
 #include <immintrin.h>
@@ -413,6 +415,75 @@ static void matmul_i8r(float *y, const float *x, const int8_t *q, const float *s
     }
 }
 
+#ifdef COLI_VULKAN
+/* Device copies of one loaded tensor. A Wt travels by value and the shared
+ * experts are read through wt_off_i views of one fused [ns][R,I] tensor, so the
+ * cache cannot live in the copy matmul_w receives: it lives in a table the
+ * loaded Wt points to and every view copies, one entry per view (keyed by the
+ * view's first weight). Released with the tensor it belongs to. */
+typedef struct { const void *q; ColiVkTensor *t; int dead; } InkVkView;
+typedef struct { int n; InkVkView e[]; } InkVk;
+
+/* The shader format that reads a weight exactly as the CPU kernel does, 0 for none.
+ * int8 per row (matmul_i8r) is fmt 1; int4 group-scaled with +8 nibbles and the low
+ * nibble on the even column (matmul_i4g) is fmt 4; f32 (matmul) is fmt 10; bf16
+ * (matmul_h) is fmt 11 -- except where matmul_h rounds the activations to bf16
+ * (the AVX512-BF16 dot), which the shader does not: there bf16 stays on the CPU. */
+static int ink_vk_fmt(const Wt *w) {
+    if (w->q4) return w->qbits == 8 ? 1 : (w->qbits == 4 && w->gs >= 8 && w->gs % 8 == 0) ? 4 : 0;
+    if (w->f) return 10;
+#ifndef HAVE_BF16_DOT
+    if (w->h) return 11;
+#endif
+    return 0;
+}
+/* Attach a table to a loaded tensor the shader can read; returns its fmt, or 0. */
+static int ink_vk_attach(Wt *w, int views) {
+    int fmt = ink_vk_fmt(w);
+    if (!fmt || w->vk || views < 1) return 0;
+    InkVk *v = calloc(1, sizeof(*v) + (size_t)views * sizeof(v->e[0]));
+    if (!v) return 0;
+    v->n = views;
+    w->vk = v;
+    return fmt;
+}
+static void ink_vk_release(Wt *w) {
+    InkVk *v = w->vk;
+    if (!v) return;
+    for (int k = 0; k < v->n; k++) if (v->e[k].t) coli_vk_tensor_free(v->e[k].t);
+    free(v);
+    w->vk = NULL;
+}
+/* 1 when y was computed on the device. One command buffer in the backend:
+ * main thread only, never from inside a parallel region. */
+static int ink_vk_matmul(float *y, const float *x, const Wt *W, int S, int I, int O) {
+    InkVk *v = W->vk;
+    if (!g_vk_ready || !v) return 0;
+#ifdef _OPENMP
+    if (omp_in_parallel()) return 0;
+#endif
+    int fmt = ink_vk_fmt(W);
+    const void *data = W->q4 ? (const void *)W->q4 : W->f ? (const void *)W->f : (const void *)W->h;
+    if (!fmt || !data) return 0;
+    for (int k = 0; k < v->n; k++) {
+        InkVkView *e = &v->e[k];
+        if (e->q && e->q != data) continue;
+        if (e->dead) return 0;
+        e->q = data;
+        if (coli_vk_matmul(&e->t, y, x, data, W->q4 ? W->qs : NULL, fmt, S, I, O,
+                           W->q4 ? W->gs : 0))
+            return 1;
+        if (!e->t) e->dead = 1;          /* refused at upload: this view stays on the CPU */
+        return 0;
+    }
+    return 0;
+}
+static void ink_vk_report(void) {
+    if (g_vk_ready)
+        fprintf(stderr, "[VK] inkling: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
+}
+#endif
+
 #ifdef COLI_INKLING_SHARED_BATCH_TEST
 static uint64_t g_matmul_w_calls;
 #endif
@@ -434,10 +505,16 @@ static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
             fprintf(stderr, "dense q4: geometria incoerente (serve %lld B, ho %lld) I=%d O=%d\n",
                     (long long)need, (long long)W.qn, I, O); exit(1);
         }
+#ifdef COLI_VULKAN
+        if (W.vk && ink_vk_matmul(y, x, &W, S, I, O)) return;
+#endif
         if (W.qbits == 8) matmul_i8r(y, x, (const int8_t*)W.q4, W.qs, S, I, O);
         else              matmul_i4g(y, x, W.q4, W.qs, S, I, O, W.gs);
         return;
     }
+#ifdef COLI_VULKAN
+    if (W.vk && ink_vk_matmul(y, x, &W, S, I, O)) return;
+#endif
     if (W.f) matmul(y, x, W.f, S, I, O);
     else     matmul_h(y, x, W.h, S, I, O);
 }
@@ -719,6 +796,17 @@ static void load_cfg(Cfg *c, const char *snap) {
 }
 
 /* ---------- weight loading ---------- */
+/* The embedding norm has two names. The converter and every container written with
+ * transformers up to 5.17 call it model.embed_norm.weight; transformers 5.18 saves
+ * the same tensor as model.embed_tokens.embed_norm.weight. Read by the old name
+ * only, a checkpoint saved by 5.18 loaded with no embedding norm at all -- no
+ * error, and every answer wrong (the tiny oracle: 1 of 36 positions). */
+static const char *embed_norm_name(shards *S) {
+    if (st_has(S, "model.embed_norm.weight")) return "model.embed_norm.weight";
+    if (st_has(S, "model.embed_tokens.embed_norm.weight")) return "model.embed_tokens.embed_norm.weight";
+    return NULL;
+}
+
 static float *load_t(Model *m, const char *name) {
     int64_t n = st_numel(&m->S, name);
     if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
@@ -896,6 +984,36 @@ static void unpack_rows(const uint8_t *raw, int8_t *q, int64_t rows, int64_t col
 
 static double mem_avail_bytes(void);
 
+#ifdef COLI_VULKAN
+/* After the weights: open the device (COLI_VULKAN=1) and mark the resident
+ * matrices it can take, which upload on first use; the line says which. The host
+ * copy stays (it is the CPU fallback), so the device holds a second copy: on a GPU
+ * that shares RAM with the CPU the resident set costs twice. */
+static void ink_vk_mark(Wt *w, int views, int *by, int *cpu) {
+    if (!w->q4 && !w->f && !w->h) return;          /* absent, or a CUDA resident */
+    int fmt = ink_vk_attach(w, views);
+    if (fmt) by[fmt]++; else (*cpu)++;
+}
+static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
+    if (!g_vk_ready) g_vk_ready = coli_vk_init_env("inkling");
+    if (!g_vk_ready) return;
+    int by[13] = {0}, cpu = 0;
+    ink_vk_mark(&m->lm_head, 1, by, &cpu);
+    for (int i = layer_begin; i < layer_end; i++) {
+        Layer *l = &m->L[i];
+        Wt *one[] = { &l->q, &l->k, &l->v, &l->r, &l->o, &l->dg, &l->du, &l->dd };
+        for (size_t j = 0; j < sizeof(one) / sizeof(one[0]); j++) ink_vk_mark(one[j], 1, by, &cpu);
+        ink_vk_mark(&l->sh_g, m->c.n_shared, by, &cpu);   /* one device copy per shared expert */
+        ink_vk_mark(&l->sh_u, m->c.n_shared, by, &cpu);
+        ink_vk_mark(&l->sh_d, m->c.n_shared, by, &cpu);
+    }
+    fprintf(stderr, "[VK] inkling: %d resident matrices go to the GPU on first use "
+            "(%d int8, %d int4-g64, %d f32, %d bf16), %d stay on the CPU; "
+            "routed experts and embedding lookups stay on the CPU\n",
+            by[1] + by[4] + by[10] + by[11], by[1], by[4], by[10], by[11], cpu);
+}
+#endif
+
 static void model_init_range(Model *m, const char *snap, int cap, int bits,
                              int layer_begin, int layer_end,
                              int load_boundaries, int allocate_state,
@@ -952,7 +1070,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
 #endif
     if (load_boundaries) {
         m->embed      = load_w(m, "model.embed_tokens.weight", 0);
-        m->embed_norm = st_has(&m->S,"model.embed_norm.weight") ? load_t(m,"model.embed_norm.weight") : NULL;
+        { const char *en = embed_norm_name(&m->S); m->embed_norm = en ? load_t(m, en) : NULL; }
         m->final_norm = load_t(m, "model.norm.weight");
         m->lm_head    = load_w(m, "lm_head.weight", 1);
     }
@@ -1115,6 +1233,9 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         m->eusage = rt_counts_all();              /* alias: the bump sites stay as they are */
     }
     m->dense_load_s = now_s() - t0;
+#ifdef COLI_VULKAN
+    ink_vk_init_model(m, layer_begin, layer_end);
+#endif
 }
 
 static void model_init(Model *m, const char *snap, int cap, int bits) {
@@ -2137,6 +2258,9 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new,
     printf("[phases] fill %.1fs | expert-mm %.1fs | shared %.1fs | attn %.1fs | other %.1fs\n",
            m->t_fill, m->t_expert, m->t_shared, m->t_attn,
            wall - m->t_fill - m->t_expert - m->t_shared - m->t_attn);
+#ifdef COLI_VULKAN
+    fflush(stdout); ink_vk_report();
+#endif
     free(ids);
 }
 
@@ -2467,6 +2591,9 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n", dt, np, gen,
            m->t_fill - f0, m->t_shared - s0, m->t_expert - e0, m->t_attn - a0, 0.0, forwards);
     fflush(stdout);
+#ifdef COLI_VULKAN
+    ink_vk_report();
+#endif
     serve_hits(m);
     free(ids);
     return 0;
@@ -2807,6 +2934,9 @@ int main(int argc, char **argv) {
 #endif
     printf("PEAK RSS: %.2f GB | expert cache hit %.1f%% | %.2f tok/s\n",
            rss_gb(), tot?100.0*m.hits/tot:0.0, ngen/dt);
+#ifdef COLI_VULKAN
+    fflush(stdout); ink_vk_report();
+#endif
     free(buf); free(arena);
     return (match == ngen) ? 0 : 1;
 }
@@ -2830,6 +2960,9 @@ typedef struct {
 
 static void inkling_segment_wt_destroy(Wt *weight) {
     if (!weight) return;
+#ifdef COLI_VULKAN
+    ink_vk_release(weight);
+#endif
     free(weight->f); free(weight->h);
     free(weight->q4); free(weight->qs);
     memset(weight, 0, sizeof(*weight));
@@ -3212,6 +3345,9 @@ typedef struct {
 
 static void inkling_edge_wt_destroy(Wt *weight) {
     if (!weight) return;
+#ifdef COLI_VULKAN
+    ink_vk_release(weight);
+#endif
     free(weight->f); free(weight->h); free(weight->q4); free(weight->qs);
     memset(weight, 0, sizeof(*weight));
 }
@@ -3269,8 +3405,8 @@ static int inkling_edge_engine_open(
         model->has_q = model->Sq.n > 0;
     }
     model->embed = load_w(model, "model.embed_tokens.weight", 0);
-    model->embed_norm = st_has(&model->S, "model.embed_norm.weight")
-        ? load_t(model, "model.embed_norm.weight") : NULL;
+    const char *embed_norm = embed_norm_name(&model->S);
+    model->embed_norm = embed_norm ? load_t(model, embed_norm) : NULL;
     model->final_norm = load_t(model, "model.norm.weight");
     model->lm_head = load_w(model, "lm_head.weight", 1);
     char tokenizer_path[4096];

@@ -49,6 +49,12 @@
 #define QI_HAVE_VAE 1
 #endif
 #endif
+#ifdef COLI_VULKAN
+/* VK=1 and COLI_VULKAN=1: the DiT's matrices run on the GPU, all the image
+ * tokens of a product in one call. One command buffer: main thread only. */
+#include "backend_vulkan.h"
+static int g_vk_ready, g_vk_tried;
+#endif
 
 static double now_s(void){
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -98,7 +104,12 @@ static int g_act8 = 1;   /* COLI_IMG_ACT8=0 turns off the int8 activations of th
  * states carry a few huge channels, and one int8 scale per token wipes out the
  * rest (last layer 124% off, against 7% with int8 weights alone), while the
  * DiT blocks keep the picture (30.1 dB against 35.6 for int8 weights alone). */
-typedef struct { QiMat m; void *own; float *own_sc; int act8; } Lin;
+typedef struct {
+    QiMat m; void *own; float *own_sc; int act8;
+    int gpu;        /* may run on the GPU (COLI_VULKAN): the DiT's matrices */
+    void *vk;       /* its device copy, made on first use */
+    int vk_off;     /* the upload failed: this one stays on the CPU */
+} Lin;
 
 static st_tensor *need_tensor(shards *S, const char *name, int64_t n0, int64_t n1){
     st_tensor *t = st_find(S, name);
@@ -138,7 +149,12 @@ static void lin_load(shards *S, const char *name, int N, int K, int bits, Lin *o
         out->m.fmt = QI_I8; out->m.w = out->own = q; out->m.sc = out->own_sc = sc;
     }
 }
-static void lin_free(Lin *l){ free(l->own); free(l->own_sc); memset(l, 0, sizeof *l); }
+static void lin_free(Lin *l){
+#ifdef COLI_VULKAN
+    if (l->vk) coli_vk_tensor_free((ColiVkTensor *)l->vk);
+#endif
+    free(l->own); free(l->own_sc); memset(l, 0, sizeof *l);
+}
 static size_t lin_bytes(const Lin *l){
     size_t e = l->m.fmt == QI_F32 ? 4 : l->m.fmt == QI_BF16 ? 2 : 1;
     return (size_t)l->m.N * l->m.K * e + (l->own_sc ? (size_t)l->m.N * 4 : 0);
@@ -149,12 +165,37 @@ static float *vec_load(shards *S, const char *name, int n){
     st_read_f32_cap(S, name, v, n, 1);
     return v;
 }
+/* Y[M][N] = X . W^T on the GPU, for every row of X in one call. Each storage
+ * format is one of the shader's as it is stored: QI_I8 is fmt 1 (int8 [N][K],
+ * one f32 scale per row), QI_BF16 fmt 11, QI_F32 fmt 10. The activations stay
+ * f32, so the result is the CPU's f32-activation product up to summation
+ * order. COLI_IMG_ACT8 is a CPU kernel: a matrix the GPU takes does not
+ * quantize its activations. 0 when the product stays on the CPU. */
+static int qi_vk_linear(float *y, const float *x, int M, const Lin *l){
+#ifdef COLI_VULKAN
+    if (!g_vk_ready || !l->gpu || l->vk_off || l->m.ld || M < 1) return 0;
+#ifdef _OPENMP
+    if (omp_in_parallel()) return 0;
+#endif
+    int fmt = l->m.fmt == QI_I8 ? 1 : l->m.fmt == QI_BF16 ? 11 : l->m.fmt == QI_F32 ? 10 : -1;
+    if (fmt < 0) return 0;
+    Lin *dev = (Lin *)l;    /* the device copy is a cache inside a read-only matrix */
+    if (coli_vk_matmul((ColiVkTensor **)&dev->vk, y, x, l->m.w, fmt == 1 ? l->m.sc : NULL, fmt,
+                       M, l->m.K, l->m.N, 0)) return 1;
+    if (!dev->vk) dev->vk_off = 1;
+#endif
+    (void)y; (void)x; (void)M; (void)l;
+    return 0;
+}
+
 /* QWENIMAGE_PROF=1: where a step's time goes (linears, attention, the rest) */
 static int g_prof; static double g_t_lin, g_t_att;
 static inline void linear(float *y, const float *x, int M, const Lin *l){
     double t0 = g_prof ? now_s() : 0;
-    if (g_act8 && l->act8 && l->m.fmt == QI_I8) qi_gemm_act8(y, l->m.N, x, l->m.K, M, &l->m, NULL);
-    else qi_gemm(y, x, M, &l->m, NULL);
+    if (!qi_vk_linear(y, x, M, l)) {
+        if (g_act8 && l->act8 && l->m.fmt == QI_I8) qi_gemm_act8(y, l->m.N, x, l->m.K, M, &l->m, NULL);
+        else qi_gemm(y, x, M, &l->m, NULL);
+    }
     if (g_prof) g_t_lin += now_s() - t0;
 }
 
@@ -499,6 +540,7 @@ static void dit_load(Dit *d, const char *model){
         lin_load(&S, BN("img_mlp.proj.weight"), d->mlp, D, g_bits, &B->proj);
         lin_load(&S, BN("img_mlp.out.weight"), D, d->mlp, g_bits, &B->out);
         B->q.act8 = B->k.act8 = B->v.act8 = B->o.act8 = B->gate.act8 = B->proj.act8 = B->out.act8 = 1;
+        B->q.gpu = B->k.gpu = B->v.gpu = B->o.gpu = B->gate.gpu = B->proj.gpu = B->out.gpu = 1;
         B->nq = vec_load(&S, BN("attn.norm_q.weight"), d->hd);
         B->nk = vec_load(&S, BN("attn.norm_k.weight"), d->hd);
 #undef BN
@@ -506,10 +548,16 @@ static void dit_load(Dit *d, const char *model){
                  lin_bytes(&B->gate) + lin_bytes(&B->proj) + lin_bytes(&B->out);
     }
     st_destroy(&S);
+    d->img_in.gpu = d->t1.gpu = d->t2.gpu = d->mod.gpu = d->norm_out.gpu = d->proj_out.gpu = 1;
+    d->txt1.gpu = d->txt2.gpu = 1;
     d->loaded = 1;
     fprintf(stderr, "[qwenimage] transformer: %d blocks, %.2f GB resident, %.1f s\n",
             d->layers, (bytes + lin_bytes(&d->mod) + lin_bytes(&d->txt1) + lin_bytes(&d->txt2)) / 1e9,
             now_s() - t0);
+#ifdef COLI_VULKAN
+    /* after the DiT's weights, once: a missing device costs one line */
+    if (!g_vk_tried) { g_vk_tried = 1; g_vk_ready = coli_vk_init_env("qwenimage"); }
+#endif
 }
 
 /* The sinusoidal embedding of the timestep, then the two linears. `t` is the
@@ -525,9 +573,9 @@ static void dit_temb(Dit *d, float t, float *temb){
         e[i] = cosf(a); e[half + i] = sinf(a);
     }
     float *h = fmalloc(d->dim);
-    qi_gemm(h, e, 1, &d->t1.m, NULL);
+    if (!qi_vk_linear(h, e, 1, &d->t1)) qi_gemm(h, e, 1, &d->t1.m, NULL);
     for (int i = 0; i < d->dim; i++) h[i] = silu(h[i]);
-    qi_gemm(temb, h, 1, &d->t2.m, NULL);
+    if (!qi_vk_linear(temb, h, 1, &d->t2)) qi_gemm(temb, h, 1, &d->t2.m, NULL);
     free(h);
 }
 /* mod[4*dim] = [scale1 | gate1 | scale2 | gate2], outs[dim] = the final norm's scale */
@@ -535,8 +583,8 @@ static void dit_modulation(Dit *d, float t, float *mod, float *outs){
     float *temb = fmalloc(d->dim), *s = fmalloc(d->dim);
     dit_temb(d, t, temb);
     for (int i = 0; i < d->dim; i++) s[i] = silu(temb[i]);
-    qi_gemm(mod, s, 1, &d->mod.m, NULL);
-    qi_gemm(outs, s, 1, &d->norm_out.m, NULL);
+    if (!qi_vk_linear(mod, s, 1, &d->mod)) qi_gemm(mod, s, 1, &d->mod.m, NULL);
+    if (!qi_vk_linear(outs, s, 1, &d->norm_out)) qi_gemm(outs, s, 1, &d->norm_out.m, NULL);
     free(temb); free(s);
 }
 
@@ -1341,6 +1389,14 @@ static int run_oracle(Engine *e, const char *refdir){
 
 /* ---- main -------------------------------------------------------------------- */
 
+/* Once, at the end: how many products the GPU actually took, so a run that
+ * asked for Vulkan and quietly stayed on the CPU says so. */
+static void qi_vk_report(void){
+#ifdef COLI_VULKAN
+    if (g_vk_ready) fprintf(stderr, "[VK] qwenimage: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
+#endif
+}
+
 static void usage(void){
     fprintf(stderr,
         "usage: qwenimage --model DIR --prompt TEXT [--width 768] [--height 512] [--steps 8] [--seed N] --out FILE.png\n"
@@ -1393,7 +1449,7 @@ int main(int argc, char **argv){
     if (!seed_set && !serve && !ref) seed = (uint64_t)time(NULL);
     static Engine e;
     engine_init(&e, model);
-    if (ref) return run_oracle(&e, ref);
+    if (ref) { int rc = run_oracle(&e, ref); qi_vk_report(); return rc; }
     if (getenv("QWENIMAGE_PRINT_TOKENS")) {          /* tokenizer check against the processor */
         int n, drop; int *ids = te_encode_prompt(&e.te, prompt ? prompt : "", &n, &drop);
         printf("drop %d ids", drop);
@@ -1405,7 +1461,9 @@ int main(int argc, char **argv){
         e.te_resident = !(te && !strcmp(te, "stage"));
         te_load(&e.te, model);
         dit_load(&e.dit, model);
-        return serve_loop(&e, width, height, steps);
+        int rc = serve_loop(&e, width, height, steps);
+        qi_vk_report();
+        return rc;
     }
     char msg[512];
     if (check_size(width, height, steps, msg, sizeof msg)) { fprintf(stderr, "%s\n", msg); return 2; }
@@ -1417,5 +1475,6 @@ int main(int argc, char **argv){
     if (write_png(out, rgba, width, height)) { fprintf(stderr, "[qwenimage] cannot write %s\n", out); return 1; }
     fprintf(stderr, "[qwenimage] %s  %dx%d  %d steps  seed %llu  encode %.1f s  denoise %.1f s  decode %.1f s\n",
             out, width, height, steps, (unsigned long long)seed, tm[0], tm[1], tm[2]);
+    qi_vk_report();
     return 0;
 }

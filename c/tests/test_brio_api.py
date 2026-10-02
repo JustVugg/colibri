@@ -64,8 +64,8 @@ class BrioApi(unittest.TestCase):
     def serve(self, table):
         self.engine = ScoringEngine(table)
         self.server = APIServer(("127.0.0.1", 0), self.engine, "test-model")
-        self.addCleanup(self.server.shutdown)
         self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
         import threading
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
@@ -262,6 +262,22 @@ class BrioApi(unittest.TestCase):
                                       "questions": [{"question": "q?", "options": ["a", "b"]}]})
         self.assertEqual(code, 400)
         self.assertIn("state", body["error"]["message"])
+
+    def test_non_string_message_text_is_a_client_error(self):
+        self.serve({})
+        code, body = self.post_error({
+            "model": "test-model", "options": ["yes", "no"],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": 7}]}],
+        })
+        self.assertEqual(code, 400)
+        self.assertEqual(body["error"]["param"], "messages.0.content.0.text")
+        self.assertEqual(self.engine.calls, [])
+        out = self.post({
+            "model": "test-model", "options": ["yes", "no"],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "Ship it?"}]}],
+        })
+        self.assertEqual(out["object"], "brio.choice")
+        self.assertEqual(self.pins()[0], "Context:\nuser: Ship it?\n\n")
 
     def test_schema_field_names_that_would_break_the_skeleton_are_refused(self):
         self.serve({})
