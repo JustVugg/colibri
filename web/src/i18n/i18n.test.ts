@@ -36,4 +36,14 @@ describe("locale dictionaries", () => {
     }
     expect(missing).toEqual([])
   })
+
+  /* FlappyBri is translated in full in every locale, and its name is not. */
+  it("carries every FlappyBri string in every locale, under its own name", () => {
+    const keys = Object.keys(en).filter((key) => key.startsWith("flappy.") || key === "nav.flappybri")
+    expect(keys.length).toBeGreaterThan(50)
+    for (const [code, dict] of Object.entries(DICTS)) {
+      expect(keys.filter((key) => !(key in dict)), code).toEqual([])
+      expect(dict["nav.flappybri"], code).toBe("FlappyBri")
+    }
+  })
 })

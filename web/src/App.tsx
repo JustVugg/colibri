@@ -41,6 +41,7 @@ import {
 import { resendFrom } from "@/lib/chat"
 import { activeRequests, supportsCacheSlots, supportsContinuation } from "@/lib/runtime"
 import Brio from "./Brio"
+import FlappyBri from "./FlappyBri"
 import { BrainWorkspace } from "./BrainWorkspace"
 import { Brand } from "./components/Brand"
 import { ImageControls, ImageProgressCard, ImageResultCard, ImageStoppedCard, type ImageRun } from "./components/ImageTurn"
@@ -558,6 +559,7 @@ export default function App() {
         </div>
       </section> : view === "brain" ? <BrainWorkspace baseUrl={baseUrl} apiKey={apiKey} connected={connected} />
       : view === "profiling" ? <section className="profiling-workspace"><header className="page-heading"><span>COLIBRI / ENGINE</span><h1>Profiling</h1></header>{metrics}<Profiling baseUrl={baseUrl} apiKey={apiKey} connected={connected} /></section>
+      : view === "flappybri" ? <section className="flappy-workspace"><header className="page-heading"><span>COLIBRI / FLAPPYBRI</span><h1>{t("nav.flappybri")}</h1><p>{t("flappy.intro")}</p></header><FlappyBri baseUrl={baseUrl} apiKey={apiKey} model={model} connected={connected} /></section>
       : <section className={cn("chat-view", empty && "empty")} hidden={view === "brio"}>
         {empty ? <div className="welcome-brand"><Brand word /></div> : <div className="conversation" role="log" aria-label={t("nav.chat")}>
           <div className="message-list">{messages.map((item, index) => <article key={item.id} className={cn("message", item.role)}>

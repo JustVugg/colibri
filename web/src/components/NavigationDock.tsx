@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react"
-import { BrainCircuit, Gauge, ListChecks, MessageSquareText } from "lucide-react"
+import { Bird, BrainCircuit, Gauge, ListChecks, MessageSquareText } from "lucide-react"
 import { useLocale } from "../i18n"
 
-export type View = "chat" | "brio" | "brain" | "profiling" | "settings"
+export type View = "chat" | "brio" | "flappybri" | "brain" | "profiling" | "settings"
 
 export function NavigationDock({ view, onNavigate, loading }: { view: View; onNavigate: (view: View) => void; loading: boolean }) {
   const { t } = useLocale()
@@ -32,7 +32,7 @@ export function NavigationDock({ view, onNavigate, loading }: { view: View; onNa
   }
   return <div ref={wrap} className={`navigation-dock ${open ? "open" : ""}`} onPointerEnter={e => { if (e.pointerType === "mouse") reveal() }} onPointerLeave={hideLater} onBlur={hideLater}>
     <nav id="workspace-navigation" aria-label={t("ui.navigation")} hidden={!open}>
-      {([{ id: "chat", Icon: MessageSquareText }, { id: "brio", Icon: ListChecks }, { id: "brain", Icon: BrainCircuit }, { id: "profiling", Icon: Gauge }] as const).map(({ id, Icon }) =>
+      {([{ id: "chat", Icon: MessageSquareText }, { id: "brio", Icon: ListChecks }, { id: "flappybri", Icon: Bird }, { id: "brain", Icon: BrainCircuit }, { id: "profiling", Icon: Gauge }] as const).map(({ id, Icon }) =>
         <button key={id} aria-current={view === id ? "page" : undefined} onClick={() => { onNavigate(id); close(true) }}><Icon /><span>{t(`nav.${id}`)}</span>{id === "chat" && loading && <i className="dock-busy" />}</button>)}
     </nav>
     <button ref={handle} className="dock-handle" aria-label={t("ui.navigation")} aria-expanded={open} aria-controls="workspace-navigation"
