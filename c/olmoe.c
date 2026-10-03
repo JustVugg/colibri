@@ -1069,7 +1069,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             float sc[4096];
             for (int t = 0; t <= qpos; t++) {          /* causale: t <= qpos */
                 const float *kv = m->K[layer] + ((int64_t)hh*m->max_t + t)*hd;
-                float acc = 0; for (int dd = 0; dd < hd; dd++) acc += qv[dd]*kv[dd];
+                float acc = dot_f32_lanes(qv, kv, hd);
                 sc[t] = acc * scale;
             }
             softmax_row(sc, qpos+1);

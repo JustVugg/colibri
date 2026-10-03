@@ -1529,8 +1529,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                 for (int t = t0; t <= qpos; t++) {
                     const float *kv = t < tb ? Kh + (int64_t)(t % win)*hd
                                              : Kb + (int64_t)(t - pos0)*kvdim;
-                    float acc = 0.f;
-                    for (int d = 0; d < hd; d++) acc += qv[d]*kv[d];
+                    float acc = dot_f32_lanes(qv, kv, hd);
                     int dist = qpos - t;
                     sc[t - t0] = tau * (acc*scale + (dist < ext ? rl[dist] : 0.f));
                 }

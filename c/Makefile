@@ -2513,6 +2513,12 @@ tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c colibri.c $(VK_OBJ)
 tests/bench_matmul_f32$(EXE): tests/bench_matmul_f32.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# bench_attn_f32: microbenchmark (one decode token's attention core in qwen36,
+# olmoe and inkling, scalar q.k vs matmul_f32.h lanes), NOT a test gate.
+# Build on demand: make tests/bench_attn_f32
+tests/bench_attn_f32$(EXE): tests/bench_attn_f32.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_matmul_f32$(EXE): tests/test_matmul_f32.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
