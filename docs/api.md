@@ -104,8 +104,9 @@ The hosted-platform bookkeeping fields `store`, `metadata`, `service_tier`,
 `stream_options.include_obfuscation` are accepted and intentionally ignored:
 they have no local equivalent and do not affect generation. Unsupported
 result-shaping requests are refused explicitly: `best_of` values above 1, a
-non-empty `logit_bias`, `suffix` infill, and audio output requested through
-`modalities`.
+non-empty `logit_bias`, and `suffix` infill. The optional `modalities` array
+accepts text output only; malformed values and requests for other output
+modalities receive a named 400 rather than silently returning text.
 
 ### `seed`
 

@@ -4044,9 +4044,17 @@ def generation_options(body, limit):
         raise APIError(400, "Colibri does not support `suffix` infill yet.",
                        "suffix", "unsupported_parameter")
     modalities = body.get("modalities")
-    if isinstance(modalities, list) and "audio" in modalities:
-        raise APIError(400, "Colibri does not support audio output via `modalities`.",
-                       "modalities", "unsupported_value")
+    if modalities is not None:
+        if (not isinstance(modalities, list) or not modalities or
+                any(not isinstance(item, str) for item in modalities)):
+            raise APIError(400, "`modalities` must be a non-empty array of strings.",
+                           "modalities", "invalid_value")
+        if "audio" in modalities:
+            raise APIError(400, "Colibri does not support audio output via `modalities`.",
+                           "modalities", "unsupported_value")
+        if any(item != "text" for item in modalities):
+            raise APIError(400, "Colibri supports only text output via `modalities`.",
+                           "modalities", "unsupported_value")
     # `tools`/`functions` are handled by render_chat (declaration) + parse_tool_calls (output).
     validate_tools(body)
     choice = body.get("tool_choice")

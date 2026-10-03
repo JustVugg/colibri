@@ -2509,6 +2509,22 @@ class OpenAIHonestySetTest(unittest.TestCase):
         generation_options({"best_of": 1, "logit_bias": {}, "suffix": None,
                             "modalities": ["text"]}, 16)
 
+    def test_modalities_rejects_unsupported_or_malformed_values(self):
+        cases = (
+            ("audio", "invalid_value"),
+            ([], "invalid_value"),
+            ([7], "invalid_value"),
+            (["video"], "unsupported_value"),
+            (["text", "video"], "unsupported_value"),
+        )
+        for value, code in cases:
+            with self.subTest(value=value):
+                with self.assertRaises(APIError) as caught:
+                    generation_options({"modalities": value}, 16)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.param, "modalities")
+                self.assertEqual(caught.exception.code, code)
+
     def test_intentionally_ignored_fields_return_200_and_do_not_reach_engine(self):
         base = {"model": "test-model", "prompt": "Complete me",
                 "temperature": 0, "max_tokens": 4}
@@ -2797,6 +2813,25 @@ class HTTPTest(unittest.TestCase):
             self.request("/v1/models", key="wrong")
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
+
+    def test_unsupported_modalities_fail_before_engine_work(self):
+        cases = (
+            ("/v1/completions", {"prompt": "hi", "modalities": ["video"]},
+             "unsupported_value"),
+            ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],
+                                      "modalities": "audio"}, "invalid_value"),
+        )
+        for path, fields, code in cases:
+            with self.subTest(path=path):
+                calls_before = len(self.engine.calls)
+                with self.assertRaises(HTTPError) as caught:
+                    self.request(path, {"model": "test-model", **fields})
+                self.addCleanup(caught.exception.close)
+                self.assertEqual(caught.exception.code, 400)
+                error = json.load(caught.exception)["error"]
+                self.assertEqual(error["param"], "modalities")
+                self.assertEqual(error["code"], code)
+                self.assertEqual(len(self.engine.calls), calls_before)
 
     def test_a_malformed_tools_or_messages_is_a_client_error_on_every_family(self):
         """`tools: 5` or `messages: null` answered HTTP 500 on most families.
