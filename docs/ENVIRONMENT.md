@@ -466,6 +466,8 @@ and the CPU/GPU execution split.
 | `QWEN_SHARED_BATCH` | bounded by 32 MiB scratch | Batch the CPU shared expert across prompt rows. `=0` restores scalar calls; a positive integer caps rows per chunk. The CUDA-tier overlap path is unchanged. |
 | `Q36_MAXT` | conservative engine default | Lower the served/context capacity; it cannot raise the model's compiled safety ceiling. |
 | `COLI_VULKAN` | `0` | `VK=1` build: the dense trunk on the Vulkan device, and the routed experts on the shared expert tier (`COLI_VK_TIER*`, `COLI_VK_DENSE`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)). With the tier on, the engine keeps the expert history `COLI_USAGE` (default `<snap>/.coli_usage`), saved at every run and serve turn end; it keeps none otherwise. |
+| `QT_PREFILL_REPLAN` | `0` (off) | CUDA expert tier: after each prefill layer's routing, swap VRAM residents this prompt never routed to for its most-routed non-residents of that layer, budget-neutral, uploads overlapping the rest of the prefill. Measured on the 35B: decode VRAM hit rate 60 -> 73 % against a heat file from other prompts, 38 -> 75 % from a cold start. See [qwen36-cuda-tier.md](qwen36-cuda-tier.md#the-residents-follow-the-prompt-qt_prefill_replan1). |
+| `QT_PREFILL_REPLAN_MAX` | `24` | Cap on the swaps planned per prefill layer by `QT_PREFILL_REPLAN` (offline at B=96 the uncapped plan's hit rate with two thirds of the swaps). |
 
 ## Qwen3.8 engine (`qwen38`)
 

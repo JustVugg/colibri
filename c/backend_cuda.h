@@ -142,6 +142,13 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
                             int fmt, int I, int O, int device);
+/* Overwrite an uploaded tensor in place with new bytes of the same shape and
+ * format. The expert tier swaps residents, and every expert of a model has the
+ * same geometry, so the victim's device buffers can take the newcomer without
+ * the cudaFree + cudaMalloc pair, which synchronises the device under the
+ * async expert groups. Optional in the DLL loader: 0 from a backend that
+ * predates it (or on any failure), and the caller frees and uploads as before. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_overwrite(ColiCudaTensor *tensor, const void *weights, const float *scales);
 #ifdef COLI_ANS
 /* Experimental Linux-only GPU-resident entropy tier. The archive remains in
  * VRAM and is decoded into per-device scratch immediately before a grouped

@@ -1556,6 +1556,26 @@ extern "C" int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
     return r;
 }
 
+extern "C" int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *weights, const float *scales) {
+    if (!t || !weights || !t->weights || !t->weights_owned) return 0;
+#ifdef COLI_ANS
+    if (t->compressed) return 0;            /* archive bytes, not a weight buffer of this size */
+#endif
+    if (t->fmt && t->fmt != 6 && (!scales || !t->scales)) return 0;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (!select_ctx(ctx)) return 0;
+    /* Same steps as the upload, into the buffers already there. A failure
+     * half-way leaves the tensor's content undefined: the caller frees it. */
+    if (!cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor overwrite")) return 0;
+    if (t->fmt==2||t->fmt==4) {
+        offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
+        if (!cuda_ok(cudaGetLastError(),"int4 weight conversion")) return 0;
+    }
+    if (t->fmt && t->fmt != 6 &&
+        !cuda_ok(cudaMemcpy(t->scales, scales, tensor_scale_bytes(t), cudaMemcpyHostToDevice), "scale overwrite")) return 0;
+    return 1;
+}
+
 #ifdef COLI_ANS
 struct AnsSidecarHeader {
     uint32_t magic,raw_bytes,archive_bytes,fmt,I,O;

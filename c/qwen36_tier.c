@@ -64,9 +64,16 @@ static struct {
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
     int issue_open;                       /* guard: no tensor_free while a group is in flight */
     pthread_cond_t cv_take;               /* signals qt_take done + queue space */
-    uint64_t tick, swaps, pf_hits, pf_notes;
+    uint64_t tick, swaps, inplace, pf_hits, pf_notes;
     uint32_t *heat0;                      /* heat table loaded from HEAT_FILE */
+    /* re-plan (qt_replan): pending (candidate, victim) slot-index pairs, drained on the decode ticks */
+    int *rp_c, *rp_v; int rp_n, rp_i; uint64_t rp_planned, rp_done;
+    /* evicted-expert ring for qt_evicted_take (slot indices) */
+    int *ev; int ev_h, ev_n;
+    /* qt_stats_mark: counters at the prefill/decode boundary */
+    uint64_t mk_hits, mk_miss; int mk_on;
 } G;
+#define QT_EV_CAP 8192
 
 /* Count parked callers so shutdown can reclaim their shared storage safely. */
 static void wait_take_locked(void){
@@ -161,8 +168,16 @@ static void *uploader(void *arg){
         uint8_t *w=G.q[G.qh].w; float *sc=G.q[G.qh].s;
         G.qh=(G.qh+1)%QT_QCAP; G.qn--;
         pthread_cond_broadcast(&G.cv_take);          /* queue space available */
+        /* staging layout: three matrices of mb bytes each; int4 packed = half a
+         * byte per element, int8/fp8 = one. Scales follow the format. */
+        size_t mb=(size_t)G.D*G.Ih/(G.wfmt==4?2:1);
+        const float *sg=sc, *su, *sd;
+        if(G.wfmt==8||G.egs){ su=sc+G.sc_gu; sd=sc+2*G.sc_gu; } else { su=sc+G.Ih; sd=sc+2*G.Ih; }
+        int dv = G.dev[home(eid)];
+        ColiCudaTensor *tg=NULL,*tu=NULL,*td=NULL;
+        int ok=0, inplace=0;
         if(ve>=0){
-            /* LFRU swap: free the victim only when no group is in flight */
+            /* LFRU swap: touch the victim only when no group is in flight */
             while(G.issue_open && !G.th_stop) wait_take_locked();
             QSlot *v=qs(vl,ve);
             if(G.th_stop && G.issue_open){
@@ -180,36 +195,43 @@ static void *uploader(void *arg){
             ColiCudaTensor *a=v->tg,*b=v->tu,*ct=v->td;
             v->tg=v->tu=v->td=NULL;
             pthread_mutex_unlock(&G.mx);
-            if(a)coli_cuda_tensor_free(a); if(b)coli_cuda_tensor_free(b); if(ct)coli_cuda_tensor_free(ct);
+            /* Every expert has the same geometry: write the newcomer into the
+             * victim's device buffers instead of cudaFree + cudaMalloc, each
+             * of which synchronises the device under the async groups (a
+             * re-plan of 1,500 swaps cost 1.3 s of prefill that way). A
+             * backend without the entry point, or a failure half-way, falls
+             * back to the old free-then-upload. */
+            if(a&&b&&ct && coli_cuda_tensor_overwrite(a,w,sg) && coli_cuda_tensor_overwrite(b,w+mb,su)
+                        && coli_cuda_tensor_overwrite(ct,w+2*mb,sd)){
+                tg=a; tu=b; td=ct; ok=1; inplace=1;
+            } else {
+                if(a)coli_cuda_tensor_free(a); if(b)coli_cuda_tensor_free(b); if(ct)coli_cuda_tensor_free(ct);
+            }
         } else pthread_mutex_unlock(&G.mx);
 
-        int dv = G.dev[home(eid)];
-        /* passo fra le tre matrici nello staging: int4 impacchettato = mezzo
-         * byte per elemento, int8 = uno. */
-        size_t mb=(size_t)G.D*G.Ih/(G.wfmt==4?2:1);
-        ColiCudaTensor *tg=NULL,*tu=NULL,*td=NULL;
-        int ok;
-        if(G.wfmt==8){
-            /* e4m3 bytes as they came from the checkpoint, block scales
-             * [ceil(O/128), ceil(I/128)] per matrix -- the layout #817's
-             * kernels and tensor_upload(fmt=8) already agree on */
-            ok = coli_cuda_tensor_upload(&tg, w,      sc,            8, G.D,  G.Ih, dv)
-              && coli_cuda_tensor_upload(&tu, w+mb,   sc+G.sc_gu,    8, G.D,  G.Ih, dv)
-              && coli_cuda_tensor_upload(&td, w+2*mb, sc+2*G.sc_gu,  8, G.Ih, G.D,  dv);
-        } else if(G.wfmt==1){
-            /* int8, scale per riga: qt_init ha gia' rifiutato il caso raggruppato,
-             * che questo formato non sa esprimere. */
-            ok = coli_cuda_tensor_upload(&tg, w,      sc,          1, G.D,  G.Ih, dv)
-              && coli_cuda_tensor_upload(&tu, w+mb,   sc+G.Ih,     1, G.D,  G.Ih, dv)
-              && coli_cuda_tensor_upload(&td, w+2*mb, sc+2*G.Ih,   1, G.Ih, G.D,  dv);
-        } else if(G.egs){
-            ok = coli_cuda_tensor_upload_g(&tg, w,      sc,             4, G.D,  G.Ih, dv, G.egs)
-              && coli_cuda_tensor_upload_g(&tu, w+mb,   sc+G.sc_gu,     4, G.D,  G.Ih, dv, G.egs)
-              && coli_cuda_tensor_upload_g(&td, w+2*mb, sc+2*G.sc_gu,   4, G.Ih, G.D,  dv, G.egs);
-        } else {
-            ok = coli_cuda_tensor_upload(&tg, w,      sc,          2, G.D,  G.Ih, dv)
-              && coli_cuda_tensor_upload(&tu, w+mb,   sc+G.Ih,     2, G.D,  G.Ih, dv)
-              && coli_cuda_tensor_upload(&td, w+2*mb, sc+2*G.Ih,   2, G.Ih, G.D,  dv);
+        if(!inplace){
+            if(G.wfmt==8){
+                /* e4m3 bytes as they came from the checkpoint, block scales
+                 * [ceil(O/128), ceil(I/128)] per matrix -- the layout #817's
+                 * kernels and tensor_upload(fmt=8) already agree on */
+                ok = coli_cuda_tensor_upload(&tg, w,      sg, 8, G.D,  G.Ih, dv)
+                  && coli_cuda_tensor_upload(&tu, w+mb,   su, 8, G.D,  G.Ih, dv)
+                  && coli_cuda_tensor_upload(&td, w+2*mb, sd, 8, G.Ih, G.D,  dv);
+            } else if(G.wfmt==1){
+                /* int8, scale per riga: qt_init ha gia' rifiutato il caso raggruppato,
+                 * che questo formato non sa esprimere. */
+                ok = coli_cuda_tensor_upload(&tg, w,      sg, 1, G.D,  G.Ih, dv)
+                  && coli_cuda_tensor_upload(&tu, w+mb,   su, 1, G.D,  G.Ih, dv)
+                  && coli_cuda_tensor_upload(&td, w+2*mb, sd, 1, G.Ih, G.D,  dv);
+            } else if(G.egs){
+                ok = coli_cuda_tensor_upload_g(&tg, w,      sg, 4, G.D,  G.Ih, dv, G.egs)
+                  && coli_cuda_tensor_upload_g(&tu, w+mb,   su, 4, G.D,  G.Ih, dv, G.egs)
+                  && coli_cuda_tensor_upload_g(&td, w+2*mb, sd, 4, G.Ih, G.D,  dv, G.egs);
+            } else {
+                ok = coli_cuda_tensor_upload(&tg, w,      sg, 2, G.D,  G.Ih, dv)
+                  && coli_cuda_tensor_upload(&tu, w+mb,   su, 2, G.D,  G.Ih, dv)
+                  && coli_cuda_tensor_upload(&td, w+2*mb, sd, 2, G.Ih, G.D,  dv);
+            }
         }
         free(w); free(sc);
         if(!ok){
@@ -219,7 +241,7 @@ static void *uploader(void *arg){
         }
         pthread_mutex_lock(&G.mx);
         QSlot *s=qs(layer,eid);
-        if(ok){ s->tg=tg; s->tu=tu; s->td=td; s->resident=1; G.uploads++; }
+        if(ok){ s->tg=tg; s->tu=tu; s->td=td; s->resident=1; G.uploads++; if(inplace) G.inplace++; }
         else  { int hd=home(eid); G.used[hd]-=G.exp_bytes;
                 G.budget[hd]=G.used[hd];   /* device genuinely full: stop trying */ }
         s->queued=0;
@@ -1082,11 +1104,111 @@ void qt_fill_wait(void){
 /* Adaptive swap check (every 16 ticks = tokens): per device, coldest resident
  * vs hottest non-resident. Decay every 1024 ticks so an old workload cannot
  * permanently own the tier; admission uses the shared tier.h contract. */
+/* G.mx held: remember an evicted slot for qt_evicted_take. */
+static void evict_note_locked(int gi){
+    if(!G.ev){ G.ev=malloc(QT_EV_CAP*sizeof(int)); if(!G.ev) return; G.ev_h=0; G.ev_n=0; }
+    if(G.ev_n==QT_EV_CAP) return;                     /* full: the miss path rebuilds lazily */
+    G.ev[(G.ev_h+G.ev_n)%QT_EV_CAP]=gi; G.ev_n++;
+}
+int qt_evicted_take(int *layers,int *eids,int max){
+    if(!G.on||max<=0) return 0;
+    pthread_mutex_lock(&G.mx);
+    int n=0;
+    while(n<max && G.ev_n>0){
+        int gi=G.ev[G.ev_h]; G.ev_h=(G.ev_h+1)%QT_EV_CAP; G.ev_n--;
+        layers[n]=gi/G.ne; eids[n]=gi%G.ne; n++;
+    }
+    pthread_mutex_unlock(&G.mx);
+    return n;
+}
+
+/* G.mx held: start up to `max` pending re-plan swaps, as many as the queue
+ * takes. Flags are re-checked -- the LFRU tick or an earlier drain may have
+ * moved a slot since the plan was made. */
+static void replan_drain_locked(int max){
+    while(max-- > 0 && G.rp_i<G.rp_n && G.qn<QT_QCAP && !G.th_stop){
+        int ci=G.rp_c[G.rp_i], vi=G.rp_v[G.rp_i]; G.rp_i++;
+        QSlot *cs=&G.slot[ci], *vs=&G.slot[vi];
+        if(cs->resident||cs->queued||!cs->g4) continue;
+        if(!vs->resident||vs->queued) continue;
+        vs->resident=0;                                   /* CPU fallback from now on */
+        if(enqueue_locked(ci/G.ne,ci%G.ne,vi/G.ne,vi%G.ne,0)){ G.swaps++; G.rp_done++; evict_note_locked(vi); }
+        else { vs->resident=1; G.rp_i--; break; }         /* no staging memory: retry later */
+    }
+    if(G.rp_i==G.rp_n){ free(G.rp_c); free(G.rp_v); G.rp_c=G.rp_v=NULL; G.rp_n=G.rp_i=0; }
+}
+#define QT_REPLAN_PER_TICK 4   /* a decode tick starts at most this many pending swaps: each swap is a
+                                * cudaFree + cudaMalloc, which synchronise the device under the async groups */
+
+static const uint32_t *g_rp_cnt; static int g_rp_base;   /* counts indexed by slot - base */
+/* Both orders are total (the slot index breaks the last tie): qsort is not
+ * stable, and glibc's and msvcrt's disagree on ties, so without it the same
+ * counts would pick different victims on Linux and Windows. */
+static int cmp_rp_cand(const void *a,const void *b){          /* count desc, index asc */
+    int ia=*(const int*)a, ib=*(const int*)b;
+    uint32_t fa=g_rp_cnt[ia-g_rp_base], fb=g_rp_cnt[ib-g_rp_base];
+    if(fa!=fb) return fa<fb ? 1 : -1;
+    return ia<ib ? -1 : ia>ib ? 1 : 0;
+}
+static int cmp_rp_vict(const void *a,const void *b){          /* count asc, heat asc, index asc */
+    int ia=*(const int*)a, ib=*(const int*)b;
+    uint32_t fa=g_rp_cnt[ia-g_rp_base], fb=g_rp_cnt[ib-g_rp_base];
+    if(fa!=fb) return fa<fb ? -1 : 1;
+    uint32_t ha=G.slot[ia].heat, hb=G.slot[ib].heat;
+    if(ha!=hb) return ha<hb ? -1 : 1;
+    return ia<ib ? -1 : ia>ib ? 1 : 0;
+}
+int qt_replan(int layer,const uint32_t *counts,int max_swaps){
+    if(!G.on||!counts||G_fp8_stream||max_swaps<=0||layer>=G.nl) return 0;
+    size_t lo = layer>=0 ? (size_t)layer*G.ne : 0, hi = layer>=0 ? lo+G.ne : (size_t)G.nl*G.ne;
+    size_t n=hi-lo;
+    int *cand=malloc(n*sizeof(int)), *vict=malloc(n*sizeof(int));
+    if(!cand||!vict){ free(cand); free(vict); return 0; }
+    pthread_mutex_lock(&G.mx);
+    g_rp_cnt=counts; g_rp_base=(int)lo;
+    int np=0, seen=0;
+    int *pc=realloc(G.rp_c,(size_t)(G.rp_n+(int)n)*sizeof(int)), *pv=realloc(G.rp_v,(size_t)(G.rp_n+(int)n)*sizeof(int));
+    if(!pc||!pv){ free(pc?pc:G.rp_c); free(pv?pv:G.rp_v); G.rp_c=G.rp_v=NULL; G.rp_n=G.rp_i=0;
+                  pthread_mutex_unlock(&G.mx); free(cand); free(vict); return 0; }
+    G.rp_c=pc; G.rp_v=pv;
+    for(int di=0;di<G.ndev && np<max_swaps;di++){
+        int nc=0, nv=0;
+        for(size_t i=lo;i<hi;i++){
+            QSlot *s=&G.slot[i]; int e=(int)(i%G.ne);
+            if(home(e)!=di || s->queued) continue;
+            if(s->resident) vict[nv++]=(int)i;
+            else if(s->g4 && counts[i-lo]>0) cand[nc++]=(int)i;
+        }
+        seen+=nc;
+        qsort(cand,nc,sizeof(int),cmp_rp_cand);
+        qsort(vict,nv,sizeof(int),cmp_rp_vict);
+        for(int k=0;k<nc && k<nv && np<max_swaps;k++){
+            if(counts[cand[k]-lo]<=counts[vict[k]-lo]) break;    /* the rest is not worth a swap */
+            G.rp_c[G.rp_n+np]=cand[k]; G.rp_v[G.rp_n+np]=vict[k]; np++;
+        }
+    }
+    G.rp_n+=np; G.rp_planned+=np;
+    replan_drain_locked(QT_QCAP);                         /* start what the queue takes */
+    pthread_mutex_unlock(&G.mx);
+    free(cand); free(vict);
+    if(layer<0) fprintf(stderr,"[qtier] replan: %d swaps planned from %d routed non-residents\n",np,seen);
+    return np;
+}
+
+void qt_stats_mark(void){
+    if(!G.on) return;
+    pthread_mutex_lock(&G.mx);
+    G.mk_hits=0; for(int i=0;i<G.ndev;i++) G.mk_hits+=G.hits[i];
+    G.mk_miss=G.miss; G.mk_on=1;
+    pthread_mutex_unlock(&G.mx);
+}
+
 static void qt_lfru_tick_locked(void){
     size_t n=(size_t)G.nl*G.ne;
     G.tick++;
     if(!(G.tick%1024))
         for(size_t i=0;i<n;i++) G.slot[i].heat=tier_decay_value(G.slot[i].heat);
+    replan_drain_locked(QT_REPLAN_PER_TICK);              /* pending re-plan pairs, a few per token */
     if(G.tick%16) return;
     for(int di=0;di<G.ndev;di++){
         int cold=-1, hot=-1; uint32_t ch=0, hh=0;
@@ -1101,7 +1223,7 @@ static void qt_lfru_tick_locked(void){
         if(!tier_should_promote(hh,ch)) continue;
         QSlot *v=&G.slot[cold];
         v->resident=0;                                    /* CPU fallback from now on */
-        if(enqueue_locked(hot/G.ne,hot%G.ne,cold/G.ne,cold%G.ne,0)) G.swaps++;
+        if(enqueue_locked(hot/G.ne,hot%G.ne,cold/G.ne,cold%G.ne,0)){ G.swaps++; evict_note_locked(cold); }
         else v->resident=1;                               /* queue full: revert */
     }
 }
@@ -1198,8 +1320,16 @@ void qt_stats(void){
                 G_trunk_bytes[i]/1073741824.0, G.budget[i]/1073741824.0);
     }
     double tot=(double)(hits+G.miss);
-    fprintf(stderr,"[qtier] VRAM hit rate: %.1f %% | LFRU swaps %llu\n",
-            tot>0? 100.0*hits/tot : 0.0, (unsigned long long)G.swaps);
+    fprintf(stderr,"[qtier] VRAM hit rate: %.1f %% | swaps %llu (%llu in place)\n",
+            tot>0? 100.0*hits/tot : 0.0, (unsigned long long)G.swaps, (unsigned long long)G.inplace);
+    if(G.mk_on){
+        uint64_t dh=hits-G.mk_hits, dm=G.miss-G.mk_miss;
+        fprintf(stderr,"[qtier] decode VRAM hit rate: %.1f %% (%llu hits, %llu misses after the prefill)\n",
+                dh+dm? 100.0*dh/(dh+dm) : 0.0, (unsigned long long)dh, (unsigned long long)dm);
+    }
+    if(G.rp_planned)
+        fprintf(stderr,"[qtier] replan: %llu swaps planned, %llu done, %d still pending\n",
+                (unsigned long long)G.rp_planned, (unsigned long long)G.rp_done, G.rp_n-G.rp_i);
     { uint64_t calls=0,ex=0,rows=0; double h2d=0,kms=0,d2h=0;
       coli_cuda_group_stats(&calls,&ex,&rows,&h2d,&kms,&d2h);
       if(calls) fprintf(stderr,"[qtier] group_stats: %llu calls, %llu experts | h2d %.0f ms, kernel %.0f ms, d2h %.0f ms\n",
@@ -1218,6 +1348,8 @@ static void dense_free_all(void){
 void qt_shutdown(void){
     dense_free_all();
     if(!G.on) return;
+    free(G.rp_c); free(G.rp_v); G.rp_c=G.rp_v=NULL; G.rp_n=G.rp_i=0;
+    free(G.ev); G.ev=NULL; G.ev_n=0;
     const char *hf=getenv("HEAT_FILE");
     if(hf){
         FILE *f=fopen(hf,"wb");
