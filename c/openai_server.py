@@ -546,6 +546,24 @@ def _project_span(span_map, start, end):
     return (low, high) if high > low else None
 
 
+# `tool_choice: "required"` as one line of prompt, for every renderer that has a tool
+# block to put it after. It is a prompt-level instruction and nothing more: no
+# renderer here constrains sampling, so a model that answers in prose anyway has done
+# nothing the API promised would be impossible. Grammar forcing is not a remedy -- that
+# path feeds a draft the engine then verifies, so it degrades to "no speedup" rather
+# than to an enforced tool call.
+#
+# One constant, because it used to live in three copies (GLM-5.2, DeepSeek V4,
+# DeepSeek V4.1) and be absent from four renderers that accept `required`, render the
+# tools and then drop the instruction on the floor -- the "accepted in silence" outcome
+# #1698 rules out. A renderer with no tool block to attach it to (Inkling, OLMoE
+# without COLI_TOOL_FALLBACK) answers HTTP 400 instead, the honest third outcome. Kimi
+# K3 spells its own, because its wire format carries a dedicated tool-choice message
+# rather than prose.
+TOOL_CHOICE_REQUIRED_INSTRUCTION = (
+    "\n\nYou must call one of the functions above. Do not answer directly.")
+
+
 def _tool_choice_name(tool_choice):
     """The tool name a dict `tool_choice` forces, or None.
 
@@ -1635,7 +1653,7 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
         if forced:
             tools_text += f"\n\nYou must call the function `{forced}`. Do not answer directly."
         elif tool_choice == "required":
-            tools_text += "\n\nYou must call one of the functions above. Do not answer directly."
+            tools_text += TOOL_CHOICE_REQUIRED_INSTRUCTION
         for msg in merged:
             if msg["role"] in ("system", "developer"):
                 msg["content"] += "\n\n" + tools_text
@@ -1708,7 +1726,11 @@ def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, to
     boundary = "|||IP_ADDRESS|||"   # bos_token == eos_token in this tokenizer
     parts = [boundary]
     if tools and _TOOL_FALLBACK:
-        parts.append(f"<|system|>\n{_fallback_tool_preamble(tools)}\n")
+        # Fallback only: without it, `required` is already a 400 above.
+        preamble = _fallback_tool_preamble(tools)
+        if tool_choice == "required":
+            preamble += TOOL_CHOICE_REQUIRED_INSTRUCTION
+        parts.append(f"<|system|>\n{preamble}\n")
     last = len(messages) - 1
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -1801,6 +1823,8 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
         start = 1
     if tools:
         block = _qwen_tool_block(tools)
+        if tool_choice == "required":
+            block += TOOL_CHOICE_REQUIRED_INSTRUCTION
         if system_text:
             block += "\n\n" + system_text
         parts.append(f"<|im_start|>system\n{block}<|im_end|>\n")
@@ -2239,7 +2263,13 @@ def render_chat_mimo(messages, enable_thinking=True, reasoning_effort=None, tool
         raise APIError(400, "`tools` must be an array.", "tools")
     parts = []
     if tools:
-        parts.append(f"<|im_start|>system\n{_mimo_tools(tools)}<|im_end|>")
+        tools_text = _mimo_tools(tools)
+        # In the tool turn, after </tools> and before its <|im_end|>: "the functions
+        # above" has to be true, and MiMo's declaration block is a whole system turn
+        # of its own, so there is nothing to put the line outside of but the frame.
+        if tool_choice == "required":
+            tools_text += TOOL_CHOICE_REQUIRED_INSTRUCTION
+        parts.append(f"<|im_start|>system\n{tools_text}<|im_end|>")
     last = len(messages) - 1
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -2398,6 +2428,8 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
         # text last -- not the other way round.
         head = (instruction + "\n\n") if instruction else ""
         block = head + _qwen_tool_block(tools)
+        if tool_choice == "required":
+            block += TOOL_CHOICE_REQUIRED_INSTRUCTION
         if system_text:
             block += "\n\n" + system_text
         parts.append(f"<|im_start|>system\n{block}<|im_end|>\n")
@@ -2592,7 +2624,7 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
         if forced:
             prompt.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
         elif tool_choice == "required":
-            prompt.append("\n\nYou must call one of the functions above. Do not answer directly.")
+            prompt.append(TOOL_CHOICE_REQUIRED_INSTRUCTION)
     prev_tool = False
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -3043,6 +3075,11 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     prompt.append(f"<|system|>Reasoning Effort: {effort}")
     if tools:
         prompt.append(_glm53_tool_block(tools))
+        # Fuori dal blocco, non dentro: il blocco e' confrontato byte a byte con
+        # jinja2 (glm53_chat_template_harness.py) e l'istruzione non c'e' nel
+        # template, quindi va dopo -- come fa render_chat per GLM-5.2.
+        if tool_choice == "required":
+            prompt.append(TOOL_CHOICE_REQUIRED_INSTRUCTION)
 
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -3241,7 +3278,7 @@ def render_chat_dsv41(messages, enable_thinking=False, reasoning_effort=None, to
         if forced:
             tools_text += f"\n\nYou must call the function `{forced}`. Do not answer directly."
         elif tool_choice == "required":
-            tools_text += "\n\nYou must call one of the functions above. Do not answer directly."
+            tools_text += TOOL_CHOICE_REQUIRED_INSTRUCTION
         for turn in turns:
             if turn["role"] == "system":
                 turn["content"] += "\n\n" + tools_text

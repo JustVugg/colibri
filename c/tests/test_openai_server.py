@@ -29,8 +29,9 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            parse_qwen_tool_calls,
                            read_engine_turn, render_chat, render_chat_qwen, render_chat_for_arch,
                            render_chat_glm53, render_chat_inkling, render_chat_kimi,
-                           render_chat_olmoe, render_chat_qwen,
-                           render_chat_qwen38, render_chat_v4, render_chat_dsv41,
+                            render_chat_olmoe, render_chat_qwen,
+                            render_chat_qwen38, render_chat_v4, render_chat_dsv41,
+                            render_chat_mimo,
                            _dsv4_tool_calls, serve,
                            resolve_generation_prompt, split_thinking_reply,
                            detect_chat_flavor, qwen36_has_vision,
@@ -38,8 +39,9 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            parse_tool_calls_spans, parse_arch_tool_calls_spans,
                            THINK_OPEN, THINK_CLOSE,
                            _compose_span_maps, _cut_span_map, _project_span,
-                           _keepalive_choice,
-                           stop_policy, tune_child_env)
+                            _keepalive_choice,
+                            stop_policy, tune_child_env,
+                            TOOL_CHOICE_REQUIRED_INSTRUCTION)
 
 
 def echo_record(pos, data, lp, topk):
@@ -3809,6 +3811,97 @@ class ToolChoiceTest(unittest.TestCase):
     def test_rejects_tool_choice_without_tools(self):
         with self.assertRaises(APIError):
             generation_options({"messages": [], "tool_choice": "required"}, 128)
+
+    # #1698 Tier 2: `required` was prompt-level on four renderers and dropped by
+    # the four others that accept it, so a client got the tools and no instruction
+    # to use them. These pin the one-line difference per renderer, because the
+    # failure is silent: the request succeeds, the model just answers in prose.
+
+    # The renderers that render a tool block and therefore have somewhere to put
+    # the instruction. Kimi K3 is absent on purpose: its wire format carries a
+    # dedicated tool-choice message rather than prose (tested below).
+    BLOCK_RENDERERS = (render_chat, render_chat_v4, render_chat_dsv41, render_chat_qwen,
+                       render_chat_qwen38, render_chat_glm53, render_chat_mimo)
+
+    def _auto_and_required(self, render, **kwargs):
+        messages = [{"role": "user", "content": "Where is order 7?"}]
+        return (render(messages, tools=ORDER_TOOL, tool_choice="auto", **kwargs),
+                render(messages, tools=ORDER_TOOL, tool_choice="required", **kwargs))
+
+    def test_required_is_auto_plus_exactly_the_instruction(self):
+        for render in self.BLOCK_RENDERERS:
+            with self.subTest(renderer=render.__name__):
+                auto, required = self._auto_and_required(render)
+                self.assertEqual(required.count(TOOL_CHOICE_REQUIRED_INSTRUCTION), 1)
+                # Nothing else moves: the instruction is the whole difference
+                # between `auto` and `required` on every one of these families.
+                self.assertEqual(
+                    required.replace(TOOL_CHOICE_REQUIRED_INSTRUCTION, "", 1), auto)
+
+    def test_required_instruction_comes_after_the_declarations(self):
+        # "the functions above" has to be true, so the instruction goes after the
+        # last declared function and not inside or before the tool block.
+        for render in self.BLOCK_RENDERERS:
+            with self.subTest(renderer=render.__name__):
+                _, required = self._auto_and_required(render)
+                self.assertLess(required.rindex("lookup_order"),
+                                required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION))
+
+    def test_required_sits_between_the_tool_block_and_the_system_text(self):
+        # Qwen3.6/3.8 build one system turn as [tool block][client system text];
+        # the instruction belongs to the tool half, so it goes between the two
+        # and not after the client's own text.
+        system = [{"role": "system", "content": "Be terse."},
+                  {"role": "user", "content": "Where is order 7?"}]
+        for render in (render_chat_qwen, render_chat_qwen38):
+            with self.subTest(renderer=render.__name__):
+                required = render(system, tools=ORDER_TOOL, tool_choice="required")
+                self.assertLess(required.index("# Tools"),
+                                required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION))
+                self.assertLess(required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION),
+                                required.index("Be terse."))
+
+    def test_mimo_required_stays_inside_the_tool_system_turn(self):
+        # MiMo's declaration block is a system turn of its own, so there is
+        # nowhere outside it to put the line: it has to land after </tools> and
+        # before that turn's <|im_end|>, or the frame closes before the model
+        # has read it.
+        _, required = self._auto_and_required(render_chat_mimo)
+        close = required.index("</tools>")
+        self.assertLess(close, required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION))
+        self.assertLess(required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION),
+                        required.index("<|im_end|>"))
+
+    def test_olmoe_required_under_the_tool_fallback(self):
+        with patch("openai_server._TOOL_FALLBACK", True):
+            auto, required = self._auto_and_required(render_chat_olmoe)
+        self.assertEqual(required.count(TOOL_CHOICE_REQUIRED_INSTRUCTION), 1)
+        self.assertEqual(required.replace(TOOL_CHOICE_REQUIRED_INSTRUCTION, "", 1), auto)
+        self.assertLess(required.rindex("lookup_order"),
+                        required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION))
+
+    def test_olmoe_without_the_fallback_refuses_required(self):
+        # No tool block, so no instruction to give: the honest outcome is the
+        # 400, not a `required` that is accepted and then ignored.
+        with patch("openai_server._TOOL_FALLBACK", False):
+            with self.assertRaisesRegex(APIError, "Tool use"):
+                render_chat_olmoe([{"role": "user", "content": "Hi"}], tools=ORDER_TOOL,
+                                  tool_choice="required")
+
+    def test_inkling_refuses_required(self):
+        with self.assertRaisesRegex(APIError, "not wired up"):
+            render_chat_inkling([{"role": "user", "content": "Hi"}], tools=ORDER_TOOL,
+                                tool_choice="required")
+
+    def test_kimi_keeps_its_own_required_wording(self):
+        # Same policy, different wire format: a dedicated tool-choice message
+        # instead of prose appended to the tool block.
+        required = render_chat_kimi([{"role": "user", "content": "Hi"}],
+                                    tools=ORDER_TOOL, tool_choice="required")
+        self.assertIn("tool-choiceThe system is invoked with `tool_choice=required`.",
+                      required)
+        self.assertIn("You MUST call tools in the next message.", required)
+        self.assertNotIn(TOOL_CHOICE_REQUIRED_INSTRUCTION, required)
 
 
 class TrailingAssistantTurnTest(unittest.TestCase):

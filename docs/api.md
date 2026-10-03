@@ -233,9 +233,11 @@ Known limitations, current build:
 | Engine | OpenAI `tools` | Anthropic `tool_use` | Native format |
 |---|---|---|---|
 | GLM-5.2 (`colibri`) | yes | yes | `<tool_call>` blocks |
+| GLM-5.3-Flash | yes | yes | `<tool_call>` blocks, with the 5.3 declaration block |
 | DeepSeek V4 | yes | yes | native DSML tool-call blocks |
 | Inkling | no | no | active tool declarations/choices return HTTP 400 |
 | Kimi K3 | yes | yes | native XTML `tools`/`call`/`argument` blocks (#1143) |
+| MiMo-V2.6 | yes | yes | native `<tools>` / `<tool_call>` blocks |
 | Qwen3.6 | yes | yes | native `<tool_call>`/`<tool_response>` blocks, the same XML-ish form as Qwen3.8 |
 | Qwen3.8-Flash-Next | yes | yes | native `<tool_call>`/`<tool_response>` blocks |
 | OLMoE | no | no | active tool declarations/choices return HTTP 400 |
@@ -248,8 +250,24 @@ Protocol support does not guarantee that every quantized model emits valid
 tool syntax; `COLI_TOOL_SALVAGE=1` is an opt-in recovery path for malformed GLM
 int4 tool calls. DeepSeek V4 uses its strict native DSML parser instead.
 
+`tool_choice: "required"` is a prompt-level instruction, not a sampling
+constraint. Every renderer that offers a tool block appends the same one line to
+it, and no renderer filters tokens or forces the sampler, so a model that
+answers in prose anyway has done nothing the API said was impossible.
+Grammar forcing is not a remedy: that path feeds a draft the engine then
+verifies, so a schema the engine cannot compile costs the speedup and nothing
+else. An engine with no tool block to attach the instruction to (Inkling, OLMoE
+without `COLI_TOOL_FALLBACK=1`) answers HTTP 400 rather than accept the choice
+and ignore it.
+
+A forced choice, `tool_choice: {"type": "function", "function": {"name": …}}`,
+is applied per engine and the engines do not agree on how: some narrow the
+offered tools to the named one, some keep the full list and name the tool in
+prose instead, and some (Qwen3.6, Qwen3.8) do neither. Read the rendered prompt
+rather than assuming the request was honoured.
+
 For GLM calls that will execute tools, an OpenAI chat request may set
-`"strict_tool_calls": true`. This opt-in accepts only complete `<tool_call>`
+`"strict_tool_calls": true`. This opt-in accepts only complete `<​tool_call>`
 blocks whose function and arguments match the declared tool schema. It returns
 HTTP 502 with code `invalid_model_tool_call` for incomplete, duplicate, unknown,
 or invalid arguments and for a tool call cut off by the generation limit. It
