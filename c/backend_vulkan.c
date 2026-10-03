@@ -2235,7 +2235,7 @@ static struct {
     int D, I, act; float limit, a, b;
     VkCommandPool cpool; VkCommandBuffer cmd; VkFence fence;
     VkQueryPool qpool; int has_ts;
-    VkShaderModule sh_act;
+    VkShaderModule sh_act, sh_gu, sh_mv, sh_mm;
     VkDescriptorSetLayout dsl6, dsl4, dsl3;
     VkPipelineLayout pl6, pl4, pl3;
     VkPipeline p_gu, p_mv, p_act, p_mm[VK_GEMM_SLOTS];
@@ -2402,7 +2402,17 @@ int coli_vk_xb_init(int D, int I, int act, float limit, float a, float b) {
     if (!xb_layout(6, (1u << 0) | (1u << 5), sizeof(struct PCGU), &XB.dsl6, &XB.pl6) ||
         !xb_layout(4, (1u << 0) | (1u << 3), sizeof(struct PC), &XB.dsl4, &XB.pl4) ||
         !xb_layout(3, 7u, sizeof(struct PCAct), &XB.dsl3, &XB.pl3)) return 0;
-    if (!xb_pipeline(G.shader_gu, XB.pl6, NULL, &XB.p_gu) || !xb_pipeline(G.shader, XB.pl4, NULL, &XB.p_mv)) return 0;
+    /* Own modules, loaded from G's files: MoltenVK with Metal argument buffers runs a
+     * pipeline built from a module that a static-layout pipeline already used without
+     * that pipeline's dynamic offsets. Own modules keep the batch's windows apart. */
+    char gu_path[1100], mm_path[1100];
+    derive_sibling(G.spv_path, "_gate_up.spv", gu_path, sizeof gu_path);
+    derive_sibling(G.spv_path, "_gemm.spv", mm_path, sizeof mm_path);
+    XB.sh_gu = load_spv(G.dev, gu_path);
+    XB.sh_mv = load_spv(G.dev, G.spv_path);
+    XB.sh_mm = G.shader_gemm ? load_spv(G.dev, mm_path) : VK_NULL_HANDLE;
+    if (!XB.sh_gu || !XB.sh_mv || (G.shader_gemm && !XB.sh_mm)) return 0;
+    if (!xb_pipeline(XB.sh_gu, XB.pl6, NULL, &XB.p_gu) || !xb_pipeline(XB.sh_mv, XB.pl4, NULL, &XB.p_mv)) return 0;
     /* the GEMM route: the backend's tiles, and expert_act.spv beside the main shader */
     char act_path[1100];
     derive_dir_file(G.spv_path, "expert_act.spv", act_path, sizeof act_path);
@@ -2415,7 +2425,7 @@ int coli_vk_xb_init(int D, int I, int act, float limit, float a, float b) {
             VkSpecializationMapEntry me[7];
             for (int i = 0; i < 7; i++) me[i] = (VkSpecializationMapEntry){(uint32_t)i, (uint32_t)(i * 4), 4};
             VkSpecializationInfo si = {7, me, sizeof(sv), sv};
-            if (!xb_pipeline(G.shader_gemm, XB.pl4, &si, &XB.p_mm[k])) XB.p_mm[k] = VK_NULL_HANDLE;
+            if (!xb_pipeline(XB.sh_mm, XB.pl4, &si, &XB.p_mm[k])) XB.p_mm[k] = VK_NULL_HANDLE;
         }
     }
     const char *e = getenv("COLI_VK_TIER_GEMM_ROWS");
@@ -2700,6 +2710,9 @@ static void xb_shutdown(void) {
     for (int k = 0; k < VK_GEMM_SLOTS; k++) ps[3 + k] = XB.p_mm[k];
     for (int k = 0; k < 3 + VK_GEMM_SLOTS; k++) if (ps[k]) vkDestroyPipeline(G.dev, ps[k], NULL);
     if (XB.sh_act) vkDestroyShaderModule(G.dev, XB.sh_act, NULL);
+    if (XB.sh_gu) vkDestroyShaderModule(G.dev, XB.sh_gu, NULL);
+    if (XB.sh_mv) vkDestroyShaderModule(G.dev, XB.sh_mv, NULL);
+    if (XB.sh_mm) vkDestroyShaderModule(G.dev, XB.sh_mm, NULL);
     if (XB.pl6) vkDestroyPipelineLayout(G.dev, XB.pl6, NULL);
     if (XB.pl4) vkDestroyPipelineLayout(G.dev, XB.pl4, NULL);
     if (XB.pl3) vkDestroyPipelineLayout(G.dev, XB.pl3, NULL);

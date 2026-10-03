@@ -28,8 +28,9 @@ layout(constant_id = 4) const int TN = 4;     // activation rows per thread
 layout(local_size_x_id = 5) in;               // (BM/TM) * (BN/TN) threads
 layout(constant_id = 6) const bool PF = true; // fetch the next step during the products
 
-layout(std430, binding = 0) readonly buffer X  { float x[]; };
-layout(std430, binding = 0) readonly buffer X4 { vec4  x4[]; };  // same buffer, quads
+// One view of x: the expert batch binds it as a dynamic buffer, and SPIRV-Cross (under
+// MoltenVK's argument buffers) gives a dynamic buffer's offset to only one of its views.
+layout(std430, binding = 0) readonly buffer X4 { vec4  x4[]; };  // x[S*I], as quads
 layout(std430, binding = 1) readonly buffer W  { uint  w[]; };   // row o at o*rowWords
 layout(std430, binding = 1) readonly buffer W2 { uvec2 w2[]; };  // same buffer, pairs
 layout(std430, binding = 1) readonly buffer W4 { uvec4 w4[]; };  // same buffer, quads
@@ -151,6 +152,8 @@ const int WU = (BM * (BK / 8) + NT - 1) / NT;    // weight units per thread and 
 const int XU = (BN * (BK / 4) + NT - 1) / NT;    // activation quads per thread and step
 uvec4 rwa[WU], rwb[WU]; vec2 rws[WU]; vec4 rx[XU];
 
+float x_at(uint i) { return x4[i >> 2][i & 3u]; }   // x[i], one float of its quad
+
 // Fetch step k0 of this tile into registers (zeros past O, S and I).
 void fetch_step(int tid, int o0, int s0, int k0) {
     [[unroll]] for (int r = 0; r < WU; r++) {
@@ -165,10 +168,10 @@ void fetch_step(int tid, int o0, int s0, int k0) {
             uint b = uint(s) * uint(p.I) + uint(k);
             if ((p.I & 3) == 0) v = x4[b >> 2];  // rows of x start on a quad
             else {
-                v.x = x[b];
-                if (k + 1 < p.I) v.y = x[b + 1u];
-                if (k + 2 < p.I) v.z = x[b + 2u];
-                if (k + 3 < p.I) v.w = x[b + 3u];
+                v.x = x_at(b);
+                if (k + 1 < p.I) v.y = x_at(b + 1u);
+                if (k + 2 < p.I) v.z = x_at(b + 2u);
+                if (k + 3 < p.I) v.w = x_at(b + 3u);
             }
         }
         rx[r] = v;
