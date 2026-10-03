@@ -1515,6 +1515,10 @@ tests/test_qwen36_encode_oom$(EXE): tests/test_qwen36_encode_oom.c qwen36.c $(QW
 tests/test_qwen36_slot_int8$(EXE): tests/test_qwen36_slot_int8.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# qwen36_cap_for_ram(): the cap<=0 "auto" sentinel's RAM-derived slot count.
+tests/test_qwen36_cap_precedence$(EXE): tests/test_qwen36_cap_precedence.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 # the dense trunk's integer path: quantizer contract, int4 planar packing, dispatch.
 tests/test_qwen36_dense_idot$(EXE): tests/test_qwen36_dense_idot.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
