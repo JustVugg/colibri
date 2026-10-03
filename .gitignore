@@ -23,6 +23,8 @@ c/qwen38
 c/qwen38.exe
 c/laya
 c/laya.exe
+c/gliner_decide
+c/gliner_decide.exe
 c/tools/jev-sdk/node_modules/
 # deepseek_v4 and the per-unit objects its amalgamated Makefile leaves behind.
 # The same omission as #858, one file over: every engine is listed here except

@@ -511,6 +511,7 @@ GLM-5.2 がリファレンスモデルですが、同じストリーミング手
 | **OLMoE**（AI2） | 7B / 1B | `c/tools/convert_olmoe_merged.py` で変換 — **int8** コンテナ、約 7 GB | `make -C c olmoe` | — |
 | **Qwen-Image-2.1**（Alibaba） | 画像モデル | [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1)（約 33 GB）、公式 diffusers チェックポイント、**変換不要**: テキストエンコーダと拡散トランスフォーマーはロード時に int8 に量子化。`coli chat` では画像をインライン表示し、`coli serve` では `POST /v1/images/generations` で提供。Qwen Research License: 非商用利用のみ | `make -C c qwenimage` | [qwen-image.md](docs/qwen-image.md) |
 | **Laya**（Convai Innovations） | 判定モデル、421M | [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya)（842 MB）、公式チェックポイント、**変換不要**: ModernBERT エンコーダと判定ヘッドで、型付きの質問（choice、score、noul）に生成ではなく較正済みの確率で答える。`coli serve` の `POST /v1/systemone` で提供。Apache-2.0 | `make -C c laya` | [laya.md](docs/laya.md) |
+| **GLiNER2.5-Decide**（fastino） | 判定モデル、340M | [`fastino/GLiNER2.5-Decide`](https://huggingface.co/fastino/GLiNER2.5-Decide)（1.9 GB）、公式チェックポイント、**変換不要**: DeBERTa-v3 エンコーダと GLiNER2 の分類ヘッド。リクエストの全質問と状態を一度に読み、各選択肢に確率を返す。`coli serve` の `POST /v1/systemone` で提供。Apache-2.0 | `make -C c gliner_decide` | [gliner_decide.md](docs/gliner_decide.md) |
 
 Qwen3.6 には変換済みコンテナが 3 つあります: **int4-gs64**（推奨 — int8 のアンカーに対するコサイン類似度は
 行単位と比べて 0.98777 → 0.99313、KL は 0.109 → 0.080 と計測されており、量子化誤差が約 44% 少ない）、

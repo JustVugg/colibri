@@ -585,6 +585,14 @@ Read **only** by `c/laya.c`, the decision engine ([laya.md](laya.md)).
 | `COLI_LAYA_MAX_LEN` | the checkpoint's `max_len` | Tokens per question sequence (512 on the English checkpoint, capped at the encoder's 8192 positions). |
 | `COLI_LAYA_HEAD_MAX_LEN` | the checkpoint's `head_max_len` | Tokens shared by a question's instructions and options; raise it for questions with many options. |
 
+## GLiNER2.5-Decide engine (`gliner_decide`)
+
+Read **only** by `c/gliner_decide.c`, the decision engine ([gliner_decide.md](gliner_decide.md)).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_GLINER_MAX_LEN` | `4096` | Tokens of the one sequence a request becomes: every question with its options, then the state. The state is cut at the last whole word that fits; questions that alone exceed it are refused with a 422. |
+
 ---
 
 ## Server / CLI (`openai_server.py`, `coli`)

@@ -840,9 +840,9 @@ def run_image_doctor(model, engine_path, available_memory=None):
 
 
 def run_decision_doctor(model, engine_path, available_memory=None):
-    """doctor for a decision model (Laya): no root config.json, no experts and
-    no KV state. What can be wrong is a missing file of the checkpoint, an
-    engine that is not built, or weights that do not fit in RAM as f32."""
+    """doctor for a decision model (Laya, GLiNER2.5-Decide): no experts and no
+    KV state. What can be wrong is a missing file of the checkpoint, an engine
+    that is not built, or weights that do not fit in RAM as f32."""
     import json
     import struct
     model = Path(model).expanduser().resolve()
@@ -857,11 +857,11 @@ def run_decision_doctor(model, engine_path, available_memory=None):
                              f"{resolved.descriptor.display_name} decision model is registered",
                              family_id=resolved.descriptor.id, model_type=resolved.model_type,
                              descriptor=public_metadata(resolved.descriptor)))
-        tokenizer_file = resolved.descriptor.tokenizer_file
+        files = (resolved.descriptor.tokenizer_file,) + resolved.descriptor.checkpoint_files
     except (FamilyConfigError, UnknownFamilyError) as error:
         checks.append(_check("model.family", "fail", str(error)))
-        tokenizer_file = "tokenizer/tokenizer.json"
-    for name in (tokenizer_file, "tokenizer/tokenizer_config.json", "encoder/config.json"):
+        files = ()
+    for name in files:
         present = (model / name).is_file()
         checks.append(_check("model.files", "pass" if present else "fail",
                              f"{name} found" if present else f"{name} is missing"))

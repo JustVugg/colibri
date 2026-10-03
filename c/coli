@@ -266,17 +266,33 @@ def is_image_model(model):
         return False
 
 def is_decision_model(model):
-    """A decision checkpoint (Laya: rl_agent_config.json, no root config.json):
-    served by coli serve / coli web on POST /v1/systemone, never chatted with."""
+    """A decision checkpoint (Laya: rl_agent_config.json, no root config.json;
+    GLiNER2.5-Decide: a GLiNER2 extractor config.json): served by coli serve /
+    coli web on POST /v1/systemone, never chatted with."""
     try:
         return resolve_model(model).descriptor.modality == "decision"
     except (FamilyConfigError, UnknownFamilyError, OSError, TypeError, ValueError):
         return False
 
+# What bounds the tokens a decision engine reads, and the variable that moves it.
+DECISION_LENGTH = {
+    "laya": ("at most its checkpoint's max_len per question", "COLI_LAYA_MAX_LEN"),
+    "gliner_decide": ("every question and the state in one sequence of at most 4096 tokens",
+                      "COLI_GLINER_MAX_LEN"),
+}
+
+def is_gliner_decide(model):
+    try:
+        return resolve_model(model).descriptor.id == "gliner_decide"
+    except (FamilyConfigError, UnknownFamilyError, OSError, TypeError, ValueError):
+        return False
+
 def decision_refusal(family):
-    """What every chatting command says about a decision model, and where to go."""
+    """What every chatting command says about a decision model, and where to go.
+    Laya ships a calibration; GLiNER2.5-Decide gives its classifier's softmax."""
+    answers = "calibrated probabilities" if family.id == "laya" else "a probability per option"
     return (f"{C.yel}{family.display_name} is a decision model:{C.r} it answers typed questions "
-            f"(choice, score, noul) with calibrated probabilities and does not chat.\n"
+            f"(choice, score, noul) with {answers} and does not chat.\n"
             f"  Start it with: coli serve --model <dir>   (or coli web for the dashboard)\n"
             f"  then POST /v1/systemone (docs/systemone.md, \"Decision engines\")")
 
@@ -514,8 +530,9 @@ def env_for_engine(a, arch, plan=None):
         sys.exit(f"{C.yel}--ctx does not apply to {family.display_name}:{C.r} an image model has "
                  f"no context window (the prompt goes through its text encoder once)")
     if family.modality == "decision" and getattr(a, "ctx", None):
+        reads, knob = DECISION_LENGTH.get(family.id, ("what its engine allows", "its engine's own variable"))
         sys.exit(f"{C.yel}--ctx does not apply to {family.display_name}:{C.r} a decision model reads "
-                 f"at most its checkpoint's max_len per question (COLI_LAYA_MAX_LEN overrides it)")
+                 f"{reads} ({knob} overrides it)")
     if getattr(a,"ram",0): explicit_env.add("RAM_GB")
     # OMP_NUM_THREADS for the sister engines that do not size their own team.
     #
@@ -1394,11 +1411,19 @@ def info_decision_model(a, resolved, row):
     enc, cfg = resolved.family_config, resolved.config
     name, scale = display_for(resolved)
     row("model", a.model)
-    row("type", f"{name}{' · ' + scale if scale else ''} · decision model · "
-                f"{enc.get('model_type')} encoder, {enc.get('num_hidden_layers')} layer x "
-                f"{enc.get('hidden_size')} · head {cfg.get('head_layers')} layer")
-    row("budget", f"max_len {cfg.get('max_len')} tokens per question, "
-                  f"head_max_len {cfg.get('head_max_len')} for the options")
+    encoder = (f"{enc.get('model_type')} encoder, {enc.get('num_hidden_layers')} layer x "
+               f"{enc.get('hidden_size')}")
+    if family.id == "gliner_decide":
+        row("type", f"{name}{' · ' + scale if scale else ''} · decision model · {encoder} · "
+                    f"GLiNER2 {cfg.get('architecture') or 'span'} classification head")
+        max_len = os.environ.get("COLI_GLINER_MAX_LEN") or "4096"
+        row("budget", f"max_len {max_len} tokens per request: every question and the state "
+                      f"in one sequence (COLI_GLINER_MAX_LEN)")
+    else:
+        row("type", f"{name}{' · ' + scale if scale else ''} · decision model · {encoder} · "
+                    f"head {cfg.get('head_layers')} layer")
+        row("budget", f"max_len {cfg.get('max_len')} tokens per question, "
+                      f"head_max_len {cfg.get('head_max_len')} for the options")
     try:
         params, disk = decision_weights(a.model)
         row("weights", f"{params/1e6:.0f}M params · {disk/1e6:.0f} MB on disk · "
@@ -1426,7 +1451,9 @@ def plan_decision_command(a):
         print(json.dumps(plan, indent=2)); return
     banner("plan · RAM for a decision model", model=a.model)
     print(f"  weights   {params/1e6:.0f}M params, {disk/1e6:.0f} MB on disk")
-    print(f"  RAM       about {params*4/1e9:.1f} GB (f32), plus activations of a few MB per question")
+    grows = ("activations that grow with the request's sequence (COLI_GLINER_MAX_LEN)"
+             if is_gliner_decide(a.model) else "activations of a few MB per question")
+    print(f"  RAM       about {params*4/1e9:.1f} GB (f32), plus {grows}")
     print(f"  nothing grows with use: no KV cache, no experts to stream")
     print()
 

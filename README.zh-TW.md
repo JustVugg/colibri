@@ -465,6 +465,7 @@ GLM-5.2 是參考模型，但同樣的串流方法還能執行另外九個語言
 | **OLMoE**（AI2） | 7B / 1B | 以 `c/tools/convert_olmoe_merged.py` 轉換，**int8** 容器，約 7 GB | `make -C c olmoe` | 無 |
 | **Qwen-Image-2.1**（Alibaba） | 圖像模型 | [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1)（約 33 GB），官方 diffusers checkpoint，**無需轉換**：文字編碼器與擴散 transformer 在載入時量化為 int8。`coli chat` 中直接顯示圖片，`coli serve` 提供 `POST /v1/images/generations`。Qwen Research License：僅限非商業用途 | `make -C c qwenimage` | [qwen-image.md](docs/qwen-image.md) |
 | **Laya**（Convai Innovations） | 決策模型，421M | [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya)（842 MB），官方 checkpoint，**無需轉換**：ModernBERT 編碼器加決策頭，對型別化問題（choice、score、noul）給出校準後的機率，而不是生成文字。由 `coli serve` 在 `POST /v1/systemone` 上提供。Apache-2.0 | `make -C c laya` | [laya.md](docs/laya.md) |
+| **GLiNER2.5-Decide**（fastino） | 決策模型，340M | [`fastino/GLiNER2.5-Decide`](https://huggingface.co/fastino/GLiNER2.5-Decide)（1.9 GB），官方 checkpoint，**無需轉換**：DeBERTa-v3 編碼器加 GLiNER2 的分類頭，一次讀完請求中的所有問題和狀態，為每個選項給出機率。由 `coli serve` 在 `POST /v1/systemone` 上提供。Apache-2.0 | `make -C c gliner_decide` | [gliner_decide.md](docs/gliner_decide.md) |
 
 Qwen3.6 提供三個預先轉換的容器：**int4-gs64**（推薦：與 per-row 相比，對 int8 基準的餘弦相似度
 實測從 0.98777 提升到 0.99313，KL 從 0.109 降到 0.080，即量化誤差減少約 44%）、作為 A/B 基準的

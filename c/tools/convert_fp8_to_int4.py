@@ -76,7 +76,13 @@ OTHER_FAMILY_PATHS = {
                            "diffusers checkpoint as downloaded; see docs/qwen-image.md",
     "laya_modernbert": "Laya is NOT converted: the decision engine reads the release "
                        "as downloaded; see docs/laya.md",
+    "gliner2_span_deberta-v2": "GLiNER2.5-Decide is NOT converted: the decision engine reads "
+                               "the release as downloaded; see docs/gliner_decide.md",
 }
+# A config.json whose model_type is not the registry's key for its family: a
+# GLiNER2 checkpoint says "extractor" for every architecture and encoder, and
+# the registry names it by both (family_registry._resolve_gliner2_checkpoint).
+CONFIG_MODEL_TYPE_ALIASES = {"extractor": "gliner2_span_deberta-v2"}
 
 
 def check_model_family(config, where):
@@ -92,7 +98,7 @@ def check_model_family(config, where):
                          "refusing to guess. This converter is for GLM-5.2 only.")
     if model_type in GLM52_MODEL_TYPES:
         return
-    hint = OTHER_FAMILY_PATHS.get(model_type)
+    hint = OTHER_FAMILY_PATHS.get(CONFIG_MODEL_TYPE_ALIASES.get(model_type, model_type))
     if hint:
         raise SystemExit(f"ERROR: {where} is '{model_type}', not GLM-5.2.\n"
                          f"  This converter would silently upcast most of its "

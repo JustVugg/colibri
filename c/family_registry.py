@@ -170,6 +170,10 @@ class FamilyDescriptor:
     # Where the tokenizer lives, relative to the model directory. A diffusers
     # pipeline keeps it in processor/, not at the root.
     tokenizer_file: str = "tokenizer.json"
+    # The other files a decision checkpoint needs besides model.safetensors and
+    # the tokenizer, relative to the model directory: what `coli doctor`
+    # checks. Each decision family keeps its configuration in its own layout.
+    checkpoint_files: tuple = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1681,6 +1685,52 @@ FAMILIES = (
         supports_accelerator=False,
         modality="decision",
         tokenizer_file="tokenizer/tokenizer.json",
+        checkpoint_files=("tokenizer/tokenizer_config.json", "encoder/config.json"),
+    ),
+    FamilyDescriptor(
+        id="gliner_decide",
+        # A GLiNER2 checkpoint's config.json says model_type "extractor" for
+        # every architecture and encoder: resolve_model reads its architecture
+        # and the encoder's own config (encoder_config/config.json) and names it
+        # gliner2_<architecture>_<encoder model_type>. The engine runs the
+        # classification head of the span architecture on a DeBERTa-v2/v3
+        # encoder; GLiNER2.5-Decide is DeBERTa-v3-large (24 layers x 1024).
+        model_types=("gliner2_span_deberta-v2",),
+        display_name="GLiNER2.5-Decide",
+        display_scale="340M",
+        display_variants=(
+            DisplayVariant((("hidden_size", 1024), ("num_hidden_layers", 24)),
+                           "GLiNER2.5-Decide", "340M"),
+        ),
+        engine_artifact="gliner_decide",
+        engine_aliases=(),
+        engine_group="gliner_decide",
+        internal_arch="gliner_decide",
+        build_target="gliner_decide",
+        process_names=("gliner_decide",),
+        default_model_id="gliner2.5-decide",
+        cli_adapter="gliner_decide",
+        gateway_adapter="gliner_decide",
+        planner_id="gliner_decide",
+        planner_geometry=None,
+        planner_unsupported_reason=(
+            "a decision model has no KV cache and no experts: it keeps its encoder and "
+            "classification head resident in f32 and reads every question of a request and "
+            "the state in one sequence of at most COLI_GLINER_MAX_LEN tokens"),
+        expert_inventory=lambda _name, _size, _config, _dtype=None: (),
+        config_section="root",
+        # One sequence per request, cut at 4096 tokens by default
+        # (COLI_GLINER_MAX_LEN); the encoder's relative positions set no
+        # ceiling of their own. No generation, so the output budgets are the
+        # placeholders every descriptor carries, and no context variable.
+        limits=FamilyLimits(4096, 4096, 1, 1, 1, 0, ""),
+        capabilities=FamilyCapabilities(False, False, False, False, decision=True),
+        has_gateway_adapter=True,
+        has_cli_adapter=False,
+        supports_accelerator=False,
+        modality="decision",
+        tokenizer_file="tokenizer.json",
+        checkpoint_files=("config.json", "encoder_config/config.json"),
     ),
 )
 
@@ -1707,7 +1757,9 @@ def _build_registry(families):
                 "{prompt}" not in family.tune_prompt_template or
                 family.modality not in ("text", "image", "decision") or
                 family.capabilities.decision != (family.modality == "decision") or
-                not isinstance(family.tokenizer_file, str) or not family.tokenizer_file):
+                not isinstance(family.tokenizer_file, str) or not family.tokenizer_file or
+                not isinstance(family.checkpoint_files, tuple) or
+                any(not isinstance(name, str) or not name for name in family.checkpoint_files)):
             raise RegistryError(f"incomplete family descriptor: {family.id}")
         try:
             family.tune_prompt_template.format(prompt="test", prompt_len=4)
@@ -1838,6 +1890,40 @@ def _resolve_decision_checkpoint(model):
     return ResolvedFamily(family, model_type, config, encoder, str(model))
 
 
+# GLiNER2's config.json says model_type "extractor" whatever the architecture
+# and the encoder; the encoder's own config sits in encoder_config/.
+GLINER2_MODEL_TYPE = "extractor"
+GLINER2_ENCODER_CONFIG = "encoder_config/config.json"
+
+
+def _resolve_gliner2_checkpoint(model, config):
+    """A GLiNER2 checkpoint (gliner2's ExtractorConfig): the family is keyed on
+    the architecture and the encoder, gliner2_<architecture>_<encoder
+    model_type>, and the encoder config is the family config (its geometry
+    names the variant). A checkpoint without an architecture is "span", as
+    gliner2's AutoExtractor reads it."""
+    path = model / GLINER2_ENCODER_CONFIG
+    try:
+        encoder = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise FamilyConfigError(f"cannot read {GLINER2_ENCODER_CONFIG}: {model}") from error
+    except json.JSONDecodeError as error:
+        raise FamilyConfigError(f"invalid {GLINER2_ENCODER_CONFIG}: {error}") from error
+    if not isinstance(encoder, dict):
+        raise FamilyConfigError(f"{GLINER2_ENCODER_CONFIG} is not a JSON object")
+    architecture = config.get("architecture") or "span"
+    if not isinstance(architecture, str):
+        raise FamilyConfigError("config.json: architecture is not a string")
+    model_type = (f"gliner2_{_normalize_model_type(architecture)}_"
+                  f"{_normalize_model_type(encoder.get('model_type'))}")
+    try:
+        family = _BY_TYPE[model_type]
+    except KeyError as error:
+        raise UnknownFamilyError(f"unsupported GLiNER2 checkpoint: the {architecture} architecture "
+                                 f"on an {encoder.get('model_type')} encoder") from error
+    return ResolvedFamily(family, model_type, config, encoder, str(model))
+
+
 def resolve_model(model_dir):
     model = Path(model_dir).expanduser().resolve()
     path = model / "config.json"
@@ -1868,6 +1954,8 @@ def resolve_model(model_dir):
             "  carries model_index.json instead.") from error
     except json.JSONDecodeError as error:
         raise FamilyConfigError(f"invalid config.json: {error}") from error
+    if isinstance(config, dict) and config.get("model_type") == GLINER2_MODEL_TYPE:
+        return _resolve_gliner2_checkpoint(model, config)
     family = family_for_config(config)
     family_config = config
     if family.config_section == "text_config":

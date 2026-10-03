@@ -461,6 +461,7 @@ cannot tell which kind answered.
 | engine | model | doc |
 |---|---|---|
 | `c/laya` | Laya (Convai Innovations): ModernBERT encoder + decision head | [laya.md](laya.md) |
+| `c/gliner_decide` | GLiNER2.5-Decide (fastino): DeBERTa-v3 encoder + GLiNER2's classification head | [gliner_decide.md](gliner_decide.md) |
 
 A decision engine serves `POST /v1/systemone` only. Chat, completions and
 messages answer 400 with a pointer to `/v1/systemone`, and
@@ -530,23 +531,23 @@ the engine's own record of how it got there. A record the engine refuses is
 **Registry.** A family with `modality="decision"` and
 `FamilyCapabilities(decision=True)` in `c/family_registry.py`, and a way for
 `resolve_model` to recognise its checkpoint (Laya: `rl_agent_config.json`
-plus `encoder/config.json`, keyed `laya_<encoder model_type>`). `coli serve`
+plus `encoder/config.json`, keyed `laya_<encoder model_type>`;
+GLiNER2.5-Decide: a `config.json` whose `model_type` is `extractor` plus
+`encoder_config/config.json`, keyed
+`gliner2_<architecture>_<encoder model_type>`). `checkpoint_files` names the
+files `coli doctor` checks. `coli serve`
 and `coli web` then serve it, `coli info` and `coli plan` describe it, and
 `coli chat` / `coli run` refuse it with a pointer to the endpoint.
 
 **Tests.** A tiny fixture whose reference answers come from the model's own
 package (`tools/make_laya_tiny.py`, `tools/make_laya_ref.py`,
-`tests/test_laya_tiny.py`), and the fixture behind the real gateway
-(`tests/test_decision_serve.py`, `tests/test_jev_sdk.py`).
+`tests/test_laya_tiny.py`; `tools/make_gliner_decide_tiny.py`,
+`tools/make_gliner_decide_ref.py`, `tests/test_gliner_decide_tiny.py`), and
+the fixture behind the real gateway (`tests/test_decision_serve.py`,
+`tests/test_jev_sdk.py`).
 
-### The next two
+### The next one
 
-- **GLiNER2.5-Decide** (DeBERTa-v3 encoder, GLiNER2 heads): a second encoder
-  engine on the same contract. It needs the DeBERTa-v3 encoder (relative
-  position buckets and disentangled attention, a SentencePiece tokenizer) and
-  its heads, its own rendering of a record into its input, and a
-  `resolve_model` rule for its checkpoint. `decide_serve.h`, the gateway and
-  the SDK tests stay as they are.
 - **Clef** (a joint schema head over Qwen3.8-27B, dense, with vision): the
   backbone is the qwen36 engine's. It would answer `DECIDE` in that engine's
   serve loop next to `SUBMIT`, announce `decide=1` without `chat=0` (the same

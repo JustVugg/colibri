@@ -1056,6 +1056,7 @@ class FamilyRegistryTest(unittest.TestCase):
             "qwen_image": "hello {world}",
             # A decision model answers questions; it has no prompt to replay.
             "laya": "hello {world}",
+            "gliner_decide": "hello {world}",
         }
         self.assertEqual(
             {family.id: tuning_replay_prompt(family, prompt) for family in FAMILIES},

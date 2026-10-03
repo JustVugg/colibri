@@ -42,7 +42,7 @@ Two more keys say what kind of engine answers. `decide=1`: the engine takes
 `DECIDE` (below), and the gateway sends `POST /v1/systemone` to it as one record
 instead of scoring options through the logprob channel. `chat=0`: it has nothing
 else, so the generating endpoints answer 400 with a pointer to `/v1/systemone`.
-A decision engine (laya) says `decide=1 chat=0`; an engine that chats and also
+A decision engine (laya, gliner_decide) says `decide=1 chat=0`; an engine that chats and also
 decides natively would say `decide=1` alone.
 
 ## Requests (server → engine)
