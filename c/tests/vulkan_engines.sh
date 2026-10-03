@@ -19,7 +19,7 @@
 # back as the CPU computes it. Each configuration is gated on two things:
 #   - the Vulkan run gives the tokens of the CPU run with the same snapshot and
 #     settings (and, where the engine has one, passes its own oracle);
-#   - its "[VK] <engine>: N matmuls on the GPU" line has N > 0, because a hook that
+#   - its per-matrix and dense-chain matmul counts sum to N > 0, because a hook that
 #     declines every matrix would otherwise pass the first gate trivially. A
 #     configuration of the routed-expert tier with the dense trunk on the CPU (the
 #     default on Lavapipe while the tier is on, see dense_where) gates on its count of
@@ -37,11 +37,13 @@ fail() { echo "FAIL: $*"; exit 1; }
 # (-march=native) GCC keeps 64-byte aligned locals there and stores them with
 # vmovdqa64, which faults (c/Makefile, ASAN_ENV, has the details).
 
-# vk_count <engine> <log>: N from the last "[VK] <engine>: N matmuls on the GPU" line
+# vk_count <engine> <log>: the latest per-matrix and dense-chain matmul counts.
+# The counters are independent and cumulative; sum their last reports, not turns.
 vk_count() {
-  local n
+  local n chain
   n=$(sed -n "s/^\[VK\] $1: \([0-9][0-9]*\) matmuls on the GPU.*/\1/p" "$2" | tail -1)
-  echo "${n:-0}"
+  chain=$(sed -n "s/^\[VK\] $1 chain: .* ops, \([0-9][0-9]*\) matmuls,.*/\1/p" "$2" | tail -1)
+  echo "$(( ${n:-0} + ${chain:-0} ))"
 }
 need_gpu() {  # <engine> <log> <tag>
   [ "$(vk_count "$1" "$2")" -gt 0 ] || { cat "$2"; fail "$3: no matmul ran on the device"; }
@@ -56,12 +58,14 @@ same_tokens() {  # <cpu log> <vk log> <tag>: the engines' "C engine" token lines
 # then the expert batch and the weight pool in the same harness, and the routed-expert
 # tier (vk_tier.c) on a synthetic model in every source format.
 shader_formats() {
-  make tests/test_vk_tier VK=1   # every shader too: the harness's expert batch needs them
+  make tests/test_vk_tier tests/test_glm53_vk_f32 VK=1   # every shader too: the harness's expert batch needs them
   cc -O2 -pthread -DVK_TEST backend_vulkan.c -o vk_test -lvulkan -lm
   COLI_VK_TEST_MATMUL_ONLY=1 ./vk_test shaders/qmatmul.spv | tee vk_test.log
   tail -1 vk_test.log | grep -qx PASS || fail "qmatmul format cases"
   ./tests/test_vk_tier shaders/qmatmul.spv | tee vk_tier.log
   tail -1 vk_tier.log | grep -qx PASS || fail "routed-expert tier"
+  ./tests/test_glm53_vk_f32
+  COLI_VK_GEMM_MIN_S=0 ./tests/test_glm53_vk_f32
 }
 
 # tier_count <engine> <log>: N from the last "[VK] tier <engine> run: device N of M" line;
@@ -1834,9 +1838,15 @@ family_glm_chain() {
   CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32 KV_SLOTS=2
   COLI_VK_CHAIN=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32
-  # a pin restored over rows another branch rewrote: the KDA state goes up from the pin,
-  # the MLA rows' watermark comes down
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny
+  # A pin restored over rows another branch rewrote: the KDA state goes up from the
+  # pin, the MLA rows' watermark comes down. This check compares printed logprobs
+  # exactly, so keep the per-row GEMV for every prompt length (as for MiMo's exact
+  # prefix check). A cold prompt and a short resumed tail can otherwise straddle
+  # the GEMM threshold, including at the now-device-resident f32 lm_head, and differ
+  # in the last printed digit from reduction order alone. The gates above exercise
+  # the default GEMM/GEMV policy against CPU tokens and the numerical tolerance.
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_GEMM_MIN_S=0 COLI_USAGE=$PWD/chain.usage \
+    $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny
   unset OMP_NUM_THREADS CAP_RAISE
 }
 

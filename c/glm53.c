@@ -989,11 +989,13 @@ static void mv(float *out, const Mat *w, const float *x) {
     }
 #endif
 #ifdef COLI_VULKAN
-    if (g_vk_dense && w->resident && (w->fmt == 1 || w->fmt == 4)) {
+    if (g_vk_dense && w->resident && (w->fmt == 0 || w->fmt == 1 || w->fmt == 4)) {
         Mat *mutable_w = (Mat *)w;
         if (coli_vk_matmul((ColiVkTensor **)&mutable_w->vk, out, x,
+                           w->fmt == 0 ? (const void *)w->f :
                            w->fmt == 4 ? (const void *)w->q4 : (const void *)w->q8,
-                           w->s, w->fmt, 1, w->columns, w->rows, w->gs))
+                           w->fmt == 0 ? NULL : w->s, w->fmt == 0 ? 10 : w->fmt,
+                           1, w->columns, w->rows, w->gs))
             return;
     }
 #endif
@@ -1017,14 +1019,16 @@ static void mm(float *out, const Mat *w, const float *x, int S) {
     gpu |= g_metal_ready && w->resident && (w->fmt == 1 || w->fmt == 4);
 #endif
 #ifdef COLI_VULKAN
-    if (S > 1 && g_vk_dense && w->resident && (w->fmt == 1 || w->fmt == 4)) {
+    if (S > 1 && g_vk_dense && w->resident && (w->fmt == 0 || w->fmt == 1 || w->fmt == 4)) {
         Mat *mutable_w = (Mat *)w;
         if (coli_vk_matmul((ColiVkTensor **)&mutable_w->vk, out, x,
+                           w->fmt == 0 ? (const void *)w->f :
                            w->fmt == 4 ? (const void *)w->q4 : (const void *)w->q8,
-                           w->s, w->fmt, S, w->columns, w->rows, w->gs))
+                           w->fmt == 0 ? NULL : w->s, w->fmt == 0 ? 10 : w->fmt,
+                           S, w->columns, w->rows, w->gs))
             return;
     }
-    gpu |= g_vk_dense && w->resident && (w->fmt == 1 || w->fmt == 4);
+    gpu |= g_vk_dense && w->resident && (w->fmt == 0 || w->fmt == 1 || w->fmt == 4);
 #endif
     if (S == 1 || gpu) {
         for (int t = 0; t < S; t++)
@@ -4037,8 +4041,9 @@ static int glm53_in_ram(void *ctx, int layer, int eid) {
 /* Bytes the resident matrices will take on the device: they upload at first use,
  * after the tier has taken its budget. */
 static size_t glm53_mat_dev_bytes(const Mat *w) {
-    if (!w->resident || (w->fmt != 1 && w->fmt != 4) || w->rows < 1 || w->columns < 1) return 0;
+    if (!w->resident || (w->fmt != 0 && w->fmt != 1 && w->fmt != 4) || w->rows < 1 || w->columns < 1) return 0;
     const size_t r = (size_t)w->rows, cl = (size_t)w->columns;
+    if (w->fmt == 0) return r * cl * sizeof(float);
     return w->fmt == 1 ? r * cl + r * 4 : r * ((cl + 1) / 2) + r * ((cl + w->gs - 1) / w->gs) * 4;
 }
 static size_t glm53_dense_dev_bytes(const GModel *m) {
