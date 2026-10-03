@@ -141,11 +141,28 @@ static void case_budget(void) {
     ck(qwen36_serve_budget(8193, 0, 8192, 1) == -1, "read-only: past the context is still refused");
 }
 
+/* RAM_GB is a whole-process ceiling, so the expert cache receives only what
+ * remains after resident weights and the activation/KV reserve. The clamp may
+ * lower a requested cap, but it must never raise one. */
+static void case_ram_budget(void) {
+    double left = 0.0;
+    ck(qwen36_cap_for_ram(16.0, 8.0, 2.0, 0.125, 4, 16, 256, &left) == 12,
+       "RAM ceiling clamps the requested expert cache");
+    ck(fabs(left - 6.0) < 1e-9, "RAM clamp reports the expert budget");
+    ck(qwen36_cap_for_ram(4096.0, 8.0, 2.0, 0.125, 4, 4, 256, NULL) == 4,
+       "RAM clamp never raises an explicit small cache");
+    ck(qwen36_cap_for_ram(9.0, 8.0, 2.0, 0.125, 4, 16, 256, NULL) == 0,
+       "RAM clamp reports when even one slot does not fit");
+    ck(qwen36_cap_for_ram(4096.0, 0.0, 0.0, 0.125, 4, 999, 256, NULL) == 256,
+       "RAM clamp never exceeds the expert count");
+}
+
 int main(void) {
     case_layout();
     case_growth();
     case_ceiling();
     case_budget();
+    case_ram_budget();
     if (fails) { printf("FAILED %d\n", fails); return 1; }
     printf("OK test_qwen36_ctx\n");
     return 0;
