@@ -814,11 +814,17 @@ static const char *embed_norm_name(shards *S) {
     return NULL;
 }
 
-static float *load_t(Model *m, const char *name) {
+/* `want` is the element count the forward pass indexes with (config dims); a
+ * short tensor used to be read past its end at inference (see qwen36 load_t_n). */
+static float *load_t(Model *m, const char *name, int64_t want) {
     int64_t n = st_numel(&m->S, name);
     if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    if (n != want) {
+        fprintf(stderr, "%s: %lld elements, config implies %lld -- refusing\n",
+                name, (long long)n, (long long)want); exit(1);
+    }
     float *p = falloc(n);
-    st_read_f32(&m->S, name, p, 0);
+    st_read_f32_cap(&m->S, name, p, want, 0);
     return p;
 }
 static float load_scalar(Model *m, const char *name, float dflt) {
@@ -1097,8 +1103,8 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
 #endif
     if (load_boundaries) {
         m->embed      = load_w(m, "model.embed_tokens.weight", 0);
-        { const char *en = embed_norm_name(&m->S); m->embed_norm = en ? load_t(m, en) : NULL; }
-        m->final_norm = load_t(m, "model.norm.weight");
+        { const char *en = embed_norm_name(&m->S); m->embed_norm = en ? load_t(m, en, D) : NULL; }
+        m->final_norm = load_t(m, "model.norm.weight", D);
         m->lm_head    = load_w(m, "lm_head.weight", 1);
     }
     /* Inkling's audio "tower" is one embedding table + one RMSNorm. The int4
@@ -1122,7 +1128,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             exit(1);
         }
         m->audio_enc  = load_w(m, "model.audio.encoder.weight", 0);
-        m->audio_norm = load_t(m, "model.audio.final_norm.weight");
+        m->audio_norm = load_t(m, "model.audio.final_norm.weight", D);
         fprintf(stderr, "[audio] DMel encoder loaded (%d bins x %d levels -> D=%d)\n",
                 c->mel_bins, c->mel_vocab, D);
     }
@@ -1132,25 +1138,26 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     char nm[320];
     for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
-        #define LD(field, suffix)  snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
+        #define LD(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm,want)
+        int64_t hd = L_HD(c,i), kvd = (int64_t)L_KV(c,i) * hd;
         #define LDW(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_w(m,nm,1)
-        LD(in_ln,  "input_layernorm.weight");
-        LD(post_ln,"post_attention_layernorm.weight");
+        LD(in_ln,  "input_layernorm.weight", D);
+        LD(post_ln,"post_attention_layernorm.weight", D);
         LDW(q, "self_attn.q_proj.weight"); LDW(k, "self_attn.k_proj.weight");
         LDW(v, "self_attn.v_proj.weight"); LDW(r, "self_attn.r_proj.weight");
         LDW(o, "self_attn.o_proj.weight");
-        LD(qn,"self_attn.q_norm.weight"); LD(kn,"self_attn.k_norm.weight");
-        LD(relp, "self_attn.rel_logits_proj.proj");
-        LD(k_cw, "self_attn.k_sconv.conv1d.weight");
-        LD(v_cw, "self_attn.v_sconv.conv1d.weight");
-        LD(a_cw, "attn_sconv.conv1d.weight");
-        LD(m_cw, "mlp_sconv.conv1d.weight");
+        LD(qn,"self_attn.q_norm.weight", hd); LD(kn,"self_attn.k_norm.weight", hd);
+        LD(relp, "self_attn.rel_logits_proj.proj", (int64_t)c->d_rel * L_EXT(c,i));
+        LD(k_cw, "self_attn.k_sconv.conv1d.weight", kvd * K);
+        LD(v_cw, "self_attn.v_sconv.conv1d.weight", kvd * K);
+        LD(a_cw, "attn_sconv.conv1d.weight", (int64_t)D * K);
+        LD(m_cw, "mlp_sconv.conv1d.weight", (int64_t)D * K);
         if (!c->sparse[i]) {
             LDW(dg, "mlp.gate_proj.weight"); LDW(du, "mlp.up_proj.weight"); LDW(dd, "mlp.down_proj.weight");
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.global_scale",i); l->dgs = load_scalar(m,nm,1.f);
         } else {
-            LD(router, "mlp.gate.weight");
-            LD(rbias,  "mlp.gate.e_score_correction_bias");
+            LD(router, "mlp.gate.weight", (int64_t)(c->n_experts + c->n_shared) * D);
+            LD(rbias,  "mlp.gate.e_score_correction_bias", c->n_experts);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.global_scale",i); l->rgs = load_scalar(m,nm,1.f);
             LDW(sh_g, "mlp.shared_experts.gate_proj");
             LDW(sh_u, "mlp.shared_experts.up_proj");
@@ -3781,8 +3788,8 @@ static int inkling_edge_engine_open(
     }
     model->embed = load_w(model, "model.embed_tokens.weight", 0);
     const char *embed_norm = embed_norm_name(&model->S);
-    model->embed_norm = embed_norm ? load_t(model, embed_norm) : NULL;
-    model->final_norm = load_t(model, "model.norm.weight");
+    model->embed_norm = embed_norm ? load_t(model, embed_norm, model->c.hidden) : NULL;
+    model->final_norm = load_t(model, "model.norm.weight", model->c.hidden);
     model->lm_head = load_w(model, "lm_head.weight", 1);
     char tokenizer_path[4096];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
