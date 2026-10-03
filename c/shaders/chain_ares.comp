@@ -1,0 +1,94 @@
+#version 450
+// Kimi K3's attention residuals and its activation on the dense chain (vk_chain.c,
+// PM_ARES), two modes.
+//
+// mode 0, the residual mix (kimi_k3.c's res_mix), for S rows. Row s mixes nb + 1
+// vectors of D floats: the block snapshots v_e at b_off + s*b_row + e*D (e < nb) and the
+// running prefix v_nb at x_off + s*x_row:
+//   score_e = (v_e . w) / sqrt(mean(v_e^2) + eps)            (w at w_off in prm)
+//   y[y_off + s*y_row + d] = sum_e softmax(score)_e v_e[d]   (the sum in e order)
+// One workgroup per row. The CPU sums the dot and the squares in double; here they are a
+// float tree, so the two agree to rounding. The softmax is the CPU's softmax_: the
+// maximum, exp(x - max) in order with their sum, then a division. nb <= 15.
+//
+// mode 1, SiTU-GLU, one thread per element i < n, in the CPU's order (situf_):
+//   y[y_off + i] = b1*tanh(g/b1)*sigmoid(g)*b2*tanh(u/b2),  g = x[x_off + i], u = blk[b_off + i]
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer XB { float xv[]; };   // 0: the prefix; 1: g
+layout(std430, binding = 1) readonly buffer BB { float bv[]; };   // 0: the block snapshots; 1: u
+layout(std430, binding = 2) readonly buffer WB { float wv[]; };   // 0: prm (the score weight)
+layout(std430, binding = 3) writeonly buffer YB { float yv[]; };
+
+layout(push_constant) uniform P { int v[32]; } p;
+#define S_      p.v[1]
+#define D_      p.v[2]
+#define NB      p.v[3]
+#define X_OFF   p.v[4]
+#define X_ROW   p.v[5]
+#define B_OFF   p.v[6]
+#define B_ROW   p.v[7]
+#define W_OFF   p.v[8]
+#define Y_OFF   p.v[9]
+#define Y_ROW   p.v[10]
+#define EPS     intBitsToFloat(p.v[11])
+// mode 1
+#define N_      p.v[1]
+#define B1      intBitsToFloat(p.v[11])
+#define B2      intBitsToFloat(p.v[12])
+
+shared float rms[256];
+shared float rdt[256];
+shared float sc[16];
+
+void mixrow() {
+    int s = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x);
+    if (s >= S_) return;                           // uniform across the workgroup
+    int tid = int(gl_LocalInvocationID.x);
+    for (int e = 0; e <= NB; e++) {
+        bool blk = e < NB;
+        int base = blk ? B_OFF + s * B_ROW + e * D_ : X_OFF + s * X_ROW;
+        float ms = 0.0, dt = 0.0;
+        for (int d = tid; d < D_; d += 256) {
+            float x = blk ? bv[base + d] : xv[base + d];
+            ms += x * x;
+            dt += x * wv[W_OFF + d];
+        }
+        rms[tid] = ms; rdt[tid] = dt;
+        barrier();
+        for (int off = 128; off > 0; off >>= 1) {
+            if (tid < off) { rms[tid] += rms[tid + off]; rdt[tid] += rdt[tid + off]; }
+            barrier();
+        }
+        if (tid == 0) sc[e] = rdt[0] / sqrt(rms[0] / float(D_) + EPS);
+        barrier();
+    }
+    if (tid == 0) {                                // softmax_, in order
+        float m = sc[0];
+        for (int e = 1; e <= NB; e++) if (sc[e] > m) m = sc[e];
+        float sum = 0.0;
+        for (int e = 0; e <= NB; e++) { sc[e] = exp(sc[e] - m); sum += sc[e]; }
+        for (int e = 0; e <= NB; e++) sc[e] /= sum;
+    }
+    barrier();
+    int xb = X_OFF + s * X_ROW, bb = B_OFF + s * B_ROW, yb = Y_OFF + s * Y_ROW;
+    for (int d = tid; d < D_; d += 256) {
+        float a = 0.0;
+        for (int e = 0; e < NB; e++) a += sc[e] * bv[bb + e * D_ + d];
+        a += sc[NB] * xv[xb + d];
+        yv[yb + d] = a;
+    }
+}
+
+void situ() {
+    int i = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u);
+    if (i >= N_) return;
+    float g = xv[X_OFF + i], u = bv[B_OFF + i];
+    float sg = 1.0 / (1.0 + exp(-g));
+    yv[Y_OFF + i] = B1 * tanh(g / B1) * sg * B2 * tanh(u / B2);
+}
+
+void main() {
+    if (p.v[0] == 0) mixrow();
+    else situ();
+}

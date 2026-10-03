@@ -674,7 +674,7 @@ to the next. qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) and qwen38 (Qwen3.8 Flas
 Next) run it: by default on a discrete GPU, and for qwen36 on an integrated one with
 the expert tier (see [the default](#the-chain-on-a-radeon-780m)); `COLI_VK_CHAIN=1`
 anywhere. olmoe and inkling run it as well ([OLMoE and Inkling](#olmoe-and-inkling)).
-colibri (GLM-5.2) and glm53 (GLM-5.3 Flash) run it too, with the MLA,
+colibri (GLM-5.2), glm53 (GLM-5.3 Flash) and kimi_k3 run it too, with the MLA,
 KDA and hyper-connection ops ([below](#glm-52-and-glm-53-flash-on-the-chain)).
 
 **What runs where, per layer** (S rows: one at decode, a prompt chunk at prefill):
@@ -742,7 +742,7 @@ f32 throughout, as the CPU's f32 path.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 and olmoe on, qwen38 off; mimo, inkling, colibri and glm53 off: not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows; decode and MTP verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
+| `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 and olmoe on, qwen38 off; mimo, inkling, colibri, glm53 and kimi_k3 off: not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows; decode and MTP verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
 | `COLI_VK_CHAIN_ROWS` | `512` | Prompt rows per chunk: a longer prompt runs every layer chunk by chunk (the device's scratch is sized for one chunk). |
 | `COLI_VK_CHAIN_GEMV` | on | `0`: the decode matrices take `qmatmul.comp`'s GEMV instead of `chain_gemv.comp`'s. |
 | `COLI_VK_CHAIN_SPIN_US` | `2000` | How long a wait on a chain frame polls the fence before blocking. |
@@ -1078,6 +1078,90 @@ the tiny fixtures, on Lavapipe and on the 780M:
 [VK] colibri: dense chain off (an integrated GPU with the expert tier: not measured; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
 ```
 
+### Kimi K3 on the chain
+
+`kimi_k3_chain.h` (kimi_k3) follows the recipe below with the
+[MLA ops](#multi-head-latent-attention-on-the-chain-vkc_mla), GLM-5.3's KDA ops and three
+of its own. Kimi K3's residual is AttnRes: per row a running prefix and a snapshot every
+`attn_res_block_size` layers, mixed by a softmax before the attention and before the MLP
+of every layer and once at the end. What runs where, per layer:
+
+| | kimi_k3 |
+|---|---|
+| device, frame A1 | the previous layer's MoE output joining the prefix (the routed sum's RMSNorm and latent up-projection, plus the shared experts, then the add: `moe_forward`'s order); the attention site's residual mix and a block boundary's snapshot; the input RMSNorm; a KDA layer (q, k, v, the full-rank output gate, the decay's two f32 matrices and beta's; the short convolution with its window, the delta rule with its state, the output norm and gate, o_proj) or a gated MLA layer (q_a, its norm, q_b, kv_a, the latent norm, the new rows into the cache; the absorbed core over the cache, the values times the sigmoid gate, o_proj); the prefix update; the MLP site's residual mix and post-attention norm; a dense layer's SiTU-GLU MLP and its add (no host step), or the f32 router's logits and the latent down-projection |
+| host | the router (sigmoid, the top-k with the correction bias, `K3_TOPP`) and the routed experts in the latent: the tier's batch and the CPU's share, added in the union's order; the new MLA rows copied into the host's cache |
+| device, frame A2 (not waited for) | the shared experts (SiTU-GLU at full width) |
+| after the last layer | the output residual mix and the final RMSNorm of every row, lm_head on the last; the normalized rows come back when the host wants the logits of every row (`K3_LOGITS`, `K3_VAL_LOGITS`, a logprobs request) and the host runs lm_head on them |
+
+Kimi K3's MLA is NoPE: the qk_rope parts of the query and of the shared key are used as
+the projections leave them. `vkc_mla_qkv` rotates them by angle 0 (a table of cos 1 and
+sin 0), which in float is the identity.
+
+| Op | Shader | What it does |
+|---|---|---|
+| `vkc_ares_mix` | `chain_ares` (mode 0) | `res_mix`: per row, the softmax of `(v . w) / sqrt(mean(v^2) + eps)` over the block snapshots and the prefix, and their weighted sum, in snapshot order (up to 15 snapshots) |
+| `vkc_situ` | `chain_ares` (mode 1) | SiTU-GLU, `b1*tanh(g/b1)*sigmoid(g)*b2*tanh(u/b2)`, in the CPU's order |
+| `vkc_kda_rec_flags` | `chain_kda` | the KDA recurrence with Kimi K3's two differences from GLM-5.3: the decay's `exp(A_log)` given as the engine keeps it (`VKC_KDA_EXP_A`), and `kda_forward`'s order of the l2 norms (the eps after the squares, q normalized, then scaled) and of the update, `k * ((v - mem) * beta)` (`VKC_KDA_K3`). `vkc_kda_rec` is the same op with no flags, unchanged for glm53 |
+
+`make vk-chain-check VK=1` runs Kimi K3's KDA layer against `kda_forward`'s arithmetic
+over two submissions (the state and the window carried, inputs small enough that the
+l2 eps counts), `res_mix` over 0 to 15 snapshots at row strides (D up to 7168) and
+SiTU-GLU at Kimi K3's constants. The KDA layer within 3.8e-7 of its largest output on
+Lavapipe, 5.0e-7 on the Radeon 780M and 5.4e-7 on the Iris Xe (Dozen); the residual mix
+within 2.4e-7, 3.3e-7 and 3.3e-7; SiTU-GLU within the test's 1e-6 on all three.
+
+**The state.** The MLA caches (`Lc`, the normalized latent, and `Rc`, the qk_rope part)
+stay the host's: each step copies its new rows back, and the device mirror has a
+watermark per layer that a CPU forward, a reset and a grown cache (`kv_alloc`) lower.
+The KDA state and the three convolution windows of every KDA layer stay on the device
+while the chain runs (96 heads of 128 x 128 floats and three windows of 12288 x 4: 6.9
+MB a layer on the full model): the host's copy is brought back before a recurrent-state
+checkpoint (`COLI_K3_CKPT`, a `pin=1` photo) or a CPU forward reads it, and goes up
+after a reset (a fill with zeros on the device) or a restored photo. Prefix reuse needs
+nothing more: the reused positions are rows below the watermark and a KDA state that
+already sits where the next step expects it.
+
+**Drafts.** kimi_k3 has no MTP head and no draft path.
+
+**A lost device.** The forward that failed runs again on the CPU from its input rows
+(the chain never writes them). If the device held the newest KDA state, that state is
+rebuilt on the CPU first: from the host's copy, current at the position where it last
+went up or came back, through the prefix record's ids up to where the device was, a
+prefill's worth of CPU work; from zeros if the loss interrupted a copy of the state to
+the host after part of it had landed. The CPU runs from there. (Both rebuilds were
+checked on the 780M, where that copy takes frames, by faults placed inside it: a serve
+session with checkpoints gave the CPU's frames either way.)
+
+**Declined** (the CPU path runs, the state synced first): the CUDA expert tier,
+`KIMI_DSA_INDEXER=1` (its index cache is filled on the CPU), the validation dumps that
+read every layer on the host (`K3_TRACE`, `K3_VALIDATE_LAYER`, `K3_DEBUG_OUT`), a model
+without its head (`K3_LAYERS`), a Segment's layer range, and geometries past the ops'
+limits (a KDA head above 128 floats, a convolution above 8 taps, `kv_lora` above 1024,
+`qk_rope` above 128 or odd). The chain's tensors are its own except the shared experts'
+under `COLI_VK_DENSE`, which it shares with the per-matrix path: a forward the chain
+declines (`COLI_VK_CHAIN=2`'s decode) runs on the CPU as before.
+
+**Arithmetic.** f32 activations, as the CPU's dense kernels (int8 rows and int4-g64
+alike); the routed experts are the tier's or the CPU's, as without the chain. The tiny
+fixture amplifies rounding at a few positions: the CPU against itself, with only its
+RMSNorm's sum taken in float instead of double, moves the logits by up to 1.4e-4 of the
+largest one on the f32 trunk and 1.0e-3 on the 8-bit one, and the served logprobs by up
+to 4.1e-3, at the positions where the chain moves them most (Lavapipe: 1.8e-4, 4.5e-4
+and 6.1e-3; the 780M: 2.3e-4, 9.9e-4 and 3.3e-3). The tests hold every logits row within
+2e-3 of the largest and the logprobs within 2e-2; the tokens are the CPU's in every
+configuration. With the CPU's int8 expert activations (`K3_IDOT=1`, tier off) a flipped
+int8 step moved the logits by 8.3e-3 on Lavapipe (no step flipped on the 780M), the
+tokens unchanged; that configuration is gated on its tokens.
+
+**The default**: kimi_k3 passes `COLI_VK_CHAIN_UNMEASURED`: off on an integrated GPU
+(`COLI_VK_CHAIN=1` turns it on, `2` for prompts only), on a discrete GPU the rule above.
+No Kimi K3 checkpoint was run (1.56 TB; the 780M box has none): speed is not measured,
+and the tests prove the tokens on the tiny fixture, on Lavapipe and on the 780M:
+
+```
+[VK] kimi_k3: dense chain off (an integrated GPU with the expert tier: not measured; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
+```
+
 ### Adding an engine to the chain
 
 The recipe qwen36_chain.h and qwen38_chain.h follow, for the engines still on the
@@ -1108,7 +1192,7 @@ What each remaining architecture needs on top of today's shaders:
 |---|---|---|
 | deepseek_v41, kimi_k3 (MLA layers) | MLA: q_a/kv_a, the latent norms, q_b, RoPE on the rope dims, a latent + rope cache | the [MLA ops](#multi-head-latent-attention-on-the-chain-vkc_mla) take any geometry (q_lora or none, NoPE, the scale and cos/sin table from the engine, a gate on the values for Kimi K3); colibri and glm53 run them ([above](#glm-52-and-glm-53-flash-on-the-chain)). DeepSeek V4.1's attention has sinks and its own sparse selection: those are not in the ops yet |
 | deepseek_v4 | MLA with compressed (CSA) and hierarchical (HCA) KV, mHC | the manifold hyper-connections are `vkc_mhc` (GLM-5.3's, the same arithmetic) and the clamped SwiGLU too; the compressors' rolling windows are rings like the conv's, snapshotted the same way; the CPU rounds activations to E4M3 before its fp8 matmuls, so the chain needs that rounding as an element-wise op to keep the same arithmetic |
-| kimi_k3 (KDA layers) | Kimi Delta Attention: a gated delta rule whose decay is a vector over the key channels | `vkc_kda_conv` and `vkc_kda_rec` (GLM-5.3's KDA, `delta_attention.h`'s step); Kimi K3 builds its decay and output gate its own way (a full g_proj, not a low-rank one), which the recurrence's prologue and epilogue would take as options |
+| kimi_k3 (KDA layers) | Kimi Delta Attention: a gated delta rule whose decay is a vector over the key channels | on the chain ([above](#kimi-k3-on-the-chain)): `vkc_kda_conv` and `vkc_kda_rec_flags` with Kimi K3's options; its full-rank output gate and low-rank decay are matmuls before the op |
 | mimo | sliding-window attention (and full layers) | done: [MiMo-V2.6 on the chain](#mimo-v26-on-the-chain) (`chain_attn.comp` with a window, a ring of W rows, V's own head dim and a sink) |
 | inkling | grouped attention with a relative-position bias, a sliding window and short convolutions; MoE with shared experts | in the chain ([OLMoE and Inkling](#olmoe-and-inkling)): two shaders of its own, `chain_relattn.comp` and `chain_sconv.comp`; the shared experts join through `HC_APPLY` |
 | olmoe | attention with q/k norm, MoE without a shared expert | in the chain ([OLMoE and Inkling](#olmoe-and-inkling)) with qwen36's ops as they are |
@@ -1258,6 +1342,12 @@ in short:
   and swiglu_limit 0, a device lost (glm53's KDA state rebuilt), serve sessions with pins
   and two KV slots, and glm53's pin-branch harness; `glm-chain-sanitize` runs them under
   ASan and UBSan.
+  `kimi-chain` does it for Kimi K3: Moonshot's
+  oracle with the chain on, every dense format, prefill a token at a time and in chunks,
+  the tier's eviction, prompts only, a device lost in a prompt, inside a chunked forward
+  and mid-decode (the KDA state rebuilt), serve sessions with prefix reuse and
+  recurrent-state checkpoints in RAM and on disk; `kimi-chain-sanitize` under ASan and
+  UBSan.
 - int4 weights decode as offset-binary (nibble−8), byte-identical layout to
   the CPU path — no repacking.
 - Khronos validation layers: the backend never enables them, so the loader

@@ -22,6 +22,10 @@
 // Each column runs the CPU's products and sums in its order; the two l2 sums and the
 // output norm's sum are made by one thread in order, as on the CPU.
 // Parameters in prm at prm_off: A_log[H], dt[P], norm[VD].
+// flags (Kimi K3's kda_forward; 0 is the above, GLM-5.3's):
+//   1  prm holds exp(A_log) itself (the engine keeps A = exp(A_log)), used as it is
+//   2  the l2 sums take eps after the squares, q is normalized and then scaled
+//      ((q * rq) * qscale, k * rk), and the update is k * ((v - mem) * beta)
 layout(local_size_x = 128) in;
 layout(constant_id = 0) const int KD = 128;
 
@@ -64,6 +68,7 @@ layout(push_constant) uniform P { int v[32]; } p;
 #define LB       intBitsToFloat(p.v[17])
 #define NEPS     intBitsToFloat(p.v[18])
 #define EPS      intBitsToFloat(p.v[19])
+#define FLAGS    p.v[20]
 
 shared float sq[KD];
 shared float sk[KD];
@@ -102,7 +107,7 @@ void rec() {
     float col[KD];
     int sb = ST_OFF + h * KD * VD;
     [[unroll]] for (int k = 0; k < KD; k++) col[k] = own ? st[sb + k * VD + v] : 0.0;
-    float ea = exp(w[PRM_OFF + h]);
+    float ea = (FLAGS & 1) != 0 ? w[PRM_OFF + h] : exp(w[PRM_OFF + h]);
     float nw = own ? w[PRM_OFF + H_ + Pw + v] : 0.0;
     for (int s = 0; s < S_; s++) {
         int mb = M_OFF + s * M_ROW;
@@ -114,21 +119,39 @@ void rec() {
         }
         barrier();
         if (v == 0) {   // the l2 sums, in order, eps first
-            float qs = NEPS, ks = NEPS;
-            for (int k = 0; k < KD; k++) { qs += sq[k] * sq[k]; ks += sk[k] * sk[k]; }
-            scal[0] = (1.0 / sqrt(float(KD))) / sqrt(qs);
-            scal[1] = 1.0 / sqrt(ks);
+            if ((FLAGS & 2) != 0) {
+                float qs = 0.0, ks = 0.0;
+                for (int k = 0; k < KD; k++) { qs += sq[k] * sq[k]; ks += sk[k] * sk[k]; }
+                scal[0] = 1.0 / sqrt(qs + NEPS);
+                scal[1] = 1.0 / sqrt(ks + NEPS);
+            } else {
+                float qs = NEPS, ks = NEPS;
+                for (int k = 0; k < KD; k++) { qs += sq[k] * sq[k]; ks += sk[k] * sk[k]; }
+                scal[0] = (1.0 / sqrt(float(KD))) / sqrt(qs);
+                scal[1] = 1.0 / sqrt(ks);
+            }
         }
         barrier();
         float qn = scal[0], kn = scal[1];
         float beta = sig(br[B_OFF + s * B_ROW + h]);
         float val = own ? xin[mb + 2 * Pw + h * VD + v] : 0.0;
         float mem = 0.0;
-        [[unroll]] for (int k = 0; k < KD; k++) { col[k] *= al[k]; mem += (sk[k] * kn) * col[k]; }
         float res = 0.0;
-        [[unroll]] for (int k = 0; k < KD; k++) {
-            col[k] += (sk[k] * kn) * (val - mem) * beta;
-            res += (sq[k] * qn) * col[k];
+        if ((FLAGS & 2) != 0) {   // kimi_k3.c: q and k normalized first, then the sweeps
+            for (int k = v; k < KD; k += 128) { sq[k] = (sq[k] * qn) * (1.0 / sqrt(float(KD))); sk[k] = sk[k] * kn; }
+            barrier();
+            [[unroll]] for (int k = 0; k < KD; k++) { col[k] *= al[k]; mem += sk[k] * col[k]; }
+            float vt = (val - mem) * beta;
+            [[unroll]] for (int k = 0; k < KD; k++) {
+                col[k] += sk[k] * vt;
+                res += sq[k] * col[k];
+            }
+        } else {
+            [[unroll]] for (int k = 0; k < KD; k++) { col[k] *= al[k]; mem += (sk[k] * kn) * col[k]; }
+            [[unroll]] for (int k = 0; k < KD; k++) {
+                col[k] += (sk[k] * kn) * (val - mem) * beta;
+                res += (sq[k] * qn) * col[k];
+            }
         }
         ov[v] = own ? res : 0.0;
         barrier();

@@ -47,6 +47,10 @@
  *                        COLI_VK_TIER* variables), the shared experts where
  *                        COLI_VK_DENSE puts the dense matrices. CPU fallback
  *                        everywhere; the tier's experts match K3_IDOT=0.
+ *   COLI_VK_CHAIN=0|1|2  with COLI_VULKAN=1: every layer's dense part on the
+ *                        device, one frame per layer up to the router
+ *                        (kimi_k3_chain.h; 2: prompts only). Default: on a
+ *                        discrete GPU, off on an integrated one (not measured).
  *   K3_VK=0|1            the old switch, an alias: 1 = COLI_VULKAN=1, 0 = the
  *                        device stays closed. Unset: COLI_VULKAN decides.
  *   K3_VK_GB=N           alias of COLI_VK_TIER_GB (when that is unset)
@@ -1915,6 +1919,12 @@ static void pin_seed(Model *m, int64_t hist){
  * matrices. Its reports: one "[VK] kimi_k3" line of device matmuls and the tier's
  * line, at the end of a run and of every serve turn. */
 #define K3_VK_ROWS 64            /* positions whose pairs one device batch carries at most */
+/* the dense chain (kimi_k3_chain.h, included before step_chunk_ex) */
+static void k3c_start(Model *m, int tier_on);
+static void k3c_atexit(void);
+static void k3c_adopt_shared(Model *m);
+static void k3c_report(void);
+static int g_k3c_on;
 static int k3_vk_in_ram(void *ctx, int li, int e){ return slot_indexed((Model*)ctx,li,e)!=NULL; }
 static size_t k3_w_bytes(const W *w){
     int fmt=k3_vk_fmt(w);
@@ -1947,6 +1957,7 @@ static void k3_vk_tier_start(Model *m){
 #ifdef COLI_CUDA
     cuda_on=g_k3_cuda;
 #endif
+    k3c_start(m,nmoe&&vkt_wanted()&&!cuda_on);   /* COLI_VK_CHAIN: the trunk on the device, before the tier sizes itself */
     if(cuda_on) fprintf(stderr,"[VK] tier kimi_k3: the CUDA expert tier is on and wins; the Vulkan tier stays off\n");
     else if(nmoe&&vkt_wanted()){
         VktConfig vc={.engine="kimi_k3",.layers=c->n_layers,.experts=c->n_experts,
@@ -1955,7 +1966,7 @@ static void k3_vk_tier_start(Model *m){
                       .act=VKT_ACT_SITU,.act_a=c->situ_b1,.act_b=c->situ_b2,
                       .max_rows=K3_VK_ROWS*c->topk,
                       .ram_reserve=(size_t)(m->e_slot+8192)*(size_t)cap*(size_t)nmoe,
-                      .dense_bytes=coli_vk_dense()?k3_vk_dense_bytes(m):0,
+                      .dense_bytes=coli_vk_dense()&&!g_k3c_on?k3_vk_dense_bytes(m):0,   /* the chain's are there already */
                       .in_ram=k3_vk_in_ram,.ram_ctx=m};
         atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
         if(vkt_init(&vc,rt_counts_all())){
@@ -1983,6 +1994,7 @@ static void k3_vk_tier_start(Model *m){
     }
     if(!vkt_ready()&&!coli_vk_dense()) coli_vk_dense_decide("kimi_k3",0,1);   /* no tier after all */
     if(coli_vk_dense()){
+        k3c_adopt_shared(m);   /* the chain's copies, where it made them */
         int nsh=0;
         for(int i=0;i<c->n_layers;i++){
             if(!m->L[i].sparse) continue;
@@ -1992,11 +2004,13 @@ static void k3_vk_tier_start(Model *m){
         size_t used=0, count=0; coli_vk_mem_info(&used,&count);
         fprintf(stderr,"[VK] kimi_k3: %d shared-expert matrices on the device (%.2f MiB)\n",nsh,used/1048576.0);
     }
+    k3c_atexit();              /* after the tier's: the chain goes before the device */
 }
 static void k3_vk_report(const Model *m, const char *scope){
     if(!g_k3_vk) return;
     fprintf(stderr,"[VK] kimi_k3: %llu matmuls on the GPU\n",coli_vk_matmul_calls());
     vkt_report(scope,m->hits,m->miss);
+    k3c_report();              /* the dense chain's line, when it ran */
 }
 #endif
 
@@ -2086,7 +2100,7 @@ static float *k3_vk_step(Model *m, Moe *o, int li, int C, const float *x, const 
     }
     int n2=k3_vk_sublist(nu,uid,pfirst,pcnt,poslist,wlist,epair,st->taken,0,u2,f2,c2,p2,w2,s2);
     if(n2) experts_apply_union(m,li,n2,u2,f2,c2,p2,w2,z,LT,u,gate,up,hz,R,s2);
-    float *sd=k3_shared(m,o,x,C);                           /* while the batch runs */
+    float *sd=x?k3_shared(m,o,x,C):NULL;                    /* while the batch runs (x NULL: the dense chain's) */
     if(st->ndev&&!vkt_join(st->dev)){                       /* the batch failed: those pairs here */
         n2=k3_vk_sublist(nu,uid,pfirst,pcnt,poslist,wlist,epair,st->taken,1,u2,f2,c2,p2,w2,s2);
         if(n2) experts_apply_union(m,li,n2,u2,f2,c2,p2,w2,z,LT,u,gate,up,hz,R,s2);
@@ -2109,14 +2123,12 @@ static float *k3_vk_step(Model *m, Moe *o, int li, int C, const float *x, const 
 }
 #endif
 
-static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float *out){
-    Cfg *c=&m->c; Moe *o=&l->moe;
-    int E=c->n_experts, K=c->topk, LT=c->latent, MI=c->moe_inter;
-    float *sco=falloc((int64_t)C*E);
-    matmul(sco,x,o->router,C,c->hidden,E);
-    int *idxs=malloc((size_t)C*K*sizeof(int)); float *wsels=falloc((int64_t)C*K);
-    int *keff=malloc((size_t)C*sizeof(int));
-    if(!idxs||!keff){fprintf(stderr,"OOM moe sel\n");exit(1);}
+/* The router's choice for C rows from their raw scores (sco [C][E], turned into
+ * sigmoids in place): the top-k with the correction bias, the weights renormalized,
+ * K3_TOPP; idxs and wsels [C][K], keff[C] the ranks kept. */
+static void k3_moe_route(Model *m, Moe *o, int li, float *sco, int C, int *idxs, float *wsels, int *keff){
+    Cfg *c=&m->c;
+    int E=c->n_experts, K=c->topk;
     for(int t=0;t<C;t++){
         float *st=sco+(int64_t)t*E;
         for(int e=0;e<E;e++) st[e]=sigmoidf_(st[e]);
@@ -2154,10 +2166,17 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
         keff[t]=Kt;
         rt_route(li,t,idx,wsel,Kt);        /* traces and counts, one call */
     }
-    float *z=falloc((int64_t)C*LT), *u=falloc((int64_t)C*LT);
+}
+
+/* The routed experts of C rows in the latent: u[C][LT] (zeroed by the caller) gets
+ * every kept rank's weighted output, in the union's order. x: the rows the shared
+ * experts read while a tier batch runs (NULL: the dense chain computes them on the
+ * device); their output is returned when this step computed it, else NULL. */
+static float *k3_moe_experts(Model *m, Moe *o, int li, const float *x, const float *z, int C,
+                             const int *keff, const int *idxs, const float *wsels, float *u){
+    Cfg *c=&m->c;
+    int E=c->n_experts, K=c->topk, LT=c->latent, MI=c->moe_inter;
     float *gate=falloc(MI), *up=falloc(MI), *hz=falloc(LT), *sd=NULL;
-    w_matmul(z,x,&o->lat_down,C);
-    memset(u,0,(size_t)C*LT*sizeof(float));
 #ifdef COLI_VULKAN
     K3VkStep vst={0};             /* the device's pairs, issued before the union is read */
     if(vkt_ready()) k3_vk_issue(m,li,C,keff,idxs,z,&vst);
@@ -2217,6 +2236,23 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
 #ifdef COLI_VULKAN
     k3_vk_step_free(&vst);
 #endif
+    free(gate);free(up);free(hz);
+    return sd;
+}
+
+static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float *out){
+    Cfg *c=&m->c; Moe *o=&l->moe;
+    int E=c->n_experts, K=c->topk, LT=c->latent;
+    float *sco=falloc((int64_t)C*E);
+    matmul(sco,x,o->router,C,c->hidden,E);
+    int *idxs=malloc((size_t)C*K*sizeof(int)); float *wsels=falloc((int64_t)C*K);
+    int *keff=malloc((size_t)C*sizeof(int));
+    if(!idxs||!keff){fprintf(stderr,"OOM moe sel\n");exit(1);}
+    k3_moe_route(m,o,li,sco,C,idxs,wsels,keff);
+    float *z=falloc((int64_t)C*LT), *u=falloc((int64_t)C*LT);
+    w_matmul(z,x,&o->lat_down,C);
+    memset(u,0,(size_t)C*LT*sizeof(float));
+    float *sd=k3_moe_experts(m,o,li,x,z,C,keff,idxs,wsels,u);
     for(int t=0;t<C;t++)
         rmsnorm_(u+(int64_t)t*LT,u+(int64_t)t*LT,o->lat_norm,LT,c->eps);
     w_matmul(out,u,&o->lat_up,C);
@@ -2224,7 +2260,7 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
     if(!sd) sd=k3_shared(m,o,x,C);
     for(int64_t d=0;d<(int64_t)C*c->hidden;d++) out[d]+=sd[d];
     free(sco);free(idxs);free(wsels);free(keff);
-    free(z);free(u);free(gate);free(up);free(hz);free(sd);
+    free(z);free(u);free(sd);
 }
 
 static void dense_forward(Model *m, Layer *l, const float *x, int C, float *out){
@@ -2350,15 +2386,9 @@ static void k3_echo(const char *id, int pos, int token, const float *lo, int V, 
     fputc('\n', stdout); fflush(stdout);
 }
 
-static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
-                            K3CancelPoll poll_cancel, void *cancel_context,
-                            int *cancelled){
-    Cfg *c=&m->c; int D=c->hidden;
-    if(cancelled) *cancelled=0;
-    int nbmax=(c->n_layers+c->res_bs-1)/c->res_bs;
-    float *hidden=falloc((int64_t)C*D), *bres=falloc((int64_t)C*nbmax*D);
-    float *mix=falloc(D);
-    int nb=0;
+/* The input rows of positions pos0..pos0+C-1: the embeddings of ids, or K3_X0's rows. */
+static void k3_embed(Model *m, const int *ids, int pos0, int C, float *hidden){
+    int D=m->c.hidden;
     for(int t=0;t<C;t++){
         if(g_x0){
             if(pos0+t>=g_x0_n){ fprintf(stderr,"K3_X0: pos %d beyond %d injected rows\n",pos0+t,g_x0_n); exit(1); }
@@ -2368,24 +2398,60 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
             st_read_slice_f32(&m->S,nm,(int64_t)ids[t]*D,D,hidden+(int64_t)t*D,0);
         }
     }
+}
+
+#ifdef COLI_VULKAN
+#include "kimi_k3_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
+#endif
+
+static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
+                            K3CancelPoll poll_cancel, void *cancel_context,
+                            int *cancelled){
+    Cfg *c=&m->c; int D=c->hidden;
+    if(cancelled) *cancelled=0;
+    int nbmax=(c->n_layers+c->res_bs-1)/c->res_bs;
+    float *hidden=falloc((int64_t)C*D), *bres=falloc((int64_t)C*nbmax*D);
+    float *mix=falloc(D);
+    int nb=0;
+    k3_embed(m,ids,pos0,C,hidden);
     if(pos0==0&&C<=1) fprintf(stderr,"[DBG] step_chunk pos=%d C=%d metal=%d\n", pos0, C, g_k3_metal);
+    int echo_on = g_echo_k>0 && g_echo_id;
+#ifdef COLI_VULKAN
+    /* every layer on the device (kimi_k3_chain.h): the final rows (fin, when the head
+     * reads more than the last one) and the last row's logits (dev_last) come back;
+     * 0: the CPU below, its state current first */
+    float *fin=NULL, *dev_last=NULL; int chain=0;
+    if(g_k3c_on){
+        chain=k3c_forward(m,hidden,pos0,C,g_lfp||g_k3_val_lfp||echo_on,&fin,&dev_last,
+                          poll_cancel,cancel_context,cancelled);
+        if(!chain) k3c_cpu_step(m,pos0);
+    }
+    if(!chain)
+#endif
     k3_layers_forward_range(m,hidden,bres,&nb,pos0,C,0,c->n_layers,
                             poll_cancel,cancel_context,cancelled);
     float *logits=NULL;
     if((!cancelled||!*cancelled)&&m->has_head){
         double t0=now_s();
-        int echo_on = g_echo_k>0 && g_echo_id;
         for(int t=0;t<C;t++){
             /* head only where needed: the chunk's last token (feeds sampling)
              * and every position when K3_LOGITS dumps teacher-forced logits;
              * also all positions during Phase 10 validation; and every
              * position when a request asked for the logprobs channel */
             if(!g_lfp && !g_k3_val_lfp && !echo_on && t<C-1) continue;
+            float *lo=falloc(c->vocab);
+#ifdef COLI_VULKAN
+            if(chain){   /* the chain's final rows, normalized; the last row's logits from the device */
+                if(t==C-1&&dev_last) memcpy(lo,dev_last,(size_t)c->vocab*sizeof(float));
+                else w_matmul(lo,fin+(int64_t)t*D,&m->lm_head,1);
+            } else
+#endif
+            {
             res_mix(mix,hidden+(int64_t)t*D,bres+(int64_t)t*nbmax*D,nb,D,m->out_sw,c->eps);
             rmsnorm_(mix,mix,m->final_norm,D,c->eps);
             if(m->trace) fwrite(mix,sizeof(float),D,m->trace);
-            float *lo=falloc(c->vocab);
             w_matmul(lo,mix,&m->lm_head,1);
+            }
             if(g_lfp) fwrite(lo,sizeof(float),(size_t)c->vocab,g_lfp);
             if(g_k3_val_lfp) fwrite(lo,sizeof(float),(size_t)c->vocab,g_k3_val_lfp);
             if(echo_on){
@@ -2404,6 +2470,9 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
     /* record what was just fed, at the positions it went to (kv_prefix.h) */
     if(!cancelled||!*cancelled) kv_prefix_record(&m->kvp,ids,pos0,C);
     free(hidden);free(bres);free(mix);
+#ifdef COLI_VULKAN
+    free(fin);free(dev_last);
+#endif
     return logits;
 }
 
@@ -2775,6 +2844,9 @@ static const ColiServeWireProfile kimi_wire={
 static void model_state_reset(Model *m){
     Cfg *c=&m->c;
     kv_prefix_clear(&m->kvp);   /* the record describes the state we are dropping */
+#ifdef COLI_VULKAN
+    k3c_host_wrote(m,1);        /* the dense chain's copy is zeros too, its MLA rows gone */
+#endif
     for(int i=0;i<c->n_layers;i++){
         if(m->L[i].kda){
             memset(m->kstate[i],0,(size_t)c->kda_heads*c->kda_hd*c->kda_hd*sizeof(float));
@@ -2871,6 +2943,9 @@ static double k3_ckpt_reserve_gb(const Model *m, int slots){
 
 static void k3_ckpt_copy(float *blob, Model *m, int to_blob){
     Cfg *c=&m->c; size_t o=0;
+#ifdef COLI_VULKAN
+    if(to_blob) k3c_sync_host(m);   /* the dense chain may hold the newest state */
+#endif
     size_t ks=(size_t)c->kda_heads*c->kda_hd*c->kda_hd;
     size_t cw=(size_t)c->kda_proj*c->conv_k;
     for(int i=0;i<c->n_layers;i++) if(m->L[i].kda){
@@ -3031,6 +3106,9 @@ static int k3_ckpt_restore_best(Model *m, const int *ids, int np){
         if(!k3_ckpt_disk_read(m,best,k->pos)){ k->pos=0; return 0; }
     } else k3_ckpt_copy(k->blob,m,0);
     m->kvp.len=k->pos;        /* the record truncates with the state it describes */
+#ifdef COLI_VULKAN
+    k3c_host_wrote(m,0);      /* the dense chain's copy goes up again */
+#endif
     g_k3_restored_logit=k->logit;
     k->used=++g_k3_ckpt_clock;
     if(getenv("K3_PREFIX_LOG"))

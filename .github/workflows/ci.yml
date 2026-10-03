@@ -217,6 +217,12 @@ jobs:
             req: c/tools/requirements-glm53-tiny.txt
           - family: glm-chain-sanitize
             req: c/tools/requirements-glm53-tiny.txt
+          # the dense chain (COLI_VK_CHAIN=1) of Kimi K3: its attention residuals, KDA
+          # and gated MLA layers on the device, and the same under ASan and UBSan
+          - family: kimi-chain
+            req: c/tools/requirements-kimi-k3-tiny.txt
+          - family: kimi-chain-sanitize
+            req: c/tools/requirements-kimi-k3-tiny.txt
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

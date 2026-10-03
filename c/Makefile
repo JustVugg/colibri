@@ -721,6 +721,8 @@ VK_SPV   += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv
 VK_SPV   += shaders/chain_mla.spv shaders/chain_hgemv.spv shaders/chain_dsa.spv
 # Kimi Delta Attention and manifold-constrained hyper-connections (vk_chain.h)
 VK_SPV   += shaders/chain_kda.spv shaders/chain_mhc.spv
+# Kimi K3's attention residuals and SiTU-GLU (vk_chain.h)
+VK_SPV   += shaders/chain_ares.spv
 # inkling's chain ops (made on first use): the short convolution and the attention
 # with its relative-position bias
 VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv

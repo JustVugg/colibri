@@ -10,6 +10,7 @@
 #   bash tests/vulkan_engines.sh mimo-chain | mimo-chain-sanitize   # MiMo-V2.6's dense chain
 #   bash tests/vulkan_engines.sh inkling-olmoe-chain | inkling-olmoe-chain-sanitize
 #   bash tests/vulkan_engines.sh glm-chain | glm-chain-sanitize     # the same for colibri and glm53
+#   bash tests/vulkan_engines.sh kimi-chain | kimi-chain-sanitize   # the same for Kimi K3
 #
 # Needs libvulkan-dev, glslc and mesa-vulkan-drivers, plus the Python packages of
 # the family's tiny fixtures (see the vulkan-engines job in .github/workflows/ci.yml).
@@ -1883,6 +1884,190 @@ family_glm_chain_sanitize() {
   make clean >/dev/null 2>&1 || true
 }
 
+# Kimi K3's dense chain (kimi_k3_chain.h). The tolerance: the tiny fixture amplifies
+# rounding at a few positions. The CPU against itself, with only its RMSNorm's sum taken
+# in float instead of double, moves the logits by up to 1.4e-4 of the largest one on the
+# f32 trunk and 1.0e-3 on the 8-bit one, and the served logprobs by up to 4.1e-3 (int4
+# trunk), at the positions where the chain moves them most (measured on Lavapipe: 1.8e-4
+# and 4.5e-4; logprobs 6.1e-3): every logits row is held within 2e-3 of the largest
+# |logit|, the logprobs of the serve sessions within 2e-2, the tokens exactly. With the CPU's int8 expert activations
+# (K3_IDOT=1) a rounding that flips an int8 step moves the logits further (8e-3, the
+# tokens unchanged): that configuration gates on its tokens (TOKENS=1).
+k3c_ids() { $PY -c "import json,sys;print(' '.join(map(str,json.load(open('kimi_k3_tiny/ref.json'))['cases'][sys.argv[1]]['prompt_ids'])))" "$1"; }
+k3c_close() {  # <cpu.f32> <vk.f32>: max |diff| within 2e-3 of the largest |logit|
+  $PY - "$1" "$2" <<'PY'
+import array, sys
+a = array.array("f", open(sys.argv[1], "rb").read()); b = array.array("f", open(sys.argv[2], "rb").read())
+d = max(abs(x - y) for x, y in zip(a, b)) if a and len(a) == len(b) else float("inf")
+m = max(abs(x) for x in a) if a else 0.0
+print(f"max |logit diff| {d / m if m else d:.1e} of the largest")
+sys.exit(0 if d <= 2e-3 * m else 1)
+PY
+}
+# k3c_gate <tag> <env...>: for each of the oracle's prompts (K3C_CASES, default all
+# three), the CPU run's tokens, every logits row (K3_VAL_LOGITS: every prefill row and
+# every decode step) within k3c_close (TOKENS=1: reported, not gated), and the chain
+# ran. EVICT=1: the tier evicted.
+# FAULT_BACK=k: the device is lost k frames before the end of the same run without a
+# fault (counted from that run's frames, so on any device the loss lands in the same
+# forward), and the run must say so; REBUILD=1: and rebuild the KDA state of some
+# positions on the CPU.
+k3c_gate() {
+  local tag=$1 c frames fault; shift
+  for c in ${K3C_CASES:-short chunk long}; do
+    rm -f k3c.usage cpu.f32 vk.f32
+    env "$@" COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 K3_VAL_LOGITS=cpu.f32 ./kimi_k3 kimi_k3_tiny --ids "$(k3c_ids $c)" --ngen 8 \
+      2> cpu.log | sed 's/ *TUNE.*//' > cpu.tok
+    fault=""
+    if [ -n "${FAULT_BACK:-}" ]; then
+      env "$@" COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+        ./kimi_k3 kimi_k3_tiny --ids "$(k3c_ids $c)" --ngen 8 2> vk.log > /dev/null
+      frames=$(sed -n 's/^\[VK\] kimi_k3 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' vk.log | tail -1)
+      [ -n "$frames" ] && [ "$frames" -gt "$FAULT_BACK" ] || { cat vk.log; fail "$tag $c: no fault-free run to count frames from"; }
+      fault="COLI_VK_CHAIN_FAULT=$((frames - FAULT_BACK + 1))"
+    fi
+    env "$@" $fault COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 K3_VAL_LOGITS=vk.f32 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
+      COLI_VK_CHAIN=${CHAINMODE:-1} ./kimi_k3 kimi_k3_tiny --ids "$(k3c_ids $c)" --ngen 8 2> vk.log | sed 's/ *TUNE.*//' > vk.tok
+    { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok; tail -20 vk.log; fail "$tag $c: the chain's tokens differ from the CPU"; }
+    if [ -n "$fault" ]; then
+      grep -q "kimi_k3 chain: the device was lost" vk.log || { cat vk.log; fail "$tag $c: no loss was handled"; }
+      if [ "${REBUILD:-0}" = 1 ]; then grep -q "rebuilding the state of [1-9]" vk.log || { cat vk.log; fail "$tag $c: no state was rebuilt"; }; fi
+    else
+      [ "$(chain_count kimi_k3 vk.log)" -gt 0 ] || { cat vk.log; fail "$tag $c: the chain never ran"; }
+    fi
+    if [ "${EVICT:-0}" = 1 ]; then
+      [ "$(tier_evictions kimi_k3 vk.log)" -gt 0 ] || { grep '\[VK\] tier' vk.log; fail "$tag $c: the budget forced no eviction"; }
+      grep -q ' failed 0 ' vk.log || { grep '\[VK\] tier' vk.log; fail "$tag $c: an upload failed"; }
+    fi
+    local lg; lg=$(k3c_close cpu.f32 vk.f32) || { echo "$lg"; [ "${TOKENS:-0}" = 1 ] || fail "$tag $c: logits"; }
+    echo "OK $tag $c: tokens = CPU, $lg, $(chain_count kimi_k3 vk.log) chain forwards$(grep -o 'rebuilding the state of [0-9]* positions\|the host.s state is current' vk.log | sed 's/^/, /')"
+  done
+}
+k3c_serve_fixture() {   # the tiny fixture with the tokenizer the serve tests speak through
+  rm -rf kimi_k3_serve && mkdir kimi_k3_serve
+  cp kimi_k3_tiny/config.json kimi_k3_tiny/model.safetensors kimi_k3_serve/
+  cp tests/tok_kimi_tiny.json kimi_k3_serve/tokenizer.json
+}
+
+# Every configuration the chain takes: Moonshot's oracle with the chain on (the tier on,
+# off, the shared experts on the device), every dense format (f32, int8 rows, int4-g64,
+# mixed), the CPU's int8 expert activations with the tier off, prefill a token at a
+# time and in chain chunks of 3, the tiled GEMM and the per-row GEMV, K3_TOPP, a tier
+# budget that evicts, prompts only (the KDA state crossing between the device and the
+# CPU at every decode), a device lost mid-decode (the KDA state rebuilt on the CPU), in
+# the first prompt chunk (the host's state current) and in a later one (rebuilt); serve
+# sessions frame for frame (pins, the prompt cache, prefix reuse, a prompt that diverges
+# and one that starts over, the prefill read-out), with recurrent-state checkpoints
+# (COLI_K3_CKPT: photos taken from the device's state and restored to it), in chain
+# chunks, on prompts only, with a device lost mid-session; the checkpoint and dashboard
+# harnesses with the chain on.
+family_kimi_chain() {
+  make kimi_k3 tests/test_vk_chain VK=1
+  ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
+  tail -1 vk_chain.log | grep -qx PASS || fail "the chain's ops"
+  $PY tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+  k3c_serve_fixture
+  export OMP_NUM_THREADS=2
+  local e b out frames
+  for e in COLI_VK_TIER=1 COLI_VK_TIER=0 COLI_VK_DENSE=1; do
+    env $e COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
+      $PY tests/test_kimi_k3_tiny.py --binary ./kimi_k3 --fixture ./kimi_k3_tiny
+    echo "OK chain kimi_k3 vendor oracle ($e)"
+  done
+  local O="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 COLI_TEMP=0"
+  k3c_gate "chain kimi_k3 f32" $O
+  k3c_gate "chain kimi_k3 f32, tier off" $O COLI_VK_TIER=0
+  k3c_gate "chain kimi_k3 f32, shared experts by COLI_VK_DENSE=1" $O COLI_VK_DENSE=1
+  for b in 8 4; do   # int8 rows (fmt 1); int4-g64 (fmt 4) where a row is whole groups, int8 elsewhere
+    k3c_gate "chain kimi_k3 ${b}-bit trunk" K3_BITS=$b K3_MLA_BITS=$b K3_HEAD_BITS=$b K3_IDOT=0 COLI_TEMP=0
+  done
+  k3c_gate "chain kimi_k3 int4 KDA and MoE, int8 MLA and head" K3_BITS=4 K3_IDOT=0 COLI_TEMP=0
+  TOKENS=1 k3c_gate "chain kimi_k3 int8 expert activations, tier off" K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 COLI_TEMP=0 COLI_VK_TIER=0
+  k3c_gate "chain kimi_k3 prefill one token at a time" $O K3_CHUNK=1
+  k3c_gate "chain kimi_k3 chain chunks of 3" $O COLI_VK_CHAIN_ROWS=3
+  k3c_gate "chain kimi_k3 tiled GEMM from 2 rows" $O COLI_VK_GEMM_MIN_S=2
+  k3c_gate "chain kimi_k3 the per-row GEMV" $O COLI_VK_CHAIN_GEMV=0
+  k3c_gate "chain kimi_k3 K3_TOPP=0.6" $O K3_TOPP=0.6
+  EVICT=1 k3c_gate "chain kimi_k3 a tier budget of two experts" $O COLI_VK_TIER_GB=0.000005
+  CHAINMODE=2 k3c_gate "chain kimi_k3 prompts only" $O
+  # the device lost: 9 frames a forward on this fixture (two per sparse layer and the
+  # head); the long prompt is three forwards (32, 32 and 8 rows), then 7 decode steps
+  FAULT_BACK=3 REBUILD=1 k3c_gate "chain kimi_k3 device lost mid-decode" $O
+  K3C_CASES=long FAULT_BACK=86 k3c_gate "chain kimi_k3 device lost in the first prompt chunk" $O
+  K3C_CASES=long FAULT_BACK=77 REBUILD=1 k3c_gate "chain kimi_k3 device lost in a later prompt chunk" $O
+  # in chain chunks of 5 rows (seven chunks a 32-row forward), the loss in the third
+  # chunk of the second forward: the state its first chunks advanced is not used
+  K3C_CASES=long FAULT_BACK=124 REBUILD=1 k3c_gate "chain kimi_k3 device lost inside a chunked forward" $O COLI_VK_CHAIN_ROWS=5
+  # serve sessions frame for frame, the KDA state across turns
+  local S="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 K3_PREFIX_LOG=1 USAGE_SAVE=0"
+  export CHAIN_SERVE_TOL=2e-2
+  rm -rf k3c_photos && mkdir k3c_photos
+  # shellcheck disable=SC2086
+  {
+    $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve $S
+    out=$($PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve $S COLI_K3_CKPT=4); echo "$out"
+    $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve $S COLI_K3_CKPT=2 COLI_K3_CKPT_DIR=$PWD/k3c_photos
+    $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve K3_BITS=4 K3_IDOT=0 K3_PREFIX_LOG=1 USAGE_SAVE=0 COLI_VK_CHAIN_ROWS=3
+    COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve $S COLI_K3_CKPT=4
+    # a device lost mid-session, 134 frames before the end of the same session without a
+    # fault (on Lavapipe frame 200 of 334: after a photo brought the state to the host,
+    # the state of the 3 positions since then is rebuilt from it)
+    frames=$(echo "$out" | sed -n 's/.*kimi_k3 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p')
+    [ -n "$frames" ] && [ "$frames" -gt 134 ] || fail "chain kimi_k3 serve: no fault-free session to count frames from"
+    CHAIN_SERVE_EXPECT='kimi_k3 chain: the device was lost' \
+      $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve $S COLI_K3_CKPT=4 COLI_VK_CHAIN_FAULT=$((frames - 134))
+  }
+  unset CHAIN_SERVE_TOL
+  # recurrent-state checkpoints and the dashboard's lines with the chain on
+  COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
+    $PY tests/test_kimi_k3_ckpt.py --binary ./kimi_k3 --fixture ./kimi_k3_tiny
+  COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
+    $PY tests/test_kimi_k3_dashboard.py --binary ./kimi_k3 --fixture ./kimi_k3_tiny
+  unset OMP_NUM_THREADS
+}
+
+# The same chain under ASan and UBSan: memory safety is the gate; each run must have
+# run the chain (or handled the loss).
+family_kimi_chain_sanitize() {
+  make clean >/dev/null 2>&1 || true
+  make kimi_k3 tests/test_vk_chain VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+  export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
+  ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  echo "OK asan: the chain's ops"
+  $PY tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+  k3c_serve_fixture
+  export OMP_NUM_THREADS=2
+  k3san() {  # <tag> <env and argv...>
+    local tag=$1; shift
+    rm -f k3c.usage
+    env COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
+    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    grep -q "kimi_k3 chain: \([1-9][0-9]* forwards\|the device was lost\)" san.log || { cat san.log; fail "$tag: the chain never ran"; }
+    echo "OK $tag: sanitizers clean, $(chain_count kimi_k3 san.log) chain forwards"
+  }
+  local O="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 COLI_TEMP=0" ids frames
+  ids=$(k3c_ids long)
+  # shellcheck disable=SC2086
+  {
+    k3san "asan chain kimi_k3 f32" env $O ./kimi_k3 kimi_k3_tiny --ids "$ids" --ngen 8
+    frames=$(sed -n 's/^\[VK\] kimi_k3 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' san.log | tail -1)
+    k3san "asan chain kimi_k3 int4 trunk, chain chunks of 3" env K3_BITS=4 K3_IDOT=0 COLI_VK_CHAIN_ROWS=3 ./kimi_k3 kimi_k3_tiny --ids "$ids" --ngen 8
+    k3san "asan chain kimi_k3 tier off, every logits row" env $O COLI_VK_TIER=0 K3_VAL_LOGITS=san.f32 ./kimi_k3 kimi_k3_tiny --ids "$ids" --ngen 8
+    k3san "asan chain kimi_k3 prompts only" env $O COLI_VK_CHAIN=2 ./kimi_k3 kimi_k3_tiny --ids "$ids" --ngen 8
+    # the device lost mid-decode: 3 frames before the end of the run above (a fixed frame
+    # number can land in the buffers' setup on a device whose memory is not mapped)
+    k3san "asan chain kimi_k3 device lost, rebuilt" env $O COLI_VK_CHAIN_FAULT=$((frames - 2)) ./kimi_k3 kimi_k3_tiny --ids "$ids" --ngen 8
+    grep -q "rebuilding the state of [1-9]" san.log || { cat san.log; fail "asan chain kimi_k3 device lost: no state was rebuilt"; }
+  }
+  CHAIN_SERVE_TOL=2e-2 $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 \
+    K3_PREFIX_LOG=1 USAGE_SAVE=0 COLI_K3_CKPT=4 > san.log 2>&1 || { cat san.log; fail "asan chain kimi_k3 serve"; }
+  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan chain kimi_k3 serve: sanitizer diagnostic"; fi
+  echo "OK asan chain kimi_k3 serve: $(tail -1 san.log)"
+  unset OMP_NUM_THREADS
+  make clean >/dev/null 2>&1 || true
+}
+
 case "${1:-}" in
   shader)         shader_formats ;;
   qwen)           family_qwen ;;
@@ -1904,5 +2089,7 @@ case "${1:-}" in
   inkling-olmoe-chain-sanitize) family_inkling_olmoe_chain_sanitize ;;
   glm-chain)      family_glm_chain ;;
   glm-chain-sanitize) family_glm_chain_sanitize ;;
-  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize" >&2; exit 2 ;;
+  kimi-chain)     family_kimi_chain ;;
+  kimi-chain-sanitize) family_kimi_chain_sanitize ;;
+  *) echo "usage: $0 shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize" >&2; exit 2 ;;
 esac

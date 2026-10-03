@@ -34,6 +34,10 @@
  *            decay, beta, output norm and gate
  *   mhc      hyper_connections.h's split, collapse and write back, the mean, and the
  *            clamped SwiGLU
+ *   kda k3   Kimi K3's KDA layer (kimi_k3.c's kda_forward): exp(A_log) as the engine
+ *            keeps it, its order of the l2 norms and the update, over two submissions
+ *   ares     Kimi K3's attention residuals (res_mix) over 0 to 15 block snapshots, and
+ *            SiTU-GLU on values both sides of its two constants
  *   sconv    inkling's short convolution (residual inside, the ring carried across
  *            calls) and its scalar multiply and divide
  *   relattn  inkling's attention: the relative-position bias, tau, a sliding window
@@ -1170,6 +1174,122 @@ static void test_kpool(int S, int pos_base, int IH, int ID, int pool, int topk, 
     free(keys); free(gates); free(ape); free(q); free(hw); free(valid); free(ref); free(hwd); free(rk); free(gk);
 }
 
+/* Kimi K3's KDA layer, kimi_k3.c's kda_forward row by row (its scalar path): the window
+ * shifted and the taps summed in order, silu; q and k l2-normalized with the eps after
+ * the squares, q then scaled; alpha from A = exp(A_log) as the engine keeps it; the
+ * recurrence k * ((v - kS) * beta); the output RMSNorm (its sum in double) and gate.
+ * S rows over two calls (the state and the window carried on the device). */
+static void test_kda_k3(int H, int KD, int CK, float xs) {
+    int VD = KD, P = H * KD, C = 3 * P, S = 6;
+    float lb = -5.f, neps = 1e-6f, eps = 1e-5f, qscale = 1.f / sqrtf((float)KD);
+    float *qkv = fvec((size_t)S * C, xs), *f = fvec((size_t)S * P, 1.f), *b = fvec((size_t)S * H, 2.f), *g = fvec((size_t)S * P, 2.f);
+    float *taps = fvec((size_t)C * CK, 0.7f), *win = fvec((size_t)C * CK, 1.f), *state = fvec((size_t)H * KD * VD, 0.3f);
+    float *prm = malloc((size_t)(H + P + VD) * 4);
+    for (int i = 0; i < H; i++) prm[i] = expf(frnd() * 0.5f);          /* A = exp(A_log), as kimi_k3.c keeps it */
+    for (int i = 0; i < P; i++) prm[H + i] = frnd() * 0.5f;
+    for (int i = 0; i < VD; i++) prm[H + P + i] = 0.5f + (rnd() % 100) / 100.f;
+    float *rs = malloc((size_t)H * KD * VD * 4), *rw = malloc((size_t)C * CK * 4), *ref = malloc((size_t)S * P * 4);
+    memcpy(rs, state, (size_t)H * KD * VD * 4); memcpy(rw, win, (size_t)C * CK * 4);
+    float *vec = malloc((size_t)C * 4), *kS = malloc((size_t)VD * 4), *oh = malloc((size_t)VD * 4);
+    float *qn = malloc((size_t)KD * 4), *kn = malloc((size_t)KD * 4), *al = malloc((size_t)KD * 4);
+    for (int s = 0; s < S; s++) {
+        for (int c = 0; c < C; c++) {               /* the short convolution, the window oldest first */
+            float *wd = rw + (size_t)c * CK;
+            for (int j = 0; j < CK - 1; j++) wd[j] = wd[j + 1];
+            wd[CK - 1] = qkv[(size_t)s * C + c];
+            float acc = 0; for (int j = 0; j < CK; j++) acc += taps[(size_t)c * CK + j] * wd[j];
+            vec[c] = acc / (1.f + expf(-acc));
+        }
+        for (int h = 0; h < H; h++) {
+            const float *qh = vec + h * KD, *kh = vec + P + h * KD, *vh = vec + 2 * P + h * VD;
+            float sq = 0, sk = 0;
+            for (int i = 0; i < KD; i++) { sq += qh[i] * qh[i]; sk += kh[i] * kh[i]; }
+            sq = 1.f / sqrtf(sq + neps); sk = 1.f / sqrtf(sk + neps);
+            for (int i = 0; i < KD; i++) { qn[i] = qh[i] * sq * qscale; kn[i] = kh[i] * sk; }
+            for (int i = 0; i < KD; i++) al[i] = expf(lb * sigm(prm[h] * (f[(size_t)s * P + h * KD + i] + prm[H + h * KD + i])));
+            float beta = sigm(b[(size_t)s * H + h]);
+            float *St = rs + (size_t)h * KD * VD;
+            memset(kS, 0, (size_t)VD * 4);
+            for (int k = 0; k < KD; k++) { float *row = St + (size_t)k * VD; for (int v = 0; v < VD; v++) { row[v] *= al[k]; kS[v] += kn[k] * row[v]; } }
+            for (int v = 0; v < VD; v++) kS[v] = (vh[v] - kS[v]) * beta;
+            memset(oh, 0, (size_t)VD * 4);
+            for (int k = 0; k < KD; k++) { float *row = St + (size_t)k * VD; for (int v = 0; v < VD; v++) { row[v] += kn[k] * kS[v]; oh[v] += qn[k] * row[v]; } }
+            double ms = 0; for (int v = 0; v < VD; v++) ms += (double)oh[v] * oh[v];
+            float r = 1.f / sqrtf((float)(ms / VD) + eps);
+            for (int v = 0; v < VD; v++) ref[(size_t)s * P + h * VD + v] = oh[v] * r * prm[H + P + v] * sigm(g[(size_t)s * P + h * VD + v]);
+        }
+    }
+    /* the device: q, k, v in three blocks [3][S][P] (in_part = S*P), as an engine's three matmuls leave them */
+    float *blk = malloc((size_t)3 * S * P * 4);
+    for (int s = 0; s < S; s++) for (int part = 0; part < 3; part++)
+        memcpy(blk + (size_t)part * S * P + (size_t)s * P, qkv + (size_t)s * C + (size_t)part * P, (size_t)P * 4);
+    VkcBuf *ib = up(blk, (size_t)3 * S * P), *tb = up(taps, (size_t)C * CK), *wb = up(win, (size_t)C * CK), *sb = up(state, (size_t)H * KD * VD);
+    VkcBuf *fb = up(f, (size_t)S * P), *bb = up(b, (size_t)S * H), *gb = up(g, (size_t)S * P), *pb = up(prm, (size_t)H + P + VD);
+    VkcBuf *mb = vkc_buf((size_t)S * C * 4, VKC_DEV), *yb = vkc_buf((size_t)S * P * 4, VKC_DEV);
+    int ok = 1, s0 = 0;
+    for (int part = 0; part < 2 && ok; part++) {
+        int n = part ? S - 1 : 1;
+        VkcKdaConv cp = {n, C, CK, P, s0 * P, P, S * P, 0, C, 0, 0};
+        VkcKdaRec rp = {n, H, VD, P, 0, C, s0 * P, P, s0 * H, H, s0 * P, P, s0 * P, P, 0, 0, lb, neps, eps};
+        ok = vkc_begin() && vkc_kda_conv(ib, tb, wb, mb, &cp) &&
+             vkc_kda_rec_flags(KD, mb, fb, bb, gb, pb, sb, yb, &rp, VKC_KDA_EXP_A | VKC_KDA_K3) && vkc_submit(part);
+        s0 += n;
+    }
+    float *y = down(yb, 0, (size_t)S * P), *st2 = down(sb, 0, (size_t)H * KD * VD), *w2 = down(wb, 0, (size_t)C * CK);
+    double e = relerr(y, ref, (size_t)S * P, 1e-3), es = relerr(st2, rs, (size_t)H * KD * VD, 1e-3), ew = relerr(w2, rw, (size_t)C * CK, 1e-3);
+    CHECK(ok && e < 1e-5 && es < 1e-5 && ew == 0 && !bad(y, (size_t)S * P), "kda k3 H %d KD %d K %d: ok %d out %.2e state %.2e window %.2e",
+          H, KD, CK, ok, e, es, ew);
+    if (getenv("VKC_TEST_VERBOSE")) printf("kda k3 H %d KD %d: out %.2e state %.2e\n", H, KD, e, es);
+    vkc_free(ib); vkc_free(tb); vkc_free(wb); vkc_free(sb); vkc_free(fb); vkc_free(bb); vkc_free(gb); vkc_free(pb); vkc_free(mb); vkc_free(yb);
+    free(qkv); free(f); free(b); free(g); free(taps); free(win); free(state); free(prm); free(rs); free(rw); free(ref);
+    free(vec); free(kS); free(oh); free(qn); free(kn); free(al); free(blk); free(y); free(st2); free(w2);
+}
+
+/* kimi_k3.c's res_mix for S rows over nb block snapshots at a row stride, and SiTU-GLU */
+static void test_ares(int S, int D, int nb) {
+    int nbmax = nb > 0 ? nb + 1 : 1, xrow = D + 3, brow = nbmax * D, yrow = D + 5;
+    float eps = 1e-5f;
+    float *x = fvec((size_t)S * xrow, 2.f), *bl = fvec((size_t)S * brow, 1.5f), *w = fvec((size_t)D + 7, 0.3f);
+    for (int s = 0; s < S; s++) for (int d = 0; d < D; d++) x[(size_t)s * xrow + d] *= 1.f + (float)s;   /* rows of different sizes */
+    float *ref = calloc((size_t)S * yrow, 4);
+    for (int s = 0; s < S; s++) {
+        const float *v[16]; float sc[16];
+        for (int e = 0; e < nb; e++) v[e] = bl + (size_t)s * brow + (size_t)e * D;
+        v[nb] = x + (size_t)s * xrow;
+        for (int e = 0; e <= nb; e++) {
+            double ms = 0, dot = 0;
+            for (int d = 0; d < D; d++) { double a = v[e][d]; ms += a * a; dot += a * (double)w[7 + d]; }
+            sc[e] = (float)(dot / sqrt(ms / D + eps));
+        }
+        float m = sc[0]; for (int e = 1; e <= nb; e++) if (sc[e] > m) m = sc[e];
+        float sum = 0; for (int e = 0; e <= nb; e++) { sc[e] = expf(sc[e] - m); sum += sc[e]; }
+        for (int e = 0; e <= nb; e++) sc[e] /= sum;
+        for (int d = 0; d < D; d++) { float a = 0; for (int e = 0; e <= nb; e++) a += sc[e] * v[e][d]; ref[(size_t)s * yrow + d] = a; }
+    }
+    VkcBuf *xb = up(x, (size_t)S * xrow), *bb = up(bl, (size_t)S * brow), *wb = up(w, (size_t)D + 7), *yb = vkc_buf((size_t)S * yrow * 4, VKC_DEV);
+    VkcAres ap = {S, D, nb, 0, xrow, 0, brow, 7, 0, yrow, eps};
+    int ok = vkc_begin() && vkc_ares_mix(xb, bb, wb, yb, &ap) && vkc_submit(1);
+    float *y = down(yb, 0, (size_t)S * yrow);
+    for (int s = 0; s < S; s++) for (int d = D; d < yrow; d++) y[(size_t)s * yrow + d] = 0.f;   /* the gaps are not written */
+    double e = relerr(y, ref, (size_t)S * yrow, 1e-3);
+    CHECK(ok && e < 2e-6 && !bad(y, (size_t)S * yrow), "ares S %d D %d nb %d: ok %d err %.2e", S, D, nb, ok, e);
+    if (getenv("VKC_TEST_VERBOSE")) printf("ares S %d D %d nb %d: %.2e\n", S, D, nb, e);
+    vkc_free(xb); vkc_free(bb); vkc_free(wb); vkc_free(yb);
+    free(x); free(bl); free(w); free(ref); free(y);
+}
+static void test_situ(float b1, float b2) {
+    int n = 777;
+    float *ga = fvec(n, 3.f * b1), *ua = fvec(n, 3.f * b2), *rr = malloc((size_t)n * 4);
+    for (int i = 0; i < n; i++) rr[i] = b1 * tanhf(ga[i] / b1) * sigm(ga[i]) * b2 * tanhf(ua[i] / b2);
+    VkcBuf *gb = up(ga, n), *ub = up(ua, n), *yb = vkc_buf((size_t)n * 4 + 64, VKC_DEV);
+    VkcSitu sp = {n, 0, 0, 16, b1, b2};
+    int ok = vkc_begin() && vkc_situ(gb, ub, yb, &sp) && vkc_submit(1);
+    float *y = down(yb, 16, n);
+    double e = relerr(y, rr, n, 1e-3);
+    CHECK(ok && e < 1e-6 && !bad(y, n), "situ b1 %g b2 %g: ok %d err %.2e", b1, b2, ok, e);
+    vkc_free(gb); vkc_free(ub); vkc_free(yb); free(ga); free(ua); free(rr); free(y);
+}
+
 /* ---- frames: many ops, frames in flight, ordering ---------------------------------------- */
 static void test_frames(void) {
     int n = 1000;
@@ -1295,6 +1415,15 @@ int main(int argc, char **argv) {
         printf("kda done\n");
         test_mhc(2, 64, 3); test_mhc(4, 96, 20); test_mhc(3, 40, 1);
         printf("mhc done\n");
+        test_kda_k3(2, 16, 4, 1.f); test_kda_k3(3, 32, 4, 1.f); test_kda_k3(2, 128, 4, 1.f); test_kda_k3(1, 64, 2, 1.f);
+        test_kda_k3(2, 16, 4, 0.002f);
+        printf("kda k3 done\n");
+    }
+    if (!vkc_ares_ready()) { fails++; printf("FAIL: the AttnRes shader did not load\n"); }
+    else {
+        test_ares(1, 128, 0); test_ares(3, 128, 1); test_ares(5, 300, 4); test_ares(2, 7168, 8); test_ares(4, 96, 15);
+        test_situ(1.f, 1.f); test_situ(4.f, 25.f);
+        printf("ares done\n");
     }
     if (vkc_sconv_ready() && vkc_relattn_ready()) { test_inkling(); printf("inkling done\n"); }
     else CHECK(0, "inkling's ops: chain_sconv.spv or chain_relattn.spv did not load");

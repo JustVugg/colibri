@@ -36,15 +36,15 @@ static const char *const pipe_file[P_NPIPE] = {
 /* COLI_VK_CHAIN_PROF=1: device time per kind of op (timestamps after every op; ops
  * that run side by side between two barriers share the time unevenly) */
 enum { PK_GEMV8, PK_GEMV, PK_GEMM, PK_NORM, PK_ROPE, PK_ATTN, PK_DNCONV, PK_DNREC, PK_EW, PK_QSA, PK_PLE, PK_COPY,
-       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_N };
+       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_ARES, PK_N };
 static const char *const pk_name[PK_N] = {"GEMV int8", "GEMV other", "tiled GEMM", "norm", "rope", "attention",
                                           "dn conv", "dn recurrence", "element-wise", "qsa", "ple", "copy",
-                                          "mla", "mla weights", "dsa", "kda", "mhc"};
-/* the MLA, KDA and mHC pipelines: optional (an engine without such layers needs none
- * of them, and a missing one turns off only its own ops) */
-enum { PM_MLA, PM_HGEMV, PM_DSA, PM_KDA, PM_MHC, PM_N };
+                                          "mla", "mla weights", "dsa", "kda", "mhc", "attnres"};
+/* the MLA, KDA, mHC and AttnRes pipelines: optional (an engine without such layers
+ * needs none of them, and a missing one turns off only its own ops) */
+enum { PM_MLA, PM_HGEMV, PM_DSA, PM_KDA, PM_MHC, PM_ARES, PM_N };
 static const char *const mla_file[PM_N] = {"chain_mla.spv", "chain_hgemv.spv", "chain_dsa.spv", "chain_kda.spv",
-                                           "chain_mhc.spv"};
+                                           "chain_mhc.spv", "chain_ares.spv"};
 #define VKC_KDA_MAX 8
 
 /* ---- memory: blocks per kind, buffers bound at offsets inside them -------------- */
@@ -888,11 +888,16 @@ static VkPipeline kda_pipe(int KD) {
     return p;
 }
 int vkc_kda_rec(int KD, VkcBuf *m, VkcBuf *f, VkcBuf *b, VkcBuf *g, VkcBuf *prm, VkcBuf *st, VkcBuf *y, const VkcKdaRec *p) {
+    return vkc_kda_rec_flags(KD, m, f, b, g, prm, st, y, p, 0);
+}
+int vkc_kda_rec_flags(int KD, VkcBuf *m, VkcBuf *f, VkcBuf *b, VkcBuf *g, VkcBuf *prm, VkcBuf *st, VkcBuf *y,
+                      const VkcKdaRec *p, int flags) {
     K.kind = PK_KDA;
-    if (!K.mpipe[PM_KDA] || KD < 1 || KD > 256 || p->VD < 1 || p->VD > 128 || p->H < 1 || p->S < 1) return 0;
+    if (!K.mpipe[PM_KDA] || KD < 1 || KD > 256 || p->VD < 1 || p->VD > 128 || p->H < 1 || p->S < 1 ||
+        (flags & ~(VKC_KDA_EXP_A | VKC_KDA_K3))) return 0;
     VkPipeline pipe = kda_pipe(KD);
     if (!pipe) return 0;
-    struct { int mode; VkcKdaRec b; } pc = {1, *p};
+    struct { int mode; VkcKdaRec b; int flags; } pc = {1, *p, flags};
     VkcBind bd[7] = {B(m, 0), B(prm, 0), B(st, 1), B(y, 1), B(f, 0), B(b, 0), B(g, 0)};
     return record(pipe, bd, 7, &pc, sizeof pc, (uint32_t)p->H, 1, 1);
 }
@@ -909,6 +914,28 @@ int vkc_mhc(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, 
     if (mode == 0) return p->S == 0 || record(K.mpipe[PM_MHC], bd, 5, &pc, sizeof pc, (uint32_t)p->S, 1, 1);
     uint32_t gx, gy; grid((n + 255) / 256, &gx, &gy);
     return n == 0 || record(K.mpipe[PM_MHC], bd, 5, &pc, sizeof pc, gx, gy, 1);
+}
+
+/* ---- attention residuals and SiTU-GLU (chain_ares.comp) ---------------------------- */
+int vkc_ares_ready(void) { return vkc_ready() && K.mpipe[PM_ARES]; }
+int vkc_ares_mix(VkcBuf *x, VkcBuf *blk, VkcBuf *prm, VkcBuf *y, const VkcAres *p) {
+    K.kind = PK_ARES;
+    if (!K.mpipe[PM_ARES] || p->S < 0 || p->D < 1 || p->nb < 0 || p->nb > 15 || (p->nb > 0 && !blk) || y == x || y == blk) return 0;
+    if (p->S == 0) return open_frame() && !K.lost;
+    struct { int mode; VkcAres b; } pc = {0, *p};
+    VkcBind bd[4] = {B(x, 0), B(p->nb > 0 ? blk : NULL, 0), B(prm, 0), B(y, 1)};
+    uint32_t gx, gy; grid((uint64_t)p->S, &gx, &gy);
+    return record(K.mpipe[PM_ARES], bd, 4, &pc, sizeof pc, gx, gy, 1);
+}
+int vkc_situ(VkcBuf *g, VkcBuf *u, VkcBuf *y, const VkcSitu *p) {
+    K.kind = PK_ARES;
+    if (!K.mpipe[PM_ARES] || p->n < 0) return 0;
+    if (p->n == 0) return open_frame() && !K.lost;
+    int32_t pc[13] = {1, p->n, 0, 0, p->g_off, 0, p->u_off, 0, 0, p->y_off, 0, 0, 0};
+    memcpy(&pc[11], &p->b1, 4); memcpy(&pc[12], &p->b2, 4);
+    VkcBind bd[4] = {B(g, 0), B(u, 0), B(NULL, 0), B(y, 1)};
+    uint32_t gx, gy; grid(((uint64_t)p->n + 255) / 256, &gx, &gy);
+    return record(K.mpipe[PM_ARES], bd, 4, pc, sizeof pc, gx, gy, 1);
 }
 
 int vkc_mla_scratch(VkcMlaScratch *s, const VkcMla *m, int rows) {
