@@ -4651,11 +4651,42 @@ def _engine_extension_args(engine_k):
     return {"logprobs": engine_k, "gbytes_before_ext": True}
 
 
+class EngineLoadError(RuntimeError):
+    """The engine said why it could not load, and exited before READY.
+
+    `LOAD_FAIL kind=<kind> <detail>` is the last line such an engine writes on the
+    handshake channel (see docs/serve_protocol.md): `kind` is nomem, io, format or
+    unsupported, `detail` the text it also wrote to stderr. Raised in place of the
+    bare "engine exited unexpectedly" so the log names the cause: an out-of-memory
+    host is not a bad file."""
+
+    def __init__(self, kind, detail):
+        super().__init__(f"colibri engine failed to load (kind={kind}): {detail}")
+        self.kind = kind
+        self.detail = detail
+
+
+def parse_load_fail(data):
+    """(kind, detail) from the last LOAD_FAIL line among the bytes an engine wrote
+    before it should have said READY; None when it wrote no such line."""
+    found = None
+    for line in data.decode("utf-8", "replace").splitlines():
+        fields = line.strip().split(None, 2)
+        if len(fields) >= 2 and fields[0] == "LOAD_FAIL" and fields[1].startswith("kind="):
+            found = (fields[1][len("kind="):], fields[2] if len(fields) > 2 else "")
+    return found
+
+
 def read_engine_turn(stream, sentinel, on_bytes, caps=None):
     pending = b""
     while True:
         byte = stream.read(1)
         if byte == b"":
+            # The sentinel-length tail was held back in case it began the
+            # sentinel; at EOF it is the engine's last words (a LOAD_FAIL line
+            # ends there), so hand it over before giving up.
+            if pending:
+                on_bytes(pending)
             raise RuntimeError("colibri engine exited unexpectedly")
         pending += byte
         if pending.endswith(sentinel):
@@ -4990,7 +5021,20 @@ class Engine:
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
         self.profile_seq = 0
         self.caps = {}                         # the engine's CAPS handshake line, key=value
-        read_engine_turn(self.process.stdout, READY, lambda _: None, self.caps)
+        # What the engine wrote before READY, the last 4 KiB of it: an engine that
+        # exits instead of saying READY leaves its LOAD_FAIL line there.
+        boot = bytearray()
+
+        def keep(data):
+            boot.extend(data)
+            del boot[:-4096]
+        try:
+            read_engine_turn(self.process.stdout, READY, keep, self.caps)
+        except RuntimeError:
+            failure = parse_load_fail(bytes(boot))
+            if failure is not None:
+                raise EngineLoadError(*failure) from None
+            raise
         # True/False when the engine said whether it loaded a vision tower; None when
         # it said nothing (an engine that predates CAPS, or a family without a tower).
         self.vision = {"1": True, "0": False}.get(self.caps.get("vision"))
@@ -7662,7 +7706,14 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                   f"{runtime.info['default_height']}, {runtime.info['default_steps']} steps",
                   file=sys.stderr)
         else:
-            runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)
+            try:
+                runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)
+            except EngineLoadError as error:
+                # The engine said why: one line naming the kind, not a traceback
+                # that ends in "exited unexpectedly".
+                print(f"[gateway] engine load failed: kind={error.kind} {error.detail}",
+                      file=sys.stderr)
+                sys.exit(1)
         server.engine = runtime
         if family.modality != "image":
             # Said once at start-up, so a checkpoint that declares a tower it does

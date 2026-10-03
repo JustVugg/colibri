@@ -38,6 +38,25 @@ declares a tower whose tensors are not in the container). Engines that say nothi
 leave the server's flag unknown. glm53, qwen38, qwen36 and deepseek_v41 emit it;
 `openai_server.py` derives `/v1/models` `input_modalities` from it.
 
+An engine that cannot load its model says why on this channel, instead of
+`READY`, and exits:
+
+```
+LOAD_FAIL kind=<nomem|io|format|unsupported> <detail>
+```
+
+It is the last line such an engine writes. `nomem`: the host refused memory
+(ENOMEM/EAGAIN from malloc, mmap or mlock); `io`: the file could not be reached or
+read (ENOENT, EACCES, EIO, ...); `format`: the file was read but is not what it
+claims (short read, bad header); `unsupported`: well-formed, but a dtype or geometry
+this engine does not serve. The detail is the same text the engine wrote to
+stderr. `openai_server.py` raises `EngineLoadError(kind, detail)` from it and logs
+`[gateway] engine load failed: kind=<kind> <detail>`; an engine that exits with no
+such line is still reported as "colibri engine exited unexpectedly". The shared
+safetensors path (`st.h`, every family) emits it through `coli_load_fail()`
+(`load_fail.h`); a family's own load-time refusals adopt the same call as they are
+touched.
+
 ## Requests (server → engine)
 
 ```
@@ -108,6 +127,7 @@ turn: `HWINFO`, `PERF`, `ENTROPY`, `GPUS`, `TIERS`, `EMAP`, `HITS` (formats belo
 | `TIERS` | `TIERS <vram> <ram> <disk> <vram_gb> <ram_gb>` | expert count per tier + resident bytes |
 | `HWINFO` | `HWINFO <cores> <ram_total> <ram_avail> <ngpu> <vram_total> <cpu>\|<gpu>` | host snapshot (GBs are floats) |
 | `CAPS` | `CAPS key=value ...` | handshake only, between `READY` and `STAT`: what the engine loaded (`vision=0\|1`) |
+| `LOAD_FAIL` | `LOAD_FAIL kind=<kind> <detail>` | handshake only, instead of `READY`: why the model did not load (`nomem`, `io`, `format`, `unsupported`); the engine exits after it |
 | `EMAP` | `EMAP <rows> <cols> <hex>` | one byte per expert, row-major over `rows×cols` (sparse layers +MTP × experts): `byte = (tier<<6) \| heat` — 2-bit tier (0 disk / 1 RAM / 2 VRAM), 6-bit log₂-bucketed usage heat |
 | `HITS` | `HITS <rows> <cols> <hex>` | 1 bit per expert, experts routed since the previous `HITS` |
 | `PERF` | `PERF <id> <dt> <t_edisk> <t_ewait> <t_emm> <t_attn> <t_kvb> <t_head>` | this turn's PROFILO deltas, seconds |

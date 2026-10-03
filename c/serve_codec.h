@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "compat.h"
+#include "load_fail.h"   /* LOAD_FAIL kind=<kind> <detail>: the handshake that never reaches READY */
 
 /* Transport only: parse and emit frames. Admission, queueing, cancellation,
  * KV ownership, scheduling, and generation remain with each family engine. */

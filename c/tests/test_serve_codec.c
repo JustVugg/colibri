@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -234,6 +235,47 @@ static void test_allocation_failures_are_fatal_to_the_caller(void)
     }
 }
 
+/* The load-time failure class: errno maps to nomem or io, the kinds have
+ * their wire words, and the line is one line (a newline in the detail is a
+ * space), so the server can read the kind and keep the detail whole. */
+static void test_load_fail_kinds_and_line(void)
+{
+    assert(coli_load_fail_kind_from_errno(ENOMEM) == COLI_LOAD_FAIL_NOMEM);
+    assert(coli_load_fail_kind_from_errno(EAGAIN) == COLI_LOAD_FAIL_NOMEM);
+    assert(coli_load_fail_kind_from_errno(ENOENT) == COLI_LOAD_FAIL_IO);
+    assert(coli_load_fail_kind_from_errno(EACCES) == COLI_LOAD_FAIL_IO);
+    assert(coli_load_fail_kind_from_errno(EIO) == COLI_LOAD_FAIL_IO);
+    assert(coli_load_fail_kind_from_errno(EMFILE) == COLI_LOAD_FAIL_IO);
+    assert(coli_load_fail_kind_from_errno(0) == COLI_LOAD_FAIL_IO);
+    assert(strcmp(coli_load_fail_kind_string(COLI_LOAD_FAIL_NOMEM), "nomem") == 0);
+    assert(strcmp(coli_load_fail_kind_string(COLI_LOAD_FAIL_IO), "io") == 0);
+    assert(strcmp(coli_load_fail_kind_string(COLI_LOAD_FAIL_FORMAT), "format") == 0);
+    assert(strcmp(coli_load_fail_kind_string(COLI_LOAD_FAIL_UNSUPPORTED), "unsupported") == 0);
+
+    FILE *output = tmpfile();
+    assert(output);
+    binary_stream(output);
+    assert(coli_serve_write_load_fail(
+        output, COLI_LOAD_FAIL_FORMAT,
+        "model-00007.safetensors: short read at EOF (off 8, 0/16 bytes)\ntruncated?"));
+    static const char expected[] =
+        "LOAD_FAIL kind=format model-00007.safetensors: short read at EOF "
+        "(off 8, 0/16 bytes) truncated?\n";
+    unsigned char bytes[256];
+    size_t count = read_output(output, bytes, sizeof(bytes));
+    assert(count == sizeof(expected) - 1);
+    assert(memcmp(bytes, expected, count) == 0);
+    fclose(output);
+
+    output = tmpfile();
+    assert(output);
+    binary_stream(output);
+    assert(coli_serve_write_load_fail(output, COLI_LOAD_FAIL_NOMEM, NULL));
+    count = read_output(output, bytes, sizeof(bytes));
+    assert(count == 22 && memcmp(bytes, "LOAD_FAIL kind=nomem \n", 22) == 0);
+    fclose(output);
+}
+
 int main(void)
 {
     test_submit_and_controls();
@@ -241,6 +283,7 @@ int main(void)
     test_writer_golden_bytes();
     test_ready_caps_golden_bytes();
     test_allocation_failures_are_fatal_to_the_caller();
+    test_load_fail_kinds_and_line();
     puts("serve codec tests: ok");
     return 0;
 }

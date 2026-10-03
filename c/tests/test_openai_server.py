@@ -7413,6 +7413,63 @@ class EngineCapsTest(unittest.TestCase):
                     engine.close()
 
 
+class EngineLoadFailTest(unittest.TestCase):
+    """An engine that cannot load says `LOAD_FAIL kind=<kind> <detail>` and exits
+    before READY; the gateway raises the kind, not "exited unexpectedly"."""
+
+    def _engine(self, stdout_bytes):
+        process = FakeProcess(lambda _process, _frame: None)
+        process.stdout = BlockingStream(stdout_bytes)
+        process.stdout.close()   # the engine is gone: EOF right after what it said
+        with patch("openai_server.ARCH", "glm53"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            return Engine("glm53", "model")
+
+    def test_load_fail_line_is_raised_as_its_kind(self):
+        detail = "model-00007.safetensors: short read at EOF (off 8, 0/16 bytes)"
+        for kind in ("nomem", "io", "format", "unsupported"):
+            with self.subTest(kind=kind):
+                with self.assertRaises(openai_server.EngineLoadError) as caught:
+                    self._engine(f"LOAD_FAIL kind={kind} {detail}\n".encode())
+                self.assertEqual(caught.exception.kind, kind)
+                self.assertEqual(caught.exception.detail, detail)
+                self.assertIn(f"kind={kind}", str(caught.exception))
+                self.assertNotIn("unexpectedly", str(caught.exception))
+
+    def test_engine_that_says_nothing_is_still_exited_unexpectedly(self):
+        with self.assertRaisesRegex(RuntimeError, "exited unexpectedly") as caught:
+            self._engine(b"")
+        self.assertNotIsInstance(caught.exception, openai_server.EngineLoadError)
+
+    def test_parse_load_fail_takes_the_last_line_and_keeps_the_detail_whole(self):
+        parse = openai_server.parse_load_fail
+        self.assertIsNone(parse(b"HWINFO 8 64 32 0 0 cpu|none\n"))
+        self.assertEqual(parse(b"noise\nLOAD_FAIL kind=nomem malloc 12 bytes for tensor a.b failed\n"),
+                         ("nomem", "malloc 12 bytes for tensor a.b failed"))
+        self.assertEqual(parse(b"LOAD_FAIL kind=io\n"), ("io", ""))
+
+    def test_serve_logs_the_kind_and_exits(self):
+        error = openai_server.EngineLoadError("nomem", "malloc 12 bytes for tensor a.b failed")
+        stderr = io.StringIO()
+        # serve() sets the module's ARCH / CHAT_FLAVOR for the family it resolves;
+        # patched here so the rest of the suite keeps its defaults.
+        with patch("openai_server.ARCH", openai_server.ARCH), \
+             patch("openai_server.CHAT_FLAVOR", openai_server.CHAT_FLAVOR), \
+             patch("openai_server.Engine", side_effect=error), \
+             patch("openai_server.resolve_model") as resolve, \
+             patch("openai_server.default_engine", return_value="colibri"), \
+             patch("openai_server.detect_chat_flavor", return_value=None), \
+             patch("openai_server.APIServer") as api_server, \
+             patch("sys.stderr", stderr):
+            resolve.return_value.descriptor = openai_server.family_by_id("glm53")
+            with self.assertRaises(SystemExit) as caught:
+                openai_server.serve("model", "127.0.0.1", 8000, "id", None)
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("[gateway] engine load failed: kind=nomem malloc 12 bytes for tensor a.b failed",
+                      stderr.getvalue())
+        api_server.return_value.server_close.assert_called_once()
+
+
 class ServedModalityTest(unittest.TestCase):
     """What /v1/models says it accepts is what the engine loaded. The tower is a
     property of the checkpoint (a glm53 export can carry vision_config and no
