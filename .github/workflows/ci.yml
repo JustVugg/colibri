@@ -883,6 +883,11 @@ jobs:
           SNAP=olmoe_tiny_c ./olmoe 8 8 olmoe_tiny/ref_olmoe.json | tee oracle.log
           # the engine prints the score and exits 0 either way: the gate is here
           grep -qE 'Matching tokens: ([0-9]+)/\1$' oracle.log
+      - name: "Dense tensors: the shape config.json gives, or the load refuses"
+        run: |
+          cd c
+          COLI_OLMOE_FIXTURE=olmoe_tiny_c COLI_OLMOE_REFERENCE=olmoe_tiny/ref_olmoe.json \
+            python3 -m unittest -v tests.test_olmoe_dense_shape
       - name: "Cache cap: the sentinel takes the budget, an explicit cap is left alone"
         run: |
           cd c

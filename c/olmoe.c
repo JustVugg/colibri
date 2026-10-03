@@ -535,10 +535,29 @@ static void load_cfg(Cfg *c, const char *snap) {
     free(buf); free(arena);
 }
 
-static float *load_t(Model *m, const char *name) {
-    int64_t n = st_numel(&m->S, name);
-    if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
-    float *p = falloc(n);
+/* rows x columns is the shape the forward uses the tensor with, counted from
+ * the config: q/k/v/o are [hidden, hidden], the router [num_experts, hidden],
+ * embed_tokens and lm_head [vocab_size, hidden], a norm [hidden] (columns 0).
+ * Allocated from the header's element count instead, a tensor shorter than
+ * that was read past its end, and one of another shape was used as if it had
+ * this one. Exact, like the experts in load_expert_merged(). */
+static float *load_t(Model *m, const char *name, int64_t rows, int64_t columns) {
+    st_tensor *t = st_find(&m->S, name);
+    if (!t) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    if (t->rank != (columns ? 2 : 1) || t->shape[0] != rows || (columns && t->shape[1] != columns)) {
+        char got[192] = "[";
+        for (int k = 0; k < t->rank; k++)
+            snprintf(got + strlen(got), sizeof(got) - strlen(got), "%s%lld", k ? ", " : "",
+                     (long long)t->shape[k]);
+        strncat(got, "]", sizeof(got) - strlen(got) - 1);
+        char want[64];
+        if (columns) snprintf(want, sizeof(want), "[%lld, %lld]", (long long)rows, (long long)columns);
+        else         snprintf(want, sizeof(want), "[%lld]", (long long)rows);
+        fprintf(stderr, "%s: shape %s, expected %s from config.json, refusing (untrusted container)\n",
+                name, got, want);
+        exit(1);
+    }
+    float *p = falloc(t->numel);
     st_read_f32(&m->S, name, p, 0);   /* densa: niente DONTNEED, resta residente */
     return p;
 }
@@ -560,21 +579,23 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     }
     double t0 = now_s();
     if (load_boundaries) {
-        m->embed      = load_t(m, "model.embed_tokens.weight");
-        m->lm_head    = load_t(m, "lm_head.weight");
-        m->final_norm = load_t(m, "model.norm.weight");
+        m->embed      = load_t(m, "model.embed_tokens.weight", c->vocab, c->hidden);
+        m->lm_head    = load_t(m, "lm_head.weight", c->vocab, c->hidden);
+        m->final_norm = load_t(m, "model.norm.weight", c->hidden, 0);
     }
     m->L = calloc(c->n_layers, sizeof(Layer));
     char nm[256];
+    const int64_t D = c->hidden;
     for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
-        #define LD(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
-        LD(in_ln,  "input_layernorm.weight");
-        LD(post_ln,"post_attention_layernorm.weight");
-        LD(q, "self_attn.q_proj.weight"); LD(k, "self_attn.k_proj.weight");
-        LD(v, "self_attn.v_proj.weight"); LD(o, "self_attn.o_proj.weight");
-        LD(qn,"self_attn.q_norm.weight"); LD(kn,"self_attn.k_norm.weight");
-        LD(gate, "mlp.gate.weight");
+        #define LD(field, suffix, rows, columns) \
+            snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm,rows,columns)
+        LD(in_ln,  "input_layernorm.weight", D, 0);
+        LD(post_ln,"post_attention_layernorm.weight", D, 0);
+        LD(q, "self_attn.q_proj.weight", D, D); LD(k, "self_attn.k_proj.weight", D, D);
+        LD(v, "self_attn.v_proj.weight", D, D); LD(o, "self_attn.o_proj.weight", D, D);
+        LD(qn,"self_attn.q_norm.weight", D, 0); LD(kn,"self_attn.k_norm.weight", D, 0);
+        LD(gate, "mlp.gate.weight", c->n_experts, D);
         #undef LD
     }
     /* cap <= 0 is "you decide", the sentinel the launcher sends when nobody
@@ -2696,9 +2717,10 @@ static int olmoe_edge_engine_open(
                                        "out of memory opening OLMoE Edge");
     load_cfg(&engine->model.c, options->model_dir);
     st_init(&engine->model.S, options->model_dir);
-    engine->model.embed = load_t(&engine->model, "model.embed_tokens.weight");
-    engine->model.lm_head = load_t(&engine->model, "lm_head.weight");
-    engine->model.final_norm = load_t(&engine->model, "model.norm.weight");
+    const Cfg *ec = &engine->model.c;
+    engine->model.embed = load_t(&engine->model, "model.embed_tokens.weight", ec->vocab, ec->hidden);
+    engine->model.lm_head = load_t(&engine->model, "lm_head.weight", ec->vocab, ec->hidden);
+    engine->model.final_norm = load_t(&engine->model, "model.norm.weight", ec->hidden, 0);
     char tokenizer_path[4096];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
              options->model_dir);
