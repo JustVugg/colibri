@@ -2139,6 +2139,34 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
     *n_out = a->len; return r;
 }
 
+/* The reference is input, and the run indexes with it: generate() and tf_nll()
+ * size the token buffer and the KV cache from its lengths, attention() scores
+ * every position into its sc[4096] stack buffer, and every id selects an
+ * embedding row (a logit too, under PPL=1). Refuse one that does not fit. */
+static int ref_fits(const int *prompt, int np, const int *full, int nfull, int vocab) {
+    if (np < 1 || nfull <= np) {
+        fprintf(stderr, "reference: prompt_ids holds %d tokens and full_ids %d; "
+                        "need 1 <= prompt < full\n", np, nfull);
+        return 0;
+    }
+    if (nfull > 4096) {
+        fprintf(stderr, "reference: full_ids holds %d tokens, more than the 4096 "
+                        "positions attention() holds\n", nfull);
+        return 0;
+    }
+    const int *ids[2] = { prompt, full };
+    const int n[2] = { np, nfull };
+    const char *name[2] = { "prompt_ids", "full_ids" };
+    for (int a = 0; a < 2; a++)
+        for (int i = 0; i < n[a]; i++)
+            if (ids[a][i] < 0 || ids[a][i] >= vocab) {
+                fprintf(stderr, "reference: %s[%d] = %d is not a token id (vocab %d)\n",
+                        name[a], i, ids[a][i], vocab);
+                return 0;
+            }
+    return 1;
+}
+
 #ifndef OLMOE_NO_MAIN
 int main(int argc, char **argv) {
     coli_omp_tune_threads("olmoe");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
@@ -2254,6 +2282,7 @@ int main(int argc, char **argv) {
      * every thread, so the pointer the worker holds stays valid. */
     static Model m; model_init(&m, snap, cap, bits);
     printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
+    if (!ref_fits(prompt, np, full, nfull, m.c.vocab)) { free(buf); free(arena); return 1; }
 
     if (getenv("PPL") && atoi(getenv("PPL")) == 1) {   /* loss-meter mode: teacher-forced NLL */
         double nll; double t = now_s();

@@ -899,6 +899,10 @@ jobs:
         run: |
           cd c
           COLI_OLMOE_FIXTURE=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_context_exceeded
+      - name: "Reference: lengths and ids checked before the run"
+        run: |
+          cd c
+          COLI_OLMOE_FIXTURE=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_reference_bounds
       - name: KV prefix reuse is token-identical (serve, several turns)
         run: |
           cd c
