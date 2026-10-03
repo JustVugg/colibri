@@ -2729,6 +2729,9 @@ bench: iobench$(EXE)
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)
 
+tests/test_glm53_image_key$(EXE): tests/test_glm53_image_key.c
+	$(CC) $(CFLAGS) tests/test_glm53_image_key.c -o tests/test_glm53_image_key$(EXE) $(LDFLAGS)
+
 tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) tests/test_kimi_request_state.c $(VK_OBJ) -o tests/test_kimi_request_state$(EXE) $(NOCUDA_LDFLAGS)
 

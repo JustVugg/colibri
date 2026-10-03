@@ -631,6 +631,7 @@ int main(int argc, char **argv) {
 #include "delta_attention.h"
 #include "sparse_index.h"
 #include "vision_tower.h"
+#include "kv_image_key.h"
 
 /* Una matrice residente, nel formato in cui conviene tenerla.
  *
@@ -3103,6 +3104,12 @@ typedef struct { float **state, **window; int n_layers; } Glm53PinState;
 typedef struct {
     GSession *session;
     int *tokens;                          /* la sequenza che lo slot tiene */
+    /* La stessa sequenza, con ogni segnaposto immagine al posto del suo id
+     * porta l'impronta dei byte che la torre ha visto (kv_image_key.h): due
+     * foto diverse hanno gli stessi id, e il confronto che decide il riuso
+     * deve distinguerle. Gli scatti (pins) confrontano gli id e passano da
+     * qui per le posizioni immagine. */
+    uint64_t *keys;
     int n, cap;
     /* Scatti dello stato (SUBMIT pin=1): la ricorrenza KDA, gli id e i logit
      * finali. Piu di uno perche i prefissi utili sono annidati: le istruzioni
@@ -3209,7 +3216,8 @@ static int slot_pin_save(const GModel *m, KVSlot *slot, const int *tokens, int n
 /* Rimette lo scatto piu profondo che sia un prefisso stretto di questo prompt,
  * se la sessione che l'ha prodotto e ancora quella dello slot. Torna quante
  * posizioni sono gia' fatte, 0 se non si applica. */
-static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, int n) {
+static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, int n,
+                            int common) {
     const Cfg *c = &m->c;
     if (!slot->session || slot->pin_session != slot->session) return 0;
     const size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd;
@@ -3223,8 +3231,12 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
          * riscritte con altri token. Che gli id combacino con la RICHIESTA
          * non basta; devono combaciare con la storia dello slot, che e' la
          * sola descrizione di cosa le righe tengono davvero (come
-         * kv_prefix_holds per gli altri motori, #1650). */
+         * kv_prefix_holds per gli altri motori, #1650). E `common`, le
+         * posizioni su cui la richiesta e la storia concordano per CHIAVE,
+         * deve coprire lo scatto: sui segnaposto immagine gli id combaciano
+         * sempre, l'impronta della foto no. */
         if (st && k->len <= slot->session->filled && k->len <= slot->n &&
+            k->len <= common &&
             !memcmp(k->ids, slot->tokens, (size_t)k->len * sizeof(int))) {
             for (int i = 0; i < c->n_layers; i++) {
                 GLayerState *ls = &slot->session->layer[i];
@@ -3295,21 +3307,25 @@ static void slot_reset(const GModel *m, KVSlot *slot) {
     slot->blank_len = 0;          /* il buffer resta: si riusa alla prossima corsa */
 }
 
-/* Quanti token iniziali lo slot ha gia' in cache e puo' tenere. */
-static int slot_shared(const KVSlot *slot, const int *tokens, int n) {
-    int shared = 0;
-    while (shared < slot->n && shared < n && slot->tokens[shared] == tokens[shared])
-        shared++;
-    return shared;
+/* Quanti token iniziali lo slot ha gia' in cache e puo' tenere. Il confronto
+ * e' per chiave, non per id: su un segnaposto immagine la chiave e' la foto. */
+static int slot_shared(const KVSlot *slot, const uint64_t *keys, int n) {
+    return kv_keys_shared(slot->keys, slot->n, keys, n);
 }
 
-static void slot_remember(KVSlot *slot, const int *tokens, int n) {
+static void slot_remember(KVSlot *slot, const int *tokens, const uint64_t *keys, int n) {
     if (n > slot->cap) {
         slot->tokens = realloc(slot->tokens, (size_t)n * sizeof(int));
-        if (!slot->tokens) { fprintf(stderr, "OOM allocating slot history\n"); exit(1); }
+        slot->keys = realloc(slot->keys, (size_t)n * sizeof(uint64_t));
+        if (!slot->tokens || !slot->keys) {
+            fprintf(stderr, "OOM allocating slot history\n"); exit(1);
+        }
         slot->cap = n;
     }
-    if (n > 0) memcpy(slot->tokens, tokens, (size_t)n * sizeof(int));
+    if (n > 0) {
+        memcpy(slot->tokens, tokens, (size_t)n * sizeof(int));
+        memcpy(slot->keys, keys, (size_t)n * sizeof(uint64_t));
+    }
     slot->n = n;
 }
 
@@ -3323,10 +3339,11 @@ static void slot_remember(KVSlot *slot, const int *tokens, int n) {
 typedef struct {
     unsigned long long id;
     float *patches;
+    size_t bytes;                         /* quanti ne porta: l'impronta li legge tutti */
     int grid_h, grid_w;
 } PendingImage;
 
-static PendingImage g_pending = {0, NULL, 0, 0};
+static PendingImage g_pending = {0, NULL, 0, 0, 0};
 
 static void pending_clear(void) {
     free(g_pending.patches);
@@ -3425,6 +3442,7 @@ static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
         (void)fgetc(stdin);                       /* il '\n' di chiusura */
         g_pending.id = id;
         g_pending.patches = patches;
+        g_pending.bytes = (size_t)bytes;
         g_pending.grid_h = grid_h;
         g_pending.grid_w = grid_w;
         q->id = id;
@@ -3601,6 +3619,24 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
                    q->id, total, q->max_tokens, room);
         return 0;
     }
+    /* L'immagine annunciata per QUESTA richiesta, se c'e'. Entra nel
+     * confronto del riuso, non lo annulla: sui segnaposto la chiave della
+     * posizione e' l'impronta dei byte arrivati (kv_image_key.h), cosi' due
+     * foto diverse con gli stessi id non concordano su nessuna posizione
+     * immagine, e la stessa foto rimandata concorda su tutte. */
+    const int image_here = g_pending.patches && g_pending.id == q->id;
+    if (image_here && !m->has_vision) {
+        pending_clear();
+        free(sequence);
+        serve_line("ERROR %llu BAD_REQUEST\n", q->id);
+        return 0;
+    }
+    uint64_t *keys = malloc((size_t)room * sizeof(uint64_t));
+    if (!keys) { free(sequence); serve_line("ERROR %llu BAD_REQUEST\n", q->id); return 0; }
+    kv_keys_build(keys, sequence, total, m->c.image_token,
+                  image_here ? kv_image_key(kv_image_hash(g_pending.patches, g_pending.bytes,
+                                                          g_pending.grid_h, g_pending.grid_w))
+                             : KV_IMAGE_KEY_NONE);
 
     const double started = now_s();
     const double s_attn = m->t_attn, s_ffn = m->t_ffn, s_disk = m->t_disk, s_head = m->t_head;
@@ -3625,7 +3661,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * e ne ha almeno una in piu': lo stato ricorrente dei layer KDA non si
      * riavvolge, quindi una divergenza a meta' cache obbliga a rifare. */
     const int cached = slot->session ? slot->session->filled : 0;
-    const int common = slot_shared(slot, sequence, total);
+    const int common = slot_shared(slot, keys, total);
     int shared = 0;
     if (cached > 0 && cached < total && common >= cached)
         shared = cached;
@@ -3646,7 +3682,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * macinare le posizioni che riporta. Si decide prima della fotografia,
      * che cambierebbe lo stato sotto. */
     float *resume = NULL;
-    const int plain = !(g_pending.patches && g_pending.id == q->id) && q->logprobs == 0;
+    const int plain = !image_here && q->logprobs == 0;
     if (plain && cached > 0 && common == total) {
         if (total == cached && slot->tail_logit && slot->tail_len == cached) {
             resume = slot->tail_logit;
@@ -3665,36 +3701,37 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * fallisce: se lo stato vivo e gia il prompt condiviso, il riuso normale
      * scatterebbe lo stesso ma il primo token fresco resterebbe senza
      * predittore, e quindi senza logprob, proprio quello che serve. */
-    int pinned = resume ? 0 : slot_pin_restore(m, slot, sequence, total);
+    int pinned = resume ? 0 : slot_pin_restore(m, slot, sequence, total, common);
     if (pinned > 0) { shared = pinned; why = "pin"; }
     if (shared <= 0) {
         slot_reset(m, slot);
         slot->session = session_open(m, room);
         shared = 0;
     }
-    /* L'immagine annunciata per QUESTA richiesta, se c'e'. Il prefisso in
-     * cache non la riguarda: la torre ha gia' dato i suoi embedding quando
-     * quei token sono stati macinati, e i segnaposto stanno nel prompt. Se il
-     * riuso salta i token immagine, gli embedding da consumare sono quelli
-     * delle posizioni nuove, quindi il riuso si annulla quando c'e' un'immagine
-     * -- costa un prefill in piu' ed e' l'unica cosa che non puo' sbagliare. */
-    float *vision = NULL;
-    int n_vision = 0;
-    if (g_pending.patches && g_pending.id == q->id) {
-        if (!m->has_vision) {
-            pending_clear();
-            free(sequence);
-            serve_line("ERROR %llu BAD_REQUEST\n", q->id);
-            return 0;
+    /* Gli embedding della torre. I segnaposto dentro il prefisso riusato sono
+     * gia' stati macinati con QUESTA foto -- e' la chiave a dirlo -- quindi
+     * alla torre si chiedono solo le posizioni nuove; se il prefisso le copre
+     * tutte, la torre non gira. Un prefisso che tiene piu' posizioni immagine
+     * di quante la torre ne produca per questa griglia non descrive questa
+     * foto: si riparte da capo, come prima di questa chiave. */
+    float *vision = NULL, *vision_new = NULL;
+    int n_vision = 0, n_new = 0;
+    if (image_here) {
+        int held = kv_keys_images(keys, shared);
+        const int wanted = kv_keys_images(keys, total);
+        if (!(wanted > 0 && held == wanted)) {
+            vision = vision_encode(m, g_pending.patches, g_pending.grid_h,
+                                   g_pending.grid_w, &n_vision);
+            if (held > n_vision) {
+                why = "image";
+                slot_reset(m, slot);
+                slot->session = session_open(m, room);
+                shared = 0;
+                held = 0;
+            }
+            vision_new = vision + (size_t)held * m->vision.config.out_hidden;
+            n_new = n_vision - held;
         }
-        if (shared) {                             /* niente riuso con un'immagine */
-            why = "image";
-            slot_reset(m, slot);
-            slot->session = session_open(m, room);
-            shared = 0;
-        }
-        vision = vision_encode(m, g_pending.patches, g_pending.grid_h,
-                               g_pending.grid_w, &n_vision);
         pending_clear();
     }
 
@@ -3710,7 +3747,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     PrefillWatch watch = { q->id, &ctl, &input_eof };
     float *logits = resume ? resume
                   : forward_prefill(m, slot->session, sequence + shared,
-                                    total - shared, vision, n_vision, 0,
+                                    total - shared, vision_new, n_new, 0,
                                     prefill_should_halt, &watch);
     g_echo_k = 0; g_echo_id = 0;   /* la lettura riguarda il prefill, non la decodifica */
     /* Interrotto a meta' prefill: la sessione ha macinato solo `filled` token,
@@ -3731,7 +3768,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * e una sua copia per ogni corsa, non per ogni token. Spento di
      * default: lo pagherebbe ogni risposta, anche di chi non fa mai Continue. */
     const char *rewind_setting = getenv("GLM53_REWIND");
-    const int keep_blank = q->logprobs == 0 && n_vision == 0 &&
+    const int keep_blank = q->logprobs == 0 && !image_here &&
                            rewind_setting && atoi(rewind_setting);
     int in_blank = 0;
     for (int step = 0; step < budget; step++) {
@@ -3767,6 +3804,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
          * ciclo descrive la posizione `filled`, ed e' quello che il turno dopo
          * riprende se il suo prompt e' questa storia esatta. */
         if (is_stop(next)) break;
+        keys[total] = (uint64_t)(uint32_t)next;
         sequence[total++] = next;
         emitted++;
         char piece[512];
@@ -3804,15 +3842,17 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * Non dopo un turno con un'immagine: il controllo del turno dopo e' sugli
      * id, e gli id dei segnaposto non dicono quale immagine ha fatto queste
      * righe. Una richiesta senza IMAGE e con gli stessi id riprenderebbe da
-     * embedding che non ha mandato. */
+     * embedding che non ha mandato. `image_here`, non `n_vision == 0`: una
+     * foto riusata per intero dal prefisso non fa girare la torre, ma il
+     * turno resta un turno con immagine. */
     free(slot->tail_logit);
-    slot->tail_logit = n_vision == 0 ? logits : NULL;
+    slot->tail_logit = image_here ? NULL : logits;
     slot->tail_len = slot->tail_logit ? session->filled : 0;
     if (!slot->tail_logit) free(logits);
     logits = NULL;
     /* La sessione resta allo slot per il turno dopo, con la sequenza che ha
      * davvero macinato: prompt piu' quello che ha generato. */
-    slot_remember(slot, sequence, total);
+    slot_remember(slot, sequence, keys, total);
     /* Quanto prefisso lo slot ha risparmiato.
      *
      * Su STDERR, non nel protocollo. La specifica dice che un server ignora le
@@ -3864,6 +3904,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         if (n_vision > 0) slot_reset(m, slot);
         serve_line("ERROR %llu CANCELLED\n", q->id);
         free(sequence);
+        free(keys);
         return input_eof ? -1 : 0;
     }
     /* ctl == SERVE_CTL_STOP non esce qui: cade nel DONE qui sotto, che e' il
@@ -3888,6 +3929,7 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     glm53_vk_report(m, "turn");
 #endif
     free(sequence);
+    free(keys);
     return input_eof ? -1 : 0;
 }
 
