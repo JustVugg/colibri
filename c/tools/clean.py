@@ -37,6 +37,7 @@ FILES = [
     "coli_cuda.dll", "coli_cuda.lib", "coli_cuda.exp",
     # hipcc emits an import library, export file and PDB alongside the DLL.
     "coli_hip.dll", "coli_hip.lib", "coli_hip.exp", "coli_hip.pdb",
+    "libcoli_xdna.so",                      # `make xdna-helper` (Linux)
     "deepseek_v4", "deepseek_v4.exe", "deepseek_v4.cflags", "deepseek_v4.cudaflags",
     "deepseek_v41", "deepseek_v41.exe",
     "mimo", "mimo.exe",
@@ -75,8 +76,8 @@ FILES = [
 # tools/ for the ctypes library; build/segment/ and build/ownership/ go as
 # whole directories below.
 ARTIFACT_GLOBS = ["tests/test_*", "tests/bench_*", "tests/fuzz_*",
-                  "tests/*_probe*", "COLI_V4_UNIT_*.o", "*.d", "tests/*.d",
-                  "tools/*.d",
+                  "tests/*_probe*", "tests/xdna_fake_helper*", "COLI_V4_UNIT_*.o",
+                  "*.d", "tests/*.d", "tools/*.d",
                   # helper objects the tests link (#1741), one unit per command
                   "tests/*.o"]
 KEEP_EXT = (".c", ".h", ".cc", ".cpp", ".cu", ".mm", ".py", ".txt", ".json",

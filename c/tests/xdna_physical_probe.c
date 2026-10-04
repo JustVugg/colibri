@@ -1,8 +1,9 @@
 /* W2-N7-I5 -- PHYSICAL qualification of the native XDNA lane.
  *
  * NOT a test gate: it requires an XDNA2 NPU, a working XRT installation, the
- * built coli_xdna.dll and the qualified F3 artifact bytes, none of which a
- * build machine is entitled to assume. It is built and run explicitly.
+ * built helper (coli_xdna.dll, or libcoli_xdna.so on Linux) and the qualified
+ * F3 artifact bytes, none of which a build machine is entitled to assume. It
+ * is built and run explicitly.
  *
  * Every step below is PRODUCTION code -- the production registry, the
  * production integrity check, the production loader, the production weight
@@ -149,7 +150,11 @@ int main(int argc, char **argv){
     }
 
     printf("W2-N7-I5 PHYSICAL XDNA QUALIFICATION\n");
+#ifdef _WIN32
     printf("PID              %lu\n", (unsigned long)GetCurrentProcessId());
+#else
+    printf("PID              %lu\n", (unsigned long)getpid());
+#endif
     printf("ARTIFACT_ROOT    %s\n", root);
     printf("HELPER           %s\n", helper);
     printf("REGISTRY         production (not a test registry)\n");

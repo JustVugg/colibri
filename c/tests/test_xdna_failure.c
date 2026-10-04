@@ -48,9 +48,15 @@ static char g_root[1024], g_helper[1024], g_helper_abi1[1024], g_helper_partial[
 static char g_xclbin[2048], g_insts[2048];
 static char g_xhex[65], g_ihex[65];
 static ColiXdnaArtifact g_test_rows[2];
-static HMODULE g_fake;
 static void (*p_set_fail)(int);
 static void (*p_reset)(void);
+
+/* Extension of the synthetic helpers the Makefile builds beside this test. */
+#ifdef _WIN32
+#define FAKE_EXT ".dll"
+#else
+#define FAKE_EXT ".so"
+#endif
 
 #define POISON (-987654.0f)
 
@@ -145,20 +151,11 @@ static void use_helper(const char *path){
      * becomes "some earlier scenario dispatched". */
     coli_xdna_test_reset_bucket_counters();
     coli_xdna_test_set_helper_path(path);
-    g_fake = NULL; p_set_fail = NULL; p_reset = NULL;
+    p_set_fail = NULL; p_reset = NULL;
     if(coli_xdna_binding() == COLI_XDNA_AVAILABLE){
-        g_fake = GetModuleHandleA(path);
-        if(!g_fake){
-            const char *base = strrchr(path, '\\');
-            const char *fw = strrchr(path, '/');
-            if(fw && (!base || fw > base)) base = fw;
-            g_fake = GetModuleHandleA(base ? base+1 : path);
-        }
-        if(g_fake){
-            p_set_fail = (void(*)(int))(void*)GetProcAddress(g_fake, "fake_set_fail");
-            p_reset    = (void(*)(void))(void*)GetProcAddress(g_fake, "fake_reset");
-            if(p_reset) p_reset();   /* host lane and fake start together */
-        }
+        p_set_fail = (void(*)(int))coli_xdna_test_helper_symbol("fake_set_fail");
+        p_reset    = (void(*)(void))coli_xdna_test_helper_symbol("fake_reset");
+        if(p_reset) p_reset();   /* host lane and fake start together */
     }
 }
 
@@ -200,12 +197,16 @@ int main(int argc, char **argv){
       if(sl) *sl = '\0'; else snprintf(dir,sizeof dir,"."); }
 
     snprintf(g_root, sizeof g_root, "%s/xdna_fail_fixtures", dir);
-    snprintf(g_helper, sizeof g_helper, "%s/xdna_fake_helper.dll", dir);
-    snprintf(g_helper_abi1, sizeof g_helper_abi1, "%s/xdna_fake_helper_abi1.dll", dir);
-    snprintf(g_helper_partial, sizeof g_helper_partial, "%s/xdna_fake_helper_partial.dll", dir);
+    snprintf(g_helper, sizeof g_helper, "%s/xdna_fake_helper" FAKE_EXT, dir);
+    snprintf(g_helper_abi1, sizeof g_helper_abi1, "%s/xdna_fake_helper_abi1" FAKE_EXT, dir);
+    snprintf(g_helper_partial, sizeof g_helper_partial, "%s/xdna_fake_helper_partial" FAKE_EXT, dir);
+#ifdef _WIN32
     { char cmd[1200]; snprintf(cmd,sizeof cmd,"mkdir \"%s\" 2>nul", g_root);
       for(char *p=cmd;*p;p++) if(*p=='/') *p='\\';
       if(system(cmd)){} }
+#else
+    { char cmd[1200]; snprintf(cmd,sizeof cmd,"mkdir -p \"%s\"", g_root); if(system(cmd)){} }
+#endif
     snprintf(g_xclbin, sizeof g_xclbin, "%s/fake.xclbin", g_root);
     snprintf(g_insts,  sizeof g_insts,  "%s/fake_insts.bin", g_root);
     if(!write_blob(g_xclbin, 31u, 4096) || !write_blob(g_insts, 41u, 1024)){
