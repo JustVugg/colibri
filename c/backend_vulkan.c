@@ -677,7 +677,8 @@ static VkShaderModule load_spv(VkDevice dev, const char *path) {
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
 
-/* qmatmul, qmatmul_gate_up and attention_absorb read gl_SubgroupSize at runtime and
+/* qmatmul, qmatmul_gate_up and attention_absorb (and the chain's chain_gemv, chain_hgemv,
+ * chain_mla and chain_kvs: vk_chain.c, through ColiVkCore) read gl_SubgroupSize at runtime and
  * assume full subgroups. ALLOW_VARYING makes the driver report the width the subgroup
  * operations actually use; the reason is MoltenVK 1.4.2, which otherwise reports 32 on
  * 64-wide AMD GCN. The flags go to every device with the extension and both features
@@ -4555,6 +4556,7 @@ int coli_vk_core(ColiVkCore *o) {
     }
     o->gemm_min_s = G.gemm_min_s; o->gemm_min_so = G.gemm_min_so;
     o->integrated = coli_vk_device_integrated(); o->shares_ram = coli_vk_device_shares_ram();
+    o->vary_sg = G.vary_sg;
     return 1;
 }
 int coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *o) {
