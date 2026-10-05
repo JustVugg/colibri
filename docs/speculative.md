@@ -91,6 +91,17 @@ standing rows' streams, each with the token that followed it.
 `auto` to let the gate pick 0 to 3 per verify. The default is 2, the depth measured
 fastest (below). `Q38_MTP_DRAFTS=1` is the one-draft verify that came before.
 
+## The MTP head's drafts (qwen36)
+
+`Q36_MTP=<gguf>` loads Qwen3.6's MTP block from a GGUF that carries it (the converted
+containers do not; see [qwen36.md](qwen36.md#the-mtp-head-q36_mtp)). It drafts one
+token: the head row at the position the picked token is about to take, from the
+model's row before (after the final norm) and the picked token. Every forward feeds the
+head the rows it computed; a fed row stores only its K/V row, since nothing else of it
+is read later. When both sources have a proposal the gate takes the one it values
+more; the verify, the rollback and the report are prompt lookup's, the gate keeps the
+two sources' acceptance apart (`[qwen36 mtp]` line).
+
 ## Prompt lookup
 
 Prompt lookup (on by default; `COLI_LOOKUP=0` turns it off) looks for the longest n-gram of

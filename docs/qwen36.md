@@ -120,6 +120,48 @@ CUDA tier, `CACHE_ROUTE` and a qpack container, whose results depend on what is
 resident. On a code edit, Qwen3.6-35B-A3B decoded 7.90 tok/s with lookup against 7.42 without (1.56 tokens per forward); on a chat prompt the gate declined every proposal and the speed was unchanged. How it works, the gate, the settings and the tests:
 [speculative.md](speculative.md).
 
+## The MTP head (`Q36_MTP`)
+
+Qwen3.6's checkpoints carry one trained MTP block that predicts the token after next;
+the converted containers do not. `Q36_MTP=<gguf>` loads it from a GGUF that holds it
+(llama.cpp's `nextn` layer: `mtp-Qwen3.6-35B-A3B-Q4_0.gguf` of
+ggml-org/Qwen3.6-35B-A3B-GGUF, 0.4 s), and the speculative step drafts one token from
+it beside prompt lookup; the gate picks the source by its measured acceptance
+([speculative.md](speculative.md#the-mtp-heads-drafts-qwen36)). One head row at
+position p (llama.cpp's `graph_mtp` for qwen35moe):
+
+    x  = eh_proj([enorm(embed(tok_p)), hnorm(h_{p-1})])      h: the model's row after the final norm
+    x += attention(attn_norm(x))                              gated attention, the head's own KV rows
+    x += moe(post_attention_norm(x))                          top-8 of 256 experts + the gated shared expert
+    logits_{p+1} = lm_head(shared_head_norm(x))               the model's lm_head
+
+Every forward feeds the head the rows it computed (prompt, decode, verify, served
+turns): a fed row only stores its K/V row, the one thing later rows read of it; the
+draft row runs whole. The head runs on the CPU in int4 (`Q36_MTP_BITS=8`: int8), its
+lm_head is the chain's on the device. A rejected draft moves where the head
+continues; its stale K/V rows are overwritten. The output is that of plain decoding,
+greedy or sampled: on Qwen3.6 the generated text was byte-identical with and without
+the head.
+
+Measured on a Radeon 8060S (Strix Halo, RADV), Qwen3.6-35B-A3B int4 gs64, tier 24 GB,
+chain on, a 256-token answer:
+
+| trunk | without the head | with the head | acceptance |
+|---|---|---|---|
+| int8 (default) | 37.6 tok/s | 44.4 tok/s | 90.6% |
+| int4 (`COLI_DENSE_BITS=4`) | 45.6 tok/s | 52.0 tok/s | 89.0% |
+
+`Q36_MTP_DRAFTS` (1 by default; 2, 3 or `auto`) drafts deeper: each further draft runs
+the head on its own state of the row before (after its norm), the model's being known
+only after the verify. On this box the deeper drafts raised the tokens per forward
+(1.78, 2.07, 2.48 at one, two, three) but cost more than they returned (65.3, 63.0,
+63.0 tok/s with the int4 trunk): a head row on the CPU and a verify row each.
+
+A verify of two rows costs 1.46-1.52 decode steps here: its decode GEMVs read each
+weight once for both rows (`chain_gemv.comp`, up to four rows a workgroup, each row
+with a decode step's bits), the routed experts of the two rows are mostly different
+ones.
+
 ## The expert kernel
 
 Routed experts run through `c/expert_ffn.h`, a header shared with the other
