@@ -690,10 +690,13 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
         int nq = ti->rowWords / 4, lpr = 4;
         if (e && *e) lpr = atoi(e); else while (lpr < 64 && lpr * 16 < nq) lpr *= 2;
         if (lpr < 1) lpr = 1;
-        struct { int fmt, S, I, O, rowWords, gs, lpr; } pc7 = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, lpr};
+        /* a verify's rows (S <= 4) in one workgroup each weight step is loaded once for;
+         * a decode step is nr = 1 through the same code, so the bits agree */
+        int nx4 = (ti->rowWords / 4) * per / 4, nr = S <= 4 && S * nx4 <= K.gemv4_xs ? S : 1;
+        struct { int fmt, S, I, O, rowWords, gs, lpr, nr; } pc8 = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, lpr, nr};
         int rows_wg = 256 / lpr;   /* at least, at subgroups of 64 */
         int wg = (ti->O + rows_wg - 1) / rows_wg; if (wg > 1024) wg = 1024;
-        ok = record(K.gemv4, bd, 4, &pc7, sizeof pc7, (uint32_t)wg, (uint32_t)S, 1);
+        ok = record(K.gemv4, bd, 4, &pc8, sizeof pc8, (uint32_t)wg, (uint32_t)((S + nr - 1) / nr), 1);
     }
     else if (path >= 0)
         ok = record(K.gemm[path], bd, 4, &pc, sizeof pc, (uint32_t)((ti->O + K.gemm_bm[path] - 1) / K.gemm_bm[path]),

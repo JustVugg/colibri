@@ -2336,6 +2336,37 @@ static void bench_gemv(void) {
     }
 }
 
+/* A speculative verify's rows through the decode GEMV: each of S rows (2..4, one
+ * workgroup) must carry the bits a one-row call gives that row. */
+static void test_gemv_rows(int fmt, int S, int I, int O) {
+    float *x = fvec((size_t)S * I, 1.f);
+    void *codes = NULL; float *sc = NULL; int gs = 0;
+    if (fmt == 1) {
+        int8_t *q = malloc((size_t)O * I); sc = malloc(O * sizeof *sc);
+        for (size_t i = 0; i < (size_t)O * I; i++) q[i] = (int8_t)((int)(rnd() % 255) - 127);
+        for (int o = 0; o < O; o++) sc[o] = 0.01f + (rnd() % 100) / 5000.f;
+        codes = q;
+    } else {
+        gs = 64; int ng = I / 64;
+        uint8_t *q = malloc((size_t)O * (I / 2)); sc = malloc((size_t)O * ng * sizeof *sc);
+        for (size_t i = 0; i < (size_t)O * (I / 2); i++) q[i] = (uint8_t)rnd();
+        for (int i = 0; i < O * ng; i++) sc[i] = 0.02f + (rnd() % 100) / 3000.f;
+        codes = q;
+    }
+    ColiVkTensor *t = NULL;
+    if (!coli_vk_tensor_ensure(&t, codes, sc, fmt, I, O, gs)) { CHECK(0, "gemv rows fmt %d: upload", fmt); return; }
+    VkcBuf *xb = vkc_buf((size_t)S * I * 4, VKC_DEV), *ya = vkc_buf((size_t)S * O * 4, VKC_DOWN), *y1 = vkc_buf((size_t)S * O * 4, VKC_DOWN);
+    vkc_gemm_rows(0);   /* every row on the GEMV, as a verify's */
+    vkc_begin(); vkc_write(xb, 0, x, (size_t)S * I * 4);
+    int ok = vkc_matmul(t, xb, 0, ya, 0, S);
+    for (int s = 0; s < S; s++) ok = ok && vkc_matmul(t, xb, (size_t)s * I, y1, (size_t)s * O, 1);
+    vkc_submit(1);
+    vkc_gemm_rows(-1);
+    int same = ok && !memcmp(vkc_ptr(ya), vkc_ptr(y1), (size_t)S * O * 4);
+    CHECK(same, "gemv rows fmt %d S %d I %d O %d: a row's bits depend on the rows beside it", fmt, S, I, O);
+    vkc_free(xb); vkc_free(ya); vkc_free(y1); coli_vk_tensor_free(t);
+    free(x); free(codes); free(sc);
+}
 int main(int argc, char **argv) {
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
@@ -2353,6 +2384,10 @@ int main(int argc, char **argv) {
     printf("matmul done\n");
     test_norm(VKC_NORM_ADD1, 0); test_norm(VKC_NORM_ADD1, 1); test_norm(0, 0); test_norm(VKC_NORM_NOW, 1); test_norm(VKC_NORM_L2 | VKC_NORM_NOW, 0);
     printf("norm done\n");
+    for (int k = 0; k < 2; k++) {   /* a verify's rows: the decode step's bits each */
+        int f = k ? 4 : 1;
+        test_gemv_rows(f, 2, 2048, 512); test_gemv_rows(f, 3, 4096, 256); test_gemv_rows(f, 4, 2048, 300);
+    }
     test_rope();
     test_chunk_rows();
     test_attn(1, 0, 16, 0); test_attn(1, 140, 32, 0); test_attn(5, 200, 64, 0); test_attn(6, 9, 256, 1); test_attn(130, 3, 24, 0);
