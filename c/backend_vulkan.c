@@ -345,6 +345,7 @@ static struct {
     size_t buf_align;            /* what a storage buffer's memory requirements align to */
     uint32_t memtype_dev;        /* DEVICE_LOCAL, for scratch only the device touches */
     char spv_path[1024];         /* the main shader, its siblings are found beside it */
+    int vary_sg;                 /* subgroup size control is on: see sg_flags */
 } G;
 
 struct PC { int fmt, S, I, O, rowWords, gs; };
@@ -676,10 +677,50 @@ static VkShaderModule load_spv(VkDevice dev, const char *path) {
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
 
+/* qmatmul, qmatmul_gate_up and attention_absorb (and the chain's chain_gemv, chain_hgemv,
+ * chain_mla and chain_kvs: vk_chain.c, through ColiVkCore) read gl_SubgroupSize at runtime and
+ * assume full subgroups. ALLOW_VARYING makes the driver report the width the subgroup
+ * operations actually use; the reason is MoltenVK 1.4.2, which otherwise reports 32 on
+ * 64-wide AMD GCN. The flags go to every device with the extension and both features
+ * (core in 1.3), where some drivers then pick the width (AMD's own, Intel, possibly
+ * RADV on RDNA): summation order and speed may change, results not, since the shaders
+ * take any width that divides 256 and the spec keeps it uniform within a dispatch. */
+static VkPipelineShaderStageCreateFlags sg_flags(int vary) {
+#ifdef VK_EXT_subgroup_size_control
+    if (vary) return VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT_EXT |
+                     VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
+#endif
+    (void)vary;
+    return 0;
+}
+#ifdef VK_EXT_subgroup_size_control
+/* What sg_flags needs: the extension with subgroupSizeControl and computeFullSubgroups. */
+static int sg_vary_ok(VkPhysicalDevice phys) {
+    VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(phys, &pp);
+    if (pp.apiVersion < VK_API_VERSION_1_1) return 0;
+    uint32_t ne = 0; int has = 0;
+    vkEnumerateDeviceExtensionProperties(phys, NULL, &ne, NULL);
+    VkExtensionProperties *ep = ne ? malloc(ne * sizeof(*ep)) : NULL;
+    if (ep) {
+        vkEnumerateDeviceExtensionProperties(phys, NULL, &ne, ep);
+        for (uint32_t i = 0; i < ne; i++)
+            if (!strcmp(ep[i].extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) has = 1;
+        free(ep);
+    }
+    if (!has) return 0;
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT f = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT};
+    VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f};
+    vkGetPhysicalDeviceFeatures2(phys, &f2);
+    return f.subgroupSizeControl && f.computeFullSubgroups;
+}
+#endif
+
 /* Build a compute pipeline + descriptor pool/set for nbind storage buffers with a
  * pc_size-byte push constant. Used by the 4-binding matmul, 6-binding gate_up and
  * 7-binding absorb attention pipelines. */
 static int build_pipeline(VkDevice dev, int nbind, size_t pc_size, VkShaderModule shader,
+                          VkPipelineShaderStageCreateFlags flags,
                           VkDescriptorSetLayout *dsl, VkPipelineLayout *plyt, VkPipeline *pipe,
                           VkDescriptorPool *dpool, VkDescriptorSet *dset) {
     VkDescriptorSetLayoutBinding b[8];
@@ -695,7 +736,7 @@ static int build_pipeline(VkDevice dev, int nbind, size_t pc_size, VkShaderModul
     VKCHECK(vkCreatePipelineLayout(dev, &pli, NULL, plyt), "pipelineLayout");
     VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main"},
+                  .flags = flags, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main"},
         .layout = *plyt};
     VKCHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, NULL, pipe), "pipeline");
     VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = (uint32_t)nbind};
@@ -991,6 +1032,13 @@ int coli_vk_init(const char *spv_path) {
     v12f.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES; v12f.pNext = &sscf;
     v12f.shaderFloat16 = VK_TRUE; v12f.vulkanMemoryModel = VK_TRUE;
 #endif
+    /* Subgroup size control for the subgroup shaders (sg_flags), whenever the device has it */
+#ifdef VK_EXT_subgroup_size_control
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sgv = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
+        .subgroupSizeControl = VK_TRUE, .computeFullSubgroups = VK_TRUE};
+    G.vary_sg = sg_vary_ok(G.phys);
+#endif
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = nqi, .pQueueCreateInfos = qis};
 #ifdef VK_EXT_memory_priority
@@ -1007,6 +1055,12 @@ int coli_vk_init(const char *spv_path) {
      * (COLI_VK_TEST_HOSTMEM), see docs/vulkan.md on integrated GPUs */
     if (G.has_hostmem) dext[ndext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
 #endif
+#ifdef VK_EXT_subgroup_size_control
+    if (G.vary_sg) {   /* last in both lists, so the retry below can take it off again */
+        dext[ndext++] = VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME;
+        sgv.pNext = (void *)di.pNext; di.pNext = &sgv;
+    }
+#endif
     di.enabledExtensionCount = ndext; di.ppEnabledExtensionNames = ndext ? dext : NULL;
     G.prio = 0.75f;                              /* default class: dense/resident weights */
 #ifdef VK_KHR_cooperative_matrix
@@ -1015,14 +1069,26 @@ int coli_vk_init(const char *spv_path) {
         const char *cext[8]; uint32_t nc = 0;
         for (uint32_t i = 0; i < ndext; i++) cext[nc++] = dext[i];
         cext[nc++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
-        cext[nc++] = VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME;
+        if (G.vary_sg) v12f.pNext = &cmf;   /* di has subgroup size control already (has_coop implies it) */
+        else cext[nc++] = VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME;
         cmf.pNext = (void *)di.pNext; dc.pNext = &v12f;
         dc.enabledExtensionCount = nc; dc.ppEnabledExtensionNames = cext;
         if (vkCreateDevice(G.phys, &dc, NULL, &G.dev) != VK_SUCCESS) { G.has_coop = 0; G.dev = VK_NULL_HANDLE; }
     }
     if (!G.dev)
 #endif
-    VKCHECK(vkCreateDevice(G.phys, &di, NULL, &G.dev), "vkCreateDevice");
+    {
+        VkResult dr = vkCreateDevice(G.phys, &di, NULL, &G.dev);
+#ifdef VK_EXT_subgroup_size_control
+        if (dr != VK_SUCCESS && G.vary_sg) {   /* likewise a device that refuses subgroup size control */
+            fprintf(stderr, "[VK] vkCreateDevice with subgroup size control failed: %d, retrying without it\n", dr);
+            G.vary_sg = 0;
+            di.pNext = sgv.pNext; di.enabledExtensionCount = --ndext; di.ppEnabledExtensionNames = ndext ? dext : NULL;
+            dr = vkCreateDevice(G.phys, &di, NULL, &G.dev);
+        }
+#endif
+        VKCHECK(dr, "vkCreateDevice");
+    }
     vk_mem_device(0, G.phys, G.dev);   /* the device memory books, and COLI_VK_DEVICE_CAP_MB */
     vk_pool_blocks(0);
     vkGetDeviceQueue(G.dev, G.qfam, 0, &G.queue);
@@ -1111,7 +1177,8 @@ int coli_vk_init(const char *spv_path) {
     G.shader = load_spv(G.dev, spv_path);
     if (!G.shader) return 0;
     snprintf(G.spv_path, sizeof G.spv_path, "%s", spv_path);
-    if (!build_pipeline(G.dev, 4, sizeof(struct PC), G.shader, &G.dsl, &G.plyt, &G.pipe, &G.dpool, &G.dset)) return 0;
+    if (!build_pipeline(G.dev, 4, sizeof(struct PC), G.shader, sg_flags(G.vary_sg),
+                        &G.dsl, &G.plyt, &G.pipe, &G.dpool, &G.dset)) return 0;
 
     /* Optional tiled GEMMs: an absent shader or a tile the device cannot hold leaves
      * that slot empty; without the fp32 one every S stays on the GEMV. The cooperative-
@@ -1172,7 +1239,8 @@ int coli_vk_init(const char *spv_path) {
      * (single-matmul path keeps working). */
     char gu_path[512]; derive_sibling(spv_path, "_gate_up.spv", gu_path, sizeof(gu_path));
     G.shader_gu = load_spv(G.dev, gu_path);
-    if (G.shader_gu && !build_pipeline(G.dev, 6, sizeof(struct PCGU), G.shader_gu, &G.dsl_gu, &G.plyt_gu, &G.pipe_gu, &G.dpool_gu, &G.dset_gu))
+    if (G.shader_gu && !build_pipeline(G.dev, 6, sizeof(struct PCGU), G.shader_gu, sg_flags(G.vary_sg),
+                                       &G.dsl_gu, &G.plyt_gu, &G.pipe_gu, &G.dpool_gu, &G.dset_gu))
         return 0;
 
     /* Optional MLA absorb attention pipeline (same directory as the main shader). */
@@ -1182,7 +1250,8 @@ int coli_vk_init(const char *spv_path) {
     G.shader_nrm = load_spv(G.dev, nrm_path);
     if (G.shader_nrm) {
         VkDescriptorPool np; VkDescriptorSet ns;
-        if (!build_pipeline(G.dev, 3, sizeof(struct PCN), G.shader_nrm, &G.dsl_nrm, &G.plyt_nrm, &G.pipe_nrm, &np, &ns))
+        if (!build_pipeline(G.dev, 3, sizeof(struct PCN), G.shader_nrm, 0,
+                            &G.dsl_nrm, &G.plyt_nrm, &G.pipe_nrm, &np, &ns))
             return 0;
         G.dset_nrm = ns;
         /* one extra 4-binding matmul set for the chain's 3rd matmul (dset+dset_pair serve 1+2) */
@@ -1196,7 +1265,8 @@ int coli_vk_init(const char *spv_path) {
     }
     char att_path[512]; derive_dir_file(spv_path, "attention_absorb.spv", att_path, sizeof(att_path));
     G.shader_att = load_spv(G.dev, att_path);
-    if (G.shader_att && !build_pipeline(G.dev, 7, sizeof(struct PCAttn), G.shader_att, &G.dsl_att, &G.plyt_att, &G.pipe_att, &G.dpool_att, &G.dset_att))
+    if (G.shader_att && !build_pipeline(G.dev, 7, sizeof(struct PCAttn), G.shader_att, sg_flags(G.vary_sg),
+                                        &G.dsl_att, &G.plyt_att, &G.pipe_att, &G.dpool_att, &G.dset_att))
         return 0;
 
     VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -2385,7 +2455,7 @@ static struct {
     VkDescriptorPool pool; VkDescriptorSet gu[64], dn[64]; int nsets;
     Scratch x, h, y;
     int inflight; size_t pending_yb;
-    int has_budget, has_hostmem;
+    int has_budget, has_hostmem, vary_sg;
     /* what the expert batch's context on this device needs (xb_bind) */
     uint32_t memtype_dev, ts_bits; float ts_period;
     size_t ssbo_align, ssbo_range, buf_align;
@@ -2470,7 +2540,7 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
     float qprio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = G2.qfam, .queueCount = 1, .pQueuePriorities = &qprio};
-    const char *dext[2]; uint32_t ndext = 0;
+    const char *dext[3]; uint32_t ndext = 0;
     {
         uint32_t ne = 0;
         vkEnumerateDeviceExtensionProperties(G2.phys, NULL, &ne, NULL);
@@ -2494,10 +2564,29 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
         if (G2.has_hostmem) dext[ndext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
 #endif
     }
+#ifdef VK_EXT_subgroup_size_control
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sgv = {   /* as on device 0 (sg_flags); last, for the retry */
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
+        .subgroupSizeControl = VK_TRUE, .computeFullSubgroups = VK_TRUE};
+    G2.vary_sg = sg_vary_ok(G2.phys);
+    if (G2.vary_sg) dext[ndext++] = VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME;
+#endif
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
         .enabledExtensionCount = ndext, .ppEnabledExtensionNames = ndext ? dext : NULL};
-    VKCHECK(vkCreateDevice(G2.phys, &di, NULL, &G2.dev), "d2 vkCreateDevice");
+#ifdef VK_EXT_subgroup_size_control
+    if (G2.vary_sg) di.pNext = &sgv;
+#endif
+    VkResult dr = vkCreateDevice(G2.phys, &di, NULL, &G2.dev);
+#ifdef VK_EXT_subgroup_size_control
+    if (dr != VK_SUCCESS && G2.vary_sg) {   /* a device that refuses it still comes up without it */
+        fprintf(stderr, "[VK] dev2: vkCreateDevice with subgroup size control failed: %d, retrying without it\n", dr);
+        G2.vary_sg = 0;
+        di.pNext = NULL; di.enabledExtensionCount = --ndext; di.ppEnabledExtensionNames = ndext ? dext : NULL;
+        dr = vkCreateDevice(G2.phys, &di, NULL, &G2.dev);
+    }
+#endif
+    VKCHECK(dr, "d2 vkCreateDevice");
     vk_mem_device(1, G2.phys, G2.dev);
     vk_pool_blocks(1);
     vkGetDeviceQueue(G2.dev, G2.qfam, 0, &G2.queue);
@@ -2543,8 +2632,10 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
     G2.sh_gu = load_spv(G2.dev, gu_path);
     if (!G2.sh_gu) { fprintf(stderr, "[VK] dev2: gate_up shader required for the tier\n"); return 0; }
     VkDescriptorPool dp; VkDescriptorSet ds;   /* build_pipeline's singleton set: unused here */
-    if (!build_pipeline(G2.dev, 4, sizeof(struct PC), G2.sh_qmm, &G2.dsl, &G2.plyt, &G2.pipe, &dp, &ds)) return 0;
-    if (!build_pipeline(G2.dev, 6, sizeof(struct PCGU), G2.sh_gu, &G2.dsl_gu, &G2.plyt_gu, &G2.pipe_gu, &dp, &ds)) return 0;
+    if (!build_pipeline(G2.dev, 4, sizeof(struct PC), G2.sh_qmm, sg_flags(G2.vary_sg),
+                        &G2.dsl, &G2.plyt, &G2.pipe, &dp, &ds)) return 0;
+    if (!build_pipeline(G2.dev, 6, sizeof(struct PCGU), G2.sh_gu, sg_flags(G2.vary_sg),
+                        &G2.dsl_gu, &G2.plyt_gu, &G2.pipe_gu, &dp, &ds)) return 0;
     VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = G2.qfam};
     VKCHECK(vkCreateCommandPool(G2.dev, &cpci, NULL, &G2.cpool), "d2 cmdPool");
@@ -3524,10 +3615,11 @@ static int xb_layout(XbCtx *X, int nbind, unsigned dynmask, size_t pc, VkDescrip
     VKCHECK(vkCreatePipelineLayout(X->dev, &pi, NULL, pl), "xb pipeline layout");
     return 1;
 }
-static int xb_pipeline(XbCtx *X, VkShaderModule sh, VkPipelineLayout pl, const VkSpecializationInfo *si, VkPipeline *pipe) {
+static int xb_pipeline(XbCtx *X, VkShaderModule sh, VkPipelineShaderStageCreateFlags flags, VkPipelineLayout pl,
+                       const VkSpecializationInfo *si, VkPipeline *pipe) {
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                  .module = sh, .pName = "main", .pSpecializationInfo = si}, .layout = pl};
+                  .flags = flags, .module = sh, .pName = "main", .pSpecializationInfo = si}, .layout = pl};
     VKCHECK(vkCreateComputePipelines(X->dev, VK_NULL_HANDLE, 1, &ci, NULL, pipe), "xb pipeline");
     return 1;
 }
@@ -3604,7 +3696,7 @@ static int xb_v4_init(XbCtx *X) {
     derive_dir_file(X->spv, "expert_act_v4.spv", path, sizeof path);
     if (!(X->sh_v4 = load_spv(X->dev, path))) return 0;
     if (!xb_layout(X, 2, 3u, sizeof(struct PCV4), &X->dsl_v4, &X->pl_v4) ||
-        !xb_pipeline(X, X->sh_v4, X->pl_v4, NULL, &X->p_v4)) return 0;
+        !xb_pipeline(X, X->sh_v4, 0, X->pl_v4, NULL, &X->p_v4)) return 0;
     VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 2};
     VkDescriptorPoolCreateInfo dp = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
@@ -3672,12 +3764,13 @@ static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a,
     X->sh_mv = load_spv(X->dev, X->spv);
     X->sh_mm = X->gemm_shader ? load_spv(X->dev, mm_path) : VK_NULL_HANDLE;
     if (!X->sh_gu || !X->sh_mv || (!X->d && X->gemm_shader && !X->sh_mm)) return 0;   /* the second device: GEMVs only */
-    if (!xb_pipeline(X, X->sh_gu, X->pl6, NULL, &X->p_gu) || !xb_pipeline(X, X->sh_mv, X->pl4, NULL, &X->p_mv)) return 0;
+    VkPipelineShaderStageCreateFlags sg = sg_flags(X->d ? G2.vary_sg : G.vary_sg);   /* as the device's own GEMVs */
+    if (!xb_pipeline(X, X->sh_gu, sg, X->pl6, NULL, &X->p_gu) || !xb_pipeline(X, X->sh_mv, sg, X->pl4, NULL, &X->p_mv)) return 0;
     /* the GEMM route: the backend's tiles, and expert_act.spv beside the main shader */
     char act_path[1100];
     derive_dir_file(X->spv, "expert_act.spv", act_path, sizeof act_path);
     X->sh_act = X->sh_mm && X->gemm_has[0] ? load_spv(X->dev, act_path) : VK_NULL_HANDLE;
-    if (X->sh_act && xb_pipeline(X, X->sh_act, X->pl3, NULL, &X->p_act)) {
+    if (X->sh_act && xb_pipeline(X, X->sh_act, 0, X->pl3, NULL, &X->p_act)) {
         for (int k = 0; k < VK_GEMM_SLOTS; k++) {
             if (!X->gemm_has[k]) continue;
             VkGemmTile t = X->gemm_t[k];
@@ -3685,7 +3778,7 @@ static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a,
             VkSpecializationMapEntry me[7];
             for (int i = 0; i < 7; i++) me[i] = (VkSpecializationMapEntry){(uint32_t)i, (uint32_t)(i * 4), 4};
             VkSpecializationInfo si = {7, me, sizeof(sv), sv};
-            if (!xb_pipeline(X, X->sh_mm, X->pl4, &si, &X->p_mm[k])) X->p_mm[k] = VK_NULL_HANDLE;
+            if (!xb_pipeline(X, X->sh_mm, 0, X->pl4, &si, &X->p_mm[k])) X->p_mm[k] = VK_NULL_HANDLE;
         }
     }
     const char *e = getenv("COLI_VK_TIER_GEMM_ROWS");
@@ -4463,6 +4556,7 @@ int coli_vk_core(ColiVkCore *o) {
     }
     o->gemm_min_s = G.gemm_min_s; o->gemm_min_so = G.gemm_min_so;
     o->integrated = coli_vk_device_integrated(); o->shares_ram = coli_vk_device_shares_ram();
+    o->vary_sg = G.vary_sg;
     return 1;
 }
 int coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *o) {

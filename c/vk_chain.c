@@ -253,10 +253,20 @@ static VkShaderModule load_module(const char *dir_spv, const char *file) {
     if (!m) fprintf(stderr, "[VK] chain: cannot load %s\n", path);
     return m;
 }
-static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
+/* The backend's flags for shaders that read gl_SubgroupSize (qmatmul, chain_gemv,
+ * chain_hgemv, chain_mla, chain_kvs): the width the subgroup operations really use,
+ * whenever the device came up with subgroup size control (see sg_flags there). */
+static VkPipelineShaderStageCreateFlags sg_flags(void) {
+#ifdef VK_EXT_subgroup_size_control
+    if (K.core.vary_sg) return VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT_EXT |
+                               VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
+#endif
+    return 0;
+}
+static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si, VkPipelineShaderStageCreateFlags flags) {
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                  .module = m, .pName = "main", .pSpecializationInfo = si}, .layout = K.pl};
+                  .flags = flags, .module = m, .pName = "main", .pSpecializationInfo = si}, .layout = K.pl};
     VkPipeline p = VK_NULL_HANDLE;
     if (vkCreateComputePipelines(K.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
     return p;
@@ -282,7 +292,7 @@ int vkc_init(void) {
     if (vkCreatePipelineLayout(K.dev, &pi, NULL, &K.pl) != VK_SUCCESS) return 0;
     for (int i = 0; i < P_NPIPE; i++) {
         K.mod[i] = load_module(K.core.spv_path, pipe_file[i]);
-        if (!K.mod[i] || !(K.pipe[i] = make_pipe(K.mod[i], NULL))) {
+        if (!K.mod[i] || !(K.pipe[i] = make_pipe(K.mod[i], NULL, i == P_GEMV ? sg_flags() : 0))) {
             fprintf(stderr, "[VK] chain: shader %s unavailable, the chain stays off\n", pipe_file[i]);
             return 0;
         }
@@ -300,7 +310,7 @@ int vkc_init(void) {
             int32_t v = xs;
             VkSpecializationMapEntry me = {0, 0, 4};
             VkSpecializationInfo si = {1, &me, 4, &v};
-            if ((K.gemv4 = make_pipe(K.mod_gemv4, &si))) K.gemv4_xs = xs;
+            if ((K.gemv4 = make_pipe(K.mod_gemv4, &si, sg_flags()))) K.gemv4_xs = xs;
         }
     }
     /* the MLA, KDA and mHC shaders, optional: without one only its ops decline */
@@ -314,7 +324,8 @@ int vkc_init(void) {
             f = fopen(path, "rb");
         }
         if (f) fclose(f);
-        if (f && (K.mmod[i] = load_module(K.core.spv_path, mla_file[i]))) K.mpipe[i] = make_pipe(K.mmod[i], NULL);
+        if (f && (K.mmod[i] = load_module(K.core.spv_path, mla_file[i])))
+            K.mpipe[i] = make_pipe(K.mmod[i], NULL, i == PM_MLA || i == PM_HGEMV ? sg_flags() : 0);
     }
     K.mla_ok = K.mpipe[PM_MLA] && K.mpipe[PM_HGEMV] && K.mpipe[PM_DSA];
     dsv4_init();
@@ -326,7 +337,7 @@ int vkc_init(void) {
         VkSpecializationMapEntry me[7];
         for (int i = 0; i < 7; i++) me[i] = (VkSpecializationMapEntry){(uint32_t)i, (uint32_t)(i * 4), 4};
         VkSpecializationInfo si = {7, me, sizeof sv, sv};
-        if (!(K.gemm[k] = make_pipe(K.mod_gemm, &si))) break;
+        if (!(K.gemm[k] = make_pipe(K.mod_gemm, &si, 0))) break;
         K.gemm_bm[k] = t[0]; K.gemm_bn[k] = t[1]; K.ngemm = k + 1;
     }
     VkCommandPoolCreateInfo cp = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -761,7 +772,7 @@ static VkPipeline kab_pipe(void) {
         int32_t v = bc;
         VkSpecializationMapEntry me = {0, 0, 4};
         VkSpecializationInfo si = {1, &me, 4, &v};
-        if ((KAB.pipe = make_pipe(KAB.mod, &si))) KAB.bc = bc;
+        if ((KAB.pipe = make_pipe(KAB.mod, &si, 0))) KAB.bc = bc;
     }
     return KAB.pipe;
 }
@@ -844,7 +855,7 @@ static VkPipeline dnrec_pipe(int KD) {
     int32_t kd = KD;
     VkSpecializationMapEntry me = {0, 0, 4};
     VkSpecializationInfo si = {1, &me, 4, &kd};
-    VkPipeline p = make_pipe(K.mod_dnrec, &si);
+    VkPipeline p = make_pipe(K.mod_dnrec, &si, 0);
     if (!p) return VK_NULL_HANDLE;
     K.dnrec[K.ndnrec] = p; K.dnrec_kd[K.ndnrec++] = KD;
     return p;
@@ -995,7 +1006,7 @@ static VkPipeline kda_pipe(int KD) {
     int32_t kd = KD;
     VkSpecializationMapEntry me = {0, 0, 4};
     VkSpecializationInfo si = {1, &me, 4, &kd};
-    VkPipeline p = make_pipe(K.mmod[PM_KDA], &si);
+    VkPipeline p = make_pipe(K.mmod[PM_KDA], &si, 0);
     if (!p) return VK_NULL_HANDLE;
     K.kdarec[K.nkdarec] = p; K.kdarec_kd[K.nkdarec++] = KD;
     return p;
@@ -1133,7 +1144,7 @@ static VkPipeline kx_pipe(int k) {
     static const char *const file[2] = {"chain_sconv.spv", "chain_relattn.spv"};
     if (KX.pipe[k] || KX.tried[k] || !vkc_ready()) return KX.pipe[k];
     KX.tried[k] = 1;
-    if ((KX.mod[k] = load_module(K.core.spv_path, file[k]))) KX.pipe[k] = make_pipe(KX.mod[k], NULL);
+    if ((KX.mod[k] = load_module(K.core.spv_path, file[k]))) KX.pipe[k] = make_pipe(KX.mod[k], NULL, 0);
     return KX.pipe[k];
 }
 static void kx_shutdown(void) {
@@ -1183,7 +1194,7 @@ static struct { VkShaderModule mod; VkPipeline pipe; int tried; } KE;
 static VkPipeline ke_pipe(void) {
     if (KE.pipe || KE.tried || !vkc_ready()) return KE.pipe;
     KE.tried = 1;
-    if ((KE.mod = load_module(K.core.spv_path, "chain_enc.spv"))) KE.pipe = make_pipe(KE.mod, NULL);
+    if ((KE.mod = load_module(K.core.spv_path, "chain_enc.spv"))) KE.pipe = make_pipe(KE.mod, NULL, 0);
     return KE.pipe;
 }
 static void ke_shutdown(void) {
@@ -1509,7 +1520,7 @@ static void dsv4_init(void) {
     FILE *f = fopen(path, "rb");
     if (!f) return;
     fclose(f);
-    if ((D4.mod = load_module(K.core.spv_path, file))) D4.pipe = make_pipe(D4.mod, NULL);
+    if ((D4.mod = load_module(K.core.spv_path, file))) D4.pipe = make_pipe(D4.mod, NULL, 0);
 }
 static void dsv4_shutdown(void) {
     if (D4.pipe) vkDestroyPipeline(K.dev, D4.pipe, NULL);
@@ -1616,7 +1627,7 @@ static VkPipeline kvs_pipe(void) {
     FILE *f = fopen(path, "rb");
     if (!f) return VK_NULL_HANDLE;
     fclose(f);
-    if ((KS.mod = load_module(K.core.spv_path, file))) KS.pipe = make_pipe(KS.mod, NULL);
+    if ((KS.mod = load_module(K.core.spv_path, file))) KS.pipe = make_pipe(KS.mod, NULL, sg_flags());
     return KS.pipe;
 }
 static void kvs_shutdown(void) {
