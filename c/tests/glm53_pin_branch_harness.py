@@ -86,10 +86,22 @@ def tail_scores(binary, fixture, branch_in_between):
     return scores
 
 
+def same(a, b, tol):
+    if tol <= 0 or a is None:
+        return a == b
+    return abs(float(a) - float(b)) <= tol
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
     parser.add_argument("--fixture", type=Path, required=True)
+    parser.add_argument("--tol", type=float, default=0.0,
+                        help="largest |difference| allowed between a score and the cold engine's "
+                             "(0: the same text). The Vulkan chain computes a long prompt with its "
+                             "blocked attention and a short tail with the per-row one: they agree "
+                             "to rounding, and a pin restored over rows that are not its own is "
+                             "off by far more")
     arguments = parser.parse_args()
     if not (arguments.fixture / "config.json").exists():
         print(f"SKIP: manca {arguments.fixture}; generala con\n"
@@ -109,7 +121,7 @@ def main() -> int:
 
     for branch_in_between in (False, True):
         scores = tail_scores(binary, arguments.fixture, branch_in_between)
-        wrong = [p for p in tail if scores.get(p) != fresh[p]]
+        wrong = [p for p in tail if not same(scores.get(p), fresh[p], arguments.tol)]
         if wrong:
             where = "con un ramo P+B in mezzo" if branch_in_between else "senza rami"
             print(f"FAIL: {where}, {len(wrong)} posizioni su {len(tail)} della coda "
