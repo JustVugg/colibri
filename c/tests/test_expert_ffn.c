@@ -123,6 +123,35 @@ static void test_layer(int S, int K, int H, int F, int NE, int mode) {
     free(E); free(tmp); free(vals); free(x); free(idx); free(val); free(ex); free(o1); free(o2); free(scratch);
 }
 
+/* The repack against its definition, with every byte value in every position
+ * of a block: the SIMD paths must give exactly the scalar bytes. */
+static void test_repack_bytes(void) {
+    uint8_t src[XF_BLOCK_BYTES], dst[XF_BLOCK_BYTES];
+    int bad = 0;
+    for (int v = 0; v < 256; v++)
+        for (int p = 0; p < XF_BLOCK_BYTES; p++) {
+            for (int j = 0; j < XF_BLOCK_BYTES; j++) src[j] = (uint8_t)rnd();
+            src[p] = (uint8_t)v;
+            xf_repack_pairs_signed(dst, src, 1, XF_BLOCK);
+            for (int k = 0; k < 32; k++) {
+                unsigned lo = (src[k >> 1] >> ((k & 1) * 4)) & 0xF, hi = (src[16 + (k >> 1)] >> ((k & 1) * 4)) & 0xF;
+                bad += dst[k] != (uint8_t)((lo ^ 8u) | ((hi ^ 8u) << 4));
+            }
+        }
+    CHECK(!bad, "repack: %d bytes differ from the definition", bad);
+#if defined(__AVX2__)
+    const char *path = "AVX2";
+#elif defined(XF_REPACK_NEON)
+    const char *path = "NEON";
+#else
+    const char *path = "scalar";
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__) && !defined(XF_REPACK_NEON)
+    CHECK(0, "repack: an AArch64 build that does not compile the NEON path");
+#endif
+    if (!bad) printf("repack path: %s, every byte value in every block position as defined\n", path);
+}
+
 int main(void) {
 #ifdef XF_HAVE_AVX2
     printf("path: AVX2%s\n",
@@ -146,6 +175,7 @@ int main(void) {
     test_layer(7, 8, 2048, 512, 12, 1);
     test_layer(5, 4, 128, 192, 6, 0);
     test_layer(3, 2, 64, 64, 2, 1);
+    test_repack_bytes();   /* last: the tests above keep their random inputs */
     if (fails) { printf("%d failure(s)\n", fails); return 1; }
     printf("all passed\n"); return 0;
 }
