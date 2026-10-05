@@ -684,6 +684,12 @@ int coli_deepseek_v4_expert_store_open_base(
  * Alternative registered ExpertStore backends safely ignore the request. */
 void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer);
 
+/* Exclusive RAM/VRAM (vk_tier.h's vkt_ram_first): when set, a full RAM cache gives up
+ * first a slot whose expert the device holds, and reports it through ram_gave. The
+ * store's eviction reads them in every build; only a Vulkan one sets them. */
+extern int (*coli_v4_expert_store_ram_first)(int layer, int expert);
+extern void (*coli_v4_expert_store_ram_gave)(void);
+
 #ifdef COLI_VULKAN
 /* The Vulkan routed-expert tier (vk_tier.c, Makefile.deepseek-v4 VK=1). The MoE
  * units reach it through this table, which the engine's own unit fills when
@@ -720,10 +726,6 @@ uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store);
 int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
                                       unsigned char *buffer, ColiExpertView *view);
 extern int (*coli_v4_expert_store_device_tier)(int layer, int expert);
-/* Exclusive RAM/VRAM (vk_tier.h's vkt_ram_first): when set, a full RAM cache gives up
- * first a slot whose expert the device holds, and reports it through ram_gave. */
-extern int (*coli_v4_expert_store_ram_first)(int layer, int expert);
-extern void (*coli_v4_expert_store_ram_gave)(void);
 
 /* The dense chain (deepseek_v4_chain.h, COLI_VK_CHAIN): a layer's attention state as its
  * units keep it, so the chain can mirror it on the device and write back what a forward

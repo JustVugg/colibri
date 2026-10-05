@@ -9662,6 +9662,9 @@ void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer) {
     pthread_mutex_unlock(&state->mutex);
 }
 
+int (*coli_v4_expert_store_ram_first)(int layer, int expert);   /* exclusive RAM/VRAM: NULL unless a Vulkan tier sets it */
+void (*coli_v4_expert_store_ram_gave)(void);
+
 #ifdef COLI_VULKAN
 /* The Vulkan routed-expert tier's side of the store (deepseek_v4_internal.h). A
  * routing the device served never comes through lookup_hot, so it is counted here
@@ -9670,8 +9673,6 @@ void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer) {
  * routing's, whichever side computed it. The store's hit and miss counters are not
  * touched: they describe the RAM cache. */
 int (*coli_v4_expert_store_device_tier)(int layer, int expert);
-int (*coli_v4_expert_store_ram_first)(int layer, int expert);
-void (*coli_v4_expert_store_ram_gave)(void);
 
 void coli_v4_expert_store_note_routed(ColiExpertStore *store, ColiExpertKey key) {
     if (!store || !store->state) return;
