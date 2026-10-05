@@ -939,6 +939,36 @@ jobs:
           make clean >/dev/null 2>&1 || true
           make qwen36
           QWEN36_TINY=qwen36_tiny_c python3 -m unittest -v tests.test_qwen36_prefix_serve
+      - name: The embedding read in place (int8 trunk) matches the f32 table, byte for byte
+        run: |
+          cd c
+          # With the default int8 trunk the engine reads each token's embedding row
+          # from the checkpoint instead of building the f32 table (COLI_EMBED_MMAP);
+          # the oracle runs above set COLI_DENSE_I8=0 and never take that path. Both
+          # ways must give the same layer outputs, logits, ids and exit status. The
+          # ids are not held to the oracle: the int8 trunk drifts from it (see the
+          # fixture step). Then several conversations at once (KV_SLOTS), whose
+          # decode step reads the rows too: every request as it is served alone.
+          # The step above built the normal engine.
+          make qwen36
+          for v in 1 0; do
+            rc=0
+            COLI_EMBED_MMAP=$v SNAP=qwen36_tiny_c DUMP=emb_logits_$v.f32 DUMP_LAYERS=emb_layers_$v.f32 \
+              ./qwen36 2 8 qwen36_tiny/ref_full.json > emb_$v.log 2>&1 || rc=$?
+            { echo "exit $rc"; grep -a -o -E "^C engine : [0-9 ]+" emb_$v.log || true; } > emb_ids_$v.txt
+          done
+          grep -q "embedding: rows read in place" emb_1.log || { echo "FAIL: the rows were not read in place"; cat emb_1.log; exit 1; }
+          grep -q "embedding: rows read in place" emb_0.log && { echo "FAIL: COLI_EMBED_MMAP=0 still read the rows in place"; exit 1; }
+          for f in emb_logits emb_layers; do
+            test -s ${f}_1.f32 || { echo "FAIL: no $f dump"; cat emb_1.log; exit 1; }
+            cmp ${f}_1.f32 ${f}_0.f32 || { echo "FAIL: $f differ"; exit 1; }
+          done
+          grep -q "^C engine" emb_ids_1.txt || { echo "FAIL: no ids"; cat emb_1.log; exit 1; }
+          cmp emb_ids_1.txt emb_ids_0.txt || { cat emb_ids_1.txt emb_ids_0.txt; exit 1; }
+          echo "in place = table: $(tr '\n' ' ' < emb_ids_1.txt)"
+          python3 -c "import sys; sys.path.insert(0, 'tests'); from pathlib import Path; \
+                      from prefix_serve_harness import ensure_byte_tokenizer as t; t(Path('qwen36_tiny_c'))"
+          python3 tests/serve_mux_check.py ./qwen36 qwen36_tiny_c 4
       - name: Expert kernel A/B on an int4 gs64 fixture (old path vs expert_ffn.h, byte-identical ids)
         run: |
           cd c
