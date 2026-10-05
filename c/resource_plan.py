@@ -582,6 +582,174 @@ def _v4_chain_layout(info, env, vulkan):
 _VK_CHAIN_LAYOUT["deepseek_v4"] = _v4_chain_layout
 
 
+# ---- qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B, Clef's backbone) and olmoe ------------
+def _vk_chain_rows(env, default=256):
+    """vkc_fit_rows: COLI_VK_CHAIN_ROWS when it is a number, else the engine's block."""
+    value = (env.get("COLI_VK_CHAIN_ROWS") or "").strip()
+    match = re.match(r"\s*([+-]?\d+)", value)
+    if not value or value == "auto" or not match:
+        return default
+    return min(max(int(match[1]), 1), 65535)
+
+
+def _vk_kv_block(env):
+    match = re.match(r"\s*([+-]?\d+)", env.get("COLI_VK_KV_BLOCK") or "")
+    return max(int(match[1]) if match else 64, 1)
+
+
+def _q36_dense_fmt(env, tag, columns):
+    """The format qwen36.c puts a dense matrix on the device in (load_tq, vk_qw_fmt): f32
+    with COLI_DENSE_I8=0, f16 with COLI_DENSE_BITS=16, int4 in groups of 64 with
+    COLI_DENSE_BITS=4 where COLI_DENSE_INT4 (unset: every tag) names its tag and the
+    columns divide by 64, else int8 rows."""
+    if (env.get("COLI_DENSE_I8") or "").strip() == "0":
+        return 10
+    match = re.match(r"\s*([+-]?\d+)", env.get("COLI_DENSE_BITS") or "")
+    bits = int(match[1]) if match else 8
+    if bits == 16:
+        return 14
+    if bits == 4 and columns % 64 == 0:
+        tags = (env.get("COLI_DENSE_INT4") or "").strip()
+        if not tags or tag in re.split(r"[ ,]+", tags):
+            return 4
+    return 1
+
+
+# the matrices qwen36's chain multiplies by, and load_tq's tag for each (a dense model's
+# MLP loads as the shared expert)
+_Q36_CHAIN_TAGS = {"self_attn.q_proj": "attn", "self_attn.k_proj": "attn", "self_attn.v_proj": "attn",
+                   "self_attn.o_proj": "attn", "linear_attn.in_proj_qkv": "dnproj",
+                   "linear_attn.in_proj_z": "dnproj", "linear_attn.out_proj": "dnout", "mlp.gate": "router",
+                   "mlp.shared_expert.gate_proj": "shexp", "mlp.shared_expert.up_proj": "shexp",
+                   "mlp.shared_expert.down_proj": "shexp", "mlp.gate_proj": "shexp", "mlp.up_proj": "shexp",
+                   "mlp.down_proj": "shexp"}
+
+
+def _q36_chain_layout(info, env, vulkan):
+    """qwen36_chain.h: q36c_fit_layer, q36c_start's fixed bytes and lm_head as the tail,
+    from the scanned matrices' shapes and the scalars of qwen36_meta.json (what the engine
+    reads; config.json's when the checkpoint has none)."""
+    try:
+        meta = json.loads((Path(info["path"]) / "qwen36_meta.json").read_text(encoding="utf-8"))
+    except (KeyError, OSError, ValueError):
+        meta = {}
+    c = info.get("config") or {}
+    c = c.get("text_config", c)
+    try:
+        L = int(meta.get("n_layers") or c["num_hidden_layers"])
+        D = int(meta.get("hidden") or c["hidden_size"])
+        hd = int(meta.get("head_dim") or c["head_dim"])
+        kdim = int(meta.get("dn_kdim") or c.get("linear_key_head_dim") or 0)
+        convk = int(meta.get("dn_convk") or c.get("linear_conv_kernel_dim") or 0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    types = meta.get("layer_types") or c.get("layer_types")
+    if not isinstance(types, list):
+        interval = int(c.get("full_attention_interval") or 4)
+        types = ["full_attention" if i % interval == interval - 1 else "linear_attention" for i in range(L)]
+    if L < 1 or len(types) < L:
+        return None
+    attn = [t == "full_attention" for t in types[:L]]
+    rot = int(meta.get("rotary_dim") or 0)
+    if rot <= 0:
+        factor = float(meta.get("partial_rotary_factor") or c.get("partial_rotary_factor") or 0)
+        rot = int(hd * factor + 0.5) if factor > 0 else hd
+        rot = min(max(rot + rot % 2, 2), hd)
+    # the shapes the engine loads, from the checkpoint
+    rows_of, layers, norms = {}, [0] * L, [0] * L
+    matrices = []
+    for tensor in info.get("dense_tensors", []):
+        name, shape = _text_weight_name(tensor["name"]), tensor.get("shape")
+        layer, part = _vk_layer_index(name), _layer_component(name)
+        if layer is not None and layer < L and part in ("self_attn.q_norm", "self_attn.k_norm"):
+            norms[layer] += hd
+            continue
+        if not isinstance(shape, list) or len(shape) != 2:
+            continue
+        if name == "lm_head.weight" or (layer is not None and layer < L and (part in _Q36_CHAIN_TAGS or part in (
+                "linear_attn.in_proj_b", "mlp.shared_expert_gate"))):
+            rows_of.setdefault(name if layer is None else part, shape)
+            matrices.append((layer, part if layer is not None else name, shape))
+    def rows(part, default=0):
+        return rows_of[part][0] if part in rows_of else default
+    E = rows("mlp.gate")
+    SI = rows("mlp.shared_expert.gate_proj") or rows("mlp.gate_proj")
+    vh = rows("linear_attn.in_proj_b")
+    conv, vd = rows("linear_attn.in_proj_qkv"), rows("linear_attn.in_proj_z")
+    qo, kvo = rows("self_attn.q_proj"), rows("self_attn.k_proj")
+    o_in = rows_of["self_attn.o_proj"][1] if "self_attn.o_proj" in rows_of else 0
+    vocab = rows("lm_head.weight", int(c.get("vocab_size") or 0))
+    vdim = vd // vh if vh else 0
+    # COLI_VK_IMPORT (qwen36.c main, vk_qw_tensor): int8 and f16 rows read in place, only
+    # their scales on the device; by default for a model without routed experts on a device
+    # sharing the CPU's RAM, never while host copies are dropped off a non-integrated one
+    kind = (vulkan or {}).get("type")
+    flag = _vk_flag(env, "COLI_VK_IMPORT")
+    imports = flag != 0 if flag is not None else E == 0 and kind in ("integrated", "cpu")
+    if imports and kind != "integrated" and _vk_flag(env, "COLI_VK_DENSE_HOST") == 0:
+        imports = False
+
+    def placed(tag, shape):
+        out, columns = shape
+        fmt = _q36_dense_fmt(env, tag, columns)
+        if imports and fmt in (1, 14):
+            return _vk_up(4 * (out if fmt == 1 else 1))
+        return vk_tensor_bytes(fmt, columns, out, 64 if fmt == 4 else 0)
+    head = 0
+    for layer, part, shape in matrices:
+        if layer is None:
+            head = placed("lmhead", shape)
+        elif part in _Q36_CHAIN_TAGS:
+            layers[layer] += placed(_Q36_CHAIN_TAGS[part], shape)
+        elif part == "mlp.shared_expert_gate" and E and SI:
+            layers[layer] += vk_tensor_bytes(10, D, 1)                 # the gate row, f32
+    for i in range(L):
+        floats = 2 * D
+        if attn[i]:
+            floats += norms[i]
+            layers[i] += 2 * vk_buf_bytes(kvo * 3 * _vk_kv_block(env) * 4)   # the K/V mirror at the split's floor
+        else:
+            floats += conv * convk + 2 * vh + vdim
+            layers[i] += vk_tensor_bytes(10, D, 2 * vh)                # the b|a rows, f32
+            layers[i] += vk_buf_bytes(vh * kdim * vdim * 4) + vk_buf_bytes(conv * (convk - 1) * 4)
+        layers[i] += 4 * floats                                        # its share of the parameters
+    # q36c_bufs for the fit's rows, their read-back, the arena's final norm
+    r, n_attn = _vk_chain_rows(env), sum(attn)
+    counts = [r * D, r * D, r * D, r * qo, r * kvo, r * kvo, r * o_in, r * conv, r * vd, r * 2 * vh, r * conv,
+              r * vd, r * D, r * max(E, 1), r * max(SI, 1), r * max(SI, 1), r * max(SI, 1), r * D, r, D, r * D,
+              r * max(E, 1), max(n_attn, 1) * 2 * r * kvo, vocab, r * D, r * max(rot, 2), r * D]
+    fixed = sum(vk_buf_bytes(4 * max(n, 1)) for n in counts) + vk_buf_bytes(4 * D) + vk_buf_bytes(4)
+    return VkChainLayout(layers, fixed, head)
+
+
+_VK_CHAIN_LAYOUT["qwen36"] = _q36_chain_layout
+
+
+def _olmoe_chain_layout(info, env, vulkan):
+    """olmoe_chain.h olc_fit_start: q, k, v, o and the router as f32 tensors, the K/V
+    mirror at the split's floor, the parameters; one chunk's scratch; lm_head the tail."""
+    c = info.get("config") or {}
+    try:
+        L, D, H = int(c["num_hidden_layers"]), int(c["hidden_size"]), int(c["num_attention_heads"])
+        E, vocab = int(c["num_experts"]), int(c["vocab_size"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if L < 1 or H < 1 or D % H:
+        return None
+    hd = D // H
+    layer = (4 * vk_tensor_bytes(10, D, D) + vk_tensor_bytes(10, D, E) +
+             2 * vk_buf_bytes(H * 3 * _vk_kv_block(env) * hd * 4) + 4 * 4 * D)
+    r = _vk_chain_rows(env)
+    counts = [r * D] * 8 + [r * E, D, r * D, r * E, 2 * r * D, vocab, r * D, r * hd, r * D]
+    if (env.get("PILOT") or "").strip() not in ("", "0"):
+        counts.append(r * D)   # PILOT's rows after attention
+    fixed = sum(vk_buf_bytes(4 * max(n, 1)) for n in counts) + vk_buf_bytes(4 * D) + vk_buf_bytes(4)
+    return VkChainLayout([layer] * L, fixed, vk_tensor_bytes(10, D, vocab))
+
+
+_VK_CHAIN_LAYOUT["olmoe"] = _olmoe_chain_layout
+
+
 def _analysis_signature(shards, config_path):
     parts = [f"v{_ANALYSIS_CACHE_VERSION}"]
     st = config_path.stat()

@@ -273,6 +273,12 @@ jobs:
             req: c/tools/requirements-qwen38-tiny.txt
           - family: dense-only-qwen36-olmoe-sanitize
             req: c/tools/requirements-qwen38-tiny.txt
+          # the partial chain of qwen36 and olmoe (the first N layers on the device, the
+          # rest and the head on the CPU), and the same under ASan and UBSan
+          - family: partial-qwen36-olmoe
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: partial-qwen36-olmoe-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
           - family: dense-only-inkling-mimo-kimi
             req: c/tools/requirements-kimi-k3-tiny.txt
             extra: -r c/tools/oracle-requirements.txt pillow

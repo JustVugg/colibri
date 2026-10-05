@@ -1770,6 +1770,170 @@ class VulkanPartialChainTest(unittest.TestCase):
         self.assertLess(two["shared_device_dense_bytes"], every["shared_device_dense_bytes"])
 
 
+class VulkanPartialChainQwenOlmoeTest(unittest.TestCase):
+    """The partial chain's layouts of qwen36 and olmoe (_VK_CHAIN_LAYOUT): each layer's
+    device bytes, the fixed bytes and the head as their engines' fit lines printed them
+    for the tiny fixtures on Lavapipe, and the plan's credit for the first N layers."""
+
+    LAYERS = ["linear_attention"] * 3 + ["full_attention"] + ["linear_attention"] * 3 + ["full_attention"]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.model = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_qwen36(self, inter=32):
+        """tools/make_qwen36_tiny.py's default geometry as tools/convert_qwen36.py writes
+        it (--inter sets the routed and shared experts' width): 8 layers, attention at 3
+        and 7, 8 experts, a shared expert with its gate, f16 dense tensors."""
+        c = {"architectures": ["Qwen3_5MoeForCausalLM"], "model_type": "qwen3_5_moe_text", "head_dim": 16,
+             "hidden_size": 64, "intermediate_size": 128, "layer_types": self.LAYERS, "linear_conv_kernel_dim": 4,
+             "linear_key_head_dim": 8, "linear_num_key_heads": 4, "linear_num_value_heads": 8,
+             "linear_value_head_dim": 8, "moe_intermediate_size": inter, "num_attention_heads": 4, "num_experts": 8,
+             "num_experts_per_tok": 2, "num_hidden_layers": 8, "num_key_value_heads": 2,
+             "partial_rotary_factor": 0.25, "shared_expert_intermediate_size": inter, "vocab_size": 320}
+        meta = {"hidden": 64, "n_layers": 8, "layer_types": self.LAYERS, "num_experts": 8, "topk": 2,
+                "moe_inter": inter, "shared_inter": inter, "partial_rotary_factor": 0.25, "q_heads": 4,
+                "kv_heads": 2, "q_head_dim": 32, "k_head_dim": 16, "v_head_dim": 16, "o_in": 64, "head_dim": 16,
+                "dn_vheads": 8, "dn_kheads": 4, "dn_kdim": 8, "dn_vdim": 8, "dn_convk": 4, "dn_conv_dim": 128}
+        (self.model / "config.json").write_text(json.dumps(c))
+        (self.model / "qwen36_meta.json").write_text(json.dumps(meta))
+        tensors = []
+
+        def add(name, dtype, *shape):
+            count = 1
+            for n in shape:
+                count *= n
+            tensors.append((name, count * {"F16": 2, "F32": 4, "I8": 1}[dtype], dtype, list(shape)))
+        add("model.embed_tokens.weight", "F16", 320, 64)
+        add("lm_head.weight", "F16", 320, 64)
+        add("model.norm.weight", "F16", 64)
+        for i, kind in enumerate(self.LAYERS):
+            p = f"model.layers.{i}."
+            add(p + "input_layernorm.weight", "F16", 64)
+            add(p + "post_attention_layernorm.weight", "F16", 64)
+            if kind == "full_attention":
+                for name, rows in (("q_proj", 128), ("k_proj", 32), ("v_proj", 32)):
+                    add(p + f"self_attn.{name}.weight", "F16", rows, 64)
+                add(p + "self_attn.o_proj.weight", "F16", 64, 64)
+                add(p + "self_attn.q_norm.weight", "F16", 16)
+                add(p + "self_attn.k_norm.weight", "F16", 16)
+            else:
+                add(p + "linear_attn.A_log", "F16", 8)
+                add(p + "linear_attn.dt_bias", "F16", 8)
+                add(p + "linear_attn.conv1d.weight", "F16", 128, 1, 4)
+                add(p + "linear_attn.in_proj_a.weight", "F16", 8, 64)
+                add(p + "linear_attn.in_proj_b.weight", "F16", 8, 64)
+                add(p + "linear_attn.in_proj_qkv.weight", "F16", 128, 64)
+                add(p + "linear_attn.in_proj_z.weight", "F16", 64, 64)
+                add(p + "linear_attn.norm.weight", "F16", 8)
+                add(p + "linear_attn.out_proj.weight", "F16", 64, 64)
+            add(p + "mlp.gate.weight", "F16", 8, 64)
+            add(p + "mlp.shared_expert.gate_proj.weight", "F16", inter, 64)
+            add(p + "mlp.shared_expert.up_proj.weight", "F16", inter, 64)
+            add(p + "mlp.shared_expert.down_proj.weight", "F16", 64, inter)
+            add(p + "mlp.shared_expert_gate.weight", "F16", 1, 64)
+            for e in range(8):
+                add(p + f"mlp.experts.{e}.merged_weight", "I8", 3 * inter * 64)
+                add(p + f"mlp.experts.{e}.qs", "F32", 2 * inter + 64)
+        write_shard(self.model / "model.safetensors", tensors)
+        return analyze_model(self.model)
+
+    def write_olmoe(self):
+        """tools/make_olmoe_tiny.py's geometry as tools/convert_olmoe_merged.py writes it."""
+        c = {"architectures": ["OlmoeForCausalLM"], "model_type": "olmoe", "hidden_size": 64,
+             "intermediate_size": 32, "num_attention_heads": 4, "num_key_value_heads": 4, "num_experts": 8,
+             "num_experts_per_tok": 2, "num_hidden_layers": 4, "vocab_size": 128, "norm_topk_prob": True}
+        (self.model / "config.json").write_text(json.dumps(c))
+        tensors = [("model.embed_tokens.weight", 128 * 64 * 4, "F32", [128, 64]),
+                   ("lm_head.weight", 128 * 64 * 4, "F32", [128, 64]), ("model.norm.weight", 256, "F32", [64])]
+        for i in range(4):
+            p = f"model.layers.{i}."
+            for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                tensors.append((p + f"self_attn.{name}.weight", 64 * 64 * 4, "F32", [64, 64]))
+            for name in ("q_norm", "k_norm"):
+                tensors.append((p + f"self_attn.{name}.weight", 256, "F32", [64]))
+            for name in ("input_layernorm", "post_attention_layernorm"):
+                tensors.append((p + f"{name}.weight", 256, "F32", [64]))
+            tensors.append((p + "mlp.gate.weight", 8 * 64 * 4, "F32", [8, 64]))
+            for e in range(8):
+                tensors.append((p + f"mlp.experts.{e}.merged_weight", 3 * 32 * 64, "I8", [3 * 32 * 64]))
+                tensors.append((p + f"mlp.experts.{e}.qs", (2 * 32 + 64) * 4, "F32", [2 * 32 + 64]))
+        write_shard(self.model / "model.safetensors", tensors)
+        return analyze_model(self.model)
+
+    def test_layouts_are_the_engines(self):
+        # "[VK] qwen36 chain fit: ... fixed X B (the engine's E B, ...), tail T B, layers ..." and
+        # olmoe's, printed on Lavapipe for the tiny fixtures in each dense format
+        from resource_plan import _VK_CHAIN_LAYOUT
+        cpu = {"type": "cpu", "budget_bytes": 64 * GB}
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"}
+        attn = [3, 7]
+        def q36(lin, full):
+            return [full if i in attn else lin for i in range(8)]
+        info = self.write_qwen36()
+        for env, fixed, tail, layers in (({"COLI_DENSE_I8": "0"}, 1448960, 82176, q36(105056, 144512)),
+                                         ({}, 1448960, 21760, q36(36192, 75648)),
+                                         ({"COLI_DENSE_BITS": "16"}, 1448960, 41216, q36(58976, 98432)),
+                                         ({"COLI_DENSE_I8": "0", "COLI_VK_CHAIN_ROWS": "3"}, 20480, 82176, q36(105056, 144512))):
+            with self.subTest(engine="qwen36", env=env):
+                got = _VK_CHAIN_LAYOUT["qwen36"](info, dict(on, **env), cpu)
+                self.assertEqual((got.layers, got.fixed, got.tail), (layers, fixed, tail))
+        # COLI_DENSE_BITS=4 on the --inter 64 fixture: int4 in groups of 64
+        self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.model = Path(self.tmp.name)
+        got = _VK_CHAIN_LAYOUT["qwen36"](self.write_qwen36(inter=64), dict(on, COLI_DENSE_BITS="4"), cpu)
+        self.assertEqual((got.layers, got.fixed, got.tail), (q36(27744, 67200), 1547264, 11520))
+        self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.model = Path(self.tmp.name)
+        info = self.write_olmoe()
+        for env, fixed in (({}, 886016), ({"PILOT": "1", "COLI_VK_CHAIN_ROWS": "3"}, 12800)):
+            with self.subTest(engine="olmoe", env=env):
+                got = _VK_CHAIN_LAYOUT["olmoe"](info, dict(on, **env), cpu)
+                self.assertEqual((got.layers, got.fixed, got.tail), ([168192] * 4, fixed, 33024))
+
+    def test_device_only_credits_the_layers_on_the_device(self):
+        from resource_plan import vk_chain_fit, vk_fit_pools
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        for engine, write, L in (("qwen36", self.write_qwen36, 8), ("olmoe", self.write_olmoe, 4)):
+            with self.subTest(engine=engine):
+                self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.model = Path(self.tmp.name)
+                info = write()
+                on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "COLI_VK_DENSE_HOST": "0",
+                      "COLI_VK_TIER_RESERVE_GB": "0", "COLI_DENSE_I8": "0"}
+                fit = vk_chain_fit(info, engine, on, {"type": "discrete", "budget_bytes": 64 * GB})
+                self.assertEqual(fit["n"], L)
+                # what each engine drops: the chain's matrices of the first k layers (not the
+                # DeltaNet's a/b rows, the shared expert's gate, norms or the head)
+                def released(k):
+                    plan = build_plan(self.model, env=dict(on, COLI_VK_CHAIN_LAYERS=str(k)),
+                                      vulkan={"type": "discrete", "budget_bytes": 64 * GB}, **kwargs)
+                    return plan["tiers"]["ram"]["dense_on_device_bytes"]
+                per = released(1)
+                self.assertGreater(per, 0)
+                self.assertEqual(released(0), 0)
+                for k in range(1, L):
+                    free = fit["fixed"] + sum(fit["layers"][:k]) + fit["layers"][k] // 2
+                    plan = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": free}, **kwargs)
+                    ram = plan["tiers"]["ram"]
+                    self.assertEqual(ram["vk_chain_layers"]["on_device"], k)
+                    self.assertEqual(ram["dense_on_device_bytes"], released(k))
+                    self.assertIn(f"the first {k} of {L} layers", format_plan(plan))
+                # every layer but no room for the head: the layers' copies alone; with room
+                # for it (or every layer forced) the head's copy goes too
+                from resource_plan import _VK_CHAIN_LAYOUT
+                tail = _VK_CHAIN_LAYOUT[engine](info, on, {"type": "discrete"}).tail
+                free = fit["fixed"] + sum(fit["layers"]) + tail // 2
+                no_head = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": free}, **kwargs)
+                full = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": 64 * GB}, **kwargs)
+                self.assertEqual((no_head["tiers"]["ram"]["vk_chain_layers"]["on_device"],
+                                  no_head["tiers"]["ram"]["vk_chain_layers"]["tail"]), (L, False))
+                self.assertEqual(full["tiers"]["ram"]["vk_chain_layers"]["tail"], True)
+                self.assertLess(no_head["tiers"]["ram"]["dense_on_device_bytes"],
+                                full["tiers"]["ram"]["dense_on_device_bytes"])
+                self.assertEqual(full["tiers"]["ram"]["dense_on_device_bytes"], released(L))
+
+
 class PhysicalCpuCountTest(unittest.TestCase):
     """Regression for #325: --auto-tier pinned decode to one core because
     physical_cpu_count() silently returned 1.

@@ -3996,29 +3996,32 @@ static float *step_ex(Model *m, const int *ids, int S, int pos_base, int nlogits
         }
         q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
     }
+    int chain_n = 0;   /* layers the chain ran (a partial chain: the CPU runs the rest) */
 #ifdef COLI_VULKAN
     /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
-     * back only when the prefill read-out below needs every row */
+     * back only when the prefill read-out below needs every row. A partial chain
+     * brings back every row's residual after its layers: the CPU continues from there. */
     float *chain_logit = NULL;
     if (g_vk_chain) {
-        int echo = 0;
+        int echo = 0, rows_only = 0;
 #ifndef QWEN36_NO_MAIN
         echo = g_echo_k > 0 && g_echo_id && S > 1;
 #endif
         if (g_hidden_sink) echo = 1;   /* the head reads every row */
         chain_logit = falloc((int64_t)nlogits * c->vocab);
-        if (!q36c_forward(m, x, S, pos_base, lf, echo, nlogits, chain_logit)) {
+        chain_n = q36c_forward(m, x, S, pos_base, lf, echo, nlogits, chain_logit, &rows_only);
+        if (!chain_n) {
             free(chain_logit); chain_logit = NULL;
             q36c_cpu_step(m, pos_base);
             /* Earlier chunks may have returned their final rows for Clef or
              * prompt logprobs. A failed forward replays every row on the CPU. */
             for (int s = 0; s < S; s++)
                 q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
-        }
+        } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
     }
     if (!chain_logit)
 #endif
-    layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1, lf);
+    layers_forward_range(m, x, S, pos_base, chain_n, c->n_layers, 1, lf);
     if (g_hidden_sink) {
         #pragma omp parallel for schedule(static)
         for (int s = 0; s < S; s++)
@@ -5553,15 +5556,19 @@ static size_t vk_qw_bytes(const QW *w) {
          : w->q  ? (size_t)w->O * w->I + (size_t)w->O * sizeof(float)
          : w->w  ? (size_t)w->O * w->I * sizeof(float) : 0;
 }
+/* What still goes to the device after the tier starts: not a matrix placed already (the
+ * chain's setup at start, or the dense weights on the device only) nor one that stays
+ * on the CPU (a partial chain's CPU layers and head: vk_off). */
+static size_t vk_qw_still(const QW *w) { return w->vk || w->vk_off ? 0 : vk_qw_bytes(w); }
 static size_t vk_dense_bytes(Model *m) {
     if (!g_vk_dense && !g_vk_chain) return 0;
     if (coli_vk_dense_device_only()) return 0;   /* placed already (q36_dho_start): the free memory the tier reads counts them */
-    size_t b = vk_qw_bytes(&m->lm_head);
+    size_t b = vk_qw_still(&m->lm_head);
     for (int i = 0; i < m->c.n_layers; i++) {
         Layer *L = &m->L[i];
         const QW *w[] = {&L->q, &L->k, &L->v, &L->o, &L->gate, &L->sh_g, &L->sh_u, &L->sh_d,
                          &L->dn_qkv, &L->dn_z, &L->dn_out};
-        for (size_t k = 0; k < sizeof w / sizeof *w; k++) b += vk_qw_bytes(w[k]);
+        for (size_t k = 0; k < sizeof w / sizeof *w; k++) b += vk_qw_still(w[k]);
     }
     return b;
 }
@@ -5577,6 +5584,16 @@ static int vk_in_ram(void *ctx, int layer, int e) {
  * the expert tier sizes its budget: the dense matrices go up now, so the tier sees them
  * placed. The CUDA tier and a qpack container keep the host copies (the dense part
  * stays theirs or the CPU's). */
+/* With the fit of a partial chain (q36c_start) only the N layers' matrices (and the head's
+ * when it goes up) count: the CPU's are vk_off. The chain's setup then drops each layer's
+ * host copies once the layer is on the device (q36c_place, then q36_dho_placed). */
+static void q36_dho_placed(void) {
+    if (coli_vk_device_integrated() && coli_vk_imported_bytes())
+        fprintf(stderr, "[VK] qwen36: dense rows shared with the integrated GPU, %.1f MiB read in place; "
+                        "the imported pages stay alive as the only weight copy\n", coli_vk_imported_bytes() / 1048576.0);
+    coli_vk_dense_host_placed("qwen36", "the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and "
+                              "the shared expert's gate vector, norms, the vision tower, any imported pages");
+}
 static void q36_dho_start(Model *m) {
     if (!g_vk_ready) return;
     size_t bytes = 0; int n = 0;
@@ -5585,13 +5602,10 @@ static void q36_dho_start(Model *m) {
         return;
     g_q36_dho_model = m;
     g_vk_dense = 1;   /* the steps the chain declines run their matrices on the device too: the CPU has none */
+    if (g_q36c_fit_on && g_vk_chain) return;   /* the chain's setup drops them layer by layer (q36c_place) */
     bytes = 0; n = 0;
     q36_dho_each(m, q36_dho_drop, &bytes, &n);
-    if (coli_vk_device_integrated() && coli_vk_imported_bytes())
-        fprintf(stderr, "[VK] qwen36: dense rows shared with the integrated GPU, %.1f MiB read in place; "
-                        "the imported pages stay alive as the only weight copy\n", coli_vk_imported_bytes() / 1048576.0);
-    coli_vk_dense_host_placed("qwen36", "the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and "
-                              "the shared expert's gate vector, norms, the vision tower, any imported pages");
+    q36_dho_placed();
 }
 
 /* The tier's streaming (a big prompt chunk's cold experts on the device): an expert's
@@ -5798,7 +5812,8 @@ int main(int argc, char **argv) {
                     "a dense model on a device sharing the CPU's RAM; COLI_VK_IMPORT=0 copies them")
                     : "this device cannot import host memory");
     }
-    if (g_vk_chain && !vkc_init()) g_vk_chain = 0;
+    /* the chain's pipelines come up with its fit (q36c_start, below): nothing of the
+     * chain is on the device before it has decided how many layers fit */
 #endif
     if (ref_image && ref_image->t == J_OBJ) {
         jval *gh = json_get(ref_image, "grid_h"), *gw = json_get(ref_image, "grid_w");
@@ -6002,7 +6017,16 @@ int main(int argc, char **argv) {
     }
 
 #ifdef COLI_VULKAN
+    q36c_start(&m);      /* COLI_VK_CHAIN: how many layers the chain places (vkc_fit), before any upload */
+    if (g_vk_chain && !g_q36c_fit_on && !vkc_init()) g_vk_chain = 0;   /* no fit (PILOT, a geometry, ...): as before */
     q36_dho_start(&m);   /* COLI_VK_DENSE_HOST: the dense matrices on the device only, before the tier sizes its budget */
+    if (g_q36c_fit_on && g_vk_chain) {   /* the chain's layers on the device now, so the tier sizes after them */
+        q36c_place(&m);
+        if (coli_vk_dense_device_only()) {
+            coli_vk_dense_host_layers(g_q36c_fit.n, g_q36c_fit.L);
+            q36_dho_placed();
+        }
+    }
     vk_tier_start(&m, snap, cap, expert_is_int4, expert_mixed);   /* COLI_VULKAN=1: hot routed experts on the device */
     if (g_vk_ready && !vkt_ready() && !g_vk_dense) g_vk_dense = coli_vk_dense_decide("qwen36", 0, 1);   /* no tier after all */
     if (g_vk_chain && qt_ready()) {   /* the CUDA tier keeps its priority */
@@ -6010,7 +6034,7 @@ int main(int argc, char **argv) {
         g_vk_chain = 0;
     }
     if (g_vk_chain && g_pilot) fprintf(stderr, "[VK] qwen36: PILOT prefetch reads the residual on the host: the dense chain stays off\n");
-    if (g_vk_chain) atexit(vkc_shutdown);   /* registered after the tier's: runs before the device goes */
+    if (g_vk_chain || g_q36c_fit_on) atexit(vkc_shutdown);   /* registered after the tier's: runs before the device goes */
 #endif
 
     /* coli serve mode: speak the gateway wire protocol instead of argv

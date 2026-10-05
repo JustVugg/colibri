@@ -36,7 +36,22 @@
  * outside chain_attn.comp (head dim above 256 or odd). A device lost mid-step costs
  * nothing to rebuild: the KV rows below pos_base are the host's, so the CPU redoes the
  * step from the embedding rows (which the chain never overwrites) and runs from there.
- * COLI_VK_CHAIN_FAULT=n (vk_chain.c) fakes the loss at the n-th frame, for tests. */
+ * COLI_VK_CHAIN_FAULT=n (vk_chain.c) fakes the loss at the n-th frame, for tests.
+ *
+ * A partial chain (vk_chain.h, vkc_fit; docs/vulkan.md, "A partial chain"): when the
+ * layers do not all fit the device, the chain takes layers 0..N-1 and the CPU the rest
+ * and the head. olc_fit_start decides N in model_init, before any upload and before the
+ * tier sizes its budget (the chain's on/off decision is taken there silently from the
+ * same inputs, as olm_dho_start does, and printed after the tier as before); olc_place
+ * then sets the chain up there and then, one layer at a time (a layer that fails is
+ * freed whole and N stops before it), each layer's host copies dropped once it is on
+ * the device when the dense weights live there only. The CPU's layers' matrices (and
+ * the head's, unless the fit puts it up) are marked refused: the per-matrix path never
+ * uploads them. A forward runs the N layers chunk by chunk, brings every row's residual
+ * after layer N-1 back, and the caller runs layers N..L-1 and the head on the CPU over
+ * all the rows. The device's layers mirror their K/V rows behind their watermarks, the
+ * CPU's keep theirs on the host only; a lost device redoes the step on the CPU as
+ * before (nothing to rebuild, and the CPU's layers have not run that step yet). */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 
@@ -50,6 +65,7 @@
 
 typedef struct {
     int ok, failed;
+    int n, head;                               /* layers 0..n-1 on the device; lm_head there too */
     int rows;                                  /* scratch capacity in rows */
     int cap;                                   /* the host's max_t the mirrors follow */
     int dev_rows;                              /* device KV rows a layer: cap, or the split's */
@@ -77,7 +93,32 @@ static ColiVkTensor *olc_tensor(void **vk, const float *w, int I, int O) {
     return (ColiVkTensor *)*vk;
 }
 
-/* The model's parameters on the device, its tensors resolved; NULL = the chain cannot run. */
+static VkcFit g_olc_fit;      /* the partial chain's fit (olc_fit_start); g_olc_fit_on (olmoe.c): it ran */
+static size_t olm_dho_layer(Model *m, int i);   /* olmoe.c: layer i's host copies given back */
+
+static int olc_geometry_ok(const Cfg *c) {
+    return !(c->head_dim > 256 || (c->head_dim & 1) || c->head_dim * c->n_heads != c->hidden);
+}
+/* Layer i stays on the CPU for good: its device copies freed (after every frame that may
+ * read them) and marked refused, so the per-matrix path never uploads them; its K/V
+ * mirror, if the chain made one, goes too. */
+static void olc_layer_cpu(OlmChain *ch, Model *m, int i) {
+    if (vkc_ready()) vkc_finish();
+    Layer *l = &m->L[i];
+    void **vk[] = {&l->vk_q, &l->vk_k, &l->vk_v, &l->vk_o, &l->vk_gate};
+    for (size_t k = 0; k < sizeof vk / sizeof *vk; k++) {
+        if (*vk[k] && *vk[k] != (void *)&g_vk_refused) coli_vk_tensor_free((ColiVkTensor *)*vk[k]);
+        *vk[k] = &g_vk_refused;
+    }
+    if (ch && ch->kc) { vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL; }
+}
+
+/* The chain on the device: the parameter arena of its layers, then layer after layer
+ * (each whole; its host copies dropped once it is there when the dense weights live on
+ * the device only), then the head when the fit puts it up. With the fit (olc_fit_start)
+ * it runs in model_init, before the tier sizes its budget; a layer that does not reach
+ * the device is freed whole and the chain keeps the layers before it. NULL = the chain
+ * cannot run. */
 static OlmChain *olc_setup(Model *m) {
     OlmChain *ch = (OlmChain *)m->vkchain;
     if (ch) return ch->ok ? ch : NULL;
@@ -85,26 +126,28 @@ static OlmChain *olc_setup(Model *m) {
     if (!ch) return NULL;
     m->vkchain = ch;
     Cfg *c = &m->c; int L = c->n_layers, D = c->hidden, E = c->n_experts;
-    if (c->head_dim > 256 || (c->head_dim & 1) || c->head_dim * c->n_heads != D) {
+    if (!olc_geometry_ok(c)) {
         fprintf(stderr, "[VK] olmoe chain: a geometry its shaders do not take (head dim %d, %d heads, hidden %d); per-matrix path\n",
                 c->head_dim, c->n_heads, D);
         return NULL;
     }
+    VkcFit *fit = g_olc_fit_on ? &g_olc_fit : NULL;
+    int n = fit ? fit->n : L;
     ch->o_in = calloc(L, sizeof(size_t)); ch->o_post = calloc(L, sizeof(size_t));
     ch->o_qn = calloc(L, sizeof(size_t)); ch->o_kn = calloc(L, sizeof(size_t));
     ch->kc = calloc(L, sizeof(void *)); ch->vc = calloc(L, sizeof(void *));
     ch->kv_valid = calloc(L, sizeof(int));
     if (!ch->o_in || !ch->o_post || !ch->o_qn || !ch->o_kn || !ch->kc || !ch->vc || !ch->kv_valid) return NULL;
-    /* the parameter arena: offsets, then one upload */
-    size_t n = 0;
-    for (int i = 0; i < L; i++) {
-        ch->o_in[i] = n; n += D; ch->o_post[i] = n; n += D;
-        ch->o_qn[i] = n; n += D; ch->o_kn[i] = n; n += D;
+    /* the parameter arena of the n layers: offsets, then one upload */
+    size_t np = 0;
+    for (int i = 0; i < n; i++) {
+        ch->o_in[i] = np; np += D; ch->o_post[i] = np; np += D;
+        ch->o_qn[i] = np; np += D; ch->o_kn[i] = np; np += D;
     }
-    ch->o_final = n; n += D;
-    float *arena = calloc(n, sizeof(float));
+    ch->o_final = np; np += D;
+    float *arena = calloc(np, sizeof(float));
     if (!arena) return NULL;
-    for (int i = 0; i < L; i++) {
+    for (int i = 0; i < n; i++) {
         Layer *l = &m->L[i];
         memcpy(arena + ch->o_in[i], l->in_ln, D * sizeof(float));
         memcpy(arena + ch->o_post[i], l->post_ln, D * sizeof(float));
@@ -112,31 +155,111 @@ static OlmChain *olc_setup(Model *m) {
         memcpy(arena + ch->o_kn[i], l->kn, D * sizeof(float));
     }
     memcpy(arena + ch->o_final, m->final_norm, D * sizeof(float));
-    ch->prm = vkc_buf(n * sizeof(float), VKC_DEV);
-    int ok = ch->prm && vkc_begin() && vkc_write(ch->prm, 0, arena, n * sizeof(float)) && vkc_submit(1);
+    ch->prm = vkc_buf(np * sizeof(float), VKC_DEV);
+    int ok = ch->prm && vkc_begin() && vkc_write(ch->prm, 0, arena, np * sizeof(float)) && vkc_submit(1);
     free(arena);
-    if (!ok) return NULL;
-    /* the tensors: the device copies the per-matrix path uses (matmul_res) */
-    for (int i = 0; i < L && ok; i++) {
+    if (!ok && !fit) return NULL;
+    /* the layers: the device copies the per-matrix path uses (matmul_res); a layer that
+     * does not get there whole is freed and the chain stops before it */
+    int placed = 0;
+    for (int i = 0; i < n && ok; i++) {
         Layer *l = &m->L[i];
-        ok = olc_tensor(&l->vk_q, l->q, D, D) && olc_tensor(&l->vk_k, l->k, D, D) &&
-             olc_tensor(&l->vk_v, l->v, D, D) && olc_tensor(&l->vk_o, l->o, D, D) &&
-             olc_tensor(&l->vk_gate, l->gate, D, E);
+        int lok = olc_tensor(&l->vk_q, l->q, D, D) && olc_tensor(&l->vk_k, l->k, D, D) &&
+                  olc_tensor(&l->vk_v, l->v, D, D) && olc_tensor(&l->vk_o, l->o, D, D) &&
+                  olc_tensor(&l->vk_gate, l->gate, D, E);
+        if (!lok) {
+            if (!fit) { fprintf(stderr, "[VK] olmoe chain: a matrix did not reach the device; per-matrix path\n"); return NULL; }
+            for (int j = i; j < n; j++) olc_layer_cpu(ch, m, j);
+            vkc_fit_shrink("olmoe", fit, i, vkc_lost() ? "the device was lost" : "an upload was refused");
+            break;
+        }
+        if (coli_vk_dense_device_only()) olm_dho_layer(m, i);   /* the layer is there whole: its host copies go */
+        if (fit) vkc_fit_mark(fit, i);
+        placed = i + 1;
     }
-    ok = ok && olc_tensor(&m->vk_lm_head, m->lm_head, D, c->vocab);
-    if (!ok) { fprintf(stderr, "[VK] olmoe chain: a matrix did not reach the device; per-matrix path\n"); return NULL; }
+    if (!ok) {   /* the parameter buffer was refused: no layer is placed */
+        for (int i = 0; i < n; i++) olc_layer_cpu(ch, m, i);
+        vkc_fit_shrink("olmoe", fit, 0, vkc_lost() ? "the device was lost" : "its parameter buffer was refused");
+    }
+    ch->n = placed;
+    if (!placed) {   /* nothing of the chain stays: its arena, blocks and frames go */
+        vkc_free(ch->prm); ch->prm = NULL;
+        if (!m->vk_lm_head) m->vk_lm_head = &g_vk_refused;
+        g_vk_chain = 0;
+        vkc_shutdown();
+    }
+    if (fit) vkc_fit_placed("olmoe", fit);
+    if (!placed) return NULL;
+    /* the head: with every layer, and room for it (the fit's tail) */
+    ch->head = (!fit || fit->tail) && olc_tensor(&m->vk_lm_head, m->lm_head, D, c->vocab);
+    if (!ch->head) {
+        if (fit) fit->tail = 0;
+        if (!m->vk_lm_head) m->vk_lm_head = &g_vk_refused;
+    } else if (coli_vk_dense_device_only()) olm_dho_layer(m, -1);
     ch->ok = 1;
-    fprintf(stderr, "[VK] olmoe chain: %d layers on the device, %.1f MiB of parameters\n", L, n * 4 / 1048576.0);
+    fprintf(stderr, "[VK] olmoe chain: %d layers on the device%s, %.1f MiB of parameters\n", placed,
+            ch->head ? "" : ", the head on the CPU", np * 4 / 1048576.0);
     return ch;
 }
 
-/* olc_res counts instead of reserving while g_olc_count >= 0 (the chunk's sizing) */
+/* olc_res counts instead of reserving while g_olc_count >= 0 (the chunk's sizing), and
+ * adds each buffer's device bytes to *g_olc_fitsum while it is set (the fit) */
 static long long g_olc_count = -1;
+static size_t *g_olc_fitsum;
 static int olc_res(VkcBuf **b, size_t floats, int kind) {
+    if (g_olc_fitsum) { *g_olc_fitsum += vkc_fit_buf((floats ? floats : 1) * sizeof(float)); return 1; }
     if (g_olc_count >= 0) { g_olc_count += (long long)(floats ? floats : 1) * (long long)sizeof(float); return 1; }
     return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind);
 }
 static int olc_bufs(OlmChain *ch, Model *m, int rows);
+
+/* ---- the fit: how many layers the chain places (vk_chain.h, vkc_fit) -------------- */
+/* In model_init, before olm_dho_start and the tier: the chain decided as olm_dho_start
+ * and olc_start decide it (silently: olc_start prints it after the tier), its pipelines
+ * up, and N from each layer's bytes (q, k, v, o and the router as f32 tensors, the K/V
+ * mirror at the split's floor of three blocks, its share of the parameter arena), the
+ * fixed bytes (one prompt chunk's scratch from the reservations themselves, its rows'
+ * read-back, PILOT's) and lm_head as the tail. The CPU's layers and (unless the fit puts
+ * it up) the head are marked refused. N = 0: the chain off, its blocks released. Not run
+ * for a geometry the shaders do not take (the chain declines at its first forward, as
+ * before). */
+static void olc_fit_start(Model *m) {
+    Cfg *c = &m->c; int L = c->n_layers, D = c->hidden, E = c->n_experts, H = c->n_heads, hd = c->head_dim;
+    if (!g_vk_ready || !olc_geometry_ok(c)) return;
+    if (!coli_vk_chain_decide(NULL, vkt_wanted() && E > 0, OLMOE_CHAIN_IGPU)) return;
+    size_t *per = calloc((size_t)L, sizeof *per), *mat = calloc((size_t)L, sizeof *mat);
+    if (!per || !mat) { free(per); free(mat); return; }
+    const char *e = getenv("COLI_VK_KV_BLOCK");
+    int B = e && *e ? atoi(e) : 64;
+    if (B < 1) B = 1;
+    for (int i = 0; i < L; i++) {
+        per[i] = 4 * vkc_fit_tensor(10, D, D, 0) + vkc_fit_tensor(10, D, E, 0) +
+                 2 * vkc_fit_buf((size_t)H * 3 * B * hd * sizeof(float)) + 4 * (size_t)D * sizeof(float);
+        mat[i] = 4 * coli_vk_tensor_payload(10, D, D, 0) + coli_vk_tensor_payload(10, D, E, 0);
+    }
+    OlmChain cnt; memset(&cnt, 0, sizeof cnt);
+    int rows = vkc_fit_rows(256);
+    size_t fixed = vkc_fit_buf((size_t)D * sizeof(float)) + vkc_fit_buf(4);
+    g_olc_fitsum = &fixed;
+    olc_bufs(&cnt, m, rows);
+    olc_res(&cnt.xd, (size_t)rows * D, VKC_DOWN);
+    if (g_pilot) olc_res(&cnt.xpd, (size_t)rows * D, VKC_DOWN);
+    g_olc_fitsum = NULL;
+    size_t tail = m->lm_head ? vkc_fit_tensor(10, D, c->vocab, 0) : 0;
+    int n = vkc_fit("olmoe", L, per, mat, fixed, tail, &g_olc_fit);
+    free(per); free(mat);
+    /* the chain's pipelines now, after the fit read the free memory */
+    if (n > 0 && !vkc_init()) return;   /* no chain after all (olc_start finds it so too): no fit */
+    g_olc_fit_on = 1;
+    for (int i = n; i < L; i++) olc_layer_cpu(NULL, m, i);
+    if (!g_olc_fit.tail && !m->vk_lm_head) m->vk_lm_head = &g_vk_refused;
+    if (n == 0) vkc_fit_placed("olmoe", &g_olc_fit);   /* the chain off: nothing of it on the device */
+}
+/* After the dense-host decision, before the tier: the chain's N layers (and the head) on
+ * the device now, so the tier sizes its budget from what is left. */
+static void olc_place(Model *m) {
+    if (g_olc_fit_on && g_olc_fit.n) olc_setup(m);
+}
 /* Prompt rows per chunk (vkc_chunk_rows): the chain's scratch a row, counted from the
  * reservations, and the routed experts' outputs (the tier's rows, the CPU's
  * contributions, and the host's sum). */
@@ -164,10 +287,10 @@ static int olc_mirror(OlmChain *ch, Model *m) {
     Cfg *c = &m->c; int H = c->n_heads, hd = c->head_dim;
     if (ch->cap != m->max_t || ch->hostK != m->K) {   /* the host cache is new: mirror it again (whole, or split) */
         size_t row = (size_t)H * hd * 2 * sizeof(float);
-        int plan = vkc_kv_plan(&ch->ks, "olmoe", c->n_layers, row, m->max_t, 1, 0, (size_t)c->n_layers * ch->dev_rows * row);
+        int plan = vkc_kv_plan(&ch->ks, "olmoe", ch->n, row, m->max_t, 1, 0, (size_t)ch->n * ch->dev_rows * row);
         if (!plan) { ch->cap = 0; ch->hostK = NULL; return 0; }
         ch->dev_rows = ch->ks.on ? ch->ks.rows : m->max_t;
-        for (int i = 0; i < c->n_layers; i++) {
+        for (int i = 0; i < ch->n; i++) {
             vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
             ch->kv_valid[i] = 0;
             ch->kc[i] = vkc_buf((size_t)H * ch->dev_rows * hd * sizeof(float), VKC_DEV);
@@ -198,7 +321,7 @@ static int olc_scratch(OlmChain *ch, Model *m, int rows) {
 static void olc_cpu_step(Model *m, int pos_base) {
     OlmChain *ch = (OlmChain *)m->vkchain;
     if (!ch || !ch->ok) return;
-    for (int i = 0; i < m->c.n_layers; i++) {
+    for (int i = 0; i < ch->n; i++) {
         if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
         vkc_kv_lower(&ch->ks, i, pos_base);
     }
@@ -207,7 +330,7 @@ static void olc_cpu_step(Model *m, int pos_base) {
  * of n rows (the split places its window). */
 static int olc_push_kv(OlmChain *ch, Model *m, int pos_base, int n_rows) {
     Cfg *c = &m->c; int hd = c->head_dim, ok = 1;
-    for (int i = 0; i < c->n_layers && ok; i++) {
+    for (int i = 0; i < ch->n && ok; i++) {
         if (ch->ks.on) {
             VkcKvPart pt[2] = {{c->n_heads, hd, m->K[i], (size_t)m->max_t * hd, ch->kc[i], 0},
                                {c->n_heads, hd, m->V[i], (size_t)m->max_t * hd, ch->vc[i], 0}};
@@ -280,13 +403,18 @@ static void olc_lost(Model *m, int pos_base) {
 
 /* Every layer for S rows from host rows xh, the last row's logits into `logit`; xh gets
  * the final rows back when want_x. 0 = not taken: the host cache below pos_base and xh
- * are as they were, and the caller runs the step on the CPU. */
-static int olc_forward(Model *m, float *xh, int S, int pos_base, int want_x, float *logit) {
+ * are as they were, and the caller runs the step on the CPU. Otherwise the layers it
+ * ran: with a partial chain (N layers, or the head on the CPU) *rows_only is 1, xh holds
+ * every row's residual after those layers, and the caller runs the rest and the head. */
+static int olc_forward(Model *m, float *xh, int S, int pos_base, int want_x, float *logit, int *rows_only) {
+    *rows_only = 0;
     if (!g_vk_chain) return 0;
     if (g_vk_chain == COLI_VK_CHAIN_PREFILL && S <= 2) return 0;   /* prompts only: decode on the CPU */
     OlmChain *ch = olc_setup(m);
     if (!ch || ch->failed) return 0;
-    Cfg *c = &m->c; int D = c->hidden, L = c->n_layers, E = c->n_experts, H = c->n_heads, hd = c->head_dim;
+    Cfg *c = &m->c; int D = c->hidden, L = ch->n, E = c->n_experts, H = c->n_heads, hd = c->head_dim;   /* L: the device's layers */
+    int part = L < c->n_layers || !ch->head;
+    if (part) want_x = 1;   /* the residual comes back; the CPU runs the rest and the head */
     int mirror_ok = olc_mirror(ch, m);
     int CH = mirror_ok ? olc_chunk_rows(ch, m) : 1, rows = S < CH ? S : CH, half = hd / 2;
     if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
@@ -341,16 +469,16 @@ static int olc_forward(Model *m, float *xh, int S, int pos_base, int want_x, flo
                 memcpy(m->V[i] + dst, kv + (size_t)ch->rows * D + src, hd * sizeof(float));
             }
             const float *xa = pilot ? (const float *)vkc_ptr(ch->xpd) : NULL;
-            if (pilot && i + 1 < L) pilot_prefetch(m, i + 1, xa, n);
+            if (pilot && i + 1 < c->n_layers) pilot_prefetch(m, i + 1, xa, n);   /* the model's next layers, wherever they run */
             double t1 = now_s();
             moe_routed(m, i, (float *)vkc_ptr(ch->h2d), n, (float *)vkc_ptr(ch->lgd), ch->host_routed);
             memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)n * D * sizeof(float));
             double t2 = now_s();
             g_prof_moe_s += t2 - t1; ch->host_ms += (t2 - t1) * 1e3;
-            if (pilot && g_pilot >= 2 && i + 2 < L) {   /* the residual after the MoE, as the device will add it */
+            if (pilot && g_pilot >= 2 && i + 2 < c->n_layers) {   /* the residual after the MoE, as the device will add it */
                 for (size_t j = 0; j < (size_t)n * D; j++) ch->xpost[j] = xa[j] + ch->host_routed[j];
                 pilot_prefetch(m, i + 2, ch->xpost, n);
-                if (g_pilot >= 3 && i + 3 < L) pilot_prefetch(m, i + 3, ch->xpost, n);
+                if (g_pilot >= 3 && i + 3 < c->n_layers) pilot_prefetch(m, i + 3, ch->xpost, n);
             }
             ok = vkc_begin();
         }
@@ -358,19 +486,20 @@ static int olc_forward(Model *m, float *xh, int S, int pos_base, int want_x, flo
                   ok = vkc_ew(ch->x, ch->x, ch->routed, NULL, NULL, &cb); }
         if (ok && want_x) ok = vkc_copy(ch->xd, 0, ch->x, 0, (size_t)n * D);
         int last = c0 + n == S;
-        if (ok && last) ok = olc_norm(ch->x, (size_t)(n - 1) * D, ch->prm, ch->o_final, ch->fin, 0, 1, D, c->eps) &&
-                             vkc_matmul((ColiVkTensor *)m->vk_lm_head, ch->fin, 0, ch->outd, 0, 1);
+        if (ok && last && !part) ok = olc_norm(ch->x, (size_t)(n - 1) * D, ch->prm, ch->o_final, ch->fin, 0, 1, D, c->eps) &&
+                                      vkc_matmul((ColiVkTensor *)m->vk_lm_head, ch->fin, 0, ch->outd, 0, 1);
         double t0 = now_s();
         ok = ok && vkc_submit(1);
         g_prof_head_s += now_s() - t0;
         if (!ok) goto lost;
         if (want_x) memcpy(xfin + (size_t)c0 * D, vkc_ptr(ch->xd), (size_t)n * D * sizeof(float));
         for (int i = 0; i < L; i++) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, i, pb + n); }
-        if (last) memcpy(logit, vkc_ptr(ch->outd), (size_t)c->vocab * sizeof(float));
+        if (last && !part) memcpy(logit, vkc_ptr(ch->outd), (size_t)c->vocab * sizeof(float));
     }
     if (want_x) { memcpy(xh, xfin, (size_t)S * D * sizeof(float)); free(xfin); }
     ch->forwards++;
-    return 1;
+    *rows_only = part;
+    return L;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost(); }
     free(xfin);
@@ -392,10 +521,14 @@ static void olc_report(Model *m) {
 /* COLI_VK_CHAIN, decided after the tier (model_init): the chain's pipelines, and its
  * teardown registered after the tier's so that it runs first at exit. */
 static void olc_start(Model *m) {
-    (void)m;
     if (!g_vk_ready) return;
     /* measured on a Radeon 780M (docs/vulkan.md, "OLMoE and Inkling") */
     g_vk_chain = coli_vk_chain_decide("olmoe", vkt_ready(), OLMOE_CHAIN_IGPU);
+    if (g_olc_fit_on) {   /* the chain was set up in model_init (olc_place) */
+        OlmChain *ch = (OlmChain *)m->vkchain;
+        if (!(ch && ch->ok)) g_vk_chain = 0;   /* N = 0, or no layer reached the device */
+        else if (!g_vk_chain) vkc_shutdown();   /* the tier did not start after all: the chain's buffers go, the tensors serve the per-matrix path */
+    }
     if (g_vk_chain && !vkc_init()) g_vk_chain = 0;
-    if (g_vk_chain) atexit(vkc_shutdown);
+    if (g_vk_chain || g_olc_fit_on) atexit(vkc_shutdown);
 }

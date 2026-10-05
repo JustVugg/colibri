@@ -68,6 +68,7 @@
 #include "vk_tier.h"
 static int g_vk_ready = 0;
 static int g_vk_chain = 0;   /* COLI_VK_CHAIN decided on, and the chain's pipelines are up (olmoe_chain.h) */
+static int g_olc_fit_on;     /* the partial chain's fit ran: the chain set itself up in model_init (olmoe_chain.h) */
 #endif
 
 #ifdef _WIN32
@@ -343,8 +344,11 @@ static void vk_res_free(void **vk) {
     *vk = NULL;
 }
 static void olmoe_vk_report(void) {
-    if (g_vk_ready)
-        fprintf(stderr, "[VK] olmoe: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
+    if (!g_vk_ready) return;
+    size_t bytes = 0, tensors = 0;   /* the dense matrices on the device (a partial chain: its layers' only) */
+    coli_vk_mem_info(&bytes, &tensors);
+    fprintf(stderr, "[VK] olmoe: %llu matmuls on the GPU (%zu matrices resident, %.1f MiB)\n", coli_vk_matmul_calls(),
+            tensors, bytes / 1048576.0);
 }
 #define MATMUL_RES(y, x, W, vk, S, I, O) matmul_res(y, x, W, &(vk), S, I, O)
 #else
@@ -733,7 +737,10 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
 #ifdef COLI_VULKAN
 static void olmoe_vk_tier_start(Model *m);
 static void olc_start(Model *m);
+static void olc_fit_start(Model *m);
+static void olc_place(Model *m);
 static void olm_dho_start(Model *m);
+static void olm_dho_finish(Model *m);
 #endif
 static void model_init(Model *m, const char *snap, int cap, int bits) {
     model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
@@ -744,7 +751,9 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
      * the expert tier will be tried (vk_tier.h step 0): on a device sharing the
      * CPU's RAM the dense matrices then stay on the CPU unless COLI_VK_DENSE=1. */
     if (!g_vk_ready) g_vk_ready = coli_vk_init_env_tier("olmoe", vkt_wanted() && m->c.n_experts > 0);
+    if (g_vk_ready) olc_fit_start(m);   /* COLI_VK_CHAIN: how many layers the chain places (vkc_fit), before any upload */
     if (g_vk_ready) olm_dho_start(m);   /* COLI_VK_DENSE_HOST: the dense matrices on the device only, before the tier sizes its budget */
+    if (g_vk_ready) { olc_place(m); olm_dho_finish(m); }   /* the chain's layers on the device now, so the tier sizes after them */
     if (g_vk_ready) olmoe_vk_tier_start(m);   /* after the history: COLI_USAGE, read above */
     if (g_vk_ready && !vkt_ready() && !coli_vk_dense()) coli_vk_dense_decide("olmoe", 0, 1);   /* no tier after all */
     if (g_vk_ready && coli_vk_dense())
@@ -847,7 +856,9 @@ static void olmoe_vk_tier_start(Model *m) {
     if (!vkt_wanted() || c->n_experts < 1) return;
     int64_t D = c->hidden, I = c->inter;
     size_t slotb = (size_t)(3 * I * D + (2 * I + D) * 4);
-    size_t dense = coli_vk_dense() && !coli_vk_dense_device_only()   /* device only: placed already */
+    /* device only, or the chain set up already with its fit (olc_place: the CPU's layers
+     * refused): placed already, or never going up */
+    size_t dense = coli_vk_dense() && !coli_vk_dense_device_only() && !g_olc_fit_on
                  ? (size_t)c->n_layers * (size_t)(4 * D * D + (int64_t)c->n_experts * D) * 4 +
                    (size_t)c->vocab * (size_t)D * 4 : 0;
     VktConfig vc = {.engine = "olmoe", .layers = c->n_layers, .experts = c->n_experts,
@@ -1439,17 +1450,15 @@ static void olm_dho_grow_cap(Model *m, size_t dropped) {
     fprintf(stderr, "[cache] %d slots/layer of %d experts (was %d): the dense weights on the device only gave "
                     "%.2f GB back, %.2f GB dense resident now\n", derived, c->n_experts, was, dropped / 1e9, resident);
 }
-static void olm_dho_start(Model *m) {
-    Cfg *c = &m->c;
-    int D = c->hidden, E = c->n_experts;
-    size_t bytes = (size_t)c->n_layers * (size_t)(4 * (int64_t)D * D + (int64_t)E * D) * sizeof(float) +
-                   (size_t)c->vocab * (size_t)D * sizeof(float);
-    int chain = coli_vk_chain_decide(NULL, vkt_wanted() && c->n_experts > 0, OLMOE_CHAIN_IGPU);
-    if (!coli_vk_dense_host_decide("olmoe", (chain || coli_vk_dense()) && m->lm_head, bytes)) return;
-    g_olm_dho_model = m;
+/* Layer i's five matrices (i = -1: lm_head) uploaded if they are not yet, their host
+ * copies given back; the bytes given back. */
+static size_t g_olm_dho_dropped;
+static size_t olm_dho_layer(Model *m, int i) {
+    Cfg *c = &m->c; int D = c->hidden, E = c->n_experts;
     size_t dropped = 0;
     char nm[96];
-    for (int i = 0; i < c->n_layers; i++) {
+    if (i < 0) olm_dho_drop(m, &m->lm_head, &m->vk_lm_head, "lm_head.weight", D, c->vocab, &dropped);
+    else {
         Layer *l = &m->L[i];
         snprintf(nm, sizeof nm, "model.layers.%d.self_attn.q_proj.weight", i); olm_dho_drop(m, &l->q, &l->vk_q, nm, D, D, &dropped);
         snprintf(nm, sizeof nm, "model.layers.%d.self_attn.k_proj.weight", i); olm_dho_drop(m, &l->k, &l->vk_k, nm, D, D, &dropped);
@@ -1457,9 +1466,35 @@ static void olm_dho_start(Model *m) {
         snprintf(nm, sizeof nm, "model.layers.%d.self_attn.o_proj.weight", i); olm_dho_drop(m, &l->o, &l->vk_o, nm, D, D, &dropped);
         snprintf(nm, sizeof nm, "model.layers.%d.mlp.gate.weight", i); olm_dho_drop(m, &l->gate, &l->vk_gate, nm, D, E, &dropped);
     }
-    olm_dho_drop(m, &m->lm_head, &m->vk_lm_head, "lm_head.weight", D, c->vocab, &dropped);
+    g_olm_dho_dropped += dropped;
+    return dropped;
+}
+/* With the fit of a partial chain (olc_fit_start) only the N layers' matrices (and the
+ * head's when it goes up) count: the CPU's are refused. The chain's setup then drops each
+ * layer's host copies once the layer is on the device (olc_place), and olm_dho_finish
+ * says what was given back and grows an automatic cache by it. */
+static void olm_dho_start(Model *m) {
+    Cfg *c = &m->c;
+    int D = c->hidden, E = c->n_experts;
+    size_t bytes = 0;
+    for (int i = 0; i < c->n_layers; i++)
+        if (m->L[i].vk_q != (void *)&g_vk_refused) bytes += (size_t)(4 * (int64_t)D * D + (int64_t)E * D) * sizeof(float);
+    if (m->vk_lm_head != (void *)&g_vk_refused) bytes += (size_t)c->vocab * (size_t)D * sizeof(float);
+    int chain = coli_vk_chain_decide(NULL, vkt_wanted() && c->n_experts > 0, OLMOE_CHAIN_IGPU);
+    if (g_olc_fit_on) chain = chain && g_olc_fit.n > 0;
+    if (!coli_vk_dense_host_decide("olmoe", (chain || coli_vk_dense()) && m->lm_head && bytes, bytes)) return;
+    g_olm_dho_model = m;
+    if (g_olc_fit_on && chain) return;   /* olc_place drops them layer by layer, olm_dho_finish reports */
+    for (int i = 0; i < c->n_layers; i++) olm_dho_layer(m, i);
+    olm_dho_layer(m, -1);
     coli_vk_dense_host_placed("olmoe", "the embedding (its rows are gathered on the CPU), norms");
-    olm_dho_grow_cap(m, dropped);
+    olm_dho_grow_cap(m, g_olm_dho_dropped);
+}
+static void olm_dho_finish(Model *m) {
+    if (!g_olc_fit_on || !g_olc_fit.n || !coli_vk_dense_device_only()) return;
+    coli_vk_dense_host_layers(g_olc_fit.n, g_olc_fit.L);
+    coli_vk_dense_host_placed("olmoe", "the embedding (its rows are gathered on the CPU), norms");
+    olm_dho_grow_cap(m, g_olm_dho_dropped);
 }
 #endif
 
@@ -1483,16 +1518,20 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
      * back only when the prefill read-out below needs every row */
     float *chain_logit = NULL;
+    int chain_n = 0;   /* layers the chain ran (a partial chain: the CPU runs the rest and the head) */
     if (g_vk_chain) {
+        int rows_only = 0;
         chain_logit = falloc(c->vocab);
-        if (!olc_forward(m, x, S, pos_base, g_echo_k > 0 && g_echo_id && S > 1, chain_logit)) {
+        chain_n = olc_forward(m, x, S, pos_base, g_echo_k > 0 && g_echo_id && S > 1, chain_logit, &rows_only);
+        if (!chain_n) {
             free(chain_logit); chain_logit = NULL;
             olc_cpu_step(m, pos_base);
-        }
+        } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
     }
-    if (!chain_logit)
-#endif
+    if (!chain_logit) layers_forward_range(m, x, S, pos_base, chain_n, c->n_layers, 1);
+#else
     layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1);
+#endif
     /* count actual tokens processed (S>1 during prefill) */
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens)

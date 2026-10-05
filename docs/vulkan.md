@@ -836,6 +836,28 @@ Prompt-cache and prefix reuse need nothing else: a reused prefix is rows below t
 watermark and a recurrent state that already sits where the next step expects it.
 The serve and prefix tests run with the chain on (below).
 
+**qwen36 with a partial chain** ([a partial chain](#a-partial-chain)). When its layers
+do not all fit the device, qwen36 places layers 0..N-1 (their matrices, the DeltaNet's
+b|a rows and the shared expert's gate row, the DeltaNet state and conv rings, the K/V
+mirrors) and the CPU runs layers N..L-1 and the head. The fit counts a layer's K/V
+mirror at the split's floor of three blocks of `COLI_VK_KV_BLOCK` positions; past it the
+split decides from what is free at the first forward. qwen36 decides N at start, before
+the dense-host decision and the tier, and sets the chain up there and then instead of at
+its first forward, one whole layer at a time; the tier then sizes itself from what is
+left (its `dense_bytes` is 0: nothing is still to come). A forward runs the N layers
+chunk by chunk as above and copies every row's residual after layer N-1 to the host once
+per chunk; the CPU then runs its layers over all the rows, layer by layer, and the head.
+The device's layers keep their state on the device (the K/V mirrors and their
+watermarks, the DeltaNet state and a verify's copies), the CPU's layers on the host (their
+K/V rows, their DeltaNet state and the CPU's verify snapshots): a rejected draft rolls each
+side back with its own copies. A device lost mid-forward rebuilds the N layers' DeltaNet
+state from the prefix record; the CPU's layers have not run that forward, so theirs is
+already the host's. With the dense weights on the device only, a layer's host copies go
+once the whole layer is on the device; the CPU's layers keep theirs and never read a
+matrix back. The matrices of the CPU's layers (and the head's, when it stays) are marked
+so that the per-matrix path never uploads them either. `tests/vulkan_engines.sh
+partial-qwen36-olmoe` gates it on Lavapipe ([below](#olmoe-and-inkling)).
+
 **What stays on the CPU.** The routed experts the tier does not hold, the router's
 top-k, the embedding gather and the vision tower's rows, Qwen3.8's n-gram table reads
 and the MTP head (its experts are FP8 beside the int4 sidecar, a few rows per draft).
@@ -1076,6 +1098,33 @@ slot) and read another expert into it mid-matmul. A slot now counts its readers,
 neither eviction takes one being read. A device lost mid-step: olmoe redoes the step on
 the CPU (attention only, nothing to rebuild); inkling rebuilds its K/V and convolution
 states on the CPU from the prefix record, as qwen36 does.
+
+**olmoe with a partial chain** ([a partial chain](#a-partial-chain)). olmoe decides N in
+`model_init`, before the dense-host decision and the tier: it takes the chain's on/off
+decision there from the same inputs, silently, as the dense-host decision already did
+(the `[VK] olmoe: dense chain ...` line still follows the tier), brings the chain's
+pipelines up and sets the N layers up there and then. A forward runs the N layers and
+copies every row's residual to the host; the CPU runs layers N..L-1 and the head over
+all the rows. Only the N layers mirror their K/V rows (the split covers those); the
+CPU's layers keep theirs on the host. `PILOT` keeps prefetching the model's next layers
+from the chain's rows, wherever those layers run. A device lost mid-step: the CPU redoes
+the step from its embedding rows, as before (the CPU's layers had not run it). With the
+dense weights on the device only, the automatic cache grows by the N layers' host copies
+alone.
+
+**Partial-chain tests** (`tests/vulkan_engines.sh partial-qwen36-olmoe`, and
+`partial-qwen36-olmoe-sanitize` under ASan and UBSan). For qwen36 (the hybrid, Qwen3-Coder,
+the 27B dense geometry, int8 and int4-g64 rows, an image) and olmoe: `COLI_VK_CHAIN_LAYERS`
+from 0 to L against the CPU's tokens and logits, with the matrices on the device after
+setup the N layers' exactly; a `COLI_VK_DEVICE_CAP_MB` computed from a probe so that
+exactly k layers fit; an upload failing inside layer k's setup (N = k, nothing of layer k
+left on the device); and with N < L prompt chunks with expert streaming, the tiled GEMM,
+the tier off, prompts only, prompt-lookup verifies (against the CPU and byte for byte
+against the same run without drafts), the KV split with a host part, a lost device
+mid-decode, serve sessions with pins and prefix reuse, Clef's oracle, olmoe's `PILOT`,
+and the dense weights on the device only (the N layers' matrices dropped alone, none read
+back on a healthy run, only theirs after a lost device). On Lavapipe only: no discrete
+GPU was available, so the placement on a real card's budget is the cap's emulation.
 
 **OLMoE-1B-7B on the Radeon 780M** (`allenai/OLMoE-1B-7B-0924`, converted with
 `tools/convert_olmoe_merged.py`: int8 experts, f32 trunk; cap 64, `OMP_NUM_THREADS=8`,
@@ -2275,6 +2324,8 @@ predict a layer more than the engine places.
 | Engine | What the handoff moves | On the partial chain |
 |---|---|---|
 | deepseek_v4 | the hc_mult streams; DSpark's taps of the last three layers come from whichever side ran them | yes |
+| qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B, Clef) | the residual rows alone; a prompt-lookup verify rolls each side back with its own copies (the device's DeltaNet slots, the CPU's snapshots) ([qwen36](#the-dense-chain-vk_chainc)) | yes |
+| olmoe | the residual rows alone; `PILOT` keeps prefetching the next layers from the chain's rows ([olmoe](#olmoe-and-inkling)) | yes |
 
 **`COLI_VK_DEVICE_CAP_MB=n`** (tests) makes the device hold at most n MiB of device-local
 memory (a fraction is taken): every allocation of the backend and the chain (tensors, the
