@@ -1006,15 +1006,17 @@ static int  slot_busy(const Slot *s) { return __atomic_load_n(&s->busy, __ATOMIC
  * recently used one that is neither being loaded (eid < 0) nor computed from
  * (busy), unpinned unless allow_pinned. -1 when there is none. The demand
  * path and the PILOT worker both pick here, so neither can evict an expert a
- * moe run is still reading. */
-static int slot_victim(const LCache *lc, int allow_pinned) {
-    int lru = -1;
+ * moe run is still reading. One whose expert the Vulkan tier holds goes first
+ * (vkt_ram_first: RAM and VRAM do not keep the same experts when RAM is short). */
+static int slot_victim(const LCache *lc, int layer, int allow_pinned) {
+    int lru = -1, dev = -1;
     for (int i = 0; i < lc->n; i++) {
         const Slot *s = &lc->slots[i];
         if (s->eid < 0 || slot_busy(s) || (s->pinned && !allow_pinned)) continue;
+        if (vkt_ram_first(layer, s->eid)) { if (dev < 0 || s->used < lc->slots[dev].used) dev = i; continue; }
         if (lru < 0 || s->used < lc->slots[lru].used) lru = i;
     }
-    return lru;
+    return dev >= 0 ? dev : lru;
 }
 
 static void ensure_pilot_worker_started(Model *m) {
@@ -2693,8 +2695,8 @@ static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
     else {
         /* LRU eviction: an unpinned slot first, else the oldest pinned one;
          * never one being loaded or computed from. */
-        int lru = slot_victim(lc, 0);
-        if (lru < 0) lru = slot_victim(lc, 1);
+        int lru = slot_victim(lc, layer, 0);
+        if (lru < 0) lru = slot_victim(lc, layer, 1);
         while (lru < 0) {
             /* Every slot is held or being loaded. Only this thread holds (the
              * PILOT worker never does) and a moe run holds fewer slots than
@@ -2718,9 +2720,10 @@ static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
             pthread_mutex_unlock(&g_pilot_mx);
             sleep_ms(1);
             pthread_mutex_lock(&g_pilot_mx);
-            lru = slot_victim(lc, 1);
+            lru = slot_victim(lc, layer, 1);
         }
         s = &lc->slots[lru]; s->pinned = 0;
+        if (vkt_ram_first(layer, s->eid)) vkt_ram_gave();
     }
     cache_hide(m, layer, s); s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
@@ -4103,9 +4106,10 @@ static void pilot_realload(Model *m, int layer, int eid) {
     Slot *s;
     if (lc->n < lc->cap) { s = &lc->slots[lc->n++]; slot_ensure_allocated(m, s); }
     else {
-        int lru = slot_victim(lc, 0);
+        int lru = slot_victim(lc, layer, 0);
         if (lru < 0) { m->is_queued[layer*c->n_experts+eid]=0; pthread_mutex_unlock(&g_pilot_mx); return; }
         s = &lc->slots[lru]; s->pinned = 0;
+        if (vkt_ram_first(layer, s->eid)) vkt_ram_gave();
     }
     cache_hide(m, layer, s); s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
@@ -4182,6 +4186,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
                  * never fired (#1391). tier_offer_slot handles both formats. */
                 tier_offer_slot(lnext, eid, ps);
             }
+            if (!found && vkt_ram_first(lnext, eid)) found = 1;   /* the device serves it: nothing to read */
             if (!found) {
                 int gidx = lnext*E + eid;
                 pthread_mutex_lock(&g_pilot_mx); int already_queued = m->is_queued[gidx];

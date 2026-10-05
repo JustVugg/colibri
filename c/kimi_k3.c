@@ -1995,11 +1995,13 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
                 /* LRU over the UNPINNED slots. pin_seed caps pinned at cap/2, so a
                  * victim always exists; the -1 fallback is a belt-and-braces guard
                  * against a future caller pinning everything and deadlocking here. */
-                int lru=-1;
+                int lru=-1, dev=-1;   /* an expert the Vulkan tier holds goes first (vkt_ram_first) */
                 for(int i=0;i<lc->n;i++){
                     if(lc->s[i].pinned) continue;
+                    if(lc->s[i].eid>=0 && vkt_ram_first(li,lc->s[i].eid)){ if(dev<0 || lc->s[i].used<lc->s[dev].used) dev=i; continue; }
                     if(lru<0 || lc->s[i].used<lc->s[lru].used) lru=i;
                 }
+                if(dev>=0){ lru=dev; vkt_ram_gave(); }
                 if(lru<0) break;                    /* every slot pinned: keep the read */
                 dst=&lc->s[lru];
             }

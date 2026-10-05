@@ -86,6 +86,10 @@ static int g_ink_dho = 0;       /* COLI_VK_DENSE_HOST: the dense matrices on the
  * device; L = 0 while there is none (the chain off, or one that declines as before). */
 static VkcFit g_inkc_fit;
 #endif
+#ifndef COLI_VULKAN   /* exclusive RAM/VRAM (vk_tier.h) is the Vulkan build's: no device holds an expert */
+static inline int  vkt_ram_first(int layer, int eid) { (void)layer; (void)eid; return 0; }
+static inline void vkt_ram_gave(void) {}
+#endif
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <sys/sysctl.h>
@@ -1543,9 +1547,16 @@ static Slot *slot_acquire(Model *m, int layer, int eid) {
                                   if (!s->q13 || !s->q2) { fprintf(stderr,"OOM expert slot\n"); exit(1); } }
         else                    { s->f13 = falloc(n13); s->f2 = falloc(n2); }
     } else {
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++)
-            if (!lc->slots[i].pinned && (lru < 0 || lc->slots[i].used < lc->slots[lru].used)) lru = i;
+        int lru = -1, dev = -1;   /* an expert the Vulkan tier holds goes first (vkt_ram_first) */
+        for (int i = 0; i < lc->n; i++) {
+            if (lc->slots[i].pinned) continue;
+            if (lc->slots[i].eid >= 0 && vkt_ram_first(layer, lc->slots[i].eid)) {
+                if (dev < 0 || lc->slots[i].used < lc->slots[dev].used) dev = i;
+                continue;
+            }
+            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+        }
+        if (dev >= 0) { lru = dev; vkt_ram_gave(); }
         if (lru < 0) { fprintf(stderr, "layer %d: cache cap %d entirely pinned\n", layer, lc->cap); exit(1); }
         s = &lc->slots[lru];
     }

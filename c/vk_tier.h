@@ -21,7 +21,12 @@
  *     hottest on the primary device, the next ones on the second (its budget: its free
  *     memory less COLI_VK_RESERVE2_GB, at most COLI_VK_EXPERTS2 experts when set), each
  *     step one batch per device, both in flight at once. Nothing changes for the
- *     engine: the calls below are the same with one device or two.
+ *     engine: the calls below are the same with one device or two;
+ *   - keeps the RAM and the VRAM from holding the same experts when RAM is short
+ *     (COLI_VK_TIER_EXCLUSIVE, on unless 0): an engine's RAM expert cache that must
+ *     evict gives up first a slot whose expert the device holds (vkt_ram_first), and
+ *     the prefetchers that read experts into RAM skip what the device holds. With RAM
+ *     to spare nothing is evicted and nothing changes.
  * With COLI_VULKAN unset, COLI_VK_TIER=0, a CUDA tier active, or a build without
  * VK=1 (the inline stubs below), nothing here runs and the engine is unchanged.
  *
@@ -237,6 +242,13 @@ int  vkt_step_rows(int S, int block);
 int  vkt_stream_prefetch(int layer, int S);
 /* How many devices hold experts: 0 (the tier is off), 1, or 2 (COLI_VK_DEV2's too). */
 int  vkt_devices(void);
+/* Exclusive RAM/VRAM: 1 when the device holds this expert and the tier wants the RAM
+ * copy given up first (COLI_VK_TIER_EXCLUSIVE unset or not 0). An engine's RAM cache
+ * asks it while it picks the slot to evict (prefer such a slot to its LRU choice) and
+ * its prefetchers before reading an expert; vkt_ram_gave() counts a slot given up so.
+ * Any thread (the prefetch workers too): it reads the slot table without the engine. */
+int  vkt_ram_first(int layer, int eid);
+void vkt_ram_gave(void);
 #else
 static inline int  vkt_wanted(void){return 0;}
 static inline int  vkt_init(const VktConfig *c, uint32_t *const *h){(void)c;(void)h;return 0;}
@@ -257,6 +269,8 @@ static inline size_t vkt_expert_bytes(int h,int i,VktFmt a,VktFmt b){(void)h;(vo
 static inline int  vkt_step_rows(int S,int b){return S<b?S:b;}
 static inline int  vkt_stream_prefetch(int l,int S){(void)l;(void)S;return 0;}
 static inline int  vkt_devices(void){return 0;}
+static inline int  vkt_ram_first(int l,int e){(void)l;(void)e;return 0;}
+static inline void vkt_ram_gave(void){}
 #endif
 
 #endif

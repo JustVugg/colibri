@@ -1636,6 +1636,12 @@ int coli_v4_expert_store_open_planned(
     int slots = (int)(cache_limit / per_slot);
     if (slots > plan.slots_per_layer) slots = plan.slots_per_layer;
     if (slots < options->experts_per_layer && slots < 6) slots = 6;
+    {   /* COLI_V4_EXPERT_SLOTS=n (tests): at most n experts a layer in RAM, never below the
+         * store's minimum (6, or every expert of a smaller layer) */
+        const char *e = getenv("COLI_V4_EXPERT_SLOTS");
+        int n = e && *e ? atoi(e) : 0, least = options->experts_per_layer < 6 ? options->experts_per_layer : 6;
+        if (n > 0 && n < slots) slots = n < least ? least : n;
+    }
     plan.expert_cache_bytes = (uint64_t)slots * per_slot;
     runtime->target_expert_cache_bytes = plan.expert_cache_bytes;
     plan.projected_bytes = fixed + dense_bytes +
@@ -8341,16 +8347,30 @@ static V4ExpertSlot *next_pooled_empty_slot(V4ExpertStoreState *state,
 /* Only referenced (in-use/in-flight) slots can precede the victim.  Therefore
  * passive cache capacity -- and consequently configured RAM -- does not add
  * work to an ordinary miss. */
+/* With coli_v4_expert_store_ram_first set (the Vulkan tier with exclusive RAM/VRAM), a
+ * slot whose expert the device holds goes first: the oldest such one. */
+static int hot_ram_first(const V4ExpertSlot *slot) {
+    int (*first)(int, int) = coli_v4_expert_store_ram_first;
+    return first && slot->owner_layer >= 0 && slot->expert >= 0 && first(slot->owner_layer, slot->expert);
+}
 static V4ExpertSlot *oldest_unreferenced_slot(V4ExpertStoreState *state,
                                               int layer) {
+    V4ExpertSlot *oldest = NULL;
     int index = state->lru_head[layer];
     while (index >= 0) {
         V4ExpertSlot *slot = &state->slots[index];
         V4_COUNT_VICTIM_PROBE();
-        if (!slot->references) return slot;
+        if (!slot->references) {
+            if (!coli_v4_expert_store_ram_first) return slot;
+            if (hot_ram_first(slot)) {
+                if (coli_v4_expert_store_ram_gave) coli_v4_expert_store_ram_gave();
+                return slot;
+            }
+            if (!oldest) oldest = slot;
+        }
         index = slot->lru_next;
     }
-    return NULL;
+    return oldest;
 }
 
 /* All index helpers are called with state->mutex held.  A single table entry
@@ -9347,19 +9367,25 @@ static void hot_repin_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
  * extra slot made possible by more RAM. */
 static V4ExpertSlot *hot_oldest_victim(V4ExpertStoreState *state,
                                        const V4HotPolicy *policy, int layer) {
-    V4ExpertSlot *fallback = NULL;
+    V4ExpertSlot *fallback = NULL, *oldest = NULL;
     int index = state->lru_head[layer];
     while (index >= 0) {
         V4ExpertSlot *slot = &state->slots[index];
         V4_COUNT_VICTIM_PROBE();
         if (!slot->references) {
             if (!fallback) fallback = slot;
-            if (!hot_is_pinned(policy, slot->owner_layer, slot->expert))
-                return slot;
+            if (!hot_is_pinned(policy, slot->owner_layer, slot->expert)) {
+                if (!coli_v4_expert_store_ram_first) return slot;
+                if (hot_ram_first(slot)) {
+                    if (coli_v4_expert_store_ram_gave) coli_v4_expert_store_ram_gave();
+                    return slot;
+                }
+                if (!oldest) oldest = slot;
+            }
         }
         index = slot->lru_next;
     }
-    return fallback;
+    return oldest ? oldest : fallback;
 }
 
 /* Pool-mode victim selection merges the heads of the physical-partition LRU
@@ -9373,6 +9399,8 @@ static V4ExpertSlot *hot_oldest_pool_victim(
     V4ExpertSlot *reserved = NULL;
     V4ExpertSlot *pinned = NULL;
     V4ExpertSlot *last_resort = NULL;
+    V4ExpertSlot *device = NULL;   /* exclusive RAM/VRAM: the oldest lendable one the device holds */
+    const int scan_all = coli_v4_expert_store_ram_first != NULL;
     for (int partition = 0; partition < state->layers; partition++) {
         int index = state->lru_head[partition];
         while (index >= 0) {
@@ -9395,8 +9423,10 @@ static V4ExpertSlot *hot_oldest_pool_victim(
                         if (!pinned || slot->used < pinned->used)
                             pinned = slot;
                     } else {
+                        if (scan_all && hot_ram_first(slot) && (!device || slot->used < device->used))
+                            device = slot;
                         if (!best || slot->used < best->used) best = slot;
-                        break;
+                        if (!scan_all) break;
                     }
                 }
             }
@@ -9407,6 +9437,10 @@ static V4ExpertSlot *hot_oldest_pool_victim(
      * leases or an extremely small cache make that impossible, correctness
      * wins: relax the reserve before evicting a pin, then use the exact oldest
      * unreferenced slot as the final fallback. */
+    if (device) {
+        if (coli_v4_expert_store_ram_gave) coli_v4_expert_store_ram_gave();
+        return device;
+    }
     if (best) return best;
     if (reserved) return reserved;
     if (pinned) return pinned;
@@ -9636,6 +9670,8 @@ void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer) {
  * routing's, whichever side computed it. The store's hit and miss counters are not
  * touched: they describe the RAM cache. */
 int (*coli_v4_expert_store_device_tier)(int layer, int expert);
+int (*coli_v4_expert_store_ram_first)(int layer, int expert);
+void (*coli_v4_expert_store_ram_gave)(void);
 
 void coli_v4_expert_store_note_routed(ColiExpertStore *store, ColiExpertKey key) {
     if (!store || !store->state) return;
@@ -13044,6 +13080,8 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
     }
     free(pl); free(pe);
     coli_v4_expert_store_device_tier = v4_vkt_device_tier;
+    coli_v4_expert_store_ram_first = vkt_ram_first;   /* exclusive RAM/VRAM (COLI_VK_TIER_EXCLUSIVE) */
+    coli_v4_expert_store_ram_gave = vkt_ram_gave;
     coli_v4_vk_tier = &g_v4_vkt;
 }
 
@@ -13273,6 +13311,8 @@ static void v4_vk_close(void) {
         v4_vk_tier_report("run", (unsigned long long)st.hits, (unsigned long long)st.misses);
         coli_v4_vk_tier = NULL;
         coli_v4_expert_store_device_tier = NULL;
+        coli_v4_expert_store_ram_first = NULL;
+        coli_v4_expert_store_ram_gave = NULL;
     }
     size_t bytes = 0, tensors = 0;
     coli_vk_mem_info(&bytes, &tensors);

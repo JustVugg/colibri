@@ -1838,6 +1838,20 @@ static void q38_ehit_mark(Model *m,int layer,int eid) {
     }
     if(layer>=0&&layer<c->layers&&eid>=0&&eid<c->experts)ehit[layer][eid]=1;
 }
+/* The slot a full layer cache gives up: the least recently used outside `protect`
+ * (NULL: none protected), and before it the least recently used of those whose expert
+ * the Vulkan tier holds (vkt_ram_first: no second copy in RAM when RAM is short).
+ * -1 when every slot is protected. */
+static int q38_victim(const LCache *lc,int layer,const uint8_t *protect){
+    int lru=-1,dev=-1;
+    for(int i=0;i<lc->n;i++){
+        if(protect&&protect[i])continue;
+        if(lc->slots[i].eid>=0&&vkt_ram_first(layer,lc->slots[i].eid)){if(dev<0||lc->slots[i].used<lc->slots[dev].used)dev=i;continue;}
+        if(lru<0||lc->slots[i].used<lc->slots[lru].used)lru=i;
+    }
+    if(dev>=0){vkt_ram_gave();return dev;}
+    return lru;
+}
 static Slot *q38_expert_get(Model *m,int layer,int eid) {
     q38_ehit_mark(m,layer,eid);
     LCache *lc=&m->cache[layer]; int si=lc->by_expert[eid];
@@ -1845,7 +1859,7 @@ static Slot *q38_expert_get(Model *m,int layer,int eid) {
     m->miss++; Slot *s;
     if(lc->n<lc->cap){s=&lc->slots[lc->n++];s->eid=-1;}
     else {
-        int victim=0;for(int i=1;i<lc->n;i++)if(lc->slots[i].used<lc->slots[victim].used)victim=i;
+        int victim=q38_victim(lc,layer,NULL);
         s=&lc->slots[victim];if(s->eid>=0)lc->by_expert[s->eid]=-1;
     }
     s->eid=-1;q38_load_expert(m,layer,eid,s);s->eid=eid;s->used=++m->clock;lc->by_expert[eid]=(int)(s-lc->slots);return s;
@@ -1946,11 +1960,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
             if(cache->n<cache->cap){
                 slot=&cache->slots[cache->n++];slot->eid=-1;
             }else{
-                int victim=-1;
-                for(int candidate=0;candidate<cache->n;candidate++)
-                    if(!protected_slots[candidate]&&
-                       (victim<0||cache->slots[candidate].used<cache->slots[victim].used))
-                        victim=candidate;
+                int victim=q38_victim(cache,layer,protected_slots);
                 if(victim<0){
                     fprintf(stderr,"Qwen3.8 expert demand set has no reservable cache slot\n");
                     exit(1);

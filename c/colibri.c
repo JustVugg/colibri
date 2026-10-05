@@ -110,6 +110,10 @@ static inline void omp_set_num_threads(int n){ (void)n; }
 #include "backend_vulkan.h"
 #include "vk_tier.h"                              /* the routed-expert tier the MoE engines share */
 #endif
+#ifndef COLI_VULKAN   /* exclusive RAM/VRAM (vk_tier.h) is the Vulkan build's: no device holds an expert */
+static inline int  vkt_ram_first(int layer, int eid) { (void)layer; (void)eid; return 0; }
+static inline void vkt_ram_gave(void) {}
+#endif
 #ifdef COLI_XDNA
 /* Optional AMD XDNA2 lane. This header pulls in no XRT: the engine owns the
  * prepared-host state, and XRT lives only behind an optional helper DLL. */
@@ -451,17 +455,21 @@ static void eslots_release(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_rele
  * prenotazioni in volo (eid<-1) contano come vive: stanno per possederne uno.
  * EN: reusing a slab-less slot re-allocates, so it only counts as eviction
  * EN: while the row's live-slab count is under ecap; else pick a slab owner. */
-static int eslot_lru_victim(ESlot *slots,int n,int ecap){
-    int lru=-1, empty=-1, live=0;
+static int eslot_lru_victim(ESlot *slots,int n,int ecap,int layer){
+    int lru=-1, empty=-1, live=0, dev=-1;
     for(int i=0;i<n;i++){
         ESlot *s=&slots[i];
         if(s->slab || s->eid<-1) live++;
         if(eslot_busy(s) || s->eid<-1) continue;
         if(!s->slab){ if(s->eid==-1 && empty<0) empty=i; continue; }
         if(s->eid==-1) return i;              /* slot libero che possiede ancora lo slab */
+        /* un expert che il tier Vulkan tiene gia' esce prima (vkt_ram_first: con poca RAM
+         * la RAM e la VRAM non tengono gli stessi expert) */
+        if(vkt_ram_first(layer,s->eid)){ if(dev<0 || s->used<slots[dev].used) dev=i; continue; }
         if(lru<0 || s->used<slots[lru].used) lru=i;
     }
     if(empty>=0 && live<ecap) return empty;   /* sotto il tetto: meglio il vuoto che sfrattare */
+    if(dev>=0){ vkt_ram_gave(); return dev; }
     return lru;
 }
 
@@ -5470,7 +5478,7 @@ static void ecache_promote_ws(Model *m,int layer,int nmiss){
     int promo = nmiss<m->ecap ? nmiss : m->ecap;
     for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
         if(*nn<m->ecap) dst=&Sl[(*nn)++];
-        else { int lru=eslot_lru_victim(Sl,*nn,m->ecap);
+        else { int lru=eslot_lru_victim(Sl,*nn,m->ecap,layer);
                if(lru<0){ static int warned;
                    if(!warned){ warned=1; fprintf(stderr,"[CUDA] no reusable LRU expert slot (in flight or cap reached); skipping cache promotion\n"); }
                    continue; }
@@ -6930,7 +6938,7 @@ static void pilot_realload(Model *m, int layer, int eid){
     int slot,isnew=0;
     if(nn<m->ecap){ slot=nn; isnew=1; m->ecn[layer]=nn+1; }   /* cresci: pubblica subito lo slot (marcato prenotato) */
     else {
-        slot=eslot_lru_victim(Sl,nn,m->ecap);           /* riusa libero-con-slab, poi LRU; slot svuotati solo sotto ecap (#1034) */
+        slot=eslot_lru_victim(Sl,nn,m->ecap,layer);     /* riusa libero-con-slab, poi LRU; slot svuotati solo sotto ecap (#1034) */
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
                     pthread_mutex_unlock(&g_pilot_mx); return; }   /* tutti in volo, o cap raggiunto */
         /* LFRU eviction guard (#441, narrowed by #497 — folded into the SPMC selection):
@@ -6938,7 +6946,7 @@ static void pilot_realload(Model *m, int layer, int eid){
          * hotter than the speculation by tier_pick_lfru's 25%+4-freq hysteresis; the
          * un-narrowed #474 test dropped ~all speculations on a full cache (#490).
          * Skips free slots (eid==-1). Cache placement only -> output unchanged. */
-        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[slot].eid>=0){
+        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[slot].eid>=0 && !vkt_ram_first(layer,Sl[slot].eid)){
             int vid=Sl[slot].eid; uint32_t vh=m->eheat[layer][vid];
             if(vh>=2){
                 uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);
@@ -7004,11 +7012,11 @@ static void pilot_uring_batch(Model *m){
         if(found){ pthread_mutex_unlock(&g_pilot_mx); continue; }
         int slot;
         if(nn<m->ecap){ slot=nn; m->ecn[layer]=nn+1; }
-        else slot=eslot_lru_victim(Sl,nn,m->ecap);    /* riusa libero-con-slab, poi LRU; slot svuotati solo sotto ecap (#1034) */
+        else slot=eslot_lru_victim(Sl,nn,m->ecap,layer);    /* riusa libero-con-slab, poi LRU; slot svuotati solo sotto ecap (#1034) */
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
         /* LFRU eviction guard (#441, narrowed by #497): protect only a genuinely WARM
          * resident (>=2 accesses) that is clearly hotter (see pilot_realload) */
-        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[slot].eid>=0){
+        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[slot].eid>=0 && !vkt_ram_first(layer,Sl[slot].eid)){
             int vid=Sl[slot].eid; uint32_t vh=m->eheat[layer][vid];
             if(vh>=2){
                 uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);

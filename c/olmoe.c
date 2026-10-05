@@ -70,6 +70,10 @@ static int g_vk_ready = 0;
 static int g_vk_chain = 0;   /* COLI_VK_CHAIN decided on, and the chain's pipelines are up (olmoe_chain.h) */
 static int g_olc_fit_on;     /* the partial chain's fit ran: the chain set itself up in model_init (olmoe_chain.h) */
 #endif
+#ifndef COLI_VULKAN   /* exclusive RAM/VRAM (vk_tier.h) is the Vulkan build's: no device holds an expert */
+static inline int  vkt_ram_first(int layer, int eid) { (void)layer; (void)eid; return 0; }
+static inline void vkt_ram_gave(void) {}
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -906,6 +910,18 @@ static void ehit_mark(Model *m, int layer, int eid) {
     if (layer >= 0 && layer < c->n_layers && eid >= 0 && eid < c->n_experts) m->ehit[layer][eid] = 1;
 }
 
+/* The unpinned slot a full layer cache gives up (caller holds g_pilot_mx), never one
+ * being loaded or read: the least recently used, or before it the least recently used
+ * of those whose expert the Vulkan tier holds. -1 when there is none. */
+static int olmoe_victim(const LCache *lc, int layer) {
+    int lru = -1, dev = -1;
+    for (int i = 0; i < lc->n; i++) {
+        if (lc->slots[i].pinned || lc->slots[i].eid < 0 || lc->slots[i].busy) continue;
+        if (vkt_ram_first(layer, lc->slots[i].eid)) { if (dev < 0 || lc->slots[i].used < lc->slots[dev].used) dev = i; continue; }
+        if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+    }
+    return dev >= 0 ? dev : lru;
+}
 static void expert_get(Model *m, int layer, int eid, Slot **out) {
     LCache *lc = &m->cache[layer];
     pthread_mutex_lock(&g_pilot_mx);
@@ -931,12 +947,9 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
         s = &lc->slots[lc->n++];
         slot_ensure_allocated(m, s);
     } else {
-        /* LRU eviction: skip pinned, in-flight (eid==-1) and busy slots */
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++) {
-            if (lc->slots[i].pinned || lc->slots[i].eid < 0 || lc->slots[i].busy) continue;
-            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-        }
+        /* LRU eviction: skip pinned, in-flight (eid==-1) and busy slots; an expert the
+         * Vulkan tier holds goes first (vkt_ram_first: no second copy when RAM is short) */
+        int lru = olmoe_victim(lc, layer);
         if (lru < 0) {
             /* All slots are pinned, in-flight or busy; find oldest non-in-flight slot
              * (may be pinned, but never select one currently being loaded or read). */
@@ -963,6 +976,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
         }
         s = &lc->slots[lru];
         s->pinned = 0;
+        if (vkt_ram_first(layer, s->eid)) vkt_ram_gave();
     }
     cache_reserve(m, layer, s, eid);
     s->used = ++m->clock;
@@ -1594,12 +1608,9 @@ static void pilot_realload(Model *m, int layer, int eid) {
         s = &lc->slots[lc->n++];
         slot_ensure_allocated(m, s);
     } else {
-        /* LRU eviction: skip pinned, in-flight (eid==-1) and busy slots */
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++) {
-            if (lc->slots[i].pinned || lc->slots[i].eid < 0 || lc->slots[i].busy) continue;
-            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-        }
+        /* LRU eviction: skip pinned, in-flight (eid==-1) and busy slots; an expert the
+         * Vulkan tier holds goes first (vkt_ram_first: no second copy when RAM is short) */
+        int lru = olmoe_victim(lc, layer);
         if (lru < 0) {
             m->is_queued[layer * c->n_experts + eid] = 0;
             pthread_mutex_unlock(&g_pilot_mx);
@@ -1608,7 +1619,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
 
         /* LFRU eviction guard: don't displace a warm resident expert with a speculation */
         if (g_pilot_evict_guard && m->freq && m->freq[layer] && m->last_access &&
-            lc->slots[lru].eid >= 0) {
+            lc->slots[lru].eid >= 0 && !vkt_ram_first(layer, lc->slots[lru].eid)) {
             int vid = lc->slots[lru].eid;
             uint64_t vs = lfru_score(m->freq[layer][vid], m->last_access[layer * c->n_experts + vid], m->clock);
             uint64_t cs = lfru_score(m->freq[layer][eid], m->last_access[layer * c->n_experts + eid], m->clock);
@@ -1620,6 +1631,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
         }
 
         s = &lc->slots[lru]; s->pinned = 0;
+        if (vkt_ram_first(layer, s->eid)) vkt_ram_gave();
     }
     cache_reserve(m, layer, s, eid); s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);

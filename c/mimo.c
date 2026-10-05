@@ -713,10 +713,16 @@ static void experts_ensure(Model *m, int li, const int *want, int n, Slot **out)
     for (int k = 0; k < nmiss; k++) {
         int best = -1;
         if (lc->n < lc->cap) best = lc->n++;
-        else {
-            uint64_t oldest = UINT64_MAX;
-            for (int s = 0; s < lc->n; s++)
-                if (lc->s[s].used < stamp && lc->s[s].used < oldest) { oldest = lc->s[s].used; best = s; }
+        else {   /* the least recently used, and before it one the Vulkan tier holds (vkt_ram_first) */
+            uint64_t oldest = UINT64_MAX, dev_oldest = UINT64_MAX;
+            int dev = -1;
+            for (int s = 0; s < lc->n; s++) {
+                if (lc->s[s].used >= stamp) continue;
+                if (lc->s[s].eid >= 0 && vkt_ram_first(li, lc->s[s].eid)) {
+                    if (lc->s[s].used < dev_oldest) { dev_oldest = lc->s[s].used; dev = s; }
+                } else if (lc->s[s].used < oldest) { oldest = lc->s[s].used; best = s; }
+            }
+            if (dev >= 0) { best = dev; vkt_ram_gave(); }
         }
         if (best < 0) { fprintf(stderr, "[mimo] expert cache smaller than one routing step\n"); exit(1); }
         Slot *s = &lc->s[best];

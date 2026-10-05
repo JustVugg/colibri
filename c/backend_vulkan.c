@@ -158,6 +158,7 @@ struct ColiVkTensor {
     VkaRange wr, sr;       /* where the rows and the scales sit in the pool's blocks */
     struct ColiVkTensor *next_free;   /* deferred-free list (a free while async work is in flight) */
     uint8_t *img;          /* staged uploads: the host image a tier tensor is filled in, until committed */
+    uint8_t img_al;        /* img came from the aligned allocator (up_img_alloc) */
     uint8_t *wmap, *smap;  /* mapped memory: the rows' and the scales' mapping (coli_vk_tensor_refill) */
     VkDeviceMemory imp;    /* coli_vk_tensor_import: the host memory its rows are read from, in place */
     struct ColiVkTensor *imp_next;   /* the live imports, freed at shutdown */
@@ -192,6 +193,13 @@ typedef struct {
     VkResult err; const char *what;   /* the failure, for the message */
     unsigned long long bytes, copies, submits, blocks_filled;
     char why[200];
+    /* copies straight from host memory (up_import, COLI_VK_UP_IMPORT): the source pages
+     * imported as a transfer source (VK_EXT_external_memory_host), no copy into the staging
+     * buffer. imp_align 0 = none on this device; each import lives until its slot is done */
+    size_t imp_align; void *imp_props;
+    struct { VkBuffer buf; VkDeviceMemory mem; } *imp[VK_UP_SLOTS];
+    int nimp[VK_UP_SLOTS], cimp[VK_UP_SLOTS];
+    unsigned long long imp_bytes, imp_copies, imp_refused;
 } VkUp;
 static VkUp g_up[2] = {{.mx = PTHREAD_MUTEX_INITIALIZER, .fill = 1}, {.mx = PTHREAD_MUTEX_INITIALIZER, .fill = 1}};
 static pthread_mutex_t g_qmx[2] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER};
@@ -453,6 +461,58 @@ static int place_decide(VkPhysicalDevice phys, int mt_host, VkUp *u) {
     return on;
 }
 /* The uploader's command buffers, fences and staging slots (u->dev, u->fam set). */
+/* A slot's imports, once its copies are done (or it was never submitted). */
+static void up_imp_release(VkUp *u, int s) {
+    for (int i = 0; i < u->nimp[s]; i++) {
+        vkDestroyBuffer(u->dev, u->imp[s][i].buf, NULL);
+        vkFreeMemory(u->dev, u->imp[s][i].mem, NULL);
+    }
+    u->nimp[s] = 0;
+}
+/* The host image a tier tensor is filled in (coli_vk_tier_tensor, staged uploads): aligned
+ * and rounded to the device's import alignment, so up_import can copy from it in place. */
+static uint8_t *up_img_alloc(int dev, size_t bytes, uint8_t *aligned) {
+    size_t al = g_up[dev].imp_align;
+    *aligned = al != 0;
+    if (!al) return calloc(1, bytes);
+    void *p = NULL;
+    size_t sz = (bytes + al - 1) / al * al;
+#ifdef _WIN32
+    p = _aligned_malloc(sz, al);
+#else
+    if (posix_memalign(&p, al, sz)) p = NULL;
+#endif
+    if (p) memset(p, 0, sz);
+    return p;
+}
+static void up_img_free(uint8_t *p, int aligned) {
+    if (!p) return;
+#ifdef _WIN32
+    if (aligned) { _aligned_free(p); return; }
+#else
+    (void)aligned;
+#endif
+    free(p);
+}
+/* Copies straight from host memory on this device (up_import): VK_EXT_external_memory_host
+ * enabled, staged uploads on, COLI_VK_UP_IMPORT not 0. After up_init. */
+static void up_import_init(VkUp *u, VkPhysicalDevice phys, int has_hostmem, const char *who) {
+    u->imp_align = 0; u->imp_props = NULL;
+#ifdef VK_EXT_external_memory_host
+    const char *e = getenv("COLI_VK_UP_IMPORT");
+    if (!u->on || !u->dev || !has_hostmem || (e && *e == '0')) return;
+    VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &hp};
+    vkGetPhysicalDeviceProperties2(phys, &p2);
+    u->imp_props = (void *)vkGetDeviceProcAddr(u->dev, "vkGetMemoryHostPointerPropertiesEXT");
+    if (!u->imp_props) return;
+    u->imp_align = hp.minImportedHostPointerAlignment ? (size_t)hp.minImportedHostPointerAlignment : 4096;
+    fprintf(stderr, "[VK] %sstaged uploads: copied straight from host memory where its pages import "
+            "(%zu KiB pages; COLI_VK_UP_IMPORT=0 stages every copy)\n", who, u->imp_align >> 10);
+#else
+    (void)phys; (void)has_hostmem; (void)who;
+#endif
+}
 static int up_init(VkUp *u) {
     VkCommandPoolCreateInfo cp = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = u->fam};
@@ -478,6 +538,7 @@ static int up_init(VkUp *u) {
 }
 static void up_destroy(VkUp *u) {
     if (!u->dev) return;
+    for (int s = 0; s < VK_UP_SLOTS; s++) { up_imp_release(u, s); free(u->imp[s]); u->imp[s] = NULL; u->cimp[s] = 0; }
     if (u->sbuf) vkDestroyBuffer(u->dev, u->sbuf, NULL);
     if (u->smem) vkFreeMemory(u->dev, u->smem, NULL);
     for (int s = 0; s < VK_UP_SLOTS; s++) if (u->fence[s]) vkDestroyFence(u->dev, u->fence[s], NULL);
@@ -1025,6 +1086,7 @@ int coli_vk_init(const char *spv_path) {
             up_destroy(&g_up[0]);
             g_up[0].on = g_up[0].shared = 0;
         }
+        up_import_init(&g_up[0], G.phys, G.has_hostmem, "");
         if (g_up[0].on) {
             VkUp *u = &g_up[0];
             fprintf(stderr, "[VK] memory: staged uploads, resident data in device-local memory (type %u, %llu MiB heap) "
@@ -1226,10 +1288,11 @@ static int up_fail(VkUp *u, VkResult r, const char *what) {
     return 0;
 }
 static int up_wait(VkUp *u, int s) {
-    if (!u->pending[s]) return 1;
+    if (!u->pending[s]) { up_imp_release(u, s); return 1; }   /* never submitted: its imports go */
     u->pending[s] = 0;
     VkResult r = vk_fence_wait(u->dev, u->fence[s]);
     if (r == VK_SUCCESS && up_fault("wait")) r = VK_TIMEOUT;
+    up_imp_release(u, s);   /* the copies are done (or the device is gone) */
     if (r == VK_SUCCESS) return 1;
     up_fail(u, r, "fence wait");
     u->lost = 1;
@@ -1281,6 +1344,72 @@ static int up_add(VkUp *u, int dev, VkBuffer dst, size_t dst_off, size_t bytes, 
         u->used = (u->used + n + 255) & ~(size_t)255;
         u->bytes += n; u->copies++; off += n;
         if (u->used >= VK_UP_SLOT && !up_submit(u, dev)) return 0;
+    }
+    return 1;
+}
+/* `bytes` at src, imported in place as a transfer source in the slot being recorded: *buf
+ * holds them at *off. The import spans the whole pages around them; it lives until the
+ * slot's fence (up_wait), so src must outlive up_finish. 0 = not here (no imports on this
+ * device, the driver refused these pages, COLI_VK_STAGED_FAULT=import): the caller stages. */
+static int up_import(VkUp *u, const void *src, size_t bytes, VkBuffer *buf, VkDeviceSize *off) {
+#ifdef VK_EXT_external_memory_host
+    if (!u->imp_align || !u->imp_props || !bytes || !up_open(u)) return 0;
+    if (up_fault("import")) { u->imp_refused++; return 0; }
+    size_t al = u->imp_align;
+    uintptr_t p = (uintptr_t)src, base = p / al * al, end = (p + bytes + al - 1) / al * al;
+    size_t sz = end - base;
+    VkMemoryHostPointerPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (((PFN_vkGetMemoryHostPointerPropertiesEXT)u->imp_props)(u->dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                                                (void *)base, &mp) != VK_SUCCESS || !mp.memoryTypeBits) {
+        u->imp_refused++; return 0;
+    }
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = sz,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkBuffer b;
+    if (vkCreateBuffer(u->dev, &bi, NULL, &b) != VK_SUCCESS) { u->imp_refused++; return 0; }
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(u->dev, b, &req);
+    uint32_t bits = mp.memoryTypeBits & req.memoryTypeBits, mt = 0;
+    if (!bits || req.size > sz) { vkDestroyBuffer(u->dev, b, NULL); u->imp_refused++; return 0; }
+    while (!(bits & (1u << mt))) mt++;
+    VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = (void *)base};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = sz,
+        .memoryTypeIndex = mt};
+    VkDeviceMemory m;
+    if (vkAllocateMemory(u->dev, &ai, NULL, &m) != VK_SUCCESS) { vkDestroyBuffer(u->dev, b, NULL); u->imp_refused++; return 0; }
+    if (vkBindBufferMemory(u->dev, b, m, 0) != VK_SUCCESS) {
+        vkDestroyBuffer(u->dev, b, NULL); vkFreeMemory(u->dev, m, NULL); u->imp_refused++; return 0;
+    }
+    int s = u->cur;
+    if (u->nimp[s] == u->cimp[s]) {
+        int nc = u->cimp[s] ? 2 * u->cimp[s] : 16;
+        void *n = realloc(u->imp[s], (size_t)nc * sizeof(*u->imp[s]));
+        if (!n) { vkDestroyBuffer(u->dev, b, NULL); vkFreeMemory(u->dev, m, NULL); u->imp_refused++; return 0; }
+        u->imp[s] = n; u->cimp[s] = nc;
+    }
+    u->imp[s][u->nimp[s]].buf = b; u->imp[s][u->nimp[s]].mem = m; u->nimp[s]++;
+    *buf = b; *off = (VkDeviceSize)(p - base);
+    return 1;
+#else
+    (void)u; (void)src; (void)bytes; (void)buf; (void)off;
+    return 0;
+#endif
+}
+/* Copies of n ranges of one host region (src: base, bytes in all), each region's
+ * src_off[i], len[i] to dst[i] at dst_off[i], straight from the imported pages. 0 = not
+ * imported (the caller stages); nothing was recorded then. */
+static int up_add_host(VkUp *u, const void *src, size_t bytes, int n, const VkBuffer *dst, const size_t *dst_off,
+                       const size_t *src_off, const size_t *len) {
+    VkBuffer b; VkDeviceSize o;
+    if (!up_import(u, src, bytes, &b, &o)) return 0;
+    for (int i = 0; i < n; i++) {
+        if (!len[i]) continue;
+        VkBufferCopy c = {o + src_off[i], dst_off[i], len[i]};
+        vkCmdCopyBuffer(u->cmd[u->cur], b, dst[i], 1, &c);
+        u->imp_bytes += len[i]; u->imp_copies++;
     }
     return 1;
 }
@@ -1462,7 +1591,7 @@ static ColiVkTensor *tensor_alloc(VkWPool *P, int fmt, int I, int O, int gs, voi
         vkDestroyBuffer(pool_device(P), t->wbuf, NULL); pool_free_range(P, t->wr); free(t); return NULL;
     }
     if (g_up[P->dev].on) {
-        if (wptr && !(t->img = calloc(1, t->wbytes + sbytes))) {
+        if (wptr && !(t->img = up_img_alloc(P->dev, t->wbytes + sbytes, &t->img_al))) {
             vkDestroyBuffer(pool_device(P), t->wbuf, NULL); vkDestroyBuffer(pool_device(P), t->sbuf, NULL);
             pool_free_range(P, t->wr); pool_free_range(P, t->sr); free(t); return NULL;
         }
@@ -1501,7 +1630,10 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
         size_t sb = scale_floats(fmt, I, O, gs) * sizeof(float);
         VkUp *u = &g_up[P->dev];
         pthread_mutex_lock(&u->mx);
-        int ok = up_add(u, P->dev, t->wbuf, 0, t->wbytes, up_fill_rows, &rows) &&
+        /* rows without padding: straight from the weights when their pages import */
+        size_t z = 0;
+        int ok = ((rows.cpu_rb == rows.stride && up_add_host(u, weights, t->wbytes, 1, &t->wbuf, &z, &z, &t->wbytes)) ||
+                  up_add(u, P->dev, t->wbuf, 0, t->wbytes, up_fill_rows, &rows)) &&
                  up_add(u, P->dev, t->sbuf, 0, sb, up_fill_bytes, fmt == 10 || fmt == 11 || fmt == 14 ? (const void *)&one : scales);
         ok = up_finish(u, P->dev) && ok;
         pthread_mutex_unlock(&u->mx);
@@ -2253,7 +2385,7 @@ static struct {
     VkDescriptorPool pool; VkDescriptorSet gu[64], dn[64]; int nsets;
     Scratch x, h, y;
     int inflight; size_t pending_yb;
-    int has_budget;
+    int has_budget, has_hostmem;
     /* what the expert batch's context on this device needs (xb_bind) */
     uint32_t memtype_dev, ts_bits; float ts_period;
     size_t ssbo_align, ssbo_range, buf_align;
@@ -2338,21 +2470,30 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
     float qprio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = G2.qfam, .queueCount = 1, .pQueuePriorities = &qprio};
-    const char *dext[1]; uint32_t ndext = 0;
-#ifdef VK_EXT_memory_budget
+    const char *dext[2]; uint32_t ndext = 0;
     {
         uint32_t ne = 0;
         vkEnumerateDeviceExtensionProperties(G2.phys, NULL, &ne, NULL);
         VkExtensionProperties *ep = ne ? malloc(ne * sizeof(*ep)) : NULL;
         if (ep) {
             vkEnumerateDeviceExtensionProperties(G2.phys, NULL, &ne, ep);
-            for (uint32_t i = 0; i < ne; i++)
+            for (uint32_t i = 0; i < ne; i++) {
+#ifdef VK_EXT_memory_budget
                 if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) G2.has_budget = 1;
+#endif
+#ifdef VK_EXT_external_memory_host
+                if (!strcmp(ep[i].extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) G2.has_hostmem = 1;
+#endif
+            }
             free(ep);
         }
+#ifdef VK_EXT_memory_budget
         if (G2.has_budget) dext[ndext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
-    }
 #endif
+#ifdef VK_EXT_external_memory_host
+        if (G2.has_hostmem) dext[ndext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+#endif
+    }
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
         .enabledExtensionCount = ndext, .ppEnabledExtensionNames = ndext ? dext : NULL};
@@ -2394,6 +2535,7 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
             up_destroy(u); u->on = u->shared = 0;
         } else fprintf(stderr, "[VK] dev2 memory: staged uploads, experts in device-local memory (type %u) copied from "
                        "host staging memory (type %u) (%s)\n", u->mt_dev, u->mt_stage, u->why);
+        up_import_init(u, G2.phys, G2.has_hostmem, "dev2 ");
     }
     G2.sh_qmm = load_spv(G2.dev, spv_path);
     if (!G2.sh_qmm) return 0;
@@ -3079,7 +3221,7 @@ static void tensor_release(ColiVkTensor *t) {
         __atomic_sub_fetch(&G.tensor_count, 1, __ATOMIC_RELAXED);
         __atomic_sub_fetch(&G.used_bytes, b, __ATOMIC_RELAXED);
     }
-    free(t->img);
+    up_img_free(t->img, t->img_al);
     free(t);
 }
 /* Async work in flight per device (the GLM expert group, the dev2 group, the expert
@@ -4121,14 +4263,18 @@ int coli_vk_tensor_commit(ColiVkTensor *const *t, int n) {
     for (int k = 0; k < n && ok; k++) {
         if (!t[k] || !t[k]->img) continue;
         size_t sb = scale_floats(t[k]->fmt, t[k]->I, t[k]->O, t[k]->gs) * sizeof(float);
-        ok = up_add(u, dev, t[k]->wbuf, 0, t[k]->wbytes, up_fill_bytes, t[k]->img) &&
-             up_add(u, dev, t[k]->sbuf, 0, sb, up_fill_bytes, t[k]->img + t[k]->wbytes);
+        /* straight from the host image when its pages import (up_import), else staged */
+        VkBuffer dst[2] = {t[k]->wbuf, t[k]->sbuf};
+        size_t doff[2] = {0, 0}, soff[2] = {0, t[k]->wbytes}, len[2] = {t[k]->wbytes, sb};
+        ok = up_add_host(u, t[k]->img, t[k]->wbytes + sb, 2, dst, doff, soff, len) ||
+             (up_add(u, dev, t[k]->wbuf, 0, t[k]->wbytes, up_fill_bytes, t[k]->img) &&
+              up_add(u, dev, t[k]->sbuf, 0, sb, up_fill_bytes, t[k]->img + t[k]->wbytes));
         if (ok && k == 0 && n > 1 && up_fault("commit")) ok = up_fail(u, VK_ERROR_OUT_OF_DEVICE_MEMORY, "commit");
     }
     ok = up_finish(u, dev) && ok;
     if (!ok) up_failed(dev, "the tensors are not resident");
     pthread_mutex_unlock(&u->mx);
-    for (int k = 0; k < n; k++) if (t[k]) { free(t[k]->img); t[k]->img = NULL; }
+    for (int k = 0; k < n; k++) if (t[k]) { up_img_free(t[k]->img, t[k]->img_al); t[k]->img = NULL; }
     return ok;
 }
 /* A tier tensor filled again in place (a staging slot of the tier's streaming): mapped
@@ -4139,8 +4285,8 @@ int coli_vk_tensor_refill(ColiVkTensor *t, uint8_t **rows, size_t *stride, float
     if (!G.ready || !t || t->pool != &g_tpool) return 0;
     if (g_up[t->dev].on) {
         size_t sb = scale_floats(t->fmt, t->I, t->O, t->gs) * sizeof(float);
-        free(t->img);
-        if (!(t->img = calloc(1, t->wbytes + sb))) return 0;
+        up_img_free(t->img, t->img_al);
+        if (!(t->img = up_img_alloc(t->dev, t->wbytes + sb, &t->img_al))) return 0;
         *rows = t->img; *scales = (float *)(t->img + t->wbytes);
     } else {
         if (!t->wmap || !t->smap) return 0;
@@ -4176,12 +4322,13 @@ static void place_report(void) {
     const double M = 1048576.0;
     fprintf(stderr, "[VK] memory at exit: weights %.1f MiB, expert tier %.1f MiB (peaks), KV mirror %.1f MiB in "
             "device-local memory type %u (%s); the dense chain's state in type %u (%s); %.1f MiB staged in %llu copies "
-            "(%llu submits), %llu blocks zero-filled; resident data in host memory: %.1f MiB\n",
+            "(%llu submits), %.1f MiB of them straight from host memory in %llu copies (%llu not imported), "
+            "%llu blocks zero-filled; resident data in host memory: %.1f MiB\n",
             w.peak_used / M, t.peak_used / M, (kv + ln) / M, u->mt_dev,
             (fd & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? "host-visible" : "not host-visible", G.memtype_dev,
             (fc & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "device-local" : "host memory",
-            (u->bytes + PW.bytes) / M, u->copies, u->submits, u->blocks_filled,
-            host / M);
+            (u->bytes + PW.bytes + u->imp_bytes) / M, u->copies + u->imp_copies, u->submits, u->imp_bytes / M,
+            u->imp_copies, u->imp_refused, u->blocks_filled, host / M);
 }
 
 /* COLI_VK_DEV2's device and everything on it: the tier's batch and pool, the registry's

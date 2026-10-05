@@ -70,6 +70,12 @@ static struct {
     int nd2; int *d2_idx; int cd2;     /* a big step's rows on it: their assignments */
     const float **d2_y; ColiVkExpert **d2_bex; int *d2_brows; const float **d2_bx; float *d2_bw; int d2_cap, d2_cexp;
     unsigned long long d2_served, d2_steps, d2_big, d2_uploads, d2_lost;
+    /* exclusive RAM/VRAM (vkt_ram_first): on, and the RAM slots given up for it. routed[l*E+e]
+     * is the issue (seq) that last routed the expert, layer_seq[l] the layer's last issue: an
+     * expert routed in its layer's current step may be one the CPU is computing from its RAM
+     * slot (handed back by the balance, past a batch's rows), so it is never offered */
+    int excl; unsigned long long ram_gave;
+    uint32_t *routed_at, *layer_seq, seq;
     double d2_ms;
     VSlot *s;
     uint32_t tick, decay_at;          /* tokens seen (rows of the forward's first layer) */
@@ -1144,6 +1150,12 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     }
     if (T.d2 && !coli_vk_xb_ready_dev(1)) d2_stop("the second device stopped answering");
     if (layer < T.last_layer || T.begin) { T.begin = 0; T.first_layer = layer; new_forward(); }
+    if (T.routed_at) {   /* this step's routing: its experts are not offered to the RAM cache's eviction */
+        uint32_t q = ++T.seq;
+        for (int i = 0; i < S * K; i++)
+            if (idx[i] >= 0 && idx[i] < T.c.experts) __atomic_store_n(&T.routed_at[(size_t)layer * T.c.experts + idx[i]], q, __ATOMIC_RELAXED);
+        __atomic_store_n(&T.layer_seq[layer], q, __ATOMIC_RELEASE);
+    }
     if (layer == T.first_layer) {   /* COLI_VK_TIER_RATE promotions per token of the forward */
         T.tick += (uint32_t)S;
         long cap = (long)T.promo_cap + (long)T.rate * S;
@@ -1503,6 +1515,13 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (fit + (T.st_ok ? T.st_slots : 0) >= all && fit_raw >= all + (T.st_ok ? T.st_slots : 0) &&
         need < lim && need <= coli_vk_block_bytes((size_t)256 << 20)) lim = need;
     coli_vk_tier_pool_limit(lim);
+    const char *ex = getenv("COLI_VK_TIER_EXCLUSIVE");
+    T.excl = !(ex && *ex == '0');
+    if (T.excl) {
+        T.routed_at = calloc((size_t)T.c.layers * T.c.experts, sizeof(uint32_t));
+        T.layer_seq = calloc((size_t)T.c.layers, sizeof(uint32_t));
+        if (!T.routed_at || !T.layer_seq) { free(T.routed_at); free(T.layer_seq); T.routed_at = T.layer_seq = NULL; T.excl = 0; }
+    }
     const char *bal = getenv("COLI_VK_TIER_BALANCE");
     T.balance = T.c.in_ram != NULL && !(bal && *bal == '0');
     T.share = 1.f;
@@ -1567,6 +1586,8 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
             human((double)T.upload_bytes, hl, sizeof hl), T.warm, T.evictions, T.qfull, T.rated, T.failed,
             T.dev_ms, T.cpu_ms, T.wait_ms, T.dev_ms > 0 ? 100.0 * hidden / T.dev_ms : 0.0);
     if (T.balance) fprintf(stderr, " | balance: device share %.2f, %llu rows handed to the CPU", T.share, T.handed);
+    if (T.excl) fprintf(stderr, " | exclusive: %llu RAM copies of device experts given up first",
+                        __atomic_load_n(&T.ram_gave, __ATOMIC_RELAXED));
     if (T.st_ok && T.st_steps) {
         char hs[32];
         fprintf(stderr, " | stream: %llu steps, %llu cold experts (%s, %.2f GB/s) and %llu rows streamed in %llu sub-batches, "
@@ -1590,6 +1611,23 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
 }
 
 int vkt_devices(void) { return !T.on ? 0 : T.d2 ? 2 : 1; }
+static VSlot *g_old_slots;   /* the slot table of the tier shut down last (vkt_shutdown) */
+static uint32_t *g_old_routed, *g_old_seq;
+
+/* The engine's prefetch workers ask too, while the engine thread changes the slot table:
+ * the state byte is read atomically (a stale answer costs one eviction order or one
+ * read, never a wrong expert: the engine's own cache decides what its slots hold). */
+int vkt_ram_first(int layer, int eid) {
+    VSlot *s = __atomic_load_n(&T.s, __ATOMIC_ACQUIRE);
+    uint32_t *routed = __atomic_load_n(&T.routed_at, __ATOMIC_ACQUIRE), *seq = __atomic_load_n(&T.layer_seq, __ATOMIC_ACQUIRE);
+    int L = T.c.layers, E = T.c.experts;
+    if (!__atomic_load_n(&T.on, __ATOMIC_RELAXED) || !T.excl || !s || !routed || !seq ||
+        layer < 0 || layer >= L || eid < 0 || eid >= E) return 0;
+    size_t i = (size_t)layer * E + eid;
+    if (__atomic_load_n(&routed[i], __ATOMIC_RELAXED) == __atomic_load_n(&seq[layer], __ATOMIC_ACQUIRE)) return 0;
+    return __atomic_load_n(&s[i].state, __ATOMIC_RELAXED) == VS_RESIDENT;
+}
+void vkt_ram_gave(void) { __atomic_add_fetch(&T.ram_gave, 1, __ATOMIC_RELAXED); }
 
 void vkt_shutdown(void) {
     if (!T.s) return;
@@ -1612,7 +1650,12 @@ void vkt_shutdown(void) {
         for (int i = 0; T.st && i < T.st_n; i++) if (T.st[i].ex) coli_vk_xb_expert_free(T.st[i].ex);
     }
     pthread_mutex_destroy(&T.mx); pthread_cond_destroy(&T.cv); pthread_cond_destroy(&T.cv_room); pthread_cond_destroy(&T.cv_done);
-    free(T.s); free(T.grp); free(T.map); free(T.touched); free(T.bex); free(T.brows); free(T.bfirst);
+    /* the slot table outlives the tier by one shutdown: a prefetch worker may be in
+     * vkt_ram_first with the pointer it read before this */
+    free(g_old_slots); g_old_slots = T.s;
+    free(g_old_routed); g_old_routed = T.routed_at;   /* the same for the routing marks */
+    free(g_old_seq); g_old_seq = T.layer_seq;
+    free(T.grp); free(T.map); free(T.touched); free(T.bex); free(T.brows); free(T.bfirst);
     free(T.bx); free(T.by); free(T.bw); free(T.evict); free(T.done);
     free(T.st); free(T.sy); free(T.bcnt); free(T.bofs); free(T.bcls); free(T.blist); free(T.pred); free(T.pred_ok);
     for (int h = 0; h < 2; h++) { free(T.hf[h].slot); free(T.hf[h].yout); }
