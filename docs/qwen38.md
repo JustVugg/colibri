@@ -4,8 +4,8 @@
 [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)
 directly from the official safetensors shards. No conversion or second copy of
 the weights is required. The engine supports text and images through the
-checkpoint's vision encoder; see **Vision** below. The checkpoint's optional
-MTP layer drafts tokens for speculative decoding under `Q38_MTP=1`; see
+checkpoint's vision encoder; see **Vision** below. The checkpoint's MTP layer
+drafts tokens for speculative decoding, on by default (`Q38_MTP=0` turns it off); see
 [Speculative decoding with the MTP head](#speculative-decoding-with-the-mtp-head).
 
 The upstream language model has 125B ordinary parameters with 6B activated,
@@ -264,10 +264,11 @@ experts on the fake backend.
 
 ## Speculative decoding with the MTP head
 
-Optional, off by default. The release carries one more decoder layer under
+On by default from 1.13.0 when the checkpoint has it (`Q38_MTP=0` turns it off, and
+`Q38_MTP=1` refuses a checkpoint without it). The release carries one more decoder layer under
 `mtp.*` that reads the model's four hyper-connection streams at a position
 together with the next token's embedding and predicts the token after it.
-`Q38_MTP=1` loads it and decodes speculatively: after each token the head
+The engine loads it and decodes speculatively: after each token the head
 drafts the next one, and one forward over both (S=2) returns the logits of the
 first as a plain decode step would while it checks the draft. When the token
 picked from those logits equals the draft, the second row's logits answer the
@@ -349,7 +350,7 @@ first reads the head's own streams from the row before, with the draft just prop
 The verify copies the DeltaNet and PLE state after each of its rows but the last, so a
 rejection after row `k` restores the state after row `k`. `Q38_MTP_DRAFTS=0` lets a gate
 pick the depth per verify from the measured acceptance by position and the measured
-cost of a verify by its rows. `COLI_LOOKUP=1` adds prompt-lookup drafts (up to 5, from
+cost of a verify by its rows. Prompt lookup (on by default) adds drafts (up to 5, from
 the context's n-grams), and a verify carries whichever proposal is worth more. The
 output stays that of plain decoding. Measured on the release with the int4-g64 sidecar: 4.94 tok/s at two drafts against 4.71 at one and 4.12 without MTP on the CPU (2.75 tokens per forward), 4.55 against 4.39 and 3.91 with the Vulkan tier and chain on a Radeon 780M, so two drafts is the default. The details, the settings and the
 tests are in [speculative.md](speculative.md).

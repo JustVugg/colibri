@@ -11,9 +11,9 @@ What runs where:
 
 | Engine | Draft sources | Verify |
 |---|---|---|
-| `qwen38` (Qwen3.8 Flash Next) | the checkpoint's MTP head, up to 3 drafts (`Q38_MTP=1`, `Q38_MTP_DRAFTS`); prompt lookup, up to 5 (`COLI_LOOKUP=1`) | up to 6 rows, on the CPU or in the Vulkan dense chain |
-| `qwen36` (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) | prompt lookup, up to 5 (`COLI_LOOKUP=1`) | up to 6 rows, on the CPU or in the Vulkan dense chain |
-| `colibri` (GLM-5.2) | its MTP head and n-gram drafts as before; with `COLI_LOOKUP=1` and no head, the n-gram drafts come from the prompt lookup below and its gate | as before |
+| `qwen38` (Qwen3.8 Flash Next) | the checkpoint's MTP head, up to 3 drafts (on by default when the checkpoint has it; `Q38_MTP=0` off, `Q38_MTP_DRAFTS`); prompt lookup, up to 5 (on by default; `COLI_LOOKUP=0` off) | up to 6 rows, on the CPU or in the Vulkan dense chain |
+| `qwen36` (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) | prompt lookup, up to 5 (on by default; `COLI_LOOKUP=0` off) | up to 6 rows, on the CPU or in the Vulkan dense chain |
+| `colibri` (GLM-5.2) | its MTP head as before; without a head, the n-gram drafts come from the prompt lookup below and its gate by default (`COLI_LOOKUP=0`: its own n-gram drafts as before) | as before |
 
 ## How a verify works
 
@@ -60,8 +60,8 @@ per copy, each ending on its row. The state crosses between them through memory 
 so the rows get the bits of the single dispatch.
 
 Drafting stays off where a row's result depends on what is resident: qwen36 under the
-CUDA expert tier, `CACHE_ROUTE` or a qpack container (`[qwen36] COLI_LOOKUP=1: no
-drafts under ...`). One case stays inside the gate but changes the last bits: with the
+CUDA expert tier, `CACHE_ROUTE` or a qpack container (with `COLI_LOOKUP=1` asked for, a
+`[qwen36] COLI_LOOKUP=1: no drafts under ...` line says so; the default stays quiet). One case stays inside the gate but changes the last bits: with the
 Vulkan expert tier on, a verify's rows, the rejected drafts' included, feed the tier's
 history, so which experts are on the device follows what was drafted. An expert on the
 device sums in a different order than on the CPU, so the logits of a run with drafts and
@@ -77,7 +77,9 @@ not a recommendation to freeze the tier for normal use.
 
 ## The MTP head's drafts (qwen38)
 
-`Q38_MTP=1` loads the head (see [qwen38.md](qwen38.md#speculative-decoding-with-the-mtp-head)).
+The engine loads the head by default when the checkpoint has one and the whole model is
+loaded, and says so when it cannot; `Q38_MTP=0` leaves it unread, and `Q38_MTP=1` refuses a
+checkpoint without one (see [qwen38.md](qwen38.md#speculative-decoding-with-the-mtp-head)).
 Its first draft reads the model's four streams at the last fed position with the picked
 token. Each next draft reads the head's own streams from the row before, in place of the
 model's (only the verify computes those), with the draft just proposed. Those deeper
@@ -91,7 +93,8 @@ fastest (below). `Q38_MTP_DRAFTS=1` is the one-draft verify that came before.
 
 ## Prompt lookup
 
-`COLI_LOOKUP=1` looks for the longest n-gram of 4 down to 2 tokens that ends the token
+Prompt lookup (on by default; `COLI_LOOKUP=0` turns it off) looks for the longest n-gram of
+4 down to 2 tokens that ends the token
 history (prompt and output so far) and also occurs earlier in it, at its most recent
 earlier occurrence. The up to 5 tokens that followed it there are the proposal
 (`COLI_LOOKUP_DRAFTS` caps it, 1 to 5). Code edits, quotes and repeated structure give
@@ -144,8 +147,9 @@ state is the one plain decoding leaves.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `Q38_MTP_DRAFTS` | `2` | qwen38 with `Q38_MTP=1`: the MTP head's drafts per verify, `1` to `3`, or `0` / `auto` for the gate's pick. |
-| `COLI_LOOKUP` | `0` | `1`: prompt-lookup drafts (qwen38, qwen36), and colibri's n-gram drafts from the same lookup and gate when it has no MTP head. |
+| `Q38_MTP` | on when the checkpoint has the head | `0`: plain decoding, the head unread; `1`: the head, and a checkpoint without one is refused. The RAM plan (`coli plan`) prices the head when it is on: its dense tensors and its own expert cache (`Q38_MTP_CAP`, the layers' cap by default, at the head's FP8 record). |
+| `Q38_MTP_DRAFTS` | `2` | qwen38 with the MTP head on: the MTP head's drafts per verify, `1` to `3`, or `0` / `auto` for the gate's pick. |
+| `COLI_LOOKUP` | `1` | Prompt-lookup drafts (qwen38, qwen36), and colibri's n-gram drafts from the same lookup and gate when it has no MTP head; always gated. `0` turns them off. |
 | `COLI_LOOKUP_DRAFTS` | `5` | Lookup drafts per verify at most, `1` to `5`. |
 | `COLI_SPEC_GATE` | `1` | `0`: every proposal drafted in full, the gate's estimates ignored (tests). |
 | `Q38_MTP_FORCE`, `COLI_LOOKUP_FORCE` | unset | Tests: in `ref.json` mode, `accept` drafts the reference's tokens, `mixed` makes every other verify's first draft wrong, `cycle` moves the wrong draft over the rows verify by verify, `rowN` makes draft `N` wrong; `Q38_MTP_FORCE=reject` also refuses every draft. |
@@ -201,10 +205,9 @@ against 10.37 and 10.47.
 
 So lookup pays where the output repeats the context (+6 to 7% on the edit) and costs
 nothing where it does not. With the MTP head attached, the head's drafts were worth more
-than lookup's on this edit (100% acceptance). `COLI_LOOKUP` stays off by default anyway:
-without `COLI_VULKAN` every engine's default must stay what it was, and qwen36's serve
-`PROF` frame counts the forwards a turn took, which drafts change. Turn it on for code
-editing and other copy-heavy work.
+than lookup's on this edit (100% acceptance). Since it costs nothing where it
+does not pay, lookup is on by default from 1.13.0, like the MTP head; `COLI_LOOKUP=0` turns
+it off. A turn's `PROF` frame counts the forwards it took, which drafts change.
 
 **Vulkan follow-up, existing int4-g64 sidecar.** On the same 780M, with the code-edit
 prompt above (241 prompt tokens), 128 generated tokens, cap 170, eight threads and
@@ -266,7 +269,7 @@ in RAM, and any discrete GPU (none was available).
 - `spec_gate_draft_cost(&gate, source, seconds)` per extra draft, for a source whose
   deeper drafts cost time.
 
-colibri's n-gram source does exactly this under `COLI_LOOKUP=1` (`spec_decode` in
+colibri's n-gram source does exactly this by default (`COLI_LOOKUP=0`: its own drafts; `spec_decode` in
 `c/colibri.c`). GLM-5.2 is attention only, so its verify needs no copies: a rejection
 rewinds `kv` and the next forward overwrites the rows. DeepSeek V4.1's DSpark drafter
 (`c/deepseek_v41.c`) has a verify path of its own, with the window rings' undo rows; its

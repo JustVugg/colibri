@@ -306,7 +306,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 - **不止一块 SSD。** `COLI_MODEL_MIRROR=/second/glm52_i4 ./coli chat --model /fast/glm52_i4` 会同时从第二块硬盘上的副本读取。两块接在独立控制器上的 NVMe 硬盘实测解码速度 +37.5%；放在较小硬盘上的部分镜像也可以（[multidisk.md](docs/multidisk.md)）。
 - **从笔记本到机架。** 在 25 GB 的笔记本上，所有专家都从磁盘流式读取，慢，但结果正确；在大型主机上，所有专家都常驻（`CUDA_EXPERT_GB=auto PIN_GB=all`），磁盘完全退出解码过程。`COLI_NUMA=1` 把常驻权重分布到多路主机的各个内存控制器上，本地集群模式则可以在其他机器上运行路由专家（[cluster.md](docs/cluster.md)）。
 - **忠实的模型。** 每个引擎都在 CI 中用一个微型 fixture 与其模型的参考实现进行对照检查。GLM-5.2 的 MLA 注意力保存压缩后的 KV 状态（每个 token 576 个浮点数，而不是 32,768 个，缩小 57 倍），并且在重启后依然保留，因此重新打开对话时无需再次读取提示词。
-- **物有所值的推测解码。** GLM-5.2 的 int8 MTP head 在划算时每次前向传播起草 2.2-2.8 个 token；Qwen3.8-Flash-Next 的 MTP head 需手动开启，在输出不变的情况下提速 12-14%。在起草成本高于节省的地方（DeepSeek V4），它保持关闭（[tuning.md](docs/tuning.md#speculation-and-reproducibility)）。
+- **物有所值的推测解码。** GLM-5.2 的 int8 MTP head 在划算时每次前向传播起草 2.2-2.8 个 token；Qwen3.8-Flash-Next 的 MTP head 默认开启，在输出不变的情况下提速 16-20%；提示词查找在代码编辑上提速 6-7%。在起草成本高于节省的地方（DeepSeek V4），它保持关闭（[tuning.md](docs/tuning.md#speculation-and-reproducibility)）。
 
 引擎是每个模型家族一个 C 文件（GLM-5.2 是 `c/colibri.c`），建立在共享的头文件之上，运行时不需要 BLAS，也不需要 Python：Python 只用于安装程序、启动器、转换工具和 API gateway。
 

@@ -3743,17 +3743,30 @@ static float q38_mean(const float *x,int n) {
     return n?(float)(sum/n):0.f;
 }
 
-/* Q38_MTP=1: load the checkpoint's MTP head and draft with it. Unset or 0
- * leaves it unread, as every run before it. The CLI and serve engine attach
- * it after the model (the Segment and Edge adapters never do); a checkpoint
- * without a head this engine runs is refused rather than decoded without
- * one, so a benchmark cannot quietly measure plain decoding. The head's
+/* The checkpoint's MTP head drafts by default (Q38_MTP unset), when the checkpoint has
+ * one this engine runs and the whole model is loaded; otherwise plain decoding, with a
+ * line. Q38_MTP=0 leaves it unread. The CLI and serve engine attach it after the model
+ * (the Segment and Edge adapters never do). Q38_MTP=1 asks for it: a checkpoint without
+ * a head this engine runs is then refused rather than decoded without one, so a
+ * benchmark cannot quietly measure plain decoding. The head's
  * routed experts stay the snapshot's (FP8 on the release): the int4-g64
  * sidecar holds the model's layers, and the head's one layer, read on at
  * most two rows per draft, is a small part of the expert traffic. */
 static void q38_mtp_attach(Model *m,int cap) {
-    if(!q38_env_bool("Q38_MTP",0))return;
+    /* On by default when the checkpoint has the head and the whole model is loaded
+     * (docs/speculative.md: +16 to +20% measured, the output plain decoding's); unset,
+     * a checkpoint without it decodes as before with a line. Q38_MTP=1 asks for it and
+     * refuses a checkpoint that cannot; Q38_MTP=0 turns it off. */
+    const char *asked=getenv("Q38_MTP");
+    int forced=asked&&*asked;
+    if(!q38_env_bool("Q38_MTP",1))return;
     Cfg *c=&m->c;int H=c->hidden,W=c->hc_width;
+    if(!forced&&(m->range_begin!=0||m->range_end!=c->layers||!m->lm_head.rows||c->mtp_layers!=1)){
+        fprintf(stderr,"[qwen38] speculative decoding with the MTP head: off (%s; Q38_MTP=0 silences this)\n",
+                c->mtp_layers==0?"the checkpoint has no MTP head":c->mtp_layers!=1?"an MTP head this engine does not run":
+                "it needs the whole model loaded");
+        return;
+    }
     if(m->range_begin!=0||m->range_end!=c->layers||!m->lm_head.rows){
         fprintf(stderr,"Q38_MTP=1 needs the whole model loaded -- refusing\n");exit(1);
     }
@@ -3779,6 +3792,11 @@ static void q38_mtp_attach(Model *m,int cap) {
     for(int i=0;i<3&&!found;i++){
         snprintf(probe,sizeof probe,"%s.fc_embedding.weight",bases[i]);
         if(st_has(&m->S,probe))found=bases[i];
+    }
+    if(!found&&!forced){   /* the config names a head the weights do not carry (a stripped container) */
+        fprintf(stderr,"[qwen38] speculative decoding with the MTP head: off (the checkpoint has no "
+                       "mtp.fc_embedding.weight; Q38_MTP=0 silences this)\n");
+        return;
     }
     if(!found){fprintf(stderr,"Q38_MTP=1 but the checkpoint has no mtp.fc_embedding.weight -- refusing\n");exit(1);}
     snprintf(m->mtp_prefix,sizeof m->mtp_prefix,"%s",found);

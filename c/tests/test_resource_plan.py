@@ -27,6 +27,13 @@ from resource_plan import (
 )
 
 
+def analyze_qwen38_mtp(model, env):
+    """The analysis build_plan works from, after the MTP head's pricing."""
+    import resource_plan
+    info = resource_plan.qwen38_int4_sidecar(resource_plan.analyze_model(model))
+    return resource_plan._q38_mtp_head(info, env)
+
+
 def write_shard(path, tensors):
     offset = 0
     header = {}
@@ -1067,6 +1074,40 @@ memInfo.free:                     23.50 GB (97%)
                 f"model.layers.0.mlp.experts.1.{projection}.weight", 128, "F32"
             ))
         write_shard(self.model / "model.safetensors", tensors)
+
+    def test_qwen38_mtp_head_is_priced_when_the_engine_attaches_it(self):
+        # qwen38_core.h attaches the checkpoint's MTP head by default: its dense
+        # tensors stay resident and its experts get a cache of the layers' cap
+        # (Q38_MTP_CAP), at the head's own record. The plan used to price neither.
+        self.write_qwen38()
+        config = json.loads((self.model / "config.json").read_text())
+        config["text_config"]["mtp_num_hidden_layers"] = 1
+        (self.model / "config.json").write_text(json.dumps(config))
+        head = [("mtp.fc_embedding.weight", 2048, "BF16", [32, 32]),
+                ("mtp.layers.0.self_attn.q_proj.weight", 1024, "BF16", [16, 32])]
+        for e in range(2):
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                head.append((f"mtp.layers.0.mlp.experts.{e}.{projection}.weight", 512, "F8_E4M3", [16, 32]))
+        write_shard(self.model / "model-mtp.safetensors", head)
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        off = build_plan(self.model, env={"Q38_MTP": "0"}, **kwargs)
+        on = build_plan(self.model, env={}, **kwargs)
+        fixed = build_plan(self.model, env={"Q38_MTP_CAP": "2"}, **kwargs)
+        self.assertEqual(on["tiers"]["ram"]["dense_bytes"] - off["tiers"]["ram"]["dense_bytes"], 2048 + 1024)
+        self.assertEqual(fixed["tiers"]["ram"]["dense_bytes"], on["tiers"]["ram"]["dense_bytes"])
+        # the default: one head expert (3 x 512 bytes) more per cache slot, so a slot costs more
+        self.assertGreaterEqual(off["tiers"]["ram"]["cache_slots_per_layer"],
+                                on["tiers"]["ram"]["cache_slots_per_layer"])
+        info_off = analyze_qwen38_mtp(self.model, {"Q38_MTP": "0"})
+        info_on = analyze_qwen38_mtp(self.model, {})
+        info_fixed = analyze_qwen38_mtp(self.model, {"Q38_MTP_CAP": "2"})
+        self.assertEqual(info_on["per_cap_bytes"] - info_off["per_cap_bytes"], 3 * 512)
+        self.assertEqual(info_fixed["per_cap_bytes"], info_off["per_cap_bytes"])
+        self.assertEqual(info_fixed["expert_fixed_bytes"] - info_off["expert_fixed_bytes"], 2 * 3 * 512)
+        # a config that names no head, or a container without its weights: nothing changes
+        config["text_config"]["mtp_num_hidden_layers"] = 0
+        (self.model / "config.json").write_text(json.dumps(config))
+        self.assertEqual(analyze_qwen38_mtp(self.model, {})["per_cap_bytes"], info_off["per_cap_bytes"])
 
     def test_qwen38_plan_prices_heterogeneous_cache_exports_cap_and_plans_vram(self):
         self.write_qwen38()

@@ -4446,7 +4446,9 @@ static int q36_spec_force_mode(const char *v, int *row) {
 static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     memset(sp, 0, sizeof *sp);
     const char *e = getenv("COLI_LOOKUP");
-    sp->lookup = e && *e == '1';
+    /* on by default, always gated (docs/speculative.md): COLI_LOOKUP=0 turns it off */
+    int asked = e && *e == '1';
+    sp->lookup = !(e && *e == '0');
     e = getenv("COLI_LOOKUP_DRAFTS");
     sp->lookup_max = e && *e ? atoi(e) : Q36_SPEC_SNAPS;
     if (sp->lookup_max < 1 || sp->lookup_max > Q36_SPEC_SNAPS) {
@@ -4457,7 +4459,7 @@ static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     spec_gate_init(&sp->gate, e && *e == '0');
     if (sp->lookup && (qt_ready() || g_cache_route || qq_active() || m->dn_dev)) {
         static int said;
-        if (!said) {
+        if (!said && asked) {   /* the default stays quiet: nothing was asked for */
             said = 1;
             fprintf(stderr, "[qwen36] COLI_LOOKUP=1: no drafts under %s (its results depend on what is "
                             "resident, so a verify would not reproduce plain decoding)\n",

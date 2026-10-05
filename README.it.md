@@ -516,7 +516,8 @@ stesse sia che un expert risponda dalla VRAM, dalla RAM o dal disco.
   senza un prompt da rileggere.
 - **Speculazione che si ripaga.** La testa MTP int8 di GLM-5.2 propone 2.2-2.8
   token per forward quando conviene; la testa MTP di Qwen3.8-Flash-Next,
-  opt-in, aggiunge il 12-14% con lo stesso output. Dove il drafting costa più di
+  accesa di default, aggiunge il 16-20% con lo stesso output, e il lookup sul
+  prompt il 6-7% sulle modifiche al codice. Dove il drafting costa più di
   quanto fa risparmiare (DeepSeek V4) resta spento
   ([tuning.md](docs/tuning.md#speculation-and-reproducibility)).
 

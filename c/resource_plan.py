@@ -1239,6 +1239,54 @@ def qwen38_int4_sidecar(info):
                 expert_fixed_bytes=0, qwen38_int4_experts=True)
 
 
+def _q38_mtp_head(info, env):
+    """Price Qwen3.8's MTP head when the engine attaches it (qwen38_core.h,
+    q38_mtp_attach): on by default when the config names one head and the
+    checkpoint carries its weights, off with Q38_MTP=0. The head is one more
+    layer over the model's, which analyze_model does not count: its dense
+    tensors (attention with the indexer, the shared expert, the mixers, the two
+    fc projections) stay resident, priced here at their size on disk, and its
+    routed experts get their own cache of Q38_MTP_CAP slots, the layers' cap by
+    default, at the head's own record (the snapshot's FP8: the int4-g64 sidecar
+    holds the model's layers only). With the default that is one more expert per
+    cache slot; a fixed Q38_MTP_CAP is a fixed cost instead. Without this the
+    plan handed the cache about 0.9 GB the head then took (cap 161 on Qwen3.8
+    Flash Next: 161 FP8 experts of 4.69 MiB, and 173 MiB of head)."""
+    resolved = info["resolved_family"]
+    if resolved.descriptor.id != "qwen38" or (env.get("Q38_MTP") or "").strip() == "0":
+        return info
+    config = info.get("config") or {}
+    text = config.get("text_config", config) if isinstance(config, dict) else {}
+    if text.get("mtp_num_hidden_layers") != 1:
+        return info
+    dense, experts = 0, {}
+    try:
+        for shard in sorted(Path(info["path"]).glob("*.safetensors")):
+            for name, size, _dtype, _shape in _tensor_sizes(shard, with_shape=True):
+                if not (name.startswith("mtp.") or ".mtp." in name):
+                    continue
+                expert = re.search(r"\.experts\.(\d+)\.", name)
+                if expert:
+                    experts[int(expert[1])] = experts.get(int(expert[1]), 0) + size
+                else:
+                    dense += size
+    except OSError:
+        return info
+    if not dense or not experts:
+        return info      # a container without the head's weights: the engine decodes without it
+    record = max(experts.values())
+    fixed = info["expert_fixed_bytes"]
+    per_cap = info["per_cap_bytes"]
+    cap = (env.get("Q38_MTP_CAP") or "").strip()
+    if cap.isdigit() and int(cap) > 0:
+        fixed += min(int(cap), len(experts)) * record
+    else:
+        per_cap += record
+    return dict(info, dense_bytes=info["dense_bytes"] + dense, per_cap_bytes=per_cap,
+                expert_fixed_bytes=fixed, qwen38_mtp_head_bytes=dense,
+                qwen38_mtp_expert_bytes=record)
+
+
 #: MEMORYSTATUSEX as Windows defines it, in order. Kept as data so a test can
 #: pin the order without a Windows machine.
 WINDOWS_MEMORYSTATUSEX_FIELDS = (
@@ -2436,6 +2484,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     info = qwen38_int4_sidecar(analyze_model(model))
     env_now = os.environ if env is None else env
     info = _q38_cpu_dense_tensors(info, env_now)
+    info = _q38_mtp_head(info, env_now)
     info = _glm53_dense_tensors(info, env_now)
     # Only the matrices a family's dho pass can release earn RAM credit. The
     # embedding, norms, CPU-only components and unrecognized formats stay reserved.

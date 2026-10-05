@@ -1003,7 +1003,7 @@ static Q38Spec q38_spec_begin(Model *m, const int *prompt, int np) {
         else if (depth[0] >= '1' && depth[0] <= '3' && !depth[1]) sp.depth = depth[0] - '0';
         else { fprintf(stderr, "Q38_MTP_DRAFTS must be 1, 2, 3, or 0 (auto: the gate picks)\n"); exit(1); }
     }
-    sp.lookup = q38_env_bool("COLI_LOOKUP", 0);
+    sp.lookup = q38_env_bool("COLI_LOOKUP", 1);   /* on by default, always gated (docs/speculative.md) */
     sp.lookup_max = q38_env_positive_int("COLI_LOOKUP_DRAFTS", Q38_SPEC_ROWS - 1, Q38_SPEC_ROWS - 1);
     sp.lk_force = q38_spec_force_mode("COLI_LOOKUP_FORCE", getenv("COLI_LOOKUP_FORCE"), Q38_SPEC_ROWS - 1, 1,
                                       &sp.lk_force_row);

@@ -49,7 +49,10 @@ SANITIZE = False   # --sanitize: every run's stderr is checked for an ASan or UB
 REQUIRE_KV_SPLIT = False
 SAN_RE = re.compile(rb"ERROR: AddressSanitizer|runtime error:")
 BASE_ENV = {"OMP_NUM_THREADS": "2", "COLI_NO_OMP_TUNE": "1", "COLI_CUDA": "0", "Q38_TRUNK_GPU": "0",
-            "NOSTREAM": "1", "USAGE_SAVE": "0"}
+            "NOSTREAM": "1", "USAGE_SAVE": "0",
+            # plain decoding is the reference, and both draft sources are on by default since
+            # 1.13.0: every run starts from them off, and a case turns on what it checks
+            "Q38_MTP": "0", "COLI_LOOKUP": "0"}
 SPEC_KEYS = ("Q38_MTP", "Q38_MTP_DRAFTS", "Q38_MTP_FORCE", "Q38_MTP_DUMP", "COLI_LOOKUP", "COLI_LOOKUP_DRAFTS",
              "COLI_LOOKUP_FORCE", "COLI_SPEC_GATE", "DUMP", "SERVE", "N_NEW", "TOK")
 MAX_ROWS = 6

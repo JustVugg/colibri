@@ -12615,7 +12615,7 @@ int main(int argc, char **argv){
     g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;
-    g_lookup = getenv("COLI_LOOKUP") && getenv("COLI_LOOKUP")[0]=='1';
+    g_lookup = !(getenv("COLI_LOOKUP") && getenv("COLI_LOOKUP")[0]=='0');   /* on by default, gated */
     spec_gate_init(&g_lookup_gate, getenv("COLI_SPEC_GATE") && getenv("COLI_SPEC_GATE")[0]=='0');
     g_no_fused_pair = getenv("COLI_NO_FUSED_PAIR")?atoi(getenv("COLI_NO_FUSED_PAIR")):0;   /* -1 = auto: 3 se MTP, 0 senza */
     g_looka = getenv("LOOKA")?atoi(getenv("LOOKA")):0;    /* 1 = misura predicibilita' routing */

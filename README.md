@@ -488,8 +488,8 @@ expert answered from VRAM, from RAM or from disk.
   that survives restarts, so a conversation reopens with no prompt to read
   again.
 - **Speculation that earns its keep.** GLM-5.2's int8 MTP head drafts 2.2-2.8
-  tokens per forward when it pays; Qwen3.8-Flash-Next's MTP head, opt-in, adds
-  12-14% with the same output. Where drafting costs more than it saves (DeepSeek V4)
+  tokens per forward when it pays; Qwen3.8-Flash-Next's MTP head, on by default, adds
+  16-20% with the same output, and prompt lookup 6-7% on code edits. Where drafting costs more than it saves (DeepSeek V4)
   it stays off ([tuning.md](docs/tuning.md#speculation-and-reproducibility)).
 
 The engine is one C file per model family (`c/colibri.c` for GLM-5.2) over

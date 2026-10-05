@@ -479,8 +479,8 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
   （每個 token 576 個浮點數，而非 32,768 個，小 57 倍），而且重新啟動後依然保留，
   因此重新開啟對話時，不需要再讀一次提示。
 - **值得才啟用的推測解碼**。GLM-5.2 的 int8 MTP head 在划算時，
-  每次前向傳遞可起草 2.2-2.8 個 token；Qwen3.8-Flash-Next 的 MTP head 需手動開啟，
-  在輸出完全相同的情況下提升 12-14%。在起草的成本高於節省的地方（DeepSeek V4），
+  每次前向傳遞可起草 2.2-2.8 個 token；Qwen3.8-Flash-Next 的 MTP head 預設開啟，
+  在輸出完全相同的情況下提升 16-20%；提示詞查找在程式碼編輯上提升 6-7%。在起草的成本高於節省的地方（DeepSeek V4），
   它保持關閉（[tuning.md](docs/tuning.md#speculation-and-reproducibility)）。
 
 引擎由每個模型家族各一個 C 檔案組成（GLM-5.2 為 `c/colibri.c`），
