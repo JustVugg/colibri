@@ -321,7 +321,7 @@ def _int4_experts_in_model(model, out: Path):
 
 
 def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_experts=False,
-          int4_experts=False, expert_gain=1.0, mtp=False):
+          int4_experts=False, expert_gain=1.0, mtp=False, ple_layer=1):
     if max_new < 1:
         raise ValueError("max_new must be at least 1")
     random.seed(seed)
@@ -331,6 +331,10 @@ def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_e
     # Four layers exercise both token mixers; layer 0 is a PLE-enabled GDN
     # layer and layers 1/3 are QSA layers.  All dimensions are intentionally
     # small, but the relationships are the production relationships.
+    # --ple-layer moves the PLE (one-based, as the config counts it): the
+    # partial Vulkan chain's tests put it past the layers on the device.
+    if not 1 <= ple_layer <= 4:
+        raise ValueError("ple_layer must be in 1..4 (one-based)")
     config = ConfigCls(
         vocab_size=64,
         hidden_size=32,
@@ -365,7 +369,7 @@ def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_e
         ngram_vocab_size_base=31,
         make_ngram_vocab_size_divisible_by=4,
         split_ngram_parts=2,
-        ple_layer_ids=[1],  # one-based; layer 0 is GDN
+        ple_layer_ids=[ple_layer],  # one-based; layer 0 (GDN) by default
         ple_embed_dim=32,
         ple_conv_kernel_size=4,
         indexer_n_heads=2,
@@ -478,6 +482,8 @@ def main():
     parser.add_argument("--int4-experts", action="store_true",
                         help="also convert the routed experts to the experts-int4g64/ sidecar "
                              "and write ref_int4.json, the reference of the dequantized sidecar")
+    parser.add_argument("--ple-layer", type=int, default=1,
+                        help="the PLE layer, one-based as in the config (default 1: layer 0)")
     parser.add_argument("--mtp", action="store_true",
                         help="add an MTP head (mtp.*, random weights from their own seed) with the "
                              "release's tensor names; the model and ref.json do not change")
@@ -485,7 +491,7 @@ def main():
     prompt = [int(x) for x in args.prompt_ids.split(",") if x.strip()] if args.prompt_ids else None
     build(args.out, prompt_ids=prompt, max_new=args.max_new, seed=args.seed, emit_ref=not args.no_ref,
           fp8_experts=args.fp8_experts, int4_experts=args.int4_experts,
-          expert_gain=args.expert_gain, mtp=args.mtp)
+          expert_gain=args.expert_gain, mtp=args.mtp, ple_layer=args.ple_layer)
 
 
 if __name__ == "__main__":

@@ -750,6 +750,141 @@ def _olmoe_chain_layout(info, env, vulkan):
 _VK_CHAIN_LAYOUT["olmoe"] = _olmoe_chain_layout
 
 
+_Q38_CHAIN_MATRICES = frozenset(_Q38_TRUNK_COMPONENTS) | {
+    "linear_attn.in_proj_a", "linear_attn.in_proj_b", "ple.key_proj", "ple.value_proj"}
+
+
+def _q38_env_int(env, name, default):
+    """C's atol/atoi: the leading integer, 0 when there is none."""
+    value = env.get(name)
+    if value is None or not value.strip():
+        return default
+    match = re.match(r"\s*([+-]?\d+)", value)
+    return int(match[1]) if match else 0
+
+
+def _q38_vk_fmt(tensor, tag, env):
+    """q38_vk_fmt: the format a resident matrix goes up in. The trunk's int8 rows (fmt 1)
+    when q38_trunk_cpu_int8 quantized it (a trunk component of at least Q38_TRUNK_MIN_KB
+    with its float scales, not in Q38_TRUNK_SKIP); else the rows as loaded: bf16 (fmt 11)
+    from a BF16 tensor with Q38_NATIVE_BF16, f32 (fmt 10) otherwise."""
+    rows, columns = tensor["shape"]
+    if tag and env.get("Q38_TRUNK_CPU_INT8") != "0":
+        min_kb = _q38_env_int(env, "Q38_TRUNK_MIN_KB", 1024)
+        skipped = set((env.get("Q38_TRUNK_SKIP") or "").split(","))
+        if min_kb >= 0 and rows * columns + 4 * rows >= min_kb * 1024 and tag not in skipped:
+            return 1
+    return 11 if tensor["dtype"] == "BF16" and env.get("Q38_NATIVE_BF16") != "0" else 10
+
+
+def _q38_chain_layout(info, env, vulkan):
+    """qwen38_chain.h: q38c_fit_layer, q38c_fit_fixed, q38c_fit_tail. None for a device
+    whose memory the plan does not know (no budget, no heap size, no cap) unless N is
+    forced: no prediction, the plan as before (every layer and every host copy)."""
+    device = vulkan or {}
+    known = _vk_cap_bytes(env) or device.get("budget_bytes") or device.get("device_local_bytes")
+    if not known and (env.get("COLI_VK_CHAIN_LAYERS") or "").strip() in ("", "auto"):
+        return None
+    c = info.get("config") or {}
+    c = c.get("text_config") or c
+    try:
+        L, H, vocab = int(c["num_hidden_layers"]), int(c["hidden_size"]), int(c["vocab_size"])
+        kinds = [0 if t == "linear_attention" else 1 for t in c["layer_types"]][:L]
+        QH, KVH, D = int(c["num_attention_heads"]), int(c["num_key_value_heads"]), int(c["head_dim"])
+        IQ, ID = int(c["indexer_n_heads"]), int(c["indexer_head_dim"])
+        budget, ratio = int(c["indexer_budget"]), int(c["indexer_compress_ratio"])
+        VH, VD = int(c["linear_num_value_heads"]), int(c["linear_value_head_dim"])
+        KH, KD, CK = int(c["linear_num_key_heads"]), int(c["linear_key_head_dim"]), int(c["linear_conv_kernel_dim"])
+        E, SI = int(c["num_experts"]), int(c["shared_expert_intermediate_size"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if L < 1 or len(kinds) != L:
+        return None
+    C, R = int(c.get("hc_count") or 4), int(c.get("hc_lowrank") or 320)
+    W = C * H
+    rope = c.get("rope_parameters") or {}
+    partial = rope.get("partial_rotary_factor", c.get("partial_rotary_factor", 1.0))
+    rotary = int(D * float(partial if partial is not None else 1.0))
+    ngram, per_ngram = int(c.get("ngram_size") or 3), int(c.get("heads_per_ngram") or 8)
+    ple_dim, ple_k = int(c.get("ple_embed_dim") or H), int(c.get("ple_conv_kernel_size") or 4)
+    heads = (ngram - 1) * per_ngram
+    Ep = max(heads * (ple_dim // heads if heads > 0 else 0), 1)
+    ids = c.get("ple_layer_ids") or []
+    ple = int(ids[0]) - 1 if ids else -1
+    CD = 2 * KH * KD + VH * VD
+    rows = _q38_chain_rows(env)
+    rows0 = 3 * max(_q38_env_int(env, "COLI_VK_KV_BLOCK", 64), 1)
+    kvo = KVH * D
+    # each layer's matrices as they go up, and the shared expert's gate (fmt 10, H x 1)
+    layers = [vk_tensor_bytes(10, H, 1) for _ in range(L)]
+    for tensor in info.get("dense_tensors", []):
+        layer, part, shape = _vk_layer_index(tensor["name"]), _layer_component(tensor["name"]), tensor.get("shape")
+        if layer is None or layer >= L or part not in _Q38_CHAIN_MATRICES or not isinstance(shape, list) or len(shape) != 2:
+            continue
+        if part.startswith("ple.") and layer != ple:
+            continue
+        fmt = _q38_vk_fmt(tensor, _Q38_TRUNK_COMPONENTS.get(part), env)
+        layers[layer] += vk_tensor_bytes(fmt, shape[1], shape[0])
+    for i in range(L):
+        floats = 2 * W
+        if kinds[i]:
+            floats += 2 * D + 2 * ID
+            layers[i] += (2 * vk_buf_bytes(kvo * rows0 * 4) + vk_buf_bytes(ID * rows0 * 4) +
+                          vk_buf_bytes(ID * (rows0 // max(ratio, 1) + 1) * 4) + rows * (2 * kvo + ID) * 4)
+        else:
+            floats += CD * CK + 2 * VH + VD
+            layers[i] += 2 * vk_buf_bytes(VH * KD * VD * 4) + 2 * vk_buf_bytes(CD * (CK - 1) * 4)
+        if i == ple:
+            floats += 3 * W + W * ple_k
+            layers[i] += vk_buf_bytes(2 * W * (ple_k - 1) * ngram * 4)
+        layers[i] += 4 * floats
+    # q38c_bufs' counting pass at `rows` rows, no context yet and no attention layer, the
+    # streams' read-back and the final norm
+    r, nb, rot = rows, 1, rotary if rotary > 0 else 2
+    counts = [r * W, r * W, r * R, r * W, r * H, r * C, r * C, r * H, r * QH * 2 * D, r * kvo, r * kvo,
+              r * (IQ + 1) * ID, r * QH * D, r * 2 * nb, r * (budget + ratio), r * CD, r * VH * VD, r * 2 * VH,
+              r * CD, r * VH * VD, r * E, r * SI, r * SI, r * SI, r * H, r, r * H, r * W, r * H, r * W, r * W,
+              r * H, r * E, r * (2 * kvo + ID), 2 * vocab, r * H, r * Ep, r * rot, nb * rot]
+    fixed = sum(4 * (n if n else 1) for n in counts) + (rows + 1) * W * 4
+    # the tail: the final mixer and lm_head; under Q38_MTP=1 the MTP head's matrices too
+    # (the scan leaves its tensors out: its decoder layer has an attention layer's shapes,
+    # its two projections are H x H and its mixer the final mixer's)
+    tail, head_dtype = 0, "BF16"
+    attn_parts = {}
+    last_attn = max([i for i in range(L) if kinds[i]] + [-1])
+    for tensor in info.get("dense_tensors", []):
+        name, shape = _text_weight_name(tensor["name"]), tensor.get("shape")
+        if not isinstance(shape, list) or len(shape) != 2:
+            continue
+        if name == "lm_head.weight":
+            head_dtype = tensor["dtype"]
+            tail += vk_tensor_bytes(_q38_vk_fmt(tensor, "lmhead", env), shape[1], shape[0])
+        elif name in ("model.hyper_connection_mixer.input_mix_weight_down.weight",
+                      "model.hyper_connection_mixer.input_mix_weight_up.weight"):
+            tail += vk_tensor_bytes(_q38_vk_fmt(tensor, None, env), shape[1], shape[0])
+        elif _vk_layer_index(tensor["name"]) == last_attn and _layer_component(tensor["name"]) in _Q38_CHAIN_MATRICES:
+            attn_parts[_layer_component(tensor["name"])] = tensor
+    if env.get("Q38_MTP") == "1" and int(c.get("mtp_num_hidden_layers") or 0) == 1:
+        for part, tensor in attn_parts.items():
+            tail += vk_tensor_bytes(_q38_vk_fmt(tensor, _Q38_TRUNK_COMPONENTS.get(part), env),
+                                    tensor["shape"][1], tensor["shape"][0])
+        for tag, out, cols in (("mtpfce", H, H), ("mtpfch", H, H), ("mtpmixd", R, W), ("mtpmixu", W, R)):
+            tensor = {"shape": [out, cols], "dtype": head_dtype}
+            tail += vk_tensor_bytes(_q38_vk_fmt(tensor, tag, env), cols, out)
+    return VkChainLayout(layers, fixed, tail)
+
+
+def _q38_chain_rows(env):
+    """vkc_fit_rows(256): COLI_VK_CHAIN_ROWS when it is a number, else 256."""
+    value = (env.get("COLI_VK_CHAIN_ROWS") or "").strip()
+    if not value or value == "auto":
+        return 256
+    return min(max(_q38_env_int(env, "COLI_VK_CHAIN_ROWS", 256), 1), 65535)
+
+
+_VK_CHAIN_LAYOUT["qwen38"] = _q38_chain_layout
+
+
 def _analysis_signature(shards, config_path):
     parts = [f"v{_ANALYSIS_CACHE_VERSION}"]
     st = config_path.stat()

@@ -871,6 +871,44 @@ a prefill's worth of CPU work, and runs on the CPU from there. Only a state the 
 not describe (a turn with an image) cannot be rebuilt: that stops the engine with a
 message. `COLI_VK_CHAIN_FAULT=n` fakes the loss at the n-th frame (the tests use it).
 
+**Qwen3.8 on a partial chain** ([A partial chain](#a-partial-chain); `vkc_fit`,
+`COLI_VK_CHAIN_LAYERS`). When its layers do not all fit the device,
+qwen38's chain takes the first N. At startup, before any upload, the dense-host pass and the
+expert tier, the fit counts each layer's matrices in the format they go up in (the trunk's
+int8 rows, bf16 or f32) with its shared expert's gate; its state at its starting size (a
+DeltaNet layer's recurrent state and conv ring with a verify's first copy of each, an
+attention layer's K/V and index-key mirrors at the KV split's floor of three blocks and its
+rows of the chunk's K/V read-back, the PLE ring with the PLE layer); and its parameters. The
+fixed part is the scratch of one 256-row chunk. The tail is the final mixer, lm_head and the
+MTP head's matrices. A partial chain is placed then and there, layer by layer, so the tier
+sizes itself after it. The full chain keeps its setup at the first forward, so with every
+layer fitting the uploads and the tier's budget are the ones before. A forward runs the N
+layers chunk by chunk on the device. After layer N-1 every row's four hyper-connection
+streams come back to the host once per chunk, and the CPU runs layers N.. over all the
+rows, the final mixer and lm_head. The device's layers keep their DeltaNet, conv, K/V,
+index-key and pooled-key state on the device. A verify copies their state into the chain's
+slots. The CPU's layers keep theirs on the host, and the CPU's copies roll them back. The PLE
+ring and its n-gram history go with whichever side holds the PLE layer. The MTP head runs
+outside the chain and reads the final streams from whichever side ran the last layer: with a
+partial chain its matrices stay on the CPU, with the full chain and the per-matrix path on
+they answer from the device one at a time, as before. A lost
+device rebuilds only the device's layers from the prefix record. The vision tower's rows and
+the n-gram table stay on the host as before. With `COLI_VK_DENSE_HOST=0` only the N layers'
+host copies go (with the full chain fitted, each layer once all of it is on the device). The
+tiny fixture on Lavapipe under `COLI_VK_DEVICE_CAP_MB=58.758690` with
+`COLI_VK_TIER_RESERVE_GB=0.04`:
+
+```
+[VK] qwen38 chain fit: free 61612952 B, reserve 42949672 B, fixed 18569232 B (the engine's 1529872 B, the pools' 17039360 B), tail 8960 B, layers 47664 92768 24112 92768 B, matrices 27080 21184 16832 21184 B
+[VK] qwen38 chain: 1 of 4 layers on the device (0.0 MiB), 3 on the CPU, the head and what goes with it (0.0 MiB) on the CPU (free 58.8 MiB, reserve 41.0 MiB)
+[VK] qwen38 chain: 1 of 4 layers placed: 27080 B of matrices on the device (the fit counted 27080 B for these layers), chain buffers 4210736 B, device memory held 4329472 B
+[VK] qwen38 chain: 1 layers on the device (0 QSA), 18 matrices resident, 0.0 MiB of parameters; the CPU runs the other layers, the final mixer and lm_head
+```
+
+`tests/vulkan_engines.sh partial-qwen38` (and `-sanitize`) covers it on Lavapipe. No
+Qwen3.8 checkpoint ran on a partial chain and no discrete GPU was available, so what N a
+real card takes for the 4.1 GiB trunk is not measured.
+
 **The shaders** (`shaders/chain_*.comp`, each documented at its top): RMSNorm over
 segments (rows, heads with a gate between them, streams with a weight slice each,
 zero-centred or not, L2); RoPE from a host table (the CPU's own cosf/sinf at the CPU's
@@ -2326,6 +2364,7 @@ predict a layer more than the engine places.
 | deepseek_v4 | the hc_mult streams; DSpark's taps of the last three layers come from whichever side ran them | yes |
 | qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B, Clef) | the residual rows alone; a prompt-lookup verify rolls each side back with its own copies (the device's DeltaNet slots, the CPU's snapshots) ([qwen36](#the-dense-chain-vk_chainc)) | yes |
 | olmoe | the residual rows alone; `PILOT` keeps prefetching the next layers from the chain's rows ([olmoe](#olmoe-and-inkling)) | yes |
+| qwen38 | the four hyper-connection streams of every row; the MTP head reads the final streams from whichever side ran the last layer, and the PLE ring and n-gram history stay with the PLE layer's side | yes |
 
 **`COLI_VK_DEVICE_CAP_MB=n`** (tests) makes the device hold at most n MiB of device-local
 memory (a fraction is taken): every allocation of the backend and the chain (tensors, the

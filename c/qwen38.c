@@ -1997,13 +1997,16 @@ static void q38_vk_tier_start(Model *m, int cap);   /* below: the Vulkan routed-
  * the trunk goes up now, so the tier sees it placed. */
 static void q38_dho_start(Model *m) {
     if(!g_vk_ready)return;
-    size_t bytes=0; int n=0;
-    q38_dho_each(m,q38_dho_count,&bytes,&n);
-    if(!coli_vk_dense_host_decide("qwen38",(g_vk_chain||g_vk_dense)&&!qt_ready(),bytes))return;
+    size_t bytes=0; int n=0,layers=m->c.layers,head=1,dev=(g_vk_chain||g_vk_dense)&&!qt_ready();
+    q38c_dho_bound(&layers,&head,&dev);   /* a partial chain: its N layers' matrices only (qwen38_chain.h) */
+    q38_dho_each(m,q38_dho_count,&bytes,&n,layers,head);
+    if(!coli_vk_dense_host_decide("qwen38",dev,bytes))return;
     g_q38_dho_model=m;
     g_vk_dense=1;   /* the steps the chain declines run their matrices on the device too: the CPU has none */
     bytes=0; n=0;
-    q38_dho_each(m,q38_dho_drop,&bytes,&n);
+    /* the full chain fitted: layer by layer, each dropped once all of it is on the device */
+    if(!q38c_dho_place(m,&bytes,&n))q38_dho_each(m,q38_dho_drop,&bytes,&n,layers,head);
+    q38c_dho_layers();
     coli_vk_dense_host_placed("qwen38","the embedding (its rows are gathered on the CPU), the vision tower, norms");
 }
 #endif
@@ -2139,6 +2142,7 @@ int main(int argc, char **argv) {
      * on an integrated GPU (docs/vulkan.md, "The dense chain") */
     if(g_vk_ready&&!qt_ready())
         g_vk_chain=coli_vk_chain_decide("qwen38",vkt_wanted()&&m.c.experts>0,COLI_VK_CHAIN_OFF);
+    q38c_start(&m);      /* the layers that fit the device, before anything of the chain goes up (a partial chain placed now; qwen38_chain.h) */
     if(g_vk_chain&&!vkc_init())g_vk_chain=0;
     q38_dho_start(&m);   /* COLI_VK_DENSE_HOST: the trunk on the device only, before the tier sizes its budget */
 #endif
@@ -2508,6 +2512,7 @@ static size_t q38_vk_dense_bytes(Model *m){
     size_t b=0;
     if(!g_vk_dense&&!g_vk_chain)return 0;
     if(coli_vk_dense_device_only())return 0;   /* placed already (q38_dho_start): the free memory the tier reads counts them */
+    if(g_q38_vk_noup)return 0;   /* a partial chain placed its layers already, and nothing else goes up */
     q38_vk_dense_add(&m->lm_head,&b);
     const GatedResidual *f=&m->final_gr;
     q38_vk_dense_add(&f->down,&b);q38_vk_dense_add(&f->up,&b);q38_vk_dense_add(&f->inject,&b);

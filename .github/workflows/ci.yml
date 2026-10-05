@@ -269,6 +269,12 @@ jobs:
             req: c/tools/requirements-qwen38-tiny.txt
           - family: dense-only-qwen38-sanitize
             req: c/tools/requirements-qwen38-tiny.txt
+          # qwen38's partial dense chain (the first N layers on the device, the rest and
+          # the head on the CPU), and the same under ASan and UBSan
+          - family: partial-qwen38
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: partial-qwen38-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
           - family: dense-only-qwen36-olmoe
             req: c/tools/requirements-qwen38-tiny.txt
           - family: dense-only-qwen36-olmoe-sanitize

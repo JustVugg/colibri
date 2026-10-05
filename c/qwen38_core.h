@@ -483,6 +483,10 @@ static int q38_vk_fmt(const Q38Weight *w) {
     return w->vk_gone?w->vk_fmt:w->q8?1:w->kind==Q38_WEIGHT_BF16?11:10;
 }
 static unsigned g_q38_vk_placed[3];   /* uploads by format: int8 rows, bf16, f32 */
+/* A partial dense chain (qwen38_chain.h, q38c_start): the first N layers' matrices are on
+ * the device, the other layers and the head stay on the CPU, so nothing that is not on
+ * the device already goes up any more (docs/vulkan.md, "A partial chain"). */
+static int g_q38_vk_noup;
 static void q38_dho_reload(Q38Weight *w);   /* below, beside the trunk's int8 rows */
 /* The weight's device copy, uploaded on the first call; NULL when it is not eligible
  * or the upload failed (vk_off). The dense chain (qwen38_chain.h) reads the same one. */
@@ -491,7 +495,7 @@ static ColiVkTensor *q38_vk_tensor(const Q38Weight *weight) {
     Q38Weight *w=(Q38Weight*)weight;   /* vk is a cache in a weight the forward pass treats as read-only */
     ColiVkTensor **t=(ColiVkTensor**)&w->vk;
     if(*t)return *t;
-    if(w->vk_gone)return NULL;
+    if(w->vk_gone||g_q38_vk_noup)return NULL;
     int fmt=q38_vk_fmt(w);
     const void *wq=w->q8?(const void*)w->q8:(const void*)w->data;
     const float *sc=w->q8?w->q8sc:NULL;   /* fmt 10/11: no scales */
@@ -533,7 +537,7 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
     if(S>1&&g_q38_rowwise&&weight&&
        (weight->gpu
 #ifdef COLI_VULKAN
-        ||(g_vk_ready&&g_vk_dense&&q38_vk_eligible(weight))
+        ||(g_vk_ready&&g_vk_dense&&q38_vk_eligible(weight)&&(weight->vk||!g_q38_vk_noup))
 #endif
        )){
         for(int s=0;s<S;s++)q38_weight_matmul(y+(int64_t)s*O,x+(int64_t)s*I,weight,1,I,O);
@@ -2592,19 +2596,22 @@ static void q38_dho_drop(Q38Weight *w,size_t *bytes,int *n) {
     *bytes+=b; (*n)++;
 }
 /* Every resident matrix the device can take, in a fixed order: the head, each layer's
- * (the MTP head's layer included), the PLE projections, the MTP head's own. */
-static void q38_dho_each(Model *m,void (*f)(Q38Weight *,size_t *,int *),size_t *bytes,int *n) {
+ * (the MTP head's layer included), the PLE projections, the MTP head's own. A partial
+ * chain (qwen38_chain.h) bounds it: the first `layers` layers only, and what is not a
+ * layer's (the head, the MTP head) only with `head`. */
+static void q38_dho_each(Model *m,void (*f)(Q38Weight *,size_t *,int *),size_t *bytes,int *n,int layers,int head) {
     Cfg *c=&m->c;
-    f(&m->lm_head,bytes,n); f(&m->final_gr.down,bytes,n); f(&m->final_gr.up,bytes,n);
+    if(head){f(&m->lm_head,bytes,n); f(&m->final_gr.down,bytes,n); f(&m->final_gr.up,bytes,n);}
     for(int i=0;i<=c->layers;i++){
-        if(i==c->layers&&!m->mtp)break;
+        if(i==c->layers&&(!m->mtp||!head))break;
+        if(i<c->layers&&i>=layers)continue;
         Layer *l=&m->L[i];
         Q38Weight *ws[]={&l->attn_gr.down,&l->attn_gr.up,&l->attn_gr.inject,&l->mlp_gr.down,&l->mlp_gr.up,
                          &l->mlp_gr.inject,&l->router,&l->sh_g,&l->sh_u,&l->sh_d,&l->q,&l->k,&l->v,&l->o,
                          &l->idx_qk,&l->dn_qkv,&l->dn_z,&l->dn_b,&l->dn_a,&l->dn_out,&l->ple_key,&l->ple_value};
         for(size_t k=0;k<sizeof ws/sizeof ws[0];k++)f(ws[k],bytes,n);
     }
-    if(m->mtp){f(&m->mtp_fc_emb,bytes,n);f(&m->mtp_fc_hid,bytes,n);f(&m->mtp_mixer.down,bytes,n);f(&m->mtp_mixer.up,bytes,n);}
+    if(m->mtp&&head){f(&m->mtp_fc_emb,bytes,n);f(&m->mtp_fc_hid,bytes,n);f(&m->mtp_mixer.down,bytes,n);f(&m->mtp_mixer.up,bytes,n);}
 }
 static void q38_dho_count(Q38Weight *w,size_t *bytes,int *n) {
     if(w->vk_res&&!w->vk_off&&q38_vk_eligible(w)){*bytes+=q38_dho_host_bytes(w);(*n)++;}
@@ -3201,14 +3208,22 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
         for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
     }
     float *mixed=falloc((int64_t)S*H),*inject=falloc((int64_t)S*C),*block=falloc((int64_t)S*H);
+    int first=0;   /* the layers a partial dense chain ran on the device (COLI_VULKAN) */
 #ifdef COLI_VULKAN
     /* COLI_VK_CHAIN: the layers, the final mixer and lm_head on the device; the streams
-     * come back for the MTP head, every row's mixed for the prefill read-out */
+     * come back for the MTP head, every row's mixed for the prefill read-out. A partial
+     * chain runs its first N layers there and hands the streams back after layer N-1:
+     * the CPU runs the other layers and the head from them, below. */
     float *chain_logit=NULL;
     if(g_vk_chain){
         int echo=g_echo_k>0&&g_echo_id&&S>1;
         chain_logit=falloc((int64_t)nlogits*c->vocab);
-        if(q38c_forward(m,ids,S,pos_base,nlogits,hyper,streams!=NULL,echo?mixed:NULL,chain_logit)){
+        int took=q38c_forward(m,ids,S,pos_base,nlogits,hyper,streams!=NULL,echo?mixed:NULL,chain_logit);
+        if(took==2){   /* the first N layers: the PLE rows were the chain's when its layer is one of them */
+            free(chain_logit); chain_logit=NULL;
+            first=q38c_layers(m);
+            if(c->ple_layer<first){free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;}
+        } else if(took){
             free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;   /* consumed, as q38_layer_forward does */
         } else {
             free(chain_logit); chain_logit=NULL;
@@ -3225,7 +3240,7 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
     }
     if(!chain_logit){
 #endif
-    for(int i=0;i<c->layers;i++)
+    for(int i=first;i<c->layers;i++)
         q38_layer_forward(m,i,hyper,ids,S,pos_base,mixed,inject,block);
     q38_gr_read(m,&m->final_gr,hyper,S,mixed,NULL);
 #ifdef COLI_VULKAN
