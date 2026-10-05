@@ -25,6 +25,7 @@ FILES = [
     "glm53", "glm53.exe",
     "glm", "glm.exe",                       # pre-rename name of the colibri engine
     "iobench", "iobench.exe",
+    "qwen36-canonical", "qwen36-canonical.exe",
     "backend_cuda.o", "backend_loader.o", "qwen36_tier.o",
     # VK=1, XDNA=1 and METAL=1 (qwen36's qpack) objects. Left behind once
     # their .d is cleaned, an object would sit in the tree with no record of

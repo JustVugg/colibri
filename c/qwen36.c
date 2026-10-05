@@ -90,6 +90,7 @@ static int qwen36_max_ctx(void) {
 #include "backend_metal.h" /* coli_metal_init: affine pipelines for the store */
 #endif
 #include "qwen36_embedding.h"     /* the embedding rows read in place from the checkpoint */
+#include "qwen36_dense_file.h"    /* canonical.qc: the INT8 dense matrices, converted once */
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h" /* COLI_VULKAN=1: the resident dense trunk on a Vulkan device */
 static int g_vk_ready = 0;
@@ -892,6 +893,7 @@ typedef struct {
     uint16_t *embed_h;      /* COLI_DENSE_BITS=16: the table in f16, embed is NULL */
     QwenEmbedding embed_native; /* the rows read in place from the checkpoint; embed is then NULL */
     QW lm_head;
+    QdfFile dense_file;        /* canonical.qc while the model loads (closed after) */
     Layer *L;
     LCache *cache;          /* [n_layers] */
     int *active_of;         /* [n_layers] original->active idx (Phase 2: identity for all layers) */
@@ -2087,6 +2089,137 @@ static float *load_t_n(Model *m, const char *name, int64_t want) {
     return p;
 }
 
+/* ---- canonical.qc: the INT8 dense matrices converted once (qwen36-canonical)
+ * and read from the file at start instead of converted again. */
+typedef struct { int count; QdfSpec *spec; char (*name)[QDF_NAME]; } QwenDenseList;
+static void qwen_dense_list_free(QwenDenseList *l) {
+    free(l->spec); free(l->name); memset(l, 0, sizeof(*l));
+}
+/* Every dense matrix model_init_range quantizes to INT8, with its shape and
+ * under the same conditions: per layer the router (a model with routed
+ * experts) and the shared expert or a dense model's MLP (when there is one),
+ * then attention or DeltaNet projections; lm_head last. */
+static int qwen_dense_list(const Cfg *c, QwenDenseList *l) {
+    memset(l, 0, sizeof(*l));
+    int max = 8 * c->n_layers + 1;
+    l->spec = calloc((size_t)max, sizeof(*l->spec)); l->name = calloc((size_t)max, sizeof(*l->name));
+    if (!l->spec || !l->name) { qwen_dense_list_free(l); return 0; }
+    int qr = c->q_heads * c->q_head_dim, kr = c->kv_heads * c->k_head_dim, vr = c->kv_heads * c->v_head_dim;
+    int vd = c->dn_vheads * c->dn_vdim;
+    #define QDL_ADD(I_, O_, ...) do { char *nm = l->name[l->count]; snprintf(nm, QDF_NAME, __VA_ARGS__); \
+        l->spec[l->count++] = (QdfSpec){nm, (I_), (O_)}; } while (0)
+    const char *shp = c->n_experts ? "mlp.shared_expert." : "mlp.";
+    for (int i = 0; i < c->n_layers; i++) {
+        if (c->n_experts) QDL_ADD(c->hidden, c->n_experts, "model.layers.%d.mlp.gate.weight", i);
+        if (c->shared_inter > 0) {
+            QDL_ADD(c->hidden, c->shared_inter, "model.layers.%d.%sgate_proj.weight", i, shp);
+            QDL_ADD(c->hidden, c->shared_inter, "model.layers.%d.%sup_proj.weight", i, shp);
+            QDL_ADD(c->shared_inter, c->hidden, "model.layers.%d.%sdown_proj.weight", i, shp);
+        }
+        if (c->is_attn[i]) {
+            QDL_ADD(c->hidden, qr, "model.layers.%d.self_attn.q_proj.weight", i);
+            QDL_ADD(c->hidden, kr, "model.layers.%d.self_attn.k_proj.weight", i);
+            QDL_ADD(c->hidden, vr, "model.layers.%d.self_attn.v_proj.weight", i);
+            QDL_ADD(c->o_in, c->hidden, "model.layers.%d.self_attn.o_proj.weight", i);
+        } else {
+            QDL_ADD(c->hidden, c->dn_conv_dim, "model.layers.%d.linear_attn.in_proj_qkv.weight", i);
+            QDL_ADD(c->hidden, vd, "model.layers.%d.linear_attn.in_proj_z.weight", i);
+            QDL_ADD(vd, c->hidden, "model.layers.%d.linear_attn.out_proj.weight", i);
+        }
+    }
+    QDL_ADD(c->hidden, c->vocab, "lm_head.weight");
+    #undef QDL_ADD
+    return 1;
+}
+/* The checkpoint tensor of a dense matrix: its name, or the name under the
+ * language_model. prefix, as dense_resolve finds it. NULL: not there. */
+static const st_tensor *qwen_dense_source(shards *S, const char *name) {
+    const st_tensor *t = st_find(S, name);
+    char rn[QW_DENSE_NAME_MAX];
+    if (!t && snprintf(rn, sizeof rn, "language_model.%s", name) < (int)sizeof rn) t = st_find(S, rn);
+    return t;
+}
+/* What canonical.qc is checked against: the matrix list, the quantizer, and
+ * the first and last 128 bytes of every source matrix. A sample, not a
+ * checksum: a fine-tune of the same shape changes it, an edit confined to the
+ * middle of a matrix does not. 0: a source is missing. */
+static uint64_t qwen_dense_fingerprint(shards *S, const QdfSpec *s, int n) {
+    uint64_t h = qdf_hash(QDF_SEED, QDF_QUANTIZER, sizeof(QDF_QUANTIZER));
+    for (int i = 0; i < n; i++) {
+        const st_tensor *t = qwen_dense_source(S, s[i].name);
+        if (!t || t->nbytes <= 0) return 0;
+        unsigned char sample[256]; int64_t k = t->nbytes < 128 ? t->nbytes : 128;
+        st_pread_full(t->fd, sample, k, t->off, "canonical.qc fingerprint");
+        st_pread_full(t->fd, sample + k, k, t->off + t->nbytes - k, "canonical.qc fingerprint");
+        int32_t shape[3] = {s[i].I, s[i].O, t->dtype};
+        h = qdf_hash(h, s[i].name, strlen(s[i].name) + 1);
+        h = qdf_hash(h, shape, sizeof shape);
+        h = qdf_hash(h, sample, (size_t)(2 * k));
+    }
+    return h ? h : 1;
+}
+/* canonical.qc (QWEN_DENSE_CACHE, or beside the model). Only where every dense
+ * matrix is the INT8 copy qw_quantize would make: the whole model, COLI_DENSE_BITS
+ * 8, no COLI_KEEP_F32, and a run on the CPU (not COLI_CUDA=1 or COLI_VULKAN=1, which
+ * place or upload the matrices their own way), outside the adapters. A file beside
+ * the model that does not match it is set aside with the reason, and the matrices
+ * are converted as without it; one named by QWEN_DENSE_CACHE stops the start. */
+static void qwen_dense_file_open(Model *m, const char *snap, int full) {
+    const char *path = getenv("QWEN_DENSE_CACHE");
+    if (path && !*path) path = NULL;   /* empty: unset */
+    char beside[1100]; struct stat st;
+    int usable = full && dense_i8_on() && dense_bits() == 8 && !getenv("COLI_KEEP_F32") && !q36_waligned();
+#ifdef COLI_CUDA
+    { const char *cu = getenv("COLI_CUDA"); if (cu && *cu == '1') usable = 0; }
+#endif
+#if defined(COLI_SEGMENT_ADAPTER) || defined(COLI_EDGE_ADAPTER)
+    usable = 0;
+#endif
+    if (!usable) {
+        if (path) { fprintf(stderr, "[qwen-dense] QWEN_DENSE_CACHE needs the whole model in INT8 (COLI_DENSE_BITS=8, not COLI_DENSE_I8=0), without COLI_KEEP_F32, COLI_CUDA=1, COLI_VULKAN=1 or an adapter\n"); exit(1); }
+        return;
+    }
+    int named = path != NULL;
+    if (!path) {
+        snprintf(beside, sizeof beside, "%s/canonical.qc", snap);
+        if (stat(beside, &st)) return;
+        path = beside;
+    }
+    QwenDenseList l; char error[1300]; double started = now_s();
+    if (!qwen_dense_list(&m->c, &l)) { fprintf(stderr, "[qwen-dense] out of memory\n"); exit(1); }
+    uint64_t fingerprint = qwen_dense_fingerprint(&m->S, l.spec, l.count);
+    if (!fingerprint || !qdf_open(&m->dense_file, path, l.spec, l.count, fingerprint, error, sizeof error)) {
+        if (!fingerprint) snprintf(error, sizeof error, "%s: a dense matrix of the model is missing", path);
+        qwen_dense_list_free(&l);
+        if (named) { fprintf(stderr, "[qwen-dense] %s\n", error); exit(1); }
+        fprintf(stderr, "[qwen-dense] %s; converting the matrices at start instead\n", error);
+        return;
+    }
+    fprintf(stderr, "[qwen-dense] %s: %d INT8 matrices (%zu bytes) checked in %.3f s, read instead of converted\n",
+            path, l.count, m->dense_file.bytes, now_s() - started);
+    qwen_dense_list_free(&l);
+}
+/* A matrix canonical.qc holds: its rows and scales copied out of the file.
+ * The CPU reads every dense matrix at every token, so they live in ordinary
+ * memory as after a conversion: file pages would be dropped by the expert
+ * reads and read again at the next token (measured on an 8 GB M1 against dev
+ * 01f32c06, a 64-token prompt and 8 generated tokens: with the matrices used
+ * in place, prompt -5% and generation -29%, and 1.3 to 4.8 times the page
+ * faults of one read of the file). */
+static int qwen_dense_read(Model *m, const char *name, int I, int O, QW *out) {
+    if (!m->dense_file.base) return 0;
+    const int8_t *q; const float *sc;
+    if (!qdf_find(&m->dense_file, name, I, O, &q, &sc)) {
+        fprintf(stderr, "[qwen-dense] %s: not in canonical.qc\n", name); exit(1);
+    }
+    memset(out, 0, sizeof(*out));
+    out->q = q36_walloc((size_t)O * I); out->sc = malloc((size_t)O * sizeof(float));
+    if (!out->q || !out->sc) { fprintf(stderr, "OOM reading %s from canonical.qc\n", name); exit(1); }
+    memcpy(out->q, q, (size_t)O * I); memcpy(out->sc, sc, (size_t)O * sizeof(float));
+    out->I = I; out->O = O;
+    return 1;
+}
+
 /* Dense matrix load, quantized to int8 (+ int4 planar per `tag`, see
  * dense_int4_wanted) DURING loading rather than in a separate pass over the
  * whole model afterward (see QW, above Layer): reads `name` (I*O elements,
@@ -2100,6 +2233,7 @@ static float *load_t_n(Model *m, const char *name, int64_t want) {
  * through keeps their f32-only behavior exactly as it was; `tag` is unused
  * on that path. */
 static void load_tq(Model *m, const char *name, int I, int O, int quantize, const char *tag, QW *out) {
+    if (quantize && dense_i8_on() && qwen_dense_read(m, name, I, O, out)) return;
     float *p = load_t_n(m, name, (int64_t)I * O);
     out->w = p; out->q = NULL; out->sc = NULL; out->I = I; out->O = O;
     out->q4 = NULL; out->sg = NULL; out->ng = 0;
@@ -2342,6 +2476,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         exit(1);
     }
     double t0 = now_s();
+    qwen_dense_file_open(m, snap, load_boundaries && allocate_state && layer_begin == 0 && layer_end == c->n_layers);
     /* Quantize during load only for the full-model path (main()'s static Model,
      * load_boundaries=1): the Segment/Edge adapters build partial or auxiliary
      * models straight off this same loop and never ran the old post-hoc
@@ -2462,9 +2597,12 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         }
     }
     #undef QCOUNT
-    if (quantize_dense)
+    if (quantize_dense && m->dense_file.base)
+        fprintf(stderr, "[dense-i8] %d matrices read from canonical.qc, no f32 copies\n", qcount);
+    else if (quantize_dense)
         fprintf(stderr, "[dense-i8] %d matrices %s during load, %.1f GB f32 freed\n", qcount,
                 dense_bits() == 16 ? "kept in f16" : "quantized", qfreed/1073741824.0);
+    qdf_close(&m->dense_file);   /* every matrix it held is copied: closed before the RAM sizes the cache */
     if (cap <= 0 && c->n_experts <= 0) {
         /* Dense checkpoint (#1757): nothing is ever routed, so the per-layer
          * expert cache is never touched by moe()/expert_get(). Sizing it

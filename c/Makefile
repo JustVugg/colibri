@@ -2121,6 +2121,22 @@ tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c $(
 tests/test_qwen36_embedding$(EXE): tests/test_qwen36_embedding.c
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
+# canonical.qc without a model: synthetic source matrices through the tool's
+# writer (the test includes tools/qwen36_canonical.c, so check compiles the
+# tool's code) and back through the engine's reader, the quantizer pinned to
+# QDF_QUANTIZER, and every kind of wrong file refused with its reason.
+tests/test_qwen36_dense_file$(EXE): tests/test_qwen36_dense_file.c tools/qwen36_canonical.c qwen36.c $(VK_OBJ)
+	$(CC) $(filter-out -DCOLI_METAL,$(NOCUDA_CFLAGS)) $< $(VK_OBJ) -o $@ $(filter-out -framework Metal Foundation -lc++,$(NOCUDA_LDFLAGS))
+
+# canonical.qc: the INT8 dense weights of a Qwen3.6 model converted once; the
+# engine reads the file beside the model instead of converting them at every start.
+#   ./qwen36-canonical <model-dir>
+# The name has a dash, so the automatic dependencies below do not cover it: its
+# own .d (written by -MMD) is included here.
+qwen36-canonical$(EXE): tools/qwen36_canonical.c qwen36.c qwen36_dense_file.h $(VK_OBJ)
+	$(CC) $(filter-out -DCOLI_METAL,$(NOCUDA_CFLAGS)) $< $(VK_OBJ) -o $@ $(filter-out -framework Metal Foundation -lc++,$(NOCUDA_LDFLAGS))
+-include qwen36-canonical.d
+
 tests/test_idot$(EXE): tests/test_idot.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 

@@ -969,6 +969,44 @@ jobs:
           python3 -c "import sys; sys.path.insert(0, 'tests'); from pathlib import Path; \
                       from prefix_serve_harness import ensure_byte_tokenizer as t; t(Path('qwen36_tiny_c'))"
           python3 tests/serve_mux_check.py ./qwen36 qwen36_tiny_c 4
+      - name: canonical.qc gives the bytes of the conversion at start, and a wrong file is not used
+        run: |
+          cd c
+          # qwen36-canonical converts the int8 dense matrices once; the engine reads
+          # them from the file (QWEN_DENSE_CACHE, or canonical.qc beside the model)
+          # instead of converting them at start. With the int8 trunk the layer
+          # outputs, logits, ids and exit status must be those of a start without
+          # the file, byte for byte. A damaged file named by QWEN_DENSE_CACHE stops
+          # the start; the same file beside the model is set aside, and the start
+          # converts the matrices as without it.
+          make qwen36 qwen36-canonical
+          ./qwen36-canonical qwen36_tiny_c canon_tiny.qc
+          rc=0
+          SNAP=qwen36_tiny_c DUMP=qc_logits_0.f32 DUMP_LAYERS=qc_layers_0.f32 \
+            ./qwen36 2 8 qwen36_tiny/ref_full.json > qc_0.log 2>&1 || rc=$?
+          { echo "exit $rc"; grep -a -o -E "^C engine : [0-9 ]+" qc_0.log || true; } > qc_ids_0.txt
+          rc=0
+          QWEN_DENSE_CACHE=canon_tiny.qc SNAP=qwen36_tiny_c DUMP=qc_logits_1.f32 DUMP_LAYERS=qc_layers_1.f32 \
+            ./qwen36 2 8 qwen36_tiny/ref_full.json > qc_1.log 2>&1 || rc=$?
+          { echo "exit $rc"; grep -a -o -E "^C engine : [0-9 ]+" qc_1.log || true; } > qc_ids_1.txt
+          grep -q "read instead of converted" qc_1.log || { echo "FAIL: the file was not read"; cat qc_1.log; exit 1; }
+          for f in qc_logits qc_layers; do
+            test -s ${f}_1.f32 || { echo "FAIL: no $f dump"; cat qc_1.log; exit 1; }
+            cmp ${f}_0.f32 ${f}_1.f32 || { echo "FAIL: $f differ"; exit 1; }
+          done
+          grep -q "^C engine" qc_ids_1.txt || { echo "FAIL: no ids"; cat qc_1.log; exit 1; }
+          cmp qc_ids_0.txt qc_ids_1.txt || { cat qc_ids_0.txt qc_ids_1.txt; exit 1; }
+          echo "canonical.qc = conversion: $(tr '\n' ' ' < qc_ids_1.txt)"
+          cp canon_tiny.qc canon_bad.qc
+          printf 'X' | dd of=canon_bad.qc bs=1 seek=40 conv=notrunc 2>/dev/null   # a name in the table
+          if QWEN_DENSE_CACHE=canon_bad.qc SNAP=qwen36_tiny_c ./qwen36 2 8 qwen36_tiny/ref_full.json > qc_bad.log 2>&1; then
+            echo "FAIL: a damaged file named by QWEN_DENSE_CACHE was accepted"; cat qc_bad.log; exit 1
+          fi
+          grep -q "has a different matrix table" qc_bad.log || { echo "FAIL: refused, but not for the damage"; cat qc_bad.log; exit 1; }
+          cp -r qwen36_tiny_c qwen36_tiny_qc && cp canon_bad.qc qwen36_tiny_qc/canonical.qc
+          SNAP=qwen36_tiny_qc DUMP=qc_logits_2.f32 ./qwen36 2 8 qwen36_tiny/ref_full.json > qc_2.log 2>&1 || true
+          grep -q "converting the matrices at start instead" qc_2.log || { echo "FAIL: the damaged file beside the model was not set aside"; cat qc_2.log; exit 1; }
+          cmp qc_logits_0.f32 qc_logits_2.f32 || { echo "FAIL: logits differ after the file was set aside"; exit 1; }
       - name: Expert kernel A/B on an int4 gs64 fixture (old path vs expert_ffn.h, byte-identical ids)
         run: |
           cd c

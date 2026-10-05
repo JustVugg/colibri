@@ -52,6 +52,8 @@ cublasLt64*.dll
 cudart64*.dll
 glm53
 qwen36
+qwen36-canonical
+qwen36_dense_file_test*.qc
 qwenimage
 qwenimage.exe
 shaders/attention_absorb.spv
