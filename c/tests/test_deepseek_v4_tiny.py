@@ -225,9 +225,14 @@ def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
             # the tiny head is microseconds and prints as 0.000; the blocks are not
             if prof["attention_s"] <= 0.0 or prof["lm_head_s"] < 0.0:
                 raise AssertionError(f"serve round {ordinal}: block/head phases not timed: {prof}")
+            # #1852: the expert wait is the compute thread's own time, measured
+            # apart from attention_s (it used to be a literal 0 folded into it)
+            if prof["expert_wait_s"] < 0.0:
+                raise AssertionError(f"serve round {ordinal}: negative expert wait: {prof}")
             # disk seconds are summed across loader lanes and may exceed the wall
-            # on their own; the compute phases must not
-            accounted = prof["expert_matmul_s"] + prof["attention_s"] + prof["lm_head_s"]
+            # on their own; the compute thread's phases must not
+            accounted = (prof["expert_wait_s"] + prof["expert_matmul_s"] +
+                         prof["attention_s"] + prof["lm_head_s"])
             if accounted > prof["wall_s"] * 1.05 + 0.05:
                 raise AssertionError(f"serve round {ordinal}: phases exceed wall: {prof}")
     finally:

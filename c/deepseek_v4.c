@@ -4523,6 +4523,7 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
 #include <stdio.h>
 static __thread char v4_moe_reason[192];
 static void moe_reason_clear(void) { v4_moe_reason[0] = 0; }
+
 static const char *moe_reason(void) { return v4_moe_reason; }
 static int moe_fail(const char *format, ...) {
     va_list arguments;
@@ -4654,6 +4655,22 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
                        int topk, float route_scale);
 #endif
 
+/* #1852: PROF's expert wait, kept by the expert-store unit (coli_v4_expert_store_add_wait). */
+void coli_v4_expert_store_add_wait(ColiExpertStore *store, double sec);
+static double v4_wait_clock(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+/* An expert read on the compute thread, not handed to a loader lane: a miss
+ * reads it from disk right here, so its whole time is wait. */
+static int v4_lookup_waited(ColiExpertStore *store, ColiExpertKey key, ColiExpertView *view) {
+    double began = v4_wait_clock();
+    int result = coli_expert_lookup(store, key, view);
+    coli_v4_expert_store_add_wait(store, v4_wait_clock() - began);
+    return result;
+}
+
 static int moe_token(float *output,
                      const ColiDeepSeekV4LayerWeights *weights,
                      const ColiDeepSeekV4Config *config,
@@ -4717,9 +4734,9 @@ static int moe_token(float *output,
             if (indices[candidate] == expert_id) rank = candidate;
         if (rank < 0) continue;
         ColiExpertView expert;
-        if (coli_expert_lookup(store,
-                               (ColiExpertKey){weights->plan.layer, expert_id},
-                               &expert)) {
+        if (v4_lookup_waited(store,
+                             (ColiExpertKey){weights->plan.layer, expert_id},
+                             &expert)) {
             result = -1;
             break;
         }
@@ -4857,6 +4874,7 @@ typedef struct {
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
     int loader_slot;
 #endif
+    ColiExpertStore *wait_store;   /* where its wait goes (profiled_expert_load_start) */
 } ExpertLoadHandle;
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
@@ -5170,12 +5188,18 @@ static double v4_now_mono(void) {   /* #890 phase timing, same clock as disk_sec
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+/* Both count as PROF's expert wait (#1852): the start waits for a free loader
+ * lane while every lane is still reading (and does the read itself under
+ * COLI_V4_EXPERIMENTAL_SYNC_EXPERT_LOOKUP), the finish for the lane's read. */
 static int profiled_expert_load_start(ExpertLoadHandle *handle,
                                       ExpertLoadJob *job) {
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     double began = coli_v4_block_profile_now();
 #endif
+    double waited = v4_wait_clock();
     int result = expert_load_start(handle, job);
+    handle->wait_store = job->store;
+    coli_v4_expert_store_add_wait(job->store, v4_wait_clock() - waited);
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_LOADER_START,
                               coli_v4_block_profile_now() - began);
@@ -5187,7 +5211,9 @@ static int profiled_expert_load_finish(ExpertLoadHandle *handle) {
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     double began = coli_v4_block_profile_now();
 #endif
+    double waited = v4_wait_clock();
     int result = expert_load_finish(handle);
+    coli_v4_expert_store_add_wait(handle->wait_store, v4_wait_clock() - waited);
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_LOADER_WAIT,
                               coli_v4_block_profile_now() - began);
@@ -5315,7 +5341,7 @@ static int v4_vk_token_finish(V4VkToken *vk, float *output, ColiExpertStore *sto
             for (int i = 0; i < d; i++) output[i] += coli_bf16_round(src[i]);
         } else {   /* the batch failed and the tier stopped: this expert on the CPU */
             ColiExpertView view;
-            if (coli_expert_lookup(store, (ColiExpertKey){layer, vk->ids[k]}, &view)) {
+            if (v4_lookup_waited(store, (ColiExpertKey){layer, vk->ids[k]}, &view)) {
                 result = moe_fail("layer %d: reading expert %d from the expert store failed",
                                   layer, vk->ids[k]);
                 break;
@@ -6209,7 +6235,7 @@ static int v4_vk_batch_finish(V4VkBatch *vk, float *outputs, ColiExpertStore *st
             continue;
         }
         ColiExpertView view;   /* the batch failed and the tier stopped: this route here */
-        if (coli_expert_lookup(store, (ColiExpertKey){layer, indices[r]}, &view)) {
+        if (v4_lookup_waited(store, (ColiExpertKey){layer, indices[r]}, &view)) {
             result = moe_fail("layer %d: reading expert %d from the expert store failed",
                               layer, indices[r]);
             break;
@@ -6445,7 +6471,7 @@ static int v4_moe_batch_union(
 #else
     for (int current = 0; !result && current < key_count; current++) {
         ColiExpertView view;
-        if (coli_expert_lookup(store, keys[current], &view)) {
+        if (v4_lookup_waited(store, keys[current], &view)) {
             result = moe_fail("layer %d: expert %d is not in the expert store",
                               weights->plan.layer, keys[current].expert);
             break;
@@ -8120,6 +8146,8 @@ typedef struct {
     double matmul_sec; /* cumulative expert-forward compute time (#890): the phase the
                         * dashboard needs alongside disk_sec so it stops folding
                         * everything into "other". One shared instance per store. */
+    double wait_sec;   /* cumulative time the compute thread waited for expert weights
+                        * (#1852): coli_v4_expert_store_add_wait */
     uint8_t *ehit;     /* layers*experts_per_layer: experts routed in the current turn */
     uint8_t *eheat;    /* layers*experts_per_layer: cumulative routing selections, capped 63 */
 } V4ExpertStoreState;
@@ -9957,6 +9985,32 @@ double coli_v4_expert_store_matmul_sec(ColiExpertStore *store) {
     pthread_mutex_unlock(&state->mutex);
     return value;
 }
+
+/* #1852: the time the compute thread waited for expert weights, PROF's
+ * expert_wait_s: handing an expert to a loader lane and waiting for it
+ * (profiled_expert_load_start/finish), or reading one itself (a lookup on the
+ * compute thread, v4_lookup_waited). PROF printed a literal 0 there before, and
+ * the wait landed in attention_s: a turn that spent most of its 169 s reading
+ * experts read as 98% "Attention". Unlike disk_sec it is the compute thread's
+ * wall time, so it does not exceed the turn. Added from the block units, read
+ * per turn like disk_sec. */
+void coli_v4_expert_store_add_wait(ColiExpertStore *store, double sec) {
+    if (!store || !store->state || sec <= 0.0) return;
+    V4ExpertStoreState *state = store->state;
+    pthread_mutex_lock(&state->mutex);
+    state->wait_sec += sec;
+    pthread_mutex_unlock(&state->mutex);
+}
+double coli_v4_expert_store_wait_sec(ColiExpertStore *store) {
+    V4ExpertStoreState *state;
+    if (!store || !store->state) return 0.0;
+    state = store->state;
+    double value;
+    pthread_mutex_lock(&state->mutex);
+    value = state->wait_sec;
+    pthread_mutex_unlock(&state->mutex);
+    return value;
+}
 #endif /* COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16 */
 
 #ifdef COLI_V4_UNIT_EXPERT_ROWS16
@@ -11642,6 +11696,8 @@ void coli_v4_gpu_moe_batch_release(void) {
     memset(v4_moe_bank_valid, 0, sizeof(v4_moe_bank_valid));
 }
 
+void coli_v4_expert_store_add_wait(ColiExpertStore *store, double sec);   /* #1852 */
+
 int coli_v4_gpu_moe_batch_union(float *outputs,
                                 const ColiDeepSeekV4LayerWeights *weights,
                                 const ColiDeepSeekV4Config *config,
@@ -11895,7 +11951,11 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                 fetched[0][i] = coli_expert_lookup(store, key, &views[0][i]) == 0;
             }
             clock_gettime(CLOCK_MONOTONIC, &_t1);
-            t_lookup += (_t1.tv_sec - _t0.tv_sec) + (_t1.tv_nsec - _t0.tv_nsec) / 1e9;
+            double primed = (_t1.tv_sec - _t0.tv_sec) + (_t1.tv_nsec - _t0.tv_nsec) / 1e9;
+            t_lookup += primed;
+            /* Nothing else runs meanwhile: all of it is PROF's expert wait (#1852).
+             * The later groups are read while the device computes, not counted. */
+            coli_v4_expert_store_add_wait(store, primed);
             gcount[0] = group;
         }
         for (int base = 0; base < missing_count; base += pipe_group) {
@@ -11961,7 +12021,14 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
             ColiExpertKey key = {weights->plan.layer, retry[r]};
             ColiExpertView view;
             clock_gettime(CLOCK_MONOTONIC, &_t0);
-            if (coli_expert_lookup(store, key, &view) != 0) { refill_failed = 1; break; }
+            int refused = coli_expert_lookup(store, key, &view) != 0;
+            {   /* a read on this thread, with nothing else running: expert wait (#1852) */
+                struct timespec read_end;
+                clock_gettime(CLOCK_MONOTONIC, &read_end);
+                coli_v4_expert_store_add_wait(store, (read_end.tv_sec - _t0.tv_sec) +
+                                                     (read_end.tv_nsec - _t0.tv_nsec) / 1e9);
+            }
+            if (refused) { refill_failed = 1; break; }
             Dsv4CudaTensor *bg = NULL, *bu = NULL, *bd = NULL;
             int uploaded =
                 view.gate.data && view.gate.scales && view.gate.block_rows == 1 &&
@@ -15475,6 +15542,7 @@ extern void coli_v4_expert_store_emit_emap(ColiExpertStore *store);
 extern void coli_v4_expert_store_emit_hits(ColiExpertStore *store);
 extern double coli_v4_expert_store_disk_sec(ColiExpertStore *store);
 extern double coli_v4_expert_store_matmul_sec(ColiExpertStore *store);   /* #890 */
+extern double coli_v4_expert_store_wait_sec(ColiExpertStore *store);     /* #1852 */
 
 #ifdef __APPLE__
 /* #macos-port: needed by the Darwin branch inside v4_hwinfo_emit below. It sits HERE, next to
@@ -15608,22 +15676,25 @@ static void v4_hwinfo_emit(void) {
 }
 
 /* PROF wall_s prompt_tokens completion_tokens expert_disk_s expert_wait_s
- * expert_matmul_s attention_s lm_head_s forwards. disk (I/O) and matmul come
- * from the expert store (#890). attention_s is the layer-block time not
- * attributed to the expert compute: attention, DSA indexer, dense projections
- * and hyper-connection mixers, plus any expert wait that blocked the block
- * (disk seconds are summed across loader lanes and can exceed the wall on
- * their own, so they are reported as they are and not subtracted; clamped at
- * zero). lm_head_s is the head matmul; forwards the
+ * expert_matmul_s attention_s lm_head_s forwards. disk (I/O), wait and matmul
+ * come from the expert store (#890, #1852). expert_wait_s is the time the
+ * compute thread waited for expert weights (coli_v4_expert_store_add_wait).
+ * attention_s is the layer-block time not attributed to the experts: attention,
+ * DSA indexer, dense projections and hyper-connection mixers (the block time less
+ * the expert compute and the expert wait, both measured inside it; clamped at
+ * zero). Disk seconds are summed across loader lanes and can exceed the wall on
+ * their own, so they are reported as they are and not subtracted. Until #1852
+ * expert_wait_s was a literal 0 and the wait sat in attention_s. lm_head_s is
+ * the head matmul; forwards the
  * positions pushed through the blocks (prefill rows, decode tokens, draft
  * verifies). Before #1491 the last three were literal zeros and a warm decode
  * on a GPU box read as 98% "other". The frontend still folds what is left
  * (sampling, framing) into "other". */
 static void v4_prof_emit(double wall_s, int prompt_tokens, int completion,
-                         double expert_disk_s, double expert_matmul_s,
+                         double expert_disk_s, double expert_wait_s, double expert_matmul_s,
                          double attention_s, double head_s, long long forwards) {
-    printf("PROF %.3f %d %d %.3f 0.000 %.3f %.3f %.3f %lld\n",
-           wall_s, prompt_tokens, completion, expert_disk_s, expert_matmul_s,
+    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %lld\n",
+           wall_s, prompt_tokens, completion, expert_disk_s, expert_wait_s, expert_matmul_s,
            attention_s, head_s, forwards);
     fflush(stdout);
 }
@@ -15848,6 +15919,8 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         engine->experts ? coli_v4_expert_store_disk_sec(engine->experts) : 0.0;
     double matmul_before =
         engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0;
+    double wait_before =
+        engine->experts ? coli_v4_expert_store_wait_sec(engine->experts) : 0.0;
     double block_before = g_v4_prof_block_s, head_before = g_v4_prof_head_s;
     long long forwards_before = g_v4_prof_forwards;
     V4ServeStream stream = {session, request->id, 0, 0, request->logprobs, {0}};
@@ -15901,13 +15974,16 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     double expert_matmul_s = engine->experts
         ? coli_v4_expert_store_matmul_sec(engine->experts) - matmul_before
         : 0.0;
-    /* Block time minus the expert compute measured inside it. The store's disk
-     * seconds are NOT subtracted: summed across loader lanes, they exceeded the
-     * wall on a cold tiny run (0.073 s of disk in a 0.034 s turn). */
-    double attention_s = (g_v4_prof_block_s - block_before) - expert_matmul_s;
+    double expert_wait_s = engine->experts
+        ? coli_v4_expert_store_wait_sec(engine->experts) - wait_before
+        : 0.0;
+    /* Block time minus the expert compute and the expert wait measured inside it.
+     * The store's disk seconds are NOT subtracted: summed across loader lanes,
+     * they exceeded the wall on a cold tiny run (0.073 s of disk in a 0.034 s turn). */
+    double attention_s = (g_v4_prof_block_s - block_before) - expert_matmul_s - expert_wait_s;
     if (attention_s < 0.0) attention_s = 0.0;
     v4_prof_emit(elapsed, stats.prompt_tokens, completion,
-                 expert_disk_s, expert_matmul_s, attention_s,
+                 expert_disk_s, expert_wait_s, expert_matmul_s, attention_s,
                  g_v4_prof_head_s - head_before, g_v4_prof_forwards - forwards_before);
 #ifdef COLI_V4_GPU_TIER
     if (coli_v4_hybrid_enabled() && (g_v4_hyb_gpu_n + g_v4_hyb_cpu_n +
@@ -16732,6 +16808,8 @@ typedef struct {
     double matmul_sec; /* cumulative expert-forward compute time (#890): the phase the
                         * dashboard needs alongside disk_sec so it stops folding
                         * everything into "other". One shared instance per store. */
+    double wait_sec;   /* cumulative time the compute thread waited for expert weights
+                        * (#1852): coli_v4_expert_store_add_wait */
     uint8_t *ehit;     /* layers*experts_per_layer: experts routed in the current turn */
     uint8_t *eheat;    /* layers*experts_per_layer: cumulative routing selections, capped 63 */
 } V4ExpertStoreState;
