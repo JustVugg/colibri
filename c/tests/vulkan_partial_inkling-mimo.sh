@@ -79,11 +79,11 @@ ptl_ink_bf16() {
     ptl_ink "$tag" "$k" "${envs[@]}" -- "$@"
   fi
 }
-# ptl_cap <engine> <tag> <probe log> <k> <run...>: COLI_VK_DEVICE_CAP_MB from the probe's fit
+# ptl_imk_cap <engine> <tag> <probe log> <k> <run...>: COLI_VK_DEVICE_CAP_MB from the probe's fit
 # line (ptl_calc cap, PTL_PROBE_CAP_MB=256) for exactly k layers; <run> is a function the
 # cap goes to in PTL_CAP, writing vk.log: N = k by the line, and by vkc_fit's rule from the
 # run's own fit line
-ptl_cap() {
+ptl_imk_cap() {
   local eng=$1 tag=$2 probe=$3 k=$4; shift 4
   local cap; cap=$(PTL_PROBE_CAP_MB=256 ptl_calc cap "$eng" "$probe" "$k") || { cat "$probe"; fail "$tag: no cap from the probe"; }
   PTL_CAP=$cap "$@"
@@ -94,24 +94,24 @@ ptl_cap() {
   ptl_check_placed "$eng" vk.log "$tag"
   echo "   $tag: COLI_VK_DEVICE_CAP_MB=$cap: $(grep -a "^\[VK\] $eng chain: [0-9]* of [0-9]* layers on the device" vk.log | tail -1 | sed "s/^\[VK\] $eng chain: //")"
 }
-# ptl_head_fault <engine> <probe log>: the COLI_VK_STAGED_FAULT=submit:n n of the head's
+# ptl_imk_head_fault <engine> <probe log>: the COLI_VK_STAGED_FAULT=submit:n n of the head's
 # upload, the first time the point is reached after the last layer's setup (the probe's
 # placed line, as for ptl_calc fault; one weight block holds the fixture, so no zero fill)
-ptl_head_fault() {
+ptl_imk_head_fault() {
   sed -n "s/^\[VK\] $1 chain: [0-9]* of [0-9]* layers placed:.*reached \([0-9,]*\) times.*/\1/p" "$2" | tail -1 |
     awk -F, '{ print $NF + 1 }'
 }
 # The reserve the capped runs keep for a chunk's scratch and the frames' staging (the tier
 # takes the rest of the device): 0.04 GiB.
 PTL_RESERVE=0.04
-# ptl_plan <engine> <tag> <fixture> <log> <env...>: coli plan's prediction (resource_plan.py,
+# ptl_imk_plan <engine> <tag> <fixture> <log> <env...>: coli plan's prediction (resource_plan.py,
 # vk_chain_fit) for the same device and settings, from the checkpoint's header and config
 # alone: the engine's free bytes, per-layer bytes, fixed bytes and N. The tiny inkling's
 # config says model_type inkling_text, which the family registry does not take: the plan
 # reads a copy that says inkling (the real checkpoint's), the tensors linked. The plan
 # counts a buffer's alignment as 256 bytes, Lavapipe's: a driver that aligns them wider
 # (Dozen: 64 KiB) gives a tiny fixture's layers other bytes, so only Lavapipe compares.
-ptl_plan() {
+ptl_imk_plan() {
   local eng=$1 tag=$2 fx=$3 log=$4; shift 4
   case "${VK_ICD_FILENAMES:-}" in
     *lvp_icd*) ;;
@@ -176,20 +176,20 @@ ptl_inkling() {
   PTL_CAP=256 ink_cap_run; cp vk.log ptl-probe.log
   ptl_check_n inkling ptl-probe.log 8 "partial inkling cap probe"
   for k in 1 4 7; do
-    ptl_cap inkling "partial inkling cap for N=$k" ptl-probe.log $k ink_cap_run
-    ptl_plan inkling "partial inkling cap for N=$k" tiny_inkling vk.log COLI_VK_DEVICE_CAP_MB=$PTL_CAP_LAST COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE
+    ptl_imk_cap inkling "partial inkling cap for N=$k" ptl-probe.log $k ink_cap_run
+    ptl_imk_plan inkling "partial inkling cap for N=$k" tiny_inkling vk.log COLI_VK_DEVICE_CAP_MB=$PTL_CAP_LAST COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE
     echo "OK partial inkling cap for N=$k: tokens = CPU, coli plan's N the engine's"
   done
   # the dense-int4g64 container's forms, and D = 6144, in the plan
   rm -f chain.usage
   env COLI_VK_DEVICE_CAP_MB=256 COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE COLI_VK_CHAIN_LAYERS=0 COLI_USAGE=chain.usage COLI_VULKAN=1 \
     COLI_VK_CHAIN=1 SNAP=tiny_inkling_q ./inkling 8 0 $R > vk.log 2>&1 || true
-  ptl_plan inkling "partial inkling plan, the dense-int4g64 container" tiny_inkling_q vk.log COLI_VK_DEVICE_CAP_MB=256 \
+  ptl_imk_plan inkling "partial inkling plan, the dense-int4g64 container" tiny_inkling_q vk.log COLI_VK_DEVICE_CAP_MB=256 \
     COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE COLI_VK_CHAIN_LAYERS=0
   rm -f chain.usage
   env COLI_VK_DEVICE_CAP_MB=256 COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE COLI_USAGE=chain.usage COLI_VULKAN=1 COLI_VK_CHAIN=1 \
     SNAP=tiny_inkling_wide ./inkling 8 0 $W > vk.log 2>&1 || true
-  ptl_plan inkling "partial inkling plan, D=6144" tiny_inkling_wide vk.log COLI_VK_DEVICE_CAP_MB=256 COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE
+  ptl_imk_plan inkling "partial inkling plan, D=6144" tiny_inkling_wide vk.log COLI_VK_DEVICE_CAP_MB=256 COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE
   echo "OK partial inkling plan: coli plan's numbers the engine's (the container, D = 6144)"
 
   # ---- an upload failing inside layer k's setup (COLI_VK_STAGED_FAULT, aimed from a probe's
@@ -214,7 +214,7 @@ ptl_inkling() {
       COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 SNAP=tiny_inkling ./inkling 8 0 $R > ptl-fprobe.log 2>&1 || true
     for k in 0 3 7; do ink_fault "partial inkling upload failing in layer $k (COLI_VK_DENSE_HOST=$h)" $k ptl-fprobe.log COLI_VK_DENSE_HOST=$h; done
     if [ $h = 1 ]; then   # lm_head's upload failing: every layer on the device, the head on the CPU
-      f=$(ptl_head_fault inkling ptl-fprobe.log)
+      f=$(ptl_imk_head_fault inkling ptl-fprobe.log)
       rm -f chain.usage
       env COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$f COLI_VK_CHAIN_LAYERS=8 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 \
         COLI_VULKAN=1 COLI_VK_CHAIN=1 SNAP=tiny_inkling ./inkling 8 0 $R > vk.log 2>&1 || true
@@ -334,14 +334,14 @@ ptl_mimo_all() {
   PTL_CAP=256 mimo_cap_run; cp vk.log ptl-probe.log
   ptl_check_n mimo ptl-probe.log 6 "partial mimo cap probe"
   for k in 1 3 5; do
-    ptl_cap mimo "partial mimo cap for N=$k" ptl-probe.log $k mimo_cap_run
-    ptl_plan mimo "partial mimo cap for N=$k" mimo_tiny vk.log COLI_VK_DEVICE_CAP_MB=$PTL_CAP_LAST COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE MIMO_DENSE_BITS=32
+    ptl_imk_cap mimo "partial mimo cap for N=$k" ptl-probe.log $k mimo_cap_run
+    ptl_imk_plan mimo "partial mimo cap for N=$k" mimo_tiny vk.log COLI_VK_DEVICE_CAP_MB=$PTL_CAP_LAST COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE MIMO_DENSE_BITS=32
     echo "OK partial mimo cap for N=$k: tokens = CPU, coli plan's N the engine's"
   done
   for bits in 0 8; do   # the release's FP8/BF16 and int8 rows, a block of 3, in the plan
     env COLI_VK_DEVICE_CAP_MB=256 COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE COLI_VK_CHAIN_LAYERS=0 MIMO_CHUNK=3 COLI_TEMP=0 COLI_VULKAN=1 \
       COLI_VK_CHAIN=1 MIMO_DENSE_BITS=$bits ./mimo mimo_tiny --ids "$P" --ngen 1 > /dev/null 2> vk.log
-    ptl_plan mimo "partial mimo plan bits=$bits" mimo_tiny vk.log COLI_VK_DEVICE_CAP_MB=256 COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE \
+    ptl_imk_plan mimo "partial mimo plan bits=$bits" mimo_tiny vk.log COLI_VK_DEVICE_CAP_MB=256 COLI_VK_TIER_RESERVE_GB=$PTL_RESERVE \
       COLI_VK_CHAIN_LAYERS=0 MIMO_CHUNK=3 MIMO_DENSE_BITS=$bits
   done
   echo "OK partial mimo plan: coli plan's numbers the engine's (MIMO_DENSE_BITS 0 and 8, blocks of 3)"
@@ -365,7 +365,7 @@ ptl_mimo_all() {
       COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 MIMO_DENSE_BITS=32 ./mimo mimo_tiny --ids "$P" --ngen 6 > /dev/null 2> ptl-fprobe.log
     for k in 0 2 5; do mimo_fault "partial mimo upload failing in layer $k (COLI_VK_DENSE_HOST=$h)" $k ptl-fprobe.log COLI_VK_DENSE_HOST=$h; done
     if [ $h = 1 ]; then   # the head's upload failing: every layer on the device, the head on the CPU
-      f=$(ptl_head_fault mimo ptl-fprobe.log)
+      f=$(ptl_imk_head_fault mimo ptl-fprobe.log)
       env COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:$f COLI_VK_CHAIN_LAYERS=6 COLI_TEMP=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
         COLI_VK_TIER_SYNC=1 MIMO_DENSE_BITS=32 ./mimo mimo_tiny --ids "$P" --ngen 6 > mimo-vk.txt 2> vk.log
       grep -qa "the head did not reach the device; it runs on the CPU" vk.log || { cat vk.log; fail "partial mimo head fault: not the head's"; }

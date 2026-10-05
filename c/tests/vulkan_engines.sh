@@ -3030,7 +3030,15 @@ ptl_check_placed() {
   set -- $mm "$3"
   [ "$1" = "$2" ] || fail "$3: $1 B of matrices on the device after setup, the N layers' are $2 B"
 }
-for f in tests/vulkan_partial_*.sh; do [ -e "$f" ] && . "$f"; done
+# Each group's helpers carry its own prefix: a script that redefines a function sourced
+# before it would silently change another group's tests (partial-dsk's ptl_plan once).
+for f in tests/vulkan_partial_*.sh; do
+  [ -e "$f" ] || continue
+  for fn in $(sed -n 's/^\([A-Za-z_][A-Za-z_0-9]*\)() .*/\1/p' "$f"); do
+    if declare -F "$fn" >/dev/null; then echo "$f redefines $fn, already defined" >&2; exit 2; fi
+  done
+  . "$f"
+done
 . tests/vulkan_dev2.sh   # the expert tier on two devices
 # ---- big prompt chunks and expert streaming (docs/vulkan.md, "Big prompt chunks and
 # expert streaming") ----
