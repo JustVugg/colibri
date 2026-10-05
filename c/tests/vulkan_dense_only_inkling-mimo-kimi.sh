@@ -159,6 +159,28 @@ PY
   echo "OK dense-only kimi_k3 expert cache under RAM_GB=$ram: $a/layer on the device only, $b/layer with the host copies"
 }
 
+# dho_gate for a bf16 snapshot. Where this CPU's bf16 dot rounds the activations
+# (AVX512-BF16, as on part of the CI's runners), inkling keeps its bf16 matrices on the
+# CPU on purpose ("bf16 stays on the CPU"): nothing goes to the device, so nothing is
+# dropped, and the tokens must be the CPU's. Elsewhere the full dho_gate applies.
+dho_gate_bf16() {  # <engine> <tag> <env...> -- <argv...>
+  local eng=$1 tag=$2; shift 2
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  rm -f chain.usage
+  env "${envs[@]}" COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 \
+    COLI_USAGE=chain.usage COLI_VK_DENSE_HOST=0 ./"$eng" "$@" > vk.log 2>&1 || true
+  rm -f chain.usage
+  if grep -qa 'bf16 stays on the CPU' vk.log; then
+    env "${envs[@]}" ./"$eng" "$@" > cpu.log 2>&1 || true
+    same_tokens cpu.log vk.log "$tag"
+    [ "$(dho_dropped vk.log)" = 0 ] || { grep '^\[VK\]' vk.log; fail "$tag: bf16 stayed on the CPU, yet host copies were dropped"; }
+    [ "$(dho_reloaded vk.log)" = 0 ] || { grep '^\[VK\]' vk.log; fail "$tag: a matrix was read back from disk"; }
+    echo "OK $tag: tokens = CPU, nothing on the device only (this CPU's bf16 dot keeps bf16 on the CPU)"
+  else
+    dho_gate "$eng" "$tag" 2 "${envs[@]}" -- "$@"
+  fi
+}
+
 dho_family_inkling_mimo_kimi() {
   export OMP_NUM_THREADS=2
   make inkling mimo kimi_k3 VK=1
@@ -167,9 +189,10 @@ dho_family_inkling_mimo_kimi() {
   # per-matrix path alone, D = 6144, staged, a lost device, a serve session
   inkling_olmoe_chain_fixtures
   local fx bits c R=tiny_inkling/ref_inkling.json W=tiny_inkling_wide/ref_inkling.json
-  for fx in tiny_inkling tiny_inkling_q tiny_inkling_bf16 tiny_inkling_x-i4 tiny_inkling_x-i8; do
+  for fx in tiny_inkling tiny_inkling_q tiny_inkling_x-i4 tiny_inkling_x-i8; do
     dho_gate inkling "dense-only inkling $fx" 2 SNAP=$fx -- 8 0 $R
   done
+  dho_gate_bf16 inkling "dense-only inkling tiny_inkling_bf16" SNAP=tiny_inkling_bf16 -- 8 0 $R
   dho_gate inkling "dense-only inkling runtime int8 experts" 2 SNAP=tiny_inkling -- 2 8 $R
   dho_gate inkling "dense-only inkling tier off" 2 COLI_VK_TIER=0 SNAP=tiny_inkling_q -- 8 0 $R
   dho_gate inkling "dense-only inkling prefill in chunks of 3" 2 COLI_VK_CHAIN_ROWS=3 SNAP=tiny_inkling -- 8 0 $R
