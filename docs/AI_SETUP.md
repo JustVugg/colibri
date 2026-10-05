@@ -243,7 +243,7 @@ next free port and the configuration is updated; read the URLs from
 
 ```bash
 python3 c/coli status          # human-readable; --json for the fields above
-python3 c/coli logs -n 50      # server log of a background start
+python3 c/coli logs -n 50      # server log of a background start (a foreground one prints to its terminal)
 python3 c/coli logs --install  # log of a detached install
 python3 c/coli stop            # stops the configured server and its engine
 ```
@@ -251,7 +251,9 @@ python3 c/coli stop            # stops the configured server and its engine
 `coli stop` without `--port` stops the server the setup configured. Rerunning
 `python3 c/coli setup` later starts the configured server directly (in the
 foreground; add `--background --no-browser` for a detached start), with no
-download and no build.
+download. Before it starts, `make` brings the engine up to date with the sources:
+nothing to do (a fraction of a second) unless they changed, as after a `git pull`,
+and then only what changed is rebuilt. `coli start` does the same.
 
 ## Files
 

@@ -581,19 +581,75 @@ class EngineResolution(HomeTestCase):
             path.write_bytes(b"\x7fELF" + content)
             self.assertEqual(setup_flow.binary_backend(str(path)), expected)
 
-    def test_present_engine_with_the_right_backend_is_not_rebuilt(self):
-        for os_name, loader in (("linux", b"libvulkan.so.1"), ("win32", b"vulkan-1.dll")):
-            with self.subTest(os=os_name), modeled(os_name), \
-                    tempfile.TemporaryDirectory() as engines:
-                Path(engines, engine_name(os_name)).write_bytes(loader)
-                decision = {"backend": "vulkan", "missing": []}
-                with mock.patch.object(setup_flow, "HERE", engines), \
-                     mock.patch.object(setup_flow, "build_engine") as build:
-                    info = setup_flow.resolve_engine(family_by_id("qwen36"), None, decision, TC_ALL,
-                                                     out=lambda *_: None)
-                build.assert_not_called()
-                self.assertEqual(info["source"], "present")
+    def resolve_present(self, os_name, make, tc=TC_ALL, content=b"libvulkan.so.1"):
+        """resolve_engine with an engine already here and `make` standing in for
+        build_engine; returns (info, the build mock, what it said)."""
+        said = []
+        with modeled(os_name), tempfile.TemporaryDirectory() as engines:
+            path = Path(engines, engine_name(os_name))
+            path.write_bytes(content)
+            os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+            with mock.patch.object(setup_flow, "HERE", engines), \
+                 mock.patch.object(setup_flow, "build_engine",
+                                   side_effect=lambda *a, **k: make(path, *a, **k)) as build:
+                info = setup_flow.resolve_engine(family_by_id("qwen36"), None,
+                                                 {"backend": "vulkan", "missing": []}, tc,
+                                                 out=said.append)
+        return info, build, "\n".join(said)
+
+    def test_present_engine_is_brought_up_to_date_with_make(self):
+        # #1852: an engine with the right backend used to be taken as it was, so after
+        # a `git pull` the old engine kept running. make now redoes what changed.
+        for os_name in ("linux", "win32"):
+            with self.subTest(os=os_name):
+                info, build, said = self.resolve_present(os_name, lambda path, *a, **k: str(path))
+                build.assert_called_once()
+                self.assertEqual(build.call_args.args[1], "vulkan")
+                self.assertTrue(build.call_args.kwargs["update"])
+                self.assertEqual(info["source"], "present")          # make had nothing to do
+                self.assertIn("up to date", said)
                 self.assertEqual(os.path.basename(info["engine"]), engine_name(os_name))
+
+    def test_changed_sources_rebuild_the_present_engine(self):
+        def make(path, *a, **k):
+            path.write_bytes(b"libvulkan.so.1 newer")
+            return str(path)
+        info, build, said = self.resolve_present("linux", make)
+        self.assertEqual(info["source"], "rebuilt")
+        self.assertIn("rebuilt: the sources changed since the last build", said)
+
+    def test_a_failed_update_keeps_the_engine_that_was_here(self):
+        def make(path, family, backend, tc, out=print, make_args=(), update=False):
+            raise setup_flow.BuildError("the qwen36 VULKAN build failed", backend, "/logs/build.log")
+        info, build, said = self.resolve_present("linux", make)
+        self.assertEqual(info["source"], "present")
+        self.assertEqual(info["backend"], "vulkan")
+        self.assertIn("could not update it (log: /logs/build.log); keeping the qwen36 engine", said)
+
+    def test_a_failed_update_that_removed_the_engine_is_a_failed_build(self):
+        def make(path, family, backend, tc, out=print, make_args=(), update=False):
+            path.unlink()
+            raise setup_flow.BuildError("the qwen36 VULKAN build failed", backend, "/logs/build.log")
+        with self.assertRaises(setup_flow.BuildError):
+            self.resolve_present("linux", make)
+
+    def test_no_toolchain_for_the_engine_kind_keeps_it_as_it_is(self):
+        no_vulkan = dict(TC_ALL, vulkan_headers=False, glslc=None, can_build_vulkan=False)
+        info, build, said = self.resolve_present("linux", lambda path, *a, **k: str(path), tc=no_vulkan)
+        build.assert_not_called()
+        self.assertEqual(info["source"], "present")
+
+    def test_a_gpu_engine_used_for_the_cpu_is_updated_as_the_gpu_build_it_is(self):
+        said = []
+        with modeled("linux"), tempfile.TemporaryDirectory() as engines:
+            Path(engines, "qwen36").write_bytes(b"libvulkan.so.1")
+            with mock.patch.object(setup_flow, "HERE", engines), \
+                 mock.patch.object(setup_flow, "build_engine") as build:
+                info = setup_flow.resolve_engine(family_by_id("qwen36"), None,
+                                                 {"backend": "cpu", "missing": []}, TC_ALL,
+                                                 out=said.append)
+        self.assertEqual(build.call_args.args[1], "vulkan")      # not rebuilt as a CPU engine
+        self.assertEqual(info["backend"], "cpu")
 
     def test_an_engine_without_the_exe_suffix_is_not_the_windows_engine(self):
         Path(self.tmp.name, "qwen36").write_bytes(b"vulkan-1.dll")
@@ -801,7 +857,14 @@ class WholeSetup(HomeTestCase):
                 mock.patch.object(setup_flow, "toolchain", return_value=TC_ALL),
                 mock.patch.object(setup_flow, "plan_summary",
                                   return_value=("dense part 0.0 GB in RAM", [])),
-                mock.patch.object(setup_download.time, "sleep")):
+                mock.patch.object(setup_download.time, "sleep"),
+                # No colibri runs (whatever this machine has on port 8000), so a
+                # rerun checks its engine; make has nothing to do, the engine here
+                # stays as it is. A test that builds patches build_engine again inside.
+                mock.patch.object(setup_flow, "server_status",
+                                  return_value={"state": "stopped", "pid": None}),
+                mock.patch.object(setup_flow, "build_engine",
+                                  side_effect=lambda family, *a, **k: os.path.join(self.engines, "qwen36"))):
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -835,7 +898,26 @@ class WholeSetup(HomeTestCase):
         self.assertEqual(code, 0, text)
         self.assertIn("Already set up: Tiny test model", text)
         self.assertEqual(len(self.hub.requests), before)
-        build.assert_not_called()
+        build.assert_called_once()                       # make, with nothing to redo
+        self.assertTrue(build.call_args.kwargs["update"])
+
+    def test_a_rerun_after_a_pull_rebuilds_the_engine_it_starts(self):
+        code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        engine = Path(self.engines, "qwen36")
+        os.utime(engine, ns=(1_000_000_000, 1_000_000_000))
+
+        def make(family, backend, tc, out=print, make_args=(), update=False):
+            self.assertEqual((backend, update), ("vulkan", True))
+            engine.write_bytes(b"\x7fELF libvulkan.so.1 with the pulled sources")
+            return str(engine)
+
+        with mock.patch.object(setup_flow, "build_engine", side_effect=make):
+            code, text = self.run_setup()
+        self.assertEqual(code, 0, text)
+        self.assertIn("Already set up: Tiny test model", text)
+        self.assertIn("rebuilt: the sources changed since the last build", text)
+        self.assertIn(b"pulled sources", engine.read_bytes())
 
     def test_interrupted_download_continues_on_rerun(self):
         real = setup_download.download_repo
@@ -883,7 +965,7 @@ class WholeSetup(HomeTestCase):
         os.remove(os.path.join(self.engines, "qwen36"))
         shard_fetches = sum("/cdn/" in r["path"] for r in self.hub.requests)
 
-        def rebuild(family, backend, tc, out=print, make_args=()):
+        def rebuild(family, backend, tc, out=print, make_args=(), update=False):
             Path(self.engines, "qwen36").write_bytes(b"libvulkan.so.1")
             return os.path.join(self.engines, "qwen36")
 
@@ -909,7 +991,7 @@ class WholeSetup(HomeTestCase):
             code, text = self.run_setup()
         self.assertIn("Already set up", text)
 
-        def rebuild(family, backend, tc, out=print, make_args=()):
+        def rebuild(family, backend, tc, out=print, make_args=(), update=False):
             self.assertEqual(backend, "vulkan")
             Path(self.engines, "qwen36").write_bytes(b"libvulkan.so.1")
             return os.path.join(self.engines, "qwen36")
@@ -924,11 +1006,15 @@ class WholeSetup(HomeTestCase):
 
     def failing_build(self, *broken):
         """build_engine as a mock: the backends in `broken` fail the way make
-        does (BuildError with their log), the others write a matching engine."""
+        does (BuildError with their log), the others write a matching engine.
+        `calls` lists the builds; updating an engine already here (refresh_engine)
+        is make with nothing to do, and not a build."""
         loaders = {"cuda": b"libcudart.so.12", "vulkan": b"libvulkan.so.1", "cpu": b"plain"}
         calls = []
 
-        def build(family, backend, tc, out=print, make_args=()):
+        def build(family, backend, tc, out=print, make_args=(), update=False):
+            if update:
+                return os.path.join(self.engines, "qwen36")
             calls.append(backend)
             log = setup_flow.log_path(setup_flow.build_log_name(backend))
             if backend in broken:
@@ -1221,6 +1307,96 @@ class ServerControl(HomeTestCase):
         self.assertNotEqual(moved["port"], self.port)
         self.assertEqual(moved["args"][moved["args"].index("--port") + 1], str(moved["port"]))
         self.port = moved["port"]                                 # cleanup stops this one
+
+
+class ForegroundLogs(HomeTestCase):
+    """#1852: the server the setup starts in the foreground prints to its terminal,
+    and `coli logs` (from another terminal) said only "no serve log yet"."""
+
+    def logs(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = setup_flow.cmd_logs(argparse.Namespace(install=False, lines=100))
+        return code, out.getvalue()
+
+    def test_a_foreground_start_leaves_a_line_saying_where_its_output_is(self):
+        Path(setup_flow._ensure_log("serve")).write_text("an older background run's lines\n")
+        setup_flow.note_foreground_start(4242, ["python3", "coli", "web", "--port", "8000"])
+        code, text = self.logs()
+        self.assertEqual(code, 0)
+        last = text.strip().splitlines()[-2:]
+        self.assertIn("in the foreground (pid 4242): python3 coli web --port 8000", last[0])
+        self.assertIn("its output goes to the terminal that started it", last[1])
+        self.assertIn("`coli start --background` writes it here", last[1])
+
+    def test_no_log_but_a_running_server_says_where_to_look(self):
+        setup_flow.save_config({"status": "ready", "port": 8000, "host": "127.0.0.1"})
+        with mock.patch.object(setup_flow, "server_status",
+                               return_value={"state": "ready", "pid": 18985}):
+            code, text = self.logs()
+        self.assertEqual(code, 1)
+        self.assertIn("no serve log yet", text)
+        self.assertIn("colibri is running (ready, pid 18985), started in the foreground: "
+                      "its output is in the terminal that started it", text)
+
+    def test_no_log_and_nothing_running_says_only_that(self):
+        setup_flow.save_config({"status": "ready", "port": 8000, "host": "127.0.0.1"})
+        with mock.patch.object(setup_flow, "server_status", return_value={"state": "stopped", "pid": None}):
+            code, text = self.logs()
+        self.assertEqual(code, 1)
+        self.assertEqual(text.strip().splitlines()[-1].startswith("no serve log yet"), True)
+        self.assertNotIn("running", text)
+
+
+class ConfiguredRefresh(HomeTestCase):
+    """refresh_configured: the engine a ready setup starts, checked against the sources."""
+
+    def setUp(self):
+        super().setUp()
+        self.engines = os.path.join(self.tmp.name, "c")
+        os.makedirs(self.engines)
+        self.engine = Path(self.engines, "qwen36")
+        self.engine.write_bytes(b"\x7fELF libvulkan.so.1")
+        for patcher in (modeled("linux"), mock.patch.object(setup_flow, "HERE", self.engines)):
+            patcher.__enter__()
+            self.addCleanup(patcher.__exit__, None, None, None)
+        self.cfg = {"family": "qwen36", "engine": str(self.engine), "port": 8000, "host": "127.0.0.1"}
+
+    def refresh(self, state="stopped", cfg=None):
+        with mock.patch.object(setup_flow, "server_status", return_value={"state": state, "pid": None}), \
+             mock.patch.object(setup_flow, "build_engine", return_value=str(self.engine)) as build:
+            result = setup_flow.refresh_configured(cfg or self.cfg, out=lambda *_: None, tc=TC_ALL)
+        return result, build
+
+    def test_a_stopped_server_gets_its_engine_checked(self):
+        result, build = self.refresh()
+        self.assertEqual(result, "present")
+        self.assertEqual(build.call_args.args[1], "vulkan")
+
+    def test_a_running_server_keeps_the_engine_it_started_with(self):
+        for state in ("ready", "loading"):
+            result, build = self.refresh(state)
+            self.assertIsNone(result)
+            build.assert_not_called()
+
+    def test_a_prebuilt_engine_from_a_release_is_left_alone(self):
+        elsewhere = Path(self.tmp.name, "release", "qwen36")
+        elsewhere.parent.mkdir()
+        elsewhere.write_bytes(b"plain")
+        result, build = self.refresh(cfg=dict(self.cfg, engine=str(elsewhere)))
+        self.assertIsNone(result)
+        build.assert_not_called()
+
+    def test_a_cuda_engine_is_updated_with_the_variables_for_its_cards(self):
+        self.engine.write_bytes(b"\x7fELF libcudart.so.12")
+        cfg = dict(self.cfg, nvidia=[{"name": "Tesla V100-SXM2-16GB", "compute_cap": "7.0"}])
+        tc = dict(TC_ALL, cuda_version="11.8")
+        with mock.patch.object(setup_flow, "server_status", return_value={"state": "stopped", "pid": None}), \
+             mock.patch.object(setup_flow, "build_engine", return_value=str(self.engine)) as build:
+            setup_flow.refresh_configured(cfg, out=lambda *_: None, tc=tc)
+        self.assertEqual(build.call_args.args[1], "cuda")
+        self.assertEqual(build.call_args.kwargs["make_args"],
+                         setup_flow.cuda_make_args(family_by_id("qwen36"), tc, cfg["nvidia"]))
 
 
 class CommandLine(HomeTestCase):

@@ -639,11 +639,17 @@ def build_log_name(backend):
     return f"build-{backend}"
 
 
-def build_engine(family, backend, tc, out=print, make_args=()):
+def build_engine(family, backend, tc, out=print, make_args=(), update=False):
+    """make the engine; `update` for one already here (refresh_engine), where make
+    redoes only what changed since it was built."""
     cmd, cwd, env = make_command(family, backend, tc, make_args)
     shown = [a for a in cmd if a == family.build_target or re.match(r"^[A-Z_]+=", a)]
     log_file = log_path(build_log_name(backend))
-    out(f"  building: make {' '.join(shown)}  (a few minutes; log: {log_file})")
+    if update:
+        out(f"  updating: make {' '.join(shown)}  (only what changed since the last build; "
+            f"log: {log_file})")
+    else:
+        out(f"  building: make {' '.join(shown)}  (a few minutes; log: {log_file})")
     write_state("build", engine=family.engine_artifact, backend=backend)
     with open(_ensure_log(build_log_name(backend)), "w", encoding="utf-8", errors="replace") as log:
         process = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
@@ -848,8 +854,10 @@ def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
     if os.path.exists(local):
         have = binary_backend(local)
         if decision["backend"] == "cpu" or have == decision["backend"]:
+            make_args = decision.get("make_args", ()) if have == decision["backend"] else ()
+            source = refresh_engine(family, have, tc, local, out=out, make_args=make_args)
             return {"launcher_dir": HERE, "engine": local, "backend": decision["backend"],
-                    "source": "present"}
+                    "source": source}
         if not tc.get("can_build"):
             out(f"  the {family.engine_artifact} engine here is a {have} build; "
                 f"keeping it, since nothing here can rebuild it")
@@ -878,6 +886,61 @@ def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
         out(f"  the prebuilt engine runs on the CPU; the {decision['backend']} build needs a "
             f"source checkout and a compiler: {package_hint(['build', decision['backend']])}")
     return {"launcher_dir": runtime, "engine": engine, "backend": "cpu", "source": f"release {tag}"}
+
+
+# What the toolchain needs to build each kind of engine (toolchain()).
+CAN_BUILD = {"cpu": "can_build", "vulkan": "can_build_vulkan", "cuda": "can_build_cuda"}
+
+
+def refresh_engine(family, backend, tc, path, out=print, make_args=()):
+    """An engine already here, brought up to date with the sources before it is
+    used: make redoes what changed since it was built, and nothing when nothing
+    did (about 0.02 s). Without this a checkout updated with `git pull` kept its
+    old engine, since one with the right backend was found and used as it was,
+    and the new code never ran (#1852). It is rebuilt as the kind it is (`backend`,
+    from binary_backend), so a Vulkan engine used for the CPU stays a Vulkan one.
+    With no toolchain for that kind, or when the rebuild fails, the engine that
+    was here stays, the failure with a line. Returns "present" or "rebuilt"."""
+    if not tc.get(CAN_BUILD.get(backend, "can_build")):
+        return "present"
+    before = os.stat(path).st_mtime_ns
+    try:
+        build_engine(family, backend, tc, out=out, make_args=make_args, update=True)
+    except BuildError as error:
+        if not os.path.exists(path):
+            raise
+        out(f"  could not update it (log: {error.log}); "
+            f"keeping the {family.engine_artifact} engine that was here")
+        return "present"
+    if os.stat(path).st_mtime_ns == before:
+        out("  up to date")
+        return "present"
+    out("  rebuilt: the sources changed since the last build")
+    return "rebuilt"
+
+
+def refresh_configured(cfg, out=print, tc=None):
+    """The configured engine, brought up to date before a start (refresh_engine).
+    A rerun of the setup, or `coli start`, used to start the engine as it was, so
+    after a `git pull` the old code kept running (#1852). Only an engine built in
+    this checkout: a prebuilt one from a release archive has no sources here. Not
+    while a server runs: it keeps the engine it started with. Returns
+    refresh_engine's answer, or None when there was nothing to check."""
+    try:
+        family = family_by_id(cfg.get("family"))
+    except Exception:
+        return None
+    engine = cfg.get("engine") or ""
+    if (not os.path.isfile(engine)
+            or os.path.abspath(engine) != os.path.abspath(engine_path(HERE, family))):
+        return None
+    if server_status(cfg)["state"] != "stopped":
+        return None
+    tc = tc or toolchain()
+    have = binary_backend(engine)
+    # The CUDA variables the setup built it with: they come from the cards it kept.
+    make_args = cuda_make_args(family, tc, cfg.get("nvidia") or []) if have == "cuda" else ()
+    return refresh_engine(family, have, tc, engine, out=out, make_args=make_args)
 
 
 def resolve_with_fallback(ui, family, entry, decision, tc, hw, requested, failed=()):
@@ -1140,6 +1203,7 @@ def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.
         out("  stop: press Ctrl+C here (or close this window)\n")
         sys.stdout.flush()      # ours before the server's, when the output is a file
         process = subprocess.Popen(cmd, env=env)
+        note_foreground_start(process.pid, cmd)
         try:
             return process.wait()
         except KeyboardInterrupt:
@@ -1180,6 +1244,21 @@ def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.
            "says when it is ready). ") + f"Log: {log}")
     print_urls(cfg, out)
     return status
+
+
+def note_foreground_start(pid, cmd):
+    """A server in the foreground prints to its terminal, not to serve.log; say so
+    in the log, so that `coli logs` (often run from another terminal) points there
+    instead of showing an older background run's lines as if they were this one's
+    (#1852). Best effort: a log that cannot be written changes nothing else."""
+    try:
+        with open(_ensure_log("serve"), "a", encoding="utf-8", errors="replace") as handle:
+            handle.write(f"\n--- start {time.strftime('%Y-%m-%d %H:%M:%S')} in the foreground "
+                         f"(pid {pid}): {' '.join(cmd)}\n"
+                         f"--- its output goes to the terminal that started it, not to this log; "
+                         f"`coli start --background` writes it here\n")
+    except OSError:
+        pass
 
 
 def spawn_detached(cmd, **kwargs):
@@ -1553,6 +1632,7 @@ def cmd_setup(a, ui=None):
             ui.say("The GPU packages are installed now: rebuilding the engine for the GPU.\n")
         else:
             ui.say(f"Already set up: {describe_existing(cfg)}")
+            refresh_configured(cfg, out=ui.say)
             return _finish(ui, cfg, a)
     # A setup that stopped half way (pending), or a finished one whose engine or
     # files went missing (ready, but not runnable): continue with the same choice.
@@ -1712,6 +1792,7 @@ def cmd_start(a):
     cfg = load_config()
     if not cfg or not config_ready(cfg):
         raise SetupError("nothing is set up yet (or the setup did not finish): run `coli setup`")
+    refresh_configured(cfg, out=(lambda *_: None) if getattr(a, "json", False) else print)
     if getattr(a, "json", False):
         print(json.dumps(start_server(cfg, background=True, open_browser=not a.no_browser,
                                       out=lambda *_: None), indent=2))
@@ -1788,6 +1869,17 @@ def cmd_logs(a):
     text = tail_file(path, a.lines)
     if not text:
         print(f"no {name} log yet ({path})")
+        cfg = load_config() if name == "serve" else None
+        try:
+            status = server_status(cfg) if cfg and cfg.get("port") else None
+        except (OSError, ValueError, KeyError):
+            status = None
+        if status and status["state"] != "stopped":
+            # Started some other way (`coli serve` in a terminal): its output is there.
+            print(f"colibri is running ({status['state']}"
+                  + (f", pid {status['pid']}" if status.get("pid") else "")
+                  + "), started in the foreground: its output is in the terminal that "
+                  "started it; `coli start --background` writes it to this log instead")
         return 1
     print(text)
     return 0

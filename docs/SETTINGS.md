@@ -29,7 +29,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `serve` | Start the OpenAI-compatible HTTP server. |
 | `web` | `serve`, then open the dashboard in the browser. |
 | `stop` | Shut down a running `coli serve` and its engine (default port: the one `coli setup` configured, else `8000`). |
-| `setup` | One step: detect the hardware, recommend a model, build or fetch the engine (Vulkan/CUDA when usable), download with resume, write the run configuration, start. A rerun starts directly. See [AI_SETUP.md](AI_SETUP.md). |
+| `setup` | One step: detect the hardware, recommend a model, build or fetch the engine (Vulkan/CUDA when usable), download with resume, write the run configuration, start. A rerun starts directly, once `make` has brought the engine up to date with the sources (a rebuild only when they changed, as after `git pull`). See [AI_SETUP.md](AI_SETUP.md). |
 | `start` | Start what `coli setup` configured (`--background`, `--no-browser`, `--json`). |
 | `status` | What is set up, install progress, server state, URLs, API model id, tok/s of the last answer (`--json`). |
 | `logs` | Tail of the background server log (`-n N`, `--install` for the install log). |

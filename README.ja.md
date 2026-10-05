@@ -97,7 +97,8 @@ Starting colibri
 | `the ... build failed`。たとえば、インストールされている CUDA ツールキットがそのカードをもうサポートしていないときの `Unsupported gpu architecture` | セットアップはまずツールキットをカードと照らし合わせてチェックし、自分で Vulkan を選びます（理由も表示します）。それでもビルドが失敗する場合は次の選択肢（Vulkan、その次に CPU）を提示します。`./start-here.sh --backend vulkan` は Vulkan を強制します。`--no-gpu` なら CPU のままです |
 | `needs N GB free for the download` | `--dir` で、より大きなディスク上のフォルダーを指定する |
 | WSL で、モデルのフォルダーが `/mnt/c` の下にある | Linux 側のディスク（デフォルトの `~/colibri-models`）に置く：`/mnt/c` は何倍も遅くなります |
-| それ以外 | `c/coli logs -n 50` でサーバーのログを、`c/coli logs --install` でセットアップのログを表示できます。セットアップが最後に表示した数行を添えて [issue](https://github.com/JustVugg/colibri/issues) を作成してください |
+| チェックアウトを更新した（`git pull`） | `./start-here.sh` をもう一度実行してください。ソースが変わっていればエンジンを再ビルドしてから起動します |
+| それ以外 | `c/coli logs -n 50` でバックグラウンドで起動したサーバーのログを（フォアグラウンドで起動したサーバーは自分のターミナルに出力します）、`c/coli logs --install` でセットアップのログを表示できます。セットアップが最後に表示した数行を添えて [issue](https://github.com/JustVugg/colibri/issues) を作成してください |
 
 ### AI アシスタントにセットアップしてもらう
 

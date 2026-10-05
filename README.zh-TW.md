@@ -123,7 +123,8 @@ Starting colibri
 | `the ... build failed`，例如已安裝的 CUDA toolkit 不再支援這張顯示卡時出現的 `Unsupported gpu architecture` | 安裝程式會先把 toolkit 和顯示卡對照檢查，自行選擇 Vulkan，並說明原因；如果建置仍然失敗，它會提供下一個選項（先 Vulkan，再 CPU）。`./start-here.sh --backend vulkan` 會強制使用 Vulkan；`--no-gpu` 則留在 CPU 上 |
 | `needs N GB free for the download` | 用 `--dir` 指定一個位於較大硬碟上的資料夾 |
 | 在 WSL 上，模型資料夾位於 `/mnt/c` 底下 | 把它放在 Linux 磁碟上（預設的 `~/colibri-models`）：`/mnt/c` 慢上好幾倍 |
-| 其他任何問題 | `c/coli logs -n 50` 會顯示伺服器日誌，`c/coli logs --install` 則顯示安裝程式的日誌；請附上安裝程式最後印出的幾行，開一個 [issue](https://github.com/JustVugg/colibri/issues) |
+| 更新了程式碼（`git pull`） | 重新執行 `./start-here.sh`：如果原始碼有變動，它會先重新編譯引擎，再啟動 |
+| 其他任何問題 | `c/coli logs -n 50` 會顯示在背景啟動的伺服器日誌（在前景啟動的伺服器會輸出到它自己的終端機），`c/coli logs --install` 則顯示安裝程式的日誌；請附上安裝程式最後印出的幾行，開一個 [issue](https://github.com/JustVugg/colibri/issues) |
 
 ### 讓你的 AI 助手幫你安裝
 

@@ -129,7 +129,8 @@ Cosa fa ogni passo, nel dettaglio: [docs/quickstart.md](docs/quickstart.md#the-o
 | `the ... build failed`, per esempio `Unsupported gpu architecture` quando il CUDA toolkit installato non supporta più la scheda | l'installazione controlla prima il toolkit rispetto alla scheda e sceglie Vulkan da sé, spiegando perché; se una compilazione fallisce ancora, offre la prossima (Vulkan, poi la CPU). `./start-here.sh --backend vulkan` forza Vulkan; `--no-gpu` resta sulla CPU |
 | `needs N GB free for the download` | `--dir` con una cartella su un disco più grande |
 | su WSL, la cartella del modello è sotto `/mnt/c` | tienila sul disco Linux (il predefinito, `~/colibri-models`): `/mnt/c` è molte volte più lento |
-| qualsiasi altra cosa | `c/coli logs -n 50` mostra il log del server e `c/coli logs --install` quello dell'installazione; apri una [issue](https://github.com/JustVugg/colibri/issues) con le ultime righe stampate dall'installazione |
+| hai aggiornato il checkout (`git pull`) | rilancia `./start-here.sh`: ricompila il motore se i sorgenti sono cambiati, poi lo avvia |
+| qualsiasi altra cosa | `c/coli logs -n 50` mostra il log del server avviato in background (quello avviato in primo piano scrive nel suo terminale) e `c/coli logs --install` quello dell'installazione; apri una [issue](https://github.com/JustVugg/colibri/issues) con le ultime righe stampate dall'installazione |
 
 ### Lascia che sia il tuo assistente AI a installarlo
 
