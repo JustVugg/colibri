@@ -16,7 +16,12 @@
  *   - on an integrated GPU, whose device memory is the CPU's RAM, defaults to a
  *     budget that leaves the RAM the engine's expert cache will need;
  *   - accounts device / CPU hits, uploads, evictions and how much device time the
- *     CPU work hid, in one "[VK] tier <engine>" line per run and serve turn.
+ *     CPU work hid, in one "[VK] tier <engine>" line per run and serve turn;
+ *   - with COLI_VK_DEV2=auto|<index>, holds experts on a second device too: the
+ *     hottest on the primary device, the next ones on the second (its budget: its free
+ *     memory less COLI_VK_RESERVE2_GB, at most COLI_VK_EXPERTS2 experts when set), each
+ *     step one batch per device, both in flight at once. Nothing changes for the
+ *     engine: the calls below are the same with one device or two.
  * With COLI_VULKAN unset, COLI_VK_TIER=0, a CUDA tier active, or a build without
  * VK=1 (the inline stubs below), nothing here runs and the engine is unchanged.
  *
@@ -230,6 +235,8 @@ int  vkt_step_rows(int S, int block);
  * layer's routing in the previous big step (else the history); an expert it misses
  * is streamed after the routing, one it adds costs an upload. Returns how many. */
 int  vkt_stream_prefetch(int layer, int S);
+/* How many devices hold experts: 0 (the tier is off), 1, or 2 (COLI_VK_DEV2's too). */
+int  vkt_devices(void);
 #else
 static inline int  vkt_wanted(void){return 0;}
 static inline int  vkt_init(const VktConfig *c, uint32_t *const *h){(void)c;(void)h;return 0;}
@@ -249,6 +256,7 @@ static inline void vkt_report(const char *s,unsigned long long r,unsigned long l
 static inline size_t vkt_expert_bytes(int h,int i,VktFmt a,VktFmt b){(void)h;(void)i;(void)a;(void)b;return 0;}
 static inline int  vkt_step_rows(int S,int b){return S<b?S:b;}
 static inline int  vkt_stream_prefetch(int l,int S){(void)l;(void)S;return 0;}
+static inline int  vkt_devices(void){return 0;}
 #endif
 
 #endif

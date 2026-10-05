@@ -277,13 +277,14 @@ With `COLI_VULKAN=1` every MoE engine (qwen36, qwen38, inkling, olmoe, kimi_k3, 
 
 ### Second Vulkan device (opt-in)
 
-GLM engine. A second GPU holds, fixed at startup, the hottest experts of the history that the expert tier on the first device does not hold (with the tier off, the hottest ones). Deliberately separate from the first device so the dev0 hot path is untouched and both groups can be in flight at once.
+Every engine on the routed-expert tier. A second GPU holds the experts after the primary device's: filled from the history at startup (the hottest on the primary device, the next ones there), then adapting as on the primary device; each step sends each device its own batch, both in flight at once. Its own pipelines, scratch and queue, so the primary device's hot path is untouched.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_VK_DEV2` | unset (off) | Enable the second device tier. A number selects that physical device index; `auto` picks a distinct real GPU (a second *logical* device on the same physical GPU is accepted only when forced by index — that is the pre-hardware test mode). |
-| `COLI_VK_EXPERTS2` | `512` | Expert count cap for the dev2 tier (only read when `COLI_VK_DEV2` brought a device up). |
-| `COLI_VK_RESERVE2_GB` | `0.5` | VRAM (GB) held back on dev2, as `COLI_VK_TIER_RESERVE_GB` is for dev0's tier. |
+| `COLI_VK_DEV2` | unset (off) | A second GPU for the routed-expert tier, every engine on it: the experts after the primary device's ([vulkan.md](vulkan.md#a-second-device-coli_vk_dev2)). A number selects that device index; `auto` picks a distinct real GPU, a discrete one first. A second *logical* device on the same physical GPU is accepted only when forced by index: that is the test mode. With `COLI_VK_TIER=0`, colibri keeps its own fixed registry there. |
+| `COLI_VK_EXPERTS2` | tier: unset (the budget decides); colibri's registry: `512` | Expert count cap on the second device. |
+| `COLI_VK_RESERVE2_GB` | `0.5` | Device memory (GiB) held back on the second device, as `COLI_VK_TIER_RESERVE_GB` is for the primary one. |
+| `COLI_VK_DEV2_FAULT` | unset | Tests: the n-th batch joined on the second device fails there, as a lost device's does; the tier gives its experts back to the CPU and goes on with the primary device. |
 
 See [docs/vulkan.md](vulkan.md). On multi-core boxes also set `COLI_NO_OMP_TUNE=1` (see that doc for why).
 

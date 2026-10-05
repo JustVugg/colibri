@@ -323,6 +323,17 @@ jobs:
           - family: partial-deepseek-sanitize
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow
+          # the routed-expert tier on two devices (COLI_VK_DEV2): every MoE engine on
+          # Lavapipe opened twice, in decode, a warm start before big prompt steps, both
+          # devices evicting and the second one failing; the shared code under ASan and UBSan
+          - family: dev2
+            req: c/tools/requirements-glm53-tiny.txt
+          - family: dev2-deepseek-kimi-mimo
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: dev2-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
           # big prompt chunks and expert streaming (docs/vulkan.md): every chain engine on a
           # prompt past its usual block, the chunk from the budget, a forced small chunk and
           # streaming threshold, staged, the feature off, and the forced runs under ASan

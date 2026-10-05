@@ -532,6 +532,61 @@ The dashboard's expert map (`EMAP`) shows a device-resident expert as tier 2 (VR
 the experts a device step served still light up in `HITS`, and qwen36's
 `CACHE_ROUTE` ranks them like CUDA-resident ones.
 
+### A second device (`COLI_VK_DEV2`)
+
+A machine with two GPUs (a V100 beside a GTX 1070, an RX 9070 beside an RX 580) can
+give the tier the memory of both. `COLI_VK_DEV2=auto` takes the best GPU that is not the
+primary device (a discrete card before an integrated one); `COLI_VK_DEV2=<index>` takes
+that entry of the Vulkan enumeration (`COLI_VK_DEV` picks the primary one the same way).
+Every engine on the tier gets it, with nothing else to set:
+
+- **What goes where.** The primary device keeps its budget as before. The second
+  device's is its free memory less `COLI_VK_RESERVE2_GB` (0.5 GiB: its batch's scratch
+  and the driver), at most `COLI_VK_EXPERTS2` experts when that is set, and never more
+  experts than the primary device leaves: a model whose experts all fit on the primary
+  device leaves the second one empty, and a line says so. An integrated GPU as the
+  second device takes a quarter of what the RAM leaves, as the primary one does.
+- **The warm start** fills the primary device with the hottest experts of the history
+  and the second one with the next ones. **While you chat**, a promoted expert goes
+  where there is room (the primary device first), or takes the place of the coldest
+  resident on either device, by the same LFRU rule.
+- **Every step** sends each device the batch of its own resident experts. Both are in
+  flight at once while the CPU computes the rest, and the rows come back to be added
+  in routing order, as with one device. The second device has its own pipelines,
+  scratch and queue. It takes the GEMV and fp32 GEMM routes, not the
+  cooperative-matrix one, because its device is created without those features.
+- **Big prompt steps.** Their sub-batches and the streaming of cold experts stay on
+  the primary device. The second device's residents of such a step run there as one
+  batch beside them, up to 128 MiB of rows; past that, the streaming rule decides for
+  them.
+- **A failure** of the second device (a batch that fails, the device lost) hands that
+  step's rows back to the CPU and frees its experts, and the tier goes on with the
+  primary device:
+  `[VK] tier <engine>: a batch on the second device failed, its experts go back to the
+  CPU and the tier goes on with <device>`.
+- **The lines.** At startup:
+  `[VK] tier <engine>: second device <name>, budget B = N experts of S (device memory),
+  the experts after the primary device's`. The run's line ends with
+  `| second device <name>: resident R (budget N, used of B), X rows in Y batches
+  (Z beside prompt steps), uploads U, T ms`. Its other fields stay the primary
+  device's.
+- **colibri's own registry.** With the tier on, colibri's fixed second-device registry
+  stays off: the tier holds the experts there, in every format. With `COLI_VK_TIER=0`
+  the registry works as before (the hottest experts of the history, int4 and int3,
+  fixed at startup).
+
+The families `dev2`, `dev2-deepseek-kimi-mimo` and `dev2-sanitize`
+(`c/tests/vulkan_dev2.sh`) run every MoE engine on Lavapipe opened twice. `COLI_VK_DEV2=0`
+is the test mode: a second logical device on the same physical one. The primary device
+is held to a few experts, and four cases run against the CPU's tokens:
+- decode;
+- a warm start before big prompt steps;
+- both devices full and evicting;
+- the second device failing at its second batch (`COLI_VK_DEV2_FAULT=2`).
+
+Not measured: speed on two real GPUs. Lavapipe shows that the rows come back right and
+land where they should. How much a second card adds depends on its memory and its bus.
+
 ### Inkling and OLMoE
 
 Both run their routed experts on this tier with `COLI_VULKAN=1`, in the form their
@@ -636,10 +691,11 @@ fixed set it replaces served S <= 4 only.
   uploaded before the tier sizes itself, so the budget is what remains; the trunk's
   default here stays off. On an integrated GPU the tier takes its default share of RAM
   after the expert cache's (the startup reservation of the fixed set is gone).
-- *`COLI_VK_DEV2`*: the second device's registry, fixed at startup, takes the hottest
-  experts of the history that the tier does not hold (with the tier off, the hottest
-  ones), up to `COLI_VK_EXPERTS2`; a step sends them there as one group on a worker
-  thread while the tier's batch and the CPU run.
+- *`COLI_VK_DEV2`*: with the tier on, the tier holds experts on the second device
+  ([A second device](#a-second-device-coli_vk_dev2)). With `COLI_VK_TIER=0`, colibri's
+  own registry there, fixed at startup, takes the hottest experts of the history, up to
+  `COLI_VK_EXPERTS2`; a step sends them there as one group on a worker thread while
+  the CPU runs.
 
 **GLM-5.3 Flash (`glm53`).** The streaming container's int4-gs64 experts go to the tier;
 the resident matrices follow the dense rule above (on a device that shares the CPU's RAM

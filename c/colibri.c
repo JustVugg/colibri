@@ -10944,7 +10944,9 @@ static void vk_tier_start(Model *m){
 
 /* COLI_VK_DEV2: the second device's registry takes the hottest experts of the history
  * that the tier does not hold, up to COLI_VK_EXPERTS2 and COLI_VK_RESERVE2_GB, uploaded
- * once (int4 per row, int4-gs and int3-g64 experts). */
+ * once (int4 per row, int4-gs and int3-g64 experts). Only when the shared tier did not
+ * take the second device itself (COLI_VK_TIER=0, or its batch would not come up there):
+ * the tier's share adapts and serves every format. */
 typedef struct { uint32_t u; int layer, eid; } VkCand;
 static int vk_cand_cmp(const void *a, const void *b){
     uint32_t ua=((const VkCand*)a)->u, ub=((const VkCand*)b)->u;
@@ -10952,7 +10954,7 @@ static int vk_cand_cmp(const void *a, const void *b){
 }
 static void vk_dev2_fill(Model *m){
     Cfg *c=&m->c; int E=c->n_experts, NL=c->n_layers;
-    if(!g_vulkan || g_vk_budget2<=0 || !coli_vk_dev2_available()) return;
+    if(!g_vulkan || g_vk_budget2<=0 || !coli_vk_dev2_available() || vkt_devices()>1) return;
     int64_t nz=0;
     for(int i=0;i<NL;i++) if(m->eusage[i]) for(int e=0;e<E;e++) if(m->eusage[i][e]) nz++;
     if(!nz){ fprintf(stderr,"[VK] dev2 tier: no usage history yet — tier empty this run "

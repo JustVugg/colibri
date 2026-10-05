@@ -28,6 +28,8 @@
 #        the first N layers on the device (COLI_VK_CHAIN_LAYERS, COLI_VK_DEVICE_CAP_MB),
 #        tests/vulkan_partial_<group>.sh
 #   bash tests/vulkan_engines.sh decide | decide-sanitize   # Laya, GLiNER2.5-Decide and Clef's DECIDE
+#   bash tests/vulkan_engines.sh dev2 | dev2-deepseek-kimi-mimo | dev2-sanitize   # the expert tier on
+#        two devices (COLI_VK_DEV2), every MoE engine, tests/vulkan_dev2.sh
 #
 # Needs libvulkan-dev, glslc and mesa-vulkan-drivers, plus the Python packages of
 # the family's tiny fixtures (see the vulkan-engines job in .github/workflows/ci.yml).
@@ -2979,6 +2981,7 @@ ptl_check_placed() {
   [ "$1" = "$2" ] || fail "$3: $1 B of matrices on the device after setup, the N layers' are $2 B"
 }
 for f in tests/vulkan_partial_*.sh; do [ -e "$f" ] && . "$f"; done
+. tests/vulkan_dev2.sh   # the expert tier on two devices
 # ---- big prompt chunks and expert streaming (docs/vulkan.md, "Big prompt chunks and
 # expert streaming") ----
 # Every engine with the chain, on a prompt longer than its usual block, against its CPU
@@ -4085,6 +4088,9 @@ case "${1:-}" in
   staged-faults)  family_staged_faults ;;
   staged-faults-sanitize) SAN=1 family_staged_faults ;;
   decide)         family_decide ;;
+  dev2)           family_dev2 ;;
+  dev2-deepseek-kimi-mimo) family_dev2_deepseek_kimi_mimo ;;
+  dev2-sanitize)  family_dev2_sanitize ;;
   decide-sanitize) SAN=1 family_decide ;;
   dense-only-*)   g=${1#dense-only-}; fn=dho_family_${g//-/_}
                   declare -F "$fn" >/dev/null || { echo "no dense-only group ${g}" >&2; exit 2; }

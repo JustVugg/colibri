@@ -53,6 +53,7 @@ size_t coli_vk_device_cap(void);
 size_t coli_vk_device_used(void);
 size_t coli_vk_free_bytes(void);
 size_t coli_vk_block_bytes(size_t def);
+size_t coli_vk_block_bytes_dev(int dev, size_t def);   /* the same for device 0 or COLI_VK_DEV2's (1) */
 int    coli_vk_mem_alloc(void *device, const void *info, void *memory);
 void   coli_vk_mem_free(void *device, const void *memory);
 /* COLI_VK_STAGED_FAULT (tests): whether a point is set, and how many times it was reached. */
@@ -177,7 +178,8 @@ size_t coli_vk_tensor_bytes(const ColiVkTensor *t);
  * Resident tensors live in a few big device-memory blocks per pool, handed out by
  * an offset allocator (vk_alloc.h) that takes freed ranges back. Pool 0 holds every
  * engine's resident weights (what coli_vk_mem_info counts), pool 1 the routed-expert
- * tier's experts, pool 2 COLI_VK_DEV2's. */
+ * tier's experts, pool 2 COLI_VK_DEV2's registry (colibri.c), pool 3 the tier's experts
+ * on COLI_VK_DEV2's device. */
 typedef struct {
     int blocks, live;                 /* device-memory blocks; ranges handed out */
     size_t total, used, free;         /* block bytes; in ranges; between them */
@@ -190,6 +192,7 @@ typedef struct {
 void coli_vk_pool_stats(int pool, ColiVkPoolStats *st);
 /* The expert tier's budget: its pool never holds more block bytes than this. */
 void coli_vk_tier_pool_limit(size_t bytes);
+void coli_vk_tier_pool_limit_dev(int dev, size_t bytes);   /* dev 1: COLI_VK_DEV2's pool (3) */
 /* A tensor in the tier's pool, to fill in place: O rows of coli_vk_tensor_row_bytes
  * at *stride apart (padding zeroed) and coli_vk_tensor_scale_count floats of scales
  * (fmt 10/11: one, set it to 1), then coli_vk_tensor_commit. Thread-safe. Returns 0
@@ -280,6 +283,39 @@ int  coli_vk_xb_sub_busy(int h);
  * coli_vk_tier_tensor hands them out, then coli_vk_tensor_commit. 0 = no memory. Not
  * while a batch that reads it is in flight. */
 int  coli_vk_tensor_refill(ColiVkTensor *t, uint8_t **rows, size_t *stride, float **scales);
+
+/* ---- the batch on the second device (COLI_VK_DEV2) --------------------------------
+ * The routed-expert tier can hold experts on a second device too (vk_tier.c). dev 0
+ * is the device the calls above use, dev 1 COLI_VK_DEV2's: there the batch has its own
+ * context (pipelines, scratch, the device's one queue), the GEMV and fp32 GEMM routes
+ * and no cooperative-matrix one, and no sub-batches. A step can have a batch in flight
+ * on each device at once. An expert belongs to the device of its tensors
+ * (coli_vk_xb_expert); a batch takes experts of its device only.
+ *   coli_vk_dev2_open_env  COLI_VK_DEV2=auto|<index>: the second device up (1), with the
+ *                          shaders device 0 was opened with; 0 when unset or unusable
+ *   coli_vk_dev_info       what the tier sizes itself by, for either device
+ *   coli_vk_tier_tensor_dev  coli_vk_tier_tensor in that device's tier pool
+ *   coli_vk_xb_*_dev       coli_vk_xb_init/_ready/_issue_w/_join/_stats on that device;
+ *                          _busy_dev: a batch in flight there */
+typedef struct {
+    const char *name;
+    int integrated, shares_ram;       /* shares_ram: an integrated GPU or a CPU device */
+    size_t local_bytes;               /* the largest device-local heap (the cap under COLI_VK_DEVICE_CAP_MB) */
+    int has_budget;                   /* free_bytes is the cap or VK_EXT_memory_budget's */
+    size_t free_bytes;                /* free now; else the heap less what this process holds */
+    size_t buf_align;                 /* where a weight range starts */
+} ColiVkDevInfo;
+int  coli_vk_dev2_open_env(void);
+int  coli_vk_dev_info(int dev, ColiVkDevInfo *out);
+int  coli_vk_tier_tensor_dev(int dev, ColiVkTensor **t, int fmt, int I, int O, int gs,
+                             uint8_t **rows, size_t *stride, float **scales);
+int  coli_vk_xb_init_dev(int dev, int D, int I, int act, float limit, float a, float b);
+int  coli_vk_xb_ready_dev(int dev);
+int  coli_vk_xb_issue_dev(int dev, ColiVkExpert *const *ex, const int *rows, int count, const float *const *xrows,
+                          const float *wrows);
+int  coli_vk_xb_join_dev(int dev, const float **yrows, double *device_ms);
+int  coli_vk_xb_busy_dev(int dev);
+void coli_vk_xb_stats_dev(int dev, ColiVkXbStats *st);
 
 /* 1 if the selected device is an integrated GPU (shares physical memory with
  * the host), 0 otherwise or when no device is selected. */
