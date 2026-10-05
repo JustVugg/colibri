@@ -49,6 +49,11 @@ cd "$(dirname "$0")/.."
 export VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/lvp_icd.json}
 export COLI_NO_OMP_TUNE=1
 PY=${PY:-python3}
+# Speculative decoding is on by default (MTP and prompt lookup, docs/speculative.md): its
+# verifies change how many rows a forward dumps and when (the gate decides from measured
+# times), which the families' row-by-row logits comparisons do not expect. They run with it
+# off; the cases that test it turn it on themselves (Q38_MTP=1, COLI_LOOKUP=1, DRAFT=n).
+export COLI_LOOKUP=${COLI_LOOKUP:-0} Q38_MTP=${Q38_MTP:-0}
 
 fail() { echo "FAIL: $*"; exit 1; }
 
