@@ -1,0 +1,105 @@
+#version 450
+// The dense chain's attention for a decode step or a verify's few rows (vk_chain.c,
+// vkc_attn_w), first of two passes: split-K over the row's positions. chain_attn.comp
+// gives each (head, row) one workgroup and each thread a whole dot product, its K row
+// read with a stride of hd floats between the threads: 16 workgroups on Qwen3.6, about
+// 140 us a call at a few hundred positions. Here a workgroup takes one KV head, all G
+// query heads that share it, and one split of the row's positions; a subgroup reads a
+// K or V row as neighbouring vec4s once for the G heads.
+//   splits   NSPL at most; a split covers ch positions, ch = max(32, ceil(n / NSPL))
+//            rounded up to 32, n = pos_base + s + 1, so the splits of a row depend on
+//            its own position only, never on how many rows share the dispatch (a
+//            verify's rows keep a decode step's bits)
+//   per split: running max m and sum l per head over tiles of TP positions, the
+//            unnormalized context acc; written to part for chain_attn_dec2.comp, which
+//            joins the splits in their order
+// The push constants are chain_attn.comp's (VkcAttnW); the host takes this shader for a
+// plain causal attention only (no list, window, ring, sink, position-major rows),
+// hd % 4 == 0, hd <= 4 * subgroup, vd <= 256, G <= 8, subgroup size 64.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int G = 8;
+#define NSPL 64
+#define TP 64
+
+layout(std430, binding = 0) readonly buffer QB { float q[]; };
+layout(std430, binding = 1) readonly buffer KB { float kc[]; };
+layout(std430, binding = 2) readonly buffer VB { float vc[]; };
+layout(std430, binding = 3) writeonly buffer PB { float part[]; };
+
+layout(push_constant) uniform P {
+    int S, H, KVH, hd, pos_base, cap;
+    int q_off, q_row, q_seg;
+    int g_off, g_row, g_seg, has_gate;
+    int o_off, o_row;
+    int sel_off, sel_row;
+    float scale;
+    int k_off, v_off;
+    int win, ring, vd, kv_pm, sink, sink_off;
+} p;
+
+shared float sc[G][TP];
+shared float ms[G], ls[G], cr[G];
+
+void main() {
+    int kvh = int(gl_WorkGroupID.x) / NSPL, sp = int(gl_WorkGroupID.x) % NSPL, s = int(gl_WorkGroupID.y);
+    int n = p.pos_base + s + 1;
+    int ch = max(32, (((n + NSPL - 1) / NSPL) + 31) / 32 * 32);
+    int t0 = sp * ch;
+    if (t0 >= n) return;                       // the whole workgroup: an unused split
+    int t1 = min(n, t0 + ch);
+    int tid = int(gl_LocalInvocationID.x), sg = int(gl_SubgroupID), lane = int(gl_SubgroupInvocationID);
+    int nsg = int(gl_NumSubgroups);
+    bool dl = 4 * lane < p.hd;
+    vec4 qv[G];
+    [[unroll]] for (int h = 0; h < G; h++) {
+        int qb = p.q_off + s * p.q_row + (kvh * G + h) * p.q_seg + 4 * lane;
+        qv[h] = dl ? vec4(q[qb], q[qb + 1], q[qb + 2], q[qb + 3]) : vec4(0.0);
+    }
+    if (tid < G) { ms[tid] = -3.0e38; ls[tid] = 0.0; }
+    float acc[G];
+    [[unroll]] for (int h = 0; h < G; h++) acc[h] = 0.0;
+    int kbase = kvh * p.cap;
+    for (int tt = t0; tt < t1; tt += TP) {
+        int cnt = min(TP, t1 - tt);
+        // scores: a subgroup per position, its lanes over the head dim
+        for (int j = sg; j < cnt; j += nsg) {
+            int kb = p.k_off + (kbase + tt + j) * p.hd + 4 * lane;
+            vec4 kv = dl ? vec4(kc[kb], kc[kb + 1], kc[kb + 2], kc[kb + 3]) : vec4(0.0);
+            [[unroll]] for (int h = 0; h < G; h++) {
+                float d = subgroupAdd(dot(qv[h], kv));
+                if (lane == 0) sc[h][j] = d * p.scale;
+            }
+        }
+        barrier();
+        // the tile's softmax step, one thread a head, positions in order
+        if (tid < G) {
+            float mt = -3.0e38;
+            for (int j = 0; j < cnt; j++) mt = max(mt, sc[tid][j]);
+            float mo = ms[tid], mn = max(mo, mt), sum = 0.0;
+            for (int j = 0; j < cnt; j++) { float e = exp(sc[tid][j] - mn); sc[tid][j] = e; sum += e; }
+            float c = exp(mo - mn);
+            ls[tid] = ls[tid] * c + sum; ms[tid] = mn; cr[tid] = c;
+        }
+        barrier();
+        // the context: a thread a dim of V
+        if (tid < p.vd) {
+            [[unroll]] for (int h = 0; h < G; h++) acc[h] *= cr[h];
+            for (int j = 0; j < cnt; j++) {
+                float vv = vc[p.v_off + (kbase + tt + j) * p.vd + tid];
+                [[unroll]] for (int h = 0; h < G; h++) acc[h] += sc[h][j] * vv;
+            }
+        }
+        barrier();
+    }
+    // part: acc [S][H][NSPL][vd], then (m, l) [S][H][NSPL]
+    [[unroll]] for (int h = 0; h < G; h++) {
+        int idx = (s * p.H + kvh * G + h) * NSPL + sp;
+        if (tid < p.vd) part[idx * p.vd + tid] = acc[h];
+        if (tid == 0) {
+            int mb = p.S * p.H * NSPL * p.vd + 2 * idx;
+            part[mb] = ms[h]; part[mb + 1] = ls[h];
+        }
+    }
+}

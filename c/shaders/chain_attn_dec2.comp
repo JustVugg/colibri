@@ -1,0 +1,42 @@
+#version 450
+// Second pass of chain_attn_dec.comp: one workgroup per (head h, row s) joins the row's
+// splits in their order (the max of their maxima, each split's sum and context rescaled
+// to it), divides, applies Qwen's output gate and writes the context row as
+// chain_attn.comp does. Same push constants; the splits as pass one counts them.
+layout(local_size_x = 256) in;
+#define NSPL 64
+
+layout(std430, binding = 0) readonly buffer PB { float part[]; };
+layout(std430, binding = 1) readonly buffer GB { float gt[]; };
+layout(std430, binding = 2) writeonly buffer OB { float o[]; };
+
+layout(push_constant) uniform P {
+    int S, H, KVH, hd, pos_base, cap;
+    int q_off, q_row, q_seg;
+    int g_off, g_row, g_seg, has_gate;
+    int o_off, o_row;
+    int sel_off, sel_row;
+    float scale;
+    int k_off, v_off;
+    int win, ring, vd, kv_pm, sink, sink_off;
+} p;
+
+void main() {
+    int h = int(gl_WorkGroupID.x), s = int(gl_WorkGroupID.y), d = int(gl_LocalInvocationID.x);
+    if (d >= p.vd) return;
+    int n = p.pos_base + s + 1;
+    int ch = max(32, (((n + NSPL - 1) / NSPL) + 31) / 32 * 32);
+    int ns = (n + ch - 1) / ch;
+    int i0 = (s * p.H + h) * NSPL, mb = p.S * p.H * NSPL * p.vd;
+    float M = -3.0e38;
+    for (int c = 0; c < ns; c++) M = max(M, part[mb + 2 * (i0 + c)]);
+    float L = 0.0, a = 0.0;
+    for (int c = 0; c < ns; c++) {
+        float w = exp(part[mb + 2 * (i0 + c)] - M);
+        L += part[mb + 2 * (i0 + c) + 1] * w;
+        a += part[(i0 + c) * p.vd + d] * w;
+    }
+    float v = L > 0.0 ? a / L : 0.0;
+    if (p.has_gate != 0) v *= 1.0 / (1.0 + exp(-gt[p.g_off + s * p.g_row + h * p.g_seg + d]));
+    o[p.o_off + s * p.o_row + h * p.vd + d] = v;
+}

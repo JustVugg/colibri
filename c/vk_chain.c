@@ -887,6 +887,34 @@ static VkPipeline kab_pipe(void) {
     }
     return KAB.pipe;
 }
+/* chain_attn_dec.comp + chain_attn_dec2.comp: a decode step's or a verify's few rows
+ * split over the positions (made on first use; subgroups of 64 only) */
+static struct { VkShaderModule mod1, mod2; VkPipeline p1, p2; int tried, g; VkcBuf *part; } KAD;
+static int kad_ready(int G) {
+    if (KAD.p1 && KAD.g == G) return 1;
+    if (KAD.tried || !vkc_ready()) return 0;
+    KAD.tried = 1;
+    VkPhysicalDeviceSubgroupProperties sgp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceProperties2 pp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sgp};
+    vkGetPhysicalDeviceProperties2((VkPhysicalDevice)K.core.phys, &pp2);
+    if (sgp.subgroupSize != 64) return 0;
+    if (!(KAD.mod1 = load_module(K.core.spv_path, "chain_attn_dec.spv")) ||
+        !(KAD.mod2 = load_module(K.core.spv_path, "chain_attn_dec2.spv"))) return 0;
+    int32_t v = G;
+    VkSpecializationMapEntry me = {0, 0, 4};
+    VkSpecializationInfo si = {1, &me, 4, &v};
+    KAD.p1 = make_pipe(KAD.mod1, &si); KAD.p2 = make_pipe(KAD.mod2, NULL);
+    if (!KAD.p1 || !KAD.p2) return 0;
+    KAD.g = G;
+    return 1;
+}
+static void kad_shutdown(void) {
+    if (KAD.p1) vkDestroyPipeline(K.dev, KAD.p1, NULL);
+    if (KAD.p2) vkDestroyPipeline(K.dev, KAD.p2, NULL);
+    if (KAD.mod1) vkDestroyShaderModule(K.dev, KAD.mod1, NULL);
+    if (KAD.mod2) vkDestroyShaderModule(K.dev, KAD.mod2, NULL);
+    memset(&KAD, 0, sizeof KAD);   /* part went with the pools */
+}
 static void kab_shutdown(void) {
     if (KAB.pipe) vkDestroyPipeline(KC.dev, KAB.pipe, NULL);
     if (KAB.mod) vkDestroyShaderModule(KC.dev, KAB.mod, NULL);
@@ -971,6 +999,19 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
     VkPipeline fp = KC.mod_fa && fl > 0 && w.a.S >= fl && !(sel && w.a.sel_row > 0) && !w.win && !w.ring && !w.kv_pm &&
                     !w.sink && w.vd == w.a.hd && w.a.hd % 64 == 0 && 16 % G == 0 ? fa_pipe(w.a.hd, G) : VK_NULL_HANDLE;
     int blocked = !fp && blk > 0 && w.a.S >= blk && G <= 32 && kab_pipe(), br = w.a.sel_row > 0 ? 1 : 32 / G;
+    /* a decode step or a verify's rows: chain_attn_dec, split over the positions */
+    if (!fp && !blocked && w.a.S <= 16 && !(sel && w.a.sel_row > 0) && !w.win && !w.ring && !w.kv_pm && !w.sink &&
+        w.a.hd % 4 == 0 && w.a.hd <= 256 && w.vd <= 256 && G <= 8 && !getenv("COLI_VK_ATTN_DEC_OFF") && kad_ready(G)) {
+        size_t need = (size_t)16 * w.a.H * 64 * (w.vd + 2) * sizeof(float);
+        if (!KAD.part || vkc_bytes(KAD.part) < need) {
+            if (KAD.part) vkc_free(KAD.part);
+            if (!(KAD.part = vkc_buf(need, VKC_DEV))) return 0;
+        }
+        VkcBind b1[4] = {B(q, 0), B(kc, 0), B(vc, 0), B(KAD.part, 1)};
+        VkcBind b2[3] = {B(KAD.part, 0), B(gate, 0), B(o, 1)};
+        return record(KAD.p1, b1, 4, &w, sizeof w, (uint32_t)(w.a.KVH * 64), (uint32_t)w.a.S, 1) &&
+               record(KAD.p2, b2, 3, &w, sizeof w, (uint32_t)w.a.H, (uint32_t)w.a.S, 1);
+    }
     int S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd),
                                         fp ? 16 / G : blocked ? br : 1);
     int ok = 1;
@@ -1697,6 +1738,7 @@ void vkc_shutdown(void) {
     if (KC.cpool) vkDestroyCommandPool(KC.dev, KC.cpool, NULL);
     kx_shutdown();
     kab_shutdown();
+    kad_shutdown();
     ke_shutdown();
     for (int i = 0; i < P_NPIPE; i++) {
         if (KC.pipe[i]) vkDestroyPipeline(KC.dev, KC.pipe[i], NULL);

@@ -219,8 +219,8 @@ static void test_chunk_rows(void) {
 
 /* ---- attention ---------------------------------------------------------------------- */
 static void test_attn_hk(int S, int pos_base, int H, int KVH, int hd, int use_list) {
-    int cap = 300, gsz = hd, qseg = hd + gsz, koff = 64;
     int T = pos_base + S;
+    int cap = T > 300 ? T : 300, gsz = hd, qseg = hd + gsz, koff = 64;
     size_t kn = (size_t)koff + (size_t)KVH * cap * hd;
     float *q = fvec((size_t)S * H * qseg, 1.f), *kc = fvec(kn, 1.f), *vc = fvec(kn, 1.f);
     float scale = 1.f / sqrtf((float)hd);
@@ -268,6 +268,27 @@ static void test_attn_hk(int S, int pos_base, int H, int KVH, int hd, int use_li
     free(q); free(kc); free(vc); free(sel); free(ref);
 }
 static void test_attn(int S, int pos_base, int hd, int use_list) { test_attn_hk(S, pos_base, 4, 2, hd, use_list); }
+/* A verify's rows through the decode attention (chain_attn_dec, split over positions):
+ * row s of an S-row call must carry the bits of a one-row call at position pos_base + s. */
+static void test_attn_rows(int S, int pos_base, int H, int KVH, int hd) {
+    int T = pos_base + S, cap = T, qseg = 2 * hd, koff = 64;
+    size_t kn = (size_t)koff + (size_t)KVH * cap * hd;
+    float *q = fvec((size_t)S * H * qseg, 1.f), *kc = fvec(kn, 1.f), *vc = fvec(kn, 1.f);
+    VkcBuf *qb = up(q, (size_t)S * H * qseg), *kb = up(kc, kn), *vb = up(vc, kn);
+    VkcBuf *ob = vkc_buf((size_t)S * H * hd * 4, VKC_DOWN), *o1 = vkc_buf((size_t)H * hd * 4, VKC_DOWN);
+    VkcAttn p = {S, H, KVH, hd, pos_base, cap, 0, H * qseg, qseg, hd, H * qseg, qseg, 1, 0, H * hd, 0, 0,
+                 1.f / sqrtf((float)hd), koff, koff};
+    vkc_begin(); int ok = vkc_attn(qb, kb, vb, ob, qb, NULL, &p); vkc_submit(1);
+    int same = 1;
+    for (int r = 0; r < S && ok; r++) {
+        VkcAttn p1 = p; p1.S = 1; p1.pos_base = pos_base + r; p1.q_off = r * H * qseg; p1.g_off = r * H * qseg + hd;
+        vkc_begin(); ok = vkc_attn(qb, kb, vb, o1, qb, NULL, &p1); vkc_submit(1);
+        if (memcmp((float *)vkc_ptr(ob) + (size_t)r * H * hd, vkc_ptr(o1), (size_t)H * hd * sizeof(float))) same = 0;
+    }
+    CHECK(ok && same, "attn rows S %d pos %d H %d/%d hd %d: a verify row's bits = a decode step's", S, pos_base, H, KVH, hd);
+    vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(ob); vkc_free(o1);
+    free(q); free(kc); free(vc);
+}
 
 /* MiMo's attention (vkc_attn_w): row s at pos = pos_base + s sees the positions
  * max(0, pos - win + 1)..pos (win 0: from 0); position t sits in row t % ring of the
@@ -2525,6 +2546,10 @@ int main(int argc, char **argv) {
     test_rope();
     test_chunk_rows();
     test_attn(1, 0, 16, 0); test_attn(1, 140, 32, 0); test_attn(5, 200, 64, 0); test_attn(6, 9, 256, 1); test_attn(130, 3, 24, 0);
+    /* Qwen3.6's heads through the decode attention: few splits, many splits, tiles of
+     * 64 positions inside a split; then a verify's rows against one-row calls */
+    test_attn_hk(1, 300, 16, 2, 256, 0); test_attn_hk(4, 1000, 16, 2, 256, 0); test_attn_hk(2, 5000, 16, 2, 256, 0);
+    test_attn_rows(4, 1000, 16, 2, 256); test_attn_rows(3, 61, 16, 2, 256); test_attn_rows(5, 4093, 16, 2, 256);
     /* prompt chunks on the matrix units where the device has them (chain_attn_flash, from
      * 16 rows): Qwen3.6's heads (hd 256, 8 query heads per kv head) from position 0 and
      * after earlier rows, a chunk over several 64-key blocks with a partial last token

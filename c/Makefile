@@ -738,6 +738,8 @@ VK_SPV   += shaders/chain_gemm.spv
 # the KV cache split between the device and the host past the device's budget
 # (vk_chain.h: vkc_kvs_*; vk_kvsplit.h)
 VK_SPV   += shaders/chain_kvs.spv
+# split-K attention for a decode step and a verify's rows (vk_chain.c, chain_attn_dec*.comp)
+VK_SPV   += shaders/chain_attn_dec.spv shaders/chain_attn_dec2.spv
 # the decision engines' encoders (laya, gliner_decide): bidirectional attention over row
 # ranges with DeBERTa's relative terms, LayerNorm, GeGLU, RoPE (made on first use)
 VK_SPV   += shaders/chain_enc.spv
