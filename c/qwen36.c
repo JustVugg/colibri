@@ -5206,26 +5206,7 @@ static void serve_data(const char *id, const char *p, int n){
     fwrite(p,1,(size_t)n,stdout); fputc('\n',stdout); fflush(stdout);
 }
 
-/* temperature + top-p sampler (ported from kimi_k3.c; vocab ~250k -> qsort O(V log V) per token) */
-typedef struct { float p; int id; } SampleProb;
-static int sample_prob_desc(const void *a, const void *b){
-    float pa=((const SampleProb*)a)->p, pb=((const SampleProb*)b)->p;
-    return (pb>pa)-(pa>pb);
-}
-static int serve_sample(const float *lo, int V, float temp, float top_p){
-    if(temp<=0.f){ int b=0; for(int i=1;i<V;i++) if(lo[i]>lo[b]) b=i; return b; }
-    SampleProb *rank=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
-    if(!rank){ fprintf(stderr,"OOM sampling\n"); exit(1); }
-    for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
-    double sum=0;
-    for(int i=0;i<V;i++){ float p=expf((lo[i]-mx)/temp); sum+=p; rank[i]=(SampleProb){p,i}; }
-    qsort(rank,(size_t)V,sizeof(SampleProb),sample_prob_desc);
-    double cut=(top_p>0.f&&top_p<1.f)?top_p*sum:sum, kept=0; int n=0;
-    while(n<V&&kept<cut) kept+=rank[n++].p;
-    double r=((double)rand()/RAND_MAX)*kept, acc=0; int pick=rank[0].id;
-    for(int i=0;i<n;i++){ acc+=rank[i].p; if(acc>=r){ pick=rank[i].id; break; } }
-    free(rank); return pick;
-}
+#include "qwen36_sample.h"
 
 /* Chat turns end on <|im_end|>, base completions on <|endoftext|>. Resolve
  * both ids from the tokenizer's added_tokens: Qwen3.6's 248320-token vocab
