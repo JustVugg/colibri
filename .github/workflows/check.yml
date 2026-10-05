@@ -42,7 +42,12 @@ jobs:
     # limit and reported as failures), including one on dev itself. The suite
     # has grown - segment conformance and adapters, the edge runtime, per-engine
     # cache indices - and MinGW is the slowest toolchain we build on.
-    timeout-minutes: 35
+    # 2026-10-05: the 35 minutes set then were reached in turn. Over the last
+    # two days the job took 21 to 34 minutes when it passed, and was cancelled
+    # at 35 three times with every test passed so far (#1907, #1911 and a dev
+    # run), after #1901 added its suites. 60 leaves room for the suites still
+    # coming; a real hang still ends the job.
+    timeout-minutes: 60
     defaults:
       run:
         shell: msys2 {0}
