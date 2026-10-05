@@ -134,7 +134,6 @@ family_staged() {
   tail -1 vk_chain.log | grep -qx PASS || { cat vk_chain.log vk_chain.err; fail "staged chain ops"; }
   staged_check vk_chain.err "staged chain ops"
   echo "OK staged chain ops: $(grep -o 'resident data in host memory: .*' vk_chain.err)"
-  staged_import
 }
 # imported_copies <log>: the copies the exit report says came straight from host memory
 imported_copies() { sed -n 's/.* MiB of them straight from host memory in \([0-9]*\) copies.*/\1/p' "$1" | tail -1; }
@@ -188,6 +187,7 @@ staged_window() {
   chain_gate qwen36 "window qwen36 chain" 1 COLI_VK_HOST_VISIBLE_CAP_MB=246 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   staged_check vk.log "window qwen36 chain"
   echo "OK window qwen36: staged on its own, $(grep -o 'resident data in host memory: .*' vk.log)"
+  staged_import   # here: the engine's fixture needs the fixture dependencies, which staged's job has not
 }
 
 # Staged uploads failing (COLI_VK_STAGED_FAULT=<point>[:n], the n-th time) at every point
