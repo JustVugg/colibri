@@ -546,12 +546,15 @@ static int gemm_pipeline(VkGemmTile t, int slot) {
     return 1;
 }
 
+/* qmatmul_coop.comp's EST: floats per epilogue row of its accumulator staging (a
+ * multiple of 4 floats, so coopMatStore's stride is 16-byte aligned; #1908). */
+#define VK_COOP_EST 20
 /* Subgroups of exactly G.coop_sg lanes; BK a multiple of 32 (group sizes are). */
 static int coop_tile_ok(VkCoopTile t, const VkPhysicalDeviceLimits *lim) {
     if (t.wm < 16 || t.wn < 16 || t.wm % 16 || t.wn % 16 || t.bm % t.wm || t.bn % t.wn ||
         t.bk < 32 || t.bk % 32 || G.coop_sg < 16 || 256 % G.coop_sg) return 0;
     long nw = (long)(t.bm / t.wm) * (t.bn / t.wn), threads = nw * G.coop_sg;
-    long lds = (long)(t.bm + 2 * t.bn) * (t.bk + 8) * 2 + (long)t.bm * 4 + nw * 16 * 17 * 4;
+    long lds = (long)(t.bm + 2 * t.bn) * (t.bk + 8) * 2 + (long)t.bm * 4 + nw * 16 * VK_COOP_EST * 4;
     return threads <= (long)lim->maxComputeWorkGroupInvocations &&
            threads <= (long)lim->maxComputeWorkGroupSize[0] && lds <= (long)lim->maxComputeSharedMemorySize;
 }
@@ -619,9 +622,18 @@ int coli_vk_init(const char *spv_path) {
     vkEnumeratePhysicalDevices(G.inst, &nd, devs);
     // Prefer a real GPU over a CPU/software device (llvmpipe) on multi-adapter hosts:
     // discrete > integrated > virtual > other/cpu. Falls back to devs[0] if all equal.
+    // COLI_VK_DEV=<index> takes that entry of the enumeration instead (the order
+    // vulkaninfo lists as GPU0, GPU1, ...): with two discrete GPUs the ranking always
+    // took the first one (#1908). Out of range or not a number: a line, then the ranking.
     G.phys = devs[0];
-    int bestrank = -1;
-    for (uint32_t i = 0; i < nd; i++) {
+    int bestrank = -1, forced = 0;
+    const char *dv = getenv("COLI_VK_DEV");
+    if (dv && *dv) {
+        char *end = NULL; long k = strtol(dv, &end, 10);
+        if (end != dv && *end == 0 && k >= 0 && k < (long)nd) { G.phys = devs[k]; forced = 1; }
+        else fprintf(stderr, "[VK] COLI_VK_DEV=%s ignored: %u device%s, numbered from 0\n", dv, nd, nd == 1 ? "" : "s");
+    }
+    for (uint32_t i = 0; i < nd && !forced; i++) {
         VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(devs[i], &p);
         int rank = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU   ? 4 :
                    p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 3 :
@@ -3125,7 +3137,7 @@ static void xb_coop_init(void) {
         VkCoopTile t = G.coop_t[k];
         int nw = (t.bm / t.wm) * (t.bn / t.wn), nt = nw * G.coop_sg;
         size_t shared = (size_t)(t.bm + 2 * t.bn) * (t.bk + 8) * 2 +
-                        (size_t)t.bm * 4 + (size_t)nw * 16 * 17 * 4 + (size_t)(nt + t.bn) * 4;
+                        (size_t)t.bm * 4 + (size_t)nw * 16 * VK_COOP_EST * 4 + (size_t)(nt + t.bn) * 4;
         if (shared > pp.limits.maxComputeSharedMemorySize || nt % (nt < t.bn ? 1 : nt / t.bn)) continue;
         int32_t sv[8] = {t.bm, t.bn, t.wm, t.wn, t.bk, G.coop_sg, nt, 1};
         VkSpecializationMapEntry me[8];

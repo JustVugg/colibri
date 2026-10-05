@@ -51,7 +51,12 @@ const int FM = WM / 16, FN = WN / 16;  // 16 x 16 accumulators per subgroup
 const int NW = (BM / WM) * (BN / WN);  // subgroups
 const int NT = NW * SG;
 const int WST = BK + 8;                // halves per staged row, 16 bytes of padding
-const int EST = 17;                    // floats per epilogue row: odd, no bank conflicts
+// floats per epilogue row. coopMatStore's stride must be a multiple of 16 bytes here
+// (VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986: the lesser of 16 bytes and a
+// row's natural alignment, 64 bytes for 16 floats). The odd 17 it was broke that rule:
+// RADV took it, NVIDIA's driver returned garbage (black Qwen-Image pictures, #1908).
+// 20 (80 bytes) keeps the rows of a store off the same banks for 8 rows in a row.
+const int EST = 20;
 shared float16_t wsh[BM * WST];        // [o][i]: the MMA's A, row-major
 shared float16_t xhs[BN * WST];        // [s][i]: its B, column-major; hi part
 shared float16_t xls[BN * WST];        //                              lo part
