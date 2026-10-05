@@ -368,7 +368,8 @@ alternating.
 In a `VK=1` build, `COLI_VULKAN=1` puts the trunk on the Vulkan device (as before)
 and the routed experts of the model's layers on the shared Vulkan expert tier
 (`c/vk_tier.c`, [vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc)): a cache of
-experts in device memory, filled at startup from `.coli_usage` and adapted while
+experts in device memory, filled at startup from `.coli_usage` (`coli setup` ships a
+starting one) and adapted while
 you chat, whose experts the device computes while the CPU computes the rest of the
 step. It takes every expert form this engine reads: the int4-g64 sidecar's planar
 records (as int4 groups of 64 on the device), the release's FP8 with the 128x128

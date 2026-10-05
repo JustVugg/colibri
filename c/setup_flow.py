@@ -888,6 +888,35 @@ def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
     return {"launcher_dir": runtime, "engine": engine, "backend": "cpu", "source": f"release {tag}"}
 
 
+# Starting expert histories, one per catalog model that has one (profiles/<id>.coli_usage).
+PROFILES_DIR = os.path.join(HERE, "profiles")
+
+
+def seed_expert_profile(entry, model_dir, out=print):
+    """Give a model with no expert history yet the one that ships for it.
+
+    Every engine with an expert tier or pins reads <model>/.coli_usage at start
+    (route_trace.h): the experts it routed to before, which the GPU's expert
+    tier (and PIN=auto's RAM pins) fill first. A fresh install has none, so its
+    first runs start cold. profiles/<id>.coli_usage is that history from a
+    calibration session (chat in several languages, code, reasoning, JSON),
+    copied in when the model has none. It is only a starting point: the engine
+    adds every run's routing to it and saves it back, so a user's own history
+    takes over as they use the model. An existing history is never replaced.
+    Returns True when one was copied."""
+    if entry is None or not model_dir:
+        return False
+    src = os.path.join(PROFILES_DIR, f"{entry.id}.coli_usage")
+    dst = os.path.join(model_dir, ".coli_usage")
+    if not os.path.isfile(src) or os.path.exists(dst) or not os.path.isdir(model_dir):
+        return False
+    try:
+        shutil.copyfile(src, dst)
+    except OSError:
+        return False
+    out(f"  expert profile: a starting history for {entry.name} (the experts its GPU tier "
+        "loads first); your own use extends it")
+    return True
 # What the toolchain needs to build each kind of engine (toolchain()).
 CAN_BUILD = {"cpu": "can_build", "vulkan": "can_build_vulkan", "cuda": "can_build_cuda"}
 
@@ -1632,6 +1661,11 @@ def cmd_setup(a, ui=None):
             ui.say("The GPU packages are installed now: rebuilding the engine for the GPU.\n")
         else:
             ui.say(f"Already set up: {describe_existing(cfg)}")
+            try:
+                seeded = setup_catalog.by_id((cfg.get("model") or {}).get("id"))
+            except KeyError:
+                seeded = None      # a model given by folder: no catalog entry, no profile
+            seed_expert_profile(seeded, cfg.get("model_dir"), out=ui.say)
             refresh_configured(cfg, out=ui.say)
             return _finish(ui, cfg, a)
     # A setup that stopped half way (pending), or a finished one whose engine or
@@ -1725,6 +1759,7 @@ def cmd_setup(a, ui=None):
                    "interrupt, rerun to continue")
             download_model(ui, entry, model_dir, via_windows=a.via_windows, verify=not a.no_verify)
         run_post_install(entry, engine_info["launcher_dir"], model_dir, ui)
+        seed_expert_profile(entry, model_dir, out=ui.say)
 
     if not web_dist_dir(engine_info["launcher_dir"]):
         ensure_web_dist(engine_info["launcher_dir"], current_version(), out=ui.say)

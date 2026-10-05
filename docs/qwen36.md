@@ -95,7 +95,8 @@ trunk on the CPU anywhere and `COLI_VK_DENSE=1` puts it on the device anywhere;
 
 This engine kept no expert history before; with the tier on it keeps route_trace.h's
 `.coli_usage` beside the container (`COLI_USAGE` moves it), saved at the end of
-every run and serve turn, and fills the tier from it at the next start. With
+every run and serve turn, and fills the tier from it at the next start. `coli
+setup` gives Qwen3.6-35B-A3B a starting one ([vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc)). With
 `COLI_CUDA=1` as well, the CUDA tier wins.
 
 On an integrated Radeon 780M, with the int4 gs64 container at cap 64 and the trunk

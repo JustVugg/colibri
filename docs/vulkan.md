@@ -396,6 +396,17 @@ of them on the device the way a GPU-equipped PC should use its card:
   than 1.25 x their heat + 4). A promotion copies the expert's bytes once on the engine thread
   (at most `COLI_VK_TIER_RATE` per token, 16) and an uploader thread writes it to
   the device; it serves from the next layer step on.
+- **A fresh install starts warm.** A model downloaded a minute ago has no history,
+  so its first runs would fill the tier one routing at a time. `coli setup` copies a
+  starting history into the model folder when it has none, for the catalog models
+  that ship one (`c/profiles/<catalog id>.coli_usage`: Qwen3.6-35B-A3B and Qwen3.8
+  Flash Next). It comes from a calibration session (16 prompts: chat in five
+  languages, code, reasoning, JSON), and the engine adds every run's routing to it,
+  so your own use takes over; an existing history is never replaced. Measured on a
+  Radeon 780M with Qwen3.6-35B-A3B, two prompts outside the calibration set, 128
+  tokens, two rounds each: the first run went from 5.9-6.2 tok/s without it to
+  10.9-11.1 with it, the device serving 92-94% of the routed experts instead of
+  15-16%, for a warm start of about 3 s.
 - **The device and the CPU compute at the same time.** For each MoE layer step the
   routed (row, expert) pairs whose expert is resident go to the device as ONE
   submit that nobody waits for: per expert, its rows run gate+up and the activation

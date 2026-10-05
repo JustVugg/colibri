@@ -919,6 +919,32 @@ class WholeSetup(HomeTestCase):
         self.assertIn("rebuilt: the sources changed since the last build", text)
         self.assertIn(b"pulled sources", engine.read_bytes())
 
+    def test_a_fresh_install_gets_the_shipped_expert_profile(self):
+        # profiles/<id>.coli_usage is copied into a model that has no history yet,
+        # never over one it has, and a model without a profile gets nothing.
+        profiles = Path(self.tmp.name, "profiles")
+        profiles.mkdir()
+        Path(profiles, "tiny.coli_usage").write_text("-1 2 4\n-2 1 7\n0 1 3\n")
+        with mock.patch.object(setup_flow, "PROFILES_DIR", str(profiles)):
+            code, text = self.run_setup(pick="tiny")
+            self.assertEqual(code, 0, text)
+            history = Path(self.models, "tiny", ".coli_usage")
+            self.assertEqual(history.read_text(), "-1 2 4\n-2 1 7\n0 1 3\n")
+            self.assertIn("expert profile: a starting history for Tiny test model", text)
+            history.write_text("-1 2 4\n-2 1 7\n1 0 9\n")           # the user's own use since
+            code, text = self.run_setup()
+            self.assertEqual(code, 0, text)
+            self.assertEqual(history.read_text(), "-1 2 4\n-2 1 7\n1 0 9\n")
+            self.assertNotIn("expert profile", text)
+            history.unlink()                                          # a rerun seeds a model left without one
+            code, text = self.run_setup()
+            self.assertIn("expert profile", text)
+            self.assertTrue(history.is_file())
+        history.unlink()
+        with mock.patch.object(setup_flow, "PROFILES_DIR", str(Path(self.tmp.name, "none"))):
+            code, text = self.run_setup()
+        self.assertFalse(history.exists())
+
     def test_interrupted_download_continues_on_rerun(self):
         real = setup_download.download_repo
         self.hub.cut_after["model-00000.safetensors"] = 150_000
