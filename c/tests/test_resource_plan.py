@@ -1574,6 +1574,202 @@ memInfo.free:                     23.50 GB (97%)
         self.assertEqual(plan["next_actions"][0]["id"], "measure-kernels")
 
 
+class VulkanPartialChainTest(unittest.TestCase):
+    """The partial chain (docs/vulkan.md, "A partial chain"): resource_plan.vk_chain_fit
+    predicts the engine's N with vkc_fit's rule from the device's budget, and the plan
+    credits only the N layers' host copies."""
+
+    CONFIG = {
+        "architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4",
+        "hidden_size": 128, "num_attention_heads": 4, "num_key_value_heads": 1, "head_dim": 32,
+        "q_lora_rank": 128, "qk_rope_head_dim": 16, "o_groups": 1, "o_lora_rank": 128,
+        "sliding_window": 8, "index_n_heads": 2, "index_head_dim": 32, "index_topk": 2,
+        "n_routed_experts": 4, "num_experts_per_tok": 2, "n_shared_experts": 1,
+        "moe_intermediate_size": 128, "num_hash_layers": 1, "num_nextn_predict_layers": 1,
+        "hc_mult": 2, "hc_sinkhorn_iters": 3, "vocab_size": 128, "max_position_embeddings": 128,
+        "rms_norm_eps": 1e-06, "hc_eps": 1e-06, "routed_scaling_factor": 1.5, "swiglu_limit": 10.0,
+        "rope_theta": 10000.0, "compress_rope_theta": 40000.0,
+        "rope_scaling": {"type": "yarn", "factor": 1.0, "original_max_position_embeddings": 128,
+                         "beta_fast": 32, "beta_slow": 1},
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.model = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_v4(self, ratios):
+        """The tiny DeepSeek V4 fixture's geometry (tools/make_deepseek_v4_tiny.py) with
+        len(ratios) layers: every tensor coli_v4_layer_plan names, and its experts."""
+        c = dict(self.CONFIG, num_hidden_layers=len(ratios), compress_ratios=list(ratios) + [0])
+        (self.model / "config.json").write_text(json.dumps(c))
+        width = {"F8_E4M3": 1, "F8_E8M0": 1, "BF16": 2, "F32": 4, "I64": 8, "I8": 1}
+        tensors = []
+
+        def add(name, dtype, *shape):
+            count = 1
+            for n in shape:
+                count *= n
+            tensors.append((name, count * width[dtype], dtype, list(shape)))
+
+        def fp8(name, rows, cols):
+            add(name + ".weight", "F8_E4M3", rows, cols)
+            add(name + ".scale", "F8_E8M0", -(-rows // 128), -(-cols // 128))
+        add("embed.weight", "BF16", 128, 128)
+        add("head.weight", "BF16", 128, 128)
+        add("norm.weight", "BF16", 128)
+        add("hc_head_fn", "F32", 2, 256)
+        for i, r in enumerate(ratios):
+            p = f"layers.{i}."
+            add(p + "attn.attn_sink", "F32", 4)
+            add(p + "attn.kv_norm.weight", "BF16", 32)
+            add(p + "attn.q_norm.weight", "BF16", 128)
+            for name, rows, cols in (("wkv", 32, 128), ("wo_a", 128, 128), ("wo_b", 128, 128),
+                                     ("wq_a", 128, 128), ("wq_b", 128, 128)):
+                fp8(p + "attn." + name, rows, cols)
+            add(p + "attn_norm.weight", "BF16", 128)
+            if r:
+                proj = (2 if r == 4 else 1) * 32
+                add(p + "attn.compressor.ape", "F32", r, proj)
+                add(p + "attn.compressor.norm.weight", "BF16", 32)
+                add(p + "attn.compressor.wgate.weight", "BF16", proj, 128)
+                add(p + "attn.compressor.wkv.weight", "BF16", proj, 128)
+            if r == 4:
+                add(p + "attn.indexer.compressor.ape", "F32", 4, 64)
+                add(p + "attn.indexer.compressor.norm.weight", "BF16", 32)
+                add(p + "attn.indexer.compressor.wgate.weight", "BF16", 64, 128)
+                add(p + "attn.indexer.compressor.wkv.weight", "BF16", 64, 128)
+                add(p + "attn.indexer.weights_proj.weight", "BF16", 2, 128)
+                fp8(p + "attn.indexer.wq_b", 64, 128)
+            add(p + "ffn.gate.weight", "BF16", 4, 128)
+            if i == 0:
+                add(p + "ffn.gate.tid2eid", "I64", 128, 2)
+            else:
+                add(p + "ffn.gate.bias", "F32", 4)
+            for name in ("w1", "w2", "w3"):
+                fp8(p + "ffn.shared_experts." + name, 128, 128)
+            add(p + "ffn_norm.weight", "BF16", 128)
+            for site in ("attn", "ffn"):
+                add(p + f"hc_{site}_base", "F32", 8)
+                add(p + f"hc_{site}_fn", "F32", 8, 256)
+                add(p + f"hc_{site}_scale", "F32", 3)
+            for e in range(4):
+                for name in ("w1", "w2", "w3"):
+                    add(p + f"ffn.experts.{e}.{name}.scale", "F8_E8M0", 128, 4)
+                    add(p + f"ffn.experts.{e}.{name}.weight", "I8", 128, 64)
+        write_shard(self.model / "model.safetensors", tensors)
+        return analyze_model(self.model)
+
+    def test_deepseek_v4_layout_is_the_engines(self):
+        # The numbers the engine printed for tools/make_deepseek_v4_tiny.py's fixture on
+        # Lavapipe ("[VK] deepseek_v4 chain fit: ... the engine's 1891840 B ..., layers
+        # 159720 278760 192104 B"): the same per-layer bytes and fixed bytes here.
+        from resource_plan import vk_chain_fit, vk_fit_pools
+        info = self.write_v4([0, 4, 8])
+        env = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"}
+        fit = vk_chain_fit(info, "deepseek_v4", env, {"type": "cpu", "budget_bytes": 64 * GB})
+        self.assertEqual(fit["layers"], [159720, 278760, 192104])
+        self.assertEqual(fit["fixed"] - vk_fit_pools(0), 1891840)
+        self.assertEqual(fit["n"], 3)
+        # COLI_VK_CHAIN_ROWS lowers the chunk the fit counts (the window rings, the scratch)
+        small = vk_chain_fit(info, "deepseek_v4", dict(env, COLI_VK_CHAIN_ROWS="3"), {"type": "cpu", "budget_bytes": 64 * GB})
+        self.assertLess(small["fixed"], fit["fixed"])
+        self.assertTrue(all(a < b for a, b in zip(small["layers"], fit["layers"])))
+
+    def test_n_follows_the_engines_rule(self):
+        from resource_plan import VkChainLayout, vk_chain_fit, vk_fit_pools
+        MiB, GiB = 1 << 20, 1 << 30
+        layout = VkChainLayout([100 * MiB, 200 * MiB, 300 * MiB, 400 * MiB], 50 * MiB, 70 * MiB)
+        on = {"COLI_VULKAN": "1"}
+        pools = vk_fit_pools(0)
+        fixed = 50 * MiB + pools
+        with mock.patch.dict("resource_plan._VK_CHAIN_LAYOUT", {"deepseek_v4": lambda info, env, vk: layout}):
+            def fit(free, env=on, kind="discrete", heaps=()):
+                return vk_chain_fit({}, "deepseek_v4", env, {"type": kind, "budget_bytes": free,
+                                                             "heaps": list(heaps)})
+            room = GiB + fixed   # free = reserve + fixed + what the layers may take
+            self.assertEqual((fit(room + 1000 * MiB + 70 * MiB)["n"], fit(room + 1000 * MiB + 70 * MiB)["tail"]), (4, True))
+            self.assertEqual((fit(room + 1000 * MiB)["n"], fit(room + 1000 * MiB)["tail"]), (4, False))
+            self.assertEqual(fit(room + 1000 * MiB - 1)["n"], 3)
+            self.assertEqual(fit(room + 600 * MiB)["n"], 3)
+            self.assertEqual(fit(room + 300 * MiB - 1)["n"], 1)
+            self.assertEqual(fit(room + 99 * MiB)["n"], 0)
+            self.assertEqual(fit(GiB // 2)["n"], 0)
+            # the heaps' usage is taken off the budget, as coli_vk_free_bytes does
+            self.assertEqual(fit(room + 600 * MiB, heaps=[{"device_local": True, "usage": 300 * MiB}])["n"], 2)
+            # the reserve is COLI_VK_TIER_RESERVE_GB
+            self.assertEqual(fit(fixed + 600 * MiB, dict(on, COLI_VK_TIER_RESERVE_GB="0"))["n"], 3)
+            # COLI_VK_CHAIN_LAYERS forces N, capped at L; the tail goes up with every layer
+            for want, n, tail in (("2", 2, False), ("0", 0, False), ("9", 4, True), ("auto", 3, False)):
+                got = fit(room + 600 * MiB, dict(on, COLI_VK_CHAIN_LAYERS=want))
+                self.assertEqual((got["n"], got["tail"], got["forced"]), (n, tail, want != "auto"))
+            # COLI_VK_DEVICE_CAP_MB: the device is the cap, with small pool blocks
+            cap = 2 * GiB
+            capped = fit(64 * GiB, dict(on, COLI_VK_DEVICE_CAP_MB=str(cap // MiB)))
+            self.assertEqual(capped["free"], cap)
+            self.assertLess(capped["fixed"], fixed)
+            self.assertEqual(capped["n"], 3)
+            # no chain, no fit: the plan as before
+            self.assertIsNone(fit(64 * GiB, dict(on, COLI_VK_CHAIN="0")))
+            self.assertIsNone(fit(64 * GiB, {}))
+
+    def test_device_only_credits_the_layers_on_the_device(self):
+        from resource_plan import vk_chain_fit, vk_fit_pools
+        info = self.write_v4([0, 4, 8, 0, 0, 4])
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "COLI_VK_DENSE_HOST": "0",
+              "COLI_VK_TIER_RESERVE_GB": "0"}
+        layers = vk_chain_fit(info, "deepseek_v4", on, {"type": "discrete", "budget_bytes": 64 * GB})["layers"]
+        # what the device can drop for the first k layers: fp8 matrices and the compressors'
+        # bf16 projections (coli_v4_dense_device_only_tensor)
+        def droppable(k):
+            total = 0
+            for t in info["dense_tensors"]:
+                parts = t["name"].split(".")
+                if parts[0] != "layers" or int(parts[1]) >= k or len(t["shape"]) != 2:
+                    continue
+                if t["dtype"] == "F8_E4M3" or (t["dtype"] == "BF16" and t["name"].endswith(
+                        ("compressor.wkv.weight", "compressor.wgate.weight"))):
+                    total += t["size"]
+            return total
+        full = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": 64 * GB}, **kwargs)
+        self.assertEqual(full["tiers"]["ram"]["dense_on_device_bytes"], droppable(6))
+        self.assertEqual(full["tiers"]["ram"]["vk_chain_layers"]["on_device"], 6)
+        for k in (1, 3, 5):
+            free = vk_fit_pools(0) + vk_chain_fit(info, "deepseek_v4", on, {"type": "discrete", "budget_bytes": 64 * GB})["fixed"] \
+                - vk_fit_pools(0) + sum(layers[:k]) + layers[k] // 2
+            device = {"type": "discrete", "budget_bytes": free}
+            with self.subTest(k=k):
+                plan = build_plan(self.model, env=on, vulkan=device, **kwargs)
+                ram = plan["tiers"]["ram"]
+                self.assertEqual(ram["vk_chain_layers"]["on_device"], k)
+                self.assertEqual(ram["dense_on_device_bytes"], droppable(k))
+                self.assertEqual(full["tiers"]["ram"]["dense_bytes"] + droppable(6) - droppable(k), ram["dense_bytes"])
+                self.assertIn(f"the first {k} of 6 layers", format_plan(plan))
+                # forced, the same credit
+                forced = build_plan(self.model, env=dict(on, COLI_VK_CHAIN_LAYERS=str(k)),
+                                    vulkan={"type": "discrete", "budget_bytes": 64 * GB}, **kwargs)
+                self.assertEqual(forced["tiers"]["ram"]["dense_on_device_bytes"], droppable(k))
+        # no layer fits: nothing on the device, the host copies stay
+        none = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": 1 << 20}, **kwargs)
+        self.assertEqual(none["tiers"]["ram"]["dense_on_device_bytes"], 0)
+        self.assertEqual(none["tiers"]["ram"]["vk_chain_layers"]["on_device"], 0)
+        # host copies kept: no credit whatever N
+        kept = build_plan(self.model, env=dict(on, COLI_VK_DENSE_HOST="1", COLI_VK_CHAIN_LAYERS="3"),
+                          vulkan={"type": "discrete", "budget_bytes": 64 * GB}, **kwargs)
+        self.assertEqual(kept["tiers"]["ram"]["dense_on_device_bytes"], 0)
+        # an integrated GPU's device copy (physical RAM, priced once) is the N layers' alone
+        igpu = {"type": "integrated", "budget_bytes": 64 * GB}
+        two = build_plan(self.model, env=dict(on, COLI_VK_CHAIN_LAYERS="2"), vulkan=igpu, **kwargs)["tiers"]["ram"]
+        every = build_plan(self.model, env=on, vulkan=igpu, **kwargs)["tiers"]["ram"]
+        self.assertEqual(two["dense_on_device_bytes"], droppable(2))
+        self.assertEqual(every["dense_on_device_bytes"], droppable(6))
+        self.assertGreaterEqual(two["shared_device_dense_bytes"], droppable(2))
+        self.assertLess(two["shared_device_dense_bytes"], every["shared_device_dense_bytes"])
+
+
 class PhysicalCpuCountTest(unittest.TestCase):
     """Regression for #325: --auto-tier pinned decode to one core because
     physical_cpu_count() silently returned 1.

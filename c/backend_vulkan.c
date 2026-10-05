@@ -24,6 +24,128 @@ static double vk_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &
 #define VKCHECK(x, what) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "[VK] %s failed: %d\n", what, _r); return 0; } } while (0)
 
+/* ---- device memory books, and COLI_VK_DEVICE_CAP_MB (docs/vulkan.md, "A partial chain") --
+ * Every device memory allocation of the process goes through vk_mem_alloc / vk_mem_free
+ * (the macros below rename the Vulkan calls in this file; vk_chain.c reaches them through
+ * coli_vk_mem_alloc / coli_vk_mem_free): the bytes in a device-local heap are counted per
+ * device (0 = G, 1 = G2). COLI_VK_DEVICE_CAP_MB=n (tests; a fraction is taken) makes a
+ * device hold at most n MiB of them: an allocation past it fails as
+ * VK_ERROR_OUT_OF_DEVICE_MEMORY, as a full card's does, and the budget the engines read
+ * (coli_vk_mem_budget, _budget2, coli_vk_free_bytes, coli_vk_device_local_bytes, the
+ * expert batch's heap room) is the cap and those bytes. So Lavapipe behaves like a small
+ * card. Host memory imported in place (coli_vk_tensor_import) is the host's and is not
+ * counted. Under the cap the pools take small blocks (coli_vk_block_bytes) so that their
+ * granularity does not decide what fits. */
+typedef struct { uint64_t key, bytes; int dev; } VkMemRec;
+static struct {
+    pthread_mutex_t mx;
+    VkDevice dev[2];
+    uint32_t dl_types[2];          /* memory types whose heap is device-local */
+    uint64_t cap[2], used[2], peak[2];
+    unsigned long long refused[2];
+    VkMemRec *rec; size_t nrec, crec;
+} g_mem = {.mx = PTHREAD_MUTEX_INITIALIZER};
+static uint64_t vk_mem_key(VkDeviceMemory m) { uint64_t k = 0; memcpy(&k, &m, sizeof m); return k; }
+static int vk_mem_dev(VkDevice d) { return d && d == g_mem.dev[1] ? 1 : 0; }
+static int vk_mem_imported(const VkMemoryAllocateInfo *ai) {
+    for (const VkBaseInStructure *p = ai->pNext; p; p = p->pNext)
+        if (p->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT) return 1;
+    return 0;
+}
+static VkResult vk_mem_alloc(VkDevice d, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *cb,
+                             VkDeviceMemory *m) {
+    int k = vk_mem_dev(d);
+    int counted = ai->memoryTypeIndex < 32 && (g_mem.dl_types[k] >> ai->memoryTypeIndex & 1u) && !vk_mem_imported(ai);
+    uint64_t n = ai->allocationSize;
+    if (counted) {
+        pthread_mutex_lock(&g_mem.mx);
+        if (g_mem.cap[k] && g_mem.used[k] + n > g_mem.cap[k]) {
+            g_mem.refused[k]++;
+            pthread_mutex_unlock(&g_mem.mx);
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+        g_mem.used[k] += n;
+        if (g_mem.used[k] > g_mem.peak[k]) g_mem.peak[k] = g_mem.used[k];
+        pthread_mutex_unlock(&g_mem.mx);
+    }
+    VkResult r = vkAllocateMemory(d, ai, cb, m);
+    if (!counted) return r;
+    pthread_mutex_lock(&g_mem.mx);
+    if (r != VK_SUCCESS) g_mem.used[k] -= n;
+    else {
+        if (g_mem.nrec == g_mem.crec) {
+            size_t c = g_mem.crec ? 2 * g_mem.crec : 256;
+            VkMemRec *nr = realloc(g_mem.rec, c * sizeof *nr);
+            if (nr) { g_mem.rec = nr; g_mem.crec = c; }
+        }
+        if (g_mem.nrec < g_mem.crec) g_mem.rec[g_mem.nrec++] = (VkMemRec){vk_mem_key(*m), n, k};
+    }
+    pthread_mutex_unlock(&g_mem.mx);
+    return r;
+}
+static void vk_mem_free(VkDevice d, VkDeviceMemory m, const VkAllocationCallbacks *cb) {
+    if (m != VK_NULL_HANDLE) {
+        uint64_t key = vk_mem_key(m);
+        int k = vk_mem_dev(d);
+        pthread_mutex_lock(&g_mem.mx);
+        for (size_t i = g_mem.nrec; i-- > 0;)
+            if (g_mem.rec[i].key == key && g_mem.rec[i].dev == k) {
+                g_mem.used[k] -= g_mem.rec[i].bytes;
+                g_mem.rec[i] = g_mem.rec[--g_mem.nrec];
+                break;
+            }
+        pthread_mutex_unlock(&g_mem.mx);
+    }
+    vkFreeMemory(d, m, cb);
+}
+#define vkAllocateMemory vk_mem_alloc
+#define vkFreeMemory vk_mem_free
+/* A device just created: which of its memory types count, and the cap. */
+static void vk_mem_device(int k, VkPhysicalDevice phys, VkDevice d) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+    uint32_t mask = 0;
+    for (uint32_t i = 0; i < mp.memoryTypeCount && i < 32; i++)
+        if (mp.memoryHeaps[mp.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) mask |= 1u << i;
+    const char *e = getenv("COLI_VK_DEVICE_CAP_MB");
+    double mb = e && *e ? atof(e) : 0.0;
+    pthread_mutex_lock(&g_mem.mx);
+    g_mem.dev[k] = d; g_mem.dl_types[k] = mask;
+    g_mem.cap[k] = mb > 0 ? (uint64_t)(mb * 1048576.0) : 0;
+    g_mem.used[k] = g_mem.peak[k] = 0; g_mem.refused[k] = 0;
+    pthread_mutex_unlock(&g_mem.mx);
+    if (g_mem.cap[k])
+        fprintf(stderr, "[VK] COLI_VK_DEVICE_CAP_MB=%s: %s takes at most %.3f MiB of device-local memory\n",
+                e, k ? "the second device" : "the device", (double)g_mem.cap[k] / 1048576.0);
+}
+/* The device is gone (shutdown): its books go with it. */
+static void vk_mem_forget(int k) {
+    pthread_mutex_lock(&g_mem.mx);
+    for (size_t i = g_mem.nrec; i-- > 0;)
+        if (g_mem.rec[i].dev == k) g_mem.rec[i] = g_mem.rec[--g_mem.nrec];
+    g_mem.dev[k] = VK_NULL_HANDLE; g_mem.dl_types[k] = 0; g_mem.used[k] = 0;
+    pthread_mutex_unlock(&g_mem.mx);
+}
+static uint64_t vk_mem_room(int k) {   /* lock-free read is enough for a budget */
+    uint64_t c = g_mem.cap[k], u = __atomic_load_n(&g_mem.used[k], __ATOMIC_RELAXED);
+    return c > u ? c - u : 0;
+}
+static void vk_pool_blocks(int k);   /* the weight pools' block size, below */
+size_t coli_vk_device_cap(void) { return (size_t)g_mem.cap[0]; }
+size_t coli_vk_device_used(void) { return (size_t)__atomic_load_n(&g_mem.used[0], __ATOMIC_RELAXED); }
+size_t coli_vk_block_bytes(size_t def) {
+    if (!g_mem.cap[0]) return def;
+    size_t b = (size_t)64 << 10;   /* at most about 4096 blocks fill the cap */
+    while ((uint64_t)b < g_mem.cap[0] / 4096) b <<= 1;
+    return b < def ? b : def;
+}
+int coli_vk_mem_alloc(void *device, const void *info, void *memory) {
+    return (int)vk_mem_alloc((VkDevice)device, (const VkMemoryAllocateInfo *)info, NULL, (VkDeviceMemory *)memory);
+}
+void coli_vk_mem_free(void *device, const void *memory) {
+    vk_mem_free((VkDevice)device, *(const VkDeviceMemory *)memory, NULL);
+}
+
 typedef struct VkWPool VkWPool;
 struct ColiVkTensor {
     VkBuffer wbuf, sbuf;
@@ -103,6 +225,9 @@ static int up_fault(const char *point) {
     fprintf(stderr, "[VK] COLI_VK_STAGED_FAULT: %s #%ld fails\n", point, g_fault_at);
     return 1;
 }
+/* How many times the COLI_VK_STAGED_FAULT point was reached so far (0 when unset). */
+unsigned long long coli_vk_fault_reached(void) { return (unsigned long long)__atomic_load_n(&g_fault_n, __ATOMIC_RELAXED); }
+int coli_vk_fault_set(void) { return g_fault_point[0] != 0; }
 
 typedef struct {
     VkBuffer buf; VkDeviceMemory mem; void *ptr; size_t cap;
@@ -391,6 +516,11 @@ void coli_vk_alloc_priority(float p) { G.prio = p < 0 ? 0 : p > 1 ? 1 : p; }
 /* Device-local heap usage/budget in GB (VK_EXT_memory_budget). Returns 0 when the
  * extension is absent — callers then keep their count-based caps unchanged. */
 int coli_vk_mem_budget(double *used_gb, double *budget_gb) {
+    if (g_mem.cap[0] && G.phys) {   /* COLI_VK_DEVICE_CAP_MB: the cap and this process's bytes */
+        if (used_gb) *used_gb = (double)__atomic_load_n(&g_mem.used[0], __ATOMIC_RELAXED) / 1e9;
+        if (budget_gb) *budget_gb = (double)g_mem.cap[0] / 1e9;
+        return 1;
+    }
 #ifdef VK_EXT_memory_budget
     if (!G.has_budget || !G.phys) return 0;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {
@@ -409,6 +539,17 @@ int coli_vk_mem_budget(double *used_gb, double *budget_gb) {
 #else
     (void)used_gb; (void)budget_gb; return 0;
 #endif
+}
+/* Free device memory now: the cap less what this process holds (COLI_VK_DEVICE_CAP_MB), else
+ * VK_EXT_memory_budget's budget less its usage, else the largest device-local heap less
+ * what this process holds. */
+size_t coli_vk_free_bytes(void) {
+    if (!G.phys) return 0;
+    if (g_mem.cap[0]) return (size_t)vk_mem_room(0);
+    double used = 0, bud = 0;
+    if (coli_vk_mem_budget(&used, &bud)) return bud > used ? (size_t)((bud - used) * 1e9) : 0;
+    size_t dl = coli_vk_device_local_bytes(), u = coli_vk_device_used();
+    return dl > u ? dl - u : 0;
 }
 static int alloc_hostvis(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr) {
     return alloc_hostvis_mt(bytes, buf, mem, ptr, G.memtype);
@@ -819,6 +960,8 @@ int coli_vk_init(const char *spv_path) {
     if (!G.dev)
 #endif
     VKCHECK(vkCreateDevice(G.phys, &di, NULL, &G.dev), "vkCreateDevice");
+    vk_mem_device(0, G.phys, G.dev);   /* the device memory books, and COLI_VK_DEVICE_CAP_MB */
+    vk_pool_blocks(0);
     vkGetDeviceQueue(G.dev, G.qfam, 0, &G.queue);
     vkGetDeviceQueue(G.dev, G.tq_fam, G.tq_idx, &G.tqueue);
     G.tq_shared = G.tqueue == G.queue;
@@ -1050,6 +1193,13 @@ struct VkWPool {
 static VkWPool g_wpool  = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 0, .prio = -1.f, .counted = 1};
 static VkWPool g_tpool  = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 0, .prio = 0.4f};
 static VkWPool g_wpool2 = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 1, .prio = -1.f};
+/* Device k's pools take VK_WBLOCK blocks, smaller ones under COLI_VK_DEVICE_CAP_MB. */
+static void vk_pool_blocks(int k) {
+    size_t bb = VK_WBLOCK;
+    if (g_mem.cap[k]) { bb = (size_t)64 << 10; while ((uint64_t)bb < g_mem.cap[k] / 4096 && bb < VK_WBLOCK) bb <<= 1; }
+    if (k == 0) { g_wpool.p.block_bytes = bb; g_tpool.p.block_bytes = bb; }
+    else g_wpool2.p.block_bytes = bb;
+}
 static VkDevice pool_device(const VkWPool *P);
 static uint32_t pool_memtype(const VkWPool *P);
 static int pool_has_prio(const VkWPool *P);
@@ -1723,6 +1873,17 @@ int coli_vk_dense(void) { return g_dense_on; }
 static int g_dho, g_dho_atexit, g_dho_on_device;
 static char g_dho_engine[32];
 static unsigned long long g_dho_drop_n, g_dho_drop_b, g_dho_load_n, g_dho_load_b;
+static int g_dho_lay_dev, g_dho_lay_all;   /* a partial chain: the first lay_dev of lay_all layers dropped theirs */
+/* " (the n of L layers ...)" for the lines, empty unless the engine said a partial chain */
+static const char *dho_layers_note(char *buf, size_t n, int placed) {
+    buf[0] = 0;
+    if (g_dho_lay_all > 0 && g_dho_lay_dev < g_dho_lay_all) {
+        if (placed) snprintf(buf, n, " (the %d of %d layers on the device; the %d on the CPU keep theirs)",
+                             g_dho_lay_dev, g_dho_lay_all, g_dho_lay_all - g_dho_lay_dev);
+        else snprintf(buf, n, ", the %d of %d layers on the device", g_dho_lay_dev, g_dho_lay_all);
+    }
+    return buf;
+}
 static double dho_gib(unsigned long long b) { return (double)b / 1073741824.0; }
 /* A size for the [VK] lines: GiB from 1 GiB, MiB below (a test fixture's KiB show as 0.0 MiB). */
 static const char *dho_size(unsigned long long b, char *buf, size_t n) {
@@ -1750,10 +1911,11 @@ static void dho_exit_report(void) {
         fprintf(stderr, "[VK] %s: dense weights at exit: on the device and in host RAM%s\n", g_dho_engine, r);
         return;
     }
-    char a[32], b[32];
+    char a[32], b[32], ln[96];
     fprintf(stderr, "[VK] %s: dense weights at exit: %llu matrices on the device only (%s of host copies "
-            "dropped), %llu read back from disk for the CPU (%s)%s\n", g_dho_engine,
+            "dropped%s), %llu read back from disk for the CPU (%s)%s\n", g_dho_engine,
             __atomic_load_n(&g_dho_drop_n, __ATOMIC_RELAXED), dho_size(__atomic_load_n(&g_dho_drop_b, __ATOMIC_RELAXED), a, sizeof a),
+            dho_layers_note(ln, sizeof ln, 0),
             __atomic_load_n(&g_dho_load_n, __ATOMIC_RELAXED), dho_size(__atomic_load_n(&g_dho_load_b, __ATOMIC_RELAXED), b, sizeof b), r);
 }
 static int dho_choice(int dense_on_device, size_t dense_bytes, char *why, size_t n) {
@@ -1812,11 +1974,14 @@ void coli_vk_dense_host_placed(const char *engine, const char *kept) {
     double rss = dho_rss_gib();
     char r[48] = "";
     if (rss >= 0) snprintf(r, sizeof r, "; RSS now %.2f GiB", rss);
-    char a[32];
-    fprintf(stderr, "[VK] %s: %llu dense matrices on the device only, %s of host RAM given back%s%s%s\n",
+    char a[32], ln[96];
+    fprintf(stderr, "[VK] %s: %llu dense matrices on the device only, %s of host RAM given back%s%s%s%s\n",
             engine, __atomic_load_n(&g_dho_drop_n, __ATOMIC_RELAXED),
-            dho_size(__atomic_load_n(&g_dho_drop_b, __ATOMIC_RELAXED), a, sizeof a), kept && *kept ? "; kept on the host: " : "",
-            kept && *kept ? kept : "", r);
+            dho_size(__atomic_load_n(&g_dho_drop_b, __ATOMIC_RELAXED), a, sizeof a), dho_layers_note(ln, sizeof ln, 1),
+            kept && *kept ? "; kept on the host: " : "", kept && *kept ? kept : "", r);
+}
+void coli_vk_dense_host_layers(int on_device, int layers) {
+    g_dho_lay_dev = on_device < 0 ? 0 : on_device; g_dho_lay_all = layers < 0 ? 0 : layers;
 }
 unsigned long long coli_vk_dense_host_dropped_bytes(void) { return __atomic_load_n(&g_dho_drop_b, __ATOMIC_RELAXED); }
 
@@ -2184,6 +2349,8 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
         .enabledExtensionCount = ndext, .ppEnabledExtensionNames = ndext ? dext : NULL};
     VKCHECK(vkCreateDevice(G2.phys, &di, NULL, &G2.dev), "d2 vkCreateDevice");
+    vk_mem_device(1, G2.phys, G2.dev);
+    vk_pool_blocks(1);
     vkGetDeviceQueue(G2.dev, G2.qfam, 0, &G2.queue);
     int mt = pick_memtype(G2.phys);
     if (mt < 0) { fprintf(stderr, "[VK] dev2: no host-visible memory\n"); return 0; }
@@ -2227,6 +2394,11 @@ int coli_vk_dev2_available(void) { return G2.ready; }
 int coli_vk_tensor_dev(const ColiVkTensor *t) { return t ? t->dev : 0; }
 
 int coli_vk_mem_budget2(double *used_gb, double *budget_gb) {
+    if (g_mem.cap[1] && G2.phys) {   /* COLI_VK_DEVICE_CAP_MB, as coli_vk_mem_budget */
+        if (used_gb) *used_gb = (double)__atomic_load_n(&g_mem.used[1], __ATOMIC_RELAXED) / 1e9;
+        if (budget_gb) *budget_gb = (double)g_mem.cap[1] / 1e9;
+        return 1;
+    }
 #ifdef VK_EXT_memory_budget
     if (!G2.has_budget || !G2.phys) return 0;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {
@@ -2897,7 +3069,8 @@ void coli_vk_tier_pool_limit(size_t bytes) {
     pthread_mutex_lock(&g_tpool.mx);
     g_tpool.p.limit = bytes;
     /* blocks no larger than the budget, so a small budget is not one refused block */
-    g_tpool.p.block_bytes = bytes && bytes < VK_WBLOCK ? ((bytes + 4095) & ~(size_t)4095) : VK_WBLOCK;
+    size_t bb = coli_vk_block_bytes(VK_WBLOCK);
+    g_tpool.p.block_bytes = bytes && bytes < bb ? ((bytes + 4095) & ~(size_t)4095) : bb;
     /* the empty block the pool keeps as a spare (vka_free) goes too: a tier started
      * again after a shutdown would otherwise fill it past its new, smaller budget */
     for (int k = 0; k < g_tpool.p.nb; k++)
@@ -2934,6 +3107,7 @@ size_t coli_vk_device_local_bytes(void) {
     VkDeviceSize m = 0;
     for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
         if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > m) m = mp.memoryHeaps[i].size;
+    if (g_mem.cap[0] && g_mem.cap[0] < m) m = g_mem.cap[0];   /* COLI_VK_DEVICE_CAP_MB */
     return (size_t)m;
 }
 const char *coli_vk_device_name(void) {
@@ -3600,6 +3774,8 @@ int coli_vk_xb_sub_fit(int rows, int experts, size_t extra_budget) {
 #ifdef VK_EXT_memory_budget
         if (G.has_budget) room[h] = bud.heapBudget[h] > bud.heapUsage[h] ? (size_t)((bud.heapBudget[h] - bud.heapUsage[h]) / 2) : 0;
 #endif
+        if (g_mem.cap[0] && (mp.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+            room[h] > vk_mem_room(0) / 2) room[h] = (size_t)(vk_mem_room(0) / 2);   /* COLI_VK_DEVICE_CAP_MB */
     }
     uint32_t xheap = mp.memoryProperties.memoryTypes[G.memtype].heapIndex;
     uint32_t iheap = mp.memoryProperties.memoryTypes[G.memtype_dev].heapIndex;
@@ -3800,6 +3976,10 @@ int coli_vk_tensor_refill(ColiVkTensor *t, uint8_t **rows, size_t *stride, float
 }
 int coli_vk_staged(void) { return G.ready && g_up[0].on; }
 size_t coli_vk_tensor_row_bytes(int fmt, int I) { return cpu_row_bytes(fmt, I); }
+size_t coli_vk_tensor_payload(int fmt, int I, int O, int gs) {
+    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) { if (gs < 1) return 0; } else gs = 0;
+    return (size_t)rowwords(fmt, I) * 4 * (size_t)O + scale_floats(fmt, I, O, gs) * sizeof(float);
+}
 size_t coli_vk_buffer_alignment(void) { return G.buf_align ? G.buf_align : 256; }
 size_t coli_vk_tensor_scale_count(int fmt, int I, int O, int gs) { return scale_floats(fmt, I, O, gs); }
 
@@ -3898,6 +4078,8 @@ void coli_vk_shutdown(void) {
     vkDestroyDevice(G.dev, NULL);
     vkDestroyInstance(G.inst, NULL);
     memset(&G, 0, sizeof(G));
+    vk_mem_forget(0);
+    vk_pool_blocks(0);
 }
 
 /* ---- the dense chain's view of the device (vk_chain.c) -------------------------

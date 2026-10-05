@@ -439,6 +439,73 @@ int vkc_chunk_rows(const char *engine, size_t row_bytes);
  * V4_PREFILL_CHUNK) then hands the chain blocks of the chain's chunk; with
  * COLI_VK_CHAIN_ROWS set it keeps its own blocks, as before. */
 int vkc_chunk_auto(void);
+
+/* ---- a partial chain: the first N layers on the device (docs/vulkan.md, "A partial chain")
+ * When the dense layers do not all fit the device, the chain takes a contiguous prefix of
+ * N layers (their matrices, the residual and their state, as for every layer before) and
+ * the CPU runs the other L - N layers and the head; the residual (and an engine's per-token
+ * stream state) moves to the host once per forward, after layer N - 1. N = L is the full
+ * chain; N = 0 is the chain off, nothing uploaded, every byte left to the expert tier.
+ *
+ * vkc_fit decides N at startup, before any upload and before the RAM plan sizes the expert
+ * cache, from the device's free memory (coli_vk_free_bytes) less:
+ *   - the reserve, COLI_VK_TIER_RESERVE_GB (1 GiB): what the tier leaves for scratch, KV
+ *     mirrors and the driver;
+ *   - fixed: the engine's fixed_bytes (its parameter buffers, the scratch of one prompt
+ *     chunk of vkc_fit_rows(..) rows, buffers every layer shares) plus the pools' own
+ *     granularity (vkc_fit_pools: a weight block, a block of each chain pool, the frames'
+ *     staging);
+ *   - each layer's bytes, layer_bytes[i]: its matrices (vkc_fit_tensor each) and its state
+ *     at its starting size (vkc_fit_buf each; the KV split covers the growth);
+ *   - tail_bytes: what the engine puts on the device only with every layer there (the head,
+ *     a final norm, matrices the per-matrix path would upload lazily).
+ * The rule: N = L when fixed + every layer fits; the tail goes up too (fit->tail) when it
+ * fits beside them; else N = the most layers from layer 0 with fixed + their bytes within
+ * the room, the tail on the CPU. COLI_VK_CHAIN_LAYERS=n forces N (capped at L; 0 = the chain
+ * off; the tail goes up when n = L). When everything fits the result is the full chain, as
+ * before. Two lines on stderr:
+ *   [VK] <engine> chain fit: free F B, reserve R B, fixed X B (the engine's E B, the pools' P B), tail T B, layers b0 b1 .. B, matrices m0 m1 .. B
+ *   [VK] <engine> chain: N of L layers on the device (S), L-N on the CPU (free F, reserve R)
+ * (the second with "(COLI_VK_CHAIN_LAYERS=n)" when forced; with N = 0 it says the chain stays
+ * off). matrix_bytes[i] (NULL: not printed) is the payload of layer i's matrices as
+ * coli_vk_mem_info counts it (coli_vk_tensor_payload each), for vkc_fit_placed's check.
+ * fit->per and fit->mat are copies the fit keeps. Returns N.
+ *
+ * vkc_fit_shrink: a layer that did not fully reach the device during setup (a driver
+ * refusing what the budget promised, an upload that failed): the engine freed everything
+ * of that layer (and of the layers after it, if any were placed) and continues with N = n,
+ * the layers before it. The line, in the same format:
+ *   [VK] <engine> chain: n of L layers on the device (S), L-n on the CPU (layer n did not reach the device: why; what it had placed was freed)
+ * vkc_fit_mark: the engine finished layer i's setup (COLI_VK_STAGED_FAULT's point count is
+ * noted for the placed line, so a test can aim a fault inside a given layer).
+ * vkc_fit_placed: after setup, before the tier sizes itself:
+ *   [VK] <engine> chain: N of L layers placed: M B of matrices on the device (the fit counted M' B for these layers), chain buffers C B, device memory held H B[; COLI_VK_STAGED_FAULT's point reached c0,c1,.. times by the end of each layer]
+ * vkc_fit_partial: 1 when something the full chain would place stays on the CPU (N < L, or
+ * the tail kept off): the engine's per-matrix path must then not upload matrices that are
+ * not on the device already (the CPU layers and the tail stay on the CPU).
+ * vkc_layer_free: frees a layer's tensors (coli_vk_tensor_free) and chain buffers (vkc_free)
+ * after the frames that may read them, setting each pointer to NULL. */
+typedef struct {
+    int L, n;                   /* the model's layers; the first n run on the device */
+    int forced, tail;           /* COLI_VK_CHAIN_LAYERS decided; the tail goes on the device */
+    size_t free_b, reserve, fixed, engine_fixed, pools, tail_b, used_b;   /* used_b: the n layers' bytes */
+    size_t *per, *mat;          /* each layer's bytes and its matrices' payload */
+    unsigned long long *marks;  /* COLI_VK_STAGED_FAULT's count at the end of each layer's setup */
+} VkcFit;
+int    vkc_fit(const char *engine, int L, const size_t *layer_bytes, const size_t *matrix_bytes,
+               size_t fixed_bytes, size_t tail_bytes, VkcFit *fit);
+void   vkc_fit_shrink(const char *engine, VkcFit *fit, int n, const char *why);
+void   vkc_fit_mark(VkcFit *fit, int layer);
+void   vkc_fit_placed(const char *engine, const VkcFit *fit);
+int    vkc_fit_partial(const VkcFit *fit);
+/* COLI_VK_CHAIN_ROWS when set to a number, else def: the rows the fit's scratch is for */
+int    vkc_fit_rows(int def);
+size_t vkc_fit_tensor(int fmt, int I, int O, int gs);   /* a resident tensor's device bytes, its two ranges aligned */
+size_t vkc_fit_buf(size_t bytes);                       /* a chain buffer's (vkc_buf) device bytes */
+size_t vkc_fit_reserve(void);                           /* COLI_VK_TIER_RESERVE_GB in bytes */
+size_t vkc_fit_pools(void);                             /* the pools' granularity the fit adds to fixed */
+void   vkc_layer_free(ColiVkTensor **const *t, int nt, VkcBuf **const *b, int nb);
+
 /* ---- a KV cache split between the device and the host (chain_kvs.comp) ----------------
  * Past the device's budget a layer's cache keeps `ns` blocks of B positions on the
  * device (the recent window, and where an engine selects positions, the blocks read

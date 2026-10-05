@@ -21,6 +21,20 @@
 #include <time.h>
 #include "compat.h"
 
+/* Every device memory block goes through the backend's books (COLI_VK_DEVICE_CAP_MB,
+ * coli_vk_mem_alloc): the chain's buffers count against the device's budget as its
+ * weights and the tier's experts do. */
+static VkResult vkc_mem_alloc(VkDevice d, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *cb, VkDeviceMemory *m) {
+    (void)cb;
+    return (VkResult)coli_vk_mem_alloc((void *)d, ai, m);
+}
+static void vkc_mem_free(VkDevice d, VkDeviceMemory m, const VkAllocationCallbacks *cb) {
+    (void)cb;
+    coli_vk_mem_free((void *)d, &m);
+}
+#define vkAllocateMemory vkc_mem_alloc
+#define vkFreeMemory vkc_mem_free
+
 static double vkc_now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
 /* ---- pipelines ------------------------------------------------------------------ */
@@ -345,7 +359,7 @@ int vkc_init(void) {
     for (int k = 0; k < 3; k++) {
         K.pool[k].memtype = memtype_of(k);
         K.pool[k].mapped = memtype_host_visible(K.pool[k].memtype);
-        vka_pool_init(&K.pool[k].p, VKC_BLOCK, 0);
+        vka_pool_init(&K.pool[k].p, coli_vk_block_bytes(VKC_BLOCK), 0);   /* smaller under COLI_VK_DEVICE_CAP_MB */
     }
     if (!K.pool[VKC_UP].mapped || !K.pool[VKC_DOWN].mapped) return 0;
     K.ready = 1;
@@ -1281,6 +1295,147 @@ int vkc_chunk_rows(const char *engine, size_t row_bytes) {
     }
     return rows;
 }
+/* ---- a partial chain (vk_chain.h, vkc_fit) ------------------------------------------- */
+static const char *fit_size(size_t b, char *buf, size_t n) {
+    if (b >= ((size_t)1 << 30)) snprintf(buf, n, "%.2f GiB", (double)b / 1073741824.0);
+    else snprintf(buf, n, "%.1f MiB", (double)b / 1048576.0);
+    return buf;
+}
+static size_t fit_up(size_t b, size_t a) { return a > 1 ? (b + a - 1) / a * a : b; }
+size_t vkc_fit_reserve(void) {
+    const char *e = getenv("COLI_VK_TIER_RESERVE_GB");
+    double g = e && *e ? atof(e) : 1.0;
+    return g > 0 ? (size_t)(g * 1073741824.0) : 0;
+}
+/* A weight pool's block, a block of each of the chain's three pools, and the frames'
+ * first staging buffers: what the pools may hold beyond the bytes asked for. */
+size_t vkc_fit_pools(void) {
+    return coli_vk_block_bytes((size_t)256 << 20) + 3 * (size_t)coli_vk_block_bytes(VKC_BLOCK) +
+           (size_t)VKC_FRAMES * ((size_t)4 << 20);
+}
+int vkc_fit_rows(int def) {
+    const char *e = getenv("COLI_VK_CHAIN_ROWS");
+    if (e && *e && strcmp(e, "auto") != 0) {
+        int v = atoi(e);
+        return v < 1 ? 1 : v > 65535 ? 65535 : v;
+    }
+    return def < 1 ? 1 : def;
+}
+size_t vkc_fit_tensor(int fmt, int I, int O, int gs) {
+    size_t a = coli_vk_buffer_alignment();
+    size_t rows = (coli_vk_tensor_row_bytes(fmt, I) + 3) / 4 * 4 * (size_t)O;
+    size_t sc = coli_vk_tensor_scale_count(fmt, I, O, gs) * sizeof(float);
+    return fit_up(rows ? rows : 4, a) + fit_up(sc ? sc : 4, a);
+}
+size_t vkc_fit_buf(size_t bytes) {
+    size_t a = K.align > 16 ? K.align : 16, b = coli_vk_buffer_alignment();
+    if (b > a) a = b;
+    size_t v = bytes ? bytes : 4;
+    return fit_up((v + 3) & ~(size_t)3, a);
+}
+int vkc_fit(const char *engine, int L, const size_t *layer_bytes, const size_t *matrix_bytes,
+            size_t fixed_bytes, size_t tail_bytes, VkcFit *fit) {
+    const char *eng = engine ? engine : "engine";
+    memset(fit, 0, sizeof *fit);
+    fit->L = L < 0 ? 0 : L;
+    fit->per = calloc((size_t)(fit->L ? fit->L : 1), sizeof(size_t));
+    fit->mat = calloc((size_t)(fit->L ? fit->L : 1), sizeof(size_t));
+    fit->marks = calloc((size_t)(fit->L ? fit->L : 1), sizeof(unsigned long long));
+    size_t all = 0;
+    for (int i = 0; i < fit->L; i++) {
+        size_t b = layer_bytes ? layer_bytes[i] : 0;
+        if (fit->per) fit->per[i] = b;
+        if (fit->mat && matrix_bytes) fit->mat[i] = matrix_bytes[i];
+        all += b;
+    }
+    fit->free_b = coli_vk_free_bytes();
+    fit->reserve = vkc_fit_reserve();
+    fit->pools = vkc_fit_pools();
+    fit->engine_fixed = fixed_bytes;
+    fit->fixed = fixed_bytes + fit->pools;
+    fit->tail_b = tail_bytes;
+    size_t room = fit->free_b > fit->reserve ? fit->free_b - fit->reserve : 0;
+    const char *e = getenv("COLI_VK_CHAIN_LAYERS");
+    char forced[48] = "";
+    if (e && *e && strcmp(e, "auto") != 0) {
+        int v = atoi(e);
+        fit->n = v < 0 ? 0 : v > fit->L ? fit->L : v;
+        fit->forced = 1;
+        fit->tail = fit->n == fit->L && fit->L > 0;
+        snprintf(forced, sizeof forced, "COLI_VK_CHAIN_LAYERS=%s", e);
+    } else if (fit->fixed + all <= room) {
+        fit->n = fit->L;
+        fit->tail = fit->fixed + all + tail_bytes <= room;
+    } else {
+        size_t acc = fit->fixed;
+        while (fit->n < fit->L && layer_bytes && acc + layer_bytes[fit->n] <= room) acc += layer_bytes[fit->n++];
+    }
+    for (int i = 0; i < fit->n; i++) fit->used_b += layer_bytes ? layer_bytes[i] : 0;
+    /* the numbers, exactly (a test predicts N from them) */
+    fprintf(stderr, "[VK] %s chain fit: free %zu B, reserve %zu B, fixed %zu B (the engine's %zu B, the pools' %zu B), tail %zu B, layers",
+            eng, fit->free_b, fit->reserve, fit->fixed, fit->engine_fixed, fit->pools, fit->tail_b);
+    for (int i = 0; i < fit->L; i++) fprintf(stderr, " %zu", layer_bytes ? layer_bytes[i] : (size_t)0);
+    fprintf(stderr, " B");
+    if (matrix_bytes) {
+        fprintf(stderr, ", matrices");
+        for (int i = 0; i < fit->L; i++) fprintf(stderr, " %zu", matrix_bytes[i]);
+        fprintf(stderr, " B");
+    }
+    fprintf(stderr, "\n");
+    char a[32], f[32], r[32], t[32], x[32], why[160];
+    if (fit->forced) snprintf(why, sizeof why, "%s", forced);
+    else snprintf(why, sizeof why, "free %s, reserve %s", fit_size(fit->free_b, f, sizeof f), fit_size(fit->reserve, r, sizeof r));
+    if (fit->n == 0)
+        fprintf(stderr, "[VK] %s chain: 0 of %d layers on the device: the chain stays off (%s%s%s%s%s)\n", eng, fit->L, why,
+                fit->forced || !fit->L ? "" : "; layer 0 takes ", fit->forced || !fit->L ? "" : fit_size(fit->per ? fit->per[0] : 0, a, sizeof a),
+                fit->forced || !fit->L ? "" : " beside ", fit->forced || !fit->L ? "" : fit_size(fit->fixed, x, sizeof x));
+    else
+        fprintf(stderr, "[VK] %s chain: %d of %d layers on the device (%s), %d on the CPU%s%s%s (%s)\n", eng, fit->n, fit->L,
+                fit_size(fit->used_b, a, sizeof a), fit->L - fit->n,
+                !fit->tail && tail_bytes ? ", the head and what goes with it (" : "",
+                !fit->tail && tail_bytes ? fit_size(tail_bytes, t, sizeof t) : "", !fit->tail && tail_bytes ? ") on the CPU" : "", why);
+    return fit->n;
+}
+void vkc_fit_shrink(const char *engine, VkcFit *fit, int n, const char *why) {
+    if (!fit || n >= fit->n) return;
+    if (n < 0) n = 0;
+    const char *eng = engine ? engine : "engine";
+    fit->n = n; fit->tail = 0; fit->used_b = 0;
+    for (int i = 0; i < n && fit->per; i++) fit->used_b += fit->per[i];
+    char a[32];
+    if (n == 0)
+        fprintf(stderr, "[VK] %s chain: 0 of %d layers on the device: the chain stays off (layer 0 did not reach the device: %s; "
+                        "what it had placed was freed)\n", eng, fit->L, why ? why : "refused");
+    else
+        fprintf(stderr, "[VK] %s chain: %d of %d layers on the device (%s), %d on the CPU (layer %d did not reach the device: %s; "
+                        "what it had placed was freed)\n", eng, n, fit->L, fit_size(fit->used_b, a, sizeof a), fit->L - n, n,
+                why ? why : "refused");
+}
+void vkc_fit_mark(VkcFit *fit, int layer) {
+    if (fit && fit->marks && layer >= 0 && layer < fit->L) fit->marks[layer] = coli_vk_fault_reached();
+}
+void vkc_fit_placed(const char *engine, const VkcFit *fit) {
+    if (!fit) return;
+    size_t w = 0, nt = 0, m = 0;
+    coli_vk_mem_info(&w, &nt);
+    for (int i = 0; i < fit->n && fit->mat; i++) m += fit->mat[i];
+    fprintf(stderr, "[VK] %s chain: %d of %d layers placed: %zu B of matrices on the device (the fit counted %zu B for these "
+                    "layers), chain buffers %zu B, device memory held %zu B", engine ? engine : "engine", fit->n, fit->L, w, m,
+            K.ready ? K.st.dev_bytes : (size_t)0, coli_vk_device_used());
+    if (coli_vk_fault_set() && fit->marks) {
+        fprintf(stderr, "; COLI_VK_STAGED_FAULT's point reached");
+        for (int i = 0; i < fit->L; i++) fprintf(stderr, "%s%llu", i ? "," : " ", fit->marks[i]);
+        fprintf(stderr, " times by the end of each layer");
+    }
+    fprintf(stderr, "\n");
+}
+int vkc_fit_partial(const VkcFit *fit) { return fit && fit->L > 0 && (fit->n < fit->L || !fit->tail); }
+void vkc_layer_free(ColiVkTensor **const *t, int nt, VkcBuf **const *b, int nb) {
+    if (vkc_ready()) vkc_finish();   /* no frame may still read them */
+    for (int i = 0; i < nt; i++) if (t[i] && *t[i]) { coli_vk_tensor_free(*t[i]); *t[i] = NULL; }
+    for (int i = 0; i < nb; i++) if (b[i] && *b[i]) { vkc_free(*b[i]); *b[i] = NULL; }
+}
+
 void vkc_prof_print(void) {
     if (!K.prof) return;
     double tot = 0; for (int k = 0; k < PK_N; k++) tot += K.prof_ms[k];

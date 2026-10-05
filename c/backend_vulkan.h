@@ -33,6 +33,32 @@ void coli_vk_set_swiglu_limit(float limit);
 void coli_vk_alloc_priority(float p);
 int  coli_vk_mem_budget(double *used_gb, double *budget_gb);
 
+/* Device memory books (docs/vulkan.md, "A partial chain"). Every device memory allocation
+ * of the backend and of the chain is counted per device when its heap is device-local.
+ * COLI_VK_DEVICE_CAP_MB=n (tests; n may be a fraction) makes the device hold at most n MiB:
+ * an allocation past it fails as out of device memory, and coli_vk_mem_budget (and
+ * _budget2, coli_vk_free_bytes, coli_vk_device_local_bytes) report the cap and this
+ * process's bytes, so a CPU device behaves like a small card.
+ *   coli_vk_device_cap      the cap in bytes (0: none)
+ *   coli_vk_device_used     device-local bytes this process holds on the device
+ *   coli_vk_free_bytes      free device memory now: the cap less what is held, else the
+ *                           budget less its usage (VK_EXT_memory_budget), else the largest
+ *                           device-local heap less what is held
+ *   coli_vk_block_bytes     the block size a memory pool of `def` bytes takes (smaller
+ *                           under the cap, at most about 4096 blocks to fill it)
+ *   coli_vk_mem_alloc/free  vkAllocateMemory / vkFreeMemory through the books (vk_chain.c):
+ *                           info is a VkMemoryAllocateInfo *, memory a VkDeviceMemory *;
+ *                           the result is a VkResult */
+size_t coli_vk_device_cap(void);
+size_t coli_vk_device_used(void);
+size_t coli_vk_free_bytes(void);
+size_t coli_vk_block_bytes(size_t def);
+int    coli_vk_mem_alloc(void *device, const void *info, void *memory);
+void   coli_vk_mem_free(void *device, const void *memory);
+/* COLI_VK_STAGED_FAULT (tests): whether a point is set, and how many times it was reached. */
+int    coli_vk_fault_set(void);
+unsigned long long coli_vk_fault_reached(void);
+
 /* y[S,O] = (x[S,I] @ dequant(W[O,I])^T) * scale[O].
  * fmt matches QT in glm.c: 1=int8, 2=int4. (0=f32,3=int2 fall back to CPU.)
  * fmt 10 = plain f32 weights and 11 = bf16 weights (low half = even column): no
@@ -179,6 +205,9 @@ int    coli_vk_tier_tensor(ColiVkTensor **t, int fmt, int I, int O, int gs,
 int    coli_vk_tensor_commit(ColiVkTensor *const *t, int n);
 int    coli_vk_staged(void);   /* 1 = resident data goes to the device through staged uploads */
 size_t coli_vk_tensor_row_bytes(int fmt, int I);
+/* What coli_vk_tensor_ensure(fmt, I, O, gs) adds to coli_vk_mem_info's bytes: the rows
+ * at their padded stride and the scales (0 for a grouped format without a group size). */
+size_t coli_vk_tensor_payload(int fmt, int I, int O, int gs);
 size_t coli_vk_buffer_alignment(void);   /* where a weight range may start (bytes) */
 size_t coli_vk_tensor_scale_count(int fmt, int I, int O, int gs);
 
@@ -298,6 +327,11 @@ void coli_vk_dense_host_reloaded(size_t bytes);/* a host copy read back from dis
  * only, the RAM given back, and what stays on the host (kept: NULL or a short note). */
 void coli_vk_dense_host_placed(const char *engine, const char *kept);
 unsigned long long coli_vk_dense_host_dropped_bytes(void);
+/* A partial chain (vk_chain.h, vkc_fit): only the first `on_device` of `layers` layers drop
+ * their host copies; the placed and exit lines then say so (nothing changes when
+ * on_device == layers, or before any call). Call it before coli_vk_dense_host_placed. The
+ * bytes the engine passes coli_vk_dense_host_decide are those layers' only. */
+void coli_vk_dense_host_layers(int on_device, int layers);
 /* COLI_VK_SHADERS (the .spv or its directory), else shaders/ next to the binary, else
  * shaders/ in the working directory. buf holds the result when it is not a literal. */
 const char *coli_vk_shader_path(char *buf, size_t n);

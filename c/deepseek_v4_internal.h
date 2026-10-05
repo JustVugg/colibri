@@ -289,6 +289,8 @@ const void *coli_v4_layer_data(const ColiDeepSeekV4LayerWeights *weights,
  *   coli_v4_dense_device_decide: asked by the RAM plan (EXPERT_STORE_AUTO) once it has
  *     measured the memory, with the bytes the device would hold and the RAM it would give
  *     back; 1 = the dense layers live on the device, their droppable tensors out of RAM.
+ *     It sets dense_resident.device_layers: only those first layers go (a partial chain
+ *     takes a prefix of the layers), and the plan counts only their bytes out of RAM.
  *   coli_v4_dense_place: after a resident layer is read, its tensors to the device and
  *     the droppable ones' pages given back (coli_v4_layer_host_drop).
  *   coli_v4_dense_device_lost: 1 once the device is gone; resident layers are then read
@@ -1035,6 +1037,11 @@ struct ColiV4Engine {
          * (the plan left them out of RAM); what the device holds and what RAM gave back */
         int device_only;
         uint64_t device_bytes, dropped_bytes;
+        /* the layers whose droppable tensors the device holds alone: the first
+         * device_layers (a partial chain, docs/vulkan.md "A partial chain"); the others
+         * keep their host copies. Set by coli_v4_dense_device_decide, lowered when a
+         * layer does not reach the device. */
+        int device_layers;
     } dense_resident;
     /* Optional CUDA tier (compiled in only when the engine build defines
      * COLI_V4_GPU_TIER on Windows). enabled is 1 only after the loader resolved

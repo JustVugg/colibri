@@ -866,6 +866,7 @@ f32 throughout, as the CPU's f32 path.
 |---|---|---|
 | `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 and olmoe on, qwen38 off; mimo, inkling, colibri, glm53, kimi_k3, deepseek_v41 and deepseek_v4 off: not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows that are not a speculative verify; decode and verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
 | `COLI_VK_CHAIN_ROWS` | from the budget, up to 8192 | Prompt rows per chunk: a longer prompt runs every layer chunk by chunk (the device's scratch is sized for one chunk). Unset or `auto`: the most rows whose buffers fit half the free device memory, up to `COLI_VK_CHAIN_ROWS_MAX` (8192); see [big prompt chunks](#big-prompt-chunks-and-expert-streaming). It was 512 before. |
+| `COLI_VK_CHAIN_LAYERS` | what fits | The engines on [the partial chain](#a-partial-chain): the first N layers on the device, the CPU the rest and the head. Unset or `auto`: the most layers the device's free memory holds (every layer when they fit, the chain as before); `n`: n layers; `0`: the chain off. |
 | `COLI_VK_CHAIN_GEMV` | on | `0`: the decode matrices take `qmatmul.comp`'s GEMV instead of `chain_gemv.comp`'s. |
 | `COLI_VK_CHAIN_SPIN_US` | `2000` | How long a wait on a chain frame polls the fence before blocking. |
 | `COLI_VK_CHAIN_PROF` | off | `1`: one `[VK] chain profile` line of device time per kind of op (timestamps). |
@@ -1336,6 +1337,20 @@ accepted give the same bits) and each decode row equal to the teacher-forced row
 position. A stale row in the device's ring after a rejected draft (a bug found while
 writing this) moved the logits by 0.39 to 0.53 of the largest, inside what a
 rounding flip can do, and failed the self-consistency check at once.
+
+**A partial chain** ([below](#a-partial-chain)): when the dense layers do not all fit the
+device, deepseek_v4 chains the first N and the CPU's `target_batch` and `target_token` run
+the rest from the streams the chain hands back (`v4c_forward` returns the layers it ran).
+The fit counts each layer's matrices (fp8 as fmt 12 with its block scales, wo_a per output
+group, the compressors' and the indexer's bf16, the mHC mixes in f32), its window ring, its
+compressors' rings and 64 compressed rows and index keys, and its parameters; the fixed part
+is the scratch of one 128-row block. The RAM plan asks for N
+(`coli_v4_dense_device_decide`, which sets `dense_resident.device_layers`) before the expert
+store opens, so only those layers' fp8 matrices and compressor projections leave RAM; a
+chained layer is built whole in its placement before its host pages are given back. With
+part of the model on the CPU the per-matrix path uploads nothing new (the head and the
+routers stay on the CPU), and after a lost device only the device's layers are read per
+forward.
 
 **The default.** `COLI_VK_CHAIN_UNMEASURED`: off on an integrated GPU (`COLI_VK_CHAIN=1`
 turns it on, `2` for prompts only), on a discrete GPU the rule above. No DeepSeek V4
@@ -2166,6 +2181,122 @@ use a CPU head with host copies and a GPU head without them, so they retain the
 existing CPU-reference numerical bound; they are not an identical-arithmetic
 comparison. A trace that declines the chain must still exercise the per-matrix
 GPU fallback.
+
+## A partial chain
+
+On a card too small for every dense layer the chain used to be decided on with no check
+that the layers fit. Setup uploaded matrix after matrix and gave up at the first one that
+did not fit, leaving what it had uploaded on the device, used only by the slow
+per-matrix path; the expert tier then sized itself from what was left. DeepSeek V4 Flash
+(7.9 GB of dense layers) on an 8 GB card ended there with no chain, half its dense part in
+VRAM and no expert tier: #1852's case on a smaller card.
+
+The chain now takes what fits: the first N layers run on the device as every layer did
+before (their matrices, the residual and their state), and the CPU path runs layers N
+to L-1 and the head. N = L is the full chain. N = 0 is the chain off with nothing of the
+dense part on the device, every byte left to the tier.
+
+**How N is chosen** (`vkc_fit`, `vk_chain.h`), once at startup, before any upload and
+before the RAM plan sizes the expert cache. The room is the device's free memory
+(`coli_vk_free_bytes`: `VK_EXT_memory_budget`'s budget less its usage, else the largest
+device-local heap less what the process holds) less the reserve, `COLI_VK_TIER_RESERVE_GB`
+(1 GiB). Out of it come, in this order:
+
+- the chain's fixed bytes: the engine's (the scratch of one prompt chunk at the engine's
+  block, buffers every layer shares) and the pools' granularity (a weight block, a block
+  of each of the chain's three pools, the frames' first staging buffers);
+- each layer's bytes: its matrices as uploaded (each of their two ranges aligned), its
+  state at its first size (the KV split covers its growth), its part of the parameters;
+- the tail: what the device takes only with every layer there (a head, matrices the
+  per-matrix path uploads as it meets them).
+
+N = L when the fixed bytes and every layer fit, the tail going up too when it fits beside
+them. Otherwise N is the most layers from layer 0 that fit, and the tail stays on the CPU.
+`COLI_VK_CHAIN_LAYERS=n` forces N (at most L; `0`: the chain off). When everything fits
+the result is the chain as before. Two lines say what was decided (DeepSeek V4's six-layer
+test fixture on Lavapipe under `COLI_VK_DEVICE_CAP_MB=59.691730` with
+`COLI_VK_TIER_RESERVE_GB=0.04`):
+
+```
+[VK] deepseek_v4 chain fit: free 62591315 B, reserve 42949672 B, fixed 18931200 B (the engine's 1891840 B, the pools' 17039360 B), tail 0 B, layers 159720 278760 192104 159720 159720 278760 B, matrices 138888 213404 155280 138888 138888 213404 B
+[VK] deepseek_v4 chain: 3 of 6 layers on the device (0.6 MiB), 3 on the CPU (free 59.7 MiB, reserve 41.0 MiB)
+```
+
+and, once the layers are on the device and before the tier sizes itself:
+
+```
+[VK] deepseek_v4 chain: 3 of 6 layers placed: 507572 B of matrices on the device (the fit counted 507572 B for these layers), chain buffers 4265784 B, device memory held 4853760 B
+```
+
+**A layer that does not reach the device.** The budget can promise what a driver then
+refuses, or an upload can fail. Setup goes layer by layer: a layer whose matrices or state
+do not all reach the device is freed whole (its tensors, its buffers), its matrices stay
+the CPU's, and the chain keeps the layers before it. Nothing of the failed layer stays on
+the device: the placed line's bytes are the kept layers' exactly.
+
+```
+[VK] deepseek_v4 chain: 2 of 6 layers on the device (0.4 MiB), 4 on the CPU (layer 2 did not reach the device: a matrix the device refused; what it had placed was freed)
+[VK] deepseek_v4 chain: 2 of 6 layers placed: 352292 B of matrices on the device (the fit counted 352292 B for these layers), chain buffers 4253936 B, device memory held 436207616 B; COLI_VK_STAGED_FAULT's point reached 11,27,0,0,0,0 times by the end of each layer
+```
+
+(the same fixture with `COLI_VK_STAGED=1 COLI_VK_STAGED_FAULT=submit:29 COLI_VK_CHAIN_LAYERS=6`:
+the 29th staged submit, the second inside layer 2, fails)
+
+A lost device keeps its handling: the CPU runs the forward again and from there on.
+
+**The handoff.** A forward runs the chain's N layers on the device chunk by chunk as before;
+after layer N-1 the residual (and the engine's per-token stream state: DeepSeek's hc_mult
+streams) comes back to the host once per chunk, and the CPU's layer loop runs from layer N
+on it, then the head. The device's layers keep their state on the device (the mirrors
+behind their watermarks), the CPU's layers on the host. While part of the model stays on
+the CPU, the per-matrix path uploads nothing new: a CPU layer's or the head's matrices are
+never put on the device behind the fit's back.
+
+**Host copies, per layer.** With `COLI_VK_DENSE_HOST=0` (or its rule) only the N layers
+give their host copies back; the CPU's layers keep theirs and never read a matrix back from
+disk. The engine's RAM plan counts only the N layers' matrices out of RAM, and so does
+`coli plan` (`resource_plan.py`'s `vk_chain_fit`, which predicts N with the same rule from
+the device's budget and the checkpoint's header). The dense-host lines say it:
+
+```
+[VK] deepseek_v4: 31 dense matrices on the device only, 0.4 MiB of host RAM given back (the 3 of 6 layers on the device; the 3 on the CPU keep theirs); kept on the host: norms, block scales, the router, the indexer's weights_proj, the mHC mixes, the head; RSS now 0.13 GiB
+[VK] deepseek_v4: dense weights at exit: 31 matrices on the device only (0.4 MiB of host copies dropped, the 3 of 6 layers on the device), 0 read back from disk for the CPU (0.0 MiB); RSS 0.14 GiB
+```
+
+`coli plan` counts every buffer at the backend's least alignment, 256 bytes. A device that
+aligns storage buffers more coarsely makes the engine count more: Mesa's Dozen (the Iris Xe
+through D3D12) aligns them to 64 KiB, and its fit counted 1,379,048 bytes for the six-layer
+fixture's first layer, which Lavapipe and the plan count at 159,720. On a real model, whose
+matrices are megabytes each, that is a few 64 KiB per matrix; on such a device the plan can
+predict a layer more than the engine places.
+
+**The tier** sizes itself after the chain's uploads, as before, and takes what is left.
+
+| Engine | What the handoff moves | On the partial chain |
+|---|---|---|
+| deepseek_v4 | the hc_mult streams; DSpark's taps of the last three layers come from whichever side ran them | yes |
+
+**`COLI_VK_DEVICE_CAP_MB=n`** (tests) makes the device hold at most n MiB of device-local
+memory (a fraction is taken): every allocation of the backend and the chain (tensors, the
+tier's pool, the chain's buffers, staging, the second device's) is counted, one past the
+cap fails as out of device memory would, and every budget the engines read reports the cap.
+Under it the pools take small blocks, so their granularity does not decide what fits. With
+it Lavapipe behaves like a small card.
+
+**Tests.** `tests/vulkan_engines.sh partial-<group>` (one file per engine group,
+`tests/vulkan_partial_<group>.sh`; `partial-deepseek` for DeepSeek V4) and its
+`-sanitize` variant (ASan and UBSan). On Lavapipe, DeepSeek V4: `COLI_VK_CHAIN_LAYERS` at 0,
+1, 3, 5 and 6 of a six-layer fixture and on the other test geometries (the CPU's tokens,
+logits within V4's bound, the placed bytes the kept layers' exactly, nothing more on the
+device at exit than at setup); `COLI_VK_DEVICE_CAP_MB` aimed at 0, 1, 2, 3 and 5 layers
+from a probe's numbers (the line's N and `coli plan`'s are the aimed one); an upload
+failing inside layers 0, 1, 2 and 4 (N = that layer); prompt chunks, prefill blocks, expert
+streaming, n-gram drafts accepted and rejected, prompts only, the per-matrix path beside,
+the KV split, a lost device mid-decode, in the prompt and between drafts, serve sessions
+and the prefix-reuse tests, and the chain against itself (chunks, prefill blocks, drafts)
+with N < L; the dense weights on the device only with N < L. A discrete GPU has not been
+measured: none is available here, so the fit's behaviour on one (the budget a real driver
+reports, its allocation granularity) is not verified.
 
 ## Correctness
 

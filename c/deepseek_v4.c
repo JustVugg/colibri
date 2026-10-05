@@ -1078,8 +1078,8 @@ int coli_v4_layer_load(ColiV4Engine *engine,
     if (!resident_enabled_v2(engine))
         return coli_v4_layer_resident_reference_load(
             NULL, weights, effective_config, index, layer, error, error_size);
-    if (engine->dense_resident.device_only && coli_v4_dense_device_lost &&
-        coli_v4_dense_device_lost()) {
+    int device_layer = engine->dense_resident.device_only && layer < engine->dense_resident.device_layers;
+    if (device_layer && coli_v4_dense_device_lost && coli_v4_dense_device_lost()) {
         /* the device that held the dense layers is gone: the CPU reads them per forward,
          * as a low-memory plan does (its two-layer reserve is in the plan) */
         if (coli_v4_layer_resident_reference_load(
@@ -1097,7 +1097,7 @@ int coli_v4_layer_load(ColiV4Engine *engine,
     }
     engine->dense_resident.index = index;
     if (!engine->dense_resident.ready[layer]) {
-        g_v4_layer_map = engine->dense_resident.device_only;   /* droppable tensors in mappings of their own */
+        g_v4_layer_map = device_layer;   /* droppable tensors in mappings of their own */
         int failed = coli_v4_layer_resident_reference_load(
                 NULL, &engine->dense_resident.layers[layer], effective_config, index,
                 layer, error, error_size);
@@ -1113,8 +1113,9 @@ int coli_v4_layer_load(ColiV4Engine *engine,
         engine->dense_resident.total_bytes +=
             engine->dense_resident.layers[layer].stats.total_bytes;
         /* device only: the layer's matrices to the device and their host pages back,
-         * before the next layer is read (one layer in RAM at a time) */
-        if (engine->dense_resident.device_only && coli_v4_dense_place)
+         * before the next layer is read (one layer in RAM at a time); a partial chain's
+         * CPU layers keep theirs */
+        if (device_layer && coli_v4_dense_place)
             coli_v4_dense_place(engine, layer);
         if (layer == effective_config->num_hidden_layers - 1)
             fprintf(stderr, "v4_dense_resident layers=%d bytes=%.3fGiB\n",
@@ -1545,10 +1546,11 @@ static int build_runtime_plan(ColiV4Engine *engine,
  * binary built with VK=1, NULL in every other link. */
 ColiV4DenseDeviceDecide coli_v4_dense_device_decide;
 
-/* The bytes of the dense layers a device may hold alone (coli_v4_dense_device_only_tensor). */
-static uint64_t v4_dense_device_bytes(const ColiV4Engine *engine) {
+/* The bytes of the first `layers` dense layers a device may hold alone
+ * (coli_v4_dense_device_only_tensor). */
+static uint64_t v4_dense_device_bytes(const ColiV4Engine *engine, int layers) {
     uint64_t total = 0;
-    for (int layer = 0; layer < engine->config.num_hidden_layers; layer++) {
+    for (int layer = 0; layer < layers && layer < engine->config.num_hidden_layers; layer++) {
         ColiDeepSeekV4LayerPlan plan;
         if (coli_v4_layer_plan(&plan, &engine->config, layer, NULL, 0)) return 0;
         for (size_t i = 0; i < plan.tensor_count; i++)
@@ -1584,11 +1586,14 @@ int coli_v4_expert_store_open_planned(
      * would have taken goes to the experts' cache. */
     uint64_t device_bytes = 0;
     if (coli_v4_dense_device_decide && dense_bytes) {
-        uint64_t candidate = v4_dense_device_bytes(engine);
+        int layers = engine->config.num_hidden_layers;
+        uint64_t candidate = v4_dense_device_bytes(engine, layers);
+        engine->dense_resident.device_layers = layers;
         if (candidate && candidate < dense_bytes &&
             coli_v4_dense_device_decide(engine, candidate, dense_bytes - candidate)) {
-            device_bytes = candidate;
-            dense_bytes -= candidate;
+            /* a partial chain: only its layers' tensors leave RAM */
+            device_bytes = v4_dense_device_bytes(engine, engine->dense_resident.device_layers);
+            dense_bytes -= device_bytes;
         }
     }
     ColiDeepSeekV4ResidentTierPlan tiers;
@@ -12721,6 +12726,7 @@ typedef struct {
 } V4VkEntry;
 static V4VkEntry *g_v4_vk_map;
 static size_t g_v4_vk_cap, g_v4_vk_used;
+static int v4c_partial(void);   /* deepseek_v4_chain.h: a partial chain keeps the rest on the CPU */
 
 static size_t v4_vk_hash(const void *data, size_t cap) {
     uint64_t h = (uint64_t)(uintptr_t)data * 0x9E3779B97F4A7C15ull;
@@ -12757,6 +12763,17 @@ static V4VkEntry *v4_vk_insert(const void *data, int fmt, int rows, int columns)
     g_v4_vk_map[at] = (V4VkEntry){data, fmt, rows, columns, 0, NULL, 0};
     g_v4_vk_used++;
     return &g_v4_vk_map[at];
+}
+
+/* A tensor of the map off the device (a layer that did not complete): freed, its entry
+ * refused, so the matrix stays the CPU's. */
+static void v4_vk_forget(ColiVkTensor *t) {
+    if (!t) return;
+    for (size_t i = 0; i < g_v4_vk_cap; i++)
+        if (g_v4_vk_map[i].data && g_v4_vk_map[i].tensor == t) {
+            g_v4_vk_map[i].tensor = NULL; g_v4_vk_map[i].refused = 1; g_v4_vk_map[i].dho = 0;
+        }
+    coli_vk_tensor_free(t);
 }
 
 /* Bytes a resident layer tensor occupies (E8M0 scales are held as f32). */
@@ -12809,6 +12826,8 @@ static int v4_vk_matmul_impl(int fmt, const void *data, const float *scales,
      * says, for the matrices the device holds alone; the rest stay where it puts them. */
     if (!coli_vk_dense() && !(e && e->dho)) return -1;
     if (e && e->refused) return -1;
+    /* a partial chain: the CPU's layers and the head stay on the CPU, nothing new goes up */
+    if (v4c_partial() && !(e && e->tensor)) return -1;
     if (e && e->tensor)
         return coli_vk_matmul(&e->tensor, output, input, NULL, NULL, fmt, batch,
                               columns, rows, fmt == 12 ? 128 : 0) ? 0 : -1;
@@ -12987,7 +13006,7 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
                         ? (size_t)(st.capacity_bytes - st.resident_bytes) : 0,
                     /* what the device has still to take: matrices placed already
                      * (the dense weights on the device only) are in its usage */
-                    .dense_bytes = coli_vk_dense()
+                    .dense_bytes = coli_vk_dense() && !v4c_partial()   /* a partial chain placed all it places */
                         ? (size_t)(engine->dense_resident.total_bytes - engine->dense_resident.dropped_bytes + engine->head_cache.bytes) : 0,
                     .in_ram = v4_vkt_in_ram, .ram_ctx = store,
                     .load = v4_vkt_load, .release = v4_vkt_unhold, .load_ctx = store};
@@ -13058,6 +13077,21 @@ static void v4c_close(void);
 static int g_v4_vk_opened, g_v4_dho_asked;
 static pthread_mutex_t g_v4_dho_mx = PTHREAD_MUTEX_INITIALIZER;
 static int v4c_decide(const ColiV4Engine *engine);   /* deepseek_v4_chain.h */
+static int v4c_fit_now(ColiV4Engine *engine);        /* the partial chain's N (vkc_fit) */
+static int v4c_fit_n(void);
+static int v4c_build_layer(int layer);
+static void v4c_drop_layer(int layer, const char *why);
+/* The bytes of the first `layers` layers' tensors a device may hold alone. */
+static uint64_t v4_dho_bytes(const ColiV4Engine *engine, int layers) {
+    uint64_t total = 0;
+    for (int layer = 0; layer < layers && layer < engine->config.num_hidden_layers; layer++) {
+        ColiDeepSeekV4LayerPlan plan;
+        if (coli_v4_layer_plan(&plan, &engine->config, layer, NULL, 0)) return 0;
+        for (size_t i = 0; i < plan.tensor_count; i++)
+            if (coli_v4_dense_device_only_tensor(&plan.tensors[i])) total += coli_v4_dense_tensor_bytes(&plan.tensors[i]);
+    }
+    return total;
+}
 
 static void v4_vk_device_open(const ColiV4Engine *engine) {
     if (g_v4_vk_opened) return;
@@ -13083,7 +13117,17 @@ static int v4_dho_decide(ColiV4Engine *engine, uint64_t device_bytes, uint64_t h
     v4_vk_device_open(engine);
     if (!g_v4_vk_ready) return 0;
     g_v4_dho_asked = 1;
-    int chain = v4c_decide(engine);
+    int chain = v4c_decide(engine), L = engine->config.num_hidden_layers;
+    engine->dense_resident.device_layers = L;
+    if (chain && v4c_fit_now(engine)) {
+        /* the chain's N decided now, before any upload: only its layers drop their host
+         * copies and leave the plan's RAM; the CPU's layers keep theirs */
+        int n = v4c_fit_n();
+        engine->dense_resident.device_layers = n;
+        int r = coli_vk_dense_host_decide("deepseek_v4", n > 0, (size_t)v4_dho_bytes(engine, n));
+        if (r) coli_vk_dense_host_layers(n, L);
+        return r && n > 0;
+    }
     return coli_vk_dense_host_decide("deepseek_v4", chain != 0 || coli_vk_dense(), (size_t)device_bytes);
 }
 /* The CPU needs a matrix the device holds alone: read back from disk at its address. */
@@ -13126,6 +13170,11 @@ static unsigned g_v4_dho_kept;
 static int v4_dho_place(ColiV4Engine *engine, int layer) {
     ColiDeepSeekV4LayerWeights *w = &engine->dense_resident.layers[layer];
     const ColiDeepSeekV4Config *c = &engine->config;
+    /* a chained layer goes up whole first (its matrices and state, v4c_build_layer); one
+     * that does not keeps its host copies, and so does every layer after it */
+    int chained = v4c_build_layer(layer);
+    if (chained < 0) return 0;
+    signed char up[COLI_V4_MAX_LAYER_TENSORS] = {0};   /* 1 on the device, -1 refused */
     for (size_t i = 0; i < w->plan.tensor_count; i++) {
         const ColiDeepSeekV4TensorSpec *spec = &w->plan.tensors[i];
         if (!w->mapped[i] || w->host_gone[i]) continue;
@@ -13145,8 +13194,17 @@ static int v4_dho_place(ColiV4Engine *engine, int layer) {
                                    spec->packed_rows8, rows, I);
             } else ok = v4_dho_up(12, data, scales, spec->packed_rows8, O, I);
         } else ok = v4_dho_up(11, w->data[i], NULL, 0, O, I);
-        if (ok && !coli_v4_layer_host_drop(engine, layer, i))
-            coli_vk_dense_host_dropped((size_t)coli_v4_dense_tensor_bytes(spec));
+        up[i] = ok ? 1 : -1;
+        if (!ok && chained) {   /* a chained layer is the device's whole or not at all */
+            v4c_drop_layer(layer, "a matrix the device refused");
+            return 0;
+        }
+    }
+    /* the pages back once the layer is on the device */
+    for (size_t i = 0; i < w->plan.tensor_count; i++) {
+        if (!up[i]) continue;
+        if (up[i] > 0 && !coli_v4_layer_host_drop(engine, layer, i))
+            coli_vk_dense_host_dropped((size_t)coli_v4_dense_tensor_bytes(&w->plan.tensors[i]));
         else g_v4_dho_kept++;
     }
     return 0;
@@ -13176,6 +13234,7 @@ static void v4_vk_open(const ColiV4Engine *engine) {
                 break;
             }
         }
+        coli_vk_dense_host_layers(engine->dense_resident.device_layers, engine->config.num_hidden_layers);
         coli_vk_dense_host_placed("deepseek_v4", g_v4_dho_kept
             ? "norms, block scales, the router, weights_proj, the mHC mixes, the head; and matrices the device refused"
             : "norms, block scales, the router, the indexer's weights_proj, the mHC mixes, the head");
@@ -13784,15 +13843,18 @@ static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **ne
      * does not change the caller's semantic distinction: speculative decode
      * always passes use_prefill_pool=0. */
     int pool_experts = use_prefill_pool && v4_prefill_pool_enabled();
+    int first_layer = 0;
 #ifdef COLI_VULKAN
-    {   /* the dense chain runs every layer on the device; 0: the CPU runs them, as below */
+    {   /* the dense chain runs its layers on the device (every layer, or a partial chain's
+         * first ones, the CPU the rest from their streams); 0: the CPU runs them all */
         int chained = v4c_forward(engine, state_ptr, next_ptr, attention, config, experts, tokens,
                                   start, batch, pool_experts, error, error_size);
-        if (chained) return chained > 0 ? 0 : -1;
-        v4c_cpu_step(start);
+        if (chained < 0) return -1;
+        if (!chained) v4c_cpu_step(start);
+        else { first_layer = chained; state = *state_ptr; next = *next_ptr; }
     }
 #endif
-    for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
+    for (int layer_id = first_layer; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
                                error, error_size)) {
@@ -13889,15 +13951,17 @@ static int target_token_impl(ColiV4Engine *engine, float **state_ptr, float **ne
                         char *error, size_t error_size) {
     float *state = *state_ptr, *next = *next_ptr;
     if (load_embedding(state, index, config, token)) return -1;
+    int first_layer = 0;
 #ifdef COLI_VULKAN
     {   /* the dense chain, as in target_batch */
         int chained = v4c_forward(engine, state_ptr, next_ptr, attention, config, experts, &token,
                                   position, 1, 0, error, error_size);
-        if (chained) return chained > 0 ? 0 : -1;
-        v4c_cpu_step(position);
+        if (chained < 0) return -1;
+        if (!chained) v4c_cpu_step(position);
+        else { first_layer = chained; state = *state_ptr; next = *next_ptr; }
     }
 #endif
-    for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
+    for (int layer_id = first_layer; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
                                error, error_size)) return -1;

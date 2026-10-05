@@ -1211,7 +1211,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (want > room) want = room;
     if (want < 0) want = 0;
     /* whole experts per pool block, so the count matches what the blocks can hold */
-    size_t blk = (size_t)256 << 20;
+    size_t blk = coli_vk_block_bytes((size_t)256 << 20);   /* the pool's blocks (smaller under COLI_VK_DEVICE_CAP_MB) */
     if ((size_t)want < blk) blk = (size_t)want;
     long long fit = 0;
     if (T.exp_bytes && blk >= T.exp_bytes) {
@@ -1268,7 +1268,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
      * block for a few experts. */
     size_t lim = T.budget, need = (size_t)(all + 1 + (T.st_ok ? T.st_slots : 0)) * T.exp_bytes;
     if (fit + (T.st_ok ? T.st_slots : 0) >= all && fit_raw >= all + (T.st_ok ? T.st_slots : 0) &&
-        need < lim && need <= ((size_t)256 << 20)) lim = need;
+        need < lim && need <= coli_vk_block_bytes((size_t)256 << 20)) lim = need;
     coli_vk_tier_pool_limit(lim);
     const char *bal = getenv("COLI_VK_TIER_BALANCE");
     T.balance = T.c.in_ram != NULL && !(bal && *bal == '0');

@@ -291,6 +291,17 @@ jobs:
           - family: dense-only-deepseek-sanitize
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow
+          # the partial chain (docs/vulkan.md, "A partial chain"): the first N layers on
+          # the device and the CPU the rest, N forced, from a small device
+          # (COLI_VK_DEVICE_CAP_MB) and after an upload failing mid-setup; every forward
+          # path with N below the layers; one leg per engine group, and the same under
+          # ASan and UBSan
+          - family: partial-deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: partial-deepseek-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
           # big prompt chunks and expert streaming (docs/vulkan.md): every chain engine on a
           # prompt past its usual block, the chunk from the budget, a forced small chunk and
           # streaming threshold, staged, the feature off, and the forced runs under ASan

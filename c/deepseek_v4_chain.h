@@ -89,6 +89,7 @@ typedef struct {
     ColiVkTensor *cwkv, *cwg, *iwkv, *iwg, *iwq, *iwp;
     VkcBuf *win, *ckv, *ring, *ikey, *iring;
     int ccap, kv_valid, ring_ok, icap, ik_valid, iring_ok;
+    int built;                                  /* its tensors and state reached the device */
     size_t pw, pc, pr, pk, pir;                 /* this forward's places in the pull buffer */
     int ns, q1;                                 /* the ring rows it pulls: all (the overlap), or the slots of q1.. */
 } V4cLayer;
@@ -96,6 +97,7 @@ typedef struct {
 typedef struct {
     int ok, failed, told;
     ColiV4Engine *engine;
+    int Lm;                                     /* the model's layers; L below: the chain's, its first L */
     int L, D, H, HD, nm, hr, nh, hd, rd, QL, og, ol, gw, W, Wd, IH, ID, I, K, rmax, rows, nkind;
     int kratio[COLI_V4_MAX_LAYERS + 1];          /* the ratio of each list kind (0: the indexer's) */
     V4cLayer *ly;
@@ -247,41 +249,26 @@ static const char *v4c_unsupported(const ColiDeepSeekV4Config *c) {
     return NULL;
 }
 
-static int v4c_setup(ColiV4Engine *engine) {
+/* ---- the partial chain (vk_chain.h, vkc_fit): the first N layers on the device ---------- */
+static VkcFit g_v4c_fit;
+static int g_v4c_fit_done, g_v4c_building;
+
+/* The chain's geometry for its first L layers (nothing allocated): the per-layer kinds,
+ * the split's tables, the list kinds. Pointers are left alone, so it runs again when a
+ * layer that did not reach the device lowers L. */
+static void v4c_geom(V4Chain *ch, ColiV4Engine *engine, int L) {
     const ColiDeepSeekV4Config *c = &engine->config;
-    const char *why = v4c_unsupported(c);
-    if (!why && !engine->runtime.dense_resident) why = "the dense layers are not resident (a low-memory plan reloads them per forward)";
-    if (!why && (engine->gpu.enabled || (engine->experts && engine->experts->gpu))) why = "the CUDA tier is on and keeps its place";
-    if (why) { fprintf(stderr, "[VK] deepseek_v4 chain: %s; the CPU runs the layers\n", why); return 0; }
-    int L = c->num_hidden_layers;
-    char err[256] = {0};
-    const ColiSafetensorsIndex *index = coli_v4_engine_target_index(engine);
-    for (int i = 0; i < L; i++) {                   /* the resident layers, loaded now */
-        ColiDeepSeekV4LayerWeights w;
-        if (coli_v4_layer_load(engine, &w, c, index, i, err, sizeof err) || !engine->dense_resident.ready[i]) {
-            fprintf(stderr, "[VK] deepseek_v4 chain: layer %d did not load (%s); the CPU runs the layers\n", i, err);
-            return 0;
-        }
-    }
-    V4Chain *ch = calloc(1, sizeof *ch);
-    if (!ch || !(ch->ly = calloc((size_t)L, sizeof *ch->ly)) || !(ch->sli = malloc((size_t)L * sizeof(int)))) {
-        if (ch) free(ch->ly);
-        free(ch); return 0;
-    }
-    g_v4c = ch;
-    ch->engine = engine; ch->L = L; ch->D = c->hidden_size; ch->H = c->hc_mult; ch->HD = ch->H * ch->D;
+    ch->engine = engine; ch->Lm = c->num_hidden_layers; ch->L = L;
+    ch->D = c->hidden_size; ch->H = c->hc_mult; ch->HD = ch->H * ch->D;
     ch->nm = (2 + ch->H) * ch->H; ch->hr = 2 * ch->H + ch->H * ch->H;
     ch->nh = c->num_attention_heads; ch->hd = c->head_dim; ch->rd = c->qk_rope_head_dim; ch->QL = c->q_lora_rank;
     ch->og = c->o_groups; ch->ol = c->o_lora_rank; ch->gw = (ch->nh / ch->og) * ch->hd;
-    ch->W = c->sliding_window; ch->Wd = ch->W + v4c_rows();
-    if (!(ch->slot_pos = malloc((size_t)ch->Wd * sizeof(int)))) return 0;
-    for (int k = 0; k < ch->Wd; k++) ch->slot_pos[k] = -1;
+    ch->W = c->sliding_window;
     ch->IH = c->index_n_heads > 0 ? c->index_n_heads : 1; ch->ID = c->index_head_dim > 0 ? c->index_head_dim : 2;
-    ch->I = c->moe_intermediate_size; ch->rmax = 1; ch->E = -1; ch->nkind = 1;
-    int D = ch->D, nm = ch->nm;
+    ch->I = c->moe_intermediate_size; ch->rmax = 1; ch->nkind = 1; ch->nsl = 0; ch->rmin = 0;
     for (int i = 0; i < L; i++) {
         V4cLayer *ly = &ch->ly[i];
-        ly->ratio = c->compress_ratios[i]; ly->idx = ly->ratio == 4;
+        ly->ratio = c->compress_ratios[i]; ly->idx = ly->ratio == 4; ly->kind = 0;
         if (ly->ratio > ch->rmax) ch->rmax = ly->ratio;
         ly->crows = ly->ratio == 4 ? 8 : ly->ratio; ly->cproj = (ly->ratio == 4 ? 2 : 1) * ch->hd;
         ch->sli[i] = ly->ratio > 0 ? ch->nsl++ : -1;    /* the split's tables: one per compressed layer */
@@ -293,20 +280,249 @@ static int v4c_setup(ColiV4Engine *engine) {
             ly->kind = k;
         }
     }
-    /* the parameter arena: norms decoded from bf16, sinks, hc scales and bases, the rings' biases */
+}
+/* The parameter arena's offsets for the chain's layers: norms decoded from bf16, sinks,
+ * hc scales and bases, the rings' biases. Returns its floats. */
+static size_t v4c_offsets(V4Chain *ch) {
     size_t n = 0;
-    for (int i = 0; i < L; i++) {
+    for (int i = 0; i < ch->L; i++) {
         V4cLayer *ly = &ch->ly[i];
-        ly->o_an = n; n += D; ly->o_fn = n; n += D; ly->o_qn = n; n += ch->QL; ly->o_kn = n; n += ch->hd;
-        ly->o_sink = n; n += ch->nh; ly->o_hca = n; n += 3 + nm; ly->o_hcf = n; n += 3 + nm;
+        ly->o_an = n; n += ch->D; ly->o_fn = n; n += ch->D; ly->o_qn = n; n += ch->QL; ly->o_kn = n; n += ch->hd;
+        ly->o_sink = n; n += ch->nh; ly->o_hca = n; n += 3 + ch->nm; ly->o_hcf = n; n += 3 + ch->nm;
         if (ly->ratio > 0) { ly->o_cn = n; n += ch->hd; ly->o_ape = n; n += (size_t)ly->ratio * ly->cproj; }
         if (ly->idx) { ly->o_icn = n; n += ch->ID; ly->o_iape = n; n += (size_t)4 * 2 * ch->ID; }
     }
+    return n;
+}
+/* What layer i puts on the device, as vkc_fit counts it: its matrices (the chain's set,
+ * which holds the device-only placement's), its state at its first size (the window
+ * ring, the compressors' rings, 64 compressed rows and keys), its part of the parameters
+ * and of a forward's pull buffer at `rows` rows; *mat its matrices' payload. */
+static size_t v4c_layer_bytes(const V4Chain *ch, int i, int rows, size_t *mat) {
+    const ColiDeepSeekV4Config *c = &ch->engine->config;
+    ColiDeepSeekV4LayerPlan plan;
+    size_t b = 0, m = 0;
+    *mat = 0;
+    if (coli_v4_layer_plan(&plan, c, i, NULL, 0)) return 0;
+    for (size_t t = 0; t < plan.tensor_count; t++) {
+        const ColiDeepSeekV4TensorSpec *sp = &plan.tensors[t];
+        if (sp->rank != 2) continue;
+        const char *suf = sp->name;
+        if (!strncmp(suf, "layers.", 7)) { const char *d = strchr(suf + 7, '.'); suf = d ? d + 1 : suf; }
+        int O = (int)sp->shape[0], I = (int)sp->shape[1], fmt = 0, parts = 1;
+        if (sp->dtype == COLI_ST_F8_E4M3) {
+            fmt = 12;
+            if (!strcmp(suf, "attn.wo_a.weight")) { parts = ch->og; O = ch->ol; }   /* one tensor per output group */
+        } else if (sp->dtype == COLI_ST_BF16 &&
+                   (coli_v4_dense_device_only_tensor(sp) || !strcmp(suf, "attn.indexer.weights_proj.weight"))) fmt = 11;
+        else if (sp->dtype == COLI_ST_F32 && (!strcmp(suf, "hc_attn_fn") || !strcmp(suf, "hc_ffn_fn"))) fmt = 10;
+        if (!fmt) continue;
+        for (int p = 0; p < parts; p++) {
+            b += vkc_fit_tensor(fmt, I, O, fmt == 12 ? 128 : 0);
+            m += coli_vk_tensor_payload(fmt, I, O, fmt == 12 ? 128 : 0);
+        }
+    }
+    const V4cLayer *ly = &ch->ly[i];
+    int W = ch->W, hd = ch->hd, ID = ch->ID, E = rows;
+    b += vkc_fit_buf((size_t)(W + v4c_rows()) * hd * sizeof(float));
+    if (ly->ratio > 0) b += vkc_fit_buf((size_t)2 * ly->crows * ly->cproj * sizeof(float)) + vkc_fit_buf((size_t)64 * hd * sizeof(float));
+    if (ly->idx) b += vkc_fit_buf((size_t)2 * 8 * 2 * ID * sizeof(float)) + vkc_fit_buf((size_t)64 * ID * sizeof(float));
+    size_t f = (size_t)2 * ch->D + ch->QL + hd + ch->nh + (size_t)2 * (3 + ch->nm);
+    if (ly->ratio > 0) f += hd + (size_t)ly->ratio * ly->cproj;
+    if (ly->idx) f += ID + (size_t)8 * ID;
+    f += (size_t)(E < W ? E : W) * hd;
+    if (ly->ratio > 0) f += (size_t)(E / ly->ratio) * hd + (size_t)2 * (ly->ratio == 4 ? ly->crows : E < ly->ratio ? E : ly->ratio) * ly->cproj;
+    if (ly->idx) f += (size_t)(E / 4) * ID + (size_t)2 * 8 * 2 * ID;
+    *mat = m;
+    return b + f * sizeof(float);
+}
+static int v4c_scratch(V4Chain *ch, int rows, int E, int LR);
+/* What the chain allocates whatever N: the scratch of one forward of `rows` rows (the
+ * counting pass of v4c_scratch, every layer's list kinds). */
+static size_t v4c_fixed_bytes(V4Chain *ch, int rows) {
+    const ColiDeepSeekV4Config *c = &ch->engine->config;
+    int E = ch->W + rows, K = 0;
+    for (int i = 0; i < ch->L; i++) {
+        V4cLayer *ly = &ch->ly[i];
+        int k = ly->idx ? c->index_topk : ly->ratio > 0 ? E / ly->ratio : 0;
+        if (k > K) K = k;
+    }
+    g_v4c_count = 0;
+    v4c_scratch(ch, rows, E, ch->W + (K > 0 ? K : 1));
+    size_t b = (size_t)g_v4c_count;
+    g_v4c_count = -1;
+    return b;
+}
+/* With every layer on the device, the per-matrix path (COLI_VK_DENSE) also puts the bf16
+ * head and each layer's router there as they are first used: the tail. */
+static size_t v4c_tail_bytes(const ColiV4Engine *engine) {
+    if (!coli_vk_dense()) return 0;
+    const ColiDeepSeekV4Config *c = &engine->config;
+    return vkc_fit_tensor(11, c->hidden_size, c->vocab_size, 0) +
+           (size_t)c->num_hidden_layers * vkc_fit_tensor(11, c->hidden_size, c->n_routed_experts, 0);
+}
+static const char *v4c_unsupported(const ColiDeepSeekV4Config *c);
+static int v4c_decide(const ColiV4Engine *engine);
+/* The decision (vkc_fit), once and before any upload: by the RAM plan when it asks about
+ * the device-only weights, else at v4c_start. 0: no fit (the chain will not run). */
+static int v4c_fit_now(ColiV4Engine *engine) {
+    if (g_v4c_fit_done) return g_v4c_fit.L > 0;
+    g_v4c_fit_done = 1;
+    if (!g_v4_vk_ready || !engine || !v4c_decide(engine) || v4c_unsupported(&engine->config)) return 0;
+    int L = engine->config.num_hidden_layers;
+    V4Chain t;
+    memset(&t, 0, sizeof t);
+    t.ly = calloc((size_t)L, sizeof *t.ly); t.sli = malloc((size_t)L * sizeof(int));
+    size_t *per = calloc((size_t)L, sizeof(size_t)), *mat = calloc((size_t)L, sizeof(size_t));
+    int ok = t.ly && t.sli && per && mat;
+    if (ok) {
+        v4c_geom(&t, engine, L);
+        int rows = v4c_rows();
+        for (int i = 0; i < L; i++) per[i] = v4c_layer_bytes(&t, i, rows, &mat[i]);
+        vkc_fit("deepseek_v4", L, per, mat, v4c_fixed_bytes(&t, rows), v4c_tail_bytes(engine), &g_v4c_fit);
+    }
+    free(t.ly); free(t.sli); free(per); free(mat);
+    return ok;
+}
+static int v4c_fit_n(void) { return g_v4c_fit.n; }
+/* 1: something the full chain would place stays on the CPU (the CPU layers, the head):
+ * the per-matrix path uploads nothing new. */
+static int v4c_partial(void) { return g_v4c_fit_done && vkc_fit_partial(&g_v4c_fit); }
+
+/* Layer i's matrices (the per-matrix path's device copies, one per matrix) and its state
+ * on the device. 0 with *why set: something did not reach it (v4c_layer_free undoes it). */
+static int v4c_layer_up(V4Chain *ch, int i, const char **why) {
+    V4cLayer *ly = &ch->ly[i];
+    const ColiDeepSeekV4LayerWeights *w = &ch->engine->dense_resident.layers[i];
+    *why = "a matrix the device refused";
+    ly->wo_a = calloc((size_t)ch->og, sizeof(void *));
+    int ok = ly->wo_a && (ly->fna = v4c_plain(w, "hc_attn_fn", 10)) && (ly->fnf = v4c_plain(w, "hc_ffn_fn", 10)) &&
+             (ly->wq_a = v4c_fp8(w, "attn.wq_a", 0, 0)) && (ly->wq_b = v4c_fp8(w, "attn.wq_b", 0, 0)) &&
+             (ly->wkv = v4c_fp8(w, "attn.wkv", 0, 0)) && (ly->wo_b = v4c_fp8(w, "attn.wo_b", 0, 0)) &&
+             (ly->sh1 = v4c_fp8(w, "ffn.shared_experts.w1", 0, 0)) && (ly->sh2 = v4c_fp8(w, "ffn.shared_experts.w2", 0, 0)) &&
+             (ly->sh3 = v4c_fp8(w, "ffn.shared_experts.w3", 0, 0));
+    for (int g = 0; ok && g < ch->og; g++) ok = (ly->wo_a[g] = v4c_fp8(w, "attn.wo_a", g, ch->ol)) != NULL;
+    if (ok && ly->ratio > 0)
+        ok = (ly->cwkv = v4c_plain(w, "attn.compressor.wkv.weight", 11)) && (ly->cwg = v4c_plain(w, "attn.compressor.wgate.weight", 11));
+    if (ok && ly->idx)
+        ok = (ly->iwkv = v4c_plain(w, "attn.indexer.compressor.wkv.weight", 11)) &&
+             (ly->iwg = v4c_plain(w, "attn.indexer.compressor.wgate.weight", 11)) &&
+             (ly->iwp = v4c_plain(w, "attn.indexer.weights_proj.weight", 11)) && (ly->iwq = v4c_fp8(w, "attn.indexer.wq_b", 0, 0));
+    if (!ok) return 0;
+    *why = "device memory for its state refused";
+    if (ly->ratio > 0 && !(ly->ring = vkc_buf((size_t)2 * ly->crows * ly->cproj * sizeof(float), VKC_DEV))) return 0;
+    if (ly->idx && !(ly->iring = vkc_buf((size_t)2 * 8 * 2 * ch->ID * sizeof(float), VKC_DEV))) return 0;
+    return (ly->win = vkc_buf((size_t)ch->Wd * ch->hd * sizeof(float), VKC_DEV)) != NULL;
+}
+static void v4_vk_forget(ColiVkTensor *t);   /* the per-matrix map's entry: its tensor freed, the matrix the CPU's */
+/* Everything of layer i off the device: its tensors (and their per-matrix entries, which
+ * stay refused: the matrix is the CPU's) and its buffers, after the frames that read them. */
+static void v4c_layer_free(V4Chain *ch, int i) {
+    V4cLayer *ly = &ch->ly[i];
+    if (vkc_ready()) vkc_finish();
+    ColiVkTensor **ts[] = {&ly->fna, &ly->fnf, &ly->wq_a, &ly->wq_b, &ly->wkv, &ly->wo_b, &ly->sh1, &ly->sh2, &ly->sh3,
+                           &ly->cwkv, &ly->cwg, &ly->iwkv, &ly->iwg, &ly->iwq, &ly->iwp};
+    for (size_t k = 0; k < sizeof ts / sizeof *ts; k++) { v4_vk_forget(*ts[k]); *ts[k] = NULL; }
+    for (int g = 0; ly->wo_a && g < ch->og; g++) v4_vk_forget(ly->wo_a[g]);
+    free(ly->wo_a); ly->wo_a = NULL;
+    VkcBuf **bs[] = {&ly->win, &ly->ckv, &ly->ring, &ly->ikey, &ly->iring};
+    for (size_t k = 0; k < sizeof bs / sizeof *bs; k++) { vkc_free(*bs[k]); *bs[k] = NULL; }
+    ly->ccap = ly->icap = ly->kv_valid = ly->ik_valid = ly->ring_ok = ly->iring_ok = 0;
+    ly->built = 0;
+}
+/* Layer i did not reach the device: the chain keeps the layers before it, and with the
+ * dense weights on the device only, the layers from i on keep their host copies. */
+static void v4c_cut(V4Chain *ch, int i, const char *why) {
+    ColiV4Engine *e = ch->engine;
+    if (i < ch->L) ch->L = i;
+    if (e->dense_resident.device_only && e->dense_resident.device_layers > i) {
+        fprintf(stderr, "[VK] deepseek_v4: layers %d to %d keep their host copies after all (the RAM plan had counted "
+                        "them on the device)\n", i, e->dense_resident.device_layers - 1);
+        e->dense_resident.device_layers = i;
+        coli_vk_dense_host_layers(i, ch->Lm);
+    }
+    vkc_fit_shrink("deepseek_v4", &g_v4c_fit, i, why);
+}
+/* The placement of the dense weights on the device only (v4_dho_place) builds the chain's
+ * layer first while the chain is being set up: 1 built, 0 not the chain's, -1 it did not
+ * reach the device (the chain was cut there; the layer keeps its host copies). */
+static int v4c_build_layer(int layer) {
+    V4Chain *ch = g_v4c;
+    if (!g_v4c_building || !ch || layer >= ch->L) return 0;
+    if (ch->ly[layer].built) return 1;
+    const char *why = NULL;
+    if (v4c_layer_up(ch, layer, &why)) { ch->ly[layer].built = 1; return 1; }
+    v4c_layer_free(ch, layer);
+    v4c_cut(ch, layer, why);
+    return -1;
+}
+/* The device-only placement of a chained layer failed after the chain built it: all of
+ * the layer off the device, the chain cut before it. */
+static void v4c_drop_layer(int layer, const char *why) {
+    if (!g_v4c) return;
+    v4c_layer_free(g_v4c, layer);
+    v4c_cut(g_v4c, layer, why);
+}
+/* Every chained layer off the device and the chain off (a layer that would not load, the
+ * parameters refused): what the device held alone comes back from disk when the CPU asks. */
+static void v4c_teardown(V4Chain *ch, const char *why) {
+    for (int i = 0; i < ch->L; i++) if (ch->ly[i].built) v4c_layer_free(ch, i);
+    vkc_free(ch->prm); ch->prm = NULL;
+    v4c_cut(ch, 0, why);
+}
+
+static int v4c_setup(ColiV4Engine *engine) {
+    const ColiDeepSeekV4Config *c = &engine->config;
+    const char *why = v4c_unsupported(c);
+    if (!why && !engine->runtime.dense_resident) why = "the dense layers are not resident (a low-memory plan reloads them per forward)";
+    if (!why && (engine->gpu.enabled || (engine->experts && engine->experts->gpu))) why = "the CUDA tier is on and keeps its place";
+    if (why) { fprintf(stderr, "[VK] deepseek_v4 chain: %s; the CPU runs the layers\n", why); return 0; }
+    int L = c->num_hidden_layers, N = g_v4c_fit.n;
+    if (N < 1) return 0;                            /* the fit's line said so: the chain stays off */
+    V4Chain *ch = calloc(1, sizeof *ch);
+    if (!ch || !(ch->ly = calloc((size_t)L, sizeof *ch->ly)) || !(ch->sli = malloc((size_t)L * sizeof(int)))) {
+        if (ch) free(ch->ly);
+        free(ch); return 0;
+    }
+    g_v4c = ch;
+    v4c_geom(ch, engine, N);
+    ch->Wd = ch->W + v4c_rows(); ch->E = -1;
+    if (!(ch->slot_pos = malloc((size_t)ch->Wd * sizeof(int)))) return 0;
+    for (int k = 0; k < ch->Wd; k++) ch->slot_pos[k] = -1;
+    size_t n = v4c_offsets(ch);
+    if (!(ch->prm = vkc_buf((n ? n : 1) * sizeof(float), VKC_DEV))) {
+        v4c_cut(ch, 0, "device memory for the parameters refused");
+        return 0;
+    }
+    /* the resident layers, loaded now; each chained one goes up whole (with the dense
+     * weights on the device only, in its placement), or the chain stops before it */
+    char err[256] = {0};
+    const ColiSafetensorsIndex *index = coli_v4_engine_target_index(engine);
+    g_v4c_building = 1;
+    for (int i = 0; i < L; i++) {
+        ColiDeepSeekV4LayerWeights w;
+        if (coli_v4_layer_load(engine, &w, c, index, i, err, sizeof err) || !engine->dense_resident.ready[i]) {
+            g_v4c_building = 0;
+            fprintf(stderr, "[VK] deepseek_v4 chain: layer %d did not load (%s); the CPU runs the layers\n", i, err);
+            v4c_teardown(ch, "a layer did not load");
+            return 0;
+        }
+        if (i >= ch->L) continue;
+        if (v4c_build_layer(i) > 0) vkc_fit_mark(&g_v4c_fit, i);
+    }
+    g_v4c_building = 0;
+    if (ch->L < 1) {   /* layer 0 did not reach the device: nothing of the chain stays there */
+        vkc_free(ch->prm); ch->prm = NULL;
+        vkc_fit_placed("deepseek_v4", &g_v4c_fit);
+        return 0;
+    }
+    v4c_geom(ch, engine, ch->L);                    /* the split's tables and list kinds for the layers it kept */
     float *a = calloc(n ? n : 1, sizeof(float));
     int ok = a != NULL;
-    for (int i = 0; ok && i < L; i++) {
+    for (int i = 0; ok && i < ch->L; i++) {
         V4cLayer *ly = &ch->ly[i];
         const ColiDeepSeekV4LayerWeights *w = &engine->dense_resident.layers[i];
+        int D = ch->D, nm = ch->nm;
         const uint16_t *an = v4c_val(w, "attn_norm.weight"), *fn = v4c_val(w, "ffn_norm.weight"),
                        *qn = v4c_val(w, "attn.q_norm.weight"), *kn = v4c_val(w, "attn.kv_norm.weight");
         const float *sink = v4c_val(w, "attn.attn_sink"), *hsa = v4c_val(w, "hc_attn_scale"), *hba = v4c_val(w, "hc_attn_base"),
@@ -335,39 +551,23 @@ static int v4c_setup(ColiV4Engine *engine) {
             if (ok) memcpy(a + ly->o_iape, iape, (size_t)8 * ch->ID * sizeof(float));
         }
     }
-    ok = ok && (ch->prm = vkc_buf((n ? n : 1) * sizeof(float), VKC_DEV)) && vkc_begin() &&
-         vkc_write(ch->prm, 0, a, n * sizeof(float)) && vkc_submit(1);
+    ok = ok && vkc_begin() && vkc_write(ch->prm, 0, a, n * sizeof(float)) && vkc_submit(1);
     free(a);
-    /* the tensors and the per-layer state on the device */
-    for (int i = 0; ok && i < L; i++) {
-        V4cLayer *ly = &ch->ly[i];
-        const ColiDeepSeekV4LayerWeights *w = &engine->dense_resident.layers[i];
-        ly->wo_a = calloc((size_t)ch->og, sizeof(void *));
-        ok = ly->wo_a && (ly->fna = v4c_plain(w, "hc_attn_fn", 10)) && (ly->fnf = v4c_plain(w, "hc_ffn_fn", 10)) &&
-             (ly->wq_a = v4c_fp8(w, "attn.wq_a", 0, 0)) && (ly->wq_b = v4c_fp8(w, "attn.wq_b", 0, 0)) &&
-             (ly->wkv = v4c_fp8(w, "attn.wkv", 0, 0)) && (ly->wo_b = v4c_fp8(w, "attn.wo_b", 0, 0)) &&
-             (ly->sh1 = v4c_fp8(w, "ffn.shared_experts.w1", 0, 0)) && (ly->sh2 = v4c_fp8(w, "ffn.shared_experts.w2", 0, 0)) &&
-             (ly->sh3 = v4c_fp8(w, "ffn.shared_experts.w3", 0, 0));
-        for (int g = 0; ok && g < ch->og; g++) ok = (ly->wo_a[g] = v4c_fp8(w, "attn.wo_a", g, ch->ol)) != NULL;
-        if (ok && ly->ratio > 0)
-            ok = (ly->cwkv = v4c_plain(w, "attn.compressor.wkv.weight", 11)) && (ly->cwg = v4c_plain(w, "attn.compressor.wgate.weight", 11)) &&
-                 (ly->ring = vkc_buf((size_t)2 * ly->crows * ly->cproj * sizeof(float), VKC_DEV));
-        if (ok && ly->idx)
-            ok = (ly->iwkv = v4c_plain(w, "attn.indexer.compressor.wkv.weight", 11)) &&
-                 (ly->iwg = v4c_plain(w, "attn.indexer.compressor.wgate.weight", 11)) &&
-                 (ly->iwp = v4c_plain(w, "attn.indexer.weights_proj.weight", 11)) && (ly->iwq = v4c_fp8(w, "attn.indexer.wq_b", 0, 0)) &&
-                 (ly->iring = vkc_buf((size_t)2 * 8 * 2 * ch->ID * sizeof(float), VKC_DEV));
-        if (ok) ok = (ly->win = vkc_buf((size_t)ch->Wd * ch->hd * sizeof(float), VKC_DEV)) != NULL;
+    if (!ok) {
+        fprintf(stderr, "[VK] deepseek_v4 chain: the parameters did not reach the device; the CPU runs the layers\n");
+        v4c_teardown(ch, "the parameters did not reach it");
+        vkc_fit_placed("deepseek_v4", &g_v4c_fit);
+        return 0;
     }
-    if (!ok) { fprintf(stderr, "[VK] deepseek_v4 chain: a matrix or the state did not reach the device; the CPU runs the layers\n"); return 0; }
     ch->ok = 1;
     int ncomp = 0, nidx = 0;
-    for (int i = 0; i < L; i++) { ncomp += ch->ly[i].ratio > 0; nidx += ch->ly[i].idx; }
+    for (int i = 0; i < ch->L; i++) { ncomp += ch->ly[i].ratio > 0; nidx += ch->ly[i].idx; }
     size_t bytes = 0, tensors = 0;
     coli_vk_mem_info(&bytes, &tensors);
     fprintf(stderr, "[VK] deepseek_v4 chain: %d layers on the device (%d compressing, %d indexing), %d streams, "
                     "%.1f MiB of parameters, %zu matrices (%.1f MiB) on the device\n",
-            L, ncomp, nidx, ch->H, n * 4 / 1048576.0, tensors, bytes / 1048576.0);
+            ch->L, ncomp, nidx, ch->H, n * 4 / 1048576.0, tensors, bytes / 1048576.0);
+    vkc_fit_placed("deepseek_v4", &g_v4c_fit);
     return 1;
 }
 
@@ -663,10 +863,12 @@ static int v4c_read_count(ColiDeepSeekV4WindowAttentionState *s, int *count, int
     return 1;
 }
 
-/* Every layer for the n rows of streams in *state_ptr (positions start..), the final
- * streams into *state_ptr (swapped with *next_ptr, as the CPU's layer loop leaves them).
- * 1: done; 0: not taken (the CPU runs the layers, nothing changed); -1: the MoE failed
- * (error set, the host state as before the forward). */
+/* The chain's layers (the first ch->L of the model's) for the n rows of streams in
+ * *state_ptr (positions start..), the streams after its last layer into *state_ptr
+ * (swapped with *next_ptr, as the CPU's layer loop leaves them): the handoff of a partial
+ * chain, where the caller's CPU loop runs the remaining layers from there. Returns the
+ * layers it ran (ch->L); 0: not taken (the CPU runs every layer, nothing changed); -1: the
+ * MoE failed (error set, the host state as before the forward). */
 static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                        ColiDeepSeekV4WindowAttentionState **attention, const ColiDeepSeekV4Config *config,
                        ColiExpertStore *experts, const int *tokens, int start, int n, int pool,
@@ -761,7 +963,8 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
     static int ident = -1;
     if (ident < 0) { const char *e = getenv("V4_IDX_IDENTITY"); ident = e && *e == '1'; }
     float *state = *state_ptr, *next = *next_ptr;
-    int T0 = L - 3, taps = coli_v4_full_dspark_wanted;     /* DSpark's targets: the last three layers */
+    int T0 = ch->Lm - 3, taps = coli_v4_full_dspark_wanted;   /* DSpark's targets: the model's last three layers
+                                                                  * (those the chain runs; the CPU taps the rest) */
     for (int c0 = 0; c0 < n; c0 += rows) {
         int nr = n - c0 < rows ? n - c0 : rows, pb = start + c0, last = c0 + nr == n;
         V4cFwd f = {start, n, pb, nr, 0, nr * rd, LR, 0};
@@ -973,7 +1176,7 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
     *state_ptr = next; *next_ptr = state;
     free(cs); free(wl); free(cos_); free(sin_);
     ch->forwards++;
-    return 1;
+    return L;   /* a partial chain: the CPU runs layers L.. from these streams */
 host_oom:   /* the host state half written: as a failed CPU forward leaves it, an error */
     free(cs); free(wl); free(cos_); free(sin_);
     v4c_lower(0);
@@ -1022,6 +1225,7 @@ static void v4c_start(const ColiV4Engine *cengine) {
         no = "the MLA, mHC or DeepSeek shaders are missing (chain_hgemv, chain_mhc, chain_dsv4)";
     if (no) fprintf(stderr, "[VK] deepseek_v4: %s: the dense chain stays off\n", no);
     if (!on || no) return;
+    if (!v4c_fit_now(engine) || g_v4c_fit.n < 1) return;   /* how many layers fit (vkc_fit), once */
     if (!v4c_setup(engine)) return;
     g_v4c_mode = on;
 }

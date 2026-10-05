@@ -24,6 +24,9 @@
 #   bash tests/vulkan_engines.sh staged-faults | staged-faults-sanitize   # staged uploads failing
 #   bash tests/vulkan_engines.sh dense-only-<group> | dense-only-<group>-sanitize   # the dense weights
 #        on the device only (COLI_VK_DENSE_HOST=0), tests/vulkan_dense_only_<group>.sh
+#   bash tests/vulkan_engines.sh partial-<group> | partial-<group>-sanitize   # the partial chain:
+#        the first N layers on the device (COLI_VK_CHAIN_LAYERS, COLI_VK_DEVICE_CAP_MB),
+#        tests/vulkan_partial_<group>.sh
 #   bash tests/vulkan_engines.sh decide | decide-sanitize   # Laya, GLiNER2.5-Decide and Clef's DECIDE
 #
 # Needs libvulkan-dev, glslc and mesa-vulkan-drivers, plus the Python packages of
@@ -2885,6 +2888,97 @@ PY
   echo "OK $tag: $(grep -o 'given back.*' vk.log | head -1)"
 }
 for f in tests/vulkan_dense_only_*.sh; do [ -e "$f" ] && . "$f"; done
+
+# ---- the partial chain (docs/vulkan.md, "A partial chain"): the first N layers on the
+# device, the rest and the head on the CPU. One file per engine group,
+# tests/vulkan_partial_<group>.sh, each defining ptl_family_<group> and
+# ptl_family_<group>_sanitize (run as partial-<group> and partial-<group>-sanitize);
+# tests/vulkan_partial_deepseek.sh is the template. The helpers read the engine's lines:
+#   [VK] <engine> chain fit: free F B, reserve R B, fixed X B (...), tail T B, layers b0 .. B, matrices m0 .. B
+#   [VK] <engine> chain: N of L layers on the device ...        (the last one is the final N)
+#   [VK] <engine> chain: N of L layers placed: M B of matrices on the device (the fit counted M' B ...), ...
+#
+# ptl_n <engine> <log>: the final N (-1 without a line)
+ptl_n() {
+  local n; n=$(sed -n "s/^\[VK\] $1 chain: \([0-9][0-9]*\) of [0-9][0-9]* layers on the device.*/\1/p" "$2" | tail -1)
+  echo "${n:--1}"
+}
+# ptl_L <engine> <log>: L, the model's layers, from the same line
+ptl_L() {
+  local n; n=$(sed -n "s/^\[VK\] $1 chain: [0-9][0-9]* of \([0-9][0-9]*\) layers on the device.*/\1/p" "$2" | tail -1)
+  echo "${n:--1}"
+}
+# ptl_calc <what> <engine> <log> [k]: arithmetic on the fit line (a probe run's for "cap")
+#   predict  N as vkc_fit's rule gives it from the line's numbers
+#   cap      the COLI_VK_DEVICE_CAP_MB (MiB, a fraction) under which exactly k layers fit:
+#            the bytes the probe held at the fit (its cap PTL_PROBE_CAP_MB less its free),
+#            the reserve, the engine's fixed bytes, the pools' granularity at the new cap,
+#            k layers, and half of layer k (k < L) or the tail too (k = L). Probe with the
+#            same settings and a cap of 256 or less: up to 256 MiB the pools' blocks (and so
+#            what is held at the fit) do not depend on the cap
+#   fault    the COLI_VK_STAGED_FAULT count to aim inside layer k's setup: the second time
+#            the point is reached within it (the placed line's marks; a first one there may
+#            be a fresh block's zero fill, which only skips the fill)
+#   matrices M and M' of the placed line, "M M'"
+ptl_calc() {
+  $PY - "$@" <<'PY'
+import os, re, sys
+what, eng, log = sys.argv[1], sys.argv[2], sys.argv[3]
+k = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+lines = open(log, errors="replace").read().splitlines()
+fit = [l for l in lines if l.startswith(f"[VK] {eng} chain fit: ")]
+if what in ("predict", "cap"):
+    if not fit: sys.exit("no fit line")
+    f = fit[-1]
+    num = lambda key: int(re.search(key + r" (\d+) B", f)[1])
+    free, res, fixed, tail = num("free"), num("reserve"), num("fixed"), num("tail")
+    layers = [int(x) for x in re.search(r"layers((?: \d+)*) B", f)[1].split()]
+    L, room = len(layers), max(0, free - res)
+    if what == "predict":
+        if fixed + sum(layers) <= room: print(L); sys.exit(0)
+        n, acc = 0, fixed
+        while n < L and acc + layers[n] <= room: acc += layers[n]; n += 1
+        print(n); sys.exit(0)
+    # the pools' part of fixed depends on the cap (coli_vk_block_bytes): recompute it
+    def blk(cap, d):
+        b = 64 << 10
+        while b < cap // 4096: b <<= 1
+        return min(b, d)
+    pools = lambda cap: blk(cap, 256 << 20) + 3 * blk(cap, 64 << 20) + 4 * (4 << 20)
+    engine = int(re.search(r"the engine's (\d+) B", f)[1])
+    held = int(float(os.environ["PTL_PROBE_CAP_MB"]) * 1048576) - free
+    cap = held + free
+    for _ in range(4):
+        cap = held + res + engine + pools(cap) + sum(layers[:k]) + (layers[k] // 2 if k < L else tail + 4096)
+    print(f"{cap / 1048576:.6f}")
+elif what == "fault":
+    p = [l for l in lines if re.match(rf"\[VK\] {eng} chain: \d+ of \d+ layers placed", l)]
+    m = re.search(r"reached ([\d,]+) times", p[-1] if p else "")
+    if not m: sys.exit("no marks on the placed line")
+    c = [int(x) for x in m[1].split(",")]
+    lo = c[k - 1] if k else 0
+    if c[k] - lo < 2: sys.exit(f"layer {k} reaches the point {c[k] - lo} times")
+    print(lo + 2)
+elif what == "matrices":
+    p = [l for l in lines if re.match(rf"\[VK\] {eng} chain: \d+ of \d+ layers placed", l)]
+    m = re.search(r"placed: (\d+) B of matrices on the device \(the fit counted (\d+) B", p[-1] if p else "")
+    if not m: sys.exit("no placed line")
+    print(m[1], m[2])
+PY
+}
+# ptl_check_n <engine> <log> <want> <tag>: the final N is want, and the line says L
+ptl_check_n() {
+  local n; n=$(ptl_n "$1" "$2")
+  [ "$n" = "$3" ] || { grep -E "^\[VK\] $1 chain" "$2"; fail "$4: N is $n, not $3"; }
+}
+# ptl_check_placed <engine> <log> <tag>: the matrices on the device after setup are the N
+# layers' as the fit counted them, nothing of a layer that did not complete
+ptl_check_placed() {
+  local mm; mm=$(ptl_calc matrices "$1" "$2") || { grep -E "^\[VK\] $1 chain" "$2"; fail "$3: no placed line"; }
+  set -- $mm "$3"
+  [ "$1" = "$2" ] || fail "$3: $1 B of matrices on the device after setup, the N layers' are $2 B"
+}
+for f in tests/vulkan_partial_*.sh; do [ -e "$f" ] && . "$f"; done
 # ---- big prompt chunks and expert streaming (docs/vulkan.md, "Big prompt chunks and
 # expert streaming") ----
 # Every engine with the chain, on a prompt longer than its usual block, against its CPU
@@ -3995,5 +4089,8 @@ case "${1:-}" in
   dense-only-*)   g=${1#dense-only-}; fn=dho_family_${g//-/_}
                   declare -F "$fn" >/dev/null || { echo "no dense-only group ${g}" >&2; exit 2; }
                   "$fn" ;;
-  *) echo "usage: $0 decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-deepseek|kv-split-deepseek-sanitize" >&2; exit 2 ;;
+  partial-*)      g=${1#partial-}; fn=ptl_family_${g//-/_}
+                  declare -F "$fn" >/dev/null || { echo "no partial-chain group ${g}" >&2; exit 2; }
+                  "$fn" ;;
+  *) echo "usage: $0 decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-deepseek|kv-split-deepseek-sanitize" >&2; exit 2 ;;
 esac

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Hardware and model placement planning for colibri's disk/RAM/VRAM tiers."""
 
+import collections
 import json
 import os
 import platform
@@ -132,13 +133,16 @@ def _vk_device(env, vulkan):
         return None
 
 
-def _vk_dense_active(family_id, env, vulkan):
+def _vk_chain_dense(family_id, env, vulkan):
+    """(chain, dense): whether the engine runs its dense chain, and its per-matrix
+    path, on the Vulkan device (coli_vk_chain_decide, coli_vk_dense_decide); both
+    False when it does not open one."""
     if (family_id not in _VK_DENSE_HOST_FAMILIES or
             not _vk_flag(env, "COLI_VULKAN") or _vk_flag(env, "COLI_CUDA")):
-        return False
+        return False, False
     kind = (vulkan or {}).get("type")
     if kind not in ("discrete", "integrated", "cpu", "virtual", "other"):
-        return False
+        return False, False
     tier = _vk_flag(env, "COLI_VK_TIER") != 0
     chain, dense = _vk_flag(env, "COLI_VK_CHAIN"), _vk_flag(env, "COLI_VK_DENSE")
     if chain is None:
@@ -148,7 +152,11 @@ def _vk_dense_active(family_id, env, vulkan):
         # colibri.c passes default=0 to coli_vk_dense_decide; its chain is
         # independent, but disabling that chain does not enable per-matrix GEMVs.
         dense = family_id != "glm" and (kind not in ("integrated", "cpu") or not tier)
-    return bool(chain or dense)
+    return bool(chain), bool(dense)
+
+
+def _vk_dense_active(family_id, env, vulkan):
+    return any(_vk_chain_dense(family_id, env, vulkan))
 
 
 def _text_weight_name(name):
@@ -360,6 +368,218 @@ def vk_dense_device_only(dense_bytes, family_id=None, env=None, vulkan=None):
         if dense_bytes <= free:
             return True, "a discrete GPU with room for the dense weights"
     return False, None
+
+
+# ---- the partial chain (docs/vulkan.md, "A partial chain") ------------------------------
+# When the dense layers do not all fit the device, the chain takes the first N of them and
+# the CPU the rest and the head; only the N layers' host copies can then be dropped. The
+# engine decides N with vkc_fit (vk_chain.c) from what the device has free; this mirrors
+# it, per family, from the scanned tensors and the config:
+#   _VK_CHAIN_LAYOUT[family_id](info, env) -> VkChainLayout(layers, fixed, tail) or None
+#     layers  each layer's device bytes as the engine's fit counts them (its matrices,
+#             each range aligned, its state at its first size, its share of the
+#             parameters), fixed  the engine's fixed bytes (the scratch of one prompt
+#             chunk, without the pools' granularity), tail  what goes up only with every
+#             layer (the head, matrices the per-matrix path uploads as it meets them).
+# Families without an entry keep N = L (the plan as before).
+VkChainLayout = collections.namedtuple("VkChainLayout", "layers fixed tail")
+_VK_CHAIN_LAYOUT = {}
+_VK_ALIGN = 256   # coli_vk_buffer_alignment: a storage buffer's alignment, at least 256
+
+
+def _vk_up(value, align=_VK_ALIGN):
+    return (value + align - 1) // align * align
+
+
+def vk_tensor_bytes(fmt, columns, rows, group=0):
+    """vkc_fit_tensor: a resident tensor's rows at their padded stride and its scales,
+    each range aligned (fmt as the backend numbers them: 10 f32, 11 bf16, 12 fp8 in
+    groups, 1 int8 rows, 2 int4 rows, 4 int4 in groups, 7 MXFP4, 13 int8 in groups)."""
+    row = {10: 4 * columns, 11: 2 * columns, 14: 2 * columns, 12: columns, 13: columns, 1: columns,
+           2: (columns + 1) // 2, 4: (columns + 1) // 2, 7: (columns + 1) // 2}[fmt]
+    data = (row + 3) // 4 * 4 * rows
+    if fmt in (10, 11, 14):
+        scales = 1
+    elif fmt in (4, 7, 12, 13):
+        scales = rows * -(-columns // group)
+    else:
+        scales = rows
+    return _vk_up(data or 4) + _vk_up(4 * scales)
+
+
+def vk_buf_bytes(value):
+    """vkc_fit_buf: a chain buffer (vkc_buf) of `value` bytes."""
+    return _vk_up((max(value, 4) + 3) // 4 * 4)
+
+
+def _vk_layer_index(name):
+    match = re.match(r"(?:model\.)?layers\.(\d+)\.", _text_weight_name(name))
+    return int(match[1]) if match else None
+
+
+def _vk_cap_bytes(env):
+    value = (env.get("COLI_VK_DEVICE_CAP_MB") or "").strip()
+    try:
+        return max(0, int(float(value) * 1048576)) if value else 0
+    except ValueError:
+        return 0
+
+
+def _vk_block(cap, default):
+    """coli_vk_block_bytes: a pool's block, smaller under COLI_VK_DEVICE_CAP_MB."""
+    if not cap:
+        return default
+    block = 64 << 10
+    while block < cap // 4096:
+        block <<= 1
+    return min(block, default)
+
+
+def vk_fit_pools(cap=0):
+    """vkc_fit_pools: a weight block, a block of each chain pool, the frames' staging."""
+    return _vk_block(cap, 256 << 20) + 3 * _vk_block(cap, 64 << 20) + 4 * (4 << 20)
+
+
+def _vk_free_bytes(env, vulkan):
+    """coli_vk_free_bytes as a plan sees it: the cap (the process holds nothing yet),
+    else the device's budget (or its device-local heap) less its heaps' usage."""
+    cap = _vk_cap_bytes(env)
+    if cap:
+        return cap
+    vulkan = vulkan or {}
+    used = sum(heap.get("usage", 0) for heap in vulkan.get("heaps", []) if heap.get("device_local"))
+    return max(0, (vulkan.get("budget_bytes") or vulkan.get("device_local_bytes") or 0) - used)
+
+
+def vk_chain_fit(info, family_id, env=None, vulkan=None):
+    """The engine's vkc_fit for this model and device: {"n", "L", "tail", "forced",
+    "free", "reserve", "fixed", "layers"}, or None when the chain does not run or the
+    family has no layout (N = L then, as before)."""
+    env = os.environ if env is None else env
+    vulkan = _vk_device(env, vulkan)
+    chain, _ = _vk_chain_dense(family_id, env, vulkan)
+    layout_of = _VK_CHAIN_LAYOUT.get(family_id)
+    layout = layout_of(info, env, vulkan) if chain and layout_of else None
+    if layout is None:
+        return None
+    layers = list(layout.layers)
+    count = len(layers)
+    free = _vk_free_bytes(env, vulkan)
+    try:
+        reserve = max(0, int(float(env.get("COLI_VK_TIER_RESERVE_GB") or 1.0) * (1 << 30)))
+    except ValueError:
+        reserve = 1 << 30
+    fixed = layout.fixed + vk_fit_pools(_vk_cap_bytes(env))
+    room = max(0, free - reserve)
+    forced = (env.get("COLI_VK_CHAIN_LAYERS") or "").strip()
+    if forced and forced != "auto":
+        match = re.match(r"\s*([+-]?\d+)", forced)
+        n = min(max(int(match[1]) if match else 0, 0), count)
+        tail = n == count and count > 0
+    elif fixed + sum(layers) <= room:
+        n, tail = count, fixed + sum(layers) + layout.tail <= room
+    else:
+        n, used = 0, fixed
+        while n < count and used + layers[n] <= room:
+            used += layers[n]
+            n += 1
+        tail = False
+    return {"n": n, "L": count, "tail": tail, "forced": bool(forced and forced != "auto"),
+            "free": free, "reserve": reserve, "fixed": fixed, "layers": layers}
+
+
+def _v4_chain_rows(env):
+    """deepseek_v4_chain.h v4c_rows: the CPU's prefill block, COLI_VK_CHAIN_ROWS below it."""
+    def number(name, default):
+        match = re.match(r"\s*([+-]?\d+)", env.get(name) or "")
+        return int(match[1]) if match else default
+    block = number("V4_PREFILL_CHUNK", 128)
+    if block < 1 or block > 128:
+        block = 128
+    value = env.get("COLI_VK_CHAIN_ROWS") or ""
+    rows = number("COLI_VK_CHAIN_ROWS", block) if value.strip() and value.strip() != "auto" else block
+    return min(max(rows, 1), block)
+
+
+def _v4_chain_layout(info, env, vulkan):
+    """deepseek_v4_chain.h: v4c_layer_bytes, v4c_fixed_bytes, v4c_tail_bytes."""
+    c = info.get("config") or {}
+    try:
+        L = int(c["num_hidden_layers"])
+        ratios = [int(r) for r in c["compress_ratios"][:L]]
+        D, H, nh, hd = c["hidden_size"], c.get("hc_mult", 1), c["num_attention_heads"], c["head_dim"]
+        rd, QL, og, ol = c["qk_rope_head_dim"], c["q_lora_rank"], c.get("o_groups", 1), c["o_lora_rank"]
+        W, inter = c["sliding_window"], c["moe_intermediate_size"]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if len(ratios) < L or L < 1:
+        return None
+    IH = c.get("index_n_heads") or 0
+    IH = IH if IH > 0 else 1
+    ID = c.get("index_head_dim") or 0
+    ID = ID if ID > 0 else 2
+    topk = c.get("index_topk") or 0
+    HD, nm, hr = H * D, (2 + H) * H, 2 * H + H * H
+    rows = _v4_chain_rows(env)
+    layers = [0] * L
+    for tensor in info.get("dense_tensors", []):
+        layer, shape = _vk_layer_index(tensor["name"]), tensor.get("shape")
+        if layer is None or layer >= L or not isinstance(shape, list) or len(shape) != 2:
+            continue
+        suffix = re.sub(r"^(?:model\.)?layers\.\d+\.", "", _text_weight_name(tensor["name"]))
+        out, columns, parts, fmt = shape[0], shape[1], 1, 0
+        if tensor["dtype"] == "F8_E4M3":
+            fmt = 12
+            if suffix == "attn.wo_a.weight":
+                parts, out = og, ol
+        elif tensor["dtype"] == "BF16" and (suffix.endswith(("compressor.wkv.weight", "compressor.wgate.weight"))
+                                            or suffix == "attn.indexer.weights_proj.weight"):
+            fmt = 11
+        elif tensor["dtype"] == "F32" and suffix in ("hc_attn_fn", "hc_ffn_fn"):
+            fmt = 10
+        if fmt:
+            layers[layer] += parts * vk_tensor_bytes(fmt, columns, out, 128 if fmt == 12 else 0)
+    for i, r in enumerate(ratios):
+        crows, cproj = (8 if r == 4 else r), (2 if r == 4 else 1) * hd
+        state = vk_buf_bytes((W + rows) * hd * 4)
+        if r > 0:
+            state += vk_buf_bytes(2 * crows * cproj * 4) + vk_buf_bytes(64 * hd * 4)
+        if r == 4:
+            state += vk_buf_bytes(2 * 8 * 2 * ID * 4) + vk_buf_bytes(64 * ID * 4)
+        floats = 2 * D + QL + hd + nh + 2 * (3 + nm)
+        if r > 0:
+            floats += hd + r * cproj
+        if r == 4:
+            floats += ID + 8 * ID
+        floats += min(rows, W) * hd
+        if r > 0:
+            floats += (rows // r) * hd + 2 * (crows if r == 4 else min(rows, r)) * cproj
+        if r == 4:
+            floats += (rows // 4) * ID + 2 * 8 * 2 * ID
+        layers[i] += state + 4 * floats
+    # v4c_scratch's counting pass at `rows` rows, the context of the window and them
+    E = W + rows
+    K = max([topk if r == 4 else E // r if r > 0 else 0 for r in ratios] + [0])
+    LR = W + (K if K > 0 else 1)
+    kinds = 1 + len({r for r in ratios if r > 0 and r != 4})
+    rmax = max([1] + ratios)
+    taps = 3 if int(c.get("num_nextn_predict_layers") or 0) >= 3 else 1
+    r_ = rows
+    counts = [r_ * HD, r_ * HD, r_ * nm, r_ * hr, r_ * hr, r_ * D, r_ * D, r_ * D, r_ * QL, r_ * QL, r_ * QL,
+              r_ * nh * hd, r_ * hd, r_ * nh * hd, r_ * og * ol, r_ * D, r_ * 2 * hd, r_ * 2 * hd,
+              r_ * 2 * ID, r_ * 2 * ID, r_ * IH * ID, r_ * IH, r_ * max(E // 4, 1), kinds * r_ * LR,
+              (2 * r_ + rmax) * rd, r_ * D, r_ * inter, r_ * inter, r_ * inter, r_ * D, r_ * D, r_ * D,
+              r_ * HD, taps * r_ * HD]
+    fixed = sum(4 * (n if n else 1) for n in counts)
+    _, dense = _vk_chain_dense("deepseek_v4", env, vulkan)
+    tail = 0
+    if dense:
+        tail = (vk_tensor_bytes(11, D, int(c.get("vocab_size") or 0)) +
+                L * vk_tensor_bytes(11, D, int(c.get("n_routed_experts") or 0)))
+    return VkChainLayout(layers, fixed, tail)
+
+
+_VK_CHAIN_LAYOUT["deepseek_v4"] = _v4_chain_layout
 
 
 def _analysis_signature(shards, config_path):
@@ -1829,18 +2049,36 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     family_id = info["resolved_family"].descriptor.id
     kept = min(info["dense_bytes"], info.get("embed_bytes", 0))
     device_dense_bytes = max(0, info["dense_bytes"] - kept)
-    vk_dense, vk_dense_why = vk_dense_device_only(
-        device_dense_bytes, family_id, env_now, vulkan)
+    # A partial chain (vk_chain_fit): only the first N layers' tensors go to the device;
+    # the CPU's layers and the head keep their host copies.
+    chain_fit = vk_chain_fit(info, family_id, env_now, vulkan)
+    partial = chain_fit is not None and (chain_fit["n"] < chain_fit["L"] or not chain_fit["tail"])
+
+    def on_device(tensor):
+        if not partial:
+            return True
+        layer = _vk_layer_index(tensor["name"])
+        return layer is not None and layer < chain_fit["n"]
+    tensors_on_device = [tensor for tensor in info.get("dense_tensors", []) if on_device(tensor)]
+    if partial:
+        released = sum(_vk_released_tensor_bytes(tensor, family_id, env_now) for tensor in tensors_on_device)
+        vk_dense, vk_dense_why = ((False, None) if chain_fit["n"] == 0 else
+                                  vk_dense_device_only(released, family_id, env_now, vulkan))
+    else:
+        vk_dense, vk_dense_why = vk_dense_device_only(
+            device_dense_bytes, family_id, env_now, vulkan)
     dense_on_device = 0
     if vk_dense:
         dense_on_device = min(device_dense_bytes, sum(
             _vk_released_tensor_bytes(tensor, family_id, env_now)
-            for tensor in info.get("dense_tensors", [])))
+            for tensor in tensors_on_device))
         info = dict(info, dense_bytes=info["dense_bytes"] - dense_on_device)
     # On an integrated/software device the remaining device copy still consumes
     # physical RAM. Keeping host copies costs two copies; dropping them saves one,
     # not both. Price the device copy even when COLI_VK_DENSE_HOST=1.
-    shared_dense_bytes = (device_dense_bytes
+    device_copy = (min(device_dense_bytes, sum(tensor["resident"] for tensor in tensors_on_device))
+                   if partial else device_dense_bytes)
+    shared_dense_bytes = (device_copy
                           if (vulkan or {}).get("type") in ("integrated", "cpu")
                           and _vk_dense_active(family_id, env_now, vulkan) else 0)
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
@@ -2078,6 +2316,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                     "budget_bytes": ram_budget, "dense_bytes": info["dense_bytes"],
                     "dense_on_device_bytes": dense_on_device,
                     "dense_on_device_reason": vk_dense_why if vk_dense else None,
+                    "vk_chain_layers": ({"on_device": chain_fit["n"], "layers": chain_fit["L"],
+                                         "tail": chain_fit["tail"], "forced": chain_fit["forced"]}
+                                        if chain_fit is not None else None),
                     "shared_device_dense_bytes": shared_dense_bytes,
                     "runtime_bytes": runtime_bytes,
                     "expert_fixed_bytes": info["expert_fixed_bytes"],
@@ -2199,7 +2440,11 @@ def format_plan(plan):
              f"{format_bytes(tiers['disk']['available_bytes'])} free",
              f"RAM    {format_bytes(tiers['ram']['budget_bytes'])} budget · "
              f"{format_bytes(tiers['ram']['dense_bytes'])} dense"
-             + (f" (+{format_bytes(tiers['ram']['dense_on_device_bytes'])} on the Vulkan device only)"
+             + (f" (+{format_bytes(tiers['ram']['dense_on_device_bytes'])} on the Vulkan device only"
+                + (f", the first {tiers['ram']['vk_chain_layers']['on_device']} of "
+                   f"{tiers['ram']['vk_chain_layers']['layers']} layers"
+                   if (tiers['ram'].get('vk_chain_layers') or {}).get('on_device', 0)
+                   < (tiers['ram'].get('vk_chain_layers') or {}).get('layers', 0) else "") + ")"
                 if tiers['ram'].get('dense_on_device_bytes') else "") + " · "
              f"{format_bytes(tiers['ram']['runtime_bytes'])} runtime · "
              f"{format_bytes(tiers['ram']['warm_expert_bytes'])} warm experts · "
