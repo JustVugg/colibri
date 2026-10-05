@@ -346,10 +346,10 @@ jobs:
           # under ASan and UBSan
           - family: partial-inkling-mimo
             req: c/tools/requirements-kimi-k3-tiny.txt
-            extra: pillow
+            extra: -r c/tools/oracle-requirements.txt pillow
           - family: partial-inkling-mimo-sanitize
             req: c/tools/requirements-kimi-k3-tiny.txt
-            extra: pillow
+            extra: -r c/tools/oracle-requirements.txt pillow
           # big prompt chunks and expert streaming (docs/vulkan.md): every chain engine on a
           # prompt past its usual block, the chunk from the budget, a forced small chunk and
           # streaming threshold, staged, the feature off, and the forced runs under ASan
