@@ -885,6 +885,97 @@ def _q38_chain_rows(env):
 _VK_CHAIN_LAYOUT["qwen38"] = _q38_chain_layout
 
 
+def _glm53_chain_layout(info, env, vulkan):
+    """glm53_chain.h g53c_fit_plan: each layer's device bytes (the mHC mixes in f32, its
+    matrices at GLM53_BITS as quantize_loaded leaves them, an int4 container's as it is,
+    the absorbed kv_b halves, its share of the parameter arena, a KDA layer's state and
+    window, an MLA layer's caches at their first 256 positions), the scratch of one prompt
+    chunk at GLM53_MAXT and the head."""
+    config = info.get("config") or {}
+    c = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
+    try:
+        L, D, V = int(c["num_hidden_layers"]), int(c["hidden_size"]), int(c["vocab_size"])
+        H = int(c.get("hc_mult") or 1)
+        linear = c["linear_attn_config"]
+        kh, kd, ck = int(linear["num_heads"]), int(linear["head_dim"]), int(linear["short_conv_kernel_size"])
+        nh, ql, kvl = int(c["num_attention_heads"]), int(c["q_lora_rank"]), int(c["kv_lora_rank"])
+        qn, qr, vh = int(c["qk_nope_head_dim"]), int(c.get("qk_rope_head_dim") or 0), int(c["v_head_dim"])
+        di, mi, ns = int(c["intermediate_size"]), int(c["moe_intermediate_size"]), int(c.get("n_shared_experts") or 1)
+        kinds = list(c["layer_types"])[:L]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if len(kinds) < L or L < 1:
+        return None
+    IH, ID = int(c.get("index_n_heads") or 0), int(c.get("index_head_dim") or 0)
+    pool, topk = int(c.get("index_kpool") or 1), int(c.get("index_topk") or 0)
+    full = ["linear" not in str(k) for k in kinds]
+    if c.get("first_k_dense_replace") is not None:
+        first_dense = int(c["first_k_dense_replace"])
+    else:
+        mlp = c.get("mlp_layer_types") or []
+        first_dense = next((i for i, k in enumerate(mlp) if "sparse" in str(k)), len(mlp))
+    setting = re.match(r"\s*([+-]?\d+)", env.get("GLM53_BITS", "4"))
+    bits = int(setting[1]) if setting else 4
+    packed = {_text_weight_name(t["name"]) for t in info.get("dense_tensors", []) if t.get("dtype") in ("U8", "I8")}
+    P, nm, HD = kh * kd, (2 + H) * H, H * D
+
+    def mat(rows, columns, name=None):
+        if name is not None and name in packed:
+            return vk_tensor_bytes(4, columns, rows, 64)
+        if bits == 32:
+            return vk_tensor_bytes(10, columns, rows)
+        if bits == 4 and columns % 64 == 0:
+            return vk_tensor_bytes(4, columns, rows, 64)
+        return vk_tensor_bytes(1, columns, rows)
+    layers = []
+    for i in range(L):
+        p = f"model.layers.{i}."
+        size = 2 * vk_tensor_bytes(10, HD, nm)
+        if full[i]:
+            a = p + "self_attn."
+            size += (mat(ql, D, a + "q_a_proj.weight") + mat(nh * (qn + qr), ql, a + "q_b_proj.weight") +
+                     mat(kvl + qr, D, a + "kv_a_proj_with_mqa.weight") + mat(nh * kvl, qn) + mat(nh * vh, kvl) +
+                     mat(D, nh * vh, a + "o_proj.weight") + mat(IH * ID, ql, a + "indexer.wq_b.weight") +
+                     mat(ID, D, a + "indexer.wk.weight") + mat(IH, D, a + "indexer.weights_proj.weight") +
+                     mat(ID, D, a + "indexer.index_kpool_compress_gate"))
+            floats = 2 * D + 2 * (3 + nm) + ql + kvl + 2 * ID + pool * ID
+            size += (vk_buf_bytes(256 * kvl * 4) + 2 * vk_buf_bytes(256 * ID * 4) +
+                     vk_buf_bytes((256 // pool + 1) * ID * 4))
+        else:
+            a = p + "self_attn."
+            size += (mat(P, D, a + "q_proj.weight") + mat(P, D, a + "k_proj.weight") + mat(P, D, a + "v_proj.weight") +
+                     mat(D, P, a + "o_proj.weight") + mat(kd, D, a + "g_a_proj.weight") + mat(P, kd, a + "g_b_proj.weight") +
+                     mat(kd, D, a + "f_a_proj.weight") + mat(P, kd, a + "f_b_proj.weight") + mat(kh, D, a + "b_proj.weight"))
+            floats = 2 * D + 2 * (3 + nm) + 3 * P * ck + kh + P + kd
+            size += vk_buf_bytes(3 * P * ck * 4) + vk_buf_bytes(kh * kd * kd * 4)
+        m = p + ("mlp." if i < first_dense else "mlp.shared_experts.")
+        inner = di if i < first_dense else mi * ns
+        size += mat(inner, D, m + "gate_proj.weight") + mat(inner, D, m + "up_proj.weight") + mat(D, inner, m + "down_proj.weight")
+        layers.append(size + 4 * floats)
+    # g53c_scratch's counting pass for one chunk (every layer's new rows down) and the MLA
+    # scratch, at vkc_fit_rows(128) rows and a serve slot's context
+    value = (env.get("COLI_VK_CHAIN_ROWS") or "").strip()
+    match = re.match(r"([+-]?\d+)", value) if value and value != "auto" else None
+    r = min(max(int(match[1]), 1), 65535) if match else 128
+    match = re.match(r"\s*([+-]?\d+)", env.get("GLM53_MAXT") or "")
+    ctx = max(int(match[1]) if match else 8192, 64)
+    wide = max(di, mi)
+    width = topk + pool - 1 if c.get("index_kpool_always_select_tail") else topk
+    counts = [r * HD, r * HD, r * D, r * D, r * D, r * nm, r * (2 * H + H * H), r * wide, r * wide, r * wide, r * D,
+              r * D, L * r * (kvl + 2 * ID), r * HD, r * D]
+    if P > 0:
+        counts += [3 * r * P, 3 * r * P, r * P, r * kh, r * P, r * kd, r * P]
+    if any(full):
+        counts += [r * ID, r * IH * ID, r * IH, r * ID, r * (ctx // pool + 1), r * (1 + width)]
+        counts += [r * ql, r * nh * qn, r * kvl, r * nh * kvl, r * nh * kvl, r * nh * vh]
+    fixed = sum(vk_buf_bytes(4 * (n if n else 1)) for n in counts) + vk_buf_bytes(4)
+    tail = 0 if c.get("tie_word_embeddings") else mat(V, D, "lm_head.weight")
+    return VkChainLayout(layers, fixed, tail)
+
+
+_VK_CHAIN_LAYOUT["glm53"] = _glm53_chain_layout
+
+
 def _analysis_signature(shards, config_path):
     parts = [f"v{_ANALYSIS_CACHE_VERSION}"]
     st = config_path.stat()

@@ -89,6 +89,11 @@ static uint64_t g_metal_moe_rows = 0;
 #include "vk_tier.h"        /* the routed-expert tier the MoE engines share */
 static int g_vk_ready = 0;  /* COLI_VULKAN=1 and the device opened */
 static int g_vk_dense = 0;  /* the resident matrices run there (coli_vk_dense_decide) */
+/* A partial chain (glm53_chain.h, vkc_fit): the device holds the first N layers only, or
+ * not the head. mv and mm then multiply on the device only what is there already: a
+ * matrix without a device copy stays on the CPU (G53_VK_MAY). */
+static int g_g53_partial = 0;
+#define G53_VK_MAY(w) (!g_g53_partial || (w)->vk != NULL)
 #endif
 #include "compat.h"
 #include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
@@ -744,6 +749,7 @@ static void glm53_vk_report(const GModel *m, const char *scope);   /* the [VK] l
 static void g53c_sync_host(const GModel *m, const GSession *s);
 static void g53c_host_wrote(const GSession *s);
 static void g53c_session_gone(const GSession *s);
+static void g53c_start(GModel *m);   /* COLI_VK_CHAIN at load: the decision, the fit, the placement */
 #endif
 
 /* `want` e' quanti valori legge chi usa il tensore, contati dalla config. Il
@@ -1091,7 +1097,7 @@ static void mv(float *out, const Mat *w, const float *x) {
         if (g53_dho_matmul(w, out, x, 1)) return;
         g53_dho_reload((Mat *)w);
     }
-    if (g_vk_dense && w->resident && (w->fmt == 1 || w->fmt == 4)) {
+    if (g_vk_dense && w->resident && (w->fmt == 1 || w->fmt == 4) && G53_VK_MAY(w)) {
         Mat *mutable_w = (Mat *)w;
         if (coli_vk_matmul((ColiVkTensor **)&mutable_w->vk, out, x,
                            w->fmt == 4 ? (const void *)w->q4 : (const void *)w->q8,
@@ -1124,14 +1130,14 @@ static void mm(float *out, const Mat *w, const float *x, int S) {
         for (int t = 0; t < S; t++) mv(out + (size_t)t * w->rows, w, x + (size_t)t * w->columns);
         return;
     }
-    if (S > 1 && g_vk_dense && w->resident && (w->fmt == 1 || w->fmt == 4)) {
+    if (S > 1 && g_vk_dense && w->resident && (w->fmt == 1 || w->fmt == 4) && G53_VK_MAY(w)) {
         Mat *mutable_w = (Mat *)w;
         if (coli_vk_matmul((ColiVkTensor **)&mutable_w->vk, out, x,
                            w->fmt == 4 ? (const void *)w->q4 : (const void *)w->q8,
                            w->s, w->fmt, S, w->columns, w->rows, w->gs))
             return;
     }
-    gpu |= g_vk_dense && w->resident && (w->fmt == 1 || w->fmt == 4);
+    gpu |= g_vk_dense && w->resident && (w->fmt == 1 || w->fmt == 4) && G53_VK_MAY(w);
 #endif
     if (S == 1 || gpu) {
         for (int t = 0; t < S; t++)
@@ -2411,41 +2417,68 @@ static int g53_dho_drop(Mat *w, int keep, int drop, size_t *bytes) {
     *bytes += b;
     return 1;
 }
-/* Every resident matrix but the routed experts: the head (unless tied to the embedding),
- * each layer's attention (KDA or MLA with its indexer), dense MLP and shared expert. The
- * absorbed kv_b halves stay when the chain will not run every forward: outside it the
- * CPU's attention reads them by row (mm_rows, mv_rows). */
-static int g53_dho_pass(GModel *m, int keep_kvb, int drop, size_t *bytes) {
-    int n = g53_dho_drop(&m->head, 0, drop, bytes);
-    for (int i = m->layer_begin; i < m->layer_end; i++) {
-        GLayer *l = &m->layer[i];
-        Mat *all[] = {&l->kq, &l->kk, &l->kv, &l->ko, &l->kga, &l->kgb, &l->kfa, &l->kfb, &l->kb,
-                      &l->qa, &l->qb, &l->kva, &l->o, &l->iwq, &l->iwk, &l->iwp, &l->ikpg,
-                      &l->dg, &l->du, &l->dd, &l->rg, &l->ru, &l->rd};
-        for (size_t k = 0; k < sizeof(all) / sizeof(all[0]); k++) n += g53_dho_drop(all[k], 0, drop, bytes);
-        n += g53_dho_drop(&l->kvb_kt, keep_kvb, drop, bytes);
-        n += g53_dho_drop(&l->kvb_v, keep_kvb, drop, bytes);
-    }
+/* Layer i's resident matrices: its attention (KDA or MLA with its indexer), dense MLP and
+ * shared expert. The absorbed kv_b halves stay when the chain will not run every forward:
+ * outside it the CPU's attention reads them by row (mm_rows, mv_rows). */
+static int g53_dho_layer(GModel *m, int i, int keep_kvb, int drop, size_t *bytes) {
+    GLayer *l = &m->layer[i];
+    Mat *all[] = {&l->kq, &l->kk, &l->kv, &l->ko, &l->kga, &l->kgb, &l->kfa, &l->kfb, &l->kb,
+                  &l->qa, &l->qb, &l->kva, &l->o, &l->iwq, &l->iwk, &l->iwp, &l->ikpg,
+                  &l->dg, &l->du, &l->dd, &l->rg, &l->ru, &l->rd};
+    int n = 0;
+    for (size_t k = 0; k < sizeof(all) / sizeof(all[0]); k++) n += g53_dho_drop(all[k], 0, drop, bytes);
+    n += g53_dho_drop(&l->kvb_kt, keep_kvb, drop, bytes);
+    n += g53_dho_drop(&l->kvb_v, keep_kvb, drop, bytes);
     return n;
 }
-/* Once the device is open, before expert_cache_init reads the free memory: the decision
- * (the chain's own, made silently here and printed by g53c_start), the uploads and the
- * RAM given back. */
-static void g53_dho_start(GModel *m, int tier) {
+/* Every resident matrix but the routed experts: the head (unless tied to the embedding;
+ * with tail) and layers [layer_begin, layer_begin + layers). */
+static int g53_dho_pass(GModel *m, int keep_kvb, int drop, size_t *bytes, int layers, int tail) {
+    int n = tail ? g53_dho_drop(&m->head, 0, drop, bytes) : 0;
+    for (int i = m->layer_begin; i < m->layer_begin + layers && i < m->layer_end; i++) n += g53_dho_layer(m, i, keep_kvb, drop, bytes);
+    return n;
+}
+static int g_g53_dho_on, g_g53_dho_keep;
+static void g53_dho_finish(GModel *m, int fit_n, int fit_tail, int partial);
+/* Once the device is open, before expert_cache_init reads the free memory (g53c_start
+ * calls it once the chain's fit is known): the decision (the chain's own, made silently
+ * here and printed by g53c_start). With a fit (fit_n >= 0) only the N layers on the device
+ * drop their copies, each as g53c_setup places it, and the head only when the whole
+ * chain and the head fit (g53_dho_finish); without one, every matrix here, as before. */
+static void g53_dho_start(GModel *m, int tier, int fit_n, int fit_tail) {
     if (!g_vk_ready || !m->has_io || m->layer_begin != 0 || m->layer_end != m->c.n_layers) return;
     const int chain = coli_vk_chain_decide(NULL, tier, COLI_VK_CHAIN_UNMEASURED);
     const int keep_kvb = chain != COLI_VK_CHAIN_ON;
+    const int L = m->c.n_layers, fitted = fit_n >= 0, n = fitted ? fit_n : L, tail = fitted ? fit_tail : 1;
     size_t bytes = 0;
-    g53_dho_pass(m, keep_kvb, 0, &bytes);
-    if (!coli_vk_dense_host_decide("glm53", chain != COLI_VK_CHAIN_OFF || g_vk_dense, bytes)) return;
+    g53_dho_pass(m, keep_kvb, 0, &bytes, n, tail);
+    if (!coli_vk_dense_host_decide("glm53", fitted ? n > 0 : (chain != COLI_VK_CHAIN_OFF || g_vk_dense), bytes)) return;
     g_g53_dho_model = m;
     g_vk_dense = 1;   /* the steps the chain does not run take the device too: the CPU has no copy */
+    g_g53_dho_on = 1; g_g53_dho_keep = keep_kvb;
+    if (fitted) { coli_vk_dense_host_layers(n, L); return; }   /* g53c_setup drops each layer it places */
     bytes = 0;
-    g53_dho_pass(m, keep_kvb, 1, &bytes);
-    coli_vk_dense_host_placed("glm53", keep_kvb
-        ? "the embedding (and a head tied to it), the routers, the mHC mixes and norms, the vision tower, "
-          "the absorbed kv_b (the chain will not run every forward: the CPU's attention reads it)"
-        : "the embedding (and a head tied to it), the routers, the mHC mixes and norms, the vision tower");
+    g53_dho_pass(m, keep_kvb, 1, &bytes, L, 1);
+    g53_dho_finish(m, -1, 1, 0);
+}
+/* g53c_setup placed all of layer i: its host copies go */
+static void g53_dho_drop_layer(GModel *m, int i) {
+    size_t b = 0;
+    if (g_g53_dho_on) g53_dho_layer(m, i, g_g53_dho_keep, 1, &b);
+}
+/* The head (a full chain with room for it), the line. */
+static void g53_dho_finish(GModel *m, int fit_n, int fit_tail, int partial) {
+    if (!g_g53_dho_on) return;
+    if (fit_n >= 0) {
+        size_t b = 0;
+        coli_vk_dense_host_layers(fit_n, m->c.n_layers);
+        if (fit_tail) g53_dho_drop(&m->head, 0, 1, &b);
+    }
+    char kept[384];
+    snprintf(kept, sizeof kept, "the embedding (and a head tied to it), the routers, the mHC mixes and norms, the vision tower%s%s",
+             g_g53_dho_keep ? ", the absorbed kv_b (the chain will not run every forward: the CPU's attention reads it)" : "",
+             partial ? ", the head (the chain's tail runs on the CPU)" : "");
+    coli_vk_dense_host_placed("glm53", kept);
 }
 #endif
 
@@ -2630,7 +2663,10 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
         if (g_vk_ready) coli_vk_set_swiglu_limit(m->c.swiglu_limit);
         if (!g_vk_ready) fprintf(stderr, "Vulkan: no usable device, falling back to CPU\n");
         else if (g_vk_dense) fprintf(stderr, "Vulkan: active for resident matrices\n");
-        g53_dho_start(m, tier);   /* COLI_VK_DENSE_HOST: the trunk on the device only, before the expert cache sizes itself */
+        /* COLI_VK_CHAIN: decided, fitted (how many layers the device holds) and placed, with
+         * COLI_VK_DENSE_HOST's host copies of those layers given back, before the expert cache
+         * sizes itself from the free memory and before the tier */
+        g53c_start(m);
     }
 #endif
     /* La cache si dimensiona qui, non prima: quanto si puo' spendere dipende
@@ -2815,10 +2851,14 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
     const Cfg *c = &m->c;
     const int H = c->hc_mult, D = c->hidden;
 #ifdef COLI_VULKAN
-    /* every layer on the device (glm53_chain.h); 0: the CPU below, its state current first */
+    /* every layer on the device (glm53_chain.h); 0: the CPU below, its state current
+     * first; a partial chain (the first N layers on the device) hands the streams back
+     * after layer N - 1 and the CPU runs the rest from there */
     if (g_vk_chain && begin == 0 && end == c->n_layers) {
-        if (g53c_forward(m, s, streams, n, start)) return streams;
-        g53c_cpu_step(m, s, start);
+        const int done = g53c_forward(m, s, streams, n, start);
+        if (done >= c->n_layers) return streams;
+        if (!done) g53c_cpu_step(m, s, start);
+        begin = done;
     }
 #endif
     float *collapsed = malloc((size_t)n * D * sizeof(float));
@@ -4264,7 +4304,10 @@ static void glm53_vk_tier_start(GModel *m) {
                         .act = VKT_ACT_SWIGLU, .act_limit = c->swiglu_limit,
                         .max_rows = GLM53_VK_ROWS * c->topk,
                         .ram_reserve = (size_t)cap * (size_t)sparse * (size_t)m->e_slot,
-                        .dense_bytes = g_vk_dense && !coli_vk_dense_device_only() ? glm53_dense_dev_bytes(m) : 0,
+                        /* a partial chain: nothing more of the trunk goes up, but the chain's first
+                         * forward allocates its scratch and the N layers' MLA caches */
+                        .dense_bytes = g_g53_partial ? g_g53c_lazy
+                                     : g_vk_dense && !coli_vk_dense_device_only() ? glm53_dense_dev_bytes(m) : 0,
                         .in_ram = glm53_in_ram, .ram_ctx = m,
                         .load = glm53_vk_load, .release = glm53_vk_unhold, .load_ctx = m,
                         .load_batch = glm53_vk_load_batch};
@@ -4401,7 +4444,6 @@ int main(int argc, char **argv) {
         model_load(&served, snap);
         glm53_telemetry_init(snap, &served.c);
 #ifdef COLI_VULKAN
-        g53c_start(&served);            /* COLI_VK_CHAIN: the trunk on the device, before the tier sizes itself */
         glm53_vk_tier_start(&served);   /* after the history: the warm start reads it */
         g53c_atexit();                  /* after the tier's: the chain goes before the device */
 #endif
@@ -4464,7 +4506,6 @@ int main(int argc, char **argv) {
     model_load(&model, dir);
     glm53_telemetry_init(dir, &model.c);
 #ifdef COLI_VULKAN
-    g53c_start(&model);            /* COLI_VK_CHAIN: the trunk on the device, before the tier sizes itself */
     glm53_vk_tier_start(&model);   /* after the history: the warm start reads it */
     g53c_atexit();                 /* after the tier's: the chain goes before the device */
 #endif

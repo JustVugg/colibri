@@ -48,7 +48,20 @@
  * segment), a session above the device's limits, and matrices or a geometry its shaders
  * do not take (kv_lora above 1024, qk_rope above 0 is not GLM-5.3's and is declined too,
  * a KDA head above 256 key or 128 value floats, an indexer above 64 heads, 4096 query
- * floats or k-pooling below 2). */
+ * floats or k-pooling below 2).
+ *
+ * A partial chain (vk_chain.h, vkc_fit; docs/vulkan.md, "A partial chain"): when the
+ * device's free memory does not hold every layer, the chain takes layers 0..N-1 and the
+ * CPU runs N..L-1, the final collapse, norm and head (the head stays on the host unless
+ * the whole chain and the head fit). N is decided at load, once the device is open and
+ * before the expert cache and the tier size themselves (g53c_start, from
+ * model_load_range); with COLI_VK_DENSE_HOST only the N layers give their host copies
+ * back, each once all of it reached the device. A forward runs every chunk of its rows
+ * through the N device layers, then run_layers goes on from layer N with the hc_mult
+ * streams (H x D floats a row, once per chunk). The KDA state and windows on the device,
+ * the MLA mirror, its watermarks and the KV split cover the N layers; the CPU layers'
+ * state is the host's alone, so a lost device rebuilds the device layers' KDA state
+ * only. */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 
@@ -58,6 +71,7 @@
 
 typedef struct {
     int ok, failed, rows, cap, pcap;
+    int n;                                    /* layers on the device: 0..n-1 (the rest run on the CPU) */
     const GSession *owner;
     int where;                                /* G53C_HOST / DEV / BOTH for owner's KDA state */
     VkcBuf *prm;
@@ -84,6 +98,11 @@ typedef struct {
 static G53Chain *g_g53c;
 static int g_vk_chain = 0;
 static int g_g53c_inited = 0;
+static VkcFit g_g53c_fit;                     /* how many layers the device holds (vkc_fit), when g_g53c_fitted */
+static int g_g53c_fitted;
+static size_t g_g53c_lazy;                    /* what the chain allocates at its first forward: one chunk's
+                                               * scratch and the N layers' MLA caches at their first size */
+static size_t *g_g53c_mir;                    /* each layer's MLA caches at their first size */
 
 
 /* A Mat's device copy (the per-matrix path's own, where it made one); f32 as fmt 10. */
@@ -110,7 +129,7 @@ static void g53c_sync_host(const GModel *m, const GSession *s) {
     if (!ch || !ch->ok || ch->owner != s || ch->where != G53C_DEV || !s) return;
     const Cfg *c = &m->c;
     size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd, nw = (size_t)3 * c->kda_proj * c->conv_k;
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = 0; i < ch->n; i++) {   /* the device's layers: a CPU layer's state is the host's already */
         if (c->is_full[i]) continue;
         if (!vkc_read(ch->st[i], 0, s->layer[i].kda_state, ns * sizeof(float)) ||
             !vkc_read(ch->win[i], 0, s->layer[i].kda_window, nw * sizeof(float))) {
@@ -138,7 +157,7 @@ static void g53c_cpu_step(const GModel *m, const GSession *s, int start) {
     if (!ch || !ch->ok || ch->owner != s) return;
     g53c_sync_host(m, s);
     ch->where = G53C_HOST;
-    for (int i = 0; i < m->c.n_layers; i++) {
+    for (int i = 0; i < ch->n; i++) {
         if (ch->kv_valid[i] > start) ch->kv_valid[i] = start;
         if (ch->pool_valid[i] > start / m->c.index_kpool) ch->pool_valid[i] = start / m->c.index_kpool;
         if (m->c.is_full[i]) vkc_kv_lower(&ch->ks, ch->mla_ord[i], start);
@@ -146,17 +165,142 @@ static void g53c_cpu_step(const GModel *m, const GSession *s, int start) {
 }
 
 /* ---- setup ----------------------------------------------------------------------------- */
+/* g53c_tensor's backend format for w without uploading it (-1: no device form) and its
+ * group size; the fit counts the bytes from it. */
+static int g53c_form(const Mat *w, int *gs) {
+    *gs = 0;
+    if (w->rows < 1 || w->columns < 1) return -1;
+    switch (w->fmt) {
+    case 0: return w->f ? 10 : -1;
+    case 1: return w->q8 ? 1 : -1;
+    case 4: if (w->gs < 8 || w->gs % 8 || !w->q4) return -1; *gs = w->gs; return 4;
+    default: return -1;
+    }
+}
+/* Layer i's matrices on the device (the chain's set; up to 13) */
+static int g53c_layer_mats(const GModel *m, int i, Mat **w) {
+    const Cfg *c = &m->c; GLayer *l = &m->layer[i]; int n = 0;
+    if (c->is_full[i]) {
+        Mat *a[] = {&l->qa, &l->qb, &l->kva, &l->kvb_kt, &l->kvb_v, &l->o, &l->iwq, &l->iwk, &l->iwp, &l->ikpg};
+        for (size_t k = 0; k < sizeof a / sizeof *a; k++) w[n++] = a[k];
+    } else {
+        Mat *a[] = {&l->kq, &l->kk, &l->kv, &l->ko, &l->kga, &l->kgb, &l->kfa, &l->kfb, &l->kb};
+        for (size_t k = 0; k < sizeof a / sizeof *a; k++) w[n++] = a[k];
+    }
+    if (i < c->first_dense) { w[n++] = &l->dg; w[n++] = &l->du; w[n++] = &l->dd; }
+    else { w[n++] = &l->rg; w[n++] = &l->ru; w[n++] = &l->rd; }
+    return n;
+}
+/* What the chain's shaders do not take (NULL: nothing), from the shapes alone: no upload. */
+static const char *g53c_check(const GModel *m) {
+    const Cfg *c = &m->c; int L = c->n_layers, H = c->hc_mult, P = c->kda_proj;
+    if (m->layer_begin != 0 || m->layer_end != L || !m->has_io) return "a layer range";
+    if (c->kv_lora > 1024 || c->qk_rope != 0 || c->qk_nope > 1024 || c->q_lora < 1) return "an attention geometry its shaders do not take";
+    if (c->index_nh > 64 || c->index_nh * c->index_hd > 4096 || c->index_kpool < 2 || c->index_topk % c->index_kpool ||
+        c->index_topk / c->index_kpool > 1024) return "an indexer its shaders do not take";
+    if (P > 0 && (c->kda_hd > 128 || c->conv_k > 8)) return "a KDA head its shaders do not take";
+    if (H < 1 || H > 8 || c->hc_iters < 1) return "hyper-connections its shaders do not take";
+    Mat *w[16]; int gs;
+    for (int i = 0; i < L; i++) {
+        int n = g53c_layer_mats(m, i, w);
+        for (int k = 0; k < n; k++)
+            if (g53c_form(w[k], &gs) < 0) return "a matrix with no device form";
+    }
+    return NULL;
+}
+/* Layer i's share of the parameter arena, in floats */
+static size_t g53c_arena_floats(const Cfg *c, int i) {
+    size_t nm = (size_t)(2 + c->hc_mult) * c->hc_mult, n = 2 * (size_t)c->hidden + 2 * (3 + nm);
+    if (c->is_full[i]) n += (size_t)c->q_lora + c->kv_lora + 2 * (size_t)c->index_hd + (size_t)c->index_kpool * c->index_hd;
+    else n += (size_t)3 * c->kda_proj * c->conv_k + (size_t)c->kda_heads + c->kda_proj + c->kda_hd;
+    return n;
+}
+
+/* g53c_res counts instead of reserving while g_g53c_count >= 0 (the chunk's sizing); with
+ * g_g53c_count_fit, each buffer at the bytes the device gives it (the fit's scratch) */
+static long long g_g53c_count = -1;
+static int g_g53c_count_fit;
+static int g53c_res(VkcBuf **b, size_t floats, int kind) {
+    size_t bytes = (floats ? floats : 1) * sizeof(float);
+    if (g_g53c_count >= 0) { g_g53c_count += (long long)(g_g53c_count_fit ? vkc_fit_buf(bytes) : bytes); return 1; }
+    return vkc_reserve(b, bytes, kind);
+}
+static int g53c_scratch(G53Chain *ch, const GModel *m, int rows, int ctx);
+
+/* The fit (vkc_fit), before any upload: each layer's device bytes (the mHC mixes and its
+ * matrices as g53c_setup uploads them, its share of the parameter arena, a KDA layer's
+ * state and window, an MLA layer's caches at the first size g53c_mirror gives them), the
+ * chain's fixed bytes (the scratch of one prompt chunk of vkc_fit_rows(128) rows at the
+ * context GLM53_MAXT, the arena's alignment) and the tail: the head, which goes up only
+ * with every layer there (COLI_VK_DENSE_HOST and the per-matrix path place it). */
+static void g53c_fit_plan(GModel *m) {
+    const Cfg *c = &m->c;
+    int L = c->n_layers, D = c->hidden, H = c->hc_mult, HD = H * D, nm = (2 + H) * H, P = c->kda_proj, ID = c->index_hd;
+    size_t *lb = calloc(L ? L : 1, sizeof(size_t)), *mb = calloc(L ? L : 1, sizeof(size_t));
+    size_t *mir = calloc(L ? L : 1, sizeof(size_t));
+    if (!lb || !mb || !mir) { free(lb); free(mb); free(mir); return; }
+    const int cap0 = 256;   /* g53c_mirror's first size */
+    for (int i = 0; i < L; i++) {
+        lb[i] = 2 * vkc_fit_tensor(10, HD, nm, 0);
+        mb[i] = 2 * coli_vk_tensor_payload(10, HD, nm, 0);
+        Mat *w[16]; int gs, n = g53c_layer_mats(m, i, w);
+        for (int k = 0; k < n; k++) {
+            int f = g53c_form(w[k], &gs);
+            lb[i] += vkc_fit_tensor(f, w[k]->columns, w[k]->rows, gs);
+            mb[i] += coli_vk_tensor_payload(f, w[k]->columns, w[k]->rows, gs);
+        }
+        lb[i] += g53c_arena_floats(c, i) * sizeof(float);
+        if (c->is_full[i])
+            mir[i] = vkc_fit_buf((size_t)cap0 * c->kv_lora * sizeof(float)) + 2 * vkc_fit_buf((size_t)cap0 * ID * sizeof(float)) +
+                     vkc_fit_buf((size_t)(cap0 / c->index_kpool + 1) * ID * sizeof(float));
+        else
+            lb[i] += vkc_fit_buf((size_t)3 * P * c->conv_k * sizeof(float)) +
+                     vkc_fit_buf((size_t)c->kda_heads * c->kda_hd * c->kda_hd * sizeof(float));
+        lb[i] += mir[i];
+    }
+    /* one chunk's scratch: g53c_scratch's buffers (every layer's rows down) and the MLA
+     * scratch at the context of a serve slot */
+    int R = vkc_fit_rows(128), ctx = getenv("GLM53_MAXT") ? atoi(getenv("GLM53_MAXT")) : 8192;
+    if (ctx < 64) ctx = 64;
+    G53Chain tmp; memset(&tmp, 0, sizeof tmp); tmp.n = L;
+    g_g53c_count = 0; g_g53c_count_fit = 1; g53c_scratch(&tmp, m, R, ctx);
+    size_t scratch = (size_t)g_g53c_count;
+    g_g53c_count = -1; g_g53c_count_fit = 0;
+    int any_mla = 0; for (int i = 0; i < L; i++) any_mla |= c->is_full[i];
+    if (any_mla) {
+        size_t r = (size_t)R, Hh = (size_t)c->n_heads;
+        scratch += vkc_fit_buf(r * c->q_lora * 4) + vkc_fit_buf(r * Hh * c->qk_nope * 4) + vkc_fit_buf(r * c->kv_lora * 4) +
+                   2 * vkc_fit_buf(r * Hh * c->kv_lora * 4) + vkc_fit_buf(r * Hh * c->v_head * 4);
+    }
+    size_t fixed = scratch + vkc_fit_buf(4), tail = 0;   /* + the arena's alignment */
+    { int gs, f = m->head.resident ? g53c_form(&m->head, &gs) : -1;
+      if (f >= 0) tail = vkc_fit_tensor(f, m->head.columns, m->head.rows, gs); }
+    vkc_fit("glm53", L, lb, mb, fixed, tail, &g_g53c_fit);
+    g_g53c_fitted = 1;
+    g_g53c_lazy = scratch;
+    g_g53c_mir = mir;
+    free(lb); free(mb);
+}
+
+/* Layer i's device objects (its mHC mixes, matrices, KDA state and window) freed: a layer
+ * that did not fully reach the device leaves nothing there. */
+static void g53c_layer_free(G53Chain *ch, GModel *m, int i) {
+    Mat *w[16]; int n = g53c_layer_mats(m, i, w);
+    ColiVkTensor **t[18]; int nt = 0;
+    t[nt++] = &ch->fna[i]; t[nt++] = &ch->fnf[i];
+    for (int k = 0; k < n; k++) t[nt++] = (ColiVkTensor **)&w[k]->vk;
+    VkcBuf **b[2] = {&ch->win[i], &ch->st[i]};
+    vkc_layer_free(t, nt, b, 2);
+}
+
+/* The parameters and layers 0..N-1 on the device (N = the fit's), layer by layer: its mHC
+ * mixes, its matrices and a KDA layer's state and window, then (COLI_VK_DENSE_HOST) its
+ * host copies given back once all of it is there. A layer that does not reach the device
+ * is freed whole and the chain keeps the layers before it (vkc_fit_shrink). 0 = no layer
+ * on the device: the chain stays off. */
 static int g53c_setup(GModel *m) {
     const Cfg *c = &m->c;
-    int L = c->n_layers, D = c->hidden, H = c->hc_mult, HD = H * D, nm = (2 + H) * H, P = c->kda_proj;
-    const char *why = NULL;
-    if (m->layer_begin != 0 || m->layer_end != L || !m->has_io) why = "a layer range";
-    else if (c->kv_lora > 1024 || c->qk_rope != 0 || c->qk_nope > 1024 || c->q_lora < 1) why = "an attention geometry its shaders do not take";
-    else if (c->index_nh > 64 || c->index_nh * c->index_hd > 4096 || c->index_kpool < 2 || c->index_topk % c->index_kpool ||
-             c->index_topk / c->index_kpool > 1024) why = "an indexer its shaders do not take";
-    else if (P > 0 && (c->kda_hd > 128 || c->conv_k > 8)) why = "a KDA head its shaders do not take";
-    else if (H < 1 || H > 8 || c->hc_iters < 1) why = "hyper-connections its shaders do not take";
-    if (why) { fprintf(stderr, "[VK] glm53 chain: %s; per-matrix path\n", why); return 0; }
+    int L = c->n_layers, D = c->hidden, H = c->hc_mult, HD = H * D, nm = (2 + H) * H, P = c->kda_proj, N = g_g53c_fit.n;
     G53Chain *ch = calloc(1, sizeof *ch);
     if (!ch) return 0;
     size_t **offs[] = {&ch->o_in, &ch->o_post, &ch->o_hca, &ch->o_hcf, &ch->o_qn, &ch->o_kn, &ch->o_ikw, &ch->o_ikb,
@@ -169,11 +313,10 @@ static int g53c_setup(GModel *m) {
     ch->kv_valid = calloc(L, sizeof(int)); ch->pool_valid = calloc(L, sizeof(int)); ch->mla_ord = calloc(L, sizeof(int));
     if (!ch->fna || !ch->fnf || !ch->mla || !ch->kv || !ch->ik || !ch->ig || !ch->pk || !ch->win || !ch->st ||
         !ch->kv_valid || !ch->pool_valid || !ch->mla_ord) return 0;
-    for (int i = 0; i < L; i++) if (c->is_full[i]) ch->mla_ord[i] = ch->n_mla++;
     g_g53c = ch;
-    /* the parameter arena */
+    /* the parameter arena of the N layers */
     size_t n = 0;
-    for (int i = 0; i < L; i++) {
+    for (int i = 0; i < N; i++) {
         ch->o_in[i] = n; n += D; ch->o_post[i] = n; n += D;
         ch->o_hca[i] = n; n += 3 + nm; ch->o_hcf[i] = n; n += 3 + nm;
         if (c->is_full[i]) {
@@ -185,9 +328,9 @@ static int g53c_setup(GModel *m) {
             ch->o_kda[i] = n; n += (size_t)c->kda_heads + P + c->kda_hd;
         }
     }
-    float *a = calloc(n, sizeof(float));
+    float *a = calloc(n ? n : 1, sizeof(float));
     if (!a) return 0;
-    for (int i = 0; i < L; i++) {
+    for (int i = 0; i < N; i++) {
         const GLayer *l = &m->layer[i];
         memcpy(a + ch->o_in[i], l->in_ln, D * sizeof(float));
         memcpy(a + ch->o_post[i], l->post_ln, D * sizeof(float));
@@ -211,44 +354,45 @@ static int g53c_setup(GModel *m) {
     ch->prm = vkc_buf(n * sizeof(float), VKC_DEV);
     int ok = ch->prm && vkc_begin() && vkc_write(ch->prm, 0, a, n * sizeof(float)) && vkc_submit(1);
     free(a);
-    for (int i = 0; i < L && ok; i++) {
-        const GLayer *l = &m->layer[i];
-        ok = coli_vk_tensor_ensure(&ch->fna[i], l->hc_attn_fn, NULL, 10, HD, nm, 0) &&
-             coli_vk_tensor_ensure(&ch->fnf[i], l->hc_ffn_fn, NULL, 10, HD, nm, 0);
-        if (ok && c->is_full[i]) {
-            ch->mla[i] = (VkcMla){c->n_heads, c->qk_nope, 0, c->v_head, c->kv_lora, D, c->q_lora, c->eps,
-                                  1.0f / sqrtf((float)c->qk_nope), VKC_ROPE_HALF, g53c_tensor(&l->qa), g53c_tensor(&l->qb),
-                                  g53c_tensor(&l->kva), NULL, g53c_tensor(&l->kvb_kt), g53c_tensor(&l->kvb_v),
-                                  g53c_tensor(&l->o), ch->prm, ch->o_qn[i], ch->o_kn[i]};
-            ok = ch->mla[i].q_a && ch->mla[i].q_b && ch->mla[i].kv_a && ch->mla[i].k_abs && ch->mla[i].v_abs && ch->mla[i].o &&
-                 g53c_tensor(&l->iwq) && g53c_tensor(&l->iwk) && g53c_tensor(&l->iwp) && g53c_tensor(&l->ikpg);
-        } else if (ok)
-            ok = g53c_tensor(&l->kq) && g53c_tensor(&l->kk) && g53c_tensor(&l->kv) && g53c_tensor(&l->ko) &&
-                 g53c_tensor(&l->kga) && g53c_tensor(&l->kgb) && g53c_tensor(&l->kfa) && g53c_tensor(&l->kfb) &&
-                 g53c_tensor(&l->kb);
-        if (ok && i < c->first_dense) ok = g53c_tensor(&l->dg) && g53c_tensor(&l->du) && g53c_tensor(&l->dd);
-        if (ok && i >= c->first_dense) ok = g53c_tensor(&l->rg) && g53c_tensor(&l->ru) && g53c_tensor(&l->rd);
-        if (ok && !c->is_full[i]) {
+    if (!ok) {
+        vkc_free(ch->prm); ch->prm = NULL;
+        vkc_fit_shrink("glm53", &g_g53c_fit, 0, "the parameters' buffer was refused");
+        return 0;
+    }
+    for (int i = 0; i < N; i++) {
+        GLayer *l = &m->layer[i];
+        Mat *w[16]; int nw = g53c_layer_mats(m, i, w);
+        int up = coli_vk_tensor_ensure(&ch->fna[i], l->hc_attn_fn, NULL, 10, HD, nm, 0) &&
+                 coli_vk_tensor_ensure(&ch->fnf[i], l->hc_ffn_fn, NULL, 10, HD, nm, 0);
+        for (int k = 0; k < nw && up; k++) up = g53c_tensor(w[k]) != NULL;
+        if (up && !c->is_full[i]) {
             ch->win[i] = vkc_buf((size_t)3 * P * c->conv_k * sizeof(float), VKC_DEV);
             ch->st[i] = vkc_buf((size_t)c->kda_heads * c->kda_hd * c->kda_hd * sizeof(float), VKC_DEV);
-            ok = ch->win[i] && ch->st[i];
+            up = ch->win[i] && ch->st[i];
         }
+        if (!up) {   /* free what it placed: the layer runs on the CPU, from its host copies */
+            g53c_layer_free(ch, m, i);
+            vkc_fit_shrink("glm53", &g_g53c_fit, i, vkc_lost() ? "the device was lost" : "a matrix or buffer was refused");
+            break;
+        }
+        if (c->is_full[i])
+            ch->mla[i] = (VkcMla){c->n_heads, c->qk_nope, 0, c->v_head, c->kv_lora, D, c->q_lora, c->eps,
+                                  1.0f / sqrtf((float)c->qk_nope), VKC_ROPE_HALF, l->qa.vk, l->qb.vk, l->kva.vk, NULL,
+                                  l->kvb_kt.vk, l->kvb_v.vk, l->o.vk, ch->prm, ch->o_qn[i], ch->o_kn[i]};
+        g53_dho_drop_layer(m, i);   /* COLI_VK_DENSE_HOST: all of the layer is there, its host copies go */
+        vkc_fit_mark(&g_g53c_fit, i);
     }
-    if (!ok) { fprintf(stderr, "[VK] glm53 chain: a matrix did not reach the device (or has no device form); per-matrix path\n"); return 0; }
+    ch->n = g_g53c_fit.n;
+    if (!ch->n) { vkc_free(ch->prm); ch->prm = NULL; return 0; }
+    for (int i = 0; i < ch->n; i++) if (c->is_full[i]) ch->mla_ord[i] = ch->n_mla++;
     ch->ok = 1;
-    int full = 0; for (int i = 0; i < L; i++) full += c->is_full[i];
+    int full = 0, dense = 0;
+    for (int i = 0; i < ch->n; i++) { full += c->is_full[i]; dense += i < c->first_dense; }
     fprintf(stderr, "[VK] glm53 chain: %d layers on the device (%d KDA, %d MLA with the k-pooled indexer, %d dense), "
-                    "%d streams, %.1f MiB of parameters\n", L, L - full, full, c->first_dense, H, n * 4 / 1048576.0);
+                    "%d streams, %.1f MiB of parameters\n", ch->n, ch->n - full, full, dense, H, n * 4 / 1048576.0);
     return 1;
 }
 
-/* g53c_res counts instead of reserving while g_g53c_count >= 0 (the chunk's sizing) */
-static long long g_g53c_count = -1;
-static int g53c_res(VkcBuf **b, size_t floats, int kind) {
-    if (g_g53c_count >= 0) { g_g53c_count += (long long)(floats ? floats : 1) * (long long)sizeof(float); return 1; }
-    return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind);
-}
-static int g53c_scratch(G53Chain *ch, const GModel *m, int rows, int ctx);
 /* Prompt rows per chunk (vkc_chunk_rows): the chain's scratch a row, counted from the
  * reservations (the MLA scratch as vkc_mla_scratch sizes it, the indexer's scores at
  * the session's capacity), and the routed experts' outputs (the tier's rows, the
@@ -257,7 +401,7 @@ static int g53c_rows(G53Chain *ch, const GModel *m, int ctx) {
     if (!vkc_chunk_auto()) return vkc_chunk_rows("glm53", 0);
     const Cfg *c = &m->c;
     size_t mla = 0;
-    for (int i = 0; i < c->n_layers; i++) if (c->is_full[i]) {
+    for (int i = 0; i < ch->n; i++) if (c->is_full[i]) {
         const VkcMla *a = &ch->mla[i];
         mla = (size_t)(a->q_lora > 0 ? a->q_lora : 1) + (size_t)a->H * (a->Q + a->R) + (size_t)(a->K + a->R) +
               2 * (size_t)a->H * a->K + (size_t)a->H * a->V;
@@ -277,10 +421,10 @@ static int g53c_rows(G53Chain *ch, const GModel *m, int ctx) {
 
 static int g53c_scratch(G53Chain *ch, const GModel *m, int rows, int ctx) {
     const Cfg *c = &m->c;
-    int D = c->hidden, H = c->hc_mult, HD = H * D, nm = (2 + H) * H, P = c->kda_proj, L = c->n_layers;
+    int D = c->hidden, H = c->hc_mult, HD = H * D, nm = (2 + H) * H, P = c->kda_proj;
     int IH = c->index_nh, ID = c->index_hd, MI = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
     int width = coli_sparse_index_width(c->index_topk, c->index_kpool, c->index_kpool_tail);
-    int mfull = -1; for (int i = 0; i < L; i++) if (c->is_full[i]) { mfull = i; break; }
+    int mfull = -1; for (int i = 0; i < ch->n; i++) if (c->is_full[i]) { mfull = i; break; }   /* the device's MLA layers */
     size_t r = (size_t)rows;
     ch->kvd_layer = r * (c->kv_lora + 2 * ID);
     int ok = (mfull < 0 || g_g53c_count >= 0 || vkc_mla_scratch(&ch->sc, &ch->mla[mfull], rows)) &&
@@ -288,7 +432,7 @@ static int g53c_scratch(G53Chain *ch, const GModel *m, int rows, int ctx) {
              g53c_res(&ch->nrm, r * D, VKC_DEV) && g53c_res(&ch->br, r * D, VKC_DEV) && g53c_res(&ch->mix, r * nm, VKC_DEV) &&
              g53c_res(&ch->hp, r * (2 * H + H * H), VKC_DEV) && g53c_res(&ch->gs, r * MI, VKC_DEV) &&
              g53c_res(&ch->us, r * MI, VKC_DEV) && g53c_res(&ch->hs, r * MI, VKC_DEV) && g53c_res(&ch->ds, r * D, VKC_DEV) &&
-             g53c_res(&ch->h2d, r * D, VKC_DOWN) && g53c_res(&ch->kvd, (size_t)L * ch->kvd_layer, VKC_DOWN) &&
+             g53c_res(&ch->h2d, r * D, VKC_DOWN) && g53c_res(&ch->kvd, (size_t)ch->n * ch->kvd_layer, VKC_DOWN) &&
              g53c_res(&ch->xd, r * HD, VKC_DOWN) && g53c_res(&ch->routed, r * D, VKC_UP);
     if (ok && P > 0)
         ok = g53c_res(&ch->qkv3, 3 * r * P, VKC_DEV) && g53c_res(&ch->cm, r * 3 * P, VKC_DEV) && g53c_res(&ch->kf, r * P, VKC_DEV) &&
@@ -322,7 +466,7 @@ static int g53c_scratch(G53Chain *ch, const GModel *m, int rows, int ctx) {
  * split (the latent rows; the index keys, pool gates and pooled keys stay whole), for
  * steps of `rows` rows. */
 static int g53c_mirror(G53Chain *ch, const GModel *m, int need, int limit, int rows) {
-    const Cfg *c = &m->c; int L = c->n_layers, ID = c->index_hd, pool = c->index_kpool;
+    const Cfg *c = &m->c; int L = ch->n, ID = c->index_hd, pool = c->index_kpool;   /* the device's layers */
     if (ch->cap >= need) return 1;
     int cap = 256; while (cap < need) cap *= 2;
     if (cap > limit) cap = limit;
@@ -355,13 +499,13 @@ static int g53c_push(G53Chain *ch, const GModel *m, const GSession *s, int start
     const Cfg *c = &m->c; int ok = 1, K = c->kv_lora, ID = c->index_hd;
     if (ch->where == G53C_HOST) {
         size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd, nw = (size_t)3 * c->kda_proj * c->conv_k;
-        for (int i = 0; i < c->n_layers && ok; i++)
+        for (int i = 0; i < ch->n && ok; i++)
             if (!c->is_full[i])
                 ok = vkc_write(ch->st[i], 0, s->layer[i].kda_state, ns * sizeof(float)) &&
                      vkc_write(ch->win[i], 0, s->layer[i].kda_window, nw * sizeof(float));
         ch->where = G53C_BOTH;
     }
-    for (int i = 0; i < c->n_layers && ok; i++) {
+    for (int i = 0; i < ch->n && ok; i++) {
         if (!c->is_full[i]) continue;
         const GLayerState *ls = &s->layer[i];
         int t0 = ch->kv_valid[i], n = start - t0;
@@ -482,12 +626,13 @@ static void g53c_recover(GModel *m, GSession *s, int start, int dev) {
     int n = start - ch->rec_base;
     fprintf(stderr, "[VK] glm53 chain: the device was lost; rebuilding the state of %d positions on the CPU, "
                     "which runs from here on\n", n);
+    /* the device's layers only: a partial chain's CPU layers ran every position already */
     if (n <= 0) return;
     float *xs = malloc((size_t)n * H * D * sizeof(float)), *xn = malloc((size_t)n * H * D * sizeof(float));
     if (!xs || !xn) { fprintf(stderr, "OOM rebuilding the state\n"); exit(1); }
     for (int t = 0; t < n; t++) for (int h = 0; h < H; h++)
         memcpy(xs + ((size_t)t * H + h) * D, ch->rec + (size_t)t * D, (size_t)D * sizeof(float));
-    run_layers(m, s, xs, xn, n, ch->rec_base, 0, c->n_layers);
+    run_layers(m, s, xs, xn, n, ch->rec_base, 0, ch->n);
     free(xs); free(xn);
 }
 
@@ -500,13 +645,15 @@ static int g53c_prefill_rows(GModel *m, GSession *s, int n) {
     int rows = g53c_rows(ch, m, s->cap);
     return ch->ks.on && rows > ch->ks.chunk ? ch->ks.chunk : rows;
 }
-/* Every layer for n rows of `streams` (the session's positions start..), the final
- * streams back into it. 0 = not taken: the CPU runs the layers (streams untouched). */
+/* The device's layers (every layer, or the first N of a partial chain) for n rows of
+ * `streams` (the session's positions start..), the streams after the last of them back
+ * into it. Returns how many layers ran: L, or N (run_layers goes on from layer N on the
+ * CPU); 0 = not taken: the CPU runs the layers (streams untouched). */
 static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start) {
     G53Chain *ch = g_g53c;
     if (!g_vk_chain || !ch || !ch->ok || ch->failed) return 0;
     if (g_vk_chain == COLI_VK_CHAIN_PREFILL && n <= 2) return 0;
-    const Cfg *c = &m->c; int L = c->n_layers, D = c->hidden, H = c->hc_mult, HD = H * D;
+    const Cfg *c = &m->c; int L = c->n_layers, D = c->hidden, H = c->hc_mult, HD = H * D, N = ch->n;
     if (ch->owner != s) {                       /* another session takes the device */
         if (ch->owner) g53c_sync_host(m, ch->owner);
         ch->owner = s; ch->where = G53C_HOST;
@@ -552,7 +699,7 @@ static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start
         if (!vkc_begin() || !g53c_push(ch, m, s, pb, nr) || !vkc_write(ch->xs, 0, streams + (size_t)c0 * HD, (size_t)nr * HD * sizeof(float)))
             goto lost;
         int ok = 1, pending = 0, pulled = 0;
-        for (int i = 0; i < L && ok; i++) {
+        for (int i = 0; i < N && ok; i++) {
             const GLayer *l = &m->layer[i];
             if (pending) {                       /* the FFN branch of the layer before: shared + routed, written back */
                 VkcEw add = {VKC_EW_ADD, nr * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
@@ -593,15 +740,15 @@ static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start
         }
         ok = ok && vkc_copy(ch->xd, 0, ch->xs, 0, (size_t)nr * HD) && vkc_submit(1);
         if (!ok) goto lost;
-        g53c_pull(ch, m, s, pulled, L, pb, nr);
+        g53c_pull(ch, m, s, pulled, N, pb, nr);
         memcpy(outs + (size_t)c0 * HD, vkc_ptr(ch->xd), (size_t)nr * HD * sizeof(float));
-        for (int i = 0; i < L; i++) if (c->is_full[i]) { ch->kv_valid[i] = pb + nr; vkc_kv_done(&ch->ks, ch->mla_ord[i], pb + nr); }
+        for (int i = 0; i < N; i++) if (c->is_full[i]) { ch->kv_valid[i] = pb + nr; vkc_kv_done(&ch->ks, ch->mla_ord[i], pb + nr); }
         ch->where = G53C_DEV;
     }
     memcpy(streams, outs, (size_t)n * HD * sizeof(float));
     free(outs);
     ch->forwards++;
-    return 1;
+    return N;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     free(outs);
     if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost(); }
@@ -620,22 +767,47 @@ static void g53c_report(void) {
     vkc_prof_print();
 }
 
-/* COLI_VK_CHAIN at startup, before the tier sizes itself: the decision, the pipelines, the tensors. */
+/* COLI_VK_CHAIN at load, once the device is open (model_load_range): before the expert
+ * cache sizes itself from the free memory and before the tier (the trunk's device copies
+ * count as used): the decision, the pipelines, the fit (how many layers the device holds),
+ * COLI_VK_DENSE_HOST's decision for those layers (g53_dho_start), the tensors layer by
+ * layer, then the head's host copy (g53_dho_finish). Without a fit (the chain off)
+ * g53_dho_start does as before. */
 static void g53c_start(GModel *m) {
     if (!g_vk_ready) return;
     const Cfg *c = &m->c;
     int tier_on = vkt_wanted() && m->streaming && c->n_experts > 0 && c->swiglu_limit > 0.f;
+    if (!m->has_io || m->layer_begin != 0 || m->layer_end != c->n_layers) return;   /* a segment: no chain, no drop */
     int on = coli_vk_chain_decide("glm53", tier_on, COLI_VK_CHAIN_UNMEASURED);
     const char *no = NULL;
+    const char *why = on ? g53c_check(m) : NULL;
+    if (why) fprintf(stderr, "[VK] glm53 chain: %s; per-matrix path\n", why);
+    /* the fit before anything of the chain is on the device (its pools' first blocks are
+     * the fit's own granularity, as coli plan counts them) */
+    if (on && !why) g53c_fit_plan(m);
     if (on && !(g_g53c_inited = vkc_init())) no = "the chain's pipelines did not come up";
     if (on && !no && !(vkc_mla_ready() && vkc_kda_ready() && vkc_mhc_ready()))
         no = "the MLA, KDA or mHC shaders are missing";
     if (no) fprintf(stderr, "[VK] glm53: %s: the dense chain stays off\n", no);
-    if (!on || no) return;
-    if (!g53c_setup(m)) return;
-    g_vk_chain = on;
+    if (no) g_g53c_fitted = 0;   /* no chain after all: everything as before */
+    g53_dho_start(m, tier_on, g_g53c_fitted ? g_g53c_fit.n : -1, g_g53c_fitted ? g_g53c_fit.tail : 1);
+    if (!g_g53c_fitted) return;
+    if (g_g53c_fit.n > 0 && g53c_setup(m)) g_vk_chain = on;
+    g_g53_partial = vkc_fit_partial(&g_g53c_fit);
+    for (int i = 0; i < g_g53c_fit.n; i++) g_g53c_lazy += g_g53c_mir[i];   /* for the tier (glm53_vk_tier_start) */
+    vkc_fit_placed("glm53", &g_g53c_fit);
+    g53_dho_finish(m, g_g53c_fit.n, g_g53c_fit.tail, g_g53_partial);
+}
+/* A partial chain at exit: the matrices the device holds, which must be the ones the
+ * setup placed (the per-matrix path put nothing of a CPU layer or the head there). */
+static void g53c_held_atexit(void) {
+    size_t w = 0, nt = 0;
+    coli_vk_mem_info(&w, &nt);
+    fprintf(stderr, "[VK] glm53 chain: %d of %d layers held at exit: %zu B of matrices on the device\n",
+            g_g53c_fit.n, g_g53c_fit.L, w);
 }
 /* After the tier's: at exit the chain goes before the device. */
 static void g53c_atexit(void) {
     if (g_g53c_inited) atexit(vkc_shutdown);
+    if (g_g53c_fitted && g_g53_partial) atexit(g53c_held_atexit);
 }

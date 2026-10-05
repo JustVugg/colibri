@@ -2114,6 +2114,141 @@ class Qwen38PartialChainTest(unittest.TestCase):
         self.assertEqual(off["tiers"]["ram"]["dense_on_device_bytes"], 0)
 
 
+class VulkanPartialChainGlm53Test(unittest.TestCase):
+    """glm53's partial chain in the plan: _glm53_chain_layout is g53c_fit_plan
+    (glm53_chain.h), and the device-only credit is the N layers' matrices alone."""
+
+    # tests/vulkan_partial_glm.sh's six-layer GLM-5.3: KDA and MLA layers alternating,
+    # the first MLP dense
+    TEXT = {
+        "vocab_size": 128, "hidden_size": 128, "intermediate_size": 256, "moe_intermediate_size": 128,
+        "num_hidden_layers": 6, "num_attention_heads": 4, "num_key_value_heads": 4, "n_shared_experts": 1,
+        "n_routed_experts": 4, "num_experts_per_tok": 2, "kv_lora_rank": 64, "q_lora_rank": 128,
+        "qk_rope_head_dim": 0, "qk_nope_head_dim": 32, "v_head_dim": 32, "max_position_embeddings": 128,
+        "layer_types": ["linear_attention", "deepseek_sparse_attention"] * 3,
+        "mlp_layer_types": ["dense"] + ["sparse"] * 5, "indexer_types": ["full"] * 6,
+        "index_topk": 4, "index_kpool": 2, "index_head_dim": 32, "index_n_heads": 2,
+        "hc_mult": 2, "hc_sinkhorn_iters": 3, "hc_eps": 1e-06, "rms_norm_eps": 1e-05,
+        "routed_scaling_factor": 2.5, "swiglu_limit": 10.0, "tie_word_embeddings": False,
+        "model_type": "glm5_next_text", "num_nextn_predict_layers": 0,
+        "linear_attn_config": {"num_heads": 4, "head_dim": 32, "short_conv_kernel_size": 4,
+                               "gate_lower_bound": -5.0, "kda_layers": [0, 2, 4]},
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.model = Path(self.tmp.name)
+        (self.model / "config.json").write_text(json.dumps({
+            "architectures": ["Glm5NextForConditionalGeneration"], "model_type": "glm5_next",
+            "text_config": self.TEXT}))
+        tensors = []
+
+        def add(name, *shape, dtype="F32"):
+            count = 1
+            for n in shape:
+                count *= n
+            tensors.append((name, count * (1 if dtype == "U8" else 4), dtype, list(shape)))
+        P = "model.language_model."
+        add("lm_head.weight", 128, 128)
+        add(P + "embed_tokens.weight", 128, 128)
+        add(P + "norm.weight", 128)
+        for i, kind in enumerate(self.TEXT["layer_types"]):
+            p = f"{P}layers.{i}."
+            for site in ("attn", "ffn"):
+                add(p + f"hc_{site}_base", 8)
+                add(p + f"hc_{site}_fn", 8, 256)
+                add(p + f"hc_{site}_scale", 3)
+            add(p + "input_layernorm.weight", 128)
+            add(p + "post_attention_layernorm.weight", 128)
+            a = p + "self_attn."
+            if kind == "linear_attention":
+                for name in ("q", "k", "v", "o"):
+                    add(a + f"{name}_proj.weight", 128, 128)
+                for name in ("q", "k", "v"):
+                    add(a + f"{name}_conv1d.weight", 128, 1, 4)
+                add(a + "A_log", 4); add(a + "dt_bias", 128); add(a + "o_norm.weight", 32)
+                add(a + "b_proj.weight", 4, 128)
+                for name in ("f", "g"):
+                    add(a + f"{name}_a_proj.weight", 32, 128)
+                    add(a + f"{name}_b_proj.weight", 128, 32)
+            else:
+                add(a + "q_a_proj.weight", 128, 128); add(a + "q_a_layernorm.weight", 128)
+                add(a + "q_b_proj.weight", 128, 128)
+                add(a + "kv_a_proj_with_mqa.weight", 64, 128); add(a + "kv_a_layernorm.weight", 64)
+                add(a + "kv_b_proj.weight", 256, 64)
+                add(a + "o_proj.weight", 128, 128)
+                ix = a + "indexer."
+                add(ix + "wq_b.weight", 64, 128); add(ix + "wk.weight", 32, 128)
+                add(ix + "weights_proj.weight", 2, 128); add(ix + "index_kpool_compress_gate", 32, 128)
+                add(ix + "index_kpool_compress_ape", 2, 32)
+                add(ix + "k_norm.weight", 32); add(ix + "k_norm.bias", 32)
+            if i == 0:
+                add(p + "mlp.gate_proj.weight", 256, 128); add(p + "mlp.up_proj.weight", 256, 128)
+                add(p + "mlp.down_proj.weight", 128, 256)
+                continue
+            add(p + "mlp.gate.weight", 4, 128); add(p + "mlp.gate.e_score_correction_bias", 4)
+            for name in ("gate", "up", "down"):
+                add(p + f"mlp.shared_experts.{name}_proj.weight", *((128, 128)))
+            for e in range(4):
+                for name in ("gate", "up", "down"):
+                    add(p + f"mlp.experts.{e}.{name}_proj.weight", 8192, dtype="U8")
+                    add(p + f"mlp.experts.{e}.{name}_proj.weight.qs", 256)
+        write_shard(self.model / "model.safetensors", tensors)
+        self.info = analyze_model(self.model)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_layout_is_the_engines(self):
+        # The numbers glm53 printed for the fixture on Lavapipe ("[VK] glm53 chain fit: ...
+        # the engine's 4847872 B ..., tail 65792 B, layers 773352 728408 ... B"), at each
+        # GLM53_BITS, and with a chunk of 7 rows and a 300-position slot (155904 B)
+        from resource_plan import vk_chain_fit, vk_fit_pools
+        device = {"type": "cpu", "budget_bytes": 64 * GB}
+        want = {"32": ([773352, 728408, 576744, 728408, 576744, 728408], 65792),
+                "8": ([234472, 312408, 184296, 312408, 184296, 312408], 16896),
+                "4": ([153832, 250456, 126184, 250456, 126184, 250456], 9216)}
+        for bits, (layers, tail) in want.items():
+            with self.subTest(bits=bits):
+                env = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "GLM53_BITS": bits}
+                fit = vk_chain_fit(self.info, "glm53", env, device)
+                self.assertEqual(fit["layers"], layers)
+                self.assertEqual(fit["fixed"] - vk_fit_pools(0), 4847872)
+                self.assertEqual((fit["n"], fit["tail"]), (6, True))
+        small = vk_chain_fit(self.info, "glm53", {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "GLM53_BITS": "4",
+                                                  "COLI_VK_CHAIN_ROWS": "7", "GLM53_MAXT": "300"}, device)
+        self.assertEqual(small["fixed"] - vk_fit_pools(0), 155904)
+        self.assertEqual(small["layers"], want["4"][0])
+
+    def test_device_only_credits_the_layers_on_the_device(self):
+        from resource_plan import _glm53_dense_tensors, _vk_layer_index, _vk_released_tensor_bytes, vk_chain_fit
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "COLI_VK_DENSE_HOST": "0", "COLI_VK_TIER_RESERVE_GB": "0",
+              "GLM53_BITS": "32"}
+        big = {"type": "discrete", "budget_bytes": 64 * GB}
+        fit = vk_chain_fit(self.info, "glm53", on, big)
+
+        tensors = _glm53_dense_tensors(self.info, on)["dense_tensors"]   # resident at GLM53_BITS=32
+
+        def droppable(k):   # the matrices g53_dho_layer drops, of layers 0..k-1
+            return sum(_vk_released_tensor_bytes(t, "glm53", on) for t in tensors
+                       if _vk_layer_index(t["name"]) is not None and _vk_layer_index(t["name"]) < k)
+        for k in (1, 3, 5):
+            with self.subTest(k=k):
+                free = fit["fixed"] + sum(fit["layers"][:k]) + fit["layers"][k] // 2
+                plan = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": free}, **kwargs)
+                ram = plan["tiers"]["ram"]
+                self.assertEqual(ram["vk_chain_layers"]["on_device"], k)
+                self.assertEqual(ram["dense_on_device_bytes"], droppable(k))
+                self.assertIn(f"the first {k} of 6 layers", format_plan(plan))
+                forced = build_plan(self.model, env=dict(on, COLI_VK_CHAIN_LAYERS=str(k)), vulkan=big, **kwargs)
+                self.assertEqual(forced["tiers"]["ram"]["dense_on_device_bytes"], droppable(k))
+        self.assertGreater(droppable(3), droppable(1))
+        none = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": 1 << 20}, **kwargs)
+        self.assertEqual(none["tiers"]["ram"]["dense_on_device_bytes"], 0)
+        self.assertEqual(none["tiers"]["ram"]["vk_chain_layers"]["on_device"], 0)
+
+
 class PhysicalCpuCountTest(unittest.TestCase):
     """Regression for #325: --auto-tier pinned decode to one core because
     physical_cpu_count() silently returned 1.

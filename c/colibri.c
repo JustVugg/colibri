@@ -665,6 +665,11 @@ static int vk_tier_resident_count(Model *m);
 static void vk_tier_turn(Model *m);   /* "[VK] tier colibri turn: ..." after a serve turn */
 static int g_vk_dense;        /* COLI_VK_DENSE=1: run the resident dense matmuls (attention
                                * projections + shared expert) on Vulkan too */
+/* A partial chain (glm_chain.h, vkc_fit): the device holds the first N layers only, or not
+ * the head and the MTP layer. The per-matrix path then multiplies on the device only what
+ * is there already: a matrix without a device copy stays on the CPU (VK_MAY). */
+static int g_glmc_partial;
+#define VK_MAY(t) (!g_glmc_partial || (t)->vk != NULL)
 static int g_vk_budget2;      /* COLI_VK_EXPERTS2: dev2 expert-tier cap (with COLI_VK_DEV2) */
 static int g_vk_reg_n2;       /* experts resident on the dev2 tier */
 /* Resolve the main shader path (#523): COLI_VK_SHADERS may be the qmatmul.spv file itself
@@ -772,13 +777,13 @@ static int qt_dho_matmul(QT *t, float *y, const float *x, int S){
     return coli_vk_matmul(&t->vk, y, x, NULL, NULL, qt_vk_fmt(t), S, t->I, t->O, t->fmt==4 ? t->gs : 0);
 }
 static int vk_matmul_qt(QT *t, float *y, const float *x, int S){
-    if(!g_vk_dense || !VK_FMT_OK(t)) return 0;
+    if(!g_vk_dense || !VK_FMT_OK(t) || !VK_MAY(t)) return 0;
     const void *w = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     return coli_vk_matmul(&t->vk, y, x, w, t->s, t->fmt, S, t->I, t->O, t->gs);
 }
 /* Two same-input resident matmuls in one submit (q_a + kv_a read the same x). */
 static int vk_matmul_pair_qt(QT *a, float *ya, QT *b, float *yb, const float *x, int S){
-    if(!g_vk_dense || a->fmt!=b->fmt || !VK_FMT_OK(a) || a->gs!=b->gs || a->I!=b->I) return 0;
+    if(!g_vk_dense || a->fmt!=b->fmt || !VK_FMT_OK(a) || a->gs!=b->gs || a->I!=b->I || !VK_MAY(a) || !VK_MAY(b)) return 0;
     const void *wa = a->fmt==1 ? (const void*)a->q8 : (const void*)a->q4;
     const void *wb = b->fmt==1 ? (const void*)b->q8 : (const void*)b->q4;
     return coli_vk_matmul_pair(&a->vk, ya, wa, a->s, a->O,
@@ -4599,7 +4604,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         float *dbgQ=NULL,*dbgC=NULL;
         if(g_vk_qprep==2){ dbgQ=falloc((int64_t)S*l->q_b.O); dbgC=falloc((int64_t)S*l->kv_a.O); }
         if(g_vk_qprep && g_vk_dense && l->q_a.fmt==l->kv_a.fmt && l->q_a.fmt==l->q_b.fmt && VK_FMT_OK(&l->q_a)
-           && l->q_a.gs==l->kv_a.gs && l->q_a.gs==l->q_b.gs)
+           && l->q_a.gs==l->kv_a.gs && l->q_a.gs==l->q_b.gs && VK_MAY(&l->q_a) && VK_MAY(&l->kv_a) && VK_MAY(&l->q_b))
             vk_qp=coli_vk_attn_qprep(layer,
                 &l->q_a.vk, l->q_a.fmt==1?(const void*)l->q_a.q8:(const void*)l->q_a.q4, l->q_a.s, l->q_a.O,
                 &l->kv_a.vk, l->kv_a.fmt==1?(const void*)l->kv_a.q8:(const void*)l->kv_a.q4, l->kv_a.s, l->kv_a.O,
@@ -4919,7 +4924,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
          * on rewrite/rebind/resize). Falls back to CPU on DSA top-k selection, ragged KV,
          * the MTP layer, or any backend failure — output identical either way. */
         if(!cuda_core&&g_vk_attn&&!kvs&&!positions&&S<=4&&layer<c->n_layers&&
-           VK_FMT_OK(&l->kv_b)&&kvl<=512&&c->qk_nope<=256&&c->qk_rope<=64&&
+           VK_FMT_OK(&l->kv_b)&&VK_MAY(&l->kv_b)&&kvl<=512&&c->qk_nope<=256&&c->qk_rope<=64&&
            m->vk_kv_valid&&m->Lc[layer]&&m->Rc[layer]){   /* f32 KV only: a quantized-KV cache
                                                 * (upstream #399 KV8/TQ leaves Lc/Rc NULL)
                                                 * falls back to the CPU path until the VK
@@ -4935,7 +4940,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                     m->vk_kv_valid[layer]=T;
                     const void *kw=l->kv_b.fmt==1?(const void*)l->kv_b.q8:(const void*)l->kv_b.q4;
                     /* fused absorb + o-projection: ctx never leaves the device */
-                    if(VK_FMT_OK(&l->o)&&
+                    if(VK_FMT_OK(&l->o)&&VK_MAY(&l->o)&&
                        coli_vk_attention_absorb_project(&l->kv_b.vk,kw,l->kv_b.s,l->kv_b.fmt,l->kv_b.gs,
                             &l->o.vk,l->o.fmt==1?(const void*)l->o.q8:(const void*)l->o.q4,
                             l->o.s,l->o.fmt,l->o.gs,out,Q,layer,S,H,c->qk_nope,c->qk_rope,
@@ -6743,7 +6748,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * (x read once, 1 fence instead of 3). Falls through to the per-matmul chain. */
         int fsh=l->sh_gate.fmt;
         if(g_vk_dense && !omp_in_parallel() && (fsh==1||fsh==2||fsh==5) &&
-           l->sh_up.fmt==fsh && l->sh_down.fmt==fsh){
+           l->sh_up.fmt==fsh && l->sh_down.fmt==fsh && VK_MAY(&l->sh_gate) && VK_MAY(&l->sh_up) && VK_MAY(&l->sh_down)){
             #define SW_(t) ((t).fmt==1?(const void*)(t).q8:(const void*)(t).q4)
             if(coli_vk_tensor_ensure(&l->sh_gate.vk,SW_(l->sh_gate),l->sh_gate.s,fsh,D,sI,l->sh_gate.gs)&&
                coli_vk_tensor_ensure(&l->sh_up.vk,  SW_(l->sh_up),  l->sh_up.s,  fsh,D,sI,l->sh_up.gs)&&
@@ -7500,6 +7505,11 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
     layer_forward_rows(m,l,li,x,S,pos_base,NULL,NULL,nrm,tmp);
 }
 #ifdef COLI_VULKAN
+/* COLI_VK_DENSE_HOST around the chain's setup (below glm_chain.h): the decision, a placed
+ * layer's host copies, the rest once the chain is set up */
+static void glm_dho_start(Model *m);
+static void glm_dho_drop_layer(Model *m, int i);
+static void glm_dho_finish(Model *m);
 #include "glm_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
 static void layers_forward_rows_range(Model *m, float *x, int S, int pos_base,
@@ -7510,10 +7520,15 @@ static void layers_forward_rows_range(Model *m, float *x, int S, int pos_base,
 #ifdef COLI_VULKAN
     /* the whole forward on the device (glm_chain.h); 0: the CPU path below, as before.
      * A decode batch of one row of the bound KV state (a single-slot serve) is a step
-     * like any other; rows of several states stay on the CPU. */
+     * like any other; rows of several states stay on the CPU. A partial chain (the
+     * device holds the first N layers) hands x back after layer N - 1: the CPU runs the
+     * rest from there. */
     if(g_vk_chain && layer_begin==0 && layer_end==c->n_layers){
-        if(!kvs && !positions && glmc_forward(m,x,S,pos_base)) return;
-        if(kvs && S==1 && kvs[0]==m->kv && glmc_forward(m,x,1,positions?positions[0]:pos_base)) return;
+        int done=0;
+        if(!kvs && !positions) done=glmc_forward(m,x,S,pos_base);
+        else if(kvs && S==1 && kvs[0]==m->kv) done=glmc_forward(m,x,1,positions?positions[0]:pos_base);
+        if(done>=c->n_layers) return;
+        layer_begin=done;
     }
 #endif
     if(g_pilot_real){   /* nuovo forward: il possesso-layer riparte da -1 (i layer si rifanno da 0) */
@@ -10736,7 +10751,7 @@ static void run_serve(Model *m, const char *snap){
  * and self-size to what actually fits in device memory. */
 static void vk_dense_preload(Model *m){
     Cfg *c=&m->c;
-    if(!g_vulkan || !g_vk_dense) return;
+    if(!g_vulkan || !g_vk_dense || g_glmc_partial) return;   /* a partial chain: nothing more goes up */
     double t0=now_s(); int64_t bytes=0; int nt=0, full=0;
     for(int i=0;i<=c->n_layers && !full;i++){
         Layer *l = i<c->n_layers ? &m->L[i] : &m->mtpL;
@@ -10882,7 +10897,10 @@ static void vk_tier_start(Model *m){
      * set is already on the device (vk_dense_preload ran first) and counted as used. */
     double dense=0;
     if(g_vk_attn){ int ctx=getenv("CTX")?atoi(getenv("CTX")):4096; if(ctx<1) ctx=4096;
-        dense+=(double)NL*ctx*(c->kv_lora+c->qk_rope)*4.0; }
+        dense+=(double)(g_glmc_partial ? g_glmc_fit.n : NL)*ctx*(c->kv_lora+c->qk_rope)*4.0; }
+    /* a partial chain: nothing more of the trunk goes up, but the chain's first forward
+     * allocates its scratch and the N layers' KV mirrors */
+    if(g_glmc_partial) dense+=(double)g_glmc_lazy;
     { const char *r=getenv("COLI_VK_RESERVE_GB"), *tr=getenv("COLI_VK_TIER_RESERVE_GB");
       if(r && *r){ double extra=atof(r)-(tr&&*tr?atof(tr):1.0); if(extra>0) dense+=extra*1073741824.0; } }
     VktConfig vc={.engine="colibri", .layers=NL, .experts=E, .hidden=c->hidden, .inter=c->moe_inter, .topk=c->topk,
@@ -12269,27 +12287,36 @@ static void qt_dho_visit(QT *t, int keep, int drop, DhoPass *p){
     coli_vk_dense_host_dropped((size_t)b);
     p->n++; p->bytes+=b;
 }
-static void glm_dho_pass(Model *m, int drop, DhoPass *p){
+/* Layer i's matrices (i == n_layers: the MTP layer's) */
+static void glm_dho_layer(Model *m, int i, int drop, DhoPass *p){
     Cfg *c=&m->c;
-    for(int i=0;i<=c->n_layers;i++){
-        if(i==c->n_layers&&!m->has_mtp) break;
-        Layer *l = i<c->n_layers ? &m->L[i] : &m->mtpL;
-        int mtp = i==c->n_layers;
-        qt_dho_visit(&l->q_a,0,drop,p); qt_dho_visit(&l->q_b,0,drop,p); qt_dho_visit(&l->kv_a,0,drop,p);
-        qt_dho_visit(&l->kv_b,mtp||p->keep_kvb,drop,p); qt_dho_visit(&l->o,0,drop,p);
-        if(l->sparse){ qt_dho_visit(&l->sh_gate,p->keep_shared,drop,p); qt_dho_visit(&l->sh_up,p->keep_shared,drop,p);
-                       qt_dho_visit(&l->sh_down,p->keep_shared,drop,p); }
-        else { qt_dho_visit(&l->gate_proj,0,drop,p); qt_dho_visit(&l->up_proj,0,drop,p); qt_dho_visit(&l->down_proj,0,drop,p); }
-        if(!mtp&&m->ix_wq&&m->has_dsa&&c->idx_type[i]){
-            qt_dho_visit(&m->ix_wq[i],p->keep_kvb,drop,p); qt_dho_visit(&m->ix_wk[i],p->keep_kvb,drop,p);
-            qt_dho_visit(&m->ix_wp[i],p->keep_kvb,drop,p);
-        }
+    Layer *l = i<c->n_layers ? &m->L[i] : &m->mtpL;
+    int mtp = i==c->n_layers;
+    qt_dho_visit(&l->q_a,0,drop,p); qt_dho_visit(&l->q_b,0,drop,p); qt_dho_visit(&l->kv_a,0,drop,p);
+    qt_dho_visit(&l->kv_b,mtp||p->keep_kvb,drop,p); qt_dho_visit(&l->o,0,drop,p);
+    if(l->sparse){ qt_dho_visit(&l->sh_gate,p->keep_shared,drop,p); qt_dho_visit(&l->sh_up,p->keep_shared,drop,p);
+                   qt_dho_visit(&l->sh_down,p->keep_shared,drop,p); }
+    else { qt_dho_visit(&l->gate_proj,0,drop,p); qt_dho_visit(&l->up_proj,0,drop,p); qt_dho_visit(&l->down_proj,0,drop,p); }
+    if(!mtp&&m->ix_wq&&m->has_dsa&&c->idx_type[i]){
+        qt_dho_visit(&m->ix_wq[i],p->keep_kvb,drop,p); qt_dho_visit(&m->ix_wk[i],p->keep_kvb,drop,p);
+        qt_dho_visit(&m->ix_wp[i],p->keep_kvb,drop,p);
     }
+}
+/* Layers [0, n) and, with tail, the MTP layer, eh_proj and lm_head */
+static void glm_dho_pass(Model *m, int drop, DhoPass *p, int n, int tail){
+    for(int i=0;i<n;i++) glm_dho_layer(m,i,drop,p);
+    if(!tail) return;
+    if(m->has_mtp) glm_dho_layer(m,m->c.n_layers,drop,p);
     if(m->has_mtp) qt_dho_visit(&m->eh_proj,0,drop,p);
     qt_dho_visit(&m->lm_head,0,drop,p);
 }
-/* After the load, before the pins and cap_for_ram: the decision (the chain's own, made
- * silently here and printed by glmc_start), the uploads and the RAM given back. */
+static DhoPass g_glm_dho;   /* the drop's keep rules and what it gave back */
+static int g_glm_dho_on;
+/* After the load, before the pins and cap_for_ram (glmc_start calls it once the chain's
+ * fit is known): the decision (the chain's own, made silently here and printed by
+ * glmc_start). With a fit only the N layers on the device drop their copies, each as
+ * glmc_setup places it, and the MTP layer, eh_proj and lm_head only when the whole chain
+ * and that tail fit (glm_dho_finish); without one, every matrix here, as before. */
 static void glm_dho_start(Model *m){
     if(!g_vulkan) return;
     int tier_on = vkt_wanted() && g_vk_experts!=0 && m->c.n_experts>0;
@@ -12303,17 +12330,37 @@ static void glm_dho_start(Model *m){
     const char *xv = getenv("COLI_EXACT_VERIFY");   /* exact_verify_on() prints its line later, where it always did */
     p.keep_kvb = chain!=COLI_VK_CHAIN_ON || g_looka || g_pilot || (xv && atoi(xv)) || slots>1;
     p.keep_shared = g_pilot || g_looka;
-    glm_dho_pass(m, 0, &p);
-    if(!coli_vk_dense_host_decide("colibri", !cuda && (chain!=COLI_VK_CHAIN_OFF || g_vk_dense), (size_t)p.bytes)) return;
+    int L = m->c.n_layers, n = g_glmc_fitted ? g_glmc_fit.n : L, tail = g_glmc_fitted ? g_glmc_fit.tail : 1;
+    glm_dho_pass(m, 0, &p, n, tail);
+    int on_device = !cuda && (g_glmc_fitted ? n>0 : (chain!=COLI_VK_CHAIN_OFF || g_vk_dense));
+    if(!coli_vk_dense_host_decide("colibri", on_device, (size_t)p.bytes)) return;
     g_dho_model = m; g_dho_thread = pthread_self();
     g_vk_dense = 1;   /* the steps the chain does not run take the device too: the CPU has no copy */
     p.n = 0; p.bytes = 0;
-    glm_dho_pass(m, 1, &p);
-    m->resident_bytes -= p.bytes;   /* what cap_for_ram and autopin count in RAM */
-    char kept[256];
-    snprintf(kept, sizeof kept, "the embedding, routers and norms, the MTP layer's kv_b%s%s",
-             p.keep_kvb ? ", every kv_b and DSA indexer (the chain will not run every forward: the CPU's attention reads them)" : "",
-             p.keep_shared ? ", the shared experts (PILOT/LOOKA multiply them on the host)" : "");
+    g_glm_dho = p; g_glm_dho_on = 1;
+    if(g_glmc_fitted){ coli_vk_dense_host_layers(n, L); return; }   /* glmc_setup drops each layer it places */
+    glm_dho_pass(m, 1, &g_glm_dho, L, 1);
+    glm_dho_finish(m);
+}
+/* glmc_setup placed all of layer i: its host copies go */
+static void glm_dho_drop_layer(Model *m, int i){
+    if(g_glm_dho_on) glm_dho_layer(m, i, 1, &g_glm_dho);
+}
+/* The tail (a full chain with room for it), the RAM given back, the line. */
+static void glm_dho_finish(Model *m){
+    if(!g_glm_dho_on) return;
+    int part = 0;
+    if(g_glmc_fitted){
+        coli_vk_dense_host_layers(g_glmc_fit.n, m->c.n_layers);
+        if(g_glmc_fit.tail) glm_dho_pass(m, 1, &g_glm_dho, 0, 1);
+        part = vkc_fit_partial(&g_glmc_fit);
+    }
+    m->resident_bytes -= g_glm_dho.bytes;   /* what cap_for_ram and autopin count in RAM */
+    char kept[384];
+    snprintf(kept, sizeof kept, "the embedding, routers and norms, the MTP layer's kv_b%s%s%s",
+             g_glm_dho.keep_kvb ? ", every kv_b and DSA indexer (the chain will not run every forward: the CPU's attention reads them)" : "",
+             g_glm_dho.keep_shared ? ", the shared experts (PILOT/LOOKA multiply them on the host)" : "",
+             part ? ", lm_head, eh_proj and the MTP layer (the chain's tail runs on the CPU)" : "");
     coli_vk_dense_host_placed("colibri", kept);
 }
 #endif
@@ -13045,7 +13092,10 @@ int main(int argc, char **argv){
     }
     if(getenv("DSA_TOPK")) m.c.index_topk=atoi(getenv("DSA_TOPK"));   /* override per test */
 #ifdef COLI_VULKAN
-    glm_dho_start(&m);   /* COLI_VK_DENSE_HOST: the trunk on the device only, before the pins and the RAM cap */
+    /* COLI_VK_CHAIN: decided, fitted (how many layers the device holds) and placed, with
+     * COLI_VK_DENSE_HOST's host copies of those layers given back, before the pins and the
+     * RAM cap (they count only what was dropped) and before the tier sizes itself */
+    glmc_start(&m);
 #endif
     /* Il path MUX (SERVE_BATCH=1, cioe' `coli serve`) forza g_draft=0 sotto —
      * la speculazione non e' ragged-safe nel batch multi-slot. Segnalarlo QUI,
@@ -13187,7 +13237,6 @@ int main(int argc, char **argv){
       if(g_prof) prof_config(&m, ram_env, est_ctx); }
 #ifdef COLI_VULKAN
     vk_dense_preload(&m);   /* dense claims VRAM first — the tier sizes to the remainder */
-    glmc_start(&m);         /* COLI_VK_CHAIN: the chain's trunk on the device, before the tier sizes itself */
     vk_tier_start(&m);      /* the shared expert tier: needs the usage history and the cap above */
     vk_dev2_fill(&m);       /* COLI_VK_DEV2: the hottest experts the tier does not hold */
     glmc_atexit(&m);        /* after the tier's: the chain goes before the device */
