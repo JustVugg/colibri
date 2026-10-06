@@ -380,8 +380,22 @@ causal GQA with the gate and a selection list, the convolution in both orders wi
 ring and snapshot, the recurrence at KD 8 and 128 with both gates, every element-wise
 op, and a failed launch marking the device lost.
 
-**Measured.** See the pull request that brought it (the 3070 numbers against
-`Q36_DN_GPU=1` and Ollama are there), and below once the defaults settle.
+**Measured** (RTX 3070 alone, Qwen3.6-35B-A3B int4, the trunk in VRAM by `COLI_PLACE=auto`,
+expert tier at 81-82 % hits, the usual 49-token prompt, 200 new tokens, two runs each):
+
+| | TTFT | tok/s, the run | ms per decode token | decode tok/s | device wait per token |
+|---|---|---|---|---|---|
+| `Q36_DN_GPU=1` (the per-layer step) | 1.22-1.26 s | 26.2-27.6 | 30-32 | 32-33 | |
+| `COLI_CUDA_CHAIN=1` | 0.98 s | 42.7-42.8 | 18.7 | 53 | 5.7 ms |
+| Ollama 0.34.4 on the same card | | | 26.2 | 38.1 | |
+
+The chain alone, with the backend's block GEMV, gave 27.6 ms a token: the CPU's parts
+went (the attention core 3.9 ms, the shared expert 4.1 ms, about seventy bus round trips)
+and the token was the device's time, 14.7 ms, which was the trunk's 1.9 GB of int8 rows
+read at 120 GB/s. `gemv_i8_rows` (backend_cuda.cu: a warp per output row, 16 bytes a
+lane, the activation in shared memory) reads them at 330-418 GB/s, and the device's part
+of a token is 5.7 ms. What is left is the routed experts on the host (9.9 ms: the tier's
+groups and the CPU's share) and the routing, launches and forty waits (about 3 ms).
 
 ## The residents follow the prompt (`QT_PREFILL_REPLAN=1`)
 
