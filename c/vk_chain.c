@@ -889,17 +889,18 @@ static VkPipeline kab_pipe(void) {
 }
 /* chain_attn_dec.comp + chain_attn_dec2.comp: a decode step's or a verify's few rows
  * split over the positions (made on first use; subgroups of 64 only) */
-static struct { VkShaderModule mod1, mod2; VkPipeline p1, p2; int tried, g; VkcBuf *part; } KAD;
+static struct { VkShaderModule mod1, mod2; VkPipeline p1, p2; int tried, g; VkcBuf *part; } g_kad[2];
+#define KAD (g_kad[g_kd])   /* per device, as KAB */
 static int kad_ready(int G) {
     if (KAD.p1 && KAD.g == G) return 1;
     if (KAD.tried || !vkc_ready()) return 0;
     KAD.tried = 1;
     VkPhysicalDeviceSubgroupProperties sgp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     VkPhysicalDeviceProperties2 pp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sgp};
-    vkGetPhysicalDeviceProperties2((VkPhysicalDevice)K.core.phys, &pp2);
+    vkGetPhysicalDeviceProperties2((VkPhysicalDevice)KC.core.phys, &pp2);
     if (sgp.subgroupSize != 64) return 0;
-    if (!(KAD.mod1 = load_module(K.core.spv_path, "chain_attn_dec.spv")) ||
-        !(KAD.mod2 = load_module(K.core.spv_path, "chain_attn_dec2.spv"))) return 0;
+    if (!(KAD.mod1 = load_module(KC.core.spv_path, "chain_attn_dec.spv")) ||
+        !(KAD.mod2 = load_module(KC.core.spv_path, "chain_attn_dec2.spv"))) return 0;
     int32_t v = G;
     VkSpecializationMapEntry me = {0, 0, 4};
     VkSpecializationInfo si = {1, &me, 4, &v};
@@ -909,10 +910,10 @@ static int kad_ready(int G) {
     return 1;
 }
 static void kad_shutdown(void) {
-    if (KAD.p1) vkDestroyPipeline(K.dev, KAD.p1, NULL);
-    if (KAD.p2) vkDestroyPipeline(K.dev, KAD.p2, NULL);
-    if (KAD.mod1) vkDestroyShaderModule(K.dev, KAD.mod1, NULL);
-    if (KAD.mod2) vkDestroyShaderModule(K.dev, KAD.mod2, NULL);
+    if (KAD.p1) vkDestroyPipeline(KC.dev, KAD.p1, NULL);
+    if (KAD.p2) vkDestroyPipeline(KC.dev, KAD.p2, NULL);
+    if (KAD.mod1) vkDestroyShaderModule(KC.dev, KAD.mod1, NULL);
+    if (KAD.mod2) vkDestroyShaderModule(KC.dev, KAD.mod2, NULL);
     memset(&KAD, 0, sizeof KAD);   /* part went with the pools */
 }
 static void kab_shutdown(void) {
