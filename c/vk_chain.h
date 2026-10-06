@@ -154,10 +154,11 @@ int  vkc_attn_flash_rows(void);   /* COLI_VK_CHAIN_FLASH: rows from which chain_
  * over nitems (expert, row, rpw outputs) items (gate_up: the SwiGLU, x rows through amap
  * / kgat); vkc_moe_sum adds each row's K outputs in rank order (expert_sum.comp). */
 int  vkc_moe_ready(void);
+int  vkc_moe_wave(void);   /* the one-wave expert kernels (16 / 32 output rows an item) */
 int  vkc_moe_route(VkcBuf *lg, VkcBuf *mgu, VkcBuf *mdn, VkcBuf *egu, VkcBuf *edn, VkcBuf *wt, VkcBuf *ix,
                    int S, int E, int K, int ix_off);
 int  vkc_moe_gemv(int gate_up, VkcBuf *x, VkcBuf *items, VkcBuf *etab, VkcBuf *y, VkcBuf *amap, int nitems,
-                  int I, int O, float limit, int kgat, int rpw);
+                  int I, int O, float limit, int kgat, int rpw, int i4g64);   /* i4g64: every entry int4 in groups of 64 */
 int  vkc_moe_sum(VkcBuf *ys, VkcBuf *w, VkcBuf *use, VkcBuf *out, int S, int K, int D);
 /* chain_dnconv.comp */
 typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off, snap_n, snap_stride; } VkcDnConv;

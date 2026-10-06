@@ -735,6 +735,8 @@ VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv
 VK_SPV   += shaders/chain_attnb.spv
 # int4 decode GEMVs as W4A8 (vk_chain.c, COLI_VK_CHAIN_IDOT)
 VK_SPV   += shaders/chain_gemv_idot.spv
+# a decode step's routed experts, one wave a (row, expert) (vk_chain.c, the device MoE)
+VK_SPV   += shaders/qmatmul_grp_gemv_wave_gate_up.spv shaders/qmatmul_grp_gemv_wave_down.spv
 # the int8/int4 prompt GEMM on the matrix units (optional at run time)
 VK_SPV   += shaders/chain_gemm.spv
 # the KV cache split between the device and the host past the device's budget
@@ -896,6 +898,12 @@ shaders/qmatmul_grp_gate_up.spv: shaders/qmatmul_grp.comp
 shaders/qmatmul_grp_gemv_gate_up.spv: shaders/qmatmul_grp_gemv.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+shaders/qmatmul_grp_gemv_wave_gate_up.spv: shaders/qmatmul_grp_gemv_wave.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+shaders/qmatmul_grp_gemv_wave_down.spv: shaders/qmatmul_grp_gemv_wave.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@
 vk_chain.o: vk_chain.c vk_chain.h backend_vulkan.h vk_alloc.h .build-config
 	$(CC) $(CFLAGS) -c vk_chain.c -o $@
 shaders/%.spv: shaders/%.comp

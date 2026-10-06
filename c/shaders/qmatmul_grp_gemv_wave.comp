@@ -1,0 +1,120 @@
+#version 450
+// The device MoE's expert GEMV (vk_chain.c, vkc_moe_gemv), one wave a workgroup, for
+// Qwen3.6-35B-A3B's shapes: int4 in groups of 64, gate|up 2048 -> 512 (-DGATE_UP, 16
+// outputs a workgroup) and down 512 -> 2048 (32 outputs). x is staged in shared memory
+// sized to the shape and held in registers for every output row; the sums run in a fixed
+// order of fmas and XOR shuffles, so a row's bits do not depend on the batch around it.
+// qmatmul_grp_gemv.comp's bindings, push constants and address table. The host takes it
+// only for these shapes with every expert int4 g64, a subgroup of 64 and full subgroups;
+// COLI_VK_MOE_WAVE=0 keeps qmatmul_grp_gemv.comp.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+layout(local_size_x=64) in;
+#ifdef GATE_UP
+#define NI 2048u
+#define NO 512u
+#define LP 64u
+#define ROWS 16u
+#else
+#define NI 512u
+#define NO 2048u
+#define LP 16u
+#define ROWS 32u
+#endif
+#define NC (64u/LP)
+layout(buffer_reference, std430, buffer_reference_align=16)
+readonly buffer WR { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align=4)
+readonly buffer SR { float v[]; };
+layout(std430,binding=0) readonly buffer X { vec4 x4[]; };
+layout(std430,binding=1) readonly buffer IT { uvec4 items[]; };
+layout(std430,binding=2) readonly buffer ET { uint etab[]; };
+layout(std430,binding=3) writeonly buffer Y { float y[]; };
+layout(std430,binding=4) readonly buffer AM { int amap[]; };
+layout(push_constant) uniform P {
+    int I,O; float limit; int ibase,kgat,rpw;
+} p;
+shared vec4 xs[NI/4u]; // 8 KiB gate/up, 2 KiB down; retain LDS staging.
+
+float d4(uint w, vec4 a, vec4 b) {
+    precise float z=a.x*float(int(w & 15u)-8);
+    z=fma(a.y,float(int((w>>4u) & 15u)-8),z);
+    z=fma(a.z,float(int((w>>8u) & 15u)-8),z);
+    z=fma(a.w,float(int((w>>12u) & 15u)-8),z);
+    z=fma(b.x,float(int((w>>16u) & 15u)-8),z);
+    z=fma(b.y,float(int((w>>20u) & 15u)-8),z);
+    z=fma(b.z,float(int((w>>24u) & 15u)-8),z);
+    z=fma(b.w,float(int(w>>28u)-8),z);
+    return z;
+}
+float reduce_fixed(float v) {
+    precise float r=v;
+    [[unroll]] for (uint off=LP/2u; off>0u; off>>=1u)
+        r=r+subgroupShuffleXor(r,off);
+    return r;
+}
+void matrix4(WR w, SR sc, uint o0, uint j, vec4 ax[8], out float acc[4]) {
+    uvec4 v[4]; float scale[4];
+    [[unroll]] for (uint t=0u;t<4u;t++) {
+        uint o=o0+t*NC;
+        v[t]=w.v[o*(NI/32u)+j];
+        scale[t]=sc.v[o*(NI/64u)+j/2u];
+    }
+    precise float d[4];
+    [[unroll]] for (uint t=0u;t<4u;t++) d[t]=0.0;
+    [[unroll]] for (uint h=0u;h<4u;h++) {
+        [[unroll]] for (uint t=0u;t<4u;t++) {
+            float z=d4(v[t][h],ax[2u*h],ax[2u*h+1u]);
+            d[t]=h==0u ? z : d[t]+z;
+        }
+    }
+    [[unroll]] for (uint t=0u;t<4u;t++) {
+        precise float a=0.0+scale[t]*d[t];
+        acc[t]=reduce_fixed(a);
+    }
+}
+void main() {
+    uvec4 it=items[uint(p.ibase)+gl_WorkGroupID.x];
+    uint eb=it.x*16u, packed=etab[eb+9u]+it.y;
+    WR wg=WR(packUint2x32(uvec2(etab[eb],etab[eb+1u])));
+    SR sg=SR(packUint2x32(uvec2(etab[eb+2u],etab[eb+3u])));
+#ifdef GATE_UP
+    WR wu=WR(packUint2x32(uvec2(etab[eb+4u],etab[eb+5u])));
+    SR su=SR(packUint2x32(uvec2(etab[eb+6u],etab[eb+7u])));
+#endif
+    uint xr=packed;
+#ifdef GATE_UP
+    if (p.kgat>0) xr=uint(amap[packed])/uint(p.kgat);
+#endif
+    for (uint i=gl_LocalInvocationID.x;i<NI/4u;i+=64u)
+        xs[i]=x4[xr*(NI/4u)+i];
+    barrier();
+    uint lane=gl_SubgroupInvocationID, j=lane%LP, cluster=lane/LP;
+    // Only one weight step per lane: these inputs serve ALL rows and both matrices.
+    vec4 ax[8];
+    [[unroll]] for (uint h=0u;h<8u;h++) ax[h]=xs[j*8u+h];
+    for (uint base=0u;base<ROWS;base+=4u*NC) {
+        uint o0=it.z+base+cluster;
+        float ag[4];
+        matrix4(wg,sg,o0,j,ax,ag);
+#ifdef GATE_UP
+        float au[4];
+        matrix4(wu,su,o0,j,ax,au); // sequential, no matrix_block2 live-weight doubling
+#endif
+        if (j==0u) {
+            [[unroll]] for (uint t=0u;t<4u;t++) {
+                float g=ag[t];
+#ifdef GATE_UP
+                float u=au[t];
+                if (p.limit>0.0) { g=min(g,p.limit); u=clamp(u,-p.limit,p.limit); }
+                y[packed*NO+o0+t*NC]=(g/(1.0+exp(-g)))*u;
+#else
+                y[packed*NO+o0+t*NC]=g;
+#endif
+            }
+        }
+    }
+}

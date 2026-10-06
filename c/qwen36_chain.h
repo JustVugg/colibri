@@ -103,6 +103,7 @@ typedef struct {
      * the grouped GEMV, its hidden and output rows, the raw logits for the bookkeeping */
     VkcBuf **mgu, **mdn, *egu, *edn, *wt, *ix, *itg, *itd, *amap, *use, *hid, *ys, *lga, *rdev;
     int moe_tab;   /* 1 built, -1 an expert the grouped GEMV cannot take */
+    int moe_i4;    /* every expert int4 in groups of 64: the one-wave kernels may take them */
     unsigned long long forwards, frames, host_ms_n, moe_steps;
     double wait_ms, host_ms;
 } Q36Chain;
@@ -815,6 +816,13 @@ static int q36c_shared(Q36Chain *ch, Model *m, Layer *l, int i, int n) {
 }
 /* The routed experts on the device for a decode step: every expert resident (the tier's
  * entries stay put for the step), plain routing, a few rows. */
+/* output rows a grouped-GEMV item: gate|up (0), down (1); COLI_VK_MOE_RPW_G / _D. The
+ * one-wave kernels take 16 (gate|up) and 32 (down) rows an item; else 64 */
+static int q36c_rpw(const Q36Chain *ch, int down) {
+    static int v[2] = {-1, -1};
+    if (v[down] < 0) { const char *e = getenv(down ? "COLI_VK_MOE_RPW_D" : "COLI_VK_MOE_RPW_G"); v[down] = e && *e ? atoi(e) : 0; }
+    return v[down] > 0 ? v[down] : ch->moe_i4 && vkc_moe_wave() ? (down ? 32 : 16) : 64;
+}
 static int q36c_moe_ok(Q36Chain *ch, Model *m, int n) {
     Cfg *c = &m->c;
     if (c->n_experts <= 0 || c->n_experts % 64 || n > 8 || ch->moe_tab < 0 || !vkc_moe_ready() || !vkt_ready() ||
@@ -833,11 +841,19 @@ static int q36c_moe_ok(Q36Chain *ch, Model *m, int n) {
                     ch->moe_tab = -1; return 0;
                 }
         }
+        ch->moe_i4 = 1;
+        for (int i = 0; i < L; i++) {
+            const uint32_t *gu = vkc_ptr(ch->mgu[i]), *dn = vkc_ptr(ch->mdn[i]);
+            for (int e = 0; e < E; e++) {   /* an entry's format and group size: words 10 and 12 */
+                const uint32_t *a = gu + (size_t)e * 16, *b = dn + (size_t)e * 16;
+                if (a[10] != 4 || a[12] != 64 || b[10] != 4 || b[12] != 64) ch->moe_i4 = 0;
+            }
+        }
         ch->moe_tab = 1;
         fprintf(stderr, "[VK] qwen36 chain: decode steps route and run their experts on the device (%d layers x %d experts)\n", L, E);
     }
     int L = ch->n, E = c->n_experts, K = c->topk, D = c->hidden, I = c->inter, nk = n * K;
-    int ng = (I + 63) / 64, nd = (D + 63) / 64;
+    int RG = q36c_rpw(ch, 0), RD = q36c_rpw(ch, 1), ng = (I + RG - 1) / RG, nd = (D + RD - 1) / RD;
     if (!q36c_res(&ch->egu, (size_t)nk * 16, VKC_DEV) || !q36c_res(&ch->edn, (size_t)nk * 16, VKC_DEV) ||
         !q36c_res(&ch->wt, nk, VKC_DEV) || !q36c_res(&ch->ix, (size_t)L * nk, VKC_DOWN) ||
         !q36c_res(&ch->itg, (size_t)nk * ng * 4, VKC_UP) || !q36c_res(&ch->itd, (size_t)nk * nd * 4, VKC_UP) ||
@@ -848,19 +864,19 @@ static int q36c_moe_ok(Q36Chain *ch, Model *m, int n) {
     uint32_t *ig = vkc_ptr(ch->itg), *id = vkc_ptr(ch->itd), *am = vkc_ptr(ch->amap), *us = vkc_ptr(ch->use);
     for (int j = 0; j < nk; j++) {
         am[j] = (uint32_t)j; us[j] = 1;
-        for (int b = 0; b < ng; b++) { uint32_t *q = ig + ((size_t)j * ng + b) * 4; q[0] = j; q[1] = 0; q[2] = b * 64; q[3] = 1; }
-        for (int b = 0; b < nd; b++) { uint32_t *q = id + ((size_t)j * nd + b) * 4; q[0] = j; q[1] = 0; q[2] = b * 64; q[3] = 1; }
+        for (int b = 0; b < ng; b++) { uint32_t *q = ig + ((size_t)j * ng + b) * 4; q[0] = j; q[1] = 0; q[2] = b * RG; q[3] = 1; }
+        for (int b = 0; b < nd; b++) { uint32_t *q = id + ((size_t)j * nd + b) * 4; q[0] = j; q[1] = 0; q[2] = b * RD; q[3] = 1; }
     }
     return 1;
 }
 /* layer i's routed experts for n rows: the router logits in ch->lg -> ch->routed */
 static int q36c_moe(Q36Chain *ch, Model *m, int i, int n) {
     Cfg *c = &m->c; int E = c->n_experts, K = c->topk, D = c->hidden, I = c->inter, nk = n * K;
-    int ng = (I + 63) / 64, nd = (D + 63) / 64;
+    int RG = q36c_rpw(ch, 0), RD = q36c_rpw(ch, 1), ng = (I + RG - 1) / RG, nd = (D + RD - 1) / RD;
     return vkc_copy(ch->lga, (size_t)i * n * E, ch->lg, 0, (size_t)n * E) &&
            vkc_moe_route(ch->lg, ch->mgu[i], ch->mdn[i], ch->egu, ch->edn, ch->wt, ch->ix, n, E, K, i * nk) &&
-           vkc_moe_gemv(1, ch->h2, ch->itg, ch->egu, ch->hid, ch->amap, nk * ng, D, I, 0.f, K, 64) &&
-           vkc_moe_gemv(0, ch->hid, ch->itd, ch->edn, ch->ys, ch->amap, nk * nd, I, D, 0.f, 0, 64) &&
+           vkc_moe_gemv(1, ch->h2, ch->itg, ch->egu, ch->hid, ch->amap, nk * ng, D, I, 0.f, K, RG, ch->moe_i4) &&
+           vkc_moe_gemv(0, ch->hid, ch->itd, ch->edn, ch->ys, ch->amap, nk * nd, I, D, 0.f, 0, RD, ch->moe_i4) &&
            vkc_moe_sum(ch->ys, ch->wt, ch->use, ch->rdev, n, K, D);   /* device memory: the next combine reads it */
 }
 /* x += routed + gate * shared, as moe() leaves `out` and layers_forward_range adds it */
