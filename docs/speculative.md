@@ -91,6 +91,27 @@ standing rows' streams, each with the token that followed it.
 `auto` to let the gate pick 0 to 3 per verify. The default is 2, the depth measured
 fastest (below). `Q38_MTP_DRAFTS=1` is the one-draft verify that came before.
 
+## The MTP head's drafts (qwen36)
+
+`Q36_MTP=1` reads the release's `mtp.*` block from the converted container
+([conversion and settings](qwen36.md#the-mtp-head-q36_mtp)). Its input pairs
+the backbone's output **after its final norm** with the next token's embedding.
+The head has its own causal KV cache; every completed pair contributes its K/V,
+and only a draft row runs the full attention/MoE/output computation.
+
+`Q36_MTP_DRAFTS=1..7` bounds the depth, `auto` lets the measured gate choose,
+`Q36_MTP_PMIN` stops uncertain deeper drafts, and `Q36_MTP_VOCAB_IDS` limits
+only the draft's output scoring. When lookup also proposes tokens the gate
+chooses a source by its measured value. Both sources share verification and
+rollback; `[qwen36 mtp]` reports the head's acceptance separately. A rejected
+row or an unconsumed tail never commits to the backbone state. Pins preserve
+the pending residual as well as the backbone recurrence.
+
+`make -C c qwen36-tiny-mtp-check` checks reference logits, exact output and final
+logits at every depth, forced rejection/acceptance/mixed rows, and multi-turn
+serve including prefix reuse, pin restore and sampling. The reference uses
+Qwen's Transformers decoder with the converted int8 or int4-g64 weights.
+
 ## Prompt lookup
 
 Prompt lookup (on by default; `COLI_LOOKUP=0` turns it off) looks for the longest n-gram of

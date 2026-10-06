@@ -1605,6 +1605,22 @@ qwen38-tiny-mtp-check: qwen38-tiny-mtp-generate qwen38$(EXE)
 	$(PYTHON) tests/qwen38_mtp_harness.py --engine ./qwen38$(EXE) --bf16 ./qwen38_tiny_mtp \
 		--fp8 ./qwen38_tiny_fp8_mtp --int4 ./qwen38_tiny_int4_mtp
 
+# The Qwen3.6 checkpoint head: independent Qwen decoder reference, exact
+# verifies at every depth through seven, and multi-turn serve on CPU.
+.PHONY: qwen36-tiny-mtp-generate qwen36-tiny-mtp-check
+qwen36-tiny-mtp-generate:
+	$(PYTHON) tools/make_qwen36_tiny.py --out ./qwen36_tiny_mtp --mtp --fused-experts \
+		--ref-mode full --vocab 128 --inter 64 --emit-ref ./qwen36_tiny_mtp/ref.json
+	$(PYTHON) tools/convert_qwen36.py --model ./qwen36_tiny_mtp --out ./qwen36_tiny_mtp_i8 --ebits 8
+	$(PYTHON) tools/convert_qwen36.py --model ./qwen36_tiny_mtp --out ./qwen36_tiny_mtp_i4 --ebits 4 --gs 64
+	@for d in qwen36_tiny_mtp_i8 qwen36_tiny_mtp_i4; do \
+		$(PYTHON) tools/make_edge_tiny_tokenizer.py --vocab-size 128 ./$$d || exit $$?; done
+
+qwen36-tiny-mtp-check: qwen36-tiny-mtp-generate qwen36$(EXE)
+	$(PYTHON) tests/test_qwen36_mtp_convert.py
+	$(PYTHON) tests/qwen36_mtp_harness.py --engine ./qwen36$(EXE) --source ./qwen36_tiny_mtp \
+		--model ./qwen36_tiny_mtp_i8 --model ./qwen36_tiny_mtp_i4
+
 # Speculative decoding with deeper verifies (docs/speculative.md): the MTP head's
 # drafts up to 3 per verify (Q38_MTP_DRAFTS) and prompt-lookup drafts up to 5
 # (COLI_LOOKUP=1, spec_draft.h), on qwen38 and qwen36. tests/test_spec_draft

@@ -296,6 +296,7 @@ void  coli_vk_xb_step_end(void);
  * left 0), for a caller that routes on the device; 0 when the grouped GEMV cannot take
  * it. The addresses stay valid while the expert does. */
 int   coli_vk_xb_expert_entries(const ColiVkExpert *e, uint32_t gu[16], uint32_t dn[16]);
+int coli_vk_tensor_entries(const ColiVkTensor *g, const ColiVkTensor *u, const ColiVkTensor *d, uint32_t gu[16], uint32_t dn[16]);
 /* Sub-batches, for a prefill step too big for one batch (vk_tier.c's streaming): batch k
  * of a step goes to half k % 2 of the scratch, so two run at once and the host fills one
  * while the device computes the other. _reserve sizes each half for a batch of up to

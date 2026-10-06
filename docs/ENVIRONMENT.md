@@ -517,6 +517,14 @@ and the CPU/GPU execution split.
 | `QWEN_DENSE_BATCH` | `1` (on) | On AVX2/FMA, reuse each dense-int8 weight decode across two prompt rows. `=0` restores one GEMV call per row. Decode `S=1` is unchanged. |
 | `QWEN_SHARED_BATCH` | bounded by 32 MiB scratch | Batch the CPU shared expert across prompt rows. `=0` restores scalar calls; a positive integer caps rows per chunk. The CUDA-tier overlap path is unchanged. |
 | `COLI_LOOKUP` | `1` (on) | Prompt-lookup drafts (`0` turns them off). When the recent tokens repeat an n-gram (4 down to 2 tokens) of the prompt or the output, the tokens that followed it are drafted and checked in one verify forward; the output is that of plain decoding, greedy or sampled. A gate drafts only where the measured acceptance and verify cost say it pays. Off under the CUDA tier, `CACHE_ROUTE` and qpack. See [speculative.md](speculative.md). |
+| `Q36_MTP` | `0` | `1`: load the release's `mtp.*` block from the converted container and draft beside prompt lookup. Missing head: plain decoding with a diagnostic. Off under CUDA tier, `CACHE_ROUTE`, qpack. See [qwen36.md](qwen36.md#the-mtp-head-q36_mtp). |
+| `Q36_MTP_DRAFTS` | `1` | Draft depth `1`..`7`, or `auto` / `0` for the gate's choice; each deeper row reads the head's previous pre-norm residual. |
+| `Q36_MTP_PMIN` | `0` | Stop deeper drafts when the newest draft probability is below this value (`0`..`1`). With a vocabulary list, probability is conditional on that list. |
+| `Q36_MTP_VOCAB_IDS` | unset | File of whitespace-separated token IDs to score with the shared `lm_head`; duplicates removed, malformed/out-of-range IDs refused. Verify always uses the full vocabulary. |
+| `Q36_MTP_GPU` | `1` | With the Vulkan chain, run the head on the device. `0`: CPU head. |
+| `Q36_MTP_DMOE` | `1` | Device MoE routing/grouped experts when supported; `0`: host routing and per-expert device matrix operations. |
+| `Q36_MTP_FORCE` | unset | Tests: `reject`, `accept`, `mixed`, `cycle`, `row1`..`row7`. In `ref.json` mode, replace proposals with reference tokens except forced wrong rows; `reject` also rejects every draft in text/serve mode. |
+| `Q36_MTP_DUMP` | unset | Tests: append `(int32 backbone row, int32 next token, float32[vocab] draft logits)` for each first draft to this file. |
 | `COLI_LOOKUP_DRAFTS` | `5` | Lookup drafts per verify at most (1..5); a verify of `k` drafts copies the DeltaNet state after `k` rows (63 MiB each on the 35B). |
 | `COLI_SPEC_GATE` | `1` (on) | `=0`: every proposal drafted in full, the gate's estimates ignored (tests). |
 | `COLI_LOOKUP_FORCE` | unset | Tests only, `ref.json` mode: the reference's tokens as the proposal; `accept`, `mixed`, `cycle`, `row1`..`row5` as for `Q38_MTP_FORCE`. |

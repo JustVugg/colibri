@@ -120,6 +120,83 @@ CUDA tier, `CACHE_ROUTE` and a qpack container, whose results depend on what is
 resident. On a code edit, Qwen3.6-35B-A3B decoded 7.90 tok/s with lookup against 7.42 without (1.56 tokens per forward); on a chat prompt the gate declined every proposal and the speed was unchanged. How it works, the gate, the settings and the tests:
 [speculative.md](speculative.md).
 
+## The MTP head (`Q36_MTP`)
+
+`tools/convert_qwen36.py` carries the release's `mtp.*` tensors into
+`model-mtp.safetensors`. Dense weights and norms stay f16; routed experts use
+exactly the trunk's merged int8/int4, group-scale or mixed-down format.
+`Q36_MTP=1` loads this block from `SNAP`; unset or `0` leaves it unread. A
+container without the block still decodes normally and reports that the head
+is unavailable. No separate model download is needed.
+
+For a full conversion, use the usual command. To add the head to an existing
+container, only the source shards named for `mtp.*` in the release's index are
+needed. This command creates a new directory, links the base files, and writes
+only the head and updated metadata. The base is never modified; the destination
+must be new or empty, and the expert quantization is inherited from the base.
+
+```sh
+python3 c/tools/convert_qwen36.py --model /path/to/hf-checkpoint \
+  --mtp-only --base-container /path/to/converted-int4 \
+  --out /path/to/converted-with-mtp
+SNAP=/path/to/converted-with-mtp Q36_MTP=1 ./c/qwen36 8 4 "Explain speculative decoding."
+```
+
+The computation follows Qwen's MTP module: at position p, concatenate the
+normalized embedding of token p+1 with the normalized backbone output h_p,
+then `mtp.fc`, one gated full-attention decoder layer with its own KV cache,
+MoE (top-8 of 256 experts and a gated shared expert), `mtp.norm`, and the shared
+`lm_head`. **h_p is the backbone's output after its final norm** (vLLM's Qwen3-Next
+MTP takes the target model's hidden states the same way), normalized once more by
+`mtp.pre_fc_norm_hidden`; a deeper draft takes the head's own output after `mtp.norm`.
+On the released 35B checkpoint this wiring drafts better than the residual before
+the norm: first drafts accepted 89.2 / 88.6 / 85.7 % against 85.1 / 88.6 / 84.0 % on a
+German, an English and a code prompt. `tools/qwen36_mtp_ref.py` computes it with Qwen's
+Transformers decoder layer from the exact converted weights, and the harness checks
+the engine is not the other wiring.
+
+Every backbone forward feeds the completed token/hidden pairs into the head's
+KV cache; only draft rows need its full decoder computation. Rejected verify
+rows are rewound, and pins preserve the pending residual. The same verify
+path as prompt lookup commits tokens: output and final logits equal ordinary
+decoding, including sampled `serve` turns. As for lookup, speculation is off
+under the CUDA tier, `CACHE_ROUTE` and qpack.
+
+`Q36_MTP_DRAFTS=1` is the default; `1` through `7` set the maximum depth, and
+`auto` lets the measured gate choose. `Q36_MTP_PMIN` (default `0`) stops adding
+deeper drafts when the newest draft's probability is below the threshold.
+`Q36_MTP_VOCAB_IDS` names a whitespace-separated list of token IDs: the head
+scores only those rows of the shared output matrix, with duplicates removed.
+The probability is then conditional on this vocabulary. Verification still
+uses the model's full vocabulary. Scores over 20 below the best are omitted
+from the float probability sum.
+
+A Vulkan build can run the head through the device chain, including its routed
+MoE. `Q36_MTP_GPU=0` keeps the head on the CPU; `Q36_MTP_DMOE=0` retains host
+routing with device matrix operations. The checkpoint port's GPU runtime and
+performance need validation on hardware; its CPU paths are covered by CI.
+
+Historical measurements from the earlier MTP prototype, Radeon 8060S (Strix
+Halo, RADV), Qwen3.6-35B-A3B int4-g64, 24 GB tier, chain on, 256-token answer:
+
+| trunk | without head | with head | acceptance |
+|---|---|---|---|
+| int8 | 37.6 tok/s | 44.4 tok/s | 90.6% |
+| int4 | 45.6 tok/s | 52.0 tok/s | 89.0% |
+
+A separate depth comparison measured 65.3 / 63.0 / 63.0 tok/s and 1.78 / 2.07 /
+2.48 tokens per forward at depths 1 / 2 / 3. These are retained as historical
+context, **not measurements of this checkpoint port**: weights and hidden-state
+wiring changed, so acceptance and speed must be remeasured.
+
+`make -C c qwen36-tiny-mtp-check` generates a fixture with fused experts and a
+random head under the release names. On int8 and int4-g64 containers it checks
+draft logits against the independent reference (absolute tolerance `1e-6`),
+every depth through seven with natural/forced proposals, byte-identical output
+and final logits, vocabulary/probability controls, and multiple `serve` turns
+including prefix reuse and pin restore. `Q36_MTP_FORCE=reject|accept|mixed|cycle|row1..row7`
+and `Q36_MTP_DUMP=<file>` are test controls, following the Qwen3.8 harness.
+
 ## The expert kernel
 
 Routed experts run through `c/expert_ffn.h`, a header shared with the other
@@ -405,8 +482,8 @@ Both checkpoints ship experts **fused** per layer (`mlp.experts.gate_up_proj`,
 `mlp.experts.down_proj`), a one-layer multi-token-prediction head (`mtp.*`,
 `mtp_num_hidden_layers: 1`), and the 35B additionally a vision tower
 (`visual.*`). `tools/qwen36_tensor_kinds.py` classifies every tensor name
-before the first shard is read: layer tensors are converted, `mtp.*` and
-`visual.*` are skipped **on purpose** and reported with a count, and a name
+before the first shard is read: layer tensors, the `mtp.*` head and the
+`visual.*` tower are converted into their own shards, and a name
 the contract does not know stops the conversion. A converter that silently
 drops what it does not recognise produces a container that loads and is
 quietly missing a tensor; this one refuses instead (the GLM-5.3 precedent).
@@ -418,7 +495,7 @@ quietly missing a tensor; this one refuses instead (the GLM-5.3 precedent).
 2.4T's structural numbers at toy widths -- 92 layers, interval 4, 512 experts
 top-10, 16:1 attention heads, 8:1 DeltaNet heads -- and rewrites the shard
 into the real layout: fused experts plus an `mtp.*` head. The converter must
-split the one and skip the other, and the engine must match the transformers
+split the experts and carry the head, and the engine must match the transformers
 reference token for token. CI runs it at cache capacities 1, 2 and 512, and
 under ASan/UBSan. Locally:
 

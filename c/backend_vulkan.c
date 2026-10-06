@@ -3998,6 +3998,26 @@ static uint64_t vk_addr(VkBuffer b) {
 /* An expert's grouped-GEMV entries (qmatmul_grp_gemv.comp's table: gate|up and down),
  * rows and packed row left 0 for the caller to fill; 0 when the grouped GEMV cannot
  * take it (not on the primary device, a format or width it does not compute). */
+/* The grouped-GEMV entries (as coli_vk_xb_expert_entries) of three plain tensors:
+ * an expert outside the tier (the MTP head's) for the chain's device MoE. */
+int coli_vk_tensor_entries(const ColiVkTensor *g, const ColiVkTensor *u, const ColiVkTensor *d, uint32_t gu[16], uint32_t dn[16]) {
+    const ColiVkTensor *t[3] = {g, u, d};
+    if (!G.has_bda) return 0;
+    for (int k = 0; k < 3; k++) {
+        if (!t[k]) return 0;
+        int f = t[k]->fmt;
+        if (t[k]->dev || !t[k]->pool || !(f == 1 || f == 2 || f == 4) || t[k]->rowWords % 4 ||
+            (f == 4 && (t[k]->gs < 32 || t[k]->gs % 32))) return 0;
+    }
+    if (u->fmt != g->fmt || u->gs != g->gs) return 0;
+    uint64_t a[6] = {vk_addr(g->wbuf), vk_addr(g->sbuf), vk_addr(u->wbuf), vk_addr(u->sbuf), vk_addr(d->wbuf), vk_addr(d->sbuf)};
+    memset(gu, 0, 64); memset(dn, 0, 64);
+    for (int k = 0; k < 4; k++) { gu[2 * k] = (uint32_t)a[k]; gu[2 * k + 1] = (uint32_t)(a[k] >> 32); }
+    for (int k = 0; k < 2; k++) { dn[2 * k] = (uint32_t)a[4 + k]; dn[2 * k + 1] = (uint32_t)(a[4 + k] >> 32); }
+    gu[10] = (uint32_t)g->fmt; gu[11] = (uint32_t)g->rowWords; gu[12] = (uint32_t)g->gs;
+    dn[10] = (uint32_t)d->fmt; dn[11] = (uint32_t)d->rowWords; dn[12] = (uint32_t)d->gs;
+    return 1;
+}
 int coli_vk_xb_expert_entries(const ColiVkExpert *e, uint32_t gu[16], uint32_t dn[16]) {
     const XbCtx *X = &g_xb[0];
     if (!e || e->X != X || !X->p_gv[0] || X->act != COLI_VK_ACT_SWIGLU) return 0;

@@ -115,7 +115,7 @@ def _rewrite_shard(out: Path, n_layers, fused_experts, mtp, hidden, seed):
     transformers saves routed experts one tensor per expert and never writes an
     mtp head. The real 35B and 2.4T checkpoints do the opposite on both counts,
     and those are the two paths the converter's tensor contract has to be seen
-    handling: splitting the fused tensor, and skipping mtp.* on purpose.
+    handling: splitting the fused tensor and carrying the MTP block.
     """
     from safetensors.torch import load_file, save_file
     path = out / "model.safetensors"
@@ -140,7 +140,7 @@ def _rewrite_shard(out: Path, n_layers, fused_experts, mtp, hidden, seed):
     if mtp:
         # One MTP layer shaped like the last transformer layer (an attention
         # layer, since (n_layers-1) % 4 == 3 for every geometry here), plus the
-        # four glue tensors the real checkpoints carry. Random, never read.
+        # four glue tensors the real checkpoints carry. Random, checked by qwen36_mtp_ref.py.
         g = torch.Generator().manual_seed(seed + 1)
         src = f"model.layers.{n_layers - 1}."
         for k in list(tens):

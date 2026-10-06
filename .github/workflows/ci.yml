@@ -774,6 +774,8 @@ jobs:
               ./qwen36 "$cap" 8 qwen36_tiny/ref_full.json
             echo "::endgroup::"
           done
+      - name: Qwen3.6 checkpoint MTP (reference logits, exact verifies, multi-turn serve)
+        run: make -C c qwen36-tiny-mtp-check
       - name: Qwen3.8-2.4T geometry, fused experts + mtp head (converter contract + token-exact)
         run: |
           cd c
@@ -782,8 +784,7 @@ jobs:
           # widths: 92 layers / interval 4 / 512 experts top-10 / 16:1 attention
           # heads / 8:1 DeltaNet heads. The shard is rewritten into the layout
           # the real checkpoints ship -- fused expert tensors and an mtp.* head
-          # -- so the converter is seen splitting the one and skipping the other
-          # ON PURPOSE (it must say so), not by never selecting them.
+          # -- so the converter exercises the routed experts and the checkpoint head.
           # --seed 3: the default seed collapses this geometry's reference to a
           # single repeated token, which a shape error could still reproduce.
           python3 tools/make_qwen36_tiny.py --geometry qwen38-2p4t --seed 3 \
@@ -791,15 +792,14 @@ jobs:
                   --emit-ref qwen38_2p4t_tiny/ref_full.json
           python3 tools/convert_qwen36.py --model qwen38_2p4t_tiny \
                   --out qwen38_2p4t_tiny_c --ebits 8 | tee convert_2p4t.log
-          grep -q "skipping 19 \`mtp.\*\` tensor" convert_2p4t.log
+          grep -q "\[mtp\] model-mtp.safetensors" convert_2p4t.log
           grep -q "tensor kinds: 1587 in 92 layers, 3 globals" convert_2p4t.log
-          # the container must not carry the head it skipped
+          # The converted head retains the checkpoint names and expert format.
           python3 - <<'EOF'
-          import glob
           from safetensors import safe_open
-          for path in glob.glob("qwen38_2p4t_tiny_c/*.safetensors"):
-              with safe_open(path, "pt") as f:
-                  assert not [k for k in f.keys() if k.startswith("mtp.")], path
+          with safe_open("qwen38_2p4t_tiny_c/model-mtp.safetensors", "pt") as f:
+              assert "mtp.fc.weight" in f.keys()
+              assert "mtp.layers.0.mlp.experts.0.merged_weight" in f.keys()
           EOF
           for cap in 1 2 512; do
             echo "::group::2.4T geometry cap=$cap"

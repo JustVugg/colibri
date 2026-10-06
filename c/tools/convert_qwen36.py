@@ -29,8 +29,7 @@ Design notes (must stay in sync with c/qwen36.c):
   * The fused expert tensors `mlp.experts.gate_up_proj` / `down_proj` are split per expert
     into the merged_weight layout (gate_up = [gate; up] along dim 0).
   * Every tensor name is classified against tools/qwen36_tensor_kinds.py before the first
-    shard is read. The `mtp.*` head and the `visual.*` tower are skipped ON PURPOSE and
-    reported with a count; a name the contract does not know stops the conversion. A
+    shard is read. The `mtp.*` head and the `visual.*` tower are carried into their own shards; a name the contract does not know stops the conversion. A
     converter that silently drops what it does not recognise produces a container that
     loads and is quietly missing a tensor (GLM-5.3 precedent, #1045).
   * Head dims are derived from the actual weight shapes (authoritative), not from config
@@ -48,7 +47,7 @@ Usage (mixed: int4 gs64 gate/up, int8 down -- the #1370 experiment):
   python tools/convert_qwen36.py --model <hf> --out ./qwen36_i4_gs64_d8 --ebits 4 --gs 64 --down-bits 8
 """
 
-import argparse, json, math, os, struct, sys, tempfile
+import argparse, json, math, os, re, struct, sys, tempfile
 from pathlib import Path
 
 # Windows: force UTF-8 output
@@ -235,12 +234,118 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qwen36_tensor_kinds import classify, resolve_prefix, skip_reason, UnknownTensor  # noqa: E402
 
 
+def convert_block(lk, get_tensor, source, target, args):
+    """One decoder block, trunk or MTP, using exactly the same container formats."""
+    tens = {}
+    # ---- MoE experts: handle BOTH layouts the source may use ----
+    #  (a) FUSED:  model.layers.i.mlp.experts.gate_up_proj [E,2*inter,H]
+    #              + model.layers.i.mlp.experts.down_proj    [E,H,inter]
+    #  (b) SEPARATE (transformers save_pretrained on the text model, e.g. the tiny fixture;
+    #      the real 35B and 2.4T checkpoints both ship the FUSED layout):
+    #              model.layers.i.mlp.experts.{e}.gate_proj [inter,H]
+    #              model.layers.i.mlp.experts.{e}.up_proj   [inter,H]
+    #              model.layers.i.mlp.experts.{e}.down_proj [H,inter]
+    sep = {}  # e -> {'gate':Tensor,'up':Tensor,'down':Tensor}
+    for k in lk:
+        if re.search(r"\.experts\.gate_up_proj(?:\.weight)?$", k):
+            gu = get_tensor(k)                    # [E, 2*inter, H]
+            E, twoI, H = gu.shape
+            inter = twoI // 2
+            gate = gu[:, :inter, :]
+            up = gu[:, inter:, :]
+            dk = k.replace("gate_up_proj", "down_proj")
+            down = get_tensor(dk)                # [E, H, inter]
+            for e in range(E):
+                mw, qs = make_merged(gate[e], up[e], down[e], args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
+                tens[f"{target}.mlp.experts.{e}.merged_weight"] = mw
+                tens[f"{target}.mlp.experts.{e}.qs"] = qs
+            continue
+        ms = re.search(r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)(?:\.weight)?$", k)
+        if ms:
+            e = int(ms.group(1)); proj = ms.group(2)
+            sep.setdefault(e, {})[proj] = get_tensor(k).float()
+            continue
+    for e in sorted(sep):
+        d = sep[e]
+        if "gate_proj" in d and "up_proj" in d and "down_proj" in d:
+            mw, qs = make_merged(d["gate_proj"], d["up_proj"], d["down_proj"], args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
+            tens[f"{target}.mlp.experts.{e}.merged_weight"] = mw
+            tens[f"{target}.mlp.experts.{e}.qs"] = qs
+        else:
+            print(f"[{source}] WARN expert {e} missing some proj "
+                  f"(have {sorted(d.keys())}) — skipped")
+    for k in lk:
+        newk = k.replace(source + ".", f"{target}.")
+        if "mlp.experts." in newk:
+            continue  # already handled above
+        # everything else stays f16
+        tens[newk] = get_tensor(k).half()
+    return tens
+
+
+def convert_mtp(keys, get_tensor, args):
+    layers = [k for k in keys if k.startswith("mtp.layers.0.")]
+    if any(k.startswith("mtp.layers.") and k not in layers for k in keys):
+        raise ValueError("only one MTP decoder layer is supported")
+    tensors = convert_block(layers, get_tensor, "mtp.layers.0", "mtp.layers.0", args)
+    for k in keys:
+        if not k.startswith("mtp.layers."):
+            tensors[k] = get_tensor(k).half()
+    return tensors
+
+
+def append_mtp(args):
+    """Read only the head's shards; build a new container with immutable base links."""
+    if not args.model or args.repo or args.upload_repo or args.stream_upload:
+        raise ValueError("--mtp-only requires local --model and --base-container")
+    src, base, out = Path(args.model).resolve(), Path(args.base_container).resolve(), Path(args.out).resolve()
+    if out == base or out == src or (out.exists() and any(out.iterdir())):
+        raise ValueError("--mtp-only --out must be a new or empty directory, distinct from source/base")
+    meta = json.loads((base / "qwen36_meta.json").read_text())
+    cfg = json.loads((src / "config.json").read_text())
+    cfg = cfg.get("text_config", cfg)
+    for key, field in (("hidden_size", "hidden"), ("num_hidden_layers", "n_layers"),
+                       ("num_experts", "num_experts"), ("moe_intermediate_size", "moe_inter"),
+                       ("num_attention_heads", "q_heads"), ("num_key_value_heads", "kv_heads")):
+        if cfg.get(key) != meta.get(field):
+            raise ValueError(f"source/base geometry differs: {key}")
+    args.ebits, args.gs = meta["ebits"], meta.get("expert_gs", 0)
+    args.down_bits, args.down_gs = meta.get("expert_down_bits", 0), meta.get("expert_down_gs", 0)
+    index = src / "model.safetensors.index.json"
+    wm = json.loads(index.read_text())["weight_map"] if index.exists() else {}
+    if not wm:
+        for shard in src.glob("*.safetensors"):
+            with safe_open_pt(str(shard), framework="pt") as f:
+                wm.update({k: shard.name for k in f.keys()})
+    keys = [k for k in wm if k.startswith("mtp.")]
+    if not keys:
+        raise ValueError("source has no mtp.* tensors")
+    for k in keys:
+        classify(k, "model.")
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        handles = {name: stack.enter_context(safe_open_pt(str(src / name), framework="pt"))
+                   for name in {wm[k] for k in keys}}
+        tensors = convert_mtp(keys, lambda k: handles[wm[k]].get_tensor(k), args)
+    out.mkdir(parents=True, exist_ok=True)
+    # Publish weights before the links; never open a base file for writing.
+    save_file(tensors, str(out / "model-mtp.safetensors"))
+    meta["mtp_num_hidden_layers"] = 1
+    (out / "qwen36_meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    for path in base.iterdir():
+        if path.is_file() and path.name not in ("qwen36_meta.json", "model-mtp.safetensors"):
+            (out / path.name).symlink_to(path.resolve())
+    print(f"[mtp] {len(keys)} source tensors -> {out / 'model-mtp.safetensors'}; base files linked")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Convert Qwen3.6 MoE HF checkpoint -> colibri container")
     src = ap.add_mutually_exclusive_group(required=False)
     src.add_argument("--repo", help="HuggingFace repo ID (will be downloaded)")
     src.add_argument("--model", help="Local HF checkpoint directory")
     ap.add_argument("--out", required=False, help="Output container directory")
+    ap.add_argument("--mtp-only", action="store_true", help="append only MTP into a new linked container")
+    ap.add_argument("--base-container", help="existing converted container (never modified)")
     ap.add_argument("--ebits", type=int, default=4, help="Expert quant bits (2..8, default 4)")
     ap.add_argument("--down-bits", type=int, default=0,
                     help="bits for down_proj only (5..8; needs --ebits <= 4): the mixed layout, "
@@ -271,6 +376,13 @@ def main():
         sys.exit("error: need --repo or --model (or --selftest)")
     if not args.out:
         sys.exit("error: --out is required")
+
+    if args.mtp_only:
+        if not args.base_container:
+            ap.error("--mtp-only requires --base-container")
+        return append_mtp(args)
+    if args.base_container:
+        ap.error("--base-container requires --mtp-only")
 
     if not 2 <= args.ebits <= 8:
         sys.exit(f"--ebits must be 2..8 (got {args.ebits})")
@@ -391,6 +503,7 @@ def main():
     layer_map = {}      # layer index -> [keys]
     global_map = {}     # kind -> key
     vision_map = {}     # name after "visual." -> key
+    mtp_keys = []
     skipped = {}        # group -> count
     unknown = []
     for k in wm:
@@ -403,6 +516,8 @@ def main():
             layer_map.setdefault(placed[1], []).append(k)
         elif placed[0] == "global":
             global_map[placed[1]] = k
+        elif placed[0] == "mtp":
+            mtp_keys.append(k)
         elif placed[0] == "vision":
             vision_map[placed[1]] = k
         else:
@@ -419,7 +534,7 @@ def main():
         if group == "mtp":
             declared = f", config mtp_num_hidden_layers={mcfg.get('mtp_num_hidden_layers')!r}"
         print(f"skipping {count} `{group}.*` tensor(s): {skip_reason(group)}{declared}")
-    if mcfg.get("mtp_num_hidden_layers") and "mtp" not in skipped:
+    if mcfg.get("mtp_num_hidden_layers") and not mtp_keys:
         print(f"note: config declares mtp_num_hidden_layers={mcfg['mtp_num_hidden_layers']} "
               "but the checkpoint carries no mtp.* tensors")
     layer_ids = set(layer_map)
@@ -463,6 +578,8 @@ def main():
                                                   "norm.weight") if kind in global_map]
     if len(globals_keys) != 3:
         sys.exit(f"ERROR: expected embed_tokens, lm_head and final norm, found {sorted(global_map)}")
+    for k in mtp_keys:
+        shard_layers.setdefault(wm[k], set()).add(-2)
     for k in globals_keys:
         shard_layers.setdefault(wm[k], set()).add(-1)
 
@@ -577,51 +694,7 @@ def main():
             print(f"[layer {i} -> active {a}] {out_name} already on HF, skip")
             evict_layer(i)
             continue
-        tens = {}
-        lk = layer_keys(i)
-        # ---- MoE experts: handle BOTH layouts the source may use ----
-        #  (a) FUSED:  model.layers.i.mlp.experts.gate_up_proj [E,2*inter,H]
-        #              + model.layers.i.mlp.experts.down_proj    [E,H,inter]
-        #  (b) SEPARATE (transformers save_pretrained on the text model, e.g. the tiny fixture;
-        #      the real 35B and 2.4T checkpoints both ship the FUSED layout):
-        #              model.layers.i.mlp.experts.{e}.gate_proj [inter,H]
-        #              model.layers.i.mlp.experts.{e}.up_proj   [inter,H]
-        #              model.layers.i.mlp.experts.{e}.down_proj [H,inter]
-        sep = {}  # e -> {'gate':Tensor,'up':Tensor,'down':Tensor}
-        for k in lk:
-            if re.search(r"\.experts\.gate_up_proj(?:\.weight)?$", k):
-                gu = get_tensor(k).float()            # [E, 2*inter, H]
-                E, twoI, H = gu.shape
-                inter = twoI // 2
-                gate = gu[:, :inter, :]
-                up = gu[:, inter:, :]
-                dk = k.replace("gate_up_proj", "down_proj")
-                down = get_tensor(dk).float()        # [E, H, inter]
-                for e in range(E):
-                    mw, qs = make_merged(gate[e], up[e], down[e], args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
-                    tens[f"model.layers.{a}.mlp.experts.{e}.merged_weight"] = mw
-                    tens[f"model.layers.{a}.mlp.experts.{e}.qs"] = qs
-                continue
-            ms = re.search(r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)(?:\.weight)?$", k)
-            if ms:
-                e = int(ms.group(1)); proj = ms.group(2)
-                sep.setdefault(e, {})[proj] = get_tensor(k).float()
-                continue
-        for e in sorted(sep):
-            d = sep[e]
-            if "gate_proj" in d and "up_proj" in d and "down_proj" in d:
-                mw, qs = make_merged(d["gate_proj"], d["up_proj"], d["down_proj"], args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
-                tens[f"model.layers.{a}.mlp.experts.{e}.merged_weight"] = mw
-                tens[f"model.layers.{a}.mlp.experts.{e}.qs"] = qs
-            else:
-                print(f"[layer {i}] WARN expert {e} missing some proj "
-                      f"(have {sorted(d.keys())}) — skipped")
-        for k in lk:
-            newk = k.replace(f"{prefix}layers.{i}.", f"model.layers.{a}.")
-            if "mlp.experts." in newk:
-                continue  # already handled above
-            # everything else stays f16
-            tens[newk] = get_tensor(k).half()
+        tens = convert_block(layer_keys(i), get_tensor, f"{prefix}layers.{i}", f"model.layers.{a}", args)
         out_path = out / f"model-{a:05d}.safetensors"
         save_file(tens, str(out_path))
         print(f"[layer {i} -> active {a}] {out_path.name} ({len(tens)} tensors)")
@@ -630,8 +703,19 @@ def main():
             out_path.unlink()
         evict_layer(i)
 
+    if mtp_keys and "model-mtp.safetensors" not in done_files:
+        tensors = convert_mtp(mtp_keys, get_tensor, args)
+        path = out / "model-mtp.safetensors"
+        save_file(tensors, str(path))
+        print(f"[mtp] {path.name} ({len(tensors)} tensors)")
+        if args.stream_upload:
+            upload_local(path)
+            path.unlink()
+        evict_layer(-2)
+
     # ---- derive authoritative head dims from a real full-attention layer's weights ----
     meta = {
+        "mtp_num_hidden_layers": 1 if mtp_keys else 0,
         "model_type": cfg_full.get("model_type"),
         "hidden": int(mcfg["hidden_size"]),
         "n_layers": int(mcfg["num_hidden_layers"]),

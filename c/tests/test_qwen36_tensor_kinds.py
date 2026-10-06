@@ -158,7 +158,7 @@ DENSE_MLP_KINDS = {"mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.
 
 
 def _concrete(names):
-    return [n.replace("N", "7") for n in names]
+    return [n.replace("mtp.layers.N.", "mtp.layers.0.").replace("N", "7") for n in names]
 
 
 def _collapsed(index_path):
@@ -209,18 +209,18 @@ class TensorKindsTest(unittest.TestCase):
         prefix, placed = self._classify_all(_concrete(QWEN38_2P4T))
         self.assertEqual(prefix, "model.")
         kinds = {p[0] for p in placed}
-        self.assertEqual(kinds, {"global", "layer", "skip"})
-        self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"mtp"})
+        self.assertEqual(kinds, {"global", "layer", "mtp"})
+        self.assertTrue(any(p[0] == "mtp" for p in placed))
         self.assertEqual({p[1] for p in placed if p[0] == "global"}, set(GLOBAL_KINDS))
         self.assertEqual({p[2] for p in placed if p[0] == "layer"},
                          set(LAYER_KINDS) - DENSE_MLP_KINDS)
 
     def test_every_27b_tensor_is_placed(self):
         """The dense checkpoint: the MoE kinds are absent, the dense MLP is placed, the
-        vision tower is converted (#1757) and the mtp head is skipped."""
+        vision tower is converted (#1757) and the mtp head is converted."""
         prefix, placed = self._classify_all(_concrete(QWEN38_27B))
         self.assertEqual(prefix, "model.language_model.")
-        self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"mtp"})
+        self.assertTrue(any(p[0] == "mtp" for p in placed))
         vision = [p[1] for p in placed if p[0] == "vision"]
         self.assertEqual(len(vision), 3)                       # the three listed kinds
         self.assertTrue(all(not v.startswith("visual.") for v in vision), vision)
@@ -231,7 +231,7 @@ class TensorKindsTest(unittest.TestCase):
     def test_every_35b_tensor_is_placed(self):
         prefix, placed = self._classify_all(_concrete(QWEN36_35B))
         self.assertEqual(prefix, "model.language_model.")
-        self.assertEqual({p[1] for p in placed if p[0] == "skip"}, {"mtp"})
+        self.assertTrue(any(p[0] == "mtp" for p in placed))
         self.assertTrue(any(p[0] == "vision" for p in placed))
         self.assertEqual(sum(p[0] == "layer" for p in placed),
                          sum(p[0] == "layer" for p in self._classify_all(
@@ -261,13 +261,15 @@ class TensorKindsTest(unittest.TestCase):
             "model.language_model.layers.0.mlp.gate.weight",  # wrong prefix for this call
             "audio.encoder.weight",
             "model.mtp.fc.weight",
+            "mtp.layers.1.self_attn.q_proj.weight",
+            "mtp.unknown.weight",
         ):
             with self.subTest(name=name):
                 with self.assertRaises(UnknownTensor):
                     classify(name, "model.")
 
-    def test_skip_groups_have_a_stated_reason(self):
-        self.assertTrue(skip_reason("mtp"))
+    def test_unknown_skip_groups(self):
+        self.assertEqual(skip_reason("mtp"), "")
         self.assertEqual(skip_reason("nope"), "")
 
     def test_layer_kinds_are_exact_suffixes(self):
