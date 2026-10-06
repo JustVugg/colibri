@@ -2861,6 +2861,30 @@ extern "C" size_t coli_cuda_tensor_vram(const ColiCudaTensor *tensor) {
 extern "C" int coli_cuda_tensor_device(const ColiCudaTensor *tensor) {
     return tensor ? tensor->device : -1;
 }
+extern "C" int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I, int *O) {
+    if (!t) return 0;
+    if (fmt) *fmt = t->fmt;
+    if (I) *I = t->I;
+    if (O) *O = t->O;
+    return 1;
+}
+/* The dense chain's matmul (cuda_chain.cu): the resident tensor's kernel on the
+ * chain's own stream, device pointers in and out, nothing synchronized here. */
+extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream) {
+    if (fault_injected()) return 0;
+    if (!t || !y_dev || !x_dev || S < 1) return 0;
+    if (t->fmt == 4 && t->gs <= 0) return 0;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (!select_ctx(ctx)) return 0;
+    cudaStream_t st = (cudaStream_t)stream;
+    dim3 grid((unsigned)t->O, (unsigned)S);
+    if (t->fmt == 8 && f8_warp_mode())
+        quant_matmul_f8w<<<grid, 256, 0, st>>>(y_dev, x_dev, t->weights, t->scales, S, t->I, t->O);
+    else
+        quant_matmul<<<grid, 256, 0, st>>>(y_dev, x_dev, t->weights, t->scales, t->fmt, S, t->I, t->O,
+                                            row_bytes(t->fmt, t->I), t->gs, t->ng);
+    return cuda_ok(cudaGetLastError(), "chain gemm launch");
+}
 
 /* ==== resident-pipeline primitives (Inc.0, 2026-07-13) ====
  * Device-side building blocks so the residual stream can stay on the layer's

@@ -335,6 +335,13 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor
         int S,int H,int Q,int R,int V,int K,int T,float scale);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_sync(int device);
 
+/* ---- the dense chain's needs (cuda_chain.cu) ---------------------------------
+ * A resident tensor's format and shape, and its GEMV / GEMM on a stream the caller
+ * owns (a cudaStream_t, NULL = the device's default) with device pointers: no
+ * transfer, no synchronization, the same kernel coli_cuda_matmul runs. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I, int *O);
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);
+
 #ifdef __cplusplus
 }
 #endif

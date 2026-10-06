@@ -95,6 +95,12 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaEventElapsedTime     hipEventElapsedTime
 #define cudaMallocHost           hipHostMalloc
 #define cudaFreeHost             hipHostFree
+#define cudaHostAlloc            hipHostMalloc        /* cuda_chain.cu: mapped host buffers */
+#define cudaHostAllocMapped      hipHostMallocMapped
+#define cudaHostAllocWriteCombined hipHostMallocWriteCombined
+#define cudaHostGetDevicePointer hipHostGetDevicePointer
+#define cudaMemcpyDefault        hipMemcpyDefault
+#define cudaMemcpyHostToHost     hipMemcpyHostToHost
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define cudaMemcpyPeer           hipMemcpyPeer
 #define cudaMemcpyPeerAsync      hipMemcpyPeerAsync
