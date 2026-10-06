@@ -2507,6 +2507,157 @@ static void test_gemv_rows(int fmt, int S, int I, int O) {
     vkc_free(xb); vkc_free(ya); vkc_free(y1); coli_vk_tensor_free(t);
     free(x); free(codes); free(sc);
 }
+
+/* int4 decode GEMVs as W4A8 (COLI_VK_CHAIN_IDOT=1, chain_gemv_idot.comp): within the bound
+ * the int8 rounding of x allows of the f32 reference (and off it: the W4A8 shader ran, not
+ * the f32 one), and each of S rows (1..8, a verify's) the bits a one-row call gives it. The
+ * chain's pipelines come up again with the switch on, and once more without it after. */
+static void test_gemv_idot(void) {
+    if (!coli_vk_has_idot()) { printf("  W4A8: no VK_KHR_shader_integer_dot_product on this device, skipped\n"); return; }
+    vkc_shutdown(); setenv("COLI_VK_CHAIN_IDOT", "1", 1);
+    int up_ok = vkc_init();
+    CHECK(up_ok, "idot: the chain did not come up with COLI_VK_CHAIN_IDOT=1");
+    int shapes[3][2] = {{2048, 512}, {512, 2048}, {4096, 256}}, rows[4] = {1, 3, 5, 8};
+    for (int c = 0; up_ok && c < 3; c++) for (int r = 0; r < 4; r++) {
+        int I = shapes[c][0], O = shapes[c][1], S = rows[r], ng = I / 64;
+        float *x = fvec((size_t)S * I, 1.f), *W = malloc((size_t)O * I * sizeof(float)), *ref = malloc((size_t)S * O * sizeof(float));
+        uint8_t *q = calloc((size_t)O * (I / 2), 1); float *sc = malloc((size_t)O * ng * sizeof *sc);
+        for (int i = 0; i < O * ng; i++) sc[i] = 0.02f + (rnd() % 100) / 3000.f;
+        for (int o = 0; o < O; o++) for (int i = 0; i < I; i++) {
+            int v = (int)(rnd() % 16); q[(size_t)o * (I / 2) + i / 2] |= (uint8_t)(v << ((i & 1) * 4));
+            W[(size_t)o * I + i] = (v - 8) * sc[o * ng + i / 64];
+        }
+        for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
+            double a = 0; for (int i = 0; i < I; i++) a += (double)x[(size_t)s * I + i] * W[(size_t)o * I + i];
+            ref[(size_t)s * O + o] = (float)a;
+        }
+        ColiVkTensor *t = NULL;
+        if (!coli_vk_tensor_ensure(&t, q, sc, 4, I, O, 64)) { CHECK(0, "idot: upload"); break; }
+        VkcBuf *xb = vkc_buf((size_t)S * I * 4, VKC_DEV), *ya = vkc_buf((size_t)S * O * 4, VKC_DOWN), *y1 = vkc_buf((size_t)S * O * 4, VKC_DOWN);
+        vkc_gemm_rows(0);   /* every row on the GEMV, as a verify's */
+        vkc_begin(); vkc_write(xb, 0, x, (size_t)S * I * 4);
+        int ok = vkc_matmul(t, xb, 0, ya, 0, S);
+        for (int s = 0; s < S; s++) ok = ok && vkc_matmul(t, xb, (size_t)s * I, y1, (size_t)s * O, 1);
+        vkc_submit(1);
+        vkc_gemm_rows(-1);
+        const float *y = vkc_ptr(ya);
+        double e = relerr(y, ref, (size_t)S * O, 1e-3);
+        CHECK(ok && e < 2e-2 && e > 1e-6 && !bad(y, (size_t)S * O), "idot I %d O %d S %d: err %.2e (W4A8 bound 2e-2, above f32's 1e-6)", I, O, S, e);
+        CHECK(ok && !memcmp(y, vkc_ptr(y1), (size_t)S * O * 4), "idot I %d O %d S %d: a row's bits depend on the rows beside it", I, O, S);
+        vkc_free(xb); vkc_free(ya); vkc_free(y1); coli_vk_tensor_free(t);
+        free(x); free(W); free(ref); free(q); free(sc);
+    }
+    vkc_shutdown(); unsetenv("COLI_VK_CHAIN_IDOT");
+    CHECK(vkc_init(), "idot: the chain did not come back without the switch");
+    printf("  W4A8 decode GEMVs: 3 shapes x 1..8 rows\n");
+}
+
+/* A decode step's routed experts on the device (vkc_moe_*: chain_moe_route.comp, the
+ * grouped GEMVs and expert_sum.comp), the chain's device MoE, at Qwen3.6-35B-A3B's expert
+ * shapes (hidden 2048, intermediate 512, int4 g64, 64 experts here, top 8) so the one-wave
+ * kernels take them: the chosen experts against the CPU's softmax and top-k, the output
+ * against an f64 reference, the generic grouped GEMV (COLI_VK_MOE_WAVE's other side, 64
+ * outputs an item) likewise, and a row's bits the same alone and among four. */
+typedef struct { int I, O; uint8_t *q; float *sc; ColiVkTensor *t; } MoeMat;
+static void moe_mat(MoeMat *m, int I, int O) {
+    int ng = I / 64; uint8_t *rows; size_t stride; float *sc;
+    m->I = I; m->O = O; m->q = calloc((size_t)O * (I / 2), 1); m->sc = malloc((size_t)O * ng * sizeof(float)); m->t = NULL;
+    for (int i = 0; i < O * ng; i++) m->sc[i] = 0.002f + (rnd() % 100) / 30000.f;
+    for (size_t i = 0; i < (size_t)O * (I / 2); i++) m->q[i] = (uint8_t)rnd();
+    if (!coli_vk_tier_tensor(&m->t, 4, I, O, 64, &rows, &stride, &sc)) { m->t = NULL; return; }
+    for (int o = 0; o < O; o++) memcpy(rows + (size_t)o * stride, m->q + (size_t)o * (I / 2), (size_t)I / 2);
+    memcpy(sc, m->sc, (size_t)O * ng * sizeof(float));
+    if (!coli_vk_tensor_commit(&m->t, 1)) { coli_vk_tensor_free(m->t); m->t = NULL; }
+}
+static double moe_dot(const MoeMat *m, int o, const double *x) {
+    double a = 0; int ng = m->I / 64;
+    for (int i = 0; i < m->I; i++) {
+        int v = (m->q[(size_t)o * (m->I / 2) + i / 2] >> ((i & 1) * 4)) & 15;
+        a += (double)(v - 8) * m->sc[o * ng + i / 64] * x[i];
+    }
+    return a;
+}
+static int moe_run(VkcBuf *lg, VkcBuf *mgu, VkcBuf *mdn, VkcBuf *xb, int S, int E, int K, int D, int I, int RG, int RD,
+                   int i4, float *out, int *ix) {
+    int nk = S * K, ng = (I + RG - 1) / RG, nd = (D + RD - 1) / RD;
+    VkcBuf *egu = vkc_buf((size_t)nk * 64, VKC_DEV), *edn = vkc_buf((size_t)nk * 64, VKC_DEV), *wt = vkc_buf((size_t)nk * 4, VKC_DEV),
+           *ixb = vkc_buf((size_t)nk * 4, VKC_DOWN), *itg = vkc_buf((size_t)nk * ng * 16, VKC_UP), *itd = vkc_buf((size_t)nk * nd * 16, VKC_UP),
+           *amap = vkc_buf((size_t)nk * 4, VKC_UP), *use = vkc_buf((size_t)nk * 4, VKC_UP), *hid = vkc_buf((size_t)nk * I * 4, VKC_DEV),
+           *ys = vkc_buf((size_t)nk * D * 4, VKC_DEV), *ob = vkc_buf((size_t)S * D * 4, VKC_DOWN);
+    uint32_t *ig = vkc_ptr(itg), *id = vkc_ptr(itd), *am = vkc_ptr(amap), *us = vkc_ptr(use);
+    for (int j = 0; j < nk; j++) {   /* as qwen36_chain.h's q36c_moe_ok lays them out */
+        am[j] = (uint32_t)j; us[j] = 1;
+        for (int b = 0; b < ng; b++) { uint32_t *q = ig + ((size_t)j * ng + b) * 4; q[0] = j; q[1] = 0; q[2] = b * RG; q[3] = 1; }
+        for (int b = 0; b < nd; b++) { uint32_t *q = id + ((size_t)j * nd + b) * 4; q[0] = j; q[1] = 0; q[2] = b * RD; q[3] = 1; }
+    }
+    vkc_begin();
+    int ok = vkc_moe_route(lg, mgu, mdn, egu, edn, wt, ixb, S, E, K, 0) &&
+             vkc_moe_gemv(1, xb, itg, egu, hid, amap, nk * ng, D, I, 0.f, K, RG, i4) &&
+             vkc_moe_gemv(0, hid, itd, edn, ys, amap, nk * nd, I, D, 0.f, 0, RD, i4) &&
+             vkc_moe_sum(ys, wt, use, ob, S, K, D);
+    ok = vkc_submit(1) && ok;
+    if (ok) { memcpy(out, vkc_ptr(ob), (size_t)S * D * 4); memcpy(ix, vkc_ptr(ixb), (size_t)nk * 4); }
+    VkcBuf *all[11] = {egu, edn, wt, ixb, itg, itd, amap, use, hid, ys, ob};
+    for (int i = 0; i < 11; i++) vkc_free(all[i]);
+    return ok;
+}
+static void test_moe(void) {
+    enum { E = 64, K = 8, D = 2048, I = 512, S = 4 };
+    if (!vkc_moe_ready()) { printf("  device MoE: not on this device (subgroups of 64, buffer addresses), skipped\n"); return; }
+    coli_vk_tier_pool_limit((size_t)1 << 30);
+    if (!coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0.f, 0.f, 0.f)) { CHECK(0, "moe: the expert batch did not start"); return; }
+    MoeMat g[E], u[E], d[E]; ColiVkExpert *ex[E];
+    VkcBuf *mgu = vkc_buf((size_t)E * 64, VKC_UP), *mdn = vkc_buf((size_t)E * 64, VKC_UP);
+    int ok = 1, i4 = 1;
+    for (int e = 0; e < E; e++) {
+        moe_mat(&g[e], D, I); moe_mat(&u[e], D, I); moe_mat(&d[e], I, D);
+        ex[e] = g[e].t && u[e].t && d[e].t ? coli_vk_xb_expert(g[e].t, u[e].t, d[e].t) : NULL;
+        uint32_t *a = (uint32_t *)vkc_ptr(mgu) + e * 16, *b = (uint32_t *)vkc_ptr(mdn) + e * 16;
+        ok = ok && ex[e] && coli_vk_xb_expert_entries(ex[e], a, b);
+        if (ok && (a[10] != 4 || a[12] != 64 || b[10] != 4 || b[12] != 64)) i4 = 0;
+    }
+    CHECK(ok && i4, "moe: experts in the tier's pool and their table entries (ok %d, int4 g64 %d)", ok, i4);
+    float *x = fvec((size_t)S * D, 1.f), *lgh = fvec((size_t)S * E, 2.f);
+    for (int e = 0; e < K; e++) lgh[e] = lgh[e + K];   /* ties in row 0: the lowest index first */
+    VkcBuf *xb = up(x, (size_t)S * D), *lg = up(lgh, (size_t)S * E);
+    /* the reference: softmax, top-k (highest first, the lowest index on ties), renormalised */
+    int rix[S * K]; double *ref = calloc((size_t)S * D, sizeof(double)), *xd = malloc(D * sizeof(double)), *h = malloc(I * sizeof(double));
+    for (int s = 0; s < S && ok; s++) {
+        float m = -FLT_MAX, p[E], tot = 0, sm = 0, pw[K];
+        for (int e = 0; e < E; e++) m = fmaxf(m, lgh[s * E + e]);
+        for (int e = 0; e < E; e++) { p[e] = expf(lgh[s * E + e] - m); tot += p[e]; }
+        for (int e = 0; e < E; e++) p[e] /= tot;
+        for (int k = 0; k < K; k++) {
+            int b = 0; for (int e = 1; e < E; e++) if (p[e] > p[b]) b = e;
+            rix[s * K + k] = b; pw[k] = p[b]; sm += p[b]; p[b] = -1.f;
+        }
+        for (int i = 0; i < D; i++) xd[i] = x[(size_t)s * D + i];
+        for (int k = 0; k < K; k++) {
+            int e = rix[s * K + k];
+            for (int o = 0; o < I; o++) { double a = moe_dot(&g[e], o, xd), b = moe_dot(&u[e], o, xd); h[o] = a / (1.0 + exp(-a)) * b; }
+            for (int o = 0; o < D; o++) ref[(size_t)s * D + o] += pw[k] / sm * moe_dot(&d[e], o, h);
+        }
+    }
+    float refs[S * D]; for (int i = 0; i < S * D; i++) refs[i] = (float)ref[i];
+    struct { int RG, RD, wave; const char *name; } cs[2] = {{16, 32, 1, "one-wave kernels"}, {64, 64, 0, "grouped GEMV"}};
+    for (int c = 0; c < 2 && ok; c++) {
+        float y4[S * D], y1[D]; int ix4[S * K], ix1[K];
+        int r4 = moe_run(lg, mgu, mdn, xb, S, E, K, D, I, cs[c].RG, cs[c].RD, cs[c].wave ? i4 : 0, y4, ix4);
+        int r1 = moe_run(lg, mgu, mdn, xb, 1, E, K, D, I, cs[c].RG, cs[c].RD, cs[c].wave ? i4 : 0, y1, ix1);
+        double e = relerr(y4, refs, (size_t)S * D, 1e-3);
+        CHECK(r4 && r1 && !memcmp(ix4, rix, sizeof ix4), "moe %s: the device chose other experts than the CPU's top-k", cs[c].name);
+        CHECK(r4 && e < 1e-4 && !bad(y4, (size_t)S * D), "moe %s: err %.2e", cs[c].name, e);
+        CHECK(r4 && r1 && !memcmp(y4, y1, sizeof y1), "moe %s: row 0's bits depend on the rows beside it", cs[c].name);
+        printf("  device MoE, %s: %d rows x top %d of %d experts, err %.2e\n", cs[c].name, S, K, E, e);
+    }
+    vkc_free(xb); vkc_free(lg); vkc_free(mgu); vkc_free(mdn);
+    for (int e = 0; e < E; e++) {
+        if (ex[e]) coli_vk_xb_expert_free(ex[e]);
+        else { if (g[e].t) coli_vk_tensor_free(g[e].t); if (u[e].t) coli_vk_tensor_free(u[e].t); if (d[e].t) coli_vk_tensor_free(d[e].t); }
+        free(g[e].q); free(g[e].sc); free(u[e].q); free(u[e].sc); free(d[e].q); free(d[e].sc);
+    }
+    free(x); free(lgh); free(ref); free(xd); free(h);
+}
 int main(int argc, char **argv) {
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
@@ -2543,6 +2694,8 @@ int main(int argc, char **argv) {
         int f = k ? 4 : 1;
         test_gemv_rows(f, 2, 2048, 512); test_gemv_rows(f, 3, 4096, 256); test_gemv_rows(f, 4, 2048, 300);
     }
+    test_gemv_idot();
+    test_moe();
     test_rope();
     test_chunk_rows();
     test_attn(1, 0, 16, 0); test_attn(1, 140, 32, 0); test_attn(5, 200, 64, 0); test_attn(6, 9, 256, 1); test_attn(130, 3, 24, 0);
