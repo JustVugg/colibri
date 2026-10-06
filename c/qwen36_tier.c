@@ -953,6 +953,21 @@ int qt_dense_matmul_batch(int h, float *y, const float *x, int S, int I, int O){
 int qt_dense_matmul(int h, float *y, const float *x, int I, int O){
     return qt_dense_matmul_batch(h, y, x, 1, I, O);
 }
+ColiCudaTensor *qt_dense_tensor(int h, int *dev){
+    if(h < 0 || h >= G_dense_n || !G_dense[h].on || !G_dense[h].t) return NULL;
+    if(dev) *dev = G_dense[h].dev;
+    return G_dense[h].t;
+}
+ColiCudaTensor *qt_dnproj_tensor(int layer, int *dev){
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on || !G_dnp[layer].t) return NULL;
+    if(dev) *dev = G_dnp[layer].dev;
+    return G_dnp[layer].t;
+}
+ColiCudaTensor *qt_lmhead_tensor(int *dev){
+    if(!G_lmh.on || !G_lmh.t) return NULL;
+    if(dev) *dev = G_lmh.dev;
+    return G_lmh.t;
+}
 int qt_dense_count(void){ return G_dense_n; }
 
 int qt_dnproj_ready(int layer){

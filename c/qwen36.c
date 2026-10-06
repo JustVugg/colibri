@@ -938,6 +938,9 @@ typedef struct {
     void *vkchain;             /* the dense chain's device state (qwen36_chain.h), NULL until it runs */
     void *vkchain2;            /* its layers on COLI_VK_DEV2's device, after the primary's (qwen36_chain.h) */
 #endif
+#ifdef COLI_CUDA
+    void *cchain;              /* the CUDA dense chain's device state (qwen36_cuda_chain.h), NULL until it runs */
+#endif
     /* A speculative verify (prompt lookup, q36_spec_step) copies the DeltaNet state
      * after each of its first snap_rows rows, row r into slot r (0 = no copy), so a
      * draft rejected after row r+1 rolls back by swapping slot r in. snap_slots: the
@@ -3679,8 +3682,10 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
                 for (int d = 0; d < D; d++) os[d] += w * hh[d];
             }
             /* Compute the shared expert NOW so it overlaps with the GPU
-             * groups; the common block below is skipped. */
-            if (c->shared_inter > 0) {
+             * groups; the common block below is skipped. Not for a caller that
+             * wants the routed experts only (the dense chain runs the shared
+             * expert on the device, qwen36_cuda_chain.h). */
+            if (c->shared_inter > 0 && !routed_only) {
                 double _ts2 = tm_now();
                 int Ish = c->shared_inter;
                 if (!qtd(l->qth_shg, sh, xs, D, Ish))  matmul_d(sh, xs, &l->sh_g, 1, D, Ish);
@@ -4039,8 +4044,8 @@ static void trunk_offer_dense(Model *m){
      * 6.3 on the same card and 11-12.7 with layers on a slower second card
      * (docs/qwen36-cuda-tier.md). A hand-written COLI_PLACE naming shexp is
      * still obeyed when the offer is made. */
-    { const char *so = getenv("Q36_OFFER_SHEXP");
-      if (so && *so == '1')
+    { const char *so = getenv("Q36_OFFER_SHEXP"), *cc = getenv("COLI_CUDA_CHAIN");   /* the chain runs it on the device, beside the host's experts */
+      if ((so && *so == '1') || (cc && *cc == '1'))
         for (int i = 0; i < c->n_layers; i++) {
             Layer *l = &m->L[i];
             size_t bg = qdw_bytes(&l->sh_g), bu = qdw_bytes(&l->sh_u), bd = qdw_bytes(&l->sh_d);
@@ -4221,6 +4226,10 @@ static void q36_embed_row(Model *m, int id, int pos, float *row) {
         memcpy(row, m->embed + (int64_t)id*D, D*sizeof(float));
 }
 
+#ifdef COLI_CUDA
+#include "qwen36_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
+#endif
+
 /* The forward: ids[0..S) at pos_base through every layer, the final norm and
  * lm_head on the last `nlogits` rows (one for a step, every row of a speculative
  * verify), each row's logits computed as a decode step computes them. */
@@ -4251,11 +4260,12 @@ static float *step_ex(Model *m, const int *ids, int S, int pos_base, int nlogits
     }
     tier_rebuild_evicted(m);
     int chain_n = 0;   /* layers the chain ran (a partial chain: the CPU runs the rest) */
+    float *chain_logit = NULL;   /* the Vulkan or the CUDA chain ran the final norm and lm_head */
+    (void)chain_logit;
 #ifdef COLI_VULKAN
     /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
      * back only when the prefill read-out below needs every row. A partial chain
      * brings back every row's residual after its layers: the CPU continues from there. */
-    float *chain_logit = NULL;
     if (g_vk_chain) {
         int echo = 0, rows_only = 0;
 #ifndef QWEN36_NO_MAIN
@@ -4273,8 +4283,26 @@ static float *step_ex(Model *m, const int *ids, int S, int pos_base, int nlogits
                 q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
         } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
     }
-    if (!chain_logit)
 #endif
+#ifdef COLI_CUDA
+    /* COLI_CUDA_CHAIN: the same on the CUDA device (qwen36_cuda_chain.h), every layer */
+    if (g_cuda_chain && !chain_logit) {
+        int echo = 0, rows_only = 0;
+#ifndef QWEN36_NO_MAIN
+        echo = g_echo_k > 0 && g_echo_id && S > 1;
+#endif
+        if (g_hidden_sink) echo = 1;
+        chain_logit = falloc((int64_t)nlogits * c->vocab);
+        chain_n = q36cc_forward(m, x, S, pos_base, lf, echo, nlogits, chain_logit, &rows_only);
+        if (!chain_n) {
+            free(chain_logit); chain_logit = NULL;
+            q36cc_cpu_step(m, pos_base);
+            for (int s = 0; s < S; s++)
+                q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
+        } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
+    }
+#endif
+    if (!chain_logit)
     layers_forward_range(m, x, S, pos_base, chain_n, c->n_layers, 1, lf);
     if (g_hidden_sink) {
         #pragma omp parallel for schedule(static)
@@ -4315,15 +4343,11 @@ static float *step_ex(Model *m, const int *ids, int S, int pos_base, int nlogits
 #endif
     float *last = falloc(D);
     float *logit;
-#ifdef COLI_VULKAN
     if (chain_logit) logit = chain_logit;   /* the chain ran the final norm and lm_head */
     else
-#endif
     logit = falloc((int64_t)nlogits * c->vocab);
     double _th = tm_now();
-#ifdef COLI_VULKAN
     if (!chain_logit)
-#endif
     for (int r = 0; r < nlogits; r++) {
         float *lr = logit + (int64_t)r * c->vocab;
         rmsnorm_row(last, x + (int64_t)(S - nlogits + r)*D, m->final_norm, D, c->eps);
@@ -4576,6 +4600,9 @@ static Q36PinState *q36_pin_state_save(Model *m, Q36PinState *reuse){
 #ifdef COLI_VULKAN
     q36c_sync_host(m);   /* the dense chain keeps the newest state on the device */
 #endif
+#ifdef COLI_CUDA
+    q36cc_sync_host(m);
+#endif
     size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim;
     size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
     Q36PinState *st = reuse;
@@ -4640,6 +4667,9 @@ static int pin_restore(Model *m, const int *ids, int n){
 #ifdef COLI_VULKAN
             q36c_host_wrote(m, 0);   /* the device's copy goes up again before the next chain step */
 #endif
+#ifdef COLI_CUDA
+            q36cc_host_wrote(m, 0);
+#endif
             dn_gpu_invalidate(m);   /* restored on the host: the card's copy is from another prompt */
             m->kv_len = k->len;
             kv_prefix_clear(&m->kvp);
@@ -4667,6 +4697,9 @@ static void reset_recurrent(Model *m){
     }
 #ifdef COLI_VULKAN
     q36c_host_wrote(m, 1);   /* zeros: the dense chain fills its copy with zeros */
+#endif
+#ifdef COLI_CUDA
+    q36cc_host_wrote(m, 1);
 #endif
     dn_gpu_invalidate(m);   /* zero on the host is the truth now; the card re-loads it before its next step */
 }
@@ -4850,6 +4883,9 @@ static void q36_spec_rollback(Model *m, int len, int keep) {
     Cfg *c = &m->c; int slot = keep - 1;
 #ifdef COLI_VULKAN
     q36c_rollback(m, slot, len);   /* the dense chain's own copies: its device buffers swap too */
+#endif
+#ifdef COLI_CUDA
+    q36cc_rollback(m, slot, len);
 #endif
     for (int i = 0; i < c->n_layers; i++) {
         if (c->is_attn[i]) continue;
@@ -5487,6 +5523,9 @@ static void serve_one(Model *m, ServeReq *q){
     fflush(stdout);
     {char scope[96]; snprintf(scope, sizeof scope, "turn %s", q->id); q36_spec_report(&spec, scope);}
     q36_spec_free(&spec);
+#ifdef COLI_CUDA
+    q36cc_report(m);
+#endif
 #ifdef COLI_VULKAN
     vk_report();   /* stderr: the wire protocol on stdout is untouched */
     q36c_report(m);
@@ -5705,6 +5744,9 @@ static void clef_serve_one(Model *m, ServeReq *q){
         }
     }
     fprintf(stderr, "[clef] DECIDE %s: %d question(s), %d tokens, %.1f ms\n", q->id, rec.n_questions, tokens, elapsed);
+#ifdef COLI_CUDA
+    q36cc_report(m);
+#endif
 #ifdef COLI_VULKAN
     vk_report();   /* stderr: the device's share of the decision */
     q36c_report(m);
@@ -5800,6 +5842,9 @@ static int q36_clef_test_modes(Model *m){
         printf("%s\n", out.data ? out.data : "{\"error\":\"out of memory\"}");
         fflush(stdout);
         free(out.data);
+#ifdef COLI_CUDA
+        q36cc_report(m);
+#endif
 #ifdef COLI_VULKAN
         vk_report();
         q36c_report(m);
@@ -6552,7 +6597,14 @@ int main(int argc, char **argv) {
          * the device (qt_dn_gpu_step). Measured motivation: with the trunk in
          * VRAM the CPU still spent ~8 of 39 ms/token on these steps -- not
          * arithmetic, host round trips, thirty per token. */
-        if (dn_gpu_env_on()) {
+        /* COLI_CUDA_CHAIN=1: every layer on the device as one chain (qwen36_cuda_chain.h),
+         * set up here, after the tier placed the trunk; it owns the DeltaNet state, so the
+         * per-layer step below is not set up beside it. */
+        int chain_up = 0;
+#ifdef COLI_CUDA
+        if (q36cc_env_on() && q36cc_setup(&m, g_q36_mux_slots)) { g_cuda_chain = 1; chain_up = 1; atexit(cc_shutdown); }
+#endif
+        if (!chain_up && dn_gpu_env_on()) {
             int n = 0; double vram = 0;
             for (int i = 0; i < m.c.n_layers; i++) {
                 if (m.c.is_attn[i] || !m.L[i].qth_dnout || !qt_dnproj_ready(i)) continue;
@@ -6621,6 +6673,9 @@ int main(int argc, char **argv) {
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         route_footer(stdout, &m);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
+#ifdef COLI_CUDA
+        q36cc_report(&m);
+#endif
 #ifdef COLI_VULKAN
         vk_report();
         q36c_report(&m);
@@ -6711,6 +6766,9 @@ int main(int argc, char **argv) {
            (unsigned long long)m.hits, (unsigned long long)m.miss);
     route_footer(stderr, &m);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
+#ifdef COLI_CUDA
+    q36cc_report(&m);
+#endif
 #ifdef COLI_VULKAN
     vk_report();
     q36c_report(&m);
