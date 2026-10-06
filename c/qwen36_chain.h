@@ -781,7 +781,7 @@ static int q36c_shared(Q36Chain *ch, Model *m, Layer *l, int i, int n) {
  * entries stay put for the step), plain routing, a few rows. */
 static int q36c_moe_ok(Q36Chain *ch, Model *m, int n) {
     Cfg *c = &m->c;
-    if (c->n_experts <= 0 || c->n_experts % 64 || n > 4 || ch->moe_tab < 0 || !vkc_moe_ready() || !vkt_ready() ||
+    if (c->n_experts <= 0 || c->n_experts % 64 || n > 8 || ch->moe_tab < 0 || !vkc_moe_ready() || !vkt_ready() ||
         !vkt_all_resident() || !q36_route_plain(m)) return 0;
     if (!ch->moe_tab) {   /* the layers' tables, once (every expert resident: nothing moves) */
         int L = ch->n, E = c->n_experts;
