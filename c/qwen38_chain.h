@@ -60,7 +60,8 @@
 
 typedef struct {
     int ok, failed, rows, cap;
-    int nl, head;                     /* the layers on the device (the first N of c.layers) and whether the final
+    int lo, d;                        /* its layers start at lo, on device d (vkc_device) */
+    int nl, head;                     /* the layers on the device (lo..lo+nl-1 of c.layers) and whether the final
                                        * mixer and lm_head are there too; a partial chain hands the rest to the CPU */
     int built, placed_said;           /* q38c_setup ran; the fit's placed line was printed */
     size_t prm_floats;
@@ -86,6 +87,10 @@ typedef struct {
     unsigned long long forwards;
     double host_ms;
 } Q38Chain;
+/* the primary device's chain (d 0) or the second device's (d 1, after it) */
+static Q38Chain *q38c_of(Model *m, int d) { return (Q38Chain *)(d ? m->vkchain2 : m->vkchain); }
+static const char *q38c_name(const Q38Chain *ch) { return ch && ch->d ? "qwen38 dev2" : "qwen38"; }
+static int q38c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
 static int g_vk_chain = 0;
 static void q38c_fatal(const char *what) {
@@ -159,7 +164,7 @@ static int q38c_chunk_rows(Q38Chain *ch, Model *m) {
                       + sizeof(Q38RouteAssignment) + 4 * sizeof(int) + sizeof(uint8_t) + sizeof(float *);
     row += (size_t)c->topk * assignment
          + ((size_t)c->experts + 3 * (size_t)c->shared_inter + c->hidden + 1) * sizeof(float);
-    return vkc_chunk_rows("qwen38", row);
+    return vkc_chunk_rows(q38c_name(ch), row);
 }
 /* Plan and allocate the KV mirror before sizing a prompt chunk. */
 static int q38c_mirror(Q38Chain *ch, Model *m) {
@@ -167,11 +172,11 @@ static int q38c_mirror(Q38Chain *ch, Model *m) {
     int nbmax = m->kv_cap / (c->idx_ratio > 0 ? c->idx_ratio : 1) + 1;
     if (ch->cap != m->kv_cap) {   /* the host cache is new: mirror it again (K/V whole, or split past the budget) */
         size_t row = (size_t)kvo * 2 * 4;
-        int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, "qwen38", ch->n_attn, row, m->kv_cap, 1, 1,
+        int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, q38c_name(ch), ch->n_attn, row, m->kv_cap, 1, 1,
                                             (size_t)ch->n_attn * ch->dev_rows * row) : 1;
         if (!plan) { ch->cap = 0; return 0; }
         ch->dev_rows = ch->ks.on ? ch->ks.rows : m->kv_cap;
-        for (int i = 0; i < ch->nl; i++) {
+        for (int i = ch->lo; i < ch->lo + ch->nl; i++) {
             if (!c->is_attn[i]) continue;
             vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); vkc_free(ch->ik[i]); vkc_free(ch->pk[i]);
             ch->kv_valid[i] = ch->pk_valid[i] = 0;
@@ -226,6 +231,14 @@ static int q38c_scratch(Q38Chain *ch, Model *m, int rows) {
  * keep their host copies and run on the CPU. */
 static VkcFit g_q38c_fit;             /* q38c_start's decision */
 static int g_q38c_fitted;
+/* The layers after the primary's on COLI_VK_DEV2's device (docs/vulkan.md, "Layers on two
+ * devices"): a second chain from layer g_q38c_fit.n, its own fit on that device's memory,
+ * placed at startup after the primary's. A forward runs the primary's layers, brings the
+ * streams back and runs these; the CPU runs what is left and, unless this chain ends at
+ * the last layer with room for it, the head. */
+static VkcFit g_q38c_fit2;
+static int g_q38c_fit2_on;
+static int g_q38c_ran;                /* the layers the last forward ran on the devices (q38c_layers) */
 #define Q38C_MATS 18
 #define Q38C_TAIL 32
 /* Layer i's matrices as the chain reads them (the PLE projections with their layer); the
@@ -309,7 +322,8 @@ static int q38c_place_mats(Q38Chain *ch, Model *m, int i) {
         if (!q38c_t(w[k])) return 0;
         if (k == 9 && !ch->t_sg[i]) {
             ColiVkTensor *t = NULL;
-            if (!coli_vk_tensor_ensure(&t, m->L[i].sh_gate, NULL, 10, m->c.hidden, 1, 0)) return 0;
+            if (!(ch->d ? coli_vk_tensor_ensure2(&t, m->L[i].sh_gate, NULL, 10, m->c.hidden, 1, 0)
+                        : coli_vk_tensor_ensure(&t, m->L[i].sh_gate, NULL, 10, m->c.hidden, 1, 0))) return 0;
             ch->t_sg[i] = t;
         }
     }
@@ -363,27 +377,27 @@ static void q38c_unplace_tail(Model *m) {
 static void q38c_shrink(Q38Chain *ch, Model *m, int k, const char *why) {
     for (int j = k; j < m->c.layers; j++) q38c_unplace(ch, m, j);
     q38c_unplace_tail(m);
-    if (k < ch->nl) ch->nl = k;
+    if (k - ch->lo < ch->nl) ch->nl = k - ch->lo;
     ch->head = 0;
     g_q38_vk_noup = 1;
-    if (g_q38c_fitted) vkc_fit_shrink("qwen38", &g_q38c_fit, k, why);
+    if (g_q38c_fitted) vkc_fit_shrink(q38c_name(ch), ch->d ? &g_q38c_fit2 : &g_q38c_fit, k - ch->lo, why);
 }
 /* The head kept on the CPU (an upload of it refused): what of the tail went up goes. */
 static void q38c_head_off(Q38Chain *ch, Model *m) {
     q38c_unplace_tail(m);
-    ch->head = 0; g_q38c_fit.tail = 0; g_q38_vk_noup = 1;
+    ch->head = 0; (ch->d ? &g_q38c_fit2 : &g_q38c_fit)->tail = 0; g_q38_vk_noup = 1;
     fprintf(stderr, "[VK] qwen38 chain: the head did not reach the device: the final mixer and lm_head run on the CPU "
                     "(what it had placed was freed)\n");
 }
 /* The parameters the shaders read (norm weights, the DeltaNet constants, the PLE's) of
  * the layers on the device, in one buffer; the attention layers' order (n_attn). */
 static int q38c_arena(Q38Chain *ch, Model *m) {
-    Cfg *c = &m->c; int L = ch->nl, W = c->hc_width;
+    Cfg *c = &m->c; int lo = ch->lo, hi = ch->lo + ch->nl, W = c->hc_width;
     int VH = c->dn_vheads, CD = c->dn_conv_dim, CK = c->dn_convk;
-    int ple = c->ple_layer >= 0 && c->ple_layer < L;
+    int ple = c->ple_layer >= lo && c->ple_layer < hi;
     size_t n = 0;
     ch->n_attn = 0;
-    for (int i = 0; i < L; i++) {
+    for (int i = lo; i < hi; i++) {
         ch->o_an[i] = n; n += W; ch->o_mn[i] = n; n += W;
         if (c->is_attn[i]) {
             ch->attn_ord[i] = ch->n_attn++;
@@ -398,7 +412,7 @@ static int q38c_arena(Q38Chain *ch, Model *m) {
     if (ple) { ch->o_ple = n; n += 3 * (size_t)W; ch->o_pconv = n; n += (size_t)W * c->ple_convk; }
     float *a = calloc(n, sizeof(float));
     if (!a) return 0;
-    for (int i = 0; i < L; i++) {
+    for (int i = lo; i < hi; i++) {
         Layer *l = &m->L[i];
         memcpy(a + ch->o_an[i], l->attn_gr.norm, W * sizeof(float));
         memcpy(a + ch->o_mn[i], l->mlp_gr.norm, W * sizeof(float));
@@ -429,10 +443,11 @@ static int q38c_arena(Q38Chain *ch, Model *m) {
 }
 /* The chain's host-side state, no device memory yet. NULL: a model or geometry its
  * shaders do not take (the per-matrix path), or no memory. */
-static Q38Chain *q38c_new(Model *m) {
+static Q38Chain *q38c_new_dev(Model *m, int d) {
     Q38Chain *ch = (Q38Chain *)calloc(1, sizeof *ch);
     if (!ch) return NULL;
-    m->vkchain = ch;
+    if (d) m->vkchain2 = ch; else m->vkchain = ch;
+    ch->d = d;
     Cfg *c = &m->c; int L = c->layers;
     if (m->range_begin != 0 || m->range_end != L || !m->lm_head.rows || !q38c_geometry_ok(c)) {
         fprintf(stderr, "[VK] qwen38 chain: a model or geometry its shaders do not take; per-matrix path\n");
@@ -447,46 +462,64 @@ static Q38Chain *q38c_new(Model *m) {
     Q38C_ARR(kv_valid, int); Q38C_ARR(pk_valid, int); Q38C_ARR(attn_ord, int);
 #undef Q38C_ARR
     ch->snap_slots = 1;
-    ch->nl = g_q38c_fitted ? g_q38c_fit.n : L;
-    ch->head = !g_q38c_fitted || !vkc_fit_partial(&g_q38c_fit);
+    if (d) {   /* from the primary's last layer; the head with the last layer and room for it */
+        ch->lo = g_q38c_fit.n; ch->nl = g_q38c_fit2.n;
+        ch->head = ch->lo + ch->nl == L && !vkc_fit_partial(&g_q38c_fit2);
+    } else {
+        ch->nl = g_q38c_fitted ? g_q38c_fit.n : L;
+        ch->head = !g_q38c_fitted || !vkc_fit_partial(&g_q38c_fit);
+    }
     return ch;
 }
+static Q38Chain *q38c_new(Model *m) { return q38c_new_dev(m, 0); }
 /* Every layer the fit gave the device, one at a time (its matrices, its state), then the
  * parameters, the placed line and the head. A partial chain runs it at startup
  * (q38c_start), the full chain at its first forward, as before. */
-static Q38Chain *q38c_setup(Model *m) {
-    Q38Chain *ch = (Q38Chain *)m->vkchain;
+/* d = 1: the second device's chain (the caller has made that device current). */
+static Q38Chain *q38c_setup_dev(Model *m, int d) {
+    Q38Chain *ch = q38c_of(m, d);
     if (ch && ch->built) return ch->ok ? ch : NULL;
-    if (!ch && !(ch = q38c_new(m))) return NULL;
+    if (d && !g_q38c_fit2_on) return NULL;
+    if (!ch && !(ch = q38c_new_dev(m, d))) return NULL;
     ch->built = 1;
-    VkcFit *fit = g_q38c_fitted ? &g_q38c_fit : NULL;
-    for (int i = 0; i < ch->nl; i++) {
-        if (q38c_place_mats(ch, m, i) && q38c_place_bufs(ch, m, i)) { if (fit) vkc_fit_mark(fit, i); continue; }
+    const char *nm = q38c_name(ch);
+    VkcFit *fit = d ? &g_q38c_fit2 : g_q38c_fitted ? &g_q38c_fit : NULL;
+    g_q38_vk_dev = d;
+    for (int i = ch->lo; i < ch->lo + ch->nl; i++) {
+        if (q38c_place_mats(ch, m, i) && q38c_place_bufs(ch, m, i)) { if (fit) vkc_fit_mark(fit, i - ch->lo); continue; }
         q38c_shrink(ch, m, i, vkc_lost() ? "the device was lost" : "the device refused an upload or an allocation");
         break;
     }
-    if (ch->nl && !q38c_arena(ch, m)) q38c_shrink(ch, m, 0, "the device refused the chain's parameter buffer");
-    if (fit && !ch->placed_said) { vkc_fit_placed("qwen38", fit); ch->placed_said = 1; }
+    if (ch->nl && !q38c_arena(ch, m))
+        q38c_shrink(ch, m, ch->lo, vkc_lost() ? "the device was lost" : "the device refused the chain's parameter buffer");
+    if (fit && !ch->placed_said) { vkc_fit_placed(nm, fit); ch->placed_said = 1; }
     if (ch->nl && ch->head) {
         Q38Weight *w[Q38C_TAIL]; int n = q38c_tail_mats(m, w, 1), ok = 1;
         for (int k = 0; k < n && ok; k++) ok = q38c_t(w[k]) != NULL;
         if (!ok) q38c_head_off(ch, m);
     }
+    g_q38_vk_dev = 0;
     if (!ch->nl) {   /* nothing of the chain on the device: its own pools go too */
         if (!fit) fprintf(stderr, "[VK] qwen38 chain: a matrix did not reach the device; per-matrix path\n");
-        vkc_shutdown(); g_vk_chain = 0;
+        vkc_shutdown();
+        if (!d) g_vk_chain = 0;   /* the second device's failing: the primary's chain stands, the CPU runs the rest */
         return NULL;
     }
     ch->dn_where = Q38C_HOST;
     ch->ok = 1;
     size_t wb = 0, wn = 0;
-    coli_vk_mem_info(&wb, &wn);
-    fprintf(stderr, "[VK] qwen38 chain: %d layers on the device (%d QSA), %zu matrices resident, %.1f MiB of parameters%s\n",
-            ch->nl, ch->n_attn, wn, ch->prm_floats * 4 / 1048576.0,
-            ch->head ? "" : "; the CPU runs the other layers, the final mixer and lm_head");
+    coli_vk_mem_info_dev(d, &wb, &wn);
+    if (d) fprintf(stderr, "[VK] qwen38 chain: layers %d..%d on the second device (%d QSA), %zu matrices resident there, "
+                           "%.1f MiB of parameters%s\n", ch->lo, ch->lo + ch->nl - 1, ch->n_attn, wn,
+                   ch->prm_floats * 4 / 1048576.0, ch->head ? ", the final mixer and lm_head too" : "");
+    else fprintf(stderr, "[VK] qwen38 chain: %d layers on the device (%d QSA), %zu matrices resident, %.1f MiB of parameters%s\n",
+                 ch->nl, ch->n_attn, wn, ch->prm_floats * 4 / 1048576.0,
+                 ch->head ? "" : "; the CPU runs the other layers, the final mixer and lm_head");
     return ch;
 }
-static int q38c_layers(Model *m) { Q38Chain *ch = (Q38Chain *)m->vkchain; return ch && ch->ok ? ch->nl : 0; }
+static Q38Chain *q38c_setup(Model *m) { return q38c_setup_dev(m, 0); }
+/* the layers the last forward ran on the devices, from layer 0 */
+static int q38c_layers(Model *m) { (void)m; return g_q38c_ran; }
 
 /* At startup, with the chain on (before anything of it is on the device, the dense-host
  * pass and the expert tier): N, the chain's pipelines (vkc_init), and a partial chain
@@ -501,14 +534,40 @@ static void q38c_start(Model *m) {
     size_t *lb = (size_t *)calloc((size_t)L, sizeof *lb), *mb = (size_t *)calloc((size_t)L, sizeof *mb);
     if (!lb || !mb) { free(lb); free(mb); return; }
     for (int i = 0; i < L; i++) q38c_fit_layer(m, i, rows, &lb[i], &mb[i]);
-    vkc_fit("qwen38", L, lb, mb, q38c_fit_fixed(m, rows), q38c_fit_tail(m), &g_q38c_fit);
-    free(lb); free(mb);
+    size_t fixed = q38c_fit_fixed(m, rows), tail = q38c_fit_tail(m);
+    vkc_fit("qwen38", L, lb, mb, fixed, tail, &g_q38c_fit);
     g_q38c_fitted = 1;
-    int partial = vkc_fit_partial(&g_q38c_fit);
-    if (!g_q38c_fit.n) { g_vk_chain = 0; g_q38_vk_noup = 1; return; }   /* the chain off: its pipelines never come up */
-    if (!vkc_init()) { g_vk_chain = 0; g_q38c_fitted = 0; return; }   /* the per-matrix path, as before */
+    int partial = vkc_fit_partial(&g_q38c_fit), n0 = g_q38c_fit.n;
+    if (!n0) { g_vk_chain = 0; g_q38_vk_noup = 1; free(lb); free(mb); return; }   /* the chain off: its pipelines never come up */
+    if (!vkc_init()) { g_vk_chain = 0; g_q38c_fitted = 0; free(lb); free(mb); return; }   /* the per-matrix path, as before */
+    /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
+     * n0, with that device's free memory (the tier there sizes itself after the placement) */
+    if (partial && n0 < L && q38c_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
+        vkc_device(1);
+        int n2 = vkc_fit("qwen38 dev2", L - n0, lb + n0, mb + n0, fixed, tail, &g_q38c_fit2);
+        if (n2 > 0 && !vkc_init()) {
+            fprintf(stderr, "[VK] qwen38 chain: the second device's pipelines did not come up; its layers stay on the CPU\n");
+            n2 = 0;
+        }
+        g_q38c_fit2_on = n2 > 0;
+        vkc_device(0);
+    }
+    free(lb); free(mb);
     if (!partial) return;   /* every layer and the head: set up at the first forward, as before */
-    if (!q38c_setup(m)) { vkc_shutdown(); g_vk_chain = 0; }
+    Q38Chain *ch = q38c_setup(m);
+    if (!ch) { vkc_shutdown(); g_vk_chain = 0; }
+    if (g_q38c_fit2_on) {
+        vkc_device(1);
+        if (!ch || ch->nl < n0) {
+            /* the primary placed fewer layers than its fit: the second device's would not
+             * follow them, so they stay on the CPU too */
+            fprintf(stderr, "[VK] qwen38 chain: the primary device stopped before layer %d; layers %d..%d stay on the CPU, "
+                            "not on the second device\n", n0, n0, n0 + g_q38c_fit2.n - 1);
+            g_q38c_fit2_on = 0;
+            vkc_shutdown();
+        } else if (!q38c_setup_dev(m, 1)) g_q38c_fit2_on = 0;
+        vkc_device(0);
+    }
     g_q38_vk_noup = 1;   /* after the setup's own uploads */
 }
 /* The dense-host pass's bound (q38_dho_start): the N layers' matrices of a partial chain,
@@ -516,7 +575,12 @@ static void q38c_start(Model *m) {
  * part is on the CPU. */
 static void q38c_dho_bound(int *layers, int *head, int *dev) {
     if (!g_q38c_fitted) return;
-    if (vkc_fit_partial(&g_q38c_fit)) { *layers = g_q38c_fit.n; *head = 0; }
+    if (vkc_fit_partial(&g_q38c_fit)) {
+        *layers = g_q38c_fit.n; *head = 0;
+        /* the second device's layers too, where the chain runs every step (with prompts
+         * only, decode reads them on the CPU); the head keeps its host copy */
+        if (g_q38c_fit2_on && g_vk_chain == COLI_VK_CHAIN_ON) *layers += g_q38c_fit2.n;
+    }
     if (!*layers) *dev = 0;
 }
 /* The dense-host pass with the full chain fitted (the matrices go up at startup in this
@@ -554,7 +618,9 @@ static int q38c_dho_place(Model *m, size_t *bytes, int *n) {
 }
 /* The dense-host lines say which layers dropped their host copies. */
 static void q38c_dho_layers(void) {
-    if (g_q38c_fitted) coli_vk_dense_host_layers(g_q38c_fit.n, g_q38c_fit.L);
+    if (g_q38c_fitted)
+        coli_vk_dense_host_layers(g_q38c_fit.n + (g_q38c_fit2_on && g_vk_chain == COLI_VK_CHAIN_ON ? g_q38c_fit2.n : 0),
+                                  g_q38c_fit.L);
 }
 
 /* ---- state between the host and the device ------------------------------------ */
@@ -568,11 +634,16 @@ static void q38_embed_row(Model *m,int id,int abs_pos,float *out);
  * partial chain only the device's layers are rebuilt: the CPU's layers (and the PLE
  * layer's state and history when it is one of them) hold their own state already. */
 static void q38c_recover(Model *m, int upto) {
-    Q38Chain *ch = (Q38Chain *)m->vkchain;
+    Q38Chain *ch = (Q38Chain *)m->vkchain, *ch2 = (Q38Chain *)m->vkchain2;
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, C = c->hc_count;
-    int nl = ch ? ch->nl : c->layers, ple = c->ple_layer >= 0 && c->ple_layer < nl;
+    int nl = ch ? ch->nl : c->layers;
+    if (ch && ch->ok && ch2 && ch2->ok) nl += ch2->nl;   /* the second device's layers ran in that forward too */
+    int ple = c->ple_layer >= 0 && c->ple_layer < nl;
     g_vk_chain = 0;
-    if (ch) { ch->failed = 1; ch->dn_where = Q38C_HOST; ch->host_zero = 0; ch->snap_valid = 0; }
+    for (int d = 0; d < 2; d++) {
+        Q38Chain *x = q38c_of(m, d);
+        if (x) { x->failed = 1; x->dn_where = Q38C_HOST; x->host_zero = 0; x->snap_valid = 0; }
+    }
     for (int i = 0; i < nl; i++) {
         if (c->is_attn[i]) continue;
         memset(m->DN_rec[i], 0, (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float));
@@ -603,60 +674,70 @@ static void q38c_recover(Model *m, int upto) {
     m->ple_pref = pref; m->ple_pref_rows = pref_rows; m->snap_rows = snap; g_q38_rowwise = rowwise;
     free(ids); free(hyper); free(mixed); free(inject); free(block);
 }
-static void q38c_sync_host(Model *m) {
-    Q38Chain *ch = (Q38Chain *)m->vkchain;
-    if (!ch || !ch->ok || ch->dn_where != Q38C_DEV) return;
+/* (every function here covers both chains: the primary's layers and the second device's) */
+static int q38c_sync_one(Model *m, Q38Chain *ch) {
+    if (!ch || !ch->ok || ch->dn_where != Q38C_DEV) return 1;
     Cfg *c = &m->c;
     size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
-    for (int i = 0; i < ch->nl; i++) {
+    int was = vkc_device(ch->d), ok = 1;
+    for (int i = ch->lo; i < ch->lo + ch->nl && ok; i++) {
         if (c->is_attn[i]) continue;
-        if (!vkc_read(ch->rec[i], 0, m->DN_rec[i], nr * 4) || !vkc_read(ch->ring[i], 0, m->DN_conv[i], nc * 4)) {
-            q38c_recover(m, m->kv_len); return;
-        }
+        ok = vkc_read(ch->rec[i], 0, m->DN_rec[i], nr * 4) && vkc_read(ch->ring[i], 0, m->DN_conv[i], nc * 4);
     }
-    if (ch->ple_ring && m->PLE_conv_state &&
-        !vkc_read(ch->ple_ring, (size_t)ch->ple_slot[0] * q38c_ple_cells(c), m->PLE_conv_state, q38c_ple_cells(c) * 4)) {
-        q38c_recover(m, m->kv_len); return;
-    }
-    ch->dn_where = Q38C_BOTH;
+    if (ok && ch->ple_ring && m->PLE_conv_state)
+        ok = vkc_read(ch->ple_ring, (size_t)ch->ple_slot[0] * q38c_ple_cells(c), m->PLE_conv_state, q38c_ple_cells(c) * 4);
+    vkc_device(was);
+    if (ok) ch->dn_where = Q38C_BOTH;
+    return ok;
+}
+static void q38c_sync_host(Model *m) {
+    for (int d = 0; d < 2; d++)
+        if (!q38c_sync_one(m, q38c_of(m, d))) { q38c_recover(m, m->kv_len); return; }
 }
 static void q38c_host_wrote(Model *m, int zero) {
-    Q38Chain *ch = (Q38Chain *)m->vkchain;
-    if (!ch || !ch->ok) return;
-    ch->dn_where = Q38C_HOST; ch->host_zero = zero; ch->snap_valid = 0;
+    for (int d = 0; d < 2; d++) {
+        Q38Chain *ch = q38c_of(m, d);
+        if (!ch || !ch->ok) continue;
+        ch->dn_where = Q38C_HOST; ch->host_zero = zero; ch->snap_valid = 0;
+    }
 }
-static void q38c_cpu_step(Model *m, int pos_base) {
-    Q38Chain *ch = (Q38Chain *)m->vkchain;
+/* A CPU step from pos_base over one chain's layers: its host state current first. */
+static void q38c_cpu_one(Model *m, Q38Chain *ch, int pos_base) {
     if (!ch || !ch->ok) return;
-    q38c_sync_host(m);
+    if (!q38c_sync_one(m, ch)) { q38c_recover(m, m->kv_len); return; }
     ch->dn_where = Q38C_HOST; ch->host_zero = 0; ch->snap_valid = 0;
-    for (int i = 0; i < ch->nl; i++) {
+    for (int i = ch->lo; i < ch->lo + ch->nl; i++) {
         if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
         if (m->c.is_attn[i]) vkc_kv_lower(&ch->ks, ch->attn_ord[i], pos_base);
         int R = m->c.idx_ratio > 0 ? m->c.idx_ratio : 1;
         if (ch->pk_valid[i] > pos_base / R) ch->pk_valid[i] = pos_base / R;
     }
 }
+static void q38c_cpu_step(Model *m, int pos_base) {
+    for (int d = 0; d < 2; d++) q38c_cpu_one(m, q38c_of(m, d), pos_base);
+}
 /* A rejected draft: the state after the verify's row `slot` (its first slot+1 rows) is
  * the device's copy in that slot; `len` positions stand. The KV and pooled-key
  * watermarks come down to them: the rows past them are the rejected drafts'. */
 static void q38c_rollback(Model *m, int slot, int len) {
-    Q38Chain *ch = (Q38Chain *)m->vkchain;
-    if (!ch || !ch->ok) return;
     int R = m->c.idx_ratio > 0 ? m->c.idx_ratio : 1;
-    for (int i = 0; i < ch->nl; i++) {
-        if (ch->kv_valid[i] > len) ch->kv_valid[i] = len;
-        if (m->c.is_attn[i]) vkc_kv_lower(&ch->ks, ch->attn_ord[i], len);
-        if (ch->pk_valid[i] > len / R) ch->pk_valid[i] = len / R;
+    for (int d = 0; d < 2; d++) {
+        Q38Chain *ch = q38c_of(m, d);
+        if (!ch || !ch->ok) continue;
+        for (int i = ch->lo; i < ch->lo + ch->nl; i++) {
+            if (ch->kv_valid[i] > len) ch->kv_valid[i] = len;
+            if (m->c.is_attn[i]) vkc_kv_lower(&ch->ks, ch->attn_ord[i], len);
+            if (ch->pk_valid[i] > len / R) ch->pk_valid[i] = len / R;
+        }
+        if (slot < 0 || slot >= ch->snap_valid || ch->dn_where != Q38C_DEV) { ch->snap_valid = 0; continue; }
+        for (int i = ch->lo; i < ch->lo + ch->nl; i++) {
+            if (m->c.is_attn[i]) continue;
+            VkcBuf *t = ch->rec[i]; ch->rec[i] = ch->rec_snap[slot][i]; ch->rec_snap[slot][i] = t;
+            t = ch->ring[i]; ch->ring[i] = ch->ring_snap[slot][i]; ch->ring_snap[slot][i] = t;
+        }
+        if (ch->ple_ring) { int t = ch->ple_slot[0]; ch->ple_slot[0] = ch->ple_slot[1 + slot]; ch->ple_slot[1 + slot] = t; }
+        ch->snap_valid = 0;
     }
-    if (slot < 0 || slot >= ch->snap_valid || ch->dn_where != Q38C_DEV) { ch->snap_valid = 0; return; }
-    for (int i = 0; i < ch->nl; i++) {
-        if (m->c.is_attn[i]) continue;
-        VkcBuf *t = ch->rec[i]; ch->rec[i] = ch->rec_snap[slot][i]; ch->rec_snap[slot][i] = t;
-        t = ch->ring[i]; ch->ring[i] = ch->ring_snap[slot][i]; ch->ring_snap[slot][i] = t;
-    }
-    if (ch->ple_ring) { int t = ch->ple_slot[0]; ch->ple_slot[0] = ch->ple_slot[1 + slot]; ch->ple_slot[1 + slot] = t; }
-    ch->snap_valid = 0;
 }
 /* Copy slots on the device for a verify that snapshots `rows` rows: the DeltaNet states
  * and conv rings (slot 0 since setup), and the PLE ring's slots, all in one buffer since
@@ -668,7 +749,7 @@ static int q38c_spec_slots(Q38Chain *ch, Model *m, int rows) {
     for (int sl = ch->snap_slots; sl < rows; sl++) {
         if (!ch->rec_snap[sl] && !(ch->rec_snap[sl] = (VkcBuf **)calloc((size_t)L, sizeof(VkcBuf *)))) return 0;
         if (!ch->ring_snap[sl] && !(ch->ring_snap[sl] = (VkcBuf **)calloc((size_t)L, sizeof(VkcBuf *)))) return 0;
-        for (int i = 0; i < ch->nl; i++) {
+        for (int i = ch->lo; i < ch->lo + ch->nl; i++) {
             if (c->is_attn[i]) continue;
             if (!ch->rec_snap[sl][i] && !(ch->rec_snap[sl][i] = vkc_buf(nr * 4, VKC_DEV))) return 0;
             if (!ch->ring_snap[sl][i] && !(ch->ring_snap[sl][i] = vkc_buf(nc * 4, VKC_DEV))) return 0;
@@ -693,7 +774,7 @@ static int q38c_push_state(Q38Chain *ch, Model *m, int pos_base, int n_rows) {
     Cfg *c = &m->c; int ok = 1;
     if (ch->dn_where == Q38C_HOST) {
         size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
-        for (int i = 0; i < ch->nl && ok; i++) {
+        for (int i = ch->lo; i < ch->lo + ch->nl && ok; i++) {
             if (c->is_attn[i]) continue;
             if (ch->host_zero) ok = vkc_zero(ch->rec[i], 0, nr) && vkc_zero(ch->ring[i], 0, nc);
             else ok = vkc_write(ch->rec[i], 0, m->DN_rec[i], nr * 4) && vkc_write(ch->ring[i], 0, m->DN_conv[i], nc * 4);
@@ -705,7 +786,7 @@ static int q38c_push_state(Q38Chain *ch, Model *m, int pos_base, int n_rows) {
         ch->dn_where = Q38C_BOTH;
     }
     int D = c->head_dim, KVH = c->kv_heads, ID = c->idx_dim, R = c->idx_ratio;
-    for (int i = 0; i < ch->nl && ok; i++) {
+    for (int i = ch->lo; i < ch->lo + ch->nl && ok; i++) {
         if (!c->is_attn[i]) continue;
         if (ch->pk_valid[i] > pos_base / R) ch->pk_valid[i] = pos_base / R;   /* blocks this step rewrites */
         if (ch->ks.on) {   /* the split: the window placed, the K/V rows below pos_base of its blocks uploaded */
@@ -912,15 +993,15 @@ static int q38c_moe_apply(Q38Chain *ch, Model *m, int n) {
  * done. A partial chain runs its N layers, every chunk across all of them, and returns
  * 2: hyper_h holds every row's streams after layer N-1 (the one copy to the host per
  * chunk), and the caller runs layers N.. and the head on the CPU from them. */
-static int q38c_forward(Model *m, const int *ids, int S, int pos_base, int nlogits, float *hyper_h,
-                        int want_streams, float *mixed_h, float *logit) {
-    if (!g_vk_chain || qt_ready()) return 0;
-    /* prompts only: decode and verifies on the CPU */
-    if (g_vk_chain == COLI_VK_CHAIN_PREFILL && (S <= 2 || g_q38_rowwise)) return 0;
-    Q38Chain *ch = q38c_setup(m);
-    if (!ch || ch->failed) return 0;
-    Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, L = ch->nl, E = c->experts, V = c->vocab;
-    if (!ch->head) { want_streams = 1; mixed_h = NULL; }   /* a partial chain: the streams after layer N-1 */
+/* One chain's layers (lo..lo+nl-1 on its device), from the streams in hyper_h. 0: not
+ * taken, *lost = 1 when a frame failed (the state rebuilt on the CPU, the chains off), else
+ * nothing on its device changed; 1: done with the head; 2: hyper_h holds the streams after
+ * its last layer. */
+static int q38c_forward_seg(Model *m, Q38Chain *ch, const int *ids, int S, int pos_base, int nlogits, float *hyper_h,
+                            int want_streams, float *mixed_h, float *logit, int *lost) {
+    *lost = 0;
+    Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, L = ch->nl, lo = ch->lo, hi = lo + L, E = c->experts, V = c->vocab;
+    if (!ch->head) { want_streams = 1; mixed_h = NULL; }   /* a partial chain: the streams after its last layer */
     int mirror_ok = q38c_mirror(ch, m);
     int CH = mirror_ok ? q38c_chunk_rows(ch, m) : 1, rows = S < CH ? S : CH;
     if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
@@ -953,9 +1034,9 @@ static int q38c_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
                 cs[(s * half + j) * 2] = cosf(ang); cs[(s * half + j) * 2 + 1] = sinf(ang);
             }
         }
-        if (c->ple_layer >= 0 && c->ple_layer < L) q38c_ple_rows(m, ids, c0, n, ch->host_emb);
+        if (c->ple_layer >= lo && c->ple_layer < hi) q38c_ple_rows(m, ids, c0, n, ch->host_emb);
         int ok = 1, pending = 0;
-        for (int i = 0; i < L && ok; i++) {
+        for (int i = lo; i < hi && ok; i++) {
             Layer *l = &m->L[i];
             if (pending) ok = q38c_moe_apply(ch, m, n);
             if (ok && i == c->ple_layer) ok = q38c_ple(ch, m, n, c0, ns);
@@ -1010,7 +1091,7 @@ static int q38c_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
         if (!ok) goto lost;
         if (want_streams) memcpy(hyper_h + (size_t)c0 * W, vkc_ptr(ch->hypd), (size_t)n * W * 4);
         if (mixed_h) memcpy(mixed_h + (size_t)c0 * H, vkc_ptr(ch->find), (size_t)n * H * 4);
-        for (int i = 0; i < L; i++) if (c->is_attn[i]) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->attn_ord[i], pb + n); }
+        for (int i = lo; i < hi; i++) if (c->is_attn[i]) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->attn_ord[i], pb + n); }
         ch->dn_where = Q38C_DEV; ch->host_zero = 0;
     }
     if (ch->head) memcpy(logit, vkc_ptr(ch->outd), (size_t)nlogits * V * sizeof(float));
@@ -1020,18 +1101,56 @@ static int q38c_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
     return ch->head ? 1 : 2;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     vkc_gemm_rows(-1);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost(); }
+    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_device(0);
     q38c_recover(m, pos_base);
+    *lost = 1;
     return 0;
 }
 
+/* Every layer the chains hold for S rows. hyper_h: the rows' streams in, the final ones
+ * out when want_streams; mixed_h (or NULL): every row's final mixed row, for the prefill
+ * read-out; logit: the last nlogits rows' logits. 0 = not taken (nothing changed, or a
+ * device lost and the state rebuilt: the CPU runs the step), 1 = done. 2: hyper_h holds
+ * every row's streams after the layers the chains ran (q38c_layers says how many: the
+ * primary's, then the second device's), and the caller runs the rest and the head on the
+ * CPU from them. */
+static int q38c_forward(Model *m, const int *ids, int S, int pos_base, int nlogits, float *hyper_h,
+                        int want_streams, float *mixed_h, float *logit) {
+    g_q38c_ran = 0;
+    if (!g_vk_chain || qt_ready()) return 0;
+    /* prompts only: decode and verifies on the CPU */
+    if (g_vk_chain == COLI_VK_CHAIN_PREFILL && (S <= 2 || g_q38_rowwise)) return 0;
+    Q38Chain *ch = q38c_setup(m), *ch2 = q38c_of(m, 1);
+    if (!ch || ch->failed) return 0;
+    if (ch2 && (!ch2->ok || ch2->failed || ch2->lo != ch->lo + ch->nl || ch->head)) ch2 = NULL;
+    int lost = 0;
+    int r = q38c_forward_seg(m, ch, ids, S, pos_base, nlogits, hyper_h, ch2 ? 1 : want_streams, ch2 ? NULL : mixed_h,
+                             logit, &lost);
+    if (!r) return 0;
+    g_q38c_ran = ch->nl;
+    if (!ch2 || r == 1) return r;
+    vkc_device(1);
+    int r2 = q38c_forward_seg(m, ch2, ids, S, pos_base, nlogits, hyper_h, want_streams, mixed_h, logit, &lost);
+    vkc_device(0);
+    if (lost) { g_q38c_ran = 0; return 0; }
+    if (!r2) { q38c_cpu_one(m, ch2, pos_base); return 2; }   /* declined: the CPU runs its layers this step */
+    g_q38c_ran += ch2->nl;
+    return r2;
+}
+
 static void q38c_report(Model *m) {
-    Q38Chain *ch = m ? (Q38Chain *)m->vkchain : NULL;
-    if (!ch || !ch->ok || !ch->forwards) return;
-    VkcStats st; vkc_stats(&st);
-    fprintf(stderr, "[VK] qwen38 chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
-                    "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
-            ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms, st.dev_bytes / 1048576.0);
-    vkc_kv_report(&ch->ks);
-    vkc_prof_print();
+    for (int d = 0; d < 2 && m; d++) {
+        Q38Chain *ch = q38c_of(m, d);
+        if (!ch || !ch->ok || !ch->forwards) continue;
+        int was = vkc_device(d);
+        VkcStats st; vkc_stats(&st);
+        fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
+                        "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
+                q38c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
+                st.dev_bytes / 1048576.0);
+        vkc_kv_report(&ch->ks);
+        vkc_prof_print();
+        vkc_device(was);
+    }
 }

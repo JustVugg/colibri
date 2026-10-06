@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include "json.h"
 #include "compat.h"
+#include "load_fail.h"
 
 /* tetto sulla dimensione dell'header safetensors: gli header reali sono piccoli
  * (KB..pochi MB). Un file crafted che dichiara un hlen enorme causerebbe una
@@ -101,7 +102,7 @@ static int st_dtype_code(const char *s) {
      * st_read_raw after validating the packed geometry). Same rule as the fp8
      * codes above: a new number, read raw, refused by the float readers. */
     if (!strcmp(s, "I32") || !strcmp(s, "U32")) return 7;
-    fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
+    coli_load_fail(COLI_LOAD_FAIL_UNSUPPORTED, "unsupported dtype: %s", s);
 }
 
 /* Byte per elemento. UNICO posto che lo sa: prima la formula era ripetuta in tre
@@ -263,9 +264,10 @@ static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
 static int st_open_fd(shards *S, const char *path) {
     for (int i = 0; i < S->nfd; i++) if (!strcmp(S->paths[i], path)) return S->fds[i];
     int fd = open(path, COMPAT_O_RDONLY);
-    if (fd < 0) { perror(path); exit(1); }
+    if (fd < 0) coli_load_fail(coli_load_fail_kind_from_errno(errno), "%s: %s", path, strerror(errno));
     struct stat sb;
-    if (fstat(fd, &sb) != 0) { perror("fstat shard"); close(fd); exit(1); }
+    if (fstat(fd, &sb) != 0) { int saved = errno; close(fd);
+        coli_load_fail(coli_load_fail_kind_from_errno(saved), "fstat shard: %s", strerror(saved)); }
     S->paths[S->nfd] = strdup(path); S->fds[S->nfd] = fd;
     S->sizes[S->nfd] = (int64_t)sb.st_size;
 #ifdef O_DIRECT
@@ -389,14 +391,15 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
         ssize_t r = pread(fd, p + got, (size_t)want, off + got);
         if (r < 0) {
             if (errno == EINTR) continue;
-            fprintf(stderr, "%s: %s (off %lld, %lld/%lld bytes)\n", tag, strerror(errno),
-                    (long long)off, (long long)got, (long long)n);
-            exit(1);
+            int saved = errno;
+            coli_load_fail(coli_load_fail_kind_from_errno(saved),
+                           "%s: %s (off %lld, %lld/%lld bytes)", tag, strerror(saved),
+                           (long long)off, (long long)got, (long long)n);
         }
         if (r == 0) {
-            fprintf(stderr, "%s: short read at EOF (off %lld, %lld/%lld bytes) — truncated file?\n",
-                    tag, (long long)off, (long long)got, (long long)n);
-            exit(1);
+            coli_load_fail(COLI_LOAD_FAIL_FORMAT,
+                           "%s: short read at EOF (off %lld, %lld/%lld bytes) — truncated file?",
+                           tag, (long long)off, (long long)got, (long long)n);
         }
         got += r;
     }
@@ -454,7 +457,7 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
         fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] is not a JSON string -- malformed stamp, refusing (untrusted container)\n",
                 shard_path); exit(1); }
     char *arena2 = NULL;
-    jval *inner = json_parse(stamp->str, &arena2);
+    jval *inner = json_parse_checked(stamp->str);
     if (!inner || inner->t != J_OBJ) {
         fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] does not parse as a JSON object -- malformed stamp, refusing (untrusted container)\n",
                 shard_path); exit(1); }
@@ -581,14 +584,14 @@ static void st_index_load(st_index *ix, const char *dir) {
     char *text = malloc((size_t)size + 1);
     if (!text || fread(text, 1, (size_t)size, f) != (size_t)size) { free(text); fclose(f); return; }
     text[size] = 0; fclose(f);
-    ix->root = json_parse(text, &ix->arena);
+    ix->root = memchr(text, 0, (size_t)size) ? NULL : json_parse_checked(text);
     free(text);
     jval *map = ix->root ? json_get(ix->root, "weight_map") : NULL;
     if (!map || map->t != J_OBJ) { json_free(ix->root); ix->root = NULL; free(ix->arena); ix->arena = NULL; return; }
     ix->map = map;
     ix->hcap = 1; while (ix->hcap < map->len * 2) ix->hcap <<= 1;
     ix->h = malloc((size_t)ix->hcap * sizeof(int));
-    if (!ix->h) { fprintf(stderr, "OOM indexing model.safetensors.index.json\n"); exit(1); }
+    if (!ix->h) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "OOM indexing model.safetensors.index.json");
     for (int i = 0; i < ix->hcap; i++) ix->h[i] = -1;
     for (int i = 0; i < map->len; i++) {
         uint64_t hh = st_hash(map->keys[i]) & (ix->hcap - 1);
@@ -620,7 +623,7 @@ static void st_index_free(st_index *ix) {
  * returns how many shards this dir contributed. */
 static void st_scan_dir(const char *dir, char files[][1024], int *nf, int *added) {
     DIR *d = opendir(dir); struct dirent *e;
-    if (!d) { perror(dir); exit(1); }
+    if (!d) coli_load_fail(coli_load_fail_kind_from_errno(errno), "%s: %s", dir, strerror(errno));
     int base_n = *nf;
     while ((e = readdir(d))) {
         const char *dot = strrchr(e->d_name, '.');
@@ -713,17 +716,19 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
          * overflow (malloc(0) e poi hdr[hlen]=0 fuori limiti) o forzare una
          * malloc gigante. */
         if (fsz < 8 || hlen > (uint64_t)(fsz - 8) || hlen > (uint64_t)ST_MAX_HEADER) {
-            fprintf(stderr, "%s: bad safetensors header length %llu (file %lld bytes)\n",
-                    files[fi], (unsigned long long)hlen, (long long)fsz); exit(1); }
+            coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: bad safetensors header length %llu (file %lld bytes)",
+                           files[fi], (unsigned long long)hlen, (long long)fsz); }
         char *hdr = malloc(hlen + 1);
-        if (!hdr) { perror("malloc safetensors header"); exit(1); }
+        if (!hdr) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "malloc safetensors header: %s", strerror(errno));
         st_pread_full(fd, hdr, (int64_t)hlen, 8, "pread hdr");
         hdr[hlen] = 0;
         int64_t data_start = 8 + (int64_t)hlen;
         char *arena = NULL;
-        jval *root = json_parse(hdr, &arena);
+        /* A partial object must not index weights or authorize an overlay.
+         * Header padding is JSON whitespace; embedded NUL is not padding. */
+        jval *root = memchr(hdr, 0, (size_t)hlen) ? NULL : json_parse_checked(hdr);
         if (!root || root->t != J_OBJ) {
-            fprintf(stderr, "%s: safetensors header is not a JSON object\n", files[fi]); exit(1); }
+            coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: safetensors header is not a JSON object", files[fi]); }
         st_fmt_stamp_ingest(S, root, files[fi]);
         for (int i = 0; i < root->len; i++) {
             const char *name = root->keys[i];
@@ -1073,7 +1078,7 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
         fprintf(stderr, "%s: tensor '%s' shape/bytes mismatch (numel %lld, %lld bytes, dtype %d) — refusing (hostile or corrupt file)\n",
                 name, name, (long long)t->numel, (long long)t->nbytes, t->dtype); exit(1); }
     void *raw = malloc(t->nbytes);
-    if (!raw) { fprintf(stderr, "malloc %lld bytes for tensor %s failed\n", (long long)t->nbytes, name); exit(1); }
+    if (!raw) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "malloc %lld bytes for tensor %s failed", (long long)t->nbytes, name);
     st_pread_full(t->fd, raw, t->nbytes, t->off, "pread data");
     if (t->dtype == 2) {
         memcpy(out, raw, t->nbytes);
@@ -1158,7 +1163,7 @@ static int64_t st_read_scale_f32(shards *S, const char *name, float *out, int64_
         fprintf(stderr, "scale %s: F8_E8M0 numel %lld disagrees with %lld bytes\n",
                 name, (long long)t->numel, (long long)t->nbytes); exit(1); }
     uint8_t *raw = (uint8_t*)malloc((size_t)t->nbytes);
-    if (!raw) { fprintf(stderr, "malloc %lld bytes for scale %s failed\n", (long long)t->nbytes, name); exit(1); }
+    if (!raw) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "malloc %lld bytes for scale %s failed", (long long)t->nbytes, name);
     st_pread_full(t->fd, raw, t->nbytes, t->off, "pread ue8m0 scale");
     for (int64_t i = 0; i < t->numel; i++) out[i] = ue8m0_to_f32(raw[i]);
     free(raw);
@@ -1462,7 +1467,7 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
         fprintf(stderr, "slice %s byte arithmetic/destination is invalid — refusing\n", name); exit(1); }
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = nb ? malloc((size_t)nb) : NULL;
-    if (nb && !raw) { fprintf(stderr, "malloc %lld bytes for slice %s failed\n", (long long)nb, name); exit(1); }
+    if (nb && !raw) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "malloc %lld bytes for slice %s failed", (long long)nb, name);
     if (nb) st_pread_full(t->fd, raw, nb, boff, "pread slice");   /* dev #331: chunked + EINTR + honest short-read */
     if (nb) {
         if (t->dtype == 2) memcpy(out, raw, (size_t)nb);

@@ -1258,11 +1258,14 @@ static VkWPool g_wpool  = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_
 static VkWPool g_tpool  = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 0, .prio = 0.4f};
 static VkWPool g_wpool2 = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 1, .prio = -1.f};
 static VkWPool g_tpool2 = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 1, .prio = -1.f};   /* the tier's experts on COLI_VK_DEV2 */
+/* the tier's extra layers (an MTP head's), whose experts have another size than the
+ * main ones': a pool of their own, so neither leaves holes the other cannot use */
+static VkWPool g_xpool  = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 0, .prio = 0.4f};
 /* Device k's pools take VK_WBLOCK blocks, smaller ones under COLI_VK_DEVICE_CAP_MB. */
 static void vk_pool_blocks(int k) {
     size_t bb = VK_WBLOCK;
     if (g_mem.cap[k]) { bb = (size_t)64 << 10; while ((uint64_t)bb < g_mem.cap[k] / 4096 && bb < VK_WBLOCK) bb <<= 1; }
-    if (k == 0) { g_wpool.p.block_bytes = bb; g_tpool.p.block_bytes = bb; }
+    if (k == 0) { g_wpool.p.block_bytes = bb; g_tpool.p.block_bytes = bb; g_xpool.p.block_bytes = bb; }
     else { g_wpool2.p.block_bytes = bb; g_tpool2.p.block_bytes = bb; }
 }
 static VkDevice pool_device(const VkWPool *P);
@@ -1701,6 +1704,53 @@ size_t coli_vk_import_alignment(void) {
 #endif
 }
 size_t coli_vk_imported_bytes(void) { return __atomic_load_n(&g_import_bytes, __ATOMIC_RELAXED); }
+/* A host range read in place by a shader (the chain's VKC_HOST): the pages around it,
+ * so the caller's allocation need not be aligned; the pages past its ends are the
+ * process's own and are never written. */
+int coli_vk_host_buffer(const void *ptr, size_t bytes, void **buf_out, void **mem_out, size_t *off) {
+#ifdef VK_EXT_external_memory_host
+    size_t al = coli_vk_import_alignment();
+    if (!al || !ptr || !bytes) return 0;
+    uintptr_t p = (uintptr_t)ptr, base = p / al * al, end = (p + bytes + al - 1) / al * al;
+    size_t sz = end - base;
+    if (sz > G.ssbo_range) return 0;
+    static PFN_vkGetMemoryHostPointerPropertiesEXT gp;
+    if (!gp) gp = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(G.dev, "vkGetMemoryHostPointerPropertiesEXT");
+    VkMemoryHostPointerPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (!gp || gp(G.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, (void *)base, &mp) != VK_SUCCESS ||
+        !mp.memoryTypeBits) return 0;
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = sz,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkBuffer b;
+    if (vkCreateBuffer(G.dev, &bi, NULL, &b) != VK_SUCCESS) return 0;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(G.dev, b, &req);
+    uint32_t bits = mp.memoryTypeBits & req.memoryTypeBits, mt = 0;
+    if (!bits || req.size > sz) { vkDestroyBuffer(G.dev, b, NULL); return 0; }
+    while (!(bits & (1u << mt))) mt++;
+    VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = (void *)base};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = sz,
+        .memoryTypeIndex = mt};
+    VkDeviceMemory m;
+    if (vkAllocateMemory(G.dev, &ai, NULL, &m) != VK_SUCCESS) { vkDestroyBuffer(G.dev, b, NULL); return 0; }
+    if (vkBindBufferMemory(G.dev, b, m, 0) != VK_SUCCESS) { vkDestroyBuffer(G.dev, b, NULL); vkFreeMemory(G.dev, m, NULL); return 0; }
+    *buf_out = (void *)b; *mem_out = (void *)m; *off = (size_t)(p - base);
+    __atomic_add_fetch(&g_import_bytes, sz, __ATOMIC_RELAXED);
+    return 1;
+#else
+    (void)ptr; (void)bytes; (void)buf_out; (void)mem_out; (void)off;
+    return 0;
+#endif
+}
+void coli_vk_host_buffer_free(void *buf, void *mem, size_t bytes) {
+    if (!G.dev) return;
+    if (buf) vkDestroyBuffer(G.dev, (VkBuffer)buf, NULL);
+    if (mem) vkFreeMemory(G.dev, (VkDeviceMemory)mem, NULL);
+    if (bytes) __atomic_sub_fetch(&g_import_bytes, bytes, __ATOMIC_RELAXED);
+}
 int coli_vk_tensor_import(ColiVkTensor **tensor, const void *weights, size_t alloc_bytes, const float *scales,
                           int fmt, int I, int O, int gs) {
     if (*tensor) return (*tensor)->fmt == fmt && (*tensor)->I == I && (*tensor)->O == O;
@@ -3261,7 +3311,9 @@ void coli_vk_tensor_free(ColiVkTensor *t) {
     tensor_release(t);
 }
 
-static VkWPool *pool_of(int which) { return which == 1 ? &g_tpool : which == 2 ? &g_wpool2 : which == 3 ? &g_tpool2 : &g_wpool; }
+static VkWPool *pool_of(int which) {
+    return which == 1 ? &g_tpool : which == 2 ? &g_wpool2 : which == 3 ? &g_tpool2 : which == 4 ? &g_xpool : &g_wpool;
+}
 void coli_vk_pool_stats(int which, ColiVkPoolStats *st) {
     VkWPool *P = pool_of(which);
     VkaStats v;
@@ -3289,6 +3341,7 @@ static void tier_pool_limit(VkWPool *P, size_t bytes) {
 }
 void coli_vk_tier_pool_limit(size_t bytes) { tier_pool_limit(&g_tpool, bytes); }
 void coli_vk_tier_pool_limit_dev(int dev, size_t bytes) { tier_pool_limit(dev == 1 ? &g_tpool2 : &g_tpool, bytes); }
+void coli_vk_tier_extra_pool_limit(size_t bytes) { tier_pool_limit(&g_xpool, bytes); }
 
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t) { return t ? t->wbytes : 0; }
 
@@ -4250,6 +4303,15 @@ int coli_vk_tier_tensor(ColiVkTensor **t, int fmt, int I, int O, int gs,
                         uint8_t **rows, size_t *stride, float **scales) {
     return coli_vk_tier_tensor_dev(0, t, fmt, I, O, gs, rows, stride, scales);
 }
+int coli_vk_tier_tensor_extra(ColiVkTensor **t, int fmt, int I, int O, int gs,
+                              uint8_t **rows, size_t *stride, float **scales) {
+    if (!G.ready || !fmt_uploadable(fmt, gs)) return 0;
+    void *w, *s;
+    ColiVkTensor *n = tensor_alloc(&g_xpool, fmt, I, O, gs, &w, &s);
+    if (!n) return 0;
+    *t = n; *rows = w; *stride = (size_t)n->rowWords * 4; *scales = s;
+    return 1;
+}
 /* Staged uploads: the host images of tensors filled in place (coli_vk_tier_tensor) go
  * to their device-local ranges, all of them before this returns, and are freed. Mapped
  * memory: nothing to do. Any thread; the tensors of one call on one device. */
@@ -4310,8 +4372,9 @@ static void place_report(void) {
     if (!u->on) return;
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
-    ColiVkPoolStats w, t;
-    coli_vk_pool_stats(0, &w); coli_vk_pool_stats(1, &t);
+    ColiVkPoolStats w, t, x;
+    coli_vk_pool_stats(0, &w); coli_vk_pool_stats(1, &t); coli_vk_pool_stats(4, &x);
+    t.peak_used += x.peak_used;   /* the expert tier: its extra layers' pool too */
     size_t kv = 0, ln = 0;
     for (int l = 0; l < VK_KV_LAYERS; l++) {
         if (G.kv[l].bl) kv += (size_t)G.kv[l].rows * (G.kv[l].K + G.kv[l].R) * 4;
@@ -4426,6 +4489,7 @@ void coli_vk_shutdown(void) {
     pthread_mutex_unlock(&g_imports_mx);
     pool_destroy(&g_wpool);    /* weight blocks: unmapped/freed with the device */
     pool_destroy(&g_tpool);
+    pool_destroy(&g_xpool);
     if (PW.buf) { vkDestroyBuffer(G.dev, PW.buf, NULL); vkFreeMemory(G.dev, PW.mem, NULL); }
     free(PW.cp);
     memset(&PW, 0, sizeof PW);
@@ -4473,6 +4537,69 @@ int coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *o) {
 }
 /* A fence the chain waited on failed: the device is gone, everyone falls back. */
 void coli_vk_mark_lost(void) { G.ready = 0; }
+
+/* ---- the dense chain on either device (vk_chain.c keeps a context per device) --------
+ * d = 0 is the primary device, what the calls without _dev answer; d = 1 is COLI_VK_DEV2's
+ * (G2), which until now held only routed experts. The chain's layers on it run the same
+ * shaders: the core below is G2's, with the primary's GEMM tiles (a tile is a speed
+ * choice; every tile computes the same bits). */
+int coli_vk_core_dev(int d, ColiVkCore *o) {
+    if (d == 0) return coli_vk_core(o);
+    if (d != 1 || !G2.ready || !G.ready || !o) return 0;
+    if (!coli_vk_core(o)) return 0;   /* the tiles, the shader path: the primary's */
+    o->phys = (void *)G2.phys; o->device = (void *)G2.dev; o->queue = (void *)G2.queue; o->qfam = G2.qfam;
+    o->memtype_host = g_up[1].on ? g_up[1].mt_stage : G2.memtype;
+    o->memtype_cached = G2.memtype_cached; o->memtype_dev = G2.memtype_dev;
+    o->ssbo_align = G2.ssbo_align; o->ssbo_range = G2.ssbo_range;
+    o->has_prio = 0;
+    o->integrated = G2.integrated; o->shares_ram = G2.shares_ram;
+    return 1;
+}
+int coli_vk_available_dev(int d) { return d == 1 ? G2.ready : G.ready; }
+void coli_vk_mark_lost_dev(int d) { if (d == 1) G2.ready = 0; else G.ready = 0; }
+int coli_vk_queue_submit_dev(int d, void *queue, const void *submit_info, void *fence) {
+    return (int)vk_submit(d == 1 ? 1 : 0, (VkQueue)queue, (const VkSubmitInfo *)submit_info, (VkFence)fence);
+}
+int coli_vk_tensor_info_dev(const ColiVkTensor *t, ColiVkTensorInfo *o, int *dev) {
+    if (!t || !o || t->dev < 0 || t->dev > 1) return 0;
+    o->wbuf = (void *)t->wbuf; o->sbuf = (void *)t->sbuf;
+    o->fmt = t->fmt; o->I = t->I; o->O = t->O; o->rowWords = t->rowWords; o->gs = t->gs;
+    if (dev) *dev = t->dev;
+    return 1;
+}
+int coli_vk_mem_budget_dev(int d, double *used_gb, double *budget_gb) {
+    return d == 1 ? coli_vk_mem_budget2(used_gb, budget_gb) : coli_vk_mem_budget(used_gb, budget_gb);
+}
+size_t coli_vk_device_used_dev(int d) { return (size_t)__atomic_load_n(&g_mem.used[d == 1 ? 1 : 0], __ATOMIC_RELAXED); }
+size_t coli_vk_device_local_bytes_dev(int d) {
+    if (d != 1) return coli_vk_device_local_bytes();
+    if (!G2.phys) return 0;
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(G2.phys, &mp);
+    VkDeviceSize m = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+        if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > m) m = mp.memoryHeaps[i].size;
+    if (g_mem.cap[1] && g_mem.cap[1] < m) m = g_mem.cap[1];   /* COLI_VK_DEVICE_CAP_MB */
+    return (size_t)m;
+}
+size_t coli_vk_free_bytes_dev(int d) {
+    if (d != 1) return coli_vk_free_bytes();
+    if (!G2.phys) return 0;
+    if (g_mem.cap[1]) return (size_t)vk_mem_room(1);
+    double used = 0, bud = 0;
+    if (coli_vk_mem_budget2(&used, &bud)) return bud > used ? (size_t)((bud - used) * 1e9) : 0;
+    size_t dl = coli_vk_device_local_bytes_dev(1), u = coli_vk_device_used_dev(1);
+    return dl > u ? dl - u : 0;
+}
+void coli_vk_mem_info_dev(int d, size_t *used, size_t *count) {
+    if (d != 1) { coli_vk_mem_info(used, count); return; }
+    if (used) *used = (size_t)__atomic_load_n(&g_wpool2.bytes, __ATOMIC_RELAXED);
+    if (count) *count = (size_t)__atomic_load_n(&g_wpool2.tensors, __ATOMIC_RELAXED);
+}
+size_t coli_vk_buffer_alignment_dev(int d) {
+    if (d != 1) return coli_vk_buffer_alignment();
+    return G2.buf_align ? G2.buf_align : 256;
+}
 /* The chain's submits: through the lock the staged uploader takes on a shared queue. */
 int coli_vk_queue_submit(void *queue, const void *submit_info, void *fence) {
     return (int)vk_submit(0, (VkQueue)queue, (const VkSubmitInfo *)submit_info, (VkFence)fence);

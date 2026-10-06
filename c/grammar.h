@@ -40,6 +40,11 @@
 #define GR_MAX_RULES  1024
 #define GR_MAX_STACKS 64      /* ambiguita' massima seguita in parallelo */
 #define GR_MAX_DEPTH  64      /* profondita' massima di uno stack del PDA */
+/* A frame keeps its alternate and its symbol in 16 bits (GrFrame): a rule with more
+ * alternates, or an alternate with more symbols, is refused when the grammar is read,
+ * not wrapped to a negative index when it is walked. */
+#define GR_MAX_ALTS   32767
+#define GR_MAX_SYMS   32767
 
 typedef struct { uint8_t bits[32]; } GrCls;              /* insieme di byte ammessi */
 enum { GR_CLS = 0, GR_REF = 1 };
@@ -57,6 +62,7 @@ typedef struct { Grammar *G; GrStack st[GR_MAX_STACKS]; int n; int alive; } GrSt
 
 static int gr__alt_new(Grammar *G, int ri){
     GrRule *R=&G->r[ri];
+    if(R->n>=GR_MAX_ALTS){ snprintf(G->err,sizeof G->err,"a rule has more than %d alternates",GR_MAX_ALTS); return -1; }
     if(R->n==R->cap){ int nc=R->cap?R->cap*2:4;
         GrAlt *na=(GrAlt*)realloc(R->a,(size_t)nc*sizeof(GrAlt)); if(!na) return -1;
         R->a=na; R->cap=nc; }
@@ -65,6 +71,7 @@ static int gr__alt_new(Grammar *G, int ri){
 }
 static int gr__push(Grammar *G, int ri, int ai, const GrSym *sy){
     GrAlt *A=&G->r[ri].a[ai];
+    if(A->n>=GR_MAX_SYMS){ snprintf(G->err,sizeof G->err,"an alternate has more than %d symbols",GR_MAX_SYMS); return -1; }
     if(A->n==A->cap){ int nc=A->cap?A->cap*2:8;
         GrSym *ns=(GrSym*)realloc(A->s,(size_t)nc*sizeof(GrSym)); if(!ns) return -1;
         A->s=ns; A->cap=nc; }
@@ -127,7 +134,7 @@ static int gr__lit(Grammar *G, int ri, int ai, const char **pp){
             if(b<0){ snprintf(G->err,sizeof G->err,"invalid escape in literal"); return -1; } }
         else b=(unsigned char)*p++;
         GrSym s; memset(&s,0,sizeof s); s.t=GR_CLS; s.c.bits[b>>3]|=(uint8_t)(1u<<(b&7));
-        if(gr__push(G,ri,ai,&s)){ snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
+        if(gr__push(G,ri,ai,&s)){ if(!G->err[0]) snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
     }
     if(*p!='"'){ snprintf(G->err,sizeof G->err,"unterminated literal"); return -1; }
     *pp=p+1; return 0;
@@ -154,7 +161,7 @@ static int gr__cls(Grammar *G, int ri, int ai, const char **pp){
     if(*p!=']'){ snprintf(G->err,sizeof G->err,"unterminated character class"); return -1; }
     if(neg) for(int i=0;i<32;i++) s.c.bits[i]=(uint8_t)~s.c.bits[i];
     *pp=p+1;
-    if(gr__push(G,ri,ai,&s)){ snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
+    if(gr__push(G,ri,ai,&s)){ if(!G->err[0]) snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
     return 0;
 }
 /* postfisso ? * + sull'ITEM appena letto (simboli [n0, n) dell'alternate corrente).
@@ -179,14 +186,14 @@ static int gr__postfix(Grammar *G, int ri, int ai, int n0, char op){
     if(gr__push(G,ri,ai,&R)) goto full;                   /* l'item nell'alternate diventa R */
     return 0;
 full:
-    snprintf(G->err,sizeof G->err,"grammar is too large");
+    if(!G->err[0]) snprintf(G->err,sizeof G->err,"grammar is too large");
     return -1;
 }
 static int gr__alts(Grammar *G, int ri, const char **pp, int depth, int in_group){
     if(depth>32){ snprintf(G->err,sizeof G->err,"groups are nested too deeply"); return -1; }
     const char *p=*pp;
     int ai=gr__alt_new(G,ri);
-    if(ai<0){ snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
+    if(ai<0){ if(!G->err[0]) snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
     for(;;){
         p=gr__ws(p);
         if(!*p){
@@ -200,7 +207,7 @@ static int gr__alts(Grammar *G, int ri, const char **pp, int depth, int in_group
         if(*p=='|'){
             p++;
             ai=gr__alt_new(G,ri);
-            if(ai<0){ snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
+            if(ai<0){ if(!G->err[0]) snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
             continue;
         }
         int n0=G->r[ri].a[ai].n;
@@ -217,7 +224,7 @@ static int gr__alts(Grammar *G, int ri, const char **pp, int depth, int in_group
             if(*p!=')'){ snprintf(G->err,sizeof G->err,"missing ')'"); return -1; }
             p++;
             GrSym s; memset(&s,0,sizeof s); s.t=GR_REF; s.ref=(int16_t)gi;
-            if(gr__push(G,ri,ai,&s)){ snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
+            if(gr__push(G,ri,ai,&s)){ if(!G->err[0]) snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
         } else if(gr__idch(*p)){
             int nl=gr__idlen(p);
             const char *after=gr__ws(p+nl);
@@ -226,7 +233,7 @@ static int gr__alts(Grammar *G, int ri, const char **pp, int depth, int in_group
             if(ref<0){ snprintf(G->err,sizeof G->err,"too many rules"); return -1; }
             p+=nl;
             GrSym s; memset(&s,0,sizeof s); s.t=GR_REF; s.ref=(int16_t)ref;
-            if(gr__push(G,ri,ai,&s)){ snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
+            if(gr__push(G,ri,ai,&s)){ if(!G->err[0]) snprintf(G->err,sizeof G->err,"out of memory"); return -1; }
         } else {
             snprintf(G->err,sizeof G->err,"unexpected character '%c'",*p); return -1;
         }
@@ -236,8 +243,8 @@ static int gr__alts(Grammar *G, int ri, const char **pp, int depth, int in_group
     *pp=p;
     return 0;
 }
-/* parse del testo GBNF. 0 = ok; -1 = errore (messaggio in G->err). */
-static int gr_parse(Grammar *G, const char *src){
+static void gr_free(Grammar *G);
+static int gr__parse(Grammar *G, const char *src){
     memset(G,0,sizeof *G); G->root=-1;
     const char *p=src;
     for(;;){
@@ -261,6 +268,19 @@ static int gr_parse(Grammar *G, const char *src){
     if(G->root<0){ snprintf(G->err,sizeof G->err,"missing 'root' rule"); return -1; }
     return 0;
 }
+
+/* parse del testo GBNF. 0 = ok; -1 = errore (messaggio in G->err), e quello che il parse
+ * aveva costruito liberato: una grammatica rifiutata non resta in memoria (il motore ne
+ * legge una per richiesta). */
+static int gr_parse(Grammar *G, const char *src){
+    if(!gr__parse(G,src)) return 0;
+    char err[sizeof G->err];
+    memcpy(err,G->err,sizeof err);
+    gr_free(G);
+    memcpy(G->err,err,sizeof err);
+    return -1;
+}
+
 static void gr_free(Grammar *G){
     for(int i=0;i<G->n;i++){
         for(int a=0;a<G->r[i].n;a++) free(G->r[i].a[a].s);

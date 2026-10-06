@@ -77,7 +77,16 @@
  * layer without an indexer) pass the attention's 3072 entries, and for a model its
  * shaders do not take: head_dim above 1024, an indexer head that is not a power of two
  * (the Hadamard transform) or above 4096 floats, a top-k above 4096, more than 8
- * streams. */
+ * streams.
+ *
+ * Layers on two devices (docs/vulkan.md, "Layers on two devices"): with COLI_VK_DEV2 a
+ * second chain takes the layers after the primary's on that device (its own fit from
+ * layer N, COLI_VK_CHAIN_LAYERS2; its own copies of their matrices, in a table of their
+ * own: the per-matrix path's map stays the primary's); the head stays on the host. A
+ * layer reads only its own state, so only the streams cross: a forward runs the
+ * primary's layers, then the second device's from the streams it hands over. A second
+ * device that is lost, or declines a forward, leaves the CPU to run its layers from
+ * there (the host's state is current: nothing to rebuild); lost, both chains go off. */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 
@@ -97,7 +106,8 @@ typedef struct {
 typedef struct {
     int ok, failed, told;
     ColiV4Engine *engine;
-    int Lm;                                     /* the model's layers; L below: the chain's, its first L */
+    int Lm;                                     /* the model's layers; lo..L-1 below: the chain's (the primary: its first L) */
+    int lo, d;                                  /* its first layer, its device (vkc_device) */
     int L, D, H, HD, nm, hr, nh, hd, rd, QL, og, ol, gw, W, Wd, IH, ID, I, K, rmax, rows, nkind;
     int kratio[COLI_V4_MAX_LAYERS + 1];          /* the ratio of each list kind (0: the indexer's) */
     V4cLayer *ly;
@@ -120,6 +130,41 @@ typedef struct {
 static V4Chain *g_v4c;
 static int g_v4c_mode = 0;                      /* COLI_VK_CHAIN as decided */
 static int g_v4c_inited = 0;
+/* the second device's chain (layers g_v4c_fit.n..) and its fit */
+static V4Chain *g_v4c2;
+static VkcFit g_v4c_fit2;
+static int g_v4c_fit2_on;
+static V4Chain *v4c_of(int d) { return d ? g_v4c2 : g_v4c; }
+static const char *v4c_name(const V4Chain *ch) { return ch && ch->d ? "deepseek_v4 dev2" : "deepseek_v4"; }
+static int v4c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
+/* The second device's copies, by their host data (the per-matrix path's map is the
+ * primary's): an open table, grown at half full. */
+typedef struct { const void *k; ColiVkTensor *t; } V4cD2;
+static V4cD2 *g_v4c_d2;
+static size_t g_v4c_d2cap, g_v4c_d2n;
+static ColiVkTensor **v4c_d2_slot(const void *k) {
+    if ((g_v4c_d2n + 1) * 2 > g_v4c_d2cap) {
+        size_t nc = g_v4c_d2cap ? g_v4c_d2cap * 2 : 256;
+        V4cD2 *nt = calloc(nc, sizeof *nt);
+        if (!nt) return NULL;
+        for (size_t i = 0; i < g_v4c_d2cap; i++) {
+            if (!g_v4c_d2[i].k) continue;
+            size_t h = ((uintptr_t)g_v4c_d2[i].k >> 4) & (nc - 1);
+            while (nt[h].k) h = (h + 1) & (nc - 1);
+            nt[h] = g_v4c_d2[i];
+        }
+        free(g_v4c_d2); g_v4c_d2 = nt; g_v4c_d2cap = nc;
+    }
+    size_t h = ((uintptr_t)k >> 4) & (g_v4c_d2cap - 1);
+    while (g_v4c_d2[h].k && g_v4c_d2[h].k != k) h = (h + 1) & (g_v4c_d2cap - 1);
+    if (!g_v4c_d2[h].k) { g_v4c_d2[h].k = k; g_v4c_d2n++; }
+    return &g_v4c_d2[h].t;
+}
+static void v4c_d2_forget(ColiVkTensor *t) {   /* its copy freed; the key stays, empty */
+    if (!t) return;
+    for (size_t i = 0; i < g_v4c_d2cap; i++) if (g_v4c_d2[i].t == t) g_v4c_d2[i].t = NULL;
+    coli_vk_tensor_free(t);
+}
 
 /* Rows per chunk with COLI_VK_CHAIN_ROWS set (or V4_PREFILL_CHUNK): the CPU's prefill
  * chunk (V4_PREFILL_CHUNK, 128 at most), so the host's MoE sees the batches the CPU block
@@ -156,13 +201,21 @@ static const void *v4c_val(const ColiDeepSeekV4LayerWeights *w, const char *suff
 static ColiVkTensor *v4c_tensor(int fmt, const void *data, const float *scales, int rows8, int rows, int columns) {
     if (!g_v4_vk_ready || !data || rows < 1 || columns < 1) return NULL;
     if (fmt == 12 && (!scales || columns % 128 || (rows8 && rows % 8))) return NULL;
-    V4VkEntry *e = v4_vk_find(data, fmt, rows, columns);
-    if (e && e->tensor) return e->tensor;
-    if (e && e->refused) return NULL;
+    int d2 = vkc_device_now();   /* the second device's chain: its own copy there */
+    ColiVkTensor **slot = NULL;
+    V4VkEntry *e = NULL;
+    if (d2) {
+        if (!(slot = v4c_d2_slot(data))) return NULL;
+        if (*slot) return *slot;
+    } else {
+        e = v4_vk_find(data, fmt, rows, columns);
+        if (e && e->tensor) return e->tensor;
+        if (e && e->refused) return NULL;
+    }
     size_t bytes = (size_t)rows * columns * (fmt == 10 ? 4 : fmt == 11 ? 2 : 1);
     if (!v4_vk_resident(data, bytes)) return NULL;
     coli_v4_vk_host_ensure(data);   /* a view the placement did not make (device only): its rows back first */
-    if (!e && !(e = v4_vk_insert(data, fmt, rows, columns))) return NULL;
+    if (!d2 && !e && !(e = v4_vk_insert(data, fmt, rows, columns))) return NULL;
     const unsigned char *weights = data;
     unsigned char *unpacked = NULL;
     float *expanded = NULL;
@@ -181,6 +234,11 @@ static ColiVkTensor *v4c_tensor(int fmt, const void *data, const float *scales, 
                         unpacked[((size_t)tile * 8 + lane) * columns + column] = packed[((size_t)tile * columns + column) * 8 + lane];
             weights = unpacked;
         }
+    }
+    if (d2) {
+        int ok = coli_vk_tensor_ensure2(slot, weights, expanded, fmt, columns, rows, fmt == 12 ? 128 : 0);
+        free(unpacked); free(expanded);
+        return ok ? *slot : NULL;
     }
     int ok = coli_vk_tensor_ensure(&e->tensor, weights, expanded, fmt, columns, rows, fmt == 12 ? 128 : 0);
     free(unpacked); free(expanded);
@@ -213,12 +271,11 @@ static ColiVkTensor *v4c_plain(const ColiDeepSeekV4LayerWeights *w, const char *
 }
 
 /* ---- the host's writes: the device's copies follow ------------------------------------- */
-static void v4c_lower(int pos) {
-    V4Chain *ch = g_v4c;
+static void v4c_lower_one(V4Chain *ch, int pos) {
     if (!ch || !ch->ok) return;
     if (pos < 0) pos = 0;
     if (ch->win_valid > pos) ch->win_valid = pos;
-    for (int i = 0; i < ch->L; i++) {
+    for (int i = ch->lo; i < ch->L; i++) {
         V4cLayer *ly = &ch->ly[i];
         if (ly->ratio > 0 && ly->kv_valid > pos / ly->ratio) ly->kv_valid = pos / ly->ratio;
         if (ly->ratio > 0 && ch->sli[i] >= 0) vkc_kv_lower(&ch->ks, ch->sli[i], pos / ly->ratio);
@@ -227,6 +284,7 @@ static void v4c_lower(int pos) {
     }
     ch->E = -1;
 }
+static void v4c_lower(int pos) { for (int d = 0; d < 2; d++) v4c_lower_one(v4c_of(d), pos); }   /* both chains */
 static void v4c_cpu_step(int start) { v4c_lower(start); }     /* a CPU forward from start */
 static void v4c_restored(int pos) { v4c_lower(pos); }         /* the state restored to pos, the rows before it kept */
 static void v4c_reset(void) { v4c_lower(0); }                 /* a reset, or a state from elsewhere */
@@ -253,12 +311,12 @@ static const char *v4c_unsupported(const ColiDeepSeekV4Config *c) {
 static VkcFit g_v4c_fit;
 static int g_v4c_fit_done, g_v4c_building;
 
-/* The chain's geometry for its first L layers (nothing allocated): the per-layer kinds,
+/* The chain's geometry for its layers lo..L-1 (nothing allocated): the per-layer kinds,
  * the split's tables, the list kinds. Pointers are left alone, so it runs again when a
  * layer that did not reach the device lowers L. */
-static void v4c_geom(V4Chain *ch, ColiV4Engine *engine, int L) {
+static void v4c_geom(V4Chain *ch, ColiV4Engine *engine, int lo, int L) {
     const ColiDeepSeekV4Config *c = &engine->config;
-    ch->engine = engine; ch->Lm = c->num_hidden_layers; ch->L = L;
+    ch->engine = engine; ch->Lm = c->num_hidden_layers; ch->lo = lo; ch->L = L;
     ch->D = c->hidden_size; ch->H = c->hc_mult; ch->HD = ch->H * ch->D;
     ch->nm = (2 + ch->H) * ch->H; ch->hr = 2 * ch->H + ch->H * ch->H;
     ch->nh = c->num_attention_heads; ch->hd = c->head_dim; ch->rd = c->qk_rope_head_dim; ch->QL = c->q_lora_rank;
@@ -266,7 +324,8 @@ static void v4c_geom(V4Chain *ch, ColiV4Engine *engine, int L) {
     ch->W = c->sliding_window;
     ch->IH = c->index_n_heads > 0 ? c->index_n_heads : 1; ch->ID = c->index_head_dim > 0 ? c->index_head_dim : 2;
     ch->I = c->moe_intermediate_size; ch->rmax = 1; ch->nkind = 1; ch->nsl = 0; ch->rmin = 0;
-    for (int i = 0; i < L; i++) {
+    for (int i = 0; i < ch->Lm; i++) ch->sli[i] = -1;
+    for (int i = lo; i < L; i++) {
         V4cLayer *ly = &ch->ly[i];
         ly->ratio = c->compress_ratios[i]; ly->idx = ly->ratio == 4; ly->kind = 0;
         if (ly->ratio > ch->rmax) ch->rmax = ly->ratio;
@@ -285,7 +344,7 @@ static void v4c_geom(V4Chain *ch, ColiV4Engine *engine, int L) {
  * hc scales and bases, the rings' biases. Returns its floats. */
 static size_t v4c_offsets(V4Chain *ch) {
     size_t n = 0;
-    for (int i = 0; i < ch->L; i++) {
+    for (int i = ch->lo; i < ch->L; i++) {
         V4cLayer *ly = &ch->ly[i];
         ly->o_an = n; n += ch->D; ly->o_fn = n; n += ch->D; ly->o_qn = n; n += ch->QL; ly->o_kn = n; n += ch->hd;
         ly->o_sink = n; n += ch->nh; ly->o_hca = n; n += 3 + ch->nm; ly->o_hcf = n; n += 3 + ch->nm;
@@ -342,7 +401,7 @@ static int v4c_scratch(V4Chain *ch, int rows, int E, int LR);
 static size_t v4c_fixed_bytes(V4Chain *ch, int rows) {
     const ColiDeepSeekV4Config *c = &ch->engine->config;
     int E = ch->W + rows, K = 0;
-    for (int i = 0; i < ch->L; i++) {
+    for (int i = ch->lo; i < ch->L; i++) {
         V4cLayer *ly = &ch->ly[i];
         int k = ly->idx ? c->index_topk : ly->ratio > 0 ? E / ly->ratio : 0;
         if (k > K) K = k;
@@ -376,10 +435,26 @@ static int v4c_fit_now(ColiV4Engine *engine) {
     size_t *per = calloc((size_t)L, sizeof(size_t)), *mat = calloc((size_t)L, sizeof(size_t));
     int ok = t.ly && t.sli && per && mat;
     if (ok) {
-        v4c_geom(&t, engine, L);
+        v4c_geom(&t, engine, 0, L);
         int rows = v4c_rows();
         for (int i = 0; i < L; i++) per[i] = v4c_layer_bytes(&t, i, rows, &mat[i]);
-        vkc_fit("deepseek_v4", L, per, mat, v4c_fixed_bytes(&t, rows), v4c_tail_bytes(engine), &g_v4c_fit);
+        size_t fixed = v4c_fixed_bytes(&t, rows);
+        vkc_fit("deepseek_v4", L, per, mat, fixed, v4c_tail_bytes(engine), &g_v4c_fit);
+        /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from
+         * layer n0 (the head stays on the host), with that device's free memory, its
+         * pipelines up now */
+        int n0 = g_v4c_fit.n;
+        if (vkc_fit_partial(&g_v4c_fit) && n0 > 0 && n0 < L && v4c_dev2_wanted() && getenv("COLI_VK_DEV2") &&
+            coli_vk_dev2_open_env()) {
+            vkc_device(1);
+            int n2 = vkc_fit("deepseek_v4 dev2", L - n0, per + n0, mat + n0, fixed, 0, &g_v4c_fit2);
+            if (n2 > 0 && !(vkc_init() && vkc_mla_ready() && vkc_mhc_ready() && vkc_dsv4_ready())) {
+                fprintf(stderr, "[VK] deepseek_v4 chain: the second device's pipelines did not come up; its layers stay on the CPU\n");
+                n2 = 0;
+            }
+            g_v4c_fit2_on = n2 > 0;
+            vkc_device(0);
+        }
     }
     free(t.ly); free(t.sli); free(per); free(mat);
     return ok;
@@ -422,8 +497,9 @@ static void v4c_layer_free(V4Chain *ch, int i) {
     if (vkc_ready()) vkc_finish();
     ColiVkTensor **ts[] = {&ly->fna, &ly->fnf, &ly->wq_a, &ly->wq_b, &ly->wkv, &ly->wo_b, &ly->sh1, &ly->sh2, &ly->sh3,
                            &ly->cwkv, &ly->cwg, &ly->iwkv, &ly->iwg, &ly->iwq, &ly->iwp};
-    for (size_t k = 0; k < sizeof ts / sizeof *ts; k++) { v4_vk_forget(*ts[k]); *ts[k] = NULL; }
-    for (int g = 0; ly->wo_a && g < ch->og; g++) v4_vk_forget(ly->wo_a[g]);
+    void (*forget)(ColiVkTensor *) = ch->d ? v4c_d2_forget : v4_vk_forget;   /* the second device's: its own */
+    for (size_t k = 0; k < sizeof ts / sizeof *ts; k++) { forget(*ts[k]); *ts[k] = NULL; }
+    for (int g = 0; ly->wo_a && g < ch->og; g++) forget(ly->wo_a[g]);
     free(ly->wo_a); ly->wo_a = NULL;
     VkcBuf **bs[] = {&ly->win, &ly->ckv, &ly->ring, &ly->ikey, &ly->iring};
     for (size_t k = 0; k < sizeof bs / sizeof *bs; k++) { vkc_free(*bs[k]); *bs[k] = NULL; }
@@ -435,6 +511,7 @@ static void v4c_layer_free(V4Chain *ch, int i) {
 static void v4c_cut(V4Chain *ch, int i, const char *why) {
     ColiV4Engine *e = ch->engine;
     if (i < ch->L) ch->L = i;
+    if (ch->d) { vkc_fit_shrink("deepseek_v4 dev2", &g_v4c_fit2, i - ch->lo, why); return; }
     if (e->dense_resident.device_only && e->dense_resident.device_layers > i) {
         fprintf(stderr, "[VK] deepseek_v4: layers %d to %d keep their host copies after all (the RAM plan had counted "
                         "them on the device)\n", i, e->dense_resident.device_layers - 1);
@@ -466,33 +543,48 @@ static void v4c_drop_layer(int layer, const char *why) {
 /* Every chained layer off the device and the chain off (a layer that would not load, the
  * parameters refused): what the device held alone comes back from disk when the CPU asks. */
 static void v4c_teardown(V4Chain *ch, const char *why) {
-    for (int i = 0; i < ch->L; i++) if (ch->ly[i].built) v4c_layer_free(ch, i);
+    for (int i = ch->lo; i < ch->L; i++) if (ch->ly[i].built) v4c_layer_free(ch, i);
     vkc_free(ch->prm); ch->prm = NULL;
-    v4c_cut(ch, 0, why);
+    v4c_cut(ch, ch->lo, why);
 }
 
-static int v4c_setup(ColiV4Engine *engine) {
+/* d = 1: the second device's chain, its layers from g_v4c_fit.n (device 1 current; the
+ * primary's setup loaded every resident layer). */
+static int v4c_setup_dev(ColiV4Engine *engine, int d) {
     const ColiDeepSeekV4Config *c = &engine->config;
     const char *why = v4c_unsupported(c);
     if (!why && !engine->runtime.dense_resident) why = "the dense layers are not resident (a low-memory plan reloads them per forward)";
     if (!why && (engine->gpu.enabled || (engine->experts && engine->experts->gpu))) why = "the CUDA tier is on and keeps its place";
     if (why) { fprintf(stderr, "[VK] deepseek_v4 chain: %s; the CPU runs the layers\n", why); return 0; }
-    int L = c->num_hidden_layers, N = g_v4c_fit.n;
+    int L = c->num_hidden_layers, N = d ? g_v4c_fit2.n : g_v4c_fit.n, lo = d ? g_v4c_fit.n : 0;
+    VkcFit *fit = d ? &g_v4c_fit2 : &g_v4c_fit;
+    const char *nmc = d ? "deepseek_v4 dev2" : "deepseek_v4";
     if (N < 1) return 0;                            /* the fit's line said so: the chain stays off */
     V4Chain *ch = calloc(1, sizeof *ch);
     if (!ch || !(ch->ly = calloc((size_t)L, sizeof *ch->ly)) || !(ch->sli = malloc((size_t)L * sizeof(int)))) {
         if (ch) free(ch->ly);
         free(ch); return 0;
     }
-    g_v4c = ch;
-    v4c_geom(ch, engine, N);
+    ch->d = d;
+    if (d) g_v4c2 = ch; else g_v4c = ch;
+    v4c_geom(ch, engine, lo, lo + N);
     ch->Wd = ch->W + v4c_rows(); ch->E = -1;
     if (!(ch->slot_pos = malloc((size_t)ch->Wd * sizeof(int)))) return 0;
     for (int k = 0; k < ch->Wd; k++) ch->slot_pos[k] = -1;
     size_t n = v4c_offsets(ch);
     if (!(ch->prm = vkc_buf((n ? n : 1) * sizeof(float), VKC_DEV))) {
-        v4c_cut(ch, 0, "device memory for the parameters refused");
+        v4c_cut(ch, lo, vkc_lost() ? "the device was lost" : "device memory for the parameters refused");
+        if (d) vkc_fit_placed(nmc, fit);
         return 0;
+    }
+    if (d) {   /* its layers' matrices and state, each whole or the chain stops before it */
+        for (int i = lo; i < ch->L; i++) {
+            if (v4c_layer_up(ch, i, &why)) { ch->ly[i].built = 1; vkc_fit_mark(fit, i - lo); continue; }
+            v4c_layer_free(ch, i);
+            v4c_cut(ch, i, vkc_lost() ? "the device was lost" : why);
+        }
+        if (ch->L <= lo) { vkc_free(ch->prm); ch->prm = NULL; vkc_fit_placed(nmc, fit); return 0; }
+        goto params;
     }
     /* the resident layers, loaded now; each chained one goes up whole (with the dense
      * weights on the device only, in its placement), or the chain stops before it */
@@ -516,10 +608,11 @@ static int v4c_setup(ColiV4Engine *engine) {
         vkc_fit_placed("deepseek_v4", &g_v4c_fit);
         return 0;
     }
-    v4c_geom(ch, engine, ch->L);                    /* the split's tables and list kinds for the layers it kept */
+params:
+    v4c_geom(ch, engine, lo, ch->L);                /* the split's tables and list kinds for the layers it kept */
     float *a = calloc(n ? n : 1, sizeof(float));
     int ok = a != NULL;
-    for (int i = 0; ok && i < ch->L; i++) {
+    for (int i = lo; ok && i < ch->L; i++) {
         V4cLayer *ly = &ch->ly[i];
         const ColiDeepSeekV4LayerWeights *w = &engine->dense_resident.layers[i];
         int D = ch->D, nm = ch->nm;
@@ -554,22 +647,26 @@ static int v4c_setup(ColiV4Engine *engine) {
     ok = ok && vkc_begin() && vkc_write(ch->prm, 0, a, n * sizeof(float)) && vkc_submit(1);
     free(a);
     if (!ok) {
-        fprintf(stderr, "[VK] deepseek_v4 chain: the parameters did not reach the device; the CPU runs the layers\n");
-        v4c_teardown(ch, "the parameters did not reach it");
-        vkc_fit_placed("deepseek_v4", &g_v4c_fit);
+        if (!d) fprintf(stderr, "[VK] deepseek_v4 chain: the parameters did not reach the device; the CPU runs the layers\n");
+        v4c_teardown(ch, vkc_lost() ? "the device was lost" : "the parameters did not reach it");
+        vkc_fit_placed(nmc, fit);
         return 0;
     }
     ch->ok = 1;
     int ncomp = 0, nidx = 0;
-    for (int i = 0; i < ch->L; i++) { ncomp += ch->ly[i].ratio > 0; nidx += ch->ly[i].idx; }
+    for (int i = lo; i < ch->L; i++) { ncomp += ch->ly[i].ratio > 0; nidx += ch->ly[i].idx; }
     size_t bytes = 0, tensors = 0;
-    coli_vk_mem_info(&bytes, &tensors);
-    fprintf(stderr, "[VK] deepseek_v4 chain: %d layers on the device (%d compressing, %d indexing), %d streams, "
-                    "%.1f MiB of parameters, %zu matrices (%.1f MiB) on the device\n",
-            ch->L, ncomp, nidx, ch->H, n * 4 / 1048576.0, tensors, bytes / 1048576.0);
-    vkc_fit_placed("deepseek_v4", &g_v4c_fit);
+    coli_vk_mem_info_dev(d, &bytes, &tensors);
+    if (d) fprintf(stderr, "[VK] deepseek_v4 chain: layers %d..%d on the second device (%d compressing, %d indexing), %d streams, "
+                           "%.1f MiB of parameters, %zu matrices (%.1f MiB) there\n",
+                   lo, ch->L - 1, ncomp, nidx, ch->H, n * 4 / 1048576.0, tensors, bytes / 1048576.0);
+    else fprintf(stderr, "[VK] deepseek_v4 chain: %d layers on the device (%d compressing, %d indexing), %d streams, "
+                         "%.1f MiB of parameters, %zu matrices (%.1f MiB) on the device\n",
+                 ch->L, ncomp, nidx, ch->H, n * 4 / 1048576.0, tensors, bytes / 1048576.0);
+    vkc_fit_placed(nmc, fit);
     return 1;
 }
+static int v4c_setup(ColiV4Engine *engine) { return v4c_setup_dev(engine, 0); }
 
 /* room on the device for `rows` compressed rows (and keys) of layer i; growing drops them */
 static int v4c_cache(V4Chain *ch, V4cLayer *ly, int rows) {
@@ -601,10 +698,10 @@ static int v4c_chunk_rows(V4Chain *ch, int E, int LR) {
     g_v4c_count = 0; v4c_scratch(ch, 2, E, LR); long long b2 = g_v4c_count;
     g_v4c_count = -1; ch->wcap = wcap;
     const ColiDeepSeekV4Config *c = &ch->engine->config;
-    size_t row = (size_t)(b2 - b1) + (size_t)ch->L * ch->hd * sizeof(float) +
+    size_t row = (size_t)(b2 - b1) + (size_t)(ch->L - ch->lo) * ch->hd * sizeof(float) +
                  (size_t)(2 * c->num_experts_per_tok + 1) * ch->D * sizeof(float);
     if (ch->ks.on) row += (size_t)LR * sizeof(int);
-    return vkc_chunk_rows("deepseek_v4", row);
+    return vkc_chunk_rows(v4c_name(ch), row);
 }
 /* The window rings for chunks of `rows`: W + rows rows each; rings that grow are
  * mirrored again (every slot stale). */
@@ -615,7 +712,7 @@ static int v4c_grow_win(V4Chain *ch, int rows) {
     if (!sp) return 0;
     ch->slot_pos = sp;
     for (int k = 0; k < Wd; k++) sp[k] = -1;
-    for (int i = 0; i < ch->L; i++) {
+    for (int i = ch->lo; i < ch->L; i++) {
         vkc_free(ch->ly[i].win);
         if (!(ch->ly[i].win = vkc_buf((size_t)Wd * ch->hd * sizeof(float), VKC_DEV))) return 0;
     }
@@ -629,7 +726,7 @@ static int v4c_plan(V4Chain *ch, int E) {
     if (!ch->nsl || ch->ks.on) return 1;
     int grow = !ch->planned, tcap = 1, hd = ch->hd;
     size_t need = 0, held = 0;
-    for (int i = 0; i < ch->L; i++) {
+    for (int i = ch->lo; i < ch->L; i++) {
         V4cLayer *ly = &ch->ly[i];
         if (ly->ratio <= 0) continue;
         int want = E / ly->ratio + 1, cap = ly->ccap, host = ch->engine->config.max_position_embeddings / ly->ratio + 1;
@@ -642,8 +739,8 @@ static int v4c_plan(V4Chain *ch, int E) {
     ch->planned = 1;
     /* a window over recent slots, with optional read-based pins; the forward's
      * chunks shrink to what the window takes (v4c_forward) */
-    if (vkc_kv_plan_need(&ch->ks, "deepseek_v4", ch->nsl, (size_t)hd * sizeof(float), tcap, 1, 1, held, need) != 2) return 1;
-    for (int i = 0; i < ch->L; i++) {
+    if (vkc_kv_plan_need(&ch->ks, v4c_name(ch), ch->nsl, (size_t)hd * sizeof(float), tcap, 1, 1, held, need) != 2) return 1;
+    for (int i = ch->lo; i < ch->L; i++) {
         V4cLayer *ly = &ch->ly[i];
         if (ly->ratio <= 0) continue;
         vkc_free(ly->ckv);
@@ -863,58 +960,58 @@ static int v4c_read_count(ColiDeepSeekV4WindowAttentionState *s, int *count, int
     return 1;
 }
 
-/* The chain's layers (the first ch->L of the model's) for the n rows of streams in
+/* One chain's layers (lo..L-1, on its device, current) for the n rows of streams in
  * *state_ptr (positions start..), the streams after its last layer into *state_ptr
  * (swapped with *next_ptr, as the CPU's layer loop leaves them): the handoff of a partial
- * chain, where the caller's CPU loop runs the remaining layers from there. Returns the
- * layers it ran (ch->L); 0: not taken (the CPU runs every layer, nothing changed); -1: the
- * MoE failed (error set, the host state as before the forward). */
-static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
-                       ColiDeepSeekV4WindowAttentionState **attention, const ColiDeepSeekV4Config *config,
-                       ColiExpertStore *experts, const int *tokens, int start, int n, int pool,
-                       char *error, size_t error_size) {
-    V4Chain *ch = g_v4c;
-    if (!g_v4c_mode || !ch || !ch->ok || ch->failed || !engine || engine != ch->engine || !attention || n < 1) return 0;
-    if (g_v4c_mode == COLI_VK_CHAIN_PREFILL && n <= 2) return 0;
-    if (vkc_lost()) { ch->failed = 1; g_v4c_mode = 0; return 0; }
+ * chain, where the caller's CPU loop (or the second device's chain) runs the remaining
+ * layers from there. Returns the layer after its last (ch->L); 0: not taken (nothing
+ * changed; *lost = 1: a frame failed, the device marked lost); -1: the MoE failed (error
+ * set, as a CPU forward failing at that layer leaves the host state). */
+static void v4c_off(V4Chain *ch) { ch->failed = 1; if (!ch->d) g_v4c_mode = 0; }
+static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr, float **next_ptr,
+                           ColiDeepSeekV4WindowAttentionState **attention, const ColiDeepSeekV4Config *config,
+                           ColiExpertStore *experts, const int *tokens, int start, int n, int pool,
+                           char *error, size_t error_size, int *lost) {
+    *lost = 0;
     const ColiDeepSeekV4Config *c = config;
-    int L = ch->L, D = ch->D, HD = ch->HD, hd = ch->hd, rd = ch->rd, W = ch->W, E = start + n;
+    int lo = ch->lo, L = ch->L, D = ch->D, HD = ch->HD, hd = ch->hd, rd = ch->rd, W = ch->W, E = start + n;
+    const char *nmc = v4c_name(ch);
     int K = 0;                                          /* the compressed slots of a list row */
-    for (int i = 0; i < L; i++) {
+    for (int i = lo; i < L; i++) {
         V4cLayer *ly = &ch->ly[i];
         int k = ly->idx ? c->index_topk : ly->ratio > 0 ? E / ly->ratio : 0;
         if (k > K) K = k;
     }
     if (W + K > 3072) {
-        if (!ch->told) fprintf(stderr, "[VK] deepseek_v4 chain: %d compressed rows at position %d pass the attention's "
-                                       "3072 entries; the CPU runs the layers from here\n", K, E);
+        if (!ch->told) fprintf(stderr, "[VK] %s chain: %d compressed rows at position %d pass the attention's "
+                                       "3072 entries; the CPU runs the layers from here\n", nmc, K, E);
         ch->told = 1;
         return 0;
     }
     char err[256] = {0};
-    for (int i = 0; i < L; i++)                         /* the compressors and the indexer exist on the host */
+    for (int i = lo; i < L; i++)                        /* the compressors and the indexer exist on the host */
         if (ch->ly[i].ratio > 0 &&
             coli_v4_window_attention_prepare(attention[i], &engine->dense_resident.layers[i], config, err, sizeof err))
             return 0;
-    if (attention != ch->attn) { v4c_lower(0); ch->attn = attention; }
-    if (start != ch->E) v4c_lower(start);
-    for (int i = 0; i < L; i++) {                       /* the host's state is where the forward starts */
+    if (attention != ch->attn) { v4c_lower_one(ch, 0); ch->attn = attention; }
+    if (start != ch->E) v4c_lower_one(ch, start);
+    for (int i = lo; i < L; i++) {                      /* the host's state is where the forward starts */
         V4cLayer *ly = &ch->ly[i];
         int cnt, keys;
         if (ly->ratio <= 0) continue;
         if (!v4c_read_count(attention[i], &cnt, &keys) || cnt != start / ly->ratio || (ly->idx && keys != start / 4)) {
-            if (!ch->told) fprintf(stderr, "[VK] deepseek_v4 chain: layer %d holds %d compressed rows at position %d; "
-                                           "the CPU runs this forward\n", i, cnt, start);
+            if (!ch->told) fprintf(stderr, "[VK] %s chain: layer %d holds %d compressed rows at position %d; "
+                                           "the CPU runs this forward\n", nmc, i, cnt, start);
             ch->told = 1;
             return 0;
         }
     }
     if (!v4c_plan(ch, E)) {
-        fprintf(stderr, "[VK] deepseek_v4 chain: device memory for the split's compressed rows refused; the CPU runs the layers\n");
-        ch->failed = 1; g_v4c_mode = 0;
+        fprintf(stderr, "[VK] %s chain: device memory for the split's compressed rows refused; the CPU runs the layers\n", nmc);
+        v4c_off(ch);
         return 0;
     }
-    for (int i = 0; ch->ks.on && i < L; i++)            /* the split: the host's rows take this forward's new ones as it goes */
+    for (int i = lo; ch->ks.on && i < L; i++)           /* the split: the host's rows take this forward's new ones as it goes */
         if (ch->ly[i].ratio > 0 && coli_v4_attention_reserve(attention[i], E / ch->ly[i].ratio)) return 0;
     int LR = W + (K > 0 ? K : 1), CH = v4c_chunk_rows(ch, E, LR);
     if (ch->ks.on) {   /* a chunk's new compressed rows fit the split's window */
@@ -923,17 +1020,17 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
     }
     int rows = n < CH ? n : CH;
     if (!v4c_grow_win(ch, rows)) {
-        fprintf(stderr, "[VK] deepseek_v4 chain: device memory for window rings of %d rows refused; the CPU runs the layers\n", rows);
-        ch->failed = 1; g_v4c_mode = 0;
+        fprintf(stderr, "[VK] %s chain: device memory for window rings of %d rows refused; the CPU runs the layers\n", nmc, rows);
+        v4c_off(ch);
         return 0;
     }
     int ok = v4c_scratch(ch, rows, E, LR);
-    for (int i = 0; ok && i < L; i++) ok = v4c_cache(ch, &ch->ly[i], E / (ch->ly[i].ratio > 0 ? ch->ly[i].ratio : 1) + 1);
+    for (int i = lo; ok && i < L; i++) ok = v4c_cache(ch, &ch->ly[i], E / (ch->ly[i].ratio > 0 ? ch->ly[i].ratio : 1) + 1);
     /* what comes back at the end: the window rows, each layer's new compressed rows and
      * keys, the rings (a ring of ratio r without the overlap: the slots this forward wrote) */
     size_t pn = 0;
     int q0 = E - W > start ? E - W : start, nq = E - q0;
-    for (int i = 0; ok && i < L; i++) {
+    for (int i = lo; ok && i < L; i++) {
         V4cLayer *ly = &ch->ly[i];
         ly->pw = pn; pn += (size_t)nq * hd;
         if (ly->ratio <= 0) continue;
@@ -952,8 +1049,8 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
     float *cos_ = malloc((size_t)rd / 2 * sizeof(float)), *sin_ = malloc((size_t)rd / 2 * sizeof(float));
     if (!ok || !cs || !wl || !cos_ || !sin_) {
         free(cs); free(wl); free(cos_); free(sin_);
-        fprintf(stderr, "[VK] deepseek_v4 chain: device memory for %d rows at %d positions refused; the CPU runs the layers\n", rows, E);
-        ch->failed = 1; g_v4c_mode = 0;
+        fprintf(stderr, "[VK] %s chain: device memory for %d rows at %d positions refused; the CPU runs the layers\n", nmc, rows, E);
+        v4c_off(ch);
         return 0;
     }
     /* every matrix on the per-row GEMV: a row's bits do not depend on the chunk it sits
@@ -1002,7 +1099,7 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
             !vkc_write(ch->cs, 0, cs, (size_t)(f.csC + (nr + ch->rmax - 1) * rd) * sizeof(float))) goto lost;
         if (c0 == 0) {   /* the device's copies made the host's, as the forward needs them */
             int q_lo = start - W + 1 < 0 ? 0 : start - W + 1;
-            for (int i = 0; ok && i < L; i++) {
+            for (int i = lo; ok && i < L; i++) {
                 V4cLayer *ly = &ch->ly[i];
                 ColiV4AttentionView v;
                 if (coli_v4_attention_view(attention[i], &v)) goto lost;
@@ -1030,7 +1127,7 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
             if (!ok) goto lost;
             for (int q = q_lo; q < start; q++) ch->slot_pos[q % ch->Wd] = q;
         }
-        for (int i = 0; ch->ks.on && ok && i < L; i++) {   /* the split: each table's window over this chunk's new rows */
+        for (int i = lo; ch->ks.on && ok && i < L; i++) {  /* the split: each table's window over this chunk's new rows */
             V4cLayer *ly = &ch->ly[i];
             if (ly->ratio <= 0) continue;
             ColiV4AttentionView v;
@@ -1043,7 +1140,7 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
         if (!ok) goto lost;
         for (int s = 0; s < nr; s++) ch->slot_pos[(pb + s) % ch->Wd] = pb + s;   /* this chunk's rows go in below */
         int pending = 0;
-        for (int i = 0; i < L && ok; i++) {
+        for (int i = lo; i < L && ok; i++) {
             V4cLayer *ly = &ch->ly[i];
             if (pending) {                                  /* the FFN branch of the layer before */
                 ok = v4c_join(ch, nr);
@@ -1074,7 +1171,7 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
                 if (pool) coli_v4_expert_store_prefill_pool(experts, -1);
                 vkc_finish();
                 for (int k = 0; k < ch->Wd; k++) ch->slot_pos[k] = -1;   /* some layers wrote this chunk's rows */
-                v4c_lower(start);
+                v4c_lower_one(ch, start);
                 free(cs); free(wl); free(cos_); free(sin_);
                 return -1;
             }
@@ -1089,7 +1186,7 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
         }
         ok = ok && vkc_copy(ch->xd, 0, ch->xs, 0, (size_t)nr * HD);
         if (ok && last) {                                   /* what the host's state gets back */
-            for (int i = 0; i < L && ok; i++) {
+            for (int i = lo; i < L && ok; i++) {
                 V4cLayer *ly = &ch->ly[i];
                 VkcRegion *rg = malloc((size_t)(nq > 0 ? nq : 1) * sizeof *rg);
                 if (!rg) { ok = 0; break; }
@@ -1123,7 +1220,7 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
         memcpy(next + (size_t)c0 * HD, vkc_ptr(ch->xd), (size_t)nr * HD * sizeof(float));
         if (taps) {
             const float *tp = (const float *)vkc_ptr(ch->taps);
-            for (int t = T0 < 0 ? 0 : T0; t < L; t++)
+            for (int t = T0 > lo ? T0 : lo; t < L; t++)   /* the chain's layers' taps only */
                 for (int s = 0; s < nr; s++)
                     v4_mainh_tap(c, t, tp + ((size_t)(t - T0) * nr + s) * HD, (int64_t)pb + s);
         }
@@ -1132,7 +1229,7 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
     /* every chunk is through: the host's state as the CPU would have left it */
     {
         const float *pl = (const float *)vkc_ptr(ch->pull);
-        for (int i = 0; i < L; i++) {
+        for (int i = lo; i < L; i++) {
             V4cLayer *ly = &ch->ly[i];
             ColiV4AttentionView v;
             coli_v4_attention_view(attention[i], &v);
@@ -1167,7 +1264,7 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
             memcpy(cv.score, pl + ly->pir + ir, ir * sizeof(float));
         }
         ch->win_valid = E; ch->E = E;
-        for (int i = 0; i < L; i++) {
+        for (int i = lo; i < L; i++) {
             V4cLayer *ly = &ch->ly[i];
             if (ly->ratio > 0) { ly->kv_valid = E / ly->ratio; ly->ring_ok = 1; }
             if (ly->idx) { ly->ik_valid = E / 4; ly->iring_ok = 1; }
@@ -1182,26 +1279,77 @@ host_oom:   /* the host state half written: as a failed CPU forward leaves it, a
     v4c_lower(0);
     if (error && error_size) snprintf(error, error_size, "out of memory writing the chained forward's state back");
     return -1;
-lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
+lost:   /* a frame failed: the device is gone (or would not take a command) */
     free(cs); free(wl); free(cos_); free(sin_);
     if (pool) coli_v4_expert_store_prefill_pool(experts, -1);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost(); }
-    g_v4c_mode = 0; ch->failed = 1;
-    v4c_lower(0);
-    fprintf(stderr, "[VK] deepseek_v4 chain: the device was lost; the CPU runs this forward again and from here on "
-                    "(the host's state is current: there is nothing to rebuild)\n");
+    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    *lost = 1;
     return 0;
+}
+/* The devices' layers (the primary's first layers, the second device's after them) for
+ * the n rows of streams in *state_ptr, as v4c_forward_seg describes, from layer 0.
+ * Returns the layer after the last that ran (the caller's CPU loop runs the rest from
+ * there); 0: not taken (the CPU runs every layer, nothing changed); -1: the MoE failed. */
+static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
+                       ColiDeepSeekV4WindowAttentionState **attention, const ColiDeepSeekV4Config *config,
+                       ColiExpertStore *experts, const int *tokens, int start, int n, int pool,
+                       char *error, size_t error_size) {
+    V4Chain *ch = g_v4c, *ch2 = g_v4c2;
+    if (!g_v4c_mode || !ch || !ch->ok || ch->failed || !engine || engine != ch->engine || !attention || n < 1) return 0;
+    if (g_v4c_mode == COLI_VK_CHAIN_PREFILL && n <= 2) return 0;
+    if (ch2 && (!ch2->ok || ch2->failed || ch2->engine != engine || ch2->lo != ch->L)) ch2 = NULL;
+    int lost = 0;
+    if (ch2) { vkc_device(1); lost = vkc_lost(); vkc_device(0); }
+    if (vkc_lost() || lost) {
+        for (int d = 0; d < 2; d++) if (v4c_of(d)) v4c_of(d)->failed = 1;
+        g_v4c_mode = 0;
+        return 0;
+    }
+    int r = v4c_forward_seg(ch, engine, state_ptr, next_ptr, attention, config, experts, tokens, start, n, pool,
+                            error, error_size, &lost);
+    if (r <= 0) {
+        if (lost) {
+            for (int d = 0; d < 2; d++) if (v4c_of(d)) v4c_of(d)->failed = 1;
+            g_v4c_mode = 0;
+            v4c_lower(0);
+            fprintf(stderr, "[VK] deepseek_v4 chain: the device was lost; the CPU runs this forward again and from here on "
+                            "(the host's state is current: there is nothing to rebuild)\n");
+        }
+        return r;
+    }
+    if (!ch2) return r;
+    vkc_device(1);
+    int r2 = v4c_forward_seg(ch2, engine, state_ptr, next_ptr, attention, config, experts, tokens, start, n, pool,
+                             error, error_size, &lost);
+    vkc_device(0);
+    if (r2 != 0) return r2;   /* the layer after its last, or the MoE's failure */
+    /* not taken there: the CPU runs its layers from the streams the primary handed over
+     * (the second device's watermarks follow) */
+    v4c_lower_one(ch2, start);
+    if (lost) {
+        for (int d = 0; d < 2; d++) if (v4c_of(d)) v4c_of(d)->failed = 1;
+        g_v4c_mode = 0;
+        v4c_lower(0);
+        fprintf(stderr, "[VK] deepseek_v4 dev2 chain: the device was lost; the CPU runs its layers, and every layer from the next "
+                        "forward on (the host's state is current: there is nothing to rebuild)\n");
+    }
+    return r;
 }
 
 static void v4c_report(void) {
-    V4Chain *ch = g_v4c;
-    if (!ch || !ch->ok || !ch->forwards) return;
-    VkcStats st; vkc_stats(&st);
-    fprintf(stderr, "[VK] deepseek_v4 chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
-                    "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
-            ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms, st.dev_bytes / 1048576.0);
-    vkc_kv_report(&ch->ks);
-    vkc_prof_print();
+    for (int d = 0; d < 2; d++) {
+        V4Chain *ch = v4c_of(d);
+        if (!ch || !ch->ok || !ch->forwards) continue;
+        int was = vkc_device(d);
+        VkcStats st; vkc_stats(&st);
+        fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
+                        "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
+                v4c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
+                st.dev_bytes / 1048576.0);
+        vkc_kv_report(&ch->ks);
+        vkc_prof_print();
+        vkc_device(was);
+    }
 }
 
 /* COLI_VK_CHAIN at startup, before the tier sizes itself (the trunk's device copies count
@@ -1226,15 +1374,29 @@ static void v4c_start(const ColiV4Engine *cengine) {
     if (no) fprintf(stderr, "[VK] deepseek_v4: %s: the dense chain stays off\n", no);
     if (!on || no) return;
     if (!v4c_fit_now(engine) || g_v4c_fit.n < 1) return;   /* how many layers fit (vkc_fit), once */
+    int n0 = g_v4c_fit.n;
     if (!v4c_setup(engine)) return;
     g_v4c_mode = on;
+    if (g_v4c_fit2_on) {
+        vkc_device(1);
+        if (g_v4c->L < n0) {
+            /* the primary placed fewer layers than its fit: the second device's would not
+             * follow them, so they stay on the CPU too */
+            fprintf(stderr, "[VK] deepseek_v4 chain: the primary device stopped before layer %d; layers %d..%d stay on the CPU, "
+                            "not on the second device\n", n0, n0, n0 + g_v4c_fit2.n - 1);
+            g_v4c_fit2_on = 0;
+            vkc_shutdown();
+        } else if (!v4c_setup_dev(engine, 1)) { g_v4c_fit2_on = 0; vkc_shutdown(); }
+        vkc_device(0);
+    }
 }
 /* After the tier's: at exit the chain goes before the device. */
 static void v4c_atexit(void) {
-    if (g_v4c_inited) atexit(vkc_shutdown);
+    if (g_v4c_inited) atexit(vkc_shutdown_all);
 }
-/* v4_vk_close, before the matrices go: the line, then every frame through. */
+/* v4_vk_close, before the matrices go: the line, then every frame through (both devices). */
 static void v4c_close(void) {
     v4c_report();
     if (g_v4c_inited && !vkc_lost()) vkc_finish();
+    if (g_v4c2) { vkc_device(1); if (!vkc_lost()) vkc_finish(); vkc_device(0); }
 }

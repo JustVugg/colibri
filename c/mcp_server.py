@@ -174,7 +174,10 @@ def _coli():
     return os.path.join(HERE, "coli")
 
 
-def tool_install(args, notify):
+_INSTALL_LOCK = threading.Lock()
+
+
+def _launch_install(args):
     running = _install_running()
     if running:
         raise ToolError(f"an install is already running (pid {running.get('pid')}, phase "
@@ -212,6 +215,16 @@ def tool_install(args, notify):
     # The job's own pid: the child rewrites this file as it goes, with the same pid.
     setup_flow._write_json(setup_flow.state_path(),
                            {"phase": "starting", "pid": process.pid, "updated": time.time()})
+    return process, log, cmd
+
+
+def tool_install(args, notify):
+    # tools/call runs in independent threads: admission and publishing the
+    # spawned job's state must be one operation, or two calls can both see no
+    # running install. Waiting/progress is outside the lock so status remains
+    # responsive and a second install receives the existing-job error promptly.
+    with _INSTALL_LOCK:
+        process, log, cmd = _launch_install(args)
     wait = int(args.get("wait_seconds") or 0)
     result = {"job": {"pid": process.pid, "log": log, "command": cmd}}
     deadline = time.time() + wait
@@ -292,7 +305,7 @@ class Server:
         self.threads = []
 
     def send(self, message):
-        line = json.dumps(message, separators=(",", ":"), ensure_ascii=False)
+        line = json.dumps(message, separators=(",", ":"), ensure_ascii=True)
         with self.lock:
             self.out.write(line + "\n")
             self.out.flush()
@@ -345,6 +358,9 @@ class Server:
         elif method == "tools/list":
             self.result(msg_id, {"tools": TOOLS})
         elif method == "tools/call":
+            # Keep EOF draining limited to calls still in flight, rather than
+            # retaining every completed worker for the lifetime of the session.
+            self.threads = [worker for worker in self.threads if worker.is_alive()]
             thread = threading.Thread(target=self.call_tool, args=(msg_id, params), daemon=True)
             self.threads.append(thread)
             thread.start()
@@ -376,7 +392,7 @@ class Server:
             self.send({"jsonrpc": "2.0", "method": "notifications/progress", "params": payload})
 
         try:
-            args = _check_args(name, params.get("arguments") or {})
+            args = _check_args(name, params.get("arguments", {}))
         except KeyError:
             self.error(msg_id, INVALID_PARAMS, f"unknown tool: {name}")
             return

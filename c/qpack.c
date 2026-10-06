@@ -388,6 +388,76 @@ static int qpack_verify_manifest_size(jval *files, const char *relative,
     return 0;
 }
 
+/* Every packed projection is sized by the one quantization the manifest
+ * declares. A quantized weight stores input_dim / (32 / bits) U32 words per
+ * row and its scales input_dim / group_size groups per row; both describe the
+ * same input_dim, so when the manifest's bits and group size make them
+ * disagree the recorded quantization is not the one the bytes were packed
+ * with -- a module quantized at another width than the manifest says, or a
+ * manifest carried over from another export -- and dequantizing by it would
+ * decode garbage. Refused here, at open, naming the section and both widths,
+ * before a caller has sized a single expert slot from the stride; the affine
+ * view used to be the first place this surfaced, after the slots existed.
+ * (Swiftlet #31 refuses the same container the same way at load.)
+ *
+ * The container records one quantization for every layer and expert, and one
+ * section table shared by all of them, so "mixed expert quant" can only show
+ * up as one module's widths disagreeing with the manifest: that is refused by
+ * the module's name. A manifest with no quantization metadata is not judged
+ * here; the affine view refuses it as unsupported when a projection is asked
+ * for. */
+static int qpack_check_packed_widths(const ColiQpackLayout *layout,
+                                     int quant_bits, int quant_group_size,
+                                     char *error, size_t error_capacity) {
+    if (quant_bits == 0 && quant_group_size == 0) return 0;
+    if ((quant_bits != 4 && quant_bits != 8) || quant_group_size <= 0)
+        return qpack_fail(error, error_capacity,
+                          "manifest %d-bit/g%d is not a supported affine "
+                          "quantization", quant_bits, quant_group_size);
+    const size_t per_word = 32u / (size_t)quant_bits;
+    const size_t group_size = (size_t)quant_group_size;
+    static const char suffix[] = ".weight";
+    const size_t suffix_size = sizeof(suffix) - 1;
+    for (size_t i = 0; i < layout->section_count; i++) {
+        const ColiQpackSection *weight = &layout->sections[i];
+        size_t name_size = strlen(weight->name);
+        if (name_size <= suffix_size ||
+            strcmp(weight->name + name_size - suffix_size, suffix) != 0 ||
+            strcmp(weight->dtype, "U32") != 0)
+            continue;
+        int module_size = (int)(name_size - suffix_size);
+        char scales_name[256];
+        int count = snprintf(scales_name, sizeof(scales_name), "%.*s.scales",
+                             module_size, weight->name);
+        if (count < 0 || (size_t)count >= sizeof(scales_name)) continue;
+        const ColiQpackSection *scales = NULL;
+        for (size_t j = 0; j < layout->section_count && !scales; j++)
+            if (strcmp(layout->sections[j].name, scales_name) == 0)
+                scales = &layout->sections[j];
+        /* No scales beside the weight: the affine view's refusal, not ours. */
+        if (!scales) continue;
+        size_t weight_inner = weight->shape[weight->rank - 1];
+        size_t scales_inner = scales->shape[scales->rank - 1];
+        if (weight_inner > SIZE_MAX / per_word ||
+            scales_inner > SIZE_MAX / group_size)
+            return qpack_fail(error, error_capacity,
+                              "section %.*s: packed width overflows",
+                              module_size, weight->name);
+        size_t from_weight = weight_inner * per_word;
+        size_t from_scales = scales_inner * group_size;
+        if (from_weight != from_scales)
+            return qpack_fail(
+                error, error_capacity,
+                "section %.*s: manifest %d-bit/g%d disagrees with the packed "
+                "shapes (weight inner %zu = %zu inputs, scales inner %zu = "
+                "%zu inputs); the container's recorded quantization does not "
+                "match its expert bytes",
+                module_size, weight->name, quant_bits, quant_group_size,
+                weight_inner, from_weight, scales_inner, from_scales);
+    }
+    return 0;
+}
+
 int coli_qpack_open(ColiQpackReader *reader, const char *container_dir,
                     char *error, size_t error_capacity) {
     if (!reader)
@@ -446,6 +516,14 @@ int coli_qpack_open(ColiQpackReader *reader, const char *container_dir,
         return -1;
     }
     free(layout_path);
+
+    if (qpack_check_packed_widths(&reader->layout, reader->quant_bits,
+                                  reader->quant_group_size,
+                                  error, error_capacity)) {
+        json_free(manifest_root);
+        coli_qpack_close(reader);
+        return -1;
+    }
 
     if (reader->layout.expert_count >
         (uint64_t)INT64_MAX / reader->layout.expert_stride) {

@@ -380,10 +380,39 @@ jobs:
           - family: kv-split-sanitize
             req: c/tools/requirements-qwen38-tiny.txt
             extra: numpy pillow
+          # the same with the host's part on the device too (COLI_VK_KV_COLD=device)
+          - family: kv-split-cold
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: kv-split-cold-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
           - family: kv-split-deepseek
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow
           - family: kv-split-deepseek-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # the dense chain's layers on two devices (Lavapipe opened twice, COLI_VK_DEV2=0):
+          # every chain engine against its CPU run, split at every kind of layer, the state
+          # crossing between the devices, the second device lost; the same under ASan and
+          # UBSan; GLM and Kimi K3, and DeepSeek, in legs of their own
+          - family: layers-dev2
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: layers-dev2-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: layers-dev2-mla
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: layers-dev2-mla-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: layers-dev2-deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: layers-dev2-deepseek-sanitize
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow
           # the decision engines: Laya's and GLiNER2.5-Decide's forward on the device and
@@ -1066,6 +1095,11 @@ jobs:
           SNAP=olmoe_tiny_c ./olmoe 8 8 olmoe_tiny/ref_olmoe.json | tee oracle.log
           # the engine prints the score and exits 0 either way: the gate is here
           grep -qE 'Matching tokens: ([0-9]+)/\1$' oracle.log
+      - name: "Dense tensors: the shape config.json gives, or the load refuses"
+        run: |
+          cd c
+          COLI_OLMOE_FIXTURE=olmoe_tiny_c COLI_OLMOE_REFERENCE=olmoe_tiny/ref_olmoe.json \
+            python3 -m unittest -v tests.test_olmoe_dense_shape
       - name: "Cache cap: the sentinel takes the budget, an explicit cap is left alone"
         run: |
           cd c
@@ -1082,6 +1116,10 @@ jobs:
         run: |
           cd c
           COLI_OLMOE_FIXTURE=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_context_exceeded
+      - name: "Reference: lengths and ids checked before the run"
+        run: |
+          cd c
+          COLI_OLMOE_FIXTURE=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_reference_bounds
       - name: KV prefix reuse is token-identical (serve, several turns)
         run: |
           cd c
@@ -1260,7 +1298,7 @@ jobs:
       - name: Generate the upstream text fixture and run the token-and-logit oracle
         run: make -C c qwen38-tiny-check
       - name: Routed experts as the release ships them (FP8 shards), then the engine on the fake CUDA tier
-        run: make -C c qwen38-tiny-fp8-check qwen38-tier-engine-check
+        run: make -C c qwen38-tiny-fp8-check qwen38-tier-engine-check qwen38-dn-gpu-check
       - name: Routed experts as int4-g64 from the converter's sidecar
         run: make -C c qwen38-tiny-int4-check
       - name: MTP speculative decoding against plain decoding (lossless gate)

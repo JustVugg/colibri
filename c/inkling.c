@@ -203,6 +203,7 @@ typedef struct {
     kv_prefix kvp;
 #ifdef COLI_VULKAN
     void *vkchain;                        /* the dense chain's device state (inkling_chain.h), NULL until it runs */
+    void *vkchain2;                       /* its layers on COLI_VK_DEV2's device, after the primary's (inkling_chain.h) */
 #endif
 } Model;
 
@@ -1746,8 +1747,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                 for (int t = t0; t <= qpos; t++) {
                     const float *kv = t < tb ? Kh + (int64_t)(t % win)*hd
                                              : Kb + (int64_t)(t - pos0)*kvdim;
-                    float acc = 0.f;
-                    for (int d = 0; d < hd; d++) acc += qv[d]*kv[d];
+                    float acc = dot_f32_lanes(qv, kv, hd);
                     int dist = qpos - t;
                     sc[t - t0] = tau * (acc*scale + (dist < ext ? rl[dist] : 0.f));
                 }
@@ -2647,7 +2647,7 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
         int took = inkc_forward(m, x, S, pos0, (g_echo_k > 0 && g_echo_id && S > 1) || tf_out != NULL, chain_logit);
         if (took != 1) { free(chain_logit); chain_logit = NULL; }
         if (!took) inkc_cpu_step(m, pos0, S);
-        else if (took == 2) layer0 = inkc_layers(m);   /* a partial chain: x is the residual after its last layer */
+        else if (took == 2) layer0 = inkc_ran();   /* a partial chain: x is the residual after the last layer it ran */
     }
     if (!chain_logit)
         inkling_layers_forward_range(m, x, S, pos0, layer0, c->n_layers);

@@ -521,15 +521,16 @@ TEST_RULES  := $(patsubst tests/%,%,$(filter tests/test_%,$(RULE_NAMES)))
 # since a bare invocation exits 2 -- and tests/test_e8x4g64_mint_load.py is what
 # actually drives it end to end.
 # test_qwen38_tier_engine drives qwen38.c over the generated FP8 fixture
-# (qwen38_tiny_fp8, gitignored); it runs from qwen38-tier-engine-check.
+# (qwen38_tiny_fp8, gitignored); it runs from qwen38-tier-engine-check. test_qwen38_dn_gpu does the same from
+# qwen38-dn-gpu-check.
 TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
 	test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_xdna_execution test_xdna_failure \
-	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine \
+	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu \
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
-TEST_EXCLUDE += test_vk_chain
+TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -1459,6 +1460,9 @@ qwen38-tiny-fp8-check: qwen38-tiny-fp8-generate qwen38$(EXE)
 qwen38-tier-engine-check: qwen38-tiny-fp8-generate tests/test_qwen38_tier_engine$(EXE)
 	./tests/test_qwen38_tier_engine$(EXE)
 
+qwen38-dn-gpu-check: qwen38-tiny-fp8-generate tests/test_qwen38_dn_gpu$(EXE)
+	./tests/test_qwen38_dn_gpu$(EXE)
+
 # The routed experts as int4-g64: tools/convert_qwen38_experts_int4.py writes
 # the experts-int4g64/ sidecar next to the FP8 shards and qwen38 picks it up.
 # The fixture is the FP8 one with its experts scaled by 3 (at the default
@@ -1646,6 +1650,10 @@ tests/test_qwen36_encode_oom$(EXE): tests/test_qwen36_encode_oom.c qwen36.c $(QW
 # slot_ensure_int8's wiring onto #1271's unpack_int4_to_int8: regression check
 # that its output matches the old separate scalar nibble-unpack loop it replaced.
 tests/test_qwen36_slot_int8$(EXE): tests/test_qwen36_slot_int8.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# qwen36_cap_for_ram(): the cap<=0 "auto" sentinel's RAM-derived slot count.
+tests/test_qwen36_cap_precedence$(EXE): tests/test_qwen36_cap_precedence.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # the dense trunk's integer path: quantizer contract, int4 planar packing, dispatch.
@@ -1914,6 +1922,9 @@ tests/test_tier$(EXE): tests/test_tier.c
 tests/test_grammar$(EXE): tests/test_grammar.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_own_file$(EXE): tests/test_own_file.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 # RoPE inv_freq precompute must stay byte-identical to the old powf-per-position
 # path; drives the real rope_interleave (includes colibri.c) vs a reference.
 # -ffp-contract=off: the in-test reference is a DIFFERENT loop body than the
@@ -2018,6 +2029,9 @@ tests/test_k3_chat_tools$(EXE): tests/test_k3_chat_tools.c kimi_k3.c $(VK_OBJ)
 tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c olmoe.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_olmoe_moe_by_expert$(EXE): tests/test_olmoe_moe_by_expert.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
@@ -2117,6 +2131,12 @@ tests/test_vk_chain$(EXE): tests/test_vk_chain.c $(VK_OBJ) $(VK_SPV)
 .PHONY: vk-chain-check
 vk-chain-check: tests/test_vk_chain$(EXE)
 	./tests/test_vk_chain$(EXE) shaders/qmatmul.spv
+
+# GLM-5.3's resident f32 dispatch and its dense memory reservation (#1863).
+# Run by vulkan_engines.sh shader; requires a real or software Vulkan device.
+tests/test_glm53_vk_f32$(EXE): tests/test_glm53_vk_f32.c glm53.c $(VK_OBJ) $(VK_SPV)
+	@[ "$(VK)" = 1 ] || { echo "tests/test_glm53_vk_f32 needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_rans$(EXE): tests/test_rans.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -2542,6 +2562,10 @@ tests/test_qwen36_tier_withdraw$(EXE): tests/test_qwen36_tier_withdraw.c qwen36_
 tests/test_qwen36_tier_layer_home$(EXE): tests/test_qwen36_tier_layer_home.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# qt_replan: the resident set follows the prompt's own routing counts (fake backend).
+tests/test_qwen36_tier_replan$(EXE): tests/test_qwen36_tier_replan.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c qwen36.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
@@ -2561,6 +2585,10 @@ tests/test_qwen36_tier_int8_decode$(EXE): tests/test_qwen36_tier_int8_decode.c q
 # from the FP8 fixture, reduced CPU list, qt_note on recycled slots, oracle
 # tokens unchanged. Needs the fixture (qwen38-tiny-fp8-generate).
 tests/test_qwen38_tier_engine$(EXE): tests/test_qwen38_tier_engine.c qwen38.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# Q38_DN_GPU=1 on the tiny FP8 fixture (fake backend, oracle): runs from qwen38-dn-gpu-check.
+tests/test_qwen38_dn_gpu$(EXE): tests/test_qwen38_dn_gpu.c qwen38.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_serve_poll$(EXE): tests/test_serve_poll.c
@@ -2650,6 +2678,12 @@ tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c colibri.c $(VK_OBJ)
 # bench_matmul_f32: microbenchmark (pre-#442 scalar vs row-blocked fmaf f32 matmul at
 # router shapes), NOT a test gate. Build on demand: make tests/bench_matmul_f32
 tests/bench_matmul_f32$(EXE): tests/bench_matmul_f32.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# bench_attn_f32: microbenchmark (one decode token's attention core in qwen36,
+# olmoe and inkling, scalar q.k vs matmul_f32.h lanes), NOT a test gate.
+# Build on demand: make tests/bench_attn_f32
+tests/bench_attn_f32$(EXE): tests/bench_attn_f32.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_matmul_f32$(EXE): tests/test_matmul_f32.c
@@ -2882,6 +2916,9 @@ bench: iobench$(EXE)
 
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)
+
+tests/test_glm53_image_key$(EXE): tests/test_glm53_image_key.c
+	$(CC) $(CFLAGS) tests/test_glm53_image_key.c -o tests/test_glm53_image_key$(EXE) $(LDFLAGS)
 
 tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) tests/test_kimi_request_state.c $(VK_OBJ) -o tests/test_kimi_request_state$(EXE) $(NOCUDA_LDFLAGS)

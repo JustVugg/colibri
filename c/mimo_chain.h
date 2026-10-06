@@ -67,7 +67,8 @@
 
 typedef struct {
     int ok, failed;
-    int nl, full;                              /* layers on the device (the first nl); the head there too */
+    int lo, d;                                 /* its layers start at lo, on device d (vkc_device) */
+    int nl, full;                              /* layers on the device (lo..lo+nl-1); the head there too */
     int rows;                                  /* scratch capacity in rows */
     int rd_off[2];                             /* the RoPE table of each layer kind in cs */
     VkcBuf *prm;                               /* the norms and the sink logits */
@@ -80,6 +81,7 @@ typedef struct {
     VkcBuf *x, *nrm, *tmp, *qkv, *kn, *vn, *wk, *wv, *ctx, *g, *u, *fin;
     VkcBuf *h2d, *kvd, *outd, *routed, *cs;
     float *host_out;
+    float *host_in;                            /* a chunk's rows before the primary's layers (the second device's chain) */
     unsigned long long forwards, frames;
     double wait_ms, host_ms;
 } MimoChain;
@@ -90,6 +92,15 @@ static int g_vk_chain = 0;     /* COLI_VK_CHAIN decided on, and the chain's pipe
 static VkcFit g_mc_fit;
 static int g_mc_placed;   /* vkc_fit_placed said it (mc_place, mimo.c) */
 static int mc_layers(const Model *m) { return g_mc_fit.L ? g_mc_fit.n : m->c.n_layers; }
+/* The layers after the primary's on COLI_VK_DEV2's device (docs/vulkan.md, "Layers on two
+ * devices"): a second chain from layer g_mc_fit.n, its own fit (mc_fit_start), its
+ * matrices placed by mc_place. Each chunk crosses the primary's layers, comes down, crosses
+ * these, comes down, and the CPU runs what is left. */
+static VkcFit g_mc_fit2;
+static int g_mc_fit2_on;
+static MimoChain *mc_of(Model *m, int d) { return (MimoChain *)(d ? m->vkchain2 : m->vkchain); }
+static const char *mc_name(const MimoChain *ch) { return ch && ch->d ? "mimo dev2" : "mimo"; }
+static int mc_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
 
 /* the geometry of layer li's attention */
@@ -124,13 +135,17 @@ static size_t mc_kv_bytes(const Model *m) { return mc_kv_bytes_n(m, m->c.n_layer
 /* The model's parameters on the device, its tensors resolved, its caches allocated;
  * NULL = the chain cannot run. With a fit, the first n layers only (their matrices placed
  * at start-up, mc_place), and the head when the tail went up too. */
-static MimoChain *mc_setup(Model *m) {
-    MimoChain *ch = (MimoChain *)m->vkchain;
+/* d = 1: the second device's chain (its matrices placed by mc_place; device 1 current). */
+static MimoChain *mc_setup_dev(Model *m, int d) {
+    MimoChain *ch = mc_of(m, d);
     if (ch) return ch->ok ? ch : NULL;
+    if (d && !g_mc_fit2_on) return NULL;
     ch = (MimoChain *)calloc(1, sizeof *ch);
     if (!ch) return NULL;
-    m->vkchain = ch;
-    Cfg *c = &m->c; int L = c->n_layers, H = c->hidden, nl = mc_layers(m);
+    if (d) m->vkchain2 = ch; else m->vkchain = ch;
+    ch->d = d;
+    Cfg *c = &m->c; int L = c->n_layers, H = c->hidden, lo = d ? g_mc_fit.n : 0, nl = d ? g_mc_fit2.n : mc_layers(m);
+    ch->lo = lo;
     for (int k = 0; k < 2; k++)
         if (c->head_dim[k] > 256 || c->v_dim[k] > 256) {
             fprintf(stderr, "[VK] mimo chain: head dims %d/%d are past its attention shader's 256; per-matrix path\n",
@@ -144,27 +159,30 @@ static MimoChain *mc_setup(Model *m) {
     if (!ch->o_ln1 || !ch->o_ln2 || !ch->o_sink || !ch->o_kvd || !ch->kv_valid || !ch->kvi || !ch->kc || !ch->vc) return NULL;
     /* the matrices: the device copies the per-matrix path uploads (vk_dense_upload) */
     int ok = 1;
-    for (int i = 0; i < nl && ok; i++) {
+    g_mimo_vk_dev = d;
+    for (int i = lo; i < lo + nl && ok; i++) {
         Layer *l = &m->L[i];
         ok = mc_ctensor(&l->qkv) && mc_ctensor(&l->o) &&
              (c->moe[i] || (mc_ctensor(&l->gate) && mc_ctensor(&l->up) && mc_ctensor(&l->down)));
     }
-    int full = nl == L && (!g_mc_fit.L || g_mc_fit.tail);
-    if (ok && full && g_mc_fit.L && !mc_ctensor(&m->head)) {   /* the fit's tail did not go up: the head on the CPU */
-        full = 0; g_mc_fit.tail = 0;
+    VkcFit *fit = d ? &g_mc_fit2 : &g_mc_fit;
+    int full = lo + nl == L && (!fit->L || fit->tail);
+    if (ok && full && fit->L && !mc_ctensor(&m->head)) {   /* the fit's tail did not go up: the head on the CPU */
+        full = 0; fit->tail = 0;
         fprintf(stderr, "[VK] mimo chain: the head did not reach the device; it runs on the CPU, the layers here\n");
     }
     ok = ok && (!full || mc_ctensor(&m->head));
+    g_mimo_vk_dev = 0;
     if (!ok) { fprintf(stderr, "[VK] mimo chain: a dense matrix did not reach the device; per-matrix path\n"); return NULL; }
     size_t n = 0;
-    for (int i = 0; i < nl; i++) {
+    for (int i = lo; i < lo + nl; i++) {
         ch->o_ln1[i] = n; n += H; ch->o_ln2[i] = n; n += H;
         if (m->L[i].sink) { ch->o_sink[i] = n; n += c->heads[c->swa[i]]; }
     }
     ch->o_final = n; n += H;
     float *arena = calloc(n, sizeof(float));
     if (!arena) return NULL;
-    for (int i = 0; i < nl; i++) {
+    for (int i = lo; i < lo + nl; i++) {
         Layer *l = &m->L[i];
         memcpy(arena + ch->o_ln1[i], l->ln1, H * sizeof(float));
         memcpy(arena + ch->o_ln2[i], l->ln2, H * sizeof(float));
@@ -181,17 +199,18 @@ static MimoChain *mc_setup(Model *m) {
     size_t frow = 0;
     for (int i = 0; i < L; i++) {
         McGeo g = mc_geo(m, i);
-        ch->kvi[i] = g.swa || i >= nl ? -1 : nfull++;
-        if (!g.swa && i < nl) { frows = g.rows; frow = (size_t)(g.kd + g.vdd) * sizeof(float); }
+        int here = i >= lo && i < lo + nl;
+        ch->kvi[i] = g.swa || !here ? -1 : nfull++;
+        if (!g.swa && here) { frows = g.rows; frow = (size_t)(g.kd + g.vdd) * sizeof(float); }
     }
     /* KV placement is row-anchored; its legacy chunk argument is not used. The
      * actual prompt chunk is sized after setup and clamped to ks.chunk. */
-    if (nfull && !vkc_kv_plan(&ch->ks, "mimo", nfull, frow, frows, 1, 0, 0)) {
+    if (nfull && !vkc_kv_plan(&ch->ks, mc_name(ch), nfull, frow, frows, 1, 0, 0)) {
         fprintf(stderr, "[VK] mimo chain: the KV split's tables refused; per-matrix path\n");
         return NULL;
     }
     size_t kv = 0;
-    for (int i = 0; i < nl; i++) {
+    for (int i = lo; i < lo + nl; i++) {
         McGeo g = mc_geo(m, i);
         if (!g.swa && ch->ks.on) g.rows = ch->ks.rows;
         ch->kc[i] = vkc_buf((size_t)g.rows * g.kd * sizeof(float), VKC_DEV);
@@ -205,11 +224,14 @@ static MimoChain *mc_setup(Model *m) {
     ch->nl = nl; ch->full = full;
     ch->ok = 1;
     int swa = 0;
-    for (int i = 0; i < nl; i++) swa += c->swa[i];
-    fprintf(stderr, "[VK] mimo chain: %d layers on the device (%d sliding window), %.1f MiB of KV mirrors\n",
-            nl, swa, kv * 4 / 1048576.0);
+    for (int i = lo; i < lo + nl; i++) swa += c->swa[i];
+    if (d) fprintf(stderr, "[VK] mimo chain: layers %d..%d on the second device (%d sliding window)%s, %.1f MiB of KV mirrors\n",
+                   lo, lo + nl - 1, swa, full ? ", the head too" : "", kv * 4 / 1048576.0);
+    else fprintf(stderr, "[VK] mimo chain: %d layers on the device (%d sliding window), %.1f MiB of KV mirrors\n",
+                 nl, swa, kv * 4 / 1048576.0);
     return ch;
 }
+static MimoChain *mc_setup(Model *m) { return mc_setup_dev(m, 0); }
 
 /* mc_res counts instead of reserving while g_mc_count >= 0 (the chunk's sizing; the fit's,
  * g_mc_fitcount, each buffer as the pools round it) */
@@ -234,7 +256,7 @@ static int mc_chunk_rows(MimoChain *ch, Model *m) {
     size_t row = (size_t)(b2 - b1) + (size_t)(2 * m->c.topk + 1) * m->c.hidden * sizeof(float);
     /* moe_cpu retains a whole chunk's gathered inputs and gate/up outputs. */
     row += (size_t)m->c.topk * ((size_t)m->c.hidden + 2 * (size_t)m->c.moe_inter) * sizeof(float);
-    return vkc_chunk_rows("mimo", row);
+    return vkc_chunk_rows(mc_name(ch), row);
 }
 
 /* scratch for `rows` rows, `out` rows of logits */
@@ -286,18 +308,22 @@ static int mc_scratch(MimoChain *ch, Model *m, int rows, int out) {
 /* ---- the KV caches between the host and the device ------------------------------- */
 /* A CPU step from pos_base writes the host's rows from there on. */
 static void mc_cpu_step(Model *m, int pos_base) {
-    MimoChain *ch = (MimoChain *)m->vkchain;
-    if (!ch || !ch->ok) return;
-    for (int i = 0; i < ch->nl; i++) {   /* the device's layers: the CPU's keep their caches on the host */
-        if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
-        if (ch->kvi[i] >= 0) vkc_kv_lower(&ch->ks, ch->kvi[i], pos_base);
+    for (int d = 0; d < 2; d++) {
+        MimoChain *ch = mc_of(m, d);
+        if (!ch || !ch->ok) continue;
+        for (int i = ch->lo; i < ch->lo + ch->nl; i++) {   /* the devices' layers: the CPU's keep their caches on the host */
+            if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
+            if (ch->kvi[i] >= 0) vkc_kv_lower(&ch->ks, ch->kvi[i], pos_base);
+        }
     }
 }
-/* The host's rings were replaced (a photo restored): the device's no longer match. */
+/* The host's rings were replaced (a photo restored): the devices' no longer match. */
 static void mc_rings_rewritten(Model *m) {
-    MimoChain *ch = (MimoChain *)m->vkchain;
-    if (!ch || !ch->ok) return;
-    for (int i = 0; i < ch->nl; i++) if (m->c.swa[i]) ch->kv_valid[i] = 0;
+    for (int d = 0; d < 2; d++) {
+        MimoChain *ch = mc_of(m, d);
+        if (!ch || !ch->ok) continue;
+        for (int i = ch->lo; i < ch->lo + ch->nl; i++) if (m->c.swa[i]) ch->kv_valid[i] = 0;
+    }
 }
 /* host rows [t0, t1) of a ring into the device's ring (at most two runs of slots) */
 static int mc_ring_up(VkcBuf *dst, const float *src, int R, int t0, int t1, int w) {
@@ -325,7 +351,7 @@ static int mc_ring_copy(VkcBuf *ring, VkcBuf *lin, int R, int base, int t0, int 
  * pos_base reads them. */
 static int mc_push_state(MimoChain *ch, Model *m, int pos_base, int n_rows) {
     Cfg *c = &m->c; int ok = 1;
-    for (int i = 0; i < ch->nl && ok; i++) {
+    for (int i = ch->lo; i < ch->lo + ch->nl && ok; i++) {
         McGeo g = mc_geo(m, i);
         Layer *l = &m->L[i];
         if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
@@ -445,7 +471,7 @@ static int mc_dense_mlp(MimoChain *ch, Model *m, int i, int n) {
 /* The rows the step at pb wrote, into the host's caches (the CPU's own placement). */
 static void mc_commit(MimoChain *ch, Model *m, int n, int pb) {
     const float *kv = (const float *)vkc_ptr(ch->kvd);
-    for (int i = 0; i < ch->nl; i++) {
+    for (int i = ch->lo; i < ch->lo + ch->nl; i++) {
         McGeo g = mc_geo(m, i);
         Layer *l = &m->L[i];
         int from = g.swa && n > g.rows ? n - g.rows : 0, cap = g.swa && g.rows < ch->rows ? g.rows : ch->rows;
@@ -461,112 +487,162 @@ static void mc_commit(MimoChain *ch, Model *m, int n, int pb) {
     }
 }
 
+/* One chain's layers (lo..lo+nl-1, on its device) for one chunk of n rows at pb, from
+ * the residual rows in hr: their K/V rows into the host's caches, and either the rows'
+ * logits (ro of them into lc: a chain with the head) or the residual after its last layer
+ * back in hr. 0: a frame failed (the device lost). */
+static int mc_chunk(MimoChain *ch, Model *m, float *hr, int n, int pb, int ro, float *lc) {
+    Cfg *c = &m->c; int H = c->hidden, lo = ch->lo, hi = lo + ch->nl, V = c->vocab;
+    if (!vkc_begin() || !vkc_write(ch->x, 0, hr, (size_t)n * H * sizeof(float)) || !mc_push_state(ch, m, pb, n)) return 0;
+    float *cs = (float *)vkc_ptr(ch->cs);   /* the CPU's angles, cosines and sines (rope()) */
+    for (int k = 0; k < 2; k++) {
+        int rd = c->rope_dim[k], half = rd / 2;
+        for (int s = 0; s < n; s++) for (int j = 0; j < half; j++) {
+            float inv = 1.0f / powf(c->theta[k], (float)(2 * j) / (float)rd);
+            float ang = inv * (float)(pb + s);
+            cs[ch->rd_off[k] + (s * half + j) * 2] = cosf(ang);
+            cs[ch->rd_off[k] + (s * half + j) * 2 + 1] = sinf(ang);
+        }
+    }
+    int ok = 1, pending = 0;
+    for (int i = lo; i < hi && ok; i++) {
+        if (pending) ok = mc_add(ch->x, ch->routed, n * H);   /* the routed experts join, as h += out */
+        pending = 0;
+        ok = ok && mc_norm(ch->x, 0, ch->prm, ch->o_ln1[i], ch->nrm, 0, n, H, c->eps) &&
+             mc_attention(ch, m, i, n, pb) && mc_add(ch->x, ch->tmp, n * H) &&
+             mc_norm(ch->x, 0, ch->prm, ch->o_ln2[i], ch->nrm, 0, n, H, c->eps);
+        if (ok && !c->moe[i]) ok = mc_dense_mlp(ch, m, i, n) && mc_add(ch->x, ch->tmp, n * H);
+        else if (ok) {
+            ok = vkc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)n * H);
+            double t0 = now_s();
+            /* while the frame runs, the tier loads the experts this layer will likely
+             * stream (a big prompt chunk only) */
+            ok = ok && vkc_submit(0);
+            if (ok) vkt_stream_prefetch(i, n);
+            ok = ok && vkc_finish();
+            ch->frames++; ch->wait_ms += (now_s() - t0) * 1e3;
+            if (!ok) break;
+            double t1 = now_s();
+            moe(m, i, (const float *)vkc_ptr(ch->h2d), n, ch->host_out);
+            memcpy(vkc_ptr(ch->routed), ch->host_out, (size_t)n * H * sizeof(float));
+            ch->host_ms += (now_s() - t1) * 1e3;
+            ok = vkc_begin();
+            pending = 1;
+        }
+    }
+    if (ok && pending) ok = mc_add(ch->x, ch->routed, n * H);
+    if (ok && ro) ok = mc_norm(ch->x, (size_t)(n - ro) * H, ch->prm, ch->o_final, ch->fin, 0, ro, H, c->eps) &&
+                       vkc_matmul((ColiVkTensor *)m->head.vk, ch->fin, 0, ch->outd, 0, ro);
+    if (ok && !ch->full) ok = vkc_copy(ch->h2d, 0, ch->x, 0, (size_t)n * H);   /* the handoff to what follows */
+    double t0 = now_s();
+    ok = ok && vkc_submit(1);
+    ch->frames++; ch->wait_ms += (now_s() - t0) * 1e3;
+    if (!ok) return 0;
+    mc_commit(ch, m, n, pb);
+    if (ro) memcpy(lc, vkc_ptr(ch->outd), (size_t)ro * V * sizeof(float));
+    if (!ch->full) memcpy(hr, vkc_ptr(ch->h2d), (size_t)n * H * sizeof(float));
+    return 1;
+}
+
 /* Every layer for the S rows h (the embedded rows, pictures spliced) at pos_base, the
  * logits as forward() wants them (NULL: none; all_rows: [S][V], else the last row's).
- * Returns how many rows it computed: S, or fewer when the device was lost or the chain
+ * Returns how many rows it computed: S, or fewer when a device was lost or the chain
  * declined -- the host's caches then hold every position before pos_base + that many,
- * and the CPU runs the rest. A partial chain (ch->full 0) runs its first ch->nl layers
- * here for each chunk, brings the chunk's residual rows down with the frame that ends it,
- * and runs the CPU's layers (layers_cpu, from nl) and the head (head_cpu) on them before
- * the next chunk, in xn and tmp (forward()'s rows): a chunk counts as computed once both
- * sides ran it, so a device lost in a later chunk loses nothing either side holds. */
+ * and the CPU runs the rest. Each chunk crosses the primary's layers, then (with one)
+ * the second device's from the rows the primary's brought down; a partial chain's last
+ * chain brings the chunk's residual rows down with the frame that ends it, and the CPU
+ * runs the layers after it (layers_cpu) and the head (head_cpu) on them before the next
+ * chunk, in xn and tmp (forward()'s rows): a chunk counts as computed once every side ran
+ * it, so a device lost in a later chunk loses nothing any side holds. */
 static int mc_forward(Model *m, float *h, int S, int pos_base, float *logits, int all_rows, float *xn, float *tmp) {
     if (!g_vk_chain) return 0;
     if (g_vk_chain == COLI_VK_CHAIN_PREFILL && S <= 2) return 0;   /* prompts only: decode on the CPU */
-    MimoChain *ch = mc_setup(m);
+    MimoChain *ch = mc_setup(m), *ch2 = NULL;
     if (!ch || ch->failed) return 0;
-    Cfg *c = &m->c; int H = c->hidden, L = ch->nl, V = c->vocab, full = ch->full;
+    if (g_mc_fit2_on && !ch->full && ch->nl == g_mc_fit.n) {
+        vkc_device(1);
+        ch2 = mc_setup_dev(m, 1);
+        vkc_device(0);
+        if (ch2 && (ch2->failed || ch2->lo != ch->lo + ch->nl)) ch2 = NULL;
+    }
+    MimoChain *last_ch = ch2 ? ch2 : ch;
+    Cfg *c = &m->c; int H = c->hidden, V = c->vocab, full = last_ch->full, done_layers = last_ch->lo + last_ch->nl;
     int CH = mc_chunk_rows(ch, m), rows = S < CH ? S : CH;
     if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
+    if (ch2) {
+        vkc_device(1);
+        int CH2 = mc_chunk_rows(ch2, m);
+        vkc_device(0);
+        if (rows > CH2) rows = CH2;
+        if (ch2->ks.on && rows > ch2->ks.chunk) rows = ch2->ks.chunk;
+    }
     int out = logits && all_rows ? rows : 1;
-    if (!mc_scratch(ch, m, rows, out)) {
+    int sc = mc_scratch(ch, m, rows, ch->full ? out : 1);
+    if (sc && ch2) { vkc_device(1); sc = mc_scratch(ch2, m, rows, ch2->full ? out : 1); vkc_device(0); }
+    if (!sc) {
         fprintf(stderr, "[VK] mimo chain: device memory for %d rows refused; per-matrix path\n", rows);
         ch->failed = 1;
         return 0;
     }
     vkc_gemm_rows(-1);
     int done = 0;
+    MimoChain *at = ch;
     for (int c0 = 0; c0 < S; c0 += rows) {
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0, last = c0 + n == S;
-        if (!vkc_begin() || !vkc_write(ch->x, 0, h + (size_t)c0 * H, (size_t)n * H * sizeof(float)) ||
-            !mc_push_state(ch, m, pb, n)) goto lost;
-        float *cs = (float *)vkc_ptr(ch->cs);   /* the CPU's angles, cosines and sines (rope()) */
-        for (int k = 0; k < 2; k++) {
-            int rd = c->rope_dim[k], half = rd / 2;
-            for (int s = 0; s < n; s++) for (int j = 0; j < half; j++) {
-                float inv = 1.0f / powf(c->theta[k], (float)(2 * j) / (float)rd);
-                float ang = inv * (float)(pb + s);
-                cs[ch->rd_off[k] + (s * half + j) * 2] = cosf(ang);
-                cs[ch->rd_off[k] + (s * half + j) * 2 + 1] = sinf(ang);
-            }
-        }
-        int ok = 1, pending = 0;
-        for (int i = 0; i < L && ok; i++) {
-            if (pending) ok = mc_add(ch->x, ch->routed, n * H);   /* the routed experts join, as h += out */
-            pending = 0;
-            ok = ok && mc_norm(ch->x, 0, ch->prm, ch->o_ln1[i], ch->nrm, 0, n, H, c->eps) &&
-                 mc_attention(ch, m, i, n, pb) && mc_add(ch->x, ch->tmp, n * H) &&
-                 mc_norm(ch->x, 0, ch->prm, ch->o_ln2[i], ch->nrm, 0, n, H, c->eps);
-            if (ok && !c->moe[i]) ok = mc_dense_mlp(ch, m, i, n) && mc_add(ch->x, ch->tmp, n * H);
-            else if (ok) {
-                ok = vkc_copy(ch->h2d, 0, ch->nrm, 0, (size_t)n * H);
-                double t0 = now_s();
-                /* while the frame runs, the tier loads the experts this layer will likely
-                 * stream (a big prompt chunk only) */
-                ok = ok && vkc_submit(0);
-                if (ok) vkt_stream_prefetch(i, n);
-                ok = ok && vkc_finish();
-                ch->frames++; ch->wait_ms += (now_s() - t0) * 1e3;
-                if (!ok) break;
-                double t1 = now_s();
-                moe(m, i, (const float *)vkc_ptr(ch->h2d), n, ch->host_out);
-                memcpy(vkc_ptr(ch->routed), ch->host_out, (size_t)n * H * sizeof(float));
-                ch->host_ms += (now_s() - t1) * 1e3;
-                ok = vkc_begin();
-                pending = 1;
-            }
-        }
-        if (ok && pending) ok = mc_add(ch->x, ch->routed, n * H);
         int ro = !full ? 0 : logits && all_rows ? n : logits && last ? 1 : 0;
-        if (ok && ro) ok = mc_norm(ch->x, (size_t)(n - ro) * H, ch->prm, ch->o_final, ch->fin, 0, ro, H, c->eps) &&
-                           vkc_matmul((ColiVkTensor *)m->head.vk, ch->fin, 0, ch->outd, 0, ro);
-        if (ok && !full) ok = vkc_copy(ch->h2d, 0, ch->x, 0, (size_t)n * H);   /* the handoff to the CPU's layers */
-        double t0 = now_s();
-        ok = ok && vkc_submit(1);
-        ch->frames++; ch->wait_ms += (now_s() - t0) * 1e3;
-        if (!ok) goto lost;
-        mc_commit(ch, m, n, pb);
-        if (ro) memcpy(all_rows ? logits + (size_t)c0 * V : logits, vkc_ptr(ch->outd), (size_t)ro * V * sizeof(float));
+        float *hr = h + (size_t)c0 * H, *lc = all_rows ? logits + (size_t)c0 * V : logits;
+        at = ch;
+        /* the chunk's rows as they came in: the primary's residual replaces them, and if the
+         * second device is lost the CPU runs the chunk from these */
+        if (ch2) {
+            float *keep = (float *)realloc(ch2->host_in, (size_t)rows * H * sizeof(float));
+            if (!keep) goto lost;
+            ch2->host_in = keep;
+            memcpy(keep, hr, (size_t)n * H * sizeof(float));
+        }
+        if (!mc_chunk(ch, m, hr, n, pb, ch2 ? 0 : ro, lc)) goto lost;
+        if (ch2) {
+            at = ch2;
+            vkc_device(1);
+            int ok = mc_chunk(ch2, m, hr, n, pb, ro, lc);
+            vkc_device(0);
+            if (!ok) { memcpy(hr, ch2->host_in, (size_t)n * H * sizeof(float)); goto lost; }
+        }
         if (!full) {   /* the CPU's layers and the head on the chunk's rows */
-            float *hr = h + (size_t)c0 * H;
-            memcpy(hr, vkc_ptr(ch->h2d), (size_t)n * H * sizeof(float));
             double t1 = now_s();
-            layers_cpu(m, hr, n, pb, L, xn, tmp, NULL);
-            float *lc = logits && all_rows ? logits + (size_t)c0 * V : logits && last ? logits : NULL;
-            if (lc) head_cpu(m, hr, n, lc, all_rows, xn);
-            ch->host_ms += (now_s() - t1) * 1e3;
+            layers_cpu(m, hr, n, pb, done_layers, xn, tmp, NULL);
+            float *lcc = logits && all_rows ? logits + (size_t)c0 * V : logits && last ? logits : NULL;
+            if (lcc) head_cpu(m, hr, n, lcc, all_rows, xn);
+            last_ch->host_ms += (now_s() - t1) * 1e3;
         }
         done = c0 + n;
     }
     ch->forwards++;
+    if (ch2) ch2->forwards++;
     return S;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost(); }
+    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(at->d); }
+    vkc_device(0);
     g_vk_chain = 0;
     ch->failed = 1;
+    if (ch2) ch2->failed = 1;
     fprintf(stderr, "[VK] mimo chain: the device was lost at position %d; the host's caches hold every "
                     "position before it, and the CPU runs from there on\n", pos_base + done);
     return done;
 }
 
 static void mc_report(Model *m, const char *what) {
-    MimoChain *ch = (MimoChain *)m->vkchain;
-    if (!ch || !ch->ok || !ch->forwards) return;
-    VkcStats st; vkc_stats(&st);
-    fprintf(stderr, "[VK] mimo chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
-                    "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device (%s)\n",
-            ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, ch->wait_ms, ch->host_ms,
-            st.dev_bytes / 1048576.0, what);
-    vkc_kv_report(&ch->ks);
-    vkc_prof_print();
+    for (int d = 0; d < 2; d++) {
+        MimoChain *ch = mc_of(m, d);
+        if (!ch || !ch->ok || !ch->forwards) continue;
+        int was = vkc_device(d);
+        VkcStats st; vkc_stats(&st);
+        fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
+                        "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device (%s)\n",
+                mc_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, ch->wait_ms, ch->host_ms,
+                st.dev_bytes / 1048576.0, what);
+        vkc_kv_report(&ch->ks);
+        vkc_prof_print();
+        vkc_device(was);
+    }
 }

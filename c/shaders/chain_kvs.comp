@@ -40,6 +40,12 @@
 //   rope key at rope_off + r*rope_row. flags 1: the normalized clat at o_off + s*o_row
 //   + h*o_seg, as chain_mla writes it; else acc there and (m, l) at st_off + (s*H+h)*2.
 //   Limits: K <= 1024, R <= 128.
+// flags 32 (cold), modes 0, 1 and 3: the host's positions of the row instead of the
+//   device's, read from a buffer in the host cache's own layout (an import of its pages:
+//   position t is row t, `rows` its positions for head-major K/V), so the device computes
+//   the part the CPU would: causal, [the row's first position, its share's first block);
+//   listed, the entries older than the share and not in a pinned block. The table only
+//   says what the device holds; a part's (m, l, acc) as without the flag. No sink.
 // mode 2, the merge: segment g = (s, h) of d floats, s = g / H. The device's part at
 //   a_off + s*a_row + h*a_seg with its (m, l) at sa_off + 2g (buffer 0), the host's
 //   packed at c_off + g*d with (m, l) at sc_off + 2g (buffer 1); the result at o_off +
@@ -96,6 +102,14 @@ int slot_of(int t, int B, int bt_off, int nblk) {
     int j = b < nblk ? tab[bt_off + b] : -1;
     return j < 0 ? -1 : (j & 0x3fffffff);
 }
+// a listed position the host takes (flags 32): older than the row's share, not pinned
+bool cold_pos(int t, int pos, int B, int bt_off, int nblk, int anchor) {
+    if (t < 0 || t > pos) return false;
+    int b = t / B;
+    if (b >= pos / B - anchor) return false;
+    int j = b < nblk ? tab[bt_off + b] : -1;
+    return j < 0 || (j & 0x40000000) == 0;
+}
 // the device row of a listed position, or -1 (the host's): the anchored blocks of the
 // row at pos, and pinned ones
 int dev_row(int t, int pos, int B, int bt_off, int nblk, int anchor) {
@@ -121,9 +135,11 @@ void gqa() {
     int qb = q_off + s * q_row + h * q_seg;
     for (int d = tid; d < hd; d += 256) qs[d] = b0[qb + d];
     int pos = pos_base + s;
-    int first = max(win > 0 ? max(0, pos - win + 1) : 0, (pos / B - anchor) * B);
+    bool cold = (flags & 32) != 0;
+    int start = win > 0 ? max(0, pos - win + 1) : 0, share0 = (pos / B - anchor) * B;
+    int first = cold ? start : max(start, share0);
     bool list = false;
-    int lb = 0, n = pos - first + 1;
+    int lb = 0, n = cold ? max(0, min(pos + 1, share0) - start) : pos - first + 1;
     if (sel_row > 0) {
         lb = sel_off + s * sel_row;
         int c = sel[lb];
@@ -134,7 +150,8 @@ void gqa() {
     for (int t0 = 0; t0 < n; t0 += 256) {
         int i = t0 + tid, r = -1;
         if (i < n) {
-            if (list) r = dev_row(sel[lb + 1 + i], pos, B, bt_off, nblk, anchor);
+            if (list) { int t = sel[lb + 1 + i]; r = cold ? (cold_pos(t, pos, B, bt_off, nblk, anchor) ? t : -1) : dev_row(t, pos, B, bt_off, nblk, anchor); }
+            else if (cold) r = first + i;
             else { int t = first + i, j = slot_of(t, B, bt_off, nblk); r = j >= 0 ? j * B + t % B : -1; }
         }
         float sv = -3.0e38;
@@ -205,9 +222,11 @@ void mla() {
     for (int i = tid; i < K; i += 256) qs[i] = b0[qb + i];
     for (int i = tid; i < R; i += 256) qrs[i] = b1[rbq + i];
     int pos = pos_base + s;
-    int first = max(kv_start, (pos / B - anchor) * B);
+    bool cold = (flags & 32) != 0;
+    int share0 = (pos / B - anchor) * B;
+    int first = cold ? kv_start : max(kv_start, share0);
     bool list = false;
-    int lb = 0, n = max(0, pos - first + 1);
+    int lb = 0, n = cold ? max(0, min(pos + 1, share0) - kv_start) : max(0, pos - first + 1);
     if (sel_row > 0) {
         lb = sel_off + s * sel_row;
         int c = sel[lb];
@@ -222,7 +241,8 @@ void mla() {
             int r = -1;
             if (tid < cnt) {
                 int i = t0 + tid;
-                if (list) r = dev_row(sel[lb + 1 + i], pos, B, bt_off, nblk, anchor);
+                if (list) { int t = sel[lb + 1 + i]; r = cold ? (cold_pos(t, pos, B, bt_off, nblk, anchor) ? t : -1) : dev_row(t, pos, B, bt_off, nblk, anchor); }
+                else if (cold) r = first + i;
                 else { int t = first + i, j = slot_of(t, B, bt_off, nblk); r = j >= 0 ? j * B + t % B : -1; }
             }
             pr[tid] = r;
@@ -321,13 +341,15 @@ void rel() {
     int qb = q_off + s * q_row + h * hd;
     for (int d = tid; d < hd; d += 256) qs[d] = b0[qb + d];
     for (int j = tid; j < d_rel; j += 256) qrs[j] = b4[r_off + s * r_row + h * d_rel + j];
-    int pos = pos_base + s, first = max(0, (pos / B - anchor) * B), n = pos - first + 1;
+    bool cold = (flags & 32) != 0;
+    int pos = pos_base + s, share0 = (pos / B - anchor) * B;
+    int first = cold ? 0 : max(0, share0), n = cold ? max(0, min(pos + 1, share0)) : pos - first + 1;
     float ts = intBitsToFloat(sel[tau_off + s]);
     barrier();
     float m = -3.0e38, l = 0.0, acc = 0.0;
     for (int t0 = 0; t0 < n; t0 += 256) {
         int i = t0 + tid, r = -1, t = first + i;
-        if (i < n) { int j = slot_of(t, B, bt_off, nblk); r = j >= 0 ? j * B + t % B : -1; }
+        if (i < n) { if (cold) r = t; else { int j = slot_of(t, B, bt_off, nblk); r = j >= 0 ? j * B + t % B : -1; } }
         float sv = -3.0e38;
         if (r >= 0) {
             int kb = k_off + (kvh * rows + r) * hd;
@@ -473,10 +495,43 @@ void dsa() {
     if (tid == 0 && (flags & 8) == 0) { b3[st_off + (s * H + h) * 2] = best; b3[st_off + (s * H + h) * 2 + 1] = den; }
 }
 
+// ---- mode 5 ----------------------------------------------------------------------
+// The chunks of a part joined (chain_attnb's split over positions): segment g of d
+// floats, chunk z's sum at a_off + z*a_z + g*d and its (m, l) at sa_off + z*sa_z + 2g
+// (buffer 0), joined in chunk order as the host joins its chunks (vkc_kv_join): the part
+// at o_off + g*d, (m, l) at so_off + 2g (buffer 3). A chunk with no position weighs nothing.
+void join() {
+    int n = p.v[1], d = p.v[2], nz = p.v[3], a_off = p.v[4], a_z = p.v[5], sa_off = p.v[6], sa_z = p.v[7];
+    int o_off = p.v[8], so_off = p.v[9];
+    int g = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x), tid = int(gl_LocalInvocationID.x);
+    if (g >= n) return;
+    float m = -3.0e38, l = 0.0;
+    for (int z = 0; z < nz; z++) {
+        float mz = b0[sa_off + z * sa_z + 2 * g], lz = b0[sa_off + z * sa_z + 2 * g + 1];
+        if (mz <= -1.0e38) continue;
+        float mn = max(m, mz);
+        l = l * (m > -1.0e38 ? exp(m - mn) : 0.0) + lz * exp(mz - mn);
+        m = mn;
+    }
+    for (int i = tid; i < d; i += 256) {
+        float acc = 0.0, mm = -3.0e38;
+        for (int z = 0; z < nz; z++) {
+            float mz = b0[sa_off + z * sa_z + 2 * g];
+            if (mz <= -1.0e38) continue;
+            float mn = max(mm, mz);
+            acc = acc * (mm > -1.0e38 ? exp(mm - mn) : 0.0) + b0[a_off + z * a_z + g * d + i] * exp(mz - mn);
+            mm = mn;
+        }
+        b3[o_off + g * d + i] = acc;
+    }
+    if (tid == 0) { b3[so_off + 2 * g] = m; b3[so_off + 2 * g + 1] = l; }
+}
+
 void main() {
     if (MODE == 0) gqa();
     else if (MODE == 1) mla();
     else if (MODE == 2) merge();
     else if (MODE == 3) rel();
+    else if (MODE == 5) join();
     else dsa();
 }

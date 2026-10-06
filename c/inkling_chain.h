@@ -85,7 +85,8 @@
 
 typedef struct {
     int ok, failed, tried;                     /* tried: inkc_setup ran (ok: the chain runs) */
-    int nl, full;                              /* layers on the device (the first nl); lm_head there too */
+    int lo, d;                                 /* its layers start at lo, on device d (vkc_device) */
+    int nl, full;                              /* layers on the device (lo..lo+nl-1); lm_head there too */
     int rows;                                  /* scratch capacity in rows */
     int max_t; float **hostK;                  /* the host cache the mirrors copy */
     VkcBuf *prm;                               /* norms, bias banks, convolution taps */
@@ -117,20 +118,32 @@ static int64_t inkc_cs_cells(const Cfg *c, int bank, int i) {
 }
 /* The layers the chain runs on the device: the first n of a partial chain's fit, else all. */
 static int inkc_layers(const Model *m) { return g_inkc_fit.L ? g_inkc_fit.n : m->c.n_layers; }
+/* The layers after the primary's on COLI_VK_DEV2's device (docs/vulkan.md, "Layers on two
+ * devices"): a second chain from layer g_inkc_fit.n, its own fit (inkc_fit_start), its own
+ * copies of their matrices there (the per-matrix path leaves those layers to the CPU). A
+ * forward runs the primary's layers, brings the residual rows back and runs these; the CPU
+ * runs what is left. */
+static VkcFit g_inkc_fit2;
+static int g_inkc_fit2_on;
+static int g_inkc_ran;   /* the layers the last forward ran on the devices, from layer 0 */
+static int inkc_ran(void) { return g_inkc_ran; }
+static InkChain *inkc_of(Model *m, int d) { return (InkChain *)(d ? m->vkchain2 : m->vkchain); }
+static const char *inkc_name(const InkChain *ch) { return ch && ch->d ? "inkling dev2" : "inkling"; }
+static int inkc_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
 /* The device copy of a resident matrix or of a view of one (wt_off_i: a shared expert
  * of the fused [ns][R][I] tensors): the per-matrix path's copy when it keeps a table
  * for the tensor (ink_vk_view_tensor, keyed by the view's first element in the tensor),
  * else the chain's own. NULL: not a form the shaders read as this CPU does (ink_vk_fmt). */
-static ColiVkTensor *inkc_tensor(Wt view, int I, int O) {
-    if (view.vk) return ink_vk_view_tensor(&view, I, O);   /* the per-matrix path's table, keyed by the view */
+static ColiVkTensor *inkc_tensor(int d, Wt view, int I, int O) {
+    if (view.vk && !d) return ink_vk_view_tensor(&view, I, O);   /* the per-matrix path's table, keyed by the view */
     int fmt = ink_vk_fmt(&view);
     const void *data = view.q4 ? (const void *)view.q4 : view.f ? (const void *)view.f : (const void *)view.h;
     const float *sc = view.q4 ? view.qs : NULL;
     int gs = view.q4 ? view.gs : 0;
     if (!fmt || !data) return NULL;
-    ColiVkTensor *t = NULL;
-    return coli_vk_tensor_ensure(&t, data, sc, fmt, I, O, gs) ? t : NULL;
+    ColiVkTensor *t = NULL;   /* the second device's: its own copy there */
+    return (d ? coli_vk_tensor_ensure2(&t, data, sc, fmt, I, O, gs) : coli_vk_tensor_ensure(&t, data, sc, fmt, I, O, gs)) ? t : NULL;
 }
 
 /* A geometry the shaders take (head dim up to 256, a bias bank up to 64 wide, up to 9
@@ -168,12 +181,13 @@ static void inkc_geom(InkChain *ch, const Model *m) {
     }
 }
 /* The chain's state, its tables empty (inkc_setup and inkc_place_init fill them). */
-static InkChain *inkc_new(Model *m) {
-    InkChain *ch = (InkChain *)m->vkchain;
+static InkChain *inkc_new_dev(Model *m, int d) {
+    InkChain *ch = inkc_of(m, d);
     if (ch) return ch;
     ch = (InkChain *)calloc(1, sizeof *ch);
     if (!ch) return NULL;
-    m->vkchain = ch;
+    if (d) m->vkchain2 = ch; else m->vkchain = ch;
+    ch->d = d; ch->lo = d ? g_inkc_fit.n : 0;
     int L = m->c.n_layers, nsl = m->c.n_shared > 0 ? m->c.n_shared : 1;
 #define INKC_ARR(f, T) (ch->f = calloc((size_t)L, sizeof(T)))
     if (!INKC_ARR(o_in, size_t) || !INKC_ARR(o_post, size_t) || !INKC_ARR(o_qn, size_t) || !INKC_ARR(o_kn, size_t) ||
@@ -190,6 +204,7 @@ static InkChain *inkc_new(Model *m) {
     if (!ch->t_sg || !ch->t_su || !ch->t_sd || !ch->o_csd) return NULL;
     return ch;
 }
+static InkChain *inkc_new(Model *m) { return inkc_new_dev(m, 0); }
 
 /* ---- a partial chain (vk_chain.h, vkc_fit): the first n layers on the device ----------
  * Layer i's matrices, all of them or none: q, k, v, the relative-bias projection r and
@@ -201,18 +216,20 @@ static int inkc_place_layer(Model *m, InkChain *ch, int i, const char **what) {
     int D = c->hidden, E = c->n_experts, ns = c->n_shared, nsl = ns > 0 ? ns : 1, dr = c->d_rel;
     int H = L_HEADS(c, i), hd = L_HD(c, i), kvo = L_KV(c, i) * hd, I = c->moe_inter;
     *what = NULL;
-    if (!(ch->t_q[i] = inkc_tensor(l->q, D, H * hd)) || !(ch->t_k[i] = inkc_tensor(l->k, D, kvo)) ||
-        !(ch->t_v[i] = inkc_tensor(l->v, D, kvo)) || !(ch->t_r[i] = inkc_tensor(l->r, D, H * dr)) ||
-        !(ch->t_o[i] = inkc_tensor(l->o, H * hd, D))) *what = "an attention matrix";
+    int d = ch->d;
+    if (!(ch->t_q[i] = inkc_tensor(d, l->q, D, H * hd)) || !(ch->t_k[i] = inkc_tensor(d, l->k, D, kvo)) ||
+        !(ch->t_v[i] = inkc_tensor(d, l->v, D, kvo)) || !(ch->t_r[i] = inkc_tensor(d, l->r, D, H * dr)) ||
+        !(ch->t_o[i] = inkc_tensor(d, l->o, H * hd, D))) *what = "an attention matrix";
     else if (!c->sparse[i]) {
-        if (!(ch->t_dg[i] = inkc_tensor(l->dg, D, c->dense_inter)) || !(ch->t_du[i] = inkc_tensor(l->du, D, c->dense_inter)) ||
-            !(ch->t_dd[i] = inkc_tensor(l->dd, c->dense_inter, D))) *what = "a dense MLP matrix";
+        if (!(ch->t_dg[i] = inkc_tensor(d, l->dg, D, c->dense_inter)) || !(ch->t_du[i] = inkc_tensor(d, l->du, D, c->dense_inter)) ||
+            !(ch->t_dd[i] = inkc_tensor(d, l->dd, c->dense_inter, D))) *what = "a dense MLP matrix";
     } else {
-        if (!coli_vk_tensor_ensure(&ch->t_router[i], l->router, NULL, 10, D, E + ns, 0)) *what = "the router";
+        if (!(d ? coli_vk_tensor_ensure2(&ch->t_router[i], l->router, NULL, 10, D, E + ns, 0)
+                : coli_vk_tensor_ensure(&ch->t_router[i], l->router, NULL, 10, D, E + ns, 0))) *what = "the router";
         for (int j = 0; j < ns && !*what; j++)
-            if (!(ch->t_sg[(size_t)i * nsl + j] = inkc_tensor(wt_off_i(l->sh_g, (int64_t)j * I * D, D), D, I)) ||
-                !(ch->t_su[(size_t)i * nsl + j] = inkc_tensor(wt_off_i(l->sh_u, (int64_t)j * I * D, D), D, I)) ||
-                !(ch->t_sd[(size_t)i * nsl + j] = inkc_tensor(wt_off_i(l->sh_d, (int64_t)j * D * I, I), I, D)))
+            if (!(ch->t_sg[(size_t)i * nsl + j] = inkc_tensor(d, wt_off_i(l->sh_g, (int64_t)j * I * D, D), D, I)) ||
+                !(ch->t_su[(size_t)i * nsl + j] = inkc_tensor(d, wt_off_i(l->sh_u, (int64_t)j * I * D, D), D, I)) ||
+                !(ch->t_sd[(size_t)i * nsl + j] = inkc_tensor(d, wt_off_i(l->sh_d, (int64_t)j * D * I, I), I, D)))
                 *what = "a shared expert";
     }
     if (*what && g_inkc_fit.L) inkc_unplace_layer(m, ch, i);   /* without a fit the chain declines as before */
@@ -225,14 +242,14 @@ static void inkc_unplace_layer(Model *m, InkChain *ch, int i) {
     if (vkc_ready()) vkc_finish();
     struct { ColiVkTensor **t; Wt *w; } own[] = {{&ch->t_q[i], &l->q}, {&ch->t_k[i], &l->k}, {&ch->t_v[i], &l->v},
         {&ch->t_r[i], &l->r}, {&ch->t_o[i], &l->o}, {&ch->t_dg[i], &l->dg}, {&ch->t_du[i], &l->du}, {&ch->t_dd[i], &l->dd}};
-    for (size_t k = 0; k < sizeof own / sizeof own[0]; k++) {
-        if (*own[k].t && !own[k].w->vk) coli_vk_tensor_free(*own[k].t);   /* a table's copy goes with its table */
+    for (size_t k = 0; k < sizeof own / sizeof own[0]; k++) {   /* a table's copy goes with its table; the second device's are own */
+        if (*own[k].t && (ch->d || !own[k].w->vk)) coli_vk_tensor_free(*own[k].t);
         *own[k].t = NULL;
     }
     for (int j = 0; j < nsl; j++) {
         ColiVkTensor **t3[3] = {&ch->t_sg[(size_t)i * nsl + j], &ch->t_su[(size_t)i * nsl + j], &ch->t_sd[(size_t)i * nsl + j]};
         Wt *w3[3] = {&l->sh_g, &l->sh_u, &l->sh_d};
-        for (int k = 0; k < 3; k++) { if (*t3[k] && !w3[k]->vk) coli_vk_tensor_free(*t3[k]); *t3[k] = NULL; }
+        for (int k = 0; k < 3; k++) { if (*t3[k] && (ch->d || !w3[k]->vk)) coli_vk_tensor_free(*t3[k]); *t3[k] = NULL; }
     }
     if (ch->t_router[i]) coli_vk_tensor_free(ch->t_router[i]);
     ch->t_router[i] = NULL;
@@ -257,7 +274,7 @@ static void inkc_shrink(Model *m, InkChain *ch, int i, const char *what) {
     snprintf(why, sizeof why, "%s did not go up", what ? what : "a matrix");
     inkc_unplace_layer(m, ch, i);
     inkc_refuse_from(m, i);
-    vkc_fit_shrink("inkling", &g_inkc_fit, i, why);
+    vkc_fit_shrink(inkc_name(ch), ch->d ? &g_inkc_fit2 : &g_inkc_fit, i - ch->lo, why);
 }
 
 /* The fit (vkc_fit), at start-up before any upload and before the expert cache is sized.
@@ -315,6 +332,22 @@ static void inkc_fit_start(Model *m) {
     size_t fixed = (size_t)g_inkc_count + vkc_fit_buf((size_t)R * D * sizeof(float)) + vkc_fit_buf((size_t)D * sizeof(float));
     g_inkc_count = -1; g_inkc_fitcount = 0;
     vkc_fit("inkling", L, per, mat, fixed, tail, &g_inkc_fit);
+    /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
+     * n0 with that device's free memory, its pipelines up now (inkc_place_init places its
+     * layers; the head goes with the last one when there is room) */
+    int n0 = g_inkc_fit.n;
+    if (vkc_fit_partial(&g_inkc_fit) && n0 > 0 && n0 < L && inkc_dev2_wanted() && getenv("COLI_VK_DEV2") &&
+        coli_vk_dev2_open_env()) {
+        vkc_device(1);
+        int n2 = vkc_fit("inkling dev2", L - n0, per + n0, mat + n0, fixed, tail, &g_inkc_fit2);
+        if (n2 > 0 && !vkc_init()) {
+            fprintf(stderr, "[VK] inkling chain: the second device's pipelines did not come up; its layers stay on the CPU\n");
+            n2 = 0;
+        }
+        g_inkc_fit2_on = n2 > 0;
+        if (!g_inkc_fit2_on) g_inkc_fit2.tail = 0;
+        vkc_device(0);
+    }
     free(per); free(mat);
 }
 /* What a partial chain still allocates on the device after its layers went up (the
@@ -348,14 +381,36 @@ static void inkc_place_init(Model *m, int *dropped) {
         inkc_refuse_from(m, 0);
         vkc_fit_shrink("inkling", &g_inkc_fit, 0, "no host memory for the chain's tables");
     }
+    int n0 = g_inkc_fit.n;
     for (int i = 0; ch && i < g_inkc_fit.n; i++) {
         const char *what = NULL;
         if (!inkc_place_layer(m, ch, i, &what)) { inkc_shrink(m, ch, i, what); break; }
         if (dropped) ink_dho_drop_layer(m, i, dropped);
         vkc_fit_mark(&g_inkc_fit, i);
     }
-    if (vkc_fit_partial(&g_inkc_fit)) inkc_refuse_from(m, g_inkc_fit.n);   /* the CPU's layers and lm_head stay there */
+    int end = g_inkc_fit.n;
+    if (vkc_fit_partial(&g_inkc_fit)) inkc_refuse_from(m, end);   /* the CPU's layers and lm_head stay there */
     vkc_fit_placed("inkling", &g_inkc_fit);
+    if (g_inkc_fit2_on && g_inkc_fit.n < n0) {
+        /* the primary placed fewer layers than its fit: the second device's would not follow
+         * them, so they stay on the CPU too */
+        fprintf(stderr, "[VK] inkling chain: the primary device stopped before layer %d; layers %d..%d stay on the CPU, "
+                        "not on the second device\n", n0, n0, n0 + g_inkc_fit2.n - 1);
+        g_inkc_fit2_on = 0;
+        vkc_device(1); vkc_shutdown(); vkc_device(0);
+    } else if (g_inkc_fit2_on) {   /* the second device's layers: their own copies there, host copies kept */
+        vkc_device(1);
+        InkChain *c2 = inkc_new_dev(m, 1);
+        for (int i = n0; c2 && i < n0 + g_inkc_fit2.n; i++) {
+            const char *what = NULL;
+            if (!inkc_place_layer(m, c2, i, &what)) { inkc_shrink(m, c2, i, what); break; }
+            vkc_fit_mark(&g_inkc_fit2, i - n0);
+        }
+        if (!c2) g_inkc_fit2.n = 0;
+        vkc_fit_placed("inkling dev2", &g_inkc_fit2);
+        if (!g_inkc_fit2.n) { g_inkc_fit2_on = 0; vkc_shutdown(); }
+        vkc_device(0);
+    }
     g_inkc_placed = 1;
 }
 
@@ -363,10 +418,12 @@ static void inkc_place_init(Model *m, int *dropped) {
  * With a fit the first n layers only (placed at start-up when the chain is partial or the
  * host copies go; here at the first forward otherwise), and lm_head when the tail is on. */
 static void inkc_free_own(Model *m, InkChain *ch);
-static InkChain *inkc_setup(Model *m) {
-    InkChain *ch = (InkChain *)m->vkchain;
+/* d = 1: the second device's chain (its layers placed by inkc_place_init; device 1 current). */
+static InkChain *inkc_setup_dev(Model *m, int d) {
+    InkChain *ch = inkc_of(m, d);
     if (ch && ch->tried) return ch->ok ? ch : NULL;
-    if (!ch && !(ch = inkc_new(m))) return NULL;
+    if (d && !g_inkc_fit2_on) return NULL;
+    if (!ch && !(ch = inkc_new_dev(m, d))) return NULL;
     ch->tried = 1;
     Cfg *c = &m->c; int L = c->n_layers, D = c->hidden, CK = c->conv_k, dr = c->d_rel;
     if (!inkc_geometry_ok(m, 1)) return NULL;
@@ -377,22 +434,23 @@ static InkChain *inkc_setup(Model *m) {
     }
     /* the tensors: the per-matrix path's device copies where it keeps them */
     const char *what = NULL;
-    int fit = g_inkc_fit.L > 0;
-    for (int i = 0; i < inkc_layers(m) && !what; i++) {
+    VkcFit *fitp = d ? &g_inkc_fit2 : &g_inkc_fit;
+    int fit = fitp->L > 0, lo = ch->lo;
+    for (int i = lo; i < lo + (d ? g_inkc_fit2.n : inkc_layers(m)) && !what; i++) {
         if (ch->t_q[i]) continue;   /* placed at start-up */
         if (!inkc_place_layer(m, ch, i, &what)) {
             if (fit) { inkc_shrink(m, ch, i, what); what = NULL; break; }
             continue;
         }
-        if (fit) vkc_fit_mark(&g_inkc_fit, i);
+        if (fit) vkc_fit_mark(fitp, i - lo);
     }
-    int nl = inkc_layers(m);
-    if (fit && !g_inkc_placed) { vkc_fit_placed("inkling", &g_inkc_fit); g_inkc_placed = 1; }   /* placed here, lm_head next */
-    if (fit && vkc_fit_partial(&g_inkc_fit)) inkc_refuse_from(m, nl);
-    if (!what && nl == L && (!fit || g_inkc_fit.tail) && !(ch->t_lm = inkc_tensor(m->lm_head, D, c->unpad_vocab))) {
+    int nl = d ? g_inkc_fit2.n : inkc_layers(m);
+    if (fit && !d && !g_inkc_placed) { vkc_fit_placed("inkling", &g_inkc_fit); g_inkc_placed = 1; }   /* placed here, lm_head next */
+    if (fit && !d && vkc_fit_partial(&g_inkc_fit)) inkc_refuse_from(m, lo + nl);
+    if (!what && lo + nl == L && (!fit || fitp->tail) && !(ch->t_lm = inkc_tensor(d, m->lm_head, D, c->unpad_vocab))) {
         if (!fit) what = "lm_head";
         else {   /* the fit's tail did not go up: every layer here, the head on the CPU */
-            g_inkc_fit.tail = 0;
+            fitp->tail = 0;
             inkc_refuse_from(m, L);
             fprintf(stderr, "[VK] inkling chain: lm_head did not reach the device; it runs on the CPU, the layers here\n");
         }
@@ -409,7 +467,7 @@ static InkChain *inkc_setup(Model *m) {
     ch->nl = nl; ch->full = ch->t_lm != NULL;
     /* the parameter arena of the device's layers: offsets, then one upload */
     size_t n = 0;
-    for (int i = 0; i < nl; i++) {
+    for (int i = lo; i < lo + nl; i++) {
         int hd = L_HD(c, i), kvo = L_KV(c, i) * hd;
         ch->o_in[i] = n; n += D; ch->o_post[i] = n; n += D;
         ch->o_qn[i] = n; n += hd; ch->o_kn[i] = n; n += hd;
@@ -420,7 +478,7 @@ static InkChain *inkc_setup(Model *m) {
     ch->o_final = n; n += D;
     float *arena = calloc(n, sizeof(float));
     if (!arena) { inkc_free_own(m, ch); return NULL; }
-    for (int i = 0; i < nl; i++) {
+    for (int i = lo; i < lo + nl; i++) {
         Layer *l = &m->L[i];
         int hd = L_HD(c, i), kvo = L_KV(c, i) * hd;
         memcpy(arena + ch->o_in[i], l->in_ln, D * sizeof(float));
@@ -437,10 +495,18 @@ static InkChain *inkc_setup(Model *m) {
     ch->prm = vkc_buf(n * sizeof(float), VKC_DEV);
     int ok = ch->prm && vkc_begin() && vkc_write(ch->prm, 0, arena, n * sizeof(float)) && vkc_submit(1);
     free(arena);
-    if (!ok) { inkc_free_own(m, ch); return NULL; }
+    if (!ok) {
+        inkc_free_own(m, ch);
+        if (d && fit) {   /* the second device's parameter buffer: its layers stay on the CPU */
+            vkc_fit_shrink(inkc_name(ch), fitp, 0, vkc_lost() ? "the device was lost" : "its parameter buffer was refused");
+            g_inkc_fit2_on = 0;
+            vkc_shutdown();
+        }
+        return NULL;
+    }
     /* geometry of the scratch; the frames: a MoE layer ends one (its host step) */
     inkc_geom(ch, m);
-    for (int i = 0; i < nl; i++)
+    for (int i = lo; i < lo + nl; i++)
         for (int b = 0; b < 4; b++) {
             ch->o_csd[(size_t)b * L + i] = ch->csd_n; ch->csd_n += (size_t)inkc_cs_cells(c, b, i);
             if (!(ch->ring[b][i] = vkc_buf((size_t)(inkc_cs_cells(c, b, i) > 0 ? inkc_cs_cells(c, b, i) : 1) * sizeof(float), VKC_DEV))) {
@@ -448,16 +514,19 @@ static InkChain *inkc_setup(Model *m) {
                 return NULL;
             }
         }
-    for (int i = 0; i < L; i++) ch->kli[i] = i < nl && !c->local[i] ? ch->nglob++ : -1;
+    for (int i = 0; i < L; i++) ch->kli[i] = i >= lo && i < lo + nl && !c->local[i] ? ch->nglob++ : -1;
     ch->cs_where = INKC_HOST; ch->host_zero = 0;
     ch->ok = 1;
-    int nsp = 0; for (int i = 0; i < nl; i++) nsp += c->sparse[i];
-    fprintf(stderr, "[VK] inkling chain: %d layers on the device (%d MoE), %.1f MiB of parameters\n",
-            nl, nsp, n * 4 / 1048576.0);
+    int nsp = 0; for (int i = lo; i < lo + nl; i++) nsp += c->sparse[i];
+    if (d) fprintf(stderr, "[VK] inkling chain: layers %d..%d on the second device (%d MoE)%s, %.1f MiB of parameters\n",
+                   lo, lo + nl - 1, nsp, ch->full ? ", lm_head too" : "", n * 4 / 1048576.0);
+    else fprintf(stderr, "[VK] inkling chain: %d layers on the device (%d MoE), %.1f MiB of parameters\n",
+                 nl, nsp, n * 4 / 1048576.0);
     return ch;
 }
+static InkChain *inkc_setup(Model *m) { return inkc_setup_dev(m, 0); }
 /* The chain declined after its layers went up: the copies only it holds (its own, not the
- * per-matrix path's tables) are freed, with whatever device memory it took. */
+ * per-matrix path's tables; the second device's are all its own) are freed, with whatever device memory it took. */
 static void inkc_free_own(Model *m, InkChain *ch) {
     if (vkc_ready()) vkc_finish();
     int L = m->c.n_layers, nsl = m->c.n_shared > 0 ? m->c.n_shared : 1;
@@ -465,17 +534,17 @@ static void inkc_free_own(Model *m, InkChain *ch) {
         Layer *l = &m->L[i];
         ColiVkTensor **t[] = {&ch->t_q[i], &ch->t_k[i], &ch->t_v[i], &ch->t_r[i], &ch->t_o[i], &ch->t_dg[i], &ch->t_du[i], &ch->t_dd[i]};
         Wt *w[] = {&l->q, &l->k, &l->v, &l->r, &l->o, &l->dg, &l->du, &l->dd};
-        for (size_t k = 0; k < sizeof t / sizeof t[0]; k++) { if (*t[k] && !w[k]->vk) coli_vk_tensor_free(*t[k]); *t[k] = NULL; }
+        for (size_t k = 0; k < sizeof t / sizeof t[0]; k++) { if (*t[k] && (ch->d || !w[k]->vk)) coli_vk_tensor_free(*t[k]); *t[k] = NULL; }
         for (int j = 0; j < nsl; j++) {
             ColiVkTensor **s[3] = {&ch->t_sg[(size_t)i * nsl + j], &ch->t_su[(size_t)i * nsl + j], &ch->t_sd[(size_t)i * nsl + j]};
             Wt *sw[3] = {&l->sh_g, &l->sh_u, &l->sh_d};
-            for (int k = 0; k < 3; k++) { if (*s[k] && !sw[k]->vk) coli_vk_tensor_free(*s[k]); *s[k] = NULL; }
+            for (int k = 0; k < 3; k++) { if (*s[k] && (ch->d || !sw[k]->vk)) coli_vk_tensor_free(*s[k]); *s[k] = NULL; }
         }
         if (ch->t_router[i]) coli_vk_tensor_free(ch->t_router[i]);
         ch->t_router[i] = NULL;
         for (int b = 0; b < 4; b++) { vkc_free(ch->ring[b][i]); ch->ring[b][i] = NULL; }
     }
-    if (ch->t_lm && !m->lm_head.vk) coli_vk_tensor_free(ch->t_lm);
+    if (ch->t_lm && (ch->d || !m->lm_head.vk)) coli_vk_tensor_free(ch->t_lm);
     ch->t_lm = NULL;
     vkc_free(ch->prm); ch->prm = NULL;
 }
@@ -507,7 +576,7 @@ static int inkc_chunk_rows(InkChain *ch, Model *m) {
         }
         row += (3 * (size_t)heads * (dim + 2) + ch->qo_max + ch->ro_max) * sizeof(float);
     }
-    return vkc_chunk_rows("inkling", row);
+    return vkc_chunk_rows(inkc_name(ch), row);
 }
 /* the scratch buffers for `rows` rows */
 static int inkc_bufs(InkChain *ch, Model *m, int rows) {
@@ -537,9 +606,9 @@ static int inkc_mirror(InkChain *ch, Model *m) {
             if (b > row) row = b;
             held += b * (size_t)ch->drows[i];
         }
-        int plan = ch->nglob ? vkc_kv_plan(&ch->ks, "inkling", ch->nglob, row, m->max_t, 1, 0, held) : 1;
+        int plan = ch->nglob ? vkc_kv_plan(&ch->ks, inkc_name(ch), ch->nglob, row, m->max_t, 1, 0, held) : 1;
         if (!plan) { ch->max_t = 0; ch->hostK = NULL; return 0; }
-        for (int i = 0; i < ch->nl; i++) {
+        for (int i = ch->lo; i < ch->lo + ch->nl; i++) {
             vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
             int cap = kv_ring_rows(c, i, m->max_t), hd = L_HD(c, i), KV = L_KV(c, i);
             int split = ch->ks.on && ch->kli[i] >= 0;
@@ -582,21 +651,26 @@ static int inkc_scratch(InkChain *ch, Model *m, int rows) {
 /* ---- state between the host and the device ----------------------------------- */
 /* The host wrote its convolution states (zero: state_reset's zeros). */
 static void inkc_host_wrote(Model *m, int zero) {
-    InkChain *ch = (InkChain *)m->vkchain;
-    if (!ch || !ch->ok) return;
-    ch->cs_where = INKC_HOST; ch->host_zero = zero;
+    for (int d = 0; d < 2; d++) {
+        InkChain *ch = inkc_of(m, d);
+        if (!ch || !ch->ok) continue;
+        ch->cs_where = INKC_HOST; ch->host_zero = zero;
+    }
 }
-/* A CPU step of S rows from pos_base: its K/V rows and states are the host's alone. */
-static void inkc_cpu_step(Model *m, int pos_base, int S) {
-    InkChain *ch = (InkChain *)m->vkchain;
+/* A CPU step of S rows from pos_base over one chain's layers: their K/V rows and states are
+ * the host's alone. */
+static void inkc_cpu_one(InkChain *ch, int pos_base, int S) {
     if (!ch || !ch->ok) return;
     ch->cs_where = INKC_HOST; ch->host_zero = 0;
-    for (int i = 0; i < ch->nl; i++) {   /* the device's layers: the CPU's keep their state on the host */
+    for (int i = ch->lo; i < ch->lo + ch->nl; i++) {   /* the device's layers: the CPU's keep their state on the host */
         if (ch->ks.on && ch->kli[i] >= 0) { vkc_kv_lower(&ch->ks, ch->kli[i], pos_base); continue; }
         if (ch->dlo[i] >= ch->dhi[i]) { ch->dlo[i] = pos_base; ch->dhi[i] = pos_base + S; continue; }
         if (pos_base < ch->dlo[i]) ch->dlo[i] = pos_base;
         if (pos_base + S > ch->dhi[i]) ch->dhi[i] = pos_base + S;
     }
+}
+static void inkc_cpu_step(Model *m, int pos_base, int S) {
+    for (int d = 0; d < 2; d++) inkc_cpu_one(inkc_of(m, d), pos_base, S);
 }
 /* Record the uploads that make the device state the host's: the convolution states if
  * the host's are newer, and the rows of the last `cap` positions the host wrote alone;
@@ -605,13 +679,13 @@ static void inkc_cpu_step(Model *m, int pos_base, int S) {
 static int inkc_push_state(InkChain *ch, Model *m, int pos_base, int n) {
     Cfg *c = &m->c; int ok = 1;
     if (ch->cs_where == INKC_HOST) {
-        for (int i = 0; i < ch->nl && ok; i++) for (int b = 0; b < 4 && ok; b++) {
+        for (int i = ch->lo; i < ch->lo + ch->nl && ok; i++) for (int b = 0; b < 4 && ok; b++) {
             size_t nc = (size_t)inkc_cs_cells(c, b, i);
             ok = ch->host_zero ? vkc_zero(ch->ring[b][i], 0, nc) : vkc_write(ch->ring[b][i], 0, m->cs[b][i], nc * sizeof(float));
         }
         ch->cs_where = INKC_BOTH;
     }
-    for (int i = 0; i < ch->nl && ok; i++) {
+    for (int i = ch->lo; i < ch->lo + ch->nl && ok; i++) {
         if (ch->ks.on && ch->kli[i] >= 0) {
             int KV = L_KV(c, i), hd = L_HD(c, i);
             VkcKvPart pt[2] = {{KV, hd, m->K[i], (size_t)ch->cap[i] * hd, ch->kc[i], 0},
@@ -642,10 +716,12 @@ static int inkc_push_state(InkChain *ch, Model *m, int pos_base, int n) {
  * states are the step's start: rebuild both on the CPU from the `upto` positions the
  * prefix record names, and leave the chain off. */
 static void inkc_recover(Model *m, int upto) {
-    InkChain *ch = (InkChain *)m->vkchain;
+    InkChain *ch = (InkChain *)m->vkchain, *ch2 = (InkChain *)m->vkchain2;
     Cfg *c = &m->c; int D = c->hidden, nl = ch ? ch->nl : c->n_layers;
+    if (ch && ch->ok && ch2 && ch2->ok) nl += ch2->nl;   /* the second device's layers ran in that forward too */
     g_vk_chain = 0;
     if (ch) ch->failed = 1;
+    if (ch2) ch2->failed = 1;
     /* the device's layers only: a partial chain's CPU layers hold their state on the host,
      * whole up to the lost step (they run after the device's, once per forward) */
     for (int i = 0; i < nl; i++)
@@ -782,13 +858,13 @@ static int inkc_join(InkChain *ch, Model *m, int i, int n) {
  * partial chain's share taken: its first ch->nl layers ran here for every row, xh holds
  * the residual after the last of them, and the caller runs the CPU's layers (from
  * inkc_layers) and lm_head on it. */
-static int inkc_forward(Model *m, float *xh, int S, int pos_base, int want_x, float *logit) {
-    if (!g_vk_chain) return 0;
-    if (g_vk_chain == COLI_VK_CHAIN_PREFILL && S <= 2) return 0;   /* prompts only: decode on the CPU */
-    InkChain *ch = inkc_setup(m);
-    if (!ch || ch->failed) return 0;
-    Cfg *c = &m->c; int D = c->hidden, L = ch->nl, ET = c->n_experts + c->n_shared, ns = c->n_shared;
-    int full = ch->full, LT = c->n_layers;   /* full: every layer and lm_head here */
+/* One chain's layers (lo..lo+nl-1, on its device) from the residual rows in xh: 1 with the
+ * head, 2 with the residual after its last layer in xh, 0 not taken (*lost = 1: a frame
+ * failed, the state rebuilt on the CPU and the chains off; else nothing changed). */
+static int inkc_forward_seg(Model *m, InkChain *ch, float *xh, int S, int pos_base, int want_x, float *logit, int *lost) {
+    *lost = 0;
+    Cfg *c = &m->c; int D = c->hidden, L = ch->nl, lo = ch->lo, hi = lo + L, ET = c->n_experts + c->n_shared, ns = c->n_shared;
+    int full = ch->full, LT = c->n_layers;   /* full: the last layer and lm_head here */
     if (!full) want_x = 1;                    /* the CPU's layers read the residual */
     int mirror_ok = inkc_mirror(ch, m);
     int CH = mirror_ok ? inkc_chunk_rows(ch, m) : 1, rows = S < CH ? S : CH;
@@ -811,8 +887,8 @@ static int inkc_forward(Model *m, float *xh, int S, int pos_base, int want_x, fl
             if (c->log_floor > 0) { double en = (double)(pb + s + 1) / c->log_floor; if (en > 1.0) t = 1.f + c->log_alpha * (float)log(en); }
             tau[s] = t; tau[ch->rows + s] = 1.f;
         }
-        int ok = 1, pending = 0, f0 = 0;
-        for (int i = 0; i < L && ok; i++) {
+        int ok = 1, pending = 0, f0 = lo;
+        for (int i = lo; i < hi && ok; i++) {
             Layer *l = &m->L[i];
             VkcEw add = {VKC_EW_ADD, n * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
             if (pending) ok = inkc_join(ch, m, i - 1, n);
@@ -845,9 +921,9 @@ static int inkc_forward(Model *m, float *xh, int S, int pos_base, int want_x, fl
             ok = ok && vkc_begin();
             pending = 1;
         }
-        if (ok && pending) ok = inkc_join(ch, m, L - 1, n);
+        if (ok && pending) ok = inkc_join(ch, m, hi - 1, n);
         if (ok && want_x) ok = vkc_copy(ch->xd, 0, ch->x, 0, (size_t)n * D);   /* a partial chain: the handoff */
-        for (int i = 0; i < L && ok; i++) for (int b = 0; b < 4 && ok; b++)   /* the convolution states, for the host */
+        for (int i = lo; i < hi && ok; i++) for (int b = 0; b < 4 && ok; b++)   /* the convolution states, for the host */
             ok = vkc_copy(ch->csd, ch->o_csd[(size_t)b * LT + i], ch->ring[b][i], 0, (size_t)inkc_cs_cells(c, b, i));
         int last = c0 + n == S;
         if (ok && last && full) {
@@ -859,12 +935,12 @@ static int inkc_forward(Model *m, float *xh, int S, int pos_base, int want_x, fl
         ok = ok && vkc_submit(1);
         m->t_attn += now_s() - t0;
         if (!ok) goto lost;
-        if (f0 < L) inkc_kv_down(ch, m, f0, L - 1, n, pb);
+        if (f0 < hi) inkc_kv_down(ch, m, f0, hi - 1, n, pb);
         const float *csd = (const float *)vkc_ptr(ch->csd);
-        for (int i = 0; i < L; i++) for (int b = 0; b < 4; b++)
+        for (int i = lo; i < hi; i++) for (int b = 0; b < 4; b++)
             memcpy(m->cs[b][i], csd + ch->o_csd[(size_t)b * LT + i], (size_t)inkc_cs_cells(c, b, i) * sizeof(float));
         ch->cs_where = INKC_BOTH; ch->host_zero = 0;
-        for (int i = 0; i < L; i++) if (ch->kli[i] >= 0) vkc_kv_done(&ch->ks, ch->kli[i], pb + n);
+        for (int i = lo; i < hi; i++) if (ch->kli[i] >= 0) vkc_kv_done(&ch->ks, ch->kli[i], pb + n);
         if (want_x) memcpy(xfin + (size_t)c0 * D, vkc_ptr(ch->xd), (size_t)n * D * sizeof(float));
         if (last && full) memcpy(logit, vkc_ptr(ch->outd), (size_t)c->unpad_vocab * sizeof(float));
     }
@@ -872,21 +948,65 @@ static int inkc_forward(Model *m, float *xh, int S, int pos_base, int want_x, fl
     ch->forwards++;
     return full ? 1 : 2;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost(); }
+    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
     free(xfin);
+    vkc_device(0);
     inkc_recover(m, pos_base);
+    *lost = 1;
     return 0;
 }
 
+/* Every layer the chains hold for S rows from host rows xh, the last row's logits into
+ * `logit`; xh gets the final rows back when want_x. 0 = not taken: xh is as it was, and
+ * the caller runs the step on the CPU (after inkc_recover when a device was lost). 1 =
+ * taken. 2 = a partial share taken: the primary's layers, then the second device's, ran
+ * here for every row, xh holds the residual after the last of them, and the caller runs
+ * the CPU's layers (from inkc_ran) and lm_head on it. */
+static int inkc_forward(Model *m, float *xh, int S, int pos_base, int want_x, float *logit) {
+    g_inkc_ran = 0;
+    if (!g_vk_chain) return 0;
+    if (g_vk_chain == COLI_VK_CHAIN_PREFILL && S <= 2) return 0;   /* prompts only: decode on the CPU */
+    InkChain *ch = inkc_setup(m), *ch2 = NULL;
+    if (!ch || ch->failed) return 0;
+    if (g_inkc_fit2_on && !ch->full && ch->nl == g_inkc_fit.n) {
+        vkc_device(1);
+        ch2 = inkc_setup_dev(m, 1);
+        vkc_device(0);
+        if (ch2 && (ch2->failed || ch2->lo != ch->lo + ch->nl)) ch2 = NULL;
+    }
+    int lost = 0, D = m->c.hidden;
+    /* the rows as they came in: the primary's residual replaces them, and if the second
+     * device is lost the caller runs the step from these */
+    float *keep = ch2 ? malloc((size_t)S * D * sizeof(float)) : NULL;
+    if (ch2 && !keep) ch2 = NULL;
+    if (keep) memcpy(keep, xh, (size_t)S * D * sizeof(float));
+    int r = inkc_forward_seg(m, ch, xh, S, pos_base, ch2 ? 1 : want_x, logit, &lost);
+    if (!r || !ch2) { free(keep); if (r) g_inkc_ran = ch->nl; return r; }
+    g_inkc_ran = ch->nl;
+    vkc_device(1);
+    int r2 = inkc_forward_seg(m, ch2, xh, S, pos_base, want_x, logit, &lost);
+    vkc_device(0);
+    if (lost) { memcpy(xh, keep, (size_t)S * D * sizeof(float)); free(keep); g_inkc_ran = 0; return 0; }
+    free(keep);
+    if (!r2) { inkc_cpu_one(ch2, pos_base, S); return 2; }   /* declined: the CPU runs its layers this step */
+    g_inkc_ran += ch2->nl;
+    return r2;
+}
+
 static void inkc_report(Model *m) {
-    InkChain *ch = (InkChain *)m->vkchain;
-    if (!ch || !ch->ok || !ch->forwards) return;
-    VkcStats st; vkc_stats(&st);
-    fprintf(stderr, "[VK] inkling chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
-                    "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
-            ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms, st.dev_bytes / 1048576.0);
-    vkc_kv_report(&ch->ks);
-    vkc_prof_print();
+    for (int d = 0; d < 2; d++) {
+        InkChain *ch = inkc_of(m, d);
+        if (!ch || !ch->ok || !ch->forwards) continue;
+        int was = vkc_device(d);
+        VkcStats st; vkc_stats(&st);
+        fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
+                        "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
+                inkc_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
+                st.dev_bytes / 1048576.0);
+        vkc_kv_report(&ch->ks);
+        vkc_prof_print();
+        vkc_device(was);
+    }
 }
 
 /* COLI_VK_CHAIN, decided after the tier (ink_vk_tier_start): CUDA and Metal keep their
@@ -906,5 +1026,5 @@ static void inkc_start(Model *m) {
     g_vk_chain = coli_vk_chain_decide("inkling", vkt_ready(), INKLING_CHAIN_IGPU);
     if (g_inkc_fit.L && !g_inkc_fit.n) g_vk_chain = 0;   /* the fit left no layer to the device (its line said so) */
     if (g_vk_chain && !vkc_init()) g_vk_chain = 0;
-    if (g_vk_chain) atexit(vkc_shutdown);
+    if (g_vk_chain || g_inkc_fit2_on) atexit(vkc_shutdown_all);
 }

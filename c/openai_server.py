@@ -13,6 +13,7 @@ import os
 import select
 import queue
 import signal
+import stat
 import socket
 import subprocess
 import sys
@@ -552,6 +553,24 @@ def _project_span(span_map, start, end):
     on either side of the hole become adjacent once the hole is gone."""
     low, high = _project_point(span_map, start), _project_point(span_map, end)
     return (low, high) if high > low else None
+
+
+# `tool_choice: "required"` as one line of prompt, for every renderer that has a tool
+# block to put it after. It is a prompt-level instruction and nothing more: no
+# renderer here constrains sampling, so a model that answers in prose anyway has done
+# nothing the API promised would be impossible. Grammar forcing is not a remedy -- that
+# path feeds a draft the engine then verifies, so it degrades to "no speedup" rather
+# than to an enforced tool call.
+#
+# One constant, because it used to live in three copies (GLM-5.2, DeepSeek V4,
+# DeepSeek V4.1) and be absent from four renderers that accept `required`, render the
+# tools and then drop the instruction on the floor -- the "accepted in silence" outcome
+# #1698 rules out. A renderer with no tool block to attach it to (Inkling, OLMoE
+# without COLI_TOOL_FALLBACK) answers HTTP 400 instead, the honest third outcome. Kimi
+# K3 spells its own, because its wire format carries a dedicated tool-choice message
+# rather than prose.
+TOOL_CHOICE_REQUIRED_INSTRUCTION = (
+    "\n\nYou must call one of the functions above. Do not answer directly.")
 
 
 def _tool_choice_name(tool_choice):
@@ -1451,7 +1470,11 @@ def _k3_order_tool_results(messages):
         msg = messages[i]
         if isinstance(msg, dict) and msg.get("role") == "assistant":
             index_map = {}
-            for pos, tc in enumerate(msg.get("tool_calls") or [], start=1):
+            calls = msg.get("tool_calls")
+            if calls is not None and not isinstance(calls, list):
+                raise APIError(400, "`tool_calls` must be an array.",
+                               f"messages.{i}.tool_calls")
+            for pos, tc in enumerate(calls or [], start=1):
                 if isinstance(tc, dict) and tc.get("id") is not None:
                     fn = tc.get("function", tc)
                     nm = fn.get("name") if isinstance(fn, dict) else None
@@ -1643,7 +1666,7 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
         if forced:
             tools_text += f"\n\nYou must call the function `{forced}`. Do not answer directly."
         elif tool_choice == "required":
-            tools_text += "\n\nYou must call one of the functions above. Do not answer directly."
+            tools_text += TOOL_CHOICE_REQUIRED_INSTRUCTION
         for msg in merged:
             if msg["role"] in ("system", "developer"):
                 msg["content"] += "\n\n" + tools_text
@@ -1716,7 +1739,11 @@ def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, to
     boundary = "|||IP_ADDRESS|||"   # bos_token == eos_token in this tokenizer
     parts = [boundary]
     if tools and _TOOL_FALLBACK:
-        parts.append(f"<|system|>\n{_fallback_tool_preamble(tools)}\n")
+        # Fallback only: without it, `required` is already a 400 above.
+        preamble = _fallback_tool_preamble(tools)
+        if tool_choice == "required":
+            preamble += TOOL_CHOICE_REQUIRED_INSTRUCTION
+        parts.append(f"<|system|>\n{preamble}\n")
     last = len(messages) - 1
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -1809,6 +1836,8 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
         start = 1
     if tools:
         block = _qwen_tool_block(tools)
+        if tool_choice == "required":
+            block += TOOL_CHOICE_REQUIRED_INSTRUCTION
         if system_text:
             block += "\n\n" + system_text
         parts.append(f"<|im_start|>system\n{block}<|im_end|>\n")
@@ -1910,6 +1939,8 @@ def _qwen_tool_calls(tool_calls, has_content, index):
     preceding content with a blank line only when that content is non-empty, and
     every later call with a single newline; getting that wrong changes the prompt
     the model is conditioned on."""
+    if tool_calls is not None and not isinstance(tool_calls, list):
+        raise APIError(400, "`tool_calls` must be an array.", f"messages.{index}.tool_calls")
     out = []
     for position, call in enumerate(tool_calls or []):
         if not isinstance(call, dict):
@@ -2247,7 +2278,13 @@ def render_chat_mimo(messages, enable_thinking=True, reasoning_effort=None, tool
         raise APIError(400, "`tools` must be an array.", "tools")
     parts = []
     if tools:
-        parts.append(f"<|im_start|>system\n{_mimo_tools(tools)}<|im_end|>")
+        tools_text = _mimo_tools(tools)
+        # In the tool turn, after </tools> and before its <|im_end|>: "the functions
+        # above" has to be true, and MiMo's declaration block is a whole system turn
+        # of its own, so there is nothing to put the line outside of but the frame.
+        if tool_choice == "required":
+            tools_text += TOOL_CHOICE_REQUIRED_INSTRUCTION
+        parts.append(f"<|im_start|>system\n{tools_text}<|im_end|>")
     last = len(messages) - 1
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -2406,6 +2443,8 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
         # text last -- not the other way round.
         head = (instruction + "\n\n") if instruction else ""
         block = head + _qwen_tool_block(tools)
+        if tool_choice == "required":
+            block += TOOL_CHOICE_REQUIRED_INSTRUCTION
         if system_text:
             block += "\n\n" + system_text
         parts.append(f"<|im_start|>system\n{block}<|im_end|>\n")
@@ -2600,7 +2639,7 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
         if forced:
             prompt.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
         elif tool_choice == "required":
-            prompt.append("\n\nYou must call one of the functions above. Do not answer directly.")
+            prompt.append(TOOL_CHOICE_REQUIRED_INSTRUCTION)
     prev_tool = False
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -2733,8 +2772,20 @@ def _image_bytes_from_url(url):
     except (ValueError, OSError):
         raise APIError(400, "image path is not allowed.", "messages")
     try:
-        with open(target, "rb") as handle:
-            return handle.read()
+        # An allowed directory can also contain a FIFO or device. Opening a
+        # FIFO in ordinary blocking mode would hold an API thread before the
+        # image decoder can reject it. Inspect the opened descriptor, rather
+        # than a pre-open path check, and never wait for a special-file writer.
+        fd = os.open(target, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise APIError(400, "local image paths must name regular files.", "messages")
+            with os.fdopen(fd, "rb") as handle:
+                fd = None                 # the file object now owns the descriptor
+                return handle.read()
+        finally:
+            if fd is not None:
+                os.close(fd)
     except OSError:
         raise APIError(400, "cannot read the requested image.", "messages")
 
@@ -3051,6 +3102,11 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     prompt.append(f"<|system|>Reasoning Effort: {effort}")
     if tools:
         prompt.append(_glm53_tool_block(tools))
+        # Fuori dal blocco, non dentro: il blocco e' confrontato byte a byte con
+        # jinja2 (glm53_chat_template_harness.py) e l'istruzione non c'e' nel
+        # template, quindi va dopo -- come fa render_chat per GLM-5.2.
+        if tool_choice == "required":
+            prompt.append(TOOL_CHOICE_REQUIRED_INSTRUCTION)
 
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -3249,7 +3305,7 @@ def render_chat_dsv41(messages, enable_thinking=False, reasoning_effort=None, to
         if forced:
             tools_text += f"\n\nYou must call the function `{forced}`. Do not answer directly."
         elif tool_choice == "required":
-            tools_text += "\n\nYou must call one of the functions above. Do not answer directly."
+            tools_text += TOOL_CHOICE_REQUIRED_INSTRUCTION
         for turn in turns:
             if turn["role"] == "system":
                 turn["content"] += "\n\n" + tools_text
@@ -4052,9 +4108,17 @@ def generation_options(body, limit):
         raise APIError(400, "Colibri does not support `suffix` infill yet.",
                        "suffix", "unsupported_parameter")
     modalities = body.get("modalities")
-    if isinstance(modalities, list) and "audio" in modalities:
-        raise APIError(400, "Colibri does not support audio output via `modalities`.",
-                       "modalities", "unsupported_value")
+    if modalities is not None:
+        if (not isinstance(modalities, list) or not modalities or
+                any(not isinstance(item, str) for item in modalities)):
+            raise APIError(400, "`modalities` must be a non-empty array of strings.",
+                           "modalities", "invalid_value")
+        if "audio" in modalities:
+            raise APIError(400, "Colibri does not support audio output via `modalities`.",
+                           "modalities", "unsupported_value")
+        if any(item != "text" for item in modalities):
+            raise APIError(400, "Colibri supports only text output via `modalities`.",
+                           "modalities", "unsupported_value")
     # `tools`/`functions` are handled by render_chat (declaration) + parse_tool_calls (output).
     validate_tools(body)
     choice = body.get("tool_choice")
@@ -4659,11 +4723,42 @@ def _engine_extension_args(engine_k):
     return {"logprobs": engine_k, "gbytes_before_ext": True}
 
 
+class EngineLoadError(RuntimeError):
+    """The engine said why it could not load, and exited before READY.
+
+    `LOAD_FAIL kind=<kind> <detail>` is the last line such an engine writes on the
+    handshake channel (see docs/serve_protocol.md): `kind` is nomem, io, format or
+    unsupported, `detail` the text it also wrote to stderr. Raised in place of the
+    bare "engine exited unexpectedly" so the log names the cause: an out-of-memory
+    host is not a bad file."""
+
+    def __init__(self, kind, detail):
+        super().__init__(f"colibri engine failed to load (kind={kind}): {detail}")
+        self.kind = kind
+        self.detail = detail
+
+
+def parse_load_fail(data):
+    """(kind, detail) from the last LOAD_FAIL line among the bytes an engine wrote
+    before it should have said READY; None when it wrote no such line."""
+    found = None
+    for line in data.decode("utf-8", "replace").splitlines():
+        fields = line.strip().split(None, 2)
+        if len(fields) >= 2 and fields[0] == "LOAD_FAIL" and fields[1].startswith("kind="):
+            found = (fields[1][len("kind="):], fields[2] if len(fields) > 2 else "")
+    return found
+
+
 def read_engine_turn(stream, sentinel, on_bytes, caps=None):
     pending = b""
     while True:
         byte = stream.read(1)
         if byte == b"":
+            # The sentinel-length tail was held back in case it began the
+            # sentinel; at EOF it is the engine's last words (a LOAD_FAIL line
+            # ends there), so hand it over before giving up.
+            if pending:
+                on_bytes(pending)
             raise RuntimeError("colibri engine exited unexpectedly")
         pending += byte
         if pending.endswith(sentinel):
@@ -5198,7 +5293,20 @@ class Engine:
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
         self.profile_seq = 0
         self.caps = {}                         # the engine's CAPS handshake line, key=value
-        read_engine_turn(self.process.stdout, READY, lambda _: None, self.caps)
+        # What the engine wrote before READY, the last 4 KiB of it: an engine that
+        # exits instead of saying READY leaves its LOAD_FAIL line there.
+        boot = bytearray()
+
+        def keep(data):
+            boot.extend(data)
+            del boot[:-4096]
+        try:
+            read_engine_turn(self.process.stdout, READY, keep, self.caps)
+        except RuntimeError:
+            failure = parse_load_fail(bytes(boot))
+            if failure is not None:
+                raise EngineLoadError(*failure) from None
+            raise
         # True/False when the engine said whether it loaded a vision tower; None when
         # it said nothing (an engine that predates CAPS, or a family without a tower).
         self.vision = {"1": True, "0": False}.get(self.caps.get("vision"))
@@ -6069,6 +6177,15 @@ class APIServer(ThreadingHTTPServer):
         super().close_request(request)
 
 
+def _content_length(value):
+    # int() also accepts signs and underscores, but HTTP lengths are 1*DIGIT.
+    # Read and early-error drain must agree on that exact framing grammar.
+    value = value.strip()
+    if re.fullmatch(r"[0-9]+", value) is None:
+        raise ValueError("invalid Content-Length")
+    return int(value)
+
+
 class _DeadlineReader:
     """rfile wrapper enforcing a CUMULATIVE deadline on reading one request.
 
@@ -6094,13 +6211,44 @@ class _DeadlineReader:
             raise TimeoutError("request read deadline exceeded")
         self._sock.settimeout(min(self._per_read, left))
 
-    def readline(self, *args):
-        self._arm()
-        return self._raw.readline(*args)
+    def readline(self, size=-1):
+        chunks = []
+        remaining = size
+        while remaining != 0:
+            self._arm()
+            # peek() does at most one raw socket read. Consume only bytes it
+            # already buffered, so readline cannot renew one socket timeout
+            # internally while a peer drips an unfinished header.
+            buffered = self._raw.peek(1)
+            if not buffered:
+                break
+            newline = buffered.find(b"\n")
+            take = newline + 1 if newline >= 0 else len(buffered)
+            if remaining > 0:
+                take = min(take, remaining)
+            chunk = self._raw.read1(take)
+            chunks.append(chunk)
+            if remaining > 0:
+                remaining -= len(chunk)
+            if chunk.endswith(b"\n"):
+                break
+        return b"".join(chunks)
 
-    def read(self, *args):
-        self._arm()
-        return self._raw.read(*args)
+    def read(self, size=-1):
+        chunks = []
+        remaining = size
+        while remaining != 0:
+            self._arm()
+            # BufferedReader.read(size) can perform many recv calls, each
+            # renewing the same socket timeout. read1() does at most one;
+            # arm the shrinking absolute budget again before the next.
+            chunk = self._raw.read1(min(remaining, 65536) if remaining > 0 else 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if remaining > 0:
+                remaining -= len(chunk)
+        return b"".join(chunks)
 
     def __getattr__(self, name):
         return getattr(self._raw, name)
@@ -6155,6 +6303,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                      self.timeout, self.READ_DEADLINE)
         try:
             super().handle_one_request()
+            if not self.close_connection:
+                self._drain_request_body()
         except TimeoutError:
             # The read budget ran out. Say so and close; do not answer, because
             # we never received a complete request to answer.
@@ -6183,8 +6333,6 @@ class APIHandler(BaseHTTPRequestHandler):
             # writes in the streaming path, which is where Ctrl-C lands.
             self.close_connection = True
             return
-        if not self.close_connection:
-            self._drain_request_body()
 
     def send_response(self, code, message=None):
         """Single choke point for "the status line is out". Overriding here rather than
@@ -6207,11 +6355,12 @@ class APIHandler(BaseHTTPRequestHandler):
         if self._body_read:
             return
         self._body_read = True
-        if self.headers.get("Transfer-Encoding"):
+        if (self.headers.get_all("Transfer-Encoding")
+                or len(self.headers.get_all("Content-Length", [])) > 1):
             self.close_connection = True   # not framed by Content-Length; we don't de-chunk
             return
         try:
-            remaining = int(self.headers.get("Content-Length", "0"))
+            remaining = _content_length(self.headers.get("Content-Length", "0"))
         except ValueError:
             self.close_connection = True   # unparseable framing: the body length is unknown
             return
@@ -6309,9 +6458,20 @@ class APIHandler(BaseHTTPRequestHandler):
                 None, "forbidden")
 
     def read_json(self):
+        # No transfer decoder lives here: accepting TE+CL would choose CL even
+        # though HTTP gives TE precedence. Multiple CL fields are likewise not
+        # a boundary we should guess. Refuse before engine work and never reuse
+        # the connection after an ambiguous frame (RFC 9112 section 6.3).
+        if self.headers.get_all("Transfer-Encoding"):
+            self.close_connection = True
+            raise APIError(400, "Transfer-Encoding is not supported; send one Content-Length.")
+        if len(self.headers.get_all("Content-Length", [])) > 1:
+            self.close_connection = True
+            raise APIError(400, "Multiple Content-Length headers are not supported.")
         try:
-            length = int(self.headers.get("Content-Length", "0"))
+            length = _content_length(self.headers.get("Content-Length", "0"))
         except ValueError:
+            self.close_connection = True
             raise APIError(400, "Invalid Content-Length header.")
         if length < 1 or length > MAX_BODY:
             raise APIError(400, f"Request body must be between 1 and {MAX_BODY} bytes.")
@@ -6475,7 +6635,14 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             self._check_host()
             self.require_auth()
-            body = self.read_json()
+            try:
+                body = self.read_json()
+            except TimeoutError:
+                # Only request intake is on this deadline. A later timeout
+                # from the engine keeps the existing structured 500 response.
+                self.close_connection = True
+                self.log_error("request read deadline exceeded")
+                return
             path = urlsplit(self.path).path
             # A client written for Jev sends "jev-latest": on that route the
             # served model answers whatever name was asked for.
@@ -8037,7 +8204,14 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                   f"{runtime.info['default_height']}, {runtime.info['default_steps']} steps",
                   file=sys.stderr)
         else:
-            runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)
+            try:
+                runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)
+            except EngineLoadError as error:
+                # The engine said why: one line naming the kind, not a traceback
+                # that ends in "exited unexpectedly".
+                print(f"[gateway] engine load failed: kind={error.kind} {error.detail}",
+                      file=sys.stderr)
+                sys.exit(1)
         server.engine = runtime
         if family.modality != "image":
             # Said once at start-up, so a checkpoint that declares a tower it does

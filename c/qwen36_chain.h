@@ -81,7 +81,8 @@
 
 typedef struct {
     int ok, failed;
-    int n, head;                               /* layers 0..n-1 on the device; lm_head there too */
+    int lo, d;                                 /* its layers start at lo, on device d (vkc_device) */
+    int n, head;                               /* layers lo..lo+n-1 on the device; lm_head there too */
     int rows;                                  /* scratch capacity in rows */
     int cap;                                   /* the host's kv_cap the mirrors follow */
     int dev_rows;                              /* device KV rows a layer: cap, or the split's */
@@ -104,6 +105,16 @@ typedef struct {
 static int g_vk_chain = 0;     /* COLI_VK_CHAIN decided on, and the chain's pipelines are up */
 static VkcFit g_q36c_fit;      /* the partial chain's fit (q36c_start) */
 static int g_q36c_fit_on;      /* the fit ran: the chain sets itself up at start (q36c_place) */
+/* The layers after the primary's on COLI_VK_DEV2's device (docs/vulkan.md, "Layers on two
+ * devices"): a second chain from layer g_q36c_fit.n, its own fit on that device's memory.
+ * A forward runs the primary's layers, brings the residual rows back and runs these;
+ * the CPU runs what is left. */
+static VkcFit g_q36c_fit2;
+static int g_q36c_fit2_on;
+static Q36Chain *q36c_of(Model *m, int d) { return (Q36Chain *)(d ? m->vkchain2 : m->vkchain); }
+static const char *q36c_name(const Q36Chain *ch) { return ch && ch->d ? "qwen36 dev2" : "qwen36"; }
+/* COLI_VK_CHAIN_DEV2=0: the second device keeps routed experts only */
+static int q36c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
 static void q36c_fatal(const char *what) {
     fprintf(stderr, "[VK] qwen36 chain: %s -- stopping (COLI_VK_CHAIN=0 keeps the state on the CPU)\n", what);
@@ -115,11 +126,15 @@ static void q36c_fatal(const char *what) {
  * A partial chain rebuilds its N layers only: the CPU's layers hold their state on the
  * host already, at `upto` (a forward the device was lost in has not reached them). */
 static void q36c_recover(Model *m, int upto) {
-    Q36Chain *ch = (Q36Chain *)m->vkchain;
+    Q36Chain *ch = (Q36Chain *)m->vkchain, *ch2 = (Q36Chain *)m->vkchain2;
     Cfg *c = &m->c; int D = c->hidden;
     int nd = ch && ch->ok ? ch->n : c->n_layers;
+    if (ch && ch->ok && ch2 && ch2->ok) nd += ch2->n;   /* the second device's layers ran in that forward too */
     g_vk_chain = 0;
-    if (ch) { ch->failed = 1; ch->dn_where = Q36C_HOST; ch->host_zero = 0; ch->snap_valid = 0; }
+    for (int d = 0; d < 2; d++) {
+        Q36Chain *x = q36c_of(m, d);
+        if (x) { x->failed = 1; x->dn_where = Q36C_HOST; x->host_zero = 0; x->snap_valid = 0; }
+    }
     for (int i = 0; i < nd; i++) {
         if (c->is_attn[i]) continue;
         memset(m->DN_rec[i], 0, (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float));
@@ -144,9 +159,9 @@ static void q36c_recover(Model *m, int upto) {
 }
 
 /* f32 rows [O x I] as a resident fmt 10 tensor */
-static ColiVkTensor *q36c_f32_tensor(const float *w, int I, int O) {
+static ColiVkTensor *q36c_f32_tensor(int d, const float *w, int I, int O) {
     ColiVkTensor *t = NULL;
-    return coli_vk_tensor_ensure(&t, w, NULL, 10, I, O, 0) ? t : NULL;
+    return (d ? coli_vk_tensor_ensure2(&t, w, NULL, 10, I, O, 0) : coli_vk_tensor_ensure(&t, w, NULL, 10, I, O, 0)) ? t : NULL;
 }
 
 static int q36c_geometry_ok(const Cfg *c) {
@@ -210,20 +225,22 @@ static void q36c_layer_cpu(Q36Chain *ch, Model *m, int i) {
 static int q36c_place_layer(Q36Chain *ch, Model *m, int i) {
     Cfg *c = &m->c; Layer *l = &m->L[i]; int D = c->hidden, vh = c->dn_vheads;
     QW *ws[16]; int nw = q36c_layer_qws(m, i, ws), ok = 1;
+    g_q36_vk_dev = ch->d;
     for (int k = 0; k < nw && ok; k++) ok = vk_qw_tensor(ws[k]) != NULL;
+    g_q36_vk_dev = 0;
     if (ok && !c->is_attn[i]) {
         float *ab = malloc((size_t)2 * vh * D * sizeof(float));
         if (ab) {
             memcpy(ab, l->dn_b, (size_t)vh * D * sizeof(float));
             memcpy(ab + (size_t)vh * D, l->dn_a, (size_t)vh * D * sizeof(float));
-            ch->t_ab[i] = q36c_f32_tensor(ab, D, 2 * vh);
+            ch->t_ab[i] = q36c_f32_tensor(ch->d, ab, D, 2 * vh);
             free(ab);
         }
         ch->rec[i] = ch->t_ab[i] ? vkc_buf((size_t)vh * c->dn_kdim * c->dn_vdim * sizeof(float), VKC_DEV) : NULL;
         ch->ring[i] = ch->rec[i] ? vkc_buf((size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float), VKC_DEV) : NULL;
         ok = ch->t_ab[i] && ch->rec[i] && ch->ring[i];
     }
-    if (ok && l->sh_gate) ok = (ch->t_sg[i] = q36c_f32_tensor(l->sh_gate, D, 1)) != NULL;
+    if (ok && l->sh_gate) ok = (ch->t_sg[i] = q36c_f32_tensor(ch->d, l->sh_gate, D, 1)) != NULL;
     return ok;
 }
 
@@ -233,20 +250,27 @@ static int q36c_place_layer(Q36Chain *ch, Model *m, int i) {
  * before the tier sizes its budget; a layer that does not reach the device is freed
  * whole and the chain keeps the layers before it (vkc_fit_shrink). NULL = the chain
  * cannot run. */
-static Q36Chain *q36c_setup(Model *m) {
-    Q36Chain *ch = (Q36Chain *)m->vkchain;
+/* d = 1: the second device's chain, its layers from g_q36c_fit.n on (the caller has made
+ * device d current, vkc_device). */
+static Q36Chain *q36c_setup_dev(Model *m, int d) {
+    void **slot = d ? &m->vkchain2 : &m->vkchain;
+    Q36Chain *ch = (Q36Chain *)*slot;
     if (ch) return ch->ok ? ch : NULL;
+    if (d && !g_q36c_fit2_on) return NULL;
     ch = (Q36Chain *)calloc(1, sizeof *ch);
     if (!ch) return NULL;
-    m->vkchain = ch;
+    *slot = ch;
+    ch->d = d;
+    const char *nm = q36c_name(ch);
     Cfg *c = &m->c; int L = c->n_layers, D = c->hidden;
     if (!q36c_geometry_ok(c)) {
         fprintf(stderr, "[VK] qwen36 chain: a geometry its shaders do not take (head dim %d, DeltaNet %dx%d); per-matrix path\n",
                 c->head_dim, c->dn_kdim, c->dn_vdim);
         return NULL;
     }
-    VkcFit *fit = g_q36c_fit_on ? &g_q36c_fit : NULL;
-    int n = fit ? fit->n : L;
+    VkcFit *fit = d ? &g_q36c_fit2 : g_q36c_fit_on ? &g_q36c_fit : NULL;
+    int lo = d ? g_q36c_fit.n : 0, n = fit ? fit->n : L;
+    ch->lo = lo;
     ch->o_in = calloc(L, sizeof(size_t)); ch->o_post = calloc(L, sizeof(size_t)); ch->o_qn = calloc(L, sizeof(size_t));
     ch->o_kn = calloc(L, sizeof(size_t)); ch->o_conv = calloc(L, sizeof(size_t)); ch->o_dn = calloc(L, sizeof(size_t));
     ch->t_ab = calloc(L, sizeof(void *)); ch->t_sg = calloc(L, sizeof(void *));
@@ -258,7 +282,7 @@ static Q36Chain *q36c_setup(Model *m) {
     /* the parameter arena of the n layers: offsets, then one upload */
     size_t np = 0;
     int vh = c->dn_vheads, conv_dim = c->dn_conv_dim, convk = c->dn_convk;
-    for (int i = 0; i < n; i++) {
+    for (int i = lo; i < lo + n; i++) {
         ch->o_in[i] = np; np += D; ch->o_post[i] = np; np += D;
         if (c->is_attn[i]) {
             if (m->L[i].qn) { ch->o_qn[i] = np; np += c->head_dim; }
@@ -271,7 +295,7 @@ static Q36Chain *q36c_setup(Model *m) {
     ch->o_final = np; np += D;
     float *arena = calloc(np, sizeof(float));
     if (!arena) return NULL;
-    for (int i = 0; i < n; i++) {
+    for (int i = lo; i < lo + n; i++) {
         Layer *l = &m->L[i];
         memcpy(arena + ch->o_in[i], l->in_ln, D * sizeof(float));
         memcpy(arena + ch->o_post[i], l->post_ln, D * sizeof(float));
@@ -292,53 +316,62 @@ static Q36Chain *q36c_setup(Model *m) {
     if (!ok) {
         if (!fit) return NULL;
         vkc_free(ch->prm); ch->prm = NULL;
-        for (int i = 0; i < n; i++) q36c_layer_cpu(ch, m, i);
-        vkc_fit_shrink("qwen36", fit, 0, vkc_lost() ? "the device was lost" : "its parameter buffer was refused");
-        m->lm_head.vk_off = 1;
-        g_vk_chain = 0;
+        for (int i = lo; i < lo + n; i++) q36c_layer_cpu(ch, m, i);
+        vkc_fit_shrink(nm, fit, 0, vkc_lost() ? "the device was lost" : "its parameter buffer was refused");
+        if (!d || fit->tail) m->lm_head.vk_off = 1;
+        if (!d) g_vk_chain = 0;   /* the second device's failing: the primary's chain stands, the CPU runs the rest */
         vkc_shutdown();   /* the chain's own blocks and frames go too */
-        vkc_fit_placed("qwen36", fit);
+        vkc_fit_placed(nm, fit);
         return NULL;
     }
     /* the layers: the same device copies the per-matrix path uses; a layer that does
      * not get there whole is freed and the chain stops before it */
     int placed = 0;
-    for (int i = 0; i < n; i++) {
+    for (int i = lo; i < lo + n; i++) {
         if (!q36c_place_layer(ch, m, i)) {
             if (!fit) { fprintf(stderr, "[VK] qwen36 chain: a matrix did not reach the device; per-matrix path\n"); return NULL; }
-            for (int j = i; j < n; j++) q36c_layer_cpu(ch, m, j);
-            vkc_fit_shrink("qwen36", fit, i, vkc_lost() ? "the device was lost" : "an upload was refused");
+            for (int j = i; j < lo + n; j++) q36c_layer_cpu(ch, m, j);
+            vkc_fit_shrink(nm, fit, i - lo, vkc_lost() ? "the device was lost" : "an upload was refused");
             break;
         }
-        if (coli_vk_dense_device_only()) {   /* the layer is there whole: its host copies go */
+        /* the layer is there whole: its host copies go (the second device's only where the
+         * chain runs every step: with prompts only, decode reads them on the CPU) */
+        if (coli_vk_dense_device_only() && (!d || g_vk_chain == COLI_VK_CHAIN_ON)) {
             QW *ws[16]; int nw = q36c_layer_qws(m, i, ws), nd = 0; size_t b = 0;
             for (int k = 0; k < nw; k++) q36_dho_drop(ws[k], &b, &nd);
         }
-        if (fit) vkc_fit_mark(fit, i);
-        placed = i + 1;
+        if (fit) vkc_fit_mark(fit, i - lo);
+        placed = i + 1 - lo;
     }
     ch->n = placed;
-    for (int i = 0; i < placed; i++) if (c->is_attn[i]) ch->attn_ord[i] = ch->n_attn++;
+    for (int i = lo; i < lo + placed; i++) if (c->is_attn[i]) ch->attn_ord[i] = ch->n_attn++;
     if (!placed) {   /* nothing of the chain stays: its arena, blocks and frames go */
         vkc_free(ch->prm); ch->prm = NULL;
-        m->lm_head.vk_off = 1;
-        g_vk_chain = 0;
+        if (!d || (fit && fit->tail)) m->lm_head.vk_off = 1;
+        if (!d) g_vk_chain = 0;
         vkc_shutdown();
     }
-    if (fit) vkc_fit_placed("qwen36", fit);
+    if (fit) vkc_fit_placed(nm, fit);
     if (!placed) return NULL;
-    /* the head: with every layer, and room for it (the fit's tail) */
-    ch->head = (!fit || fit->tail) && vk_qw_tensor(&m->lm_head);
+    /* the head: with every layer, and room for it (the fit's tail), on the chain that
+     * ends at the last layer */
+    g_q36_vk_dev = d;
+    ch->head = lo + placed == L && (!fit || fit->tail) && vk_qw_tensor(&m->lm_head);
+    g_q36_vk_dev = 0;
     if (!ch->head) {
         if (fit) fit->tail = 0;
-        if (!m->lm_head.vk) m->lm_head.vk_off = 1;
-    } else if (coli_vk_dense_device_only()) { int nd = 0; size_t b = 0; q36_dho_drop(&m->lm_head, &b, &nd); }
+        /* the second device's chain may still take it (it is set up after this one) */
+        if (!m->lm_head.vk && (d || !g_q36c_fit2_on || !g_q36c_fit2.tail)) m->lm_head.vk_off = 1;
+    } else if (coli_vk_dense_device_only() && !d) { int nd = 0; size_t b = 0; q36_dho_drop(&m->lm_head, &b, &nd); }
     ch->dn_where = Q36C_HOST; ch->host_zero = 0;
     ch->ok = 1;
-    fprintf(stderr, "[VK] qwen36 chain: %d layers on the device (%d attention)%s, %.1f MiB of parameters\n",
-            placed, ch->n_attn, ch->head ? "" : ", the head on the CPU", np * 4 / 1048576.0);
+    if (d) fprintf(stderr, "[VK] qwen36 chain: layers %d..%d on the second device (%d attention)%s, %.1f MiB of parameters\n",
+                   lo, lo + placed - 1, ch->n_attn, ch->head ? ", the head too" : "", np * 4 / 1048576.0);
+    else fprintf(stderr, "[VK] qwen36 chain: %d layers on the device (%d attention)%s, %.1f MiB of parameters\n",
+                 placed, ch->n_attn, ch->head ? "" : ", the head on the CPU", np * 4 / 1048576.0);
     return ch;
 }
+static Q36Chain *q36c_setup(Model *m) { return q36c_setup_dev(m, 0); }
 
 /* q36c_res counts instead of reserving while g_q36c_count >= 0 (the chunk's sizing), and
  * adds each buffer's device bytes to *g_q36c_fitsum while it is set (the fit) */
@@ -425,13 +458,32 @@ static void q36c_start(Model *m) {
     size_t tail = 0, tail_m = 0;
     q36c_fit_qw(&m->lm_head, &tail, &tail_m);
     int n = vkc_fit("qwen36", L, per, mat, fixed, tail, &g_q36c_fit);
-    free(per); free(mat);
     /* the chain's pipelines now, after the fit read the free memory: nothing of it was on
      * the device before (vkc_init's own buffer counts in the pools' share) */
-    if (n > 0 && !vkc_init()) { g_vk_chain = 0; return; }   /* no chain after all: no fit, as before */
+    if (n > 0 && !vkc_init()) { g_vk_chain = 0; free(per); free(mat); return; }   /* no chain after all: no fit, as before */
     g_q36c_fit_on = 1;
-    for (int i = n; i < L; i++) q36c_layer_cpu(NULL, m, i);
-    if (!g_q36c_fit.tail) m->lm_head.vk_off = 1;
+    /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
+     * n, with that device's free memory (the tier there sizes itself after the placement) */
+    int n2 = 0;
+    if (n > 0 && n < L && q36c_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
+        vkc_device(1);
+        size_t fixed2 = vkc_fit_buf((size_t)D * sizeof(float)) + vkc_fit_buf(4);
+        g_q36c_fitsum = &fixed2;
+        q36c_bufs(&cnt, m, rows);
+        q36c_res(&cnt.xd, (size_t)rows * D, VKC_DOWN);
+        g_q36c_fitsum = NULL;
+        n2 = vkc_fit("qwen36 dev2", L - n, per + n, mat + n, fixed2, tail, &g_q36c_fit2);
+        if (n2 > 0 && !vkc_init()) {
+            fprintf(stderr, "[VK] qwen36 chain: the second device's pipelines did not come up; its layers stay on the CPU\n");
+            n2 = 0;
+        }
+        g_q36c_fit2_on = n2 > 0;
+        if (!g_q36c_fit2_on) g_q36c_fit2.tail = 0;
+        vkc_device(0);
+    }
+    free(per); free(mat);
+    for (int i = n + n2; i < L; i++) q36c_layer_cpu(NULL, m, i);
+    if (!g_q36c_fit.tail && !g_q36c_fit2.tail) m->lm_head.vk_off = 1;
     if (n == 0) {   /* the chain off: nothing of it on the device, every byte is the tier's */
         g_vk_chain = 0;
         vkc_fit_placed("qwen36", &g_q36c_fit);
@@ -441,7 +493,21 @@ static void q36c_start(Model *m) {
  * on the device now, so the tier sizes its budget from what is left. */
 static void q36c_place(Model *m) {
     if (!g_q36c_fit_on || !g_q36c_fit.n || !g_vk_chain) return;
-    q36c_setup(m);
+    Q36Chain *ch = q36c_setup(m);
+    if (!g_q36c_fit2_on) return;
+    int lo = g_q36c_fit.n, n2 = g_q36c_fit2.n;
+    vkc_device(1);
+    if (!ch || ch->n < lo) {
+        /* the primary placed fewer layers than its fit: the second device's would not follow
+         * them, so they go to the CPU too */
+        fprintf(stderr, "[VK] qwen36 chain: the primary device stopped before layer %d; layers %d..%d stay on the CPU, "
+                        "not on the second device\n", lo, lo, lo + n2 - 1);
+        for (int i = lo; i < lo + n2; i++) q36c_layer_cpu(NULL, m, i);
+        if (g_q36c_fit2.tail) m->lm_head.vk_off = 1;
+        g_q36c_fit2_on = 0;
+        vkc_shutdown();
+    } else q36c_setup_dev(m, 1);
+    vkc_device(0);
 }
 /* Prompt rows per chunk (vkc_chunk_rows): the chain's scratch a row, counted from the
  * reservations themselves, and the routed experts' outputs (the tier's rows, the
@@ -480,11 +546,11 @@ static int q36c_mirror(Q36Chain *ch, Model *m) {
     Cfg *c = &m->c; int KV = c->kv_heads;
     if (ch->cap != m->kv_cap) {        /* the host cache grew: mirror it again (whole, or split past the budget) */
         size_t row = (size_t)KV * c->k_head_dim * 2 * sizeof(float);
-        int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, "qwen36", ch->n_attn, row, m->kv_cap, 1, 0,
+        int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, q36c_name(ch), ch->n_attn, row, m->kv_cap, 1, 0,
                                             (size_t)ch->n_attn * ch->dev_rows * row) : 1;
         if (!plan) { ch->cap = 0; return 0; }
         ch->dev_rows = ch->ks.on ? ch->ks.rows : m->kv_cap;
-        for (int i = 0; i < ch->n; i++) {
+        for (int i = ch->lo; i < ch->lo + ch->n; i++) {
             if (!c->is_attn[i]) continue;
             vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
             ch->kv_valid[i] = 0;
@@ -513,52 +579,66 @@ static int q36c_scratch(Q36Chain *ch, Model *m, int rows) {
 
 /* ---- state between the host and the device ----------------------------------- */
 /* The host's DeltaNet state brought up to date (before anything reads it there). */
-static void q36c_sync_host(Model *m) {
-    Q36Chain *ch = (Q36Chain *)m->vkchain;
-    if (!ch || !ch->ok || ch->dn_where != Q36C_DEV) return;
+/* (every function here covers both chains: the primary's layers and the second device's) */
+static int q36c_sync_one(Model *m, Q36Chain *ch) {
+    if (!ch || !ch->ok || ch->dn_where != Q36C_DEV) return 1;
     Cfg *c = &m->c;
     size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
-    for (int i = 0; i < ch->n; i++) {
+    int was = vkc_device(ch->d), ok = 1;
+    for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
         if (c->is_attn[i]) continue;
-        if (!vkc_read(ch->rec[i], 0, m->DN_rec[i], nr * sizeof(float)) ||
-            !vkc_read(ch->ring[i], 0, m->DN_conv[i], nc * sizeof(float))) { q36c_recover(m, m->kv_len); return; }
+        ok = vkc_read(ch->rec[i], 0, m->DN_rec[i], nr * sizeof(float)) &&
+             vkc_read(ch->ring[i], 0, m->DN_conv[i], nc * sizeof(float));
     }
-    ch->dn_where = Q36C_BOTH;
+    vkc_device(was);
+    if (ok) ch->dn_where = Q36C_BOTH;
+    return ok;
+}
+static void q36c_sync_host(Model *m) {
+    for (int d = 0; d < 2; d++)
+        if (!q36c_sync_one(m, q36c_of(m, d))) { q36c_recover(m, m->kv_len); return; }
 }
 /* The host wrote its DeltaNet state (zero: reset_recurrent's zeros). */
 static void q36c_host_wrote(Model *m, int zero) {
-    Q36Chain *ch = (Q36Chain *)m->vkchain;
-    if (!ch || !ch->ok) return;
-    ch->dn_where = Q36C_HOST; ch->host_zero = zero; ch->snap_valid = 0;
+    for (int d = 0; d < 2; d++) {
+        Q36Chain *ch = q36c_of(m, d);
+        if (!ch || !ch->ok) continue;
+        ch->dn_where = Q36C_HOST; ch->host_zero = zero; ch->snap_valid = 0;
+    }
 }
-/* A CPU step from pos_base: the host state current before it, the device's stale after. */
-static void q36c_cpu_step(Model *m, int pos_base) {
-    Q36Chain *ch = (Q36Chain *)m->vkchain;
+/* A CPU step from pos_base over one chain's layers: its host state current before it,
+ * the device's stale after. */
+static void q36c_cpu_one(Model *m, Q36Chain *ch, int pos_base) {
     if (!ch || !ch->ok) return;
-    q36c_sync_host(m);
+    if (!q36c_sync_one(m, ch)) { q36c_recover(m, m->kv_len); return; }
     ch->dn_where = Q36C_HOST; ch->host_zero = 0; ch->snap_valid = 0;
-    for (int i = 0; i < ch->n; i++) {
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) {
         if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
         if (m->c.is_attn[i]) vkc_kv_lower(&ch->ks, ch->attn_ord[i], pos_base);
     }
+}
+static void q36c_cpu_step(Model *m, int pos_base) {
+    for (int d = 0; d < 2; d++) q36c_cpu_one(m, q36c_of(m, d), pos_base);
 }
 /* A rejected draft: the state after the verify's row `slot` (its first slot+1 rows) is
  * the device's copy in that slot; `len` positions stand, and the KV watermark comes
  * down to them (the rows past them are the rejected drafts'). */
 static void q36c_rollback(Model *m, int slot, int len) {
-    Q36Chain *ch = (Q36Chain *)m->vkchain;
-    if (!ch || !ch->ok) return;
-    for (int i = 0; i < ch->n; i++) {
-        if (ch->kv_valid[i] > len) ch->kv_valid[i] = len;
-        if (m->c.is_attn[i]) vkc_kv_lower(&ch->ks, ch->attn_ord[i], len);
+    for (int d = 0; d < 2; d++) {
+        Q36Chain *ch = q36c_of(m, d);
+        if (!ch || !ch->ok) continue;
+        for (int i = ch->lo; i < ch->lo + ch->n; i++) {
+            if (ch->kv_valid[i] > len) ch->kv_valid[i] = len;
+            if (m->c.is_attn[i]) vkc_kv_lower(&ch->ks, ch->attn_ord[i], len);
+        }
+        if (slot < 0 || slot >= ch->snap_valid || ch->dn_where != Q36C_DEV) { ch->snap_valid = 0; continue; }
+        for (int i = ch->lo; i < ch->lo + ch->n; i++) {
+            if (m->c.is_attn[i]) continue;
+            VkcBuf *t = ch->rec[i]; ch->rec[i] = ch->rec_snap[slot][i]; ch->rec_snap[slot][i] = t;
+            t = ch->ring[i]; ch->ring[i] = ch->ring_snap[slot][i]; ch->ring_snap[slot][i] = t;
+        }
+        ch->snap_valid = 0;
     }
-    if (slot < 0 || slot >= ch->snap_valid || ch->dn_where != Q36C_DEV) { ch->snap_valid = 0; return; }
-    for (int i = 0; i < ch->n; i++) {
-        if (m->c.is_attn[i]) continue;
-        VkcBuf *t = ch->rec[i]; ch->rec[i] = ch->rec_snap[slot][i]; ch->rec_snap[slot][i] = t;
-        t = ch->ring[i]; ch->ring[i] = ch->ring_snap[slot][i]; ch->ring_snap[slot][i] = t;
-    }
-    ch->snap_valid = 0;
 }
 /* The device's copy slots for a verify that copies `rows` rows, allocated the first
  * time a verify that deep runs. */
@@ -569,7 +649,7 @@ static int q36c_spec_slots(Q36Chain *ch, Model *m, int rows) {
     for (int sl = ch->snap_slots; sl < rows; sl++) {
         if (!ch->rec_snap[sl] && !(ch->rec_snap[sl] = (VkcBuf **)calloc((size_t)L, sizeof(VkcBuf *)))) return 0;
         if (!ch->ring_snap[sl] && !(ch->ring_snap[sl] = (VkcBuf **)calloc((size_t)L, sizeof(VkcBuf *)))) return 0;
-        for (int i = 0; i < ch->n; i++) {
+        for (int i = ch->lo; i < ch->lo + ch->n; i++) {
             if (c->is_attn[i]) continue;
             if (!ch->rec_snap[sl][i] && !(ch->rec_snap[sl][i] = vkc_buf(nr * sizeof(float), VKC_DEV))) return 0;
             if (!ch->ring_snap[sl][i] && !(ch->ring_snap[sl][i] = vkc_buf(nc * sizeof(float), VKC_DEV))) return 0;
@@ -583,7 +663,7 @@ static int q36c_push_state(Q36Chain *ch, Model *m, int pos_base, int n_rows) {
     Cfg *c = &m->c; int ok = 1;
     if (ch->dn_where == Q36C_HOST) {
         size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
-        for (int i = 0; i < ch->n && ok; i++) {
+        for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
             if (c->is_attn[i]) continue;
             if (ch->host_zero) ok = vkc_zero(ch->rec[i], 0, nr) && vkc_zero(ch->ring[i], 0, nc);
             else ok = vkc_write(ch->rec[i], 0, m->DN_rec[i], nr * sizeof(float)) &&
@@ -592,7 +672,7 @@ static int q36c_push_state(Q36Chain *ch, Model *m, int pos_base, int n_rows) {
         ch->dn_where = Q36C_BOTH;
     }
     int kvd = c->k_head_dim, KV = c->kv_heads;
-    for (int i = 0; i < ch->n && ok; i++) {
+    for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
         if (c->is_attn[i] && ch->ks.on) {     /* the split: the window placed, its rows below pos_base uploaded */
             VkcKvPart pt[2] = {{KV, kvd, m->K[i], (size_t)m->max_t * kvd, ch->kc[i], 0},
                                {KV, kvd, m->V[i], (size_t)m->max_t * kvd, ch->vc[i], 0}};
@@ -705,16 +785,15 @@ static int q36c_combine(Q36Chain *ch, Model *m, int i, int n) {
  * Otherwise the layers it ran: with a partial chain (N layers, or the head on the CPU)
  * *rows_only is 1, xh holds every row's residual after those layers, and the caller
  * runs the rest of the layers and the head on the CPU. */
-static int q36c_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int want_x, int nlogits, float *logit,
-                        int *rows_only) {
-    *rows_only = 0;
-    if (!g_vk_chain || qt_ready() || qq_active() || g_pilot) return 0;
-    /* prompts only: decode and verifies on the CPU */
-    if (g_vk_chain == COLI_VK_CHAIN_PREFILL && (S <= 2 || g_q36_rowwise)) return 0;
-    Q36Chain *ch = q36c_setup(m);
-    if (!ch || ch->failed) return 0;
-    Cfg *c = &m->c; int D = c->hidden, L = ch->n, E = c->n_experts;   /* L: the layers on the device */
-    int part = L < c->n_layers || !ch->head;
+/* One chain's layers (lo..lo+n-1 on its device) over the S rows, from the residual rows in
+ * xh. Returns its layer count, or 0: *lost = 1 when a frame failed (the state was rebuilt
+ * on the CPU, every chain is off), else nothing on its device changed. tail: whether the
+ * layers after it run elsewhere (the second device's chain, the CPU). */
+static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_base, FILE *lf, int want_x, int nlogits,
+                            float *logit, int *rows_only, int *lost) {
+    *rows_only = 0; *lost = 0;
+    Cfg *c = &m->c; int D = c->hidden, L = ch->n, lo = ch->lo, hi = lo + L, E = c->n_experts;   /* L: the layers on the device */
+    int part = hi < c->n_layers || !ch->head;
     if (part) { want_x = 1; nlogits = 0; }   /* the residual comes back; the CPU runs the rest and the head */
     int mirror_ok = q36c_mirror(ch, m);
     int CH = mirror_ok ? q36c_chunk_rows(ch, m) : 1, rows = S < CH ? S : CH;
@@ -756,18 +835,18 @@ static int q36c_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int 
             }
         }
         int ok = 1, pending = 0;
-        for (int i = 0; i < L && ok; i++) {
+        for (int i = lo; i < hi && ok; i++) {
             Layer *l = &m->L[i];
             if (pending) {
                 ok = q36c_combine(ch, m, i - 1, n);
-                if (ok && lf) ok = vkc_copy(ch->lfd, ((size_t)(i - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
+                if (ok && lf) ok = vkc_copy(ch->lfd, ((size_t)(i - 1 - lo) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
             }
             ok = ok && q36c_norm(ch->x, 0, ch->prm, ch->o_in[i], ch->nrm, 0, n, D, c->eps);
             ok = ok && (c->is_attn[i] ? q36c_attention(ch, m, l, i, n, pb) : q36c_deltanet(ch, m, l, i, n, c0, ns));
-            if (ok && lf) ok = vkc_copy(ch->lfd, (size_t)i * 3 * D, ch->tmp, (size_t)(n - 1) * D, D);
+            if (ok && lf) ok = vkc_copy(ch->lfd, (size_t)(i - lo) * 3 * D, ch->tmp, (size_t)(n - 1) * D, D);
             VkcEw add = {VKC_EW_ADD, n * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
             ok = ok && vkc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
-            if (ok && lf) ok = vkc_copy(ch->lfd, ((size_t)i * 3 + 1) * D, ch->x, (size_t)(n - 1) * D, D);
+            if (ok && lf) ok = vkc_copy(ch->lfd, ((size_t)(i - lo) * 3 + 1) * D, ch->x, (size_t)(n - 1) * D, D);
             ok = ok && q36c_norm(ch->x, 0, ch->prm, ch->o_post[i], ch->h2, 0, n, D, c->eps);
             if (ok && E > 0) {
                 ok = vkc_matmul(vk_qw_tensor(&l->gate), ch->h2, 0, ch->lg, 0, n) &&
@@ -803,11 +882,11 @@ static int q36c_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int 
                  * Keep each layer in its own submission: a full 27B prompt in
                  * one submission can exceed the driver's watchdog. The next
                  * frame's barrier orders its residual add after this MLP. */
-                if (ok && i + 1 < L) ok = vkc_submit(0) && vkc_begin();
+                if (ok && i + 1 < hi) ok = vkc_submit(0) && vkc_begin();
             }
             pending = 1;
         }
-        if (ok) ok = q36c_combine(ch, m, L - 1, n);
+        if (ok) ok = q36c_combine(ch, m, hi - 1, n);
         if (ok && lf) ok = vkc_copy(ch->lfd, ((size_t)(L - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
         if (ok && want_x) ok = vkc_copy(ch->xd, 0, ch->x, 0, (size_t)n * D);
         int last = c0 + n == S;
@@ -822,7 +901,7 @@ static int q36c_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int 
         ok = ok && vkc_submit(1);
         ch->frames++; ch->wait_ms += tm_now() - t0;
         if (!ok) goto lost;
-        if (E == 0) for (int i = 0; i < L; i++) {             /* a dense model reads its K/V rows back here */
+        if (E == 0) for (int i = lo; i < hi; i++) {           /* a dense model reads its K/V rows back here */
             if (!c->is_attn[i]) continue;
             const float *kv = (const float *)vkc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
             for (int s = 0; s < n; s++) for (int h = 0; h < c->kv_heads; h++) {
@@ -832,7 +911,7 @@ static int q36c_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int 
             }
         }
         if (want_x) memcpy(xh + (size_t)c0 * D, vkc_ptr(ch->xd), (size_t)n * D * sizeof(float));
-        for (int i = 0; i < L; i++) if (c->is_attn[i]) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->attn_ord[i], pb + n); }
+        for (int i = lo; i < hi; i++) if (c->is_attn[i]) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->attn_ord[i], pb + n); }
         ch->dn_where = Q36C_DEV; ch->host_zero = 0;
         if (last && !part) memcpy(logit, vkc_ptr(ch->outd), (size_t)nlogits * c->vocab * sizeof(float));
     }
@@ -844,18 +923,58 @@ static int q36c_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int 
     return L;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     vkc_gemm_rows(-1);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost(); }
+    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    vkc_device(0);
     q36c_recover(m, pos_base);
+    *lost = 1;
     return 0;
 }
 
+/* Every layer the chains hold for S rows from host rows xh, the last row's logits into
+ * `logit`; xh gets the final rows back when want_x. 0 = not taken (nothing on the devices
+ * changed, or a device was lost and the state rebuilt: the CPU runs the step). Otherwise
+ * the layers they ran, from layer 0: the primary's, then the second device's (from the
+ * residual rows the primary's brought back). With layers left (or the head on the CPU)
+ * *rows_only is 1, xh holds every row's residual after them, and the caller runs the
+ * rest of the layers and the head on the CPU. */
+static int q36c_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int want_x, int nlogits, float *logit,
+                        int *rows_only) {
+    *rows_only = 0;
+    if (!g_vk_chain || qt_ready() || qq_active() || g_pilot) return 0;
+    /* prompts only: decode and verifies on the CPU */
+    if (g_vk_chain == COLI_VK_CHAIN_PREFILL && (S <= 2 || g_q36_rowwise)) return 0;
+    Q36Chain *ch = q36c_setup(m), *ch2 = q36c_of(m, 1);
+    if (!ch || ch->failed) return 0;
+    if (ch2 && (!ch2->ok || ch2->failed || ch2->lo != ch->lo + ch->n)) ch2 = NULL;
+    int lost = 0, ro = 0;
+    g_q36_vk_dev = 0;
+    int n = q36c_forward_seg(m, ch, xh, S, pos_base, lf, ch2 ? 1 : want_x, ch2 ? 0 : nlogits, logit, &ro, &lost);
+    if (!n || !ch2) { *rows_only = ro; return n; }
+    vkc_device(1); g_q36_vk_dev = 1;
+    int n2 = q36c_forward_seg(m, ch2, xh, S, pos_base, lf, want_x, nlogits, logit, &ro, &lost);
+    vkc_device(0); g_q36_vk_dev = 0;
+    if (lost) return 0;
+    if (!n2) {   /* declined before touching its device: the CPU runs its layers this step */
+        q36c_cpu_one(m, ch2, pos_base);
+        *rows_only = 1;
+        return n;
+    }
+    *rows_only = ro;
+    return n + n2;
+}
+
 static void q36c_report(Model *m) {
-    Q36Chain *ch = (Q36Chain *)m->vkchain;
-    if (!ch || !ch->ok || !ch->forwards) return;
-    VkcStats st; vkc_stats(&st);
-    fprintf(stderr, "[VK] qwen36 chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
-                    "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
-            ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms, st.dev_bytes / 1048576.0);
-    vkc_kv_report(&ch->ks);
-    vkc_prof_print();
+    for (int d = 0; d < 2; d++) {
+        Q36Chain *ch = q36c_of(m, d);
+        if (!ch || !ch->ok || !ch->forwards) continue;
+        int was = vkc_device(d);
+        VkcStats st; vkc_stats(&st);
+        fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
+                        "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
+                q36c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
+                st.dev_bytes / 1048576.0);
+        vkc_kv_report(&ch->ks);
+        vkc_prof_print();
+        vkc_device(was);
+    }
 }

@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
+#include <math.h>
 #include "json.h"
 #include "tok_unicode.h"
 #include "tok_unicode_o200k.h"
@@ -140,18 +141,32 @@ static void tok_free(Tok *T){
     memset(T,0,sizeof(*T));
 }
 
+/* Validate the JSON number before converting it: casting an infinite or
+ * out-of-range double to int is undefined, and fractional ids silently alias
+ * a different token. The same bound applies to vocabulary and added tokens. */
+static int tk_checked_id(const jval *value){
+    if(!value || value->t!=J_NUM || !isfinite(value->num) ||
+       value->num<0 || value->num>(1<<21) || value->num!=(double)(int)value->num){
+        fprintf(stderr,"tokenizer.json: token id must be an integer between 0 and %d\n",1<<21);
+        exit(1);
+    }
+    return (int)value->num;
+}
+
 static void tok_load(Tok *T, const char *path){
     memset(T,0,sizeof(*T));
     tk_build_bytemap(T);
     long fn; char *buf=tk_read_file(path,&fn);
-    char *arena=NULL; jval *root=json_parse(buf,&arena);
+    jval *root=memchr(buf,0,(size_t)fn) ? NULL : json_parse_checked(buf);
     free(buf);
-    (void)arena;
+    if(!root){ fprintf(stderr,"tokenizer.json: malformed JSON\n"); exit(1); }
     jval *model=json_get(root,"model");
     jval *vocab=json_get(model,"vocab");
     jval *merges=json_get(model,"merges");
     jval *added=json_get(root,"added_tokens");
-    if(!vocab){ fprintf(stderr,"tokenizer.json: missing model.vocab\n"); exit(1); }
+    if(!vocab || vocab->t!=J_OBJ){ fprintf(stderr,"tokenizer.json: model.vocab must be an object\n"); exit(1); }
+    if(merges && merges->t!=J_ARR){ fprintf(stderr,"tokenizer.json: model.merges must be an array\n"); exit(1); }
+    if(added && added->t!=J_ARR){ fprintf(stderr,"tokenizer.json: added_tokens must be an array\n"); exit(1); }
     if(!merges||merges->len==0){ T->rankbpe=1; merges=NULL; }
 
     /* id massimo per dimensionare id2str. Gli id vengono da un tokenizer.json di
@@ -159,15 +174,11 @@ static void tok_load(Tok *T, const char *path){
      * (OOB write) e un added_token privo di "id"/"content" darebbe NULL-deref. */
     int maxid=0;
     for(int i=0;i<vocab->len;i++){
-        if(vocab->kids[i]->t!=J_NUM){ fprintf(stderr,"tokenizer.json: non-numeric vocab id at %d\n",i); exit(1); }
-        int id=(int)vocab->kids[i]->num;
-        if(id<0){ fprintf(stderr,"tokenizer.json: negative vocab id %d\n",id); exit(1); }
+        int id=tk_checked_id(vocab->kids[i]);
         if(id>maxid)maxid=id; }
     if(added) for(int i=0;i<added->len;i++){
         jval *ji=json_get(added->kids[i],"id");
-        if(!ji||ji->t!=J_NUM){ fprintf(stderr,"tokenizer.json: added_token missing numeric id\n"); exit(1); }
-        int id=(int)ji->num;
-        if(id<0){ fprintf(stderr,"tokenizer.json: negative added id %d\n",id); exit(1); }
+        int id=tk_checked_id(ji);
         if(id>maxid)maxid=id; }
     /* an id near INT_MAX would overflow n_ids=maxid+1 (UB) and calloc multi-GB */
     if(maxid > (1<<21)){ fprintf(stderr,"tokenizer.json: implausible max vocab id %d\n",maxid); exit(1); }

@@ -55,6 +55,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "compat.h"                    /* rename() -> MoveFileEx on Windows; see above */
+#include "own_file.h"                  /* the history may sit in a downloaded model dir */
 
 #define RT_FORMAT_VERSION 1
 #define RT_IKU1_MAGIC 0x31554B49u      /* "IKU1" — inkling.c's usage_save/pins_load */
@@ -360,7 +361,10 @@ static int rt_save(const char *path, int quiet){
         }
         return 0;
     }
-    FILE *f = fopen(tmp, "w");
+    /* Never through a link planted in the model dir. The temp name is ours, so whatever
+     * else sits there is removed (the link, never its target) and the open retried. */
+    FILE *f = coli_own_fopen(tmp, "w");
+    if(!f && (errno == ELOOP || errno == EINVAL) && remove(tmp) == 0) f = coli_own_fopen(tmp, "w");
     if(!f){ if(!quiet) perror(tmp); return 0; }
     /* An all-zero history stays a ZERO-BYTE file, the way it was before this header
      * existed. PIN=auto decides whether a history is usable by testing the file SIZE and

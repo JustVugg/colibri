@@ -176,6 +176,10 @@ typedef struct {
     uint64_t expert_prefetch_ranges, expert_parallel_batches;
     uint64_t expert_scale_bytes;
     float **DN_rec, **DN_conv;
+    /* Q38_DN_GPU=1 (qt_dn_gpu_*): the host arrays above stay canonical; per
+     * layer, dn_dev_fresh says the card holds the host's state, dn_host_stale
+     * says the card advanced past the host copy (pull before any CPU use). */
+    uint8_t *dn_dev_fresh, *dn_host_stale; int dn_dev;
     float **K, **V, **IK;
     int kv_len, kv_cap, max_t;
     kv_prefix kvp; /* token identity of the live attention rows, not a snapshot */
@@ -232,6 +236,7 @@ typedef struct {
     int snap_ple_history_len[Q38_SPEC_SNAPS];
 #ifdef COLI_VULKAN
     void *vkchain;                 /* the dense chain's device state (qwen38_chain.h), NULL until it runs */
+    void *vkchain2;                /* its layers on COLI_VK_DEV2's device, after the primary's (qwen38_chain.h) */
 #endif
 } Model;
 
@@ -487,6 +492,8 @@ static unsigned g_q38_vk_placed[3];   /* uploads by format: int8 rows, bf16, f32
  * the device, the other layers and the head stay on the CPU, so nothing that is not on
  * the device already goes up any more (docs/vulkan.md, "A partial chain"). */
 static int g_q38_vk_noup;
+static int g_q38_vk_dev;   /* the device q38_vk_tensor uploads a new weight to: 1 for the chain's
+                            * layers on COLI_VK_DEV2's (qwen38_chain.h) */
 static void q38_dho_reload(Q38Weight *w);   /* below, beside the trunk's int8 rows */
 /* The weight's device copy, uploaded on the first call; NULL when it is not eligible
  * or the upload failed (vk_off). The dense chain (qwen38_chain.h) reads the same one. */
@@ -499,7 +506,8 @@ static ColiVkTensor *q38_vk_tensor(const Q38Weight *weight) {
     int fmt=q38_vk_fmt(w);
     const void *wq=w->q8?(const void*)w->q8:(const void*)w->data;
     const float *sc=w->q8?w->q8sc:NULL;   /* fmt 10/11: no scales */
-    if(!coli_vk_tensor_ensure(t,wq,sc,fmt,w->cols,w->rows,0)){w->vk_off=1;return NULL;}
+    if(!(g_q38_vk_dev?coli_vk_tensor_ensure2(t,wq,sc,fmt,w->cols,w->rows,0)
+                     :coli_vk_tensor_ensure(t,wq,sc,fmt,w->cols,w->rows,0))){w->vk_off=1;return NULL;}
     g_q38_vk_placed[fmt==1?0:fmt==11?1:2]++;
     return *t;
 }
@@ -513,7 +521,7 @@ static int q38_vk_matmul(float *y,const float *x,const Q38Weight *weight,int S,i
     const void *wq=w->q8?(const void*)w->q8:(const void*)w->data;
     const float *sc=w->q8?w->q8sc:NULL;   /* fmt 10/11: no scales */
     ColiVkTensor *t=q38_vk_tensor(w);
-    if(!t)return 0;
+    if(!t||coli_vk_tensor_dev(t))return 0;   /* a weight of the second device's layers: only its chain reads it */
     return coli_vk_matmul(&t,y,x,wq,sc,fmt,S,I,O,0);
 }
 /* One line at the end of a run or a serve turn: how many matmuls the device
@@ -1018,6 +1026,7 @@ static void q38_load_ple(Model *m,Layer *l) {
 static void q38_alloc_state(Model *m) {
     Cfg *c=&m->c;
     m->DN_rec=(float**)calloc((size_t)c->layers,sizeof(float*));
+    m->dn_dev_fresh=(uint8_t*)calloc((size_t)c->layers,1); m->dn_host_stale=(uint8_t*)calloc((size_t)c->layers,1); m->dn_dev=0;
     m->DN_conv=(float**)calloc((size_t)c->layers,sizeof(float*));
     m->K=(float**)calloc((size_t)c->layers+1,sizeof(float*));    /* +1: the MTP head's row */
     m->V=(float**)calloc((size_t)c->layers+1,sizeof(float*));
@@ -2217,6 +2226,27 @@ static int q38_bounded_prefill_rows(int requested,uint64_t fixed,
  * in bounded chunks.  The convolution and recurrent update remain strictly
  * token-causal inside each chunk, so chunk boundaries cannot change state or
  * floating-point order. */
+/* Q38_DN_GPU=1: host/device hand-over of a DeltaNet layer's state (conv ring
+ * and recurrence) when the layer runs on the card (qt_dn_gpu_*). The host
+ * arrays stay canonical; the card's copy is fresh or ahead. */
+static void q38_dn_gpu_push(Model *m,int layer) {
+    if(!m->dn_dev_fresh[layer]&&qt_dn_gpu_set_state(layer,m->DN_conv[layer],m->DN_rec[layer]))m->dn_dev_fresh[layer]=1;
+}
+static void q38_dn_gpu_pull(Model *m,int layer) {
+    if(m->dn_host_stale&&m->dn_host_stale[layer]){
+        if(qt_dn_gpu_get_state(layer,m->DN_conv[layer],m->DN_rec[layer]))m->dn_host_stale[layer]=0;
+        else fprintf(stderr,"[dn] layer %d: could not read the GPU state back; the CPU continues from a stale copy\n",layer);
+    }
+}
+static void q38_dn_gpu_pull_all(Model *m) {
+    if(!m->dn_dev)return;
+    for(int i=0;i<m->c.layers;i++)if(!m->c.is_attn[i])q38_dn_gpu_pull(m,i);
+}
+static void q38_dn_gpu_invalidate(Model *m) {   /* the host state was rewritten: the card's copy is old */
+    if(!m->dn_dev_fresh)return;
+    memset(m->dn_dev_fresh,0,(size_t)m->c.layers); memset(m->dn_host_stale,0,(size_t)m->c.layers);
+}
+
 static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                          float *out) {
     double phase_started=now_s();
@@ -2243,6 +2273,29 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
     float *q=falloc((int64_t)VH*KD),*k=falloc((int64_t)VH*KD);
     float *core=falloc(V);
     float *rec=m->DN_rec[layer],*ring=m->DN_conv[layer];
+
+    /* Decode token with the layer on the card: the two gates on the CPU (b and
+     * a, 48 outputs each), everything else -- in_proj qkv and z, conv,
+     * recurrence, gated norm, out_proj -- in one device chain, host in, host
+     * out. Not during an MTP verify (snap_rows: the CPU path keeps a copy
+     * of the state after each of its rows). */
+    if(S==1&&m->dn_dev&&m->snap_rows==0&&qt_dn_gpu_ready(layer)){
+        q38_dense_matmul(m,bb,x,&l->dn_b,1,H,VH);
+        q38_dense_matmul(m,aa,x,&l->dn_a,1,H,VH);
+        float egh[64],beta[64];
+        for(int h=0;h<VH&&h<64;h++){
+            egh[h]=expf(-expf(l->dn_alog[h])*q38_softplus(aa[h]+l->dn_dtbias[h]));
+            beta[h]=q38_sigmoid(bb[h]);
+        }
+        q38_dn_gpu_push(m,layer);
+        if(m->dn_dev_fresh[layer]&&qt_dn_gpu_step(layer,x,out,egh,beta)){
+            m->dn_host_stale[layer]=1;
+            free(qkv);free(z);free(bb);free(aa);free(norm);free(conv);free(q);free(k);free(core);
+            q38_tm_add(m,Q38_TM_DELTANET,phase_started);
+            return;
+        }
+        q38_dn_gpu_pull(m,layer);   /* the tier turned the layer off: continue on the CPU from the card's state */
+    } else if(m->dn_dev) q38_dn_gpu_pull(m,layer);   /* prefill, verify or a CPU-only layer: the host must be current */
 
     for(int base=0;base<S;) {
         int rows=S-base<rows_capacity?S-base:rows_capacity;
@@ -2322,6 +2375,7 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                          rows,V,H);
         base+=rows;
     }
+    if(m->dn_dev_fresh)m->dn_dev_fresh[layer]=0;   /* the host advanced: the card's copy is old */
     free(qkv);free(z);free(bb);free(aa);free(norm);free(conv);
     free(q);free(k);free(core);
     q38_tm_add(m,Q38_TM_DELTANET,phase_started);
@@ -2687,6 +2741,25 @@ static void q38_tier_start(Model *m,int cap) {
         atexit(qt_shutdown);
         fprintf(stderr,"[qtier] qwen38: fp8 expert tier on (RAM LRU %d/layer stays; experts stream to VRAM as they get hot)\n",cap);
         q38_trunk_place_all(m);
+        /* Q38_DN_GPU=1: where dnqkv, dnz and dnout of a DeltaNet layer all sit
+         * on one card, the conv ring, the recurrence and the gated norm go there
+         * too, and a decode token runs the layer end to end on the device
+         * (qwen36 measured 8 of 39 ms/token in these round trips). */
+        const char *dg=getenv("Q38_DN_GPU");
+        if(dg&&dg[0]=='1'&&!dg[1]){
+            int n=0; double vram=0;
+            for(int i=0;i<c->layers;i++){
+                Layer *L=&m->L[i];
+                if(c->is_attn[i]||!L->dn_qkv.gpu||!L->dn_z.gpu||!L->dn_out.gpu)continue;
+                if(qt_dn_gpu_init_dense(i,c->dn_vheads,c->dn_kheads,c->dn_kdim,c->dn_vdim,c->dn_conv_dim,c->dn_convk,c->hidden,
+                                        L->dn_conv,L->dn_norm,c->eps,1,L->dn_qkv.gpu,L->dn_z.gpu,L->dn_out.gpu)){
+                    n++; vram+=(double)c->dn_vheads*c->dn_kdim*c->dn_vdim*4+(double)c->dn_conv_dim*(c->dn_convk-1)*4;
+                }
+            }
+            m->dn_dev=n>0;
+            if(n)fprintf(stderr,"[dn] qwen38: %d DeltaNet layers run on the GPU end to end (conv, recurrence, gated norm; %.0f MB of state in VRAM)\n",n,vram/1048576.0);
+            else fprintf(stderr,"[dn] Q38_DN_GPU=1 but no DeltaNet layer has dnqkv, dnz and dnout on one card; the CPU path stands\n");
+        }
     }
 }
 
@@ -2694,9 +2767,9 @@ static void q38_tier_start(Model *m,int cap) {
  * The tier computes the resident experts of a step on the device while the CPU
  * computes the rest; every expert's output then joins the row in rank order, the
  * device's and the CPU's alike, so the sum's order is the CPU run's whatever was
- * resident. The model's layers only: the MTP head's layer keeps its FP8 experts on
- * the CPU (the sidecar's int4 covers the model's layers). A slot's bytes are what
- * the tier reads when it promotes the expert: codes and scales of each matrix. */
+ * resident. The MTP head's layer too (index c.layers, the tier's extra layer), with
+ * the experts the snapshot keeps (FP8 beside the sidecar's int4). A slot's bytes are
+ * what the tier reads when it promotes the expert: codes and scales of each matrix. */
 static VktExpertSrc q38_vk_src(const Slot *ex) {
     VktExpertSrc s={ex->gate.data,ex->up.data,ex->down.data,ex->gate.scales,ex->up.scales,ex->down.scales};
     return s;
@@ -2718,7 +2791,7 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
     Cfg *c=&m->c;int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
     float *logits=falloc(E),*sg=falloc(SI),*su=falloc(SI),*sh=falloc(SI),*shared=falloc(H);
     float *eg=falloc(I),*eu=falloc(I),*eh=falloc(I),*eo=falloc(H);
-    int vk=vkt_ready()&&layer<c->layers;      /* the Vulkan tier: outputs buffered per rank */
+    int vk=vkt_ready()&&layer<vkt_layers();   /* the Vulkan tier: outputs buffered per rank */
     float *ebuf=vk?falloc((int64_t)K*H):NULL;
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*H;float *ys=out+(int64_t)s*H;memset(ys,0,(size_t)H*sizeof(float));
@@ -2870,7 +2943,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
     }
 
     /* the Vulkan tier: per assignment, whether the device takes it and its output */
-    int vk=vkt_ready()&&layer<c->layers;
+    int vk=vkt_ready()&&layer<vkt_layers();
     int *vk_idx=vk?(int*)malloc((size_t)max_assign*sizeof(int)):NULL;
     uint8_t *vk_taken=vk?(uint8_t*)calloc((size_t)max_assign,1):NULL;
     const float **vk_dev=vk?(const float**)malloc((size_t)max_assign*sizeof(*vk_dev)):NULL;
@@ -3111,6 +3184,7 @@ static void reset_recurrent(Model *m) {
     }
     memset(m->PLE_conv_state,0,(size_t)c->hc_width*(c->ple_convk-1)*c->ngram_size*sizeof(float));m->ple_history_len=0;
     m->mtp_len=0;m->mtp_pend_n=0;   /* the MTP head's rows go with the model's */
+    q38_dn_gpu_invalidate(m);       /* zeros on the host are the truth; the card re-loads before its next step */
 #ifdef COLI_VULKAN
     q38c_host_wrote(m,1);           /* zeros: the dense chain fills its copy with zeros */
 #endif
@@ -3585,6 +3659,7 @@ static void q38_spec_rollback(Model *m,int len,int keep) {
         float *t=m->DN_rec[i];m->DN_rec[i]=m->snap_rec[slot][i];m->snap_rec[slot][i]=t;
         t=m->DN_conv[i];m->DN_conv[i]=m->snap_conv[slot][i];m->snap_conv[slot][i]=t;
     }
+    q38_dn_gpu_invalidate(m);   /* the host swapped its state in: the card's copy is from the rejected draft */
     if(m->snap_ple[slot]){
         float *t=m->PLE_conv_state;m->PLE_conv_state=m->snap_ple[slot];m->snap_ple[slot]=t;
         memcpy(m->ple_history,m->snap_ple_history[slot],sizeof(m->snap_ple_history[slot]));
@@ -3938,7 +4013,7 @@ static void q38_model_free(Model *m) {
     q38_weight_free(&m->mtp_fc_emb); q38_weight_free(&m->mtp_fc_hid);
     free(m->mtp_mixer.norm); q38_weight_free(&m->mtp_mixer.down); q38_weight_free(&m->mtp_mixer.up);
     if(m->x4){st_destroy(&m->x4->S);free(m->x4->fd);free(m->x4->off);free(m->x4);}
-    free(m->L); free(m->cache); free(m->expert_scales); free(m->DN_rec); free(m->DN_conv); free(m->K); free(m->V); free(m->IK);
+    free(m->L); free(m->cache); free(m->expert_scales); free(m->DN_rec); free(m->DN_conv); free(m->dn_dev_fresh); free(m->dn_host_stale); free(m->K); free(m->V); free(m->IK);
     q38_weight_free(&m->embed);q38_weight_free(&m->lm_head);
     free(m->final_gr.norm);q38_weight_free(&m->final_gr.down);q38_weight_free(&m->final_gr.up);q38_weight_free(&m->final_gr.inject);
     free(m->ple_history); free(m->PLE_conv_state); free(m->c.is_attn); st_destroy(&m->S);

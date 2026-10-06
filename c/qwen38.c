@@ -1455,6 +1455,7 @@ static void q38_pin_state_free(void *v){
 static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
     const Cfg *c = &m->c;
     size_t rec = 0, conv = 0, ple = 0;
+    if (to_state) q38_dn_gpu_pull_all(m);   /* the card may be ahead of the host copy */
 #ifdef COLI_VULKAN
     if (to_state) q38c_sync_host(m);   /* the dense chain keeps the newest state on the device */
 #endif
@@ -1507,6 +1508,7 @@ static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
         }
     }
     q38_mtp_state_copy(m, st->mtp_pend, &st->mtp_len, &st->mtp_pend_n, st->mtp_pend_tok, to_state);
+    if (!to_state) q38_dn_gpu_invalidate(m);   /* restored on the host: the card's copy is from another prompt */
 #ifdef COLI_VULKAN
     if (!to_state) q38c_host_wrote(m, 0);   /* up to the device before the next chain step */
 #endif
@@ -1609,6 +1611,7 @@ static int q38_prefix_ids_reserve(int len){
 }
 
 static void q38_prefix_copy_state(Model *m,int to_cache){
+    if(to_cache)q38_dn_gpu_pull_all(m); else q38_dn_gpu_invalidate(m);
 #ifdef COLI_VULKAN
     if(to_cache)q38c_sync_host(m);
     else q38c_host_wrote(m,0);
@@ -2157,7 +2160,7 @@ int main(int argc, char **argv) {
 #ifdef COLI_VULKAN
     q38_vk_tier_start(&m, cap);   /* COLI_VULKAN=1: hot routed experts on the device (vk_tier.c) */
     if(g_vk_ready&&!vkt_ready()&&!g_vk_dense)g_vk_dense=coli_vk_dense_decide("qwen38",0,1);   /* no tier after all */
-    if(g_vk_chain)atexit(vkc_shutdown);   /* registered after the tier's: runs before the device goes */
+    if(g_vk_chain)atexit(vkc_shutdown_all);   /* registered after the tier's: runs before the device goes */
 #endif
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
 
@@ -2383,7 +2386,7 @@ static int q38_segment_expert_layout(Model *m,uint32_t begin,uint32_t end,
                                      uint64_t *fixed_scale_bytes,
                                      unsigned *numeric_kinds){
     if(!m||!bytes_per_capacity||!fixed_scale_bytes||!numeric_kinds||begin>=end||
-       end>(uint32_t)m->c.layers)return -1;
+       end>(uint32_t)q38_layer_rows(m))return -1;
     Cfg *c=&m->c;uint64_t range_bytes=0,range_scales=0;unsigned kinds=0;
     for(uint32_t layer=begin;layer<end;layer++){
         char name[320];q38_name(m,name,sizeof name,(int)layer,
@@ -2502,7 +2505,9 @@ static void q38_expert_report(Model *m, int cap) {
  * the tier how this snapshot's experts sit in RAM, what else will live on the
  * device, and how much RAM the expert cache may still take; then fill it from the
  * history, reading the planned experts straight from the files (not through the
- * LRU, which keeps its own working set). The MTP head's layer is not offered. */
+ * LRU, which keeps its own working set). The MTP head's layer goes on the tier as
+ * an extra layer, its experts in the form the snapshot keeps them (FP8 beside the
+ * int4 sidecar); it has no history, so the drafts fill it. */
 #ifdef COLI_VULKAN
 static void q38_vk_dense_add(const Q38Weight *w,size_t *bytes){
     if(!w||!q38_vk_eligible(w))return;
@@ -2578,6 +2583,24 @@ static int q38_vk_load_batch(void *ctx,int layer,const int *e,int n,VktExpertSrc
     for(int i=0;i<n;i++){srcs[i]=q38_vk_src(sl[i]);h[i]=sl[i];}
     return n;
 }
+/* The tier's source form of layers [begin,end)'s routed experts as the snapshot
+ * keeps them (not the int4 sidecar's), and one expert's bytes in RAM; VKT_SRC_NONE
+ * when they mix formats. */
+static VktFmt q38_vk_native_fmt(Model *m,int begin,int end,size_t *ram_expert){
+    Cfg *c=&m->c;int H=c->hidden,F=c->inter;
+    uint64_t per_capacity=0,fixed=0;unsigned kinds=0;
+    VktFmt f={VKT_SRC_NONE,0};
+    if(q38_segment_expert_layout(m,(uint32_t)begin,(uint32_t)end,&per_capacity,&fixed,&kinds))return f;
+    if(kinds==Q38_EXPERT_FP8_BLOCK&&m->native_fp8){
+        for(int l=begin;l<end;l++)
+            if(!q38_prepare_expert_scale_bank(m,l))return f;
+        f.kind=VKT_SRC_FP8_BLOCK; f.gs=FP8_BLOCK; *ram_expert=(size_t)3*H*F;
+    } else if(kinds==Q38_EXPERT_BF16&&m->native_bf16){ f.kind=VKT_SRC_BF16; *ram_expert=(size_t)3*H*F*2; }
+    else if(kinds==Q38_EXPERT_BF16||kinds==Q38_EXPERT_F16||kinds==Q38_EXPERT_F32||kinds==Q38_EXPERT_FP8_EXPANDED){
+        f.kind=VKT_SRC_F32; *ram_expert=(size_t)3*H*F*4;
+    }
+    return f;
+}
 static void q38_vk_tier_start(Model *m,int cap){
     if(!g_vk_ready||qt_ready()){
         if(g_vk_ready&&qt_ready())
@@ -2585,25 +2608,26 @@ static void q38_vk_tier_start(Model *m,int cap){
         return;
     }
     Cfg *c=&m->c;int H=c->hidden,F=c->inter;
-    uint64_t per_capacity=0,fixed=0;unsigned kinds=0;
     VktFmt f={VKT_SRC_NONE,0};size_t ram_expert=0;
     if(m->x4){ f.kind=VKT_SRC_I4U_PLANAR64; f.gs=64; ram_expert=(size_t)m->x4->record_bytes; }
-    else if(!q38_segment_expert_layout(m,0,(uint32_t)c->layers,&per_capacity,&fixed,&kinds)){
-        if(kinds==Q38_EXPERT_FP8_BLOCK&&m->native_fp8){
-            for(int l=0;l<c->layers;l++)
-                if(!q38_prepare_expert_scale_bank(m,l)){ kinds=0; break; }
-            if(kinds){ f.kind=VKT_SRC_FP8_BLOCK; f.gs=FP8_BLOCK; ram_expert=(size_t)3*H*F; }
-        } else if(kinds==Q38_EXPERT_BF16&&m->native_bf16){ f.kind=VKT_SRC_BF16; ram_expert=(size_t)3*H*F*2; }
-        else if(kinds==Q38_EXPERT_BF16||kinds==Q38_EXPERT_F16||kinds==Q38_EXPERT_F32||kinds==Q38_EXPERT_FP8_EXPANDED){
-            f.kind=VKT_SRC_F32; ram_expert=(size_t)3*H*F*4;
-        }
-    }
+    else f=q38_vk_native_fmt(m,0,c->layers,&ram_expert);
     if(f.kind==VKT_SRC_NONE){
         fprintf(stderr,"[VK] tier qwen38: the routed experts mix formats; they stay on the CPU\n");
         return;
     }
+    /* the MTP head's layer (index c->layers): by default on a discrete GPU only. On a
+     * Radeon 780M (shared RAM) it ran 3.44 tok/s against 3.48 on the CPU, its share of
+     * the budget taken from the model's layers; COLI_VK_TIER_MTP=1 or 0 decides. */
+    VktFmt fm={VKT_SRC_NONE,0};size_t ram_mtp=0;
+    const char *tm=getenv("COLI_VK_TIER_MTP");
+    int want_mtp=tm&&*tm?*tm!='0':!coli_vk_device_shares_ram();
+    if(m->mtp&&want_mtp){
+        fm=q38_vk_native_fmt(m,c->layers,c->layers+1,&ram_mtp);
+        if(fm.kind==VKT_SRC_NONE)fprintf(stderr,"[VK] tier qwen38: the MTP head's experts mix formats; they stay on the CPU\n");
+    }
     VktConfig vc={.engine="qwen38",.layers=c->layers,.experts=c->experts,.hidden=H,.inter=F,.topk=c->topk,
                   .gate_up=f,.down=f,.act=VKT_ACT_SWIGLU,
+                  .extra_layers=fm.kind!=VKT_SRC_NONE,.extra_gate_up=fm,.extra_down=fm,
                   .max_rows=q38_moe_prefill_rows(c,q38_prefill_batch_rows())*c->topk,
                   .ram_reserve=ram_expert*(size_t)cap*(size_t)c->layers,
                   .dense_bytes=q38_vk_dense_bytes(m),

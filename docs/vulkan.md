@@ -114,12 +114,12 @@ the shared expert tier ([below](#the-routed-expert-tier-vk_tierc)).
 | Engine | On the device | Weight formats | Stays on the CPU |
 |---|---|---|---|
 | qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B, Clef) | the dense trunk; routed experts on the expert tier | int8 rows; int4-g64 with `COLI_DENSE_BITS=4`; f16 (fmt 14) with `COLI_DENSE_BITS=16`; f32 with `COLI_DENSE_I8=0`; experts int4-g64, int4 per row, int8 per row or gs64 | DeltaNet `dn_a`/`dn_b`, vision tower, Clef's joint head, the experts the tier does not hold |
-| qwen38 (Qwen3.8 Flash Next) | the trunk; routed experts on the expert tier | int8 trunk rows, bf16, f32 (`Q38_NATIVE_BF16=0`); experts int4-g64 (sidecar), FP8 128x128 blocks, bf16 | the MTP head's experts, the experts the tier does not hold |
+| qwen38 (Qwen3.8 Flash Next) | the trunk; routed experts on the expert tier, the MTP head's too on a discrete GPU | int8 trunk rows, bf16, f32 (`Q38_NATIVE_BF16=0`); experts int4-g64 (sidecar), FP8 128x128 blocks, bf16 | the experts the tier does not hold |
 | inkling | dense and shared-expert matrices; routed experts on the expert tier | int8 and int4-g64 (dense-int4g64 container), f32, bf16; experts int4 or int8 per row (container or runtime quantization), f32 | embedding and audio lookups, CUDA residents (with CUDA or Metal on, the experts too); bf16 on CPUs with the AVX512-BF16 dot (see below); the experts the tier does not hold |
 | olmoe | attention q/k/v/o, router, lm_head; routed experts on the expert tier | f32; experts int8 per row | embedding, the experts the tier does not hold |
 | kimi_k3 (Kimi K3) | the shared experts' matrices (one row at a time: decode); routed experts on the expert tier | shared experts int8 rows, int4-g64, f32 (`K3_BITS`); experts MXFP4 with ue8m0 scales (fmt 7), SiTU-GLU in the latent space | KDA, MLA, the latent projections, router, head, prefill's shared experts, the experts the tier does not hold |
 | mimo | trunk and vision tower; routed experts on the expert tier | native fp8/bf16, int8, f32 (`MIMO_DENSE_BITS`); experts MXFP4 with e8m0 scales (fmt 7) | router, the experts the tier does not hold |
-| deepseek_v41 | the trunk, vision included; routed experts on the expert tier | fp8 in 32x32 ue8m0 tiles, bf16; experts MXFP4 (fp4, a ue8m0 scale per 32) | the DSpark stages and their experts, the experts the tier does not hold |
+| deepseek_v41 | the trunk, vision included; routed experts on the expert tier | fp8 in 32x32 ue8m0 tiles, bf16; experts MXFP4 (fp4, a ue8m0 scale per 32) | the DSpark stages (their experts on the tier on a discrete GPU), the experts the tier does not hold |
 | deepseek_v4 | resident dense layers, head, router, compressors; routed experts on the expert tier | fp8 in 128x128 blocks, bf16; experts MXFP4 (fp4, a ue8m0 scale per 32) with [an activation of its own](#deepseek-v4s-activation) | the indexer's `weights_proj`, DSpark stages, the `--oracle` path's dense layers, the experts the tier does not hold |
 | glm53 (GLM-5.3 Flash) | the resident matrices (an f32 checkpoint's experts among them); the streaming container's routed experts on the expert tier | int8 and int4-g64 (`GLM53_BITS`); experts int4-gs64 | f32 matrices (`GLM53_BITS=32`), the streamed experts the tier does not hold, all of them when `swiglu_limit` is 0 |
 | qwenimage | the DiT's matrices | int8, bf16, f32 (`COLI_IMG_BITS`) | text encoder, VAE, attention |
@@ -451,12 +451,12 @@ order its CPU-only run does, and keeps a history for the warm start where it has
 | Engine | Experts in RAM (`VktSrc`), device format | Activation | Warm start from | Of its own |
 |---|---|---|---|---|
 | qwen36 (Qwen3.6, Qwen3-Coder, the 2.4T geometry) | int8 per row `I8_ROW` or gs64 `I8_GS` (fmt 1, 13); int4 per row or gs64 from the int8-slot kernel, `I8_AS_I4_ROW` / `I8_AS_I4_GS` (fmt 2, 4); planar int4-g64 from the int4 kernel, `I4U_PLANAR64` (fmt 4); the mixed container's int4 gate/up and int8 down | SwiGLU | `COLI_USAGE` (default `<snap>/.coli_usage`), kept only while the tier is on | the tier's experts match `QWEN_EXPERT_ACT=f32` (the default kernel rounds activations to int8) |
-| qwen38 (Qwen3.8 Flash Next) | the int4-g64 sidecar `I4U_PLANAR64` (fmt 4); the release's FP8 in 128x128 blocks `FP8_BLOCK` (fmt 12); `BF16` (fmt 11); `F32` (fmt 10) | SwiGLU | `COLI_USAGE` (default `<snap>/.coli_usage`), always kept | the MTP head's layer stays on the CPU (its experts are FP8 beside an int4 sidecar) |
+| qwen38 (Qwen3.8 Flash Next) | the int4-g64 sidecar `I4U_PLANAR64` (fmt 4); the release's FP8 in 128x128 blocks `FP8_BLOCK` (fmt 12); `BF16` (fmt 11); `F32` (fmt 10) | SwiGLU | `COLI_USAGE` (default `<snap>/.coli_usage`), always kept | the MTP head's layer is an extra layer of its own form (FP8 beside an int4 sidecar), [below](#the-mtp-heads-layer-on-the-tier-coli_vk_tier_mtp) |
 | inkling | int4 container `I4U_PAIRS_ROW` (fmt 2); int8 container `I8_ROW` (fmt 1); runtime int8 rows, `I8_AS_I4_ROW` at 2 to 4 bits (fmt 2) and `I8_ROW` above; `F32` at `bits=0` (fmt 10). Gate and up come from the fused `gate_up` tensor, up I rows in | SwiGLU | `<snap>/.coli_usage` or `PIN=<path>`, in the generate and serve modes; the ref.json oracle reads none | [Inkling and OLMoE](#inkling-and-olmoe) |
 | olmoe | int8 rows `I8_ROW` (fmt 1), gate, up and down as the merged container holds them | SwiGLU | `COLI_USAGE` only | [Inkling and OLMoE](#inkling-and-olmoe) |
 | kimi_k3 (Kimi K3) | the checkpoint's MXFP4 with ue8m0 scales `MXFP4_E8M0` 32 (fmt 7): gate `w1`, up `w3`, down `w2`, in the latent space | SiTU-GLU (`VKT_ACT_SITU`) | `COLI_USAGE` (default `<snap>/.coli_usage`) | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
 | mimo (MiMo-V2.6 Flash and Pro) | the release's MXFP4 `MXFP4_E8M0` 32 (fmt 7) | SwiGLU | none: the tier fills as experts pass by | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
-| deepseek_v41 (DeepSeek V4.1 Flash) | MXFP4 `MXFP4_E8M0` 32 (fmt 7), as the checkpoint stores it | SwiGLU with `swiglu_limit` | `COLI_USAGE` (default `<snap>/.coli_usage`), kept only while the tier is on | the backbone's layers; the DSpark stages keep their own experts on the CPU |
+| deepseek_v41 (DeepSeek V4.1 Flash) | MXFP4 `MXFP4_E8M0` 32 (fmt 7), as the checkpoint stores it | SwiGLU with `swiglu_limit` | `COLI_USAGE` (default `<snap>/.coli_usage`), kept only while the tier is on | the backbone's layers; the DSpark stages, with caches of their own, are extra layers ([below](#the-mtp-heads-layer-on-the-tier-coli_vk_tier_mtp)) |
 | deepseek_v4 (DeepSeek V4 Flash) | MXFP4 `MXFP4_E8M0` 32 (fmt 7); pinned experts unpacked from rows16 | `VKT_ACT_SWIGLU_V4` | the store's own `<model>/.coli_usage` | [DeepSeek V4's activation](#deepseek-v4s-activation) |
 | colibri (GLM-5.2) | `F32` (fmt 10), int8 `I8_ROW` (fmt 1), int4 per row `I4U_PAIRS_ROW` (fmt 2), int4-gs `I4U_PAIRS_GS` (fmt 4), int3-g64 `I3_G64` (fmt 5); down may have its own | SwiGLU | `<snap>/.coli_usage` | [GLM-5.2 and GLM-5.3 Flash](#glm-52-and-glm-53-flash-on-the-tier) |
 | glm53 (GLM-5.3 Flash) | the streaming container's int4-gs64 `I4U_PAIRS_GS` 64 (fmt 4) | SwiGLU with `swiglu_limit`, run only above 0 | `COLI_USAGE` (default `<snap>/.coli_usage`) | [GLM-5.2 and GLM-5.3 Flash](#glm-52-and-glm-53-flash-on-the-tier) |
@@ -564,7 +564,77 @@ The `dev2` families' `excl` and `noexcl` cases run every engine with a RAM cache
 or two against its CPU run. On DeepSeek V4's 16-expert fixture with 6 slots a layer, the
 run with it gave up 21 RAM copies and read 46 experts from disk, against 51 without it.
 
+### The MTP head's layer on the tier (`COLI_VK_TIER_MTP`)
+
+Qwen3.8's MTP head drafts with a MoE layer of its own (index `layers`), whose experts the
+snapshot keeps in their own form: FP8 in 128x128 blocks beside the int4-g64 sidecar, which
+covers the model's layers only. With `COLI_VK_TIER_MTP=1`, the default on a discrete GPU,
+the tier takes that layer as an extra layer (`VktConfig.extra_layers`, with
+`extra_gate_up` and `extra_down`): its experts are promoted
+as the drafts pass by, served by the same batches as any layer's, and given up to the
+exclusive RAM cache the same way. What differs:
+
+- **A pool of its own.** An FP8 expert is about twice an int4 one, and in one pool the
+  holes an evicted int4 expert leaves are too small for it. The extra layer's experts sit
+  in a pool of their own on the primary device, where a newcomer displaces only another
+  extra expert, so each pool holds one size. The pool gets every extra expert when the
+  budget holds them beside every main one, else the extra layers' share of the budget
+  (their layers over all the layers, at least one expert), and its bytes leave the main
+  experts' count. They never go to a second device.
+- **No history, no streaming.** The history and the warm start cover the model's layers;
+  the drafts fill the extra layer, with `COLI_VK_TIER_RATE` promotions per token of its
+  own. It comes last in a forward, after the model's layers have spent theirs: on the
+  release they always do, and with one shared rate the head's layer got no expert at
+  all. Big prompt steps never reach it (the head drafts a few rows at a time), so it
+  takes no streaming slots.
+- **The lines.** The startup line adds `; the extra layers' experts (1, fmt 12): X of S
+  in a pool of P`, the run's line `| extra layers (1): N of M routed experts on the
+  device, resident R (budget X)`.
+
+**Measured** on the Radeon 780M of [speculative.md](speculative.md#measured) with the same
+command as its Vulkan runs (the tier alone, int4-g64 sidecar, three drafts, cap 170, the
+code-edit prompt, 128 tokens, the same starting history, model pages evicted before every
+run), three runs each, alternating:
+
+| MTP head's experts | tok/s | head's routed experts on the device | model's layers on the device |
+|---|---|---|---|
+| on the CPU (`COLI_VK_TIER_MTP=0`) | 3.48, 3.49, 3.46 | | 90382-90410 of 176640 |
+| on the tier (`COLI_VK_TIER_MTP=1`) | 3.44, 3.44, 3.46 | 1095-1160 of 4280 (31 resident, 4.8 MiB each) | 89773-90343 of 176640 |
+
+All six answers were byte-identical, and so was the head's acceptance (95 of 95 drafts).
+On this integrated GPU the head's experts on the device bought nothing: their pool (149
+MiB) came out of the model's layers' budget, whose share on the device fell a little. So
+the default puts them on the tier on a discrete GPU only;
+`COLI_VK_TIER_MTP=1` or `0` decides either way. A discrete GPU was not measured here.
+
+When the head's experts have no device form (`[VK] tier qwen38: the extra layers' expert
+format ... has no device form`), mix formats or find no room, they stay on the CPU. The
+tokens are the CPU run's either way: the MTP layer's experts join the row in rank order
+like the others'.
+
+**The other engines with a drafting head.**
+
+| Engine | Extra layers | Their experts |
+|---|---|---|
+| colibri (GLM-5.2) | the MTP head's layer, index `n_layers` | as the container keeps them (int8 beside int4 in a converted GLM-5.2), checked like the model's |
+| deepseek_v41 | the DSpark stages, `n_layers + stage` | the backbone's MXFP4; each stage's cache is the RAM side the balance and the exclusive RAM cache read |
+| deepseek_v4 | none | its full DSpark drafter (three stages, the DSpark supplement) keeps its experts on the CPU: the tiny fixture has one MTP layer, so no test reaches that path |
+| glm53 | none | its MTP layer has no routed experts |
+
+The same `COLI_VK_TIER_MTP` decides, with the same default.
+
+**Tests.** `tests/test_vk_tier`'s `extra` case gates the pools (an f32 extra layer, eight
+times an int4 expert: each pool evicts its own kind, no upload refused, an extra expert
+gets in beside a full main pool on its own promotions). The `qwen` family runs the head's
+layer on the device on both MTP fixtures and its default on Lavapipe; `glm` colibri's
+head with f32 and 4-bit experts at two drafts, and its default; `deepseek` V4.1's two
+DSpark stages at three forced acceptances, the default at five. Each must give the CPU's
+tokens and serve experts of the extra layers from the device; the sanitizer families run
+one of each.
+
 ### A second device (`COLI_VK_DEV2`)
+
+The dense chain can put layers there too: [Layers on two devices](#layers-on-two-devices).
 
 A machine with two GPUs (a V100 beside a GTX 1070, an RX 9070 beside an RX 580) can
 give the tier the memory of both. `COLI_VK_DEV2=auto` takes the best GPU that is not the
@@ -699,7 +769,8 @@ int3-g64 when a bf16 or FP8 checkpoint is quantized at load, the int4-gs contain
 down may have its own (`--down-bits 3`; an int4-g64 container's rows narrower than the
 group stay per row). E8/IQ3 experts (fmt 6, whose input is rotated), int2 and fp8 have
 no device form and stay on the CPU (`[VK] tier colibri: experts in fmt 6/6/6 ... stay
-on the CPU`), and so does the MTP head's layer (int8). The tier serves every row count:
+on the CPU`). The MTP head's layer (its experts int8 in a converted container) is an extra
+layer ([above](#the-mtp-heads-layer-on-the-tier-coli_vk_tier_mtp)). The tier serves every row count:
 decode, the MTP and n-gram verify rows and the batched prefill, by blocks of 64 rows; the
 fixed set it replaces served S <= 4 only.
 
@@ -959,7 +1030,9 @@ partial-qwen36-olmoe` gates it on Lavapipe ([below](#olmoe-and-inkling)).
 
 **What stays on the CPU.** The routed experts the tier does not hold, the router's
 top-k, the embedding gather and the vision tower's rows, Qwen3.8's n-gram table reads
-and the MTP head (its experts are FP8 beside the int4 sidecar, a few rows per draft).
+and the MTP head's layer apart from its matrices (with the full chain the per-matrix path
+runs those on the device, and its routed experts are on the expert tier as an extra
+layer).
 The chain declines, and the per-matrix path runs with the state synced first, under
 the CUDA expert tier (CUDA keeps its priority), a qpack container, PILOT prefetch, or
 a geometry outside its shaders (head dim above 256, a DeltaNet value head above 128 or
@@ -1034,6 +1107,7 @@ f32 throughout, as the CPU's f32 path.
 | `COLI_VK_KV_DEVICE_ROWS` | from the budget | The positions a split layer keeps on the device; set, the cache splits whenever it is longer. |
 | `COLI_VK_KV_BLOCK` | `64` | Positions per block of the split's block table. |
 | `COLI_VK_KV_PIN` | off | `1`: enable read-based block pins; QSA/DSA/pooled MLA rounding can then depend on read history. DeepSeek preserves its sparse arithmetic in either mode. |
+| `COLI_VK_KV_COLD` | unset | `device`: a split layer's host part attended on the device too, from a shadow of the host's rows ([below](#a-kv-cache-past-the-devices-budget)); off by default, because on the measured integrated GPU it slowed decode. |
 
 Each run and serve turn prints `[VK] <engine> chain: N forwards, F frames (ops,
 matmuls, tiled GEMM), the time spent waiting for the device, the routed experts' host
@@ -1416,8 +1490,9 @@ forward of the session and when another session takes the device, and goes up af
 pin or a state is restored.
 
 **Drafts and the MTP head.** colibri's speculative decode runs as before: the verify
-rows go through the chain, the MTP head stays on the CPU and reads the chain's final
-rows, and n-gram drafts work the same way. glm53 has no draft path.
+rows go through the chain, the MTP head runs on the CPU (its routed experts on the
+expert tier on a discrete GPU) and reads the chain's final rows, and n-gram drafts work
+the same way. glm53 has no draft path.
 
 **A lost device.** The forward that failed runs again on the CPU from its input (the
 chain keeps the caller's rows untouched until its last chunk is through), and the CPU
@@ -2152,10 +2227,26 @@ whole mirrors), and the whole of a block that just got its slot.
 
 **The partition, and why it is the row's own.** A row at position `pos` attends on the
 device over the blocks `pos/B - anchor .. pos/B` (and, from a list, the pinned blocks),
-and on the CPU over the rest. A step writes at most `chunk` rows (an eighth of the
-window), so every block of a row's share is in the window while any step holds the row,
-and the share covers the step's earlier rows, which reach the host's cache only after the
-step. Because the share depends on the row's position only, and the host's part is cut
+and on the CPU over the rest. A step writes at most `chunk` rows, so every block of a
+row's share is in the window while any step holds the row, and the share covers the
+step's earlier rows, which reach the host's cache only after the step. `chunk` is the
+largest both allow, half the window less a block: a prompt's chunk is a step, and each
+chunk carries its own frames and expert loads.
+
+| Qwen3.6-35B-A3B, 7579-token prompt, Radeon 780M, the chain | first token after |
+|---|---|
+| the whole mirrors | 77 s |
+| 1024 positions a layer on the device, chunks of an eighth of the window (before) | 170 s |
+| the same, a quarter | 141 s |
+| the same, half the window less a block (now) | 122 s |
+| 4096 positions a layer, an eighth (before) | 183 s |
+| 4096 positions, a quarter | 165 s |
+| 4096 positions, half less a block (now) | 142 s |
+
+(`COLI_VK_KV_DEVICE_ROWS` forced the split, `OMP_NUM_THREADS=8`, cap 256, 32 new tokens,
+the model in the page cache; two runs of the eighth agreed within 1%, one run each of the
+others.) A row's share shrinks with it (896 of 1024 positions before, 576 now), so a
+decode step's host part grows; the 31 decode tokens took 3.4 to 3.6 s either way. Because the share depends on the row's position only, and the host's part is cut
 into chunks fixed by position and joined in order, a row gets the same bits however a
 forward is cut into steps: a prompt in one chunk or many, a decode step, a verify, a
 resumed prefix or a cold one. Pins follow the history of reads, so a listed row's bits
@@ -2183,6 +2274,40 @@ round trip is paid only on layers with a host part.
 | `vkc_kvs_ds` | `chain_kvs` (mode 4) | DeepSeek's sparse attention with its sink over the window rows and the resident compressed rows; with every listed row resident, `vkc_dsv4_attn`'s bits |
 | `vkc_kvs_merge` | `chain_kvs` (mode 2) | the two parts joined, a gate or V4's bf16 rounding after |
 
+**The host's part on the device (`COLI_VK_KV_COLD=device`, off by default).** The
+host's rows can also be attended on the device, so a step with a host part runs in one
+frame with no round trip:
+- **The copy.** Each split layer keeps a shadow of the host's rows in page-aligned memory
+  the device reads in place (an imported host allocation, `VK_EXT_external_memory_host`).
+  The shadow follows the host's cache row by row and is lowered with it on a rewind or a
+  rollback.
+- **The ops.** `chain_kvs` reads the shadow with its COLD flag (the GQA, MLA and Inkling
+  forms; position t is row t). The prompt's rows take the blocked attention
+  (`chain_attnb`'s part mode) in chunks of 512 positions, one workgroup each, and mode 5
+  of `chain_kvs` joins them in order.
+- **The bits.** The chunks are fixed by position, so a row's bits do not depend on how a
+  forward is cut into steps, as on the CPU path.
+- **Where it applies.** It needs a device that imports host memory, no read-based pins
+  and no staged uploads. DeepSeek's sparse forms keep the host's part on the CPU, and so
+  does the second device's chain ([Layers on two devices](#layers-on-two-devices)): the
+  import is the primary's. Where it cannot run, the line says so and the CPU computes the
+  host's part.
+
+The run's report adds `| the host's part on the device: N layer steps, R rows copied
+to the shadow in T ms (M MiB held)`.
+
+| Qwen3.6-35B-A3B, 7579-token prompt, Radeon 780M, the chain | first token after | 31 decode tokens |
+|---|---|---|
+| 1024 positions a layer on the device, the host's part on the CPU | 121 s | 3.5 s |
+| the same, the host's part on the device | 114 s | 20 s |
+| 4096 positions a layer, on the CPU | 143 s | |
+| the same, on the device | 137 s | |
+
+The prompt gains 4 to 6%. Decode is 5.7 times slower: with the default, the CPU
+computes the host's part while the device runs its own, and on this integrated GPU the
+decode attention is slower than the CPU's. Hence the default. A dedicated GPU, whose
+attention outruns the CPU's by more, has not been measured.
+
 `vk_kvsplit.h` carries the rest: the plan, the tables, the uploads and the stores of a
 step's rows, the host's part (`vkc_kv_host_attn`, with the same bias, tau and V4
 rounding), and one call per form for an engine (`vkc_kv_gqa`, `vkc_kv_mla`,
@@ -2197,7 +2322,7 @@ turns the split off (past the budget the chain declines as before), `COLI_VK_KV_
 enables read-based pins. The line says what was decided:
 
 ```
-[VK] qwen36 chain: the KV cache split past the device's budget: 4096 of 65568 positions a layer on the device (64 blocks of 64, 0 for pins by reads; a row's newest 3584 positions on the device), the rest in RAM (160.0 MiB on the device instead of 2561.2)
+[VK] qwen36 chain: the KV cache split past the device's budget: 4096 of 65568 positions a layer on the device (64 blocks of 64, 0 for pins by reads; a row's newest 2112 positions on the device), the rest in RAM (160.0 MiB on the device instead of 2561.2)
 ```
 
 and each run reports the split's steps: `[VK] <engine> chain: KV split: N layer steps, M
@@ -2252,7 +2377,9 @@ part): the CPU's tokens, logits within each family's tolerance, chunks of 3, pro
 only, the split off, a lost device, pins, MTP and n-gram drafts, serve sessions with
 pins, prompt-cache extensions and divergent prompts, and the prefix-reuse tests;
 `kv-split-deepseek` the same for deepseek_v41 and deepseek_v4; `kv-split-sanitize` and
-`kv-split-deepseek-sanitize` a set of each under ASan and UBSan.
+`kv-split-deepseek-sanitize` a set of each under ASan and UBSan. `kv-split-cold` and
+`kv-split-cold-sanitize` run `kv-split` and `kv-split-sanitize` again with
+`COLI_VK_KV_COLD=device`, and every gate must have run the host's part on the device.
 
 Validation on the local Lavapipe device covers numerical correctness, not hardware
 throughput. A discrete GPU has not been measured for this change.
@@ -2270,7 +2397,9 @@ in short:
    (`VKT_ACT_SWIGLU` with an optional clamp, `VKT_ACT_SITU`, `VKT_ACT_SWIGLU_V4`), the most assignments a
    step carries, the RAM the expert cache may still take and the dense bytes still to
    come to the device; optionally `.max_experts`, a count the engine's users already
-   size its device tier in (GLM-5.2's `COLI_VK_EXPERTS`). `atexit(coli_vk_shutdown)`,
+   size its device tier in (GLM-5.2's `COLI_VK_EXPERTS`), and `.extra_layers` with
+   their own `VktFmt` for layers past the model's whose experts RAM holds in another
+   form (an MTP head's: [above](#the-mtp-heads-layer-on-the-tier-coli_vk_tier_mtp)). `atexit(coli_vk_shutdown)`,
    then `vkt_init(&cfg, rt_counts_all())` after the device and the history, then
    `atexit(vkt_shutdown)` when it succeeds: at exit the tier lets go of its experts
    first and the device is destroyed before the drivers unload, whether or not the
@@ -2658,6 +2787,70 @@ the KV split, a lost device (V4.1: the forward again on the CPU; Kimi K3: the ch
 KDA state rebuilt from the prefix record), serve sessions with prefix reuse, Kimi K3's
 recurrent-state photos and V4.1's images with N < L; the dense weights on the device only
 with N < L.
+
+### Layers on two devices
+
+With a second GPU (`COLI_VK_DEV2`) the layers the primary device leaves do not have to go
+to the CPU: a second chain takes them on that device. The primary keeps its first N
+layers (its fit, as above); the second device's chain takes the layers from N on with a
+fit of its own over that device's free memory (`COLI_VK_CHAIN_LAYERS2` forces how many);
+the CPU runs what is left, and the head stays on the host. Every chain engine does it:
+qwen36, qwen38, OLMoE, MiMo, Inkling, GLM-5.2 (colibri), GLM-5.3, Kimi K3, DeepSeek V4.1
+and DeepSeek V4. It needs a partial chain on the primary: when every layer fits there,
+the second device holds experts only, as before.
+
+A forward runs every row through the primary's layers, brings them back, and runs them
+through the second device's layers from there: what crosses is what the CPU's next layer
+would have read. That is the residual (the hc_mult streams on the mHC engines; Kimi K3's
+AttnRes prefix, block snapshots and their count), and on GLM-5.2 the DSA selection of the
+primary's last full layer when the second device's first layer shares its indexer. The
+second device's matrices are copies of its own, which the per-matrix path never reads.
+Each device's KV mirror, KV split and watermarks are its own.
+
+Recurrent state (qwen36's and qwen38's DeltaNet, Inkling's convolution rings, GLM-5.3's
+and Kimi K3's KDA) stays where its layers run. The host's copy is made current for both
+devices or for neither, the second device's read first, so a read that fails leaves the
+primary's as it was.
+
+DeepSeek V4.1's second device starts only at a layer that reads nothing the layers
+before it make in a forward. Its first compressed layer owns its compressed rows and runs
+its own indexer, and no candidate mask crosses. On V4.1 Flash those are layers 2, 8, 14
+and 20. The fit comes down to the last such layer, with a line that says so; a forced
+`COLI_VK_CHAIN_LAYERS` that is not one stays, and the second device stays off.
+
+The lines (Kimi K3's six-layer fixture, Lavapipe opened twice: `COLI_VK_DEV2=0`):
+
+```
+[VK] kimi_k3 chain: 2 of 6 layers on the device (0.5 MiB), 4 on the CPU, the head and what goes with it (0.2 MiB) on the CPU (COLI_VK_CHAIN_LAYERS=2)
+[VK] kimi_k3 dev2 chain fit: free 23872688128 B, reserve 1073741824 B, fixed 489255168 B (...), tail 0 B, layers 190280 304512 304512 304512 B, ...
+[VK] kimi_k3 dev2 chain: 4 of 4 layers on the device (1.1 MiB), 0 on the CPU (COLI_VK_CHAIN_LAYERS2=4)
+[VK] kimi_k3 chain: layers 2..5 on the second device (1 KDA, 3 MLA, 0 dense MLP), 3 AttnRes blocks, ...
+[VK] kimi_k3 dev2 chain: 8 forwards, 41 frames (...), ...
+```
+
+**A lost second device.** Losing either device turns both chains off. An engine whose
+state is the host's (OLMoE, MiMo, GLM-5.2, DeepSeek V4.1 and V4) has the CPU run the
+forward again, or run the second device's layers from the primary's output. An engine with
+recurrent state rebuilds the state its devices held from its record, as on one device.
+`COLI_VK_CHAIN_FAULT2=n` fakes the loss at the second device's n-th frame; frame 1 is its
+setup, whose layers then stay on the CPU from the start.
+
+`COLI_VK_CHAIN_DEV2=0` keeps the layers off the second device (its experts stay there).
+
+Tested on Lavapipe only, opened twice: every split of every engine's fixtures against its
+own CPU run. The families are `layers-dev2` (qwen36, qwen38, OLMoE, MiMo, Inkling),
+`layers-dev2-mla` (colibri, GLM-5.3, Kimi K3) and `layers-dev2-deepseek`, each also under
+ASan and UBSan. They cover:
+
+- the tokens, and every logits row within each engine's chain tolerance;
+- prompt chunks, drafts and MTP accepted and rejected;
+- prompts only, the KV split on both devices, experts on both devices;
+- the second device lost at its setup, in a prompt and mid-decode;
+- serve sessions with pins and the prompt cache.
+
+Two real GPUs have not been measured: none is available here. So whether a forward is
+faster than the same layers on one device and the CPU depends on the card and the link,
+and is not verified. The rows cross through host memory once per forward, chunk by chunk.
 
 ## Correctness
 

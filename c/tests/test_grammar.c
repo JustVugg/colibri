@@ -171,6 +171,36 @@ int main(void){
     CHECK(gr_admissible(&S,m,&end)==0 && end==1);
     gr_free(&G);
 
+    /* A frame keeps its alternate and its symbol in 16 bits: one past 32767 of either
+     * is refused when the grammar is read (it used to wrap to a negative index and read
+     * before the alternates); at the limit the grammar still parses and walks. */
+    {
+        static char big[140000];
+        int n = snprintf(big, sizeof big, "root ::= ");
+        for (int i = 0; i < 32768; i++) big[n++] = '|';
+        big[n] = 0;
+        CHECK(gr_parse(&G, big) != 0 && strstr(G.err, "alternates"));
+        gr_free(&G);
+        n = snprintf(big, sizeof big, "root ::= ");
+        for (int i = 0; i < 32768; i++) { big[n++] = '"'; big[n++] = 'a'; big[n++] = '"'; big[n++] = ' '; }
+        big[n] = 0;
+        CHECK(gr_parse(&G, big) != 0 && strstr(G.err, "symbols"));
+        gr_free(&G);
+        n = snprintf(big, sizeof big, "root ::= \"y\"");
+        for (int i = 1; i < 32767; i++) { big[n++] = '|'; big[n++] = '"'; big[n++] = 'x'; big[n++] = '"'; }
+        big[n] = 0;
+        CHECK(gr_parse(&G, big) == 0);
+        gr_state_init(&S, &G);           /* past GR_MAX_STACKS the walker turns itself off */
+        gr_free(&G);
+        n = snprintf(big, sizeof big, "root ::= ");
+        for (int i = 0; i < 32767; i++) { big[n++] = '"'; big[n++] = 'a'; big[n++] = '"'; big[n++] = ' '; }
+        big[n] = 0;
+        CHECK(gr_parse(&G, big) == 0);
+        gr_state_init(&S, &G);
+        CHECK(S.alive && feed(&S, "aaaa") == 4);
+        gr_free(&G);
+    }
+
     puts("test_grammar: ok");
     return 0;
 }

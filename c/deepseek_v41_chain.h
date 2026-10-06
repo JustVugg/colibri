@@ -57,7 +57,20 @@
  * above 3072 entries, an indexer above 64 heads or 4096 query floats, more than 8 hyper-
  * connection streams, a compressed layer that is not an index source and reads the list
  * of an earlier index source with another ratio (or of none), a candidate-mask consumer
- * with another ratio than the candidate source. */
+ * with another ratio than the candidate source.
+ *
+ * Layers on two devices (docs/vulkan.md, "Layers on two devices"): with COLI_VK_DEV2 a
+ * second chain takes the layers after the primary's on that device (its own fit from
+ * layer N, COLI_VK_CHAIN_LAYERS2; its own copies of their matrices, which the per-matrix
+ * path never sees); the head stays on the host. It starts only at a layer that reads
+ * nothing the layers before it make in a forward (v41c_dev2_from: its first compressed
+ * layer owns its caches and runs its indexer, and no candidate mask crosses): the
+ * primary's fit comes down to that layer when it is the fit's choice. The index keys a
+ * layer there reads of an earlier layer (the published-key rule) come from the host,
+ * which the primary's forward has written back by then. A forward runs the primary's
+ * layers, then the second device's from the streams it hands over; a lost second device
+ * leaves the CPU to run its layers from there (the host's state is current: nothing to
+ * rebuild), and both chains go off. */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 
@@ -81,13 +94,22 @@ typedef struct {
     VkcKvSplit ks;                             /* the compressed rows split past the device's budget (ks.on) */
     int *sli, nsl, rmin, planned;              /* per layer its table (-1 none), tables, the least ratio */
     VkcBuf *cnew, *cdn;                        /* a chunk's new compressed rows, and their copy for the host */
-    int n;                                     /* the layers on the device: the model's first n (a partial chain) */
+    int lo, d;                                 /* its layers start at lo, on device d (vkc_device) */
+    int n;                                     /* the layers on the device: lo..lo+n-1 (a partial chain) */
     VkcBuf *cmd, *ld;                          /* the handoff: the candidate mask and the index list, down */
 } V41Chain;
 
 static V41Chain *g_v41c;
 static int g_vk_chain = 0;
 static int g_v41c_inited = 0;
+/* the second device's chain (layers g_v41_fit.n..) and its fit */
+static V41Chain *g_v41c2;
+static VkcFit g_v41c_fit2;
+static int g_v41c_fit2_on;
+static V41Chain *v41c_of(int d) { return d ? g_v41c2 : g_v41c; }
+static const char *v41c_name(const V41Chain *ch) { return ch && ch->d ? "deepseek_v41 dev2" : "deepseek_v41"; }
+static int v41c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
+static int v41c_own(const V41Chain *ch, int i) { return i >= ch->lo && i < ch->lo + ch->n; }
 
 /* The window ring's extra rows at setup: COLI_VK_CHAIN_ROWS when set, else 512; a forward
  * whose chunk is bigger grows the rings first (v41c_grow_win). */
@@ -103,25 +125,74 @@ static int v41c_res(VkcBuf **b, size_t floats, int kind) {
     return vkc_reserve(b, (floats ? floats : 1) * sizeof(float), kind);
 }
 
-/* The device copies the per-matrix path keeps (vk_entry), uploaded here if it has not:
- * fp8 as fmt 12 with each 32x32 tile's scale written out for its rows, bf16 as fmt 11. */
-static ColiVkTensor *v41c_w8(const W8 *w) {
-    if (!w->q || w->O < 1 || w->I < 1) return NULL;
-    VkEntry *e = vk_entry(w->q, 12, w->O, w->I);
-    if (!e || e->refused) return NULL;
-    if (e->t) return e->t;
-    v41_dho_host(w->q);   /* not placed this way (device only): its rows back first */
+/* The second device's copies, by host pointer (the per-matrix path's map is the
+ * primary's): an open table, grown at half full. */
+typedef struct { const void *k; ColiVkTensor *t; } V41cD2;
+static V41cD2 *g_v41c_d2;
+static size_t g_v41c_d2cap, g_v41c_d2n;
+static ColiVkTensor **v41c_d2_slot(const void *k) {
+    if ((g_v41c_d2n + 1) * 2 > g_v41c_d2cap) {
+        size_t nc = g_v41c_d2cap ? g_v41c_d2cap * 2 : 256;
+        V41cD2 *nt = calloc(nc, sizeof *nt);
+        if (!nt) return NULL;
+        for (size_t i = 0; i < g_v41c_d2cap; i++) {
+            if (!g_v41c_d2[i].k) continue;
+            size_t h = ((uintptr_t)g_v41c_d2[i].k >> 4) & (nc - 1);
+            while (nt[h].k) h = (h + 1) & (nc - 1);
+            nt[h] = g_v41c_d2[i];
+        }
+        free(g_v41c_d2); g_v41c_d2 = nt; g_v41c_d2cap = nc;
+    }
+    size_t h = ((uintptr_t)k >> 4) & (g_v41c_d2cap - 1);
+    while (g_v41c_d2[h].k && g_v41c_d2[h].k != k) h = (h + 1) & (g_v41c_d2cap - 1);
+    if (!g_v41c_d2[h].k) { g_v41c_d2[h].k = k; g_v41c_d2n++; }
+    return &g_v41c_d2[h].t;
+}
+static void v41c_d2_forget(const void *k) {   /* its copy freed; the key stays, empty */
+    if (!k || !g_v41c_d2cap) return;
+    size_t h = ((uintptr_t)k >> 4) & (g_v41c_d2cap - 1);
+    while (g_v41c_d2[h].k && g_v41c_d2[h].k != k) h = (h + 1) & (g_v41c_d2cap - 1);
+    if (g_v41c_d2[h].k) { coli_vk_tensor_free(g_v41c_d2[h].t); g_v41c_d2[h].t = NULL; }
+}
+/* fp8 tiles' scales written out for their rows (fmt 12's form) */
+static float *v41c_fp8_scales(const W8 *w) {
     int groups = (w->I + FP8_TILE - 1) / FP8_TILE;
     float *scales = malloc((size_t)w->O * groups * sizeof(float));
     if (!scales) return NULL;
     for (int o = 0; o < w->O; o++)
         for (int g = 0; g < groups; g++) scales[(size_t)o * groups + g] = ue8m0(w->s[(size_t)(o / FP8_TILE) * groups + g]);
+    return scales;
+}
+/* The device copies the per-matrix path keeps (vk_entry), uploaded here if it has not:
+ * fp8 as fmt 12 with each 32x32 tile's scale written out for its rows, bf16 as fmt 11.
+ * With the second device current, its own copies there. */
+static ColiVkTensor *v41c_w8(const W8 *w) {
+    if (!w->q || w->O < 1 || w->I < 1) return NULL;
+    if (vkc_device_now()) {
+        ColiVkTensor **t = v41c_d2_slot(w->q);
+        if (!t || *t) return t ? *t : NULL;
+        float *scales = v41c_fp8_scales(w);
+        int ok = scales && coli_vk_tensor_ensure2(t, w->q, scales, 12, w->I, w->O, FP8_TILE);
+        free(scales);
+        return ok ? *t : NULL;
+    }
+    VkEntry *e = vk_entry(w->q, 12, w->O, w->I);
+    if (!e || e->refused) return NULL;
+    if (e->t) return e->t;
+    v41_dho_host(w->q);   /* not placed this way (device only): its rows back first */
+    float *scales = v41c_fp8_scales(w);
+    if (!scales) return NULL;
     int ok = coli_vk_tensor_ensure(&e->t, w->q, scales, 12, w->I, w->O, FP8_TILE);
     free(scales);
     return ok ? e->t : NULL;
 }
 static ColiVkTensor *v41c_wb(const WB *w) {
     if (!w->w || w->O < 1 || w->I < 1) return NULL;
+    if (vkc_device_now()) {
+        ColiVkTensor **t = v41c_d2_slot(w->w);
+        if (!t || *t) return t ? *t : NULL;
+        return coli_vk_tensor_ensure2(t, w->w, NULL, 11, w->I, w->O, 0) ? *t : NULL;
+    }
     VkEntry *e = vk_entry(w->w, 11, w->O, w->I);
     if (!e || e->refused) return NULL;
     if (e->t) return e->t;
@@ -130,19 +201,19 @@ static ColiVkTensor *v41c_wb(const WB *w) {
 }
 
 /* ---- the host's writes: the device's copies follow ------------------------------------- */
-static void v41c_lower(Model *m, int pos) {
-    V41Chain *ch = g_v41c;
+static void v41c_lower_one(Model *m, V41Chain *ch, int pos) {
     if (!ch || !ch->ok) return;
     if (pos < 0) pos = 0;
     if (ch->win_valid > pos) ch->win_valid = pos;
-    /* every kv_source layer: the chain's own, and (a partial chain) a CPU layer whose index
-     * keys a chain layer reads; the split's tables are the chain's layers' only */
+    /* every kv_source layer: the chain's own, and (a partial chain) another layer whose
+     * index keys a chain layer reads; the split's tables are the chain's layers' only */
     for (int i = 0; i < m->c.n_layers; i++) {
         int r = m->c.compress_ratio[i];
         if (m->c.kv_source[i] && r > 0 && ch->kv_valid[i] > pos / r) ch->kv_valid[i] = pos / r;
         if (m->c.kv_source[i] && r > 0 && ch->sli[i] >= 0) vkc_kv_lower(&ch->ks, ch->sli[i], pos / r);
     }
 }
+static void v41c_lower(Model *m, int pos) { for (int d = 0; d < 2; d++) v41c_lower_one(m, v41c_of(d), pos); }   /* both chains */
 static void v41c_cpu_step(Model *m, int start_pos) { v41c_lower(m, start_pos); }      /* a CPU forward from start_pos */
 static void v41c_rollback(Model *m, int committed_end) { v41c_lower(m, committed_end); }  /* rows past it rejected */
 static void v41c_reset(Model *m) { v41c_lower(m, 0); }
@@ -181,6 +252,22 @@ static const char *v41c_unsupported(const Model *m) {
 static int v41c_cand_on(const Cfg *c) {
     int cs = c->candidate_source;
     return cs >= 0 && cs < c->n_layers && c->index_source[cs] && c->compress_ratio[cs] > 0;
+}
+/* Whether the second device's chain may start at layer b: its layers read nothing the
+ * layers before b make in a forward but index keys (the host's, written back by then).
+ * The first compressed layer at or after b owns its caches and runs its indexer (no
+ * compressed rows or index list from before b), and no candidate mask made before b is
+ * read at or after it. */
+static int v41c_clean_at(const Model *m, int b) {
+    const Cfg *c = &m->c; int L = c->n_layers;
+    for (int i = b; i < L; i++) {
+        if (c->compress_ratio[i] <= 0) continue;
+        if (!c->kv_source[i] || !c->index_source[i]) return 0;
+        break;
+    }
+    if (v41c_cand_on(c) && c->candidate_source < b)
+        for (int i = b; i < L; i++) if (c->index_source[i] && c->compress_ratio[i] > 0) return 0;
+    return 1;
 }
 
 /* ---- the partial chain (vk_chain.h, vkc_fit): the first N layers on the device ------------
@@ -269,8 +356,41 @@ static int v41c_fit_now(Model *m) {
     size_t *per = calloc((size_t)L, sizeof(size_t)), *mat = calloc((size_t)L, sizeof(size_t));
     if (!per || !mat) { free(per); free(mat); return 0; }
     for (int i = 0; i < L; i++) per[i] = v41c_layer_bytes(m, i, rows, g_v41_dho_try, views && g_v41_dho_try, &mat[i]);
-    vkc_fit("deepseek_v41", L, per, mat, v41c_fixed_bytes(m, rows), v41c_tail_bytes(m, views && !g_v41_dho_try), &g_v41_fit);
+    size_t fixed = v41c_fixed_bytes(m, rows);
+    vkc_fit("deepseek_v41", L, per, mat, fixed, v41c_tail_bytes(m, views && !g_v41_dho_try), &g_v41_fit);
     g_v41_partial = vkc_fit_partial(&g_v41_fit);
+    /* the layers the primary leaves, on COLI_VK_DEV2's device: from a layer that reads
+     * nothing the layers before it make (v41c_clean_at; the fit's N comes down to the last
+     * such layer, a forced one stays and the second device stays off), its own fit (its
+     * layers' own set: no device-only placement there, the head on the host), its
+     * pipelines up now */
+    int n0 = g_v41_fit.n;
+    if (g_v41_partial && n0 > 0 && n0 < L && v41c_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
+        int b = n0;
+        while (b > 0 && !v41c_clean_at(m, b)) b--;
+        if (b != n0 && g_v41_fit.forced) {
+            fprintf(stderr, "[VK] deepseek_v41 chain: layer %d reads what the layers before it make in a forward; the second device's "
+                            "chain starts only at a layer that does not (COLI_VK_CHAIN_LAYERS=%d would do): its layers stay on the CPU\n",
+                    n0, b);
+            b = 0;
+        } else if (b != n0 && b > 0) {
+            g_v41_fit.n = b; g_v41_fit.tail = 0; g_v41_fit.used_b = 0;
+            for (int i = 0; i < b; i++) g_v41_fit.used_b += per[i];
+            fprintf(stderr, "[VK] deepseek_v41 chain: %d of %d layers on the device: the second device's layers start at layer %d, "
+                            "the last at or before %d that reads nothing the layers before it make in a forward\n", b, L, b, n0);
+        }
+        if (b > 0) {
+            for (int i = b; i < L; i++) per[i] = v41c_layer_bytes(m, i, rows, 0, 0, &mat[i]);
+            vkc_device(1);
+            int n2 = vkc_fit("deepseek_v41 dev2", L - b, per + b, mat + b, fixed, 0, &g_v41c_fit2);
+            if (n2 > 0 && !(vkc_init() && vkc_mla_ready() && vkc_mhc_ready() && vkc_dsv4_ready())) {
+                fprintf(stderr, "[VK] deepseek_v41 chain: the second device's pipelines did not come up; its layers stay on the CPU\n");
+                n2 = 0;
+            }
+            g_v41c_fit2_on = n2 > 0;
+            vkc_device(0);
+        }
+    }
     free(per); free(mat);
     return 1;
 }
@@ -288,8 +408,10 @@ static int v41c_layer_state(V41Chain *ch, Model *m, int i, const char **why) {
     Cfg *c = &m->c; Layer *l = &m->L[i];
     int H = c->hc_mult, D = c->dim, nm = (2 + H) * H, r = c->compress_ratio[i];
     *why = "a matrix the device refused";
-    if (!coli_vk_tensor_ensure(&ch->fna[i], l->hc_attn_fn.w, NULL, 10, H * D, nm, 0) ||
-        !coli_vk_tensor_ensure(&ch->fnf[i], l->hc_ffn_fn.w, NULL, 10, H * D, nm, 0)) return 0;
+    if (ch->d ? !coli_vk_tensor_ensure2(&ch->fna[i], l->hc_attn_fn.w, NULL, 10, H * D, nm, 0) ||
+                !coli_vk_tensor_ensure2(&ch->fnf[i], l->hc_ffn_fn.w, NULL, 10, H * D, nm, 0)
+              : !coli_vk_tensor_ensure(&ch->fna[i], l->hc_attn_fn.w, NULL, 10, H * D, nm, 0) ||
+                !coli_vk_tensor_ensure(&ch->fnf[i], l->hc_ffn_fn.w, NULL, 10, H * D, nm, 0)) return 0;
     *why = "device memory for its state refused";
     if (!ch->win[i] && !(ch->win[i] = vkc_buf((size_t)ch->Wd * c->head_dim * sizeof(float), VKC_DEV))) return 0;
     if (c->kv_source[i] && r > 1 && !ch->ring[i] && !(ch->ring[i] = vkc_buf((size_t)2 * r * c->head_dim * sizeof(float), VKC_DEV)))
@@ -321,26 +443,33 @@ static void v41c_layer_free(V41Chain *ch, Model *m, int i) {
     ch->ccap[i] = ch->kv_valid[i] = 0;
     const W8 *w8[] = {&l->wq_a, &l->wq_b, &l->wkv, &l->wo_a, &l->wo_b, &l->sh_w1, &l->sh_w3, &l->sh_w2, &l->idx_wq_b, &l->eng_wkv};
     const WB *wb[] = {&l->comp_wkv, &l->comp_wgate, &l->idx_wk, &l->idx_wproj};
+    if (ch->d) {   /* the second device's own copies */
+        for (size_t k = 0; k < sizeof w8 / sizeof *w8; k++) v41c_d2_forget(w8[k]->q);
+        for (size_t k = 0; k < sizeof wb / sizeof *wb; k++) v41c_d2_forget(wb[k]->w);
+        return;
+    }
     for (size_t k = 0; k < sizeof w8 / sizeof *w8; k++) if (w8[k]->q) v41_vk_forget_range(w8[k]->q, (size_t)w8[k]->O * w8[k]->I);
     for (size_t k = 0; k < sizeof wb / sizeof *wb; k++) if (wb[k]->w) v41_vk_forget_range(wb[k]->w, (size_t)wb[k]->O * wb[k]->I * 2);
 }
 /* Layer i did not reach the device: it and the layers after it off the device (with the
  * trunk on the device only, their host copies read back), the chain cut before it. */
 static void v41c_cut(V41Chain *ch, Model *m, int i, const char *why) {
-    for (int k = i; k < ch->n; k++) v41c_layer_free(ch, m, k);
+    for (int k = i; k < ch->lo + ch->n; k++) v41c_layer_free(ch, m, k);
+    if (ch->lo + ch->n > i) ch->n = i - ch->lo;
+    if (ch->d) { vkc_fit_shrink("deepseek_v41 dev2", &g_v41c_fit2, i - ch->lo, why); return; }
     if (g_v41_dho) v41_dho_unplace(m, i);
-    if (ch->n > i) ch->n = i;
     vkc_fit_shrink("deepseek_v41", &g_v41_fit, i, why);
 }
 
 /* The chain's struct, made once: by the device-only placement, which builds each of the
  * chain's layers whole as model_load reads it (v41c_build_layer), else by the setup. */
-static V41Chain *v41c_alloc(Model *m) {
-    if (g_v41c) return g_v41c;
+static V41Chain *v41c_alloc_dev(Model *m, int d) {
+    if (v41c_of(d)) return v41c_of(d);
     Cfg *c = &m->c;
     int L = c->n_layers;
     V41Chain *ch = calloc(1, sizeof *ch);
     if (!ch) return NULL;
+    ch->d = d; ch->lo = d ? g_v41_fit.n : 0;
     size_t **offs[] = {&ch->o_an, &ch->o_fn, &ch->o_qn, &ch->o_kn, &ch->o_sink, &ch->o_hca, &ch->o_hcf, &ch->o_cn, &ch->o_ikn,
                        &ch->o_eq, &ch->o_ek};
     for (size_t k = 0; k < sizeof offs / sizeof *offs; k++) if (!(*offs[k] = calloc(L, sizeof(size_t)))) return NULL;
@@ -349,12 +478,14 @@ static V41Chain *v41c_alloc(Model *m) {
     ch->ikey = calloc(L, sizeof(void *)); ch->ring = calloc(L, sizeof(void *));
     ch->kv_valid = calloc(L, sizeof(int)); ch->ccap = calloc(L, sizeof(int)); ch->sli = malloc(L * sizeof(int));
     if (!ch->fna || !ch->fnf || !ch->win || !ch->ckv || !ch->ikey || !ch->ring || !ch->kv_valid || !ch->ccap || !ch->sli) return NULL;
-    ch->n = g_v41_fit.L > 0 ? g_v41_fit.n : L;
+    ch->n = d ? g_v41c_fit2.n : g_v41_fit.L > 0 ? g_v41_fit.n : L;
     ch->W = c->window; ch->K = c->index_topk > 0 ? c->index_topk : 0; ch->rmax = 1;
     for (int i = 0; i < L; i++) if (c->kv_source[i] && c->compress_ratio[i] > ch->rmax) ch->rmax = c->compress_ratio[i];
     ch->Wd = ch->W + v41c_rows();
-    return g_v41c = ch;
+    if (d) g_v41c2 = ch; else g_v41c = ch;
+    return ch;
 }
+static V41Chain *v41c_alloc(Model *m) { return v41c_alloc_dev(m, 0); }
 /* The device-only placement of layer i put its matrices up (model_load, v41_dho_place):
  * its state goes up too before its host pages are given back, so the layer reaches the
  * device whole or not at all and a failure reads nothing back. 0 with *why set. */
@@ -381,19 +512,22 @@ static int v41c_prepare(Model *m) {
     return g_v41c_build = v41c_alloc(m) != NULL;
 }
 
-static int v41c_setup(Model *m) {
+/* d = 1: the second device's chain, its layers from g_v41_fit.n (device 1 current). */
+static int v41c_setup_dev(Model *m, int d) {
     Cfg *c = &m->c;
     int L = c->n_layers, D = c->dim, H = c->hc_mult, nm = (2 + H) * H;
     const char *why = v41c_unsupported(m);
     if (why) { fprintf(stderr, "[VK] deepseek_v41 chain: %s; the CPU runs the layers\n", why); return 0; }
-    if ((g_v41_fit.L > 0 ? g_v41_fit.n : L) < 1) return 0;
-    V41Chain *ch = v41c_alloc(m);
+    if ((d ? g_v41c_fit2.n : g_v41_fit.L > 0 ? g_v41_fit.n : L) < 1) return 0;
+    V41Chain *ch = v41c_alloc_dev(m, d);
     if (!ch) return 0;
-    int N = ch->n;
+    VkcFit *fit = d ? &g_v41c_fit2 : &g_v41_fit;
+    const char *nmc = v41c_name(ch);
+    int N = ch->n, lo = ch->lo;
     if (N < 1) return 0;
     /* the parameter arena, the chain's layers' */
     size_t n = 0;
-    for (int i = 0; i < N; i++) {
+    for (int i = lo; i < lo + N; i++) {
         ch->o_an[i] = n; n += D; ch->o_fn[i] = n; n += D;
         ch->o_qn[i] = n; n += c->q_lora; ch->o_kn[i] = n; n += c->head_dim;
         ch->o_sink[i] = n; n += c->n_heads;
@@ -402,24 +536,24 @@ static int v41c_setup(Model *m) {
         if (m->L[i].engram_index >= 0) { ch->o_eq[i] = n; n += (size_t)H * D; ch->o_ek[i] = n; n += (size_t)H * D; }
     }
     if (!(ch->prm = vkc_buf((n ? n : 1) * sizeof(float), VKC_DEV))) {
-        v41c_cut(ch, m, 0, "device memory for the parameters refused");
-        vkc_fit_placed("deepseek_v41", &g_v41_fit);
+        v41c_cut(ch, m, lo, vkc_lost() ? "the device was lost" : "device memory for the parameters refused");
+        vkc_fit_placed(nmc, fit);
         return 0;
     }
     /* the layers, each whole or the chain stops before it */
-    for (int i = 0; i < N; i++) {
-        if (!v41c_layer_up(ch, m, i, &why)) { v41c_cut(ch, m, i, why); break; }
-        if (!g_v41_dho) vkc_fit_mark(&g_v41_fit, i);   /* device only: noted as each layer was placed */
+    for (int i = lo; i < lo + N; i++) {
+        if (!v41c_layer_up(ch, m, i, &why)) { v41c_cut(ch, m, i, vkc_lost() ? "the device was lost" : why); break; }
+        if (d || !g_v41_dho) vkc_fit_mark(fit, i - lo);   /* device only: noted as each layer was placed */
     }
     N = ch->n;
     for (int i = 0; i < L; i++) {               /* the split's tables: one per chain layer that makes compressed rows */
-        ch->sli[i] = i < N && c->kv_source[i] && c->compress_ratio[i] > 0 ? ch->nsl++ : -1;
+        ch->sli[i] = v41c_own(ch, i) && c->kv_source[i] && c->compress_ratio[i] > 0 ? ch->nsl++ : -1;
         if (ch->sli[i] >= 0 && (ch->rmin == 0 || c->compress_ratio[i] < ch->rmin)) ch->rmin = c->compress_ratio[i];
     }
     int ok = N > 0;
     float *a = ok ? calloc(n ? n : 1, sizeof(float)) : NULL;
     ok = ok && a;
-    for (int i = 0; ok && i < N; i++) {
+    for (int i = lo; ok && i < lo + N; i++) {
         Layer *l = &m->L[i];
         memcpy(a + ch->o_an[i], l->attn_norm.w, D * sizeof(float));
         memcpy(a + ch->o_fn[i], l->ffn_norm.w, D * sizeof(float));
@@ -443,24 +577,28 @@ static int v41c_setup(Model *m) {
     free(a);
     if (!ok) {
         if (N > 0) {
-            fprintf(stderr, "[VK] deepseek_v41 chain: the parameters did not reach the device; the CPU runs the layers\n");
-            v41c_cut(ch, m, 0, "the parameters did not reach it");
+            if (!d) fprintf(stderr, "[VK] deepseek_v41 chain: the parameters did not reach the device; the CPU runs the layers\n");
+            v41c_cut(ch, m, lo, vkc_lost() ? "the device was lost" : "the parameters did not reach it");
         }
         vkc_free(ch->prm); ch->prm = NULL;
-        vkc_fit_placed("deepseek_v41", &g_v41_fit);
+        vkc_fit_placed(nmc, fit);
         return 0;
     }
     ch->ok = 1;
     int nsrc = 0, nidx = 0, neng = 0;
-    for (int i = 0; i < N; i++) { nsrc += c->kv_source[i]; nidx += c->index_source[i] && c->compress_ratio[i] > 0; neng += m->L[i].engram_index >= 0; }
+    for (int i = lo; i < lo + N; i++) { nsrc += c->kv_source[i]; nidx += c->index_source[i] && c->compress_ratio[i] > 0; neng += m->L[i].engram_index >= 0; }
     size_t bytes = 0, tensors = 0;
-    coli_vk_mem_info(&bytes, &tensors);
-    fprintf(stderr, "[VK] deepseek_v41 chain: %d layers on the device (%d compressing, %d indexing, %d engram), %d streams, "
-                    "%.1f MiB of parameters, %zu matrices (%.1f MiB) on the device\n", N, nsrc, nidx, neng, H, n * 4 / 1048576.0,
-            tensors, bytes / 1048576.0);
-    vkc_fit_placed("deepseek_v41", &g_v41_fit);
+    coli_vk_mem_info_dev(d, &bytes, &tensors);
+    if (d) fprintf(stderr, "[VK] deepseek_v41 chain: layers %d..%d on the second device (%d compressing, %d indexing, %d engram), "
+                           "%d streams, %.1f MiB of parameters, %zu matrices (%.1f MiB) there\n", lo, lo + N - 1, nsrc, nidx, neng, H,
+                   n * 4 / 1048576.0, tensors, bytes / 1048576.0);
+    else fprintf(stderr, "[VK] deepseek_v41 chain: %d layers on the device (%d compressing, %d indexing, %d engram), %d streams, "
+                         "%.1f MiB of parameters, %zu matrices (%.1f MiB) on the device\n", N, nsrc, nidx, neng, H, n * 4 / 1048576.0,
+                 tensors, bytes / 1048576.0);
+    vkc_fit_placed(nmc, fit);
     return 1;
 }
+static int v41c_setup(Model *m) { return v41c_setup_dev(m, 0); }
 
 /* The compressed rows of the kv_source layers, whole or split: planned when the whole
  * mirrors would grow (and at the first forward); once split, the split stays. ctx: the
@@ -481,7 +619,7 @@ static int v41c_plan(V41Chain *ch, Model *m, int ctx) {
     ch->planned = 1;
     /* a window of half the slots, the rest pinned by the indexer's picks; the forward's
      * chunks shrink to what the window takes (v41c_forward) */
-    if (vkc_kv_plan_need(&ch->ks, "deepseek_v41", ch->nsl, (size_t)hd * sizeof(float), tcap, 1, 1, held, need) != 2) return 1;
+    if (vkc_kv_plan_need(&ch->ks, v41c_name(ch), ch->nsl, (size_t)hd * sizeof(float), tcap, 1, 1, held, need) != 2) return 1;
     for (int i = 0; i < L; i++) {
         if (ch->sli[i] < 0) continue;
         vkc_free(ch->ckv[i]);
@@ -495,7 +633,7 @@ static int v41c_plan(V41Chain *ch, Model *m, int ctx) {
 static int v41c_cache(V41Chain *ch, Model *m, int i, int rows) {
     Cfg *c = &m->c;
     if (ch->ccap[i] >= rows) return 1;
-    int r = c->compress_ratio[i], host = c->max_positions / (r > 0 ? r : 1), own = i < ch->n;
+    int r = c->compress_ratio[i], host = c->max_positions / (r > 0 ? r : 1), own = v41c_own(ch, i);
     int cap = 64; while (cap < rows) cap *= 2;
     if (cap > host) cap = host;
     if (cap < rows) return 0;
@@ -527,7 +665,7 @@ static int v41c_chunk_rows(V41Chain *ch, Model *m, int ctx) {
      * output beside the rank-order contribution buffer. */
     row += 2 * ((size_t)c->dim + c->moe_inter) * sizeof(float);
     if (ch->ks.on) row += (size_t)(ch->W + ch->K) * sizeof(int);
-    return vkc_chunk_rows("deepseek_v41", row);
+    return vkc_chunk_rows(v41c_name(ch), row);
 }
 /* The window rings for chunks of `rows`: W + rows rows each (a chunk never overwrites a
  * row one of its earlier queries reads); a ring that grows is mirrored again. */
@@ -535,7 +673,7 @@ static int v41c_grow_win(V41Chain *ch, Model *m, int rows) {
     if (ch->W + rows <= ch->Wd) return 1;
     const Cfg *c = &m->c;
     int Wd = ch->W + rows;
-    for (int i = 0; i < ch->n; i++) {
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) {
         vkc_free(ch->win[i]);
         if (!(ch->win[i] = vkc_buf((size_t)Wd * c->head_dim * sizeof(float), VKC_DEV))) return 0;
     }
@@ -579,9 +717,9 @@ static int v41c_scratch(V41Chain *ch, Model *m, int rows, int ctx) {
 }
 
 /* ---- one layer's pieces ----------------------------------------------------------------- */
-static int v41c_norm(VkcBuf *x, size_t xo, int xrow, size_t wo, VkcBuf *y, size_t yo, int yrow, int rows, int D, float eps) {
+static int v41c_norm(const V41Chain *ch, VkcBuf *x, size_t xo, int xrow, size_t wo, VkcBuf *y, size_t yo, int yrow, int rows, int D, float eps) {
     VkcNorm p = {rows, D, 1, (int)xo, xrow, D, (int)yo, yrow, D, (int)wo, 0, 0, eps, 1.f};
-    return vkc_norm(x, g_v41c->prm, y, &p);
+    return vkc_norm(x, ch->prm, y, &p);
 }
 /* mHC's entry for a site: the mix, the split into hp, the collapse with `prev`'s pre, the norm into nrm */
 static int v41c_pre(V41Chain *ch, Model *m, ColiVkTensor *fn, size_t hco, VkcBuf *hp, VkcBuf *prev, size_t lno, int n) {
@@ -590,7 +728,7 @@ static int v41c_pre(V41Chain *ch, Model *m, ColiVkTensor *fn, size_t hco, VkcBuf
     VkcMhc co = sp;
     return vkc_matmul(fn, ch->xs, 0, ch->mix, 0, n) && vkc_mhc(VKC_MHC_SPLIT, ch->xs, ch->mix, hp, ch->prm, NULL, &sp) &&
            vkc_mhc(VKC_MHC_COLLAPSE, ch->xs, NULL, prev, NULL, ch->col, &co) &&
-           v41c_norm(ch->col, 0, D, lno, ch->nrm, 0, D, n, D, c->norm_eps);
+           v41c_norm(ch, ch->col, 0, D, lno, ch->nrm, 0, D, n, D, c->norm_eps);
 }
 /* mHC's exit: xn = comb(xs) + post * br, then the two swap */
 static int v41c_post(V41Chain *ch, Model *m, VkcBuf *hp, int n) {
@@ -623,10 +761,10 @@ static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
     int nr = f->nr, pb = f->pb, qrow = nh * hd, LR = ch->W + ch->K;
     int tcs = r > 0 ? f->csB + (ch->rmax - 1) * rd : 0;            /* rope_for(layer): the row of position pb */
     int ok = vkc_matmul(v41c_w8(&l->wq_a), ch->nrm, 0, ch->qa, 0, nr) &&
-             v41c_norm(ch->qa, 0, QL, ch->o_qn[i], ch->qr, 0, QL, nr, QL, c->norm_eps) &&
+             v41c_norm(ch, ch->qa, 0, QL, ch->o_qn[i], ch->qr, 0, QL, nr, QL, c->norm_eps) &&
              vkc_matmul(v41c_w8(&l->wq_b), ch->qr, 0, ch->q, 0, nr) &&
              vkc_matmul(v41c_w8(&l->wkv), ch->nrm, 0, ch->kv, 0, nr) &&
-             v41c_norm(ch->kv, 0, hd, ch->o_kn[i], ch->kv, 0, hd, nr, hd, c->norm_eps) &&
+             v41c_norm(ch, ch->kv, 0, hd, ch->o_kn[i], ch->kv, 0, hd, nr, hd, c->norm_eps) &&
              v41c_rope(ch, m, ch->q, nr * nh, nh, hd - rd, qrow, hd, tcs, rd, 0) &&
              v41c_rope(ch, m, ch->kv, nr, 1, hd - rd, hd, 0, tcs, rd, 0);
     if (!ok) return 0;
@@ -640,12 +778,12 @@ static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
         VkcBuf *cb = sp ? ch->cnew : ch->ckv[i];                     /* the split: the new rows through a scratch */
         size_t co = sp ? 0 : (size_t)g0 * hd;
         ok = vkc_matmul(v41c_wb(&l->comp_wkv), ch->nrm, 0, ch->craw, 0, nr);
-        if (ok && r == 1) ok = v41c_norm(ch->craw, 0, hd, ch->o_cn[i], cb, co, hd, nr, hd, c->norm_eps);
+        if (ok && r == 1) ok = v41c_norm(ch, ch->craw, 0, hd, ch->o_cn[i], cb, co, hd, nr, hd, c->norm_eps);
         else if (ok) {
             VkcDsComp cp = {nr, pb, r, hd, hd, 0, 0, hd, 0, hd, -1, sp ? -g0 * hd : 0, hd, 0};
             ok = vkc_matmul(v41c_wb(&l->comp_wgate), ch->nrm, 0, ch->cscr, 0, nr) &&
                  vkc_dsv4_compress(ch->craw, ch->cscr, ch->ring[i], NULL, cb, &cp) &&
-                 (np == 0 || v41c_norm(cb, co, hd, ch->o_cn[i], cb, co, hd, np, hd, c->norm_eps));
+                 (np == 0 || v41c_norm(ch, cb, co, hd, ch->o_cn[i], cb, co, hd, np, hd, c->norm_eps));
             if (ok && f->spec && f->praw)                           /* a verify's raw rows, for its undo rows */
                 ok = vkc_copy(ch->pull, f->praw[i], ch->craw, 0, (size_t)nr * hd) &&
                      vkc_copy(ch->pull, f->praw[i] + (size_t)nr * hd, ch->cscr, 0, (size_t)nr * hd);
@@ -653,7 +791,7 @@ static int v41c_attention(V41Chain *ch, Model *m, int i, const V41Fwd *f) {
         if (ok && np > 0) {
             int bc = f->csB + (g0 * r - (pb - ch->rmax + 1)) * rd;   /* a latent rotates at its group's first position */
             ok = vkc_matmul(v41c_wb(&l->idx_wk), cb, co, ch->ikey[i], (size_t)g0 * ihd, np) &&
-                 v41c_norm(ch->ikey[i], (size_t)g0 * ihd, ihd, ch->o_ikn[i], ch->ikey[i], (size_t)g0 * ihd, ihd, np, ihd, c->norm_eps) &&
+                 v41c_norm(ch, ch->ikey[i], (size_t)g0 * ihd, ihd, ch->o_ikn[i], ch->ikey[i], (size_t)g0 * ihd, ihd, np, ihd, c->norm_eps) &&
                  v41c_rope(ch, m, ch->ikey[i], np, 1, g0 * ihd + ihd - rd, ihd, 0, bc, r * rd, 0) &&
                  v41c_rope(ch, m, cb, np, 1, (int)co + hd - rd, hd, 0, bc, r * rd, 0);
             if (ok && sp) {   /* into their slots, and down for the host's ckv once the frame is through */
@@ -731,24 +869,25 @@ static int v41c_engram(V41Chain *ch, Model *m, int i, int nr, int pb, float *row
            vkc_matmul(v41c_w8(&l->eng_wkv), ch->erows, 0, ch->ekv, 0, nr) && vkc_dsv4_engram(ch->ekv, ch->prm, ch->xs, &p);
 }
 
-/* The chain's layers (every layer, or a partial chain's first ch->n) for n rows of streams
- * h (positions start..): the streams after its last layer and that layer's FFN mix back
- * into h and pre_mix (every row when all, or with a partial chain, whose CPU layers read
- * them all; else the last). Returns the layers it ran: the caller's CPU loop runs the
- * others from there. 0 = not taken: the CPU runs every layer, h and pre_mix untouched. */
-static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, int spec, int all) {
-    V41Chain *ch = g_v41c;
-    if (!g_vk_chain || !ch || !ch->ok || ch->failed || g_trace) return 0;
-    if (g_vk_chain == COLI_VK_CHAIN_PREFILL && n <= 2) return 0;
-    if (vkc_lost()) { ch->failed = 1; g_vk_chain = 0; return 0; }
+/* One chain's layers (lo..lo+n-1, on its device, current) for n rows of streams h
+ * (positions start..), from h and pre_mix (the mix of the FFN site before its first
+ * layer: [1, 0, ...] at layer 0): the streams after its last layer and that layer's FFN
+ * mix back into h and pre_mix (every row when all, or when layers run after it, which
+ * read them all; else the last). Returns ch->n; 0 = not taken: h and pre_mix untouched
+ * (*lost = 1: a frame failed, the device marked lost; else declined, or memory refused:
+ * the chain off). */
+static void v41c_off(V41Chain *ch) { ch->failed = 1; if (!ch->d) g_vk_chain = 0; }
+static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, int n, int start, int spec, int all, int *lost) {
+    *lost = 0;
     Cfg *c = &m->c;
-    int L = c->n_layers, N = ch->n, D = c->dim, H = c->hc_mult, HD = H * D, hr = 2 * H + H * H, hd = c->head_dim, rd = c->rope_dim;
+    int L = c->n_layers, lo = ch->lo, hi = lo + ch->n, D = c->dim, H = c->hc_mult, HD = H * D, hr = 2 * H + H * H, hd = c->head_dim, rd = c->rope_dim;
     int W = ch->W, LR = W + ch->K, T = m->spec.active ? c->n_spec_targets : 0, E = start + n;
-    if (N < L) all = 1;
+    const char *nmc = v41c_name(ch);
+    if (hi < L) all = 1;
     if (spec && n > W) return 0;                           /* the undo rows: one window at most */
     if (!v41c_plan(ch, m, E)) {
-        fprintf(stderr, "[VK] deepseek_v41 chain: device memory for the split's compressed rows refused; the CPU runs the layers\n");
-        ch->failed = 1; g_vk_chain = 0;
+        fprintf(stderr, "[VK] %s chain: device memory for the split's compressed rows refused; the CPU runs the layers\n", nmc);
+        v41c_off(ch);
         return 0;
     }
     int CH = v41c_chunk_rows(ch, m, E), rows;
@@ -760,8 +899,8 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     if (spec && n > CH) return 0;                          /* a verify is one chunk */
     rows = n < CH ? n : CH;
     if (!v41c_grow_win(ch, m, rows)) {
-        fprintf(stderr, "[VK] deepseek_v41 chain: device memory for window rings of %d rows refused; the CPU runs the layers\n", rows);
-        ch->failed = 1; g_vk_chain = 0;
+        fprintf(stderr, "[VK] %s chain: device memory for window rings of %d rows refused; the CPU runs the layers\n", nmc, rows);
+        v41c_off(ch);
         return 0;
     }
     /* A partial chain's handoff beyond the streams: the CPU's layers read the candidate
@@ -769,12 +908,12 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
      * after N reads it) and the index list the last chain index source published (a
      * compressed layer after N reads it before the next index source runs). */
     int cs = c->candidate_source, cand_out = 0, list_out = -1, list_w = 0;
-    if (N < L) {
-        if (v41c_cand_on(c) && cs < N)
-            for (int i = N; i < L; i++) cand_out |= c->index_source[i] && c->compress_ratio[i] > 0;
+    if (hi < L) {
+        if (v41c_cand_on(c) && cs >= lo && cs < hi)
+            for (int i = hi; i < L; i++) cand_out |= c->index_source[i] && c->compress_ratio[i] > 0;
         int last = -1, reader = 0;
-        for (int i = 0; i < N; i++) if (c->index_source[i] && c->compress_ratio[i] > 0) last = i;
-        for (int i = N; i < L && last >= 0; i++) {
+        for (int i = lo; i < hi; i++) if (c->index_source[i] && c->compress_ratio[i] > 0) last = i;
+        for (int i = hi; i < L && last >= 0; i++) {
             if (c->compress_ratio[i] <= 0) continue;
             if (c->index_source[i]) break;
             reader = 1;
@@ -805,9 +944,9 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
      * the complete groups before it, and whatever another layer's selection reaches (the
      * host's rows there, as the CPU reads them; a partial chain: also the index keys of a
      * CPU layer a chain layer reads, the host's as the CPU's layer order has them then) */
-    for (int i = 0; i < N; i++) if (c->kv_source[i] && c->compress_ratio[i] > 0) need[i] = start / c->compress_ratio[i];
+    for (int i = lo; i < hi; i++) if (c->kv_source[i] && c->compress_ratio[i] > 0) need[i] = start / c->compress_ratio[i];
     int pub = m->published_index_k ? m->published_index_layer : -1, last_pub = -1;
-    for (int i = 0; i < N; i++) {
+    for (int i = lo; i < hi; i++) {
         int r = c->compress_ratio[i];
         if (r <= 0) continue;
         int owner = c->index_owner[i];
@@ -830,14 +969,14 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
         if (!c->kv_source[i]) continue;
         int r = c->compress_ratio[i], host = c->max_positions / r;
         if (need[i] > host) need[i] = host;
-        if (i >= N) { if (need[i] > 0) ok = v41c_cache(ch, m, i, need[i]); continue; }   /* a CPU layer's keys a chain layer reads */
+        if (!v41c_own(ch, i)) { if (need[i] > 0) ok = v41c_cache(ch, m, i, need[i]); continue; }   /* another layer's keys a chain layer reads */
         int want = need[i] > E / r ? need[i] : E / r;
         ok = v41c_cache(ch, m, i, want > 0 ? want : 1);
     }
     /* what comes back at the end: the window rows, the compressed rows and keys, the groups,
      * a verify's raw compressor rows */
     size_t pw = (size_t)(n < W ? n : W) * hd, pn = 0, *pc = calloc((size_t)L, sizeof(size_t));
-    for (int i = 0; ok && pc && i < N; i++) {
+    for (int i = lo; ok && pc && i < hi; i++) {
         pc[i] = pn; pn += pw;
         int r = c->compress_ratio[i];
         if (!c->kv_source[i]) continue;
@@ -848,9 +987,9 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
          (!cand_out || v41c_res(&ch->cmd, (size_t)rows * ch->wcap, VKC_DOWN)) &&
          (list_out < 0 || v41c_res(&ch->ld, (size_t)rows * LR, VKC_DOWN));
     if (!ok) {
-        fprintf(stderr, "[VK] deepseek_v41 chain: device memory for %d rows at %d positions refused; the CPU runs the layers\n", rows, E);
+        fprintf(stderr, "[VK] %s chain: device memory for %d rows at %d positions refused; the CPU runs the layers\n", nmc, rows, E);
         free(f.keyl); free(f.praw); free(need); free(outs); free(pres); free(wl); free(cs_); free(er); free(pc);
-        ch->failed = 1; g_vk_chain = 0;
+        v41c_off(ch);
         return 0;
     }
     if (cand_out) {   /* the CPU's mask, as indexer_run sizes it */
@@ -881,8 +1020,10 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
         }
         /* the window half of each row's list (window_idxs): the positions of the last
          * `window` the row reaches, oldest first, as device ring rows; -1 where the CPU's
-         * ring does not hold the position (window_pos). The selection half starts empty. */
-        const Layer *l0 = &m->L[0];
+         * ring does not hold the position (window_pos: the chain's first layer's, which
+         * holds what every layer held when the forward began; the layers before it have
+         * written theirs by now). The selection half starts empty. */
+        const Layer *l0 = &m->L[lo];
         for (int s = 0; s < nr; s++) {
             int p = pb + s;
             for (int k = 0; k < W; k++) {
@@ -895,10 +1036,14 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
         if (!vkc_begin() || !vkc_write(ch->xs, 0, h + (size_t)c0 * HD, (size_t)nr * HD * sizeof(float)) ||
             !vkc_write(ch->list, 0, wl, (size_t)nr * LR * sizeof(int)) ||
             !vkc_write(ch->cs, 0, cs_, (size_t)(f.csB + (nr + ch->rmax - 1) * rd) * sizeof(float))) goto lost;
-        {   /* the first site collapses with [1, 0, ...] (forward_full's pre_mix) */
+        {   /* the first site collapses with [1, 0, ...] (forward_full's pre_mix), a later
+             * chain's with the mix the layers before it handed over */
             float *hp0 = calloc((size_t)nr * hr, sizeof(float));
             if (!hp0) goto lost;
-            for (int s = 0; s < nr; s++) hp0[(size_t)s * hr] = 1.0f;
+            for (int s = 0; s < nr; s++) {
+                if (lo == 0) hp0[(size_t)s * hr] = 1.0f;
+                else memcpy(hp0 + (size_t)s * hr, pre_mix + (size_t)(c0 + s) * H, (size_t)H * sizeof(float));
+            }
             ok = vkc_write(ch->hpf, 0, hp0, (size_t)nr * hr * sizeof(float));
             free(hp0);
             if (!ok) goto lost;
@@ -906,19 +1051,20 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
         if (c0 == 0) {   /* the device's copies made the host's, as the forward needs them */
             for (int q = ch->win_valid > start - W + 1 ? ch->win_valid : start - W + 1; q < start && ok; q++) {
                 if (q < 0) continue;
-                for (int i = 0; i < N && ok; i++) {
+                for (int i = lo; i < hi && ok; i++) {
                     const Layer *l = &m->L[i];
                     if (l->window_pos[q % W] != q) continue;
                     ok = vkc_write(ch->win[i], (size_t)(q % ch->Wd) * hd, l->window + (size_t)(q % W) * hd, (size_t)hd * sizeof(float));
                 }
             }
             for (int i = 0; i < L && ok; i++) {
-                if (!c->kv_source[i] || (i >= N && !ch->ikey[i])) continue;
+                int own = v41c_own(ch, i);
+                if (!c->kv_source[i] || (!own && !ch->ikey[i])) continue;
                 const Layer *l = &m->L[i];
                 int r = c->compress_ratio[i], ihd = c->index_head_dim, t0 = ch->kv_valid[i], t1 = need[i];
-                if (t1 > t0) ok = (i >= N || ch->ks.on || vkc_write(ch->ckv[i], (size_t)t0 * hd, l->ckv + (size_t)t0 * hd, (size_t)(t1 - t0) * hd * sizeof(float))) &&
+                if (t1 > t0) ok = (!own || ch->ks.on || vkc_write(ch->ckv[i], (size_t)t0 * hd, l->ckv + (size_t)t0 * hd, (size_t)(t1 - t0) * hd * sizeof(float))) &&
                                   vkc_write(ch->ikey[i], (size_t)t0 * ihd, l->ikey + (size_t)t0 * ihd, (size_t)(t1 - t0) * ihd * sizeof(float));
-                if (i >= N) { if (ok && t1 > t0) ch->kv_valid[i] = t1; continue; }
+                if (!own) { if (ok && t1 > t0) ch->kv_valid[i] = t1; continue; }
                 if (ok && r > 1) ok = vkc_write(ch->ring[i], 0, l->cstate_kv, (size_t)r * hd * sizeof(float)) &&
                                       vkc_write(ch->ring[i], (size_t)r * hd, l->cstate_score, (size_t)r * hd * sizeof(float));
             }
@@ -933,7 +1079,7 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
         }
         if (!ok) goto lost;
         int pending = 0;
-        for (int i = 0; i < N && ok; i++) {
+        for (int i = lo; i < hi && ok; i++) {
             Layer *l = &m->L[i];
             if (pending) {                                 /* the FFN branch of the layer before */
                 VkcEw add = {VKC_EW_ADD, nr * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
@@ -987,7 +1133,7 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
         ok = ok && vkc_copy(ch->xd, 0, ch->xs, 0, (size_t)nr * HD) && vkc_copy(ch->hpd, 0, ch->hpf, 0, (size_t)nr * hr) &&
              (list_out < 0 || vkc_copy(ch->ld, 0, ch->list, 0, (size_t)nr * LR));
         if (ok && last) {                                  /* what the host's state gets back */
-            for (int i = 0; i < N && ok; i++) {
+            for (int i = lo; i < hi && ok; i++) {
                 int q0 = E - W > start ? E - W : start, nq = E - q0;
                 VkcRegion *rg = malloc((size_t)nq * sizeof *rg);
                 if (!rg) { ok = 0; break; }
@@ -1020,8 +1166,8 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
                     m->shared_topk[(size_t)(c0 + s) * list_w + k] = v >= 0 ? v - ch->Wd + wrows : -1;
                 }
         }
-        for (int k = 0; k < T; k++) {   /* the chain layers' DSpark inputs (the CPU's layers fill the others) */
-            if (c->spec_targets[k] >= N) continue;
+        for (int k = 0; k < T; k++) {   /* the chain layers' DSpark inputs (the other layers' fill the others) */
+            if (!v41c_own(ch, c->spec_targets[k])) continue;
             const float *mh = (const float *)vkc_ptr(ch->mh);
             for (int s = 0; s < nr; s++)
                 memcpy(m->main_hidden + ((size_t)(c0 + s) * T + k) * D, mh + ((size_t)s * T + k) * D, (size_t)D * sizeof(float));
@@ -1031,7 +1177,7 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
     {
         const float *pl = (const float *)vkc_ptr(ch->pull);
         int save = spec && m->rollback_save && n > 1;
-        for (int i = 0; i < N; i++) {
+        for (int i = lo; i < hi; i++) {
             Layer *l = &m->L[i];
             int q0 = E - W > start ? E - W : start;
             for (int t = 0; t < n; t++) {
@@ -1070,33 +1216,80 @@ static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, in
         for (int i = 0; i < L; i++) {
             if (!c->kv_source[i]) continue;
             int r = c->compress_ratio[i];
-            if (i < N) ch->kv_valid[i] = E / r;
-            else if (ch->kv_valid[i] > start / r) ch->kv_valid[i] = start / r;   /* the CPU's layer writes its keys from here */
+            if (v41c_own(ch, i)) ch->kv_valid[i] = E / r;
+            else if (ch->kv_valid[i] > start / r) ch->kv_valid[i] = start / r;   /* another layer writes its keys from here */
         }
     }
     if (all) { memcpy(h, outs, (size_t)n * HD * sizeof(float)); memcpy(pre_mix, pres, (size_t)n * H * sizeof(float)); }
     else { memcpy(h + (size_t)(n - 1) * HD, outs, (size_t)HD * sizeof(float)); memcpy(pre_mix + (size_t)(n - 1) * H, pres, (size_t)H * sizeof(float)); }
     free(f.keyl); free(f.praw); free(need); free(outs); free(pres); free(wl); free(cs_); free(er); free(pc);
     ch->forwards++;
-    return N;
-lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
+    return ch->n;
+lost:   /* a frame failed: the device is gone (or would not take a command) */
     free(f.keyl); free(f.praw); free(need); free(outs); free(pres); free(wl); free(cs_); free(er); free(pc);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost(); }
-    g_vk_chain = 0; ch->failed = 1;
-    fprintf(stderr, "[VK] deepseek_v41 chain: the device was lost; the CPU runs this forward again and from here on "
-                    "(the host's state is current: there is nothing to rebuild)\n");
+    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    *lost = 1;
     return 0;
+}
+/* The devices' layers (every layer, or the primary's first n of a partial chain and the
+ * second device's after them) for n rows of streams h (positions start..), as
+ * v41c_forward_seg describes, from layer 0. Returns the layers that ran: the caller's CPU
+ * loop runs the others from there. 0 = not taken: the CPU runs every layer, h and pre_mix
+ * untouched. */
+static int v41c_forward(Model *m, float *h, float *pre_mix, int n, int start, int spec, int all) {
+    V41Chain *ch = g_v41c, *ch2 = g_v41c2;
+    if (!g_vk_chain || !ch || !ch->ok || ch->failed || g_trace) return 0;
+    if (g_vk_chain == COLI_VK_CHAIN_PREFILL && n <= 2) return 0;
+    if (ch2 && (!ch2->ok || ch2->failed || ch2->lo != ch->lo + ch->n)) ch2 = NULL;
+    int lost2 = 0;
+    if (ch2) { vkc_device(1); lost2 = vkc_lost(); vkc_device(0); }
+    if (vkc_lost() || lost2) {
+        for (int d = 0; d < 2; d++) if (v41c_of(d)) v41c_of(d)->failed = 1;
+        g_vk_chain = 0;
+        return 0;
+    }
+    int lost = 0;
+    int r = v41c_forward_seg(m, ch, h, pre_mix, n, start, spec, all, &lost);
+    if (!r) {
+        if (lost) {
+            for (int d = 0; d < 2; d++) if (v41c_of(d)) v41c_of(d)->failed = 1;
+            g_vk_chain = 0;
+            fprintf(stderr, "[VK] deepseek_v41 chain: the device was lost; the CPU runs this forward again and from here on "
+                            "(the host's state is current: there is nothing to rebuild)\n");
+        }
+        return 0;
+    }
+    if (!ch2) return r;
+    vkc_device(1);
+    int r2 = v41c_forward_seg(m, ch2, h, pre_mix, n, start, spec, all, &lost);
+    vkc_device(0);
+    if (r2) return r + r2;
+    /* not taken there: the CPU runs its layers from the streams the primary handed over
+     * (the second device's watermarks follow) */
+    v41c_lower_one(m, ch2, start);
+    if (lost) {
+        for (int d = 0; d < 2; d++) if (v41c_of(d)) v41c_of(d)->failed = 1;
+        g_vk_chain = 0;
+        fprintf(stderr, "[VK] deepseek_v41 dev2 chain: the device was lost; the CPU runs its layers, and every layer from the next "
+                        "forward on (the host's state is current: there is nothing to rebuild)\n");
+    }
+    return r;
 }
 
 static void v41c_report(void) {
-    V41Chain *ch = g_v41c;
-    if (!ch || !ch->ok || !ch->forwards) return;
-    VkcStats st; vkc_stats(&st);
-    fprintf(stderr, "[VK] deepseek_v41 chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
-                    "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
-            ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms, st.dev_bytes / 1048576.0);
-    vkc_kv_report(&ch->ks);
-    vkc_prof_print();
+    for (int d = 0; d < 2; d++) {
+        V41Chain *ch = v41c_of(d);
+        if (!ch || !ch->ok || !ch->forwards) continue;
+        int was = vkc_device(d);
+        VkcStats st; vkc_stats(&st);
+        fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
+                        "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
+                v41c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
+                st.dev_bytes / 1048576.0);
+        vkc_kv_report(&ch->ks);
+        vkc_prof_print();
+        vkc_device(was);
+    }
 }
 
 /* COLI_VK_CHAIN at startup, before the tier sizes itself (the trunk's device copies count
@@ -1121,12 +1314,25 @@ static void v41c_start(Model *m) {
         no = "the MLA, mHC or DeepSeek shaders are missing (chain_hgemv, chain_mhc, chain_dsv4)";
     if (no) fprintf(stderr, "[VK] deepseek_v41: %s: the dense chain stays off\n", no);
     if (!on || no) return;
+    int n0 = g_v41_fit.n;
     if (!v41c_setup(m)) return;
     g_vk_chain = on;
+    if (g_v41c_fit2_on) {
+        vkc_device(1);
+        if (g_v41c->n < n0) {
+            /* the primary placed fewer layers than its fit: the second device's would not
+             * follow them, so they stay on the CPU too */
+            fprintf(stderr, "[VK] deepseek_v41 chain: the primary device stopped before layer %d; layers %d..%d stay on the CPU, "
+                            "not on the second device\n", n0, n0, n0 + g_v41c_fit2.n - 1);
+            g_v41c_fit2_on = 0;
+            vkc_shutdown();
+        } else if (!v41c_setup_dev(m, 1)) { g_v41c_fit2_on = 0; vkc_shutdown(); }
+        vkc_device(0);
+    }
 }
 /* After the tier's: at exit the report, then the chain goes, then the device. */
 static void v41c_atexit(void) {
     if (!g_v41c_inited) return;
-    atexit(vkc_shutdown);
+    atexit(vkc_shutdown_all);
     atexit(v41c_report);
 }

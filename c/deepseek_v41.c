@@ -236,6 +236,13 @@ static void cfg_load(Cfg *c, const char *snap) {
 
     if (c->n_layers < 1 || c->n_layers > V41_MAX_LAYERS) {
         fprintf(stderr, "[cfg] n_layers %d out of range\n", c->n_layers); exit(1); }
+    /* The rope turns the last rope_head_dim floats of every attention row (head_dim long)
+     * and of every index query and key (index_head_dim long): it must fit both, in pairs
+     * (the release: 64 of 512 and of 128). */
+    if (c->head_dim < 1 || c->rope_dim < 0 || (c->rope_dim & 1) || c->rope_dim > c->head_dim ||
+        c->index_head_dim < 0 || (c->index_head_dim > 0 && c->rope_dim > c->index_head_dim)) {
+        fprintf(stderr, "[cfg] rope_head_dim %d does not fit head_dim %d and index_head_dim %d\n",
+                c->rope_dim, c->head_dim, c->index_head_dim); exit(1); }
     int ratios[V41_MAX_LAYERS] = {0};
     int nr = jints(t, "compress_ratios", ratios, V41_MAX_LAYERS);
     if (nr < c->n_layers) {
@@ -1629,15 +1636,20 @@ static void ehit_mark(Model *m, int layer, int eid) {
  * DSpark stage: same slot shapes, same LRU, a different set of experts. Only the
  * backbone's routing reaches the dashboard's grid -- the draft head has its own,
  * smaller expert set, and a row of it would not line up with anything. */
-/* The slot a full cache gives up: the least recently used, and before it (the
- * backbone's layers: the DSpark stages keep their experts on the CPU) the least
+/* The Vulkan tier's index of a MoE call's layer: a backbone layer's own, a DSpark
+ * stage's n_layers + stage (the tier's extra layers, COLI_VK_TIER_MTP; a stage the tier
+ * did not take answers no to everything there). */
+static int v41_tier_layer(const Model *m, const char *kind, int layer) {
+    return !strcmp(kind, "layers") ? layer : m->c.n_layers + layer;
+}
+/* The slot a full cache gives up: the least recently used, and before it the least
  * recently used of those whose expert the Vulkan tier holds (vkt_ram_first). */
-static int v41_victim(const LCache *cache, const char *kind, int layer) {
-    int oldest = 0, dev = -1, backbone = !strcmp(kind, "layers");
+static int v41_victim(const Model *m, const LCache *cache, const char *kind, int layer) {
+    int oldest = 0, dev = -1, tl = v41_tier_layer(m, kind, layer);
     for (int i = 1; i < cache->n; i++)
         if (cache->slot[i].used < cache->slot[oldest].used) oldest = i;
-    for (int i = 0; backbone && i < cache->n; i++)
-        if (cache->slot[i].eid >= 0 && vkt_ram_first(layer, cache->slot[i].eid) &&
+    for (int i = 0; i < cache->n; i++)
+        if (cache->slot[i].eid >= 0 && vkt_ram_first(tl, cache->slot[i].eid) &&
             (dev < 0 || cache->slot[i].used < cache->slot[dev].used)) dev = i;
     if (dev >= 0) { vkt_ram_gave(); return dev; }
     return oldest;
@@ -1655,7 +1667,7 @@ static Slot *expert_slot_at(Model *m, LCache *cache, const char *kind, int layer
     if (cache->n < cache->cap) {
         victim = &cache->slot[cache->n++];
     } else {
-        victim = &cache->slot[v41_victim(cache, kind, layer)];
+        victim = &cache->slot[v41_victim(m, cache, kind, layer)];
     }
     victim->used = ++m->clock;
     expert_fetch(m, kind, layer, &victim, &eid, 1);
@@ -1694,7 +1706,7 @@ static void expert_slots_at(Model *m, LCache *cache, const char *kind, int layer
         if (cache->n < cache->cap) {
             victim = &cache->slot[cache->n++];
         } else {
-            victim = &cache->slot[v41_victim(cache, kind, layer)];
+            victim = &cache->slot[v41_victim(m, cache, kind, layer)];
         }
         victim->used = ++m->clock;
         victim->eid = -1;                  /* not this expert yet: the read is still pending */
@@ -2714,8 +2726,9 @@ static void moe_gate(Model *m, Layer *l, int E, int topk, float *scores,
  * device's rows and the CPU's alike (w x row, then the add), and the shared expert
  * after them, as moe_run_at adds them. So the order of the sum never depends on
  * which experts were resident. Every expert the CPU computed passes its slot to the
- * tier (vkt_note), which may promote it. The DSpark stages ("mtp") have expert
- * sets and caches of their own and stay on the CPU. */
+ * tier (vkt_note), which may promote it. The DSpark stages ("mtp"), with caches of
+ * their own, are the tier's extra layers n_layers + stage when it took them
+ * (COLI_VK_TIER_MTP). */
 static char g_vk_usage[2100];   /* the tier's history (vk_tier_start); empty = none */
 static void vk_tier_save(void) { if (g_vk_usage[0]) rt_save(g_vk_usage, 1); }
 
@@ -2725,7 +2738,7 @@ static VktExpertSrc vk_slot_src(const Slot *s) {
 
 /* The draws want[d] of a block on the CPU into contrib[d] = w x expert(x): moe_run_at's
  * expert-major union over those draws only. */
-static void moe_vk_cpu(Model *m, LCache *cache, int layer, int topk, const float *xc, int rows,
+static void moe_vk_cpu(Model *m, LCache *cache, const char *kind, int layer, int topk, const float *xc, int rows,
                        const int *chosen, const float *weights, const uint8_t *want, float *contrib) {
     Cfg *c = &m->c;
     int dim = c->dim, draws = rows * topk;
@@ -2750,7 +2763,7 @@ static void moe_vk_cpu(Model *m, LCache *cache, int layer, int topk, const float
     for (int u0 = 0; u0 < n_uniq; u0 += step) {
         int ne = n_uniq - u0 < step ? n_uniq - u0 : step;
         Slot *slot[MOE_ROW_CHUNK];
-        expert_slots_at(m, cache, "layers", layer, uniq + u0, ne, slot);
+        expert_slots_at(m, cache, kind, layer, uniq + u0, ne, slot);
         for (int u = 0; u < ne; u++) {
             int cnt = count[u0 + u], at = 0;
             for (int d = head[u0 + u]; d >= 0; d = next[d], at++)
@@ -2766,26 +2779,28 @@ static void moe_vk_cpu(Model *m, LCache *cache, int layer, int topk, const float
             }
             m->hits += (uint64_t)(cnt - 1);
             VktExpertSrc src = vk_slot_src(slot[u]);
-            vkt_note(layer, uniq[u0 + u], &src);
+            vkt_note(v41_tier_layer(m, kind, layer), uniq[u0 + u], &src);
         }
     }
     free(down); free(gathered); free(uniq);
 }
 
-static void moe_vk_block(Model *m, Layer *l, LCache *cache, int layer, int topk, const float *xc,
+/* kind "layers" (the backbone) or "mtp" (a DSpark stage, the tier's extra layer: no
+ * history row and no EMAP mark, as on the CPU path) */
+static void moe_vk_block(Model *m, Layer *l, LCache *cache, const char *kind, int layer, int topk, const float *xc,
                          int rows, float *outc, const int *chosen, const float *weights, int with_shared) {
-    int dim = m->c.dim, draws = rows * topk;
+    int dim = m->c.dim, draws = rows * topk, backbone = !strcmp(kind, "layers");
     uint8_t *taken = xmalloc((size_t)draws * 2, "device draws"), *want = taken + draws;
     const float **dev = xmalloc((size_t)draws * sizeof(*dev), "device rows");
-    for (int r = 0; r < rows; r++) rt_count(layer, chosen + r * topk, topk);
-    int ndev = vkt_issue(layer, xc, rows, topk, chosen, taken);
-    for (int d = 0; d < draws; d++) { want[d] = !taken[d]; if (taken[d]) ehit_mark(m, layer, chosen[d]); }
+    for (int r = 0; backbone && r < rows; r++) rt_count(layer, chosen + r * topk, topk);
+    int ndev = vkt_issue(v41_tier_layer(m, kind, layer), xc, rows, topk, chosen, taken);
+    for (int d = 0; d < draws; d++) { want[d] = !taken[d]; if (taken[d] && backbone) ehit_mark(m, layer, chosen[d]); }
     float *contrib = xmalloc((size_t)draws * dim * sizeof(float), "expert contributions");
     float *shared = xmalloc((size_t)rows * dim * sizeof(float), "shared expert");
-    moe_vk_cpu(m, cache, layer, topk, xc, rows, chosen, weights, want, contrib);
+    moe_vk_cpu(m, cache, kind, layer, topk, xc, rows, chosen, weights, want, contrib);
     if (with_shared) shared_ffn_down(m, l, xc, rows, shared);
     if (ndev && !vkt_join(dev)) {   /* the batch failed (the tier stops): those draws here */
-        moe_vk_cpu(m, cache, layer, topk, xc, rows, chosen, weights, taken, contrib);
+        moe_vk_cpu(m, cache, kind, layer, topk, xc, rows, chosen, weights, taken, contrib);
         memset(taken, 0, (size_t)draws);
     }
     for (int r = 0; r < rows; r++) {
@@ -2863,7 +2878,7 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
         for (int r = 0; r < n; r++)
             moe_gate(m, l, E, topk, scores + (size_t)r * E, chosen + r * topk, weights + r * topk);
         free(scores);
-        moe_vk_block(m, l, cache, layer, topk, x, n, out, chosen, weights, with_shared);
+        moe_vk_block(m, l, cache, kind, layer, topk, x, n, out, chosen, weights, with_shared);
         free(chosen); free(weights);
         return;
     }
@@ -2882,8 +2897,8 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
                      chosen + r * topk, weights + r * topk);
         free(scores);
 #ifdef COLI_VULKAN
-        if (vkt_ready() && !strcmp(kind, "layers")) {
-            moe_vk_block(m, l, cache, layer, topk, xc, rows, outc, chosen, weights, with_shared);
+        if (vkt_ready() && v41_tier_layer(m, kind, layer) < vkt_layers()) {   /* the backbone, a stage the tier took */
+            moe_vk_block(m, l, cache, kind, layer, topk, xc, rows, outc, chosen, weights, with_shared);
             continue;
         }
 #endif
@@ -4614,8 +4629,8 @@ static size_t vk_dense_bytes(Model *m) {
 /* Is the expert in this layer's slots now (the tier's balance asks)? */
 static int vk_in_ram(void *ctx, int layer, int e) {
     Model *m = ctx;
-    if (layer < 0 || layer >= m->c.n_layers) return 0;
-    LCache *cache = &m->cache[layer];
+    if (layer < 0 || layer >= m->c.n_layers + (m->spec.active ? m->c.n_mtp : 0)) return 0;
+    LCache *cache = layer < m->c.n_layers ? &m->cache[layer] : &m->spec.cache[layer - m->c.n_layers];   /* a DSpark stage's */
     for (int i = 0; i < cache->n; i++) if (cache->slot[i].eid == e) return 1;
     return 0;
 }
@@ -4625,15 +4640,23 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
     VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
     size_t expert = 0;
     for (int part = 0; part < V41_EXPERT_TENSORS; part++) expert += (size_t)expert_part_bytes(c, part);
+    /* The DSpark stages (index n_layers + stage): their experts are the backbone's form,
+     * the tier's extra layers. By default on a discrete GPU only: on a GPU that shares
+     * the RAM, qwen38's head measured no faster there (docs/vulkan.md, "The MTP head's
+     * layer on the tier"); COLI_VK_TIER_MTP=1 or 0 decides. */
+    const char *tm = getenv("COLI_VK_TIER_MTP");
+    int want_mtp = tm && *tm ? *tm != '0' : !coli_vk_device_shares_ram();
+    int stages = want_mtp && m->spec.active && c->spec_routed <= c->n_routed && c->spec_activated <= MOE_TOPK_MAX ? c->n_mtp : 0;
     VktConfig vc = {.engine = "deepseek_v41", .layers = c->n_layers, .experts = c->n_routed,
                     .hidden = c->dim, .inter = c->moe_inter, .topk = c->n_activated,
                     .gate_up = f, .down = f, .act = VKT_ACT_SWIGLU, .act_limit = c->swiglu_limit,
+                    .extra_layers = stages, .extra_gate_up = f, .extra_down = f,
                     .max_rows = MOE_ROW_CHUNK * c->n_activated,
                     .ram_reserve = expert * (size_t)cap * (size_t)c->n_layers,
                     .dense_bytes = vk_dense_bytes(m), .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = vk_load, .release = vk_unhold, .load_ctx = m, .load_batch = vk_load_batch};
     rt_init("deepseek_v41", c->n_layers, c->n_routed);
-    rt_drop_row(c->n_layers);   /* no MTP row: the DSpark stages stay on the CPU */
+    rt_drop_row(c->n_layers);   /* no MTP row: the history is the backbone's */
     const char *up = getenv("COLI_USAGE");
     if (up && *up) snprintf(g_vk_usage, sizeof g_vk_usage, "%s", up);
     else snprintf(g_vk_usage, sizeof g_vk_usage, "%s/.coli_usage", snap);

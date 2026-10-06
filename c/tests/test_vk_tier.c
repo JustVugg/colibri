@@ -18,6 +18,12 @@
  *   books    device + CPU = routed, resident <= budget, no failed upload;
  *   v4       DeepSeek V4's activation (route weight on the device, its bf16 and E4M3
  *            roundings): device rows against the engine's CPU arithmetic;
+ *   extra    an extra layer (an MTP head's) in another, bigger form: each layer's rows
+ *            on the device equal the reference, its experts sit in a pool of their
+ *            own with its share of the budget (each pool evicts its own kind, no
+ *            upload refused), it gets its expert in beside a full main pool on its
+ *            own promotion rate, and with no device form for it the tier serves the
+ *            main layers;
  *   stream   big prefill steps with streaming (vkt_issue's sub-batches, the staging
  *            slots, prefetch, experts cut into parts): every device row, resident or
  *            streamed, equals the reference, the sum the all-CPU sum, the cold experts
@@ -144,11 +150,10 @@ static void expert_ref(const Ex *e, const float *x, float *y) {
 static VktExpertSrc src_of(const Ex *e) {
     return (VktExpertSrc){e->g.codes, e->u.codes, e->d.codes, e->g.scales, e->u.scales, e->d.scales};
 }
-static void model_make(VktFmt gu, VktFmt dn) {
-    for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) {
-        mat_make(&ex[l][e].g, gu, H, F); mat_make(&ex[l][e].u, gu, H, F); mat_make(&ex[l][e].d, dn, F, H);
-    }
+static void layer_make(int l, VktFmt gu, VktFmt dn) {
+    for (int e = 0; e < E; e++) { mat_make(&ex[l][e].g, gu, H, F); mat_make(&ex[l][e].u, gu, H, F); mat_make(&ex[l][e].d, dn, F, H); }
 }
+static void model_make(VktFmt gu, VktFmt dn) { for (int l = 0; l < L; l++) layer_make(l, gu, dn); }
 static void model_free(void) {
     for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) { mat_free(&ex[l][e].g); mat_free(&ex[l][e].u); mat_free(&ex[l][e].d); }
 }
@@ -402,6 +407,94 @@ static void sync_evict(void) {
           "sync: expert 5 did not displace expert 1 (resident 1 %d, 5 %d, all %d of a budget of 2)", vkt_resident(0, 1), vkt_resident(0, 5), res);
     CHECK(worst < 2e-3, "sync: relative error %.3g", worst);
     vkt_shutdown(); model_free();
+}
+
+/* An extra layer: layer 0 is the model's (int4 v+8 gs64), layer 1 an MTP head's held
+ * as f32 (VktConfig.extra_layers), eight times the bytes. Its experts sit in a pool of
+ * their own with the extra layer's share of the budget; uploads awaited throughout. */
+static void extra(void) {
+    VktFmt fm = {VKT_SRC_I4U_PAIRS_GS, 64}, fx = {VKT_SRC_F32, 0};
+    layer_make(0, fm, fm); layer_make(1, fx, fx); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    size_t mb = vkt_expert_bytes(H, F, fm, fm), xb = vkt_expert_bytes(H, F, fx, fx);
+    int per = (int)((xb + mb - 1) / mb);
+    unsigned long long ev, failed;
+    int idx[4 * K]; float w[4 * K];
+    VktConfig vc = cfg_of(fm, fm, VKT_ACT_SWIGLU, 0);
+    vc.layers = 1; vc.extra_layers = 1; vc.extra_gate_up = fx; vc.extra_down = fx;
+    /* Half of a budget of 2 * per + 4 main experts is the extra layer's: one f32 expert,
+     * whose room leaves the main layer all ten of its own. Both layers route, the hot
+     * set moves halfway: each pool evicts in its own kind, every row is right. */
+    int units = 2 * per + 4;
+    set_budget(units, fm, fm);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    int on = vkt_init(&vc, NULL);
+    unsetenv("COLI_VK_TIER_SYNC");
+    CHECK(on && vkt_layers() == 2, "extra: the tier did not start with its extra layer (%d layers)", vkt_layers());
+    if (!on) { model_free(); return; }
+    Books b0 = {0, 0}, b1 = {0, 0}; double worst = 0;
+    for (int t = 0; t < 140; t++)   /* the new hot set needs a while to outweigh the old one */
+        for (int l = 0; l < 2; l++) {
+            route(4, t < 40 ? 0 : 5, 5, idx, w);
+            double r = step(l, 4, idx, w, l ? &b1 : &b0);
+            if (r > worst) worst = r;
+        }
+    int r0 = 0, r1 = 0;
+    for (int e = 0; e < E; e++) { r0 += vkt_resident(0, e); r1 += vkt_resident(1, e); }
+    report_counts(&ev, &failed);
+    ColiVkPoolStats xp; coli_vk_pool_stats(4, &xp);
+    printf("  extra: an f32 expert is %d int4 ones; device main %llu of %llu, extra %llu of %llu; resident main %d, "
+           "extra %d (its pool %zu of %zu bytes), evictions %llu, failed %llu, worst relative error %.2e\n",
+           per, b0.dev, b0.routed, b1.dev, b1.routed, r0, r1, xp.used, xp.limit, ev, failed, worst);
+    CHECK(per > 1, "extra: the f32 form takes no more room than the int4 one (%zu, %zu bytes)", xb, mb);
+    CHECK(b0.dev > 0 && b1.dev > 0, "extra: a layer ran nothing on the device (main %llu, extra %llu)", b0.dev, b1.dev);
+    CHECK(r0 == E && r1 == 1, "extra: resident main %d (want %d), extra %d (want 1)", r0, E, r1);
+    CHECK(xp.used > 0 && xp.used <= xp.limit, "extra: the extra pool holds %zu bytes of %zu", xp.used, xp.limit);
+    CHECK(ev >= 1 && failed == 0, "extra: %llu evictions, %llu failed uploads", ev, failed);
+    CHECK(worst < 2e-3, "extra: relative error %.3g", worst);
+    vkt_shutdown();
+    /* A budget of per + 4: the extra layer's share is under one of its experts, so it
+     * gets one (two main ones still fit) and the main layer the four places left. The
+     * main layer fills them, then keeps routing and spends each forward's promotion
+     * (COLI_VK_TIER_RATE=1) before the extra layer runs: the extra layer's expert must
+     * still get in, on its own promotion. */
+    units = per + 4;
+    set_budget(units, fm, fm);
+    setenv("COLI_VK_TIER_RATE", "1", 1);
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    on = vkt_init(&vc, NULL);
+    unsetenv("COLI_VK_TIER_SYNC");
+    CHECK(on && vkt_layers() == 2, "extra: the tier did not start for the full-tier case");
+    if (on) {
+        Books c0 = {0, 0}, c1 = {0, 0}; worst = 0;
+        for (int t = 0; t < 40; t++) { route(4, 0, E, idx, w); double r = step(0, 4, idx, w, &c0); if (r > worst) worst = r; }
+        int full = 0; for (int e = 0; e < E; e++) full += vkt_resident(0, e);
+        for (int t = 0; t < 60; t++) {
+            route(4, 0, E, idx, w); double r = step(0, 4, idx, w, &c0); if (r > worst) worst = r;
+            route(4, 0, 5, idx, w); r = step(1, 4, idx, w, &c1); if (r > worst) worst = r;
+        }
+        r0 = r1 = 0;
+        for (int e = 0; e < E; e++) { r0 += vkt_resident(0, e); r1 += vkt_resident(1, e); }
+        report_counts(&ev, &failed);
+        printf("  extra, full tier: main resident %d after the first phase; then main %d + extra %d, "
+               "extra device %llu of %llu, evictions %llu, failed %llu, worst %.2e\n",
+               full, r0, r1, c1.dev, c1.routed, ev, failed, worst);
+        CHECK(full == 4 && r0 == 4, "extra: the main layer holds %d then %d of its 4 places", full, r0);
+        CHECK(r1 == 1 && c1.dev > 0, "extra: no extra expert got in beside a full main pool (resident %d, device %llu)", r1, c1.dev);
+        CHECK(ev >= 1 && failed == 0, "extra, full tier: %llu evictions, %llu failed uploads", ev, failed);
+        CHECK(worst < 2e-3, "extra, full tier: relative error %.3g", worst);
+        vkt_shutdown();
+    }
+    /* an extra form with no device form: the main layers only */
+    vc.extra_gate_up = vc.extra_down = (VktFmt){VKT_SRC_NONE, 0};
+    on = vkt_init(&vc, NULL);
+    CHECK(on && vkt_layers() == 1, "extra: no device form, the tier has %d layers (want the main one)", vkt_layers());
+    if (on) {
+        float x[H] = {0}; int id[K] = {0, 1, 2}; uint8_t taken[K];
+        CHECK(vkt_issue(1, x, 1, K, id, taken) == 0, "extra: a layer past the tier's took rows");
+        vkt_shutdown();
+    }
+    model_free();
 }
 
 /* DeepSeek V4's activation (VKT_ACT_SWIGLU_V4) through the tier: MXFP4 ue8m0 experts,
@@ -708,10 +801,11 @@ int main(int argc, char **argv) {
     printf("adapt:\n"); adapt();
     printf("partial:\n"); partial();
     printf("sync:\n"); sync_evict();
+    printf("extra:\n"); extra();
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
-    ColiVkPoolStats ps; coli_vk_pool_stats(1, &ps);
-    CHECK(ps.live == 0, "%d tier ranges still live after every shutdown", ps.live);
+    ColiVkPoolStats ps, px; coli_vk_pool_stats(1, &ps); coli_vk_pool_stats(4, &px);
+    CHECK(ps.live == 0 && px.live == 0, "%d + %d tier ranges still live after every shutdown", ps.live, px.live);
     coli_vk_shutdown();   /* with staged uploads: where the experts were ("[VK] memory at exit") */
     stream_commit_failure(spv);
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);

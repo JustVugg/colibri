@@ -53,17 +53,29 @@ typedef struct VkcBuf VkcBuf;
 #define VKC_DEV  0
 #define VKC_UP   1
 #define VKC_DOWN 2
+#define VKC_HOST 3   /* host memory read in place (vkc_host): bound read-only, never written */
 
 int  vkc_init(void);          /* after coli_vk_init; 1 = the chain's pipelines are up */
 int  vkc_ready(void);
 int  vkc_lost(void);
 void vkc_shutdown(void);      /* before coli_vk_shutdown (register it with atexit after it) */
+/* The device the calls go to: 0 the primary, 1 COLI_VK_DEV2's (coli_vk_core_dev), each
+ * with a context of its own that vkc_init opens and vkc_shutdown closes while it is
+ * current. A buffer belongs to the device it was made on: bound or copied on the other
+ * the op fails; vkc_free takes it back on its own device. Returns the previous device. */
+int  vkc_device(int d);
+int  vkc_device_now(void);
+void vkc_shutdown_all(void);   /* both devices' contexts: what an engine registers with atexit */
 
 VkcBuf *vkc_buf(size_t bytes, int kind);                 /* zero-filled; NULL when out of memory */
 void    vkc_free(VkcBuf *b);                             /* waits for the frames that may read it */
 int     vkc_reserve(VkcBuf **b, size_t bytes, int kind); /* at least `bytes`; growing drops the contents */
 void   *vkc_ptr(const VkcBuf *b);                        /* host mapping (VKC_UP, VKC_DOWN; VKC_DEV when host-visible) */
 size_t  vkc_bytes(const VkcBuf *b);
+/* The pages around a host range as a buffer the device reads in place (coli_vk_host_buffer:
+ * a device that shares the RAM, without staged uploads); *off: ptr's byte offset in it.
+ * NULL when the device cannot. vkc_free releases it after the frames that read it. */
+VkcBuf *vkc_host(const void *ptr, size_t bytes, size_t *off);
 
 /* recording */
 int  vkc_begin(void);
@@ -112,6 +124,23 @@ int  vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcB
  * chain_attnb.comp: a workgroup per KV head and block of rows, each K and V row read once
  * per block instead of once per (head, row); below it chain_attn as before. */
 int  vkc_attn_block_rows(void);
+/* chain_attnb's part mode (vk_kvsplit.h, the host's part on the device): each row's causal
+ * positions before its share of a split cache, [first, (pos/B - anchor)*B), from a cache
+ * in the host's head-major layout (p->a.cap positions a KV head), the value sum
+ * unnormalized at o_off + s*o_row + h*vd and (m, l) at st_off + (s*H + h)*2. Blocked for
+ * any S, its tiles at multiples of their size: a row's bits do not depend on the step
+ * around it. No lists, sink or ring; 0 without the blocked pipeline. */
+int  vkc_attn_part(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const VkcAttnW *p, int blk, int anchor, int st_off);
+/* The same over chunks of `ch` positions (a multiple of 16), nz of them, chunk z's part at
+ * o_off + z*o_z + s*o_row + h*vd and (m, l) at st_off + z*st_z + (s*H + h)*2 (vkc_kvs_join
+ * joins them): a decode row's positions over many workgroups. */
+int  vkc_attn_part_chunks(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const VkcAttnW *p, int blk, int anchor, int st_off,
+                          int ch, int nz, int o_z, int st_z);
+/* chain_kvs.comp mode 5: the chunks of a part joined in order (vkc_attn_part_chunks): segment
+ * g of d floats, chunk z's sum at a_off + z*a_z + g*d and (m, l) at sa_off + z*sa_z + 2g of
+ * parts, into out at o_off + g*d and so_off + 2g. */
+typedef struct { int n, d, nz, a_off, a_z, sa_off, sa_z, o_off, so_off; } VkcKvsJoin;
+int  vkc_kvs_join(VkcBuf *parts, VkcBuf *out, const VkcKvsJoin *p);
 /* The attention ops (vkc_attn, vkc_attn_w, vkc_mla_core, vkc_relattn) whose rows x positions
  * x heads x head dim pass COLI_VK_ATTN_SLICE (2^32; 0 = never) record their rows in slices,
  * each ending its frame (submitted, not waited for) and the next in a new one: no single
@@ -541,6 +570,7 @@ void   vkc_layer_free(ColiVkTensor **const *t, int nt, VkcBuf **const *b, int nb
 int vkc_kvs_ready(void);
 #define VKC_KVS_FIN  1
 #define VKC_KVS_GATE 2
+#define VKC_KVS_COLD 32   /* vkc_kvs_attn/_mla/_rel: the host's positions, from a buffer in the host's layout (row t = position t) */
 typedef struct { int S, H, KVH, hd, vd, pos_base, rows, q_off, q_row, q_seg, sel_off, sel_row; float scale;
                  int k_off, v_off, win, kv_pm, sink, sink_off, B, ns, bt_off, nblk, anchor, o_off, o_row, st_off, flags,
                  g_off, g_row, g_seg; } VkcKvsAttn;

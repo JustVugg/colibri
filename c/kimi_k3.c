@@ -924,6 +924,11 @@ static void load_cfg(Cfg *c, const char *snap){
                 if(v>=1&&v<=c->n_layers) c->idx_type[v-1]=1; }
         }
     }
+    /* the DSA indexer ropes the first qk_rope_head_dim floats of each of its index_hd-long
+     * rows (dsa_rope) */
+    if(c->index_hd > 0 && c->index_hd < c->qk_rope){
+        fprintf(stderr,"config.json: index_hd=%d is shorter than qk_rope_head_dim=%d, which the "
+                       "indexer ropes in each of its rows\n",c->index_hd,c->qk_rope); exit(1); }
     jval *b=json_get(root,"bos_token_id"); if(!b) b=json_get(tc,"bos_token_id");
     c->bos = b&&b->t==J_NUM ? (int)b->num : -1;
     jval *e=json_get(root,"eos_token_id"); if(!e) e=json_get(tc,"eos_token_id");

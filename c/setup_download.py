@@ -133,7 +133,16 @@ def safe_join(root, relative):
     parts = [p for p in relative.replace("\\", "/").split("/") if p not in ("", ".")]
     if not parts or any(p == ".." for p in parts) or re.match(r"^[A-Za-z]:", parts[0]):
         raise DownloadError(f"unsafe path in the repository listing: {relative!r}")
-    return os.path.join(root, *parts)
+    path = os.path.join(root, *parts)
+    resolved_root = os.path.realpath(root)
+    for candidate in (path, path + ".part"):
+        try:
+            contained = os.path.commonpath((resolved_root, os.path.realpath(candidate))) == resolved_root
+        except ValueError:
+            contained = False
+        if not contained:
+            raise DownloadError(f"repository path resolves outside the model folder: {relative!r}")
+    return path
 
 
 def _hasher(spec):
@@ -179,6 +188,9 @@ def download_file(url, dest, spec, *, token=None, progress=None, opener=None,
     if have > size:
         os.remove(part)
         have = 0
+    if size == 0:
+        with open(part, "wb"):
+            pass
     hasher, expected = _hasher(spec) if verify else (None, None)
     if hasher is not None and have:
         _feed_prefix(hasher, part, have)
@@ -371,8 +383,8 @@ def read_manifest(model_dir):
 
 
 def _write_manifest(model_dir, data):
-    path = os.path.join(model_dir, MANIFEST)
-    tmp = path + ".tmp"
+    path = safe_join(model_dir, MANIFEST)
+    tmp = safe_join(model_dir, MANIFEST + ".tmp")
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=1)
     os.replace(tmp, path)

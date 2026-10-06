@@ -14558,6 +14558,7 @@ static int v4_ckpt_slot_count(void) {
 #include <sys/stat.h>
 #define v4_ckpt_mkdir(p) mkdir((p), 0755)
 #endif
+#include "own_file.h"      /* the checkpoints sit in a downloaded model dir */
 static void v4_ckpt_slot_free(V4PrefixCkpt *slot);
 static char v4_ckpt_dir[1024];
 static uint32_t v4_ckpt_fingerprint;
@@ -14577,6 +14578,13 @@ static void v4_ckpt_disk_init(ColiV4Session *session) {
     const char *model = coli_v4_engine_target_model_dir(session->engine);
     if (!model || !*model) { v4_ckpt_dir[0] = '-'; return; }
     snprintf(v4_ckpt_dir, sizeof(v4_ckpt_dir), "%s/.coli_ckpt", model);
+    /* The engine makes this directory itself; one that is a link came with the
+     * model, and the checkpoints would land wherever it points. */
+    if (coli_own_is_link(v4_ckpt_dir)) {
+        fprintf(stderr, "v4_ckpt: %s is a link, not the engine's directory: "
+                        "checkpoints stay in memory\n", v4_ckpt_dir);
+        v4_ckpt_dir[0] = '-'; return;
+    }
     const ColiDeepSeekV4Config *c = &session->config;
     uint32_t h = 2166136261u;
     int fields[] = {c->num_hidden_layers, c->hidden_size, c->head_dim,
@@ -14601,10 +14609,10 @@ static void v4_ckpt_disk_write(int i) {
     char path[1200], tmp[1240];
     v4_ckpt_disk_path(path, sizeof(path), i);
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    FILE *f = fopen(tmp, "wb");
+    FILE *f = coli_own_fopen(tmp, "wb");
     if (!f) {
         v4_ckpt_mkdir(v4_ckpt_dir);
-        f = fopen(tmp, "wb");
+        f = coli_own_fopen(tmp, "wb");
         if (!f) return;
     }
     static const char magic[9] = "COLIV4CK";
@@ -14630,7 +14638,7 @@ static void v4_ckpt_disk_load(void) {
         if (v4_ckpt_slots[i].ids) continue;
         char path[1200];
         v4_ckpt_disk_path(path, sizeof(path), i);
-        FILE *f = fopen(path, "rb");
+        FILE *f = coli_own_fopen(path, "rb");
         if (!f) continue;
         char magic[8]; uint32_t fp = 0; int32_t head[4];
         V4PrefixCkpt *slot = &v4_ckpt_slots[i];

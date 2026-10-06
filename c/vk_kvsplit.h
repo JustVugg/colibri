@@ -33,6 +33,12 @@
  *   COLI_VK_KV_BLOCK=B          positions per block (default 64)
  *   COLI_VK_KV_PIN=1            opt in to read-based pins (GQA/MLA rounding can then
  *                               depend on read history; the default is deterministic)
+ *   COLI_VK_KV_COLD=device      the host's part on the device too (vkc_kv_shadow): each
+ *                               split layer keeps a copy of the host's rows in memory the
+ *                               device reads in place, kept up to date row by row, and the
+ *                               device computes the same positions the CPU would; on a
+ *                               device that can import host memory (not with staged
+ *                               uploads), without pins. Unset: the CPU, as before
  *
  * The residency (VkcKvTab, per layer): bt (block -> slot or -1) and rb (slot -> block
  * or -1), uploaded to `tab` when they change; `valid`, the watermark: every resident
@@ -72,6 +78,14 @@ typedef struct {
     VkcBuf *dev; size_t dev_off;
 } VkcKvPart;
 
+/* COLI_VK_KV_COLD=device: a split layer's host rows in memory the device reads in place,
+ * per array (K and V, or the latent and the rope key): nseg segments of cap positions of
+ * seglen floats, head-major (segment g, position t at (g*cap + t)*seglen), page-aligned and
+ * imported once (b, off floats into it); rows below `valid` equal the host's. */
+typedef struct {
+    float *p[2]; VkcBuf *b[2]; size_t off[2], n[2];
+    int nseg[2], seglen[2], cap, valid;
+} VkcKvShadow;
 typedef struct {
     int on;                        /* split: every split layer holds `rows` rows on the device */
     int B, ns, nw, np, rows, nl;   /* block size, slots (window, pinned), rows = ns*B, layers */
@@ -86,12 +100,26 @@ typedef struct {
     float *hpart; size_t hpart_n;
     int *cold, *lo, *cnt, *causal; size_t cold_n, lo_n;
     unsigned long long steps, splits, host_pos, pins, staged_rows; double host_ms, wait_ms;
+    int cold_dev;                  /* COLI_VK_KV_COLD=device: the host's part on the device, from sh */
+    VkcKvShadow *sh;               /* per split layer (cold_dev) */
+    VkcBuf *cscr;                  /* its chunks' parts (vkc_attn_part_chunks), joined into cpart */
+    unsigned long long dev_cold, shadow_rows; size_t shadow_bytes; double shadow_ms;
     const char *engine;
 } VkcKvSplit;
 
 static double vkc_kv_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
+static void vkc_kv_shadow_free(VkcKvSplit *ks) {
+    if (ks->sh) for (int i = 0; i < ks->nl; i++)
+        for (int k = 0; k < 2; k++) {
+            vkc_free(ks->sh[i].b[k]);   /* after the frames that read it, before its pages go */
+            free(ks->sh[i].p[k]);
+        }
+    free(ks->sh); ks->sh = NULL; ks->shadow_bytes = 0;
+    vkc_free(ks->cscr); ks->cscr = NULL;
+}
 static void vkc_kv_free(VkcKvSplit *ks) {
+    vkc_kv_shadow_free(ks);
     if (ks->t) for (int i = 0; i < ks->nl; i++) {
         VkcKvTab *t = &ks->t[i];
         free(t->bt); free(t->rb); free(t->pin); free(t->fresh); free(t->hits);
@@ -114,6 +142,7 @@ static void vkc_kv_reset(VkcKvSplit *ks) {
         for (int j = 0; j < ks->ns; j++) { t->rb[j] = -1; t->pin[j] = 0; t->fresh[j] = 0; }
         memset(t->hits, 0, (size_t)t->nblk * sizeof *t->hits);
         t->valid = 0; t->dirty = 1; t->wb0 = t->wb1 = 0; t->counted = 0;
+        if (ks->sh) ks->sh[i].valid = 0;
     }
 }
 
@@ -149,11 +178,11 @@ static int vkc_kv_plan_need(VkcKvSplit *ks, const char *engine, int nl, size_t r
     } else {
         double used = 0, bud = 0;
         size_t avail;
-        if (coli_vk_mem_budget(&used, &bud)) avail = bud > used ? (size_t)((bud - used) * 1e9) : 0;
+        if (coli_vk_mem_budget_dev(vkc_device_now(), &used, &bud)) avail = bud > used ? (size_t)((bud - used) * 1e9) : 0;
         else {
-            size_t dev = coli_vk_device_local_bytes(), w = 0, n = 0;
+            size_t dev = coli_vk_device_local_bytes_dev(vkc_device_now()), w = 0, n = 0;
             VkcStats st; vkc_stats(&st);
-            coli_vk_mem_info(&w, &n);
+            coli_vk_mem_info_dev(vkc_device_now(), &w, &n);
             avail = dev > w + st.dev_bytes ? dev - w - st.dev_bytes : 0;
         }
         avail += held;
@@ -169,13 +198,15 @@ static int vkc_kv_plan_need(VkcKvSplit *ks, const char *engine, int nl, size_t r
     if (selects && vkc_kv_env("COLI_VK_KV_PIN", 0) != 0) { nw = ns / 2 > 3 ? ns / 2 : 3; np = ns - nw; }
     if ((long)ns * B >= cap) return 1;
     ks->B = B; ks->ns = ns; ks->nw = nw; ks->np = np; ks->rows = ns * B; ks->nl = nl; ks->cap = cap;
-    /* A step writes at most cb blocks' worth of rows (an eighth of the window, a block at
-     * least), so its rows span at most cb blocks past its first. A row's share reaches
-     * back `anchor` blocks: every block of it stays in the window while a step holds the
-     * row (anchor <= nw - 1 - cb), and it covers the step's earlier rows (anchor >= cb),
-     * which reach the host's cache only after the step. */
-    int cb = nw / 8 > 1 ? nw / 8 : 1;
-    if (nw - 1 - cb < cb) cb = (nw - 1) / 2;
+    /* A step writes at most cb blocks' worth of rows, so its rows span at most cb blocks
+     * past its first. A row's share reaches back `anchor` blocks: every block of it stays
+     * in the window while a step holds the row (anchor <= nw - 1 - cb), and it covers the
+     * step's earlier rows (anchor >= cb), which reach the host's cache only after the
+     * step. cb is the largest both allow: a prompt's chunk is a step, and every chunk
+     * carries its own frames and expert loads (with an eighth of the window, Qwen3.6's
+     * 7.6K-token prompt on a Radeon 780M took 170 s to its first token at 1024 rows on the
+     * device and 183 s at 4096; with this, 122 s and 142 s; docs/vulkan.md). */
+    int cb = (nw - 1) / 2 > 1 ? (nw - 1) / 2 : 1;
     ks->chunk = cb * B;
     ks->anchor = nw - 1 - cb;
     int nblk = (cap + B - 1) / B + 1;
@@ -192,13 +223,19 @@ static int vkc_kv_plan_need(VkcKvSplit *ks, const char *engine, int nl, size_t r
     }
     ks->tab = vkc_buf((size_t)nl * ks->tab_stride * sizeof(int), VKC_DEV);
     if (!ks->tab) { vkc_kv_free(ks); return 0; }
+    { const char *cm = getenv("COLI_VK_KV_COLD");
+      ks->cold_dev = cm && !strcmp(cm, "device") && np == 0 && coli_vk_import_alignment() > 0;
+      if (cm && !strcmp(cm, "device") && !ks->cold_dev)
+          fprintf(stderr, "[VK] %s chain: COLI_VK_KV_COLD=device needs host memory the device reads in place and no pins; "
+                          "the CPU computes the host's part\n", engine);
+      if (ks->cold_dev && !(ks->sh = (VkcKvShadow *)calloc((size_t)nl, sizeof *ks->sh))) { vkc_kv_free(ks); return 0; } }
     ks->on = 1;
     vkc_kv_reset(ks);
     fprintf(stderr, "[VK] %s chain: the KV cache split past the device's budget: %d of %d positions a layer on the device "
                     "(%d blocks of %d, %d for pins by reads; a row's newest %d positions on the device), the rest in RAM "
-                    "(%.1f MiB on the device instead of %.1f)\n",
+                    "(%.1f MiB on the device instead of %.1f)%s\n",
             engine, ks->rows, cap, ns, B, np, (ks->anchor + 1) * B, (double)nl * ks->rows * row_bytes / 1048576.0,
-            need / 1048576.0);
+            need / 1048576.0, ks->cold_dev ? ", its attention on the device too (COLI_VK_KV_COLD=device)" : "");
     return 2;
 }
 static int vkc_kv_plan(VkcKvSplit *ks, const char *engine, int nl, size_t row_bytes, int cap, int chunk, int selects,
@@ -227,6 +264,9 @@ static void vkc_kv_assign(VkcKvTab *t, int j, int b, int pinned) {
  * blocks and the ones its rows' shares reach back to get slots. */
 static void vkc_kv_place(VkcKvSplit *ks, int li, int pos_base, int S) {
     VkcKvTab *t = &ks->t[li];
+    /* the shadow too: rows from pos_base on may be rewritten from here (this step's, or a
+     * new request's after a rewind, whether or not this step has a host part) */
+    if (ks->sh && ks->sh[li].valid > pos_base) ks->sh[li].valid = pos_base > 0 ? pos_base : 0;
     if (pos_base + S <= 0) { t->wb0 = t->wb1 = 0; return; }
     int B = ks->B, wb1 = (pos_base + S - 1) / B, wb0 = wb1 - ks->nw + 1;
     if (wb0 < 0) wb0 = 0;
@@ -346,7 +386,10 @@ static int vkc_kv_store(VkcKvSplit *ks, int li, const VkcKvPart *pt, VkcBuf *src
     return ok;
 }
 static void vkc_kv_done(VkcKvSplit *ks, int li, int end) { if (ks->on) ks->t[li].valid = end; }
-static void vkc_kv_lower(VkcKvSplit *ks, int li, int pos_base) { if (ks->on && ks->t[li].valid > pos_base) ks->t[li].valid = pos_base; }
+static void vkc_kv_lower(VkcKvSplit *ks, int li, int pos_base) {
+    if (ks->on && ks->t[li].valid > pos_base) ks->t[li].valid = pos_base;
+    if (ks->on && ks->sh && ks->sh[li].valid > pos_base) ks->sh[li].valid = pos_base;
+}
 
 /* 1 when a row of the step may read a position outside the device's share: causal
  * rows see [first, pos] (first = pos - win + 1 with a window, else kv_start), the share
@@ -669,6 +712,55 @@ static int vkc_kv_run(VkcKvSplit *ks, VkcBuf *q, size_t q_off, size_t n_q, VkcBu
     return vkc_kv_run2(ks, q, q_off, n_q, NULL, 0, 0, sel, sel_off, n_sel, dev, host, u, part_n);
 }
 
+/* ---- the host's part on the device (COLI_VK_KV_COLD=device) ------------------------
+ * Layer li's shadow up to row `upto` (exclusive: a step's cold positions are all below its
+ * first row, which the host holds): nparts arrays, part k's segment g of position t at
+ * host[k] + g*grp[k] + t*pstride[k], seglen[k] floats. Made at the first use, sized to the
+ * tables' positions; rows from `valid` on are copied (a step lowers `valid` to its first
+ * row: the rows from there may be rewritten, by it or by a rollback). NULL when the memory
+ * or the import fails (the CPU's part then, for good on this layer). */
+static VkcKvShadow *vkc_kv_shadow(VkcKvSplit *ks, int li, int nparts, const float *const *host, const size_t *grp,
+                                  const size_t *pstride, const int *nseg, const int *seglen, int upto) {
+    VkcKvShadow *sh = &ks->sh[li];
+    if (sh->cap < 0) return NULL;
+    if (!sh->cap) {
+        size_t al = coli_vk_import_alignment();
+        for (int k = 0; k < nparts; k++) {
+            size_t n = (size_t)nseg[k] * ks->cap * seglen[k], bytes = (n * sizeof(float) + al - 1) / al * al;
+            void *p = NULL;
+            if (!al || posix_memalign(&p, al, bytes)) p = NULL;
+            sh->p[k] = (float *)p;
+            if (p) { memset(p, 0, bytes); sh->b[k] = vkc_host(p, bytes, &sh->off[k]); }
+            if (!p || !sh->b[k]) {
+                fprintf(stderr, "[VK] %s chain: no shadow for layer %d's host rows (%.1f MiB), the CPU computes its part\n",
+                        ks->engine, li, bytes / 1048576.0);
+                for (int j = 0; j <= k; j++) { vkc_free(sh->b[j]); free(sh->p[j]); sh->b[j] = NULL; sh->p[j] = NULL; }
+                sh->cap = -1;
+                return NULL;
+            }
+            sh->off[k] /= sizeof(float); sh->n[k] = n; sh->nseg[k] = nseg[k]; sh->seglen[k] = seglen[k];
+            ks->shadow_bytes += bytes;
+        }
+        sh->cap = ks->cap; sh->valid = 0;
+    }
+    if (upto > sh->cap) upto = sh->cap;
+    if (sh->valid > upto) sh->valid = upto;
+    if (sh->valid < upto) {
+        double t0 = vkc_kv_now();
+        long rows = upto - sh->valid;
+        for (int k = 0; k < nparts; k++) {
+            int G = nseg[k], L = seglen[k];
+            #pragma omp parallel for collapse(2) schedule(static) if (rows * G * L > (1 << 20))
+            for (int g = 0; g < G; g++)
+                for (long t = sh->valid; t < upto; t++)
+                    memcpy(sh->p[k] + ((size_t)g * sh->cap + t) * L, host[k] + g * grp[k] + t * pstride[k], (size_t)L * sizeof(float));
+        }
+        ks->shadow_rows += (unsigned long long)rows; ks->shadow_ms += vkc_kv_now() - t0;
+        sh->valid = upto;
+    }
+    return sh;
+}
+
 /* ---- one layer's attention over the split cache, the forms the engines use ----------- */
 /* The device's attention of S rows in slices of rows, each slice in a submission of its
  * own (the rows are independent: the same bits), so that no one submission runs long
@@ -713,6 +805,48 @@ static int vkc_kv_gqa_rec(VkcKvGqa *a, int s0, int ns, int fin) {
     return vkc_kvs_attn(a->q, a->kc, a->vc, fin ? a->out : ks->dpart, fin ? a->gate : NULL, a->sel, a->snk, ks->tab, &p);
 }
 static int vkc_kv_gqa_part(void *u, int s0, int ns) { return vkc_kv_gqa_rec((VkcKvGqa *)u, s0, ns, 0); }
+/* rows [s0, s0 + ns) of the host's part on the device, from the shadow, into ks->cpart */
+static int vkc_kv_gqa_cold(void *u, int s0, int ns) {
+    VkcKvGqa *a = (VkcKvGqa *)u; VkcKvSplit *ks = a->ks; VkcKvShadow *sh = &ks->sh[a->li];
+    int bt = (int)((size_t)a->li * ks->tab_stride), nb = ks->t[a->li].nblk;
+    VkcKvsAttn p = {ns, a->H, a->KVH, a->hd, a->vd, a->pos_base + s0, sh->cap, s0 * a->q_row, a->q_row, a->q_seg,
+                    a->sel_off + s0 * a->sel_row, a->sel_row, a->scale, (int)sh->off[0], (int)sh->off[1], a->win, 0, 0, 0,
+                    ks->B, ks->ns, bt, nb, ks->anchor, s0 * a->H * a->vd, a->H * a->vd, a->S * a->H * a->vd + s0 * a->H * 2,
+                    VKC_KVS_COLD, 0, 0, 0};
+    return vkc_kvs_attn(a->q, sh->b[0], sh->b[1], ks->cpart, NULL, a->sel, NULL, ks->tab, &p);
+}
+/* The same without lists through the blocked attention (vkc_attn_part_chunks): the
+ * shadow's K and V rows read once per block of rows, not once per (head, row), and the
+ * positions in chunks of VKC_KV_CCH, one workgroup each, joined in order (vkc_kvs_join):
+ * a decode row's thousands of positions over many workgroups. The chunks are fixed by
+ * position, so a row's bits do not depend on the step around it. Rows go in slices whose
+ * chunk parts fit 64 MiB. */
+#define VKC_KV_CCH 512
+static int vkc_kv_gqa_cold_blocked(VkcKvGqa *a) {
+    VkcKvSplit *ks = a->ks; VkcKvShadow *sh = &ks->sh[a->li];
+    int H = a->H, vd = a->vd, last = a->pos_base + a->S - 1;
+    int end = (last / ks->B - ks->anchor) * ks->B;   /* the last row's cold positions end there */
+    int nz = end > 0 ? (end + VKC_KV_CCH - 1) / VKC_KV_CCH : 0;
+    size_t per_row = (size_t)(nz > 0 ? nz : 1) * H * (vd + 2) * sizeof(float);
+    int rows = (int)(((size_t)64 << 20) / per_row);
+    if (rows < 1) rows = 1;
+    if (rows > a->S) rows = a->S;
+    if (!vkc_reserve(&ks->cscr, (size_t)rows * per_row, VKC_DEV)) return 0;
+    for (int r0 = 0; r0 < a->S; r0 += rows) {
+        int n = a->S - r0 < rows ? a->S - r0 : rows, o_z = n * H * vd, st_z = n * H * 2, sa_off = nz * o_z;
+        if (nz > 0) {
+            VkcAttnW w; memset(&w, 0, sizeof w);
+            w.a = (VkcAttn){n, H, a->KVH, a->hd, a->pos_base + r0, sh->cap, r0 * a->q_row, a->q_row, a->q_seg, 0, 0, 0, 0,
+                            0, H * vd, 0, 0, a->scale, (int)sh->off[0], (int)sh->off[1]};
+            w.win = a->win; w.vd = vd;
+            if (!vkc_attn_part_chunks(a->q, sh->b[0], sh->b[1], ks->cscr, &w, ks->B, ks->anchor, sa_off, VKC_KV_CCH, nz,
+                                      o_z, st_z)) return 0;
+        }
+        VkcKvsJoin j = {n * H, vd, nz, 0, o_z, sa_off, st_z, r0 * H * vd, a->S * H * vd + r0 * H * 2};
+        if (!vkc_kvs_join(ks->cscr, ks->cpart, &j)) return 0;
+    }
+    return 1;
+}
 static int vkc_kv_gqa_fin(void *u, int s0, int ns) { return vkc_kv_gqa_rec((VkcKvGqa *)u, s0, ns, 1); }
 static long vkc_kv_span(const VkcKvSplit *ks, int win, int sel_row) {   /* the most positions a row's device part reads */
     long n = (long)(ks->anchor + 1) * ks->B;
@@ -745,6 +879,20 @@ static int vkc_kv_gqa(VkcKvGqa *a) {
     if (!vkc_kv_cold(ks, a->li, a->pos_base, a->S, a->win, 0, a->sel_row > 0))
         return vkc_kv_sliced(a->S, a->H, vkc_kv_span(ks, a->win, a->sel_row), a->hd + a->vd, vkc_kv_gqa_fin, a);
     size_t part = (size_t)a->S * a->H * (a->vd + 2);
+    if (ks->cold_dev) {   /* the host's part on the device too: one frame, no round trip */
+        const float *host[2] = {a->Kh, a->Vh};
+        size_t grp[2] = {a->k_grp, a->v_grp}, ps[2] = {a->k_pos, a->v_pos};
+        int nseg[2] = {a->KVH, a->KVH}, sl[2] = {a->hd, a->vd};
+        if (vkc_kv_shadow(ks, a->li, 2, host, grp, ps, nseg, sl, a->pos_base)) {
+            ks->dev_cold++; ks->splits++;   /* a step with a host part, on the device */
+            VkcKvsMerge mg = {a->S * a->H, a->H, a->vd, 0, a->H * a->vd, a->vd, a->S * a->H * a->vd, 0, a->S * a->H * a->vd,
+                              0, a->o_row, a->vd, a->gated ? VKC_KVS_GATE : 0, a->g_off, a->g_row, a->g_seg};
+            return vkc_kv_parts(ks, part) && vkc_kv_gqa_dev(a) &&
+                   (a->sel_row > 0 ? vkc_kv_sliced(a->S, a->H, (long)a->pos_base + a->S, a->hd + a->vd, vkc_kv_gqa_cold, a)
+                                   : vkc_kv_gqa_cold_blocked(a)) &&
+                   vkc_kvs_merge(ks->dpart, ks->cpart, a->gate, a->out, &mg);
+        }
+    }
     if (!vkc_kv_parts(ks, part) ||
         !vkc_kv_run(ks, a->q, 0, (size_t)a->S * a->q_row, a->sel_row > 0 ? a->sel : NULL, (size_t)a->sel_off,
                     (size_t)a->S * a->sel_row, vkc_kv_gqa_dev, vkc_kv_gqa_host, a, part)) return 0;
@@ -779,6 +927,15 @@ static int vkc_kv_mla_rec(VkcKvMla *a, int s0, int ns, int fin) {
     return vkc_kvs_mla(a->qa, a->qr, a->lat, a->rope, a->sel, fin ? a->out : ks->dpart, ks->tab, &p);
 }
 static int vkc_kv_mla_part(void *u, int s0, int ns) { return vkc_kv_mla_rec((VkcKvMla *)u, s0, ns, 0); }
+static int vkc_kv_mla_cold(void *u, int s0, int ns) {
+    VkcKvMla *a = (VkcKvMla *)u; VkcKvSplit *ks = a->ks; VkcKvShadow *sh = &ks->sh[a->li];
+    int bt = (int)((size_t)a->li * ks->tab_stride), nb = ks->t[a->li].nblk;
+    VkcKvsMla p = {ns, a->H, a->K, a->R, a->pos_base + s0, a->kv_start, a->qa_off + s0 * a->qa_row, a->qa_row, a->qa_seg,
+                   a->qr_off + s0 * a->qr_row, a->qr_row, a->qr_seg, (int)sh->off[0], a->K, (int)sh->off[1], a->R,
+                   a->sel_off + s0 * a->sel_row, a->sel_row, s0 * a->H * a->K, a->H * a->K, a->K, a->scale, ks->B, ks->ns,
+                   bt, nb, ks->anchor, VKC_KVS_COLD, a->S * a->H * a->K + s0 * a->H * 2};
+    return vkc_kvs_mla(a->qa, a->qr, sh->b[0], a->R > 0 ? sh->b[1] : NULL, a->sel, ks->cpart, ks->tab, &p);
+}
 static int vkc_kv_mla_fin(void *u, int s0, int ns) { return vkc_kv_mla_rec((VkcKvMla *)u, s0, ns, 1); }
 static int vkc_kv_mla_dev(void *u) {
     VkcKvMla *a = (VkcKvMla *)u;
@@ -803,6 +960,19 @@ static int vkc_kv_mla(VkcKvMla *a) {
     if (!vkc_kv_cold(ks, a->li, a->pos_base, a->S, 0, a->kv_start, a->sel_row > 0))
         return vkc_kv_sliced(a->S, a->H, vkc_kv_span(ks, 0, a->sel_row), 2 * a->K + a->R, vkc_kv_mla_fin, a);
     size_t part = (size_t)a->S * a->H * (a->K + 2);
+    if (ks->cold_dev) {   /* the host's part on the device too */
+        const float *host[2] = {a->Lh, a->Rh};
+        size_t grp[2] = {0, 0}, ps[2] = {(size_t)a->K, (size_t)a->R};
+        int nseg[2] = {1, 1}, sl[2] = {a->K, a->R};
+        if (vkc_kv_shadow(ks, a->li, a->R > 0 ? 2 : 1, host, grp, ps, nseg, sl, a->pos_base)) {
+            ks->dev_cold++; ks->splits++;   /* a step with a host part, on the device */
+            VkcKvsMerge mg = {a->S * a->H, a->H, a->K, 0, a->H * a->K, a->K, a->S * a->H * a->K, 0, a->S * a->H * a->K,
+                              a->o_off, a->o_row, a->o_seg, 0, 0, 0, 0};
+            return vkc_kv_parts(ks, part) && vkc_kv_mla_dev(a) &&
+                   vkc_kv_sliced(a->S, a->H, (long)a->pos_base + a->S, 2 * a->K + a->R, vkc_kv_mla_cold, a) &&
+                   vkc_kvs_merge(ks->dpart, ks->cpart, NULL, a->out, &mg);
+        }
+    }
     a->nqa = (size_t)(a->S - 1) * a->qa_row + (size_t)(a->H - 1) * a->qa_seg + a->K;
     size_t nqr = a->R > 0 ? (size_t)(a->S - 1) * a->qr_row + (size_t)(a->H - 1) * a->qr_seg + a->R : 0;
     if (!vkc_kv_parts(ks, part) ||
@@ -839,6 +1009,14 @@ static int vkc_kv_rel_rec(VkcKvRel *a, int s0, int ns, int fin) {
     return vkc_kvs_rel(a->q, a->kc, a->vc, fin ? a->out : ks->dpart, a->r, a->tau, a->relp, ks->tab, &p);
 }
 static int vkc_kv_rel_part(void *u, int s0, int ns) { return vkc_kv_rel_rec((VkcKvRel *)u, s0, ns, 0); }
+static int vkc_kv_rel_cold(void *u, int s0, int ns) {
+    VkcKvRel *a = (VkcKvRel *)u; VkcKvSplit *ks = a->ks; VkcKvShadow *sh = &ks->sh[a->li];
+    int bt = (int)((size_t)a->li * ks->tab_stride), nb = ks->t[a->li].nblk;
+    VkcKvsRel p = {ns, a->H, a->KVH, a->hd, a->pos_base + s0, sh->cap, s0 * a->q_row, a->q_row, a->scale, (int)sh->off[0],
+                   (int)sh->off[1], a->ext, a->d_rel, s0 * a->r_row, a->r_row, a->relp_off, a->tau_off + s0, ks->B, bt, nb,
+                   ks->anchor, s0 * a->H * a->hd, a->H * a->hd, a->S * a->H * a->hd + s0 * a->H * 2, VKC_KVS_COLD};
+    return vkc_kvs_rel(a->q, sh->b[0], sh->b[1], ks->cpart, a->r, a->tau, a->relp, ks->tab, &p);
+}
 static int vkc_kv_rel_fin(void *u, int s0, int ns) { return vkc_kv_rel_rec((VkcKvRel *)u, s0, ns, 1); }
 static int vkc_kv_rel_dev(void *u) {
     VkcKvRel *a = (VkcKvRel *)u;
@@ -865,6 +1043,19 @@ static int vkc_kv_rel(VkcKvRel *a) {
     if (!vkc_kv_cold(ks, a->li, a->pos_base, a->S, 0, 0, 0))
         return vkc_kv_sliced(a->S, a->H, vkc_kv_span(ks, 0, 0), 2 * a->hd + a->d_rel, vkc_kv_rel_fin, a);
     size_t part = (size_t)a->S * a->H * (a->hd + 2);
+    if (ks->cold_dev) {   /* the host's part on the device too */
+        const float *host[2] = {a->Kh, a->Vh};
+        size_t grp[2] = {a->k_grp, a->v_grp}, ps[2] = {a->k_pos, a->v_pos};
+        int nseg[2] = {a->KVH, a->KVH}, sl[2] = {a->hd, a->hd};
+        if (vkc_kv_shadow(ks, a->li, 2, host, grp, ps, nseg, sl, a->pos_base)) {
+            ks->dev_cold++; ks->splits++;   /* a step with a host part, on the device */
+            VkcKvsMerge mg = {a->S * a->H, a->H, a->hd, 0, a->H * a->hd, a->hd, a->S * a->H * a->hd, 0, a->S * a->H * a->hd,
+                              0, a->o_row, a->hd, 0, 0, 0, 0};
+            return vkc_kv_parts(ks, part) && vkc_kv_rel_dev(a) &&
+                   vkc_kv_sliced(a->S, a->H, (long)a->pos_base + a->S, 2 * a->hd + a->d_rel, vkc_kv_rel_cold, a) &&
+                   vkc_kvs_merge(ks->dpart, ks->cpart, NULL, a->out, &mg);
+        }
+    }
     a->nq = (size_t)a->S * a->q_row;
     if (!vkc_kv_parts(ks, part) ||
         !vkc_kv_run2(ks, a->q, 0, a->nq, a->d_rel > 0 ? a->r : NULL, 0, (size_t)a->S * a->r_row, NULL, 0, 0,
@@ -893,10 +1084,10 @@ static int vkc_kv_sparse_reserve(VkcBuf **b, size_t bytes) {
     if (old >= bytes) return 1;
     double used = 0, budget = 0;
     size_t free_bytes;
-    if (coli_vk_mem_budget(&used, &budget)) free_bytes = budget > used ? (size_t)((budget - used) * 1e9) : 0;
+    if (coli_vk_mem_budget_dev(vkc_device_now(), &used, &budget)) free_bytes = budget > used ? (size_t)((budget - used) * 1e9) : 0;
     else {
-        size_t total = coli_vk_device_local_bytes(), weights = 0, count = 0;
-        VkcStats st; vkc_stats(&st); coli_vk_mem_info(&weights, &count);
+        size_t total = coli_vk_device_local_bytes_dev(vkc_device_now()), weights = 0, count = 0;
+        VkcStats st; vkc_stats(&st); coli_vk_mem_info_dev(vkc_device_now(), &weights, &count);
         free_bytes = total > weights + st.dev_bytes ? total - weights - st.dev_bytes : 0;
     }
     if (bytes - old > free_bytes) return 0;
@@ -1014,7 +1205,11 @@ static int vkc_kv_mla_attn(VkcKvSplit *ks, int li, const VkcMla *m, VkcMlaScratc
 static void vkc_kv_report(const VkcKvSplit *ks) {
     if (!ks->on || !ks->steps) return;
     fprintf(stderr, "[VK] %s chain: KV split: %llu layer steps, %llu with a host part (%.1f ms waiting for the queries, "
-                    "%.1f ms of host work over %llu positions, %llu sparse rows staged), %llu blocks pinned by reads\n",
+                    "%.1f ms of host work over %llu positions, %llu sparse rows staged), %llu blocks pinned by reads",
             ks->engine, ks->steps, ks->splits, ks->wait_ms, ks->host_ms, ks->host_pos, ks->staged_rows, ks->pins);
+    if (ks->cold_dev)
+        fprintf(stderr, " | the host's part on the device: %llu layer steps, %llu rows copied to the shadow in %.1f ms "
+                        "(%.1f MiB held)", ks->dev_cold, ks->shadow_rows, ks->shadow_ms, ks->shadow_bytes / 1048576.0);
+    fprintf(stderr, "\n");
 }
 #endif

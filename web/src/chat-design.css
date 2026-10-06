@@ -49,6 +49,12 @@ button{color:inherit}button:disabled{cursor:default;opacity:.4}svg.lucide{stroke
 .md blockquote{margin:0 0 .75em;padding:.1em 0 .1em .85em;border-left:2px solid var(--primary);opacity:.9}
 .md hr{border:0;border-top:1px solid color-mix(in srgb,var(--foreground) 18%,transparent);margin:1.1em 0}
 .md :not(pre)>code{background:color-mix(in srgb,var(--foreground) 10%,transparent);padding:.12em .36em;border-radius:.35em;font-size:.92em}
+.md-table{margin:0 0 .85em;overflow-x:auto;border:1px solid color-mix(in srgb,var(--foreground) 14%,transparent);border-radius:.6em}
+.md-table table{border-collapse:collapse;width:100%;font-size:.92em;font-variant-numeric:tabular-nums}
+.md-table th,.md-table td{padding:.42em .7em;text-align:left;vertical-align:top;border-bottom:1px solid color-mix(in srgb,var(--foreground) 10%,transparent)}
+.md-table thead th{font-weight:600;white-space:nowrap;background:color-mix(in srgb,var(--foreground) 5%,transparent);border-bottom:1px solid color-mix(in srgb,var(--foreground) 16%,transparent)}
+.md-table tbody tr:last-child td{border-bottom:0}
+.md-table :not(pre)>code{font-size:.9em}
 .md-code{margin:0 0 .85em;border:1px solid color-mix(in srgb,var(--foreground) 14%,transparent);border-radius:.6em;overflow:hidden;background:color-mix(in srgb,var(--foreground) 5%,transparent)}
 .md-code figcaption{display:flex;align-items:center;justify-content:space-between;gap:.5em;padding:.35em .5em .35em .75em;font-size:.78em;letter-spacing:.04em;text-transform:uppercase;opacity:.7;border-bottom:1px solid color-mix(in srgb,var(--foreground) 12%,transparent)}
 .md-code figcaption button{display:inline-flex;align-items:center;justify-content:center;width:1.9em;height:1.9em;border-radius:.4em;color:inherit;opacity:.8}

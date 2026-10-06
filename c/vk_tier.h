@@ -197,6 +197,13 @@ typedef struct {
      * the first ones in order. A partial batch is consumed and released before the
      * next batch; 0 falls back to load for the next expert. */
     int  (*load_batch)(void *ctx, int layer, const int *eids, int n, VktExpertSrc *srcs, void **h);
+    /* Optional: layers past `layers` (an MTP head's) whose experts the engine holds in another
+     * form (extra_gate_up, extra_down), with the same geometry: index them layers..
+     * layers+extra_layers-1 in every call. They never stream (an MTP head's steps are a few
+     * rows; streaming's slots are in the main form) and have no history (heat rows: the
+     * main layers only). 0: none. */
+    int extra_layers;
+    VktFmt extra_gate_up, extra_down;
 } VktConfig;
 
 
@@ -242,6 +249,9 @@ int  vkt_step_rows(int S, int block);
 int  vkt_stream_prefetch(int layer, int S);
 /* How many devices hold experts: 0 (the tier is off), 1, or 2 (COLI_VK_DEV2's too). */
 int  vkt_devices(void);
+/* The layers the tier serves: VktConfig.layers plus the extra layers it took (an MTP
+ * head's, when their form has a device form); 0 when it is off. */
+int  vkt_layers(void);
 /* Exclusive RAM/VRAM: 1 when the device holds this expert and the tier wants the RAM
  * copy given up first (COLI_VK_TIER_EXCLUSIVE unset or not 0). An engine's RAM cache
  * asks it while it picks the slot to evict (prefer such a slot to its LRU choice) and
@@ -269,6 +279,7 @@ static inline size_t vkt_expert_bytes(int h,int i,VktFmt a,VktFmt b){(void)h;(vo
 static inline int  vkt_step_rows(int S,int b){return S<b?S:b;}
 static inline int  vkt_stream_prefetch(int l,int S){(void)l;(void)S;return 0;}
 static inline int  vkt_devices(void){return 0;}
+static inline int  vkt_layers(void){return 0;}
 static inline int  vkt_ram_first(int l,int e){(void)l;(void)e;return 0;}
 static inline void vkt_ram_gave(void){}
 #endif

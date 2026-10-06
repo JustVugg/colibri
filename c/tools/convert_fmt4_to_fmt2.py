@@ -309,7 +309,7 @@ def main():
     if not a.indir or not a.outdir:
         ap.error("--indir and --outdir are required")
     a.outdir = os.path.expanduser(a.outdir)
-    if os.path.abspath(a.indir) == os.path.abspath(a.outdir):
+    if os.path.realpath(a.indir) == os.path.realpath(a.outdir):
         die("--indir and --outdir must differ (in-place conversion would corrupt the source)")
     cfg_path = os.path.join(a.indir, "config.json")
     if not os.path.exists(cfg_path):

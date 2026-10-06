@@ -111,6 +111,14 @@ int  coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const flo
 int    coli_vk_tensor_import(ColiVkTensor **tensor, const void *weights, size_t alloc_bytes, const float *scales,
                              int fmt, int I, int O, int gs);
 size_t coli_vk_import_alignment(void);
+/* Host memory a shader reads in place (VK_EXT_external_memory_host, where
+ * coli_vk_import_alignment() is not 0): the pages around [ptr, ptr + bytes) as a storage
+ * buffer of the primary device (VkBuffer, VkDeviceMemory as void *), *off the byte
+ * offset of ptr in it. 0 when the device refuses. The pages must stay mapped until
+ * coli_vk_host_buffer_free (bytes: the buffer's, ptr's page-rounded range), after the
+ * last submission that read them. */
+int    coli_vk_host_buffer(const void *ptr, size_t bytes, void **buf, void **mem, size_t *off);
+void   coli_vk_host_buffer_free(void *buf, void *mem, size_t bytes);
 size_t coli_vk_imported_bytes(void);
 
 /* SECOND DEVICE (COLI_VK_DEV2): a self-contained context on another Vulkan GPU that
@@ -193,6 +201,12 @@ void coli_vk_pool_stats(int pool, ColiVkPoolStats *st);
 /* The expert tier's budget: its pool never holds more block bytes than this. */
 void coli_vk_tier_pool_limit(size_t bytes);
 void coli_vk_tier_pool_limit_dev(int dev, size_t bytes);   /* dev 1: COLI_VK_DEV2's pool (3) */
+/* The tier's extra layers (an MTP head's experts, another size than the main ones'):
+ * a pool of their own on the primary device (pool 4), its budget, and a tensor in it
+ * (as coli_vk_tier_tensor). */
+void coli_vk_tier_extra_pool_limit(size_t bytes);
+int  coli_vk_tier_tensor_extra(ColiVkTensor **t, int fmt, int I, int O, int gs,
+                               uint8_t **rows, size_t *stride, float **scales);
 /* A tensor in the tier's pool, to fill in place: O rows of coli_vk_tensor_row_bytes
  * at *stride apart (padding zeroed) and coli_vk_tensor_scale_count floats of scales
  * (fmt 10/11: one, set it to 1), then coli_vk_tensor_commit. Thread-safe. Returns 0
@@ -405,6 +419,21 @@ void coli_vk_mark_lost(void);
 /* vkQueueSubmit(queue, 1, submit_info, fence) as the backend submits (a VkResult): the
  * staged uploader may share the main queue from its own thread. */
 int  coli_vk_queue_submit(void *queue, const void *submit_info, void *fence);
+/* The same for either device: d = 0 the primary (as the calls above), d = 1 COLI_VK_DEV2's,
+ * whose context the chain opens for the layers it places there (vk_chain.c). The core of
+ * device 1 carries the primary's shader path and GEMM tiles. coli_vk_tensor_info_dev
+ * reports a tensor on either device and which (coli_vk_tensor_info: device 0's only). */
+int    coli_vk_core_dev(int d, ColiVkCore *out);
+int    coli_vk_available_dev(int d);
+void   coli_vk_mark_lost_dev(int d);
+int    coli_vk_queue_submit_dev(int d, void *queue, const void *submit_info, void *fence);
+int    coli_vk_tensor_info_dev(const ColiVkTensor *t, ColiVkTensorInfo *out, int *dev);
+int    coli_vk_mem_budget_dev(int d, double *used_gb, double *budget_gb);
+size_t coli_vk_device_used_dev(int d);
+size_t coli_vk_device_local_bytes_dev(int d);
+size_t coli_vk_free_bytes_dev(int d);
+size_t coli_vk_buffer_alignment_dev(int d);
+void   coli_vk_mem_info_dev(int d, size_t *used_bytes, size_t *tensor_count);   /* dense weights on device d */
 
 #ifdef __cplusplus
 }

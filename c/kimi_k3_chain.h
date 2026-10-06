@@ -62,7 +62,18 @@
  * tier, with KIMI_DSA_INDEXER=1 (its index cache is filled on the CPU), for the
  * validation dumps that read every layer on the host (K3_TRACE, K3_VALIDATE_LAYER,
  * K3_DEBUG_OUT), without a head (K3_LAYERS), and for a geometry past the ops' limits
- * (a KDA head above 128 floats, kv_lora above 1024, qk_rope above 128 or odd). */
+ * (a KDA head above 128 floats, kv_lora above 1024, qk_rope above 128 or odd).
+ *
+ * Layers on two devices (docs/vulkan.md, "Layers on two devices"): with COLI_VK_DEV2 a
+ * second chain takes the layers after the primary's on that device (its own fit from
+ * layer N, COLI_VK_CHAIN_LAYERS2; its own copies of their matrices, which the per-matrix
+ * path never sees). The primary hands each row's AttnRes state (the prefix, the block
+ * snapshots and their count) to it as it would to the CPU; the head stays on the host.
+ * Both chains' KDA state moves together (the host's copy current for both, or for
+ * neither; the primary's host_pos, host_zero and dev_pos speak for both): the second
+ * device's is read back first, so a read that fails leaves the primary's as it was.
+ * Losing either device turns both off and rebuilds the state of the layers whose newest
+ * state was on a device. */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 
@@ -76,6 +87,7 @@ typedef struct { ColiVkTensor *router, *down, *up, *sg, *su, *sd, *dg, *du, *dd;
 typedef struct {
     const Model *m;
     int ok, failed, rows, cap, nbmax;
+    int lo, d;                                /* its layers start at lo, on device d (vkc_device) */
     VkcBuf *prm;                              /* every norm, AttnRes weight, conv tap and KDA parameter */
     size_t *o_in, *o_post, *o_asw, *o_msw, *o_qn, *o_kn, *o_conv, *o_kda, *o_latn, o_osw, o_final;
     K3cKda *kda; K3cFfn *ffn; VkcMla *mla; ColiVkTensor **mg, *head;
@@ -93,13 +105,21 @@ typedef struct {
     float *host_u, *host_sco;
     unsigned long long forwards;
     double host_ms;
-    int n;                                    /* the layers on the device: the model's first n (a partial chain) */
+    int n;                                    /* the layers on the device: lo..lo+n-1 (a partial chain) */
     VkcBuf *xo, *bo;                          /* the handoff after layer n - 1: the prefix and the block snapshots, down */
 } K3Chain;
 
 static K3Chain *g_k3c;
 static int g_k3c_on;       /* COLI_VK_CHAIN as decided (on, or prompts only), the chain set up */
 static int g_k3c_inited;   /* vkc_init ran: vkc_shutdown goes at exit */
+/* the second device's chain (layers g_k3_fit.n..), its fit; g_k3c_dev: the device the
+ * chain's uploads go to */
+static K3Chain *g_k3c2;
+static VkcFit g_k3c_fit2;
+static int g_k3c_fit2_on, g_k3c_dev;
+static K3Chain *k3c_of(int d) { return d ? g_k3c2 : g_k3c; }
+static const char *k3c_name(const K3Chain *ch) { return ch && ch->d ? "kimi_k3 dev2" : "kimi_k3"; }
+static int k3c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 /* The chain's own f32 tensors (the router, the KDA decay pair, beta): with the dense
  * weights on the device only (COLI_VK_DENSE_HOST) the per-matrix path multiplies by them
  * too, and the CPU drops its copies. which: 0 the router, 1 f_a, 2 f_b, 3 b_proj. */
@@ -126,10 +146,10 @@ static int k3c_scratch(K3Chain *ch, const Model *m, int rows);
  * reservations (the MLA scratch as vkc_mla_scratch sizes it), and the routed experts'
  * outputs (the tier's rows, the CPU's, the host's sum, in the latent space) for it. */
 static int k3c_chunk_rows(K3Chain *ch, const Model *m) {
-    if (!vkc_chunk_auto()) return vkc_chunk_rows("kimi_k3", 0);
+    if (!vkc_chunk_auto()) return vkc_chunk_rows(k3c_name(ch), 0);
     const Cfg *c = &m->c;
     size_t mla = 0;
-    for (int i = 0; i < ch->n; i++) if (!m->L[i].kda) {
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) if (!m->L[i].kda) {
         const VkcMla *a = &ch->mla[i];
         mla = (size_t)(a->q_lora > 0 ? a->q_lora : 1) + (size_t)a->H * (a->Q + a->R) + (size_t)(a->K + a->R) +
               2 * (size_t)a->H * a->K + (size_t)a->H * a->V;
@@ -140,13 +160,21 @@ static int k3c_chunk_rows(K3Chain *ch, const Model *m) {
     g_k3c_count = 0; k3c_scratch(ch, m, 2); long long b2 = g_k3c_count;
     g_k3c_count = -1; ch->kvd_layer = ksz;
     size_t row = (size_t)(b2 - b1) + mla * sizeof(float) + (size_t)(2 * c->topk + 1) * c->latent * sizeof(float);
-    return vkc_chunk_rows("kimi_k3", row);
+    return vkc_chunk_rows(k3c_name(ch), row);
 }
 
 /* A W's device copy into *t: the per-matrix path's own where it made one (the shared
  * experts under COLI_VK_DENSE), else one of the chain's, which w_matmul never sees (so
- * a forward the chain declines stays on the CPU, as before). */
+ * a forward the chain declines stays on the CPU, as before). The second device's chain
+ * makes its own there, always. */
 static ColiVkTensor *k3c_w(W *w, ColiVkTensor **t) {
+    if (g_k3c_dev) {
+        if (*t) return *t;
+        int fmt = k3_vk_fmt(w);
+        if (fmt < 0 || w->mapped) return NULL;
+        const void *src = fmt == 1 ? (const void *)w->q8 : fmt == 4 ? (const void *)w->q4 : (const void *)w->f;
+        return coli_vk_tensor_ensure2(t, src, fmt == 10 ? NULL : w->s, fmt, w->I, w->O, fmt == 4 ? w->gs : 0) ? *t : NULL;
+    }
     if (!*t && w->vk) *t = (ColiVkTensor *)w->vk;
     if (*t) return *t;
     /* the dense weights on the device only, the chain's fit: the per-matrix path's copy,
@@ -160,81 +188,107 @@ static ColiVkTensor *k3c_w(W *w, ColiVkTensor **t) {
 /* the shared experts go where the per-matrix path puts them when it puts them on the
  * device (COLI_VK_DENSE): one copy for both */
 static ColiVkTensor *k3c_w_shared(W *w, ColiVkTensor **t) {
-    if (!*t && coli_vk_dense() && !w->vk) w_vk_upload(w);
+    if (!*t && !g_k3c_dev && coli_vk_dense() && !w->vk) w_vk_upload(w);
     return k3c_w(w, t);
 }
 static ColiVkTensor *k3c_f32(const float *w, int I, int O, ColiVkTensor **own) {
-    return coli_vk_tensor_ensure(own, w, NULL, 10, I, O, 0) ? *own : NULL;
+    return (g_k3c_dev ? coli_vk_tensor_ensure2(own, w, NULL, 10, I, O, 0) : coli_vk_tensor_ensure(own, w, NULL, 10, I, O, 0)) ? *own : NULL;
 }
 
 /* ---- the KDA state between the host and the device ------------------------------ */
-static void k3c_recover(Model *m, int dev, int upto);
-/* The host's KDA state brought up to date (before anything reads it there). */
-static void k3c_sync_host(Model *m) {
-    K3Chain *ch = g_k3c;
-    if (!ch || !ch->ok || ch->m != m || ch->where != K3C_DEV) return;
+/* (each covers both chains: the second device's first; the primary's host_pos, host_zero
+ * and dev_pos speak for both, see the top) */
+static void k3c_recover(Model *m, int dev0, int dev2, int upto, const K3Chain *who);
+/* One chain's KDA state read back into the host's copy; 0: lost on the way (*reads: how
+ * many copies landed before). */
+static int k3c_sync_one(Model *m, K3Chain *ch, int *reads) {
     const Cfg *c = &m->c;
     size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd, nw = (size_t)c->kda_proj * c->conv_k;
-    int reads = 0;   /* the copies that landed: after one, the host's copy is no longer the old one */
-    for (int i = 0; i < ch->n; i++) {   /* the chain's layers: the CPU's hold their own */
+    int was = vkc_device(ch->d), ok = 1;
+    for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {   /* the chain's layers: the CPU's hold their own */
         if (!m->L[i].kda) continue;
-        if (!(vkc_read(ch->st[i], 0, m->kstate[i], ns * sizeof(float)) && ++reads) ||
-            !(vkc_read(ch->win[i], 0, m->cwq[i], nw * sizeof(float)) && ++reads) ||
-            !(vkc_read(ch->win[i], nw, m->cwk[i], nw * sizeof(float)) && ++reads) ||
-            !(vkc_read(ch->win[i], 2 * nw, m->cwv[i], nw * sizeof(float)) && ++reads)) {
+        ok = (vkc_read(ch->st[i], 0, m->kstate[i], ns * sizeof(float)) && ++*reads) &&
+             (vkc_read(ch->win[i], 0, m->cwq[i], nw * sizeof(float)) && ++*reads) &&
+             (vkc_read(ch->win[i], nw, m->cwk[i], nw * sizeof(float)) && ++*reads) &&
+             (vkc_read(ch->win[i], 2 * nw, m->cwv[i], nw * sizeof(float)) && ++*reads);
+    }
+    vkc_device(was);
+    if (ok) ch->where = K3C_BOTH;
+    return ok;
+}
+/* The host's KDA state brought up to date (before anything reads it there). */
+static void k3c_sync_host(Model *m) {
+    K3Chain *ch = g_k3c, *ch2 = g_k3c2;
+    if (!ch || !ch->ok || ch->m != m) return;
+    int synced = 0;
+    for (int d = 1; d >= 0; d--) {
+        K3Chain *x = k3c_of(d);
+        if (!x || !x->ok || x->where != K3C_DEV) continue;
+        int reads = 0;   /* the copies that landed: after one, the host's copy is no longer the old one */
+        if (!k3c_sync_one(m, x, &reads)) {
             /* lost halfway: the host's copy is part old, part new; it is rebuilt from zeros */
             if (reads) { ch->host_pos = 0; ch->host_zero = 1; }
-            k3c_recover(m, 1, ch->dev_pos);
+            k3c_recover(m, ch->where == K3C_DEV, ch2 && ch2->ok && ch2->where == K3C_DEV, ch->dev_pos, x);
             return;
         }
+        synced = 1;
     }
-    ch->where = K3C_BOTH; ch->host_pos = ch->dev_pos; ch->host_zero = 0;
+    if (!synced) return;
+    ch->host_pos = ch->dev_pos;
+    for (int d = 0; d < 2; d++) { K3Chain *x = k3c_of(d); if (x) x->host_zero = 0; }
 }
 /* The host wrote its KDA state (zero: model_state_reset's zeros; else a restored
  * photo). A reset also drops the MLA rows: the mirror's watermark goes to 0. */
 static void k3c_host_wrote(Model *m, int zero) {
-    K3Chain *ch = g_k3c;
-    if (!ch || !ch->ok || ch->m != m) return;
-    ch->where = K3C_HOST; ch->host_zero = zero;
-    if (zero) { for (int i = 0; i < m->c.n_layers; i++) ch->kv_valid[i] = 0; vkc_kv_reset(&ch->ks); }
+    for (int d = 0; d < 2; d++) {
+        K3Chain *ch = k3c_of(d);
+        if (!ch || !ch->ok || ch->m != m) continue;
+        ch->where = K3C_HOST; ch->host_zero = zero;
+        if (zero) { for (int i = 0; i < m->c.n_layers; i++) ch->kv_valid[i] = 0; vkc_kv_reset(&ch->ks); }
+    }
 }
-/* A CPU forward from pos0: the host's state current before it, the device's stale after
- * (and its MLA rows from pos0 on). */
-static void k3c_cpu_step(Model *m, int pos0) {
-    K3Chain *ch = g_k3c;
-    if (!ch || !ch->ok || ch->m != m) return;
-    k3c_sync_host(m);
+/* The CPU runs one chain's layers from pos0: the device's state stale after (and its MLA
+ * rows from pos0 on). */
+static void k3c_cpu_one(Model *m, K3Chain *ch, int pos0) {
     ch->where = K3C_HOST; ch->host_zero = 0;
-    for (int i = 0; i < ch->n; i++) {
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) {
         if (ch->kv_valid[i] > pos0) ch->kv_valid[i] = pos0;
         if (!m->L[i].kda) vkc_kv_lower(&ch->ks, ch->mla_ord[i], pos0);
     }
 }
-
-/* The device was lost. If it held the newest KDA state (dev), the state is rebuilt on
- * the CPU: from the host's copy, current at host_pos, through the prefix record's ids
- * up to `upto`. The CPU runs from here on. */
-static void k3c_recover(Model *m, int dev, int upto) {
+/* A CPU forward from pos0: the host's state current before it. */
+static void k3c_cpu_step(Model *m, int pos0) {
     K3Chain *ch = g_k3c;
+    if (!ch || !ch->ok || ch->m != m) return;
+    k3c_sync_host(m);
+    for (int d = 0; d < 2; d++) { K3Chain *x = k3c_of(d); if (x && x->ok && x->m == m) k3c_cpu_one(m, x, pos0); }
+}
+
+/* A device was lost (who: the chain whose device it was); both chains go off. If the
+ * devices held the newest KDA state (dev0, dev2: the primary's and the second device's),
+ * the state of their layers is rebuilt on the CPU: from the host's copy, current at
+ * host_pos, through the prefix record's ids up to `upto`. The CPU runs from here on. */
+static void k3c_recover(Model *m, int dev0, int dev2, int upto, const K3Chain *who) {
+    K3Chain *ch = g_k3c, *ch2 = g_k3c2;
     g_k3c_on = 0;
     if (!ch) return;
-    ch->failed = 1;
     int from = ch->host_pos, zero = ch->host_zero;
-    int had = dev && ch->where == K3C_DEV;
-    ch->where = K3C_HOST;
+    int had = dev0 || dev2, hi = ch->lo + ch->n + (dev2 && ch2 ? ch2->n : 0);   /* the layers whose state the devices held */
+    for (int d = 0; d < 2; d++) { K3Chain *x = k3c_of(d); if (x) { x->failed = 1; x->where = K3C_HOST; } }
+    const char *nm = k3c_name(who);
     if (!had || upto <= from) {
-        fprintf(stderr, "[VK] kimi_k3 chain: the device was lost; the host's state is current, the CPU runs from here on\n");
+        fprintf(stderr, "[VK] %s chain: the device was lost; the host's state is current, the CPU runs from here on\n", nm);
         return;
     }
-    if (m->kvp.tainted || !m->kvp.fed || m->kvp.len < upto) {
-        fprintf(stderr, "[VK] kimi_k3 chain: the device was lost with a KDA state its token ids do not describe -- stopping "
-                        "(COLI_VK_CHAIN=0 keeps the state on the CPU)\n");
+    if (m->kvp.tainted || !m->kvp.fed || m->kvp.len < upto || !dev0) {
+        fprintf(stderr, "[VK] %s chain: the device was lost with a KDA state its token ids do not describe -- stopping "
+                        "(COLI_VK_CHAIN=0 keeps the state on the CPU)\n", nm);
         exit(1);
     }
-    fprintf(stderr, "[VK] kimi_k3 chain: the device was lost; rebuilding the state of %d positions on the CPU, "
-                    "which runs from here on\n", upto - from);
+    fprintf(stderr, "[VK] %s chain: the device was lost; rebuilding the state of %d positions on the CPU, "
+                    "which runs from here on\n", nm, upto - from);
     const Cfg *c = &m->c;
-    if (zero) for (int i = 0; i < ch->n; i++) {   /* the host was told "zeros" and kept its old arrays (the chain's layers) */
+    if (zero) for (int i = 0; i < hi; i++) {   /* the host was told "zeros" and kept its old arrays (the devices' layers) */
         if (!m->L[i].kda) continue;
         memset(m->kstate[i], 0, (size_t)c->kda_heads * c->kda_hd * c->kda_hd * sizeof(float));
         memset(m->cwq[i], 0, (size_t)c->kda_proj * c->conv_k * sizeof(float));
@@ -246,7 +300,7 @@ static void k3c_recover(Model *m, int dev, int upto) {
     for (int p = from; p < upto; p += chunk) {
         int n = upto - p < chunk ? upto - p : chunk, nb = 0;
         k3_embed(m, m->kvp.fed + p, p, n, h);
-        k3_layers_forward_range(m, h, bres, &nb, p, n, 0, ch->n, NULL, NULL, NULL);   /* the chain's layers: the CPU's are current */
+        k3_layers_forward_range(m, h, bres, &nb, p, n, 0, hi, NULL, NULL, NULL);   /* the devices' layers: the CPU's are current */
     }
     free(h); free(bres);
 }
@@ -345,8 +399,22 @@ static int k3c_fit_now(Model *m, int tier_on, int cuda_on) {
     if (!per || !mat) { free(per); free(mat); return 0; }
     for (int i = 0; i < L; i++) per[i] = k3c_layer_bytes(m, i, rows, &mat[i]);
     k3c_fit_w(&m->lm_head, &tail, &tm);
-    vkc_fit("kimi_k3", L, per, mat, k3c_fixed_bytes(m, rows), tail, &g_k3_fit);
+    size_t fixed = k3c_fixed_bytes(m, rows);
+    vkc_fit("kimi_k3", L, per, mat, fixed, tail, &g_k3_fit);
     g_k3_partial = vkc_fit_partial(&g_k3_fit);
+    /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
+     * n0 (the head stays on the host), with that device's free memory, its pipelines up now */
+    int n0 = g_k3_fit.n;
+    if (g_k3_partial && n0 > 0 && n0 < L && k3c_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
+        vkc_device(1);
+        int n2 = vkc_fit("kimi_k3 dev2", L - n0, per + n0, mat + n0, fixed, 0, &g_k3c_fit2);
+        if (n2 > 0 && !(vkc_init() && vkc_mla_ready() && vkc_kda_ready() && vkc_ares_ready())) {
+            fprintf(stderr, "[VK] kimi_k3 chain: the second device's pipelines did not come up; its layers stay on the CPU\n");
+            n2 = 0;
+        }
+        g_k3c_fit2_on = n2 > 0;
+        vkc_device(0);
+    }
     free(per); free(mat);
     return 1;
 }
@@ -419,23 +487,28 @@ static void k3c_layer_free(K3Chain *ch, Model *m, int i) {
  * cut before it; with the dense weights on the device only, the layers from i keep their
  * host copies (nothing of theirs was dropped yet: that comes after the setup). */
 static void k3c_cut(K3Chain *ch, Model *m, int i, const char *why) {
-    for (int k = i; k < ch->n; k++) k3c_layer_free(ch, m, k);
-    if (ch->n > i) ch->n = i;
+    for (int k = i; k < ch->lo + ch->n; k++) k3c_layer_free(ch, m, k);
+    if (ch->lo + ch->n > i) ch->n = i - ch->lo;
+    if (ch->d) { vkc_fit_shrink("kimi_k3 dev2", &g_k3c_fit2, i - ch->lo, why); return; }
     if (g_k3_dho_layers > i) { g_k3_dho_layers = i; g_k3_dho_head = 0; coli_vk_dense_host_layers(i, m->c.n_layers); }
     vkc_fit_shrink("kimi_k3", &g_k3_fit, i, why);
     g_k3_partial = 1;
 }
 
-static int k3c_setup(Model *m) {
+/* d = 1: the second device's chain, its layers from g_k3_fit.n (device 1 current). */
+static int k3c_setup_dev(Model *m, int d) {
     const Cfg *c = &m->c;
     int L = c->n_layers, D = c->hidden, P = c->kda_proj, LT = c->latent;
     int nbmax = (L + c->res_bs - 1) / c->res_bs;
     const char *why = k3c_unsupported(m);
     if (why) { fprintf(stderr, "[VK] kimi_k3 chain: %s; the CPU runs the layers\n", why); return 0; }
-    int N = g_k3_fit.L > 0 ? g_k3_fit.n : L;
+    VkcFit *fit = d ? &g_k3c_fit2 : &g_k3_fit;
+    const char *nmc = d ? "kimi_k3 dev2" : "kimi_k3";
+    int N = d ? g_k3c_fit2.n : g_k3_fit.L > 0 ? g_k3_fit.n : L, lo = d ? g_k3_fit.n : 0;
     if (N < 1) return 0;
     K3Chain *ch = calloc(1, sizeof *ch);
     if (!ch) return 0;
+    ch->d = d; ch->lo = lo;
     size_t **offs[] = {&ch->o_in, &ch->o_post, &ch->o_asw, &ch->o_msw, &ch->o_qn, &ch->o_kn, &ch->o_conv, &ch->o_kda, &ch->o_latn};
     for (size_t k = 0; k < sizeof offs / sizeof *offs; k++) if (!(*offs[k] = calloc(L, sizeof(size_t)))) return 0;
     ch->kda = calloc(L, sizeof(K3cKda)); ch->ffn = calloc(L, sizeof(K3cFfn)); ch->mla = calloc(L, sizeof(VkcMla));
@@ -444,10 +517,10 @@ static int k3c_setup(Model *m) {
     ch->kv_valid = calloc(L, sizeof(int)); ch->mla_ord = calloc(L, sizeof(int));
     if (!ch->kda || !ch->ffn || !ch->mla || !ch->mg || !ch->kv || !ch->win || !ch->st || !ch->kv_valid || !ch->mla_ord) return 0;
     ch->m = m; ch->nbmax = nbmax; ch->n = N;
-    g_k3c = ch;
+    if (d) g_k3c2 = ch; else g_k3c = ch;
     /* the parameter arena: offsets for the chain's layers and the output mix, then one upload */
     size_t n = 0;
-    for (int i = 0; i < N; i++) {
+    for (int i = lo; i < lo + N; i++) {
         const Layer *l = &m->L[i];
         ch->o_in[i] = n; n += D; ch->o_post[i] = n; n += D; ch->o_asw[i] = n; n += D; ch->o_msw[i] = n; n += D;
         if (l->kda) {
@@ -460,20 +533,22 @@ static int k3c_setup(Model *m) {
     }
     ch->o_osw = n; n += D; ch->o_final = n; n += D;
     if (!(ch->prm = vkc_buf(n * sizeof(float), VKC_DEV))) {
-        k3c_cut(ch, m, 0, "device memory for the parameters refused");
-        vkc_fit_placed("kimi_k3", &g_k3_fit);
+        k3c_cut(ch, m, lo, vkc_lost() ? "the device was lost" : "device memory for the parameters refused");
+        vkc_fit_placed(nmc, fit);
         return 0;
     }
     /* the layers, each whole or the chain stops before it */
-    for (int i = 0; i < N; i++) {
-        if (!k3c_layer_up(ch, m, i, &why)) { k3c_cut(ch, m, i, why); break; }
-        vkc_fit_mark(&g_k3_fit, i);
+    g_k3c_dev = d;
+    for (int i = lo; i < lo + N; i++) {
+        if (!k3c_layer_up(ch, m, i, &why)) { k3c_cut(ch, m, i, vkc_lost() ? "the device was lost" : why); break; }
+        vkc_fit_mark(fit, i - lo);
     }
+    g_k3c_dev = 0;
     N = ch->n;
-    for (int i = 0; i < N; i++) if (!m->L[i].kda) ch->mla_ord[i] = ch->n_mla++;
+    for (int i = lo; i < lo + N; i++) if (!m->L[i].kda) ch->mla_ord[i] = ch->n_mla++;
     float *a = N > 0 ? calloc(n, sizeof(float)) : NULL;
     int ok = a != NULL;
-    for (int i = 0; ok && i < N; i++) {
+    for (int i = lo; ok && i < lo + N; i++) {
         const Layer *l = &m->L[i];
         memcpy(a + ch->o_in[i], l->in_ln, D * sizeof(float));
         memcpy(a + ch->o_post[i], l->post_ln, D * sizeof(float));
@@ -501,17 +576,18 @@ static int k3c_setup(Model *m) {
     free(a);
     if (!ok) {
         if (N > 0) {
-            fprintf(stderr, "[VK] kimi_k3 chain: the parameters did not reach the device; the CPU runs the layers\n");
-            k3c_cut(ch, m, 0, "the parameters did not reach it");
+            if (!d) fprintf(stderr, "[VK] kimi_k3 chain: the parameters did not reach the device; the CPU runs the layers\n");
+            k3c_cut(ch, m, lo, vkc_lost() ? "the device was lost" : "the parameters did not reach it");
         }
         vkc_free(ch->prm); ch->prm = NULL;
-        vkc_fit_placed("kimi_k3", &g_k3_fit);
+        vkc_fit_placed(nmc, fit);
         return 0;
     }
-    vkc_fit_placed("kimi_k3", &g_k3_fit);   /* the layers' matrices only, before the head */
+    vkc_fit_placed(nmc, fit);   /* the layers' matrices only, before the head */
     /* the head goes up with every layer and the tail (the fit's; without a fit, as before);
-     * if the device refuses it the CPU multiplies it from the chain's final rows */
-    if (N == L && (g_k3_fit.L < 1 || g_k3_fit.tail)) {
+     * if the device refuses it the CPU multiplies it from the chain's final rows (the
+     * second device's: the host's always) */
+    if (!d && N == L && (g_k3_fit.L < 1 || g_k3_fit.tail)) {
         if (g_k3_dho && g_k3_fit.L > 0) w_vk_upload(&m->lm_head);
         if (!k3c_w(&m->lm_head, &ch->head)) {
             if (g_k3_fit.L < 1) {
@@ -524,21 +600,25 @@ static int k3c_setup(Model *m) {
     }
     ch->where = K3C_HOST; ch->host_zero = 1;   /* the host's KDA state is the zeros it was allocated with */
     ch->ok = 1;
-    int nkda = 0, nsparse = 0; for (int i = 0; i < N; i++) { nkda += m->L[i].kda; nsparse += m->L[i].sparse; }
+    int nkda = 0, nsparse = 0; for (int i = lo; i < lo + N; i++) { nkda += m->L[i].kda; nsparse += m->L[i].sparse; }
     size_t bytes = 0, tensors = 0;
-    coli_vk_mem_info(&bytes, &tensors);
-    fprintf(stderr, "[VK] kimi_k3 chain: %d layers on the device (%d KDA, %d MLA, %d dense MLP), %d AttnRes blocks, "
-                    "%.1f MiB of parameters, %zu matrices (%.1f MiB) on the device\n", N, nkda, ch->n_mla, N - nsparse, nbmax,
-            n * 4 / 1048576.0, tensors, bytes / 1048576.0);
+    coli_vk_mem_info_dev(d, &bytes, &tensors);
+    if (d) fprintf(stderr, "[VK] kimi_k3 chain: layers %d..%d on the second device (%d KDA, %d MLA, %d dense MLP), %d AttnRes blocks, "
+                           "%.1f MiB of parameters, %zu matrices (%.1f MiB) there\n", lo, lo + N - 1, nkda, ch->n_mla, N - nsparse,
+                   nbmax, n * 4 / 1048576.0, tensors, bytes / 1048576.0);
+    else fprintf(stderr, "[VK] kimi_k3 chain: %d layers on the device (%d KDA, %d MLA, %d dense MLP), %d AttnRes blocks, "
+                         "%.1f MiB of parameters, %zu matrices (%.1f MiB) on the device\n", N, nkda, ch->n_mla, N - nsparse, nbmax,
+                 n * 4 / 1048576.0, tensors, bytes / 1048576.0);
     return 1;
 }
+static int k3c_setup(Model *m) { return k3c_setup_dev(m, 0); }
 
 /* scratch for `rows` rows (grows, never shrinks) */
 static int k3c_scratch(K3Chain *ch, const Model *m, int rows) {
     const Cfg *c = &m->c;
     int D = c->hidden, P = c->kda_proj, H = c->kda_heads, LT = c->latent, E = c->n_experts, R = c->qk_rope;
     int SI = c->moe_inter * c->n_shared, MI = SI > c->dense_inter ? SI : c->dense_inter;
-    int mfull = -1; for (int i = 0; i < ch->n; i++) if (!m->L[i].kda) { mfull = i; break; }   /* the chain's layers */
+    int mfull = -1; for (int i = ch->lo; i < ch->lo + ch->n; i++) if (!m->L[i].kda) { mfull = i; break; }   /* the chain's layers */
     size_t r = (size_t)rows;
     ch->kvd_layer = r * (c->kv_lora + R);
     int ok = (mfull < 0 || g_k3c_count >= 0 || vkc_mla_scratch(&ch->sc, &ch->mla[mfull], rows)) &&
@@ -592,17 +672,17 @@ static int k3c_mirror(K3Chain *ch, const Model *m, int rows) {
     const Cfg *c = &m->c;
     if (ch->cap == m->max_t) return 1;
     size_t row = (size_t)(c->kv_lora + c->qk_rope) * sizeof(float);
-    if (ch->n_mla && !vkc_kv_plan(&ch->ks, "kimi_k3", ch->n_mla, row, m->max_t, rows, 0, (size_t)ch->n_mla * ch->dev_rows * row))
+    if (ch->n_mla && !vkc_kv_plan(&ch->ks, k3c_name(ch), ch->n_mla, row, m->max_t, rows, 0, (size_t)ch->n_mla * ch->dev_rows * row))
         return 0;
     int dr = ch->ks.on ? ch->ks.rows : m->max_t;
-    for (int i = 0; i < ch->n; i++) {
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) {
         if (m->L[i].kda) continue;
         vkc_free(ch->kv[i].lat); vkc_free(ch->kv[i].rope);
         ch->kv[i] = (VkcMlaCache){NULL, NULL, 0};
         ch->kv_valid[i] = 0;
     }
     ch->cap = 0; ch->dev_rows = 0;
-    for (int i = 0; i < ch->n; i++) {
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) {
         if (m->L[i].kda) continue;
         ch->kv[i].lat = vkc_buf((size_t)dr * c->kv_lora * sizeof(float), VKC_DEV);
         if (c->qk_rope > 0) ch->kv[i].rope = vkc_buf((size_t)dr * c->qk_rope * sizeof(float), VKC_DEV);
@@ -619,7 +699,7 @@ static int k3c_push(K3Chain *ch, const Model *m, int pb, int n_rows) {
     const Cfg *c = &m->c; int ok = 1, K = c->kv_lora, R = c->qk_rope;
     if (ch->where == K3C_HOST) {
         size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd, nw = (size_t)c->kda_proj * c->conv_k;
-        for (int i = 0; i < ch->n && ok; i++) {
+        for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
             if (!m->L[i].kda) continue;
             if (ch->host_zero) ok = vkc_zero(ch->st[i], 0, ns) && vkc_zero(ch->win[i], 0, 3 * nw);
             else ok = vkc_write(ch->st[i], 0, m->kstate[i], ns * sizeof(float)) &&
@@ -629,7 +709,7 @@ static int k3c_push(K3Chain *ch, const Model *m, int pb, int n_rows) {
         }
         ch->where = K3C_BOTH; ch->host_pos = pb;
     }
-    for (int i = 0; i < ch->n && ok; i++) {
+    for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
         if (!m->L[i].kda && ch->ks.on) {   /* the split: the window placed, its rows below pb uploaded */
             VkcKvPart pt[2] = {{1, K, m->Lc[i], 0, ch->kv[i].lat, 0}, {1, R, m->Rc[i], 0, ch->kv[i].rope, 0}};
             vkc_kv_place(&ch->ks, ch->mla_ord[i], pb, n_rows);
@@ -721,49 +801,49 @@ static void k3c_moe_host(K3Chain *ch, Model *m, int li, int n) {
 }
 
 /* The prompt block the engine hands the chain: its chunk, when the chain runs with a
- * chunk from the budget (vkc_chunk_auto) and K3_CHUNK is not set; 0 = K3_CHUNK's (32). */
+ * chunk from the budget (vkc_chunk_auto) and K3_CHUNK is not set, the smaller of the two
+ * chains'; 0 = K3_CHUNK's (32). */
 static int k3c_prefill_rows(const Model *m) {
-    K3Chain *ch = g_k3c;
+    K3Chain *ch = g_k3c, *ch2 = g_k3c2;
     if (!g_k3c_on || !ch || !ch->ok || ch->failed || ch->m != m || getenv("K3_CHUNK") || !vkc_chunk_auto()) return 0;
     if (m->trace || g_k3_val_layer >= 0 || g_k3_dfp) return 0;
     if (!k3c_mirror(ch, m, 1)) return 0;
     int rows = k3c_chunk_rows(ch, m);
-    return ch->ks.on && rows > ch->ks.chunk ? ch->ks.chunk : rows;
-}
-/* The chain's layers (every layer, or a partial chain's first ch->n) for C rows of
- * `hidden` (positions pos0..). Every layer: then the output mix and the final norm, the
- * rows into *fin (when need_rows, or when the head stays on the CPU), the last row's
- * logits into *last (the head on the device). A partial chain: each row's AttnRes state
- * after its last layer (the prefix into hidden, the block snapshots into bres, their
- * count into *nb_out), from which the caller's CPU loop runs the other layers and the
- * head. Returns the layers it ran; 0: not taken (the CPU runs every layer; nothing the
- * caller holds changed). On a cancel (poll), nonzero with *cancelled set: the state is
- * the caller's to reset. */
-static int k3c_forward(Model *m, float *hidden, float *bres, int *nb_out, int pos0, int C, int need_rows, float **fin_out,
-                       float **last_out, K3CancelPoll poll, void *pctx, int *cancelled) {
-    K3Chain *ch = g_k3c;
-    if (!g_k3c_on || !ch || !ch->ok || ch->failed || ch->m != m) return 0;
-    if (g_k3c_on == COLI_VK_CHAIN_PREFILL && C <= 2) return 0;   /* prompts only: decode on the CPU */
-    if (m->trace || g_k3_val_layer >= 0 || g_k3_dfp) {
-        static int said = 0;
-        if (!said++) fprintf(stderr, "[VK] kimi_k3 chain: a validation dump reads every layer on the host; the CPU runs the layers\n");
-        return 0;
+    if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;
+    if (ch2 && ch2->ok && !ch2->failed) {
+        vkc_device(1);
+        if (k3c_mirror(ch2, m, 1)) {
+            int r2 = k3c_chunk_rows(ch2, m);
+            if (ch2->ks.on && r2 > ch2->ks.chunk) r2 = ch2->ks.chunk;
+            if (r2 < rows) rows = r2;
+        }
+        vkc_device(0);
     }
-    const Cfg *c = &m->c; int L = c->n_layers, N = ch->n, D = c->hidden, E = c->n_experts, LT = c->latent;
-    int part = N < L, nbx = ch->nbmax;
+    return rows;
+}
+/* One chain's layers (lo..lo+n-1, on its device, current) for C rows (positions
+ * pos0..), from each row's AttnRes state as it comes in: the prefix in `hidden`, *nb
+ * block snapshots in `bres` (none at layer 0). Its last layer the model's last: the
+ * output mix and the final norm, the rows into *fin (when need_rows, or when the head
+ * stays on the host), the last row's logits into *last (the head on the device). Else
+ * each row's AttnRes state after its last layer back into hidden, bres and *nb. Returns
+ * ch->n; 0: not taken (*lost = 1: a frame failed, the device marked lost; else memory
+ * refused), nothing the caller holds changed. On a cancel (poll), ch->n with *cancelled
+ * set: the state is the caller's to reset. */
+static int k3c_forward_seg(Model *m, K3Chain *ch, float *hidden, float *bres, int *nb_io, int pos0, int C, int need_rows,
+                           float **fin_out, float **last_out, K3CancelPoll poll, void *pctx, int *cancelled, int *lost) {
+    *lost = 0;
+    const Cfg *c = &m->c; int L = c->n_layers, N = ch->n, lo = ch->lo, hi = lo + N, D = c->hidden, E = c->n_experts, LT = c->latent;
+    int part = hi < L, nbx = ch->nbmax, nb_in = *nb_io;
     if (!part && !ch->head) need_rows = 1;   /* the head on the CPU: it reads the final rows */
-    int dev0 = ch->where == K3C_DEV, dev_start = ch->dev_pos;
-    if (vkc_lost()) { k3c_recover(m, dev0, dev_start); return 0; }
     int mirror_ok = k3c_mirror(ch, m, 1);
     int CH = mirror_ok ? k3c_chunk_rows(ch, m) : 1, rows = C < CH ? C : CH;
     if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
     if (!mirror_ok || !k3c_scratch(ch, m, rows) ||
         (part && !(k3c_res(&ch->xo, (size_t)rows * D, VKC_DOWN) && k3c_res(&ch->bo, (size_t)rows * nbx * D, VKC_DOWN)))) {
-        if (vkc_lost()) { k3c_recover(m, dev0, dev_start); return 0; }   /* lost while its buffers were made */
-        fprintf(stderr, "[VK] kimi_k3 chain: device memory for %d rows at %d positions refused; the CPU runs the layers\n",
-                rows, m->max_t);
-        k3c_cpu_step(m, pos0);
-        ch->failed = 1; g_k3c_on = 0;
+        if (vkc_lost()) { *lost = 1; return 0; }   /* lost while its buffers were made */
+        fprintf(stderr, "[VK] %s chain: device memory for %d rows at %d positions refused; the CPU runs the layers\n",
+                k3c_name(ch), rows, m->max_t);
         return 0;
     }
     float *fin = need_rows && !part ? falloc((int64_t)C * D) : NULL, *last = !part && ch->head ? falloc(c->vocab) : NULL;
@@ -774,10 +854,11 @@ static int k3c_forward(Model *m, float *hidden, float *bres, int *nb_out, int po
     vkc_gemm_rows(-1);
     for (int c0 = 0; c0 < C; c0 += rows) {
         int n = C - c0 < rows ? C - c0 : rows, pb = pos0 + c0, end = c0 + n == C;
-        if (!vkc_begin() || !k3c_push(ch, m, pb, n) || !vkc_write(ch->x, 0, hidden + (size_t)c0 * D, (size_t)n * D * sizeof(float)))
+        if (!vkc_begin() || !k3c_push(ch, m, pb, n) || !vkc_write(ch->x, 0, hidden + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
+            (nb_in > 0 && !vkc_write(ch->bres, 0, bres + (size_t)c0 * nbx * D, (size_t)n * nbx * D * sizeof(float))))
             goto lost;
-        int ok = 1, pending = 0, pulled = 0, nb = 0;
-        for (int i = 0; i < N && ok; i++) {
+        int ok = 1, pending = 0, pulled = lo, nb = nb_in;
+        for (int i = lo; i < hi && ok; i++) {
             const Layer *l = &m->L[i];
             if (pending) { ok = k3c_join(ch, m, i - 1, n); pending = 0; }
             int snap = i % c->res_bs == 0;
@@ -839,7 +920,7 @@ static int k3c_forward(Model *m, float *hidden, float *bres, int *nb_out, int po
             ok = ok && vkc_begin();
             pending = 1;
         }
-        if (ok && pending) ok = k3c_join(ch, m, N - 1, n);
+        if (ok && pending) ok = k3c_join(ch, m, hi - 1, n);
         nb_end = nb;
         if (part)   /* the handoff: each row's prefix and its block snapshots after the chain's last layer */
             ok = ok && vkc_copy(ch->xo, 0, ch->x, 0, (size_t)n * D) && vkc_copy(ch->bo, 0, ch->bres, 0, (size_t)n * nbx * D);
@@ -851,13 +932,13 @@ static int k3c_forward(Model *m, float *hidden, float *bres, int *nb_out, int po
         }
         ok = ok && vkc_submit(1);
         if (!ok) goto lost;
-        k3c_pull(ch, m, pulled, N, pb, n);
+        k3c_pull(ch, m, pulled, hi, pb, n);
         if (part) {
             memcpy(xh + (size_t)c0 * D, vkc_ptr(ch->xo), (size_t)n * D * sizeof(float));
             memcpy(bh + (size_t)c0 * nbx * D, vkc_ptr(ch->bo), (size_t)n * nbx * D * sizeof(float));
         }
         if (need_rows && fin) memcpy(fin + (size_t)c0 * D, vkc_ptr(ch->find), (size_t)n * D * sizeof(float));
-        for (int i = 0; i < N; i++) if (!m->L[i].kda) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->mla_ord[i], pb + n); }
+        for (int i = lo; i < hi; i++) if (!m->L[i].kda) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->mla_ord[i], pb + n); }
         ch->where = K3C_DEV;
         if (end && last) memcpy(last, vkc_ptr(ch->outd), (size_t)c->vocab * sizeof(float));
     }
@@ -866,28 +947,100 @@ static int k3c_forward(Model *m, float *hidden, float *bres, int *nb_out, int po
     if (part) {
         memcpy(hidden, xh, (size_t)C * D * sizeof(float));
         memcpy(bres, bh, (size_t)C * nbx * D * sizeof(float));
-        *nb_out = nb_end;
+        *nb_io = nb_end;
         free(xh); free(bh);
     }
     *fin_out = fin; *last_out = last;
     return N;
-lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
+lost:   /* a frame failed: the device is gone (or would not take a command) */
     free(fin); free(last); free(xh); free(bh);
-    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost(); }
-    ch->where = dev0 ? K3C_DEV : K3C_HOST;   /* the state as it was when this forward began */
-    k3c_recover(m, dev0, dev_start);
+    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    *lost = 1;
     return 0;
+}
+/* The devices' layers (every layer, or a partial chain's first ch->n, and the second
+ * device's after them) for C rows of `hidden` (positions pos0..), as k3c_forward_seg
+ * describes, from layer 0. Returns the layers that ran; 0: not taken (the CPU runs every
+ * layer; nothing the caller holds changed). */
+static int k3c_forward(Model *m, float *hidden, float *bres, int *nb_out, int pos0, int C, int need_rows, float **fin_out,
+                       float **last_out, K3CancelPoll poll, void *pctx, int *cancelled) {
+    K3Chain *ch = g_k3c, *ch2 = g_k3c2;
+    if (!g_k3c_on || !ch || !ch->ok || ch->failed || ch->m != m) return 0;
+    if (g_k3c_on == COLI_VK_CHAIN_PREFILL && C <= 2) return 0;   /* prompts only: decode on the CPU */
+    if (m->trace || g_k3_val_layer >= 0 || g_k3_dfp) {
+        static int said = 0;
+        if (!said++) fprintf(stderr, "[VK] kimi_k3 chain: a validation dump reads every layer on the host; the CPU runs the layers\n");
+        return 0;
+    }
+    if (ch2 && (!ch2->ok || ch2->failed || ch2->m != m || ch2->lo != ch->lo + ch->n)) ch2 = NULL;
+    int D = m->c.hidden;
+    int dev0 = ch->where == K3C_DEV, dev2 = ch2 && ch2->where == K3C_DEV, dev_start = ch->dev_pos, lost2 = 0;
+    if (ch2) { vkc_device(1); lost2 = vkc_lost(); vkc_device(0); }
+    if (vkc_lost() || lost2) { k3c_recover(m, dev0, dev2, dev_start, lost2 ? ch2 : ch); return 0; }
+    /* the rows as they came in: the primary's handoff replaces them, and if the second
+     * device is lost the CPU runs the forward again from these */
+    float *keep = ch2 ? falloc((int64_t)C * D) : NULL;
+    if (keep) memcpy(keep, hidden, (size_t)C * D * sizeof(float));
+    int lost = 0, nb = 0;
+    float *fin = NULL, *last = NULL;
+    int r = k3c_forward_seg(m, ch, hidden, bres, &nb, pos0, C, need_rows, &fin, &last, poll, pctx, cancelled, &lost);
+    if (!r) {
+        free(keep);
+        if (lost) {
+            ch->where = dev0 ? K3C_DEV : K3C_HOST;   /* the state as it was when this forward began */
+            k3c_recover(m, dev0, dev2, dev_start, ch);
+            return 0;
+        }
+        k3c_cpu_step(m, pos0);   /* memory refused: the CPU from here on, the state current first */
+        ch->failed = 1; g_k3c_on = 0;
+        return 0;
+    }
+    if (!ch2 || (cancelled && *cancelled)) { free(keep); *nb_out = nb; *fin_out = fin; *last_out = last; return r; }
+    vkc_device(1);
+    int r2 = k3c_forward_seg(m, ch2, hidden, bres, &nb, pos0, C, need_rows, &fin, &last, poll, pctx, cancelled, &lost);
+    vkc_device(0);
+    if (lost) {
+        memcpy(hidden, keep, (size_t)C * D * sizeof(float));
+        free(keep);
+        ch->where = dev0 ? K3C_DEV : K3C_HOST; ch2->where = dev2 ? K3C_DEV : K3C_HOST;
+        k3c_recover(m, dev0, dev2, dev_start, ch2);
+        return 0;
+    }
+    if (!r2) {   /* memory refused there: its layers on the CPU from this step on, their state current first */
+        int reads = 0;
+        if (ch2->where == K3C_DEV && !k3c_sync_one(m, ch2, &reads)) {   /* lost on the way: the forward again, from its input */
+            memcpy(hidden, keep, (size_t)C * D * sizeof(float));
+            free(keep);
+            if (reads) { ch->host_pos = 0; ch->host_zero = 1; }
+            ch->where = dev0 ? K3C_DEV : K3C_HOST;
+            k3c_recover(m, dev0, 1, dev_start, ch2);
+            return 0;
+        }
+        free(keep);
+        k3c_cpu_one(m, ch2, pos0);
+        ch2->failed = 1;
+        *nb_out = nb;
+        return r;
+    }
+    free(keep);
+    *nb_out = nb; *fin_out = fin; *last_out = last;
+    return r + r2;
 }
 
 static void k3c_report(void) {
-    K3Chain *ch = g_k3c;
-    if (!ch || !ch->ok || !ch->forwards) return;
-    VkcStats st; vkc_stats(&st);
-    fprintf(stderr, "[VK] kimi_k3 chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
-                    "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
-            ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms, st.dev_bytes / 1048576.0);
-    vkc_kv_report(&ch->ks);
-    vkc_prof_print();
+    for (int d = 0; d < 2; d++) {
+        K3Chain *ch = k3c_of(d);
+        if (!ch || !ch->ok || !ch->forwards) continue;
+        int was = vkc_device(d);
+        VkcStats st; vkc_stats(&st);
+        fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
+                        "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
+                k3c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
+                st.dev_bytes / 1048576.0);
+        vkc_kv_report(&ch->ks);
+        vkc_prof_print();
+        vkc_device(was);
+    }
 }
 
 /* COLI_VK_CHAIN at startup, before the tier sizes itself: the decision, the pipelines,
@@ -910,12 +1063,25 @@ static void k3c_start(Model *m, int tier_on) {
     }
     if (no) fprintf(stderr, "[VK] kimi_k3: %s: the dense chain stays off\n", no);
     if (!on || no) return;
+    int n0 = g_k3_fit.n;
     if (!k3c_setup(m)) return;
     g_k3c_on = on;
+    if (g_k3c_fit2_on) {
+        vkc_device(1);
+        if (g_k3c->n < n0) {
+            /* the primary placed fewer layers than its fit: the second device's would not
+             * follow them, so they stay on the CPU too */
+            fprintf(stderr, "[VK] kimi_k3 chain: the primary device stopped before layer %d; layers %d..%d stay on the CPU, "
+                            "not on the second device\n", n0, n0, n0 + g_k3c_fit2.n - 1);
+            g_k3c_fit2_on = 0;
+            vkc_shutdown();
+        } else if (!k3c_setup_dev(m, 1)) { g_k3c_fit2_on = 0; vkc_shutdown(); }
+        vkc_device(0);
+    }
 }
 /* After the tier's: at exit the chain goes before the device. */
 static void k3c_atexit(void) {
-    if (g_k3c_inited) atexit(vkc_shutdown);
+    if (g_k3c_inited) atexit(vkc_shutdown_all);
 }
 /* The per-matrix path is about to put the shared experts on the device (no tier after
  * all): the chain's copies become its own. */

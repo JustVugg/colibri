@@ -39,7 +39,7 @@
 # back as the CPU computes it. Each configuration is gated on two things:
 #   - the Vulkan run gives the tokens of the CPU run with the same snapshot and
 #     settings (and, where the engine has one, passes its own oracle);
-#   - its "[VK] <engine>: N matmuls on the GPU" line has N > 0, because a hook that
+#   - its per-matrix and dense-chain matmul counts sum to N > 0, because a hook that
 #     declines every matrix would otherwise pass the first gate trivially. A
 #     configuration of the routed-expert tier with the dense trunk on the CPU (the
 #     default on Lavapipe while the tier is on, see dense_where) gates on its count of
@@ -62,11 +62,13 @@ fail() { echo "FAIL: $*"; exit 1; }
 # (-march=native) GCC keeps 64-byte aligned locals there and stores them with
 # vmovdqa64, which faults (c/Makefile, ASAN_ENV, has the details).
 
-# vk_count <engine> <log>: N from the last "[VK] <engine>: N matmuls on the GPU" line
+# vk_count <engine> <log>: the latest per-matrix and dense-chain matmul counts.
+# The counters are independent and cumulative; sum their last reports, not turns.
 vk_count() {
-  local n
+  local n chain
   n=$(sed -n "s/^\[VK\] $1: \([0-9][0-9]*\) matmuls on the GPU.*/\1/p" "$2" | tail -1)
-  echo "${n:-0}"
+  chain=$(sed -n "s/^\[VK\] $1 chain: .* ops, \([0-9][0-9]*\) matmuls,.*/\1/p" "$2" | tail -1)
+  echo "$(( ${n:-0} + ${chain:-0} ))"
 }
 need_gpu() {  # <engine> <log> <tag>
   [ "$(vk_count "$1" "$2")" -gt 0 ] || { cat "$2"; fail "$3: no matmul ran on the device"; }
@@ -81,12 +83,14 @@ same_tokens() {  # <cpu log> <vk log> <tag>: the engines' "C engine" token lines
 # then the expert batch and the weight pool in the same harness, and the routed-expert
 # tier (vk_tier.c) on a synthetic model in every source format.
 shader_formats() {
-  make tests/test_vk_tier VK=1   # every shader too: the harness's expert batch needs them
+  make tests/test_vk_tier tests/test_glm53_vk_f32 VK=1   # every shader too: the harness's expert batch needs them
   cc -O2 -pthread -DVK_TEST backend_vulkan.c -o vk_test -lvulkan -lm
   COLI_VK_TEST_MATMUL_ONLY=1 ./vk_test shaders/qmatmul.spv | tee vk_test.log
   tail -1 vk_test.log | grep -qx PASS || fail "qmatmul format cases"
   ./tests/test_vk_tier shaders/qmatmul.spv | tee vk_tier.log
   tail -1 vk_tier.log | grep -qx PASS || fail "routed-expert tier"
+  ./tests/test_glm53_vk_f32
+  COLI_VK_GEMM_MIN_S=0 ./tests/test_glm53_vk_f32
 }
 
 # Staged uploads (docs/vulkan.md, "Memory placement without Resizable BAR"): resident
@@ -473,12 +477,25 @@ family_qwen() {
   EVICT=1 tier_gate qwen38 "qwen38 tier, a budget of two experts" OMP_NUM_THREADS=2 Q38_PREFILL_BATCH=0 COLI_VK_TIER_GB=0.0000065 SNAP=qwen38_tiny_fp8 -- 1 8 qwen38_tiny_fp8/ref.json
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny_fp8_mtp --fp8-experts --mtp
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4_mtp --fp8-experts --int4-experts --expert-gain 3 --mtp
+  # the MTP head's layer as the tier's extra layer (COLI_VK_TIER_MTP=1; the default on a
+  # discrete GPU): its experts (FP8, beside the int4 sidecar on the second fixture) run
+  # on the device too. Lavapipe shares the RAM, where the default keeps them on the CPU;
+  # the tokens are the same either way.
   for fx in qwen38_tiny_fp8_mtp qwen38_tiny_int4_mtp; do
     for batch in 0 1; do
       D=; [ $batch = 1 ] && D=COLI_VK_DENSE=1
-      tier_gate qwen38 "qwen38 tier MTP $fx batch=$batch" OMP_NUM_THREADS=2 $D Q38_MTP=1 Q38_PREFILL_BATCH=$batch SNAP=$fx -- 2 8 $fx/ref.json
+      tier_gate qwen38 "qwen38 tier MTP $fx batch=$batch" OMP_NUM_THREADS=2 $D Q38_MTP=1 COLI_VK_TIER_MTP=1 Q38_PREFILL_BATCH=$batch SNAP=$fx -- 2 8 $fx/ref.json
+      mtp_on_device "qwen38 tier MTP $fx batch=$batch"
     done
   done
+  tier_gate qwen38 "qwen38 tier MTP head on the CPU (shared RAM default)" OMP_NUM_THREADS=2 Q38_MTP=1 Q38_PREFILL_BATCH=0 SNAP=qwen38_tiny_int4_mtp -- 2 8 qwen38_tiny_int4_mtp/ref.json
+  ! grep -aq 'extra layers' vk.log || { grep -a '\[VK\] tier' vk.log; fail "shared RAM: the MTP head's layer went on the tier by default"; }
+  echo "OK shared RAM: the MTP head's experts on the CPU by default"
+}
+mtp_on_device() {  # <tag> [log, vk.log]: the tier served experts of the MTP head's layers (its extra layers)
+  local log=${2:-vk.log} n; n=$(grep -a -o 'extra layers ([0-9]*): [0-9]*' "$log" | tail -1 | grep -o '[0-9]*$')
+  [ "${n:-0}" -gt 0 ] || { grep -a '\[VK\] tier' "$log"; fail "$1: no expert of the MTP head's layers ran on the device"; }
+  echo "OK $1: $(grep -a -o 'extra layers ([0-9]*): [0-9]* of [0-9]* routed experts on the device' "$log" | tail -1)"
 }
 
 # The routed-expert tier under ASan and UBSan: a sanitized VK=1 build of both qwen
@@ -522,7 +539,8 @@ family_qwen_sanitize() {
     san qwen38 "asan qwen38 int4 batch=$b" $D Q38_PREFILL_BATCH=$b SNAP=qwen38_tiny_int4 ./qwen38 1 8 qwen38_tiny_int4/ref_int4.json
   done
   san qwen38 "asan qwen38 eviction" Q38_PREFILL_BATCH=0 COLI_VK_TIER_GB=0.0000065 SNAP=qwen38_tiny_fp8 ./qwen38 1 8 qwen38_tiny_fp8/ref.json
-  san qwen38 "asan qwen38 MTP" COLI_VK_DENSE=1 Q38_MTP=1 Q38_PREFILL_BATCH=0 SNAP=qwen38_tiny_int4_mtp ./qwen38 2 8 qwen38_tiny_int4_mtp/ref.json
+  san qwen38 "asan qwen38 MTP" COLI_VK_DENSE=1 Q38_MTP=1 COLI_VK_TIER_MTP=1 Q38_PREFILL_BATCH=0 SNAP=qwen38_tiny_int4_mtp ./qwen38 2 8 qwen38_tiny_int4_mtp/ref.json
+  mtp_on_device "asan qwen38 MTP" san.log
   san qwen38 "asan qwen38 tier alone" COLI_VK_DENSE=0 SNAP=qwen38_tiny_int4 ./qwen38 4 8 qwen38_tiny_int4/ref_int4.json
   make clean >/dev/null 2>&1 || true
 }
@@ -915,9 +933,17 @@ family_deepseek() {
   }
   for cap in 1 2 8; do v41_tier "cap=$cap" SNAP=dsv41_tiny ./deepseek_v41 $cap dsv41_tiny/ref.json; done
   for cap in 2 8; do v41_tier "40-token prompt cap=$cap" SNAP=dsv41_long ./deepseek_v41 $cap dsv41_long/ref.json; done
-  # DSpark: the drafts stay on the CPU, the verify rows of the backbone take the device
+  # DSpark: the verify rows of the backbone take the device, and the drafts stay on the
+  # CPU (the default on Lavapipe, which shares the RAM); with COLI_VK_TIER_MTP=1 (the
+  # default on a discrete GPU) the stages are the tier's extra layers, their experts on
+  # the device too
   for force in 1 2 3 4 5; do
     v41_tier "DSpark spec=$force" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 1 dsv41_tiny/ref.json
+    ! grep -aq 'extra layers' v41-vk.err || { grep -a '\[VK\] tier' v41-vk.err; fail "deepseek_v41 DSpark spec=$force: the stages went on the tier by default on shared RAM"; }
+  done
+  for force in 1 3 5; do
+    v41_tier "DSpark stages on the tier spec=$force" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force COLI_VK_TIER_MTP=1 ./deepseek_v41 1 dsv41_tiny/ref.json
+    mtp_on_device "deepseek_v41 DSpark stages on the tier spec=$force" v41-vk.err
   done
   EVICT=1 v41_tier "a budget of three experts" COLI_VK_TIER_GB=0.00005 SNAP=dsv41_long ./deepseek_v41 8 dsv41_long/ref.json
   v41_tier "trunk on the device too" COLI_VK_DENSE=1 SNAP=dsv41_long ./deepseek_v41 2 dsv41_long/ref.json
@@ -1066,6 +1092,8 @@ PY
   local cap force p
   for cap in 1 8; do san deepseek_v41 "asan deepseek_v41 cap=$cap" SNAP=dsv41_long ./deepseek_v41 $cap dsv41_long/ref.json; done
   for force in 2 4; do san deepseek_v41 "asan deepseek_v41 DSpark spec=$force" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 1 dsv41_tiny/ref.json; done
+  san deepseek_v41 "asan deepseek_v41 DSpark stages on the tier" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=3 COLI_VK_TIER_MTP=1 ./deepseek_v41 1 dsv41_tiny/ref.json
+  mtp_on_device "asan deepseek_v41 DSpark stages on the tier" san.log
   san deepseek_v41 "asan deepseek_v41 eviction" COLI_VK_TIER_GB=0.00005 SNAP=dsv41_long ./deepseek_v41 8 dsv41_long/ref.json
   san deepseek_v41 "asan deepseek_v41 trunk on the device" COLI_VK_DENSE=1 SNAP=dsv41_tiny ./deepseek_v41 2 dsv41_tiny/ref.json
   p=$($PY -c 'import json; c=json.load(open("deepseek_v4_tiny_t/ref.json"))["cases"]["long"]; print("".join("<t%03d>" % t for t in c["prompt_ids"]))')
@@ -1480,6 +1508,17 @@ family_glm() {
   cmp -s <(grep -a '^GLM C engine' cpu.log) <(grep -a '^GLM C engine' vk.log) || { cat vk.log; fail "colibri COLI_VK_TIER=0: tokens differ"; }
   ! grep -qa '^\[VK\] tier colibri' vk.log || { cat vk.log; fail "colibri COLI_VK_TIER=0: the tier started"; }
   echo "OK colibri COLI_VK_TIER=0: tokens = CPU, no tier"
+  # the MTP head's layer as the tier's extra layer (COLI_VK_TIER_MTP=1, the default on a
+  # discrete GPU): its experts f32 and quantized at load, two drafts; Lavapipe shares the
+  # RAM, where the default keeps them on the CPU
+  $PY tools/make_glm_mtp_tiny.py --src glm_tiny --out glm_tiny_mtp > /dev/null && cp ref_glm.json glm_tiny_mtp/
+  glm_tier "colibri MTP head on the tier, f32" glm_tiny_mtp glm_tiny_mtp/ref_glm.json DRAFT=2 COLI_VK_TIER_MTP=1 -- 64 16 16
+  mtp_on_device "colibri MTP head on the tier, f32"
+  glm_tier "colibri MTP head on the tier, 4-bit" glm_tiny_mtp glm_tiny_mtp/ref_glm.json DRAFT=2 IDOT=0 COLI_VK_TIER_MTP=1 -- 2 4 4
+  mtp_on_device "colibri MTP head on the tier, 4-bit"
+  glm_tier "colibri MTP head, shared RAM default" glm_tiny_mtp glm_tiny_mtp/ref_glm.json DRAFT=2 -- 64 16 16
+  ! grep -aq 'extra layers' vk.log || { grep -a '\[VK\] tier' vk.log; fail "colibri: the MTP head's layer went on the tier by default on shared RAM"; }
+  echo "OK colibri shared RAM: the MTP head's experts on the CPU by default"
 
   # glm53: its int4-gs64 streaming container (swiglu_limit 10), dense matrices f32 and int4
   local ids
@@ -1530,6 +1569,9 @@ family_glm_sanitize() {
   HIST=1 gsan colibri "asan colibri tier + COLI_VK_DEV2" glm_tiny_i4r SNAP=glm_tiny_i4r REF=glm_tiny_i4r/ref_glm.json COLI_VK_EXPERTS=4 COLI_VK_DEV2=0 ./colibri 64 4 4
   gsan colibri "asan colibri int4 at load, PIPE=1" glm_tiny SNAP=glm_tiny REF=ref_glm.json PIPE=1 ./colibri 1 4 4
   gsan colibri "asan colibri int8 at load, PILOT=1" glm_tiny SNAP=glm_tiny REF=ref_glm.json PILOT=1 ./colibri 2 8 8
+  $PY tools/make_glm_mtp_tiny.py --src glm_tiny --out glm_tiny_mtp > /dev/null && cp ref_glm.json glm_tiny_mtp/
+  gsan colibri "asan colibri MTP head on the tier" glm_tiny_mtp SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 IDOT=0 COLI_VK_TIER_MTP=1 ./colibri 2 4 4
+  mtp_on_device "asan colibri MTP head on the tier" san.log
   local ids
   ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
   gsan glm53 "asan glm53 decode" - GLM53_BITS=32 ./glm53 --model glm53_stream-i4 --ids 5,7,9,11,13,17,19,23 --greedy 20
@@ -2170,8 +2212,9 @@ family_glm_chain() {
   COLI_VK_CHAIN=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32
   # a pin restored over rows another branch rewrote: the KDA state goes up from the pin,
   # the MLA rows' watermark comes down (the tier off and the scores within 1e-5: two
-  # engine processes, see vulkan_partial_glm.sh)
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage COLI_VK_TIER=0 $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny --tol 1e-5
+  # engine processes, see vulkan_partial_glm.sh; the per-row GEMV for every prompt
+  # length, so a cold prompt and a short resumed tail take the same kernels)
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_GEMM_MIN_S=0 COLI_USAGE=$PWD/chain.usage COLI_VK_TIER=0 $PY tests/glm53_pin_branch_harness.py --binary ./glm53 --fixture glm53_mm_tiny --tol 1e-5
   unset OMP_NUM_THREADS CAP_RAISE
 }
 
@@ -2520,6 +2563,15 @@ v4_chain_gate() {
     frames=$(sed -n 's/^\[VK\] deepseek_v4 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' v4-vk.err | tail -1)
     [ -n "$frames" ] && [ "$frames" -gt "$FAULT_BACK" ] || { cat v4-vk.err; fail "$tag: no fault-free run to count frames from"; }
     fault=("COLI_VK_CHAIN_FAULT=$((frames - FAULT_BACK + 1))")
+  elif [ -n "${FAULT2_BACK:-}" ]; then   # the second device's frames (vulkan_layers_dev2.sh); 0: its first, the setup
+    fault=("COLI_VK_CHAIN_FAULT2=1")
+    if [ "$FAULT2_BACK" -gt 0 ]; then
+      rm -f "$fx/.coli_usage"
+      env "$@" COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./deepseek_v4 "./$fx" "$p" --raw-prompt --max-tokens "$mt" > /dev/null 2> v4-vk.err || true
+      frames=$(sed -n 's/^\[VK\] deepseek_v4 dev2 chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' v4-vk.err | tail -1)
+      [ -n "$frames" ] && [ "$frames" -gt "$FAULT2_BACK" ] || { cat v4-vk.err; fail "$tag: no fault-free run to count frames from"; }
+      fault=("COLI_VK_CHAIN_FAULT2=$((frames - FAULT2_BACK + 1))")
+    fi
   fi
   rm -f "$fx/.coli_usage"
   env "$@" "${fault[@]}" DUMP=vk.f32 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} \
@@ -2543,6 +2595,9 @@ PY
     "$(grep -ao 'v4_dspark attempts=[0-9]* drafted=[0-9]* accepted=[0-9]*' v4-vk.err)" ] || { grep -a v4_dspark v4-cpu.err v4-vk.err; fail "$tag: the drafts went otherwise"; }
   if [ -n "${FAULT_BACK:-}" ]; then
     grep -q "deepseek_v4 chain: the device was lost" v4-vk.err || { cat v4-vk.err; fail "$tag: no loss was handled"; }
+  elif [ -n "${FAULT2_BACK:-}" ]; then
+    grep -q "deepseek_v4 dev2 chain: \(0 of [0-9]* layers on the device: the chain stays off (layer 0 did not reach the device: \)\?the device was lost" v4-vk.err ||
+      { cat v4-vk.err; fail "$tag: the second device's loss was not taken over"; }
   else
     [ "$(chain_count deepseek_v4 v4-vk.err)" -gt 0 ] || { cat v4-vk.err; fail "$tag: the chain never ran"; }
   fi
@@ -2550,7 +2605,7 @@ PY
     { echo "$lg"; fail "$tag: logits"; }
   # an oracle case on the chain throughout: its decode rows are the teacher-forced
   # forward's rows at the same positions, bit for bit (as on the CPU)
-  if [ "${c#ids:}" = "$c" ] && [ "${CHAINMODE:-1}" = 1 ] && [ -z "${FAULT_BACK:-}" ] && [ "${*#*V4_DRAFT}" = "$*" ]; then
+  if [ "${c#ids:}" = "$c" ] && [ "${CHAINMODE:-1}" = 1 ] && [ -z "${FAULT_BACK:-}${FAULT2_BACK:-}" ] && [ "${*#*V4_DRAFT}" = "$*" ]; then
     $PY - vk.f32 "$fx" "$c" <<'PY' || fail "$tag: a decode row differs from the teacher-forced row at its position"
 import array, json, sys
 v = array.array("f", open(sys.argv[1], "rb").read())
@@ -2625,6 +2680,9 @@ for text in (err_cpu, err):   # a sanitized build reports into the engine's stde
     if "ERROR: AddressSanitizer" in text or "runtime error:" in text: print(text[-4000:]); sys.exit("sanitizer diagnostic")
 if "deepseek_v4 chain:" not in err or " forwards" not in err:
     print(err[-3000:]); sys.exit("the chain never ran")
+import re
+if os.environ.get("V4_SERVE_EXPECT") and not re.search(os.environ["V4_SERVE_EXPECT"], err):
+    print(err[-3000:]); sys.exit("no line matches V4_SERVE_EXPECT")
 worst, n, same = 0.0, 0, 0
 for x, y in zip(cpu, dev):
     if [d[0] for d in x.data] != [d[0] for d in y.data] or sorted(x.echoes) != sorted(y.echoes) or x.reuse != y.reuse:
@@ -3041,6 +3099,7 @@ for f in tests/vulkan_partial_*.sh; do
   . "$f"
 done
 . tests/vulkan_dev2.sh   # the expert tier on two devices
+. tests/vulkan_layers_dev2.sh   # the chain's layers on two devices
 # ---- big prompt chunks and expert streaming (docs/vulkan.md, "Big prompt chunks and
 # expert streaming") ----
 # Every engine with the chain, on a prompt longer than its usual block, against its CPU
@@ -3333,6 +3392,24 @@ kv_hostparts() {
   n=$(sed -n "s/^\[VK\] $1 chain: KV split: [0-9]* layer steps, \([0-9]*\) with a host part.*/\1/p" "$2" | tail -1)
   echo "${n:-0}"
 }
+# kv_devcold <engine> <log>: N from "| the host's part on the device: N layer steps"
+# (COLI_VK_KV_COLD=device), 0 without it
+kv_devcold() {
+  local n
+  n=$(sed -n "s/^\[VK\] $1 chain: KV split: .* the host's part on the device: \([0-9]*\) layer steps.*/\1/p" "$2" | tail -1)
+  echo "${n:-0}"
+}
+# kv_cold_check <engine> <tag> <log>: with COLI_VK_KV_COLD=device exported (the
+# kv-split-cold families), the host's part must have run on the device; with read-based
+# pins (COLI_VK_KV_PIN=1) it stays on the CPU by design, and the engine says so
+kv_cold_check() {
+  [ "${COLI_VK_KV_COLD:-}" = device ] || return 0
+  if [ "${COLI_VK_KV_PIN:-0}" = 1 ]; then
+    grep -qa "COLI_VK_KV_COLD=device needs .* no pins; the CPU computes the host's part" "$3" || { cat "$3"; fail "$2: pins on, and no line that the CPU computes the host's part"; }
+    return 0
+  fi
+  [ "$(kv_devcold "$1" "$3")" -gt 0 ] || { cat "$3"; fail "$2: the host's part never ran on the device"; }
+}
 # kv_gate <engine> <tag> <tol 0|1> <rows> <block> <env...> -- <argv...>: chain_gate (the
 # CPU's tokens, logits within 1e-4 of the largest with tol 1) with the split on, which
 # must have run steps with a host part.
@@ -3340,6 +3417,7 @@ kv_gate() {
   local eng=$1 tag=$2 tol=$3 rows=$4 blk=$5; shift 5
   chain_gate "$eng" "$tag" "$tol" COLI_VK_KV_DEVICE_ROWS=$rows COLI_VK_KV_BLOCK=$blk "$@"
   [ "$(kv_hostparts "$eng" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the split never ran a host part"; }
+  kv_cold_check "$eng" "$tag" vk.log
   echo "   $tag: $(grep -a "KV split:" vk.log | tail -1 | sed 's/.*KV split: //')"
 }
 # kv_san <engine> <tag> <env and argv...>: a sanitized run under the split (the build is
@@ -3350,6 +3428,7 @@ kv_san() {
   env OMP_NUM_THREADS=2 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
   if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
   [ "$(kv_hostparts "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: the split never ran a host part"; }
+  kv_cold_check "$eng" "$tag" san.log
   echo "OK $tag: sanitizers clean, $(kv_hostparts "$eng" san.log) layer steps with a host part"
 }
 
@@ -3681,6 +3760,7 @@ kv_mla_gate() {
   mla_gate "$eng" "$tag" "$tol" COLI_VK_KV_DEVICE_ROWS=$rows COLI_VK_KV_BLOCK=$blk "$@"
   [ "$(kv_hostparts "$eng" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the split never ran a host part"; }
   if [ "${PINNED:-0}" = 1 ]; then grep -qa 'KV split: .* [1-9][0-9]* blocks pinned by reads' vk.log || { cat vk.log; fail "$tag: no block was pinned"; }; fi
+  kv_cold_check "$eng" "$tag" vk.log
   echo "   $tag: $(grep -a "KV split:" vk.log | tail -1 | sed 's/.*KV split: //')"
 }
 # colibri (GLM-5.2): the 32-token oracle over 8 or 16 rows on the device; DSA's lists
@@ -4008,6 +4088,20 @@ family_kv_split_sanitize() {
   kv_split_mimo_sanitize; kv_split_colibri_sanitize; kv_split_glm53_sanitize; kv_split_kimi_sanitize
   make clean >/dev/null 2>&1 || true
 }
+# COLI_VK_KV_COLD=device: every gate of the two families above again, with the host's
+# part of each split layer's attention on the device too (vkc_kv_shadow). The tokens and
+# logits are held to the CPU's as before, and each gate must have run the host's part on
+# the device (kv_cold_check). DeepSeek's sparse forms keep it on the CPU.
+family_kv_split_cold() {
+  export COLI_VK_KV_COLD=device
+  family_kv_split
+  unset COLI_VK_KV_COLD
+}
+family_kv_split_cold_sanitize() {
+  export COLI_VK_KV_COLD=device
+  family_kv_split_sanitize
+  unset COLI_VK_KV_COLD
+}
 family_kv_split_deepseek() {
   export OMP_NUM_THREADS=2
   make deepseek_v41 deepseek-v4 VK=1
@@ -4137,6 +4231,17 @@ case "${1:-}" in
   prefill-deepseek) family_prefill_deepseek ;;
   kv-split)       family_kv_split ;;
   kv-split-sanitize) family_kv_split_sanitize ;;
+  kv-split-cold)  family_kv_split_cold ;;
+  kv-split-cold-sanitize) family_kv_split_cold_sanitize ;;
+  layers-dev2)    family_layers_dev2 ;;
+  layers-dev2-sanitize) family_layers_dev2_sanitize ;;
+  layers-dev2-mla) family_layers_dev2_mla ;;
+  layers-dev2-mla-sanitize) family_layers_dev2_mla_sanitize ;;
+  layers-dev2-deepseek) family_layers_dev2_deepseek ;;
+  layers-dev2-deepseek-sanitize) family_layers_dev2_deepseek_sanitize ;;
+  layers-dev2-*)  e=${1#layers-dev2-}   # one engine's gates (the engine already built)
+                  declare -F "ld2_$e" >/dev/null || { echo "no layers-dev2 engine $e" >&2; exit 2; }
+                  OMP_NUM_THREADS=2 "ld2_$e" ;;
   kv-split-deepseek) family_kv_split_deepseek ;;
   kv-split-deepseek-sanitize) family_kv_split_deepseek_sanitize ;;
   staged)         family_staged ;;
@@ -4157,5 +4262,5 @@ case "${1:-}" in
   partial-*)      g=${1#partial-}; fn=ptl_family_${g//-/_}
                   declare -F "$fn" >/dev/null || { echo "no partial-chain group ${g}" >&2; exit 2; }
                   "$fn" ;;
-  *) echo "usage: $0 decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-deepseek|kv-split-deepseek-sanitize|dev2|dev2-deepseek-kimi-mimo|dev2-sanitize" >&2; exit 2 ;;
+  *) echo "usage: $0 decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-cold|kv-split-cold-sanitize|layers-dev2[-mla|-deepseek][-sanitize]|layers-dev2-<engine>|kv-split-deepseek|kv-split-deepseek-sanitize|dev2|dev2-deepseek-kimi-mimo|dev2-sanitize" >&2; exit 2 ;;
 esac

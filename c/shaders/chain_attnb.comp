@@ -20,6 +20,18 @@
 // per row (sel_row > 0): then BR = 1, the row's list is the workgroup's.
 // The order of the sums differs from chain_attn's and the CPU's; all agree to rounding.
 // Push constants: chain_attn's, then br (rows per workgroup, br * H / KVH <= 32).
+// part != 0 (vk_kvsplit.h's host part on the device, from its shadow of the host's
+// rows): a row's positions are its causal ones before its share of a split cache, the
+// blocks pos/B - anchor and on, so [first, (pos/B - anchor)*B); the output is the part
+// (the value sum unnormalized at o_off + s*o_row + h*vd, (m, l) at st_off + (s*H + h)*2)
+// for vkc_kvs_merge. Its tiles start at multiples of BC: a row's sums then depend on its
+// own positions only, whatever rows share its workgroup (a tile it does not see changes
+// nothing), so a row gets the same bits however a forward is cut into steps. No lists,
+// no sink, no ring there. With g_off > 0 the positions are cut into chunks of g_off (a
+// multiple of BC), workgroup z taking [z*g_off, (z+1)*g_off): its part at o_off +
+// z*g_row + ... and its (m, l) at st_off + z*g_seg + ..., for chain_kvs.comp's join (a
+// decode row's thousands of positions over many workgroups; the chunks are fixed by
+// position, so the bits still are the row's own).
 // Limits: hd, vd <= 256.
 layout(local_size_x = 256) in;
 layout(constant_id = 0) const int BC = 8;
@@ -42,6 +54,7 @@ layout(push_constant) uniform P {
     int k_off, v_off;
     int win, ring, vd, kv_pm, sink, sink_off;
     int br;
+    int B, anchor, part, st_off;
 } p;
 
 shared float ks[BC * 256];        // the tile's keys   [j][d]
@@ -73,6 +86,18 @@ void main() {
     int first = p.win > 0 ? max(0, pos - p.win + 1) : 0;    // this pair's row
     int bfirst = p.win > 0 ? max(0, p.pos_base + s0 - p.win + 1) : 0;
     int n = p.pos_base + slast + 1 - bfirst;
+    int end = pos + 1;                                       // this pair's row: positions before end
+    if (p.part != 0) {
+        end = (pos / p.B - p.anchor) * p.B;
+        int bend = ((p.pos_base + slast) / p.B - p.anchor) * p.B;   // the block's last row's
+        bfirst -= bfirst % BC;
+        if (p.g_off > 0) {
+            int c0 = int(gl_WorkGroupID.z) * p.g_off, c1 = c0 + p.g_off;
+            bfirst = max(bfirst, c0); bend = min(bend, c1);
+            first = max(first, c0); end = min(end, c1);
+        }
+        n = max(0, bend - bfirst);
+    }
     bool list = false;
     int lb = 0;
     if (p.sel_row > 0) {
@@ -122,7 +147,7 @@ void main() {
         for (int j = lane; j < BC; j += 8) {
             int t = tpos[j];
             float sc = -3.0e38;
-            if (live && t >= 0 && (list || (t >= first && t <= pos))) {
+            if (live && t >= 0 && (list || (t >= first && t < end))) {
                 float a = 0.0;
                 for (int k = 0; k < 8; k++) a += part[(pair * 8 + k) * BC + j];
                 sc = a * p.scale;
@@ -150,8 +175,19 @@ void main() {
         barrier();
     }
     if (!live) return;
-    float inv = l > 0.0 ? 1.0 / l : 0.0;
     int ob = p.o_off + s * p.o_row + h * p.vd;
+    if (p.part != 0) {   // the part (a chunk's, with g_off), for the merge (or the join)
+        int z = p.g_off > 0 ? int(gl_WorkGroupID.z) : 0;
+        int obz = ob + z * p.g_row, sb = p.st_off + z * p.g_seg + (s * p.H + h) * 2;
+        for (int i = 0; i < 32; i++) {
+            int d = lane + 8 * i;
+            if (d >= p.vd) break;
+            o[obz + d] = av[i];
+        }
+        if (lane == 0) { o[sb] = m; o[sb + 1] = l; }
+        return;
+    }
+    float inv = l > 0.0 ? 1.0 / l : 0.0;
     int gb = p.g_off + s * p.g_row + h * p.g_seg;
     for (int i = 0; i < 32; i++) {
         int d = lane + 8 * i;

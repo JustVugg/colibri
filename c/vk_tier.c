@@ -55,8 +55,17 @@ static struct {
     int on;
     VktConfig c;
     char engine[32];
-    int gu_fmt, gu_gs, dn_fmt, dn_gs;
-    size_t gu_codes, gu_scales, d_codes, d_scales, stage_bytes;   /* one expert as the engine holds it */
+    /* the forms of the experts, as the engine holds them and on the device: [0] the main
+     * layers', [1] the extra layers' (VktConfig.extra_layers, an MTP head's), from
+     * main_layers on */
+    int main_layers;
+    struct { VktFmt gu, dn; int gu_fmt, gu_gs, dn_fmt, dn_gs; size_t gu_codes, gu_scales, d_codes, d_scales, stage_bytes; } form[2];
+    /* the extra layers' experts: on the primary device, in a pool of their own (another
+     * size than the main ones', so neither leaves holes the other cannot use), at most
+     * xmax of x_bytes each in x_budget */
+    int xmax, xres, xque;
+    size_t x_bytes, x_budget;
+    unsigned long long extra_served, extra_routed;
     size_t exp_bytes, budget;
     int max_resident, resident, queued, rate, uma;   /* totals over the devices */
     /* per device: the most it holds, resident, queued (dmax[1] = 0 without a second one) */
@@ -79,7 +88,7 @@ static struct {
     double d2_ms;
     VSlot *s;
     uint32_t tick, decay_at;          /* tokens seen (rows of the forward's first layer) */
-    int last_layer, first_layer, promos, promo_cap;
+    int last_layer, first_layer, promos[2], promo_cap;   /* promotions this forward, the main layers' and the extra ones', each up to the cap */
     int begin;                         /* vkt_begin_forward: the next issue starts a forward */
     /* uploader */
     pthread_t th; int th_on, stop;
@@ -93,7 +102,7 @@ static struct {
     /* evicted, freed at the next quiescent point */
     int *evict; int nevict, cevict;
     /* the coldest residents, refreshed once per forward */
-    int cand[VKT_CAND]; uint64_t cand_score[VKT_CAND]; int ncand;
+    int cand[2][VKT_CAND]; uint64_t cand_score[2][VKT_CAND]; int ncand[2];   /* per kind: main, extra */
     /* the step in flight */
     int inflight, S, K;
     int *map; int cmap;
@@ -133,6 +142,7 @@ static const char *human(double b, char *buf, size_t n) {
 }
 static double vkt_now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 static VSlot *slot(int layer, int eid) { return &T.s[(size_t)layer * T.c.experts + eid]; }
+static int kind_of(int layer) { return layer >= T.main_layers; }   /* the form of a layer's experts */
 
 /* ---- source formats ---------------------------------------------------------- */
 static int src_per_row(VktSrc k) {
@@ -250,17 +260,19 @@ static void convert_par(VktFmt f, int I, int O, const uint8_t *codes, const void
 /* Upload one expert from its RAM form to device dev's pool (any thread). 0 when the pool
  * refused, -1 when the copy to the device failed (staged uploads: the room was there,
  * and is given back). */
-static int upload(int dev, const uint8_t *g, const uint8_t *u, const uint8_t *d,
+static int upload(int dev, int kind, const uint8_t *g, const uint8_t *u, const uint8_t *d,
                   const void *gs, const void *us, const void *ds, ColiVkTensor *t[3]) {
     const int H = T.c.hidden, F = T.c.inter;
+    const __typeof__(T.form[0]) *fm = &T.form[kind];
     const uint8_t *codes[3] = {g, u, d}; const void *sc[3] = {gs, us, ds};
     t[0] = t[1] = t[2] = NULL;
     for (int k = 0; k < 3; k++) {
-        VktFmt f = k < 2 ? T.c.gate_up : T.c.down;
-        int fmt = k < 2 ? T.gu_fmt : T.dn_fmt, fgs = k < 2 ? T.gu_gs : T.dn_gs;
+        VktFmt f = k < 2 ? fm->gu : fm->dn;
+        int fmt = k < 2 ? fm->gu_fmt : fm->dn_fmt, fgs = k < 2 ? fm->gu_gs : fm->dn_gs;
         int I = k < 2 ? H : F, O = k < 2 ? F : H;
         uint8_t *rows; size_t stride; float *scales;
-        if (!coli_vk_tier_tensor_dev(dev, &t[k], fmt, I, O, fgs, &rows, &stride, &scales)) {
+        if (!(kind ? coli_vk_tier_tensor_extra(&t[k], fmt, I, O, fgs, &rows, &stride, &scales)   /* its own pool */
+                   : coli_vk_tier_tensor_dev(dev, &t[k], fmt, I, O, fgs, &rows, &stride, &scales))) {
             for (int j = 0; j < k; j++) { coli_vk_tensor_free(t[j]); t[j] = NULL; }
             return 0;
         }
@@ -325,8 +337,10 @@ static void *uploader(void *arg) {
         VQ e = T.q[T.qh]; T.qh = (T.qh + 1) % VKT_QCAP; T.qn--; T.busy = 1;
         pthread_mutex_unlock(&T.mx);
         const uint8_t *b = e.buf;
-        const uint8_t *g = b, *u = g + T.gu_codes, *d = u + T.gu_codes;
-        const uint8_t *gs = d + T.d_codes, *us = gs + T.gu_scales, *ds = us + T.gu_scales;
+        const int kd = kind_of(e.layer);
+        const size_t guc = T.form[kd].gu_codes, dc = T.form[kd].d_codes, gus = T.form[kd].gu_scales;
+        const uint8_t *g = b, *u = g + guc, *d = u + guc;
+        const uint8_t *gs = d + dc, *us = gs + gus, *ds = us + gus;
         ColiVkTensor *t[3];
         int ok = 0, r = 0;
         /* Refused: the pool is at its budget until the engine thread frees the victim
@@ -335,7 +349,7 @@ static void *uploader(void *arg) {
          * and try again; refused again after three frees, or nothing freed for a
          * minute (the engine stopped stepping), the pool is full for real. */
         for (int frees = 0, waited = 0; !ok; ) {
-            r = upload(e.dev, g, u, d, gs, us, ds, t);
+            r = upload(e.dev, kd, g, u, d, gs, us, ds, t);
             ok = r > 0;
             /* sync: every free decided so far came first (above), and the engine now waits
              * on us, not we on it: the pool is full for real. A failed copy is no question
@@ -386,12 +400,12 @@ static void quiesce(void) {
     pthread_mutex_unlock(&T.mx);
     for (int i = 0; i < n; i++) {
         VSlot *v = slot(d[i].layer, d[i].eid);
-        int dv = v->dev;
-        T.queued--; T.dque[dv]--;
+        int dv = v->dev, kd = kind_of(d[i].layer);
+        T.queued--; if (kd) T.xque--; else T.dque[dv]--;
         /* an upload to a second device that has stopped meanwhile (d2_stop) is dropped */
         ColiVkExpert *e = d[i].ok && (dv == 0 || T.d2) ? coli_vk_xb_expert(d[i].g, d[i].u, d[i].d) : NULL;
         if (e) {
-            v->ex = e; v->state = VS_RESIDENT; T.resident++; T.dres[dv]++;
+            v->ex = e; v->state = VS_RESIDENT; T.resident++; if (kd) T.xres++; else T.dres[dv]++;
             T.uploads++; T.upload_bytes += coli_vk_tensor_bytes(d[i].g) + coli_vk_tensor_bytes(d[i].u) + coli_vk_tensor_bytes(d[i].d);
             if (dv) T.d2_uploads++;
         } else {
@@ -402,7 +416,8 @@ static void quiesce(void) {
             /* refused: the budget holds fewer than the count said (fragmentation, or the
              * device ran out first): stop planning past what is there. A failed copy gave
              * its room back: the budget stands, the expert may come again. */
-            if (!d[i].copy_failed && T.dmax[dv] > T.dres[dv] + T.dque[dv]) {
+            if (!d[i].copy_failed && kd && T.xmax > T.xres + T.xque) T.xmax = T.xres + T.xque;
+            if (!d[i].copy_failed && !kd && T.dmax[dv] > T.dres[dv] + T.dque[dv]) {
                 T.max_resident -= T.dmax[dv] - (T.dres[dv] + T.dque[dv]);
                 T.dmax[dv] = T.dres[dv] + T.dque[dv];
             }
@@ -430,9 +445,11 @@ static void d2_stop(const char *why) {
             T.engine, why, coli_vk_device_name());
 }
 
-/* The device a newcomer goes to when there is room: the primary device first, then the
- * second one; -1 when both are full. */
-static int room_dev(void) {
+/* The device a newcomer of layer `layer` goes to when there is room: a main layer's to
+ * the primary device first, then the second one; an extra layer's to its pool on the
+ * primary device; -1 when they are full. */
+static int room_dev(int layer) {
+    if (kind_of(layer)) return T.xres + T.xque < T.xmax ? 0 : -1;
     if (T.dres[0] + T.dque[0] < T.dmax[0]) return 0;
     if (T.d2 && T.dres[1] + T.dque[1] < T.dmax[1]) return 1;
     return -1;
@@ -441,32 +458,34 @@ static int room_dev(void) {
 /* ---- placement ------------------------------------------------------------------ */
 static uint64_t score(const VSlot *v) { return tier_lfru_score(v->heat, v->last, T.tick); }
 
-/* The coldest residents, ascending, once per forward. */
+/* The coldest residents of each kind, ascending, once per forward. */
 static void refresh_candidates(void) {
-    T.ncand = 0;
+    T.ncand[0] = T.ncand[1] = 0;
     size_t n = (size_t)T.c.layers * T.c.experts;
     for (size_t i = 0; i < n; i++) {
         VSlot *v = &T.s[i];
         if (v->state != VS_RESIDENT) continue;
-        uint64_t sc = score(v);
-        if (T.ncand == VKT_CAND && sc >= T.cand_score[VKT_CAND - 1]) continue;
-        int at = T.ncand < VKT_CAND ? T.ncand++ : VKT_CAND - 1;
-        while (at > 0 && T.cand_score[at - 1] > sc) { T.cand[at] = T.cand[at - 1]; T.cand_score[at] = T.cand_score[at - 1]; at--; }
-        T.cand[at] = (int)i; T.cand_score[at] = sc;
+        int k = kind_of((int)(i / (size_t)T.c.experts)), *c = T.cand[k];
+        uint64_t sc = score(v), *cs = T.cand_score[k];
+        if (T.ncand[k] == VKT_CAND && sc >= cs[VKT_CAND - 1]) continue;
+        int at = T.ncand[k] < VKT_CAND ? T.ncand[k]++ : VKT_CAND - 1;
+        while (at > 0 && cs[at - 1] > sc) { c[at] = c[at - 1]; cs[at] = cs[at - 1]; at--; }
+        c[at] = (int)i; cs[at] = sc;
     }
 }
-/* The resident a newcomer of score hs would displace, or -1: the coldest candidate
- * still resident, when the newcomer beats it by tier.h's LFRU margin (25% + 4
- * counts). It stays first in the list until drop_victim takes it. */
-static void drop_victim(void) {
-    memmove(T.cand, T.cand + 1, (size_t)--T.ncand * sizeof(int));
-    memmove(T.cand_score, T.cand_score + 1, (size_t)T.ncand * sizeof(uint64_t));
+/* The resident a newcomer of kind k and score hs would displace, or -1: the coldest
+ * candidate of its kind (each kind has its own pool) still resident, when the newcomer
+ * beats it by tier.h's LFRU margin (25% + 4 counts). It stays first in the list until
+ * drop_victim takes it. */
+static void drop_victim(int k) {
+    memmove(T.cand[k], T.cand[k] + 1, (size_t)--T.ncand[k] * sizeof(int));
+    memmove(T.cand_score[k], T.cand_score[k] + 1, (size_t)T.ncand[k] * sizeof(uint64_t));
 }
-static int peek_victim(uint64_t hs) {
-    while (T.ncand) {
-        int i = T.cand[0];
+static int peek_victim(int k, uint64_t hs) {
+    while (T.ncand[k]) {
+        int i = T.cand[k][0];
         VSlot *v = &T.s[i];
-        if (v->state != VS_RESIDENT) { drop_victim(); continue; }
+        if (v->state != VS_RESIDENT) { drop_victim(k); continue; }
         uint64_t cs = score(v);
         return hs > cs + (cs >> 2) + (4u << 8) ? i : -1;
     }
@@ -477,7 +496,7 @@ static int peek_victim(uint64_t hs) {
  * blocks of rows, or rows one by one, is the same forward). The tick counts tokens:
  * the rows of the forward's first layer, every block of them. */
 static void new_forward(void) {
-    T.promos = 0; T.promo_cap = 0; T.said_fwd = 0;
+    T.promos[0] = T.promos[1] = 0; T.promo_cap = 0; T.said_fwd = 0;
     if (T.tick >= T.decay_at) {
         size_t n = (size_t)T.c.layers * T.c.experts;
         for (size_t i = 0; i < n; i++) T.s[i].heat = tier_decay_value(T.s[i].heat);
@@ -493,38 +512,42 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
     if (!T.on || !src || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return;
     VSlot *v = slot(layer, eid);
     if (v->state != VS_NONE || !src->g || !src->u || !src->d) return;
-    if (T.promos >= T.promo_cap) { T.rated++; return; }
-    if (T.gu_scales && (!src->gs || !src->us || !src->ds)) return;
-    int victim = -1, dev = room_dev();
-    if (dev < 0 && (!v->heat || (victim = peek_victim(score(v))) < 0)) return;
+    /* the extra layers (an MTP head's) come last in a forward: their promotions are
+     * counted apart, or the model's layers would always have spent the rate first */
+    const int kd = kind_of(layer);
+    if (T.promos[kd] >= T.promo_cap) { T.rated++; return; }
+    const __typeof__(T.form[0]) *fm = &T.form[kd];
+    if (fm->gu_scales && (!src->gs || !src->us || !src->ds)) return;
+    int victim = -1, dev = room_dev(layer);
+    if (dev < 0 && (!v->heat || (victim = peek_victim(kd, score(v))) < 0)) return;
     if (victim >= 0) dev = T.s[victim].dev;   /* the newcomer takes its place, on its device */
     pthread_mutex_lock(&T.mx);
     int qfull = T.qn >= VKT_QCAP;
     pthread_mutex_unlock(&T.mx);
     if (qfull) { T.qfull++; return; }
-    uint8_t *buf = malloc(T.stage_bytes);
+    uint8_t *buf = malloc(fm->stage_bytes);
     if (!buf) return;
-    if (victim >= 0) drop_victim();
+    if (victim >= 0) drop_victim(kd);
     uint8_t *p = buf;
-    memcpy(p, src->g, T.gu_codes); p += T.gu_codes;
-    memcpy(p, src->u, T.gu_codes); p += T.gu_codes;
-    memcpy(p, src->d, T.d_codes);  p += T.d_codes;
-    if (T.gu_scales) { memcpy(p, src->gs, T.gu_scales); p += T.gu_scales; memcpy(p, src->us, T.gu_scales); p += T.gu_scales; }
-    if (T.d_scales) memcpy(p, src->ds, T.d_scales);
+    memcpy(p, src->g, fm->gu_codes); p += fm->gu_codes;
+    memcpy(p, src->u, fm->gu_codes); p += fm->gu_codes;
+    memcpy(p, src->d, fm->d_codes);  p += fm->d_codes;
+    if (fm->gu_scales) { memcpy(p, src->gs, fm->gu_scales); p += fm->gu_scales; memcpy(p, src->us, fm->gu_scales); p += fm->gu_scales; }
+    if (fm->d_scales) memcpy(p, src->ds, fm->d_scales);
     if (victim >= 0) {
         VSlot *w = &T.s[victim];
-        w->state = VS_EVICT; T.resident--; T.dres[w->dev]--; T.evictions++;
+        w->state = VS_EVICT; T.resident--; if (kd) T.xres--; else T.dres[w->dev]--; T.evictions++;
         if (T.nevict == T.cevict) {
             int nc = T.cevict ? 2 * T.cevict : 64;
             int *n = realloc(T.evict, (size_t)nc * sizeof(int));
-            if (!n) { w->state = VS_RESIDENT; T.resident++; T.dres[w->dev]++; T.evictions--; free(buf); return; }
+            if (!n) { w->state = VS_RESIDENT; T.resident++; if (kd) T.xres++; else T.dres[w->dev]++; T.evictions--; free(buf); return; }
             T.evict = n; T.cevict = nc;
         }
         T.evict[T.nevict++] = victim;
         pthread_mutex_lock(&T.mx); T.evict_pending = T.nevict; pthread_mutex_unlock(&T.mx);
         quiesce();   /* nothing in flight: free it right away; else at the join */
     }
-    v->state = VS_QUEUED; v->dev = (uint8_t)dev; T.queued++; T.dque[dev]++; T.promos++;
+    v->state = VS_QUEUED; v->dev = (uint8_t)dev; T.queued++; if (kd) T.xque++; else T.dque[dev]++; T.promos[kd]++;
     pthread_mutex_lock(&T.mx);
     T.q[(T.qh + T.qn) % VKT_QCAP] = (VQ){layer, eid, dev, buf}; T.qn++;
     pthread_cond_signal(&T.cv);
@@ -535,8 +558,8 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
 int vkt_wants(int layer, int eid) {
     if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return 0;
     VSlot *v = slot(layer, eid);
-    if (v->state != VS_NONE || T.promos >= T.promo_cap) return 0;
-    if (room_dev() < 0 && (!v->heat || peek_victim(score(v)) < 0)) return 0;
+    if (v->state != VS_NONE || T.promos[kind_of(layer)] >= T.promo_cap) return 0;
+    if (room_dev(layer) < 0 && (!v->heat || peek_victim(kind_of(layer), score(v)) < 0)) return 0;
     pthread_mutex_lock(&T.mx);
     int qfull = T.qn >= VKT_QCAP;
     pthread_mutex_unlock(&T.mx);
@@ -554,7 +577,7 @@ static int plan_cmp(const void *a, const void *b) {
 static uint32_t *const *g_heat_hist;
 int vkt_plan(int *layers, int *eids, int max) {
     if (!T.on || !g_heat_hist) return 0;
-    int L = T.c.layers, E = T.c.experts, n = 0;
+    int L = T.main_layers, E = T.c.experts, n = 0;   /* the history: the main layers' */
     int *order = malloc((size_t)L * E * sizeof(int));
     if (!order) return 0;
     for (int l = 0; l < L; l++)
@@ -562,10 +585,10 @@ int vkt_plan(int *layers, int *eids, int max) {
     g_plan_heat = (const uint32_t *const *)g_heat_hist; g_plan_E = E;
     qsort(order, (size_t)n, sizeof(int), plan_cmp);
     int k = 0;
-    for (int i = 0; i < n && k < max && room_dev() >= 0; i++) {
+    for (int i = 0; i < n && k < max && room_dev(0) >= 0; i++) {
         VSlot *v = &T.s[order[i]];
         if (v->state != VS_NONE) continue;
-        int dev = room_dev();   /* the hottest fill the primary device, the next ones the second */
+        int dev = room_dev(0);   /* the hottest fill the primary device, the next ones the second */
         v->state = VS_QUEUED; v->dev = (uint8_t)dev; T.queued++; T.dque[dev]++;
         layers[k] = order[i] / E; eids[k] = order[i] % E; k++;
     }
@@ -576,7 +599,7 @@ int vkt_put(int layer, int eid, const VktExpertSrc *src) {
     if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return 0;
     ColiVkTensor *t[3] = {NULL, NULL, NULL};
     int dev = slot(layer, eid)->dev;   /* vkt_plan's choice */
-    int r = src && src->g && src->u && src->d ? upload(dev, src->g, src->u, src->d, src->gs, src->us, src->ds, t) : 0;
+    int r = src && src->g && src->u && src->d ? upload(dev, kind_of(layer), src->g, src->u, src->d, src->gs, src->us, src->ds, t) : 0;
     int ok = r > 0;
     push_done(layer, eid, ok, r < 0, t);
     if (ok) __atomic_add_fetch(&T.warm, 1, __ATOMIC_RELAXED);
@@ -677,7 +700,7 @@ static int st_alloc(void) {
         VStage *v = &T.st[n];
         int ok = 1;
         for (int k = 0; k < 3 && ok; k++) {
-            int fmt = k < 2 ? T.gu_fmt : T.dn_fmt, gs = k < 2 ? T.gu_gs : T.dn_gs;
+            int fmt = k < 2 ? T.form[0].gu_fmt : T.form[0].dn_fmt, gs = k < 2 ? T.form[0].gu_gs : T.form[0].dn_gs;
             uint8_t *rows; size_t stride; float *sc;
             ok = coli_vk_tier_tensor(&v->t[k], fmt, k < 2 ? H : F, k < 2 ? F : H, gs, &rows, &stride, &sc);
             if (!ok) v->t[k] = NULL;
@@ -706,12 +729,12 @@ static int st_alloc(void) {
  * parallel, each expert into its own slot. */
 static int st_put(int layer, int eid, VStage *v, const VktExpertSrc *src, int par) {
     const int H = T.c.hidden, F = T.c.inter;
-    if (!src->g || !src->u || !src->d || (T.gu_scales && (!src->gs || !src->us || !src->ds))) return 0;
+    if (!src->g || !src->u || !src->d || (T.form[0].gu_scales && (!src->gs || !src->us || !src->ds))) return 0;
     const uint8_t *codes[3] = {src->g, src->u, src->d}; const void *scs[3] = {src->gs, src->us, src->ds};
     for (int k = 0; k < 3; k++) {
         uint8_t *rows; size_t stride; float *sc;
         if (!coli_vk_tensor_refill(v->t[k], &rows, &stride, &sc)) return 0;
-        convert_par(k < 2 ? T.c.gate_up : T.c.down, k < 2 ? H : F, k < 2 ? F : H, codes[k], scs[k], rows, stride, sc, par);
+        convert_par(k < 2 ? T.form[0].gu : T.form[0].dn, k < 2 ? H : F, k < 2 ? F : H, codes[k], scs[k], rows, stride, sc, par);
     }
     (void)layer; (void)eid;
     return 1;
@@ -1098,7 +1121,7 @@ static int join_big(const float **rows) {
 
 /* layer's likely streamed experts into the free slots, while the device runs its attention */
 int vkt_stream_prefetch(int layer, int S) {
-    if (!T.on || !T.st_ok || T.inflight || layer < 0 || layer >= T.c.layers || S < T.gemm_rows) return 0;
+    if (!T.on || !T.st_ok || T.inflight || layer < 0 || layer >= T.main_layers || S < T.gemm_rows) return 0;
     if (!coli_vk_xb_ready() || !st_alloc()) return 0;
     const int E = T.c.experts, K = T.c.topk;
     int R = stream_min_rows();
@@ -1163,7 +1186,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     }
     T.last_layer = layer;
     quiesce();
-    if (T.st_ok && S >= T.gemm_rows) return issue_big(layer, x, S, K, idx, w, taken);
+    if (T.st_ok && S >= T.gemm_rows && layer < T.main_layers) return issue_big(layer, x, S, K, idx, w, taken);
     int E = T.c.experts, H = T.c.hidden, n = S * K;
     if (!grow_map(n)) return 0;
     /* heat for every routed expert, groups for the resident ones (first seen first) */
@@ -1173,6 +1196,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
         int e = idx[i];
         if (e < 0 || e >= E) continue;
         T.routed++;
+        if (layer >= T.main_layers) T.extra_routed++;
         VSlot *v = slot(layer, e);
         if (v->heat < 0xFFFFFFFFu) v->heat++;
         v->last = T.tick;
@@ -1276,6 +1300,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     }
     if (!took) return 0;
     T.inflight = 1; T.S = S; T.K = K; T.steps++; T.served += (unsigned long long)took;
+    if (layer >= T.main_layers) T.extra_served += (unsigned long long)took;
     if (T.d2_inflight) { T.d2_served += (unsigned long long)(total - rows0); T.d2_steps++; }
     T.t_issued = vkt_now_ms();
     return took;
@@ -1341,6 +1366,21 @@ static double env_gb(const char *name, double def) {
 int vkt_wanted(void) {
     const char *on = getenv("COLI_VK_TIER");
     return !(on && *on == '0');
+}
+
+/* A form of the experts: the device formats and the bytes of one expert as the engine
+ * holds it. 0 when it has no device form. */
+static int form_init(int k, VktFmt gu, VktFmt dn) {
+    __typeof__(T.form[0]) *fm = &T.form[k];
+    const int H = T.c.hidden, F = T.c.inter;
+    if (!dev_fmt(gu, &fm->gu_fmt, &fm->gu_gs) || !dev_fmt(dn, &fm->dn_fmt, &fm->dn_gs)) return 0;
+    fm->gu = gu; fm->dn = dn;
+    fm->gu_codes = src_row_bytes(gu.kind, H) * (size_t)F;
+    fm->d_codes = src_row_bytes(dn.kind, F) * (size_t)H;
+    fm->gu_scales = src_scale_bytes(gu, H, F);
+    fm->d_scales = src_scale_bytes(dn, F, H);
+    fm->stage_bytes = 2 * fm->gu_codes + fm->d_codes + 2 * fm->gu_scales + fm->d_scales;
+    return 1;
 }
 
 /* COLI_VK_DEV2: the second device's share. Its budget is what it has free less
@@ -1412,7 +1452,8 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     T.c = *cfg;
     snprintf(T.engine, sizeof T.engine, "%s", eng);
     if (T.c.layers < 1 || T.c.experts < 1 || T.c.hidden < 1 || T.c.inter < 1 || T.c.topk < 1) return 0;
-    if (!dev_fmt(T.c.gate_up, &T.gu_fmt, &T.gu_gs) || !dev_fmt(T.c.down, &T.dn_fmt, &T.dn_gs)) {
+    T.main_layers = T.c.layers;
+    if (!form_init(0, T.c.gate_up, T.c.down)) {
         fprintf(stderr, "[VK] tier %s: expert format %d/%d (gs %d/%d) has no device form, the experts stay on the CPU\n",
                 eng, T.c.gate_up.kind, T.c.down.kind, T.c.gate_up.gs, T.c.down.gs);
         return 0;
@@ -1424,12 +1465,17 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         return 0;
     }
     int H = T.c.hidden, F = T.c.inter;
-    T.gu_codes = src_row_bytes(T.c.gate_up.kind, H) * (size_t)F;
-    T.d_codes = src_row_bytes(T.c.down.kind, F) * (size_t)H;
-    T.gu_scales = src_scale_bytes(T.c.gate_up, H, F);
-    T.d_scales = src_scale_bytes(T.c.down, F, H);
-    T.stage_bytes = 2 * T.gu_codes + T.d_codes + 2 * T.gu_scales + T.d_scales;
     T.exp_bytes = vkt_expert_bytes(H, F, T.c.gate_up, T.c.down);
+    /* the extra layers (an MTP head's): on the tier when their form has a device form */
+    if (T.c.extra_layers > 0) {
+        if (form_init(1, T.c.extra_gate_up, T.c.extra_down) && T.exp_bytes &&
+            (T.x_bytes = vkt_expert_bytes(H, F, T.c.extra_gate_up, T.c.extra_down)))
+            T.c.layers += T.c.extra_layers;
+        else
+            fprintf(stderr, "[VK] tier %s: the extra layers' expert format %d/%d (gs %d/%d) has no device form, their experts stay on the CPU\n",
+                    eng, T.c.extra_gate_up.kind, T.c.extra_down.kind, T.c.extra_gate_up.gs, T.c.extra_down.gs);
+    }
+    if (T.main_layers == T.c.layers) T.c.extra_layers = 0;
 
     /* The budget. Discrete: what VK_EXT_memory_budget says is free on the device,
      * minus a reserve (scratch, KV mirrors, driver) and the dense weights still to
@@ -1462,8 +1508,29 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         size_t full = (size_t)want / blk, rest = (size_t)want - full * blk;
         fit = (long long)full * (long long)(blk / T.exp_bytes) + (long long)(rest / T.exp_bytes);
     }
-    long long all = (long long)T.c.layers * T.c.experts, fit_raw = fit;
+    long long all = (long long)T.main_layers * T.c.experts, fit_raw = fit;
+    /* The extra layers' pool: all their experts when the budget holds them beside every
+     * main one, else their layers' share of the budget (at least one expert, when two
+     * main ones still fit beside it). Its room, in main experts, leaves the main count. */
+    if (T.c.extra_layers) {
+        long long xall = (long long)T.c.extra_layers * T.c.experts, xn;
+        double bud = (double)fit_raw * T.exp_bytes;
+        if (bud >= (double)all * T.exp_bytes + (double)xall * T.x_bytes) xn = xall;
+        else xn = (long long)(bud * T.c.extra_layers / (T.main_layers + T.c.extra_layers) / T.x_bytes);
+        if (xn < 1 && bud >= (double)T.x_bytes + 2.0 * T.exp_bytes) xn = 1;
+        if (xn > xall) xn = xall;
+        if (xn < 1) {
+            char hx[32];
+            fprintf(stderr, "[VK] tier %s: no room for an extra layer's expert (%s), they stay on the CPU\n",
+                    eng, human((double)T.x_bytes, hx, sizeof hx));
+            T.c.layers = T.main_layers; T.c.extra_layers = 0;
+        } else {
+            long long take = (long long)(((size_t)xn * T.x_bytes + T.exp_bytes - 1) / T.exp_bytes);
+            T.xmax = (int)xn; T.x_budget = (size_t)take * T.exp_bytes; fit_raw -= take;
+        }
+    }
     if (fit > all) fit = all;
+    if (fit > fit_raw) fit = fit_raw;
     if (fit < 2) {
         char hb[32], he[32];
         fprintf(stderr, "[VK] tier %s: no room for experts (budget %s, %s each; COLI_VK_TIER_GB sets it), the experts stay on the CPU\n",
@@ -1511,10 +1578,11 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     /* Every expert fits in one block's worth: the pool's limit (and so its one block)
      * is what they take, not the budget, so a small model does not hold a 256 MB
      * block for a few experts. */
-    size_t lim = T.budget, need = (size_t)(all + 1 + (T.st_ok ? T.st_slots : 0)) * T.exp_bytes;
+    size_t lim = T.budget - T.x_budget, need = (size_t)(all + 1 + (T.st_ok ? T.st_slots : 0)) * T.exp_bytes;
     if (fit + (T.st_ok ? T.st_slots : 0) >= all && fit_raw >= all + (T.st_ok ? T.st_slots : 0) &&
         need < lim && need <= coli_vk_block_bytes((size_t)256 << 20)) lim = need;
     coli_vk_tier_pool_limit(lim);
+    if (T.xmax) coli_vk_tier_extra_pool_limit(T.x_budget);
     const char *ex = getenv("COLI_VK_TIER_EXCLUSIVE");
     T.excl = !(ex && *ex == '0');
     if (T.excl) {
@@ -1528,7 +1596,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     const char *r = getenv("COLI_VK_TIER_RATE");
     T.rate = r && *r ? atoi(r) : 16;
     if (T.rate < 0) T.rate = 0;
-    T.s = calloc((size_t)all, sizeof(VSlot));
+    T.s = calloc((size_t)T.c.layers * T.c.experts, sizeof(VSlot));
     T.grp = malloc((size_t)T.c.experts * sizeof(int));
     if (!T.s || !T.grp) { free(T.s); free(T.grp); return 0; }
     for (int e = 0; e < T.c.experts; e++) T.grp[e] = -1;
@@ -1539,7 +1607,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
      * from a long history would hold the tier for hours). */
     g_heat_hist = heat;
     if (heat)
-        for (int l = 0; l < T.c.layers; l++) {
+        for (int l = 0; l < T.main_layers; l++) {   /* the history has the main layers */
             if (!heat[l]) continue;
             uint32_t mx = 0;
             for (int e = 0; e < T.c.experts; e++) if (heat[l][e] > mx) mx = heat[l][e];
@@ -1555,15 +1623,20 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     char hb[32], he[32];
     fprintf(stderr, "[VK] tier %s: on, %s, budget %s = %d experts of %s (fmt %d", eng,
             coli_vk_device_name(), human((double)T.budget, hb, sizeof hb), T.dmax[0],
-            human((double)T.exp_bytes, he, sizeof he), T.gu_fmt);
-    if (T.gu_gs) fprintf(stderr, " gs %d", T.gu_gs);
-    fprintf(stderr, ", down fmt %d", T.dn_fmt);
-    if (T.dn_gs) fprintf(stderr, " gs %d", T.dn_gs);
+            human((double)T.exp_bytes, he, sizeof he), T.form[0].gu_fmt);
+    if (T.form[0].gu_gs) fprintf(stderr, " gs %d", T.form[0].gu_gs);
+    fprintf(stderr, ", down fmt %d", T.form[0].dn_fmt);
+    if (T.form[0].dn_gs) fprintf(stderr, " gs %d", T.form[0].dn_gs);
     fprintf(stderr, "), %s, %s queue, up to %d promotions per token%s%s",
             T.uma ? (cap && *cap ? "shared RAM (COLI_VK_TIER_GB)" : "shared RAM: a quarter of what the expert cache leaves")
                   : "device memory", coli_vk_xb_queue_shared() ? "shared" : "own", T.rate,
             T.balance ? ", balanced against the CPU" : "", T.sync ? ", uploads awaited (COLI_VK_TIER_SYNC)" : "");
     if (T.st_ok) fprintf(stderr, ", streaming cold experts of prompt steps through %d slots", T.st_slots);
+    if (T.xmax) {
+        char hx[32], hp[32];
+        fprintf(stderr, "; the extra layers' experts (%d, fmt %d): %d of %s in a pool of %s", T.c.extra_layers,
+                T.form[1].gu_fmt, T.xmax, human((double)T.x_bytes, hx, sizeof hx), human((double)T.x_budget, hp, sizeof hp));
+    }
     fprintf(stderr, "\n");
     d2_init(fit, all, act);   /* COLI_VK_DEV2: the experts after these on a second device */
     return 1;
@@ -1586,6 +1659,9 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
             human((double)T.upload_bytes, hl, sizeof hl), T.warm, T.evictions, T.qfull, T.rated, T.failed,
             T.dev_ms, T.cpu_ms, T.wait_ms, T.dev_ms > 0 ? 100.0 * hidden / T.dev_ms : 0.0);
     if (T.balance) fprintf(stderr, " | balance: device share %.2f, %llu rows handed to the CPU", T.share, T.handed);
+    if (T.c.extra_layers)
+        fprintf(stderr, " | extra layers (%d): %llu of %llu routed experts on the device, resident %d (budget %d)",
+                T.c.extra_layers, T.extra_served, T.extra_routed, T.xres, T.xmax);
     if (T.excl) fprintf(stderr, " | exclusive: %llu RAM copies of device experts given up first",
                         __atomic_load_n(&T.ram_gave, __ATOMIC_RELAXED));
     if (T.st_ok && T.st_steps) {
@@ -1611,6 +1687,7 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
 }
 
 int vkt_devices(void) { return !T.on ? 0 : T.d2 ? 2 : 1; }
+int vkt_layers(void) { return T.on ? T.c.layers : 0; }
 static VSlot *g_old_slots;   /* the slot table of the tier shut down last (vkt_shutdown) */
 static uint32_t *g_old_routed, *g_old_seq;
 

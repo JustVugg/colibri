@@ -509,6 +509,7 @@ typedef struct {
 #ifdef COLI_VULKAN
     int *vk_kv_valid;                            /* righe [0,v) specchiate nella cache KV Vulkan */
     void *vkchain;                               /* the dense chain's device state (glm_chain.h), NULL until it starts */
+    void *vkchain2;                              /* its layers on COLI_VK_DEV2's device, after the primary's (glm_chain.h) */
 #endif
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
@@ -666,7 +667,8 @@ static inline int vk_reg_served(int layer,int eid){
 /* The shared tier's view of this model's experts (vk_tier_start). */
 static struct {
     int on;                       /* vkt_init accepted the experts */
-    int gu_fmt, gu_gs, dn_fmt, dn_gs;   /* the QT formats it was given (gate = up) */
+    int nl;                       /* the model's layers; the MTP head's (index nl) is [1] below */
+    int gu_fmt[2], gu_gs[2], dn_fmt[2], dn_gs[2];   /* the QT formats it was given (gate = up) */
     size_t exp_bytes;             /* one expert on the device */
 } g_vkt;
 static int vk_tier_resident_count(Model *m);
@@ -782,16 +784,18 @@ static pthread_t g_dho_thread;
 static int qt_vk_fmt(const QT *t){ return t->fmt==0 ? 10 : t->fmt; }
 static int qt_dho_matmul(QT *t, float *y, const float *x, int S){
     if(omp_in_parallel() || !pthread_equal(pthread_self(), g_dho_thread) || !t->vk) return 0;
+    if(coli_vk_tensor_dev(t->vk)) return 0;   /* a matrix of the second device's layers: only its chain reads it */
     return coli_vk_matmul(&t->vk, y, x, NULL, NULL, qt_vk_fmt(t), S, t->I, t->O, t->fmt==4 ? t->gs : 0);
 }
 static int vk_matmul_qt(QT *t, float *y, const float *x, int S){
-    if(!g_vk_dense || !VK_FMT_OK(t) || !VK_MAY(t)) return 0;
+    if(!g_vk_dense || !VK_FMT_OK(t) || !VK_MAY(t) || (t->vk && coli_vk_tensor_dev(t->vk))) return 0;
     const void *w = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     return coli_vk_matmul(&t->vk, y, x, w, t->s, t->fmt, S, t->I, t->O, t->gs);
 }
 /* Two same-input resident matmuls in one submit (q_a + kv_a read the same x). */
 static int vk_matmul_pair_qt(QT *a, float *ya, QT *b, float *yb, const float *x, int S){
     if(!g_vk_dense || a->fmt!=b->fmt || !VK_FMT_OK(a) || a->gs!=b->gs || a->I!=b->I || !VK_MAY(a) || !VK_MAY(b)) return 0;
+    if((a->vk && coli_vk_tensor_dev(a->vk)) || (b->vk && coli_vk_tensor_dev(b->vk))) return 0;
     const void *wa = a->fmt==1 ? (const void*)a->q8 : (const void*)a->q4;
     const void *wb = b->fmt==1 ? (const void*)b->q8 : (const void*)b->q4;
     return coli_vk_matmul_pair(&a->vk, ya, wa, a->s, a->O,
@@ -1883,6 +1887,11 @@ static void load_cfg(Cfg *c, const char *snap){
     if(c->topk>c->n_experts){
         fprintf(stderr,"config: num_experts_per_tok=%d exceeds n_routed_experts=%d\n",
                 c->topk,c->n_experts); exit(1); }
+    /* the DSA indexer ropes the first qk_rope_head_dim floats of each of its rows, which
+     * are index_head_dim long (GLM-5.2: 64 of 128) */
+    if(c->index_hd>0 && c->index_hd<c->qk_rope){
+        fprintf(stderr,"config: index_head_dim=%d is shorter than qk_rope_head_dim=%d, which the "
+                "indexer ropes in each of its rows\n",c->index_hd,c->qk_rope); exit(1); }
     #undef CKR
     free(ar);
 }
@@ -3343,9 +3352,18 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal, int de
 #define COLI_CLUSTER_MAGIC "COLIEX01"
 #define COLI_CLUSTER_VERSION 1u
 static int cluster_io(int fd, void *buf, size_t n, int write_mode){
+    int send_flags=0;
+#ifdef MSG_NOSIGNAL
+    send_flags=MSG_NOSIGNAL;
+#elif defined(SO_NOSIGPIPE)
+    if(write_mode){
+        int enabled=1;
+        if(setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&enabled,sizeof(enabled))!=0) return -1;
+    }
+#endif
     char *p=(char*)buf;
     while(n){
-        ssize_t r=write_mode?send(fd,p,n,0):recv(fd,p,n,MSG_WAITALL);
+        ssize_t r=write_mode?send(fd,p,n,send_flags):recv(fd,p,n,MSG_WAITALL);
         if(r<=0){ if(r<0&&errno==EINTR) continue; return -1; }
         p+=r; n-=(size_t)r;
     }
@@ -3824,7 +3842,9 @@ static int g_pipe=0;      /* PIPE=1: async expert-load pipeline. Default ON for 
                            * Keeps expert pread off the forward-pass thread so loads overlap
                            * the matmul. PIPE=0 opts back into the blocking serial path. */
 static int g_pipe_nw=8;   /* PIPE_WORKERS=n: I/O worker threads (disk-parallel reads) */
+#if defined(__linux__) || !defined(COLIBRI_NO_MAIN)
 static int g_uring=0;     /* URING=1: Linux io_uring load/completion backend; implies PIPE */
+#endif
 static int g_pipe_block=0;/* COLI_PIPE_BLOCK=1: pipe_wait blocca su una condvar invece dello
                            * spin sched_yield (default OFF = spin byte-identico). EN: a yield
                            * storm on the main thread fights the OpenMP team for cycles during
@@ -5572,20 +5592,23 @@ static int mb_gs_compat(int est_fmt, int est_gs, int fmt, int gs){
 static const void *vk_qt_codes(const QT *t){
     return t->fmt==0 ? (const void*)t->qf : (t->fmt==1||t->fmt==8) ? (const void*)t->q8 : (const void*)t->q4;
 }
-/* An expert slot as the tier reads it, or 0 when its tensors are not in the format the
- * tier was configured with (a mixed container): such an expert stays on the CPU. */
-static int vk_slot_src(const ESlot *e, VktExpertSrc *src){
-    if(!g_vkt.on || e->g.fmt!=g_vkt.gu_fmt || e->u.fmt!=g_vkt.gu_fmt || e->g.gs!=g_vkt.gu_gs ||
-       e->u.gs!=g_vkt.gu_gs || e->d.fmt!=g_vkt.dn_fmt || e->d.gs!=g_vkt.dn_gs ||
+/* An expert slot of `layer` as the tier reads it, or 0 when its tensors are not in the
+ * format the tier was configured with for that layer (the model's, or the MTP head's:
+ * int8 beside int4; a mixed container): such an expert stays on the CPU. */
+static int vk_slot_src(const ESlot *e, int layer, VktExpertSrc *src){
+    int k = layer>=g_vkt.nl;
+    if(!g_vkt.on || e->g.fmt!=g_vkt.gu_fmt[k] || e->u.fmt!=g_vkt.gu_fmt[k] || e->g.gs!=g_vkt.gu_gs[k] ||
+       e->u.gs!=g_vkt.gu_gs[k] || e->d.fmt!=g_vkt.dn_fmt[k] || e->d.gs!=g_vkt.dn_gs[k] ||
        e->g.planar || e->u.planar || e->d.planar) return 0;
     *src=(VktExpertSrc){vk_qt_codes(&e->g),vk_qt_codes(&e->u),vk_qt_codes(&e->d),e->g.s,e->u.s,e->d.s};
     return src->g && src->u && src->d;
 }
-/* Does this MoE call go through moe_vk? Layers 0..n_layers-1 only: the MTP head's
- * experts are int8 and stay on the CPU. CUDA, Metal, the cluster workers and the
+/* Does this MoE call go through moe_vk? The layers the tier serves: the model's, and
+ * the MTP head's (index n_layers) when the tier took it as an extra layer (its experts
+ * int8 beside int4, COLI_VK_TIER_MTP). CUDA, Metal, the cluster workers and the
  * ablation harness keep moe()'s own loop. */
 static int moe_vk_on(Model *m,int layer){
-    if(!g_vulkan || layer<0 || layer>=m->c.n_layers || omp_in_parallel()) return 0;
+    if(!g_vulkan || layer<0 || layer>=(vkt_ready() ? vkt_layers() : m->c.n_layers) || omp_in_parallel()) return 0;
     if(!vkt_ready() && g_vk_reg_n2<=0) return 0;
     if(g_abl.mode || g_metal_enabled || g_pre_idx) return 0;
 #if !defined(_WIN32)
@@ -5649,7 +5672,7 @@ static void vk_cpu_pairs(Model *m,int layer,const float *x,int rows,int K,const 
             if(g_prof){ m->t_ecpu+=dt; m->cpu_expert_rows+=(uint64_t)nr;
                 m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d); }
             VktExpertSrc vs;
-            if(note && vk_slot_src(e,&vs)) vkt_note(layer,eid,&vs);   /* may promote it to the device */
+            if(note && vk_slot_src(e,layer,&vs)) vkt_note(layer,eid,&vs);   /* may promote it to the device */
         }
         ecache_promote_ws(m,layer,nmiss);
     }
@@ -8332,6 +8355,35 @@ static int forward_all(Model *m, const int *ids, int S, int *pred, const int *re
  * input: file con righe "<ctxlen> <contlen> <id0> .. <id_{T-1}>"  (T=ctxlen+contlen)
  * output: riga "<logprob_continuazione> <contlen> <greedy 0/1>" per richiesta.
  * Un solo forward per richiesta (teacher-forcing): niente generazione -> fattibile a bassa velocita'. */
+/* SCORE rows are a whitespace-separated pair of lengths and exactly that
+ * many vocabulary ids. Check the entire file before allocating inference
+ * buffers or emitting any score; a missing id must not become token zero. */
+static int score_int(char **cursor, int *value){
+    char *p=*cursor, *end;
+    while(isspace((unsigned char)*p)) p++;
+    if(!*p) return 0;
+    errno=0;
+    long n=strtol(p,&end,10);
+    if(p==end || errno==ERANGE || n<0 || n>INT_MAX ||
+       (*end && !isspace((unsigned char)*end))) return 0;
+    *value=(int)n; *cursor=end; return 1;
+}
+static int score_row(char *line, size_t length, int vocab, int reserve,
+                     int *ctx, int *cont, int *ids, int capacity){
+    if(memchr(line,0,length)) return 0;
+    char *p=line;
+    if(!score_int(&p,ctx) || !score_int(&p,cont) || *ctx<1 ||
+       *ctx>INT_MAX-reserve || *cont>INT_MAX-reserve-*ctx) return 0;
+    int total=*ctx+*cont;
+    if(ids && total>capacity-reserve) return 0;
+    for(int i=0;i<total;i++){
+        int id;
+        if(!score_int(&p,&id) || id>=vocab) return 0;
+        if(ids) ids[i]=id;
+    }
+    while(isspace((unsigned char)*p)) p++;
+    return !*p;
+}
 static void run_score(Model *m, const char *snap, const char *path){
     Cfg *c=&m->c; int D=c->hidden;
     /* prefisso GLM (#108): il modello vede [gMASK]<sop> in testa a OGNI sequenza di training —
@@ -8355,18 +8407,29 @@ static void run_score(Model *m, const char *snap, const char *path){
         free(ar);
     }
     FILE *f=fopen(path,"rb"); if(!f){perror(path);exit(1);}
-    int maxT=1; { char *ln=NULL; size_t cp=0;
-        while(getline(&ln,&cp,f)>0){ int a,b; if(sscanf(ln,"%d %d",&a,&b)==2 && a+b>maxT) maxT=a+b; }
+    int maxT=1, reserve=pfx_on?2:0; { char *ln=NULL; size_t cp=0; ssize_t length; size_t lineno=0;
+        while((length=getline(&ln,&cp,f))>0){
+            int ctx,cont; lineno++;
+            if(!score_row(ln,(size_t)length,c->vocab,reserve,&ctx,&cont,NULL,0)){
+                fprintf(stderr,"[SCORE] invalid request at line %zu\n",lineno); exit(1);
+            }
+            if(ctx+cont>maxT) maxT=ctx+cont;
+        }
+        if(ferror(f)){ perror(path); exit(1); }
         free(ln); }
     if(pfx_on) maxT+=2;   /* le richieste senza prefisso crescono di 2 token */
     kv_alloc(m,maxT);
     float *x=falloc((int64_t)maxT*D), *lo=falloc(c->vocab), *row=falloc(D);
-    int *ids=malloc(maxT*sizeof(int));
-    rewind(f); char *ln=NULL; size_t cp=0; int nreq=0; double t0=now_s();
-    while(getline(&ln,&cp,f)>0){
-        char *p=ln; int ctxlen=strtol(p,&p,10), contlen=strtol(p,&p,10), T=ctxlen+contlen;
-        if(T<=0||ctxlen<1){ printf("0 0 0\n"); fflush(stdout); continue; }
-        for(int i=0;i<T;i++) ids[i]=strtol(p,&p,10);
+    int *ids=malloc((size_t)maxT*sizeof(int));
+    if(!ids){ perror("SCORE token buffer"); exit(1); }
+    rewind(f); char *ln=NULL; size_t cp=0; ssize_t length; size_t lineno=0;
+    int nreq=0; double t0=now_s();
+    while((length=getline(&ln,&cp,f))>0){
+        int ctxlen,contlen; lineno++;
+        if(!score_row(ln,(size_t)length,c->vocab,reserve,&ctxlen,&contlen,ids,maxT)){
+            fprintf(stderr,"[SCORE] invalid request at line %zu\n",lineno); exit(1);
+        }
+        int T=ctxlen+contlen;
         if(pfx_on && !(T>=2 && ids[0]==pfx[0] && ids[1]==pfx[1])){   /* gia' prefissato -> intatto */
             memmove(ids+2,ids,(size_t)T*sizeof(int));
             ids[0]=pfx[0]; ids[1]=pfx[1]; ctxlen+=2; T+=2;
@@ -8383,6 +8446,7 @@ static void run_score(Model *m, const char *snap, const char *path){
         if(++nreq%5==0) fprintf(stderr,"[score %d req | %.1fs | RSS %.2f GB | hit %.0f%%]\n",
             nreq, now_s()-t0, rss_gb(), (m->hits+m->miss)?100.0*m->hits/(m->hits+m->miss):0.0);
     }
+    if(ferror(f)){ perror(path); exit(1); }
     free(ln); free(ids); free(x); free(lo); free(row); fclose(f);
 }
 
@@ -10851,7 +10915,7 @@ static int vk_load_batch(void *ctx,int layer,const int *e,int n,VktExpertSrc *sr
         for(int q=0;q<nmiss;q++) expert_load(m,layer,e[miss[q]],&m->ws[q],1,1);
         m->t_ewait += now_s()-t0; }
     int k=0;
-    for(;k<n;k++){ if(!vk_slot_src(use[k],&srcs[k])) break; h[k]=m; }
+    for(;k<n;k++){ if(!vk_slot_src(use[k],layer,&srcs[k])) break; h[k]=m; }
     g_vks_layer=layer; g_vks_nmiss=nmiss; g_vks_held=k;
     if(!k) vk_stream_promote(m);
     return k;
@@ -10911,8 +10975,24 @@ static void vk_tier_start(Model *m){
     if(g_glmc_partial) dense+=(double)g_glmc_lazy;
     { const char *r=getenv("COLI_VK_RESERVE_GB"), *tr=getenv("COLI_VK_TIER_RESERVE_GB");
       if(r && *r){ double extra=atof(r)-(tr&&*tr?atof(tr):1.0); if(extra>0) dense+=extra*1073741824.0; } }
+    /* The MTP head's layer (index NL): its experts as the container keeps them (int8
+     * beside int4), the tier's extra layer. By default on a discrete GPU only: on a GPU
+     * that shares the RAM, qwen38's head measured no faster there (docs/vulkan.md, "The
+     * MTP head's layer on the tier"); COLI_VK_TIER_MTP=1 or 0 decides. */
+    VktFmt xgu={VKT_SRC_NONE,0}, xdn={VKT_SRC_NONE,0}; int xf[3]={0,0,0}, xgs[3]={0,0,0};
+    { const char *tm=getenv("COLI_VK_TIER_MTP");
+      int want = tm&&*tm ? *tm!='0' : !coli_vk_device_shares_ram();
+      if(m->has_mtp && want){
+          for(int k=0;k<3;k++) xf[k]=vk_expert_fmt(m,NL,0,k,&xgs[k]);
+          if(xf[0]!=xf[1] || xgs[0]!=xgs[1] || !vk_src_kind(xf[0],xgs[0],&xgu) || !vk_src_kind(xf[2],xgs[2],&xdn)){
+              fprintf(stderr,"[VK] tier colibri: the MTP head's experts in fmt %d/%d/%d have no device form, they stay on the CPU\n",
+                      xf[0],xf[1],xf[2]);
+              xgu.kind=VKT_SRC_NONE;
+          }
+      } }
     VktConfig vc={.engine="colibri", .layers=NL, .experts=E, .hidden=c->hidden, .inter=c->moe_inter, .topk=c->topk,
                   .gate_up=gu, .down=dn, .act=VKT_ACT_SWIGLU, .act_limit=0.f,
+                  .extra_layers=xgu.kind!=VKT_SRC_NONE, .extra_gate_up=xgu, .extra_down=xdn,
                   .max_rows=GLM_VK_ROWS*c->topk,
                   .ram_reserve=(size_t)((double)m->ecap*expert_cache_row_bytes(m,m->ebits)),
                   .dense_bytes=(size_t)dense,
@@ -10921,7 +11001,8 @@ static void vk_tier_start(Model *m){
                   .load=vk_load, .release=vk_unhold, .load_ctx=m, .load_batch=vk_load_batch};
     atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
     if(!vkt_init(&vc,m->eusage)) return;
-    g_vkt.on=1; g_vkt.gu_fmt=f[0]; g_vkt.gu_gs=gs[0]; g_vkt.dn_fmt=f[2]; g_vkt.dn_gs=gs[2];
+    g_vkt.on=1; g_vkt.nl=NL; g_vkt.gu_fmt[0]=f[0]; g_vkt.gu_gs[0]=gs[0]; g_vkt.dn_fmt[0]=f[2]; g_vkt.dn_gs[0]=gs[2];
+    g_vkt.gu_fmt[1]=xf[0]; g_vkt.gu_gs[1]=xgs[0]; g_vkt.dn_fmt[1]=xf[2]; g_vkt.dn_gs[1]=xgs[2];
     g_vkt.exp_bytes=vkt_expert_bytes(c->hidden,c->moe_inter,gu,dn);
     atexit(vkt_shutdown);
     g_vk_model=m; atexit(vk_tier_report_run);   /* runs first: the tier is still up */
@@ -10937,9 +11018,9 @@ static void vk_tier_start(Model *m){
         #pragma omp parallel for schedule(dynamic,4)
         for(int i=0;i<n;i++){
             VktExpertSrc vs; ESlot *p=pin_indexed(m,ql[i],qe[i]);
-            if(p && vk_slot_src(p,&vs)){ vkt_put(ql[i],qe[i],&vs); continue; }
+            if(p && vk_slot_src(p,ql[i],&vs)){ vkt_put(ql[i],qe[i],&vs); continue; }
             ESlot *t=&tmp[omp_get_thread_num()];
-            int ok = expert_load(m,ql[i],qe[i],t,0,0)==0 && vk_slot_src(t,&vs);   /* demand=0: startup */
+            int ok = expert_load(m,ql[i],qe[i],t,0,0)==0 && vk_slot_src(t,ql[i],&vs);   /* demand=0: startup */
             vkt_put(ql[i],qe[i],ok?&vs:NULL);   /* NULL: planned but not placed (a mixed container) */
         }
         vkt_put_done();

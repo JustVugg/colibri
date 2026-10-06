@@ -55,17 +55,18 @@ dho_qwen36_olmoe_fixtures() {
 }
 
 # dho_olmoe_cap_gate: olmoe's automatic cache (cap 0) under a RAM_GB that leaves the
-# experts almost nothing beside the dense weights: with the host copies kept it stays
+# experts half of their bytes beside the dense weights (the room is RAM_GB less what is
+# resident less 0.5 GB; the KV is not set aside): with the host copies kept it stays
 # below every expert of a layer, on the device only it takes them all (the 64 MiB the
 # dense weights held hold them many times over).
 dho_olmoe_cap_gate() {
   local R=olmoe_wide/ref_olmoe.json
   SNAP=olmoe_wide_c ./olmoe 8 8 $R > cpu.log 2>&1 || true
-  local rss kv ram
+  local rss half ram
   rss=$(sed -n 's/.*RSS after load: \([0-9.]*\) GB.*/\1/p' cpu.log | tail -1)
   [ -n "$rss" ] || { cat cpu.log; fail "olmoe automatic cache: no RSS after load"; }
-  kv=$($PY -c 'import json; c=json.load(open("olmoe_wide_c/config.json")); print(2*c["num_hidden_layers"]*c["num_attention_heads"]*4096*(c["hidden_size"]//c["num_attention_heads"])*4/1e9)')
-  ram=$($PY -c "print(f'{$rss + $kv + 0.5:.4f}')")
+  half=$($PY -c 'import json; c=json.load(open("olmoe_wide_c/config.json")); h,i=c["hidden_size"],c["intermediate_size"]; print((h*i*3+(2*i+h)*4)*c["num_experts"]*c["num_hidden_layers"]/2/1e9)')
+  ram=$($PY -c "print(f'{$rss + 0.5 + $half:.4f}')")
   local vk=(COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 RAM_GB=$ram SNAP=olmoe_wide_c)
   rm -f chain.usage
   env "${vk[@]}" COLI_USAGE=chain.usage COLI_VK_DENSE_HOST=1 ./olmoe 0 8 $R > host.log 2>&1 || true

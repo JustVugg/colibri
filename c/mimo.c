@@ -354,18 +354,21 @@ static int dw_vk_fmt(const DW *d, int *gs, const float **sc) {
     return -1;
 }
 
+static int g_mimo_vk_dev;   /* the device dw_upload sends a new matrix to: 1 for the chain's layers on
+                            * COLI_VK_DEV2's (mimo_chain.h) */
 static int dw_upload(DW *d) {
     int gs; const float *sc;
     int fmt = dw_vk_fmt(d, &gs, &sc);
     if (d->vk || d->vk_off || !d->w) return d->vk != NULL;
-    if (fmt < 0 || !coli_vk_tensor_ensure((ColiVkTensor **)&d->vk, d->w, sc, fmt, d->I, d->O, gs)) d->vk_off = 1;
+    if (fmt < 0 || !(g_mimo_vk_dev ? coli_vk_tensor_ensure2((ColiVkTensor **)&d->vk, d->w, sc, fmt, d->I, d->O, gs)
+                                   : coli_vk_tensor_ensure((ColiVkTensor **)&d->vk, d->w, sc, fmt, d->I, d->O, gs))) d->vk_off = 1;
     return d->vk != NULL;
 }
 
 static int dw_matmul_vk(float *y, const float *x, int S, const DW *d) {
     if (!g_vk_ready || !(coli_vk_dense() || g_mimo_dho) || d->vk_off || !vk_main_thread()) return 0;
     DW *dev = (DW *)d;     /* the device copy is a cache inside a read-only matrix */
-    if (!dw_upload(dev)) return 0;
+    if (!dw_upload(dev) || coli_vk_tensor_dev((ColiVkTensor *)dev->vk)) return 0;   /* the second device's: only its chain */
     int gs; const float *sc;
     int fmt = dw_vk_fmt(d, &gs, &sc);
     return coli_vk_matmul((ColiVkTensor **)&dev->vk, y, x, d->w, sc, fmt, S, d->I, d->O, gs);
@@ -608,6 +611,7 @@ typedef struct {
     uint8_t **ehit;              /* [layer][expert] routed this turn, for HITS */
 #ifdef COLI_VULKAN
     void *vkchain;               /* the dense chain's device state (mimo_chain.h), NULL until it runs */
+    void *vkchain2;              /* its layers on COLI_VK_DEV2's device, after the primary's (mimo_chain.h) */
 #endif
 } Model;
 
@@ -1460,6 +1464,23 @@ static void mc_fit_start(Model *m) {
     g_mc_count = -1; g_mc_fitcount = 0;
     free(g.o_kvd);
     vkc_fit("mimo", L, per, mat, fixed, tail, &g_mc_fit);
+    /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
+     * n0 with that device's free memory, its pipelines up now (the head goes with it when it
+     * ends at the last layer with room; the tower stays on the CPU) */
+    int n0 = g_mc_fit.n;
+    if (vkc_fit_partial(&g_mc_fit) && n0 > 0 && n0 < L && mc_dev2_wanted() && getenv("COLI_VK_DEV2") &&
+        coli_vk_dev2_open_env()) {
+        vkc_device(1);
+        size_t tail2 = vkc_fit_tensor(hf, m->head.I, m->head.O, hg);
+        int n2 = vkc_fit("mimo dev2", L - n0, per + n0, mat + n0, fixed, tail2, &g_mc_fit2);
+        if (n2 > 0 && !vkc_init()) {
+            fprintf(stderr, "[VK] mimo chain: the second device's pipelines did not come up; its layers stay on the CPU\n");
+            n2 = 0;
+        }
+        g_mc_fit2_on = n2 > 0;
+        if (!g_mc_fit2_on) g_mc_fit2.tail = 0;
+        vkc_device(0);
+    }
     free(per); free(mat);
 }
 /* Layers from..L-1, the head and the tower refused to the device: what of them is there
@@ -1474,7 +1495,8 @@ static void mc_refuse_from(Model *m, int from) {
         Layer *l = &m->L[li];
         mc_refuse(&l->qkv); mc_refuse(&l->o); mc_refuse(&l->gate); mc_refuse(&l->up); mc_refuse(&l->down);
     }
-    mc_refuse(&m->head);
+    if (!(m->head.vk && coli_vk_tensor_dev((ColiVkTensor *)m->head.vk)))   /* the second device's chain keeps it */
+        mc_refuse(&m->head);
     if (g_vision) {
         Vision *v = g_vision;
         mc_refuse(&v->embed); mc_refuse(&v->fc1); mc_refuse(&v->fc2);
@@ -1488,6 +1510,7 @@ static void dw_drop(DW *d, int *n);   /* below */
  * freed, it and the rest refused, vkc_fit_shrink); dropped: with COLI_VK_DENSE_HOST, each
  * layer's host copies given back once all of it is on the device (counted there). */
 static void mc_place(Model *m, int *dropped) {
+    int n0 = g_mc_fit.n;
     for (int i = 0; i < g_mc_fit.n; i++) {
         Layer *l = &m->L[i];
         DW *d[5] = {&l->qkv, &l->o, &l->gate, &l->up, &l->down};
@@ -1501,7 +1524,38 @@ static void mc_place(Model *m, int *dropped) {
         if (dropped) for (int k = 0; k < nd; k++) dw_drop(d[k], dropped);
         vkc_fit_mark(&g_mc_fit, i);
     }
-    if (vkc_fit_partial(&g_mc_fit)) mc_refuse_from(m, g_mc_fit.n);   /* the CPU's layers, the head, the tower */
+    int end = g_mc_fit.n;
+    if (g_mc_fit2_on && g_mc_fit.n < n0) {
+        /* the primary placed fewer layers than its fit: the second device's would not follow
+         * them, so they stay on the CPU too */
+        fprintf(stderr, "[VK] mimo chain: the primary device stopped before layer %d; layers %d..%d stay on the CPU, "
+                        "not on the second device\n", n0, n0, n0 + g_mc_fit2.n - 1);
+        g_mc_fit2_on = 0;
+        vkc_device(1); vkc_shutdown(); vkc_device(0);
+    } else if (g_mc_fit2_on) {   /* the second device's layers (their host copies kept), and the head with the last one */
+        vkc_device(1); g_mimo_vk_dev = 1;
+        for (int i = n0; i < n0 + g_mc_fit2.n; i++) {
+            Layer *l = &m->L[i];
+            DW *d[5] = {&l->qkv, &l->o, &l->gate, &l->up, &l->down};
+            int nd = m->c.moe[i] ? 2 : 5, ok = 1;
+            for (int k = 0; k < nd && ok; k++) ok = dw_upload(d[k]);
+            if (!ok) {
+                g_mimo_vk_dev = 0;
+                mc_refuse_from(m, i);
+                vkc_fit_shrink("mimo dev2", &g_mc_fit2, i - n0, "a dense matrix did not go up");
+                g_mimo_vk_dev = 1;
+                break;
+            }
+            vkc_fit_mark(&g_mc_fit2, i - n0);
+        }
+        end = n0 + g_mc_fit2.n;
+        if (end == m->c.n_layers && g_mc_fit2.tail && !dw_upload(&m->head)) g_mc_fit2.tail = 0;
+        g_mimo_vk_dev = 0;
+        vkc_fit_placed("mimo dev2", &g_mc_fit2);
+        if (!g_mc_fit2.n) { g_mc_fit2_on = 0; vkc_shutdown(); }
+        vkc_device(0);
+    }
+    if (vkc_fit_partial(&g_mc_fit)) mc_refuse_from(m, end);   /* the CPU's layers, the head (unless the second device's), the tower */
     vkc_fit_placed("mimo", &g_mc_fit);
     g_mc_placed = 1;
 }
@@ -2137,7 +2191,7 @@ int main(int argc, char **argv) {
         if (g_vk_ready && !vkt_ready() && !coli_vk_dense()) coli_vk_dense_decide("mimo", 0, 1);   /* no tier after all */
         if (g_vk_chain) {   /* the chain's teardown before the device's (the tier registered the device's) */
             if (!tier) atexit(coli_vk_shutdown);
-            atexit(vkc_shutdown);
+            atexit(vkc_shutdown_all);
         }
     }
     if (g_vk_ready && (coli_vk_dense() || g_vk_chain) && !(g_mc_fit.L && !g_mc_fit.n)) {   /* COLI_VK_DENSE=0: the trunk stays on the CPU */

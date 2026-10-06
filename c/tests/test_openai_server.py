@@ -29,8 +29,9 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            parse_qwen_tool_calls,
                            read_engine_turn, render_chat, render_chat_qwen, render_chat_for_arch,
                            render_chat_glm53, render_chat_inkling, render_chat_kimi,
-                           render_chat_olmoe, render_chat_qwen,
-                           render_chat_qwen38, render_chat_v4, render_chat_dsv41,
+                            render_chat_olmoe, render_chat_qwen,
+                            render_chat_qwen38, render_chat_v4, render_chat_dsv41,
+                            render_chat_mimo,
                            _dsv4_tool_calls, serve,
                            resolve_generation_prompt, split_thinking_reply,
                            detect_chat_flavor, qwen36_has_vision,
@@ -38,8 +39,9 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            parse_tool_calls_spans, parse_arch_tool_calls_spans,
                            THINK_OPEN, THINK_CLOSE,
                            _compose_span_maps, _cut_span_map, _project_span,
-                           _keepalive_choice,
-                           stop_policy, tune_child_env)
+                            _keepalive_choice,
+                            stop_policy, tune_child_env,
+                            TOOL_CHOICE_REQUIRED_INSTRUCTION)
 
 
 def echo_record(pos, data, lp, topk):
@@ -2509,6 +2511,22 @@ class OpenAIHonestySetTest(unittest.TestCase):
         generation_options({"best_of": 1, "logit_bias": {}, "suffix": None,
                             "modalities": ["text"]}, 16)
 
+    def test_modalities_rejects_unsupported_or_malformed_values(self):
+        cases = (
+            ("audio", "invalid_value"),
+            ([], "invalid_value"),
+            ([7], "invalid_value"),
+            (["video"], "unsupported_value"),
+            (["text", "video"], "unsupported_value"),
+        )
+        for value, code in cases:
+            with self.subTest(value=value):
+                with self.assertRaises(APIError) as caught:
+                    generation_options({"modalities": value}, 16)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.param, "modalities")
+                self.assertEqual(caught.exception.code, code)
+
     def test_intentionally_ignored_fields_return_200_and_do_not_reach_engine(self):
         base = {"model": "test-model", "prompt": "Complete me",
                 "temperature": 0, "max_tokens": 4}
@@ -2797,6 +2815,25 @@ class HTTPTest(unittest.TestCase):
             self.request("/v1/models", key="wrong")
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
+
+    def test_unsupported_modalities_fail_before_engine_work(self):
+        cases = (
+            ("/v1/completions", {"prompt": "hi", "modalities": ["video"]},
+             "unsupported_value"),
+            ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],
+                                      "modalities": "audio"}, "invalid_value"),
+        )
+        for path, fields, code in cases:
+            with self.subTest(path=path):
+                calls_before = len(self.engine.calls)
+                with self.assertRaises(HTTPError) as caught:
+                    self.request(path, {"model": "test-model", **fields})
+                self.addCleanup(caught.exception.close)
+                self.assertEqual(caught.exception.code, 400)
+                error = json.load(caught.exception)["error"]
+                self.assertEqual(error["param"], "modalities")
+                self.assertEqual(error["code"], code)
+                self.assertEqual(len(self.engine.calls), calls_before)
 
     def test_a_malformed_tools_or_messages_is_a_client_error_on_every_family(self):
         """`tools: 5` or `messages: null` answered HTTP 500 on most families.
@@ -3292,6 +3329,39 @@ class HTTPTest(unittest.TestCase):
                 with patch("openai_server.ARCH", arch):
                     with self.request("/v1/chat/completions",
                                       history({"name": "fn", "arguments": "{}"})) as response:
+                        self.assertEqual(response.status, 200)
+
+    def test_past_tool_calls_that_are_not_an_array_are_a_client_error(self):
+        """A replayed assistant turn with `tool_calls: 5` answered HTTP 500 on Qwen and Kimi.
+
+        The other renderers already answer 400 "`tool_calls` must be an array.". The Qwen
+        renderer's _qwen_tool_calls and Kimi's _k3_order_tool_results iterated the value as
+        it came, and the TypeError became do_POST's 500 "The colibri engine failed to process the
+        request."
+        """
+        def history(tool_calls):
+            return {"model": "test-model", "messages": [
+                {"role": "user", "content": "run it"},
+                {"role": "assistant", "content": "", "tool_calls": tool_calls},
+                {"role": "tool", "tool_call_id": "x", "content": "done"},
+                {"role": "user", "content": "and now?"},
+            ]}
+        for arch in ("glm", "glm53", "qwen36", "qwen38", "kimi", "deepseek_v4",
+                     "deepseek_v41", "mimo"):
+            for tool_calls in (5, 1.5, True, "call", {"id": "x"}):
+                with self.subTest(arch=arch, tool_calls=tool_calls):
+                    with patch("openai_server.ARCH", arch):
+                        with self.assertRaises(HTTPError) as caught:
+                            self.request("/v1/chat/completions", history(tool_calls))
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(json.loads(caught.exception.read())["error"]["param"],
+                                     "messages.1.tool_calls")
+            with self.subTest(arch=arch, tool_calls="well formed"):
+                with patch("openai_server.ARCH", arch):
+                    with self.request("/v1/chat/completions", history([
+                            {"id": "x", "type": "function",
+                             "function": {"name": "fn", "arguments": "{}"}}])) as response:
                         self.assertEqual(response.status, 200)
 
 
@@ -3809,6 +3879,97 @@ class ToolChoiceTest(unittest.TestCase):
     def test_rejects_tool_choice_without_tools(self):
         with self.assertRaises(APIError):
             generation_options({"messages": [], "tool_choice": "required"}, 128)
+
+    # #1698 Tier 2: `required` was prompt-level on four renderers and dropped by
+    # the four others that accept it, so a client got the tools and no instruction
+    # to use them. These pin the one-line difference per renderer, because the
+    # failure is silent: the request succeeds, the model just answers in prose.
+
+    # The renderers that render a tool block and therefore have somewhere to put
+    # the instruction. Kimi K3 is absent on purpose: its wire format carries a
+    # dedicated tool-choice message rather than prose (tested below).
+    BLOCK_RENDERERS = (render_chat, render_chat_v4, render_chat_dsv41, render_chat_qwen,
+                       render_chat_qwen38, render_chat_glm53, render_chat_mimo)
+
+    def _auto_and_required(self, render, **kwargs):
+        messages = [{"role": "user", "content": "Where is order 7?"}]
+        return (render(messages, tools=ORDER_TOOL, tool_choice="auto", **kwargs),
+                render(messages, tools=ORDER_TOOL, tool_choice="required", **kwargs))
+
+    def test_required_is_auto_plus_exactly_the_instruction(self):
+        for render in self.BLOCK_RENDERERS:
+            with self.subTest(renderer=render.__name__):
+                auto, required = self._auto_and_required(render)
+                self.assertEqual(required.count(TOOL_CHOICE_REQUIRED_INSTRUCTION), 1)
+                # Nothing else moves: the instruction is the whole difference
+                # between `auto` and `required` on every one of these families.
+                self.assertEqual(
+                    required.replace(TOOL_CHOICE_REQUIRED_INSTRUCTION, "", 1), auto)
+
+    def test_required_instruction_comes_after_the_declarations(self):
+        # "the functions above" has to be true, so the instruction goes after the
+        # last declared function and not inside or before the tool block.
+        for render in self.BLOCK_RENDERERS:
+            with self.subTest(renderer=render.__name__):
+                _, required = self._auto_and_required(render)
+                self.assertLess(required.rindex("lookup_order"),
+                                required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION))
+
+    def test_required_sits_between_the_tool_block_and_the_system_text(self):
+        # Qwen3.6/3.8 build one system turn as [tool block][client system text];
+        # the instruction belongs to the tool half, so it goes between the two
+        # and not after the client's own text.
+        system = [{"role": "system", "content": "Be terse."},
+                  {"role": "user", "content": "Where is order 7?"}]
+        for render in (render_chat_qwen, render_chat_qwen38):
+            with self.subTest(renderer=render.__name__):
+                required = render(system, tools=ORDER_TOOL, tool_choice="required")
+                self.assertLess(required.index("# Tools"),
+                                required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION))
+                self.assertLess(required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION),
+                                required.index("Be terse."))
+
+    def test_mimo_required_stays_inside_the_tool_system_turn(self):
+        # MiMo's declaration block is a system turn of its own, so there is
+        # nowhere outside it to put the line: it has to land after </tools> and
+        # before that turn's <|im_end|>, or the frame closes before the model
+        # has read it.
+        _, required = self._auto_and_required(render_chat_mimo)
+        close = required.index("</tools>")
+        self.assertLess(close, required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION))
+        self.assertLess(required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION),
+                        required.index("<|im_end|>"))
+
+    def test_olmoe_required_under_the_tool_fallback(self):
+        with patch("openai_server._TOOL_FALLBACK", True):
+            auto, required = self._auto_and_required(render_chat_olmoe)
+        self.assertEqual(required.count(TOOL_CHOICE_REQUIRED_INSTRUCTION), 1)
+        self.assertEqual(required.replace(TOOL_CHOICE_REQUIRED_INSTRUCTION, "", 1), auto)
+        self.assertLess(required.rindex("lookup_order"),
+                        required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION))
+
+    def test_olmoe_without_the_fallback_refuses_required(self):
+        # No tool block, so no instruction to give: the honest outcome is the
+        # 400, not a `required` that is accepted and then ignored.
+        with patch("openai_server._TOOL_FALLBACK", False):
+            with self.assertRaisesRegex(APIError, "Tool use"):
+                render_chat_olmoe([{"role": "user", "content": "Hi"}], tools=ORDER_TOOL,
+                                  tool_choice="required")
+
+    def test_inkling_refuses_required(self):
+        with self.assertRaisesRegex(APIError, "not wired up"):
+            render_chat_inkling([{"role": "user", "content": "Hi"}], tools=ORDER_TOOL,
+                                tool_choice="required")
+
+    def test_kimi_keeps_its_own_required_wording(self):
+        # Same policy, different wire format: a dedicated tool-choice message
+        # instead of prose appended to the tool block.
+        required = render_chat_kimi([{"role": "user", "content": "Hi"}],
+                                    tools=ORDER_TOOL, tool_choice="required")
+        self.assertIn("tool-choiceThe system is invoked with `tool_choice=required`.",
+                      required)
+        self.assertIn("You MUST call tools in the next message.", required)
+        self.assertNotIn(TOOL_CHOICE_REQUIRED_INSTRUCTION, required)
 
 
 class TrailingAssistantTurnTest(unittest.TestCase):
@@ -7411,6 +7572,63 @@ class EngineCapsTest(unittest.TestCase):
                     self.assertIs(engine.vision, expected)
                 finally:
                     engine.close()
+
+
+class EngineLoadFailTest(unittest.TestCase):
+    """An engine that cannot load says `LOAD_FAIL kind=<kind> <detail>` and exits
+    before READY; the gateway raises the kind, not "exited unexpectedly"."""
+
+    def _engine(self, stdout_bytes):
+        process = FakeProcess(lambda _process, _frame: None)
+        process.stdout = BlockingStream(stdout_bytes)
+        process.stdout.close()   # the engine is gone: EOF right after what it said
+        with patch("openai_server.ARCH", "glm53"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            return Engine("glm53", "model")
+
+    def test_load_fail_line_is_raised_as_its_kind(self):
+        detail = "model-00007.safetensors: short read at EOF (off 8, 0/16 bytes)"
+        for kind in ("nomem", "io", "format", "unsupported"):
+            with self.subTest(kind=kind):
+                with self.assertRaises(openai_server.EngineLoadError) as caught:
+                    self._engine(f"LOAD_FAIL kind={kind} {detail}\n".encode())
+                self.assertEqual(caught.exception.kind, kind)
+                self.assertEqual(caught.exception.detail, detail)
+                self.assertIn(f"kind={kind}", str(caught.exception))
+                self.assertNotIn("unexpectedly", str(caught.exception))
+
+    def test_engine_that_says_nothing_is_still_exited_unexpectedly(self):
+        with self.assertRaisesRegex(RuntimeError, "exited unexpectedly") as caught:
+            self._engine(b"")
+        self.assertNotIsInstance(caught.exception, openai_server.EngineLoadError)
+
+    def test_parse_load_fail_takes_the_last_line_and_keeps_the_detail_whole(self):
+        parse = openai_server.parse_load_fail
+        self.assertIsNone(parse(b"HWINFO 8 64 32 0 0 cpu|none\n"))
+        self.assertEqual(parse(b"noise\nLOAD_FAIL kind=nomem malloc 12 bytes for tensor a.b failed\n"),
+                         ("nomem", "malloc 12 bytes for tensor a.b failed"))
+        self.assertEqual(parse(b"LOAD_FAIL kind=io\n"), ("io", ""))
+
+    def test_serve_logs_the_kind_and_exits(self):
+        error = openai_server.EngineLoadError("nomem", "malloc 12 bytes for tensor a.b failed")
+        stderr = io.StringIO()
+        # serve() sets the module's ARCH / CHAT_FLAVOR for the family it resolves;
+        # patched here so the rest of the suite keeps its defaults.
+        with patch("openai_server.ARCH", openai_server.ARCH), \
+             patch("openai_server.CHAT_FLAVOR", openai_server.CHAT_FLAVOR), \
+             patch("openai_server.Engine", side_effect=error), \
+             patch("openai_server.resolve_model") as resolve, \
+             patch("openai_server.default_engine", return_value="colibri"), \
+             patch("openai_server.detect_chat_flavor", return_value=None), \
+             patch("openai_server.APIServer") as api_server, \
+             patch("sys.stderr", stderr):
+            resolve.return_value.descriptor = openai_server.family_by_id("glm53")
+            with self.assertRaises(SystemExit) as caught:
+                openai_server.serve("model", "127.0.0.1", 8000, "id", None)
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("[gateway] engine load failed: kind=nomem malloc 12 bytes for tensor a.b failed",
+                      stderr.getvalue())
+        api_server.return_value.server_close.assert_called_once()
 
 
 class ServedModalityTest(unittest.TestCase):

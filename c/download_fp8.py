@@ -6,6 +6,7 @@ Usage: python download_fp8.py
        python download_fp8.py --dest /data/glm52_fp8  (or set $GLM_DEST)
 """
 import os, time, threading, argparse, subprocess
+from urllib.parse import quote
 
 REPO_MS = "ZhipuAI/GLM-5.2-FP8"        # ModelScope
 REPO_HF = "zai-org/GLM-5.2-FP8"        # HuggingFace
@@ -36,7 +37,8 @@ def bar(cur, total, width=24):
 
 def get_shard_list_hf():
     from huggingface_hub import HfApi
-    info=HfApi().repo_info(REPO_HF, files_metadata=True)
+    info=HfApi().repo_info(REPO_HF, revision=os.environ.get("GLM_HF_REVISION", "main"),
+                         files_metadata=True)
     shards=sorted(s.rfilename for s in info.siblings if s.rfilename.endswith(".safetensors"))
     sizes={s.rfilename:s.size for s in info.siblings if s.rfilename.endswith(".safetensors")}
     return shards, sizes
@@ -45,7 +47,9 @@ def get_shard_list_ms():
     """Get shard list from ModelScope API."""
     import requests
     # ModelScope API: list files
-    r = requests.get(f"https://modelscope.cn/api/v1/models/{REPO_MS}/repo/files?Revision=master&Root=", timeout=30)
+    r = requests.get(f"https://modelscope.cn/api/v1/models/{REPO_MS}/repo/files",
+                     params={"Revision": os.environ.get("GLM_MS_REVISION", "master"), "Root": ""},
+                     timeout=30)
     data = r.json()["Data"]["Files"]
     shards = sorted(f["Path"] for f in data if f["Path"].endswith(".safetensors"))
     sizes = {f["Path"]: f.get("Size", 0) for f in data if f["Path"].endswith(".safetensors")}
@@ -74,11 +78,11 @@ def download_file_curl(fn, base_url, expected_size):
     if os.path.exists(outpath) and os.path.getsize(outpath) == expected_size:
         return True
     url = f"{base_url}/{fn}"
-    cmd = ["curl", "-L", "-C", "-", "--retry", "999", "--retry-delay", "5",
+    cmd = ["curl", "--fail", "-L", "-C", "-", "--retry", "999", "--retry-delay", "5",
            "--connect-timeout", "15", "--speed-time", "30", "--speed-limit", "1000",
            "-o", partpath, "-H", "User-Agent: colibri-download/1.0", url]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if os.path.exists(partpath) and os.path.getsize(partpath) >= expected_size:
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if result.returncode == 0 and shard_complete(partpath, expected_size):
         os.replace(partpath, outpath)
         return True
     return False
@@ -212,9 +216,11 @@ def main():
                         success = True; break
                     # Retry with curl fallback
                     if use_ms:
-                        base = f"https://modelscope.cn/api/v1/models/{REPO_MS}/repo?Revision=master&FilePath="
+                        revision = quote(os.environ.get("GLM_MS_REVISION", "master"), safe="")
+                        base = f"https://modelscope.cn/api/v1/models/{REPO_MS}/repo?Revision={revision}&FilePath="
                     else:
-                        base = f"https://huggingface.co/{REPO_HF}/resolve/main"
+                        revision = quote(os.environ.get("GLM_HF_REVISION", "main"), safe="")
+                        base = f"https://huggingface.co/{REPO_HF}/resolve/{revision}"
                     if download_file_curl(fn, base, expected):
                         success = True; break
                 except Exception as e:
@@ -229,7 +235,8 @@ def main():
                     completed.append(fn)
                     elapsed = time.time() - t0
                     have = sum(sizes.get(f,0) for f in completed)
-                    pct = 100.0 * have / total_bytes
+                    pct = (100.0 * have / total_bytes if total_bytes > 0
+                           else 100.0 * len(completed) / total)
                     speed = (have - sum(sizes[f] for f in done_set)) / max(elapsed, 1)
                     eta = (total_bytes - have) / speed if speed > 0 else 0
                     print(f"  {C.grn}✓{C.r} {fn} {C.dim}— {len(completed)}/{total} · "
