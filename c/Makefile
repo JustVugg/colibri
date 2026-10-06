@@ -896,7 +896,7 @@ shaders/qmatmul_grp_gate_up.spv: shaders/qmatmul_grp.comp
 shaders/qmatmul_grp_gemv_gate_up.spv: shaders/qmatmul_grp_gemv.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
-vk_chain.o: vk_chain.c .build-config
+vk_chain.o: vk_chain.c vk_chain.h backend_vulkan.h vk_alloc.h .build-config
 	$(CC) $(CFLAGS) -c vk_chain.c -o $@
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }

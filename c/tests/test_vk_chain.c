@@ -368,8 +368,8 @@ static void test_dnconv(int order) {
     VkcBuf *wb = up(w, (size_t)CD * CK), *ib = up(in, (size_t)(S1 + S2) * CD);
     VkcBuf *rb = vkc_buf((size_t)CD * nh * 2 * 4 + 64, VKC_DEV), *ob = vkc_buf((size_t)(S1 + S2) * CD * 4, VKC_DEV);
     int ro = 16, so = 16 + CD * nh;   /* ring and its snapshot in one buffer, at offsets */
-    VkcDnConv p1 = {S1, CD, CK, 0, CD, 0, CD, 2, order, 0, ro, so};
-    VkcDnConv p2 = {S2, CD, CK, S1 * CD, CD, S1 * CD, CD, -1, order, 0, ro, so};
+    VkcDnConv p1 = {S1, CD, CK, 0, CD, 0, CD, 2, order, 0, ro, so, 0, 0};
+    VkcDnConv p2 = {S2, CD, CK, S1 * CD, CD, S1 * CD, CD, -1, order, 0, ro, so, 0, 0};
     vkc_begin(); int ok = vkc_dnconv(ib, wb, rb, ob, rb, &p1); vkc_submit(0);     /* left in flight */
     vkc_begin(); ok &= vkc_dnconv(ib, wb, rb, ob, rb, &p2); vkc_submit(1);
     float *o = down(ob, 0, (size_t)(S1 + S2) * CD), *r = down(rb, ro, (size_t)CD * nh), *sn = down(rb, so, (size_t)CD * nh);
@@ -425,7 +425,7 @@ static void test_dnrec(int KD, int VD, int VH, int KH, int sig_gate) {
     VkcBuf *sb = vkc_buf(2 * SN * 4, VKC_DEV), *yb = vkc_buf((size_t)S * VH * VD * 4, VKC_DEV);
     vkc_begin(); vkc_write(sb, 0, st0, SN * 4); vkc_submit(1);
     VkcDnRec p1 = {S1, VH, KH, VD, Kt, 0, CD, 0, 2 * VH, VH, 2 * VH, 0, VH * VD, 0, VH * VD, 1, sig_gate, 1e-6f,
-                   1.f / sqrtf((float)KD), 0, (int)SN, 0};
+                   1.f / sqrtf((float)KD), 0, (int)SN, 0, 0, 0};
     VkcDnRec p2 = p1;
     p2.S = S2; p2.cv_off = S1 * CD; p2.b_off = S1 * 2 * VH; p2.a_off = S1 * 2 * VH + VH; p2.z_off = S1 * VH * VD; p2.y_off = S1 * VH * VD; p2.snap_row = -1;
     vkc_begin(); int ok = vkc_dnrec(KD, cb, abb, zb, sb, pb, yb, sb, &p1); vkc_submit(0);

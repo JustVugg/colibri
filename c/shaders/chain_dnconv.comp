@@ -21,6 +21,7 @@ layout(push_constant) uniform P {
     int in_off, in_row, out_off, out_row;
     int snap_row, order;
     int w_off, ring_off, snap_off;
+    int snap_n, snap_stride;   // > 0: the ring after each of rows 0..snap_n-1, slot s at snap_off + s * snap_stride
 } p;
 
 void main() {
@@ -46,8 +47,8 @@ void main() {
         o[p.out_off + s * p.out_row + c] = acc / (1.0 + exp(-acc));
         for (int k = 0; k < 7; k++) if (k + 1 < nh) hist[k] = hist[k + 1];
         for (int k = 0; k < 8; k++) if (k == nh - 1) hist[k] = cur;
-        if (s == p.snap_row)
-            for (int k = 0; k < 8; k++) if (k < nh) snap[p.snap_off + c * nh + k] = hist[k];
+        if (p.snap_n > 0 ? s < p.snap_n : s == p.snap_row)
+            for (int k = 0; k < 8; k++) if (k < nh) snap[p.snap_off + (p.snap_n > 0 ? s * p.snap_stride : 0) + c * nh + k] = hist[k];
     }
     for (int k = 0; k < 8; k++) if (k < nh) ring[p.ring_off + c * nh + k] = hist[k];
 }

@@ -906,10 +906,10 @@ static int q38c_deltanet(Q38Chain *ch, Model *m, Layer *l, int i, int n, int c0,
     int segs = ns > 1 ? ns : 1;
     for (int r = 0; r < segs && ok; r++) {
         int s0 = ns > 1 ? r : 0, len = ns > 1 && r < ns - 1 ? 1 : n - s0, snap_row = ns ? 0 : -1, slot = ns ? c0 + r : 0;
-        VkcDnConv cp = {len, CD, c->dn_convk, s0 * CD, CD, s0 * CD, CD, snap_row, 1, (int)ch->o_conv[i], 0, 0};
+        VkcDnConv cp = {len, CD, c->dn_convk, s0 * CD, CD, s0 * CD, CD, snap_row, 1, (int)ch->o_conv[i], 0, 0, 0, 0};
         VkcDnRec rp = {len, VH, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s0 * CD, CD, s0 * VH, VH,
                        ch->rows * VH + s0 * VH, VH, s0 * V, V, s0 * V, V, snap_row, 1, c->eps,
-                       1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
+                       1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i], 0, 0};
         ok = vkc_dnconv(ch->qkv, ch->prm, ch->ring[i], ch->cv, ch->ring_snap[slot][i], &cp) &&
              vkc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->z, ch->rec[i], ch->prm, ch->dny, ch->rec_snap[slot][i], &rp);
     }

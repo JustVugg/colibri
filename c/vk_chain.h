@@ -160,11 +160,11 @@ int  vkc_moe_gemv(int gate_up, VkcBuf *x, VkcBuf *items, VkcBuf *etab, VkcBuf *y
                   int I, int O, float limit, int kgat, int rpw);
 int  vkc_moe_sum(VkcBuf *ys, VkcBuf *w, VkcBuf *use, VkcBuf *out, int S, int K, int D);
 /* chain_dnconv.comp */
-typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } VkcDnConv;
+typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off, snap_n, snap_stride; } VkcDnConv;
 int  vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, const VkcDnConv *p);
 /* chain_dnrec.comp (KD a specialization constant, VD <= 128) */
 typedef struct { int S, VH, KH, VD, Ktot, cv_off, cv_row, b_off, b_row, a_off, a_row, z_off, z_row,
-                 y_off, y_row, snap_row, flags; float eps, qscale; int st_off, snap_off, prm_off; } VkcDnRec;
+                 y_off, y_row, snap_row, flags; float eps, qscale; int st_off, snap_off, prm_off, snap_n, snap_stride; } VkcDnRec;
 int  vkc_dnrec(int KD, VkcBuf *cv, VkcBuf *ab, VkcBuf *z, VkcBuf *st, VkcBuf *prm, VkcBuf *y, VkcBuf *snap, const VkcDnRec *p);
 /* chain_ew.comp */
 #define VKC_EW_ADD      0

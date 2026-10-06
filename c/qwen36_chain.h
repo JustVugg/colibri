@@ -225,6 +225,14 @@ static void q36c_layer_cpu(Q36Chain *ch, Model *m, int i) {
     }
 }
 
+/* A verify's DeltaNet copies written by the one convolution and recurrence dispatch,
+ * after each row, into slots behind the state in its own buffer; a rejection copies its
+ * slot back on the device (Q36_DN_SNAP1=0: a dispatch and a buffer a copy, as before) */
+static int q36c_snap1(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("Q36_DN_SNAP1"); v = !(e && *e == '0'); }
+    return v;
+}
 /* Layer i's matrices, its DeltaNet b|a rows and shared-expert gate row, and its state on
  * the device; 0 = something did not get there (the caller frees the layer). */
 static int q36c_place_layer(Q36Chain *ch, Model *m, int i) {
@@ -241,8 +249,10 @@ static int q36c_place_layer(Q36Chain *ch, Model *m, int i) {
             ch->t_ab[i] = q36c_f32_tensor(ch->d, ab, D, 2 * vh);
             free(ab);
         }
-        ch->rec[i] = ch->t_ab[i] ? vkc_buf((size_t)vh * c->dn_kdim * c->dn_vdim * sizeof(float), VKC_DEV) : NULL;
-        ch->ring[i] = ch->rec[i] ? vkc_buf((size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float), VKC_DEV) : NULL;
+        /* the state, then (q36c_snap1) a verify's copies after its rows 0.. in the same buffer */
+        size_t ns1 = q36c_snap1() ? 1 + Q36_SPEC_SNAPS : 1;
+        ch->rec[i] = ch->t_ab[i] ? vkc_buf(ns1 * vh * c->dn_kdim * c->dn_vdim * sizeof(float), VKC_DEV) : NULL;
+        ch->ring[i] = ch->rec[i] ? vkc_buf(ns1 * c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float), VKC_DEV) : NULL;
         ok = ch->t_ab[i] && ch->rec[i] && ch->ring[i];
     }
     if (ok && l->sh_gate) ok = (ch->t_sg[i] = q36c_f32_tensor(ch->d, l->sh_gate, D, 1)) != NULL;
@@ -637,6 +647,21 @@ static void q36c_rollback(Model *m, int slot, int len) {
             if (m->c.is_attn[i]) vkc_kv_lower(&ch->ks, ch->attn_ord[i], len);
         }
         if (slot < 0 || slot >= ch->snap_valid || ch->dn_where != Q36C_DEV) { ch->snap_valid = 0; continue; }
+        if (q36c_snap1()) {   /* the slot back over the state, on the device, ahead of the next step */
+            Cfg *c = &m->c;
+            size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
+            int was = vkc_device(ch->d), ok = vkc_begin();
+            for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
+                if (c->is_attn[i]) continue;
+                ok = vkc_copy(ch->rec[i], 0, ch->rec[i], (1 + (size_t)slot) * nr, nr) &&
+                     vkc_copy(ch->ring[i], 0, ch->ring[i], (1 + (size_t)slot) * nc, nc);
+            }
+            ok = ok && vkc_submit(0);
+            vkc_device(was);
+            if (!ok) q36c_recover(m, len);
+            ch->snap_valid = 0;
+            continue;
+        }
         for (int i = ch->lo; i < ch->lo + ch->n; i++) {
             if (m->c.is_attn[i]) continue;
             VkcBuf *t = ch->rec[i]; ch->rec[i] = ch->rec_snap[slot][i]; ch->rec_snap[slot][i] = t;
@@ -649,6 +674,7 @@ static void q36c_rollback(Model *m, int slot, int len) {
  * time a verify that deep runs. */
 static int q36c_spec_slots(Q36Chain *ch, Model *m, int rows) {
     Cfg *c = &m->c; int L = c->n_layers;
+    if (q36c_snap1()) return rows <= Q36_SPEC_SNAPS;   /* the slots came with the state */
     if (rows > Q36_SPEC_SNAPS) rows = Q36_SPEC_SNAPS;
     size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
     for (int sl = ch->snap_slots; sl < rows; sl++) {
@@ -752,14 +778,24 @@ static int q36c_deltanet(Q36Chain *ch, Model *m, Layer *l, int i, int n, int c0,
     int ok = vkc_matmul(vk_qw_tensor(&l->dn_qkv), ch->nrm, 0, ch->qkv, 0, n) &&
              vkc_matmul(vk_qw_tensor(&l->dn_z), ch->nrm, 0, ch->z, 0, n) &&
              vkc_matmul(ch->t_ab[i], ch->nrm, 0, ch->ab, 0, n);
+    if (ns > 0 && q36c_snap1()) {   /* one dispatch each: copies after rows 0..ns-1 into slots 1 + c0 .. */
+        size_t nrs = (size_t)vh * c->dn_kdim * c->dn_vdim, ncs = (size_t)CD * (c->dn_convk - 1);
+        VkcDnConv cp = {n, CD, c->dn_convk, 0, CD, 0, CD, -1, 0, (int)ch->o_conv[i], 0, (int)((1 + c0) * ncs), ns, (int)ncs};
+        VkcDnRec rp = {n, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, 0, CD, 0, 2 * vh,
+                       vh, 2 * vh, 0, vd, 0, vd, -1, 0, c->eps,
+                       1.f / sqrtf((float)c->dn_kdim), 0, (int)((1 + c0) * nrs), (int)ch->o_dn[i], ns, (int)nrs};
+        ok = ok && vkc_dnconv(ch->qkv, ch->prm, ch->ring[i], ch->cv, ch->ring[i], &cp) &&
+             vkc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->z, ch->rec[i], ch->prm, ch->dny, ch->rec[i], &rp);
+        return ok && vkc_matmul(vk_qw_tensor(&l->dn_out), ch->dny, 0, ch->tmp, 0, n);
+    }
     int segs = ns > 1 ? ns : 1;
     for (int r = 0; r < segs && ok; r++) {
         int s0 = ns > 1 ? r : 0, len = ns > 1 && r < ns - 1 ? 1 : n - s0, snap_row = ns ? 0 : -1;
         VkcBuf *rs = ns ? ch->rec_snap[c0 + r][i] : NULL, *cs = ns ? ch->ring_snap[c0 + r][i] : NULL;
-        VkcDnConv cp = {len, CD, c->dn_convk, s0 * CD, CD, s0 * CD, CD, snap_row, 0, (int)ch->o_conv[i], 0, 0};
+        VkcDnConv cp = {len, CD, c->dn_convk, s0 * CD, CD, s0 * CD, CD, snap_row, 0, (int)ch->o_conv[i], 0, 0, 0, 0};
         VkcDnRec rp = {len, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s0 * CD, CD, s0 * 2 * vh, 2 * vh,
                        vh + s0 * 2 * vh, 2 * vh, s0 * vd, vd, s0 * vd, vd, snap_row, 0, c->eps,
-                       1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
+                       1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i], 0, 0};
         ok = vkc_dnconv(ch->qkv, ch->prm, ch->ring[i], ch->cv, cs, &cp) &&
              vkc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->z, ch->rec[i], ch->prm, ch->dny, rs, &rp);
     }

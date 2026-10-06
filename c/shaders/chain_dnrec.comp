@@ -34,6 +34,7 @@ layout(push_constant) uniform P {
     int snap_row, flags;
     float eps, qscale;
     int st_off, snap_off, prm_off;
+    int snap_n, snap_stride;   // > 0: the state after each of rows 0..snap_n-1, slot s at snap_off + s * snap_stride
 } p;
 
 shared float qn[KD];
@@ -99,8 +100,10 @@ void main() {
             float zv = z[p.z_off + s * p.z_row + h * p.VD + v];
             float g = (p.flags & 1) != 0 ? 1.0 / (1.0 + exp(-zv)) : zv / (1.0 + exp(-zv));
             y[p.y_off + s * p.y_row + h * p.VD + v] = o * r * nw * g;
-            if (s == p.snap_row)
-                [[unroll]] for (int k = 0; k < KD; k++) snap[nb + k * p.VD + v] = col[k];
+            if (p.snap_n > 0 ? s < p.snap_n : s == p.snap_row) {
+                int sn = nb + (p.snap_n > 0 ? s * p.snap_stride : 0);
+                [[unroll]] for (int k = 0; k < KD; k++) snap[sn + k * p.VD + v] = col[k];
+            }
         }
         barrier();
     }
