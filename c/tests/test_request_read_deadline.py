@@ -92,7 +92,14 @@ class RequestReadDeadlineTest(unittest.TestCase):
                     writer.start()
                     try:
                         started = time.monotonic()
-                        self.assertEqual(client.recv(65536), b"")
+                        try:
+                            data = client.recv(65536)
+                        except ConnectionResetError:
+                            # the server closed with a dripped byte still unread: the
+                            # kernel resets instead of a clean close (seen on macOS);
+                            # either way nothing was answered
+                            data = b""
+                        self.assertEqual(data, b"")
                         self.assertLess(time.monotonic() - started, 0.8)
                     finally:
                         stopped.set()

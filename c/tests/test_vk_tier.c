@@ -42,7 +42,8 @@
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
-enum { L = 2, E = 10, H = 192, F = 128, K = 3 };
+enum { L = 2, E = 10, K = 3, HF_MAX = 512 };
+static int H = 192, F = 128;   /* hidden and expert width; grouped() widens H */
 static unsigned rng = 7;
 static unsigned rnd(void) { rng = rng * 1103515245u + 12345u; return rng >> 8; }
 static float frnd(void) { return (float)((int)(rnd() % 2001) - 1000) / 1000.0f; }
@@ -134,7 +135,7 @@ typedef struct { Mat g, u, d; } Ex;
 static Ex ex[L][E];
 static int g_act; static float g_limit;
 static void expert_ref(const Ex *e, const float *x, float *y) {
-    float h[F];
+    float h[HF_MAX];
     for (int o = 0; o < F; o++) {
         double a = 0, b = 0;
         for (int i = 0; i < H; i++) { a += (double)e->g.w[(size_t)o * H + i] * x[i]; b += (double)e->u.w[(size_t)o * H + i] * x[i]; }
@@ -490,7 +491,8 @@ static void extra(void) {
     on = vkt_init(&vc, NULL);
     CHECK(on && vkt_layers() == 1, "extra: no device form, the tier has %d layers (want the main one)", vkt_layers());
     if (on) {
-        float x[H] = {0}; int id[K] = {0, 1, 2}; uint8_t taken[K];
+        float x[H]; memset(x, 0, sizeof x);   /* H is a variable (grouped() widens it) */
+        int id[K] = {0, 1, 2}; uint8_t taken[K];
         CHECK(vkt_issue(1, x, 1, K, id, taken) == 0, "extra: a layer past the tier's took rows");
         vkt_shutdown();
     }
@@ -538,7 +540,7 @@ static void qdq128(float *v, int n) {
     }
 }
 static void expert_v4(const Ex *e, const float *xq, float w, float limit, float *y) {
-    float h[F];
+    float h[HF_MAX];
     for (int o = 0; o < F; o++) {
         double a = 0, b = 0;
         for (int i = 0; i < H; i++) { a += (double)e->g.w[(size_t)o * H + i] * xq[i]; b += (double)e->u.w[(size_t)o * H + i] * xq[i]; }
@@ -587,10 +589,10 @@ static void v4_act(void) {
                     expert_v4(&ex[l][idx[i]], xq + (size_t)s * H, w[i], limit, y);
                     for (int d = 0; d < H; d++) ref[(size_t)s * H + d] += y[d];
                     if (taken[i] && joined) {
-                        float dr[H];
+                        float dr[HF_MAX];
                         for (int d = 0; d < H; d++) dr[d] = bf16r(rows[i][d]);
                         double r = rel(dr, y, H); if (r > worst) worst = r;
-                        rows_same += !memcmp(dr, y, sizeof dr);
+                        rows_same += !memcmp(dr, y, (size_t)H * sizeof(float));
                         for (int d = 0; d < H; d++) out[(size_t)s * H + d] += dr[d];
                         dev++;
                     } else for (int d = 0; d < H; d++) out[(size_t)s * H + d] += cpu[(size_t)i * H + d];
@@ -655,7 +657,7 @@ static double stream_step(int layer, int S, const int *idx, const float *w, int 
             int i = s * K + k;
             if (v4) expert_v4(&ex[layer][idx[i]], xq + (size_t)s * H, w[i], 10.0f, y);
             else expert_ref(&ex[layer][idx[i]], xq + (size_t)s * H, y);
-            float dr[H];
+            float dr[HF_MAX];
             const float *c = cpu + (size_t)i * H;
             if (taken[i] && joined) {
                 for (int d = 0; d < H; d++) dr[d] = v4 ? bf16r(dev[i][d]) : dev[i][d];
@@ -790,6 +792,119 @@ static void stream_commit_failure(const char *spv) {
     unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");
 }
 
+/* The expert batch's grouped GEMM (qmatmul_grp.comp) and a big step's whole-step
+ * buffers (coli_vk_xb_step_*): a hidden width of 256 (multiples of 128 take the grouped
+ * route), every format it computes (device fmt 1, 2, 4).
+ *   single  steps of 32 rows x top-3 (96 assignments, over its 64) as one batch;
+ *   whole   prompt steps of 40 and 64 rows with every expert resident: sub-batches
+ *           read their x through the assignment map, write y in place, and
+ *           vkt_join_sum returns the rows summed on the device, compared with the
+ *           reference sum and with the engines' own loop over the device rows;
+ *   mixed   the same steps with a budget of four experts: cold ones stream or stay on
+ *           the CPU, no device sum (*sum NULL), the rows still right.
+ * Inputs and weights are rounded to f16 on this route, hence the looser bound. A device
+ * without it (no cooperative matrices at subgroup size 64 or bufferDeviceAddress, e.g.
+ * Lavapipe) runs the same steps on the per-expert route and vkt_join_sum gives NULL. */
+static double sum_step(int layer, int S, const int *idx, const float *w, Books *bk, int *summed) {
+    float *x = calloc((size_t)S * H, sizeof(float)), *cpu = calloc((size_t)S * K * H, sizeof(float));
+    float *ref = calloc((size_t)S * H, sizeof(float)), *loop = calloc((size_t)S * H, sizeof(float)), *y = malloc(sizeof(float) * H);
+    uint8_t *taken = malloc((size_t)S * K); const float **dev = malloc(sizeof(*dev) * S * K);
+    for (int i = 0; i < S * H; i++) x[i] = frnd();
+    int n = vkt_issue_w(layer, x, S, K, idx, w, taken);
+    for (int i = 0; i < S * K; i++) {
+        if (taken[i]) continue;
+        expert_ref(&ex[layer][idx[i]], x + (size_t)(i / K) * H, cpu + (size_t)i * H);
+        VktExpertSrc s = src_of(&ex[layer][idx[i]]); vkt_note(layer, idx[i], &s);
+    }
+    const float *sum = NULL;
+    int joined = n ? vkt_join_sum(dev, w, &sum) : 1;
+    CHECK(joined, "grouped: join failed");
+    double worst = 0;
+    for (int s = 0; s < S; s++)
+        for (int k = 0; k < K; k++) {
+            int i = s * K + k;
+            expert_ref(&ex[layer][idx[i]], x + (size_t)s * H, y);
+            const float *c = taken[i] && joined ? dev[i] : cpu + (size_t)i * H;
+            if (taken[i] && joined) { double r = rel(c, y, H); if (r > worst) worst = r; }
+            for (int d = 0; d < H; d++) { ref[(size_t)s * H + d] += w[i] * y[d]; loop[(size_t)s * H + d] += w[i] * c[d]; }
+            bk->routed++; bk->dev += taken[i] != 0;
+        }
+    double r = rel(loop, ref, S * H);
+    if (r > worst) worst = r;
+    if (sum) {
+        (*summed)++;
+        /* the device's sum: the reference's within the bound, the host loop's to rounding */
+        double rs = rel(sum, ref, S * H), rl = rel(sum, loop, S * H);
+        if (rs > worst) worst = rs;
+        CHECK(rl < 1e-6, "grouped: the device sum is off the host loop over its rows (%.3g)", rl);
+    }
+    free(x); free(cpu); free(ref); free(loop); free(y); free(taken); free(dev);
+    return worst;
+}
+static void grouped(void) {
+    struct { VktFmt gu, dn; float limit; const char *name; } cs[] = {
+        {{VKT_SRC_I8_ROW, 0}, {VKT_SRC_I8_ROW, 0}, 0, "int8 per row"},
+        {{VKT_SRC_I8_AS_I4_ROW, 0}, {VKT_SRC_I4S_PAIRS_ROW, 0}, 0, "int4 per row"},
+        {{VKT_SRC_I4U_PAIRS_GS, 64}, {VKT_SRC_I4U_PAIRS_GS, 64}, 2.5f, "int4 v+8 gs64, SwiGLU limit"},
+        {{VKT_SRC_I4S_PAIRS_GS, 32}, {VKT_SRC_I4S_PAIRS_GS, 32}, 0, "signed int4 pairs gs32"},
+        {{VKT_SRC_I4U_PLANAR64, 64}, {VKT_SRC_I4U_PLANAR64, 64}, 0, "planar int4-g64"},
+    };
+    int h0 = H; H = 256;
+    int any_grouped = 0, any_summed = 0, any_gemv = 0;
+    for (size_t c = 0; c < sizeof cs / sizeof *cs; c++) {
+        for (int mode = 0; mode < 4; mode++) {   /* single, whole, mixed, decode */
+            model_make(cs[c].gu, cs[c].dn);
+            g_act = VKT_ACT_SWIGLU; g_limit = cs[c].limit;
+            set_budget(mode == 2 ? 4 : L * E, cs[c].gu, cs[c].dn);
+            setenv("COLI_VK_TIER_RATE", mode == 1 || mode == 2 ? "0" : "64", 1);
+            setenv("COLI_VK_TIER_SYNC", "1", 1);
+            if (mode == 1 || mode == 2) { setenv("COLI_VK_TIER_STREAM_SLOTS", "4", 1); setenv("COLI_VK_TIER_STREAM_ROWS", "6", 1);
+                        setenv("COLI_VK_TIER_STREAM_HALF", "70", 1); }
+            VktConfig vc = cfg_of(cs[c].gu, cs[c].dn, VKT_ACT_SWIGLU, cs[c].limit);
+            if (mode == 1 || mode == 2) { vc.load = load_cb; vc.release = release_cb; }
+            uint32_t hist[L][E], *hr[L];
+            for (int l = 0; l < L; l++) { hr[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = 100 - e; }
+            int on = vkt_init(&vc, mode == 1 || mode == 2 || mode == 3 ? hr : NULL);
+            unsetenv("COLI_VK_TIER_SYNC"); unsetenv("COLI_VK_TIER_STREAM_HALF");
+            CHECK(on, "grouped %s: the tier did not start", cs[c].name);
+            if (!on) { model_free(); continue; }
+            if (mode) {   /* the warm start: whole and decode = every expert, mixed = the four hottest */
+                int pl[L * E], pe[L * E], np = vkt_plan(pl, pe, L * E);
+                for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+                vkt_put_done();
+            }
+            ColiVkXbStats a, b; coli_vk_xb_stats(&a);
+            Books bk = {0, 0}; double worst = 0; int summed = 0;
+            static const int Ss[4][4] = {{32, 32, 32, 32}, {40, 64, 40, 64}, {40, 64, 40, 64}, {1, 2, 1, 3}};
+            for (int t = 0; t < 4; t++)
+                for (int l = 0; l < L; l++) {
+                    int S = Ss[mode][t], idx[64 * K]; float w[64 * K];
+                    route(S, 0, E, idx, w);
+                    vkt_begin_forward();
+                    double r = sum_step(l, S, idx, w, &bk, &summed);
+                    if (r > worst) worst = r;
+                }
+            coli_vk_xb_stats(&b);
+            unsigned long long gb = b.grouped_batches - a.grouped_batches, gv = b.gemv_batches - a.gemv_batches;
+            static const char *mn[4] = {"single", "whole", "mixed", "decode"};
+            printf("  %-30s %-6s device %3llu of %3llu, %3llu grouped GEMM / %3llu GEMV batches, %d summed on the device, worst %.2e\n",
+                   cs[c].name, mn[mode], bk.dev, bk.routed, gb, gv, summed, worst);
+            CHECK(bk.dev > 0, "grouped %s %s: nothing ran on the device", cs[c].name, mn[mode]);
+            CHECK(worst < (gb ? 1e-2 : 2e-3), "grouped %s %s: off the reference (%.3g)", cs[c].name, mn[mode], worst);
+            any_gemv |= gv > 0;
+            any_grouped |= gb > 0; any_summed |= summed > 0;
+            vkt_shutdown(); model_free();
+            unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");
+        }
+    }
+    printf("  grouped route %s, device sums %s\n", any_grouped ? "taken" : "not on this device",
+           any_summed ? "taken" : "not on this device");
+    CHECK(!any_grouped || any_summed, "grouped: the device took the grouped route but never summed a whole step");
+    const char *gve = getenv("COLI_VK_XB_GEMV");
+    CHECK(!any_grouped || any_gemv || (gve && *gve == '0'), "grouped: the device took the grouped GEMM but never the grouped GEMV");
+    H = h0;
+}
+
 int main(int argc, char **argv) {
     char buf[1024];
     const char *spv = argc > 1 ? argv[1] : coli_vk_shader_path(buf, sizeof buf);
@@ -797,6 +912,7 @@ int main(int argc, char **argv) {
     setenv("COLI_VK_TIER_RESERVE_GB", "0", 1);
     scratch_budget();
     printf("formats:\n"); formats();
+    printf("grouped:\n"); grouped();
     printf("warm:\n"); warm();
     printf("adapt:\n"); adapt();
     printf("partial:\n"); partial();

@@ -7551,13 +7551,16 @@ static void layers_forward_rows_range(Model *m, float *x, int S, int pos_base,
 #ifdef COLI_VULKAN
     /* the whole forward on the device (glm_chain.h); 0: the CPU path below, as before.
      * A decode batch of one row of the bound KV state (a single-slot serve) is a step
-     * like any other; rows of several states stay on the CPU. A partial chain (the
-     * device holds the first N layers) hands x back after layer N - 1: the CPU runs the
-     * rest from there. */
+     * like any other; rows of several states (KV_SLOTS' batched decode) attend each over
+     * its own state's mirror (glmc_forward_rows). A partial chain (the device holds the
+     * first N layers) hands x back after layer N - 1: the CPU runs the rest from there. */
     if(g_vk_chain && layer_begin==0 && layer_end==c->n_layers){
         int done=0;
         if(!kvs && !positions) done=glmc_forward(m,x,S,pos_base);
-        else if(kvs && S==1 && kvs[0]==m->kv) done=glmc_forward(m,x,1,positions?positions[0]:pos_base);
+        else {
+            if(kvs && positions) done=glmc_forward_rows(m,x,S,kvs,positions);
+            if(!done && kvs && S==1 && kvs[0]==m->kv) done=glmc_forward(m,x,1,positions?positions[0]:pos_base);
+        }
         if(done>=c->n_layers) return;
         layer_begin=done;
     }
@@ -12630,7 +12633,7 @@ int main(int argc, char **argv){
     }
 #endif
     const char *snap=getenv("SNAP");
-    if(!snap){ coli_print_launcher_help("GLM-5.2"); return 1; }
+    if(!snap){ coli_print_launcher_help("GLM-5.2", "SNAP=<model directory> ./colibri ..."); return 1; }
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;

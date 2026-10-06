@@ -710,7 +710,7 @@ endif
 VK_OBJ    = backend_vulkan.o vk_tier.o
 VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv \
             shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv shaders/expert_act.spv \
-            shaders/expert_act_v4.spv
+            shaders/expert_act_v4.spv shaders/qmatmul_grp.spv shaders/qmatmul_grp_gate_up.spv shaders/expert_sum.spv shaders/qmatmul_grp_gemv.spv shaders/qmatmul_grp_gemv_gate_up.spv
 # vk_chain.o: a layer's dense chain recorded into one submission (vk_chain.h), and
 # its shaders; an engine that does not call it links nothing from it.
 VK_OBJ   += vk_chain.o
@@ -733,12 +733,16 @@ VK_SPV   += shaders/chain_ares.spv
 VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv
 # blocked attention for prompt chunks (made on first use; vk_chain.c, chain_attnb.comp)
 VK_SPV   += shaders/chain_attnb.spv
+# the int8/int4 prompt GEMM on the matrix units (optional at run time)
+VK_SPV   += shaders/chain_gemm.spv
 # the KV cache split between the device and the host past the device's budget
 # (vk_chain.h: vkc_kvs_*; vk_kvsplit.h)
 VK_SPV   += shaders/chain_kvs.spv
 # the decision engines' encoders (laya, gliner_decide): bidirectional attention over row
 # ranges with DeBERTa's relative terms, LayerNorm, GeGLU, RoPE (made on first use)
 VK_SPV   += shaders/chain_enc.spv
+# the attention core on the matrix units for prompt chunks (optional at run time)
+VK_SPV   += shaders/chain_attn_flash.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
@@ -874,15 +878,41 @@ backend_vulkan.o: backend_vulkan.c .build-config
 	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
 vk_tier.o: vk_tier.c .build-config
 	$(CC) $(CFLAGS) -c vk_tier.c -o $@
+# The expert batch's grouped GEMM (qmatmul_grp.comp): down, and gate+up+SwiGLU with
+# -DGATE_UP. Same glslc requirement and fallback as qmatmul_coop.spv; at run
+# time the batch keeps its per-expert route without them.
+shaders/qmatmul_grp.spv: shaders/qmatmul_grp.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/qmatmul_grp_gate_up.spv: shaders/qmatmul_grp.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+shaders/qmatmul_grp_gemv_gate_up.spv: shaders/qmatmul_grp_gemv.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
 vk_chain.o: vk_chain.c .build-config
 	$(CC) $(CFLAGS) -c vk_chain.c -o $@
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+# chain_attn_flash.comp needs the same glslc as qmatmul_coop.comp below, with the same
+# fallback; without its .spv the chain keeps chain_attn.comp.
+shaders/chain_attn_flash.spv: shaders/chain_attn_flash.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
 # The cooperative-matrix GEMM needs a glslc that knows GL_KHR_cooperative_matrix
 # (shaderc 2023.6+). An older one keeps the committed .spv instead of failing the build;
 # at run time the shader is optional anyway (the fp32 GEMM takes over without it).
 shaders/qmatmul_coop.spv: shaders/qmatmul_coop.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+# chain_gemm.comp needs the same glslc as qmatmul_coop.comp above, with the same
+# fallback; without its .spv the chain keeps its other GEMMs.
+shaders/chain_gemm.spv: shaders/chain_gemm.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
 	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
@@ -1229,7 +1259,11 @@ tests/bench_cuda_resident_batch$(EXE): tests/bench_cuda_resident_batch.cu backen
 # the GPU sits idle. Same guard #783 put on kimi_k3, which since gaining an
 # MXFP4 expert path no longer needs it. tests/test_makefile_cuda_scope.py
 # asserts this shape.
-olmoe$(EXE): olmoe.c $(VK_OBJ) $(VK_SPV)
+ifneq ($(EXE),)
+.PHONY: olmoe
+olmoe: olmoe$(EXE)
+endif
+olmoe$(EXE): olmoe.c $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(NOCUDA_CFLAGS) olmoe.c $(VK_OBJ) -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
@@ -1375,6 +1409,10 @@ tests/test_qi_gemm$(EXE): tests/test_qi_gemm.c
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
 # stream from the official checkpoint and quant.h's mxfp4 kernel reads them as they
 # are, so there is no conversion target here to go with it.
+ifneq ($(EXE),)
+.PHONY: deepseek_v41
+deepseek_v41: deepseek_v41$(EXE)
+endif
 deepseek_v41$(EXE): deepseek_v41.c $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) deepseek_v41.c $(VK_OBJ) -o deepseek_v41$(EXE) $(LDFLAGS)
 
@@ -1410,7 +1448,11 @@ mimo-tiny-serve-check: mimo-tiny-generate mimo$(EXE)
 # loader and SERVE=1 protocol. With CUDA=1 it links the same expert tier as
 # qwen36 (fp8 streaming mode: hot experts get VRAM copies, the RAM LRU stays);
 # without it the tier header's inline stubs keep the build toolkit-free.
-qwen38$(EXE): qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV)
+ifneq ($(EXE),)
+.PHONY: qwen38
+qwen38: qwen38$(EXE)
+endif
+qwen38$(EXE): qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(QWEN36_CFLAGS) qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o qwen38$(EXE) $(QWEN36_LDFLAGS)
 
 .PHONY: qwen38-tiny-generate qwen38-tiny-check
@@ -1669,7 +1711,11 @@ tests/bench_qwen36_dense_batch$(EXE): tests/bench_qwen36_dense_batch.c qwen36.c 
 		$(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
-inkling$(EXE): inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV)
+ifneq ($(EXE),)
+.PHONY: inkling
+inkling: inkling$(EXE)
+endif
+inkling$(EXE): inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
 # ENGINES WITHOUT A CUDA BACKEND (#783).
@@ -1686,10 +1732,18 @@ NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
 
 # GLM-5.3-Flash: routed experts stream from the int4-gs64 container.
 # METAL=1 accelerates resident matrices and routed MoE; CPU remains fallback.
-glm53$(EXE): glm53.c $(METAL_OBJ) $(VK_OBJ) $(VK_SPV)
+ifneq ($(EXE),)
+.PHONY: glm53
+glm53: glm53$(EXE)
+endif
+glm53$(EXE): glm53.c $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) glm53.c $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
-kimi_k3$(EXE): kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
+ifneq ($(EXE),)
+.PHONY: kimi_k3
+kimi_k3: kimi_k3$(EXE)
+endif
+kimi_k3$(EXE): kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ) .build-config
 	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
@@ -1711,6 +1765,10 @@ endif
 portable:
 	$(MAKE) colibri$(EXE) ARCH=$(PORTABLE_ARCH)
 
+ifneq ($(EXE),)
+.PHONY: iobench
+iobench: iobench$(EXE)
+endif
 iobench$(EXE): iobench.c
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
 

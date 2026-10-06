@@ -476,6 +476,10 @@ the device, since no Vulkan tier runs.
 | `COLI_VK_TIER_WARM` | on | `0`: no warm start; the tier fills as experts pass by. |
 | `COLI_VK_TIER_SYNC` | `0` | `1`: each layer step first waits for the uploads staged so far: residency then follows the routing alone (with `COLI_VK_TIER_BALANCE=0`, the run is reproducible). A promotion that displaces a resident while a batch is in flight waits for the join to free it. For tests and debugging. |
 | `COLI_VK_TIER_GEMM_ROWS` | `16` | Rows from which an expert of a step takes the tiled GEMM instead of the per-row GEMV; `0` never. |
+| `COLI_VK_XB_GROUPED` | on where supported | `0`: a step's experts keep their own dispatches where the grouped GEMM would take them (cooperative matrices at subgroup size 64, `bufferDeviceAddress`, widths multiples of 128, int8/int4, SwiGLU). |
+| `COLI_VK_XB_GROUPED_ROWS` | `64` | Assignments in a batch from which the grouped GEMM takes it. |
+| `COLI_VK_XB_STEP` | on where supported | `0`: a prompt step packs its rows per expert and sums on the host, as before the whole-step buffers. On a Radeon 8060S (Qwen3.6, 1011-token prompt) the grouped GEMM and the step buffers took the experts' device time from 762 to 344 ms and the first token from 2.08 to 1.49 s, perplexity unchanged (7.65). |
+| `COLI_VK_XB_GEMV` | on where supported | `0`: a decode step's experts keep a GEMV dispatch each instead of the grouped GEMV (`qmatmul_grp_gemv.comp`). On a Radeon 8060S (Qwen3.6, a 256-token answer, tier 24 GB) the grouped GEMV took decode from 37.2 to 42.5 tok/s with the int8 trunk and from 45.0 to 53.5 with the int4 trunk. |
 | `COLI_VK_TIER_QUEUE` | a second queue | `0`: the tier shares the main queue (its batches and the dense matmuls then serialize). |
 | `COLI_VK_TIER_STREAM` | on | A prompt step's cold experts streamed to the device ([below](#big-prompt-chunks-and-expert-streaming)); `0` off. `_SLOTS`, `_ROWS`, `_HALF`, `_PAR` there. |
 | `COLI_VK_DENSE` | on, but off on a device sharing the CPU's RAM while the tier is on | `0`: the dense trunk stays on the CPU and the device takes the routed experts only; `1`: the trunk on the device whatever the device. Unset: on a discrete GPU, or with the tier off, on the device; on an integrated GPU or Lavapipe with the tier on, on the CPU. The startup line says which and why. (The GLM engine reads it through the same rule with its own default, off.) |
@@ -956,7 +960,10 @@ command buffer instead, and keeps the residual stream on the device from one lay
 to the next. qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) and qwen38 (Qwen3.8 Flash
 Next) run it: by default on a discrete GPU, and for qwen36 on an integrated one with
 the expert tier (see [the default](#the-chain-on-a-radeon-780m)); `COLI_VK_CHAIN=1`
-anywhere. olmoe and inkling run it as well ([OLMoE and Inkling](#olmoe-and-inkling)).
+anywhere. `COLI_VK_DENSE=0` keeps it off too, unless `COLI_VK_CHAIN` says otherwise: the
+chain's copy of the trunk would take the expert tier's budget (on an 8 GB RTX 4070
+Laptop with qwen38, disk-bound, the tier got 1.87 GiB instead of 6.00 and decode went
+from 0.84 to 0.64 tok/s, #1900). olmoe and inkling run it as well ([OLMoE and Inkling](#olmoe-and-inkling)).
 colibri (GLM-5.2), glm53 (GLM-5.3 Flash) and kimi_k3 run it too, with the MLA,
 KDA and hyper-connection ops ([below](#glm-52-and-glm-53-flash-on-the-chain)), and
 deepseek_v41 and deepseek_v4 with DeepSeek's own ([below](#deepseek-v41-flash-and-deepseek-v4-on-the-chain)).
@@ -1099,6 +1106,7 @@ f32 throughout, as the CPU's f32 path.
 | `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 and olmoe on, qwen38 off; mimo, inkling, colibri, glm53, kimi_k3, deepseek_v41 and deepseek_v4 off: not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows that are not a speculative verify; decode and verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
 | `COLI_VK_CHAIN_ROWS` | from the budget, up to 8192 | Prompt rows per chunk: a longer prompt runs every layer chunk by chunk (the device's scratch is sized for one chunk). Unset or `auto`: the most rows whose buffers fit half the free device memory, up to `COLI_VK_CHAIN_ROWS_MAX` (8192); see [big prompt chunks](#big-prompt-chunks-and-expert-streaming). It was 512 before. |
 | `COLI_VK_CHAIN_LAYERS` | what fits | The engines on [the partial chain](#a-partial-chain): the first N layers on the device, the CPU the rest and the head. Unset or `auto`: the most layers the device's free memory holds (every layer when they fit, the chain as before); `n`: n layers; `0`: the chain off. |
+| `COLI_VK_CHAIN_FLASH` | `16` | Rows from which a forward's plain causal attention runs on the matrix units (`chain_attn_flash.comp`: query heads of one kv head folded into 16-row tiles, K/V staged once per block as f16, two passes); `0` never. Needs cooperative matrices at subgroup size 64; otherwise, and for a selection list, a window, a ring or a sink, the blocked shader or `chain_attn.comp`. On a Radeon 8060S (Qwen3.6, 1011-token prompt) the attention went from 186 ms (`chain_attnb`) to 22 ms, the first token from 2.08 to 1.85 s, perplexity unchanged (7.65). |
 | `COLI_VK_CHAIN_GEMV` | on | `0`: the decode matrices take `qmatmul.comp`'s GEMV instead of `chain_gemv.comp`'s. |
 | `COLI_VK_CHAIN_GEMV_UNR` / `COLI_VK_CHAIN_GEMV_UNR1` | `4` / `8` | 16-byte weight steps a lane of `chain_gemv.comp` loads before it decodes them, for a verify's rows (several a workgroup) and for a decode step's one row. More loads in flight, same sums in the same order. |
 | `COLI_VK_CHAIN_GEMV2` | on where supported | `0`: the int8 decode matrices keep `chain_gemv.comp` instead of `chain_gemv2.comp` (rows a workgroup by the matrix's length). On a Radeon 8060S (Qwen3.6, a 256-token answer, int8 trunk) decode went from 36.8 to 39.0 tok/s; at int4 (`COLI_DENSE_BITS=4`) it measured slower, so it takes int8 only. |
@@ -1502,7 +1510,31 @@ rebuilds the KDA state on the CPU from the input rows the chain records since th
 copy was last current (embedding rows, or the vision tower's), a prefill's worth of CPU
 work.
 
-**Declined** (the CPU path runs, the state synced first): a ragged multi-slot decode
+**Several conversations at once (colibri).** `KV_SLOTS`' batched decode (one row from
+each active conversation, each at its own position) runs on the chain: the norms, the
+projections and the MoE take the batch's rows as one; each row's new KV rows go to its
+own conversation's mirror, and its attention core runs over that mirror
+(`vkc_mla_attn_rows`) with its own DSA list over its own index keys. A conversation's
+mirror is the chain's own when the chain holds it (the last one a prompt or a one-row
+step ran for), else one of up to `COLI_VK_CHAIN_MUX` (default 16) beside it: whole,
+with its own watermarks, which a turn that goes back in its conversation lowers as on
+the host. Past that count the mirror read longest ago gives way, and its conversation's
+rows go up again from the host when it comes back. A mirror holds `positions x
+(kv_lora + qk_rope)` floats a layer (and `positions x index_hd` on a full DSA layer),
+positions in powers of two up to the context, and is placed only within four fifths of
+the device's free memory. A step whose conversations the mirrors cannot all hold, a
+step with the KV split on, and `COLI_VK_CHAIN_MUX=0` run on the CPU as before. With a
+second device each chain runs its layers for the whole batch, the DSA lists crossing as
+in one conversation's step; a partial chain hands the rows (and their lists) to the CPU
+after its layers. The `[VK] colibri chain: n multiplexed steps (r rows), ...` line at
+exit says what ran. `tests/vulkan_chain_mux.py` compares every frame with the CPU's:
+waves of requests on 3 and 4 slots sent at once (the batches grow and shrink; the
+second wave extends, rewinds and replaces each conversation), DSA top-4, one mirror
+beside the chain's, the device lost in a multiplexed step, the partial chain and two
+devices with a shared indexer at their edges. Not yet measured with a real checkpoint.
+glm53 still runs such steps on the CPU.
+
+**Declined** (the CPU path runs, the state synced first): glm53's multi-slot decode
 batch (a single-slot serve's one-row batch takes the chain), a layer range (a segment),
 a quantized KV cache (KV8, KV_TQ), PILOT, LOOKA, the exact verify of
 `COLI_EXACT_VERIFY`, the CUDA backend, matrices with no device form (int2, E8/IQ3, fp8
@@ -2126,6 +2158,7 @@ The run's line counts what streamed:
 | `COLI_VK_CHAIN_ROWS` | from the budget, up to 8192 | Prompt rows per chain chunk; `auto` as unset. Set, it also keeps the engines' own prompt blocks (above). |
 | `COLI_VK_CHAIN_ROWS_MAX` | `8192` | The most rows the budget's chunk takes. |
 | `COLI_VK_ATTN_BLOCK` | `16` | Rows from which the chain's attention takes `chain_attnb.comp`; `0` never. |
+| `COLI_VK_CHAIN_GEMM` | on where supported | The chain's int8/int4 prompt matmuls (`I % 64`, `O % 128`) on `chain_gemm.comp` (cooperative matrices at subgroup size 64, x rounded to f16 once, 128 outputs x 64 rows a workgroup); `0` keeps the fp32 GEMM. On a Radeon 8060S (Qwen3.6, 1011-token prompt): 517-546 -> 282-287 ms of tiled GEMM, the first token 2.08 -> 1.85 s, perplexity unchanged (7.65). |
 | `COLI_VK_ATTN_SLICE` | `4294967296` | Rows x positions x heads x head dim past which an attention is cut over several submissions; `0` never. |
 | `COLI_VK_TIER_STREAM` | on | `0`: no streaming; the tier takes a prompt step in the engine's usual blocks and leaves the cold experts to the CPU, as before. |
 | `COLI_VK_TIER_STREAM_SLOTS` | `64` | Staging slots (experts) for streaming, out of the tier's budget. |
@@ -3004,7 +3037,7 @@ hit-rate line is the tier-effectiveness number.
   GEMM shaders would save both copies; it is not written.
 - Without the dense chain, DSA top-k selection, ragged multi-slot serving, and
   quantized-KV caches fall back to the CPU attention path; with it, the DSA selection
-  runs on the device.
+  and colibri's multi-slot serving run on the device.
 - Not yet done: a fully resident-layer pipeline for the engines other than qwen36,
   qwen38, colibri and glm53 ([the dense chain](#the-dense-chain-vk_chainc) is theirs), Polaris/gfx803 validation on real
   hardware (the shaders use dynamic subgroup sizes and are wave64-safe by

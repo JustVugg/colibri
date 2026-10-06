@@ -575,8 +575,10 @@ static inline void coli_hold_console(void)
 
 /* One wording for every engine: what this binary is, and the command that does
  * what the user was trying to do. Called on the "no model" exit path, which is
- * where a bare launch lands. `engine` is the family name for the message. */
-static inline void coli_print_launcher_help(const char *engine)
+ * where a bare launch lands. `engine` is the family name for the message,
+ * `by_hand` how this binary itself is run (they differ: some read the model
+ * from SNAP, some from their first argument; #1906). */
+static inline void coli_print_launcher_help(const char *engine, const char *by_hand)
 {
 #ifdef _WIN32
     const char *run = "coli.cmd";
@@ -593,11 +595,10 @@ static inline void coli_print_launcher_help(const char *engine)
         "    %s doctor --model <model directory>   check a model is usable\n"
         "\n"
         "The launcher needs Python 3 and picks the right engine for the model.\n"
-        "(Running the engine by hand: it reads the model directory from the\n"
-        "SNAP environment variable, e.g. SNAP=<model directory> ./%s ...)\n"
+        "(Running the engine by hand: %s)\n"
         "Getting a model, step by step: https://github.com/JustVugg/colibri"
         "/blob/main/docs/quickstart.md\n",
-        engine, run, run, run, run, engine);
+        engine, run, run, run, run, by_hand);
     coli_hold_console();
 }
 

@@ -2404,18 +2404,32 @@ def _discover_metal_gpus():
 
 
 def _discover_nvidia_gpus():
-    command = ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free",
-               "--format=csv,noheader,nounits"]
-    try:
-        result = subprocess.run(command, text=True, capture_output=True, check=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
+    # compute_cap last: a driver that predates the field refuses the whole query,
+    # and then the same without it (setup_hw.py does the same)
+    result = None
+    for fields_asked in ("index,name,memory.total,memory.free,compute_cap",
+                         "index,name,memory.total,memory.free"):
+        command = ["nvidia-smi", f"--query-gpu={fields_asked}", "--format=csv,noheader,nounits"]
+        try:
+            result = subprocess.run(command, text=True, capture_output=True, check=True, timeout=5)
+            break
+        except subprocess.CalledProcessError:
+            continue
+        except (OSError, subprocess.SubprocessError):
+            return []
+    if result is None:
         return []
     devices = []
     import csv
     for fields in csv.reader(result.stdout.splitlines()):
         fields = [f.strip() for f in fields]
-        if len(fields) != 4:
+        if len(fields) not in (4, 5):
             continue
+        cap = None
+        if len(fields) == 5:
+            m = re.fullmatch(r"(\d+)\.(\d+)", fields[4])
+            cap = (int(m.group(1)), int(m.group(2))) if m else None
+            fields = fields[:4]
         try:
             index = int(fields[0])
         except ValueError:
@@ -2435,10 +2449,13 @@ def _discover_nvidia_gpus():
                 total = free = 0
         name = fields[1]
         unified = any(token in name.lower() for token in ("gb10", "jetson", "grace blackwell"))
-        devices.append({"index": index, "name": name,
-                        "total_bytes": total * 1024 * 1024,
-                        "free_bytes": free * 1024 * 1024,
-                        "unified_memory": unified})
+        device = {"index": index, "name": name,
+                  "total_bytes": total * 1024 * 1024,
+                  "free_bytes": free * 1024 * 1024,
+                  "unified_memory": unified}
+        if cap:
+            device["compute_cap"] = cap
+        devices.append(device)
     return devices
 
 
@@ -2609,6 +2626,13 @@ def _discover_amd_gpus():
                         "total_bytes": total, "free_bytes": free,
                         "unified_memory": False})
     return devices
+
+
+#: The oldest compute capability an engine's CUDA tier is built for by default, and
+#: what reaches older cards (docs/deepseek-v4.md).
+CUDA_TIER_FLOOR = {
+    "deepseek_v4": ((8, 0), "a build with CUDA_ARCH=portable-pre-ampere NO_TC=1 runs on Pascal and Turing"),
+}
 
 
 def plans_placement(gpu):
@@ -3020,6 +3044,12 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     # stops "a GPU exists" from being read as "a GPU should be used" -- see
     # plans_placement().
     planning_gpus = [gpu for gpu in gpus if plans_placement(gpu)]
+    # A CUDA tier built for newer cards than the one found: that card drives no
+    # placement (#1906: a Quadro P2000, sm_61, planned as "GPU compute" for V4)
+    floor = CUDA_TIER_FLOOR.get(resolved.descriptor.id)
+    below = [gpu for gpu in planning_gpus
+             if floor and gpu.get("compute_cap") and tuple(gpu["compute_cap"]) < floor[0]]
+    planning_gpus = [gpu for gpu in planning_gpus if gpu not in below]
 
     placement_unified = any(gpu.get("unified_memory", False)
                             for gpu in planning_gpus)
@@ -3041,7 +3071,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     gpu_plan = []
     safe_vram = 0
     for gpu in gpus:
-        usable = max(0, gpu["free_bytes"] - reserve) if plans_placement(gpu) else 0
+        usable = max(0, gpu["free_bytes"] - reserve) if plans_placement(gpu) and gpu not in below else 0
         safe_vram += usable
         gpu_plan.append(dict(gpu, reserve_bytes=reserve, usable_bytes=usable))
     requested_vram = int(vram_gb * GB) if vram_gb > 0 else safe_vram
@@ -3067,6 +3097,12 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     vram_experts = int(vram_budget // typical) if typical else 0
     hot_bytes = min(info["expert_bytes"], vram_experts * typical)
     warnings = []
+    for gpu in below:
+        cc = gpu["compute_cap"]
+        warnings.append(
+            f"GPU {gpu['index']} ({gpu['name']}, sm_{cc[0]}{cc[1]}) is below the "
+            f"sm_{floor[0][0]}{floor[0][1]} {resolved.descriptor.id}'s CUDA tier is built for by "
+            f"default; planned without it ({floor[1]})")
     if placement_unified:
         requested_ram = int(ram_gb * GB) if ram_gb > 0 else int(available_memory * 0.88)
         requested_ram_experts = max(0, requested_ram - info["dense_bytes"] - runtime_bytes)

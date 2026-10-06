@@ -4723,6 +4723,19 @@ def _engine_extension_args(engine_k):
     return {"logprobs": engine_k, "gbytes_before_ext": True}
 
 
+def engine_exit_status(status):
+    """A child's exit status in words: a signal on POSIX (a SIGKILL is most often the
+    out-of-memory killer), the NTSTATUS on Windows."""
+    if status < 0:
+        name = {9: "SIGKILL, most often the out-of-memory killer", 11: "SIGSEGV", 6: "SIGABRT"}.get(-status)
+        return f"killed by signal {-status}" + (f", {name}" if name else "")
+    if status >= 0xC0000000:
+        name = {0xC0000005: "access violation", 0xC0000017: "out of memory", 0xC00000FD: "stack overflow",
+                0xC0000409: "fail-fast or stack buffer overrun"}.get(status)
+        return f"exit status 0x{status:08X}" + (f", {name}" if name else "")
+    return f"exit status {status}"
+
+
 class EngineLoadError(RuntimeError):
     """The engine said why it could not load, and exited before READY.
 
@@ -5629,8 +5642,23 @@ class Engine:
                     raise RuntimeError(f"invalid engine response: {' '.join(fields)}")
         except Exception as error:
             if not self.closed:
+                error = self._dispatcher_cause(error)
                 self.dispatcher_error = error
+                print(f"colibri: the engine dispatcher stopped: {error}", file=sys.stderr)
                 self._fail_pending(error)
+
+    def _dispatcher_cause(self, error):
+        """The dispatcher's error, with the engine's exit status when the engine is gone:
+        every later request fails with it, and the log used to say only "dispatcher
+        stopped" (#1941)."""
+        try:
+            gone = str(error) == "colibri engine exited unexpectedly"
+            status = self.process.wait(timeout=2) if gone else self.process.poll()
+        except Exception:
+            status = None
+        if status is None:
+            return error
+        return RuntimeError(f"{error} ({engine_exit_status(status)})")
 
     def decide(self, record, cache_slot=0, cancelled=None):
         """One DECIDE round trip: the record out, the engine's DECISION back.
@@ -5650,7 +5678,8 @@ class Engine:
             if self.closed:
                 raise RuntimeError("colibri engine is shutting down")
             if self.dispatcher_error is not None:
-                raise RuntimeError("colibri engine dispatcher stopped") from self.dispatcher_error
+                raise RuntimeError(f"colibri engine dispatcher stopped: {self.dispatcher_error}") \
+                    from self.dispatcher_error
             if self.process.poll() is not None:
                 raise RuntimeError("colibri engine is not running")
             request_id = str(self.next_request_id)
@@ -5728,7 +5757,8 @@ class Engine:
             if self.closed:
                 raise RuntimeError("colibri engine is shutting down")
             if self.dispatcher_error is not None:
-                raise RuntimeError("colibri engine dispatcher stopped") from self.dispatcher_error
+                raise RuntimeError(f"colibri engine dispatcher stopped: {self.dispatcher_error}") \
+                    from self.dispatcher_error
             if self.process.poll() is not None:
                 raise RuntimeError("colibri engine is not running")
             request_id = str(self.next_request_id)

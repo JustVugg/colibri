@@ -1,0 +1,22 @@
+#version 450
+// A big step's routed sum on the device (backend_vulkan.c, coli_vk_xb_step_sum):
+//   out[s][d] = sum over k in rank order with use[s*K+k] of w[s*K+k] * y[s*K+k][d]
+// as an fma chain from 0 -- the engines' host loop (os[d] += w * row[d] from a zeroed
+// row, contracted to fma), so the rows come back as that loop would make them.
+// Grid: x = ceil(D / 256), y = S.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Y { float y[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 2) readonly buffer U { uint use[]; };
+layout(std430, binding = 3) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P { int S, K, D; } p;
+void main() {
+    uint d = gl_GlobalInvocationID.x, s = gl_WorkGroupID.y;
+    if (d >= uint(p.D)) return;
+    float acc = 0.0;
+    for (uint k = 0u; k < uint(p.K); k++) {
+        uint i = s * uint(p.K) + k;
+        if (use[i] != 0u) acc = fma(w[i], y[i * uint(p.D) + d], acc);
+    }
+    o[s * uint(p.D) + d] = acc;
+}

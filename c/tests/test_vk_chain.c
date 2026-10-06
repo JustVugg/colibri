@@ -104,6 +104,7 @@ static uint16_t f2bf(float f) { uint32_t u; memcpy(&u, &f, 4); return (uint16_t)
 static float bf2f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f; }
 static int g_test_dev;   /* the device test_matmul uploads to (the chain's current one) */
 static float *g_mm_out;  /* test_matmul's output, kept when set to non-NULL (the two devices' bits) */
+static double g_mm_tol = 2e-4;   /* chain_gemm.comp's cases: x rounded to f16 */
 static void test_matmul(int fmt, int S, int I, int O, size_t xo, size_t yo) {
     float *x = fvec((size_t)S * I, 1.f), *W = malloc((size_t)O * I * sizeof(float));
     void *codes = NULL; float *sc = NULL; int gs = 0;
@@ -143,7 +144,7 @@ static void test_matmul(int fmt, int S, int I, int O, size_t xo, size_t yo) {
     vkc_submit(1);
     float *y = (float *)vkc_ptr(yb) + yo;
     double e = relerr(y, ref, (size_t)S * O, 1e-3);
-    CHECK(ok && e < 2e-4 && !bad(y, (size_t)S * O), "matmul fmt %d S %d I %d O %d xo %zu yo %zu: ok %d err %.2e", fmt, S, I, O, xo, yo, ok, e);
+    CHECK(ok && e < g_mm_tol && !bad(y, (size_t)S * O), "matmul fmt %d S %d I %d O %d xo %zu yo %zu: ok %d err %.2e", fmt, S, I, O, xo, yo, ok, e);
     if (g_mm_out) memcpy(g_mm_out, y, (size_t)S * O * sizeof(float));
     vkc_free(xb); vkc_free(yb); coli_vk_tensor_free(t);
     free(x); free(W); free(codes); free(sc); free(ref);
@@ -257,9 +258,12 @@ static void test_attn_hk(int S, int pos_base, int H, int KVH, int hd, int use_li
     VkcAttn p = {S, H, KVH, hd, pos_base, cap, 0, H * qseg, qseg, hd, H * qseg, qseg, 1, 0, H * hd, 0, use_list ? selrow : 0, scale, koff, koff};
     vkc_begin(); int ok = vkc_attn(qb, kb, vb, ob, qb, lb, &p); vkc_submit(1);
     float *o = vkc_ptr(ob);
+    /* chain_attn_flash's operands are f16: its bound where it may have run */
+    int fl = vkc_attn_flash_rows();
     double e = relerr(o, ref, (size_t)S * H * hd, 1e-3);
-    CHECK(ok && e < 2e-5, "attn S %d pos %d H %d/%d hd %d list %d (block from %d): err %.2e", S, pos_base, H, KVH, hd,
-          use_list, vkc_attn_block_rows(), e);
+    double tol = fl > 0 && S >= fl && !use_list && hd % 64 == 0 && 16 % (H / KVH) == 0 ? 2e-3 : 2e-5;
+    CHECK(ok && e < tol, "attn S %d pos %d H %d/%d hd %d list %d (block from %d, flash from %d): err %.2e", S, pos_base, H, KVH, hd,
+          use_list, vkc_attn_block_rows(), fl, e);
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(ob); vkc_free(lb);
     free(q); free(kc); free(vc); free(sel); free(ref);
 }
@@ -2390,38 +2394,6 @@ static void bench_gemv(void) {
     }
 }
 
-/* A speculative verify's rows through the decode GEMV: each of S rows (2..4, one
- * workgroup) must carry the bits a one-row call gives that row. */
-static void test_gemv_rows(int fmt, int S, int I, int O) {
-    float *x = fvec((size_t)S * I, 1.f);
-    void *codes = NULL; float *sc = NULL; int gs = 0;
-    if (fmt == 1) {
-        int8_t *q = malloc((size_t)O * I); sc = malloc(O * sizeof *sc);
-        for (size_t i = 0; i < (size_t)O * I; i++) q[i] = (int8_t)((int)(rnd() % 255) - 127);
-        for (int o = 0; o < O; o++) sc[o] = 0.01f + (rnd() % 100) / 5000.f;
-        codes = q;
-    } else {
-        gs = 64; int ng = I / 64;
-        uint8_t *q = malloc((size_t)O * (I / 2)); sc = malloc((size_t)O * ng * sizeof *sc);
-        for (size_t i = 0; i < (size_t)O * (I / 2); i++) q[i] = (uint8_t)rnd();
-        for (int i = 0; i < O * ng; i++) sc[i] = 0.02f + (rnd() % 100) / 3000.f;
-        codes = q;
-    }
-    ColiVkTensor *t = NULL;
-    if (!coli_vk_tensor_ensure(&t, codes, sc, fmt, I, O, gs)) { CHECK(0, "gemv rows fmt %d: upload", fmt); return; }
-    VkcBuf *xb = vkc_buf((size_t)S * I * 4, VKC_DEV), *ya = vkc_buf((size_t)S * O * 4, VKC_DOWN), *y1 = vkc_buf((size_t)S * O * 4, VKC_DOWN);
-    vkc_gemm_rows(0);   /* every row on the GEMV, as a verify's */
-    vkc_begin(); vkc_write(xb, 0, x, (size_t)S * I * 4);
-    int ok = vkc_matmul(t, xb, 0, ya, 0, S);
-    for (int s = 0; s < S; s++) ok = ok && vkc_matmul(t, xb, (size_t)s * I, y1, (size_t)s * O, 1);
-    vkc_submit(1);
-    vkc_gemm_rows(-1);
-    int same = ok && !memcmp(vkc_ptr(ya), vkc_ptr(y1), (size_t)S * O * 4);
-    CHECK(same, "gemv rows fmt %d S %d I %d O %d: a row's bits depend on the rows beside it", fmt, S, I, O);
-    vkc_free(xb); vkc_free(ya); vkc_free(y1); coli_vk_tensor_free(t);
-    free(x); free(codes); free(sc);
-}
-
 /* ---- a second device (vkc_device(1), COLI_VK_DEV2) -------------------------------------
  * The chain's context on COLI_VK_DEV2's device: the ops against their references there,
  * the matmul's bits equal to device 0's, and the boundary held (a buffer of one device
@@ -2483,6 +2455,37 @@ static void test_dev2(const char *spv) {
     vkc_device(0);
 }
 
+/* A speculative verify's rows through the decode GEMV: each of S rows (2..4, one
+ * workgroup) must carry the bits a one-row call gives that row. */
+static void test_gemv_rows(int fmt, int S, int I, int O) {
+    float *x = fvec((size_t)S * I, 1.f);
+    void *codes = NULL; float *sc = NULL; int gs = 0;
+    if (fmt == 1) {
+        int8_t *q = malloc((size_t)O * I); sc = malloc(O * sizeof *sc);
+        for (size_t i = 0; i < (size_t)O * I; i++) q[i] = (int8_t)((int)(rnd() % 255) - 127);
+        for (int o = 0; o < O; o++) sc[o] = 0.01f + (rnd() % 100) / 5000.f;
+        codes = q;
+    } else {
+        gs = 64; int ng = I / 64;
+        uint8_t *q = malloc((size_t)O * (I / 2)); sc = malloc((size_t)O * ng * sizeof *sc);
+        for (size_t i = 0; i < (size_t)O * (I / 2); i++) q[i] = (uint8_t)rnd();
+        for (int i = 0; i < O * ng; i++) sc[i] = 0.02f + (rnd() % 100) / 3000.f;
+        codes = q;
+    }
+    ColiVkTensor *t = NULL;
+    if (!coli_vk_tensor_ensure(&t, codes, sc, fmt, I, O, gs)) { CHECK(0, "gemv rows fmt %d: upload", fmt); return; }
+    VkcBuf *xb = vkc_buf((size_t)S * I * 4, VKC_DEV), *ya = vkc_buf((size_t)S * O * 4, VKC_DOWN), *y1 = vkc_buf((size_t)S * O * 4, VKC_DOWN);
+    vkc_gemm_rows(0);   /* every row on the GEMV, as a verify's */
+    vkc_begin(); vkc_write(xb, 0, x, (size_t)S * I * 4);
+    int ok = vkc_matmul(t, xb, 0, ya, 0, S);
+    for (int s = 0; s < S; s++) ok = ok && vkc_matmul(t, xb, (size_t)s * I, y1, (size_t)s * O, 1);
+    vkc_submit(1);
+    vkc_gemm_rows(-1);
+    int same = ok && !memcmp(vkc_ptr(ya), vkc_ptr(y1), (size_t)S * O * 4);
+    CHECK(same, "gemv rows fmt %d S %d I %d O %d: a row's bits depend on the rows beside it", fmt, S, I, O);
+    vkc_free(xb); vkc_free(ya); vkc_free(y1); coli_vk_tensor_free(t);
+    free(x); free(codes); free(sc);
+}
 int main(int argc, char **argv) {
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
@@ -2497,6 +2500,21 @@ int main(int argc, char **argv) {
         test_matmul(fmts[k], 1, 100, 33, 0, 0);          /* rows that are not whole 16-byte steps */
         test_matmul(fmts[k], 2, 3072, 40, 0, 0);         /* a long row (chain_gemv's staging) */
     }
+    /* int8 and int4 prompt GEMMs whose shapes chain_gemm.comp takes (I % 64, O % 128), on
+     * a device with cooperative matrices at subgroup size 64: full and partial row tiles,
+     * bindable offsets; its x is rounded to f16, hence the bound */
+    {
+        VkcStats s0; vkc_stats(&s0);
+        g_mm_tol = 2e-3;
+        for (int k = 0; k < 2; k++) {
+            test_matmul(fmts[k], 64, 256, 256, 0, 0);
+            test_matmul(fmts[k], 70, 512, 384, 64, 128);
+            test_matmul(fmts[k], 130, 192, 128, 0, 0);
+        }
+        g_mm_tol = 2e-4;
+        VkcStats s1; vkc_stats(&s1);
+        printf("  prompt GEMMs on chain_gemm: %llu\n", s1.tile_gemms - s0.tile_gemms);
+    }
     printf("matmul done\n");
     test_norm(VKC_NORM_ADD1, 0); test_norm(VKC_NORM_ADD1, 1); test_norm(0, 0); test_norm(VKC_NORM_NOW, 1); test_norm(VKC_NORM_L2 | VKC_NORM_NOW, 0);
     printf("norm done\n");
@@ -2507,6 +2525,21 @@ int main(int argc, char **argv) {
     test_rope();
     test_chunk_rows();
     test_attn(1, 0, 16, 0); test_attn(1, 140, 32, 0); test_attn(5, 200, 64, 0); test_attn(6, 9, 256, 1); test_attn(130, 3, 24, 0);
+    /* prompt chunks on the matrix units where the device has them (chain_attn_flash, from
+     * 16 rows): Qwen3.6's heads (hd 256, 8 query heads per kv head) from position 0 and
+     * after earlier rows, a chunk over several 64-key blocks with a partial last token
+     * group, hd 64 with GQA 2, hd 128 with GQA 16; then cut in slices */
+    {
+        VkcStats s0; vkc_stats(&s0);
+        test_attn_hk(16, 0, 16, 2, 256, 0); test_attn_hk(37, 200, 16, 2, 256, 0); test_attn_hk(130, 3, 4, 2, 64, 0);
+        test_attn_hk(21, 70, 16, 1, 128, 0);
+        setenv("COLI_VK_ATTN_SLICE", "60000", 1);
+        test_attn_hk(40, 7, 16, 2, 256, 0); test_attn_hk(130, 3, 4, 2, 64, 0);
+        unsetenv("COLI_VK_ATTN_SLICE");
+        VkcStats s1; vkc_stats(&s1);
+        printf("  attention on the matrix units: %llu calls\n", s1.attn_flash - s0.attn_flash);
+    }
+    setenv("COLI_VK_CHAIN_FLASH", "0", 1);   /* the blocked and plain cases below: their own shaders */
     /* MiMo: a prompt's rows through a window (from position 0, and past it), a decode row
      * over a ring as large as the window, prefill rows over a larger ring, full attention
      * with V's own head dim, a window wider than a tile, the head-major layout with a
@@ -2545,6 +2578,7 @@ int main(int argc, char **argv) {
         printf("  attention in slices: %llu extra submissions\n", s1.attn_slices - s0.attn_slices);
         unsetenv("COLI_VK_ATTN_SLICE");
     }
+    unsetenv("COLI_VK_CHAIN_FLASH");
     printf("attn done\n");
     test_dnconv(0); test_dnconv(1);
     test_dnrec(8, 8, 8, 4, 0); test_dnrec(4, 4, 4, 2, 1); test_dnrec(128, 128, 4, 2, 0); test_dnrec(32, 100, 6, 3, 1);

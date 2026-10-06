@@ -90,6 +90,12 @@ experts per matrix and takes the original contiguous fast path everywhere else
 (#1310). The banner reports it by its measured geometry, `43L x 132E`, rather
 than the 284B of the official checkpoint, because that number is not its.
 
+Its experts take 76 GB, about half the official checkpoint's, so the RAM that suits the official
+checkpoint does not carry over, and more is not always faster: on a 128 GB
+Threadripper PRO 3975WX (#1906) `--ram 64` decoded 0.768 tok/s, 90 and 100
+0.745, 120 0.765. Two or three runs of your own prompt at different `--ram`
+values find the best one for a machine.
+
 A download can finish with a truncated shard even when the client reports
 success. If `st.h` rejects a shard as out of bounds, compare every local shard
 size with the Hugging Face repository before treating it as an engine failure.
@@ -102,6 +108,10 @@ CPU engine (all platforms):
 cd c
 make deepseek-v4            # ARCH=native for the local CPU (default x86-64-v3)
 ```
+
+The build uses link-time optimization by default. A gcc built without it (the
+portable w64devkit on Windows says `LTO support has not been enabled in this
+configuration`) builds with `make deepseek-v4 LTO=0`.
 
 ### Windows CUDA tier
 
@@ -178,7 +188,9 @@ $env:V4_LOADER_LANES = "3"   # GPU tier: 9-lane default tuned for the CPU path, 
 python ./coli serve --model C:\models\DeepSeek-V4-Flash --ram 32 --ctx 20000
 ```
 
-`coli run|chat|web` take the same environment. `--ngen` is a ceiling, not a
+`coli run|chat|web` take the same environment. On Windows a prompt with text
+outside ASCII (Chinese, accented letters) does not survive the command line of
+the engine run by hand: give it with `--prompt-file <UTF-8 file>`. `--ngen` is a ceiling, not a
 target (answers end at EOS; an oversized ceiling is clamped to the context
 with a stderr note). `CTX`/`--ctx` sets the context window.
 
@@ -463,7 +475,11 @@ kernels are not bit-identical to each other in general — a GPU run and a CPU
 run of the same prompt diverge by a rounding flip after some tokens, exactly
 as two CPU runs with different hot-expert sets do (next section) — so text
 identity is a regression check within one configuration, not a proof across
-configurations.
+configurations. The same holds across builds: a binary built with
+`ARCH=native` and the release's (`x86-64-v3`) can differ by such a flip, the
+compiler having chosen other instructions (FMA contraction, vector width) for
+the same arithmetic (#1906 saw one word change after 384 characters), so a
+check of exact text compares runs of one binary.
 
 ### Linux CUDA tier under WSL2 (2026-08-16)
 

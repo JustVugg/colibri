@@ -157,6 +157,16 @@ static long vkc_kv_env(const char *name, long def) {
  * engine holds now (freed before the new ones). Returns 1 for whole mirrors (ks->on = 0:
  * the chain as before), 2 for the split (ks->on = 1, tables ready, every block in the
  * host's RAM until a step places it), 0 when not even the split can run. */
+/* The current device's free bytes: the driver's budget less what is in use, else the
+ * local heap less the weights and the chain's buffers. */
+static size_t vkc_dev_avail(void) {
+    double used = 0, bud = 0;
+    if (coli_vk_mem_budget_dev(vkc_device_now(), &used, &bud)) return bud > used ? (size_t)((bud - used) * 1e9) : 0;
+    size_t dev = coli_vk_device_local_bytes_dev(vkc_device_now()), w = 0, n = 0;
+    VkcStats st; vkc_stats(&st);
+    coli_vk_mem_info_dev(vkc_device_now(), &w, &n);
+    return dev > w + st.dev_bytes ? dev - w - st.dev_bytes : 0;
+}
 /* vkc_kv_plan_need: the same with the whole mirrors' bytes given (need_bytes; 0: nl * cap
  * * row_bytes), for layers whose caches differ (DeepSeek's compressed rows, one ratio a
  * layer): the decision compares those bytes with the budget, the tables cover cap
@@ -176,16 +186,7 @@ static int vkc_kv_plan_need(VkcKvSplit *ks, const char *engine, int nl, size_t r
         if (forced >= cap) return 1;
         rows = forced;
     } else {
-        double used = 0, bud = 0;
-        size_t avail;
-        if (coli_vk_mem_budget_dev(vkc_device_now(), &used, &bud)) avail = bud > used ? (size_t)((bud - used) * 1e9) : 0;
-        else {
-            size_t dev = coli_vk_device_local_bytes_dev(vkc_device_now()), w = 0, n = 0;
-            VkcStats st; vkc_stats(&st);
-            coli_vk_mem_info_dev(vkc_device_now(), &w, &n);
-            avail = dev > w + st.dev_bytes ? dev - w - st.dev_bytes : 0;
-        }
-        avail += held;
+        size_t avail = vkc_dev_avail() + held;
         size_t room = avail / 10 * 8;          /* a fifth for scratch, frames and the rest */
         if (need <= room) return 1;
         rows = (long)(room / ((size_t)nl * row_bytes));

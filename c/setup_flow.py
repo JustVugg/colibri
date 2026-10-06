@@ -155,7 +155,8 @@ def read_state():
 
 def find_msys2():
     candidates = [os.environ.get("MSYS2_ROOT"), r"C:\msys64",
-                  os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "msys64")]
+                  os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "msys64"),
+                  os.path.join(os.path.expanduser("~"), "scoop", "apps", "msys2", "current")]
     for root in candidates:
         if root and os.path.isfile(os.path.join(root, "usr", "bin", "bash.exe")):
             return root
@@ -283,7 +284,19 @@ def toolchain(here=None):
           "msys2": None, "npm": shutil.which("npm")}
     if sys.platform == "win32":
         tc["nvcc"] = None   # the Windows CUDA path is a separate MSVC build (docs/windows.md)
+        path_vulkan = False
+        if tc["cc"]:
+            prefix = os.path.dirname(os.path.dirname(tc["cc"]))
+            path_vulkan = bool(tc["glslc"]) and os.path.isfile(os.path.join(prefix, "include", "vulkan", "vulkan.h"))
+        # MSYS2's UCRT64 when the PATH has no compiler, and also when the PATH's cannot
+        # build the Vulkan backend (no headers or no glslc) and MSYS2 has a compiler of
+        # its own: a gcc and make from elsewhere (scoop's) used to hide it (#1900)
         root = None if (tc["make"] and tc["cc"]) else find_msys2()
+        if root is None and not path_vulkan:
+            found = find_msys2()
+            if found and os.path.isfile(os.path.join(found, "ucrt64", "bin", "gcc.exe")) \
+                    and os.path.isfile(os.path.join(found, "usr", "bin", "make.exe")):
+                root = found
         if root:
             ucrt = os.path.join(root, "ucrt64")
             tc["msys2"] = root
@@ -340,7 +353,7 @@ PACKAGES = {
                                          "cuda": ["cuda"], "python": ["python"]}),
     "suse": ("sudo zypper install", {"build": ["gcc", "make"], "vulkan": ["vulkan-devel", "shaderc"],
                                      "python": ["python3"]}),
-    "msys2": ("pacman -S --needed", {"build": ["mingw-w64-ucrt-x86_64-gcc", "make"],
+    "msys2": ("pacman -S --needed", {"build": ["mingw-w64-ucrt-x86_64-gcc", "mingw-w64-ucrt-x86_64-libgomp", "make"],
                                      "vulkan": ["mingw-w64-ucrt-x86_64-vulkan-headers",
                                                 "mingw-w64-ucrt-x86_64-vulkan-loader",
                                                 "mingw-w64-ucrt-x86_64-shaderc"]}),

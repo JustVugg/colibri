@@ -362,8 +362,9 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
     """Launchers size shared engines; V4 delegates to its loader-aware runtime.
 
     #805's physical-core default still covers the memory-bound sister engines.
-    DeepSeek V4 instead reserves logical CPUs for its expert-loader workers in
-    v4_omp_reserve_loader_cpus(), unless the operator overrides or disables it.
+    DeepSeek V4 sizes its own team in v4_omp_reserve_loader_cpus() (the physical
+    cores with SMT, the loaders on the siblings; else the logical CPUs less its
+    expert-loader workers), unless the operator overrides or disables it.
     """
 
     @classmethod

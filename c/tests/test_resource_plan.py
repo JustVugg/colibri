@@ -672,6 +672,22 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertTrue(any("share one physical memory" in warning
                             for warning in plan["warnings"]))
 
+    def test_nvidia_compute_capability_is_read_when_the_driver_has_it(self):
+        from resource_plan import _discover_nvidia_gpus
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="0, Quadro P2000, 5120, 5000, 6.1\n", stderr="")
+        with mock.patch("resource_plan.subprocess.run", return_value=ok) as run:
+            devices = _discover_nvidia_gpus()
+        self.assertEqual(devices[0]["compute_cap"], (6, 1))
+        self.assertIn("compute_cap", run.call_args_list[0][0][0][1])
+        # a driver that predates the field refuses the query: asked again without it
+        old = subprocess.CompletedProcess(args=[], returncode=0, stdout="0, Quadro P2000, 5120, 5000\n", stderr="")
+        with mock.patch("resource_plan.subprocess.run",
+                        side_effect=[subprocess.CalledProcessError(2, "nvidia-smi"), old]) as run:
+            devices = _discover_nvidia_gpus()
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(devices[0]["free_bytes"], 5000 * 1024 * 1024)
+        self.assertNotIn("compute_cap", devices[0])
+
     def test_nvidia_unified_device_is_marked_from_name(self):
         output = "0, NVIDIA GB10, 130000, 120000\n"
         with mock.patch("resource_plan.subprocess.run",
@@ -1702,6 +1718,24 @@ class VulkanPartialChainTest(unittest.TestCase):
                     add(p + f"ffn.experts.{e}.{name}.weight", "I8", 128, 64)
         write_shard(self.model / "model.safetensors", tensors)
         return analyze_model(self.model)
+
+    def test_deepseek_v4_plans_without_a_gpu_below_its_cuda_floor(self):
+        """#1906: a Quadro P2000 (sm_61) was planned as GPU compute for V4, whose CUDA
+        tier is built for sm_80 and newer by default."""
+        self.write_v4([0, 4])
+
+        def plan_with(cap):
+            gpu = {"index": 0, "name": "Quadro P2000", "total_bytes": 5 * GB, "free_bytes": 5 * GB,
+                   "unified_memory": False, "compute_cap": cap}
+            return build_plan(self.model, ram_gb=16, available_memory=64 * GB, available_disk=1,
+                              gpus=[gpu], physical_cpus=32, cpu_sockets=1)
+        old = plan_with((6, 1))
+        self.assertEqual(old["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertNotIn("GPU", old["expected_bottleneck"])
+        self.assertTrue(any("sm_61" in w and "portable-pre-ampere" in w for w in old["warnings"]))
+        new = plan_with((8, 6))
+        self.assertGreater(new["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertFalse(any("sm_86" in w for w in new["warnings"]))
 
     def test_deepseek_v4_layout_is_the_engines(self):
         # The numbers the engine printed for tools/make_deepseek_v4_tiny.py's fixture on

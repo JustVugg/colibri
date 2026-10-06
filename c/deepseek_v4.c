@@ -16217,19 +16217,33 @@ static int v4_serve_main(void) {
 
 #ifndef COLI_V4_SKIP_GENERATE_MAIN
 #ifdef _OPENMP
+#include "omp_tune.h"
 /* Size the OpenMP team so the block pipeline's persistent expert-loader
  * workers keep whole CPUs. The OpenMP default team spans every logical CPU,
  * which schedules compute threads onto the CPUs the loaders need -- and on a
  * disk-bound decode the loaders are doing the rate-limiting work (the same
  * rationale omp_tune.h records for the spin-wait half of the GLM tuning: a
- * busy team steals cores from the I/O pool). An explicit OMP_NUM_THREADS or
- * COLI_NO_OMP_TUNE=1 wins, exactly like the other engines' tuning. */
+ * busy team steals cores from the I/O pool). With SMT the team is the physical
+ * cores (the loaders take the siblings): the kernels are bound by memory
+ * bandwidth, and siblings contend for it (#718; on a Threadripper PRO 3975WX,
+ * 32 cores and 64 threads, 61 threads decoded 0.675 tok/s and 32 0.745, #1906).
+ * An explicit OMP_NUM_THREADS or COLI_NO_OMP_TUNE=1 wins, exactly like the other
+ * engines' tuning. */
 static int v4_omp_reserve_loader_cpus(void) {
     if (getenv("COLI_NO_OMP_TUNE")) return 0; /* family-wide kill-switch */
     if (getenv("OMP_NUM_THREADS")) return 0;  /* the user already chose */
     int logical = omp_get_max_threads();
     int team = logical - COLI_V4_EXPERT_LOADER_COUNT;
     if (team < 2) return 0; /* tiny machine: leave the OpenMP default alone */
+    int phys = coli_physical_cores();   /* 0: not known, and then no guess */
+    if (phys > 0 && phys < logical && phys < team) {
+        omp_set_num_threads(phys);
+        fprintf(stderr, "[OMP] deepseek-v4: %d compute threads (the physical cores of %d logical "
+                        "CPUs; the %d expert-loader workers take the SMT siblings); "
+                        "OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables\n",
+                phys, logical, COLI_V4_EXPERT_LOADER_COUNT);
+        return 1;
+    }
     omp_set_num_threads(team);
     fprintf(stderr, "[OMP] deepseek-v4: %d compute threads (%d logical CPUs "
                     "minus %d expert-loader workers); OMP_NUM_THREADS=<n> "
@@ -16250,7 +16264,7 @@ int main(int argc, char **argv) {
     double process_started = spec_now();
     int result = 1;
     V4CliOptions cli;
-    if (argc < 2) { coli_print_launcher_help("DeepSeek V4"); return 1; }
+    if (argc < 2) { coli_print_launcher_help("DeepSeek V4", "./deepseek_v4 <model directory> --prompt-file <UTF-8 file> ...; --help lists the options"); return 1; }
     if (v4_cli_parse(argc, argv, &cli)) {
         v4_cli_usage(stderr, argc ? argv[0] : "deepseek-v4");
         return 2;

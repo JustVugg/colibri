@@ -306,12 +306,20 @@ ptl_family_glm() {
     { grep -a 'resident dense\|dense matrices' ptl-ram*.log; fail "partial colibri device only: resident dense $r0 / $r2 / $r5 MB with 0 / 2 / 5 layers"; }
   echo "OK partial colibri device only: resident dense $r0 MB with 0 layers on the device, $r2 MB with 2, $r5 MB with 5"
   # serve sessions frame for frame with 2 of 5 layers: pins, the prompt cache, the prefill
-  # read-out, drafts, two KV slots (the ragged batch declines the chain), prompts only
+  # read-out, drafts, two KV slots, prompts only; several conversations at once, the
+  # shared indexer after the device's layers taking their rows' DSA lists
   export CHAIN_SERVE_EXPECT='colibri chain: 2 of 5 layers on the device'
   CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 COLI_VK_CHAIN_LAYERS=2
   CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 DRAFT=3 COLI_VK_CHAIN_LAYERS=2
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2 COLI_VK_CHAIN_LAYERS=2
   COLI_VK_CHAIN=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 COLI_VK_CHAIN_LAYERS=2
+  CHAIN_MUX_EXPECT="$CHAIN_SERVE_EXPECT" $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_serve 3 SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 COLI_VK_CHAIN_LAYERS=2
+  ptl_glm_shx glm_tiny_serve glm_tiny_shx_serve
+  for k in 1 3; do
+    CHAIN_MUX_EXPECT="colibri chain: $k of 5 layers on the device" \
+      $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_shx_serve 3 SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 COLI_VK_CHAIN_LAYERS=$k
+  done
+  rm -rf glm_tiny_shx_serve chain-mux.usage
   CHAIN_SERVE_EXPECT='colibri: [0-9]+ dense matrices on the device only.*the 2 of 5 layers on the device' COLI_VK_DENSE_HOST=0 \
     CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 COLI_VK_CHAIN_LAYERS=2
   unset CHAIN_SERVE_EXPECT

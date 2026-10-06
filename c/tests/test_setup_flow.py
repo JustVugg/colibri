@@ -1451,5 +1451,62 @@ class CommandLine(HomeTestCase):
         self.assertIn("coli setup", result.stderr)
 
 
+class WindowsToolchainTests(unittest.TestCase):
+    """toolchain() on Windows: a gcc and make on the PATH that cannot build the Vulkan
+    backend no longer hide an MSYS2 that can (#1900)."""
+
+    def tree(self, root, files):
+        for f in files:
+            path = os.path.join(root, *f.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "w").close()
+        return root
+
+    def run_toolchain(self, path_tools, msys2):
+        def which(name):
+            return path_tools.get(name)
+        with mock.patch.object(setup_flow.sys, "platform", "win32"), \
+                mock.patch.object(setup_flow.shutil, "which", side_effect=which), \
+                mock.patch.object(setup_flow, "find_msys2", return_value=msys2):
+            return setup_flow.toolchain(here=str(C_DIR))
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = self.tmp.name
+        self.msys2 = self.tree(os.path.join(base, "msys64"), [
+            "usr/bin/bash.exe", "usr/bin/make.exe", "ucrt64/bin/gcc.exe", "ucrt64/bin/glslc.exe",
+            "ucrt64/include/vulkan/vulkan.h", "ucrt64/lib/libvulkan-1.dll.a"])
+        scoop = self.tree(os.path.join(base, "scoop"), ["bin/gcc.exe", "bin/make.exe"])
+        self.scoop = {"gcc": os.path.join(scoop, "bin", "gcc.exe"), "make": os.path.join(scoop, "bin", "make.exe")}
+
+    def test_msys2_beats_a_path_compiler_without_vulkan(self):
+        tc = self.run_toolchain(self.scoop, self.msys2)
+        self.assertEqual(tc["msys2"], self.msys2)
+        self.assertEqual(tc["cc"], os.path.join(self.msys2, "ucrt64", "bin", "gcc.exe"))
+        self.assertTrue(tc["can_build_vulkan"])
+
+    def test_a_path_compiler_with_vulkan_stays(self):
+        prefix = self.tree(os.path.join(self.tmp.name, "full"),
+                           ["bin/gcc.exe", "bin/make.exe", "bin/glslc.exe", "include/vulkan/vulkan.h"])
+        tools = {"gcc": os.path.join(prefix, "bin", "gcc.exe"), "make": os.path.join(prefix, "bin", "make.exe"),
+                 "glslc": os.path.join(prefix, "bin", "glslc.exe")}
+        tc = self.run_toolchain(tools, self.msys2)
+        self.assertIsNone(tc["msys2"])
+        self.assertEqual(tc["cc"], tools["gcc"])
+        self.assertTrue(tc["can_build_vulkan"])
+
+    def test_an_msys2_without_its_compiler_does_not_replace_a_working_one(self):
+        bare = self.tree(os.path.join(self.tmp.name, "bare"), ["usr/bin/bash.exe"])
+        tc = self.run_toolchain(self.scoop, bare)
+        self.assertIsNone(tc["msys2"])
+        self.assertEqual(tc["cc"], self.scoop["gcc"])
+        self.assertTrue(tc["can_build"])
+        self.assertFalse(tc["can_build_vulkan"])
+
+    def test_msys2_build_packages_include_libgomp(self):
+        self.assertIn("mingw-w64-ucrt-x86_64-libgomp", setup_flow.PACKAGES["msys2"][1]["build"])
+
+
 if __name__ == "__main__":
     unittest.main()

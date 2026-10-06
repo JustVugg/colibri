@@ -272,6 +272,16 @@ ld2_colibri() {
     $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 DRAFT=3 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=1 COLI_VK_CHAIN_LAYERS2=2
   CHAIN_SERVE_EXPECT='colibri dev2 chain: [1-9][0-9]* forwards' CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=colibri \
     $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=2
+  # several conversations at once on both devices; a shared indexer first on the second
+  # (the primary's rows' DSA lists cross), and the CPU's after it
+  CHAIN_MUX_EXPECT='colibri dev2 chain: [1-9][0-9]* multiplexed' \
+    $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_serve 3 SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=3
+  ptl_glm_shx glm_tiny_serve glm_tiny_shx_serve
+  for s in "1 2" "3 2"; do
+    CHAIN_MUX_EXPECT='colibri dev2 chain: [1-9][0-9]* multiplexed' $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_shx_serve 3 \
+      SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=${s% *} COLI_VK_CHAIN_LAYERS2=${s#* }
+  done
+  rm -rf glm_tiny_shx_serve chain-mux.usage
 }
 
 # glm53 (GLM-5.3 Flash): the six-layer fixture, KDA and MLA alternating (the KDA state on
@@ -616,6 +626,11 @@ family_layers_dev2_mla_sanitize() {
     SNAP=glm_tiny_shx REF=ref_glm.json USAGE_SAVE=0 DSA_TOPK=4 TF=1 COLI_VK_CHAIN_ROWS=5 ./colibri 64 16 16
   LD2_SAN_LOST=1 ld2_san colibri "asan ld2 colibri second device lost mid-decode" COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=2 \
     COLI_VK_CHAIN_FAULT2=10 "${G[@]}" ./colibri 64 16 16
+  ptl_glm_shx glm_tiny_serve glm_tiny_shx_serve   # several conversations at once, the DSA lists crossing
+  $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_shx_serve 3 SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 COLI_VK_DEV2=0 COLI_VK_CHAIN_LAYERS=1 \
+    COLI_VK_CHAIN_LAYERS2=2 > san.log 2>&1 || { cat san.log; fail "asan ld2 colibri several conversations at once"; }
+  echo "OK asan ld2 colibri several conversations at once: $(tail -1 san.log)"
+  rm -rf glm_tiny_shx_serve chain-mux.usage
   ld2_san glm53 "asan ld2 glm53 KV split on both" COLI_VK_CHAIN_LAYERS=2 COLI_VK_CHAIN_LAYERS2=2 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 \
     GLM53_BITS=32 USAGE_SAVE=0 ./glm53 --model glm53_l6s-i4 --ids $ids --greedy 8
   LD2_SAN_LOST=1 ld2_san glm53 "asan ld2 glm53 second device lost, the KDA state rebuilt" COLI_VK_CHAIN_LAYERS=3 COLI_VK_CHAIN_LAYERS2=3 \

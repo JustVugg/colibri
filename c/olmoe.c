@@ -2569,7 +2569,7 @@ static int ref_fits(const int *prompt, int np, const int *full, int nfull, int v
 int main(int argc, char **argv) {
     coli_omp_tune_threads("olmoe");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
     const char *snap = getenv("SNAP");
-    if (!snap) { coli_print_launcher_help("OLMoE"); return 1; }
+    if (!snap) { coli_print_launcher_help("OLMoE", "SNAP=<model directory> ./olmoe ..."); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
     g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;

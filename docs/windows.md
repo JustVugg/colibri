@@ -151,6 +151,11 @@ This is not Defender and not Mark-of-the-Web — SAC blocks *all* unsigned, unkn
 # 0 = off, 1 = enforced, 2 = evaluation
 ```
 
+SAC can also block the compiler itself: right after `pacman` installs gcc, its own
+`collect2.exe` is unknown to SAC until the cloud verdict arrives (two hours, in #1900),
+and gcc only says `cannot execute 'collect2.exe': CreateProcess: No such file or
+directory`. The fix is the same (SAC off and a reboot), or waiting for the verdict.
+
 ## 3. Build the CUDA DLL (GPU tier)
 
 nvcc needs MSVC as host compiler, so this one step must run from a shell with the MSVC environment: open **"x64 Native Tools Command Prompt for VS 2022"** from the Start menu (plain PowerShell will fail the `cl` check). Not the generic "Developer Command Prompt": that one is the 32-bit compiler, and nvcc then fails inside `cuda_fp16.hpp` with `asm operand type size(8) does not match ... constraint 'r'` (#1405). `cl` alone prints which one you have: `for x64` is the right banner. Then:
@@ -200,6 +205,10 @@ Size `CUDA_EXPERT_GB` so dense (~10 GB) + experts + working set stays under your
 |---|---|---|
 | `'printf' is not recognized` / `The system cannot find the path specified` during `make colibri.exe` | scoop MinGW has no `sh.exe`; make fell back to cmd.exe (#478) | §0 — use MSYS2/w64devkit, or `set PATH=%PATH%;C:\msys64\usr\bin` |
 | `An Application Control policy has blocked this file` | Smart App Control | §2 — turn SAC off + **reboot** |
+| `cannot execute 'collect2.exe': CreateProcess: No such file or directory` | Smart App Control blocked the freshly installed compiler (#1900) | §2: SAC off and a reboot, or wait for SAC's verdict |
+| `cannot find -lgomp` at the link | MSYS2's gcc 16 no longer pulls libgomp (#1900) | `pacman -S mingw-w64-ucrt-x86_64-libgomp` (`coli setup` lists it) |
+| `make qwen38` (or glm53, inkling, kimi_k3, olmoe, deepseek_v41) ends in `undefined reference to ...` | older tree: no bare target for that engine, make compiled the `.c` alone (#1945) | update, or name the binary: `make qwen38.exe ...` |
+| `coli setup` does not find MSYS2 installed by scoop, or uses another gcc on the PATH without Vulkan | older tree (#1900) | update, or set `MSYS2_ROOT` to the MSYS2 folder |
 | `cuda-dll ... Error 1` immediately | old tree: spaced CUDA_HOME / MSVC rejects `-Wextra` | update to current `dev` (#314) |
 | `colibri.exe is up to date` but GPU never engages | old tree: stale CPU-only binary | update to `dev`, or delete the binary and rebuild |
 | `cl.exe (MSVC) not in PATH` | built from plain PowerShell | use the x64 Native Tools prompt |

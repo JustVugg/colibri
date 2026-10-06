@@ -127,9 +127,11 @@ static struct {
     unsigned sk;                          /* sub-batches issued in this step */
     VSub hf[2];                           /* the two in flight */
     float *sy; size_t csy;                /* the step's device rows, S*K*hidden */
+    float *sy_step;                       /* the backend's whole-step rows instead (coli_vk_xb_step_begin), or NULL */
+    int big_valid;                        /* the step's routed assignments (idx >= 0) */
     int *bcnt, *bofs, *blist, *bcls, cblist; /* per expert of the step: rows, first row, class; the rows grouped */
     uint32_t *pred; uint8_t *pred_ok;     /* per layer: the last big step's rows per expert */
-    unsigned long long st_steps, st_experts, st_rows, st_bytes, st_subs, st_kept, st_kept_rows, pf_n, pf_used;
+    unsigned long long st_steps, st_experts, st_rows, st_bytes, st_subs, st_sums, st_kept, st_kept_rows, pf_n, pf_used;
     double st_up_ms;
 } T;
 
@@ -947,6 +949,12 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     }
     for (int i = 0; i < n; i++) T.map[i] = -1;
     T.big = 1; T.big_fail = 0; T.big_n = n; T.big_taken = 0; T.sk = 0;
+    T.big_valid = 0;
+    for (int e = 0; e < E; e++) T.big_valid += cnt[e];
+    /* the step's token rows once and its output rows in place, where the backend can
+     * (not beside the second device: its rows come back as before) */
+    T.sy_step = !nd2 && (ndev || nst) ? coli_vk_xb_step_begin(S, K, x) : NULL;
+    float *SY = T.sy_step ? T.sy_step : T.sy;
     T.can_balance = 0;
     /* the order: resident experts, then the streamed ones already in a slot, then the rest */
     int *order = malloc((size_t)E * sizeof(int)), no = 0;
@@ -981,7 +989,8 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     int curh = 0;
 #define SUBMIT_CURRENT() do { \
         if (cnt_b) { \
-            int okk = !T.big_fail && coli_vk_xb_sub_issue(curh, bex, brows, cnt_b, bx, bw); \
+            int okk = !T.big_fail && (T.sy_step ? coli_vk_xb_sub_issue_step(curh, bex, brows, cnt_b, bidx, bw) \
+                                                : coli_vk_xb_sub_issue(curh, bex, brows, cnt_b, bx, bw)); \
             if (okk) { \
                 for (int q = 0; q < rows_b; q++) { taken[bidx[q]] = 1; T.map[bidx[q]] = bidx[q]; } \
                 total += rows_b; T.st_subs++; T.sk++; \
@@ -1053,7 +1062,7 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
                 bx[rows_b + q] = x + (size_t)(i / K) * H;
                 bw[rows_b + q] = w ? w[i] : 1.0f;
                 bidx[rows_b + q] = i;
-                cur->yout[rows_b + q] = T.sy + (size_t)i * H;
+                cur->yout[rows_b + q] = SY + (size_t)i * H;
             }
             rows_b += take; cur->n = rows_b;
             if (sl >= 0) {
@@ -1072,6 +1081,7 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     T.big_taken = total;
     if (!total && !T.inflight) {   /* nothing went (or everything failed before a submit) */
         T.big = 0;
+        if (T.sy_step) { coli_vk_xb_step_end(); T.sy_step = NULL; }
         if (T.big_fail) {
             fprintf(stderr, "[VK] tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
             T.on = 0;
@@ -1094,7 +1104,7 @@ static int join_big(const float **rows) {
         double dms = 0, t1 = vkt_now_ms();
         ok1 = coli_vk_xb_join_dev(1, T.d2_y, &dms);
         T.wait_ms += vkt_now_ms() - t1; T.dev_ms += dms; T.d2_ms += dms;
-        if (ok1) for (int q = 0; q < T.nd2; q++) memcpy(T.sy + (size_t)T.d2_idx[q] * T.c.hidden, T.d2_y[q], (size_t)T.c.hidden * sizeof(float));
+        if (ok1) for (int q = 0; q < T.nd2; q++) memcpy((T.sy_step ? T.sy_step : T.sy) + (size_t)T.d2_idx[q] * T.c.hidden, T.d2_y[q], (size_t)T.c.hidden * sizeof(float));
         T.d2_inflight = 0;
     }
     int cpu_pairs = T.big_n - T.big_taken;
@@ -1104,7 +1114,8 @@ static int join_big(const float **rows) {
     }
     T.inflight = 0; T.big = 0;
     int ok = !T.big_fail;
-    for (int i = 0; i < T.big_n; i++) rows[i] = ok && ok1 && T.map[i] >= 0 ? T.sy + (size_t)i * T.c.hidden : NULL;
+    const float *SY = T.sy_step ? T.sy_step : T.sy;
+    for (int i = 0; i < T.big_n; i++) rows[i] = ok && ok1 && T.map[i] >= 0 ? SY + (size_t)i * T.c.hidden : NULL;
     for (int i = 0; T.st && i < T.st_n; i++) if (T.st[i].state == SS_BUSY) { T.st[i].state = SS_FREE; T.st[i].pending = 0; }
     if (!ok) {
         fprintf(stderr, "[VK] tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
@@ -1314,7 +1325,11 @@ int vkt_issue_w(int layer, const float *x, int S, int K, const int *idx, const f
 
 int vkt_join(const float **rows) {
     if (!T.inflight) return 0;
-    if (T.big) return join_big(rows);
+    if (T.big) {
+        int ok = join_big(rows);
+        if (T.sy_step) coli_vk_xb_step_end();   /* rows stay readable until the next step */
+        return ok;
+    }
     double t0 = vkt_now_ms(), dms = 0, dms1 = 0, tc = t0 - T.t_issued;
     T.cpu_ms += tc;
     int ok = !T.d0_inflight || coli_vk_xb_join(T.by, &dms);
@@ -1347,6 +1362,30 @@ int vkt_join(const float **rows) {
     }
     quiesce();
     return 1;
+}
+
+/* vkt_join, and for a big step that ran wholly on the device (every routed assignment
+ * taken) on the backend's whole-step buffers, the routed sum per row on the device:
+ * *sum = S rows of sum over k in rank order of w[s*K+k] * expert(s, k), as an fma chain
+ * from 0 (the engines' own loop); else *sum = NULL and rows as vkt_join gives them. */
+int vkt_join_sum(const float **rows, const float *w, const float **sum) {
+    *sum = NULL;
+    if (!T.inflight) return 0;
+    if (!T.big || !T.sy_step) return vkt_join(rows);
+    int ok = join_big(rows);
+    if (ok && T.big_taken == T.big_valid && T.big_valid > 0) {
+        uint8_t *use = malloc((size_t)T.big_n);
+        if (use) {
+            for (int i = 0; i < T.big_n; i++) use[i] = T.map[i] >= 0;
+            double dms = 0, t0 = vkt_now_ms();
+            *sum = coli_vk_xb_step_sum(w, use, &dms);
+            T.wait_ms += vkt_now_ms() - t0; T.dev_ms += dms;
+            if (*sum) T.st_sums++;
+            free(use);
+        }
+    }
+    coli_vk_xb_step_end();
+    return ok;
 }
 
 void vkt_begin_forward(void) { if (T.on) T.begin = 1; }
@@ -1671,6 +1710,7 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
                 T.st_steps, T.st_experts, human((double)T.st_bytes, hs, sizeof hs),
                 T.st_up_ms > 0 ? (double)T.st_bytes / T.st_up_ms / 1e6 : 0.0, T.st_rows, T.st_subs, T.pf_n, T.pf_used,
                 T.st_kept, T.st_kept_rows);
+        if (T.st_sums) fprintf(stderr, ", %llu steps summed on the device", T.st_sums);
     }
     if (T.d2 || T.d2_lost) {
         ColiVkPoolStats p2; coli_vk_pool_stats(3, &p2);

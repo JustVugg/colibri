@@ -134,13 +134,17 @@ dho_family_glm() {
   dho_mla_lost colibri "dense-only colibri device lost in the prompt" 3 SNAP=glm_tiny REF=ref_glm.json TF=1 -- 64 16 16
   dho_mla_lost colibri "dense-only colibri device lost with MTP" 12 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json -- 64 16 16
   COLI_VK_STAGED=1 dho_mla_lost colibri "dense-only colibri device lost, staged" 12 SNAP=glm_tiny REF=ref_glm.json -- 64 16 16
-  # serve sessions: pins, the prompt cache, the prefill read-out, drafts, two KV slots (the
-  # ragged batch declines the chain: per matrix on the device, kv_b on the host)
+  # serve sessions: pins, the prompt cache, the prefill read-out, drafts, two KV slots,
+  # several conversations at once
   export COLI_VK_DENSE_HOST=0 CHAIN_SERVE_EXPECT='dense matrices on the device only'
   CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0
   CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 DRAFT=3
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2
   COLI_VK_CHAIN=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4
+  CHAIN_MUX_EXPECT="$CHAIN_SERVE_EXPECT" $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_serve 3 SERVE_BATCH=1 IDOT=0 DSA_TOPK=4
+  # the steps the chain does not take (MUX=0): per matrix on the device, kv_b on the host
+  CHAIN_MUX_EXPECT="$CHAIN_SERVE_EXPECT" CHAIN_MUX_STEPS=0 $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_serve 3 SERVE_BATCH=1 IDOT=0 COLI_VK_CHAIN_MUX=0
+  rm -f chain-mux.usage
   unset COLI_VK_DENSE_HOST CHAIN_SERVE_EXPECT
   # the RAM the experts' cache gets back: RAM_GB just above the fixture's fixed reserve, the
   # cap cap_for_ram leaves with the host copies against the one it leaves without them

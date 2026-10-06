@@ -17,7 +17,7 @@ from pathlib import Path
 
 import openai_server
 from family_registry import family_by_id, family_ids
-from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
+from openai_server import (APIError, engine_exit_status, APIHandler, APIServer, ClientCancelled,
                            CONTINUATION_FAMILIES, _marker_cuts,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            LOGPROBS_TOP_K_CAP, logprobs_options,
@@ -2229,9 +2229,30 @@ class DispatcherTest(unittest.TestCase):
             engine = Engine("glm", "model")
         with self.assertRaisesRegex(RuntimeError, "DATA size"):
             engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
-        with self.assertRaisesRegex(RuntimeError, "dispatcher stopped"):
+        # the cause comes with every later failure, not only "dispatcher stopped" (#1941)
+        with self.assertRaisesRegex(RuntimeError, "dispatcher stopped: .*DATA size"):
             engine.generate("again", 4, 0.7, 0.9, lambda _: None)
         engine.close()
+
+    def test_an_engine_that_dies_names_its_exit_status(self):
+        def respond(process, frame):
+            process.returncode = -9          # the out-of-memory killer, as #1941 may have met
+            process.stdout.close()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "exited unexpectedly .*signal 9, SIGKILL"):
+            engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        with self.assertRaisesRegex(RuntimeError, "dispatcher stopped: .*signal 9"):
+            engine.generate("again", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
+
+    def test_engine_exit_status_words(self):
+        self.assertEqual(engine_exit_status(1), "exit status 1")
+        self.assertIn("SIGKILL", engine_exit_status(-9))
+        self.assertEqual(engine_exit_status(0xC0000005), "exit status 0xC0000005, access violation")
+        self.assertEqual(engine_exit_status(0xC0000017), "exit status 0xC0000017, out of memory")
 
     def test_decodes_utf8_split_across_data_frames(self):
         def respond(process, frame):

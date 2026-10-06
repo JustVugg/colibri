@@ -47,8 +47,15 @@
  * The layers already done in the lost forward count their experts' routing twice in
  * the usage statistics.
  *
- * The chain declines (the CPU path runs, the watermark follows) for a ragged
- * multi-slot decode batch, a layer range (segments), a quantized KV cache (KV8, KV_TQ),
+ * KV_SLOTS' batched decode (several conversations, a row each at its own position) runs
+ * on the chain too (glmc_forward_rows): the batch's matrices as one, each row's attention
+ * over its own conversation's mirror (the chain's own, or one of up to COLI_VK_CHAIN_MUX
+ * beside it, whole, each with its watermarks; the one read longest ago gives way) and its
+ * own DSA list. Such a step stays on the CPU with the split on, past the mirrors' count
+ * or the device's room, and with COLI_VK_CHAIN_MUX=0.
+ *
+ * The chain declines (the CPU path runs, the watermark follows) for a layer range
+ * (segments), a quantized KV cache (KV8, KV_TQ),
  * PILOT or LOOKA (they read the residual on the host between layers), the exact verify
  * of COLI_EXACT_VERIFY, the CUDA backend, and a model whose matrices or geometry its
  * shaders do not take (int2, E8/IQ3, fp8 dense matrices; kv_lora above 1024, qk_rope
@@ -69,6 +76,16 @@
  * cover the N layers; the CPU layers' rows are the host's alone. */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
+
+/* A KV mirror of one conversation beside the chain's own, for the rows of a multiplexed
+ * decode step (glmc_forward_rows): the same arrays, its own watermarks. */
+#define GLMC_MUX_MAX 16
+typedef struct {
+    KVState *owner;                            /* the conversation (NULL: free) */
+    int cap;                                   /* positions a layer holds */
+    VkcMlaCache *kv; VkcBuf **ik; int *kv_valid;   /* per layer, indexed as the model's */
+    unsigned long long used;                   /* the step that last read it: the eviction's order */
+} GlmcMirror;
 
 typedef struct {
     int ok, failed;
@@ -92,6 +109,12 @@ typedef struct {
     float *host_routed;
     unsigned long long forwards;
     double host_ms;
+    /* multiplexed decode steps: the other conversations' mirrors, the step's new rows
+     * before their mirrors (latent and rope, index keys), one row's DSA selection */
+    GlmcMirror mux[GLMC_MUX_MAX];
+    VkcMlaCache mtmp; VkcBuf *mik, *msel;
+    unsigned long long mux_steps, mux_fw, mux_rows, mux_up, mux_evict;
+    int mux_noted;
 } GlmChain;
 
 static int g_vk_chain = 0;     /* COLI_VK_CHAIN decided on, and the chain's pipelines are up */
@@ -160,7 +183,14 @@ static int glmc_layer_qts(Model *m, int i, QT **q) {
 
 /* ---- the host's writes to its KV cache: the mirror's watermark follows ------------ */
 /* The CPU's attention writes rows [pos..] of each row's KV state for this layer. */
-/* (each covers both chains; a chain's split indexes its own layers from 0) */
+/* (each covers both chains and their conversations' mirrors; a chain's split indexes its
+ * own layers from 0) */
+static void glmc_mux_lower(GlmChain *ch, KVState *k, int from, int to, int pos) {
+    if (pos < 0) pos = 0;
+    for (int j = 0; j < GLMC_MUX_MAX; j++)
+        if (ch->mux[j].owner == k)
+            for (int i = from; i < to; i++) if (ch->mux[j].kv_valid[i] > pos) ch->mux[j].kv_valid[i] = pos;
+}
 static void glmc_cpu_rows(Model *m, int layer, KVState *const *kvs, const int *positions, int pos_base, int S) {
     for (int d = 0; d < 2; d++) {
         GlmChain *ch = glmc_of(m, d);
@@ -170,6 +200,7 @@ static void glmc_cpu_rows(Model *m, int layer, KVState *const *kvs, const int *p
             int pos = positions ? positions[s] : pos_base + s;
             if (ks == ch->owner && ch->kv_valid[layer] > pos) ch->kv_valid[layer] = pos;
             if (ks == ch->owner) vkc_kv_lower(&ch->ks, layer - ch->lo, pos);
+            glmc_mux_lower(ch, ks, layer, layer + 1, pos);
         }
     }
 }
@@ -177,7 +208,9 @@ static void glmc_cpu_rows(Model *m, int layer, KVState *const *kvs, const int *p
 static void glmc_host_rows(Model *m, KVState *k, int from) {
     for (int d = 0; d < 2; d++) {
         GlmChain *ch = glmc_of(m, d);
-        if (!ch || !ch->kv_valid || k != ch->owner) continue;
+        if (!ch || !ch->kv_valid) continue;
+        glmc_mux_lower(ch, k, ch->lo, ch->lo + ch->n, from);
+        if (k != ch->owner) continue;
         for (int i = ch->lo; i < ch->lo + ch->n; i++) {
             if (ch->kv_valid[i] > from) ch->kv_valid[i] = from < 0 ? 0 : from;
             vkc_kv_lower(&ch->ks, i - ch->lo, from < 0 ? 0 : from);
@@ -192,6 +225,7 @@ static void glmc_kv_reset(Model *m) {
         for (int i = ch->lo; i < ch->lo + ch->n; i++) ch->kv_valid[i] = 0;
         vkc_kv_reset(&ch->ks);
         ch->owner = NULL;
+        glmc_mux_lower(ch, m->kv, ch->lo, ch->lo + ch->n, 0);
     }
 }
 
@@ -692,6 +726,9 @@ static int glmc_forward(Model *m, float *xh, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden, L = c->n_layers, TK = c->index_topk;
     if (!m->Lc || !m->Rc || (m->has_dsa && !m->Ic)) return 0;
     for (int i = 0; i < L; i++) if (m->kv_start[i] != 0 || !m->Lc[i]) return 0;
+    /* the rows this step writes: a mirror of the bound state beside a chain's own (a
+     * multiplexed step's) holds them no longer */
+    for (int d = 0; d < 2; d++) { GlmChain *x = glmc_of(m, d); if (x) glmc_mux_lower(x, m->kv, x->lo, x->lo + x->n, pos_base); }
     /* the chunk: the smaller of the two chains' (the selection crosses chunk by chunk) */
     int mirror_ok = glmc_mirror(ch, m, pos_base + S, 1);
     int CH = mirror_ok ? glmc_chunk_rows(ch, m) : 1;
@@ -743,6 +780,297 @@ static int glmc_forward(Model *m, float *xh, int S, int pos_base) {
     return n + n2;
 }
 
+/* ---- a multiplexed decode step: one row from each of several conversations -------- */
+/* KV_SLOTS' batched decode (step_decode_batch): row s is the next token of conversation
+ * kvs[s] at its own position pos[s]. Everything but the attention core is the batch's,
+ * as in glmc_forward_seg; the new KV rows go to each conversation's mirror and the core
+ * runs one row at a time over it (vkc_mla_attn_rows). A conversation's mirror is the
+ * chain's own when the chain holds it, else one of up to COLI_VK_CHAIN_MUX (default 16,
+ * 0: these steps on the CPU) beside it, whole (never split), each with its watermarks;
+ * past that count, or the device's room, the one read longest ago gives way. The DSA
+ * selection is per row too (each over its own conversation's index keys). */
+static int g_glmc_mux = -1;
+static int glmc_mux_n(void) {
+    if (g_glmc_mux < 0) {
+        const char *e = getenv("COLI_VK_CHAIN_MUX");
+        int v = e && *e ? atoi(e) : GLMC_MUX_MAX;
+        g_glmc_mux = v < 0 ? 0 : v > GLMC_MUX_MAX ? GLMC_MUX_MAX : v;
+    }
+    return g_glmc_mux;
+}
+static size_t glmc_mux_bytes(GlmChain *ch, Model *m, int cap) {
+    Cfg *c = &m->c; size_t b = 0;
+    for (int i = ch->lo; i < ch->lo + ch->n && cap > 0; i++)
+        b += vkc_fit_buf((size_t)cap * c->kv_lora * sizeof(float)) + (c->qk_rope ? vkc_fit_buf((size_t)cap * c->qk_rope * sizeof(float)) : 0) +
+             (glmc_full(m, i) ? vkc_fit_buf((size_t)cap * c->index_hd * sizeof(float)) : 0);
+    return b;
+}
+static void glmc_mux_free(GlmChain *ch, GlmcMirror *v) {
+    for (int i = ch->lo; i < ch->lo + ch->n && v->kv; i++) {
+        vkc_free(v->kv[i].lat); vkc_free(v->kv[i].rope); vkc_free(v->ik[i]);
+        v->kv[i] = (VkcMlaCache){NULL, NULL, 0}; v->ik[i] = NULL; v->kv_valid[i] = 0;
+    }
+    v->owner = NULL; v->cap = 0;
+}
+/* Conversation k's mirror beside the chain's own, with room for `need` positions: the
+ * one that holds it, else a free one, else the one read longest ago (not by this step).
+ * NULL: none to take, or no room on the device. */
+static GlmcMirror *glmc_mux_get(GlmChain *ch, Model *m, KVState *k, int need) {
+    Cfg *c = &m->c; int L = c->n_layers, n = glmc_mux_n();
+    GlmcMirror *v = NULL, *fr = NULL, *old = NULL;
+    for (int j = 0; j < n && !v; j++) {
+        GlmcMirror *x = &ch->mux[j];
+        if (x->owner == k) v = x;
+        else if (!x->owner) { if (!fr) fr = x; }
+        else if (x->used != ch->mux_steps && (!old || x->used < old->used)) old = x;
+    }
+    if (!v) {
+        if (!(v = fr ? fr : old)) return NULL;
+        if (v->owner) ch->mux_evict++;   /* its buffers stay, for the conversation that takes it */
+        if (!v->kv) {
+            v->kv = calloc(L, sizeof *v->kv); v->ik = calloc(L, sizeof *v->ik); v->kv_valid = calloc(L, sizeof *v->kv_valid);
+            if (!v->kv || !v->ik || !v->kv_valid) {
+                free(v->kv); free(v->ik); free(v->kv_valid); v->kv = NULL; v->ik = NULL; v->kv_valid = NULL;
+                return NULL;
+            }
+        }
+        v->owner = k;
+        for (int i = ch->lo; i < ch->lo + ch->n; i++) v->kv_valid[i] = 0;
+    }
+    v->used = ch->mux_steps;
+    if (v->cap >= need) return v;
+    int cap = 256; while (cap < need) cap *= 2;
+    if (cap > k->max_t) cap = k->max_t;
+    size_t room = (vkc_dev_avail() + glmc_mux_bytes(ch, m, v->cap)) / 10 * 8;   /* a fifth for the rest, as the split */
+    glmc_mux_free(ch, v);
+    if (cap < need || glmc_mux_bytes(ch, m, cap) > room) return NULL;
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) {
+        v->kv[i].lat = vkc_buf((size_t)cap * c->kv_lora * sizeof(float), VKC_DEV);
+        v->kv[i].rope = c->qk_rope > 0 ? vkc_buf((size_t)cap * c->qk_rope * sizeof(float), VKC_DEV) : NULL;
+        v->kv[i].cap = cap;
+        if (glmc_full(m, i)) v->ik[i] = vkc_buf((size_t)cap * c->index_hd * sizeof(float), VKC_DEV);
+        if (!v->kv[i].lat || (c->qk_rope > 0 && !v->kv[i].rope) || (glmc_full(m, i) && !v->ik[i])) { glmc_mux_free(ch, v); return NULL; }
+    }
+    v->owner = k; v->cap = cap;
+    return v;
+}
+/* Record the uploads that make mirror v conversation k's below position p. */
+static int glmc_mux_push(GlmChain *ch, Model *m, GlmcMirror *v, KVState *k, int p) {
+    Cfg *c = &m->c; int ok = 1, K = c->kv_lora, R = c->qk_rope, ID = c->index_hd;
+    for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
+        int t0 = v->kv_valid[i], n = p - t0;
+        if (n > 0) {
+            ok = vkc_write(v->kv[i].lat, (size_t)t0 * K, coli_kv_row(k->Lc[i], t0, K), (size_t)n * K * sizeof(float)) &&
+                 (R == 0 || vkc_write(v->kv[i].rope, (size_t)t0 * R, coli_kv_row(k->Rc[i], t0, R), (size_t)n * R * sizeof(float))) &&
+                 (!glmc_full(m, i) || vkc_write(v->ik[i], (size_t)t0 * ID, coli_kv_row(k->Ic[i], t0, ID), (size_t)n * ID * sizeof(float)));
+            ch->mux_up += (unsigned long long)n;
+        }
+        v->kv_valid[i] = p;
+    }
+    return ok;
+}
+/* The new rows of layers [from, to) into each row's conversation (after their frame's wait). */
+static void glmc_mux_pull(GlmChain *ch, Model *m, int from, int to, int S, KVState *const *kvs, const int *pos) {
+    Cfg *c = &m->c; int K = c->kv_lora, R = c->qk_rope, ID = c->index_hd;
+    for (int i = from; i < to; i++) {
+        const float *kv = (const float *)vkc_ptr(ch->kvd) + (size_t)(i - ch->lo) * ch->kvd_layer;
+        for (int s = 0; s < S; s++) {
+            memcpy(coli_kv_row(kvs[s]->Lc[i], pos[s], K), kv + (size_t)s * K, K * sizeof(float));
+            if (R) memcpy(coli_kv_row(kvs[s]->Rc[i], pos[s], R), kv + (size_t)S * K + (size_t)s * R, R * sizeof(float));
+            if (glmc_full(m, i))
+                memcpy(coli_kv_row(kvs[s]->Ic[i], pos[s], ID), kv + (size_t)S * (K + R) + (size_t)s * ID, ID * sizeof(float));
+        }
+    }
+}
+/* glmc_dsa for the rows of a multiplexed step: each row's index key into its mirror (and
+ * the host's copy), each row's selection over its own conversation's keys into sel's row
+ * (the select writes -1, every position, while a row's context is within index_topk) */
+static int glmc_mux_dsa(GlmChain *ch, Model *m, int i, int S, const int *pos, GlmcMirror *const *mir, int ctx) {
+    Cfg *c = &m->c; int IH = c->index_nh, ID = c->index_hd, R = c->qk_rope, SR = 1 + c->index_topk;
+    size_t kof = (size_t)(i - ch->lo) * ch->kvd_layer + (size_t)S * (c->kv_lora + R);
+    VkcMlaRow ln = {S, 1, 0, ID, 0, 0, ID, 0, 0, ID, 0, 0, 0, (int)ch->o_ixw[i], (int)ch->o_ixb[i], 1, 1e-6f};
+    VkcMlaRow rk = {S, 1, R, ID, VKC_ROPE_INTERLEAVED, 0, ID, 0, 0, ID, 0, 0, R, 0, 0, 0, 0.f};
+    VkcMlaRow rq = {S * IH, IH, R, ID, VKC_ROPE_INTERLEAVED, 0, IH * ID, ID, 0, IH * ID, ID, 0, R, 0, 0, 0, 0.f};
+    int ok = vkc_matmul(glmc_tensor(&m->ix_wk[i]), ch->nrm, 0, ch->ikd, 0, S) &&
+             vkc_mla_lnorm(ch->ikd, ch->prm, ch->mik, &ln) &&
+             (R == 0 || vkc_mla_rope(ch->mik, ch->cs, ch->mik, &rk)) &&
+             vkc_copy(ch->kvd, kof, ch->mik, 0, (size_t)S * ID);
+    for (int s = 0; ok && s < S; s++) ok = vkc_copy(mir[s]->ik[i], (size_t)pos[s] * ID, ch->mik, (size_t)s * ID, ID);
+    ok = ok && vkc_matmul(glmc_tensor(&m->ix_wq[i]), ch->sc.qa, 0, ch->iq, 0, S) &&
+         (R == 0 || vkc_mla_rope(ch->iq, ch->cs, ch->iq, &rq)) &&
+         vkc_matmul(glmc_tensor(&m->ix_wp[i]), ch->nrm, 0, ch->ihw, 0, S);
+    for (int s = 0; ok && s < S; s++) {
+        VkcDsa ds = {1, pos[s], IH, ID, c->index_topk, g_dsa_force, s * IH * ID, IH * ID, s * IH, IH, 0, ID, ctx, SR,
+                     1.f / sqrtf((float)ID), 1.f / sqrtf((float)IH)};
+        ok = vkc_dsa_select(ch->iq, ch->ihw, mir[s]->ik[i], ch->isc, ch->msel, &ds) &&
+             vkc_copy(ch->sel, (size_t)s * SR, ch->msel, 0, SR);
+    }
+    return ok;
+}
+/* One chain's layers for the S rows of a multiplexed step (one chunk), the rows after the
+ * last of them back into xh. sel_in/on_in, sel_out/on_out: glmc_forward_seg's crossing
+ * selection. 0 = not taken (*lost = 1: a frame failed, the chains off). */
+static int glmc_mux_seg(Model *m, GlmChain *ch, float *xh, int S, KVState *const *kvs, const int *pos,
+                        const int *sel_in, int on_in, int *sel_out, int *on_out, int *lost) {
+    *lost = 0;
+    Cfg *c = &m->c; int D = c->hidden, L = c->n_layers, K = c->kv_lora, R = c->qk_rope, ID = c->index_hd;
+    int TK = c->index_topk, SR = 1 + TK, N = ch->n, lo = ch->lo, hi = lo + N, ctx = 0;
+    for (int s = 0; s < S; s++) if (pos[s] + 1 > ctx) ctx = pos[s] + 1;
+    int hand_sel = hi < L && m->has_dsa && !glmc_full(m, hi);
+    if (hand_sel && (int64_t)S * TK > m->dsa_scap) {
+        int *sl = malloc((size_t)S * TK * sizeof(int)), *ns = malloc((size_t)S * sizeof(int));
+        if (!sl || !ns) { free(sl); free(ns); return 0; }
+        free(m->dsa_sel); free(m->dsa_nsel);
+        m->dsa_sel = sl; m->dsa_nsel = ns; m->dsa_scap = (int)((int64_t)S * TK);
+    }
+    /* each row's mirror: the chain's own when it holds that conversation, else one beside it */
+    GlmcMirror own = {ch->owner, ch->cap, ch->kv, ch->ik, ch->kv_valid, 0};
+    GlmcMirror **mir = malloc((size_t)S * sizeof *mir);
+    VkcMlaCache **cl = malloc((size_t)S * sizeof *cl);
+    float *inv = R ? malloc((size_t)(R / 2) * sizeof(float)) : NULL;
+    if (!mir || !cl || (R && !inv)) { free(mir); free(cl); free(inv); return 0; }
+    ch->mux_steps++;
+    int ok = 1;
+    for (int s = 0; s < S && ok; s++)
+        ok = (mir[s] = kvs[s] == ch->owner && ch->cap >= pos[s] + 1 ? &own : glmc_mux_get(ch, m, kvs[s], pos[s] + 1)) != NULL;
+    ok = ok && glmc_scratch(ch, m, S, ctx) && glmc_res(&ch->mtmp.lat, (size_t)S * K, VKC_DEV) &&
+         (R == 0 || glmc_res(&ch->mtmp.rope, (size_t)S * R, VKC_DEV)) &&
+         (!m->has_dsa || (glmc_res(&ch->mik, (size_t)S * ID, VKC_DEV) && glmc_res(&ch->msel, SR, VKC_DEV)));
+    if (!ok) {
+        if (!ch->mux_noted++)
+            fprintf(stderr, "[VK] %s chain: no device room for the KV of %d conversations at once; such steps run on the CPU\n",
+                    glmc_name(ch), S);
+        free(mir); free(cl); free(inv);
+        return 0;
+    }
+    ch->mtmp.cap = S;
+    vkc_gemm_rows(-1);
+    for (int j = 0; j < R / 2; j++) inv[j] = powf(c->theta, -2.0f * j / R);   /* rope_interleave's frequencies */
+    for (int s = 0; s < S && R; s++)    /* the CPU's own angles, cosines and sines, at each row's position */
+        for (int j = 0; j < R / 2; j++) {
+            float ang = pos[s] * inv[j];
+            float *cs = (float *)vkc_ptr(ch->cs) + (size_t)s * R + 2 * j;
+            cs[0] = cosf(ang); cs[1] = sinf(ang);
+        }
+    /* a turn that went back: every mirror of these conversations below the rows' positions */
+    for (int i = lo; i < hi; i++) glmc_cpu_rows(m, i, kvs, pos, 0, S);
+    if (!vkc_begin() || !vkc_write(ch->x, 0, xh, (size_t)S * D * sizeof(float))) goto lost;
+    for (int s = 0; s < S; s++) if (!glmc_mux_push(ch, m, mir[s], kvs[s], pos[s])) goto lost;
+    int pending = 0, pulled = lo, sel_on = 0;
+    if (sel_in && on_in) {   /* the primary's selection, for the layers here that reuse it */
+        ok = vkc_write(ch->sel, 0, sel_in, (size_t)S * SR * sizeof(int));
+        sel_on = 1;
+    }
+    for (int i = lo; i < hi && ok; i++) {
+        Layer *l = &m->L[i];
+        if (g_spec && g_prefetch && l->sparse && m->enr[i] > 0)      /* the CPU path's I/O hint */
+            for (int z = 0; z < m->enr[i]; z++) if (!(S <= 4 && vk_reg_served(i, m->eroute[i][z]))) expert_prefetch(m, i, m->eroute[i][z]);
+        if (pending) { ok = glmc_combine(ch, m, S); pending = 0; }
+        size_t ko = (size_t)(i - lo) * ch->kvd_layer;
+        ok = ok && glmc_norm(ch->x, ch->prm, ch->o_in[i], ch->nrm, S, D, c->eps) &&
+             vkc_mla_qkv(&ch->mla[i], &ch->sc, ch->nrm, 0, S, 0, ch->cs, &ch->mtmp, ch->kvd, ko);
+        for (int s = 0; ok && s < S; s++) {   /* the new rows into their conversations' mirrors */
+            cl[s] = &mir[s]->kv[i];
+            ok = vkc_copy(cl[s]->lat, (size_t)pos[s] * K, ch->mtmp.lat, (size_t)s * K, K) &&
+                 (R == 0 || vkc_copy(cl[s]->rope, (size_t)pos[s] * R, ch->mtmp.rope, (size_t)s * R, R));
+        }
+        if (ok && glmc_full(m, i)) { ok = glmc_mux_dsa(ch, m, i, S, pos, mir, ctx); sel_on = 1; }
+        ok = ok && vkc_mla_attn_rows(&ch->mla[i], &ch->sc, S, pos, cl, sel_on ? ch->sel : NULL, 0, SR, ch->tmp, 0);
+        VkcEw add = {VKC_EW_ADD, S * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+        ok = ok && vkc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add) &&
+             glmc_norm(ch->x, ch->prm, ch->o_post[i], ch->h2, S, D, c->eps);
+        if (!ok) break;
+        if (!l->sparse) {                                  /* a dense layer: its MLP here, no host step */
+            ok = glmc_mlp(ch, &l->gate_proj, &l->up_proj, &l->down_proj, ch->h2, ch->tmp, S) &&
+                 vkc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
+            continue;
+        }
+        ok = vkc_copy(ch->h2d, 0, ch->h2, 0, (size_t)S * D) && vkc_submit(0) && vkc_finish();   /* A1 */
+        if (!ok) break;
+        glmc_mux_pull(ch, m, pulled, i + 1, S, kvs, pos); pulled = i + 1;
+        /* A2: the shared expert, while the host computes the routed experts */
+        ok = vkc_begin() && glmc_mlp(ch, &l->sh_gate, &l->sh_up, &l->sh_down, ch->h2, ch->ds, S) && vkc_submit(0);
+        double t1 = now_s();
+        moe(m, l, i, (float *)vkc_ptr(ch->h2d), S, ch->host_routed, 0);
+        memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)S * D * sizeof(float));
+        ch->host_ms += (now_s() - t1) * 1e3;
+        ok = ok && vkc_begin();
+        pending = 1;
+    }
+    int keep_sel = hand_sel || sel_out;
+    if (ok && pending) ok = glmc_combine(ch, m, S);
+    ok = ok && vkc_copy(ch->xd, 0, ch->x, 0, (size_t)S * D) &&
+         (!keep_sel || !sel_on || vkc_copy(ch->seld, 0, ch->sel, 0, (size_t)S * SR)) && vkc_submit(1);
+    if (!ok) goto lost;
+    glmc_mux_pull(ch, m, pulled, hi, S, kvs, pos);
+    memcpy(xh, vkc_ptr(ch->xd), (size_t)S * D * sizeof(float));
+    if (sel_out) {   /* the raw rows, for the second device's chain */
+        *on_out = sel_on;
+        if (sel_on) memcpy(sel_out, vkc_ptr(ch->seld), (size_t)S * SR * sizeof(int));
+    }
+    for (int s = 0; hand_sel && s < S; s++) {   /* in the CPU's form: a count (0 = every position), the positions */
+        const int *sr = (const int *)vkc_ptr(ch->seld) + (size_t)s * SR;
+        int k = sel_on && sr[0] > 0 ? (sr[0] < TK ? sr[0] : TK) : 0;
+        if (k) memcpy(m->dsa_sel + (size_t)s * TK, sr + 1, (size_t)k * sizeof(int));
+        m->dsa_nsel[s] = k;
+    }
+    for (int s = 0; s < S; s++) for (int i = lo; i < hi; i++) mir[s]->kv_valid[i] = pos[s] + 1;
+    free(mir); free(cl); free(inv);
+    ch->forwards++; ch->mux_fw++; ch->mux_rows += (unsigned long long)S;
+    return N;
+lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
+    free(mir); free(cl); free(inv);
+    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
+    g_vk_chain = 0; ch->failed = 1;
+    { GlmChain *o = glmc_of(m, !ch->d); if (o) o->failed = 1; }
+    fprintf(stderr, "[VK] %s chain: the device was lost in a multiplexed step; the CPU runs it again and from here on "
+                    "(the KV caches are the host's: there is no state to rebuild)\n", glmc_name(ch));
+    *lost = 1;
+    return 0;
+}
+/* The devices' layers for a multiplexed decode step (glmc_forward's contract: how many
+ * layers ran, 0 = not taken). A single row of the bound state is the chain's own step
+ * (glmc_forward), unless a mirror beside the chain's holds that conversation and the
+ * chain's own does not. */
+static int glmc_forward_rows(Model *m, float *xh, int S, KVState *const *kvs, const int *pos) {
+    if (!g_vk_chain || g_vk_chain == COLI_VK_CHAIN_PREFILL || !glmc_mux_n() || S < 1) return 0;
+    if (g_pilot || g_pilot_real || g_looka || g_kv8 || g_tq || (exact_verify_on() && g_spec_live)) return 0;
+    GlmChain *ch = (GlmChain *)m->vkchain, *ch2 = (GlmChain *)m->vkchain2;
+    if (!ch || !ch->ok || ch->failed || vkc_lost() || ch->ks.on) return 0;
+    if (ch2 && (!ch2->ok || ch2->failed || ch2->lo != ch->lo + ch->n || ch2->ks.on)) ch2 = NULL;
+    if (S == 1 && kvs[0] == m->kv) {
+        int held = 0;
+        for (int j = 0; j < GLMC_MUX_MAX; j++) held |= ch->mux[j].owner == kvs[0];
+        if (!held || ch->owner == kvs[0]) return 0;
+    }
+    Cfg *c = &m->c; int D = c->hidden, L = c->n_layers, TK = c->index_topk, ctx = 0;
+    for (int s = 0; s < S; s++) {
+        KVState *k = kvs[s];
+        if (!k || !k->Lc || !k->Rc || (m->has_dsa && !k->Ic) || pos[s] < 0 || pos[s] >= k->max_t) return 0;
+        for (int i = 0; i < L; i++)
+            if (k->kv_start[i] != 0 || !k->Lc[i] || (c->qk_rope && !k->Rc[i]) || (glmc_full(m, i) && !k->Ic[i])) return 0;
+        if (pos[s] + 1 > ctx) ctx = pos[s] + 1;
+    }
+    /* one chunk: the chains' rows, and the DSA scores' scratch (rows x context) */
+    int CH = glmc_chunk_rows(ch, m);
+    if (ch2) { vkc_device(1); int CH2 = glmc_chunk_rows(ch2, m); vkc_device(0); if (CH2 < CH) CH = CH2; }
+    if (S > CH || (m->has_dsa && (int64_t)S * ctx > ((int64_t)32 << 20))) return 0;
+    int cross = ch2 && m->has_dsa && !glmc_full(m, ch2->lo), on = 0, lost = 0;
+    int *sel = cross ? malloc((size_t)S * (1 + TK) * sizeof(int)) : NULL;
+    float *keep = ch2 ? malloc((size_t)S * D * sizeof(float)) : NULL;   /* the rows as they came in */
+    if ((cross && !sel) || (ch2 && !keep)) { free(sel); free(keep); ch2 = NULL; sel = NULL; keep = NULL; }
+    if (keep) memcpy(keep, xh, (size_t)S * D * sizeof(float));
+    int n = glmc_mux_seg(m, ch, xh, S, kvs, pos, NULL, 0, sel, &on, &lost);
+    if (!n || !ch2) { free(sel); free(keep); return n; }
+    vkc_device(1);
+    int n2 = glmc_mux_seg(m, ch2, xh, S, kvs, pos, sel, on, NULL, NULL, &lost);
+    vkc_device(0);
+    free(sel);
+    if (lost) { memcpy(xh, keep, (size_t)S * D * sizeof(float)); free(keep); return 0; }
+    free(keep);
+    return n + n2;   /* n2 0, declined: the CPU runs those layers (their mirrors follow, glmc_cpu_rows) */
+}
+
 static void glmc_report(Model *m) {
     for (int d = 0; d < 2 && m; d++) {
         GlmChain *ch = glmc_of(m, d);
@@ -753,6 +1081,13 @@ static void glmc_report(Model *m) {
                         "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
                 glmc_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
                 st.dev_bytes / 1048576.0);
+        if (ch->mux_fw) {
+            int held = 0;
+            for (int j = 0; j < GLMC_MUX_MAX; j++) held += ch->mux[j].owner != NULL;
+            fprintf(stderr, "[VK] %s chain: %llu multiplexed steps (%llu rows), %d conversation mirrors beside its own, "
+                            "%llu rows uploaded to them, %llu evicted\n",
+                    glmc_name(ch), ch->mux_fw, ch->mux_rows, held, ch->mux_up, ch->mux_evict);
+        }
         vkc_kv_report(&ch->ks);
         vkc_prof_print();
         vkc_device(was);
