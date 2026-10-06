@@ -96,6 +96,7 @@ typedef struct {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout pl;
     VkShaderModule mod[P_NPIPE], mod_gemm, mod_dnrec;
+    VkShaderModule mod_gemvi; VkPipeline gemvi;   /* chain_gemv_idot.comp: int4 as W4A8 (COLI_VK_CHAIN_IDOT=1) */
     VkShaderModule mod_gv2; VkPipeline gv2;   /* chain_gemv2.comp: int8 decode GEMVs (COLI_VK_CHAIN_GEMV2) */
     VkPipeline pipe[P_NPIPE];
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
@@ -363,6 +364,14 @@ int vkc_init(void) {
             VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
             VkSpecializationInfo si = {3, me, 12, v};
             if ((KC.gemv4 = make_pipe(KC.mod_gemv4, &si))) KC.gemv4_xs = xs;
+            /* COLI_VK_CHAIN_IDOT=1: the int4 rows as W4A8 (chain_gemv_idot.comp), one pipeline
+             * for every row count up to eight (a verify's), as chain_gemv's above */
+            const char *ie = getenv("COLI_VK_CHAIN_IDOT");
+            if (ie && *ie == '1' && g_kd == 0 && coli_vk_has_idot() && (KC.mod_gemvi = load_module(KC.core.spv_path, "chain_gemv_idot.spv"))) {
+                int32_t vi[3] = {1024, 8, v[2]};
+                VkSpecializationInfo sii = {3, me, 12, vi};
+                if ((KC.gemvi = make_pipe(KC.mod_gemvi, &sii))) fprintf(stderr, "[VK] chain: int4 decode GEMVs as W4A8 (packed int8 dot products)\n");
+            }
         }
     }
     /* the int8/int4 decode GEMV with lanes per row and rows per workgroup chosen per
@@ -833,7 +842,12 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
         struct { int fmt, S, I, O, rowWords, gs, lpr, nr; } pc8 = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, lpr, nr};
         int rows_wg = 256 / lpr;   /* at least, at subgroups of 64 */
         int wg = (ti->O + rows_wg - 1) / rows_wg; if (wg > 1024) wg = 1024;
-        ok = record(KC.gemv4, bd, 4, &pc8, sizeof pc8, (uint32_t)wg, (uint32_t)((S + nr - 1) / nr), 1);
+        VkPipeline ip = VK_NULL_HANDLE;
+        if (KC.gemvi && ti->fmt == 4 && ti->gs >= 32 && ti->I % 32 == 0) {   /* W4A8: up to eight rows share the loads */
+            int nri = S <= 8 && S * (ti->rowWords / 4) <= 1024 ? S : 1;
+            if (nri * (ti->rowWords / 4) <= 1024) { ip = KC.gemvi; nr = nri; pc8.nr = nr; }
+        }
+        ok = record(ip ? ip : KC.gemv4, bd, 4, &pc8, sizeof pc8, (uint32_t)wg, (uint32_t)((S + nr - 1) / nr), 1);
     }
     else if (path >= 0 && KC.tg && (ti->fmt == 1 || ti->fmt == 2 || (ti->fmt == 4 && ti->gs >= 8 && ti->gs % 8 == 0)) &&
              ti->I % 64 == 0 && ti->O % 128 == 0 && ti->rowWords % 4 == 0) {
@@ -1804,6 +1818,8 @@ void vkc_shutdown(void) {
     if (KC.mod_tg) vkDestroyShaderModule(KC.dev, KC.mod_tg, NULL);
     for (int i = 0; i < KC.ndnrec; i++) vkDestroyPipeline(KC.dev, KC.dnrec[i], NULL);
     if (KC.gemv4) vkDestroyPipeline(KC.dev, KC.gemv4, NULL);
+    if (KC.gemvi) vkDestroyPipeline(KC.dev, KC.gemvi, NULL);
+    if (KC.mod_gemvi) vkDestroyShaderModule(KC.dev, KC.mod_gemvi, NULL);
     if (KC.mod_gemv4) vkDestroyShaderModule(KC.dev, KC.mod_gemv4, NULL);
     if (KC.gv2) vkDestroyPipeline(KC.dev, KC.gv2, NULL);
     for (int i = 0; i < 4; i++) {

@@ -279,6 +279,7 @@ typedef struct {
     unsigned long long cooperative_matmuls; /* all projections, including sub-batches */
 } ColiVkXbStats;
 void coli_vk_xb_stats(ColiVkXbStats *st);
+int coli_vk_has_idot(void);   /* VK_KHR_shader_integer_dot_product enabled */
 /* A big step's whole-step buffers on the primary device (the grouped GEMM): the step's
  * S token rows x[S*D] uploaded once; returns its S*K output rows (s*K + k, host-readable)
  * or NULL when the device cannot (the tier then packs and copies as before). Sub-batches

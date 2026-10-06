@@ -1,0 +1,102 @@
+#version 450
+// chain_gemv.comp's int4 path (fmt 4, groups of gs >= 32) as W4A8 (vk_chain.c,
+// COLI_VK_CHAIN_IDOT): x is quantized per 32-value block (a weight step) to int8 with
+// its own scale, sx = max|x| / 127, and each step is eight packed int8 dot products
+// (dotPacked4x8EXT, v_dot4 on RDNA3) instead of 32 decoded nibbles and 32 float fmas a
+// row. The nibbles n go in as they are (0..15); the -8 is taken off with the block's
+// sum of codes: sum (n - 8) q = sum n q - 8 sum q. Per step a row adds
+// float(dot) * sx * scale[group] in step order; a row's quantization and sums depend on
+// the row alone, so a verify's rows keep a decode step's bits.
+// Staging is step-major: the even and odd columns' codes of step q at [r * nq + q], so
+// the lanes of a row read neighbouring uvec4s. Same bindings, push constants, workgroup
+// geometry and lanes per row as chain_gemv.comp. Host: I % 32 == 0, nr * steps <= XS.
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int XS = 1024;   // staged steps (all rows)
+layout(constant_id = 1) const int NRMAX = 4;
+layout(constant_id = 2) const int UNR = 1;
+
+layout(std430, binding = 0) readonly buffer X4 { vec4 x4[]; };
+layout(std430, binding = 1) readonly buffer W4 { uvec4 w4[]; };
+layout(std430, binding = 2) readonly buffer Sc { float scale[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int fmt, S, I, O, rowWords, gs;
+    int lpr;
+    int nr;
+} p;
+
+shared uvec4 xe[XS], xo[XS];   // codes of the even / odd columns of each word
+shared vec2 xm[XS];            // (sx, 8 * sum of codes)
+
+uint pk(ivec4 v) { return uint(v.x & 255) | (uint(v.y & 255) << 8) | (uint(v.z & 255) << 16) | (uint(v.w & 255) << 24); }
+
+void main() {
+    int nr = p.nr > 0 ? p.nr : 1;
+    int s0 = int(gl_WorkGroupID.y) * nr;
+    int tid = int(gl_LocalInvocationID.x);
+    int nq = p.rowWords / 4, i4 = p.I / 4;
+    for (int t = tid; t < nr * nq; t += 256) {
+        int r = t / nq, q = t % nq;
+        bool have = s0 + r < p.S;
+        vec4 v[8];
+        float am = 0.0;
+        [[unroll]] for (int k = 0; k < 8; k++) {
+            int ix = q * 8 + k;
+            v[k] = have && ix < i4 ? x4[(s0 + r) * i4 + ix] : vec4(0.0);
+            am = max(am, max(max(abs(v[k].x), abs(v[k].y)), max(abs(v[k].z), abs(v[k].w))));
+        }
+        float sx = am / 127.0, inv = am > 0.0 ? 127.0 / am : 0.0;
+        uvec4 e, o; int sum = 0;
+        [[unroll]] for (int w = 0; w < 4; w++) {   // word w: columns 8w .. 8w+7 = v[2w], v[2w+1]
+            ivec4 a = ivec4(round(v[2 * w] * inv)), b = ivec4(round(v[2 * w + 1] * inv));
+            sum += a.x + a.y + a.z + a.w + b.x + b.y + b.z + b.w;
+            e[w] = pk(ivec4(a.x, a.z, b.x, b.z));    // columns 0, 2, 4, 6
+            o[w] = pk(ivec4(a.y, a.w, b.y, b.w));    // columns 1, 3, 5, 7
+        }
+        xe[t] = e; xo[t] = o; xm[t] = vec2(sx, float(8 * sum));
+    }
+    barrier();
+    int sg = int(gl_SubgroupID), sgs = int(gl_SubgroupSize);
+    int lpr = min(p.lpr, sgs), rps = sgs / lpr;
+    int sub = int(gl_SubgroupInvocationID) / lpr, lane = int(gl_SubgroupInvocationID) % lpr;
+    int nsg = 256 / sgs, stride = int(gl_NumWorkGroups.x) * nsg * rps;
+    int ng = (p.I + p.gs - 1) / p.gs;
+    for (int o0 = (int(gl_WorkGroupID.x) * nsg + sg) * rps; o0 < p.O; o0 += stride) {
+        int o = o0 + sub;
+        bool live = o < p.O;
+        int rb = o * nq, nql = live ? nq : 0;
+        float a0[NRMAX];
+        [[unroll]] for (int r = 0; r < NRMAX; r++) a0[r] = 0.0;
+        for (int q0 = lane; q0 < nql; q0 += UNR * lpr) {
+            uvec4 wv[UNR]; float sv[UNR];
+            [[unroll]] for (int u = 0; u < UNR; u++) {
+                int q = q0 + u * lpr; bool h = q < nql;
+                wv[u] = h ? w4[rb + q] : uvec4(0);
+                sv[u] = h ? scale[o * ng + (q * 32) / p.gs] : 0.0;
+            }
+            [[unroll]] for (int u = 0; u < UNR; u++) {
+                int q = q0 + u * lpr;
+                if (q >= nql) break;
+                uvec4 w = wv[u], lo = w & 0x0F0F0F0Fu, hi = (w >> 4) & 0x0F0F0F0Fu;
+                [[unroll]] for (int r = 0; r < NRMAX; r++) if (r < nr) {
+                    int t = r * nq + q;
+                    uvec4 e = xe[t], od = xo[t]; vec2 m = xm[t];
+                    int d = dotPacked4x8EXT(int(lo.x), int(e.x)) + dotPacked4x8EXT(int(hi.x), int(od.x)) +
+                            dotPacked4x8EXT(int(lo.y), int(e.y)) + dotPacked4x8EXT(int(hi.y), int(od.y)) +
+                            dotPacked4x8EXT(int(lo.z), int(e.z)) + dotPacked4x8EXT(int(hi.z), int(od.z)) +
+                            dotPacked4x8EXT(int(lo.w), int(e.w)) + dotPacked4x8EXT(int(hi.w), int(od.w));
+                    a0[r] += (float(d) - m.y) * (m.x * sv[u]);
+                }
+            }
+        }
+        [[unroll]] for (int r = 0; r < NRMAX; r++) {
+            float tot = a0[r];
+            for (int off = lpr / 2; off > 0; off >>= 1) tot += subgroupShuffleXor(tot, uint(off));
+            if (r < nr && lane == 0 && live && s0 + r < p.S) y[(s0 + r) * p.O + o] = tot;
+        }
+    }
+}

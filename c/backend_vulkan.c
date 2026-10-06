@@ -292,6 +292,7 @@ static struct {
     VkCoopTile coop_t[VK_COOP_SLOTS];
     int gemm_min_s, gemm_min_so, has_coop, coop_sg, coop_off;
     int has_bda;           /* bufferDeviceAddress on: the expert batch's grouped GEMM reads weights by address */
+    int has_idot;          /* VK_KHR_shader_integer_dot_product on (the chain's W4A8 GEMV) */
     /* fused dual gate+up+silu pipeline (6 bindings): x, Wg, gscale, Wu, uscale, hidden */
     VkShaderModule shader_gu; VkDescriptorSetLayout dsl_gu; VkPipelineLayout plyt_gu;
     VkPipeline pipe_gu; VkDescriptorPool dpool_gu; VkDescriptorSet dset_gu;
@@ -1024,7 +1025,18 @@ int coli_vk_init(const char *spv_path) {
         cext[nc++] = VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME;
         cmf.pNext = (void *)di.pNext; dc.pNext = &v12f;
         dc.enabledExtensionCount = nc; dc.ppEnabledExtensionNames = cext;
-        if (vkCreateDevice(G.phys, &dc, NULL, &G.dev) != VK_SUCCESS) { G.has_coop = 0; G.has_bda = 0; G.dev = VK_NULL_HANDLE; }
+        /* packed int8 dot products for the chain's W4A8 GEMV (COLI_VK_CHAIN_IDOT), when the
+         * device takes the extension; else the device as before */
+        VkPhysicalDeviceShaderIntegerDotProductFeatures idf = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES, .pNext = &v12f, .shaderIntegerDotProduct = VK_TRUE};
+        {
+            VkDeviceCreateInfo di2 = dc; const char *e2[9]; uint32_t n2 = 0;
+            for (uint32_t i = 0; i < nc; i++) e2[n2++] = cext[i];
+            e2[n2++] = "VK_KHR_shader_integer_dot_product";
+            di2.pNext = &idf; di2.enabledExtensionCount = n2; di2.ppEnabledExtensionNames = e2;
+            if (vkCreateDevice(G.phys, &di2, NULL, &G.dev) == VK_SUCCESS) G.has_idot = 1; else G.dev = VK_NULL_HANDLE;
+        }
+        if (!G.dev && vkCreateDevice(G.phys, &dc, NULL, &G.dev) != VK_SUCCESS) { G.has_coop = 0; G.has_bda = 0; G.dev = VK_NULL_HANDLE; }
     }
     if (!G.dev)
 #endif
@@ -4346,6 +4358,7 @@ static void xb_stats(const XbCtx *X, ColiVkXbStats *st) {
     st->sub_gemm = X->sub_gemm; st->sub_ms = X->sub_ms;
     st->cooperative_matmuls = X->cooperative_matmuls; st->grouped_batches = X->grp_batches; st->gemv_batches = X->gv_batches;
 }
+int coli_vk_has_idot(void) { return G.has_idot; }
 void coli_vk_xb_stats(ColiVkXbStats *st) { xb_stats(&g_xb[0], st); }
 void coli_vk_xb_stats_dev(int dev, ColiVkXbStats *st) {
     if (dev == 0 || dev == 1) xb_stats(&g_xb[dev], st); else memset(st, 0, sizeof(*st));

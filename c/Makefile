@@ -733,6 +733,8 @@ VK_SPV   += shaders/chain_ares.spv
 VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv
 # blocked attention for prompt chunks (made on first use; vk_chain.c, chain_attnb.comp)
 VK_SPV   += shaders/chain_attnb.spv
+# int4 decode GEMVs as W4A8 (vk_chain.c, COLI_VK_CHAIN_IDOT)
+VK_SPV   += shaders/chain_gemv_idot.spv
 # the int8/int4 prompt GEMM on the matrix units (optional at run time)
 VK_SPV   += shaders/chain_gemm.spv
 # the KV cache split between the device and the host past the device's budget
