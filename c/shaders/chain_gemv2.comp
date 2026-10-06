@@ -46,10 +46,13 @@ float red(float v, uint lpr) {
 
 void main() {
     uint nr = uint(max(p.nr, 1)), s0 = gl_WorkGroupID.y * nr, I = uint(p.I), I4 = I / 4u, O = uint(p.O);
-    for (uint r = 0u; r < nr; r++)
-        for (uint i = gl_LocalInvocationID.x; i < I4; i += 256u) xsh[r * I4 + i] = s0 + r < uint(p.S) ? x4[(s0 + r) * I4 + i] : vec4(0.0);
-    barrier();
     int fmt = p.fmt;
+    // step-major: the o-th vec4 of 16-byte step j at o * W4 + j, so neighbouring lanes
+    // (neighbouring steps) read neighbouring vec4s, free of shared-memory bank conflicts
+    uint V = fmt == 1 ? 4u : 8u, NS = I4 / V;
+    for (uint r = 0u; r < nr; r++)
+        for (uint i = gl_LocalInvocationID.x; i < I4; i += 256u) xsh[r * I4 + (i % V) * NS + i / V] = s0 + r < uint(p.S) ? x4[(s0 + r) * I4 + i] : vec4(0.0);
+    barrier();
     uint rowWords = uint(p.rowWords), gs = uint(max(p.gs, 1)), ng = (I + gs - 1u) / gs;
     uint W4 = fmt == 1 ? I / 16u : I / 32u;
     uint cap = min(min(gl_SubgroupSize, W4), 64u), lpr = 1u;
@@ -75,9 +78,9 @@ void main() {
                 [[unroll]] for (uint t = 0u; t < RPS; t++) {
                     float d = 0.0;
                     if (fmt == 1) {
-                        [[unroll]] for (uint h = 0u; h < 4u; h++) d += d8(v[t][h], xsh[xb + j * 4u + h]);
+                        [[unroll]] for (uint h = 0u; h < 4u; h++) d += d8(v[t][h], xsh[xb + h * NS + j]);
                     } else {
-                        [[unroll]] for (uint h = 0u; h < 4u; h++) d += d4(v[t][h], xsh[xb + j * 8u + h * 2u], xsh[xb + j * 8u + h * 2u + 1u]);
+                        [[unroll]] for (uint h = 0u; h < 4u; h++) d += d4(v[t][h], xsh[xb + h * 2u * NS + j], xsh[xb + (h * 2u + 1u) * NS + j]);
                     }
                     acc[r * RPS + t] += sv[t] * d;
                 }

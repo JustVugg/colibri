@@ -349,9 +349,16 @@ int vkc_init(void) {
         int xs = (int)(pp.limits.maxComputeSharedMemorySize / 16);
         if (xs > 4096) xs = 4096;
         if (!(e && *e == '0') && xs >= 256 && (KC.mod_gemv4 = load_module(KC.core.spv_path, "chain_gemv.spv"))) {
-            int32_t v = xs;
-            VkSpecializationMapEntry me = {0, 0, 4};
-            VkSpecializationInfo si = {1, &me, 4, &v};
+            /* XS, rows a workgroup at most, steps a lane loads ahead (COLI_VK_CHAIN_GEMV_UNR:
+             * 1..8; 0 would never advance the loop and a negative value hang it, so a value
+             * outside the range keeps the default). One pipeline for a decode step and a
+             * verify's rows alike: the same compiled code gives a row the same bits on any
+             * driver (a one-row variant measured 2 % faster, not worth that) */
+            const char *ue = getenv("COLI_VK_CHAIN_GEMV_UNR");
+            int un = ue && *ue ? atoi(ue) : 0;
+            int32_t v[3] = {xs, 4, un >= 1 && un <= 8 ? un : 8};
+            VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+            VkSpecializationInfo si = {3, me, 12, v};
             if ((KC.gemv4 = make_pipe(KC.mod_gemv4, &si))) KC.gemv4_xs = xs;
         }
     }
@@ -789,15 +796,20 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
     else if (v4) {
         /* each workgroup stages x once: give it enough rows that the staging does not
          * rival the weights, while keeping enough workgroups to fill the device */
-        /* lanes per row: about sixteen 16-byte steps each (COLI_VK_CHAIN_GEMV_LPR overrides) */
+        /* lanes per row: about sixteen 16-byte steps each, eight for int4, whose steps
+         * carry twice the arithmetic (measured on a Radeon 8060S: int4 4096 -> 2048
+         * 52 -> 43 us, 2048 -> 8192 71 -> 62 us); COLI_VK_CHAIN_GEMV_LPR overrides */
         const char *e = getenv("COLI_VK_CHAIN_GEMV_LPR");
-        int nq = ti->rowWords / 4, lpr = 4;
-        if (e && *e) lpr = atoi(e); else while (lpr < 64 && lpr * 16 < nq) lpr *= 2;
+        int nq = ti->rowWords / 4, lpr = 4, st = ti->fmt == 4 ? 8 : 16;
+        if (e && *e) lpr = atoi(e); else while (lpr < 64 && lpr * st < nq) lpr *= 2;
         if (lpr < 1) lpr = 1;
-        struct { int fmt, S, I, O, rowWords, gs, lpr; } pc7 = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, lpr};
+        /* a verify's rows (S <= 4) in one workgroup each weight step is loaded once for;
+         * a decode step is nr = 1 through the same code, so the bits agree */
+        int nx4 = (ti->rowWords / 4) * per / 4, nr = S <= 4 && S * nx4 <= KC.gemv4_xs ? S : 1;
+        struct { int fmt, S, I, O, rowWords, gs, lpr, nr; } pc8 = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, lpr, nr};
         int rows_wg = 256 / lpr;   /* at least, at subgroups of 64 */
         int wg = (ti->O + rows_wg - 1) / rows_wg; if (wg > 1024) wg = 1024;
-        ok = record(KC.gemv4, bd, 4, &pc7, sizeof pc7, (uint32_t)wg, (uint32_t)S, 1);
+        ok = record(KC.gemv4, bd, 4, &pc8, sizeof pc8, (uint32_t)wg, (uint32_t)((S + nr - 1) / nr), 1);
     }
     else if (path >= 0 && KC.tg && (ti->fmt == 1 || ti->fmt == 2 || (ti->fmt == 4 && ti->gs >= 8 && ti->gs % 8 == 0)) &&
              ti->I % 64 == 0 && ti->O % 128 == 0 && ti->rowWords % 4 == 0) {
