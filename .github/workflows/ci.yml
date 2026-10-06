@@ -739,6 +739,13 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c backend_cuda.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "CUDA syntax check passed"
+      - name: Compile cuda_chain.cu (syntax only, no GPU)
+        run: |
+          cd c
+          # the dense chain on a CUDA device (cuda_chain.h), built into the same backend
+          nvcc -O2 -std=c++17 -arch=sm_80 -c cuda_chain.cu -o /dev/null \
+            -Xcompiler=-Wall,-Wextra
+          echo "cuda_chain syntax check passed"
       - name: Compile backend_cuda_ink.cu (syntax only, no GPU)
         run: |
           cd c

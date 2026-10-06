@@ -59,6 +59,10 @@ static int upload_common(ColiCudaTensor **t, const void *w, const float *sc, int
         if (q && s) { memcpy(q, w, (size_t)I * O); memcpy(s, sc, (size_t)O * sizeof(float)); n->w = q; n->sc = s; }
         else { free(q); free(s); n->w = NULL; n->sc = NULL; }
     }
+    if (fake_dense_compute && fmt == 0 && w) {   /* f32 rows (the chain's b|a, gate rows): the caller frees its copy */
+        float *f = (float *)malloc((size_t)I * O * sizeof(float));
+        if (f) { memcpy(f, w, (size_t)I * O * sizeof(float)); n->w = f; n->sc = NULL; } else n->w = NULL;
+    }
     *t = n;
     fake_uploads++;
     last_fmt = fmt;
@@ -219,5 +223,243 @@ int coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz
     fake_dn_steps++;
     return 1;
 }
+
+/* ---- the dense chain's table, host-side (cuda_chain.h) ------------------------
+ * The same ops as cuda_chain.cu's kernels, in plain C in the kernels' order of sums,
+ * so an engine test can run qwen36's CUDA chain (qwen36_cuda_chain.h) on the fake and
+ * demand the CPU path's tokens. Buffers are plain memory (every kind), a frame is
+ * nothing (every op runs when called), the matmul is the fake's fmt 1 compute or the
+ * f32 rows of a fmt 0 tensor. fake_chain_fail_at: the n-th cc_submit fails (a lost
+ * device); fake_chain_frames counts the submits. */
+#include "../cuda_chain.h"
+struct CcBuf { int kind; size_t bytes; float *d; };
+static int fake_chain_up, fake_chain_lost, fake_chain_dev = -1, fake_chain_frames, fake_chain_fail_at, fake_chain_ops;
+static size_t fake_chain_dev_bytes;
+static int fcc_init(int device) { fake_chain_up = 1; fake_chain_lost = 0; fake_chain_dev = device; return 1; }
+static int fcc_ready(void) { return fake_chain_up && !fake_chain_lost; }
+static int fcc_lost(void) { return !fake_chain_up || fake_chain_lost; }
+static void fcc_shutdown(void) { fake_chain_up = 0; }
+static int fcc_device(int d) { int was = fake_chain_dev; fake_chain_dev = d; return was; }
+static int fcc_device_now(void) { return fake_chain_dev; }
+static CcBuf *fcc_buf(size_t bytes, int kind) {
+    if (!bytes) bytes = 4;
+    CcBuf *b = (CcBuf *)calloc(1, sizeof *b);
+    b->kind = kind; b->bytes = bytes; b->d = (float *)calloc(bytes, 1);
+    if (kind == CC_DEV) fake_chain_dev_bytes += bytes;
+    return b;
+}
+static void fcc_free(CcBuf *b) { if (!b) return; if (b->kind == CC_DEV) fake_chain_dev_bytes -= b->bytes; free(b->d); free(b); }
+static int fcc_reserve(CcBuf **b, size_t bytes, int kind) {
+    if (*b && (*b)->bytes >= bytes && (*b)->kind == kind) return 1;
+    CcBuf *n = fcc_buf(bytes, kind); fcc_free(*b); *b = n; return 1;
+}
+static void *fcc_ptr(const CcBuf *b) { return b ? b->d : NULL; }
+static size_t fcc_bytes(const CcBuf *b) { return b ? b->bytes : 0; }
+static int fcc_begin(void) { return fcc_ready(); }
+static int fcc_submit(int wait) {
+    (void)wait;
+    if (!fcc_ready()) return 0;
+    fake_chain_frames++;
+    if (fake_chain_fail_at && fake_chain_frames == fake_chain_fail_at) { fake_chain_lost = 1; return 0; }
+    return 1;
+}
+static int fcc_finish(void) { return fcc_ready(); }
+static int fcc_copy(CcBuf *dst, size_t doff, CcBuf *src, size_t soff, size_t n) {
+    if (!fcc_ready() || !dst || !src || (doff + n) * 4 > dst->bytes || (soff + n) * 4 > src->bytes) return 0;
+    memmove(dst->d + doff, src->d + soff, n * 4); fake_chain_ops++; return 1;
+}
+static int fcc_zero(CcBuf *dst, size_t off, size_t n) {
+    if (!fcc_ready() || !dst || (off + n) * 4 > dst->bytes) return 0;
+    memset(dst->d + off, 0, n * 4); return 1;
+}
+static int fcc_copy_regions(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
+    for (int i = 0; i < n; i++) if (!fcc_copy(dst, r[i].dst, src, r[i].src, r[i].n)) return 0;
+    return 1;
+}
+static int fcc_write(CcBuf *dst, size_t off, const void *src, size_t bytes) {
+    if (!fcc_ready() || !dst || off * 4 + bytes > dst->bytes) return 0;
+    memcpy((char *)dst->d + off * 4, src, bytes); return 1;
+}
+static int fcc_read(CcBuf *src, size_t off, void *dst, size_t bytes) {
+    if (!fcc_ready() || !src || off * 4 + bytes > src->bytes) return 0;
+    memcpy(dst, (const char *)src->d + off * 4, bytes); return 1;
+}
+static int fcc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S) {
+    if (!fcc_ready() || !t || !x || !y || S < 1 || !t->w) return 0;
+    if ((xo + (size_t)S * t->I) * 4 > x->bytes || (yo + (size_t)S * t->O) * 4 > y->bytes) return 0;
+    fake_chain_ops++;
+    for (int s = 0; s < S; s++) {
+        const float *xs = x->d + xo + (size_t)s * t->I; float *ys = y->d + yo + (size_t)s * t->O;
+        if (t->fmt == 1 && t->sc) {
+            const int8_t *q = (const int8_t *)t->w;
+            for (int o = 0; o < t->O; o++) { const int8_t *w = q + (size_t)o * t->I; float a = 0.f;
+                for (int i = 0; i < t->I; i++) a += xs[i] * (float)w[i]; ys[o] = a * t->sc[o]; }
+        } else if (t->fmt == 0) {
+            const float *w = (const float *)t->w;
+            for (int o = 0; o < t->O; o++) { const float *wr = w + (size_t)o * t->I; float a = 0.f;
+                for (int i = 0; i < t->I; i++) a += xs[i] * wr[i]; ys[o] = a; }
+        } else return 0;
+    }
+    return 1;
+}
+static int fcc_norm(CcBuf *x, CcBuf *w, CcBuf *y, const CcNorm *p) {
+    if (!fcc_ready() || !x || !y || !p) return 0;
+    fake_chain_ops++;
+    for (int g = 0; g < p->nseg; g++) {
+        int row = g / p->per_row, j = g - row * p->per_row;
+        const float *xb = x->d + p->x_off + row * p->x_row + j * p->x_seg;
+        float *yb = y->d + p->y_off + row * p->y_row + j * p->y_seg;
+        const float *wb = w ? w->d + p->w_off + (p->w_mod > 0 ? (j % p->w_mod) * p->D : 0) : NULL;
+        float acc = 0.f; for (int i = 0; i < p->D; i++) acc += xb[i] * xb[i];
+        float r = (p->flags & 4) ? 1.f / sqrtf(acc + p->eps) : 1.f / sqrtf(acc / (float)p->D + p->eps);
+        for (int i = 0; i < p->D; i++) {
+            float wv = (p->flags & 2) ? 1.f : ((p->flags & 1) ? 1.f + wb[i] : wb[i]);
+            yb[i] = xb[i] * r * wv * p->post;
+        }
+    }
+    return 1;
+}
+static int fcc_rope(CcBuf *x, CcBuf *cs, const CcRope *p) {
+    if (!fcc_ready() || !x || !cs || !p) return 0;
+    fake_chain_ops++;
+    for (int seg = 0; seg < p->nseg; seg++) {
+        int row = seg / p->per_row, hh = seg - row * p->per_row;
+        float *base = x->d + p->x_off + row * p->x_row + hh * p->x_seg;
+        const float *cb = cs->d + p->cs_off + row * p->cs_row;
+        for (int j = 0; j < p->half_; j++) {
+            float c = cb[2 * j], s = cb[2 * j + 1], a = base[j], b = base[j + p->half_];
+            base[j] = a * c - b * s; base[j + p->half_] = b * c + a * s;
+        }
+    }
+    return 1;
+}
+static int fcc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
+    if (!fcc_ready() || !q || !kc || !vc || !o || !p || (p->has_gate && !gate)) return 0;
+    fake_chain_ops++;
+    int rep = p->H / p->KVH;
+    for (int s = 0; s < p->S; s++) for (int h = 0; h < p->H; h++) {
+        int kvh = h / rep, kbase = kvh * p->cap;
+        const float *qs = q->d + p->q_off + s * p->q_row + h * p->q_seg;
+        int n = p->pos_base + s + 1, list = 0, lb = 0;
+        if (p->sel_row > 0 && sel) { lb = p->sel_off + s * p->sel_row; int c = ((const int *)sel->d)[lb]; if (c >= 0) { n = c; list = 1; } }
+        float m = -3.0e38f, l = 0.f, acc[256]; for (int d = 0; d < p->hd; d++) acc[d] = 0.f;
+        for (int t0 = 0; t0 < n; t0 += 128) {
+            int cnt = n - t0 < 128 ? n - t0 : 128; float sv[128], pe[128]; int pt[128];
+            float mx = -3.0e38f;
+            for (int i = 0; i < cnt; i++) {
+                int t = list ? ((const int *)sel->d)[lb + 1 + t0 + i] : t0 + i;
+                pt[i] = t;
+                const float *kb = kc->d + p->k_off + (kbase + t) * p->hd;
+                float a = 0.f; for (int d = 0; d < p->hd; d++) a += qs[d] * kb[d];
+                sv[i] = a * p->scale; if (sv[i] > mx) mx = sv[i];
+            }
+            float mn = m > mx ? m : mx, sum = 0.f;
+            for (int i = 0; i < cnt; i++) { pe[i] = expf(sv[i] - mn); sum += pe[i]; }
+            float corr = expf(m - mn);
+            l = l * corr + sum;
+            for (int d = 0; d < p->hd; d++) acc[d] *= corr;
+            for (int i = 0; i < cnt; i++) { const float *vb = vc->d + p->v_off + (kbase + pt[i]) * p->hd; for (int d = 0; d < p->hd; d++) acc[d] += pe[i] * vb[d]; }
+            m = mn;
+        }
+        float inv = l > 0.f ? 1.f / l : 0.f;
+        float *ob = o->d + p->o_off + s * p->o_row + h * p->hd;
+        const float *gb = p->has_gate ? gate->d + p->g_off + s * p->g_row + h * p->g_seg : NULL;
+        for (int d = 0; d < p->hd; d++) { float v = acc[d] * inv; if (gb) v *= 1.f / (1.f + expf(-gb[d])); ob[d] = v; }
+    }
+    return 1;
+}
+static int fcc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, const CcDnConv *p) {
+    if (!fcc_ready() || !in || !w || !ring || !out || !p || (p->snap_row >= 0 && !snap)) return 0;
+    fake_chain_ops++;
+    int nh = p->CK - 1;
+    for (int c = 0; c < p->CD; c++) {
+        float hist[8] = {0};
+        for (int k = 0; k < nh; k++) hist[k] = ring->d[p->ring_off + c * nh + k];
+        const float *wb = w->d + p->w_off + c * p->CK; float wl = wb[p->CK - 1];
+        for (int s = 0; s < p->S; s++) {
+            float cur = in->d[p->in_off + s * p->in_row + c], acc;
+            if (p->order == 0) { acc = 0.f; for (int k = 0; k < nh; k++) acc += wb[k] * hist[k]; acc += wl * cur; }
+            else { acc = wl * cur; for (int k = 0; k < nh; k++) acc += wb[k] * hist[k]; }
+            out->d[p->out_off + s * p->out_row + c] = acc / (1.f + expf(-acc));
+            for (int k = 0; k + 1 < nh; k++) hist[k] = hist[k + 1];
+            if (nh > 0) hist[nh - 1] = cur;
+            if (s == p->snap_row) for (int k = 0; k < nh; k++) snap->d[p->snap_off + c * nh + k] = hist[k];
+        }
+        for (int k = 0; k < nh; k++) ring->d[p->ring_off + c * nh + k] = hist[k];
+    }
+    return 1;
+}
+static float fcc_softplus(float x) { if (x > 20.f) return x; float e = expf(x); return e < 1e-4f ? e - 0.5f * e * e : logf(1.f + e); }
+static int fcc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *prm, CcBuf *y, CcBuf *snap, const CcDnRec *p) {
+    if (!fcc_ready() || !cv || !ab || !z || !st || !prm || !y || !p || (p->snap_row >= 0 && !snap) || KD > 256 || p->VD > 128) return 0;
+    fake_chain_ops++;
+    for (int h = 0; h < p->VH; h++) {
+        int kh = h / (p->VH / p->KH);
+        float *S = st->d + p->st_off + h * KD * p->VD;
+        float alog = prm->d[p->prm_off + h], dtb = prm->d[p->prm_off + p->VH + h];
+        const float *nw = prm->d + p->prm_off + 2 * p->VH;
+        for (int s = 0; s < p->S; s++) {
+            const float *cb = cv->d + p->cv_off + s * p->cv_row;
+            float qn[256], kn[256], qa = 0.f, ka = 0.f;
+            for (int k = 0; k < KD; k++) { qn[k] = cb[kh * KD + k]; kn[k] = cb[p->Ktot + kh * KD + k]; qa += qn[k] * qn[k]; ka += kn[k] * kn[k]; }
+            float qsc = 1.f / sqrtf(qa + 1e-6f) * p->qscale, ksc = 1.f / sqrtf(ka + 1e-6f);
+            for (int k = 0; k < KD; k++) { qn[k] *= qsc; kn[k] *= ksc; }
+            float bv = ab->d[p->b_off + s * p->b_row + h], av = ab->d[p->a_off + s * p->a_row + h];
+            float beta = 1.f / (1.f + expf(-bv)), decay = expf(-expf(alog) * fcc_softplus(av + dtb));
+            float o[128], ms = 0.f;
+            for (int v = 0; v < p->VD; v++) {
+                float vin = cb[2 * p->Ktot + h * p->VD + v], kvs = 0.f;
+                for (int k = 0; k < KD; k++) { S[k * p->VD + v] *= decay; kvs += kn[k] * S[k * p->VD + v]; }
+                float delta = (vin - kvs) * beta;
+                for (int k = 0; k < KD; k++) S[k * p->VD + v] += kn[k] * delta;
+                float ov = 0.f; for (int k = 0; k < KD; k++) ov += qn[k] * S[k * p->VD + v];
+                o[v] = ov; ms += ov * ov;
+            }
+            float r = 1.f / sqrtf(ms / (float)p->VD + p->eps);
+            for (int v = 0; v < p->VD; v++) {
+                float zv = z->d[p->z_off + s * p->z_row + h * p->VD + v];
+                float g = (p->flags & 1) ? 1.f / (1.f + expf(-zv)) : zv / (1.f + expf(-zv));
+                y->d[p->y_off + s * p->y_row + h * p->VD + v] = o[v] * r * nw[v] * g;
+            }
+            if (s == p->snap_row) memcpy(snap->d + p->snap_off + h * KD * p->VD, S, (size_t)KD * p->VD * sizeof(float));
+        }
+    }
+    return 1;
+}
+static float fcc_sig(float x) { return 1.f / (1.f + expf(-x)); }
+static int fcc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *p) {
+    if (!fcc_ready() || !y || !p) return 0;
+    fake_chain_ops++;
+    float *Y = y->d; const float *A = a ? a->d : NULL, *B = b ? b->d : NULL, *Cc = c ? c->d : NULL, *E = e ? e->d : NULL;
+    for (int i = 0; i < p->n; i++) {
+        if (p->op == 0) Y[p->y_off + i] = A[p->a_off + i] + B[p->b_off + i];
+        else if (p->op == 1) {
+            int r = i / p->D, d = i - r * p->D;
+            float t = (p->flags & 1) ? B[p->b_off + r * p->D + d] : 0.f;
+            if (p->flags & 2) { float g = (p->flags & 4) ? fcc_sig(E[p->e_off + r * p->e_row]) : 1.f; t = t + g * Cc[p->c_off + r * p->D + d]; }
+            Y[p->y_off + i] = (p->flags & 8) ? t : A[p->a_off + i] + t;
+        } else if (p->op == 2) { float g = A[p->a_off + i]; Y[p->y_off + i] = (g / (1.f + expf(-g))) * B[p->b_off + i]; }
+        else if (p->op == 3) { float v = A[p->a_off + i] / p->fc; Y[p->y_off + i] = v * fcc_sig(v); }
+        else if (p->op == 4) { int r = i / p->D, d = i - r * p->D, W = p->C * p->D; float v = 0.f;
+            for (int k = 0; k < p->C; k++) { int j = r * W + k * p->D + d; v += fcc_sig(A[p->a_off + j]) * B[p->b_off + j]; }
+            Y[p->y_off + i] = v / p->fc; }
+        else if (p->op == 5) Y[p->y_off + i] = 2.f * fcc_sig(A[p->a_off + i] / p->fc);
+        else if (p->op == 6) { int W = p->C * p->D, r = i / W, rem = i - r * W, k = rem / p->D, d = rem - k * p->D;
+            Y[p->y_off + i] += A[p->a_off + r * p->C + k] * B[p->b_off + r * p->D + d]; }
+        else if (p->op == 7) Y[p->y_off + i] = A[p->a_off + i] * p->fc;
+        else if (p->op == 8) Y[p->y_off + i] = A[p->a_off + i] + E[p->e_off + i % p->D] * B[p->b_off + i];
+        else return 0;
+    }
+    return 1;
+}
+static void fcc_stats(CcStats *st) { memset(st, 0, sizeof *st); st->frames = (unsigned long long)fake_chain_frames; st->ops = (unsigned long long)fake_chain_ops; st->dev_bytes = fake_chain_dev_bytes; }
+static const ColiCudaChainOps fake_chain_table = {
+    sizeof(ColiCudaChainOps), fcc_init, fcc_ready, fcc_lost, fcc_shutdown, fcc_device, fcc_device_now,
+    fcc_buf, fcc_free, fcc_reserve, fcc_ptr, fcc_bytes, fcc_begin, fcc_submit, fcc_finish,
+    fcc_copy, fcc_zero, fcc_copy_regions, fcc_write, fcc_read,
+    fcc_matmul, fcc_norm, fcc_rope, fcc_attn, fcc_dnconv, fcc_dnrec, fcc_ew, fcc_stats,
+};
+static int fake_chain_absent;   /* 1: a backend without the chain (an older DLL) */
+const ColiCudaChainOps *coli_cuda_chain_ops(void) { return fake_chain_absent ? NULL : &fake_chain_table; }
 
 #endif /* QWEN36_FAKE_CUDA_H */

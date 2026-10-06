@@ -128,6 +128,10 @@ on multi-GPU hosts the per-layer P2P hops cancel the gain, so the decode gate is
 device-count aware. `COLI_CUDA_TC_W4A16=1` enables Tensor-Core int4×fp16 mixed
 dispatch for batched rows (pays at ≥16 rows).
 
+qwen36 has its own form of this, shaped like the Vulkan chain: `COLI_CUDA_CHAIN=1`
+runs every layer as one chain on the card (`c/cuda_chain.h`, `c/qwen36_cuda_chain.h`;
+docs/qwen36-cuda-tier.md, "The dense chain on the card").
+
 ## Notes and limitations
 
 - Text-mode timing reports prefill separately from decode.
