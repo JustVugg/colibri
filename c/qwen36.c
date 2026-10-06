@@ -1323,8 +1323,19 @@ static int dense_bits(void){ static int v=-1; if(v<0){ const char *e=getenv("COL
  * K1b planar layout (unsigned nibbles v+8, block b: lo nibbles = elements
  * b*64..b*64+31, hi = b*64+32..b*64+63). The quantizer is the symmetric
  * absmax/7 the expert containers use. */
+/* COLI_INT4_GRID / _STEP, read once before any thread packs (int4_grid_init) */
+static int g_int4_grid = -1; static float g_int4_step = 0.1f;
+static void int4_grid_init(void) {
+    if (g_int4_grid >= 0) return;
+    const char *ge = getenv("COLI_INT4_GRID"), *se = getenv("COLI_INT4_GRID_STEP");
+    g_int4_step = se && *se ? (float)atof(se) : 0.1f;
+    __atomic_store_n(&g_int4_grid, ge && *ge ? atoi(ge) : 0, __ATOMIC_RELEASE);
+}
+static int int4_grid_n(void) { return __atomic_load_n(&g_int4_grid, __ATOMIC_ACQUIRE); }
+static float int4_grid_step(void) { return g_int4_step; }
 static void pack_int4_g64_planar(const float *w, uint8_t *q4, float *sg, int O, int I){
     int rb = I / 2, ng = I / 64;
+    int4_grid_init();
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++) {
         const float *wr = w + (int64_t)o * I;
@@ -1341,20 +1352,28 @@ static void pack_int4_g64_planar(const float *w, uint8_t *q4, float *sg, int O, 
              * perplexity absmax alone loses at 4 bits. */
             float best_s = amax / 7.f; if (best_s < 1e-8f) best_s = 1e-8f;
             int best_q[64]; double best_err = 1e30;
-            float s = best_s;
-            for (int round = 0; round < 4; round++) {
-                int q[64]; double err = 0, wq = 0, qq = 0;
-                float inv = 1.f / s;
-                for (int k = 0; k < 64; k++) {
-                    int v = (int)lrintf(blk[k] * inv); if (v > 7) v = 7; if (v < -8) v = -8;
-                    q[k] = v; double d = (double)blk[k] - (double)v * s; err += d * d;
-                    wq += (double)blk[k] * v; qq += (double)v * v;
+            /* COLI_INT4_GRID = n: the refinement also starts from amax / (7 + step i),
+             * amax / (7 - step i) (i = 1..n, COLI_INT4_GRID_STEP, 0.1) and amax / 8,
+             * the best of all kept */
+            const int grid = int4_grid_n();
+            const float gstep = int4_grid_step();
+            for (int gi = 0; gi <= 2 * grid; gi++) {
+                float s = gi == 0 ? best_s : gi <= grid ? amax / (7.f + gstep * gi) : gi < 2 * grid ? amax / (7.f - gstep * (gi - grid)) : amax / 8.f;
+                if (s < 1e-8f) s = 1e-8f;
+                for (int round = 0; round < 4; round++) {
+                    int q[64]; double err = 0, wq = 0, qq = 0;
+                    float inv = 1.f / s;
+                    for (int k = 0; k < 64; k++) {
+                        int v = (int)lrintf(blk[k] * inv); if (v > 7) v = 7; if (v < -8) v = -8;
+                        q[k] = v; double d = (double)blk[k] - (double)v * s; err += d * d;
+                        wq += (double)blk[k] * v; qq += (double)v * v;
+                    }
+                    if (err < best_err) { best_err = err; best_s = s; memcpy(best_q, q, sizeof q); }
+                    if (qq <= 0) break;
+                    float ns = (float)(wq / qq);          /* least-squares scale for these codes */
+                    if (ns <= 0.f || ns == s) break;
+                    s = ns;
                 }
-                if (err < best_err) { best_err = err; best_s = s; memcpy(best_q, q, sizeof q); }
-                if (qq <= 0) break;
-                float ns = (float)(wq / qq);          /* least-squares scale for these codes */
-                if (ns <= 0.f || ns == s) break;
-                s = ns;
             }
             sr[g] = best_s;
             uint8_t *dst = row + g * 32;
@@ -1414,6 +1433,66 @@ static int dense_keep_i8(void){
     }
     return v;
 }
+#ifdef _WIN32
+#include <direct.h>
+#define int4_mkdir(p) _mkdir(p)
+#else
+#include <sys/stat.h>
+#define int4_mkdir(p) mkdir((p), 0755)
+#endif
+/* COLI_INT4_GRID > 0 makes the int4 packing a search of several seconds per GB: its
+ * result is kept in COLI_INT4_CACHE (default ~/.cache/colibri-int4; "0" off), one file a
+ * matrix, keyed by a hash of a sample of the source weights, the shape and the search */
+static int int4_cache_path(const float *W, int O, int I, char *path, size_t n) {
+    static int grid = -2; static float step; static char dir[512];
+    if (__atomic_load_n(&grid, __ATOMIC_ACQUIRE) == -2) {
+        #pragma omp critical(int4_cache_init)
+        if (grid == -2) {
+            int4_grid_init();
+            const char *ce = getenv("COLI_INT4_CACHE");
+            int gv = int4_grid_n(); step = int4_grid_step();
+            if (ce && !strcmp(ce, "0")) gv = -1;
+            else if (ce && *ce) snprintf(dir, sizeof dir, "%s", ce);
+            else snprintf(dir, sizeof dir, "%s/.cache/colibri-int4", getenv("HOME") ? getenv("HOME") : "/tmp");
+            __atomic_store_n(&grid, gv, __ATOMIC_RELEASE);
+        }
+    }
+    if (grid <= 0) return 0;
+    uint64_t h = 1469598103934665603ull ^ 0x7632ull;   /* the cache format's version (2) */
+    h = (h ^ (uint64_t)O) * 1099511628211ull; h = (h ^ (uint64_t)I) * 1099511628211ull;
+    h = (h ^ (uint64_t)grid) * 1099511628211ull; { uint32_t b; memcpy(&b, &step, 4); h = (h ^ b) * 1099511628211ull; }
+    for (int64_t i = 0, nn = (int64_t)O * I; i < nn; i += 61) { uint32_t b; memcpy(&b, &W[i], 4); h = (h ^ b) * 1099511628211ull; }
+    static int made;
+    if (!made) {   /* mkdir -p: an existing part fails harmlessly */
+        made = 1;
+        for (char *p = dir + 1; *p; p++) if (*p == '/') { *p = 0; int4_mkdir(dir); *p = '/'; }
+        int4_mkdir(dir);
+    }
+    snprintf(path, n, "%s/%016llx.i4", dir, (unsigned long long)h);
+    return 1;
+}
+static void pack_int4_cached(const float *W, uint8_t *q4, float *sg, int O, int I) {
+    char path[700]; size_t nq = (size_t)O * (I / 2), ns = (size_t)O * (I / 64) * sizeof(float);
+    int c = int4_cache_path(W, O, I, path, sizeof path);
+    if (c) {
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            int ok = fread(q4, 1, nq, f) == nq && fread(sg, 1, ns, f) == ns;
+            fclose(f);
+            if (ok) return;
+        }
+    }
+    pack_int4_g64_planar(W, q4, sg, O, I);
+    if (c) {
+        char tmp[720]; snprintf(tmp, sizeof tmp, "%s.%d", path, (int)getpid());
+        FILE *f = fopen(tmp, "wb");
+        if (f) {
+            int ok = fwrite(q4, 1, nq, f) == nq && fwrite(sg, 1, ns, f) == ns;
+            fclose(f);
+            if (ok) rename(tmp, path); else remove(tmp);
+        }
+    }
+}
 static void qw_quantize(const float *W, int I, int O, const char *tag, QW *out) {
     int8_t *q = q36_walloc((size_t)O*I); float *sc = malloc((size_t)O*sizeof(float));
     if (!q || !sc) { fprintf(stderr, "OOM qw_quantize\n"); exit(1); }
@@ -1430,7 +1509,7 @@ static void qw_quantize(const float *W, int I, int O, const char *tag, QW *out) 
     if (dense_int4_wanted(tag) && I % 64 == 0) {
         uint8_t *q4 = malloc((size_t)O*(I/2)); float *sg = malloc((size_t)O*(I/64)*sizeof(float));
         if (q4 && sg) {
-            pack_int4_g64_planar(W, q4, sg, O, I);
+            pack_int4_cached(W, q4, sg, O, I);
             out->q4 = q4; out->sg = sg; out->ng = I/64;
             if (!dense_keep_i8()) { q36_wfree(out->q); free(out->sc); out->q = NULL; out->sc = NULL; }
         } else { free(q4); free(sg); }
