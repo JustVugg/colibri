@@ -748,7 +748,7 @@ VK_SPV   += shaders/chain_attn_dec.spv shaders/chain_attn_dec2.spv
 # ranges with DeBERTa's relative terms, LayerNorm, GeGLU, RoPE (made on first use)
 VK_SPV   += shaders/chain_enc.spv
 # the attention core on the matrix units for prompt chunks (optional at run time)
-VK_SPV   += shaders/chain_attn_flash.spv
+VK_SPV   += shaders/chain_attn_flash.spv shaders/chain_attn_flash_mr.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
@@ -925,6 +925,11 @@ shaders/qmatmul_coop.spv: shaders/qmatmul_coop.comp
 # chain_gemm.comp needs the same glslc as qmatmul_coop.comp above, with the same
 # fallback; without its .spv the chain keeps its other GEMMs.
 shaders/chain_gemm.spv: shaders/chain_gemm.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
+# chain_attn_flash_mr.comp likewise (cooperative matrices; the chain keeps chain_attn_flash without it)
+shaders/chain_attn_flash_mr.spv: shaders/chain_attn_flash_mr.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
 	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }

@@ -110,7 +110,7 @@ typedef struct {
     VkShaderModule mmod[PM_N]; VkPipeline mpipe[PM_N]; int mla_ok;   /* chain_mla, chain_hgemv, chain_dsa */
     /* chain_attn_flash.comp: the attention core on the matrix units for prompt chunks,
      * one pipeline per (head dim, query heads per kv head) */
-    VkShaderModule mod_fa; VkPipeline fa[4]; int fa_hd[4], fa_gq[4], nfa;
+    VkShaderModule mod_fa; VkPipeline fa[4]; int fa_hd[4], fa_gq[4], nfa, fa_mr;
     VkPipeline kdarec[VKC_KDA_MAX]; int kdarec_kd[VKC_KDA_MAX], nkdarec;   /* chain_kda's recurrence per key dim */
     VkCommandPool cpool;
     VkcFrame fr[VKC_FRAMES];
@@ -425,7 +425,14 @@ int vkc_init(void) {
     KC.mla_ok = KC.mpipe[PM_MLA] && KC.mpipe[PM_HGEMV] && KC.mpipe[PM_DSA];
     /* the attention core on the matrix units (vkc_attn_flash_rows): subgroups of 64 with
      * cooperative matrices, the shader's tiling assumes four of them */
-    if (KC.core.coop_sg == 64) KC.mod_fa = load_module(KC.core.spv_path, "chain_attn_flash.spv");
+    /* chain_attn_flash_mr.comp: a subgroup a 16-row tile, four tiles a
+     * workgroup sharing each K/V block, online softmax; COLI_VK_CHAIN_FLASH_MR=0: the old one */
+    if (KC.core.coop_sg == 64) {
+        const char *me_ = getenv("COLI_VK_CHAIN_FLASH_MR");
+        KC.fa_mr = !(me_ && *me_ == '0');
+        KC.mod_fa = load_module(KC.core.spv_path, KC.fa_mr ? "chain_attn_flash_mr.spv" : "chain_attn_flash.spv");
+        if (!KC.mod_fa && KC.fa_mr) { KC.fa_mr = 0; KC.mod_fa = load_module(KC.core.spv_path, "chain_attn_flash.spv"); }
+    }
     dsv4_init();
     /* the int8/int4 prompt GEMM on the matrix units (chain_gemm.comp, subgroups of 64);
      * COLI_VK_CHAIN_GEMM=0 leaves those formats to the GEMMs below */
@@ -1046,6 +1053,7 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
     if (w.a.hd > 256 || w.vd > 256 || w.a.H % w.a.KVH || w.win < 0 || w.ring < 0 || (w.sink && !snk)) return 0;
     VkcBind bd[7] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(gate, 0), B(sel, 0), B(snk, 0)};
     int G = w.a.H / w.a.KVH, blk = vkc_attn_block_rows(), fl = vkc_attn_flash_rows();
+    int fa_tpw = G > 0 && 16 % G == 0 ? (KC.fa_mr ? 4 : 1) * 16 / G : 1;   /* tokens a flash workgroup */
     /* a prompt chunk's plain causal attention on the matrix units (chain_attn_flash),
      * 16 / G rows a workgroup; else the blocked shader, else chain_attn */
     VkPipeline fp = KC.mod_fa && fl > 0 && w.a.S >= fl && !(sel && w.a.sel_row > 0) && !w.win && !w.ring && !w.kv_pm &&
@@ -1065,7 +1073,7 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
                record(KAD.p2, b2, 3, &w, sizeof w, (uint32_t)w.a.H, (uint32_t)w.a.S, 1);
     }
     int S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd),
-                                        fp ? 16 / G : blocked ? br : 1);
+                                        fp ? fa_tpw : blocked ? br : 1);
     int ok = 1;
     for (int r0 = 0; ok && r0 < S; r0 += rr) {
         VkcAttnW x = w;
@@ -1075,7 +1083,7 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
         if (w.a.sel_row > 0) x.a.sel_off += r0 * w.a.sel_row;
         if (r0 && !attn_slice_next()) return 0;
         if (fp) {
-            ok = record(fp, bd, 7, &x, sizeof x, (uint32_t)((x.a.S + 16 / G - 1) / (16 / G)), (uint32_t)x.a.KVH, 1);
+            ok = record(fp, bd, 7, &x, sizeof x, (uint32_t)((x.a.S + fa_tpw - 1) / fa_tpw), (uint32_t)x.a.KVH, 1);
             KC.st.attn_flash += ok;
         } else if (blocked) {
             struct { VkcAttnW w; int br, B, anchor, part, st_off; } pc = {x, br, 0, 0, 0, 0};
