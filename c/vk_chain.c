@@ -103,7 +103,7 @@ typedef struct {
     VkPipeline dnrec[VKC_DNREC_MAX]; int dnrec_kd[VKC_DNREC_MAX], ndnrec;
     VkShaderModule mod_gemv4; VkPipeline gemv4; int gemv4_xs;   /* chain_gemv.comp: the vectorized decode GEMV */
     /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
-    VkShaderModule mod_tg; VkPipeline tg;
+    VkShaderModule mod_tg; VkPipeline tg; int tg_rows, tg_oxf;
     /* the routed experts of a decode step on the device (vkc_moe_*): routing, the grouped
      * GEMV (gate|up, down) and the rank-order sum, subgroups of 64 */
     VkShaderModule mod_moe[4]; VkPipeline moe[4]; int moe_ok;
@@ -429,9 +429,18 @@ int vkc_init(void) {
     {
         const char *e = getenv("COLI_VK_CHAIN_GEMM");
         if (KC.core.coop_sg == 64 && !(e && *e == '0') && (KC.mod_tg = load_module(KC.core.spv_path, "chain_gemm.spv"))) {
-            int32_t tt = 4;
-            VkSpecializationMapEntry me = {0, 0, 4};
-            VkSpecializationInfo si = {1, &me, 4, &tt};
+            /* 128 token rows a workgroup and the grid's x over the output blocks: the
+             * workgroups running together share their x rows (one read from memory, the
+             * rest from the caches) and each weight block is dequantised half as often;
+             * 4k-token prompt 1551 -> 1093 ms of trunk GEMMs on a Radeon 8060S.
+             * COLI_VK_CHAIN_GEMM_TT / _OXF=0 for the old 64 rows and order */
+            int32_t tt = 8;
+            { const char *te = getenv("COLI_VK_CHAIN_GEMM_TT"); if (te && *te) tt = atoi(te); }   /* 16-row tiles a workgroup */
+            KC.tg_rows = 16 * tt;
+            { const char *oe = getenv("COLI_VK_CHAIN_GEMM_OXF"); KC.tg_oxf = oe && *oe ? atoi(oe) : 1; }
+            int32_t sv2[2] = {tt, KC.tg_oxf};
+            VkSpecializationMapEntry me2[2] = {{0, 0, 4}, {1, 4, 4}};
+            VkSpecializationInfo si = {2, me2, 8, sv2};
             VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
                 .requiredSubgroupSize = 64};
@@ -851,7 +860,8 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
     }
     else if (path >= 0 && KC.tg && (ti->fmt == 1 || ti->fmt == 2 || (ti->fmt == 4 && ti->gs >= 8 && ti->gs % 8 == 0)) &&
              ti->I % 64 == 0 && ti->O % 128 == 0 && ti->rowWords % 4 == 0) {
-        ok = record(KC.tg, bd, 4, &pc, sizeof pc, (uint32_t)((S + 63) / 64), (uint32_t)(ti->O / 128), 1);
+        uint32_t rb = (uint32_t)((S + KC.tg_rows - 1) / KC.tg_rows), ob = (uint32_t)(ti->O / 128);
+        ok = record(KC.tg, bd, 4, &pc, sizeof pc, KC.tg_oxf ? ob : rb, KC.tg_oxf ? rb : ob, 1);
         KC.st.tile_gemms += ok;
     }
     else if (path >= 0)

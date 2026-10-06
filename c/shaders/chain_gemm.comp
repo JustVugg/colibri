@@ -19,6 +19,7 @@
 #extension GL_KHR_shader_subgroup_basic : require
 layout(local_size_x = 256) in;
 layout(constant_id = 0) const uint TT = 4;          // 16-row token tiles per workgroup
+layout(constant_id = 1) const uint OXF = 0;         // 1: grid x = output blocks (neighbouring workgroups share x rows)
 
 layout(std430, binding = 0) readonly buffer X  { float x[]; };
 layout(std430, binding = 1) readonly buffer W  { uint  wg[]; };
@@ -105,8 +106,8 @@ void store_raw(uint tid) {
 #define MAXQ 2u
 
 void main() {
-    uint s0 = gl_WorkGroupID.x * TM;
-    uint o0 = gl_WorkGroupID.y * BO;
+    uint s0 = (OXF != 0u ? gl_WorkGroupID.y : gl_WorkGroupID.x) * TM;
+    uint o0 = (OXF != 0u ? gl_WorkGroupID.x : gl_WorkGroupID.y) * BO;
     uint tid = gl_LocalInvocationID.x;
     uint nsg = gl_NumSubgroups, sgi = gl_SubgroupID;
     uint K = uint(p.I), S = uint(p.S);
