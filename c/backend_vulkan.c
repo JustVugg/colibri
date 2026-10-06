@@ -3983,6 +3983,29 @@ static uint64_t vk_addr(VkBuffer b) {
     VkBufferDeviceAddressInfo ai = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = b};
     return (uint64_t)vkGetBufferDeviceAddress(G.dev, &ai);
 }
+/* An expert's grouped-GEMV entries (qmatmul_grp_gemv.comp's table: gate|up and down),
+ * rows and packed row left 0 for the caller to fill; 0 when the grouped GEMV cannot
+ * take it (not on the primary device, a format or width it does not compute). */
+int coli_vk_xb_expert_entries(const ColiVkExpert *e, uint32_t gu[16], uint32_t dn[16]) {
+    const XbCtx *X = &g_xb[0];
+    if (!e || e->X != X || !X->p_gv[0] || X->act != COLI_VK_ACT_SWIGLU) return 0;
+    if (X->D % 32 || X->I % 32 || X->D > 8192 || X->I > 8192) return 0;
+    const ColiVkTensor *t[3] = {e->g, e->u, e->d};
+    for (int k = 0; k < 3; k++) {
+        int f = t[k]->fmt;
+        if (t[k]->dev || !t[k]->pool || !(f == 1 || f == 2 || f == 4) || t[k]->rowWords % 4 ||
+            (f == 4 && (t[k]->gs < 32 || t[k]->gs % 32))) return 0;
+    }
+    if (e->u->fmt != e->g->fmt || e->u->gs != e->g->gs) return 0;
+    uint64_t a[6] = {vk_addr(e->g->wbuf), vk_addr(e->g->sbuf), vk_addr(e->u->wbuf), vk_addr(e->u->sbuf),
+                     vk_addr(e->d->wbuf), vk_addr(e->d->sbuf)};
+    memset(gu, 0, 64); memset(dn, 0, 64);
+    for (int k = 0; k < 4; k++) { gu[2 * k] = (uint32_t)a[k]; gu[2 * k + 1] = (uint32_t)(a[k] >> 32); }
+    for (int k = 0; k < 2; k++) { dn[2 * k] = (uint32_t)a[4 + k]; dn[2 * k + 1] = (uint32_t)(a[4 + k] >> 32); }
+    gu[10] = (uint32_t)e->g->fmt; gu[11] = (uint32_t)e->g->rowWords; gu[12] = (uint32_t)e->g->gs;
+    dn[10] = (uint32_t)e->d->fmt; dn[11] = (uint32_t)e->d->rowWords; dn[12] = (uint32_t)e->d->gs;
+    return 1;
+}
 /* The grouped route of a batch (X->p_grp) into cmd: gate+up+SwiGLU of every expert in
  * one dispatch, a barrier, down of every expert in another. The packed rows stay where
  * xb_plan put them: with row sizes on the buffers' alignment an expert's x, hidden and y

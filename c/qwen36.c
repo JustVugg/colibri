@@ -4177,6 +4177,33 @@ static void serve_echo(const char *id, int pos, int token, const float *lo, int 
 static float *g_hidden_sink = NULL;
 
 #ifdef COLI_VULKAN
+/* A decode step routed on the device (qwen36_chain.h, q36c_moe_*): the bookkeeping the
+ * routing loop in moe_ex does, from the ids the device chose and the raw router logits,
+ * layer by layer after the step. */
+static int q36_route_plain(Model *m) {
+    Cfg *c = &m->c;
+    return !g_cache_route && !g_route_agree && c->n_group <= 1 && !c->has_bias && c->n_experts <= 1024 && c->topk <= 16;
+}
+static void q36_route_note(Model *m, int layer, const int *idx, const float *logits, int S) {
+    Cfg *c = &m->c; int E = c->n_experts, K = c->topk;
+    if (m->momentum_logits && m->pilot_smooth > 0.f) {
+        float *ema = m->momentum_logits + (int64_t)layer * E;
+        for (int s = 0; s < S; s++) {
+            const float *pr = logits + (int64_t)s * E;
+            int is_zero = 1; for (int e = 0; e < E; e++) if (ema[e] != 0.f) { is_zero = 0; break; }
+            if (is_zero) { for (int e = 0; e < E; e++) ema[e] = pr[e]; }
+            else { for (int e = 0; e < E; e++) ema[e] = (1.f - m->pilot_smooth)*pr[e] + m->pilot_smooth*ema[e]; }
+        }
+    }
+    for (int s = 0; s < S; s++) {
+        const int *id = idx + (int64_t)s * K;
+        if (m->resident_collecting) for (int k = 0; k < K; k++) m->seen[(int64_t)layer * E + id[k]] = 1;
+        if (!m->hot_pinned && m->freq) { uint32_t *f = m->freq + (int64_t)layer * E; for (int k = 0; k < K; k++) f[id[k]]++; }
+        if (m->vk_hist) rt_count(layer, id, K);
+        for (int k = 0; k < K; k++) ehit_mark(m, layer, id[k]);
+    }
+    vkt_note_routed(layer, idx, S * K);
+}
 #include "qwen36_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
 

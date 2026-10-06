@@ -103,6 +103,9 @@ typedef struct {
     VkShaderModule mod_gemv4; VkPipeline gemv4; int gemv4_xs;   /* chain_gemv.comp: the vectorized decode GEMV */
     /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
     VkShaderModule mod_tg; VkPipeline tg;
+    /* the routed experts of a decode step on the device (vkc_moe_*): routing, the grouped
+     * GEMV (gate|up, down) and the rank-order sum, subgroups of 64 */
+    VkShaderModule mod_moe[4]; VkPipeline moe[4]; int moe_ok;
     VkShaderModule mmod[PM_N]; VkPipeline mpipe[PM_N]; int mla_ok;   /* chain_mla, chain_hgemv, chain_dsa */
     /* chain_attn_flash.comp: the attention core on the matrix units for prompt chunks,
      * one pipeline per (head dim, query heads per kv head) */
@@ -372,6 +375,27 @@ int vkc_init(void) {
         int ok = (sgp.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT) && (sgp.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
                  sgp.subgroupSize >= 16 && !(e && *e == '0');
         if (ok && (KC.mod_gv2 = load_module(KC.core.spv_path, "chain_gemv2.spv"))) KC.gv2 = make_pipe(KC.mod_gv2, NULL);
+    }
+    /* the device MoE's shaders (optional; COLI_VK_CHAIN_MOE=0 keeps the host's experts) */
+    {
+        const char *e = getenv("COLI_VK_CHAIN_MOE");
+        const char *nm[4] = {"chain_moe_route.spv", "qmatmul_grp_gemv_gate_up.spv", "qmatmul_grp_gemv.spv", "expert_sum.spv"};
+        int ok = KC.core.coop_sg == 64 && !(e && *e == '0');
+        int32_t zero = 0;
+        VkSpecializationMapEntry me = {0, 0, 4};
+        VkSpecializationInfo si = {1, &me, 4, &zero};
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT, .requiredSubgroupSize = 64};
+        for (int i = 0; i < 4 && ok; i++) {
+            if (!(KC.mod_moe[i] = load_module(KC.core.spv_path, nm[i]))) { ok = 0; break; }
+            VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &rss,
+                          .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
+                          .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KC.mod_moe[i], .pName = "main",
+                          .pSpecializationInfo = &si}, .layout = KC.pl};
+            if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &KC.moe[i]) != VK_SUCCESS) { KC.moe[i] = VK_NULL_HANDLE; ok = 0; }
+        }
+        KC.moe_ok = ok;
     }
     /* the MLA, KDA and mHC shaders, optional: without one only its ops decline */
     for (int i = 0; i < PM_N; i++) {
@@ -1065,6 +1089,31 @@ int vkc_attn_part_chunks(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, const Vkc
                          int ch, int nz, int o_z, int st_z) {
     return ch > 0 && attn_part_rec(q, kc, vc, o, p, blk, anchor, st_off, ch, nz, o_z, st_z);
 }
+/* ---- the routed experts of a decode step on the device -------------------------- */
+int vkc_moe_ready(void) { return vkc_ready() && KC.moe_ok; }
+int vkc_moe_route(VkcBuf *lg, VkcBuf *mgu, VkcBuf *mdn, VkcBuf *egu, VkcBuf *edn, VkcBuf *wt, VkcBuf *ix,
+                  int S, int E, int K_, int ix_off) {
+    KC.kind = PK_EW;
+    if (!KC.moe_ok || E > 1024 || K_ > 16 || S < 1) return 0;
+    VkcBind bd[7] = {B(lg, 0), B(mgu, 0), B(mdn, 0), B(egu, 1), B(edn, 1), B(wt, 1), B(ix, 1)};
+    int pc[3] = {E, K_, ix_off};
+    return record(KC.moe[0], bd, 7, pc, sizeof pc, (uint32_t)S, 1, 1);
+}
+int vkc_moe_gemv(int gate_up, VkcBuf *x, VkcBuf *items, VkcBuf *etab, VkcBuf *y, VkcBuf *amap, int nitems,
+                 int I, int O, float limit, int kgat, int rpw) {
+    KC.kind = PK_GEMV;
+    if (!KC.moe_ok || nitems < 1) return 0;
+    VkcBind bd[5] = {B(x, 0), B(items, 0), B(etab, 0), B(y, 1), B(amap, 0)};
+    struct { int I, O; float limit; int ibase, kgat, rpw; } pc = {I, O, limit, 0, kgat, rpw};
+    return record(KC.moe[gate_up ? 1 : 2], bd, 5, &pc, sizeof pc, (uint32_t)nitems, 1, 1);
+}
+int vkc_moe_sum(VkcBuf *ys, VkcBuf *w, VkcBuf *use, VkcBuf *out, int S, int K_, int D) {
+    KC.kind = PK_EW;
+    if (!KC.moe_ok) return 0;
+    VkcBind bd[4] = {B(ys, 0), B(w, 0), B(use, 0), B(out, 1)};
+    int pc[3] = {S, K_, D};
+    return record(KC.moe[3], bd, 4, pc, sizeof pc, (uint32_t)((D + 255) / 256), (uint32_t)S, 1);
+}
 int vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, const VkcDnConv *p) {
     KC.kind = PK_DNCONV;
     if (p->CK < 1 || p->CK > 9) return 0;
@@ -1757,6 +1806,10 @@ void vkc_shutdown(void) {
     if (KC.gemv4) vkDestroyPipeline(KC.dev, KC.gemv4, NULL);
     if (KC.mod_gemv4) vkDestroyShaderModule(KC.dev, KC.mod_gemv4, NULL);
     if (KC.gv2) vkDestroyPipeline(KC.dev, KC.gv2, NULL);
+    for (int i = 0; i < 4; i++) {
+        if (KC.moe[i]) vkDestroyPipeline(KC.dev, KC.moe[i], NULL);
+        if (KC.mod_moe[i]) vkDestroyShaderModule(KC.dev, KC.mod_moe[i], NULL);
+    }
     if (KC.mod_gv2) vkDestroyShaderModule(KC.dev, KC.mod_gv2, NULL);
     if (KC.mod_gemm) vkDestroyShaderModule(KC.dev, KC.mod_gemm, NULL);
     if (KC.mod_dnrec) vkDestroyShaderModule(KC.dev, KC.mod_dnrec, NULL);

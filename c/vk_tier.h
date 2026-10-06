@@ -233,6 +233,11 @@ int  vkt_join(const float **rows);
  * rank-order sum of w[s*K+k] * expert(s, k) as an fma chain from 0, the engines' loop),
  * summed on the device; else *sum = NULL. w as vkt_issue_w's (NULL = 1). */
 int vkt_join_sum(const float **rows, const float *w, const float **sum);
+/* Every expert resident (no promotion can move one): the device may route a step and
+ * run its experts by vkt_expert's entries; vkt_note_routed counts what it chose. */
+int  vkt_all_resident(void);
+const void *vkt_expert(int layer, int eid);   /* the resident expert (a ColiVkExpert *), or NULL */
+void vkt_note_routed(int layer, const int *idx, int n);
 int  vkt_resident(int layer, int eid);
 /* The next vkt_issue starts a forward (promotion rate, decay, eviction candidates).
  * Optional: the tier tells forwards apart by the layer index going back, which a model
@@ -277,6 +282,9 @@ static inline int  vkt_issue_w(int l,const float *x,int S,int K,const int *i,con
 static inline int  vkt_wants(int l,int e){(void)l;(void)e;return 0;}
 static inline int  vkt_join(const float **r){(void)r;return 0;}
 static inline int  vkt_join_sum(const float **r, const float *w, const float **s){(void)r;(void)w;*s=0;return 0;}
+static inline int  vkt_all_resident(void){return 0;}
+static inline const void *vkt_expert(int l,int e){(void)l;(void)e;return 0;}
+static inline void vkt_note_routed(int l,const int *i,int n){(void)l;(void)i;(void)n;}
 static inline int  vkt_resident(int l,int e){(void)l;(void)e;return 0;}
 static inline void vkt_begin_forward(void){}
 static inline void vkt_report(const char *s,unsigned long long r,unsigned long long d){(void)s;(void)r;(void)d;}

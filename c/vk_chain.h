@@ -147,6 +147,18 @@ int  vkc_attn_flash_rows(void);   /* COLI_VK_CHAIN_FLASH: rows from which chain_
  * each ending its frame (submitted, not waited for) and the next in a new one: no single
  * submission of a big prompt chunk runs for seconds (a driver resets a job past its
  * timeout: amdgpu 10 s, Windows 2 s). The rows' arithmetic does not change. */
+/* The routed experts of a decode step on the device (qwen36_chain.h, every expert held
+ * by the tier): vkc_moe_route (chain_moe_route.comp) turns S rows of router logits into
+ * the chosen experts' grouped-GEMV entries (from the layer's tables mgu/mdn, [E][16]
+ * each), their weights and ids (ix at ix_off); vkc_moe_gemv runs qmatmul_grp_gemv.comp
+ * over nitems (expert, row, rpw outputs) items (gate_up: the SwiGLU, x rows through amap
+ * / kgat); vkc_moe_sum adds each row's K outputs in rank order (expert_sum.comp). */
+int  vkc_moe_ready(void);
+int  vkc_moe_route(VkcBuf *lg, VkcBuf *mgu, VkcBuf *mdn, VkcBuf *egu, VkcBuf *edn, VkcBuf *wt, VkcBuf *ix,
+                   int S, int E, int K, int ix_off);
+int  vkc_moe_gemv(int gate_up, VkcBuf *x, VkcBuf *items, VkcBuf *etab, VkcBuf *y, VkcBuf *amap, int nitems,
+                  int I, int O, float limit, int kgat, int rpw);
+int  vkc_moe_sum(VkcBuf *ys, VkcBuf *w, VkcBuf *use, VkcBuf *out, int S, int K, int D);
 /* chain_dnconv.comp */
 typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } VkcDnConv;
 int  vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, const VkcDnConv *p);

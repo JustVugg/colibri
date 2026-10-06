@@ -1,0 +1,65 @@
+#version 450
+// A decode step's MoE routing on the device (qwen36_chain.h, the whole token in one
+// submission while the expert tier holds every expert): per row, the softmax over the
+// router logits (max, then the sum of exp, as softmax_row), top-k by the CPU's rule
+// (highest probability first, the lowest expert index on ties), the weights renormalised
+// as the CPU does. Writes each chosen expert's grouped-GEMV entries (copied from the
+// layer's table of resident experts, row count 1, packed row t*K + k) for gate|up and
+// down, the weights, and the chosen ids for the host's bookkeeping after the step.
+// One subgroup of 64 lanes per row (required subgroup size 64), no barriers: each lane
+// holds E/64 probabilities in registers, reductions and the K rounds of top-k are
+// subgroup operations. E <= 1024 (a multiple of 64), K <= 16.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : enable
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer LG { float logit[]; };   // [S][E]
+layout(std430, binding = 1) readonly buffer MG { uint mgu[]; };      // [E][16] gate|up entries
+layout(std430, binding = 2) readonly buffer MD { uint mdn[]; };      // [E][16] down entries
+layout(std430, binding = 3) writeonly buffer EG { uint egu[]; };     // [S*K][16]
+layout(std430, binding = 4) writeonly buffer ED { uint edn[]; };     // [S*K][16]
+layout(std430, binding = 5) writeonly buffer WT { float wt[]; };     // [S*K]
+layout(std430, binding = 6) writeonly buffer IX { int ix[]; };       // [S*K] at ix_off
+layout(push_constant) uniform P { int E, K, ix_off; } p;
+#define PER 16u   // probabilities per lane: E <= 1024
+void main() {
+    uint lane = gl_SubgroupInvocationID, E = uint(p.E), t = gl_WorkGroupID.x, K = uint(p.K);
+    uint lo = t * E, so = t * K, per = E / 64u;
+    float v[PER];
+    float m = -3.0e38;
+    [[unroll]] for (uint q = 0u; q < PER; q++) {
+        v[q] = q < per ? logit[lo + q * 64u + lane] : -3.0e38;   // expert q*64 + lane
+        m = max(m, v[q]);
+    }
+    m = subgroupMax(m);
+    float sum = 0.0;
+    [[unroll]] for (uint q = 0u; q < PER; q++) if (q < per) { v[q] = exp(v[q] - m); sum += v[q]; }
+    float tot = subgroupAdd(sum);
+    [[unroll]] for (uint q = 0u; q < PER; q++) if (q < per) v[q] = v[q] / tot;
+    int pick[16]; float pval[16]; float sm = 0.0;
+    for (uint k = 0u; k < K; k++) {
+        float bv = -3.0e38; int bi = 1 << 30;
+        [[unroll]] for (uint q = 0u; q < PER; q++)
+            if (q < per && v[q] > bv) { bv = v[q]; bi = int(q * 64u + lane); }   // ascending q: the lowest index first
+        float gv = subgroupMax(bv);
+        int gi = subgroupMin(bv == gv ? bi : (1 << 30));
+        pick[k] = gi; pval[k] = gv; sm += gv;
+        if (uint(gi) % 64u == lane) v[uint(gi) / 64u] = -3.0e38;   // taken
+    }
+    if (lane < K) {
+        uint k = lane;
+        float pv = 0.0; int pk = 0;
+        for (uint j = 0u; j < K; j++) if (j == k) { pv = pval[j]; pk = pick[j]; }
+        wt[so + k] = sm > 0.0 ? pv / sm : pv;
+        ix[uint(p.ix_off) + so + k] = pk;
+    }
+    for (uint j = lane; j < K * 16u; j += 64u) {
+        uint k = j / 16u, f = j % 16u;
+        int pk = 0; for (uint i = 0u; i < K; i++) if (i == k) pk = pick[i];
+        uint e = uint(pk) * 16u + f;
+        uint vg = mgu[e], vd = mdn[e];
+        if (f == 8u) { vg = 1u; vd = 1u; }
+        if (f == 9u) { vg = so + k; vd = so + k; }
+        egu[(so + k) * 16u + f] = vg; edn[(so + k) * 16u + f] = vd;
+    }
+}

@@ -595,6 +595,19 @@ int vkt_plan(int *layers, int *eids, int max) {
         layers[k] = order[i] / E; eids[k] = order[i] % E; k++;
     }
     free(order);
+    /* With the chain's device MoE (COLI_VK_CHAIN_MOE=1, qwen36), when the primary device
+     * holds every expert, the ones without history come too: a step can then route on
+     * the device (vkt_all_resident) from the first token. Otherwise only history counts. */
+    const char *dm = getenv("COLI_VK_CHAIN_MOE");
+    int cold = 0;
+    if (dm && *dm == '1') for (int i = 0; i < L * E; i++) cold += T.s[i].state == VS_NONE;
+    if (cold && !T.d2 && T.dmax[0] - (T.dres[0] + T.dque[0]) >= cold && k + cold <= max)
+        for (int i = 0; i < L * E; i++) {
+            VSlot *v = &T.s[i];
+            if (v->state != VS_NONE) continue;
+            v->state = VS_QUEUED; v->dev = 0; T.queued++; T.dque[0]++;
+            layers[k] = i / E; eids[k] = i % E; k++;
+        }
     return k;
 }
 int vkt_put(int layer, int eid, const VktExpertSrc *src) {
@@ -1386,6 +1399,30 @@ int vkt_join_sum(const float **rows, const float *w, const float **sum) {
     }
     coli_vk_xb_step_end();
     return ok;
+}
+
+/* Every expert of every layer resident on the primary device and nothing on its way in
+ * or out: a caller may then route on the device and use the experts' entries for the
+ * whole step (no promotion can start, so no eviction either). */
+int vkt_all_resident(void) {
+    if (!T.on || T.inflight || T.d2) return 0;
+    return T.resident == T.c.layers * T.c.experts;
+}
+const void *vkt_expert(int layer, int eid) {
+    if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return NULL;
+    VSlot *v = slot(layer, eid);
+    return v->state == VS_RESIDENT && !v->dev ? v->ex : NULL;
+}
+/* The routings of a step that ran on the device, for the heat (the LFRU's counts). */
+void vkt_note_routed(int layer, const int *idx, int n) {
+    if (!T.on || layer < 0 || layer >= T.c.layers) return;
+    for (int i = 0; i < n; i++) {
+        if (idx[i] < 0 || idx[i] >= T.c.experts) continue;
+        VSlot *v = slot(layer, idx[i]);
+        if (v->heat < 0xFFFFFFFFu) v->heat++;
+        v->last = T.tick;
+        T.routed++; T.served++;
+    }
 }
 
 void vkt_begin_forward(void) { if (T.on) T.begin = 1; }
