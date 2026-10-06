@@ -43,7 +43,7 @@ layout(push_constant) uniform P {
     int lpr;            // lanes per row, a power of two
     int nr;             // rows a workgroup (1..4), 0 = one
 } p;
-layout(constant_id = 1) const int NRMAX = 4;   // rows a workgroup at most (1: a decode step's pipeline)
+layout(constant_id = 1) const int NRMAX = 4;   // rows a workgroup at most (the host: 4 for every call)
 layout(constant_id = 2) const int UNR = 1;     // 16-byte steps a lane loads before it decodes them
 #define XI(r, o) xs[(r) * nx4 + (o) * nq + q]
 
