@@ -190,6 +190,15 @@ int main(void) {
         std::vector<float> y = down(yb, (size_t)S * O + 3);
         ck(maxdiff(y.data() + 3, ref.data(), (size_t)S * O) < 1e-3, "equals the CPU GEMV");
         ck(T->begin() && T->matmul(t, xb, 7, yb, 3, 1) && T->submit(1) && maxdiff(down(yb, O + 3).data() + 3, ref.data(), O) < 1e-3, "and one row");
+        {   /* a width the warp GEMV does not take (not a multiple of 16): the block kernel */
+            const int I2 = 100; std::vector<int8_t> q2((size_t)I2 * O); for (auto &v : q2) v = (int8_t)(frand(&s) * 60);
+            std::vector<float> x2 = rnd(I2, 13), ref2(O);
+            for (int o = 0; o < O; o++) { float a = 0; for (int i = 0; i < I2; i++) a += x2[i] * q2[(size_t)o * I2 + i]; ref2[o] = a * sc[o]; }
+            ColiCudaTensor *t2 = NULL; CcBuf *x2b = up(x2);
+            ck(coli_cuda_tensor_upload(&t2, q2.data(), sc.data(), 1, I2, O, 0) && T->begin() && T->matmul(t2, x2b, 0, yb, 0, 1) && T->submit(1) &&
+               maxdiff(down(yb, O).data(), ref2.data(), O) < 1e-3, "int8 rows of a width the warp GEMV leaves to the block kernel");
+            coli_cuda_tensor_free(t2); T->free(x2b);
+        }
         std::vector<float> w = rnd((size_t)I * O, 11), ones(O, 1.f), ref0(O);
         for (int o = 0; o < O; o++) { float a = 0; for (int i = 0; i < I; i++) a += x[7 + i] * w[(size_t)o * I + i]; ref0[o] = a; }
         ColiCudaTensor *t0 = NULL;
@@ -201,16 +210,16 @@ int main(void) {
     {
         const int rows = 3, H = 4, hd = 32, D = 64;
         std::vector<float> x = rnd((size_t)rows * (H * hd + 8), 21, 2.f), w = rnd(D + hd, 22), ref = x;
-        CcBuf *xb = up(x), *wb = up(w), *yb = T->buf(x.size() * 4, CC_DEV);
+        CcBuf *xb = up(x), *wb = up(w), *yb = up(x);   /* y starts as x: the elements past D of a row stay */
         CcNorm p = {rows, D, 1, 0, H * hd + 8, D, 0, H * hd + 8, D, 0, 0, CC_NORM_ADD1, 1e-6f, 1.f};
         ref_norm(x.data(), w.data(), ref.data(), &p);
-        ck(T->begin() && T->norm(xb, wb, yb, &p) && T->submit(1) && maxdiff(down(yb, x.size()).data(), ref.data(), (size_t)rows * D) < 1e-5, "zero-centred rows");
+        ck(T->begin() && T->norm(xb, wb, yb, &p) && T->submit(1) && maxdiff(down(yb, x.size()).data(), ref.data(), x.size()) < 1e-5, "zero-centred rows");
         CcNorm ph = {rows * H, hd, H, 0, H * hd + 8, hd, 0, H * hd + 8, hd, D, 0, 0, 1e-6f, 1.f};
         std::vector<float> refh = x; ref_norm(x.data(), w.data(), refh.data(), &ph);
         ck(T->begin() && T->norm(xb, wb, xb, &ph) && T->submit(1) && maxdiff(down(xb, x.size()).data(), refh.data(), x.size()) < 1e-5, "heads at a stride, plain weight, in place");
         CcNorm pn = {rows, D, 1, 0, H * hd + 8, D, 0, H * hd + 8, D, 0, 0, CC_NORM_NOW | CC_NORM_L2, 1e-6f, 0.5f};
         std::vector<float> refn = refh; ref_norm(refh.data(), NULL, refn.data(), &pn);
-        ck(T->begin() && T->norm(xb, NULL, yb, &pn) && T->submit(1) && maxdiff(down(yb, x.size()).data(), refn.data(), (size_t)rows * D) < 1e-5, "L2, no weight, post scale");
+        ck(T->begin() && T->write(yb, 0, refh.data(), refh.size() * 4) && T->norm(xb, NULL, yb, &pn) && T->submit(1) && maxdiff(down(yb, x.size()).data(), refn.data(), x.size()) < 1e-5, "L2, no weight, post scale");
         T->free(xb); T->free(wb); T->free(yb);
     }
     printf("rope\n");

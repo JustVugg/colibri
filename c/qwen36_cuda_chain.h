@@ -70,8 +70,8 @@ typedef struct {
     CcBuf *x, *nrm, *tmp, *q, *k, *v, *ctx, *qkvz, *ab, *cv, *dny, *h2, *lg, *gs, *us, *hs, *ds, *sgd, *fin;
     CcBuf *h2d, *lgd, *kvd, *outd, *xd, *lfd, *routed, *cs;
     float *host_routed;
-    unsigned long long forwards, frames, fault_at;
-    double wait_ms, host_ms;
+    unsigned long long forwards, frames, fault_at, dec_n;   /* dec_n: one-row forwards (decode tokens) */
+    double wait_ms, host_ms, dec_wait_ms, dec_host_ms;      /* and their shares of the waits and the host's experts */
 } Q36CChain;
 
 static int g_cuda_chain = 0;     /* COLI_CUDA_CHAIN asked for it and the chain is up */
@@ -541,6 +541,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         return 0;
     }
     int snapped = 0;
+    double w0 = ch->wait_ms, h0 = ch->host_ms;
     for (int c0 = 0; c0 < S; c0 += rows) {
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
         int ns = m->snap_rows - c0 < n ? m->snap_rows - c0 : n;   /* the rows of this chunk a verify copies */
@@ -636,6 +637,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
     if (lf) fwrite(cc_ptr(ch->lfd), sizeof(float), (size_t)L * 3 * D, lf);
     ch->snap_valid = snapped;
     ch->forwards++;
+    if (S == 1) { ch->dec_n++; ch->dec_wait_ms += ch->wait_ms - w0; ch->dec_host_ms += ch->host_ms - h0; }
     return L;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     if (!cc_lost()) cc_finish();
@@ -648,6 +650,7 @@ static void q36cc_report(Model *m) {
     if (!ch || !ch->ok || !ch->forwards) return;
     CcStats st; cc_stats(&st);
     fprintf(stderr, "[chain] qwen36: %llu forwards, %llu frames (%llu ops, %llu matmuls), %.1f ms waiting for the device, "
-                    "%.1f ms of routed experts on the host, %.1f MiB on the device\n",
-            ch->forwards, st.frames, st.ops, st.matmuls, ch->wait_ms, ch->host_ms, st.dev_bytes / 1048576.0);
+                    "%.1f ms of routed experts on the host, %.1f MiB on the device; per decode token %.2f ms waiting, %.2f ms of experts (%llu tokens)\n",
+            ch->forwards, st.frames, st.ops, st.matmuls, ch->wait_ms, ch->host_ms, st.dev_bytes / 1048576.0,
+            ch->dec_n ? ch->dec_wait_ms / ch->dec_n : 0.0, ch->dec_n ? ch->dec_host_ms / ch->dec_n : 0.0, ch->dec_n);
 }
