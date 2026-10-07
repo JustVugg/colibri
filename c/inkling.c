@@ -241,6 +241,32 @@ static float g_topp = 0.f;
 #endif
 #if defined(__AVX2__)
 #include <immintrin.h>
+
+/* An empty register barrier keeps GCC/clang from contracting the explicit
+ * multiply and add.  GCC's decision otherwise changes with -mtune, and can
+ * differ between the four-row tile and its scalar remainder. */
+static inline __m128 matmul_h_mul_add_ps(__m128 acc, __m128 x, __m128 w) {
+    __m128 product = _mm_mul_ps(x, w);
+#if defined(__GNUC__) || defined(__clang__)
+    __asm__ volatile ("" : "+x" (product));
+#endif
+    return _mm_add_ps(acc, product);
+}
+static inline __m128 matmul_h_mul_add_ss(__m128 acc, __m128 x, __m128 w) {
+    __m128 product = _mm_mul_ss(x, w);
+#if defined(__GNUC__) || defined(__clang__)
+    __asm__ volatile ("" : "+x" (product));
+#endif
+    return _mm_add_ss(acc, product);
+}
+static inline float matmul_h_row(const float *x, const uint16_t *w, int I) {
+    __m128 acc = _mm_setzero_ps();
+    for (int i = 0; i < I; i++) {
+        union { uint32_t u; float f; } v = { (uint32_t)w[i] << 16 };
+        acc = matmul_h_mul_add_ss(acc, _mm_set_ss(x[i]), _mm_set_ss(v.f));
+    }
+    return _mm_cvtss_f32(acc);
+}
 #endif
 
 /* bf16-weight matmul: activations rounded to bf16 per row (matches the HF
@@ -312,7 +338,7 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
                 for (int i = 0; i < I; i++) {
                     union { uint32_t u; float f; } v = { (uint32_t)w[i] << 16 };
                     __m128 xv = _mm_set_ps(x3[i], x2[i], x1[i], x0[i]);
-                    acc = _mm_add_ps(acc, _mm_mul_ps(xv, _mm_set1_ps(v.f)));
+                    acc = matmul_h_mul_add_ps(acc, xv, _mm_set1_ps(v.f));
                 }
                 float a[4]; _mm_storeu_ps(a, acc);
                 y[(int64_t)(s+0)*O + o] = a[0]; y[(int64_t)(s+1)*O + o] = a[1];
@@ -320,12 +346,7 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
             }
             for (; s < S; s++) {
                 const float *xs = x + (int64_t)s * I;
-                float acc = 0.f;
-                for (int i = 0; i < I; i++) {
-                    union { uint32_t u; float f; } v = { (uint32_t)w[i] << 16 };
-                    acc += xs[i] * v.f;
-                }
-                y[(int64_t)s * O + o] = acc;
+                y[(int64_t)s * O + o] = matmul_h_row(xs, w, I);
             }
         }
         return;
@@ -336,12 +357,16 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
         const uint16_t *w = W + (int64_t)o * I;
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s * I;
+#if defined(__AVX2__)
+            y[(int64_t)s * O + o] = matmul_h_row(xs, w, I);
+#else
             float acc = 0.f;
             for (int i = 0; i < I; i++) {
                 union { uint32_t u; float f; } v = { (uint32_t)w[i] << 16 };
                 acc += xs[i] * v.f;
             }
             y[(int64_t)s * O + o] = acc;
+#endif
         }
     }
 }

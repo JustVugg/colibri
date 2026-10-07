@@ -53,12 +53,13 @@ static void compare_paths(const char *format,Model *m,Layer *l,int S,
           "%s scalar calls=%llu expected=%d",format,
           (unsigned long long)g_matmul_w_calls,S*ns*3);
 
-    const char *modes[]={NULL,"3"};
-    for(int z=0;z<2;z++){
+    const char *modes[]={NULL,"3","4","5"};
+    for(int z=0;z<4;z++){
         memcpy(out,seed,out_bytes);
         if(modes[z])setenv("INK_SHARED_BATCH",modes[z],1);else unsetenv("INK_SHARED_BATCH");
         g_matmul_w_calls=0;shared_experts_cpu(m,l,x,S,out,wgt,g,u,hh);
-        int chunks=modes[z]?(S+2)/3:1,expected=chunks*ns*3;
+        int batch=modes[z]?atoi(modes[z]):S;
+        int chunks=(S+batch-1)/batch,expected=chunks*ns*3;
         CHECK(!memcmp(out,scalar,out_bytes),"%s mode=%s is not scalar bit-exact",
               format,modes[z]?modes[z]:"default");
         CHECK(g_matmul_w_calls==(uint64_t)expected,
