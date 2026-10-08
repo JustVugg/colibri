@@ -136,6 +136,10 @@ rerun the same setup command.
 | `--no-verify` | skip the checksums of downloaded files |
 | `--json` | machine-readable result (implies `--yes` and a background start) |
 
+On a completed setup, explicit `--backend`, `--no-gpu`, `--host` and `--port`
+update the saved configuration for the same model. Options left out keep their
+saved values.
+
 ### How the engine build is chosen
 
 With `--backend auto` (the default):
