@@ -1755,7 +1755,8 @@ def cmd_setup(a, ui=None):
                 ui.say(f" {mark} {entry.id:<24} {entry.disk_gb:>7.0f} GB  {row['status']:<10} {row['reason']}")
         return 0
 
-    if cfg and not picking and config_ready(cfg):
+    overriding = bool(a.backend or a.no_gpu or a.host is not None or a.port is not None)
+    if cfg and not picking and not overriding and config_ready(cfg):
         if gpu_now_buildable(cfg):
             ui.say("The GPU packages are installed now: rebuilding the engine for the GPU.\n")
         else:
