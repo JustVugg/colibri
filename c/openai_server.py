@@ -4952,6 +4952,21 @@ def parse_load_fail(data):
     return found
 
 
+def _cluster_stats(fields):
+    """The summary a coordinator with CLUSTER_WORKERS appends to its STAT line, as
+    key=value after length_limited -- per emitted token, in the shape distributed-llama
+    prints per token: cluster_g_ms (the whole decode step), cluster_i_ms (local
+    inference), cluster_t_ms (time on the wire), cluster_tx_kb / cluster_rx_kb (bytes
+    each way). Absent without a cluster; a bare positional tail has no '=' and is
+    left alone."""
+    out = {}
+    for entry in fields[7:]:
+        key, sep, value = entry.partition("=")
+        if sep and key.startswith("cluster_"):
+            out[key] = float(value)
+    return out
+
+
 def read_engine_turn(stream, sentinel, on_bytes, caps=None):
     pending = b""
     while True:
@@ -4992,6 +5007,7 @@ def read_engine_turn(stream, sentinel, on_bytes, caps=None):
         "rss_gb": float(fields[4]),
         "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
         "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
+        **_cluster_stats(fields),
     }
 
 
@@ -5592,6 +5608,7 @@ class Engine:
             "rss_gb": float(fields[4]),
             "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
             "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
+            **_cluster_stats(fields),
         }
 
     def _fail_pending(self, error):
@@ -5851,7 +5868,7 @@ class Engine:
                     self.hits_seq += 1
                 elif kind == "PROF" and len(fields) >= 10:
                     # per-turn phase timings: where the engine spent this turn's wall time
-                    self.profile.append({
+                    turn = {
                         "wall_s": float(fields[1]),
                         "prompt_tokens": int(fields[2]),
                         "completion_tokens": int(fields[3]),
@@ -5861,7 +5878,13 @@ class Engine:
                         "attention_s": float(fields[7]),
                         "lm_head_s": float(fields[8]),
                         "forwards": int(fields[9]),
-                    })
+                    }
+                    if len(fields) >= 13:
+                        # CLUSTER_WORKERS: the coordinator's time on the wire, bytes each way
+                        turn["cluster_transfer_s"] = float(fields[10])
+                        turn["cluster_tx_bytes"] = int(fields[11])
+                        turn["cluster_rx_bytes"] = int(fields[12])
+                    self.profile.append(turn)
                     self.profile_seq += 1
                 elif kind == "TIERS" and len(fields) >= 6:
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),

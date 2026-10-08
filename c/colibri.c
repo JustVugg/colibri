@@ -165,10 +165,10 @@ static const float *g_pre_sh;
 /* routing precalcolata dalla GPU (Metal layer CB o device router CUDA, #431):
  * moe() la usa e salta la FASE A. NULL = router su CPU. */
 static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pre_keff;
+static int g_cluster_n;                           /* expert workers connected; 0 = no cluster (always 0 on Windows) */
 #if !defined(_WIN32)
 typedef struct { int fd; char host[128]; int port; } ClusterWorker;
 static ClusterWorker g_cluster_workers[16];
-static int g_cluster_n;
 #endif
 #ifdef __APPLE__
 #include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
@@ -961,6 +961,15 @@ static _Atomic int64_t g_prof_io;                /* bytes pread()/faulted from e
  * wait ~ service means the loads block the compute thread. */
 static _Atomic int64_t g_edisk_ns;
 static double edisk_s(void){ return atomic_load_explicit(&g_edisk_ns,memory_order_relaxed)*1e-9; }
+/* Cluster transfer: wall time the coordinator spent blocked in socket I/O inside
+ * cluster_moe_batch (sending a layer's routed batch-union, receiving the expert
+ * outputs) and the bytes it moved each way, headers included. Only the wire is
+ * in it -- cluster_item() and the weighted accumulate run outside the timed
+ * calls -- and only the coordinator's side: a worker's own cluster_io is not
+ * counted. Thread-seconds like g_edisk_ns; all zero when CLUSTER_WORKERS is
+ * unset, so every line that reports them is unchanged without a cluster. */
+static _Atomic int64_t g_cluster_ns, g_cluster_tx, g_cluster_rx;
+static double cluster_s(void){ return atomic_load_explicit(&g_cluster_ns,memory_order_relaxed)*1e-9; }
 /* DISK-CLASS (PROF=1): per-load cold/warm classification against the engine's own
  * recency state. Instrumentation only -- it never changes which fd serves a read (see
  * expert_classify() and its call site in expert_load_impl; the fd choice expression is
@@ -1033,9 +1042,13 @@ typedef struct {
     uint64_t hit_pin,hit_ecache;
     uint64_t dc_n[2], dc_direct_n[2]; int64_t dc_bytes[2], dc_ns[2]; /* DISK-CLASS */
     int64_t dc_wall_ns[2], dc_wall_all_ns;       /* busy-wall (per class + combined) */
+    double cluster; int64_t cluster_tx, cluster_rx;   /* cluster transfer: seconds, bytes each way */
 } ProfBase;
 static void prof_base(Model *m, ProfBase *b){
     b->edisk=edisk_s(); b->ewait=m->t_ewait; b->emm=m->t_emm;
+    b->cluster=cluster_s();
+    b->cluster_tx=atomic_load_explicit(&g_cluster_tx,memory_order_relaxed);
+    b->cluster_rx=atomic_load_explicit(&g_cluster_rx,memory_order_relaxed);
     b->ecpu=m->t_ecpu; b->egpu=m->t_egpu; b->route=m->t_route; b->p2p=m->t_p2p;
     b->attn=m->t_attn; b->head=m->t_head;
     b->io=atomic_load_explicit(&g_prof_io,memory_order_relaxed);
@@ -1050,6 +1063,23 @@ static void prof_base(Model *m, ProfBase *b){
         b->dc_direct_n[i]=atomic_load_explicit(&g_dc_direct_n[i],memory_order_relaxed);
     }
     dc_wall_read(b->dc_wall_ns,&b->dc_wall_all_ns);
+}
+/* Window deltas of the cluster counters since `b`: seconds on the wire, bytes out, bytes in. */
+static double cluster_window(const ProfBase *b, int64_t *tx, int64_t *rx){
+    *tx=atomic_load_explicit(&g_cluster_tx,memory_order_relaxed)-b->cluster_tx;
+    *rx=atomic_load_explicit(&g_cluster_rx,memory_order_relaxed)-b->cluster_rx;
+    return cluster_s()-b->cluster;
+}
+/* The cluster summary on a STAT line, per emitted token in the shape distributed-llama
+ * prints per token: G = the whole decode step, I = local inference (G - T), T = time on
+ * the wire, S/R = kB sent/received. Same window as the line's tokens_per_second. With
+ * KV_SLOTS>1 the window is the engine's, not the one request's (the hit% convention).
+ * Prints nothing without a cluster: STAT stays byte-identical. */
+static void cluster_stat_suffix(const ProfBase *b, double dt, int ntok){
+    if(!g_cluster_n) return;
+    int64_t tx,rx; double n=ntok>0?ntok:1, t=cluster_window(b,&tx,&rx)*1e3/n, g=dt*1e3/n;
+    printf(" cluster_g_ms=%.1f cluster_i_ms=%.1f cluster_t_ms=%.1f cluster_tx_kb=%.1f cluster_rx_kb=%.1f",
+           g, g>t?g-t:0.0, t, (double)tx/1e3/n, (double)rx/1e3/n);
 }
 
 static float *falloc(int64_t n){
@@ -3359,6 +3389,22 @@ static int cluster_u32(int fd, uint32_t *v, int write_mode){
     if(!write_mode) *v=ntohl(*v);
     return 0;
 }
+/* The coordinator's side of the wire, timed and counted (see g_cluster_ns): every
+ * byte cluster_moe_batch moves goes through these two and nothing else does, so
+ * the counters are exactly what crossed the socket, headers included. A failed
+ * transfer counts its wait but not its bytes (the caller exits on it anyway). */
+static void cluster_account(double t0, size_t n, int write_mode){
+    atomic_fetch_add_explicit(&g_cluster_ns,(int64_t)((now_s()-t0)*1e9),memory_order_relaxed);
+    atomic_fetch_add_explicit(write_mode?&g_cluster_tx:&g_cluster_rx,(int64_t)n,memory_order_relaxed);
+}
+static int cluster_xfer(int fd, void *buf, size_t n, int write_mode){
+    double t0=now_s(); int rc=cluster_io(fd,buf,n,write_mode);
+    cluster_account(t0,rc?0:n,write_mode); return rc;
+}
+static int cluster_xfer_u32(int fd, uint32_t *v, int write_mode){
+    double t0=now_s(); int rc=cluster_u32(fd,v,write_mode);
+    cluster_account(t0,rc?0:sizeof(*v),write_mode); return rc;
+}
 static int cluster_connect_one(const char *spec, ClusterWorker *out){
     char copy[256]; strncpy(copy,spec,sizeof(copy)-1); copy[sizeof(copy)-1]=0;
     char *colon=strrchr(copy,':'); if(!colon||colon==copy||!colon[1]) return -1;
@@ -3425,27 +3471,27 @@ static void cluster_moe_batch(Model *m,int layer,float *x,int S,float *out,
         }
         if(!n) continue;
         ClusterWorker *w=&g_cluster_workers[wi]; char magic[8]; uint32_t v;
-        if(cluster_io(w->fd,(void*)COLI_CLUSTER_MAGIC,8,1)) goto fail;
-        v=COLI_CLUSTER_VERSION; if(cluster_u32(w->fd,&v,1)) goto fail;
-        v=(uint32_t)layer; if(cluster_u32(w->fd,&v,1)) goto fail;
-        v=(uint32_t)D; if(cluster_u32(w->fd,&v,1)) goto fail;
-        v=(uint32_t)m->c.moe_inter; if(cluster_u32(w->fd,&v,1)) goto fail;
-        v=(uint32_t)n; if(cluster_u32(w->fd,&v,1)) goto fail;
+        if(cluster_xfer(w->fd,(void*)COLI_CLUSTER_MAGIC,8,1)) goto fail;
+        v=COLI_CLUSTER_VERSION; if(cluster_xfer_u32(w->fd,&v,1)) goto fail;
+        v=(uint32_t)layer; if(cluster_xfer_u32(w->fd,&v,1)) goto fail;
+        v=(uint32_t)D; if(cluster_xfer_u32(w->fd,&v,1)) goto fail;
+        v=(uint32_t)m->c.moe_inter; if(cluster_xfer_u32(w->fd,&v,1)) goto fail;
+        v=(uint32_t)n; if(cluster_xfer_u32(w->fd,&v,1)) goto fail;
         for(int j=0;j<n;j++){
-            v=(uint32_t)items[j].eid; if(cluster_u32(w->fd,&v,1)) goto fail;
-            v=(uint32_t)items[j].nr; if(cluster_u32(w->fd,&v,1)) goto fail;
-            if(cluster_io(w->fd,items[j].inputs,(size_t)items[j].nr*D*sizeof(float),1)) goto fail;
+            v=(uint32_t)items[j].eid; if(cluster_xfer_u32(w->fd,&v,1)) goto fail;
+            v=(uint32_t)items[j].nr; if(cluster_xfer_u32(w->fd,&v,1)) goto fail;
+            if(cluster_xfer(w->fd,items[j].inputs,(size_t)items[j].nr*D*sizeof(float),1)) goto fail;
         }
-        if(cluster_io(w->fd,magic,8,0)||memcmp(magic,COLI_CLUSTER_MAGIC,8)) goto fail;
-        if(cluster_u32(w->fd,&v,0)||v!=COLI_CLUSTER_VERSION) goto fail;
-        if(cluster_u32(w->fd,&v,0)||v!=0) goto fail;
-        if(cluster_u32(w->fd,&v,0)||v!=(uint32_t)n) goto fail;
+        if(cluster_xfer(w->fd,magic,8,0)||memcmp(magic,COLI_CLUSTER_MAGIC,8)) goto fail;
+        if(cluster_xfer_u32(w->fd,&v,0)||v!=COLI_CLUSTER_VERSION) goto fail;
+        if(cluster_xfer_u32(w->fd,&v,0)||v!=0) goto fail;
+        if(cluster_xfer_u32(w->fd,&v,0)||v!=(uint32_t)n) goto fail;
         for(int j=0;j<n;j++){
             uint32_t eid,nr;
-            if(cluster_u32(w->fd,&eid,0)||cluster_u32(w->fd,&nr,0) ||
+            if(cluster_xfer_u32(w->fd,&eid,0)||cluster_xfer_u32(w->fd,&nr,0) ||
                eid!=(uint32_t)items[j].eid || nr!=(uint32_t)items[j].nr) goto fail;
             float *y=falloc((int64_t)nr*D);
-            if(cluster_io(w->fd,y,(size_t)nr*D*sizeof(float),0)){ free(y); goto fail; }
+            if(cluster_xfer(w->fd,y,(size_t)nr*D*sizeof(float),0)){ free(y); goto fail; }
             for(uint32_t r=0;r<nr;r++){ float *dst=out+(int64_t)items[j].rows[r]*D;
                 float wt=items[j].weights[r]; for(int d=0;d<D;d++) dst[d]+=wt*y[(int64_t)r*D+d]; }
             free(y);
@@ -9332,6 +9378,9 @@ static void profile_reset(Model *m){
 #endif
     m->t_aproj=m->t_acore=m->t_aout=0;
     atomic_store_explicit(&g_edisk_ns,0,memory_order_relaxed);
+    atomic_store_explicit(&g_cluster_ns,0,memory_order_relaxed);
+    atomic_store_explicit(&g_cluster_tx,0,memory_order_relaxed);
+    atomic_store_explicit(&g_cluster_rx,0,memory_order_relaxed);
 }
 
 /* PROF=1 report: forward-latency percentiles, expert I/O totals, phase shares
@@ -9378,6 +9427,12 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
         g_mmap?"; COLI_MMAP=1: page cache may serve part":"",
         hitp,(unsigned long long)dhp,(unsigned long long)dhe,(unsigned long long)dm, tokens>0?(double)dq/tokens:0.0,
         io_svc,io_w);
+    if(g_cluster_n){                    /* coordinator: the wire's share of this window */
+        int64_t tx,rx; double cl=cluster_window(b,&tx,&rx);
+        fprintf(f,"[PROF] cluster: %.1fs on the wire (%.1f%% of wall, %.1f ms/token) | %.2f GB sent / %.2f GB received (%.1f / %.1f kB per token)\n",
+            cl,100.0*cl/elapsed,tokens>0?cl*1e3/tokens:0.0,(double)tx/1e9,(double)rx/1e9,
+            tokens>0?(double)tx/1e3/tokens:0.0,tokens>0?(double)rx/1e3/tokens:0.0);
+    }
     /* DISK-CLASS: per-load cold/warm classification vs. which fd ACTUALLY served it.
      * Three per-class rates, labeled to keep the units unambiguous (ambiguous units
      * mislead -- measured lesson): GB/s-thread = bytes / thread-seconds (per-read
@@ -10166,14 +10221,22 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
      * in a wall-time breakdown. With KV_SLOTS>1 concurrent slots share the
      * batched forwards, so the shares describe the whole engine over the
      * window, not the single request (same convention as the STAT hit% below). */
-    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n",dt,
+    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu",dt,
            r->prompt_tokens,r->emitted,
            edisk_s()-r->pb.edisk,m->t_ewait-r->pb.ewait,m->t_emm-r->pb.emm,
            m->t_attn-r->pb.attn,m->t_head-r->pb.head,
            (unsigned long long)(m->n_fw-r->pb.n_fw));
-    printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
+    /* With CLUSTER_WORKERS the line continues " <cluster_s> <tx_bytes> <rx_bytes>":
+     * the coordinator's time on the wire -- a wall-time phase, unlike edisk: the
+     * compute thread does nothing else while it waits -- and the bytes each way. */
+    if(g_cluster_n){ int64_t tx,rx; double cl=cluster_window(&r->pb,&tx,&rx);
+        printf(" %.3f %lld %lld",cl,(long long)tx,(long long)rx); }
+    printf("\n");
+    printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d",r->id,r->emitted,
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
            r->prompt_tokens,r->length_limited);
+    cluster_stat_suffix(&r->pb,dt,r->emitted);
+    printf("\n");
     fflush(stdout);
 #ifdef COLI_VULKAN
     vk_tier_turn(m);                                  /* the expert tier's line, on stderr */
@@ -10746,7 +10809,7 @@ static void run_serve(Model *m, const char *snap){
         uint64_t agh0=m->route_agree_hit, agt0=m->route_agree_tot;
         uint64_t kln0=m->route_kl_n; double kls0=m->route_kl_sum;
         double tt0=now_s();
-        ProfBase pb; if(g_prof) prof_base(m,&pb);
+        ProfBase pb; prof_base(m,&pb);   /* a few loads: cheap enough to always track (the cluster STAT suffix reads it) */
         float *logit;
         if(k>0){ logit=step(m,hist+len,k,len); len+=k; }
         else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
@@ -10771,6 +10834,7 @@ static void run_serve(Model *m, const char *snap){
                    " route_agree=%.1f route_kl=%.4f",
                 swap_pct,(unsigned long long)rswaps,(unsigned long long)rslots,
                 agree_pct,kl_mean);
+        cluster_stat_suffix(&pb,tdt,prod);
         printf("\n");
         fflush(stdout);
 #ifdef COLI_VULKAN

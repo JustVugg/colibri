@@ -2288,6 +2288,56 @@ class DispatcherTest(unittest.TestCase):
             "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15,
         }])
 
+    def test_records_cluster_transfer_from_the_prof_tail(self):
+        # CLUSTER_WORKERS set: PROF continues " <cluster_s> <tx_bytes> <rx_bytes>"
+        # after n_fw -- the coordinator's time on the wire and the bytes each way.
+        # The plain DONE line of the same turn carries no cluster_ keys.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+            process.stdout.feed(
+                b"PROF 2.500 7 12 0.400 0.100 0.900 0.600 0.200 15 0.350 1536000 2048000\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 12 4.8 0 1.0 7 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        stats = engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+        engine.close()
+        [turn] = engine.profile
+        self.assertEqual(turn["forwards"], 15)
+        self.assertEqual(turn["cluster_transfer_s"], 0.35)
+        self.assertEqual(turn["cluster_tx_bytes"], 1536000)
+        self.assertEqual(turn["cluster_rx_bytes"], 2048000)
+        self.assertEqual([k for k in stats if k.startswith("cluster_")], [])
+
+    def test_done_stat_cluster_suffix_lands_in_the_stats(self):
+        # The per-token G/I/T/S/R summary a clustered coordinator appends to STAT as
+        # key=value after length_limited; a bare positional tail (deepseek's 8th
+        # field) stays ignored, and the positional fields parse as before.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+            process.stdout.feed(
+                b"DONE " + request_id + b" STAT 12 4.8 0 1.0 7 0 17"
+                b" cluster_g_ms=208.3 cluster_i_ms=179.2 cluster_t_ms=29.1"
+                b" cluster_tx_kb=128.0 cluster_rx_kb=170.7\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        stats = engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+        engine.close()
+        self.assertEqual(stats["completion_tokens"], 12)
+        self.assertEqual(stats["prompt_tokens"], 7)
+        self.assertEqual(stats["length_limited"], False)
+        self.assertEqual(stats["cluster_g_ms"], 208.3)
+        self.assertEqual(stats["cluster_i_ms"], 179.2)
+        self.assertEqual(stats["cluster_t_ms"], 29.1)
+        self.assertEqual(stats["cluster_tx_kb"], 128.0)
+        self.assertEqual(stats["cluster_rx_kb"], 170.7)
+        self.assertNotIn("17", stats)
+
     def test_accepts_u7a_echo_and_extended_data_frames(self):
         # U7a forward-compat: the engine's opt-in per-token numeric channel --
         # ECHO frames for echoed prompt positions and DATA frames extended
