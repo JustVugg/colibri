@@ -2876,9 +2876,12 @@ extern "C" int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I,
  * (about 1.9 GB of rows on Qwen3.6-35B). The same sums as quant_matmul up to the
  * order of the float additions. */
 #define GEMV_I8_ROWS 8   /* warps, and output rows, per block */
+#define GEMV_I8_MAX_S 8  /* activation rows it takes, each on its own (blockIdx.y): a verify's
+                            rows get a decode step's bits, as the engines ask (q36_spec_step) */
 __global__ static void __launch_bounds__(256) gemv_i8_rows(float *__restrict__ y, const float *__restrict__ x,
         const int8_t *__restrict__ w, const float *__restrict__ sc, int I, int O) {
     extern __shared__ float xs[];
+    x += (size_t)blockIdx.y * I; y += (size_t)blockIdx.y * O;
     for (int i = threadIdx.x; i < I; i += 256) xs[i] = x[i];
     __syncthreads();
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -2906,8 +2909,8 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
     DeviceContext *ctx = find_ctx(t->device);
     if (!select_ctx(ctx)) return 0;
     cudaStream_t st = (cudaStream_t)stream;
-    if (t->fmt == 1 && S == 1 && t->I % 16 == 0 && t->I <= 12288) {
-        unsigned blocks = (unsigned)((t->O + GEMV_I8_ROWS - 1) / GEMV_I8_ROWS);
+    if (t->fmt == 1 && S <= GEMV_I8_MAX_S && t->I % 16 == 0 && t->I <= 12288) {
+        dim3 blocks((unsigned)((t->O + GEMV_I8_ROWS - 1) / GEMV_I8_ROWS), (unsigned)S);
         gemv_i8_rows<<<blocks, 256, (size_t)t->I * sizeof(float), st>>>(y_dev, x_dev, (const int8_t *)t->weights, t->scales, t->I, t->O);
         return cuda_ok(cudaGetLastError(), "chain gemv launch");
     }
