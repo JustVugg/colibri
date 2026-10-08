@@ -930,7 +930,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
         f = self.fixture
         self.assertEqual(len(f.mandatory), 47)
         self.assertEqual(len(f.optional), 16)  # +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step; +tensor_overwrite; +chain_ops (the dense chain's table)
-        self.assertEqual(len(f.exports), 62)
+        self.assertEqual(len(f.exports), 63)
         self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)
         self.assertIn("coli_cuda_e8_set_grid", f.optional)
