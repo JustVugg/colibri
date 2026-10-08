@@ -4238,7 +4238,9 @@ def validate_tools(body):
     iterate the list and parse_tool_calls reads each schema's `properties` and `required`, so
     this has to run before either: chat_completion() calls it ahead of rendering, and
     generation_options() calls it again for every other path."""
-    tools_raw = body.get("tools") or body.get("functions")
+    tools_raw = body.get("tools")
+    if tools_raw is None or (isinstance(tools_raw, list) and not tools_raw):
+        tools_raw = body.get("functions")
     if tools_raw is not None:
         if not isinstance(tools_raw, list):
             raise APIError(400, "`tools` must be a non-empty array.", "tools", "invalid_value")
