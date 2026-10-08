@@ -1,0 +1,24 @@
+The logit files, 248,320 float32 per vector, of Qwen3.6-35B-A3B in Colibri's qwen36 container (INT4 experts
+with gs=64 group scales).
+
+The last token of three prompts (prompt-<name>.txt), saved on 2026-10-05 with the CPU engine of dev 01f32c06
+(make -C c qwen36):
+
+  env -i PATH=/usr/bin:/bin HOME=$HOME SNAP=<model> N_NEW=1 Q36_EOS=-1 NOSTREAM=1 \
+    DUMP=logits-<name>.f32 ./qwen36 16 4 prompt-<name>.txt
+
+logits-it.f32  sha256 af3547606616d257425cf64e8983a7d431c4c710fb6b081d2832399414fea4e0  (prompt-it.txt)
+logits-en.f32  sha256 7348462380fc530ba698627104146bd4ab4c70867c510c4e0b8600f3f82840f9  (prompt-en.txt)
+logits-code.f32  sha256 925578145e5b2c0f90d7e1ec66526850267d2cc75a77658e19d4612c64ef20fc  (prompt-code.txt)
+
+Every token of three chat replies (chat-<name>.txt: one user message in Qwen3.6's chat template as the
+gateway renders it, thinking off, byte for byte, so each ends with the template's empty line; the replies in
+reply-<name>.txt), saved on 2026-10-08 by sample_gen.c built against this branch (0f4864a2) with the flags of
+make -C c qwen36, seeds 1, 2 and 3:
+
+  env -i PATH=/usr/bin:/bin HOME=$HOME SNAP=<model> /usr/bin/time -l ./sample_gen chat-<name>.txt 128 <seed> \
+    reply-<name>.f32 > reply-<name>.txt
+
+reply-it.f32  128 vectors  sha256 4c79cc064a9ab15ccb9fb1b526c54f4a72c630acd51853e394ff47d2ab5353a3  (chat-it.txt)
+reply-en.f32  128 vectors  sha256 24aca47603c3888120a470fda717c2690ad9b4e512d3d4c9b70de6c70e63ae10  (chat-en.txt)
+reply-code.f32  83 vectors  sha256 36d97cbeeadb13a5700e211f4ba1cc4a1a93a26c1e3ee8c72777052e2fd0cd07  (chat-code.txt)

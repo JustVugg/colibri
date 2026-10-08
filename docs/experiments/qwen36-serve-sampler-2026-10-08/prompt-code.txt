@@ -1,0 +1,4 @@
+def fibonacci(n):
+    """Return the n-th Fibonacci number."""
+    if n < 2:
+        return n

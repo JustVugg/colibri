@@ -1,0 +1,143 @@
+# this branch 0f4864a2: only the nucleus buckets sorted
+
+sample_bench (sample_bench.c) on the logit files of logits.txt, run from their directory: PICKS=<run>.picks ./sample_bench logits-it.f32 logits-en.f32 logits-code.f32 -- reply-it.f32 reply-en.f32 reply-code.f32 (PICKS= also writes every drawn token, for picks.c). Before every run: thermal state nominal, then 60 s.
+
+## warmup-pr (warm-up, discarded)
+### before the run
+2026-10-08 01:47:34
+thermal state 0, waited 0s for state 0, then 60 s
+chrome=0
+
+### output
+logits-it.f32 temperature 0.70 top_p 0.90: median 1.178 ms a call (min 1.094, max 3.734), 100 calls
+logits-it.f32 temperature 0.60 top_p 0.95: median 1.070 ms a call (min 1.064, max 1.120), 100 calls
+logits-it.f32 temperature 1.00 top_p 1.00: median 24.513 ms a call (min 24.436, max 24.998), 100 calls
+logits-it.f32 temperature 1.50 top_p 0.95: median 1.310 ms a call (min 1.306, max 1.356), 100 calls
+logits-it.f32 temperature 2.00 top_p 0.90: median 20.166 ms a call (min 20.072, max 20.598), 100 calls
+logits-en.f32 temperature 0.70 top_p 0.90: median 1.108 ms a call (min 1.099, max 1.235), 100 calls
+logits-en.f32 temperature 0.60 top_p 0.95: median 1.075 ms a call (min 1.070, max 1.123), 100 calls
+logits-en.f32 temperature 1.00 top_p 1.00: median 24.614 ms a call (min 24.527, max 25.062), 100 calls
+logits-en.f32 temperature 1.50 top_p 0.95: median 1.420 ms a call (min 1.412, max 1.457), 100 calls
+logits-en.f32 temperature 2.00 top_p 0.90: median 20.370 ms a call (min 20.274, max 20.824), 100 calls
+logits-code.f32 temperature 0.70 top_p 0.90: median 1.132 ms a call (min 1.126, max 1.184), 100 calls
+logits-code.f32 temperature 0.60 top_p 0.95: median 1.100 ms a call (min 1.093, max 1.233), 100 calls
+logits-code.f32 temperature 1.00 top_p 1.00: median 24.653 ms a call (min 24.523, max 27.765), 100 calls
+logits-code.f32 temperature 1.50 top_p 0.95: median 1.338 ms a call (min 1.312, max 1.381), 100 calls
+logits-code.f32 temperature 2.00 top_p 0.90: median 22.668 ms a call (min 22.558, max 23.060), 100 calls
+reply-it.f32 temperature 0.70 top_p 0.90: 128 tokens, a token mean 1.108 ms, median 1.107, 90th percentile 1.118, largest 1.155 (each the median of 5 calls)
+reply-en.f32 temperature 0.70 top_p 0.90: 128 tokens, a token mean 1.119 ms, median 1.114, 90th percentile 1.151, largest 1.198 (each the median of 5 calls)
+reply-code.f32 temperature 0.70 top_p 0.90: 83 tokens, a token mean 1.123 ms, median 1.122, 90th percentile 1.145, largest 1.160 (each the median of 5 calls)
+every reply token at the gateway default: 339 tokens in 0.378 s = 896.36 draws per second
+checksum of every drawn token: 1efec896cbb4e686
+
+## pr-run1
+### before the run
+2026-10-08 01:51:07
+thermal state 0, waited 0s for state 0, then 60 s
+chrome=0
+
+### output
+logits-it.f32 temperature 0.70 top_p 0.90: median 1.097 ms a call (min 1.090, max 1.239), 100 calls
+logits-it.f32 temperature 0.60 top_p 0.95: median 1.070 ms a call (min 1.063, max 1.095), 100 calls
+logits-it.f32 temperature 1.00 top_p 1.00: median 24.468 ms a call (min 24.376, max 24.966), 100 calls
+logits-it.f32 temperature 1.50 top_p 0.95: median 1.312 ms a call (min 1.304, max 1.389), 100 calls
+logits-it.f32 temperature 2.00 top_p 0.90: median 20.106 ms a call (min 20.006, max 20.464), 100 calls
+logits-en.f32 temperature 0.70 top_p 0.90: median 1.106 ms a call (min 1.100, max 1.134), 100 calls
+logits-en.f32 temperature 0.60 top_p 0.95: median 1.078 ms a call (min 1.073, max 1.113), 100 calls
+logits-en.f32 temperature 1.00 top_p 1.00: median 24.596 ms a call (min 24.505, max 25.075), 100 calls
+logits-en.f32 temperature 1.50 top_p 0.95: median 1.417 ms a call (min 1.410, max 1.506), 100 calls
+logits-en.f32 temperature 2.00 top_p 0.90: median 20.336 ms a call (min 20.253, max 20.676), 100 calls
+logits-code.f32 temperature 0.70 top_p 0.90: median 1.131 ms a call (min 1.127, max 1.164), 100 calls
+logits-code.f32 temperature 0.60 top_p 0.95: median 1.098 ms a call (min 1.091, max 1.150), 100 calls
+logits-code.f32 temperature 1.00 top_p 1.00: median 24.599 ms a call (min 24.491, max 25.005), 100 calls
+logits-code.f32 temperature 1.50 top_p 0.95: median 1.315 ms a call (min 1.309, max 1.363), 100 calls
+logits-code.f32 temperature 2.00 top_p 0.90: median 22.626 ms a call (min 22.513, max 23.069), 100 calls
+reply-it.f32 temperature 0.70 top_p 0.90: 128 tokens, a token mean 1.106 ms, median 1.106, 90th percentile 1.119, largest 1.136 (each the median of 5 calls)
+reply-en.f32 temperature 0.70 top_p 0.90: 128 tokens, a token mean 1.110 ms, median 1.105, 90th percentile 1.143, largest 1.199 (each the median of 5 calls)
+reply-code.f32 temperature 0.70 top_p 0.90: 83 tokens, a token mean 1.103 ms, median 1.103, 90th percentile 1.122, largest 1.141 (each the median of 5 calls)
+every reply token at the gateway default: 339 tokens in 0.375 s = 903.69 draws per second
+checksum of every drawn token: 1efec896cbb4e686
+
+## pr-run2
+### before the run
+2026-10-08 01:52:24
+thermal state 0, waited 0s for state 0, then 60 s
+chrome=0
+
+### output
+logits-it.f32 temperature 0.70 top_p 0.90: median 1.098 ms a call (min 1.091, max 1.220), 100 calls
+logits-it.f32 temperature 0.60 top_p 0.95: median 1.070 ms a call (min 1.063, max 1.144), 100 calls
+logits-it.f32 temperature 1.00 top_p 1.00: median 24.516 ms a call (min 24.384, max 25.185), 100 calls
+logits-it.f32 temperature 1.50 top_p 0.95: median 1.321 ms a call (min 1.315, max 1.485), 100 calls
+logits-it.f32 temperature 2.00 top_p 0.90: median 20.133 ms a call (min 20.060, max 20.543), 100 calls
+logits-en.f32 temperature 0.70 top_p 0.90: median 1.107 ms a call (min 1.102, max 1.142), 100 calls
+logits-en.f32 temperature 0.60 top_p 0.95: median 1.076 ms a call (min 1.070, max 1.110), 100 calls
+logits-en.f32 temperature 1.00 top_p 1.00: median 24.604 ms a call (min 24.456, max 25.094), 100 calls
+logits-en.f32 temperature 1.50 top_p 0.95: median 1.418 ms a call (min 1.411, max 1.501), 100 calls
+logits-en.f32 temperature 2.00 top_p 0.90: median 20.361 ms a call (min 20.277, max 20.722), 100 calls
+logits-code.f32 temperature 0.70 top_p 0.90: median 1.133 ms a call (min 1.127, max 1.293), 100 calls
+logits-code.f32 temperature 0.60 top_p 0.95: median 1.097 ms a call (min 1.091, max 1.130), 100 calls
+logits-code.f32 temperature 1.00 top_p 1.00: median 24.614 ms a call (min 24.497, max 24.971), 100 calls
+logits-code.f32 temperature 1.50 top_p 0.95: median 1.316 ms a call (min 1.310, max 1.366), 100 calls
+logits-code.f32 temperature 2.00 top_p 0.90: median 22.614 ms a call (min 22.516, max 23.340), 100 calls
+reply-it.f32 temperature 0.70 top_p 0.90: 128 tokens, a token mean 1.098 ms, median 1.098, 90th percentile 1.113, largest 1.136 (each the median of 5 calls)
+reply-en.f32 temperature 0.70 top_p 0.90: 128 tokens, a token mean 1.114 ms, median 1.110, 90th percentile 1.141, largest 1.199 (each the median of 5 calls)
+reply-code.f32 temperature 0.70 top_p 0.90: 83 tokens, a token mean 1.118 ms, median 1.119, 90th percentile 1.142, largest 1.162 (each the median of 5 calls)
+every reply token at the gateway default: 339 tokens in 0.376 s = 901.76 draws per second
+checksum of every drawn token: 1efec896cbb4e686
+
+## pr-run3
+### before the run
+2026-10-08 01:58:12
+thermal state 0, waited 0s for state 0, then 60 s
+chrome=0
+
+### output
+logits-it.f32 temperature 0.70 top_p 0.90: median 1.096 ms a call (min 1.090, max 1.204), 100 calls
+logits-it.f32 temperature 0.60 top_p 0.95: median 1.070 ms a call (min 1.064, max 1.099), 100 calls
+logits-it.f32 temperature 1.00 top_p 1.00: median 24.506 ms a call (min 24.411, max 24.969), 100 calls
+logits-it.f32 temperature 1.50 top_p 0.95: median 1.320 ms a call (min 1.314, max 1.379), 100 calls
+logits-it.f32 temperature 2.00 top_p 0.90: median 20.125 ms a call (min 20.060, max 20.511), 100 calls
+logits-en.f32 temperature 0.70 top_p 0.90: median 1.105 ms a call (min 1.100, max 1.144), 100 calls
+logits-en.f32 temperature 0.60 top_p 0.95: median 1.076 ms a call (min 1.070, max 1.114), 100 calls
+logits-en.f32 temperature 1.00 top_p 1.00: median 24.579 ms a call (min 24.479, max 24.987), 100 calls
+logits-en.f32 temperature 1.50 top_p 0.95: median 1.415 ms a call (min 1.407, max 1.533), 100 calls
+logits-en.f32 temperature 2.00 top_p 0.90: median 20.362 ms a call (min 20.269, max 20.775), 100 calls
+logits-code.f32 temperature 0.70 top_p 0.90: median 1.131 ms a call (min 1.125, max 1.172), 100 calls
+logits-code.f32 temperature 0.60 top_p 0.95: median 1.100 ms a call (min 1.093, max 1.140), 100 calls
+logits-code.f32 temperature 1.00 top_p 1.00: median 24.652 ms a call (min 24.538, max 25.056), 100 calls
+logits-code.f32 temperature 1.50 top_p 0.95: median 1.314 ms a call (min 1.308, max 1.375), 100 calls
+logits-code.f32 temperature 2.00 top_p 0.90: median 22.641 ms a call (min 22.555, max 23.257), 100 calls
+reply-it.f32 temperature 0.70 top_p 0.90: 128 tokens, a token mean 1.097 ms, median 1.096, 90th percentile 1.112, largest 1.145 (each the median of 5 calls)
+reply-en.f32 temperature 0.70 top_p 0.90: 128 tokens, a token mean 1.102 ms, median 1.098, 90th percentile 1.134, largest 1.176 (each the median of 5 calls)
+reply-code.f32 temperature 0.70 top_p 0.90: 83 tokens, a token mean 1.103 ms, median 1.102, 90th percentile 1.125, largest 1.180 (each the median of 5 calls)
+every reply token at the gateway default: 339 tokens in 0.373 s = 908.91 draws per second
+checksum of every drawn token: 1efec896cbb4e686
+
+## pr-run4
+### before the run
+2026-10-08 01:59:29
+thermal state 0, waited 0s for state 0, then 60 s
+chrome=0
+
+### output
+logits-it.f32 temperature 0.70 top_p 0.90: median 1.099 ms a call (min 1.092, max 1.232), 100 calls
+logits-it.f32 temperature 0.60 top_p 0.95: median 1.070 ms a call (min 1.065, max 1.109), 100 calls
+logits-it.f32 temperature 1.00 top_p 1.00: median 24.474 ms a call (min 24.380, max 24.815), 100 calls
+logits-it.f32 temperature 1.50 top_p 0.95: median 1.319 ms a call (min 1.314, max 1.403), 100 calls
+logits-it.f32 temperature 2.00 top_p 0.90: median 20.143 ms a call (min 20.089, max 20.647), 100 calls
+logits-en.f32 temperature 0.70 top_p 0.90: median 1.106 ms a call (min 1.100, max 1.242), 100 calls
+logits-en.f32 temperature 0.60 top_p 0.95: median 1.076 ms a call (min 1.071, max 1.103), 100 calls
+logits-en.f32 temperature 1.00 top_p 1.00: median 24.553 ms a call (min 24.469, max 24.989), 100 calls
+logits-en.f32 temperature 1.50 top_p 0.95: median 1.412 ms a call (min 1.407, max 1.493), 100 calls
+logits-en.f32 temperature 2.00 top_p 0.90: median 20.328 ms a call (min 20.244, max 20.794), 100 calls
+logits-code.f32 temperature 0.70 top_p 0.90: median 1.131 ms a call (min 1.125, max 1.162), 100 calls
+logits-code.f32 temperature 0.60 top_p 0.95: median 1.098 ms a call (min 1.092, max 1.135), 100 calls
+logits-code.f32 temperature 1.00 top_p 1.00: median 24.546 ms a call (min 24.477, max 24.942), 100 calls
+logits-code.f32 temperature 1.50 top_p 0.95: median 1.314 ms a call (min 1.310, max 1.365), 100 calls
+logits-code.f32 temperature 2.00 top_p 0.90: median 22.596 ms a call (min 22.532, max 23.078), 100 calls
+reply-it.f32 temperature 0.70 top_p 0.90: 128 tokens, a token mean 1.088 ms, median 1.087, 90th percentile 1.100, largest 1.150 (each the median of 5 calls)
+reply-en.f32 temperature 0.70 top_p 0.90: 128 tokens, a token mean 1.100 ms, median 1.097, 90th percentile 1.126, largest 1.174 (each the median of 5 calls)
+reply-code.f32 temperature 0.70 top_p 0.90: 83 tokens, a token mean 1.102 ms, median 1.102, 90th percentile 1.124, largest 1.140 (each the median of 5 calls)
+every reply token at the gateway default: 339 tokens in 0.372 s = 912.39 draws per second
+checksum of every drawn token: 1efec896cbb4e686
