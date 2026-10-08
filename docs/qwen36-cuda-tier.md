@@ -303,6 +303,100 @@ cards would keep the MoE gain without that price. Cold, two cards win either
 way (45.3 against 52.3 ms), since more experts are resident at once. For the
 record, Ollama 0.34.4 on the same pair shows the same shape: 38.1 tok/s on the
 3070 alone, 36.6-37.5 on both cards, 33.0 on the Quadro alone.
+## The dense chain on the card (`COLI_CUDA_CHAIN=1`)
+
+With the trunk in VRAM and `Q36_DN_GPU=1`, a decode token still crossed the bus about
+seventy times: every attention projection (`qt_dense_matmul`: the input up, the kernel,
+the output down, a synchronization), every DeltaNet step, lm_head, and between them the
+CPU ran the attention core, the norms, the router and the shared expert. The Vulkan
+backend solved the same problem with its dense chain (`vk_chain.h`, docs/vulkan.md "The
+dense chain"): a whole layer recorded as one submission, the residual stream on the
+device from layer to layer, only the routed experts' rows crossing. `COLI_CUDA_CHAIN=1`
+is the CUDA twin, and it is shaped like the Vulkan one on purpose, so the engine wires
+both the same way:
+
+- `c/cuda_chain.h` / `c/cuda_chain.cu` (the backend): buffers (`CC_DEV` on the device,
+  `CC_UP` and `CC_DOWN` page-locked host memory the device reads or writes in place),
+  frames (`cc_begin` / `cc_submit(wait)` on one non-blocking stream per device, an event
+  per frame), and the ops `cc_matmul` (the backend's own GEMV / GEMM kernel over the
+  tier's resident tensors, on the chain's stream), `cc_norm`, `cc_rope`, `cc_attn`,
+  `cc_dnconv`, `cc_dnrec`, `cc_ew`, each the arithmetic of the shader of the same name
+  in `shaders/chain_*.comp`, ported line for line, with the Vkc parameter structs field
+  for field. The backend exports them as one table (`coli_cuda_chain_ops`), one symbol
+  for the Windows loader, versioned by its size: a DLL that predates the chain has none
+  and the engine stays on the per-matrix path.
+- `c/qwen36_cuda_chain.h` (the engine): `qwen36_chain.h`'s frames and state contract.
+  Per layer, frame A1: the previous layer's MoE output joins the residual (routed in
+  rank order, then the gated shared expert, then the add: the CPU's order), the input
+  norm, the gated attention (q/k/v, q/k norms, RoPE from the CPU's own cos/sin table,
+  the new K/V rows into the device cache and down to the host's, the attention with the
+  output gate, o_proj) or the Gated DeltaNet (the tier's fused qkv ++ z projection, b|a,
+  the convolution with its ring, the recurrence with its state, the gated norm,
+  out_proj), the residual add, the post-attention norm, the router logits; waited for.
+  The host routes, runs the routed experts through the tier (`moe_ex` routed only) and
+  hands the sum up. Frame A2, not waited for: the shared expert and its gate, on the
+  chain's stream while the tier's groups run on the backend's. The last frame runs the
+  final norm and lm_head on the last row, or on every row of a speculative verify.
+
+**What it needs.** Every projection of every layer, the shared expert's three matrices
+and lm_head on one card: `COLI_CUDA_CHAIN=1` offers the shared expert to the placer
+(what `Q36_OFFER_SHEXP=1` does) and `COLI_PLACE=auto` takes the whole 35B trunk on an
+8 GB card. The chain uploads itself the router's matrix, the DeltaNet b|a rows and the
+shared expert's gate row, and the parameter arena. It declines, naming the first matrix
+on the CPU, when the placement left anything behind, and under a qpack container, PILOT
+prefetch (which reads the residual on the host) or `KV_SLOTS` > 1 (one state per
+conversation on the host). `Q36_DN_GPU`'s per-layer step is not set up beside it: the
+chain owns the DeltaNet state.
+
+**State, and who owns it.** The residual stream lives on the device for a forward. The
+host's KV cache stays canonical: every step copies its new rows back, the device holds
+a mirror per attention layer with a watermark (`kv_valid`), a step from `pos_base`
+uploads the rows between the watermark and `pos_base` first, a CPU step lowers the
+watermark, a cache that grows is mirrored again. The DeltaNet state and conv rings stay
+on the device while the chain runs: the host copy is brought back before anything reads
+it there (a pinned snapshot, a CPU step: `q36cc_sync_host`) and pushed up after anything
+writes it there (a reset: zeros filled on the device; a restored snapshot: an upload). A
+speculative verify copies the state after each of its rows but the last into a device
+slot, the convolution and the recurrence split into one dispatch per copy (the same bits),
+and a rejected draft swaps slot r's buffers in (`q36cc_rollback`) as the CPU swaps its own.
+A CUDA error inside a frame loses the device to the chain: the engine zeroes the
+recurrent state, rebuilds it on the CPU from the prefix record (a prefill's worth of CPU
+work; the KV rows are the host's already) and runs on the CPU from there, as the Vulkan
+chain does. `COLI_CUDA_CHAIN_FAULT=n` fakes the loss at the n-th frame.
+
+**Tests.** `tests/test_qwen36_cuda_chain.c` drives an in-memory two-layer model (a
+DeltaNet layer, a gated-attention layer, four routed experts and a gated shared expert
+per layer, lm_head) through `step_ex` on the fake CUDA tier, the chain's ops answered by
+the fake's host-side table (`tests/qwen36_fake_cuda.h`, the same arithmetic as the
+kernels): a prompt and decode tokens give the CPU path's logits (max diff 2e-5 of 20),
+the host state is untouched while the chain runs and reads back as the CPU path's, the
+K/V rows reach the host cache, a reset and a CPU step in between continue from the right
+state, a verify's three rows and the rollback of a rejected draft, a frame that fails
+(the state rebuilt, the step and the rest on the CPU, the same logits), and a backend
+without the table. `tests/test_cuda_chain.cu` (`make cuda-chain-check CUDA=1`, needs a
+device; `gpu-compile` builds it) checks every op on a real card against the same CPU
+references: buffers and frames, int8 and f32 matmuls at offsets, the four norms, RoPE,
+causal GQA with the gate and a selection list, the convolution in both orders with its
+ring and snapshot, the recurrence at KD 8 and 128 with both gates, every element-wise
+op, and a failed launch marking the device lost.
+
+**Measured** (RTX 3070 alone, Qwen3.6-35B-A3B int4, the trunk in VRAM by `COLI_PLACE=auto`,
+expert tier at 81-82 % hits, the usual 49-token prompt, 200 new tokens, two runs each):
+
+| | TTFT | tok/s, the run | ms per decode token | decode tok/s | device wait per token |
+|---|---|---|---|---|---|
+| `Q36_DN_GPU=1` (the per-layer step) | 1.22-1.26 s | 26.2-27.6 | 30-32 | 32-33 | |
+| `COLI_CUDA_CHAIN=1` | 0.98 s | 42.7-42.8 | 18.7 | 53 | 5.7 ms |
+| Ollama 0.34.4 on the same card | | | 26.2 | 38.1 | |
+
+The chain alone, with the backend's block GEMV, gave 27.6 ms a token: the CPU's parts
+went (the attention core 3.9 ms, the shared expert 4.1 ms, about seventy bus round trips)
+and the token was the device's time, 14.7 ms, which was the trunk's 1.9 GB of int8 rows
+read at 120 GB/s. `gemv_i8_rows` (backend_cuda.cu: a warp per output row, 16 bytes a
+lane, the activation in shared memory) reads them at 330-418 GB/s, and the device's part
+of a token is 5.7 ms. What is left is the routed experts on the host (9.9 ms: the tier's
+groups and the CPU's share) and the routing, launches and forty waits (about 3 ms).
+
 ## The residents follow the prompt (`QT_PREFILL_REPLAN=1`)
 
 The warmstart fills VRAM from the heat file, i.e. from what earlier prompts

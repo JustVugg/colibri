@@ -2861,6 +2861,67 @@ extern "C" size_t coli_cuda_tensor_vram(const ColiCudaTensor *tensor) {
 extern "C" int coli_cuda_tensor_device(const ColiCudaTensor *tensor) {
     return tensor ? tensor->device : -1;
 }
+extern "C" int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I, int *O) {
+    if (!t) return 0;
+    if (fmt) *fmt = t->fmt;
+    if (I) *I = t->I;
+    if (O) *O = t->O;
+    return 1;
+}
+/* A decode GEMV for int8 rows (fmt 1, one activation row): a warp per output row,
+ * each lane 16 bytes of the row per step (I a multiple of 16), the activation in
+ * shared memory, a shuffle reduction, the row's scale. quant_matmul above spends a
+ * block of 256 threads on one row and reaches a quarter of the bus; this reads the
+ * trunk at the bus's pace, which is what the dense chain's decode token is made of
+ * (about 1.9 GB of rows on Qwen3.6-35B). The same sums as quant_matmul up to the
+ * order of the float additions. */
+#define GEMV_I8_ROWS 8   /* warps, and output rows, per block */
+#define GEMV_I8_MAX_S 8  /* activation rows it takes, each on its own (blockIdx.y): a verify's
+                            rows get a decode step's bits, as the engines ask (q36_spec_step) */
+__global__ static void __launch_bounds__(256) gemv_i8_rows(float *__restrict__ y, const float *__restrict__ x,
+        const int8_t *__restrict__ w, const float *__restrict__ sc, int I, int O) {
+    extern __shared__ float xs[];
+    x += (size_t)blockIdx.y * I; y += (size_t)blockIdx.y * O;
+    for (int i = threadIdx.x; i < I; i += 256) xs[i] = x[i];
+    __syncthreads();
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int o = blockIdx.x * GEMV_I8_ROWS + warp;
+    if (o >= O) return;
+    const int8_t *row = w + (size_t)o * I;
+    float acc = 0.f;
+    for (int i0 = lane * 16; i0 < I; i0 += 32 * 16) {
+        int4 v = *reinterpret_cast<const int4 *>(row + i0);
+        const int8_t *b = reinterpret_cast<const int8_t *>(&v);
+        const float *xv = xs + i0;
+        #pragma unroll
+        for (int k = 0; k < 16; k++) acc += xv[k] * (float)b[k];
+    }
+    for (int off = 16; off > 0; off >>= 1) acc += f8_shfl_down(acc, off);
+    if (lane == 0) y[o] = acc * sc[o];
+}
+
+/* The dense chain's matmul (cuda_chain.cu): the resident tensor's kernel on the
+ * chain's own stream, device pointers in and out, nothing synchronized here. */
+extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream) {
+    if (fault_injected()) return 0;
+    if (!t || !y_dev || !x_dev || S < 1) return 0;
+    if (t->fmt == 4 && t->gs <= 0) return 0;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (!select_ctx(ctx)) return 0;
+    cudaStream_t st = (cudaStream_t)stream;
+    if (t->fmt == 1 && S <= GEMV_I8_MAX_S && t->I % 16 == 0 && t->I <= 12288) {
+        dim3 blocks((unsigned)((t->O + GEMV_I8_ROWS - 1) / GEMV_I8_ROWS), (unsigned)S);
+        gemv_i8_rows<<<blocks, 256, (size_t)t->I * sizeof(float), st>>>(y_dev, x_dev, (const int8_t *)t->weights, t->scales, t->I, t->O);
+        return cuda_ok(cudaGetLastError(), "chain gemv launch");
+    }
+    dim3 grid((unsigned)t->O, (unsigned)S);
+    if (t->fmt == 8 && f8_warp_mode())
+        quant_matmul_f8w<<<grid, 256, 0, st>>>(y_dev, x_dev, t->weights, t->scales, S, t->I, t->O);
+    else
+        quant_matmul<<<grid, 256, 0, st>>>(y_dev, x_dev, t->weights, t->scales, t->fmt, S, t->I, t->O,
+                                            row_bytes(t->fmt, t->I), t->gs, t->ng);
+    return cuda_ok(cudaGetLastError(), "chain gemm launch");
+}
 
 /* ==== resident-pipeline primitives (Inc.0, 2026-07-13) ====
  * Device-side building blocks so the residual stream can stay on the layer's

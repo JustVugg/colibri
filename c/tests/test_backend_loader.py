@@ -918,7 +918,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
             cls.fixture = None
 
     def test_abi_is_derived_from_the_loader_source(self):
-        """47 mandatory + 15 optional, parsed from backend_loader.c.
+        """47 mandatory + 16 optional, parsed from backend_loader.c.
 
         The counts are a deliberate tripwire: adding a RESOLVE to the loader
         widens the ABI every Windows DLL must satisfy, and that should be a
@@ -929,8 +929,8 @@ class LoaderStubFixtureTest(unittest.TestCase):
         """
         f = self.fixture
         self.assertEqual(len(f.mandatory), 47)
-        self.assertEqual(len(f.optional), 15)  # +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step; +tensor_overwrite
-        self.assertEqual(len(f.exports), 62)
+        self.assertEqual(len(f.optional), 16)  # +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step; +tensor_overwrite; +chain_ops (the dense chain's table)
+        self.assertEqual(len(f.exports), 63)
         self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)
         self.assertIn("coli_cuda_e8_set_grid", f.optional)
