@@ -2646,7 +2646,7 @@ tests/test_qwen36_dn_gpu$(EXE): tests/test_qwen36_dn_gpu.c qwen36.c qwen36_tier.
 
 # The CUDA dense chain (COLI_CUDA_CHAIN=1, qwen36_cuda_chain.h): logits, state, verify
 # rollback and a lost device against the CPU path, on the fake backend's host-side table.
-tests/test_qwen36_cuda_chain$(EXE): tests/test_qwen36_cuda_chain.c qwen36.c qwen36_tier.c qwen36_cuda_chain.h cuda_chain.h tests/qwen36_fake_cuda.h $(VK_OBJ)
+tests/test_qwen36_cuda_chain$(EXE): tests/test_qwen36_cuda_chain.c qwen36.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # dnout / attnproj / shexp offered, placed and served from VRAM (fake backend).

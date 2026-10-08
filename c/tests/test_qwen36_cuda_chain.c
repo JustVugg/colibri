@@ -152,7 +152,7 @@ int main(void) {
     setenv("COLI_CUDA_CHAIN", "1", 1);
     fake_ndev = 1; fake_dense_compute = 1;
     Weights w; make_weights(&w);
-    const int ids[8] = {3, 17, 42, 9, 21, 60, 5, 33};
+    const int ids[12] = {3, 17, 42, 9, 21, 60, 5, 33, 12, 48, 7, 29};   /* the verify reads three from index 6 */
 
     ck(qt_init(NL, E, D, INTER, E, TOPK, 0, 0), "the tier is up");
     Model ref; build_model(&ref, &w);

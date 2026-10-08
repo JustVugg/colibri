@@ -23,6 +23,13 @@
 #include <cstring>
 #include <chrono>
 
+/* Two of backend_cuda.cu's, for this file alone (the same DLL / object set, never the
+ * host's: not in backend_cuda.h, not in the loader): a resident tensor's format and
+ * shape, and its GEMV / GEMM on a stream the caller owns (a cudaStream_t, NULL = the
+ * device's default) with device pointers, no transfer, no synchronization. */
+extern "C" int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I, int *O);
+extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);
+
 struct CcBuf { int kind, dev; size_t bytes; float *d; void *h; };
 
 namespace {
