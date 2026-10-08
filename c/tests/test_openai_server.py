@@ -2868,6 +2868,58 @@ class HTTPTest(unittest.TestCase):
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
 
+    def test_large_integer_temperature_is_a_named_client_error(self):
+        self._assert_large_sampler_integer_is_client_error("temperature")
+
+    def test_large_integer_top_p_is_a_named_client_error(self):
+        self._assert_large_sampler_integer_is_client_error("top_p")
+
+    def _assert_large_sampler_integer_is_client_error(self, field):
+        for path, input_fields in (
+                ("/v1/completions", {"prompt": "hi"}),
+                ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})):
+            for sign in (1, -1):
+                with self.subTest(path=path, field=field, sign=sign):
+                    value = sign * 10 ** 400
+                    body = {"model": "test-model", **input_fields, field: value}
+                    # A bounded, valid JSON integer survives the actual producer.
+                    encoded = json.dumps(body).encode()
+                    self.assertLess(len(encoded), 1024)
+                    self.assertEqual(json.loads(encoded)[field], value)
+                    calls_before = len(self.engine.calls)
+                    with self.assertRaises(HTTPError) as caught:
+                        self.request(path, body)
+                    self.addCleanup(caught.exception.close)
+                    error = json.load(caught.exception)["error"]
+                    self.assertEqual(len(self.engine.calls), calls_before)
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(error["param"], field)
+                    self.assertEqual(error["type"], "invalid_request_error")
+
+    def test_integer_sampler_boundary_controls(self):
+        for path, input_fields in (
+                ("/v1/completions", {"prompt": "hi"}),
+                ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})):
+            with self.subTest(path=path, kind="valid-boundaries"):
+                calls_before = len(self.engine.calls)
+                with self.request(path, {"model": "test-model", **input_fields,
+                                         "temperature": 0, "top_p": 1}) as response:
+                    payload = json.load(response)
+                    self.assertEqual(response.status, 200)
+                self.assertEqual(len(self.engine.calls), calls_before + 1)
+                self.assertEqual(self.engine.calls[-1][2:4], (0.0, 1.0))
+                self.assertEqual(payload["choices"][0]["finish_reason"], "stop")
+            for field, value in (("temperature", 3), ("top_p", 0)):
+                with self.subTest(path=path, kind="small-out-of-range", field=field):
+                    calls_before = len(self.engine.calls)
+                    with self.assertRaises(HTTPError) as caught:
+                        self.request(path, {"model": "test-model", **input_fields, field: value})
+                    self.addCleanup(caught.exception.close)
+                    error = json.load(caught.exception)["error"]
+                    self.assertEqual(len(self.engine.calls), calls_before)
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(error["param"], field)
+
     def test_unsupported_modalities_fail_before_engine_work(self):
         cases = (
             ("/v1/completions", {"prompt": "hi", "modalities": ["video"]},

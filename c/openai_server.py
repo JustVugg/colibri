@@ -4389,10 +4389,10 @@ def generation_options(body, limit):
         maximum = limit   # clamp to the server's --max-tokens cap instead of 400 (#260): OpenAI
                           # clients (opencode/ai-sdk) default to large max_tokens; rejecting breaks them.
     if (isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or
-            not math.isfinite(temperature) or not 0 <= temperature <= 2):
+            not 0 <= temperature <= 2 or not math.isfinite(temperature)):
         raise APIError(400, "`temperature` must be between 0 and 2.", "temperature")
     if (isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or
-            not math.isfinite(top_p) or not 0 < top_p <= 1):
+            not 0 < top_p <= 1 or not math.isfinite(top_p)):
         raise APIError(400, "`top_p` must be greater than 0 and at most 1.", "top_p")
     return maximum, float(temperature), float(top_p), grammar, stop_sequences
 
