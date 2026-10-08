@@ -11,6 +11,8 @@ drop. The rules that make a rerun continue instead of starting over:
   second copy;
 - the hash is computed while the bytes arrive (the prefix already on disk is
   read once when resuming), so the check costs no second pass over the model;
+- completed files reused during a repository download are checked against the
+  supplied digest too, unless verification is disabled;
 - `.colibri-download.json` in the model folder records the repository, the
   revision and the file list, and says when the folder is complete.
 
@@ -180,7 +182,8 @@ def download_file(url, dest, spec, *, token=None, progress=None, opener=None,
     called as bytes land."""
     opener = opener or urllib.request.urlopen
     size = int(spec["size"])
-    if os.path.exists(dest) and os.path.getsize(dest) == size:
+    if (os.path.exists(dest) and os.path.getsize(dest) == size
+            and (not verify or verify_file(dest, spec))):
         return "present"
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     part = dest + ".part"
@@ -335,7 +338,8 @@ def download_file_windows(url, dest, spec, curl, *, token=None, progress=None, v
     """The same contract as download_file, with Windows' curl.exe doing the transfer
     into the same `.part` file (curl's own `-C -` resumes it)."""
     size = int(spec["size"])
-    if os.path.exists(dest) and os.path.getsize(dest) == size:
+    if (os.path.exists(dest) and os.path.getsize(dest) == size
+            and (not verify or verify_file(dest, spec))):
         return "present"
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     part = dest + ".part"

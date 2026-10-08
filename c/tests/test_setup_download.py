@@ -106,6 +106,49 @@ class DownloadTest(unittest.TestCase):
         setup_download.download_repo(REPO, "main", self.dst, files, base=self.hub.base)
         self.assertEqual(len(self.hub.requests), before)
 
+    def test_same_length_file_from_previous_revision_is_downloaded_again(self):
+        name = "README.md"
+        files = self.listing(include=(name,))
+        setup_download.download_repo(REPO, "previous", self.dst, files, base=self.hub.base)
+        replacement = b"# newer!\n"
+        self.assertEqual(len(replacement), len(self.files[name]))
+        Path(self.src, name).write_bytes(replacement)
+        current = self.listing(include=(name,))
+        self.assertNotEqual(current[0]["git_oid"], files[0]["git_oid"])
+        setup_download.download_repo(REPO, "current", self.dst, current, base=self.hub.base)
+        self.assertEqual(Path(self.dst, name).read_bytes(), replacement)
+        self.assertEqual(setup_download.read_manifest(self.dst)["revision"], "current")
+
+    def test_windows_collector_revalidates_existing_file_before_accepting_it(self):
+        name = "README.md"
+        spec = self.spec(name)
+        dest = os.path.join(self.dst, name)
+        os.makedirs(self.dst)
+        Path(dest).write_bytes(b"x" * spec["size"])
+        # A complete verified .part file can be promoted without invoking WSL or
+        # curl, exercising this collector's real cache and checksum decisions.
+        Path(dest + ".part").write_bytes(self.files[name])
+        self.assertEqual(setup_download.download_file_windows(self.url(name), dest, spec,
+                                                              "unused-curl"), "downloaded")
+        self.assertEqual(Path(dest).read_bytes(), self.files[name])
+        self.assertFalse(Path(dest + ".part").exists())
+
+    def test_existing_file_skip_verification_and_missing_hash_controls(self):
+        name = "README.md"
+        spec = self.spec(name)
+        dest = os.path.join(self.dst, name)
+        os.makedirs(self.dst)
+        cached = b"x" * spec["size"]
+        Path(dest).write_bytes(cached)
+        for collector, extra in ((setup_download.download_file, ()),
+                                 (setup_download.download_file_windows, ("unused-curl",))):
+            with self.subTest(collector=collector.__name__):
+                self.assertEqual(collector(self.url(name), dest, spec, *extra, verify=False),
+                                 "present")
+                unknown = dict(spec, sha256=None, git_oid=None)
+                self.assertEqual(collector(self.url(name), dest, unknown, *extra), "present")
+                self.assertEqual(Path(dest).read_bytes(), cached)
+
     def test_empty_repository_file_is_completed_and_manifest_is_reusable(self):
         Path(self.src, "empty.txt").write_bytes(b"")
         files = self.listing(include=("empty.txt",))
