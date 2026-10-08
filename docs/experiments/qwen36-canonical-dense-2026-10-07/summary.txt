@@ -1,0 +1,27 @@
+The summary printed at the end of the measurement by the script that ran it (a local script, not in this record: before every run it waits for the nominal thermal state, rests 60 s and reads the swap counters, then runs the manifests' command): every run's raw log is in baseline.txt and trial.txt. Its 'peak memory ... MB' is in MiB (2^20 bytes); 'pages written to swap' is the system-wide counter. Its prompt percentages come from the CSV's two-decimal tok/s; the manifests and the texts use the prompt's tokens over its timed seconds. The trial runs' engine line '[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed' is the measured commit's old log line: the matrices came from the file, as the line above it says; this branch's code prints 'read from canonical.qc, no f32 copies' instead.
+
+model <model>; text promessi_sposi.txt; lengths 64,512; gen 32; runs 4; extra env: none
+cooldown before every run: 60 seconds, after waiting for thermal state 0: yes, at most 900s; thermal states: 0 nominal, 1 fair, 2 serious, 3 critical
+v0: bin-pr3/qwen36-bench (commit 0d5eae65413392bff48f84daa76ac18ba3d1c124 (CPU engine, make qwen36 flags on macOS))
+v1: bin-pr4/qwen36-bench (commit ac9c4c83dfdeb98054f769abbafd95309f0d4090 (CPU engine, make qwen36 flags on macOS))
+order: the binaries' order turns at every round (ABBA)
+
+v0: 4 runs (median, min-max)
+tokens    new            prompt tok/s          first token ms        generation tok/s  experts read  fingerprint
+    64     64        1.84 (1.82-1.84)           750 (698-779)     1.587 (1.552-1.600)         11275  f1300d8431ba2787
+   512    512        2.25 (2.25-2.25)        1120 (1042-1146)     1.566 (1.499-1.580)         61469  8e0bf69c62deb041
+peak memory 4501 MB, model ready in 4.40 s (medians)
+
+v1: 4 runs (median, min-max)
+tokens    new            prompt tok/s          first token ms        generation tok/s  experts read  fingerprint
+    64     64        1.82 (1.80-1.84)           690 (641-761)     1.582 (1.543-1.595)         11275  f1300d8431ba2787
+   512    512        2.25 (2.25-2.25)         1074 (936-1100)     1.560 (1.530-1.602)         61469  8e0bf69c62deb041
+peak memory 3322 MB, model ready in 3.58 s (medians)
+
+warm-up (does not count): 64 tokens: prompt 1.83 tok/s, generation 1.498 tok/s; 512 tokens: prompt 2.24 tok/s, generation 1.573 tok/s
+
+v1 against v0 (medians):
+    64 tokens: prompt -1.1%, first token +8.8%, generation -0.3%  (same results)
+   512 tokens: prompt +0.0%, first token +4.3%, generation -0.4%  (same results)
+(positive = faster)
+swap used 390.00M -> 437.69M; pages written to swap during the runs: 17388 (16 KB each)
