@@ -2924,6 +2924,52 @@ class HTTPTest(unittest.TestCase):
                     self.assertEqual(caught.exception.code, 400)
                     self.assertEqual(json.loads(caught.exception.read())["error"]["param"], param)
 
+    def test_falsey_non_array_tools_are_named_client_errors(self):
+        # JSON's falsey non-array values must not disappear as absent tools.
+        # Truthy values of the same four JSON types are rejection controls.
+        for value in (False, 0, "", {}, True, 1, "x", {"x": 1}):
+            with self.subTest(value=value):
+                body = {"model": "test-model", "max_tokens": 1,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "tools": value}
+                calls_before = len(self.engine.calls)
+                with patch("openai_server.ARCH", "glm"):
+                    try:
+                        response = self.request("/v1/chat/completions", body)
+                    except HTTPError as error:
+                        response = error
+                    with response:
+                        status = response.status
+                        payload = json.load(response)
+                self.assertEqual(status, 400)
+                self.assertEqual(payload["error"]["type"], "invalid_request_error")
+                self.assertEqual(payload["error"]["param"], "tools")
+                self.assertEqual(payload["error"]["code"], "invalid_value")
+                self.assertEqual(len(self.engine.calls), calls_before)
+
+    def test_absent_null_empty_tools_keep_legacy_function_fallback(self):
+        legacy = [{"name": "frozen_legacy_lookup",
+                   "parameters": {"type": "object", "properties": {}}}]
+        for extra in ({}, {"tools": None}, {"tools": []}):
+            for functions in (None, legacy):
+                with self.subTest(extra=extra, legacy=functions is not None):
+                    body = {"model": "test-model", "max_tokens": 1,
+                            "messages": [{"role": "user", "content": "hi"}], **extra}
+                    if functions is not None:
+                        body["functions"] = functions
+                    calls_before = len(self.engine.calls)
+                    with patch("openai_server.ARCH", "glm"):
+                        with self.request("/v1/chat/completions", body) as response:
+                            self.assertEqual(response.status, 200)
+                            self.assertEqual(json.load(response)["choices"][0]
+                                             ["message"]["content"], "Héllo")
+                    self.assertEqual(len(self.engine.calls), calls_before + 1)
+                    prompt = self.engine.calls[-1][0]
+                    if functions is not None:
+                        self.assertIn("frozen_legacy_lookup", prompt)
+                    else:
+                        self.assertNotIn("frozen_legacy_lookup", prompt)
+
     def test_metrics_counts_http_engine_failure_without_success(self):
         before = self.server.scheduler.snapshot()
         with patch.object(self.engine, "generate", side_effect=RuntimeError("injected failure")):
