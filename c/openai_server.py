@@ -437,6 +437,9 @@ def _fallback_tool_calls(tool_calls, index):
             except (json.JSONDecodeError, TypeError, ValueError):
                 raise APIError(400, "`function.arguments` must be a JSON object.",
                                f"messages.{index}.tool_calls.{position}.function.arguments")
+        if args and not isinstance(args, dict):
+            raise APIError(400, "`function.arguments` must be a JSON object.",
+                           f"messages.{index}.tool_calls.{position}.function.arguments")
         out.append(BOX_START + name)
         for key, value in (args or {}).items():
             rendered = value if isinstance(value, str) else json.dumps(
