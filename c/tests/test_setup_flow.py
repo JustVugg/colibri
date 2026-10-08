@@ -1002,6 +1002,78 @@ class WholeSetup(HomeTestCase):
         build.assert_called_once()                       # make, with nothing to redo
         self.assertTrue(build.call_args.kwargs["update"])
 
+    def test_ready_setup_honors_explicit_cpu_backend(self):
+        code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        previous = setup_flow.load_config()
+        self.assertEqual(previous["backend"], "vulkan")
+        self.assertEqual(previous["env"]["COLI_VULKAN"], "1")
+        build, _ = self.failing_build()
+        with mock.patch.object(setup_flow, "build_engine", side_effect=build):
+            code, text = self.run_setup(backend="cpu")
+        self.assertEqual(code, 0, text)
+        current = setup_flow.load_config()
+        self.assertEqual(current["backend"], "cpu")
+        self.assertNotIn("COLI_VULKAN", current["env"])
+        self.assertEqual(current["model_dir"], previous["model_dir"])
+        self.assertEqual(
+            Path(current["model_dir"], "model-00000.safetensors").read_bytes(),
+            self.shard,
+        )
+
+    def test_ready_setup_honors_no_gpu(self):
+        code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        previous = setup_flow.load_config()
+        self.assertEqual(previous["backend"], "vulkan")
+        self.assertEqual(previous["env"]["COLI_VULKAN"], "1")
+        build, _ = self.failing_build()
+        with mock.patch.object(setup_flow, "build_engine", side_effect=build):
+            code, text = self.run_setup(no_gpu=True)
+        self.assertEqual(code, 0, text)
+        current = setup_flow.load_config()
+        self.assertEqual(current["backend"], "cpu")
+        self.assertNotIn("COLI_VULKAN", current["env"])
+        self.assertEqual(current["model_dir"], previous["model_dir"])
+        self.assertEqual(
+            Path(current["model_dir"], "model-00000.safetensors").read_bytes(),
+            self.shard,
+        )
+
+    def test_ready_setup_honors_explicit_host(self):
+        code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        previous = setup_flow.load_config()
+        self.assertEqual(previous["host"], "127.0.0.1")
+        code, text = self.run_setup(host="127.0.0.2")
+        self.assertEqual(code, 0, text)
+        current = setup_flow.load_config()
+        self.assertEqual(current["host"], "127.0.0.2")
+        self.assertEqual(current["args"][current["args"].index("--host") + 1], "127.0.0.2")
+        self.assertEqual(current["urls"]["browser"], "http://127.0.0.2:8000/")
+        self.assertEqual(current["model_dir"], previous["model_dir"])
+        self.assertEqual(
+            Path(current["model_dir"], "model-00000.safetensors").read_bytes(),
+            self.shard,
+        )
+
+    def test_ready_setup_honors_explicit_port(self):
+        code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        previous = setup_flow.load_config()
+        self.assertEqual(previous["port"], 8000)
+        code, text = self.run_setup(port=8123)
+        self.assertEqual(code, 0, text)
+        current = setup_flow.load_config()
+        self.assertEqual(current["port"], 8123)
+        self.assertEqual(current["args"][current["args"].index("--port") + 1], "8123")
+        self.assertEqual(current["urls"]["browser"], "http://127.0.0.1:8123/")
+        self.assertEqual(current["model_dir"], previous["model_dir"])
+        self.assertEqual(
+            Path(current["model_dir"], "model-00000.safetensors").read_bytes(),
+            self.shard,
+        )
+
     def test_a_rerun_after_a_pull_rebuilds_the_engine_it_starts(self):
         code, text = self.run_setup(pick="tiny")
         self.assertEqual(code, 0, text)
