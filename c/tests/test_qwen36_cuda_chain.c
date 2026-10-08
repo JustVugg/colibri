@@ -174,7 +174,14 @@ int main(void) {
     same_logits(lc, lr, V, "the prompt's logits equal the CPU path's");
     free(lr); free(lc);
     { int allzero = 1; for (size_t i = 0; i < (size_t)VH * KD * VD; i++) if (m.DN_rec[0][i] != 0.f) allzero = 0; ck(allzero, "the host's DeltaNet state was not touched"); }
-    ck(maxdiff(m.K[1], ref.K[1], (size_t)KV * CAP * HD) < 1e-4 && maxdiff(m.V[1], ref.V[1], (size_t)KV * CAP * HD) < 1e-4, "the K/V rows reached the host cache as the CPU path wrote them");
+    {   /* the four positions written, per head (the rows past them are malloc's: not zero on Windows) */
+        int kv_ok = 1;
+        for (int h = 0; h < KV; h++) {
+            size_t off = (size_t)h * CAP * HD;
+            if (maxdiff(m.K[1] + off, ref.K[1] + off, (size_t)4 * HD) > 1e-4 || maxdiff(m.V[1] + off, ref.V[1] + off, (size_t)4 * HD) > 1e-4) kv_ok = 0;
+        }
+        ck(kv_ok, "the K/V rows reached the host cache as the CPU path wrote them");
+    }
     for (int t = 4; t < 7; t++) {
         lr = step_ex(&ref, ids + t, 1, t, 1); ref.kv_len = t + 1;
         lc = step_ex(&m, ids + t, 1, t, 1); m.kv_len = t + 1;
