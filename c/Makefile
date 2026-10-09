@@ -2126,6 +2126,31 @@ tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
 tests/test_i4_grouped_sse41$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -O3 -DCOLI_HAVE_GROUPED_PAIR -DCOLI_I4_GROUPED_SCALAR_EXACT -msse4.1 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
+tests/test_lora$(EXE): tests/test_lora.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_train_linear$(EXE): tests/test_train_linear.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_train_tiny$(EXE): tests/test_train_tiny.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_train_resume$(EXE): tests/test_train_resume.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# QLoRA trainer (experimental). One translation unit, so -MMD writes a complete
+# coli_train.d. There is no coli_train.c for the engine discovery to find, so
+# the generated dependencies are hooked up here, the same way AUTODEP_BINS does
+# it: the binary depends on its own .d, and a missing .d forces the rebuild.
+coli_train$(EXE): train/train_main.c colibri.c $(METAL_OBJ) $(VK_OBJ) .build-config
+	$(CC) $(CFLAGS) train/train_main.c $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+coli_train$(EXE): coli_train.d
+coli_train.d: ;
+-include $(wildcard coli_train.d)
+ifneq ($(EXE),)
+coli_train: coli_train$(EXE)
+endif
+
 tests/test_i4_grouped_sse41_o1$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -O1 -DCOLI_HAVE_GROUPED_PAIR -DCOLI_I4_GROUPED_SCALAR_EXACT -msse4.1 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
