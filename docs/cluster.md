@@ -66,3 +66,26 @@ chunk.
 The transport is disabled unless workers are configured, so the existing
 single-machine path remains unchanged. Dense-layer sharding and browser/WebGPU
 workers are separate follow-up seams.
+
+## Engines
+
+The protocol (`COLIEX01`) is carried by two engines, and a worker serves the
+family it was built for -- engines are never mixed on one coordinator:
+
+- `colibri` (GLM): the routed experts of every layer, as above.
+- `deepseek_v41` (DeepSeek V4.1 Flash): the backbone's fp4 routed experts. A
+  worker holds one expert slot per layer and runs the same `matmul_mxfp4`
+  kernel the coordinator would, so a row comes back as the bytes the local path
+  produces. Routing, the shared expert, attention, the DSA indexer, the engram
+  tables, the vision tower and the DSpark draft stages (their own, smaller
+  expert set) stay on the coordinator.
+
+```bash
+./coli cluster worker --model /nvme/dsv41 --port 9100 --advertise-host WORKER_IP
+./coli serve --model /nvme/dsv41 --cluster-workers WORKER_IP:9100
+```
+
+`c/tests/test_cluster_sharding.py` and `c/tests/test_dsv41_cluster_sharding.py`
+are the token-exact gates: a local run and a delegated run of the same binary
+must decode the same tokens, and the delegated one must have gone through the
+worker.

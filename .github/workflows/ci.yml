@@ -1645,6 +1645,36 @@ jobs:
       - name: Cluster parity gate (token-exact)
         run: cd c && python3 -m unittest -v tests.test_cluster_sharding
 
+  # The same gate for deepseek_v41.c (c/tests/test_dsv41_cluster_sharding.py).
+  # The engine carries the COLIEX01 protocol separately, so it is pinned
+  # separately: a dsv41 coordinator against a dsv41 worker, on the tiny
+  # container dsv41-tiny-check builds, at cap=1 and cap=8. The fixture is
+  # gitignored for the same reason as above, so this job regenerates it; the
+  # test skips cleanly without it, which is exactly the dormancy to avoid.
+  # Same socket safety: the worker binds a 127.0.0.1 port from bind-to-0.
+  dsv41-cluster-parity:
+    name: DeepSeek V4.1 cluster parity gate (token-exact)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + sympy + Pillow
+        run: |
+          pip install -r c/tools/oracle-requirements.txt
+          pip install sympy pillow
+      - name: Build deepseek_v41 and its wire-contract test
+        run: make -C c deepseek_v41 tests/test_dsv41_cluster_protocol
+      - name: Wire contract (socketpair, no fixture)
+        run: c/tests/test_dsv41_cluster_protocol
+      - name: Tiny V4.1-shaped container and its reference
+        run: cd c && python3 tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json
+      - name: Cluster parity gate (token-exact)
+        run: cd c && python3 -m unittest -v tests.test_dsv41_cluster_sharding
+
   engine-hip-syntax:
     name: HIP syntax check
     runs-on: ubuntu-latest

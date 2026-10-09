@@ -1795,6 +1795,11 @@ tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c
 tests/test_cluster_protocol$(EXE): tests/test_cluster_protocol.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
+# The same wire contract as deepseek_v41.c carries it: each engine has its own
+# copy of the COLIEX01 protocol, so each is pinned on its own source.
+tests/test_dsv41_cluster_protocol$(EXE): tests/test_dsv41_cluster_protocol.c deepseek_v41.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
 tests/test_ue8m0$(EXE): tests/test_ue8m0.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

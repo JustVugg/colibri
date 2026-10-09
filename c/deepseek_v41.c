@@ -52,6 +52,17 @@
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
 #endif
+/* The expert-worker transport (CLUSTER_WORKERS on a coordinator, EXPERT_WORKER=1
+ * on a worker): the sockets colibri.c opens for the same protocol, and like there
+ * not on Windows. */
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#define V41_CLUSTER 1
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#endif
 #if defined(COLI_VULKAN) && !defined(_WIN32)
 #include <sys/mman.h>
 #include <unistd.h>
@@ -2863,6 +2874,255 @@ static int vk_load(void *ctx, int layer, int e, VktExpertSrc *src, void **h) {
 static void vk_unhold(void *ctx, void *h) { (void)ctx; (void)h; }
 #endif
 
+#ifdef V41_CLUSTER
+/* ---------------------------------------------------------- expert workers ----
+ *
+ * The COLIEX01 protocol colibri.c speaks, byte for byte: network-order u32
+ * headers, raw little-endian f32 rows, one request per layer per worker carrying
+ * that layer's routed batch-union, expert (eid, layer) on worker (eid + layer) % n.
+ * A deepseek_v41 coordinator talks to deepseek_v41 workers only: the worker reads
+ * the fp4 slot the coordinator would have read and runs expert_ffn_rows on it, so
+ * a row comes back as the bytes the local path produces, and the rank-ordered sum
+ * in moe_run_at is the same sum. Off unless CLUSTER_WORKERS names a worker; the
+ * single-machine path is untouched. Only the backbone's routed experts travel --
+ * routing, the shared expert, attention, the indexer, the engram tables, the
+ * vision tower and the DSpark stages' own experts stay here. */
+#define COLI_CLUSTER_MAGIC "COLIEX01"
+#define COLI_CLUSTER_VERSION 1u
+#define V41_CLUSTER_MAX_WORKERS 16
+#define V41_CLUSTER_MAX_ITEMS 64        /* experts per request: the worker's bound */
+typedef struct { int fd; char host[128]; int port; } ClusterWorker;
+static ClusterWorker g_cluster_workers[V41_CLUSTER_MAX_WORKERS];
+static int g_cluster_n;
+
+static int cluster_io(int fd, void *buf, size_t n, int write_mode) {
+    int send_flags = 0;
+#ifdef MSG_NOSIGNAL
+    send_flags = MSG_NOSIGNAL;
+#elif defined(SO_NOSIGPIPE)
+    if (write_mode) {
+        int enabled = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0) return -1;
+    }
+#endif
+    char *p = (char *)buf;
+    while (n) {
+        ssize_t r = write_mode ? send(fd, p, n, send_flags) : recv(fd, p, n, MSG_WAITALL);
+        if (r <= 0) { if (r < 0 && errno == EINTR) continue; return -1; }
+        p += r; n -= (size_t)r;
+    }
+    return 0;
+}
+static int cluster_u32(int fd, uint32_t *v, int write_mode) {
+    uint32_t x = write_mode ? htonl(*v) : 0;
+    if (cluster_io(fd, write_mode ? (void *)&x : (void *)v, sizeof(x), write_mode)) return -1;
+    if (!write_mode) *v = ntohl(*v);
+    return 0;
+}
+static int cluster_connect_one(const char *spec, ClusterWorker *out) {
+    char copy[256]; strncpy(copy, spec, sizeof(copy) - 1); copy[sizeof(copy) - 1] = 0;
+    char *colon = strrchr(copy, ':'); if (!colon || colon == copy || !colon[1]) return -1;
+    *colon = 0; int port = atoi(colon + 1); if (port < 1 || port > 65535) return -1;
+    char portbuf[16]; snprintf(portbuf, sizeof(portbuf), "%d", port);
+    struct addrinfo hint, *ai = NULL; memset(&hint, 0, sizeof(hint)); hint.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(copy, portbuf, &hint, &ai) != 0) return -1;
+    int fd = -1;
+    for (struct addrinfo *p = ai; p; p = p->ai_next) {
+        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
+        close(fd); fd = -1;
+    }
+    freeaddrinfo(ai); if (fd < 0) return -1;
+    out->fd = fd;
+    size_t hostlen = strlen(copy); if (hostlen >= sizeof(out->host)) hostlen = sizeof(out->host) - 1;
+    memcpy(out->host, copy, hostlen); out->host[hostlen] = 0;
+    out->port = port; return 0;
+}
+static void cluster_close_all(void) {
+    for (int i = 0; i < g_cluster_n; i++) if (g_cluster_workers[i].fd >= 0) close(g_cluster_workers[i].fd);
+    g_cluster_n = 0;
+}
+static void cluster_init(void) {
+    const char *list = getenv("CLUSTER_WORKERS"); if (!list || !*list) return;
+    char *copy = strdup(list), *save = NULL;
+    for (char *tok = strtok_r(copy, ",", &save); tok && g_cluster_n < V41_CLUSTER_MAX_WORKERS;
+         tok = strtok_r(NULL, ",", &save)) {
+        while (*tok == ' ' || *tok == '\t') tok++;
+        if (!cluster_connect_one(tok, &g_cluster_workers[g_cluster_n])) g_cluster_n++;
+        else fprintf(stderr, "[CLUSTER] cannot connect to expert worker %s\n", tok);
+    }
+    free(copy);
+    if (g_cluster_n < 1) { fprintf(stderr, "[CLUSTER] no expert workers reachable\n"); exit(1); }
+    fprintf(stderr, "[CLUSTER] coordinator connected to %d expert worker(s)\n", g_cluster_n);
+}
+
+/* A block's routed experts to the workers, in moe_run_at's own terms: `uniq` with
+ * its draw chains (head/next/count), the rows gathered per expert in chain order
+ * -- the order the local loop feeds expert_ffn_rows -- and each returned row
+ * landing in contrib[d] = w * y exactly where that loop would have put it. One
+ * request per worker per block, split only by the worker's item bound. `gathered`
+ * and `down` are the caller's rows*dim scratch. */
+static void cluster_moe_batch(Model *m, int layer, const float *xc, int topk,
+                              const int *uniq, const int *head, const int *next,
+                              const int *count, int n_uniq, const float *weights,
+                              float *contrib, float *gathered, float *down) {
+    int dim = m->c.dim;
+    for (int wi = 0; wi < g_cluster_n; wi++) {
+        ClusterWorker *w = &g_cluster_workers[wi];
+        int *mine = xmalloc((size_t)(n_uniq > 0 ? n_uniq : 1) * sizeof(int), "worker experts");
+        int total = 0;
+        for (int u = 0; u < n_uniq; u++)
+            if ((uniq[u] + layer) % g_cluster_n == wi) mine[total++] = u;
+        for (int at0 = 0; at0 < total; at0 += V41_CLUSTER_MAX_ITEMS) {
+            int n = total - at0 < V41_CLUSTER_MAX_ITEMS ? total - at0 : V41_CLUSTER_MAX_ITEMS;
+            uint32_t v; char magic[8];
+            if (cluster_io(w->fd, (void *)COLI_CLUSTER_MAGIC, 8, 1)) goto fail;
+            v = COLI_CLUSTER_VERSION; if (cluster_u32(w->fd, &v, 1)) goto fail;
+            v = (uint32_t)layer; if (cluster_u32(w->fd, &v, 1)) goto fail;
+            v = (uint32_t)dim; if (cluster_u32(w->fd, &v, 1)) goto fail;
+            v = (uint32_t)m->c.moe_inter; if (cluster_u32(w->fd, &v, 1)) goto fail;
+            v = (uint32_t)n; if (cluster_u32(w->fd, &v, 1)) goto fail;
+            for (int j = 0; j < n; j++) {
+                int u = mine[at0 + j], cnt = count[u], at = 0;
+                ehit_mark(m, layer, uniq[u]);   /* the dashboard's HITS, as expert_slots_at marks it */
+                for (int d = head[u]; d >= 0; d = next[d], at++)
+                    memcpy(gathered + (size_t)at * dim, xc + (size_t)(d / topk) * dim,
+                           (size_t)dim * sizeof(float));
+                v = (uint32_t)uniq[u]; if (cluster_u32(w->fd, &v, 1)) goto fail;
+                v = (uint32_t)cnt; if (cluster_u32(w->fd, &v, 1)) goto fail;
+                if (cluster_io(w->fd, gathered, (size_t)cnt * dim * sizeof(float), 1)) goto fail;
+            }
+            if (cluster_io(w->fd, magic, 8, 0) || memcmp(magic, COLI_CLUSTER_MAGIC, 8)) goto fail;
+            if (cluster_u32(w->fd, &v, 0) || v != COLI_CLUSTER_VERSION) goto fail;
+            if (cluster_u32(w->fd, &v, 0) || v != 0) goto fail;
+            if (cluster_u32(w->fd, &v, 0) || v != (uint32_t)n) goto fail;
+            for (int j = 0; j < n; j++) {
+                int u = mine[at0 + j], cnt = count[u], at = 0;
+                uint32_t eid, nr;
+                if (cluster_u32(w->fd, &eid, 0) || cluster_u32(w->fd, &nr, 0) ||
+                    eid != (uint32_t)uniq[u] || nr != (uint32_t)cnt) goto fail;
+                if (cluster_io(w->fd, down, (size_t)cnt * dim * sizeof(float), 0)) goto fail;
+                for (int d = head[u]; d >= 0; d = next[d], at++) {
+                    float wt = weights[d];
+                    float *dst = contrib + (size_t)d * dim;
+                    const float *src = down + (size_t)at * dim;
+                    for (int i = 0; i < dim; i++) dst[i] = wt * src[i];
+                }
+            }
+        }
+        free(mine);
+        continue;
+fail:
+        free(mine);
+        fprintf(stderr, "[CLUSTER] expert worker %s:%d failed during layer %d batch\n",
+                w->host, w->port, layer);
+        exit(1);
+    }
+}
+
+typedef struct { int eid, nr; float *inputs; } ClusterRequestItem;
+/* Mirror expert_read_list's resolution so the worker can NAME the tensor it cannot
+ * resolve instead of dying inside st_die_missing. Returns 1 and fills `out` with
+ * the first missing of the six -- three fp4 weights and their scales -- else 0. */
+static int worker_expert_missing_tensor(Model *m, int layer, int eid, char *out, size_t outsz) {
+    static const char *const part[3] = { "w1", "w3", "w2" };
+    static const char *const leaf[2] = { "weight", "scale" };
+    char name[160];
+    for (int i = 0; i < 3; i++)
+        for (int f = 0; f < 2; f++) {
+            snprintf(name, sizeof(name), "layers.%d.ffn.experts.%d.%s.%s", layer, eid, part[i], leaf[f]);
+            if (!st_has(&m->S, name)) { snprintf(out, outsz, "%s", name); return 1; }
+        }
+    return 0;
+}
+/* EXPERT_WORKER=1: serve the backbone's routed experts over COLIEX01. Loads the
+ * config and the shard index only -- no dense weights, no engram, no vision --
+ * and keeps one expert slot per layer, read on a miss through the same
+ * expert_slot_at the coordinator uses. Returns only when the socket fails. */
+static int cluster_worker_run(const char *snap, int port) {
+    Model m; memset(&m, 0, sizeof(m));
+    cfg_load(&m.c, snap);
+    const char *extra_dirs = getenv("COLI_MODEL_DIRS");   /* SPLIT across drives, as model_load */
+    st_init_multi(&m.S, snap, (extra_dirs && *extra_dirs) ? extra_dirs : NULL);
+    mirror_setup(&m.S, snap, m.c.n_routed);                /* DUAL-SSD replicas, as model_load */
+    int nr_layers = m.c.n_layers;
+    /* Cache depth: 1 slot/layer kept the worker honest but meant every routed read
+     * after the first was a cold SSD read; the coordinator runs a RAM-plan cache
+     * (48 slots/layer there), so a worker on the same class of box should be able
+     * to hold a working set too. CLUSTER_WORKER_CACHE=<slots/layer>, default 1. */
+    int ecap = 1;
+    const char *ce = getenv("CLUSTER_WORKER_CACHE");
+    if (ce && *ce) {
+        ecap = atoi(ce);
+        if (ecap < 1) { fprintf(stderr, "[CLUSTER] CLUSTER_WORKER_CACHE must be >= 1, not '%s'\n", ce); return 1; }
+    }
+    m.ecap = ecap;
+    m.cache = xmalloc((size_t)nr_layers * sizeof(LCache), "expert caches");
+    for (int i = 0; i < nr_layers; i++) cache_init(&m, &m.cache[i], ecap);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { perror("cluster worker socket"); return 1; }
+    int yes = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_ANY); addr.sin_port = htons((uint16_t)port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) || listen(fd, 4)) {
+        perror("cluster worker bind/listen"); return 1; }
+    fprintf(stderr, "[CLUSTER] expert worker listening on 0.0.0.0:%d (disk-backed, cache=%d/layer, "
+                    "%d layers x %d experts)\n", port, ecap, nr_layers, m.c.n_routed);
+    for (;;) {
+        int cfd = accept(fd, NULL, NULL);
+        if (cfd < 0) { if (errno == EINTR) continue; break; }
+        for (;;) {
+            char magic[8]; uint32_t v, layer, D, I, n;
+            if (cluster_io(cfd, magic, 8, 0)) break;
+            if (memcmp(magic, COLI_CLUSTER_MAGIC, 8) || cluster_u32(cfd, &v, 0) || v != COLI_CLUSTER_VERSION ||
+                cluster_u32(cfd, &layer, 0) || cluster_u32(cfd, &D, 0) || cluster_u32(cfd, &I, 0) ||
+                cluster_u32(cfd, &n, 0) || D != (uint32_t)m.c.dim || I != (uint32_t)m.c.moe_inter ||
+                layer >= (uint32_t)nr_layers || n < 1 || n > V41_CLUSTER_MAX_ITEMS) {
+                close(cfd); cfd = -1; break;
+            }
+            ClusterRequestItem *items = xcalloc(n, sizeof(*items), "worker request"); int bad = 0;
+            for (uint32_t j = 0; j < n; j++) {
+                uint32_t eid, nr;
+                if (cluster_u32(cfd, &eid, 0) || cluster_u32(cfd, &nr, 0) ||
+                    eid >= (uint32_t)m.c.n_routed || nr < 1 || nr > 65536) { bad = 1; break; }
+                items[j].eid = (int)eid; items[j].nr = (int)nr;
+                items[j].inputs = xmalloc((size_t)nr * D * sizeof(float), "worker inputs");
+                if (cluster_io(cfd, items[j].inputs, (size_t)nr * D * sizeof(float), 0)) { bad = 1; break; }
+            }
+            if (bad) { for (uint32_t j = 0; j < n; j++) free(items[j].inputs); free(items); close(cfd); cfd = -1; break; }
+            v = COLI_CLUSTER_VERSION;
+            if (cluster_io(cfd, (void *)COLI_CLUSTER_MAGIC, 8, 1) || cluster_u32(cfd, &v, 1)) bad = 1;
+            v = 0; if (!bad && cluster_u32(cfd, &v, 1)) bad = 1;
+            v = n; if (!bad && cluster_u32(cfd, &v, 1)) bad = 1;
+            for (uint32_t j = 0; !bad && j < n; j++) {
+                char miss[160];
+                if (worker_expert_missing_tensor(&m, (int)layer, items[j].eid, miss, sizeof(miss))) {
+                    fprintf(stderr, "[CLUSTER] worker cannot resolve expert tensor %s (layer %d, expert %d)\n",
+                            miss, (int)layer, items[j].eid);
+                    bad = 1; break;
+                }
+                Slot *s = expert_slot_at(&m, &m.cache[layer], "layers", (int)layer, items[j].eid);
+                int rows = items[j].nr;
+                float *y = xmalloc((size_t)rows * D * sizeof(float), "worker outputs");
+                expert_ffn_rows(&m, s->w1, s->s1, s->w3, s->s3, s->w2, s->s2, items[j].inputs, rows, y);
+                v = (uint32_t)items[j].eid;
+                if (cluster_u32(cfd, &v, 1)) bad = 1;
+                v = (uint32_t)rows;
+                if (!bad && (cluster_u32(cfd, &v, 1) || cluster_io(cfd, y, (size_t)rows * D * sizeof(float), 1))) bad = 1;
+                free(y);
+            }
+            for (uint32_t j = 0; j < n; j++) free(items[j].inputs);
+            free(items);
+            if (bad) break;
+        }
+        if (cfd >= 0) close(cfd);
+    }
+    close(fd);
+    return 0;
+}
+#endif
+
 /* The MoE for a block of positions, expert-major.
  *
  * Position-major is the obvious reading and it is what this did: route a
@@ -2925,7 +3185,16 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
 #endif
 
         int draws = rows * topk;
-        if (cache->cap < topk) {
+#ifdef V41_CLUSTER
+        /* Expert workers take the backbone's routed experts whole: no slot on the
+         * coordinator is touched, so neither local path below runs for them. The
+         * DSpark stages ("mtp") keep their own experts here -- a v1 request names
+         * a backbone layer and nothing else. */
+        int delegated = g_cluster_n && !strcmp(kind, "layers");
+#else
+        const int delegated = 0;
+#endif
+        if (cache->cap < topk && !delegated) {
             /* one position at a time, and one expert at a time inside it */
             for (int r = 0; r < rows; r++) {
                 float *o = outc + (size_t)r * dim;
@@ -2981,7 +3250,12 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
          * bandwidth the matmuls are already bound by, and the idle disk wait it
          * removes costs more than it was worth. Both are measurements, not opinions;
          * they are written down so the third attempt starts from them. */
-        for (int u0 = 0; u0 < n_uniq; u0 += step) {
+#ifdef V41_CLUSTER
+        if (delegated)
+            cluster_moe_batch(m, layer, xc, topk, uniq, head, next, count, n_uniq,
+                              weights, contrib, gathered, down);
+#endif
+        for (int u0 = 0; !delegated && u0 < n_uniq; u0 += step) {
             int ne = n_uniq - u0 < step ? n_uniq - u0 : step;
             Slot *slot[MOE_ROW_CHUNK];
             expert_slots_at(m, cache, kind, layer, uniq + u0, ne, slot);
@@ -5084,6 +5358,20 @@ int main(int argc, char **argv) {
     coli_omp_tune_threads("deepseek-v41");
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "SNAP=<container dir> is required\n"); return 2; }
+#ifdef V41_CLUSTER
+    /* EXPERT_WORKER=1 (`coli cluster worker`): serve routed experts and nothing
+     * else. Before anything reads argv: the launcher passes GLM's <cap> <ebits>
+     * <dbits>, which mean nothing here. */
+    if (getenv("EXPERT_WORKER")) {
+        int port = getenv("CLUSTER_WORKER_PORT") ? atoi(getenv("CLUSTER_WORKER_PORT")) : 9100;
+        if (port < 1 || port > 65535) { fprintf(stderr, "CLUSTER_WORKER_PORT must be 1..65535\n"); return 2; }
+        return cluster_worker_run(snap, port);
+    }
+#else
+    if (getenv("EXPERT_WORKER")) {
+        fprintf(stderr, "[CLUSTER] expert workers are not supported on Windows yet\n"); return 2;
+    }
+#endif
     if (getenv("SERVE") && atoi(getenv("SERVE"))) {   /* KV_SLOTS: the conversations decoded at once */
         const char *ks = getenv("KV_SLOTS");
         if (ks && *ks) {
@@ -5106,6 +5394,12 @@ int main(int argc, char **argv) {
                     "window %d, engram %s — loaded in %.2fs\n",
             c->n_layers, c->n_routed, c->n_activated, c->dim, c->hc_mult, c->window,
             m.engram.active ? "on" : "off", now_s() - started);
+#ifdef V41_CLUSTER
+    if (getenv("CLUSTER_WORKERS") && *getenv("CLUSTER_WORKERS")) {   /* the coordinator's workers, as colibri.c */
+        cluster_init();
+        atexit(cluster_close_all);
+    }
+#endif
 #ifdef COLI_VULKAN
     /* After the weights, as in glm53: the device is an option, never a requirement.
      * The matrices go up on their first multiply (see vk_mul), from this thread. */

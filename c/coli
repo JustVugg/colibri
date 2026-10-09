@@ -765,15 +765,18 @@ def dsv4_cuda_build_hint():
         return "make deepseek-v4 CUDA=1 (this binary is CPU-only)"
     return "the DeepSeek V4 CUDA tier is supported only on Linux and Windows"
 
-# Engines that implement EXPERT_WORKER / CLUSTER_WORKERS: colibri.c and glm53.c.
-WORKER_FAMILIES = ("glm", "glm53")
+# Engines that implement EXPERT_WORKER / CLUSTER_WORKERS: colibri.c, glm53.c and
+# deepseek_v41.c. A worker serves the family it was built for: a deepseek_v41
+# coordinator talks to deepseek_v41 workers (COLIEX01), a GLM one to GLM workers,
+# a GLM-5.3 one to GLM-5.3 workers (COLIG53X).
+WORKER_FAMILIES = ("glm", "glm53", "deepseek_v41")
 
 def need_worker_model(model):
     require_model(model, file="config.json")
     family = resolve_model(model).descriptor
     if family.id not in WORKER_FAMILIES:
-        sys.exit(f"{C.yel}cluster expert workers currently support the GLM and GLM-5.3 engines only;{C.r} "
-                 f"{family.display_name} models cannot serve experts")
+        sys.exit(f"{C.yel}cluster expert workers currently support the GLM, GLM-5.3 and DeepSeek V4.1 "
+                 f"engines only;{C.r} {family.display_name} models cannot serve experts")
     engine = engine_for(model)
     require_model(model, file="config.json", engine=engine, target=family.build_target,
                   build=f"make -C c {family.build_target}")
