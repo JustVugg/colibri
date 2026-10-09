@@ -3412,49 +3412,63 @@ static int cluster_item(const int *idxs,const float *ws,const int *keff,int K,in
     return 1;
 }
 static void cluster_item_free(ClusterItem *it){ free(it->rows); free(it->weights); free(it->inputs); memset(it,0,sizeof(*it)); }
+/* One layer's routed batch-union to the workers: every worker's request goes on
+ * the wire first, then every reply is read, in worker order -- the order the
+ * routed rows were summed in when each worker was served in turn, so the f32
+ * sum does not move and the gate stays token-exact. The bytes per worker are
+ * the same; what changes is that the workers compute at the same time, so a
+ * layer waits for its slowest worker instead of for each of them in turn. */
 static void cluster_moe_batch(Model *m,int layer,float *x,int S,float *out,
                               const int *idxs,const float *ws,const int *keff,int K,
                               const int *uniq,int base,int nb){
-    int D=m->c.hidden;
-    for(int wi=0;wi<g_cluster_n;wi++){
-        ClusterItem items[64]; memset(items,0,sizeof(items)); int n=0;
+    int D=m->c.hidden, wfail=-1;
+    ClusterItem (*items)[64]=calloc((size_t)g_cluster_n,sizeof(*items));
+    int *n=calloc((size_t)g_cluster_n,sizeof(int));
+    if(!items||!n){ fprintf(stderr,"OOM cluster batch\n"); exit(1); }
+    for(int wi=0;wi<g_cluster_n&&wfail<0;wi++){           /* 1) every request out */
         for(int j=0;j<nb;j++){
             int eid=uniq[base+j];
             if((eid+layer)%g_cluster_n!=wi) continue;
-            if(n<64 && cluster_item(idxs,ws,keff,K,S,eid,&items[n],D,x)) n++;
+            if(n[wi]<64 && cluster_item(idxs,ws,keff,K,S,eid,&items[wi][n[wi]],D,x)) n[wi]++;
         }
-        if(!n) continue;
+        if(!n[wi]) continue;
+        ClusterWorker *w=&g_cluster_workers[wi]; uint32_t v;
+        if(cluster_io(w->fd,(void*)COLI_CLUSTER_MAGIC,8,1)){ wfail=wi; break; }
+        v=COLI_CLUSTER_VERSION; if(cluster_u32(w->fd,&v,1)){ wfail=wi; break; }
+        v=(uint32_t)layer; if(cluster_u32(w->fd,&v,1)){ wfail=wi; break; }
+        v=(uint32_t)D; if(cluster_u32(w->fd,&v,1)){ wfail=wi; break; }
+        v=(uint32_t)m->c.moe_inter; if(cluster_u32(w->fd,&v,1)){ wfail=wi; break; }
+        v=(uint32_t)n[wi]; if(cluster_u32(w->fd,&v,1)){ wfail=wi; break; }
+        for(int j=0;j<n[wi]&&wfail<0;j++){
+            ClusterItem *it=&items[wi][j];
+            v=(uint32_t)it->eid; if(cluster_u32(w->fd,&v,1)){ wfail=wi; break; }
+            v=(uint32_t)it->nr; if(cluster_u32(w->fd,&v,1)){ wfail=wi; break; }
+            if(cluster_io(w->fd,it->inputs,(size_t)it->nr*D*sizeof(float),1)){ wfail=wi; break; }
+        }
+    }
+    for(int wi=0;wi<g_cluster_n&&wfail<0;wi++){           /* 2) every reply in, in worker order */
+        if(!n[wi]) continue;
         ClusterWorker *w=&g_cluster_workers[wi]; char magic[8]; uint32_t v;
-        if(cluster_io(w->fd,(void*)COLI_CLUSTER_MAGIC,8,1)) goto fail;
-        v=COLI_CLUSTER_VERSION; if(cluster_u32(w->fd,&v,1)) goto fail;
-        v=(uint32_t)layer; if(cluster_u32(w->fd,&v,1)) goto fail;
-        v=(uint32_t)D; if(cluster_u32(w->fd,&v,1)) goto fail;
-        v=(uint32_t)m->c.moe_inter; if(cluster_u32(w->fd,&v,1)) goto fail;
-        v=(uint32_t)n; if(cluster_u32(w->fd,&v,1)) goto fail;
-        for(int j=0;j<n;j++){
-            v=(uint32_t)items[j].eid; if(cluster_u32(w->fd,&v,1)) goto fail;
-            v=(uint32_t)items[j].nr; if(cluster_u32(w->fd,&v,1)) goto fail;
-            if(cluster_io(w->fd,items[j].inputs,(size_t)items[j].nr*D*sizeof(float),1)) goto fail;
-        }
-        if(cluster_io(w->fd,magic,8,0)||memcmp(magic,COLI_CLUSTER_MAGIC,8)) goto fail;
-        if(cluster_u32(w->fd,&v,0)||v!=COLI_CLUSTER_VERSION) goto fail;
-        if(cluster_u32(w->fd,&v,0)||v!=0) goto fail;
-        if(cluster_u32(w->fd,&v,0)||v!=(uint32_t)n) goto fail;
-        for(int j=0;j<n;j++){
-            uint32_t eid,nr;
+        if(cluster_io(w->fd,magic,8,0)||memcmp(magic,COLI_CLUSTER_MAGIC,8)){ wfail=wi; break; }
+        if(cluster_u32(w->fd,&v,0)||v!=COLI_CLUSTER_VERSION){ wfail=wi; break; }
+        if(cluster_u32(w->fd,&v,0)||v!=0){ wfail=wi; break; }
+        if(cluster_u32(w->fd,&v,0)||v!=(uint32_t)n[wi]){ wfail=wi; break; }
+        for(int j=0;j<n[wi]&&wfail<0;j++){
+            ClusterItem *it=&items[wi][j]; uint32_t eid,nr;
             if(cluster_u32(w->fd,&eid,0)||cluster_u32(w->fd,&nr,0) ||
-               eid!=(uint32_t)items[j].eid || nr!=(uint32_t)items[j].nr) goto fail;
+               eid!=(uint32_t)it->eid || nr!=(uint32_t)it->nr){ wfail=wi; break; }
             float *y=falloc((int64_t)nr*D);
-            if(cluster_io(w->fd,y,(size_t)nr*D*sizeof(float),0)){ free(y); goto fail; }
-            for(uint32_t r=0;r<nr;r++){ float *dst=out+(int64_t)items[j].rows[r]*D;
-                float wt=items[j].weights[r]; for(int d=0;d<D;d++) dst[d]+=wt*y[(int64_t)r*D+d]; }
+            if(cluster_io(w->fd,y,(size_t)nr*D*sizeof(float),0)){ free(y); wfail=wi; break; }
+            for(uint32_t r=0;r<nr;r++){ float *dst=out+(int64_t)it->rows[r]*D;
+                float wt=it->weights[r]; for(int d=0;d<D;d++) dst[d]+=wt*y[(int64_t)r*D+d]; }
             free(y);
         }
-        for(int j=0;j<n;j++) cluster_item_free(&items[j]);
-        continue;
-fail:
-        for(int j=0;j<n;j++) cluster_item_free(&items[j]);
-        fprintf(stderr,"[CLUSTER] expert worker %s:%d failed during layer %d batch\n",w->host,w->port,layer);
+    }
+    for(int wi=0;wi<g_cluster_n;wi++) for(int j=0;j<n[wi];j++) cluster_item_free(&items[wi][j]);
+    free(items); free(n);
+    if(wfail>=0){
+        fprintf(stderr,"[CLUSTER] expert worker %s:%d failed during layer %d batch\n",
+                g_cluster_workers[wfail].host,g_cluster_workers[wfail].port,layer);
         exit(1);
     }
 }

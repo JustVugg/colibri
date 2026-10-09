@@ -3,7 +3,8 @@
 The coordinator keeps token generation, routing, and KV state local while
 disk-backed expert workers execute routed FFNs on other Macs. A layer's routed
 batch-union is sent as one persistent TCP request, so a token does not incur one
-round trip per expert.
+round trip per expert, and to every worker before any reply is read, so a layer
+waits for its slowest worker rather than for each of them in turn.
 
 Start the optional registration service:
 
