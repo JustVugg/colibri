@@ -295,10 +295,13 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
     }
 #endif
     /* Prefill tile: decode each bf16 weight once for four independent rows.
-     * Explicit mul+add (rather than a C expression that the compiler may fuse)
-     * matches the non-FMA scalar oracle bit for bit.  Every SIMD lane still
-     * accumulates i=0..I-1 in the original order. */
-#if defined(__AVX2__)
+     * The rounding is spelled out as one fused multiply-add in every path
+     * below, tile and scalar alike: a separate multiply and add is fused or
+     * not at the optimizer's discretion (-ffp-contract=fast fuses it under
+     * -mtune=skylake and leaves it alone under generic tuning, #1864), so
+     * the tile and the single-row loop could round differently. Every SIMD
+     * lane still accumulates i=0..I-1 in the original order. */
+#if defined(__AVX2__) && defined(__FMA__)
     if (S > 1) {
         #pragma omp parallel for schedule(static)
         for (int o = 0; o < O; o++) {
@@ -313,7 +316,7 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
                 for (int i = 0; i < I; i++) {
                     union { uint32_t u; float f; } v = { (uint32_t)w[i] << 16 };
                     __m128 xv = _mm_set_ps(x3[i], x2[i], x1[i], x0[i]);
-                    acc = _mm_add_ps(acc, _mm_mul_ps(xv, _mm_set1_ps(v.f)));
+                    acc = _mm_fmadd_ps(xv, _mm_set1_ps(v.f), acc);
                 }
                 float a[4]; _mm_storeu_ps(a, acc);
                 y[(int64_t)(s+0)*O + o] = a[0]; y[(int64_t)(s+1)*O + o] = a[1];
@@ -324,7 +327,7 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
                 float acc = 0.f;
                 for (int i = 0; i < I; i++) {
                     union { uint32_t u; float f; } v = { (uint32_t)w[i] << 16 };
-                    acc += xs[i] * v.f;
+                    acc = fmaf(xs[i], v.f, acc);
                 }
                 y[(int64_t)s * O + o] = acc;
             }
@@ -340,7 +343,7 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
             float acc = 0.f;
             for (int i = 0; i < I; i++) {
                 union { uint32_t u; float f; } v = { (uint32_t)w[i] << 16 };
-                acc += xs[i] * v.f;
+                acc = fmaf(xs[i], v.f, acc);
             }
             y[(int64_t)s * O + o] = acc;
         }

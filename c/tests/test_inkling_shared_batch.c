@@ -53,12 +53,14 @@ static void compare_paths(const char *format,Model *m,Layer *l,int S,
           "%s scalar calls=%llu expected=%d",format,
           (unsigned long long)g_matmul_w_calls,S*ns*3);
 
-    const char *modes[]={NULL,"3"};
-    for(int z=0;z<2;z++){
+    /* Batches of 3, 4 and 5 cover the four-row tile with a remainder of 3,
+     * no remainder, and a remainder of 1 (#1864). */
+    const char *modes[]={NULL,"3","4","5"};
+    for(int z=0;z<4;z++){
         memcpy(out,seed,out_bytes);
         if(modes[z])setenv("INK_SHARED_BATCH",modes[z],1);else unsetenv("INK_SHARED_BATCH");
         g_matmul_w_calls=0;shared_experts_cpu(m,l,x,S,out,wgt,g,u,hh);
-        int chunks=modes[z]?(S+2)/3:1,expected=chunks*ns*3;
+        int B=modes[z]?atoi(modes[z]):S,chunks=(S+B-1)/B,expected=chunks*ns*3;
         CHECK(!memcmp(out,scalar,out_bytes),"%s mode=%s is not scalar bit-exact",
               format,modes[z]?modes[z]:"default");
         CHECK(g_matmul_w_calls==(uint64_t)expected,
