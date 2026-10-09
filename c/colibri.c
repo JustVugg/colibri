@@ -3332,9 +3332,24 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal, int de
 #if !defined(_WIN32)
 /* Expert-worker protocol. Headers use network-order u32 values; activation
  * bytes remain raw little-endian f32, matching the native engine ABI. One
- * request contains the routed batch-union for a layer. */
+ * request contains the routed batch-union for a layer.
+ *   v1: magic version layer D I n, then per expert eid nr and nr*D f32.
+ *   v2: magic version act layer D I n -- v1 with the rows in `act`, spoken
+ *       only for COLI_CLUSTER_ACT=q8: a row is its ceil(D/32) f32 block
+ *       scales then its D int8 (qrow_i8 per block of 32, the engine's own
+ *       activation rounding), both directions: ~3.5x fewer bytes, and NOT
+ *       token-exact. f32 (the default) keeps speaking v1, so a cluster of
+ *       mixed binaries keeps working; a v1 worker refuses v2 by closing,
+ *       which the coordinator names. */
 #define COLI_CLUSTER_MAGIC "COLIEX01"
 #define COLI_CLUSTER_VERSION 1u
+#define COLI_CLUSTER_VERSION_ACT 2u
+#define COLI_ACT_F32 0u
+#define COLI_ACT_Q8  1u
+#define COLI_Q8_BLOCK 32u
+static uint32_t g_cluster_act=COLI_ACT_F32;
+static _Atomic uint64_t g_cluster_tx_bytes, g_cluster_rx_bytes;
+static const char *cluster_act_name(uint32_t act){ return act==COLI_ACT_Q8?"q8":"f32"; }
 static int cluster_io(int fd, void *buf, size_t n, int write_mode){
     int send_flags=0;
 #ifdef MSG_NOSIGNAL
@@ -3345,12 +3360,13 @@ static int cluster_io(int fd, void *buf, size_t n, int write_mode){
         if(setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&enabled,sizeof(enabled))!=0) return -1;
     }
 #endif
-    char *p=(char*)buf;
+    char *p=(char*)buf; size_t total=n;
     while(n){
         ssize_t r=write_mode?send(fd,p,n,send_flags):recv(fd,p,n,MSG_WAITALL);
         if(r<=0){ if(r<0&&errno==EINTR) continue; return -1; }
         p+=r; n-=(size_t)r;
     }
+    atomic_fetch_add_explicit(write_mode?&g_cluster_tx_bytes:&g_cluster_rx_bytes,(uint64_t)total,memory_order_relaxed);
     return 0;
 }
 static int cluster_u32(int fd, uint32_t *v, int write_mode){
@@ -3358,6 +3374,45 @@ static int cluster_u32(int fd, uint32_t *v, int write_mode){
     if(cluster_io(fd,write_mode?(void*)&x:(void*)v,sizeof(x),write_mode)) return -1;
     if(!write_mode) *v=ntohl(*v);
     return 0;
+}
+/* Wire bytes of nr rows of D values in `act`: raw f32, or for q8 each row's
+ * ceil(D/32) f32 block scales followed by its D int8 values. */
+static size_t cluster_act_bytes(uint32_t act,uint32_t nr,uint32_t D){
+    size_t row=act==COLI_ACT_Q8?(size_t)((D+COLI_Q8_BLOCK-1)/COLI_Q8_BLOCK)*sizeof(float)+D:(size_t)D*sizeof(float);
+    return row*nr;
+}
+static void cluster_q8_encode(const float *x,uint32_t nr,uint32_t D,uint8_t *dst){
+    uint32_t nb=(D+COLI_Q8_BLOCK-1)/COLI_Q8_BLOCK;
+    for(uint32_t r=0;r<nr;r++){
+        uint8_t *row=dst+(size_t)r*(nb*sizeof(float)+D); int8_t *q=(int8_t*)(row+nb*sizeof(float));
+        for(uint32_t b=0;b<nb;b++){
+            uint32_t n=D-b*COLI_Q8_BLOCK; if(n>COLI_Q8_BLOCK) n=COLI_Q8_BLOCK;
+            float s=qrow_i8(x+(size_t)r*D+b*COLI_Q8_BLOCK,q+b*COLI_Q8_BLOCK,(int)n);
+            memcpy(row+b*sizeof(float),&s,sizeof(s));
+        }
+    }
+}
+static void cluster_q8_decode(const uint8_t *src,uint32_t nr,uint32_t D,float *x){
+    uint32_t nb=(D+COLI_Q8_BLOCK-1)/COLI_Q8_BLOCK;
+    for(uint32_t r=0;r<nr;r++){
+        const uint8_t *row=src+(size_t)r*(nb*sizeof(float)+D); const int8_t *q=(const int8_t*)(row+nb*sizeof(float));
+        for(uint32_t b=0;b<nb;b++){
+            float s; memcpy(&s,row+b*sizeof(float),sizeof(s));
+            uint32_t n=D-b*COLI_Q8_BLOCK; if(n>COLI_Q8_BLOCK) n=COLI_Q8_BLOCK;
+            for(uint32_t i=0;i<n;i++) x[(size_t)r*D+b*COLI_Q8_BLOCK+i]=s*(float)q[b*COLI_Q8_BLOCK+i];
+        }
+    }
+}
+/* nr rows of D floats across the wire in `act`; q8 goes through a scratch buffer. */
+static int cluster_act_send(int fd,uint32_t act,const float *x,uint32_t nr,uint32_t D){
+    if(act!=COLI_ACT_Q8) return cluster_io(fd,(void*)x,(size_t)nr*D*sizeof(float),1);
+    size_t n=cluster_act_bytes(act,nr,D); uint8_t *buf=malloc(n); if(!buf) return -1;
+    cluster_q8_encode(x,nr,D,buf); int rc=cluster_io(fd,buf,n,1); free(buf); return rc;
+}
+static int cluster_act_recv(int fd,uint32_t act,float *x,uint32_t nr,uint32_t D){
+    if(act!=COLI_ACT_Q8) return cluster_io(fd,x,(size_t)nr*D*sizeof(float),0);
+    size_t n=cluster_act_bytes(act,nr,D); uint8_t *buf=malloc(n); if(!buf) return -1;
+    int rc=cluster_io(fd,buf,n,0); if(!rc) cluster_q8_decode(buf,nr,D,x); free(buf); return rc;
 }
 static int cluster_connect_one(const char *spec, ClusterWorker *out){
     char copy[256]; strncpy(copy,spec,sizeof(copy)-1); copy[sizeof(copy)-1]=0;
@@ -3380,11 +3435,20 @@ static int cluster_connect_one(const char *spec, ClusterWorker *out){
     out->port=port; return 0;
 }
 static void cluster_close_all(void){
+    if(g_cluster_n) fprintf(stderr,"[CLUSTER] transfer: %llu bytes sent, %llu bytes received (activations %s)\n",
+                            (unsigned long long)atomic_load_explicit(&g_cluster_tx_bytes,memory_order_relaxed),
+                            (unsigned long long)atomic_load_explicit(&g_cluster_rx_bytes,memory_order_relaxed),
+                            cluster_act_name(g_cluster_act));
     for(int i=0;i<g_cluster_n;i++) if(g_cluster_workers[i].fd>=0) close(g_cluster_workers[i].fd);
     g_cluster_n=0;
 }
 static void cluster_init(void){
     const char *list=getenv("CLUSTER_WORKERS"); if(!list||!*list) return;
+    const char *act=getenv("COLI_CLUSTER_ACT");
+    if(act&&*act){
+        if(!strcmp(act,"q8")) g_cluster_act=COLI_ACT_Q8;
+        else if(strcmp(act,"f32")){ fprintf(stderr,"[CLUSTER] COLI_CLUSTER_ACT must be f32 or q8, not '%s'\n",act); exit(1); }
+    }
     char *copy=strdup(list),*save=NULL;
     for(char *tok=strtok_r(copy,",",&save);tok&&g_cluster_n<16;tok=strtok_r(NULL,",",&save)){
         while(*tok==' '||*tok=='\t') tok++;
@@ -3393,7 +3457,8 @@ static void cluster_init(void){
     }
     free(copy);
     if(g_cluster_n<1){ fprintf(stderr,"[CLUSTER] no expert workers reachable\n"); exit(1); }
-    fprintf(stderr,"[CLUSTER] coordinator connected to %d expert worker(s)\n",g_cluster_n);
+    fprintf(stderr,"[CLUSTER] coordinator connected to %d expert worker(s), activations %s%s\n",g_cluster_n,
+            cluster_act_name(g_cluster_act),g_cluster_act==COLI_ACT_Q8?" (protocol v2, not token-exact)":"");
 }
 typedef struct { int eid,nr; int *rows; float *weights,*inputs; } ClusterItem;
 static int cluster_item(const int *idxs,const float *ws,const int *keff,int K,int S,
@@ -3425,8 +3490,10 @@ static void cluster_moe_batch(Model *m,int layer,float *x,int S,float *out,
         }
         if(!n) continue;
         ClusterWorker *w=&g_cluster_workers[wi]; char magic[8]; uint32_t v;
+        uint32_t ver=g_cluster_act==COLI_ACT_F32?COLI_CLUSTER_VERSION:COLI_CLUSTER_VERSION_ACT;
         if(cluster_io(w->fd,(void*)COLI_CLUSTER_MAGIC,8,1)) goto fail;
-        v=COLI_CLUSTER_VERSION; if(cluster_u32(w->fd,&v,1)) goto fail;
+        v=ver; if(cluster_u32(w->fd,&v,1)) goto fail;
+        if(ver==COLI_CLUSTER_VERSION_ACT){ v=g_cluster_act; if(cluster_u32(w->fd,&v,1)) goto fail; }
         v=(uint32_t)layer; if(cluster_u32(w->fd,&v,1)) goto fail;
         v=(uint32_t)D; if(cluster_u32(w->fd,&v,1)) goto fail;
         v=(uint32_t)m->c.moe_inter; if(cluster_u32(w->fd,&v,1)) goto fail;
@@ -3434,10 +3501,11 @@ static void cluster_moe_batch(Model *m,int layer,float *x,int S,float *out,
         for(int j=0;j<n;j++){
             v=(uint32_t)items[j].eid; if(cluster_u32(w->fd,&v,1)) goto fail;
             v=(uint32_t)items[j].nr; if(cluster_u32(w->fd,&v,1)) goto fail;
-            if(cluster_io(w->fd,items[j].inputs,(size_t)items[j].nr*D*sizeof(float),1)) goto fail;
+            if(cluster_act_send(w->fd,g_cluster_act,items[j].inputs,(uint32_t)items[j].nr,(uint32_t)D)) goto fail;
         }
         if(cluster_io(w->fd,magic,8,0)||memcmp(magic,COLI_CLUSTER_MAGIC,8)) goto fail;
-        if(cluster_u32(w->fd,&v,0)||v!=COLI_CLUSTER_VERSION) goto fail;
+        if(cluster_u32(w->fd,&v,0)||v!=ver) goto fail;
+        if(ver==COLI_CLUSTER_VERSION_ACT&&(cluster_u32(w->fd,&v,0)||v!=g_cluster_act)) goto fail;
         if(cluster_u32(w->fd,&v,0)||v!=0) goto fail;
         if(cluster_u32(w->fd,&v,0)||v!=(uint32_t)n) goto fail;
         for(int j=0;j<n;j++){
@@ -3445,7 +3513,7 @@ static void cluster_moe_batch(Model *m,int layer,float *x,int S,float *out,
             if(cluster_u32(w->fd,&eid,0)||cluster_u32(w->fd,&nr,0) ||
                eid!=(uint32_t)items[j].eid || nr!=(uint32_t)items[j].nr) goto fail;
             float *y=falloc((int64_t)nr*D);
-            if(cluster_io(w->fd,y,(size_t)nr*D*sizeof(float),0)){ free(y); goto fail; }
+            if(cluster_act_recv(w->fd,g_cluster_act,y,nr,(uint32_t)D)){ free(y); goto fail; }
             for(uint32_t r=0;r<nr;r++){ float *dst=out+(int64_t)items[j].rows[r]*D;
                 float wt=items[j].weights[r]; for(int d=0;d<D;d++) dst[d]+=wt*y[(int64_t)r*D+d]; }
             free(y);
@@ -3454,7 +3522,11 @@ static void cluster_moe_batch(Model *m,int layer,float *x,int S,float *out,
         continue;
 fail:
         for(int j=0;j<n;j++) cluster_item_free(&items[j]);
-        fprintf(stderr,"[CLUSTER] expert worker %s:%d failed during layer %d batch\n",w->host,w->port,layer);
+        fprintf(stderr,"[CLUSTER] expert worker %s:%d failed during layer %d batch (protocol v%u, activations %s)\n",
+                w->host,w->port,layer,ver,cluster_act_name(g_cluster_act));
+        if(ver!=COLI_CLUSTER_VERSION)
+            fprintf(stderr,"[CLUSTER] if the worker at %s:%d only speaks protocol v%u it refuses this v%u request by closing: "
+                    "rebuild it, or run this coordinator with COLI_CLUSTER_ACT=f32\n",w->host,w->port,COLI_CLUSTER_VERSION,ver);
         exit(1);
     }
 }
@@ -3492,14 +3564,27 @@ static int cluster_worker_run(const char *snap,int port,int ebits,int dbits){
     int yes=1; setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));
     struct sockaddr_in addr={0}; addr.sin_family=AF_INET; addr.sin_addr.s_addr=htonl(INADDR_ANY); addr.sin_port=htons((uint16_t)port);
     if(bind(fd,(struct sockaddr*)&addr,sizeof(addr))||listen(fd,4)){perror("cluster worker bind/listen");return 1;}
-    fprintf(stderr,"[CLUSTER] expert worker listening on 0.0.0.0:%d (disk-backed, cache=%d/layer)\n",port,nr_layers);
+    fprintf(stderr,"[CLUSTER] expert worker listening on 0.0.0.0:%d (disk-backed, cache=%d/layer, protocol v%u/v%u)\n",
+            port,nr_layers,COLI_CLUSTER_VERSION,COLI_CLUSTER_VERSION_ACT);
     for(;;){
         int cfd=accept(fd,NULL,NULL); if(cfd<0){if(errno==EINTR)continue;break;}
         for(;;){
-            char magic[8]; uint32_t v,layer,D,I,n;
+            char magic[8]; uint32_t v,ver,act=COLI_ACT_F32,layer,D,I,n;
             if(cluster_io(cfd,magic,8,0)) break;
-            if(memcmp(magic,COLI_CLUSTER_MAGIC,8)||cluster_u32(cfd,&v,0)||v!=COLI_CLUSTER_VERSION||
-               cluster_u32(cfd,&layer,0)||cluster_u32(cfd,&D,0)||cluster_u32(cfd,&I,0)||cluster_u32(cfd,&n,0)||
+            if(memcmp(magic,COLI_CLUSTER_MAGIC,8)||cluster_u32(cfd,&ver,0)){ close(cfd); cfd=-1; break; }
+            if(ver!=COLI_CLUSTER_VERSION&&ver!=COLI_CLUSTER_VERSION_ACT){
+                fprintf(stderr,"[CLUSTER] worker speaks protocol v%u and v%u; refusing a v%u request\n",
+                        COLI_CLUSTER_VERSION,COLI_CLUSTER_VERSION_ACT,ver);
+                close(cfd); cfd=-1; break;
+            }
+            if(ver==COLI_CLUSTER_VERSION_ACT){
+                if(cluster_u32(cfd,&act,0)){ close(cfd); cfd=-1; break; }
+                if(act!=COLI_ACT_F32&&act!=COLI_ACT_Q8){
+                    fprintf(stderr,"[CLUSTER] worker refusing activation format %u (f32=%u, q8=%u)\n",act,COLI_ACT_F32,COLI_ACT_Q8);
+                    close(cfd); cfd=-1; break;
+                }
+            }
+            if(cluster_u32(cfd,&layer,0)||cluster_u32(cfd,&D,0)||cluster_u32(cfd,&I,0)||cluster_u32(cfd,&n,0)||
                D!=(uint32_t)m.c.hidden||I!=(uint32_t)m.c.moe_inter||layer>=(uint32_t)nr_layers||n<1||n>64){
                 close(cfd); cfd=-1; break;
             }
@@ -3508,11 +3593,15 @@ static int cluster_worker_run(const char *snap,int port,int ebits,int dbits){
                 uint32_t eid,nr;
                 if(cluster_u32(cfd,&eid,0)||cluster_u32(cfd,&nr,0)||eid>=(uint32_t)m.c.n_experts||nr<1||nr>65536){bad=1;break;}
                 items[j].eid=(int)eid; items[j].nr=(int)nr; items[j].inputs=falloc((int64_t)nr*D);
-                if(cluster_io(cfd,items[j].inputs,(size_t)nr*D*sizeof(float),0)){bad=1;break;}
+                if(cluster_act_recv(cfd,act,items[j].inputs,nr,D)){bad=1;break;}
             }
             if(bad){ for(uint32_t j=0;j<n;j++)free(items[j].inputs); free(items); close(cfd); cfd=-1; break; }
-            v=COLI_CLUSTER_VERSION; if(cluster_io(cfd,(void*)COLI_CLUSTER_MAGIC,8,1)||cluster_u32(cfd,&v,1)) break;
-            v=0; if(cluster_u32(cfd,&v,1)) break; v=n; if(cluster_u32(cfd,&v,1)) break;
+            /* Response header; a peer gone mid-header frees the batch like a bad request did. */
+            v=ver; bad=cluster_io(cfd,(void*)COLI_CLUSTER_MAGIC,8,1)||cluster_u32(cfd,&v,1);
+            if(!bad&&ver==COLI_CLUSTER_VERSION_ACT){ v=act; bad=cluster_u32(cfd,&v,1); }
+            if(!bad){ v=0; bad=cluster_u32(cfd,&v,1); }
+            if(!bad){ v=n; bad=cluster_u32(cfd,&v,1); }
+            if(bad){ for(uint32_t j=0;j<n;j++)free(items[j].inputs); free(items); break; }
             ESlot *slot=&cache[layer];
             for(uint32_t j=0;j<n;j++){
                 if(slot->eid!=items[j].eid || !slot->slab){
@@ -3531,7 +3620,7 @@ static int cluster_worker_run(const char *snap,int port,int ebits,int dbits){
                 if(slot->g.fmt==6) e8_rot_rows(items[j].inputs,rows,D);
                 expert_ffn(y,g,u,items[j].inputs,&slot->g,&slot->u,&slot->d,rows,I);
                 v=(uint32_t)items[j].eid; if(cluster_u32(cfd,&v,1)){bad=1;free(g);free(u);free(y);break;}
-                v=(uint32_t)rows; if(cluster_u32(cfd,&v,1)||cluster_io(cfd,y,(size_t)rows*D*sizeof(float),1)){bad=1;free(g);free(u);free(y);break;}
+                v=(uint32_t)rows; if(cluster_u32(cfd,&v,1)||cluster_act_send(cfd,act,y,(uint32_t)rows,D)){bad=1;free(g);free(u);free(y);break;}
                 free(g);free(u);free(y);
             }
             for(uint32_t j=0;j<n;j++)free(items[j].inputs); free(items);
