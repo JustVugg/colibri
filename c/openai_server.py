@@ -4273,9 +4273,14 @@ def validate_tools(body):
 
 
 def generation_options(body, limit):
-    if body.get("n", 1) != 1:
+    n = body.get("n", 1)
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise APIError(400, "`n` must be an integer.", "n", "invalid_value")
+    if n != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
     best_of = body.get("best_of", 1)
+    if best_of is not None and (isinstance(best_of, bool) or not isinstance(best_of, int)):
+        raise APIError(400, "`best_of` must be an integer.", "best_of", "invalid_value")
     if best_of not in (None, 1):
         raise APIError(400, "Colibri currently supports `best_of` equal to 1 only.",
                        "best_of", "unsupported_value")

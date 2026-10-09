@@ -2513,6 +2513,15 @@ class BaseWireContractTest(unittest.TestCase):
 
 
 class OpenAIHonestySetTest(unittest.TestCase):
+    def test_rejects_non_integer_count_fields(self):
+        for field in ("n", "best_of"):
+            for value in (True, 1.0, "1"):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(APIError) as caught:
+                        generation_options({field: value}, 16)
+                    self.assertEqual((caught.exception.status, caught.exception.param,
+                                      caught.exception.code), (400, field, "invalid_value"))
+
     def test_refuses_unsupported_result_shaping_fields(self):
         cases = (
             ({"best_of": 2}, "best_of", "unsupported_value"),
@@ -2867,6 +2876,22 @@ class HTTPTest(unittest.TestCase):
             self.request("/v1/models", key="wrong")
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
+
+    def test_non_integer_count_fields_return_400_before_engine_work(self):
+        cases = (("/v1/completions", {"prompt": "hi"}, "n", True),
+                 ("/v1/completions", {"prompt": "hi"}, "best_of", 1.0),
+                 ("/v1/chat/completions",
+                  {"messages": [{"role": "user", "content": "hi"}]}, "n", 1.0))
+        for path, fields, field, value in cases:
+            with self.subTest(path=path, field=field, value=value):
+                calls_before = len(self.engine.calls)
+                with self.assertRaises(HTTPError) as caught:
+                    self.request(path, {"model": "test-model", **fields, field: value})
+                with caught.exception as response:
+                    self.assertEqual(response.code, 400)
+                    error = json.load(response)["error"]
+                self.assertEqual((error["param"], error["code"]), (field, "invalid_value"))
+                self.assertEqual(len(self.engine.calls), calls_before)
 
     def test_unsupported_modalities_fail_before_engine_work(self):
         cases = (
