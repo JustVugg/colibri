@@ -27,7 +27,7 @@ for path in sorted(glob.glob(os.path.join(STATS, "*.txt"))):
     t = 0
     for line in open(path):
         p = line.split()
-        if len(p) == 3:
+        if len(p) == 3 and int(p[0]) >= 0:  # negative layer = header record (route_trace.h)
             d[(int(p[0]), int(p[1]))] = int(p[2])
             t += int(p[2])
     runs[(cat, idx)] = d
