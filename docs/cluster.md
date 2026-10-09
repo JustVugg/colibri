@@ -63,6 +63,37 @@ without closing is noticed by TCP keepalive in about two deadlines. Raise the
 deadline for a worker whose disk needs more than two minutes per prefill
 chunk.
 
+## Protocol v2
+
+The wire protocol (`COLIEX01` in `c/colibri.c`) has two versions. v1, the
+default, moves raw f32 rows and is what every coordinator speaks unless asked
+otherwise, so a cluster of mixed engine builds keeps working. v2 adds an `act`
+word to the header and sends a layer's batch rows once, each expert naming its
+rows by index, where v1 copies a row into every expert that routes it (at
+decode with top-8, the same row eight times); a worker accepts both. The
+coordinator speaks v2 only when it needs one of:
+
+- **q8 activations**, `COLI_CLUSTER_ACT=q8`: every row crosses the wire as int8
+  blocks of 32 behind one f32 scale, both directions -- about 3.5x fewer bytes,
+  and not token-exact (the gate gives it a drift bound, not a seat).
+- **The shared expert on the worker**, `CLUSTER_SHARED=1`: each layer's shared
+  expert rides the layer's first routed request as one more item (every row,
+  unweighted, in the request's `act`) to the worker `layer % n_workers`, which
+  loads the three matrices once and keeps them (GLM-5.2 at 8-bit dense: 2.9 GB
+  over all layers). With f32 rows the worker runs the same CPU sequence FASE E
+  runs and the coordinator adds the rows at the same point, so neither a token
+  nor a logits byte moves: `c/tests/test_cluster_sharding.py` holds that run to
+  the local run's logits bytes. Off by default.
+
+Whenever the coordinator will speak v2 it first sends every worker an empty v2
+request, a hello. A worker built from an older engine closes on it instead of
+answering, and the coordinator refuses that worker by name (`expert worker
+HOST:PORT closed on the COLIEX01 v2 hello ... rebuild the worker`) before
+generating anything. A worker refuses a version or activation format it does
+not speak the same way, on its own stderr. The coordinator reports bytes sent
+and received at exit.
+
 The transport is disabled unless workers are configured, so the existing
-single-machine path remains unchanged. Dense-layer sharding and browser/WebGPU
-workers are separate follow-up seams.
+single-machine path remains unchanged. Sharding the attention and dense
+matrices across workers, and browser/WebGPU workers, are separate follow-up
+seams.
