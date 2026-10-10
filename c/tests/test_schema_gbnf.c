@@ -30,7 +30,63 @@ static int walk(GrState *S, const char *bytes){
     return n;
 }
 
+/* Finite numbers outside the integer formatting fast path must reach the
+ * compiler and PDA without an out-of-range float-to-integer conversion.
+ * Run this suite with -fsanitize=undefined,float-cast-overflow as well. */
+static void number_literals(void){
+    static const struct { const char *source, *literal; } cases[] = {
+        {"1e100", "1e+100"}, {"-1e100", "-1e+100"},
+        {"1.7976931348623157e308", "1.7976931348623157e+308"},
+        {"-1.7976931348623157e308", "-1.7976931348623157e+308"},
+        {"9223372036854775808", "9.2233720368547758e+18"},
+        {"-9223372036854775808", "-9.2233720368547758e+18"},
+        {"1e15", "1000000000000000"}, {"-1e15", "-1000000000000000"},
+        {"999999999999999", "999999999999999"},
+        {"-999999999999999", "-999999999999999"},
+        {"1e-100", "1e-100"}, {"-1e-100", "-1e-100"},
+        {"0", "0"}, {"-0", "0"}, {"42.0", "42"}, {"-42", "-42"},
+        {"0.5", "0.5"}, {"-0.5", "-0.5"}
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++){
+        /* Both numeric callers share the formatter. Keep a mixed enum so the
+         * numeric path does not disturb its existing boolean/string members. */
+        for (int en = 0; en < 2; en++){
+            char schema[192];
+            if (en) snprintf(schema, sizeof schema,
+                "{\"enum\":[%s,false,\"control\"]}", cases[i].source);
+            else snprintf(schema, sizeof schema, "{\"const\":%s}", cases[i].source);
+            Grammar G; GrState S;
+            int ok = compile(schema, &G, NULL, 0) == 0;
+            CHECK(ok);
+            if (!ok) continue;
+            gr_state_init(&S, &G);
+            CHECK(walk(&S, cases[i].literal) == (int)strlen(cases[i].literal));
+            unsigned char mask[32]; int can_end = 0;
+            gr_admissible(&S, mask, &can_end);
+            CHECK(can_end == 1);
+            /* A different number must not be admitted as this literal. */
+            const char *wrong = !strcmp(cases[i].literal, "0") ? "1" : "0";
+            gr_state_init(&S, &G);
+            int consumed = walk(&S, wrong);
+            gr_admissible(&S, mask, &can_end);
+            CHECK(consumed != (int)strlen(wrong) || can_end == 0);
+            if (en){
+                gr_state_init(&S, &G);
+                CHECK(walk(&S, "false") == 5);
+                gr_admissible(&S, mask, &can_end);
+                CHECK(can_end == 1);
+                gr_state_init(&S, &G);
+                CHECK(walk(&S, "\"control\"") == 9);
+                gr_admissible(&S, mask, &can_end);
+                CHECK(can_end == 1);
+            }
+            gr_free(&G);
+        }
+    }
+}
+
 int main(void){
+    number_literals();
     /* 1. simple strict object: forced spans resume inside literals (jws points
      *    themselves are not forced), compact AND sloppy instances both walk */
     {

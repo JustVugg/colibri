@@ -81,8 +81,9 @@ static void sgb_put_json_string_lit(SgbCtx *C, const char *raw){
 /* emit a number the way a model would print it: shortest round-trip via %g */
 static void sgb_put_number_lit(SgbCtx *C, double d){
     char b[64]; snprintf(b, sizeof b, "\"%.17g\"", d);
-    /* trim %.17g noise for integers */
-    if (d == (double)(long long)d && d < 1e15 && d > -1e15)
+    /* Check the formatting range before converting: finite schema numbers
+     * outside it need not be representable as long long. */
+    if (d < 1e15 && d > -1e15 && d == (double)(long long)d)
         snprintf(b, sizeof b, "\"%lld\"", (long long)d);
     sgb_put(C, b);
 }
