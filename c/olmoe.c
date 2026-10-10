@@ -877,6 +877,12 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
 static void (*g_test_expert_load)(Model *m, int layer, int eid, Slot *s);
 #endif
 
+static void missing_merged_expert_tensor(const char *name) {
+    fprintf(stderr, "%s is missing; this OLMoE engine requires a converted merged-int8 "
+            "checkpoint. Run python tools/convert_olmoe_merged.py --model <source-model> "
+            "--out <converted-model> first, then use <converted-model> as the model.\n", name);
+}
+
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
 #ifdef COLI_CACHE_INDEX_TEST
     if (g_test_expert_load) { g_test_expert_load(m, layer, eid, s); return; }
@@ -896,13 +902,15 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     int64_t want_w = ng + ng + nd;
     int64_t want_s = (int64_t)cc->inter + cc->inter + cc->hidden;
     st_tensor *tw = st_find(&m->S, nm), *ts = st_find(&m->S, qsnm);
-    if (!tw || tw->nbytes != want_w) {
+    if (!tw) { missing_merged_expert_tensor(nm); exit(1); }
+    if (tw->nbytes != want_w) {
         fprintf(stderr, "%s: expert weight is %lld bytes — expected %lld for [inter=%d,hidden=%d], "
-                "refusing (untrusted container)\n", nm, (long long)(tw ? tw->nbytes : -1),
+                "refusing (untrusted container)\n", nm, (long long)tw->nbytes,
                 (long long)want_w, cc->inter, cc->hidden); exit(1); }
-    if (!ts || ts->numel != want_s) {
+    if (!ts) { missing_merged_expert_tensor(qsnm); exit(1); }
+    if (ts->numel != want_s) {
         fprintf(stderr, "%s: scale array is %lld elems — expected %lld, refusing (untrusted container)\n",
-                qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1); }
+                qsnm, (long long)ts->numel, (long long)want_s); exit(1); }
     double started = now_s();
     st_read_raw(&m->S, nm, s->g, g_expert_drop);
     st_read_f32(&m->S, qsnm, s->gs, 0);  /* scales are F32; use typed reader for dtype safety */
