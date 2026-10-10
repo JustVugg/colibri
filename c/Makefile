@@ -2669,6 +2669,24 @@ tests/test_qwen36_trunk_dense$(EXE): tests/test_qwen36_trunk_dense.c qwen36.c qw
 tests/test_qwen36_tier_int8_decode$(EXE): tests/test_qwen36_tier_int8_decode.c qwen36.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
+# The expert cache of the qwen36 Metal engine and its loaders, without a model:
+# eviction policies, leases, cancellation, the selected-expert loader thread,
+# the prompt layer's reader threads and the read-ahead advice schedule.
+tests/test_qwen36_cache_policy$(EXE): tests/test_qwen36_cache_policy.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen36_global_cache$(EXE): tests/test_qwen36_global_cache.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen36_selected_loader$(EXE): tests/test_qwen36_selected_loader.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen36_layer_loader$(EXE): tests/test_qwen36_layer_loader.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen36_advice_schedule$(EXE): tests/test_qwen36_advice_schedule.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
 # The qwen38 engine through its own main() on the fake backend: tier start
 # from the FP8 fixture, reduced CPU list, qt_note on recycled slots, oracle
 # tokens unchanged. Needs the fixture (qwen38-tiny-fp8-generate).
