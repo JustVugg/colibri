@@ -89,6 +89,7 @@ static int qwen36_max_ctx(void) {
 #ifdef COLI_METAL
 #include "backend_metal.h" /* coli_metal_init: affine pipelines for the store */
 #endif
+#include "qwen36_embedding.h"     /* the embedding rows read in place from the checkpoint */
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h" /* COLI_VULKAN=1: the resident dense trunk on a Vulkan device */
 static int g_vk_ready = 0;
@@ -889,6 +890,7 @@ typedef struct {
     int quant_bits;
     float *embed, *final_norm;
     uint16_t *embed_h;      /* COLI_DENSE_BITS=16: the table in f16, embed is NULL */
+    QwenEmbedding embed_native; /* the rows read in place from the checkpoint; embed is then NULL */
     QW lm_head;
     Layer *L;
     LCache *cache;          /* [n_layers] */
@@ -2348,7 +2350,22 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     int quantize_dense = load_boundaries && dense_i8_on();
     int qcount = 0; double qfreed = 0;
     if (load_boundaries) {
-        m->embed = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
+        /* With the INT8 trunk the embedding rows are read in place from the
+         * checkpoint (qwen36_embedding.h): the same f32 values as the table,
+         * without the table in RAM (2 GB on the 35B). COLI_EMBED_MMAP=0 keeps
+         * the table; a tensor it cannot map (another dtype or shape) falls
+         * back to it. A Vulkan run (COLI_VULKAN=1 in a VK=1 build, as
+         * q36_waligned tells) keeps the table: qwen36_chain.h rebuilds the
+         * state from it. */
+        const char *embed_env = getenv("COLI_EMBED_MMAP");
+        int embed_native = quantize_dense && dense_bits() == 8 && !getenv("COLI_KEEP_F32") &&
+                           !(embed_env && *embed_env == '0') && !q36_waligned();
+        char en[QW_DENSE_NAME_MAX];
+        const char *ename = dense_resolve(m, "model.embed_tokens.weight", en, sizeof en);
+        if (embed_native && qem_open(&m->embed_native, &m->S, ename, c->hidden, c->vocab))
+            fprintf(stderr, "[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table\n");
+        else
+            m->embed = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
 #ifndef COLI_VULKAN
         if (quantize_dense && dense_bits() == 16) {   /* 16-bit trunk: the table too, 2.5 GB less on the 27B */
             int64_t n = (int64_t)c->vocab * c->hidden;
@@ -4218,7 +4235,9 @@ static void q36_embed_row(Model *m, int id, int pos, float *row) {
         memcpy(row, m->vis_rows + (int64_t)vrow*D, D*sizeof(float));
     else if (m->embed_h)
         f16_to_f32_bulk(m->embed_h + (int64_t)id*D, row, D);
-    else
+    else if (m->embed_native.data) {
+        if (!qem_row(&m->embed_native, id, row, (size_t)D)) { fprintf(stderr, "invalid embedding row for token %d\n", id); exit(1); }
+    } else
         memcpy(row, m->embed + (int64_t)id*D, D*sizeof(float));
 }
 
@@ -4416,8 +4435,7 @@ static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S)
             fprintf(stderr, "token id %d out of range 0..%d -- refusing\n", ids[s], c->vocab - 1);
             exit(1);
         }
-        if (m->embed_h) f16_to_f32_bulk(m->embed_h + (int64_t)ids[s]*D, x + (int64_t)s*D, D);
-        else memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+        q36_embed_row(m, ids[s], INT_MAX, x + (int64_t)s*D);   /* never an image's row */
     }
     tier_rebuild_evicted(m);
     m->mux_rows = rows;
