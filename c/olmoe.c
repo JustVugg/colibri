@@ -51,6 +51,7 @@
 #include "pin_pool.h"                       /* piu scatti annidati */   /* riuso del prefisso tra turni (shared) */
 #include "serve_codec.h"
 #include "serve_budget.h"
+#include "exact_expf.h"                    /* exp correctly rounded: the same bits on every platform */
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -563,8 +564,22 @@ static void rmsnorm_row(float *out, const float *x, const float *w, int D, float
 
 static void softmax_row(float *x, int n) {
     float m = -1e30f; for (int i = 0; i < n; i++) if (x[i] > m) m = x[i];
-    float s = 0; for (int i = 0; i < n; i++) { x[i] = expf(x[i]-m); s += x[i]; }
+    for (int i = 0; i < n; i++) x[i] -= m;
+    exact_expf_n(x, x, n);
+    float s = 0; for (int i = 0; i < n; i++) s += x[i];
     for (int i = 0; i < n; i++) x[i] /= s;
+}
+
+/* g[i] = silu(g[i]) * u[i], silu(v) = v / (1 + exp(-v)): the exponentials of a chunk at a
+ * time through exact_expf_n, the rest element by element as before */
+static void swiglu_exact(float *g, const float *u, int I) {
+    float t[64];
+    for (int i0 = 0; i0 < I; i0 += 64) {
+        int c = I - i0 < 64 ? I - i0 : 64;
+        for (int j = 0; j < c; j++) t[j] = -g[i0 + j];
+        exact_expf_n(t, t, c);
+        for (int j = 0; j < c; j++) { float gv = g[i0 + j]; g[i0 + j] = (gv / (1.f + t[j])) * u[i0 + j]; }
+    }
 }
 
 /* ---------- caricamento ---------- */
@@ -1361,14 +1376,14 @@ static void moe_expert_row(const Model *m, const Slot *e, const float *xs, float
 #if defined(__AVX2__)
     if (moe_fused3(D, I)) {
         matmul_q_idot_pair_v3(g, u, xs, e->g, e->gs, e->u, e->us, D, I);   /* gate+up share one quant of xs */
-        for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+        swiglu_exact(g, u, I);
         matmul_q_idot_v3(hh, g, e->d, e->ds, I, D);                        /* down_proj [D,I] */
     } else
 #endif
     {
     matmul_q(g, xs, e->g, e->gs, D, I);     /* gate_proj [I,D] */
     matmul_q(u, xs, e->u, e->us, D, I);     /* up_proj   [I,D] */
-    for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+    swiglu_exact(g, u, I);
     matmul_q(hh, g, e->d, e->ds, I, D);     /* down_proj [D,I] */
     }
 }
@@ -2003,10 +2018,9 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
         for (int e = 0; e < E; e++) { if (blended[e] > max_logit) max_logit = blended[e]; }
         float *exps = falloc(E);
         float sum_exps = 0.f;
-        for (int e = 0; e < E; e++) {
-            exps[e] = expf(blended[e] - max_logit);
-            sum_exps += exps[e];
-        }
+        for (int e = 0; e < E; e++) exps[e] = blended[e] - max_logit;
+        exact_expf_n(exps, exps, E);
+        for (int e = 0; e < E; e++) sum_exps += exps[e];
 
         float cum_sum = 0.f;
         int min_cand = c->topk;

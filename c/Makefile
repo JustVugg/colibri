@@ -2695,6 +2695,11 @@ tests/test_mem_available$(EXE): tests/test_mem_available.c
 tests/test_exact_dot$(EXE): tests/test_exact_dot.c
 	$(CC) $(CFLAGS) tests/test_exact_dot.c -o tests/test_exact_dot$(EXE) $(LDFLAGS)
 
+# test_exact_expf: exact_expf.h correctly rounded and the same bits in every tier, on every
+# 61st float (about a second); `tests/test_exact_expf --all` is every one of the 2^32.
+tests/test_exact_expf$(EXE): tests/test_exact_expf.c
+	$(CC) $(CFLAGS) tests/test_exact_expf.c -o tests/test_exact_expf$(EXE) $(LDFLAGS)
+
 tests/test_798_guards$(EXE): tests/test_798_guards.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
