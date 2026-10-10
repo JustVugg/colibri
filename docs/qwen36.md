@@ -198,6 +198,47 @@ A least-squares refinement of the block scale was tried and changes nothing
 quantizer. If you take one, take `lmhead`: 254 MB less per token for the
 smallest cost.
 
+## `canonical.qc`: the dense trunk converted once
+
+At every start the engine reads the dense matrices (16-bit floats in the
+container) and quantizes them to int8 (`qw_quantize`): 1.9 GB of int8 on the
+35B, made from 3.9 GB of f16 through f32 copies. `qwen36-canonical` does that
+conversion once and writes the result beside the model (1.94 GB of disk for the
+35B). The tool is not in the release archives; build it from the source:
+
+```sh
+make -C c qwen36-canonical
+./c/qwen36-canonical /path/to/model        # writes /path/to/model/canonical.qc
+```
+
+When `canonical.qc` is there (or `QWEN_DENSE_CACHE` names it), the engine reads
+the matrices from it instead of converting them: the same bytes, so the same
+logits, without the conversion and its f32 copies at start. They are copied into
+ordinary memory, as after a conversion, and the file is closed once they are: the
+CPU reads every dense matrix at every token. On an 8 GB M1 the 35B model is then
+ready in 3.6 s instead of 4.4, with a peak memory footprint of 3.5 GB instead of
+4.7 and the same speed ([experiment manifest](experiments/qwen36-canonical-dense-2026-10-07/manifest.json)).
+
+The file is checked against the model before it is used: the list of matrices
+and their shapes, the quantizer (`QDF_QUANTIZER`), and the first and last 128
+bytes of every source matrix. So a file made from other weights (a full fine-tune
+of the same shape too) or for another quantizer is not used. The check samples
+the source and is not a checksum: an edit confined to the middle of a matrix is
+not seen, and the int8 rows of the file are not verified. A file beside the
+model that does not match (other weights, a converter that changed with an
+engine update, a damaged file) is set aside with the reason, and the matrices
+are converted at start as without it; run `qwen36-canonical` again then. A file
+named by `QWEN_DENSE_CACHE` that does not match stops the start with the reason.
+
+It is used only where every dense matrix is the int8 copy the engine would make:
+the whole model, `COLI_DENSE_BITS=8` (the default), no `COLI_KEEP_F32`, and a run
+on the CPU, not with `COLI_CUDA=1` or `COLI_VULKAN=1`, and not in the Segment and
+Edge adapters. A `VK=1` build that runs on the CPU, as the Linux and Windows
+release binaries do without `COLI_VULKAN=1`, uses it. The tool converts BF16, F16
+and F32 dense matrices, with or without the `language_model.` prefix (the
+containers of `convert_qwen36.py`); it does not convert a qpack container's
+affine matrices. Delete the file to go back to the conversion at start.
+
 ## Cache-aware routing (`CACHE_ROUTE`, off by default)
 
 The residual misses above are the lever's target. `CACHE_ROUTE=1` ports the
