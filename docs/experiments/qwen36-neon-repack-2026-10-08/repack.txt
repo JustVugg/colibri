@@ -1,0 +1,10 @@
+repack_bench.c built with clang -O3 against the expert_ffn.h of dev 94dee9d2 (dev:) and of d5d844e8 (pr:). The three calls go through a function the compiler cannot inline, so that, as in load_expert_merged, it cannot prove the two buffers distinct: the loop then compiles to the same instructions as in the engine (checked in both builds). Run in the order dev pr pr dev dev pr pr dev on the M1 on 2026-10-07 at 21:06 (the runs of baseline.txt and trial.txt are of 2026-10-08), after the nominal thermal state and a 60 s rest.
+
+dev: repack of one expert (3 x 524288 bytes): median 1.2433 ms, min 1.2415, max 1.2471 (15 rounds x 200 experts); checksum 09da8f7ad012d126; NEON or scalar, as the header chooses
+pr: repack of one expert (3 x 524288 bytes): median 0.0350 ms, min 0.0328, max 0.0741 (15 rounds x 200 experts); checksum 09da8f7ad012d126; NEON or scalar, as the header chooses
+pr: repack of one expert (3 x 524288 bytes): median 0.0327 ms, min 0.0326, max 0.0334 (15 rounds x 200 experts); checksum 09da8f7ad012d126; NEON or scalar, as the header chooses
+dev: repack of one expert (3 x 524288 bytes): median 1.2434 ms, min 1.2416, max 1.2485 (15 rounds x 200 experts); checksum 09da8f7ad012d126; NEON or scalar, as the header chooses
+dev: repack of one expert (3 x 524288 bytes): median 1.2433 ms, min 1.2423, max 1.2470 (15 rounds x 200 experts); checksum 09da8f7ad012d126; NEON or scalar, as the header chooses
+pr: repack of one expert (3 x 524288 bytes): median 0.0328 ms, min 0.0326, max 0.0330 (15 rounds x 200 experts); checksum 09da8f7ad012d126; NEON or scalar, as the header chooses
+pr: repack of one expert (3 x 524288 bytes): median 0.0326 ms, min 0.0325, max 0.0328 (15 rounds x 200 experts); checksum 09da8f7ad012d126; NEON or scalar, as the header chooses
+dev: repack of one expert (3 x 524288 bytes): median 1.2435 ms, min 1.2421, max 1.2463 (15 rounds x 200 experts); checksum 09da8f7ad012d126; NEON or scalar, as the header chooses
