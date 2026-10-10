@@ -734,7 +734,7 @@ def find_user_icds(home=None):
     for pattern in patterns:
         for path in sorted(glob.glob(os.path.join(home, pattern))):
             if path not in found and os.path.isfile(path):
-                found.append(path)
+                found.append(os.path.normpath(path))
     return found
 
 
