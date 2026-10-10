@@ -39,10 +39,8 @@ def _run(record, name):
     digest = evidence.get("sha256")
     if not isinstance(digest, str) or len(digest) != 64:
         raise ValueError(f"{name}.evidence.sha256 must be 64 hex characters")
-    try:
-        bytes.fromhex(digest)
-    except ValueError as error:
-        raise ValueError(f"{name}.evidence.sha256 must be hexadecimal") from error
+    if any(c not in "0123456789abcdefABCDEF" for c in digest):
+        raise ValueError(f"{name}.evidence.sha256 must be hexadecimal")
     quality = _object(run.get("quality"), f"{name}.quality")
     _text(quality.get("method"), f"{name}.quality.method")
     if quality.get("passed") is not True:
@@ -60,10 +58,8 @@ def validate(record):
     commit = record["commit"]
     if len(commit) != 40:
         raise ValueError("commit must be a full 40-character git SHA")
-    try:
-        bytes.fromhex(commit)
-    except ValueError as error:
-        raise ValueError("commit must be hexadecimal") from error
+    if any(c not in "0123456789abcdefABCDEF" for c in commit):
+        raise ValueError("commit must be hexadecimal")
     hardware = _object(record.get("hardware"), "hardware")
     for field in ("cpu", "ram", "storage", "os"):
         _text(hardware.get(field), f"hardware.{field}")
