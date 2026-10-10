@@ -71,7 +71,14 @@ static void sgb_put_json_string_lit(SgbCtx *C, const char *raw){
         unsigned char c = *p;
         if (c == '"')       sgb_put(C, "\\\\\\\"");   /* JSON \"  inside GBNF literal */
         else if (c == '\\') sgb_put(C, "\\\\\\\\");
-        else if (c < 0x20){ snprintf(b, sizeof b, "\\x%02x", c); sgb_put(C, b); } /* raw ctl byte (invalid JSON anyway) */
+        else if (c < 0x20){
+            /* json.h already decoded the schema string. Escape the control
+             * for JSON first, then escape that backslash for the GBNF literal. */
+            const char *short_escape = c == '\b' ? "\\\\b" : c == '\f' ? "\\\\f"
+                : c == '\n' ? "\\\\n" : c == '\r' ? "\\\\r" : c == '\t' ? "\\\\t" : NULL;
+            if (short_escape) sgb_put(C, short_escape);
+            else { snprintf(b, sizeof b, "\\\\u%04x", c); sgb_put(C, b); }
+        }
         else if (c == 0x7f) sgb_put(C, "\\x7f");
         else { b[0] = (char)c; b[1] = 0; sgb_put(C, b); }
     }

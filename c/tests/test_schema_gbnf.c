@@ -211,6 +211,49 @@ int main(void){
         }
     }
 
+    /* Decoded JSON controls in enums, consts and property names must draft
+     * their escaped JSON spelling, never an invalid raw control byte. */
+    for (int ch = 1; ch < 32; ch++){
+        char escaped[8];
+        switch (ch){
+        case '\b': strcpy(escaped, "\\b"); break;
+        case '\f': strcpy(escaped, "\\f"); break;
+        case '\n': strcpy(escaped, "\\n"); break;
+        case '\r': strcpy(escaped, "\\r"); break;
+        case '\t': strcpy(escaped, "\\t"); break;
+        default: snprintf(escaped, sizeof escaped, "\\u%04x", ch); break;
+        }
+        for (int kind = 0; kind < 3; kind++){
+            char schema[256], instance[64], raw[64];
+            if (kind == 0)
+                snprintf(schema, sizeof schema, "{\"enum\":[\"p%sq\"]}", escaped);
+            else if (kind == 1)
+                snprintf(schema, sizeof schema, "{\"const\":\"p%sq\"}", escaped);
+            else
+                snprintf(schema, sizeof schema, "{\"type\":\"object\",\"properties\":{"
+                    "\"p%sq\":{\"type\":\"null\"}},\"required\":[\"p%sq\"]}", escaped, escaped);
+            snprintf(instance, sizeof instance, kind == 2 ? "{\"p%sq\":null}" : "\"p%sq\"", escaped);
+            snprintf(raw, sizeof raw, kind == 2 ? "{\"p%cq\":null}" : "\"p%cq\"", ch);
+            Grammar G; GrState S;
+            int ok = compile(schema, &G, NULL, 0) == 0;
+            CHECK(ok);
+            if (!ok) continue;
+            gr_state_init(&S, &G);
+            CHECK(walk(&S, instance) == (int)strlen(instance));
+            unsigned char mask[32]; int can_end = 0;
+            gr_admissible(&S, mask, &can_end);
+            CHECK(can_end == 1);
+            gr_state_init(&S, &G);
+            const char *prefix = kind == 2 ? "{\"p" : "\"p";
+            CHECK(walk(&S, prefix) == (int)strlen(prefix));
+            char forced[64]; int n = gr_forced(&S, forced, sizeof forced);
+            CHECK(n >= (int)strlen(escaped) && !strncmp(forced, escaped, strlen(escaped)));
+            gr_state_init(&S, &G);
+            CHECK(walk(&S, raw) < (int)strlen(raw));
+            gr_free(&G);
+        }
+    }
+
     if (fails){ printf("test_schema_gbnf: %d FAILED\n", fails); return 1; }
     printf("test_schema_gbnf: OK\n");
     return 0;
