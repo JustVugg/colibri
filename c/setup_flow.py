@@ -1121,7 +1121,9 @@ def run_environment(backend, engine, family, hw):
 def launcher_args(backend, model_dir, host, port):
     args = ["web", "--model", model_dir, "--host", host, "--port", str(port)]
     if backend == "cuda":
-        args += ["--gpu", "auto", "--auto-tier"]
+        args += ["--gpu", "auto"]
+    if backend in ("cuda", "vulkan", "cpu"):
+        args += ["--auto-tier"]
     return args
 
 
