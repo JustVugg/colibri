@@ -85,6 +85,10 @@ def main():
                     rows.append({"ctx": ctx, "choices": choices, "gold": gold}); n += 1
             except Exception: continue
             if n >= a.limit: break
+        if not rows:
+            print(f"{t}: FAILED — no usable benchmark rows; existing data is unchanged")
+            failed.append(t)
+            continue
         outp = os.path.join(a.out, t + ".jsonl")
         # scrittura atomica: coli controlla solo l'ESISTENZA del file, quindi un jsonl
         # troncato da un run interrotto bloccherebbe il re-download per sempre.
