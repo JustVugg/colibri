@@ -116,7 +116,7 @@ TC_ALL = {"source_checkout": True, "make": "/usr/bin/make", "cc": "/usr/bin/gcc"
 
 
 def setup_args(**overrides):
-    values = dict(yes=True, json=False, pick=None, model_dir=None, dir=None, backend=None,
+    values = dict(yes=True, json=False, pick=None, ctx=None, model_dir=None, dir=None, backend=None,
                   no_gpu=False, host=None, port=None, no_start=True, background=False,
                   no_browser=True, reconfigure=False, list=False, all=False, via_windows="no",
                   no_verify=False)
@@ -1002,6 +1002,32 @@ class WholeSetup(HomeTestCase):
         build.assert_called_once()                       # make, with nothing to redo
         self.assertTrue(build.call_args.kwargs["update"])
 
+    def test_setup_context_persists_and_a_rerun_updates_it(self):
+        code, text = self.run_setup(pick="tiny", ctx=8192)
+        self.assertEqual(code, 0, text)
+        cfg = setup_flow.load_config()
+        self.assertEqual(cfg["args"][-2:], ["--ctx", "8192"])
+        self.assertIn("--ctx 8192", text)
+        before = len(self.hub.requests)
+
+        code, text = self.run_setup(ctx=4096)
+        self.assertEqual(code, 0, text)
+        cfg = setup_flow.load_config()
+        self.assertEqual(cfg["args"].count("--ctx"), 1)
+        self.assertEqual(cfg["args"][-2:], ["--ctx", "4096"])
+        self.assertEqual(len(self.hub.requests), before)
+
+    def test_setup_rejects_invalid_context_before_saving(self):
+        maximum = family_by_id("qwen36").limits.max_context
+        for context in (-1, maximum + 1):
+            with self.subTest(context=context):
+                error = io.StringIO()
+                with contextlib.redirect_stderr(error):
+                    code, text = self.run_setup(pick="tiny", ctx=context)
+                self.assertEqual(code, 1, text)
+                self.assertIn(f"--ctx must be between 0 and {maximum}", error.getvalue())
+                self.assertIsNone(setup_flow.load_config())
+
     def test_a_rerun_after_a_pull_rebuilds_the_engine_it_starts(self):
         code, text = self.run_setup(pick="tiny")
         self.assertEqual(code, 0, text)
@@ -1051,9 +1077,10 @@ class WholeSetup(HomeTestCase):
         self.hub.cut_after["model-00000.safetensors"] = 150_000
         with mock.patch.object(setup_download, "download_repo",
                                side_effect=lambda *a, **k: real(*a, **dict(k, retries=0))):
-            code, text = self.run_setup(pick="tiny")
+            code, text = self.run_setup(pick="tiny", ctx=8192)
         self.assertEqual(code, 1)
         self.assertEqual(setup_flow.load_config()["status"], "pending")
+        self.assertEqual(setup_flow.load_config()["ctx"], 8192)
         self.assertEqual(setup_flow.read_state()["phase"], "error")
         part = Path(self.models, "tiny", "model-00000.safetensors.part")
         self.assertEqual(part.stat().st_size, 150_000)
@@ -1067,6 +1094,7 @@ class WholeSetup(HomeTestCase):
         self.assertEqual(ranges[-1], "bytes=150000-")
         self.assertEqual(Path(self.models, "tiny", "model-00000.safetensors").read_bytes(), self.shard)
         self.assertEqual(setup_flow.load_config()["status"], "ready")
+        self.assertEqual(setup_flow.load_config()["args"][-2:], ["--ctx", "8192"])
 
     def test_install_on_windows_names_the_exe_engine(self):
         os.remove(os.path.join(self.engines, "qwen36"))
