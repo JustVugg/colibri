@@ -38,7 +38,10 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `bench [tasks]` | Run benchmark tasks (`--limit`, `--data`). |
 | `convert` | Convert an FP8 repo to a colibrì int4 snapshot. |
 
-### Common flags (all subcommands)
+### Common flags (engine subcommands)
+
+These flags apply to engine commands such as `run`, `chat`, `serve`, and `web`.
+`setup`, `start`, `status`, and `logs` have their own options below.
 
 | Flag | Default | Maps to | Meaning |
 |---|---|---|---|
@@ -84,6 +87,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 |---|---|---|
 | `--yes`, `-y` | off | Non-interactive: the recommendation and every default. |
 | `--model ID` | the recommendation | Catalog model to install (`--list` shows the ids). |
+| `--ctx N` | auto | Context length for the configured server, saved for later `coli start` runs (`0`=auto). |
 | `--model-dir DIR` | none | Use a model already on disk instead of downloading one. |
 | `--dir DIR` | `~/colibri-models` | Folder for downloaded models. |
 | `--backend` | `auto` | `auto`, `cpu`, `vulkan` or `cuda`: the engine build. `auto` takes CUDA, then Vulkan, then the CPU. |
@@ -158,6 +162,6 @@ Tool calling is supported by GLM, DeepSeek V4, Kimi K3, Qwen3.6, and Qwen3.8; In
 
 A flag and its mapped environment variable are two routes to the same engine knob. Precedence and coverage:
 
-- For knobs with a flag (`--temp`, `--ctx`, `--ram`, `--topk`, `--topp`, `--repin`, `--cap`, `--ngen`, `--policy`), prefer the flag — it's the supported surface.
+- For engine commands, prefer a flag when one is available (`--temp`, `--ctx`, `--ram`, `--topk`, `--topp`, `--repin`, `--cap`, `--ngen`, `--policy`). `coli setup --ctx N` also saves a context override for the server it configures.
 - For knobs with **no** flag (`COLI_METAL`, `PIPE`, `DIRECT`, `COLI_NO_OMP_TUNE`, `MLOCK`, `CAP_RAISE`, `KVSAVE`, `SEED`, `NUCLEUS`, …), export the environment variable.
 - The CLI copies your whole environment through to `glm`, so any variable you export is honored unless a flag explicitly overrides it.
