@@ -1125,6 +1125,25 @@ def launcher_args(backend, model_dir, host, port):
     return args
 
 
+def validate_setup_context(family, context):
+    limits = family.limits
+    if not limits.context_env:
+        raise SetupError(f"--ctx does not apply to {family.display_name}")
+    if context < 0 or (limits.max_context and context > limits.max_context):
+        raise SetupError(f"--ctx must be between 0 and {limits.max_context} "
+                         f"for {family.display_name}")
+
+
+def configured_context(cfg, context):
+    """Persist an explicit setup context in the saved `coli web` command."""
+    if context is None:
+        return cfg
+    validate_setup_context(family_by_id(cfg["family"]), context)
+    cfg["args"] = _replace_arg(cfg["args"], "--ctx", str(context))
+    cfg["ctx"] = context
+    return cfg
+
+
 def make_config(*, model_dir, family, entry, engine_info, hw, host, port, status="ready"):
     backend = engine_info["backend"]
     return {
@@ -1759,6 +1778,9 @@ def cmd_setup(a, ui=None):
         if gpu_now_buildable(cfg):
             ui.say("The GPU packages are installed now: rebuilding the engine for the GPU.\n")
         else:
+            if a.ctx is not None:
+                configured_context(cfg, a.ctx)
+                save_config(cfg)
             ui.say(f"Already set up: {describe_existing(cfg)}")
             try:
                 seeded = setup_catalog.by_id((cfg.get("model") or {}).get("id"))
@@ -1770,6 +1792,7 @@ def cmd_setup(a, ui=None):
     # A setup that stopped half way (pending), or a finished one whose engine or
     # files went missing (ready, but not runnable): continue with the same choice.
     resume = cfg if (cfg and cfg.get("status") in ("pending", "ready") and not picking) else None
+    context = a.ctx if a.ctx is not None else (resume or {}).get("ctx")
 
     ui.say("Your machine")
     probe_root = models_root_for(None, a.dir or (resume or {}).get("models_root"))
@@ -1814,6 +1837,8 @@ def cmd_setup(a, ui=None):
 
     host = a.host or (resume or {}).get("host") or DEFAULT_HOST
     port = int(a.port or (resume or {}).get("port") or DEFAULT_PORT)
+    if context is not None:
+        validate_setup_context(family, context)
     requested = "cpu" if a.no_gpu else (a.backend or (resume or {}).get("requested_backend") or "auto")
     pending = {"status": "pending", "model": {"id": entry.id if entry else None,
                                               "name": entry.name if entry else family.display_name,
@@ -1821,6 +1846,8 @@ def cmd_setup(a, ui=None):
                                               "revision": entry.revision if entry else None},
                "model_dir": model_dir, "models_root": os.path.dirname(model_dir),
                "family": family.id, "host": host, "port": port, "requested_backend": requested}
+    if context is not None:
+        pending["ctx"] = context
     if not resume or picking:
         save_config(pending)
 
@@ -1870,6 +1897,7 @@ def cmd_setup(a, ui=None):
 
     cfg = make_config(model_dir=model_dir, family=family, entry=entry, engine_info=engine_info,
                       hw=hw, host=host, port=port)
+    configured_context(cfg, context)
     cfg["requested_backend"] = requested
     # A GPU this setup found but could not build for: a rerun checks whether
     # the packages arrived and rebuilds (gpu_now_buildable).

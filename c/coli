@@ -3643,6 +3643,8 @@ def main():
                       help="non-interactive: take the recommendation and every default")
     pset.add_argument("--model",dest="pick",default=None,metavar="ID",
                       help="catalog model to install (see --list); default: the recommendation")
+    pset.add_argument("--ctx",type=int,default=None,metavar="N",
+                      help="context length for the configured server (0=auto)")
     pset.add_argument("--model-dir",default=None,metavar="DIR",
                       help="use a model already on disk instead of downloading one")
     pset.add_argument("--dir",default=None,metavar="DIR",
