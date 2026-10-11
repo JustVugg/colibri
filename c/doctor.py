@@ -143,7 +143,7 @@ def _json_object(pairs):
     return result
 
 
-def _safetensors_header(path):
+def _safetensors_header(path, max_header=SAFETENSORS_MAX_HEADER):
     """Read one bounded safetensors header without touching tensor payloads."""
     path = Path(path)
     with path.open("rb") as stream:
@@ -152,7 +152,7 @@ def _safetensors_header(path):
         if len(raw_length) != 8:
             raise ValueError("short safetensors header")
         header_length = int.from_bytes(raw_length, "little")
-        if (header_length < 2 or header_length > SAFETENSORS_MAX_HEADER or
+        if (header_length < 2 or header_length > max_header or
                 header_length > file_size - 8):
             raise ValueError(f"invalid safetensors header length: {header_length}")
         raw_header = stream.read(header_length)
@@ -173,7 +173,7 @@ def _tensor_layout(meta, payload_size):
     dtype = meta.get("dtype")
     offsets = meta.get("data_offsets")
     shape = meta.get("shape")
-    if dtype not in SAFETENSORS_DTYPES:
+    if not isinstance(dtype, str) or dtype not in SAFETENSORS_DTYPES:
         raise ValueError(f"unsupported dtype: {dtype!r}")
     if (not isinstance(offsets, list) or len(offsets) != 2 or
             any(isinstance(value, bool) or not isinstance(value, int) for value in offsets)):
@@ -892,18 +892,18 @@ def run_decision_doctor(model, engine_path, available_memory=None):
                          "engine executable is ready" if engine_ok else "engine is not built",
                          path=str(engine)))
     try:
-        with open(model / "model.safetensors", "rb") as handle:
-            size = struct.unpack("<Q", handle.read(8))[0]
-            if size > 64 << 20:
-                raise ValueError("model.safetensors: implausible header size")
-            header = json.loads(handle.read(size))
+        file_size, raw_header, header = _safetensors_header(
+            model / "model.safetensors", max_header=64 << 20)
+        payload_size = file_size - 8 - len(raw_header)
         params = 0
         for name, entry in header.items():
-            if name != "__metadata__" and isinstance(entry, dict):
-                count = 1
-                for dim in entry.get("shape", []):
-                    count *= int(dim)
-                params += count
+            if name == "__metadata__":
+                continue
+            _tensor_layout(entry, payload_size)
+            count = 1
+            for dim in entry["shape"]:
+                count *= dim
+            params += count
         needed = params * 4
         available_memory = memory_available() if available_memory is None else available_memory
         if not available_memory:
