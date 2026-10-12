@@ -633,6 +633,15 @@ Read **only** by `c/olmoe.c`. This is the sister engine used for streaming-cache
 | `CONF_LIMIT` | `0.92` | Confidence ceiling for the router prediction. Clamped to [0.1, 1.0]. |
 | `EXPERT_DROP` | `0` (off) | Drop experts below the confidence threshold instead of loading them (quality/speed experiment). |
 | `COLI_VULKAN` | `0` | `VK=1` build: attention, router and lm_head on the Vulkan device, and the routed experts (int8 rows) on the shared expert tier (`COLI_VK_TIER*`, `COLI_VK_DENSE`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)). The warm start reads the history `COLI_USAGE` names; without it the tier fills as experts pass by. |
+| `COLI_GPU` / `COLI_OLMOE_GPU` | unset | `=0` explicitly disables GPU acceleration and forces CPU execution. |
+| `COLI_OLMOE_CUDA_DLL` | unset | Path to `coli_olmoe_cuda.dll` / `libcoli_olmoe_cuda.so`. Searches current directory and system paths if unset. |
+| `COLI_GPU_CTX` | `1024` | Context capacity for on-device KV cache (clamped to `[64, 4096]`). |
+| `COLI_GPU_SLOTS` | all that fit | Expert slot capacity in VRAM; allows LRU eviction and on-demand streaming when VRAM is constrained. |
+| `COLI_GPU_RESERVE_MB` | `160` | VRAM buffer held back in MB. |
+| `COLI_GPU_VERIFY` | `0` (off) | `=1` runs CPU forward pass as reference and logs logit divergence and argmax agreement. |
+| `COLI_GPU_PREFILL` | `1` (on) | `=1` enables batched token-grouped prefill on GPU; `=0` falls back to CPU prefill. |
+| `COLI_CPU_BASELINE_TOK_S` | `0.0` (off) | CPU baseline tok/s for circuit breaker; automatically redos token and falls back to CPU if GPU runs slower or emits non-finite logits. |
+| `COLI_GPU_PROF` | `0` (off) | `=1` prints per-token microsecond breakdown across dense GEMV, attention, routing, MLP, and lm_head kernels. |
 
 ## Laya engine (`laya`)
 

@@ -999,6 +999,24 @@ hip-dll: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h
 		-L"$(HIP_LIB_DIR)" -lamdhip64 \
 		backend_cuda.cu -o coli_hip.dll
 
+# Opt-in GPU-resident CUDA library for OLMoE (Issue #2040).
+# Compiles into coli_olmoe_cuda.dll on Windows or libcoli_olmoe_cuda.so on Linux.
+# The olmoe engine loads it dynamically at runtime if present.
+.PHONY: olmoe-cuda
+ifneq ($(IS_WIN),)
+olmoe-cuda: coli_olmoe_cuda.dll
+
+coli_olmoe_cuda.dll: olmoe_cuda.cu
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) -shared olmoe_cuda.cu -o $@
+else
+olmoe-cuda: libcoli_olmoe_cuda.so
+
+libcoli_olmoe_cuda.so: olmoe_cuda.cu
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) -shared -Xcompiler=-fPIC olmoe_cuda.cu -o $@
+endif
+
 backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_ink.cu -o $@
@@ -1278,7 +1296,7 @@ ifneq ($(EXE),)
 olmoe: olmoe$(EXE)
 endif
 olmoe$(EXE): olmoe.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(NOCUDA_CFLAGS) olmoe.c $(VK_OBJ) -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
+	$(CC) $(NOCUDA_CFLAGS) olmoe.c $(VK_OBJ) -o olmoe$(EXE) $(NOCUDA_LDFLAGS) $(if $(IS_WIN),,-ldl)
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
 # MoE). With CUDA=1 the optional VRAM expert tier (qwen36_tier.c) is compiled
@@ -2995,7 +3013,7 @@ bench: iobench$(EXE)
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
 	qwen38-tiny-generate qwen38-tiny-check \
 	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
-	test-c test-python test check clean install uninstall bench
+	olmoe-cuda test-c test-python test check clean install uninstall bench
 
 # Own line: see the TEST_RULES note above on shared .PHONY lines.
 .PHONY: bench-omp-grain

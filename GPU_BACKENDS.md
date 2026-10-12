@@ -18,6 +18,7 @@ only — never `#ifdef __HIP__` (or CUDA-specific code) in `backend_cuda.cu`.
 | CUDA (`CUDA=1`) | Linux x86-64 | CUDA toolkit (nvcc), `CUDA_HOME=/usr/local/cuda` default | `make -C c glm CUDA=1 [CUDA_ARCH=native\|sm_XX]` |
 | HIP (`HIP=1`) | Linux x86-64 | ROCm (hipcc), `ROCM_HOME=/opt/rocm` default; tested on ROCm 7.2 | `make -C c glm HIP=1 [HIP_ARCH=native\|gfxXXXX]` |
 | HIP DLL (`HIP_DLL=1`) — build **and** runtime; validated on one configuration | Windows x86-64 | HIP SDK (hipcc) + a compatible MSVC x64 host toolchain; `HIP_SDK_ROOT` from `HIP_PATH` | `make -C c hip-dll HIP_DLL=1 HIP_SDK_ROOT=<sdk-root> HIP_ARCH=gfxNNNN` → `c/coli_hip.dll` |
+| OLMoE CUDA library (`olmoe-cuda`) | Windows / Linux x86-64 | CUDA toolkit (nvcc) | `make -C c olmoe-cuda` → `c/coli_olmoe_cuda.dll` or `c/libcoli_olmoe_cuda.so` |
 
 `CUDA=1` and `HIP=1` are mutually exclusive and both opt-in: the default build
 remains pure, dependency-free CPU. Both are **directly linked** paths and remain
@@ -492,3 +493,20 @@ tests/xdna_physical_probe <artifact-root> <path-to-coli_xdna.dll> [M-list]
 
 `M-list` defaults to `1,32,64`; pass `65,130,256` to qualify the M256 bucket
 through the same binary, or a value above 256 to see the decline.
+
+## OLMoE GPU-resident CUDA library (`olmoe_cuda.cu`)
+
+An opt-in runtime library accelerating OLMoE-1B-7B decode and batched prefill:
+
+- **Build**: `make -C c olmoe-cuda` compiles `c/olmoe_cuda.cu` via `nvcc` into `coli_olmoe_cuda.dll` (Windows) or `libcoli_olmoe_cuda.so` (Linux).
+- **Runtime loading**: Loaded dynamically via `LoadLibrary` / `dlopen` at runtime by `olmoe.c`. The core engine remains 100% dependency-free and continues running on the CPU if the library or an NVIDIA GPU is absent.
+- **Kernels**:
+  - FP16 dense layer projections (`q, k, v, o, lm_head`).
+  - INT8 expert warp-per-row GEMVs using 16-byte vectorized loads (`int4` dequantized in shared registers).
+  - On-device softmax and top-k router (top-8 of 64 experts).
+  - Expert VRAM slot table with LRU eviction and on-demand host upload when VRAM cannot hold all 1024 experts.
+  - Batched token-grouped prefill path (`COLI_GPU_PREFILL=1`), reading expert weights once across tokens grouped per expert.
+- **Circuit breaker & Verification**:
+  - Host CPU KV cache mirror is kept synchronized during generation.
+  - Non-finite logits (NaN/Inf) or throughput falling below `COLI_CPU_BASELINE_TOK_S` triggers an automatic rollback of the token onto the CPU path, staying on CPU thereafter.
+  - Verify mode (`COLI_GPU_VERIFY=1`) executes the CPU forward pass concurrently as reference to validate logit divergence and argmax agreement.
