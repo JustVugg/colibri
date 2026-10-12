@@ -2230,13 +2230,15 @@ def image_data_uri(path):
 # /v1/images/generations, streamed): the two backends below return the same
 # thing, so drawing, saving and the commands exist once.
 IMAGE_CHAT_COMMANDS = {
-    "size":   "WxH       image size; /size alone lists the presets (TAB completes them)",
-    "steps":  "N         denoising steps (more is slower and usually cleaner)",
-    "seed":   "N|random  fix the seed to reproduce an image, or a new one each time",
-    "render": "MODE      how images are drawn: kitty | iterm | sixel | blocks | none",
-    "save":   "[PATH]    a copy of the last image: a folder, or a file name (.png is added)",
-    "help":   "          this list",
-    "quit":   "          leave (also :q)",
+    "size":     "WxH       image size; /size alone lists the presets (TAB completes them)",
+    "steps":    "N         denoising steps (more is slower and usually cleaner)",
+    "seed":     "N|random  fix the seed to reproduce an image, or a new one each time",
+    "image":    "[PATH]    input image for editing / image-to-image (/image off clears)",
+    "strength": "VAL       denoising strength (0.0 - 1.0; e.g. 0.75)",
+    "render":   "MODE      how images are drawn: kitty | iterm | sixel | blocks | none",
+    "save":     "[PATH]    a copy of the last image: a folder, or a file name (.png is added)",
+    "help":     "          this list",
+    "quit":     "          leave (also :q)",
 }
 
 class LocalImageBackend:
@@ -2259,13 +2261,14 @@ class LocalImageBackend:
         self.info = self.engine.info
 
     def generate(self, prompt, width, height, steps, seed, want_preview, on_progress,
-                 on_preview, on_interrupt):
+                 on_preview, on_interrupt, input_image=None, mask=None, strength=None):
         from image_engine import encode_png
         def preview(meta, pixels):
             on_preview(meta.get("width"), meta.get("height"), meta.get("channels", 3), pixels)
         result = self.engine.generate(prompt, width, height, steps, seed, preview=want_preview,
                                       on_progress=on_progress, on_preview=preview,
-                                      interruptible=True, on_interrupt=on_interrupt)
+                                      interruptible=True, on_interrupt=on_interrupt,
+                                      image=input_image, mask=mask, strength=strength)
         result["png"] = encode_png(result["width"], result["height"], result["rgba"], 4)
         return result
 
@@ -2288,7 +2291,7 @@ class RemoteImageBackend:
         self.alive = True
 
     def generate(self, prompt, width, height, steps, seed, want_preview, on_progress,
-                 on_preview, on_interrupt):
+                 on_preview, on_interrupt, input_image=None, mask=None, strength=None):
         import base64, urllib.request, urllib.error
         from image_engine import ImageCancelled, ImageEngineError, decode_png
         body = {"model": self.model_id, "prompt": prompt, "size": f"{width}x{height}",
@@ -2296,7 +2299,27 @@ class RemoteImageBackend:
                 "stream": True}
         if not want_preview:
             body["partial_images"] = 0
-        req = urllib.request.Request(self.base + "/v1/images/generations",
+        endpoint_path = "/v1/images/generations"
+        if input_image:
+            endpoint_path = "/v1/images/edits"
+            img_val = input_image
+            if os.path.isfile(input_image):
+                try:
+                    img_val = image_data_uri(input_image)
+                except Exception:
+                    pass
+            body["image"] = img_val
+            if mask:
+                mask_val = mask
+                if os.path.isfile(mask):
+                    try:
+                        mask_val = image_data_uri(mask)
+                    except Exception:
+                        pass
+                body["mask"] = mask_val
+            if strength is not None:
+                body["strength"] = strength
+        req = urllib.request.Request(self.base + endpoint_path,
                                      data=json.dumps(body).encode("utf-8"),
                                      headers={"Content-Type": "application/json"})
         if self.api_key: req.add_header("Authorization", f"Bearer {self.api_key}")
@@ -2510,7 +2533,15 @@ def image_settings(a, info):
     if seed is not None:
         problem = check_seed(seed)
         if problem: sys.exit(f"{C.yel}--seed: {problem}{C.r}")
-    return {"width": width, "height": height, "steps": steps, "seed": seed}
+    input_image = getattr(a, "input_image", None)
+    mask = getattr(a, "mask", None)
+    strength = getattr(a, "strength", None)
+    if strength is not None:
+        from image_engine import check_strength
+        problem = check_strength(strength)
+        if problem: sys.exit(f"{C.yel}--strength: {problem}{C.r}")
+    return {"width": width, "height": height, "steps": steps, "seed": seed,
+            "input_image": input_image, "mask": mask, "strength": strength}
 
 def generate_image(backend, prompt, settings, protocol, out=None, stream=None, last=None):
     """One image: progress, the picture drawn in the terminal, the PNG on disk.
@@ -2528,7 +2559,10 @@ def generate_image(backend, prompt, settings, protocol, out=None, stream=None, l
     try:
         result = backend.generate(prompt, settings["width"], settings["height"],
                                   settings["steps"], seed, previews, progress.progress,
-                                  progress.preview, progress.interrupted)
+                                  progress.preview, progress.interrupted,
+                                  input_image=settings.get("input_image"),
+                                  mask=settings.get("mask"),
+                                  strength=settings.get("strength"))
     except ImageCancelled:
         progress.stop()
         print(f"  {C.yel}■ cancelled{C.r}\n", file=stream)
@@ -2610,7 +2644,7 @@ def image_repl(a, backend, model_id):
     print(f"  {C.grn}✦ {model_id}{C.r} {C.dim}· {backend.mode} · images are saved to "
           f"{image_dir()}{C.r}")
     print(f"  {C.dim}describe an image and press Enter · Ctrl-C stops it · /size /steps /seed · "
-          f"/save · /help · :q exits{C.r}")
+          f"/image /strength · /save · /help · :q exits{C.r}")
     print(f"  {C.dim}{settings['width']}x{settings['height']} · {settings['steps']} steps · seed "
           f"{settings['seed'] if settings['seed'] is not None else 'random'} · drawn with "
           f"{protocol} ({why}){C.r}\n")
@@ -2674,6 +2708,25 @@ def image_repl(a, backend, model_id):
             if problem: print(f"  {C.yel}  {problem}, or /seed random{C.r}\n"); continue
             settings["seed"] = seed
             print(f"  {C.dim}✦ seed {seed}: the same prompt now gives the same image{C.r}\n"); continue
+        if name == "image":
+            if not rest or rest.lower() in ("none", "off", "clear"):
+                settings["input_image"] = None
+                print(f"  {C.dim}✦ cleared input image (back to text-to-image){C.r}\n"); continue
+            path = to_local_path(rest.strip())
+            if not os.path.isfile(path):
+                print(f"  {C.yel}  no such file: {path}{C.r}\n"); continue
+            settings["input_image"] = path
+            print(f"  {C.dim}✦ input image: {path}{C.r}\n"); continue
+        if name == "strength":
+            if not rest:
+                current_st = settings.get("strength")
+                print(f"  {C.dim}strength: {current_st if current_st is not None else '0.75 (default)'} (0.0 to 1.0){C.r}\n"); continue
+            try: st_val = float(rest)
+            except ValueError: st_val = -1.0
+            if not 0.0 <= st_val <= 1.0:
+                print(f"  {C.yel}  /strength must be between 0.0 and 1.0{C.r}\n"); continue
+            settings["strength"] = st_val
+            print(f"  {C.dim}✦ strength {st_val}{C.r}\n"); continue
         if name == "save":
             path, why = save_last_image(last, rest.strip())
             if why: print(f"  {C.yel}  {why}{C.r}\n")
@@ -3575,7 +3628,10 @@ def main():
     # Image models: what to draw and where to put it. Ignored by text models.
     image_flags=(("--size",dict(default=None,help="image size WxH (image models; default: the engine's)")),
                  ("--steps",dict(type=int,default=None,help="denoising steps (image models)")),
-                 ("--seed",dict(type=int,default=None,help="image seed (image models; default: random)")))
+                 ("--seed",dict(type=int,default=None,help="image seed (image models; default: random)")),
+                 ("--input-image",dict(default=None,help="input image path for editing (image models)")),
+                 ("--mask",dict(default=None,help="mask image path for in-painting (image models)")),
+                 ("--strength",dict(type=float,default=None,help="denoising strength 0.0-1.0 (image models)")))
     for flag,kw in image_flags: pr.add_argument(flag,**kw)
     pr.add_argument("--out",default=None,help="PNG path for an image model (default: the images folder)")
     pc=sub.add_parser("chat", parents=[common])

@@ -281,7 +281,7 @@ class ImageEngine:
 
     def generate(self, prompt, width, height, steps, seed, preview=False, on_progress=None,
                  on_preview=None, cancelled=None, on_idle=None, interruptible=False,
-                 on_interrupt=None):
+                 on_interrupt=None, image=None, mask=None, strength=None):
         """Run one GEN to its final frame and return the image.
 
         Returns {"width","height","channels","seed","steps","timings","rgba"}.
@@ -298,8 +298,15 @@ class ImageEngine:
             self._finish_abandoned()
             self._seq += 1
             rid = f"r{self._seq}"
-            self._send("GEN", {"id": rid, "prompt": prompt, "width": width, "height": height,
-                               "steps": steps, "seed": seed, "preview": 1 if preview else 0})
+            req_msg = {"id": rid, "prompt": prompt, "width": width, "height": height,
+                       "steps": steps, "seed": seed, "preview": 1 if preview else 0}
+            if image is not None:
+                req_msg["image"] = image
+            if mask is not None:
+                req_msg["mask"] = mask
+            if strength is not None:
+                req_msg["strength"] = strength
+            self._send("GEN", req_msg)
             cancel_sent = False
 
             def cancel():
@@ -543,6 +550,38 @@ def image_request(body, info):
         seed = random_seed()
     return {"prompt": prompt, "width": width, "height": height, "steps": steps,
             "seed": seed, "seed_given": seed_given}
+
+
+def check_strength(strength):
+    if isinstance(strength, bool) or not isinstance(strength, (int, float)) or not 0.0 <= strength <= 1.0:
+        return "`strength` must be a number between 0.0 and 1.0"
+    return None
+
+
+def image_edits_request(body, info):
+    """Validate an OpenAI-style images edit request (POST /v1/images/edits).
+
+    Accepts `image` (base64 string, data URI, or file path), optional `mask`,
+    optional `strength` or `denoising_strength` (0.0 to 1.0, default 0.75),
+    in addition to the prompt, size, steps and seed accepted by image_request."""
+    image = body.get("image")
+    if not isinstance(image, str) or not image.strip():
+        raise ImageRequestError("`image` is required and must be a non-empty string.", "image")
+    mask = body.get("mask")
+    if mask is not None and (not isinstance(mask, str) or not mask.strip()):
+        raise ImageRequestError("`mask` must be a non-empty string if provided.", "mask")
+    strength = body.get("strength")
+    if strength is None:
+        strength = body.get("denoising_strength", 0.75)
+    problem = check_strength(strength)
+    if problem:
+        raise ImageRequestError(problem + ".", "strength")
+
+    req = image_request(body, info)
+    req["image"] = image.strip()
+    req["mask"] = mask.strip() if mask else None
+    req["strength"] = float(strength)
+    return req
 
 
 # ---------------------------------------------------------------- PNG

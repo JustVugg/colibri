@@ -6977,7 +6977,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.check_model(body)
             if is_image_engine(self.server.engine) and path in TEXT_ENDPOINTS:
                 raise APIError(400, f"`{self.server.model_id}` is an image generation model and "
-                                    "does not chat: POST /v1/images/generations instead.",
+                                    "does not chat: POST /v1/images/generations or /v1/images/edits instead.",
                                "model", "unsupported_endpoint")
             if not engine_chats(self.server.engine) and path in GENERATING_ENDPOINTS:
                 raise APIError(400, f"`{self.server.model_id}` is a decision model: it answers typed "
@@ -6986,6 +6986,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                "model", "unsupported_endpoint")
             if path == "/v1/images/generations":
                 self.image_generation(body, request_id)
+            elif path == "/v1/images/edits":
+                self.image_edits(body, request_id)
             elif path == "/v1/chat/completions":
                 self.chat_completion(body, request_id)
             elif path == "/v1/completions":
@@ -7493,6 +7495,60 @@ class APIHandler(BaseHTTPRequestHandler):
                                "server_error") from None
             self.send_json(200, self._image_payload(result, created), request_id, queue_headers)
 
+    def image_edits(self, body, request_id):
+        engine = self.server.engine
+        if not is_image_engine(engine):
+            if not engine_chats(engine):
+                raise APIError(400, f"`{self.server.model_id}` does not generate images: it is a "
+                                    "decision model (POST /v1/systemone).",
+                               "model", "unsupported_endpoint")
+            raise APIError(400, f"`{self.server.model_id}` does not generate images: it is a "
+                                "chat model (POST /v1/chat/completions).",
+                           "model", "unsupported_endpoint")
+        try:
+            request = image_engine.image_edits_request(body, engine.info)
+        except image_engine.ImageRequestError as error:
+            raise APIError(400, str(error), error.param, "invalid_value")
+        stream = body.get("stream", False)
+        if not isinstance(stream, bool):
+            raise APIError(400, "`stream` must be a boolean.", "stream")
+        partial_images = body.get("partial_images")
+        if partial_images is not None and (isinstance(partial_images, bool) or
+                                           not isinstance(partial_images, int) or
+                                           not 0 <= partial_images <= 16):
+            raise APIError(400, "`partial_images` must be an integer between 0 and 16.",
+                           "partial_images")
+        created = int(time.time())
+        with contextlib.ExitStack() as stack:
+            try:
+                queue_wait, _slot = stack.enter_context(
+                    self.server.scheduler.admit(self.client_disconnected))
+            except APIError as error:
+                if error.status == 429:
+                    raise APIError(503, error.message, None, error.code, "server_error",
+                                   error.headers) from None
+                raise
+            if not engine.alive:
+                raise APIError(503, f"The image engine is not running ({engine.dead or 'exited'}).",
+                               None, "engine_unavailable", "server_error")
+            queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
+            if stream:
+                self._image_stream(engine, request, request_id, created, queue_headers,
+                                   partial_images)
+                return
+            try:
+                result = engine.generate(request["prompt"], request["width"], request["height"],
+                                         request["steps"], request["seed"], preview=False,
+                                         cancelled=self.client_disconnected,
+                                         image=request.get("image"), mask=request.get("mask"),
+                                         strength=request.get("strength"))
+            except image_engine.ImageCancelled:
+                raise ClientCancelled() from None
+            except image_engine.ImageEngineError as error:
+                raise APIError(500, f"The image engine failed: {error}", None, "engine_error",
+                               "server_error") from None
+            self.send_json(200, self._image_payload(result, created), request_id, queue_headers)
+
     @staticmethod
     def _image_payload(result, created):
         import base64
@@ -7591,7 +7647,9 @@ class APIHandler(BaseHTTPRequestHandler):
                                      request["steps"], request["seed"],
                                      preview=partial_images != 0, on_progress=on_progress,
                                      on_preview=on_preview, cancelled=cancelled,
-                                     on_idle=on_idle)
+                                     on_idle=on_idle,
+                                     image=request.get("image"), mask=request.get("mask"),
+                                     strength=request.get("strength"))
         except image_engine.ImageCancelled:
             if not state["started"]:
                 raise ClientCancelled() from None

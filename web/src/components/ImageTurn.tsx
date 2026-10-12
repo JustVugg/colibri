@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react"
-import { ChevronDown, Copy, Dices, Download, Footprints, Proportions, RefreshCw, RotateCcw, X } from "lucide-react"
+import { ChevronDown, Copy, Dices, Download, Footprints, Image as ImageIcon, Proportions, RefreshCw, RotateCcw, Sliders, X } from "lucide-react"
 
 import type { GeneratedImage, ImageProgress } from "@/lib/api"
 import {
@@ -119,7 +119,10 @@ const RATIOS = [...new Set(SIZE_PRESETS.map((preset) => preset.ratio))]
    chips sit for a text model. A custom side is typed freely and snapped to a
    multiple of 32 when the field is left; a valid value counts right away, so
    sending straight from the field uses what is on screen. */
-export function ImageControls({ size, custom, steps, seed, seedValid, onSize, onCustom, onSteps, onSeed }: {
+export function ImageControls({
+  size, custom, steps, seed, seedValid, onSize, onCustom, onSteps, onSeed,
+  image, strength, onImage, onStrength,
+}: {
   size: ImageSize
   custom: boolean
   steps: number
@@ -129,6 +132,10 @@ export function ImageControls({ size, custom, steps, seed, seedValid, onSize, on
   onCustom: (custom: boolean) => void
   onSteps: (steps: number) => void
   onSeed: (seed: string) => void
+  image?: string | null
+  strength?: number
+  onImage?: (image: string | null) => void
+  onStrength?: (strength: number) => void
 }) {
   const { t } = useLocale()
   const [width, setWidth] = useState(String(size.width))
@@ -195,5 +202,27 @@ export function ImageControls({ size, custom, steps, seed, seedValid, onSize, on
         placeholder={t("image.seedRandom")} onChange={(event) => onSeed(event.target.value)} />
       {seed && <button type="button" className="image-clear" aria-label={t("image.seedClear")} title={t("image.seedClear")} onClick={() => onSeed("")}><X /></button>}
     </label>
+    {onImage && <label className={cn("image-chip", image && "active")} title={image ? "Image attached for editing" : "Upload image for editing"}>
+      <ImageIcon aria-hidden="true" />
+      <span>{image ? "Image" : "Upload"}</span>
+      <input type="file" accept="image/png,image/jpeg,image/webp" style={{ display: "none" }} onChange={(e) => {
+        const file = e.target.files?.[0]
+        if (!file) return
+        const reader = new FileReader()
+        reader.onload = () => {
+          if (typeof reader.result === "string") onImage(reader.result)
+        }
+        reader.readAsDataURL(file)
+      }} />
+      {image && <button type="button" className="image-clear" aria-label="Clear image" onClick={(e) => { e.preventDefault(); e.stopPropagation(); onImage(null) }}><X /></button>}
+    </label>}
+    {image && onStrength && <label className="image-chip" title="Denoising strength (0.05 to 1.0)">
+      <Sliders aria-hidden="true" />
+      <span className="image-unit">Strength</span>
+      <input type="range" min="0.05" max="1.0" step="0.05" value={strength ?? 0.75}
+        onChange={(e) => onStrength(Number(e.target.value))}
+        style={{ width: "60px", accentColor: "currentColor", cursor: "pointer" }} />
+      <span className="image-unit">{(strength ?? 0.75).toFixed(2)}</span>
+    </label>}
   </div>
 }

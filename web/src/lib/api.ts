@@ -406,6 +406,9 @@ export interface GeneratedImage {
   height: number
   steps: number
   seed: number
+  image?: string
+  mask?: string
+  strength?: number
   url?: string
   seconds?: number
   timings?: ImageTimings
@@ -421,6 +424,9 @@ export interface GenerateImageOptions {
   steps: number
   seed: number
   signal: AbortSignal
+  image?: string
+  mask?: string
+  strength?: number
   onProgress?: (progress: ImageProgress) => void
   /* A preview as a data URI, small and noisy: the latent of the step so far. */
   onPartial?: (url: string, index: number) => void
@@ -455,6 +461,9 @@ function imageRequest(options: GenerateImageOptions, stream: boolean) {
       steps: options.steps,
       seed: options.seed,
       stream,
+      ...(options.image ? { image: options.image } : {}),
+      ...(options.mask ? { mask: options.mask } : {}),
+      ...(options.strength != null ? { strength: options.strength } : {}),
     }),
   }
 }
@@ -480,7 +489,8 @@ function streamError(data: string) {
 }
 
 async function streamImage(options: GenerateImageOptions): Promise<ImageGenerationResponse> {
-  const response = await fetch(endpoint(options.baseUrl, "images/generations"), imageRequest(options, true))
+  const path = options.image ? "images/edits" : "images/generations"
+  const response = await fetch(endpoint(options.baseUrl, path), imageRequest(options, true))
   if (!response.ok) throw await imageError(response)
   /* A server that ignores `stream` answers with the plain object: that is the
      result, not a failure, and asking again would generate a second picture. */
@@ -537,7 +547,8 @@ async function streamImage(options: GenerateImageOptions): Promise<ImageGenerati
 }
 
 async function requestImage(options: GenerateImageOptions): Promise<ImageGenerationResponse> {
-  const response = await fetch(endpoint(options.baseUrl, "images/generations"), imageRequest(options, false))
+  const path = options.image ? "images/edits" : "images/generations"
+  const response = await fetch(endpoint(options.baseUrl, path), imageRequest(options, false))
   if (!response.ok) throw await imageError(response)
   return (await response.json()) as ImageGenerationResponse
 }

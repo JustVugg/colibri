@@ -110,6 +110,8 @@ export default function App() {
   const [imageSteps, setImageSteps] = useState(() => clampSteps(Number(stored(localStorage, "colibri.imageSteps", String(DEFAULT_STEPS)))))
   const [seedText, setSeedText] = useState("")
   const [imageRun, setImageRun] = useState<ImageRun | null>(null)
+  const [inputImage, setInputImage] = useState<string | null>(null)
+  const [imageStrength, setImageStrength] = useState<number>(0.75)
   const historyDialog = useRef<HTMLDialogElement>(null)
   useEffect(() => { document.documentElement.dataset.theme = theme; try { localStorage.setItem("colibri.theme", theme) } catch {} }, [theme])
   useEffect(() => { if (historyOpen) historyDialog.current?.showModal(); else historyDialog.current?.close() }, [historyOpen])
@@ -409,10 +411,17 @@ export default function App() {
   const sendImage = async () => {
     const prompt = draft.trim()
     if (!prompt || loading || seed === undefined) return
-    const request = { prompt, width: imageSize.width, height: imageSize.height, steps: imageSteps, seed: seed ?? randomSeed() }
+    const request = {
+      prompt,
+      width: imageSize.width,
+      height: imageSize.height,
+      steps: imageSteps,
+      seed: seed ?? randomSeed(),
+      ...(inputImage ? { image: inputImage, strength: imageStrength } : {}),
+    }
     const assistant = imageTurn(request)
     setDraft("")
-    updateMessages((current) => [...current, { ...message("user", prompt), mode: "image" }, assistant])
+    updateMessages((current) => [...current, { ...message("user", prompt, inputImage ? [inputImage] : []), mode: "image" }, assistant])
     await runImage(assistant.id, request)
   }
 
@@ -620,7 +629,8 @@ export default function App() {
             <Textarea ref={draftRef} id="draft" aria-label={imageMode ? t("image.placeholder") : t("chat.placeholder")} value={draft} onChange={e => setDraft(e.target.value)} placeholder={imageMode ? t("image.placeholder") : t("chat.placeholder")} onPaste={event => { if (imageMode) return; const files = Array.from(event.clipboardData.files || []); if (files.length) { event.preventDefault(); void attach(files) } }} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); submit() } }} />
             <div className="composer-foot">
               {imageMode ? <ImageControls size={imageSize} custom={customSize} steps={imageSteps} seed={seedText} seedValid={seed !== undefined}
-                onSize={setImageSize} onCustom={setCustomSize} onSteps={setImageSteps} onSeed={setSeedText} /> : <>
+                onSize={setImageSize} onCustom={setCustomSize} onSteps={setImageSteps} onSeed={setSeedText}
+                image={inputImage} strength={imageStrength} onImage={setInputImage} onStrength={setImageStrength} /> : <>
               <input ref={fileRef} type="file" accept="image/*" multiple hidden
                 onChange={e => { void attach(e.target.files); e.target.value = "" }} />
               <button type="button" className="attach-chip" aria-label={t("ui.attachImage")} title={t("ui.attachImage")}
