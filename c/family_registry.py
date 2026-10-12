@@ -936,6 +936,81 @@ def _mimo_geometry(config, context, _model_dir):
     return PlannerGeometry(state, fixed, workspace, experts)
 
 
+def _kolibri1_geometry(config, context, _model_dir):
+    """Kolibri-1 (kolibri1.c): GQA with a sliding-window ring on most layers.
+
+    layer_types says which layer is which ("full_attention" or
+    "sliding_attention"). KV is f32 and has no separate value width:
+
+        full-attention layers  context * kv_heads * (head_dim + head_dim) * 4
+        sliding-window layers  min(sliding_window, context) * kv_heads *
+                               (head_dim + head_dim) * 4, a ring (fixed)
+
+    The SERVE prefix snapshot (a second copy of both, plus the int64 ring positions) is
+    charged on top of the live cache at its worst case (P = context); see below.
+
+    Workspace mirrors the engine's 64-row blocks: x (six hidden-wide rows plus the
+    FP64 routed sum and residual stream, see below), q and the
+    attention output (heads * head_dim), one score row per head, the logits row and
+    the MoE block (rows * top-k * (hidden + 2 * moe width)). The expert count key
+    is `num_experts`, not `n_routed_experts`.
+    """
+    layers = _required_int(config, "num_hidden_layers", "kolibri1")
+    experts = _required_int(config, "num_experts", "kolibri1")
+    hidden = _required_int(config, "hidden_size", "kolibri1")
+    kv = _required_int(config, "num_key_value_heads", "kolibri1")
+    heads = _required_int(config, "num_attention_heads", "kolibri1")
+    head_dim = _required_int(config, "head_dim", "kolibri1")
+    vocab = _required_int(config, "vocab_size", "kolibri1")
+    topk = _required_int(config, "num_experts_per_tok", "kolibri1")
+    moe = _required_int(config, "moe_intermediate_size", "kolibri1")
+    types = config.get("layer_types")
+    if not isinstance(types, list) or len(types) != layers:
+        raise ValueError("kolibri1: layer_types must list every layer")
+    if any(kind not in ("full_attention", "sliding_attention") for kind in types):
+        raise ValueError("kolibri1: layer_types holds an unknown attention type")
+    windowed = sum(1 for kind in types if kind == "sliding_attention")
+    window = _required_int(config, "sliding_window", "kolibri1") if windowed else 0
+    full_kv = (layers - windowed) * context * kv * (head_dim + head_dim) * 4
+    ring_rows = windowed * min(window, context)
+    ring_kv = ring_rows * kv * (head_dim + head_dim) * 4
+    # SERVE keeps a second copy of the cache for prefix reuse (k1_snap_take, taken after
+    # every completed prompt, K1_SERVE_PREFIX=1 by default): the full layers' history
+    # [0, P) with P <= context, the whole ring, and the ring positions (int64). Charge its
+    # worst case here so the planner takes it out of the expert cache (cap), not out of
+    # the reserve. Per-context int arrays: the prompt ids, the fed ids and the snapshot ids.
+    snapshot_full = full_kv
+    snapshot_ring = ring_kv + ring_rows * 8
+    snapshot_meta = 3 * layers * 8 + 64
+    state = full_kv + snapshot_full + 3 * context * 4
+    fixed = ring_kv + ring_rows * 8 + snapshot_ring + snapshot_meta   # live ring + its positions + snapshot
+    block = 64
+    # The FP64 routed-sum workspace (ws.routed64) is two more hidden-wide 4-byte rows per
+    # block, and the FP64 residual stream (ws.x, ws.xo, ws.ffn) three more: hidden * 11 in
+    # all (6 + 2 + 3), i.e. +12 x block x hidden bytes over an all-FP32 engine.
+    workspace = (block * hidden * 11 + block * heads * head_dim * 2 + heads * context
+                 + vocab + block * topk * (hidden + 2 * moe)) * 4
+    return PlannerGeometry(state, fixed, workspace, experts)
+
+
+_KOLIBRI1_DTYPES = ("BF16", "F8_E4M3", "F8_E4M3FN", "F32")
+
+
+def _kolibri1_resident_inventory(name, size, _config, dtype=None):
+    """Resident bytes of the non-expert tensors, as stored in the release.
+
+    qwen38's inventory refuses F8 and expands everything but the big matrices to f32;
+    kolibri1 keeps every tensor as stored: BF16 embed / lm_head / norms / router gate
+    and bias, F8_E4M3 attention and shared-expert matrices with their F32 128x128
+    scale grids (3,311,125,120 B for the real checkpoint).
+    The routed experts and their scale grids never reach this hook (expert and fixed
+    inventories claim them first).
+    """
+    if dtype is not None and dtype not in _KOLIBRI1_DTYPES:
+        raise ValueError(f"kolibri1: resident tensor {name!r} has unsupported dtype {dtype}")
+    return size
+
+
 # What the checkpoint carries and mimo.c never loads: the three MTP layers (no
 # speculative decoding yet) and the audio encoder (text and images only).
 _MIMO_NOT_LOADED = re.compile(r"^(?:model\.mtp\.|audio_encoder\.|speech_embeddings\.)")
@@ -1659,6 +1734,51 @@ FAMILIES = (
         # the gateway's cue with thinking on (render_chat_mimo): the template's
         # ChatML with no newline after <|im_end|>, and the <think> the model writes
         tune_prompt_template="<|im_start|>user\n{prompt}<|im_end|><|im_start|>assistant\n<think>",
+    ),
+    FamilyDescriptor(
+        id="kolibri1",
+        model_types=("kolibri1",),
+        display_name="Kolibri-1",
+        display_scale="78B",
+        engine_artifact="kolibri1",
+        engine_aliases=(),
+        engine_group="kolibri1",
+        internal_arch="kolibri1",
+        build_target="kolibri1",
+        process_names=("kolibri1",),
+        default_model_id="kolibri-1-colibri",
+        cli_adapter="kolibri1",
+        gateway_adapter="kolibri1",
+        planner_id="kolibri1",
+        planner_geometry=_kolibri1_geometry,
+        planner_unsupported_reason="",
+        # Per-expert FP8 tensors named like Qwen3.8's (model.layers.N.mlp.experts.E.
+        # {gate,up,down}_proj.weight / weight_scale_inv): the same inventories apply,
+        # the scale grids go to one fixed bank, counted once.
+        expert_inventory=_qwen38_expert_inventory,
+        fixed_resident_inventory=_qwen38_fixed_resident_inventory,
+        resident_inventory=_kolibri1_resident_inventory,
+        config_section="root",
+        # max_position_embeddings 262144; the engine reads K1_CTX, then CTX
+        limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 1, "CTX"),
+        # tools (Hermes JSON, parse_kolibri1_tool_calls) and thinking; no grammars,
+        # no audio, no images
+        capabilities=FamilyCapabilities(True, False, False, True),
+        has_gateway_adapter=True,
+        # the engine is driven through the gateway (SERVE); coli run has no kolibri1
+        # branch
+        has_cli_adapter=False,
+        # render_chat_kolibri1's cue with thinking on (the model writes <think>)
+        tune_prompt_template=(
+            "<|im_start|>system\n# Reasoning effort\n\nReasoning effort is set to high. "
+            "Think carefully through the task in the user's language, validate key "
+            "assumptions, consider plausible alternatives, and prioritize correctness "
+            "and clarity.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n"
+            "<|im_start|>assistant\n"),
+        # CPU engine only for now: no expert tier and no trunk_inventory (int8 trunk
+        # quantisation would break the logit gates).
+        supports_accelerator=False,
+        trunk_inventory=None,
     ),
     FamilyDescriptor(
         id="qwen_image",

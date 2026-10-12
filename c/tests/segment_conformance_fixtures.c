@@ -136,6 +136,14 @@ static const ColiSegmentConformanceFixture g_fixtures[] = {
             COLI_SEGMENT_FIXTURE_VISION_TOWER,
         3, 8, 6, 64, UINT32_C(0x4d494d4f),
     },
+    {
+        "kolibri1", "Kolibri-1", "fixture/kolibri1-kv-ring-nope-v1",
+        "full-attention KV + sliding-window KV ring (contract fixture only; no real adapter)",
+        "tools/make_kolibri1_tiny.py",
+        COLI_SEGMENT_FIXTURE_KV |
+            COLI_SEGMENT_FIXTURE_SLIDING_RING,
+        3, 8, 6, 64, UINT32_C(0x4b4f4c31),
+    },
 };
 
 static int fail(char *error, size_t error_size, const char *message) {
@@ -388,6 +396,7 @@ DECLARE_OPEN_WRAPPER(qwen38, 6)
 DECLARE_OPEN_WRAPPER(deepseek_v4, 7)
 DECLARE_OPEN_WRAPPER(deepseek_v41, 8)
 DECLARE_OPEN_WRAPPER(mimo, 9)
+DECLARE_OPEN_WRAPPER(kolibri1, 10)
 
 #define FIXTURE_ADAPTER(name)                                                  \
     {                                                                          \
@@ -415,6 +424,7 @@ static const ColiSegmentAdapter g_adapters[] = {
     FIXTURE_ADAPTER(deepseek_v4),
     FIXTURE_ADAPTER(deepseek_v41),
     FIXTURE_ADAPTER(mimo),
+    FIXTURE_ADAPTER(kolibri1),
 };
 
 int coli_segment_conformance_register_fixtures(void) {

@@ -153,6 +153,19 @@
         "path": "tools/make_mimo_tiny.py"
       },
       "real_adapter_required": true
+    },
+    {
+      "family_id": "kolibri1",
+      "state_schema": "fixture/kolibri1-kv-ring-nope-v1",
+      "state_components": [
+        "full_attention_kv",
+        "window_attention"
+      ],
+      "oracle": {
+        "kind": "generated_tiny",
+        "path": "tools/make_kolibri1_tiny.py"
+      },
+      "real_adapter_required": true
     }
   ]
 }

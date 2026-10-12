@@ -1051,6 +1051,13 @@ class FamilyRegistryTest(unittest.TestCase):
             "deepseek_v41": "hello {world}",
             # MiMo-V2.6: render_chat_mimo's cue with thinking on (its template's default)
             "mimo": "<|im_start|>user\nhello {world}<|im_end|><|im_start|>assistant\n<think>",
+            # Kolibri-1: render_chat_kolibri1 with thinking on, effort unset (= high); the
+            # cue stops at assistant\n, the model writes <think> itself.
+            "kolibri1": "<|im_start|>system\n# Reasoning effort\n\nReasoning effort is set to "
+                        "high. Think carefully through the task in the user's language, validate "
+                        "key assumptions, consider plausible alternatives, and prioritize "
+                        "correctness and clarity.<|im_end|>\n<|im_start|>user\nhello {world}"
+                        "<|im_end|>\n<|im_start|>assistant\n",
             # An image model has no chat template and nothing to tune; the
             # template is the identity and `coli tune` refuses the modality.
             "qwen_image": "hello {world}",
