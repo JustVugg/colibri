@@ -1296,7 +1296,7 @@ ifneq ($(EXE),)
 olmoe: olmoe$(EXE)
 endif
 olmoe$(EXE): olmoe.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(NOCUDA_CFLAGS) olmoe.c $(VK_OBJ) -o olmoe$(EXE) $(NOCUDA_LDFLAGS) $(if $(IS_WIN),,-ldl)
+	$(CC) $(NOCUDA_CFLAGS) olmoe.c $(VK_OBJ) -o olmoe$(EXE) $(NOCUDA_LDFLAGS) $(if $(IS_WIN),,$(if $(filter 1,$(VK)),,-ldl))
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
 # MoE). With CUDA=1 the optional VRAM expert tier (qwen36_tier.c) is compiled

@@ -154,6 +154,7 @@ typedef struct {
      * run unlocked and in parallel, so this is an atomic counter rather than a
      * plain double: a per-turn delta of it is what the PROF line reports. */
     uint64_t disk_ns;
+    uint64_t disk_bytes;
     float **K, **V; int kv_len, max_t;
     /* The bytes the expert cache and the KV share when the cache was sized from
      * the automatic budget (0: an explicit cap, nothing shared), and the
