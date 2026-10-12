@@ -80,7 +80,7 @@ def main():
     shards = json.loads((fx / "fixture.json").read_text())["shard_sha256"] if (fx / "fixture.json").exists() else {}
     out = {
         "schema": "kolibri1-tiny-ref/1",
-        "oracle": "FP32 PyTorch reference implementation (tools/kolibri1_reference)", "reference_sha256": got, "reference_provenance": prov,
+        "oracle": "FP32 PyTorch reference implementation (tools/kolibri1_reference)", "generation_source_sha256": got, "generation_provenance": prov,
         "torch": torch.__version__, "numpy": np.__version__,
         "config_sha256": sha(fx / "config.json"), "fixture_shard_sha256": shards,
         "window": window, "vocab": vocab,

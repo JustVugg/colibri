@@ -1,5 +1,5 @@
 {
-  "what": "vendored, pinned copy of the FP32 PyTorch reference implementation of Kolibri-1; used only by tools/make_kolibri1_ref.py to write kolibri1_tiny/ref.json",
+  "what": "vendored, pinned copy of the FP32 PyTorch reference implementation of Kolibri-1; used only by tools/make_kolibri1_ref.py to write kolibri1_tiny/ref.json. 'sha256' is the identity of this file; the numbers in ref.json were generated with an earlier byte-form, see MIGRATION.json",
   "source": "written for this engine from the checkpoint's published semantics and the vendor plugin (see the file's docstring and docs/kolibri1.md)",
   "file": "kolibri1_ref.py",
   "sha256": "3591275eb00759ffcf0e8f42a41ba5edb491c85f54b84dd192bc3a106d4a9114",
@@ -9,5 +9,6 @@
     "safetensors": "0.8.0",
     "numpy": "2.5.3"
   },
-  "note": "The mimo and kimi oracles run the vendor's own code; the vendor stack for Kolibri-1 needs vLLM, so this oracle is a separate implementation, see docs/kolibri1.md"
+  "note": "The mimo and kimi oracles run the vendor's own code; the vendor stack for Kolibri-1 needs vLLM, so this oracle is a separate implementation, see docs/kolibri1.md",
+  "migration": "MIGRATION.json"
 }
