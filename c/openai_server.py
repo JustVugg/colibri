@@ -1056,6 +1056,8 @@ def _parse_arch_tool_calls(reply, tools, tool_reply, track_spans):
             _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
             return reply.strip(), calls, None, None
         return parse_k3_tool_calls(reply, tools) + (None, None)  # pre-#1147 engines
+    if ARCH == "kolibri1":
+        return parse_kolibri1_tool_calls(reply, tools) + (None, None)
     if chat_flavor() in ("qwen36", "qwen38", "qwen3_coder"):
         return parse_qwen_tool_calls(reply, tools) + (None, None)
     if ARCH == "mimo":
@@ -2396,6 +2398,215 @@ def _parse_mimo_tool_calls(reply, tools, track_spans):
     return content, calls, box_map, _compose_span_maps(box_map, step)
 
 
+# ---- Kolibri 1 (Aleph Alpha) ---------------------------------------------------------------
+# The checkpoint's chat template (tokenizer_config.json, copied as the vendor's
+# tests/kolibri1_chat_template.jinja) is rendered here by hand and pinned byte for byte by
+# tests/test_kolibri1_chat_template.py. Differences from the other ChatML renderers:
+#   - the system block is ALWAYS emitted and always carries `# Reasoning effort`;
+#   - `reasoning_effort` outranks `enable_thinking` (the template's own precedence), and the
+#     reply splitter reads the same switch (kolibri1_thinking_enabled) as the renderer;
+#   - with thinking ON the prompt stops at `<|im_start|>assistant\n` (the model writes
+#     `<think>` itself); with thinking OFF it ends in the closed empty think block;
+#   - tool calls are Hermes JSON (`<tool_call>\n{"name": ..., "arguments": ...}\n</tool_call>`).
+KOLIBRI1_EFFORTS = (None, "none", "minimal", "low", "medium", "high", "xhigh", "max")
+KOLIBRI1_SENTENCES = {
+    "none": "Reasoning is disabled. Proceed straight to answering according to the user's "
+            "instructions.",
+    "low": "Reasoning effort is set to low. Think briefly through only the essential steps "
+           "in the user's language, then proceed directly to the answer.",
+    "medium": "Reasoning effort is set to medium. Think through the task methodically in the "
+              "user's language, check key assumptions, and provide a well-supported answer.",
+    "high": "Reasoning effort is set to high. Think carefully through the task in the user's "
+            "language, validate key assumptions, consider plausible alternatives, and "
+            "prioritize correctness and clarity.",
+}
+KOLIBRI1_TOOLS_HEAD = (
+    "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+    "You are provided with function signatures within <tools></tools> XML tags:\n<tools>")
+KOLIBRI1_TOOLS_TAIL = (
+    "\n</tools>\n\nFor each function call, return a json object with function name and "
+    "arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n"
+    "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>")
+KOLIBRI1_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)", re.S)
+
+
+def kolibri1_thinking_enabled(reasoning_effort=None, enable_thinking=None):
+    """Whether the Kolibri 1 template renders the prompt for thinking. One definition for the
+    renderer AND the reply splitter (the vendor's reasoning.thinking_enabled): a
+    `reasoning_effort` other than null wins and only "none" turns thinking off; without one
+    only a literal `enable_thinking: false` does."""
+    if reasoning_effort is not None:
+        return reasoning_effort != "none"
+    return enable_thinking is not False
+
+
+def _kolibri1_tojson(value):
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _kolibri1_arguments(arguments):
+    """`tool_call.arguments` as the template prints it. the vendor stack parses an OpenAI client's JSON
+    string into an object before the template runs, and the template then prints it with
+    `tojson`; a string that is not JSON is printed raw, as the template does for a string."""
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            return arguments
+    return _kolibri1_tojson(arguments)
+
+
+def render_chat_kolibri1(messages, enable_thinking=None, reasoning_effort=None, tools=None,
+                         tool_choice=None, add_generation_prompt=True, preserve_thinking=False):
+    """Kolibri 1's chat template. `enable_thinking` is the client's raw value (None when it
+    sent none): the template consults it only when there is no `reasoning_effort`.
+    `preserve_thinking` is the template's own flag (undefined means false there)."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    # add_generation_prompt=False is the vendor stack's `continue_final_message` (the only
+    # open-turn mechanism it has): the template is rendered with no cue and the final
+    # assistant turn is cut right after its content, so the prompt ends mid-turn on the shape
+    # the template writes for a past turn -- `<think>\n{reasoning}\n</think>\n\n{content}` --
+    # without `<|im_end|>`. (HF apply_chat_template tags the final content, renders, and cuts at
+    # the tag; the bytes below are pinned against that in the tests.)
+    if not add_generation_prompt:
+        final = messages[-1]
+        if not isinstance(final, dict) or final.get("role") != "assistant":
+            raise APIError(400, "Continuing a turn needs the final message to be an `assistant` "
+                           "message.", f"messages.{len(messages) - 1}.role")
+        if final.get("tool_calls"):
+            raise APIError(400, "A continued `assistant` message cannot carry `tool_calls`.",
+                           f"messages.{len(messages) - 1}.tool_calls", "unsupported_value")
+    if tool_choice in ("none",):
+        tools = None
+    if tools is not None and not isinstance(tools, list):
+        raise APIError(400, "`tools` must be an array.", "tools")
+    thinking = kolibri1_thinking_enabled(reasoning_effort, enable_thinking)
+    if not thinking:
+        sentence = KOLIBRI1_SENTENCES["none"]
+    elif reasoning_effort in ("minimal", "low"):
+        sentence = KOLIBRI1_SENTENCES["low"]
+    elif reasoning_effort == "medium":
+        sentence = KOLIBRI1_SENTENCES["medium"]
+    else:                                  # high, xhigh, max, or none given
+        sentence = KOLIBRI1_SENTENCES["high"]
+
+    # Flatten first: the template prints message.content raw and tests `is string`.
+    rows = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role == "developer":
+            role = "system"
+        if role not in ("system", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        body = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        rows.append((role, body, message))
+
+    has_system = rows[0][0] == "system"
+    out = ["<|im_start|>system\n"]
+    if has_system:
+        out.append(rows[0][1])
+        out.append("\n\n")
+    out.append("# Reasoning effort\n\n" + sentence)
+    if tools:
+        out.append("\n\n" + KOLIBRI1_TOOLS_HEAD)
+        for tool in tools:
+            out.append("\n" + _kolibri1_tojson(tool))
+        out.append(KOLIBRI1_TOOLS_TAIL)
+    out.append("<|im_end|>\n")
+
+    last_query = len(rows) - 1
+    for index in range(len(rows) - 1, -1, -1):
+        role, body, _message = rows[index]
+        if role == "user" and not (body.startswith("<tool_response>")
+                                   and body.endswith("</tool_response>")):
+            last_query = index
+            break
+
+    for index, (role, body, message) in enumerate(rows):
+        if role == "user" or (role == "system" and index > 0):
+            out.append(f"<|im_start|>{role}\n{body}<|im_end|>\n")
+        elif role == "assistant":
+            content = body
+            reasoning = None
+            for key in ("reasoning", "reasoning_content"):
+                value = message.get(key)
+                if value is not None:
+                    if not isinstance(value, str):
+                        raise APIError(400, f"`{key}` must be a string.",
+                                       f"messages.{index}.{key}")
+                    reasoning = value
+                    break
+            else:
+                if "</think>" in content:
+                    reasoning = content.split("</think>")[0].rstrip("\n").split("<think>")[-1] \
+                        .lstrip("\n")
+                    content = content.split("</think>")[-1].lstrip("\n")
+            out.append("<|im_start|>assistant\n")
+            if index > last_query or preserve_thinking is True:
+                out.append("<think>\n")
+                if reasoning is not None and reasoning.strip():
+                    out.append(reasoning.strip("\n"))
+                out.append("\n</think>\n\n")
+            out.append(content.lstrip("\n"))
+            calls = message.get("tool_calls")
+            if calls:
+                if not isinstance(calls, list):
+                    raise APIError(400, "`tool_calls` must be an array.",
+                                   f"messages.{index}.tool_calls")
+                for position, call in enumerate(calls):
+                    where = f"messages.{index}.tool_calls.{position}"
+                    if not isinstance(call, dict):
+                        raise APIError(400, "Each tool call must be an object.", where)
+                    fn = call.get("function") or call
+                    if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) \
+                            or not fn["name"]:
+                        raise APIError(400, "A tool call needs a `function.name`.",
+                                       f"{where}.function")
+                    if (position == 0 and content) or position > 0:
+                        out.append("\n")
+                    out.append('<tool_call>\n{"name": "' + fn["name"] + '", "arguments": '
+                               + _kolibri1_arguments(fn.get("arguments")) + "}\n</tool_call>")
+            if add_generation_prompt or index != len(rows) - 1:
+                out.append("<|im_end|>\n")
+        elif role == "tool":               # consecutive results share one user turn
+            if index == 0 or rows[index - 1][0] != "tool":
+                out.append("<|im_start|>user")
+            out.append("\n<tool_response>\n" + body + "\n</tool_response>")
+            if index == len(rows) - 1 or rows[index + 1][0] != "tool":
+                out.append("<|im_end|>\n")
+    if not add_generation_prompt:
+        return "".join(out)                # open turn: no terminator, no cue
+    out.append("<|im_start|>assistant\n")
+    if not thinking:
+        out.append("<think>\n\n</think>\n\n")
+    return "".join(out)
+
+
+def parse_kolibri1_tool_calls(reply, tools=None):
+    """Hermes JSON tool calls, read the way the vendor stack's Hermes tool parser reads them (the
+    vendor registers it for Kolibri 1): every `<tool_call>JSON</tool_call>` (the last may be unclosed) is
+    `json.loads`ed, `arguments` is re-dumped with ensure_ascii=False, content is the text
+    before the first `<tool_call>` (not stripped). Anything unparseable makes the WHOLE reply
+    content with no calls. Returns (content, tool_calls)."""
+    text = reply or ""
+    if BOX_START not in text:
+        return text, []
+    try:
+        raw = [json.loads(closed if closed else tail)
+               for closed, tail in KOLIBRI1_CALL_RE.findall(text)]
+        calls = [{"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
+                  "function": {"name": call["name"],
+                               "arguments": json.dumps(call["arguments"], ensure_ascii=False)}}
+                 for call in raw]
+    except Exception:
+        return text, []
+    return text[:text.find(BOX_START)], calls
+
+
 def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, tools=None,
                        tool_choice=None, add_generation_prompt=True):
     """Text-only Qwen3.8 chat-template subset with native reasoning hints.
@@ -3392,7 +3603,7 @@ def render_chat_dsv41(messages, enable_thinking=False, reasoning_effort=None, to
 # on by default, and a family without its open-turn shape yet must not start rejecting requests
 # nobody opted into. Each renderer adds itself here in the same commit that derives its shape.
 CONTINUATION_FAMILIES = {"glm53", "qwen38", "qwen36", "glm", "olmoe", "deepseek_v4", "inkling",
-                         "kimi", "deepseek_v41", "mimo"}
+                         "kimi", "deepseek_v41", "mimo", "kolibri1"}
 
 
 def resolve_generation_prompt(messages, body):
@@ -3506,6 +3717,9 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if ARCH == "deepseek_v41":
         return render_chat_dsv41(messages, enable_thinking, reasoning_effort, tools,
                                  tool_choice, add_generation_prompt)
+    if ARCH == "kolibri1":
+        return render_chat_kolibri1(messages, enable_thinking, reasoning_effort, tools,
+                                    tool_choice, add_generation_prompt, preserve_thinking)
     if ARCH == "mimo":
         return render_chat_mimo(messages, enable_thinking, reasoning_effort, tools,
                                 tool_choice, add_generation_prompt)
@@ -4272,6 +4486,53 @@ def validate_tools(body):
                                f"tools.{idx}.function.parameters.required", "invalid_value")
 
 
+KOLIBRI1_VENDOR_SAMPLING = {"temperature": 1.0, "top_p": 0.97, "top_k": 128}
+KOLIBRI1_MODEL_DIR = None   # set in serve() for the kolibri1 family
+_K1_SAMPLING_CACHE = {}
+
+
+def kolibri1_sampling_defaults(model_dir=None):
+    """Kolibri 1 sampling defaults: the checkpoint's generation_config.json (temperature, top_p,
+    top_k), each key falling back to the vendor value (1.0 / 0.97 / 128) when the file or the key
+    is missing or out of range. Cached per directory.
+
+    Precision on what a kolibri1 request controls. The SUBMIT frame carries `temperature` and
+    `top_p` per request and nothing else (serve_codec.h is not extended; no sign tricks on
+    existing fields). Therefore:
+      * request `top_k` is IGNORED, whatever its value (including 1). top_k is launch-level:
+        the engine runs K1_TOP_K, which the gateway sets from the operator's K1_TOP_K, else the
+        checkpoint's generation_config.json top_k, else the vendor 128.
+      * request `seed` is IGNORED. The seed is launch-level (engine env K1_SEED / SEED).
+      * `temperature` and `top_p` are honoured per request (client > COLI_TEMP for temperature
+        > generation_config.json > vendor defaults).
+    Each request that sends a `top_k` or `seed` logs one warning line to stderr. A per-request
+    top_k would need a named, capability-advertised field through a maintainer-reviewed
+    shared-header change."""
+    model_dir = KOLIBRI1_MODEL_DIR if model_dir is None else model_dir
+    key = str(model_dir)
+    if key in _K1_SAMPLING_CACHE:
+        return dict(_K1_SAMPLING_CACHE[key])
+    out = dict(KOLIBRI1_VENDOR_SAMPLING)
+    try:
+        cfg = json.loads((Path(model_dir) / "generation_config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        cfg = {}
+    if isinstance(cfg, dict):
+        def num(name, ok, kind):
+            value = cfg.get(name)
+            if isinstance(value, bool) or not isinstance(value, kind):
+                return
+            if isinstance(value, float) and not math.isfinite(value):
+                return
+            if ok(value):
+                out[name] = int(value) if kind is int else float(value)
+        num("temperature", lambda v: 0 <= v <= 2, (int, float))
+        num("top_p", lambda v: 0 < v <= 1, (int, float))
+        num("top_k", lambda v: v >= 0, int)
+    _K1_SAMPLING_CACHE[key] = out
+    return dict(out)
+
+
 def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
@@ -4372,6 +4633,13 @@ def generation_options(body, limit):
         maximum = limit
     temperature = body.get("temperature")
     top_p = body.get("top_p")
+    k1_defaults = kolibri1_sampling_defaults() if ARCH == "kolibri1" else None
+    if temperature is None and k1_defaults is not None and "COLI_TEMP" not in os.environ:
+        # kolibri1: nothing from the client, nothing from the operator -> the checkpoint's
+        # generation_config.json (vendor 1.0). An explicit COLI_TEMP (coli --temp) still wins.
+        temperature = k1_defaults["temperature"]
+    if top_p is None and k1_defaults is not None:
+        top_p = k1_defaults["top_p"]
     if temperature is None:
         # The launcher publishes --temp through COLI_TEMP (#509, #968). The
         # gateway must use that value as its request default or the SERVE frame
@@ -4394,6 +4662,16 @@ def generation_options(body, limit):
     if (isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or
             not math.isfinite(top_p) or not 0 < top_p <= 1):
         raise APIError(400, "`top_p` must be greater than 0 and at most 1.", "top_p")
+    if ARCH == "kolibri1":
+        # Request `top_k` and `seed` are NOT forwarded and have no effect (documented in
+        # kolibri1_sampling_defaults). The SUBMIT frame carries temperature and top_p only, and
+        # an unversioned protocol extension is not an option; top_k is launch-level (K1_TOP_K)
+        # and the seed is launch-level (K1_SEED / SEED). One line per request that sends one.
+        ignored = [name for name in ("top_k", "seed") if body.get(name) is not None]
+        if ignored:
+            sys.stderr.write("[api] kolibri1: request %s ignored (sampling is launch-level: K1_TOP_K, "
+                             "K1_SEED); only temperature and top_p are per request\n" % " and ".join(ignored))
+            sys.stderr.flush()
     return maximum, float(temperature), float(top_p), grammar, stop_sequences
 
 
@@ -5052,8 +5330,8 @@ def cap_for_arch(arch, cap, env=None, model=None):
             planned = 0
         if planned >= 1:
             return planned
-    if arch in ("deepseek_v41", "mimo", "qwen36", "qwen38") and model is not None:
-        # V4.1, MiMo, Qwen3.6 and Qwen3.8 only read their argv cap, not RAM_GB.
+    if arch in ("deepseek_v41", "mimo", "qwen36", "qwen38", "kolibri1") and model is not None:
+        # V4.1, MiMo, Qwen3.6, Qwen3.8 and Kolibri 1 only read their argv cap, not RAM_GB.
         # Without --auto-tier the legacy eight slots silently discarded both --ram
         # and RAM_GB (#1666), and Qwen3.8's implicit one slot, Qwen3.6's eight, left
         # a `coli web` or `coli serve` without --cap or a tune profile reading
@@ -5519,6 +5797,10 @@ class Engine:
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
+        if arch == "kolibri1" and not child_env.get("K1_TOP_K"):
+            # top_k is not on the SUBMIT wire: the engine takes it from K1_TOP_K at launch. Default =
+            # the checkpoint's generation_config.json (vendor 128); an operator K1_TOP_K wins.
+            child_env["K1_TOP_K"] = str(kolibri1_sampling_defaults(model)["top_k"])
         decision_head_env(child_env, model)
         # before the cap: the RAM plan reserves the context it is given
         self.context_limit = chat_context_env(child_env, family, model, kv_slots)
@@ -7975,6 +8257,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     emit(sp["buf"])                     # no tool call happened: flush held tail
                 _content, calls = parse_arch_tool_calls("".join(raw), tools,
                                                         sideband.reply())
+                if ARCH == "kolibri1" and sp["tool"] and not calls:
+                    # The Hermes parser returns the WHOLE reply as content when a call does
+                    # not parse (the non-streaming answer); the stream already sent the text
+                    # before the marker, so send the withheld rest instead of dropping it.
+                    full = "".join(raw)
+                    emit(full[full.find(BOX_START):])
                 for i, tc in enumerate(calls):
                     event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
                              "type": "function", "function": {"name": tc["function"]["name"],
@@ -8058,13 +8346,16 @@ class APIHandler(BaseHTTPRequestHandler):
                            "logprobs", "unsupported_parameter")
         reasoning_effort = body.get("reasoning_effort")
         efforts = (None, "none", "minimal", "low", "medium", "high", "xhigh")
+        if ARCH == "kolibri1":
+            efforts = KOLIBRI1_EFFORTS             # the template also takes "max"
         if reasoning_effort not in efforts:
-            raise APIError(400, "`reasoning_effort` must be none, minimal, low, medium, high, or xhigh.",
+            raise APIError(400, "`reasoning_effort` must be none, minimal, low, medium, high, "
+                           + ("xhigh, or max." if ARCH == "kolibri1" else "or xhigh."),
                            "reasoning_effort")
         # COLI_THINK=1 makes thinking the default when the client sends NEITHER reasoning_effort
         # nor enable_thinking (a global switch, like the old server's --think). An explicit
         # client value always wins. Default off => exact OpenAI-standard behavior.
-        if reasoning_effort is None and "enable_thinking" not in body:
+        if reasoning_effort is None and "enable_thinking" not in body and ARCH != "kolibri1":
             # Qwen3.8's official template defaults to enabled xhigh thinking;
             # preserve the older opt-in default for the other families.
             if chat_flavor() == "qwen38":
@@ -8072,7 +8363,20 @@ class APIHandler(BaseHTTPRequestHandler):
             elif ARCH == "mimo" or os.environ.get("COLI_THINK", "0") == "1":
                 # MiMo-V2.6's template thinks unless told not to (enable_thinking false)
                 reasoning_effort = "high"
-        enable_thinking = body.get("enable_thinking", reasoning_effort not in (None, "none"))
+        template_thinking = None
+        if ARCH == "kolibri1":
+            # The template's own switch, scoped to this family: thinking is ON unless a
+            # reasoning_effort of "none" or (with no effort) a literal enable_thinking false
+            # says otherwise. The raw client value goes to the renderer, the resolved one to
+            # the reply splitter, both through kolibri1_thinking_enabled(). COLI_THINK does
+            # not apply: the template's default is already thinking.
+            template_thinking = body.get("enable_thinking")
+            if template_thinking is not None and not isinstance(template_thinking, bool):
+                raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
+            enable_thinking = kolibri1_thinking_enabled(reasoning_effort, template_thinking)
+        else:
+            enable_thinking = body.get("enable_thinking",
+                                       reasoning_effort not in (None, "none"))
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         if (ARCH == "olmoe" or chat_flavor() == "qwen3_coder") and enable_thinking:
@@ -8091,7 +8395,8 @@ class APIHandler(BaseHTTPRequestHandler):
         # thinking off: there the block the history gets is the empty one the turn was
         # actually generated after, so the resent history is the engine's state byte for
         # byte and prefix reuse can engage. Only the qwen36 renderer reads it.
-        preserve_thinking = body.get("preserve_thinking", not enable_thinking)
+        preserve_thinking = body.get("preserve_thinking",
+                                     False if ARCH == "kolibri1" else not enable_thinking)
         if not isinstance(preserve_thinking, bool):
             raise APIError(400, "`preserve_thinking` must be a boolean.", "preserve_thinking")
         # The request's shape is checked before the image expanders and the renderer read it.
@@ -8116,6 +8421,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`messages` must be a non-empty array.", "messages")
         compact = compaction_requested(body)
         render = dict(enable_thinking=enable_thinking, reasoning_effort=reasoning_effort,
+                      template_thinking=template_thinking if ARCH == "kolibri1" else None,
                       tools=tools, tool_choice=tool_choice, preserve_thinking=preserve_thinking)
         lead, conversation = split_lead(messages)
         keys = compaction_keys(lead, conversation) if compact else None
@@ -8131,7 +8437,9 @@ class APIHandler(BaseHTTPRequestHandler):
             audio_clips = [] if ARCH == "inkling" else None
             expanded, image = self.expand_images(view)
             add_generation_prompt = resolve_generation_prompt(expanded, body)
-            prompt = render_chat_for_arch(expanded, enable_thinking, reasoning_effort,
+            prompt = render_chat_for_arch(expanded,
+                                          template_thinking if ARCH == "kolibri1" else enable_thinking,
+                                          reasoning_effort,
                                           tools, tool_choice, audio_out=audio_clips,
                                           add_generation_prompt=add_generation_prompt,
                                           preserve_thinking=preserve_thinking)
@@ -8250,8 +8558,10 @@ class APIHandler(BaseHTTPRequestHandler):
         # the conversation's own flags, so the prompt begins as the engine's state does,
         # with the reasoning block closed; a family whose block this cannot close (its
         # thinking switch is not a marker at the end) is asked with thinking off instead
-        prompt, closed = close_open_thinking(rendered(render["enable_thinking"],
-                                                      render["reasoning_effort"]))
+        first = render["enable_thinking"]
+        if ARCH == "kolibri1":
+            first = render.get("template_thinking")     # the template reads the raw client value
+        prompt, closed = close_open_thinking(rendered(first, render["reasoning_effort"]))
         thinking = False
         if not closed and starts_in_reasoning(render["enable_thinking"], True):
             prompt, closed = close_open_thinking(rendered(False, None))
@@ -8336,7 +8646,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`thinking` must be an object.", "thinking")
         enable_thinking = bool(thinking and thinking.get("type") == "enabled")
         if not enable_thinking and thinking is None:
-            if chat_flavor() == "qwen38" or ARCH == "mimo":
+            if chat_flavor() == "qwen38" or ARCH in ("mimo", "kolibri1"):
                 enable_thinking = True
             elif os.environ.get("COLI_THINK", "0") == "1":
                 enable_thinking = True
@@ -8360,7 +8670,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                       default_effort if enable_thinking else None,
                                       tools, tool_choice,
                                       add_generation_prompt=add_generation_prompt,
-                                      preserve_thinking=not enable_thinking)
+                                      preserve_thinking=(False if ARCH == "kolibri1"
+                                                         else not enable_thinking))
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking,
                                   add_generation_prompt, image)
 
@@ -8672,6 +8983,8 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
         family = pending_family or resolve_model(model).descriptor
         global ARCH, CHAT_FLAVOR
         ARCH = family.id
+        global KOLIBRI1_MODEL_DIR
+        KOLIBRI1_MODEL_DIR = str(model) if ARCH == "kolibri1" else None
         CHAT_FLAVOR = detect_chat_flavor(family.id, model)
         if CHAT_FLAVOR:
             print(f"[gateway] {family.id} engine, {CHAT_FLAVOR} chat template "

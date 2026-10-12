@@ -85,3 +85,12 @@ not copy Swiftlet or huggingface_hub source code.
 emitted by Swiftlet's `scripts/verify_container.py`. They are new Python
 implementations with stricter path, transport, credential, resume, and digest
 validation; no Swiftlet source code is copied.
+
+## Kolibri-1 chat template (`c/tests/fixtures/kolibri1_chat_template.jinja`)
+
+The file is the `chat_template` string of the `tokenizer_config.json` that Aleph Alpha
+ships with the Kolibri-1 checkpoint (https://huggingface.co/Aleph-Alpha/Kolibri-1),
+which is licensed under Apache License 2.0. This repository's `LICENSE` contains the
+applicable Apache 2.0 text. It is kept unmodified (its SHA-256 is pinned in
+`c/tests/test_kolibri1_chat_template.py`) as the reference the gateway's hand-written
+renderer is compared against, byte for byte. It is test data and is not used at run time.
