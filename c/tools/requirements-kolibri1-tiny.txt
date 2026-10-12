@@ -1,0 +1,3 @@
+# tiny Kolibri-1 fixture generation and the committed-reference check (CI): deterministic
+# numpy weights; no torch (the reference output is committed as c/kolibri1_tiny/ref.json)
+numpy>=1.24

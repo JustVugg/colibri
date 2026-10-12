@@ -1458,6 +1458,94 @@ mimo-tiny-serve-check: mimo-tiny-generate mimo$(EXE)
 	$(PYTHON) -m unittest -v tests.test_mimo_prefix_serve tests.test_brio_serve.MimoBrioServe \
 		tests.test_systemone_api.MimoSystemOneEndToEnd
 
+# Aleph Alpha Kolibri-1 (50 layers, 384 experts top-6, FP8 block-128 experts). One
+# file, CPU only (CUDA=1 does not change it; the CUDA expert tier is a separate
+# change). Tests: loader and --validate, kernels, tokenizer, forward pass.
+ifneq ($(EXE),)
+.PHONY: kolibri1
+kolibri1: kolibri1$(EXE)
+endif
+kolibri1$(EXE): kolibri1.c
+	$(CC) $(NOCUDA_CFLAGS) kolibri1.c -o kolibri1$(EXE) $(NOCUDA_LDFLAGS)
+
+# Tiny fixtures: the release layout (F32 scales first in every shard, a 60/20/20
+# mix of contiguous and split experts), the same with the {s,s,F,s,s,F} layer
+# list (valid for the generic loader, rejected by --release) and a plain
+# two-shard layout. numpy only, deterministic, gitignored.
+.PHONY: kolibri1-tiny-generate kolibri1-tiny-check
+kolibri1-tiny-generate:
+	$(PYTHON) tools/make_kolibri1_tiny.py --out ./kolibri1_tiny --layout release --force
+	$(PYTHON) tools/make_kolibri1_tiny.py --out ./kolibri1_tiny_alt --layout release --layer-types alt --force
+	$(PYTHON) tools/make_kolibri1_tiny.py --out ./kolibri1_tiny_simple --force
+
+# The fixture census, then the loader on every fixture and the negative matrix.
+kolibri1-tiny-check: kolibri1-tiny-generate kolibri1$(EXE)
+	$(PYTHON) tests/test_kolibri1_tiny.py
+	./kolibri1$(EXE) ./kolibri1_tiny --validate --release
+	./kolibri1$(EXE) ./kolibri1_tiny_alt --validate
+	./kolibri1$(EXE) ./kolibri1_tiny_simple --validate
+	KOLIBRI1_BIN=./kolibri1$(EXE) $(PYTHON) tests/test_kolibri1_loader.py
+
+# FP8 dequantisation: all 256 e4m3 codes x 4096 FP32 scales, bitwise. test-c runs it with
+# the independent in-C decoder; this maintainer-run target also compares against torch
+# (tests/kolibri1_c1_ref.py), so it is not part of kolibri1-check.
+tests/test_kolibri1_dequant$(EXE): tests/test_kolibri1_dequant.c kolibri1.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+.PHONY: kolibri1-c1-check
+kolibri1-c1-check: tests/test_kolibri1_dequant$(EXE)
+	$(PYTHON) tests/kolibri1_c1_ref.py --out ./kolibri1_ref/c1
+	./tests/test_kolibri1_dequant$(EXE) ./kolibri1_ref/c1
+
+# The engine's kernels as components (FP8 matmul S=1/S>1, bf16, rmsnorm, RoPE tables,
+# router). test-c runs it with in-C long double references; this target gates it
+# against the NumPy float64 reference (tests/kolibri1_kernel_ref.py).
+tests/test_kolibri1_kernels$(EXE): tests/test_kolibri1_kernels.c kolibri1.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+.PHONY: kolibri1-kernels-check
+kolibri1-kernels-check: tests/test_kolibri1_kernels$(EXE)
+	$(PYTHON) tests/kolibri1_kernel_ref.py --out ./kolibri1_ref/k
+	./tests/test_kolibri1_kernels$(EXE) ./kolibri1_ref/k
+
+# tok.h + the engine-local guarded digit override against Hugging Face `tokenizers`.
+# test-c runs the tiny tokenizer (tests/tok_kolibri1_tiny.json: the real regex and 98
+# added tokens, a few hundred merges; regenerate with tests/make_kolibri1_tok_tiny.py).
+# kolibri1-tokenizer-real compares the full vocabulary, a multilingual corpus and every
+# Unicode scalar value on the release's own tokenizer.json (MODEL=/path/to/kolibri-1-fp8).
+tests/test_kolibri1_tokenizer$(EXE): tests/test_kolibri1_tokenizer.c kolibri1.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+.PHONY: kolibri1-tokenizer-real
+kolibri1-tokenizer-real: tests/test_kolibri1_tokenizer$(EXE)
+	$(PYTHON) tests/kolibri1_tok_ref.py --tokenizer $(MODEL)/tokenizer.json --out ./kolibri1_ref/tok \
+		--readme $(MODEL)/README.md --source kolibri1.c --source st.h --source tok.h
+	./tests/test_kolibri1_tokenizer$(EXE) $(MODEL)/tokenizer.json ./kolibri1_ref/tok/vocab.hex \
+		./kolibri1_ref/tok/corpus.hex ./kolibri1_ref/tok/unicode.hex
+
+# CPU forward on the tiny fixture against the committed oracle output
+# (kolibri1_tiny/ref.json, written by tools/make_kolibri1_ref.py from the pinned reference).
+.PHONY: kolibri1-forward-check
+kolibri1-forward-check: kolibri1-tiny-generate kolibri1$(EXE)
+	K1_REQUIRE_FORWARD=1 KOLIBRI1_BIN=./kolibri1$(EXE) $(PYTHON) tests/kolibri1_tiny_harness.py
+
+.PHONY: kolibri1-capture-check
+kolibri1-capture-check: kolibri1-tiny-generate kolibri1$(EXE)
+	K1_REQUIRE_FORWARD=1 KOLIBRI1_BIN=./kolibri1$(EXE) $(PYTHON) tests/kolibri1_capture_harness.py
+
+# The FP64 residual rule against an independent exact-rational reference (operator and
+# layer probes, chunk invariance, an fp32-stream control).
+.PHONY: kolibri1-residual-check
+kolibri1-residual-check: kolibri1$(EXE)
+	K1_REQUIRE_FORWARD=1 KOLIBRI1_BIN=./kolibri1$(EXE) $(PYTHON) tests/test_kolibri1_residual_c.py
+
+# Everything that runs on the tiny fixtures with numpy only (no torch, no network, no
+# model): the CI job. The real-checkpoint checks are `./kolibri1 <model> --validate
+# --release` and kolibri1-tokenizer-real.
+.PHONY: kolibri1-check
+kolibri1-check: kolibri1-tiny-check kolibri1-kernels-check kolibri1-forward-check kolibri1-capture-check kolibri1-residual-check tests/test_kolibri1_tokenizer$(EXE)
+	./tests/test_kolibri1_tokenizer$(EXE)
+
 # Qwen3.8-Flash-Next text-only sibling. qwen38.c owns the direct checkpoint
 # loader and SERVE=1 protocol. With CUDA=1 it links the same expert tier as
 # qwen36 (fp8 streaming mode: hot experts get VRAM copies, the RAM LRU stays);
@@ -2946,7 +3034,7 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) mimo$(EXE) qwenimage$(EXE) laya$(EXE) gliner_decide$(EXE) \
+install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) mimo$(EXE) kolibri1$(EXE) qwenimage$(EXE) laya$(EXE) gliner_decide$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
@@ -2964,6 +3052,7 @@ install: colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen3
 	$(INSTALL) -m 755 gliner_decide$(EXE) $(DESTDIR)$(LIBEXECDIR)/gliner_decide$(EXE)
 	$(INSTALL) -m 755 deepseek_v41$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v41$(EXE)
 	$(INSTALL) -m 755 mimo$(EXE) $(DESTDIR)$(LIBEXECDIR)/mimo$(EXE)
+	$(INSTALL) -m 755 kolibri1$(EXE) $(DESTDIR)$(LIBEXECDIR)/kolibri1$(EXE)
 	@if [ -f deepseek_v4$(EXE) ]; then \
 	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
 	fi

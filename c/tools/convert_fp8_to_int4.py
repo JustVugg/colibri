@@ -72,6 +72,8 @@ OTHER_FAMILY_PATHS = {
     "mimo_v2":         "MiMo-V2.6 is NOT converted: its experts already ship MXFP4 and its "
                        "dense FP8/BF16, and the engine reads the release as downloaded; "
                        "see docs/mimo.md",
+    "kolibri1":        "Kolibri-1 is NOT converted: the engine reads the official FP8 release "
+                       "as downloaded (F8_E4M3 weights, F32 128x128 scale grids)",
     "qwenimage21pipeline": "Qwen-Image-2.1 is NOT converted: the image engine reads the "
                            "diffusers checkpoint as downloaded; see docs/qwen-image.md",
     "laya_modernbert": "Laya is NOT converted: the decision engine reads the release "
