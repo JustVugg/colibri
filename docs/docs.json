@@ -23,7 +23,7 @@
           },
           {
             "group": "Model engines",
-            "pages": ["deepseek-v4", "kimi_k3", "qwen38", "qwen36", "inkling", "mimo", "qwen-image", "laya", "gliner_decide", "clef"]
+            "pages": ["deepseek-v4", "kimi_k3", "qwen38", "qwen36", "inkling", "mimo", "kolibri1", "qwen-image", "laya", "gliner_decide", "clef"]
           },
           {
             "group": "Configure and tune",

@@ -22,6 +22,7 @@ what follows, but the sister engines read their own:
 | `deepseek_v4` | `c/deepseek_v4.c` | `CTX`, the `V4_*` / `DSV4_*` families, the two `COLI_CUDA_*_BATCH` gates and the Vulkan expert tier's `COLI_VK_TIER*` — see [DeepSeek V4 engine](#deepseek-v4-engine-deepseek_v4); note that the CUDA section below describes `colibri.c` knobs (`COLI_CUDA`, `CUDA_DENSE`, ...) which the V4 engine does not read — its GPU switch is `DSV4_CUDA` |
 | `deepseek_v41` | `c/deepseek_v41.c` | the `V41_*` family and the Vulkan expert tier's `COLI_VK_TIER*`: see [DeepSeek V4.1 engine](#deepseek-v41-engine-deepseek_v41) |
 | `mimo` | `c/mimo.c` | the `MIMO_*` family, and the Vulkan expert tier's `COLI_VK_TIER*`: see [MiMo-V2.6 engine](#mimo-v26-engine-mimo) |
+| `kolibri1` | `c/kolibri1.c` | the `K1_*` family (CPU only): see [Kolibri-1 engine](#kolibri-1-engine-kolibri1) |
 
 Setting an `INK_*` variable while running `colibri` does nothing, and vice
 versa; nothing warns you about it. A few variables are genuinely shared because
@@ -617,6 +618,25 @@ Read **only** by `c/mimo.c` (and `MIMO_MAX_IMAGE_TOKENS` by the gateway). See [m
 | `MIMO_STATS` | unset | MiMo: report the vision tower's time per picture. |
 | `COLI_VULKAN` | `0` | MiMo, `VK=1` build: the routed experts on the shared expert tier (`COLI_VK_TIER*`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)) as the release's MXFP4, and the dense matrices of the trunk and of the vision tower on the device where `COLI_VK_DENSE` puts them, in their `MIMO_DENSE_BITS` form (FP8 and BF16, int8 or f32). The router stays on the CPU. MiMo keeps no expert history: the tier fills as experts pass by. |
 | `MIMO_VK_EXPERTS` | unset | MiMo, with `COLI_VULKAN=1`: the switch of the engine's own tier before the shared one, kept as an alias. `0` keeps the routed experts on the CPU (no tier); `N` sizes the shared tier's budget at N experts (`COLI_VK_TIER_GB`, which wins when set); the tier then evicts as the routing moves, where the old one stopped at N and never let go. Unset: the shared tier with its own budget. |
+
+## Kolibri-1 engine (`kolibri1`)
+
+Read **only** by `c/kolibri1.c` (`K1_TOP_K` and `K1_SEED` are also set by the gateway). CPU only. See [kolibri1.md](kolibri1.md).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `K1_CAP` | every expert of a layer (the gateway passes the planned cap as the argument) | Kolibri-1: expert cache slots per layer when no argument gives one. |
+| `K1_CTX` | `CTX`, else the longest request plus its generation | Kolibri-1: context the KV cache is sized for. |
+| `K1_CHUNK` | 64 | Kolibri-1: prompt tokens per prefill block. The result does not depend on it. |
+| `K1_TOP_K` | the checkpoint's `generation_config.json` (128) | Kolibri-1, launch level: top-k cut before top-p; `0` turns it off. A request's `top_k` is ignored. |
+| `K1_SEED` / `SEED` | unset (time and pid) | Kolibri-1, launch level: a fixed seed makes every request draw from the same stream. A request's `seed` is ignored. |
+| `K1_STOP_IDS` | unset | Kolibri-1: extra stop token ids (comma list) beside the checkpoint's `eos_token_id`. |
+| `K1_SERVE_PREFIX` | 1 | Kolibri-1, `SERVE=1`: `0` turns the prefix snapshot (and so prefix reuse) off. |
+| `K1_SERVE_LOG` | 0 | Kolibri-1, `SERVE=1`: write one stderr line per request. |
+| `K1_FP8_KERNEL` | unset | Kolibri-1: `scalar` selects the portable FP8 kernel instead of the AVX2 one (same results, slower). |
+| `K1_BENCH_TOKENS` | 0 | Kolibri-1, benchmarking: `1` records one line per sampled token (id and monotonic nanosecond timestamp) and cumulative expert-cache counters. `K1_BENCH_FILE` appends them to a file instead of stderr; `K1_IGNORE_EOS=1` (needs `K1_BENCH_TOKENS=1`) makes stop ids ordinary tokens so a request yields exactly `max_tokens`. |
+
+Test and diagnostic hooks, all off by default and each printing a banner when on; they exist for the fixture suite and for comparing against a reference, not for normal use: `K1_CAPTURE`, `K1_FEED`, `K1_LOGITS`, `K1_LOGITS_FIFO`, `K1_ATTN_KEYS`, `K1_REPLAY_IDS` (see `c/kolibri1_capture.h`), `K1_PROBE` with `K1_PROBE_IN`, `K1_PROBE_OUT`, `K1_PROBE_T`, `K1_PROBE_LAYER`, `K1_PROBE_TAILS`, `K1_LAYERS` (a truncated model), `K1_DECODE_TAIL`, `K1_RESET`, `K1_REUSE_PREFIX`, `K1_TEST_KILL_AT`, `K1_TEST_MUT_NATSEL`, `K1_TEST_SERVE_IDS`, `K1_TEST_SERVE_NAN_REQ`, `K1_TEST_SERVE_SCRIPT`.
 
 ## OLMoE engine (`olmoe`)
 
