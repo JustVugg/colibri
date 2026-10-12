@@ -26,6 +26,8 @@
 **Laya** 與 **GLiNER2.5-Decide**；第三個決策模型 **Clef** 則執行在
 Qwen3.6 引擎上。[我的機器適合哪一個](#which-model-for-my-machine)
 
+**Kolibri-1**（kolibri1.c，`make kolibri1`）以實驗性語言模型引擎的形式放在程式碼樹中：微型夾具與註冊表/閘道已測試，真實權重的驗證尚未完成，因此不計入上面的數量。
+
 ```
 $ ./coli chat
   colibri v2.0.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU

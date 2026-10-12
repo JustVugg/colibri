@@ -27,6 +27,8 @@ Thirteen engines run today. Ten are for language models: **GLM-5.2/5.3**,
 **Laya** and **GLiNER2.5-Decide**, with a third decision model, **Clef**, on the
 Qwen3.6 engine. [Which one for my machine](#which-model-for-my-machine)
 
+**Kolibri-1** (kolibri1.c, built with `make kolibri1`) is in the tree as an experimental, CPU-only language-model engine: it runs the tiny fixture and the registry/gateway plumbing is tested, qualification on the real checkpoint is incomplete (see [docs/kolibri1.md](docs/kolibri1.md)), so it is not counted above.
+
 ```
 $ ./coli chat
   colibri v2.0.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
