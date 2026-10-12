@@ -120,8 +120,7 @@ What that means, in plain terms:
 - **Development cells.** Candidate C (the numerics in this change) was run on 123 development
   runs. On 99 of them every declared check passed, including expert routing. On the other 24
   (9 mixed-format 4k runs and 15 16k runs) the output and execution checks passed and the
-  routing checks were deferred, not run. Across all 123: KL max 3.7e-9, largest |logit
-  difference| 2.1e-3, zero decisive top-1 disagreements.
+  routing checks were deferred, not run. Across replay runs and dependency-uncontaminated natural positions, KL max was 3.7e-9 and maximum logit difference was 2.1e-3. These are conditional natural-run measurements; unmasked differences are reported separately. There were zero decisive top-1 disagreements on those populations.
 - **Fresh validation (G3) failed.** G3 was run once on new documents under a sealed
   procedure. It stopped at the first failure: a 16k-token replay run whose full-vocabulary
   logit difference at one prefill position was 0.0140647, over the 0.01 tolerance. The other
@@ -129,21 +128,15 @@ What that means, in plain terms:
   of G3 were not evaluated, and one 16k cell was not run. The tolerance was not changed
   afterwards. A diagnostic investigation of the failing cell is in progress and is not a
   qualification.
-- **Residual stream.** The scaled-residual difference against the FP64 reference is larger
-  than an early 1e-2 diagnostic limit in three development cells (4k mixed 1.8e-2; one 16k
-  CSV cell 5.7e-2 at layer 45). Local checks show the engine's arithmetic is correct at those
-  points and the map amplifies accumulated rounding (a few hidden coordinates carry very
-  large activations). The outputs are within the gates above; the residual is reported, not
+- **Residual stream.** The retired residual limit was exceeded in mixed-format 4k development runs and the 16k CSV replay-engine run. A few hidden coordinates carry very large activations. Selected local checks found discrepancies small relative to the accumulated error, and exact-FP64 continuation reproduced most of the excursions. This does not establish correctness on every operator or input. The outputs are within the gates above; the residual is reported, not
   gated.
-- **Natural (free-running) runs are not equivalent to the reference over the whole
+- **Natural-routing, teacher-forced runs are not equivalent to the reference over the whole
   population.** Where MoE routing has a near-tie, engine and reference can choose different
   experts and later positions then differ legitimately. Unmasked, with each side routing
   naturally: no top-1 differences on the 2k and 4k development documents; at 16k, 37 of 16,384 positions differ for the English document, 12 for the CSV
   and 6 for the regression prompt, 0 for the German and code documents.
-- **Qualified range.** Up to 16,384 positions (15,872 prompt + 512 generated). Longer
-  contexts run but are not qualified.
-- **J-typical detector: NOT QUALIFIED.** The detector meant to classify routing divergences
-  by typicality did not pass its qualification and is excluded from every result above.
+- **Tested length.** Testing covered up to 16,384 teacher-forced positions, including 512 incremental decode positions. Qualification is incomplete at that length; longer contexts were not assessed.
+- **J-typical detector: NOT QUALIFIED.** The detector was a development-calibrated defect detector based on residual and biased-score envelope exceedance rates. It did not pass its qualification and is excluded from every result above.
 - **Unresolved qualification gaps; further work paused.** (F1) routing and envelope identity for
   the nine mixed-format development cells; (F2) routing envelopes for the development 16k
   cells; (F3) routing envelopes for the G3 16k cells; (F4) the detector above. (F5) Limited
@@ -163,10 +156,7 @@ What that means, in plain terms:
 
 - Experimental and CPU only; Linux x86-64 is the platform used for real weights. The fixture
   suite builds on macOS arm64. Windows is untested.
-- Speed is bounded by memory bandwidth and expert reads. Earlier, unfrozen screens on a
-  16-core desktop with the experts resident gave prefill of about 18 s at 600 tokens, 164 s
-  at 4,096 and 1,220 s at 15,872, and decode of about 10.3, 8.8 and 4.6 tok/s. There is no
-  validated benchmark manifest for this engine yet.
+- Speed is bounded by memory bandwidth and expert reads. No benchmark has been validated for this engine, so no speed figures are given.
 - `top_k` and the seed are launch-level.
 - The test hooks compiled into the binary (`K1_CAPTURE`, `K1_PROBE`, `K1_TEST_*`, ...) are off
   by default and print a banner when on.
