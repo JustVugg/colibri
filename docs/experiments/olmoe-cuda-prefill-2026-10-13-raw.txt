@@ -1,0 +1,208 @@
+=== COLI_OLMOE_CUDA_PREFILL=0  mode=ppl ref=ref_p140.json wall=15.3s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+TF-NLL: 1.8031 nats/token over 32 tokens  |  ppl = 6.07
+Expert cache hit rate: 95.0%  (hit=17017 miss=903)
+Speed: 3.78 tok/s (8.5s for 32 tokens) | PEAK RSS: 6.57 GB
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 5.1s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload)
+[OLMOE CUDA] on=1 tokens=31 expert_misses=34 fetch_syncs=496 gpu_s=1.180
+
+=== COLI_OLMOE_CUDA_PREFILL=1  mode=ppl ref=ref_p140.json wall=9.8s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+TF-NLL: 1.8031 nats/token over 32 tokens  |  ppl = 6.07
+Expert cache hit rate: 0.0%  (hit=0 miss=0)
+Speed: 10.21 tok/s (3.1s for 32 tokens) | PEAK RSS: 1.29 GB
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 5.0s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload)
+[OLMOE CUDA] on=1 tokens=31 expert_misses=26 fetch_syncs=528 gpu_s=0.735 prefill_calls=1 prefill_rows=140 prefill_s=2.386 pf_verify_n=0 pf_verify_argmax_agree=0 pf_verify_max_dlogit=0.00000
+
+=== COLI_OLMOE_CUDA_PREFILL=1  mode=ppl ref=ref_p140.json wall=9.7s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+TF-NLL: 1.8031 nats/token over 32 tokens  |  ppl = 6.07
+Expert cache hit rate: 0.0%  (hit=0 miss=0)
+Speed: 10.23 tok/s (3.1s for 32 tokens) | PEAK RSS: 1.29 GB
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 5.0s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload)
+[OLMOE CUDA] on=1 tokens=31 expert_misses=26 fetch_syncs=528 gpu_s=0.764 prefill_calls=1 prefill_rows=140 prefill_s=2.353 pf_verify_n=0 pf_verify_argmax_agree=0 pf_verify_max_dlogit=0.00000
+
+=== COLI_OLMOE_CUDA_PREFILL=0  mode=ppl ref=ref_p140.json wall=15.3s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+TF-NLL: 1.8031 nats/token over 32 tokens  |  ppl = 6.07
+Expert cache hit rate: 95.0%  (hit=17017 miss=903)
+Speed: 3.74 tok/s (8.6s for 32 tokens) | PEAK RSS: 6.57 GB
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 5.0s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload)
+[OLMOE CUDA] on=1 tokens=31 expert_misses=34 fetch_syncs=496 gpu_s=1.192
+
+=== COLI_OLMOE_CUDA_PREFILL=0  mode=ppl ref=ref_p140.json wall=15.5s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+TF-NLL: 1.8031 nats/token over 32 tokens  |  ppl = 6.07
+Expert cache hit rate: 95.0%  (hit=17017 miss=903)
+Speed: 3.75 tok/s (8.5s for 32 tokens) | PEAK RSS: 6.57 GB
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 5.1s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload)
+[OLMOE CUDA] on=1 tokens=31 expert_misses=34 fetch_syncs=496 gpu_s=1.241
+
+=== COLI_OLMOE_CUDA_PREFILL=1  mode=ppl ref=ref_p140.json wall=9.8s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+TF-NLL: 1.8031 nats/token over 32 tokens  |  ppl = 6.07
+Expert cache hit rate: 0.0%  (hit=0 miss=0)
+Speed: 10.21 tok/s (3.1s for 32 tokens) | PEAK RSS: 1.29 GB
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 5.0s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload)
+[OLMOE CUDA] on=1 tokens=31 expert_misses=26 fetch_syncs=528 gpu_s=0.760 prefill_calls=1 prefill_rows=140 prefill_s=2.363 pf_verify_n=0 pf_verify_argmax_agree=0 pf_verify_max_dlogit=0.00000
+
+=== COLI_OLMOE_CUDA_PREFILL=1  mode=ppl ref=ref_p140.json wall=9.2s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+TF-NLL: 1.8031 nats/token over 32 tokens  |  ppl = 6.07
+Expert cache hit rate: 0.0%  (hit=0 miss=0)
+Speed: 10.27 tok/s (3.1s for 32 tokens) | PEAK RSS: 1.29 GB
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 4.8s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload)
+[OLMOE CUDA] on=1 tokens=31 expert_misses=26 fetch_syncs=528 gpu_s=0.747 prefill_calls=1 prefill_rows=140 prefill_s=2.356 pf_verify_n=0 pf_verify_argmax_agree=0 pf_verify_max_dlogit=0.00000
+
+=== COLI_OLMOE_CUDA_PREFILL=0  mode=ppl ref=ref_p140.json wall=13.8s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.5s | RSS after load: 1.22 GB
+TF-NLL: 1.8031 nats/token over 32 tokens  |  ppl = 6.07
+Expert cache hit rate: 95.0%  (hit=17017 miss=903)
+Speed: 3.78 tok/s (8.5s for 32 tokens) | PEAK RSS: 6.57 GB
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 3.8s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload)
+[OLMOE CUDA] on=1 tokens=31 expert_misses=34 fetch_syncs=496 gpu_s=1.136
+
+=== COLI_OLMOE_CUDA_PREFILL=0  mode=ppl ref=ref_p140.json wall=14.7s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+TF-NLL: 1.8031 nats/token over 32 tokens  |  ppl = 6.07
+Expert cache hit rate: 95.0%  (hit=17017 miss=903)
+Speed: 4.00 tok/s (8.0s for 32 tokens) | PEAK RSS: 6.57 GB
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 4.9s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload)
+[OLMOE CUDA] on=1 tokens=31 expert_misses=34 fetch_syncs=496 gpu_s=0.887
+
+=== COLI_OLMOE_CUDA_PREFILL=1  mode=ppl ref=ref_p140.json wall=9.8s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+TF-NLL: 1.8031 nats/token over 32 tokens  |  ppl = 6.07
+Expert cache hit rate: 0.0%  (hit=0 miss=0)
+Speed: 10.18 tok/s (3.1s for 32 tokens) | PEAK RSS: 1.29 GB
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 5.0s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload)
+[OLMOE CUDA] on=1 tokens=31 expert_misses=26 fetch_syncs=528 gpu_s=0.756 prefill_calls=1 prefill_rows=140 prefill_s=2.374 pf_verify_n=0 pf_verify_argmax_agree=0 pf_verify_max_dlogit=0.00000
+
+=== COLI_OLMOE_CUDA_PREFILL=1  mode=ppl ref=ref_p140.json wall=9.7s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+TF-NLL: 1.8031 nats/token over 32 tokens  |  ppl = 6.07
+Expert cache hit rate: 0.0%  (hit=0 miss=0)
+Speed: 10.24 tok/s (3.1s for 32 tokens) | PEAK RSS: 1.29 GB
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 4.9s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload)
+[OLMOE CUDA] on=1 tokens=31 expert_misses=26 fetch_syncs=528 gpu_s=0.761 prefill_calls=1 prefill_rows=140 prefill_s=2.351 pf_verify_n=0 pf_verify_argmax_agree=0 pf_verify_max_dlogit=0.00000
+
+=== COLI_OLMOE_CUDA_PREFILL=0  mode=ppl ref=ref_p140.json wall=15.2s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+TF-NLL: 1.8031 nats/token over 32 tokens  |  ppl = 6.07
+Expert cache hit rate: 95.0%  (hit=17017 miss=903)
+Speed: 3.78 tok/s (8.5s for 32 tokens) | PEAK RSS: 6.57 GB
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 5.0s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload)
+[OLMOE CUDA] on=1 tokens=31 expert_misses=34 fetch_syncs=496 gpu_s=1.195
+
+=== COLI_OLMOE_CUDA_PREFILL=0  mode=ppl ref=ref_p140.json wall=15.0s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+TF-NLL: 1.8031 nats/token over 32 tokens  |  ppl = 6.07
+Expert cache hit rate: 95.0%  (hit=17017 miss=903)
+Speed: 3.84 tok/s (8.3s for 32 tokens) | PEAK RSS: 6.57 GB
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 4.9s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload)
+[OLMOE CUDA] on=1 tokens=31 expert_misses=34 fetch_syncs=496 gpu_s=1.185
+
+=== COLI_OLMOE_CUDA_PREFILL=1  mode=ppl ref=ref_p140.json wall=9.7s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+TF-NLL: 1.8031 nats/token over 32 tokens  |  ppl = 6.07
+Expert cache hit rate: 0.0%  (hit=0 miss=0)
+Speed: 10.23 tok/s (3.1s for 32 tokens) | PEAK RSS: 1.29 GB
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 4.9s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload)
+[OLMOE CUDA] on=1 tokens=31 expert_misses=26 fetch_syncs=528 gpu_s=0.729 prefill_calls=1 prefill_rows=140 prefill_s=2.387 pf_verify_n=0 pf_verify_argmax_agree=0 pf_verify_max_dlogit=0.00000
+
+=== COLI_OLMOE_CUDA_PREFILL=0  mode=gen ref=ref_p140_gen.json wall=15.1s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+
+Reference: 342 760 253 2127 15 187 29 93 515 5567 49651 187 1545 310 64 9154 9 79 2262 187 50274 2309 295 2462 374 2295 470 50279 15 50279 15 187 
+C engine : 342 760 253 2127 15 187 187 4943 310 253 2127 323 253 1159 27 187 187 1545 310 64 9154 9 79 2262 187 50274 2309 295 2462 374 2295 470 
+Matching tokens: 6/32
+
+PEAK RSS: 6.57 GB
+Expert cache hit rate: 95.0%  (hit=17017 miss=903)
+Speed: 3.76 tok/s (8.5s for 32 tokens)
+TUNE decode: 32 tokens in 8.499s
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 4.9s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload)
+
+=== COLI_OLMOE_CUDA_PREFILL=1  mode=gen ref=ref_p140_gen.json wall=9.7s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+
+Reference: 342 760 253 2127 15 187 29 93 515 5567 49651 187 1545 310 64 9154 9 79 2262 187 50274 2309 295 2462 374 2295 470 50279 15 50279 15 187 
+C engine : 342 760 253 2127 15 187 187 4943 310 253 2127 323 253 1159 27 187 187 1545 310 64 9154 9 79 2262 187 50274 2309 295 2462 374 2295 470 
+Matching tokens: 6/32
+
+PEAK RSS: 1.29 GB
+Expert cache hit rate: 0.0%  (hit=0 miss=0)
+Speed: 10.24 tok/s (3.1s for 32 tokens)
+TUNE decode: 32 tokens in 3.124s
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 5.0s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload)
+
+=== COLI_OLMOE_CUDA_PREFILL=1 {'COLI_OLMOE_CUDA_VERIFY': '1'} mode=ppl ref=ref_p140.json wall=20.5s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+TF-NLL: 1.8031 nats/token over 32 tokens  |  ppl = 6.07
+Expert cache hit rate: 95.9%  (hit=20981 miss=907)
+Speed: 2.30 tok/s (13.9s for 32 tokens) | PEAK RSS: 6.63 GB
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 4.9s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload), VERIFY vs CPU
+[OLMOE CUDA] on=1 tokens=31 expert_misses=26 fetch_syncs=528 gpu_s=1.029 prefill_calls=1 prefill_rows=140 prefill_s=2.379 pf_verify_n=1 pf_verify_argmax_agree=1 pf_verify_max_dlogit=0.00001 verify_n=31 verify_argmax_agree=31 verify_max_dlogit=0.00002
+
+=== COLI_OLMOE_CUDA_PREFILL=1 {'COLI_OLMOE_CUDA_VERIFY': '1'} mode=ppl ref=ref_p300.json wall=24.6s
+== Streaming C engine v2.2 | cache=64/layer bits=8 pilot=0 wide=1 guard=1 hot=0 smooth=0.30 conf=0.92 fused3=0 ==
+resident weights loaded in 0.8s | RSS after load: 1.22 GB
+TF-NLL: 0.0820 nats/token over 30 tokens  |  ppl = 1.09
+Expert cache hit rate: 97.8%  (hit=41171 miss=941)
+Speed: 1.64 tok/s (18.3s for 30 tokens) | PEAK RSS: 6.86 GB
+
+[OMP] olmoe: 14 physical-core threads instead of 20 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[OLMOE CUDA] ready in 4.5s: 992/1024 experts resident in VRAM (6.26 GB), ctx 1024, partial residency (LRU + on-demand upload), VERIFY vs CPU
+[OLMOE CUDA] on=1 tokens=29 expert_misses=42 fetch_syncs=512 gpu_s=0.545 prefill_calls=1 prefill_rows=300 prefill_s=2.219 pf_verify_n=1 pf_verify_argmax_agree=1 pf_verify_max_dlogit=0.00002 verify_n=29 verify_argmax_agree=29 verify_max_dlogit=0.00001
+

@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "hypothesis": "Prefilling the prompt on the GPU in batched chunks (weights read once per 8 tokens, tokens grouped per expert) instead of on the CPU removes the dominant cost of a short chat turn, with logits equal up to float summation order.",
+  "commit": "9e3fdf7060f16b981f80a168a8eb5a073f5b8b21",
+  "model": "OLMoE-1B-7B-Instruct, Colibri int8-expert container (dense tensors FP16 on disk), 7.2 GB",
+  "command": "make -C c olmoe-cuda-dll CUDA_ARCH=sm_89 && make -C c olmoe OLMOE_CUDA_DLL=1; arms alternate B,T,T,B,... after one warm-up pair: SNAP=<model> COLI_TEMP=0 COLI_OLMOE_CUDA_PREFILL=<0|1> PPL=1 ./olmoe 64 8 ref_p140.json (tok_s = the Speed line: 140-token prefill + 32 decode steps, so it is the end-to-end rate of a short turn); quality: greedy generate of 64 tokens compared between arms; verify: COLI_OLMOE_CUDA_VERIFY=1 PPL=1 on a 140-token (one chunk) and a 300-token (two chunks) prompt",
+  "prompt_hash": "139444ce622c37f9c7b76b27af87328fa712f12fdff628ae734eaf9d0b0caea4",
+  "hardware": {
+    "cpu": "12th Gen Intel Core i7-12700H, 14 cores / 20 threads, AVX2/F16C/FMA",
+    "ram": "16 GB DDR4-3200",
+    "storage": "WD PC SN740 512 GB NVMe, NTFS; model read through the OS page cache",
+    "os": "Windows 11 Education 10.0.26200; gcc 16.1.0 (MinGW-W64 ucrt) engine and loader; nvcc 13.4 + MSVC 2022 BuildTools DLL; NVIDIA GeForce RTX 4060 Laptop GPU 8 GB, driver 617.14; laptop on mains power"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "COLI_OLMOE_CUDA_PREFILL"
+  ],
+  "baseline": {
+    "config": {
+      "COLI_OLMOE_CUDA_PREFILL": 0,
+      "fixed": "olmoe.exe built with OLMOE_CUDA_DLL=1 (coli_cuda_olmoe.dll sm_89), decode on the GPU in both arms, SNAP=OLMoE-1B-7B-Instruct int8 experts, COLI_TEMP=0, PPL=1 teacher-forced 140-token prompt + 32 scored tokens, cap 64, 992/1024 experts resident"
+    },
+    "samples": {
+      "tok_s": [
+        3.74,
+        3.75,
+        3.78,
+        4.0,
+        3.78,
+        3.84
+      ]
+    },
+    "median_tok_s": 3.78,
+    "quality": {
+      "method": "TF-NLL 1.8031 and greedy 64-token stream identical to the trial arm",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/olmoe-cuda-prefill-2026-10-13-raw.txt",
+      "sha256": "c3a0535bf70bced0eefa000083074a1a2985867a7a2cbefcfb36f48c32d988b9"
+    }
+  },
+  "trial": {
+    "config": {
+      "COLI_OLMOE_CUDA_PREFILL": 1,
+      "fixed": "olmoe.exe built with OLMOE_CUDA_DLL=1 (coli_cuda_olmoe.dll sm_89), decode on the GPU in both arms, SNAP=OLMoE-1B-7B-Instruct int8 experts, COLI_TEMP=0, PPL=1 teacher-forced 140-token prompt + 32 scored tokens, cap 64, 992/1024 experts resident"
+    },
+    "samples": {
+      "tok_s": [
+        10.23,
+        10.21,
+        10.27,
+        10.18,
+        10.24,
+        10.23
+      ]
+    },
+    "median_tok_s": 10.23,
+    "quality": {
+      "method": "TF-NLL 1.8031 and greedy 64-token stream identical to the baseline arm; verify mode: 140-token prompt argmax agree, max |dlogit| 1e-5; 300-token prompt (two chunks) argmax agree, max |dlogit| 2e-5",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/olmoe-cuda-prefill-2026-10-13-raw.txt",
+      "sha256": "c3a0535bf70bced0eefa000083074a1a2985867a7a2cbefcfb36f48c32d988b9"
+    }
+  },
+  "outcome": "improvement"
+}
