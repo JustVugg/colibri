@@ -141,6 +141,20 @@ typedef struct {
     int quant_bits;
     float *embed, *lm_head, *final_norm;
     uint16_t *lm_head_h;    /* half-resident lm_head (COLI_DENSE_F16); lm_head is NULL when set */
+#ifdef COLI_OLMOE_CUDA
+    /* GPU-resident decode (olmoe_cuda.h). The CPU's KV stays current after every GPU token. */
+    int gpu_on;                      /* 1 = batch-1 decode runs on the GPU */
+    int gpu_max_t;                   /* device KV capacity in positions; beyond it decode falls back to the CPU */
+    int gpu_kv_len;                  /* device KV holds positions [0, gpu_kv_len) */
+    int gpu_n_slots, gpu_all_resident;
+    int *gpu_slot_of;                /* [L*E] host mirror of the device (layer,expert)->slot table, -1 = absent */
+    int *gpu_slot_owner;             /* [n_slots] layer*E+expert, -1 = free */
+    uint64_t *gpu_slot_use, gpu_clock;
+    float *gpu_kv_stage;             /* [L][2][D] */
+    uint64_t gpu_tokens, gpu_miss, gpu_fetch_syncs;
+    double gpu_s;                    /* wall seconds spent in gpu_decode */
+    float gpu_max_dlogit; uint64_t gpu_verify_n, gpu_verify_agree;   /* COLI_OLMOE_CUDA_VERIFY statistics */
+#endif
 #ifdef COLI_VULKAN
     void *vk_lm_head;
     void *vkchain;          /* the dense chain's device state (olmoe_chain.h), NULL until it runs */
@@ -347,6 +361,9 @@ static float g_nuc  = 0.95f;  /* NUCLEUS env overrides */
 #include "sample.h"
 
 #include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
+#ifdef COLI_OLMOE_CUDA
+#include "olmoe_cuda.h"   /* GPU-resident decode (opt-in build: OLMOE_CUDA=1 / OLMOE_CUDA_DLL=1) */
+#endif
 #include "matmul_f16.h"   /* the same product with W kept as IEEE half: bit-identical, half the bytes (needs F16C) */
 
 /* matmul for a RESIDENT f32 matrix W [O,I], with *vk caching its device copy:
@@ -1793,9 +1810,181 @@ static void olm_dho_finish(Model *m) {
 }
 #endif
 
+/* ============================ GPU-resident decode (olmoe_cuda.h) ============================
+ * Opt-in: compiled only with -DCOLI_OLMOE_CUDA (OLMOE_CUDA=1 on Linux, OLMOE_CUDA_DLL=1 on Windows), and even then only
+ * used when the library loads, a device initialises and the dense weights are half-resident. Batch-1 decode runs on the
+ * GPU; the prompt is prefilled on the CPU and its KV rows are uploaded on first use. The CPU's KV mirror is kept current
+ * after every GPU token, so any failure (CUDA error, non-finite logits) trips the breaker: that token is redone on the CPU
+ * and the session carries on there, with the same text the CPU alone would have produced. */
+#ifdef COLI_OLMOE_CUDA
+static int g_gpu_verify = 0;                     /* COLI_OLMOE_CUDA_VERIFY=1: the CPU is the reference, the GPU shadows it */
+
+/* read one expert's merged int8 blob + scales into the library's pinned staging buffer and copy it to `slot` */
+static int gpu_load_expert(Model *m, int layer, int eid, int slot) {
+    Cfg *c = &m->c;
+    int64_t ng = (int64_t)c->inter * c->hidden, want_w = 3 * ng;
+    char nm[256], qsnm[256];
+    snprintf(nm, sizeof nm, "model.layers.%d.mlp.experts.%d.merged_weight", layer, eid);
+    snprintf(qsnm, sizeof qsnm, "model.layers.%d.mlp.experts.%d.qs", layer, eid);
+    st_tensor *tw = st_find(&m->S, nm), *ts = st_find(&m->S, qsnm);
+    if (!tw || tw->nbytes != want_w || !ts || ts->numel != (int64_t)(2 * c->inter + c->hidden)) return 0;
+    int8_t *stage = (int8_t *)olmoe_cuda_stage_ptr();
+    st_read_raw(&m->S, nm, stage, g_expert_drop);
+    st_read_f32(&m->S, qsnm, (float *)(stage + want_w), g_expert_drop);
+    return olmoe_cuda_upload_expert(layer, eid, slot, stage, (const float *)(stage + want_w)) > 0;
+}
+
+static void gpu_try_init(Model *m) {
+    const char *en = getenv("COLI_OLMOE_CUDA");
+    if (en && atoi(en) == 0) return;
+    Cfg *c = &m->c;
+    /* batch-1 kernels need FP16-resident dense weights, head_dim 128 and a single conversation (KV_SLOTS>1 swaps the KV) */
+    if (!m->L || !m->lm_head_h || !m->L[0].q_h || c->head_dim != 128 || c->n_experts > 1024) return;
+    if (getenv("KV_SLOTS") && atoi(getenv("KV_SLOTS")) > 1) return;
+    if (!olmoe_cuda_available()) { if (en) fprintf(stderr, "[OLMOE CUDA] library not found; staying on the CPU\n"); return; }
+    int max_t = getenv("COLI_OLMOE_CUDA_CTX") ? atoi(getenv("COLI_OLMOE_CUDA_CTX")) : 1024;
+    if (max_t < 64) max_t = 64;
+    if (max_t > 4096) max_t = 4096;
+    double t0 = now_s();
+    if (olmoe_cuda_init(0, c->n_layers, c->hidden, c->n_heads, c->head_dim, c->inter, c->n_experts, c->topk,
+                        c->vocab, max_t, c->eps, c->theta, c->norm_topk) <= 0) {
+        fprintf(stderr, "[OLMOE CUDA] no usable device; staying on the CPU\n"); return; }
+    for (int l = 0; l < c->n_layers; l++) {
+        Layer *L = &m->L[l];
+        if (olmoe_cuda_set_layer(l, L->q_h, L->k_h, L->v_h, L->o_h, L->in_ln, L->post_ln, L->qn, L->kn, L->gate) <= 0) {
+            fprintf(stderr, "[OLMOE CUDA] weight upload failed (layer %d); staying on the CPU\n", l); olmoe_cuda_shutdown(); return; }
+    }
+    if (olmoe_cuda_set_head(m->lm_head_h, m->final_norm) <= 0) { olmoe_cuda_shutdown(); return; }
+    size_t fb = 0, tb = 0; olmoe_cuda_mem_info(&fb, &tb);
+    size_t reserve = (size_t)(getenv("COLI_OLMOE_CUDA_RESERVE_MB") ? atoi(getenv("COLI_OLMOE_CUDA_RESERVE_MB")) : 160) << 20;
+    size_t per = (size_t)3 * c->inter * c->hidden + ((size_t)2 * c->inter + c->hidden) * 4;
+    int want = c->n_layers * c->n_experts;
+    long fit = fb > reserve ? (long)((fb - reserve) / per) : 0;
+    int cap_env = getenv("COLI_OLMOE_CUDA_SLOTS") ? atoi(getenv("COLI_OLMOE_CUDA_SLOTS")) : want;
+    int n = (int)(fit < want ? fit : want);
+    if (n > cap_env) n = cap_env;
+    if (n < 1) n = 1;
+    n = olmoe_cuda_alloc_slots(n);
+    if (n < c->topk) { fprintf(stderr, "[OLMOE CUDA] no VRAM for expert slots; staying on the CPU\n"); olmoe_cuda_shutdown(); return; }
+    m->gpu_n_slots = n;
+    m->gpu_slot_of = malloc((size_t)want * sizeof(int));
+    m->gpu_slot_owner = malloc((size_t)n * sizeof(int));
+    m->gpu_slot_use = calloc((size_t)n, sizeof(uint64_t));
+    m->gpu_kv_stage = malloc((size_t)c->n_layers * 2 * c->hidden * sizeof(float));
+    if (!m->gpu_slot_of || !m->gpu_slot_owner || !m->gpu_slot_use || !m->gpu_kv_stage) { olmoe_cuda_shutdown(); return; }
+    for (int i = 0; i < want; i++) m->gpu_slot_of[i] = -1;
+    for (int i = 0; i < n; i++) m->gpu_slot_owner[i] = -1;
+    int loaded = 0;   /* layer-major preload; the LRU refines it at run time when it does not all fit */
+    for (int l = 0; l < c->n_layers && loaded < n; l++)
+        for (int e = 0; e < c->n_experts && loaded < n; e++) {
+            if (!gpu_load_expert(m, l, e, loaded)) { fprintf(stderr, "[OLMOE CUDA] expert load failed; staying on the CPU\n"); olmoe_cuda_shutdown(); return; }
+            m->gpu_slot_of[l * c->n_experts + e] = loaded; m->gpu_slot_owner[loaded] = l * c->n_experts + e; loaded++;
+        }
+    m->gpu_all_resident = (loaded == want);
+    m->gpu_max_t = max_t; m->gpu_kv_len = 0;
+    m->gpu_on = 1;
+    g_gpu_verify = getenv("COLI_OLMOE_CUDA_VERIFY") ? atoi(getenv("COLI_OLMOE_CUDA_VERIFY")) : 0;
+    fprintf(stderr, "[OLMOE CUDA] ready in %.1fs: %d/%d experts resident in VRAM (%.2f GB), ctx %d, %s%s\n",
+            now_s() - t0, loaded, want, (double)loaded * per / 1e9, max_t,
+            m->gpu_all_resident ? "all resident (no host sync per layer)" : "partial residency (LRU + on-demand upload)",
+            g_gpu_verify ? ", VERIFY vs CPU" : "");
+}
+
+/* pick a slot: a free one, else the least recently used that is not in `keep` */
+static int gpu_pick_slot(Model *m, const int *keep, int nkeep) {
+    int best = -1; uint64_t bu = ~0ULL;
+    for (int i = 0; i < m->gpu_n_slots; i++) {
+        if (m->gpu_slot_owner[i] < 0) return i;
+        int kept = 0;
+        for (int j = 0; j < nkeep; j++) if (keep[j] == i) { kept = 1; break; }
+        if (kept) continue;
+        if (m->gpu_slot_use[i] < bu) { bu = m->gpu_slot_use[i]; best = i; }
+    }
+    return best;
+}
+
+/* one decode token on the GPU. Returns 1 on success, 0 on failure (the caller falls back to the CPU). */
+static int gpu_decode(Model *m, int tok, int pos, float *logit_out, int mirror_kv) {
+    Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, L = c->n_layers, H = c->n_heads, hd = c->head_dim;
+    double t0 = now_s();
+    if (pos >= m->gpu_max_t || !m->K || K > 16) return 0;
+    if (m->gpu_kv_len < pos) {                       /* rows the CPU produced (prefill / fallback) */
+        for (int l = 0; l < L; l++)
+            if (olmoe_cuda_kv_upload(l, m->K[l], m->V[l], m->max_t, m->gpu_kv_len, pos) <= 0) return 0;
+        m->gpu_kv_len = pos;
+    }
+    if (olmoe_cuda_begin_token(m->embed + (int64_t)tok * D, pos) <= 0) return 0;
+    for (int l = 0; l < L; l++) {
+        if (olmoe_cuda_layer_attn(l) <= 0 || olmoe_cuda_layer_route(l) <= 0) return 0;
+        if (m->gpu_all_resident) {
+            if (olmoe_cuda_layer_experts(NULL) <= 0) return 0;
+            continue;
+        }
+        int ids[16], miss = 0, slots[16], kept[16], nk = 0; float w[16];
+        if (olmoe_cuda_route_fetch(ids, w, &miss) <= 0) return 0;
+        m->gpu_fetch_syncs++;
+        for (int k = 0; k < K; k++) {
+            int idx = l * E + ids[k], sl = m->gpu_slot_of[idx];
+            if (sl < 0) {
+                sl = gpu_pick_slot(m, kept, nk);
+                if (sl < 0) return 0;
+                int old = m->gpu_slot_owner[sl];
+                if (old >= 0) { olmoe_cuda_unmap_expert(old / E, old % E); m->gpu_slot_of[old] = -1; }
+                if (!gpu_load_expert(m, l, ids[k], sl)) return 0;
+                m->gpu_slot_of[idx] = sl; m->gpu_slot_owner[sl] = idx; m->gpu_miss++;
+            }
+            m->gpu_slot_use[sl] = ++m->gpu_clock; slots[k] = sl; kept[nk++] = sl;
+        }
+        if (olmoe_cuda_layer_experts(slots) <= 0) return 0;
+    }
+    if (olmoe_cuda_finish(logit_out, m->gpu_kv_stage) <= 0) return 0;
+    for (int i = 0; i < c->vocab; i++) if (!isfinite(logit_out[i])) return 0;   /* correctness breaker: never emit garbage */
+    if (mirror_kv) {
+        for (int l = 0; l < L; l++)
+            for (int h = 0; h < H; h++) {
+                memcpy(m->K[l] + ((int64_t)h * m->max_t + pos) * hd, m->gpu_kv_stage + (int64_t)l * 2 * D + h * hd, hd * sizeof(float));
+                memcpy(m->V[l] + ((int64_t)h * m->max_t + pos) * hd, m->gpu_kv_stage + (int64_t)l * 2 * D + D + h * hd, hd * sizeof(float));
+            }
+    }
+    m->gpu_kv_len = pos + 1;
+    m->gpu_tokens++; m->gpu_s += now_s() - t0;
+    return 1;
+}
+
+static void gpu_report(const Model *m) {
+    if (!m->gpu_n_slots) return;
+    fprintf(stderr, "[OLMOE CUDA] on=%d tokens=%llu expert_misses=%llu fetch_syncs=%llu gpu_s=%.3f",
+            m->gpu_on, (unsigned long long)m->gpu_tokens, (unsigned long long)m->gpu_miss,
+            (unsigned long long)m->gpu_fetch_syncs, m->gpu_s);
+    if (m->gpu_verify_n)
+        fprintf(stderr, " verify_n=%llu verify_argmax_agree=%llu verify_max_dlogit=%.5f",
+                (unsigned long long)m->gpu_verify_n, (unsigned long long)m->gpu_verify_agree, m->gpu_max_dlogit);
+    fprintf(stderr, "\n");
+}
+#else
+#define gpu_try_init(m) ((void)(m))
+#define gpu_report(m) ((void)(m))
+#endif
+
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     kv_room_fit(m, pos_base + S);   /* before the positions' pages are written */
+#ifdef COLI_OLMOE_CUDA
+    if (m->gpu_on && S == 1 && !g_gpu_verify) {
+        float *lg = falloc(c->vocab);
+        if (gpu_decode(m, ids[0], pos_base, lg, 1)) {
+            m->token_count += 1; m->freq_token_count += 1;
+            m->kv_len = pos_base + 1;
+            kv_prefix_record(&m->kvp, ids, pos_base, 1);
+            g_prof_forwards += 1;
+            return lg;
+        }
+        free(lg);
+        m->gpu_on = 0;   /* circuit breaker: this token is redone below and the session continues on the CPU */
+        fprintf(stderr, "[OLMOE CUDA] decode failed at position %d: continuing on the CPU for the rest of the session\n", pos_base);
+    }
+    if (m->gpu_on && pos_base < m->gpu_kv_len) m->gpu_kv_len = pos_base;   /* the CPU rewrites these rows */
+#endif
     if (g_pilot && m->token_count > 0) {
         /* Flush stale prefetch requests: clear is_queued so pilot_realload
          * will skip any entries still sitting in pilot_q for the previous
@@ -1870,6 +2059,23 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     g_prof_head_s += now_s() - t_head;
     g_prof_forwards += 1;   /* forward passes, not positions: a prefill of S rows is one */
     free(x); free(last);
+#ifdef COLI_OLMOE_CUDA
+    if (m->gpu_on && g_gpu_verify && S == 1) {
+        /* the CPU is the reference (its logits are returned); the GPU runs the same token on its own KV */
+        float *lg = falloc(c->vocab);
+        if (gpu_decode(m, ids[0], pos_base, lg, 0)) {
+            float mx = 0.f; int ac = 0, ag = 0;
+            for (int i = 0; i < c->vocab; i++) {
+                float d = fabsf(lg[i] - logit[i]); if (d > mx) mx = d;
+                if (lg[i] > lg[ag]) ag = i;
+                if (logit[i] > logit[ac]) ac = i;
+            }
+            if (mx > m->gpu_max_dlogit) m->gpu_max_dlogit = mx;
+            m->gpu_verify_n++; if (ag == ac) m->gpu_verify_agree++;
+        } else { m->gpu_on = 0; fprintf(stderr, "[OLMOE CUDA] verify decode failed; GPU disabled\n"); }
+        free(lg);
+    }
+#endif
     return logit;
 }
 
@@ -2541,6 +2747,7 @@ static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     olmoe_vk_report(); vkt_report("turn", m->hits, m->miss); olc_report(m);
 #endif
     serve_hits(m);
+    gpu_report(m);
     free(ids);
     return 0;
 }
@@ -2881,7 +3088,7 @@ int main(int argc, char **argv) {
      * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
      * with the run's tokens already correct (#1262). Static storage outlives
      * every thread, so the pointer the worker holds stays valid. */
-        static Model m; model_init(&m, snap, cap, bits);
+        static Model m; model_init(&m, snap, cap, bits); gpu_try_init(&m);
         m.max_t = ctx_cap;
         m.K = calloc(m.c.n_layers, sizeof(float*)); m.V = calloc(m.c.n_layers, sizeof(float*));
         for (int i = 0; i < m.c.n_layers; i++) {
@@ -2942,7 +3149,7 @@ int main(int argc, char **argv) {
      * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
      * with the run's tokens already correct (#1262). Static storage outlives
      * every thread, so the pointer the worker holds stays valid. */
-        static Model m; model_init(&m, snap, cap, bits);
+        static Model m; model_init(&m, snap, cap, bits); gpu_try_init(&m);
         printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
         Tok T;
         char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
@@ -2974,7 +3181,7 @@ int main(int argc, char **argv) {
      * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
      * with the run's tokens already correct (#1262). Static storage outlives
      * every thread, so the pointer the worker holds stays valid. */
-    static Model m; model_init(&m, snap, cap, bits);
+    static Model m; model_init(&m, snap, cap, bits); gpu_try_init(&m);
     printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
     if (!ref_fits(prompt, np, full, nfull, m.c.vocab)) { free(buf); free(arena); return 1; }
 
@@ -2987,6 +3194,7 @@ int main(int argc, char **argv) {
         printf("Expert cache hit rate: %.1f%%  (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
+        gpu_report(&m);
 #ifdef COLI_VULKAN
         fflush(stdout); olmoe_vk_report(); vkt_report("run", m.hits, m.miss); olc_report(&m);
 #endif

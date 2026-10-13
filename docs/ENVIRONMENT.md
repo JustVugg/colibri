@@ -633,6 +633,12 @@ Read **only** by `c/olmoe.c`. This is the sister engine used for streaming-cache
 | `CONF_LIMIT` | `0.92` | Confidence ceiling for the router prediction. Clamped to [0.1, 1.0]. |
 | `EXPERT_DROP` | `0` (off) | Drop experts below the confidence threshold instead of loading them (quality/speed experiment). |
 | `COLI_DENSE_F16` | `1` (on) | Keep attention `q/k/v/o` and `lm_head` half-resident when the checkpoint stores them as FP16 (standalone engine, F16C builds, not `VK=1`). Each element is widened to f32 and run through the same lanes as the f32 `matmul`, so the output is bit-identical; the dense part costs half the RAM and half the bytes a cached decode step streams (RSS after load 1.79 -> 1.09 GB, cached decode 5.28 -> 6.67 tok/s on an i7-12700H, see `docs/experiments/olmoe-dense-f16-2026-10-12.json`). `=0` restores the f32 copies (A/B). |
+| `COLI_OLMOE_CUDA` | on when built in | Only in an `OLMOE_CUDA=1` / `OLMOE_CUDA_DLL=1` build ([GPU_BACKENDS.md](../GPU_BACKENDS.md#olmoe-gpu-resident-decode-its-own-library)). `=0` keeps decode on the CPU. Needs half-resident dense weights (`COLI_DENSE_F16`), `head_dim` 128, one conversation (`KV_SLOTS` 1). |
+| `COLI_OLMOE_CUDA_VERIFY` | `0` | `=1`: the CPU is the reference, the GPU shadows it on its own KV; the per-request `[OLMOE CUDA]` line reports `verify_argmax_agree` and `verify_max_dlogit`. About the CPU's speed. |
+| `COLI_OLMOE_CUDA_CTX` | `1024` | Device KV capacity in positions (64..4096). A longer context falls back to the CPU. |
+| `COLI_OLMOE_CUDA_RESERVE_MB` | `160` | VRAM left free when sizing the expert slots. |
+| `COLI_OLMOE_CUDA_SLOTS` | all experts that fit | Cap on VRAM expert slots (forces partial residency for testing). |
+| `COLI_OLMOE_CUDA_DLL` | next to `olmoe.exe` | Windows: full path of `coli_cuda_olmoe.dll`. |
 | `COLI_VULKAN` | `0` | `VK=1` build: attention, router and lm_head on the Vulkan device, and the routed experts (int8 rows) on the shared expert tier (`COLI_VK_TIER*`, `COLI_VK_DENSE`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)). The warm start reads the history `COLI_USAGE` names; without it the tier fills as experts pass by. |
 
 ## Laya engine (`laya`)

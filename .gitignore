@@ -60,6 +60,12 @@ c/coli_cuda_dsv4.dll
 c/coli_cuda_dsv4.lib
 c/coli_cuda_dsv4.exp
 c/backend_cuda_dsv4*.o
+# OLMoE CUDA library build artifacts (coli_cuda_olmoe.dll is the MSVC/nvcc build; the .o files are the Linux link / Windows loader)
+c/coli_cuda_olmoe.dll
+c/coli_cuda_olmoe.lib
+c/coli_cuda_olmoe.exp
+c/olmoe_cuda.o
+c/olmoe_cuda_loader.o
 c/COLI_V4_UNIT_*.o
 c/dsv4_*_test*
 c/dsv4_loader_test*

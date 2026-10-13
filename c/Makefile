@@ -862,7 +862,7 @@ glm: colibri$(EXE)
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)|OLMOE_CUDA=$(OLMOE_CUDA)|OLMOE_CUDA_DLL=$(OLMOE_CUDA_DLL)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
@@ -1277,8 +1277,49 @@ ifneq ($(EXE),)
 .PHONY: olmoe
 olmoe: olmoe$(EXE)
 endif
-olmoe$(EXE): olmoe.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(NOCUDA_CFLAGS) olmoe.c $(VK_OBJ) -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
+# GPU-resident OLMoE decode (olmoe_cuda.h), opt-in and absent from the default build, split like DeepSeek V4:
+#   OLMOE_CUDA=1      Linux: olmoe_cuda.o (nvcc) is linked into olmoe directly, with cudart.
+#   OLMOE_CUDA_DLL=1  Windows: olmoe links only olmoe_cuda_loader.o; `make olmoe-cuda-dll` (nvcc + MSVC) builds
+#                     coli_cuda_olmoe.dll, which the engine finds next to olmoe.exe (COLI_OLMOE_CUDA_DLL overrides).
+# Either way the engine runs on the CPU when the library or a device is missing; COLI_OLMOE_CUDA=0 turns it off.
+OLMOE_GPU_CFLAGS  :=
+OLMOE_GPU_LDFLAGS :=
+OLMOE_GPU_OBJ     :=
+ifeq ($(OLMOE_CUDA),1)
+ifneq ($(IS_WIN),)
+$(error OLMOE_CUDA=1 links cudart directly and is Linux-only; on Windows use OLMOE_CUDA_DLL=1 and `make olmoe-cuda-dll`)
+endif
+OLMOE_GPU_CFLAGS  := -DCOLI_OLMOE_CUDA
+OLMOE_GPU_OBJ     := olmoe_cuda.o
+OLMOE_GPU_LDFLAGS := -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
+endif
+ifeq ($(OLMOE_CUDA_DLL),1)
+ifeq ($(IS_WIN),)
+$(error OLMOE_CUDA_DLL=1 is the Windows loader build; on Linux use OLMOE_CUDA=1)
+endif
+OLMOE_GPU_CFLAGS  := -DCOLI_OLMOE_CUDA
+OLMOE_GPU_OBJ     := olmoe_cuda_loader.o
+endif
+
+olmoe$(EXE): olmoe.c olmoe_cuda.h $(VK_OBJ) $(VK_SPV) $(OLMOE_GPU_OBJ) .build-config
+	$(CC) $(NOCUDA_CFLAGS) $(OLMOE_GPU_CFLAGS) olmoe.c $(VK_OBJ) $(OLMOE_GPU_OBJ) -o olmoe$(EXE) $(NOCUDA_LDFLAGS) $(OLMOE_GPU_LDFLAGS)
+
+olmoe_cuda.o: olmoe_cuda.cu olmoe_cuda.h .build-config
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) -c olmoe_cuda.cu -o $@
+
+olmoe_cuda_loader.o: olmoe_cuda_loader.c olmoe_cuda.h .build-config
+	$(CC) $(CFLAGS) -c olmoe_cuda_loader.c -o $@
+
+# Windows: the OLMoE kernels as a DLL (nvcc + MSVC cl.exe as host; run from a vcvars64 shell like cuda-dll).
+olmoe-cuda-dll: olmoe_cuda.cu olmoe_cuda.h olmoe_cuda.def
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) -shared -Xlinker /DEF:olmoe_cuda.def \
+		-L"$(CUDA_HOME)/lib/x64" -lcudart \
+		olmoe_cuda.cu -o coli_cuda_olmoe.dll
+.PHONY: olmoe-cuda-dll
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
 # MoE). With CUDA=1 the optional VRAM expert tier (qwen36_tier.c) is compiled
@@ -2106,6 +2147,11 @@ tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c olmoe.c $(VK_OBJ)
 
 tests/test_olmoe_moe_by_expert$(EXE): tests/test_olmoe_moe_by_expert.c olmoe.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# The Windows loader for the OLMoE CUDA library fails closed when the DLL is absent (no GPU needed). Off Windows
+# the loader source is empty and the test reports a skip.
+tests/test_olmoe_cuda_loader$(EXE): tests/test_olmoe_cuda_loader.c olmoe_cuda_loader.c olmoe_cuda.h
+	$(CC) $(NOCUDA_CFLAGS) tests/test_olmoe_cuda_loader.c olmoe_cuda_loader.c -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)

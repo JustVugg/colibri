@@ -1,0 +1,18 @@
+EXPORTS
+    olmoe_cuda_available
+    olmoe_cuda_init
+    olmoe_cuda_set_layer
+    olmoe_cuda_set_head
+    olmoe_cuda_mem_info
+    olmoe_cuda_alloc_slots
+    olmoe_cuda_stage_ptr
+    olmoe_cuda_upload_expert
+    olmoe_cuda_unmap_expert
+    olmoe_cuda_kv_upload
+    olmoe_cuda_begin_token
+    olmoe_cuda_layer_attn
+    olmoe_cuda_layer_route
+    olmoe_cuda_route_fetch
+    olmoe_cuda_layer_experts
+    olmoe_cuda_finish
+    olmoe_cuda_shutdown

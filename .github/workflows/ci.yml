@@ -748,6 +748,13 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c backend_cuda_ink.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "inkling CUDA syntax check passed"
+      - name: Compile olmoe_cuda.cu (syntax only, no GPU)
+        run: |
+          cd c
+          # the OLMoE GPU-resident decode library (olmoe_cuda.h); same no-pipeline rule as above
+          nvcc -O2 -std=c++17 -arch=sm_80 -c olmoe_cuda.cu -o /dev/null \
+            -Xcompiler=-Wall,-Wextra
+          echo "OLMoE CUDA syntax check passed"
 
   qwen36-tiny-check:
     name: Qwen3.6 tiny oracle (token-exact + ASan/UBSan)
@@ -1792,6 +1799,17 @@ jobs:
           make kimi_k3.exe CUDA_DLL=1
           test -f kimi_k3.exe || { echo "kimi_k3 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "kimi_k3.exe built against the DLL loader"
+      - name: make olmoe-cuda-dll + make olmoe OLMOE_CUDA_DLL=1 (the OLMoE library and its loader)
+        shell: msys2 {0}
+        run: |
+          cd c
+          # Build-only, like the steps above: the runner has no GPU. The DLL carries the portable gencode and the
+          # host links olmoe_cuda_loader.o, never cudart. (Its own DLL, like coli_cuda_dsv4.dll.)
+          make olmoe-cuda-dll CUDA_ARCH=portable
+          test -f coli_cuda_olmoe.dll || { echo "olmoe-cuda-dll reported success but produced no DLL" >&2; exit 1; }
+          make olmoe OLMOE_CUDA_DLL=1
+          test -f olmoe.exe || { echo "olmoe OLMOE_CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "coli_cuda_olmoe.dll built; olmoe.exe built against the DLL loader"
       - name: Collect the runtime the DLL links (cudart64_12.dll)
         shell: bash
         run: |
@@ -1812,6 +1830,8 @@ jobs:
             c/colibri.exe
             c/qwen36.exe
             c/kimi_k3.exe
+            c/coli_cuda_olmoe.dll
+            c/olmoe.exe
 
   web:
     name: Web UI

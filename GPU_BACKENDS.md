@@ -186,6 +186,34 @@ on real hardware is for (matrix below).
   capacity extension with deeper engine integration; this branch's safety
   and validation work now targets that mechanism.
 
+## OLMoE GPU-resident decode (its own library)
+
+`olmoe` can run batch-1 decode on a CUDA GPU. It is a separate, opt-in library, split the way DeepSeek V4's is
+(`backend_cuda_dsv4.cu`): the ABI is `c/olmoe_cuda.h`, the kernels `c/olmoe_cuda.cu`, and it is **not** part of the
+`coli_cuda_*` surface. The default build contains none of it.
+
+| platform | build |
+|---|---|
+| Linux x86-64 | `make -C c olmoe OLMOE_CUDA=1 [CUDA_ARCH=native\|sm_XX]`: `olmoe_cuda.o` (nvcc) is linked into `olmoe` with cudart |
+| Windows | from a `vcvars64` shell: `make -C c olmoe-cuda-dll CUDA_ARCH=...` builds `coli_cuda_olmoe.dll` (symbols via `olmoe_cuda.def`); `make -C c olmoe OLMOE_CUDA_DLL=1` links only `olmoe_cuda_loader.o`, which finds the DLL next to `olmoe.exe` (`COLI_OLMOE_CUDA_DLL=<path>` overrides) |
+
+What it does: the FP16-resident dense weights (`COLI_DENSE_F16`) and the lm_head sit in VRAM; each routed expert is a
+"slot" (int8 blob + row scales) with a device table `(layer, expert) -> slot`; the router kernel resolves slots on the
+device, so with every expert resident a token needs no host synchronisation. When the experts do not all fit, the host
+fetches the routed ids after the router, uploads the misses (LRU) and passes explicit slots. The prompt is prefilled on the
+CPU and its KV rows are uploaded on first use; the CPU's KV mirror is kept current after every GPU token.
+
+Safety, in order of what you will notice: no library or no device means the engine simply runs on the CPU; a CUDA error or
+non-finite logits trip a breaker that redoes that token on the CPU and stays there (same text the CPU alone gives);
+`COLI_OLMOE_CUDA=0` turns it off. The GPU's float summation order is not the CPU's, so it is not bit-identical:
+`COLI_OLMOE_CUDA_VERIFY=1` runs the CPU as the reference and reports per-token argmax agreement and the largest logit
+difference. Shapes it does not implement (`head_dim != 128`, `topk > 16`, more than 1024 experts, `hidden % 256`,
+`inter % 16`), builds with `COLI_VULKAN`, and `KV_SLOTS > 1` stay on the CPU. Environment: `docs/ENVIRONMENT.md`.
+
+CI is build-only (no GPU on the runners): the Linux CUDA syntax job compiles `olmoe_cuda.cu`, the Windows job builds the DLL
+and the loader-linked `olmoe.exe`, and `tests/test_olmoe_cuda_loader.c` proves the loader fails closed without the DLL. The
+numbers come from verify mode on a card: `docs/experiments/olmoe-cuda-decode-2026-10-13.json`.
+
 ## Optional XDNA2 (Ryzen AI NPU) lane
 
 XDNA2 is an *optional compute lane*, not an engine and not a GPU. Colibri keeps
