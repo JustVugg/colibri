@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "hypothesis": "Running OLMoE batch-1 decode on the GPU (dense weights resident in VRAM, 992 of the 1024 int8 experts resident with the default reserve and the rest uploaded on demand, router resolved on the device) is bandwidth-bound on VRAM instead of DRAM, so tokens/s rises several-fold with the same logits up to float summation order.",
+  "commit": "4db2a603856740d6d1f643fd48868abe9941a658",
+  "model": "OLMoE-1B-7B-Instruct, Colibri int8-expert container (dense tensors FP16 on disk), 7.2 GB",
+  "command": "make -C c olmoe-cuda-dll CUDA_ARCH=sm_89 && make -C c olmoe OLMOE_CUDA_DLL=1; arms alternate B,T,T,B,... after one warm-up pair: SNAP=<model> COLI_TEMP=0 COLI_OLMOE_CUDA=<0|1> PPL=1 ./olmoe 64 8 ref600.json (tok_s = the Speed line, prefill included); quality: same binary, PPL unset, greedy generate of 128 tokens, token streams compared; verify: COLI_OLMOE_CUDA_VERIFY=1 PPL=1 (575 decode steps) reported 575/575 argmax agreement, max |dlogit| 6e-5",
+  "prompt_hash": "5749d10d0a7eec32fae93fd4e773788404a033e093e82b265a71e7d46fcd5174",
+  "hardware": {
+    "cpu": "12th Gen Intel Core i7-12700H, 14 cores / 20 threads, AVX2/F16C/FMA",
+    "ram": "16 GB DDR4-3200",
+    "storage": "WD PC SN740 512 GB NVMe, NTFS; model read through the OS page cache",
+    "os": "Windows 11 Education 10.0.26200; gcc 16.1.0 (MinGW-W64 ucrt) for the engine and loader; nvcc 13.4 + MSVC 2022 BuildTools for the DLL; NVIDIA GeForce RTX 4060 Laptop GPU 8 GB, driver 617.14; laptop on mains power"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "COLI_OLMOE_CUDA"
+  ],
+  "baseline": {
+    "config": {
+      "COLI_OLMOE_CUDA": 0,
+      "fixed": "same olmoe.exe built with OLMOE_CUDA_DLL=1 (coli_cuda_olmoe.dll sm_89), SNAP=OLMoE-1B-7B-Instruct int8 experts, COLI_TEMP=0, PPL=1 teacher-forced 24-token prompt (CPU prefill in both arms) + 552 decode steps, cap 64, COLI_DENSE_F16=1"
+    },
+    "samples": {
+      "tok_s": [
+        6.86,
+        7.03,
+        7.02,
+        7.05,
+        6.7
+      ]
+    },
+    "median_tok_s": 7.02,
+    "quality": {
+      "method": "TF-NLL 1.5229 and greedy 128-token stream identical to the trial arm",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/olmoe-cuda-decode-2026-10-13-raw.txt",
+      "sha256": "db5f5453ed222a9074920bf9fc32790a94ec44beafdc3c9c65a1214d746c36a6"
+    }
+  },
+  "trial": {
+    "config": {
+      "COLI_OLMOE_CUDA": 1,
+      "fixed": "same olmoe.exe built with OLMOE_CUDA_DLL=1 (coli_cuda_olmoe.dll sm_89), SNAP=OLMoE-1B-7B-Instruct int8 experts, COLI_TEMP=0, PPL=1 teacher-forced 24-token prompt (CPU prefill in both arms) + 552 decode steps, cap 64, COLI_DENSE_F16=1"
+    },
+    "samples": {
+      "tok_s": [
+        46.24,
+        45.96,
+        46.67,
+        46.61,
+        46.86
+      ]
+    },
+    "median_tok_s": 46.61,
+    "quality": {
+      "method": "TF-NLL 1.5229 and greedy 128-token stream identical to the baseline arm; verify mode 575/575 argmax agreement, max |dlogit| 6e-5",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/olmoe-cuda-decode-2026-10-13-raw.txt",
+      "sha256": "db5f5453ed222a9074920bf9fc32790a94ec44beafdc3c9c65a1214d746c36a6"
+    }
+  },
+  "outcome": "improvement"
+}
