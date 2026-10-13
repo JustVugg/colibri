@@ -18,4 +18,4 @@ Completed chat requests settle without a second read and release the transport. 
 
 ## Validation
 
-The frozen dev base88f25a60776036414f62f087905a634890ca5a61 makes the actual streamChat fixture read beyond its terminal message and reject. Candidate full web suite passed99 tests across9 files; TypeScript/Vite build and whitespace checks passed. The fixture controls the reader deterministically without real timers, model execution or network traffic. Native C/oracle checks remain separate; no such success is claimed here.
+The frozen dev base88f25a60776036414f62f087905a634890ca5a61 makes the actual streamChat fixture read beyond its terminal message and reject. Candidate full web suite passed100 tests across9 files; TypeScript/Vite build and whitespace checks passed. An additional actual-entry regression confirms a throwing delta handler cancels the body and a failed cancellation preserves the original error. The fixture controls the reader deterministically without real timers, model execution or network traffic. Native C/oracle checks remain separate; no such success is claimed here.

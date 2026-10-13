@@ -401,3 +401,16 @@ it("finishes chat at DONE without waiting for the backend to close its connectio
   expect(reader.read).toHaveBeenCalledTimes(1);
   expect(reader.cancel).toHaveBeenCalledTimes(1);
 });
+
+it("cancels the chat body when processing a frame fails without masking that error", async () => {
+  const failure = new Error("delta handler failed")
+  const reader = {
+    read: vi.fn().mockResolvedValue({ value: new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'), done: false }),
+    cancel: vi.fn().mockRejectedValue(new Error("cleanup failed")),
+  }
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, headers: new Headers(), body: { getReader: () => reader } }));
+  await expect(streamChat({ baseUrl: "http://fixture.invalid/v1", apiKey: "", model: "fixture", messages: [],
+    temperature: 0, maxTokens: 8, enableThinking: false, signal: new AbortController().signal,
+    onDelta: () => { throw failure } })).rejects.toBe(failure);
+  expect(reader.cancel).toHaveBeenCalledTimes(1);
+});
