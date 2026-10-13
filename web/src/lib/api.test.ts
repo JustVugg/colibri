@@ -387,3 +387,17 @@ describe("generateImage", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })
+
+it("finishes chat at DONE without waiting for the backend to close its connection", async () => {
+  const reader = {
+    read: vi.fn().mockResolvedValueOnce({ value: new TextEncoder().encode("data: [DONE]\n\n"), done: false })
+      .mockRejectedValue(new Error("read after terminal marker")),
+    cancel: vi.fn().mockResolvedValue(undefined),
+  }
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, headers: new Headers(), body: { getReader: () => reader } }));
+  await expect(streamChat({ baseUrl: "http://fixture.invalid/v1", apiKey: "", model: "fixture", messages: [],
+    temperature: 0, maxTokens: 8, enableThinking: false, signal: new AbortController().signal,
+    onDelta: () => undefined })).resolves.toMatchObject({ finishReason: null });
+  expect(reader.read).toHaveBeenCalledTimes(1);
+  expect(reader.cancel).toHaveBeenCalledTimes(1);
+});
