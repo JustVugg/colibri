@@ -294,7 +294,10 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
       buffer += decoder.decode(value, { stream: !done })
       const parsed = extractSSE(buffer)
       buffer = parsed.rest
-      parsed.data.forEach(consume)
+      for (const data of parsed.data) {
+        consume(data)
+        if (finished) break
+      }
       if (done) break
     }
   } catch (cause) {

@@ -414,3 +414,17 @@ it("cancels the chat body when processing a frame fails without masking that err
     onDelta: () => { throw failure } })).rejects.toBe(failure);
   expect(reader.cancel).toHaveBeenCalledTimes(1);
 });
+
+it("ignores all frames after DONE in the same network chunk", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+    'data: {"choices":[{"delta":{"content":"hello"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n'
+    + 'data: [DONE]\n\ndata: {"choices":[{"delta":{"content":"late"}}]}\n\ndata: malformed\n\n',
+    { headers: { "content-type": "text/event-stream" } },
+  )));
+  const deltas: string[] = [];
+  const result = await streamChat({ baseUrl: "http://fixture.invalid/v1", apiKey: "", model: "fixture", messages: [],
+    temperature: 0, maxTokens: 8, enableThinking: false, signal: new AbortController().signal,
+    onDelta: text => deltas.push(text) });
+  expect(deltas).toEqual(["hello"]);
+  expect(result.usage).toEqual({ prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 });
+});
