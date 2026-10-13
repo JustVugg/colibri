@@ -200,8 +200,10 @@ on real hardware is for (matrix below).
 What it does: the FP16-resident dense weights (`COLI_DENSE_F16`) and the lm_head sit in VRAM; each routed expert is a
 "slot" (int8 blob + row scales) with a device table `(layer, expert) -> slot`; the router kernel resolves slots on the
 device, so with every expert resident a token needs no host synchronisation. When the experts do not all fit, the host
-fetches the routed ids after the router, uploads the misses (LRU) and passes explicit slots. The prompt is prefilled on the
-CPU and its KV rows are uploaded on first use; the CPU's KV mirror is kept current after every GPU token.
+fetches the routed ids after the router, uploads the misses (LRU) and passes explicit slots. The prompt is prefilled in
+batched chunks of up to 128 tokens (weights read once per 8 tokens, tokens grouped per expert so each routed expert streams once
+per chunk, every expert output summed in the decode path's fixed order); the CPU's KV mirror is kept current after every GPU
+token and every prefill chunk, and a conversation the CPU extended (prefix reuse) is uploaded on first use.
 
 Safety, in order of what you will notice: no library or no device means the engine simply runs on the CPU; a CUDA error or
 non-finite logits trip a breaker that redoes that token on the CPU and stays there (same text the CPU alone gives);

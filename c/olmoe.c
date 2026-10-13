@@ -154,6 +154,8 @@ typedef struct {
     uint64_t gpu_tokens, gpu_miss, gpu_fetch_syncs;
     double gpu_s;                    /* wall seconds spent in gpu_decode */
     float gpu_max_dlogit; uint64_t gpu_verify_n, gpu_verify_agree;   /* COLI_OLMOE_CUDA_VERIFY statistics */
+    uint64_t gpu_pf_rows, gpu_pf_calls; double gpu_pf_s;             /* GPU prefill: rows, calls, wall seconds */
+    float gpu_pf_max_dlogit; uint64_t gpu_pf_verify_n, gpu_pf_verify_agree;
 #endif
 #ifdef COLI_VULKAN
     void *vk_lm_head;
@@ -1817,6 +1819,7 @@ static void olm_dho_finish(Model *m) {
  * after every GPU token, so any failure (CUDA error, non-finite logits) trips the breaker: that token is redone on the CPU
  * and the session carries on there, with the same text the CPU alone would have produced. */
 #ifdef COLI_OLMOE_CUDA
+static int g_gpu_prefill = 1;                    /* COLI_OLMOE_CUDA_PREFILL=0 keeps prompts on the CPU */
 static int g_gpu_verify = 0;                     /* COLI_OLMOE_CUDA_VERIFY=1: the CPU is the reference, the GPU shadows it */
 
 /* read one expert's merged int8 blob + scales into the library's pinned staging buffer and copy it to `slot` */
@@ -1884,6 +1887,7 @@ static void gpu_try_init(Model *m) {
     m->gpu_max_t = max_t; m->gpu_kv_len = 0;
     m->gpu_on = 1;
     g_gpu_verify = getenv("COLI_OLMOE_CUDA_VERIFY") ? atoi(getenv("COLI_OLMOE_CUDA_VERIFY")) : 0;
+    g_gpu_prefill = getenv("COLI_OLMOE_CUDA_PREFILL") ? atoi(getenv("COLI_OLMOE_CUDA_PREFILL")) : 1;
     fprintf(stderr, "[OLMOE CUDA] ready in %.1fs: %d/%d experts resident in VRAM (%.2f GB), ctx %d, %s%s\n",
             now_s() - t0, loaded, want, (double)loaded * per / 1e9, max_t,
             m->gpu_all_resident ? "all resident (no host sync per layer)" : "partial residency (LRU + on-demand upload)",
@@ -1951,11 +1955,80 @@ static int gpu_decode(Model *m, int tok, int pos, float *logit_out, int mirror_k
     return 1;
 }
 
+/* S prompt tokens on the GPU in chunks of GPU_PF_MAX (weights read once per 8 tokens). Writes the logits of the LAST token to
+ * logit_out and, if mirror_kv, the chunk's K/V rows to the CPU cache so a CPU fallback or a prefix reuse sees them.
+ * Returns 1 on success, 0 on failure (the caller falls back to the CPU). */
+#define GPU_PF_MAX 128   /* must match PF_MAX in olmoe_cuda.cu */
+static int gpu_prefill(Model *m, const int *ids, int S, int pos_base, float *logit_out, int mirror_kv) {
+    Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, L = c->n_layers, H = c->n_heads, hd = c->head_dim;
+    double t0 = now_s();
+    if (S < 1 || pos_base + S > m->gpu_max_t || !m->K) return 0;
+    if (m->gpu_kv_len < pos_base) {                  /* rows the CPU produced earlier (prefix reuse / fallback) */
+        for (int l = 0; l < L; l++)
+            if (olmoe_cuda_kv_upload(l, m->K[l], m->V[l], m->max_t, m->gpu_kv_len, pos_base) <= 0) return 0;
+        m->gpu_kv_len = pos_base;
+    }
+    float *xr = falloc((int64_t)GPU_PF_MAX * D);
+    int *kept = malloc((size_t)E * sizeof(int)), *used = malloc((size_t)E * sizeof(int));
+    int ok = xr && kept && used;
+    for (int c0 = 0; ok && c0 < S; c0 += GPU_PF_MAX) {
+        int cs = S - c0 < GPU_PF_MAX ? S - c0 : GPU_PF_MAX, pos = pos_base + c0, last = (c0 + cs == S);
+        for (int s = 0; s < cs; s++) memcpy(xr + (int64_t)s * D, m->embed + (int64_t)ids[c0 + s] * D, D * sizeof(float));
+        if (olmoe_cuda_pf_begin(xr, cs, pos) <= 0) { ok = 0; break; }
+        for (int l = 0; l < L && ok; l++) {
+            if (olmoe_cuda_pf_attn(l) <= 0) { ok = 0; break; }
+            if (m->gpu_all_resident) {
+                if (olmoe_cuda_pf_route(l, NULL) <= 0 || olmoe_cuda_pf_experts(l) <= 0) ok = 0;
+                continue;
+            }
+            if (olmoe_cuda_pf_route(l, used) <= 0) { ok = 0; break; }
+            m->gpu_fetch_syncs++;
+            int nk = 0;
+            for (int e = 0; e < E && ok; e++) {
+                if (!used[e]) continue;
+                int idx = l * E + e, sl = m->gpu_slot_of[idx];
+                if (sl < 0) {
+                    sl = gpu_pick_slot(m, kept, nk);
+                    if (sl < 0) { ok = 0; break; }
+                    int old = m->gpu_slot_owner[sl];
+                    if (old >= 0) { olmoe_cuda_unmap_expert(old / E, old % E); m->gpu_slot_of[old] = -1; }
+                    if (!gpu_load_expert(m, l, e, sl)) { ok = 0; break; }
+                    m->gpu_slot_of[idx] = sl; m->gpu_slot_owner[sl] = idx; m->gpu_miss++;
+                }
+                m->gpu_slot_use[sl] = ++m->gpu_clock; kept[nk++] = sl;
+            }
+            if (ok && olmoe_cuda_pf_experts(l) <= 0) ok = 0;
+        }
+        if (!ok) break;
+        float *kv = NULL;
+        if (olmoe_cuda_pf_finish(last ? cs - 1 : 0, last ? 1 : 0, logit_out, &kv) <= 0 || !kv) { ok = 0; break; }
+        if (mirror_kv) {
+            for (int l = 0; l < L; l++) {
+                const float *kl = kv + (int64_t)l * 2 * GPU_PF_MAX * D, *vl = kl + (int64_t)cs * D;
+                for (int s = 0; s < cs; s++)
+                    for (int h = 0; h < H; h++) {
+                        memcpy(m->K[l] + ((int64_t)h * m->max_t + pos + s) * hd, kl + (int64_t)s * D + h * hd, hd * sizeof(float));
+                        memcpy(m->V[l] + ((int64_t)h * m->max_t + pos + s) * hd, vl + (int64_t)s * D + h * hd, hd * sizeof(float));
+                    }
+            }
+        }
+        m->gpu_kv_len = pos + cs;
+    }
+    free(xr); free(kept); free(used);
+    if (ok) for (int i = 0; i < c->vocab; i++) if (!isfinite(logit_out[i])) { ok = 0; break; }   /* never emit garbage */
+    if (ok) { m->gpu_pf_rows += (uint64_t)S; m->gpu_pf_calls++; m->gpu_pf_s += now_s() - t0; }
+    return ok;
+}
+
 static void gpu_report(const Model *m) {
     if (!m->gpu_n_slots) return;
     fprintf(stderr, "[OLMOE CUDA] on=%d tokens=%llu expert_misses=%llu fetch_syncs=%llu gpu_s=%.3f",
             m->gpu_on, (unsigned long long)m->gpu_tokens, (unsigned long long)m->gpu_miss,
             (unsigned long long)m->gpu_fetch_syncs, m->gpu_s);
+    if (m->gpu_pf_calls || m->gpu_pf_verify_n)
+        fprintf(stderr, " prefill_calls=%llu prefill_rows=%llu prefill_s=%.3f pf_verify_n=%llu pf_verify_argmax_agree=%llu pf_verify_max_dlogit=%.5f",
+                (unsigned long long)m->gpu_pf_calls, (unsigned long long)m->gpu_pf_rows, m->gpu_pf_s,
+                (unsigned long long)m->gpu_pf_verify_n, (unsigned long long)m->gpu_pf_verify_agree, m->gpu_pf_max_dlogit);
     if (m->gpu_verify_n)
         fprintf(stderr, " verify_n=%llu verify_argmax_agree=%llu verify_max_dlogit=%.5f",
                 (unsigned long long)m->gpu_verify_n, (unsigned long long)m->gpu_verify_agree, m->gpu_max_dlogit);
@@ -1970,6 +2043,19 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     kv_room_fit(m, pos_base + S);   /* before the positions' pages are written */
 #ifdef COLI_OLMOE_CUDA
+    if (m->gpu_on && S > 1 && !g_gpu_verify && g_gpu_prefill && !(g_echo_k > 0 && g_echo_id)) {   /* the echo channel needs every row */
+        float *lg = falloc(c->vocab);
+        if (gpu_prefill(m, ids, S, pos_base, lg, 1)) {
+            m->token_count += S; m->freq_token_count += S;
+            m->kv_len = pos_base + S;
+            kv_prefix_record(&m->kvp, ids, pos_base, S);
+            g_prof_forwards += 1;
+            return lg;
+        }
+        free(lg);
+        m->gpu_on = 0;   /* circuit breaker: the prompt is redone below on the CPU */
+        fprintf(stderr, "[OLMOE CUDA] prefill failed at position %d: continuing on the CPU for the rest of the session\n", pos_base);
+    }
     if (m->gpu_on && S == 1 && !g_gpu_verify) {
         float *lg = falloc(c->vocab);
         if (gpu_decode(m, ids[0], pos_base, lg, 1)) {
@@ -2060,6 +2146,20 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     g_prof_forwards += 1;   /* forward passes, not positions: a prefill of S rows is one */
     free(x); free(last);
 #ifdef COLI_OLMOE_CUDA
+    if (m->gpu_on && g_gpu_verify && S > 1 && g_gpu_prefill) {
+        float *lg = falloc(c->vocab);
+        if (gpu_prefill(m, ids, S, pos_base, lg, 0)) {
+            float mx = 0.f; int ac = 0, ag = 0;
+            for (int i = 0; i < c->vocab; i++) {
+                float d = fabsf(lg[i] - logit[i]); if (d > mx) mx = d;
+                if (lg[i] > lg[ag]) ag = i;
+                if (logit[i] > logit[ac]) ac = i;
+            }
+            if (mx > m->gpu_pf_max_dlogit) m->gpu_pf_max_dlogit = mx;
+            m->gpu_pf_verify_n++; if (ag == ac) m->gpu_pf_verify_agree++;
+        } else { m->gpu_on = 0; fprintf(stderr, "[OLMOE CUDA] verify prefill failed; GPU disabled\n"); }
+        free(lg);
+    }
     if (m->gpu_on && g_gpu_verify && S == 1) {
         /* the CPU is the reference (its logits are returned); the GPU runs the same token on its own KV */
         float *lg = falloc(c->vocab);

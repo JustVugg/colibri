@@ -16,3 +16,8 @@ EXPORTS
     olmoe_cuda_layer_experts
     olmoe_cuda_finish
     olmoe_cuda_shutdown
+    olmoe_cuda_pf_begin
+    olmoe_cuda_pf_attn
+    olmoe_cuda_pf_route
+    olmoe_cuda_pf_experts
+    olmoe_cuda_pf_finish

@@ -4,8 +4,7 @@
  * backend_cuda_dsv4.cu uses: the ABI is olmoe_cuda.h. Without the library or without a GPU the engine
  * keeps running on the CPU; nothing here is reachable from the default build.
  *
- * Scope: batch-1 decode (S == 1). Prefill stays on the CPU path; the engine uploads the prompt's KV
- * rows afterwards. Everything is FP32 activations x (FP16 dense | int8 per-row-scaled expert) weights,
+ * Scope: batch-1 decode (S == 1) and batched prefill (S <= 128 tokens per chunk). Everything is FP32 activations x (FP16 dense | int8 per-row-scaled expert) weights,
  * the same operations and weight values as the CPU path (no requantisation). The GPU's float summation
  * order differs from the CPU's, so results are not bit-identical to the CPU; the engine's verify mode
  * (COLI_OLMOE_CUDA_VERIFY=1) measures per-token logit divergence and argmax agreement against the CPU.
@@ -35,6 +34,8 @@
 
 #define MAXK 16          /* max routed experts per token */
 #define GEMV_WARPS 8     /* rows per block */
+#define PF_MAX 128       /* batched path: max tokens per chunk */
+#define PF_R 8           /* batched path: token vectors sharing one weight-row read */
 
 struct LayerDev {
     __half *q, *k, *v, *o;           /* [D][D] FP16 */
@@ -320,7 +321,7 @@ OLMOE_CUDA_API int olmoe_cuda_init(int device, int layers, int hidden, int heads
     for (int l = 0; l < layers; l++) { CK(cudaMalloc(&g.layers[l].K, kvb)); CK(cudaMalloc(&g.layers[l].V, kvb)); }
     CK(cudaMalloc(&g.x, hidden * 4)); CK(cudaMalloc(&g.xn, hidden * 4)); CK(cudaMalloc(&g.q, hidden * 4));
     CK(cudaMalloc(&g.k, hidden * 4)); CK(cudaMalloc(&g.v, hidden * 4)); CK(cudaMalloc(&g.ctx, hidden * 4));
-    CK(cudaMalloc(&g.logits_e, nexp * 4)); CK(cudaMalloc(&g.logits, (size_t)vocab * 4));
+    CK(cudaMalloc(&g.logits_e, nexp * 4)); CK(cudaMalloc(&g.logits, (size_t)vocab * 4 * PF_R));   /* the batched head writes up to PF_R rows */
     CK(cudaMalloc(&g.act, (size_t)MAXK * inter * 4));
     CK(cudaMalloc(&g.sel_slots, MAXK * 4)); CK(cudaMalloc(&g.sel_ids, MAXK * 4)); CK(cudaMalloc(&g.sel_w, MAXK * 4));
     CK(cudaMalloc(&g.miss, 4));
@@ -462,6 +463,384 @@ OLMOE_CUDA_API int olmoe_cuda_finish(float *logits_out, float *kv_stage_out) {
     CK(cudaStreamSynchronize(g.st));
     memcpy(logits_out, g.h_logits, (size_t)g.V * 4);
     memcpy(kv_stage_out, g.h_kv_stage, (size_t)g.L * 2 * D * 4);
+    return 1;
+}
+
+/* ============================ batched path (prefill) ============================
+ * S tokens at once (S <= PF_MAX). Dense projections and expert MLPs are "rows" GEMVs: a block owns 8
+ * weight rows and up to PF_R token vectors, so every weight row is read once per PF_R tokens and the
+ * re-reads by the other token chunks are served from L2. Tokens are grouped per expert so each routed
+ * expert's weights stream once per chunk of its tokens. Each (token, k) expert output is written to its own
+ * slot of tbuf and summed per token in fixed k order, i.e. the same accumulation order as decode/CPU. */
+struct PF {
+    int S = 0, pos = 0, ok = 0;
+    float *x, *xn, *q, *k, *v, *ctx, *logits_e, *w_sel, *act, *tbuf, *kvl;
+    int *ids, *cnt, *start, *cursor, *list, *used;
+    float *hkv;       /* pinned host [L][2][PF_MAX][D] */
+    int *h_used;
+    float *h_logits_rows;
+};
+static PF pf;
+
+template <int R>
+__global__ void k_gemv_f16_rows(const __half *__restrict__ W, const float *__restrict__ X, float *__restrict__ Y,
+                                int I, int O, int S, int add) {
+    extern __shared__ float xs[];
+    int s0 = blockIdx.y * R, nr = min(R, S - s0);
+    for (int idx = threadIdx.x; idx < nr * I; idx += blockDim.x) xs[idx] = X[(size_t)s0 * I + idx];
+    __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int row = blockIdx.x * GEMV_WARPS + warp;
+    if (row >= O) return;
+    const uint4 *wp = reinterpret_cast<const uint4 *>(W + (size_t)row * I);
+    float acc[R];
+    #pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.f;
+    for (int j = lane; j < (I >> 3); j += 32) {
+        uint4 v = __ldg(wp + j);
+        const __half2 *h = reinterpret_cast<const __half2 *>(&v);
+        float wf[8];
+        #pragma unroll
+        for (int t = 0; t < 4; t++) { float2 f = __half22float2(h[t]); wf[2 * t] = f.x; wf[2 * t + 1] = f.y; }
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            if (r < nr) {
+                const float *xj = xs + (size_t)r * I + (j << 3);
+                float a = 0.f;
+                #pragma unroll
+                for (int t = 0; t < 8; t++) a += wf[t] * xj[t];
+                acc[r] += a;
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        float a = warp_sum(acc[r]);
+        if (lane == 0 && r < nr) { size_t o = (size_t)(s0 + r) * O + row; Y[o] = add ? Y[o] + a : a; }
+    }
+}
+
+__global__ void k_gemv_f32_rows(const float *__restrict__ W, const float *__restrict__ X, float *__restrict__ Y, int I, int O, int S) {
+    int sidx = blockIdx.y; extern __shared__ float xs[];
+    for (int i = threadIdx.x; i < I; i += blockDim.x) xs[i] = X[(size_t)sidx * I + i];
+    __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int row = blockIdx.x * GEMV_WARPS + warp;
+    if (row >= O) return;
+    const float4 *wp = reinterpret_cast<const float4 *>(W + (size_t)row * I);
+    float acc = 0.f;
+    for (int j = lane; j < (I >> 2); j += 32) {
+        float4 w = __ldg(wp + j); const float *xj = xs + (j << 2);
+        acc += w.x * xj[0] + w.y * xj[1] + w.z * xj[2] + w.w * xj[3];
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) Y[(size_t)sidx * O + row] = acc;
+}
+
+/* one block per token row: out = x*r*w */
+__global__ void k_rmsnorm_rows(float *out, const float *x, const float *w, int D, float eps) {
+    __shared__ double sm[32];
+    const float *xr = x + (size_t)blockIdx.x * D; float *o = out + (size_t)blockIdx.x * D;
+    double a = 0;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) a += (double)xr[i] * xr[i];
+    for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffffu, a, off);
+    if ((threadIdx.x & 31) == 0) sm[threadIdx.x >> 5] = a;
+    __syncthreads();
+    if (threadIdx.x == 0) { double t = 0; for (int i = 0; i < (blockDim.x >> 5); i++) t += sm[i]; sm[0] = t; }
+    __syncthreads();
+    float r = 1.f / sqrtf((float)(sm[0] / D) + eps);
+    for (int i = threadIdx.x; i < D; i += blockDim.x) o[i] = xr[i] * r * w[i];
+}
+
+/* q,k rows: RoPE at pos_base+s, then append K,V rows to the layer cache and to the per-layer staging buffer */
+__global__ void k_rope_append_rows(float *q, float *k, const float *v, float *Kc, float *Vc, float *stage,
+                                   int H, int hd, int max_t, int pos_base, float theta, int D, int S) {
+    int s = blockIdx.y; int t = blockIdx.x * blockDim.x + threadIdx.x;
+    int half = hd >> 1;
+    if (t >= H * half) return;
+    int h = t / half, j = t % half, pos = pos_base + s;
+    float inv = powf(theta, -2.0f * j / hd);
+    float ang = pos * inv, cs = cosf(ang), sn = sinf(ang);
+    float *qh = q + (size_t)s * D + h * hd, *kh = k + (size_t)s * D + h * hd;
+    float a = qh[j], b = qh[j + half];
+    qh[j] = a * cs - b * sn; qh[j + half] = b * cs + a * sn;
+    a = kh[j]; b = kh[j + half];
+    float ka = a * cs - b * sn, kb = b * cs + a * sn;
+    kh[j] = ka; kh[j + half] = kb;
+    size_t base = ((size_t)h * max_t + pos) * hd;
+    const float *vh = v + (size_t)s * D + h * hd;
+    Kc[base + j] = ka; Kc[base + j + half] = kb;
+    Vc[base + j] = vh[j]; Vc[base + j + half] = vh[j + half];
+    stage[(size_t)s * D + h * hd + j] = ka; stage[(size_t)s * D + h * hd + j + half] = kb;
+    stage[(size_t)S * D + (size_t)s * D + h * hd + j] = vh[j]; stage[(size_t)S * D + (size_t)s * D + h * hd + j + half] = vh[j + half];
+}
+
+/* causal MHA for every (head, row): T = pos_base + s + 1 */
+__global__ void k_attn_rows(const float *q, const float *Kc, const float *Vc, float *ctx, int hd, int max_t, int pos_base, int D, float scale) {
+    extern __shared__ float sc[];
+    __shared__ float red[32];
+    int h = blockIdx.x, s = blockIdx.y, T = pos_base + s + 1;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    const float *qh = q + (size_t)s * D + h * hd;
+    const float *Kh = Kc + (size_t)h * max_t * hd, *Vh = Vc + (size_t)h * max_t * hd;
+    float q4[4];
+    for (int i = 0; i < 4; i++) q4[i] = qh[lane * 4 + i];
+    for (int t = warp; t < T; t += nw) {
+        float4 kv = *reinterpret_cast<const float4 *>(Kh + (size_t)t * hd + lane * 4);
+        float d = kv.x * q4[0] + kv.y * q4[1] + kv.z * q4[2] + kv.w * q4[3];
+        d = warp_sum(d);
+        if (lane == 0) sc[t] = d * scale;
+    }
+    __syncthreads();
+    float m = -1e30f;
+    for (int t = threadIdx.x; t < T; t += blockDim.x) m = fmaxf(m, sc[t]);
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, o));
+    if (lane == 0) red[warp] = m;
+    __syncthreads();
+    if (threadIdx.x == 0) { float mm = red[0]; for (int i = 1; i < nw; i++) mm = fmaxf(mm, red[i]); red[0] = mm; }
+    __syncthreads();
+    m = red[0];
+    __syncthreads();
+    float sum = 0.f;
+    for (int t = threadIdx.x; t < T; t += blockDim.x) { float e = expf(sc[t] - m); sc[t] = e; sum += e; }
+    sum = warp_sum(sum);
+    if (lane == 0) red[warp] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) { float ss = 0; for (int i = 0; i < nw; i++) ss += red[i]; red[0] = ss; }
+    __syncthreads();
+    sum = red[0];
+    for (int t = threadIdx.x; t < T; t += blockDim.x) sc[t] /= sum;
+    __syncthreads();
+    if (threadIdx.x < hd) {
+        float acc = 0.f;
+        for (int t = 0; t < T; t++) acc += sc[t] * Vh[(size_t)t * hd + threadIdx.x];
+        ctx[(size_t)s * D + h * hd + threadIdx.x] = acc;
+    }
+}
+
+/* softmax + top-K per token; counts tokens per expert */
+__global__ void k_route_rows(const float *logits, float *sel_w, int *sel_ids, int *cnt, int *used, int E, int K, int norm_topk) {
+    __shared__ float p[1024];
+    int s = blockIdx.x;
+    for (int e = threadIdx.x; e < E; e += blockDim.x) p[e] = logits[(size_t)s * E + e];
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = -1e30f; for (int e = 0; e < E; e++) if (p[e] > m) m = p[e];
+        float sm = 0.f; for (int e = 0; e < E; e++) { p[e] = expf(p[e] - m); sm += p[e]; }
+        for (int e = 0; e < E; e++) p[e] /= sm;
+        int taken[MAXK]; float val[MAXK];
+        for (int k = 0; k < K; k++) {
+            int best = -1; float bv = -1e30f;
+            for (int e = 0; e < E; e++) {
+                int t = 0; for (int j = 0; j < k; j++) if (taken[j] == e) { t = 1; break; }
+                if (!t && p[e] > bv) { bv = p[e]; best = e; }
+            }
+            if (best < 0) { best = 0; while (true) { int t = 0; for (int j = 0; j < k; j++) if (taken[j] == best) t = 1; if (!t) break; best++; } bv = 0.f; }
+            taken[k] = best; val[k] = bv;
+        }
+        if (norm_topk) { float t = 0; for (int k = 0; k < K; k++) t += val[k]; for (int k = 0; k < K; k++) val[k] /= t; }
+        for (int k = 0; k < K; k++) {
+            sel_ids[s * K + k] = taken[k]; sel_w[s * K + k] = val[k];
+            atomicAdd(&cnt[taken[k]], 1); used[taken[k]] = 1;
+        }
+    }
+}
+__global__ void k_scan(const int *cnt, int *start, int *cursor, int E) {
+    if (threadIdx.x == 0) { int a = 0; for (int e = 0; e < E; e++) { start[e] = a; a += cnt[e]; cursor[e] = 0; } }
+}
+__global__ void k_scatter(const int *ids, const int *start, int *cursor, int *list, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int e = ids[i];
+    list[start[e] + atomicAdd(&cursor[e], 1)] = i;   /* i = s*K + k */
+}
+
+/* grid (I/8, chunks, E): chunk c of expert e covers list positions start[e] + c*R .. */
+__global__ void k_expert_gateup_rows(const int8_t *slot_w, const float *slot_s, const int *slot_of, const int *cnt, const int *start,
+                                     const int *list, const float *X, float *act, int D, int I, int K, size_t w_bytes, size_t s_elems) {
+    extern __shared__ float xs[];
+    int e = blockIdx.z, c = blockIdx.y, ne = cnt[e], j0 = c * PF_R;
+    if (j0 >= ne) return;
+    int sl = slot_of[e]; if (sl < 0) return;
+    int nr = min(PF_R, ne - j0);
+    for (int r = 0; r < nr; r++) {
+        int tok = list[start[e] + j0 + r] / K;
+        for (int i = threadIdx.x; i < D; i += blockDim.x) xs[r * D + i] = X[(size_t)tok * D + i];
+    }
+    __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int row = blockIdx.x * GEMV_WARPS + warp;
+    if (row >= I) return;
+    const int8_t *w = slot_w + (size_t)sl * w_bytes; const float *sc = slot_s + (size_t)sl * s_elems;
+    const uint4 *gp = reinterpret_cast<const uint4 *>(w + (size_t)row * D);
+    const uint4 *up = reinterpret_cast<const uint4 *>(w + (size_t)I * D + (size_t)row * D);
+    float ag[PF_R], au[PF_R];
+    #pragma unroll
+    for (int r = 0; r < PF_R; r++) { ag[r] = 0.f; au[r] = 0.f; }
+    for (int j = lane; j < (D >> 4); j += 32) {
+        uint4 gv = __ldg(gp + j), uv = __ldg(up + j);
+        const int8_t *gb = reinterpret_cast<const int8_t *>(&gv), *ub = reinterpret_cast<const int8_t *>(&uv);
+        #pragma unroll
+        for (int r = 0; r < PF_R; r++) {
+            if (r < nr) {
+                const float *xj = xs + (size_t)r * D + (j << 4);
+                /* accumulate straight into the running sum, exactly as dot_i8_row does: keeps this kernel bit-identical
+                 * to the decode kernel so speculative verification never changes a token */
+                #pragma unroll
+                for (int t = 0; t < 16; t++) { ag[r] += (float)gb[t] * xj[t]; au[r] += (float)ub[t] * xj[t]; }
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < PF_R; r++) {
+        float g = warp_sum(ag[r]), u = warp_sum(au[r]);
+        if (lane == 0 && r < nr) {
+            g *= sc[row]; u *= sc[I + row];
+            act[(size_t)(start[e] + j0 + r) * I + row] = (g / (1.f + expf(-g))) * u;
+        }
+    }
+}
+
+__global__ void k_expert_down_rows(const int8_t *slot_w, const float *slot_s, const int *slot_of, const int *cnt, const int *start,
+                                   const int *list, const float *act, float *tbuf, int D, int I, size_t w_bytes, size_t s_elems) {
+    extern __shared__ float xs[];
+    int e = blockIdx.z, c = blockIdx.y, ne = cnt[e], j0 = c * PF_R;
+    if (j0 >= ne) return;
+    int sl = slot_of[e]; if (sl < 0) return;
+    int nr = min(PF_R, ne - j0);
+    for (int idx = threadIdx.x; idx < nr * I; idx += blockDim.x) xs[idx] = act[(size_t)(start[e] + j0) * I + idx];
+    __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int row = blockIdx.x * GEMV_WARPS + warp;
+    if (row >= D) return;
+    const uint4 *dp = reinterpret_cast<const uint4 *>(slot_w + (size_t)sl * w_bytes + (size_t)2 * I * D + (size_t)row * I);
+    float ad[PF_R];
+    #pragma unroll
+    for (int r = 0; r < PF_R; r++) ad[r] = 0.f;
+    for (int j = lane; j < (I >> 4); j += 32) {
+        uint4 v = __ldg(dp + j); const int8_t *b = reinterpret_cast<const int8_t *>(&v);
+        #pragma unroll
+        for (int r = 0; r < PF_R; r++) {
+            if (r < nr) {
+                const float *xj = xs + (size_t)r * I + (j << 4);
+                #pragma unroll
+                for (int t = 0; t < 16; t++) ad[r] += (float)b[t] * xj[t];
+            }
+        }
+    }
+    float ds = slot_s[(size_t)sl * s_elems + 2 * I + row];
+    #pragma unroll
+    for (int r = 0; r < PF_R; r++) {
+        float a = warp_sum(ad[r]);
+        if (lane == 0 && r < nr) tbuf[(size_t)list[start[e] + j0 + r] * D + row] = a * ds;
+    }
+}
+
+/* x[s] += sum_k w[s,k] * tbuf[s,k]  (k in order, as the CPU loop) */
+__global__ void k_combine(float *x, const float *tbuf, const float *sel_w, int D, int K) {
+    int s = blockIdx.x;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        float acc = 0.f;
+        for (int k = 0; k < K; k++) acc += sel_w[s * K + k] * tbuf[((size_t)s * K + k) * D + d];
+        x[(size_t)s * D + d] += acc;
+    }
+}
+
+static int pf_alloc(void) {
+    int D = g.D, K = g.K, S = PF_MAX;
+    size_t sd = (size_t)S * D * 4;
+    CK(cudaMalloc(&pf.x, sd)); CK(cudaMalloc(&pf.xn, sd)); CK(cudaMalloc(&pf.q, sd)); CK(cudaMalloc(&pf.k, sd));
+    CK(cudaMalloc(&pf.v, sd)); CK(cudaMalloc(&pf.ctx, sd));
+    CK(cudaMalloc(&pf.logits_e, (size_t)S * g.E * 4)); CK(cudaMalloc(&pf.w_sel, (size_t)S * K * 4));
+    CK(cudaMalloc(&pf.ids, (size_t)S * K * 4)); CK(cudaMalloc(&pf.list, (size_t)S * K * 4));
+    CK(cudaMalloc(&pf.act, (size_t)S * K * g.I * 4)); CK(cudaMalloc(&pf.tbuf, (size_t)S * K * D * 4));
+    CK(cudaMalloc(&pf.kvl, 2 * sd));
+    CK(cudaMalloc(&pf.cnt, g.E * 4)); CK(cudaMalloc(&pf.start, g.E * 4)); CK(cudaMalloc(&pf.cursor, g.E * 4)); CK(cudaMalloc(&pf.used, g.E * 4));
+    CK(cudaHostAlloc((void **)&pf.hkv, (size_t)g.L * 2 * sd, 0));
+    CK(cudaHostAlloc((void **)&pf.h_used, g.E * 4, 0));
+    CK(cudaHostAlloc((void **)&pf.h_logits_rows, (size_t)PF_R * g.V * 4, 0));
+    CK(cudaFuncSetAttribute(k_gemv_f16_rows<PF_R>, cudaFuncAttributeMaxDynamicSharedMemorySize, PF_R * g.D * 4));
+    CK(cudaFuncSetAttribute(k_expert_gateup_rows, cudaFuncAttributeMaxDynamicSharedMemorySize, PF_R * g.D * 4));
+    CK(cudaFuncSetAttribute(k_expert_down_rows, cudaFuncAttributeMaxDynamicSharedMemorySize, PF_R * g.I * 4));
+    pf.ok = 1;
+    return 1;
+}
+
+/* x_rows: S embedding rows (host). Positions pos_base .. pos_base+S-1. */
+OLMOE_CUDA_API int olmoe_cuda_pf_begin(const float *x_rows, int S, int pos_base) {
+    if (S < 1 || S > PF_MAX || pos_base + S > g.max_t) return -4;
+    if (!pf.ok && pf_alloc() < 0) return -1;
+    pf.S = S; pf.pos = pos_base;
+    CK(cudaMemcpyAsync(pf.x, x_rows, (size_t)S * g.D * 4, cudaMemcpyHostToDevice, g.st));
+    return 1;
+}
+
+OLMOE_CUDA_API int olmoe_cuda_pf_attn(int l) {
+    LayerDev *L = &g.layers[l]; int D = g.D, S = pf.S;
+    dim3 gg((D + GEMV_WARPS - 1) / GEMV_WARPS, (S + PF_R - 1) / PF_R);
+    size_t sm = (size_t)PF_R * D * 4;
+    k_rmsnorm_rows<<<S, 256, 0, g.st>>>(pf.xn, pf.x, L->in_ln, D, g.eps);
+    k_gemv_f16_rows<PF_R><<<gg, 32 * GEMV_WARPS, sm, g.st>>>(L->q, pf.xn, pf.q, D, D, S, 0);
+    k_gemv_f16_rows<PF_R><<<gg, 32 * GEMV_WARPS, sm, g.st>>>(L->k, pf.xn, pf.k, D, D, S, 0);
+    k_gemv_f16_rows<PF_R><<<gg, 32 * GEMV_WARPS, sm, g.st>>>(L->v, pf.xn, pf.v, D, D, S, 0);
+    k_rmsnorm_rows<<<S, 256, 0, g.st>>>(pf.q, pf.q, L->qn, D, g.eps);
+    k_rmsnorm_rows<<<S, 256, 0, g.st>>>(pf.k, pf.k, L->kn, D, g.eps);
+    k_rope_append_rows<<<dim3((g.H * (g.hd / 2) + 127) / 128, S), 128, 0, g.st>>>(pf.q, pf.k, pf.v, L->K, L->V, pf.kvl,
+                                                                                  g.H, g.hd, g.max_t, pf.pos, g.theta, D, S);
+    /* per-layer KV rows back to the host mirror (stream-ordered: pf.kvl is reused by the next layer) */
+    CK(cudaMemcpyAsync(pf.hkv + (size_t)l * 2 * PF_MAX * D, pf.kvl, (size_t)2 * S * D * 4, cudaMemcpyDeviceToHost, g.st));
+    k_attn_rows<<<dim3(g.H, S), 256, (size_t)(pf.pos + S) * 4, g.st>>>(pf.q, L->K, L->V, pf.ctx, g.hd, g.max_t, pf.pos, D, 1.f / sqrtf((float)g.hd));
+    k_gemv_f16_rows<PF_R><<<gg, 32 * GEMV_WARPS, sm, g.st>>>(L->o, pf.ctx, pf.x, D, D, S, 1);
+    CK(cudaGetLastError());
+    return 1;
+}
+
+/* routing + per-expert token grouping. If `used_out` is non-NULL it is filled (host sync) so the engine can
+ * make every used expert resident before olmoe_cuda_pf_experts. */
+OLMOE_CUDA_API int olmoe_cuda_pf_route(int l, int *used_out) {
+    LayerDev *L = &g.layers[l]; int D = g.D, S = pf.S, E = g.E, K = g.K;
+    k_rmsnorm_rows<<<S, 256, 0, g.st>>>(pf.xn, pf.x, L->post_ln, D, g.eps);
+    CK(cudaMemsetAsync(pf.cnt, 0, E * 4, g.st)); CK(cudaMemsetAsync(pf.used, 0, E * 4, g.st));
+    k_gemv_f32_rows<<<dim3((E + GEMV_WARPS - 1) / GEMV_WARPS, S), 32 * GEMV_WARPS, (size_t)D * 4, g.st>>>(L->gate, pf.xn, pf.logits_e, D, E, S);
+    k_route_rows<<<S, 64, 0, g.st>>>(pf.logits_e, pf.w_sel, pf.ids, pf.cnt, pf.used, E, K, g.norm_topk);
+    k_scan<<<1, 32, 0, g.st>>>(pf.cnt, pf.start, pf.cursor, E);
+    k_scatter<<<(S * K + 127) / 128, 128, 0, g.st>>>(pf.ids, pf.start, pf.cursor, pf.list, S * K);
+    CK(cudaGetLastError());
+    if (used_out) {
+        CK(cudaMemcpyAsync(pf.h_used, pf.used, E * 4, cudaMemcpyDeviceToHost, g.st));
+        CK(cudaStreamSynchronize(g.st));
+        memcpy(used_out, pf.h_used, E * 4);
+    }
+    return 1;
+}
+
+OLMOE_CUDA_API int olmoe_cuda_pf_experts(int l) {
+    int D = g.D, I = g.I, S = pf.S, E = g.E, K = g.K;
+    int chunks = (S + PF_R - 1) / PF_R;   /* an expert appears at most once per token, so ne <= S */
+    const int *slot_of = g.slot_of + (size_t)l * E;
+    k_expert_gateup_rows<<<dim3((I + GEMV_WARPS - 1) / GEMV_WARPS, chunks, E), 32 * GEMV_WARPS, (size_t)PF_R * D * 4, g.st>>>(
+        g.slot_w, g.slot_s, slot_of, pf.cnt, pf.start, pf.list, pf.xn, pf.act, D, I, K, g.w_bytes, g.s_elems);
+    k_expert_down_rows<<<dim3((D + GEMV_WARPS - 1) / GEMV_WARPS, chunks, E), 32 * GEMV_WARPS, (size_t)PF_R * I * 4, g.st>>>(
+        g.slot_w, g.slot_s, slot_of, pf.cnt, pf.start, pf.list, pf.act, pf.tbuf, D, I, g.w_bytes, g.s_elems);
+    k_combine<<<S, 256, 0, g.st>>>(pf.x, pf.tbuf, pf.w_sel, D, K);
+    CK(cudaGetLastError());
+    return 1;
+}
+
+/* final norm + lm_head for `nrows` rows starting at row `first` (1 row for prefill);
+ * logits_out is [nrows][V]. *kv_out points at the pinned [L][2][PF_MAX][D] K/V rows of this chunk (S valid rows). */
+OLMOE_CUDA_API int olmoe_cuda_pf_finish(int first, int nrows, float *logits_out, float **kv_out) {
+    int D = g.D;
+    if (nrows > PF_R) return -5;
+    if (nrows > 0) {
+        k_rmsnorm_rows<<<pf.S, 256, 0, g.st>>>(pf.xn, pf.x, g.final_norm, D, g.eps);
+        dim3 gg((g.V + GEMV_WARPS - 1) / GEMV_WARPS, 1);
+        k_gemv_f16_rows<PF_R><<<gg, 32 * GEMV_WARPS, (size_t)PF_R * D * 4, g.st>>>(g.lm_head, pf.xn + (size_t)first * D, g.logits, D, g.V, nrows, 0);
+        CK(cudaMemcpyAsync(pf.h_logits_rows, g.logits, (size_t)nrows * g.V * 4, cudaMemcpyDeviceToHost, g.st));
+    }
+    CK(cudaStreamSynchronize(g.st));
+    if (nrows > 0) memcpy(logits_out, pf.h_logits_rows, (size_t)nrows * g.V * 4);
+    *kv_out = pf.hkv;
     return 1;
 }
 

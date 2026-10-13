@@ -52,6 +52,17 @@ OLMOE_CUDA_API int olmoe_cuda_layer_route(int l);
 OLMOE_CUDA_API int olmoe_cuda_route_fetch(int *ids, float *w, int *miss);
 OLMOE_CUDA_API int olmoe_cuda_layer_experts(const int *slots);
 OLMOE_CUDA_API int olmoe_cuda_finish(float *logits_out, float *kv_stage_out);
+/* Batched prefill: S <= 128 tokens at once at positions pos_base.. (weights read once per 8 tokens; tokens grouped per
+ * expert; each (token, k) expert output is summed in the fixed k order of the decode path). Per layer: pf_attn, then pf_route,
+ * then pf_experts. pf_route(l, used) with used != NULL syncs and fills used[e] = 1 for every expert some token routed to, so
+ * the host can make them resident first; with NULL (everything resident) the chunk needs no host sync. pf_finish applies the
+ * final norm and the head to `nrows` rows starting at row `first` and returns their logits [nrows][vocab] (nrows <= 8), and
+ * a pinned buffer of this chunk's K/V rows laid out [layer][2*128*hidden]: K rows [S][hidden] first, then V rows [S][hidden]. */
+OLMOE_CUDA_API int olmoe_cuda_pf_begin(const float *x_rows, int S, int pos_base);
+OLMOE_CUDA_API int olmoe_cuda_pf_attn(int l);
+OLMOE_CUDA_API int olmoe_cuda_pf_route(int l, int *used_out);
+OLMOE_CUDA_API int olmoe_cuda_pf_experts(int l);
+OLMOE_CUDA_API int olmoe_cuda_pf_finish(int first, int nrows, float *logits_out, float **kv_out);
 OLMOE_CUDA_API void olmoe_cuda_shutdown(void);
 
 #ifdef __cplusplus

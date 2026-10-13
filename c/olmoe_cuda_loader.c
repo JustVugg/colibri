@@ -36,6 +36,9 @@ typedef int   (*fn_route_fetch)(int *, float *, int *);
 typedef int   (*fn_layer_experts)(const int *);
 typedef int   (*fn_finish)(float *, float *);
 typedef void  (*fn_shutdown)(void);
+typedef int   (*fn_pf_begin)(const float *, int, int);
+typedef int   (*fn_pf_route)(int, int *);
+typedef int   (*fn_pf_finish)(int, int, float *, float **);
 
 static struct {
     int tried, ok;
@@ -43,6 +46,7 @@ static struct {
     fn_alloc_slots alloc_slots; fn_stage_ptr stage_ptr; fn_upload_expert upload_expert; fn_unmap_expert unmap_expert;
     fn_kv_upload kv_upload; fn_begin_token begin_token; fn_layer layer_attn; fn_layer layer_route;
     fn_route_fetch route_fetch; fn_layer_experts layer_experts; fn_finish finish; fn_shutdown shutdown;
+    fn_pf_begin pf_begin; fn_layer pf_attn; fn_pf_route pf_route; fn_layer pf_experts; fn_pf_finish pf_finish;
 } L;
 
 static int load(void) {
@@ -63,6 +67,7 @@ static int load(void) {
     BIND(available); BIND(init); BIND(set_layer); BIND(set_head); BIND(mem_info); BIND(alloc_slots); BIND(stage_ptr);
     BIND(upload_expert); BIND(unmap_expert); BIND(kv_upload); BIND(begin_token); BIND(layer_attn); BIND(layer_route);
     BIND(route_fetch); BIND(layer_experts); BIND(finish); BIND(shutdown);
+    BIND(pf_begin); BIND(pf_attn); BIND(pf_route); BIND(pf_experts); BIND(pf_finish);
 #undef BIND
     L.ok = 1;
     return 1;
@@ -95,4 +100,9 @@ int olmoe_cuda_route_fetch(int *ids, float *w, int *miss) { return load() ? L.ro
 int olmoe_cuda_layer_experts(const int *slots) { return load() ? L.layer_experts(slots) : -1; }
 int olmoe_cuda_finish(float *logits, float *kv) { return load() ? L.finish(logits, kv) : -1; }
 void olmoe_cuda_shutdown(void) { if (L.ok) L.shutdown(); }
+int olmoe_cuda_pf_begin(const float *x, int S, int pos) { return load() ? L.pf_begin(x, S, pos) : -1; }
+int olmoe_cuda_pf_attn(int l) { return load() ? L.pf_attn(l) : -1; }
+int olmoe_cuda_pf_route(int l, int *used) { return load() ? L.pf_route(l, used) : -1; }
+int olmoe_cuda_pf_experts(int l) { return load() ? L.pf_experts(l) : -1; }
+int olmoe_cuda_pf_finish(int first, int nrows, float *logits, float **kv) { return load() ? L.pf_finish(first, nrows, logits, kv) : -1; }
 #endif
