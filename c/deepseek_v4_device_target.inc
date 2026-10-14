@@ -73,9 +73,16 @@ static int v4_device_layer_prepare(ColiV4Engine *engine, V4DeviceTarget *target,
     pthread_mutex_unlock(&cache->mutex);
     if (!l->experts) return -1;
     if (lw->plan.uses_hash_router) {
+        /* The device indexes its 256-expert table with these ids as they are:
+         * check the table's shape and every id here, once per layer. */
         char key[96]; snprintf(key,sizeof(key),"layers.%d.ffn.gate.tid2eid",id);
-        const int64_t *map=coli_v4_layer_data(lw,key,NULL);
-        if (!map || !dsv4_cuda_expert_set_upload_hash(l->experts,map,c->vocab_size,6)) return -1;
+        const ColiDeepSeekV4TensorSpec *spec=NULL;
+        const int64_t *map=coli_v4_layer_data(lw,key,&spec);
+        if (!map || !spec || c->num_experts_per_tok!=6 || spec->dtype!=COLI_ST_I64 ||
+            spec->rank!=2 || spec->shape[0]!=c->vocab_size || spec->shape[1]!=6) return -1;
+        for (size_t i=0;i<(size_t)c->vocab_size*6;i++)
+            if (map[i]<0 || map[i]>=256) return -1;
+        if (!dsv4_cuda_expert_set_upload_hash(l->experts,map,c->vocab_size,6)) return -1;
     } else if (!w.bias) return -1;
     w.experts=l->experts; w.hidden=c->hidden_size; w.rank=c->q_lora_rank;
     w.heads=c->num_attention_heads; w.dim=c->head_dim; w.rope=c->qk_rope_head_dim;
