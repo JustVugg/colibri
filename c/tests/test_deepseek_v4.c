@@ -1771,6 +1771,9 @@ static int test_fp8_decode_batch_order(void) {
                    memcmp(reference_dual, other, sizeof(reference_dual))) return 1;
     }
     puts("DeepSeek-V4 FP8 decode: batch-exact bits");
+    return 0;
+}
+
 static int test_e8m0_exact(void) {
     static const struct { float value; int encoded; } cases[] = {
         {1.0f, 127}, {0.5f, 126}, {0x1p-127f, 0}, {0x1p127f, 254},
