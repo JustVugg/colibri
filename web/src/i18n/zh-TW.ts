@@ -1,6 +1,7 @@
 const zhTW: Record<string, string> = {
   "nav.chat": "對話",
   "nav.brain": "大腦",
+  "nav.brio": "System One",
   "nav.profiling": "效能分析",
 
   "brand.tagline": "本地巨人，極小足跡",
@@ -60,6 +61,10 @@ const zhTW: Record<string, string> = {
   "prompts.caching": "比較 RAM 與 VRAM 快取",
 
   "chat.you": "你",
+  "chat.toBottom": "跳到最新訊息",
+  "chat.image": "圖片",
+  "ui.exportMarkdown": "Markdown (.md)",
+  "ui.exportJson": "JSON (.json)",
   "chat.colibri": "colibrì",
   "chat.placeholder": "傳送訊息給 colibrì…",
   "chat.inputHint": "Enter 傳送 · Shift+Enter 換行",

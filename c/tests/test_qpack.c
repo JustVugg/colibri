@@ -84,15 +84,67 @@ static const char *overflow_layout =
     "{\"name\":\"w\",\"dtype\":\"U32\","
     "\"shape\":[4294967296,4294967296],\"offset\":0,\"size\":4}]}";
 
+/* Scales with the right packed width but the wrong leading dimension: open
+ * accepts it (the widths agree), the affine view refuses it. */
 static const char *bad_affine_shape_layout =
     "{\"expertCount\":2,\"layerCount\":2,\"expertStride\":16384,"
     "\"linearLayers\":[true,false],\"sections\":["
     "{\"name\":\"gate_proj.weight\",\"dtype\":\"U32\","
     "\"shape\":[2,1],\"offset\":0,\"size\":8},"
     "{\"name\":\"gate_proj.scales\",\"dtype\":\"BF16\","
-    "\"shape\":[1,2],\"offset\":8,\"size\":4},"
+    "\"shape\":[1,1],\"offset\":8,\"size\":2},"
     "{\"name\":\"gate_proj.biases\",\"dtype\":\"BF16\","
     "\"shape\":[2,1],\"offset\":12,\"size\":4}]}";
+
+/* Manifest 4-bit/g8, but the scales carry two groups per row (16 inputs)
+ * against a one-word weight row (8 inputs): the recorded quantization does
+ * not match the packed bytes. */
+static const char *mismatched_width_layout =
+    "{\"expertCount\":2,\"layerCount\":2,\"expertStride\":16384,"
+    "\"linearLayers\":[true,false],\"sections\":["
+    "{\"name\":\"gate_proj.weight\",\"dtype\":\"U32\","
+    "\"shape\":[2,1],\"offset\":0,\"size\":8},"
+    "{\"name\":\"gate_proj.scales\",\"dtype\":\"BF16\","
+    "\"shape\":[2,2],\"offset\":8,\"size\":8},"
+    "{\"name\":\"gate_proj.biases\",\"dtype\":\"BF16\","
+    "\"shape\":[2,2],\"offset\":16,\"size\":8}]}";
+
+/* gate_proj packed at the manifest's 4-bit/g8 (8 inputs), up_proj packed at
+ * 8-bit/g8 for the same 8 inputs (two words per row, one group): one module
+ * quantized differently from the rest, which a single-valued manifest cannot
+ * describe. Refused by the module's name. */
+static const char *mixed_module_layout =
+    "{\"expertCount\":2,\"layerCount\":2,\"expertStride\":16384,"
+    "\"linearLayers\":[true,false],\"sections\":["
+    "{\"name\":\"gate_proj.weight\",\"dtype\":\"U32\","
+    "\"shape\":[2,1],\"offset\":0,\"size\":8},"
+    "{\"name\":\"gate_proj.scales\",\"dtype\":\"BF16\","
+    "\"shape\":[2,1],\"offset\":8,\"size\":4},"
+    "{\"name\":\"gate_proj.biases\",\"dtype\":\"BF16\","
+    "\"shape\":[2,1],\"offset\":12,\"size\":4},"
+    "{\"name\":\"up_proj.weight\",\"dtype\":\"U32\","
+    "\"shape\":[2,2],\"offset\":16,\"size\":16},"
+    "{\"name\":\"up_proj.scales\",\"dtype\":\"BF16\","
+    "\"shape\":[2,1],\"offset\":32,\"size\":4},"
+    "{\"name\":\"up_proj.biases\",\"dtype\":\"BF16\","
+    "\"shape\":[2,1],\"offset\":36,\"size\":4}]}";
+
+/* The same two modules, both packed at the manifest's 4-bit/g8: opens. */
+static const char *two_module_layout =
+    "{\"expertCount\":2,\"layerCount\":2,\"expertStride\":16384,"
+    "\"linearLayers\":[true,false],\"sections\":["
+    "{\"name\":\"gate_proj.weight\",\"dtype\":\"U32\","
+    "\"shape\":[2,1],\"offset\":0,\"size\":8},"
+    "{\"name\":\"gate_proj.scales\",\"dtype\":\"BF16\","
+    "\"shape\":[2,1],\"offset\":8,\"size\":4},"
+    "{\"name\":\"gate_proj.biases\",\"dtype\":\"BF16\","
+    "\"shape\":[2,1],\"offset\":12,\"size\":4},"
+    "{\"name\":\"up_proj.weight\",\"dtype\":\"U32\","
+    "\"shape\":[2,1],\"offset\":16,\"size\":8},"
+    "{\"name\":\"up_proj.scales\",\"dtype\":\"BF16\","
+    "\"shape\":[2,1],\"offset\":24,\"size\":4},"
+    "{\"name\":\"up_proj.biases\",\"dtype\":\"BF16\","
+    "\"shape\":[2,1],\"offset\":28,\"size\":4}]}";
 
 static void make_path(char *output, size_t capacity,
                       const char *root, const char *name) {
@@ -301,6 +353,63 @@ static void test_valid_container(const char *layout,
     cleanup(root);
 }
 
+/* A manifest whose bits/group size disagree with the packed shapes is refused
+ * at open, by section and both widths, before a single layer file is opened
+ * or an expert slot sized. */
+static void expect_width_refusal(const char *layout, int quant_bits,
+                                 int group_size, const char *section,
+                                 const char *widths) {
+    char root[] = "test_qpack_width_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    write_fixture(root, layout, "QPACK", 32768, quant_bits, group_size,
+                  COLI_AFFINE_SCALAR_BF16);
+    ColiQpackReader reader;
+    char error[512] = {0};
+    CHECK(coli_qpack_open(&reader, root, error, sizeof(error)) != 0);
+    CHECK(strstr(error, section) != NULL);
+    CHECK(strstr(error, widths) != NULL);
+    CHECK(strstr(error, "recorded quantization does not match") != NULL);
+    CHECK(reader.layer_fds == NULL && reader.layout.sections == NULL);
+    cleanup(root);
+}
+
+static void test_packed_width_refusals(void) {
+    /* 4-bit/g8: weight inner 1 word = 8 inputs, scales inner 2 groups = 16. */
+    expect_width_refusal(mismatched_width_layout, 4, 8, "section gate_proj:",
+                         "weight inner 1 = 8 inputs, scales inner 2 = 16 inputs");
+    /* The same bytes read as 8-bit/g4: 4 inputs against 8. Still refused. */
+    expect_width_refusal(mismatched_width_layout, 8, 4, "section gate_proj:",
+                         "weight inner 1 = 4 inputs, scales inner 2 = 8 inputs");
+    /* gate_proj agrees with the manifest; up_proj was packed at 8 bits. */
+    expect_width_refusal(mixed_module_layout, 4, 8, "section up_proj:",
+                         "weight inner 2 = 16 inputs, scales inner 1 = 8 inputs");
+
+    /* Declared quantization the affine contract cannot size anything by. */
+    char root[] = "test_qpack_bits_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    write_fixture(root, valid_layout_bf16, "QPACK", 32768, 2, 8,
+                  COLI_AFFINE_SCALAR_BF16);
+    ColiQpackReader reader;
+    char error[512] = {0};
+    CHECK(coli_qpack_open(&reader, root, error, sizeof(error)) != 0);
+    CHECK(strstr(error, "2-bit/g8 is not a supported") != NULL);
+    CHECK(reader.layer_fds == NULL && reader.layout.sections == NULL);
+    cleanup(root);
+}
+
+static void test_two_modules_open(void) {
+    char root[] = "test_qpack_two_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    write_fixture(root, two_module_layout, "QPACK", 32768, 4, 8,
+                  COLI_AFFINE_SCALAR_BF16);
+    ColiQpackReader reader;
+    char error[512] = {0};
+    CHECK(coli_qpack_open(&reader, root, error, sizeof(error)) == 0);
+    CHECK(coli_qpack_find_section(&reader, "up_proj.scales") != NULL);
+    coli_qpack_close(&reader);
+    cleanup(root);
+}
+
 static void test_affine_shape_refusal(void) {
     char root[] = "test_qpack_shape_XXXXXX";
     CHECK(mkdtemp(root) != NULL);
@@ -403,10 +512,13 @@ int main(void) {
     expect_open_failure(overflow_layout, "QPACK", 32768, "invalid shape");
     expect_open_failure(valid_layout_bf16, "QPACK", 32767,
                         "manifest size mismatch");
+    test_packed_width_refusals();
+    test_two_modules_open();
     test_affine_shape_refusal();
     test_eager_layer_validation_cleanup();
     test_embedded_nul_metadata();
     test_post_open_truncation();
-    puts("test_qpack: strict v1 metadata, fixed-stride read, affine views: ok");
+    puts("test_qpack: strict v1 metadata, packed widths, fixed-stride read, "
+         "affine views: ok");
     return 0;
 }

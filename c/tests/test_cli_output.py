@@ -297,9 +297,9 @@ class BannerModelLineTest(unittest.TestCase):
 
     def test_unknown_model_states_its_own_type(self):
         """No forcing into the roster: an unknown checkpoint speaks for itself."""
-        line = self.line({"model_type": "qwen3_moe", "num_hidden_layers": 48,
+        line = self.line({"model_type": "mixtral", "num_hidden_layers": 48,
                           "n_routed_experts": 128})
-        self.assertIn("qwen3_moe", line)
+        self.assertIn("mixtral", line)
         self.assertIn("48L x 128E", line)
         self.assertNotIn("GLM", line)
 
@@ -362,8 +362,9 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
     """Launchers size shared engines; V4 delegates to its loader-aware runtime.
 
     #805's physical-core default still covers the memory-bound sister engines.
-    DeepSeek V4 instead reserves logical CPUs for its expert-loader workers in
-    v4_omp_reserve_loader_cpus(), unless the operator overrides or disables it.
+    DeepSeek V4 sizes its own team in v4_omp_reserve_loader_cpus() (the physical
+    cores with SMT, the loaders on the siblings; else the logical CPUs less its
+    expert-loader workers), unless the operator overrides or disables it.
     """
 
     @classmethod

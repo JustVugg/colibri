@@ -42,7 +42,12 @@ jobs:
     # limit and reported as failures), including one on dev itself. The suite
     # has grown - segment conformance and adapters, the edge runtime, per-engine
     # cache indices - and MinGW is the slowest toolchain we build on.
-    timeout-minutes: 35
+    # 2026-10-05: the 35 minutes set then were reached in turn. Over the last
+    # two days the job took 21 to 34 minutes when it passed, and was cancelled
+    # at 35 three times with every test passed so far (#1907, #1911 and a dev
+    # run), after #1901 added its suites. 60 leaves room for the suites still
+    # coming; a real hang still ends the job.
+    timeout-minutes: 60
     defaults:
       run:
         shell: msys2 {0}
@@ -98,12 +103,17 @@ jobs:
         run: python -m pip install -r c/tools/requirements-mimo-tiny.txt
       - name: Generate fixture and run vendor oracle
         run: make -C c mimo-tiny-check
+      - name: "Brio and the prompt cache: photos exact against a cold engine"
+        run: make -C c mimo-tiny-serve-check
       - name: Same oracle under ASan and UBSan
         run: |
           make -C c clean >/dev/null
           make -C c mimo EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
-          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+          ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
             python c/tests/mimo_tiny_harness.py --binary c/mimo --fixture c/mimo_tiny
+          cd c && ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            python -m unittest tests.test_mimo_prefix_serve tests.test_brio_serve.MimoBrioServe \
+            tests.test_systemone_api.MimoSystemOneEndToEnd
 
   v4-tiny:
     name: Linux (generated tiny V4 target oracle)
@@ -153,6 +163,8 @@ jobs:
           cd c && COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_dashboard
           COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_context_exceeded
           COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_hostile_weights
+          COLI_GLM53_FIXTURE=/tmp/glm53_mm python -m unittest -v tests.test_glm53_hostile_weights.Glm53MatrixShapeTest
+          COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_cluster
       # The two stdlib-only oracles used to be argparse scripts that `make
       # test-python` collected as zero tests (#1700). They run here, on the
       # fixtures generated above, token-exact against transformers in f32.

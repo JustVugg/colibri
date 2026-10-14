@@ -3,6 +3,275 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.0.0] - 2026-10-06
+
+169 pull requests since v1.12.1, 88 of them from contributors. Every MoE
+engine now runs on any GPU a Vulkan driver can see: the routed experts on a
+shared device tier, the dense layers on a device chain (all of them, or the
+first N that fit), and a second GPU for more experts. Three model families
+arrive (MiMo-V2.6, Qwen3-Coder, Qwen-Image-2.1) and one dense checkpoint
+(Qwen3.8-27B). Qwen3.8 Flash Next gets int4 experts and speculative decoding
+that is on by default. Every text engine serves up to 16 conversations at once.
+The release archives carry the GPU backends. Setup is one step, and there is one
+decision API (System One).
+
+### Several conversations at once
+
+- **#1955**: every text engine serves several conversations at once (`coli serve
+  --kv-slots N`, up to 16), as GLM-5.2 and GLM-5.3 Flash did: qwen36 (Qwen3.6,
+  Qwen3-Coder, Qwen3.8-27B), qwen38, OLMoE, Inkling, Kimi K3, MiMo-V2.6,
+  DeepSeek V4 and V4.1. Each slot keeps its own conversation's state, and every
+  decode step takes the next token of each active request as one batch, so the
+  weights and experts a step reads serve all of them. A request gets the tokens
+  it gets alone, checked frame for frame on every engine, on the CPU and with
+  the expert tier. With more than one slot nothing drafts and the dense chain
+  stays off.
+
+### Vulkan on every engine
+
+- **#1830**: every engine's resident matrices run on any Vulkan GPU (fmt 10, 11
+  and 12 added), each configuration checked against the engine's own CPU run on
+  Lavapipe (`tests/vulkan_engines.sh`).
+- **#1834**: tiled GEMMs for prefill in every weight format, and a
+  cooperative-matrix GEMM where the device has one.
+- **#1840**, **#1843**: a shared routed-expert tier (`vk_tier.c`). It holds a
+  cache of experts in device memory, filled from the expert history and adapting
+  while you chat, and computes the resident experts of each step as one async
+  batch while the CPU computes the rest. First on qwen38 and qwen36, then on
+  every MoE engine: GLM-5.2, GLM-5.3 Flash, Inkling, OLMoE, Kimi K3, MiMo-V2.6,
+  DeepSeek V4 and V4.1.
+- **#1844**, **#1848**, **#1849**, **#1851**, **#1857**: the dense chain
+  (`vk_chain.c`), a layer's dense part in one submission, on qwen36, qwen38,
+  MiMo-V2.6 (sliding window and sinks on the device), OLMoE, Inkling (and
+  OLMoE's PILOT race fixed), GLM-5.2 and GLM-5.3 Flash (shared MLA, DSA, KDA and
+  mHC ops), Kimi K3, DeepSeek V4.1 and DeepSeek V4.
+- **#1871**: staged device-local uploads for cards without Resizable BAR, where
+  the mapped path failed or spilled to system RAM.
+- **#1901**: expert streaming for big prompt steps, memory budgets and
+  speculative verification on the device.
+- **#1909**, **#1913**, **#1916**, **#1918**: a partial dense chain. The first N
+  layers that fit go to the device, the CPU runs the rest, and nothing is
+  uploaded that the chain will not use, so an 8 GB card with a larger trunk keeps
+  the chain and its expert tier instead of losing both. `COLI_VK_CHAIN_LAYERS`
+  forces N, `coli plan` predicts it. DeepSeek V4, qwen36 and olmoe, qwen38,
+  GLM-5.2 and GLM-5.3 Flash.
+- **#1920**: a second GPU for the expert tier (`COLI_VK_DEV2=auto|<index>`) on
+  every MoE engine: the experts after the primary device's, each step one batch
+  per device, both in flight at once. A failing second device gives its experts
+  back to the CPU and the tier goes on with the first.
+- **#1942**: the dense chain's layers on two GPUs. With `COLI_VK_DEV2`, the
+  layers a partial chain leaves go to the second device instead of the CPU, on
+  every chain engine (qwen36, qwen38, OLMoE, MiMo-V2.6, Inkling, GLM-5.2,
+  GLM-5.3 Flash, Kimi K3, DeepSeek V4.1 and V4). `COLI_VK_CHAIN_LAYERS2` forces
+  how many, `COLI_VK_CHAIN_DEV2=0` keeps them off. A lost second device leaves
+  the CPU to run its layers, the recurrent state rebuilt where it was held.
+  Checked on Lavapipe opened twice; two real GPUs not measured yet.
+- **#1933**: `COLI_VK_KV_COLD=device` (opt-in): with the KV cache split past the
+  device's budget, the host's part of the attention runs on the device too, from
+  host memory it reads in place, so a step runs in one frame. The prompt gains
+  4-6% on a Radeon 780M, decode is slower there (hence off by default); a
+  dedicated GPU has not been measured.
+- **#1948**: several conversations at once on the dense chain. colibri's
+  multiplexed decode (`KV_SLOTS`, one row from each active conversation) runs on
+  the device: the batch's matrices as one, each row's attention over its own
+  conversation's KV mirror (up to `COLI_VK_CHAIN_MUX`, default 16, beside the
+  chain's own) with its own DSA list; two devices and the partial chain too.
+  Every frame checked against the CPU's on Lavapipe; not measured with a real
+  checkpoint yet.
+- **#1934**, **#1935**, **#1936**, **#1937**, **#1938**, **#1939** (@huppiflupp):
+  the matrix units for prompt attention and int8/int4 prompt GEMMs on the
+  chain, a step's experts as one grouped GEMM (decode: one grouped GEMV per
+  phase), qwen36's routing in parallel, and int8 decode GEMVs sized by the
+  matrix. On a Radeon 780M with Qwen3.6-35B-A3B the first token of a
+  1000-token prompt comes in 9.3 s instead of 12.6, decode 6.1 tok/s instead
+  of 5.7, perplexity unchanged.
+- **#1954**: on an Intel GPU the dense chain decoded garbage (Qwen3.6 on an Iris
+  Xe, the default there). Its pipelines now run at the subgroup size the device
+  reports; the device compiles at 8 to 32 lanes, and the chain's GEMVs had run
+  at another width than the one they read. On Windows the chain also finds its
+  optional shaders (MLA, KDA, mHC, DeepSeek V4, the split KV cache), and the
+  split cache frees its host memory with the matching call.
+- **#1911**: `COLI_VK_DEV=<index>` picks the device on a machine with two GPUs of
+  the same kind; the cooperative GEMM's epilogue stride is aligned to 16 bytes, a
+  validation error on some drivers (#1908).
+- **#1846** (@crichalchemist): correct expert-batch results under MoltenVK's
+  default mode.
+- **#1762**, **#1763** (@Kenneth-Javier): the Vulkan loader linked on Windows
+  under `-static`, and the Vulkan objects linked into every engine-including
+  test rule.
+
+### Models
+
+- **#1813**, **#1819**, **#1820**, **#1827**, **#1835**: MiMo-V2.6 (Flash and
+  Pro): the engine, the vision tower, tool calling and Brio mode with logprobs,
+  read as released; Pro verified against Xiaomi's reference on the real
+  checkpoint, and `coli serve` names the loaded variant.
+- **#1828**, **#1829**: Qwen3-Coder-30B-A3B (`qwen3_moe`) on the qwen36 engine.
+- **#1777**, **#1779**: dense checkpoints of the Qwen3.6 family on the qwen36
+  engine (Qwen3.8-27B), text and images.
+- **#1780**: Qwen-Image-2.1, text to image: a C engine, pictures in the
+  terminal, the web app and the OpenAI images API.
+- **#1951**: Qwen-Image on the GPU and a faster start. The weights load in
+  7.5 s instead of 34 (four layers at once, quantized straight from bf16, the
+  same int8 bytes). With Vulkan every block of a denoising step runs on the
+  device, its attention included, and the VAE decodes there too; a card that
+  does not hold the 7.1 GB transformer keeps the blocks that fit and streams
+  the others each step. On a Radeon 780M a 512x512 image takes 61 s instead of
+  112 and a 1024x1024 step 38 s instead of 67; every stage checked against the
+  diffusers reference.
+- **#1831**: Qwen3.8 Flash Next's routed experts as int4-g64: 1.4 to 1.56x
+  decode.
+- **#1832**, **#1917**: speculative decoding with the checkpoint's MTP head,
+  lossless, +12-14% on the release; with #1917 it is on by default with prompt
+  lookup on every engine that has it (`Q38_MTP=0`, `COLI_LOOKUP=0` turn them
+  off), and `coli plan` counts the MTP head's memory.
+- **#1814**: Inkling reads the embedding norm under the name transformers 5.18
+  writes.
+
+### System One: one decision API
+
+- **#1856**: `POST /v1/systemone`, one decision API, and the Laya decision
+  engine; `/v1/brio` is removed.
+- **#1868**: GLiNER2.5-Decide as a native decision engine (DeBERTa-v3 and
+  GLiNER2's head).
+- **#1872**: Clef as a native decision model on qwen36, a joint head over
+  Qwen3.8-27B, with a 16-bit dense mode.
+- **#1743**: the brio serve gates run in CI against the converted fixture.
+- **#1753** (@tarazum): brio normalizes to sum by default and warns when a mean
+  mixes option token counts.
+
+### Setup and the CLI
+
+- **#1953**: the release archives carry the GPU backends: every Linux and
+  Windows engine built with Vulkan and its shaders, the macOS engines with
+  Metal, and a Windows CUDA package (`coli_cuda.dll` for compute 8.0 and newer,
+  with colibri, qwen36 and kimi_k3 built to load it). The Vulkan loader is
+  opened at run time, so these engines still start on a machine without one,
+  on the CPU. `coli setup` uses them without a Vulkan toolchain.
+
+- **#1842**: one-step install and start (`start-here`, `coli setup`), the
+  `AI_SETUP.md` guide and an MCP server.
+- **#1850**, **#1896**: setup picks the backend that works on the machine: on an
+  integrated GPU, Vulkan only where it was measured faster; CUDA only when the
+  toolkit builds for the card, Vulkan otherwise, and a failed build falls back.
+- **#1903**: an engine already built is brought up to date with `make` before it
+  is used (a `git pull` used to keep running the old binary), and `coli logs`
+  says where a foreground server prints (#1852).
+- **#1919**: a fresh install of Qwen3.6-35B-A3B or Qwen3.8 Flash Next gets a
+  starting expert history, so its first run fills the GPU tier from the start:
+  on a Radeon 780M Qwen3.6's first run went from about 6 to 11 tok/s.
+- **#1817**: in `coli chat`, a line that starts with a picture's path is a
+  message, not a command.
+- **#1959** (@rudycelekli): `coli setup` counts a server on its port as a running
+  colibri only when `/health` answers as colibri does; another program's HTTP 200
+  no longer passes for one, and the setup starts its own on the next free port.
+- **#1315** (@Avicennasis): resumable, hash-verified qpack installers for
+  Hugging Face and static mirrors.
+- **#1316** (@Avicennasis): the planner honours cgroup memory limits.
+- **#1949**: on Windows every engine has its bare `make <engine>` target (six
+  fell to make's built-in rule and linked without CUDA or Vulkan, #1945,
+  #1900); `coli setup` prefers an MSYS2 that can build Vulkan over a PATH
+  compiler that cannot, and installs libgomp; `COLI_VK_DENSE=0` keeps the dense
+  chain off too (on an 8 GB laptop it had taken the expert tier's budget,
+  #1900); DeepSeek V4 uses the physical cores on an SMT machine (+10% decode on
+  a Threadripper, #1906); `coli plan` leaves a card below an engine's CUDA
+  floor out; the server says why its engine stopped (#1941); clearer messages
+  for a missing model and a CUDA DLL that does not load.
+
+### The serve contract
+
+- **#1353** (@monotophic): `logprobs`, `top_logprobs` and `echo` on the OpenAI
+  endpoints, aligned by raw-stream span.
+- **#1794**, **#1767**: Qwen3.6 tool calling, and the template's
+  `preserve_thinking` rendered so standard clients get KV prefix reuse.
+- **#1802** (@bherald): opt-in strict GLM tool-call parsing.
+- **#1765** (@SulimanAbdulrazzaq): GLM-5.3's reasoning stays out of the
+  `/v1/messages` answer.
+- **#1791**, **#1793** (@Avicennasis): Anthropic image blocks are served and a
+  tool result's picture is not dropped; the modalities a model card claims are
+  the ones the engine loaded.
+- **#1787**, **#1804** (@benmaster82): unsupported OpenAI result shaping is
+  refused; the completions keepalive streams as a text chunk.
+- **#1782**, **#1783**, **#1785**, **#1786** (@kevin9327): malformed tool calls,
+  text parts, tools, messages and image URLs answer 400 instead of 500.
+- **#1809** (@Stamina9): non-string brio message text is refused.
+- **#1749**, **#1751**, **#1789**, **#1803** (@enitimeago): glm53 reports REUSE
+  in detail and logs CANCEL, does not restore a pin over rows another branch
+  rewrote, handles cancellation during prompt processing, and continues from the
+  cache instead of prefilling again.
+
+### Correctness and security
+
+- **#1930**: hardening of three input paths. The files the engines keep beside a
+  model (`.coli_kv`, `.coli_usage.tmp`, `hot_pinned.bin`, `.coli_ckpt/`) are
+  opened without following a symlink and only as regular files, so a link
+  planted in a downloaded model directory no longer redirects the engine's
+  writes. Request grammars are limited to 32767 alternates and symbols per rule
+  (past that the walker's index wrapped) and are refused with a message.
+  colibri, kimi_k3 and deepseek_v41 check the indexer's and RoPE's head
+  dimensions in the config.
+- **#1739**, **#1740**, **#1754**, **#1755**, **#1854**, **#1855**
+  (@namespaceMarcello): the published advisory fixes carried to glm53, qwen36 and
+  deepseek_v41; glm53 refuses f32 tensors shorter than the config reads and
+  matrices whose shape differs from it; deepseek_v41 keeps engram lookups inside
+  their table; qwen36 gives the same logits at every expert-cache capacity on FMA
+  builds and never evicts an expert a MoE run is still reading.
+- **#1775**: the DeepSeek V4/V4.1 pre-tokenizer in `tok.h`, so Turkish
+  tokenizes as HF does.
+- **#1799** (@RayanR000): the DeepSeek V4.1 reference sends top-k ties to the
+  lowest index and its indexer never keeps -inf.
+- **#1812** (@ZacharyZcR): the shared-expert bindings of DeepSeek V4's fused MoE.
+- **#1611** (@Cometbuster4969): OLMoE uses the shared RAM probe, with a
+  plausibility floor.
+- **#1744**, **#1745** (@kevin9327): a numeric `node_id` no longer kills the
+  cluster's topology and health requests, and a manifest that is not a JSON
+  object no longer crashes the experiments validator.
+- **#1356** (@monotophic): the ablation scoring mode replaced by a checked,
+  digest-bound one.
+- **#1904**: DeepSeek V4's `PROF` measures the expert wait instead of printing 0
+  and folding it into `attention_s` (#1852).
+- **#1902**: Windows expert prefetch is asynchronous and its queued work bounded.
+
+### Speed on the CPU
+
+- **#1837**: every engine's per-token projections run per block of rows in
+  prefill.
+- **#1761** (@mfethe1): a NEON arm for batched `matmul_fp8`, bit-exact, 6 to 10x
+  at prefill shapes.
+- **#1790**, **#1798** (@RayanR000): the f32 matmul runs eight `fmaf` chains at
+  once with the same bits on every FMA build, and one vectorized f32 matmul
+  serves quant.h, olmoe, inkling and qwen36 (#442).
+- **#1773** (@JackKnifeAI): glm53's dense prefill batched, bit-identical per
+  token.
+- **#1784** (@kreuzzelg): qwen36's DeltaNet layer on the card
+  (`Q36_DN_GPU=1`), expert homes per layer range (`QT_HOME=layer`), the shared
+  expert offered on request.
+- **#1323**, **#1343** (@Avicennasis): qwen36 reads routed experts from a qpack
+  container through bounded Metal slots, and MLX-affine dense weights and norms.
+- **#1261** (@Kenneth-Javier): an optional explicit AMD XDNA2 lane for the GLM
+  shared expert.
+
+### Build, tests and CI
+
+- **#1758** (@Kenneth-Javier): header prerequisites generated with `-MMD -MP`
+  (#1741).
+- **#1845**, **#1912**: the sanitizer runs and the bf16 gates hold on AVX-512
+  runners, whose CPUs keep bf16 on the CPU.
+- **#1914**: the Windows UCRT64 job's limit from 35 to 60 minutes.
+- **#1795**, **#1821**, **#1836**, **#1839**: four flaky tests made
+  deterministic.
+
+### Docs
+
+- **#1897**, **#1833**: the README rewritten for the release (one-step setup,
+  models per machine, GPUs, System One) in five languages, with the site.
+- **#1768**, **#1776**: every engine in the environment reference, DeepSeek V4.1
+  in its own section, and the weights-from-disk options.
+- **#1788** (@jamshaid120): duplicate entries removed from the DeepSeek V4 docs.
+- **#1801** (@benmaster82): the web app's image alt count and German image
+  labels.
+- **#1738**: the 1.12.1 entry's pull request count corrected.
+
 ## [1.12.1] — 2026-09-24
 
 96 pull requests since v1.12.0, 80 of them from contributors. Two tokenizers

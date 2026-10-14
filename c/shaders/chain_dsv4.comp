@@ -1,0 +1,561 @@
+#version 450
+// DeepSeek V4.1 Flash's (and DeepSeek V4's) attention on the dense chain (vk_chain.c,
+// chain_dsv4; vk_chain.h: vkc_dsv4_*). The model is MQA over one KV row per position:
+// a sliding window of raw rows plus compressed rows a DSA indexer picks. Ten modes:
+//
+// mode 0, sparse attention with a sink (sparse_attn.h, coli_sparse_attend): one
+//   workgroup per (head h, row s). The row's list is list[l_off + s*l_row + j], j < cnt:
+//   an entry e < 0 is skipped, e < nwin reads the window ring's row e (win at w_off +
+//   e*hd), any other the compressed row e - nwin (cmp at c_off + ...). Per entry
+//   score = (q . k) * scale (the dot in the CPU scalar path's order), best = the largest
+//   score (-1e30 when none), w = exp(score - best), denom = exp(sink[h] - best) + the w in
+//   list order, out = (sum of w * k in list order) / denom. A row with no entry gives 0.
+//   flags 1 (DeepSeek V4): w rounds to bf16 before the value sum (the denominator keeps it
+//   whole), and the output rounds to bf16.
+// mode 1, RoPE on interleaved pairs in place (deepseek_v41.c rope_apply): segment g at
+//   x_off + row*x_row + j*x_seg (row = g / per_row, j = g % per_row), its first rd floats;
+//   pair i: a = x[2i], b = x[2i+1], (cos, sin) = cs[cs_off + row*cs_row + 2i, +1], the
+//   sine negated when inverse; x[2i] = a*cos - b*sin, x[2i+1] = a*sin + b*cos. flags 1:
+//   both round to bf16 after (DeepSeek V4).
+// mode 2, the compressor's rolling group (model.py Compressor, its decode form, which a
+//   prefill reproduces): one workgroup; the S rows in order, row s at position pos =
+//   pos_base + s writes its kv and score rows (P floats each; score + ape[slot] when
+//   ape_off >= 0) into ring row slot = pos % ratio (ratio + slot when overlap), and when
+//   (pos + 1) % ratio == 0 pools channel d < D over the ring rows (with overlap, the
+//   first ratio rows read column d and the next ratio rows column D + d):
+//   best = max score, out[pos / ratio][d] = sum(exp(score - best) * kv) / sum(exp(...)),
+//   the sums in ring-row order; with overlap the second half of the ring then moves to
+//   the first. The ring: kv rows at ring_off, score rows after them ((1+overlap)*ratio
+//   rows of P each).
+// mode 3, the indexer's scores (deepseek_v41.c indexer_run): one workgroup per row s,
+//   position pos = pos_base + s, lens = (pos + 1) / ratio. For j < width: j < lens (and
+//   mask[mask_off + s*mask_row + j] != 0 when mask_row > 0) scores sum_h [dot > 0] dot *
+//   w_h, dot = q_h . key[j] (k_off + j*k_row), w_h = hw[w_off + s*w_row + h] * wscale; any
+//   other j scores -inf. Into sc[sc_off + s*sc_row + j]. Limits: IH <= 64, IH*ID <= 4096.
+// mode 4, the candidate blocks (model.py select_candidate_blocks): one workgroup per row
+//   s: the best score of each block of `block` columns of the row's first `width`, the
+//   block holding column lens - 1 pinned (+inf), then min(topb, blocks) times the best
+//   block above -inf (the lower block on a tie), each kept whole: mask[s*mask_row + j] =
+//   1 for its columns, 0 elsewhere. Limit: 4096 blocks.
+// mode 5, the top-k: one workgroup per row s: keep = min(topk, the scores above -inf);
+//   the keep largest, ties to the lower column (the CPU's selection), written as base + j
+//   to list[l_off + s*l_row + k], k < keep, in ascending column order (order 0) or by
+//   rank, score then column (order 1); -1 in the slots after them up to topk. The
+//   threshold is found by bisection on order-keeping integer keys (-0 counts as +0).
+// mode 6, the engram gate (deepseek_v41.c engram_run): one workgroup per (stream c, row
+//   s): x = the stream (x_off + s*x_row + c*D), key = kv[s][c*D..], value = kv[s][H*D..];
+//   r = 1/sqrt(mean(x^2) + eps) * 1/sqrt(mean(key^2) + eps), t = sum(x * qw * kw * key)
+//   * r / sqrt(D), g = sigmoid(sign(t) * sqrt(max(|t|, 1e-6))); x += g * value.
+// mode 7, DeepSeek V4's roundings over segments: segment g (row g / per_row, index
+//   j = g % per_row) is len floats at x_off + row*x_row + j*x_seg, written to y at
+//   y_off + row*y_row + j*y_seg (in place when x is y). Each kind as the engine's C:
+//   kind 0, bf16 (coli_bf16_round). One thread per value.
+//   kind 1, E4M3 per block of `block` values (coli_fp8_activation_qdq_ref): amax floored
+//     at 1e-4, the scale 2^e with e the smallest for which amax <= 448 * 2^e, each value
+//     times 2^-e clamped to +-448, rounded to E4M3 (nearest even, steps of 2^-9 below
+//     2^-6) and times 2^e back. One workgroup per (segment, block), block <= 256.
+//   kind 2, E2M1 per block (coli_fp4_activation_qdq_ref): amax floored at 6 * 2^-126, the
+//     scale 2^e smallest for which amax <= 6 * 2^e, each value times 2^-e clamped to +-6
+//     and rounded to the nearest of 0, 0.5, 1, 1.5, 2, 3, 4, 6 (a tie to the smaller,
+//     zero as +0), times 2^e. One workgroup per (segment, block), block <= 256.
+//   kind 3, the Hadamard transform (coli_hadamard_bf16_ref): butterflies of width 1, 2,
+//     4, ... in place in the CPU's order, then each value times hscale (the host's
+//     1 / sqrtf(len)) to bf16. One workgroup per segment, len a power of two <= 4096.
+//   flags 1 (kinds 1 and 2): the result to bf16 after. Every step is exact in f32 or
+//   rounds once as the CPU does, so the result is the CPU's bit for bit.
+// mode 8, DeepSeek V4's SwiGLU between the shared expert's roundings (coli_v4_swiglu):
+//   over n values g = bf16(a[a_off + i]), u = bf16(b[b_off + i]); with lim > 0,
+//   g = min(g, lim) and u = clamp(u, -lim, lim); y[y_off + i] = bf16(g * sigmoid(g) * u),
+//   the sigmoid in the CPU's stable form.
+// mode 9, mode 3 for queries above 4096 floats (DeepSeek V4's 64 heads of 128): the
+//   queries read from memory instead of staged, the sums in mode 3's order (the same
+//   bits). Limit: IH <= 4096.
+// Offsets and strides in floats (ints for lists and masks).
+#extension GL_KHR_shader_subgroup_basic : enable
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float b0[]; };   // q, kv rows, iq, scores, engram kv
+layout(std430, binding = 1) readonly buffer B1 { float b1[]; };   // window ring, score rows, hw, prm
+layout(std430, binding = 2) readonly buffer B2 { float b2[]; };   // compressed rows, index keys
+layout(std430, binding = 3) readonly buffer L3 { int l3[]; };     // attention list, score mask
+layout(std430, binding = 4) readonly buffer B4 { float b4[]; };   // sinks, ape, cos/sin
+layout(std430, binding = 5) buffer Y5 { float y5[]; };            // outputs (in place for 1, 6)
+layout(std430, binding = 6) buffer I6 { int i6[]; };              // top-k list, candidate mask
+layout(std430, binding = 7) buffer R7 { float r7[]; };            // the compressor's ring
+
+layout(push_constant) uniform P { int v[32]; } p;
+#define MODE p.v[0]
+
+shared float sm[4160];
+shared float red[256];
+shared uint cnt[256];
+
+#define NEG_INF uintBitsToFloat(0xff800000u)
+#define POS_INF uintBitsToFloat(0x7f800000u)
+
+float bf16r(float f) {   // round to nearest even, as coli_bf16_round
+    uint u = floatBitsToUint(f);
+    if ((u & 0x7f800000u) != 0x7f800000u) u += 0x7fffu + ((u >> 16) & 1u);
+    return uintBitsToFloat(u & 0xffff0000u);
+}
+float sig(float v) {
+    if (v >= 0.0) { float d = exp(-v); return 1.0 / (1.0 + d); }
+    float g = exp(v);
+    return g / (1.0 + g);
+}
+uint okey(float f) {
+    uint u = floatBitsToUint(f);
+    if (u == 0x80000000u) u = 0u;
+    return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
+}
+uint wsum(uint v, int tid) {
+    cnt[tid] = v;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) cnt[tid] += cnt[tid + off];
+        barrier();
+    }
+    uint t = cnt[0];
+    barrier();
+    return t;
+}
+uint wscan(uint v, int tid) {   // exclusive, in thread order
+    cnt[tid] = v;
+    barrier();
+    for (int off = 1; off < 256; off <<= 1) {
+        uint a = tid >= off ? cnt[tid - off] : 0u;
+        barrier();
+        cnt[tid] += a;
+        barrier();
+    }
+    uint incl = cnt[tid];
+    barrier();
+    return incl - v;
+}
+
+// ---- mode 0 ------------------------------------------------------------------------
+void attend() {
+    int h = int(gl_WorkGroupID.x), s = int(gl_WorkGroupID.y), tid = int(gl_LocalInvocationID.x);
+    int S = p.v[1], H = p.v[2], hd = p.v[3], n = p.v[4];
+    if (s >= S || h >= H) return;
+    int lb = p.v[5] + s * p.v[6], nwin = p.v[7], woff = p.v[8], coff = p.v[9];
+    int qb = p.v[10] + s * p.v[11] + h * hd, ob = p.v[12] + s * p.v[13] + h * hd;
+    float sink = b4[p.v[14] + h];
+    int flags = p.v[15];
+    float scale = intBitsToFloat(p.v[16]);
+    for (int i = tid; i < hd; i += 256) sm[i] = b0[qb + i];
+    barrier();
+    float best = -1.0e30;
+    for (int j = tid; j < n; j += 256) {
+        int e = l3[lb + j];
+        float sc = NEG_INF;
+        if (e >= 0) {
+            float d = 0.0;
+            if (e < nwin) { int kb = woff + e * hd; for (int i = 0; i < hd; i++) d += sm[i] * b1[kb + i]; }
+            else { int kb = coff + (e - nwin) * hd; for (int i = 0; i < hd; i++) d += sm[i] * b2[kb + i]; }
+            sc = d * scale;
+            if (sc > best) best = sc;
+        }
+        sm[1024 + j] = sc;
+    }
+    red[tid] = best;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off && red[tid + off] > red[tid]) red[tid] = red[tid + off];
+        barrier();
+    }
+    best = red[0];
+    barrier();
+    for (int j = tid; j < n; j += 256) {
+        float sc = sm[1024 + j];
+        sm[1024 + j] = sc > NEG_INF ? exp(sc - best) : 0.0;
+    }
+    barrier();
+    if (tid == 0) {                 // the denominator in list order, from the sink
+        float den = exp(sink - best);
+        for (int j = 0; j < n; j++) if (l3[lb + j] >= 0) den += sm[1024 + j];
+        red[0] = den;
+    }
+    barrier();
+    float den = red[0];
+    for (int i = tid; i < hd; i += 256) {
+        float acc = 0.0;
+        for (int j = 0; j < n; j++) {
+            int e = l3[lb + j];
+            if (e < 0) continue;
+            float w = sm[1024 + j];
+            if ((flags & 1) != 0) w = bf16r(w);
+            float k = e < nwin ? b1[woff + e * hd + i] : b2[coff + (e - nwin) * hd + i];
+            acc += w * k;
+        }
+        float o = acc / den;
+        y5[ob + i] = (flags & 1) != 0 ? bf16r(o) : o;
+    }
+}
+
+// ---- mode 1 ------------------------------------------------------------------------
+void rope() {
+    int t = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u);
+    int nseg = p.v[1], per_row = p.v[2], half_ = p.v[3] / 2;
+    if (t >= nseg * half_) return;
+    int g = t / half_, i = t - g * half_;
+    int row = g / per_row, j = g - row * per_row;
+    int xb = p.v[4] + row * p.v[5] + j * p.v[6] + 2 * i;
+    int cb = p.v[7] + row * p.v[8] + 2 * i;
+    float c = b4[cb], sn = b4[cb + 1];
+    if (p.v[9] != 0) sn = -sn;
+    float a = y5[xb], b = y5[xb + 1];
+    float x0 = a * c - b * sn, x1 = a * sn + b * c;
+    if ((p.v[10] & 1) != 0) { x0 = bf16r(x0); x1 = bf16r(x1); }
+    y5[xb] = x0; y5[xb + 1] = x1;
+}
+
+// ---- mode 2 ------------------------------------------------------------------------
+void compress() {
+    int tid = int(gl_LocalInvocationID.x);
+    int S = p.v[1], pb = p.v[2], R = p.v[3], P = p.v[4], D = p.v[5], ov = p.v[6];
+    int kvo = p.v[7], kvr = p.v[8], sco = p.v[9], scr = p.v[10], ape = p.v[11];
+    int oo = p.v[12], orow = p.v[13], ro = p.v[14];
+    int rows = ov != 0 ? 2 * R : R, so = ro + rows * P;
+    for (int s = 0; s < S; s++) {
+        int pos = pb + s, slot = pos % R, srow = ov != 0 ? R + slot : slot;
+        for (int c = tid; c < P; c += 256) {
+            r7[ro + srow * P + c] = b0[kvo + s * kvr + c];
+            float v = b1[sco + s * scr + c];
+            if (ape >= 0) v = v + b4[ape + slot * P + c];
+            r7[so + srow * P + c] = v;
+        }
+        if ((pos + 1) % R != 0) continue;
+        memoryBarrierBuffer();
+        barrier();
+        int g = pos / R;
+        for (int d = tid; d < D; d += 256) {
+            float best = NEG_INF;
+            for (int k = 0; k < rows; k++) {
+                int col = (ov != 0 && k >= R) ? D + d : d;
+                float v = r7[so + k * P + col];
+                if (v > best) best = v;
+            }
+            float tot = 0.0, mix = 0.0;
+            for (int k = 0; k < rows; k++) {
+                int col = (ov != 0 && k >= R) ? D + d : d;
+                float w = exp(r7[so + k * P + col] - best);
+                tot += w;
+                mix += w * r7[ro + k * P + col];
+            }
+            y5[oo + g * orow + d] = mix / tot;
+        }
+        memoryBarrierBuffer();
+        barrier();
+        if (ov != 0) {
+            for (int c = tid; c < R * P; c += 256) {
+                r7[ro + c] = r7[ro + R * P + c];
+                r7[so + c] = r7[so + R * P + c];
+            }
+            memoryBarrierBuffer();
+            barrier();
+        }
+    }
+}
+
+// ---- mode 3 ------------------------------------------------------------------------
+void score() {
+    int s = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    int pos = p.v[2] + s, lens = (pos + 1) / p.v[3];
+    int IH = p.v[4], ID = p.v[5], width = p.v[6];
+    int qb = p.v[7] + s * p.v[8], wb = p.v[9] + s * p.v[10];
+    int ko = p.v[11], kr = p.v[12], mr = p.v[13], sb = p.v[16] + s * p.v[14], mb = p.v[17] + s * mr;
+    float wscale = intBitsToFloat(p.v[15]);
+    for (int i = tid; i < IH * ID; i += 256) sm[i] = b0[qb + i];
+    for (int h = tid; h < IH; h += 256) sm[4096 + h] = b1[wb + h] * wscale;
+    barrier();
+    for (int j = tid; j < width; j += 256) {
+        float v = NEG_INF;
+        if (j < lens && (mr <= 0 || l3[mb + j] != 0)) {
+            int kb = ko + j * kr;
+            float tot = 0.0;
+            for (int h = 0; h < IH; h++) {
+                float d = 0.0;
+                for (int i = 0; i < ID; i++) d += sm[h * ID + i] * b2[kb + i];
+                if (d > 0.0) tot += d * sm[4096 + h];
+            }
+            v = tot;
+        }
+        y5[sb + j] = v;
+    }
+}
+
+// ---- mode 4 ------------------------------------------------------------------------
+void candidates() {
+    int s = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    int pos = p.v[2] + s, lens = (pos + 1) / p.v[3];
+    int width = p.v[4], blk = p.v[5], topb = p.v[6], sb = s * p.v[7], mb = s * p.v[8];
+    int blocks = (width + blk - 1) / blk;
+    for (int b = tid; b < blocks; b += 256) {
+        float top = NEG_INF;
+        for (int i = b * blk; i < (b + 1) * blk && i < width; i++) { float v = b0[sb + i]; if (v > top) top = v; }
+        sm[b] = top;
+    }
+    for (int i = tid; i < width; i += 256) i6[mb + i] = 0;
+    memoryBarrierBuffer();
+    barrier();
+    // C's (lens - 1) / block, which truncates toward zero
+    int last = lens >= 1 ? (lens - 1) / blk : (blk == 1 ? -1 : 0);
+    if (tid == 0 && last >= 0 && last < blocks) sm[last] = POS_INF;
+    barrier();
+    int wanted = min(topb, blocks);
+    for (int pick = 0; pick < wanted; pick++) {
+        // the best block above -inf, the lower one on a tie
+        float bv = NEG_INF; int bi = -1;
+        for (int b = tid; b < blocks; b += 256) {
+            float v = sm[b];
+            if (v > NEG_INF && (bi < 0 || v > bv)) { bv = v; bi = b; }
+        }
+        red[tid] = bv; cnt[tid] = uint(bi < 0 ? 0x7fffffff : bi);
+        barrier();
+        for (int off = 128; off > 0; off >>= 1) {
+            if (tid < off) {
+                float ov = red[tid + off]; uint oi = cnt[tid + off];
+                if (oi != 0x7fffffffu && (cnt[tid] == 0x7fffffffu || ov > red[tid] || (ov == red[tid] && oi < cnt[tid]))) {
+                    red[tid] = ov; cnt[tid] = oi;
+                }
+            }
+            barrier();
+        }
+        uint chosen = cnt[0];
+        barrier();
+        if (chosen == 0x7fffffffu) break;
+        int cb = int(chosen);
+        for (int i = cb * blk + tid; i < (cb + 1) * blk && i < width; i += 256) i6[mb + i] = 1;
+        if (tid == 0) sm[cb] = NEG_INF;
+        barrier();
+    }
+}
+
+// ---- mode 5 ------------------------------------------------------------------------
+void topk() {
+    int s = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    int width = p.v[2], topk_ = p.v[3], sb = s * p.v[4], lb = p.v[5] + s * p.v[6], base = p.v[7], order = p.v[8];
+    uint nv = 0u;
+    for (int j = tid; j < width; j += 256) if (b0[sb + j] > NEG_INF) nv++;
+    int valid = int(wsum(nv, tid));
+    int keep = min(topk_, valid);
+    for (int k = keep + tid; k < topk_; k += 256) i6[lb + k] = -1;
+    if (keep == 0) return;
+    // the keep-th largest key among the valid scores, bit by bit from the top
+    uint K = 0u;
+    for (int bit = 31; bit >= 0; bit--) {
+        uint cand = K | (1u << uint(bit));
+        uint c = 0u;
+        for (int j = tid; j < width; j += 256) { float v = b0[sb + j]; if (v > NEG_INF && okey(v) >= cand) c++; }
+        if (wsum(c, tid) >= uint(keep)) K = cand;
+    }
+    uint ab = 0u;
+    for (int j = tid; j < width; j += 256) { float v = b0[sb + j]; if (v > NEG_INF && okey(v) > K) ab++; }
+    int above = int(wsum(ab, tid)), need = keep - above;
+    // walk the columns in order: the selected ones (above K, or equal to it while ties are
+    // still needed, lower columns first)
+    uint seen_eq = 0u, placed = 0u;
+    for (int j0 = 0; j0 < width; j0 += 256) {
+        int j = j0 + tid;
+        float v = j < width ? b0[sb + j] : NEG_INF;
+        bool ok = v > NEG_INF;
+        uint key = ok ? okey(v) : 0u;
+        uint eq = ok && key == K ? 1u : 0u;
+        uint eq_before = wscan(eq, tid) + seen_eq;
+        bool sel = ok && (key > K || (eq == 1u && eq_before < uint(need)));
+        uint sv = sel ? 1u : 0u;
+        uint at = wscan(sv, tid) + placed;
+        if (sel) {
+            if (order == 0) i6[lb + int(at)] = base + j;
+            else sm[int(at)] = float(j);   // ranked below
+        }
+        seen_eq += wsum(eq, tid);
+        placed += wsum(sv, tid);
+    }
+    if (order == 0) return;
+    // rank order: score, then the lower column (keep <= 4096)
+    barrier();
+    for (int a = tid; a < keep; a += 256) {
+        int ja = int(sm[a]); float va = b0[sb + ja];
+        int r = 0;
+        for (int b = 0; b < keep; b++) {
+            int jb = int(sm[b]); float vb = b0[sb + jb];
+            if (vb > va || (vb == va && jb < ja)) r++;
+        }
+        i6[lb + r] = base + ja;
+    }
+}
+
+// ---- mode 6 ------------------------------------------------------------------------
+void engram() {
+    int c = int(gl_WorkGroupID.x), s = int(gl_WorkGroupID.y), tid = int(gl_LocalInvocationID.x);
+    int S = p.v[1], H = p.v[2], D = p.v[3];
+    if (s >= S || c >= H) return;
+    int kb = p.v[4] + s * p.v[5], xb = p.v[6] + s * p.v[7] + c * D;
+    int qw = p.v[8] + c * D, kw = p.v[9] + c * D;
+    float eps = intBitsToFloat(p.v[10]);
+    float xs = 0.0, ks = 0.0, dt = 0.0;
+    for (int i = tid; i < D; i += 256) {
+        float xv = y5[xb + i], kv = b0[kb + c * D + i];
+        xs += xv * xv; ks += kv * kv; dt += xv * b1[qw + i] * b1[kw + i] * kv;
+    }
+    sm[tid] = xs; sm[256 + tid] = ks; sm[512 + tid] = dt;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) { sm[tid] += sm[tid + off]; sm[256 + tid] += sm[256 + tid + off]; sm[512 + tid] += sm[512 + tid + off]; }
+        barrier();
+    }
+    float r = (1.0 / sqrt(sm[0] / float(D) + eps)) * (1.0 / sqrt(sm[256] / float(D) + eps));
+    float t = sm[512] * r / sqrt(float(D));
+    float mag = abs(t);
+    if (mag < 1.0e-6) mag = 1.0e-6;
+    float sr = sqrt(mag);
+    if (t < 0.0) sr = -sr;
+    float g = sig(sr);
+    barrier();
+    int vb = kb + H * D;
+    for (int i = tid; i < D; i += 256) y5[xb + i] = y5[xb + i] + g * b0[vb + i];
+}
+
+// ---- mode 9 ------------------------------------------------------------------------
+void score_wide() {
+    int s = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    int pos = p.v[2] + s, lens = (pos + 1) / p.v[3];
+    int IH = p.v[4], ID = p.v[5], width = p.v[6];
+    int qb = p.v[7] + s * p.v[8], wb = p.v[9] + s * p.v[10];
+    int ko = p.v[11], kr = p.v[12], mr = p.v[13], sb = p.v[16] + s * p.v[14], mb = p.v[17] + s * mr;
+    float wscale = intBitsToFloat(p.v[15]);
+    for (int h = tid; h < IH; h += 256) sm[h] = b1[wb + h] * wscale;
+    barrier();
+    for (int j = tid; j < width; j += 256) {
+        float v = NEG_INF;
+        if (j < lens && (mr <= 0 || l3[mb + j] != 0)) {
+            int kb = ko + j * kr;
+            float tot = 0.0;
+            for (int h = 0; h < IH; h++) {
+                float d = 0.0;
+                for (int i = 0; i < ID; i++) d += b0[qb + h * ID + i] * b2[kb + i];
+                if (d > 0.0) tot += d * sm[h];
+            }
+            v = tot;
+        }
+        y5[sb + j] = v;
+    }
+}
+
+// ---- mode 7 ------------------------------------------------------------------------
+float pow2(int k) { return uintBitsToFloat(uint(k + 127) << 23); }   // 2^k, -126 <= k <= 127
+// |x| <= 448: the nearest E4M3 value (ties to even), coli_e4m3fn_encode then _decode
+float e4m3r(float x) {
+    float a = abs(x), r;
+    if (a == 0.0) return x;
+    if (a >= 448.0) r = 448.0;
+    else if (a < 0.015625) {                 // below 2^-6: subnormal codes, steps of 2^-9
+        float s = a * 512.0, f = floor(s), fr = s - f;
+        if (fr > 0.5 || (fr == 0.5 && (int(f) & 1) == 1)) f += 1.0;
+        r = f * 0.001953125;
+    } else {                                 // 1.mmm x 2^E, three mantissa bits
+        uint b = floatBitsToUint(a);
+        int E = int((b >> 23) & 0xffu) - 127;
+        uint sg = 0x800000u | (b & 0x7fffffu), q = sg >> 20, rem = sg & 0xfffffu;
+        if (rem > 0x80000u || (rem == 0x80000u && (q & 1u) == 1u)) q++;
+        r = float(q) * pow2(E - 3);
+    }
+    return x < 0.0 ? -r : r;
+}
+// |x| <= 6: the nearest E2M1 value, a tie to the smaller magnitude, zero as +0 (the CPU
+// scans the codes in order and keeps the first of two equal distances)
+float e2m1r(float x) {
+    float a = abs(x), r;
+    if (a <= 0.25) return 0.0;
+    if (a <= 0.75) r = 0.5;
+    else if (a <= 1.25) r = 1.0;
+    else if (a <= 1.75) r = 1.5;
+    else if (a <= 2.5) r = 2.0;
+    else if (a <= 3.5) r = 3.0;
+    else if (a <= 5.0) r = 4.0;
+    else r = 6.0;
+    return x < 0.0 ? -r : r;
+}
+float rd_in(int i) { return p.v[13] != 0 ? y5[i] : b0[i]; }
+void roundings() {
+    int g = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x), tid = int(gl_LocalInvocationID.x);
+    int kind = p.v[1], nseg = p.v[2], per_row = p.v[3], len = p.v[4], blk = p.v[5], flags = p.v[6];
+    if (kind == 0) {
+        int t = g * 256 + tid;
+        if (t >= nseg * len) return;
+        int sg = t / len, i = t - sg * len, row = sg / per_row, j = sg - row * per_row;
+        float v = rd_in(p.v[7] + row * p.v[8] + j * p.v[9] + i);
+        y5[p.v[10] + row * p.v[11] + j * p.v[12] + i] = bf16r(v);
+        return;
+    }
+    if (kind == 3) {                         // one workgroup per segment
+        if (g >= nseg) return;
+        int row = g / per_row, j = g - row * per_row;
+        int xb = p.v[7] + row * p.v[8] + j * p.v[9], yb = p.v[10] + row * p.v[11] + j * p.v[12];
+        for (int i = tid; i < len; i += 256) sm[i] = rd_in(xb + i);
+        barrier();
+        for (int w = 1; w < len; w *= 2) {
+            for (int k = tid; k < len / 2; k += 256) {
+                int base = (k / w) * 2 * w, i = k - (k / w) * w;
+                float l = sm[base + i], r = sm[base + w + i];
+                sm[base + i] = l + r;
+                sm[base + w + i] = l - r;
+            }
+            barrier();
+        }
+        float hs = intBitsToFloat(p.v[14]);
+        for (int i = tid; i < len; i += 256) y5[yb + i] = bf16r(sm[i] * hs);
+        return;
+    }
+    // kinds 1 and 2: one workgroup per (segment, block)
+    int nblk = (len + blk - 1) / blk, sg = g / nblk, bk = g - sg * nblk;
+    if (sg >= nseg) return;
+    int row = sg / per_row, j = sg - row * per_row, i = bk * blk + tid;
+    bool live = tid < blk && i < len;
+    int xa = p.v[7] + row * p.v[8] + j * p.v[9] + i, ya = p.v[10] + row * p.v[11] + j * p.v[12] + i;
+    float v = live ? rd_in(xa) : 0.0;
+    red[tid] = abs(v);
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) red[tid] = max(red[tid], red[tid + off]);
+        barrier();
+    }
+    // m = (1 + man / 2^23) * 2^E. E4M3: 448 = 1.75 * 2^8, so m <= 448 * 2^e holds from
+    // e = E - 8 when the mantissa is at most 1.75, else from E - 7; E2M1: 6 = 1.5 * 2^2,
+    // from E - 2 when it is at most 1.5, else from E - 1. (The CPU takes the ceiling of
+    // log2 of m / 448 or m / 6, a correctly rounded quotient: the two agree.)
+    float m = kind == 1 ? max(red[0], 1.0e-4) : max(red[0], 6.0 * pow2(-126));
+    uint mb = floatBitsToUint(m), man = mb & 0x7fffffu;
+    int E = int((mb >> 23) & 0xffu) - 127;
+    int e = kind == 1 ? (man <= 0x600000u ? E - 8 : E - 7) : (man <= 0x400000u ? E - 2 : E - 1);
+    e = clamp(e, -126, 126);
+    float r = kind == 1 ? e4m3r(clamp(v * pow2(-e), -448.0, 448.0)) * pow2(e)
+                        : e2m1r(clamp(v * pow2(-e), -6.0, 6.0)) * pow2(e);
+    if ((flags & 1) != 0) r = bf16r(r);
+    if (live) y5[ya] = r;
+}
+
+// ---- mode 8 ------------------------------------------------------------------------
+void swiglu_v4() {
+    int t = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u);
+    if (t >= p.v[1]) return;
+    float g = bf16r(b0[p.v[2] + t]), u = bf16r(b1[p.v[3] + t]), lim = intBitsToFloat(p.v[5]);
+    if (lim > 0.0) { g = min(g, lim); u = max(-lim, min(u, lim)); }
+    y5[p.v[4] + t] = bf16r(g * sig(g) * u);
+}
+
+void main() {
+    int m = MODE;
+    if (m == 0) attend();
+    else if (m == 1) rope();
+    else if (m == 2) compress();
+    else if (m == 3) score();
+    else if (m == 4) candidates();
+    else if (m == 5) topk();
+    else if (m == 6) engram();
+    else if (m == 7) roundings();
+    else if (m == 8) swiglu_v4();
+    else if (m == 9) score_wide();
+}

@@ -1,0 +1,108 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+// Gated DeltaNet's recurrence with its gated RMSNorm (vk_chain.c, VKC_P_DNREC), one
+// workgroup per value head h, rows in order. The state S[h] = [KD][VD] lives on the
+// device across steps; thread v owns its column S[h][:, v] in registers for the whole
+// call (KD is a specialization constant, so the column is a register array).
+// Per row, from the convolution's output cv (q, k at key head h / (VH/KH), v at h):
+//   q, k  <- l2-normalized (eps 1e-6 inside the root), q also times qscale (1/sqrt(KD))
+//   beta  = sigmoid(b[s][h]);  decay = exp(-exp(A_log[h]) * softplus(a[s][h] + dt_bias[h]))
+//   S    *= decay;  kv = k . S;  delta = (v - kv) * beta;  S += k (x) delta;  o = q . S
+//   y[s][h*VD + v] = o * rsqrt(mean(o^2) + eps) * norm[v] * gate(z[s][h*VD + v])
+// with gate = silu (flags 0, Qwen3.6) or sigmoid (flags 1, Qwen3.8's gated norm).
+// Every column runs the CPU's own sequence of products and sums (the k loop in order);
+// the norms reduce in float where the CPU uses double.
+// snap_row >= 0: the state after that row is also written to snap (MTP verify).
+// Limits: VD <= 128 (one column per thread), KD the specialization constant; the k
+// loops are unrolled so the column stays in registers.
+layout(local_size_x = 128) in;
+layout(constant_id = 0) const int KD = 128;
+
+layout(std430, binding = 0) readonly buffer CV { float cv[]; };   // conv output rows
+layout(std430, binding = 1) readonly buffer AB { float ab[]; };   // b and a projections
+layout(std430, binding = 2) readonly buffer ZB { float z[]; };    // z projection rows
+layout(std430, binding = 3) buffer ST { float st[]; };            // state [VH][KD][VD]
+layout(std430, binding = 4) readonly buffer PB { float prm[]; };  // A_log[VH], dt_bias[VH], norm[VD]
+layout(std430, binding = 5) writeonly buffer OB { float y[]; };
+layout(std430, binding = 6) writeonly buffer SB { float snap[]; };
+
+layout(push_constant) uniform P {
+    int S, VH, KH, VD, Ktot;
+    int cv_off, cv_row;
+    int b_off, b_row, a_off, a_row;
+    int z_off, z_row, y_off, y_row;
+    int snap_row, flags;
+    float eps, qscale;
+    int st_off, snap_off, prm_off;
+} p;
+
+shared float qn[KD];
+shared float kn[KD];
+shared float red[128];
+shared float red2[128];
+
+float softplus(float x) {
+    if (x > 20.0) return x;
+    float e = exp(x);
+    return e < 1e-4 ? e - 0.5 * e * e : log(1.0 + e);     // log1p
+}
+
+void main() {
+    int h = int(gl_WorkGroupID.x);
+    int v = int(gl_LocalInvocationID.x);
+    bool own = v < p.VD;
+    int kh = h / (p.VH / p.KH);
+    float col[KD];
+    int sb = p.st_off + h * KD * p.VD, nb = p.snap_off + h * KD * p.VD;
+    [[unroll]] for (int k = 0; k < KD; k++) col[k] = own ? st[sb + k * p.VD + v] : 0.0;
+    float alog = prm[p.prm_off + h], dtb = prm[p.prm_off + p.VH + h];
+    float nw = own ? prm[p.prm_off + 2 * p.VH + v] : 0.0;
+    for (int s = 0; s < p.S; s++) {
+        int cb = p.cv_off + s * p.cv_row;
+        float qa = 0.0, ka = 0.0;
+        for (int k = v; k < KD; k += 128) {
+            float qv = cv[cb + kh * KD + k], kv = cv[cb + p.Ktot + kh * KD + k];
+            qn[k] = qv; kn[k] = kv;
+            qa += qv * qv; ka += kv * kv;
+        }
+        red[v] = qa; red2[v] = ka;
+        barrier();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (v < off) { red[v] += red[v + off]; red2[v] += red2[v + off]; }
+            barrier();
+        }
+        float qsc = 1.0 / sqrt(red[0] + 1e-6) * p.qscale;
+        float ksc = 1.0 / sqrt(red2[0] + 1e-6);
+        barrier();
+        for (int k = v; k < KD; k += 128) { qn[k] *= qsc; kn[k] *= ksc; }
+        barrier();
+        float bv = ab[p.b_off + s * p.b_row + h], av = ab[p.a_off + s * p.a_row + h];
+        float beta = 1.0 / (1.0 + exp(-bv));
+        float decay = exp(-exp(alog) * softplus(av + dtb));
+        float o = 0.0;
+        if (own) {
+            float vin = cv[cb + 2 * p.Ktot + h * p.VD + v];
+            float kvs = 0.0;
+            [[unroll]] for (int k = 0; k < KD; k++) { col[k] *= decay; kvs += kn[k] * col[k]; }
+            float delta = (vin - kvs) * beta;
+            [[unroll]] for (int k = 0; k < KD; k++) col[k] += kn[k] * delta;
+            [[unroll]] for (int k = 0; k < KD; k++) o += qn[k] * col[k];
+        }
+        red[v] = o * o;
+        barrier();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (v < off) red[v] += red[v + off];
+            barrier();
+        }
+        float r = 1.0 / sqrt(red[0] / float(p.VD) + p.eps);
+        if (own) {
+            float zv = z[p.z_off + s * p.z_row + h * p.VD + v];
+            float g = (p.flags & 1) != 0 ? 1.0 / (1.0 + exp(-zv)) : zv / (1.0 + exp(-zv));
+            y[p.y_off + s * p.y_row + h * p.VD + v] = o * r * nw * g;
+            if (s == p.snap_row)
+                [[unroll]] for (int k = 0; k < KD; k++) snap[nb + k * p.VD + v] = col[k];
+        }
+        barrier();
+    }
+    if (own) [[unroll]] for (int k = 0; k < KD; k++) st[sb + k * p.VD + v] = col[k];
+}

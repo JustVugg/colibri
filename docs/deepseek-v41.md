@@ -353,6 +353,7 @@ and costs the contention. Anything that tries again has to start from that.
 | `COLI_MODEL_DIRS` | unset | `;`/`,`-separated directories holding **distinct** shards of the same container, so it can be split across drives with no second copy (see above). |
 | `COLI_DISK_WEIGHTS` | unset (startup probe) | the split ratio, one positive weight per drive (`1,1` for an even pair). Unset measures each drive with the engine's own access pattern. |
 | `V41_DIRECT` | 1 | read experts with `O_DIRECT` instead of through the page cache. `0` is the buffered arm and the escape hatch; the two paths return identical bytes. |
+| `COLI_VULKAN` | off | `VK=1` build: the trunk on the Vulkan device and the backbone's routed experts on the shared expert tier (see "Vulkan" below; `COLI_VK_DENSE`, `COLI_VK_TIER*` in [ENVIRONMENT.md](ENVIRONMENT.md#vulkan-any-gpu-with-a-vulkan-12-driver)). With the tier on, the expert history `COLI_USAGE` is kept. |
 | `V41_ENGRAM_ROWS` | 65536 | rows of engram cache per table. The traffic is Zipfian: common 2-grams repeat constantly, so a small cache absorbs most of it. 65536 rows is 64 MB per table on the released head_dim. |
 | `V41_INDEX_OWNER` | unset | each layer scores against its own owner's index keys (see above). Changes the model's behaviour. |
 | `V41_MAX_IMAGE_TOKENS` | the checkpoint's `max_image_tokens` | a ceiling on what one image costs in prompt tokens. |
@@ -361,6 +362,44 @@ and costs the contention. Anything that tries again has to start from that.
 | `V41_DSPARK_MAX` | the checkpoint's `dspark_block_size` | how many of the drafted tokens are put in front of the main model. Fewer means a cheaper rejected round and a lower ceiling on the win. |
 | `V41_DSPARK_MINACC` | 60 | percent of drafts that must be accepted over a window of ten for drafting to continue; below it, drafts pause for 64 tokens. 60 is the measured break-even, not a guess. |
 | `V41_SPEC_FORCE` | unset | oracle mode only: draft the reference's tokens (`1`), corrupt the last one (`2`), use the head's own (`3`), corrupt the first one (`4`) or a different one each round (`5`), to exercise the verification path on a fixture whose draft head is random. |
+
+## Vulkan (`VK=1`)
+
+`make deepseek_v41 VK=1` links the shared Vulkan backend and its routed-expert tier;
+`COLI_VULKAN=1` opens the device after the weights load (no usable device: one line,
+and the run stays on the CPU). The trunk goes up in the checkpoint's own formats, fp8
+in 32x32 ue8m0 tiles and bf16, vision tower included. The backbone's routed experts go
+to the shared tier ([vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc)) as the
+container stores them, fp4 with a ue8m0 scale per 32 (MXFP4, fmt 7), with the clamped
+SwiGLU: a cache on the device that fills from the history and adapts while you chat,
+computed while the CPU computes the experts it does not hold. `moe_run_at` hands each
+block of positions to the device first, computes the other draws expert-major as
+before and the shared expert beside them, then adds every rank in rank order, the
+device's rows and the CPU's alike, and the shared expert last: the CPU path's order,
+whatever was resident. The DSpark stages keep their own experts and caches on the
+CPU; a verify's rows take the device like any others.
+
+On a device that shares the CPU's RAM (an integrated GPU, Lavapipe) the trunk stays on
+the CPU while the tier is on (`COLI_VK_DENSE=1` puts it on the device anyway). The
+engine keeps an expert history only while the tier is on (`COLI_USAGE`, default
+`<snap>/.coli_usage`, saved at every run and serve turn end): the next run's warm
+start reads its hottest experts from the container in parallel. EMAP shows a
+device-resident expert as tier 2, and each run and serve turn ends with a
+`[VK] tier deepseek_v41` line. On Lavapipe every tiny oracle, the 40-token prompt,
+DSpark at every forced acceptance and a budget that evicts give the CPU's tokens
+(`tests/vulkan_engines.sh deepseek`; `deepseek-sanitize` under ASan and UBSan), and so
+do they on an Intel Iris Xe through Mesa's Dozen, the one GPU it has run on (for
+correctness; no speed has been measured).
+
+`COLI_VK_CHAIN=1` runs every layer as the dense chain instead
+([vulkan.md](vulkan.md#deepseek-v41-flash-and-deepseek-v4-on-the-chain)): the streams,
+the attention with its window ring, compressor and indexer, the engram's projection and
+gate, the mHC sites and the shared expert on the device, one host round trip per layer
+for the router and the routed experts; the host's state stays canonical (written back
+after every forward), so rollbacks, prefix reuse and a lost device need nothing extra.
+Off by default on an integrated GPU (not measured on a V4.1 checkpoint); on the tiny
+fixtures every configuration gives the CPU's tokens (`tests/vulkan_engines.sh
+deepseek-chain`, `deepseek-chain-sanitize`).
 
 ## Reusing a turn, and why it is asked for rather than assumed
 

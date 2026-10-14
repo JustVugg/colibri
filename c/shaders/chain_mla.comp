@@ -1,0 +1,235 @@
+#version 450
+// Multi-head latent attention on the dense chain (vk_chain.c, VKC_P_MLA), three modes.
+// The weights never reach this shader: the absorbed query and the value rows are
+// per-head matmuls of the weights (chain_hgemv.comp); what is left here is the part
+// that reads the cache, and the two small row ops MLA needs around it.
+//
+// mode 0, the attention core. One workgroup per (head h = WorkGroupID.x, row s =
+// WorkGroupID.y). With qa the absorbed query (the no-position query times the key
+// half of kv_b, in the latent space, K floats) and qr the rotated part (R floats):
+//   score_t = (qa . L[t] + qr . Rc[t]) * scale       over the row's positions
+//   clat    = sum_t softmax(score)_t L[t]             (K floats, the latent context)
+// L is the latent cache ([cap][lat_row], the normalized latent of every position),
+// Rc the rope cache ([cap][rope_row], the rotated shared key). The positions are
+// kv_start..pos_base+s (causal), or the row's selection list: sel[sel_off + s*sel_row]
+// = count, then the positions (a DSA indexer's choice); a negative count means the
+// causal range, a negative entry is skipped. A row with no position gets clat = 0.
+// The softmax runs online over tiles of 64 positions (running max and sum, the
+// accumulator rescaled when the max grows), so no score row is stored and a context
+// of any length costs one pass over the cache. The CPU normalizes first, then sums:
+// the two agree to rounding. Limits: K <= 1024, R <= 128.
+//
+// mode 1, RoPE over segments from a host table, in place or into another buffer.
+// Segment g: row g / per_row, j = g % per_row, at x_off + row*x_row + j*x_seg (the
+// same for y). Its first rd floats rotate with (c, s) = cs[cs_off + row*cs_row + 2i],
+// cs[... + 1] for i < rd/2; the rest of the segment (seg_len - rd floats) is copied
+// when y is another buffer (copy_rest). style 0: rotate-half, a = x[i], b = x[i + rd/2];
+// style 1: interleaved pairs in, halves out, a = x[2i], b = x[2i+1] (GLM, DeepSeek):
+//   y[i] = a*c - b*s,  y[i + rd/2] = b*c + a*s
+// One workgroup per segment, so the pairs can be read before any is written (rd <= 256).
+//
+// mode 2, LayerNorm over segments (a DSA indexer's key norm): y = (x - mean) * r * w
+// + b with r = 1 / sqrt(var + eps), weight at w_off, bias at b_off when has_b. One
+// workgroup per segment, laid out as in mode 1. The CPU sums in double (colibri) or in
+// float in order (glm53); this is a float tree: they agree to rounding.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer QA { float qa[]; };     // mode 0: absorbed query; 1, 2: x
+layout(std430, binding = 1) readonly buffer QR { float qrb[]; };    // mode 0: q's rotated part; 1: cos/sin; 2: w, b
+layout(std430, binding = 2) readonly buffer LC { float lc[]; };     // mode 0: latent cache
+layout(std430, binding = 3) readonly buffer RC { float rc[]; };     // mode 0: rope cache
+layout(std430, binding = 4) readonly buffer SL { int sel[]; };      // mode 0: selection lists
+layout(std430, binding = 5) buffer OB { float ob[]; };              // mode 0: clat; 1, 2: y
+
+// Push constants: one block of 32 words, read per mode (vk_chain.h's VkcMlaCore and
+// VkcMlaRow have the same layout).
+layout(push_constant) uniform P { int v[32]; } p;
+// mode 0
+#define S_        p.v[1]
+#define H_        p.v[2]
+#define K_        p.v[3]
+#define R_        p.v[4]
+#define POS_BASE  p.v[5]
+#define KV_START  p.v[6]
+#define QA_OFF    p.v[7]
+#define QA_ROW    p.v[8]
+#define QA_SEG    p.v[9]
+#define QR_OFF    p.v[10]
+#define QR_ROW    p.v[11]
+#define QR_SEG    p.v[12]
+#define LAT_OFF   p.v[13]
+#define LAT_ROW   p.v[14]
+#define ROPE_OFF  p.v[15]
+#define ROPE_ROW  p.v[16]
+#define SEL_OFF   p.v[17]
+#define SEL_ROW   p.v[18]
+#define O_OFF     p.v[19]
+#define O_ROW     p.v[20]
+#define O_SEG     p.v[21]
+#define SCALE     intBitsToFloat(p.v[22])
+// modes 1 and 2
+#define NSEG      p.v[1]
+#define PER_ROW   p.v[2]
+#define RD        p.v[3]
+#define SEG_LEN   p.v[4]
+#define STYLE     p.v[5]
+#define X_OFF     p.v[6]
+#define X_ROW     p.v[7]
+#define X_SEG     p.v[8]
+#define Y_OFF     p.v[9]
+#define Y_ROW     p.v[10]
+#define Y_SEG     p.v[11]
+#define CS_OFF    p.v[12]
+#define CS_ROW    p.v[13]
+#define W_OFF     p.v[14]
+#define B_OFF     p.v[15]
+#define HAS_B     p.v[16]
+#define EPS       intBitsToFloat(p.v[17])
+#define COPY_REST p.v[18]         // mode 1: y is not x, the rest of the segment is copied
+
+shared float qs[1024];
+shared float qrs[128];
+shared float sc[64];
+shared int   tp[64];
+shared float red[256];
+
+void core() {
+    int h = int(gl_WorkGroupID.x), s = int(gl_WorkGroupID.y);
+    int tid = int(gl_LocalInvocationID.x);
+    int lane = int(gl_SubgroupInvocationID), sgs = int(gl_SubgroupSize);
+    int sg = int(gl_SubgroupID), nsg = 256 / sgs;
+    int qb = QA_OFF + s * QA_ROW + h * QA_SEG, rb = QR_OFF + s * QR_ROW + h * QR_SEG;
+    for (int i = tid; i < K_; i += 256) qs[i] = qa[qb + i];
+    for (int i = tid; i < R_; i += 256) qrs[i] = qrb[rb + i];
+    int n = POS_BASE + s + 1 - KV_START;
+    bool list = false;
+    int lb = 0;
+    if (SEL_ROW > 0) {
+        lb = SEL_OFF + s * SEL_ROW;
+        int c = sel[lb];
+        if (c >= 0) { n = c; list = true; }
+    }
+    barrier();
+    float m = -3.0e38, l = 0.0;
+    float acc[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    for (int t0 = 0; t0 < n; t0 += 64) {
+        int cnt = min(64, n - t0);
+        // the tile's positions and scores: one subgroup per position, lanes split the dot
+        if (tid < 64) {
+            int t = -1;
+            if (tid < cnt) t = list ? sel[lb + 1 + t0 + tid] : KV_START + t0 + tid;
+            tp[tid] = t;
+        }
+        barrier();
+        for (int j = sg; j < cnt; j += nsg) {
+            int t = tp[j];
+            float a = 0.0;
+            if (t >= 0) {
+                int lo = LAT_OFF + t * LAT_ROW, ro = ROPE_OFF + t * ROPE_ROW;
+                for (int i = lane; i < K_; i += sgs) a += qs[i] * lc[lo + i];
+                for (int i = lane; i < R_; i += sgs) a += qrs[i] * rc[ro + i];
+            }
+            float tot = subgroupAdd(a);
+            if (lane == 0) sc[j] = t >= 0 ? tot * SCALE : -3.0e38;
+        }
+        barrier();
+        // the tile's maximum, then the weights
+        red[tid] = tid < cnt ? sc[tid] : -3.0e38;
+        barrier();
+        for (int off = 128; off > 0; off >>= 1) {
+            if (tid < off) red[tid] = max(red[tid], red[tid + off]);
+            barrier();
+        }
+        float mt = red[0];
+        barrier();
+        if (mt > -1.0e38) {   // a tile with a live position (a skipped entry scores -3e38)
+            float mn = max(m, mt);
+            float corr = m > -1.0e38 ? exp(m - mn) : 0.0;
+            if (tid < 64) sc[tid] = tid < cnt && tp[tid] >= 0 ? exp(sc[tid] - mn) : 0.0;
+            barrier();
+            red[tid] = tid < 64 ? sc[tid] : 0.0;
+            barrier();
+            for (int off = 128; off > 0; off >>= 1) {
+                if (tid < off) red[tid] += red[tid + off];
+                barrier();
+            }
+            l = l * corr + red[0];
+            for (int k = 0; k < 4; k++) {
+                int i = tid + 256 * k;
+                if (i >= K_) break;
+                float a = acc[k] * corr;
+                for (int j = 0; j < cnt; j++) {
+                    int t = tp[j];
+                    if (t >= 0) a += sc[j] * lc[LAT_OFF + t * LAT_ROW + i];
+                }
+                acc[k] = a;
+            }
+            m = mn;
+        }
+        barrier();
+    }
+    float inv = l > 0.0 ? 1.0 / l : 0.0;
+    int ob0 = O_OFF + s * O_ROW + h * O_SEG;
+    for (int k = 0; k < 4; k++) {
+        int i = tid + 256 * k;
+        if (i >= K_) break;
+        ob[ob0 + i] = acc[k] * inv;
+    }
+}
+
+void rope() {
+    int g = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x);
+    if (g >= NSEG) return;
+    int row = g / PER_ROW, j = g - row * PER_ROW;
+    int xb = X_OFF + row * X_ROW + j * X_SEG, yb = Y_OFF + row * Y_ROW + j * Y_SEG;
+    int tid = int(gl_LocalInvocationID.x), half_ = RD / 2;
+    for (int i = tid; i < RD; i += 256) red[i] = qa[xb + i];
+    barrier();
+    int cb = CS_OFF + row * CS_ROW;
+    for (int i = tid; i < half_; i += 256) {
+        float c = qrb[cb + 2 * i], sn = qrb[cb + 2 * i + 1];
+        float a = STYLE == 1 ? red[2 * i] : red[i], b = STYLE == 1 ? red[2 * i + 1] : red[i + half_];
+        ob[yb + i] = a * c - b * sn;
+        ob[yb + i + half_] = b * c + a * sn;
+    }
+    if (COPY_REST != 0) for (int i = RD + tid; i < SEG_LEN; i += 256) ob[yb + i] = qa[xb + i];
+}
+
+void lnorm() {
+    int g = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x);
+    if (g >= NSEG) return;
+    int row = g / PER_ROW, j = g - row * PER_ROW;
+    int xb = X_OFF + row * X_ROW + j * X_SEG, yb = Y_OFF + row * Y_ROW + j * Y_SEG;
+    int tid = int(gl_LocalInvocationID.x), D = SEG_LEN;
+    float a = 0.0;
+    for (int i = tid; i < D; i += 256) a += qa[xb + i];
+    red[tid] = a;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        barrier();
+    }
+    float mean = red[0] / float(D);
+    barrier();
+    a = 0.0;
+    for (int i = tid; i < D; i += 256) { float d = qa[xb + i] - mean; a += d * d; }
+    red[tid] = a;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        barrier();
+    }
+    float rr = 1.0 / sqrt(red[0] / float(D) + EPS);
+    barrier();
+    for (int i = tid; i < D; i += 256) {
+        float v = (qa[xb + i] - mean) * rr * qrb[W_OFF + i];
+        ob[yb + i] = HAS_B != 0 ? v + qrb[B_OFF + i] : v;
+    }
+}
+
+void main() {
+    if (p.v[0] == 0) core();
+    else if (p.v[0] == 1) rope();
+    else lnorm();
+}

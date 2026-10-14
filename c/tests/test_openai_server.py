@@ -17,7 +17,7 @@ from pathlib import Path
 
 import openai_server
 from family_registry import family_by_id, family_ids
-from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
+from openai_server import (APIError, engine_exit_status, APIHandler, APIServer, ClientCancelled,
                            CONTINUATION_FAMILIES, _marker_cuts,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            LOGPROBS_TOP_K_CAP, logprobs_options,
@@ -29,8 +29,9 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            parse_qwen_tool_calls,
                            read_engine_turn, render_chat, render_chat_qwen, render_chat_for_arch,
                            render_chat_glm53, render_chat_inkling, render_chat_kimi,
-                           render_chat_olmoe, render_chat_qwen,
-                           render_chat_qwen38, render_chat_v4, render_chat_dsv41,
+                            render_chat_olmoe, render_chat_qwen,
+                            render_chat_qwen38, render_chat_v4, render_chat_dsv41,
+                            render_chat_mimo,
                            _dsv4_tool_calls, serve,
                            resolve_generation_prompt, split_thinking_reply,
                            detect_chat_flavor, qwen36_has_vision,
@@ -38,8 +39,9 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            parse_tool_calls_spans, parse_arch_tool_calls_spans,
                            THINK_OPEN, THINK_CLOSE,
                            _compose_span_maps, _cut_span_map, _project_span,
-                           _keepalive_choice,
-                           stop_policy, tune_child_env)
+                            _keepalive_choice,
+                            stop_policy, tune_child_env,
+                            TOOL_CHOICE_REQUIRED_INSTRUCTION)
 
 
 def echo_record(pos, data, lp, topk):
@@ -1480,6 +1482,27 @@ class StageSpanReportingTest(unittest.TestCase):
         self.assertEqual(len(public[1]), 1)
         self.assertEqual(public[1][0]["function"]["name"], "weather")
 
+    def test_the_mimo_parser_maps_the_content_it_returns(self):
+        # The logprobs channel is open on mimo, so its parser has to say which
+        # characters of the reply survive as content: every call block, then the
+        # whitespace around what is left, exactly as the plain parse removes them.
+        tool = {"type": "function", "function": {
+            "name": "weather", "parameters": {"type": "object",
+                                              "properties": {"city": {"type": "string"},
+                                                             "days": {"type": "integer"}}}}}
+        raw = ("  Sure. <tool_call>\n<function=weather>\n<parameter=city>Rome</parameter>\n"
+               "<parameter=days>3</parameter>\n</function>\n</tool_call> then this. ")
+        with patch("openai_server.ARCH", "mimo"):
+            content, calls, box_map, content_map = parse_arch_tool_calls_spans(raw, [tool])
+            public = parse_arch_tool_calls(raw, [tool])
+        self.assertEqual(content, "Sure.  then this.")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"city": "Rome", "days": 3})
+        self._assert_map_rebuilds(raw, content, content_map)
+        self._assert_map_rebuilds(raw, "  Sure.  then this. ", box_map)
+        self.assertEqual(public[0], content)
+        self.assertEqual([c["function"] for c in public[1]], [c["function"] for c in calls])
+
     def test_the_qwen38_engine_parses_its_own_calls_with_no_flavor_set(self):
         # The native arm of the same dispatch: chat_flavor() falls back to ARCH, so a
         # qwen38 engine with no flavor recorded still reaches the qwen38 parser.
@@ -2206,9 +2229,30 @@ class DispatcherTest(unittest.TestCase):
             engine = Engine("glm", "model")
         with self.assertRaisesRegex(RuntimeError, "DATA size"):
             engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
-        with self.assertRaisesRegex(RuntimeError, "dispatcher stopped"):
+        # the cause comes with every later failure, not only "dispatcher stopped" (#1941)
+        with self.assertRaisesRegex(RuntimeError, "dispatcher stopped: .*DATA size"):
             engine.generate("again", 4, 0.7, 0.9, lambda _: None)
         engine.close()
+
+    def test_an_engine_that_dies_names_its_exit_status(self):
+        def respond(process, frame):
+            process.returncode = -9          # the out-of-memory killer, as #1941 may have met
+            process.stdout.close()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "exited unexpectedly .*signal 9, SIGKILL"):
+            engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        with self.assertRaisesRegex(RuntimeError, "dispatcher stopped: .*signal 9"):
+            engine.generate("again", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
+
+    def test_engine_exit_status_words(self):
+        self.assertEqual(engine_exit_status(1), "exit status 1")
+        self.assertIn("SIGKILL", engine_exit_status(-9))
+        self.assertEqual(engine_exit_status(0xC0000005), "exit status 0xC0000005, access violation")
+        self.assertEqual(engine_exit_status(0xC0000017), "exit status 0xC0000017, out of memory")
 
     def test_decodes_utf8_split_across_data_frames(self):
         def respond(process, frame):
@@ -2488,6 +2532,22 @@ class OpenAIHonestySetTest(unittest.TestCase):
         generation_options({"best_of": 1, "logit_bias": {}, "suffix": None,
                             "modalities": ["text"]}, 16)
 
+    def test_modalities_rejects_unsupported_or_malformed_values(self):
+        cases = (
+            ("audio", "invalid_value"),
+            ([], "invalid_value"),
+            ([7], "invalid_value"),
+            (["video"], "unsupported_value"),
+            (["text", "video"], "unsupported_value"),
+        )
+        for value, code in cases:
+            with self.subTest(value=value):
+                with self.assertRaises(APIError) as caught:
+                    generation_options({"modalities": value}, 16)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.param, "modalities")
+                self.assertEqual(caught.exception.code, code)
+
     def test_intentionally_ignored_fields_return_200_and_do_not_reach_engine(self):
         base = {"model": "test-model", "prompt": "Complete me",
                 "temperature": 0, "max_tokens": 4}
@@ -2688,6 +2748,59 @@ class CapSentinelShimTest(unittest.TestCase):
                                                 context=8192, gpu_indices=[])
                 self.assertEqual(popen.call_args[0][0], ["deepseek_v41", "96"])
 
+    def test_qwen_ram_plan_reaches_engine_argv(self):
+        # Qwen3.6 and Qwen3.8 read only their argv cap. Without --cap, a tune
+        # profile or --auto-tier they started on the registry's implicit cap
+        # (8 and 1 slots a layer) while the plan for the same RAM held 100+.
+        for executable, model_type in (("qwen36", "qwen3_5_moe_text"),
+                                       ("qwen38", "qwen4_exp_text")):
+            with self.subTest(engine=executable):
+                model = self._model(model_type)
+                process = FakeProcess(lambda _process, _frame: None)
+                with patch("resource_plan.build_plan", return_value={
+                        "tiers": {"ram": {"cache_slots_per_layer": 153}}}) as planner, \
+                        patch("openai_server.subprocess.Popen", return_value=process) as popen:
+                    engine = Engine(executable, model, env={})
+                    engine.close()
+                planner.assert_called_once()
+                self.assertEqual(popen.call_args[0][0][:2], [executable, "153"])
+
+    def test_qwen_without_a_plan_keeps_the_implicit_cap(self):
+        for arch, implicit in (("qwen36", 8), ("qwen38", 1)):
+            with self.subTest(arch=arch):
+                with patch("resource_plan.build_plan", side_effect=ValueError("no safetensors shards")):
+                    self.assertEqual(cap_for_arch(arch, None, {}, model="model"), implicit)
+                with patch("resource_plan.build_plan", return_value={
+                        "tiers": {"ram": {"cache_slots_per_layer": 0}}}):
+                    self.assertEqual(cap_for_arch(arch, None, {}, model="model"), implicit)
+                with patch("resource_plan.build_plan") as planner:
+                    self.assertEqual(cap_for_arch(arch, 5, {}, model="model"), 5)
+                    self.assertEqual(cap_for_arch(arch, None, {"COLI_PROFILE_CAP": "105"},
+                                                  model="model"), 105)
+                    planner.assert_not_called()
+
+    def test_qwen_cap_never_below_one_tokens_route(self):
+        # #2031: a plan that came out empty left Qwen3.8 on its implicit cap 1
+        # (top-k 10), and every token read its experts from the disk
+        for arch, model_type, top_k, implicit in (("qwen38", "qwen4_exp_text", 10, 1),
+                                                  ("qwen36", "qwen3_5_moe_text", 8, 8)):
+            model = self._model(model_type)
+            cfg_path = Path(model) / "config.json"
+            cfg = json.loads(cfg_path.read_text())
+            (cfg.get("text_config") or cfg)["num_experts_per_tok"] = top_k
+            cfg_path.write_text(json.dumps(cfg))
+            floor = max(implicit, top_k)
+            for planned, expected in ((0, floor), (3, floor), (153, 153)):
+                with self.subTest(arch=arch, planned=planned), patch("resource_plan.build_plan", return_value={
+                        "tiers": {"ram": {"cache_slots_per_layer": planned}}}):
+                    self.assertEqual(cap_for_arch(arch, None, {}, model=model), expected)
+            with self.subTest(arch=arch, plan="fails"), \
+                    patch("resource_plan.build_plan", side_effect=ValueError("no safetensors shards")):
+                self.assertEqual(cap_for_arch(arch, None, {}, model=model), floor)
+            with self.subTest(arch=arch, cap="explicit"), patch("resource_plan.build_plan") as planner:
+                self.assertEqual(cap_for_arch(arch, 2, {}, model=model), 2)
+                planner.assert_not_called()
+
     def test_v41_explicit_and_calibrated_caps_bypass_planning(self):
         for cap, env, expected in ((7, {}, 7), (0, {}, 0),
                                    (None, {"COLI_PROFILE_CAP": "12"}, 12),
@@ -2776,6 +2889,38 @@ class HTTPTest(unittest.TestCase):
             self.request("/v1/models", key="wrong")
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
+
+    def test_models_report_the_context(self):
+        """Agents size their own compaction from the listed context (#1973's limit)."""
+        def entry():
+            with self.request("/v1/models") as response:
+                return json.load(response)["data"][0]
+        self.assertNotIn("context_length", entry())
+        self.server.context_limit = 65536
+        self.addCleanup(setattr, self.server, "context_limit", None)
+        listed = entry()
+        self.assertEqual((listed["context_length"], listed["max_model_len"]), (65536, 65536))
+        with self.request("/v1/models/test-model") as response:
+            self.assertEqual(json.load(response)["context_length"], 65536)
+
+    def test_unsupported_modalities_fail_before_engine_work(self):
+        cases = (
+            ("/v1/completions", {"prompt": "hi", "modalities": ["video"]},
+             "unsupported_value"),
+            ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],
+                                      "modalities": "audio"}, "invalid_value"),
+        )
+        for path, fields, code in cases:
+            with self.subTest(path=path):
+                calls_before = len(self.engine.calls)
+                with self.assertRaises(HTTPError) as caught:
+                    self.request(path, {"model": "test-model", **fields})
+                self.addCleanup(caught.exception.close)
+                self.assertEqual(caught.exception.code, 400)
+                error = json.load(caught.exception)["error"]
+                self.assertEqual(error["param"], "modalities")
+                self.assertEqual(error["code"], code)
+                self.assertEqual(len(self.engine.calls), calls_before)
 
     def test_a_malformed_tools_or_messages_is_a_client_error_on_every_family(self):
         """`tools: 5` or `messages: null` answered HTTP 500 on most families.
@@ -3271,6 +3416,39 @@ class HTTPTest(unittest.TestCase):
                 with patch("openai_server.ARCH", arch):
                     with self.request("/v1/chat/completions",
                                       history({"name": "fn", "arguments": "{}"})) as response:
+                        self.assertEqual(response.status, 200)
+
+    def test_past_tool_calls_that_are_not_an_array_are_a_client_error(self):
+        """A replayed assistant turn with `tool_calls: 5` answered HTTP 500 on Qwen and Kimi.
+
+        The other renderers already answer 400 "`tool_calls` must be an array.". The Qwen
+        renderer's _qwen_tool_calls and Kimi's _k3_order_tool_results iterated the value as
+        it came, and the TypeError became do_POST's 500 "The colibri engine failed to process the
+        request."
+        """
+        def history(tool_calls):
+            return {"model": "test-model", "messages": [
+                {"role": "user", "content": "run it"},
+                {"role": "assistant", "content": "", "tool_calls": tool_calls},
+                {"role": "tool", "tool_call_id": "x", "content": "done"},
+                {"role": "user", "content": "and now?"},
+            ]}
+        for arch in ("glm", "glm53", "qwen36", "qwen38", "kimi", "deepseek_v4",
+                     "deepseek_v41", "mimo"):
+            for tool_calls in (5, 1.5, True, "call", {"id": "x"}):
+                with self.subTest(arch=arch, tool_calls=tool_calls):
+                    with patch("openai_server.ARCH", arch):
+                        with self.assertRaises(HTTPError) as caught:
+                            self.request("/v1/chat/completions", history(tool_calls))
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(json.loads(caught.exception.read())["error"]["param"],
+                                     "messages.1.tool_calls")
+            with self.subTest(arch=arch, tool_calls="well formed"):
+                with patch("openai_server.ARCH", arch):
+                    with self.request("/v1/chat/completions", history([
+                            {"id": "x", "type": "function",
+                             "function": {"name": "fn", "arguments": "{}"}}])) as response:
                         self.assertEqual(response.status, 200)
 
 
@@ -3788,6 +3966,97 @@ class ToolChoiceTest(unittest.TestCase):
     def test_rejects_tool_choice_without_tools(self):
         with self.assertRaises(APIError):
             generation_options({"messages": [], "tool_choice": "required"}, 128)
+
+    # #1698 Tier 2: `required` was prompt-level on four renderers and dropped by
+    # the four others that accept it, so a client got the tools and no instruction
+    # to use them. These pin the one-line difference per renderer, because the
+    # failure is silent: the request succeeds, the model just answers in prose.
+
+    # The renderers that render a tool block and therefore have somewhere to put
+    # the instruction. Kimi K3 is absent on purpose: its wire format carries a
+    # dedicated tool-choice message rather than prose (tested below).
+    BLOCK_RENDERERS = (render_chat, render_chat_v4, render_chat_dsv41, render_chat_qwen,
+                       render_chat_qwen38, render_chat_glm53, render_chat_mimo)
+
+    def _auto_and_required(self, render, **kwargs):
+        messages = [{"role": "user", "content": "Where is order 7?"}]
+        return (render(messages, tools=ORDER_TOOL, tool_choice="auto", **kwargs),
+                render(messages, tools=ORDER_TOOL, tool_choice="required", **kwargs))
+
+    def test_required_is_auto_plus_exactly_the_instruction(self):
+        for render in self.BLOCK_RENDERERS:
+            with self.subTest(renderer=render.__name__):
+                auto, required = self._auto_and_required(render)
+                self.assertEqual(required.count(TOOL_CHOICE_REQUIRED_INSTRUCTION), 1)
+                # Nothing else moves: the instruction is the whole difference
+                # between `auto` and `required` on every one of these families.
+                self.assertEqual(
+                    required.replace(TOOL_CHOICE_REQUIRED_INSTRUCTION, "", 1), auto)
+
+    def test_required_instruction_comes_after_the_declarations(self):
+        # "the functions above" has to be true, so the instruction goes after the
+        # last declared function and not inside or before the tool block.
+        for render in self.BLOCK_RENDERERS:
+            with self.subTest(renderer=render.__name__):
+                _, required = self._auto_and_required(render)
+                self.assertLess(required.rindex("lookup_order"),
+                                required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION))
+
+    def test_required_sits_between_the_tool_block_and_the_system_text(self):
+        # Qwen3.6/3.8 build one system turn as [tool block][client system text];
+        # the instruction belongs to the tool half, so it goes between the two
+        # and not after the client's own text.
+        system = [{"role": "system", "content": "Be terse."},
+                  {"role": "user", "content": "Where is order 7?"}]
+        for render in (render_chat_qwen, render_chat_qwen38):
+            with self.subTest(renderer=render.__name__):
+                required = render(system, tools=ORDER_TOOL, tool_choice="required")
+                self.assertLess(required.index("# Tools"),
+                                required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION))
+                self.assertLess(required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION),
+                                required.index("Be terse."))
+
+    def test_mimo_required_stays_inside_the_tool_system_turn(self):
+        # MiMo's declaration block is a system turn of its own, so there is
+        # nowhere outside it to put the line: it has to land after </tools> and
+        # before that turn's <|im_end|>, or the frame closes before the model
+        # has read it.
+        _, required = self._auto_and_required(render_chat_mimo)
+        close = required.index("</tools>")
+        self.assertLess(close, required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION))
+        self.assertLess(required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION),
+                        required.index("<|im_end|>"))
+
+    def test_olmoe_required_under_the_tool_fallback(self):
+        with patch("openai_server._TOOL_FALLBACK", True):
+            auto, required = self._auto_and_required(render_chat_olmoe)
+        self.assertEqual(required.count(TOOL_CHOICE_REQUIRED_INSTRUCTION), 1)
+        self.assertEqual(required.replace(TOOL_CHOICE_REQUIRED_INSTRUCTION, "", 1), auto)
+        self.assertLess(required.rindex("lookup_order"),
+                        required.index(TOOL_CHOICE_REQUIRED_INSTRUCTION))
+
+    def test_olmoe_without_the_fallback_refuses_required(self):
+        # No tool block, so no instruction to give: the honest outcome is the
+        # 400, not a `required` that is accepted and then ignored.
+        with patch("openai_server._TOOL_FALLBACK", False):
+            with self.assertRaisesRegex(APIError, "Tool use"):
+                render_chat_olmoe([{"role": "user", "content": "Hi"}], tools=ORDER_TOOL,
+                                  tool_choice="required")
+
+    def test_inkling_refuses_required(self):
+        with self.assertRaisesRegex(APIError, "not wired up"):
+            render_chat_inkling([{"role": "user", "content": "Hi"}], tools=ORDER_TOOL,
+                                tool_choice="required")
+
+    def test_kimi_keeps_its_own_required_wording(self):
+        # Same policy, different wire format: a dedicated tool-choice message
+        # instead of prose appended to the tool block.
+        required = render_chat_kimi([{"role": "user", "content": "Hi"}],
+                                    tools=ORDER_TOOL, tool_choice="required")
+        self.assertIn("tool-choiceThe system is invoked with `tool_choice=required`.",
+                      required)
+        self.assertIn("You MUST call tools in the next message.", required)
+        self.assertNotIn(TOOL_CHOICE_REQUIRED_INSTRUCTION, required)
 
 
 class TrailingAssistantTurnTest(unittest.TestCase):
@@ -6280,6 +6549,32 @@ class LogprobsStageCompositionTest(unittest.TestCase):
         self.assertEqual("".join(entry["token"] for entry in entries),
                          choice["message"]["content"])
 
+    def test_mimo_tool_call_syntax_is_not_described_as_content(self):
+        # MiMo's call form, through the same three stages on a mimo gateway: the
+        # reasoning and the call block are cut, and the entries join back to the
+        # content the message returns.
+        call = ("<tool_call>\n<function=search>\n<parameter=q>x</parameter>\n"
+                "</function>\n</tool_call>")
+        engine = ScriptedEngine(
+            chunks=("why", "</think>", "before ", call, " after"),
+            records=[(b"why", -0.1, [(1, -0.1)]), (b"</think>", -0.2, [(2, -0.2)]),
+                     (b"before ", -0.3, [(3, -0.3)]), (call.encode(), -0.4, [(4, -0.4)]),
+                     (b" after", -0.5, [(5, -0.5)])])
+        with patch("openai_server.ARCH", "mimo"):
+            choice = self._chat(engine, enable_thinking=True, tools=[{
+                "type": "function",
+                "function": {"name": "search",
+                             "parameters": {"type": "object",
+                                            "properties": {"q": {"type": "string"}}}}}])
+        entries = choice["logprobs"]["content"]
+        self.assertEqual(choice["message"]["reasoning_content"], "why")
+        self.assertEqual(choice["message"]["content"], "before  after")
+        self.assertEqual(len(choice["message"]["tool_calls"]), 1)
+        self.assertEqual([entry["token"] for entry in entries], ["before ", " after"])
+        self.assertEqual([entry["logprob"] for entry in entries], [-0.3, -0.5])
+        self.assertEqual("".join(entry["token"] for entry in entries),
+                         choice["message"]["content"])
+
     def test_a_plain_chat_turn_describes_every_token(self):
         # The control: with no stage cutting anything, nothing is dropped.
         choice = self._chat(ScriptedEngine(chunks=("the ", "answer")))
@@ -6521,9 +6816,9 @@ class ClientVisibleEngineFaultCodeTest(unittest.TestCase):
 
 class CapabilitySplitIndependenceTest(unittest.TestCase):
     """`supports_logprobs_echo` and `supports_tok_ids` gate two unrelated SUBMIT extension
-    keys and must be settable one without the other. Both are `arch == "glm"` today, so
-    nothing short of a double with the two flags set to different values can show the
-    split is real rather than cosmetic."""
+    keys and must be settable one without the other. A mimo engine has the first and not
+    the second; the doubles below also set them apart by hand, so the split is shown to be
+    real rather than cosmetic."""
 
     def test_logprobs_is_refused_when_only_token_id_intake_is_available(self):
         base = _spawn_test_server(self, ScriptedEngine(supports_logprobs_echo=False,
@@ -6552,6 +6847,17 @@ class CapabilitySplitIndependenceTest(unittest.TestCase):
         self.assertTrue(engine.supports_tok_ids)
         engine.supports_logprobs_echo = False
         self.assertTrue(engine.supports_tok_ids)
+
+    def test_a_mimo_engine_has_the_numeric_channel_and_not_token_id_intake(self):
+        # mimo.c keeps the channel's whole contract (an ECHO for every prompt position
+        # unless a pin photo covers the prefix); it reads its frames with serve_codec.h,
+        # which has no `ids=`.
+        process = FakeProcess(lambda process, written: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("mimo", "model", cap=8, family=family_by_id("mimo"))
+        self.addCleanup(engine.close)
+        self.assertTrue(engine.supports_logprobs_echo)
+        self.assertFalse(engine.supports_tok_ids)
 
 
 class ChatFlavorLogprobsGateTest(unittest.TestCase):
@@ -7353,6 +7659,96 @@ class EngineCapsTest(unittest.TestCase):
                     self.assertIs(engine.vision, expected)
                 finally:
                     engine.close()
+
+
+class EngineLoadFailTest(unittest.TestCase):
+    """An engine that cannot load says `LOAD_FAIL kind=<kind> <detail>` and exits
+    before READY; the gateway raises the kind, not "exited unexpectedly"."""
+
+    def _engine(self, stdout_bytes, returncode=None):
+        process = FakeProcess(lambda _process, _frame: None)
+        process.stdout = BlockingStream(stdout_bytes)
+        process.stdout.close()   # the engine is gone: EOF right after what it said
+        process.returncode = returncode
+        with patch("openai_server.ARCH", "glm53"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            return Engine("glm53", "model")
+
+    def test_load_fail_line_is_raised_as_its_kind(self):
+        detail = "model-00007.safetensors: short read at EOF (off 8, 0/16 bytes)"
+        for kind in ("nomem", "io", "format", "unsupported"):
+            with self.subTest(kind=kind):
+                with self.assertRaises(openai_server.EngineLoadError) as caught:
+                    self._engine(f"LOAD_FAIL kind={kind} {detail}\n".encode())
+                self.assertEqual(caught.exception.kind, kind)
+                self.assertEqual(caught.exception.detail, detail)
+                self.assertIn(f"kind={kind}", str(caught.exception))
+                self.assertNotIn("unexpectedly", str(caught.exception))
+
+    def test_engine_that_says_nothing_is_still_exited_unexpectedly(self):
+        with self.assertRaisesRegex(RuntimeError, "exited unexpectedly") as caught:
+            self._engine(b"")
+        self.assertNotIsInstance(caught.exception, openai_server.EngineLoadError)
+
+    def test_an_engine_that_dies_at_start_names_its_exit_status(self):
+        with self.assertRaisesRegex(RuntimeError, r"exited unexpectedly \(exit status 3\)") as caught:
+            self._engine(b"", returncode=3)
+        self.assertNotIsInstance(caught.exception, openai_server.EngineLoadError)
+
+    def test_an_illegal_instruction_at_start_names_the_processor(self):
+        # #1979: a 2.0.0 engine (x86-64-v3) on a Xeon E3-1230 V2, no AVX2: the banner,
+        # then STATUS_ILLEGAL_INSTRUCTION; SIGILL on Linux. Said as a load failure, with
+        # the way forward, instead of "exited unexpectedly" and a traceback.
+        for status in (0xC000001D, -4):
+            with self.subTest(status=status):
+                with self.assertRaises(openai_server.EngineLoadError) as caught:
+                    self._engine(b"", returncode=status)
+                self.assertEqual(caught.exception.kind, "unsupported")
+                self.assertIn("instruction this processor does not have", caught.exception.detail)
+                self.assertIn("ARCH=x86-64-v2", caught.exception.detail)
+
+    def test_the_processor_check_is_a_load_failure(self):
+        detail = ("this processor has no avx2 fma, which this engine build needs; build the "
+                  "engines for it with ARCH=x86-64-v2 (docs/quickstart.md, \"Old processors\")")
+        with self.assertRaises(openai_server.EngineLoadError) as caught:
+            self._engine(f"LOAD_FAIL kind=unsupported {detail}\n".encode(), returncode=1)
+        self.assertEqual((caught.exception.kind, caught.exception.detail), ("unsupported", detail))
+
+    def test_exit_statuses_in_words(self):
+        status = openai_server.engine_exit_status
+        self.assertIn("illegal instruction", status(0xC000001D))
+        self.assertIn("SIGILL", status(-4))
+        self.assertTrue(openai_server.engine_illegal_instruction(0xC000001D))
+        self.assertTrue(openai_server.engine_illegal_instruction(-4))
+        self.assertFalse(openai_server.engine_illegal_instruction(-9))
+
+    def test_parse_load_fail_takes_the_last_line_and_keeps_the_detail_whole(self):
+        parse = openai_server.parse_load_fail
+        self.assertIsNone(parse(b"HWINFO 8 64 32 0 0 cpu|none\n"))
+        self.assertEqual(parse(b"noise\nLOAD_FAIL kind=nomem malloc 12 bytes for tensor a.b failed\n"),
+                         ("nomem", "malloc 12 bytes for tensor a.b failed"))
+        self.assertEqual(parse(b"LOAD_FAIL kind=io\n"), ("io", ""))
+
+    def test_serve_logs_the_kind_and_exits(self):
+        error = openai_server.EngineLoadError("nomem", "malloc 12 bytes for tensor a.b failed")
+        stderr = io.StringIO()
+        # serve() sets the module's ARCH / CHAT_FLAVOR for the family it resolves;
+        # patched here so the rest of the suite keeps its defaults.
+        with patch("openai_server.ARCH", openai_server.ARCH), \
+             patch("openai_server.CHAT_FLAVOR", openai_server.CHAT_FLAVOR), \
+             patch("openai_server.Engine", side_effect=error), \
+             patch("openai_server.resolve_model") as resolve, \
+             patch("openai_server.default_engine", return_value="colibri"), \
+             patch("openai_server.detect_chat_flavor", return_value=None), \
+             patch("openai_server.APIServer") as api_server, \
+             patch("sys.stderr", stderr):
+            resolve.return_value.descriptor = openai_server.family_by_id("glm53")
+            with self.assertRaises(SystemExit) as caught:
+                openai_server.serve("model", "127.0.0.1", 8000, "id", None)
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("[gateway] engine load failed: kind=nomem malloc 12 bytes for tensor a.b failed",
+                      stderr.getvalue())
+        api_server.return_value.server_close.assert_called_once()
 
 
 class ServedModalityTest(unittest.TestCase):

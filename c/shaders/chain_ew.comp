@@ -1,0 +1,75 @@
+#version 450
+// The dense chain's element-wise steps (vk_chain.c, VKC_P_EW), one op per dispatch,
+// one thread per output element (i < n). Buffers: y (written), a, b, c, e (read; any
+// may alias another or y where an op reads and writes the same element).
+//   0 ADD       y[i] = a[i] + b[i]                                   (the residual add)
+//   1 COMBINE   the MoE output joining the residual, row r = i / D, d = i % D:
+//                 t = (flags&1 ? b[r*D+d] : 0)                       (routed experts, summed on the host)
+//                 t = t + g * c[r*D+d], g = flags&4 ? sigmoid(e[r*e_row]) : 1   (flags&2: the shared expert)
+//                 y = flags&8 ? t : a[r*D+d] + t
+//               which is the CPU's order: routed in rank order, then the gated shared expert,
+//               then the residual.
+//   2 SWIGLU    y[i] = silu(a[i]) * b[i]                             (the shared expert's activation)
+//   3 HC_LOW    y[i] = silu(a[i] / fc)                               (Qwen3.8 hyper-connection read, fc = streams)
+//   4 HC_MIX    y[r*D+d] = sum_k sigmoid(a[r*W+k*D+d]) * b[r*W+k*D+d] / fc,  k < C, W = C*D
+//   5 HC_INJ    y[i] = 2 * sigmoid(a[i] / fc)
+//   6 HC_APPLY  y[r*W+k*D+d] += a[r*C+k] * b[r*D+d]                  (i over S*C*D)
+//   7 SCALE     y[i] = a[i] * fc                                     (MiMo's value scale)
+//   8 GATE_ADD  y[i] = a[i] + e[e_off + i % D] * b[i]                (Qwen-Image's gated residual,
+//                                                                     a gate per column)
+// Offsets in floats: y_off, a_off, b_off, c_off, e_off.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer YB { float y[]; };
+layout(std430, binding = 1) readonly buffer AB { float a[]; };
+layout(std430, binding = 2) readonly buffer BB { float b[]; };
+layout(std430, binding = 3) readonly buffer CB { float c[]; };
+layout(std430, binding = 4) readonly buffer EB { float e[]; };
+
+layout(push_constant) uniform P {
+    int op, n, D, C, flags, e_row;
+    int y_off, a_off, b_off, c_off, e_off;
+    float fc;
+} p;
+
+float sig(float x) { return 1.0 / (1.0 + exp(-x)); }
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u);
+    if (i >= p.n) return;
+    if (p.op == 0) {
+        y[p.y_off + i] = a[p.a_off + i] + b[p.b_off + i];
+    } else if (p.op == 1) {
+        int r = i / p.D, d = i - r * p.D;
+        float t = (p.flags & 1) != 0 ? b[p.b_off + r * p.D + d] : 0.0;
+        if ((p.flags & 2) != 0) {
+            float g = (p.flags & 4) != 0 ? sig(e[p.e_off + r * p.e_row]) : 1.0;
+            t = t + g * c[p.c_off + r * p.D + d];
+        }
+        y[p.y_off + i] = (p.flags & 8) != 0 ? t : a[p.a_off + i] + t;
+    } else if (p.op == 2) {
+        float g = a[p.a_off + i];
+        y[p.y_off + i] = (g / (1.0 + exp(-g))) * b[p.b_off + i];
+    } else if (p.op == 3) {
+        float v = a[p.a_off + i] / p.fc;
+        y[p.y_off + i] = v * sig(v);
+    } else if (p.op == 4) {
+        int r = i / p.D, d = i - r * p.D, W = p.C * p.D;
+        float v = 0.0;
+        for (int k = 0; k < p.C; k++) {
+            int j = r * W + k * p.D + d;
+            v += sig(a[p.a_off + j]) * b[p.b_off + j];
+        }
+        y[p.y_off + i] = v / p.fc;
+    } else if (p.op == 5) {
+        y[p.y_off + i] = 2.0 * sig(a[p.a_off + i] / p.fc);
+    } else if (p.op == 6) {
+        int W = p.C * p.D;
+        int r = i / W, rem = i - r * W, k = rem / p.D, d = rem - k * p.D;
+        y[p.y_off + i] += a[p.a_off + r * p.C + k] * b[p.b_off + r * p.D + d];
+    } else if (p.op == 7) {
+        y[p.y_off + i] = a[p.a_off + i] * p.fc;
+    } else if (p.op == 8) {
+        y[p.y_off + i] = a[p.a_off + i] + e[p.e_off + i % p.D] * b[p.b_off + i];
+    }
+}

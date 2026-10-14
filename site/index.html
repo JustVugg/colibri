@@ -6,7 +6,7 @@
 <title>colibri</title>
 <meta name="description" content="Run frontier open models on hardware you already own. A dependency-free C engine that streams mixture-of-experts weights from disk.">
 <meta property="og:title" content="colibri">
-<meta property="og:description" content="Run frontier open models on hardware you already own. Nine families, up to 2.8T parameters, pure C, zero dependencies.">
+<meta property="og:description" content="Run frontier open models on hardware you already own. Ten language-model families, an image model and decision models, up to 2.8T parameters, pure C, zero dependencies.">
 <meta property="og:type" content="website">
 <link rel="icon" type="image/svg+xml" href="colibri-icon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -142,6 +142,7 @@ header{position:sticky;top:0;z-index:40;background:#fff}
 .tg span.b{color:#2563eb;background:#eff6ff} .tg span.e{color:#059669;background:#ecfdf5}
 .tg span.a{color:#b45309;background:#fffbeb} .tg span.r{color:#e11d48;background:#fff1f2}
 .tg span.g{color:#525252;background:#f5f5f5}
+.tg span.s{color:#7c3aed;background:#f5f3ff}
 .mm{display:flex;gap:1.1rem;flex-wrap:wrap;margin-top:.8rem;font-size:14px;color:var(--dim)}
 .mm span,.mm a{display:inline-flex;align-items:center;gap:.35rem}
 .mm svg{width:15px;height:15px;flex:none}
@@ -154,6 +155,12 @@ header{position:sticky;top:0;z-index:40;background:#fff}
   border-radius:8px;padding:.5rem .8rem;cursor:pointer;flex:none}
 .cp:hover{background:var(--softer);color:var(--fg)}
 .mnone{color:var(--dim);padding:2rem 0}
+
+/* the one-step setup */
+.steps{margin:1.4rem 0 .4rem;padding-left:1.3rem;color:var(--body);font-size:1rem;line-height:1.6}
+.steps li{margin:.35rem 0}
+.steps b{color:var(--fg);font-weight:600}
+.mrow p code,.msec .sub code{font:400 14px var(--mono);background:var(--soft);border-radius:4px;padding:1px 5px}
 
 /* closing + footer */
 .closing{text-align:center;padding:6rem 0 7rem}
@@ -192,6 +199,7 @@ footer{border-top:1px solid var(--line)}
 [data-theme="dark"] .tg span.a{color:#fcd34d;background:#292008}
 [data-theme="dark"] .tg span.r{color:#fda4af;background:#2d0d16}
 [data-theme="dark"] .tg span.g{color:#a3a3a3;background:#1f1f1f}
+[data-theme="dark"] .tg span.s{color:#c4b5fd;background:#2e1065}
 /* the 300ms cross-fade while the theme changes, and nothing else animated */
 .theme-transition,.theme-transition *{transition:background-color .3s ease,color .3s ease,border-color .3s ease !important}
 
@@ -223,7 +231,7 @@ footer{border-top:1px solid var(--line)}
 <rect height="14" width="14" x="84" y="84" fill="#00afaf"/><rect height="14" width="14" x="98" y="84" fill="#00afaf"/><rect height="14" width="14" x="112" y="84" fill="#5fd7d7"/><rect height="14" width="14" x="126" y="84" fill="#5fd7d7"/>
 <rect height="14" width="14" x="98" y="98" fill="#00afaf"/><rect height="14" width="14" x="112" y="98" fill="#5fd7d7"/>
 <rect height="14" width="14" x="112" y="112" fill="#5fd7d7"/></g></svg><b>colibri</b></a>
-  <nav class="hnav"><a href="#models">Models</a><a href="#brio">Brio</a>
+  <nav class="hnav"><a href="#start">Get started</a><a href="#models">Models</a><a href="#systemone">System One</a>
     <a href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">Docs</a></nav>
   <label class="hsearch">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
@@ -248,8 +256,8 @@ footer{border-top:1px solid var(--line)}
     <p class="sub">colibri streams a model's experts off the disk instead of loading them, so a
       2.8-trillion-parameter model answers on a machine that could never hold it.</p>
     <div class="hcta">
-      <a class="pill d big" href="#models">Browse models</a>
-      <a class="pill g big" href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">Quickstart</a>
+      <a class="pill d big" href="#start">Get started</a>
+      <a class="pill g big" href="#models">Browse models</a>
     </div>
   </div>
   <figure class="shot">
@@ -257,38 +265,84 @@ footer{border-top:1px solid var(--line)}
            autoplay muted loop playsinline preload="metadata"
            aria-label="A real session: the terminal chat, then the same model scoring a closed set of options in the dashboard"></video>
     <figcaption>A real session, nothing staged: <code>coli chat</code> attached to a running
-      server, then the same model in brio mode. The numbers are the ones it produced.</figcaption>
+      server, then the same model in System One mode. The numbers are the ones it produced.</figcaption>
   </figure>
-</div>
 </div></section>
 
 <p class="trust">Measured today on machines people actually have</p>
 <div class="logos"><span>RTX 5090</span><span>Graviton4</span><span>Xeon Gold</span>
   <span>DGX Spark</span><span>M5 Max</span><span>Ryzen 9</span><span>Mac Mini</span></div>
 
+<section class="msec" id="start"><div class="narrow">
+  <h2>Get started in one step</h2>
+  <p class="sub">One file looks at your machine, recommends a model that fits, gets the engine,
+     downloads the model with resume and opens the dashboard. You need 8 GB of RAM at the very
+     least (16 GB or more is better) and 22 GB free on the disk for the smallest model. A
+     graphics card is optional.</p>
+  <article class="mrow">
+    <h3>Windows</h3>
+    <p class="d">On GitHub click <b>Code</b>, then <b>Download ZIP</b>, unzip it and double-click
+      <code>START-HERE.bat</code>. If Python is missing, it offers to install it for you.</p>
+  </article>
+  <article class="mrow">
+    <h3>Linux</h3>
+    <p class="d">Ubuntu and Debian; other distributions have the same packages under their own names.</p>
+    <div class="mget"><code>sudo apt install git python3 build-essential
+git clone https://github.com/JustVugg/colibri
+cd colibri
+./start-here.sh</code><button class="cp" type="button">copy</button></div>
+  </article>
+  <article class="mrow">
+    <h3>macOS</h3>
+    <p class="d">With Homebrew.</p>
+    <div class="mget"><code>xcode-select --install
+brew install libomp git python
+git clone https://github.com/JustVugg/colibri
+cd colibri
+./start-here.sh</code><button class="cp" type="button">copy</button></div>
+  </article>
+  <ol class="steps">
+    <li><b>It looks at your machine:</b> RAM, free disk, CPU and GPUs.</li>
+    <li><b>It recommends a model that fits</b>, and Enter takes it. <code>--list</code> shows every model against your machine, <code>--model ID</code> picks another.</li>
+    <li><b>It gets the engine:</b> built for your machine when a compiler is there, or the prebuilt one from the release, with Vulkan built in on Linux and Windows. It uses your GPU when that pays: CUDA for an NVIDIA card on Linux with the CUDA toolkit, otherwise Vulkan; on an integrated GPU only for the models measured faster there. A missing package is printed as the exact command to run.</li>
+    <li><b>It downloads the model</b> with resume: stop it any time, run it again and it continues.</li>
+    <li><b>It starts colibri and opens the dashboard</b>, and prints the OpenAI and Anthropic addresses for other apps. Next time it starts straight away.</li>
+  </ol>
+  <article class="mrow">
+    <h3>Or let your AI assistant do it</h3>
+    <p class="d">Ask your coding assistant the line below; it follows every step as a command and
+      asks you before downloading anything. Assistants that speak the Model Context Protocol can
+      use <code>coli mcp</code> instead.</p>
+    <div class="mget"><code>Set up colibri on this machine following docs/AI_SETUP.md from https://github.com/JustVugg/colibri</code><button class="cp" type="button">copy</button></div>
+  </article>
+  <a class="more" href="https://github.com/JustVugg/colibri#if-something-goes-wrong">If something goes wrong &rarr;</a>
+</div></section>
+
 <section class="msec" id="models"><div class="narrow">
   <h2>Models</h2>
-  <p class="sub">Pull a converted container where one is published, or point the engine at the
-     original checkpoint.</p>
-  <div class="fbar"><button class="fp" data-f="vision">vision</button><button class="fp" data-f="audio">audio</button><button class="fp" data-f="tools">tools</button><button class="fp" data-f="int4">int4</button><button class="fp" data-f="mtp">mtp</button></div>
+  <p class="sub">The ones tagged <b>setup</b> are offered by the one-step setup, which picks among
+     them by your RAM and disk. For the others, pull a converted container where one is published,
+     or point the engine at the original checkpoint.</p>
+  <div class="fbar"><button class="fp" data-f="setup">setup</button><button class="fp" data-f="decision">decision</button><button class="fp" data-f="vision">vision</button><button class="fp" data-f="audio">audio</button><button class="fp" data-f="tools">tools</button><button class="fp" data-f="int4">int4</button><button class="fp" data-f="mtp">mtp</button></div>
   <div id="mlist">
-      <article class="mrow" data-find="glm-5.2 glm-5.2 glm z.ai colibri.c moe int4 mla mtp" data-tags="moe int4 mla mtp">
-        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">glm-5.2</a></h3>
-        <p class="d">The model colibri was built around. 78 layers, 256 routed experts, streamed from disk on a machine that could never hold them.</p>
-        <div class="tg"><span class="">MoE</span><span class="e">int4</span><span class="g">MLA</span><span class="a">MTP</span></div>
+      <article class="mrow" data-find="glm-5.2 glm-5.3 glm z.ai colibri.c moe int4 mla mtp" data-tags="moe int4 mla mtp setup">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">glm-5.2 / glm-5.3</a></h3>
+        <p class="d">The model colibri was built around. 78 layers, 256 routed experts, streamed from disk on a machine that could never hold them. GLM-5.3 is the same base model on the same engine, from its own container, which has no MTP head.</p>
+        <div class="tg"><span class="s">setup</span><span class="">MoE</span><span class="e">int4</span><span class="g">MLA</span><span class="a">MTP</span></div>
         <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>744B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>40B active</span>
-          <a href="https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>container, 372 GB</a><a href="https://huggingface.co/zai-org/GLM-5.2-FP8">upstream</a>
+          <a href="https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>container, 429 GB</a><a href="https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>GLM-5.3 container, 419 GB</a><a href="https://huggingface.co/zai-org/GLM-5.2-FP8">upstream</a>
           <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>colibri.c</span></div>
         <div class="mget"><code>hf download mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp --local-dir ~/Models/glm52_i4</code><button class="cp" type="button">copy</button></div>
-      </article>
-      <article class="mrow" data-find="glm-5.3-flash glm-5.3-flash glm53 z.ai glm53.c moe int4-gs64 vision" data-tags="moe int4-gs64 vision">
-        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/glm53-flash.md">glm-5.3-flash</a></h3>
-        <p class="d">Natively multimodal. Routed experts convert to int4-gs64, the dense set stays BF16 and its precision is a load-time choice.</p>
-        <div class="tg"><span class="">MoE</span><span class="e">int4-gs64</span><span class="b">vision</span></div>
-        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>320B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>18B active</span>
-          <a href="https://huggingface.co/Justvugg/GLM-5.3-colibri-int4-g64"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>container, 419 GB</a><a href="https://huggingface.co/zai-org/GLM-5.3-Flash">upstream</a>
-          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>glm53.c</span></div>
         <div class="mget"><code>hf download Justvugg/GLM-5.3-colibri-int4-g64 --local-dir ~/Models/glm53_i4</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="glm-5.3-flash glm-5.3-flash glm53 z.ai glm53.c moe int4-gs64 vision convert" data-tags="moe int4-gs64 vision">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/glm53-flash.md">glm-5.3-flash</a></h3>
+        <p class="d">Natively multimodal. Routed experts convert to int4-gs64, the dense set stays BF16 and its precision is a load-time choice. One resumable command downloads the 328 GB release and converts it a shard at a time.</p>
+        <div class="tg"><span class="">MoE</span><span class="e">int4-gs64</span><span class="b">vision</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>321B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>18B active</span>
+          <a href="https://huggingface.co/zai-org/GLM-5.3-Flash"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>convert, 195 GB int4</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>glm53.c</span></div>
+        <div class="mget"><code>python3 c/tools/convert_glm53.py --outdir ~/Models/glm53_flash_i4 --min-free-gb 30</code><button class="cp" type="button">copy</button></div>
       </article>
       <article class="mrow" data-find="deepseek v4.1 flash deepseek-v4.1-flash deepseek_v41 deepseek deepseek_v41.c moe fp4 vision tools dspark" data-tags="moe fp4 vision tools dspark">
         <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/deepseek-v41.md">deepseek-v4.1-flash</a></h3>
@@ -299,50 +353,86 @@ footer{border-top:1px solid var(--line)}
           <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>deepseek_v41.c</span></div>
         <div class="mget"><code>hf download deepseek-ai/DeepSeek-V4.1-Flash --local-dir ~/Models/DeepSeek-V4.1-Flash</code><button class="cp" type="button">copy</button></div>
       </article>
-      <article class="mrow" data-find="deepseek v4 flash deepseek-v4-flash deepseek_v4 deepseek deepseek_v4.c moe fp4 mtp reap" data-tags="moe fp4 mtp reap">
+      <article class="mrow" data-find="deepseek v4 flash deepseek-v4-flash deepseek_v4 deepseek deepseek_v4.c moe fp4 mtp reap" data-tags="moe fp4 mtp reap setup">
         <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/deepseek-v4.md">deepseek-v4-flash</a></h3>
         <p class="d">Native fp4 experts, fp8-e4m3 dense. The REAP-pruned 150B cut, 132 of 256 experts and 85 GB, loads with the same engine and no conversion.</p>
-        <div class="tg"><span class="">MoE</span><span class="e">fp4</span><span class="a">MTP</span><span class="a">REAP</span></div>
+        <div class="tg"><span class="s">setup</span><span class="">MoE</span><span class="e">fp4</span><span class="a">MTP</span><span class="a">REAP</span></div>
         <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>284B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>13B active</span>
           <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>official, no conversion</a>
           <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>deepseek_v4.c</span></div>
         <div class="mget"><code>hf download deepseek-ai/DeepSeek-V4-Flash-0731 --local-dir ~/Models/DeepSeek-V4-Flash</code><button class="cp" type="button">copy</button></div>
       </article>
-      <article class="mrow" data-find="kimi k3 kimi-k3 kimi moonshot kimi_k3.c moe mxfp4 kda largest" data-tags="moe mxfp4 kda largest">
+      <article class="mrow" data-find="mimo-v2.6-flash mimo-v2.6 mimo xiaomi mimo.c moe mxfp4 vision tools" data-tags="moe mxfp4 vision tools setup">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/mimo.md">mimo-v2.6-flash</a></h3>
+        <p class="d">Xiaomi's hybrid: 39 of its 48 layers attend a 128-token window, so a long context costs the KV of 9. Experts stream as released in MXFP4, with no conversion. 2.34 to 3.37 tok/s on an 8-core Ryzen with 64 GB.</p>
+        <div class="tg"><span class="s">setup</span><span class="">MoE</span><span class="e">MXFP4</span><span class="b">vision</span><span class="b">tools</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>309B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>15B active</span>
+          <a href="https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-MOPD"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>official, no conversion</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>mimo.c</span></div>
+        <div class="mget"><code>hf download XiaomiMiMo/MiMo-V2.6-Flash-MOPD --local-dir ~/Models/MiMo-V2.6-Flash</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="mimo-v2.6-pro mimo-v2.6 mimo xiaomi mimo.c moe mxfp4 vision tools" data-tags="moe mxfp4 vision tools setup">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/mimo.md#pro">mimo-v2.6-pro</a></h3>
+        <p class="d">The same engine and architecture as Flash at 70 layers and 384 experts. Checked against Xiaomi's own modeling code on 32 of its 70 layers; 0.66 to 0.79 tok/s on the same 64 GB box.</p>
+        <div class="tg"><span class="s">setup</span><span class="">MoE</span><span class="e">MXFP4</span><span class="b">vision</span><span class="b">tools</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>1.02T total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>42B active</span>
+          <a href="https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-MOPD"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>official, no conversion</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>mimo.c</span></div>
+        <div class="mget"><code>hf download XiaomiMiMo/MiMo-V2.6-Pro-MOPD --local-dir ~/Models/MiMo-V2.6-Pro --exclude "dflash/*" --exclude "audio_tokenizer/*" --exclude "model_mtp.safetensors"</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="kimi k3 kimi-k3 kimi moonshot kimi_k3.c moe mxfp4 kda largest" data-tags="moe mxfp4 kda largest setup">
         <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/kimi_k3.md">kimi-k3</a></h3>
         <p class="d">The largest model colibri runs. 93 layers, 69 Kimi Delta Attention plus 24 gated MLA, and 16 of 896 experts per token. QAT-trained MXFP4 streams straight from the original shards.</p>
-        <div class="tg"><span class="">MoE</span><span class="e">MXFP4</span><span class="g">KDA</span><span class="r">largest</span></div>
+        <div class="tg"><span class="s">setup</span><span class="">MoE</span><span class="e">MXFP4</span><span class="g">KDA</span><span class="r">largest</span></div>
         <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>2.8T total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>104B active</span>
           <a href="https://huggingface.co/moonshotai/Kimi-K3"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>official, no conversion</a>
           <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>kimi_k3.c</span></div>
         <div class="mget"><code>hf download moonshotai/Kimi-K3 --local-dir ~/Models/Kimi-K3</code><button class="cp" type="button">copy</button></div>
       </article>
-      <article class="mrow" data-find="inkling inkling inkling thinking machines inkling.c moe int4 audio apache 2.0" data-tags="moe int4 audio apache 2.0">
+      <article class="mrow" data-find="inkling inkling inkling thinking machines inkling.c moe int4 audio apache 2.0" data-tags="moe int4 audio apache 2.0 setup">
         <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/inkling.md">inkling</a></h3>
         <p class="d">Sliding-window attention with short convolutions. Audio input is supported when the audio tensors are present; the dense set fits a 25 GB host at 15.3 GB.</p>
-        <div class="tg"><span class="">MoE</span><span class="e">int4</span><span class="">audio</span><span class="g">Apache 2.0</span></div>
+        <div class="tg"><span class="s">setup</span><span class="">MoE</span><span class="e">int4</span><span class="">audio</span><span class="g">Apache 2.0</span></div>
         <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>975B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>41B active</span>
-          <a href="https://huggingface.co/nbeerbower/Inkling-colibri-int4"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>container, 469 GB</a><a href="https://huggingface.co/thinkingmachines/Inkling">upstream</a>
+          <a href="https://huggingface.co/nbeerbower/Inkling-colibri-int4"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>container, 514 GB</a><a href="https://huggingface.co/thinkingmachines/Inkling">upstream</a>
           <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>inkling.c</span></div>
         <div class="mget"><code>hf download nbeerbower/Inkling-colibri-int4 --local-dir ~/Models/inkling_i4</code><button class="cp" type="button">copy</button></div>
       </article>
-      <article class="mrow" data-find="qwen3.8-flash-next qwen3.8-flash-next qwen38 alibaba qwen38.c moe block-fp8 deltanet ple" data-tags="moe block-fp8 deltanet ple">
+      <article class="mrow" data-find="qwen3.8-flash-next qwen3.8-flash-next qwen38 alibaba qwen38.c moe block-fp8 int4-g64 deltanet ple mtp" data-tags="moe block-fp8 int4-g64 deltanet ple mtp setup">
         <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/qwen38.md">qwen3.8-flash-next</a></h3>
-        <p class="d">48 layers, 512 experts, 10 routed per token. 125B of backbone plus a 51B n-gram embedding that stays pageable and a 4B MTP head; the experts stay native block-FP8. CPU only for now.</p>
-        <div class="tg"><span class="">MoE</span><span class="e">block-FP8</span><span class="g">DeltaNet</span><span class="g">PLE</span></div>
+        <p class="d">48 layers, 512 experts, 10 routed per token. 125B of backbone plus a 51B n-gram embedding that stays pageable and a 4B MTP head. The experts stay native block-FP8, or run as int4-g64 from an optional sidecar: 1.4-1.5x the decode speed at the same cache. Opt-in MTP drafting gives the same output, 12-14% faster.</p>
+        <div class="tg"><span class="s">setup</span><span class="">MoE</span><span class="e">block-FP8</span><span class="e">int4-g64</span><span class="g">DeltaNet</span><span class="g">PLE</span><span class="a">MTP</span></div>
         <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>180B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>6B active</span>
           <a href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>official, no conversion</a>
           <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>qwen38.c</span></div>
         <div class="mget"><code>hf download Qwen/Qwen3.8-Flash-Next-FP8 --local-dir ~/Models/Qwen3.8-Flash-Next-FP8</code><button class="cp" type="button">copy</button></div>
       </article>
-      <article class="mrow" data-find="qwen3.6-35b-a3b qwen3.6-35b-a3b qwen36 alibaba qwen36.c moe int4-gs64 deltanet cuda tier" data-tags="moe int4-gs64 deltanet cuda tier">
+      <article class="mrow" data-find="qwen3.6-35b-a3b qwen3.6-35b-a3b qwen36 alibaba qwen36.c moe int4-gs64 deltanet cuda tier" data-tags="moe int4-gs64 deltanet cuda tier setup">
         <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/qwen36.md">qwen3.6-35b-a3b</a></h3>
-        <p class="d">The one to start with: 20 GB on disk, gated attention interleaved with gated DeltaNet. With CUDA=1 the VRAM expert tier measured 1.44 to 10.05 tok/s on two 8 GB cards, output bit-identical to the CPU path.</p>
-        <div class="tg"><span class="">MoE</span><span class="e">int4-gs64</span><span class="g">DeltaNet</span><span class="a">CUDA tier</span></div>
+        <p class="d">The one to start with: 23 GB on disk, gated attention interleaved with gated DeltaNet. 6.0 tok/s on an 8-core desktop CPU, 9.9 with Vulkan on its integrated Radeon 780M, and 30.0 with CUDA on an RTX 3070 with the DeltaNet layers on the card.</p>
+        <div class="tg"><span class="s">setup</span><span class="">MoE</span><span class="e">int4-gs64</span><span class="g">DeltaNet</span><span class="a">CUDA tier</span><span class="a">Vulkan</span></div>
         <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>35B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>3B active</span>
-          <a href="https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>container, 20 GB</a><a href="https://huggingface.co/Qwen/Qwen3.6-35B-A3B">upstream</a>
+          <a href="https://huggingface.co/Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>container, 23 GB</a><a href="https://huggingface.co/Qwen/Qwen3.6-35B-A3B">upstream</a>
           <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>qwen36.c</span></div>
         <div class="mget"><code>hf download Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 --local-dir ~/Models/qwen36_i4_gs64</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="qwen3.8-27b qwen3.8 qwen36 alibaba qwen36.c dense int8 int4 vision tools" data-tags="dense int8 vision tools">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/qwen36.md#the-dense-27b">qwen3.8-27b</a></h3>
+        <p class="d">Dense: one MLP per layer and no router, on the Qwen3.6 engine, text and images. Every weight is read for every token, so memory bandwidth sets the speed, not the disk. With every weight in int4 it needs 18.8 GB and decoded 3.45 tok/s on a 16-thread CPU server.</p>
+        <div class="tg"><span class="g">dense</span><span class="e">int8</span><span class="b">vision</span><span class="b">tools</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>27B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>dense, all active</span>
+          <a href="https://huggingface.co/Qwen/Qwen3.8-27B"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>convert, 51 GB f16</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>qwen36.c</span></div>
+        <div class="mget"><code>python3 c/tools/convert_qwen36.py --repo Qwen/Qwen3.8-27B --out ~/Models/qwen38_27b</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="qwen3-coder-30b-a3b qwen3-coder coder code alibaba qwen36.c moe int4-gs64 tools" data-tags="moe int4-gs64 tools setup">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/qwen36.md#qwen3-coder-30b-a3b">qwen3-coder-30b-a3b</a></h3>
+        <p class="d">Qwen3-Coder on the Qwen3.6 engine: 48 attention layers, 128 experts with 8 per token, tool calls in its own XML form and no thinking. With all 128 experts cached the int4 container decoded at 8.5 to 9.6 tok/s on an 8-core Ryzen, in 15.2 GB.</p>
+        <div class="tg"><span class="s">setup</span><span class="">MoE</span><span class="e">int4-gs64</span><span class="b">tools</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>30B total</span><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>3B active</span>
+          <a href="https://huggingface.co/Justvugg/Qwen3-Coder-30B-A3B-colibri-int4"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>container, 19 GB</a><a href="https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct">upstream</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>qwen36.c</span></div>
+        <div class="mget"><code>hf download Justvugg/Qwen3-Coder-30B-A3B-colibri-int4 --local-dir ~/Models/qwen3-coder-i4</code><button class="cp" type="button">copy</button></div>
       </article>
       <article class="mrow" data-find="olmoe 1b-7b olmoe olmoe allen ai olmoe.c moe int8 open data small" data-tags="moe int8 open data small">
         <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">olmoe</a></h3>
@@ -353,6 +443,42 @@ footer{border-top:1px solid var(--line)}
           <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>olmoe.c</span></div>
         <div class="mget"><code>python3 c/tools/convert_olmoe_merged.py --repo allenai/OLMoE-1B-7B-0125-Instruct --out ~/Models/olmoe_i8</code><button class="cp" type="button">copy</button></div>
       </article>
+      <article class="mrow" data-find="qwen-image-2.1 qwen-image qwen image picture text to image alibaba qwenimage.c dit int8" data-tags="image int8 dit setup">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/qwen-image.md">qwen-image-2.1</a></h3>
+        <p class="d">Text to picture, read straight from the official diffusers checkpoint and quantized to int8 while loading. coli chat draws the image inside the terminal, coli serve answers the OpenAI images API. One 768x512 image peaks at 9.0 GB of RAM. Qwen Research License: non-commercial use only.</p>
+        <div class="tg"><span class="s">setup</span><span class="b">image</span><span class="e">int8</span><span class="g">DiT</span><span class="g">non-commercial</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>text to image</span>
+          <a href="https://huggingface.co/Qwen/Qwen-Image-2.1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>official, 33 GB, no conversion</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>qwenimage.c</span></div>
+        <div class="mget"><code>hf download Qwen/Qwen-Image-2.1 --local-dir ~/Models/Qwen-Image-2.1</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="laya convai innovations laya.c decision system one jev modernbert english" data-tags="decision">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/laya.md">laya</a></h3>
+        <p class="d">A decision model: a state and typed questions in, a calibrated probability for every option out, in one forward pass. Served on POST /v1/systemone; 219 ms for one question on a laptop CPU, in 1.7 GB of RAM. English.</p>
+        <div class="tg"><span class="b">decision</span><span class="g">ModernBERT</span><span class="g">Apache 2.0</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>421M</span>
+          <a href="https://huggingface.co/convaiinnovations/laya"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>official, 842 MB, no conversion</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>laya.c</span></div>
+        <div class="mget"><code>hf download convaiinnovations/laya model.safetensors rl_agent_config.json "encoder/*" "tokenizer/*" --local-dir ~/Models/laya</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="gliner2.5-decide gliner decide fastino gliner_decide.c decision system one jev deberta english" data-tags="decision">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/gliner_decide.md">gliner2.5-decide</a></h3>
+        <p class="d">A classifier for operational decisions: intent, routing, urgency, yes or no over a passage. All the questions of a request are read in one pass; 294 ms for one question on a busy laptop CPU, in 1.9 GB of RAM. English.</p>
+        <div class="tg"><span class="b">decision</span><span class="g">DeBERTa-v3</span><span class="g">Apache 2.0</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>encoder + classifier</span>
+          <a href="https://huggingface.co/fastino/GLiNER2.5-Decide"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>official, 1.9 GB, no conversion</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>gliner_decide.c</span></div>
+        <div class="mget"><code>hf download fastino/GLiNER2.5-Decide model.safetensors config.json "encoder_config/*" tokenizer.json tokenizer_config.json special_tokens_map.json --local-dir ~/Models/GLiNER2.5-Decide</code><button class="cp" type="button">copy</button></div>
+      </article>
+      <article class="mrow" data-find="clef cloudflare qwen36.c decision system one jev qwen3.8-27b chat" data-tags="decision tools">
+        <h3><a href="https://github.com/JustVugg/colibri/blob/main/docs/clef.md">clef</a></h3>
+        <p class="d">Qwen3.8-27B post-trained with a joint schema head that scores every option of every question in one pass. POST /v1/systemone answers natively and the same process still chats. 20.4 s per request in int8 on an 8-core desktop CPU.</p>
+        <div class="tg"><span class="b">decision</span><span class="g">dense</span><span class="g">Apache 2.0</span></div>
+        <div class="mm"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>27B total</span>
+          <a href="https://huggingface.co/Cloudflare/clef"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>convert, 55 GB</a>
+          <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>qwen36.c</span></div>
+        <div class="mget"><code>python3 c/tools/convert_qwen36.py --model ~/Models/clef --out ~/Models/clef_c</code><button class="cp" type="button">copy</button></div>
+      </article>
   </div>
   <p class="mnone" id="mnone" hidden>Nothing matches that.</p>
 </div></section>
@@ -361,7 +487,7 @@ footer{border-top:1px solid var(--line)}
   <nav class="railnav" id="rail">
     <a href="#fits" class="on">Bigger than your RAM</a>
     <a href="#open">Frontier open models</a>
-    <a href="#brio">Brio mode</a>
+    <a href="#systemone">System One mode</a>
     <a href="#yours">Your weights stay yours</a>
   </nav>
   <div>
@@ -374,27 +500,43 @@ footer{border-top:1px solid var(--line)}
       <div class="chart"><div class="crow"><span class="cl">6x RTX 5090<s>full residency</s></span><span class="ct"><i style="width:100.0%"></i></span><span class="cv">9.0-9.2<s> tok/s</s></span></div><div class="crow"><span class="cl">AWS Graviton4<s>aarch64, CPU only</s></span><span class="ct"><i style="width:87.0%"></i></span><span class="cv">8.0<s> tok/s</s></span></div><div class="crow"><span class="cl">2x Xeon Gold 6430<s>1 TB DDR5</s></span><span class="ct"><i style="width:58.9%"></i></span><span class="cv">5.42<s> tok/s</s></span></div><div class="crow"><span class="cl">NVIDIA DGX Spark<s>121 GB unified</s></span><span class="ct"><i style="width:36.2%"></i></span><span class="cv">3.33<s> tok/s</s></span></div><div class="crow"><span class="cl">MacBook Pro M5 Max<s>Metal</s></span><span class="ct"><i style="width:21.7%"></i></span><span class="cv">2.0<s> tok/s</s></span></div><div class="crow"><span class="cl">Ryzen 9 9950X3D<s>RTX 5090 + NVMe</s></span><span class="ct"><i style="width:13.4%"></i></span><span class="cv">1.23<s> tok/s</s></span></div><div class="crow"><span class="cl">25 GB dev box<s>cold</s></span><span class="ct"><i style="width:1.1%"></i></span><span class="cv">0.05-0.1<s> tok/s</s></span></div></div>
       <p class="src">GLM-5.2 int4, decode speed reported by the people who ran it. The hardware
         changes where the experts live, not what the model answers.</p>
+      <p class="src">A GPU is optional on every engine. With Vulkan, any GPU keeps the hottest
+        experts and runs whole layers: on the integrated Radeon 780M of an 8-core desktop,
+        Qwen3.6 went from 6.0 to 9.9 tok/s. A small model can lose on an integrated GPU, so the
+        setup turns it on only where it was measured faster (<code>coli setup --backend vulkan</code>
+        or <code>--backend cpu</code> decides for you); no discrete GPU has run the new
+        expert tier yet. With CUDA, NVIDIA cards keep the hottest experts in VRAM. The release
+        archives carry these backends ready to run: Vulkan on Linux and Windows, Metal on macOS,
+        and a CUDA package for NVIDIA cards on Windows.
+        <a href="https://github.com/JustVugg/colibri/blob/main/docs/vulkan.md" style="text-decoration:underline;text-underline-offset:3px">Vulkan notes</a></p>
       <a class="more" href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">See the benchmarks &rarr;</a>
     </div>
 
     <div class="block" id="open">
       <h2>Frontier open models</h2>
-      <p class="sub">Nine families run today, one hand-written C file each. Not a wrapper around
-        someone else's runtime.</p>
-      <div class="chart"><div class="crow"><span class="cl">kimi-k3<s>104B active</s></span><span class="ct"><i style="width:100.0%"></i></span><span class="cv">2.8T</span></div><div class="crow"><span class="cl">inkling<s>41B active</s></span><span class="ct"><i style="width:34.8%"></i></span><span class="cv">975B</span></div><div class="crow"><span class="cl">glm-5.2<s>40B active</s></span><span class="ct"><i style="width:26.6%"></i></span><span class="cv">744B</span></div><div class="crow"><span class="cl">deepseek-v4.1-flash<s>16B active</s></span><span class="ct"><i style="width:19.7%"></i></span><span class="cv">552B</span></div><div class="crow"><span class="cl">mimo-v2.6-flash<s>15B active</s></span><span class="ct"><i style="width:11.0%"></i></span><span class="cv">309B</span></div><div class="crow"><span class="cl">glm-5.3-flash<s>18B active</s></span><span class="ct"><i style="width:11.4%"></i></span><span class="cv">320B</span></div><div class="crow"><span class="cl">deepseek-v4-flash<s>13B active</s></span><span class="ct"><i style="width:10.1%"></i></span><span class="cv">284B</span></div><div class="crow"><span class="cl">qwen3.8-flash-next<s>6B active</s></span><span class="ct"><i style="width:6.4%"></i></span><span class="cv">180B</span></div><div class="crow"><span class="cl">qwen3.6-35b-a3b<s>3B active</s></span><span class="ct"><i style="width:1.2%"></i></span><span class="cv">35B</span></div><div class="crow"><span class="cl">olmoe<s>1B active</s></span><span class="ct"><i style="width:0.8%"></i></span><span class="cv">7B</span></div></div>
+      <p class="sub">Thirteen engines run today: ten for language models, one for pictures and two
+        for decisions, one hand-written C file each. Not a wrapper around someone else's runtime.</p>
+      <div class="chart"><div class="crow"><span class="cl">kimi-k3<s>104B active</s></span><span class="ct"><i style="width:100.0%"></i></span><span class="cv">2.8T</span></div><div class="crow"><span class="cl">mimo-v2.6-pro<s>42B active</s></span><span class="ct"><i style="width:36.4%"></i></span><span class="cv">1.02T</span></div><div class="crow"><span class="cl">inkling<s>41B active</s></span><span class="ct"><i style="width:34.8%"></i></span><span class="cv">975B</span></div><div class="crow"><span class="cl">glm-5.2 / glm-5.3<s>40B active</s></span><span class="ct"><i style="width:26.6%"></i></span><span class="cv">744B</span></div><div class="crow"><span class="cl">deepseek-v4.1-flash<s>16B active</s></span><span class="ct"><i style="width:19.7%"></i></span><span class="cv">552B</span></div><div class="crow"><span class="cl">glm-5.3-flash<s>18B active</s></span><span class="ct"><i style="width:11.4%"></i></span><span class="cv">320B</span></div><div class="crow"><span class="cl">mimo-v2.6-flash<s>15B active</s></span><span class="ct"><i style="width:11.0%"></i></span><span class="cv">309B</span></div><div class="crow"><span class="cl">deepseek-v4-flash<s>13B active</s></span><span class="ct"><i style="width:10.1%"></i></span><span class="cv">284B</span></div><div class="crow"><span class="cl">qwen3.8-flash-next<s>6B active</s></span><span class="ct"><i style="width:6.4%"></i></span><span class="cv">180B</span></div><div class="crow"><span class="cl">qwen3.6-35b-a3b<s>3B active</s></span><span class="ct"><i style="width:1.2%"></i></span><span class="cv">35B</span></div><div class="crow"><span class="cl">qwen3-coder-30b-a3b<s>3B active</s></span><span class="ct"><i style="width:1.1%"></i></span><span class="cv">30B</span></div><div class="crow"><span class="cl">qwen3.8-27b<s>dense, all active</s></span><span class="ct"><i style="width:1.0%"></i></span><span class="cv">27B</span></div><div class="crow"><span class="cl">olmoe<s>1B active</s></span><span class="ct"><i style="width:0.8%"></i></span><span class="cv">7B</span></div></div>
       <p class="src">Total parameters. Only the active ones are computed per token, and only the
         routed experts move. The engines, by the names the docs use:
-        GLM-5.3-Flash, GLM-5.2/5.3, Inkling, Kimi K3, OLMoE, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6 Flash.
-        And for images, Qwen-Image-2.1: text to picture, drawn inside the terminal.</p>
+        GLM-5.3-Flash, GLM-5.2/5.3, Inkling, Kimi K3, OLMoE, Qwen3.6-35B-A3B (which also runs
+        Qwen3-Coder-30B-A3B and the dense Qwen3.8-27B), Qwen3.8-Flash-Next, DeepSeek V4 Flash,
+        DeepSeek V4.1 Flash, MiMo-V2.6 Flash (and Pro, on the same engine).
+        And for images, Qwen-Image-2.1: text to picture, drawn inside the terminal.
+        And for decisions, Laya and GLiNER2.5-Decide, with Clef on the Qwen3.6 engine: typed
+        questions in, a probability per option out. Every language engine serves up to 16
+        conversations at once, their next tokens decoded together.</p>
       <a class="more" href="#models">Browse all models &rarr;</a>
     </div>
 
-    <div class="block" id="brio">
-      <h2>Brio mode</h2>
+    <div class="block" id="systemone">
+      <h2>System One mode</h2>
       <p class="sub">Most of what people ask a model for is a choice, not an essay. Hand it the
         options it may pick and it reports the probability of each one. Nothing is generated,
-        so there is nothing to parse and no answer outside the list.</p>
-      <div class="chart"><div class="crow"><span class="cl">one question, 10 options<s>brio</s></span><span class="ct"><i style="width:38.8%"></i></span><span class="cv">101.2 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:48.1%"></i></span><span class="cv">125.6 s<s> 1.2x</s></span></div><div class="crow"><span class="cl">JSON, 4-field schema<s>brio</s></span><span class="ct"><i style="width:39.8%"></i></span><span class="cv">103.8 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:94.2%"></i></span><span class="cv">246.0 s<s> 2.4x</s></span></div><div class="crow"><span class="cl">4 items, shared instructions<s>brio</s></span><span class="ct"><i style="width:17.5%"></i></span><span class="cv">45.7 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:100.0%"></i></span><span class="cv">261.1 s<s> 5.7x</s></span></div></div>
+        so there is nothing to parse and no answer outside the list. Typed decisions with
+        calibrated probabilities on <code>POST /v1/systemone</code>, with the request and the reply
+        of TypeSafe's Jev API: a Jev client switches by changing its base URL.</p>
+      <div class="chart"><div class="crow"><span class="cl">one question, 10 options<s>System One</s></span><span class="ct"><i style="width:38.8%"></i></span><span class="cv">101.2 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:48.1%"></i></span><span class="cv">125.6 s<s> 1.2x</s></span></div><div class="crow"><span class="cl">4 items, shared instructions<s>System One</s></span><span class="ct"><i style="width:17.5%"></i></span><span class="cv">45.7 s</span></div><div class="crow"><span class="cl"><s>chat</s></span><span class="ct"><i style="width:100.0%"></i></span><span class="cv">261.1 s<s> 5.7x</s></span></div></div>
       <p class="src">Measured on qwen36 (22 GB), same engine, separate processes. Time from the
         prompt to the answer.</p>
 
@@ -404,11 +546,11 @@ footer{border-top:1px solid var(--line)}
              a message to a policy.</p>
           <div class="io"><b>question</b> what should the reviewer do?<br>
             <b>options</b> merge &middot; request changes &middot; close</div></div>
-        <div class="ex"><h3>Filling a schema</h3>
-          <p>Braces, quotes and field names are data. The engine fills one slot at a time, so
-             the JSON is valid by construction.</p>
-          <div class="io"><b>brio</b> every value is one you allowed<br>
-            <b>chat</b> invented no_tests and track</div></div>
+        <div class="ex"><h3>Three decision models</h3>
+          <p>Laya, GLiNER2.5-Decide and Clef answer the same request natively: one forward pass,
+             no prompt and nothing generated. Any chat model answers it by scoring.</p>
+          <div class="io"><b>same API</b> POST /v1/systemone<br>
+            <b>Laya</b> 219 ms for one question on a laptop CPU</div></div>
         <div class="ex"><h3>Many questions, one document</h3>
           <p>Read the contract once, then ask it twenty things. The first question pays for the
              reading, the rest cost their own words.</p>
@@ -417,36 +559,39 @@ footer{border-top:1px solid var(--line)}
       </div>
 
       <div class="split2">
-        <div class="code"><span class="lbl">POST /v1/brio</span><pre>{
-  <span class="k">"model"</span>: <span class="s">"qwen36"</span>,
+        <div class="code"><span class="lbl">POST /v1/systemone</span><pre>{
   <span class="k">"state"</span>: <span class="s">"340 lines, 8 files, no tests."</span>,
-  <span class="k">"question"</span>: <span class="s">"What should the reviewer do?"</span>,
-  <span class="k">"options"</span>: [<span class="s">"merge"</span>, <span class="s">"request changes"</span>, <span class="s">"close"</span>]
+  <span class="k">"questions"</span>: {<span class="k">"review"</span>: {
+    <span class="k">"type"</span>: <span class="s">"choice"</span>,
+    <span class="k">"instructions"</span>: <span class="s">"What should the reviewer do?"</span>,
+    <span class="k">"criteria"</span>: {<span class="k">"merge"</span>: <span class="n">null</span>, <span class="k">"request changes"</span>: <span class="n">null</span>, <span class="k">"close"</span>: <span class="n">null</span>}
+  }}
 }</pre></div>
         <div class="code"><span class="lbl">the reply</span><pre>{
-  <span class="k">"answer"</span>: <span class="s">"request changes"</span>,
-  <span class="k">"entropy"</span>: <span class="n">0.121</span>,
-  <span class="k">"choices"</span>: [
-    {<span class="k">"option"</span>: <span class="s">"request changes"</span>, <span class="k">"p"</span>: <span class="n">0.974</span>},
-    {<span class="k">"option"</span>: <span class="s">"merge"</span>,           <span class="k">"p"</span>: <span class="n">0.023</span>},
-    {<span class="k">"option"</span>: <span class="s">"close"</span>,           <span class="k">"p"</span>: <span class="n">0.004</span>}
-  ],
-  <span class="k">"usage"</span>: {<span class="k">"completion_tokens"</span>: <span class="n">0</span>}
+  <span class="k">"answers"</span>: {<span class="k">"review"</span>: {
+    <span class="k">"choice"</span>: <span class="s">"request changes"</span>,
+    <span class="k">"probabilities"</span>: {
+      <span class="k">"merge"</span>: <span class="n">0.023</span>, <span class="k">"request changes"</span>: <span class="n">0.974</span>, <span class="k">"close"</span>: <span class="n">0.004</span>
+    },
+    <span class="k">"confidence"</span>: <span class="n">0.961</span>
+  }},
+  <span class="k">"usage"</span>: {<span class="k">"output_tokens"</span>: <span class="n">4</span>, <span class="k">"cost"</span>: <span class="n">0</span>}
 }</pre></div>
       </div>
 
       <h3 style="font-size:1.3rem;font-weight:500;margin:3rem 0 .6rem;letter-spacing:-.02em">
         And the thing generation cannot give</h3>
-      <p class="sub" style="margin-bottom:1.6rem">Same request, same model, three fields of one
-        JSON schema. On <b>area</b> it is sure and it is right. On the other two the entropy is
+      <p class="sub" style="margin-bottom:1.6rem">Same document, same model, three closed
+        questions about it (measured when they were the fields of one JSON object, filled one
+        at a time). On <b>area</b> it is sure and it is right. On the other two the entropy is
         near the maximum: it does not know, and it says so. The chat arm wrote
         <code style="font:400 14px var(--mono);background:var(--soft);padding:1px 6px;border-radius:4px">"risk": "high"</code>
         with exactly the same face.</p>
       <div class="chart"><div class="crow"><span class="cl">area<s>the model is sure</s></span><span class="ct"><i style="width:94.4%"></i></span><span class="cv">94.4%<s> entropy 0.17</s></span></div><div class="crow"><span class="cl">needs_tests<s>it is not</s></span><span class="ct"><i style="width:52.0%"></i></span><span class="cv">52%<s> entropy 0.95</s></span></div><div class="crow"><span class="cl">risk<s>it is not</s></span><span class="ct"><i style="width:46.0%"></i></span><span class="cv">46%<s> entropy 0.99</s></span></div></div>
       <p class="src">That number is what you put a threshold on to send a case to a human.
-        Brio does not write prose, so anything open-ended is still the chat's job, and the
+        System One mode does not write prose, so anything open-ended is still the chat's job, and the
         speed multipliers above were measured on an engine reading experts from disk.</p>
-      <a class="more" href="https://github.com/JustVugg/colibri/blob/main/docs/brio.md">Read the brio guide &rarr;</a>
+      <a class="more" href="https://github.com/JustVugg/colibri/blob/main/docs/systemone.md">Read the System One guide &rarr;</a>
     </div>
 
     <div class="block" id="yours">
@@ -480,7 +625,7 @@ footer{border-top:1px solid var(--line)}
 <rect height="14" width="14" x="98" y="98" fill="#00afaf"/><rect height="14" width="14" x="112" y="98" fill="#5fd7d7"/>
 <rect height="14" width="14" x="112" y="112" fill="#5fd7d7"/></g></svg>
   <h2>Get up and running on hardware you already own</h2>
-  <a class="pill d big" href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">Get started</a>
+  <a class="pill d big" href="#start">Get started</a>
 </div></section>
 
 </main>
@@ -489,10 +634,10 @@ footer{border-top:1px solid var(--line)}
 
 <footer><div class="fin">
   <span>&copy; 2026 colibri</span>
-  <span>Currently shipping <b>v1.12.1</b></span>
+  <span>Currently shipping <b>v2.0.0</b></span>
   <span class="sp">
     <a href="https://github.com/JustVugg/colibri/">GitHub</a><a href="https://github.com/JustVugg/colibri/blob/main/docs/quickstart.md">Docs</a>
-    <a href="https://github.com/JustVugg/colibri/blob/main/docs/brio.md">Brio</a><a href="https://github.com/JustVugg/colibri/blob/main/docs/api.md">API</a>
+    <a href="https://github.com/JustVugg/colibri/blob/main/docs/systemone.md">System One</a><a href="https://github.com/JustVugg/colibri/blob/main/docs/api.md">API</a>
     <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Benchmarks</a><a href="https://github.com/JustVugg/colibri/issues">Issues</a>
     <a href="https://github.com/JustVugg/colibri/blob/main/LICENSE">Apache 2.0</a>
   </span>

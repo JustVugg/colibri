@@ -51,8 +51,8 @@ int main(void){
     if(compat_open_direct("no_such_file.tmp")>=0) return fail("open missing file must fail");
     if(compat_fsize(-1)>=0) return fail("compat_fsize on bad fd must be negative");
 
-    /* compat_fadvise: WILLNEED warms the page cache (background read into throwaway
-     * buffer), DONTNEED is a documented no-op. After a WILLNEED the buffered fd's
+    /* compat_fadvise: WILLNEED schedules bounded background readahead,
+     * DONTNEED is a documented no-op. After a WILLNEED the buffered fd's
      * subsequent pread must still return the exact bytes — the cache-warmer must not
      * corrupt data. Bad fd / non-WILLNEED advice must be safe no-ops (return 0). */
     int wfd = open(TMPF, COMPAT_O_RDONLY);

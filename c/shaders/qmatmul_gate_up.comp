@@ -1,15 +1,23 @@
 #version 450
-// Fused dual projection + SiLU gate, the VK equivalent of colibri's
-// grouped_hidden_w4_dual:  hidden[s,o] = silu(gate[s,o]) * up[s,o]
-//   gate[s,o] = (sum_i x[s,i]*dequant(Wg[o,i])) * gscale[o]
-//   up  [s,o] = (sum_i x[s,i]*dequant(Wu[o,i])) * uscale[o]
-//   silu(z)   = z / (1 + exp(-z))
-// The whole expert MLP first half in ONE dispatch: x is read ONCE from shared and
-// reused for both projections (half the activation traffic + one launch instead of
-// two), one subgroup per output row, subgroupAdd reduction, grid-stride over rows.
-// fmt: 1=int8, 2=int4 (nibble-8), 5=int3-g64 (24B/64-group two-plane packing with
-// ONE f32 scale per group — gscale/uscale hold O*ceil(I/64) entries; the per-row
-// multiply after the reduction does not apply, the group scale folds in per-lane).
+// Fused dual projection + gated activation, the first half of a routed expert:
+//   gate[s,o] = sum_i x[s,i]*dequant(Wg[o,i])   (scales as the format says)
+//   up  [s,o] = sum_i x[s,i]*dequant(Wu[o,i])
+//   hid [s,o] = act(gate[s,o], up[s,o])
+// in ONE dispatch: x is read once (shared memory when it fits) for both
+// projections, one subgroup per output row, subgroupAdd reduction, grid-stride
+// over rows. Formats are qmatmul.comp's: 1 int8 and 2 int4 with one scale per
+// row; 4 int4 and 7 MXFP4 with one scale per gs inputs (gs % 8 == 0); 5 int3-g64
+// (one scale per 64-group); 10 f32 and 11 bf16 without scales; 12 fp8 e4m3 and
+// 13 int8 with one scale per gs inputs (gs % 4 == 0). Grouped scales fold into
+// each word's partial, the per-row ones multiply the reduced sum.
+//
+// act (push constant), shared with expert_act.comp:
+//   0  SwiGLU silu(g) * u; with limit > 0 the gate is clamped from above at limit
+//      and up to [-limit, limit] first (swiglu_limit; 0 = unclamped)
+//   1  SiTU-GLU a*tanh(g/a)*sigmoid(g) * b*tanh(u/b) (Kimi K3: a = 4, b = 25)
+//   2  DeepSeek V4: gate and up rounded to bf16 first, then act 0's clamps and
+//      g * sigmoid(g) * u as its CPU computes it (act_v4 below); the route weight,
+//      bf16 and E4M3 rounding that follow run in expert_act_v4.comp
 #extension GL_KHR_shader_subgroup_arithmetic : require
 layout(local_size_x = 256) in;
 
@@ -21,24 +29,63 @@ layout(std430, binding = 4) readonly buffer SU { float uscale[]; };
 layout(std430, binding = 5) writeonly buffer H { float hid[]; };
 
 layout(push_constant) uniform P {
-    int fmt;        // 1=int8, 2=int4, 4=grouped int4, 5=int3-g64
+    int fmt;        // see above
     int S, I, O;    // I = input dim (hidden), O = moe_inter
     int rowWords;   // uint32 words per weight row (of the I-dim rows)
-    int gs;         // fmt=4 group size (multiple of 8; host gates otherwise)
-    float limit;    // SwiGLU clamp; 0 = unclamped (GLM-5.2)
+    int gs;         // group size of fmt 4/7 (multiple of 8) and 12/13 (multiple of 4)
+    float limit;    // act 0's clamp; 0 = none
+    int act;        // activation, see above
+    float a, b;     // act 1's two bounds
 } p;
 
 shared float xsh[6144];
+bool staged;
+int xoff;
 
+float xv(int i) { return staged ? xsh[i] : x[xoff + i]; }
 float i8(uint w, int l) { int b = int((w >> (uint(l) * 8u)) & 0xffu); if (b >= 128) b -= 256; return float(b); }
 float i4(uint w, int l) { return float(int((w >> (uint(l) * 4u)) & 0xfu) - 8); }
+float mx4(uint w, int l) {
+    uint n = (w >> (uint(l) * 4u)) & 0xfu;
+    const float lut[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    float v = lut[n & 7u];
+    return (n & 8u) != 0u ? -v : v;
+}
+float e4m3(uint w, int l) {
+    uint b = (w >> (uint(l) * 8u)) & 0xffu;
+    if ((b & 0x7fu) == 0x7fu) return uintBitsToFloat(0x7fc00000u);
+    uint e = (b >> 3) & 0xfu, m = b & 7u;
+    float v = e == 0u ? float(m) * 0.001953125 : ldexp(1.0 + float(m) * 0.125, int(e) - 7);
+    return (b & 0x80u) != 0u ? -v : v;
+}
+
+// act 2: round to bf16, nearest even (the CPU's coli_bf16_round), and DeepSeek V4's
+// SwiGLU in its CPU form (coli_v4_swiglu after coli_bf16_round_array of gate and up)
+float bf16r(float v) {
+    uint b = floatBitsToUint(v);
+    if ((b & 0x7f800000u) != 0x7f800000u) b += 0x7fffu + ((b >> 16) & 1u);
+    return uintBitsToFloat(b & 0xffff0000u);
+}
+float act_v4(float g, float u, float limit) {
+    g = bf16r(g); u = bf16r(u);
+    if (limit > 0.0) { g = min(g, limit); u = max(-limit, min(u, limit)); }
+    float s = g >= 0.0 ? 1.0 / (1.0 + exp(-g)) : exp(g) / (1.0 + exp(g));
+    return g * s * u;
+}
+
+// Preserve small SiTU inputs; tanh(x) rounds to x below 2^-12 in f32.
+float situ_tanh(float x) { return abs(x) < 0.000244140625 ? x : tanh(x); }
 
 void main() {
     int s   = int(gl_WorkGroupID.y);
     int tid = int(gl_LocalInvocationID.x);
     int nth = int(gl_WorkGroupSize.x);
 
-    for (int i = tid; i < p.I; i += nth) xsh[i] = x[s * p.I + i];
+    // Stage x[s,:] once; a row longer than the staging array (a hidden size past
+    // 6144) is read from the buffer instead, coalesced across the subgroup.
+    staged = p.I <= 6144;
+    xoff = s * p.I;
+    if (staged) for (int i = tid; i < p.I; i += nth) xsh[i] = x[xoff + i];
     barrier();
 
     int lane   = int(gl_SubgroupInvocationID);
@@ -54,7 +101,7 @@ void main() {
             int words = (p.I + 3) / 4;
             for (int wi = lane; wi < words; wi += sgsize) {
                 uint gp = wg[rb + uint(wi)], upk = wu[rb + uint(wi)]; int i0 = wi * 4;
-                for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.I) { float xv = xsh[i]; g += xv * i8(gp, k); u += xv * i8(upk, k); } }
+                for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.I) { float a = xv(i); g += a * i8(gp, k); u += a * i8(upk, k); } }
             }
         } else if (p.fmt == 5) { // int3-g64: lanes stride 16-value low-plane words; one
             // group scale per word-partial (gate and up have independent scale arrays)
@@ -71,40 +118,82 @@ void main() {
                 for (int k = 0; k < 16; k++) {
                     int i = i0 + k;
                     if (i < p.I) {
-                        float xv = xsh[i];
+                        float a = xv(i);
                         uint gv = ((glo >> uint(k * 2)) & 3u) | (((ghi >> uint(hs + k)) & 1u) << 2);
                         uint uv = ((ulo >> uint(k * 2)) & 3u) | (((uhi >> uint(hs + k)) & 1u) << 2);
-                        ga += xv * float(int(gv) - 4);
-                        ua += xv * float(int(uv) - 4);
+                        ga += a * float(int(gv) - 4);
+                        ua += a * float(int(uv) - 4);
                     }
                 }
                 g += ga * gscale[sb + uint(gi)];
                 u += ua * uscale[sb + uint(gi)];
             }
-        } else if (p.fmt == 4) { // grouped int4: nibble decode, per-word group scale (gs%8==0)
+        } else if (p.fmt == 4 || p.fmt == 7) { // grouped int4 / MXFP4: per-word group scale (gs%8==0)
             int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
             uint sb = uint(o) * uint(ng);
             for (int wi = lane; wi < words; wi += sgsize) {
                 uint gp = wg[rb + uint(wi)], upk = wu[rb + uint(wi)]; int i0 = wi * 8;
                 float ga = 0.0, ua = 0.0;
-                for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.I) { float xv = xsh[i]; ga += xv * i4(gp, k); ua += xv * i4(upk, k); } }
-                float sc_g = gscale[sb + uint(i0 / p.gs)], sc_u = uscale[sb + uint(i0 / p.gs)];
-                g += ga * sc_g; u += ua * sc_u;
+                if (p.fmt == 4) {
+                    for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.I) { float a = xv(i); ga += a * i4(gp, k); ua += a * i4(upk, k); } }
+                } else {
+                    for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.I) { float a = xv(i); ga += a * mx4(gp, k); ua += a * mx4(upk, k); } }
+                }
+                uint si = sb + uint(i0 / p.gs);
+                g += ga * gscale[si]; u += ua * uscale[si];
             }
-        } else { // int4
+        } else if (p.fmt == 12 || p.fmt == 13) { // fp8 e4m3 / int8, one scale per gs inputs (gs%4==0)
+            int words = (p.I + 3) / 4, ng = (p.I + p.gs - 1) / p.gs;
+            uint sb = uint(o) * uint(ng);
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint gp = wg[rb + uint(wi)], upk = wu[rb + uint(wi)]; int i0 = wi * 4;
+                float ga = 0.0, ua = 0.0;
+                if (p.fmt == 12) {
+                    for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.I) { float a = xv(i); ga += a * e4m3(gp, k); ua += a * e4m3(upk, k); } }
+                } else {
+                    for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.I) { float a = xv(i); ga += a * i8(gp, k); ua += a * i8(upk, k); } }
+                }
+                uint si = sb + uint(i0 / p.gs);
+                g += ga * gscale[si]; u += ua * uscale[si];
+            }
+        } else if (p.fmt == 10) { // f32, one weight per word, no scales
+            for (int i = lane; i < p.I; i += sgsize) {
+                float a = xv(i);
+                g += a * uintBitsToFloat(wg[rb + uint(i)]); u += a * uintBitsToFloat(wu[rb + uint(i)]);
+            }
+        } else if (p.fmt == 11) { // bf16, two per word, LOW half = even column, no scales
+            int words = (p.I + 1) / 2;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint gp = wg[rb + uint(wi)], upk = wu[rb + uint(wi)]; int i0 = wi * 2;
+                float a = xv(i0);
+                g += a * uintBitsToFloat((gp & 0xffffu) << 16); u += a * uintBitsToFloat((upk & 0xffffu) << 16);
+                if (i0 + 1 < p.I) {
+                    float b = xv(i0 + 1);
+                    g += b * uintBitsToFloat(gp & 0xffff0000u); u += b * uintBitsToFloat(upk & 0xffff0000u);
+                }
+            }
+        } else { // int4, per-row scale
             int words = (p.I + 7) / 8;
             for (int wi = lane; wi < words; wi += sgsize) {
                 uint gp = wg[rb + uint(wi)], upk = wu[rb + uint(wi)]; int i0 = wi * 8;
-                for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.I) { float xv = xsh[i]; g += xv * i4(gp, k); u += xv * i4(upk, k); } }
+                for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.I) { float a = xv(i); g += a * i4(gp, k); u += a * i4(upk, k); } }
             }
         }
         float gt = subgroupAdd(g), ut = subgroupAdd(u);
-        if (p.fmt != 5 && p.fmt != 4) { gt *= gscale[o]; ut *= uscale[o]; }   // per-row formats only
-        if (p.limit > 0.0) {
-            if (gt > p.limit) gt = p.limit;
-            if (ut > p.limit) ut = p.limit;
-            if (ut < -p.limit) ut = -p.limit;
+        if (p.fmt == 1 || p.fmt == 2) { gt *= gscale[o]; ut *= uscale[o]; }   // per-row formats only
+        float h;
+        if (p.act == 1) {
+            h = p.a * situ_tanh(gt / p.a) * (1.0 / (1.0 + exp(-gt))) * (p.b * situ_tanh(ut / p.b));
+        } else if (p.act == 2) {
+            h = act_v4(gt, ut, p.limit);
+        } else {
+            if (p.limit > 0.0) {
+                if (gt > p.limit) gt = p.limit;
+                if (ut > p.limit) ut = p.limit;
+                if (ut < -p.limit) ut = -p.limit;
+            }
+            h = (gt / (1.0 + exp(-gt))) * ut;   // silu(gate)*up
         }
-        if (lane == 0) hid[s * p.O + o] = (gt / (1.0 + exp(-gt))) * ut;   // silu(gate)*up
+        if (lane == 0) hid[s * p.O + o] = h;
     }
 }

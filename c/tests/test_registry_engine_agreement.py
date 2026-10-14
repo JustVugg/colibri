@@ -33,8 +33,13 @@ sys.path.insert(0, str(ROOT))
 import family_registry as fr  # noqa: E402
 
 
-BACKEND_OBJECTS = ("CUDA_OBJ", "METAL_OBJ", "VK_OBJ", "VK_SPV", "INK_CUDA_OBJ",
-                   "QWEN36_TIER_OBJ")
+# VK_OBJ/VK_SPV are not on the list: since #1830 every engine links the Vulkan
+# backend in a VK=1 build, and in the engines that link nothing else it only puts
+# the resident matrices on the device, opt-in (COLI_VULKAN=1), with no VRAM tier
+# for the planner to size and no GPU for it to select. What the flag promises is
+# exactly that tier and that selection, so a Vulkan-only engine stays CPU-only to
+# the planner.
+BACKEND_OBJECTS = ("CUDA_OBJ", "METAL_OBJ", "INK_CUDA_OBJ", "QWEN36_TIER_OBJ")
 
 
 def engine_rule(artifact: str) -> str:

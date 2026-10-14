@@ -1,6 +1,7 @@
 const zhCN: Record<string, string> = {
   "nav.chat": "对话",
   "nav.brain": "大脑",
+  "nav.brio": "System One",
   "nav.profiling": "性能分析",
 
   "brand.tagline": "本地巨人，极小足迹",
@@ -60,6 +61,10 @@ const zhCN: Record<string, string> = {
   "prompts.caching": "比较 RAM 和 VRAM 缓存",
 
   "chat.you": "你",
+  "chat.toBottom": "跳到最新消息",
+  "chat.image": "图片",
+  "ui.exportMarkdown": "Markdown (.md)",
+  "ui.exportJson": "JSON (.json)",
   "chat.colibri": "colibrì",
   "chat.placeholder": "给 colibrì 发消息…",
   "chat.inputHint": "回车发送 · Shift+回车换行",

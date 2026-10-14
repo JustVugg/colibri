@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import {
   Activity,
+  ArrowDown,
   ArrowUp,
   BrainCircuit,
   CircleStop,
@@ -24,7 +25,7 @@ import {
   SlidersHorizontal,
   Timer,
   Trash2,
-  Zap, ImagePlus, Camera, Grid3x3, Palette} from "lucide-react"
+  Zap, ImagePlus, Camera, Grid3x3, Palette, FileText} from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -38,8 +39,8 @@ import {
   DEFAULT_SIZE, DEFAULT_STEPS, chatTurns, clampSteps, dataUrlBlob, imageFileName, parseSeed, parseSize,
   presetOf, randomSeed, sizeKey, validSide, type ImageSize,
 } from "@/lib/images"
-import { resendFrom } from "@/lib/chat"
-import { activeRequests, supportsCacheSlots, supportsContinuation } from "@/lib/runtime"
+import { chatMarkdown, exportName, resendFrom } from "@/lib/chat"
+import { activeRequests, supportsCacheSlots, supportsCompaction, supportsContinuation } from "@/lib/runtime"
 import Brio from "./Brio"
 import { BrainWorkspace } from "./BrainWorkspace"
 import { Brand } from "./components/Brand"
@@ -117,6 +118,10 @@ export default function App() {
   const abortRef = useRef<AbortController | null>(null)
   const probeRef = useRef<AbortController | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
+  const conversationRef = useRef<HTMLDivElement>(null)
+  const exportRef = useRef<HTMLDivElement>(null)
+  const [atBottom, setAtBottom] = useState(true)
+  const [exportOpen, setExportOpen] = useState(false)
   const messages = conversations[cacheSlot] || []
   const kvSlots = Math.max(1, health?.kv_slots || 1)
   const active = activeRequests(health)
@@ -178,7 +183,27 @@ export default function App() {
   useEffect(() => { setLastRun(null) }, [cacheSlot])
 
   // EFFECT #7
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }) }, [messages])
+  /* The view goes to the bottom when a turn is added (a sent message, a restored or
+     switched conversation), not with every streamed token: someone reading an earlier
+     part of the answer stays where they are. The button below the list goes down. */
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }) }, [messages.length, cacheSlot])
+  const checkBottom = () => {
+    const box = conversationRef.current
+    setAtBottom(!box || box.scrollHeight - box.scrollTop - box.clientHeight < 80)
+  }
+  useEffect(checkBottom, [messages])
+
+  // EFFECT #8
+  useEffect(() => {
+    if (!exportOpen) return
+    const close = (event: Event) => {
+      if (event instanceof KeyboardEvent ? event.key === "Escape" : !exportRef.current?.contains(event.target as Node))
+        setExportOpen(false)
+    }
+    document.addEventListener("mousedown", close)
+    document.addEventListener("keydown", close)
+    return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", close) }
+  }, [exportOpen])
 
   const connect = async () => {
     probeRef.current?.abort()
@@ -267,6 +292,7 @@ export default function App() {
         maxTokens,
         enableThinking: thinking,
         cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
+        compact: supportsCompaction(health),
         signal: controller.signal,
         /* Reasoning tokens are tokens: they count toward the rate, and the
            first one is the real time-to-first-token. The answer's first token
@@ -429,9 +455,14 @@ export default function App() {
     if (messages.length) setArchives(items => [{ id: message("system", "").id, slot: cacheSlot, messages: [...messages] }, ...items])
     clearChat(); setDraft(""); setView("chat"); requestAnimationFrame(() => draftRef.current?.focus())
   }
-  const exportChat = () => {
-    const url = URL.createObjectURL(new Blob([JSON.stringify({ model, messages }, null, 2)], { type: "application/json" }))
-    const anchor = document.createElement("a"); anchor.href = url; anchor.download = "colibri-chat.json"; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000)
+  const exportChat = (format: "md" | "json") => {
+    setExportOpen(false)
+    const when = new Date()
+    const body = format === "md"
+      ? chatMarkdown(messages, model, when, { user: t("chat.you"), assistant: t("chat.colibri"), reasoning: t("sidebar.reasoning"), image: t("chat.image") })
+      : JSON.stringify({ model, exported: when.toISOString(), messages }, null, 2)
+    const url = URL.createObjectURL(new Blob([body], { type: format === "md" ? "text/markdown" : "application/json" }))
+    const anchor = document.createElement("a"); anchor.href = url; anchor.download = exportName(when, format); anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
   const copyMessage = async (item: ChatMessage) => {
     try { await navigator.clipboard.writeText(item.content); setCopied(item.id) } catch { setError(t("ui.copyError")) }
@@ -541,7 +572,7 @@ export default function App() {
         <button className="model-button" onClick={() => openSettings("model")}><span>{model}</span><ChevronDown /></button>
         <div className="workspace-actions">
           <button className={cn("connection-state", connected && "connected")} onClick={() => openSettings("connection")}><span />{connected ? t("status.connected") : t("status.notConnected")}</button>
-          {view === "chat" && <><button className="icon-action" aria-label={t("ui.export")} title={t("ui.export")} disabled={empty} onClick={exportChat}><Download /></button><button className="icon-action" aria-label={t("topbar.clear")} title={t("topbar.clear")} disabled={empty || loading} onClick={clearChat}><Trash2 /></button></>}
+          {view === "chat" && <><div className="export-wrap" ref={exportRef}><button className="icon-action" aria-label={t("ui.export")} title={t("ui.export")} aria-haspopup="menu" aria-expanded={exportOpen} disabled={empty} onClick={() => setExportOpen(open => !open)}><Download /></button>{exportOpen && <div className="export-menu" role="menu"><button role="menuitem" onClick={() => exportChat("md")}><FileText />{t("ui.exportMarkdown")}</button><button role="menuitem" onClick={() => exportChat("json")}><Code2 />{t("ui.exportJson")}</button></div>}</div><button className="icon-action" aria-label={t("topbar.clear")} title={t("topbar.clear")} disabled={empty || loading} onClick={clearChat}><Trash2 /></button></>}
         </div>
       </header>}
       {view === "settings" ? <section className="settings-page">
@@ -559,7 +590,7 @@ export default function App() {
       </section> : view === "brain" ? <BrainWorkspace baseUrl={baseUrl} apiKey={apiKey} connected={connected} />
       : view === "profiling" ? <section className="profiling-workspace"><header className="page-heading"><span>COLIBRI / ENGINE</span><h1>Profiling</h1></header>{metrics}<Profiling baseUrl={baseUrl} apiKey={apiKey} connected={connected} /></section>
       : <section className={cn("chat-view", empty && "empty")} hidden={view === "brio"}>
-        {empty ? <div className="welcome-brand"><Brand word /></div> : <div className="conversation" role="log" aria-label={t("nav.chat")}>
+        {empty ? <div className="welcome-brand"><Brand word /></div> : <div className="conversation" role="log" aria-label={t("nav.chat")} ref={conversationRef} onScroll={checkBottom}>
           <div className="message-list">{messages.map((item, index) => <article key={item.id} className={cn("message", item.role)}>
             {item.role !== "user" && <div className="assistant-brand"><Brand /><span>colibrì</span></div>}
             {item.images?.length ? <div className="message-images">{item.images.map((url, at) =>
@@ -574,6 +605,7 @@ export default function App() {
           </article>)}<div ref={bottomRef} /></div>
         </div>}
         <div className="composer-wrap">
+          {!empty && !atBottom && <button className="scroll-bottom" aria-label={t("chat.toBottom")} title={t("chat.toBottom")} onClick={() => bottomRef.current?.scrollIntoView({ behavior: "smooth" })}><ArrowDown /></button>}
           {error && <div className="error-banner" role="alert">{t(error)}</div>}
           <form className={cn("composer", imageMode && "image-mode")} onSubmit={e => { e.preventDefault(); submit() }}
             onDragOver={e => { if (!imageMode && e.dataTransfer.types.includes("Files")) e.preventDefault() }}
@@ -601,10 +633,11 @@ export default function App() {
           </form>
           {empty && <div className="suggestions">{suggestions.map(({ key, Icon, label }) => <button key={key} onClick={() => { setDraft(t(key)); draftRef.current?.focus() }}><Icon />{t(label)}</button>)}</div>}
           {!empty && !imageMode && lastRun?.finishReason === "length" && <p className="truncation-note">{t("topbar.truncatedHelp")}</p>}
+          {!empty && !imageMode && lastRun?.compaction && <p className="truncation-note" title={lastRun.compaction.summary}>{t("chat.compacted", { n: lastRun.compaction.summarized_messages })}</p>}
         </div>
       </section>}
       <section className="brio-workspace" hidden={view !== "brio"}>
-        <header className="page-heading"><span>COLIBRI / BRIO</span><h1>{t("nav.brio")}</h1></header>
+        <header className="page-heading"><span>COLIBRI / SYSTEM ONE</span><h1>{t("nav.brio")}</h1></header>
         <Brio baseUrl={baseUrl} apiKey={apiKey} model={model} connected={connected} />
       </section>
     </main>

@@ -38,6 +38,7 @@
 #include <tlhelp32.h>
 
 #include "backend_cuda.h"
+#include "cuda_chain.h"   /* the dense chain's table (one optional export) */
 
 /* Which backend DLL this host looks for, and how it labels its own messages.
  * The Makefile defines COLI_HIP_DLL for a HIP_DLL=1 host and leaves it undefined
@@ -95,6 +96,13 @@ typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, 
 typedef int            (*fn_tensor_upload)(ColiCudaTensor **tensor, const void *weights,
                                            const float *scales, int fmt, int I, int O, int device);
 typedef int            (*fn_tensor_upload_g)(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device, int gs);
+typedef ColiCudaDn    *(*fn_dn_create)(int device, int vh, int vk, int kdim, int vdim, int conv_dim, int convk, int hidden, const float *conv_w, const float *norm_w, float eps, int gate_sigmoid);
+typedef void           (*fn_dn_free)(ColiCudaDn *d);
+typedef int            (*fn_dn_set_state)(ColiCudaDn *d, const float *ring, const float *rec);
+typedef int            (*fn_dn_get_state)(ColiCudaDn *d, float *ring, float *rec);
+typedef int            (*fn_dn_step)(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz, ColiCudaTensor *outp, const float *x, float *out, const float *egh, const float *beta);
+typedef int            (*fn_tensor_overwrite)(ColiCudaTensor *tensor, const void *weights, const float *scales);
+typedef const ColiCudaChainOps *(*fn_chain_ops)(void);
 typedef int            (*fn_e8_set_grid)(const void *grid);
 typedef int            (*fn_fp8_set_lut)(const float *lut);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
@@ -180,6 +188,9 @@ static struct {
     fn_attention_absorb attention_absorb;
     fn_tensor_upload   tensor_upload;
     fn_tensor_upload_g tensor_upload_g;
+    fn_dn_create dn_create; fn_dn_free dn_free; fn_dn_set_state dn_set_state; fn_dn_get_state dn_get_state; fn_dn_step dn_step;   /* optional: gated delta layer on the device */
+    fn_tensor_overwrite tensor_overwrite;   /* optional: DLLs before it leave it NULL */
+    fn_chain_ops chain_ops;                 /* optional: the dense chain (cuda_chain.h); NULL = none */
     fn_e8_set_grid     e8_set_grid;
     fn_fp8_set_lut     fp8_set_lut;
     fn_matmul          matmul;
@@ -1432,6 +1443,13 @@ static int coli_cuda_load(void){
     RESOLVE(attention_absorb, fn_attention_absorb)
     RESOLVE(tensor_upload,  fn_tensor_upload)
     RESOLVE(tensor_upload_g, fn_tensor_upload_g)
+    RESOLVE_OPT(dn_create, fn_dn_create)
+    RESOLVE_OPT(dn_free, fn_dn_free)
+    RESOLVE_OPT(dn_set_state, fn_dn_set_state)
+    RESOLVE_OPT(dn_get_state, fn_dn_get_state)
+    RESOLVE_OPT(dn_step, fn_dn_step)
+    RESOLVE_OPT(tensor_overwrite, fn_tensor_overwrite)
+    RESOLVE_OPT(chain_ops, fn_chain_ops)
     RESOLVE_OPT(e8_set_grid, fn_e8_set_grid)
     RESOLVE_OPT(fp8_set_lut, fn_fp8_set_lut)
     RESOLVE(matmul,         fn_matmul)
@@ -1638,6 +1656,29 @@ int coli_cuda_tensor_upload(ColiCudaTensor **tensor, const void *weights,
 int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device, int gs){
     if(!g_cuda.available || !g_cuda.tensor_upload_g){ return 0; }
     return g_cuda.tensor_upload_g(tensor, weights, scales, fmt, I, O, device, gs);
+}
+
+/* Gated delta layer on the device: every entry point is optional, a DLL
+ * predating them answers NULL/0 and the engine keeps the layer on the CPU. */
+ColiCudaDn *coli_cuda_dn_create(int device, int vh, int vk, int kdim, int vdim, int conv_dim, int convk, int hidden, const float *conv_w, const float *norm_w, float eps, int gate_sigmoid){
+    if(!g_cuda.available || !g_cuda.dn_create || !g_cuda.dn_free || !g_cuda.dn_set_state || !g_cuda.dn_get_state || !g_cuda.dn_step) return NULL;
+    return g_cuda.dn_create(device, vh, vk, kdim, vdim, conv_dim, convk, hidden, conv_w, norm_w, eps, gate_sigmoid);
+}
+void coli_cuda_dn_free(ColiCudaDn *d){ if(d && g_cuda.dn_free) g_cuda.dn_free(d); }
+int coli_cuda_dn_set_state(ColiCudaDn *d, const float *ring, const float *rec){ return d && g_cuda.dn_set_state ? g_cuda.dn_set_state(d, ring, rec) : 0; }
+int coli_cuda_dn_get_state(ColiCudaDn *d, float *ring, float *rec){ return d && g_cuda.dn_get_state ? g_cuda.dn_get_state(d, ring, rec) : 0; }
+int coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz, ColiCudaTensor *outp, const float *x, float *out, const float *egh, const float *beta){
+    return d && g_cuda.dn_step ? g_cuda.dn_step(d, proj, projz, outp, x, out, egh, beta) : 0;
+}
+
+int coli_cuda_tensor_overwrite(ColiCudaTensor *tensor, const void *weights, const float *scales){
+    if(!g_cuda.available || !g_cuda.tensor_overwrite) return 0;   /* older DLL: the tier frees and uploads instead */
+    return g_cuda.tensor_overwrite(tensor, weights, scales);
+}
+
+const ColiCudaChainOps *coli_cuda_chain_ops(void){
+    if(!g_cuda.available || !g_cuda.chain_ops) return NULL;   /* older DLL: no chain, the per-matrix path */
+    return g_cuda.chain_ops();
 }
 
 int coli_cuda_e8_set_grid(const void *grid){
