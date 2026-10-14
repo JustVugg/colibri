@@ -1,0 +1,166 @@
+{
+  "runs": [
+    {
+      "tag": "q38-i4g64-mtp-baseline-1",
+      "family": "qwen38",
+      "model": "/root/colibri-test/models/qwen38-flash-next-fp8",
+      "prompt": "/root/colibri-test/p4mtp/prompts/code.txt",
+      "new": 128,
+      "cap": 170,
+      "cold": true,
+      "env": {
+        "COLI_VULKAN": "1",
+        "COLI_VK_CHAIN": "0",
+        "COLI_VK_DENSE": "0",
+        "Q38_EXPERT_INT4": "1",
+        "Q38_MTP": "0",
+        "Q38_MTP_DRAFTS": "3"
+      },
+      "kind": "generate",
+      "prompt_sha256": "b840c508d4d473840929f53cc370614e1438c6d0fd5f9afc67176ce1d99dfc2f",
+      "history_sha256": "d7d86f69d2c83d900c7d869b7a04e34be19a4f466eb40ec7c52deb70d50fc108",
+      "cmd": [
+        "/root/colibri-test/colibri-pr-validation-20261005/src/c/qwen38",
+        "170",
+        "8",
+        "/root/colibri-test/p4mtp/prompts/code.txt"
+      ],
+      "settings": {
+        "OMP_NUM_THREADS": "8",
+        "COLI_NO_OMP_TUNE": "1",
+        "COLI_TIMERS": "1",
+        "VK_ICD_FILENAMES": "/usr/share/vulkan/icd.d/radeon_icd.json",
+        "COLI_LOOKUP": "0",
+        "Q38_MTP": "0",
+        "COLI_VULKAN": "1",
+        "COLI_VK_CHAIN": "0",
+        "COLI_VK_DENSE": "0",
+        "Q38_EXPERT_INT4": "1",
+        "Q38_MTP_DRAFTS": "3",
+        "SNAP": "/root/colibri-test/models/qwen38-flash-next-fp8",
+        "COLI_USAGE": "/root/colibri-test/colibri-pr-validation-20261005/results/q38-i4g64-mtp-baseline-1/run.usage",
+        "N_NEW": "128"
+      },
+      "load_start": [
+        0.09716796875,
+        0.1455078125,
+        0.76318359375
+      ],
+      "source": "2f33f211ea6e28186d62cf9c00d511df826590a0",
+      "rc": 0,
+      "wall_s": 54.302,
+      "peak_rss_kib": 29819624,
+      "other_engines": [],
+      "stdout": "```c\nstatic int count_words(const char *s) {\n    int total = 0, in_word = 0;\n    for (const char *p = s; *p; p++) {\n        if (*p == ' ' || *p == '\\n' || *p == '\\t') {\n            in_word = 0;\n        } else if (!in_word) {\n            in_word = 1;\n            total++;\n        }\n    }\n    return total;\n}\n\nstatic void print_counts(const char **lines, int n) {\n    int total",
+      "stderr": "== Qwen3.8-Flash-Next native text engine | cache=170/layer | CPU ==\n[tok] loaded 248044 base pieces + 33 added tokens (max id 248076) from /root/colibri-test/models/qwen38-flash-next-fp8/tokenizer.json\n[enc] prompt tokens: 241 | generating 128 new tokens\n[qwen38] vision tower: 27 blocks, hidden 1152, 16 heads, patch 16, merge 2\n[qwen38] native text weights: prefix=model.language_model, 48 layers, PLE=1, cache=170/layer, FP8=native, BF16=native (resident matrices 10.88 GiB)\n[qwen38] trunk: 553 matrices int8 on the CPU (3.97 GiB, 7.93 GiB of BF16 released) in 1.9s; Q38_TRUNK_CPU_INT8=0 keeps BF16\n[qwen38] routed experts: int4-g64 from experts-int4g64/, 2764800 bytes (2.64 MiB) per expert (the snapshot's native FP8: 4915200 bytes); cache 170/layer x 48 layers = 21.01 GiB full; 56.1 GB available now holds 422/layer\n[VK] VRAM pressure-proofing: memory_priority on, memory_budget on\n[VK] ready: AMD Radeon 780M Graphics (RADV PHOENIX), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)\n[VK] qwen38: device ready, dense matrices on the CPU (COLI_VK_DENSE=0)\n[VK] qwen38: dense chain off (COLI_VK_CHAIN=0)\n[VK] qwen38: dense weights on the device and in host RAM (the dense part runs on the CPU)\n[USAGE] expert history: 158400 selections (/root/colibri-test/colibri-pr-validation-20261005/results/q38-i4g64-mtp-baseline-1/run.usage)\n[VK] tier qwen38: on, AMD Radeon 780M Graphics (RADV PHOENIX), budget 7.31 GiB = 2770 experts of 2.6 MiB (fmt 4 gs 64, down fmt 4 gs 64), shared RAM: a quarter of what the expert cache leaves, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots\n[VK] tier qwen38: warm start, 2770 experts from the history in 1.9s\nresident weights loaded in 4.5s | RSS after load: 11.61 GB\nGenerated (128 new tokens):\nText : [VK] tier qwen38 stream: a step of 241 rows; cold experts with 16 rows or more go to the device (the GEMM's 16 rows: the upload and the CPU's rows not measured yet); layer 0: 61 resident, 31 streamed, 289 kept on the CPU (1475 rows)\n\nTTFT: 16.69 s (time to first token)\n[qwen38 timers] total: 128 forwards\n[qwen38 timers]   expert-read        8.288 s     64.749 ms/forward\n[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward\n[qwen38 timers]   routed-expert      5.547 s     43.333 ms/forward\n[qwen38 timers]   shared-expert      1.054 s      8.234 ms/forward\n[qwen38 timers]   resident-mm       11.637 s     90.913 ms/forward\n[qwen38 timers]   deltanet          10.243 s     80.022 ms/forward\n[qwen38 timers]   qsa-index          0.110 s      0.863 ms/forward\n[qwen38 timers]   qsa-attn           2.083 s     16.274 ms/forward\n[qwen38 timers]   ple                1.031 s      8.057 ms/forward\n[qwen38 timers]   lm-head            1.359 s     10.614 ms/forward\n[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work\n[qwen38 timers] prefill: 1 forwards\n[qwen38 timers]   expert-read        3.906 s   3906.416 ms/forward\n[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward\n[qwen38 timers]   routed-expert      1.933 s   1933.317 ms/forward\n[qwen38 timers]   shared-expert      0.247 s    246.866 ms/forward\n[qwen38 timers]   resident-mm        2.866 s   2865.993 ms/forward\n[qwen38 timers]   deltanet           3.752 s   3751.728 ms/forward\n[qwen38 timers]   qsa-index          0.011 s     10.927 ms/forward\n[qwen38 timers]   qsa-attn           0.224 s    224.093 ms/forward\n[qwen38 timers]   ple                0.650 s    649.645 ms/forward\n[qwen38 timers]   lm-head            0.012 s     12.328 ms/forward\n[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work\n[qwen38 timers] decode: 127 forwards\n[qwen38 timers]   expert-read        4.381 s     34.500 ms/forward\n[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward\n[qwen38 timers]   routed-expert      3.613 s     28.451 ms/forward\n[qwen38 timers]   shared-expert      0.807 s      6.355 ms/forward\n[qwen38 timers]   resident-mm        8.771 s     69.062 ms/forward\n[qwen38 timers]   deltanet           6.491 s     51.111 ms/forward\n[qwen38 timers]   qsa-index          0.100 s      0.784 ms/forward\n[qwen38 timers]   qsa-attn           1.859 s     14.638 ms/forward\n[qwen38 timers]   ple                0.382 s      3.005 ms/forward\n[qwen38 timers]   lm-head            1.346 s     10.601 ms/forward\n[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work\n[qwen38 expert I/O] weight-ranges=18554 scale-ranges=0 coalesced-gate-up=0 prefetched=16815 parallel-batches=2146 resident-scales=0.00 MiB\n\nPEAK RSS: 28.44 GB\nExpert cache hit rate: 69.0% (hit=41260 miss=18554)\nSpeed: 2.93 tok/s (43.7s for 128 tokens)\n[VK] qwen38: 0 matmuls on the GPU (0 matrices resident, 0.0 MiB; placed int8 0, bf16 0, f32 0)\n[VK] tier qwen38 run: device 89124 of 176640 routed experts (50.5%; this run 89124 of 176640) | CPU RAM hits 41260, disk loads 18554 | resident 2770 (budget 2770, 7.30 GiB of 7.31 GiB, 30 blocks, frag 0.42) | uploads 4866 (11.14 GiB, 2770 warm), evictions 2096, skipped 145 queue + 27546 rate, failed 0 | device 7178.6 ms, CPU share 15258.8 ms, waited 1275.3 ms (82% of device time hidden) | balance: device share 0.29, 4868 rows handed to the CPU | stream: 48 steps, 1739 cold experts (4.48 GiB, 10.42 GB/s) and 61912 rows streamed in 85 sub-batches, prefetched 0 (0 used), 9443 cold experts (38884 rows) kept on the CPU | cooperative matmuls: 612\n[STATS] 335040 selections across 20176 distinct experts -> /root/colibri-test/colibri-pr-validation-20261005/results/q38-i4g64-mtp-baseline-1/run.usage\n"
+    },
+    {
+      "tag": "q38-i4g64-mtp-baseline-2",
+      "family": "qwen38",
+      "model": "/root/colibri-test/models/qwen38-flash-next-fp8",
+      "prompt": "/root/colibri-test/p4mtp/prompts/code.txt",
+      "new": 128,
+      "cap": 170,
+      "cold": true,
+      "env": {
+        "COLI_VULKAN": "1",
+        "COLI_VK_CHAIN": "0",
+        "COLI_VK_DENSE": "0",
+        "Q38_EXPERT_INT4": "1",
+        "Q38_MTP": "0",
+        "Q38_MTP_DRAFTS": "3"
+      },
+      "kind": "generate",
+      "prompt_sha256": "b840c508d4d473840929f53cc370614e1438c6d0fd5f9afc67176ce1d99dfc2f",
+      "history_sha256": "d7d86f69d2c83d900c7d869b7a04e34be19a4f466eb40ec7c52deb70d50fc108",
+      "cmd": [
+        "/root/colibri-test/colibri-pr-validation-20261005/src/c/qwen38",
+        "170",
+        "8",
+        "/root/colibri-test/p4mtp/prompts/code.txt"
+      ],
+      "settings": {
+        "OMP_NUM_THREADS": "8",
+        "COLI_NO_OMP_TUNE": "1",
+        "COLI_TIMERS": "1",
+        "VK_ICD_FILENAMES": "/usr/share/vulkan/icd.d/radeon_icd.json",
+        "COLI_LOOKUP": "0",
+        "Q38_MTP": "0",
+        "COLI_VULKAN": "1",
+        "COLI_VK_CHAIN": "0",
+        "COLI_VK_DENSE": "0",
+        "Q38_EXPERT_INT4": "1",
+        "Q38_MTP_DRAFTS": "3",
+        "SNAP": "/root/colibri-test/models/qwen38-flash-next-fp8",
+        "COLI_USAGE": "/root/colibri-test/colibri-pr-validation-20261005/results/q38-i4g64-mtp-baseline-2/run.usage",
+        "N_NEW": "128"
+      },
+      "load_start": [
+        1.62109375,
+        1.81298828125,
+        1.4033203125
+      ],
+      "source": "2f33f211ea6e28186d62cf9c00d511df826590a0",
+      "rc": 0,
+      "wall_s": 54.304,
+      "peak_rss_kib": 29819676,
+      "other_engines": [],
+      "stdout": "```c\nstatic int count_words(const char *s) {\n    int total = 0, in_word = 0;\n    for (const char *p = s; *p; p++) {\n        if (*p == ' ' || *p == '\\n' || *p == '\\t') {\n            in_word = 0;\n        } else if (!in_word) {\n            in_word = 1;\n            total++;\n        }\n    }\n    return total;\n}\n\nstatic void print_counts(const char **lines, int n) {\n    int total",
+      "stderr": "== Qwen3.8-Flash-Next native text engine | cache=170/layer | CPU ==\n[tok] loaded 248044 base pieces + 33 added tokens (max id 248076) from /root/colibri-test/models/qwen38-flash-next-fp8/tokenizer.json\n[enc] prompt tokens: 241 | generating 128 new tokens\n[qwen38] vision tower: 27 blocks, hidden 1152, 16 heads, patch 16, merge 2\n[qwen38] native text weights: prefix=model.language_model, 48 layers, PLE=1, cache=170/layer, FP8=native, BF16=native (resident matrices 10.88 GiB)\n[qwen38] trunk: 553 matrices int8 on the CPU (3.97 GiB, 7.93 GiB of BF16 released) in 1.9s; Q38_TRUNK_CPU_INT8=0 keeps BF16\n[qwen38] routed experts: int4-g64 from experts-int4g64/, 2764800 bytes (2.64 MiB) per expert (the snapshot's native FP8: 4915200 bytes); cache 170/layer x 48 layers = 21.01 GiB full; 56.1 GB available now holds 422/layer\n[VK] VRAM pressure-proofing: memory_priority on, memory_budget on\n[VK] ready: AMD Radeon 780M Graphics (RADV PHOENIX), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)\n[VK] qwen38: device ready, dense matrices on the CPU (COLI_VK_DENSE=0)\n[VK] qwen38: dense chain off (COLI_VK_CHAIN=0)\n[VK] qwen38: dense weights on the device and in host RAM (the dense part runs on the CPU)\n[USAGE] expert history: 158400 selections (/root/colibri-test/colibri-pr-validation-20261005/results/q38-i4g64-mtp-baseline-2/run.usage)\n[VK] tier qwen38: on, AMD Radeon 780M Graphics (RADV PHOENIX), budget 7.31 GiB = 2773 experts of 2.6 MiB (fmt 4 gs 64, down fmt 4 gs 64), shared RAM: a quarter of what the expert cache leaves, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots\n[VK] tier qwen38: warm start, 2773 experts from the history in 2.0s\nresident weights loaded in 4.5s | RSS after load: 11.61 GB\nGenerated (128 new tokens):\nText : [VK] tier qwen38 stream: a step of 241 rows; cold experts with 16 rows or more go to the device (the GEMM's 16 rows: the upload and the CPU's rows not measured yet); layer 0: 61 resident, 31 streamed, 289 kept on the CPU (1475 rows)\n\nTTFT: 16.75 s (time to first token)\n[qwen38 timers] total: 128 forwards\n[qwen38 timers]   expert-read        8.274 s     64.640 ms/forward\n[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward\n[qwen38 timers]   routed-expert      5.566 s     43.483 ms/forward\n[qwen38 timers]   shared-expert      1.046 s      8.173 ms/forward\n[qwen38 timers]   resident-mm       11.654 s     91.049 ms/forward\n[qwen38 timers]   deltanet          10.215 s     79.802 ms/forward\n[qwen38 timers]   qsa-index          0.110 s      0.857 ms/forward\n[qwen38 timers]   qsa-attn           2.075 s     16.211 ms/forward\n[qwen38 timers]   ple                1.044 s      8.160 ms/forward\n[qwen38 timers]   lm-head            1.359 s     10.616 ms/forward\n[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work\n[qwen38 timers] prefill: 1 forwards\n[qwen38 timers]   expert-read        3.952 s   3952.437 ms/forward\n[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward\n[qwen38 timers]   routed-expert      1.935 s   1934.785 ms/forward\n[qwen38 timers]   shared-expert      0.238 s    238.284 ms/forward\n[qwen38 timers]   resident-mm        2.890 s   2889.701 ms/forward\n[qwen38 timers]   deltanet           3.746 s   3745.537 ms/forward\n[qwen38 timers]   qsa-index          0.011 s     11.000 ms/forward\n[qwen38 timers]   qsa-attn           0.225 s    224.504 ms/forward\n[qwen38 timers]   ple                0.656 s    655.910 ms/forward\n[qwen38 timers]   lm-head            0.012 s     12.029 ms/forward\n[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work\n[qwen38 timers] decode: 127 forwards\n[qwen38 timers]   expert-read        4.321 s     34.027 ms/forward\n[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward\n[qwen38 timers]   routed-expert      3.631 s     28.591 ms/forward\n[qwen38 timers]   shared-expert      0.808 s      6.362 ms/forward\n[qwen38 timers]   resident-mm        8.765 s     69.012 ms/forward\n[qwen38 timers]   deltanet           6.469 s     50.937 ms/forward\n[qwen38 timers]   qsa-index          0.099 s      0.777 ms/forward\n[qwen38 timers]   qsa-attn           1.851 s     14.571 ms/forward\n[qwen38 timers]   ple                0.389 s      3.060 ms/forward\n[qwen38 timers]   lm-head            1.347 s     10.605 ms/forward\n[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work\n[qwen38 expert I/O] weight-ranges=18409 scale-ranges=0 coalesced-gate-up=0 prefetched=16662 parallel-batches=2080 resident-scales=0.00 MiB\n\nPEAK RSS: 28.44 GB\nExpert cache hit rate: 69.3% (hit=41476 miss=18409)\nSpeed: 2.93 tok/s (43.8s for 128 tokens)\n[VK] qwen38: 0 matmuls on the GPU (0 matrices resident, 0.0 MiB; placed int8 0, bf16 0, f32 0)\n[VK] tier qwen38 run: device 89191 of 176640 routed experts (50.5%; this run 89191 of 176640) | CPU RAM hits 41476, disk loads 18409 | resident 2773 (budget 2773, 7.31 GiB of 7.31 GiB, 30 blocks, frag 0.47) | uploads 4869 (11.14 GiB, 2773 warm), evictions 2096, skipped 146 queue + 27747 rate, failed 0 | device 7181.5 ms, CPU share 15241.2 ms, waited 1284.8 ms (82% of device time hidden) | balance: device share 0.17, 4962 rows handed to the CPU | stream: 48 steps, 1747 cold experts (4.50 GiB, 10.37 GB/s) and 62038 rows streamed in 84 sub-batches, prefetched 0 (0 used), 9438 cold experts (38749 rows) kept on the CPU | cooperative matmuls: 615\n[STATS] 335040 selections across 20115 distinct experts -> /root/colibri-test/colibri-pr-validation-20261005/results/q38-i4g64-mtp-baseline-2/run.usage\n"
+    },
+    {
+      "tag": "q38-i4g64-mtp-baseline-3",
+      "family": "qwen38",
+      "model": "/root/colibri-test/models/qwen38-flash-next-fp8",
+      "prompt": "/root/colibri-test/p4mtp/prompts/code.txt",
+      "new": 128,
+      "cap": 170,
+      "cold": true,
+      "env": {
+        "COLI_VULKAN": "1",
+        "COLI_VK_CHAIN": "0",
+        "COLI_VK_DENSE": "0",
+        "Q38_EXPERT_INT4": "1",
+        "Q38_MTP": "0",
+        "Q38_MTP_DRAFTS": "3"
+      },
+      "kind": "generate",
+      "prompt_sha256": "b840c508d4d473840929f53cc370614e1438c6d0fd5f9afc67176ce1d99dfc2f",
+      "history_sha256": "d7d86f69d2c83d900c7d869b7a04e34be19a4f466eb40ec7c52deb70d50fc108",
+      "cmd": [
+        "/root/colibri-test/colibri-pr-validation-20261005/src/c/qwen38",
+        "170",
+        "8",
+        "/root/colibri-test/p4mtp/prompts/code.txt"
+      ],
+      "settings": {
+        "OMP_NUM_THREADS": "8",
+        "COLI_NO_OMP_TUNE": "1",
+        "COLI_TIMERS": "1",
+        "VK_ICD_FILENAMES": "/usr/share/vulkan/icd.d/radeon_icd.json",
+        "COLI_LOOKUP": "0",
+        "Q38_MTP": "0",
+        "COLI_VULKAN": "1",
+        "COLI_VK_CHAIN": "0",
+        "COLI_VK_DENSE": "0",
+        "Q38_EXPERT_INT4": "1",
+        "Q38_MTP_DRAFTS": "3",
+        "SNAP": "/root/colibri-test/models/qwen38-flash-next-fp8",
+        "COLI_USAGE": "/root/colibri-test/colibri-pr-validation-20261005/results/q38-i4g64-mtp-baseline-3/run.usage",
+        "N_NEW": "128"
+      },
+      "load_start": [
+        1.56982421875,
+        2.05029296875,
+        1.5576171875
+      ],
+      "source": "2f33f211ea6e28186d62cf9c00d511df826590a0",
+      "rc": 0,
+      "wall_s": 55.305,
+      "peak_rss_kib": 29822384,
+      "other_engines": [],
+      "stdout": "```c\nstatic int count_words(const char *s) {\n    int total = 0, in_word = 0;\n    for (const char *p = s; *p; p++) {\n        if (*p == ' ' || *p == '\\n' || *p == '\\t') {\n            in_word = 0;\n        } else if (!in_word) {\n            in_word = 1;\n            total++;\n        }\n    }\n    return total;\n}\n\nstatic void print_counts(const char **lines, int n) {\n    int total",
+      "stderr": "== Qwen3.8-Flash-Next native text engine | cache=170/layer | CPU ==\n[tok] loaded 248044 base pieces + 33 added tokens (max id 248076) from /root/colibri-test/models/qwen38-flash-next-fp8/tokenizer.json\n[enc] prompt tokens: 241 | generating 128 new tokens\n[qwen38] vision tower: 27 blocks, hidden 1152, 16 heads, patch 16, merge 2\n[qwen38] native text weights: prefix=model.language_model, 48 layers, PLE=1, cache=170/layer, FP8=native, BF16=native (resident matrices 10.88 GiB)\n[qwen38] trunk: 553 matrices int8 on the CPU (3.97 GiB, 7.93 GiB of BF16 released) in 1.9s; Q38_TRUNK_CPU_INT8=0 keeps BF16\n[qwen38] routed experts: int4-g64 from experts-int4g64/, 2764800 bytes (2.64 MiB) per expert (the snapshot's native FP8: 4915200 bytes); cache 170/layer x 48 layers = 21.01 GiB full; 56.1 GB available now holds 422/layer\n[VK] VRAM pressure-proofing: memory_priority on, memory_budget on\n[VK] ready: AMD Radeon 780M Graphics (RADV PHOENIX), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)\n[VK] qwen38: device ready, dense matrices on the CPU (COLI_VK_DENSE=0)\n[VK] qwen38: dense chain off (COLI_VK_CHAIN=0)\n[VK] qwen38: dense weights on the device and in host RAM (the dense part runs on the CPU)\n[USAGE] expert history: 158400 selections (/root/colibri-test/colibri-pr-validation-20261005/results/q38-i4g64-mtp-baseline-3/run.usage)\n[VK] tier qwen38: on, AMD Radeon 780M Graphics (RADV PHOENIX), budget 7.30 GiB = 2769 experts of 2.6 MiB (fmt 4 gs 64, down fmt 4 gs 64), shared RAM: a quarter of what the expert cache leaves, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots\n[VK] tier qwen38: warm start, 2769 experts from the history in 1.9s\nresident weights loaded in 4.5s | RSS after load: 11.61 GB\nGenerated (128 new tokens):\nText : [VK] tier qwen38 stream: a step of 241 rows; cold experts with 16 rows or more go to the device (the GEMM's 16 rows: the upload and the CPU's rows not measured yet); layer 0: 61 resident, 31 streamed, 289 kept on the CPU (1475 rows)\n\nTTFT: 17.01 s (time to first token)\n[qwen38 timers] total: 128 forwards\n[qwen38 timers]   expert-read        8.387 s     65.527 ms/forward\n[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward\n[qwen38 timers]   routed-expert      5.675 s     44.336 ms/forward\n[qwen38 timers]   shared-expert      1.057 s      8.259 ms/forward\n[qwen38 timers]   resident-mm       11.740 s     91.722 ms/forward\n[qwen38 timers]   deltanet          10.318 s     80.606 ms/forward\n[qwen38 timers]   qsa-index          0.113 s      0.880 ms/forward\n[qwen38 timers]   qsa-attn           2.071 s     16.178 ms/forward\n[qwen38 timers]   ple                1.038 s      8.109 ms/forward\n[qwen38 timers]   lm-head            1.362 s     10.642 ms/forward\n[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work\n[qwen38 timers] prefill: 1 forwards\n[qwen38 timers]   expert-read        4.001 s   4001.120 ms/forward\n[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward\n[qwen38 timers]   routed-expert      2.032 s   2031.749 ms/forward\n[qwen38 timers]   shared-expert      0.255 s    255.384 ms/forward\n[qwen38 timers]   resident-mm        2.932 s   2931.647 ms/forward\n[qwen38 timers]   deltanet           3.777 s   3777.196 ms/forward\n[qwen38 timers]   qsa-index          0.011 s     10.846 ms/forward\n[qwen38 timers]   qsa-attn           0.224 s    223.894 ms/forward\n[qwen38 timers]   ple                0.654 s    653.562 ms/forward\n[qwen38 timers]   lm-head            0.012 s     12.109 ms/forward\n[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work\n[qwen38 timers] decode: 127 forwards\n[qwen38 timers]   expert-read        4.386 s     34.538 ms/forward\n[qwen38 timers]   fp8-expand         0.000 s      0.000 ms/forward\n[qwen38 timers]   routed-expert      3.643 s     28.687 ms/forward\n[qwen38 timers]   shared-expert      0.802 s      6.313 ms/forward\n[qwen38 timers]   resident-mm        8.809 s     69.360 ms/forward\n[qwen38 timers]   deltanet           6.540 s     51.499 ms/forward\n[qwen38 timers]   qsa-index          0.102 s      0.802 ms/forward\n[qwen38 timers]   qsa-attn           1.847 s     14.542 ms/forward\n[qwen38 timers]   ple                0.384 s      3.027 ms/forward\n[qwen38 timers]   lm-head            1.350 s     10.631 ms/forward\n[qwen38 timers] architecture phases overlap resident-mm; expert-read is disk service and fp8-expand is synchronous miss work\n[qwen38 expert I/O] weight-ranges=18473 scale-ranges=0 coalesced-gate-up=0 prefetched=16734 parallel-batches=2112 resident-scales=0.00 MiB\n\nPEAK RSS: 28.44 GB\nExpert cache hit rate: 69.1% (hit=41329 miss=18473)\nSpeed: 2.90 tok/s (44.2s for 128 tokens)\n[VK] qwen38: 0 matmuls on the GPU (0 matrices resident, 0.0 MiB; placed int8 0, bf16 0, f32 0)\n[VK] tier qwen38 run: device 89136 of 176640 routed experts (50.5%; this run 89136 of 176640) | CPU RAM hits 41329, disk loads 18473 | resident 2769 (budget 2769, 7.29 GiB of 7.30 GiB, 30 blocks, frag 0.70) | uploads 4865 (11.14 GiB, 2769 warm), evictions 2096, skipped 145 queue + 27474 rate, failed 0 | device 7192.9 ms, CPU share 15451.7 ms, waited 1292.4 ms (82% of device time hidden) | balance: device share 0.24, 4963 rows handed to the CPU | stream: 48 steps, 1739 cold experts (4.48 GiB, 10.34 GB/s) and 61912 rows streamed in 85 sub-batches, prefetched 0 (0 used), 9443 cold experts (38884 rows) kept on the CPU | cooperative matmuls: 612\n[STATS] 335040 selections across 20154 distinct experts -> /root/colibri-test/colibri-pr-validation-20261005/results/q38-i4g64-mtp-baseline-3/run.usage\n"
+    }
+  ]
+}

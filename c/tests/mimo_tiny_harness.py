@@ -14,6 +14,11 @@ What is checked, all token-exact (argmax, no tolerances):
     weights, an expert cache that evicts at every layer, prefill in blocks of 3
     and of 1 (the sliding-window ring across blocks), buffered expert reads
   - determinism (two identical runs, identical tokens)
+  - block invariance, BIT for bit: the logits of every position are the same
+    bytes whatever the prefill blocks (64, 3, 1) and the expert cache (one that
+    evicts at every layer), text and picture. A prompt resumed from a prefix or
+    a Brio photo is computed in other blocks than the same prompt cold, so this
+    is what lets the two agree to the last bit rather than to the argmax
   - with the vision fixture (make_mimo_tiny.py --vision): the picture through
     the tower, greedy and teacher-forced, f32 and native BF16, and the negated
     picture giving the reference's own answer for it
@@ -124,6 +129,51 @@ def teacher_forced(binary, fixture, ids, env, vocab, image=None):
                              f"{len(ids) * vocab}")
     return [max(range(vocab), key=raw[p * vocab:(p + 1) * vocab].__getitem__)
             for p in range(len(ids))]
+
+
+def logits_bytes(binary, fixture, ids, env, image=None):
+    with tempfile.NamedTemporaryFile(suffix=".f32", delete=False) as tmp:
+        path = tmp.name
+    try:
+        run_engine(binary, fixture, ids, 0, env, extra_env={"MIMO_LOGITS": path},
+                   image=image)
+        with open(path, "rb") as fh:
+            return fh.read()
+    finally:
+        os.unlink(path)
+
+
+def check_block_invariance(binary, fixture, reference):
+    """A row is a function of its own inputs, never of the rows that share its
+    prefill block: the logits must be the same BYTES for every block size.
+
+    A CPU property. With COLI_VULKAN=1 the device takes a block of two or more
+    rows through the tiled GEMM and a single row through the GEMV (#1834), and
+    the two sum in different orders, so the bytes depend on the block size by
+    design; tests/vulkan_engines.sh checks the device against the CPU's tokens
+    instead."""
+    vk = os.environ.get("COLI_VULKAN", "")
+    if vk and vk != "0":
+        print("skip block invariance: COLI_VULKAN=1 (GEMM for blocks, GEMV for one row)")
+        return
+    variants = {"blocks of 3": {"MIMO_CHUNK": "3"},
+                "one token at a time": {"MIMO_CHUNK": "1"},
+                "cache 4 (evicts at every layer)": {"MIMO_CAP": "4"}}
+    inputs = [(name, case["greedy_full_ids"], None)
+              for name, case in reference["cases"].items()]
+    if "image" in reference:
+        image = reference["image"]
+        inputs.append(("image", image["greedy_full_ids"],
+                       (fixture / "patches.f32", image["grid_h"], image["grid_w"])))
+    for name, ids, image in inputs:
+        base = logits_bytes(binary, fixture, ids, reference["engine_env"], image)
+        for label, extra in variants.items():
+            env = dict(reference["engine_env"], **extra)
+            if logits_bytes(binary, fixture, ids, env, image) != base:
+                raise AssertionError(f"block invariance: case '{name}', {label}: the "
+                                     f"logits are not the bytes of the default blocks")
+    print(f"ok block invariance: {len(inputs)} cases x {len(variants)} variants, "
+          f"bit-identical logits")
 
 
 def check_teacher_forcing(binary, fixture, reference, vocab):
@@ -268,6 +318,7 @@ def main():
     check_greedy(args.binary, fixture, reference)
     check_exact_variants(args.binary, fixture, reference)
     check_determinism(args.binary, fixture, reference)
+    check_block_invariance(args.binary, fixture, reference)
     check_teacher_forcing(args.binary, fixture, reference, config["vocab_size"])
     check_oracle_bites(args.binary, fixture, reference,
                        config["n_routed_experts"])

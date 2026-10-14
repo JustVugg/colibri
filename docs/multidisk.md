@@ -37,10 +37,47 @@ probe failures before trusting the split. See the
 [environment reference](ENVIRONMENT.md#dual-ssd-streaming) for the variables.
 
 Missing or divergent mirror shards fall back to the primary. For a smaller
-drive, use the [partial-mirror planner](../README.md#multiple-ssds-stream-model-copies-from-more-than-one-drive)
+drive, use the [partial-mirror planner](#partial-mirrors-coli-mirror)
 to stage a usage-ranked subset. `COLI_MODEL_DIRS` is a different layout: it
 spreads distinct shards across drives to combine capacity, rather than adding
 replicas of the same shards.
+
+Details worth knowing:
+
+- the mirror is **validated at startup** (per-file size + safetensors header must
+  be byte-identical to the primary); divergent or missing files stay on the
+  primary, so a **partial mirror is fine**: a smaller second SSD can serve the
+  shards it holds;
+- the mirror is **never written**: `.coli_usage`, `.coli_kv` and all sidecars stay
+  on the primary;
+- a read error on the mirror falls back to the primary (one warning, no crash), so
+  unplugging the second drive mid-run degrades instead of killing the server;
+- buffered reads use deterministic expert routing; eligible direct reads can
+  stripe one expert across replicas;
+- routing never changes tokens, because both copies are byte-identical; enable
+  `PROF=1` for the `MIRROR:` profile counters showing GB served per drive.
+
+## Partial mirrors: `coli mirror`
+
+For a second drive that cannot hold the whole model, Colibri can rank a partial
+mirror from the expert history it already learns. Run a few representative
+prompts first so `.coli_usage` reflects the workload, then plan, stage, and
+verify the mirror:
+
+```bash
+./c/coli mirror plan  --model /fast/glm52_i4 --mirror /second/glm52_i4 \
+  --budget-gib 200 --reserve-gib 20
+./c/coli mirror stage --model /fast/glm52_i4 --mirror /second/glm52_i4 \
+  --budget-gib 200 --reserve-gib 20
+./c/coli mirror verify --model /fast/glm52_i4 --mirror /second/glm52_i4
+```
+
+The planner reads safetensors headers directly, follows split-model directories
+from `COLI_MODEL_DIRS`, and prioritizes shards that can serve the hottest routed
+experts. Staging never changes the primary model: it copies through temporary
+files, preserves the requested free-space reserve, verifies every shard with
+SHA-256, never deletes an existing mirror shard, and atomically publishes a
+receipt only after the selected mirror is ready.
 
 ## What has been measured
 

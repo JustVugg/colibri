@@ -1,6 +1,8 @@
 import { useState } from "react"
 import { Check, Copy } from "lucide-react"
 
+import { parseTableAt, type Table } from "@/lib/markdown-table"
+
 /* A small Markdown subset, rendered as React nodes rather than HTML.
  *
  * The text comes from a model, so nothing here ever reaches innerHTML: every
@@ -10,9 +12,14 @@ import { Check, Copy } from "lucide-react"
  *
  * Covered, because it is what a model actually emits in chat: fenced code with
  * its language and a copy button, inline code, bold, italic, links, headings,
- * ordered and unordered lists, blockquotes and horizontal rules. Not covered:
- * tables, footnotes, raw HTML. Those degrade to the literal text instead of
- * disappearing, which is the right failure for a reader.
+ * ordered and unordered lists, blockquotes, horizontal rules and GFM pipe
+ * tables. Not covered: footnotes, raw HTML. Those degrade to the literal text
+ * instead of disappearing, which is the right failure for a reader.
+ *
+ * Tables used to be in that list, but they did not in fact degrade to literal
+ * text: the rows fell through to the paragraph branch and were joined with
+ * spaces, so a table arrived as one run-on line. Parsing them (lib/markdown-table)
+ * is the smaller change.
  */
 
 type Segment = { kind: "code"; lang: string; body: string } | { kind: "text"; body: string }
@@ -79,6 +86,23 @@ function CodeBlock({ lang, body }: { lang: string; body: string }) {
   </figure>
 }
 
+function MdTable({ head, align, rows, id }: Table & { id: string }) {
+  const cell = (at: number) => (align[at] ? { textAlign: align[at]! } : undefined)
+  return <div className="md-table">
+    <table>
+      <thead>
+        <tr>{head.map((text, at) =>
+          <th key={at} style={cell(at)}>{inline(text, `${id}-th${at}`)}</th>)}</tr>
+      </thead>
+      <tbody>
+        {rows.map((row, at) =>
+          <tr key={at}>{row.map((text, column) =>
+            <td key={column} style={cell(column)}>{inline(text, `${id}-td${at}-${column}`)}</td>)}</tr>)}
+      </tbody>
+    </table>
+  </div>
+}
+
 /** One text segment: block structure, then inline marks inside each block. */
 function blocks(source: string, key: string): React.ReactNode[] {
   const out: React.ReactNode[] = []
@@ -106,13 +130,24 @@ function blocks(source: string, key: string): React.ReactNode[] {
   }
   const flushAll = () => { flushParagraph(); flushList(); flushQuote() }
 
-  for (const line of lines) {
+  for (let at = 0; at < lines.length; at++) {
+    const line = lines[at]
     const heading = /^(#{1,4})\s+(.*)$/.exec(line)
     const bullet = /^\s*[-*+]\s+(.*)$/.exec(line)
     const numbered = /^\s*\d+[.)]\s+(.*)$/.exec(line)
     const quoted = /^>\s?(.*)$/.exec(line)
 
     if (!line.trim()) { flushAll(); continue }
+    /* Before the list and paragraph branches: a bullet-looking delimiter row
+       such as "|---|---|" must not be read as a list item. */
+    const table = line.includes("|") ? parseTableAt(lines, at) : null
+    if (table) {
+      flushAll()
+      const id = `${key}-t${out.length}`
+      out.push(<MdTable key={id} id={id} head={table.head} align={table.align} rows={table.rows} length={table.length} />)
+      at += table.length - 1
+      continue
+    }
     if (/^\s*([-*_])\s*\1\s*\1[\s\-*_]*$/.test(line)) { flushAll(); out.push(<hr key={`${key}-hr${out.length}`} />); continue }
     if (heading) {
       flushAll()

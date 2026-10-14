@@ -9,14 +9,27 @@ A short f32 tensor: load_f32() sized the buffer by the numel the header declares
 while the forward pass reads norms, router, mHC and vision weights by the sizes in
 config.json. One element short was a heap read past the buffer.
 
+A matrix of the wrong shape: load_mat() took rows and columns from the header,
+and mm() writes w->rows values per token and reads w->columns. One row more was a
+heap write past the output buffer, one column more a read past the input; the same
+held for a dense int4 container, and for a shared expert wider than the FFN
+buffers, which config.json can ask for through n_shared_experts.
+
 Runs in the GLM-5.3 oracle job of check.yml, on the streaming fixture it builds
 (the same one test_glm53_context_exceeded uses):
 
   COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_hostile_weights
+
+and the matrix shapes once more on the f32 fixture, whose routed experts are
+resident and so pass through load_mat() too:
+
+  COLI_GLM53_FIXTURE=/tmp/glm53_mm python -m unittest -v \
+      tests.test_glm53_hostile_weights.Glm53MatrixShapeTest
 """
 import json
 import math
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -24,7 +37,8 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from safetensors_edit import copy_fixture, fill_nan, shape_of, shrink  # noqa: E402
+from safetensors_edit import (copy_fixture, dtype_of, fill_nan, put,  # noqa: E402
+                              reshape, shape_of, shrink)
 
 HERE = Path(__file__).resolve().parent.parent
 BINARY = next((path for path in (HERE / "glm53.exe", HERE / "glm53") if path.exists()), None)
@@ -60,6 +74,37 @@ F32_TENSORS = ["model.language_model." + name for name in (
     "blocks.0.mlp.up_proj.weight", "blocks.0.mlp.up_proj.bias",
     "blocks.0.mlp.down_proj.weight", "blocks.0.mlp.down_proj.bias",
 )]
+
+# Every matrix glm53 loads through load_mat(), once per shape rule: layer 0 holds the
+# KDA projections and the dense MLP, layer 3 the MLA + indexer and the shared expert.
+MATRICES = ["lm_head.weight"] + ["model.language_model." + name for name in (
+    "layers.0.self_attn.q_proj.weight", "layers.0.self_attn.k_proj.weight",
+    "layers.0.self_attn.v_proj.weight", "layers.0.self_attn.o_proj.weight",
+    "layers.0.self_attn.g_a_proj.weight", "layers.0.self_attn.g_b_proj.weight",
+    "layers.0.self_attn.f_a_proj.weight", "layers.0.self_attn.f_b_proj.weight",
+    "layers.0.self_attn.b_proj.weight",
+    "layers.0.mlp.gate_proj.weight", "layers.0.mlp.up_proj.weight",
+    "layers.0.mlp.down_proj.weight",
+    "layers.3.self_attn.q_a_proj.weight", "layers.3.self_attn.q_b_proj.weight",
+    "layers.3.self_attn.kv_a_proj_with_mqa.weight", "layers.3.self_attn.o_proj.weight",
+    "layers.3.self_attn.indexer.wq_b.weight", "layers.3.self_attn.indexer.wk.weight",
+    "layers.3.self_attn.indexer.weights_proj.weight",
+    "layers.3.self_attn.indexer.index_kpool_compress_gate",
+    "layers.3.mlp.shared_experts.gate_proj.weight",
+    "layers.3.mlp.shared_experts.up_proj.weight",
+    "layers.3.mlp.shared_experts.down_proj.weight",
+)]
+# A routed expert passes through load_mat() only when the fixture keeps it in f32.
+EXPERTS = ["model.language_model.layers.3.mlp.experts.0." + name + ".weight"
+           for name in ("gate_proj", "up_proj", "down_proj")]
+SHARED = "model.language_model.layers.3.mlp.shared_experts."
+
+
+def to_int4(snapshot, name, rows, columns):
+    """Store `name` as the dense int4 container load_mat() takes as it is."""
+    put(snapshot, name, "U8", [rows, columns // 2], bytes(rows * columns // 2))
+    put(snapshot, name + ".qs", "F32", [rows * columns // 64],
+        struct.pack("<f", 0.01) * (rows * columns // 64), beside=name)
 
 
 def image_run(snapshot):
@@ -151,6 +196,65 @@ class Glm53ShortTensorTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn(f"{name}: ", result.stderr)
                 self.assertIn("the config needs", result.stderr)
+
+
+@unittest.skipUnless(BINARY, "glm53 engine is not built")
+@unittest.skipUnless(FIXTURE.name and (FIXTURE / "patches.f32").is_file(),
+                     "COLI_GLM53_FIXTURE not set to a GLM-5.3-Flash container with an image")
+class Glm53MatrixShapeTest(unittest.TestCase):
+    def assertRefused(self, snapshot, message):
+        result = image_run(snapshot)
+        for marker in SANITIZER:
+            self.assertNotIn(marker, result.stderr, result.stderr[-4000:])
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(message, result.stderr)
+
+    def test_a_matrix_one_row_or_column_off_is_refused_at_load(self):
+        resident = [name for name in EXPERTS if dtype_of(FIXTURE, name) == "F32"]
+        for name in MATRICES + resident:
+            rows, columns = shape_of(FIXTURE, name)
+            for shape in ([rows + 1, columns], [rows, columns + 1]):
+                with self.subTest(name=name, shape=shape), \
+                        tempfile.TemporaryDirectory() as scratch:
+                    snapshot = copy_fixture(FIXTURE, Path(scratch) / "model")
+                    reshape(snapshot, name, shape)
+                    self.assertRefused(snapshot, f"{name}: {shape[0]} x {shape[1]}, "
+                                                 f"the config needs {rows} x {columns}")
+
+    def test_an_int4_matrix_takes_its_shape_from_the_config(self):
+        name = "model.language_model.layers.3.self_attn.o_proj.weight"
+        rows, columns = shape_of(FIXTURE, name)
+        with tempfile.TemporaryDirectory() as scratch:
+            snapshot = copy_fixture(FIXTURE, Path(scratch) / "model")
+            to_int4(snapshot, name, rows, columns)
+            result = image_run(snapshot)
+        for marker in SANITIZER:
+            self.assertNotIn(marker, result.stderr, result.stderr[-4000:])
+        self.assertEqual(result.returncode, 0, result.stderr[-4000:])
+        # the last one has the right byte count, split into twice the rows
+        for shape in ([rows + 1, columns], [rows, columns + 64], [rows * 2, columns // 2]):
+            with self.subTest(shape=shape), tempfile.TemporaryDirectory() as scratch:
+                snapshot = copy_fixture(FIXTURE, Path(scratch) / "model")
+                to_int4(snapshot, name, *shape)
+                self.assertRefused(snapshot, f"{name}: {shape[0]} rows and "
+                                             f"{shape[0] * shape[1]} values, "
+                                             f"the config needs {rows} x {columns}")
+
+    def test_a_shared_expert_wider_than_the_ffn_buffers_is_refused(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            snapshot = copy_fixture(FIXTURE, Path(scratch) / "model")
+            config = json.loads((snapshot / "config.json").read_text())
+            text = config["text_config"]
+            widest = max(text["intermediate_size"], text["moe_intermediate_size"])
+            shared = widest // text["moe_intermediate_size"] + 1
+            text["n_shared_experts"] = shared
+            (snapshot / "config.json").write_text(json.dumps(config))
+            # the file agrees with that config, so only the buffers can stop it
+            hidden, width = text["hidden_size"], text["moe_intermediate_size"] * shared
+            reshape(snapshot, SHARED + "gate_proj.weight", [width, hidden])
+            reshape(snapshot, SHARED + "up_proj.weight", [width, hidden])
+            reshape(snapshot, SHARED + "down_proj.weight", [hidden, width])
+            self.assertRefused(snapshot, f"n_shared_experts={shared} does not fit the FFN buffers")
 
 
 if __name__ == "__main__":

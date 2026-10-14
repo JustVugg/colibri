@@ -1,0 +1,60 @@
+{
+  "architectures": [
+    "ModernBertForMaskedLM"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "bos_token_id": 449,
+  "cls_token_id": 449,
+  "eos_token_id": 450,
+  "sep_token_id": 450,
+  "pad_token_id": 451,
+  "classifier_activation": "gelu",
+  "classifier_bias": false,
+  "classifier_dropout": 0.0,
+  "classifier_pooling": "mean",
+  "decoder_bias": true,
+  "deterministic_flash_attn": false,
+  "dtype": "float32",
+  "embedding_dropout": 0.0,
+  "global_attn_every_n_layers": 3,
+  "gradient_checkpointing": false,
+  "hidden_activation": "gelu",
+  "hidden_size": 128,
+  "initializer_cutoff_factor": 2.0,
+  "initializer_range": 0.02,
+  "intermediate_size": 160,
+  "layer_norm_eps": 1e-05,
+  "layer_types": [
+    "full_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention"
+  ],
+  "local_attention": 16,
+  "max_position_embeddings": 512,
+  "mlp_bias": false,
+  "mlp_dropout": 0.0,
+  "model_type": "modernbert",
+  "norm_bias": false,
+  "norm_eps": 1e-05,
+  "num_attention_heads": 4,
+  "num_hidden_layers": 4,
+  "position_embedding_type": "absolute",
+  "repad_logits_with_grad": false,
+  "rope_parameters": {
+    "full_attention": {
+      "rope_theta": 160000.0,
+      "rope_type": "default"
+    },
+    "sliding_attention": {
+      "rope_theta": 10000.0,
+      "rope_type": "default"
+    }
+  },
+  "sparse_pred_ignore_index": -100,
+  "sparse_prediction": false,
+  "tie_word_embeddings": true,
+  "transformers_version": "5.0.0",
+  "vocab_size": 640
+}

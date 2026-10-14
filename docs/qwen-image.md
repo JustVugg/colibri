@@ -260,6 +260,62 @@ Measured on a server with 8 Zen 4 cores (AVX-512, 8 OpenMP threads), 768x512,
   scores 30.1 dB with them and 35.6 dB without, and by eye the two cannot be
   told apart.
 
+On a GPU, a `make qwenimage VK=1` build with `COLI_VULKAN=1` runs the
+transformer there. With the device chain (`qwenimage_chain.h`, on by default on a
+discrete GPU and on a Radeon 780M, `COLI_VK_CHAIN=0` to keep it off) every block of
+a step runs on the device with the image tokens resident from the input layer to
+the output layer: the modulated norms, q/k/v, the per-head norms and RoPE, the
+attention of the image tokens over the prompt's tokens and their own, the gated
+residuals and the MLP. The prompt's keys and values go up once per prompt, the
+timestep's modulation once per step, the latents up and the prediction down once
+per step. Without the chain (`COLI_VK_CHAIN=0`, or a device that refuses the
+chain's buffers) the matrices run there one by one and the attention on the CPU,
+as before. The weights keep the storage `COLI_IMG_BITS` gave them (int8 by default,
+bf16 or f32) and the activations stay f32, so `COLI_IMG_ACT8` does not apply on the
+device and the result is the CPU's `COLI_IMG_ACT8=0` run up to summation order. When
+the chain runs, the VAE decodes on the device too (`qwenimage_vae_vk.h`: its 3x3
+convolutions as a band's taps and one GEMM, the norms, the shortcuts; the mid block's
+attention over every pixel on the CPU), with the CPU's decode as the fallback. The
+text encoder runs on the CPU.
+
+A card whose free memory does not hold the transformer (it is 7.1 GB in int8: a 6 or
+8 GB card) keeps the blocks that fit and uploads the others at every step, two at a
+time, each going up while the block before it runs; their matrices never go through
+the one-by-one path, so the device is not asked for more memory than it has. The
+start says how many blocks stay (`[VK] qwenimage: 9 of 32 blocks stay on the
+device`), and `COLI_VK_QI_RESIDENT=n` forces the number. On the 780M, streaming
+every block costs 0.3 s on a 512x512 step (5.64 s against 5.35); a discrete card
+moves them over PCIe, about 6.5 GB a step. With blocks streamed, the VAE decodes on
+the CPU.
+
+`COLI_VK_QI_ATTN=coop` runs the attention on the device's matrix units (tensor
+cores, WMMA, XMX; cooperative matrices at subgroups of 32 or 64) with int8 weights:
+f16 operands, the result the f32 attention's to about one part in a thousand. It is
+off by default because on the 780M it is slower (a 1024x1024 step's attention 32.5 s
+against 17.9): RDNA3's matrix units are only twice its f32 rate. A card whose matrix
+units outrun its f32 by more may gain; that has not been measured.
+
+Measured on a Radeon 780M (an integrated GPU sharing the RAM of the 8-core Zen 4
+above), 8 steps:
+
+| | 512x512, a step | 1024x1024, a step | 512x512, one image |
+|---|---|---|---|
+| CPU | 11.6 s | 67 s | 1 min 52 s |
+| GPU, the matrices one by one | 11.8 s | 63 s | |
+| GPU, the chain | 5.4 s | 38 s | 61 s |
+
+The image's time with the chain: 11 s to load and encode the prompt, 42 s of
+denoising, 7.5 s of VAE (6.1 s of it on the device; 8.0 s on the CPU). At 1024x1024
+the VAE takes 24 s on the 780M against the CPU's 28 to 30: an integrated GPU's f32
+products gain little there, a discrete card's more. Loading went from 34 s to 7.5 s in this release: four
+layers at once, each matrix quantized straight from its bf16 rows
+(`COLI_IMG_LOAD_THREADS` sets how many; each holds one matrix's bf16 bytes, up to
+about 140 MB, while it quantizes). On a 1024x1024 step the 780M spends half the
+time in the attention (the image tokens over each other, 4096 of them), the other
+half in the matrices. A discrete card has not been measured on this path yet; the
+matrices-one-by-one path took a 512x512 step in 4.5 s on an RTX 5060 Ti 16 GB
+(#1910), the attention still on the CPU.
+
 Every stage of the engine is checked against the diffusers pipeline: on the
 real checkpoint in f32 the text encoder, all eight denoising steps and the VAE
 agree to about one part in a million, and of the million bytes of the final

@@ -120,8 +120,8 @@ monitors may still show the touched mapping (about 33.8 GB for the full model)
 in RSS; it is clean file-backed memory, not private heap, so use `/proc` smaps
 accounting to distinguish file-backed RSS from private anonymous memory. The
 option has no fallback: tensors that need load-time conversion, non-F32 scale
-sidecars, and enabled Vulkan/CUDA backends are refused. A Vulkan build therefore
-requires `K3_VK=0 K3_MMAP=1` explicitly.
+sidecars, and enabled Vulkan/CUDA backends are refused: `K3_MMAP=1` runs with
+`COLI_VULKAN` unset (or `K3_VK=0`) and `K3_CUDA` off.
 
 Sizes: source 1.56 TB → ≈1.50 TB (`--bits 8`) / ≈1.48 TB (`--bits 4`). The
 experts (93 % of bytes) are already at 4.25 bits/weight and cannot shrink
@@ -171,9 +171,10 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_HEAD_BITS` | 8 | load-time bits for lm_head |
 | `K3_MMAP` | 0 | map fully prepared U8/F32 weights read-only (experimental, CPU-only, no conversion fallback) |
 | `K3_EXPERT_GB` | 8 | routed-expert LRU budget |
-| `K3_VK` | 1 | Vulkan tier when built with `make VK=1 kimi_k3` (0 = pure CPU) |
-| `K3_VK_GB` | driver budget | VRAM cap for the Vulkan tier |
-| `K3_VK_UP` | 8 | routed-expert uploads per step (fill-once tier) |
+| `COLI_VULKAN` | 0 | `make VK=1 kimi_k3`: routed experts on the shared Vulkan expert tier, shared experts where `COLI_VK_DENSE` puts the dense matrices (see [Vulkan](#vulkan-make-vk1-kimi_k3)) |
+| `K3_VK` | unset | old switch, an alias: 1 = `COLI_VULKAN=1`, 0 = never open the device |
+| `K3_VK_GB` | unset | old switch, read as `COLI_VK_TIER_GB` when that is unset |
+| `K3_VK_UP` | unset | old switch, a number read as `COLI_VK_TIER_RATE` when that is unset; `auto` does nothing |
 | `K3_DIRECT` | 1 | O_DIRECT expert reads (0 = buffered + WILLNEED) |
 | `K3_IDOT` | 1 | int8-activation expert matmuls (0 = exact-float kernel) |
 | `K3_PIPE` | 1 | overlap expert loads with compute (loader threads) |
@@ -243,37 +244,67 @@ is returned as `reasoning_content`, response text as `content`, and
 honoured between generated tokens. Long prefill also polls `CANCEL` between
 layers and drops the unpublished partial state before serving another request.
 
-## Vulkan tier (`make VK=1 kimi_k3`)
+Long agent sessions can opt into recurrent-state checkpoints (`COLI_K3_CKPT=N`
+slots in RAM, or parked on disk with `COLI_K3_CKPT_DIR`): an edited or follow-up
+prompt restores the deepest surviving checkpoint and re-prefills only the tail,
+instead of replaying the whole conversation through the SSM layers.
 
-The shared Vulkan backend (`backend_vulkan.c`) gained an **fmt=7 MXFP4**
-decode path for K3's expert format — e2m1 nibbles with the ue8m0 exponents
-expanded to f32 per-32-group scales at upload, so the QAT bytes are uploaded
-exactly as stored and never re-encoded (kernel vs `matmul_mxfp4`: rel_l2
-2.2e-07 on an RX 9070/RADV, 2.6e-07 on llvmpipe;
-`tests/test_vk_mxfp4.c`). The engine keeps two residency classes on the
-card, both with transparent CPU fallback and identical output:
+## Vulkan (`make VK=1 kimi_k3`)
 
-- **shared experts**, uploaded once at init (int4/int8, the existing
-  fmt-1/4 shaders): they run every token and are the largest always-on
-  dense slice that fits VRAM (7.5 GB for all 92 MoE layers at int4);
-- a **fill-once routed-expert tier** in fmt=7: experts enter from
-  freshly-read RAM slots (`K3_VK_UP` per step) until the VRAM budget
-  (`K3_VK_GB`) is reached. At decode, tier-resident experts skip **both**
-  the 17.5 MB disk read and the CPU matmuls (one paired w1/w3 submit,
-  SiTU-GLU on CPU, w2 down). Chunked prefill stays on the CPU-batched path
-  and still warms the tier.
+Run with `COLI_VULKAN=1`, a `VK=1` build puts the routed experts on the shared Vulkan
+expert tier ([vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc)): the shards'
+MXFP4 bytes as they sit in RAM (e2m1 nibbles, the ue8m0 group exponents widened to
+the f32 scales the shader reads, never re-encoded; the fmt 7 kernel against
+`matmul_mxfp4`: rel_l2 2.2e-07 on an RX 9070/RADV, 2.6e-07 on llvmpipe,
+`tests/test_vk_mxfp4.c`), gate, SiTU-GLU and down on the device, in the latent
+space (the tier's hidden is the latent, 3584, its intermediate `moe_inter`, 3072).
+
+- **What is resident adapts.** At startup the tier fills its budget from the expert
+  history (`<snap>/.coli_usage`, the hottest first, read in parallel); after that
+  every expert the CPU computes is a candidate, and a hotter one displaces the
+  coldest resident. The engine's own tier before this one filled once and never
+  let go.
+- **The device and the CPU work at once, prefill included.** Each MoE step sends
+  the (position, rank) pairs whose expert is resident to the device as one batch;
+  the CPU reads and computes the other experts of the chunk's union and the shared
+  experts meanwhile. An expert the device took entirely is not read from disk.
+- **The sum keeps the CPU run's order.** Every pair joins its position in the
+  union's disk-offset order, the order a CPU-only run adds them, the device's rows
+  and the CPU's alike: which experts were resident never changes the order, and an
+  expert computed on the CPU keeps the CPU run's bits.
+- **The shared experts** go to the device where `COLI_VK_DENSE` puts the dense
+  matrices (int8, int4-g64 or f32, as `K3_BITS` made them; one row at a time, so
+  decode): on a discrete GPU the device, on an integrated GPU or Lavapipe the CPU
+  while the tier runs. KDA, MLA, the latent projections, the router and the head stay
+  on the CPU. With `COLI_VK_TIER=0` the shared experts alone go to the device.
+
+The device computes with f32 activations: its experts match `K3_IDOT=0`, the
+configuration of the vendor oracle, while the CPU's default kernel rounds
+activations to int8 per 32. With `K3_IDOT=0` a run with the tier gives the CPU's
+tokens on the tiny fixture and passes Moonshot's oracle, the eviction and warm-start
+cases included (`tests/vulkan_engines.sh kimi`). With `K3_CUDA=1` as well, CUDA
+wins and the Vulkan tier stays off. Each run and serve turn ends with
+`[VK] kimi_k3: N matmuls on the GPU` and the tier's `[VK] tier kimi_k3` line.
+
+The old switches still work, read as the shared tier's (an explicit shared one
+wins): `K3_VK=1` opens the device as `COLI_VULKAN=1` does and `K3_VK=0` keeps it
+closed, `K3_VK_GB` is the tier's budget (`COLI_VK_TIER_GB`), a numeric `K3_VK_UP`
+its promotions per token (`COLI_VK_TIER_RATE`); `K3_VK_UP=auto` and
+`K3_VK_FILL_FRAC` do nothing, since the shared tier uploads on a thread of its own
+and never holds a step. One default changed: a `VK=1` build used to open the device
+without being asked (`K3_VK` defaulted to 1); it now waits for `COLI_VULKAN=1` or
+`K3_VK=1`, like every engine, and without either it is the CPU build's bytes.
 
 K3's Quantile-Balancing-flat routing caps what any cache tier can do — the
-tier's value scales with how long the server lives (fill-once) and with the
-measured short-term reuse (temporal locality), not with marginal expert
-heat. `K3_VK=0` disables the tier at runtime.
+tier's value scales with how long the server lives and with the measured
+short-term reuse (temporal locality), not with marginal expert heat.
 
 ## Current limitations
 
 - Decode is single-token (no speculative decoding — K3 has no MTP head).
 - Tool declarations/calls and image content are not exposed through the shared
   gateway yet; unsupported requests fail explicitly.
-- CPU + optional Vulkan tier (no CUDA/Metal).
+- CPU + optional Vulkan (the shared expert tier; no CUDA/Metal).
 - The protocol, tokenizer, gateway, TUI, and Web client paths are locally
   testable without the 1.5 TB checkpoint. A release claim still requires one
   full-model multi-turn TUI/Web run on a host that owns the complete snapshot.

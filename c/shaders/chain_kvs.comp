@@ -1,0 +1,537 @@
+#version 450
+// Attention over a KV cache split between the device and the host (vk_chain.c,
+// VKC_P_KVS; vk_chain.h: vkc_kvs_*; the host side is vk_kvsplit.h). Past the device's
+// budget a layer's cache keeps only some blocks of B positions on the device: `ns`
+// slots of B rows each, a block table bt (block -> slot, -1: the block is in the
+// host's RAM only) and its inverse rb (slot -> block, -1: a free slot), both in the
+// int buffer `tab`; a block pinned by a selection's reads has bit 30 set in bt. The
+// partition of a row's positions depends on the row's own position only, so a row
+// gets the same bits however the forward around it is cut into steps: the device
+// takes the positions of the `anchor` + 1 newest blocks up to the row's (blocks
+// pos/B - anchor .. pos/B, every one of them on the device while a step holds the
+// row) and, from a list, the positions in pinned blocks; the host takes the rest.
+// Each part writes a partial result: the unnormalized value sum acc and the softmax
+// statistics (m, the running max, and l, the sum of exp(score - m)); mode 2 merges
+// the two:
+//   M = max(m_d, m_c), e_x = exp(m_x - M), out = (e_d acc_d + e_c acc_c) / (e_d l_d + e_c l_c)
+// which is the full attention up to the order of the sums. A part with no position
+// has m = -3e38, l = 0, acc = 0 and weighs nothing. Position t sits in device row
+// slot*B + t % B, slot = bt[t / B] without bit 30.
+//
+// mode 0, grouped-query attention (chain_attn.comp's arithmetic over the device's
+//   rows): one workgroup per (head h = WorkGroupID.x, row s = WorkGroupID.y), the
+//   online softmax over tiles of 256 positions. Causal: the device's positions of
+//   first..pos_base+s (first = max(0, pos - win + 1) with a window, else 0), in
+//   order; with a selection list (sel_row > 0, sel[sel_off + s*sel_row] = count >= 0,
+//   then the positions; a negative count means causal), the device's listed positions
+//   in list order (a negative entry is skipped). K and V as
+//   chain_attn keeps them (head-major (kvh*rows + r)*hd, or position-major
+//   (r*KVH + kvh)*hd with kv_pm), at k_off / v_off; V's head dim vd. With a sink the
+//   running max and sum start from snk[sink_off + h] (MiMo's attention sink: it joins
+//   the denominator, so it belongs to exactly one part, the device's).
+//   flags 1 (fin): every visible position is on the device; the output is normalized
+//   (times sigmoid(gate[g_off + s*g_row + h*g_seg + d]) with flags 2) at o_off +
+//   s*o_row + h*vd, as chain_attn writes it. Otherwise acc at o_off + s*o_row + h*vd
+//   and (m, l) at st_off + (s*H + h)*2. Limits: hd, vd <= 256.
+// mode 1, multi-head latent attention (chain_mla.comp's core over the device's rows):
+//   score_t = (qa . L[t] + qr . Rc[t]) * scale, acc = sum softmax-weighted L[t] (K
+//   floats); the device's positions of kv_start..pos_base+s, or of the row's list (a
+//   negative entry skipped); the latent at lat_off + r*lat_row, the
+//   rope key at rope_off + r*rope_row. flags 1: the normalized clat at o_off + s*o_row
+//   + h*o_seg, as chain_mla writes it; else acc there and (m, l) at st_off + (s*H+h)*2.
+//   Limits: K <= 1024, R <= 128.
+// flags 32 (cold), modes 0, 1 and 3: the host's positions of the row instead of the
+//   device's, read from a buffer in the host cache's own layout (an import of its pages:
+//   position t is row t, `rows` its positions for head-major K/V), so the device computes
+//   the part the CPU would: causal, [the row's first position, its share's first block);
+//   listed, the entries older than the share and not in a pinned block. The table only
+//   says what the device holds; a part's (m, l, acc) as without the flag. No sink.
+// mode 2, the merge: segment g = (s, h) of d floats, s = g / H. The device's part at
+//   a_off + s*a_row + h*a_seg with its (m, l) at sa_off + 2g (buffer 0), the host's
+//   packed at c_off + g*d with (m, l) at sc_off + 2g (buffer 1); the result at o_off +
+//   s*o_row + h*o_seg, times sigmoid(gate[g_off + s*g_row + h*g_seg + i]) with flags 2,
+//   rounded to bf16 with flags 4 (DeepSeek V4's attention output).
+// mode 3, Inkling's attention (chain_relattn.comp's arithmetic over the device's rows,
+//   causal, a global layer): score_t = tau[s] * (q . k_t * scale + (d < ext ? bias(d) :
+//   0)), d = pos - t, bias(d) = sum_j r[s][h][j] * relp[j*ext + d] in j's order; q at
+//   q_off + s*q_row + h*hd, r at r_off + s*r_row + h*d_rel (buffer 4), relp at relp_off
+//   (buffer 6), tau[s] at tau_off + s of buffer 5 (floats); K/V head-major. Outputs as
+//   mode 0's (fin: normalized). Limits: hd <= 256, d_rel <= 64.
+// mode 4, DeepSeek's sparse attention with a sink (chain_dsv4.comp mode 0's arithmetic):
+//   row s's list l[l_off + s*l_row + j], j < cnt (buffer 5): e < 0 skipped, e < nwin the
+//   window ring's row e (w_off + e*hd, buffer 1), else the compressed row c = e - nwin
+//   when its block has a slot (c_off + r*hd, buffer 2), skipped otherwise: the
+//   with flags 16, -2-j names cold row j staged in buffer 6 (-1 remains skipped).
+//   This complete-list path preserves the arithmetic regardless of residency. Scores (q . k)
+//   * scale, each dot in one thread in order; best = the largest; w = exp(score - best),
+//   the denominator exp(sink - best) + the w in list order (one thread), the value sum
+//   in list order per dim with w rounded to bf16 under flags 1 (DeepSeek V4). fin (flags
+//   8): out = sum / den (bf16 with flags 1) at o_off + s*o_row + h*hd: chain_dsv4's bits. Else
+//   the part, its max taken over the sink too (a part with no row still has the sink),
+//   acc and (m, l) as mode 0's. The sink, in buffer 4 at sink_off + h, belongs to the
+//   device's part. Limits: hd <= 1024.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float b0[]; };   // q / qa / the device's part
+layout(std430, binding = 1) readonly buffer B1 { float b1[]; };   // K / qr / the host's part
+layout(std430, binding = 2) readonly buffer B2 { float b2[]; };   // V / latent / gate
+layout(std430, binding = 3) buffer B3 { float b3[]; };            // out (modes 0, 2) / rope keys
+layout(std430, binding = 4) readonly buffer B4 { float b4[]; };   // gate (mode 0)
+layout(std430, binding = 5) readonly buffer L5 { int sel[]; };    // selection lists
+layout(std430, binding = 6) buffer B6 { float b6[]; };            // sink (mode 0) / out (mode 1)
+layout(std430, binding = 7) readonly buffer T7 { int tab[]; };    // bt and rb
+
+layout(push_constant) uniform P { int v[32]; } p;
+#define MODE p.v[0]
+
+shared float qs[1024];
+shared float qrs[128];
+shared float pe[256];
+shared int   pr[256];
+shared float red[256];
+
+float bf16r(float f) {   // round to nearest even, as coli_bf16_round
+    uint u = floatBitsToUint(f);
+    if ((u & 0x7f800000u) != 0x7f800000u) u += 0x7fffu + ((u >> 16) & 1u);
+    return uintBitsToFloat(u & 0xffff0000u);
+}
+int slot_of(int t, int B, int bt_off, int nblk) {
+    if (t < 0) return -1;
+    int b = t / B;
+    int j = b < nblk ? tab[bt_off + b] : -1;
+    return j < 0 ? -1 : (j & 0x3fffffff);
+}
+// a listed position the host takes (flags 32): older than the row's share, not pinned
+bool cold_pos(int t, int pos, int B, int bt_off, int nblk, int anchor) {
+    if (t < 0 || t > pos) return false;
+    int b = t / B;
+    if (b >= pos / B - anchor) return false;
+    int j = b < nblk ? tab[bt_off + b] : -1;
+    return j < 0 || (j & 0x40000000) == 0;
+}
+// the device row of a listed position, or -1 (the host's): the anchored blocks of the
+// row at pos, and pinned ones
+int dev_row(int t, int pos, int B, int bt_off, int nblk, int anchor) {
+    if (t < 0 || t > pos) return -1;
+    int b = t / B;
+    int j = b < nblk ? tab[bt_off + b] : -1;
+    if (j < 0 || (b < pos / B - anchor && (j & 0x40000000) == 0)) return -1;
+    return (j & 0x3fffffff) * B + t % B;
+}
+
+// ---- mode 0 ----------------------------------------------------------------------
+void gqa() {
+    int S = p.v[1], H = p.v[2], KVH = p.v[3], hd = p.v[4], vd = p.v[5], pos_base = p.v[6], rows = p.v[7];
+    int q_off = p.v[8], q_row = p.v[9], q_seg = p.v[10], sel_off = p.v[11], sel_row = p.v[12];
+    float scale = intBitsToFloat(p.v[13]);
+    int k_off = p.v[14], v_off = p.v[15], win = p.v[16], kv_pm = p.v[17], sink = p.v[18], sink_off = p.v[19];
+    int B = p.v[20], bt_off = p.v[22], nblk = p.v[23], anchor = p.v[24];
+    int o_off = p.v[25], o_row = p.v[26], st_off = p.v[27], flags = p.v[28];
+    int g_off = p.v[29], g_row = p.v[30], g_seg = p.v[31];
+    int h = int(gl_WorkGroupID.x), s = int(gl_WorkGroupID.y), tid = int(gl_LocalInvocationID.x);
+    if (h >= H || s >= S) return;
+    int kvh = h / (H / KVH);
+    int qb = q_off + s * q_row + h * q_seg;
+    for (int d = tid; d < hd; d += 256) qs[d] = b0[qb + d];
+    int pos = pos_base + s;
+    bool cold = (flags & 32) != 0;
+    int start = win > 0 ? max(0, pos - win + 1) : 0, share0 = (pos / B - anchor) * B;
+    int first = cold ? start : max(start, share0);
+    bool list = false;
+    int lb = 0, n = cold ? max(0, min(pos + 1, share0) - start) : pos - first + 1;
+    if (sel_row > 0) {
+        lb = sel_off + s * sel_row;
+        int c = sel[lb];
+        if (c >= 0) { n = c; list = true; }
+    }
+    barrier();
+    float m = sink != 0 ? b6[sink_off + h] : -3.0e38, l = sink != 0 ? 1.0 : 0.0, acc = 0.0;
+    for (int t0 = 0; t0 < n; t0 += 256) {
+        int i = t0 + tid, r = -1;
+        if (i < n) {
+            if (list) { int t = sel[lb + 1 + i]; r = cold ? (cold_pos(t, pos, B, bt_off, nblk, anchor) ? t : -1) : dev_row(t, pos, B, bt_off, nblk, anchor); }
+            else if (cold) r = first + i;
+            else { int t = first + i, j = slot_of(t, B, bt_off, nblk); r = j >= 0 ? j * B + t % B : -1; }
+        }
+        float sv = -3.0e38;
+        if (r >= 0) {
+            int kb = k_off + (kv_pm != 0 ? r * KVH + kvh : kvh * rows + r) * hd;
+            float a = 0.0;
+            for (int d = 0; d < hd; d++) a += qs[d] * b1[kb + d];
+            sv = a * scale;
+        }
+        pr[tid] = r;
+        red[tid] = sv;
+        barrier();
+        for (int off = 128; off > 0; off >>= 1) {
+            if (tid < off) red[tid] = max(red[tid], red[tid + off]);
+            barrier();
+        }
+        float mt = red[0];
+        barrier();
+        if (mt > -1.0e38) {   // a tile with a position on the device
+            float mn = max(m, mt);
+            float e = r >= 0 ? exp(sv - mn) : 0.0;
+            pe[tid] = e;
+            red[tid] = e;
+            barrier();
+            for (int off = 128; off > 0; off >>= 1) {
+                if (tid < off) red[tid] += red[tid + off];
+                barrier();
+            }
+            float corr = m > -1.0e38 ? exp(m - mn) : 0.0;
+            l = l * corr + red[0];
+            acc *= corr;
+            int cnt = min(256, n - t0);
+            if (tid < vd)
+                for (int j = 0; j < cnt; j++) {
+                    int rr = pr[j];
+                    if (rr < 0) continue;
+                    int vb = v_off + (kv_pm != 0 ? rr * KVH + kvh : kvh * rows + rr) * vd;
+                    acc += pe[j] * b2[vb + tid];
+                }
+            m = mn;
+        }
+        barrier();
+    }
+    if (tid < vd) {
+        int ob = o_off + s * o_row + h * vd;
+        if ((flags & 1) != 0) {
+            float v = acc * (l > 0.0 ? 1.0 / l : 0.0);
+            if ((flags & 2) != 0) v *= 1.0 / (1.0 + exp(-b4[g_off + s * g_row + h * g_seg + tid]));
+            b3[ob + tid] = v;
+        } else b3[ob + tid] = acc;
+    }
+    if (tid == 0 && (flags & 1) == 0) { b3[st_off + (s * H + h) * 2] = m; b3[st_off + (s * H + h) * 2 + 1] = l; }
+}
+
+// ---- mode 1 ----------------------------------------------------------------------
+void mla() {
+    int S = p.v[1], H = p.v[2], K = p.v[3], R = p.v[4], pos_base = p.v[5], kv_start = p.v[6];
+    int qa_off = p.v[7], qa_row = p.v[8], qa_seg = p.v[9], qr_off = p.v[10], qr_row = p.v[11], qr_seg = p.v[12];
+    int lat_off = p.v[13], lat_row = p.v[14], rope_off = p.v[15], rope_row = p.v[16];
+    int sel_off = p.v[17], sel_row = p.v[18], o_off = p.v[19], o_row = p.v[20], o_seg = p.v[21];
+    float scale = intBitsToFloat(p.v[22]);
+    int B = p.v[23], bt_off = p.v[25], nblk = p.v[26], anchor = p.v[27], flags = p.v[28], st_off = p.v[29];
+    int h = int(gl_WorkGroupID.x), s = int(gl_WorkGroupID.y), tid = int(gl_LocalInvocationID.x);
+    if (h >= H || s >= S) return;
+    int lane = int(gl_SubgroupInvocationID), sgs = int(gl_SubgroupSize);
+    int sg = int(gl_SubgroupID), nsg = 256 / sgs;
+    int qb = qa_off + s * qa_row + h * qa_seg, rbq = qr_off + s * qr_row + h * qr_seg;
+    for (int i = tid; i < K; i += 256) qs[i] = b0[qb + i];
+    for (int i = tid; i < R; i += 256) qrs[i] = b1[rbq + i];
+    int pos = pos_base + s;
+    bool cold = (flags & 32) != 0;
+    int share0 = (pos / B - anchor) * B;
+    int first = cold ? kv_start : max(kv_start, share0);
+    bool list = false;
+    int lb = 0, n = cold ? max(0, min(pos + 1, share0) - kv_start) : max(0, pos - first + 1);
+    if (sel_row > 0) {
+        lb = sel_off + s * sel_row;
+        int c = sel[lb];
+        if (c >= 0) { n = c; list = true; }
+    }
+    barrier();
+    float m = -3.0e38, l = 0.0;
+    float acc[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    for (int t0 = 0; t0 < n; t0 += 64) {
+        int cnt = min(64, n - t0);
+        if (tid < 64) {
+            int r = -1;
+            if (tid < cnt) {
+                int i = t0 + tid;
+                if (list) { int t = sel[lb + 1 + i]; r = cold ? (cold_pos(t, pos, B, bt_off, nblk, anchor) ? t : -1) : dev_row(t, pos, B, bt_off, nblk, anchor); }
+                else if (cold) r = first + i;
+                else { int t = first + i, j = slot_of(t, B, bt_off, nblk); r = j >= 0 ? j * B + t % B : -1; }
+            }
+            pr[tid] = r;
+        }
+        barrier();
+        for (int j = sg; j < cnt; j += nsg) {
+            int r = pr[j];
+            float a = 0.0;
+            if (r >= 0) {
+                int lo = lat_off + r * lat_row, ro = rope_off + r * rope_row;
+                for (int i = lane; i < K; i += sgs) a += qs[i] * b2[lo + i];
+                for (int i = lane; i < R; i += sgs) a += qrs[i] * b3[ro + i];
+            }
+            float tot = subgroupAdd(a);
+            if (lane == 0) pe[j] = r >= 0 ? tot * scale : -3.0e38;
+        }
+        barrier();
+        red[tid] = tid < cnt ? pe[tid] : -3.0e38;
+        barrier();
+        for (int off = 128; off > 0; off >>= 1) {
+            if (tid < off) red[tid] = max(red[tid], red[tid + off]);
+            barrier();
+        }
+        float mt = red[0];
+        barrier();
+        if (mt > -1.0e38) {
+            float mn = max(m, mt);
+            float corr = m > -1.0e38 ? exp(m - mn) : 0.0;
+            if (tid < 64) pe[tid] = tid < cnt && pr[tid] >= 0 ? exp(pe[tid] - mn) : 0.0;
+            barrier();
+            red[tid] = tid < 64 ? pe[tid] : 0.0;
+            barrier();
+            for (int off = 128; off > 0; off >>= 1) {
+                if (tid < off) red[tid] += red[tid + off];
+                barrier();
+            }
+            l = l * corr + red[0];
+            for (int k = 0; k < 4; k++) {
+                int i = tid + 256 * k;
+                if (i >= K) break;
+                float a = acc[k] * corr;
+                for (int j = 0; j < cnt; j++) {
+                    int r = pr[j];
+                    if (r >= 0) a += pe[j] * b2[lat_off + r * lat_row + i];
+                }
+                acc[k] = a;
+            }
+            m = mn;
+        }
+        barrier();
+    }
+    float inv = (flags & 1) != 0 ? (l > 0.0 ? 1.0 / l : 0.0) : 1.0;
+    int ob = o_off + s * o_row + h * o_seg;
+    for (int k = 0; k < 4; k++) {
+        int i = tid + 256 * k;
+        if (i >= K) break;
+        b6[ob + i] = acc[k] * inv;
+    }
+    if (tid == 0 && (flags & 1) == 0) { b6[st_off + (s * H + h) * 2] = m; b6[st_off + (s * H + h) * 2 + 1] = l; }
+}
+
+// ---- mode 2 ----------------------------------------------------------------------
+void merge() {
+    int n = p.v[1], H = p.v[2], d = p.v[3];
+    int a_off = p.v[4], a_row = p.v[5], a_seg = p.v[6], sa_off = p.v[7], c_off = p.v[8], sc_off = p.v[9];
+    int o_off = p.v[10], o_row = p.v[11], o_seg = p.v[12], flags = p.v[13], g_off = p.v[14], g_row = p.v[15], g_seg = p.v[16];
+    int g = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x), tid = int(gl_LocalInvocationID.x);
+    if (g >= n) return;
+    int s = g / H, h = g - s * H;
+    float md = b0[sa_off + 2 * g], ld = b0[sa_off + 2 * g + 1];
+    float mc = b1[sc_off + 2 * g], lc = b1[sc_off + 2 * g + 1];
+    float mx = max(md, mc);
+    float ed = md > -1.0e38 ? exp(md - mx) : 0.0, ec = mc > -1.0e38 ? exp(mc - mx) : 0.0;
+    float den = ed * ld + ec * lc;
+    float inv = den > 0.0 ? 1.0 / den : 0.0;
+    int ab = a_off + s * a_row + h * a_seg, cb = c_off + g * d, ob = o_off + s * o_row + h * o_seg;
+    for (int i = tid; i < d; i += 256) {
+        float v = (ed * b0[ab + i] + ec * b1[cb + i]) * inv;
+        if ((flags & 2) != 0) v *= 1.0 / (1.0 + exp(-b2[g_off + s * g_row + h * g_seg + i]));
+        if ((flags & 4) != 0) v = bf16r(v);
+        b3[ob + i] = v;
+    }
+}
+
+// ---- mode 3 ----------------------------------------------------------------------
+void rel() {
+    int S = p.v[1], H = p.v[2], KVH = p.v[3], hd = p.v[4], pos_base = p.v[5], rows = p.v[6];
+    int q_off = p.v[7], q_row = p.v[8];
+    float scale = intBitsToFloat(p.v[9]);
+    int k_off = p.v[10], v_off = p.v[11], ext = p.v[12], d_rel = p.v[13], r_off = p.v[14], r_row = p.v[15];
+    int relp_off = p.v[16], tau_off = p.v[17], B = p.v[18], bt_off = p.v[19], nblk = p.v[20], anchor = p.v[21];
+    int o_off = p.v[22], o_row = p.v[23], st_off = p.v[24], flags = p.v[25];
+    int h = int(gl_WorkGroupID.x), s = int(gl_WorkGroupID.y), tid = int(gl_LocalInvocationID.x);
+    if (h >= H || s >= S) return;
+    int kvh = h / (H / KVH);
+    int qb = q_off + s * q_row + h * hd;
+    for (int d = tid; d < hd; d += 256) qs[d] = b0[qb + d];
+    for (int j = tid; j < d_rel; j += 256) qrs[j] = b4[r_off + s * r_row + h * d_rel + j];
+    bool cold = (flags & 32) != 0;
+    int pos = pos_base + s, share0 = (pos / B - anchor) * B;
+    int first = cold ? 0 : max(0, share0), n = cold ? max(0, min(pos + 1, share0)) : pos - first + 1;
+    float ts = intBitsToFloat(sel[tau_off + s]);
+    barrier();
+    float m = -3.0e38, l = 0.0, acc = 0.0;
+    for (int t0 = 0; t0 < n; t0 += 256) {
+        int i = t0 + tid, r = -1, t = first + i;
+        if (i < n) { if (cold) r = t; else { int j = slot_of(t, B, bt_off, nblk); r = j >= 0 ? j * B + t % B : -1; } }
+        float sv = -3.0e38;
+        if (r >= 0) {
+            int kb = k_off + (kvh * rows + r) * hd;
+            float a = 0.0;
+            for (int d = 0; d < hd; d++) a += qs[d] * b1[kb + d];
+            int dist = pos - t;
+            float bias = 0.0;
+            if (dist < ext)
+                for (int j = 0; j < d_rel; j++) bias += qrs[j] * b6[relp_off + j * ext + dist];
+            sv = ts * (a * scale + bias);
+        }
+        pr[tid] = r;
+        red[tid] = sv;
+        barrier();
+        for (int off = 128; off > 0; off >>= 1) {
+            if (tid < off) red[tid] = max(red[tid], red[tid + off]);
+            barrier();
+        }
+        float mt = red[0];
+        barrier();
+        if (mt > -1.0e38) {
+            float mn = max(m, mt);
+            float e = r >= 0 ? exp(sv - mn) : 0.0;
+            pe[tid] = e;
+            red[tid] = e;
+            barrier();
+            for (int off = 128; off > 0; off >>= 1) {
+                if (tid < off) red[tid] += red[tid + off];
+                barrier();
+            }
+            float corr = m > -1.0e38 ? exp(m - mn) : 0.0;
+            l = l * corr + red[0];
+            acc *= corr;
+            int cnt = min(256, n - t0);
+            if (tid < hd)
+                for (int j = 0; j < cnt; j++) {
+                    int rr = pr[j];
+                    if (rr >= 0) acc += pe[j] * b2[v_off + (kvh * rows + rr) * hd + tid];
+                }
+            m = mn;
+        }
+        barrier();
+    }
+    if (tid < hd) b3[o_off + s * o_row + h * hd + tid] = (flags & 1) != 0 ? acc * (l > 0.0 ? 1.0 / l : 0.0) : acc;
+    if (tid == 0 && (flags & 1) == 0) { b3[st_off + (s * H + h) * 2] = m; b3[st_off + (s * H + h) * 2 + 1] = l; }
+}
+
+// ---- mode 4 ----------------------------------------------------------------------
+void dsa() {
+    int S = p.v[1], H = p.v[2], hd = p.v[3], cnt = p.v[4], l_off = p.v[5], l_row = p.v[6], nwin = p.v[7];
+    int w_off = p.v[8], c_off = p.v[9], q_off = p.v[10], q_row = p.v[11], sink_off = p.v[12], flags = p.v[13];
+    float scale = intBitsToFloat(p.v[14]);
+    int B = p.v[15], ns = p.v[16], bt_off = p.v[17], nblk = p.v[18], o_off = p.v[19], o_row = p.v[20], st_off = p.v[21];
+    int h = int(gl_WorkGroupID.x), s = int(gl_WorkGroupID.y), tid = int(gl_LocalInvocationID.x);
+    if (h >= H || s >= S) return;
+    int lb = l_off + s * l_row;
+    for (int i = tid; i < hd; i += 256) qs[i] = b0[q_off + s * q_row + h * hd + i];
+    float sink = b4[sink_off + h];
+    barrier();
+    // In complete sparse mode, -2-j addresses staged cold row j. Give these
+    // offsets a disjoint range after the resident cache in the value-sum table.
+    int cold_base = c_off + ns * B * hd;
+    // pass 1: the part's largest score (with the sink unless fin)
+    float best = (flags & 8) != 0 ? -1.0e30 : sink;
+    for (int t0 = 0; t0 < cnt; t0 += 256) {
+        int j = t0 + tid;
+        if (j < cnt) {
+            int e = sel[lb + j], kb = -1;
+            if ((flags & 16) != 0 && e < -1) kb = cold_base + (-2 - e) * hd;
+            else if (e >= 0 && e < nwin) kb = w_off + e * hd;
+            else if (e >= nwin) { int sl = slot_of(e - nwin, B, bt_off, nblk); if (sl >= 0) kb = c_off + (sl * B + (e - nwin) % B) * hd; }
+            if (kb >= 0) {
+                float d = 0.0;
+                if (e >= 0 && e < nwin) for (int i = 0; i < hd; i++) d += qs[i] * b1[kb + i];
+                else if (kb < cold_base) for (int i = 0; i < hd; i++) d += qs[i] * b2[kb + i];
+                else for (int i = 0; i < hd; i++) d += qs[i] * b6[kb - cold_base + i];
+                best = max(best, d * scale);
+            }
+        }
+    }
+    red[tid] = best;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off && red[tid + off] > red[tid]) red[tid] = red[tid + off];
+        barrier();
+    }
+    best = red[0];
+    barrier();
+    // pass 2: the weights tile by tile, the denominator and the value sums in list order
+    float den = exp(sink - best);
+    float acc[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    for (int t0 = 0; t0 < cnt; t0 += 256) {
+        int j = t0 + tid, kb = -1;
+        float w = 0.0;
+        if (j < cnt) {
+            int e = sel[lb + j];
+            if ((flags & 16) != 0 && e < -1) kb = cold_base + (-2 - e) * hd;
+            else if (e >= 0 && e < nwin) kb = w_off + e * hd;
+            else if (e >= nwin) { int sl = slot_of(e - nwin, B, bt_off, nblk); if (sl >= 0) kb = c_off + (sl * B + (e - nwin) % B) * hd; }
+            if (kb >= 0) {
+                float d = 0.0;
+                if (e >= 0 && e < nwin) for (int i = 0; i < hd; i++) d += qs[i] * b1[kb + i];
+                else if (kb < cold_base) for (int i = 0; i < hd; i++) d += qs[i] * b2[kb + i];
+                else for (int i = 0; i < hd; i++) d += qs[i] * b6[kb - cold_base + i];
+                w = d * scale;
+                kb = e >= 0 && e < nwin ? kb : -2 - kb;   // the compressed rows' offsets as -2 - offset
+            }
+        }
+        pe[tid] = w;
+        pr[tid] = kb;
+        barrier();
+        // The whole-cache shader stores each scaled score before subtracting
+        // the maximum. Keep that f32 rounding boundary here too: contracting
+        // d * scale - best changes f32 attention on hardware that fuses it.
+        pe[tid] = pr[tid] != -1 ? exp(pe[tid] - best) : 0.0;
+        barrier();
+        int c = min(256, cnt - t0);
+        if (tid == 0) for (int q = 0; q < c; q++) if (pr[q] != -1) den += pe[q];   // thread 0: in list order
+        for (int k = 0; k < 4; k++) {
+            int i = tid + 256 * k;
+            if (i >= hd) break;
+            float a = acc[k];
+            for (int q = 0; q < c; q++) {
+                int o = pr[q];
+                if (o == -1) continue;
+                float wv = (flags & 1) != 0 ? bf16r(pe[q]) : pe[q];
+                a += wv * (o >= 0 ? b1[o + i] : -2 - o < cold_base ? b2[-2 - o + i] : b6[-2 - o - cold_base + i]);
+            }
+            acc[k] = a;
+        }
+        barrier();
+    }
+    if (tid == 0) red[0] = den;
+    barrier();
+    den = red[0];
+    int ob = o_off + s * o_row + h * hd;
+    for (int k = 0; k < 4; k++) {
+        int i = tid + 256 * k;
+        if (i >= hd) break;
+        if ((flags & 8) != 0) { float o = acc[k] / den; b3[ob + i] = (flags & 1) != 0 ? bf16r(o) : o; }
+        else b3[ob + i] = acc[k];
+    }
+    if (tid == 0 && (flags & 8) == 0) { b3[st_off + (s * H + h) * 2] = best; b3[st_off + (s * H + h) * 2 + 1] = den; }
+}
+
+// ---- mode 5 ----------------------------------------------------------------------
+// The chunks of a part joined (chain_attnb's split over positions): segment g of d
+// floats, chunk z's sum at a_off + z*a_z + g*d and its (m, l) at sa_off + z*sa_z + 2g
+// (buffer 0), joined in chunk order as the host joins its chunks (vkc_kv_join): the part
+// at o_off + g*d, (m, l) at so_off + 2g (buffer 3). A chunk with no position weighs nothing.
+void join() {
+    int n = p.v[1], d = p.v[2], nz = p.v[3], a_off = p.v[4], a_z = p.v[5], sa_off = p.v[6], sa_z = p.v[7];
+    int o_off = p.v[8], so_off = p.v[9];
+    int g = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x), tid = int(gl_LocalInvocationID.x);
+    if (g >= n) return;
+    float m = -3.0e38, l = 0.0;
+    for (int z = 0; z < nz; z++) {
+        float mz = b0[sa_off + z * sa_z + 2 * g], lz = b0[sa_off + z * sa_z + 2 * g + 1];
+        if (mz <= -1.0e38) continue;
+        float mn = max(m, mz);
+        l = l * (m > -1.0e38 ? exp(m - mn) : 0.0) + lz * exp(mz - mn);
+        m = mn;
+    }
+    for (int i = tid; i < d; i += 256) {
+        float acc = 0.0, mm = -3.0e38;
+        for (int z = 0; z < nz; z++) {
+            float mz = b0[sa_off + z * sa_z + 2 * g];
+            if (mz <= -1.0e38) continue;
+            float mn = max(mm, mz);
+            acc = acc * (mm > -1.0e38 ? exp(mm - mn) : 0.0) + b0[a_off + z * a_z + g * d + i] * exp(mz - mn);
+            mm = mn;
+        }
+        b3[o_off + g * d + i] = acc;
+    }
+    if (tid == 0) { b3[so_off + 2 * g] = m; b3[so_off + 2 * g + 1] = l; }
+}
+
+void main() {
+    if (MODE == 0) gqa();
+    else if (MODE == 1) mla();
+    else if (MODE == 2) merge();
+    else if (MODE == 3) rel();
+    else if (MODE == 5) join();
+    else dsa();
+}

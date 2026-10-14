@@ -1,5 +1,5 @@
-/* deepseek_v41.c reads two things from the snapshot directory that are as
- * attacker-chosen as the weights themselves, and both trusted the file for a size
+/* deepseek_v41.c reads three things from the snapshot directory that are as
+ * attacker-chosen as the weights themselves, and all trusted the file for a size
  * nothing had checked:
  *
  *  - wf_load() allocated `n` floats and let st_read_f32 write as many as the TENSOR
@@ -10,8 +10,12 @@
  *    layer_ids -- a different, equally file-chosen number -- and dereferenced
  *    whatever sat past the end of a shorter array, or a NULL kids pointer when
  *    the key was not an array at all.
+ *  - engram_row() read row `id` of a table at id * head_dim in the shard. The id is
+ *    a hash bucket plus a sidecar offset, head_dim is the sidecar's, the row count
+ *    and the scale count are the shards': none was compared with another, so an id
+ *    past the table read whatever the file holds there.
  *
- * Both refusals exit(1) in place, so those cases run in a forked child with stderr
+ * All refusals exit(1) in place, so those cases run in a forked child with stderr
  * captured (the idiom of tests/test_dup_name_refusal.c). Under `make test-asan` the
  * unfixed loader is a heap-buffer-overflow report instead of the refusal message
  * these checks ask for; in a plain build it is the wrong message, or a crash. */
@@ -182,16 +186,149 @@ static void test_engram_sidecar(void) {
     snprintf(path, sizeof(path), "%s/dsv41_engram.json", dir); unlink(path);
     rmdir(dir);
 }
+
+static uint8_t engram_byte(int row) { return (uint8_t)(0x30 + row % 8); }
+static uint8_t engram_scale(int row) { return (uint8_t)(127 + row % 3); }
+
+/* layers.1.engram.embed.weight as `rows` x `row_bytes` e4m3 bytes and its scale as
+ * `scale_rows` x `scale_cols` ue8m0 bytes, then a 64-byte tail: a read past either
+ * tensor lands in file data, as it would in a real shard, not at EOF. */
+static void write_engram_shard(const char *dir, int rows, int row_bytes, int scale_rows,
+                               int scale_cols) {
+    char path[600], hdr[512];
+    snprintf(path, sizeof(path), "%s/model.safetensors", dir);
+    long long w = (long long)rows * row_bytes, s = (long long)scale_rows * scale_cols;
+    int hl = snprintf(hdr, sizeof(hdr),
+        "{\"layers.1.engram.embed.weight\":{\"dtype\":\"F8_E4M3\",\"shape\":[%d,%d],"
+        "\"data_offsets\":[0,%lld]},"
+        "\"layers.1.engram.embed.scale\":{\"dtype\":\"U8\",\"shape\":[%d,%d],"
+        "\"data_offsets\":[%lld,%lld]},"
+        "\"tail\":{\"dtype\":\"U8\",\"shape\":[64],\"data_offsets\":[%lld,%lld]}}",
+        rows, row_bytes, w, scale_rows, scale_cols, w, w + s, w + s, w + s + 64);
+    uint64_t hlen = (uint64_t)hl;
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); exit(1); }
+    fwrite(&hlen, 8, 1, f);
+    fwrite(hdr, 1, (size_t)hl, f);
+    for (int r = 0; r < rows; r++)
+        for (int i = 0; i < row_bytes; i++) fputc(engram_byte(r), f);
+    for (int r = 0; r < scale_rows; r++)
+        for (int g = 0; g < scale_cols; g++) fputc(engram_scale(r), f);
+    for (int i = 0; i < 64; i++) fputc(0x41, f);
+    fclose(f);
+}
+
+static int g_head_dim;
+static int64_t g_id;
+
+/* layer 1's table opened with g_head_dim, then row g_id looked up */
+static void child_engram_row(void) {
+    shards S; st_init(&S, g_dir);
+    EngramTable t; engram_table_open(&t, &S, 1, g_head_dim, 16);
+    engram_row(&t, g_id, g_head_dim);
+}
+
+/* the sidecar's hash over a short history, every column looked up in table 0 */
+static void child_engram_lookup(void) {
+    memset(&g_engram, 0, sizeof(g_engram));
+    engram_load_sidecar(&g_engram, g_dir);
+    shards S; st_init(&S, g_dir);
+    engram_table_open(&g_engram.table[0], &S, g_engram.layer_of[0], g_engram.head_dim, 16);
+    static const int ids[] = {1, 2, 0, 2, 1};
+    engram_push(&g_engram, ids, 5, NULL);
+    int64_t rows[V41_MAX_NGRAM * V41_MAX_EHEADS];
+    for (int pos = 0; pos < 5; pos++) {
+        engram_hash(&g_engram, 0, pos, rows);
+        for (int col = 0; col < g_engram.cols; col++)
+            engram_row(&g_engram.table[0], rows[col], g_engram.head_dim);
+    }
+}
+
+static void expect_table_refused(void (*fn)(void), const char *key, const char *what) {
+    int code; char err[8192];
+    run_forked(fn, &code, err, sizeof(err));
+    char label[160];
+    snprintf(label, sizeof(label), "engram table: %s exits(1)", what);
+    check(code == 1, label);
+    snprintf(label, sizeof(label), "engram table: %s is refused by name", what);
+    int named = strstr(err, "[engram]") != NULL && strstr(err, key) != NULL;
+    check(named, label);
+    if (code != 1 || !named) printf("--- child stderr (exit %d) ---\n%s\n", code, err);
+}
+
+static void test_engram_table(void) {
+    char dir[] = "test_dsv41_untrusted_table_XXXXXX";
+    if (!mkdtemp(dir)) { perror("mkdtemp"); check(0, "engram table: mkdtemp"); return; }
+    snprintf(g_dir, sizeof(g_dir), "%s", dir);
+    int code; char err[8192];
+
+    /* ENGRAM_OK's table 0 has 5 + 7 + 11 + 13 = 36 rows: every id its hash makes fits */
+    write_engram_shard(dir, 36, 32, 36, 1);
+    write_sidecar(dir, ENGRAM_OK);
+    run_forked(child_engram_lookup, &code, err, sizeof(err));
+    check(code == 42, "engram table: a sidecar that describes the table looks every n-gram up");
+    if (code != 42) printf("--- child stderr (exit %d) ---\n%s\n", code, err);
+
+    shards S; st_init(&S, dir);
+    EngramTable t; engram_table_open(&t, &S, 1, 32, 16);
+    check(t.rows == 36, "engram table: 36 rows of 32 bytes");
+    for (int row = 0; row < 36; row += 35) {
+        const float *v = engram_row(&t, row, 32);
+        float want = e4m3_decode(engram_byte(row)) * ue8m0(engram_scale(row));
+        check(v[0] == want && v[31] == want, "engram table: first and last rows read their own bytes");
+    }
+    free(t.key); free(t.used); free(t.value);
+
+    /* the last column starts where the table ends: a sidecar for another table */
+    write_sidecar(dir,
+        "{\"max_ngram_size\":3,\"n_heads\":2,\"head_dim\":32,\"pad_id\":0,\"layer_ids\":[1,2],"
+        "\"primes\":[[[5,7],[11,13]],[[17,19],[23,29]]],"
+        "\"offsets\":[[0,5,12,36],[0,17,36,59]],"
+        "\"multipliers\":[[\"3\",\"5\",\"7\"],[\"11\",\"13\",\"17\"]],"
+        "\"token_map\":[0,1,2]}");
+    expect_table_refused(child_engram_lookup, "outside the table", "a sidecar hashing past the table");
+
+    /* the ids themselves, at both ends */
+    g_head_dim = 32;
+    g_id = 36;
+    expect_table_refused(child_engram_row, "outside the table", "row 36 of 36");
+    g_id = -1;
+    expect_table_refused(child_engram_row, "outside the table", "row -1, the empty-slot key");
+    g_id = INT64_MAX / 16;
+    expect_table_refused(child_engram_row, "outside the table", "a row whose offset overflows");
+
+    /* the table, its scales and head_dim disagree */
+    g_id = 35;
+    write_engram_shard(dir, 36, 32, 35, 1);
+    expect_table_refused(child_engram_row, "scale bytes", "a scale tensor one row short");
+    write_engram_shard(dir, 36, 32, 37, 1);
+    expect_table_refused(child_engram_row, "scale bytes", "a scale tensor one row long");
+    write_engram_shard(dir, 1, 36 * 32 + 1, 36, 1);
+    expect_table_refused(child_engram_row, "scale bytes", "a table that is not whole rows");
+    write_engram_shard(dir, 36, 32, 36, 1);
+    g_head_dim = 0; g_id = 0;
+    expect_table_refused(child_engram_row, "multiple of 32", "head_dim 0");
+    write_engram_shard(dir, 4, 48, 4, 1);
+    g_head_dim = 48; g_id = 3;
+    expect_table_refused(child_engram_row, "multiple of 32", "head_dim 48");
+
+    char path[600];
+    snprintf(path, sizeof(path), "%s/model.safetensors", dir); unlink(path);
+    snprintf(path, sizeof(path), "%s/dsv41_engram.json", dir); unlink(path);
+    rmdir(dir);
+}
 #endif
 
 int main(void) {
 #ifndef _WIN32
     test_wf_load();
     test_engram_sidecar();
+    test_engram_table();
 #else
     printf("dsv41 untrusted load: skipped on Windows (no fork)\n");
 #endif
     if (g_fails) { printf("%d check(s) failed\n", g_fails); return 1; }
-    printf("dsv41 untrusted load: wf_load capacity + engram sidecar shape -- ok\n");
+    printf("dsv41 untrusted load: wf_load capacity + engram sidecar shape + engram table "
+           "bounds -- ok\n");
     return 0;
 }

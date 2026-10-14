@@ -66,11 +66,13 @@ typedef struct {
     int cin, cout, k;       /* k = 1 or 3 */
     float *w, *b;           /* w: [cout][kx][ky][cin] */
     QiMat m;
+    void *vk; int bo;       /* qwenimage_vae_vk.h: the device's copy of w, b's place in its parameters */
 } QivConv;
 
 typedef struct {
     int cin, cout;
     float *g1, *g2;         /* RMS norm gammas, [cin] and [cout] */
+    int g1o, g2o;           /* their places in the device's parameters (qwenimage_vae_vk.h) */
     QivConv c1, c2, sc;     /* sc only when cin != cout */
 } QivRes;
 
@@ -92,6 +94,7 @@ typedef struct QiVae {
     int nblk;
     QivBlock blk[QIV_MAX_BLOCKS];
     float *g_out;
+    int g_outo;                 /* its place in the device's parameters */
     QivConv conv_out;
     size_t wbytes;              /* resident weight bytes */
     void (*progress)(void *ud, int step, int steps);
@@ -530,6 +533,22 @@ out:
     return rc;
 }
 
+/* conv_out's [HW][OC] to the picture: torch.clamp(-1, 1), then postprocess
+ * ((x*0.5 + 0.5).clamp(0, 1), *255 in float32, numpy round (half to even), uint8;
+ * x*0.5 is exact, so an FMA here rounds exactly like torch's two ops). */
+static void qiv_post(const float *o, size_t HW, int OC, uint8_t *rgba, float *out_f){
+    #pragma omp parallel for schedule(static)
+    for (size_t p = 0; p < HW; p++)
+        for (int c = 0; c < 4; c++) {
+            float f = c < OC ? o[p * OC + c] : 1.f;
+            f = f < -1.f ? -1.f : f > 1.f ? 1.f : f;
+            if (c < OC && out_f) out_f[(size_t)c * HW + p] = f;
+            float u = f * 0.5f + 0.5f;
+            u = u < 0.f ? 0.f : u > 1.f ? 1.f : u;
+            if (rgba) rgba[p * 4 + c] = (uint8_t)nearbyintf(u * 255.f);
+        }
+}
+
 /* z: normalized latents [h][w][z_dim] (the packed DiT output, token y*w + x).
  * rgba: [scale*h][scale*w][4] uint8 top row first (alpha 255 if the model has 3
  * output channels). out_f: optional [out_ch][scale*h][scale*w] in [-1, 1].
@@ -600,19 +619,7 @@ static int qiv_decode(QiVae *v, const float *z, int h, int w, uint8_t *rgba, flo
         QivEpi ep; memset(&ep, 0, sizeof ep); ep.rel_x = 1;
         if (!o || qiv_conv3(&v->conv_out, x, H, W, v->g_out, 0, o, &ep)) { free(o); goto fail; }
         free(x); x = NULL;
-        #pragma omp parallel for schedule(static)
-        for (size_t p = 0; p < HW; p++)
-            for (int c = 0; c < 4; c++) {
-                float f = c < OC ? o[p * OC + c] : 1.f;
-                /* torch.clamp(-1, 1), then postprocess: (x*0.5 + 0.5).clamp(0, 1),
-                 * *255 in float32, numpy round (half to even), uint8. x*0.5 is
-                 * exact, so an FMA here rounds exactly like torch's two ops. */
-                f = f < -1.f ? -1.f : f > 1.f ? 1.f : f;
-                if (c < OC && out_f) out_f[(size_t)c * HW + p] = f;
-                float u = f * 0.5f + 0.5f;
-                u = u < 0.f ? 0.f : u > 1.f ? 1.f : u;
-                if (rgba) rgba[p * 4 + c] = (uint8_t)nearbyintf(u * 255.f);
-            }
+        qiv_post(o, HW, OC, rgba, out_f);
         free(o);
     }
     QIV_STAGE("conv_out");

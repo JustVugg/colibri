@@ -7,6 +7,30 @@
 #include <assert.h>
 
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#include <sys/wait.h>
+
+static void test_disconnected_peer_is_an_io_error(void)
+{
+    /* Use a child with the default signal disposition: a caller must receive
+     * the error, even when its launcher has not globally ignored SIGPIPE. */
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        int sockets[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        close(sockets[1]);
+        signal(SIGPIPE, SIG_DFL);
+        char byte = 'x';
+        int result = cluster_io(sockets[0], &byte, 1, 1);
+        close(sockets[0]);
+        assert(signal(SIGPIPE, SIG_DFL) == SIG_DFL);
+        _exit(result == -1 ? 0 : 2);
+    }
+    int status;
+    while (waitpid(child, &status, 0) < 0) assert(errno == EINTR);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 typedef struct { int fd; int failed; } ClusterProtocolArgs;
 
 static void *cluster_protocol_worker(void *opaque)
@@ -88,6 +112,7 @@ static void test_wire_round_trip(void)
 int main(void)
 {
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+    test_disconnected_peer_is_an_io_error();
     test_wire_round_trip();
     puts("cluster protocol tests: ok");
 #else

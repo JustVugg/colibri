@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The numeric channel on the DeepSeek V4 serve path (SUBMIT logprobs=k / pin=1).
 
-This is what `POST /v1/brio` speaks (docs/brio.md), and #1648 found that this
+This is what `POST /v1/systemone` speaks to a language model (docs/systemone.md), and #1648 found that this
 engine accepted the header and then refused the request. The properties under
 test are the exact ones a closed-set caller relies on:
 

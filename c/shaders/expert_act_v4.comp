@@ -1,0 +1,75 @@
+#version 450
+// DeepSeek V4's routed expert between its activation (act 2 of qmatmul_gate_up.comp
+// and expert_act.comp) and down, in place over one expert's hidden rows:
+//   hid[r][i] = e4m3(bf16(hid[r][i] * w[r]))
+// with w[r] the row's route weight, bf16 rounding to nearest even, and e4m3 the
+// quantize-dequantize the engine's fp4 kernel applies to down's input on the CPU
+// (coli_fp8_activation_qdq_ref, blocks of 128): per block a power-of-two scale
+// 2^e with e the smallest integer for which max(amax, 1e-4) <= 448 * 2^e, each value
+// divided by it, clamped to [-448, 448], rounded to E4M3 (nearest even, subnormals
+// in steps of 2^-9) and multiplied back. Every step is exact in f32 or rounds once
+// as the CPU does, so a row equals the CPU's whenever its activation does.
+// One workgroup per (block, row); a block past the end of a row is partial.
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer H { float hid[]; };
+layout(std430, binding = 1) readonly buffer W { float rw[]; };
+
+layout(push_constant) uniform P {
+    int rows;
+    int n;          // elements per row: moe_inter
+} p;
+
+shared float amax[128];
+
+float bf16r(float v) {
+    uint b = floatBitsToUint(v);
+    if ((b & 0x7f800000u) != 0x7f800000u) b += 0x7fffu + ((b >> 16) & 1u);
+    return uintBitsToFloat(b & 0xffff0000u);
+}
+float pow2(int k) { return uintBitsToFloat(uint(k + 127) << 23); }   // 2^k, -126 <= k <= 127
+
+// |x| <= 448: the E4M3 value nearest to x (ties to even), as coli_e4m3fn_encode
+// followed by coli_e4m3fn_decode
+float e4m3r(float x) {
+    float a = abs(x), r;
+    if (a == 0.0) return x;
+    if (a >= 448.0) r = 448.0;
+    else if (a < 0.015625) {             // below 2^-6: subnormal codes, steps of 2^-9
+        float s = a * 512.0, f = floor(s), fr = s - f;
+        if (fr > 0.5 || (fr == 0.5 && (int(f) & 1) == 1)) f += 1.0;
+        r = f * 0.001953125;
+    } else {                             // 1.mmm x 2^E, three mantissa bits
+        uint b = floatBitsToUint(a);
+        int E = int((b >> 23) & 0xffu) - 127;
+        uint sig = 0x800000u | (b & 0x7fffffu), q = sig >> 20, rem = sig & 0xfffffu;
+        if (rem > 0x80000u || (rem == 0x80000u && (q & 1u) == 1u)) q++;
+        r = float(q) * pow2(E - 3);
+    }
+    return x < 0.0 ? -r : r;
+}
+
+void main() {
+    int t = int(gl_LocalInvocationID.x), r = int(gl_WorkGroupID.y);
+    int i = int(gl_WorkGroupID.x) * 128 + t;
+    bool live = r < p.rows && i < p.n;
+    uint at = uint(r) * uint(p.n) + uint(max(i, 0));
+    float v = live ? bf16r(hid[at] * rw[r]) : 0.0;
+    amax[t] = abs(v);
+    barrier();
+    for (int s = 64; s > 0; s >>= 1) {
+        if (t < s) amax[t] = max(amax[t], amax[t + s]);
+        barrier();
+    }
+    // m = (1 + man / 2^23) * 2^E: m <= 448 * 2^e, 448 = 1.75 * 2^8, holds from
+    // e = E - 8 when the mantissa is at most 1.75, else from e = E - 7. (The CPU
+    // divides by 448 and takes the ceiling of the log; its quotient is correctly
+    // rounded, so the two agree, a power of two included.)
+    float m = max(amax[0], 1e-4);
+    uint mb = floatBitsToUint(m);
+    int E = int((mb >> 23) & 0xffu) - 127;
+    int e = (mb & 0x7fffffu) <= 0x600000u ? E - 8 : E - 7;
+    e = clamp(e, -126, 126);
+    float x = clamp(v * pow2(-e), -448.0, 448.0);
+    if (live) hid[at] = e4m3r(x) * pow2(e);
+}

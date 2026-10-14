@@ -19,6 +19,7 @@ tools/librans_c.so
 tools/librans_c.dylib
 tools/rans_c.dll
 tests/fuzz_rans
+tests/fuzz_glm53_worker
 tests/bench_omp_grain
 tests/mxfp4_ref.o
 mxfp4_cuda_test
@@ -56,6 +57,8 @@ qwenimage
 qwenimage.exe
 shaders/attention_absorb.spv
 shaders/qmatmul_gate_up.spv
+shaders/expert_act.spv
+shaders/expert_act_v4.spv
 shaders/rmsnorm.spv
 # Optional XDNA test scaffolding that the *.o / *.dll globs above do not cover.
 tests/xdna_exec_fixtures/

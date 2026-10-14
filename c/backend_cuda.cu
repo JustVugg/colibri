@@ -1556,6 +1556,26 @@ extern "C" int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
     return r;
 }
 
+extern "C" int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *weights, const float *scales) {
+    if (!t || !weights || !t->weights || !t->weights_owned) return 0;
+#ifdef COLI_ANS
+    if (t->compressed) return 0;            /* archive bytes, not a weight buffer of this size */
+#endif
+    if (t->fmt && t->fmt != 6 && (!scales || !t->scales)) return 0;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (!select_ctx(ctx)) return 0;
+    /* Same steps as the upload, into the buffers already there. A failure
+     * half-way leaves the tensor's content undefined: the caller frees it. */
+    if (!cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor overwrite")) return 0;
+    if (t->fmt==2||t->fmt==4) {
+        offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
+        if (!cuda_ok(cudaGetLastError(),"int4 weight conversion")) return 0;
+    }
+    if (t->fmt && t->fmt != 6 &&
+        !cuda_ok(cudaMemcpy(t->scales, scales, tensor_scale_bytes(t), cudaMemcpyHostToDevice), "scale overwrite")) return 0;
+    return 1;
+}
+
 #ifdef COLI_ANS
 struct AnsSidecarHeader {
     uint32_t magic,raw_bytes,archive_bytes,fmt,I,O;
@@ -1799,6 +1819,173 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->dy, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
     return 1;
+}
+
+/* ---- gated delta layer on the device (see backend_cuda.h) ---------------- */
+#define DN_MAX_HEADS 64
+struct DnGates { float egh[DN_MAX_HEADS]; float beta[DN_MAX_HEADS]; };
+struct ColiCudaDn {
+    int device, vh, vk, kdim, vdim, conv_dim, convk, hidden;
+    float eps; int gate_sigmoid;
+    float *ring, *rec, *conv_w, *norm_w;              /* resident */
+    float *x, *qkvz, *conv_out, *outr, *out;          /* scratch for one token */
+};
+
+/* one thread per channel: causal depthwise conv over the ring + this token,
+ * SiLU, then the ring advances (drop oldest, append this token's value) */
+__global__ void dn_conv_kernel(const float *__restrict__ qkv, float *__restrict__ ring,
+                               const float *__restrict__ w, float *__restrict__ conv_out,
+                               int conv_dim, int convk) {
+    int cc = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cc >= conv_dim) return;
+    const float *wc = w + (size_t)cc * convk;
+    float *rg = ring + (size_t)cc * (convk - 1);
+    float acc = 0.f;
+    for (int kk = 0; kk < convk - 1; kk++) acc += wc[kk] * rg[kk];
+    float cur = qkv[cc];
+    acc += wc[convk - 1] * cur;
+    conv_out[cc] = acc / (1.f + expf(-acc));
+    for (int kk = 0; kk < convk - 2; kk++) rg[kk] = rg[kk + 1];
+    rg[convk - 2] = cur;
+}
+
+__device__ static double dn_block_sum(double v, double *sh) {
+    /* blockDim <= 1024; warp shuffle then one pass over warps */
+    for (int o = 16; o > 0; o >>= 1) v += f8_shfl_down(v, o);   /* CUDA: __shfl_down_sync, HIP: __shfl_down (backend_gpu_compat) */
+    int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    __syncthreads();
+    if (lane == 0) sh[wid] = v;
+    __syncthreads();
+    double r = 0.0;
+    int nw = (blockDim.x + 31) >> 5;
+    for (int i = 0; i < nw; i++) r += sh[i];
+    return r;
+}
+
+/* one block per value head; thread t owns column t of the state (vdim) and
+ * element t of q/k (kdim). Same arithmetic as the CPU deltanet(): norms in
+ * double with eps inside the sqrt, S = S*egh + k delta^T with delta read from
+ * the decayed state, out = q^T S over the updated state, then the gated
+ * RMSNorm with silu(z). */
+__global__ void __launch_bounds__(256) dn_head_kernel(const float *__restrict__ conv_out, const float *__restrict__ z,
+                               float *__restrict__ S, float *__restrict__ outr,
+                               const float *__restrict__ normw, DnGates g,
+                               int rep, int kdim, int vdim, int key_dim_tot, float scale, float eps, int gate_sigmoid) {
+    __shared__ float q[256], k[256], delta[256];
+    __shared__ double red[32];
+    int h = blockIdx.x, t = threadIdx.x;
+    int kh = h / rep;
+    const float *qs = conv_out + (size_t)kh * kdim;
+    const float *ks = conv_out + key_dim_tot + (size_t)kh * kdim;
+    const float *vs = conv_out + 2 * (size_t)key_dim_tot + (size_t)h * vdim;
+    float qv = t < kdim ? qs[t] : 0.f, kv_ = t < kdim ? ks[t] : 0.f;
+    double sq = dn_block_sum((double)qv * qv, red);
+    double sk = dn_block_sum((double)kv_ * kv_, red);
+    double nq = sqrt(sq + 1e-6), nk = sqrt(sk + 1e-6);
+    if (t < kdim) { q[t] = (float)((double)qv / nq * scale); k[t] = (float)((double)kv_ / nk); }
+    __syncthreads();
+    float egh = g.egh[h], beta = g.beta[h];
+    float *Sh = S + (size_t)h * kdim * vdim;
+    float o = 0.f;
+    if (t < vdim) {
+        float kvsum = 0.f;
+        for (int kk = 0; kk < kdim; kk++) kvsum += k[kk] * (Sh[(size_t)kk * vdim + t] * egh);
+        delta[t] = (vs[t] - kvsum) * beta;
+        for (int kk = 0; kk < kdim; kk++) {
+            float s = Sh[(size_t)kk * vdim + t] * egh + k[kk] * delta[t];
+            Sh[(size_t)kk * vdim + t] = s;
+            o += q[kk] * s;
+        }
+    }
+    double ms = dn_block_sum((double)o * o, red);
+    if (t < vdim) {
+        float r = 1.f / sqrtf((float)(ms / vdim) + eps);
+        float zz = z[(size_t)h * vdim + t];
+        float gate = gate_sigmoid ? 1.f / (1.f + expf(-zz)) : zz / (1.f + expf(-zz));
+        outr[(size_t)h * vdim + t] = (o * r * normw[t]) * gate;
+    }
+}
+
+extern "C" ColiCudaDn *coli_cuda_dn_create(int device, int vh, int vk, int kdim, int vdim,
+                            int conv_dim, int convk, int hidden,
+                            const float *conv_w, const float *norm_w, float eps, int gate_sigmoid) {
+    if (vh < 1 || vh > DN_MAX_HEADS || vk < 1 || vh % vk || kdim < 1 || kdim > 256 || vdim < 1 || vdim > 256 ||
+        convk < 2 || conv_dim != 2 * vk * kdim + vh * vdim || hidden < 1 || !conv_w || !norm_w) return NULL;
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return NULL;
+    ColiCudaDn *d = static_cast<ColiCudaDn *>(std::calloc(1, sizeof(*d)));
+    if (!d) return NULL;
+    d->device = device; d->vh = vh; d->vk = vk; d->kdim = kdim; d->vdim = vdim;
+    d->conv_dim = conv_dim; d->convk = convk; d->hidden = hidden; d->eps = eps; d->gate_sigmoid = gate_sigmoid ? 1 : 0;
+    size_t ring_b = (size_t)conv_dim * (convk - 1) * sizeof(float), rec_b = (size_t)vh * kdim * vdim * sizeof(float);
+    size_t proj = (size_t)conv_dim + (size_t)vh * vdim;
+    int ok = cuda_ok(cudaMalloc(&d->ring, ring_b), "dn ring") && cuda_ok(cudaMalloc(&d->rec, rec_b), "dn state") &&
+             cuda_ok(cudaMalloc(&d->conv_w, (size_t)conv_dim * convk * sizeof(float)), "dn conv weights") &&
+             cuda_ok(cudaMalloc(&d->norm_w, (size_t)vdim * sizeof(float)), "dn norm weights") &&
+             cuda_ok(cudaMalloc(&d->x, (size_t)hidden * sizeof(float)), "dn x") &&
+             cuda_ok(cudaMalloc(&d->qkvz, proj * sizeof(float)), "dn qkvz") &&
+             cuda_ok(cudaMalloc(&d->conv_out, (size_t)conv_dim * sizeof(float)), "dn conv out") &&
+             cuda_ok(cudaMalloc(&d->outr, (size_t)vh * vdim * sizeof(float)), "dn outr") &&
+             cuda_ok(cudaMalloc(&d->out, (size_t)hidden * sizeof(float)), "dn out") &&
+             cuda_ok(cudaMemcpy(d->conv_w, conv_w, (size_t)conv_dim * convk * sizeof(float), cudaMemcpyHostToDevice), "dn conv upload") &&
+             cuda_ok(cudaMemcpy(d->norm_w, norm_w, (size_t)vdim * sizeof(float), cudaMemcpyHostToDevice), "dn norm upload") &&
+             cuda_ok(cudaMemset(d->ring, 0, ring_b), "dn ring zero") && cuda_ok(cudaMemset(d->rec, 0, rec_b), "dn state zero");
+    if (!ok) { coli_cuda_dn_free(d); return NULL; }
+    return d;
+}
+extern "C" void coli_cuda_dn_free(ColiCudaDn *d) {
+    if (!d) return;
+    DeviceContext *ctx = find_ctx(d->device);
+    if (ctx) select_ctx(ctx);
+    float *bufs[] = { d->ring, d->rec, d->conv_w, d->norm_w, d->x, d->qkvz, d->conv_out, d->outr, d->out };
+    for (float *b : bufs) if (b) cudaFree(b);
+    std::free(d);
+}
+extern "C" int coli_cuda_dn_set_state(ColiCudaDn *d, const float *ring, const float *rec) {
+    if (!d) return 0;
+    if (!select_ctx(find_ctx(d->device))) return 0;
+    size_t ring_b = (size_t)d->conv_dim * (d->convk - 1) * sizeof(float), rec_b = (size_t)d->vh * d->kdim * d->vdim * sizeof(float);
+    int ok = ring ? cuda_ok(cudaMemcpy(d->ring, ring, ring_b, cudaMemcpyHostToDevice), "dn ring set")
+                  : cuda_ok(cudaMemset(d->ring, 0, ring_b), "dn ring zero");
+    ok = ok && (rec ? cuda_ok(cudaMemcpy(d->rec, rec, rec_b, cudaMemcpyHostToDevice), "dn state set")
+                    : cuda_ok(cudaMemset(d->rec, 0, rec_b), "dn state zero"));
+    return ok;
+}
+extern "C" int coli_cuda_dn_get_state(ColiCudaDn *d, float *ring, float *rec) {
+    if (!d || !ring || !rec) return 0;
+    if (!select_ctx(find_ctx(d->device))) return 0;
+    size_t ring_b = (size_t)d->conv_dim * (d->convk - 1) * sizeof(float), rec_b = (size_t)d->vh * d->kdim * d->vdim * sizeof(float);
+    return cuda_ok(cudaMemcpy(ring, d->ring, ring_b, cudaMemcpyDeviceToHost), "dn ring get") &&
+           cuda_ok(cudaMemcpy(rec, d->rec, rec_b, cudaMemcpyDeviceToHost), "dn state get");
+}
+extern "C" int coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz, ColiCudaTensor *outp,
+                            const float *x, float *out, const float *egh, const float *beta) {
+    if (fault_injected()) return 0;
+    if (!d || !proj || !outp || !x || !out || !egh || !beta) return 0;
+    size_t proj_dim = (size_t)d->conv_dim + (size_t)d->vh * d->vdim, value_dim = (size_t)d->vh * d->vdim;
+    size_t want_o = projz ? (size_t)d->conv_dim : proj_dim;
+    if (proj->fmt != 1 || proj->I != d->hidden || (size_t)proj->O != want_o || proj->device != d->device ||
+        outp->fmt != 1 || (size_t)outp->I != value_dim || outp->O != d->hidden || outp->device != d->device) return 0;
+    if (projz && (projz->fmt != 1 || projz->I != d->hidden || (size_t)projz->O != value_dim || projz->device != d->device)) return 0;
+    if (!select_ctx(find_ctx(d->device))) return 0;
+    DnGates g;
+    for (int h = 0; h < d->vh; h++) { g.egh[h] = egh[h]; g.beta[h] = beta[h]; }
+    if (!cuda_ok(cudaMemcpy(d->x, x, (size_t)d->hidden * sizeof(float), cudaMemcpyHostToDevice), "dn x upload")) return 0;
+    quant_matmul_launch(d->qkvz, d->x, proj->weights, proj->scales, 1, 1, d->hidden, (int)want_o,
+                        row_bytes(1, d->hidden), proj->gs, proj->ng);
+    if (projz)
+        quant_matmul_launch(d->qkvz + d->conv_dim, d->x, projz->weights, projz->scales, 1, 1, d->hidden, (int)value_dim,
+                            row_bytes(1, d->hidden), projz->gs, projz->ng);
+    dn_conv_kernel<<<(unsigned)((d->conv_dim + 255) / 256), 256>>>(d->qkvz, d->ring, d->conv_w, d->conv_out, d->conv_dim, d->convk);
+    int threads = d->kdim > d->vdim ? d->kdim : d->vdim;
+    threads = ((threads + 31) / 32) * 32;
+    dn_head_kernel<<<(unsigned)d->vh, threads>>>(d->conv_out, d->qkvz + d->conv_dim, d->rec, d->outr, d->norm_w, g,
+                                                 d->vh / d->vk, d->kdim, d->vdim, d->vk * d->kdim,
+                                                 1.f / sqrtf((float)d->kdim), d->eps, d->gate_sigmoid);
+    quant_matmul_launch(d->out, d->outr, outp->weights, outp->scales, 1, 1, (int)value_dim, d->hidden,
+                        row_bytes(1, (int)value_dim), outp->gs, outp->ng);
+    return cuda_ok(cudaGetLastError(), "dn step launch") &&
+           cuda_ok(cudaMemcpy(out, d->out, (size_t)d->hidden * sizeof(float), cudaMemcpyDeviceToHost), "dn out download");
 }
 
 /* MXFP4 matmul, stateless. Separate from coli_cuda_matmul on purpose: that one
@@ -2673,6 +2860,67 @@ extern "C" size_t coli_cuda_tensor_vram(const ColiCudaTensor *tensor) {
 
 extern "C" int coli_cuda_tensor_device(const ColiCudaTensor *tensor) {
     return tensor ? tensor->device : -1;
+}
+extern "C" int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I, int *O) {
+    if (!t) return 0;
+    if (fmt) *fmt = t->fmt;
+    if (I) *I = t->I;
+    if (O) *O = t->O;
+    return 1;
+}
+/* A decode GEMV for int8 rows (fmt 1, one activation row): a warp per output row,
+ * each lane 16 bytes of the row per step (I a multiple of 16), the activation in
+ * shared memory, a shuffle reduction, the row's scale. quant_matmul above spends a
+ * block of 256 threads on one row and reaches a quarter of the bus; this reads the
+ * trunk at the bus's pace, which is what the dense chain's decode token is made of
+ * (about 1.9 GB of rows on Qwen3.6-35B). The same sums as quant_matmul up to the
+ * order of the float additions. */
+#define GEMV_I8_ROWS 8   /* warps, and output rows, per block */
+#define GEMV_I8_MAX_S 8  /* activation rows it takes, each on its own (blockIdx.y): a verify's
+                            rows get a decode step's bits, as the engines ask (q36_spec_step) */
+__global__ static void __launch_bounds__(256) gemv_i8_rows(float *__restrict__ y, const float *__restrict__ x,
+        const int8_t *__restrict__ w, const float *__restrict__ sc, int I, int O) {
+    extern __shared__ float xs[];
+    x += (size_t)blockIdx.y * I; y += (size_t)blockIdx.y * O;
+    for (int i = threadIdx.x; i < I; i += 256) xs[i] = x[i];
+    __syncthreads();
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int o = blockIdx.x * GEMV_I8_ROWS + warp;
+    if (o >= O) return;
+    const int8_t *row = w + (size_t)o * I;
+    float acc = 0.f;
+    for (int i0 = lane * 16; i0 < I; i0 += 32 * 16) {
+        int4 v = *reinterpret_cast<const int4 *>(row + i0);
+        const int8_t *b = reinterpret_cast<const int8_t *>(&v);
+        const float *xv = xs + i0;
+        #pragma unroll
+        for (int k = 0; k < 16; k++) acc += xv[k] * (float)b[k];
+    }
+    for (int off = 16; off > 0; off >>= 1) acc += f8_shfl_down(acc, off);
+    if (lane == 0) y[o] = acc * sc[o];
+}
+
+/* The dense chain's matmul (cuda_chain.cu): the resident tensor's kernel on the
+ * chain's own stream, device pointers in and out, nothing synchronized here. */
+extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream) {
+    if (fault_injected()) return 0;
+    if (!t || !y_dev || !x_dev || S < 1) return 0;
+    if (t->fmt == 4 && t->gs <= 0) return 0;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (!select_ctx(ctx)) return 0;
+    cudaStream_t st = (cudaStream_t)stream;
+    if (t->fmt == 1 && S <= GEMV_I8_MAX_S && t->I % 16 == 0 && t->I <= 12288) {
+        dim3 blocks((unsigned)((t->O + GEMV_I8_ROWS - 1) / GEMV_I8_ROWS), (unsigned)S);
+        gemv_i8_rows<<<blocks, 256, (size_t)t->I * sizeof(float), st>>>(y_dev, x_dev, (const int8_t *)t->weights, t->scales, t->I, t->O);
+        return cuda_ok(cudaGetLastError(), "chain gemv launch");
+    }
+    dim3 grid((unsigned)t->O, (unsigned)S);
+    if (t->fmt == 8 && f8_warp_mode())
+        quant_matmul_f8w<<<grid, 256, 0, st>>>(y_dev, x_dev, t->weights, t->scales, S, t->I, t->O);
+    else
+        quant_matmul<<<grid, 256, 0, st>>>(y_dev, x_dev, t->weights, t->scales, t->fmt, S, t->I, t->O,
+                                            row_bytes(t->fmt, t->I), t->gs, t->ng);
+    return cuda_ok(cudaGetLastError(), "chain gemm launch");
 }
 
 /* ==== resident-pipeline primitives (Inc.0, 2026-07-13) ====

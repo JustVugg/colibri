@@ -6,6 +6,7 @@ known-good tiny fixture and change exactly one thing, so a test can ask what the
 engine does with that one thing.
 """
 import json
+import math
 import shutil
 import struct
 from pathlib import Path
@@ -30,6 +31,10 @@ def _shard_of(directory, name):
 
 def shape_of(directory, name):
     return list(_shard_of(directory, name)[1][name]["shape"])
+
+
+def dtype_of(directory, name):
+    return _shard_of(directory, name)[1][name]["dtype"]
 
 
 def copy_fixture(source, destination):
@@ -63,27 +68,48 @@ def add_f32(directory, beside, name, count, value=0x41414141):
                       + struct.pack("<I", value) * count)
 
 
-def shrink(directory, name, count):
-    """Keep the first `count` elements of tensor `name`, declared as a flat vector.
-
-    The header stays honest: shape and offsets agree, and the tensors stored after
-    it move up so the data section has no hole. Only the length is hostile.
-    """
+def tensor_bytes(directory, name):
     shard, header, start = _shard_of(directory, name)
+    first, last = header[name]["data_offsets"]
+    with open(shard, "rb") as handle:
+        handle.seek(start + first)
+        return handle.read(last - first)
+
+
+def put(directory, name, dtype, shape, payload, beside=None):
+    """Store tensor `name` as `dtype`, `shape`, `payload`: in its shard, or beside `beside`.
+
+    The header stays honest: dtype, shape and offsets agree with the bytes, and the
+    other tensors move up so the data section has no hole. Only the values the test
+    chose are hostile.
+    """
+    shard, header, start = _shard_of(directory, beside or name)
     data = shard.read_bytes()[start:]
-    width = len(_NAN[header[name]["dtype"]])
     tensors = sorted((entry["data_offsets"][0], key) for key, entry in header.items()
-                     if key != "__metadata__")
+                     if key not in ("__metadata__", name))
     body, at = [], 0
     for _, key in tensors:
-        entry = header[key]
-        first, last = entry["data_offsets"]
-        if key == name:
-            last = first + width * count
-            entry["shape"] = [count]
+        first, last = header[key]["data_offsets"]
         body.append(data[first:last])
-        entry["data_offsets"] = [at, at + last - first]
+        header[key]["data_offsets"] = [at, at + last - first]
         at += last - first
+    header[name] = {"dtype": dtype, "shape": list(shape),
+                    "data_offsets": [at, at + len(payload)]}
     encoded = json.dumps(header, separators=(",", ":")).encode()
     encoded += b" " * (-len(encoded) % 8)
-    shard.write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"".join(body))
+    shard.write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"".join(body) + payload)
+
+
+def shrink(directory, name, count):
+    """Keep the first `count` elements of tensor `name`, declared as a flat vector."""
+    dtype = dtype_of(directory, name)
+    put(directory, name, dtype, [count],
+        tensor_bytes(directory, name)[:len(_NAN[dtype]) * count])
+
+
+def reshape(directory, name, shape):
+    """Declare tensor `name` as `shape`, its data cut or zero-padded to fit."""
+    dtype = dtype_of(directory, name)
+    size = len(_NAN[dtype]) * math.prod(shape)
+    data = tensor_bytes(directory, name)[:size]
+    put(directory, name, dtype, shape, data + bytes(size - len(data)))

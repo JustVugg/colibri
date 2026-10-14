@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import type { HealthResponse } from "./api"
-import { activeRequests, supportsCacheSlots, supportsContinuation } from "./runtime"
+import { activeRequests, supportsCacheSlots, supportsCompaction, supportsContinuation } from "./runtime"
 
 const healthWithActive = (active: boolean | number): HealthResponse => ({
   status: "ok",
@@ -44,5 +44,11 @@ describe("runtime capability normalization", () => {
     expect(supportsContinuation({ status: "ok", continue_assistant: false })).toBe(false)
     expect(supportsContinuation({ status: "ok" })).toBe(false)
     expect(supportsContinuation(null)).toBe(false)
+  })
+
+  it("asks for context compaction only from a server that says it compacts", () => {
+    expect(supportsCompaction({ status: "ok", context_compaction: true })).toBe(true)
+    expect(supportsCompaction({ status: "ok" })).toBe(false)
+    expect(supportsCompaction(null)).toBe(false)
   })
 })

@@ -1,0 +1,131 @@
+#version 450
+// The image rows' attention of a diffusion step (vk_chain.c, vkc_attn_full; Qwen-Image's
+// DiT): S query rows, each over all T key rows, every head. No mask but the end of the
+// keys and no cache: q, k and v are rows of one buffer, token-major,
+//   q[q_off + i*q_row + h*HD + d], k[k_off + t*kv_row + h*HD + d], v[v_off + t*kv_row + h*HD + d]
+//   o[o_off + i*o_row + h*HD + d] = sum_t softmax_t(scale * q_i,h . k_t,h) v_t,h[d]
+// One workgroup of 256 threads takes 64 query rows of one head through the keys in tiles
+// of 64. Thread (ty, tx) = (t / 16, t % 16) scores rows 4ty..4ty+3 against keys
+// 4tx..4tx+3, from chunks of 32 dims of Q and K staged transposed in shared memory (a
+// dim's 64 rows side by side, so four rows or four keys are one vec4), and accumulates
+// its rows' output from 32 keys of V at a time: dims 4tx..4tx+3 and 64+4tx..64+4tx+3
+// (HD 128), 4tx..4tx+3 (64), 2tx, 2tx+1 (32). The softmax runs online in float: each
+// tile's row max, the running sum and the output rescaled by exp(old max - new max); the
+// CPU normalizes the scores first and sums the row in double, so the two agree to
+// rounding. HD (a specialization constant) is 32, 64 or 128. Shared memory: 38.8 KB.
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int HD = 128;
+#define BR 64
+#define BC 64
+#define DC 32
+#define LD 68                      // a transposed tile's row: 64 values and 4 of padding
+#define DPT (HD / 16)              // output dims a thread
+#define NG (HD >= 64 ? HD / 64 : 1)
+
+layout(std430, binding = 0) readonly buffer QKV { float x[]; };
+layout(std430, binding = 1) writeonly buffer OB { float o[]; };
+layout(push_constant) uniform P {
+    int S, T, H, hd, q_off, q_row, k_off, v_off, kv_row, o_off, o_row;
+    float scale;
+} p;
+
+shared vec4 sb4[2 * DC * LD / 4];  // Q^T and K^T chunks, [32][68] each; later a V chunk, [32][HD]
+shared vec4 pt4[BC * LD / 4];      // the tile's exp(score - max), transposed: [64 keys][68]
+shared float red[BR * 16];         // per-row partial maxima, then sums
+
+float sbf(int i) { return sb4[i >> 2][i & 3]; }
+
+void main() {
+    int t = int(gl_LocalInvocationID.x), ty = t / 16, tx = t % 16;
+    int h = int(gl_WorkGroupID.y), r0 = int(gl_WorkGroupID.x) * BR, hb = h * HD;
+    vec4 acc[4][2];                // rows x (up to two vec4 groups of dims)
+    vec2 acc2[4];                  // HD 32
+    float m[4], l[4];
+    for (int i = 0; i < 4; i++) {
+        m[i] = -1e30; l[i] = 0.0; acc[i][0] = vec4(0.0); acc[i][1] = vec4(0.0); acc2[i] = vec2(0.0);
+    }
+    for (int kb = 0; kb < p.T; kb += BC) {
+        vec4 s[4];
+        for (int i = 0; i < 4; i++) s[i] = vec4(0.0);
+        for (int dc = 0; dc < HD; dc += DC) {
+            barrier();   // the previous chunk (or V) is read
+            for (int e = t; e < BR * DC; e += 256) {
+                int r = e / DC, c = e - r * DC, row = r0 + r, key = kb + r;
+                int qi = c * LD + r, ki = DC * LD + c * LD + r;
+                sb4[qi >> 2][qi & 3] = row < p.S ? x[p.q_off + row * p.q_row + hb + dc + c] : 0.0;
+                sb4[ki >> 2][ki & 3] = key < p.T ? x[p.k_off + key * p.kv_row + hb + dc + c] : 0.0;
+            }
+            barrier();
+            for (int c = 0; c < DC; c++) {
+                vec4 a = sb4[(c * LD + 4 * ty) >> 2], b = sb4[(DC * LD + c * LD + 4 * tx) >> 2];
+                s[0] += a.x * b; s[1] += a.y * b; s[2] += a.z * b; s[3] += a.w * b;
+            }
+        }
+        // the tile's row maxima across the 16 threads that share the rows
+        float mn[4];
+        for (int i = 0; i < 4; i++) {
+            float mt = -1e30;
+            for (int j = 0; j < 4; j++) {
+                s[i][j] = kb + 4 * tx + j < p.T ? s[i][j] * p.scale : -1e30;
+                mt = max(mt, s[i][j]);
+            }
+            red[(4 * ty + i) * 16 + tx] = mt;
+        }
+        barrier();
+        for (int i = 0; i < 4; i++) {
+            float mx = m[i];
+            for (int k = 0; k < 16; k++) mx = max(mx, red[(4 * ty + i) * 16 + k]);
+            mn[i] = mx;
+        }
+        barrier();   // red is read: the sums take it
+        vec4 e4[4];
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) e4[i][j] = kb + 4 * tx + j < p.T ? exp(s[i][j] - mn[i]) : 0.0;
+            red[(4 * ty + i) * 16 + tx] = e4[i].x + e4[i].y + e4[i].z + e4[i].w;
+        }
+        for (int j = 0; j < 4; j++)   // P^T: key 4tx+j, rows 4ty..4ty+3 as one vec4
+            pt4[((4 * tx + j) * LD + 4 * ty) >> 2] = vec4(e4[0][j], e4[1][j], e4[2][j], e4[3][j]);
+        barrier();
+        for (int i = 0; i < 4; i++) {
+            float sum = 0.0;
+            for (int k = 0; k < 16; k++) sum += red[(4 * ty + i) * 16 + k];
+            float al = exp(m[i] - mn[i]);
+            l[i] = l[i] * al + sum; m[i] = mn[i];
+            acc[i][0] *= al; acc[i][1] *= al; acc2[i] *= al;
+        }
+        // P . V, 32 keys of V at a time in the chunks' space
+        for (int kc = 0; kc < BC; kc += 32) {
+            barrier();   // the chunks and the sums are read
+            for (int e = t; e < 32 * HD / 4; e += 256) {
+                int kk = (4 * e) / HD, d = 4 * e - kk * HD, key = kb + kc + kk;
+                int base = p.v_off + key * p.kv_row + hb + d;
+                sb4[e] = key < p.T ? vec4(x[base], x[base + 1], x[base + 2], x[base + 3]) : vec4(0.0);
+            }
+            barrier();
+            for (int kk = 0; kk < 32; kk++) {
+                vec4 pv = pt4[((kc + kk) * LD + 4 * ty) >> 2];
+                if (HD >= 64) {
+                    for (int g = 0; g < NG; g++) {
+                        vec4 vv = sb4[(kk * HD + 64 * g + 4 * tx) >> 2];
+                        acc[0][g] += pv.x * vv; acc[1][g] += pv.y * vv; acc[2][g] += pv.z * vv; acc[3][g] += pv.w * vv;
+                    }
+                } else {
+                    vec2 vv = vec2(sbf(kk * HD + 2 * tx), sbf(kk * HD + 2 * tx + 1));
+                    acc2[0] += pv.x * vv; acc2[1] += pv.y * vv; acc2[2] += pv.z * vv; acc2[3] += pv.w * vv;
+                }
+            }
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        int row = r0 + 4 * ty + i;
+        if (row >= p.S) continue;
+        float inv = 1.0 / l[i];
+        int ob = p.o_off + row * p.o_row + hb;
+        if (HD >= 64) {
+            for (int g = 0; g < NG; g++)
+                for (int k = 0; k < 4; k++) o[ob + 64 * g + 4 * tx + k] = acc[i][g][k] * inv;
+        } else {
+            o[ob + 2 * tx] = acc2[i].x * inv; o[ob + 2 * tx + 1] = acc2[i].y * inv;
+        }
+    }
+}

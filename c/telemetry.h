@@ -193,8 +193,9 @@ static void tiers_emit(Model *m){
 #ifdef COLI_CUDA
     vram=m->gpu_expert_count; vram_gb=m->gpu_expert_bytes/1e9;
 #elif defined(COLI_VULKAN)
-    vram=g_vk_reg_n+g_vk_reg_n2;
-    int64_t bytes=0;
+    int vk_tier_n=vk_tier_resident_count(m);       /* the shared tier's residents, then dev2's */
+    vram=vk_tier_n+g_vk_reg_n2;
+    int64_t bytes=(int64_t)vk_tier_n*(int64_t)g_vkt.exp_bytes;
     if(g_vk_reg) for(int i=0;i<g_vk_reg_NL;i++) for(int e=0;e<g_vk_reg_E;e++){
         ColiVkTensor **slot=vk_reg_at(i,e);
         for(int j=0;j<3;j++) if(slot[j]) bytes+=(int64_t)coli_vk_tensor_bytes(slot[j]);
@@ -234,7 +235,7 @@ static void emap_emit(Model *m){
         for(int e=0;e<cols;e++){
             int tier=0;
 #ifdef COLI_VULKAN
-            if(vk_reg_served(i,e)) tier=2;
+            if(vkt_resident(i,e) || vk_reg_served(i,e)) tier=2;   /* on a Vulkan device */
 #endif
             ESlot *P=m->pin[i];
             for(int z=0;!tier&&z<m->npin[i];z++) if(P[z].eid==e){

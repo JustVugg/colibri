@@ -378,7 +378,8 @@ class TextModelImagesTest(unittest.TestCase):
             self.assertIn("does not generate images", body["error"]["message"])
             conn.request("GET", "/v1/models")
             entry = json.loads(conn.getresponse().read())["data"][0]
-            self.assertNotIn("capabilities", entry)
+            self.assertNotIn("image_generation", entry["capabilities"])
+            self.assertEqual(entry["capabilities"], ["chat", "systemone"])
             conn.close()
         finally:
             server.scheduler.close()

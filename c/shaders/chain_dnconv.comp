@@ -1,0 +1,53 @@
+#version 450
+// Gated DeltaNet's causal depthwise convolution (vk_chain.c, VKC_P_DNCONV): one thread
+// per channel c walks the S rows in order with the channel's ring of the last ck-1
+// inputs (which lives on the device across steps):
+//   acc = sum_k w[c][k] * ring[k] + w[c][ck-1] * in[s][c]   (order 0: the taps first)
+//   acc = w[c][ck-1] * in[s][c] + sum_k w[c][k] * ring[k]   (order 1: the input first)
+//   out[s][c] = silu(acc); the ring drops its oldest input and takes in[s][c].
+// The two orders are the two engines' (qwen36.c, qwen38_core.h), so the sum rounds as
+// on the CPU. snap_row >= 0: the ring as it stands after that row is copied to snap
+// (the state an MTP verify's first row leaves, for the rollback of its draft).
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer IN { float xin[]; };
+layout(std430, binding = 1) readonly buffer WB { float w[]; };
+layout(std430, binding = 2) buffer RB { float ring[]; };
+layout(std430, binding = 3) writeonly buffer OB { float o[]; };
+layout(std430, binding = 4) writeonly buffer SB { float snap[]; };
+
+layout(push_constant) uniform P {
+    int S, CD, CK;
+    int in_off, in_row, out_off, out_row;
+    int snap_row, order;
+    int w_off, ring_off, snap_off;
+} p;
+
+void main() {
+    int c = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u);
+    if (c >= p.CD) return;
+    int nh = p.CK - 1;
+    float hist[8];
+    for (int k = 0; k < 8; k++) hist[k] = k < nh ? ring[p.ring_off + c * nh + k] : 0.0;
+    int wb = p.w_off + c * p.CK;
+    float wl = w[wb + p.CK - 1];
+    for (int s = 0; s < p.S; s++) {
+        float cur = xin[p.in_off + s * p.in_row + c];
+        float acc;
+        /* constant trip counts: the ring stays in registers */
+        if (p.order == 0) {
+            acc = 0.0;
+            for (int k = 0; k < 8; k++) if (k < nh) acc += w[wb + k] * hist[k];
+            acc += wl * cur;
+        } else {
+            acc = wl * cur;
+            for (int k = 0; k < 8; k++) if (k < nh) acc += w[wb + k] * hist[k];
+        }
+        o[p.out_off + s * p.out_row + c] = acc / (1.0 + exp(-acc));
+        for (int k = 0; k < 7; k++) if (k + 1 < nh) hist[k] = hist[k + 1];
+        for (int k = 0; k < 8; k++) if (k == nh - 1) hist[k] = cur;
+        if (s == p.snap_row)
+            for (int k = 0; k < 8; k++) if (k < nh) snap[p.snap_off + c * nh + k] = hist[k];
+    }
+    for (int k = 0; k < 8; k++) if (k < nh) ring[p.ring_off + c * nh + k] = hist[k];
+}

@@ -1,0 +1,173 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+// Kimi Delta Attention on the dense chain (vk_chain.c, VKC_P_KDA): the linear-attention
+// layers of GLM-5.3 (and Kimi K3), delta_attention.h's coli_kda_step for S rows in
+// order, the state and the convolution window on the device across steps.
+//
+// mode 0, the short convolution: one thread per channel c of the C = 3P channels (q, k,
+// v, P each), the rows in order. The channel's window holds its last K inputs, oldest
+// first, as the CPU keeps it ([C][K]); per row it drops the oldest, takes the input
+// (part c / P at in_off + part*in_part + s*in_row + c % P) and the output is
+// silu(sum_tap w[c][tap] * window[tap]), the taps in order, at out_off + s*out_row + c.
+//
+// mode 1, the recurrence and the output norm: one workgroup per head h, thread v owns
+// the state's column S[h][:, v] in registers (KD, the key dim, is a specialization
+// constant; the value dim VD <= 128). Per row, from the convolution's output m (q at
+// h*KD, k at P + h*KD, v at 2P + h*VD) and the raw projections:
+//   q, k   l2-normalized with eps inside the root, q also times 1/sqrt(KD)
+//   alpha  = exp(lb * sigmoid(exp(A_log[h]) * (f[s][h*KD+k] + dt[h*KD+k]))), per key row
+//   beta   = sigmoid(b[s][h])
+//   S[k]  *= alpha[k];  mem = sum_k k[k] S[k];  S[k] += k[k] (v - mem) beta;  o = sum_k q[k] S[k]
+//   y[s][h*VD+v] = o * rsqrt(mean(o^2) + eps) * norm[v] * sigmoid(g[s][h*VD+v])
+// Each column runs the CPU's products and sums in its order; the two l2 sums and the
+// output norm's sum are made by one thread in order, as on the CPU.
+// Parameters in prm at prm_off: A_log[H], dt[P], norm[VD].
+// flags (Kimi K3's kda_forward; 0 is the above, GLM-5.3's):
+//   1  prm holds exp(A_log) itself (the engine keeps A = exp(A_log)), used as it is
+//   2  the l2 sums take eps after the squares, q is normalized and then scaled
+//      ((q * rq) * qscale, k * rk), and the update is k * ((v - mem) * beta)
+layout(local_size_x = 128) in;
+layout(constant_id = 0) const int KD = 128;
+
+layout(std430, binding = 0) readonly buffer IN { float xin[]; };   // 0: q|k|v projections; 1: conv output
+layout(std430, binding = 1) readonly buffer WB { float w[]; };     // 0: taps; 1: prm
+layout(std430, binding = 2) buffer RB { float st[]; };             // 0: window; 1: state [H][KD][VD]
+layout(std430, binding = 3) writeonly buffer OB { float o[]; };    // 0: conv output; 1: y
+layout(std430, binding = 4) readonly buffer FB { float fr[]; };    // 1: decay projection f
+layout(std430, binding = 5) readonly buffer BB { float br[]; };    // 1: beta projection b
+layout(std430, binding = 6) readonly buffer GB { float gr[]; };    // 1: output gate projection g
+
+layout(push_constant) uniform P { int v[32]; } p;
+// mode 0
+#define S_       p.v[1]
+#define C_       p.v[2]
+#define KW       p.v[3]
+#define PW       p.v[4]
+#define IN_OFF   p.v[5]
+#define IN_ROW   p.v[6]
+#define IN_PART  p.v[7]
+#define OUT_OFF  p.v[8]
+#define OUT_ROW  p.v[9]
+#define W_OFF    p.v[10]
+#define WIN_OFF  p.v[11]
+// mode 1
+#define H_       p.v[2]
+#define VD       p.v[3]
+#define M_OFF    p.v[5]
+#define M_ROW    p.v[6]
+#define F_OFF    p.v[7]
+#define F_ROW    p.v[8]
+#define B_OFF    p.v[9]
+#define B_ROW    p.v[10]
+#define G_OFF    p.v[11]
+#define G_ROW    p.v[12]
+#define Y_OFF    p.v[13]
+#define Y_ROW    p.v[14]
+#define ST_OFF   p.v[15]
+#define PRM_OFF  p.v[16]
+#define LB       intBitsToFloat(p.v[17])
+#define NEPS     intBitsToFloat(p.v[18])
+#define EPS      intBitsToFloat(p.v[19])
+#define FLAGS    p.v[20]
+
+shared float sq[KD];
+shared float sk[KD];
+shared float al[KD];
+shared float ov[128];
+shared float scal[2];
+
+float sig(float x) {   // hyper_connections.h's and glm53.c's two-sided form
+    if (x >= 0.0) return 1.0 / (1.0 + exp(-x));
+    float e = exp(x);
+    return e / (1.0 + e);
+}
+
+void conv() {
+    int c = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 128u);
+    if (c >= C_) return;
+    int part = c / PW, j = c - part * PW;
+    float hist[8];
+    int wb = WIN_OFF + c * KW, tb = W_OFF + c * KW;
+    for (int k = 0; k < 8; k++) hist[k] = k < KW ? st[wb + k] : 0.0;
+    for (int s = 0; s < S_; s++) {
+        for (int k = 0; k < 7; k++) if (k + 1 < KW) hist[k] = hist[k + 1];
+        float cur = xin[IN_OFF + part * IN_PART + s * IN_ROW + j];
+        for (int k = 0; k < 8; k++) if (k == KW - 1) hist[k] = cur;
+        float sum = 0.0;
+        for (int k = 0; k < 8; k++) if (k < KW) sum += w[tb + k] * hist[k];
+        o[OUT_OFF + s * OUT_ROW + c] = sum / (1.0 + exp(-sum));
+    }
+    for (int k = 0; k < 8; k++) if (k < KW) st[wb + k] = hist[k];
+}
+
+void rec() {
+    int h = int(gl_WorkGroupID.x), v = int(gl_LocalInvocationID.x);
+    int Pw = PW;
+    bool own = v < VD;
+    float col[KD];
+    int sb = ST_OFF + h * KD * VD;
+    [[unroll]] for (int k = 0; k < KD; k++) col[k] = own ? st[sb + k * VD + v] : 0.0;
+    float ea = (FLAGS & 1) != 0 ? w[PRM_OFF + h] : exp(w[PRM_OFF + h]);
+    float nw = own ? w[PRM_OFF + H_ + Pw + v] : 0.0;
+    for (int s = 0; s < S_; s++) {
+        int mb = M_OFF + s * M_ROW;
+        for (int k = v; k < KD; k += 128) {
+            sq[k] = xin[mb + h * KD + k];
+            sk[k] = xin[mb + Pw + h * KD + k];
+            float f = fr[F_OFF + s * F_ROW + h * KD + k] + w[PRM_OFF + H_ + h * KD + k];
+            al[k] = exp(LB * sig(ea * f));
+        }
+        barrier();
+        if (v == 0) {   // the l2 sums, in order, eps first
+            if ((FLAGS & 2) != 0) {
+                float qs = 0.0, ks = 0.0;
+                for (int k = 0; k < KD; k++) { qs += sq[k] * sq[k]; ks += sk[k] * sk[k]; }
+                scal[0] = 1.0 / sqrt(qs + NEPS);
+                scal[1] = 1.0 / sqrt(ks + NEPS);
+            } else {
+                float qs = NEPS, ks = NEPS;
+                for (int k = 0; k < KD; k++) { qs += sq[k] * sq[k]; ks += sk[k] * sk[k]; }
+                scal[0] = (1.0 / sqrt(float(KD))) / sqrt(qs);
+                scal[1] = 1.0 / sqrt(ks);
+            }
+        }
+        barrier();
+        float qn = scal[0], kn = scal[1];
+        float beta = sig(br[B_OFF + s * B_ROW + h]);
+        float val = own ? xin[mb + 2 * Pw + h * VD + v] : 0.0;
+        float mem = 0.0;
+        float res = 0.0;
+        if ((FLAGS & 2) != 0) {   // kimi_k3.c: q and k normalized first, then the sweeps
+            for (int k = v; k < KD; k += 128) { sq[k] = (sq[k] * qn) * (1.0 / sqrt(float(KD))); sk[k] = sk[k] * kn; }
+            barrier();
+            [[unroll]] for (int k = 0; k < KD; k++) { col[k] *= al[k]; mem += sk[k] * col[k]; }
+            float vt = (val - mem) * beta;
+            [[unroll]] for (int k = 0; k < KD; k++) {
+                col[k] += sk[k] * vt;
+                res += sq[k] * col[k];
+            }
+        } else {
+            [[unroll]] for (int k = 0; k < KD; k++) { col[k] *= al[k]; mem += (sk[k] * kn) * col[k]; }
+            [[unroll]] for (int k = 0; k < KD; k++) {
+                col[k] += (sk[k] * kn) * (val - mem) * beta;
+                res += (sq[k] * qn) * col[k];
+            }
+        }
+        ov[v] = own ? res : 0.0;
+        barrier();
+        if (v == 0) {
+            float sum = 0.0;
+            for (int d = 0; d < VD; d++) sum += ov[d] * ov[d];
+            scal[0] = 1.0 / sqrt(sum / float(VD) + EPS);
+        }
+        barrier();
+        if (own) o[Y_OFF + s * Y_ROW + h * VD + v] = res * scal[0] * nw * sig(gr[G_OFF + s * G_ROW + h * VD + v]);
+        barrier();
+    }
+    if (own) [[unroll]] for (int k = 0; k < KD; k++) st[sb + k * VD + v] = col[k];
+}
+
+void main() {
+    if (p.v[0] == 0) conv();
+    else rec();
+}

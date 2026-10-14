@@ -1,0 +1,309 @@
+#version 450
+// The bidirectional encoders of the decision engines on the dense chain (vk_chain.c,
+// vkc_enc_*): Laya's ModernBERT and its decision head (laya.c), GLiNER2.5-Decide's
+// DeBERTa-v3 (gliner_decide.c). A forward has no cache and no state: every row of every
+// sequence of a request goes through the encoder at once, so the attention reads the
+// step's own K and V, and a row sees a range of rows instead of a causal prefix.
+// The matrices are vkc_matmul's; this shader is everything between them. Six modes
+// (push constants: v[0] the mode, the rest per mode, vk_chain.h's VkcEnc* structs):
+//
+// mode 0, LayerNorm. One workgroup per row r < rows:
+//   t = a[a_off + r*a_row + i] (+ b[b_off + r*b_row + i] with flags & 1)
+//   with flags & 2, t is written back to a (the residual stream of a pre-norm layer:
+//   x += h, then h = LayerNorm(x))
+//   y[y_off + r*y_row + i] = (t - mean) * rstd * w[w_off + i] (+ prm[bias_off + i] when
+//   bias_off >= 0), rstd = 1 / sqrt(var + eps), the biased variance.
+//   The engines sum in double; this is a float tree: they agree to rounding. D <= 4096.
+// mode 1, bias and activation, in place: y[y_off + r*y_row + o] = act(y[...] +
+//   prm[b_off + o]) (no bias when b_off < 0), one thread per (r, o < O); act 0 none,
+//   1 GELU (erf), 2 GELU (tanh), 3 ReLU.
+// mode 2, GeGLU: y[y_off + r*y_row + j] = gelu(u_j + bu_j) * (u_{I+j} + bu_{I+j}), u the
+//   row a[a_off + r*a_row ...], bu the bias at prm[b_off] (none when b_off < 0); act 1
+//   erf, 2 tanh (ModernBERT's MLP: Wi's output split in halves, the first activated).
+// mode 3, RoPE, rotate-half, in place on the query and key heads of each row:
+//   v = x[x_off + r*x_row + part*part_off + h*hd], c = tab[cos_off + pos[r]*half + i],
+//   s = tab[sin_off + pos[r]*half + i]: v[i] = a*c - b*s, v[i+half] = b*c + a*s,
+//   a = v[i], b = v[i+half]: laya.c's apply_rope, the host's own cosf/sinf in the table.
+// mode 4, a table row per row: y[y_off + r*y_row + i] += tab[t_off + idx[r]*D + i]
+//   (Laya's type embedding).
+// mode 5, the attention, every head of every row over a range of rows (its own
+//   sequence, and a window inside it): one workgroup per (head h, block of 16 rows).
+//   Row i sees the rows j in rng[2i] .. rng[2i+1] (inclusive; an empty range gives 0),
+//   q, k and v at q_off, k_off, v_off + row*kv_row + h*hd:
+//     score(i, j) = (q_i . k_j  [+ c2p[h][i][r] with flags & 1]  [+ p2c[h][j][r] with
+//                   flags & 2]) * scale,   r = ridx[pos[i] - pos[j] + rc] - r0
+//   (DeBERTa's disentangled attention: content to content, content to position,
+//   position to content, the relative position bucketed by the host's table; c2p and p2c
+//   are mode 6's products, [H][S][nr] at c_off and p_off), out = sum_j softmax(score)_j
+//   v_j at o_off + i*o_row + h*hd. The softmax runs online over tiles of 32 rows
+//   (running max and sum); the engines normalize first, then sum: the two agree to
+//   rounding. hd <= 128.
+// mode 6, the relative terms' products, as the engine's attention() computes them:
+//   y[y_off + (h*S + i)*nr + t] = sum_d x[x_off + i*x_row + h*hd + d] * p[p_off + (r0 + t)*p_row
+//   + h*hd + d] for every head h, row i < S and t < nr: each row's query against the key
+//   projection of the relative embeddings (c2p), or its key against their query
+//   projection (p2c), for the nr buckets r0 .. r0 + nr - 1 the step can reach. A
+//   workgroup takes 16 rows by 64 buckets of one head, d in steps of 32.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer AB { float a[]; };            // 0: a (and the sum); 2: u; 3: x; 5: qkv
+layout(std430, binding = 1) readonly buffer BB { float b[]; };   // 0: b; 3: the cos/sin table; 5: pk
+layout(std430, binding = 2) readonly buffer PB { float prm[]; }; // 0: w, bias; 1, 2: bias; 4: table; 5: pq
+layout(std430, binding = 3) buffer YB { float y[]; };            // 0, 1, 2, 4: y; 5: out
+layout(std430, binding = 4) readonly buffer IA { int ia[]; };    // 3: pos; 4: idx; 5: rng
+layout(std430, binding = 5) readonly buffer IB { int ib[]; };    // 5: ridx
+layout(std430, binding = 6) readonly buffer IC { int ic[]; };    // 5: pos
+
+layout(push_constant) uniform P { int v[32]; } p;
+#define MODE p.v[0]
+
+shared float red[256];
+#define BQ 16
+#define BK 32
+#define HDM 128
+#define HDP (HDM + 1)
+shared float qs[BQ * HDM];
+shared float kv[BK * HDP];
+shared float sc[BQ * BK];
+shared float mrow[BQ], lrow[BQ], crow[BQ];
+#define BR 64          // mode 6: buckets per workgroup
+#define DC 32          // mode 6: inputs per staged step
+shared int rlo[BQ], rhi[BQ], rpos[BQ];
+shared int klo, khi;
+
+// erfc(x) to a relative error under 1.2e-7 everywhere (Chebyshev fit, Numerical
+// Recipes' erfcc), so 0.5 x erfc(-x / sqrt 2) is GELU to the CPU's erff within float
+// rounding at any magnitude
+float erfc_(float x) {
+    float z = abs(x), t = 1.0 / (1.0 + 0.5 * z);
+    float r = t * exp(-z * z - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 +
+              t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 +
+              t * (-0.82215223 + t * 0.17087277)))))))));
+    return x >= 0.0 ? r : 2.0 - r;
+}
+float act(float x, int k) {
+    if (k == 1) return 0.5 * x * erfc_(-x * 0.70710678118654752);
+    if (k == 2) return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
+    if (k == 3) return max(x, 0.0);
+    return x;
+}
+float sum256(float v, int tid) {
+    red[tid] = v;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        barrier();
+    }
+    float s = red[0];
+    barrier();
+    return s;
+}
+int gid() { return int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u); }
+
+void layernorm() {
+    int rows = p.v[1], D = p.v[2], a_off = p.v[3], a_row = p.v[4], b_off = p.v[5], b_row = p.v[6];
+    int y_off = p.v[7], y_row = p.v[8], w_off = p.v[9], bias_off = p.v[10], flags = p.v[11];
+    float eps = intBitsToFloat(p.v[12]);
+    int r = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x), tid = int(gl_LocalInvocationID.x);
+    if (r >= rows) return;
+    float t[16];
+    float s = 0.0;
+    for (int k = 0; k < 16; k++) {
+        int i = tid + 256 * k;
+        t[k] = 0.0;
+        if (i < D) {
+            float v = a[a_off + r * a_row + i];
+            if ((flags & 1) != 0) v = v + b[b_off + r * b_row + i];
+            t[k] = v;
+            s += v;
+        }
+    }
+    float mean = sum256(s, tid) / float(D);
+    float q = 0.0;
+    for (int k = 0; k < 16; k++) { int i = tid + 256 * k; if (i < D) { float c = t[k] - mean; q += c * c; } }
+    float var = sum256(q, tid) / float(D);
+    float rstd = 1.0 / sqrt(var + eps);
+    // every read of the row is done (the sums' barriers): the row may now be rewritten
+    for (int k = 0; k < 16; k++) {
+        int i = tid + 256 * k;
+        if (i >= D) continue;
+        if ((flags & 2) != 0) a[a_off + r * a_row + i] = t[k];
+        float o = (t[k] - mean) * rstd * prm[w_off + i];
+        if (bias_off >= 0) o = o + prm[bias_off + i];
+        y[y_off + r * y_row + i] = o;
+    }
+}
+
+int g_r0 = 0;
+int r0_row(int i) { return g_r0 + i; }
+
+void attention() {
+    int S = p.v[1], hd = p.v[3];
+    int q_off = p.v[4], k_off = p.v[5], v_off = p.v[6], kv_row = p.v[7], o_off = p.v[8], o_row = p.v[9];
+    int flags = p.v[10], c_off = p.v[11], p_off = p.v[12], nr = p.v[13], rc = p.v[14];
+    float scale = intBitsToFloat(p.v[15]);
+    int r0 = p.v[16];
+    int h = int(gl_WorkGroupID.x), b0 = int(gl_WorkGroupID.y) * BQ, tid = int(gl_LocalInvocationID.x);
+    g_r0 = b0;
+    int nrow = min(BQ, S - b0);
+    for (int e = tid; e < nrow * hd; e += 256) {
+        int i = e / hd, d = e - i * hd;
+        qs[i * HDM + d] = a[q_off + (b0 + i) * kv_row + h * hd + d];
+    }
+    if (tid < BQ) {
+        if (tid < nrow) {
+            rlo[tid] = ia[2 * (b0 + tid)]; rhi[tid] = ia[2 * (b0 + tid) + 1];
+            rpos[tid] = (flags & 3) != 0 ? ic[b0 + tid] : 0;
+        } else { rlo[tid] = 1; rhi[tid] = 0; rpos[tid] = 0; }
+        mrow[tid] = -3.0e38; lrow[tid] = 0.0;
+    }
+    barrier();
+    if (tid == 0) {
+        int lo = 0x7fffffff, hi = -1;
+        for (int i = 0; i < nrow; i++) if (rlo[i] <= rhi[i]) { lo = min(lo, rlo[i]); hi = max(hi, rhi[i]); }
+        klo = lo; khi = hi;
+    }
+    barrier();
+    int pi = tid >> 4, pd = tid & 15;          // the PV step: row pi, dims pd + 16k
+    float acc[8];
+    for (int k = 0; k < 8; k++) acc[k] = 0.0;
+    for (int j0 = klo; j0 <= khi; j0 += BK) {
+        int nk = min(BK, khi - j0 + 1);
+        for (int e = tid; e < nk * hd; e += 256) {
+            int jj = e / hd, d = e - jj * hd;
+            kv[jj * HDP + d] = a[k_off + (j0 + jj) * kv_row + h * hd + d];
+        }
+        barrier();
+        for (int u = 0; u < 2; u++) {
+            int pr = tid + 256 * u, i = pr / BK, jj = pr - i * BK, j = j0 + jj;
+            float sv = 0.0;
+            if (i < nrow && jj < nk && j >= rlo[i] && j <= rhi[i]) {
+                float s = 0.0;
+                for (int d = 0; d < hd; d++) s += qs[i * HDM + d] * kv[jj * HDP + d];
+                if ((flags & 3) != 0) {
+                    int rr = ib[rpos[i] - ic[j] + rc] - r0;
+                    if ((flags & 1) != 0) s += b[c_off + (h * S + r0_row(i)) * nr + rr];
+                    if ((flags & 2) != 0) s += prm[p_off + (h * S + j) * nr + rr];
+                }
+                sv = s * scale;
+            }
+            sc[i * BK + jj] = sv;
+        }
+        barrier();
+        if (tid < BQ) {
+            int i = tid;
+            float m = mrow[i], mn = m;
+            int jlo = max(rlo[i] - j0, 0), jhi = min(rhi[i] - j0, nk - 1);
+            for (int jj = jlo; jj <= jhi; jj++) mn = max(mn, sc[i * BK + jj]);
+            float l = 0.0;
+            for (int jj = 0; jj < BK; jj++) {
+                float e = jj >= jlo && jj <= jhi ? exp(sc[i * BK + jj] - mn) : 0.0;
+                sc[i * BK + jj] = e;
+                l += e;
+            }
+            float c = exp(m - mn);
+            crow[i] = c;
+            lrow[i] = lrow[i] * c + l;
+            mrow[i] = mn;
+        }
+        barrier();
+        for (int e = tid; e < nk * hd; e += 256) {
+            int jj = e / hd, d = e - jj * hd;
+            kv[jj * HDP + d] = a[v_off + (j0 + jj) * kv_row + h * hd + d];
+        }
+        barrier();
+        if (pi < nrow) {
+            float c = crow[pi];
+            for (int k = 0; k < 8; k++) {
+                int d = pd + 16 * k;
+                if (d >= hd) break;
+                float t = acc[k] * c;
+                for (int jj = 0; jj < nk; jj++) t += sc[pi * BK + jj] * kv[jj * HDP + d];
+                acc[k] = t;
+            }
+        }
+        barrier();
+    }
+    if (pi < nrow) {
+        float l = lrow[pi];
+        float inv = l > 0.0 ? 1.0 / l : 0.0;
+        for (int k = 0; k < 8; k++) {
+            int d = pd + 16 * k;
+            if (d >= hd) break;
+            y[o_off + (b0 + pi) * o_row + h * hd + d] = acc[k] * inv;
+        }
+    }
+}
+
+void relprod() {
+    int S = p.v[1], hd = p.v[3], x_off = p.v[4], x_row = p.v[5], p_off = p.v[6], p_row = p.v[7];
+    int y_off = p.v[8], nr = p.v[9], r0 = p.v[10];
+    int t0 = int(gl_WorkGroupID.x) * BR, i0 = int(gl_WorkGroupID.y) * BQ, h = int(gl_WorkGroupID.z);
+    int tid = int(gl_LocalInvocationID.x), tt = tid & 63, iq = tid >> 6;   // bucket tt, rows 4iq .. 4iq+3
+    float acc[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    for (int d0 = 0; d0 < hd; d0 += DC) {
+        int dn = min(DC, hd - d0);
+        for (int e = tid; e < BQ * DC; e += 256) {
+            int i = e / DC, d = e - i * DC;
+            qs[i * (DC + 1) + d] = i0 + i < S && d < dn ? a[x_off + (i0 + i) * x_row + h * hd + d0 + d] : 0.0;
+        }
+        for (int e = tid; e < BR * DC; e += 256) {
+            int t = e / DC, d = e - t * DC;
+            kv[t * (DC + 1) + d] = t0 + t < nr && d < dn ? b[p_off + (r0 + t0 + t) * p_row + h * hd + d0 + d] : 0.0;
+        }
+        barrier();
+        for (int d = 0; d < dn; d++) {
+            float pv = kv[tt * (DC + 1) + d];
+            for (int k = 0; k < 4; k++) acc[k] += qs[(4 * iq + k) * (DC + 1) + d] * pv;
+        }
+        barrier();
+    }
+    if (t0 + tt < nr)
+        for (int k = 0; k < 4; k++) {
+            int i = i0 + 4 * iq + k;
+            if (i < S) y[y_off + (h * S + i) * nr + t0 + tt] = acc[k];
+        }
+}
+
+void main() {
+    int mode = MODE;
+    if (mode == 0) { layernorm(); return; }
+    if (mode == 5) { attention(); return; }
+    if (mode == 6) { relprod(); return; }
+    int i = gid();
+    if (mode == 1) {
+        int n = p.v[1], O = p.v[2], y_off = p.v[3], y_row = p.v[4], b_off = p.v[5], k = p.v[6];
+        if (i >= n) return;
+        int r = i / O, o = i - r * O, at = y_off + r * y_row + o;
+        float v = y[at];
+        if (b_off >= 0) v = v + prm[b_off + o];
+        y[at] = act(v, k);
+    } else if (mode == 2) {
+        int n = p.v[1], I = p.v[2], a_off = p.v[3], a_row = p.v[4], y_off = p.v[5], y_row = p.v[6];
+        int b_off = p.v[7], k = p.v[8];
+        if (i >= n) return;
+        int r = i / I, j = i - r * I, ab = a_off + r * a_row;
+        float u = a[ab + j], g = a[ab + I + j];
+        if (b_off >= 0) { u = u + prm[b_off + j]; g = g + prm[b_off + I + j]; }
+        y[y_off + r * y_row + j] = act(u, k) * g;
+    } else if (mode == 3) {
+        int n = p.v[1], H = p.v[2], hd = p.v[3], x_off = p.v[4], x_row = p.v[5], part_off = p.v[6];
+        int cos_off = p.v[7], sin_off = p.v[8];
+        int half_ = hd / 2;
+        if (i >= n) return;
+        int per_row = 2 * H * half_;
+        int r = i / per_row, rem = i - r * per_row;
+        int part = rem / (H * half_), rem2 = rem - part * H * half_, hh = rem2 / half_, k = rem2 - hh * half_;
+        int vb = x_off + r * x_row + part * part_off + hh * hd;
+        int ps = ia[r] * half_ + k;
+        float c = b[cos_off + ps], s = b[sin_off + ps];
+        float x0 = a[vb + k], x1 = a[vb + k + half_];
+        a[vb + k] = x0 * c - x1 * s;
+        a[vb + k + half_] = x1 * c + x0 * s;
+    } else if (mode == 4) {
+        int n = p.v[1], D = p.v[2], y_off = p.v[3], y_row = p.v[4], t_off = p.v[5];
+        if (i >= n) return;
+        int r = i / D, d = i - r * D;
+        y[y_off + r * y_row + d] += prm[t_off + ia[r] * D + d];
+    }
+}

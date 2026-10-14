@@ -83,6 +83,41 @@ int coli_v4_gpu_fp8_matmul_batch(const ColiTensorView *w, float *outputs,
                                  const float *inputs, int batch);
 #endif
 
+/* Optional Vulkan path (Makefile.deepseek-v4 VK=1). A pointer, not a function:
+ * the engine binary sets it when COLI_VULKAN=1 opened a device, and every other
+ * link of these units (the parent Makefile's tests among them, which carry no
+ * backend) sees NULL and stays on the CPU. It computes
+ * output[batch, rows] = input[batch, columns] W^T for a weight the engine keeps
+ * resident, in the device's own formats: fmt 12 is E4M3 with the f32 128x128
+ * block scales (rows8 = the AVX2 8-row tile layout), fmt 11 is bf16 with no
+ * scales. 0 = done on the device, anything else = run the CPU path. */
+#ifdef COLI_VULKAN
+typedef int (*ColiV4VkMatmul)(int fmt, const void *data, const float *scales,
+                              int rows8, int rows, int columns, float *output,
+                              const float *input, int batch);
+extern ColiV4VkMatmul coli_v4_vk_matmul;
+
+/* With the dense weights on the device only (COLI_VK_DENSE_HOST), a matrix may have no
+ * host copy: the CPU paths call this before they read one, and it is read back from disk
+ * at its own address (deepseek_v4_internal.h, coli_v4_layer_host_restore). NULL when no
+ * device holds a matrix alone. */
+typedef int (*ColiV4VkHost)(const void *data);
+extern ColiV4VkHost coli_v4_vk_host;
+static inline void coli_v4_vk_host_ensure(const void *data) {
+    if (coli_v4_vk_host && data) coli_v4_vk_host(data);
+}
+
+/* An fp8 view on the device, fed the activation the CPU kernel would read
+ * (already rounded to E4M3 per 128 by coli_fp8_activation_qdq_ref). */
+static inline int coli_v4_vk_fp8(float *output, const ColiTensorView *weight,
+                                 const float *activation, int batch) {
+    return coli_v4_vk_matmul &&
+           coli_v4_vk_matmul(12, weight->data, (const float *)weight->scales,
+                             weight->block_rows == 8, (int)weight->rows,
+                             (int)weight->columns, output, activation, batch) == 0;
+}
+#endif
+
 #ifdef __cplusplus
 }
 #endif

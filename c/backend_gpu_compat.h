@@ -95,10 +95,17 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaEventElapsedTime     hipEventElapsedTime
 #define cudaMallocHost           hipHostMalloc
 #define cudaFreeHost             hipHostFree
+#define cudaHostAlloc            hipHostMalloc        /* cuda_chain.cu: mapped host buffers */
+#define cudaHostAllocMapped      hipHostMallocMapped
+#define cudaHostAllocWriteCombined hipHostMallocWriteCombined
+#define cudaHostGetDevicePointer hipHostGetDevicePointer
+#define cudaMemcpyDefault        hipMemcpyDefault
+#define cudaMemcpyHostToHost     hipMemcpyHostToHost
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define cudaMemcpyPeer           hipMemcpyPeer
 #define cudaMemcpyPeerAsync      hipMemcpyPeerAsync
 #define cudaMemsetAsync          hipMemsetAsync
+#define cudaMemset               hipMemset
 /* Device-side kernel abort (weight_at's undecodable-format backstop,
  * backend_cuda.cu). CUDA's __trap() intrinsic has no HIP name-twin; HIP
  * device code aborts via abort() -- the same mapping hipify applies. NVCC

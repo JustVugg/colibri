@@ -37,6 +37,7 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "st.h"
 #include "json.h"
 #include "tok.h"
@@ -48,6 +49,12 @@
 #include "qwenimage_vae.h"
 #define QI_HAVE_VAE 1
 #endif
+#endif
+#ifdef COLI_VULKAN
+/* VK=1 and COLI_VULKAN=1: the DiT's matrices run on the GPU, all the image
+ * tokens of a product in one call. One command buffer: main thread only. */
+#include "backend_vulkan.h"
+static int g_vk_ready, g_vk_tried;
 #endif
 
 static double now_s(void){
@@ -98,7 +105,12 @@ static int g_act8 = 1;   /* COLI_IMG_ACT8=0 turns off the int8 activations of th
  * states carry a few huge channels, and one int8 scale per token wipes out the
  * rest (last layer 124% off, against 7% with int8 weights alone), while the
  * DiT blocks keep the picture (30.1 dB against 35.6 for int8 weights alone). */
-typedef struct { QiMat m; void *own; float *own_sc; int act8; } Lin;
+typedef struct {
+    QiMat m; void *own; float *own_sc; int act8;
+    int gpu;        /* may run on the GPU (COLI_VULKAN): the DiT's matrices */
+    void *vk;       /* its device copy, made on first use */
+    int vk_off;     /* the upload failed: this one stays on the CPU */
+} Lin;
 
 static st_tensor *need_tensor(shards *S, const char *name, int64_t n0, int64_t n1){
     st_tensor *t = st_find(S, name);
@@ -112,9 +124,38 @@ static st_tensor *need_tensor(shards *S, const char *name, int64_t n0, int64_t n
     return t;
 }
 
+/* How many layers load at once (COLI_IMG_LOAD_THREADS, default 4): each thread holds
+ * one matrix's bf16 bytes while it quantizes them (up to ~140 MB for the text encoder's
+ * MLP), so the count bounds the load's transient memory as well as its speed. */
+static int qi_load_threads(void){
+    static int n = 0;
+    if (!n) {
+        const char *e = getenv("COLI_IMG_LOAD_THREADS");
+        n = e && atoi(e) > 0 ? atoi(e) : 4;
+#ifdef _OPENMP
+        if (n > omp_get_max_threads()) n = omp_get_max_threads();
+#endif
+        if (n < 1) n = 1;
+    }
+    return n;
+}
+
 /* bits: 8 = int8 rows, 16 = bf16, 32 = f32. Small matrices ask for 32. */
 static void lin_load(shards *S, const char *name, int N, int K, int bits, Lin *out){
-    need_tensor(S, name, N, K);
+    st_tensor *t = need_tensor(S, name, N, K);
+    if (bits == 8 && t->dtype == 0 && t->nbytes == (int64_t)N * K * 2) {
+        /* bf16 rows straight to int8 rows: the same values as through an f32 copy */
+        uint16_t *raw = xmalloc((size_t)N * K * 2);
+        st_read_raw_cap(S, name, raw, (int64_t)N * K * 2, 1);
+        memset(out, 0, sizeof *out);
+        out->m.N = N; out->m.K = K;
+        int8_t *q = xmalloc((size_t)N * K);
+        float *sc = fmalloc(N);
+        qi_quantize_i8_bf16(raw, N, K, q, sc);
+        free(raw);
+        out->m.fmt = QI_I8; out->m.w = out->own = q; out->m.sc = out->own_sc = sc;
+        return;
+    }
     float *tmp = fmalloc((size_t)N * K);
     st_read_f32_cap(S, name, tmp, (int64_t)N * K, 1);
     memset(out, 0, sizeof *out);
@@ -138,7 +179,12 @@ static void lin_load(shards *S, const char *name, int N, int K, int bits, Lin *o
         out->m.fmt = QI_I8; out->m.w = out->own = q; out->m.sc = out->own_sc = sc;
     }
 }
-static void lin_free(Lin *l){ free(l->own); free(l->own_sc); memset(l, 0, sizeof *l); }
+static void lin_free(Lin *l){
+#ifdef COLI_VULKAN
+    if (l->vk) coli_vk_tensor_free((ColiVkTensor *)l->vk);
+#endif
+    free(l->own); free(l->own_sc); memset(l, 0, sizeof *l);
+}
 static size_t lin_bytes(const Lin *l){
     size_t e = l->m.fmt == QI_F32 ? 4 : l->m.fmt == QI_BF16 ? 2 : 1;
     return (size_t)l->m.N * l->m.K * e + (l->own_sc ? (size_t)l->m.N * 4 : 0);
@@ -149,12 +195,37 @@ static float *vec_load(shards *S, const char *name, int n){
     st_read_f32_cap(S, name, v, n, 1);
     return v;
 }
+/* Y[M][N] = X . W^T on the GPU, for every row of X in one call. Each storage
+ * format is one of the shader's as it is stored: QI_I8 is fmt 1 (int8 [N][K],
+ * one f32 scale per row), QI_BF16 fmt 11, QI_F32 fmt 10. The activations stay
+ * f32, so the result is the CPU's f32-activation product up to summation
+ * order. COLI_IMG_ACT8 is a CPU kernel: a matrix the GPU takes does not
+ * quantize its activations. 0 when the product stays on the CPU. */
+static int qi_vk_linear(float *y, const float *x, int M, const Lin *l){
+#ifdef COLI_VULKAN
+    if (!g_vk_ready || !coli_vk_dense() || !l->gpu || l->vk_off || l->m.ld || M < 1) return 0;
+#ifdef _OPENMP
+    if (omp_in_parallel()) return 0;
+#endif
+    int fmt = l->m.fmt == QI_I8 ? 1 : l->m.fmt == QI_BF16 ? 11 : l->m.fmt == QI_F32 ? 10 : -1;
+    if (fmt < 0) return 0;
+    Lin *dev = (Lin *)l;    /* the device copy is a cache inside a read-only matrix */
+    if (coli_vk_matmul((ColiVkTensor **)&dev->vk, y, x, l->m.w, fmt == 1 ? l->m.sc : NULL, fmt,
+                       M, l->m.K, l->m.N, 0)) return 1;
+    if (!dev->vk) dev->vk_off = 1;
+#endif
+    (void)y; (void)x; (void)M; (void)l;
+    return 0;
+}
+
 /* QWENIMAGE_PROF=1: where a step's time goes (linears, attention, the rest) */
 static int g_prof; static double g_t_lin, g_t_att;
 static inline void linear(float *y, const float *x, int M, const Lin *l){
     double t0 = g_prof ? now_s() : 0;
-    if (g_act8 && l->act8 && l->m.fmt == QI_I8) qi_gemm_act8(y, l->m.N, x, l->m.K, M, &l->m, NULL);
-    else qi_gemm(y, x, M, &l->m, NULL);
+    if (!qi_vk_linear(y, x, M, l)) {
+        if (g_act8 && l->act8 && l->m.fmt == QI_I8) qi_gemm_act8(y, l->m.N, x, l->m.K, M, &l->m, NULL);
+        else qi_gemm(y, x, M, &l->m, NULL);
+    }
     if (g_prof) g_t_lin += now_s() - t0;
 }
 
@@ -289,10 +360,12 @@ static void te_load(Te *te, const char *model){
     double t0 = now_s();
     te->L = calloc(te->layers, sizeof(TeLayer));
     int H = te->hidden, qd = te->heads * te->hd, kd = te->kv * te->hd;
-    char n[256];
     size_t bytes = 0;
+    /* a few layers at once: each reads and quantizes its own matrices (COLI_IMG_LOAD_THREADS) */
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(qi_load_threads()) reduction(+:bytes)
     for (int l = 0; l < te->layers; l++) {
         TeLayer *L = &te->L[l];
+        char n[256];
 #define TN(s) (snprintf(n, sizeof n, "model.language_model.layers.%d.%s", l, s), n)
         lin_load(&te->S, TN("self_attn.q_proj.weight"), qd, H, g_bits, &L->q);
         lin_load(&te->S, TN("self_attn.k_proj.weight"), kd, H, g_bits, &L->k);
@@ -469,6 +542,9 @@ static void dit_config(Dit *d, const char *model){
     }
 }
 
+#ifdef COLI_VULKAN
+static void qic_plan(Dit *d);   /* qwenimage_chain.h: the blocks the device keeps */
+#endif
 static void dit_load(Dit *d, const char *model){
     if (d->loaded) return;
     char dir[2048]; snprintf(dir, sizeof dir, "%s/transformer", model);
@@ -486,10 +562,11 @@ static void dit_load(Dit *d, const char *model){
     lin_load(&S, "txt_in.out_layer.weight", D, D, g_bits, &d->txt2);
     d->txt_norm = vec_load(&S, "txt_in.text_norm.weight", d->ctx);
     d->B = calloc(d->layers, sizeof(DitBlock));
-    char n[256];
     size_t bytes = 0;
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(qi_load_threads()) reduction(+:bytes)
     for (int l = 0; l < d->layers; l++) {
         DitBlock *B = &d->B[l];
+        char n[256];
 #define BN(s) (snprintf(n, sizeof n, "transformer_blocks.%d.%s", l, s), n)
         lin_load(&S, BN("attn.to_q.weight"), D, D, g_bits, &B->q);
         lin_load(&S, BN("attn.to_k.weight"), D, D, g_bits, &B->k);
@@ -499,6 +576,7 @@ static void dit_load(Dit *d, const char *model){
         lin_load(&S, BN("img_mlp.proj.weight"), d->mlp, D, g_bits, &B->proj);
         lin_load(&S, BN("img_mlp.out.weight"), D, d->mlp, g_bits, &B->out);
         B->q.act8 = B->k.act8 = B->v.act8 = B->o.act8 = B->gate.act8 = B->proj.act8 = B->out.act8 = 1;
+        B->q.gpu = B->k.gpu = B->v.gpu = B->o.gpu = B->gate.gpu = B->proj.gpu = B->out.gpu = 1;
         B->nq = vec_load(&S, BN("attn.norm_q.weight"), d->hd);
         B->nk = vec_load(&S, BN("attn.norm_k.weight"), d->hd);
 #undef BN
@@ -506,10 +584,19 @@ static void dit_load(Dit *d, const char *model){
                  lin_bytes(&B->gate) + lin_bytes(&B->proj) + lin_bytes(&B->out);
     }
     st_destroy(&S);
+    d->img_in.gpu = d->t1.gpu = d->t2.gpu = d->mod.gpu = d->norm_out.gpu = d->proj_out.gpu = 1;
+    d->txt1.gpu = d->txt2.gpu = 1;
     d->loaded = 1;
     fprintf(stderr, "[qwenimage] transformer: %d blocks, %.2f GB resident, %.1f s\n",
             d->layers, (bytes + lin_bytes(&d->mod) + lin_bytes(&d->txt1) + lin_bytes(&d->txt2)) / 1e9,
             now_s() - t0);
+#ifdef COLI_VULKAN
+    /* after the DiT's weights, once: a missing device costs one line */
+    if (!g_vk_tried) {
+        g_vk_tried = 1; g_vk_ready = coli_vk_init_env("qwenimage");
+        if (g_vk_ready) qic_plan(d);   /* before the prompt's prefix uploads anything */
+    }
+#endif
 }
 
 /* The sinusoidal embedding of the timestep, then the two linears. `t` is the
@@ -525,9 +612,9 @@ static void dit_temb(Dit *d, float t, float *temb){
         e[i] = cosf(a); e[half + i] = sinf(a);
     }
     float *h = fmalloc(d->dim);
-    qi_gemm(h, e, 1, &d->t1.m, NULL);
+    if (!qi_vk_linear(h, e, 1, &d->t1)) qi_gemm(h, e, 1, &d->t1.m, NULL);
     for (int i = 0; i < d->dim; i++) h[i] = silu(h[i]);
-    qi_gemm(temb, h, 1, &d->t2.m, NULL);
+    if (!qi_vk_linear(temb, h, 1, &d->t2)) qi_gemm(temb, h, 1, &d->t2.m, NULL);
     free(h);
 }
 /* mod[4*dim] = [scale1 | gate1 | scale2 | gate2], outs[dim] = the final norm's scale */
@@ -535,8 +622,8 @@ static void dit_modulation(Dit *d, float t, float *mod, float *outs){
     float *temb = fmalloc(d->dim), *s = fmalloc(d->dim);
     dit_temb(d, t, temb);
     for (int i = 0; i < d->dim; i++) s[i] = silu(temb[i]);
-    qi_gemm(mod, s, 1, &d->mod.m, NULL);
-    qi_gemm(outs, s, 1, &d->norm_out.m, NULL);
+    if (!qi_vk_linear(mod, s, 1, &d->mod)) qi_gemm(mod, s, 1, &d->mod.m, NULL);
+    if (!qi_vk_linear(outs, s, 1, &d->norm_out)) qi_gemm(outs, s, 1, &d->norm_out.m, NULL);
     free(temb); free(s);
 }
 
@@ -577,7 +664,8 @@ static void dit_rope_apply(float *x, int T, int heads, int hd, const float *cs, 
 
 /* The prompt side of the DiT, computed once per prompt: per block, the keys and
  * values of the text tokens (after norm and RoPE). */
-typedef struct { int L; float **K, **V; } Prefix;
+typedef struct { int L; float **K, **V; unsigned gen; } Prefix;
+static unsigned g_qi_gen;   /* every prefix and step layout a number of its own (the device chain's uploads) */
 
 static void prefix_free(Prefix *p, int layers){
     if (p->K) for (int l = 0; l < layers; l++) { free(p->K[l]); free(p->V[l]); }
@@ -641,7 +729,7 @@ static void dit_prefix(Dit *d, const float *emb, int L, Prefix *p, float *txt_ou
     for (int t = 0; t < L; t++) pos[3 * t] = pos[3 * t + 1] = pos[3 * t + 2] = t;
     float *cs = fmalloc((size_t)L * d->hd / 2), *sn = fmalloc((size_t)L * d->hd / 2);
     dit_rope_table(d, pos, L, cs, sn);
-    p->L = L;
+    p->L = L; p->gen = ++g_qi_gen;
     p->K = calloc(d->layers, sizeof(float *)); p->V = calloc(d->layers, sizeof(float *));
     DitScratch w; scratch_alloc(&w, d, L);
     for (int l = 0; l < d->layers; l++) {
@@ -654,11 +742,11 @@ static void dit_prefix(Dit *d, const float *emb, int L, Prefix *p, float *txt_ou
 }
 
 /* noise_pred[N][in_ch] for the image tokens at timestep t. */
-typedef struct { float *kbuf, *vbuf, *cs, *sn, *x; DitScratch w; int N; } DitStep;
+typedef struct { float *kbuf, *vbuf, *cs, *sn, *x; DitScratch w; int N; unsigned gen; } DitStep;
 
 static void dit_step_init(DitStep *s, Dit *d, const Prefix *p, int gh, int gw){
     int N = gh * gw, T = p->L + N;
-    s->N = N;
+    s->N = N; s->gen = ++g_qi_gen;
     s->kbuf = fmalloc((size_t)T * d->dim); s->vbuf = fmalloc((size_t)T * d->dim);
     s->cs = fmalloc((size_t)N * d->hd / 2); s->sn = fmalloc((size_t)N * d->hd / 2);
     s->x = fmalloc((size_t)N * d->dim);
@@ -679,7 +767,26 @@ static void dit_step_free(DitStep *s){
     free(s->kbuf); free(s->vbuf); free(s->cs); free(s->sn); free(s->x); scratch_free(&s->w);
 }
 
+#ifdef COLI_VULKAN
+#include "qwenimage_chain.h"   /* COLI_VK_CHAIN: every block of a step on the device */
+#ifdef QI_HAVE_VAE
+#include "qwenimage_vae_vk.h"  /* and the VAE decoder after it */
+#endif
+#endif
+#ifdef QI_HAVE_VAE
+/* The VAE decode: on the device when the transformer's chain runs, else (or when the
+ * device's decode fails) the CPU's. */
+static int qi_vae_decode(QiVae *v, const float *z, int h, int w, uint8_t *rgba, float *out_f){
+#ifdef COLI_VULKAN
+    if (g_qic_on > 0 && !g_qic.failed && !g_qic.streamed && qvv_decode(v, z, h, w, rgba, out_f) == 0) return 0;
+#endif
+    return qiv_decode(v, z, h, w, rgba, out_f);
+}
+#endif
 static void dit_forward(Dit *d, const Prefix *p, DitStep *s, const float *lat, float t, float *out){
+#ifdef COLI_VULKAN
+    if (qic_forward(d, p, s, lat, t, out)) return;
+#endif
     int D = d->dim, N = s->N, L = p->L;
     float *mod = fmalloc(4 * (size_t)D), *outs = fmalloc(D);
     dit_modulation(d, t, mod, outs);
@@ -983,7 +1090,7 @@ static int engine_generate(Engine *e, const char *prompt, int width, int height,
         emit_progress(pg, "decode", steps, steps, t0);
 #ifdef QI_HAVE_VAE
         if (!e->vae && !(e->vae = engine_vae(e, msg, msgn))) rc = -1;
-        if (rc == 0 && qiv_decode(e->vae, lat, gh, gw, rgba, NULL) != 0) { snprintf(msg, msgn, "VAE decode failed"); rc = -1; }
+        if (rc == 0 && qi_vae_decode(e->vae, lat, gh, gw, rgba, NULL) != 0) { snprintf(msg, msgn, "VAE decode failed"); rc = -1; }
 #else
         /* no VAE compiled in: show the first three latent channels, stretched */
         for (int y = 0; y < height; y++)
@@ -1300,7 +1407,7 @@ static int run_oracle(Engine *e, const char *refdir){
         if (vae && fin) {
             uint8_t *rgba = xmalloc((size_t)width * height * 4);
             float *of = fmalloc((size_t)4 * width * height);
-            qiv_decode(vae, fin, gh, gw, rgba, of);
+            qi_vae_decode(vae, fin, gh, gw, rgba, of);
             float *img_ref = ref_tensor(&R, "vae_out", NULL);
             if (img_ref) fails += cmp("VAE output (ref latents)", of, img_ref, (size_t)4 * width * height) > LOOSE;
             st_tensor *rt = st_find(&R, "rgba");
@@ -1316,7 +1423,7 @@ static int run_oracle(Engine *e, const char *refdir){
             }
             const char *tag = getenv("QWENIMAGE_ORACLE_TAG");
             char out[2200]; snprintf(out, sizeof out, "%s/oracle_c%s%s.png", refdir, tag ? "_" : "", tag ? tag : "");
-            qiv_decode(vae, mine, gh, gw, rgba, NULL);
+            qi_vae_decode(vae, mine, gh, gw, rgba, NULL);
             if (!write_png(out, rgba, width, height)) fprintf(stderr, "[oracle] our own chained image: %s\n", out);
             /* PSNR of the RGB of our chained image against the reference's: the
              * number that says what int8 weights or activations cost in pixels */
@@ -1341,6 +1448,18 @@ static int run_oracle(Engine *e, const char *refdir){
 
 /* ---- main -------------------------------------------------------------------- */
 
+/* Once, at the end: how many products the GPU actually took, so a run that
+ * asked for Vulkan and quietly stayed on the CPU says so. */
+static void qi_vk_report(void){
+#ifdef COLI_VULKAN
+    if (g_vk_ready) fprintf(stderr, "[VK] qwenimage: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
+    qic_report();
+#ifdef QI_HAVE_VAE
+    if (g_qvv.decodes) fprintf(stderr, "[VK] qwenimage vae: %llu decodes on the device\n", g_qvv.decodes);
+#endif
+#endif
+}
+
 static void usage(void){
     fprintf(stderr,
         "usage: qwenimage --model DIR --prompt TEXT [--width 768] [--height 512] [--steps 8] [--seed N] --out FILE.png\n"
@@ -1348,7 +1467,11 @@ static void usage(void){
         "       qwenimage --model DIR --ref REFDIR\n"
         "env:   COLI_IMG_BITS=8|16|32 weight storage (default 8: int8 rows)\n"
         "       COLI_IMG_ACT8=0  f32 activations in the DiT (default where VNNI exists: int8, about 2x per step)\n"
-        "       COLI_IMG_TE=resident|stage  keep the text encoder loaded between prompts (serve default: resident)\n");
+        "       COLI_IMG_TE=resident|stage  keep the text encoder loaded between prompts (serve default: resident)\n"
+        "       COLI_IMG_LOAD_THREADS=n  layers loaded at once (default 4)\n"
+        "       COLI_VK_QI_RESIDENT=n  transformer blocks kept on the GPU (default: what its free memory holds)\n"
+        "       COLI_VULKAN=1 (a VK=1 build): the transformer on the GPU; COLI_VK_CHAIN=0 keeps each step's blocks\n"
+        "                    off the device chain (the matrices one by one)\n");
 }
 
 int main(int argc, char **argv){
@@ -1393,7 +1516,7 @@ int main(int argc, char **argv){
     if (!seed_set && !serve && !ref) seed = (uint64_t)time(NULL);
     static Engine e;
     engine_init(&e, model);
-    if (ref) return run_oracle(&e, ref);
+    if (ref) { int rc = run_oracle(&e, ref); qi_vk_report(); return rc; }
     if (getenv("QWENIMAGE_PRINT_TOKENS")) {          /* tokenizer check against the processor */
         int n, drop; int *ids = te_encode_prompt(&e.te, prompt ? prompt : "", &n, &drop);
         printf("drop %d ids", drop);
@@ -1405,7 +1528,9 @@ int main(int argc, char **argv){
         e.te_resident = !(te && !strcmp(te, "stage"));
         te_load(&e.te, model);
         dit_load(&e.dit, model);
-        return serve_loop(&e, width, height, steps);
+        int rc = serve_loop(&e, width, height, steps);
+        qi_vk_report();
+        return rc;
     }
     char msg[512];
     if (check_size(width, height, steps, msg, sizeof msg)) { fprintf(stderr, "%s\n", msg); return 2; }
@@ -1417,5 +1542,6 @@ int main(int argc, char **argv){
     if (write_png(out, rgba, width, height)) { fprintf(stderr, "[qwenimage] cannot write %s\n", out); return 1; }
     fprintf(stderr, "[qwenimage] %s  %dx%d  %d steps  seed %llu  encode %.1f s  denoise %.1f s  decode %.1f s\n",
             out, width, height, steps, (unsigned long long)seed, tm[0], tm[1], tm[2]);
+    qi_vk_report();
     return 0;
 }
