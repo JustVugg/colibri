@@ -1135,6 +1135,9 @@ struct ColiV4Engine {
         int device;
         int devices[16];
         int device_count;
+        /* The GPU prefix, layers [0, layers): V4_GPU_LAYERS, parsed once by
+         * coli_v4_gpu_engine_open; 0 before it means every layer. */
+        int layers;
         unsigned char layer_ready[COLI_V4_RESIDENT_MAX_LAYERS];
         long long uploaded_bytes;
         /* Optional opaque V4GpuExpertMirrorCache* for the dspark/MTP draft

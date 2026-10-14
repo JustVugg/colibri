@@ -489,6 +489,54 @@ static void test_draft_cache(void) {
     free(engine); unsetenv("V4_MTP_GPU_DENSE"); unsetenv("V4_MTP_GPU_MIRRORS");
 }
 
+/* coli_v4_gpu_layer_upload returns before these for a layer past the prefix. */
+const ColiDeepSeekV4Config *coli_v4_engine_config(const ColiV4Engine *engine) {
+    (void)engine; abort();
+}
+int coli_v4_layer_gpu_set(ColiDeepSeekV4LayerWeights *weights, const char *suffix, void *handle) {
+    (void)weights; (void)suffix; (void)handle; abort();
+}
+/* V4_GPU_LAYERS: a strict whole number, and a prefix shorter than the model
+ * keeps the layers past it off the devices. */
+static void test_gpu_prefix(ColiV4Engine *engine, ColiExpertStore *store) {
+    setenv("DSV4_CUDA_DEVICES", "5,3,1", 1);
+    static const char *const bad[] = {"0", "44", "-3", "ten", "10x", "", "2"};
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        setenv("V4_GPU_LAYERS", bad[i], 1);
+        assert(coli_v4_gpu_engine_open(engine) == -1);
+        assert(!engine->gpu.enabled && !store->gpu);
+    }
+    setenv("V4_GPU_LAYERS", "10", 1);
+    assert(coli_v4_gpu_engine_open(engine) == 0);
+    assert(engine->gpu.enabled && coli_v4_gpu_layer_count(engine) == 10);
+    unsetenv("V4_GPU_LAYERS");   /* parsed once, at the open */
+    assert(coli_v4_gpu_layer_count(engine) == 10);
+    assert(v4_gpu_expert_cache(store, 9) && !v4_gpu_expert_cache(store, 10));
+    assert(!v4_gpu_expert_cache(store, 42));
+    uint8_t data[4] = {0};
+    for (int layer = 0; layer < 43; layer++) {
+        ColiExpertView view = {0};
+        view.key = (ColiExpertKey){layer, 0};
+        view.gate.data = view.up.data = view.down.data = data;
+        view.gate.scales = view.up.scales = view.down.scales = data;
+        view.gate.rows = view.up.rows = view.down.rows = 2;
+        view.gate.columns = view.up.columns = view.down.columns = 2;
+        view.gate.block_rows = view.up.block_rows = view.down.block_rows = 1;
+        int attached = coli_v4_gpu_expert_attach_async(store, &view) == 0 && view.gate.gpu;
+        assert(attached == (layer < 10));
+        if (attached) assert(((Dsv4CudaTensor *)view.gate.gpu)->device ==
+            engine->gpu.devices[coli_v4_gpu_layer_owner(layer, 3, 10)]);
+        ColiDeepSeekV4LayerWeights weights = {0};
+        weights.plan.layer = layer;
+        if (layer >= 10) {
+            assert(coli_v4_gpu_layer_upload(engine, layer, &weights) == 0);
+            assert(!engine->gpu.layer_ready[layer]);
+        }
+    }
+    coli_v4_gpu_engine_close(engine);
+    assert(!store->gpu);
+    unsetenv("DSV4_CUDA_DEVICES");
+}
 int main(void) {
     ColiV4Engine *engine = calloc(1, sizeof(*engine));
     ColiExpertStore store = {0};
@@ -541,6 +589,7 @@ int main(void) {
     assert(coli_v4_gpu_engine_open(engine) == 0);
     assert(!engine->gpu.enabled && !store.gpu);
     unsetenv("DSV4_CUDA_DEVICE");
+    test_gpu_prefix(engine, &store);
     free(engine);
     test_preload();
     test_resident_route();

@@ -9701,6 +9701,17 @@ static int hot_layer_on_gpu(ColiExpertStore *store, int layer) {
 #endif
 }
 
+/* V4_CPU_TAIL_CACHE=1: CPU layers of a GPU engine pool and pack their experts
+ * like a CPU-only engine. Read once; lookups are on the decode hot path. */
+static int v4_cpu_tail_cache_wanted(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *setting = getenv("V4_CPU_TAIL_CACHE");
+        on = setting && atoi(setting) != 0;
+    }
+    return on;
+}
+
 static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
                       ColiExpertView *view) {
     if (!store || !store->state || !view) {
@@ -9714,8 +9725,7 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         memset(view, 0, sizeof(*view));
         return -1;
     }
-    const char *tail_cache_env = getenv("V4_CPU_TAIL_CACHE");
-    int tail_cache = tail_cache_env && atoi(tail_cache_env) != 0 &&
+    int tail_cache = v4_cpu_tail_cache_wanted() &&
         store->gpu && !hot_layer_on_gpu(store, key.layer);
     pthread_mutex_lock(&state->mutex);
     state->stats.requests++;
@@ -9909,8 +9919,7 @@ int coli_v4_expert_store_preload_cpu_tail(ColiExpertStore *store,
     return 0;
 #else
     const char *preload = getenv("V4_CPU_TAIL_PRELOAD");
-    const char *cache = getenv("V4_CPU_TAIL_CACHE");
-    if (!preload || !atoi(preload) || !cache || !atoi(cache) ||
+    if (!preload || !atoi(preload) || !v4_cpu_tail_cache_wanted() ||
         !store || !store->gpu || !store->state) return 0;
     V4HotPolicy *policy = hot_find(store);
     if (!policy) return 0;
@@ -11110,14 +11119,33 @@ fail:
 #include "backend_cuda_dsv4.h"
 #include "deepseek_v4_gpu_devices.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 
 /* Experimental contiguous GPU prefix; remaining layers keep CPU weights/state. */
 int coli_v4_gpu_layer_count(const ColiV4Engine *engine) {
+    return engine->gpu.layers ? engine->gpu.layers : engine->config.num_hidden_layers;
+}
+
+/* V4_GPU_LAYERS as a whole number of layers from 1 to the model's; anything
+ * else stops the open with a line that says what is wrong. */
+static int v4_gpu_layers_parse(const ColiV4Engine *engine, int *layers) {
+    int total = engine->config.num_hidden_layers;
     const char *value = getenv("V4_GPU_LAYERS");
-    return value ? atoi(value) : engine->config.num_hidden_layers;
+    *layers = total;
+    if (!value) return 0;
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || *end || errno || parsed < 1 || parsed > total) {
+        fprintf(stderr, "v4_gpu V4_GPU_LAYERS=%s: expected a whole number of layers from 1 to %d\n",
+                value, total);
+        return -1;
+    }
+    *layers = (int)parsed;
+    return 0;
 }
 
 static int v4_gpu_wanted(void) {
@@ -11143,9 +11171,10 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (!engine) return -1;
     engine->gpu.enabled = 0;
     engine->gpu.device = 0;
+    engine->gpu.layers = 0;
     if (!v4_gpu_wanted()) return 0;
-    int gpu_layers = coli_v4_gpu_layer_count(engine);
-    if (gpu_layers < 1 || gpu_layers > engine->config.num_hidden_layers) return -1;
+    int gpu_layers;
+    if (v4_gpu_layers_parse(engine, &gpu_layers)) return -1;
     const char *setting = getenv("DSV4_CUDA_DEVICES");
     int count = 1;
     if (setting) {
@@ -11153,6 +11182,11 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     } else {
         const char *device = getenv("DSV4_CUDA_DEVICE");
         engine->gpu.devices[0] = device ? atoi(device) : 0;
+    }
+    if (count > 0 && count > gpu_layers && gpu_layers < engine->config.num_hidden_layers) {
+        fprintf(stderr, "v4_gpu V4_GPU_LAYERS=%d: fewer layers than the %d devices listed\n",
+                gpu_layers, count);
+        return -1;
     }
     if (count < 1 || count > gpu_layers) {
         fprintf(stderr, "v4_gpu invalid device list (use distinct CUDA ordinals, at most one per layer)\n");
@@ -11172,6 +11206,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
         }
     }
     engine->gpu.device_count = count;
+    engine->gpu.layers = gpu_layers;
     int device = engine->gpu.devices[0];
     engine->gpu.enabled = 1;
     engine->gpu.device = device;
