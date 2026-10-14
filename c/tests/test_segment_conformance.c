@@ -8,7 +8,7 @@
  * other is how this test last failed for a reason unrelated to what it checks. */
 static const char *const kExpectedFamilies[] = {
     "glm", "glm53", "inkling", "kimi", "olmoe", "qwen36", "qwen38", "deepseek_v4",
-    "deepseek_v41",
+    "deepseek_v41", "mimo",
 };
 
 static int expected_family(const char *family_id) {

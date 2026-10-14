@@ -1,0 +1,145 @@
+#version 450
+// chain_attn_full.comp's attention (vk_chain.c, vkc_attn_full with the matrix units; a
+// diffusion step's image rows over every key) on cooperative matrices, f16 x f16 -> f32
+// in 16 x 16 tiles: the same bindings, push constants and layout.
+//   o[o_off + i*o_row + h*HD + d] = sum_t softmax_t(scale * q_i . k_t) v_t[d]
+// A workgroup of 256 threads (256 / SG subgroups) takes 64 query rows of one head and
+// walks the keys twice, 32 at a time:
+//   pass 1, every row's max m and sum l of exp(score - m), the scores from the MMAs
+//     going through shared memory where the threads read them (4 threads a row);
+//   pass 2, the scores again, P = exp(score - m) / l as f16, then O += P V into the
+//     accumulators: m and l are final, so nothing is rescaled.
+// Q (times scale), K, V and P are rounded to f16, so the result is the f32 attention's
+// to f16 rounding (about 1e-3 relative), unlike chain_attn_full.comp's: the chain picks
+// it for int8 weights only. Tiles are staged 16 x 16 contiguous (tile (a, b) at
+// (a*NB + b)*256, element (row, col) at row*16 + col), Q once, K and V each key block;
+// K as the B operand is a key x dim tile loaded column-major. Rows past S and keys past
+// T are zeros, the keys masked out of the softmax. Specialization constants: HD (64 or
+// 128) and SG (the subgroup size the pipeline requires, 32 or 64). Shared memory: 37 KB.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int HD = 128;
+layout(constant_id = 1) const int SG = 64;
+#define BR 64                    // query rows a workgroup: 4 row tiles
+#define BC 32                    // keys a block: 2 key tiles
+#define NDT (HD / 16)            // dim tiles
+#define NSUB (256 / SG)          // subgroups
+#define OT (4 * NDT / NSUB)      // output tiles a subgroup
+
+layout(std430, binding = 0) readonly buffer QKV { float x[]; };
+layout(std430, binding = 1) writeonly buffer OB { float o[]; };
+layout(push_constant) uniform P {
+    int S, T, H, hd, q_off, q_row, k_off, v_off, kv_row, o_off, o_row;
+    float scale;
+} p;
+
+shared float16_t sq[4 * NDT * 256];   // Q * scale, tiles (row tile, dim tile)
+shared float16_t skv[2 * NDT * 256];  // K, then V, tiles (key tile, dim tile)
+shared float16_t sp[4 * 2 * 256];     // P, tiles (row tile, key tile)
+shared float ss[4 * 2 * 256];         // the block's scores, tiles (row tile, key tile); the output's staging
+shared float red[BR * 4];
+
+void stage_kv(int off, int kb, int hb, int t) {
+    for (int e = t; e < BC * HD; e += 256) {
+        int key = e / HD, d = e - key * HD, k = kb + key;
+        float v = k < p.T ? x[off + k * p.kv_row + hb + d] : 0.0;
+        skv[((key >> 4) * NDT + (d >> 4)) * 256 + (key & 15) * 16 + (d & 15)] = float16_t(v);
+    }
+}
+void scores(int sgid) {   // ss = Q K^T for the block
+    for (int tile = sgid; tile < 8; tile += NSUB) {
+        int ri = tile >> 1, kj = tile & 1;
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        [[unroll]] for (int dt = 0; dt < NDT; dt++) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+            coopMatLoad(a, sq, (ri * NDT + dt) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b, skv, (kj * NDT + dt) * 256, 16, gl_CooperativeMatrixLayoutColumnMajor);
+            c = coopMatMulAdd(a, b, c);
+        }
+        coopMatStore(c, ss, (ri * 2 + kj) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+    }
+}
+float score_at(int row, int key, int kb) {   // the block's score, masked past T
+    return kb + key < p.T ? ss[((row >> 4) * 2 + (key >> 4)) * 256 + (row & 15) * 16 + (key & 15)] : -1e30;
+}
+
+void main() {
+    int t = int(gl_LocalInvocationID.x), sgid = t / SG;
+    int h = int(gl_WorkGroupID.y), r0 = int(gl_WorkGroupID.x) * BR, hb = h * HD;
+    int row = t >> 2, part = t & 3;   // the softmax: 4 threads a row, 8 keys each
+    for (int e = t; e < BR * HD; e += 256) {
+        int r = e / HD, d = e - r * HD, i = r0 + r;
+        float v = i < p.S ? x[p.q_off + i * p.q_row + hb + d] * p.scale : 0.0;
+        sq[((r >> 4) * NDT + (d >> 4)) * 256 + (r & 15) * 16 + (d & 15)] = float16_t(v);
+    }
+    // pass 1: each row's max and sum
+    float m = -1e30, l = 0.0;
+    for (int kb = 0; kb < p.T; kb += BC) {
+        barrier();
+        stage_kv(p.k_off, kb, hb, t);
+        barrier();
+        scores(sgid);
+        barrier();
+        float mt = -1e30;
+        for (int j = 0; j < 8; j++) mt = max(mt, score_at(row, part * 8 + j, kb));
+        red[row * 4 + part] = mt;
+        barrier();
+        float mn = max(max(red[row * 4], red[row * 4 + 1]), max(red[row * 4 + 2], red[row * 4 + 3]));
+        mn = max(m, mn);
+        float s = 0.0;
+        for (int j = 0; j < 8; j++) { int k = part * 8 + j; s += kb + k < p.T ? exp(score_at(row, k, kb) - mn) : 0.0; }
+        barrier();
+        red[row * 4 + part] = s;
+        barrier();
+        l = l * exp(m - mn) + red[row * 4] + red[row * 4 + 1] + red[row * 4 + 2] + red[row * 4 + 3];
+        m = mn;
+    }
+    float il = 1.0 / l;
+    // pass 2: P V into the accumulators
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[OT];
+    [[unroll]] for (int u = 0; u < OT; u++) acc[u] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    for (int kb = 0; kb < p.T; kb += BC) {
+        barrier();
+        stage_kv(p.k_off, kb, hb, t);
+        barrier();
+        scores(sgid);
+        barrier();
+        for (int j = 0; j < 8; j++) {
+            int k = part * 8 + j;
+            float pv = kb + k < p.T ? exp(score_at(row, k, kb) - m) * il : 0.0;
+            sp[((row >> 4) * 2 + (k >> 4)) * 256 + (row & 15) * 16 + (k & 15)] = float16_t(pv);
+        }
+        barrier();   // K is read: V takes its place
+        stage_kv(p.v_off, kb, hb, t);
+        barrier();
+        [[unroll]] for (int u = 0; u < OT; u++) {
+            int ot = sgid + NSUB * u, ri = ot / NDT, dt = ot - ri * NDT;
+            [[unroll]] for (int kj = 0; kj < 2; kj++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+                coopMatLoad(a, sp, (ri * 2 + kj) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(b, skv, (kj * NDT + dt) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+                acc[u] = coopMatMulAdd(a, b, acc[u]);
+            }
+        }
+    }
+    // the output, a row tile at a time through ss (16 rows x HD floats: HD / 16 tiles)
+    for (int ri = 0; ri < 4; ri++) {
+        barrier();
+        [[unroll]] for (int u = 0; u < OT; u++) {
+            int ot = sgid + NSUB * u;
+            if (ot / NDT == ri) coopMatStore(acc[u], ss, (ot - ri * NDT) * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+        for (int e = t; e < 16 * HD; e += 256) {
+            int r = e / HD, d = e - r * HD, i = r0 + ri * 16 + r;
+            if (i < p.S) o[p.o_off + i * p.o_row + hb + d] = ss[(d >> 4) * 256 + r * 16 + (d & 15)];
+        }
+    }
+}

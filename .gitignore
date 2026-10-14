@@ -21,6 +21,11 @@ c/kimi_k3.exe
 c/olmoe.exe
 c/qwen38
 c/qwen38.exe
+c/laya
+c/laya.exe
+c/gliner_decide
+c/gliner_decide.exe
+c/tools/jev-sdk/node_modules/
 # deepseek_v4 and the per-unit objects its amalgamated Makefile leaves behind.
 # The same omission as #858, one file over: every engine is listed here except
 # the one added last, so `make deepseek-v4` left 26 untracked .o files in
@@ -92,6 +97,14 @@ c/glm_tiny_i4/
 c/glm_tiny_mix/
 c/glm_tiny_fmt6/
 c/glm_tiny_fmt4/
+# tests/vulkan_engines.sh glm: the FP8 oracle and its int4/int3 conversions, GLM-5.3's tiny pair
+c/glm_fp8/
+c/glm_tiny_i4r/
+c/glm_tiny_i3/
+c/glm_tiny_d3/
+c/glm53_tiny/
+c/glm53_stream-i4/
+c/glm53_stream-deq/
 c/glm_bench_medium/
 c/bench/
 
@@ -129,6 +142,15 @@ c/qwen38_tiny/
 c/dsv41_tiny/
 c/qwen36_tiny/
 c/qwen36_tiny_c/
+# tests/spec_drafts_harness.py: the ASCII-vocabulary fixture whose replies round-trip as text
+c/qwen36_tiny_v128/
+c/qwen36_tiny_v128_c/
+c/qwen36_tiny64_v128/
+c/qwen36_tiny64_v128_c/
+# tools/make_clef_tiny.py and its container; clef_tiny/ref.json is committed
+c/clef_tiny/*
+!c/clef_tiny/ref.json
+c/clef_tiny_c/
 c/qwen38_2p4t_tiny/
 c/qwen38_2p4t_tiny_c/
 
@@ -158,3 +180,16 @@ c/kimi_k3_tiny/.coli_usage
 c/qwen38_vision_tiny/
 c/qwen38_mm_tiny/
 c/qwen38_tiny_fp8/
+c/qwen38_tiny_int4/
+c/qwen38_tiny_mtp/
+c/qwen38_tiny_fp8_mtp/
+c/qwen38_tiny_int4_mtp/
+# MiMo tiny fixture: config.json and ref.json are committed, the rest is regenerated
+c/mimo_tiny/*.safetensors
+c/mimo_tiny/model.safetensors.index.json
+c/mimo_tiny/.vendor_mimo_v2/
+c/mimo_tiny/image.png
+c/mimo_tiny/image.json
+c/mimo_tiny/patches.f32
+c/mimo
+c/mimo.exe

@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import subprocess
+import tempfile
 import sys
 from pathlib import Path
 
@@ -43,7 +44,7 @@ def read_line(stream):
     return line.decode("utf-8", "replace").rstrip("\n")
 
 
-def ask(process, request_id, prompt, image):
+def ask(process, request_id, prompt, image, max_tokens=4):
     """IMAGE piu' SUBMIT, e la risposta in byte."""
     patches, grid_h, grid_w = image
     blob = patches.tobytes()
@@ -51,7 +52,7 @@ def ask(process, request_id, prompt, image):
         f"IMAGE {request_id} {len(blob)} {grid_h} {grid_w}\n".encode() + blob + b"\n")
     body = prompt.encode("utf-8")
     process.stdin.write(
-        f"SUBMIT {request_id} 0 {len(body)} 4 0.0 1.0\n".encode() + body + b"\n")
+        f"SUBMIT {request_id} 0 {len(body)} {max_tokens} 0.0 1.0\n".encode() + body + b"\n")
     process.stdin.flush()
 
     pieces = []
@@ -103,23 +104,47 @@ def main() -> int:
 
     prompt = "gu" + IMAGE_OPEN + IMAGE_TOKEN * tokens + IMAGE_CLOSE + "xy"
     environment = {**os.environ, "SERVE": "1", "SERVE_BATCH": "1",
-                   "SNAP": str(arguments.fixture), "GLM53_BITS": "32"}
+                   "SNAP": str(arguments.fixture), "GLM53_BITS": "32",
+                   "GLM53_VERBOSE": "1"}
+    notes = tempfile.NamedTemporaryFile(suffix=".glm53.stderr", delete=False)
     process = subprocess.Popen([os.path.abspath(arguments.binary)],
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, env=environment)
+                               stderr=notes, env=environment)
     try:
         if "READY" not in read_line(process.stdout):
             print("FAIL: nessun READY")
             return 1
-        read_line(process.stdout)                       # STAT
+        line = read_line(process.stdout)                # CAPS vision=<0|1>, then STAT
+        while line.startswith("CAPS "):
+            line = read_line(process.stdout)
+        if not line.startswith("STAT "):
+            print(f"FAIL: dopo READY {line!r}, atteso STAT")
+            return 1
         first = ask(process, 1, prompt, images[0])
         second = ask(process, 2, prompt, images[1])
+        # Un turno con l'immagine che si ferma al primo token lascia in cache
+        # esattamente il prompt. Lo stesso prompt SENZA IMAGE ha gli stessi id,
+        # ma le righe sono state fatte dagli embedding dell'immagine: il motore
+        # non deve riprendere da li' (id uguali non dicono quale immagine).
+        ask(process, 3, prompt, images[0], max_tokens=1)
+        body = prompt.encode("utf-8")
+        process.stdin.write(f"SUBMIT 4 0 {len(body)} 1 0.0 1.0\n".encode() + body + b"\n")
+        process.stdin.flush()
+        while not read_line(process.stdout).startswith(("DONE 4 ", "ERROR 4 ")):
+            pass
         process.stdin.close()
         process.wait(timeout=120)
     finally:
         if process.poll() is None:
             process.kill()
 
+    reuse4 = [line.split() for line in open(notes.name, errors="replace").read().splitlines()
+              if line.startswith("REUSE 4 ")]
+    os.unlink(notes.name)
+    if not reuse4 or reuse4[0][2] != "0":
+        print(f"FAIL: dopo un turno con l'immagine, lo stesso prompt senza IMAGE "
+              f"ha ripreso dalle righe dell'immagine: {reuse4!r}")
+        return 1
     if not first:
         print("FAIL: nessun token generato con un'immagine")
         return 1

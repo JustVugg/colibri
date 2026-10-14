@@ -1,0 +1,249 @@
+#version 450
+// A DSA lightning indexer's top-k selection on the dense chain (vk_chain.c,
+// VKC_P_DSA), for the attention core's selection list (chain_mla.comp mode 0).
+//
+// mode 0, per token (GLM-5.2, colibri.c's attention_rows): one workgroup per query row
+// s, position pos = pos_base + s, nk = pos + 1 positions. When nk <= topk (and not
+// force) the row attends to every position: sel[s*sel_row] = -1. Otherwise each
+// position t scores
+//   score_t = (sum_h [d_h > 0] w_h * d_h) * wscale,   d_h = (q_h . k_t) * qscale
+// (q the row's IH index queries of ID floats, roped; w its IH head weights; k the
+// index-key cache), the CPU's sums in its order, and the row keeps keep = min(nk, topk)
+// positions as the CPU does: thr = the keep-th largest score, then the positions
+// scoring above thr in position order, then those scoring exactly thr in position
+// order until keep. The threshold is found by bisection on the scores' order-keeping
+// integer keys (32 counting passes); -0 counts as +0, as the float compare does.
+// sel[s*sel_row] = keep, then the positions. Scores live in sc[s*sc_row + t].
+// Limits: IH*ID <= 4096.
+//
+// With k-pooling (GLM-5.3, sparse_index.h's coli_sparse_index_select_range):
+// mode 1, the pooled keys: one workgroup per pool p = p0 + WorkGroupID.x, complete (its
+// `pool` positions all written). Per channel d, the pool's key is the softmax mixture of
+// its members' keys under their gate logits plus the position bias ape[j][d]:
+//   pk[p][d] = sum_j softmax_j(gate[p*pool + j][d] + ape[j][d]) * key[p*pool + j][d]
+// in the CPU's order. A pool's key depends on its own rows only: the engine computes
+// each once, when a step completes it, and keeps it (the CPU recomputes it every step).
+// mode 2, the selection: one workgroup per query row s, position q = pos_base + s. The
+// complete pools visible to it (p < (q+1)/pool) score
+//   sum_h [dot_h > 0] (w_h / wdiv) * dot_h * scale,   dot_h = q_h . pk[p]
+// and the top topk/pool of them, in rank order (score, then the lower pool first), give
+// their positions: rank r's pool fills slots [r*pool, r*pool + pool); the incomplete tail
+// (the positions after the last complete pool, up to pool - 1 of them) fills the slots
+// from topk on when `tail`; every other slot is -1 (skipped by the attention core).
+// sel[s*sel_row] = topk (+ pool - 1 with the tail), then the slots. Limits: IH*ID <=
+// 4096, topk/pool <= 1024.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer IQ { float iq[]; };
+layout(std430, binding = 1) readonly buffer HW { float hw[]; };
+layout(std430, binding = 2) readonly buffer KC { float kc[]; };
+layout(std430, binding = 3) buffer SC { float sc[]; };
+layout(std430, binding = 4) buffer SL { int sel[]; };
+layout(std430, binding = 5) buffer PK { float pk[]; };             // 1: written; 2: read
+layout(std430, binding = 6) readonly buffer GT { float gt[]; };    // 1: gate logits [cap][ID]
+layout(std430, binding = 7) readonly buffer AP { float prm[]; };   // 1: ape [pool][ID]
+
+// one block of 32 words, read per mode (vk_chain.h: VkcDsa, VkcDsaPool, VkcDsaPick)
+layout(push_constant) uniform P { int v[32]; } p;
+#define S_       p.v[1]
+#define POS_BASE p.v[2]
+#define IH_      p.v[3]
+#define ID_      p.v[4]
+#define TOPK     p.v[5]
+#define FORCE    p.v[6]
+#define Q_OFF    p.v[7]
+#define Q_ROW    p.v[8]
+#define W_OFF    p.v[9]
+#define W_ROW    p.v[10]
+#define K_OFF    p.v[11]
+#define K_ROW    p.v[12]
+#define SC_ROW   p.v[13]
+#define SEL_ROW  p.v[14]
+#define QSCALE   intBitsToFloat(p.v[15])
+#define WSCALE   intBitsToFloat(p.v[16])
+// mode 1: ID_ at 4, then
+#define POOL1    p.v[2]
+#define P0       p.v[3]
+#define G_OFF    p.v[5]
+#define G_ROW    p.v[6]
+#define APE_OFF  p.v[7]
+#define PK_OFF1  p.v[8]
+#define K_OFF1   p.v[9]
+#define K_ROW1   p.v[10]
+// mode 2: S_, POS_BASE, IH_, ID_, TOPK, Q_OFF.., W_.., SC_ROW, SEL_ROW as mode 0, then
+#define POOL2    p.v[6]
+#define PK_OFF2  p.v[11]
+#define TAIL     p.v[12]
+#define WDIV     intBitsToFloat(p.v[15])
+#define PSCALE   intBitsToFloat(p.v[16])
+
+shared float qs[4096];
+shared float ws[64];
+shared uint cnt[256];
+shared int  plist[1024];
+shared uint pkey[1024];
+
+uint okey(float f) {
+    uint u = floatBitsToUint(f);
+    if (u == 0x80000000u) u = 0u;
+    return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
+}
+
+// the workgroup's sum of v (every thread passes its own)
+uint wsum(uint v, int tid) {
+    cnt[tid] = v;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) cnt[tid] += cnt[tid + off];
+        barrier();
+    }
+    uint t = cnt[0];
+    barrier();
+    return t;
+}
+// exclusive prefix sum of v over the workgroup's threads, in thread order
+uint wscan(uint v, int tid) {
+    cnt[tid] = v;
+    barrier();
+    for (int off = 1; off < 256; off <<= 1) {
+        uint a = tid >= off ? cnt[tid - off] : 0u;
+        barrier();
+        cnt[tid] += a;
+        barrier();
+    }
+    uint incl = cnt[tid];
+    barrier();
+    return incl - v;
+}
+
+void token_select() {
+    int s = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    int nk = POS_BASE + s + 1;
+    int lb = s * SEL_ROW;
+    if (nk <= TOPK && FORCE == 0) { if (tid == 0) sel[lb] = -1; return; }
+    int keep = min(nk, TOPK);
+    int nq = IH_ * ID_, qb = Q_OFF + s * Q_ROW;
+    for (int i = tid; i < nq; i += 256) qs[i] = iq[qb + i];
+    for (int h = tid; h < IH_; h += 256) ws[h] = hw[W_OFF + s * W_ROW + h];
+    barrier();
+    int sb = s * SC_ROW;
+    for (int t = tid; t < nk; t += 256) {
+        int kb = K_OFF + t * K_ROW;
+        float a = 0.0;
+        for (int h = 0; h < IH_; h++) {
+            float d = 0.0;
+            for (int i = 0; i < ID_; i++) d += qs[h * ID_ + i] * kc[kb + i];
+            d *= QSCALE;
+            if (d > 0.0) a += ws[h] * d;
+        }
+        sc[sb + t] = a * WSCALE;
+    }
+    memoryBarrierBuffer();
+    barrier();
+    // the keep-th largest key, bit by bit from the top
+    uint K = 0u;
+    for (int b = 31; b >= 0; b--) {
+        uint cand = K | (1u << uint(b));
+        uint c = 0u;
+        for (int t = tid; t < nk; t += 256) if (okey(sc[sb + t]) >= cand) c++;
+        if (wsum(c, tid) >= uint(keep)) K = cand;
+    }
+    // the positions in order: each thread a contiguous chunk, its place from a scan
+    int chunk = (nk + 255) / 256, c0 = tid * chunk, c1 = min(nk, c0 + chunk);
+    uint above = 0u, at = 0u;
+    for (int t = c0; t < c1; t++) { uint k = okey(sc[sb + t]); above += k > K ? 1u : 0u; at += k == K ? 1u : 0u; }
+    uint n1 = wsum(above, tid);
+    uint o = wscan(above, tid);
+    for (int t = c0; t < c1; t++) if (okey(sc[sb + t]) > K) sel[lb + 1 + int(o++)] = t;
+    o = n1 + wscan(at, tid);
+    for (int t = c0; t < c1 && o < uint(keep); t++) if (okey(sc[sb + t]) == K) sel[lb + 1 + int(o++)] = t;
+    if (tid == 0) sel[lb] = keep;
+}
+
+// the keep-th largest key among n scores at sc[sb..], bit by bit from the top
+uint kth_key(int sb, int n, int keep, int tid) {
+    uint K = 0u;
+    for (int b = 31; b >= 0; b--) {
+        uint cand = K | (1u << uint(b));
+        uint c = 0u;
+        for (int t = tid; t < n; t += 256) if (okey(sc[sb + t]) >= cand) c++;
+        if (wsum(c, tid) >= uint(keep)) K = cand;
+    }
+    return K;
+}
+
+void pool_keys() {
+    int pp = P0 + int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    int start = pp * POOL1;
+    for (int d = tid; d < ID_; d += 256) {
+        float mxv = -3.402823466e38;
+        for (int j = 0; j < POOL1; j++) {
+            float lg = gt[G_OFF + (start + j) * G_ROW + d] + prm[APE_OFF + j * ID_ + d];
+            if (lg > mxv) mxv = lg;
+        }
+        float total = 0.0;
+        for (int j = 0; j < POOL1; j++)
+            total += exp(gt[G_OFF + (start + j) * G_ROW + d] + prm[APE_OFF + j * ID_ + d] - mxv);
+        float mixed = 0.0;
+        for (int j = 0; j < POOL1; j++) {
+            float wgt = exp(gt[G_OFF + (start + j) * G_ROW + d] + prm[APE_OFF + j * ID_ + d] - mxv) / total;
+            mixed += wgt * kc[K_OFF1 + (start + j) * K_ROW1 + d];
+        }
+        pk[PK_OFF1 + pp * ID_ + d] = mixed;
+    }
+}
+
+void pool_select() {
+    int s = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    int q = POS_BASE + s, pool = POOL2;
+    int nvis = (q + 1) / pool, wanted = TOPK / pool, keep = min(wanted, nvis);
+    int width = TAIL != 0 ? TOPK + pool - 1 : TOPK;
+    int lb = s * SEL_ROW;
+    for (int i = tid; i < width; i += 256) sel[lb + 1 + i] = -1;
+    int nq = IH_ * ID_, qb = Q_OFF + s * Q_ROW;
+    for (int i = tid; i < nq; i += 256) qs[i] = iq[qb + i];
+    for (int h = tid; h < IH_; h += 256) ws[h] = hw[W_OFF + s * W_ROW + h] / WDIV;
+    barrier();
+    int sb = s * SC_ROW;
+    for (int pp = tid; pp < nvis; pp += 256) {
+        float score = 0.0;
+        for (int h = 0; h < IH_; h++) {
+            float dot = 0.0;
+            for (int d = 0; d < ID_; d++) dot += qs[h * ID_ + d] * pk[PK_OFF2 + pp * ID_ + d];
+            if (dot > 0.0) score += ws[h] * dot * PSCALE;
+        }
+        sc[sb + pp] = score;
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (keep > 0) {
+        uint K = kth_key(sb, nvis, keep, tid);
+        int chunk = (nvis + 255) / 256, c0 = tid * chunk, c1 = min(nvis, c0 + chunk);
+        uint above = 0u, at = 0u;
+        for (int t = c0; t < c1; t++) { uint k = okey(sc[sb + t]); above += k > K ? 1u : 0u; at += k == K ? 1u : 0u; }
+        uint n1 = wsum(above, tid);
+        uint o = wscan(above, tid);
+        for (int t = c0; t < c1; t++) { uint k = okey(sc[sb + t]); if (k > K) { plist[o] = t; pkey[o] = k; o++; } }
+        o = n1 + wscan(at, tid);
+        for (int t = c0; t < c1 && o < uint(keep); t++) { uint k = okey(sc[sb + t]); if (k == K) { plist[o] = t; pkey[o] = k; o++; } }
+        barrier();
+        // rank order: the higher score first, then the lower pool
+        for (int i = tid; i < keep; i += 256) {
+            uint ki = pkey[i]; int pi = plist[i], r = 0;
+            for (int j = 0; j < keep; j++) { uint kj = pkey[j]; if (kj > ki || (kj == ki && plist[j] < pi)) r++; }
+            for (int j = 0; j < pool; j++) sel[lb + 1 + r * pool + j] = pi * pool + j;
+        }
+    }
+    if (TAIL != 0 && tid == 0) {
+        int visible = q + 1, tail = visible % pool, ts = visible - tail;
+        for (int j = 0; j < tail && j < pool - 1; j++) sel[lb + 1 + TOPK + j] = ts + j;
+    }
+    if (tid == 0) sel[lb] = width;
+}
+
+void main() {
+    if (p.v[0] == 0) token_select();
+    else if (p.v[0] == 1) pool_keys();
+    else pool_select();
+}

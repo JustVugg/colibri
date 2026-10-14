@@ -413,3 +413,30 @@ class ClusterWorkerCapTest(unittest.TestCase):
 
     def test_explicit_cap_is_passed_through(self):
         self.assertEqual(self._worker_argv(24)[1], "24")
+
+    def test_glm53_serve_env_carries_cluster_workers(self):
+        """`coli serve --cluster-workers` on a glm53 model must reach the
+        engine: env_for_engine, not env_for, builds glm53's environment."""
+        a = args(cluster_workers="10.0.0.2:9100,10.0.0.3:9100", cluster_coordinator=None)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            env = coli.env_for_engine(a, "glm53")
+        self.assertEqual(env["CLUSTER_WORKERS"], "10.0.0.2:9100,10.0.0.3:9100")
+
+    def test_glm53_worker_gets_its_own_argv(self):
+        """glm53 reads every bare number as the cache/layer cap, so the
+        colibri.c `cap ebits dbits` triple would leave dbits as the cap; it
+        gets the cap and --model instead, and the family check lets it in."""
+        with tempfile.TemporaryDirectory() as model:
+            Path(model, "config.json").write_text(
+                json.dumps({"model_type": "glm5_next"}), encoding="utf-8")
+            captured = {}
+            a = args(model=model, cap=24, ebits=8, dbits=8, port=9100, layers="0-1",
+                     coordinator=None, advertise_host=None, node_id=None)
+            with mock.patch.object(coli, "require_model"), \
+                 mock.patch.object(coli, "engine_for", return_value="/tmp/glm53"), \
+                 mock.patch.object(coli.subprocess, "call",
+                                   lambda cmd, env=None, **kw: captured.update(cmd=cmd, env=env) or 0):
+                coli.cmd_cluster_worker(a)
+        self.assertEqual(captured["cmd"], ["/tmp/glm53", "24", "--model", os.path.abspath(model)])
+        self.assertEqual(captured["env"]["EXPERT_WORKER"], "1")
+        self.assertEqual(captured["env"]["CLUSTER_WORKER_PORT"], "9100")

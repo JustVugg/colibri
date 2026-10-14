@@ -102,6 +102,7 @@ int main(void) {
     setenv("COLI_CUDA", "1", 1); setenv("COLI_GPUS", "0", 1);
     setenv("QT_NO_WARMSTART", "1", 1); setenv("HEAT_FILE", "", 1);
     setenv("COLI_PLACE", "", 1);                    /* "" == unset == auto */
+    setenv("Q36_OFFER_SHEXP", "1", 1);             /* the shared expert is offered on request only; this test is about the offer */
     setenv("CUDA_EXPERT_GB", "1", 1);               /* room for everything */
     unsetenv("COLI_DENSE_I8");
     /* the GEMV from VRAM is compared with the CPU's f32-activation kernel, the

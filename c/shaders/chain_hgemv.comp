@@ -1,0 +1,108 @@
+#version 450
+// Per-head block matmuls of a resident tensor on the dense chain (vk_chain.c,
+// VKC_P_HGEMV): the weight halves of multi-head latent attention, where every head
+// multiplies its own slice of the activations by its own block of rows. Head h's
+// block is the rows h*hstride + hoff + [0, n) of W ([O x I], any resident format).
+//
+// mode 0, rows: y[s][h][o] = sum_i W[h*hstride + hoff + o][i] * x[s][h][i], o < n,
+//   i < I (the value rows of kv_b times the latent context; an absorbed query from a
+//   key matrix stored per head as [K x Q]). One subgroup per output row, its lanes
+//   split the row. With has_gate, y *= sigmoid(g[g_off + s*g_row + h*n + o]) (an
+//   output gate on the values).
+// mode 1, transposed: y[s][h][i] = sum_d W[h*hstride + hoff + d][i] * x[s][h][d],
+//   d < n, i < I (the absorbed query from kv_b's key rows: q_nope's n values times
+//   the head's n rows, into the latent's I columns). One workgroup per (h, s), x's
+//   slice staged in shared memory (n <= 1024), a thread per column, d in order.
+// x[s][h][.] is at x_off + s*x_row + h*x_seg, y[s][h][.] at y_off + s*y_row + h*y_seg.
+//
+// Formats (the backend's, qmatmul.comp's layout: row r at r*rowWords words):
+//   1 int8 rows (scale per row), 2 int4 rows (nibble - 8, scale per row), 4 int4 in
+//   groups of gs, 5 int3-g64 (24 bytes and one scale per 64), 7 MXFP4 (scale per gs),
+//   10 f32, 11 bf16 (low half = even column), 12 fp8 e4m3 (scale per gs), 13 int8 in
+//   groups of gs.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W { uint w[]; };
+layout(std430, binding = 2) readonly buffer Sc { float sc[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+layout(std430, binding = 4) readonly buffer G { float g[]; };
+
+layout(push_constant) uniform P {
+    int mode, fmt, I, rowWords, gs;
+    int S, H, n, hstride, hoff;
+    int x_off, x_row, x_seg, y_off, y_row, y_seg;
+    int g_off, g_row, has_gate;
+} p;
+
+shared float xs[1024];
+
+float i8(uint word, int lane) { return float(bitfieldExtract(int(word), lane * 8, 8)); }
+float i4(uint word, int lane) { return float(bitfieldExtract(word, lane * 4, 4)) - 8.0; }
+float mx4(uint word, int lane) {
+    uint nb = bitfieldExtract(word, lane * 4, 4);
+    const float lut[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    float v = lut[nb & 7u];
+    return (nb & 8u) != 0u ? -v : v;
+}
+float e4m3(uint word, int lane) {
+    uint b = bitfieldExtract(word, lane * 8, 8);
+    if ((b & 0x7fu) == 0x7fu) return uintBitsToFloat(0x7fc00000u);
+    uint e = (b >> 3) & 0xfu, m = b & 7u;
+    float v = e == 0u ? float(m) * 0.001953125 : ldexp(1.0 + float(m) * 0.125, int(e) - 7);
+    return (b & 0x80u) != 0u ? -v : v;
+}
+
+// W[row][i], dequantized
+float wv(int row, int i) {
+    uint rb = uint(row) * uint(p.rowWords);
+    int f = p.fmt;
+    if (f == 10) return uintBitsToFloat(w[rb + uint(i)]);
+    if (f == 11) { uint pk = w[rb + uint(i >> 1)]; return uintBitsToFloat((i & 1) != 0 ? (pk & 0xffff0000u) : (pk << 16)); }
+    if (f == 1) return i8(w[rb + uint(i >> 2)], i & 3) * sc[row];
+    if (f == 2) return i4(w[rb + uint(i >> 3)], i & 7) * sc[row];
+    int ng = (p.I + p.gs - 1) / max(p.gs, 1);
+    if (f == 4) return i4(w[rb + uint(i >> 3)], i & 7) * sc[row * ng + i / p.gs];
+    if (f == 7) return mx4(w[rb + uint(i >> 3)], i & 7) * sc[row * ng + i / p.gs];
+    if (f == 12) return e4m3(w[rb + uint(i >> 2)], i & 3) * sc[row * ng + i / p.gs];
+    if (f == 13) return i8(w[rb + uint(i >> 2)], i & 3) * sc[row * ng + i / p.gs];
+    // 5: int3-g64, 24 bytes per group: a 16-byte plane of 2-bit lows, an 8-byte plane of high bits
+    int gi = i >> 6, j = i & 63, ng64 = (p.I + 63) >> 6;
+    uint blo = w[rb + uint(gi * 6 + (j >> 4))], bhi = w[rb + uint(gi * 6 + 4 + (j >> 5))];
+    uint u = ((blo >> uint((j & 15) * 2)) & 3u) | (((bhi >> uint(j & 31)) & 1u) << 2);
+    return float(int(u) - 4) * sc[row * ng64 + gi];
+}
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x);
+    if (p.mode == 0) {
+        int s = int(gl_WorkGroupID.y);
+        int lane = int(gl_SubgroupInvocationID), sgs = int(gl_SubgroupSize);
+        int nsg = 256 / sgs, total = p.H * p.n;
+        int stride = int(gl_NumWorkGroups.x) * nsg;
+        for (int og = int(gl_WorkGroupID.x) * nsg + int(gl_SubgroupID); og < total; og += stride) {
+            int h = og / p.n, o = og - h * p.n;
+            int row = h * p.hstride + p.hoff + o;
+            int xb = p.x_off + s * p.x_row + h * p.x_seg;
+            float a = 0.0;
+            for (int i = lane; i < p.I; i += sgs) a += wv(row, i) * x[xb + i];
+            float tot = subgroupAdd(a);
+            if (lane == 0) {
+                if (p.has_gate != 0) tot *= 1.0 / (1.0 + exp(-g[p.g_off + s * p.g_row + h * p.n + o]));
+                y[p.y_off + s * p.y_row + h * p.y_seg + o] = tot;
+            }
+        }
+        return;
+    }
+    int h = int(gl_WorkGroupID.x), s = int(gl_WorkGroupID.y);
+    int xb = p.x_off + s * p.x_row + h * p.x_seg;
+    for (int d = tid; d < p.n; d += 256) xs[d] = x[xb + d];
+    barrier();
+    int r0 = h * p.hstride + p.hoff, yb = p.y_off + s * p.y_row + h * p.y_seg;
+    for (int i = tid; i < p.I; i += 256) {
+        float a = 0.0;
+        for (int d = 0; d < p.n; d++) a += xs[d] * wv(r0 + d, i);
+        y[yb + i] = a;
+    }
+}

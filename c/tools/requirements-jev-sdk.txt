@@ -1,0 +1,18 @@
+# TypeSafe's Python SDK and what it pulls in, pinned, for tests/test_jev_sdk.py
+# (make jev-sdk-check). numpy builds the tiny fixtures the test serves, and Pillow
+# the MiMo fixture's test picture (make mimo-tiny-generate passes --vision).
+typesafe_sdk==0.7.2
+httpx2==2.13.1
+httpcore2==2.13.1
+pydantic==2.13.5
+pydantic_core==2.46.5
+tenacity==9.1.4
+typing_extensions==4.16.0
+typing-inspection==0.4.4
+annotated-types==0.8.0
+anyio==4.15.1
+h11==0.16.0
+idna==3.20
+truststore==0.10.4
+numpy
+pillow

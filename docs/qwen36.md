@@ -13,7 +13,7 @@ KAT-Coder-V2.5-Dev) run on this engine unchanged.
 
 ## Quickstart
 
-Pre-converted containers (int4 experts, self-contained, ~20 GB):
+Pre-converted containers (int4 experts, self-contained, ~23 GB):
 
 ```sh
 # group-scaled int4 (gs64) — recommended, see "Which container" below
@@ -76,6 +76,49 @@ through ROCm with `make -C c qwen36 HIP=1 HIP_ARCH=<gfx>` (for example
 `HIP_ARCH=gfx1151`, with `ROCM_HOME` and `HIPCC` pointing at the toolchain):
 measured on a Ryzen AI MAX+ 395, output bit-identical to the CPU path and 2.4x
 faster than CPU-only (#1502).
+
+## Vulkan
+
+In a `VK=1` build (`make -C c qwen36 VK=1`), `COLI_VULKAN=1` puts the dense trunk on
+the Vulkan device and the routed experts on the shared Vulkan expert tier
+(`c/vk_tier.c`, [vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc)): a cache of
+experts in device memory, filled at startup from the expert history and adapted
+while you chat, computed by the device while the CPU computes the rest of the
+layer step, every expert's output joining its row in rank order. It takes every
+container this engine reads: the shared kernel's planar int4-g64 slots, the int8
+copy of an int4 container (packed back to int4 on the device), int8 per row or gs64,
+and the mixed int4 gate/up + int8 down layout. On an integrated GPU (or Lavapipe) the
+trunk stays on the CPU by default while the tier is on, where it costs more on the
+device than the tier gains; a discrete GPU takes both. `COLI_VK_DENSE=0` keeps the
+trunk on the CPU anywhere and `COLI_VK_DENSE=1` puts it on the device anywhere;
+`COLI_VK_TIER=0` turns the tier off (the trunk then goes to the device).
+
+This engine kept no expert history before; with the tier on it keeps route_trace.h's
+`.coli_usage` beside the container (`COLI_USAGE` moves it), saved at the end of
+every run and serve turn, and fills the tier from it at the next start. `coli
+setup` gives Qwen3.6-35B-A3B a starting one ([vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc)). With
+`COLI_CUDA=1` as well, the CUDA tier wins.
+
+On an integrated Radeon 780M, with the int4 gs64 container at cap 64 and the trunk
+on the CPU, the tier decoded at 8.03 tok/s against the CPU's 6.02 and reached the
+first token of a 512-token prompt in 12.3 s against 35.7 s, the same text; the
+measurements and what they leave out are in
+[vulkan.md](vulkan.md#measured-on-a-radeon-780m). With the dense chain on as well
+(the default for this engine on an integrated GPU with the tier), decode reached
+9.94 tok/s against the CPU's 6.01 and the 512-token prompt 9.5 s
+([vulkan.md](vulkan.md#the-chain-on-a-radeon-780m)).
+
+## Prompt-lookup drafts (on by default, `COLI_LOOKUP=0` turns them off)
+
+When the recent tokens repeat an n-gram of the prompt or the output (a code edit, a
+quote, repeated structure), the engine drafts the up to 5 tokens that followed it
+and checks them in one verify forward. The DeltaNet state is copied after each verify
+row, so a rejected draft rolls back by swapping a copy in. A gate drafts only where the
+measured acceptance and verify cost say it pays. The output is that of plain decoding,
+greedy or sampled, on the CPU and in the Vulkan dense chain. Lookup stays off under the
+CUDA tier, `CACHE_ROUTE` and a qpack container, whose results depend on what is
+resident. On a code edit, Qwen3.6-35B-A3B decoded 7.90 tok/s with lookup against 7.42 without (1.56 tokens per forward); on a chat prompt the gate declined every proposal and the speed was unchanged. How it works, the gate, the settings and the tests:
+[speculative.md](speculative.md).
 
 ## The expert kernel
 
@@ -177,7 +220,9 @@ same prompt and seed, tok/s and hit rate against agreement and KL, and treat
 ## Which container?
 
 The gs64 container carries one scale per 64-weight group instead of one per
-row. On GLM, per-row int4 was the root cause of think-mode loops and
+row. Against the per-row container it measured a cosine to the int8 anchor of
+0.99313 instead of 0.98777 and a KL of 0.080 instead of 0.109, about 44% less
+quantization error. On GLM, per-row int4 was the root cause of think-mode loops and
 never-terminating generations (#455), and group scales fixed them in
 controlled A/Bs — with `moe_intermediate_size=512`, Qwen's rows are short, so
 per-row quantization error concentrates the same way. The gs64 container costs
@@ -199,14 +244,17 @@ tier takes one format per expert and refuses a mixed container with a line
 
 ## Which checkpoints, and what the banner calls them
 
-Three Qwen checkpoints resolve to this engine: two MoE ones that declare
-`model_type: qwen3_5_moe_text`, and a dense one that declares `qwen3_5`:
+These Qwen checkpoints resolve to this engine: two hybrid MoE ones that declare
+`model_type: qwen3_5_moe_text`, a dense one that declares `qwen3_5`, and the
+all-attention Qwen3 MoE (`qwen3_moe`) of Qwen3-Coder:
 
 | checkpoint | layers | experts | hidden | banner |
 |---|---|---|---|---|
 | Qwen/Qwen3.6-35B-A3B | 40 (10 attention) | 256, top-8 | 2048 | `Qwen3.6-35B-A3B · 35B MoE` |
 | Qwen/Qwen3.8-2.4T-A95B | 92 (23 attention) | 512, top-10 | 8192 | `Qwen3.8-2.4T-A95B · 2.4T MoE` |
 | Qwen/Qwen3.8-27B | 64 (16 attention) | none: one MLP of 17408 per layer | 5120 | `Qwen3.8-27B · 27B` |
+| Qwen/Qwen3-Coder-30B-A3B-Instruct | 48 (all attention) | 128, top-8 | 2048 | `Qwen3-Coder-30B-A3B · 30B MoE` |
+| cerebras/Qwen3-Coder-REAP-25B-A3B | 48 (all attention) | 103, top-8 | 2048 | `Qwen3-Coder-REAP-25B-A3B · 25B MoE` (named, not run here) |
 
 The registry names a checkpoint by its geometry (`display_variants` on the
 `qwen36` descriptor), so the banner says what is on disk. A config that
@@ -293,6 +341,63 @@ been run with real pictures.
 
 Not yet: the CUDA tier (a dense checkpoint runs on the CPU), the MTP head
 (skipped by the converter), video, and an int4 container on disk.
+
+### Qwen3-Coder-30B-A3B
+
+Qwen/Qwen3-Coder-30B-A3B-Instruct (Apache-2.0) is `Qwen3MoeForCausalLM`: 48
+attention layers and no DeltaNet, no attention output gate, no shared expert,
+rotary over the whole head (`rope_theta` 1e7), plain RMSNorm weights, and 128
+experts top-8 renormalized (`norm_topk_prob`). The converter recognises
+`model_type: qwen3_moe` and writes exactly that into `qwen36_meta.json`
+(all-attention `layer_types`, `shared_inter: 0`, `partial_rotary_factor: 1.0`,
+`zero_centered_norms: false`); the engine then skips the shared expert and
+passes the attention output ungated. The REAP prunes are the same
+architecture with fewer experts and resolve to the same family under their
+own name. The chat template is its own: tools as XML, calls as
+`<tool_call><function=...><parameter=...>`, and no thinking at all. The gateway
+recognises it from the template, renders it byte for byte
+(`tests/test_qwen3_coder_chat_template.py` holds it to the release's
+`chat_template.jinja`), and keeps `enable_thinking` off. The API model id is
+`qwen3-coder-30b-a3b-colibri`.
+
+```bash
+hf download Qwen/Qwen3-Coder-30B-A3B-Instruct --local-dir qwen3-coder     # 61.1 GB, bf16
+python3 tools/convert_qwen36.py --model qwen3-coder --out qwen3-coder-i4 --ebits 4 --gs 64
+coli serve --model qwen3-coder-i4 --cap 128     # every expert in RAM
+coli serve --model qwen3-coder-i4 --cap 32      # 6.5 GB resident
+```
+
+The int4 gs64 container is 19 GB and converts in under a minute; `--ebits 8`
+gives a 30 GB int8 one. As everywhere on this engine, `--cap` sizes the
+expert cache and `--ram` does not (see below).
+
+Against the bf16 release, on a 325-token code question and answer, teacher
+forced (every position's logits; the reference reads the release one layer at
+a time in f32):
+
+| experts | dense trunk | top-1 = bf16 | top-5 overlap | mean \|Δ log p\| | max \|Δ log p\| |
+|---|---|---|---|---|---|
+| int4 gs64 | int8 (the default) | 96.9% | 91.1% | 0.176 | 3.74 |
+| int4 gs64 | f32 (`COLI_DENSE_I8=0`) | 96.0% | 91.7% | 0.134 | 2.59 |
+| int8 | int8 | 95.1% | 95.2% | 0.098 | 2.13 |
+| int8 | f32 | 98.1% | 97.8% | 0.022 | 0.60 |
+
+Decode on a Ryzen 7 PRO 8700GE (8 cores, 64 GB, NVMe RAID), the CLI from a cold
+cache, 128 tokens, dense trunk int8:
+
+| container | experts cached per layer | decode | resident |
+|---|---|---|---|
+| int4 gs64 | 128 (all) | 8.5 and 9.6 tok/s (two runs) | 15.2 GB |
+| int8 | 128 (all) | 6.4 tok/s | 25.1 GB |
+| int4 gs64 | 32 | 5.1 tok/s | 6.5 GB |
+| int8 | 32 | 3.8 tok/s | 9.6 GB |
+
+Through `coli chat` with `--cap 128` and the cache warm, a 577-token answer
+streams at 13 tok/s. Prefill is the slow part on the CPU: a request whose tool
+block makes the prompt about 500 tokens takes around two minutes from a cold
+cache.
+
+![Qwen3-Coder-30B-A3B in coli web](media/qwen3-coder-web.png)
 
 ### The converter's tensor contract
 

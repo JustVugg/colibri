@@ -142,6 +142,36 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
                             int fmt, int I, int O, int device);
+
+/* Gated delta layer on the device (the linear-attention layers of Qwen3.6/3.8,
+ * Kimi K3's KDA, GLM-5.3-Flash). One object per layer holds the short-conv ring
+ * [conv_dim x (convk-1)], the recurrent state [vh x kdim x vdim], the conv and
+ * norm weights and the scratch for one token. coli_cuda_dn_step runs a whole
+ * decode step on the card: x (host) -> in_proj GEMV -> causal conv + SiLU ->
+ * per head L2 norm, decay, delta rule, gated RMSNorm -> out_proj GEMV -> out
+ * (host). Only x and out cross the bus; the state never does. Gates (egh =
+ * exp(g) per value head, beta) arrive by value. All optional in the DLL
+ * loader: a backend without them leaves the layer on the CPU. */
+typedef struct ColiCudaDn ColiCudaDn;
+COLI_CUDA_DLLEXPORT ColiCudaDn *coli_cuda_dn_create(int device, int vh, int vk, int kdim, int vdim,
+                            int conv_dim, int convk, int hidden,
+                            const float *conv_w, const float *norm_w, float eps, int gate_sigmoid);
+COLI_CUDA_DLLEXPORT void coli_cuda_dn_free(ColiCudaDn *d);
+COLI_CUDA_DLLEXPORT int  coli_cuda_dn_set_state(ColiCudaDn *d, const float *ring, const float *rec);  /* NULL = zero */
+COLI_CUDA_DLLEXPORT int  coli_cuda_dn_get_state(ColiCudaDn *d, float *ring, float *rec);
+/* proj: the in_proj rows. Fused qkv ++ z in one matrix (projz NULL, qwen36's
+ * dnproj) or qkv alone with z in projz (qwen38's dnqkv / dnz). gate_sigmoid at
+ * create: the gated RMSNorm multiplies by silu(z) (0, Qwen3.6) or sigmoid(z)
+ * (1, Qwen3.8). */
+COLI_CUDA_DLLEXPORT int  coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz, ColiCudaTensor *outp,
+                            const float *x, float *out, const float *egh, const float *beta);
+/* Overwrite an uploaded tensor in place with new bytes of the same shape and
+ * format. The expert tier swaps residents, and every expert of a model has the
+ * same geometry, so the victim's device buffers can take the newcomer without
+ * the cudaFree + cudaMalloc pair, which synchronises the device under the
+ * async expert groups. Optional in the DLL loader: 0 from a backend that
+ * predates it (or on any failure), and the caller frees and uploads as before. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_overwrite(ColiCudaTensor *tensor, const void *weights, const float *scales);
 #ifdef COLI_ANS
 /* Experimental Linux-only GPU-resident entropy tier. The archive remains in
  * VRAM and is decoded into per-device scratch immediately before a grouped

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
-  askBrio, extractSSE, extractSSEEvents, generateImage, generatesImages, getHealth, getProfile,
+  askSystemOne, extractSSE, extractSSEEvents, generateImage, generatesImages, getHealth, getProfile,
   listModelInfo, serverEndpoint, streamChat, type GenerateImageOptions, type ImageProgress,
 } from "./api"
 
@@ -59,7 +59,7 @@ describe("chat request extensions", () => {
     headers: { "content-type": "text/event-stream" },
   })
 
-  async function requestBody(cacheSlot?: number) {
+  async function requestBody(cacheSlot?: number, compact?: boolean) {
     const fetchMock = vi.fn().mockResolvedValue(completedStream())
     vi.stubGlobal("fetch", fetchMock)
     await streamChat({
@@ -71,6 +71,7 @@ describe("chat request extensions", () => {
       maxTokens: 8,
       enableThinking: false,
       cacheSlot,
+      compact,
       signal: new AbortController().signal,
       onDelta: () => undefined,
     })
@@ -83,6 +84,34 @@ describe("chat request extensions", () => {
 
   it("sends cache_slot zero when colibrì advertises KV slots", async () => {
     expect(await requestBody(0)).toMatchObject({ cache_slot: 0 })
+  })
+
+  it("asks a colibrì server for context compaction, and only a colibrì server", async () => {
+    expect(await requestBody(undefined, true)).toMatchObject({ context_compaction: "auto" })
+    expect(await requestBody()).not.toHaveProperty("context_compaction")
+  })
+})
+
+describe("context compaction", () => {
+  /* The gateway says, in a chunk before the text, that the turn ran on a summary of
+     the conversation's first messages; the page tells the user why. */
+  it("returns the compaction the stream reported", async () => {
+    const compaction = { summarized_messages: 6, summary: "the user listed topics" }
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+      'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n'
+      + `data: ${JSON.stringify({ choices: [], compaction })}\n\n`
+      + 'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n'
+      + "data: [DONE]\n\n",
+      { headers: { "content-type": "text/event-stream" } },
+    )))
+    const content: string[] = []
+    const result = await streamChat({
+      baseUrl: "http://localhost:8000/v1", apiKey: "", model: "test-model", messages: [],
+      temperature: 0, maxTokens: 8, enableThinking: false,
+      signal: new AbortController().signal, onDelta: (text) => content.push(text),
+    })
+    expect(result.compaction).toEqual(compaction)
+    expect(content).toEqual(["answer"])
   })
 })
 
@@ -119,34 +148,39 @@ describe("reasoning stream", () => {
   })
 })
 
-describe("askBrio", () => {
-  /* The options must travel as a field, never folded into the prompt: keeping
-     them out of the text is half of what the mode saves, and a refactor that
-     "helpfully" appended them would be invisible in the answer. */
-  it("sends the options as data and posts to the brio endpoint", async () => {
-    const seen: { url?: string; body?: unknown } = {}
+describe("askSystemOne", () => {
+  /* The options must travel as the labels of a `choice`, never folded into the
+     state: the gateway reads each one as the answer's continuation, and a
+     refactor that "helpfully" appended them to the text would be invisible in
+     the answer. */
+  it("asks one choice question on /v1/systemone and draws its probabilities", async () => {
+    const seen: { url?: string; body?: { state: string; pin_state?: boolean; questions: { q: { type: string; criteria: object } } } } = {}
     vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
       seen.url = url
       seen.body = JSON.parse(String(init.body))
       return new Response(JSON.stringify({
-        answer: "b", entropy: 0.5, normalize: "mean",
-        choices: [{ option: "b", p: 0.7, logprob: -1, mean_logprob: -1, tokens: 1 }],
-        usage: { prompt_tokens: 9, completion_tokens: 0, read_tokens: 2, total_tokens: 11 },
+        id: "req_1", model: "laya", provider: "colibri",
+        answers: { q: { type: "choice", choice: "b", probabilities: { a: 0.25, b: 0.75 }, confidence: 0.5 } },
+        usage: { input_tokens: 40, output_tokens: 3, cost: 0 },
       }), { status: 200, headers: { "Content-Type": "application/json" } })
     }))
-    const out = await askBrio("http://x/v1", "", "m", "state", "q?", ["a", "b"])
-    expect(seen.url).toBe("http://x/v1/brio")
-    expect(seen.body).toMatchObject({ model: "m", state: "state", question: "q?", options: ["a", "b"] })
+    const out = await askSystemOne("http://x/v1", "", "laya", "state", "q?", ["a", "b"], true)
+    expect(seen.url).toBe("http://x/v1/systemone")
+    expect(seen.body?.state).toBe("state")
+    expect(seen.body?.pin_state).toBe(true)
+    expect(seen.body?.questions.q).toEqual({ type: "choice", instructions: "q?", criteria: { a: null, b: null } })
     expect(out.answer).toBe("b")
-    expect(out.usage.completion_tokens).toBe(0)
+    expect(out.choices.map((c) => c.option)).toEqual(["b", "a"])
+    expect(out.entropy).toBeCloseTo(-(0.25 * Math.log(0.25) + 0.75 * Math.log(0.75)) / Math.log(2), 6)
+    expect(out.usage).toEqual({ input_tokens: 40, output_tokens: 3 })
   })
 
   it("surfaces the server's own message instead of a bare status", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(
-      JSON.stringify({ error: { message: "options must be a non-empty array" } }),
-      { status: 400, headers: { "Content-Type": "application/json" } })))
-    await expect(askBrio("http://x/v1", "", "m", "s", "q", ["a"]))
-      .rejects.toThrow("options must be a non-empty array")
+      JSON.stringify({ error: { message: "`questions.q.criteria` must be a non-empty object" } }),
+      { status: 422, headers: { "Content-Type": "application/json" } })))
+    await expect(askSystemOne("http://x/v1", "", "m", "s", "q", [], false))
+      .rejects.toThrow("must be a non-empty object")
   })
 })
 

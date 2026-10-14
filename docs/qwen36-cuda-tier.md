@@ -93,7 +93,7 @@ on Qwen3.6-35B-A3B (hidden 2048, 30 DeltaNet and 10 attention layers):
 | `dnproj` | DeltaNet in_proj qkv ++ z, fused | 25.2 MB | 755 MB |
 | `dnout` | DeltaNet out_proj | 8.4 MB | 252 MB |
 | `attnproj` | attention q, k, v, o (one item, four matrices) | 27.3 MB | 273 MB |
-| `shexp` | the shared expert's gate, up, down | 3.1 MB | 126 MB |
+| `shexp` | the shared expert's gate, up, down (offered only with `Q36_OFFER_SHEXP=1`, see below) | 3.1 MB | 126 MB |
 
 Offer order is the placement priority once the budget runs short: `lmhead`,
 then `dnproj`, `dnout`, `attnproj`, `shexp`, each in layer order, so a partial
@@ -202,6 +202,278 @@ and `qt_take`. A dense GEMV issued in that window (Qwen3.8's shared expert)
 overwrote the group's input and output mid-flight -- no CUDA error, only
 wrong numbers. qwen36 never called the dense path inside that window, so its
 outputs were unaffected.
+
+## The DeltaNet layer on the card (`Q36_DN_GPU=1`)
+
+With the trunk in VRAM the CPU still spent about 8 of 39 ms per token on the
+thirty DeltaNet layers' convolution, L2 norms, recurrence and gated norm
+(`dn-sub: proj 7.9 | conv 3.0 | l2n+rec 2.4 | norm+out 2.8`). None of that is
+arithmetic -- a token's convolution is 33k multiply-adds, the recurrence 32
+outer products of 128 x 128 -- it is the round trip: the in_proj's result
+came down to the host, the recurrence ran there, its output went back up for
+the out_proj, four copies and their synchronisations per layer, thirty layers
+per token.
+
+`Q36_DN_GPU=1` keeps the layer on the card. For every DeltaNet layer whose
+in_proj (`dnproj`) and out_proj (`dnout`) the placer put on the same device,
+the conv ring, the recurrent state (32 x 128 x 128 f32, 2 MB per layer, 63 MB
+for the 35B) and the conv/norm weights go there too, and a decode token runs
+the layer end to end in one device chain (`coli_cuda_dn_step`): x up, in_proj
+GEMV, causal conv + SiLU, per value head the L2 norms (double, eps inside the
+square root as on the CPU), the decay, the delta against the decayed state,
+the write-back, `out = q^T S` over the updated state, the gated RMSNorm with
+`silu(z)`, out_proj GEMV, out down. The two gates (`a`, `b` projections, 32
+outputs each) stay on the CPU and travel as kernel parameters. One upload and
+one download of 8 KB per layer, the state never crosses the bus.
+
+The host arrays remain the state's owner. The card's copy is a cache that is
+either fresh (holds what the host holds) or ahead of it; a CPU step -- a
+prompt (`S > 1` keeps the batched CPU path), a layer whose projections are
+not on one card, a step after a failed GPU step -- pulls the state down
+first, a snapshot for `--pin` pulls all layers, `reset_recurrent` and a pin
+restore invalidate the card's copy. So `--pin`, prefix reuse and the
+`QT_UPLOAD_SYNC`-style diagnostics keep working unchanged. The automatic
+placer now puts a layer's `dnout` on the device its `dnproj` went to when that
+device has the room, so under `auto` every DeltaNet layer qualifies; a
+hand-written list must keep the two on one card itself (note that a split
+such as `dnproj=0:20+1:20` counts *model* layers 0..39, not DeltaNet layers).
+
+Measured on the 3070 alone (per-row int4 35B, 49-token prompt, 200 decoded
+tokens, trunk in VRAM, `COLI_TIMERS=1`):
+
+| | `Q36_DN_GPU=0` | `Q36_DN_GPU=1` |
+|---|---|---|
+| DeltaNet ms/token | 16.2 | **10.8** |
+| token ms | 39.4 / 39.3 | **33.9 / 33.3** |
+| decode tok/s | 25.4 | **30.0** |
+| tok/s as the engine prints it (TTFT included) | 21.2 / 21.3 | **24.1 / 24.4** |
+| VRAM hit rate | 82 % | 82 % |
+| layers on the card | 0 | 30 |
+
+Fourteen per cent per token; the 10.8 ms that remain are the two GEMVs (16
+and 8 MB per layer) and the two copies. The output is not byte-identical to
+the CPU path (the GEMVs sum in a different order; two GPU runs are identical
+to each other), same as every other placed component. On two cards the layer
+gains the same 6-7 ms, but this box's second card (Quadro RTX 4000) runs a
+dense GEMV about 65 % slower than the 3070 (lm_head 7.3 against 4.4 ms), and
+at 99-100 % expert residency the MoE phase only drops from 14.0 to 11.2-13.6
+ms -- the expert groups are bound by GPU time and by the slower card's
+`take()`, not by misses -- so the best two-card form (trunk on the 3070,
+`experts=all`) lands at 32.9 ms, level with the 3070 alone.
+
+`COLI_PLACE` gained `experts=all`: the routed experts stay on every
+`COLI_GPUS` card even when a hand-written list reserves some of them for the
+trunk (the default hands a reserved card's experts back to the others, #1361).
+
+### The shared expert stays on the CPU by default
+
+`shexp` on the card is 120 synchronous small GEMVs per token that sit between
+`qt_issue` and `qt_take`, where on the CPU the shared expert hides behind the
+expert group. Measured on the 35B with the DeltaNet layer on the card: shared
+3.7-4.0 ms/token on the CPU against 6.3 on the same 3070, and 11-12.7 ms when
+a slower second card holds some of the layers; the token went 33.3 -> 31.8 ms
+on one card and 38.6 -> 33.6 ms as a two-card pipeline once `shexp` left the
+card. The engine therefore offers `shexp` to the placer only with
+`Q36_OFFER_SHEXP=1`; a hand-written `COLI_PLACE` naming it is obeyed when the
+offer is made.
+
+### Two cards as a pipeline (`QT_HOME=layer`)
+
+By default expert `eid` is homed on device `eid % n_gpus` in *every* layer,
+so each layer's group is issued to both cards and `qt_take` waits for the
+slower one -- measured on the 3070 + Quadro RTX 4000 pair, `take` 5.2 ms per
+token against 0.2 on one card. `QT_HOME=layer` homes every expert of a layer
+on one device, chosen per layer range by each card's allowance divided by
+the time it needs for a dense GEMV (probed at startup with a 64 MB int8
+matrix; `QT_LAYER_SPLIT=<n>` layers on the first card overrides), puts the layer's trunk
+components on the same device and lm_head on the last layer's, and issues a
+group to exactly one device: the token runs the first layers on one card and
+the rest on the other, like llama.cpp's layer split. Budgets, warmstart, LFRU
+and the swap path follow the homes; a hand-written list's reservation does
+not remove a card in this mode, its layers' experts live there.
+
+Measured (same box, `Q36_DN_GPU=1`, shared expert on the CPU, 200 tokens):
+the join is gone (`take` 5.2 -> 0.17 ms) and the MoE phase falls from 12.4-13.4
+to 9.4 ms at 99.7 % residency, but the pipeline ends level with the 3070 alone
+-- 33.6 ms/token (29.8 tok/s) at a 28/12 split against 31.8-33.1 ms (30.2-31.4
+tok/s) -- because lm_head (+2.8 ms) and twelve DeltaNet layers (+1.6 ms) now run
+on the slower card. The startup probe measures that card 154 % slower per dense
+byte and chooses 28/12 by itself; under `auto` that is 36.0 ms (27.8 tok/s). Two equal
+cards would keep the MoE gain without that price. Cold, two cards win either
+way (45.3 against 52.3 ms), since more experts are resident at once. For the
+record, Ollama 0.34.4 on the same pair shows the same shape: 38.1 tok/s on the
+3070 alone, 36.6-37.5 on both cards, 33.0 on the Quadro alone.
+## The dense chain on the card (`COLI_CUDA_CHAIN=1`)
+
+With the trunk in VRAM and `Q36_DN_GPU=1`, a decode token still crossed the bus about
+seventy times: every attention projection (`qt_dense_matmul`: the input up, the kernel,
+the output down, a synchronization), every DeltaNet step, lm_head, and between them the
+CPU ran the attention core, the norms, the router and the shared expert. The Vulkan
+backend solved the same problem with its dense chain (`vk_chain.h`, docs/vulkan.md "The
+dense chain"): a whole layer recorded as one submission, the residual stream on the
+device from layer to layer, only the routed experts' rows crossing. `COLI_CUDA_CHAIN=1`
+is the CUDA twin, and it is shaped like the Vulkan one on purpose, so the engine wires
+both the same way:
+
+- `c/cuda_chain.h` / `c/cuda_chain.cu` (the backend): buffers (`CC_DEV` on the device,
+  `CC_UP` and `CC_DOWN` page-locked host memory the device reads or writes in place),
+  frames (`cc_begin` / `cc_submit(wait)` on one non-blocking stream per device, an event
+  per frame), and the ops `cc_matmul` (the backend's own GEMV / GEMM kernel over the
+  tier's resident tensors, on the chain's stream), `cc_norm`, `cc_rope`, `cc_attn`,
+  `cc_dnconv`, `cc_dnrec`, `cc_ew`, each the arithmetic of the shader of the same name
+  in `shaders/chain_*.comp`, ported line for line, with the Vkc parameter structs field
+  for field. The backend exports them as one table (`coli_cuda_chain_ops`), one symbol
+  for the Windows loader, versioned by its size: a DLL that predates the chain has none
+  and the engine stays on the per-matrix path.
+- `c/qwen36_cuda_chain.h` (the engine): `qwen36_chain.h`'s frames and state contract.
+  Per layer, frame A1: the previous layer's MoE output joins the residual (routed in
+  rank order, then the gated shared expert, then the add: the CPU's order), the input
+  norm, the gated attention (q/k/v, q/k norms, RoPE from the CPU's own cos/sin table,
+  the new K/V rows into the device cache and down to the host's, the attention with the
+  output gate, o_proj) or the Gated DeltaNet (the tier's fused qkv ++ z projection, b|a,
+  the convolution with its ring, the recurrence with its state, the gated norm,
+  out_proj), the residual add, the post-attention norm, the router logits; waited for.
+  The host routes, runs the routed experts through the tier (`moe_ex` routed only) and
+  hands the sum up. Frame A2, not waited for: the shared expert and its gate, on the
+  chain's stream while the tier's groups run on the backend's. The last frame runs the
+  final norm and lm_head on the last row, or on every row of a speculative verify.
+
+**What it needs.** Every projection of every layer, the shared expert's three matrices
+and lm_head on one card: `COLI_CUDA_CHAIN=1` offers the shared expert to the placer
+(what `Q36_OFFER_SHEXP=1` does) and `COLI_PLACE=auto` takes the whole 35B trunk on an
+8 GB card. The chain uploads itself the router's matrix, the DeltaNet b|a rows and the
+shared expert's gate row, and the parameter arena. It declines, naming the first matrix
+on the CPU, when the placement left anything behind, and under a qpack container, PILOT
+prefetch (which reads the residual on the host) or `KV_SLOTS` > 1 (one state per
+conversation on the host). `Q36_DN_GPU`'s per-layer step is not set up beside it: the
+chain owns the DeltaNet state.
+
+**State, and who owns it.** The residual stream lives on the device for a forward. The
+host's KV cache stays canonical: every step copies its new rows back, the device holds
+a mirror per attention layer with a watermark (`kv_valid`), a step from `pos_base`
+uploads the rows between the watermark and `pos_base` first, a CPU step lowers the
+watermark, a cache that grows is mirrored again. The DeltaNet state and conv rings stay
+on the device while the chain runs: the host copy is brought back before anything reads
+it there (a pinned snapshot, a CPU step: `q36cc_sync_host`) and pushed up after anything
+writes it there (a reset: zeros filled on the device; a restored snapshot: an upload). A
+speculative verify copies the state after each of its rows but the last into a device
+slot, the convolution and the recurrence split into one dispatch per copy (the same bits),
+and a rejected draft swaps slot r's buffers in (`q36cc_rollback`) as the CPU swaps its own.
+A CUDA error inside a frame loses the device to the chain: the engine zeroes the
+recurrent state, rebuilds it on the CPU from the prefix record (a prefill's worth of CPU
+work; the KV rows are the host's already) and runs on the CPU from there, as the Vulkan
+chain does. `COLI_CUDA_CHAIN_FAULT=n` fakes the loss at the n-th frame.
+
+**Tests.** `tests/test_qwen36_cuda_chain.c` drives an in-memory two-layer model (a
+DeltaNet layer, a gated-attention layer, four routed experts and a gated shared expert
+per layer, lm_head) through `step_ex` on the fake CUDA tier, the chain's ops answered by
+the fake's host-side table (`tests/qwen36_fake_cuda.h`, the same arithmetic as the
+kernels): a prompt and decode tokens give the CPU path's logits (max diff 2e-5 of 20),
+the host state is untouched while the chain runs and reads back as the CPU path's, the
+K/V rows reach the host cache, a reset and a CPU step in between continue from the right
+state, a verify's three rows and the rollback of a rejected draft, a frame that fails
+(the state rebuilt, the step and the rest on the CPU, the same logits), and a backend
+without the table. `tests/test_cuda_chain.cu` (`make cuda-chain-check CUDA=1`, needs a
+device; `gpu-compile` builds it) checks every op on a real card against the same CPU
+references: buffers and frames, int8 and f32 matmuls at offsets, the four norms, RoPE,
+causal GQA with the gate and a selection list, the convolution in both orders with its
+ring and snapshot, the recurrence at KD 8 and 128 with both gates, every element-wise
+op, and a failed launch marking the device lost.
+
+**Measured** (RTX 3070 alone, Qwen3.6-35B-A3B int4, the trunk in VRAM by `COLI_PLACE=auto`,
+expert tier at 81-82 % hits, the usual 49-token prompt, 200 new tokens, two runs each):
+
+| | TTFT | tok/s, the run | ms per decode token | decode tok/s | device wait per token |
+|---|---|---|---|---|---|
+| `Q36_DN_GPU=1` (the per-layer step) | 1.22-1.26 s | 26.2-27.6 | 30-32 | 32-33 | |
+| `COLI_CUDA_CHAIN=1` | 0.98 s | 42.7-42.8 | 18.7 | 53 | 5.7 ms |
+| Ollama 0.34.4 on the same card | | | 26.2 | 38.1 | |
+
+The chain alone, with the backend's block GEMV, gave 27.6 ms a token: the CPU's parts
+went (the attention core 3.9 ms, the shared expert 4.1 ms, about seventy bus round trips)
+and the token was the device's time, 14.7 ms, which was the trunk's 1.9 GB of int8 rows
+read at 120 GB/s. `gemv_i8_rows` (backend_cuda.cu: a warp per output row, 16 bytes a
+lane, the activation in shared memory) reads them at 330-418 GB/s, and the device's part
+of a token is 5.7 ms. What is left is the routed experts on the host (9.9 ms: the tier's
+groups and the CPU's share) and the routing, launches and forty waits (about 3 ms).
+
+## The residents follow the prompt (`QT_PREFILL_REPLAN=1`)
+
+The warmstart fills VRAM from the heat file, i.e. from what earlier prompts
+routed to, and the LFRU tick then corrects one expert per sixteen tokens and
+device. For a prompt on a new topic that is thousands of tokens of catching up:
+measured on the 35B with a heat file accumulated over six other prompts, a
+fresh prompt's decode hits VRAM 56-63 % of the time at 37 % residency, a cold
+start 38 %, and a heat file from the *same* prompt 89-91 % -- the heat
+warmstart is an oracle for a repeated prompt and a stranger's guess for a new
+one.
+
+The prefill knows better. Its routing is this prompt's routing: offline, a
+static per-layer set of B experts chosen from the prompt's own prefill counts
+covers its decode routing far better than the heat file at the same budget
+(held-out prompts, four topics):
+
+| B per layer (of 256) | heat from other prompts | own prefill counts | oracle (own decode) |
+|---|---|---|---|
+| 32 | 0.217 | **0.421** | 0.566 |
+| 64 | 0.423 | **0.613** | 0.777 |
+| 96 (~the 8 GB card's share) | 0.593 | **0.741** | 0.890 |
+| 128 | 0.725 | **0.825** | 0.952 |
+
+`QT_PREFILL_REPLAN=1` spends that: after each prefill layer's routing the
+engine hands the tier the layer's counts over the prompt rows, and the tier
+swaps residents the prompt never routed to for the prompt's most-routed
+non-residents of that layer -- budget-neutral, through the same victim-first
+swap the LFRU tick uses, in strict count order and only while the newcomer's
+count beats the victim's. The swaps of layer L upload while layers L+1.. still
+compute; whatever the upload queue does not take at once is drained on the
+next layers and, a few per token, on the decode ticks (each swap is a
+`cudaFree` + `cudaMalloc`, which synchronise the device under the async
+groups, so the decode drains slowly on purpose). `QT_PREFILL_REPLAN_MAX`
+caps the swaps per layer (default 256). Placement never changes routing:
+the tokens are the ones the CPU path produces.
+
+Two costs come with an eviction and are handled here rather than paid in the
+miss path: the tier reports evicted experts (`qt_evicted_take`) and the engine
+rebuilds their RAM int8 copies at the next step, in parallel, before the
+layers run -- on the int4 container the warmstart had freed them, and left to
+the miss path 2,000 victims cost ~7 ms/token over the following 300 tokens.
+The `[qtier]` footer also reports the hit rate counted from the first decode
+token (`decode VRAM hit rate`), which is the number that moves.
+
+Measured on the 3070 alone (per-row int4 35B, 200-250-token prompts, 300
+decoded tokens, four held-out prompts, heat file from six other prompts,
+`QT_PREFILL_REPLAN_MAX=24` = 960 swaps per prompt, 12 cores `OMP_PLACES=cores`).
+`off -> on`, decode-only figures from `COLI_TIMERS=1`:
+
+| prompt | trunk | decode VRAM hit rate | MoE ms/token | total ms/token | TTFT |
+|---|---|---|---|---|---|
+| chat | CPU (`COLI_PLACE=off`) | 54.8 -> **72.8 %** | 18.8 -> 15.2 | 67.7 -> 68.5 | 3.9 -> 5.0 s |
+| code | CPU | 59.9 -> **75.1 %** | 18.0 -> 14.5 | 69.5 -> 66.8 | 5.1 -> 5.4 s |
+| Chinese | CPU | 62.7 -> **74.8 %** | 16.8 -> 14.6 | 68.8 -> 65.8 | 4.0 -> 5.0 s |
+| reasoning | CPU | 63.1 -> **75.3 %** | 17.4 -> 15.9 | 70.4 -> 71.6 | 4.4 -> 5.5 s |
+| chat | VRAM (all five components) | 41.8 -> **61.7 %** | 22.9 -> 18.7 | 49.2 -> **45.2** | 6.4 -> 6.6 s |
+| code | VRAM | 45.1 -> **64.8 %** | 22.3 -> 17.5 | 49.0 -> **44.1** | 8.1 -> 8.2 s |
+| Chinese | VRAM | 49.6 -> **60.3 %** | 20.4 -> 20.4 | 46.3 -> 47.8 | 6.2 -> 7.0 s |
+| reasoning | VRAM | 44.5 -> **66.7 %** | 22.4 -> 17.6 | 48.7 -> **44.4** | 7.0 -> 7.5 s |
+
+The hit rate moves as the offline table predicted (+12 to +22 points), the
+MoE phase loses 2 to 5 ms/token, and with the trunk in VRAM that is 8-10 % of
+the token on three prompts of four (the fourth is inside the run-to-run noise
+of about ±2 ms). With the trunk on the CPU the same MoE saving disappears in
+the 50 ms the dense trunk costs there. The price is at the front: the swaps
+upload during the prefill, and each one is six synchronous host-to-device
+copies (three matrices, three scale vectors), about 1 ms on this box, so 960
+swaps add 0.1-1.1 s to the TTFT of a 200-token prompt; the decode saving pays
+that back after 100-250 tokens. Fewer swaps buy most of the gain -- offline at
+B = 96, a cap of 12 per layer (480 swaps) reaches 0.709 of the 0.741 the
+uncapped plan reaches, 24 per layer reaches 0.741 -- which is why the default
+cap is 24. The follow-up that would take the TTFT price away is a pinned,
+asynchronous staging path (or one contiguous device block per expert) so the
+copies stop serialising with the prefill's expert groups; the swap itself
+already writes into the victim's buffers (`coli_cuda_tensor_overwrite`, no
+`cudaFree`/`cudaMalloc`; a backend without the entry point falls back to
+free-then-upload).
 
 ## Measured (Threadripper 3945WX 12C, RTX 3070 8 GB + Quadro RTX 4000 8 GB, Qwen3.6-35B-A3B int4, 200-token decode)
 

@@ -1,0 +1,126 @@
+#version 450
+// The dense chain's attention core (vk_chain.c, VKC_P_ATTN): grouped-query attention
+// of S query rows over a KV cache that lives on the device, with Qwen's output gate.
+// One workgroup per (head h = WorkGroupID.x, row s = WorkGroupID.y):
+//   score_t = (q . K[kvh][t]) * scale over the row's positions,
+//   ctx     = sum_t softmax(score)_t V[kvh][t],  times sigmoid(gate) when has_gate.
+// The positions are 0..pos_base+s (causal) or, with a selection list (Qwen3.8's QSA
+// indexer, chain_qsa.comp), the row's list: sel[sel_off + s*sel_row] = count, then the
+// positions; a negative count means every position 0..pos_base+s.
+// The softmax runs online over tiles of 128 positions (running max and sum, the
+// accumulator rescaled when the max grows), so no score row is stored and a context
+// of any length costs one pass over K and V. The CPU's order of the sums differs (it
+// normalizes first); the two agree to rounding.
+// Cache layout as the engines keep it on the host: K[(kvh*cap + t)*hd + d].
+// Limits: hd <= 256 (two dims per thread).
+//
+// The trailing push constants (all zero for the callers that predate them, who get
+// exactly the arithmetic above):
+//   win    a sliding window: row s sees the positions max(0, pos - win + 1)..pos,
+//          pos = pos_base + s (MiMo's SWA layers); 0 = every position from 0
+//   ring   the cache is a ring of `ring` rows: position t sits in row t % ring;
+//          0 = position t in row t
+//   vd     V's head dim when it differs from K's (the output's per-head stride too);
+//          vk_chain.c passes hd for 0. vd <= 256
+//   kv_pm  1: position-major rows, K[(row*KVH + kvh)*hd + d], V[(row*KVH + kvh)*vd + d]
+//          (MiMo's host layout); 0: the head-major layout above
+//   sink, sink_off   1: one more logit per head, snk[sink_off + h], joins the softmax
+//          denominator and nothing else (MiMo's attention sink): the running max and
+//          sum start from it instead of from nothing
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer QB { float q[]; };
+layout(std430, binding = 1) readonly buffer KB { float kc[]; };
+layout(std430, binding = 2) readonly buffer VB { float vc[]; };
+layout(std430, binding = 3) buffer OB { float o[]; };
+layout(std430, binding = 4) readonly buffer GB { float gt[]; };
+layout(std430, binding = 5) readonly buffer LB { int sel[]; };
+layout(std430, binding = 6) readonly buffer SB { float snk[]; };
+
+layout(push_constant) uniform P {
+    int S, H, KVH, hd, pos_base, cap;
+    int q_off, q_row, q_seg;
+    int g_off, g_row, g_seg, has_gate;
+    int o_off, o_row;
+    int sel_off, sel_row;
+    float scale;
+    int k_off, v_off;      // where this layer's cache starts in kc / vc
+    int win, ring, vd, kv_pm, sink, sink_off;
+} p;
+
+shared float qs[256];
+shared float pe[128];
+shared int   pt[128];
+shared float red[128];
+
+void main() {
+    int h = int(gl_WorkGroupID.x), s = int(gl_WorkGroupID.y);
+    int tid = int(gl_LocalInvocationID.x);
+    int kvh = h / (p.H / p.KVH);
+    int qb = p.q_off + s * p.q_row + h * p.q_seg;
+    for (int d = tid; d < p.hd; d += 128) qs[d] = q[qb + d];
+    int first = p.win > 0 ? max(0, p.pos_base + s - p.win + 1) : 0;
+    int n = p.pos_base + s + 1 - first;
+    bool list = false;
+    int lb = 0;
+    if (p.sel_row > 0) {
+        lb = p.sel_off + s * p.sel_row;
+        int c = sel[lb];
+        if (c >= 0) { n = c; list = true; }
+    }
+    barrier();
+    float m = p.sink != 0 ? snk[p.sink_off + h] : -3.0e38, l = p.sink != 0 ? 1.0 : 0.0, acc0 = 0.0, acc1 = 0.0;
+    int kbase = kvh * p.cap;
+    for (int t0 = 0; t0 < n; t0 += 128) {
+        int i = t0 + tid;
+        float sv = -3.0e38;
+        if (i < n) {
+            int t = list ? sel[lb + 1 + i] : first + i;
+            int r = p.ring > 0 ? t % p.ring : t;
+            pt[tid] = r;
+            int kb = p.k_off + (p.kv_pm != 0 ? r * p.KVH + kvh : kbase + r) * p.hd;
+            float a = 0.0;
+            for (int d = 0; d < p.hd; d++) a += qs[d] * kc[kb + d];
+            sv = a * p.scale;
+        }
+        red[tid] = sv;
+        barrier();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (tid < off) red[tid] = max(red[tid], red[tid + off]);
+            barrier();
+        }
+        float mn = max(m, red[0]);
+        barrier();
+        float e = i < n ? exp(sv - mn) : 0.0;
+        pe[tid] = e;
+        red[tid] = e;
+        barrier();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (tid < off) red[tid] += red[tid + off];
+            barrier();
+        }
+        float corr = exp(m - mn);
+        l = l * corr + red[0];
+        acc0 *= corr; acc1 *= corr;
+        int cnt = min(128, n - t0);
+        int d0 = tid, d1 = tid + 128;
+        for (int j = 0; j < cnt; j++) {
+            int vb = p.v_off + (p.kv_pm != 0 ? pt[j] * p.KVH + kvh : kbase + pt[j]) * p.vd;
+            float w = pe[j];
+            if (d0 < p.vd) acc0 += w * vc[vb + d0];
+            if (d1 < p.vd) acc1 += w * vc[vb + d1];
+        }
+        m = mn;
+        barrier();
+    }
+    float inv = l > 0.0 ? 1.0 / l : 0.0;
+    int ob = p.o_off + s * p.o_row + h * p.vd;
+    int gb = p.g_off + s * p.g_row + h * p.g_seg;
+    for (int k = 0; k < 2; k++) {
+        int d = tid + 128 * k;
+        if (d >= p.vd) break;
+        float v = (k == 0 ? acc0 : acc1) * inv;
+        if (p.has_gate != 0) v *= 1.0 / (1.0 + exp(-gt[gb + d]));
+        o[ob + d] = v;
+    }
+}

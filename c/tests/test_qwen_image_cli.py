@@ -130,6 +130,11 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(set(self.cli.IMAGE_CHAT_COMMANDS),
                          {"size", "steps", "seed", "render", "save", "help", "quit"})
         self.assertEqual(self.cli.chat_command("/size 1024x576"), ("size", "1024x576"))
+        # a picture's path at the start of a line is a message, not a command
+        self.assertEqual(self.cli.chat_command("/home/me/foto.png cosa vedi?"), (None, None))
+        self.assertEqual(self.cli.chat_command("~/Desktop/a.JPG"), (None, None))
+        self.assertEqual(self.cli.chat_command("/decide a | b"), ("decide", "a | b"))
+        self.assertEqual(self.cli.chat_command("/save /tmp/x/nome.png"), ("save", "/tmp/x/nome.png"))
 
 
 def run_coli(args, env, stdin=None, timeout=60):
@@ -308,12 +313,29 @@ class CommandsTest(unittest.TestCase):
             with urlopen(req, timeout=30) as r:
                 self.assertEqual(json.loads(r.read())["colibri"]["width"], 256)
         finally:
+            stop_process_tree(process)
+
+
+def stop_process_tree(process):
+    """Stop the gateway and the engine it spawned. On POSIX the gateway handles
+    SIGTERM and closes its engine itself. On Windows terminate() is
+    TerminateProcess on the gateway alone: the engine survives, still holding
+    the inherited serve.log, and the temporary directory cannot be removed
+    (WinError 32 in tearDown). taskkill /T takes the whole tree."""
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
             process.terminate()
-            try:
-                process.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 if __name__ == "__main__":

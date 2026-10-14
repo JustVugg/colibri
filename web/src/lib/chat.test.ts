@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { streamChat, type ChatMessage } from "./api"
-import { resendFrom } from "./chat"
+import { chatMarkdown, exportName, resendFrom } from "./chat"
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -111,5 +111,28 @@ describe("regenerate request body", () => {
     expect(body.messages[0].content).toEqual([
       { type: "image_url", image_url: { url: photo } },
     ])
+  })
+})
+
+describe("chatMarkdown", () => {
+  const labels = { user: "You", assistant: "colibrì", reasoning: "Reasoning", image: "image" }
+  it("writes a heading a turn, folds the reasoning and leaves pictures as placeholders", () => {
+    const messages: ChatMessage[] = [
+      { id: "s", role: "system", content: "be brief" },
+      { id: "u", role: "user", content: "what is this?", images: ["data:image/png;base64,aaa"] },
+      { id: "a", role: "assistant", content: "A cat.", reasoning: "It has whiskers." },
+    ]
+    const text = chatMarkdown(messages, "qwen3.6", new Date(2026, 9, 11, 9, 30), labels)
+    expect(text.startsWith("# colibrì: qwen3.6\n\n")).toBe(true)
+    expect(text).not.toContain("be brief")
+    expect(text).not.toContain("base64")
+    expect(text).toContain("## You\n\n[image 1]\n\nwhat is this?")
+    expect(text).toContain("## colibrì\n\n<details><summary>Reasoning</summary>\n\nIt has whiskers.\n\n</details>\n\nA cat.")
+  })
+})
+
+describe("exportName", () => {
+  it("carries the date and the time", () => {
+    expect(exportName(new Date(2026, 9, 11, 9, 5), "md")).toBe("colibri-chat-2026-10-11-0905.md")
   })
 })
