@@ -10,6 +10,7 @@ import json
 import math
 import mimetypes
 import os
+import secrets
 import select
 import queue
 import signal
@@ -6341,6 +6342,12 @@ class APIServer(ThreadingHTTPServer):
         self.engine = engine
         self.model_id = model_id
         self.api_key = api_key
+        # A fresh secret for this process only. The bundled dashboard on a
+        # loopback bind receives it as an HttpOnly cookie; the configured API
+        # key itself is never placed in that cookie or in page JavaScript.
+        # A new process mints a new secret, so a previous dashboard session
+        # stops working when this process exits.
+        self.dashboard_session = secrets.token_urlsafe(32) if api_key else None
         self.max_tokens = max_tokens
         self.scheduler = GenerationScheduler(max_queue, queue_timeout, kv_slots)
         self.kv_slots = kv_slots
@@ -6736,18 +6743,89 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_header("Vary", "Origin")
 
     LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", ""}
+    DASHBOARD_COOKIE = "colibri_dashboard"
+
+    def _loopback_name(self, name):
+        return str(name).strip("[]").lower() in {"127.0.0.1", "localhost", "::1"}
+
+    def _request_host_name(self):
+        host = self.headers.get("Host", "")
+        if host.startswith("["):
+            name = host[1:].split("]", 1)[0]
+        elif host.count(":") == 1:
+            name = host.rsplit(":", 1)[0]
+        else:
+            name = host
+        return name.strip().lower()
+
+    def _local_http_origin(self):
+        return "http://" + self.headers.get("Host", "").strip()
+
+    def _on_loopback_dashboard(self):
+        """The request arrived at a loopback bind, from a loopback client, for a loopback Host."""
+        if not self.server.api_key or not self.server.dashboard_session:
+            return False
+        try:
+            bound = self.server.server_address[0]
+            client = self.client_address[0]
+        except Exception:
+            return False
+        return (self._loopback_name(bound) and self._loopback_name(client)
+                and self._loopback_name(self._request_host_name()))
+
+    def _origin_matches_this_server(self):
+        origin = (self.headers.get("Origin") or "").strip().rstrip("/")
+        if not origin:
+            return True
+        return origin == self._local_http_origin().rstrip("/")
+
+    def _dashboard_document_may_set_cookie(self):
+        """A browser load of this server's own dashboard, not a cross-site fetch of it."""
+        if not self._on_loopback_dashboard() or not self._origin_matches_this_server():
+            return False
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        return site in ("", "none", "same-origin")
+
+    def _cookie_value(self, name):
+        for part in self.headers.get("Cookie", "").split(";"):
+            key, sep, value = part.strip().partition("=")
+            if sep and key == name:
+                return value
+        return ""
+
+    def _dashboard_cookie_authenticates(self):
+        """The in-memory dashboard session, only for this loopback origin.
+
+        A cross-site or same-site (other port) browser request is refused even
+        if it presents the cookie. Remote API clients are unaffected: they
+        still send the API key, and this cookie is never that key.
+        """
+        token = self._cookie_value(self.DASHBOARD_COOKIE)
+        expected = self.server.dashboard_session
+        if not token or not expected or not self._on_loopback_dashboard():
+            return False
+        if not self._origin_matches_this_server():
+            return False
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if site in ("cross-site", "same-site"):
+            return False
+        import hmac
+        return hmac.compare_digest(token, expected)
 
     def _is_authed(self):
         """True if no key is configured, or a correct key was presented. Anthropic clients
         (Claude Code, the Anthropic SDKs) authenticate with `x-api-key`, not `Bearer` — both
-        are accepted, and both are compared in constant time."""
+        are accepted, and both are compared in constant time. A loopback dashboard may
+        instead present the process-local session cookie."""
         if not self.server.api_key:
             return True
         import hmac
         if hmac.compare_digest(self.headers.get("Authorization", ""),
                                f"Bearer {self.server.api_key}"):
             return True
-        return hmac.compare_digest(self.headers.get("x-api-key", ""), self.server.api_key)
+        if hmac.compare_digest(self.headers.get("x-api-key", ""), self.server.api_key):
+            return True
+        return self._dashboard_cookie_authenticates()
 
     def require_auth(self):
         if not self._is_authed():
@@ -6868,6 +6946,14 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        # The dashboard document, and only that document, may receive a session
+        # cookie. Assets stay cookieless, and the cookie value is not the API key.
+        if target.name == "index.html" and self._dashboard_document_may_set_cookie():
+            self.send_header(
+                "Set-Cookie",
+                f"{self.DASHBOARD_COOKIE}={self.server.dashboard_session}; "
+                "HttpOnly; SameSite=Strict; Path=/")
+            self.send_header("Cache-Control", "no-store")
         self.send_cors_headers()
         self.end_headers()
         self.wfile.write(data)
