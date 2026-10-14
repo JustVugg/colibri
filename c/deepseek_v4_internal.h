@@ -7,6 +7,7 @@
  */
 #include "deepseek_v4.h"
 
+#include <math.h>
 #include <stdio.h>
 #include "tensor.h"
 #include "expert_store.h"
@@ -16,6 +17,17 @@
 #include "native_quant_dual.h"
 #include "native_quant_fp4_rows16.h"
 #include "st.h"
+
+/* An FP32 block scale as the device's E8M0 byte: only a finite positive power
+ * of two in E8M0's range converts exactly; anything else returns -1 so the
+ * caller keeps that matrix on the CPU instead of rounding the scale. */
+static inline int coli_v4_e8m0_exact(float value, uint8_t *encoded) {
+    int exponent;
+    if (!isfinite(value) || !(value > 0.0f) || frexpf(value, &exponent) != 0.5f ||
+        exponent - 1 < -127 || exponent - 1 > 127) return -1;
+    *encoded = (uint8_t)(exponent - 1 + 127);
+    return 0;
+}
 
 /* Worker count for the persistent expert-loader pool in the block pipeline
  * (deepseek_v4_block_pipeline.c). Shared here so the CLI can size the OpenMP

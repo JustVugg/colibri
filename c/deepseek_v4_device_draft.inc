@@ -28,7 +28,8 @@ static Dsv4CudaTensor *v4_dd_fp8(V4DeviceDraftStage *s,const uint8_t *packed,con
     size_t blocks=(size_t)(rows/128)*(cols/128);
     uint8_t *encoded=malloc(blocks),*unpacked=NULL;
     if(!encoded)return NULL;
-    for(size_t i=0;i<blocks;i++)encoded[i]=(uint8_t)(ilogbf(scales[i])+127);
+    for(size_t i=0;i<blocks;i++)
+        if(coli_v4_e8m0_exact(scales[i],&encoded[i])){free(encoded);return NULL;}
     const uint8_t *data=packed;
 #ifdef __AVX2__
     unpacked=malloc((size_t)rows*cols);

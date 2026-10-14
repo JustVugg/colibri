@@ -11237,10 +11237,11 @@ int coli_v4_gpu_dspark_dense_attach(ColiV4Engine *engine, ColiTensorView *view) 
     uint8_t *scales = malloc(blocks), *unpacked = NULL;
     const uint8_t *data = view->data;
     if (!scales) return -1;
-    for (size_t i = 0; i < blocks; i++) {
-        float value = ((const float *)view->scales)[i];
-        scales[i] = isfinite(value) && value > 0 ? (uint8_t)(ilogbf(value) + 127) : 255;
-    }
+    for (size_t i = 0; i < blocks; i++)
+        if (coli_v4_e8m0_exact(((const float *)view->scales)[i], &scales[i])) {
+            free(scales);
+            return -1;
+        }
     if (view->block_rows == 8) {
         unpacked = malloc(rows * cols);
         if (!unpacked) { free(scales); return -1; }

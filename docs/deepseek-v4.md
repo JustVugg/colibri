@@ -454,6 +454,31 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
 | `V4_MOE_BANK_FULL` (off) | `=N`: prefetch a whole layer's experts above N tokens (measured worse) |
+| `DSV4_CUDA_INDEXER_LAZY` (1) | with `COLI_CUDA_ATTN_BATCH=1`: when every compressed row fits under `index_topk`, the CUDA full-set attention reads them in cache order and the indexer only advances its state instead of scoring; on by default for anyone who already sets `COLI_CUDA_ATTN_BATCH=1`, `0` scores as before |
+| `V4_RESIDENT_MOE_BATCH` (0) | `1` = a batch on layers whose experts are fully resident takes the resident route-and-MoE pipeline instead of the CPU union |
+| `V4_UNIFIED_DECODE` (0) | `1` = single-token decode goes through the batched target path (batch 1) |
+| `V4_SPEC_RETAIN` (0) | `1` = after a partly accepted draft, keep the accepted rows' attention state instead of restoring the snapshot and replaying them; implied by `V4_DEVICE_TARGET` |
+
+**Device execution (opt-in, Linux CUDA, official V4-Flash layout)**
+
+Keeps the target layers' activations, compressor history, attention and expert
+routing on the GPUs, the layers placed as with `DSV4_CUDA_DEVICES`. Limits: full-set
+attention only, up to `min(2048, 4 * index_topk)` positions with a 25-token draft
+tail reserved; one active prefix, so CPU prefix-checkpoint reuse is off; FP8
+activation quantization and FP4 reduction order differ from the CPU path, so the
+tokens are not bit-identical to it. Long-context indexer selection, concurrent
+serving and Windows are not validated.
+
+| var | meaning |
+|---|---|
+| `V4_DEVICE_TARGET` (0) | `1` = run the target forward on the device path above |
+| `V4_DEVICE_GRAPH` (0) | `1` = replay each layer group as a CUDA Graph (re-captured when a scratch buffer grows) |
+| `V4_DEVICE_MMA` (0, `.cu`) | `1` = native FP8 MMA for the device path's dense matrices |
+| `V4_DEVICE_FP4_VEC` (0, `.cu`) | `1` = vectorized FP4 expert GEMV on the device path |
+| `V4_MTP_GPU_DENSE` (0) | `1` = the MTP drafter's dense work on the GPU (three mirror partitions on 3+ devices with `V4_MTP_GPU_MIRRORS` >= 24) |
+| `V4_MTP_GPU_ATTN` (1) | with `V4_MTP_GPU_DENSE=1`: the drafter's attention on the GPU; `0` keeps it on the CPU |
+| `V4_MTP_GPU_HEAD` (0) | with `V4_MTP_GPU_DENSE=1`: the drafter's vocabulary projection and Markov selection on the GPU |
+| `V4_MTP_DEVICE` (0) | with `V4_MTP_GPU_DENSE=1`, Linux: each MTP stage runs whole on the device with resident expert banks |
 
 **Prefill / checkpoints**
 | var | meaning |

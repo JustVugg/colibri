@@ -1771,12 +1771,27 @@ static int test_fp8_decode_batch_order(void) {
                    memcmp(reference_dual, other, sizeof(reference_dual))) return 1;
     }
     puts("DeepSeek-V4 FP8 decode: batch-exact bits");
+static int test_e8m0_exact(void) {
+    static const struct { float value; int encoded; } cases[] = {
+        {1.0f, 127}, {0.5f, 126}, {0x1p-127f, 0}, {0x1p127f, 254},
+        {0.75f, -1}, {3.0f, -1}, {0x1p-128f, -1}, {0.0f, -1}, {-1.0f, -1},
+        {INFINITY, -1}, {NAN, -1},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint8_t encoded = 0;
+        int result = coli_v4_e8m0_exact(cases[i].value, &encoded);
+        if (cases[i].encoded < 0 ? !result : result || encoded != cases[i].encoded) {
+            fprintf(stderr, "FAIL: e8m0 case %zu\n", i);
+            return 1;
+        }
+    }
     return 0;
 }
 
 int main(int argc, char **argv) {
     if (test_fp8_decode_batch_order() || test_sparse_attention_parallel_order() ||
         test_route_bf16_parallel_order() || test_fp8_grouped_projection()) return 1;
+    if (test_e8m0_exact()) return 1;
     if (test_attention_cache() != 0) {
         fprintf(stderr, "FAIL: test_attention_cache\n");
         return 1;
