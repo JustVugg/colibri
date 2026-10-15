@@ -187,3 +187,10 @@ Interactive lines are prompts; control frames: `\x02RESET` (clear history),
 `\x02PROMPT <bytes> <max_tokens> <temperature> <top_p> [kv_slot]\n<prompt>\n`
 (the pre-mux API mode). Responses are raw text terminated by `\x01\x01END\x01\x01`
 plus a `STAT` line. New integrations should use the mux protocol.
+
+Over-context prompts are refused, never silently truncated (#2097): the engine
+emits an empty answer, a `STAT` line with a seventh `CONTEXT_EXCEEDED` token,
+and a stderr line naming the cause (prompt too long for the context, a
+conversation history that no longer fits, or text clipped by the 64 KB render
+buffer). Raise `CTX` or shorten the prompt; in chat, `\x02RESET` clears a full
+history.
