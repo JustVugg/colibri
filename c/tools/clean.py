@@ -35,6 +35,7 @@ FILES = [
     "backend_cuda_bench", "backend_cuda_bench.exe",
     "backend_metal.o", "backend_metal_test",
     "coli_cuda.dll", "coli_cuda.lib", "coli_cuda.exp",
+    "coli_olmoe_cuda.dll", "coli_olmoe_cuda.lib", "coli_olmoe_cuda.exp", "libcoli_olmoe_cuda.so",
     # hipcc emits an import library, export file and PDB alongside the DLL.
     "coli_hip.dll", "coli_hip.lib", "coli_hip.exp", "coli_hip.pdb",
     "tests/compat_prefetch_module.dll",
