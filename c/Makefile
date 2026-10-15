@@ -1313,10 +1313,14 @@ cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_fo
 # two-GPU start-up (peer probe, init rollback; it includes backend_cuda_dsv4.cu
 # with shims, so it links what the backend needs -- cuBLASLt for the default
 # tensor-core path, NCCL with NCCL=1 -- plus the driver API it asks whether a
-# context exists).
-dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c tests/test_dsv4_generic_bitwise_cuda.c tests/test_dsv4_bank_bytes_cuda.c tests/test_dsv4_peer_init_cuda.cu backend_cuda_dsv4.cu backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
+# context exists), then the decode MoE with experts on a peer GPU (peer
+# compute and in-place reads vs one GPU, and an injected peer failure; skips
+# without two peer-capable GPUs).
+dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c tests/test_dsv4_generic_bitwise_cuda.c tests/test_dsv4_bank_bytes_cuda.c tests/test_dsv4_peer_init_cuda.cu tests/test_dsv4_peer_moe_cuda.c backend_cuda_dsv4.cu backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
 	"$(NVCC)" $(NVCCFLAGS) tests/test_dsv4_peer_init_cuda.cu -o dsv4_peer_init_cuda_test$(EXE) -lcuda -lcublasLt $(if $(filter 1,$(NCCL)),-lnccl)
 	./dsv4_peer_init_cuda_test$(EXE)
+	$(CC) $(CFLAGS) tests/test_dsv4_peer_moe_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_peer_moe_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_peer_moe_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_bank_bytes_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_bank_bytes_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_bank_bytes_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_dense_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_cuda_test$(EXE) $(LDFLAGS)

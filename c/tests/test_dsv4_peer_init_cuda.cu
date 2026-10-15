@@ -17,7 +17,8 @@
  * cannot run must leave the peer untouched, a refused peer must lose the
  * context its check made; only a missing image gets the rebuild hint, not a
  * GPU that is full or held by an exclusive-process job (cudaSetDevice's error
- * is faked for that: a real one needs such a GPU). A build with no image for
+ * is faked for that: a real one needs such a GPU). A peer latched off by
+ * dsv4_cuda_peer_healthy is refused untouched. A build with no image for
  * these GPUs (say CUDA_ARCH=sm_89 on 3090s) checks the real refusal and skips
  * the init parts.
  * About one CUDA context per GPU (~0.3 GiB each) plus a few KiB. */
@@ -168,6 +169,11 @@ int main(void){
             fail_image_dev=1;fail_image_err=cudaErrorMemoryAllocation;usable=dsv4_cuda_peer_probe(0,1,why,sizeof why);fail_image_dev=-1;fail_image_err=cudaSuccess;
             CHECK(!usable&&strstr(why,"peer device 1")&&strstr(why,"kernel-image check")&&strstr(why,cudaGetErrorString(cudaErrorMemoryAllocation))&&!rebuild_hint(why)&&!strstr(why,"rebuild")&&!strstr(why,"code only"),"kernel query out of memory: \"%s\"",why);
             CHECK(has_context(1)==0,"the refused peer kept the context of its failed kernel-image check");}
+        /* a peer latched off by an earlier failure in this process: refused
+         * before anything touches it */
+        g_peer_lost[1]=1;usable=dsv4_cuda_peer_probe(0,1,why,sizeof why);g_peer_lost[1]=0;
+        CHECK(!usable&&strstr(why,"peer device 1")&&strstr(why,"latched"),"latched peer: %d \"%s\"",usable,why);
+        CHECK(has_context(1)==0,"the probe touched a latched peer");
         usable=dsv4_cuda_peer_probe(0,1,why,sizeof why);
         printf("probe 0 -> 1: %s%s\n",usable?"usable":"refused: ",why);
         /* accepted: the kernel-image check made the peer's context (and shows has_context sees one) */

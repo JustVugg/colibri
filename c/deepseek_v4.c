@@ -6041,6 +6041,7 @@ static int moe_token_pipeline(float *output,
                 ups[i] = views[i].up.gpu;
                 downs[i] = views[i].down.gpu;
             }
+            int peer_up = coli_v4_gpu_peer_pool_up();
             if (moe_ok) {
                 extern int dsv4_cuda_moe(
                     void *const *gate, void *const *up, void *const *down,
@@ -6051,7 +6052,31 @@ static int moe_token_pipeline(float *output,
                     selected, sg, su, sd, config->swiglu_limit,
                     expert_output, input)) moe_ok = 0;
             }
-            if (!moe_ok) {
+            if (!moe_ok && peer_up && !coli_v4_gpu_peer_pool_up()) {
+                /* The peer GPU failed under this call and its memory is no
+                 * longer read (when it still could be, dsv4_cuda_moe already
+                 * recomputed those experts on the primary and succeeded):
+                 * compute the routed experts from host data on the CPU, as
+                 * the path without GPU compute does. Its mirrors are misses
+                 * from the next lookup on. The views drop their mirror
+                 * handles: coli_v4_expert_forward_ref would otherwise hand
+                 * the peer's back to the backend's matvec. */
+                result = v4_views_fetch_host(store, views, leased, selected,
+                                             weights->plan.layer, fetch,
+                                             jobs, loaders, loader_active, dec);
+                for (int current = 0; !result && current < selected; current++) {
+                    views[current].gate.gpu = views[current].up.gpu =
+                        views[current].down.gpu = NULL;
+                    result = coli_v4_expert_forward_ref(
+                        expert_output, &views[current], input,
+                        expert_weights[current], config->swiglu_limit);
+                    if (!result)
+                        for (int i = 0; i < d; i++) output[i] += expert_output[i];
+                }
+                if (!result)
+                    for (int i = 0; i < d; i++)
+                        expert_output[i] = output[i] + shared_output[i];
+            } else if (!moe_ok) {
                 extern int dsv4_cuda_expert_group(
                     void *const *gate, void *const *up, void *const *down,
                     const float *weights, int count, float limit,
@@ -11736,8 +11761,9 @@ static int v4_gpu_wanted(void) {
 }
 
 typedef struct V4GpuExpertMirrorCache V4GpuExpertMirrorCache;
-/* Peer mirror pool (DSV4_CUDA_PEER_DEVICE): a second cache on another GPU,
- * whose mirrors the fused MoE reads in place over P2P/NVLink. */
+/* Peer mirror pool (DSV4_CUDA_PEER_DEVICE): a second cache on another GPU.
+ * The fused MoE runs its experts on that GPU (peer compute) or reads them in
+ * place over P2P/NVLink (dsv4_cuda_peer_compute says which). */
 static V4GpuExpertMirrorCache *g_v4_peer_mirrors;
 static int v4_peer_mirrors_capacity(void);
 static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device, int primary,
@@ -12373,6 +12399,18 @@ static unsigned long long g_v4_mirror_uploads;
 unsigned long long coli_v4_gpu_expert_uploads(void) {
     return g_v4_mirror_uploads;
 }
+/* The peer pool while its device is healthy. Once a peer-side CUDA failure
+ * has latched the device off (dsv4_cuda_peer_healthy) the pool counts as
+ * absent: its mirrors are misses and decode goes on with the primary. The
+ * pool itself, and its VRAM on that GPU, stays allocated until
+ * coli_v4_gpu_engine_close: freeing it here would pull mirrors out from
+ * under views and lookups still holding them, and on a lost device the
+ * frees fail anyway. */
+static V4GpuExpertMirrorCache *v4_peer_pool(void) {
+    V4GpuExpertMirrorCache *peer = g_v4_peer_mirrors;
+    return peer && dsv4_cuda_peer_healthy(peer->device) ? peer : NULL;
+}
+int coli_v4_gpu_peer_pool_up(void) { return v4_peer_pool() != NULL; }
 
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
     int device, int capacity) {
@@ -12427,10 +12465,17 @@ static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device, int primary,
     const char *res = getenv("DSV4_CUDA_PEER_RESERVE_MB");
     cache->reserve_mb = res ? atoll(res) : 1024;
     if (cache->reserve_mb < 256) cache->reserve_mb = 256;
-    /* p2p-read: the primary reads the pool's experts in place */
-    fprintf(stderr, "v4_gpu peer-mirrors device=%d reserve=%lldMB mode=p2p-read "
-                    "(device %d reads these experts in place over P2P)\n",
-            device, cache->reserve_mb, primary);
+    /* mode=compute: the fused MoE runs the pool's experts on the peer GPU;
+     * p2p-read: the primary reads them in place (DSV4_CUDA_PEER_COMPUTE=0,
+     * DSV4_CUDA_BATCHED=0, or GPUs of different SM versions). */
+    if (dsv4_cuda_peer_compute(primary, device))
+        fprintf(stderr, "v4_gpu peer-mirrors device=%d reserve=%lldMB mode=compute "
+                        "(the decode MoE runs these experts on device %d)\n",
+                device, cache->reserve_mb, device);
+    else
+        fprintf(stderr, "v4_gpu peer-mirrors device=%d reserve=%lldMB mode=p2p-read "
+                        "(device %d reads these experts in place over P2P)\n",
+                device, cache->reserve_mb, primary);
     return cache;
 }
 
@@ -12731,14 +12776,15 @@ static int v4_mirror_peek_cache(V4GpuExpertMirrorCache *cache, ColiExpertView *v
     return -1;
 }
 /* coli_v4_expert_store_vram_held (VRAM-first decode): the experts of `layer`
- * with a live mirror in the store's cache or in the peer pool. It runs on any
- * thread that looks an expert up, with the store's lock held, and takes only
- * the caches' own locks; nothing that holds one of those calls the store. */
+ * with a live mirror in the store's cache or in the peer pool (while its
+ * device is healthy: v4_peer_pool, like peek). It runs on any thread that
+ * looks an expert up, with the store's lock held, and takes only the caches'
+ * own locks; nothing that holds one of those calls the store. */
 static void v4_gpu_expert_vram_held(ColiExpertStore *store, int layer,
                                     unsigned char *held, int experts) {
     if (!store || !store->gpu || !held) return;
     V4GpuExpertMirrorCache *caches[2] = {
-        (V4GpuExpertMirrorCache *)store->gpu, g_v4_peer_mirrors};
+        (V4GpuExpertMirrorCache *)store->gpu, v4_peer_pool()};
     for (int c = 0; c < 2; c++) {
         V4GpuExpertMirrorCache *cache = caches[c];
         if (!cache) continue;
@@ -12779,7 +12825,7 @@ static uint64_t v4_mirror_lru_clock(V4GpuExpertMirrorCache *cache) {
  * cache alone would have taken. */
 static int v4_gpu_expert_attach_tiered(V4GpuExpertMirrorCache *primary,
                                        ColiExpertView *view, int sync) {
-    V4GpuExpertMirrorCache *peer = g_v4_peer_mirrors;   /* the only read here */
+    V4GpuExpertMirrorCache *peer = v4_peer_pool();   /* the only read here */
     if (!peer || !primary) return v4_gpu_expert_attach_cached_ex(primary, view, sync);
     if (v4_mirror_peek_cache(primary, view) == 0 ||
         v4_mirror_peek_cache(peer, view) == 0) return 0;
@@ -12830,7 +12876,7 @@ int coli_v4_gpu_expert_drain(ColiExpertStore *store) {
  * miss the moment it is discovered. The primary cache is scanned once; the
  * peer pool only on a primary miss. */
 int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view) {
-    V4GpuExpertMirrorCache *peer = g_v4_peer_mirrors;   /* the only read here */
+    V4GpuExpertMirrorCache *peer = v4_peer_pool();   /* the only read here */
     if (!store || !view || !store->gpu) return -1;
     if (v4_mirror_peek_cache((V4GpuExpertMirrorCache *)store->gpu, view) == 0)
         return 0;

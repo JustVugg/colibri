@@ -1121,6 +1121,9 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view);
 /* lookup-only twin: reports residency, never uploads (hybrid q* split) */
 int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view);
+/* 1 while a peer mirror pool (DSV4_CUDA_PEER_DEVICE) is in use, 0 without
+ * one or once a peer-side CUDA failure latched its device off. */
+int coli_v4_gpu_peer_pool_up(void);
 /* Mirror uploads so far (a new mirror, or a recycled one refilled), any cache:
  * the decode MoE counts the ones its own attaches cause. */
 unsigned long long coli_v4_gpu_expert_uploads(void);
