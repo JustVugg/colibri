@@ -5575,6 +5575,12 @@ static void v4_vk_token_free(V4VkToken *vk) {
 }
 #endif
 
+/* Decode MoE counters (V4_SERVE_STATS_LOG; deepseek_v4_internal.h). */
+int g_v4_dec_counting;
+unsigned long long g_v4_dec_calls, g_v4_dec_uploads;
+double g_v4_dec_total_s, g_v4_dec_fetch_s, g_v4_dec_attach_s, g_v4_dec_gpu_s;
+unsigned long long g_v4_dec_store_fetches;
+
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 /* Finish every lane still reading and give back what it leased. Every exit of
  * a fetch pass runs this, errors included: a lane left running would write
@@ -5598,6 +5604,11 @@ static int moe_token_pipeline(float *output,
                               const float *input, int token) {
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     double profile_moe_began = coli_v4_block_profile_now();
+#endif
+#ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+    /* decode MoE counters (deepseek_v4_internal.h): the routing included */
+    int dec = g_v4_dec_counting;
+    double dec_t0 = v4_wait_clock();
 #endif
     int d = config->hidden_size;
     int n = config->n_routed_experts;
@@ -5713,6 +5724,7 @@ static int moe_token_pipeline(float *output,
     ExpertLoadHandle loaders[DUAL_EXPERT_LOADER_MAX] = {{0}};
     int loader_active[DUAL_EXPERT_LOADER_MAX] = {0};
     if (!result) {
+        if (dec) g_v4_dec_store_fetches += (unsigned long long)selected;
         int preload = selected < dual_loader_lanes()
             ? selected : dual_loader_lanes();
         for (int i = 0; i < preload; i++) {
@@ -5769,8 +5781,11 @@ static int moe_token_pipeline(float *output,
 #endif
         for (int current = 0; !result && current < selected; current++) {
             int slot = current % dual_loader_lanes();
-            if (!loader_active[slot] ||
-                profiled_expert_load_finish(&loaders[slot]) != 0) {
+            double fw0 = v4_wait_clock();
+            int finish_failed = !loader_active[slot] ||
+                profiled_expert_load_finish(&loaders[slot]) != 0;
+            if (dec) g_v4_dec_fetch_s += v4_wait_clock() - fw0;
+            if (finish_failed) {
                 result = moe_fail("layer %d: the read of expert %d did not complete",
                                   weights->plan.layer, jobs[slot].key.expert);
                 break;
@@ -5788,8 +5803,15 @@ static int moe_token_pipeline(float *output,
                     /* peek only: uploads are decided once the token's full
                      * miss count is known, by the q* pass below */
                     coli_v4_gpu_expert_peek(store, &views[current]);
-                else
+                else {
+                    double at0 = v4_wait_clock();
+                    unsigned long long uploads = coli_v4_gpu_expert_uploads();
                     coli_v4_gpu_expert_attach(store, &views[current]);
+                    if (dec) {
+                        g_v4_dec_attach_s += v4_wait_clock() - at0;
+                        g_v4_dec_uploads += coli_v4_gpu_expert_uploads() - uploads;
+                    }
+                }
             }
 #endif
 #ifdef COLI_V4_GPU_TIER
@@ -5875,6 +5897,7 @@ static int moe_token_pipeline(float *output,
             gpu_compute = 1;    /* every expert made it: use the fused path */
     }
     if (!result && gpu_compute && store->gpu) {
+        double gpu_t0 = v4_wait_clock();
         void *sg = coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
         void *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
         void *sd = coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
@@ -5922,6 +5945,7 @@ static int moe_token_pipeline(float *output,
                     output[i] = coli_bf16_round(expert_output[i]);
         }
         free(gates); free(ups); free(downs);
+        if (dec) g_v4_dec_gpu_s += v4_wait_clock() - gpu_t0;
     } else if (!result && hybrid_gpu_count > 0 && store->gpu) {
         /* Hybrid split: the GPU computes the resident subset as one weighted
          * group while the CPU computes the rest; the two partial sums merge
@@ -6062,6 +6086,10 @@ static int moe_token_pipeline(float *output,
     for (int current = 0; views && current < selected; current++)
         coli_expert_release(store, &views[current]);
     free(views);
+    if (dec) {
+        g_v4_dec_total_s += v4_wait_clock() - dec_t0;
+        g_v4_dec_calls++;
+    }
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
     v4_vk_token_free(&vk_step);
 #endif
@@ -12038,6 +12066,12 @@ struct V4GpuExpertMirrorCache {
     int device;
     pthread_mutex_t mutex;
 };
+/* Mirror uploads, every cache (coli_v4_gpu_expert_uploads). Uploads happen on
+ * the generation thread only. */
+static unsigned long long g_v4_mirror_uploads;
+unsigned long long coli_v4_gpu_expert_uploads(void) {
+    return g_v4_mirror_uploads;
+}
 
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
     int device, int capacity) {
@@ -12225,6 +12259,7 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                 cache->entries[found].layer = view->key.layer;
                 cache->entries[found].expert = view->key.expert;
                 cache->entries[found].clock = ++cache->clock;
+                g_v4_mirror_uploads++;
                 view->gate.gpu = cache->entries[found].gate;
                 view->up.gpu = cache->entries[found].up;
                 view->down.gpu = cache->entries[found].down;
@@ -12295,6 +12330,7 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
         cache->entries[found].gate = gate;
         cache->entries[found].up = up;
         cache->entries[found].down = down;
+        g_v4_mirror_uploads++;
     }
     cache->entries[found].clock = ++cache->clock;
     view->gate.gpu = cache->entries[found].gate;
@@ -15328,8 +15364,10 @@ static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_pt
                         ColiExpertStore *experts, int token, int position,
                         char *error, size_t error_size) {
     double t0 = spec_now();
+    g_v4_dec_counting = 1;   /* the decode MoE counters: decode forwards only */
     int result = target_token_impl(engine, state_ptr, next_ptr, attention, index, config,
                                    experts, token, position, error, error_size);
+    g_v4_dec_counting = 0;
     g_v4_prof_block_s += spec_now() - t0;
     g_v4_prof_forwards += 1;
     return result;
@@ -17672,6 +17710,33 @@ static void v4_serve_finish(ColiV4Engine *engine, ColiV4Session *session,
      * they exceeded the wall on a cold tiny run (0.073 s of disk in a 0.034 s turn). */
     double attention_s = (g_v4_prof_block_s - marks->block) - expert_matmul_s - expert_wait_s;
     if (attention_s < 0.0) attention_s = 0.0;
+    {   /* V4_SERVE_STATS_LOG=1: the turn's DONE/PROF numbers on stderr too (the
+         * gateway consumes stdout), for decode benchmarking from the serve log.
+         * v4_dec_moe: process totals of the single-token decode MoE
+         * (deepseek_v4_internal.h). v4_serve_turn: decode_s and tok_s are the
+         * decode's, hit% and the expert and attention seconds the whole turn's,
+         * prefill included (as DONE/PROF), and store_fetches_total is the
+         * process total of the decode experts fetched from the store. */
+        static int stats_log = -1;
+        if (stats_log < 0) {
+            const char *setting = getenv("V4_SERVE_STATS_LOG");
+            stats_log = setting && atoi(setting) > 0;
+        }
+        if (stats_log)
+            fprintf(stderr, "v4_dec_moe calls=%llu total_s=%.2f fetch_wait_s=%.2f "
+                    "attach_s=%.2f uploads=%llu gpu_s=%.2f (cumulative)\n",
+                    g_v4_dec_calls, g_v4_dec_total_s, g_v4_dec_fetch_s,
+                    g_v4_dec_attach_s, g_v4_dec_uploads, g_v4_dec_gpu_s);
+        if (stats_log)
+            fprintf(stderr, "v4_serve_turn prompt=%d completion=%d decode_s=%.2f "
+                    "tok_s=%.3f hit=%.1f%% expert_disk_s=%.2f expert_wait_s=%.2f "
+                    "expert_matmul_s=%.2f attention_s=%.2f rss_gb=%.1f "
+                    "store_fetches_total=%llu\n",
+                    prompt_tokens, completion, decode,
+                    decode > 0.0 ? completion / decode : 0.0, hit_rate,
+                    expert_disk_s, expert_wait_s, expert_matmul_s, attention_s,
+                    v4_serve_rss_gb(), g_v4_dec_store_fetches);
+    }
     v4_prof_emit(elapsed, prompt_tokens, completion,
                  expert_disk_s, expert_wait_s, expert_matmul_s, attention_s,
                  g_v4_prof_head_s - marks->head, g_v4_prof_forwards - marks->forwards);
