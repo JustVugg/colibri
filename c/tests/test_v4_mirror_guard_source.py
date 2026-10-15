@@ -31,13 +31,13 @@ def find(text, needle, start=0, where="deepseek_v4.c"):
 
 
 class V4MirrorGuardSourceTest(unittest.TestCase):
-    """The guard's state is per cache (cache->...), and the
+    """The guard's state is per cache (cache->...) since the peer pool, and the
     margin comes back from v4_gpu_mirror_reserve_mb."""
 
     def setUp(self):
         self.text = SOURCE.read_text(encoding="utf-8")
-        decl = find(self.text, "static int v4_gpu_expert_attach_cached_ex(")   # the forward declaration
-        start = find(self.text, "static int v4_gpu_expert_attach_cached_ex(", decl + 1)
+        decl = find(self.text, "static int v4_gpu_expert_attach_cached_mode(")   # the forward declaration
+        start = find(self.text, "static int v4_gpu_expert_attach_cached_mode(", decl + 1)
         self.body = self.text[start:find(self.text, "\n}\n", start)]
 
     def test_probe_resets_the_grown_count(self):

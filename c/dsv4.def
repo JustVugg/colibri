@@ -67,6 +67,8 @@ EXPORTS
     dsv4_cuda_expert_bank_slots
     dsv4_cuda_expert_bank_create
     dsv4_cuda_expert_bank_slot_bytes
+    dsv4_cuda_peer_access
+    dsv4_cuda_peer_probe
     dsv4_cuda_expert_bank_upload
     dsv4_cuda_expert_bank_set_shared
     dsv4_cuda_expert_bank_upload_tp2
