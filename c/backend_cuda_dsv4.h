@@ -194,6 +194,13 @@ Dsv4CudaExpertSet *dsv4_cuda_expert_set_create(Dsv4CudaTensor *const *gate,Dsv4C
 int dsv4_cuda_expert_bank_slots(int experts);
 /* Device bytes one slot of an expert bank of this geometry takes. */
 long long dsv4_cuda_expert_bank_slot_bytes(int hidden,int intermediate);
+int dsv4_cuda_peer_access(int a,int b);
+/* Before dsv4_cuda_init: can `peer` carry `device`'s peer mirror pool (both
+ * visible and distinct, both of an architecture and with a kernel image this
+ * build runs -- the primary checked first --, peer access both ways)? 1 = yes;
+ * 0 = no, the reason in why (truncated to why_size). A refused peer is left
+ * uninitialised. */
+int dsv4_cuda_peer_probe(int device,int peer,char *why,int why_size);
 Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count,int hidden,int intermediate,int device,
                                                  Dsv4CudaTensor *shared_gate,Dsv4CudaTensor *shared_up,
                                                  Dsv4CudaTensor *shared_down);

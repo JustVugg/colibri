@@ -71,6 +71,10 @@ struct Dev { int id,sms; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;fl
 #endif
 };
 static Dev g[16];static int ng;
+/* g_peer[a][b]: device a's kernels may read device b's memory (peer access
+ * enabled by dsv4_cuda_init, e.g. over NVLink). */
+static unsigned char g_peer[16][16];
+static bool dev_ok(int a,int b){return a==b||(a>=0&&a<16&&b>=0&&b<16&&g_peer[a][b]);}
 static Dev *ctx(int d){for(int i=0;i<ng;i++)if(g[i].id==d)return g+i;return nullptr;}
 static int ok(cudaError_t e,const char *s){if(e==cudaSuccess)return 1;fprintf(stderr,"[DSV4 CUDA] %s: %s\n",s,cudaGetErrorString(e));return 0;}
 #if COLI_DSV4_TC
@@ -1386,10 +1390,54 @@ static int tc_dev_init(Dev*c){return bok(cublasLtCreate(&c->lt),"cuBLASLt create
 #else
 static int tc_dev_init(Dev*){return 1;}
 #endif
-extern "C" int dsv4_cuda_init(const int *dev,int n){if(n<1||n>16)return 0;float scale[256];for(int b=0;b<256;b++)scale[b]=b?ldexpf(1.f,b-127):ldexpf(1.f,-127);ng=0;for(int i=0;i<n;i++){cudaDeviceProp p{};if(!ok(cudaSetDevice(dev[i]),"select device")||!ok(cudaMemcpyToSymbol(e8_table,scale,sizeof(scale)),"scale table upload")||!ok(cudaGetDeviceProperties(&p,dev[i]),"device properties")||!ok(cudaStreamCreateWithFlags(&g[i].stream,cudaStreamNonBlocking),"stream")||!ok(cudaStreamCreateWithFlags(&g[i].aux,cudaStreamNonBlocking),"aux stream")||!ok(cudaEventCreateWithFlags(&g[i].ready,cudaEventDisableTiming),"device event")||!ok(cudaEventCreateWithFlags(&g[i].fork,cudaEventDisableTiming),"fork event")||!ok(cudaEventCreateWithFlags(&g[i].join,cudaEventDisableTiming),"join event")||!tc_dev_init(&g[i])||!ok(cudaMalloc(&g[i].decode_state,2*sizeof(int)),"decode state allocation"))return 0;g[i].id=dev[i];g[i].sms=p.multiProcessorCount;ng++;fprintf(stderr,"[DSV4 CUDA] device %d: %s %.1f GB sm_%d%d\n",dev[i],p.name,p.totalGlobalMem/1e9,p.major,p.minor);}for(int i=0;i<n;i++)for(int j=0;j<n;j++)if(i!=j){int can=0;if(!ok(cudaDeviceCanAccessPeer(&can,dev[i],dev[j]),"peer query"))return 0;if(can){if(!ok(cudaSetDevice(dev[i]),"select peer device"))return 0;cudaError_t e=cudaDeviceEnablePeerAccess(dev[j],0);if(e!=cudaSuccess&&e!=cudaErrorPeerAccessAlreadyEnabled)return ok(e,"enable peer access");}}
-#ifdef COLI_DSV4_NCCL
-    if(n==6)for(int pair=0;pair<3;pair++){int ids[2]={dev[2*pair],dev[2*pair+1]};ncclComm_t comm[2];if(!nok(ncclCommInitAll(comm,2,ids),"EP2 communicator init"))return 0;g[2*pair].ep_comm=comm[0];g[2*pair+1].ep_comm=comm[1];}
+extern "C" int dsv4_cuda_peer_access(int a,int b){return a!=b&&dev_ok(a,b)&&dev_ok(b,a);}
+/* Asked BEFORE dsv4_cuda_init (DSV4_CUDA_PEER_DEVICE), so a peer that is
+ * refused is never initialised: both ordinals visible, distinct and < 16 (the
+ * size of g_peer), a compute capability this build accepts for each
+ * (dsv4_cuda_backend_arch_ok), peer access in both directions, and a kernel
+ * image in this binary for each (cudaFuncGetAttributes: "no kernel image" or
+ * "invalid device function" otherwise -- the only errors the reason pairs
+ * with a rebuild hint). The primary is checked first: one the build cannot
+ * run fails its own init anyway, and its peer must not be left holding a
+ * context for a CPU-only run. Only the kernel-image check makes a
+ * context: the primary's is the one its init creates; the peer's is destroyed
+ * again on refusal unless the backend already holds a device. 1 = usable;
+ * 0 = refused, the reason in why. */
+extern "C" int dsv4_cuda_peer_probe(int device,int peer,char *why,int why_size){
+    char none[1];if(!why||why_size<1){why=none;why_size=1;}why[0]=0;
+    int count=0;cudaError_t e=cudaGetDeviceCount(&count);
+    if(e!=cudaSuccess){cudaGetLastError();snprintf(why,why_size,"no CUDA device (%s)",cudaGetErrorString(e));return 0;}
+    if(peer==device){snprintf(why,why_size,"peer device %d is the primary device",peer);return 0;}
+    for(int k=0;k<2;k++){int d=k?peer:device;
+        if(d<0||d>=count){snprintf(why,why_size,"device %d is not a visible CUDA device (%d visible)",d,count);return 0;}
+        if(d>=16){snprintf(why,why_size,"device %d: peer access is tracked for devices 0-15 only",d);return 0;}}
+    cudaDeviceProp p[2]{};const char *role[2]={"primary","peer"};
+    for(int k=0;k<2;k++){int d=k?peer:device;
+        if((e=cudaGetDeviceProperties(&p[k],d))!=cudaSuccess){cudaGetLastError();snprintf(why,why_size,"%s device %d: %s",role[k],d,cudaGetErrorString(e));return 0;}
+        if(!dsv4_cuda_backend_arch_ok(d)){
+#ifdef COLI_DSV4_DEEPGEMM
+            snprintf(why,why_size,"%s device %d (%s, sm_%d%d): the %s backend runs on sm_120 only (pair other cards with the generic build: no DEEPGEMM)",role[k],d,p[k].name,p[k].major,p[k].minor,dsv4_cuda_backend_name());
+#else
+            snprintf(why,why_size,"%s device %d (%s, sm_%d%d): the generic kernels need sm_60 or newer",role[k],d,p[k].name,p[k].major,p[k].minor);
 #endif
+            return 0;}}
+    int ab=0,ba=0;
+    if((e=cudaDeviceCanAccessPeer(&ab,device,peer))!=cudaSuccess||(e=cudaDeviceCanAccessPeer(&ba,peer,device))!=cudaSuccess){cudaGetLastError();snprintf(why,why_size,"peer query %d<->%d: %s",device,peer,cudaGetErrorString(e));return 0;}
+    if(!ab||!ba){snprintf(why,why_size,"no peer access %d%s%d (P2P needs NVLink or a P2P-capable PCIe path; nvidia-smi topo -p2p r shows it)",ab?peer:device,!ab&&!ba?"<->":"->",ab?device:peer);return 0;}
+    for(int k=0;k<2;k++){int d=k?peer:device,set=(e=cudaSetDevice(d))==cudaSuccess;
+        if(set){cudaFuncAttributes fa;e=cudaFuncGetAttributes(&fa,(const void*)mv_fp4_grouped<4>);}
+        if(e==cudaSuccess)continue;
+        cudaGetLastError();if(k&&!ng&&cudaSetDevice(peer)==cudaSuccess)cudaDeviceReset();cudaGetLastError();
+        /* only these two mean "no code for this device"; a GPU that is full,
+         * held by an exclusive-process job or faulting gets no rebuild advice */
+        if(e!=cudaErrorNoKernelImageForDevice&&e!=cudaErrorInvalidDeviceFunction){
+            snprintf(why,why_size,"%s device %d (%s, sm_%d%d): cannot be used: %s: %s",role[k],d,p[k].name,p[k].major,p[k].minor,set?"kernel-image check":"cudaSetDevice",cudaGetErrorString(e));return 0;}
+#ifdef COLI_DSV4_DEEPGEMM
+        snprintf(why,why_size,"%s device %d (%s, sm_%d%d): %s (this %s build carries sm_120a code only; pair other cards with the generic build: no DEEPGEMM)",role[k],d,p[k].name,p[k].major,p[k].minor,cudaGetErrorString(e),dsv4_cuda_backend_name());
+#else
+        snprintf(why,why_size,"%s device %d (%s, sm_%d%d): %s (this build has no code for it; rebuild with a CUDA_ARCH that covers sm_%d%d, e.g. CUDA_ARCH=%s)",role[k],d,p[k].name,p[k].major,p[k].minor,cudaGetErrorString(e),p[k].major,p[k].minor,p[k].major<8?"portable-pre-ampere NO_TC=1":"portable");
+#endif
+        return 0;}
     return 1;}
 #if COLI_DSV4_TC
 static void plan_free(TcPlan*p){if(p->d)cublasLtMatrixLayoutDestroy(p->d);if(p->c)cublasLtMatrixLayoutDestroy(p->c);if(p->b)cublasLtMatrixLayoutDestroy(p->b);if(p->a)cublasLtMatrixLayoutDestroy(p->a);if(p->op)cublasLtMatmulDescDestroy(p->op);memset(p,0,sizeof(*p));}
@@ -1397,21 +1445,47 @@ static void tc_dev_free(Dev*c){for(int p=0;p<2;p++)plan_free(&c->plans[p]);if(c-
 #else
 static void tc_dev_free(Dev*){}
 #endif
-extern "C" void dsv4_cuda_shutdown(void){
-    for(int i=0;i<ng;i++){cudaSetDevice(g[i].id);if(g[i].decode_state)cudaFree(g[i].decode_state);
+/* Frees what g[0..n) holds -- a live backend, or whatever a failed init had
+ * set up when it stopped (a stream or handle it never created is 0) -- and
+ * zeroes the slots. */
+static void dev_release(int n){
+    for(int i=0;i<n;i++){cudaSetDevice(g[i].id);if(g[i].decode_state)cudaFree(g[i].decode_state);
 #ifdef COLI_DSV4_NCCL
         if(g[i].ep_comm)ncclCommDestroy(g[i].ep_comm);
 #endif
     }
-    for(int i=0;i<ng;i++){cudaSetDevice(g[i].id);if(g[i].dx)cudaFree(g[i].dx);if(g[i].dy)cudaFree(g[i].dy);if(g[i].p1)cudaFree(g[i].p1);if(g[i].p2)cudaFree(g[i].p2);if(g[i].p3)cudaFree(g[i].p3);if(g[i].p4)cudaFree(g[i].p4);if(g[i].aux1)cudaFree(g[i].aux1);if(g[i].aux2)cudaFree(g[i].aux2);if(g[i].aux3)cudaFree(g[i].aux3);if(g[i].mvdesc)cudaFree(g[i].mvdesc);if(g[i].expert_weights)cudaFree(g[i].expert_weights);if(g[i].expert_ids)cudaFree(g[i].expert_ids);if(g[i].tcw)cudaFree(g[i].tcw);if(g[i].tcs)cudaFree(g[i].tcs);if(g[i].tcx)cudaFree(g[i].tcx);if(g[i].tcxs)cudaFree(g[i].tcxs);if(g[i].tc_workspace)cudaFree(g[i].tc_workspace);
+    for(int i=0;i<n;i++){cudaSetDevice(g[i].id);if(g[i].dx)cudaFree(g[i].dx);if(g[i].dy)cudaFree(g[i].dy);if(g[i].p1)cudaFree(g[i].p1);if(g[i].p2)cudaFree(g[i].p2);if(g[i].p3)cudaFree(g[i].p3);if(g[i].p4)cudaFree(g[i].p4);if(g[i].aux1)cudaFree(g[i].aux1);if(g[i].aux2)cudaFree(g[i].aux2);if(g[i].aux3)cudaFree(g[i].aux3);if(g[i].mvdesc)cudaFree(g[i].mvdesc);if(g[i].expert_weights)cudaFree(g[i].expert_weights);if(g[i].expert_ids)cudaFree(g[i].expert_ids);if(g[i].tcw)cudaFree(g[i].tcw);if(g[i].tcs)cudaFree(g[i].tcs);if(g[i].tcx)cudaFree(g[i].tcx);if(g[i].tcxs)cudaFree(g[i].tcxs);if(g[i].tc_workspace)cudaFree(g[i].tc_workspace);
         if(g[i].emaj)cudaFree(g[i].emaj);if(g[i].emv1)cudaFree(g[i].emv1);if(g[i].emv2)cudaFree(g[i].emv2);if(g[i].emv4)cudaFree(g[i].emv4);if(g[i].emcount)cudaFree(g[i].emcount);if(g[i].mmv)cudaFree(g[i].mmv);if(g[i].mmvcount)cudaFree(g[i].mmvcount);
 #ifdef COLI_DSV4_DEEPGEMM
         if(g[i].dga1)cudaFree(g[i].dga1);if(g[i].dga2)cudaFree(g[i].dga2);if(g[i].dgsfa1)cudaFree(g[i].dgsfa1);if(g[i].dgsfa2)cudaFree(g[i].dgsfa2);if(g[i].dglayout)cudaFree(g[i].dglayout);if(g[i].dgrowmap)cudaFree(g[i].dgrowmap);if(g[i].dgmm1)cudaFree(g[i].dgmm1);if(g[i].dgmm2)cudaFree(g[i].dgmm2);if(g[i].dgref)cudaFree(g[i].dgref);if(g[i].dgdensews)cudaFree(g[i].dgdensews);
 #endif
-        tc_dev_free(&g[i]);if(g[i].hx)cudaFreeHost(g[i].hx);if(g[i].hy)cudaFreeHost(g[i].hy);if(g[i].ready)cudaEventDestroy(g[i].ready);if(g[i].fork)cudaEventDestroy(g[i].fork);if(g[i].join)cudaEventDestroy(g[i].join);cudaStreamDestroy(g[i].aux);cudaStreamDestroy(g[i].stream);
+        tc_dev_free(&g[i]);if(g[i].hx)cudaFreeHost(g[i].hx);if(g[i].hy)cudaFreeHost(g[i].hy);if(g[i].ready)cudaEventDestroy(g[i].ready);if(g[i].fork)cudaEventDestroy(g[i].fork);if(g[i].join)cudaEventDestroy(g[i].join);if(g[i].aux)cudaStreamDestroy(g[i].aux);if(g[i].stream)cudaStreamDestroy(g[i].stream);
         /* zero the slot: every buffer above is grown lazily through buf(), which
          * would cudaFree a stale pointer (and trust its cap) after a re-init */
-        memset(&g[i],0,sizeof g[i]);}ng=0;}
+        memset(&g[i],0,sizeof g[i]);}ng=0;
+    /* peer access ends with the contexts; a re-init records it afresh */
+    memset(g_peer,0,sizeof g_peer);}
+/* A failed init releases every device it touched (streams, events, cuBLASLt
+ * handles, buffers, peer records) and clears the runtime's last error, so a
+ * retry with fewer devices -- the engine's two-GPU fallback -- starts clean
+ * instead of leaking the first attempt and failing on its stale error. With
+ * several devices it names the one that failed (b < 0) or the link a -> b,
+ * and it also destroys the contexts of dev[1..n) (made by this init or by
+ * dsv4_cuda_peer_probe, holding nothing now): the fallback runs on dev[0]
+ * alone, or on the CPU, so those GPUs would otherwise keep ~0.3 GiB each for
+ * the whole run. dev[0]'s context stays for the retry. */
+static int init_fail(const int *dev,int n,int touched,int a,int b){
+    if(n>1&&a>=0){if(b<0)fprintf(stderr,"[DSV4 CUDA] device %d did not initialise\n",a);
+        else fprintf(stderr,"[DSV4 CUDA] peer access %d -> %d failed\n",a,b);}
+    dev_release(touched);
+    for(int i=1;i<n;i++)if(dev[i]!=dev[0]&&cudaSetDevice(dev[i])==cudaSuccess)cudaDeviceReset();
+    cudaGetLastError();return 0;}
+extern "C" int dsv4_cuda_init(const int *dev,int n){if(n<1||n>16)return 0;float scale[256];for(int b=0;b<256;b++)scale[b]=b?ldexpf(1.f,b-127):ldexpf(1.f,-127);ng=0;for(int i=0;i<n;i++){cudaDeviceProp p{};g[i].id=dev[i];if(!ok(cudaSetDevice(dev[i]),"select device")||!ok(cudaMemcpyToSymbol(e8_table,scale,sizeof(scale)),"scale table upload")||!ok(cudaGetDeviceProperties(&p,dev[i]),"device properties")||!ok(cudaStreamCreateWithFlags(&g[i].stream,cudaStreamNonBlocking),"stream")||!ok(cudaStreamCreateWithFlags(&g[i].aux,cudaStreamNonBlocking),"aux stream")||!ok(cudaEventCreateWithFlags(&g[i].ready,cudaEventDisableTiming),"device event")||!ok(cudaEventCreateWithFlags(&g[i].fork,cudaEventDisableTiming),"fork event")||!ok(cudaEventCreateWithFlags(&g[i].join,cudaEventDisableTiming),"join event")||!tc_dev_init(&g[i])||!ok(cudaMalloc(&g[i].decode_state,2*sizeof(int)),"decode state allocation"))return init_fail(dev,n,i+1,dev[i],-1);g[i].sms=p.multiProcessorCount;ng++;fprintf(stderr,"[DSV4 CUDA] device %d: %s %.1f GB sm_%d%d\n",dev[i],p.name,p.totalGlobalMem/1e9,p.major,p.minor);}for(int i=0;i<n;i++)for(int j=0;j<n;j++)if(i!=j){int can=0;if(!ok(cudaDeviceCanAccessPeer(&can,dev[i],dev[j]),"peer query"))return init_fail(dev,n,n,dev[i],dev[j]);if(can){if(!ok(cudaSetDevice(dev[i]),"select peer device"))return init_fail(dev,n,n,dev[i],dev[j]);cudaError_t e=cudaDeviceEnablePeerAccess(dev[j],0);if(e!=cudaSuccess&&e!=cudaErrorPeerAccessAlreadyEnabled){ok(e,"enable peer access");return init_fail(dev,n,n,dev[i],dev[j]);}if(e==cudaErrorPeerAccessAlreadyEnabled)cudaGetLastError();if(dev[i]>=0&&dev[i]<16&&dev[j]>=0&&dev[j]<16)g_peer[dev[i]][dev[j]]=1;}}
+#ifdef COLI_DSV4_NCCL
+    if(n==6)for(int pair=0;pair<3;pair++){int ids[2]={dev[2*pair],dev[2*pair+1]};ncclComm_t comm[2];if(!nok(ncclCommInitAll(comm,2,ids),"EP2 communicator init"))return init_fail(dev,n,n,-1,-1);g[2*pair].ep_comm=comm[0];g[2*pair+1].ep_comm=comm[1];}
+#endif
+    return 1;}
+extern "C" void dsv4_cuda_shutdown(void){dev_release(ng);}
 extern "C" Dsv4CudaActivation *dsv4_cuda_activation_create(int device,long long elements){Dev*c=ctx(device);if(!c||elements<1||!ok(cudaSetDevice(device),"select activation device"))return nullptr;Dsv4CudaActivation*a=(Dsv4CudaActivation*)calloc(1,sizeof(*a));if(!a)return nullptr;a->device=device;a->elements=elements;if(!alloc_ok(cudaMalloc(&a->data,(size_t)elements*sizeof(float)),"activation allocation")){free(a);return nullptr;}return a;}
 extern "C" void dsv4_cuda_activation_free(Dsv4CudaActivation*a){if(!a)return;cudaSetDevice(a->device);cudaFree(a->data);free(a);}
 extern "C" int dsv4_cuda_activation_upload(Dsv4CudaActivation*a,const float*x,long long n){Dev*c=a?ctx(a->device):nullptr;if(!c||!x||n<0||n>a->elements||!ok(cudaSetDevice(a->device),"select activation upload device"))return 0;return ok(cudaMemcpyAsync(a->data,x,(size_t)n*sizeof(float),cudaMemcpyHostToDevice,c->stream),"activation upload");}
@@ -1903,7 +1977,7 @@ extern "C" int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor
         const float *weights,int count,float limit,float *y,const float *x){
     if(count<1||count>16||!gate||!up||!down)return 0;Dsv4CudaTensor *t=gate[0];Dev*c=t?ctx(t->device):nullptr;
     if(!c||t->fmt!=4||!ok(cudaSetDevice(t->device),"select expert-group device"))return 0;int H=t->I,I=t->O;
-    for(int e=0;e<count;e++)if(!gate[e]||!up[e]||!down[e]||gate[e]->device!=t->device||up[e]->device!=t->device||down[e]->device!=t->device||gate[e]->fmt!=4||up[e]->fmt!=4||down[e]->fmt!=4||gate[e]->I!=H||gate[e]->O!=I||up[e]->I!=H||up[e]->O!=I||down[e]->I!=I||down[e]->O!=H)return 0;
+    for(int e=0;e<count;e++)if(!gate[e]||!up[e]||!down[e]||!dev_ok(t->device,gate[e]->device)||!dev_ok(t->device,up[e]->device)||!dev_ok(t->device,down[e]->device)||gate[e]->fmt!=4||up[e]->fmt!=4||down[e]->fmt!=4||gate[e]->I!=H||gate[e]->O!=I||up[e]->I!=H||up[e]->O!=I||down[e]->I!=I||down[e]->O!=H)return 0;
     size_t xb=(size_t)H*4,ib=(size_t)count*I*4,hb=(size_t)count*H*4;
     if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,(size_t)H*4)||
        !buf((void**)&c->p1,&c->p1cap,ib)||!buf((void**)&c->p2,&c->p2cap,ib)||
@@ -1959,10 +2033,13 @@ extern "C" int dsv4_cuda_expert_fp8(Dsv4CudaTensor *gate,Dsv4CudaTensor *up,Dsv4
 }
 extern "C" int dsv4_cuda_moe(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4CudaTensor *const *down,
         const float *weights,int count,Dsv4CudaTensor *sg,Dsv4CudaTensor *su,Dsv4CudaTensor *sd,float limit,float *y,const float *x){
-    if(count<1||count>16||!gate||!up||!down||!sg||!su||!sd)return 0;Dsv4CudaTensor*t=gate[0];Dev*c=t?ctx(t->device):nullptr;
-    if(!c||t->fmt!=4||sg->device!=t->device||su->device!=t->device||sd->device!=t->device||sg->fmt!=8||su->fmt!=8||sd->fmt!=8||!ok(cudaSetDevice(t->device),"select MoE device"))return 0;
+    /* Runs on the shared expert's device. Routed experts may live on a peer
+     * device (peer mirror pool): this device reads them in place over
+     * P2P/NVLink. */
+    if(count<1||count>16||!gate||!up||!down||!sg||!su||!sd)return 0;Dsv4CudaTensor*t=gate[0];Dev*c=ctx(sg->device);
+    if(!c||!t||t->fmt!=4||su->device!=sg->device||sd->device!=sg->device||sg->fmt!=8||su->fmt!=8||sd->fmt!=8||!ok(cudaSetDevice(sg->device),"select MoE device"))return 0;
     int H=t->I,I=t->O;if(sg->I!=H||sg->O!=I||su->I!=H||su->O!=I||sd->I!=I||sd->O!=H)return 0;
-    for(int e=0;e<count;e++)if(!gate[e]||!up[e]||!down[e]||gate[e]->device!=t->device||up[e]->device!=t->device||down[e]->device!=t->device||gate[e]->fmt!=4||up[e]->fmt!=4||down[e]->fmt!=4)return 0;
+    for(int e=0;e<count;e++)if(!gate[e]||!up[e]||!down[e]||!dev_ok(sg->device,gate[e]->device)||!dev_ok(sg->device,up[e]->device)||!dev_ok(sg->device,down[e]->device)||gate[e]->fmt!=4||up[e]->fmt!=4||down[e]->fmt!=4)return 0;
     size_t hb=(size_t)H*4,ib=(size_t)count*I*4,parts=(size_t)count*H*4;
     if(!buf((void**)&c->dx,&c->xcap,hb)||!buf((void**)&c->dy,&c->ycap,hb)||!buf((void**)&c->p1,&c->p1cap,ib)||
        !buf((void**)&c->p2,&c->p2cap,ib)||!buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,parts)||
