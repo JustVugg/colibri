@@ -1066,6 +1066,204 @@ static int test_expert_store_miss_scaling(void) {
     return 0;
 }
 
+/* VRAM-first decode (V4_GPU_RESIDENT_FIRST) as the hot store sees it, without
+ * a GPU: a routing served from VRAM reaches the saved history through
+ * note_vram but not the stats or the pin ranking's usage, and the vram_held
+ * hook keeps the experts it reports mirrored out of the RAM pins for as long
+ * as it reports them, in the repins a GPU-bank prefill's routing (note_union)
+ * fires too, while note_union still counts those experts in full. */
+static unsigned test_vram_held_mask;   /* bit e: expert e of layer 0 is in VRAM */
+static void test_vram_held(ColiExpertStore *store, int layer,
+                           unsigned char *held, int experts) {
+    (void)store;
+    for (int expert = 0; layer == 0 && expert < experts && expert < 32; expert++)
+        if (test_vram_held_mask >> expert & 1u) held[expert] = 1;
+}
+
+static int lookup_times(ColiExpertStore *store, int expert, int times) {
+    for (int i = 0; i < times; i++) {
+        ColiExpertView view;
+        if (coli_expert_lookup(store, (ColiExpertKey){0, expert}, &view)) {
+            fprintf(stderr, "vram-first fixture lookup failed: expert=%d\n", expert);
+            return -1;
+        }
+        coli_expert_release(store, &view);
+    }
+    return 0;
+}
+
+static int expect_pins(ColiExpertStore *store, int first, int second,
+                       const char *what) {
+    for (int expert = 0; expert < 8; expert++) {
+        int want = expert == first || expert == second;
+        if (coli_v4_test_expert_pinned(store, (ColiExpertKey){0, expert}) != want) {
+            fprintf(stderr, "%s: expected the RAM pins {%d, %d}, expert %d is %s\n",
+                    what, first, second, expert, want ? "not pinned" : "pinned");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Layer 0's books (usage, HITS, heat, the request clock, the pins) and the
+ * RAM cache's statistics. */
+typedef struct {
+    uint64_t usage[8], requests;
+    unsigned char hit[8], heat[8];
+    int pins[8];
+    ColiExpertStoreStats stats;
+} VramFirstBooks;
+
+static int vram_first_books(ColiExpertStore *store, VramFirstBooks *books) {
+    store->ops->stats(store, &books->stats);
+    if (coli_v4_test_expert_books(store, 0, books->usage, books->hit,
+                                  books->heat, &books->requests,
+                                  books->pins) != 2) {
+        fprintf(stderr, "vram-first: no hot store books\n");
+        return -1;
+    }
+    return 0;
+}
+
+/* What `what` moved from before to after: each expert's usage and heat by
+ * usage[] and heat[] (an expert it heats also has its HITS flag set; the
+ * others keep theirs), the request clock by `requests`, the RAM cache's
+ * statistics not at all. */
+static int vram_first_moved(const VramFirstBooks *before,
+                            const VramFirstBooks *after,
+                            const unsigned usage[8], const unsigned heat[8],
+                            uint64_t requests, const char *what) {
+    if (memcmp(&before->stats, &after->stats, sizeof(before->stats)) != 0) {
+        fprintf(stderr, "%s changed the RAM cache statistics\n", what);
+        return -1;
+    }
+    if (after->requests - before->requests != requests) {
+        fprintf(stderr, "%s advanced the request clock by %llu, expected %llu\n",
+                what, (unsigned long long)(after->requests - before->requests),
+                (unsigned long long)requests);
+        return -1;
+    }
+    for (int expert = 0; expert < 8; expert++) {
+        uint64_t used = after->usage[expert] - before->usage[expert];
+        int heated = after->heat[expert] - before->heat[expert];
+        if (used != usage[expert] || heated != (int)heat[expert]) {
+            fprintf(stderr, "%s: expert %d usage +%llu heat %+d, expected "
+                            "+%u +%u\n", what, expert, (unsigned long long)used,
+                    heated, usage[expert], heat[expert]);
+            return -1;
+        }
+        int hit = heat[expert] ? 1 : before->hit[expert];
+        if (after->hit[expert] != hit) {
+            fprintf(stderr, "%s: expert %d HITS flag %d, expected %d\n", what,
+                    expert, after->hit[expert], hit);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Three chunks of a GPU-bank prefill (note_union) while the hook reports
+ * experts 0 and 1 in VRAM. The bank does not read the mirrors, so each chunk
+ * counts every distinct member of its routing once, the mirrored experts
+ * included, and the RAM cache is not touched; the repins the chunks fire
+ * rank expert 6 up but leave 0 and 1 out. */
+static int vram_first_note_union(ColiExpertStore *store) {
+    static const int routing[] = {0, 6, 6, 1, 0, 9, -1, 6};   /* 9: no such expert */
+    static const unsigned counted[8] = {3, 3, 0, 0, 0, 0, 3, 0};
+    VramFirstBooks before, after;
+    if (vram_first_books(store, &before)) return -1;
+    for (int chunk = 0; chunk < 3; chunk++)
+        coli_v4_expert_store_note_union(store, 0, routing, 8);
+    if (vram_first_books(store, &after) ||
+        vram_first_moved(&before, &after, counted, counted, 9, "note_union"))
+        return -1;
+    /* usage 0: 9, 1: 8, 3: 3, 6: 3, 2: 2; 3 ranks before 6 by id */
+    return expect_pins(store, 3, 6, "note_union with experts 0 and 1 in VRAM");
+}
+
+static int test_expert_store_vram_first(void) {
+    char directory[] = "colibri-v4-vram-XXXXXX";
+    char path[256], history[300], error[256];
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "1", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    if (!mkdtemp(directory)) { perror("mkdtemp vram-first"); return 1; }
+    snprintf(path, sizeof(path), "%s/model.safetensors", directory);
+    snprintf(history, sizeof(history), "%s/.coli_usage", directory);
+    if (write_fixture_experts(path, 8) != 0) {
+        perror("write vram-first fixture");
+        rmdir(directory);
+        return 1;
+    }
+    /* eight slots, two pins, a repin on every lookup */
+    ColiDeepSeekV4ExpertStoreOptions options = {
+        directory, 1, 8, 8 * 51, 2, 1, 0, 0
+    };
+    ColiExpertStore *store = NULL;
+    if (coli_deepseek_v4_expert_store_open(&options, &store,
+                                            error, sizeof(error)) != 0) {
+        fprintf(stderr, "%s\n", error);
+        unlink(path); rmdir(directory);
+        return 1;
+    }
+    int failed = lookup_times(store, 0, 6) || lookup_times(store, 1, 5) ||
+                 lookup_times(store, 2, 2) || lookup_times(store, 3, 1) ||
+                 expect_pins(store, 0, 1, "store usage");
+    /* routings served from VRAM: heat, but no usage, requests or stats */
+    static const int served[] = {0, 1, 0, 5, 5, 5, 5, 5};
+    static const unsigned none[8] = {0}, heated[8] = {2, 1, 0, 0, 0, 10, 0, 0};
+    VramFirstBooks before, after;
+    if (!failed) failed = vram_first_books(store, &before);
+    coli_v4_expert_store_note_vram(store, 0, served, 8);
+    coli_v4_expert_store_note_vram(store, 0, served + 3, 5);
+    coli_v4_expert_store_note_vram(store, 7, served, 8);   /* no such layer */
+    if (!failed)
+        failed = vram_first_books(store, &after) ||
+                 vram_first_moved(&before, &after, none, heated, 0, "note_vram");
+    /* ten routings of expert 5 served from VRAM do not pin it in RAM */
+    if (!failed)
+        failed = lookup_times(store, 3, 1) ||
+                 expect_pins(store, 0, 1, "after note_vram");
+    coli_v4_expert_store_vram_held = test_vram_held;
+    test_vram_held_mask = 1u << 0 | 1u << 1;
+    if (!failed)
+        failed = lookup_times(store, 3, 1) ||
+                 expect_pins(store, 2, 3, "experts 0 and 1 in VRAM") ||
+                 vram_first_note_union(store);
+    coli_v4_expert_store_vram_held = NULL;
+    if (!failed)
+        failed = lookup_times(store, 3, 1) ||
+                 expect_pins(store, 0, 1, "experts 0 and 1 back out of VRAM");
+    store->ops->destroy(store);   /* saves the history */
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    /* lookups, the bank's three chunks and the routings noted from VRAM,
+     * layer 0 */
+    static const unsigned expected[8] = {11, 9, 2, 4, 0, 10, 3, 0};
+    unsigned counts[8] = {0};
+    FILE *file = fopen(history, "r");
+    if (!file) {
+        if (!failed) fprintf(stderr, "no expert history saved at %s\n", history);
+        failed = 1;
+    } else {
+        int layer, expert;
+        unsigned count;
+        while (fscanf(file, "%d %d %u", &layer, &expert, &count) == 3)
+            if (layer == 0 && expert >= 0 && expert < 8) counts[expert] = count;
+        fclose(file);
+        if (!failed && memcmp(counts, expected, sizeof(counts)) != 0) {
+            fprintf(stderr, "history counts %u %u %u %u %u %u %u %u, expected "
+                            "11 9 2 4 0 10 3 0\n", counts[0], counts[1], counts[2],
+                    counts[3], counts[4], counts[5], counts[6], counts[7]);
+            failed = 1;
+        }
+    }
+    unlink(history);
+    failed |= scratch_remove(directory, path);
+    if (failed) return 1;
+    puts("DeepSeek-V4 ExpertStore VRAM-first accounting: ok");
+    return 0;
+}
+
 /* REAP-style layout: per-matrix scale/weight pairs so contiguous_group()
  * fails and build_record() sets per_matrix=1. Payload is padded past 4 KiB
  * so an O_DIRECT window has a real aligned pread. */
@@ -2445,6 +2643,10 @@ int main(int argc, char **argv) {
     }
     if (test_expert_store_miss_scaling() != 0) {
         fprintf(stderr, "FAIL: test_expert_store_miss_scaling\n");
+        return 1;
+    }
+    if (test_expert_store_vram_first() != 0) {
+        fprintf(stderr, "FAIL: test_expert_store_vram_first\n");
         return 1;
     }
     if (test_expert_store_per_matrix_direct() != 0) {

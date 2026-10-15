@@ -758,6 +758,25 @@ void coli_v4_expert_store_note_union(ColiExpertStore *store, int layer,
 extern int (*coli_v4_expert_store_ram_first)(int layer, int expert);
 extern void (*coli_v4_expert_store_ram_gave)(void);
 
+/* VRAM-first decode (V4_GPU_RESIDENT_FIRST, the CUDA tier). An expert mirrored
+ * in VRAM is computed without a store lookup, so:
+ *   note_vram  counts the routings decode served from VRAM, once per
+ *              token-layer, where a lookup counts its routing (the .coli_usage
+ *              history, the dashboard's HITS and heat), but not as a request,
+ *              hit or miss (those describe the RAM cache) nor in the pin
+ *              ranking's usage and request clock (mirrored experts must
+ *              neither rank nor pace the RAM pins). No-op on another
+ *              ExpertStore backend.
+ *   vram_held  when set, marks held[expert] for each expert of `layer` that
+ *              decode would compute from VRAM, and the RAM pin ranking leaves
+ *              those out: a pin would hold a RAM slot that is never read.
+ *              Called with the store's lock held, from whichever thread looks
+ *              an expert up; NULL unless the CUDA tier set it at engine open. */
+void coli_v4_expert_store_note_vram(ColiExpertStore *store, int layer,
+                                    const int *experts, int count);
+extern void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
+                                              unsigned char *held, int experts);
+
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
 /* The routed-expert tier (vk_tier.c, Makefile.deepseek-v4 VK=1; cu_tier.c on a CUDA device). The MoE
  * units reach it through this table, which the engine's own unit fills when
@@ -989,11 +1008,12 @@ extern double g_v4_open_index_seconds;
  * verify, the KV_SLOTS mux) are left out. Per token-layer: calls, its wall
  * time from routing on, the wait for store fetches, the VRAM attach time and
  * the mirror uploads it caused, the fused/grouped GPU compute; per expert:
+ * computed from VRAM without a store lookup (V4_GPU_RESIDENT_FIRST) or
  * fetched from the store. */
 extern int g_v4_dec_counting;
 extern unsigned long long g_v4_dec_calls, g_v4_dec_uploads;
 extern double g_v4_dec_total_s, g_v4_dec_fetch_s, g_v4_dec_attach_s, g_v4_dec_gpu_s;
-extern unsigned long long g_v4_dec_store_fetches;
+extern unsigned long long g_v4_gpu_first_hits, g_v4_dec_store_fetches;
 
 #ifdef COLI_V4_GPU_TIER
 /* Provided by the COLI_V4_UNIT_GPU translation unit. Compiled in only on the
@@ -1104,6 +1124,9 @@ int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view);
 /* Mirror uploads so far (a new mirror, or a recycled one refilled), any cache:
  * the decode MoE counts the ones its own attaches cause. */
 unsigned long long coli_v4_gpu_expert_uploads(void);
+/* V4_GPU_RESIDENT_FIRST=1: decode computes an expert mirrored in VRAM without
+ * asking the store (block unit; the GPU unit reads it at engine open). */
+int coli_v4_gpu_resident_first(void);
 /* DSV4_HYBRID=1 gate plus its cross-unit counters/EMAs: defined in the block
  * unit, read by the serve unit's per-turn stderr line. */
 int coli_v4_hybrid_enabled(void);
@@ -1280,6 +1303,7 @@ int coli_v4_test_expert_books(ColiExpertStore *store, int layer,
                               uint64_t *usage, unsigned char *hit,
                               unsigned char *heat, uint64_t *requests,
                               int *pins);
+int coli_v4_test_expert_pinned(ColiExpertStore *store, ColiExpertKey key);
 void coli_v4_test_reset_direct_io_stats(void);
 uint64_t coli_v4_test_direct_reads(void);
 uint64_t coli_v4_test_direct_fallbacks(void);
