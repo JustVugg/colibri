@@ -40,23 +40,23 @@ class V4MirrorGuardSourceTest(unittest.TestCase):
     def test_probe_resets_the_grown_count(self):
         probe = find(self.body, "last_free_mb = dsv4_cuda_mem_free_mb(cache->device);")
         close = find(self.body, "}", probe)
-        self.assertIn("grown_bytes = 0;", self.body[probe:close])
+        self.assertIn("cache->grown_bytes = 0;", self.body[probe:close])
 
     def test_grown_mirrors_count_against_the_reserve(self):
-        self.assertRegex(self.body, r"grown_mb = \(grown_bytes \+ mirror_bytes")
+        self.assertRegex(self.body, r"grown_mb =\s*\(cache->grown_bytes \+ mirror_bytes")
         self.assertRegex(
             self.body,
-            r"cache->count >= 8 && last_free_mb - grown_mb < reserve_mb - margin_mb")
+            r"cache->count >= 8 &&\s*cache->last_free_mb - grown_mb < reserve_mb - margin_mb")
 
     def test_only_appended_slots_add_and_failures_clear(self):
         self.assertIn("found = cache->count++;\n            appended = 1;", self.body)
-        self.assertIn("if (appended) grown_bytes += mirror_bytes;", self.body)
-        fail = find(self.body, "upload_failed = 1;")
-        self.assertIn("grown_bytes = 0;", self.body[fail:fail + 80])
+        self.assertIn("if (appended) cache->grown_bytes += mirror_bytes;", self.body)
+        fail = find(self.body, "cache->upload_failed = 1;")
+        self.assertIn("cache->grown_bytes = 0;", self.body[fail:fail + 80])
 
     def test_bank_default_keeps_its_margin(self):
-        self.assertIn("long long margin_mb = v4_gpu_mirror_reserve_margin_mb(cache->count);",
-                      self.body)
+        self.assertRegex(self.body, r"long long margin_mb = cache->reserve_mb >= 0\s*\? 0\s*"
+                                    r": v4_gpu_mirror_reserve_margin_mb\(cache->count\);")
         text = SOURCE.read_text(encoding="utf-8")
         start = find(text, "static long long v4_gpu_mirror_reserve_margin_mb(int live) {")
         margin = text[start:find(text, "\n}\n", start)]
