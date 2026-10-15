@@ -1448,8 +1448,9 @@ extern "C" void dsv4_cuda_graph_free(Dsv4CudaGraph*g){if(!g)return;cudaSetDevice
  * c->stream does not wait for, and from pageable memory it may return before
  * the DMA has landed: a kernel queued on c->stream right after could read a
  * half-written decode mirror, and decode output then drifted with the mirror
- * cache's recycling timing (expert slabs past the 20 GiB page-lock cap,
- * or with DSV4_CUDA_PIN_HOST=0, are pageable). Same blocking contract for the caller as cudaMemcpy. */
+ * cache's recycling timing (expert slabs past DSV4_CUDA_PIN_CAP_GB, or all of
+ * them with DSV4_CUDA_PIN_HOST=0, are pageable). Same blocking contract for
+ * the caller as cudaMemcpy. */
 static int h2d(Dev*c,void*dst,const void*src,size_t n,const char*what){
     return ok(cudaMemcpyAsync(dst,src,n,cudaMemcpyHostToDevice,c->stream),what)&&ok(cudaStreamSynchronize(c->stream),what);}
 static int upload(Dsv4CudaTensor **pt,const void *w,size_t wb,const uint8_t *sc,size_t sb,int O,int I,int d,int fmt){if(*pt)return 1;Dev *c=ctx(d);if(!c||!ok(cudaSetDevice(d),"select upload device"))return 0;Dsv4CudaTensor *t=(Dsv4CudaTensor*)calloc(1,sizeof(*t));t->O=O;t->I=I;t->device=d;t->fmt=fmt;t->bytes=wb+sb;
@@ -2115,6 +2116,16 @@ struct PinRegion{uintptr_t base;size_t size;};
 static std::vector<PinRegion> g_pin_regions,g_pin_failed;
 static size_t g_pin_bytes;
 static int g_pin_enabled=-1;
+/* DSV4_CUDA_PIN_CAP_GB (20): total page-locked expert-slab bytes, in GiB. The
+ * RAM expert cache can exceed 20 GB (--ram 40 -> ~32 GB of slabs); slabs past
+ * the cap upload through pageable staging at roughly half the PCIe rate.
+ * Unset, empty, unparsable or NaN: 20; negative: 0 (nothing pinned); inf or
+ * anything above 1 PiB: 1 PiB, i.e. no cap (the size_t conversion of a larger
+ * double is undefined). */
+static size_t pin_cap_bytes(){
+    const char*e=getenv("DSV4_CUDA_PIN_CAP_GB");char*end=nullptr;double gb=e&&*e?strtod(e,&end):20.0;
+    if(e&&*e&&(end==e||gb!=gb))gb=20.0;if(gb<0)gb=0;if(gb>1048576.0)gb=1048576.0;
+    return (size_t)(gb*(double)(1ULL<<30));}
 static bool host_pinned(const void*p,size_t len){
     if(g_pin_enabled<0){const char*e=getenv("DSV4_CUDA_PIN_HOST");g_pin_enabled=!(e&&*e=='0');}
     if(!g_pin_enabled||!p||!len)return false;
@@ -2126,7 +2137,7 @@ static bool host_pinned(const void*p,size_t len){
     if(!VirtualQuery(p,&mbi,sizeof mbi)||mbi.State!=MEM_COMMIT)return false;
     uintptr_t base=(uintptr_t)mbi.BaseAddress;size_t size=mbi.RegionSize;
     if(a<base||a+len>base+size)return false;
-    static const size_t cap=(size_t)20<<30;
+    static const size_t cap=pin_cap_bytes();
     if(g_pin_bytes+size>cap){g_pin_failed.push_back({base,size});return false;}
     cudaError_t err=cudaHostRegister((void*)base,size,cudaHostRegisterPortable);
     if(err==cudaErrorHostMemoryAlreadyRegistered){cudaGetLastError();g_pin_regions.push_back({base,size});return true;}
@@ -2146,7 +2157,7 @@ static bool host_pinned(const void*p,size_t len){
     long page=sysconf(_SC_PAGESIZE);if(page<=0)page=4096;
     uintptr_t base=a&~((uintptr_t)page-1);
     size_t size=((a+len+page-1)&~((uintptr_t)page-1))-base;
-    static const size_t cap=(size_t)20<<30;
+    static const size_t cap=pin_cap_bytes();
     if(g_pin_bytes+size>cap){g_pin_failed.push_back({base,size});return false;}
     cudaError_t err=cudaHostRegister((void*)base,size,cudaHostRegisterPortable);
     if(err==cudaErrorHostMemoryAlreadyRegistered){cudaGetLastError();g_pin_regions.push_back({base,size});return true;}
