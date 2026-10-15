@@ -5,8 +5,8 @@ pins the shape that a CPU-only CI host can see:
 
 - the engine settles the peer pool BEFORE any init (DSV4_HYBRID=1 first, then
   the DSV4_CUDA_PEER_MIRRORS capacity, then dsv4_cuda_peer_probe), so a
-  refused peer is never initialised, and the probe checks the primary before
-  it touches the peer;
+  refused peer is never initialised, and the probe refuses a latched-off peer
+  and checks the primary before it touches the peer;
 - it never calls dsv4_cuda_shutdown() between the failed two-device init and
   the single-device retry (on Windows the loader's shutdown unloads the DLL);
 - with the peer unset the engine makes exactly one init,
@@ -91,7 +91,7 @@ class V4PeerInitSourceTest(unittest.TestCase):
     def test_probe_checks_before_any_context(self):
         probe = function_body(self.backend, 'extern "C" int dsv4_cuda_peer_probe(', "\n    return 1;}")
         order = [probe.index(s) for s in (
-            "cudaGetDeviceCount(", "peer==device",
+            "cudaGetDeviceCount(", "peer==device", "if(dev_lost(peer))",
             "cudaGetDeviceProperties(", "dsv4_cuda_backend_arch_ok(d)",
             "cudaDeviceCanAccessPeer(&ab,device,peer)", "cudaDeviceCanAccessPeer(&ba,peer,device)",
             "cudaSetDevice(d)", "cudaFuncGetAttributes(")]

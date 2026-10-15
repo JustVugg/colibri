@@ -210,6 +210,8 @@ typedef int             (*fn_expert_bank_slots)(int experts);
 typedef long long       (*fn_expert_bank_slot_bytes)(int hidden, int intermediate);
 typedef int             (*fn_peer_access)(int a, int b);
 typedef int             (*fn_peer_probe)(int device, int peer, char *why, int why_size);
+typedef int             (*fn_peer_compute)(int device, int peer);
+typedef int             (*fn_peer_healthy)(int device);
 typedef Dsv4CudaExpertSet *(*fn_expert_bank_create)(int count, int hidden, int intermediate, int device,
                                                     Dsv4CudaTensor *shared_gate, Dsv4CudaTensor *shared_up,
                                                     Dsv4CudaTensor *shared_down);
@@ -334,6 +336,8 @@ static struct {
     fn_expert_bank_slot_bytes expert_bank_slot_bytes; /* optional (older DLLs) */
     fn_peer_access peer_access; /* optional (older DLLs: no peer mirror pool) */
     fn_peer_probe peer_probe;   /* optional (older DLLs: no peer mirror pool) */
+    fn_peer_compute peer_compute; /* optional (older DLLs: reported as in-place reads) */
+    fn_peer_healthy peer_healthy; /* optional (older DLLs: never latch a peer off) */
     fn_expert_bank_upload expert_bank_upload;
     fn_expert_bank_set_shared expert_bank_set_shared;
     fn_expert_bank_upload_tp2 expert_bank_upload_tp2;
@@ -535,6 +539,8 @@ static int dsv4_cuda_resolve(const char *dllname){
     g_dsv4.expert_bank_slot_bytes = (fn_expert_bank_slot_bytes)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slot_bytes");
     g_dsv4.peer_access = (fn_peer_access)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_access");
     g_dsv4.peer_probe = (fn_peer_probe)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_probe");
+    g_dsv4.peer_compute = (fn_peer_compute)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_compute");
+    g_dsv4.peer_healthy = (fn_peer_healthy)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_healthy");
     g_dsv4.backend_name = (fn_backend_name)GetProcAddress(g_dsv4.dll, "dsv4_cuda_backend_name");
     _Pragma("GCC diagnostic pop")
     return 1;
@@ -983,6 +989,14 @@ int dsv4_cuda_peer_probe(int device, int peer, char *why, int why_size){
         return 0;
     }
     return g_dsv4.peer_probe(device, peer, why, why_size);
+}
+
+int dsv4_cuda_peer_compute(int device, int peer){
+    return g_dsv4.available && g_dsv4.peer_compute ? g_dsv4.peer_compute(device, peer) : 0;
+}
+
+int dsv4_cuda_peer_healthy(int device){
+    return g_dsv4.available && g_dsv4.peer_healthy ? g_dsv4.peer_healthy(device) : 1;
 }
 
 int dsv4_cuda_expert_bank_slots(int experts){
