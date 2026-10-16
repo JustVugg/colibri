@@ -1,0 +1,112 @@
+{%- set _sv_reasoning_effort = reasoning_effort | default(none) -%}
+{%- set _sv_thinking_disabled = false -%}
+{%- if _sv_reasoning_effort is not none -%}
+    {%- set _sv_thinking_disabled = _sv_reasoning_effort == 'none' -%}
+{%- elif enable_thinking is defined and enable_thinking is false -%}
+    {%- set _sv_thinking_disabled = true -%}
+{%- endif -%}
+{%- set _sv_no_reasoning_sentence = "Reasoning is disabled. Proceed straight to answering according to the user's instructions." -%}
+{%- set _sv_low_reasoning_sentence = "Reasoning effort is set to low. Think briefly through only the essential steps in the user's language, then proceed directly to the answer." -%}
+{%- set _sv_medium_reasoning_sentence = "Reasoning effort is set to medium. Think through the task methodically in the user's language, check key assumptions, and provide a well-supported answer." -%}
+{%- set _sv_high_reasoning_sentence = "Reasoning effort is set to high. Think carefully through the task in the user's language, validate key assumptions, consider plausible alternatives, and prioritize correctness and clarity." -%}
+{%- set _sv_reasoning_sentence = _sv_high_reasoning_sentence -%}
+{%- if _sv_thinking_disabled -%}
+    {%- set _sv_reasoning_sentence = _sv_no_reasoning_sentence -%}
+{%- elif _sv_reasoning_effort in ['minimal', 'low'] -%}
+    {%- set _sv_reasoning_sentence = _sv_low_reasoning_sentence -%}
+{%- elif _sv_reasoning_effort == 'medium' -%}
+    {%- set _sv_reasoning_sentence = _sv_medium_reasoning_sentence -%}
+{%- elif _sv_reasoning_effort in ['high', 'xhigh', 'max'] or _sv_reasoning_effort is none -%}
+    {%- set _sv_reasoning_sentence = _sv_high_reasoning_sentence -%}
+{%- endif -%}
+{%- set _sv_has_system = messages | length > 0 and messages[0].role == 'system' -%}
+{%- if tools or _sv_reasoning_sentence is not none or _sv_has_system %}
+    {{- '<|im_start|>system\n' }}
+    {%- if _sv_has_system %}
+        {{- messages[0].content }}
+    {%- endif %}
+    {%- if _sv_reasoning_sentence is not none %}
+        {%- if _sv_has_system %}{{- '\n\n' }}{%- endif %}
+        {{- '# Reasoning effort\n\n' + _sv_reasoning_sentence }}
+    {%- endif %}
+    {%- if tools %}
+        {%- if _sv_has_system or _sv_reasoning_sentence is not none %}{{- '\n\n' }}{%- endif %}
+        {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+        {%- for tool in tools %}
+            {{- "\n" }}
+            {{- tool | tojson }}
+        {%- endfor %}
+        {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>" }}
+    {%- endif %}
+    {{- '<|im_end|>\n' }}
+{%- endif %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" and message.content is string and not(message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}
+        {%- set ns.multi_step_tool = false %}
+        {%- set ns.last_query_index = index %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+        {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set content = message.content if message.content is string else '' %}
+        {%- set reasoning = none %}
+        {%- if message.reasoning is defined and message.reasoning is not none %}
+            {%- set reasoning = message.reasoning %}
+        {%- elif message.reasoning_content is defined and message.reasoning_content is not none %}
+            {#- Deprecated vLLM compatibility. Prefer the `reasoning` field. -#}
+            {%- set reasoning = message.reasoning_content %}
+        {%- elif content is string and '</think>' in content %}
+            {%- set reasoning = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+            {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+        {%- endif %}
+        {{- '<|im_start|>' + message.role + '\n' }}
+        {%- if (loop.index0 > ns.last_query_index) or (preserve_thinking is defined and preserve_thinking is true) %}
+            {{- '<think>\n' }}
+            {%- if reasoning is not none and reasoning | trim %}
+                {{- reasoning.strip('\n') }}
+            {%- endif %}
+            {{- '\n</think>\n\n' }}
+        {%- endif %}
+        {{- content.lstrip('\n') }}
+        {%- if message.tool_calls %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if (loop.first and content) or (not loop.first) %}
+                    {{- '\n' }}
+                {%- endif %}
+                {%- if tool_call.function %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '<tool_call>\n{"name": "' }}
+                {{- tool_call.name }}
+                {{- '", "arguments": ' }}
+                {%- if tool_call.arguments is string %}
+                    {{- tool_call.arguments }}
+                {%- else %}
+                    {{- tool_call.arguments | tojson }}
+                {%- endif %}
+                {{- '}\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- message.content }}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if _sv_thinking_disabled %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- endif %}
+{%- endif %}

@@ -1,0 +1,15 @@
+{
+  "schema": "kolibri1-reference-migration-1",
+  "what": "Record of the one change to the vendored reference after kolibri1_tiny/ref.json was generated.",
+  "original_source_sha256": "6a5eda85b5fbe2f6b259147ffab981f30de694e9b9aede8e9eabcdf876af1a53",
+  "original_source_note": "the byte-form of kolibri1_ref.py the numbers in kolibri1_tiny/ref.json were generated with (project commit 6787846a; header named the file 'R2' and cited project documents)",
+  "current_source_sha256": "3591275eb00759ffcf0e8f42a41ba5edb491c85f54b84dd192bc3a106d4a9114",
+  "current_source_note": "file identity of tools/kolibri1_reference/kolibri1_ref.py in this tree (also in PROVENANCE.json)",
+  "normalisation_procedure": "parse both files with Python's ast module; delete the leading docstring of the module and of every function and class (replaced by pass if it was the only statement); compare ast.dump() of the two trees. Comments are not in the AST.",
+  "executable_ast_equal": true,
+  "numerical_payload_sha256": "ff4e3fb4c2fa1b14a2714731d46a084dbfa956d714d5174e7d20bc8495acbf11",
+  "numerical_payload_definition": "sha256 of json.dumps(sorted keys, compact separators) of kolibri1_tiny/ref.json without the keys oracle, r2_sha256, r2_provenance, reference_sha256, reference_provenance, generation_source_sha256, generation_provenance. Identical for the original ref.json and the current one.",
+  "numerical_payload_unchanged": true,
+  "regenerated": false,
+  "statement": "The numbers in kolibri1_tiny/ref.json were retained, not regenerated, with the edited source. Regenerating with tools/make_kolibri1_ref.py on a host with torch (pinned versions in PROVENANCE.json) would confirm them."
+}

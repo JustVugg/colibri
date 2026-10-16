@@ -17,6 +17,8 @@
 
 目前有十三个引擎可以运行。其中十个用于语言模型：**GLM-5.2/5.3**、**GLM-5.3-Flash**、**Inkling**、**Kimi K3**、**DeepSeek V4 Flash**、**DeepSeek V4.1 Flash**、**MiMo-V2.6 Flash**（以及 Pro）、**Qwen3.8-Flash-Next**、**Qwen3.6**（它也能运行 Qwen3-Coder 和稠密的 Qwen3.8-27B）以及 **OLMoE**。一个用于生成图片：**Qwen-Image-2.1**。两个用于回答决策问题：**Laya** 和 **GLiNER2.5-Decide**，第三个决策模型 **Clef** 运行在 Qwen3.6 引擎上。[我的机器适合哪一个](#which-model-for-my-machine)
 
+**Kolibri-1**（kolibri1.c，`make kolibri1`）作为实验性语言模型引擎已在代码树中：微型夹具以及注册表/网关已测试，真实权重的验证尚未完成，因此不计入上面的数量。
+
 ```
 $ ./coli chat
   colibri v2.0.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU

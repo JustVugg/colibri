@@ -3,6 +3,17 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Models
+
+- **Kolibri-1 (experimental, CPU only)**: a `kolibri1` engine for Aleph Alpha's Kolibri-1
+  (50 layers, 384 experts top-6, FP8 checkpoint read as released), its family descriptor in
+  `c/family_registry.py`, gateway support (chat template, Hermes tool calls, sampling
+  defaults, `SERVE=1`) and a tiny random fixture with a committed reference that runs in CI
+  without torch (`make -C c kolibri1-check`). Qualification on the real checkpoint is
+  incomplete; see [docs/kolibri1.md](docs/kolibri1.md).
+
 ## [2.0.0] - 2026-10-06
 
 169 pull requests since v1.12.1, 88 of them from contributors. Every MoE

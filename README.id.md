@@ -29,6 +29,8 @@ dense Qwen3.8-27B), serta **OLMoE**. Satu menghasilkan gambar:
 **Laya** dan **GLiNER2.5-Decide**, dengan model keputusan ketiga, **Clef**, pada
 engine Qwen3.6. [Mana yang cocok untuk mesin saya](#which-model-for-my-machine)
 
+**Kolibri-1** (kolibri1.c, `make kolibri1`) ada di pohon kode sebagai engine bahasa eksperimental: berjalan pada fixture kecil dan bagian registri/gateway sudah diuji, kualifikasi pada bobot asli belum lengkap, sehingga tidak dihitung di atas.
+
 ```
 $ ./coli chat
   colibri v2.0.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU

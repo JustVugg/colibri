@@ -41,6 +41,7 @@ FILES = [
     "deepseek_v4", "deepseek_v4.exe", "deepseek_v4.cflags", "deepseek_v4.cudaflags",
     "deepseek_v41", "deepseek_v41.exe",
     "mimo", "mimo.exe",
+    "kolibri1", "kolibri1.exe",
     "qwenimage", "qwenimage.exe",
     "laya", "laya.exe",
     "gliner_decide", "gliner_decide.exe",

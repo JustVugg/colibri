@@ -28,6 +28,8 @@ Oggi girano tredici motori. Dieci sono per modelli linguistici: **GLM-5.2/5.3**,
 **Laya** e **GLiNER2.5-Decide**, con un terzo modello di decisione, **Clef**, sul
 motore Qwen3.6. [Quale scegliere per la mia macchina](#which-model-for-my-machine)
 
+**Kolibri-1** (kolibri1.c, `make kolibri1`) e' nell'albero come motore linguistico sperimentale: gira sulla fixture minuscola e la parte registro/gateway e' testata, la qualificazione sui pesi reali e' ancora in corso, quindi non e' contato sopra.
+
 ```
 $ ./coli chat
   colibri v2.0.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
