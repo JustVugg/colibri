@@ -927,6 +927,14 @@ static void emit_openai_result(const int *out, int np, int n_new, int stream){
 #include "edge_adapter_internal.h"
 #endif
 
+/* The state file named by the setting `env`, or <snap>/<name>. */
+static char *q38_state_path(const char *snap, const char *env, const char *name) {
+    const char *given = getenv(env);
+    char *path = given && *given ? q38_format_alloc("%s", given) : q38_format_alloc("%s/%s", snap, name);
+    if (!path) { fprintf(stderr, "OOM path of %s\n", name); exit(1); }
+    return path;
+}
+
 /* Qwen3.8 routes every transformer layer; the MTP row (index c.layers) is
  * kept only when the head is attached and routes too. Keep the
  * process-global route_trace owner in the CLI/serve model only; segment
@@ -935,13 +943,97 @@ static void emit_openai_result(const int *out, int np, int n_new, int stream){
 static void q38_telemetry_init(const char *snap, const Model *m) {
     rt_init("qwen38", m->c.layers, m->c.experts);
     if (!m->mtp) rt_drop_row(m->c.layers);
-    const char *up = getenv("COLI_USAGE");
-    if (up && *up) snprintf(g_q38_usage, sizeof g_q38_usage, "%s", up);
-    else snprintf(g_q38_usage, sizeof g_q38_usage, "%s/.coli_usage", snap);
+    char *usage = q38_state_path(snap, "COLI_USAGE", ".coli_usage");
+    snprintf(g_q38_usage, sizeof g_q38_usage, "%s", usage);
+    free(usage);
     int64_t h = rt_load(g_q38_usage);
     if (h > 0)
         fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n",
                 (long long)h, g_q38_usage);
+}
+
+/* Creates the draft list (draft_vocab.h) when the head can use one: Q38_MTP_VOCAB is above 0,
+ * Q38_MTP_DUMP is unset (the dump contains the logits of the whole vocabulary), the lm_head
+ * has int8 rows on the host and the counts file is not the file of the expert history, which the
+ * counts would replace. It runs after the trunk is int8 and before COLI_VK_DENSE_HOST releases
+ * host copies, so the lm_head rows can stay on the host. */
+static void q38_vocab_decide(Model *m, const char *snap) {
+    if (!m->mtp) return;
+    int top = q38_env_int_in_range("Q38_MTP_VOCAB", DRAFT_VOCAB_DEFAULT_TOP, 0, m->c.vocab);
+    if (!top || g_q38_mtp_dump) return;
+    if (!m->lm_head.q8) {
+        fprintf(stderr, "[qwen38 MTP] draft vocabulary: the lm_head has no int8 rows on the host, "
+                        "so the head scores the whole vocabulary (Q38_MTP_VOCAB=0 silences this)\n");
+        return;
+    }
+    char *counts = q38_state_path(snap, "COLI_VOCAB_USAGE", ".coli_vocab");
+    char *usage = q38_state_path(snap, "COLI_USAGE", ".coli_usage");
+    int same = coli_own_same_path(counts, usage);
+    if (same)
+        fprintf(stderr, "[qwen38 MTP] draft vocabulary off, the head scores the whole vocabulary: "
+                        "COLI_VOCAB_USAGE and COLI_USAGE are the same file, %s. Set COLI_VOCAB_USAGE "
+                        "to another file.\n", counts);
+    free(counts);
+    free(usage);
+    if (same) return;
+    if (!(m->draft_vocab = draft_vocab_new(m->c.vocab, top))) { fprintf(stderr, "OOM draft vocabulary\n"); exit(1); }
+}
+
+/* Reads the token counts of the draft list from <snap>/.coli_vocab or COLI_VOCAB_USAGE. */
+static void q38_vocab_init(const char *snap, Model *m) {
+    DraftVocab *v = m->draft_vocab;
+    if (!v) return;
+    char *path = q38_state_path(snap, "COLI_VOCAB_USAGE", ".coli_vocab");
+    fprintf(stderr, "[qwen38 MTP] draft vocabulary: top %d + %d/%d rule + conversation, ",
+            v->top, DRAFT_VOCAB_NEAR_NUM, DRAFT_VOCAB_NEAR_DEN);
+    double tokens; int distinct;
+    switch (draft_vocab_load(v, path)) {
+    case DRAFT_VOCAB_LOADED:
+        draft_vocab_totals(v, &tokens, &distinct);
+        fprintf(stderr, "counts from %s (%.0f tokens, %d distinct)\n", v->path, tokens, distinct);
+        break;
+    case DRAFT_VOCAB_NO_FILE:
+        fprintf(stderr, "no counts file at %s yet\n", v->path);
+        break;
+    case DRAFT_VOCAB_NOT_COUNTS:
+        fprintf(stderr, "%s cannot be read as a counts file\n", v->path);
+        break;
+    case DRAFT_VOCAB_OTHER_SIZE:
+        fprintf(stderr, "%s has counts for another vocabulary size\n", v->path);
+        break;
+    case DRAFT_VOCAB_DAMAGED:
+        draft_vocab_totals(v, &tokens, &distinct);
+        fprintf(stderr, "counts from %s up to a damaged record, after %d records (%.0f tokens, %d distinct)\n",
+                v->path, v->records, tokens, distinct);
+        break;
+    }
+}
+
+static void q38_vocab_save(const Model *m) {
+    DraftVocab *v = m->draft_vocab;
+    if (!v || !rt_save_enabled()) return;
+    double tokens; int distinct;
+    draft_vocab_totals(v, &tokens, &distinct);
+    switch (draft_vocab_save(v)) {
+    case DRAFT_VOCAB_SAVED:
+        fprintf(stderr, "[STATS] %.0f tokens across %d distinct -> %s\n", tokens, distinct, v->path);
+        break;
+    case DRAFT_VOCAB_LEFT_ALONE:
+        fprintf(stderr, "[STATS] no counts are written to %s. Set COLI_VOCAB_USAGE to use another file.\n", v->path);
+        break;
+    case DRAFT_VOCAB_NOT_SAVED:
+        fprintf(stderr, "[STATS] the draft vocabulary counts were not written to %s. Make the directory "
+                        "writable, or point COLI_VOCAB_USAGE at a file that is.\n", v->path);
+        break;
+    }
+}
+
+static void q38_vocab_report(const Model *m, const char *scope) {
+    if (!m->draft_vocab) return;
+    DraftVocabSummary s = draft_vocab_summary(m->draft_vocab);
+    fprintf(stderr, "[qwen38 MTP] %s: draft list %.0f tokens on average, %.1f%% of picks inside, "
+                    "%llu ids appended, %llu rebuilds\n", scope, s.average_list_tokens, s.inside_percent,
+            (unsigned long long)s.appended, (unsigned long long)s.rebuilds);
 }
 
 static int q38_context_total(const Cfg *c, int prompt_tokens, int new_tokens,
@@ -1078,6 +1170,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     float *logit = step(m, prompt, np, 0);
     q38_tm_snapshot_prefill(m);        /* COLI_TIMERS: decode bank starts here */
     Q38Spec *sp = &g_q38_run_spec;
+    if (m->draft_vocab) draft_vocab_begin(m->draft_vocab, prompt, np, 0);
     *sp = q38_spec_begin(m, prompt, np);   /* Q38_MTP=1, COLI_LOOKUP=1: drafts, every token still the argmax below */
     int len = np;
     for (int s = 0; s < n_new; s++) {
@@ -1096,6 +1189,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
             free(logit); out[len++] = best; break;
         }
         free(logit); out[len++] = best;
+        if (m->draft_vocab) draft_vocab_count_token(m->draft_vocab, best);
         logit = q38_spec_step(m, sp, best, len - 1, n_new - 1 - s);
     }
     q38_spec_end(m, sp);
@@ -1877,6 +1971,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         fprintf(stderr,"[qwen38 prefix] cache disabled for request %s (state snapshot unavailable)\n",q->id);
     if(getenv("Q38_PREFIX_LOG"))
         fprintf(stderr,"[qwen38 prefix] request=%s reused=%d/%d\n",q->id,reuse,np);
+    if(m->draft_vocab)draft_vocab_begin(m->draft_vocab,ids,np,reuse);
     *ids_out=ids; *np_out=np; *lo_out=lo;
     return 1;
 }
@@ -1935,6 +2030,7 @@ static int serve_one(Model *m, ServeReq *q){
          * is restored on the next request, so stepping here would only run a
          * full discarded decode pass. */
         if(s == q->max_tok - 1) break;
+        if(m->draft_vocab)draft_vocab_count_token(m->draft_vocab,tk);
         lo = q38_spec_step(m, &spec, tk, np+s, q->max_tok-1-s);
     }
     q38_spec_end(m, &spec);
@@ -1967,7 +2063,7 @@ static int serve_one(Model *m, ServeReq *q){
     fflush(stdout);
     serve_hits(m);
     q38_tm_report_bank(&timers,"request");
-    {char scope[96];snprintf(scope,sizeof scope,"turn %s",q->id);q38_spec_report(m,&spec,scope);}
+    {char scope[96];snprintf(scope,sizeof scope,"turn %s",q->id);q38_spec_report(m,&spec,scope);q38_vocab_report(m,scope);}
     q38_spec_free(&spec);
     return input_eof?-1:0;
 }
@@ -2226,17 +2322,19 @@ static void q38_vk_tier_start(Model *m, int cap);   /* below: the Vulkan routed-
  * the trunk goes up now, so the tier sees it placed. */
 static void q38_dho_start(Model *m) {
     if(!g_vk_ready)return;
+    g_q38_dho_model=m;
     size_t bytes=0; int n=0,layers=m->c.layers,head=1,dev=(g_vk_chain||g_vk_dense)&&!qt_ready();
     q38c_dho_bound(&layers,&head,&dev);   /* a partial chain: its N layers' matrices only (qwen38_chain.h) */
     q38_dho_each(m,q38_dho_count,&bytes,&n,layers,head);
     if(!coli_vk_dense_host_decide("qwen38",dev,bytes))return;
-    g_q38_dho_model=m;
     g_vk_dense=1;   /* the steps the chain declines run their matrices on the device too: the CPU has none */
     bytes=0; n=0;
     /* the full chain fitted: layer by layer, each dropped once all of it is on the device */
     if(!q38c_dho_place(m,&bytes,&n))q38_dho_each(m,q38_dho_drop,&bytes,&n,layers,head);
     q38c_dho_layers();
-    coli_vk_dense_host_placed("qwen38","the embedding (its rows are gathered on the CPU), the vision tower, norms");
+    coli_vk_dense_host_placed("qwen38",m->draft_vocab
+        ? "the embedding (its rows are gathered on the CPU), the lm_head's int8 rows (the MTP draft list is scored from them), the vision tower, norms"
+        : "the embedding (its rows are gathered on the CPU), the vision tower, norms");
 }
 #endif
 
@@ -2375,6 +2473,11 @@ int main(int argc, char **argv) {
                 g_q38_mux_slots);
     }
     q38_trunk_cpu_int8(&m);    /* the trunk's int8 rows on the CPU, BF16 released (Q38_TRUNK_CPU_INT8=0 keeps BF16) */
+    if(m.mtp&&getenv("Q38_MTP_DUMP")&&*getenv("Q38_MTP_DUMP")){
+        g_q38_mtp_dump=fopen(getenv("Q38_MTP_DUMP"),"wb");
+        if(!g_q38_mtp_dump){perror(getenv("Q38_MTP_DUMP"));return 1;}
+    }
+    q38_vocab_decide(&m, snap);   /* the draft list or the whole vocabulary, before COLI_VK_DENSE_HOST releases the lm_head rows */
     q38_expert_report(&m, cap);         /* expert format, bytes per expert, what the cache costs */
 #ifdef COLI_VULKAN
     /* After the trunk is int8: those rows upload at their first matmul. No
@@ -2399,11 +2502,8 @@ int main(int argc, char **argv) {
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
     if(is_ref){g_q38_mtp_oracle=full;g_q38_mtp_oracle_n=nfull;}   /* Q38_MTP_FORCE=accept|mixed */
-    if(m.mtp&&getenv("Q38_MTP_DUMP")&&*getenv("Q38_MTP_DUMP")){
-        g_q38_mtp_dump=fopen(getenv("Q38_MTP_DUMP"),"wb");
-        if(!g_q38_mtp_dump){perror(getenv("Q38_MTP_DUMP"));return 1;}
-    }
     q38_telemetry_init(snap, &m);
+    q38_vocab_init(snap, &m);
 #ifdef COLI_VULKAN
     q38_vk_tier_start(&m, cap);   /* COLI_VULKAN=1: hot routed experts on the device (vk_tier.c) */
     if(g_vk_ready&&!vkt_ready()&&!g_vk_dense)g_vk_dense=coli_vk_dense_decide("qwen38",0,1);   /* no tier after all */
@@ -2420,6 +2520,7 @@ int main(int argc, char **argv) {
         coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&m);
         rt_save(g_q38_usage, 0);
+        q38_vocab_save(&m);
         q38_prefix_cache_release(&m);
         q38_model_free(&m); free_tokenizer(); rt_destroy();
         return 0;
@@ -2441,6 +2542,7 @@ int main(int argc, char **argv) {
         vkt_report("run", m.hits, m.miss);
 #endif
         rt_save(g_q38_usage,0);
+        q38_vocab_save(&m);
         q38_model_free(&m); free(prompt); free(full); json_free(ref_root);
         free(buf); free(arena); free_tokenizer(); rt_destroy(); return 0;
     }
@@ -2511,6 +2613,7 @@ int main(int argc, char **argv) {
     double tot = m.hits + m.miss;
     if (g_ttft >= 0) fprintf(stderr, "TTFT: %.2f s (time to first token)\n", g_ttft);
     q38_spec_report(&m, &g_q38_run_spec, "run");
+    q38_vocab_report(&m, "run");
     q38_spec_free(&g_q38_run_spec);
     if (g_q38_mtp_dump) { fclose(g_q38_mtp_dump); g_q38_mtp_dump = NULL; }
     tm_report(&m);
@@ -2525,6 +2628,7 @@ int main(int argc, char **argv) {
     vkt_report("run", m.hits, m.miss);
 #endif
     rt_save(g_q38_usage, 0);
+    q38_vocab_save(&m);
     free(g_last_logit); g_last_logit=NULL;
     q38_model_free(&m); free(out); free(prompt); free(full); json_free(ref_root);
     free(buf); free(arena); free_tokenizer(); rt_destroy();

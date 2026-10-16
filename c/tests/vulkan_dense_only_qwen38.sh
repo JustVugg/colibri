@@ -23,6 +23,8 @@ dho_family_qwen38() {
   # the MTP head's matrices run per matrix on the device here (on the CPU with the host
   # copies kept on this device): tokens and the CPU's logits
   dho_gate qwen38 "dense-only qwen38 MTP mixed" 1 Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  # the draft list is scored from the int8 rows of the lm_head, which are left on the host
+  dho_gate qwen38 "dense-only qwen38 MTP draft list" 0 Q38_MTP=1 Q38_MTP_FORCE=mixed Q38_TRUNK_MIN_KB=0 USAGE_SAVE=0 SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
   # prompts on the chain, decode on the per-matrix path: the device's in this mode
   CHAINMODE=2 dho_gate qwen38 "dense-only qwen38 prompts only" 1 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
   CHAINMODE=0 dho_gate qwen38 "dense-only qwen38 per-matrix path" 2 Q38_TRUNK_MIN_KB=0 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json

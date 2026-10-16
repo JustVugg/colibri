@@ -450,6 +450,11 @@ static void matmul_i4_idot_mm(float *y, const int8_t *xq, const float *sx, const
 #endif
 
 /* ---- IDOT dispatch (int8-quantized activations) --------------------------- */
+/* One output of the integer kernel: the dot of an int8 row with a quantized activation row,
+ * times the row's scale and the activation's scale. */
+static inline float dot_i8i8_scaled(const int8_t *w, const int8_t *x, int I, float scale, float sx){
+    return (float)dot_i8i8(w,x,I)*scale*sx;
+}
 static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
                           const float *scale, int S, int I, int O){
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
@@ -457,7 +462,14 @@ static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int
 #endif
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
-        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=dot_i8i8_scaled(w,xq+(int64_t)s*I,I,sc,sx[s]); }
+}
+/* matmul_q_idot for one activation row (S = 1) and only the rows ids[0..n) of q: y[j] is
+ * the output of row ids[j]. */
+static void matmul_q_idot_rows(float *y, const int8_t *xq, float sx, const int8_t *q,
+                               const float *scale, const int *ids, int n, int I){
+    #pragma omp parallel for schedule(static)
+    for(int j=0;j<n;j++) y[j]=dot_i8i8_scaled(q+(int64_t)ids[j]*I,xq,I,scale[ids[j]],sx);
 }
 static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
                            const float *scale, int S, int I, int O){

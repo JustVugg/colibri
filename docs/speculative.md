@@ -91,6 +91,29 @@ standing rows' streams, each with the token that followed it.
 `auto` to let the gate pick 0 to 3 per verify. The default is 2, the depth measured
 fastest (below). `Q38_MTP_DRAFTS=1` is the one-draft verify that came before.
 
+### The draft vocabulary
+
+For a draft the head scores a list of tokens instead of the 248,320 of the vocabulary. The list
+has the `Q38_MTP_VOCAB` tokens with the highest counts (`16000` by default), every token with a
+count of at least 3/4 of the count of the last of those, and every token of the current
+conversation. Every token read as part of a prompt (past the part restored from the prefix cache)
+and every token picked adds 1 to the count of that token. All counts halve every 1024 counted
+tokens. The list is rebuilt when a request starts and at every halving. A picked token missing from
+it joins it at once.
+
+The counts are written to a file in the model directory when a run ends or serve receives SIGTERM,
+and the next run starts from them. `COLI_VOCAB_USAGE` sets another file and `USAGE_SAVE=0` skips the
+write. A file that cannot be read as counts, has counts for another vocabulary size or ends on a
+damaged record is not replaced. The list is off when `COLI_VOCAB_USAGE` and `COLI_USAGE` are the
+same file.
+
+The output does not change: the verify step checks every token, and a token missing from the list
+can only turn an accepted draft into a rejected one. The CPU scores the listed rows from the int8
+rows of the `lm_head`, so `COLI_VK_DENSE_HOST=0` does not release those rows from host RAM. The
+head scores the whole vocabulary with `Q38_MTP_VOCAB=0`, with `Q38_MTP_DUMP`, and without int8 rows
+on the host (for example with `Q38_TRUNK_CPU_INT8=0`). Each run and served turn prints the average
+size of the list, the share of picks inside it, and the ids appended and rebuilds.
+
 ## Prompt lookup
 
 Prompt lookup (on by default; `COLI_LOOKUP=0` turns it off) looks for the longest n-gram of
@@ -149,6 +172,7 @@ state is the one plain decoding leaves.
 |---|---|---|
 | `Q38_MTP` | on when the checkpoint has the head | `0`: plain decoding, the head unread; `1`: the head, and a checkpoint without one is refused. The RAM plan (`coli plan`) prices the head when it is on: its dense tensors and its own expert cache (`Q38_MTP_CAP`, the layers' cap by default, at the head's FP8 record). |
 | `Q38_MTP_DRAFTS` | `2` | qwen38 with the MTP head on: the MTP head's drafts per verify, `1` to `3`, or `0` / `auto` for the gate's pick. |
+| `Q38_MTP_VOCAB` | `16000` | qwen38 with the MTP head on: how many of the most used tokens the head scores for a draft. `0`: the whole vocabulary. |
 | `COLI_LOOKUP` | `1` | Prompt-lookup drafts (qwen38, qwen36), and colibri's n-gram drafts from the same lookup and gate when it has no MTP head; always gated. `0` turns them off. |
 | `COLI_LOOKUP_DRAFTS` | `5` | Lookup drafts per verify at most, `1` to `5`. |
 | `COLI_SPEC_GATE` | `1` | `0`: every proposal drafted in full, the gate's estimates ignored (tests). |
