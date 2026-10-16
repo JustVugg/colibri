@@ -235,6 +235,7 @@ typedef struct {
      * a verify that stood: up to Q38_SPEC_ROWS, every one but the last with
      * its next token in mtp_pend_tok). */
     int mtp, mtp_wiring;
+    int mtp_drafts;                   /* drafts per verify when Q38_MTP_DRAFTS is unset */
     char mtp_prefix[32];
     float *mtp_norm_emb, *mtp_norm_hid;
     Q38Weight mtp_fc_emb, mtp_fc_hid;
@@ -1222,6 +1223,15 @@ static void q38_load_layer(Model *m,int i,int cap) {
     #undef VLD
     LCache *lc=&m->cache[i]; lc->cap=cap; lc->slots=(Slot*)calloc((size_t)cap,sizeof(Slot)); lc->by_expert=(int*)malloc((size_t)c->experts*sizeof(int));
     if(!lc->slots||!lc->by_expert){fprintf(stderr,"OOM expert cache\n");exit(1);} for(int e=0;e<c->experts;e++)lc->by_expert[e]=-1;
+}
+
+/* Replaces the slot table of an expert cache with an empty one of `cap` slots. Returns -1 when
+ * out of memory and leaves the table unchanged. */
+static int q38_cache_slots_set(LCache *cache,int cap){
+    Slot *slots=(Slot*)calloc((size_t)cap,sizeof(*slots));
+    if(!slots)return -1;
+    free(cache->slots);cache->slots=slots;cache->cap=cap;
+    return 0;
 }
 
 static void model_init_range(Model *m,const char *snap,int cap,int bits,
@@ -3718,8 +3728,8 @@ static float *step(Model *m,const int *ids,int S,int pos_base) {
  * exception is the CUDA expert tier, whose float order already depends on
  * which experts are resident when, with drafts or without.
  *
- * How many drafts: Q38_MTP_DRAFTS (1..3, default 2) fixes the head's; 0 lets
- * the gate pick 0..3 from the measured acceptance per draft position and the
+ * How many drafts: Q38_MTP_DRAFTS (1..3, default Model.mtp_drafts) fixes the head's;
+ * 0 lets the gate pick 0..3 from the measured acceptance per draft position and the
  * measured cost of a verify by its rows (spec_draft.h). Lookup drafts are
  * always gated (COLI_SPEC_GATE=0 drafts every proposal in full: tests). With
  * both sources a verify carries the proposal whose expected tokens per unit of
@@ -3958,6 +3968,13 @@ static float q38_mean(const float *x,int n) {
     return n?(float)(sum/n):0.f;
 }
 
+/* The first routed expert of the MTP head in the snapshot (NULL when the experts are fused). */
+static st_tensor *q38_mtp_expert_tensor(Model *m) {
+    char nm[384];
+    snprintf(nm,sizeof nm,"%s.layers.0.mlp.experts.0.gate_proj.weight",m->mtp_prefix);
+    return st_find(&m->S,nm);
+}
+
 /* The checkpoint's MTP head drafts by default (Q38_MTP unset), when the checkpoint has
  * one this engine runs and the whole model is loaded; otherwise plain decoding, with a
  * line. Q38_MTP=0 leaves it unread. The CLI and serve engine attach it after the model
@@ -4023,6 +4040,7 @@ static void q38_mtp_attach(Model *m,int cap) {
     snprintf(nm,sizeof nm,"%s.fc_hidden.weight",found); m->mtp_fc_hid=q38_load_weight(m,nm,H,H);
     snprintf(base,sizeof base,"%s.hyper_connection_mixer",found); q38_load_gr_at(m,&m->mtp_mixer,base,0);
     m->mtp=1;                                 /* from here on index c.layers is the head's layer */
+    m->mtp_drafts=2;
     /* Q38_MTP_CAP: the head's expert cache, by default the cap every layer
      * has. Its experts are FP8 even beside the int4 sidecar, so on a cap
      * sized to fill RAM with int4 experts it costs more than a model layer. */
@@ -4031,8 +4049,7 @@ static void q38_mtp_attach(Model *m,int cap) {
     m->mtp_pend=falloc((int64_t)Q38_SPEC_ROWS*W);
     /* the verify's first rollback copy (q38_spec_rollback); deeper verifies add theirs */
     if(!q38_spec_alloc(m,1)){fprintf(stderr,"OOM MTP rollback state\n");exit(1);}
-    snprintf(nm,sizeof nm,"%s.layers.0.mlp.experts.0.gate_proj.weight",found);
-    st_tensor *expert=st_find(&m->S,nm);
+    st_tensor *expert=q38_mtp_expert_tensor(m);
     double expert_bytes=expert?3.0*(double)expert->nbytes:0.0;   /* gate, up and down are the same size */
     const char *how=m->mtp_wiring==Q38_MTP_STREAM_NORM?"a norm per stream, fc_hidden per stream":
                     "one norm over the four streams, fc_hidden per stream (diagnostic; b is the default)";
@@ -4045,6 +4062,47 @@ static void q38_mtp_attach(Model *m,int cap) {
     fprintf(stderr,"[qwen38] MTP norm weights, mean: embedding %.4f, hidden %.4f, mixer %.4f "
                    "(q38_rms0 scales by 1+w; a plain norm's weights would sit near 1)\n",
             q38_mean(m->mtp_norm_emb,H),q38_mean(m->mtp_norm_hid,W),q38_mean(m->mtp_mixer.norm,W));
+}
+
+/* Whether the MTP head takes the values of q38_mtp_igpu_defaults: it is attached, the device is
+ * an integrated GPU with many compute units, and the dense chain runs every step. The Vulkan
+ * expert tier must be up too. */
+static int q38_mtp_igpu_wanted(const Model *m,int many_cu,int chain_on){
+    return m->mtp&&many_cu&&chain_on;
+}
+
+/* The slots q38_mtp_igpu_defaults gives the expert cache of the head: one for each expert,
+ * or the size Q38_MTP_CAP already set. */
+static int q38_mtp_igpu_slots(const Model *m){
+    const char *cap=getenv("Q38_MTP_CAP");
+    return cap&&*cap?m->cache[m->c.layers].cap:m->c.experts;
+}
+
+/* The RAM the Vulkan expert tier leaves free for the CPU caches: every layer at `cap` and,
+ * with `igpu`, the slots q38_mtp_igpu_defaults adds to the cache of the head. */
+static size_t q38_vk_tier_ram_reserve(Model *m,int cap,size_t ram_expert,int igpu){
+    size_t reserve=ram_expert*(size_t)cap*(size_t)m->c.layers;
+    st_tensor *expert=igpu?q38_mtp_expert_tensor(m):NULL;
+    int more=q38_mtp_igpu_slots(m)-m->cache[m->c.layers].cap;
+    return expert&&more>0?reserve+(size_t)more*3*(size_t)expert->nbytes:reserve;
+}
+
+/* The values for the MTP head on an integrated GPU with many compute units, the dense chain and
+ * the Vulkan expert tier (measured on a Radeon 8060S, docs/vulkan.md): one draft per verify and
+ * a cache slot for each expert of the head. The expert tier reserves RAM for that cache.
+ * Q38_MTP_DRAFTS and Q38_MTP_CAP override them. */
+static void q38_mtp_igpu_defaults(Model *m){
+    const char *drafts=getenv("Q38_MTP_DRAFTS");
+    const char *why="an integrated GPU with many compute units, the dense chain and the expert tier on";
+    if(!(drafts&&*drafts)){
+        m->mtp_drafts=1;
+        fprintf(stderr,"[qwen38] MTP drafts per verify 1 (%s; Q38_MTP_DRAFTS sets it)\n",why);
+    }
+    LCache *head=&m->cache[m->c.layers];
+    int slots=q38_mtp_igpu_slots(m);
+    if(head->n||slots==head->cap)return;
+    if(q38_cache_slots_set(head,slots)){fprintf(stderr,"OOM expert cache\n");exit(1);}
+    fprintf(stderr,"[qwen38] MTP head expert cache %d (%s; Q38_MTP_CAP sets it)\n",slots,why);
 }
 
 static int q38_tm_enabled(void) {

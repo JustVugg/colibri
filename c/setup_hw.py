@@ -542,6 +542,20 @@ def _vulkan_library():
     return None
 
 
+def _vk_compute_units(properties2, handle, extensions):
+    """The active compute units a device reports in VK_AMD_shader_core_properties2, as the
+    engine reads them (backend_vulkan.c); None when it reports none."""
+    if properties2 is None or "VK_AMD_shader_core_properties2" not in extensions:
+        return None
+    core = (ctypes.c_ubyte * 32)()
+    head = (ctypes.c_ubyte * 1024)()
+    struct.pack_into("<I", core, 0, 1000227000)   # VkPhysicalDeviceShaderCoreProperties2AMD
+    struct.pack_into("<I", head, 0, 1000059001)   # VkPhysicalDeviceProperties2
+    struct.pack_into("<Q", head, 8, ctypes.addressof(core))
+    properties2(handle, head)
+    return struct.unpack_from("<I", core, 20)[0] or None   # activeComputeUnitCount
+
+
 def _vk_probe_inprocess():
     """Enumerate Vulkan physical devices with the loader, as the engine does.
 
@@ -598,12 +612,16 @@ def _vk_probe_inprocess():
         lib.vkEnumeratePhysicalDevices(instance, ctypes.byref(count), None)
         handles = (vp * max(count.value, 1))()
         lib.vkEnumeratePhysicalDevices(instance, ctypes.byref(count), handles)
-        props2 = None
+        props2 = properties2 = None
         if api >= (1 << 22) | (1 << 12):
             props2 = getattr(lib, "vkGetPhysicalDeviceMemoryProperties2", None)
             if props2 is not None:
                 props2.argtypes = [vp, vp]
                 props2.restype = None
+            properties2 = getattr(lib, "vkGetPhysicalDeviceProperties2", None)
+            if properties2 is not None:
+                properties2.argtypes = [vp, vp]
+                properties2.restype = None
         for handle in handles[:count.value]:
             raw = (ctypes.c_ubyte * 2048)()
             lib.vkGetPhysicalDeviceProperties(handle, raw)
@@ -634,13 +652,15 @@ def _vk_probe_inprocess():
                 memory = bytes(mem)[:520]
             devices.append(_vk_device_record(name, dtype, vendor, device_id, api_v, driver_v,
                                              memory, bytes(budget_raw) if has_budget else None,
-                                             "VK_KHR_cooperative_matrix" in extensions))
+                                             "VK_KHR_cooperative_matrix" in extensions,
+                                             _vk_compute_units(properties2, handle, extensions)))
     finally:
         lib.vkDestroyInstance(instance, None)
     return {"loader": True, "instance_version": vk_version(instance_version), "devices": devices}
 
 
-def _vk_device_record(name, dtype, vendor, device_id, api_v, driver_v, memory, budget, coop):
+def _vk_device_record(name, dtype, vendor, device_id, api_v, driver_v, memory, budget, coop,
+                      compute_units=None):
     """Turn VkPhysicalDeviceMemoryProperties (and the budget struct) into figures."""
     heap_count = struct.unpack_from("<I", memory, 260)[0]
     heaps = []
@@ -664,13 +684,14 @@ def _vk_device_record(name, dtype, vendor, device_id, api_v, driver_v, memory, b
         "budget_bytes": (sum(h.get("budget", 0) for h in local) or None) if budget is not None else None,
         "memory_budget_ext": budget is not None,
         "cooperative_matrix": coop,
+        "compute_units": compute_units,
         "heaps": heaps,
     }
 
 
 def parse_vulkaninfo_summary(text):
     """Devices from `vulkaninfo --summary`: names, types and API versions. The
-    summary carries no memory figures, so those stay None."""
+    summary carries no memory figures and no compute units, so those stay None."""
     devices = []
     current = None
     for line in (text or "").splitlines():
@@ -679,7 +700,8 @@ def parse_vulkaninfo_summary(text):
             current = {"name": None, "type": "other", "vendor": None, "vendor_id": None,
                        "device_id": None, "api_version": None, "api_version_raw": None,
                        "device_local_bytes": None, "budget_bytes": None,
-                       "memory_budget_ext": False, "cooperative_matrix": False, "heaps": []}
+                       "memory_budget_ext": False, "cooperative_matrix": False,
+                       "compute_units": None, "heaps": []}
             devices.append(current)
             continue
         if current is None:

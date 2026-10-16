@@ -89,7 +89,9 @@ standing rows' streams, each with the token that followed it.
 
 `Q38_MTP_DRAFTS` sets the drafts per verify: `1`, `2` or `3` drafts every time, or `0` /
 `auto` to let the gate pick 0 to 3 per verify. The default is 2, the depth measured
-fastest (below). `Q38_MTP_DRAFTS=1` is the one-draft verify that came before.
+fastest (below), and 1 on an integrated GPU with 32 or more compute units, the expert tier
+and the dense chain on ([vulkan.md](vulkan.md#the-chain-on-a-radeon-780m)). `Q38_MTP_DRAFTS=1` is the
+one-draft verify that came before.
 
 ## Prompt lookup
 
@@ -147,8 +149,8 @@ state is the one plain decoding leaves.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `Q38_MTP` | on when the checkpoint has the head | `0`: plain decoding, the head unread; `1`: the head, and a checkpoint without one is refused. The RAM plan (`coli plan`) prices the head when it is on: its dense tensors and its own expert cache (`Q38_MTP_CAP`, the layers' cap by default, at the head's FP8 record). |
-| `Q38_MTP_DRAFTS` | `2` | qwen38 with the MTP head on: the MTP head's drafts per verify, `1` to `3`, or `0` / `auto` for the gate's pick. |
+| `Q38_MTP` | on when the checkpoint has the head | `0`: plain decoding, the head unread; `1`: the head, and a checkpoint without one is refused. The RAM plan (`coli plan`) prices the head when it is on: its dense tensors and its own expert cache (`Q38_MTP_CAP`, the layers' cap by default and every expert of the head where the engine sets that, at the head's FP8 record). |
+| `Q38_MTP_DRAFTS` | `2`; `1` on an integrated GPU with 32 or more compute units, the expert tier and the dense chain on | qwen38 with the MTP head on: the MTP head's drafts per verify, `1` to `3`, or `0` / `auto` for the gate's pick. |
 | `COLI_LOOKUP` | `1` | Prompt-lookup drafts (qwen38, qwen36), and colibri's n-gram drafts from the same lookup and gate when it has no MTP head; always gated. `0` turns them off. |
 | `COLI_LOOKUP_DRAFTS` | `5` | Lookup drafts per verify at most, `1` to `5`. |
 | `COLI_SPEC_GATE` | `1` | `0`: every proposal drafted in full, the gate's estimates ignored (tests). |
@@ -183,7 +185,7 @@ but the speed peaks at two. A verify of `k` drafts reads the trunk once, but eve
 routes its own 10 experts per layer (the cache hit rate falls from 81% without MTP to
 76% at two drafts), and a rejected row's expert reads are spent all the same. At three
 drafts the third row stands 65% of the time and costs more than it returns. The
-default is therefore 2 (`Q38_MTP_DRAFTS=2`) on the CPU and in the chain alike.
+default is therefore 2 (`Q38_MTP_DRAFTS=2`) on the CPU and in the chain alike, measured on a Radeon 780M.
 
 **Prompt lookup on a code edit.** The prompt asks to rename a variable in 23 lines of C
 and print the code again (`enable_thinking: false`). 160 tokens; Qwen3.8 at cap 170 on

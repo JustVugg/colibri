@@ -10,6 +10,7 @@ from unittest import mock
 
 from resource_plan import (
     GB,
+    MANY_COMPUTE_UNITS,
     CgroupFormatError,
     analyze_model,
     build_plan,
@@ -27,11 +28,16 @@ from resource_plan import (
 )
 
 
-def analyze_qwen38_mtp(model, env):
+def analyze_qwen38_mtp(model, env, vulkan=None):
     """The analysis build_plan works from, after the MTP head's pricing."""
     import resource_plan
     info = resource_plan.qwen38_int4_sidecar(resource_plan.analyze_model(model))
-    return resource_plan._q38_mtp_head(info, env)
+    return resource_plan._q38_mtp_head(info, env, vulkan)
+
+
+def integrated(compute_units):
+    """The device setup_hw reports for an integrated GPU with that many compute units."""
+    return {"type": "integrated", "compute_units": compute_units}
 
 
 # 1.0000001: an f32 that is not a bf16 widened (its low half is not zero)
@@ -1106,10 +1112,8 @@ memInfo.free:                     23.50 GB (97%)
             ))
         write_shard(self.model / "model.safetensors", tensors)
 
-    def test_qwen38_mtp_head_is_priced_when_the_engine_attaches_it(self):
-        # qwen38_core.h attaches the checkpoint's MTP head by default: its dense
-        # tensors stay resident and its experts get a cache of the layers' cap
-        # (Q38_MTP_CAP), at the head's own record. The plan used to price neither.
+    def write_qwen38_mtp(self):
+        """The qwen38 checkpoint with an MTP head of two experts of 3 x 512 bytes; returns the config."""
         self.write_qwen38()
         config = json.loads((self.model / "config.json").read_text())
         config["text_config"]["mtp_num_hidden_layers"] = 1
@@ -1120,6 +1124,13 @@ memInfo.free:                     23.50 GB (97%)
             for projection in ("gate_proj", "up_proj", "down_proj"):
                 head.append((f"mtp.layers.0.mlp.experts.{e}.{projection}.weight", 512, "F8_E4M3", [16, 32]))
         write_shard(self.model / "model-mtp.safetensors", head)
+        return config
+
+    def test_qwen38_mtp_head_is_priced_when_the_engine_attaches_it(self):
+        # qwen38_core.h attaches the checkpoint's MTP head by default: its dense
+        # tensors stay resident and its experts get a cache of the layers' cap
+        # (Q38_MTP_CAP), at the head's own record. The plan used to price neither.
+        config = self.write_qwen38_mtp()
         kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
         off = build_plan(self.model, env={"Q38_MTP": "0"}, **kwargs)
         on = build_plan(self.model, env={}, **kwargs)
@@ -1139,6 +1150,86 @@ memInfo.free:                     23.50 GB (97%)
         config["text_config"]["mtp_num_hidden_layers"] = 0
         (self.model / "config.json").write_text(json.dumps(config))
         self.assertEqual(analyze_qwen38_mtp(self.model, {})["per_cap_bytes"], info_off["per_cap_bytes"])
+
+    def test_qwen38_mtp_head_cache_is_every_expert_where_the_engine_sets_it(self):
+        # q38_mtp_igpu_defaults: on an integrated GPU with many compute units, the expert tier
+        # wanted and the dense chain on for decode, the cache of the head has a slot for every
+        # expert, a fixed cost. Q38_MTP_CAP still sets it. Elsewhere a slot costs one head expert.
+        self.write_qwen38_mtp()
+        record, experts = 3 * 512, 2
+        base = analyze_qwen38_mtp(self.model, {"Q38_MTP": "0"})
+        on = {"COLI_VULKAN": "1"}
+        many = analyze_qwen38_mtp(self.model, on, integrated(MANY_COMPUTE_UNITS))
+        self.assertEqual(many["expert_fixed_bytes"] - base["expert_fixed_bytes"], experts * record)
+        self.assertEqual(many["per_cap_bytes"], base["per_cap_bytes"])
+        cases = {
+            "one compute unit fewer": (on, integrated(MANY_COMPUTE_UNITS - 1)),
+            "no count": (on, integrated(None)),
+            "no device": (on, None),
+            "a discrete GPU": (on, {"type": "discrete", "compute_units": 2 * MANY_COMPUTE_UNITS}),
+            "no expert tier": (dict(on, COLI_VK_TIER="0"), integrated(MANY_COMPUTE_UNITS)),
+            "the CUDA tier": (dict(on, COLI_CUDA="1"), integrated(MANY_COMPUTE_UNITS)),
+            "Vulkan off": ({}, integrated(MANY_COMPUTE_UNITS)),
+            "dense chain off": (dict(on, COLI_VK_CHAIN="0"), integrated(MANY_COMPUTE_UNITS)),
+            "dense chain for prompts only": (dict(on, COLI_VK_CHAIN="2"), integrated(MANY_COMPUTE_UNITS)),
+            "trunk on the CPU": (dict(on, COLI_VK_DENSE="0"), integrated(MANY_COMPUTE_UNITS)),
+        }
+        for name, (env, device) in cases.items():
+            with self.subTest(name):
+                info = analyze_qwen38_mtp(self.model, env, device)
+                self.assertEqual(info["expert_fixed_bytes"], base["expert_fixed_bytes"])
+                self.assertEqual(info["per_cap_bytes"] - base["per_cap_bytes"], record)
+        fixed = analyze_qwen38_mtp(self.model, dict(on, Q38_MTP_CAP="1"), integrated(MANY_COMPUTE_UNITS))
+        self.assertEqual(fixed["expert_fixed_bytes"] - base["expert_fixed_bytes"], record)
+        # build_plan hands the device it probed to the pricing of the head
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        ram_many = build_plan(self.model, env=on, vulkan=integrated(MANY_COMPUTE_UNITS), **kwargs)["tiers"]["ram"]
+        ram_few = build_plan(self.model, env=on, vulkan=integrated(MANY_COMPUTE_UNITS - 1), **kwargs)["tiers"]["ram"]
+        self.assertEqual(ram_many["expert_fixed_bytes"] - ram_few["expert_fixed_bytes"], experts * record)
+
+    def test_plan_warns_when_an_integrated_gpu_reports_no_compute_units(self):
+        # the vulkaninfo path of setup_hw cannot read them: the plan prices fewer than MANY_COMPUTE_UNITS and says so
+        self.write_qwen38_mtp()
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        cases = {
+            "unknown": ({"COLI_VULKAN": "1"}, integrated(None), True),
+            "known": ({"COLI_VULKAN": "1"}, integrated(MANY_COMPUTE_UNITS), False),
+            "a discrete GPU": ({"COLI_VULKAN": "1"}, {"type": "discrete", "compute_units": None}, False),
+            "Vulkan off": ({}, integrated(None), False),
+        }
+        for name, (env, device, warned) in cases.items():
+            with self.subTest(name):
+                warnings = build_plan(self.model, env=env, vulkan=device, **kwargs)["warnings"]
+                self.assertEqual(any("reports no compute units" in w for w in warnings), warned)
+
+    def test_vk_igpu_threshold_header_is_what_the_generator_writes(self):
+        c_dir = Path(__file__).resolve().parents[1]
+        written = subprocess.run([sys.executable, str(c_dir / "tools" / "gen_vk_igpu.py")],
+                                 check=True, capture_output=True, text=True).stdout
+        self.assertEqual(written, (c_dir / "vk_igpu_threshold.h").read_text())
+
+    def test_vulkan_chain_default_of_qwen38_follows_the_compute_units_of_an_integrated_gpu(self):
+        # qwen38 passes coli_vk_chain_decide ON from MANY_COMPUTE_UNITS compute units, qwen36 and
+        # olmoe on at any count, and an engine not measured on an integrated GPU off
+        from resource_plan import _vk_chain_dense
+        on = {"COLI_VULKAN": "1"}
+        many, few = integrated(MANY_COMPUTE_UNITS), integrated(MANY_COMPUTE_UNITS - 1)
+        cases = [
+            ("qwen38", on, many, True),
+            ("qwen38", on, few, False),
+            ("qwen38", on, integrated(None), False),
+            ("qwen38", dict(on, COLI_VK_TIER="0"), many, False),
+            ("qwen38", dict(on, COLI_VK_CHAIN="0"), many, False),
+            ("qwen38", dict(on, COLI_VK_DENSE="0"), many, False),
+            ("qwen38", dict(on, COLI_VK_DENSE="0", COLI_VK_CHAIN="1"), many, True),
+            ("qwen38", on, {"type": "cpu", "compute_units": MANY_COMPUTE_UNITS}, False),
+            ("qwen36", on, few, True),
+            ("olmoe", on, few, True),
+            ("glm53", on, many, False),
+        ]
+        for family, env, device, chain in cases:
+            with self.subTest(family=family, env=env, device=device):
+                self.assertEqual(_vk_chain_dense(family, env, device)[0], chain)
 
     def test_qwen38_plan_prices_heterogeneous_cache_exports_cap_and_plans_vram(self):
         self.write_qwen38()
