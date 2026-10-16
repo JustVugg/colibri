@@ -9,6 +9,7 @@
 // submit/wait per call; async queues and zero-copy import come in M4.
 #include "backend_vulkan.h"
 #include "vk_alloc.h"
+#include "vk_igpu_threshold.h"
 #include "vk_load.h"
 #include <pthread.h>
 #include <stdio.h>
@@ -418,6 +419,7 @@ static struct {
      * (measured: decode attention 7.8s at 7.6 GB resident -> 17.8s at 15.2 GB).
      * VK_EXT_memory_budget lets the tier fill stop at a reserve instead of guessing. */
     int has_prio, has_budget, has_hostmem;
+    int compute_units;           /* VK_AMD_shader_core_properties2: the active ones, 0 when not reported */
     float prio;                  /* priority applied to the NEXT allocations (class knob) */
     /* the routed-expert tier's queue (coli_vk_xb_*): family, index, whether it is the
      * main queue after all, and its timestamp bits; device limits its batches respect */
@@ -1086,6 +1088,15 @@ int coli_vk_init(const char *spv_path) {
 #endif
 #ifdef VK_KHR_cooperative_matrix
                 if (!strcmp(ep[i].extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) has_cm = 1;
+#endif
+#ifdef VK_AMD_shader_core_properties2
+                if (!strcmp(ep[i].extensionName, VK_AMD_SHADER_CORE_PROPERTIES_2_EXTENSION_NAME)) {
+                    VkPhysicalDeviceShaderCoreProperties2AMD core = {
+                        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_2_AMD};
+                    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &core};
+                    vkGetPhysicalDeviceProperties2(G.phys, &p2);
+                    G.compute_units = (int)core.activeComputeUnitCount;
+                }
 #endif
 #ifdef VK_EXT_subgroup_size_control
                 if (!strcmp(ep[i].extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) has_ssc = 1;
@@ -2403,7 +2414,9 @@ unsigned long long coli_vk_dense_host_dropped_bytes(void) { return __atomic_load
  *   and prefill, 9.5 against 12.2 s); qwen38 OFF (its chain won prefill, 30.1 against
  *   38.7 s, and lost decode, 3.2 against 3.8 tok/s: the device's GEMV at the GPU's
  *   800 MHz floor is slower than the CPU's int8 one on a 4.3 GB trunk; prompts only
- *   still lost 5% of decode, the trunk's device copy taking from the tier's budget).
+ *   still lost 5% of decode, the trunk's device copy taking from the tier's budget),
+ *   and ON on a Radeon 8060S, which has 40 compute units (coli_vk_device_igpu_many_cu): it
+ *   decoded 17.4 tok/s against 8.3 with the trunk on the CPU.
  *   olmoe ON (OLMoE-1B-7B: the chain decoded 17.3 against 12.8 tok/s and prefilled 512
  *   tokens in 5.5 against 6.4 s; the CPU alone decodes 23.1 tok/s, its trunk being f32).
  *   inkling passes COLI_VK_CHAIN_UNMEASURED (no checkpoint of it runs on the box).
@@ -3657,6 +3670,11 @@ int coli_vk_device_integrated(void) {
     VkPhysicalDeviceProperties p;
     vkGetPhysicalDeviceProperties(G.phys, &p);
     return p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
+}
+/* An integrated GPU with COLI_VK_IGPU_MANY_CU active compute units or more. A device without
+ * VK_AMD_shader_core_properties2 reports no count and is treated as having fewer. */
+int coli_vk_device_igpu_many_cu(void) {
+    return coli_vk_device_integrated() && G.compute_units >= COLI_VK_IGPU_MANY_CU;
 }
 /* An integrated GPU or a CPU device (Lavapipe): its "device memory" is host RAM. */
 int coli_vk_device_shares_ram(void) {

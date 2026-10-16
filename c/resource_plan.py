@@ -116,8 +116,11 @@ def _vk_flag(env, name):
 
 
 # The families whose dense chain is on by default on an integrated GPU with the
-# expert tier (coli_vk_chain_decide's measured `igpu`, docs/vulkan.md).
+# expert tier (coli_vk_chain_decide's measured `igpu`, docs/vulkan.md), and those where
+# it is on only from MANY_COMPUTE_UNITS compute units.
 _VK_IGPU_CHAIN_ON = ("qwen36", "olmoe")
+_VK_IGPU_MANY_CU_CHAIN_ON = ("qwen38",)
+MANY_COMPUTE_UNITS = 32
 _VK_DENSE_HOST_FAMILIES = frozenset((
     "qwen36", "qwen38", "glm", "glm53", "inkling", "kimi", "mimo",
     "olmoe", "deepseek_v4", "deepseek_v41",
@@ -134,6 +137,20 @@ def _vk_device(env, vulkan):
         return None
 
 
+def _vk_igpu_many_units(vulkan):
+    """Whether the device is an integrated GPU with MANY_COMPUTE_UNITS compute units or more
+    (coli_vk_device_igpu_many_cu); setup_hw reads the units."""
+    device = vulkan or {}
+    return device.get("type") == "integrated" and (device.get("compute_units") or 0) >= MANY_COMPUTE_UNITS
+
+
+def _vk_igpu_units_unknown(vulkan):
+    """Whether the device is an integrated GPU without a count of compute units. setup_hw
+    reads the count through the Vulkan loader, not through `vulkaninfo`."""
+    device = vulkan or {}
+    return device.get("type") == "integrated" and device.get("compute_units") is None
+
+
 def _vk_chain_dense(family_id, env, vulkan):
     """(chain, dense): whether the engine runs its dense chain, and its per-matrix
     path, on the Vulkan device (coli_vk_chain_decide, coli_vk_dense_decide); both
@@ -147,8 +164,10 @@ def _vk_chain_dense(family_id, env, vulkan):
     tier = _vk_flag(env, "COLI_VK_TIER") != 0
     chain, dense = _vk_flag(env, "COLI_VK_CHAIN"), _vk_flag(env, "COLI_VK_DENSE")
     if chain is None:
-        chain = (kind not in ("integrated", "cpu") or
-                 kind == "integrated" and tier and family_id in _VK_IGPU_CHAIN_ON)
+        # COLI_VK_DENSE=0 keeps the trunk on the CPU, and the chain with it
+        igpu_on = (family_id in _VK_IGPU_CHAIN_ON or
+                   family_id in _VK_IGPU_MANY_CU_CHAIN_ON and _vk_igpu_many_units(vulkan))
+        chain = dense != 0 and (kind not in ("integrated", "cpu") or kind == "integrated" and tier and igpu_on)
     if dense is None:
         # colibri.c passes default=0 to coli_vk_dense_decide; its chain is
         # independent, but disabling that chain does not enable per-matrix GEMVs.
@@ -1789,7 +1808,15 @@ def qwen38_int4_sidecar(info):
                 expert_fixed_bytes=0, qwen38_int4_experts=True)
 
 
-def _q38_mtp_head(info, env):
+def _q38_mtp_igpu_defaults(env, vulkan):
+    """Whether qwen38.c sets the values for an integrated GPU with many compute units
+    (q38_mtp_igpu_defaults): the expert tier is wanted and the dense chain runs for decode."""
+    chain, _dense = _vk_chain_dense("qwen38", env, vulkan)
+    return (_vk_igpu_many_units(vulkan) and _vk_flag(env, "COLI_VK_TIER") != 0 and chain and
+            _vk_flag(env, "COLI_VK_CHAIN") != 2)
+
+
+def _q38_mtp_head(info, env, vulkan):
     """Price Qwen3.8's MTP head when the engine attaches it (qwen38_core.h,
     q38_mtp_attach): on by default when the config names one head and the
     checkpoint carries its weights, off with Q38_MTP=0. The head is one more
@@ -1799,9 +1826,12 @@ def _q38_mtp_head(info, env):
     routed experts get their own cache of Q38_MTP_CAP slots, the layers' cap by
     default, at the head's own record (the snapshot's FP8: the int4-g64 sidecar
     holds the model's layers only). With the default that is one more expert per
-    cache slot; a fixed Q38_MTP_CAP is a fixed cost instead. Without this the
-    plan handed the cache about 0.9 GB the head then took (cap 161 on Qwen3.8
-    Flash Next: 161 FP8 experts of 4.69 MiB, and 173 MiB of head)."""
+    cache slot; a fixed Q38_MTP_CAP is a fixed cost instead. The cache of every
+    expert of the head that qwen38.c sets on an integrated GPU with many compute
+    units, the expert tier and the dense chain (q38_mtp_igpu_defaults) is a
+    fixed cost too. Without this the plan handed the cache about 0.9 GB the head
+    then took (cap 161 on Qwen3.8 Flash Next: 161 FP8 experts of 4.69 MiB, and
+    173 MiB of head)."""
     resolved = info["resolved_family"]
     if resolved.descriptor.id != "qwen38" or (env.get("Q38_MTP") or "").strip() == "0":
         return info
@@ -1830,6 +1860,8 @@ def _q38_mtp_head(info, env):
     cap = (env.get("Q38_MTP_CAP") or "").strip()
     if cap.isdigit() and int(cap) > 0:
         fixed += min(int(cap), len(experts)) * record
+    elif _q38_mtp_igpu_defaults(env, vulkan):
+        fixed += len(experts) * record
     else:
         per_cap += record
     return dict(info, dense_bytes=info["dense_bytes"] + dense, per_cap_bytes=per_cap,
@@ -3117,12 +3149,12 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         raise ValueError(f"unknown policy: {policy}")
     info = qwen38_int4_sidecar(analyze_model(model))
     env_now = os.environ if env is None else env
+    vulkan = _vk_device(env_now, vulkan)
     info = _q38_cpu_dense_tensors(info, env_now)
-    info = _q38_mtp_head(info, env_now)
+    info = _q38_mtp_head(info, env_now, vulkan)
     info = _glm53_dense_tensors(info, env_now)
     # Only the matrices a family's dho pass can release earn RAM credit. The
     # embedding, norms, CPU-only components and unrecognized formats stay reserved.
-    vulkan = _vk_device(env_now, vulkan)
     family_id = info["resolved_family"].descriptor.id
     kept = min(info["dense_bytes"], info.get("embed_bytes", 0))
     device_dense_bytes = max(0, info["dense_bytes"] - kept)
@@ -3330,6 +3362,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if placement_unified:
         warnings.append(
             "GPU and RAM share one physical memory pool; budgets were jointly constrained")
+    if family_id == "qwen38" and _vk_flag(env_now, "COLI_VULKAN") and _vk_igpu_units_unknown(vulkan):
+        warnings.append(
+            f"the integrated GPU reports no compute units: qwen38 is planned as with fewer than "
+            f"{MANY_COMPUTE_UNITS}, the dense chain off and the cache of the MTP head as large as "
+            "the cache of a layer")
     # The plan sizes the hot tier from *free* VRAM, so running it while an engine
     # instance already holds the GPUs silently produces a tiny tier and a
     # pessimistic hit rate that describe nothing. That is exactly when a user

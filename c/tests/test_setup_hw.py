@@ -5,6 +5,7 @@ parsers the text and the raw structs real machines produce (Linux /proc files,
 nvidia-smi, vulkaninfo, the Vulkan memory-properties layout, the Windows
 system calls' results) so the detection is checked without the hardware.
 """
+import ctypes
 import os
 import struct
 import sys
@@ -363,6 +364,7 @@ class VulkanParsing(unittest.TestCase):
         self.assertEqual(devices[1]["type"], "cpu")
         self.assertEqual(devices[0]["api_version"], "1.3.289")
         self.assertIsNone(devices[0]["device_local_bytes"])   # the summary has no memory figures
+        self.assertIsNone(devices[0]["compute_units"])        # nor compute units
 
     def test_vulkaninfo_on_windows(self):
         devices = setup_hw.parse_vulkaninfo_summary(VULKANINFO_WINDOWS)
@@ -392,6 +394,26 @@ class VulkanParsing(unittest.TestCase):
         self.assertEqual(record["vendor"], "Intel")
         self.assertIsNone(record["budget_bytes"])
         self.assertEqual(record["device_local_bytes"], 17 * 10**9)
+
+    def test_compute_units_are_read_from_the_amd_shader_core_properties2_struct(self):
+        def driver(handle, head):
+            """Fills the struct chained behind VkPhysicalDeviceProperties2, as a driver does."""
+            self.assertEqual(struct.unpack_from("<I", head, 0)[0], 1000059001)
+            core = (ctypes.c_ubyte * 32).from_address(struct.unpack_from("<Q", head, 8)[0])
+            self.assertEqual(struct.unpack_from("<I", core, 0)[0], 1000227000)
+            struct.pack_into("<I", core, 20, units)
+        units = 40
+        extensions = {"VK_AMD_shader_core_properties2"}
+        self.assertEqual(setup_hw._vk_compute_units(driver, None, extensions), 40)
+        units = 0
+        self.assertIsNone(setup_hw._vk_compute_units(driver, None, extensions))   # reported as none
+        units = 40
+        self.assertIsNone(setup_hw._vk_compute_units(driver, None, set()))        # extension missing
+        self.assertIsNone(setup_hw._vk_compute_units(None, None, extensions))     # loader older than Vulkan 1.1
+        memory = memory_properties([(17 * 10**9, True)])
+        record = setup_hw._vk_device_record("Radeon 8060S", 1, 0x1002, 0x1586, (1 << 22) | (3 << 12), 1,
+                                            memory, None, True, 40)
+        self.assertEqual(record["compute_units"], 40)
 
     def test_usable_and_best(self):
         cpu = device("llvmpipe", "cpu")

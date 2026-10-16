@@ -984,7 +984,8 @@ integrated GPU that made the dense part slower on the device than on the CPU (se
 command buffer instead, and keeps the residual stream on the device from one layer
 to the next. qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) and qwen38 (Qwen3.8 Flash
 Next) run it: by default on a discrete GPU, and for qwen36 on an integrated one with
-the expert tier (see [the default](#the-chain-on-a-radeon-780m)); `COLI_VK_CHAIN=1`
+the expert tier, and for qwen38 on one with 32 or more compute units too (see [the
+default](#the-chain-on-a-radeon-780m)); `COLI_VK_CHAIN=1`
 anywhere. `COLI_VK_DENSE=0` keeps it off too, unless `COLI_VK_CHAIN` says otherwise: the
 chain's copy of the trunk would take the expert tier's budget (on an 8 GB RTX 4070
 Laptop with qwen38, disk-bound, the tier got 1.87 GiB instead of 6.00 and decode went
@@ -1128,7 +1129,7 @@ f32 throughout, as the CPU's f32 path.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 and olmoe on, qwen38 off; mimo, inkling, colibri, glm53, kimi_k3, deepseek_v41 and deepseek_v4 off: not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows that are not a speculative verify; decode and verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
+| `COLI_VK_CHAIN` | on for a discrete GPU; on an integrated GPU with the expert tier, what the engine measured (qwen36 and olmoe on, qwen38 on with 32 or more compute units and off with fewer; mimo, inkling, colibri, glm53, kimi_k3, deepseek_v41 and deepseek_v4 off: not measured); off on a CPU device | `1`: every layer's dense chain on the device; `2`: prompts only (forwards of more than two rows that are not a speculative verify; decode and verifies on the per-matrix path, the state moving between the two); `0`: the per-matrix path. The `[VK] <engine>: dense chain ...` line says which and why. |
 | `COLI_VK_CHAIN_ROWS` | from the budget, up to 8192 | Prompt rows per chunk: a longer prompt runs every layer chunk by chunk (the device's scratch is sized for one chunk). Unset or `auto`: the most rows whose buffers fit half the free device memory, up to `COLI_VK_CHAIN_ROWS_MAX` (8192); see [big prompt chunks](#big-prompt-chunks-and-expert-streaming). It was 512 before. |
 | `COLI_VK_CHAIN_LAYERS` | what fits | The engines on [the partial chain](#a-partial-chain): the first N layers on the device, the CPU the rest and the head. Unset or `auto`: the most layers the device's free memory holds (every layer when they fit, the chain as before); `n`: n layers; `0`: the chain off. |
 | `COLI_VK_CHAIN_FLASH` | `16` | Rows from which a forward's plain causal attention runs on the matrix units (`chain_attn_flash.comp`: query heads of one kv head folded into 16-row tiles, K/V staged once per block as f16, two passes); `0` never. Needs cooperative matrices at subgroup size 64; otherwise, and for a selection list, a window, a ring or a sink, the blocked shader or `chain_attn.comp`. On a Radeon 8060S (Qwen3.6, 1011-token prompt) the attention went from 186 ms (`chain_attnb`) to 22 ms, the first token from 2.08 to 1.85 s, perplexity unchanged (7.65). |
@@ -1207,15 +1208,36 @@ What the numbers say:
 
 **The default** (`coli_vk_chain_decide`, next to `coli_vk_dense_decide`): on a discrete
 GPU the chain is on. On an integrated GPU with the expert tier on, each engine passes
-what it measured here: qwen36 on, qwen38 off (decode, a chat's steady state, is slower
-in both modes; `COLI_VK_CHAIN=2` is the choice for long prompts). Without the tier, and
-on a CPU device such as Lavapipe, it is off. An engine not timed on an integrated GPU
-passes `COLI_VK_CHAIN_UNMEASURED`: off there, and the line says "not measured". The
-startup line says which and why:
+what it measured here: qwen36 on, qwen38 off with fewer than 32 compute units (decode, a
+chat's steady state, is slower in both modes; `COLI_VK_CHAIN=2` is the choice for long
+prompts) and on with 32 or more. Without the tier, and on a CPU device such as Lavapipe, it
+is off. An engine not timed on an integrated GPU passes `COLI_VK_CHAIN_UNMEASURED`: off
+there, and the line says "not measured". The startup line says which and why:
 
 ```
 [VK] qwen36: dense chain on (an integrated GPU with the expert tier: measured faster on decode and prefill; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
 ```
+
+**Compute units.** An integrated GPU reports its active compute units in
+`VK_AMD_shader_core_properties2`. From 32 units on, qwen38 turns the chain on by default. With
+the chain and the expert tier on, qwen38 also drafts one token per verify and gives the expert
+cache of the MTP head a slot for every expert. The tier reserves RAM for that cache.
+`Q38_MTP_DRAFTS` and `Q38_MTP_CAP` set either. `coli plan` reads the units through the Vulkan
+loader. Where only `vulkaninfo` is available, it warns and prices fewer than 32 units.
+
+A verify of two drafts is three rows and took 1.67 times a one-row forward, against 1.22 for
+one draft. It returned 2.20 tokens per forward against 1.76. A cache of 32 slots misses the FP8
+experts of the head, which are then read from disk on every draft (2,707 to 3,111 loads a run
+against 614 with a slot for every expert). Qwen3.8 Flash Next with the int4-g64 sidecar on a Radeon 8060S (40 compute
+units), `COLI_VULKAN=1`, an 84-token prompt and 300 new tokens, greedy, single runs:
+
+| Arm | tok/s |
+|---|---|
+| trunk on the CPU, 2 drafts, head cache 32 | 8.3 |
+| chain on, 2 drafts, head cache 32 | 17.4 |
+| chain on, 1 draft, head cache 32 | 19.8 |
+| chain on, 2 drafts, head cache 512 | 20.0 |
+| chain on, 1 draft, head cache 512 | 22.2 to 23.4 |
 
 **What was not measured.** No discrete GPU was available. On one the trunk sits in
 VRAM, read at several times the CPU's bandwidth, the clock is not held at a floor

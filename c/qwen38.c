@@ -975,8 +975,8 @@ static void q38_validate_ids(const Cfg *c, const int *ids, int count,
 /* A decode run's speculation (qwen38_core.h, "speculative decoding"): the MTP
  * head's drafts when it is attached, Q38_MTP_DRAFTS of them per verify (1..3,
  * default 2, the depth measured fastest on a Ryzen 8700GE, CPU and Vulkan chain
- * alike, docs/speculative.md; 1 is the verify before it; 0 or auto lets the gate
- * pick); prompt-lookup drafts under
+ * alike, docs/speculative.md, and 1 where q38_mtp_igpu_defaults sets it; 0 or
+ * auto lets the gate pick); prompt-lookup drafts under
  * COLI_LOOKUP=1, up to COLI_LOOKUP_DRAFTS (1..5, default 5); the forced modes
  * the tests use (Q38_MTP_FORCE, COLI_LOOKUP_FORCE), and COLI_SPEC_GATE=0,
  * which drafts every proposal in full. */
@@ -998,7 +998,7 @@ static Q38Spec q38_spec_begin(Model *m, const int *prompt, int np) {
     sp.on = m->mtp;
     sp.force = q38_spec_force_mode("Q38_MTP_FORCE", getenv("Q38_MTP_FORCE"), 3, 0, &sp.force_row);
     const char *depth = getenv("Q38_MTP_DRAFTS");
-    sp.depth = 2;
+    sp.depth = m->mtp_drafts;
     if (depth && *depth) {
         if (!strcmp(depth, "auto") || !strcmp(depth, "0")) sp.depth = 0;
         else if (depth[0] >= '1' && depth[0] <= '3' && !depth[1]) sp.depth = depth[0] - '0';
@@ -2383,10 +2383,11 @@ int main(int argc, char **argv) {
     g_vk_dense=coli_vk_dense();   /* COLI_VK_DENSE; unset, off on a device sharing the CPU's RAM with the tier on */
     /* COLI_VK_CHAIN: every layer's dense chain on the device (qwen38_chain.h); the CUDA
      * tier keeps its priority */
-    /* measured on a Radeon 780M: prefill faster, decode slower in either mode, so opt-in
-     * on an integrated GPU (docs/vulkan.md, "The dense chain") */
+    /* measured on a Radeon 780M: prefill faster, decode slower in either mode, so opt-in on an
+     * integrated GPU, and on by default from many compute units (docs/vulkan.md, "The dense chain") */
     if(g_vk_ready&&!qt_ready())
-        g_vk_chain=coli_vk_chain_decide("qwen38",vkt_wanted()&&m.c.experts>0,COLI_VK_CHAIN_OFF);
+        g_vk_chain=coli_vk_chain_decide("qwen38",vkt_wanted()&&m.c.experts>0,
+                                        coli_vk_device_igpu_many_cu()?COLI_VK_CHAIN_ON:COLI_VK_CHAIN_OFF);
     if(g_vk_chain&&g_q38_mux_slots>1){
         g_vk_chain=0;
         fprintf(stderr,"[VK] qwen38: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "
@@ -2872,11 +2873,12 @@ static void q38_vk_tier_start(Model *m,int cap){
         fm=q38_vk_native_fmt(m,c->layers,c->layers+1,&ram_mtp);
         if(fm.kind==VKT_SRC_NONE)fprintf(stderr,"[VK] tier qwen38: the MTP head's experts mix formats; they stay on the CPU\n");
     }
+    int igpu=q38_mtp_igpu_wanted(m,coli_vk_device_igpu_many_cu(),g_vk_chain==COLI_VK_CHAIN_ON);
     VktConfig vc={.engine="qwen38",.layers=c->layers,.experts=c->experts,.hidden=H,.inter=F,.topk=c->topk,
                   .gate_up=f,.down=f,.act=VKT_ACT_SWIGLU,
                   .extra_layers=fm.kind!=VKT_SRC_NONE,.extra_gate_up=fm,.extra_down=fm,
                   .max_rows=q38_moe_prefill_rows(c,q38_prefill_batch_rows())*c->topk,
-                  .ram_reserve=ram_expert*(size_t)cap*(size_t)c->layers,
+                  .ram_reserve=q38_vk_tier_ram_reserve(m,cap,ram_expert,igpu),
                   .dense_bytes=q38_vk_dense_bytes(m),
                   .in_ram=q38_vk_in_ram,.ram_ctx=m,
                   .load=q38_vk_load,.release=q38_vk_release,.load_ctx=m,.load_batch=q38_vk_load_batch};
@@ -2885,6 +2887,7 @@ static void q38_vk_tier_start(Model *m,int cap){
     atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
     if(!vkt_init(&vc,heat))return;
     atexit(vkt_shutdown);
+    if(igpu)q38_mtp_igpu_defaults(m);   /* the tier is up and has left room for the cache of the head */
     /* the warm start: the history's hottest experts, read in parallel */
     int all=c->layers*c->experts,*pl=(int*)malloc((size_t)all*sizeof(int)),*pe=(int*)malloc((size_t)all*sizeof(int));
     if(!pl||!pe){free(pl);free(pe);return;}
@@ -2965,10 +2968,7 @@ static int q38_segment_cache_resize(Model *m,int capacity){
     if(!m||capacity<1)return -1;
     for(int layer=m->range_begin;layer<m->range_end;layer++){
         LCache *cache=&m->cache[layer];
-        if(cache->n)return -1;
-        Slot *slots=(Slot*)calloc((size_t)capacity,sizeof(*slots));
-        if(!slots)return -1;
-        free(cache->slots);cache->slots=slots;cache->cap=capacity;
+        if(cache->n||q38_cache_slots_set(cache,capacity))return -1;
     }
     return 0;
 }
