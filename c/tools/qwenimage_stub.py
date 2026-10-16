@@ -75,7 +75,70 @@ def _palette(prompt, seed):
     return words, layout
 
 
-def render(prompt, seed, width, height):
+def _load_image_bytes(image_data):
+    if not image_data or not isinstance(image_data, str):
+        return None
+    data_str = image_data.strip()
+    if data_str.startswith("data:") and "," in data_str:
+        data_str = data_str.split(",", 1)[1]
+    import base64
+    try:
+        return base64.b64decode(data_str)
+    except Exception:
+        if os.path.isfile(image_data):
+            try:
+                with open(image_data, "rb") as f:
+                    return f.read()
+            except OSError:
+                pass
+    return None
+
+
+def _decode_png_pixels(data):
+    if not data or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+    pos = 8
+    idat = []
+    width = height = color = 0
+    while pos + 8 <= len(data):
+        length, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        chunk_body = data[pos + 8:pos + 8 + length]
+        if kind == b"IHDR" and len(chunk_body) >= 10:
+            width, height, depth, color = struct.unpack(">IIBB", chunk_body[:10])
+        elif kind == b"IDAT":
+            idat.append(chunk_body)
+        elif kind == b"IEND":
+            break
+        pos += 12 + length
+    if not idat or width < 1 or height < 1:
+        return None
+    try:
+        decompressed = zlib.decompress(b"".join(idat))
+    except Exception:
+        return None
+    ch = 4 if color == 6 else (3 if color == 2 else (1 if color == 0 else 4))
+    stride = width * ch
+    if len(decompressed) < (stride + 1) * height:
+        return None
+    out = bytearray(width * height * 4)
+    for y in range(height):
+        row = decompressed[y * (stride + 1) + 1 : (y + 1) * (stride + 1)]
+        for x in range(width):
+            src_idx = x * ch
+            dst_idx = (y * width + x) * 4
+            if ch >= 3:
+                out[dst_idx] = row[src_idx]
+                out[dst_idx + 1] = row[src_idx + 1]
+                out[dst_idx + 2] = row[src_idx + 2]
+                out[dst_idx + 3] = row[src_idx + 3] if ch == 4 else 255
+            else:
+                v = row[src_idx]
+                out[dst_idx] = out[dst_idx + 1] = out[dst_idx + 2] = v
+                out[dst_idx + 3] = 255
+    return width, height, bytes(out)
+
+
+def render(prompt, seed, width, height, image=None, mask=None, strength=None):
     """RGBA8 bytes, row-major, top row first.
 
     Resolution independent on purpose: every coordinate is a fraction of the
@@ -103,7 +166,7 @@ def render(prompt, seed, width, height):
             tables[key] = found
         return found
 
-    image = bytearray(width * height * 4)
+    out_image = bytearray(width * height * 4)
     # A prompt asking for transparency gets a clear background under opaque
     # shapes, the RGBA cut-out the real model can produce.
     alpha_row = bytes([0 if transparent else 255]) * width
@@ -113,7 +176,7 @@ def render(prompt, seed, width, height):
             shift = int((bottom[c] - top[c]) * y / max(1, height - 1)) // 2
             row[c::4] = planes[c].translate(table(c, shift))
         row[3::4] = alpha_row
-        image[y * width * 4:(y + 1) * width * 4] = row
+        out_image[y * width * 4:(y + 1) * width * 4] = row
 
     def span(y, x0, x1, rgba):
         x0 = max(0, x0)
@@ -121,7 +184,7 @@ def render(prompt, seed, width, height):
         if y < 0 or y >= height or x1 <= x0:
             return
         base = (y * width + x0) * 4
-        image[base:base + (x1 - x0) * 4] = rgba * (x1 - x0)
+        out_image[base:base + (x1 - x0) * 4] = rgba * (x1 - x0)
 
     shapes = 3 + layout[0] % 3
     unit = min(width, height)
@@ -153,13 +216,39 @@ def render(prompt, seed, width, height):
     for y in range(height):
         x = int(width / 2 + slope * (y - height / 2))
         span(y, x - band // 2, x + band // 2, stripe)
-    return bytes(image)
+
+    if image is not None:
+        raw_bytes = _load_image_bytes(image)
+        decoded = _decode_png_pixels(raw_bytes) if raw_bytes else None
+        st = float(strength if strength is not None else 0.75)
+        st = max(0.0, min(1.0, st))
+        alpha = 1.0 - st
+        if decoded:
+            src_w, src_h, src_px = decoded
+            for y in range(height):
+                for x in range(width):
+                    sx = min(src_w - 1, int(x * src_w / width))
+                    sy = min(src_h - 1, int(y * src_h / height))
+                    s_idx = (sy * src_w + sx) * 4
+                    d_idx = (y * width + x) * 4
+                    for c in range(3):
+                        out_image[d_idx + c] = int(src_px[s_idx + c] * alpha + out_image[d_idx + c] * (1.0 - alpha)) & 255
+        else:
+            img_hash = hashlib.sha256(str(image).encode("utf-8")).digest()
+            for y in range(height):
+                for x in range(width):
+                    d_idx = (y * width + x) * 4
+                    for c in range(3):
+                        val = img_hash[(x + y + c) % len(img_hash)]
+                        out_image[d_idx + c] = int(val * alpha + out_image[d_idx + c] * (1.0 - alpha)) & 255
+
+    return bytes(out_image)
 
 
-def preview(prompt, seed, width, height, step, steps):
+def preview(prompt, seed, width, height, step, steps, image=None, mask=None, strength=None):
     """RGB8 thumbnail at 1/16, fading from grey noise to the picture."""
     pw, ph = max(1, width // 16), max(1, height // 16)
-    final = render(prompt, seed, pw, ph)
+    final = render(prompt, seed, pw, ph, image=image, mask=mask, strength=strength)
     mix = step / max(1, steps)
     noise = hashlib.sha256(f"noise\0{seed}\0{step}".encode("utf-8")).digest()
     out = bytearray(pw * ph * 3)
@@ -207,6 +296,10 @@ def check(request, info):
     seed = request.get("seed", 0)
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         return "seed must be a non-negative integer"
+    strength = request.get("strength")
+    if strength is not None:
+        if isinstance(strength, bool) or not isinstance(strength, (int, float)) or not 0.0 <= strength <= 1.0:
+            return "strength must be a float between 0.0 and 1.0"
     return None
 
 
@@ -280,6 +373,9 @@ def serve(args):
         steps = body.get("steps", info["default_steps"])
         seed = body.get("seed", 0)
         want_preview = bool(body.get("preview")) and os.environ.get("QWENIMAGE_STUB_PREVIEW", "1") != "0"
+        image_input = body.get("image")
+        mask_input = body.get("mask")
+        strength_input = body.get("strength")
         delay = env_float("QWENIMAGE_STUB_DELAY", 0.15)
         if "__stub_garbage__" in prompt:
             with wire.lock:
@@ -326,7 +422,8 @@ def serve(args):
             wire.line("PROGRESS", {"id": rid, "stage": "denoise", "step": step, "steps": steps,
                                    "elapsed": round(time.monotonic() - t0, 3)})
             if want_preview:
-                pw, ph, data = preview(prompt, seed, width, height, step, steps)
+                pw, ph, data = preview(prompt, seed, width, height, step, steps,
+                                       image=image_input, mask=mask_input, strength=strength_input)
                 wire.line("PREVIEW", {"id": rid, "step": step, "width": pw, "height": ph,
                                       "channels": 3, "bytes": len(data)}, data)
         if eof:
@@ -339,7 +436,8 @@ def serve(args):
         wire.line("PROGRESS", {"id": rid, "stage": "decode", "step": steps, "steps": steps,
                                "elapsed": round(time.monotonic() - t0, 3)})
         t1 = time.monotonic()
-        rgba = render(prompt, seed, width, height)
+        rgba = render(prompt, seed, width, height,
+                      image=image_input, mask=mask_input, strength=strength_input)
         t_decode = time.monotonic() - t1
         wire.line("IMAGE", {"id": rid, "width": width, "height": height, "channels": 4,
                             "bytes": len(rgba), "seed": seed, "steps": steps,
@@ -357,6 +455,9 @@ def main():
     parser.add_argument("--height", type=int, default=DEFAULTS["default_height"])
     parser.add_argument("--steps", type=int, default=DEFAULTS["default_steps"])
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--input-image", default=None, help="input image path for editing")
+    parser.add_argument("--mask", default=None, help="mask image path for in-painting")
+    parser.add_argument("--strength", type=float, default=None, help="denoising strength (0.0 to 1.0)")
     parser.add_argument("--out")
     args = parser.parse_args()
     if not os.path.isdir(args.model):
@@ -367,13 +468,14 @@ def main():
     if not args.prompt or not args.out:
         parser.error("one-shot mode needs --prompt and --out (or use --serve)")
     error = check({"prompt": args.prompt, "width": args.width, "height": args.height,
-                   "steps": args.steps, "seed": args.seed}, DEFAULTS)
+                   "steps": args.steps, "seed": args.seed, "strength": args.strength}, DEFAULTS)
     if error:
         log(error)
         return 2
     with open(args.out, "wb") as handle:
         handle.write(png(args.width, args.height,
-                         render(args.prompt, args.seed, args.width, args.height)))
+                         render(args.prompt, args.seed, args.width, args.height,
+                                image=args.input_image, mask=args.mask, strength=args.strength)))
     log(f"wrote {args.out}")
     return 0
 

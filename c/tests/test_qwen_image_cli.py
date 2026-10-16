@@ -128,7 +128,7 @@ class LauncherTest(unittest.TestCase):
 
     def test_image_commands_share_the_completion_machinery(self):
         self.assertEqual(set(self.cli.IMAGE_CHAT_COMMANDS),
-                         {"size", "steps", "seed", "render", "save", "help", "quit"})
+                         {"size", "steps", "seed", "render", "save", "help", "quit", "image", "strength"})
         self.assertEqual(self.cli.chat_command("/size 1024x576"), ("size", "1024x576"))
         # a picture's path at the start of a line is a message, not a command
         self.assertEqual(self.cli.chat_command("/home/me/foto.png cosa vedi?"), (None, None))
@@ -211,6 +211,20 @@ class CommandsTest(unittest.TestCase):
         refused = run_coli(["run", "--model", self.model, "--size", "768x432", "x"], self.env)
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("multiple of 32", refused.stderr + refused.stdout)
+
+    def test_run_with_input_image_and_strength(self):
+        base_out = Path(self.tmp.name) / "base.png"
+        run_coli(["run", "--model", self.model, "--size", "256x256", "--steps", "2",
+                  "--seed", "1", "--out", str(base_out), "a base image"], self.env)
+        self.assertTrue(base_out.exists())
+        edited_out = Path(self.tmp.name) / "edited.png"
+        result = run_coli(["run", "--model", self.model, "--size", "256x256", "--steps", "2",
+                           "--seed", "1", "--input-image", str(base_out), "--strength", "0.6",
+                           "--out", str(edited_out), "an edited image"], self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(edited_out.exists())
+        w, h, ch, _ = image_engine.decode_png(edited_out.read_bytes())
+        self.assertEqual((w, h, ch), (256, 256, 4))
 
     def test_chat_private_mode(self):
         script = "/size 256x256\n/steps 2\n/seed 7\n/bogus\na lighthouse at dusk\n/size\n:q\n"
