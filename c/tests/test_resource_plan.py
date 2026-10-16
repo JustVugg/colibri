@@ -1378,10 +1378,12 @@ memInfo.free:                     23.50 GB (97%)
         self.assertFalse(vk_dense_device_only(
             1, "qwen38", dict(forced, COLI_CUDA="1"), device)[0])
         igpu = {"type": "integrated"}
-        # Dense and chain are independent decisions in the runtime. Disabling
-        # the per-matrix path alone still leaves qwen36's default chain on.
-        self.assertTrue(vk_dense_device_only(
+        # COLI_VK_DENSE=0 keeps the default chain off too (coli_vk_chain_decide),
+        # and COLI_VK_CHAIN=1 turns it back on.
+        self.assertFalse(vk_dense_device_only(
             1, "qwen36", dict(on, COLI_VK_DENSE="0"), igpu)[0])
+        self.assertTrue(vk_dense_device_only(
+            1, "qwen36", dict(on, COLI_VK_DENSE="0", COLI_VK_CHAIN="1"), igpu)[0])
         self.assertTrue(vk_dense_device_only(
             1, "qwen38", dict(on, COLI_VK_CHAIN="0", COLI_VK_TIER="0"), igpu)[0])
         for gpu in (device, igpu):

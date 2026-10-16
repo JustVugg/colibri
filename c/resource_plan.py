@@ -147,8 +147,9 @@ def _vk_chain_dense(family_id, env, vulkan):
     tier = _vk_flag(env, "COLI_VK_TIER") != 0
     chain, dense = _vk_flag(env, "COLI_VK_CHAIN"), _vk_flag(env, "COLI_VK_DENSE")
     if chain is None:
-        chain = (kind not in ("integrated", "cpu") or
-                 kind == "integrated" and tier and family_id in _VK_IGPU_CHAIN_ON)
+        # COLI_VK_DENSE=0 keeps the trunk on the CPU, and the chain with it
+        chain = dense != 0 and (kind not in ("integrated", "cpu") or
+                                kind == "integrated" and tier and family_id in _VK_IGPU_CHAIN_ON)
     if dense is None:
         # colibri.c passes default=0 to coli_vk_dense_decide; its chain is
         # independent, but disabling that chain does not enable per-matrix GEMVs.
