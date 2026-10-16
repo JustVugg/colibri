@@ -1496,6 +1496,10 @@ jobs:
           cd c
           python3 tools/make_qwenimage_vae_tiny.py qwenimage_vae_tiny
           tests/test_qwenimage_vae qwenimage_vae_tiny
+      - name: Single-frame VAE encoder against diffusers, normal and ASan/UBSan
+        run: |
+          make -C c qwenimage-encoder-check
+          python3 c/tools/check_qwenimage_encoder.py --sanitizers
       - name: The shipping defaults (int8 weights) end to end, and the serve protocol
         run: |
           cd c

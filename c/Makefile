@@ -1947,6 +1947,15 @@ tests/test_qwenimage_vae$(EXE): tests/test_qwenimage_vae.c
 .PHONY: test_qwenimage_vae
 test_qwenimage_vae: tests/test_qwenimage_vae$(EXE)
 
+# Bare invocation is dependency-free and participates in make check. The
+# opt-in oracle uses the existing pinned torch/diffusers environment on CPU.
+tests/test_qwenimage_encoder$(EXE): tests/test_qwenimage_encoder.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+.PHONY: qwenimage-encoder-check
+qwenimage-encoder-check: tests/test_qwenimage_encoder$(EXE) tests/test_qwenimage_vae$(EXE)
+	$(PYTHON) tools/check_qwenimage_encoder.py
+
 # Il percorso completo: frame IMAGE, torre, sostituzione degli embedding,
 # generazione. Prova che due immagini diverse danno risposte diverse, che e'
 # l'unica domanda a cui una fixture con pesi casuali sa rispondere onestamente.
