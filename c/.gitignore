@@ -1,5 +1,15 @@
 *.exe
 glm_tiny/
+# QLoRA training (experimental): trainer and test binaries, adapters, generated data
+coli_train
+tests/test_lora
+tests/test_train_linear
+tests/test_train_tiny
+tests/test_train_resume
+adapters/
+train_state.bin
+data/m8_tokenized/
+data/tiny_sft/
 olmoe_hf/
 olmoe_i4/
 .build-config
