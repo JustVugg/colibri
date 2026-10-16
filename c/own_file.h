@@ -17,6 +17,15 @@
  * coli_own_is_link() says whether a path's last component is a symlink (or, on
  * Windows, any reparse point), for directories the engine creates and writes in.
  *
+ * coli_own_fopen_tmp() and coli_own_replace() write a state file as a whole: the
+ * first opens "<path>.tmp" for writing, the second renames it over <path> once
+ * the caller has written and closed it. A program reading <path> gets the old
+ * file or the new one, never half of it. A link or another file under the temp
+ * name is removed and the open is tried once more.
+ *
+ * coli_own_same_path() says whether two paths are one file, also for a file that
+ * does not exist yet.
+ *
  * Windows has no O_NOFOLLOW: there the name is checked for a reparse point just
  * before the open. Creating a symlink there needs a privilege or developer
  * mode, and archive tools leave them out unless asked. */
@@ -25,7 +34,9 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include "compat.h"      /* rename() replaces an existing file on Windows */
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -79,5 +90,67 @@ static inline FILE *coli_own_fopen(const char *path, const char *mode){
     return f;
 }
 #endif
+
+/* The absolute path of `path` with links resolved, in allocated memory. A file that does not
+ * exist yet is resolved through its directory. NULL when that fails too. */
+static inline char *coli_own_resolve(const char *path){
+#ifdef _WIN32
+    return _fullpath(NULL, path, 0);
+#else
+    char *full = realpath(path, NULL);
+    if(full || errno != ENOENT) return full;
+    const char *slash = strrchr(path, '/'), *name = slash ? slash + 1 : path;
+    char *dir = slash ? strndup(path, slash == path ? 1 : (size_t)(slash - path)) : strdup(".");
+    char *real = dir ? realpath(dir, NULL) : NULL;
+    free(dir);
+    if(!real) return NULL;
+    char *joined = (char *)malloc(strlen(real) + strlen(name) + 2);
+    if(joined) sprintf(joined, "%s/%s", real, name);
+    free(real);
+    return joined;
+#endif
+}
+
+/* 1 when both paths are one file. Paths that cannot be resolved are compared as written. */
+static inline int coli_own_same_path(const char *a, const char *b){
+    char *ra = coli_own_resolve(a), *rb = coli_own_resolve(b);
+    int same = ra && rb ? strcmp(ra, rb) == 0 : strcmp(a, b) == 0;
+    free(ra);
+    free(rb);
+    return same;
+}
+
+/* "<path>.tmp" in allocated memory; NULL with errno set when there is none. */
+static inline char *coli_own_tmp_name(const char *path){
+    size_t n = strlen(path);
+    char *tmp = (char *)malloc(n + sizeof ".tmp");
+    if(!tmp){ errno = ENOMEM; return NULL; }
+    memcpy(tmp, path, n);
+    memcpy(tmp + n, ".tmp", sizeof ".tmp");
+    return tmp;
+}
+
+/* Opens "<path>.tmp" with fopen's mode "w". NULL with errno set on failure. */
+static inline FILE *coli_own_fopen_tmp(const char *path){
+    char *tmp = coli_own_tmp_name(path);
+    if(!tmp) return NULL;
+    FILE *f = coli_own_fopen(tmp, "w");
+    if(!f && (errno == ELOOP || errno == EINVAL) && remove(tmp) == 0) f = coli_own_fopen(tmp, "w");
+    int e = errno;
+    free(tmp);
+    errno = e;
+    return f;
+}
+
+/* Renames the closed "<path>.tmp" over <path>. 0 on success, -1 with errno set on failure. */
+static inline int coli_own_replace(const char *path){
+    char *tmp = coli_own_tmp_name(path);
+    if(!tmp) return -1;
+    int rc = rename(tmp, path);
+    int e = errno;
+    free(tmp);
+    errno = e;
+    return rc;
+}
 
 #endif /* OWN_FILE_H */

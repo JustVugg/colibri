@@ -2201,6 +2201,22 @@ class Qwen38PartialChainTest(unittest.TestCase):
         self.assertEqual([a < b for a, b in zip(small["layers"], [47664, 92768, 24112, 92768])],
                          [False, True, False, True])
 
+    def test_qwen38_keeps_the_lm_head_on_the_host_for_the_draft_list(self):
+        from resource_plan import _vk_released_tensor_bytes
+        head = {"name": "lm_head.weight", "dtype": "BF16", "shape": [320, 64], "size": 320 * 64 * 2,
+                "resident": 320 * 64 + 4 * 320}
+        self.assertEqual(_vk_released_tensor_bytes(head, "qwen38", {}), 0)
+        for off in ({"Q38_MTP": "0"}, {"Q38_MTP_VOCAB": "0"}):
+            with self.subTest(env=off):
+                self.assertEqual(_vk_released_tensor_bytes(head, "qwen38", off), head["resident"])
+        # the engine drops the list when its counts file is the expert history, in any spelling
+        for same in ({"COLI_VOCAB_USAGE": "u", "COLI_USAGE": "./u"},
+                     {"COLI_USAGE": "/model/.coli_vocab"},
+                     {"COLI_VOCAB_USAGE": "/model/./.coli_usage"}):
+            with self.subTest(env=same):
+                self.assertEqual(_vk_released_tensor_bytes(head, "qwen38", same, "/model"), head["resident"])
+        self.assertEqual(_vk_released_tensor_bytes(head, "qwen38", {"COLI_USAGE": "/model/.coli_vocab"}, "/other"), 0)
+
     def test_qwen38_device_only_credits_the_layers_on_the_device(self):
         from resource_plan import vk_chain_fit, _vk_released_tensor_bytes
         info = self.write_q38(1)

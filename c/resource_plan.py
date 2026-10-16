@@ -266,7 +266,22 @@ def _glm53_dense_tensors(info, env):
     return dict(info, dense_bytes=total, embed_bytes=embedding, dense_tensors=adjusted)
 
 
-def _vk_released_tensor_bytes(tensor, family, env):
+def _q38_state_file(env, setting, default, model_dir):
+    return os.path.realpath(env.get(setting) or os.path.join(model_dir, default))
+
+
+def _q38_draft_list_on(env, model_dir):
+    """Whether qwen38 may score MTP drafts from a token list (draft_vocab.h), which needs the host
+    int8 rows of the lm_head. The head drafts unless Q38_MTP=0, and from a list unless Q38_MTP_VOCAB=0
+    or the counts file of the list is the file of the expert history.
+    A checkpoint without an MTP head has no list. Crediting 0 for the lm_head of that checkpoint is
+    still a lower bound."""
+    return ((env.get("Q38_MTP") or "").strip() != "0" and (env.get("Q38_MTP_VOCAB") or "").strip() != "0" and
+            _q38_state_file(env, "COLI_VOCAB_USAGE", ".coli_vocab", model_dir) !=
+            _q38_state_file(env, "COLI_USAGE", ".coli_usage", model_dir))
+
+
+def _vk_released_tensor_bytes(tensor, family, env, model_dir=""):
     """A lower bound on the host allocation an engine's dho pass can free.
 
     Only audited matrix names and source formats get credit. Keep norms, vision,
@@ -283,6 +298,8 @@ def _vk_released_tensor_bytes(tensor, family, env):
     head = name == "lm_head.weight"
     floating = dtype in ("BF16", "F16", "F32")
     if family == "qwen38":
+        if head and _q38_draft_list_on(env, model_dir):
+            return 0
         known = (head or part in _Q38_TRUNK_COMPONENTS or
                  part in ("linear_attn.in_proj_a", "linear_attn.in_proj_b", "ple.key_proj", "ple.value_proj") or
                  name in ("model.hyper_connection_mixer.input_mix_weight_down.weight",
@@ -3138,7 +3155,8 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         return layer is not None and layer < chain_fit["n"]
     tensors_on_device = [tensor for tensor in info.get("dense_tensors", []) if on_device(tensor)]
     if partial:
-        released = sum(_vk_released_tensor_bytes(tensor, family_id, env_now) for tensor in tensors_on_device)
+        released = sum(_vk_released_tensor_bytes(tensor, family_id, env_now, info["path"])
+                       for tensor in tensors_on_device)
         vk_dense, vk_dense_why = ((False, None) if chain_fit["n"] == 0 else
                                   vk_dense_device_only(released, family_id, env_now, vulkan))
     else:
@@ -3147,7 +3165,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     dense_on_device = 0
     if vk_dense:
         dense_on_device = min(device_dense_bytes, sum(
-            _vk_released_tensor_bytes(tensor, family_id, env_now)
+            _vk_released_tensor_bytes(tensor, family_id, env_now, info["path"])
             for tensor in tensors_on_device))
         info = dict(info, dense_bytes=info["dense_bytes"] - dense_on_device)
     # On an integrated/software device the remaining device copy still consumes
