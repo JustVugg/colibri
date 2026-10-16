@@ -169,6 +169,10 @@ jobs:
           # choose staging on its own; then the formats, the tier and the chain's ops staged.
           bash tests/vulkan_engines.sh staged
           COLI_VK_STAGED=1 bash tests/vulkan_engines.sh shader
+      - name: Memory types and budgets against tables
+        run: |
+          cd c
+          make vk-memtype-check VK=1
 
   # Every engine with a Vulkan hook, run twice on its tiny fixture: on the CPU and on
   # Lavapipe, with the same snapshot and settings. The gate is the CPU's tokens (and

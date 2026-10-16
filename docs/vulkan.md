@@ -2545,14 +2545,24 @@ in short:
 
 Resident data (the dense weights, the routed-expert tier, the MLA KV mirror) is written
 by the host once and read by the device for the rest of the run. The mapped path puts it
-in the HOST_VISIBLE|DEVICE_LOCAL memory type and writes it through a mapping. On an
-integrated GPU, a CPU device (Lavapipe) or a discrete card with Resizable BAR, that type
-covers the device's memory. A discrete card without Resizable BAR (every Turing card,
-every Ampere card on its launch VBIOS, older AMD cards with the option off) exposes it
-as a window of about 256 MB of 8 GB or more. NVIDIA's driver refuses allocations past the
-window: on an RTX 3070 with its launch VBIOS the backend warned "only 246 of 8192 MB VRAM
-is host-visible", placed no matrix, every tier upload failed and the chain stopped at its
-first matrix. RADV places them in system RAM instead, where every access crosses PCIe.
+in the memory type for what the CPU writes (HOST_VISIBLE|DEVICE_LOCAL, or system memory
+on an integrated GPU) and writes it through a mapping. On an integrated GPU, a CPU device
+(Lavapipe) or a discrete card with Resizable BAR, that type covers the device's memory. A
+discrete card without Resizable BAR (every Turing card, every Ampere card on its launch
+VBIOS, older AMD cards with the option off) exposes it as a window of about 256 MB of 8 GB
+or more. NVIDIA's driver refuses allocations past the window: on an RTX 3070 with its
+launch VBIOS the backend warned "only 246 of 8192 MB VRAM is host-visible", placed no
+matrix, every tier upload failed and the chain stopped at its first matrix. RADV places
+them in system RAM instead, where every access crosses PCIe.
+
+**Memory types by use.** The backend chooses the memory type of a buffer by what the buffer
+is used for: only the GPU uses it, the CPU writes it, or the CPU reads it back. A discrete
+GPU and Lavapipe get device-local memory where the use allows it, and a host-cached type
+for what the CPU reads back. An integrated GPU with a heap of system memory gets
+host-visible system memory for all three uses, so no buffer is placed in the VRAM
+carve-out reserved by the BIOS. An allocation that runs out of memory there is retried in a
+device-local type. `COLI_VK_DEVICE_CAP_MB`, the budget and the expert batch count the
+device memory: the device-local heaps, and every heap of an integrated GPU.
 
 **Staged uploads** put resident data in a DEVICE_LOCAL memory type the host does not map
 and copy it there from a host staging buffer with `vkCmdCopyBuffer`.
@@ -2895,7 +2905,7 @@ predict a layer more than the engine places.
 | deepseek_v41 | the hc_mult streams and the last site's mix; the candidate mask and the published index list a chain layer made for the CPU's layers; DSpark's target means from whichever side ran them | yes |
 | kimi_k3 | the AttnRes prefix, the block snapshots and their count; with every layer but not the head, the final rows for the CPU's head | yes |
 
-**`COLI_VK_DEVICE_CAP_MB=n`** (tests) makes the device hold at most n MiB of device-local
+**`COLI_VK_DEVICE_CAP_MB=n`** (tests) limits the device to n MiB of device
 memory (a fraction is taken): every allocation of the backend and the chain (tensors, the
 tier's pool, the chain's buffers, staging, the second device's) is counted, one past the
 cap fails as out of device memory would, and every budget the engines read reports the cap.
