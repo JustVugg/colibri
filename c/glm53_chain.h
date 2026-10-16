@@ -204,6 +204,12 @@ static void g53c_cpu_step(const GModel *m, const GSession *s, int start) {
     g53c_sync_host(m, s);
     for (int d = 0; d < 2; d++) { G53Chain *x = g53c_of(d); if (x && x->ok && x->owner == s) g53c_cpu_one(m, x, start); }
 }
+/* A forward of s from `start` stopped between layers (g_layer_halt): its chunk is thrown
+ * away, so nothing the devices hold from `start` on counts. The host's KDA state is not
+ * read back: forward_prefill puts back the copy it took when the chunk began. */
+static void g53c_halted(const GModel *m, const GSession *s, int start) {
+    for (int d = 0; d < 2; d++) { G53Chain *x = g53c_of(d); if (x && x->ok && x->owner == s) g53c_cpu_one(m, x, start); }
+}
 
 /* ---- setup ----------------------------------------------------------------------------- */
 /* g53c_tensor's backend format for w without uploading it (-1: no device form) and its
@@ -734,7 +740,8 @@ static int g53c_prefill_rows(GModel *m, GSession *s, int n) {
 /* One chain's layers (lo..lo+n-1, on its device, current) for n rows of `streams` (the
  * session's positions start..), the streams after the last of them back into it. Returns
  * ch->n; 0 = not taken: memory refused (the streams untouched), or *lost = 1: a frame
- * failed (the device marked lost). */
+ * failed (the device marked lost); -1 = g_layer_halt stopped it between two layers (the
+ * device idle, the streams untouched). */
 static int g53c_forward_seg(GModel *m, GSession *s, G53Chain *ch, float *streams, int n, int start, int *lost) {
     *lost = 0;
     const Cfg *c = &m->c; int D = c->hidden, H = c->hc_mult, HD = H * D, lo = ch->lo, hi = lo + ch->n;
@@ -757,6 +764,14 @@ static int g53c_forward_seg(GModel *m, GSession *s, G53Chain *ch, float *streams
             goto lost;
         int ok = 1, pending = 0, pulled = lo;
         for (int i = lo; i < hi && ok; i++) {
+            /* between two layers, as run_layers on the CPU: not before the forward's first */
+            if (g_layer_halt && (i > lo || c0 > 0 || lo > 0) && g_layer_halt(g_layer_halt_arg)) {
+                if (!vkc_finish()) goto lost;
+                g_halted_at_layer = i;
+                g_halted_on_device = 1;
+                free(outs);
+                return -1;
+            }
             const GLayer *l = &m->layer[i];
             if (pending) {                       /* the FFN branch of the layer before: shared + routed, written back */
                 VkcEw add = {VKC_EW_ADD, nr * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
@@ -816,7 +831,8 @@ lost:   /* a frame failed: the device is gone (or would not take a command) */
  * device's after them) for n rows of `streams` (the session's positions start..), the
  * streams after the last of them back into it. Returns how many layers ran: L, or fewer
  * (run_layers goes on from there on the CPU); 0 = not taken: the CPU runs the layers
- * (streams as they came in). */
+ * (streams as they came in); -1 = stopped between layers (g53c_halted: the chunk is the
+ * caller's to throw away). */
 static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start) {
     G53Chain *ch = g_g53c, *ch2 = g_g53c2;
     if (!g_vk_chain || !ch || !ch->ok || ch->failed) return 0;
@@ -862,6 +878,7 @@ static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start
     if (keep) memcpy(keep, streams, (size_t)n * HD * sizeof(float));
     int lost = 0;
     int done = g53c_forward_seg(m, s, ch, streams, n, start, &lost);
+    if (done < 0) { free(keep); g53c_halted(m, s, start); return -1; }
     if (!done) {
         free(keep);
         if (lost) { g53c_recover(m, s, start, dev0, dev2, ch); return 0; }
@@ -873,6 +890,7 @@ static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start
     vkc_device(1);
     int done2 = g53c_forward_seg(m, s, ch2, streams, n, start, &lost);
     vkc_device(0);
+    if (done2 < 0) { free(keep); g53c_halted(m, s, start); return -1; }
     if (lost) {
         memcpy(streams, keep, (size_t)n * HD * sizeof(float));
         free(keep);

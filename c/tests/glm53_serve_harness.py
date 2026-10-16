@@ -17,6 +17,7 @@ che nessuno ha fatto.
 import argparse
 import os
 import tempfile
+import time
 import subprocess
 import sys
 from pathlib import Path
@@ -107,10 +108,10 @@ def collect(process, request_id):
             return b"".join(pieces), line, reuse_reported()
 
 
-def fresh_answer(binary, fixture, body, tokens):
+def fresh_answer(binary, fixture, body, tokens, extra=None):
     """La risposta di un motore appena partito: il riferimento per ogni riuso.
     Un motore suo, perche' lo slot di un altro potrebbe riusare qualcosa."""
-    reference = engine(binary, fixture)
+    reference = engine(binary, fixture, extra)
     try:
         handshake(reference)
         submit_bytes(reference, 1, body, max_tokens=tokens)
@@ -143,6 +144,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
     parser.add_argument("--fixture", type=Path, required=True)
+    # Con COLI_VULKAN=1 il prefill puo' passare dalla catena densa sul device
+    # (g53c_forward), che ha il suo controllo fra i layer: questo esige che il
+    # CANCEL dentro un pezzo lo fermi li' (riga HALT "on the device"), e non
+    # su un layer del CPU.
+    parser.add_argument("--vk-chain", action="store_true",
+                        help="il CANCEL dentro un pezzo deve passare dalla catena Vulkan")
     arguments = parser.parse_args()
     if not (arguments.fixture / "ref.json").exists():
         # Un traceback su un file che manca fa sembrare rotto il
@@ -666,6 +673,112 @@ def main() -> int:
               f"  riusando: {retried!r}\n  da pulito: {from_clean!r} ({done32!r})")
         return 1
 
+    # --- CANCEL a meta' di un pezzo di prefill ---
+    #
+    # Fra un pezzo e l'altro non basta: un pezzo puo' durare a lungo. Il
+    # CANCEL si guarda anche fra un layer e l'altro, e un pezzo fermato a
+    # meta' si butta rimettendo lo stato KDA di inizio pezzo. Qui un solo
+    # pezzo lungo (1000 token, 8000 sulla catena Vulkan, 4 layer) e un CANCEL
+    # mandato dopo un po': deve fermarlo dentro il pezzo (riga HALT), lasciare
+    # la cache ai 10 token di prima, e il nuovo tentativo deve riusarli e
+    # rispondere come un motore appena partito. Se lo stato non venisse
+    # rimesso, il riuso partirebbe da una ricorrenza avanzata a meta'.
+    #
+    # E' l'unico caso a tempo: se il CANCEL arriva prima o dopo il pezzo si
+    # riprova con un altro ritardo, e senza una riga HALT il caso fallisce
+    # invece di passare senza aver provato niente. I ritardi sono frazioni di
+    # quanto dura il pezzo su questa macchina, misurato prima senza CANCEL:
+    # ritardi fissi andavano bene su una macchina e su un'altra, dieci volte
+    # piu' veloce, arrivavano tutti dopo il pezzo. Il pezzo e' quello che
+    # dice la riga PROF (attenzione + esperti), non tutta la richiesta: sulla
+    # catena Vulkan il forward e' una frazione piccola della richiesta, e
+    # frazioni della richiesta cadevano tutte dopo il pezzo.
+    width = 8000 if arguments.vk_chain else 1000
+    one_chunk = {"GLM53_PREFILL_CHUNK": "8192"}
+    if arguments.vk_chain and "COLI_VK_CHAIN_ROWS" not in os.environ:
+        # Sulla catena i 3 layer densi della fixture si registrano in pochi ms
+        # e poi si aspetta il device per tutto il pezzo: i controlli fra i
+        # layer cadono tutti all'inizio, e nessun ritardo li prende. A righe
+        # di 128 il device si aspetta a ogni gruppo di righe, e fra un gruppo
+        # e l'altro si guarda di nuovo (riga HALT al layer 0).
+        one_chunk["COLI_VK_CHAIN_ROWS"] = "128"
+    wide = ("gu" + "abcdefghijklmnopqrstuvwxyz0123" * 400)[:width].encode()
+    timing = engine(binary, arguments.fixture, one_chunk)
+    try:
+        handshake(timing)
+        submit_bytes(timing, 50, wide[:10], max_tokens=1)
+        collect(timing, 50)
+        started = time.monotonic()
+        submit_bytes(timing, 51, wide, max_tokens=1)
+        prof = []
+        while True:
+            line = read_line(timing.stdout)
+            if line.startswith("PROF "):
+                prof = line.split()
+            elif line.startswith("DONE 51 ") or line.startswith("ERROR 51 "):
+                break
+        took = time.monotonic() - started
+    finally:
+        timing.stdin.close()
+        timing.wait(timeout=120)
+    # PROF elapsed prompt emitted disk 0 ffn-disk attn head forwards
+    forward = sum(float(v) for v in prof[4:5] + prof[6:8]) if len(prof) >= 8 else 0.0
+    window = forward if 0.0 < forward <= took else took
+    delays = [window * share for share in (0.4, 0.25, 0.55, 0.15, 0.7)]
+    halted_mid = None
+    for delay in delays:
+        mid = engine(binary, arguments.fixture, one_chunk)
+        try:
+            handshake(mid)
+            submit_bytes(mid, 50, wide[:10], max_tokens=1)
+            collect(mid, 50)
+            submit_bytes(mid, 51, wide, max_tokens=4)
+            time.sleep(delay)
+            mid.stdin.write(b"CANCEL 51\n")
+            mid.stdin.flush()
+            _, done51, _ = collect(mid, 51)
+            notes = open(NOTES, "r", errors="replace").read().splitlines()
+            halts = [line for line in notes if line.startswith("HALT ")]
+            if not halts:
+                continue                      # fuori dal pezzo: altro ritardo
+            submit_bytes(mid, 52, wide, max_tokens=4)
+            retried_mid, done52, _ = collect(mid, 52)
+            halted_mid = (done51, [line.split() for line in notes
+                                   if line.startswith("CANCEL 51 ")],
+                          retried_mid, done52, reuse_line(52), halts)
+            break
+        finally:
+            mid.stdin.close()
+            mid.wait(timeout=120)
+    if not halted_mid:
+        print("FAIL: nessun CANCEL e' arrivato dentro il pezzo di prefill con "
+              f"nessuno dei ritardi provati (nessuna riga HALT): il pezzo dura "
+              f"{window:.3f} s (la richiesta {took:.3f} s), ritardi "
+              f"{', '.join(f'{d:.3f}' for d in delays)} s")
+        return 1
+    done51, cancel51, retried_mid, done52, reuse52, halts = halted_mid
+    # Il conto dei forward della catena non basta: la richiesta di 10 token
+    # prima e la decodifica ci passano comunque, anche se il pezzo lungo
+    # finisse sul CPU. Lo dice solo la riga HALT del pezzo fermato.
+    if arguments.vk_chain and not all(" on the device," in line for line in halts):
+        print(f"FAIL: --vk-chain ma il pezzo non e' stato fermato dalla catena "
+              f"Vulkan: {halts!r}")
+        return 1
+    if done51 != "ERROR 51 CANCELLED" or \
+            cancel51 != [["CANCEL", "51", str(len(wide)), "0", "10"]]:
+        print(f"FAIL: CANCEL dentro il pezzo -> {done51!r}, {cancel51!r}; attesi "
+              f"CANCELLED e la cache ferma ai 10 token di prima")
+        return 1
+    if not done52.startswith("DONE 52 ") or reuse52[2:4] != ["10", str(len(wide))] \
+            or reuse52[-1] != "extend":
+        print(f"FAIL: dopo un pezzo buttato il nuovo tentativo doveva riusare i 10 "
+              f"token: {done52!r}, {reuse52!r}")
+        return 1
+    if retried_mid != fresh_answer(binary, arguments.fixture, wide, 4, one_chunk):
+        print(f"FAIL: dopo un pezzo buttato la risposta cambia ({retried_mid!r}): "
+              f"lo stato KDA non e' tornato all'inizio del pezzo")
+        return 1
+
     # La CLI stampa la risposta e poi un a capo; quello che conta e' che i byte
     # della risposta siano gli stessi.
     from_cli = cli_answer(binary, arguments.fixture, prompt, tokens)
@@ -681,6 +794,7 @@ def main() -> int:
           f"CANCEL onorato a meta' turno dopo {emitted_before} token su {budget}, "
           f"STOP chiuso col DONE dopo {emitted_stop} token su {stop_budget}, "
           f"Continue senza gli spazi finali ripreso a {len(trimmed)} token, "
+          f"CANCEL dentro un pezzo di prefill buttato e rimesso a 10 token, "
           f"CANCEL durante il prefill fermo a 10 token su {len(body)} e riusato "
           f"dal nuovo tentativo, "
           f"SUBMIT a slot occupato rifiutato con SLOT_BUSY, "
