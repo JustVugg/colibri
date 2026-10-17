@@ -605,15 +605,27 @@ static void q38_matmul_int4g64(float *y,const float *x,const uint8_t *codes,
  * on the CPU in every format. The device copy lives in weight->vk from the
  * first call; a failed upload sets vk_off and the matrix stays on the CPU.
  * The backend has one command buffer: never from a parallel region. */
+/* A GGUF's matrix of ggml blocks the device reads as the file has them (blockdec.glsl):
+ * only the dense chain does (qwen38_chain.h); the per-matrix dense path and the host-copy
+ * drop leave it on the CPU, which also runs the prompts' longer chunks. */
+static int q38_vk_blocks(const Q38Weight *w) {
+    if(w->kind!=Q38_WEIGHT_GGML)return 0;
+    const int base=gq_r16_base(w->gq_type),t=base>=0?base:w->gq_type,be=coli_vk_block_elems(100+t);
+    return be>0&&w->cols%be==0;
+}
 static int q38_vk_eligible(const Q38Weight *w) {
     return w->q8 || w->vk_gone || (w->vk_res && w->data &&
-                     (w->kind==Q38_WEIGHT_BF16 || w->kind==Q38_WEIGHT_F32));
+                     (w->kind==Q38_WEIGHT_BF16 || w->kind==Q38_WEIGHT_F32 || q38_vk_blocks(w)));
 }
-/* The format of the weight's device copy: the int8 rows, else the rows as loaded; with
- * the host copy dropped (vk_gone), the one it was uploaded in. */
+/* The format of the weight's device copy: the int8 rows, else the rows as loaded (a
+ * GGUF's blocks: 100 + their ggml type); with the host copy dropped (vk_gone), the one it
+ * was uploaded in. */
 static int q38_vk_fmt(const Q38Weight *w) {
+    if(!w->vk_gone&&!w->q8&&w->kind==Q38_WEIGHT_GGML){const int b=gq_r16_base(w->gq_type);return 100+(b>=0?b:w->gq_type);}
     return w->vk_gone?w->vk_fmt:w->q8?1:w->kind==Q38_WEIGHT_BF16?11:10;
 }
+/* eligible for the per-matrix dense path (q38_vk_matmul) and the host-copy drop */
+static int q38_vk_dense_ok(const Q38Weight *w) { return q38_vk_eligible(w)&&!q38_vk_blocks(w); }
 static unsigned g_q38_vk_placed[3];   /* uploads by format: int8 rows, bf16, f32 */
 /* A partial dense chain (qwen38_chain.h, q38c_start): the first N layers' matrices are on
  * the device, the other layers and the head stay on the CPU, so nothing that is not on
@@ -633,8 +645,16 @@ static ColiVkTensor *q38_vk_tensor(const Q38Weight *weight) {
     int fmt=q38_vk_fmt(w);
     const void *wq=w->q8?(const void*)w->q8:(const void*)w->data;
     const float *sc=w->q8?w->q8sc:NULL;   /* fmt 10/11: no scales */
-    if(!(g_q38_vk_dev?coli_vk_tensor_ensure2(t,wq,sc,fmt,w->cols,w->rows,0)
-                     :coli_vk_tensor_ensure(t,wq,sc,fmt,w->cols,w->rows,0))){w->vk_off=1;return NULL;}
+    uint8_t *rows=NULL;   /* a GGUF's rows interleaved by 16 for the CPU: the file's rows back */
+    if(fmt>=100&&gq_r16_base(w->gq_type)>=0){
+        if(!(rows=(uint8_t*)malloc((size_t)gq_row_bytes(fmt-100,w->cols)*w->rows))){w->vk_off=1;return NULL;}
+        gq_r16_unpack(w->gq_type,rows,(const uint8_t*)w->data,w->rows,w->cols);
+        wq=rows;
+    }
+    int ok=g_q38_vk_dev?coli_vk_tensor_ensure2(t,wq,sc,fmt,w->cols,w->rows,0)
+                       :coli_vk_tensor_ensure(t,wq,sc,fmt,w->cols,w->rows,0);
+    free(rows);
+    if(!ok){w->vk_off=1;return NULL;}
     g_q38_vk_placed[fmt==1?0:fmt==11?1:2]++;
     return *t;
 }
@@ -642,7 +662,7 @@ static int q38_vk_matmul(float *y,const float *x,const Q38Weight *weight,int S,i
 #ifdef _OPENMP
     if(omp_in_parallel())return 0;
 #endif
-    if(weight->vk_off||S<1||S>65535)return 0;
+    if(weight->vk_off||S<1||S>65535||!q38_vk_dense_ok(weight))return 0;
     Q38Weight *w=(Q38Weight*)weight;
     int fmt=q38_vk_fmt(w);
     const void *wq=w->q8?(const void*)w->q8:(const void*)w->data;
@@ -688,7 +708,7 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
     if(S>1&&g_q38_rowwise&&weight&&
        (weight->gpu
 #ifdef COLI_VULKAN
-        ||(g_vk_ready&&g_vk_dense&&q38_vk_eligible(weight)&&(weight->vk||!g_q38_vk_noup))
+        ||(g_vk_ready&&g_vk_dense&&q38_vk_dense_ok(weight)&&(weight->vk||!g_q38_vk_noup))
 #endif
        )){
         for(int s=0;s<S;s++)q38_weight_matmul(y+(int64_t)s*O,x+(int64_t)s*I,weight,1,I,O);
@@ -722,7 +742,7 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
     if(S==1&&weight&&weight->gpu&&weight->rows==O&&weight->cols==I&&
        qt_dense_matmul(weight->gpu-1,y,x,I,O))return;
 #ifdef COLI_VULKAN
-    if(g_vk_ready&&g_vk_dense&&weight&&weight->rows==O&&weight->cols==I&&q38_vk_eligible(weight)&&
+    if(g_vk_ready&&g_vk_dense&&weight&&weight->rows==O&&weight->cols==I&&q38_vk_dense_ok(weight)&&
        q38_vk_matmul(y,x,weight,S,I,O))return;
     /* the CPU needs a matrix the device holds alone (a lost device): read it back */
     if(weight&&weight->vk_gone)q38_dho_reload((Q38Weight*)weight);
@@ -1386,7 +1406,15 @@ static int q38_env_bool(const char *name,int default_value) {
 }
 
 static Q38Weight q38_load_weight(Model *m,const char *name,int rows,int cols) {
-    if(g_q38_gguf)return q38_gg_weight(m,name,rows,cols);
+    if(g_q38_gguf){
+        Q38Weight w=q38_gg_weight(m,name,rows,cols);
+#ifdef COLI_VULKAN
+        w.vk_res=1;   /* as below: its rows may live on the device (a block type's on the dense chain only) */
+        w.vk_name=strdup(name);
+        if(!w.vk_name){fprintf(stderr,"OOM weight name\n");exit(1);}
+#endif
+        return w;
+    }
     st_tensor *tensor=st_find(&m->S,name);Q38Weight weight={0};
     if(!tensor){fprintf(stderr,"missing %s\n",name);exit(1);}
     if(tensor->rank!=2||tensor->shape[0]!=rows||tensor->shape[1]!=cols||
@@ -3652,7 +3680,7 @@ static void q38_dho_reload(Q38Weight *w) {
     pthread_mutex_unlock(&g_q38_dho_mx);
 }
 static void q38_dho_drop(Q38Weight *w,size_t *bytes,int *n) {
-    if(!w->vk_res||w->vk_gone||!q38_vk_eligible(w)||!w->vk_name||!q38_vk_tensor(w))return;
+    if(!w->vk_res||w->vk_gone||!q38_vk_dense_ok(w)||!w->vk_name||!q38_vk_tensor(w))return;
     size_t b=q38_dho_host_bytes(w);
     w->vk_fmt=q38_vk_fmt(w);
     if(w->q8){free(w->q8);free(w->q8sc);w->q8=NULL;w->q8sc=NULL;}
@@ -3680,7 +3708,7 @@ static void q38_dho_each(Model *m,void (*f)(Q38Weight *,size_t *,int *),size_t *
     if(m->mtp&&head){f(&m->mtp_fc_emb,bytes,n);f(&m->mtp_fc_hid,bytes,n);f(&m->mtp_mixer.down,bytes,n);f(&m->mtp_mixer.up,bytes,n);}
 }
 static void q38_dho_count(Q38Weight *w,size_t *bytes,int *n) {
-    if(w->vk_res&&!w->vk_off&&q38_vk_eligible(w)){*bytes+=q38_dho_host_bytes(w);(*n)++;}
+    if(w->vk_res&&!w->vk_off&&q38_vk_dense_ok(w)){*bytes+=q38_dho_host_bytes(w);(*n)++;}
 }
 #endif
 
