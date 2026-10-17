@@ -1598,6 +1598,7 @@ PAGES = {"/health": {"status": "ok", "arch": "qwen36"},
          "/profile": {"seq": 1, "turns": [{"wall_s": 2.0, "completion_tokens": 10}]},
          "/v1/models": {"object": "list", "data": [{"id": "fake-model"}]}}
 class H(http.server.BaseHTTPRequestHandler):
+    server_version = "colibri"
     def log_message(self, *a): pass
     def do_GET(self):
         body = json.dumps(PAGES.get(self.path, {})).encode()
@@ -1703,9 +1704,14 @@ class ServerControl(HomeTestCase):
         self.port = moved["port"]                                 # cleanup stops this one
 
     def test_foreign_http_health_does_not_prevent_starting_the_configured_server(self):
-        for payload in ({"service": "other program"}, ["healthy"]):
-            with self.subTest(payload=payload):
+        for payload, product in (({"service": "other program"}, "other"),
+                                 (["healthy"], "other"),
+                                 ({"status": "ok"}, "uvicorn"),
+                                 ({"status": "ok"}, "colibri-extra"),
+                                 ({"status": "ok"}, "not-colibri")):
+            with self.subTest(payload=payload, product=product):
                 class ForeignHealth(SimpleHTTPRequestHandler):
+                    server_version = product
                     def log_message(self, *_): pass
                     def do_GET(self):
                         body = json.dumps(payload).encode()
@@ -1721,18 +1727,123 @@ class ServerControl(HomeTestCase):
                     args = list(self.cfg["args"])
                     args[args.index("--port") + 1] = str(occupied)
                     cfg = setup_flow.save_config(dict(self.cfg, args=args, port=occupied))
-                    self.assertEqual(setup_flow.server_status(cfg)["state"], "stopped")
+                    initial = setup_flow.server_status(cfg)
                     setup_flow.start_server(cfg, background=True, open_browser=False,
                                             out=lambda *_: None, wait=10)
                     moved = setup_flow.load_config()
                     self.port = moved["port"]
                     self.assertNotEqual(self.port, occupied)
+                    self.assertEqual(initial["state"], "stopped")
                     self.assertEqual(self.wait_state(moved, "ready")["state"], "ready")
                     self.cleanup_server()
                 finally:
                     blocker.shutdown()
                     blocker.server_close()
                     thread.join(timeout=2)
+
+    def test_finish_reports_selected_port_after_fallback(self):
+        for json_mode in (True, False):
+            with self.subTest(json=json_mode):
+                class OccupiedPort(SimpleHTTPRequestHandler):
+                    def log_message(self, *_): pass
+                    def do_GET(self):
+                        body = b'{"service":"other"}'
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                server = ThreadingHTTPServer(("127.0.0.1", 0), OccupiedPort)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    occupied = server.server_port
+                    cfg = setup_flow.save_config(dict(self.cfg, port=occupied,
+                        urls=setup_flow.urls("127.0.0.1", occupied),
+                        args=setup_flow._replace_arg(self.cfg["args"], "--port", str(occupied))))
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        code = setup_flow._finish(setup_flow.UI(False, stream=output), cfg,
+                            setup_args(json=json_mode, no_start=False, background=True))
+                    moved = setup_flow.load_config()
+                    self.port = moved["port"]
+                    self.assertEqual(code, 0)
+                    self.assertNotEqual(moved["port"], occupied)
+                    self.assertEqual(self.wait_state(moved, "ready")["state"], "ready")
+                    if json_mode:
+                        result = json.loads(output.getvalue())
+                        self.assertEqual(result["config"], moved)
+                        self.assertEqual(result["status"]["urls"], moved["urls"])
+                    self.assertEqual(setup_flow.read_state()["urls"], moved["urls"])
+                finally:
+                    current = setup_flow.load_config()
+                    if current:
+                        self.port = current["port"]
+                    self.cleanup_server()
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=2)
+
+    def test_finish_keeps_config_when_the_port_does_not_change(self):
+        for json_mode in (True, False):
+            with self.subTest(json=json_mode):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(setup_flow._finish(setup_flow.UI(False, stream=output), self.cfg,
+                        setup_args(json=json_mode, no_start=False, background=True)), 0)
+                self.assertEqual(setup_flow.load_config(), self.cfg)
+                self.assertEqual(setup_flow.read_state()["urls"], self.cfg["urls"])
+                if json_mode:
+                    self.assertEqual(json.loads(output.getvalue())["config"], self.cfg)
+
+    def test_finish_no_start_does_not_launch_or_write_started_state(self):
+        for json_mode in (True, False):
+            with self.subTest(json=json_mode):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(setup_flow._finish(setup_flow.UI(False, stream=output), self.cfg,
+                        setup_args(json=json_mode, no_start=True, background=True)), 0)
+                self.assertFalse(Path(self.env_out).exists())
+                self.assertIsNone(setup_flow.read_state())
+                self.assertEqual(setup_flow.load_config(), self.cfg)
+                if json_mode:
+                    result = json.loads(output.getvalue())
+                    self.assertEqual(result["config"], self.cfg)
+                    self.assertNotIn("status", result)
+
+    def test_old_colibri_product_header_still_marks_the_server_ready(self):
+        class OldColibri(SimpleHTTPRequestHandler):
+            server_version = "colibri"
+            sys_version = "Python/3.8.10"
+            def log_message(self, *_): pass
+            def do_GET(self):
+                body = b'{"status":"ok"}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), OldColibri)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.assertEqual(setup_flow.server_status(dict(self.cfg, port=server.server_port))["state"],
+                             "ready")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_live_pid_without_health_is_still_loading(self):
+        pidfile = Path(setup_flow.serve_pidfile(self.port))
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            pidfile.write_text(str(process.pid))
+            result = setup_flow.server_status(self.cfg)
+            self.assertEqual(result["state"], "loading")
+            self.assertEqual(result["pid"], process.pid)
+        finally:
+            pidfile.unlink(missing_ok=True)
+            process.terminate()
+            process.wait(timeout=5)
 
     def test_actual_protected_colibri_health_remains_ready_without_a_pidfile(self):
         from openai_server import APIServer
