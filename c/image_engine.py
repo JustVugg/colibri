@@ -793,7 +793,7 @@ def inspect_image_model(model_dir):
 
     The numbers in RAM follow the engine's contract: the language model of the
     text encoder and the DiT are quantized at load to int8 with a per-row scale;
-    the VAE stays f32 as shipped. The text encoder's vision tower and lm_head
+    the VAE is converted to f32 at load. The text encoder's vision tower and lm_head
     are never loaded (text-to-image only reads the language model's hidden
     states), so they count on disk and not in RAM."""
     root = Path(model_dir).expanduser()
@@ -831,7 +831,7 @@ def inspect_image_model(model_dir):
                 elif name == "transformer":
                     resident += _quantized_bytes(shape, nbytes, dtype)
                 elif name == "vae":
-                    resident += nbytes
+                    resident += elements * 4
         entry.update(params=params, dtypes=sorted(dtypes), resident_bytes=resident)
         if name == "text_encoder":
             entry["precision"] = "int8"
@@ -839,7 +839,7 @@ def inspect_image_model(model_dir):
         elif name == "transformer":
             entry["precision"] = "int8"
         elif name == "vae":
-            entry["precision"] = "/".join(d.lower() for d in sorted(dtypes)) or None
+            entry["precision"] = "f32" if dtypes else None
         components[name] = entry
     tokenizer = root / TOKENIZER_FILE
     license_text = ""
