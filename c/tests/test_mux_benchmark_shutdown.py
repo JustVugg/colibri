@@ -64,6 +64,16 @@ class BenchmarkShutdownTest(unittest.TestCase):
                         if stream:
                             stream.close()
 
+    def test_continuous_preserves_error_and_reaps_stalled_engine(self):
+        self.run_failure("benchmark_continuous_batch", True)
+
+    @unittest.skipUnless(os.name == "posix", "Windows termination is already forced")
+    def test_continuous_kills_engine_that_ignores_termination(self):
+        self.run_failure("benchmark_continuous_batch", "ignore_term")
+
+    def test_continuous_preserves_cooperative_shutdown(self):
+        self.run_failure("benchmark_continuous_batch", False)
+
     def test_kv_prefix_preserves_error_and_reaps_stalled_engine(self):
         self.run_failure("benchmark_kv_prefix", True)
 

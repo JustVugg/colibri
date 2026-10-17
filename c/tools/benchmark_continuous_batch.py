@@ -11,6 +11,12 @@ import threading
 import time
 
 
+try:
+    from tools.benchmark_process import close_engine
+except ModuleNotFoundError:              # direct execution from c/tools
+    from benchmark_process import close_engine
+
+
 def frame(request_id, slot, prompt, max_tokens):
     body = prompt.encode()
     return (
@@ -140,9 +146,7 @@ def main():
         for phase_id, batch in enumerate(batches, 1):
             results.append(run_phase(proc, batch, args.tokens, phase_id))
     finally:
-        if proc.stdin:
-            proc.stdin.close()
-        proc.wait(timeout=60)
+        close_engine(proc)
         thread.join(timeout=1)
 
     grouped = {}
