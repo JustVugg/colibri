@@ -55,6 +55,7 @@
 #include "vk_kvsplit.h"
 #include "vk_dmoe.h"
 
+#define Q38C_GGUF_ROWS 16   /* a GGUF's steps of more rows than this decline (q38c_forward) */
 #define Q38C_HOST 0
 #define Q38C_DEV  1
 #define Q38C_BOTH 2
@@ -926,7 +927,8 @@ static int q38c_deltanet(Q38Chain *ch, Model *m, Layer *l, int i, int n, int c0,
         int s0 = ns > 1 ? r : 0, len = ns > 1 && r < ns - 1 ? 1 : n - s0, snap_row = ns ? 0 : -1, slot = ns ? c0 + r : 0;
         VkcDnConv cp = {len, CD, c->dn_convk, s0 * CD, CD, s0 * CD, CD, snap_row, 1, (int)ch->o_conv[i], 0, 0};
         VkcDnRec rp = {len, VH, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s0 * CD, CD, s0 * VH, VH,
-                       ch->rows * VH + s0 * VH, VH, s0 * V, V, s0 * V, V, snap_row, 1, c->eps,
+                       ch->rows * VH + s0 * VH, VH, s0 * V, V, s0 * V, V, snap_row,
+                       1 | (g_q38_a_direct ? 2 : 0) | (g_q38_dn_tiled ? 4 : 0), c->eps,
                        1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
         ok = vkc_dnconv(ch->qkv, ch->prm, ch->ring[i], ch->cv, ch->ring_snap[slot][i], &cp) &&
              vkc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->z, ch->rec[i], ch->prm, ch->dny, ch->rec_snap[slot][i], &rp);
@@ -1106,7 +1108,7 @@ static int q38c_forward_seg(Model *m, Q38Chain *ch, const int *ids, int S, int p
             ok = ok && q38c_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m);
             if (ok && dmoe && vkc_dmoe_on(&ch->dm, i)) {   /* everything here, and on to the next layer */
                 VkcRoute rp = {.kind = 0, .n_group = 1, .topk_group = 1, .norm = c->norm_topk ? 1 : 0, .temp = 1.f, .scale = 1.f};
-                VkcMoe mp = {.D = H, .I = c->inter, .act = 0};
+                VkcMoe mp = {.D = H, .I = c->inter, .act = 0, .blocks = g_q38_gguf};
                 ok = vkc_matmul(q38c_t(&l->router), ch->mixed, 0, ch->lg, 0, n) && q38c_shared(ch, m, l, i, n) &&
                      vkc_dmoe_layer(&ch->dm, i, n, ch->lg, NULL, ch->mixed, &rp, &mp);
                 prev_dev = 1; pending = 1;
@@ -1185,6 +1187,10 @@ static int q38c_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
     if (!g_vk_chain || qt_ready()) return 0;
     /* prompts only: decode and verifies on the CPU */
     if (g_vk_chain == COLI_VK_CHAIN_PREFILL && (S <= 2 || g_q38_rowwise)) return 0;
+    /* a GGUF's dense matrices run on the block formats' GEMV, a row at a time: decode and
+     * verifies here, a prompt's longer chunks through the CPU and the expert tier, as
+     * qwen36_chain.h's (Q36C_GGUF_ROWS) */
+    if (g_q38_gguf && S > Q38C_GGUF_ROWS && !vkc_gemm_bd_ready()) return 0;
     Q38Chain *ch = q38c_setup(m), *ch2 = q38c_of(m, 1);
     if (!ch || ch->failed) return 0;
     if (ch2 && (!ch2->ok || ch2->failed || ch2->lo != ch->lo + ch->nl || ch->head)) ch2 = NULL;

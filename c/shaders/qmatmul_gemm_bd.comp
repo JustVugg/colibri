@@ -1,0 +1,82 @@
+#version 450
+// The block formats' tiled GEMM (a GGUF's matrices, the file's rows: 100 + ggml type T, a
+// specialization constant): y[s,o] = sum_i x[s,i] * w[o,i] for a prompt's rows, with
+// qmatmul_bd.comp's bindings and push constants, so the dense chain (vk_chain.c,
+// matmul_bd) and the expert batch (backend_vulkan.c) both take it.
+// A workgroup of 256 computes 64 outputs (rows of W) for 64 rows of x, through I in steps of
+// 64 weights: half its threads decode the 64 rows' two 32-weight steps (bdstep.glsl, one
+// decode a weight for the tile's 64 rows of x) into shared memory, the other half stage
+// the x rows' 64 values; then each thread accumulates a 4 x 4 block of the tile from vec4
+// reads (rows 68 floats apart, so the 8 lanes of a phase meet 8 bank groups). Needs I a
+// multiple of 64; rows of W or x past O or S are read clamped and never written.
+// Shared memory: 2 x 64 x 68 floats and bdstep's tables, 43.5 KiB.
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int T = 12;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W1 { uint w1[]; };
+layout(std430, binding = 1) readonly buffer W4 { uvec4 w4[]; };
+layout(std430, binding = 2) readonly buffer G { uint gt[]; };   // blockdec_table.h's table
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int fmt, S, I, O, rowWords, gs;
+} p;
+
+#define TM 64
+#define TK 64
+#define LDK 68
+shared vec4 ws4[TM * LDK / 4];   // the tile's decoded weights: row r, weight k at r * LDK + k
+shared vec4 xs4[TM * LDK / 4];   // the tile's x rows the same way
+shared float bs_kvt[16];
+shared uint bs_grid[2048];
+shared uint bs_ks[128];
+
+uint g_row, g_k0;   // the row a decoding thread writes, and the tile's first vec4 of x in the row
+#define BS_W1(i) w1[i]
+#define BS_W4(i) w4[i]
+#define BS_ACC(w, i) ws4[(g_row * LDK) / 4 + (i) - g_k0] = (w)
+#define BS_G(i) gt[i]
+#include "bdstep.glsl"
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x);
+    int o0 = int(gl_WorkGroupID.x) * TM, s0 = int(gl_WorkGroupID.y) * TM;
+    bs_tables_fill(T, tid);
+    int ty = tid / 16, tx = tid % 16;   // outputs o0 + 4ty .. +3, x rows s0 + tx + 16j
+    vec4 accr[4][4];   // output 4ty + i against x row tx + 16j, four partial sums
+    [[unroll]] for (int i = 0; i < 4; i++) [[unroll]] for (int j = 0; j < 4; j++) accr[i][j] = vec4(0.0);
+    for (int k0 = 0; k0 < p.I; k0 += TK) {
+        barrier();   // the last tile is read (and, the first time, the tables are in)
+        if (tid < 2 * TM) {   // row tid / 2, step k0 / 32 + tid % 2
+            int r = tid >> 1, o = min(o0 + r, p.O - 1);
+            g_row = uint(r); g_k0 = uint(k0 / 4);
+            bs_step(T, uint(o) * uint(p.rowWords) * 4u, uint(k0 / 32 + (tid & 1)));
+        } else {             // x rows: 64 x 64 values, 32 a thread
+            int t2 = tid - 2 * TM;
+            for (int e = t2; e < TM * TK / 4; e += 2 * TM) {
+                int r = e / (TK / 4), c4 = e - r * (TK / 4), s = min(s0 + r, p.S - 1);
+                int b = s * p.I + k0 + 4 * c4;
+                xs4[(r * LDK) / 4 + c4] = vec4(x[b], x[b + 1], x[b + 2], x[b + 3]);
+            }
+        }
+        barrier();
+        [[unroll]] for (int k4 = 0; k4 < TK / 4; k4++) {
+            vec4 wv[4], xv[4];
+            [[unroll]] for (int i = 0; i < 4; i++) wv[i] = ws4[((4 * ty + i) * LDK) / 4 + k4];
+            [[unroll]] for (int j = 0; j < 4; j++) xv[j] = xs4[((tx + 16 * j) * LDK) / 4 + k4];
+            [[unroll]] for (int i = 0; i < 4; i++) [[unroll]] for (int j = 0; j < 4; j++) accr[i][j] += wv[i] * xv[j];
+        }
+    }
+    [[unroll]] for (int i = 0; i < 4; i++) {
+        int o = o0 + 4 * ty + i;
+        if (o >= p.O) continue;
+        [[unroll]] for (int j = 0; j < 4; j++) {
+            int s = s0 + tx + 16 * j;
+            vec4 a = accr[i][j];
+            if (s < p.S) y[s * p.O + o] = (a.x + a.y) + (a.z + a.w);
+        }
+    }
+}

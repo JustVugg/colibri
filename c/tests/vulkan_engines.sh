@@ -1727,6 +1727,30 @@ lost_gate() {
   echo "OK $tag: tokens = CPU, $(grep -o 'rebuilding the state of [0-9]* positions' vk.log)"
 }
 
+# A GGUF on the dense chain (qwen36): its ggml blocks on the device as the file has them, the
+# dense matrices on the block formats' GEMV and the routed experts in the frame (chain_moe's
+# block path), against the CPU's float kernels (GQ_EXACT=1: the device's arithmetic). The
+# tiny model is tests/test_gguf_import.py's, Q8_0 / Q4_K / Q5_K / Q6_K / IQ2_XXS mixed, with
+# each layer's expert gate and up of one type (the tier keeps those as the file's blocks).
+qwen36_gguf_tiny() {   # qwen36_gguf_tiny/, imported, and its ref.json (the prompt and 8 tokens)
+  $PY - <<'PY' || fail "gguf-py (pip install gguf) is needed for the GGUF chain gates"
+import sys
+sys.path.insert(0, "tests")
+import numpy as np
+from test_gguf_import import write_model
+write_model("qwen36_gguf_tiny.gguf", np.random.default_rng(7), same_gate_up=True)
+PY
+  rm -rf qwen36_gguf_tiny
+  $PY tools/gguf_import.py qwen36_gguf_tiny.gguf qwen36_gguf_tiny > /dev/null
+  echo '{"prompt_ids": [1, 2, 3, 4, 5, 6, 7, 8], "full_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]}' > qwen36_gguf_tiny/ref.json
+}
+qwen36_gguf_chain_gates() {
+  qwen36_gguf_tiny
+  local cap
+  for cap in 1 8; do
+    CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF cap=$cap" all GQ_EXACT=1 SNAP=qwen36_gguf_tiny -- $cap 8 qwen36_gguf_tiny/ref.json
+  done
+}
 family_qwen_chain() {
   make qwen36 qwen38 tests/test_vk_chain VK=1
   ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
@@ -1776,6 +1800,12 @@ family_qwen_chain() {
     SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   dmoe_gate qwen36 "chain qwen36 the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 COLI_DENSE_I8=0 \
     SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  # the same budget with the host pool (COLI_VK_TIER_HOST=1: on a device that shares the
+  # host's RAM too): the experts the device leaves in system RAM it reads, every layer's
+  # routed experts in the frame again
+  dmoe_gate qwen36 "chain qwen36 the host pool" all COLI_VK_TIER_GB=0.00077 COLI_VK_TIER_HOST=1 COLI_DENSE_I8=0 \
+    SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  grep -q "host pool on, [1-9]" vk.log || { cat vk.log; fail "chain qwen36 the host pool: no expert in the host pool"; }
   # the device lost mid-decode: the state rebuilt on the CPU, the run finishes there; in a
   # step's frames on the host's routing, and in a step that is one frame
   lost_late qwen36 "chain qwen36 device lost" 20 rebuild COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
@@ -1787,6 +1817,7 @@ family_qwen_chain() {
   # between them at every turn's first decode step and next prompt
   CHAINMODE=2 chain_gate qwen36 "chain qwen36 prompts only" 1 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
+  qwen36_gguf_chain_gates
 
   # qwen38: every resident format, prefill batching, every expert form, MTP
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny
@@ -1868,6 +1899,8 @@ family_qwen_chain_sanitize() {
   csan qwen36 "asan chain qwen36 int8 dense, chunks of 3" COLI_VK_CHAIN_ROWS=3 SNAP=qwen36_tiny_c ./qwen36 8 8 qwen36_tiny/ref_full.json
   csan qwen36 "asan chain qwen36 int4-g64 planar" COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c ./qwen36 8 4 qwen36_tiny64/ref_full.json
   csan qwen36 "asan chain qwen36 dense model" COLI_DENSE_I8=0 SNAP=qwen38_27b_tiny_c ./qwen36 8 8 qwen38_27b_tiny/ref_full.json
+  qwen36_gguf_tiny
+  csan qwen36 "asan chain qwen36 GGUF" GQ_EXACT=1 SNAP=qwen36_gguf_tiny ./qwen36 1 8 qwen36_gguf_tiny/ref.json
   csan qwen38 "asan chain qwen38 batch=0" Q38_PREFILL_BATCH=0 SNAP=qwen38_tiny ./qwen38 4 8 qwen38_tiny/ref.json
   csan qwen38 "asan chain qwen38 int8 trunk, chunks of 3" Q38_TRUNK_MIN_KB=0 COLI_VK_CHAIN_ROWS=3 SNAP=qwen38_tiny ./qwen38 4 8 qwen38_tiny/ref.json
   csan qwen38 "asan chain qwen38 MTP reject" Q38_MTP=1 Q38_MTP_FORCE=reject SNAP=qwen38_tiny_int4_mtp ./qwen38 2 8 qwen38_tiny_int4_mtp/ref.json

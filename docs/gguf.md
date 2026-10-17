@@ -60,7 +60,8 @@ Both are lossless: the same blocks, the same tokens.
 - **OLMoE's experts keep the file's rows**: they fit in RAM, and interleaving one at its read cost more than the 16-row kernels gave back on its matrices. llama.cpp's `olmoe` files carry no `norm_topk_prob`; the import writes false, as the official checkpoints have it and as llama.cpp computes them.
 - **DeepSeek V4.1's engram tables** are read a row at a time, as from the checkpoint: a `deepseek41` file holds each row's e4m3 values and their scales together. These files carry no DSpark head, so nothing drafts.
 - **GLM's MLA**: `k_b` / `v_b` (llama.cpp splits `kv_b_proj`) stay the file's blocks.
-- **Dense matrices stay on the CPU.** The dense chains and CUDA take none of a GGUF's ggml matrices; the routed experts are where a device helps most.
+- **The Vulkan dense chain** (qwen36, qwen38) takes a GGUF's dense matrices as the file has them too. Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_S, IQ3_S, IQ4_NL and IQ4_XS run on a GEMV with one decoder per type (`shaders/chain_gemv_bd.comp`), and the other types on the general block decoder. The routed experts run inside the same frame when the tier holds every expert of a layer. A decode step or a verify of up to 16 rows runs there; a prompt's longer chunks go through the CPU and the expert tier.
+- **The other engines' dense matrices stay on the CPU**, and CUDA takes none of a GGUF's ggml matrices.
 
 ## Checking a GGUF before downloading it
 
