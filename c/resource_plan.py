@@ -1951,7 +1951,7 @@ def windows_available_bytes(avail_phys, avail_pagefile):
     handed the resulting cap to the engine; the engine filled it slot by slot
     until Windows refused the next 14 MB. Physical memory was there. Commit
     was not, and nothing had looked at it."""
-    if avail_pagefile and 0 < avail_pagefile < avail_phys:
+    if avail_pagefile is not None and 0 <= avail_pagefile < avail_phys:
         return avail_pagefile
     return avail_phys
 
