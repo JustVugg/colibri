@@ -6365,8 +6365,8 @@ static int serve_control_pending(const char *id){
 /* --- Dashboard: Brain e Profile ------------------------------------------
  * Stesse quattro righe di colibri.c/glm53.c, stessi byte: EMAP dopo READY,
  * HITS e PROF prima di DONE. Qui ogni layer e' MoE, quindi la griglia e'
- * n_layers x n_experts. Il tier VRAM non espone una query di residenza:
- * la griglia distingue solo disco (0) e cache RAM (1). Le fasi del Profile
+ * n_layers x n_experts. La griglia distingue disco (0), cache RAM (1) e
+ * VRAM CUDA/Vulkan (2). Le fasi del Profile
  * vengono dai timer che il motore ha gia' (deltanet, attention, moe, head),
  * ora accumulati sempre e riportati a schermo solo con COLI_TIMERS=1; il
  * disco e' misurato attorno a load_expert_merged su entrambi i percorsi.
@@ -6383,7 +6383,7 @@ static void emap_emit(Model *m){
     uint8_t *cells=calloc((size_t)rows*cols,1);
     pthread_mutex_lock(&g_pilot_mx);
     for(int i=0;i<rows;i++) for(int e=0;e<cols;e++)
-        cells[(size_t)i*cols+e]=(uint8_t)((vkt_resident(i,e)?2:slot_indexed(m,i,e)?1:0)<<6);   /* 2 = on the Vulkan device */
+        cells[(size_t)i*cols+e]=(uint8_t)(((qt_is_resident(i,e)||vkt_resident(i,e))?2:slot_indexed(m,i,e)?1:0)<<6);   /* 2 = on a CUDA/Vulkan device */
     pthread_mutex_unlock(&g_pilot_mx);
     char *hex=malloc((size_t)rows*cols*2+1); dash_hex(cells,rows*cols,hex);
     printf("EMAP %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex); free(cells);
