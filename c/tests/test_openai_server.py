@@ -4158,6 +4158,48 @@ class StrictGLMToolCallTest(unittest.TestCase):
         self.assertEqual(content, "Checking.")
         self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"order_id": "00123"})
 
+    def test_nonfinite_json_arguments_fail_closed_including_nested_values(self):
+        for kind, values in (("number", ("NaN", "Infinity", "-Infinity", "1e10000")),
+                             ("object", ('{"amount": NaN}', '{"amount": 1e10000}')),
+                             ("array", ('[Infinity]', '[{"amount": -Infinity}]'))):
+            tools = [{"type": "function", "function": {"name": "record", "parameters": {
+                "type": "object", "properties": {"value": {"type": kind}}}}}]
+            for value in values:
+                reply = ("<tool_call>record<arg_key>value</arg_key><arg_value>" + value +
+                         "</arg_value></tool_call>")
+                with self.subTest(kind=kind, value=value):
+                    with self.assertRaises(APIError) as caught:
+                        openai_server.parse_glm_tool_calls_strict(reply, tools)
+                    self.assertEqual(caught.exception.code, "invalid_model_tool_call")
+
+    def test_finite_json_and_literal_nonfinite_strings_remain_valid(self):
+        for kind, value, expected in (("number", "1e308", 1e308),
+                                       ("number", "-4.25", -4.25),
+                                       ("object", '{"amount": 12}', {"amount": 12}),
+                                       ("string", "NaN", "NaN"),
+                                       ("string", "Infinity", "Infinity")):
+            tools = [{"type": "function", "function": {"name": "record", "parameters": {
+                "type": "object", "properties": {"value": {"type": kind}}}}}]
+            reply = ("<tool_call>record<arg_key>value</arg_key><arg_value>" + value +
+                     "</arg_value></tool_call>")
+            with self.subTest(kind=kind, value=value):
+                _content, calls = openai_server.parse_glm_tool_calls_strict(reply, tools)
+                self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"value": expected})
+
+    def test_http_nonfinite_tool_argument_returns_named_model_output_error(self):
+        reply = ("<tool_call>record<arg_key>amount</arg_key>"
+                 "<arg_value>1e10000</arg_value></tool_call>")
+        engine = ScriptedEngine(chunks=(reply,))
+        base = _spawn_test_server(self, engine)
+        body = {"model": "test-model", "messages": [{"role": "user", "content": "record amount"}],
+                "tools": [{"type": "function", "function": {"name": "record", "parameters": {
+                    "type": "object", "properties": {"amount": {"type": "number"}}}}}],
+                "strict_tool_calls": True}
+        with patch.object(openai_server, "ARCH", "glm"):
+            status, error = _error_body(self, lambda: _post_chat(base, body))
+        self.assertEqual((status, error["code"]), (502, "invalid_model_tool_call"))
+        self.assertEqual(len(engine.calls), 1)
+
     def test_incomplete_duplicate_undeclared_and_invalid_calls_fail_closed(self):
         bad = (self.CALL[:-len("</tool_call>")],
                self.CALL.replace("</tool_call>",

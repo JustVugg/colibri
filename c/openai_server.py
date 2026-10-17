@@ -805,8 +805,12 @@ def parse_glm_tool_calls_strict(reply, tools):
             cursor = match.end()
         if any(key not in args for key in params.get("required") or []):
             invalid("missing required argument")
+        try:
+            arguments = json.dumps(args, ensure_ascii=False, allow_nan=False)
+        except ValueError:
+            invalid("argument contains a non-finite JSON number")
         calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
-                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+                      "function": {"name": name, "arguments": arguments}})
     content, _box_map, _content_map = _tool_call_content_spans(reply, None, False)
     return content, calls
 
