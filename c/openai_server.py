@@ -2464,39 +2464,52 @@ def _parse_mimo_tool_calls(reply, tools, track_spans):
     def make_call(name, body):
         args = {}
         found = MIMO_PARAM_RE.findall(body)
-        for key, raw in found:
-            key = key.strip()
-            if raw.startswith("\n"):
-                raw = raw[1:]
-            if raw.endswith("\n"):
-                raw = raw[:-1]
-            declared = (schema.get(name) or {}).get(key) or {}
-            kind = declared.get("type") if isinstance(declared, dict) else None
-            args[key] = _coerce_arg(raw, kind if isinstance(kind, str) else None) \
-                if kind not in (None, "string") else raw
-        if not found and body.strip():
-            try:
+        if found and MIMO_PARAM_RE.sub("", body).strip():
+            return None
+        try:
+            for key, raw in found:
+                key = key.strip()
+                if key in args:
+                    return None
+                if raw.startswith("\n"):
+                    raw = raw[1:]
+                if raw.endswith("\n"):
+                    raw = raw[:-1]
+                declared = (schema.get(name) or {}).get(key) or {}
+                args[key] = _qwen_argument(raw, declared)
+            if not found and body.strip():
                 parsed = json.loads(body)
-                if isinstance(parsed, dict):
-                    args = parsed
-            except (TypeError, ValueError):
-                pass
+                if not isinstance(parsed, dict):
+                    return None
+                args = parsed
+            # Python accepts NaN/Infinity in JSON; these are not JSON arguments.
+            arguments = json.dumps(args, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError, RecursionError):
+            return None
         return {"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
-                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+                "function": {"name": name, "arguments": arguments}}
 
     text = reply or ""
     matches = list(MIMO_CALL_RE.finditer(text))
-    calls = [make_call(m.group(1).strip(), m.group(2)) for m in matches]
+    accepted = []
+    calls = []
+    for match in matches:
+        call = make_call(match.group(1).strip(), match.group(2))
+        if call is not None:
+            calls.append(call)
+            accepted.append(match)
     if not calls and tools and ("<tool_call>" in text or "<function=" in text):
         sys.stderr.write("[api] mimo tool markers present but no call parsed -- "
                          "possibly truncated or mangled output\n")
         sys.stderr.flush()
     if not track_spans:
-        return MIMO_CALL_RE.sub("", text).strip(), calls, None, None
-    # The same two deletions as the line above -- every call block, then the surrounding
+        for match in reversed(accepted):
+            text = text[:match.start()] + text[match.end():]
+        return text.strip(), calls, None, None
+    # The same two deletions as the line above -- accepted call blocks, then surrounding
     # whitespace -- found as ranges, so logprobs.content can describe the content returned
     # rather than the raw reply with the call syntax in it.
-    content, box_map = _apply_cuts(text, [(m.start(), m.end()) for m in matches])
+    content, box_map = _apply_cuts(text, [(m.start(), m.end()) for m in accepted])
     head = len(content) - len(content.lstrip())
     kept = len(content.strip())
     content, step = _apply_cuts(content, [(0, head), (head + kept, len(content))])
