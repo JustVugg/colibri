@@ -238,7 +238,13 @@ static int gguf_parse_one(gguf_ctx *g, int part, const char *path, int want_kv) 
         if (r.bad) { free(t->name); break; }
         int64_t rb = gq_row_bytes(t->type, t->ne[0]);
         if (rb < 0) { r.bad = 1; snprintf(g->err, sizeof g->err, "%s: tensor %s: type %d (%s) cannot hold rows of %lld", path, t->name, t->type, gq_type_name(t->type), (long long)t->ne[0]); free(t->name); break; }
-        t->nbytes = rb * (numel / t->ne[0]);
+        int64_t rows = numel / t->ne[0];
+        if (rb > INT64_MAX / rows) {
+            r.bad = 1;
+            snprintf(g->err, sizeof g->err, "%s: tensor %s byte size overflows int64", path, t->name);
+            free(t->name); break;
+        }
+        t->nbytes = rb * rows;
         t->file = part; t->off = rel;          /* made absolute below */
         g->n_tensors++;
     }
