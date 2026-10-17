@@ -956,7 +956,7 @@ def run_decision_doctor(model, engine_path, available_memory=None):
             params += count
         needed = params * 4
         available_memory = memory_available() if available_memory is None else available_memory
-        if not available_memory:
+        if available_memory is None:
             status, summary = "warn", "available RAM could not be measured"
         elif needed < available_memory:
             status, summary = "pass", f"{needed / 1e9:.1f} GB of f32 weights fit in RAM"

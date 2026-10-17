@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from doctor import run_decision_doctor
 
@@ -49,6 +50,28 @@ class DecisionWeightsTest(unittest.TestCase):
                 self.assertEqual(checks[0]["status"], "fail")
                 self.assertEqual(report["status"], "error")
                 self.assertFalse(any(c["id"] == "memory.ram" for c in report["checks"]))
+
+    def test_exhausted_memory_is_not_reported_as_an_unknown_probe(self):
+        self.write_weights({'w': {'dtype': 'F32', 'shape': [4],
+                                   'data_offsets': [0, 16]}}, bytes(16))
+        for supplied in (True, False):
+            with self.subTest(explicit_budget=supplied), \
+                    patch('doctor.memory_available', return_value=0):
+                kwargs = {'available_memory': 0} if supplied else {}
+                report = run_decision_doctor(self.model, self.engine, **kwargs)
+                check = next(c for c in report['checks'] if c['id'] == 'memory.ram')
+                self.assertEqual(check['status'], 'fail')
+                self.assertEqual(check['details']['available_bytes'], 0)
+                self.assertEqual(report['status'], 'error')
+
+    def test_unknown_memory_probe_remains_a_warning(self):
+        self.write_weights({'w': {'dtype': 'F32', 'shape': [4],
+                                   'data_offsets': [0, 16]}}, bytes(16))
+        with patch('doctor.memory_available', return_value=None):
+            report = run_decision_doctor(self.model, self.engine)
+        check = next(c for c in report['checks'] if c['id'] == 'memory.ram')
+        self.assertEqual(check['status'], 'warn')
+        self.assertIn('could not be measured', check['summary'])
 
     def test_valid_weight_dtypes_preserve_f32_residency_estimate(self):
         for dtype, byte_count in (("F32", 16), ("BF16", 8), ("F16", 8)):
