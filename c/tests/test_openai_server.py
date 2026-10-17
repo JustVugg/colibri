@@ -624,6 +624,18 @@ class TemplateTest(unittest.TestCase):
         # O: the result resolves its name through tool_call_id
         self.assertIn("O 1 11 5\nget_weathersunny", prompt)
 
+    def test_kimi_argument_fallback_keeps_trailing_data(self):
+        for raw in ('{} trailing', '{"city":"Rome"} trailing', '{}{}'):
+            with self.subTest(raw=raw):
+                records = openai_server._k3_call_records(
+                    [{'function': {'name': 'f', 'arguments': raw}}], 'tool_calls')
+                self.assertEqual(records, [f'J 1 {len(raw)}\nf{raw}'])
+
+    def test_kimi_argument_parser_allows_only_whitespace_after_object(self):
+        self.assertEqual(openai_server._k3_parse_arguments(' {} \n'), [])
+        self.assertEqual(openai_server._k3_parse_arguments(' {"n":1e2} \t'),
+                         [('n', 'number', '1e2')])
+
     def test_kimi_tool_results_resort_by_call_id(self):
         messages = [
             {"role": "assistant", "content": "", "tool_calls": [
