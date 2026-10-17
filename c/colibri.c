@@ -6918,7 +6918,9 @@ static void la_predict(Model *m, int target, const float *h, int kind){
         }
         Layer *sl = &m->L[src_layer];
         int sI = c->moe_inter * c->n_shared;
-        float *snrm = falloc(D), *sg = falloc(sI), *su = falloc(sI);
+        /* zeroed to silence -Wmaybe-uninitialized: rmsnorm fills all D values, which gcc cannot prove */
+        float *snrm = xzalloc((size_t)D * sizeof(float), "la_predict norm");
+        float *sg = falloc(sI), *su = falloc(sI);
         float *sout = falloc(D), *hc = falloc(D);
         rmsnorm(snrm, h, sl->post_ln, D, c->eps);
         matmul_qt(sg, snrm, &sl->sh_gate, 1);
