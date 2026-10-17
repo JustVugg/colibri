@@ -418,7 +418,8 @@ int main(void) {
          * one expert alone, and a refusal that must not lose the device */
         const int D = 64, I = 96, N = 3; unsigned s = 77;
         std::vector<int8_t> q4[N][3]; std::vector<uint8_t> pk[N][3]; std::vector<float> sc[N][3];
-        auto pack = [&](std::vector<int8_t> &q, std::vector<uint8_t> &p) { p.assign(q.size() / 2, 0); for (size_t b = 0; b < p.size(); b++) p[b] = (uint8_t)((q[2 * b] & 15) | ((q[2 * b + 1] & 15) << 4)); };
+        /* the host's nibbles are offset-binary (value + 8), as the container stores them; the upload turns them signed */
+        auto pack = [&](std::vector<int8_t> &q, std::vector<uint8_t> &p) { p.assign(q.size() / 2, 0); for (size_t b = 0; b < p.size(); b++) p[b] = (uint8_t)(((q[2 * b] + 8) & 15) | (((q[2 * b + 1] + 8) & 15) << 4)); };
         for (int c = 0; c < N; c++) for (int k = 0; k < 3; k++) {
             size_t n = (size_t)D * I; q4[c][k].resize(n); for (auto &v : q4[c][k]) v = (int8_t)floorf(frand(&s) * 8.f); for (auto &v : q4[c][k]) if (v > 7) v = 7;
             pack(q4[c][k], pk[c][k]);
@@ -458,7 +459,7 @@ int main(void) {
         std::vector<float> want = ref_y(N, NULL, NULL, 0, NULL);
         ck(T->begin() && T->experts(tg, tu, td, vals.data(), N, xb, 0, yb, 5) && T->submit(1), "three experts of one row, y at an offset");
         std::vector<float> got = down(yb, D + 5);
-        ck(maxdiff(got.data() + 5, want.data(), D) < 1e-4, "equals the CPU reference (per-row int4)");
+        { char b[120]; snprintf(b, sizeof b, "equals the CPU reference (per-row int4): max diff %.2e", maxdiff(got.data() + 5, want.data(), D)); ck(maxdiff(got.data() + 5, want.data(), D) < 1e-4, b); }
         want = ref_y(1, NULL, NULL, 0, NULL);
         ck(T->begin() && T->experts(tg, tu, td, vals.data(), 1, xb, 0, yb, 0) && T->submit(1) && maxdiff(down(yb, D).data(), want.data(), D) < 1e-4, "one expert alone");
         /* grouped gate/up (gs 32: two groups per row) over an int8 down */

@@ -378,7 +378,13 @@ format the kernels decline turns the route off from that layer on (the message n
 `tests/test_qwen36_cuda_chain.c` runs the route through the fake's `experts` (the
 kernels' arithmetic on the fake's int8 copies) against the CPU path; `tests/test_cuda_chain.cu`
 checks the op on a card: per-row int4, grouped gate/up over an int8 down, one expert alone,
-and a refusal that leaves the device to the chain.
+and a refusal that leaves the device to the chain. Measured on the 3070 (the same runs as the
+table below, 84 % of the routed experts resident): 18.9 ms a decode token with the residents
+through the host path, 16.4 with the route (53 -> 61 tok/s), TTFT 1.05 -> 0.81 s; the host's
+part of a token fell from 9.8 ms (the tier's issue 0.8, the CPU's misses 4.6, the take 4.1) to
+5.5 ms, nearly all of it the CPU's misses, while the device's wait grew 6.1 -> 7.8 ms with the
+residents now on its stream. The text is the same as the host path's for the first 150
+characters and diverges afterwards, as two runs with a different order of the K summands do.
 
 **What it needs.** Every projection of every layer, the shared expert's three matrices
 and lm_head on one card: `COLI_CUDA_CHAIN=1` offers the shared expert to the placer
@@ -428,7 +434,8 @@ expert tier at 81-82 % hits, the usual 49-token prompt, 200 new tokens, two runs
 | | TTFT | tok/s, the run | ms per decode token | decode tok/s | device wait per token |
 |---|---|---|---|---|---|
 | `Q36_DN_GPU=1` (the per-layer step) | 1.22-1.26 s | 26.2-27.6 | 30-32 | 32-33 | |
-| `COLI_CUDA_CHAIN=1` | 0.98 s | 42.7-42.8 | 18.7 | 53 | 5.7 ms |
+| `COLI_CUDA_CHAIN=1`, the residents through the host path | 0.98-1.05 s | 41.6-42.8 | 18.7-18.9 | 53 | 5.7-6.1 ms |
+| `COLI_CUDA_CHAIN=1`, the residents on the chain's stream (`COLI_CUDA_CHAIN_EXPERTS`) | 0.81-0.82 s | 48.6-48.9 | 16.4-16.6 | 61 | 7.8 ms |
 | Ollama 0.34.4 on the same card | | | 26.2 | 38.1 | |
 
 The chain alone, with the backend's block GEMV, gave 27.6 ms a token: the CPU's parts
