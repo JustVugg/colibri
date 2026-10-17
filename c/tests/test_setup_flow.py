@@ -698,6 +698,29 @@ class RunConfiguration(HomeTestCase):
         self.assertIsNone(setup_flow.load_config())
         self.assertEqual(setup_flow.configured_port(), 8000)
 
+    @unittest.skipIf(os.name == "nt", "requires a native POSIX shell")
+    def test_recovery_command_preserves_shell_special_paths(self):
+        bindir = Path(self.tmp.name, "bin")
+        bindir.mkdir()
+        launcher = bindir / "coli"
+        launcher.write_text(
+            "#!" + sys.executable + "\nimport os, sys, json\n"
+            + "print(json.dumps({'args': sys.argv[1:], 'shader': os.environ.get('COLI_VK_SHADERS')}))\n",
+            encoding="utf-8")
+        launcher.chmod(0o700)
+        for name in ("$HOME model", "$(printf expanded)", "owner's models", "模型 é"):
+            with self.subTest(name=name), modeled("linux"):
+                cfg = {"args": ["serve", "--model", name],
+                       "env": {"COLI_VK_SHADERS": name}}
+                result = subprocess.run(
+                    ["/bin/sh", "-c", setup_flow.equivalent_command(cfg)],
+                    env={"PATH": str(bindir) + ":/usr/bin:/bin", "HOME": self.tmp.name},
+                    capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                consumed = json.loads(result.stdout)
+                self.assertEqual(consumed["args"], cfg["args"])
+                self.assertEqual(consumed["shader"], name)
+
     def test_last_turn_speed(self):
         self.assertEqual(setup_flow.last_turn_speed({"turns": [{"wall_s": 4.0, "completion_tokens": 10}]}),
                          2.5)
