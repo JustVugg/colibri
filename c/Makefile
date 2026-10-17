@@ -1695,6 +1695,9 @@ spec-drafts-run: qwen38$(EXE) qwen36$(EXE) tests/test_spec_draft$(EXE) tests/tes
 tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
+tests/test_qwen36_prefill_control$(EXE): tests/test_qwen36_prefill_control.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+
 tests/test_qwen36_weight_alloc$(EXE): tests/test_qwen36_weight_alloc.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 

@@ -101,6 +101,14 @@ DECIDE <id> <slot> <bytes>\n<payload>\n
   usage history, and KV state are persisted; the HTTP gateway uses it after a
   client-provided stop sequence matches.
 - `CANCEL` aborts a request after its client disconnects and returns `CANCELLED`.
+  Qwen3.6 single-slot CPU text prefill polls controls between layers, keeping
+  all fresh prompt rows batched without adding row-chunk passes over streamed
+  experts. An interrupted layer stack discards its live prefix, recurrent
+  state and saved pins; the next request recomputes from a clean state. A control
+  received after the complete prefill retains that valid prefix. Response time
+  depends on one full prompt-layer of work, not a fixed millisecond bound.
+  Image turns, prompt logprobs, layer dumps, qpack, CUDA tiers/chains, Vulkan,
+  and `KV_SLOTS>1` retain their existing whole-prefill handling.
 - `DECIDE` (only to an engine that announced `decide=1`) carries one decision
   record, UTF-8 JSON: the state and the typed questions with their options in
   order. The engine answers with one `DECISION` frame and `DONE`, or with

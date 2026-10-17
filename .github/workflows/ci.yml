@@ -976,6 +976,12 @@ jobs:
           make clean >/dev/null 2>&1 || true
           make qwen36
           QWEN36_TINY=qwen36_tiny_c python3 -m unittest -v tests.test_qwen36_prefix_serve tests.test_qwen36_text_stops
+          make tests/test_qwen36_prefill_control
+          for dense in 0 1; do
+            for cap in 1 8; do
+              COLI_DENSE_I8=$dense QWEN36_TINY=qwen36_tiny_c ./tests/test_qwen36_prefill_control $cap
+            done
+          done
       - name: The embedding read in place (int8 trunk) matches the f32 table, byte for byte
         run: |
           cd c
@@ -1062,6 +1068,12 @@ jobs:
           python3 tools/make_qwen36_tiny.py --out qwen36_tiny64 --ref-mode full --inter 64 \
                   --emit-ref qwen36_tiny64/ref_full.json
           python3 tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_c --ebits 4 --gs 64
+          make tests/test_qwen36_prefill_control
+          for dense in 0 1; do
+            for cap in 1 8; do
+              COLI_DENSE_I8=$dense QWEN36_TINY=qwen36_tiny64_c ./tests/test_qwen36_prefill_control $cap
+            done
+          done
           for cap in 1 2 8 16; do
             for k in 0 1; do
               QWEN_EXPERT_KERNEL=$k COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c DUMP=logits_${cap}_$k.f32 \
