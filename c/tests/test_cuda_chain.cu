@@ -411,6 +411,83 @@ int main(void) {
            maxdiff(down(hb, hyp.size()).data(), rh.data(), hyp.size()) < 1e-5 && maxdiff(down(rb, ring.size()).data(), rr.data(), ring.size()) < 1e-6, "the dilated convolution, the ring carried, the copy after row 1");
         T->free(kb); T->free(hb); T->free(vb); T->free(pb); T->free(gb); T->free(nb); T->free(cb); T->free(rb);
     }
+    printf("experts\n");
+    {
+        /* the route's op against a CPU reference: three int4 experts with per-row scales (the
+         * container's fmt 2), then gate/up grouped (fmt 4, gs 32) over an int8 down (--down-bits),
+         * one expert alone, and a refusal that must not lose the device */
+        const int D = 64, I = 96, N = 3; unsigned s = 77;
+        std::vector<int8_t> q4[N][3]; std::vector<uint8_t> pk[N][3]; std::vector<float> sc[N][3];
+        auto pack = [&](std::vector<int8_t> &q, std::vector<uint8_t> &p) { p.assign(q.size() / 2, 0); for (size_t b = 0; b < p.size(); b++) p[b] = (uint8_t)((q[2 * b] & 15) | ((q[2 * b + 1] & 15) << 4)); };
+        for (int c = 0; c < N; c++) for (int k = 0; k < 3; k++) {
+            size_t n = (size_t)D * I; q4[c][k].resize(n); for (auto &v : q4[c][k]) v = (int8_t)floorf(frand(&s) * 8.f); for (auto &v : q4[c][k]) if (v > 7) v = 7;
+            pack(q4[c][k], pk[c][k]);
+            int O = k < 2 ? I : D; sc[c][k].resize(O); for (auto &v : sc[c][k]) v = 0.02f + 0.01f * frand(&s);
+        }
+        std::vector<float> x = rnd(D, 78), vals = {0.5f, 0.3f, 0.2f};
+        /* the reference, in double; fmt 2 everywhere */
+        auto ref_y = [&](int count, const std::vector<float> *gsc, const std::vector<float> *usc, int gs, const std::vector<int8_t> *d8) {
+            std::vector<float> y(D, 0.f);
+            for (int c = 0; c < count; c++) {
+                std::vector<double> h(I);
+                for (int o = 0; o < I; o++) {
+                    double g = 0, u = 0;
+                    for (int i = 0; i < D; i++) {
+                        double gw = q4[c][0][(size_t)o * D + i], uw = q4[c][1][(size_t)o * D + i];
+                        if (gs) { gw *= gsc[c][(size_t)o * (D / gs) + i / gs]; uw *= usc[c][(size_t)o * (D / gs) + i / gs]; }
+                        g += x[i] * gw; u += x[i] * uw;
+                    }
+                    if (!gs) { g *= sc[c][0][o]; u *= sc[c][1][o]; }
+                    h[o] = (g / (1.0 + exp(-g))) * u;
+                }
+                for (int o = 0; o < D; o++) {
+                    double a = 0;
+                    for (int i = 0; i < I; i++) a += h[i] * (double)(d8 ? d8[c][(size_t)o * I + i] : q4[c][2][(size_t)o * I + i]);
+                    y[o] += (float)(vals[c] * a * sc[c][2][o]);
+                }
+            }
+            return y;
+        };
+        ColiCudaTensor *tg[N] = {0}, *tu[N] = {0}, *td[N] = {0};
+        int okup = 1;
+        for (int c = 0; c < N; c++) okup &= coli_cuda_tensor_upload(&tg[c], pk[c][0].data(), sc[c][0].data(), 2, D, I, 0) &&
+                                          coli_cuda_tensor_upload(&tu[c], pk[c][1].data(), sc[c][1].data(), 2, D, I, 0) &&
+                                          coli_cuda_tensor_upload(&td[c], pk[c][2].data(), sc[c][2].data(), 2, I, D, 0);
+        ck(okup, "nine int4 tensors resident");
+        CcBuf *xb = up(x), *yb = T->buf((size_t)(D + 5) * 4, CC_DEV);
+        std::vector<float> want = ref_y(N, NULL, NULL, 0, NULL);
+        ck(T->begin() && T->experts(tg, tu, td, vals.data(), N, xb, 0, yb, 5) && T->submit(1), "three experts of one row, y at an offset");
+        std::vector<float> got = down(yb, D + 5);
+        ck(maxdiff(got.data() + 5, want.data(), D) < 1e-4, "equals the CPU reference (per-row int4)");
+        want = ref_y(1, NULL, NULL, 0, NULL);
+        ck(T->begin() && T->experts(tg, tu, td, vals.data(), 1, xb, 0, yb, 0) && T->submit(1) && maxdiff(down(yb, D).data(), want.data(), D) < 1e-4, "one expert alone");
+        /* grouped gate/up (gs 32: two groups per row) over an int8 down */
+        std::vector<float> gsc[N], usc[N]; std::vector<int8_t> d8[N];
+        ColiCudaTensor *tg4[N] = {0}, *tu4[N] = {0}, *td8[N] = {0};
+        for (int c = 0; c < N; c++) {
+            gsc[c].resize((size_t)I * (D / 32)); usc[c].resize((size_t)I * (D / 32));
+            for (auto &v : gsc[c]) v = 0.02f + 0.01f * frand(&s); for (auto &v : usc[c]) v = 0.02f + 0.01f * frand(&s);
+            d8[c].resize((size_t)D * I); for (auto &v : d8[c]) v = (int8_t)(frand(&s) * 60);
+            okup &= coli_cuda_tensor_upload_g(&tg4[c], pk[c][0].data(), gsc[c].data(), 4, D, I, 0, 32) &&
+                    coli_cuda_tensor_upload_g(&tu4[c], pk[c][1].data(), usc[c].data(), 4, D, I, 0, 32) &&
+                    coli_cuda_tensor_upload(&td8[c], d8[c].data(), sc[c][2].data(), 1, I, D, 0);
+        }
+        ck(okup, "grouped int4 and int8 tensors resident");
+        want = ref_y(N, gsc, usc, 32, d8);
+        ck(T->begin() && T->experts(tg4, tu4, td8, vals.data(), N, xb, 0, yb, 0) && T->submit(1) && maxdiff(down(yb, D).data(), want.data(), D) < 1e-4,
+           "grouped gate/up scales over an int8 down (--down-bits) equal the reference");
+        {   /* gs 16: a 16-byte load would straddle two groups; refused without a launch, the device kept */
+            ColiCudaTensor *bad = NULL; std::vector<float> bsc((size_t)I * (D / 16), 0.02f);
+            ck(coli_cuda_tensor_upload_g(&bad, pk[0][0].data(), bsc.data(), 4, D, I, 0, 16), "a gs-16 tensor resident");
+            ColiCudaTensor *bg[1] = {bad};
+            ck(T->begin() && !T->experts(bg, tu4, td8, vals.data(), 1, xb, 0, yb, 0) && !T->lost() && T->submit(1), "refused, the device not lost");
+            if (bad) coli_cuda_tensor_free(bad);
+        }
+        CcStats st; T->stats(&st);
+        ck(st.experts == 7, "the counter saw seven experts");
+        for (int c = 0; c < N; c++) { coli_cuda_tensor_free(tg[c]); coli_cuda_tensor_free(tu[c]); coli_cuda_tensor_free(td[c]); coli_cuda_tensor_free(tg4[c]); coli_cuda_tensor_free(tu4[c]); coli_cuda_tensor_free(td8[c]); }
+        T->free(xb); T->free(yb);
+    }
     printf("lost\n");
     {
         CcStats st; T->stats(&st);

@@ -70,6 +70,9 @@ typedef struct {
     CcBuf *x, *nrm, *tmp, *q, *k, *v, *ctx, *qkvz, *ab, *cv, *dny, *h2, *lg, *gs, *us, *hs, *ds, *sgd, *fin;
     CcBuf *h2d, *lgd, *kvd, *outd, *xd, *lfd, *routed, *cs;
     float *host_routed;
+    CcBuf *rdev;                               /* the residents' weighted sum per row, computed on the device (the route) */
+    int xdev, last_xdev;                       /* the route is on; the layer just computed used it */
+    unsigned long long xdev_rows, xdev_experts, xdev_refused;
     unsigned long long forwards, frames, fault_at, dec_n;   /* dec_n: one-row forwards (decode tokens) */
     double wait_ms, host_ms, dec_wait_ms, dec_host_ms;      /* and their shares of the waits and the host's experts */
 } Q36CChain;
@@ -78,6 +81,8 @@ static int g_cuda_chain = 0;     /* COLI_CUDA_CHAIN asked for it and the chain i
 static Q36CChain *q36cc_of(Model *m) { return (Q36CChain *)m->cchain; }
 
 static int q36cc_env_on(void) { const char *e = getenv("COLI_CUDA_CHAIN"); return e && *e == '1'; }
+/* COLI_CUDA_CHAIN_EXPERTS=0: the residents through the tier's host path (qt_issue / qt_take) instead of the route */
+static int q36cc_experts_env(void) { const char *e = getenv("COLI_CUDA_CHAIN_EXPERTS"); return !e || *e != '0'; }
 static int q36cc_rows_env(void) {
     const char *e = getenv("COLI_CUDA_CHAIN_ROWS");
     int r = e && *e ? atoi(e) : 256;
@@ -292,10 +297,12 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     ch->dn_where = Q36CC_HOST; ch->host_zero = 0;
     { const char *e = getenv("COLI_CUDA_CHAIN_FAULT"); ch->fault_at = e && *e ? strtoull(e, NULL, 10) : 0; }
     ch->ok = 1;
+    ch->xdev = c->n_experts > 0 && q36cc_experts_env() && qt_resident_capable(ch->dev);
     fprintf(stderr, "[chain] qwen36: %d layers on CUDA device %d (%d attention), lm_head too; %.1f MiB of parameters, "
-                    "%.1f MiB of router, b|a and gate rows, %.0f MB of DeltaNet state\n",
+                    "%.1f MiB of router, b|a and gate rows, %.0f MB of DeltaNet state; the resident experts %s\n",
             L, ch->dev, ch->n_attn, np * 4 / 1048576.0, own / 1048576.0,
-            (double)(L - ch->n_attn) * ((double)vh * c->dn_kdim * c->dn_vdim + (double)conv_dim * (convk - 1)) * 4 / 1e6);
+            (double)(L - ch->n_attn) * ((double)vh * c->dn_kdim * c->dn_vdim + (double)conv_dim * (convk - 1)) * 4 / 1e6,
+            ch->xdev ? "on the chain's stream" : c->n_experts > 0 && q36cc_experts_env() && qt_experts_on() ? "through the tier's host path (more than one device)" : "through the tier's host path");
     return ch;
 }
 
@@ -315,6 +322,7 @@ static int q36cc_bufs(Q36CChain *ch, Model *m, int rows) {
              cc_reserve(&ch->h2d, r * D * F, CC_DOWN) && cc_reserve(&ch->lgd, r * E * F, CC_DOWN) &&
              cc_reserve(&ch->kvd, (size_t)(ch->n_attn ? ch->n_attn : 1) * 2 * r * kvo * F, CC_DOWN) &&
              cc_reserve(&ch->outd, (size_t)c->vocab * F, CC_DOWN) && cc_reserve(&ch->routed, r * D * F, CC_UP) &&
+             cc_reserve(&ch->rdev, r * D * F, CC_DEV) &&
              cc_reserve(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP);
     return ok;
 }
@@ -501,12 +509,53 @@ static int q36cc_shared(Q36CChain *ch, Model *m, Layer *l, int i, int n) {
     if (ok && ch->t_sg[i]) ok = cc_matmul(ch->t_sg[i], ch->h2, 0, ch->sgd, 0, n);
     return ok;
 }
-/* x += routed + gate * shared, as moe() leaves `out` and layers_forward_range adds it */
+/* x += routed + gate * shared, as moe() leaves `out` and layers_forward_range adds it. With the
+ * route, the residents' sum is on the device (rdev) and the CPU's share came up (routed): the
+ * two are added first, in that order (the host path adds the CPU's share first, then the tier's;
+ * both are one float add per expert, the sum's bits differ only by the order of the K terms). */
 static int q36cc_combine(Q36CChain *ch, Model *m, int i, int n) {
-    Cfg *c = &m->c;
+    Cfg *c = &m->c; int D = c->hidden;
+    CcBuf *routed = ch->routed;
+    if (ch->last_xdev) {
+        CcEw add = {CC_EW_ADD, n * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+        if (!cc_ew(ch->rdev, ch->rdev, ch->routed, NULL, NULL, &add)) return 0;
+        routed = ch->rdev;
+    }
     int flags = (c->n_experts > 0 ? 1 : 0) | (c->shared_inter > 0 ? 2 : 0) | (m->L[i].sh_gate && c->shared_inter > 0 ? 4 : 0);
-    CcEw p = {CC_EW_COMBINE, n * c->hidden, c->hidden, 1, flags, 1, 0, 0, 0, 0, 0, 1.f};
-    return cc_ew(ch->x, ch->x, ch->routed, ch->ds, ch->sgd, &p);
+    CcEw p = {CC_EW_COMBINE, n * D, D, 1, flags, 1, 0, 0, 0, 0, 0, 1.f};
+    return cc_ew(ch->x, ch->x, routed, ch->ds, ch->sgd, &p);
+}
+
+/* ---- the route: the residents of a row on the chain's stream (moe_ex calls these) ---- */
+/* 1 while the chain is running a forward with the route on: moe_ex sends every row's residents here */
+static int q36cc_experts_route(Model *m) {
+    Q36CChain *ch = q36cc_of(m);
+    return g_cuda_chain && ch && ch->ok && !ch->failed && ch->xdev;
+}
+/* Row s of the layer: the residents among idx[0..K) as one launch on the device, reading the
+ * normalized row from h2 and writing their weighted sum to rdev's row; the bitmask of the k
+ * taken comes back, the rest is the CPU's (qt_cpu_misses, into the host's `out`). A refusal
+ * (a format the kernels do not take) hands the residents to the CPU as well and turns the
+ * route off for the layers to come; the row of rdev is zeroed so the combine stays right. */
+static uint32_t q36cc_experts_row(Model *m, int layer, int s, const int *idx, const float *val, int K) {
+    Q36CChain *ch = q36cc_of(m); int D = m->c.hidden;
+    ColiCudaTensor *tg[32], *tu[32], *td[32]; int ks[32]; float vals[32]; uint32_t mask = 0;
+    int n = K <= 32 ? qt_resident_open(layer, idx, K, ch->dev, tg, tu, td, ks, &mask) : 0;
+    if (n > 0) {
+        for (int j = 0; j < n; j++) vals[j] = val[ks[j]];
+        if (cc_experts(tg, tu, td, vals, n, ch->h2, (size_t)s * D, ch->rdev, (size_t)s * D)) {
+            ch->xdev_rows++; ch->xdev_experts += (unsigned long long)n;
+            return mask;
+        }
+        if (!cc_lost()) {
+            ch->xdev = 0; ch->xdev_refused++;
+            fprintf(stderr, "[chain] qwen36: the device declined the routed experts of layer %d (%d resident, a format or shape the "
+                            "kernels do not take); they stay on the host from here (the tier's path)\n", layer, n);
+        }
+        mask = 0;
+    }
+    cc_zero(ch->rdev, (size_t)s * D, (size_t)D);   /* a failure here is the frame's: the next op reports the lost device */
+    return mask;
 }
 /* COLI_CUDA_CHAIN_FAULT=n: the n-th frame fails (for the tests) */
 static int q36cc_frame_begin(Q36CChain *ch) {
@@ -582,6 +631,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                 double t0 = tm_now();
                 ok = ok && cc_submit(1);   /* A1 */
                 ch->wait_ms += tm_now() - t0;
+                qt_resident_close();       /* the previous layer's residents were read by now */
                 if (!ok) break;
                 if (c->is_attn[i]) {                           /* the rows into the host's cache */
                     const float *kv = (const float *)cc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
@@ -591,15 +641,19 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                         memcpy(m->V[i] + dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim * sizeof(float));
                     }
                 }
-                /* A2: the shared expert, while the host computes the routed experts */
-                ok = q36cc_frame_begin(ch) && q36cc_shared(ch, m, l, i, n) && cc_submit(0);
+                /* A2: the shared expert, then -- with the route -- the residents of each row as
+                 * the host routes it (q36cc_experts_row), all on the chain's stream behind A1's
+                 * work; the CPU's share overlaps and comes up through `routed` */
+                ok = q36cc_frame_begin(ch) && q36cc_shared(ch, m, l, i, n);
+                ch->last_xdev = q36cc_experts_route(m);
                 double t1 = tm_now();
                 moe_ex(m, l, i, (float *)cc_ptr(ch->h2d), n, ch->host_routed, (const float *)cc_ptr(ch->lgd), 1);
                 memcpy(cc_ptr(ch->routed), ch->host_routed, (size_t)n * D * sizeof(float));
                 double t2 = tm_now();
                 tm_add(n, 2, t2 - t1); ch->host_ms += t2 - t1;
-                ok = ok && q36cc_frame_begin(ch);
+                ok = ok && cc_submit(0) && q36cc_frame_begin(ch);
             } else if (ok) {
+                ch->last_xdev = 0;
                 ok = q36cc_shared(ch, m, l, i, n);
                 if (ok && i + 1 < L) ok = cc_submit(0) && q36cc_frame_begin(ch);
             }
@@ -619,6 +673,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         double t0 = tm_now();
         ok = ok && cc_submit(1);
         ch->wait_ms += tm_now() - t0;
+        qt_resident_close();
         if (!ok) goto lost;
         if (E == 0) for (int i = 0; i < L; i++) {           /* a dense model reads its K/V rows back here */
             if (!c->is_attn[i]) continue;
@@ -641,6 +696,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
     return L;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     if (!cc_lost()) cc_finish();
+    qt_resident_close();
     q36cc_recover(m, pos_base);
     return 0;
 }
@@ -653,4 +709,7 @@ static void q36cc_report(Model *m) {
                     "%.1f ms of routed experts on the host, %.1f MiB on the device; per decode token %.2f ms waiting, %.2f ms of experts (%llu tokens)\n",
             ch->forwards, st.frames, st.ops, st.matmuls, ch->wait_ms, ch->host_ms, st.dev_bytes / 1048576.0,
             ch->dec_n ? ch->dec_wait_ms / ch->dec_n : 0.0, ch->dec_n ? ch->dec_host_ms / ch->dec_n : 0.0, ch->dec_n);
+    if (ch->xdev_rows || ch->xdev_refused)
+        fprintf(stderr, "[chain] qwen36: the route: %llu resident experts over %llu rows on the chain's stream%s\n",
+                ch->xdev_experts, ch->xdev_rows, ch->xdev_refused ? ", then declined by the device (the tier's path from there)" : "");
 }

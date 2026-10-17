@@ -104,6 +104,7 @@ typedef struct {
      * qt_issue and qt_take. Sharing x/y there overwrote the group's input and
      * output mid-flight (silent, output-only corruption, no CUDA error). */
     float *dx, *dy; size_t dx_cap, dy_cap;
+    float *xh; size_t xh_cap;                   /* the chain's experts: silu(gate)*up rows (coli_cuda_experts_dev_async) */
     uint8_t *qx; float *qscale;
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y,*host_kv; size_t host_x_cap,host_y_cap,host_kv_cap;
@@ -1361,6 +1362,7 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->y) cudaFree(ctx->y);
         if (ctx->dx) cudaFree(ctx->dx);
         if (ctx->dy) cudaFree(ctx->dy);
+        if (ctx->xh) cudaFree(ctx->xh);
         if (ctx->gate) cudaFree(ctx->gate);
         if (ctx->up) cudaFree(ctx->up);
         if (ctx->qx) cudaFree(ctx->qx);
@@ -2921,6 +2923,134 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
         quant_matmul<<<grid, 256, 0, st>>>(y_dev, x_dev, t->weights, t->scales, t->fmt, S, t->I, t->O,
                                             row_bytes(t->fmt, t->I), t->gs, t->ng);
     return cuda_ok(cudaGetLastError(), "chain gemm launch");
+}
+
+/* ==== the routed experts of one row on the chain's stream (cuda_chain.h `experts`) ====
+ * The tier's groups (coli_cuda_expert_group_issue) stage the activation up and the
+ * result down through pinned memory and run one 256-thread block per output row;
+ * the dense chain already holds the normalized row on the device and wants the
+ * weighted sum there, so this path takes DEVICE pointers and the chain's stream,
+ * moves nothing across the bus and reads the weights the way gemv_i8_rows reads
+ * the trunk: a warp (or a half or quarter of one for short rows) per output row,
+ * 16 bytes a lane, the activation in shared memory, a shuffle reduction. Member
+ * formats: fmt 1 (int8, per-row scale), fmt 2 (int4 packed, per-row scale) and
+ * fmt 4 (int4 packed, a scale per gs weights, gs a multiple of 32 so a 16-byte
+ * load never straddles a group); gate/up and down may differ (--down-bits). The
+ * descriptors travel as a by-value kernel parameter (no staging copy that could
+ * outlive its host buffer, no stream sync for a pageable source). */
+#define XD_MAX 32
+typedef struct { const void *g,*u,*d; const float *gs,*us,*ds; int gf,uf,df,ggs,ugs,dgs; float val; } XDesc;
+typedef struct { XDesc e[XD_MAX]; } XDescs;
+
+__device__ __forceinline__ float xd_chunk_dot(const uint8_t *row, int fmt, int ci, const float *xs) {
+    int4 v = *reinterpret_cast<const int4 *>(row + (size_t)ci * 16);
+    float a = 0.f;
+    if (fmt == 1) {
+        const int8_t *b = (const int8_t *)&v; const float *x = xs + ci * 16;
+        #pragma unroll
+        for (int k = 0; k < 16; k++) a += x[k] * (float)b[k];
+    } else {
+        const uint8_t *b = (const uint8_t *)&v; const float *x = xs + ci * 32;
+        #pragma unroll
+        for (int k = 0; k < 16; k++) {
+            int lo = b[k] & 15, hi = b[k] >> 4;
+            a += x[2 * k] * (float)((lo & 8) ? lo - 16 : lo) + x[2 * k + 1] * (float)((hi & 8) ? hi - 16 : hi);
+        }
+    }
+    return a;
+}
+/* row o of a [O,In] matrix dotted with xs by LPR lanes (lane 0 of the group gets the sum) */
+template <int LPR>
+__device__ __forceinline__ float xd_row_dot(const void *w, const float *sc, int fmt, int gs, int o, int In, const float *xs, int lane) {
+    int per = fmt == 1 ? 16 : 32, chunks = In / per;
+    const uint8_t *row = (const uint8_t *)w + (size_t)o * (size_t)(fmt == 1 ? In : In / 2);
+    float acc = 0.f;
+    if (fmt == 4) {
+        const float *s = sc + (size_t)o * (size_t)((In + gs - 1) / gs);
+        for (int ci = lane; ci < chunks; ci += LPR) acc += s[(ci * 32) / gs] * xd_chunk_dot(row, fmt, ci, xs);
+    } else {
+        for (int ci = lane; ci < chunks; ci += LPR) acc += xd_chunk_dot(row, fmt, ci, xs);
+    }
+    for (int off = LPR >> 1; off > 0; off >>= 1) acc += f8_shfl_down(acc, off);
+    return fmt == 4 ? acc : acc * sc[o];
+}
+/* h[c][o] = silu(gate_c[o] . x) * (up_c[o] . x); grid (ceil(I/8), count), x [D] on the device */
+__global__ static void __launch_bounds__(256) xd_hidden_k(float *h, const float *x, XDescs ds, int D, int I) {
+    extern __shared__ float xs[];
+    for (int i = threadIdx.x; i < D; i += 256) xs[i] = x[i];
+    __syncthreads();
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, c = blockIdx.y;
+    int o = blockIdx.x * 8 + warp, valid = o < I;
+    if (!valid) o = I - 1;                      /* every lane stays for the shuffles */
+    const XDesc *e = &ds.e[c];
+    float g = xd_row_dot<32>(e->g, e->gs, e->gf, e->ggs, o, D, xs, lane);
+    float u = xd_row_dot<32>(e->u, e->us, e->uf, e->ugs, o, D, xs, lane);
+    if (lane == 0 && valid) h[(size_t)c * I + o] = (g / (1.0f + expf(-g))) * u;
+}
+/* y[o] = sum_c val_c * (down_c[o] . h[c]); grid ceil(D / (256/LPR)); h in shared memory when it fits */
+template <int LPR>
+__global__ static void __launch_bounds__(256) xd_down_k(float *y, const float *h, XDescs ds, int count, int D, int I, int h_smem) {
+    extern __shared__ float hs_[];
+    const float *hs = h;
+    if (h_smem) {
+        for (int i = threadIdx.x; i < count * I; i += 256) hs_[i] = h[i];
+        __syncthreads();
+        hs = hs_;
+    }
+    int lane = threadIdx.x & (LPR - 1), sub = threadIdx.x / LPR;
+    int o = blockIdx.x * (256 / LPR) + sub, valid = o < D;
+    if (!valid) o = D - 1;
+    float acc = 0.f;
+    for (int c = 0; c < count; c++) {
+        const XDesc *e = &ds.e[c];
+        acc += e->val * xd_row_dot<LPR>(e->d, e->ds, e->df, e->dgs, o, I, hs + (size_t)c * I, lane);
+    }
+    if (lane == 0 && valid) y[o] = acc;
+}
+static int xd_member_ok(const ColiCudaTensor *t, int In) {
+    if (t->fmt == 1) return In % 16 == 0;
+    if (t->fmt == 2) return In % 32 == 0;
+    if (t->fmt == 4) return t->gs >= 32 && t->gs % 32 == 0 && In % t->gs == 0;
+    return 0;
+}
+/* 1: launched on `stream`; 0: refused (a shape or format these kernels do not take, nothing
+ * launched); -1: a launch failed (the device is in an unknown state). y[D] is overwritten. */
+extern "C" int coli_cuda_experts_dev_async(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
+                                            ColiCudaTensor *const *downs, const float *vals, int count,
+                                            const float *x_dev, float *y_dev, void *stream) {
+    if (fault_injected()) return -1;
+    if (!gates || !ups || !downs || !vals || count < 1 || count > XD_MAX || !x_dev || !y_dev || !gates[0]) return 0;
+    int device = gates[0]->device, D = gates[0]->I, I = gates[0]->O;
+    if (D < 16 || I < 16 || D > 65536) return 0;
+    XDescs ds;
+    for (int c = 0; c < count; c++) {
+        const ColiCudaTensor *g = gates[c], *u = ups[c], *d = downs[c];
+        if (!g || !u || !d || g->device != device || u->device != device || d->device != device ||
+            g->I != D || u->I != D || g->O != I || u->O != I || d->I != I || d->O != D ||
+            !g->weights || !u->weights || !d->weights || !g->scales || !u->scales || !d->scales ||
+            !xd_member_ok(g, D) || !xd_member_ok(u, D) || !xd_member_ok(d, I) || d->fmt != downs[0]->fmt) return 0;
+        ds.e[c].g = g->weights; ds.e[c].u = u->weights; ds.e[c].d = d->weights;
+        ds.e[c].gs = g->scales; ds.e[c].us = u->scales; ds.e[c].ds = d->scales;
+        ds.e[c].gf = g->fmt; ds.e[c].uf = u->fmt; ds.e[c].df = d->fmt;
+        ds.e[c].ggs = g->gs; ds.e[c].ugs = u->gs; ds.e[c].dgs = d->gs;
+        ds.e[c].val = vals[c];
+    }
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return 0;
+    cudaStream_t st = (cudaStream_t)stream;
+    size_t hb = (size_t)count * I * sizeof(float);
+    if (ctx->xh_cap < hb) {   /* the previous row's kernels may still read the old buffer */
+        if (ctx->xh && !cuda_ok(cudaStreamSynchronize(st), "experts scratch drain")) return -1;
+        if (!reserve(&ctx->xh, &ctx->xh_cap, hb)) return -1;
+    }
+    dim3 hg((unsigned)((I + 7) / 8), (unsigned)count);
+    xd_hidden_k<<<hg, 256, (size_t)D * sizeof(float), st>>>(ctx->xh, x_dev, ds, D, I);
+    int chunks = I / (downs[0]->fmt == 1 ? 16 : 32), h_smem = hb <= 48 * 1024;
+    size_t sm = h_smem ? hb : 0;
+    if (chunks >= 32)      xd_down_k<32><<<(unsigned)((D + 7) / 8), 256, sm, st>>>(y_dev, ctx->xh, ds, count, D, I, h_smem);
+    else if (chunks >= 16) xd_down_k<16><<<(unsigned)((D + 15) / 16), 256, sm, st>>>(y_dev, ctx->xh, ds, count, D, I, h_smem);
+    else                   xd_down_k<8><<<(unsigned)((D + 31) / 32), 256, sm, st>>>(y_dev, ctx->xh, ds, count, D, I, h_smem);
+    return cuda_ok(cudaGetLastError(), "chain experts launch") ? 1 : -1;
 }
 
 /* ==== resident-pipeline primitives (Inc.0, 2026-07-13) ====

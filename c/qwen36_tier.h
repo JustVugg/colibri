@@ -165,6 +165,23 @@ uint32_t qt_issue(int layer, const int *eids, int K, const float *x);
  * stop inference: experts selected by qt_issue were not computed on CPU. */
 int qt_take(uint32_t mask, const float *val, int K, float *out);
 
+/* The resident experts of one routed row for a caller that computes them itself on
+ * device `dev` (the CUDA chain, qwen36_cuda_chain.h, on its own stream with the row
+ * already on the device): fills tg/tu/td with the tensors of the residents among the
+ * K selected and ks[j] with each one's rank k, counts them as hits (and their heat),
+ * marks the group open -- no eviction and no in-place swap until qt_resident_close()
+ * -- and returns their number, with the bitmask of the k taken in *mask. 0 when the
+ * tier is off, serves more than one device, or `dev` is not its device: then every
+ * expert is the caller's (qt_resident_capable says so once, at setup). The caller
+ * computes the rest on the CPU and closes the group once the device has finished
+ * reading the tensors (after the wait for the frame they were issued in). Open may
+ * be called again for the next row before the close: the group grows. */
+int  qt_resident_capable(int dev);
+int  qt_resident_open(int layer, const int *eids, int K, int dev,
+                      struct ColiCudaTensor **tg, struct ColiCudaTensor **tu, struct ColiCudaTensor **td,
+                      int *ks, uint32_t *mask);
+void qt_resident_close(void);
+
 /* Warmstart: plan the full fill set (heat order, budget reserved), then any
  * number of loader threads may call qt_note_planned per planned expert. */
 int  qt_plan_fill(int *layers, int *eids, int max);
@@ -202,6 +219,7 @@ void qt_stats_mark(void);
 void qt_stats(void);
 
 #else /* !COLI_CUDA: inline stubs, engine stays CPU-only */
+struct ColiCudaTensor;   /* the route's stubs name it; no CUDA build defines it */
 
 static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g,int h){(void)h;(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_init_fp8(int a,int b,int c,int d,int e,int f,const float*g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
@@ -238,6 +256,9 @@ static inline void qt_shutdown(void){}
 static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int qt_take(uint32_t a,const float*b,int c,float*d){(void)b;(void)c;(void)d;return a==0;}
+static inline int  qt_resident_capable(int a){(void)a;return 0;}
+static inline int  qt_resident_open(int a,const int*b,int c,int d,struct ColiCudaTensor**e,struct ColiCudaTensor**f,struct ColiCudaTensor**g,int*h,uint32_t*m){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;*m=0;return 0;}
+static inline void qt_resident_close(void){}
 static inline int  qt_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
 static inline void qt_note_planned(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline int  qt_fill_next(int*a,int*b){(void)a;(void)b;return 0;}

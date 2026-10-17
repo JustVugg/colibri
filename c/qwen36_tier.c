@@ -1483,6 +1483,43 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     return mask;
 }
 
+/* The chain's route (qwen36_tier.h): the residents of a row as tensors, the group
+ * held open across the caller's frame. One device only: the chain runs on one card
+ * and an expert resident on the other would have to cross the bus to reach it. */
+int qt_resident_capable(int dev){
+    return G.on && !G_trunk_only && G.ndev==1 && G.dev[0]==dev;
+}
+int qt_resident_open(int layer,const int *eids,int K,int dev,
+                     ColiCudaTensor **tg,ColiCudaTensor **tu,ColiCudaTensor **td,int *ks,uint32_t *mask){
+    *mask=0;
+    if(!G.on||K>QT_MAX_ROWS||G.ndev!=1||G.dev[0]!=dev) return 0;
+    int n=0;
+    pthread_mutex_lock(&G.mx);
+    /* QT_UPLOAD_SYNC=1, as in qt_issue: everything enqueued is resident first -- only
+     * while no group is open, since a swap's upload parks on issue_open and would
+     * never finish under a group this caller holds. */
+    if(G_upload_sync && !G.issue_open) while(G.inflight>0 && !G.th_stop) wait_take_locked();
+    if(G.th_stop){ pthread_mutex_unlock(&G.mx); return 0; }
+    if(layer==0 && !G.issue_open) qt_lfru_tick_locked();
+    G.issue_open=1;
+    for(int k=0;k<K;k++){
+        QSlot *s=qs(layer,eids[k]);
+        if(s->resident){
+            if(s->heat<0xFFFFFFFFu) s->heat++;
+            tg[n]=s->tg; tu[n]=s->tu; td[n]=s->td; ks[n]=k; n++;
+            *mask|=1u<<k; G.hits[0]++;
+        } else G.miss++;
+    }
+    pthread_mutex_unlock(&G.mx);
+    return n;
+}
+void qt_resident_close(void){
+    if(!G.on) return;
+    pthread_mutex_lock(&G.mx);
+    if(G.issue_open){ G.issue_open=0; pthread_cond_broadcast(&G.cv_take); }
+    pthread_mutex_unlock(&G.mx);
+}
+
 int qt_take(uint32_t mask,const float *val,int K,float *out){
     (void)K;
     if(!G.on) return mask==0;

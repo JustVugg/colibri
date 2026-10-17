@@ -150,7 +150,9 @@ int main(void) {
     setenv("COLI_LMHEAD_GPU", "0", 1);
     setenv("COLI_DENSE_IDOT", "0", 1);          /* f32 activations on the CPU too: the chain's arithmetic */
     setenv("COLI_CUDA_CHAIN", "1", 1);
+    setenv("QT_UPLOAD_SYNC", "1", 1);          /* an expert the CPU computed is resident before the next layer's group */
     fake_ndev = 1; fake_dense_compute = 1;
+    g_expert_is_int4 = 0;                       /* the slots hold int8 rows: moe_ex offers them to the tier (tier_offer_slot) */
     Weights w; make_weights(&w);
     const int ids[12] = {3, 17, 42, 9, 21, 60, 5, 33, 12, 48, 7, 29};   /* the verify reads three from index 6 */
 
@@ -192,6 +194,8 @@ int main(void) {
     q36cc_sync_host(&m);
     ck(maxdiff(m.DN_rec[0], ref.DN_rec[0], (size_t)VH * KD * VD) < 1e-3 && maxdiff(m.DN_conv[0], ref.DN_conv[0], (size_t)CD * (CONVK - 1)) < 1e-4,
        "the state read back from the device equals the CPU path's");
+    ck(ch->xdev && ch->xdev_experts > 0 && !ch->xdev_refused, "the residents of the decode tokens ran through the route (the fake's experts op)");
+    { CcStats st; cc_stats(&st); ck(st.experts == ch->xdev_experts, "the table counted them"); }
     ck(ch->dn_where == Q36CC_BOTH, "both sides hold it now");
 
     printf(" B. a host write, then the chain again; a CPU prompt, then the chain again\n");
@@ -250,6 +254,10 @@ int main(void) {
       ck(coli_cuda_chain_ops() == NULL, "the backend has no table");
       fake_chain_absent = 0;
       ck(q36cc_setup(&m2, 2) == NULL, "KV_SLOTS > 1 keeps the chain off");
+      setenv("COLI_CUDA_CHAIN_EXPERTS", "0", 1);
+      Q36CChain *c2 = q36cc_setup(&m2, 1);
+      ck(c2 && c2->ok && !c2->xdev, "COLI_CUDA_CHAIN_EXPERTS=0 keeps the residents on the tier's host path");
+      setenv("COLI_CUDA_CHAIN_EXPERTS", "", 1);
       (void)m2; }
 
     qt_shutdown();
