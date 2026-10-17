@@ -174,6 +174,51 @@ class MimoTemplateTest(unittest.TestCase):
 
 class MimoToolParseTest(unittest.TestCase):
 
+    def test_invalid_arguments_remain_visible_instead_of_becoming_calls(self):
+        bodies = (
+            '{not json', '[1, 2]',
+            '<parameter=days>not a number</parameter>',
+            '<parameter=days>true</parameter>',
+            '<parameter=days>1.5</parameter>',
+            '<parameter=units>{"not": "an array"}</parameter>',
+            '<parameter=units>[NaN]</parameter>',
+            '<parameter=city>Rome</parameter><parameter=city>Paris</parameter>',
+            'unexpected prose<parameter=city>Rome</parameter>',
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                reply = '<tool_call><function=get_weather>' + body + '</function></tool_call>'
+                text, calls = openai_server.parse_mimo_tool_calls(reply, [WEATHER])
+                self.assertEqual(calls, [])
+                self.assertEqual(text, reply)
+
+    def test_json_decoder_nesting_limit_preserves_model_output(self):
+        raw = '[' * 10000 + '0' + ']' * 10000
+        for body in ('{"city":' + raw + '}', '<parameter=units>' + raw + '</parameter>'):
+            with self.subTest(tagged=body.startswith('<')):
+                reply = '<tool_call><function=get_weather>' + body + '</function></tool_call>'
+                text, calls = openai_server.parse_mimo_tool_calls(reply, [WEATHER])
+                self.assertEqual(calls, [])
+                self.assertEqual(text, reply)
+
+    def test_union_type_uses_declared_json_value(self):
+        tool = copy.deepcopy(WEATHER)
+        tool['function']['parameters']['properties']['days']['type'] = ['integer', 'null']
+        for raw, expected in (('3', 3), ('null', None)):
+            reply = ('<tool_call><function=get_weather><parameter=days>' + raw +
+                     '</parameter></function></tool_call>')
+            _text, calls = openai_server.parse_mimo_tool_calls(reply, [tool])
+            self.assertEqual(json.loads(calls[0]['function']['arguments']), {'days': expected})
+
+    def test_span_parser_preserves_invalid_call_between_valid_calls(self):
+        valid = '<tool_call><function=search><parameter=query>x</parameter></function></tool_call>'
+        invalid = '<tool_call><function=get_weather>{broken</function></tool_call>'
+        reply = 'before' + valid + invalid + 'after'
+        text, calls, _box, spans = openai_server._parse_mimo_tool_calls(reply, [SEARCH, WEATHER], True)
+        self.assertEqual(text, 'before' + invalid + 'after')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(''.join(reply[a:b] for a, b, _ in spans), text)
+
     def test_inline_calls_with_typed_arguments(self):
         reply = ("Controllo.<tool_call><function=get_weather><parameter=city>Roma</parameter>"
                  "<parameter=days>3</parameter><parameter=units>[\"C\", \"mm\"]</parameter>"
