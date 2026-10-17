@@ -763,11 +763,27 @@ def _tensors(path):
         if length < 2 or length > size - 8:
             raise ValueError(f"invalid safetensors header length: {path}")
         header = json.loads(stream.read(length))
+    if not isinstance(header, dict):
+        raise ValueError(f"safetensors header is not an object: {path}")
+    payload_size = size - 8 - length
     for name, meta in header.items():
         if name == "__metadata__":
             continue
-        start, end = meta["data_offsets"]
-        yield name, meta.get("dtype", "?"), tuple(meta.get("shape") or ()), end - start
+        if not isinstance(meta, dict):
+            raise ValueError(f"invalid tensor metadata for {name}: {path}")
+        offsets, shape, dtype = meta.get("data_offsets"), meta.get("shape"), meta.get("dtype")
+        if (not isinstance(offsets, list) or len(offsets) != 2 or
+                any(isinstance(v, bool) or not isinstance(v, int) for v in offsets)):
+            raise ValueError(f"invalid tensor offsets for {name}: {path}")
+        start, end = offsets
+        if not 0 <= start <= end <= payload_size:
+            raise ValueError(f"tensor offsets exceed payload for {name}: {path}")
+        if (not isinstance(shape, list) or
+                any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in shape)):
+            raise ValueError(f"invalid tensor shape for {name}: {path}")
+        if not isinstance(dtype, str):
+            raise ValueError(f"invalid tensor dtype for {name}: {path}")
+        yield name, dtype, tuple(shape), end - start
 
 
 def _quantized_bytes(shape, nbytes, dtype):
