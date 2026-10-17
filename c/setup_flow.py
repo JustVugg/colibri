@@ -22,6 +22,7 @@ COLI_SETUP_HOME):
 It installs nothing system-wide. When a package is missing it prints the exact
 command for this system and lets the user run it.
 """
+import http.client
 import json
 import os
 import re
@@ -858,8 +859,12 @@ def _download_asset(release, name, folder):
                                              headers={"User-Agent": "colibri-setup"})
             with urllib.request.urlopen(request, timeout=30) as response:
                 sums = parse_sha256sums(response.read().decode("utf-8", "replace"))
-        except (urllib.error.URLError, OSError):
-            sums = {}
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
+            raise SetupError(f"cannot read SHA256SUMS.txt for {name}: {error}") from error
+        if name not in sums:
+            raise SetupError(f"release {release['tag']}: SHA256SUMS.txt has no valid SHA256 for {name}")
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, name)
     # The asset size is not in the listing we keep; HEAD-less: let the server tell.

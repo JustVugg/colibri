@@ -1011,6 +1011,68 @@ class Releases(HomeTestCase):
                         self.assertEqual(info["backend"], "vulkan")
                         self.assertIn("release v2.1.0 has no windows-x86_64-cuda.zip: using Vulkan", said)
 
+    def test_advertised_release_checksums_cannot_be_skipped(self):
+        name = "colibri-v1.12.1-fixture.tar.gz"
+        archive = b"release fixture, never extracted or executed"
+        digest = hashlib.sha256(archive).hexdigest()
+        mode = {"value": "valid"}
+        requests = []
+        class ReleaseHTTP(SimpleHTTPRequestHandler):
+            def log_message(self, *_): pass
+            def do_GET(self):
+                requests.append(self.path)
+                status = 200
+                extra_length = 0
+                if self.path == "/" + name:
+                    body = archive
+                elif mode["value"] == "503":
+                    status, body = 503, b""
+                else:
+                    text = {"valid": f"{digest}  {name}\n",
+                            "missing": f"{digest}  other-archive.tar.gz\n",
+                            "malformed": f"not-a-sha256  {name}\n",
+                            "truncated-entry": digest[:24],
+                            "truncated-http": "short"}[mode["value"]]
+                    body = text.encode()
+                    extra_length = 30 if mode["value"] == "truncated-http" else 0
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body) + extra_length))
+                self.end_headers()
+                self.wfile.write(body)
+                self.close_connection = True
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ReleaseHTTP)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        release = {"tag": "v1.12.1", "assets": {
+            name: f"{base}/{name}", "SHA256SUMS.txt": f"{base}/SHA256SUMS.txt"}}
+        try:
+            for value in ("503", "truncated-http", "truncated-entry", "missing", "malformed"):
+                with self.subTest(case=value):
+                    mode["value"] = value
+                    before = len(requests)
+                    folder = os.path.join(self.tmp.name, value)
+                    with self.assertRaises(setup_flow.SetupError) as caught:
+                        setup_flow._download_asset(release, name, folder)
+                    self.assertIn("SHA256SUMS.txt", str(caught.exception))
+                    self.assertIn(name, str(caught.exception))
+                    self.assertEqual(requests[before:], ["/SHA256SUMS.txt"])
+                    self.assertFalse(Path(folder, name).exists())
+            for value in ("valid", "legacy"):
+                with self.subTest(case=value):
+                    mode["value"] = value
+                    selected = release if value == "valid" else {
+                        "tag": release["tag"], "assets": {name: release["assets"][name]}}
+                    before = len(requests)
+                    path = setup_flow._download_asset(selected, name, os.path.join(self.tmp.name, value))
+                    self.assertEqual(Path(path).read_bytes(), archive)
+                    self.assertEqual(requests[before:], (["/SHA256SUMS.txt"] if value == "valid" else [])
+                                     + ["/" + name])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_bad_checksum_is_refused(self):
         tag = "v1.12.1"
         name = f"colibri-{tag}-linux-x86_64.tar.gz"
