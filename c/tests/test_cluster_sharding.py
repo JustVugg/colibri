@@ -26,8 +26,15 @@ Regeneration (run from c/):
 Determinism: both the worker and the coordinator run the SAME c/colibri binary
 (same ARCH) with the SAME numeric-path env block, so the comparison is
 meaningful rather than accidental.
+
+Q8 drift gate (ClusterQ8DriftTest): COLI_CLUSTER_ACT=q8 is the opt-in protocol
+v2 transfer -- every row crosses the wire as int8 blocks of 32 with one f32
+scale, both directions -- and is lossy by construction, so it gets its own
+bound (Q8_MAX_MISMATCHES, measured) and a byte-cut floor instead of a seat at
+the token-exact gate above. The f32 gate is untouched: the default stays exact.
 """
 
+import contextlib
 import os
 import re
 import socket
@@ -100,100 +107,105 @@ def _tf_signature(result: subprocess.CompletedProcess[str]):
     return (match.groups() if match else None, mismatches)
 
 
+@contextlib.contextmanager
+def _expert_worker(fixture_dir: Path, fail):
+    """One disk-backed expert worker on a free loopback port, torn down after."""
+    port = _free_port()
+    worker_env = {
+        **os.environ,
+        "SNAP": str(fixture_dir),
+        "EXPERT_WORKER": "1",
+        "CLUSTER_WORKER_PORT": str(port),
+        **_NUMERIC_ENV,
+    }
+    worker = subprocess.Popen(
+        [str(ENGINE), *ENGINE_ARGS],
+        cwd=C_DIR,
+        env=worker_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if worker.poll() is not None:
+                stderr = worker.stderr.read() if worker.stderr else ""
+                fail(f"cluster worker exited early: {stderr}")
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            fail("cluster worker did not start listening")
+        yield port
+    finally:
+        worker.terminate()
+        try:
+            worker.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            worker.kill()
+            worker.wait()
+        for stream in (worker.stdout, worker.stderr):
+            if stream is not None:
+                stream.close()
+
+
+def _coordinator(fixture_dir: Path, **extra_env: str) -> subprocess.CompletedProcess[str]:
+    """One teacher-forced coordinator run against the fixture's oracle."""
+    env = {
+        **os.environ,
+        "SNAP": str(fixture_dir),
+        "REF": str(fixture_dir / "ref_glm.json"),
+        "TF": "1",
+        "TEMP": "0",
+        **_NUMERIC_ENV,
+        **extra_env,
+    }
+    return subprocess.run(
+        [str(ENGINE), *ENGINE_ARGS],
+        cwd=C_DIR,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 @unittest.skipUnless(_available(), _skip_reason())
 class ClusterShardingParityTest(unittest.TestCase):
     """Local CPU must equal cluster-delegated expert sharding, token-exact."""
 
     def _run_parity(self, fixture_dir: Path):
-        port = _free_port()
-        worker_env = {
-            **os.environ,
-            "SNAP": str(fixture_dir),
-            "EXPERT_WORKER": "1",
-            "CLUSTER_WORKER_PORT": str(port),
-            **_NUMERIC_ENV,
-        }
-        worker = subprocess.Popen(
-            [str(ENGINE), *ENGINE_ARGS],
-            cwd=C_DIR,
-            env=worker_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        with _expert_worker(fixture_dir, self.fail) as port:
+            baseline = _coordinator(fixture_dir)
+            delegated = _coordinator(fixture_dir, CLUSTER_WORKERS=f"127.0.0.1:{port}")
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        self.assertEqual(delegated.returncode, 0, delegated.stderr)
+
+        base_sig = _tf_signature(baseline)
+        del_sig = _tf_signature(delegated)
+        self.assertIsNotNone(
+            base_sig[0],
+            f"baseline produced no teacher-forcing signature:\n"
+            f"stdout={baseline.stdout}\nstderr={baseline.stderr}",
         )
-        try:
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline:
-                if worker.poll() is not None:
-                    stderr = worker.stderr.read() if worker.stderr else ""
-                    self.fail(f"cluster worker exited early: {stderr}")
-                try:
-                    with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                        break
-                except OSError:
-                    time.sleep(0.05)
-            else:
-                self.fail("cluster worker did not start listening")
-
-            common_env = {
-                **os.environ,
-                "SNAP": str(fixture_dir),
-                "REF": str(fixture_dir / "ref_glm.json"),
-                "TF": "1",
-                "TEMP": "0",
-                **_NUMERIC_ENV,
-            }
-            baseline = subprocess.run(
-                [str(ENGINE), *ENGINE_ARGS],
-                cwd=C_DIR,
-                env=common_env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            delegated = subprocess.run(
-                [str(ENGINE), *ENGINE_ARGS],
-                cwd=C_DIR,
-                env={**common_env, "CLUSTER_WORKERS": f"127.0.0.1:{port}"},
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(baseline.returncode, 0, baseline.stderr)
-            self.assertEqual(delegated.returncode, 0, delegated.stderr)
-
-            base_sig = _tf_signature(baseline)
-            del_sig = _tf_signature(delegated)
-            self.assertIsNotNone(
-                base_sig[0],
-                f"baseline produced no teacher-forcing signature:\n"
-                f"stdout={baseline.stdout}\nstderr={baseline.stderr}",
-            )
-            self.assertEqual(
-                base_sig[1],
-                (),
-                f"baseline mismatched the oracle ({base_sig[0]}): {base_sig[1]}",
-            )
-            self.assertEqual(
-                del_sig[1],
-                (),
-                f"delegated mismatched the oracle ({del_sig[0]}): {del_sig[1]}",
-            )
-            self.assertEqual(
-                base_sig,
-                del_sig,
-                "cluster delegation changed teacher-forced token predictions",
-            )
-        finally:
-            worker.terminate()
-            try:
-                worker.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                worker.kill()
-                worker.wait()
-            for stream in (worker.stdout, worker.stderr):
-                if stream is not None:
-                    stream.close()
+        self.assertEqual(
+            base_sig[1],
+            (),
+            f"baseline mismatched the oracle ({base_sig[0]}): {base_sig[1]}",
+        )
+        self.assertEqual(
+            del_sig[1],
+            (),
+            f"delegated mismatched the oracle ({del_sig[0]}): {del_sig[1]}",
+        )
+        self.assertEqual(
+            base_sig,
+            del_sig,
+            "cluster delegation changed teacher-forced token predictions",
+        )
 
     def test_fmt6_parity(self):
         """fmt=6 (rotation-bearing) routed experts: worker must rotate the input."""
@@ -206,6 +218,78 @@ class ClusterShardingParityTest(unittest.TestCase):
     def test_fmt4_parity(self):
         """fmt=4 (no-rotation control) routed experts."""
         self._run_parity(FMT4)
+
+
+_TRANSFER_RE = re.compile(r"\[CLUSTER\] transfer: (\d+) bytes sent, (\d+) bytes received")
+
+# COLI_CLUSTER_ACT=q8 (protocol v2) is lossy by construction: every row crosses
+# the wire as int8 blocks of 32 with one f32 scale, both directions. It gets a
+# drift bound, never a seat at the token-exact gate above. Measured 0 mismatched
+# positions on both tiny fixtures; the bound carries no slack on purpose --
+# raise it WITH a fresh measurement if a fixture change moves it.
+Q8_MAX_MISMATCHES = 0
+
+
+def _transfer_bytes(result: subprocess.CompletedProcess[str]):
+    match = _TRANSFER_RE.search(result.stderr)
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+@unittest.skipUnless(_available(), _skip_reason())
+class ClusterQ8DriftTest(unittest.TestCase):
+    """COLI_CLUSTER_ACT=q8: bounded oracle drift and a real byte cut; f32 untouched."""
+
+    def _run_q8(self, fixture_dir: Path):
+        with _expert_worker(fixture_dir, self.fail) as port:
+            workers = f"127.0.0.1:{port}"
+            f32 = _coordinator(fixture_dir, CLUSTER_WORKERS=workers)
+            q8 = _coordinator(fixture_dir, CLUSTER_WORKERS=workers, COLI_CLUSTER_ACT="q8")
+        self.assertEqual(f32.returncode, 0, f32.stderr)
+        self.assertEqual(q8.returncode, 0, q8.stderr)
+        self.assertIn(
+            "activations q8 (protocol v2", q8.stderr, "the coordinator did not take the q8 path"
+        )
+
+        f32_sig, q8_sig = _tf_signature(f32), _tf_signature(q8)
+        self.assertIsNotNone(
+            f32_sig[0], f"f32 produced no teacher-forcing signature:\n{f32.stdout}\n{f32.stderr}"
+        )
+        self.assertIsNotNone(
+            q8_sig[0], f"q8 produced no teacher-forcing signature:\n{q8.stdout}\n{q8.stderr}"
+        )
+        self.assertEqual(f32_sig[1], (), f"f32 delegation mismatched the oracle: {f32_sig[1]}")
+        self.assertEqual(q8_sig[0][1], f32_sig[0][1], "q8 scored a different number of positions")
+        self.assertLessEqual(
+            len(q8_sig[1]),
+            Q8_MAX_MISMATCHES,
+            f"q8 drift exceeded the bound ({q8_sig[0]} positions matched): {q8_sig[1]}",
+        )
+
+        f32_bytes, q8_bytes = _transfer_bytes(f32), _transfer_bytes(q8)
+        self.assertIsNotNone(f32_bytes, f"no transfer summary:\n{f32.stderr}")
+        self.assertIsNotNone(q8_bytes, f"no transfer summary:\n{q8.stderr}")
+        positions = int(f32_sig[0][1])
+        print(
+            f"\n[q8] {fixture_dir.name}: {positions} positions, "
+            f"f32 {sum(f32_bytes) / positions:.0f} B/position, "
+            f"q8 {sum(q8_bytes) / positions:.0f} B/position "
+            f"({sum(f32_bytes) / sum(q8_bytes):.2f}x), "
+            f"oracle mismatches f32={len(f32_sig[1])} q8={len(q8_sig[1])}",
+            flush=True,
+        )
+        self.assertLess(sum(q8_bytes) * 3, sum(f32_bytes), "q8 moved more than a third of f32's bytes")
+
+    def test_fmt6_q8_drift(self):
+        """fmt=6 routed experts: the worker dequantizes, then rotates."""
+        self._run_q8(FMT6)
+
+    @unittest.skipUnless(
+        _fixture_ok(FMT4),
+        "glm_tiny_fmt4 fixture absent (run: python3 tools/make_glm_oracle.py --fmt4)",
+    )
+    def test_fmt4_q8_drift(self):
+        """fmt=4 routed experts: the no-rotation control."""
+        self._run_q8(FMT4)
 
 
 if __name__ == "__main__":
