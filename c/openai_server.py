@@ -6517,6 +6517,21 @@ class APIServer(ThreadingHTTPServer):
     # leaves 56 slots that one address cannot touch.
     MAX_CONNECTIONS_PER_IP = _positive_env("COLI_MAX_CONNECTIONS_PER_IP", 8)
 
+    # The kernel's accept queue, which socketserver leaves at 5. It holds the
+    # completed handshakes the accept loop has not drained yet; once it is full
+    # Linux drops the next SYN (ListenOverflows in /proc/net/netstat) and that
+    # client sits out the SYN retransmit timer -- 1 s, then 2 s, then 4 s --
+    # before the server has even seen it, which is how a dashboard's parallel
+    # fetches or a benchmark client's burst turn into multi-second stalls. The
+    # caps above run after accept(); they cannot see this. Measured with 100
+    # simultaneous connects, each GET /v1/models: at 5, 47-87 of them waited
+    # over 900 ms (max 2.2-7.9 s) and the counter rose by 91-309 per burst; at
+    # 128 none did and the counter did not move. 128 is werkzeug's and
+    # uvicorn's figure, and holds the 64 connections MAX_CONNECTIONS admits at
+    # once with room for the next burst; the kernel caps it at
+    # net.core.somaxconn (4096 on current Linux, 128 on older ones).
+    request_queue_size = 128
+
     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
                  cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
                  kv_slots=1, allowed_hosts=()):
