@@ -7895,7 +7895,10 @@ class APIHandler(BaseHTTPRequestHandler):
         stream_options = body.get("stream_options") if stream else None
         if stream and stream_options is not None and not isinstance(stream_options, dict):
             raise APIError(400, "`stream_options` must be an object.", "stream_options")
-        include_usage = bool((stream_options or {}).get("include_usage"))
+        include_usage = (stream_options or {}).get("include_usage")
+        if include_usage is not None and not isinstance(include_usage, bool):
+            raise APIError(400, "`stream_options.include_usage` must be a boolean.",
+                           "stream_options.include_usage", "invalid_value")
         object_name = "chat.completion" if chat else "text_completion"
         id_prefix = "chatcmpl-" if chat else "cmpl-"
         completion_id = id_prefix + uuid.uuid4().hex

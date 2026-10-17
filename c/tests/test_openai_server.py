@@ -3382,6 +3382,24 @@ class HTTPTest(unittest.TestCase):
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
 
+    def test_rejects_non_boolean_include_usage_before_engine_work(self):
+        routes = (("/v1/completions", {"prompt": "Hi"}),
+                  ("/v1/chat/completions", {"messages": [{"role": "user", "content": "Hi"}]}))
+        for path, fields in routes:
+            for value in ("false", 0, [], {}):
+                with self.subTest(path=path, value=value):
+                    calls_before = len(self.engine.calls)
+                    with self.assertRaises(HTTPError) as caught:
+                        self.request(path, {"model": "test-model", **fields,
+                                            "stream": True,
+                                            "stream_options": {"include_usage": value}})
+                    with caught.exception as response:
+                        self.assertEqual(response.code, 400)
+                        error = json.load(response)["error"]
+                    self.assertEqual((error["param"], error["code"]),
+                                     ("stream_options.include_usage", "invalid_value"))
+                    self.assertEqual(len(self.engine.calls), calls_before)
+
     def _request_with_raw_metadata(self, path, fields, metadata):
         # Build the wire bytes directly: constructing a Python integer first
         # would trip the caller's digit guard before the HTTP request existed.
