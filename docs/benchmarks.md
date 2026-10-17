@@ -211,7 +211,7 @@ one five-run sweep put cap 64 ahead on median (14.96 vs 14.32), a later ten-run
 block put cap 32 ahead by 35% (18.21 vs 13.45), and cap 32 alone ranged from 13.97
 to 20.62 tok/s across sessions. Absolute throughput drifts far more between
 sessions than the effect being measured, so only same-session alternation resolves
-it — the discipline [the decode failure ledger](glm52-decode-failure-ledger-2026-07-31.md)
+it — the discipline [the decode failure ledger](experiments/glm52-decode-failure-ledger-2026-07-31.md)
 already asks for after the WarpDecode episode. Quoting this machine's cap curve
 from a single ordered sweep produces whatever the machine felt like that hour.
 
