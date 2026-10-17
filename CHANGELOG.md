@@ -12,6 +12,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   give pre-AVX2 x86-64 CPUs (SSSE3, no AVX2/FMA) an accelerated path where
   they previously fell through to the scalar reference. Exact int32 sums,
   so every ISA path stays bit-identical to the scalar reference.
+- `residency_sim.py --engine olmoe`: the offline residency simulator replays
+  OLMoE `ROUTE_TRACE` files with OLMoE's own cache traversal (one expert per
+  fetch, immediate admission into the per-layer LRU, 128-row prompt blocks in
+  ascending expert id), so expert-placement policies can be compared on a model
+  that runs on a CPU-only machine.
 
 ## [2.0.0] - 2026-10-06
 

@@ -7,7 +7,8 @@ rejected before changing inference code or renting hardware.
 
 ## Scope
 
-`c/tools/residency_sim.py` currently models the main GLM CPU-routing path:
+`c/tools/residency_sim.py` models the main GLM CPU-routing path by default,
+and OLMoE's with `--engine olmoe` (below). For GLM it models:
 
 - first-seen expert unions for each contiguous `(call, layer)` batch;
 - promotion between GLM's 64-expert working-set blocks;
@@ -41,10 +42,24 @@ and wrote a zero-byte file for as long as the stream existed, because
 consumer saw "no data" rather than an error. `moe()` calls `rt_route()` per
 position and `rt_trace_end()` once per invocation, so the stream has one line
 per `(moe call, position, layer)` with `call` advancing once per layer per
-forward (16 calls per forward on OLMoE, rows `0..S-1` within each). It still
-needs an engine profile before this simulator accepts it, because its cache
-traversal is per-layer LRU with a `--cap` slot budget and its gates are raw
-softmax weights rather than a renormalised top-k (`norm_topk_prob=false`).
+forward (16 calls per forward on OLMoE, rows `0..S-1` within each). Pass
+`--engine olmoe` to replay it with OLMoE's own cache traversal instead of GLM's:
+
+- `olmoe.c`'s `expert_get()` fetches one expert at a time and admits a miss
+  immediately into the layer's LRU (`--cap` slots), with no 64-expert promotion
+  block and no batch admission;
+- a one-row call (decode) fetches its top-k in rank order;
+- a prompt is routed in blocks of 128 rows (`OLMOE_PREFILL_ROWS`), and each block
+  fetches every expert it routed once, in ascending expert id (the counting sort
+  in `moe_by_expert`). The block's other rows on that expert are served by the
+  same slot; they count toward training frequencies, not toward demand I/O.
+
+The profile turns every fetch into a one-expert event, so `--max-training-events`
+counts fetches for this engine, not call groups. It models the CPU path only: the
+Vulkan expert tier, the PILOT prefetcher and `HOT=`/`hot_pinned.bin` startup pins
+are out of scope. Record traces without pins: once `hot_pinned` is set the engine
+stops calling `rt_route()`, so a pinned run writes no records. Raw softmax gates
+(`norm_topk_prob=false`) do not matter here, since residency uses only expert ids.
 
 ## Trace contract
 
