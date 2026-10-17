@@ -1312,6 +1312,22 @@ def decode_wav_mono16k(data, param):
             if len(body) < 16:
                 raise APIError(400, "WAV fmt chunk is too short.", param, "invalid_value")
             fmt = _struct.unpack_from("<HHIIHH", body, 0)
+            if fmt[0] == 0xFFFE:      # WAVE_FORMAT_EXTENSIBLE identifies encoding by GUID.
+                if len(body) < 40:
+                    raise APIError(400, "WAV extensible fmt chunk is too short.", param, "invalid_value")
+                extension_size = _struct.unpack_from("<H", body, 16)[0]
+                if extension_size < 22 or 18 + extension_size > len(body):
+                    raise APIError(400, "WAV extensible fmt has an invalid extension size.",
+                                   param, "invalid_value")
+                guid = body[24:40]
+                guid_tail = bytes.fromhex("00001000800000aa00389b71")
+                if guid == b"\x01\0\0\0" + guid_tail:
+                    fmt = (1,) + fmt[1:]
+                elif guid == b"\x03\0\0\0" + guid_tail:
+                    fmt = (3,) + fmt[1:]
+                else:
+                    raise APIError(400, "Unsupported WAV extensible subformat; use PCM16 or float32.",
+                                   param, "invalid_value")
         elif cid == b"data":
             raw = body
         pos += 8 + size + (size & 1)
@@ -1320,8 +1336,6 @@ def decode_wav_mono16k(data, param):
     audio_format, channels, rate, _, _, bits = fmt
     if channels == 0:
         raise APIError(400, "WAV channel count must be positive.", param, "invalid_value")
-    if audio_format == 0xFFFE:      # WAVE_FORMAT_EXTENSIBLE: trust the bit width
-        audio_format = 3 if bits == 32 else 1
     if rate != AUDIO_SAMPLE_RATE:
         raise APIError(400, f"Audio must be {AUDIO_SAMPLE_RATE} Hz (got {rate}). "
                             "Resample at the capture edge.", param, "invalid_value")
