@@ -48,6 +48,20 @@ def _run(record, name):
     return config
 
 
+def _same_config_value(left, right):
+    # JSON booleans are not numbers, even though Python's True == 1. Compare
+    # containers recursively so nested flags cannot hide another changed variable.
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _same_config_value(left[key], right[key]) for key in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _same_config_value(a, b) for a, b in zip(left, right))
+    return left == right
+
+
 def validate(record):
     """Return a normalized summary or raise ValueError with an exact field."""
     _object(record, "manifest")
@@ -70,7 +84,8 @@ def validate(record):
     baseline = _run(record, "baseline")
     trial = _run(record, "trial")
     keys = sorted(set(baseline) | set(trial))
-    actual = [key for key in keys if baseline.get(key) != trial.get(key)]
+    actual = [key for key in keys if key not in baseline or key not in trial or
+              not _same_config_value(baseline[key], trial[key])]
     declared = record.get("changed_variables")
     if not isinstance(declared, list) or len(declared) != 1 or not isinstance(declared[0], str):
         raise ValueError("changed_variables must name exactly one variable")

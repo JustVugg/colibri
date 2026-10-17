@@ -45,6 +45,26 @@ class ExperimentManifestTest(unittest.TestCase):
         result = validate(manifest())
         self.assertEqual(result["variable"], "PIPE_WORKERS")
 
+    def test_config_diff_distinguishes_missing_null_and_booleans(self):
+        cases = (
+            ({}, {'EXTRA': None}),
+            ({'EXTRA': True}, {'EXTRA': 1}),
+            ({'EXTRA': {'flags': [True]}}, {'EXTRA': {'flags': [1]}}),
+        )
+        for baseline, trial in cases:
+            with self.subTest(baseline=baseline, trial=trial):
+                record = manifest()
+                record['baseline']['config'].update(baseline)
+                record['trial']['config'].update(trial)
+                with self.assertRaisesRegex(ValueError, 'config diff'):
+                    validate(record)
+
+    def test_identical_nested_config_and_numeric_values_are_unchanged(self):
+        record = manifest()
+        record['baseline']['config']['EXTRA'] = {'flags': [True, None], 'scale': 1}
+        record['trial']['config']['EXTRA'] = {'scale': 1.0, 'flags': [True, None]}
+        self.assertEqual(validate(record)['variable'], 'PIPE_WORKERS')
+
     def test_rejects_hidden_second_variable(self):
         record = manifest()
         record["trial"]["config"]["DIRECT"] = "0"
