@@ -120,6 +120,29 @@ class PngTest(unittest.TestCase):
             self.assertEqual(row, pixels[y * stride:(y + 1) * stride])
             previous = row
 
+    def test_png_decompression_stops_at_declared_image_size(self):
+        import tracemalloc
+        # Independently constructed 1x1 RGB image whose deflate stream has
+        # far more than its four declared scanline bytes.
+        png = (b"\x89PNG\r\n\x1a\n" +
+               _chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)) +
+               _chunk(b"IDAT", zlib.compress(bytes(1 << 20))) + _chunk(b"IEND", b""))
+        tracemalloc.start()
+        try:
+            with self.assertRaisesRegex(ValueError, "length"):
+                ie.decode_png(png)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 256 << 10, "decoder inflated the oversized payload before rejecting it")
+
+    def test_invalid_png_deflate_is_a_value_error(self):
+        png = (b"\x89PNG\r\n\x1a\n" +
+               _chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)) +
+               _chunk(b"IDAT", b"not a deflate stream") + _chunk(b"IEND", b""))
+        with self.assertRaises(ValueError):
+            ie.decode_png(png)
+
     def test_corruption_and_unsupported_formats_are_refused(self):
         png = bytearray(ie.encode_png(4, 4, bytes(64), 4))
         png[-20] ^= 0xff

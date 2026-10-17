@@ -642,8 +642,13 @@ def decode_png(data):
                          f"interlace {interlace}); 8-bit grey/RGB/RGBA only")
     channels = _CHANNELS[color]
     stride = width * channels
-    raw = zlib.decompress(b"".join(idat))
-    if len(raw) != (stride + 1) * height:
+    expected = (stride + 1) * height
+    decompressor = zlib.decompressobj()
+    try:
+        raw = decompressor.decompress(b"".join(idat), expected + 1)
+    except zlib.error as error:
+        raise ValueError(f"invalid PNG image data: {error}") from error
+    if len(raw) != expected or not decompressor.eof:
         raise ValueError("PNG image data has the wrong length")
     _sub, add = _swar(stride)
     out = bytearray(stride * height)
