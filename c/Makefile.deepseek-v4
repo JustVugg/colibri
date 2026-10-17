@@ -319,11 +319,12 @@ backend_vulkan_v4.o: backend_vulkan.c backend_vulkan.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
 vk_tier_v4.o: vk_tier.c vk_tier.h backend_vulkan.h tier.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -c vk_tier.c -o $@
-vk_chain_v4.o: vk_chain.c vk_chain.h vk_alloc.h backend_vulkan.h $(V4_FLAGS_STAMP)
+vk_chain_v4.o: vk_chain.c vk_chain.h vk_alloc.h shaders/chain_qsa.h backend_vulkan.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -c vk_chain.c -o $@
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+shaders/chain_qsa.spv: shaders/chain_qsa.h
 # As in the parent: an older glslc keeps the committed cooperative-matrix .spv.
 shaders/qmatmul_coop.spv: shaders/qmatmul_coop.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }

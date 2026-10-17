@@ -15,6 +15,7 @@
 #include "vk_chain.h"
 #include "vk_alloc.h"
 #include "vk_load.h"
+#include "shaders/chain_qsa.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1119,6 +1120,7 @@ int vkc_ew(VkcBuf *y, VkcBuf *a, VkcBuf *b, VkcBuf *c, VkcBuf *e, const VkcEw *p
     uint32_t gx, gy; grid(((uint64_t)p->n + 255) / 256, &gx, &gy);
     return record(KC.pipe[P_EW], bd, 5, p, sizeof *p, gx, gy, 1);
 }
+enum { QSA_SCORES = 1, QSA_SELECT };   /* the modes of chain_qsa.comp that VkcQsa mode 1 runs in turn */
 int vkc_qsa(VkcBuf *src, VkcBuf *w, VkcBuf *pk, VkcBuf *cs, VkcBuf *sc, VkcBuf *sel, const VkcQsa *p) {
     KC.kind = PK_QSA;
     if (p->ID > 256) return 0;
@@ -1126,8 +1128,15 @@ int vkc_qsa(VkcBuf *src, VkcBuf *w, VkcBuf *pk, VkcBuf *cs, VkcBuf *sc, VkcBuf *
         VkcBind bd[4] = {B(src, 0), B(w, 0), B(pk, 1), B(cs, 0)};
         return record(KC.pipe[P_QSA], bd, 4, p, sizeof *p, (uint32_t)p->nb, 1, 1);
     }
-    VkcBind bd[6] = {B(src, 0), {VK_NULL_HANDLE, 0, 0, 0}, B(pk, 0), {VK_NULL_HANDLE, 0, 0, 0}, B(sc, 1), B(sel, 1)};
-    return record(KC.pipe[P_QSA], bd, 6, p, sizeof *p, (uint32_t)p->S, 1, 1);
+    VkcBind none = {VK_NULL_HANDLE, 0, 0, 0};
+    VkcBind scores[6] = {B(src, 0), none, B(pk, 0), none, B(sc, 1), none};
+    VkcBind select[6] = {none, none, none, none, B(sc, 0), B(sel, 1)};
+    int blocks = (p->pos_base + p->S) / p->R;   /* complete blocks in the last row */
+    VkcQsa pass = *p;
+    pass.mode = QSA_SCORES;
+    if (!record(KC.pipe[P_QSA], scores, 6, &pass, sizeof pass, (uint32_t)p->S, (uint32_t)((blocks + QSA_WG - 1) / QSA_WG), 1)) return 0;
+    pass.mode = QSA_SELECT;
+    return record(KC.pipe[P_QSA], select, 6, &pass, sizeof pass, (uint32_t)p->S, 1, 1);
 }
 int vkc_ple(VkcBuf *keys, VkcBuf *hyp, VkcBuf *val, VkcBuf *prm, VkcBuf *gated, VkcBuf *normv,
             VkcBuf *conv, VkcBuf *ring, const VkcPle *p) {

@@ -134,7 +134,7 @@ static int q38c_bufs(Q38Chain *ch, Model *m, int rows) {
              q38c_res(&ch->mix, r * W, VKC_DEV) && q38c_res(&ch->mixed, r * H, VKC_DEV) && q38c_res(&ch->inj_a, r * C, VKC_DEV) &&
              q38c_res(&ch->inj_m, r * C, VKC_DEV) && q38c_res(&ch->blk, r * H, VKC_DEV) && q38c_res(&ch->q, r * QH * 2 * D, VKC_DEV) &&
              q38c_res(&ch->k, r * kvo, VKC_DEV) && q38c_res(&ch->v, r * kvo, VKC_DEV) && q38c_res(&ch->ip, r * ipw, VKC_DEV) &&
-             q38c_res(&ch->ctx, r * QH * D, VKC_DEV) && q38c_res(&ch->qsc, r * 2 * (size_t)nbmax, VKC_DEV) &&
+             q38c_res(&ch->ctx, r * QH * D, VKC_DEV) && q38c_res(&ch->qsc, r * (size_t)nbmax, VKC_DEV) &&
              q38c_res(&ch->sel, r * q38c_selrow(c), VKC_DEV) && q38c_res(&ch->qkv, r * c->dn_conv_dim, VKC_DEV) &&
              q38c_res(&ch->z, r * V, VKC_DEV) && q38c_res(&ch->ab, r * 2 * c->dn_vheads, VKC_DEV) &&
              q38c_res(&ch->cv, r * c->dn_conv_dim, VKC_DEV) && q38c_res(&ch->dny, r * V, VKC_DEV) &&
@@ -895,7 +895,7 @@ static int q38c_attention(Q38Chain *ch, Model *m, Layer *l, int i, int n, int pb
         ok = vkc_qsa(ch->ik[i], ch->prm, ch->pk[i], ch->pcs, NULL, NULL, &pp);
         ch->pk_valid[i] = nb;
     }
-    int nbmax = (int)(vkc_bytes(ch->qsc) / 4 / (2 * (size_t)ch->rows));
+    int nbmax = (int)(vkc_bytes(ch->qsc) / 4 / (size_t)ch->rows);
     VkcQsa ps = {1, ID, R, 0, 0, n, pb, c->idx_budget, IQ, 0, ipw, nbmax, q38c_selrow(c), c->eps, 0, 0, 0, 0};
     if (ch->ks.on) {   /* the split: the selection's listed positions in two parts */
         VkcKvGqa a = {&ch->ks, ch->attn_ord[i], ch->q, ch->kc[i], ch->vc[i], ch->q, ch->sel, NULL, ch->ctx, n, QH, KVH, D, D, pb,

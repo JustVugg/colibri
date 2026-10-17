@@ -17,7 +17,8 @@
  *   dnconv   both orders of the sum, the ring carried across calls, the snapshot row
  *   dnrec    KD 8 and 128, silu and sigmoid gates, the state carried, the snapshot
  *   ew       every element-wise op (SCALE: MiMo's value scale)
- *   qsa      block keys, and the selection with ties broken as the CPU sorts
+ *   qsa      block keys, and the selection with ties broken as the CPU sorts, over 12,000
+ *            blocks too, with equal scores across the cut and rows that take every block
  *   ple      the gate and the dilated convolution with its ring and snapshot
  *   frames   vkc_write, vkc_read, a frame left in flight and one ordered after it
  *   mla      the per-head weight blocks in every format, both ways, with a gate; RoPE
@@ -681,6 +682,98 @@ static void test_inkling(void) {
 }
 
 /* ---- QSA: block keys and selection ----------------------------------------------------- */
+typedef struct { int ID, R, budget, IQ; } QsaShape;
+static const QsaShape QSA_MODEL = {.ID = 128, .R = 4, .budget = 2048, .IQ = 4};   /* the index used by Qwen3.8: 512 blocks taken */
+/* the length of a row of sel (q38c_selrow): the count, the positions of the blocks taken, the tail */
+static int qsa_sel_row(const QsaShape *m) { return 1 + m->budget + m->R - 1; }
+
+typedef struct { float score; int block; } QsaRank;
+/* must equal q38_block_desc in qwen38_core.h: higher score first, then the lower block */
+static int qsa_rank_cmp(const void *aa, const void *bb) {
+    const QsaRank *a = aa, *b = bb;
+    if (a->score > b->score) return -1;
+    if (a->score < b->score) return 1;
+    return a->block - b->block;
+}
+/* The row of sel for the query row q at position pos. Fills ref with the positions of the blocks that rank first, in
+ * block order, then the tail, and returns how many. Returns -1 where every block is taken. cut_ties is 1 where blocks
+ * equal to the score of the last block taken lie on both sides of the cut. */
+static int qsa_expected_row(const QsaShape *m, const float *q, const float *pk, int pos, int *ref, int *cut_ties) {
+    int visible = pos + 1, blocks = visible / m->R, take = blocks < m->budget / m->R ? blocks : m->budget / m->R;
+    *cut_ties = 0;
+    if (take >= blocks) return -1;
+    QsaRank *rank = malloc((size_t)blocks * sizeof *rank);
+    char *taken = calloc((size_t)blocks, 1);
+    for (int b = 0; b < blocks; b++) {
+        float score = 0;
+        for (int h = 0; h < m->IQ; h++) {
+            float a = 0;
+            for (int d = 0; d < m->ID; d++) a += q[(size_t)h * m->ID + d] * pk[(size_t)b * m->ID + d];
+            if (a > 0) score += a;
+        }
+        rank[b] = (QsaRank){score / sqrtf((float)m->ID), b};
+    }
+    qsort(rank, (size_t)blocks, sizeof *rank, qsa_rank_cmp);
+    int tied = 0, tied_taken = 0;
+    for (int z = 0; z < blocks; z++) {
+        taken[rank[z].block] = z < take;
+        if (rank[z].score == rank[take - 1].score) { tied++; tied_taken += z < take; }
+    }
+    *cut_ties = tied_taken < tied;
+    int n = 0;
+    for (int b = 0; b < blocks; b++) if (taken[b]) for (int r = 0; r < m->R; r++) ref[n++] = b * m->R + r;
+    for (int t = blocks * m->R; t < visible; t++) ref[n++] = t;
+    free(rank); free(taken);
+    return n;
+}
+/* S query rows from pos_base, selected on the device over nbmax block keys in one call. The S rows of sel are written. */
+static int qsa_run_selection(const QsaShape *m, const float *q, const float *pk, int nbmax, int S, int pos_base, int *sel) {
+    int sel_row = qsa_sel_row(m);
+    VkcBuf *pb = up(pk, (size_t)nbmax * m->ID), *qb = up(q, (size_t)S * m->IQ * m->ID);
+    VkcBuf *sb = vkc_buf((size_t)S * nbmax * 4, VKC_DEV), *lb = vkc_buf((size_t)S * sel_row * 4, VKC_DEV);
+    VkcQsa p = {.mode = 1, .ID = m->ID, .R = m->R, .S = S, .pos_base = pos_base, .budget = m->budget,
+                .IQ = m->IQ, .q_row = m->IQ * m->ID, .nbmax = nbmax, .sel_row = sel_row};
+    vkc_begin(); int ok = vkc_qsa(qb, NULL, pb, NULL, sb, lb, &p); vkc_submit(1);
+    ok &= vkc_read(lb, 0, sel, (size_t)S * sel_row * 4);
+    vkc_free(pb); vkc_free(qb); vkc_free(sb); vkc_free(lb);
+    return ok;
+}
+/* sel against qsa_expected_row for every row; returns how many rows have cut ties */
+static int qsa_check_selection(const char *what, const QsaShape *m, const float *q, const float *pk, const int *sel,
+                               int S, int pos_base, int ok) {
+    int sel_row = qsa_sel_row(m), rows_with_cut_ties = 0;
+    int *ref = malloc((size_t)sel_row * sizeof *ref);
+    for (int s = 0; s < S; s++) {
+        const int *got = sel + (size_t)s * sel_row;
+        int cut_ties, n = qsa_expected_row(m, q + (size_t)s * m->IQ * m->ID, pk, pos_base + s, ref, &cut_ties);
+        int same = got[0] == n;
+        for (int j = 0; same && j < n; j++) same = got[1 + j] == ref[j];
+        CHECK(ok && same, "qsa %s row %d: count %d vs %d, or a position differs", what, s, got[0], n);
+        rows_with_cut_ties += cut_ties;
+    }
+    free(ref);
+    return rows_with_cut_ties;
+}
+/* key_count: block b has the key of block b - key_count, so scores repeat every key_count blocks (0: every block has a
+ * different key). min_rows_with_cut_ties: how many rows must have cut ties for the case to test the ties. */
+typedef struct { const char *what; int rows, pos_base, key_count, min_rows_with_cut_ties; } QsaCase;
+/* Random block keys and queries as small whole numbers, so every dot product is exact and two blocks tie exactly
+ * where their sums do. */
+static void test_qsa_select(const QsaShape *m, const QsaCase *c) {
+    int nbmax = (c->pos_base + c->rows) / m->R + 1, key_count = c->key_count ? c->key_count : nbmax;
+    size_t key_floats = (size_t)key_count * m->ID;
+    float *pk = malloc((size_t)nbmax * m->ID * sizeof *pk), *q = malloc((size_t)c->rows * m->IQ * m->ID * sizeof *q);
+    for (size_t i = 0; i < (size_t)nbmax * m->ID; i++) pk[i] = i < key_floats ? (float)((int)(rnd() % 9) - 4) : pk[i - key_floats];
+    for (size_t i = 0; i < (size_t)c->rows * m->IQ * m->ID; i++) q[i] = (float)((int)(rnd() % 9) - 4);
+    int *sel = malloc((size_t)c->rows * qsa_sel_row(m) * sizeof *sel);
+    int ok = qsa_run_selection(m, q, pk, nbmax, c->rows, c->pos_base, sel);
+    int rows_with_cut_ties = qsa_check_selection(c->what, m, q, pk, sel, c->rows, c->pos_base, ok);
+    CHECK(rows_with_cut_ties >= c->min_rows_with_cut_ties,
+          "qsa %s: %d rows have blocks equal to the last taken score on both sides of the cut, at least %d expected",
+          c->what, rows_with_cut_ties, c->min_rows_with_cut_ties);
+    printf("  qsa selection, %s: %d rows, %d with equal scores across the cut\n", c->what, c->rows, rows_with_cut_ties);
+    free(pk); free(q); free(sel);
+}
 static void test_qsa(void) {
     int ID = 12, R = 2, half = 3, cap = 40, nbmax = cap / R, IQ = 2, budget = 6;   /* take = 3 blocks */
     float *ik = fvec((size_t)cap * ID, 1.f), *w = fvec(ID, 0.3f), *pk = calloc((size_t)nbmax * ID, sizeof *pk);
@@ -714,33 +807,22 @@ static void test_qsa(void) {
     CHECK(ok && e < 1e-5, "qsa block keys: err %.2e", e);
     /* selection: 4 query rows at positions 20..23; give two blocks the same key to test ties */
     memcpy(pk + 5 * ID, pk + 2 * ID, ID * sizeof(float));
-    vkc_begin(); vkc_write(pb, 0, pk, (size_t)nbmax * ID * 4); vkc_submit(1);
-    int S = 4, pos_base = 20, selrow = 1 + budget + R - 1;
+    int S = 4, pos_base = 20;
+    QsaShape small = {.ID = ID, .R = R, .budget = budget, .IQ = IQ};
     float *qi = fvec((size_t)S * IQ * ID, 1.f);
-    VkcBuf *qb = up(qi, (size_t)S * IQ * ID), *sb = vkc_buf((size_t)S * 2 * nbmax * 4, VKC_DEV), *lb = vkc_buf((size_t)S * selrow * 4, VKC_DEV);
-    VkcQsa ps = {1, ID, R, 0, 0, S, pos_base, budget, IQ, 0, IQ * ID, nbmax, selrow, 1e-6f, 0, 0, 0, 0};
-    vkc_begin(); ok = vkc_qsa(qb, NULL, pb, NULL, sb, lb, &ps); vkc_submit(1);
-    int *sel = malloc((size_t)S * selrow * sizeof *sel);
-    ok &= vkc_read(lb, 0, sel, (size_t)S * selrow * 4);
-    for (int s = 0; s < S; s++) {
-        int vis = pos_base + s + 1, blocks = vis / R, take = blocks < budget / R ? blocks : budget / R;
-        float score[64]; int sel_ref[64], n = 0, chosen[64] = {0};
-        for (int b = 0; b < blocks; b++) {
-            float sc = 0; for (int h = 0; h < IQ; h++) { float a = 0; for (int d = 0; d < ID; d++) a += qi[(s * IQ + h) * ID + d] * pk[b * ID + d]; if (a > 0) sc += a; }
-            score[b] = sc / sqrtf((float)ID);
-        }
-        for (int z = 0; z < take; z++) {   /* the CPU's sort: score desc, block asc */
-            int best = -1; for (int b = 0; b < blocks; b++) if (!chosen[b] && (best < 0 || score[b] > score[best])) best = b;
-            chosen[best] = 1;
-        }
-        for (int b = 0; b < blocks; b++) if (chosen[b]) for (int r = 0; r < R; r++) sel_ref[n++] = b * R + r;
-        for (int t = blocks * R; t < vis; t++) sel_ref[n++] = t;
-        int same = sel[s * selrow] == n;
-        for (int j = 0; same && j < n; j++) same = sel[s * selrow + 1 + j] == sel_ref[j];
-        CHECK(ok && same, "qsa selection row %d: count %d vs %d", s, sel[s * selrow], n);
-    }
-    vkc_free(ib); vkc_free(wb); vkc_free(pb); vkc_free(cb); vkc_free(cb2); vkc_free(qb); vkc_free(sb); vkc_free(lb);
+    int *sel = malloc((size_t)S * qsa_sel_row(&small) * sizeof *sel);
+    ok = qsa_run_selection(&small, qi, pk, nbmax, S, pos_base, sel);
+    qsa_check_selection("13 blocks", &small, qi, pk, sel, S, pos_base, ok);
+    vkc_free(ib); vkc_free(wb); vkc_free(pb); vkc_free(cb); vkc_free(cb2);
     free(ik); free(w); free(pk); free(cs); free(pd); free(qi); free(sel);
+    static const QsaCase cases[] = {
+        {.what = "12,000 blocks", .rows = 8, .pos_base = 47997},   /* tails of 2, 3, 0 and 1 positions */
+        {.what = "12,000 blocks, 97 keys repeated", .rows = 8, .pos_base = 47997, .key_count = 97, .min_rows_with_cut_ties = 1},
+        {.what = "5,000 equal blocks", .rows = 3, .pos_base = 19999, .key_count = 1, .min_rows_with_cut_ties = 3},
+        {.what = "blocks around the budget", .rows = 40, .pos_base = 2030},   /* 507 to 517 blocks: from 5 below the budget of 512 blocks to 5 above it */
+        {.what = "first blocks", .rows = 8, .pos_base = 0},   /* 0 to 2 blocks: every block taken */
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) test_qsa_select(&QSA_MODEL, &cases[i]);
 }
 
 /* ---- PLE ---------------------------------------------------------------------------- */

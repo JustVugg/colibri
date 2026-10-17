@@ -921,6 +921,7 @@ shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv: shaders/blockdec.glsl sha
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+shaders/chain_qsa.spv: shaders/chain_qsa.h
 # chain_attn_flash.comp needs the same glslc as qmatmul_coop.comp below, with the same
 # fallback; without its .spv the chain keeps chain_attn.comp.
 shaders/chain_attn_flash.spv: shaders/chain_attn_flash.comp
@@ -3200,7 +3201,7 @@ AUTODEP_OWN_FLAGS = bench_cuda_resident_batch bench_load_tq_peak_rss \
 	bench_indexer_allocations
 ENGINE_RULES := $(foreach n,$(RULE_NAMES),$(if $(findstring /,$(n)),,$(if $(wildcard $(n).c),$(n))))
 AUTODEP_TESTS := $(patsubst tests/%,%,$(filter tests/%,$(RULE_NAMES)))
-AUTODEP_OBJS      = backend_vulkan.o vk_tier.o backend_loader.o backend_xdna.o qwen36_tier.o \
+AUTODEP_OBJS      = backend_vulkan.o vk_tier.o vk_chain.o backend_loader.o backend_xdna.o qwen36_tier.o \
 	tests/backend_xdna_lane.o tests/edge_runtime.o tests/edge_runtime_nocuda.o \
 	tests/segment_runtime.o tests/segment_runtime_nocuda.o \
 	tests/segment_conformance_fixtures.o tests/deepseek_v4_native_quant.o \
