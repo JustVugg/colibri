@@ -2942,7 +2942,11 @@ class WindowsCommitLimitTest(unittest.TestCase):
 
     def test_physical_is_used_when_commit_is_larger_or_unknown(self):
         self.assertEqual(windows_available_bytes(110 << 30, 200 << 30), 110 << 30)
-        self.assertEqual(windows_available_bytes(110 << 30, 0), 110 << 30)
+        self.assertEqual(windows_available_bytes(110 << 30, None), 110 << 30)
+
+    def test_zero_commit_headroom_is_not_an_unknown_measurement(self):
+        self.assertEqual(windows_available_bytes(110 << 30, 0), 0)
+        self.assertEqual(windows_available_bytes(0, 40 << 30), 0)
 
     def test_memorystatusex_layout_is_the_documented_one(self):
         # Order matters for ctypes: a skipped field shifts every later one.

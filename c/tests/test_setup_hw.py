@@ -137,6 +137,11 @@ class MemoryParsing(unittest.TestCase):
         mem = setup_hw.memory_from_windows_status(32 * 2**30, 20 * 2**30, 40 * 2**30)
         self.assertEqual(mem["available"], 20 * 2**30)
 
+    def test_windows_status_preserves_zero_measured_headroom(self):
+        self.assertEqual(setup_hw.memory_from_windows_status(32 << 30, 20 << 30, 0)["available"], 0)
+        self.assertEqual(setup_hw.memory_from_windows_status(32 << 30, 0, 20 << 30)["available"], 0)
+        self.assertEqual(setup_hw.memory_from_windows_status(32 << 30, 20 << 30)["available"], 20 << 30)
+
     def test_darwin(self):
         vm_stat = ("Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
                    "Pages free:                               10000.\n"
