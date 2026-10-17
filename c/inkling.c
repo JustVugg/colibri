@@ -1662,6 +1662,14 @@ static Slot *slot_find(Model *m, int layer, int eid) {
     return s;
 }
 
+/* A round holds every acquired slot until compute completes. Pinned slots
+ * cannot be eviction victims, so they must not count toward that round's room.
+ * npin is pins_load's upper bound; sparse history may pin fewer per layer. */
+static int slot_round_cap(const Model *m, int layer) {
+    int room = m->cache[layer].cap - m->npin;
+    return room > 0 ? room : 1;
+}
+
 /* allocate a slot (or evict the LRU non-pinned one); serial callers only */
 static Slot *slot_acquire(Model *m, int layer, int eid) {
     LCache *lc = &m->cache[layer]; Cfg *c = &m->c;
@@ -2298,8 +2306,10 @@ static void ink_vk_unhold(void *ctx, void *h) { (void)ctx; ink_vk_drop_rows((Slo
 static void ink_vk_tier_report(const Model *m, const char *scope) {
     vkt_report(scope, m->hits, m->miss);   /* nothing when the tier never started */
 }
+#endif
+#if defined(COLI_VULKAN) || defined(COLI_CACHE_INDEX_TEST)
 /* The CPU's pairs of a block (want[i] set) into ctb[i]: moe()'s rounds of at most
- * `cap` pairs -- acquire, fill in parallel, check, compute -- with its kernels. The
+ * `cap - npin` pairs -- acquire, fill in parallel, check, compute -- with its kernels. The
  * pairs' history and HITS were counted by the caller. */
 static void ink_vk_cpu_pairs(Model *m, int layer, const float *x, int n, const int *ib,
                              const uint8_t *want, float *ctb, float *g) {
@@ -2307,13 +2317,14 @@ static void ink_vk_cpu_pairs(Model *m, int layer, const float *x, int n, const i
     int D = c->hidden, K = c->topk, I = c->moe_inter;
     float *u = g + I;
     int cap = m->cache[layer].cap; if (cap < 1) cap = 1;
+    int round_cap = slot_round_cap(m, layer);
     int q4 = m->xq && m->rb13*2 == D;
     Slot **use = malloc((size_t)cap * sizeof(Slot *)), **fill = malloc((size_t)cap * sizeof(Slot *));
     int *pi = malloc((size_t)cap * sizeof(int));
     if (!use || !fill || !pi) { fprintf(stderr, "OOM ink_vk_cpu_pairs\n"); exit(1); }
     for (int i = 0; i < n; ) {
         int nr = 0, nfill = 0;
-        for (; i < n && nr < cap; i++) {
+        for (; i < n && nr < round_cap; i++) {
             if (!want[i] || ib[i] < 0) continue;
             Slot *e = slot_find(m, layer, ib[i]);
             if (e) m->hits++;
@@ -2357,14 +2368,18 @@ static void ink_vk_cpu_pairs(Model *m, int layer, const float *x, int n, const i
                 for (int k = 0; k < I; k++) g[k] = siluf(g[k]) * u[k];
                 matmul(hh, g, e->f2, 1, I, D);
             }
+#ifdef COLI_VULKAN
             if (ink_gx_ilv(m, layer) && !vkt_wants(layer, e->eid)) continue;   /* converted only for the tier to take */
             VktExpertSrc vs = ink_vk_slot_src(m, layer, e);
             vkt_note(layer, e->eid, &vs);
             ink_vk_drop_rows(e);
+#endif
         }
     }
     free(use); free(fill); free(pi);
 }
+#endif
+#ifdef COLI_VULKAN
 /* moe() with the tier on, after its routing pass: idx/keff/wgt as moe() made them;
  * routed_only leaves the shared experts out (the dense chain runs them). */
 static void ink_vk_moe(Model *m, Layer *l, int layer, const float *x, int S, float *out,
@@ -2500,12 +2515,13 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
      * tutte le S*K coppie in una volta pretendeva quindi una cache capace di tenere
      * tutti gli esperti distinti del batch (18 token x topk 6 = fino a 108 slot per
      * layer), e sotto quella soglia il modello sembrava rotto.
-     * Fix: si lavora a GIRI di al piu' `cap` coppie — acquisisci, riempi, calcola e
+     * Fix: si lavora a GIRI di al piu' `cap - npin` coppie — acquisisci, riempi, calcola e
      * accumula — cosi' nessuno slot puo' essere evinto mentre serve. L'output MoE e'
      * una somma pesata, quindi accumulare a giri da' lo stesso risultato di una
      * passata sola, e la cache puo' scendere fino a 1 slot per layer (piu' letture
      * da disco, ma memoria proporzionale a `cap` invece che al batch). */
     int cap = m->cache[layer].cap; if (cap < 1) cap = 1;
+    int round_cap = slot_round_cap(m, layer);
     float *g = falloc(2*I), *u = g + I, *hh = falloc(D);
     int q4 = m->xq && m->rb13*2 == D;   /* packed int4 vs int8 container */
     int shared_done = 0;                /* set when overlapped with the last GPU round */
@@ -2564,8 +2580,8 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
         m->t_shared += now_s() - ts;
     }
 #endif
-    for (int64_t base = 0; base < npair; base += cap) {
-        int64_t end = base + cap < npair ? base + cap : npair;
+    for (int64_t base = 0; base < npair; base += round_cap) {
+        int64_t end = base + round_cap < npair ? base + round_cap : npair;
         nfill = 0;
         for (int64_t t = base; t < end; t++) {           /* acquisizione del giro */
             int s = (int)(t / K), kk = (int)(t % K);
@@ -2639,7 +2655,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
                  * GPU only touches out in _end's scatter-add, after the wait).
                  * On a GPU fault _end returns 0 and the CPU loop below redoes
                  * the round; shared_done stays set either way. */
-                if (base + cap >= npair && !sh_h) {
+                if (base + round_cap >= npair && !sh_h) {
                     ColiMetalMoeHandle *h = coli_metal_moe_block_begin(
                         nb, D, I, q4 ? 2 : 1, 0, mgp, mup, mdp, mgs, mus, mds,
                         mxg, mxoff, mnr, mrows, mrw);
