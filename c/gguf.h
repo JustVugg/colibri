@@ -282,10 +282,18 @@ static int gguf_is_file(const char *path) {
  * (NAME-00001-of-000NN.gguf), in which case every part is opened. */
 static int gguf_open(gguf_ctx *g, const char *path) {
     memset(g, 0, sizeof *g);
-    const char *of = strstr(path, "-of-");
+    const char *filename = strrchr(path, '/');
+    filename = filename ? filename + 1 : path;
+#ifdef _WIN32
+    const char *backslash = strrchr(filename, '\\');
+    if (backslash) filename = backslash + 1;
+#endif
+    size_t flen = strlen(filename);
+    const char *of = flen >= 20 ? filename + flen - 14 : NULL;
     int parts = 1;
     size_t plen = strlen(path);
-    if (of && of - path >= 6 && plen >= 5 && !strcmp(path + plen - 5, ".gguf")) {
+    if (of && !strncmp(of, "-of-", 4) && of - filename >= 6 &&
+        plen >= 5 && !strcmp(path + plen - 5, ".gguf")) {
         const char *num = of - 5;
         int a = atoi(num), b = atoi(of + 4);
         if (num[-1] == '-' && a == 1 && b >= 1 && b <= 9999) parts = b;
