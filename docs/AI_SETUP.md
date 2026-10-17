@@ -170,7 +170,11 @@ With `--backend auto` (the default):
 2. **Vulkan**, when a Vulkan GPU answered and the Vulkan headers and `glslc`
    are installed. On an integrated GPU, which shares the CPU's RAM, only the
    engines measured faster there (today Qwen3.6, Qwen3-Coder and Qwen3.8)
-   use it, unless `--backend vulkan` asks for it.
+   use it, unless `--backend vulkan` asks for it. On Linux, setup checks the
+   headers with the selected C compiler, so compiler wrappers (including
+   NixOS) and custom include paths work without placing headers in `/usr`.
+   The check is syntax-only, links no Vulkan loader and times out after five
+   seconds; an unavailable or failing compiler keeps the CPU fallback.
 3. **The CPU** otherwise.
 
 When the toolkit cannot build for the card, the setup does not try. It says
