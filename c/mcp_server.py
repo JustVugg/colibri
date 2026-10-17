@@ -322,7 +322,7 @@ class Server:
             return
         try:
             message = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             self.error(None, PARSE_ERROR, "parse error")
             return
         if isinstance(message, list):

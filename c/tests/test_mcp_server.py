@@ -93,6 +93,18 @@ class Protocol(unittest.TestCase):
         self.x.send({"id": 5, "method": "ping"})                       # no jsonrpc member
         self.assertEqual(self.x.messages()[-1]["error"]["code"], mcp_server.INVALID_REQUEST)
 
+    def test_deeply_nested_json_does_not_end_stdio_session(self):
+        deep = '[' * (sys.getrecursionlimit() * 10) + '0' + ']' * (sys.getrecursionlimit() * 10)
+        ping = json.dumps(request(91, 'ping'))
+        process = subprocess.run(
+            [sys.executable, str(C_DIR / 'mcp_server.py')],
+            input=deep + '\n' + ping + '\n', text=True, capture_output=True, timeout=10)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        replies = [json.loads(line) for line in process.stdout.splitlines()]
+        self.assertEqual(replies[0]['error']['code'], mcp_server.PARSE_ERROR)
+        self.assertIsNone(replies[0]['id'])
+        self.assertEqual(replies[1], {'jsonrpc': '2.0', 'id': 91, 'result': {}})
+
     def test_batch(self):
         self.x.server.handle_line(json.dumps([request(1, "ping"), request(2, "ping")]))
         self.assertEqual({m["id"] for m in self.x.messages()}, {1, 2})
