@@ -345,6 +345,9 @@ def download_file_windows(url, dest, spec, curl, *, token=None, progress=None, v
     part = dest + ".part"
     if os.path.exists(part) and os.path.getsize(part) > size:
         os.remove(part)
+    if size == 0:
+        with open(part, "wb"):
+            pass
     if not (os.path.exists(part) and os.path.getsize(part) == size):
         target = wsl_windows_path(part)
         if not target:
