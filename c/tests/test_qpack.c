@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -487,6 +488,152 @@ static void test_embedded_nul_metadata(void) {
     cleanup(root);
 }
 
+/* Every byte of an error string is printable ASCII (0x20-0x7E): the string
+ * reaches stderr and logs unescaped. */
+static void check_printable(const char *text) {
+    for (; *text; text++)
+        CHECK((unsigned char)*text >= 0x20 && (unsigned char)*text <= 0x7E);
+}
+
+static char *format_layout(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    int size = vsnprintf(NULL, 0, format, args);
+    va_end(args);
+    CHECK(size > 0);
+    char *text = (char *)malloc((size_t)size + 1);
+    CHECK(text != NULL);
+    va_start(args, format);
+    vsnprintf(text, (size_t)size + 1, format, args);
+    va_end(args);
+    return text;
+}
+
+/* gate_proj.weight, then a second U32 section whose name and dtype are the
+ * caller's: the rule must name section 1 by index, never by its bytes. */
+static char *second_section_layout(const char *name, const char *dtype) {
+    return format_layout(
+        "{\"expertCount\":2,\"layerCount\":2,\"expertStride\":16384,"
+        "\"linearLayers\":[true,false],\"sections\":["
+        "{\"name\":\"gate_proj.weight\",\"dtype\":\"U32\","
+        "\"shape\":[2,1],\"offset\":0,\"size\":8},"
+        "{\"name\":\"%s\",\"dtype\":\"%s\","
+        "\"shape\":[2,1],\"offset\":8,\"size\":8}]}", name, dtype);
+}
+
+/* <module>.weight/.scales/.biases over a module of module_size 'm's at the
+ * fixtures' 4-bit/g8 geometry; scales_inner 2 is the width mismatch
+ * test_packed_width_refusals refuses by name. */
+static char *module_trio_layout(size_t module_size, int scales_inner) {
+    char *module = (char *)malloc(module_size + 1);
+    CHECK(module != NULL);
+    memset(module, 'm', module_size);
+    module[module_size] = 0;
+    int scalar_bytes = 2 * 2 * scales_inner;  /* BF16 [2, scales_inner] */
+    char *layout = format_layout(
+        "{\"expertCount\":2,\"layerCount\":2,\"expertStride\":16384,"
+        "\"linearLayers\":[true,false],\"sections\":["
+        "{\"name\":\"%s.weight\",\"dtype\":\"U32\",\"shape\":[2,1],"
+        "\"offset\":0,\"size\":8},"
+        "{\"name\":\"%s.scales\",\"dtype\":\"BF16\",\"shape\":[2,%d],"
+        "\"offset\":8,\"size\":%d},"
+        "{\"name\":\"%s.biases\",\"dtype\":\"BF16\",\"shape\":[2,%d],"
+        "\"offset\":%d,\"size\":%d}]}",
+        module, module, scales_inner, scalar_bytes,
+        module, scales_inner, 8 + scalar_bytes, scalar_bytes);
+    free(module);
+    return layout;
+}
+
+/* Refused at open with the message, the message printable end to end, the
+ * offending bytes nowhere in it. Takes ownership of layout. */
+static void expect_token_refusal(char *layout, const char *message,
+                                 const char *never_echoed) {
+    char root[] = "test_qpack_token_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    write_fixture(root, layout, "QPACK", 32768, 4, 8,
+                  COLI_AFFINE_SCALAR_BF16);
+    ColiQpackReader reader;
+    char error[512] = {0};
+    CHECK(coli_qpack_open(&reader, root, error, sizeof(error)) != 0);
+    CHECK(strstr(error, message) != NULL);
+    CHECK(strstr(error, never_echoed) == NULL);
+    check_printable(error);
+    CHECK(reader.layer_fds == NULL && reader.layout.sections == NULL);
+    cleanup(root);
+    free(layout);
+}
+
+/* A section name or dtype is graphic ASCII (0x21-0x7E). json.h decodes
+ * \uXXXX to the codepoint's UTF-8 bytes while refusing raw bytes below 0x20
+ * inside a string, so the escape form is the one a hostile layout.json
+ * carries; bytes at or above 0x80 arrive raw. Each is refused by index, and
+ * the printable part of the name is not echoed either. */
+static void test_section_token_rules(void) {
+    expect_token_refusal(
+        second_section_layout("\\u001b[31mup_proj\\u001b[0m.weight", "U32"),
+        "section 1 name is not printable ASCII", "up_proj");
+    expect_token_refusal(
+        second_section_layout("up_proj\\u007f.weight", "U32"),
+        "section 1 name is not printable ASCII", "up_proj");
+    expect_token_refusal(
+        second_section_layout("up proj.weight", "U32"),
+        "section 1 name is not printable ASCII", "up proj");
+    expect_token_refusal(
+        second_section_layout("up_proj\xc3\xa9.weight", "U32"),
+        "section 1 name is not printable ASCII", "up_proj");
+    expect_token_refusal(
+        second_section_layout("up_proj.weight", "\\u001b[31mU32\\u001b[0m"),
+        "section 1 dtype is not printable ASCII", "U32");
+
+    char long_dtype[257];
+    memset(long_dtype, 'U', sizeof(long_dtype) - 1);
+    long_dtype[sizeof(long_dtype) - 1] = 0;
+    expect_token_refusal(second_section_layout("up_proj.weight", long_dtype),
+                         "section 1 dtype is longer than 255 bytes", "UUUU");
+}
+
+/* qpack.c derives <module>.scales (at open) and <module>.weight/.scales/
+ * .biases (affine view) into 256-byte buffers; a derived name is exactly as
+ * long as the .weight it came from, so 255 bytes is the longest name every
+ * derived name of which still fits, and 256 the first that the open-time
+ * width check used to skip silently. */
+static void test_section_name_cap(void) {
+    char root[] = "test_qpack_cap_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char *layout = module_trio_layout(248, 1);
+    write_fixture(root, layout, "QPACK", 32768, 4, 8,
+                  COLI_AFFINE_SCALAR_BF16);
+    ColiQpackReader reader;
+    char error[512] = {0};
+    CHECK(coli_qpack_open(&reader, root, error, sizeof(error)) == 0);
+    CHECK(strlen(reader.layout.sections[0].name) == 255);
+    char module[249];
+    memset(module, 'm', sizeof(module) - 1);
+    module[sizeof(module) - 1] = 0;
+    unsigned char *blob = (unsigned char *)calloc(reader.layout.expert_stride, 1);
+    CHECK(blob != NULL);
+    ColiAffineQuantizedView view;
+    CHECK(coli_qpack_affine_view(&reader, blob, reader.layout.expert_stride,
+                                 module, &view, error, sizeof(error)) == 0);
+    free(blob);
+    coli_qpack_close(&reader);
+    cleanup(root);
+    free(layout);
+
+    /* At the cap the width check still runs, and refuses by name. */
+    layout = module_trio_layout(248, 2);
+    expect_width_refusal(layout, 4, 8, "section mmmm",
+                         "weight inner 1 = 8 inputs, scales inner 2 = 16 inputs");
+    free(layout);
+
+    /* One byte past it: the container the width check skipped and opened
+     * despite the same mismatch. Refused at parse, by index, before any
+     * derived name is built. */
+    expect_token_refusal(module_trio_layout(249, 2),
+                         "section 0 name is longer than 255 bytes", "mmmm");
+}
+
 int main(void) {
     static const struct {
         const char *layout;
@@ -517,8 +664,10 @@ int main(void) {
     test_affine_shape_refusal();
     test_eager_layer_validation_cleanup();
     test_embedded_nul_metadata();
+    test_section_token_rules();
+    test_section_name_cap();
     test_post_open_truncation();
-    puts("test_qpack: strict v1 metadata, packed widths, fixed-stride read, "
-         "affine views: ok");
+    puts("test_qpack: strict v1 metadata, printable bounded names, packed "
+         "widths, fixed-stride read, affine views: ok");
     return 0;
 }
