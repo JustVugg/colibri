@@ -50,9 +50,11 @@ def blocks(name, shape, rng, std=0.02):
     return raw.reshape(*shape[:-1], nb * size)
 
 
-def write_model(path, rng, dense=False):
+def write_model(path, rng, dense=False, same_gate_up=False):
     """dense: llama.cpp's qwen35 (a dense model of the family): an MLP per layer instead of the
-    experts, and no output.weight (the head tied to token_embd), as the small checkpoints ship."""
+    experts, and no output.weight (the head tied to token_embd), as the small checkpoints ship.
+    same_gate_up: every layer's expert up in its gate's type (layer 0 IQ2_XXS, the others
+    Q4_K), the pairing the Vulkan tier keeps as the file's blocks."""
     arch = "qwen35" if dense else "qwen35moe"
     w = gguf.GGUFWriter(str(path), arch)
     p = arch + "."
@@ -90,7 +92,7 @@ def write_model(path, rng, dense=False):
             q(b + "ffn_gate_shexp.weight", (I, H), "Q8_0"); q(b + "ffn_up_shexp.weight", (I, H), "Q8_0")
             q(b + "ffn_down_shexp.weight", (H, I), "Q8_0")
             q(b + "ffn_gate_exps.weight", (E, I, H), "IQ2_XXS" if L == 0 else "Q4_K")
-            q(b + "ffn_up_exps.weight", (E, I, H), "Q4_K")
+            q(b + "ffn_up_exps.weight", (E, I, H), "IQ2_XXS" if same_gate_up and L == 0 else "Q4_K")
             q(b + "ffn_down_exps.weight", (E, H, I), "Q6_K" if L % 2 else "Q5_K")
         if (L + 1) % 4 == 0:
             q(b + "attn_q.weight", (QH * HD * 2, H), "Q8_0"); q(b + "attn_k.weight", (KVH * HD, H), "Q8_0")

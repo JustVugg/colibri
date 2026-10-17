@@ -1197,6 +1197,9 @@ int main(int argc, char **argv) {
     const char *spv = argc > 1 ? argv[1] : coli_vk_shader_path(buf, sizeof buf);
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
     setenv("COLI_VK_TIER_RESERVE_GB", "0", 1);
+    /* the budgets, evictions and promotions below are the device's: the host pool (a
+     * discrete card's system RAM) would take what the device leaves */
+    setenv("COLI_VK_TIER_HOST", "0", 0);
     scratch_budget();
     printf("formats:\n"); formats();
     printf("blocks:\n"); blocks();

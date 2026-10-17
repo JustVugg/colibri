@@ -354,6 +354,7 @@ static struct {
     uint32_t qfam;
     uint32_t memtype;            // HOST_VISIBLE|HOST_COHERENT (prefer DEVICE_LOCAL) — for inputs/weights
     uint32_t memtype_cached;     // HOST_CACHED — for buffers the CPU reads back (outputs)
+    int memtype_sys;             // HOST_VISIBLE in system RAM, not DEVICE_LOCAL: the tier's host pool (-1: none, an integrated GPU)
     VkDescriptorSetLayout dsl;
     VkPipelineLayout plyt;
     VkPipeline pipe;
@@ -530,6 +531,25 @@ static int pick_memtype_cached(VkPhysicalDevice phys) {
             (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) return (int)i;
     }
     return pick_memtype(phys);   /* no cached type -> fall back (no worse than before) */
+}
+
+/* System RAM the device reads over PCIe (HOST_VISIBLE|HOST_COHERENT, not DEVICE_LOCAL,
+ * write-combined before cached: the host writes it once, the device reads it): the
+ * tier's host pool. -1 when every host-visible type is device-local (an integrated GPU,
+ * a CPU device: their tier pool is that memory already). */
+static int pick_memtype_sys(VkPhysicalDevice phys) {
+    VkPhysicalDeviceMemoryProperties m;
+    vkGetPhysicalDeviceMemoryProperties(phys, &m);
+    int best = -1;
+    for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
+        if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || !(f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
+            (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) || (m.memoryHeaps[m.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
+            continue;
+        if (!(f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) return (int)i;
+        if (best < 0) best = (int)i;
+    }
+    return best;
 }
 
 /* DEVICE_LOCAL for buffers only the device reads and writes (the expert batch's
@@ -1283,6 +1303,12 @@ int coli_vk_init(const char *spv_path) {
     G.memtype = (uint32_t)mt;
     G.memtype_cached = (uint32_t)pick_memtype_cached(G.phys);
     G.memtype_dev = (uint32_t)pick_memtype_device(G.phys);
+    G.memtype_sys = pick_memtype_sys(G.phys);
+    {   /* COLI_VK_TIER_HOST=1 on a device that shares the host's RAM (tests): the host pool in
+         * its host-visible type, the same memory as the tier's pool, the same paths as on a card */
+        const char *e = getenv("COLI_VK_TIER_HOST");
+        if (G.memtype_sys < 0 && e && !strcmp(e, "1")) G.memtype_sys = (int)G.memtype;
+    }
 
     /* Resizable-BAR sanity (#523): on discrete cards the weight tiers want
      * HOST_VISIBLE|DEVICE_LOCAL. With ReBAR disabled that combination exists only in a
@@ -1468,6 +1494,7 @@ struct VkWPool {
     VkaPool p;
     pthread_mutex_t mx;
     int dev;                 /* 0 = G, 1 = G2 */
+    int host;                /* 1 = system RAM the device reads over PCIe (G.memtype_sys), mapped, never staged */
     float prio;              /* eviction priority of its blocks; < 0 = G.prio at creation */
     int counted;             /* 1 = its tensors are coli_vk_mem_info's (the resident weights) */
     size_t bytes, tensors;   /* payload of its live tensors (rows + scales) */
@@ -1480,6 +1507,11 @@ static VkWPool g_tpool2 = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_
 /* the tier's extra layers (an MTP head's), whose experts have another size than the
  * main ones': a pool of their own, so neither leaves holes the other cannot use */
 static VkWPool g_xpool  = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 0, .prio = 0.4f};
+/* the tier's experts the primary device's memory has no room for, in system RAM it reads
+ * by address over PCIe (coli_vk_tier_tensor_pad dev 2): a discrete card only */
+static VkWPool g_hpool  = {.p = {.block_bytes = VK_WBLOCK}, .mx = PTHREAD_MUTEX_INITIALIZER, .dev = 0, .prio = -1.f, .host = 1};
+/* a pool whose memory the uploader fills (staged uploads), or the host's own mapping */
+static int pool_staged(const VkWPool *P);
 /* Device k's pools take VK_WBLOCK blocks, smaller ones under COLI_VK_DEVICE_CAP_MB. */
 static void vk_pool_blocks(int k) {
     size_t bb = VK_WBLOCK;
@@ -1719,7 +1751,7 @@ static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
         .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
     if (pool_bda(P)) { afl.pNext = ai.pNext; ai.pNext = &afl; }
     VkDevice dev = pool_device(P);
-    int staged = g_up[P->dev].on;   /* device-local, never mapped: the uploader fills it */
+    int staged = pool_staged(P);   /* device-local, never mapped: the uploader fills it */
     if (staged && up_fault("block")) { free(bk); return NULL; }
     if (vkAllocateMemory(dev, &ai, NULL, &bk->mem) != VK_SUCCESS ||
         (!staged && vkMapMemory(dev, bk->mem, 0, cap, 0, (void **)&bk->base) != VK_SUCCESS)) {
@@ -1743,7 +1775,7 @@ static int pool_suballoc(VkWPool *P, size_t bytes, VkBuffer *buf, void **ptr, Vk
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = bytes ? bytes : 4, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-    if (g_up[P->dev].on) { bi.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT; up_sharing(&g_up[P->dev], &bi); }
+    if (pool_staged(P)) { bi.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT; up_sharing(&g_up[P->dev], &bi); }
     if (pool_bda(P)) bi.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     VKCHECK(vkCreateBuffer(dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
@@ -1828,7 +1860,7 @@ static ColiVkTensor *tensor_alloc_pad(VkWPool *P, int fmt, int I, int O, int gs,
     if (!pool_suballoc(P, t->scap, &t->sbuf, &sp, &t->sr)) {
         vkDestroyBuffer(pool_device(P), t->wbuf, NULL); pool_free_range(P, t->wr); free(t); return NULL;
     }
-    if (g_up[P->dev].on) {
+    if (pool_staged(P)) {
         if (wptr && !(t->img = up_img_alloc(P->dev, t->wbytes + sbytes, &t->img_al))) {
             vkDestroyBuffer(pool_device(P), t->wbuf, NULL); vkDestroyBuffer(pool_device(P), t->sbuf, NULL);
             pool_free_range(P, t->wr); pool_free_range(P, t->sr); free(t); return NULL;
@@ -1864,7 +1896,7 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
                               int fmt, int I, int O, int gs) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
     if (!fmt_uploadable(fmt, gs)) return 0;
-    if (g_up[P->dev].on) {   /* staged: the rows and the scales through the uploader */
+    if (pool_staged(P)) {   /* staged: the rows and the scales through the uploader */
         ColiVkTensor *t = tensor_alloc(P, fmt, I, O, gs, NULL, NULL);
         if (!t) return 0;
         static const float one = 1.0f;   /* float weights: no scales */
@@ -2802,7 +2834,9 @@ static int scratch_reserve_d2(Scratch *s, size_t bytes, uint32_t memtype) {
 }
 static VkDevice pool_device(const VkWPool *P) { return P->dev ? G2.dev : G.dev; }
 static int bd_dev_ready(int dev) { return dev ? G2.ready : G.ready; }
+static int pool_staged(const VkWPool *P) { return g_up[P->dev].on && !P->host; }
 static uint32_t pool_memtype(const VkWPool *P) {
+    if (P->host) return (uint32_t)G.memtype_sys;
     return g_up[P->dev].on ? g_up[P->dev].mt_dev : P->dev ? G2.memtype : G.memtype;
 }
 /* An upload's fence failed: the device is gone, as for any other wait. */
@@ -2812,7 +2846,7 @@ static void up_lost(int dev) {
     /* another thread (the tier's uploader) may be the one that finds out */
     if (dev) __atomic_store_n(&G2.ready, 0, __ATOMIC_RELEASE); else __atomic_store_n(&G.ready, 0, __ATOMIC_RELEASE);
 }
-static int pool_has_prio(const VkWPool *P) { return P->dev ? 0 : G.has_prio; }
+static int pool_has_prio(const VkWPool *P) { return P->dev || P->host ? 0 : G.has_prio; }
 static int upload_tensor_d2(ColiVkTensor **out, const void *weights, const float *scales,
                             int fmt, int I, int O, int gs) {
     return upload_tensor_pool(&g_wpool2, out, weights, scales, fmt, I, O, gs);
@@ -3724,7 +3758,8 @@ void coli_vk_tensor_free(ColiVkTensor *t) {
 }
 
 static VkWPool *pool_of(int which) {
-    return which == 1 ? &g_tpool : which == 2 ? &g_wpool2 : which == 3 ? &g_tpool2 : which == 4 ? &g_xpool : &g_wpool;
+    return which == 1 ? &g_tpool : which == 2 ? &g_wpool2 : which == 3 ? &g_tpool2 : which == 4 ? &g_xpool :
+           which == 5 ? &g_hpool : &g_wpool;
 }
 void coli_vk_pool_stats(int which, ColiVkPoolStats *st) {
     VkWPool *P = pool_of(which);
@@ -3752,7 +3787,8 @@ static void tier_pool_limit(VkWPool *P, size_t bytes) {
     pthread_mutex_unlock(&P->mx);
 }
 void coli_vk_tier_pool_limit(size_t bytes) { tier_pool_limit(&g_tpool, bytes); }
-void coli_vk_tier_pool_limit_dev(int dev, size_t bytes) { tier_pool_limit(dev == 1 ? &g_tpool2 : &g_tpool, bytes); }
+void coli_vk_tier_pool_limit_dev(int dev, size_t bytes) { tier_pool_limit(dev == 2 ? &g_hpool : dev == 1 ? &g_tpool2 : &g_tpool, bytes); }
+int coli_vk_tier_host_pool(void) { return G.ready && G.has_bda && G.memtype_sys >= 0; }
 void coli_vk_tier_extra_pool_limit(size_t bytes) { tier_pool_limit(&g_xpool, bytes); }
 
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t) { return t ? t->wbytes : 0; }
@@ -4413,10 +4449,14 @@ static uint64_t vk_addr(VkBuffer b) {
 int coli_vk_xb_expert_entry(const ColiVkExpert *e, uint32_t *o) {
     if (!e || !o || !G.ready || !G.has_bda) return 0;
     const ColiVkTensor *t[3] = {e->g, e->u, e->d};
-    for (int k = 0; k < 3; k++) if (!t[k] || t[k]->dev || !t[k]->pool || !pool_bda(t[k]->pool) || !t[k]->sbuf) return 0;
+    /* a block format (a GGUF's experts) has no scales: chain_moe.comp reads its blocks and
+     * the table, and the entry's scale address stays its weights' (never read) */
+    for (int k = 0; k < 3; k++)
+        if (!t[k] || t[k]->dev || !t[k]->pool || !pool_bda(t[k]->pool) || (!t[k]->sbuf && !bd_fmt(t[k]->fmt)) ||
+            (bd_fmt(t[k]->fmt) && (t[k]->fmt >= 200 || t[k]->I % 32))) return 0;
     memset(o, 0, COLI_VK_XB_ENTRY * sizeof *o);
     for (int k = 0; k < 3; k++) {
-        uint64_t w = vk_addr(t[k]->wbuf), s = vk_addr(t[k]->sbuf);
+        uint64_t w = vk_addr(t[k]->wbuf), s = t[k]->sbuf ? vk_addr(t[k]->sbuf) : w;
         o[4 * k] = (uint32_t)w; o[4 * k + 1] = (uint32_t)(w >> 32);
         o[4 * k + 2] = (uint32_t)s; o[4 * k + 3] = (uint32_t)(s >> 32);
     }
@@ -5117,9 +5157,9 @@ static void xb_shutdown(XbCtx *X) {
  * calls this; the pool's lock is the only shared state it touches. */
 int coli_vk_tier_tensor_pad(int dev, ColiVkTensor **t, int fmt, int I, int O, int gs, size_t pad_w, size_t pad_s,
                             uint8_t **rows, size_t *stride, float **scales) {
-    if ((dev == 1 ? !G2.ready : !G.ready) || !fmt_uploadable(fmt, gs)) return 0;
+    if ((dev == 1 ? !G2.ready : !G.ready) || !fmt_uploadable(fmt, gs) || (dev == 2 && !coli_vk_tier_host_pool())) return 0;
     void *w, *s;
-    ColiVkTensor *n = tensor_alloc_pad(dev == 1 ? &g_tpool2 : &g_tpool, fmt, I, O, gs, pad_w, pad_s, &w, &s);
+    ColiVkTensor *n = tensor_alloc_pad(dev == 2 ? &g_hpool : dev == 1 ? &g_tpool2 : &g_tpool, fmt, I, O, gs, pad_w, pad_s, &w, &s);
     if (!n) return 0;
     *t = n; *rows = w; *stride = (size_t)n->rowWords * 4; *scales = s;
     return 1;
@@ -5211,6 +5251,7 @@ int coli_vk_staged(void) { return G.ready && g_up[0].on; }
 size_t coli_vk_tensor_row_bytes(int fmt, int I) { return cpu_row_bytes(fmt, I); }
 /* elements per block of a block format (shaders/blockdec.glsl), 0 for any other format */
 int coli_vk_block_elems(int fmt) { return !bd_fmt(fmt) || !bd_shaders() ? 0 : fmt == 203 ? 64 : fmt >= 200 ? 128 : (int)BD_BLK[fmt - 100]; }
+void *coli_vk_block_table_dev(int dev) { return bd_shaders() ? (void *)bdtab_buf(dev == 1 ? 1 : 0) : NULL; }
 /* vq2's codebooks (two 256 x 8 int8, row-major) into the table buffer. The table is built
  * once, at the first block-format tensor: call this before (the tier's start); -1 when a
  * table is already on a device with other books. */
@@ -5356,6 +5397,7 @@ void coli_vk_shutdown(void) {
     pool_destroy(&g_wpool);    /* weight blocks: unmapped/freed with the device */
     pool_destroy(&g_tpool);
     pool_destroy(&g_xpool);
+    pool_destroy(&g_hpool);
     if (PW.buf) { vkDestroyBuffer(G.dev, PW.buf, NULL); vkFreeMemory(G.dev, PW.mem, NULL); }
     free(PW.cp);
     memset(&PW, 0, sizeof PW);

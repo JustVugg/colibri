@@ -2505,10 +2505,6 @@ int main(int argc, char **argv) {
      * on an integrated GPU (docs/vulkan.md, "The dense chain") */
     if(g_vk_ready&&!qt_ready())
         g_vk_chain=coli_vk_chain_decide("qwen38",vkt_wanted()&&m.c.experts>0,COLI_VK_CHAIN_OFF);
-    if(g_vk_chain&&g_q38_gguf){   /* the chain uploads the dense matrices in its own formats; a GGUF's are ggml blocks */
-        g_vk_chain=0;
-        fprintf(stderr,"[VK] qwen38: the dense chain is off for a GGUF (its dense matrices are ggml blocks, kept on the CPU); the expert tier runs\n");
-    }
     if(g_vk_chain&&g_q38_mux_slots>1){
         g_vk_chain=0;
         fprintf(stderr,"[VK] qwen38: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "
