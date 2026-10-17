@@ -20,6 +20,7 @@
 #define ST_GGUF_H
 
 #include "gguf.h"
+#include <limits.h>
 
 #define ST_GGML_BASE 32
 static inline int st_is_ggml(int dtype) { return dtype >= ST_GGML_BASE; }
@@ -326,6 +327,8 @@ static int st_init_gguf(shards *S, const char *snap_dir) {
 again:;
         const int per_expert = hf && strstr(hf, "%d") != NULL;
         const int dims = per_expert ? 2 : t->n_dims;
+        if (per_expert && (t->n_dims != 3 || t->ne[2] > INT_MAX))
+            coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF %s: expert count does not fit the tensor index", t->name);
         const int E = per_expert ? (int)t->ne[2] : 1;
         if (per_expert && (t->n_dims != 3 || t->nbytes % E)) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF %s: not [experts][rows][cols]", t->name);
         const int64_t slice = t->nbytes / E;
