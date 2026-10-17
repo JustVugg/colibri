@@ -4518,6 +4518,11 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
  * so `out` gets the routed experts' rank-order sum alone (the Vulkan dense chain runs
  * the router and the shared expert on the device and adds them there). moe() is
  * moe_ex(..., NULL, 0): the same operations in the same order as before. */
+#ifdef COLI_CUDA
+/* the CUDA chain's route for the resident experts (qwen36_cuda_chain.h, included below) */
+static int q36cc_experts_route(Model *m);
+static uint32_t q36cc_experts_row(Model *m, int layer, int s, const int *idx, const float *val, int K);
+#endif
 static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
                    const float *logits_in, int routed_only) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
@@ -4549,6 +4554,13 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
     int use_gq = g_gguf && !vkt_ready();   /* the Vulkan tier takes GGUF experts as int8-g32 */
     int use_qq = !use_gq && qq_active();
     int use_qt = !use_gq && !use_qq && qt_ready() && qt_experts_on();   /* a trunk-only tier leaves the experts to the paths below */
+    /* the CUDA chain running this layer with its route on: the residents of every row go to the
+     * device from here (q36cc_experts_row), the CPU's share stays below; decided once per call so
+     * every row of the layer writes its row of the device's sum */
+    int use_xdev = 0;
+#ifdef COLI_CUDA
+    use_xdev = use_qt && routed_only && q36cc_experts_route(m);
+#endif
     /* the Vulkan tier takes the routed experts of every format it was given
      * (moe_vk_run): the routing is collected first, as for the shared kernel */
     int use_vk = !use_gq && !use_qq && !use_qt && vkt_ready();
@@ -4739,7 +4751,12 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
              * read into RAM for it: below full residency the RAM cache and the
              * VRAM tier then add up instead of holding the same experts. */
             double _q0 = tm_now();
-            uint32_t qmask = qt_issue(layer, idx, K, xs);
+            uint32_t qmask;
+#ifdef COLI_CUDA
+            if (use_xdev) qmask = q36cc_experts_row(m, layer, s, idx, val, K);
+            else
+#endif
+            qmask = qt_issue(layer, idx, K, xs);
             double _q1 = tm_now();
             qt_cpu_misses(m, layer, xs, idx, val, qmask, out + (int64_t)s*D, g, u, hh);
             /* Compute the shared expert NOW so it overlaps with the GPU
@@ -4764,7 +4781,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
                 tm_add(S, 3, tm_now()-_ts2);
             }
             double _q2 = tm_now();
-            if(!qt_take(qmask, val, K, out + (int64_t)s*D)){
+            if(!use_xdev && !qt_take(qmask, val, K, out + (int64_t)s*D)){   /* the route's sum stays on the device */
                 fprintf(stderr,"qwen36: CUDA expert collection failed at layer %d; stopping inference\n",layer);
                 exit(1);
             }

@@ -29,6 +29,10 @@
  * device's default) with device pointers, no transfer, no synchronization. */
 extern "C" int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I, int *O);
 extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);
+/* and the routed experts of one row (1 launched, 0 refused, -1 a launch failed) */
+extern "C" int coli_cuda_experts_dev_async(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
+                                            ColiCudaTensor *const *downs, const float *vals, int count,
+                                            const float *x_dev, float *y_dev, void *stream);
 
 struct CcBuf { int kind, dev; size_t bytes; float *d; void *h; };
 
@@ -756,6 +760,18 @@ static int cc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated,
     } else return 0;
     return launched(c, "ple");
 }
+static int cc_experts(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d, const float *vals, int count,
+                      CcBuf *x, size_t xo, CcBuf *y, size_t yo) {
+    CcCtx *c = live();
+    if (!c || !g || !u || !d || !vals || count < 1 || !x || !y || !g[0]) return 0;
+    int fmt, D, I;
+    if (!coli_cuda_tensor_shape(g[0], &fmt, &D, &I) || coli_cuda_tensor_device(g[0]) != c->device) return 0;
+    if ((xo + (size_t)D) * 4 > x->bytes || (yo + (size_t)D) * 4 > y->bytes) return 0;
+    int rc = coli_cuda_experts_dev_async(g, u, d, vals, count, x->d + xo, y->d + yo, (void *)c->stream);
+    if (rc < 0) { c->lost = 1; return 0; }
+    if (rc > 0) { g_st.ops++; g_st.experts += (unsigned long long)count; }
+    return rc > 0;
+}
 static void cc_stats(CcStats *st) { if (st) *st = g_st; }
 
 static const ColiCudaChainOps g_cc_ops = {
@@ -767,5 +783,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_matmul, cc_norm, cc_rope, cc_attn, cc_dnconv, cc_dnrec, cc_ew,
     cc_stats,
     cc_qsa, cc_ple,
+    cc_experts,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

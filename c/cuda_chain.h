@@ -95,6 +95,7 @@ typedef struct {
     unsigned long long frames, waits, ops, matmuls, bytes_up, bytes_down;
     double wait_ms;      /* host time blocked in event waits */
     size_t dev_bytes;    /* live chain buffers on the device */
+    unsigned long long experts;   /* routed experts computed on the device (`experts`) */
 } CcStats;
 
 /* The table the backend exports. `size` is the backend's sizeof: a field past it is
@@ -135,6 +136,13 @@ typedef struct ColiCudaChainOps {
     /* Qwen3.8's two: the QSA indexer's block keys and selections, the PLE gate and convolution */
     int  (*qsa)(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *sel, const CcQsa *p);
     int  (*ple)(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated, CcBuf *normv, CcBuf *conv, CcBuf *ring, const CcPle *p);
+    /* The routed experts of one row, on the device: y[D] = sum_c vals[c] * down_c(silu(gate_c x) * (up_c x))
+     * over `count` resident triples of the tier (gate/up [I,D], down [D,I]; fmt 1, 2, or 4 with gs a
+     * multiple of 32), x and y at float offsets, y overwritten. Returns 0 without launching for a
+     * shape or format the kernels do not take (the device is not lost: the caller keeps those experts
+     * on the host). The caller holds the tensors until the frame they belong to has been waited for. */
+    int  (*experts)(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups, ColiCudaTensor *const *downs,
+                    const float *vals, int count, CcBuf *x, size_t xo, CcBuf *y, size_t yo);
 } ColiCudaChainOps;
 
 /* The backend's table; NULL from a backend without the chain. Optional in the DLL
@@ -178,6 +186,7 @@ static inline int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const 
 static inline void cc_stats(CcStats *st) { const ColiCudaChainOps *t = cc_ops(); if (t) t->stats(st); else memset(st, 0, sizeof *st); }
 static inline int cc_qsa(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *sel, const CcQsa *p) { const ColiCudaChainOps *t = cc_ops(); return t ? t->qsa(src, w, pk, cs, sc, sel, p) : 0; }
 static inline int cc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated, CcBuf *normv, CcBuf *conv, CcBuf *ring, const CcPle *p) { const ColiCudaChainOps *t = cc_ops(); return t ? t->ple(keys, hyp, val, prm, gated, normv, conv, ring, p) : 0; }
+static inline int cc_experts(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d, const float *vals, int count, CcBuf *x, size_t xo, CcBuf *y, size_t yo) { const ColiCudaChainOps *t = cc_ops(); return t ? t->experts(g, u, d, vals, count, x, xo, y, yo) : 0; }
 #endif
 
 #ifdef __cplusplus

@@ -541,13 +541,48 @@ static int fcc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated
     }
     return 1;
 }
-static void fcc_stats(CcStats *st) { memset(st, 0, sizeof *st); st->frames = (unsigned long long)fake_chain_frames; st->ops = (unsigned long long)fake_chain_ops; st->dev_bytes = fake_chain_dev_bytes; }
+/* the route's op: the residents of one row from the fake's int8 copies (fake_dense_compute), the
+ * kernels' arithmetic -- silu(gate x) * (up x) per hidden unit, the down rows, the weighted sum */
+static int fake_chain_experts;   /* residents computed through it */
+static int fcc_experts(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d, const float *vals, int count,
+                       CcBuf *x, size_t xo, CcBuf *y, size_t yo) {
+    if (!fcc_ready() || !g || !u || !d || !vals || count < 1 || !x || !y || !g[0]) return 0;
+    int D = g[0]->I, I = g[0]->O;
+    if ((xo + (size_t)D) * 4 > x->bytes || (yo + (size_t)D) * 4 > y->bytes) return 0;
+    for (int c = 0; c < count; c++) {
+        const ColiCudaTensor *a = g[c], *b = u[c], *e = d[c];
+        if (!a || !b || !e || a->fmt != 1 || b->fmt != 1 || e->fmt != 1 || !a->w || !a->sc || !b->w || !b->sc || !e->w || !e->sc ||
+            a->I != D || b->I != D || a->O != I || b->O != I || e->I != I || e->O != D || a->device != fake_chain_dev) return 0;
+    }
+    fake_chain_ops++; fake_chain_experts += count;
+    const float *xs = x->d + xo; float *ys = y->d + yo;
+    float *h = (float *)malloc((size_t)I * sizeof(float));
+    for (int o = 0; o < D; o++) ys[o] = 0.f;
+    for (int c = 0; c < count; c++) {
+        const int8_t *gw = (const int8_t *)g[c]->w, *uw = (const int8_t *)u[c]->w, *dw = (const int8_t *)d[c]->w;
+        for (int o = 0; o < I; o++) {
+            float ga = 0.f, ua = 0.f;
+            for (int i = 0; i < D; i++) { ga += xs[i] * (float)gw[(size_t)o * D + i]; ua += xs[i] * (float)uw[(size_t)o * D + i]; }
+            float gv = ga * g[c]->sc[o], uv = ua * u[c]->sc[o];
+            h[o] = (gv / (1.f + expf(-gv))) * uv;
+        }
+        for (int o = 0; o < D; o++) {
+            float a = 0.f;
+            for (int i = 0; i < I; i++) a += h[i] * (float)dw[(size_t)o * I + i];
+            ys[o] += vals[c] * a * d[c]->sc[o];
+        }
+    }
+    free(h);
+    return 1;
+}
+static void fcc_stats(CcStats *st) { memset(st, 0, sizeof *st); st->frames = (unsigned long long)fake_chain_frames; st->ops = (unsigned long long)fake_chain_ops; st->dev_bytes = fake_chain_dev_bytes; st->experts = (unsigned long long)fake_chain_experts; }
 static const ColiCudaChainOps fake_chain_table = {
     sizeof(ColiCudaChainOps), fcc_init, fcc_ready, fcc_lost, fcc_shutdown, fcc_device, fcc_device_now,
     fcc_buf, fcc_free, fcc_reserve, fcc_ptr, fcc_bytes, fcc_begin, fcc_submit, fcc_finish,
     fcc_copy, fcc_zero, fcc_copy_regions, fcc_write, fcc_read,
     fcc_matmul, fcc_norm, fcc_rope, fcc_attn, fcc_dnconv, fcc_dnrec, fcc_ew, fcc_stats,
     fcc_qsa, fcc_ple,
+    fcc_experts,
 };
 static int fake_chain_absent;   /* 1: a backend without the chain (an older DLL) */
 const ColiCudaChainOps *coli_cuda_chain_ops(void) { return fake_chain_absent ? NULL : &fake_chain_table; }
