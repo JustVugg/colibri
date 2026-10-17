@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import shlex
 import socket
 import subprocess
 import sys
@@ -1272,6 +1273,8 @@ def equivalent_command(cfg):
 
 def _quote(value):
     value = str(value)
+    if host_os() != "win32":
+        return shlex.quote(value)
     return value if re.match(r"^[A-Za-z0-9_./:=,+-]+$", value) else json.dumps(value, ensure_ascii=False)
 
 
