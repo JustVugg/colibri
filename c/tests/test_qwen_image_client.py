@@ -137,6 +137,13 @@ class PngTest(unittest.TestCase):
 
 
 class RequestRulesTest(unittest.TestCase):
+    def test_unpaired_surrogates_are_prompt_errors(self):
+        for prompt in ("a\ud800cat", "a\udfffcat"):
+            with self.subTest(prompt=repr(prompt)), self.assertRaises(ie.ImageRequestError) as caught:
+                ie.image_request({"prompt": prompt}, INFO)
+            self.assertEqual(caught.exception.param, "prompt")
+        self.assertEqual(ie.image_request({"prompt": "a cat 🐈"}, INFO)["prompt"], "a cat 🐈")
+
     def test_defaults_come_from_ready(self):
         request = ie.image_request({"prompt": "a cat", "seed": 3}, INFO)
         self.assertEqual((request["width"], request["height"], request["steps"],
@@ -210,6 +217,13 @@ class ImageEngineTest(unittest.TestCase):
         self.assertEqual(size, meta["width"] * meta["height"] * 3)
         # stderr was drained from the first byte, into our callable
         self.assertTrue(any("stub" in line for line in self.logs))
+
+    def test_invalid_unicode_prompt_does_not_poison_the_engine(self):
+        engine = self.engine()
+        with self.assertRaises(ie.ImageRequestError):
+            engine.generate("bad\ud800prompt", 256, 256, 2, 1)
+        self.assertTrue(engine.alive)
+        self.assertEqual(engine.generate("a cat 🐈", 256, 256, 2, 1)["width"], 256)
 
     def test_engine_error_leaves_the_engine_usable(self):
         engine = self.engine()

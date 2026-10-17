@@ -103,6 +103,13 @@ def describe_exit(code):
     return f"exit code {code}"
 
 
+def _prompt_byte_length(prompt):
+    try:
+        return len(prompt.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise ImageRequestError("`prompt` must contain valid Unicode text.", "prompt") from error
+
+
 class ImageEngine:
     """One engine process and the one request it can work on at a time.
 
@@ -290,7 +297,7 @@ class ImageEngine:
         polled between frames and on every idle tick; with `interruptible` the
         first Ctrl-C sends CANCEL and keeps waiting (the engine is still busy
         until it answers), the second one propagates."""
-        if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+        if _prompt_byte_length(prompt) > MAX_PROMPT_BYTES:
             raise ImageRequestError(f"`prompt` is longer than {MAX_PROMPT_BYTES} bytes.", "prompt")
         with self.lock:
             if self.dead:
@@ -502,7 +509,7 @@ def image_request(body, info):
     prompt = body.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ImageRequestError("`prompt` must be a non-empty string.", "prompt")
-    if len(prompt.encode("utf-8", "surrogatepass")) > MAX_PROMPT_BYTES:
+    if _prompt_byte_length(prompt) > MAX_PROMPT_BYTES:
         raise ImageRequestError(f"`prompt` is longer than {MAX_PROMPT_BYTES} bytes.", "prompt")
     n = body.get("n", 1)
     if n is not None and (isinstance(n, bool) or n != 1):
