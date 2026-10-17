@@ -583,6 +583,40 @@ class TemplateTest(unittest.TestCase):
             self.assertNotEqual(render_chat_for_arch(history, True, "xhigh"),
                                 render_chat_qwen38(history, True, "xhigh"))
 
+    def test_embedded_history_json_limits_keep_renderer_error_policy(self):
+        bad_arguments = ('[' * 10000 + '0' + ']' * 10000, '9' * 10000)
+        for arch in ('glm', 'glm53', 'qwen36', 'qwen38', 'mimo', 'olmoe'):
+            for raw in bad_arguments:
+                with self.subTest(arch=arch, nested=raw.startswith('[')):
+                    engine = ScriptedEngine()
+                    base = _spawn_test_server(self, engine)
+                    body = {'model': 'test-model', 'messages': [
+                        {'role': 'user', 'content': 'run'},
+                        {'role': 'assistant', 'content': '', 'tool_calls': [
+                            {'id': 'x', 'type': 'function', 'function': {
+                                'name': 'f', 'arguments': raw}}]},
+                        {'role': 'tool', 'tool_call_id': 'x', 'content': 'done'},
+                        {'role': 'user', 'content': 'continue'}]}
+                    with patch('openai_server.ARCH', arch), patch('openai_server._TOOL_FALLBACK', True):
+                        if arch in ('glm', 'glm53'):
+                            with _post_chat(base, body) as response:
+                                self.assertEqual(response.status, 200)
+                            self.assertEqual(len(engine.calls), 1)
+                        else:
+                            status, error = _error_body(self, lambda: _post_chat(base, body))
+                            self.assertEqual(status, 400)
+                            self.assertIn('arguments', error['param'])
+                            self.assertEqual(engine.calls, [])
+
+    def test_coder_history_json_nesting_is_a_client_error(self):
+        raw = '[' * 10000 + '0' + ']' * 10000
+        with self.assertRaises(APIError) as caught:
+            openai_server.render_chat_qwen3_coder([
+                {'role': 'assistant', 'content': '', 'tool_calls': [
+                    {'function': {'name': 'f', 'arguments': raw}}]}])
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.param, 'messages.0.tool_calls.0.function.arguments')
+
     def test_kimi_renders_tool_declaration_and_choice(self):
         tools = [{"type": "function", "function": {
             "name": "get_weather", "parameters": {"type": "object"}}}]
