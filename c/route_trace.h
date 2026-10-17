@@ -379,7 +379,11 @@ static int rt_save(const char *path, int quiet){
                 if(rt_c[i][e]) fprintf(f, "%d %d %u\n", i, e, rt_c[i][e]);
         }
     }
-    fclose(f);
+    /* Buffered writes may fail only during close (for example a full disk).
+     * Publish only a complete history, keeping the previous one on failure. */
+    int write_failed = ferror(f);
+    if(fclose(f) != 0) write_failed = 1;
+    if(write_failed){ remove(tmp); return 0; }
     if(rename(tmp, path) != 0) return 0;
     if(!quiet) fprintf(stderr, "[STATS] %lld selections across %lld distinct experts -> %s\n",
                        (long long)tot, (long long)nz, path);
