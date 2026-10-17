@@ -35,6 +35,33 @@ int main(void) {
     SampleProb *rank = malloc((size_t)V * sizeof(SampleProb));
     const float temps[] = {0.2f, 0.7f, 1.0f, 2.0f}, tops[] = {0.3f, 0.9f, 0.99f, 1.0f};
     int failures = 0, cases = 0;
+    /* A numerical failure must not turn the first logit into a permanent
+     * token-0 answer. Match the finite-argmax fallback of the GLM sampler. */
+    const float bad[] = {NAN, INFINITY, -INFINITY};
+    for (int kind = 0; kind < 3; kind++) {
+        for (int pos = 0; pos < 3; pos++) {
+            float row[] = {0, 1, 2};
+            row[pos] = bad[kind];
+            int want = pos == 2 ? 1 : 2;
+            for (int greedy = 0; greedy < 2; greedy++) {
+                for (int full = 0; full < 2; full++) {
+                    srand(1);
+                    int got = serve_sample(row, 3, greedy ? 0.f : 0.7f,
+                                           full ? 1.f : 0.9f);
+                    if (got != want) {
+                        failures++;
+                        printf("FAIL nonfinite kind %d pos %d greedy %d full %d: %d instead of %d\n",
+                               kind, pos, greedy, full, got, want);
+                    }
+                }
+            }
+        }
+    }
+    const float unusable[] = {NAN, INFINITY, -INFINITY};
+    if (serve_sample(unusable, 3, 0.7f, 0.9f) != 0) failures++;
+    int numerical_failures = failures;
+    failures = 0;
+
     for (int trial = 0; trial < 13; trial++) {
         srand(500 + trial);
         for (int i = 0; i < V; i++) {               /* long tail plus a few peaks; trial 11 quantized: many ties */
@@ -77,8 +104,9 @@ int main(void) {
     if (serve_sample(lo, V, 0.f, 0.9f) != arg) { failures++; printf("FAIL temperature 0 is not the argmax\n"); }
     printf("serve sampler: %d of %d draws as the full sort%s\n", cases - (failures > 0 ? failures : 0), cases,
            failures ? "" : ", argmax at temperature 0");
-    printf("%s\n", failures ? "FAILED" : "PASSED");
+    printf("nonfinite fallback: %d failures over 37 cases\n", numerical_failures);
+    printf("%s\n", (failures || numerical_failures) ? "FAILED" : "PASSED");
     free(rank);
     free(lo);
-    return failures != 0;
+    return failures != 0 || numerical_failures != 0;
 }

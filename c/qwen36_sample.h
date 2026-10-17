@@ -25,11 +25,28 @@ static int sample_prob_desc(const void *a, const void *b){
     if(x->p!=y->p) return (y->p>x->p)-(x->p>y->p);
     return (x->id>y->id)-(x->id<y->id);
 }
+/* Numerical failures use the largest finite logit, as the GLM sampler does.
+ * Keep the healthy-row RNG sequence untouched. */
+static int sample_finite_max(const float *lo, int V, int *bad){
+    int best = -1;
+    *bad = 0;
+    for(int i=0;i<V;i++){
+        if(!isfinite(lo[i])){ *bad = 1; continue; }
+        if(best < 0 || lo[i] > lo[best]) best = i;
+    }
+    if(*bad){
+        static int warned;
+        if(!warned){ warned = 1; fprintf(stderr,"[SAMPLE] warning: non-finite logits; falling back to finite argmax\n"); }
+    }
+    return best < 0 ? 0 : best;
+}
+
 /* The whole vocabulary sorted. */
 static int serve_sample_sorted(const float *lo, int V, float temp, float top_p){
-    SampleProb *rank=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
+    int bad, best = sample_finite_max(lo, V, &bad);
+    if(bad) return best;
+    SampleProb *rank=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[best];
     if(!rank){ fprintf(stderr,"OOM sampling\n"); exit(1); }
-    for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
     double sum=0;
     for(int i=0;i<V;i++){ float p=expf((lo[i]-mx)/temp); sum+=p; rank[i]=(SampleProb){p,i}; }
     qsort(rank,(size_t)V,sizeof(SampleProb),sample_prob_desc);
@@ -40,11 +57,12 @@ static int serve_sample_sorted(const float *lo, int V, float temp, float top_p){
     free(rank); return pick;
 }
 static int serve_sample(const float *lo, int V, float temp, float top_p){
-    if(temp<=0.f){ int b=0; for(int i=1;i<V;i++) if(lo[i]>lo[b]) b=i; return b; }
+    if(temp<=0.f){ int bad; return sample_finite_max(lo,V,&bad); }
     if(!(top_p>0.f&&top_p<1.f)) return serve_sample_sorted(lo,V,temp,top_p);   /* every token is in the nucleus */
-    float *prob=malloc((size_t)V*sizeof(float)), mx=lo[0];
+    int bad, best = sample_finite_max(lo, V, &bad);
+    if(bad) return best;
+    float *prob=malloc((size_t)V*sizeof(float)), mx=lo[best];
     if(!prob){ fprintf(stderr,"OOM sampling\n"); exit(1); }
-    for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
     double sum=0, bucket[256]={0};
     for(int i=0;i<V;i++){ float p=expf((lo[i]-mx)/temp); sum+=p; prob[i]=p; }
     double cut=top_p*sum, kept=0;
