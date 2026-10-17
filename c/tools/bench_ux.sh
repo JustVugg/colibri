@@ -17,7 +17,7 @@
 set -u
 GLM="${1:-./glm}"
 REPS="${REPS:-3}"
-export TEMP=0 DRAFT=0
+export COLI_TEMP=0 TEMP=0 DRAFT=0
 [ -n "${PIPE:-}" ] && export COLI_CUDA_PIPE="$PIPE"
 
 SHORT_PROMPT="Explain why the sky is blue in simple terms."
