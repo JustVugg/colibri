@@ -398,8 +398,8 @@ static void olmoe_vk_report(void) {
 #if defined(COLI_MATMUL_F16) && !defined(COLI_VULKAN)
 #define OLM_DENSE_F16 1
 #endif
-static int g_dense_f16 = 0;
 #ifdef OLM_DENSE_F16
+static int g_dense_f16 = 0;
 #define MATMUL_RESH(y, x, W, Wh, vk, S, I, O) do { if (Wh) matmul_f16w(y, x, Wh, S, I, O); else matmul(y, x, W, S, I, O); } while (0)
 #else
 #define MATMUL_RESH(y, x, W, Wh, vk, S, I, O) MATMUL_RES(y, x, W, vk, S, I, O)
@@ -2870,7 +2870,9 @@ int main(int argc, char **argv) {
     g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
     g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 0;
     g_fused3     = getenv("FUSED3") ? atoi(getenv("FUSED3")) : 0;
+#ifdef OLM_DENSE_F16
     g_dense_f16  = getenv("COLI_DENSE_F16") ? atoi(getenv("COLI_DENSE_F16")) : 1;   /* standalone engine only, see OLM_DENSE_F16 */
+#endif
     if (g_wide < 1) g_wide = 1;
     if (g_wide > 4) g_wide = 4;
     int hot_n  = getenv("HOT")   ? atoi(getenv("HOT"))   : 0;
