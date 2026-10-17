@@ -264,6 +264,46 @@ class DownloadTest(unittest.TestCase):
         os.replace(os.path.join(self.dst, "config.json"), os.path.join(other, "config.json"))
         self.assertFalse(setup_download.is_complete(self.dst, [other]))
 
+    def test_split_shard_checks_requested_digest_before_completing(self):
+        name = "model-00001.safetensors"
+        previous = self.spec(name)
+        other = Path(self.tmp.name, "second drive")
+        other.mkdir()
+        shard = other / name
+        stale = self.files[name]
+        shard.write_bytes(stale)
+        Path(self.src, name).write_bytes(b"x" * previous["size"])
+        spec = self.spec(name)
+        self.assertEqual(spec["size"], previous["size"])
+        self.assertNotEqual(spec["sha256"], previous["sha256"])
+        with self.assertRaises(setup_download.DownloadError) as caught:
+            setup_download.download_repo(REPO, "current", self.dst, [spec],
+                                         base=self.hub.base, extra_dirs=[str(other)])
+        self.assertIn(str(shard), str(caught.exception))
+        self.assertIn("checksum", str(caught.exception))
+        self.assertFalse(setup_download.read_manifest(self.dst)["complete"])
+        self.assertEqual(shard.read_bytes(), stale)
+        self.assertFalse(Path(self.dst, name).exists())
+
+    def test_split_shard_disabled_verification_and_absent_digest(self):
+        name = "model-00001.safetensors"
+        spec = self.spec(name)
+        other = Path(self.tmp.name, "second drive")
+        other.mkdir()
+        shard = other / name
+        stale = b"x" * spec["size"]
+        shard.write_bytes(stale)
+        for verify, listed in ((False, spec), (True, dict(spec, sha256=None, git_oid=None))):
+            with self.subTest(verify=verify):
+                before = len(self.hub.requests)
+                setup_download.download_repo(REPO, "current", self.dst, [listed],
+                                             base=self.hub.base, extra_dirs=[str(other)],
+                                             verify=verify)
+                self.assertTrue(setup_download.read_manifest(self.dst)["complete"])
+                self.assertEqual(shard.read_bytes(), stale)
+                self.assertEqual(len(self.hub.requests), before)
+                self.assertFalse(Path(self.dst, name).exists())
+
     def test_repository_download_refuses_existing_symlinks_outside_model_dir(self):
         os.makedirs(self.dst)
         for index, (linked_path, name) in enumerate(((Path(self.dst, "sub"), "sub/extra.bin"),
