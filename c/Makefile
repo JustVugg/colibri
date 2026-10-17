@@ -1661,6 +1661,13 @@ qwen36-tiny-v128-generate:
 		--emit-ref ./qwen36_tiny64_v128/ref_full.json
 	$(PYTHON) tools/convert_qwen36.py --model ./qwen36_tiny64_v128 --out ./qwen36_tiny64_v128_c --ebits 4 --gs 64
 
+# The prompt echo's completeness on this engine (scoring gate): a client that asks for
+# the numeric channel reads one ECHO frame per prompt position, starting at 0. Fails on
+# a read-out that starts at 1, and on a live prefix resumed while the channel is on.
+qwen36-echo-serve-check: qwen36-tiny-v128-generate qwen36$(EXE)
+	$(PYTHON) tests/qwen36_echo_serve_harness.py ./qwen36_tiny_v128_c
+	$(PYTHON) tests/qwen36_echo_serve_harness.py ./qwen36_tiny64_v128_c
+
 tests/test_spec_draft$(EXE): tests/test_spec_draft.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

@@ -5050,8 +5050,11 @@ def _engine_extension_args(engine_k):
 
     An empty mapping when nothing was requested, which is what keeps a plain request's
     header byte-identical to one built with no extension at all. When the channel is
-    requested it also asks for the seventh numeric field, which coli_submit_parse expects
-    before the first key=value token.
+    requested, the seventh numeric field goes ahead of the first key=value token -- but
+    only for the families whose SUBMIT header carries it (`submit_gbytes`):
+    coli_submit_parse reads seven fields, while a sibling engine's parser reads six and
+    takes its keys straight after top_p, so the extra field would land where it wants a
+    key and be answered with "bad submit extension".
 
     That is this helper's decision for THESE endpoints, not a property of the request
     builder. `gbytes_before_ext` is a per-call-site parameter, and the other caller that
@@ -5059,7 +5062,10 @@ def _engine_extension_args(engine_k):
     always sent; changing that endpoint's wire is not this change's to make."""
     if not engine_k:
         return {}
-    return {"logprobs": engine_k, "gbytes_before_ext": True}
+    args = {"logprobs": engine_k}
+    if family_by_id(ARCH).capabilities.submit_gbytes:
+        args["gbytes_before_ext"] = True
+    return args
 
 
 # An instruction the processor does not have: SIGILL on POSIX, STATUS_ILLEGAL_INSTRUCTION on
@@ -5685,12 +5691,22 @@ class Engine:
         # pre-tokenized token-id intake (`ids=`) are unrelated capabilities with separate
         # coli_submit_ext keys. The numeric channel is opened to an engine that keeps the
         # whole of its contract: a DATA tail on every generated token, and an ECHO frame
-        # for EVERY prompt position (" nan 0" at position 0) unless a pin photo covers the
-        # prefix -- which means never resuming a read-out from a live prefix. colibri.c
-        # (glm) and mimo.c do; the engines that score /v1/systemone options but resume
-        # read-outs from a live prefix would answer `echo` with a hole. Token-id intake
-        # is glm's alone: serve_codec.h, which mimo reads its frames with, has no `ids=`.
-        self.supports_logprobs_echo = arch in ("glm", "mimo")
+        # for EVERY prompt position (" nan 0" at position 0), which also means never
+        # resuming a read-out from a live prefix (such a prefix is not recomputed, so its
+        # positions would carry no frame). Whose wire keeps the contract is the family's
+        # own declaration (`logprobs_echo`): colibri.c (glm), mimo.c and qwen36.c do --
+        # qwen36 after its read-out learned to carry position 0 and to refuse a live
+        # prefix while the channel is on. An engine that answers `echo` with a hole gets
+        # its request refused by name instead of a 200 with every logprob shifted. Token-id
+        # intake is glm's alone: serve_codec.h, which mimo reads its frames with, has no
+        # `ids=`. The two conditions are independent: the family's wire declares the channel
+        # (`logprobs_echo`), and the engine has to run under its OWN rendering -- a chat
+        # flavor (CHAT_FLAVOR, resolved from the checkpoint's template before this
+        # constructor) swaps in another family's tool-call parser, which does not report the
+        # tool-call spans the alignment reads. ChatFlavorLogprobsGateTest keeps the two sets
+        # apart for every registry family.
+        self.supports_logprobs_echo = (family.capabilities.logprobs_echo
+                                       and CHAT_FLAVOR in (None, arch))
         self.supports_tok_ids = (arch == "glm")
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))

@@ -40,6 +40,21 @@ class FamilyCapabilities:
     # command) and generates nothing. The engine confirms it at start-up with
     # `CAPS decide=1 chat=0`, which is what the gateway routes on.
     decision: bool = False
+    # The numeric logprobs/echo channel (the SUBMIT `logprobs=` key): the engine
+    # emits one ECHO frame per prompt position it read out, position 0 included
+    # (" nan 0"), so the gateway can serve a run that starts at 0 -- which is what
+    # /v1/completions with `echo: true` promises and what a scoring harness reads.
+    # colibri.c, mimo.c and qwen36.c keep that contract. An engine that resumes a
+    # read-out from a live prefix without a pin photo answers it with a hole, and
+    # the gateway refuses that by name rather than shifting every logprob by one
+    # token (engine_pinned_prefix_not_echoed).
+    logprobs_echo: bool = False
+    # The family's SUBMIT header carries the seventh (gbytes) numeric field in front
+    # of the key=value extension keys -- the shape decode_batch.h's coli_submit_parse
+    # reads. The siblings speak a 6-field header (c/qwen36.c takes its keys straight
+    # after top_p), so handing them the extra field puts a bare `0` where their
+    # parser wants `key=value` and the engine answers "bad submit extension".
+    submit_gbytes: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1344,7 +1359,8 @@ FAMILIES = (
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         config_section="root",
         limits=FamilyLimits(4096, 1048576, 1024, 16384, 16, 0, "CTX"),
-        capabilities=FamilyCapabilities(True, True, False, True),
+        capabilities=FamilyCapabilities(True, True, False, True,
+                                        logprobs_echo=True, submit_gbytes=True),
         has_gateway_adapter=True,
         has_cli_adapter=True,
         tune_prompt_template="[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>",
@@ -1506,7 +1522,8 @@ FAMILIES = (
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         config_section="text_config",
         limits=FamilyLimits(8192, 262144, 1024, 8192, 16, 8, "Q36_MAXT"),
-        capabilities=FamilyCapabilities(True, False, False, True, image=True),
+        capabilities=FamilyCapabilities(True, False, False, True, image=True,
+                                        logprobs_echo=True),
         has_gateway_adapter=True,
         # coli run stays unwired on purpose: cmd_run dispatches per arch after
         # this gate, and without a qwen36 branch the engine would inherit GLM's
@@ -1672,7 +1689,8 @@ FAMILIES = (
         limits=FamilyLimits(8192, 1048576, 1024, 16384, 16, 16, "CTX"),
         # tools (the XML call form, parse_mimo_tool_calls), thinking (on by default,
         # as the template has it); no grammars, no audio in or out
-        capabilities=FamilyCapabilities(True, False, False, True, image=True),
+        capabilities=FamilyCapabilities(True, False, False, True, image=True,
+                                        logprobs_echo=True, submit_gbytes=True),
         has_gateway_adapter=True,
         # the engine is driven through the gateway (SERVE); coli run has no mimo
         # branch and would fall through to GLM's binary, as for deepseek_v41

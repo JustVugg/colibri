@@ -125,6 +125,25 @@ class FamilyRegistryTest(unittest.TestCase):
                 json.dumps(public_metadata(family))
                 self.assertIn(family.id, by_id)
 
+    def test_the_wire_capabilities_follow_the_engines_own_submit_contract(self):
+        # `logprobs_echo` is the numeric logprobs/echo channel: the engine emits one ECHO
+        # frame per prompt position it read out, position 0 included. `submit_gbytes` is
+        # the header SHAPE -- the seventh numeric field coli_submit_parse reads, which a
+        # sibling engine's six-field parser would take for a malformed key and answer with
+        # "bad submit extension". Neither is published metadata: they describe the engine
+        # link, not the user surface.
+        by_id, _ = _build_registry(FAMILIES)
+        for family_id, echo, gbytes in (("glm", True, True), ("mimo", True, True),
+                                        ("qwen36", True, False), ("inkling", False, False),
+                                        ("kimi", False, False), ("olmoe", False, False)):
+            with self.subTest(family=family_id):
+                self.assertIs(by_id[family_id].capabilities.logprobs_echo, echo)
+                self.assertIs(by_id[family_id].capabilities.submit_gbytes, gbytes)
+        # The positional flags keep their meaning and both new bits default to off.
+        caps = FamilyCapabilities(True, False, False, True)
+        self.assertFalse(caps.logprobs_echo)
+        self.assertFalse(caps.submit_gbytes)
+
     def test_capabilities_carry_the_image_bit_for_families_with_an_image_path(self):
         # The bit says the gateway has a placeholder expansion for the family. Whether
         # the checkpoint being served actually loaded its tower is the engine's word

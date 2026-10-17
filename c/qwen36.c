@@ -5360,6 +5360,15 @@ static float *step_ex(Model *m, const int *ids, int S, int pos_base, int nlogits
          * l'opzione perderebbe il suo primo token, che spesso e l'unico. */
         if (g_pin_use_logit && g_pin_logit)
             serve_echo(g_echo_id, pos_base, ids[0], g_pin_logit, c->vocab, g_echo_k);
+        else if (pos_base == 0)
+            /* Nothing conditions position 0: its predictor is a state that does not exist
+             * (a fresh slot has no previous token), and the case above is the only way to
+             * hold one. Emit the same " nan 0" placeholder colibri.c's mux_echo writes for
+             * an echo's position 0 (coli_logprob_tail: lo==NULL), which the gateway maps to
+             * OpenAI's null. Without this frame the read-out starts at position 1 and the
+             * gateway refuses the request by name rather than shifting every logprob by
+             * one token. */
+            serve_echo(g_echo_id, pos_base, ids[0], NULL, c->vocab, 0);
         for (int p = 0; p + 1 < S; p++) {
             rmsnorm_row(erow, x + (int64_t)p*D, m->final_norm, D, c->eps);
             if (!qt_lmhead_matmul(elog, erow, D, c->vocab))
@@ -6461,6 +6470,14 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         if (pinned) { reuse = pinned; g_pin_use_logit = 1; }
     }
     g_echo_k = q->logprobs; g_echo_id = q->id;
+    /* The read-out promises a frame for EVERY prompt position, starting at 0. A live
+     * prefix is not recomputed, so its positions would carry no frame at all -- the hole
+     * the gateway refuses by name (engine_pinned_prefix_not_echoed) rather than serving
+     * logprobs shifted by a token. A request that asked for the channel therefore never
+     * resumes one: it is a scoring request, not a chat turn, and it pays a full prefill.
+     * The pin path above is untouched -- a photograph carries the logits for the position
+     * that follows it, so it still resumes. */
+    if (g_echo_k > 0 && !g_pin_use_logit) reuse = 0;
     if (!reuse) { reset_recurrent(m); m->kv_len = 0; }
     /* Per-REQUEST state, not per-process: without this the server keeps the
      * first request's prefill flag and expert-collection set forever, so
