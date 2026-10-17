@@ -1425,7 +1425,9 @@ def _k3_parse_arguments(raw):
     skip()
     if idx >= len(s) or s[idx] != "{": return None
     idx += 1; skip()
-    if idx < len(s) and s[idx] == "}": return []
+    if idx < len(s) and s[idx] == "}":
+        idx += 1; skip()
+        return [] if idx == len(s) else None
     out = []
     try:
         while True:
@@ -1441,7 +1443,7 @@ def _k3_parse_arguments(raw):
             skip()
             if idx >= len(s): return None
             c = s[idx]; idx += 1; skip()
-            if c == "}": return out
+            if c == "}": return out if idx == len(s) else None
             if c != ",": return None
     except (json.JSONDecodeError, ValueError):
         return None
