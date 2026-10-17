@@ -10187,6 +10187,66 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     r->active=0;
 }
 
+/* Cross-slot KV prefix adoption (COLI_KV_SHARE=1) — RadixAttention's benefit
+ * at memcpy cost: if another slot's history shares a longer prefix with
+ * this prompt (shared system prompt, agent loop), copy its KV rows instead
+ * of recomputing them. MLA rows are position-addressed and self-contained
+ * (the same per-position serialization .coli_kv relies on), so a raw row
+ * copy is exact — the adopted prefill is skipped, not approximated.
+ * Copying beats aliasing here: step_decode_batch rejects two rows sharing
+ * one KVState, and a copy keeps every slot's lifetime independent.
+ * Measured (6x5090, 675-token shared prefix): slot TTFT 50.1s -> 1.7s,
+ * generated tokens identical to the full-prefill run.
+ *
+ * The copy covers every KV representation the slot can hold: the f32 Lc/Rc
+ * rows (NULL under KV8/KV_TQ), the always-f32 index rows Ic, and — #2096 —
+ * the KV8/KV_TQ byte rows Lc8/Rc8 plus their per-row scales Lsc/Rsc. Note
+ * the asymmetric scale strides: under KV8, Lsc holds
+ * coli_kv8_nscale(kv_lora, g_kv8_gs) group scales per row while Rsc holds a
+ * single scale per row; under KV_TQ both hold one float per row (the
+ * radius). The history comes from the donor slot — the donor-selection loop
+ * in mux_submit only picks a slot whose hist matches the incoming prompt on
+ * [0,blen), so this is identical to copying tmp. Separated from mux_submit
+ * so the #2096 gate (tests/test_kv_share_kv8.c) can exercise it directly. */
+static void coli_kv_share_adopt_rows(Cfg *cc, KVState *sc, KVState *dn,
+                                     int *sc_hist, const int *dn_hist,
+                                     int from, int n){
+    int NR=cc->n_layers+1;
+    for(int l=0;l<NR;l++){
+        if(sc->Lc[l]&&dn->Lc[l])
+            memcpy(coli_kv_row(sc->Lc[l],from,cc->kv_lora),
+                   coli_kv_row(dn->Lc[l],from,cc->kv_lora),
+                   (size_t)n*cc->kv_lora*sizeof(float));
+        if(sc->Rc[l]&&dn->Rc[l])
+            memcpy(coli_kv_row(sc->Rc[l],from,cc->qk_rope),
+                   coli_kv_row(dn->Rc[l],from,cc->qk_rope),
+                   (size_t)n*cc->qk_rope*sizeof(float));
+        if(sc->Ic&&dn->Ic&&sc->Ic[l]&&dn->Ic[l])
+            memcpy(coli_kv_row(sc->Ic[l],from,cc->index_hd),
+                   coli_kv_row(dn->Ic[l],from,cc->index_hd),
+                   (size_t)n*cc->index_hd*sizeof(float));
+        /* #2096: under KV8/KV_TQ the f32 Lc/Rc row arrays are NULL and
+         * the cache lives in the byte rows Lc8/Rc8 plus the per-row
+         * scales Lsc/Rsc. Copy both here so the adopted range is not
+         * left uninitialized. Same guard style as the f32 paths above. */
+        if((g_kv8||g_tq)&&sc->Lc8[l]&&dn->Lc8[l]){
+            int lb=g_tq?coli_kvq_row_bytes(cc->kv_lora,g_tq_bits,g_tq_codec):cc->kv_lora;
+            memcpy(coli_kv_row8(sc->Lc8[l],from,lb),
+                   coli_kv_row8(dn->Lc8[l],from,lb),(size_t)n*lb);
+            int nsl=g_kv8?coli_kv8_nscale(cc->kv_lora,g_kv8_gs):1;
+            memcpy(sc->Lsc[l]+(int64_t)from*nsl,
+                   dn->Lsc[l]+(int64_t)from*nsl,(size_t)n*nsl*sizeof(float));
+        }
+        if((g_kv8||g_tq)&&sc->Rc8[l]&&dn->Rc8[l]){
+            int rb=g_tq?coli_kvq_row_bytes(cc->qk_rope,g_tq_bits,g_tq_codec):cc->qk_rope;
+            memcpy(coli_kv_row8(sc->Rc8[l],from,rb),
+                   coli_kv_row8(dn->Rc8[l],from,rb),(size_t)n*rb);
+            memcpy(sc->Rsc[l]+from,dn->Rsc[l]+from,(size_t)n*sizeof(float));
+        }
+    }
+    memcpy(sc_hist+from,dn_hist+from,(size_t)n*sizeof(int));
+}
+
 /* Read and prefill one request. Returns -1 on EOF, 0 for a rejected frame and
  * 1 for an accepted request. Prefill deliberately remains serial: continuous
  * batching starts at decode, where every active slot contributes one row. */
@@ -10343,16 +10403,9 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     }
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
         kv_disk_truncate(m,sc->len); }
-    /* Cross-slot prefix adoption (COLI_KV_SHARE=1) — RadixAttention's benefit
-     * at memcpy cost: if another slot's history shares a longer prefix with
-     * this prompt (shared system prompt, agent loop), copy its KV rows instead
-     * of recomputing them. MLA rows are position-addressed and self-contained
-     * (the same per-position serialization .coli_kv relies on), so a raw row
-     * copy is exact — the adopted prefill is skipped, not approximated.
-     * Copying beats aliasing here: step_decode_batch rejects two rows sharing
-     * one KVState, and a copy keeps every slot's lifetime independent.
-     * Measured (6x5090, 675-token shared prefix): slot TTFT 50.1s -> 1.7s,
-     * generated tokens identical to the full-prefill run. */
+    /* Cross-slot prefix adoption (COLI_KV_SHARE=1): if another slot's history
+     * shares a longer prefix with this prompt, copy its KV rows instead of
+     * recomputing them — see coli_kv_share_adopt_rows for the full rationale. */
     static int kvshare=-1;
     if(kvshare<0) kvshare=getenv("COLI_KV_SHARE")?atoi(getenv("COLI_KV_SHARE")):0;
     if(kvshare && !echo && nctx>1 && prefix>=sc->len){
@@ -10365,23 +10418,11 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
             if(p>blen){ blen=p; best=i; }
         }
         if(best>=0){
-            ServeCtx *dn=&ctx[best]; Cfg *cc=&m->c; int NR=cc->n_layers+1;
+            ServeCtx *dn=&ctx[best]; Cfg *cc=&m->c;
             int from=sc->len, n=blen-from;
-            for(int l=0;l<NR;l++){
-                if(sc->kv.Lc[l]&&dn->kv.Lc[l])
-                    memcpy(coli_kv_row(sc->kv.Lc[l],from,cc->kv_lora),
-                           coli_kv_row(dn->kv.Lc[l],from,cc->kv_lora),
-                           (size_t)n*cc->kv_lora*sizeof(float));
-                if(sc->kv.Rc[l]&&dn->kv.Rc[l])
-                    memcpy(coli_kv_row(sc->kv.Rc[l],from,cc->qk_rope),
-                           coli_kv_row(dn->kv.Rc[l],from,cc->qk_rope),
-                           (size_t)n*cc->qk_rope*sizeof(float));
-                if(sc->kv.Ic&&dn->kv.Ic&&sc->kv.Ic[l]&&dn->kv.Ic[l])
-                    memcpy(coli_kv_row(sc->kv.Ic[l],from,cc->index_hd),
-                           coli_kv_row(dn->kv.Ic[l],from,cc->index_hd),
-                           (size_t)n*cc->index_hd*sizeof(float));
-            }
-            memcpy(sc->hist+from,tmp+from,(size_t)n*sizeof(int));
+            /* the donor's hist matches tmp on [0,blen) by selection, so the
+             * history copy below is identical to copying tmp. */
+            coli_kv_share_adopt_rows(cc,&sc->kv,&dn->kv,sc->hist,tmp,from,n);
 #ifdef COLI_VULKAN
             glmc_host_rows(m,&sc->kv,from);   /* the dense chain's mirror of this slot, from `from` on */
 #endif

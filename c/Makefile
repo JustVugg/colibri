@@ -2145,6 +2145,13 @@ tests/test_kv_fp8$(EXE): tests/test_kv_fp8.c
 tests/test_kv_tq$(EXE): tests/test_kv_tq.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# #2096 gate: exercises coli_kv_share_adopt_rows (the COLI_KV_SHARE cross-slot
+# adoption routine) under KV8 and KV_TQ — donor "fully prefilled", receiver
+# adopts [from,from+n), rows dequantized and compared. Includes colibri.c
+# like test_kv_alloc (kv_alloc + the adopt routine live there).
+tests/test_kv_share_kv8$(EXE): tests/test_kv_share_kv8.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
 tests/test_kv_disk$(EXE): tests/test_kv_disk.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
