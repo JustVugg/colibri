@@ -159,6 +159,21 @@ class DoctorTest(unittest.TestCase):
         report = self.report(gpu_indices=None, linkage={"linked": False, "missing": True, "vulkan": True})
         self.assertEqual(self.checks_by_id(report)["accelerator.gpu"]["status"], "fail")
 
+    def test_vulkan_plan_respects_explicit_cpu_selection(self):
+        device = {'name': 'Fixture GPU', 'type': 'discrete'}
+        with mock.patch('setup_hw.detect_vulkan', return_value={'devices': [device]}):
+            report = self.report(gpu_indices=[], linkage={
+                'linked': True, 'missing': False, 'vulkan': True})
+        self.assertEqual(self.checks_by_id(report)['accelerator.gpu']['status'], 'skip')
+        self.assertIsNone(report['plan']['vulkan'])
+
+    def test_cpu_binary_does_not_inherit_vulkan_placement_from_environment(self):
+        device = {'name': 'Fixture GPU', 'type': 'discrete'}
+        with mock.patch.dict(os.environ, {'COLI_VULKAN': '1'}), \
+                mock.patch('setup_hw.detect_vulkan', return_value={'devices': [device]}):
+            report = self.report(gpu_indices=None, linkage={'linked': False, 'missing': False})
+        self.assertIsNone(report['plan']['vulkan'])
+
     def test_cpu_engine_with_detected_gpu_is_only_a_warning(self):
         gpu = {"index": 0, "name": "fixture", "total_bytes": 12 * GB,
                "free_bytes": 10 * GB}
