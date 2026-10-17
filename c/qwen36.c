@@ -1624,6 +1624,11 @@ static int g_q36_vk_dev;          /* the device vk_qw_tensor uploads a new matri
  * f16 with COLI_DENSE_BITS=16, else f32), its rows and its scales. */
 static int vk_qw_fmt(const QW *w, const void **wq, const float **sc) {
     if (w->vk_gone) { *wq = NULL; *sc = NULL; return w->vk_fmt; }
+    if (w->gq) {   /* a GGUF's: its blocks, the file's type (vk_qw_tensor gives the device the file's rows) */
+        const int base = gq_r16_base(w->gq_type);
+        *wq = w->gq; *sc = NULL;
+        return 100 + (base >= 0 ? base : w->gq_type);
+    }
     if (w->q4) { *wq = w->q4; *sc = w->sg; return 4; }
     if (w->q) { *wq = w->q; *sc = w->sc; return 1; }
     if (w->h) { *wq = w->h; *sc = NULL; return 14; }
@@ -1648,6 +1653,19 @@ static ColiVkTensor *vk_qw_tensor(const QW *w) {
     int fmt = vk_qw_fmt(w, &wq, &sc), gs = fmt == 4 ? 64 : 0;
     if (!wq) return NULL;
     int ok;
+    if (w->gq) {   /* a GGUF's blocks for the dense chain (blockdec.glsl), as the file has them */
+        const int be = coli_vk_block_elems(fmt);
+        if (w->gs != 1.f || !be || I % be) { mw->vk_off = 1; return NULL; }   /* no device form, or a scale the shader lacks */
+        uint8_t *rows = NULL;
+        if (gq_r16_base(w->gq_type) >= 0 && !(rows = malloc((size_t)gq_row_bytes(fmt - 100, I) * O))) { mw->vk_off = 1; return NULL; }
+        if (rows) gq_r16_unpack(w->gq_type, rows, w->gq, O, I);
+        const void *src = rows ? (const void *)rows : (const void *)w->gq;
+        ok = g_q36_vk_dev ? coli_vk_tensor_ensure2(t, src, NULL, fmt, I, O, 0) : coli_vk_tensor_ensure(t, src, NULL, fmt, I, O, 0);
+        free(rows);
+        if (!ok) { mw->vk_off = 1; return NULL; }
+        g_vk_placed[2]++;
+        return *t;
+    }
     /* On an integrated device these are already one shared allocation. Retain
      * it instead of moving the same physical bytes into a smaller logical
      * device-local heap. q36_dho_drop keeps imported pages alive. */
@@ -2369,8 +2387,8 @@ static float *load_t_n(Model *m, const char *name, int64_t want) {
  * interleaved by 16 (gq_r16_*, GQ_*_R16), the same bytes or a few percent more,
  * on an AVX2 or AVX-512 build, when the type has that form and the matrix whole
  * groups; else the file's rows. Q36_ILV16=0 keeps the file's rows, as GQ_EXACT=1
- * does. Only the CPU reads these copies: the Vulkan tier gets the file's rows
- * back (vk_slot_src, gq_rows_i8), the dense chain and CUDA take no GGUF. */
+ * does. Only the CPU reads these copies: the Vulkan tier and the dense chain get
+ * the file's rows back (vk_slot_src, vk_qw_tensor), CUDA takes no GGUF. */
 static int q36_gq_held(int type, int rows, int cols) {
 #ifdef GQ_R16_ON
     static int on = -1;
@@ -7574,10 +7592,6 @@ int main(int argc, char **argv) {
     /* measured on a Radeon 780M: decode and prefill both faster (docs/vulkan.md) */
     if (g_vk_ready && !qq_active())
         g_vk_chain = coli_vk_chain_decide("qwen36", vkt_wanted() && m.c.n_experts > 0, COLI_VK_CHAIN_ON);
-    if (g_vk_chain && g_gguf) {   /* the chain reads colibri's own dense formats, not ggml blocks */
-        fprintf(stderr, "[VK] qwen36: GGUF weights: the dense chain stays off, the expert tier takes the experts\n");
-        g_vk_chain = 0;
-    }
     if (g_vk_chain && g_q36_mux_slots > 1) {
         g_vk_chain = 0;
         fprintf(stderr, "[VK] qwen36: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "

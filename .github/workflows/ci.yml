@@ -193,8 +193,10 @@ jobs:
           # ASan and UBSan
           - family: qwen-chain
             req: c/tools/requirements-qwen38-tiny.txt
+            extra: gguf>=0.19   # the GGUF chain gates write their tiny model with gguf-py
           - family: qwen-chain-sanitize
             req: c/tools/requirements-qwen38-tiny.txt
+            extra: gguf>=0.19
           # speculative decoding with deeper verifies (MTP drafts up to 3, prompt-lookup
           # drafts up to 5) on qwen36 and qwen38: against plain decoding on the CPU and
           # in the dense chain, and the same under ASan and UBSan
@@ -208,6 +210,7 @@ jobs:
             req: c/tools/requirements-qwen38-tiny.txt
           - family: qwen-chain-staged
             req: c/tools/requirements-qwen38-tiny.txt
+            extra: gguf>=0.19
           # staged uploads failing at every point they can (COLI_VK_STAGED_FAULT): qwen36's
           # matrices, tier and chain, colibri's KV mirror; the CPU's tokens, and the same
           # under ASan and UBSan

@@ -745,6 +745,8 @@ VK_SPV   += shaders/chain_ares.spv
 VK_SPV   += shaders/chain_route.spv
 # the routed experts on the device, their weights by address (vk_chain.h: vkc_moe)
 VK_SPV   += shaders/chain_moe.spv
+# a GGUF's dense matrices on the chain, one pipeline per block type (vk_chain.c: matmul_bd)
+VK_SPV   += shaders/chain_gemv_bd.spv
 # inkling's chain ops (made on first use): the short convolution and the attention
 # with its relative-position bias
 VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv
@@ -916,8 +918,11 @@ shaders/qmatmul_grp_gemv_gate_up.spv: shaders/qmatmul_grp_gemv.comp
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
 vk_chain.o: vk_chain.c .build-config
 	$(CC) $(CFLAGS) -c vk_chain.c -o $@
-# the block formats' decoders (fmt >= 100), included by the two GEMV shaders
-shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv: shaders/blockdec.glsl shaders/blockdec_table.h
+# the block formats' decoders (fmt >= 100), included by the GEMV shaders and the chain's
+# routed experts; the chain's block GEMV reads the same table
+shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv shaders/chain_moe.spv: shaders/blockdec.glsl shaders/blockdec_table.h
+# the per-type decoders of the chain's block GEMV and of its routed experts
+shaders/chain_gemv_bd.spv shaders/chain_moe.spv: shaders/bdstep.glsl shaders/blockdec_table.h
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@

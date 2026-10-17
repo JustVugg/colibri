@@ -223,6 +223,7 @@ int    coli_vk_tensor_commit(ColiVkTensor *const *t, int n);
 int    coli_vk_staged(void);   /* 1 = resident data goes to the device through staged uploads */
 size_t coli_vk_tensor_row_bytes(int fmt, int I);
 int coli_vk_block_elems(int fmt);   /* block formats (100 + ggml type, 200-203): elements per block; else 0 */
+void *coli_vk_block_table_dev(int dev);   /* the VkBuffer their GEMVs read at binding 2 (blockdec_table.h), NULL without it */
 int coli_vk_set_vq2_books(const int8_t *a, const int8_t *b);   /* fmt 203's codebooks (256 x 8 int8 each) */
 /* What coli_vk_tensor_ensure(fmt, I, O, gs) adds to coli_vk_mem_info's bytes: the rows
  * at their padded stride and the scales (0 for a grouped format without a group size). */

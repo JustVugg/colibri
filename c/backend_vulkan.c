@@ -4413,10 +4413,14 @@ static uint64_t vk_addr(VkBuffer b) {
 int coli_vk_xb_expert_entry(const ColiVkExpert *e, uint32_t *o) {
     if (!e || !o || !G.ready || !G.has_bda) return 0;
     const ColiVkTensor *t[3] = {e->g, e->u, e->d};
-    for (int k = 0; k < 3; k++) if (!t[k] || t[k]->dev || !t[k]->pool || !pool_bda(t[k]->pool) || !t[k]->sbuf) return 0;
+    /* a block format (a GGUF's experts) has no scales: chain_moe.comp reads its blocks and
+     * the table, and the entry's scale address stays its weights' (never read) */
+    for (int k = 0; k < 3; k++)
+        if (!t[k] || t[k]->dev || !t[k]->pool || !pool_bda(t[k]->pool) || (!t[k]->sbuf && !bd_fmt(t[k]->fmt)) ||
+            (bd_fmt(t[k]->fmt) && (t[k]->fmt >= 200 || t[k]->I % 32))) return 0;
     memset(o, 0, COLI_VK_XB_ENTRY * sizeof *o);
     for (int k = 0; k < 3; k++) {
-        uint64_t w = vk_addr(t[k]->wbuf), s = vk_addr(t[k]->sbuf);
+        uint64_t w = vk_addr(t[k]->wbuf), s = t[k]->sbuf ? vk_addr(t[k]->sbuf) : w;
         o[4 * k] = (uint32_t)w; o[4 * k + 1] = (uint32_t)(w >> 32);
         o[4 * k + 2] = (uint32_t)s; o[4 * k + 3] = (uint32_t)(s >> 32);
     }
@@ -5211,6 +5215,7 @@ int coli_vk_staged(void) { return G.ready && g_up[0].on; }
 size_t coli_vk_tensor_row_bytes(int fmt, int I) { return cpu_row_bytes(fmt, I); }
 /* elements per block of a block format (shaders/blockdec.glsl), 0 for any other format */
 int coli_vk_block_elems(int fmt) { return !bd_fmt(fmt) || !bd_shaders() ? 0 : fmt == 203 ? 64 : fmt >= 200 ? 128 : (int)BD_BLK[fmt - 100]; }
+void *coli_vk_block_table_dev(int dev) { return bd_shaders() ? (void *)bdtab_buf(dev == 1 ? 1 : 0) : NULL; }
 /* vq2's codebooks (two 256 x 8 int8, row-major) into the table buffer. The table is built
  * once, at the first block-format tensor: call this before (the tier's start); -1 when a
  * table is already on a device with other books. */

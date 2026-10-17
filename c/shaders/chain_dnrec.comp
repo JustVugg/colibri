@@ -10,6 +10,9 @@
 //   S    *= decay;  kv = k . S;  delta = (v - kv) * beta;  S += k (x) delta;  o = q . S
 //   y[s][h*VD + v] = o * rsqrt(mean(o^2) + eps) * norm[v] * gate(z[s][h*VD + v])
 // with gate = silu (flags 0, Qwen3.6) or sigmoid (flags 1, Qwen3.8's gated norm).
+// A GGUF's layout (qwen36.c g_ssm_a_direct, g_dn_tiled): flags 2, the parameter is A itself
+// (-exp(A_log), decay = exp(A * softplus(..))); flags 4, the value heads tiled, so value
+// head h reads key head h % KH.
 // Every column runs the CPU's own sequence of products and sums (the k loop in order);
 // the norms reduce in float where the CPU uses double.
 // snap_row >= 0: the state after that row is also written to snap (MTP verify).
@@ -51,7 +54,7 @@ void main() {
     int h = int(gl_WorkGroupID.x);
     int v = int(gl_LocalInvocationID.x);
     bool own = v < p.VD;
-    int kh = h / (p.VH / p.KH);
+    int kh = (p.flags & 4) != 0 ? h % p.KH : h / (p.VH / p.KH);
     float col[KD];
     int sb = p.st_off + h * KD * p.VD, nb = p.snap_off + h * KD * p.VD;
     [[unroll]] for (int k = 0; k < KD; k++) col[k] = own ? st[sb + k * p.VD + v] : 0.0;
@@ -78,7 +81,7 @@ void main() {
         barrier();
         float bv = ab[p.b_off + s * p.b_row + h], av = ab[p.a_off + s * p.a_row + h];
         float beta = 1.0 / (1.0 + exp(-bv));
-        float decay = exp(-exp(alog) * softplus(av + dtb));
+        float decay = exp(((p.flags & 2) != 0 ? alog : -exp(alog)) * softplus(av + dtb));
         float o = 0.0;
         if (own) {
             float vin = cv[cb + 2 * p.Ktot + h * p.VD + v];
