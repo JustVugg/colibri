@@ -1926,6 +1926,8 @@ family_qwen_spec() {
   for f in cycle row2 row3; do
     chain_gate qwen38 "spec chain qwen38 MTP depth 3 $f, tier on" 1 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_DRAFTS=3 \
       Q38_MTP_FORCE=$f SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+    # the drafts' logits from the chain's lm_head (q38c_draft_logits), the CPU arm's from its own
+    grep -q "MTP drafts' logits here" vk.log || { cat vk.log; fail "spec chain qwen38 MTP depth 3 $f: no draft's logits on the device"; }
     chain_gate qwen36 "spec chain qwen36 lookup $f, tier on" 1 COLI_DENSE_I8=0 COLI_LOOKUP=1 COLI_SPEC_GATE=0 \
       COLI_LOOKUP_FORCE=$f SNAP=qwen36_tiny_v128_c -- 8 8 qwen36_tiny_v128/ref_full.json
   done

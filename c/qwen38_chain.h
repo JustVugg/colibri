@@ -85,7 +85,7 @@ typedef struct {
     VkcBuf *mixd, *lgd, *kvd, *outd, *hypd, *find, *routed, *cs, *pcs;
     VkcBuf *gseg, *nseg;              /* a deep verify's PLE rows past its first copy (q38c_ple) */
     float *host_routed, *host_emb;
-    unsigned long long forwards;
+    unsigned long long forwards, drafts;   /* drafts: the MTP head's logits computed here (q38c_draft_logits) */
     double host_ms;
     VkcDmoe dm;                                /* the routed experts in the frame (vk_dmoe.h) */
 } Q38Chain;
@@ -1203,17 +1203,41 @@ static int q38c_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
     return r2;
 }
 
+/* The MTP head's draft logits on the device that holds the lm_head (the chain's tail): one
+ * row's GEMV and the vocabulary's floats read back, where the CPU's pass reads the whole
+ * matrix (Qwen3.8-Flash-Next's IQ4_XS lm_head: 337 MiB a draft, 12 ms on the 20 cores of
+ * an RTX PRO 4000's host, about 1 ms on the card). A draft is a proposal the verify
+ * checks, so the device's order of the sums changes no output. 0: the CPU's way. */
+static int q38c_draft_logits(Model *m, float *logit, const float *x) {
+    if (!g_vk_chain || qt_ready() || m->lm_head.rows != m->c.vocab) return 0;
+    Q38Chain *ch = NULL;
+    for (int d = 0; d < 2 && !ch; d++) {
+        Q38Chain *c = q38c_of(m, d);
+        if (c && c->ok && !c->failed && c->head && c->outd && c->mixed) ch = c;
+    }
+    ColiVkTensor *t = ch ? q38c_t(&m->lm_head) : NULL;
+    if (!t) return 0;
+    int was = vkc_device(ch->d);
+    int ok = !vkc_lost() && vkc_begin() && vkc_write(ch->mixed, 0, x, (size_t)m->c.hidden * sizeof(float)) &&
+             vkc_matmul(t, ch->mixed, 0, ch->outd, 0, 1) && vkc_submit(1);
+    if (ok) { memcpy(logit, vkc_ptr(ch->outd), (size_t)m->c.vocab * sizeof(float)); ch->drafts++; }
+    vkc_device(was);
+    return ok;
+}
+
 static void q38c_report(Model *m) {
     for (int d = 0; d < 2 && m; d++) {
         Q38Chain *ch = q38c_of(m, d);
         if (!ch || !ch->ok || !ch->forwards) continue;
         int was = vkc_device(d);
         VkcStats st; vkc_stats(&st);
+        char dl[64] = "";
+        if (ch->drafts) snprintf(dl, sizeof dl, ", %llu MTP drafts' logits here", ch->drafts);
         fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
                         "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %llu layer steps with "
-                        "the routed experts in the frame, %.1f MiB on the device\n",
+                        "the routed experts in the frame, %.1f MiB on the device%s\n",
                 q38c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
-                ch->dm.steps, st.dev_bytes / 1048576.0);
+                ch->dm.steps, st.dev_bytes / 1048576.0, dl);
         vkc_kv_report(&ch->ks);
         vkc_prof_print();
         vkc_device(was);

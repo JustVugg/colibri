@@ -3606,8 +3606,14 @@ static void q38_draft_head_build(Model *m) {
             ((double)V*xf_row_bytes(H)+(double)V*xf_groups(H)*sizeof(float))/1073741824.0,now_s()-t0);
 }
 /* logit[V] for one row x[H]: the draft head when there is one, else lm_head */
+#ifdef COLI_VULKAN
+static int q38c_draft_logits(Model *m,float *logit,const float *x);   /* qwen38_chain.h */
+#endif
 static void q38_draft_logits(Model *m,float *logit,const float *x) {
     const int V=m->lm_head.rows,H=m->lm_head.cols;
+#ifdef COLI_VULKAN
+    if(q38c_draft_logits(m,logit,x))return;   /* the device's lm_head, where the chain holds it */
+#endif
     if(!m->draft_codes){q38_weight_matmul(logit,x,&m->lm_head,1,H,V);return;}
     int8_t *xq=(int8_t*)malloc((size_t)H);float *xsum=falloc(H/XF_BLOCK);
     if(!xq){fprintf(stderr,"OOM draft activation\n");exit(1);}
