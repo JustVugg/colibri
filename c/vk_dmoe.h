@@ -121,6 +121,7 @@ static int vkc_dmoe_layer(VkcDmoe *d, int layer, int n, VkcBuf *lg, VkcBuf *bias
     VkcMoe m = *mp;
     m.S = n; m.K = d->K; m.t_off = i * d->E; m.x_off = 0; m.x_row = mp->D; m.i_off = io; m.i_row = d->K;
     m.w_off = 0; m.w_row = d->K; m.y_off = 0; m.y_row = mp->D;
+    if (!m.gfmt && d->tabh) m.gfmt = (int)d->tabh[(size_t)i * d->E * COLI_VK_XB_ENTRY + 12];   /* the layer's gate/up format */
     if (!vkc_route(lg, bias, d->rid, d->rwt, &r) || !vkc_moe(x, d->rid, d->rwt, d->tab, d->hid, d->y, &m)) return 0;
     d->steps++;
     return 1;

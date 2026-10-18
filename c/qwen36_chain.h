@@ -76,6 +76,7 @@
 #include "vk_kvsplit.h"
 #include "vk_dmoe.h"
 
+#define Q36C_GGUF_ROWS 16   /* a GGUF's steps of more rows than this decline (q36c_forward) */
 #define Q36C_HOST 0
 #define Q36C_DEV  1
 #define Q36C_BOTH 2
@@ -393,7 +394,7 @@ static int q36c_bufs(Q36Chain *ch, Model *m, int rows);
 static int q36c_imports(const QW *w, int fmt, const void *wq) {
     const char *e = getenv("COLI_VK_DENSE_HOST");
     int only = coli_vk_dense_device_only() || (e && *e && atoi(e) == 0);
-    return g_vk_import && (coli_vk_device_integrated() || !only) && fmt != 4 && w->w != wq;
+    return g_vk_import && (coli_vk_device_integrated() || !only) && fmt != 4 && fmt < 100 && w->w != wq;   /* block formats: copied */
 }
 /* w as vk_qw_tensor places it: its device bytes (dev) and what coli_vk_mem_info counts
  * for it (mat); nothing for a matrix that is not loaded or stays on the CPU */
@@ -755,7 +756,8 @@ static int q36c_deltanet(Q36Chain *ch, Model *m, Layer *l, int i, int n, int c0,
         VkcBuf *rs = ns ? ch->rec_snap[c0 + r][i] : NULL, *cs = ns ? ch->ring_snap[c0 + r][i] : NULL;
         VkcDnConv cp = {len, CD, c->dn_convk, s0 * CD, CD, s0 * CD, CD, snap_row, 0, (int)ch->o_conv[i], 0, 0};
         VkcDnRec rp = {len, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s0 * CD, CD, s0 * 2 * vh, 2 * vh,
-                       vh + s0 * 2 * vh, 2 * vh, s0 * vd, vd, s0 * vd, vd, snap_row, 0, c->eps,
+                       vh + s0 * 2 * vh, 2 * vh, s0 * vd, vd, s0 * vd, vd, snap_row,
+                       (g_ssm_a_direct ? 2 : 0) | (g_dn_tiled ? 4 : 0), c->eps,
                        1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
         ok = vkc_dnconv(ch->qkv, ch->prm, ch->ring[i], ch->cv, cs, &cp) &&
              vkc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->z, ch->rec[i], ch->prm, ch->dny, rs, &rp);
@@ -903,7 +905,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
             if (ok && E > 0 && dmoe && vkc_dmoe_on(&ch->dm, i)) {   /* everything here, and on to the next layer */
                 int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1;
                 VkcRoute rp = {.kind = 0, .n_group = ng, .topk_group = ng > 1 ? c->topk_group : 1, .norm = 1, .temp = 1.f, .scale = 1.f};
-                VkcMoe mp = {.D = D, .I = c->inter, .act = 0};
+                VkcMoe mp = {.D = D, .I = c->inter, .act = 0, .blocks = g_gguf};
                 ok = vkc_matmul(vk_qw_tensor(&l->gate), ch->h2, 0, ch->lg, 0, n) && q36c_shared(ch, m, l, i, n) &&
                      vkc_dmoe_layer(&ch->dm, i, n, ch->lg, NULL, ch->h2, &rp, &mp);
                 prev_dev = 1; pending = 1;
@@ -995,6 +997,11 @@ static int q36c_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int 
     if (!g_vk_chain || qt_ready() || qq_active() || g_pilot) return 0;
     /* prompts only: decode and verifies on the CPU */
     if (g_vk_chain == COLI_VK_CHAIN_PREFILL && (S <= 2 || g_q36_rowwise)) return 0;
+    /* A GGUF's dense matrices: decode and verifies on the block formats' GEMV, a prompt's
+     * chunks on their tiled GEMM (vkc_gemm_bd_ready); without it those chunks go through the
+     * CPU and the expert tier (measured on an RTX PRO 4000, Qwen3.6-35B-A3B: a 456-token
+     * prompt 37-42 tok/s on the GEMV, 45 the other way) */
+    if (g_gguf && S > Q36C_GGUF_ROWS && !vkc_gemm_bd_ready()) return 0;
     Q36Chain *ch = q36c_setup(m), *ch2 = q36c_of(m, 1);
     if (!ch || ch->failed) return 0;
     if (ch2 && (!ch2->ok || ch2->failed || ch2->lo != ch->lo + ch->n)) ch2 = NULL;

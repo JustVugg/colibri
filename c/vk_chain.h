@@ -416,8 +416,14 @@ typedef struct {
     int S, K, D, I, act;
     float limit, a, b;
     int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row;
+    int rpw;   /* outputs a workgroup, both passes: 0 = 64, or the block formats' own by pass (vkc_moe) */
+    int blocks;   /* 1: the experts are block formats (a GGUF's): the pipeline with their decoders */
+    int gfmt;     /* the layer's gate/up format (100 + a ggml type), 0 unknown: picks the block path's shape */
 } VkcMoe;
 int vkc_moe_ready(void);
+/* 1 = a GGUF's block-format matrices take a prompt's rows through the tiled GEMM
+ * (qmatmul_gemm_bd.comp), else only the GEMV's few rows a step suit them */
+int vkc_gemm_bd_ready(void);
 int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBuf *y, const VkcMoe *p);
 
 /* ---- attention residuals and SiTU-GLU (chain_ares.comp) ----------------------------

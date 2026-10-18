@@ -29,8 +29,14 @@
 #define BDN(n) BD_CAT(BD_P, n)
 
 uint BDN(u8)(uint off) { return (BD_W(off >> 2u) >> ((off & 3u) << 3u)) & 0xffu; }
-uint BDN(u16)(uint off) { return BDN(u8)(off) | (BDN(u8)(off + 1u) << 8u); }
-uint BDN(u32)(uint off) { return BDN(u16)(off) | (BDN(u16)(off + 2u) << 16u); }
+// four bytes from any offset: one word when aligned, two otherwise (blocks of 34, 66, 210
+// bytes leave their fields unaligned); every decoder below reads its codes a word at a time
+uint BDN(u32)(uint off) {
+    uint a = off >> 2u, sh = (off & 3u) << 3u;
+    uint lo = BD_W(a);
+    return sh == 0u ? lo : (lo >> sh) | (BD_W(a + 1u) << (32u - sh));
+}
+uint BDN(u16)(uint off) { return BDN(u32)(off) & 0xffffu; }
 float BDN(f16)(uint off) { return unpackHalf2x16(BDN(u16)(off)).x; }
 int BDN(s8)(uint off) { int v = int(BDN(u8)(off)); return v >= 128 ? v - 256 : v; }
 
@@ -48,8 +54,68 @@ int bd_sb(uint word, uint k) { return bitfieldExtract(int(word), int(8u * k), 8)
 #endif
 uvec2 BDN(g2)(uint base, uint i) { return uvec2(BD_G(base + 2u * i), BD_G(base + 2u * i + 1u)); }
 
+// The common GGUF types straight from the words they read: the same weights and the same
+// sums of groups of 16 as the general path below (sw * w - mw), without its array of 32
+// codes. 0 when the format has no such path (then the general one runs).
+bool BDN(fast_dot)(int fmt, uint rb, uint u, out float r) {
+    uint xb = u * 32u;
+    if (fmt == 108) {   // Q8_0: the unit is the block (34 bytes)
+        uint off = rb + u * 34u;
+        float a = 0.0;
+        for (uint q4 = 0u; q4 < 8u; q4++) {
+            uint wd = BDN(u32)(off + 2u + 4u * q4), i = xb + 4u * q4;
+            a += float(bd_sb(wd, 0u)) * BD_X(i) + float(bd_sb(wd, 1u)) * BD_X(i + 1u) +
+                 float(bd_sb(wd, 2u)) * BD_X(i + 2u) + float(bd_sb(wd, 3u)) * BD_X(i + 3u);
+        }
+        r = BDN(f16)(off) * a;
+        return true;
+    }
+    if (fmt == 112 || fmt == 113) {   // Q4_K, Q5_K: a group of 32 with a 6-bit scale and min
+        uint e0 = xb & 255u, off = rb + (xb >> 8) * (fmt == 112 ? 144u : 176u), g = e0 >> 5, sc = off + 4u;
+        vec2 dm = unpackHalf2x16(BDN(u32)(off));
+        uint sv, mv;
+        if (g < 4u) { sv = BDN(u8)(sc + g) & 63u; mv = BDN(u8)(sc + g + 4u) & 63u; }
+        else {
+            sv = (BDN(u8)(sc + g + 4u) & 15u) | ((BDN(u8)(sc + g - 4u) >> 2) & 48u);
+            mv = (BDN(u8)(sc + g + 4u) >> 4) | ((BDN(u8)(sc + g) >> 2) & 48u);
+        }
+        uint q = off + (fmt == 112 ? 16u : 48u) + (g >> 1) * 32u, sh = (g & 1u) * 4u;
+        float a = 0.0, xs = 0.0;
+        for (uint q4 = 0u; q4 < 8u; q4++) {
+            uint wd = BDN(u32)(q + 4u * q4) >> sh, hd = fmt == 113 ? BDN(u32)(off + 16u + 4u * q4) >> g : 0u;
+            for (uint k = 0u; k < 4u; k++) {
+                float x = BD_X(xb + 4u * q4 + k);
+                uint v = (wd >> (8u * k)) & 15u;
+                if (fmt == 113) v |= ((hd >> (8u * k)) & 1u) << 4;
+                a += float(v) * x; xs += x;
+            }
+        }
+        r = dm.x * float(sv) * a - dm.y * float(mv) * xs;
+        return true;
+    }
+    if (fmt == 114) {   // Q6_K: two groups of 16, each its signed 8-bit scale
+        uint e0 = xb & 255u, off = rb + (xb >> 8) * 210u, c = e0 >> 7, r0 = e0 & 127u, nib = r0 >> 6, sh = r0 >> 5;
+        uint ql = off + c * 64u + (r0 & 63u), qh = off + 128u + c * 32u, g0 = e0 >> 4;
+        float a = 0.0, b = 0.0;
+        for (uint q4 = 0u; q4 < 8u; q4++) {
+            uint lw = BDN(u32)(ql + 4u * q4) >> (4u * nib), hw = BDN(u32)(qh + 4u * q4) >> (2u * sh);
+            float acc = 0.0;
+            for (uint k = 0u; k < 4u; k++) {
+                int v = int(((lw >> (8u * k)) & 15u) | (((hw >> (8u * k)) & 3u) << 4)) - 32;
+                acc += float(v) * BD_X(xb + 4u * q4 + k);
+            }
+            if (q4 < 4u) a += acc; else b += acc;
+        }
+        float d = BDN(f16)(off + 208u);
+        r = d * (float(BDN(s8)(off + 192u + g0)) * a + float(BDN(s8)(off + 192u + g0 + 1u)) * b);
+        return true;
+    }
+    return false;
+}
+
 // sum over the unit's 32 weights of weight * x; I is the row's width (low-bit formats)
 float BDN(unit)(int fmt, uint rb, uint u, uint I) {
+    { float r; if (BDN(fast_dot)(fmt, rb, u, r)) return r; }
     int wv[32];   /* not w: the including shader's weight buffer may be named w (BD_W) */
     float sA = 0.0, mA = 0.0, sB = 0.0, mB = 0.0;   // scale and min of elements 0..15 and 16..31
     uint xb = u * 32u;
@@ -89,25 +155,33 @@ float BDN(unit)(int fmt, uint rb, uint u, uint I) {
             float d = BDN(f16)(off), m = mn ? BDN(f16)(off + 2u) : 0.0;
             uint qh = t == 6 ? BDN(u32)(off + 2u) : t == 7 ? BDN(u32)(off + 4u) : 0u;
             uint qs = off + (t == 2 ? 2u : t == 3 ? 4u : t == 6 ? 6u : 8u);
-            for (uint j = 0u; j < 16u; j++) {
-                uint b = BDN(u8)(qs + j);
-                int lo = int(b & 15u), hi = int(b >> 4);
-                if (t >= 6) { lo |= int((qh >> j) & 1u) << 4; hi |= int((qh >> (j + 16u)) & 1u) << 4; }
-                int z = t == 2 ? 8 : t == 6 ? 16 : 0;
-                wv[j] = lo - z; wv[j + 16u] = hi - z;
+            int z = t == 2 ? 8 : t == 6 ? 16 : 0;
+            for (uint q4 = 0u; q4 < 4u; q4++) {
+                uint wd = BDN(u32)(qs + 4u * q4);
+                for (uint k = 0u; k < 4u; k++) {
+                    uint j = 4u * q4 + k, b = (wd >> (8u * k)) & 255u;
+                    int lo = int(b & 15u), hi = int(b >> 4);
+                    if (t >= 6) { lo |= int((qh >> j) & 1u) << 4; hi |= int((qh >> (j + 16u)) & 1u) << 4; }
+                    wv[j] = lo - z; wv[j + 16u] = hi - z;
+                }
             }
             sA = sB = d; mA = mB = -m;
         } else if (t == 8) {                                 // Q8_0
             float d = BDN(f16)(off);
-            for (uint j = 0u; j < 32u; j++) wv[j] = BDN(s8)(off + 2u + j);
+            for (uint q4 = 0u; q4 < 8u; q4++) {
+                uint wd = BDN(u32)(off + 2u + 4u * q4);
+                for (uint k = 0u; k < 4u; k++) wv[4u * q4 + k] = bd_sb(wd, k);
+            }
             sA = sB = d;
         } else if (t == 20 || t == 39) {                     // IQ4_NL, MXFP4
             float d = t == 20 ? BDN(f16)(off) : bd_e8m0_half(BDN(u8)(off));
-            uint qs = off + (t == 20 ? 2u : 1u);
-            for (uint j = 0u; j < 16u; j++) {
-                uint b = BDN(u8)(qs + j);
-                uint kv = t == 20 ? BDT_IQ4NL : BDT_MXFP4;
-                wv[j] = int(BD_G(kv + (b & 15u))); wv[j + 16u] = int(BD_G(kv + (b >> 4)));
+            uint qs = off + (t == 20 ? 2u : 1u), kv = t == 20 ? BDT_IQ4NL : BDT_MXFP4;
+            for (uint q4 = 0u; q4 < 4u; q4++) {
+                uint wd = BDN(u32)(qs + 4u * q4);
+                for (uint k = 0u; k < 4u; k++) {
+                    uint j = 4u * q4 + k, b = (wd >> (8u * k)) & 255u;
+                    wv[j] = int(BD_G(kv + (b & 15u))); wv[j + 16u] = int(BD_G(kv + (b >> 4)));
+                }
             }
             sA = sB = d;
         } else if (t == 42) {                                // Q2_0: element 4k+r in bits 2r of byte k
@@ -131,9 +205,12 @@ float BDN(unit)(int fmt, uint rb, uint u, uint I) {
             }
         } else if (t == 10) {                                // Q2_K
             float d = BDN(f16)(off + 80u), dmin = BDN(f16)(off + 82u);
-            for (uint j = 0u; j < 32u; j++) {
-                uint i = e0 + j, c = i >> 7, sh = (i >> 5) & 3u, jj = i & 31u;
-                wv[j] = int((BDN(u8)(off + 16u + c * 32u + jj) >> (2u * sh)) & 3u);
+            {   // the unit's 32 weights: bytes 32c..32c+31 of the codes, bit pair sh of each
+                uint c = e0 >> 7, sh = (e0 >> 5) & 3u, q = off + 16u + c * 32u;
+                for (uint q4 = 0u; q4 < 8u; q4++) {
+                    uint wd = BDN(u32)(q + 4u * q4);
+                    for (uint k = 0u; k < 4u; k++) wv[4u * q4 + k] = int((wd >> (8u * k + 2u * sh)) & 3u);
+                }
             }
             uint a = BDN(u8)(off + g0), b = BDN(u8)(off + g0 + 1u);
             sA = d * float(a & 15u); mA = dmin * float(a >> 4); sB = d * float(b & 15u); mB = dmin * float(b >> 4);
@@ -163,18 +240,27 @@ float BDN(unit)(int fmt, uint rb, uint u, uint I) {
             }
             sA = sB = d * float(s); mA = mB = dmin * float(m);
             uint q = qs + (g >> 1) * 32u, sh = (g & 1u) * 4u;
-            for (uint j = 0u; j < 32u; j++) {
-                int v = int((BDN(u8)(q + j) >> sh) & 15u);
-                if (t == 13) v |= int((BDN(u8)(off + 16u + j) >> g) & 1u) << 4;
-                wv[j] = v;
+            for (uint q4 = 0u; q4 < 8u; q4++) {
+                uint wd = BDN(u32)(q + 4u * q4), hd = t == 13 ? BDN(u32)(off + 16u + 4u * q4) : 0u;
+                for (uint k = 0u; k < 4u; k++) {
+                    int v = int((wd >> (8u * k + sh)) & 15u);
+                    if (t == 13) v |= int((hd >> (8u * k + g)) & 1u) << 4;
+                    wv[4u * q4 + k] = v;
+                }
             }
         } else if (t == 14) {                                // Q6_K
             float d = BDN(f16)(off + 208u);
-            for (uint j = 0u; j < 32u; j++) {
-                uint i = e0 + j, c = i >> 7, r = i & 127u, nib = r >> 6, k = r & 63u, sh = r >> 5, jj = r & 31u;
-                int lo = int((BDN(u8)(off + c * 64u + k) >> (4u * nib)) & 15u);
-                int hi = int((BDN(u8)(off + 128u + c * 32u + jj) >> (2u * sh)) & 3u);
-                wv[j] = (lo | (hi << 4)) - 32;
+            {   // the unit is 32 consecutive weights of one 32-run: low nibbles at bytes
+                // c*64 + (r & 63), high bit pairs at 128 + c*32 + (r & 31)
+                uint c = e0 >> 7, r0 = e0 & 127u, nib = r0 >> 6, sh = r0 >> 5;
+                uint ql = off + c * 64u + (r0 & 63u), qh = off + 128u + c * 32u;
+                for (uint q4 = 0u; q4 < 8u; q4++) {
+                    uint lw = BDN(u32)(ql + 4u * q4), hw = BDN(u32)(qh + 4u * q4);
+                    for (uint k = 0u; k < 4u; k++) {
+                        int lo = int((lw >> (8u * k + 4u * nib)) & 15u), hi = int((hw >> (8u * k + 2u * sh)) & 3u);
+                        wv[4u * q4 + k] = (lo | (hi << 4)) - 32;
+                    }
+                }
             }
             sA = d * float(BDN(s8)(off + 192u + g0)); sB = d * float(BDN(s8)(off + 192u + g0 + 1u));
         } else if (t == 16) {                                // IQ2_XXS
