@@ -68,6 +68,32 @@ class DownloadTest(unittest.TestCase):
         return [r["headers"].get("Range") for r in self.hub.requests
                 if r["path"].endswith("/" + name) and "/cdn/" in r["path"]]
 
+    def test_resumed_206_requires_a_matching_content_range(self):
+        import io
+        class Response(io.BytesIO):
+            status = 206
+            def __init__(self, content_range):
+                super().__init__(b"def")
+                self.headers = ({"Content-Range": content_range}
+                                if content_range is not None else {})
+        dest = os.path.join(self.dst, "range.bin")
+        os.makedirs(self.dst)
+        for header in (None, "invalid", "bytes 3-5/7", "bytes 3-2/6",
+                       "bytes 3-6/6", "bytes 2-4/6"):
+            with self.subTest(header=header):
+                Path(dest + ".part").write_bytes(b"abc")
+                with self.assertRaises(setup_download.DownloadError):
+                    setup_download.download_file(
+                        "https://example.test/file", dest, {"size": 6},
+                        opener=lambda *a, **k: Response(header), retries=0)
+                self.assertFalse(Path(dest).exists())
+                self.assertEqual(Path(dest + ".part").read_bytes(), b"abc")
+        Path(dest + ".part").write_bytes(b"abc")
+        setup_download.download_file(
+            "https://example.test/file", dest, {"size": 6},
+            opener=lambda *a, **k: Response("bytes 3-5/6"), retries=0)
+        self.assertEqual(Path(dest).read_bytes(), b"abcdef")
+
     def test_listing_sizes_hashes_and_filters(self):
         files = {f["path"]: f for f in self.listing()}
         self.assertEqual(set(files), set(self.files))

@@ -204,9 +204,14 @@ def download_file(url, dest, spec, *, token=None, progress=None, opener=None,
             with opener(_request(url, token, headers), timeout=timeout) as response:
                 status = getattr(response, "status", None) or response.getcode()
                 if have and status == 206:
-                    start = _content_range_start(response.headers.get("Content-Range"))
-                    if start is not None and start != have:
-                        raise DownloadError(f"server resumed at byte {start}, expected {have}")
+                    value = response.headers.get("Content-Range") or ""
+                    match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+)", value)
+                    if not match:
+                        raise DownloadError("server returned an invalid Content-Range for resume")
+                    start, end, total = map(int, match.groups())
+                    if start != have or not start <= end < size or total != size:
+                        raise DownloadError(f"server returned Content-Range {value!r}; "
+                                            f"expected byte {have} of {size}")
                 elif have:
                     # 200 to a ranged request: the server sent the whole file.
                     have = 0
