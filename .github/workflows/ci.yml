@@ -634,7 +634,7 @@ jobs:
         run: |
           cd c
           rc=0
-          for t in colibri inkling kimi_k3; do
+          for t in colibri inkling kimi_k3 qwen36; do
             echo "::group::$t METAL=1"
             make clean >/dev/null 2>&1 || true
             make $t METAL=1 || { echo "FAILED: $t METAL=1"; rc=1; }
@@ -657,6 +657,27 @@ jobs:
         run: |
           cd c
           make metal-test
+      - if: matrix.os == 'macos-latest'
+        name: qwen36 Metal kernels
+        # The kernels of the qwen36 Metal engine against a double-precision
+        # reference (tests/test_qwen36_kernels.c), not part of `make check`
+        # either. On the runner's Apple Paravirtual device it only compiles
+        # them and prints SKIPPED, as metal-test does.
+        timeout-minutes: 10
+        run: |
+          cd c
+          make test-qwen36-kernels
+      - if: matrix.os == 'macos-latest'
+        name: qwen36 Metal graph
+        # The graph against the CPU engine on a model the test writes
+        # (tests/test_qwen36_graph.py), not part of `make check` either. On the
+        # runner's Apple Paravirtual device the graph steps aside at start: the
+        # test checks that the CPU engine takes over with its line, and skips
+        # the comparisons.
+        timeout-minutes: 10
+        run: |
+          cd c
+          make test-qwen36-graph METAL=1 PYTHON=python3
 
       # macOS is the newest COLI_V4_SUPPORTED platform and the only one whose
       # engine coverage lives solely in this job (Linux has the v4-tiny job in

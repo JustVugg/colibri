@@ -697,9 +697,9 @@ static void q36_mtp_attach(Model *m) {
                         "where there are no speculative steps\n");
         return;
     }
-    if (g_cache_route || qq_active()) {
+    if (g_cache_route || qq_active() || QWEN_GRAPH(m)) {
         fprintf(stderr, "[mtp] Q36_MTP=1: the head stays off under %s, where there are no speculative steps\n",
-                g_cache_route ? "CACHE_ROUTE" : "a qpack container");
+                g_cache_route ? "CACHE_ROUTE" : qq_active() ? "a qpack container" : "the Metal graph");
         return;
     }
     if (!q36_mtp_load(m)) { fprintf(stderr, "[mtp] Q36_MTP=%s: the head stays off\n", path); return; }

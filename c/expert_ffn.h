@@ -65,10 +65,33 @@ static inline size_t xf_row_bytes(int I) { return (size_t)I / 2; }
 static inline int    xf_groups(int I)    { return I / XF_BLOCK; }
 static inline int    xf_layout_ok(int I) { return I > 0 && (I % XF_BLOCK) == 0; }
 
+/* Blocks b..n-1 of a row through the scalar loop, in the layout of
+ * xf_repack_row_pairs_signed below: the blocks its SIMD paths do not take, or
+ * all of them without SIMD; tests/test_expert_ffn.c checks it on every host.
+ * src and dst may be identical (in-place), otherwise they may not overlap. */
+static inline void xf_repack_blocks_scalar(uint8_t *dst, const uint8_t *src, int b, int n) {
+    for (; b < n; b++) {
+        const uint8_t *s = src + (size_t)b * XF_BLOCK_BYTES;
+        uint8_t *d = dst + (size_t)b * XF_BLOCK_BYTES;
+        /* In-place output byte k can overwrite a pair needed by a later k.
+         * Preserve this one block; no expert-sized temporary is necessary. */
+        uint8_t saved[XF_BLOCK_BYTES];
+        if (d == s) { memcpy(saved, s, sizeof saved); s = saved; }
+        for (int k = 0; k < 32; k++) {
+            /* element k of the block: byte k/2, nibble k&1; element k+32: byte 16 + k/2 */
+            unsigned lo = (unsigned)(s[k >> 1]      >> ((k & 1) * 4)) & 0xF;
+            unsigned hi = (unsigned)(s[16 + (k >> 1)] >> ((k & 1) * 4)) & 0xF;
+            /* signed 4-bit -> v+8 is the nibble xor 8 */
+            d[k] = (uint8_t)((lo ^ 8u) | ((hi ^ 8u) << 4));
+        }
+    }
+}
+
 /* Repack one row from the "signed pairs" container layout (byte j = element
  * 2j in the low nibble, 2j+1 in the high nibble, two's-complement 4-bit — the
- * qwen36 converter's pack_int4) into planar unsigned. src and dst may not
- * overlap. I % 64 == 0. */
+ * qwen36 converter's pack_int4) into planar unsigned. src and dst may be
+ * identical (in-place), otherwise they may not overlap. I % 64 == 0.
+ * SIMD paths load each complete 32-byte block before storing it. */
 static inline void xf_repack_row_pairs_signed(uint8_t *dst, const uint8_t *src, int I) {
     int b = 0;
 #if defined(__AVX2__)
@@ -106,17 +129,7 @@ static inline void xf_repack_row_pairs_signed(uint8_t *dst, const uint8_t *src, 
         vst1q_u8(d + 16, veorq_u8(vzip2q_u8(even, odd), e8));
     }
 #endif
-    for (; b < I / XF_BLOCK; b++) {
-        const uint8_t *s = src + (size_t)b * XF_BLOCK_BYTES;
-        uint8_t *d = dst + (size_t)b * XF_BLOCK_BYTES;
-        for (int k = 0; k < 32; k++) {
-            /* element k of the block: byte k/2, nibble k&1; element k+32: byte 16 + k/2 */
-            unsigned lo = (unsigned)(s[k >> 1]      >> ((k & 1) * 4)) & 0xF;
-            unsigned hi = (unsigned)(s[16 + (k >> 1)] >> ((k & 1) * 4)) & 0xF;
-            /* signed 4-bit -> v+8 is the nibble xor 8 */
-            d[k] = (uint8_t)((lo ^ 8u) | ((hi ^ 8u) << 4));
-        }
-    }
+    xf_repack_blocks_scalar(dst, src, b, I / XF_BLOCK);
 }
 static inline void xf_repack_pairs_signed(uint8_t *dst, const uint8_t *src, int O, int I) {
     for (int o = 0; o < O; o++)
