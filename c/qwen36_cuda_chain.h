@@ -52,6 +52,7 @@
 #define Q36CC_DEV  1
 #define Q36CC_BOTH 2
 
+#define Q36CC_PROMO_SLOTS 32   /* promotions in flight at most (their staging: an expert each) */
 typedef struct {
     int ok, failed;
     int dev;                                   /* the CUDA ordinal every matrix sits on */
@@ -83,6 +84,13 @@ typedef struct {
      * their sum, and a hybrid layer's host rows and words */
     int dm_on, dm_fmt, dm_gs, dm_read, dm_held;
     unsigned dm_epoch, dm_seq;
+    int *dm_nres;   /* a layer's experts the table lacks (dm_part = any) */
+    int dm_stage_dirty;   /* the staged table is behind the residents */
+    /* promotions (q36cc_promote): the rate a step, a ring of page-locked staging slots the
+     * newcomers' bytes go up from, the pairs whose copies are in flight */
+    int promo_rate, pr_n, pr_busy[Q36CC_PROMO_SLOTS]; size_t pr_stride; CcBuf *pr_buf;
+    struct { int ci, vi, slot; unsigned tk; } pr_pend[Q36CC_PROMO_SLOTS]; int pr_npend;
+    unsigned long long dm_promoted, dm_landed, dm_rebuilds, dm_patches; double promo_ms, patch_ms;
     CcExpert *dm_host; uint8_t *dm_res; int *dm_part; uint8_t *dm_ran;   /* dm_ran: the step's layers that ran so */
     /* a prompt chunk's table (more than Q36CC_STAGE_ROWS rows): the residents, and the tier's host
      * pool staged a layer at a time into dm_stage (planar; dm_fr the copies, dm_fro and dm_frn each
@@ -214,7 +222,9 @@ static size_t q36cc_mirror_bytes(Model *m, int ctx) {
     if (coli_cuda_mem_info(0, &fr, &tot) && tot && kv > tot / 2) kv = tot / 2;
     return kv;
 }
+static void q36cc_promote_settle(Q36CChain *ch);
 static void q36cc_free_own(Q36CChain *ch, Model *m) {
+    q36cc_promote_settle(ch);   /* the copies in flight: landed (the finish before) or failed (a lost device) */
     int L = m->c.n_layers;
     if (ch->t_ab) for (int i = 0; i < L; i++) { if (ch->t_ab[i]) coli_cuda_tensor_free(ch->t_ab[i]); ch->t_ab[i] = NULL; }
     if (ch->t_sg) for (int i = 0; i < L; i++) { if (ch->t_sg[i]) coli_cuda_tensor_free(ch->t_sg[i]); ch->t_sg[i] = NULL; }
@@ -756,6 +766,84 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
  * table points each such expert at its place there (planar, as the RAM holds it). 0: no
  * VRAM for it. */
 #define Q36CC_STAGE_ROWS 32
+/* Promotions (qt_chain_promote): after a decode-sized step, up to this many of its misses move
+ * into the buffers of the coldest residents by this conversation's routes. The chain copies
+ * each newcomer's RAM bytes into a page-locked staging slot and from there into the victim's
+ * device buffers on its copy stream, while the next steps run; once the copies landed the tier
+ * hands the buffers to the newcomer (qt_chain_promote_done) and the table takes the change
+ * entry by entry (qt_chain_changes). The victim computes on the CPU from the next step on. The
+ * warm start's set comes from the history, and a conversation's experts drift from it.
+ * COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set, =n sets the rate (qwen38's chain reads
+ * the same knob). */
+#define Q36CC_PROMOTE 8
+#define QT_CHG_LIST 512   /* residency changes read at once (the tier's ring holds as many) */
+static int q36cc_promote_rate(void) { const char *e = getenv("COLI_CUDA_CHAIN_PROMOTE"); return e && *e ? atoi(e) : Q36CC_PROMOTE; }
+/* entry (i, e) of the host's table from the tier: 1 resident on this device */
+static int q36cc_dm_entry(Q36CChain *ch, int E, int i, int e) {
+    CcExpert *x = &ch->dm_host[(size_t)i * E + e];
+    ColiCudaTensor *g, *u, *d;
+    memset(x, 0, sizeof *x);
+    int on = qt_chain_resident(i, e, ch->dev, &g, &u, &d) && cc_tensor_dev(g, &x->g, &x->gs, NULL) &&
+             cc_tensor_dev(u, &x->u, &x->us, NULL) && cc_tensor_dev(d, &x->d, &x->ds, NULL);
+    if (!on) memset(x, 0, sizeof *x);
+    return on;
+}
+/* the pairs whose copies landed: the tier hands the buffers over; then this step's promotions */
+static void q36cc_promote(Q36CChain *ch, Model *m) {
+    Cfg *c = &m->c; int D = c->hidden, I = c->inter;
+    if (ch->promo_rate <= 0) return;
+    double t0 = tm_now();
+    int w = 0;
+    for (int p = 0; p < ch->pr_npend; p++) {
+        if (!cc_host_up_done(ch->pr_pend[p].tk)) { ch->pr_pend[w++] = ch->pr_pend[p]; continue; }
+        qt_chain_promote_done(ch->pr_pend[p].ci, ch->pr_pend[p].vi, 1);
+        ch->pr_busy[ch->pr_pend[p].slot] = 0; ch->dm_landed++;
+    }
+    ch->pr_npend = w;
+    int room = Q36CC_PROMO_SLOTS - ch->pr_npend, max = room < ch->promo_rate ? room : ch->promo_rate;
+    if (max <= 0) { ch->promo_ms += tm_now() - t0; return; }
+    if (!ch->pr_buf) {   /* the staging: three matrices and their scales an expert, 256-byte aligned */
+        size_t mb = ch->dm_fmt == 2 || ch->dm_fmt == 4 ? (size_t)D * I / 2 : (size_t)D * I, sb = (size_t)(2 * I + D) * sizeof(float);
+        if (ch->dm_fmt == 4) sb = (size_t)(2 * I * ((D + ch->dm_gs - 1) / ch->dm_gs) + D * ((I + ch->dm_gs - 1) / ch->dm_gs)) * sizeof(float);
+        ch->pr_stride = (3 * mb + sb + 255) / 256 * 256;
+        if (!cc_host_up_ready() || !cc_reserve(&ch->pr_buf, ch->pr_stride * Q36CC_PROMO_SLOTS, CC_UP)) {
+            fprintf(stderr, "[chain] qwen36: no page-locked staging for promotions; the warm start's set stays\n");
+            ch->promo_rate = 0; return;
+        }
+    }
+    QtPromo pr[Q36CC_PROMO_SLOTS];
+    int n = qt_chain_promote(max, pr);
+    for (int k = 0; k < n; k++) {
+        QtPromo *q = &pr[k];
+        int slot = -1;
+        for (int j = 0; j < Q36CC_PROMO_SLOTS; j++) if (!ch->pr_busy[j]) { slot = j; break; }
+        const void *wg, *wu, *wd; const float *sg, *su, *sd;
+        if (slot < 0 || 3 * q->mb + 2 * q->sb_gu + q->sb_d > ch->pr_stride ||
+            !cc_tensor_dev(q->tg, &wg, &sg, NULL) || !cc_tensor_dev(q->tu, &wu, &su, NULL) || !cc_tensor_dev(q->td, &wd, &sd, NULL)) {
+            qt_chain_promote_done(q->ci, q->vi, 0); continue;
+        }
+        char *st = (char *)cc_ptr(ch->pr_buf) + (size_t)slot * ch->pr_stride;
+        memcpy(st, q->g, q->mb); memcpy(st + q->mb, q->u, q->mb); memcpy(st + 2 * q->mb, q->d, q->mb);
+        char *sc = st + 3 * q->mb;
+        memcpy(sc, q->gs, q->sb_gu); memcpy(sc + q->sb_gu, q->us, q->sb_gu); memcpy(sc + 2 * q->sb_gu, q->ds, q->sb_d);
+        unsigned tk = 0;
+        if (!cc_host_up((void *)wg, st, q->mb, &tk) || !cc_host_up((void *)wu, st + q->mb, q->mb, &tk) || !cc_host_up((void *)wd, st + 2 * q->mb, q->mb, &tk) ||
+            !cc_host_up((void *)sg, sc, q->sb_gu, &tk) || !cc_host_up((void *)su, sc + q->sb_gu, q->sb_gu, &tk) || !cc_host_up((void *)sd, sc + 2 * q->sb_gu, q->sb_d, &tk)) {
+            qt_chain_promote_done(q->ci, q->vi, 0);   /* the victim's buffers hold neither now */
+            continue;
+        }
+        ch->pr_busy[slot] = 1;
+        ch->pr_pend[ch->pr_npend].ci = q->ci; ch->pr_pend[ch->pr_npend].vi = q->vi; ch->pr_pend[ch->pr_npend].slot = slot;
+        ch->pr_pend[ch->pr_npend].tk = tk; ch->pr_npend++;
+        ch->dm_promoted++;
+    }
+    ch->promo_ms += tm_now() - t0;
+}
+/* at the chain's end: the copies in flight finished first (cc_finish), the pairs settled */
+static void q36cc_promote_settle(Q36CChain *ch) {
+    for (int p = 0; p < ch->pr_npend; p++) { qt_chain_promote_done(ch->pr_pend[p].ci, ch->pr_pend[p].vi, cc_host_up_done(ch->pr_pend[p].tk)); ch->pr_busy[ch->pr_pend[p].slot] = 0; }
+    ch->pr_npend = 0;
+}
 static int q36cc_stage_table(Q36CChain *ch, Model *m) {
     Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, D = c->hidden, I = c->inter;
     size_t ne = (size_t)L * E, mb = (size_t)D * I / 2, nsc = (size_t)I * (D / ch->dm_gs), wb = 3 * mb, sb = 3 * nsc * sizeof(float);
@@ -809,14 +897,19 @@ static int q36cc_stage_table(Q36CChain *ch, Model *m) {
     return cc_begin() && cc_write(ch->dm_tabb, 0, ch->dm_hostb, ne * sizeof(CcExpert)) && cc_submit(1);
 }
 /* the step's buffers, and the table when the tier's residents moved (the tier held) */
-static int q36cc_dm_begin(Q36CChain *ch, Model *m) {
+static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
     Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, K = c->topk, D = c->hidden, I = c->inter;
     size_t r = (size_t)ch->rows, ne = (size_t)L * E, F = sizeof(float);
     if (!ch->dm_host) {
         ch->dm_host = malloc(ne * sizeof(CcExpert)); ch->dm_res = calloc(ne, 1); ch->dm_part = calloc(L, sizeof(int));
-        ch->dm_ran = calloc(L, 1);
+        ch->dm_ran = calloc(L, 1); ch->dm_nres = calloc(L, sizeof(int));
         ch->dm_g = falloc(I); ch->dm_u = falloc(I); ch->dm_hh = falloc(D);
-        if (!ch->dm_host || !ch->dm_res || !ch->dm_part || !ch->dm_ran) return 0;
+        if (!ch->dm_host || !ch->dm_res || !ch->dm_part || !ch->dm_ran || !ch->dm_nres) return 0;
+        ch->promo_rate = q36cc_promote_rate();
+        if (ch->promo_rate > 0 && qt_chain_devices() == 1 && ch->dm_fmt < 100 && cc_host_up_ready())
+            fprintf(stderr, "[chain] qwen36: up to %d experts a step promoted into the card by this conversation's routes, "
+                            "the coldest residents giving way (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)\n", ch->promo_rate);
+        else ch->promo_rate = 0;
     }
     if (!cc_reserve(&ch->dm_ids, (size_t)L * r * K * 4, CC_DEV) || !cc_reserve(&ch->dm_w, (size_t)L * r * K * F, CC_DEV) ||
         !cc_reserve(&ch->dm_idsd, (size_t)L * r * K * 4, CC_DOWN) || !cc_reserve(&ch->dm_wd, (size_t)L * r * K * F, CC_DOWN) ||
@@ -825,28 +918,46 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m) {
         !cc_reserve(&ch->dm_tab, ne * sizeof(CcExpert), CC_DEV)) return 0;
     if (!ch->dm_held) { qt_chain_hold(1); ch->dm_held = 1; }
     unsigned ep = qt_chain_epoch();
-    if (ch->dm_read && ep == ch->dm_epoch) return 1;
-    for (int i = 0; i < L; i++) {
-        int miss = 0;
-        for (int e = 0; e < E; e++) {
-            CcExpert *x = &ch->dm_host[(size_t)i * E + e];
-            ColiCudaTensor *g, *u, *d;
-            memset(x, 0, sizeof *x);
-            int on = qt_chain_resident(i, e, ch->dev, &g, &u, &d) && cc_tensor_dev(g, &x->g, &x->gs, NULL) &&
-                     cc_tensor_dev(u, &x->u, &x->us, NULL) && cc_tensor_dev(d, &x->d, &x->ds, NULL);
-            if (!on) memset(x, 0, sizeof *x);
-            ch->dm_res[(size_t)i * E + e] = (uint8_t)on; miss |= !on;
+    if (!ch->dm_read || ep != ch->dm_epoch) {
+        /* the residents that moved since the last read: those entries alone, or every entry
+         * where the tier lost count (the first read, a host-pool registration, too many) */
+        double tp = tm_now();
+        int chg[QT_CHG_LIST], nchg, over;
+        nchg = qt_chain_changes(chg, QT_CHG_LIST, &over);
+        if (over || !ch->dm_read) {
+            for (int i = 0; i < L; i++) {
+                int miss = 0;
+                for (int e = 0; e < E; e++) { int on = q36cc_dm_entry(ch, E, i, e); ch->dm_res[(size_t)i * E + e] = (uint8_t)on; miss += !on; }
+                ch->dm_nres[i] = miss; ch->dm_part[i] = miss > 0;
+            }
+            if (!cc_begin() || !cc_write(ch->dm_tab, 0, ch->dm_host, ne * sizeof(CcExpert)) || !cc_submit(1)) return 0;
+            ch->dm_rebuilds++;
+        } else if (nchg > 0) {
+            int ok = cc_begin();
+            for (int k = 0; k < nchg && ok; k++) {
+                int j = chg[k], i = j / E, e = j % E;
+                if (j < 0 || (size_t)j >= ne) continue;
+                int was = ch->dm_res[j], on = q36cc_dm_entry(ch, E, i, e);
+                ch->dm_res[j] = (uint8_t)on;
+                if (was != on) { ch->dm_nres[i] += was ? 1 : -1; ch->dm_part[i] = ch->dm_nres[i] > 0; }
+                ok = cc_write(ch->dm_tab, (size_t)j * (sizeof(CcExpert) / 4), &ch->dm_host[j], sizeof(CcExpert));   /* offsets in floats */
+                ch->dm_patches++;
+            }
+            if (!ok || !cc_submit(1)) return 0;
         }
-        ch->dm_part[i] = miss;
+        ch->dm_epoch = ep; ch->dm_read = 1; ch->dm_stage_dirty = 1;
+        ch->patch_ms += tm_now() - tp;
     }
-    if (!cc_begin() || !cc_write(ch->dm_tab, 0, ch->dm_host, ne * sizeof(CcExpert)) || !cc_submit(1)) return 0;
-    if (qt_chain_host_count() > 0 && !ch->dm_stage_off && cc_fetch_ready() && !q36cc_stage_table(ch, m)) {
-        if (cc_lost()) return 0;
-        fprintf(stderr, "[chain] qwen36: no VRAM to stage the host pool's experts in; a prompt chunk's go to the host's step\n");
-        ch->dm_stage_off = 1;
-        cc_free(ch->dm_stage); ch->dm_stage = NULL;
+    /* the staged table (a prompt chunk's host-pool copies) follows the residents when a chunk needs it */
+    if (ch->dm_stage_dirty && n > Q36CC_STAGE_ROWS && qt_chain_host_count() > 0 && !ch->dm_stage_off && cc_fetch_ready()) {
+        if (!q36cc_stage_table(ch, m)) {
+            if (cc_lost()) return 0;
+            fprintf(stderr, "[chain] qwen36: no VRAM to stage the host pool's experts in; a prompt chunk's go to the host's step\n");
+            ch->dm_stage_off = 1;
+            cc_free(ch->dm_stage); ch->dm_stage = NULL;
+        }
+        ch->dm_stage_dirty = 0;
     }
-    ch->dm_epoch = ep; ch->dm_read = 1;
     return 1;
 }
 /* layer i's table and whether some of its experts are elsewhere (the host's), for a step of n rows */
@@ -1015,7 +1126,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
          * every layer; a prompt chunk's layers whose experts are all in the table (a layer
          * with some elsewhere, or the prompt's re-plan of the residents, keeps the host's step) */
         int dm = E > 0 && ch->dm_on && (n <= Q36CC_DM_ROWS || !prefill_replan_on());
-        if (dm && !q36cc_dm_begin(ch, m)) {
+        if (dm && !q36cc_dm_begin(ch, m, n)) {
             if (cc_lost()) goto lost;
             fprintf(stderr, "[chain] qwen36: the routed experts' buffers or table refused; the host's step from here on\n");
             q36cc_dm_end(ch); ch->dm_on = dm = 0;
@@ -1107,6 +1218,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         ch->wait_ms += tm_now() - t0;
         if (!ok) goto lost;
         if (dm) q36cc_dm_books(ch, m, n, pb);
+        if (dm && n <= Q36CC_DM_ROWS) q36cc_promote(ch, m);
         /* a dense model reads its K/V rows back here, and so does a Flint dense layer (no
          * expert step ends its frame; q36c_forward_seg says what went wrong without it) */
         for (int i = 0; i < L; i++) {
@@ -1143,6 +1255,10 @@ static void q36cc_report(Model *m) {
         fprintf(stderr, "[chain] qwen36: %llu layer steps with the routed experts in the frame, %llu of them hybrid "
                         "(%llu slots on the host in %.1f ms, %.1f ms waiting for the device's routes)\n",
                 ch->dm_steps, ch->dm_hyb, ch->dm_pairs, ch->dm_host_ms, ch->dm_spin_ms);
+    if (ch->dm_promoted || ch->dm_rebuilds > 1)
+        fprintf(stderr, "[chain] qwen36: %llu experts promoted into the card by this conversation's routes (%llu landed); "
+                        "the table read whole %llu times, %llu entries patched; %.1f ms choosing and staging, %.1f ms patching\n",
+                ch->dm_promoted, ch->dm_landed, ch->dm_rebuilds, ch->dm_patches, ch->promo_ms, ch->patch_ms);
     if (ch->dm_staged)
         fprintf(stderr, "[chain] qwen36: %llu prompt layer steps staged the host pool's experts (%.2f GB copied over the bus)\n",
                 ch->dm_staged, ch->dm_stage_bytes / 1073741824.0);

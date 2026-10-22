@@ -256,6 +256,21 @@ void qt_heat_order(uint32_t *const *counts, int nl, int ne);
 int  qt_note_wanted(int layer, int eid);
 void qt_note_heat(int layer, int eid);
 int  qt_chain_devices(void);
+/* The chain's promotions (qwen36_tier.c's comment): after a decode-sized step, up to max of its
+ * misses into the buffers of the coldest residents by this conversation's routes -- the pairs,
+ * the newcomer's RAM bytes and the victim's tensors, for the chain to copy; qt_chain_promote_done
+ * once a pair's copy landed (ok) or failed; the changes of residency since the chain last asked
+ * (slot indices; *overflow: read every entry again); how many promotions landed so far */
+typedef struct {
+    int ci, vi;                                   /* newcomer and victim: layer * ne + eid */
+    const uint8_t *g, *u, *d; const float *gs, *us, *ds;   /* the newcomer's RAM copy */
+    struct ColiCudaTensor *tg, *tu, *td;          /* the victim's device tensors */
+    size_t mb, sb_gu, sb_d;                       /* a matrix's bytes; the gate/up and down scales' bytes */
+} QtPromo;
+int  qt_chain_promote(int max, QtPromo *out);
+void qt_chain_promote_done(int ci, int vi, int ok);
+int  qt_chain_changes(int *idx, int max, int *overflow);
+uint64_t qt_chain_promoted(void);
 /* The host pool (qwen36_tier.c): qt_note_host page-locks a non-resident expert's RAM copy (its
  * planar blocks and scales, as the engine's slot holds them) for the device to copy a prompt
  * chunk's experts from; qt_chain_host the copy's two blocks, the three matrices and the three
@@ -314,6 +329,11 @@ static inline void qt_heat_order(uint32_t*const*a,int b,int c){(void)a;(void)b;(
 static inline int  qt_note_wanted(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_note_heat(int a,int b){(void)a;(void)b;}
 static inline int  qt_chain_devices(void){return 0;}
+typedef struct { int ci, vi; const uint8_t *g, *u, *d; const float *gs, *us, *ds; struct ColiCudaTensor *tg, *tu, *td; size_t mb, sb_gu, sb_d; } QtPromo;
+static inline int  qt_chain_promote(int a,QtPromo*b){(void)a;(void)b;return 0;}
+static inline void qt_chain_promote_done(int a,int b,int c){(void)a;(void)b;(void)c;}
+static inline int  qt_chain_changes(int*a,int b,int*c){(void)a;(void)b;*c=0;return 0;}
+static inline uint64_t qt_chain_promoted(void){return 0;}
 static inline void qt_note_host(int l,int e,const uint8_t*g,const uint8_t*u,const uint8_t*d,const float*a,const float*b,const float*c){(void)l;(void)e;(void)g;(void)u;(void)d;(void)a;(void)b;(void)c;}
 static inline int  qt_chain_host(int l,int e,const void**w,size_t*wb,const float**sc,size_t*sb){(void)l;(void)e;(void)w;(void)wb;(void)sc;(void)sb;return 0;}
 static inline int  qt_chain_host_count(void){return 0;}

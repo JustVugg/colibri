@@ -516,6 +516,54 @@ the CPU computes two thirds of the slots (about 10 ms a token) and the layer aft
 for them: the hybrid step overlaps the device's experts with the host's, not the layers.
 The host pool below takes a prompt's share off the CPU.
 
+### The residents follow the conversation (`COLI_CUDA_CHAIN_PROMOTE`, on by default)
+
+The warm start fills the card from the heat file: the history's routes. A conversation on
+another topic misses it -- on the RTX 3070 (2748 of Qwen3.6-35B's 10240 experts resident)
+a story prompt found 44.5 % of its decode routes in a set trained on a question about MoE
+routing, against 82 % for that question itself -- and every miss is a row the CPU computes
+while the device waits (`qt_cpu_misses`, about 0.1 ms each).
+
+After a decode-sized step the chain asks the tier for promotions (`qt_chain_promote`): up to
+`COLI_CUDA_CHAIN_PROMOTE` (8) of the step's misses routed at least `COLI_CUDA_CHAIN_PROMOTE_MIN`
+(2) times in this conversation, the worth the most first. An expert's worth is its heat --
+the history's routes, decayed, plus this conversation's (`qt_chain_count` for the residents,
+`qt_note` for the misses) -- plus this conversation's routes once more, so that a conversation
+away from the history overtakes within tens of tokens. Each takes the device buffers of the
+coldest of 64 residents drawn at random on its device, where it clears the tier's admission
+margin (`tier_should_promote`: a quarter and four over the victim; the same rule as the LFRU
+tick, which keeps running once in 16 tokens). The chain copies the newcomer's RAM bytes --
+as the RAM holds them: the device's int8 and int4 rows are the same bytes, the upload's XOR
+and the device's undo it; int4 per group from planar blocks is refused -- into a page-locked
+staging slot and from there into the victim's buffers on its copy stream (`cc_host_up`, six
+copies an expert), while the next steps run. The tier's uploader thread does not take part:
+its synchronous copies take the driver's lock from another thread while the chain's frame
+waits for the host (`cc_wait_host`), and that deadlocked inside the driver on the 3070.
+Once the copies landed (`cc_host_up_done`, checked after the next steps) the tier hands the
+buffers to the newcomer (`qt_chain_promote_done`) and it is resident; the victim computes on
+the CPU from the step after its eviction on (its int8 copy rebuilt by `tier_rebuild_evicted`
+before that forward, in parallel). The chain's table takes the changes entry by entry
+(`qt_chain_changes`: the tier records every change of residency; the whole table is read
+again only where the tier lost count), and the staged table of a prompt chunk follows when
+a chunk needs it.
+
+**Measured** (RTX 3070 alone, Qwen3.6-35B-A3B int4 per row, `COLI_PLACE=auto
+COLI_TRUNK_PROBE=0 CUDA_EXPERT_GB=auto`, OMP 12 threads, the heat file frozen; decode ms a
+token = (N / speed - TTFT) / (N - 1)):
+
+| prompt, heat file | tokens | `COLI_CUDA_CHAIN_PROMOTE=0` | the default (8) |
+|---|---|---|---|
+| a story; the heat file from the MoE question | 200 | 44.5 % hits, 25.1 / 23.2 ms | 65.0 % hits, 21.3 / 21.6 ms (543 promoted) |
+| the same | 600 | 38.2 % hits, 28.8 ms | 67.3 % hits, 21.9 ms (1016 promoted) |
+| the MoE question; its own heat file | 200 | 81.7-82.8 % hits, 14.5-14.9 ms | 80.1 % hits, 16.5 ms (159 promoted) |
+
+Away from the history a token gets 15 % cheaper over 200 tokens and 24 % over 600, where the
+set keeps adapting; on the very prompt the history was trained on the swaps cost about 1.5 ms
+a token (a promoted expert displaces a resident the history still routes to) -- the margin
+keeps that to 159 swaps, and `0` keeps the warm start's set. The greedy text with and without
+is the same. A promotion costs the engine thread about 0.15 ms (the staging memcpy) and the
+victim's int8 rebuild about 0.85 ms of one CPU thread before the next forward.
+
 ### A prompt's experts past VRAM: the host pool (`COLI_CUDA_HOST_POOL`, on by default)
 
 A prompt chunk routes nearly every expert of a layer (467 rows, 8 slots each, over 256
