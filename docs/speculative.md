@@ -12,7 +12,7 @@ What runs where:
 | Engine | Draft sources | Verify |
 |---|---|---|
 | `qwen38` (Qwen3.8 Flash Next) | the checkpoint's MTP head, up to 3 drafts (on by default when the checkpoint has it; `Q38_MTP=0` off, `Q38_MTP_DRAFTS`); prompt lookup, up to 5 (on by default; `COLI_LOOKUP=0` off) | up to 6 rows, on the CPU or in the Vulkan dense chain |
-| `qwen36` (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) | prompt lookup, up to 5 (on by default; `COLI_LOOKUP=0` off) | up to 6 rows, on the CPU or in the Vulkan dense chain |
+| `qwen36` (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) | prompt lookup, up to 5 (on by default; `COLI_LOOKUP=0` off); the checkpoint's MTP head, up to 7 drafts (`Q36_MTP=1`, `Q36_MTP_DRAFTS`); on the Metal graph its own run of that head instead, one draft (on when the container has the head, `model-mtp.safetensors`; `QWEN36_MTP=0` off; see [qwen36-metal.md](qwen36-metal.md#speculative-decoding)) | up to 8 rows, on the CPU, in the Vulkan dense chain or in the CUDA chain; 2 rows on the Metal graph |
 | `colibri` (GLM-5.2) | its MTP head (`DRAFT`), carried by the gate below (`COLI_SPEC_GATE=0`: the acceptance guard of `COLI_MTP_GUARD_PCT` instead); without a head, the n-gram drafts come from the prompt lookup below and its gate by default (`COLI_LOOKUP=0`: its own n-gram drafts as before) | as before |
 
 ## How a verify works
@@ -62,7 +62,10 @@ so the rows get the bits of the single dispatch.
 Drafting stays off where a row's result depends on what is resident: qwen36 under a
 CUDA expert tier holding part of the experts, `CACHE_ROUTE` or a qpack container (with
 `COLI_LOOKUP=1` asked for, a `[qwen36] COLI_LOOKUP=1: no drafts under ...` line says so;
-the default stays quiet). A tier holding every routed expert, run by the CUDA chain, drafts:
+the default stays quiet). qwen36's Metal graph takes no lookup drafts (with `COLI_LOOKUP=1`,
+a line says so): it drafts with the checkpoint's MTP head when the container has it,
+one draft a verify ([qwen36-metal.md](qwen36-metal.md#speculative-decoding)). A tier holding
+every routed expert, run by the CUDA chain, drafts:
 nothing there depends on residency, and the chain's verify rows get a decode step's bits.
 On an RTX PRO 4000 (Qwen3.6-35B-A3B int4-g64) a code edit of 400 tokens took 3.25 s
 against 4.40 s without lookup, 2.91 tokens per forward, the same text; on a chat answer
@@ -134,6 +137,10 @@ rollback; `[qwen36 mtp]` reports the head's acceptance separately. A rejected
 row or an unconsumed tail never commits to the backbone state. Pins preserve
 the pending residual as well as the backbone recurrence.
 
+The Metal graph does not load this head: it drafts with its own, on the GPU, from the
+same tensors, one draft a verify, on when the container has the head
+([qwen36-metal.md](qwen36-metal.md#speculative-decoding)).
+
 `make -C c qwen36-tiny-mtp-check` checks reference logits, exact output and final
 logits at every depth, forced rejection/acceptance/mixed rows, and multi-turn
 serve including prefix reuse, pin restore and sampling. The reference uses
@@ -175,7 +182,9 @@ runs a layer of its own for each draft and absorbs the drafts that stood, so a v
 `T(n)` counts the forward, the head's drafts and that absorb. `COLI_SPEC_GATE=0` drafts
 every proposal in full (the tests use it), and on colibri brings back the acceptance
 guard that pauses the head for 256 tokens under 70% (`COLI_MTP_GUARD_PCT`,
-`COLI_MTP_GUARD_WINDOW`).
+`COLI_MTP_GUARD_WINDOW`). The Metal graph's MTP head is not gated: a draft goes to a
+verify on its confidence alone (`QWEN36_MTP_MIN_P`, see
+[qwen36-metal.md](qwen36-metal.md#speculative-decoding)).
 
 A step that does not run colibri's head (a plain step, or another source's verify)
 leaves the head's KV row for that position unwritten. The head's window then restarts
@@ -198,7 +207,10 @@ Every run, and every served turn, prints its counts on stderr (never on the wire
 Tokens are the decode tokens fed after the prompt, and forwards are the forwards that
 fed them. The acceptance by position counts a draft when its verify carried it. `ended
 mid-verify` marks a turn that stopped with drafts unconsumed: they were undone, and the
-state is the one plain decoding leaves.
+state is the one plain decoding leaves. With the head, the Metal graph prints one more
+`[qwen36 mtp]` line, which counts the drafts below the head's confidence that it left out
+and the steps it did not run, and carries `ended mid-verify`, and no lookup line: every
+verify is the head's. Its acceptance line says `gate off:` before what the gate measured.
 
 ## Settings
 

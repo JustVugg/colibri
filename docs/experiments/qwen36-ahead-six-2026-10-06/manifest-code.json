@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "hypothesis": "In decode the Metal graph announces to the kernel the guessed experts of the next layer that are not in the cache, so the SSD reads them while the GPU works; announcing only the six likeliest instead of all eight leaves out the reads a step most often does not use, so decode steps 2 to 32 after a 512-token prompt of code.txt get faster on an 8 GB M1, with the same logits.",
+  "commit": "b16c23cafa00c517a4b27f1d25d572ba088df425",
+  "model": "Qwen3.6-35B-A3B (Qwen3_5MoeForConditionalGeneration) converted to Colibri's qwen36 container: INT4 routed experts with gs=64 group scales, f16 dense weights (quantized to INT8 at load) and f16 embedding; 23 GB of safetensors; canonical.qc beside it (1.94 GB, written by qwen36-canonical) and experts.qc (17.1 GB, scales as 16-bit codes, the bytes qwen36-canonical --experts writes: its records written on 2026-10-05, its 8-byte stamp on 2026-10-07); the checkpoint's shards were written on 2026-09-16",
+  "command": "for each version, git archive <its commit> c | tar -x -C <dir>, make -C <dir>/c qwen36_metal.o backend_metal.o METAL=1, then from the repository root, with the compiler flags make -C c qwen36 METAL=1 gives qwen36.c except its qpack path (-DQWEN36_QPACK and its objects, which the harness does not use): clang -O3 -Xclang -fopenmp -I<libomp>/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_METAL -DQWEN36_METAL -I<dir>/c docs/experiments/qwen36-ahead-six-2026-10-06/bench.c <dir>/c/qwen36_metal.o <dir>/c/backend_metal.o -o <dir>/qwen36-bench -lm -L<libomp>/lib -lomp -framework Metal -framework Foundation -framework Accelerate -lc++; every run: /usr/bin/time -l env -i PATH=/usr/bin:/bin HOME=$HOME SNAP=<model> <dir>/qwen36-bench code.txt 64,512 32; baseline = a367db0c (the parent), trial = b16c23ca",
+  "prompt_hash": "ff641dc87569e6e3b56c3e7996fce21627a4b8cea5489d90864d6102232a2e72",
+  "hardware": {
+    "cpu": "Apple M1, 4 performance + 4 efficiency cores (MacBook Air, MacBookAir10,1, no fan)",
+    "ram": "8 GB unified memory",
+    "storage": "internal APPLE SSD AP0256Q, APFS",
+    "os": "macOS 26.6.2 (25G83), Apple clang 21.0.0 (clang-2100.3.34.2), Homebrew libomp"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "ANNOUNCED_GUESSES"
+  ],
+  "baseline": {
+    "config": {
+      "SNAP": "Qwen3.6-35B-A3B, Colibri qwen36 container, INT4 experts gs=64, internal SSD",
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "EXPERT_CACHE": "the Metal graph's default: a sixteenth of the RAM (512 MiB, 303 slots of 1.77 MB in both versions)",
+      "PROMPT": "the first 64 and the first 512 tokens of code.txt (in this record: an earlier version of c/qwen36_graph.h, 69,605 bytes, of which the harness reads the first 20,480; prompt_hash is its SHA-256), each from an empty state; after each, 32 greedy tokens",
+      "ORDER": "1 warm-up run (baseline, discarded), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "EXPERT_SOURCE": "experts.qc beside the model",
+      "ENGINE": "the Metal graph, default (fast) kernels",
+      "ANNOUNCED_GUESSES": "the next layer's eight guessed experts (its top-k), those not in the cache (a367db0c)",
+      "MEASURED": "tokens per second of the 32 tokens generated after the 512-token prompt (the first token excluded)"
+    },
+    "samples": {
+      "tok_s": [
+        7.314,
+        7.314,
+        7.314,
+        7.317
+      ]
+    },
+    "median_tok_s": 7.314,
+    "quality": {
+      "method": "FNV-1a fingerprint of every logit of the run, and the hash of the generated tokens, per prompt length: 64 tokens 159092f3f28e4cac/3e9c13145e5486b2, 512 tokens fd85cc7ab1039e3c/70e3abbbde3ccaf3, the same in all nine runs (the warm-up and the 4 runs of each version)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-ahead-six-2026-10-06/baseline-code.txt",
+      "sha256": "380312e727d5e7ea474564275b95b7ae4175fa91fce60e752e10aa33add5d622"
+    }
+  },
+  "trial": {
+    "config": {
+      "SNAP": "Qwen3.6-35B-A3B, Colibri qwen36 container, INT4 experts gs=64, internal SSD",
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "EXPERT_CACHE": "the Metal graph's default: a sixteenth of the RAM (512 MiB, 303 slots of 1.77 MB in both versions)",
+      "PROMPT": "the first 64 and the first 512 tokens of code.txt (in this record: an earlier version of c/qwen36_graph.h, 69,605 bytes, of which the harness reads the first 20,480; prompt_hash is its SHA-256), each from an empty state; after each, 32 greedy tokens",
+      "ORDER": "1 warm-up run (baseline, discarded), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "EXPERT_SOURCE": "experts.qc beside the model",
+      "ENGINE": "the Metal graph, default (fast) kernels",
+      "ANNOUNCED_GUESSES": "the six likeliest of them, those not in the cache (b16c23ca)",
+      "MEASURED": "tokens per second of the 32 tokens generated after the 512-token prompt (the first token excluded)"
+    },
+    "samples": {
+      "tok_s": [
+        7.703,
+        7.749,
+        7.583,
+        7.72
+      ]
+    },
+    "median_tok_s": 7.7115,
+    "quality": {
+      "method": "FNV-1a fingerprint of every logit of the run, and the hash of the generated tokens, per prompt length: 64 tokens 159092f3f28e4cac/3e9c13145e5486b2, 512 tokens fd85cc7ab1039e3c/70e3abbbde3ccaf3, the same in all nine runs (the warm-up and the 4 runs of each version)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-ahead-six-2026-10-06/trial-code.txt",
+      "sha256": "846d16fedace1cea8612b22e225e453a51113aff931b20e04ed7f1b5765bf27e"
+    }
+  },
+  "outcome": "improvement"
+}
