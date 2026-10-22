@@ -93,6 +93,18 @@ static int qwen36_max_ctx(void) {
 #endif
 #include "qwen36_embedding.h"     /* the embedding rows read in place from the checkpoint */
 #include "qwen36_dense_file.h"    /* canonical.qc: the INT8 dense matrices, converted once */
+/* The Metal graph (qwen36_graph.h) is the forward of the Metal engine build
+ * (`make qwen36 METAL=1` defines QWEN36_METAL). CUDA, the segment/edge adapters
+ * and the tests that include this file keep the CPU engine. */
+#if defined(COLI_METAL) && defined(QWEN36_METAL) && !defined(COLI_CUDA) && \
+    !defined(COLI_SEGMENT_ADAPTER) && !defined(COLI_EDGE_ADAPTER)
+#define QWEN36_METAL_GRAPH 1
+#endif
+#ifdef QWEN36_METAL_GRAPH
+#include "qwen36_gpu.h"
+#include <dispatch/dispatch.h>
+#include <sys/sysctl.h>
+#endif
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h" /* COLI_VULKAN=1: the resident dense trunk on a Vulkan device */
 static int g_vk_ready = 0;
@@ -1083,6 +1095,7 @@ typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; fl
                  void *vk; int vk_off; uint16_t *h;
                  char *vk_name; const char *vk_tag; int vk_quant, vk_fmt, vk_gone, vk_imported;
                  uint8_t *gq; int gq_type; float gs;
+                 int mapped; /* q/sc are canonical.qc's pages (qwen_dense_mapped): never freed */
                  int q8r16; } QW;   /* q8r16: q's rows interleaved by 16 (idot.h i8r16_*, q36_trunk_q8_interleave) */
 static void qw_free(QW *w) {
 #ifdef COLI_VULKAN
@@ -1090,8 +1103,9 @@ static void qw_free(QW *w) {
     w->vk = NULL; w->vk_off = 0; w->vk_imported = 0;
     free(w->vk_name); w->vk_name = NULL; w->vk_gone = 0;
 #endif
-    free((void*)w->w); q36_wfree(w->q); free(w->sc); free(w->q4); free(w->sg); q36_wfree(w->h); free(w->gq);
-    w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0; w->h = NULL; w->gq = NULL;
+    if (!w->mapped) { q36_wfree(w->q); free(w->sc); }
+    free((void*)w->w); free(w->q4); free(w->sg); q36_wfree(w->h); free(w->gq);
+    w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0; w->h = NULL; w->gq = NULL; w->mapped = 0;
 }
 
 /* ---------- per-layer dense weights ---------- */
@@ -1130,7 +1144,14 @@ typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g
                  unsigned busy; /* callers computing from this slot (expert_hold): never evicted */
                  uint8_t *gqe;  /* GGUF mode: the expert, [gate | up | down] in their held types (GqExp hg/hu/hd) */
                  int8_t *t8; float *t8s; int t8_eid;   /* GGUF mode, the Vulkan tier: gqe as int8 with one scale per 32 weights (gq_slot_i8),
-                                                          or as the file's rows when gqe holds them interleaved (vk_slot_src), for expert t8_eid - 1 */ } Slot;
+                                                          or as the file's rows when gqe holds them interleaved (vk_slot_src), for expert t8_eid - 1 */
+#ifdef QWEN36_METAL_GRAPH
+                 q36_tensor *gpu; /* Metal graph: the slot itself, weights then scales */
+#endif
+               } Slot;
+#ifdef QWEN36_METAL_GRAPH
+#include "qwen36_global_cache.h"   /* the Metal graph's expert cache */
+#endif
 /* GGUF mode: where layer L's experts live. The three fused tensors hold
  * n_experts contiguous matrices each; expert e of gate is eb_g bytes at
  * e*eb_g. The types can differ per matrix and per layer (a Q4_K_M file keeps
@@ -1180,7 +1201,12 @@ typedef struct {
     GqExp *gqx; int64_t gqe_max;                            /* GGUF: per-layer expert tensors, largest expert */
     QwenEmbedding embed_native; /* the rows read in place from the checkpoint; embed is then NULL */
     QW lm_head;
-    QdfFile dense_file;        /* canonical.qc while the model loads (closed after) */
+    QdfFile dense_file;        /* canonical.qc while the model loads; the Metal graph keeps it */
+#ifdef QWEN36_METAL_GRAPH
+    QwenGlobalCache *global_cache; /* the Metal graph's experts (qwen36_global_cache.h) */
+    Slot *global_slots;     /* its slot descriptors */
+    size_t global_cache_budget;
+#endif
     Layer *L;
     LCache *cache;          /* [n_layers] */
     int *active_of;         /* [n_layers] original->active idx (Phase 2: identity for all layers) */
@@ -1243,7 +1269,24 @@ typedef struct {
      * mux_rows[s].pos of mux_rows[s].seq, so the attention and DeltaNet read and
      * write that conversation's state; NULL in every other forward. */
     const Q36Row *mux_rows;
+#ifdef QWEN36_METAL_GRAPH
+    int metal_graph;                /* the forward runs as the Metal graph */
+    struct Qwen36Graph *graph;
+#endif
 } Model;
+
+#ifdef QWEN36_METAL_GRAPH
+#define QWEN_GRAPH(m) ((m)->metal_graph)
+typedef struct Qwen36Graph Qwen36Graph;
+static int g_q36_mux_slots;   /* KV_SLOTS (serve_mux): main() sets it before the model loads */
+static int qg_create(Model *);
+static void qg_free(Model *);
+static int qg_reserve(Model *, int);
+static void qg_reset(Model *);
+static int qg_forward(Model *, const int *, int, int, float *, FILE *);
+#else
+#define QWEN_GRAPH(m) 0
+#endif
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
 static struct { int l, e; } pilot_q[4096];
@@ -1553,9 +1596,16 @@ static int container_layer_is_int4(Model *m, int layer);
  * ms/token for +0.1% perplexity. QWEN_EXPERT_ACT=f32 restores mode 0, f32
  * activations and the bit-identical contract with the pair kernels. */
 static int xf_act_mode(void){ static int v=-1; if(v<0){ const char *e=getenv("QWEN_EXPERT_ACT"); v=(e&&!strcmp(e,"f32"))?0:1; } return v; }
+static int g_xf_quiet;   /* the Metal graph's checks ask without the CPU engine's line */
 static int xf_mode(Model *m) {
-    static int v = -1;
-    if (v >= 0) return v;
+    static int v = -1, said;
+    if (v >= 0) {
+        if (v && !said && !g_xf_quiet && !QWEN_GRAPH(m)) {
+            said = 1;
+            fprintf(stderr, "[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack\n");
+        }
+        return v;
+    }
     const char *e = getenv("QWEN_EXPERT_KERNEL");
     int on = !(e && *e == '0');
     Cfg *c = &m->c;
@@ -1570,8 +1620,7 @@ static int xf_mode(Model *m) {
         if (probe != 1) on = 0;
     }
     v = on;
-    if (v) fprintf(stderr, "[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack\n");
-    return v;
+    return xf_mode(m);   /* says it, for the CPU engine */
 }
 /* The int4 experts' numbers: activations per 32, exact integer sums per 32, one fma per
  * 64 (expert_ffn.h xf16_ref), on an AVX2 build with the shared kernel in its integer
@@ -1592,10 +1641,11 @@ static int xf_a32(Model *m) {
 /* Those numbers held as rows interleaved by 16 for the CPU (xf16_*, XF_MODE_R16), unless
  * the CUDA expert tier reads the slots: it keeps pointers to their planar rows (qt_note,
  * tier_src), and the CPU then takes the same numbers from them (XF_MODE_A32), so a CUDA
- * build computes what a CPU build does. Decided at the first expert, after qt_init. */
+ * build computes what a CPU build does. Nor under the Metal graph (an x86 Mac): its kernels
+ * read the planar rows. Decided at the first expert, after qt_init. */
 static int xf_r16(Model *m) {
     static int v = -1;
-    if (v < 0) v = xf_a32(m) && !(qt_ready() && qt_experts_on());
+    if (v < 0) v = xf_a32(m) && !(qt_ready() && qt_experts_on()) && !QWEN_GRAPH(m);
     return v;
 }
 static int xf_run_mode(Model *m) { return xf_r16(m) ? XF_MODE_R16 : xf_a32(m) ? XF_MODE_A32 : xf_act_mode(); }
@@ -2065,8 +2115,8 @@ static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O)
  * the same bytes and the same bits, a prompt's rows about twice as fast. In place, a group
  * of 16 rows at a time (a group's rows and its interleaved form are the same byte range).
  * Only matrices the integer path reads from q (no int4 or f16 copy), and only when no
- * device reads them: main() skips it under the CUDA tier or a Vulkan device. Q36_ILV16=0
- * keeps the rows, as COLI_DENSE_IDOT=0 does (its f32 kernels read rows). */
+ * device reads them: main() skips it under the CUDA tier, a Vulkan device or the Metal
+ * graph. Q36_ILV16=0 keeps the rows, as COLI_DENSE_IDOT=0 does (its f32 kernels read rows). */
 #ifdef IDOT_R16
 static int q36_q8_interleave_one(QW *w) {
     if (!w->q || w->q8r16 || w->q4 || w->h || w->gq || w->O % 16 || w->I % 4) return 0;
@@ -2853,6 +2903,19 @@ static int qwen_dense_read(Model *m, const char *name, int I, int O, QW *out) {
     return 1;
 }
 
+/* The Metal graph uses canonical.qc's rows and scales in place: the GPU reads
+ * them from the mapping (qwen36_graph.h), which it keeps for the run. */
+static int qwen_dense_mapped(Model *m, const char *name, int I, int O, QW *out) {
+    if (!m->dense_file.base) return 0;
+    const int8_t *q; const float *sc;
+    if (!qdf_find(&m->dense_file, name, I, O, &q, &sc)) {
+        fprintf(stderr, "[qwen-dense] %s: not in canonical.qc\n", name); exit(1);
+    }
+    memset(out, 0, sizeof(*out));
+    out->q = (int8_t *)(uintptr_t)q; out->sc = (float *)(uintptr_t)sc; out->I = I; out->O = O; out->mapped = 1;
+    return 1;
+}
+
 /* Dense matrix load, quantized to int8 (+ int4 planar per `tag`, see
  * dense_int4_wanted) DURING loading rather than in a separate pass over the
  * whole model afterward (see QW, above Layer): reads `name` (I*O elements,
@@ -2926,7 +2989,8 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         }
         return;
     }
-    if (quantize && dense_i8_on() && qwen_dense_read(m, name, I, O, out)) return;
+    if (quantize && dense_i8_on() &&
+        (QWEN_GRAPH(m) ? qwen_dense_mapped(m, name, I, O, out) : qwen_dense_read(m, name, I, O, out))) return;
     float *p = load_t_n(m, name, (int64_t)I * O);
     out->w = p; out->q = NULL; out->sc = NULL; out->I = I; out->O = O;
     out->q4 = NULL; out->sg = NULL; out->ng = 0;
@@ -2989,7 +3053,7 @@ static void q36_dho_reload(QW *w) {
     pthread_mutex_unlock(&g_q36_dho_mx);
 }
 static void q36_dho_drop(QW *w, size_t *bytes, int *n) {
-    if (!w->vk_name || w->vk_gone || w->vk_off || w->vk_imported || !(w->q || w->q4 || w->w || w->h)) return;
+    if (!w->vk_name || w->vk_gone || w->vk_off || w->vk_imported || w->mapped || !(w->q || w->q4 || w->w || w->h)) return;
     const void *wq; const float *sc;
     int fmt = vk_qw_fmt(w, &wq, &sc);
     if (!vk_qw_tensor(w) || w->vk_imported) return;   /* refused or still read in place: keep its host pages */
@@ -3460,6 +3524,54 @@ static int gguf_report_unused(const Cfg *c) {
     return n;
 }
 
+#ifdef QWEN36_METAL_GRAPH
+/* Whether the Metal graph runs this model: the INT8 dense trunk, the packed INT4
+ * experts with groups of 64, the geometry of its kernels and a GPU that runs
+ * them. Otherwise the CPU engine runs it, and one line says why. */
+static int qwen_graph_eligible(Model *m) {
+    const Cfg *c = &m->c;
+    const char *qpack = getenv("QWEN36_QPACK"), *why = NULL;
+    char text[200];
+    if (g_gguf) why = "a GGUF model";
+    else if (!dense_i8_on() || dense_bits() != 8) why = "the dense weights are not INT8 (COLI_DENSE_I8=0 or COLI_DENSE_BITS)";
+    else if (getenv("COLI_KEEP_F32")) why = "COLI_KEEP_F32 keeps the f32 dense weights";
+    else if (qpack && *qpack) why = "a qpack container (QWEN36_QPACK)";
+    else if (q36_waligned()) why = "COLI_VULKAN=1 runs the Vulkan dense chain";
+    else if (g_q36_mux_slots > 1) {
+        snprintf(text, sizeof text, "KV_SLOTS=%d (the graph keeps one conversation's state on the GPU)", g_q36_mux_slots);
+        why = text;
+    } else if (g_cache_route) why = "CACHE_ROUTE=1 (cache-aware routing is the CPU engine's)";
+    else if (c->n_experts < 1) why = "a dense model, with no routed experts";
+    else if (c->shared_inter < 1) why = "a model without a shared expert";
+    else if (c->router_sigmoid || c->attn_sinks || c->window || c->dense_inter || c->muse)
+        why = "sigmoid routing, attention sinks, a sliding window or dense layers (Flint and Muse Spark are the "
+              "CPU engine's)";
+    else if (c->topk < 1 || c->topk > 8 || c->n_experts > 256 || c->head_dim > 256 || c->dn_kdim > 128 ||
+             c->hidden % 64 || c->inter % 64)
+        why = "a geometry outside the graph's kernels (top-k<=8, experts<=256, head_dim<=256, DeltaNet key "
+              "dim<=128, hidden and expert sizes multiples of 64)";
+    else if (g_tok_exact)   /* main sets it before model_init exactly when the snapshot has a Clef head */
+        why = "a Clef decision head (DECIDE reads every position's hidden state, the graph returns the last one)";
+    else {
+        g_xf_quiet = 1; int packed = xf_mode(m); g_xf_quiet = 0;
+        size_t bytes = (size_t)3 * c->hidden * c->inter / 2;
+        for (int l = 0; packed && l < c->n_layers; l++) for (int e = 0; packed && e < c->n_experts; e++) {
+            char name[256]; snprintf(name, sizeof name, "model.layers.%d.mlp.experts.%d.merged_weight", m->active_of[l], e);
+            const st_tensor *t = st_find(&m->S, name);
+            packed = t && t->nbytes == (int64_t)bytes;
+        }
+        if (!packed) why = "the routed experts are not all packed INT4 with groups of 64 (or QWEN_EXPERT_KERNEL=0)";
+    }
+    if (!why) {
+        const char *device = q36_gpu_default_device_name();
+        if (!*device) why = "no Metal device";
+        else if (strstr(device, "Apple Paravirtual device")) why = "the Apple Paravirtual device of a virtual machine";
+        else if (!q36_gpu_init()) why = "the Metal device cannot run the graph's kernels";
+    }
+    if (why) fprintf(stderr, "[qwen36-metal] the Metal graph is off: %s; the CPU engine runs the model\n", why);
+    return !why;
+}
+#endif
 static void model_init_range(Model *m, const char *snap, int cap, int bits,
                              int layer_begin, int layer_end,
                              int load_boundaries, int allocate_state) {
@@ -3490,7 +3602,19 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         exit(1);
     }
     double t0 = now_s();
-    qwen_dense_file_open(m, snap, load_boundaries && allocate_state && layer_begin == 0 && layer_end == c->n_layers);
+    int full_model = load_boundaries && allocate_state && layer_begin == 0 && layer_end == c->n_layers;
+    /* Phase 2: the converter stores EVERY layer (Gated-Attention + Gated DeltaNet)
+     * under its OWN original index model.layers.{i}. So active_of is the identity
+     * map; experts and dense weights are read from model.layers.{i} for all i. */
+    m->active_of = malloc((size_t)c->n_layers * sizeof(int));
+    for (int i = 0; i < c->n_layers; i++) m->active_of[i] = i;
+#ifdef QWEN36_METAL_GRAPH
+    /* A Metal engine build runs the forward on the GPU (qwen36_graph.h) where the
+     * graph can (qwen_graph_eligible); COLI_METAL=0 keeps the CPU engine. */
+    const char *metal_option = getenv("COLI_METAL");
+    if (full_model && (!metal_option || atoi(metal_option))) m->metal_graph = qwen_graph_eligible(m);
+#endif
+    qwen_dense_file_open(m, snap, full_model);
     /* Quantize during load only for the full-model path (main()'s static Model,
      * load_boundaries=1): the Segment/Edge adapters build partial or auxiliary
      * models straight off this same loop and never ran the old post-hoc
@@ -3545,14 +3669,12 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         load_tq_noted(m, "lm_head.weight", c->hidden, c->vocab, quantize_dense, "lmhead", &m->lm_head);
         if (m->lm_head.q || m->lm_head.q4 || m->lm_head.h) { qcount++; qfreed += (double)c->hidden * c->vocab * sizeof(float); }
         m->final_norm = load_norm_n(m, "model.norm.weight", c->hidden);
-        q36_load_vision(m);
+        if (!QWEN_GRAPH(m)) q36_load_vision(m);
+        else if (c->vis_depth)   /* the Metal graph takes no images */
+            fprintf(stderr, "[qwen36-metal] the vision tower is not loaded: the Metal graph takes no images "
+                            "(COLI_METAL=0 runs the CPU engine, which does)\n");
     }
     m->L = calloc((size_t)c->n_layers, sizeof(Layer));
-    /* Phase 2: the converter stores EVERY layer (Gated-Attention + Gated DeltaNet)
-     * under its OWN original index model.layers.{i}. So active_of is the identity
-     * map; experts and dense weights are read from model.layers.{i} for all i. */
-    m->active_of = malloc((size_t)c->n_layers * sizeof(int));
-    for (int i = 0; i < c->n_layers; i++) m->active_of[i] = i;
     char nm[256];
     int q_out = c->q_heads * c->q_head_dim, kv_out = c->kv_heads * c->k_head_dim;
     #define QCOUNT(field) do { if ((field).q || (field).q4 || (field).h) { qcount++; qfreed += (double)(field).I * (field).O * sizeof(float); } } while (0)
@@ -3663,7 +3785,9 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             fprintf(stderr, "refusing: running without them would compute a different model (GGUF_IGNORE_UNUSED=1 to run anyway)\n"); exit(1);
         }
     }
-    qdf_close(&m->dense_file);   /* every matrix it held is copied: closed before the RAM sizes the cache */
+    /* The CPU engine copied every matrix the file held: closed before the RAM
+     * sizes the cache. The Metal graph reads it in place and keeps it. */
+    if (!QWEN_GRAPH(m)) qdf_close(&m->dense_file);
     if (cap <= 0 && c->n_experts <= 0) {
         /* Dense checkpoint (#1757): nothing is ever routed, so the per-layer
          * expert cache is never touched by moe()/expert_get(). Sizing it
@@ -3691,11 +3815,12 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         cap = qwen36_cap_for_ram(resident, avail, ram_override,
                                   q36_eh(c), c->inter, c->n_experts, n_active,
                                   xf_mode(m), &slot_gb, &budget_gb);
-        fprintf(stderr, "[qwen36] cache auto-sized: %d slots/layer of %d experts "
-                        "(%.1f GB budget via %s, %.1f GB dense resident, %.0f MB/slot)\n",
-                cap, c->n_experts, budget_gb,
-                ram_override > 0.0 ? "RAM_GB" : "88% of available RAM",
-                resident, slot_gb * 1000.0);
+        if (!QWEN_GRAPH(m))   /* the Metal graph has one cache of its own (QWEN_EXPERT_CACHE_BYTES) */
+            fprintf(stderr, "[qwen36] cache auto-sized: %d slots/layer of %d experts "
+                            "(%.1f GB budget via %s, %.1f GB dense resident, %.0f MB/slot)\n",
+                    cap, c->n_experts, budget_gb,
+                    ram_override > 0.0 ? "RAM_GB" : "88% of available RAM",
+                    resident, slot_gb * 1000.0);
     }
     m->cache = calloc((size_t)c->n_layers, sizeof(LCache));
     for (int i = layer_begin; i < layer_end; i++) {
@@ -3712,6 +3837,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     for (int i = layer_begin; allocate_state && i < layer_end; i++) {
         if (c->is_attn[i]) { m->DN_rec[i] = NULL; m->DN_conv[i] = NULL; continue; }
         if (c->dn_vheads <= 0) { fprintf(stderr, "layer %d is DeltaNet but dn dims missing from meta\n", i); exit(1); }
+        if (QWEN_GRAPH(m)) continue;   /* the graph keeps its state on the GPU */
         m->DN_rec[i]  = calloc((size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, sizeof(float));
         m->DN_conv[i] = calloc((size_t)c->dn_conv_dim * (c->dn_convk - 1), sizeof(float));
     }
@@ -3736,8 +3862,33 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     m->dense_load_s = now_s() - t0;
 }
 
+#ifdef QWEN36_METAL_GRAPH
+static int qwen_global_cache_init(Model *m);
+#endif
 static void model_init(Model *m, const char *snap, int cap, int bits) {
     model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
+#ifdef QWEN36_METAL_GRAPH
+    if (m->metal_graph) {
+        double built = now_s();
+        /* The graph's expert cache: QWEN_EXPERT_CACHE_BYTES, else a sixteenth
+         * of the RAM (512 MiB on 8 GB). Every token needs every non-expert
+         * weight too; a larger cache helps only while the rest still fits. */
+        const char *budget = getenv("QWEN_EXPERT_CACHE_BYTES");
+        if (budget && *budget) {
+            char *end = NULL; errno = 0; unsigned long long bytes = strtoull(budget, &end, 10);
+            if (errno || !end || *end || *budget < '0' || *budget > '9' || !bytes || bytes > SIZE_MAX) {
+                fprintf(stderr, "[qwen-cache] QWEN_EXPERT_CACHE_BYTES must be a positive number of bytes\n"); exit(1);
+            }
+            m->global_cache_budget = (size_t)bytes;
+        } else {
+            uint64_t ram = 0; size_t len = sizeof(ram);
+            if (sysctlbyname("hw.memsize", &ram, &len, NULL, 0) || !ram) ram = (uint64_t)8 << 30;
+            m->global_cache_budget = (size_t)(ram / 16);
+        }
+        if (!qwen_global_cache_init(m) || !qg_create(m)) exit(1);
+        m->dense_load_s += now_s() - built;
+    }
+#endif
 }
 
 /* scale counts per expert matrix: per-row (gs=0) or grouped along input dim */
@@ -3958,13 +4109,18 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         return;
     }
     if (tw->nbytes == want_w / 2) {
-        static int noted = 0;
-        if (!noted) { fprintf(stderr, "[qwen36] int4 packed weights detected — %s\n", s->pw ? (xf_r16(m) ? "kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)" : "kept int4, repacked planar for expert_ffn.h") : "unpacking to int8 in slot"); noted = 1; }
+        static int noted = 0;   /* the Metal graph's readers come here from four threads: said once */
+        if (!__atomic_exchange_n(&noted, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "[qwen36] int4 packed weights detected — %s\n", s->pw ? (xf_r16(m) ? "kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)" : "kept int4, repacked planar for expert_ffn.h") : "unpacking to int8 in slot");
         /* The packed bytes pass through a block the thread keeps (one per thread
          * that loads experts, 1.5 MB on the 35B, never given back). Allocated and
          * freed for every miss, a block this size is mapped, zeroed and unmapped
          * each time on Windows: measured there, a copy and a repack of 1.5 MB take
-         * 0.67 ms with the malloc and the free and 0.09 ms without. */
+         * 0.67 ms with the malloc and the free and 0.09 ms without. The Metal
+         * graph's readers give it back after each read: they are threads of the
+         * system's pool (Grand Central Dispatch), which ends a thread left
+         * waiting, or the four readers of a long prompt, which end with it, and
+         * a block such a thread kept would be lost with it. */
         static _Thread_local uint8_t *raw; static _Thread_local size_t raw_cap;
         if (raw_cap < (size_t)(want_w / 2)) {
             free(raw); raw = (uint8_t *)malloc((size_t)(want_w / 2)); raw_cap = raw ? (size_t)(want_w / 2) : 0;
@@ -4008,6 +4164,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
             xf_repack_pairs_signed(s->pw + gp,     raw + gp,     cc->inter,  q36_eh(cc));
             xf_repack_pairs_signed(s->pw + 2 * gp, raw + 2 * gp, q36_eh(cc), cc->inter);
             s->is_int4 = 1;
+            if (QWEN_GRAPH(m)) { free(raw); raw = NULL; raw_cap = 0; }   /* the graph's readers keep no block (above) */
             st_read_f32(&m->S, qsnm, s->gs, 0);
             return;
         }
@@ -4055,6 +4212,112 @@ static int container_layer_is_int4(Model *m, int layer) {
     if (!tw) return 0;
     return (tw->nbytes == want_w / 2) ? 1 : 0;
 }
+
+#ifdef QWEN36_METAL_GRAPH
+/* ---- The Metal graph's expert cache (qwen36_global_cache.h): one budget for
+ * the whole model instead of a cache per layer, slots that are Metal buffers
+ * (the planar int4 weights, then the scales: what the graph's kernels read),
+ * reads announced to the disk before they are made, and a group's misses
+ * loaded in parallel. The CPU engine keeps its per-layer cache. */
+static void *qwen_global_allocate(void *context, size_t index) {
+    Model *m = context; Slot *s = &m->global_slots[index]; Cfg *c = &m->c;
+    size_t packed = (size_t)3 * c->hidden * c->inter / 2;
+    size_t gu = (size_t)scale_count_gu(c), ns = 2 * gu + (size_t)scale_count_d(c);
+    s->gpu = q36_tensor_new(packed + ns * sizeof(float));
+    if (!s->gpu) return NULL;
+    s->pw = q36_tensor_data(s->gpu);
+    s->gs = (float *)(s->pw + packed);
+    s->us = s->gs + gu; s->ds = s->gs + 2 * gu; s->eid = -1; s->is_int4 = 1;
+    return s;
+}
+/* Ask the kernel to start reading an expert into the page cache (st_prefetch:
+ * F_RDADVISE on macOS). Advisory only: the pread that follows returns the same bytes
+ * whether or not the readahead has finished, but misses announced together
+ * are read by the SSD in parallel instead of one pread at a time. */
+static void qwen_expert_advise(Model *m, int layer, int eid) {
+    char nm[256], qsnm[256]; int la = m->active_of[layer];
+    snprintf(nm, sizeof nm, "model.layers.%d.mlp.experts.%d.merged_weight", la, eid);
+    snprintf(qsnm, sizeof qsnm, "model.layers.%d.mlp.experts.%d.qs", la, eid);
+    st_prefetch(&m->S, nm); st_prefetch(&m->S, qsnm);
+}
+static void qwen_global_advise(void *context, int key) {
+    Model *m = context; qwen_expert_advise(m, key / m->c.n_experts, key % m->c.n_experts);
+}
+static int qwen_global_load(void *context, int key, void *payload) {
+    Model *m = context; Slot *s = payload; int layer = key / m->c.n_experts, eid = key % m->c.n_experts;
+    double start = now_s(); load_expert_merged(m, layer, eid, s);
+    double elapsed = now_s() - start;
+    pthread_mutex_lock(&g_pilot_mx); m->t_disk += elapsed; pthread_mutex_unlock(&g_pilot_mx);
+    s->eid = eid; return 1;   /* tensor I/O errors stay process-fatal, as in load_expert_merged */
+}
+/* A group's misses on up to four of the system's worker threads (Grand
+ * Central Dispatch: they sleep between groups, where OpenMP's spin and take
+ * power from the GPU). The reads were announced together, so a load is
+ * mostly a copy out of the page cache and a repack: CPU work that one thread
+ * did one expert after the other. */
+typedef struct { Model *m; const int *keys; void *const *payloads; unsigned n, workers; int ok; } QwenLoadMany;
+static void qwen_global_load_some(void *context, size_t worker) {
+    QwenLoadMany *w = context;
+    for (size_t i = worker; i < w->n; i += w->workers)
+        if (!qwen_global_load(w->m, w->keys[i], w->payloads[i])) __atomic_store_n(&w->ok, 0, __ATOMIC_RELAXED);
+}
+static int qwen_global_load_many(void *context, const int *keys, void *const *payloads, unsigned n) {
+    QwenLoadMany w = {context, keys, payloads, n, n < 4 ? n : 4, 1};
+    dispatch_apply_f(w.workers, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), &w, qwen_global_load_some);
+    return __atomic_load_n(&w.ok, __ATOMIC_RELAXED);   /* a failed load never publishes its slot */
+}
+static void qwen_global_free(void *context, void *payload) {
+    Slot *s = payload; (void)context;
+    if (s->gpu) q36_tensor_free(s->gpu);
+    memset(s, 0, sizeof(*s));
+}
+static int qwen_global_cache_init(Model *m) {
+    Cfg *c = &m->c;
+    (void)xf_r16(m);   /* decided once here, before the readers reach it from four threads at once */
+    /* Decode keeps the experts by their expected reuse (qwen36_expected_policy.h);
+     * the graph tells the cache when decode starts. QWEN36_CACHE_EXPECTED=0
+     * keeps the frequency policy, to measure. */
+    const char *expected_env = getenv("QWEN36_CACHE_EXPECTED");
+    int expected_on = !expected_env || strcmp(expected_env, "0");
+    if (!xf_mode(m) || c->topk < 1 || c->topk > QGC_MAX_GROUP ||
+        c->n_layers < 1 || c->n_experts < 1 || c->n_layers > INT_MAX / c->n_experts) {
+        fprintf(stderr, "[qwen-cache] the Metal graph needs the packed INT4 experts\n"); return 0;
+    }
+    if (c->hidden <= 0 || c->inter <= 0 || (uint64_t)c->hidden > (uint64_t)INT64_MAX / 3 / (uint64_t)c->inter) return 0;
+    size_t packed = (size_t)3 * c->hidden * c->inter / 2;
+    size_t scales = (size_t)(2 * scale_count_gu(c) + scale_count_d(c)) * sizeof(float);
+    if (!packed || packed > SIZE_MAX - scales) return 0;
+    size_t payload = packed + scales, keys = (size_t)c->n_layers * c->n_experts;
+    size_t slots = m->global_cache_budget / payload;
+    if (slots > (size_t)INT_MAX || slots < (size_t)c->topk) {
+        fprintf(stderr, "[qwen-cache] budget cannot hold one complete top-k group\n"); return 0;
+    }
+    if (slots > keys + (size_t)c->topk) slots = keys + (size_t)c->topk;
+    /* One physical representation for every slot: check every expert first. */
+    for (int l = 0; l < c->n_layers; l++) for (int e = 0; e < c->n_experts; e++) {
+        char name[256]; snprintf(name, sizeof name, "model.layers.%d.mlp.experts.%d.merged_weight", m->active_of[l], e);
+        st_tensor *t = st_find(&m->S, name);
+        if (!t || t->nbytes != (int64_t)packed) { fprintf(stderr, "[qwen-cache] incompatible packed expert %s\n", name); return 0; }
+    }
+    m->global_slots = calloc(slots, sizeof(Slot)); m->global_cache = calloc(1, sizeof(QwenGlobalCache));
+    if (!m->global_slots || !m->global_cache) goto fail;
+    uint64_t age_interval = (uint64_t)c->n_layers * c->topk * 8;
+    if (!qgc_init(m->global_cache, keys, slots, (size_t)c->topk, payload, payload, age_interval,
+                  m, qwen_global_allocate, qwen_global_load, qwen_global_free)) goto fail;
+    if (expected_on && !qgc_expected_enable(m->global_cache, (size_t)c->n_layers, (size_t)c->n_experts, (size_t)c->topk)) {
+        fprintf(stderr, "[qwen-cache] cannot allocate the decode reuse estimates\n");
+        qgc_destroy(m->global_cache); goto fail;
+    }
+    m->global_cache->advise = qwen_global_advise;
+    m->global_cache->load_many = qwen_global_load_many;
+    m->global_cache->stats.metadata += slots * sizeof(Slot);
+    fprintf(stderr, "[qwen-cache] global_bytes=%zu slots=%zu slot_bytes=%zu decode_policy=%s\n",
+            m->global_cache->budget, slots, payload, expected_on ? "expected-reuse" : "frequency");
+    return 1;
+fail:
+    free(m->global_cache); free(m->global_slots); m->global_cache = NULL; m->global_slots = NULL; return 0;
+}
+#endif
 
 /* Rematerialize a slot's int8 block from its packed int4 copy on demand
  * (~0.5 ms, no container access). Needed after the warmstart freed the int8
@@ -5928,6 +6191,16 @@ static void q36_embed_row(Model *m, int id, int pos, float *row) {
         memcpy(row, m->embed + (int64_t)id*D, D*sizeof(float));
     if (m->c.muse && !(vrow >= 0 && vrow < m->vis_rows_n)) rmsnorm_plain(row, row, D, m->c.eps);   /* Muse Spark: the token's row normalised */
 }
+#ifdef QWEN36_METAL_GRAPH
+/* A token's embedding row, without the image rows (the Metal graph takes no images). */
+static int qwen_embedding_row(Model *m, int id, float *row) {
+    if (id < 0 || id >= m->c.vocab) return 0;
+    q36_embed_row(m, id, INT_MAX, row);
+    return 1;
+}
+#include "qwen36_selected_loader.h"
+#include "qwen36_graph.h"
+#endif
 
 #ifdef COLI_CUDA
 #include "qwen36_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
@@ -5968,6 +6241,24 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
      * Set DUMP_LAYERS=<path> to write n_layers * D raw float32 rows. */
     FILE *lf = NULL; const char *lfn = getenv("DUMP_LAYERS");
     if (lfn) { lf = fopen(lfn, "wb"); if (!lf) fprintf(stderr, "DUMP_LAYERS: cannot open %s\n", lfn); }
+#ifdef QWEN36_METAL_GRAPH
+    /* The Metal graph: the forward pass on the GPU, the last row's logits back. */
+    if (m->graph) {
+        if (nlogits != 1 || g_hidden_sink) { fprintf(stderr, "[qwen36-metal] the Metal graph returns only the last row\n"); exit(1); }
+        for (int s = 0; s < S; s++)
+            if (ids[s] < 0 || ids[s] >= c->vocab) {
+                fprintf(stderr, "token id %d out of range 0..%d -- refusing\n", ids[s], c->vocab - 1);
+                exit(1);
+            }
+        float *logit = falloc(c->vocab);
+        if (!qg_forward(m, ids, S, pos_base, logit, lf)) { fprintf(stderr, "[qwen36-metal] forward failed\n"); exit(1); }
+        if (lf) fclose(lf);
+        kv_prefix_record(&m->kvp, ids, pos_base, S);
+        m->token_count += S; m->freq_token_count += S;
+        m->kv_len = pos_base + S;
+        return logit;
+    }
+#endif
     if (g_pilot && m->token_count > 0) {
         pthread_mutex_lock(&g_pilot_mx);
         memset(m->is_queued, 0, (size_t)c->n_layers * c->n_experts);
@@ -6459,6 +6750,9 @@ static void reset_recurrent(Model *m){
      * forget what it was built from, or the two disagree in favour of the one
      * nobody can check. */
     kv_prefix_clear(&m->kvp);
+#ifdef QWEN36_METAL_GRAPH
+    if (m->graph) { qg_reset(m); return; }
+#endif
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]) continue;
         if (m->DN_rec[i])  memset(m->DN_rec[i],  0, (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float));
@@ -6487,6 +6781,17 @@ static void q36_prefill_abort(Model *m) {
  * growth so the server doesn't leak KV memory across requests. */
 static void ensure_kv(Model *m){
     Cfg *c = &m->c;
+#ifdef QWEN36_METAL_GRAPH
+    if (m->graph) {
+        if (!qg_reserve(m, m->max_t)) { fprintf(stderr, "[qwen36-metal] cannot reserve the KV cache\n"); exit(1); }
+        /* The graph keeps its rows when it grows, so the record of what built
+         * them stays too (kv_prefix_reuse). */
+        if (m->kvp.cap < m->max_t &&
+            !(m->kvp.fed ? kv_prefix_grow(&m->kvp, m->max_t, m->kvp.len) : kv_prefix_alloc(&m->kvp, m->max_t)))
+            kv_prefix_clear(&m->kvp);
+        return;
+    }
+#endif
     if (m->kv_cap >= m->max_t && m->K) {
         /* max_t is the ROW STRIDE of the KV cache, not just a capacity: a row
          * lives at (head*max_t + position)*head_dim. Callers set it per request
@@ -6574,7 +6879,8 @@ static void ensure_kv(Model *m){
  * reads each row on its own (step_ex). So the logits the caller sees, and its
  * picks, greedy or sampled, are those of plain decoding. Drafting stays off
  * where that does not hold: the CUDA tier (its float order follows residency),
- * CACHE_ROUTE (it routes by residency) and a qpack container.
+ * CACHE_ROUTE (it routes by residency) and a qpack container. The Metal graph
+ * has no verify, so it does not draft either.
  *
  * Whether a proposal is drafted is the gate's call (spec_draft.h): the measured
  * acceptance by draft position and the measured cost of a verify by its rows;
@@ -6622,6 +6928,14 @@ static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     sp->force = q36_spec_force_mode(getenv("COLI_LOOKUP_FORCE"), &sp->force_row);
     e = getenv("COLI_SPEC_GATE");
     spec_gate_init(&sp->gate, e && *e == '0');
+    if (sp->lookup && QWEN_GRAPH(m)) {
+        static int said_graph;
+        if (!said_graph && asked) {   /* the default stays quiet: nothing was asked for */
+            said_graph = 1;
+            fprintf(stderr, "[qwen36] COLI_LOOKUP=1: the Metal graph has no speculative verify; plain decoding\n");
+        }
+        sp->lookup = 0;
+    }
     int tier_off = (qt_ready() || m->dn_dev) && !q36_cuda_tier_drafts(m);
     if (sp->lookup && (tier_off || g_cache_route || qq_active())) {
         static int said;
@@ -7112,6 +7426,15 @@ static int serve_eos_ids(int *ids, int cap){
     return n;
 }
 
+#ifdef QWEN36_METAL_GRAPH
+/* The token that opens a turn of the chat template, -1 without one. */
+static int serve_turn_id(void){
+    for(int k=0;k<g_nspecial;k++)
+        if(!strcmp(g_sp_str[k],"<|im_start|>")) return g_sp_id[k];
+    return -1;
+}
+#endif
+
 /* Un CANCEL per la richiesta in corso, visto SENZA bloccare (#1332).
  *
  * Prima serve_read_req era l'unico posto che leggeva un CANCEL, e viene
@@ -7171,6 +7494,11 @@ static void emap_emit(Model *m){
     for(int i=0;i<rows;i++) for(int e=0;e<cols;e++)
         cells[(size_t)i*cols+e]=(uint8_t)(((qt_is_resident(i,e)||vkt_resident(i,e))?2:slot_indexed(m,i,e)?1:0)<<6);   /* 2 = on a CUDA/Vulkan device */
     pthread_mutex_unlock(&g_pilot_mx);
+#ifdef QWEN36_METAL_GRAPH
+    if(QWEN_GRAPH(m))   /* the graph's experts are in its one cache, which takes its own lock */
+        for(int i=0;i<rows;i++) for(int e=0;e<cols;e++)
+            cells[(size_t)i*cols+e]=(uint8_t)((qgc_contains(m->global_cache,i*cols+e)?1:0)<<6);
+#endif
     char *hex=malloc((size_t)rows*cols*2+1); dash_hex(cells,rows*cols,hex);
     printf("EMAP %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex); free(cells);
 }
@@ -7222,7 +7550,10 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     if(g_pending_image.present){
         Cfg *vc = &m->c;
         if(!m->vis_ready){
-            printf("ERROR %s this engine has no vision tower; images are not supported\n",q->id);
+            if(QWEN_GRAPH(m) && vc->vis_depth)
+                printf("ERROR %s the Metal graph takes no images; COLI_METAL=0 runs the CPU engine, which does\n",q->id);
+            else
+                printf("ERROR %s this engine has no vision tower; images are not supported\n",q->id);
             fflush(stdout); q36_pending_image_clear(); free(ids); return 0;
         }
         unsigned long long want = (unsigned long long)g_pending_image.grid_h*g_pending_image.grid_w*
@@ -7238,6 +7569,16 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         }
         q36_pending_image_clear();
     }
+#ifdef QWEN36_METAL_GRAPH
+    if(m->graph && q->logprobs > 0){   /* the graph returns the last row's logits only */
+        printf("ERROR %s the Metal graph returns no prompt logprobs; COLI_METAL=0 runs the CPU engine, which does\n",q->id);
+        fflush(stdout); free(ids); return 0;
+    }
+    if(m->graph && q->pin){
+        static int said_pin;
+        if(!said_pin){ said_pin = 1; fprintf(stderr, "[qwen36-metal] pin=1: the Metal graph keeps no pins (its state is on the GPU); the requests run without\n"); }
+    }
+#endif
     int max_ctx = qwen36_max_ctx();
     int budget = qwen36_serve_budget(np, q->max_tok, max_ctx, q->logprobs > 0);
     if(budget < 0){
@@ -7283,11 +7624,34 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * suo primo token senza logprob: proprio il token che serve. Rimetterla
      * quando lo stato e gia quello costa una memcpy, non un prefill. */
     g_pin_use_logit = 0;
+#ifdef QWEN36_METAL_GRAPH
+    if (!m->graph)   /* pins copy the CPU engine's state; the graph keeps its own on the GPU */
+#endif
     {
         int pinned = pin_restore(m, ids, np);
         if (pinned) { reuse = pinned; g_pin_use_logit = 1; }
     }
     g_echo_k = q->logprobs; g_echo_id = q->id;
+#ifdef QWEN36_METAL_GRAPH
+    /* With the graph a chat turn also finds the state where the previous
+     * prompt's last turn opened (its last <|im_start|>): the template rewrites
+     * the open turn's header and <think> block with the answer, so a prompt
+     * that resends the conversation usually diverges right after it, where
+     * kv_prefix_reuse finds nothing. The forward keeps a copy of the DeltaNet
+     * state there; the KV rows before it stay where they are. */
+    int snap_cut = np - 1, snap_armed = 0;
+    if (m->graph && !kv_prefix_off()) {   /* COLI_KV_PREFIX=0: no reuse at all, as on the CPU engine */
+        Qwen36Graph *g = m->graph; int turn = serve_turn_id();
+        for (int i = np - 1; i > 0; i--) if (ids[i] == turn) { snap_cut = i; break; }
+        int snap_ok = g->snap_len > 0 && g->snap_len <= snap_cut &&
+                      !memcmp(ids, g->snap_ids, (size_t)g->snap_len * sizeof(int));
+        if (snap_ok && reuse < g->snap_len) {
+            qg_snapshot_load(m); reuse = g->snap_len;
+            kv_prefix_clear(&m->kvp); kv_prefix_record(&m->kvp, ids, 0, reuse);
+            fprintf(stderr, "[qwen36] prompt of %d tokens: %d from the previous turn\n", np, reuse);
+        } else if (!snap_ok) g->snap_len = 0;   /* its KV rows are about to be overwritten */
+    }
+#endif
     /* The read-out promises a frame for EVERY prompt position, starting at 0. A live
      * prefix is not recomputed, so its positions would carry no frame at all -- the hole
      * the gateway refuses by name (engine_pinned_prefix_not_echoed) rather than serving
@@ -7297,6 +7661,9 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * that follows it, so it still resumes. */
     if (g_echo_k > 0 && !g_pin_use_logit) reuse = 0;
     if (!reuse) { reset_recurrent(m); m->kv_len = 0; }
+#ifdef QWEN36_METAL_GRAPH
+    if (m->graph && !kv_prefix_off()) snap_armed = snap_cut > reuse && qg_snapshot_arm(m, snap_cut);
+#endif
     /* Per-REQUEST state, not per-process: without this the server keeps the
      * first request's prefill flag and expert-collection set forever, so
      * COLIBRI_RESIDENT=1 collects on request #1 and never again, and the
@@ -7321,6 +7688,8 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
 #ifdef COLI_CUDA
     if (g_cuda_chain) interruptible = 0;
 #endif
+    /* The Metal graph is given the control too and does not poll it: a control
+     * that arrives during its prompt is taken below, once the prompt is read. */
     Q36StepControl control = {serve_prefill_poll, q->id, Q36_CONTROL_NONE};
     int prefill_control = g_q36_mux_slots == 1 ? serve_control_pending(q->id) : Q36_CONTROL_NONE;
     float *lo = NULL;
@@ -7342,6 +7711,10 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         return 0;
     }
     qt_stats_mark();
+#ifdef QWEN36_METAL_GRAPH
+    if (snap_armed) qg_snapshot_taken(m, ids);
+    if (!m->graph)
+#endif
     if (q->pin) pin_save(m, ids, np, lo);
     clk->s_disk=m->t_disk; clk->s_attn=tm_sum(0)+tm_sum(1); clk->s_moe=tm_sum(2); clk->s_head=tm_sum(5);
     clk->hits=m->hits; clk->miss=m->miss;
@@ -8801,7 +9174,7 @@ int main(int argc, char **argv) {
 #ifdef COLI_VULKAN
         dev = dev || g_vk_ready;
 #endif
-        if (!dev) q36_trunk_q8_interleave(&m);
+        if (!dev && !QWEN_GRAPH(&m)) q36_trunk_q8_interleave(&m);   /* the Metal graph reads the rows as they are */
     }
     /* coli serve mode: speak the gateway wire protocol instead of argv
      * generation. AFTER the tier init: serve sessions ride the VRAM experts

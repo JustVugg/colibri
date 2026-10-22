@@ -75,7 +75,9 @@ the optional CUDA VRAM expert tier documented in
 through ROCm with `make -C c qwen36 HIP=1 HIP_ARCH=<gfx>` (for example
 `HIP_ARCH=gfx1151`, with `ROCM_HOME` and `HIPCC` pointing at the toolchain):
 measured on a Ryzen AI MAX+ 395, output bit-identical to the CPU path and 2.4x
-faster than CPU-only (#1502).
+faster than CPU-only (#1502). On Apple Silicon, `make -C c qwen36 METAL=1`
+runs the forward pass on the GPU, by default in that build; see
+[`qwen36-metal.md`](qwen36-metal.md).
 
 ## Vulkan
 
@@ -117,7 +119,7 @@ row, so a rejected draft rolls back by swapping a copy in. A gate drafts only wh
 measured acceptance and verify cost say it pays. The output is that of plain decoding,
 greedy or sampled, on the CPU, in the Vulkan dense chain and in the CUDA chain with every
 routed expert on the device. Lookup stays off under a CUDA tier holding part of the
-experts, `CACHE_ROUTE` and a qpack container, whose results depend on what is resident. On a code edit, Qwen3.6-35B-A3B decoded 7.90 tok/s with lookup against 7.42 without (1.56 tokens per forward); on a chat prompt the gate declined every proposal and the speed was unchanged. How it works, the gate, the settings and the tests:
+experts, `CACHE_ROUTE` and a qpack container, whose results depend on what is resident, and under the Metal graph ([qwen36-metal.md](qwen36-metal.md)), which has no verify. On a code edit, Qwen3.6-35B-A3B decoded 7.90 tok/s with lookup against 7.42 without (1.56 tokens per forward); on a chat prompt the gate declined every proposal and the speed was unchanged. How it works, the gate, the settings and the tests:
 [speculative.md](speculative.md).
 
 ## The MTP head (`Q36_MTP`)
@@ -159,7 +161,8 @@ KV cache; only draft rows need its full decoder computation. Rejected verify
 rows are rewound, and pins preserve the pending residual. The same verify
 path as prompt lookup commits tokens: output and final logits equal ordinary
 decoding, including sampled `serve` turns. As for lookup, speculation is off
-under a CUDA tier holding part of the experts, `CACHE_ROUTE` and qpack.
+under a CUDA tier holding part of the experts, `CACHE_ROUTE`, qpack and the
+Metal graph.
 
 `Q36_MTP_DRAFTS=1` is the default; `1` through `7` set the maximum depth, and
 `auto` lets the measured gate choose. `Q36_MTP_PMIN` (default `0`) stops adding
@@ -318,6 +321,8 @@ ordinary memory, as after a conversion, and the file is closed once they are: th
 CPU reads every dense matrix at every token. On an 8 GB M1 the 35B model is then
 ready in 3.6 s instead of 4.4, with a peak memory footprint of 3.5 GB instead of
 4.7 and the same speed ([experiment manifest](experiments/qwen36-canonical-dense-2026-10-07/manifest.json)).
+The Metal graph ([qwen36-metal.md](qwen36-metal.md)) does not copy them: it reads
+the matrices in place and keeps the file mapped.
 
 The file is checked against the model before it is used: the list of matrices
 and their shapes, the quantizer (`QDF_QUANTIZER`), and the first and last 128

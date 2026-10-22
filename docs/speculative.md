@@ -62,7 +62,9 @@ so the rows get the bits of the single dispatch.
 Drafting stays off where a row's result depends on what is resident: qwen36 under a
 CUDA expert tier holding part of the experts, `CACHE_ROUTE` or a qpack container (with
 `COLI_LOOKUP=1` asked for, a `[qwen36] COLI_LOOKUP=1: no drafts under ...` line says so;
-the default stays quiet). A tier holding every routed expert, run by the CUDA chain, drafts:
+the default stays quiet). qwen36's Metal graph ([qwen36-metal.md](qwen36-metal.md)) has no
+verify, so it does not draft either (with `COLI_LOOKUP=1`, a line says so). A tier holding
+every routed expert, run by the CUDA chain, drafts:
 nothing there depends on residency, and the chain's verify rows get a decode step's bits.
 On an RTX PRO 4000 (Qwen3.6-35B-A3B int4-g64) a code edit of 400 tokens took 3.25 s
 against 4.40 s without lookup, 2.91 tokens per forward, the same text; on a chat answer
