@@ -39,6 +39,14 @@ The release's `macos-arm64.tar.gz` has `colibri`, `inkling` and `kimi_k3` built
 with `METAL=1`: `COLI_METAL=1` (`K3_METAL=1` for Kimi K3) turns the backend on
 with nothing to build, and without it they run on the CPU as before.
 
+Qwen3.6 (`qwen36`) has an engine of its own on Metal, the graph of
+[qwen36-metal.md](qwen36-metal.md), and it differs from the above: a
+`make qwen36 METAL=1` build runs it by default (`COLI_METAL=0` runs the CPU
+engine), the build needs a clang with `#embed` and the macOS 15 SDK, and it
+does not fall back per block: where the graph cannot run it steps aside at
+start with one line, and a GPU, memory or read error stops the process. The
+release archives build `qwen36` without it.
+
 Measured on an M4 Max (128 GB, warm cache, MTP on): CPU 0.30 → Metal
 **0.42 tok/s (~1.4×)** (best config adds `DIRECT=1`; ~3× vs this machine's
 first cold run). An M5 Max with a 46.9 GB learned pin reached **2.06 tok/s**
