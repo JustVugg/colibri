@@ -1,0 +1,27 @@
+The summary printed at the end of the measurement by the script that ran it (a local script, not in this record: before every run it waits for the nominal thermal state, rests 60 s and reads the swap counters, then runs the manifests' command): every run's raw log is in baseline.txt and trial.txt. Its 'peak memory ... MB' is in MiB (2^20 bytes); 'pages written to swap' is the system-wide counter.
+
+model <model>; text promessi_sposi.txt; lengths 64,512; gen 32; runs 4; extra env: none
+cooldown before every run: 60 seconds, after waiting for thermal state 0: yes, at most 900s; thermal states: 0 nominal, 1 fair, 2 serious, 3 critical
+v0: bin-checkpoint/qwen36-bench ()
+v1: bin-pr8/qwen36-bench (commit ca1a863b1b8b2c2b99a1367a25f8ea2880f4dcfb (Metal engine, make qwen36 METAL=1 flags on macOS))
+order: the binaries' order turns at every round (ABBA)
+
+v0: 4 runs (median, min-max)
+tokens    new            prompt tok/s          first token ms        generation tok/s  experts read  fingerprint
+    64     64     21.93 (21.73-22.43)           318 (286-337)     8.744 (8.599-8.811)          8999  9585b2736ec3699f
+   512    512  114.27 (110.91-114.85)           298 (295-302)     9.206 (9.101-9.262)         10839  465ed0efdf92a690
+peak memory 998 MB, model ready in 0.18 s (medians)
+
+v1: 4 runs (median, min-max)
+tokens    new            prompt tok/s          first token ms        generation tok/s  experts read  fingerprint
+    64     64     26.34 (25.66-26.55)           268 (255-286)     9.114 (9.068-9.210)          8999  9585b2736ec3699f
+   512    512  136.68 (136.16-138.31)           260 (253-270)     9.486 (9.408-9.568)         10839  465ed0efdf92a690
+peak memory 985 MB, model ready in 0.19 s (medians)
+
+warm-up (does not count): 64 tokens: prompt 17.07 tok/s, generation 8.468 tok/s; 512 tokens: prompt 110.34 tok/s, generation 9.244 tok/s
+
+v1 against v0 (medians):
+    64 tokens: prompt +20.1%, first token +18.6%, generation +4.2%  (same results)
+   512 tokens: prompt +19.6%, first token +14.7%, generation +3.0%  (same results)
+(positive = faster)
+swap used 366.56M -> 366.56M; pages written to swap during the runs: 0 (16 KB each)

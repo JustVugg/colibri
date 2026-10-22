@@ -1,0 +1,27 @@
+The summary printed at the end of the measurement by the script that ran it (a local script, not in this record: before every run it waits for the nominal thermal state, rests 60 s and reads the swap counters, then runs the manifests' command): every run's raw log is in baseline-fast-prose.txt and trial-fast-prose.txt. Its 'peak memory ... MB' is in MiB (2^20 bytes); 'pages written to swap' is the system-wide counter. Its 'first token ms' is the first decode step and its 'generation tok/s' steps 2 to 32, the harness's two columns; the manifests and the README count all 32 steps.
+
+model <model+head>; text promessi_sposi.txt; lengths 64,512; gen 32; runs 4; extra env: TEACHER=1
+cooldown before every run: 60 seconds, after waiting for thermal state 0: yes, at most 900s; thermal states: 0 nominal, 1 fair, 2 serious, 3 critical
+v0: launchers/fast-mtp0/qwen36-bench (commit c8fc51fcd3f1a7b725b26c2a103fdd52bbca4138 (fast mode, QWEN36_MTP=0))
+v1: launchers/fast-mtp/qwen36-bench (commit c8fc51fcd3f1a7b725b26c2a103fdd52bbca4138 (fast mode, the MTP head's drafts))
+order: the binaries' order turns at every round (ABBA)
+
+v0: 4 runs (median, min-max)
+tokens    new            prompt tok/s          first token ms        generation tok/s  experts read  fingerprint
+    64     64     25.57 (24.54-25.65)           273 (269-275)     8.623 (8.564-8.779)          8717  22460e54acfb3fb4  nll 2.6915 top1 0.469
+   512    512  128.93 (124.56-136.24)           298 (296-306)     8.924 (8.664-9.050)         10754  42619567031d6eeb  nll 2.9840 top1 0.438
+peak memory 986 MB, model ready in 0.19 s (medians)
+
+v1: 4 runs (median, min-max)
+tokens    new            prompt tok/s          first token ms        generation tok/s  experts read  fingerprint
+    64     64     24.77 (24.50-25.17)           290 (277-296)     8.820 (8.758-8.881)          9003  5aa2beb015d4c044  nll 2.6915 top1 0.469
+   512    512  126.32 (124.34-128.07)           434 (387-487)     9.123 (9.093-9.152)         10968  dd89fa1e2761d655  nll 2.9740 top1 0.438
+peak memory 1122 MB, model ready in 0.29 s (medians)
+
+warm-up (does not count): 64 tokens: prompt 24.18 tok/s, generation 8.615 tok/s; 512 tokens: prompt 128.72 tok/s, generation 8.963 tok/s
+
+v1 against v0 (medians):
+    64 tokens: prompt -3.1%, first token -5.7%, generation +2.3%  (same words, logits differ; nll 2.6915 -> 2.6915 (+0.0000), top1 0.469 -> 0.469)
+   512 tokens: prompt -2.0%, first token -31.2%, generation +2.2%  (same words, logits differ; nll 2.9840 -> 2.9740 (-0.0099), top1 0.438 -> 0.438)
+(positive = faster)
+swap used 361.38M -> 361.38M; pages written to swap during the runs: 0 (16 KB each)
