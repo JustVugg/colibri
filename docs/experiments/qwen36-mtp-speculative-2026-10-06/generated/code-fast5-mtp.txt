@@ -1,0 +1,24 @@
+_tensor *router_logits;
+    q36_tensor *x;                 /* input/output tensor */
+    int head_count, head_size, kv_head_count;
+    int head_size_norm;
+    int kv_cap;
+    int is_delta;
+} QgLayer;
+
+typedef struct {
+    q36_tensor *ln_f;
+    q36_tensor *wte;
+    q36_tensor *lm_head;
+    q36_tensor *rope_table;
+    q36_tensor *logits;
+    QgLayer *layers;
+    int layer_count;
+} QgModel;
+
+/* ── graph construction ──────��─────────��─────────��────── */
+
+static inline void qg_dense(QgModel *m, QgLayer *l, q36_tensor *x, QgDense *d,
+                 q36_tensor *ln, q36_tensor *post_ln) {
+    d->q = q36_tensor_alloc(m->ctx, x->dims[0], x->dims[1], d->in, d->out);
+    d->sc = q36_tensor_alloc(m->ctx, x->dims[0

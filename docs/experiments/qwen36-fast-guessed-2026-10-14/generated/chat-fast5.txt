@@ -1,0 +1,19 @@
+ floor, which are worth it if you want a deeper experience. For the Vatican, the early morning slot is the best to avoid the longest lines.
+
+For food, Rome is famous for its pasta and pizza. For lunch, try a classic pasta dish like carbonara, cacio e pepe, or amatriciana. For dinner, pizza al taglio (by the slice) or pizza tonda (round pizza) is a good choice. For dessert, gelato is a must.
+
+User: What are the best gelato places?
+
+Assistant:
+
+<think>
+Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - User asks: "What are the best gelato places?"
+   - Context: Rome trip, late October, 3 days, first-time visitor.
+   - Need: Recommendations for authentic, high-quality gelato spots in Rome.
+   - Should include: Specific names, locations/areas, what to look for (how to spot real gelato), and maybe a tip about timing/seasonality.
+
+2.  **Identify Key Requirements for Gelato Recommendations in Rome:**
+   - Authenticity: Real gelato (not ice cream) uses natural ingredients, is stored in covered containers
