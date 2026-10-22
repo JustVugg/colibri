@@ -209,6 +209,98 @@ static void test_repack_bytes(void) {
     if (!bad) printf("repack path: %s, every byte value in every block position as defined\n", path);
 }
 
+/* Independent format oracle: decode the 64 signed elements first, then encode
+ * their unsigned planar pairs. Do not share the implementation's SIMD shuffle
+ * or compare only against the out-of-place implementation of the same helper. */
+static void repack_oracle(uint8_t *dst, const uint8_t *src, size_t bytes) {
+    for (size_t b = 0; b < bytes; b += XF_BLOCK_BYTES) {
+        int values[XF_BLOCK];
+        for (int k = 0; k < XF_BLOCK; k++) {
+            int v = (src[b + k / 2] >> (4 * (k % 2))) & 15;
+            values[k] = v >= 8 ? v - 16 : v;
+        }
+        for (int k = 0; k < XF_BLOCK_BYTES; k++)
+            dst[b + k] = (uint8_t)((values[k] + 8) |
+                                  ((values[k + XF_BLOCK_BYTES] + 8) << 4));
+    }
+}
+
+static void test_repack_inplace_shape(int O, int I, int offset) {
+    size_t bytes = (size_t)O * I / 2, prefix = 32 + (size_t)offset;
+    uint8_t *src = malloc(bytes), *expected = malloc(bytes);
+    uint8_t *allocation = malloc(prefix + bytes + 32);
+    CHECK(src && expected && allocation, "in-place repack allocation");
+    if (!src || !expected || !allocation) {
+        free(src); free(expected); free(allocation); return;
+    }
+    for (size_t i = 0; i < bytes; i++)
+        src[i] = (uint8_t)(i * 17 + (i / 32) * 23 + offset);
+    repack_oracle(expected, src, bytes);
+    memset(allocation, 0xa7, prefix + bytes + 32);
+    uint8_t *actual = allocation + prefix;
+    memcpy(actual, src, bytes);
+    xf_repack_pairs_signed(actual, actual, O, I);
+    CHECK(!memcmp(actual, expected, bytes), "in-place repack O=%d I=%d offset=%d", O, I, offset);
+    int guard_bad = 0;
+    for (size_t i = 0; i < prefix; i++) guard_bad += allocation[i] != 0xa7;
+    for (size_t i = 0; i < 32; i++) guard_bad += actual[bytes + i] != 0xa7;
+    CHECK(!guard_bad, "in-place repack O=%d I=%d offset=%d changed %d guard bytes", O, I, offset, guard_bad);
+    free(src); free(expected); free(allocation);
+}
+
+/* Separate from the existing disjoint-buffer checks: complete aliasing is the
+ * loader's contract. Partial overlap is deliberately unsupported. */
+static void test_repack_inplace(void) {
+    static const int offsets[] = {0, 1, 7, 15, 16, 31};
+    uint8_t src[XF_BLOCK_BYTES], expected[XF_BLOCK_BYTES];
+    uint8_t allocation[32 + 31 + XF_BLOCK_BYTES + 32];
+    int bad = 0, guard_bad = 0;
+    for (size_t oi = 0; oi < sizeof offsets / sizeof offsets[0]; oi++) {
+        size_t prefix = 32 + (size_t)offsets[oi];
+        uint8_t *actual = allocation + prefix;
+        for (int v = 0; v < 256; v++) for (int p = 0; p < XF_BLOCK_BYTES; p++) {
+            for (int j = 0; j < XF_BLOCK_BYTES; j++) src[j] = (uint8_t)(j * 37 + v * 19 + p);
+            src[p] = (uint8_t)v;
+            repack_oracle(expected, src, sizeof src);
+            memset(allocation, 0xa7, sizeof allocation);
+            memcpy(actual, src, sizeof src);
+            xf_repack_pairs_signed(actual, actual, 1, XF_BLOCK);
+            bad += memcmp(actual, expected, sizeof expected) != 0;
+            for (size_t j = 0; j < prefix; j++) guard_bad += allocation[j] != 0xa7;
+            for (size_t j = prefix + sizeof src; j < sizeof allocation; j++) guard_bad += allocation[j] != 0xa7;
+        }
+        test_repack_inplace_shape(3, 128, offsets[oi]);
+        test_repack_inplace_shape(512, 2048, offsets[oi]);
+        test_repack_inplace_shape(2048, 512, offsets[oi]);
+    }
+    CHECK(!bad && !guard_bad, "in-place repack: %d cases differ, %d guard bytes changed", bad, guard_bad);
+    if (!bad && !guard_bad) printf("repack in-place: every byte/position, unaligned rows and expert shapes match independent oracle\n");
+}
+
+/* The scalar loop on every host, in place and between distinct buffers: an
+ * AVX2 or AArch64 build takes no block of a whole row through it. */
+static void test_repack_scalar(void) {
+    uint8_t src[XF_BLOCK_BYTES], expected[XF_BLOCK_BYTES], out[XF_BLOCK_BYTES];
+    uint8_t allocation[32 + XF_BLOCK_BYTES + 32];
+    uint8_t *actual = allocation + 32;
+    int bad = 0, guard_bad = 0;
+    for (int v = 0; v < 256; v++) for (int p = 0; p < XF_BLOCK_BYTES; p++) {
+        for (int j = 0; j < XF_BLOCK_BYTES; j++) src[j] = (uint8_t)(j * 37 + v * 19 + p);
+        src[p] = (uint8_t)v;
+        repack_oracle(expected, src, sizeof src);
+        memset(allocation, 0xa7, sizeof allocation);
+        memcpy(actual, src, sizeof src);
+        xf_repack_blocks_scalar(actual, actual, 0, 1);
+        bad += memcmp(actual, expected, sizeof expected) != 0;
+        xf_repack_blocks_scalar(out, src, 0, 1);
+        bad += memcmp(out, expected, sizeof expected) != 0;
+        for (size_t j = 0; j < 32; j++) guard_bad += (allocation[j] != 0xa7) + (actual[XF_BLOCK_BYTES + j] != 0xa7);
+    }
+    CHECK(!bad && !guard_bad, "scalar repack: %d cases differ, %d guard bytes changed", bad, guard_bad);
+    if (!bad && !guard_bad)
+        printf("repack scalar loop: every byte/position, in place and between buffers, matches independent oracle\n");
+}
+
 int main(void) {
 #ifdef XF_HAVE_AVX2
     printf("path: AVX2%s\n",
@@ -256,6 +348,8 @@ int main(void) {
     test_layer(5, 4, 128, 192, 6, XF_MODE_A32);
 #endif
     test_repack_bytes();   /* last: the tests above keep their random inputs */
+    test_repack_inplace();
+    test_repack_scalar();
     if (fails) { printf("%d failure(s)\n", fails); return 1; }
     printf("all passed\n"); return 0;
 }

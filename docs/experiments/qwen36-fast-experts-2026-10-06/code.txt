@@ -1,0 +1,1352 @@
+/* Qwen3.6 on Metal: the forward pass as one sequence of GPU operations.
+ *
+ * Included by qwen36.c in Metal builds. The model semantics are those of the
+ * CPU engine; the kernels are metal/qwen36.metal, reached through
+ * qwen36_gpu.h. The tensors stay on the GPU for the whole forward. The CPU
+ * writes the token embeddings and a RoPE table, reads the router's choices
+ * (the chosen experts have to come from disk), computes the final norm of
+ * the last token and reads the logits. Decode is prefill with one row.
+ *
+ * One layer:
+ *   1. trunk and router, one batch: norm, projections, DeltaNet or attention,
+ *      output projection, residual, norm, router logits, top-k;
+ *   2. sync, read the choices and sort them by expert; the loader thread
+ *      reads the first experts from disk while the GPU computes the shared
+ *      expert;
+ *   3. the routed experts, by expert: each one is read once per batch and
+ *      computes every token that chose it. A last kernel adds them up per
+ *      token, with the shared expert and the residual, and writes the next
+ *      layer's input in place of x. */
+#ifndef QWEN36_GRAPH_H
+#define QWEN36_GRAPH_H
+#ifdef QWEN36_METAL_GRAPH
+#include "qwen36_layer_loader.h"
+#include "qwen36_advice_schedule.h"
+#include "qwen36_cpu_mm.h"
+
+typedef struct { q36_tensor *q, *sc; int in, out; } QgDense;
+
+typedef struct {
+    q36_tensor *in_ln, *post_ln;
+    QgDense q, k, v, o;                         /* attention */
+    q36_tensor *qn, *kn, *kc, *vc;              /* q/k norms, KV cache [kv][cap][hd] */
+    QgDense qkv, z, out;                        /* DeltaNet */
+    q36_tensor *a, *b, *conv, *alog, *dt, *norm;
+    q36_tensor *state, *ring;                   /* recurrent state (2 planes), conv history */
+    q36_tensor *snap_state, *snap_ring;         /* their copy at the snapshot (qg_snapshot_arm) */
+    q36_tensor *spec_state, *spec_ring;         /* their copy after a verify's first row (qg_spec_alloc) */
+    QgDense router, sh_g, sh_u, sh_d;
+    q36_tensor *bias, *sh_gate;                 /* bias is zeros when the model has none */
+} QgLayer;
+
+struct Qwen36Graph {
+    int rows, cap;                              /* rows per batch, KV capacity */
+    q36_map *map;                               /* the dense cache file */
+    const char *map_base;
+    size_t map_bytes;
+    QgLayer *L;
+    QgDense head;
+    /* batch tensors, `rows` rows each */
+    q36_tensor *x, *normal, *p0, *p1, *p2, *query, *gate, *key, *core, *normout, *tmp;
+    q36_tensor *projected, *sum, *post, *decay, *beta, *conv, *qk, *rot;
+    q36_tensor *logits, *prob, *ids, *weights, *sg, *su, *sh, *shared, *scalar;
+    q36_tensor *pairs, *eh, *ey;                /* routed experts: choices by expert, h and y per choice */
+    q36_tensor *last, *head_out;
+    q36_tensor *ahead, *ahead_logits;           /* decode: the next layer's router on this residual */
+    q36_tensor *scores;                         /* attention scores, see qg_scores */
+    size_t slot_scales;                         /* byte offset of the scales in a slot */
+    QwenSelectedLoader loader;
+    QasPending ahead_advice;                    /* decode: the guess, hinted once the next trunk is submitted */
+    int defer_decode_advice;                    /* set per forward: a one-token continuation */
+    /* The loader keeps its lease on the last group of experts until the next
+     * sync: the GPU runs batches in order, so once a later batch completes the
+     * experts batch has too, and the slots can go back to the cache. The
+     * DUMP_LAYERS row of that MoE output is written at the same point. */
+    int lease_pending;
+    size_t kv_bytes;                            /* a KV element: 4, or 2 where q36_kv_half */
+    QwenLayerLoader stream_loader;              /* fast prompt layers, see qwen36_prefill_stream.h */
+    int stream_enabled, stream_initialized, stream_pending;
+    int stream_order[256], stream_ne;           /* the layer's experts in the order they were chosen */
+    int layer_major, stream_more;               /* a long prompt layer by layer; more batches of this layer follow */
+    int stream_warm;                            /* a later batch of a layer: its experts are loaded */
+    int stream_early;                           /* the experts the batch's first window chose, the first loaded */
+    FILE *dump_pending;
+    q36_tensor *dump_x;                         /* the tensor that row is in */
+    int dump_row;
+    double ms[7];                               /* COLI_TIMERS of the current forward, see qg_cut */
+    /* Speculative decoding (q36_spec_step in qwen36.c). A verify forward (verify =
+     * its rows) runs the picked token and its draft as one batch, every row through
+     * the last layer, and returns every row's logits; the DeltaNet kernels copy the
+     * state after its first row into spec_state/spec_ring, which a rejected draft
+     * swaps in (qg_spec_rollback). The MTP head (m->mtp) reads the final residual of
+     * each verified row with the token after it: a forward keeps its rows' residuals
+     * as pending rows, and qg_mtp_draft runs them through the head once the token
+     * after the last is known. */
+    int verify, no_tail;
+    q36_tensor *last_rows, *head_rows;          /* final norms and logits of a verify's rows */
+    float *h_rows; size_t h_cap;                /* host: final residuals of the forward's rows */
+    QgDense mtp_fc;
+    q36_tensor *mtp_in;                         /* [rows][2 hidden]: the normed embedding, then the normed residual */
+    float *mtp_pend;                            /* pending rows' residuals, Q36_SPEC_ROWS rows */
+    int mtp_pend_n, mtp_pend_pos, mtp_pend_tok[Q36_SPEC_ROWS], mtp_len, mtp_post, mtp_holes;
+    int snap_at, snap_rows;                     /* the forward copies the state after snap_at tokens */
+    int *snap_ids, snap_len;                    /* the tokens the copy holds */
+#ifdef __APPLE__
+    int cpu_mm;                                 /* qwen36_cpu_mm.h: products of fast prompt batches on the CPU */
+    QcmWeights cpu_z, cpu_o;
+    QcmShared cpu_shared;
+    QcmAttn cpu_attn;
+#endif
+};
+
+static void qg_settle(Model *, Qwen36Graph *, int);
+
+static q36_tensor *qg_upload(const float *data, size_t count) {
+    return data ? q36_tensor_upload(data, count * sizeof(float)) : NULL;
+}
+
+/* Whether [p, p + bytes) lies inside the dense cache file mapping. */
+static int qg_mapped(const Qwen36Graph *g, const void *p, size_t bytes) {
+    uintptr_t at = (uintptr_t)p, base = (uintptr_t)g->map_base;
+    return g->map && at >= base && at - base <= g->map_bytes && bytes <= g->map_bytes - (at - base);
+}
+
+/* A matrix of canonical.qc is seen in place; without the file it is copied
+ * once. */
+static int qg_dense(Qwen36Graph *g, const QW *w, QgDense *out) {
+    if (!w->q || !w->sc) return 0;
+    size_t qb = (size_t)w->I * w->O, sb = (size_t)w->O * sizeof(float);
+    const char *q = (const char *)w->q, *sc = (const char *)w->sc;
+    out->in = w->I;
+    out->out = w->O;
+    if (qg_mapped(g, q, qb) && qg_mapped(g, sc, sb)) {
+        out->q = q36_map_view(g->map, (size_t)(q - g->map_base), qb);
+        out->sc = q36_map_view(g->map, (size_t)(sc - g->map_base), sb);
+    } else {
+        out->q = q36_tensor_upload(q, qb);
+        out->sc = q36_tensor_upload(sc, sb);
+    }
+    return out->q && out->sc;
+}
+
+static void qg_dense_free(QgDense *d) {
+    q36_tensor_free(d->q);
+    q36_tensor_free(d->sc);
+    memset(d, 0, sizeof(*d));
+}
+
+static int qg_mm(q36_tensor *y, q36_tensor *x, const QgDense *w, int rows) {
+    return q36_dot_i8(y, x, w->q, w->sc, rows, w->in, w->out);
+}
+
+/* Whether the CPU's matrix unit takes products of this batch (qwen36_cpu_mm.h). */
+static int qg_cpu(const Qwen36Graph *g, int rows) {
+#ifdef __APPLE__
+    return g->cpu_mm && rows >= QCM_MIN_ROWS && !q36_gpu_is_exact();
+#else
+    (void)g; (void)rows;
+    return 0;
+#endif
+}
+
+/* y = x w on the CPU, x being written before the mark: what was encoded after
+ * it goes to the GPU first, and runs meanwhile. Without memory for the float
+ * weights the GPU computes it after that. */
+static int qg_cpu_mm(Qwen36Graph *g, q36_tensor *y, q36_tensor *x, const QgDense *w, int rows, int mark) {
+#ifdef __APPLE__
+    const int8_t *q = q36_tensor_data(w->q);
+    const float *sc = q36_tensor_data(w->sc);
+    if (!q36_gpu_flush()) return 0;
+    if (!qcm_convert(&g->cpu_z, 1, &q, &sc, w->out, w->in)) return q36_gpu_wait_mark(mark) && qg_mm(y, x, w, rows);
+    if (!q36_gpu_wait_mark(mark)) return 0;
+    qcm_mm(q36_tensor_data(y), w->out, q36_tensor_data(x), w->in, g->cpu_z.w, rows, w->in, w->out);
+    return 1;
+#else
+    (void)g;
+    return q36_gpu_wait_mark(mark) && qg_mm(y, x, w, rows);
+#endif
+}
+
+/* The gate parts of q (the second half of each head) on the CPU, x being
+ * written before the mark, while the GPU runs what was encoded after it. The
+ * converted rows share z's buffer: a layer has one or the other. Without memory
+ * for them the GPU computes the gates. */
+static int qg_cpu_gate(Qwen36Graph *g, q36_tensor *gate, q36_tensor *x, const QgDense *w, int rows, int hd, int qd,
+                       int mark) {
+    int heads = w->out / qd, width = heads * hd;
+    if (!q36_gpu_flush()) return 0;
+#ifdef __APPLE__
+    if (qcm_convert_rows(&g->cpu_z, q36_tensor_data(w->q), q36_tensor_data(w->sc), width, w->in, hd, qd, hd)) {
+        if (!q36_gpu_wait_mark(mark)) return 0;
+        qcm_mm(q36_tensor_data(gate), width, q36_tensor_data(x), w->in, g->cpu_z.w, rows, w->in, width);
+        return 1;
+    }
+#endif
+    /* the gate parts are the query parts of heads that start hd rows later */
+    q36_tensor *qv = q36_tensor_view(w->q, (size_t)hd * w->in, q36_tensor_bytes(w->q) - (size_t)hd * w->in);
+    q36_tensor *sv = q36_tensor_view(w->sc, (size_t)hd * sizeof(float), q36_tensor_bytes(w->sc) - (size_t)hd * sizeof(float));
+    int ok = qv && sv && q36_dot_i8_heads(gate, x, qv, sv, rows, w->in, width, hd, qd);
+    q36_tensor_free(qv);
+    q36_tensor_free(sv);
+    return ok;
+}
+
+/* The last rows of a long prompt batch whose attention the CPU computes
+ * (qwen36_cpu_mm.h), while the GPU computes the others: as many as by these
+ * estimates both finish together, the CPU after the gate half of q, the GPU
+ * after the query half, k and v. Measured on the M1 with the 35B model (the
+ * crossing points at 2048, 4096 and 6144 positions came out at 350, 375 and
+ * 400 of 2048 rows): a row's attention takes the GPU about macs / 482 ns per
+ * position and the CPU macs / 134 (its softmax included), macs = 2 qh hd; the
+ * projections before it hidden (qh + 2 kv) hd / 700 ns a row on the GPU and the
+ * gate's hidden qh hd / 318 on the CPU. A CPU row costs about 3.6 GPU rows, and
+ * too many rows cost more than too few: rounded down to steps of 32. Batches of
+ * 512 rows or more after 1024 positions, on the GPU's eight-heads-per-KV-head
+ * path; 0 when it does not pay. */
+static int qg_cpu_attn_rows(const Qwen36Graph *g, const Cfg *c, int rows, int pos) {
+    if (!qg_cpu(g, rows) || rows < 512 || pos < 1024 || c->q_heads != 8 * c->kv_heads || c->head_dim % 256) return 0;
+    double ctx = pos + rows / 2.0, macs = 2.0 * c->q_heads * c->head_dim;
+    double gpu = ctx * macs / 482.0, cpu = ctx * macs / 134.0;                    /* ns a row */
+    double gpu0 = (double)c->hidden * (c->q_heads + 2 * c->kv_heads) * c->head_dim / 700.0;
+    double cpu0 = (double)c->hidden * c->q_heads * c->head_dim / 318.0;
+    int r = (int)(rows * (gpu0 + gpu - cpu0) / (cpu + gpu)) / 32 * 32;
+    if (r > rows / 2) r = rows / 2 / 32 * 32;
+    return r >= 64 ? r : 0;
+}
+
+/* A layer's output projection, which the residual right after it reads: in a
+ * prompt batch of 1024 rows or more run as one window (a later batch of a
+ * long prompt), where the CPU is free after its z or its attention, the GPU
+ * computes the first 1408 of every 2048 columns and the CPU's matrix unit the
+ * others at the same time (the GPU computes a product about 1.6 times as fast
+ * as the CPU while both run; qwen36_cpu_mm.h). In the windows of a first batch
+ * the extra wait cost more than it saved. Without memory for the float weights
+ * the GPU computes every column. */
+static int qg_out(Qwen36Graph *g, q36_tensor *y, q36_tensor *x, const QgDense *w, int rows) {
+#ifdef __APPLE__
+    int cols = w->out * 11 / 16 / 128 * 128;
+    if (qg_cpu(g, rows) && rows >= 1024 && cols >= 128 && cols < w->out) {
+        const int8_t *q = (const int8_t *)q36_tensor_data(w->q) + (size_t)cols * w->in;
+        const float *sc = (const float *)q36_tensor_data(w->sc) + cols;
+        int n = w->out - cols, mark = qcm_convert(&g->cpu_o, 1, &q, &sc, n, w->in) ? q36_gpu_mark() : 0;
+        if (mark && q36_dot_i8_cols(y, w->out, x, w->q, w->sc, rows, w->in, cols)) {
+            if (!q36_gpu_flush() || !q36_gpu_wait_mark(mark)) return 0;
+            qcm_mm((float *)q36_tensor_data(y) + cols, w->out, q36_tensor_data(x), w->in, g->cpu_o.w, rows, w->in, n);
+            return 1;
+        }
+    }
+#endif
+    return qg_mm(y, x, w, rows);
+}
+
+/* Rows of a prompt batch; a longer prompt is cut in batches. Each batch reads
+ * nearly every expert of every layer once, so a larger batch reads fewer
+ * experts per prompt token; its tensors take about 330 KB per row (340 MB at
+ * 1024). With 2048 rows instead of 1024 the routed experts get 64 rows each
+ * instead of 32 on average and run 10-15% more of their products per second:
+ * an 8192-token prompt of the 35B model ran 4.3% faster, for about 330 MB more
+ * while the prompt runs (the results are the same bits). So 2048 while the
+ * system reports no memory pressure (kern.memorystatus_vm_pressure_level 1),
+ * 1024 under warning or critical pressure. The available memory the system
+ * reports is no guide: reading experts fills the file cache, and it went from
+ * 72% to 30% within a prompt with no pressure at all. QWEN36_PROMPT_ROWS=1024
+ * or 2048 sets it. */
+static int qg_prompt_rows(void) {
+    const char *v = getenv("QWEN36_PROMPT_ROWS");
+    if (v && (!strcmp(v, "1024") || !strcmp(v, "2048"))) return atoi(v);
+#ifdef __APPLE__
+    int level = 0;
+    size_t len = sizeof(level);
+    if (!sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &len, NULL, 0) && level == 1) return 2048;
+#endif
+    return 1024;
+}
+
+/* The batch tensors hold the rows of one forward: a prompt's batch (up to
+ * qg_prompt_rows, about 330 KB a row) or the single row of a decode step. A
+ * forward resizes them when its batch is different, so the 340 to 680 MB of a
+ * long prompt are not kept through the answer: the system gets them back, and
+ * caches experts in them. The GPU must be idle. */
+static void qg_free_rows(Qwen36Graph *g) {
+    q36_tensor **t[] = {&g->x, &g->normal, &g->p0, &g->p1, &g->p2, &g->query, &g->gate, &g->key,
+                        &g->core, &g->normout, &g->tmp, &g->projected, &g->sum, &g->post, &g->decay,
+                        &g->beta, &g->conv, &g->qk, &g->rot, &g->logits, &g->prob, &g->ids, &g->weights,
+                        &g->sg, &g->su, &g->sh, &g->shared, &g->scalar, &g->pairs, &g->eh, &g->ey, &g->mtp_in};
+    for (size_t k = 0; k < sizeof(t) / sizeof(t[0]); k++) { q36_tensor_free(*t[k]); *t[k] = NULL; }
+    g->rows = 0;
+#ifdef __APPLE__
+    qcm_weights_free(&g->cpu_z);
+    qcm_weights_free(&g->cpu_o);
+    qcm_shared_release(&g->cpu_shared);
+    qcm_attn_free(&g->cpu_attn);
+#endif
+}
+
+/* Attention scores: up to Q36_ATTN_CHUNK rows of every head over the whole
+ * cache for a prompt batch, three planes for a decode step, then a float per
+ * row and head of a chunk (q36_attn). */
+static int qg_scores(Model *m) {
+    Qwen36Graph *g = m->graph;
+    if (!g->cap) return 1;
+    /* at least the three planes of one row: a prompt's last row runs its last layer alone (qg_layer_tail) */
+    size_t planes = g->rows > 3 ? (g->rows < Q36_ATTN_CHUNK ? (size_t)g->rows : Q36_ATTN_CHUNK) : 3;
+    size_t tail = g->rows > 1 ? planes * (((size_t)g->cap + 31) / 32) : 0;   /* the prompt's maxima */
+    if (tail < Q36_ATTN_CHUNK) tail = Q36_ATTN_CHUNK;
+    size_t bytes = (planes * (size_t)g->cap + tail) * m->c.q_heads * sizeof(float);
+    if (g->scores && q36_tensor_bytes(g->scores) == bytes) return 1;
+    q36_tensor *scores = q36_tensor_new(bytes);
+    if (!scores) return 0;
+    q36_tensor_free(g->scores);
+    g->scores = scores;
+    return 1;
+}
+
+static int qg_rows(Model *m, int R) {
+    Qwen36Graph *g = m->graph;
+    Cfg *c = &m->c;
+    /* decode alternates one-row steps, verifies and MTP rows: a small batch keeps its tensors */
+    if (R == g->rows || (R < g->rows && g->rows <= Q36_SPEC_ROWS)) return 1;
+    if (!q36_gpu_sync()) return 0;
+    qg_free_rows(g);
+    int H = c->hidden, K = c->topk;
+    int aw = c->q_heads * c->head_dim, dw = c->dn_vheads * c->dn_vdim;
+    int wide = aw > dw ? aw : dw;
+    int p0 = c->q_heads * c->q_head_dim > c->dn_conv_dim ? c->q_heads * c->q_head_dim : c->dn_conv_dim;
+    int kvw = c->kv_heads * c->head_dim, p1 = kvw > dw ? kvw : dw;
+    size_t F = sizeof(float);
+#define QG_NEW(field, count) do { if (!(g->field = q36_tensor_new((size_t)(count) * F))) goto failed; } while (0)
+    QG_NEW(x, R * H); QG_NEW(normal, R * H); QG_NEW(projected, R * H); QG_NEW(sum, R * H); QG_NEW(post, R * H);
+    QG_NEW(p0, R * p0); QG_NEW(p1, R * p1); QG_NEW(p2, R * kvw); QG_NEW(key, R * kvw);
+    QG_NEW(query, R * wide); QG_NEW(gate, R * wide); QG_NEW(core, R * wide); QG_NEW(normout, R * wide);
+    QG_NEW(tmp, R * wide);
+    QG_NEW(decay, R * c->dn_vheads); QG_NEW(beta, R * c->dn_vheads);
+    QG_NEW(conv, R * c->dn_conv_dim); QG_NEW(qk, R * c->dn_conv_dim);
+    QG_NEW(rot, R * (c->rotary_dim > 0 ? c->rotary_dim : 2));
+    QG_NEW(logits, R * c->n_experts); QG_NEW(prob, R * c->n_experts);
+    QG_NEW(ids, R * K); QG_NEW(weights, R * K);
+    QG_NEW(sg, R * c->shared_inter); QG_NEW(su, R * c->shared_inter); QG_NEW(sh, R * c->shared_inter);
+    QG_NEW(shared, R * H); QG_NEW(scalar, R);
+    QG_NEW(pairs, R * K);                       /* uint32, as wide as a float */
+    QG_NEW(eh, R * K * c->inter); QG_NEW(ey, R * K * H);
+    if (m->mtp) QG_NEW(mtp_in, R * 2 * H);
+#undef QG_NEW
+    g->rows = R;
+    return qg_scores(m);
+failed:
+    qg_free_rows(g);
+    return 0;
+}
+
+static void qg_free(Model *m) {
+    Qwen36Graph *g = m->graph;
+    if (!g) return;
+    qas_clear(&g->ahead_advice);
+    q36_gpu_sync();
+    if (!qll_destroy(&g->stream_loader)) abort();
+    qsl_destroy(&g->loader);
+    for (int i = 0; g->L && i < m->c.n_layers + m->mtp; i++) {
+        QgLayer *L = &g->L[i];
+        q36_tensor *t[] = {L->in_ln, L->post_ln, L->qn, L->kn, L->kc, L->vc, L->a, L->b, L->conv,
+                           L->alog, L->dt, L->norm, L->state, L->ring, L->bias, L->sh_gate,
+                           L->snap_state, L->snap_ring, L->spec_state, L->spec_ring};
+        for (size_t k = 0; k < sizeof(t) / sizeof(t[0]); k++) q36_tensor_free(t[k]);
+        QgDense *d[] = {&L->q, &L->k, &L->v, &L->o, &L->qkv, &L->z, &L->out,
+                        &L->router, &L->sh_g, &L->sh_u, &L->sh_d};
+        for (size_t k = 0; k < sizeof(d) / sizeof(d[0]); k++) qg_dense_free(d[k]);
+    }
+    free(g->L);
+    qg_dense_free(&g->head);
+    qg_free_rows(g);
+    q36_tensor *t[] = {g->last, g->head_out, g->ahead, g->ahead_logits, g->scores, g->last_rows, g->head_rows};
+    for (size_t k = 0; k < sizeof(t) / sizeof(t[0]); k++) q36_tensor_free(t[k]);
+    qg_dense_free(&g->mtp_fc);
+    free(g->h_rows); free(g->mtp_pend);
+    q36_map_free(g->map);
+    free(g->snap_ids);
+#ifdef __APPLE__
+    if (g->cpu_shared.queue) dispatch_release(g->cpu_shared.queue);
+    if (g->cpu_shared.group) dispatch_release(g->cpu_shared.group);
+#endif
+    free(g);
+    m->graph = NULL;
+}
+
+static int qg_create(Model *m) {
+    Cfg *c = &m->c;
+    int H = c->hidden, K = c->topk;
+    if (!m->global_cache || K > 8 || c->n_experts > 256 || c->head_dim > 256 || c->dn_kdim > 128 ||
+        H % 64 || c->inter % 64 || c->shared_inter < 1) {
+        fprintf(stderr, "[qwen36-metal] geometry outside the Metal graph (top-k<=8, experts<=256, "
+                        "head_dim<=256, kdim<=128, hidden/inter multiples of 64, global expert cache)\n");
+        return 0;
+    }
+    Qwen36Graph *g = calloc(1, sizeof(*g));
+    if (!g) return 0;
+    m->graph = g;
+    /* Fast mode keeps the KV cache in halves where its kernels read them. */
+    q36_shape kvs = {0};
+    kvs.q_heads = c->q_heads; kvs.kv_heads = c->kv_heads; kvs.head_dim = c->head_dim;
+    g->kv_bytes = q36_kv_half(&kvs) ? 2 : sizeof(float);
+    /* QWEN36_PREFILL_STREAM=0 keeps the eight-expert prompt schedule, to measure. */
+    const char *stream = getenv("QWEN36_PREFILL_STREAM");
+    if (!stream || strcmp(stream, "0")) {
+        g->stream_enabled = qll_cache_eligible(m->global_cache);
+        if (!g->stream_enabled)
+            fprintf(stderr, "[qwen36-metal] expert cache below %d retained slots: prompt experts load eight at a time\n",
+                    QLL_MAX_KEYS);
+    }
+#ifdef __APPLE__
+    const char *cpu_mm = getenv("QWEN36_CPU_MATMUL");
+    g->cpu_mm = !cpu_mm || strcmp(cpu_mm, "0");
+    if (g->cpu_mm) qcm_init();
+#endif
+    /* The matrices of canonical.qc are seen in place through its mapping. */
+    if (m->dense_file.base) {
+        g->map_base = (const char *)m->dense_file.base;
+        g->map_bytes = m->dense_file.bytes;
+        g->map = q36_map_new(g->map_base, g->map_bytes);
+        if (!g->map) goto failed;
+    }
+    g->L = calloc((size_t)c->n_layers + m->mtp, sizeof(QgLayer));
+    if (!g->L) goto failed;
+    size_t cells = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim;
+    for (int i = 0; i < c->n_layers + m->mtp; i++) {     /* the MTP head's layer last (an attention layer) */
+        Layer *l = i < c->n_layers ? &m->L[i] : &m->mtp_L;
+        QgLayer *L = &g->L[i];
+        L->in_ln = qg_upload(l->in_ln, (size_t)H);
+        L->post_ln = qg_upload(l->post_ln, (size_t)H);
+        if (!L->in_ln || !L->post_ln) goto failed;
+        if (c->is_attn[i]) {
+            if (!qg_dense(g, &l->q, &L->q) || !qg_dense(g, &l->k, &L->k) || !qg_dense(g, &l->v, &L->v) ||
+                !qg_dense(g, &l->o, &L->o)) goto failed;
+            L->qn = qg_upload(l->qn, (size_t)c->head_dim);
+            L->kn = qg_upload(l->kn, (size_t)c->head_dim);
+        } else {
+            if (!qg_dense(g, &l->dn_qkv, &L->qkv) || !qg_dense(g, &l->dn_z, &L->z) ||
+                !qg_dense(g, &l->dn_out, &L->out)) goto failed;
+            L->a = qg_upload(l->dn_a, (size_t)c->dn_vheads * H);
+            L->b = qg_upload(l->dn_b, (size_t)c->dn_vheads * H);
+            L->conv = qg_upload(l->dn_conv, (size_t)c->dn_conv_dim * c->dn_convk);
+            L->alog = qg_upload(l->dn_alog, (size_t)c->dn_vheads);
+            L->dt = qg_upload(l->dn_dtbias, (size_t)c->dn_vheads);
+            L->norm = qg_upload(l->dn_norm, (size_t)c->dn_vdim);
+            /* The low plane of the compensated state is the exact kernels'
+             * only; fast mode keeps the high plane (60 MB less on the 35B). */
+            q36_shape dn = {0};
+            dn.k_dim = c->dn_kdim; dn.v_dim = c->dn_vdim; dn.conv_dim = c->dn_conv_dim;
+            L->state = q36_tensor_new((q36_dn_high_only(&dn) ? 1 : 2) * cells * sizeof(float));
+            L->ring = q36_tensor_new((size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float));
+            if (!L->a || !L->b || !L->conv || !L->alog || !L->dt || !L->norm || !L->state || !L->ring) goto failed;
+        }
+        if (!qg_dense(g, &l->gate, &L->router) || !qg_dense(g, &l->sh_g, &L->sh_g) ||
+            !qg_dense(g, &l->sh_u, &L->sh_u) || !qg_dense(g, &l->sh_d, &L->sh_d)) goto failed;
+        L->bias = c->has_bias && l->gate_bias ? qg_upload(l->gate_bias, (size_t)c->n_experts)
+                                              : q36_tensor_new((size_t)c->n_experts * sizeof(float));
+        L->sh_gate = qg_upload(l->sh_gate, (size_t)H);
+        if (!L->bias) goto failed;
+    }
+    if (!m->final_norm || !qg_dense(g, &m->lm_head, &g->head)) goto failed;
+    if (m->mtp) {
+        if (!qg_dense(g, &m->mtp_fc, &g->mtp_fc) || !(g->mtp_pend = malloc((size_t)Q36_SPEC_ROWS * H * sizeof(float))))
+            goto failed;
+        qw_free(&m->mtp_fc);
+        /* the head runs on the GPU only: its CPU copies go */
+        Layer *l = &m->mtp_L;
+        QW *w[] = {&l->q, &l->k, &l->v, &l->o, &l->gate, &l->sh_g, &l->sh_u, &l->sh_d};
+        for (size_t k = 0; k < sizeof(w) / sizeof(w[0]); k++) qw_free(w[k]);
+        /* QWEN36_MTP_HIDDEN=pre: the head reads the residual before the model's final norm */
+        const char *hv = getenv("QWEN36_MTP_HIDDEN");
+        g->mtp_post = !(hv && !strcmp(hv, "pre"));
+    }
+    qw_free(&m->lm_head);                       /* the GPU sees it; a CPU copy is not needed */
+
+    if (!(g->last = q36_tensor_new((size_t)H * sizeof(float))) ||
+        !(g->head_out = q36_tensor_new((size_t)c->vocab * sizeof(float))) ||
+        !(g->ahead = q36_tensor_new((size_t)H * sizeof(float))) ||
+        !(g->ahead_logits = q36_tensor_new((size_t)c->n_experts * sizeof(float)))) goto failed;
+    g->slot_scales = (size_t)3 * H * c->inter / 2;
+    if (!qsl_init(&g->loader, m->global_cache)) goto failed;
+    fprintf(stderr, "[qwen36-metal] graph ready on %s: rows<=%d dense=%s kv=%s (%zu bytes mapped)\n",
+            q36_gpu_device_name(), qg_prompt_rows(), g->map ? "mapped" : "copied", g->kv_bytes == 2 ? "half" : "float",
+            g->map_bytes);
+    return 1;
+failed:
+    fprintf(stderr, "[qwen36-metal] cannot build the Metal graph (weights or GPU memory)\n");
+    qg_free(m);
+    return 0;
+}
+
+/* KV capacity: 256, 512 or 1024 rows, then multiples of 1024, so a context of
+ * 8192 tokens holds 9216 rows instead of 16384 (40 MB per 1024 rows on the 35B
+ * model, 20 MB with the halves of fast mode). A request reserves its prompt and
+ * answer at once (ensure_kv); the rows already written move along. */
+static int qg_reserve(Model *m, int need) {
+    Qwen36Graph *g = m->graph;
+    Cfg *c = &m->c;
+    if (need <= g->cap) return 1;
+    int cap = g->cap > 256 ? g->cap : 256;
+    while (cap < need && cap < 1024) cap *= 2;
+    if (cap < need) cap = (need + 1023) / 1024 * 1024;
+    if (!q36_gpu_sync()) return 0;
+    size_t head = (size_t)c->head_dim * g->kv_bytes;
+    for (int i = 0; i < c->n_layers + m->mtp; i++) {
+        if (!c->is_attn[i]) continue;
+        QgLayer *L = &g->L[i];
+        q36_tensor *kc = q36_tensor_new((size_t)c->kv_heads * cap * head);
+        q36_tensor *vc = q36_tensor_new((size_t)c->kv_heads * cap * head);
+        if (!kc || !vc) { q36_tensor_free(kc); q36_tensor_free(vc); return 0; }
+        for (int h = 0; L->kc && h < c->kv_heads; h++) {
+            memcpy((char *)q36_tensor_data(kc) + (size_t)h * cap * head,
+                   (char *)q36_tensor_data(L->kc) + (size_t)h * g->cap * head, (size_t)g->cap * head);
+            memcpy((char *)q36_tensor_data(vc) + (size_t)h * cap * head,
+                   (char *)q36_tensor_data(L->vc) + (size_t)h * g->cap * head, (size_t)g->cap * head);
+        }
+        q36_tensor_free(L->kc);
+        q36_tensor_free(L->vc);
+        L->kc = kc;
+        L->vc = vc;
+    }
+    g->cap = cap;
+    return qg_scores(m);
+}
+
+/* A new sequence: zero the recurrent state. KV rows are simply overwritten. */
+static void qg_reset(Model *m) {
+    Qwen36Graph *g = m->graph;
+    qas_clear(&g->ahead_advice);
+    g->defer_decode_advice = 0;
+    qg_settle(m, g, q36_gpu_sync());
+    if (qll_held(&g->stream_loader) && !qll_finish(&g->stream_loader, 1)) abort();
+    g->stream_pending = 0;
+    g->mtp_len = g->mtp_pend_n = 0;
+    for (int i = 0; i < m->c.n_layers; i++) {
+        QgLayer *L = &g->L[i];
+        if (L->state) memset(q36_tensor_data(L->state), 0, q36_tensor_bytes(L->state));
+        if (L->ring) memset(q36_tensor_data(L->ring), 0, q36_tensor_bytes(L->ring));
+    }
+}
+
+/* cos/sin per row and rotary pair. Frequency and angle are computed in
+ * double and only the result is rounded to float: float phases are already
+ * off by a visible amount below 2048 tokens. */
+static void qg_rope_table(const Cfg *c, Qwen36Graph *g, int rows, int pos) {
+    float *t = q36_tensor_data(g->rot);
+    for (int d = 0; d < c->rotary_dim / 2; d++) {
+        double f = pow((double)c->theta, -2.0 * (double)d / (double)c->rotary_dim);
+        for (int r = 0; r < rows; r++) {
+            float *p = t + (size_t)r * c->rotary_dim + 2 * d;
+            double angle = (double)(pos + r) * f;
+            p[0] = (float)cos(angle);
+            p[1] = (float)sin(angle);
+        }
+    }
+}
+
+static void qg_dump_row(FILE *lf, q36_tensor *t, int row, int width) {
+    if (lf) fwrite((const float *)q36_tensor_data(t) + (size_t)row * width, sizeof(float), (size_t)width, lf);
+}
+
+/* After a sync: write the deferred MoE dump row, release the deferred lease. */
+static void qg_settle(Model *m, Qwen36Graph *g, int ok) {
+    if (g->dump_pending && ok) qg_dump_row(g->dump_pending, g->dump_x, g->dump_row, m->c.hidden);
+    g->dump_pending = NULL;
+    if (!ok) qas_clear(&g->ahead_advice);
+    if (g->lease_pending) qsl_finish(&g->loader, !ok);
+    g->lease_pending = 0;
+    if (g->stream_pending && !qll_finish(&g->stream_loader, !ok)) abort();
+    g->stream_pending = 0;
+}
+
+/* A copy of the sequence state after the first tokens of a prompt, so a later
+ * prompt that begins with the same tokens does not read them again (serve
+ * mode, qwen36.c). The forward takes it on its way: in the batch that holds
+ * that token the DeltaNet kernels also write the state and conv history of
+ * their layer as they are after it (q36_shape.snap). The KV rows before it
+ * are not copied: nothing written at later positions reaches them. */
+static int qg_snapshot_arm(Model *m, int len) {
+    Qwen36Graph *g = m->graph;
+    qas_clear(&g->ahead_advice);
+    g->snap_len = 0;
+    for (int i = 0; i < m->c.n_layers; i++) {
+        QgLayer *L = &g->L[i];
+        if (!L->state) continue;
+        if (!L->snap_state) L->snap_state = q36_tensor_new(q36_tensor_bytes(L->state));
+        if (!L->snap_ring) L->snap_ring = q36_tensor_new(q36_tensor_bytes(L->ring));
+        if (!L->snap_state || !L->snap_ring) return 0;
+    }
+    g->snap_at = len;
+    return 1;
+}
+
+/* After the forward: the copy holds the first snap_at of these tokens. */
+static void qg_snapshot_taken(Model *m, const int *ids) {
+    Qwen36Graph *g = m->graph;
+    int len = g->snap_at, *copy = realloc(g->snap_ids, (size_t)len * sizeof(int));
+    g->snap_at = 0;
+    if (!copy) return;
+    g->snap_ids = copy;
+    memcpy(copy, ids, (size_t)len * sizeof(int));
+    g->snap_len = len;
+}
+
+/* A sequence that starts from the copy: its state back in place, and kv_len
+ * where the copy ends. */
+static void qg_snapshot_load(Model *m) {
+    Qwen36Graph *g = m->graph;
+    qas_clear(&g->ahead_advice);
+    qg_settle(m, g, q36_gpu_sync());
+    for (int i = 0; i < m->c.n_layers; i++) {
+        QgLayer *L = &g->L[i];
+        if (!L->state) continue;
+        memcpy(q36_tensor_data(L->state), q36_tensor_data(L->snap_state), q36_tensor_bytes(L->state));
+        memcpy(q36_tensor_data(L->ring), q36_tensor_data(L->snap_ring), q36_tensor_bytes(L->ring));
+    }
+    m->kv_len = g->snap_len;
+}
+
+/* COLI_TIMERS=1: what was encoded so far becomes a batch of its own, and the
+ * GPU's own report of its time goes to g->ms[idx]: the phases of qwen36.c's
+ * timers (0 DeltaNet, 1 attention, 2 routed experts, 3 shared expert,
+ * 4 router, 5 lm_head); 6 is the wall time spent waiting for the disk.
+ * Nothing waits for the GPU, so a timed run keeps its pace. */
+static int qg_cut(Qwen36Graph *g, int idx) {
+    return !tm_on() || q36_gpu_flush_timed(&g->ms[idx]);
+}
+
+/* Experts [from, to) of the sorted list that are not in the cache are
+ * announced to the kernel, so the SSD reads them while the current group is
+ * loaded and computed. Advisory only. */
+static void qg_advise(Model *m, int il, const int *experts, int from, int to) {
+    for (int i = from; i < to; i++)
+        if (!qgc_contains(m->global_cache, il * m->c.n_experts + experts[i])) qwen_expert_advise(m, il, experts[i]);
+}
+
+/* Only an already encoded batch can be submitted. No GPU command is
+ * encoded between this flush and the existing sync, so its flush is empty. */
+static int qg_advice_submit(void *context) {
+    (void)context;
+    return q36_gpu_flush();
+}
+static void qg_advice_emit(void *context, int layer, const int *ids, int from, int to) {
+    qg_advise(context, layer, ids, from, to);
+}
+
+/* Decode: the top-k of the next layer's router run on this layer's residual
+ * (qg_layer). The residual changes little from one layer to the next, so
+ * about four in five of them are experts the next layer will choose; those
+ * not in the cache are announced once the next layer's trunk is submitted,
+ * and the SSD reads them while the GPU computes it. A wrong guess costs a
+ * read, never a result. */
+static void qg_advise_ahead(Model *m, Qwen36Graph *g, int il) {
+    const float *l = q36_tensor_data(g->ahead_logits);
+    int K = m->c.topk, top[8], n = 0;
+    for (int e = 0; e < m->c.n_experts; e++) {
+        int i;
+        if (n < K) i = n++;
+        else if (l[e] > l[top[K - 1]]) i = K - 1;
+        else continue;
+        while (i > 0 && l[e] > l[top[i - 1]]) { top[i] = top[i - 1]; i--; }
+        top[i] = e;
+    }
+    if (g->defer_decode_advice) {
+        /* The next trunk overwrites ahead_logits. Save only the selected IDs
+         * and emit them after that trunk and the current experts are submitted. */
+        qas_save(&g->ahead_advice, il + 1, top, n);
+        return;
+    }
+    qg_advise(m, il + 1, top, 0, n);
+}
+
+/* The shared expert of the batch on the GPU, into g->shared. */
+static int qg_shared_gpu(Model *m, Qwen36Graph *g, QgLayer *L, int rows) {
+    int H = m->c.hidden, SI = m->c.shared_inter;
+    return q36_shared_dot(g->sg, g->post, L->sh_g.q, L->sh_g.sc, rows, H, SI) &&
+           q36_shared_dot(g->su, g->post, L->sh_u.q, L->sh_u.sc, rows, H, SI) &&
+           q36_silu_mul(g->sh, g->sg, g->su, rows * SI) &&
+           q36_shared_dot(g->shared, g->sh, L->sh_d.q, L->sh_d.sc, rows, SI, H) &&
+           q36_shared_gate(g->scalar, g->post, L->sh_gate, rows, H) &&
+           q36_scale_rows(g->shared, g->scalar, rows, H);
+}
+
+/* The shared expert on the CPU's matrix unit (qwen36_cpu_mm.h), from post as
+ * the last sync left it, while the GPU runs the routed experts: 0 if the GPU
+ * computes it. */
+static int qg_shared_cpu_start(Model *m, Qwen36Graph *g, QgLayer *L, int rows) {
+#ifdef __APPLE__
+    if (!qg_cpu(g, rows)) return 0;
+    QcmShared *j = &g->cpu_shared;
+    const QgDense *d[3] = {&L->sh_g, &L->sh_u, &L->sh_d};
+    for (int k = 0; k < 3; k++) {
+        j->q[k] = q36_tensor_data(d[k]->q);
+        j->sc[k] = q36_tensor_data(d[k]->sc);
+    }
+    j->post = q36_tensor_data(g->post);
+    j->shared = q36_tensor_data(g->shared);
+    j->gate = L->sh_gate ? q36_tensor_data(L->sh_gate) : NULL;
+    j->rows = rows;
+    j->H = m->c.hidden;
+    j->SI = m->c.shared_inter;
+    return qcm_shared_start(j);
+#else
+    (void)m; (void)g; (void)L; (void)rows;
+    return 0;
+#endif
+}
+
+/* Waits for the CPU's shared expert; when it could not run (memory), the GPU
+ * computes it. */
+static int qg_shared_cpu_finish(Model *m, Qwen36Graph *g, QgLayer *L, int rows) {
+#ifdef __APPLE__
+    if (qcm_shared_finish(&g->cpu_shared)) return 1;
+#endif
+    return qg_shared_gpu(m, g, L, rows);
+}
+
+/* The routed experts, by expert. The batch's choices are sorted by expert;
+ * the distinct experts are read in groups of top-k (one cache lease each, the
+ * first while the GPU computes the shared expert) and each group computes all
+ * the choices routed to it. expert_sum then adds them up per token in the
+ * router's order, so the grouping does not change a bit of the result. */
+static int qg_moe(Model *m, Qwen36Graph *g, int il, int rows, FILE *lf) {
+    Cfg *c = &m->c;
+    QgLayer *L = &g->L[il];
+    int H = c->hidden, K = c->topk, E = c->n_experts, n = rows * K;
+    const int32_t *ids = q36_tensor_data(g->ids);
+    uint32_t *pairs = q36_tensor_data(g->pairs);
+    int first[257] = {0}, fill[256], experts[256], ne = 0, keys[8];
+    for (int p = 0; p < n; p++) {
+        if (ids[p] < 0 || ids[p] >= E) return 0;
+        first[ids[p] + 1]++;
+        if (il < c->n_layers) ehit_mark(m, il, ids[p]);
+    }
+    for (int e = 0; e < E; e++) {
+        if (first[e + 1]) experts[ne++] = e;
+        first[e + 1] += first[e];
+    }
+    memcpy(fill, first, (size_t)E * sizeof(int));
+    for (int p = 0; p < n; p++) pairs[fill[ids[p]]++] = (uint32_t)p;
+    for (int i = 0; i < ne; i++)                /* the slot of each expert in its group */
+        for (int q = first[experts[i]]; q < first[experts[i] + 1]; q++) pairs[q] |= (uint32_t)(i % K) << 28;
+    int ng = ne < K ? ne : K;
+    for (int j = 0; j < ng; j++) keys[j] = il * E + experts[j];
+    if (!qsl_start(&g->loader, keys, (unsigned)ng)) return 0;
+    qg_advise(m, il, experts, ng, ng + K < ne ? ng + K : ne);
+    /* The shared expert runs on the GPU while the worker reads from disk. */
+    int ok = qg_shared_gpu(m, g, L, rows) && qg_cut(g, 3) && q36_gpu_flush();
+    for (int g0 = 0;;) {
+        /* Fast prompt kernels also leave gaps while the next experts load. */
+        if (rows > 1) q36_gpu_keepalive(0.25);
+        int a = first[experts[g0]], b = first[experts[g0 + ng - 1] + 1], done = 0;
+        Slot *slots[8] = {0};
+        q36_tensor *gpu[8] = {0};
+        /* Decode: the experts the cache already holds are computed while the
+         * misses read, in a GPU batch of their own; the misses' pairs follow
+         * theirs. Each choice is computed alone and expert_sum adds them in
+         * the router's order: the same bits in any order. */
+        if (ok && rows == 1 && ng == ne && b - a == ng) {
+            Slot *hit[8] = {0};
+            unsigned held = qsl_wait_hits(&g->loader, (void **)hit);
+            if (held > 0 && held < (unsigned)ng) {
+                uint32_t order[8];
+                int o = 0;
+                for (int j = 0; j < ng; j++) if (hit[j]) order[o++] = pairs[a + j];
+                for (int j = 0; j < ng; j++) if (!hit[j]) order[o++] = pairs[a + j];
+                memcpy(pairs + a, order, (size_t)ng * sizeof(uint32_t));
+                for (int j = 0; j < ng; j++) gpu[j] = hit[j] ? hit[j]->gpu : NULL;
+                done = (int)held;
+                ok = q36_expert_gate_up(g->eh, g->post, g->pairs, a, done, gpu, rows, H, c->inter, K, g->slot_scales) &&
+                     q36_expert_down(g->ey, g->eh, g->pairs, a, done, gpu, rows, H, c->inter, K, g->slot_scales) &&
+                     q36_gpu_flush();
+            }
+        }
+        double t = tm_on() ? tm_now() : 0;
+        ok = qsl_wait(&g->loader, NULL, NULL, (void **)slots) && ok;
+        if (tm_on()) g->ms[6] += tm_now() - t;
+        if (ok && rows == 1 && il + 1 < c->n_layers) qg_advise_ahead(m, g, il);
+        for (int j = 0; ok && j < ng; j++) ok = (gpu[j] = slots[j] ? slots[j]->gpu : NULL) != NULL;
+        ok = ok && q36_expert_gate_up(g->eh, g->post, g->pairs, a + done, b - a - done, gpu, rows, H, c->inter, K,
+                                      g->slot_scales) &&
+             q36_expert_down(g->ey, g->eh, g->pairs, a + done, b - a - done, gpu, rows, H, c->inter, K, g->slot_scales);
+        if (!ok || (g0 += ng) == ne) break;
+        ok = qg_cut(g, 2);
+        ok = q36_gpu_sync() && ok;            /* the GPU is done with the slots before release, even after a failure */
+        qsl_finish(&g->loader, !ok);
+        if (!ok) return 0;
+        ng = ne - g0 < K ? ne - g0 : K;
+        for (int j = 0; j < ng; j++) keys[j] = il * E + experts[g0 + j];
+        if (!qsl_start(&g->loader, keys, (unsigned)ng)) return 0;
+        qg_advise(m, il, experts, g0 + ng, g0 + ng + K < ne ? g0 + ng + K : ne);
+    }
+    ok = ok && q36_expert_sum(g->x, g->ey, g->weights, g->shared, g->sum, rows, H, K) && qg_cut(g, 2);
+    /* The last lease and the dump row are settled at the next sync. */
+    g->lease_pending = 1;
+    g->dump_pending = ok ? lf : NULL;
+    g->dump_x = g->x;
+    g->dump_row = rows - 1;
+    QgcStats cache = qgc_snapshot(m->global_cache);
+    m->hits = cache.hits;
+    m->miss = cache.misses;
+    return ok;
+}
+
+/* Non-owning base pointers or owned small tensor-view descriptors. Never copy
+ * Qwen36Graph, whose loader mutexes and lease identities are not copyable. */
+typedef struct {
+    q36_tensor *x, *normal, *p0, *p1, *p2, *query, *gate, *key, *core, *normout, *tmp, *projected, *sum, *post, *decay, *beta, *conv, *qk, *rot, *logits, *prob, *ids, *weights;
+    int owns_views;
+} QgTrunk;
+static void qg_trunk_release(QgTrunk *t) {
+    if (t->owns_views) {
+        q36_tensor_free(t->x);
+        q36_tensor_free(t->normal);
+        q36_tensor_free(t->p0);
+        q36_tensor_free(t->p1);
+        q36_tensor_free(t->p2);
+        q36_tensor_free(t->query);
+        q36_tensor_free(t->gate);
+        q36_tensor_free(t->key);
+        q36_tensor_free(t->core);
+        q36_tensor_free(t->normout);
+        q36_tensor_free(t->tmp);
+        q36_tensor_free(t->projected);
+        q36_tensor_free(t->sum);
+        q36_tensor_free(t->post);
+        q36_tensor_free(t->decay);
+        q36_tensor_free(t->beta);
+        q36_tensor_free(t->conv);
+        q36_tensor_free(t->qk);
+        q36_tensor_free(t->rot);
+        q36_tensor_free(t->logits);
+        q36_tensor_free(t->prob);
+        q36_tensor_free(t->ids);
+        q36_tensor_free(t->weights);
+    }
+    memset(t, 0, sizeof(*t));
+}
+static int qg_trunk_bind(QgTrunk *t, Qwen36Graph *g, const Cfg *c,
+                         int attn, int first, int rows, int views) {
+    memset(t, 0, sizeof(*t)); t->owns_views = views;
+    int aw = c->q_heads*c->head_dim, dw = c->dn_vheads*c->dn_vdim;
+    int width = attn ? aw : dw, kv = c->kv_heads*c->head_dim;
+#define QG_VIEW(field, stride) do { \
+    size_t sw = (size_t)(stride); \
+    t->field = views ? q36_tensor_view(g->field, (size_t)first*sw*4, (size_t)rows*sw*4) : g->field; \
+    if (!t->field) { qg_trunk_release(t); return 0; } \
+} while (0)
+    QG_VIEW(x, c->hidden);
+    QG_VIEW(normal, c->hidden);
+    QG_VIEW(p0, attn ? c->q_heads*c->q_head_dim : c->dn_conv_dim);
+    QG_VIEW(p1, attn ? kv : dw);
+    QG_VIEW(p2, kv);
+    QG_VIEW(query, aw);
+    QG_VIEW(gate, aw);
+    QG_VIEW(key, kv);
+    QG_VIEW(core, width);
+    QG_VIEW(normout, dw);
+    QG_VIEW(tmp, width);
+    QG_VIEW(projected, c->hidden);
+    QG_VIEW(sum, c->hidden);
+    QG_VIEW(post, c->hidden);
+    QG_VIEW(decay, c->dn_vheads);
+    QG_VIEW(beta, c->dn_vheads);
+    QG_VIEW(conv, c->dn_conv_dim);
+    QG_VIEW(qk, c->dn_conv_dim);
+    QG_VIEW(rot, c->rotary_dim > 0 ? c->rotary_dim : 2);
+    QG_VIEW(logits, c->n_experts);
+    QG_VIEW(prob, c->n_experts);
+    QG_VIEW(ids, c->topk);
+    QG_VIEW(weights, c->topk);
+#undef QG_VIEW
+    return 1;
+}
+/* The attention of rows first .. rows on the CPU, the queries and the cache
+ * written before the mark. Without memory the GPU computes them too. */
+static int qg_cpu_attention(Qwen36Graph *g, QgLayer *L, QgTrunk *t, const q36_shape *s, int first, int mark) {
+    if (!q36_gpu_flush() || !q36_gpu_wait_mark(mark)) return 0;
+#ifdef __APPLE__
+    if (qcm_attention(&g->cpu_attn, q36_tensor_data(t->core), q36_tensor_data(t->query), q36_tensor_data(L->kc),
+                      q36_tensor_data(L->vc), g->kv_bytes == 2, first, s->rows, s->pos, s->q_heads, s->kv_heads,
+                      s->head_dim, s->cap)) return 1;
+#endif
+    size_t row = (size_t)s->q_heads * s->head_dim * sizeof(float);
+    q36_tensor *qv = q36_tensor_view(t->query, first * row, (size_t)(s->rows - first) * row);
+    q36_tensor *ov = q36_tensor_view(t->core, first * row, (size_t)(s->rows - first) * row);
+    q36_shape r = *s;
+    r.rows = s->rows - first;
+    r.pos = s->pos + first;
+    int ok = qv && ov && q36_attn(ov, qv, L->kc, L->vc, g->scores, &r);
+    q36_tensor_free(qv);
+    q36_tensor_free(ov);
+    return ok;
+}
+
+static int qg_trunk(Model *m, Qwen36Graph *g, QgTrunk *t, int il, int rows, int pos, int snap, int decode_ahead) {
+    Cfg *c = &m->c;
+    QgLayer *L = &g->L[il];
+    int H = c->hidden;
+    q36_shape s = {rows, H, c->q_heads, c->kv_heads, c->head_dim, c->q_head_dim, c->rotary_dim,
+                   c->dn_vheads, c->dn_kheads, c->dn_kdim, c->dn_vdim, c->dn_convk, c->dn_conv_dim, pos, g->cap,
+                   snap};
+    int ok = q36_rmsnorm(t->normal, t->x, L->in_ln, rows, H, c->eps, 0), width;
+    const QgDense *wo;
+    if (c->is_attn[il]) {
+        width = c->q_heads * c->head_dim;
+        /* The gate half of q is read only after the attention: the CPU computes it while the GPU
+         * computes the query half, k, v and the attention, each straight into its tensor. */
+        int mark = 0;
+        int cpu = qg_cpu(g, rows) && c->q_head_dim == 2 * c->head_dim && c->head_dim % 32 == 0 &&
+                  (mark = q36_gpu_mark()) &&
+                  q36_dot_i8_heads(t->query, t->normal, L->q.q, L->q.sc, rows, H, width, c->head_dim, c->q_head_dim);
+        /* the query half goes to the GPU now: after the mark it had only the short input norm */
+        if (cpu) ok = ok && q36_gpu_flush() && qg_mm(t->key, t->normal, &L->k, rows) && qg_mm(t->p2, t->normal, &L->v, rows);
+        else
+            ok = ok && qg_mm(t->p0, t->normal, &L->q, rows) && qg_mm(t->p1, t->normal, &L->k, rows) &&
+                 qg_mm(t->p2, t->normal, &L->v, rows) && q36_attn_split(t->query, t->gate, t->key, t->p0, t->p1, &s);
+        if (ok && L->qn) ok = q36_rmsnorm(t->query, t->query, L->qn, rows * c->q_heads, c->head_dim, c->eps, 0);
+        if (ok && L->kn) ok = q36_rmsnorm(t->key, t->key, L->kn, rows * c->kv_heads, c->head_dim, c->eps, 0);
+        if (ok && c->rotary_dim)
+            ok = q36_attn_rope(t->query, t->rot, c->q_heads, &s) && q36_attn_rope(t->key, t->rot, c->kv_heads, &s);
+        ok = ok && q36_attn_kv(L->kc, L->vc, t->key, t->p2, &s);
+        /* In a long prompt the CPU also takes the attention of the last rows. */
+        int arows = cpu ? qg_cpu_attn_rows(g, c, rows, pos) : 0, amark = arows && ok ? q36_gpu_mark() : 0;
+        q36_shape sa = s;
+        if (amark) sa.rows = rows - arows;
+        ok = ok && q36_attn(t->core, t->query, L->kc, L->vc, g->scores, &sa) &&
+             (!cpu || qg_cpu_gate(g, t->gate, t->normal, &L->q, rows, c->head_dim, c->q_head_dim, mark)) &&
+             (!amark || qg_cpu_attention(g, L, t, &s, rows - arows, amark)) &&
+             q36_gate(t->tmp, t->core, t->gate, rows * width, 0);
+        wo = &L->o;
+    } else {
+        width = c->dn_vheads * c->dn_vdim;
+        /* z is read only by the gate: the CPU can compute it during the recurrence */
+        int cpu = qg_cpu(g, rows), mark = cpu ? q36_gpu_mark() : 0;
+        /* qkv goes to the GPU at once: after the mark it had only the short input norm, and
+         * idled about 0.3 ms while the rest was encoded (673 times in an 8192-token prompt) */
+        ok = ok && (!cpu || mark) && qg_mm(t->p0, t->normal, &L->qkv, rows) && (!cpu || q36_gpu_flush()) &&
+             (cpu || qg_mm(t->p1, t->normal, &L->z, rows)) &&
+             q36_dn_aux(t->decay, t->beta, t->normal, L->a, L->b, L->alog, L->dt, &s) &&
+             q36_dn_conv(t->conv, L->ring, t->p0, L->conv, L->snap_ring, &s) && q36_dn_l2(t->qk, t->conv, &s) &&
+             q36_dn_delta(t->core, L->state, t->qk, t->conv, t->decay, t->beta, L->snap_state, &s) &&
+             q36_rmsnorm(t->normout, t->core, L->norm, rows * c->dn_vheads, c->dn_vdim, c->eps, 1) &&
+             (!cpu || qg_cpu_mm(g, t->p1, t->normal, &L->z, rows, mark)) &&
+             q36_gate(t->tmp, t->normout, t->p1, rows * width, 1);
+        wo = &L->out;
+    }
+    int groups = c->n_group > 1 ? c->n_group : 1;
+    ok = ok && qg_out(g, t->projected, t->tmp, wo, rows) && qg_cut(g, c->is_attn[il] ? 1 : 0) &&
+         q36_add(t->sum, t->projected, t->x, rows * H) &&
+         q36_rmsnorm(t->post, t->sum, L->post_ln, rows, H, c->eps, 0);
+    /* Decode: the next layer's router on this layer's residual guesses the
+     * experts it will choose, so qg_moe can start reading them early. The two
+     * routers go in one dispatch. */
+    if (ok && decode_ahead && rows == 1 && il + 1 < c->n_layers)
+        ok = q36_rmsnorm(g->ahead, t->sum, g->L[il + 1].post_ln, 1, H, c->eps, 0) &&
+             q36_router_dot2(t->logits, t->post, L->router.q, L->router.sc, g->ahead_logits, g->ahead,
+                             g->L[il + 1].router.q, g->L[il + 1].router.sc, H, c->n_experts);
+    else ok = ok && q36_router_dot(t->logits, t->post, L->router.q, L->router.sc, rows, H, c->n_experts);
+    ok = ok && q36_router_softmax(t->prob, t->logits, L->bias, rows, c->n_experts) &&
+         q36_router_select(t->ids, t->weights, t->prob, rows, c->n_experts, c->topk, groups, c->topk_group) &&
+         qg_cut(g, 4);
+    return ok;
+}
+/* A prompt's last layer, when it is an attention layer: only the last row's output goes on, to
+ * the final norm and the head. The other rows only write their keys and values to the cache:
+ * the input norm, the k and v projections, the k norm and RoPE, as qg_trunk computes them. */
+static int qg_trunk_kv(Model *m, Qwen36Graph *g, QgTrunk *t, int il, int rows, int pos) {
+    Cfg *c = &m->c;
+    QgLayer *L = &g->L[il];
+    q36_shape s = {rows, c->hidden, c->q_heads, c->kv_heads, c->head_dim, c->q_head_dim, c->rotary_dim,
+                   c->dn_vheads, c->dn_kheads, c->dn_kdim, c->dn_vdim, c->dn_convk, c->dn_conv_dim, pos, g->cap, 0};
+    int ok = q36_rmsnorm(t->normal, t->x, L->in_ln, rows, c->hidden, c->eps, 0) &&
+             qg_mm(t->p1, t->normal, &L->k, rows) && qg_mm(t->p2, t->normal, &L->v, rows);
+    if (ok && L->kn) ok = q36_rmsnorm(t->p1, t->p1, L->kn, rows * c->kv_heads, c->head_dim, c->eps, 0);
+    if (ok && c->rotary_dim) ok = q36_attn_rope(t->p1, t->rot, c->kv_heads, &s);
+    return ok && q36_attn_kv(L->kc, L->vc, t->p1, t->p2, &s);
+}
+
+static int qg_layer_legacy(Model *m, Qwen36Graph *g, int il, int rows, int pos, FILE *lf);
+
+/* The last layer for a batch of a prompt: keys and values of its rows, and with last (the
+ * prompt's final batch) the whole layer for its last row alone, at its position. Every row is
+ * computed as in a whole batch, so exact mode keeps every bit; the last layer's queries,
+ * attention, output projection and experts of the other rows are skipped. */
+static int qg_layer_tail(Model *m, Qwen36Graph *g, int il, int rows, int pos, int last, FILE *lf) {
+    int kv_rows = last ? rows - 1 : rows, ok = 1;
+    if (kv_rows > 0) {
+        QgTrunk t;
+        if (!qg_trunk_bind(&t, g, &m->c, 1, 0, kv_rows, 0)) return 0;
+        ok = qg_trunk_kv(m, g, &t, il, kv_rows, pos);
+        qg_trunk_release(&t);
+    }
+    if (!ok || !last) return ok;
+    size_t H = (size_t)m->c.hidden, rd = m->c.rotary_dim > 0 ? (size_t)m->c.rotary_dim : 2;
+    q36_tensor *x = g->x, *rot = g->rot;
+    q36_tensor *xv = q36_tensor_view(x, (size_t)(rows - 1) * H * sizeof(float), H * sizeof(float));
+    q36_tensor *rv = q36_tensor_view(rot, (size_t)(rows - 1) * rd * sizeof(float), rd * sizeof(float));
+    if (xv && rv) {
+        g->x = xv; g->rot = rv;
+        ok = qg_layer_legacy(m, g, il, 1, pos + rows - 1, lf);
+        g->x = x; g->rot = rot;
+        if (g->dump_x == xv) { g->dump_x = x; g->dump_row = rows - 1; }   /* the same row, read at the next sync */
+    } else ok = 0;
+    /* encoded commands keep the buffer; q36_tensor_free only drops the views' descriptors */
+    q36_tensor_free(xv); q36_tensor_free(rv);
+    return ok;
+}
+static int qg_is_tail(const Qwen36Graph *g, const Cfg *c, int il, int rows) {
+    return il == c->n_layers - 1 && c->is_attn[il] && rows > 1 && !g->no_tail;
+}
+
+static int qg_layer_legacy(Model *m, Qwen36Graph *g, int il, int rows, int pos, FILE *lf) {
+    QgTrunk t;
+    if (!qg_trunk_bind(&t, g, &m->c, m->c.is_attn[il], 0, rows, 0)) return 0;
+    int ok = qg_trunk(m, g, &t, il, rows, pos, g->snap_rows, rows == 1);
+    if (ok && g->ahead_advice.n)
+        ok = qas_submit_pending(&g->ahead_advice, il, m, qg_advice_submit, qg_advice_emit);
+    if (!ok || !q36_gpu_sync()) return 0;
+    qg_settle(m, g, 1);
+    qg_dump_row(lf, g->projected, rows - 1, m->c.hidden);
+    qg_dump_row(lf, g->sum, rows - 1, m->c.hidden);
+    return qg_moe(m, g, il, rows, lf);
+}
+
+#include "qwen36_prefill_stream.h"
+
+/* A fast prompt longer than one batch runs layer by layer: all its batches
+ * through layer 0, then all through layer 1, and so on. A batch chooses
+ * nearly every expert of a layer, and they do not stay in the cache until
+ * the next batch: batch by batch, every batch read them all again (about
+ * 18 GB on the 35B model). Here a layer's experts stay borrowed while all its
+ * batches run (qwen36_prefill_stream.h), so the prompt reads each once. The
+ * residual of every row waits in one buffer between layers, 4 bytes per
+ * hidden unit and token (64 MB at 8192 tokens), with the RoPE table of all
+ * the positions; both are freed at the end of the prompt. Every batch of a
+ * layer sees the same inputs, state and KV rows as batch by batch, so the
+ * results are the same bits. */
+typedef struct { q36_tensor *x, *rot, *x0, *rot0, **xv, **rv; int nb; } QgPrompt;
+
+static void qg_prompt_done(Qwen36Graph *g, QgPrompt *p) {
+    if (p->x0) { g->x = p->x0; g->rot = p->rot0; }
+    for (int b = 0; b < p->nb; b++) {
+        if (p->xv) q36_tensor_free(p->xv[b]);
+        if (p->rv) q36_tensor_free(p->rv[b]);
+    }
+    free(p->xv); free(p->rv);
+    q36_tensor_free(p->x); q36_tensor_free(p->rot);
+    g->layer_major = g->stream_more = g->stream_warm = 0;
+    memset(p, 0, sizeof(*p));
+}
+
+/* The dense weights' pages. A prompt's expert reads fill the file cache, and
+ * by its end canonical.qc's pages are out of memory: the head's, which the
+ * prompt does not read (the first head after it waited about 300 ms for the
+ * 509 MB of the 35B model's head, against 8 ms in memory), and in a prompt run
+ * layer by layer the earlier layers' too (the first decode step after an
+ * 8192-token prompt took 510 ms against about 140). The prompt asks for them
+ * near its end: a prompt run layer by layer for the whole file in the second
+ * batch of its second-to-last layer, when that layer's experts are loaded and
+ * the disk is free; a shorter one when its last four layers start, sharing the
+ * disk with their experts: the whole file from 1536 tokens (the first decode
+ * step after 1536 and 2048 tokens 85 and 65 ms sooner, the prompt the same),
+ * the head alone below (after 1024 tokens the whole file made the first decode
+ * step 100 ms sooner but the prompt 90 ms longer). madvise reads the pages
+ * before it returns (about 300 ms for the head), so another thread calls it,
+ * at the priority of the prompt: the system slows down the reads of lower
+ * ones. */
+static struct { void *at; size_t bytes; } g_dense_pages;
+static void qg_dense_pages(void *arg) {
+    (void)arg;
+    madvise(g_dense_pages.at, g_dense_pages.bytes, MADV_WILLNEED);
+}
+static void qg_prefetch_dense(Qwen36Graph *g, int whole) {
+    if (!g->map || !g->head.q) return;          /* copied weights stay in memory */
+    uintptr_t page = (uintptr_t)getpagesize(), at = (uintptr_t)q36_tensor_data(g->head.q);
+    size_t bytes = q36_tensor_bytes(g->head.q);
+    if (whole) {
+        at = (uintptr_t)g->map_base;
+        bytes = g->map_bytes;
+    }
+    uintptr_t lo = at & ~(page - 1), hi = (at + bytes + page - 1) & ~(page - 1);
+    g_dense_pages.at = (void *)lo;
+    g_dense_pages.bytes = hi - lo;
+    dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), NULL, qg_dense_pages);
+}
+
+/* The forward waits for the GPU and calls qg_prompt_done whatever happens. */
+static int qg_prompt_layers(Model *m, const int *ids, int S, int pos, FILE *lf, QgPrompt *p, int *last_rows) {
+    Qwen36Graph *g = m->graph;
+    Cfg *c = &m->c;
+    int H = c->hidden, rd = c->rotary_dim > 0 ? c->rotary_dim : 2, R = g->rows;
+    p->nb = (S + R - 1) / R;
+    p->x = q36_tensor_new((size_t)S * H * sizeof(float));
+    p->rot = q36_tensor_new((size_t)S * rd * sizeof(float));
+    p->xv = calloc((size_t)p->nb, sizeof(*p->xv));
+    p->rv = calloc((size_t)p->nb, sizeof(*p->rv));
+    int ok = p->x && p->rot && p->xv && p->rv;
+    for (int b = 0; ok && b < p->nb; b++) {
+        size_t r0 = (size_t)b * R, n = (size_t)S - r0 < (size_t)R ? (size_t)S - r0 : (size_t)R;
+        ok = (p->xv[b] = q36_tensor_view(p->x, r0 * H * sizeof(float), n * H * sizeof(float))) &&
+             (p->rv[b] = q36_tensor_view(p->rot, r0 * rd * sizeof(float), n * rd * sizeof(float)));
+    }
+    /* x and the RoPE table are written by the CPU: nothing may be in flight */
+    ok = q36_gpu_sync() && ok;
+    qg_settle(m, g, ok);
+    if (ok) ok = qgc_expected_phase(m->global_cache, S, pos);
+    if (!ok) return 0;
+    p->x0 = g->x; p->rot0 = g->rot;
+    float *x = q36_tensor_data(p->x);
+    for (int r = 0; ok && r < S; r++) ok = qwen_embedding_row(m, ids[r], x + (size_t)r * H);
+    if (ok && c->rotary_dim) { g->rot = p->rot; qg_rope_table(c, g, S, pos); }
+    g->layer_major = 1;
+    for (int il = 0; ok && il < c->n_layers; il++)
+        for (int b = 0; ok && b < p->nb; b++) {
+            if (il == c->n_layers - 2 && b == 1) qg_prefetch_dense(g, 1);
+            int s0 = b * R, rows = S - s0 < R ? S - s0 : R;
+            int before = g->snap_at - (pos + s0);   /* rows of this batch up to the snapshot */
+            g->snap_rows = before >= 1 && before <= rows ? before : 0;
+            g->x = p->xv[b]; g->rot = p->rv[b];
+            g->stream_more = b + 1 < p->nb;
+            g->stream_warm = b > 0;
+            q36_gpu_keepalive(0.25);
+            FILE *dump = b + 1 == p->nb ? lf : NULL;
+            ok = qg_is_tail(g, c, il, rows) ? qg_layer_tail(m, g, il, rows, pos + s0, b + 1 == p->nb, dump)
+                                         : qg_layer(m, g, il, rows, pos + s0, dump);
+            *last_rows = rows;
+        }
+    return ok;
+}
+
+/* S tokens at positions pos..; logits of the last one, or of every row in a
+ * verify (g->verify). lf: DUMP_LAYERS file, three rows per layer for the last
+ * token (projection, residual, MoE output). With the MTP head the final residual
+ * of every row is kept (qg_keep), a prompt's pairs go through the head, and the
+ * rows left wait for the token after them (qg_mtp_draft). */
+static int qg_keep(Qwen36Graph *g, const float *x, int first, int n, int H) {
+    size_t need = (size_t)(first + n) * H;
+    if (need > g->h_cap) {
+        float *h = realloc(g->h_rows, need * sizeof(float));
+        if (!h) return 0;
+        g->h_rows = h;
+        g->h_cap = need;
+    }
+    memcpy(g->h_rows + (size_t)first * H, x, (size_t)n * H * sizeof(float));
+    return 1;
+}
+static int qg_mtp_rows(Model *m, const float *h, const int *next, int n, int pos, float *logits);
+
+static int qg_forward(Model *m, const int *ids, int S, int pos, float *logits, FILE *lf) {
+    Qwen36Graph *g = m->graph;
+    Cfg *c = &m->c;
+    int verify = g->verify;
+    qas_clear(&g->ahead_advice);
+    g->defer_decode_advice = S == 1 && pos > 0;
+    g->no_tail = verify || m->mtp;
+    int R = S > 1 && !verify ? qg_prompt_rows() : S;
+    int H = c->hidden, rows = 0, ok = S >= 1 && pos >= 0 && qg_reserve(m, pos + S) && qg_rows(m, S < R ? S : R);
+    /* Decode leaves the GPU waiting at every layer, and a prompt waits for
+     * its experts too: keep the clocks up until a quarter of a second after
+     * the last renewal (every step, and every layer and group of a prompt). */
+    q36_gpu_keepalive(0.25);
+    /* A verify's kernels copy the DeltaNet state after its first row into the spec copies. */
+    if (verify)
+        for (int i = 0; i < c->n_layers; i++) {
+            QgLayer *L = &g->L[i];
+            if (!L->state) continue;
+            q36_tensor *s = L->snap_state, *r = L->snap_ring;
+            L->snap_state = L->spec_state; L->snap_ring = L->spec_ring;
+            L->spec_state = s; L->spec_ring = r;
+        }
+    QgPrompt lp = {0};
+    if (ok && S > g->rows && g->stream_enabled && !q36_gpu_is_exact())
+        ok = qg_prompt_layers(m, ids, S, pos, lf, &lp, &rows);
+    else for (int s0 = 0; ok && s0 < S; s0 += rows) {
+        int prev = rows;
+        rows = S - s0 < g->rows ? S - s0 : g->rows;
+        int before = g->snap_at - (pos + s0);   /* rows of this batch up to the snapshot */
+        g->snap_rows = verify ? 1 : before >= 1 && before <= rows ? before : 0;
+        /* x and the RoPE table are rewritten by the CPU: nothing may be in flight */
+        ok = q36_gpu_sync();
+        qg_settle(m, g, ok);
+        if (ok && m->mtp && s0 > 0) ok = qg_keep(g, q36_tensor_data(g->x), s0 - prev, prev, H);
+        /* a verify is decode for the expert cache's reuse estimates */
+        if (ok && s0 == 0) ok = qgc_expected_phase(m->global_cache, verify ? 1 : S, pos);
+        float *x = q36_tensor_data(g->x);
+        for (int r = 0; ok && r < rows; r++) ok = qwen_embedding_row(m, ids[s0 + r], x + (size_t)r * H);
+        if (ok && c->rotary_dim) qg_rope_table(c, g, rows, pos + s0);
+        for (int il = 0; ok && il < c->n_layers; il++) {
+            if (S > 1) q36_gpu_keepalive(0.25);
+            if (S > 64 && il == c->n_layers - 4 && s0 + rows == S) qg_prefetch_dense(g, S >= 1536);
+            FILE *dump = s0 + rows == S ? lf : NULL;
+            ok = qg_is_tail(g, c, il, rows) ? qg_layer_tail(m, g, il, rows, pos + s0, s0 + rows == S, dump)
+                                            : qg_layer(m, g, il, rows, pos + s0, dump);
+        }
+    }
+    /* The final norm is the CPU engine's double sum of squares. The head
+     * runs on the GPU, with ordered sums in exact mode and vector sums in
+     * fast mode. It costs one more wait for the GPU per forward. */
+    ok = q36_gpu_sync() && ok;
+    qg_settle(m, g, ok);
+    qas_clear(&g->ahead_advice);
+    g->defer_decode_advice = 0;
+    g->snap_rows = 0;
+    if (verify)
+        for (int i = 0; i < c->n_layers; i++) {
+            QgLayer *L = &g->L[i];
+            if (!L->state) continue;
+            q36_tensor *s = L->snap_state, *r = L->snap_ring;
+            L->snap_state = L->spec_state; L->snap_ring = L->spec_ring;
+            L->spec_state = s; L->spec_ring = r;
+        }
+    if (ok && m->mtp)       /* the rows' final residuals: the whole prompt layer by layer, else the last batch */
+        ok = lp.x ? qg_keep(g, q36_tensor_data(lp.x), 0, S, H)
+                  : qg_keep(g, q36_tensor_data(g->x), S - rows, rows, H);
+    int nl = verify ? S : 1;                    /* rows whose logits come back */
+    q36_tensor *last = verify ? g->last_rows : g->last, *out = verify ? g->head_rows : g->head_out;
+    for (int r = 0; ok && r < nl; r++)
+        rmsnorm_row((float *)q36_tensor_data(last) + (size_t)r * H,
+                    (const float *)q36_tensor_data(g->x) + (size_t)(rows - nl + r) * H, m->final_norm, H, c->eps);
+    qg_prompt_done(g, &lp);
+    ok = ok && qg_mm(out, last, &g->head, nl) && qg_cut(g, 5) && q36_gpu_sync();
+    if (ok) memcpy(logits, q36_tensor_data(out), (size_t)nl * c->vocab * sizeof(float));
+    if (tm_on()) {      /* as on the CPU, the MoE time holds the router, the shared expert and the disk */
+        const double *t = g->ms;
+        tm_add(S, 0, t[0]); tm_add(S, 1, t[1]); tm_add(S, 2, t[2] + t[3] + t[4] + t[6]);
+        tm_add(S, 3, t[3]); tm_add(S, 4, t[4]); tm_add(S, 5, t[5]);
+        if (S == 1) { g_xf_load += t[6]; g_xf_run += t[2]; g_tm_dec_tokens++; } else g_tm_pre_tokens += S;
+        memset(g->ms, 0, sizeof(g->ms));
+    }
+    if (g->stream_initialized) {
+        /* The readers sleep on the cache's condition: join them at the end of
+         * the prompt, so that decode does not wake four idle threads. */
+        if (!qll_destroy(&g->stream_loader)) abort();
+        g->stream_initialized = 0;
+    }
+    if (ok && m->mtp) {
+        if (S > 1 && !verify) {
+            /* a prompt: its pairs through the head; its last row waits for the next token */
+            ok = qg_mtp_rows(m, g->h_rows, ids + 1, S - 1, pos, NULL);
+            memcpy(g->mtp_pend, g->h_rows + (size_t)(S - 1) * H, (size_t)H * sizeof(float));
+            g->mtp_pend_n = 1;
+            g->mtp_pend_pos = pos + S - 1;
+            if (g->h_cap > (size_t)Q36_SPEC_ROWS * H) { free(g->h_rows); g->h_rows = NULL; g->h_cap = 0; }
+        } else {
+            /* a step or a verify: its rows wait; a verify's drafts are settled by q36_spec_step (qg_mtp_keep) */
+            memcpy(g->mtp_pend, g->h_rows, (size_t)S * H * sizeof(float));
+            for (int j = 0; j + 1 < S; j++) g->mtp_pend_tok[j] = ids[j + 1];
+            g->mtp_pend_n = S;
+            g->mtp_pend_pos = pos;
+        }
+    }
+    if (S > 1 && !verify) q36_gpu_keepalive(0);       /* also on a failed prefill; a verify is decode */
+    return ok;
+}
+
+/* ---- speculative decoding (q36_spec_step) --------------------------------- */
+
+/* The copies a verify needs, allocated the first time: the DeltaNet state after
+ * its first row (as large as the state: 60 MB on the 35B model in fast mode, 120
+ * in exact mode) and the final norms and logits of its rows. 0 = no memory. */
+static int qg_spec_alloc(Model *m) {
+    Qwen36Graph *g = m->graph;
+    Cfg *c = &m->c;
+    for (int i = 0; i < c->n_layers; i++) {
+        QgLayer *L = &g->L[i];
+        if (!L->state) continue;
+        if (!L->spec_state && !(L->spec_state = q36_tensor_new(q36_tensor_bytes(L->state)))) return 0;
+        if (!L->spec_ring && !(L->spec_ring = q36_tensor_new(q36_tensor_bytes(L->ring)))) return 0;
+    }
+    if (!g->last_rows && !(g->last_rows = q36_tensor_new((size_t)Q36_SPEC_ROWS * c->hidden * sizeof(float)))) return 0;
+    if (!g->head_rows && !(g->head_rows = q36_tensor_new((size_t)Q36_SPEC_ROWS * c->vocab * sizeof(float)))) return 0;
+    return 1;
+}
+
+/* A verify's draft was rejected: the state after its first row comes back. */
+static void qg_spec_rollback(Model *m) {
+    Qwen36Graph *g = m->graph;
+    qg_settle(m, g, q36_gpu_sync());
+    for (int i = 0; i < m->c.n_layers; i++) {
+        QgLayer *L = &g->L[i];
+        if (!L->state) continue;
+        q36_tensor *s = L->state, *r = L->ring;
+        L->state = L->spec_state; L->ring = L->spec_ring;
+        L->spec_state = s; L->spec_ring = r;
+    }
+}
+
+/* The MTP head over n pairs at positions pos..: row r pairs the model's final
+ * residual h[r] at pos + r with the token next[r] at pos + r + 1. Their K/V
+ * rows go into the head's attention (its own cache, layer c.n_layers), the
+ * routed experts through the expert cache; with logits, the last row's logits
+ * come back: what the head says follows next[n - 1]. The input is the
+ * checkpoint's: the embedding normed by pre_fc_norm_embedding, then the residual
+ * (after the model's final norm, as the head was trained; QWEN36_MTP_HIDDEN=pre
+ * reads it before) normed by pre_fc_norm_hidden, both into fc. */
+static int qg_mtp_rows(Model *m, const float *h, const int *next, int n, int pos, float *logits) {
+    Qwen36Graph *g = m->graph;
+    Cfg *c = &m->c;
+    int H = c->hidden, il = c->n_layers, rows = 0;
+    int R = n <= g->rows ? g->rows : n < qg_prompt_rows() ? n : qg_prompt_rows();   /* no new tensors when they hold n rows */
+    float *e = malloc((size_t)H * sizeof(float)), *hn = malloc((size_t)H * sizeof(float));
+    int ok = e && hn && n > 0 && qg_reserve(m, pos + n) && qg_rows(m, R);
+    g->snap_rows = 0;
+    if (ok && g->mtp_len != pos && !g->mtp_holes++)
+        fprintf(stderr, "[qwen36-mtp] the head's rows stop at %d, a pair comes at %d: its attention misses rows\n",
+                g->mtp_len, pos);
+    for (int b0 = 0; ok && b0 < n; b0 += rows) {
+        rows = n - b0 < g->rows ? n - b0 : g->rows;
+        ok = q36_gpu_sync();
+        qg_settle(m, g, ok);
+        float *in = q36_tensor_data(g->mtp_in);
+        for (int r = 0; ok && r < rows; r++) {
+            float *row = in + (size_t)r * 2 * H;
+            const float *hr = h + (size_t)(b0 + r) * H;
+            ok = qwen_embedding_row(m, next[b0 + r], e);
+            rmsnorm_row(row, e, m->mtp_norm_emb, H, c->eps);
+            if (g->mtp_post) { rmsnorm_row(hn, hr, m->final_norm, H, c->eps); hr = hn; }
+            rmsnorm_row(row + H, hr, m->mtp_norm_hid, H, c->eps);
+        }
+        if (ok && c->rotary_dim) qg_rope_table(c, g, rows, pos + b0);
+        ok = ok && qg_mm(g->x, g->mtp_in, &g->mtp_fc, rows) && qg_layer_legacy(m, g, il, rows, pos + b0, NULL);
+    }
+    ok = q36_gpu_sync() && ok;
+    qg_settle(m, g, ok);
+    if (ok) g->mtp_len = pos + n;
+    if (ok && logits) {
+        rmsnorm_row(q36_tensor_data(g->last), (const float *)q36_tensor_data(g->x) + (size_t)(rows - 1) * H,
+                    m->mtp_norm, H, c->eps);
+        ok = qg_mm(g->head_out, g->last, &g->head, 1) && q36_gpu_sync();
+        if (ok) memcpy(logits, q36_tensor_data(g->head_out), (size_t)c->vocab * sizeof(float));
+    }
+    free(e);
+    free(hn);
+    return ok;
+}
+
+/* After a verify: of its rows, the first keep stood. */
+static void qg_mtp_keep(Model *m, int keep) {
+    Qwen36Graph *g = m->graph;
+    if (keep < g->mtp_pend_n) g->mtp_pend_n = keep;
+}
+
+/* The pending rows meet the token after the last, tok: through the head, whose
+ * most likely next token is the draft. 0 = nothing pending or a failure. */
+static int qg_mtp_draft(Model *m, int tok, int *draft) {
+    Qwen36Graph *g = m->graph;
+    int n = g->mtp_pend_n, next[Q36_SPEC_ROWS], V = m->c.vocab;
+    if (!n) return 0;
+    for (int j = 0; j + 1 < n; j++) next[j] = g->mtp_pend_tok[j];
+    next[n - 1] = tok;
+    float *logits = malloc((size_t)V * sizeof(float));
+    int ok = logits && qg_mtp_rows(m, g->mtp_pend, next, n, g->mtp_pend_pos, logits);
+    g->mtp_pend_n = 0;
+    if (ok) {
+        int best = 0;
+        for (int i = 1; i < V; i++) if (logits[i] > logits[best]) best = i;
+        *draft = best;
+    }
+    free(logits);
+    return ok;
+}
+
+#endif
+#endif

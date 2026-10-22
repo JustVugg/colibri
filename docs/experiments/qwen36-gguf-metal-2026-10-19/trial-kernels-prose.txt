@@ -1,0 +1,206 @@
+Paths shortened: <GGUF model> is the directory coli import --mode link made for the GGUF (<GGUF dir>/ holds the file), <model> is the model's own directory (canonical.qc and experts.qc beside it); bin-<commit>/ holds the harness built from that commit; each launchers/<name>/qwen36-bench is a script that sets SNAP and the variables in brackets and runs a harness. Units: /usr/bin/time -l gives bytes; the engine's '[bench] peak RSS' is in GiB; the summary's 'peak memory ... MB' is in MiB, and so is the engine's '1.95 MB per expert at most' (2,039,808 bytes, 2.04 MB).
+
+# this change's (08293922): lanes spread over the blocks as llama.cpp's matrix-vector kernels, the block scales on the blocks' sums of q x, prompts decoded into the matrix units' operands, the experts' prompt tiles of the int4 kernels
+
+model set by each launcher; text promessi_sposi.txt; lengths 64,512; gen 32; runs 4; extra env: TEACHER=1
+cooldown before every run: 60 seconds, after waiting for thermal state 0: yes, at most 900s; thermal states: 0 nominal, 1 fair, 2 serious, 3 critical
+v0: launchers/gguf-435651fb/qwen36-bench (the change before (435651fb), the defaults, SNAP=<GGUF model>)
+v1: launchers/gguf/qwen36-bench (this change (08293922), the defaults, SNAP=<GGUF model>)
+order: the binaries' order turns at every round (ABBA)
+
+host before the runs: 2026-10-19 12:31:07 chrome=0 System-wide memory free percentage: 79% swap_used=701.62M swapouts=75988
+
+host after the runs: 2026-10-19 12:46:52 chrome=0 System-wide memory free percentage: 78% swap_used=693.62M swapouts=75988
+
+## v1-run1
+### before the run (date, thermal state, swap, wait)
+2026-10-19 12:36:14
+0
+swap_used=701.62M swapouts=75988
+waited for state 0: 0s
+
+### harness output
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,4.006,15.97,32,1166.7,6.983,9072,9.31,d11eb1bbd30253bb,5cb23346ab6be1d8,2.72050,0.469
+512,512,7.751,66.06,32,799.9,7.462,10962,10.22,c048488df5ccaad8,7a8848450b863c49,3.00958,0.500
+
+### engine log and /usr/bin/time -l
+[bench] GGUF <GGUF dir>/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf: 1 file(s), 733 tensors
+[tok] loaded 248320 pieces (max id 248319) from <GGUF model>/tokenizer.json
+[gguf] qwen35moe: 40 layers (10 attention), hidden 2048, 256 experts top-8, inter 512, vocab 248320, DeltaNet v/k heads 32/16
+[gguf] experts: layer 0 gate Q4_K up Q4_K down Q5_K, 1.95 MB per expert at most
+[qwen-cache] global_bytes=536469504 slots=263 slot_bytes=2039808 decode_policy=expected-reuse
+[qwen36-metal] expert cache below 256 retained slots: prompt experts load eight at a time
+[qwen36-metal] graph ready on Apple M1: rows<=2048 dense=mapped kv=half (1910087680 bytes mapped); the experts in the global cache, not in the per-layer one
+[qwen36-metal] GGUF: the dense matrices read in place as the file's ggml blocks, and the routed experts as its blocks too (layer 0: gate Q4_K, up Q4_K, down Q5_K), with no second quantization
+[bench] Metal graph ready in 0.18 s; text 6182 tokens; lengths 64,512; gen 32; each length from an empty state
+[bench] peak RSS 0.71 GB
+[qwen36-metal] GGUF: 21706 products with the file's dense matrices and 12192 with its routed experts ran on the GPU
+       22.87 real         1.56 user        12.82 sys
+           764575744  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              115305  page reclaims
+               30518  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 334  voluntary context switches
+              367958  involuntary context switches
+         37286011150  instructions retired
+         41769752716  cycles elapsed
+          1147670848  peak memory footprint
+
+### after the run
+2026-10-19 12:36:37
+0
+swap_used=693.62M swapouts=75988
+
+## v1-run2
+### before the run (date, thermal state, swap, wait)
+2026-10-19 12:37:38
+0
+swap_used=693.62M swapouts=75988
+waited for state 0: 0s
+
+### harness output
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,4.140,15.46,32,982.6,7.121,9072,9.10,d11eb1bbd30253bb,5cb23346ab6be1d8,2.72050,0.469
+512,512,7.297,70.16,32,992.4,7.550,10962,10.26,c048488df5ccaad8,7a8848450b863c49,3.00958,0.500
+
+### engine log and /usr/bin/time -l
+[bench] GGUF <GGUF dir>/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf: 1 file(s), 733 tensors
+[tok] loaded 248320 pieces (max id 248319) from <GGUF model>/tokenizer.json
+[gguf] qwen35moe: 40 layers (10 attention), hidden 2048, 256 experts top-8, inter 512, vocab 248320, DeltaNet v/k heads 32/16
+[gguf] experts: layer 0 gate Q4_K up Q4_K down Q5_K, 1.95 MB per expert at most
+[qwen-cache] global_bytes=536469504 slots=263 slot_bytes=2039808 decode_policy=expected-reuse
+[qwen36-metal] expert cache below 256 retained slots: prompt experts load eight at a time
+[qwen36-metal] graph ready on Apple M1: rows<=2048 dense=mapped kv=half (1910087680 bytes mapped); the experts in the global cache, not in the per-layer one
+[qwen36-metal] GGUF: the dense matrices read in place as the file's ggml blocks, and the routed experts as its blocks too (layer 0: gate Q4_K, up Q4_K, down Q5_K), with no second quantization
+[bench] Metal graph ready in 0.23 s; text 6182 tokens; lengths 64,512; gen 32; each length from an empty state
+[bench] peak RSS 0.75 GB
+[qwen36-metal] GGUF: 21706 products with the file's dense matrices and 12192 with its routed experts ran on the GPU
+       22.49 real         1.58 user        12.79 sys
+           802390016  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              111009  page reclaims
+               31060  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 518  voluntary context switches
+              357770  involuntary context switches
+         37134006243  instructions retired
+         41722615598  cycles elapsed
+          1147654464  peak memory footprint
+
+### after the run
+2026-10-19 12:38:00
+0
+swap_used=693.62M swapouts=75988
+
+## v1-run3
+### before the run (date, thermal state, swap, wait)
+2026-10-19 12:43:05
+0
+swap_used=693.62M swapouts=75988
+waited for state 0: 0s
+
+### harness output
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,4.020,15.92,32,860.2,7.260,9072,8.70,d11eb1bbd30253bb,5cb23346ab6be1d8,2.72050,0.469
+512,512,7.524,68.05,32,872.7,7.492,10962,10.12,c048488df5ccaad8,7a8848450b863c49,3.00958,0.500
+
+### engine log and /usr/bin/time -l
+[bench] GGUF <GGUF dir>/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf: 1 file(s), 733 tensors
+[tok] loaded 248320 pieces (max id 248319) from <GGUF model>/tokenizer.json
+[gguf] qwen35moe: 40 layers (10 attention), hidden 2048, 256 experts top-8, inter 512, vocab 248320, DeltaNet v/k heads 32/16
+[gguf] experts: layer 0 gate Q4_K up Q4_K down Q5_K, 1.95 MB per expert at most
+[qwen-cache] global_bytes=536469504 slots=263 slot_bytes=2039808 decode_policy=expected-reuse
+[qwen36-metal] expert cache below 256 retained slots: prompt experts load eight at a time
+[qwen36-metal] graph ready on Apple M1: rows<=2048 dense=mapped kv=half (1910087680 bytes mapped); the experts in the global cache, not in the per-layer one
+[qwen36-metal] GGUF: the dense matrices read in place as the file's ggml blocks, and the routed experts as its blocks too (layer 0: gate Q4_K, up Q4_K, down Q5_K), with no second quantization
+[bench] Metal graph ready in 0.17 s; text 6182 tokens; lengths 64,512; gen 32; each length from an empty state
+[bench] peak RSS 0.76 GB
+[qwen36-metal] GGUF: 21706 products with the file's dense matrices and 12192 with its routed experts ran on the GPU
+       22.21 real         1.49 user        12.66 sys
+           819412992  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               97723  page reclaims
+               29512  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 251  voluntary context switches
+              358515  involuntary context switches
+         35711767518  instructions retired
+         41106329776  cycles elapsed
+          1142723712  peak memory footprint
+
+### after the run
+2026-10-19 12:43:27
+0
+swap_used=693.62M swapouts=75988
+
+## v1-run4
+### before the run (date, thermal state, swap, wait)
+2026-10-19 12:44:27
+0
+swap_used=693.62M swapouts=75988
+waited for state 0: 0s
+
+### harness output
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,4.290,14.92,32,854.2,7.116,9072,8.94,d11eb1bbd30253bb,5cb23346ab6be1d8,2.72050,0.469
+512,512,7.304,70.10,32,1019.7,7.471,10962,10.36,c048488df5ccaad8,7a8848450b863c49,3.00958,0.500
+
+### engine log and /usr/bin/time -l
+[bench] GGUF <GGUF dir>/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf: 1 file(s), 733 tensors
+[tok] loaded 248320 pieces (max id 248319) from <GGUF model>/tokenizer.json
+[gguf] qwen35moe: 40 layers (10 attention), hidden 2048, 256 experts top-8, inter 512, vocab 248320, DeltaNet v/k heads 32/16
+[gguf] experts: layer 0 gate Q4_K up Q4_K down Q5_K, 1.95 MB per expert at most
+[qwen-cache] global_bytes=536469504 slots=263 slot_bytes=2039808 decode_policy=expected-reuse
+[qwen36-metal] expert cache below 256 retained slots: prompt experts load eight at a time
+[qwen36-metal] graph ready on Apple M1: rows<=2048 dense=mapped kv=half (1910087680 bytes mapped); the experts in the global cache, not in the per-layer one
+[qwen36-metal] GGUF: the dense matrices read in place as the file's ggml blocks, and the routed experts as its blocks too (layer 0: gate Q4_K, up Q4_K, down Q5_K), with no second quantization
+[bench] Metal graph ready in 0.23 s; text 6182 tokens; lengths 64,512; gen 32; each length from an empty state
+[bench] peak RSS 0.75 GB
+[qwen36-metal] GGUF: 21706 products with the file's dense matrices and 12192 with its routed experts ran on the GPU
+       22.58 real         1.58 user        12.84 sys
+           810500096  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              110316  page reclaims
+               31009  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 520  voluntary context switches
+              359508  involuntary context switches
+         37199110447  instructions retired
+         41880545524  cycles elapsed
+          1147507008  peak memory footprint
+
+### after the run
+2026-10-19 12:44:50
+0
+swap_used=693.62M swapouts=75988
+
