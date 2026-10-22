@@ -49,8 +49,16 @@ struct CcCtx {
     /* host_up: the copies' marks, a ring of CC_UP_MARKS events on the copy stream */
     cudaEvent_t up_ev[CC_UP_MARKS]; unsigned up_seq, up_made; cudaEvent_t up_after;
     float *adec; size_t adec_bytes;   /* cc_attn_dec_k's blocks */
+    /* the scratch a resize retired: freed once a later frame has been waited for (a stream
+     * sync here could wait on a cc_wait_host kernel whose host side comes after this frame) */
+    float *adec_old[4]; int adec_n_old;
 };
 CcCtx g_cc[COLI_CUDA_MAX_DEVICES];
+/* the retired attention scratches, after the stream was seen to pass the frames that read them */
+static void cc_adec_reap(CcCtx *c) {
+    for (int i = 0; i < c->adec_n_old; i++) cudaFree(c->adec_old[i]);
+    c->adec_n_old = 0;
+}
 int g_ncc, g_cur = -1;   /* g_cur: index into g_cc of the current context */
 CcStats g_st;
 
@@ -885,6 +893,7 @@ static void cc_shutdown(void) {
             if (c->up_made) { for (int i = 0; i < CC_UP_MARKS; i++) cudaEventDestroy(c->up_ev[i]); cudaEventDestroy(c->up_after); }
             c->up_made = 0; c->up_seq = 0;
             if (c->adec) cudaFree(c->adec);
+            cc_adec_reap(c);
         }
         c->adec = nullptr; c->adec_bytes = 0;
         (void)cudaGetLastError();
@@ -974,6 +983,7 @@ static int cc_submit(int wait) {
     int ok = cc_ok(c, cudaEventSynchronize(c->ev), "frame wait");
     g_st.waits++; g_st.wait_ms += cc_now_ms() - t0;
     c->ev_pending = 0;
+    if (ok) cc_adec_reap(c);
     return ok;
 }
 static int cc_finish(void) {
@@ -984,6 +994,7 @@ static int cc_finish(void) {
     if (ok && c->cs_ok) ok = cc_ok(c, cudaStreamSynchronize(c->cs), "finish copies");
     g_st.waits++; g_st.wait_ms += cc_now_ms() - t0;
     c->ev_pending = 0;
+    if (ok) cc_adec_reap(c);
     return ok;
 }
 
@@ -1235,7 +1246,10 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
         }
         size_t need = (size_t)p->S * p->H * nb * (p->hd + 2) * sizeof(float);
         if (need > c->adec_bytes) {   /* rare: the context past what it was; the frames before done first */
-            if (c->adec) { if (!cc_ok(c, cudaStreamSynchronize(c->stream), "attn scratch")) return 0; cudaFree(c->adec); }
+            if (c->adec) {   /* retired, not freed: the frames before may still read it, and a sync here can deadlock a hybrid layer */
+                if (c->adec_n_old == 4) { if (!cc_ok(c, cudaStreamSynchronize(c->stream), "attn scratch")) return 0; cc_adec_reap(c); }
+                c->adec_old[c->adec_n_old++] = c->adec;
+            }
             c->adec = nullptr; c->adec_bytes = 0;
             size_t want = need + need / 2;
             if (cudaMalloc((void **)&c->adec, want) == cudaSuccess) c->adec_bytes = want;
@@ -1493,7 +1507,10 @@ static int cc_attn_w2(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcB
         }
         size_t need = (size_t)p->S * p->H * nb * (p->hd + 2) * sizeof(float);
         if (need > c->adec_bytes) {   /* the frames before done first, as in cc_attn */
-            if (c->adec) { if (!cc_ok(c, cudaStreamSynchronize(c->stream), "attn scratch")) return 0; cudaFree(c->adec); }
+            if (c->adec) {   /* retired, not freed: the frames before may still read it, and a sync here can deadlock a hybrid layer */
+                if (c->adec_n_old == 4) { if (!cc_ok(c, cudaStreamSynchronize(c->stream), "attn scratch")) return 0; cc_adec_reap(c); }
+                c->adec_old[c->adec_n_old++] = c->adec;
+            }
             c->adec = nullptr; c->adec_bytes = 0;
             size_t want = need + need / 2;
             if (cudaMalloc((void **)&c->adec, want) == cudaSuccess) c->adec_bytes = want;
