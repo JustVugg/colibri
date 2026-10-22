@@ -108,7 +108,8 @@ DECIDE <id> <slot> <bytes>\n<payload>\n
   received after the complete prefill retains that valid prefix. Response time
   depends on one full prompt-layer of work, not a fixed millisecond bound.
   Image turns, prompt logprobs, layer dumps, qpack, CUDA tiers/chains, Vulkan,
-  and `KV_SLOTS>1` retain their existing whole-prefill handling.
+  the Metal graph, and `KV_SLOTS>1` retain their existing whole-prefill
+  handling.
 - `DECIDE` (only to an engine that announced `decide=1`) carries one decision
   record, UTF-8 JSON: the state and the typed questions with their options in
   order. The engine answers with one `DECISION` frame and `DONE`, or with
