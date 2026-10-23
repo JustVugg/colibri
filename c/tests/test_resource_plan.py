@@ -10,9 +10,11 @@ from unittest import mock
 
 from resource_plan import (
     GB,
+    CgroupFormatError,
     analyze_model,
     build_plan,
     cpu_socket_count,
+    discover_gpus,
     environment_for_plan,
     format_plan,
     memory_available,
@@ -25,13 +27,21 @@ from resource_plan import (
 )
 
 
+def analyze_qwen38_mtp(model, env):
+    """The analysis build_plan works from, after the MTP head's pricing."""
+    import resource_plan
+    info = resource_plan.qwen38_int4_sidecar(resource_plan.analyze_model(model))
+    return resource_plan._q38_mtp_head(info, env)
+
+
 def write_shard(path, tensors):
     offset = 0
     header = {}
     for tensor in tensors:
         name, size, *metadata = tensor
         dtype = metadata[0] if metadata else "U8"
-        header[name] = {"dtype": dtype, "shape": [size],
+        shape = metadata[1] if len(metadata) > 1 else [size]
+        header[name] = {"dtype": dtype, "shape": shape,
                         "data_offsets": [offset, offset + size]}
         offset += size
     raw = json.dumps(header).encode()
@@ -112,6 +122,28 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertFalse(any("jointly constrained" in warning
                              for warning in plan["warnings"]))
 
+    def test_macos_discovers_metal_gpu_without_cuda_or_rocm_probes(self):
+        output = json.dumps({"SPDisplaysDataType": [{
+            "_name": "Apple M1 Pro",
+            "sppci_model": "Apple M1 Pro",
+            "spdisplays_mtlgpufamilysupport": "spdisplays_metal4",
+        }]})
+        result = subprocess.CompletedProcess(args=[], returncode=0,
+                                             stdout=output, stderr="")
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch("resource_plan.subprocess.run", return_value=result) as run:
+            devices = discover_gpus()
+        self.assertEqual(devices, [{"index": 0, "name": "Apple M1 Pro",
+                                    "total_bytes": 0, "free_bytes": None,
+                                    "unified_memory": True, "backend": "metal"}])
+        self.assertEqual(run.call_args.args[0],
+                         ["system_profiler", "SPDisplaysDataType", "-json"])
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                  available_disk=1, gpus=devices, physical_cpus=8,
+                  cpu_sockets=1)
+        self.assertIn("Metal  0:Apple M1 Pro · unified memory",
+                  format_plan(plan))
+
     def test_glm53_auto_tune_does_not_emit_generic_inert_knobs(self):
         from resource_plan import _auto_tune
 
@@ -122,6 +154,319 @@ class ResourcePlanTest(unittest.TestCase):
         glm53 = _auto_tune("disk", 0.50, [], 1, False,
                            engine_group="glm53")
         self.assertEqual(glm53, {})
+
+    def test_only_the_colibri_engine_gets_its_own_knobs(self):
+        """DRAFT, PIPE, COLI_CUDA_PIPE, COLI_NUMA and PIN_GB are read by
+        colibri.c and by no other engine. glm53 was excluded; every other
+        sibling was still told to set them, in `coli plan`, in `coli doctor`
+        and in the --auto-tier environment."""
+        from family_registry import all_families
+        from resource_plan import _auto_tune
+
+        gpu = [{"index": 0, "name": "GPU", "total_bytes": 24 * GB,
+                "free_bytes": 24 * GB}]
+        cases = (("disk", 0.50, [], 2), ("compute", 1.0, [], 2),
+                 ("compute", 1.0, gpu, 2), ("mixed", 0.80, gpu + gpu, 1))
+        core = [_auto_tune(*case, False, engine_group="colibri-core") for case in cases]
+        self.assertEqual({key for tune in core for key in tune},
+                         {"DRAFT", "PIPE", "COLI_CUDA_PIPE", "COLI_NUMA",
+                          "_numa_hint", "PIN_GB"})
+        groups = {family.engine_group for family in all_families()} - {"colibri-core"}
+        self.assertIn("qwen36", groups)
+        for group in sorted(groups):
+            for case in cases:
+                with self.subTest(engine_group=group, case=case[:2]):
+                    self.assertEqual(_auto_tune(*case, False, engine_group=group), {})
+
+    def test_v41_gateway_sizes_cap_from_ram_without_auto_tier(self):
+        from openai_server import cap_for_arch
+
+        (self.model / "config.json").write_text(json.dumps({
+            "model_type": "deepseek_v41", "num_hidden_layers": 2,
+            "n_routed_experts": 128, "hidden_size": 128, "head_dim": 64,
+            "window_size": 8, "index_head_dim": 32, "hc_mult": 4,
+            "compress_ratios": [0, 2], "kv_source_layers": [1],
+        }))
+        write_shard(self.model / "model.safetensors", [
+            ("embed.weight", GB),
+            *[(f"layers.{layer}.ffn.experts.{expert}.w1.weight", 16 * 1024**2)
+              for layer in range(2) for expert in range(128)],
+        ])
+        with mock.patch("resource_plan.memory_available", return_value=16 * GB):
+            small = cap_for_arch("deepseek_v41", None, {"RAM_GB": "8"}, self.model)
+            large = cap_for_arch("deepseek_v41", None, {"RAM_GB": "12"}, self.model)
+            automatic = cap_for_arch("deepseek_v41", None, {}, self.model)
+        self.assertGreater(small, 8)
+        self.assertGreater(large, small)
+        self.assertEqual(large, 128)
+        self.assertEqual(automatic, 128)
+        self.assertEqual(cap_for_arch("deepseek_v41", 4, {"RAM_GB": "12"}, self.model), 4)
+
+    def test_sibling_plan_advises_no_colibri_knob(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        olmoe = Path(other.name)
+        (olmoe / "config.json").write_text(json.dumps({
+            "model_type": "olmoe", "num_hidden_layers": 2, "hidden_size": 32,
+            "num_attention_heads": 4, "num_key_value_heads": 4,
+            "num_experts": 2, "num_experts_per_tok": 2,
+            "intermediate_size": 16, "vocab_size": 100,
+        }))
+        write_shard(olmoe / "model.safetensors", [
+            ("model.embed_tokens.weight", 100),
+            ("model.layers.0.mlp.experts.0.gate_proj.weight", 30),
+            ("model.layers.0.mlp.experts.1.gate_proj.weight", 30),
+        ])
+        glm = build_plan(self.model, context=32, available_memory=32 * GB,
+                         available_disk=1, gpus=[], cpu_sockets=1)
+        self.assertEqual(set(glm["tune"]), {"DRAFT", "PIN_GB"})
+        plan = build_plan(olmoe, context=32, available_memory=32 * GB,
+                          available_disk=1, gpus=[], cpu_sockets=1)
+        self.assertEqual(plan["bottleneck_class"], glm["bottleneck_class"])
+        self.assertEqual(plan["tune"], {})
+        self.assertNotIn("auto-tune:", format_plan(plan))
+        env = environment_for_plan(plan, {})
+        for key in ("DRAFT", "PIPE", "COLI_CUDA_PIPE", "COLI_NUMA", "PIN_GB"):
+            self.assertNotIn(key, env)
+
+    def _kimi_model(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        model = Path(other.name)
+        (model / "config.json").write_text(json.dumps({
+            "model_type": "kimi_k3",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "q_lora_rank": 8,
+            "kv_lora_rank": 8,
+            "qk_nope_head_dim": 8,
+            "qk_rope_head_dim": 4,
+            "v_head_dim": 8,
+            "num_experts": 2,
+            "linear_attn_config": {
+                "num_heads": 2,
+                "head_dim": 8,
+                "kda_layers": [1],
+            },
+        }))
+        write_shard(model / "model.safetensors", [
+            ("model.embed_tokens.weight", 100),
+            ("model.layers.0.block_sparse_moe.experts.0.w1.weight", 80),
+            ("model.layers.0.block_sparse_moe.experts.1.w1.weight", 80),
+            ("model.layers.1.block_sparse_moe.experts.0.w1.weight", 80),
+            ("model.layers.1.block_sparse_moe.experts.1.w1.weight", 80),
+        ])
+        return model
+
+    def _qwen_dense_model(self, num_experts=None):
+        """Qwen3.8-27B's shape at toy size (#1757): the qwen3_5 architecture with one
+        dense MLP per layer and no expert count in the config."""
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        model = Path(other.name)
+        text = {
+            "model_type": "qwen3_5_text", "num_hidden_layers": 4, "hidden_size": 32,
+            "intermediate_size": 64, "num_key_value_heads": 1, "head_dim": 8,
+            "linear_num_key_heads": 2, "linear_key_head_dim": 8,
+            "linear_num_value_heads": 4, "linear_value_head_dim": 8,
+            "linear_conv_kernel_dim": 4,
+            "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+        }
+        if num_experts is not None:
+            text["num_experts"] = num_experts
+        (model / "config.json").write_text(json.dumps(
+            {"model_type": "qwen3_5", "text_config": text}))
+        write_shard(model / "model.safetensors", [
+            ("model.language_model.embed_tokens.weight", 100),
+            ("model.language_model.layers.0.mlp.gate_proj.weight", 80),
+            ("model.language_model.layers.0.mlp.up_proj.weight", 80),
+            ("model.language_model.layers.0.mlp.down_proj.weight", 80),
+        ])
+        return model
+
+    def test_dense_qwen_model_keeps_every_weight_resident(self):
+        plan = build_plan(self._qwen_dense_model(), context=32, available_memory=32 * GB,
+                          available_disk=100 * GB, gpus=[])
+        self.assertEqual(plan["model"]["family_id"], "qwen36")
+        self.assertEqual(plan["model"]["configured_experts"], 0)
+        self.assertEqual(plan["tiers"]["ram"]["cache_slots_per_layer"], 1)
+        self.assertIn("dense model", plan["expected_bottleneck"])
+        self.assertFalse([w for w in plan["warnings"] if "expert slot" in w])
+        self.assertEqual([d["target"] for d in plan["decisions"]], ["RAM"])
+
+    def test_zero_experts_declared_is_still_a_broken_config(self):
+        with self.assertRaisesRegex(ValueError, "num_experts|expert count is zero"):
+            build_plan(self._qwen_dense_model(num_experts=0), context=32,
+                       available_memory=32 * GB, available_disk=100 * GB, gpus=[])
+
+    def _glm53_model(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        model = Path(other.name)
+        (model / "config.json").write_text(json.dumps({
+            "model_type": "glm5_next",
+            "text_config": {
+                "num_hidden_layers": 2,
+                "n_routed_experts": 2,
+                "hidden_size": 32,
+                "num_attention_heads": 4,
+                "q_lora_rank": 8,
+                "kv_lora_rank": 8,
+                "qk_nope_head_dim": 8,
+                "v_head_dim": 8,
+                "index_head_dim": 8,
+                "hc_mult": 2,
+                "layer_types": ["linear", "full"],
+                "linear_attn_config": {
+                    "num_heads": 2,
+                    "head_dim": 8,
+                    "short_conv_kernel_size": 2,
+                },
+            },
+        }))
+        write_shard(model / "model.safetensors", [
+            ("model.language_model.embed_tokens.weight", 100),
+            ("model.language_model.layers.1.mlp.experts.0.gate_proj.weight", 80),
+            ("model.language_model.layers.1.mlp.experts.1.gate_proj.weight", 80),
+        ])
+        return model
+
+    def test_kimi_plan_exports_the_expert_cache_knob_the_engine_reads(self):
+        """Kimi K3 sizes the expert LRU from K3_EXPERT_GB (default 8 GB).
+        RAM_GB is only a ceiling, and main() never takes argv as a cap, so
+        --auto-tier that set RAM_GB and COLI_PLAN_CAP left the 8 GB default
+        in place on a machine whose plan had hundreds of GB of warm experts."""
+        plan = build_plan(self._kimi_model(), context=32, available_memory=32 * GB,
+                          available_disk=1, gpus=[], cpu_sockets=1)
+        cache = plan["tiers"]["ram"]["expert_cache_bytes"]
+        self.assertGreater(cache, 0)
+        expected = f"{cache / GB:.3f}"
+        self.assertIn("K3_EXPERT_GB", plan["tune"])
+        self.assertEqual(plan["tune"]["K3_EXPERT_GB"]["value"], expected)
+        self.assertNotIn("GLM53_EXPERT_GB", plan["tune"])
+        self.assertIn("K3_EXPERT_GB=", format_plan(plan))
+        env = environment_for_plan(plan, {})
+        self.assertIn("K3_EXPERT_GB", env)
+        self.assertEqual(env["K3_EXPERT_GB"], expected)
+        kept = environment_for_plan(plan, {"K3_EXPERT_GB": "3.5"})
+        self.assertEqual(kept["K3_EXPERT_GB"], "3.5")
+
+    def test_glm53_dense_ram_uses_loaded_components_and_each_plans_environment(self):
+        model = self._glm53_model()
+        write_shard(model / "model.safetensors", [
+            ("model.language_model.embed_tokens.weight", 2048, "BF16", [16, 64]),
+            ("model.language_model.layers.0.self_attn.q_proj.weight", 2048, "BF16", [16, 64]),
+            # The eight-column projection falls back to int8 even at GLM53_BITS=4.
+            ("model.language_model.layers.0.self_attn.g_b_proj.weight", 512, "F32", [16, 8]),
+            ("lm_head.weight", 2048, "F16", [16, 64]),
+            ("model.language_model.layers.0.mlp.gate.weight", 256, "BF16", [2, 64]),
+            ("model.language_model.layers.0.input_layernorm.weight", 128, "BF16", [64]),
+            ("model.visual.blocks.0.attn.qkv.weight", 2048, "BF16", [16, 64]),
+            # Absorbed kv_b, unknown components and packed source weights never
+            # receive a guessed checkpoint-wide shrink factor.
+            ("model.language_model.layers.1.self_attn.kv_b_proj.weight", 1024, "BF16", [64, 8]),
+            ("model.language_model.layers.0.unknown_projection.weight", 128, "BF16", [8, 8]),
+            ("model.language_model.layers.0.mlp.up_proj.weight", 512, "U8", [16, 32]),
+            ("model.language_model.layers.0.mlp.up_proj.weight.qs", 64, "F32", [16, 1]),
+        ])
+        kwargs = dict(context=32, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        retained = 4096 + 512 + 256 + 4096 + 2048 + 256 + 512 + 64
+        expected = {4: retained + 2 * (512 + 64) + (128 + 64),
+                    8: retained + 2 * (1024 + 64) + (128 + 64),
+                    32: retained + 2 * 4096 + 512}
+        with mock.patch.dict(os.environ, {"GLM53_BITS": "32"}):
+            scan = analyze_model(model)
+            self.assertEqual(scan["dense_bytes"], expected[4])
+            self.assertEqual(scan["embed_bytes"], 4096)
+            # The cached scan is reused for all plans. An explicit env wins over
+            # os.environ, and none of these calls bakes its format into the cache.
+            with mock.patch("resource_plan._tensor_sizes", side_effect=AssertionError("cache miss")):
+                for bits in (4, 32, 8, 4):
+                    plan = build_plan(model, env={"GLM53_BITS": str(bits)}, **kwargs)
+                    self.assertEqual(plan["tiers"]["ram"]["dense_bytes"], expected[bits])
+                inherited = build_plan(model, **kwargs)
+                self.assertEqual(inherited["tiers"]["ram"]["dense_bytes"], expected[32])
+        with mock.patch.dict(os.environ, {"GLM53_BITS": "8"}):
+            self.assertEqual(analyze_model(model)["dense_bytes"], scan["dense_bytes"])
+
+    def test_glm53_rejects_a_dense_precision_the_engine_cannot_load(self):
+        model = self._glm53_model()
+        for bits in ("0", "16", "", "invalid"):
+            with self.subTest(bits=bits), self.assertRaisesRegex(ValueError, "GLM53_BITS"):
+                build_plan(model, context=32, env={"GLM53_BITS": bits},
+                           available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+
+    def test_glm53_plan_exports_the_expert_cache_knob_the_engine_reads(self):
+        """glm53.c reads GLM53_EXPERT_GB, not RAM_GB. --auto-tier exported
+        RAM_GB (inert) and relied on COLI_PLAN_CAP as argv, which a direct
+        engine launch never sees."""
+        plan = build_plan(self._glm53_model(), context=32, available_memory=32 * GB,
+                          available_disk=1, gpus=[], cpu_sockets=1)
+        cache = plan["tiers"]["ram"]["expert_cache_bytes"]
+        self.assertGreater(cache, 0)
+        expected = f"{cache / GB:.3f}"
+        self.assertIn("GLM53_EXPERT_GB", plan["tune"])
+        self.assertEqual(plan["tune"]["GLM53_EXPERT_GB"]["value"], expected)
+        self.assertNotIn("K3_EXPERT_GB", plan["tune"])
+        env = environment_for_plan(plan, {})
+        self.assertIn("GLM53_EXPERT_GB", env)
+        self.assertEqual(env["GLM53_EXPERT_GB"], expected)
+        self.assertNotIn("K3_EXPERT_GB", env)
+    def test_auto_ram_keeps_reserve_below_small_finite_headroom(self):
+        # T15: detecting a 2 GB cgroup budget and later inflating it to the
+        # planner's historical 8 GB floor is still over-admission. Preserve the
+        # ordinary 12% reserve and never export more RAM than the finite value.
+        with mock.patch("resource_plan.memory_available", return_value=2 * GB):
+            plan = build_plan(self.model, available_disk=1, gpus=[])
+        ram = plan["tiers"]["ram"]
+        self.assertEqual(plan["memory"]["available_bytes"], 2 * GB)
+        self.assertEqual(ram["budget_bytes"], int(2 * GB * 0.88))
+        self.assertLessEqual(ram["budget_bytes"], ram["available_bytes"])
+        self.assertEqual(environment_for_plan(plan)["RAM_GB"], "1.760")
+
+    def test_auto_ram_never_exceeds_finite_headroom_on_unified_memory(self):
+        gpu = {"index": 0, "name": "NVIDIA GB10", "total_bytes": 130 * GB,
+               "free_bytes": 128 * GB, "unified_memory": True}
+        with mock.patch("resource_plan.memory_available", return_value=2 * GB):
+            plan = build_plan(self.model, available_disk=1, gpus=[gpu])
+        ram = plan["tiers"]["ram"]
+        self.assertTrue(plan["memory"]["unified"])
+        self.assertEqual(ram["budget_bytes"], int(2 * GB * 0.88))
+        self.assertLessEqual(ram["budget_bytes"], ram["available_bytes"])
+
+    def test_auto_ram_rejects_known_zero_headroom(self):
+        # current >= limit is authoritative exhaustion, not the old
+        # unavailable-probe sentinel. Never turn it into an 8 GB launch --
+        # whether the zero was probed or handed in explicitly.
+        with mock.patch("resource_plan.memory_available", return_value=0), \
+             self.assertRaisesRegex(ValueError, "memory budget is exhausted"):
+            build_plan(self.model, available_disk=1, gpus=[])
+        with self.assertRaisesRegex(ValueError, "memory budget is exhausted"):
+            build_plan(self.model, available_memory=0, available_disk=1, gpus=[])
+
+    def test_auto_ram_retains_legacy_fallback_only_when_probe_is_unknown(self):
+        # None is the tri-state's "nothing could measure it": the historical
+        # 8 GB fallback and the historical 0 in the report, never a refusal.
+        with mock.patch("resource_plan.memory_available", return_value=None):
+            plan = build_plan(self.model, available_disk=1, gpus=[])
+        self.assertEqual(plan["tiers"]["ram"]["budget_bytes"], 8 * GB)
+        self.assertEqual(plan["memory"]["available_bytes"], 0)
+
+    def test_malformed_cgroup_input_is_a_typed_refusal_not_a_fallback(self):
+        # A present but malformed controller reaches the caller with its
+        # reason; it is a ValueError, so existing handlers still catch it.
+        error = CgroupFormatError("malformed cgroup memory limit: /sys/fs/cgroup/memory.max")
+        with mock.patch("resource_plan.memory_available", side_effect=error), \
+             self.assertRaises(CgroupFormatError) as context:
+            build_plan(self.model, available_disk=1, gpus=[])
+        self.assertIsInstance(context.exception, ValueError)
+        self.assertIn("memory.max", str(context.exception))
+
+    def test_explicit_small_ram_budget_is_not_silently_inflated(self):
+        plan = build_plan(self.model, ram_gb=2, available_memory=16 * GB,
+                          available_disk=1, gpus=[])
+        self.assertEqual(plan["tiers"]["ram"]["budget_bytes"], 2 * GB)
 
     def test_cpu_socket_count_is_positive(self):
         self.assertGreaterEqual(cpu_socket_count(), 1)
@@ -326,6 +671,22 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertLessEqual(ram + vram + plan["model"]["dense_bytes"], 121 * GB)
         self.assertTrue(any("share one physical memory" in warning
                             for warning in plan["warnings"]))
+
+    def test_nvidia_compute_capability_is_read_when_the_driver_has_it(self):
+        from resource_plan import _discover_nvidia_gpus
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="0, Quadro P2000, 5120, 5000, 6.1\n", stderr="")
+        with mock.patch("resource_plan.subprocess.run", return_value=ok) as run:
+            devices = _discover_nvidia_gpus()
+        self.assertEqual(devices[0]["compute_cap"], (6, 1))
+        self.assertIn("compute_cap", run.call_args_list[0][0][0][1])
+        # a driver that predates the field refuses the query: asked again without it
+        old = subprocess.CompletedProcess(args=[], returncode=0, stdout="0, Quadro P2000, 5120, 5000\n", stderr="")
+        with mock.patch("resource_plan.subprocess.run",
+                        side_effect=[subprocess.CalledProcessError(2, "nvidia-smi"), old]) as run:
+            devices = _discover_nvidia_gpus()
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(devices[0]["free_bytes"], 5000 * 1024 * 1024)
+        self.assertNotIn("compute_cap", devices[0])
 
     def test_nvidia_unified_device_is_marked_from_name(self):
         output = "0, NVIDIA GB10, 130000, 120000\n"
@@ -687,7 +1048,7 @@ memInfo.free:                     23.50 GB (97%)
         self.assertEqual(plan["tiers"]["vram"]["devices"], [])
         self.assertIn("not detected", plan["warnings"][0])
 
-    def test_qwen38_cpu_only_plan_prices_heterogeneous_cache_and_exports_cap(self):
+    def write_qwen38(self):
         config = {
             "model_type": "qwen4_exp",
             "text_config": {
@@ -712,7 +1073,15 @@ memInfo.free:                     23.50 GB (97%)
             },
         }
         (self.model / "config.json").write_text(json.dumps(config))
-        tensors = [("model.embed_tokens.weight", 256, "BF16")]
+        MiB = 1 << 20
+        tensors = [("model.embed_tokens.weight", 256, "BF16", [16, 8]),
+                   # dense matmul matrices the engine offers to the tier: one
+                   # big enough to go (4 MiB BF16 -> 2 MiB int8), one under the
+                   # 1 MiB line that stays on the CPU, one PLE projection that
+                   # is never offered
+                   ("model.layers.0.linear_attn.in_proj_qkv.weight", 4 * MiB, "BF16", [1024, 2048]),
+                   ("model.layers.0.mlp.gate.weight", 1024, "BF16", [2, 256]),
+                   ("model.layers.1.ple.key_proj.weight", 4 * MiB, "BF16", [1024, 2048])]
         for projection in ("gate_proj", "up_proj", "down_proj"):
             prefix = f"model.layers.0.mlp.experts.0.{projection}"
             tensors.append((prefix + ".weight", 32, "F8_E4M3"))
@@ -721,8 +1090,48 @@ memInfo.free:                     23.50 GB (97%)
                 f"model.layers.0.mlp.experts.1.{projection}.weight", 128, "F32"
             ))
         write_shard(self.model / "model.safetensors", tensors)
+
+    def test_qwen38_mtp_head_is_priced_when_the_engine_attaches_it(self):
+        # qwen38_core.h attaches the checkpoint's MTP head by default: its dense
+        # tensors stay resident and its experts get a cache of the layers' cap
+        # (Q38_MTP_CAP), at the head's own record. The plan used to price neither.
+        self.write_qwen38()
+        config = json.loads((self.model / "config.json").read_text())
+        config["text_config"]["mtp_num_hidden_layers"] = 1
+        (self.model / "config.json").write_text(json.dumps(config))
+        head = [("mtp.fc_embedding.weight", 2048, "BF16", [32, 32]),
+                ("mtp.layers.0.self_attn.q_proj.weight", 1024, "BF16", [16, 32])]
+        for e in range(2):
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                head.append((f"mtp.layers.0.mlp.experts.{e}.{projection}.weight", 512, "F8_E4M3", [16, 32]))
+        write_shard(self.model / "model-mtp.safetensors", head)
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        off = build_plan(self.model, env={"Q38_MTP": "0"}, **kwargs)
+        on = build_plan(self.model, env={}, **kwargs)
+        fixed = build_plan(self.model, env={"Q38_MTP_CAP": "2"}, **kwargs)
+        self.assertEqual(on["tiers"]["ram"]["dense_bytes"] - off["tiers"]["ram"]["dense_bytes"], 2048 + 1024)
+        self.assertEqual(fixed["tiers"]["ram"]["dense_bytes"], on["tiers"]["ram"]["dense_bytes"])
+        # the default: one head expert (3 x 512 bytes) more per cache slot, so a slot costs more
+        self.assertGreaterEqual(off["tiers"]["ram"]["cache_slots_per_layer"],
+                                on["tiers"]["ram"]["cache_slots_per_layer"])
+        info_off = analyze_qwen38_mtp(self.model, {"Q38_MTP": "0"})
+        info_on = analyze_qwen38_mtp(self.model, {})
+        info_fixed = analyze_qwen38_mtp(self.model, {"Q38_MTP_CAP": "2"})
+        self.assertEqual(info_on["per_cap_bytes"] - info_off["per_cap_bytes"], 3 * 512)
+        self.assertEqual(info_fixed["per_cap_bytes"], info_off["per_cap_bytes"])
+        self.assertEqual(info_fixed["expert_fixed_bytes"] - info_off["expert_fixed_bytes"], 2 * 3 * 512)
+        # a config that names no head, or a container without its weights: nothing changes
+        config["text_config"]["mtp_num_hidden_layers"] = 0
+        (self.model / "config.json").write_text(json.dumps(config))
+        self.assertEqual(analyze_qwen38_mtp(self.model, {})["per_cap_bytes"], info_off["per_cap_bytes"])
+
+    def test_qwen38_plan_prices_heterogeneous_cache_exports_cap_and_plans_vram(self):
+        self.write_qwen38()
+        MiB = 1 << 20
         analysis = analyze_model(self.model)
-        self.assertEqual(analysis["dense_bytes"], 256)
+        self.assertEqual(analysis["dense_bytes"], 256 + 4 * MiB + 1024 + 4 * MiB)
+        # The stage-1 trunk offload: int8 bytes of the offered matrices only.
+        self.assertEqual(analysis["trunk_int8_bytes"], 2 * MiB)
         # The three native FP8 sidecars are retained once in the normalized
         # scale bank, not once per cache slot.
         self.assertEqual(analysis["expert_fixed_bytes"], 12)
@@ -735,12 +1144,24 @@ memInfo.free:                     23.50 GB (97%)
                "free_bytes": 14 * GB, "unified_memory": True}
         plan = build_plan(self.model, context=64, available_memory=16 * GB,
                           available_disk=16 * GB, gpus=[gpu])
-        self.assertEqual(plan["tiers"]["vram"]["devices"], [])
-        self.assertEqual(plan["tiers"]["vram"]["budget_bytes"], 0)
-        self.assertFalse(any(item["target"] == "VRAM" for item in plan["decisions"]))
+        # Qwen3.8 has the CUDA VRAM expert tier (fp8 streaming mode): a
+        # qualified device is planned, the environment names it, and the RAM
+        # cache cap is still exported -- VRAM is a stage above the LRU, not
+        # a replacement for it.
+        self.assertEqual([device["index"] for device in plan["tiers"]["vram"]["devices"]], [0])
+        self.assertGreater(plan["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertTrue(any(item["target"] == "VRAM" for item in plan["decisions"]))
+        # The trunk goes first, out of the same VRAM, and the plan says so.
+        self.assertEqual(plan["tiers"]["vram"]["trunk_bytes"], 2 * MiB)
+        self.assertTrue(any(item["reason"] == "dense trunk as int8 residents"
+                            for item in plan["decisions"]))
+        self.assertIn("int8 trunk", format_plan(plan))
         cap = plan["tiers"]["ram"]["cache_slots_per_layer"]
         self.assertGreaterEqual(cap, 1)
-        self.assertEqual(environment_for_plan(plan)["COLI_PLAN_CAP"], str(cap))
+        environment = environment_for_plan(plan)
+        self.assertEqual(environment["COLI_PLAN_CAP"], str(cap))
+        self.assertEqual(environment["COLI_CUDA"], "1")
+        self.assertEqual(environment["COLI_GPU"], "0")
         for variable in ("Q38_NATIVE_FP8", "Q38_NATIVE_BF16"):
             with self.subTest(variable=variable), self.assertRaisesRegex(
                     ValueError, "requires native expert storage"):
@@ -748,12 +1169,273 @@ memInfo.free:                     23.50 GB (97%)
         plan["tiers"]["ram"]["cache_slots_per_layer"] = 0
         with self.assertRaisesRegex(ValueError, "one expert slot"):
             environment_for_plan(plan)
-        with self.assertRaisesRegex(ValueError, "CPU only"):
-            build_plan(self.model, context=64, gpu_indices=[0], available_memory=16 * GB,
-                       available_disk=16 * GB, gpus=[gpu])
-        with self.assertRaisesRegex(ValueError, "CPU only"):
-            build_plan(self.model, context=64, vram_gb=4, available_memory=16 * GB,
-                       available_disk=16 * GB, gpus=[gpu])
+        selected = build_plan(self.model, context=64, gpu_indices=[0], available_memory=16 * GB,
+                              available_disk=16 * GB, gpus=[gpu])
+        self.assertEqual([device["index"] for device in selected["tiers"]["vram"]["devices"]], [0])
+        capped = build_plan(self.model, context=64, vram_gb=4, available_memory=16 * GB,
+                            available_disk=16 * GB, gpus=[gpu])
+        self.assertLessEqual(capped["tiers"]["vram"]["budget_bytes"], 4 * GB - 2 * MiB)
+        self.assertEqual(capped["tiers"]["vram"]["trunk_bytes"], 2 * MiB)
+        # A budget too small for the trunk leaves it on the CPU: experts only.
+        tiny = build_plan(self.model, context=64, vram_gb=0.001, available_memory=16 * GB,
+                          available_disk=16 * GB, gpus=[gpu])
+        self.assertEqual(tiny["tiers"]["vram"]["trunk_bytes"], 0)
+
+    def test_qwen38_plan_holds_the_trunk_as_int8_rows(self):
+        # q38_trunk_cpu_int8 (on by default) keeps the trunk's large matrices as
+        # int8 rows: the plan's RAM is the checkpoint's BF16 less those bytes.
+        self.write_qwen38()
+        MiB = 1 << 20
+        analysis = analyze_model(self.model)
+        kwargs = dict(context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        plan = build_plan(self.model, env={}, **kwargs)
+        self.assertEqual(plan["tiers"]["ram"]["dense_bytes"], analysis["dense_bytes"] - 2 * MiB + 4 * 1024)
+        bf16 = build_plan(self.model, env={"Q38_TRUNK_CPU_INT8": "0"}, **kwargs)
+        self.assertEqual(bf16["tiers"]["ram"]["dense_bytes"], analysis["dense_bytes"])
+
+    def test_qwen38_cpu_int8_selection_is_recomputed_for_each_plan(self):
+        self.write_qwen38()
+        kwargs = dict(context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        baseline = analyze_model(self.model)["dense_bytes"]
+        # Every call after the scan hits the same cache. These knobs must still
+        # affect RAM: neither the GPU inventory nor a cached default is the CPU table.
+        for env in ({"Q38_TRUNK_SKIP": "dnqkv"},
+                    {"Q38_TRUNK_SKIP": "router,dnqkv,attnq"},
+                    {"Q38_TRUNK_MIN_KB": "999999999"},
+                    {"Q38_TRUNK_MIN_KB": "-1"}):
+            with self.subTest(env=env):
+                plan = build_plan(self.model, env=env, **kwargs)
+                self.assertEqual(plan["tiers"]["ram"]["dense_bytes"], baseline)
+        regular = build_plan(self.model, env={}, **kwargs)
+        no_gpu = build_plan(self.model, env={"Q38_TRUNK_GPU": "0"}, **kwargs)
+        self.assertEqual(regular["tiers"]["ram"]["dense_bytes"],
+                         no_gpu["tiers"]["ram"]["dense_bytes"])
+        self.assertLess(regular["tiers"]["ram"]["dense_bytes"], baseline)
+
+    def test_qwen38_cpu_int8_threshold_includes_scales_and_loaded_dtype(self):
+        self.write_qwen38()
+        kwargs = dict(context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        rows, cols = 256, 4092
+        # At exactly 1 MiB including row scales, but below 1 MiB of values.
+        # F16 is expanded to F32 by q38_load_weight, BF16 remains native.
+        for dtype, width, loaded_width in (("BF16", 2, 2), ("F16", 2, 4), ("F32", 4, 4)):
+            with self.subTest(dtype=dtype):
+                write_shard(self.model / "model.safetensors", [
+                    ("model.layers.0.linear_attn.in_proj_qkv.weight", rows * cols * width,
+                     dtype, [rows, cols]),
+                    # Embedding and PLE are never CPU-int8 trunk candidates,
+                    # even when they meet its size threshold.
+                    ("model.embed_tokens.weight", rows * cols * 2, "BF16", [rows, cols]),
+                    ("model.layers.1.ple.key_proj.weight", rows * cols * 2, "BF16", [rows, cols]),
+                ])
+                before = build_plan(self.model, env={"Q38_TRUNK_CPU_INT8": "0"}, **kwargs)
+                after = build_plan(self.model, env={}, **kwargs)
+                self.assertEqual(before["tiers"]["ram"]["dense_bytes"] - after["tiers"]["ram"]["dense_bytes"],
+                                 rows * cols * loaded_width - (rows * cols + 4 * rows))
+                above = build_plan(self.model, env={"Q38_TRUNK_MIN_KB": "1025"}, **kwargs)
+                self.assertEqual(above["tiers"]["ram"]["dense_bytes"], before["tiers"]["ram"]["dense_bytes"])
+
+    def test_vulkan_device_only_reserves_cpu_components_and_unknown_matrices(self):
+        self.write_qwen38()
+        write_shard(self.model / "retained.safetensors", [
+            ("model.layers.0.input_layernorm.weight", 32, "BF16", [16]),
+            ("model.layers.0.linear_attn.conv1d.weight", 256, "BF16", [4, 4, 8]),
+            ("model.layers.0.unknown_projection.weight", 2048, "F32", [16, 32]),
+        ])
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB,
+                      available_disk=16 * GB, gpus=[],
+                      vulkan={"type": "discrete", "budget_bytes": 16 * GB})
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"}
+        kept = build_plan(self.model, env=dict(on, COLI_VK_DENSE_HOST="1"), **kwargs)["tiers"]["ram"]
+        dropped = build_plan(self.model, env=dict(on, COLI_VK_DENSE_HOST="0"), **kwargs)["tiers"]["ram"]
+        # Small BF16 vectors/conv weights expand to F32 in this loader.
+        retained = 256 + 32 * 2 + 256 * 2 + 2048
+        self.assertEqual(dropped["dense_bytes"], retained)
+        self.assertEqual(dropped["dense_on_device_bytes"], kept["dense_bytes"] - retained)
+        self.assertEqual(dropped["expert_cache_bytes"] - kept["expert_cache_bytes"],
+                         dropped["dense_on_device_bytes"])
+
+    def test_qwen36_vulkan_credit_keeps_vision_vectors_and_unsupported_storage(self):
+        model = self._qwen_dense_model()
+        write_shard(model / "model.safetensors", [
+            ("model.language_model.embed_tokens.weight", 8192, "BF16", [64, 64]),
+            ("model.language_model.layers.0.self_attn.q_proj.weight", 8192, "BF16", [64, 64]),
+            ("model.language_model.layers.0.linear_attn.in_proj_a.weight", 8192, "BF16", [64, 64]),
+            ("model.language_model.layers.0.mlp.shared_expert_gate.weight", 128, "BF16", [64]),
+            ("model.visual.blocks.0.attn.qkv.weight", 8192, "BF16", [64, 64]),
+            ("model.language_model.layers.0.self_attn.k_proj.weight", 2048, "U8", [64, 32]),
+        ])
+        kwargs = dict(context=32, available_memory=16 * GB, available_disk=16 * GB, gpus=[],
+                      vulkan={"type": "discrete", "budget_bytes": 16 * GB})
+        on = {"COLI_VULKAN": "1", "COLI_VK_DENSE_HOST": "0"}
+        host = build_plan(model, env=dict(on, COLI_VK_DENSE_HOST="1"), **kwargs)["tiers"]["ram"]
+        for bits, credit in (("8", 4096), ("4", 2048), ("16", 0)):
+            with self.subTest(bits=bits):
+                ram = build_plan(model, env=dict(on, COLI_DENSE_BITS=bits), **kwargs)["tiers"]["ram"]
+                self.assertEqual(ram["dense_on_device_bytes"], credit)
+                self.assertEqual(ram["dense_bytes"], host["dense_bytes"] - credit)
+
+    def test_vulkan_device_only_dense_leaves_the_embedding_in_ram(self):
+        # COLI_VULKAN=1 with the dense weights on the device only: the RAM budget
+        # holds the embedding table alone, and the experts' cache takes the rest.
+        self.write_qwen38()
+        MiB = 1 << 20
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB,
+                      available_disk=16 * GB, gpus=[])
+        # Model the device explicitly: a CPU-only runner must exercise the same
+        # placement policy without relying on an installed Vulkan driver.
+        dgpu = {"type": "discrete", "budget_bytes": 16 * GB}
+        host = build_plan(self.model, env={"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1",
+                                           "COLI_VK_DENSE_HOST": "1"}, vulkan=dgpu, **kwargs)
+        only = build_plan(self.model, env={"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1",
+                                           "COLI_VK_DENSE_HOST": "0"}, vulkan=dgpu, **kwargs)
+        self.assertEqual(only["tiers"]["ram"]["dense_bytes"], 256)
+        self.assertEqual(only["tiers"]["ram"]["dense_on_device_bytes"],
+                         host["tiers"]["ram"]["dense_bytes"] - 256)
+        self.assertEqual(host["tiers"]["ram"]["dense_on_device_bytes"], 0)
+        self.assertGreater(only["tiers"]["ram"]["expert_cache_bytes"],
+                           host["tiers"]["ram"]["expert_cache_bytes"])
+        self.assertIn("on the Vulkan device only", format_plan(only))
+        self.assertNotIn("on the Vulkan device only", format_plan(host))
+        # unset: an integrated GPU holds them when the chain is on (no host copy:
+        # the same RAM twice); a discrete one when they fit its free memory
+        igpu = build_plan(self.model, env={"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"},
+                          vulkan={"type": "integrated"}, **kwargs)
+        self.assertEqual(igpu["tiers"]["ram"]["dense_bytes"], 256)
+        small = build_plan(self.model, env={"COLI_VULKAN": "1"},
+                           vulkan={"type": "discrete", "budget_bytes": GB + MiB}, **kwargs)
+        self.assertEqual(small["tiers"]["ram"]["dense_bytes"], host["tiers"]["ram"]["dense_bytes"])
+        # without COLI_VULKAN nothing changes
+        cpu = build_plan(self.model, env={"COLI_VK_DENSE_HOST": "0"}, **kwargs)
+        self.assertEqual(cpu["tiers"]["ram"]["dense_bytes"], host["tiers"]["ram"]["dense_bytes"])
+
+    def test_vulkan_without_a_device_keeps_dense_weights_in_ram(self):
+        self.write_qwen38()
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB,
+                      available_disk=16 * GB, gpus=[])
+        cpu = build_plan(self.model, env={}, **kwargs)["tiers"]["ram"]
+        with mock.patch("setup_hw.detect_vulkan", return_value={"devices": []}):
+            for host in (None, "0", "1"):
+                with self.subTest(dense_host=host):
+                    env = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"}
+                    if host is not None:
+                        env["COLI_VK_DENSE_HOST"] = host
+                    ram = build_plan(self.model, env=env, **kwargs)["tiers"]["ram"]
+                    self.assertEqual(ram["dense_on_device_bytes"], 0)
+                    self.assertEqual(ram["dense_bytes"], cpu["dense_bytes"])
+                    self.assertEqual(ram["expert_cache_bytes"], cpu["expert_cache_bytes"])
+
+    def test_vulkan_device_only_decision_follows_the_engine_rule(self):
+        from resource_plan import vk_dense_device_only
+        on = {"COLI_VULKAN": "1"}
+        igpu, dgpu = {"type": "integrated"}, {"type": "discrete", "budget_bytes": 16 * GB}
+        cases = [
+            ({}, dgpu, 1, False),                                     # no Vulkan
+            (dict(on), dgpu, 5 * GB, True),                           # discrete, fits
+            (dict(on), dgpu, 15.5 * GB, False),                       # discrete, 1 GiB short
+            (dict(on, COLI_VK_DENSE_HOST="1"), dgpu, 1, False),       # copies kept
+            (dict(on, COLI_VK_CHAIN="0", COLI_VK_DENSE="0"), dgpu, 1, False),  # dense on the CPU
+            (dict(on), igpu, 1, False),                               # qwen38's chain is off there
+            (dict(on, COLI_VK_CHAIN="1"), igpu, 1, True),
+            (dict(on, COLI_VK_DENSE="1"), igpu, 1, True),
+            (dict(on, COLI_VK_DENSE_HOST="0", COLI_VK_CHAIN="1"), {"type": "cpu"}, 1, True),
+            (dict(on, COLI_VK_CHAIN="1"), {"type": "cpu"}, 1, False),  # Lavapipe keeps them
+        ]
+        for env, device, dense, want in cases:
+            with self.subTest(env=env, device=device["type"], dense=dense):
+                self.assertEqual(vk_dense_device_only(dense, "qwen38", env, device)[0], want)
+        # qwen36 and olmoe run the chain by default on an integrated GPU
+        self.assertTrue(vk_dense_device_only(1, "qwen36", dict(on), igpu)[0])
+
+    def test_vulkan_host_copies_use_free_budget_and_supported_engine(self):
+        from resource_plan import vk_dense_device_only
+        GiB = 1 << 30
+        on = {"COLI_VULKAN": "1"}
+        device = {"type": "discrete", "budget_bytes": 8 * GiB,
+                  "heaps": [{"device_local": True, "usage": 4 * GiB}]}
+        self.assertFalse(vk_dense_device_only(4 * GiB, "qwen38", on, device)[0])
+        self.assertTrue(vk_dense_device_only(3 * GiB, "qwen38", on, device)[0])
+        self.assertFalse(vk_dense_device_only(3 * GiB + 1, "qwen38", on, device)[0])
+        forced = dict(on, COLI_VK_DENSE_HOST="0")
+        for family in ("laya", "gliner_decide", "qwen_image", None):
+            with self.subTest(family=family):
+                self.assertFalse(vk_dense_device_only(1, family, forced, device)[0])
+        self.assertFalse(vk_dense_device_only(
+            1, "qwen38", dict(forced, COLI_CUDA="1"), device)[0])
+        igpu = {"type": "integrated"}
+        # Dense and chain are independent decisions in the runtime. Disabling
+        # the per-matrix path alone still leaves qwen36's default chain on.
+        self.assertTrue(vk_dense_device_only(
+            1, "qwen36", dict(on, COLI_VK_DENSE="0"), igpu)[0])
+        self.assertTrue(vk_dense_device_only(
+            1, "qwen38", dict(on, COLI_VK_CHAIN="0", COLI_VK_TIER="0"), igpu)[0])
+        for gpu in (device, igpu):
+            with self.subTest(glm_device=gpu["type"]):
+                off = dict(on, COLI_VK_CHAIN="0", COLI_VK_TIER="0")
+                self.assertFalse(vk_dense_device_only(1, "glm", off, gpu)[0])
+                self.assertTrue(vk_dense_device_only(1, "glm", dict(off, COLI_VK_DENSE="1"), gpu)[0])
+
+    def test_vulkan_integrated_dense_copy_is_still_physical_ram(self):
+        self.write_qwen38()
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB,
+                      available_disk=16 * GB, gpus=[], vulkan={"type": "integrated"})
+        cpu = build_plan(self.model, env={}, **kwargs)
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"}
+        kept = build_plan(self.model, env=dict(on, COLI_VK_DENSE_HOST="1"), **kwargs)
+        dropped = build_plan(self.model, env=dict(on, COLI_VK_DENSE_HOST="0"), **kwargs)
+        cpu_ram, kept_ram, dropped_ram = (p["tiers"]["ram"] for p in (cpu, kept, dropped))
+        device_copy = dropped_ram["dense_on_device_bytes"]
+        self.assertGreater(device_copy, 0)
+        self.assertEqual(dropped_ram["shared_device_dense_bytes"], device_copy)
+        self.assertEqual(kept_ram["shared_device_dense_bytes"], device_copy)
+        self.assertEqual(dropped_ram["runtime_bytes"], cpu_ram["runtime_bytes"] + device_copy)
+        self.assertEqual(kept_ram["runtime_bytes"], dropped_ram["runtime_bytes"])
+        # One GPU copy replaces one CPU copy, so dropping the duplicate recovers
+        # exactly its bytes without pretending that the weights vanished from RAM.
+        self.assertEqual(dropped_ram["expert_cache_bytes"], cpu_ram["expert_cache_bytes"])
+        self.assertEqual(dropped_ram["expert_cache_bytes"] - kept_ram["expert_cache_bytes"],
+                         device_copy)
+        self.assertTrue(dropped["memory"]["unified"])
+
+    def test_qwen38_int4_sidecar_prices_the_cache_with_its_records(self):
+        # tools/convert_qwen38_experts_int4.py's index for this geometry
+        # (2 layers, 2 experts, hidden 8, moe_intermediate 4): codes 16+16+16
+        # bytes, scales (4+4+8) floats -> 112 bytes per expert.
+        self.write_qwen38()
+        sidecar = self.model / "experts-int4g64"
+        sidecar.mkdir()
+        index = {"format": "colibri.qwen38.experts-int4g64", "version": 1, "complete": True,
+                 "layers": 2, "experts": 2, "hidden_size": 8, "moe_intermediate_size": 4,
+                 "record_bytes": 112}
+        (sidecar / "index.json").write_text(json.dumps(index))
+        gpu = {"index": 0, "name": "unrelated", "total_bytes": 16 * GB,
+               "free_bytes": 14 * GB, "unified_memory": True}
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("Q38_EXPERT_INT4", None)
+            plan = build_plan(self.model, context=64, available_memory=16 * GB,
+                              available_disk=16 * GB, gpus=[gpu])
+            model = plan["model"]
+            self.assertTrue(model["qwen38_int4_experts"])
+            self.assertEqual((model["per_cap_bytes"], model["expert_bytes"],
+                              model["expert_fixed_bytes"]), (112, 224, 0))
+            # the engine's tier declines int4 experts, so nothing is planned on the GPU
+            self.assertEqual(plan["tiers"]["vram"]["devices"], [])
+            self.assertNotIn("COLI_CUDA", environment_for_plan(plan))
+            with self.assertRaisesRegex(ValueError, "run on the CPU"):
+                build_plan(self.model, context=64, gpu_indices=[0], available_memory=16 * GB,
+                           available_disk=16 * GB, gpus=[gpu])
+            # what the engine would not use is not priced: FP8 forced, or a
+            # conversion still running
+            os.environ["Q38_EXPERT_INT4"] = "0"
+            forced = build_plan(self.model, context=64, available_memory=16 * GB,
+                                available_disk=16 * GB, gpus=[])
+            self.assertEqual(forced["model"]["per_cap_bytes"], 384)
+            os.environ.pop("Q38_EXPERT_INT4")
+            (sidecar / "index.json").write_text(json.dumps(dict(index, complete=False)))
+            partial = build_plan(self.model, context=64, available_memory=16 * GB,
+                                 available_disk=16 * GB, gpus=[])
+            self.assertNotIn("qwen38_int4_experts", partial["model"])
+            self.assertEqual(partial["model"]["per_cap_bytes"], 384)
 
     def test_cli_emits_versioned_json(self):
         cli = Path(__file__).parents[1] / "coli"
@@ -947,6 +1629,1126 @@ memInfo.free:                     23.50 GB (97%)
                           available_disk=1, gpus=[])
         self.assertEqual(plan["bottleneck_class"], "compute")
         self.assertEqual(plan["next_actions"][0]["id"], "measure-kernels")
+
+
+class VulkanPartialChainTest(unittest.TestCase):
+    """The partial chain (docs/vulkan.md, "A partial chain"): resource_plan.vk_chain_fit
+    predicts the engine's N with vkc_fit's rule from the device's budget, and the plan
+    credits only the N layers' host copies."""
+
+    CONFIG = {
+        "architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4",
+        "hidden_size": 128, "num_attention_heads": 4, "num_key_value_heads": 1, "head_dim": 32,
+        "q_lora_rank": 128, "qk_rope_head_dim": 16, "o_groups": 1, "o_lora_rank": 128,
+        "sliding_window": 8, "index_n_heads": 2, "index_head_dim": 32, "index_topk": 2,
+        "n_routed_experts": 4, "num_experts_per_tok": 2, "n_shared_experts": 1,
+        "moe_intermediate_size": 128, "num_hash_layers": 1, "num_nextn_predict_layers": 1,
+        "hc_mult": 2, "hc_sinkhorn_iters": 3, "vocab_size": 128, "max_position_embeddings": 128,
+        "rms_norm_eps": 1e-06, "hc_eps": 1e-06, "routed_scaling_factor": 1.5, "swiglu_limit": 10.0,
+        "rope_theta": 10000.0, "compress_rope_theta": 40000.0,
+        "rope_scaling": {"type": "yarn", "factor": 1.0, "original_max_position_embeddings": 128,
+                         "beta_fast": 32, "beta_slow": 1},
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.model = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_v4(self, ratios):
+        """The tiny DeepSeek V4 fixture's geometry (tools/make_deepseek_v4_tiny.py) with
+        len(ratios) layers: every tensor coli_v4_layer_plan names, and its experts."""
+        c = dict(self.CONFIG, num_hidden_layers=len(ratios), compress_ratios=list(ratios) + [0])
+        (self.model / "config.json").write_text(json.dumps(c))
+        width = {"F8_E4M3": 1, "F8_E8M0": 1, "BF16": 2, "F32": 4, "I64": 8, "I8": 1}
+        tensors = []
+
+        def add(name, dtype, *shape):
+            count = 1
+            for n in shape:
+                count *= n
+            tensors.append((name, count * width[dtype], dtype, list(shape)))
+
+        def fp8(name, rows, cols):
+            add(name + ".weight", "F8_E4M3", rows, cols)
+            add(name + ".scale", "F8_E8M0", -(-rows // 128), -(-cols // 128))
+        add("embed.weight", "BF16", 128, 128)
+        add("head.weight", "BF16", 128, 128)
+        add("norm.weight", "BF16", 128)
+        add("hc_head_fn", "F32", 2, 256)
+        for i, r in enumerate(ratios):
+            p = f"layers.{i}."
+            add(p + "attn.attn_sink", "F32", 4)
+            add(p + "attn.kv_norm.weight", "BF16", 32)
+            add(p + "attn.q_norm.weight", "BF16", 128)
+            for name, rows, cols in (("wkv", 32, 128), ("wo_a", 128, 128), ("wo_b", 128, 128),
+                                     ("wq_a", 128, 128), ("wq_b", 128, 128)):
+                fp8(p + "attn." + name, rows, cols)
+            add(p + "attn_norm.weight", "BF16", 128)
+            if r:
+                proj = (2 if r == 4 else 1) * 32
+                add(p + "attn.compressor.ape", "F32", r, proj)
+                add(p + "attn.compressor.norm.weight", "BF16", 32)
+                add(p + "attn.compressor.wgate.weight", "BF16", proj, 128)
+                add(p + "attn.compressor.wkv.weight", "BF16", proj, 128)
+            if r == 4:
+                add(p + "attn.indexer.compressor.ape", "F32", 4, 64)
+                add(p + "attn.indexer.compressor.norm.weight", "BF16", 32)
+                add(p + "attn.indexer.compressor.wgate.weight", "BF16", 64, 128)
+                add(p + "attn.indexer.compressor.wkv.weight", "BF16", 64, 128)
+                add(p + "attn.indexer.weights_proj.weight", "BF16", 2, 128)
+                fp8(p + "attn.indexer.wq_b", 64, 128)
+            add(p + "ffn.gate.weight", "BF16", 4, 128)
+            if i == 0:
+                add(p + "ffn.gate.tid2eid", "I64", 128, 2)
+            else:
+                add(p + "ffn.gate.bias", "F32", 4)
+            for name in ("w1", "w2", "w3"):
+                fp8(p + "ffn.shared_experts." + name, 128, 128)
+            add(p + "ffn_norm.weight", "BF16", 128)
+            for site in ("attn", "ffn"):
+                add(p + f"hc_{site}_base", "F32", 8)
+                add(p + f"hc_{site}_fn", "F32", 8, 256)
+                add(p + f"hc_{site}_scale", "F32", 3)
+            for e in range(4):
+                for name in ("w1", "w2", "w3"):
+                    add(p + f"ffn.experts.{e}.{name}.scale", "F8_E8M0", 128, 4)
+                    add(p + f"ffn.experts.{e}.{name}.weight", "I8", 128, 64)
+        write_shard(self.model / "model.safetensors", tensors)
+        return analyze_model(self.model)
+
+    def test_deepseek_v4_plans_without_a_gpu_below_its_cuda_floor(self):
+        """#1906: a Quadro P2000 (sm_61) was planned as GPU compute for V4, whose CUDA
+        tier is built for sm_80 and newer by default."""
+        self.write_v4([0, 4])
+
+        def plan_with(cap):
+            gpu = {"index": 0, "name": "Quadro P2000", "total_bytes": 5 * GB, "free_bytes": 5 * GB,
+                   "unified_memory": False, "compute_cap": cap}
+            return build_plan(self.model, ram_gb=16, available_memory=64 * GB, available_disk=1,
+                              gpus=[gpu], physical_cpus=32, cpu_sockets=1)
+        old = plan_with((6, 1))
+        self.assertEqual(old["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertNotIn("GPU", old["expected_bottleneck"])
+        self.assertTrue(any("sm_61" in w and "portable-pre-ampere" in w for w in old["warnings"]))
+        new = plan_with((8, 6))
+        self.assertGreater(new["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertFalse(any("sm_86" in w for w in new["warnings"]))
+
+    def test_deepseek_v4_layout_is_the_engines(self):
+        # The numbers the engine printed for tools/make_deepseek_v4_tiny.py's fixture on
+        # Lavapipe ("[VK] deepseek_v4 chain fit: ... the engine's 1891840 B ..., layers
+        # 159720 278760 192104 B"): the same per-layer bytes and fixed bytes here.
+        from resource_plan import vk_chain_fit, vk_fit_pools
+        info = self.write_v4([0, 4, 8])
+        env = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"}
+        fit = vk_chain_fit(info, "deepseek_v4", env, {"type": "cpu", "budget_bytes": 64 * GB})
+        self.assertEqual(fit["layers"], [159720, 278760, 192104])
+        self.assertEqual(fit["fixed"] - vk_fit_pools(0), 1891840)
+        self.assertEqual(fit["n"], 3)
+        # COLI_VK_CHAIN_ROWS lowers the chunk the fit counts (the window rings, the scratch)
+        small = vk_chain_fit(info, "deepseek_v4", dict(env, COLI_VK_CHAIN_ROWS="3"), {"type": "cpu", "budget_bytes": 64 * GB})
+        self.assertLess(small["fixed"], fit["fixed"])
+        self.assertTrue(all(a < b for a, b in zip(small["layers"], fit["layers"])))
+
+    def test_n_follows_the_engines_rule(self):
+        from resource_plan import VkChainLayout, vk_chain_fit, vk_fit_pools
+        MiB, GiB = 1 << 20, 1 << 30
+        layout = VkChainLayout([100 * MiB, 200 * MiB, 300 * MiB, 400 * MiB], 50 * MiB, 70 * MiB)
+        on = {"COLI_VULKAN": "1"}
+        pools = vk_fit_pools(0)
+        fixed = 50 * MiB + pools
+        with mock.patch.dict("resource_plan._VK_CHAIN_LAYOUT", {"deepseek_v4": lambda info, env, vk: layout}):
+            def fit(free, env=on, kind="discrete", heaps=()):
+                return vk_chain_fit({}, "deepseek_v4", env, {"type": kind, "budget_bytes": free,
+                                                             "heaps": list(heaps)})
+            room = GiB + fixed   # free = reserve + fixed + what the layers may take
+            self.assertEqual((fit(room + 1000 * MiB + 70 * MiB)["n"], fit(room + 1000 * MiB + 70 * MiB)["tail"]), (4, True))
+            self.assertEqual((fit(room + 1000 * MiB)["n"], fit(room + 1000 * MiB)["tail"]), (4, False))
+            self.assertEqual(fit(room + 1000 * MiB - 1)["n"], 3)
+            self.assertEqual(fit(room + 600 * MiB)["n"], 3)
+            self.assertEqual(fit(room + 300 * MiB - 1)["n"], 1)
+            self.assertEqual(fit(room + 99 * MiB)["n"], 0)
+            self.assertEqual(fit(GiB // 2)["n"], 0)
+            # the heaps' usage is taken off the budget, as coli_vk_free_bytes does
+            self.assertEqual(fit(room + 600 * MiB, heaps=[{"device_local": True, "usage": 300 * MiB}])["n"], 2)
+            # the reserve is COLI_VK_TIER_RESERVE_GB
+            self.assertEqual(fit(fixed + 600 * MiB, dict(on, COLI_VK_TIER_RESERVE_GB="0"))["n"], 3)
+            # COLI_VK_CHAIN_LAYERS forces N, capped at L; the tail goes up with every layer
+            for want, n, tail in (("2", 2, False), ("0", 0, False), ("9", 4, True), ("auto", 3, False)):
+                got = fit(room + 600 * MiB, dict(on, COLI_VK_CHAIN_LAYERS=want))
+                self.assertEqual((got["n"], got["tail"], got["forced"]), (n, tail, want != "auto"))
+            # COLI_VK_DEVICE_CAP_MB: the device is the cap, with small pool blocks
+            cap = 2 * GiB
+            capped = fit(64 * GiB, dict(on, COLI_VK_DEVICE_CAP_MB=str(cap // MiB)))
+            self.assertEqual(capped["free"], cap)
+            self.assertLess(capped["fixed"], fixed)
+            self.assertEqual(capped["n"], 3)
+            # no chain, no fit: the plan as before
+            self.assertIsNone(fit(64 * GiB, dict(on, COLI_VK_CHAIN="0")))
+            self.assertIsNone(fit(64 * GiB, {}))
+
+    def test_device_only_credits_the_layers_on_the_device(self):
+        from resource_plan import vk_chain_fit, vk_fit_pools
+        info = self.write_v4([0, 4, 8, 0, 0, 4])
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "COLI_VK_DENSE_HOST": "0",
+              "COLI_VK_TIER_RESERVE_GB": "0"}
+        layers = vk_chain_fit(info, "deepseek_v4", on, {"type": "discrete", "budget_bytes": 64 * GB})["layers"]
+        # what the device can drop for the first k layers: fp8 matrices and the compressors'
+        # bf16 projections (coli_v4_dense_device_only_tensor)
+        def droppable(k):
+            total = 0
+            for t in info["dense_tensors"]:
+                parts = t["name"].split(".")
+                if parts[0] != "layers" or int(parts[1]) >= k or len(t["shape"]) != 2:
+                    continue
+                if t["dtype"] == "F8_E4M3" or (t["dtype"] == "BF16" and t["name"].endswith(
+                        ("compressor.wkv.weight", "compressor.wgate.weight"))):
+                    total += t["size"]
+            return total
+        full = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": 64 * GB}, **kwargs)
+        self.assertEqual(full["tiers"]["ram"]["dense_on_device_bytes"], droppable(6))
+        self.assertEqual(full["tiers"]["ram"]["vk_chain_layers"]["on_device"], 6)
+        for k in (1, 3, 5):
+            free = vk_fit_pools(0) + vk_chain_fit(info, "deepseek_v4", on, {"type": "discrete", "budget_bytes": 64 * GB})["fixed"] \
+                - vk_fit_pools(0) + sum(layers[:k]) + layers[k] // 2
+            device = {"type": "discrete", "budget_bytes": free}
+            with self.subTest(k=k):
+                plan = build_plan(self.model, env=on, vulkan=device, **kwargs)
+                ram = plan["tiers"]["ram"]
+                self.assertEqual(ram["vk_chain_layers"]["on_device"], k)
+                self.assertEqual(ram["dense_on_device_bytes"], droppable(k))
+                self.assertEqual(full["tiers"]["ram"]["dense_bytes"] + droppable(6) - droppable(k), ram["dense_bytes"])
+                self.assertIn(f"the first {k} of 6 layers", format_plan(plan))
+                # forced, the same credit
+                forced = build_plan(self.model, env=dict(on, COLI_VK_CHAIN_LAYERS=str(k)),
+                                    vulkan={"type": "discrete", "budget_bytes": 64 * GB}, **kwargs)
+                self.assertEqual(forced["tiers"]["ram"]["dense_on_device_bytes"], droppable(k))
+        # no layer fits: nothing on the device, the host copies stay
+        none = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": 1 << 20}, **kwargs)
+        self.assertEqual(none["tiers"]["ram"]["dense_on_device_bytes"], 0)
+        self.assertEqual(none["tiers"]["ram"]["vk_chain_layers"]["on_device"], 0)
+        # host copies kept: no credit whatever N
+        kept = build_plan(self.model, env=dict(on, COLI_VK_DENSE_HOST="1", COLI_VK_CHAIN_LAYERS="3"),
+                          vulkan={"type": "discrete", "budget_bytes": 64 * GB}, **kwargs)
+        self.assertEqual(kept["tiers"]["ram"]["dense_on_device_bytes"], 0)
+        # an integrated GPU's device copy (physical RAM, priced once) is the N layers' alone
+        igpu = {"type": "integrated", "budget_bytes": 64 * GB}
+        two = build_plan(self.model, env=dict(on, COLI_VK_CHAIN_LAYERS="2"), vulkan=igpu, **kwargs)["tiers"]["ram"]
+        every = build_plan(self.model, env=on, vulkan=igpu, **kwargs)["tiers"]["ram"]
+        self.assertEqual(two["dense_on_device_bytes"], droppable(2))
+        self.assertEqual(every["dense_on_device_bytes"], droppable(6))
+        self.assertGreaterEqual(two["shared_device_dense_bytes"], droppable(2))
+        self.assertLess(two["shared_device_dense_bytes"], every["shared_device_dense_bytes"])
+
+
+class VulkanPartialChainQwenOlmoeTest(unittest.TestCase):
+    """The partial chain's layouts of qwen36 and olmoe (_VK_CHAIN_LAYOUT): each layer's
+    device bytes, the fixed bytes and the head as their engines' fit lines printed them
+    for the tiny fixtures on Lavapipe, and the plan's credit for the first N layers."""
+
+    LAYERS = ["linear_attention"] * 3 + ["full_attention"] + ["linear_attention"] * 3 + ["full_attention"]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.model = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_qwen36(self, inter=32):
+        """tools/make_qwen36_tiny.py's default geometry as tools/convert_qwen36.py writes
+        it (--inter sets the routed and shared experts' width): 8 layers, attention at 3
+        and 7, 8 experts, a shared expert with its gate, f16 dense tensors."""
+        c = {"architectures": ["Qwen3_5MoeForCausalLM"], "model_type": "qwen3_5_moe_text", "head_dim": 16,
+             "hidden_size": 64, "intermediate_size": 128, "layer_types": self.LAYERS, "linear_conv_kernel_dim": 4,
+             "linear_key_head_dim": 8, "linear_num_key_heads": 4, "linear_num_value_heads": 8,
+             "linear_value_head_dim": 8, "moe_intermediate_size": inter, "num_attention_heads": 4, "num_experts": 8,
+             "num_experts_per_tok": 2, "num_hidden_layers": 8, "num_key_value_heads": 2,
+             "partial_rotary_factor": 0.25, "shared_expert_intermediate_size": inter, "vocab_size": 320}
+        meta = {"hidden": 64, "n_layers": 8, "layer_types": self.LAYERS, "num_experts": 8, "topk": 2,
+                "moe_inter": inter, "shared_inter": inter, "partial_rotary_factor": 0.25, "q_heads": 4,
+                "kv_heads": 2, "q_head_dim": 32, "k_head_dim": 16, "v_head_dim": 16, "o_in": 64, "head_dim": 16,
+                "dn_vheads": 8, "dn_kheads": 4, "dn_kdim": 8, "dn_vdim": 8, "dn_convk": 4, "dn_conv_dim": 128}
+        (self.model / "config.json").write_text(json.dumps(c))
+        (self.model / "qwen36_meta.json").write_text(json.dumps(meta))
+        tensors = []
+
+        def add(name, dtype, *shape):
+            count = 1
+            for n in shape:
+                count *= n
+            tensors.append((name, count * {"F16": 2, "F32": 4, "I8": 1}[dtype], dtype, list(shape)))
+        add("model.embed_tokens.weight", "F16", 320, 64)
+        add("lm_head.weight", "F16", 320, 64)
+        add("model.norm.weight", "F16", 64)
+        for i, kind in enumerate(self.LAYERS):
+            p = f"model.layers.{i}."
+            add(p + "input_layernorm.weight", "F16", 64)
+            add(p + "post_attention_layernorm.weight", "F16", 64)
+            if kind == "full_attention":
+                for name, rows in (("q_proj", 128), ("k_proj", 32), ("v_proj", 32)):
+                    add(p + f"self_attn.{name}.weight", "F16", rows, 64)
+                add(p + "self_attn.o_proj.weight", "F16", 64, 64)
+                add(p + "self_attn.q_norm.weight", "F16", 16)
+                add(p + "self_attn.k_norm.weight", "F16", 16)
+            else:
+                add(p + "linear_attn.A_log", "F16", 8)
+                add(p + "linear_attn.dt_bias", "F16", 8)
+                add(p + "linear_attn.conv1d.weight", "F16", 128, 1, 4)
+                add(p + "linear_attn.in_proj_a.weight", "F16", 8, 64)
+                add(p + "linear_attn.in_proj_b.weight", "F16", 8, 64)
+                add(p + "linear_attn.in_proj_qkv.weight", "F16", 128, 64)
+                add(p + "linear_attn.in_proj_z.weight", "F16", 64, 64)
+                add(p + "linear_attn.norm.weight", "F16", 8)
+                add(p + "linear_attn.out_proj.weight", "F16", 64, 64)
+            add(p + "mlp.gate.weight", "F16", 8, 64)
+            add(p + "mlp.shared_expert.gate_proj.weight", "F16", inter, 64)
+            add(p + "mlp.shared_expert.up_proj.weight", "F16", inter, 64)
+            add(p + "mlp.shared_expert.down_proj.weight", "F16", 64, inter)
+            add(p + "mlp.shared_expert_gate.weight", "F16", 1, 64)
+            for e in range(8):
+                add(p + f"mlp.experts.{e}.merged_weight", "I8", 3 * inter * 64)
+                add(p + f"mlp.experts.{e}.qs", "F32", 2 * inter + 64)
+        write_shard(self.model / "model.safetensors", tensors)
+        return analyze_model(self.model)
+
+    def write_olmoe(self):
+        """tools/make_olmoe_tiny.py's geometry as tools/convert_olmoe_merged.py writes it."""
+        c = {"architectures": ["OlmoeForCausalLM"], "model_type": "olmoe", "hidden_size": 64,
+             "intermediate_size": 32, "num_attention_heads": 4, "num_key_value_heads": 4, "num_experts": 8,
+             "num_experts_per_tok": 2, "num_hidden_layers": 4, "vocab_size": 128, "norm_topk_prob": True}
+        (self.model / "config.json").write_text(json.dumps(c))
+        tensors = [("model.embed_tokens.weight", 128 * 64 * 4, "F32", [128, 64]),
+                   ("lm_head.weight", 128 * 64 * 4, "F32", [128, 64]), ("model.norm.weight", 256, "F32", [64])]
+        for i in range(4):
+            p = f"model.layers.{i}."
+            for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                tensors.append((p + f"self_attn.{name}.weight", 64 * 64 * 4, "F32", [64, 64]))
+            for name in ("q_norm", "k_norm"):
+                tensors.append((p + f"self_attn.{name}.weight", 256, "F32", [64]))
+            for name in ("input_layernorm", "post_attention_layernorm"):
+                tensors.append((p + f"{name}.weight", 256, "F32", [64]))
+            tensors.append((p + "mlp.gate.weight", 8 * 64 * 4, "F32", [8, 64]))
+            for e in range(8):
+                tensors.append((p + f"mlp.experts.{e}.merged_weight", 3 * 32 * 64, "I8", [3 * 32 * 64]))
+                tensors.append((p + f"mlp.experts.{e}.qs", (2 * 32 + 64) * 4, "F32", [2 * 32 + 64]))
+        write_shard(self.model / "model.safetensors", tensors)
+        return analyze_model(self.model)
+
+    def test_layouts_are_the_engines(self):
+        # "[VK] qwen36 chain fit: ... fixed X B (the engine's E B, ...), tail T B, layers ..." and
+        # olmoe's, printed on Lavapipe for the tiny fixtures in each dense format
+        from resource_plan import _VK_CHAIN_LAYOUT
+        cpu = {"type": "cpu", "budget_bytes": 64 * GB}
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"}
+        attn = [3, 7]
+        def q36(lin, full):
+            return [full if i in attn else lin for i in range(8)]
+        info = self.write_qwen36()
+        for env, fixed, tail, layers in (({"COLI_DENSE_I8": "0"}, 1448960, 82176, q36(105056, 144512)),
+                                         ({}, 1448960, 21760, q36(36192, 75648)),
+                                         ({"COLI_DENSE_BITS": "16"}, 1448960, 41216, q36(58976, 98432)),
+                                         ({"COLI_DENSE_I8": "0", "COLI_VK_CHAIN_ROWS": "3"}, 20480, 82176, q36(105056, 144512))):
+            with self.subTest(engine="qwen36", env=env):
+                got = _VK_CHAIN_LAYOUT["qwen36"](info, dict(on, **env), cpu)
+                self.assertEqual((got.layers, got.fixed, got.tail), (layers, fixed, tail))
+        # COLI_DENSE_BITS=4 on the --inter 64 fixture: int4 in groups of 64
+        self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.model = Path(self.tmp.name)
+        got = _VK_CHAIN_LAYOUT["qwen36"](self.write_qwen36(inter=64), dict(on, COLI_DENSE_BITS="4"), cpu)
+        self.assertEqual((got.layers, got.fixed, got.tail), (q36(27744, 67200), 1547264, 11520))
+        self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.model = Path(self.tmp.name)
+        info = self.write_olmoe()
+        for env, fixed in (({}, 886016), ({"PILOT": "1", "COLI_VK_CHAIN_ROWS": "3"}, 12800)):
+            with self.subTest(engine="olmoe", env=env):
+                got = _VK_CHAIN_LAYOUT["olmoe"](info, dict(on, **env), cpu)
+                self.assertEqual((got.layers, got.fixed, got.tail), ([168192] * 4, fixed, 33024))
+
+    def test_device_only_credits_the_layers_on_the_device(self):
+        from resource_plan import vk_chain_fit, vk_fit_pools
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        for engine, write, L in (("qwen36", self.write_qwen36, 8), ("olmoe", self.write_olmoe, 4)):
+            with self.subTest(engine=engine):
+                self.tmp.cleanup(); self.tmp = tempfile.TemporaryDirectory(); self.model = Path(self.tmp.name)
+                info = write()
+                on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "COLI_VK_DENSE_HOST": "0",
+                      "COLI_VK_TIER_RESERVE_GB": "0", "COLI_DENSE_I8": "0"}
+                fit = vk_chain_fit(info, engine, on, {"type": "discrete", "budget_bytes": 64 * GB})
+                self.assertEqual(fit["n"], L)
+                # what each engine drops: the chain's matrices of the first k layers (not the
+                # DeltaNet's a/b rows, the shared expert's gate, norms or the head)
+                def released(k):
+                    plan = build_plan(self.model, env=dict(on, COLI_VK_CHAIN_LAYERS=str(k)),
+                                      vulkan={"type": "discrete", "budget_bytes": 64 * GB}, **kwargs)
+                    return plan["tiers"]["ram"]["dense_on_device_bytes"]
+                per = released(1)
+                self.assertGreater(per, 0)
+                self.assertEqual(released(0), 0)
+                for k in range(1, L):
+                    free = fit["fixed"] + sum(fit["layers"][:k]) + fit["layers"][k] // 2
+                    plan = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": free}, **kwargs)
+                    ram = plan["tiers"]["ram"]
+                    self.assertEqual(ram["vk_chain_layers"]["on_device"], k)
+                    self.assertEqual(ram["dense_on_device_bytes"], released(k))
+                    self.assertIn(f"the first {k} of {L} layers", format_plan(plan))
+                # every layer but no room for the head: the layers' copies alone; with room
+                # for it (or every layer forced) the head's copy goes too
+                from resource_plan import _VK_CHAIN_LAYOUT
+                tail = _VK_CHAIN_LAYOUT[engine](info, on, {"type": "discrete"}).tail
+                free = fit["fixed"] + sum(fit["layers"]) + tail // 2
+                no_head = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": free}, **kwargs)
+                full = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": 64 * GB}, **kwargs)
+                self.assertEqual((no_head["tiers"]["ram"]["vk_chain_layers"]["on_device"],
+                                  no_head["tiers"]["ram"]["vk_chain_layers"]["tail"]), (L, False))
+                self.assertEqual(full["tiers"]["ram"]["vk_chain_layers"]["tail"], True)
+                self.assertLess(no_head["tiers"]["ram"]["dense_on_device_bytes"],
+                                full["tiers"]["ram"]["dense_on_device_bytes"])
+                self.assertEqual(full["tiers"]["ram"]["dense_on_device_bytes"], released(L))
+
+
+class Qwen38PartialChainTest(unittest.TestCase):
+    """qwen38 on the partial chain: resource_plan's layout (_q38_chain_layout) is the
+    engine's fit (q38c_fit_layer, q38c_fit_fixed, q38c_fit_tail in qwen38_chain.h), and
+    the plan credits the first N layers' host copies only."""
+
+    # tools/make_qwen38_tiny.py's geometry (the config it writes, the fields the engine reads)
+    CONFIG = {
+        "architectures": ["Qwen4ExpForCausalLM"], "model_type": "qwen4_exp_text",
+        "attention_bias": False, "hidden_act": "silu", "output_gate_type": "sigmoid",
+        "tie_word_embeddings": False, "bos_token_id": 1, "eos_token_id": 2, "pad_token_id": 0,
+        "hidden_size": 32, "num_hidden_layers": 4, "vocab_size": 64, "max_position_embeddings": 128,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8, "rms_norm_eps": 1e-06,
+        "partial_rotary_factor": 0.5,
+        "rope_parameters": {"partial_rotary_factor": 0.5, "rope_theta": 10000.0, "rope_type": "default"},
+        "layer_types": ["linear_attention", "qwen_sparse_attention", "linear_attention", "qwen_sparse_attention"],
+        "linear_conv_kernel_dim": 4, "linear_key_head_dim": 4, "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4, "linear_value_head_dim": 4,
+        "hc_count": 4, "hc_lowrank": 8, "ngram_size": 3, "heads_per_ngram": 2, "ngram_vocab_size_base": 31,
+        "make_ngram_vocab_size_divisible_by": 4, "split_ngram_parts": 2, "ple_layer_ids": [1],
+        "ple_embed_dim": 32, "ple_conv_kernel_size": 4, "indexer_n_heads": 2, "indexer_kv_heads": 1,
+        "indexer_head_dim": 4, "indexer_budget": 4, "indexer_compress_ratio": 2, "num_experts": 4,
+        "num_experts_per_tok": 2, "moe_intermediate_size": 8, "shared_expert_intermediate_size": 8,
+        "norm_topk_prob": True,
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.model = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_q38(self, ple_layer=1):
+        """Every tensor of the tiny fixture (BF16), the PLE at ple_layer (one-based)."""
+        c = dict(self.CONFIG, ple_layer_ids=[ple_layer])
+        (self.model / "config.json").write_text(json.dumps(c))
+        H, W, R, V = 32, 128, 8, 64
+        tensors = []
+
+        def add(name, *shape):
+            count = 1
+            for n in shape:
+                count *= n
+            tensors.append((name, 2 * count, "BF16", list(shape)))
+        add("lm_head.weight", V, H)
+        add("model.embed_tokens.weight", V, H)
+        add("model.hyper_connection_mixer.hc_norm.weight", W)
+        add("model.hyper_connection_mixer.input_mix_weight_down.weight", R, W)
+        add("model.hyper_connection_mixer.input_mix_weight_up.weight", W, R)
+        for i, kind in enumerate(c["layer_types"]):
+            p = f"model.layers.{i}."
+            for block in ("attn", "mlp"):
+                add(p + block + "_hyper_connection.block_inject_weight.weight", 4, W)
+                add(p + block + "_hyper_connection.hc_norm.weight", W)
+                add(p + block + "_hyper_connection.input_mix_weight_down.weight", R, W)
+                add(p + block + "_hyper_connection.input_mix_weight_up.weight", W, R)
+            if kind == "linear_attention":
+                add(p + "linear_attn.A_log", 4)
+                add(p + "linear_attn.conv1d.weight", 32, 1, 4)
+                add(p + "linear_attn.dt_bias", 4)
+                add(p + "linear_attn.in_proj_a.weight", 4, H)
+                add(p + "linear_attn.in_proj_b.weight", 4, H)
+                add(p + "linear_attn.in_proj_qkv.weight", 32, H)
+                add(p + "linear_attn.in_proj_z.weight", 16, H)
+                add(p + "linear_attn.norm.weight", 4)
+                add(p + "linear_attn.out_proj.weight", H, 16)
+            else:
+                add(p + "self_attn.indexer.index_qk_proj.weight", 12, H)
+                add(p + "self_attn.indexer.k_layernorm.weight", 4)
+                add(p + "self_attn.indexer.q_layernorm.weight", 4)
+                add(p + "self_attn.k_norm.weight", 8)
+                add(p + "self_attn.k_proj.weight", 16, H)
+                add(p + "self_attn.o_proj.weight", H, H)
+                add(p + "self_attn.q_norm.weight", 8)
+                add(p + "self_attn.q_proj.weight", 64, H)
+                add(p + "self_attn.v_proj.weight", 16, H)
+            add(p + "mlp.gate.weight", 4, H)
+            add(p + "mlp.shared_expert.down_proj.weight", H, 8)
+            add(p + "mlp.shared_expert.gate_proj.weight", 8, H)
+            add(p + "mlp.shared_expert.up_proj.weight", 8, H)
+            add(p + "mlp.shared_expert_gate.weight", 1, H)
+            for e in range(4):
+                add(p + f"mlp.experts.{e}.down_proj.weight", H, 8)
+                add(p + f"mlp.experts.{e}.gate_proj.weight", 8, H)
+                add(p + f"mlp.experts.{e}.up_proj.weight", 8, H)
+            if i == ple_layer - 1:
+                add(p + "ple.conv1d.weight", W, 1, 4)
+                add(p + "ple.key_proj.weight", W, 32)
+                for norm in ("norm_conv", "norm_key", "norm_query"):
+                    add(p + f"ple.{norm}.weight", W)
+                add(p + "ple.ple_embedding.ngram_embedding.shard_0.weight", 76, 8)
+                add(p + "ple.ple_embedding.ngram_embedding.shard_1.weight", 76, 8)
+                add(p + "ple.value_proj.weight", H, 32)
+        write_shard(self.model / "model.safetensors", tensors)
+        return analyze_model(self.model)
+
+    def test_qwen38_layout_is_the_engines(self):
+        # The numbers qwen38 printed for these geometries on Lavapipe ("[VK] qwen38 chain
+        # fit: ... the engine's 1529872 B ..., tail 8960 B, layers 47664 92768 24112 92768 B"):
+        # bf16 by default, the int8 trunk (Q38_TRUNK_MIN_KB=0), f32, the PLE at layer 2, and
+        # the MTP head's matrices in the tail.
+        from resource_plan import vk_chain_fit, vk_fit_pools
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"}
+        device = {"type": "cpu", "budget_bytes": 64 * GB}
+        cases = (
+            (1, {}, [47664, 92768, 24112, 92768], 8960),
+            (1, {"Q38_TRUNK_MIN_KB": "0"}, [40240, 83040, 16688, 83040], 6912),
+            (1, {"Q38_TRUNK_CPU_INT8": "0", "Q38_NATIVE_BF16": "0"}, [74544, 113760, 40752, 113760], 17152),
+            (3, {}, [24112, 92768, 47664, 92768], 8960),
+        )
+        for ple, env, layers, tail in cases:
+            with self.subTest(ple=ple, env=env):
+                info = self.write_q38(ple)
+                fit = vk_chain_fit(info, "qwen38", dict(on, **env), device)
+                self.assertEqual(fit["layers"], layers)
+                self.assertEqual(fit["fixed"] - vk_fit_pools(0), 1529872)
+                self.assertEqual(fit["n"], 4)
+                self.assertTrue(fit["tail"])
+        # the MTP head goes with the tail under Q38_MTP=1 (43008 B in bf16, 27392 B as int8 rows)
+        from resource_plan import _q38_chain_layout
+        info = self.write_q38(1)
+        c = dict(self.CONFIG, mtp_num_hidden_layers=1)
+        (self.model / "config.json").write_text(json.dumps(c))
+        info = dict(info, config=c)
+        self.assertEqual(_q38_chain_layout(info, {"Q38_MTP": "1"}, device).tail, 43008)
+        self.assertEqual(_q38_chain_layout(info, {"Q38_MTP": "1", "Q38_TRUNK_MIN_KB": "0"}, device).tail, 27392)
+        self.assertEqual(_q38_chain_layout(info, {}, device).tail, 8960)
+        # a device whose memory the plan does not know: no prediction unless N is forced
+        self.assertIsNone(_q38_chain_layout(info, {}, {"type": "integrated"}))
+        self.assertIsNotNone(_q38_chain_layout(info, {"COLI_VK_CHAIN_LAYERS": "2"}, {"type": "integrated"}))
+        # COLI_VK_CHAIN_ROWS lowers the chunk the fit counts: the scratch and the attention
+        # layers' read-back rows
+        small = vk_chain_fit(info, "qwen38", dict(on, COLI_VK_CHAIN_ROWS="3"), device)
+        self.assertLess(small["fixed"], vk_chain_fit(info, "qwen38", on, device)["fixed"])
+        self.assertEqual([a < b for a, b in zip(small["layers"], [47664, 92768, 24112, 92768])],
+                         [False, True, False, True])
+
+    def test_qwen38_device_only_credits_the_layers_on_the_device(self):
+        from resource_plan import vk_chain_fit, _vk_released_tensor_bytes
+        info = self.write_q38(1)
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "COLI_VK_DENSE_HOST": "0", "COLI_VK_TIER_RESERVE_GB": "0"}
+        big = {"type": "discrete", "budget_bytes": 64 * GB}
+        fit = vk_chain_fit(info, "qwen38", on, big)
+
+        def credit(k, head):
+            total = 0
+            for t in info["dense_tensors"]:
+                name = t["name"]
+                if name.startswith("model.layers."):
+                    if int(name.split(".")[2]) >= k:
+                        continue
+                elif not head:
+                    continue
+                total += _vk_released_tensor_bytes(t, "qwen38", on)
+            return total
+        full = build_plan(self.model, env=on, vulkan=big, **kwargs)
+        self.assertEqual(full["tiers"]["ram"]["vk_chain_layers"]["on_device"], 4)
+        self.assertEqual(full["tiers"]["ram"]["dense_on_device_bytes"], credit(4, True))
+        for k in (1, 2, 3):
+            # a device holding k layers and half of the next: the plan's N is k
+            free = fit["fixed"] + sum(fit["layers"][:k]) + fit["layers"][k] // 2
+            with self.subTest(k=k):
+                plan = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": free}, **kwargs)
+                ram = plan["tiers"]["ram"]
+                self.assertEqual(ram["vk_chain_layers"]["on_device"], k)
+                self.assertEqual(ram["dense_on_device_bytes"], credit(k, False))
+                self.assertIn(f"the first {k} of 4 layers", format_plan(plan))
+                forced = build_plan(self.model, env=dict(on, COLI_VK_CHAIN_LAYERS=str(k)), vulkan=big, **kwargs)
+                self.assertEqual(forced["tiers"]["ram"]["dense_on_device_bytes"], credit(k, False))
+        # every layer but no room for the head: the layers' copies only
+        free = fit["fixed"] + sum(fit["layers"])
+        plan = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": free}, **kwargs)
+        self.assertEqual(plan["tiers"]["ram"]["vk_chain_layers"]["on_device"], 4)
+        self.assertEqual(plan["tiers"]["ram"]["dense_on_device_bytes"], credit(4, False))
+        # COLI_VK_CHAIN_LAYERS=0: the chain off, every host copy stays
+        off = build_plan(self.model, env=dict(on, COLI_VK_CHAIN_LAYERS="0"), vulkan=big, **kwargs)
+        self.assertEqual(off["tiers"]["ram"]["dense_on_device_bytes"], 0)
+
+
+class VulkanPartialChainGlm53Test(unittest.TestCase):
+    """glm53's partial chain in the plan: _glm53_chain_layout is g53c_fit_plan
+    (glm53_chain.h), and the device-only credit is the N layers' matrices alone."""
+
+    # tests/vulkan_partial_glm.sh's six-layer GLM-5.3: KDA and MLA layers alternating,
+    # the first MLP dense
+    TEXT = {
+        "vocab_size": 128, "hidden_size": 128, "intermediate_size": 256, "moe_intermediate_size": 128,
+        "num_hidden_layers": 6, "num_attention_heads": 4, "num_key_value_heads": 4, "n_shared_experts": 1,
+        "n_routed_experts": 4, "num_experts_per_tok": 2, "kv_lora_rank": 64, "q_lora_rank": 128,
+        "qk_rope_head_dim": 0, "qk_nope_head_dim": 32, "v_head_dim": 32, "max_position_embeddings": 128,
+        "layer_types": ["linear_attention", "deepseek_sparse_attention"] * 3,
+        "mlp_layer_types": ["dense"] + ["sparse"] * 5, "indexer_types": ["full"] * 6,
+        "index_topk": 4, "index_kpool": 2, "index_head_dim": 32, "index_n_heads": 2,
+        "hc_mult": 2, "hc_sinkhorn_iters": 3, "hc_eps": 1e-06, "rms_norm_eps": 1e-05,
+        "routed_scaling_factor": 2.5, "swiglu_limit": 10.0, "tie_word_embeddings": False,
+        "model_type": "glm5_next_text", "num_nextn_predict_layers": 0,
+        "linear_attn_config": {"num_heads": 4, "head_dim": 32, "short_conv_kernel_size": 4,
+                               "gate_lower_bound": -5.0, "kda_layers": [0, 2, 4]},
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.model = Path(self.tmp.name)
+        (self.model / "config.json").write_text(json.dumps({
+            "architectures": ["Glm5NextForConditionalGeneration"], "model_type": "glm5_next",
+            "text_config": self.TEXT}))
+        tensors = []
+
+        def add(name, *shape, dtype="F32"):
+            count = 1
+            for n in shape:
+                count *= n
+            tensors.append((name, count * (1 if dtype == "U8" else 4), dtype, list(shape)))
+        P = "model.language_model."
+        add("lm_head.weight", 128, 128)
+        add(P + "embed_tokens.weight", 128, 128)
+        add(P + "norm.weight", 128)
+        for i, kind in enumerate(self.TEXT["layer_types"]):
+            p = f"{P}layers.{i}."
+            for site in ("attn", "ffn"):
+                add(p + f"hc_{site}_base", 8)
+                add(p + f"hc_{site}_fn", 8, 256)
+                add(p + f"hc_{site}_scale", 3)
+            add(p + "input_layernorm.weight", 128)
+            add(p + "post_attention_layernorm.weight", 128)
+            a = p + "self_attn."
+            if kind == "linear_attention":
+                for name in ("q", "k", "v", "o"):
+                    add(a + f"{name}_proj.weight", 128, 128)
+                for name in ("q", "k", "v"):
+                    add(a + f"{name}_conv1d.weight", 128, 1, 4)
+                add(a + "A_log", 4); add(a + "dt_bias", 128); add(a + "o_norm.weight", 32)
+                add(a + "b_proj.weight", 4, 128)
+                for name in ("f", "g"):
+                    add(a + f"{name}_a_proj.weight", 32, 128)
+                    add(a + f"{name}_b_proj.weight", 128, 32)
+            else:
+                add(a + "q_a_proj.weight", 128, 128); add(a + "q_a_layernorm.weight", 128)
+                add(a + "q_b_proj.weight", 128, 128)
+                add(a + "kv_a_proj_with_mqa.weight", 64, 128); add(a + "kv_a_layernorm.weight", 64)
+                add(a + "kv_b_proj.weight", 256, 64)
+                add(a + "o_proj.weight", 128, 128)
+                ix = a + "indexer."
+                add(ix + "wq_b.weight", 64, 128); add(ix + "wk.weight", 32, 128)
+                add(ix + "weights_proj.weight", 2, 128); add(ix + "index_kpool_compress_gate", 32, 128)
+                add(ix + "index_kpool_compress_ape", 2, 32)
+                add(ix + "k_norm.weight", 32); add(ix + "k_norm.bias", 32)
+            if i == 0:
+                add(p + "mlp.gate_proj.weight", 256, 128); add(p + "mlp.up_proj.weight", 256, 128)
+                add(p + "mlp.down_proj.weight", 128, 256)
+                continue
+            add(p + "mlp.gate.weight", 4, 128); add(p + "mlp.gate.e_score_correction_bias", 4)
+            for name in ("gate", "up", "down"):
+                add(p + f"mlp.shared_experts.{name}_proj.weight", *((128, 128)))
+            for e in range(4):
+                for name in ("gate", "up", "down"):
+                    add(p + f"mlp.experts.{e}.{name}_proj.weight", 8192, dtype="U8")
+                    add(p + f"mlp.experts.{e}.{name}_proj.weight.qs", 256)
+        write_shard(self.model / "model.safetensors", tensors)
+        self.info = analyze_model(self.model)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_layout_is_the_engines(self):
+        # The numbers glm53 printed for the fixture on Lavapipe ("[VK] glm53 chain fit: ...
+        # the engine's 4847872 B ..., tail 65792 B, layers 773352 728408 ... B"), at each
+        # GLM53_BITS, and with a chunk of 7 rows and a 300-position slot (155904 B)
+        from resource_plan import vk_chain_fit, vk_fit_pools
+        device = {"type": "cpu", "budget_bytes": 64 * GB}
+        want = {"32": ([773352, 728408, 576744, 728408, 576744, 728408], 65792),
+                "8": ([234472, 312408, 184296, 312408, 184296, 312408], 16896),
+                "4": ([153832, 250456, 126184, 250456, 126184, 250456], 9216)}
+        for bits, (layers, tail) in want.items():
+            with self.subTest(bits=bits):
+                env = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "GLM53_BITS": bits}
+                fit = vk_chain_fit(self.info, "glm53", env, device)
+                self.assertEqual(fit["layers"], layers)
+                self.assertEqual(fit["fixed"] - vk_fit_pools(0), 4847872)
+                self.assertEqual((fit["n"], fit["tail"]), (6, True))
+        small = vk_chain_fit(self.info, "glm53", {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "GLM53_BITS": "4",
+                                                  "COLI_VK_CHAIN_ROWS": "7", "GLM53_MAXT": "300"}, device)
+        self.assertEqual(small["fixed"] - vk_fit_pools(0), 155904)
+        self.assertEqual(small["layers"], want["4"][0])
+
+    def test_device_only_credits_the_layers_on_the_device(self):
+        from resource_plan import _glm53_dense_tensors, _vk_layer_index, _vk_released_tensor_bytes, vk_chain_fit
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "COLI_VK_DENSE_HOST": "0", "COLI_VK_TIER_RESERVE_GB": "0",
+              "GLM53_BITS": "32"}
+        big = {"type": "discrete", "budget_bytes": 64 * GB}
+        fit = vk_chain_fit(self.info, "glm53", on, big)
+
+        tensors = _glm53_dense_tensors(self.info, on)["dense_tensors"]   # resident at GLM53_BITS=32
+
+        def droppable(k):   # the matrices g53_dho_layer drops, of layers 0..k-1
+            return sum(_vk_released_tensor_bytes(t, "glm53", on) for t in tensors
+                       if _vk_layer_index(t["name"]) is not None and _vk_layer_index(t["name"]) < k)
+        for k in (1, 3, 5):
+            with self.subTest(k=k):
+                free = fit["fixed"] + sum(fit["layers"][:k]) + fit["layers"][k] // 2
+                plan = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": free}, **kwargs)
+                ram = plan["tiers"]["ram"]
+                self.assertEqual(ram["vk_chain_layers"]["on_device"], k)
+                self.assertEqual(ram["dense_on_device_bytes"], droppable(k))
+                self.assertIn(f"the first {k} of 6 layers", format_plan(plan))
+                forced = build_plan(self.model, env=dict(on, COLI_VK_CHAIN_LAYERS=str(k)), vulkan=big, **kwargs)
+                self.assertEqual(forced["tiers"]["ram"]["dense_on_device_bytes"], droppable(k))
+        self.assertGreater(droppable(3), droppable(1))
+        none = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": 1 << 20}, **kwargs)
+        self.assertEqual(none["tiers"]["ram"]["dense_on_device_bytes"], 0)
+        self.assertEqual(none["tiers"]["ram"]["vk_chain_layers"]["on_device"], 0)
+
+
+class VulkanPartialChainDskTest(unittest.TestCase):
+    """The partial chain's layouts of DeepSeek V4.1 Flash (deepseek_v41) and Kimi K3
+    (kimi): resource_plan.vk_chain_fit counts each layer, the fixed bytes and the tail as
+    the engine's fit prints them for its tiny fixture (tools/make_dsv41_tiny.py,
+    tools/make_kimi_k3_tiny.py), and the plan credits only the N layers' host copies."""
+
+    V41 = {
+        "architectures": ["DeepseekV41ForCausalLM"], "model_type": "deepseek_v41",
+        "text_config": {
+            "vocab_size": 256, "dim": 128, "moe_inter_dim": 64, "n_layers": 6, "n_heads": 4, "head_dim": 64,
+            "rope_head_dim": 16, "q_lora_rank": 64, "o_lora_rank": 32, "o_groups": 2, "n_routed_experts": 8,
+            "n_shared_experts": 1, "n_activated_experts": 2, "window_size": 8, "compress_ratios": [0, 2, 2, 1, 1, 0],
+            "kv_source_layers": [1, 3], "index_source_layers": [1, 3, 4], "index_n_heads": 4, "index_head_dim": 32,
+            "index_topk": 4, "candidate_source_layer": 3, "candidate_topk_blocks": 2, "candidate_block_size": 2,
+            "hc_mult": 4, "engram_layer_ids": [1, 4], "dspark_block_size": 3, "dspark_target_layer_ids": [3, 4, 5],
+            "max_position_embeddings": 256, "model_type": "deepseek_v41_text", "hidden_size": 128,
+            "num_hidden_layers": 6, "num_attention_heads": 4, "moe_intermediate_size": 64, "num_experts_per_tok": 2,
+            "sliding_window": 8, "rope_theta": 10000.0, "original_seq_len": 32},
+    }
+    K3 = {
+        "model_type": "kimi_linear", "architectures": ["KimiLinearForCausalLM"], "hidden_size": 128,
+        "num_hidden_layers": 6, "vocab_size": 320, "first_k_dense_replace": 2, "intermediate_size": 64,
+        "num_attention_heads": 4, "num_key_value_heads": 4, "q_lora_rank": 32, "kv_lora_rank": 32,
+        "qk_nope_head_dim": 16, "qk_rope_head_dim": 8, "v_head_dim": 16, "num_experts": 8,
+        "num_experts_per_token": 2, "moe_intermediate_size": 32, "routed_expert_hidden_size": 32,
+        "num_shared_experts": 1, "attn_res_block_size": 2, "max_position_embeddings": 256,
+        "linear_attn_config": {"num_heads": 2, "head_dim": 16, "short_conv_kernel_size": 4,
+                               "kda_layers": [1, 3], "full_attn_layers": [2, 4, 5, 6]},
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.model = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, config, tensors):
+        (self.model / "config.json").write_text(json.dumps(config))
+        write_shard(self.model / "model.safetensors", tensors)
+        return analyze_model(self.model)
+
+    def write_v41(self):
+        """The tiny V4.1 fixture's trunk: every matrix the chain or the device-only
+        placement takes, the router, the norms, the experts."""
+        t = []
+        width = {"F8_E4M3": 1, "BF16": 2, "F32": 4, "I8": 1, "U8": 1}
+
+        def add(name, dtype, *shape):
+            n = 1
+            for d in shape:
+                n *= d
+            t.append((name, n * width[dtype], dtype, list(shape)))
+        add("embed.weight", "BF16", 256, 128)
+        add("head.weight", "BF16", 256, 128)
+        for i, r in enumerate([0, 2, 2, 1, 1, 0]):
+            p = f"layers.{i}."
+            for name, rows, cols in (("attn.wq_a", 64, 128), ("attn.wq_b", 256, 64), ("attn.wkv", 64, 128),
+                                     ("attn.wo_a", 64, 128), ("attn.wo_b", 128, 64), ("ffn.shared_experts.w1", 64, 128),
+                                     ("ffn.shared_experts.w3", 64, 128), ("ffn.shared_experts.w2", 128, 64)):
+                add(p + name + ".weight", "F8_E4M3", rows, cols)
+            add(p + "ffn.gate.weight", "BF16", 8, 128)
+            add(p + "attn_norm.weight", "BF16", 128)
+            add(p + "hc_attn_fn", "F32", 24, 512)
+            if i in (1, 3):
+                add(p + "attn.compressor.wkv.weight", "BF16", 64, 128)
+                if r > 1:
+                    add(p + "attn.compressor.wgate.weight", "BF16", 64, 128)
+                add(p + "attn.indexer.wk.weight", "BF16", 32, 64)
+            if i in (1, 3, 4):
+                add(p + "attn.indexer.wq_b.weight", "F8_E4M3", 128, 64)
+                add(p + "attn.indexer.weights_proj.weight", "BF16", 4, 128)
+            if i in (1, 4):
+                add(p + "engram.wkv.weight", "F8_E4M3", 640, 192)
+            for e in range(8):
+                add(p + f"ffn.experts.{e}.w1.weight", "I8", 64, 64)
+        return self.write(self.V41, t)
+
+    def write_k3(self, dtype="F32"):
+        """The tiny Kimi K3 fixture's matrices (f32 as the generator writes them)."""
+        t = []
+        c = self.K3
+
+        def add(name, *shape):
+            n = 1
+            for d in shape:
+                n *= d
+            t.append((name, n * 4, dtype, list(shape)))
+        add("model.embed_tokens.weight", 320, 128)
+        add("lm_head.weight", 320, 128)
+        for i in range(6):
+            p = f"model.layers.{i}."
+            add(p + "input_layernorm.weight", 128)
+            if i in (0, 2):
+                for part in ("q", "k", "v", "g"):
+                    add(p + f"self_attn.{part}_proj.weight", 32, 128)
+                add(p + "self_attn.o_proj.weight", 128, 32)
+                add(p + "self_attn.f_a_proj.weight", 16, 128)
+                add(p + "self_attn.f_b_proj.weight", 32, 16)
+                add(p + "self_attn.b_proj.weight", 2, 128)
+            else:
+                add(p + "self_attn.q_a_proj.weight", 32, 128)
+                add(p + "self_attn.q_b_proj.weight", 96, 32)
+                add(p + "self_attn.kv_a_proj_with_mqa.weight", 40, 128)
+                add(p + "self_attn.kv_b_proj.weight", 128, 32)
+                add(p + "self_attn.o_proj.weight", 128, 64)
+                add(p + "self_attn.g_proj.weight", 64, 128)
+            if i >= c["first_k_dense_replace"]:
+                m = p + "block_sparse_moe."
+                add(m + "gate.weight", 8, 128)
+                add(m + "routed_expert_down_proj.weight", 32, 128)
+                add(m + "routed_expert_up_proj.weight", 128, 32)
+                add(m + "shared_experts.gate_proj.weight", 32, 128)
+                add(m + "shared_experts.up_proj.weight", 32, 128)
+                add(m + "shared_experts.down_proj.weight", 128, 32)
+            else:
+                add(p + "mlp.gate_proj.weight", 64, 128)
+                add(p + "mlp.up_proj.weight", 64, 128)
+                add(p + "mlp.down_proj.weight", 128, 64)
+        return self.write(c, t)
+
+    def test_deepseek_v41_layout_is_the_engines(self):
+        # "[VK] deepseek_v41 chain fit: ... fixed ... (the engine's E B, ...), tail T B, layers
+        # b0 .. B" for dsv41_tiny on Lavapipe, per configuration
+        from resource_plan import vk_chain_fit, vk_fit_pools
+        info = self.write_v41()
+        cpu = {"type": "cpu", "budget_bytes": 64 * GB}
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"}
+        for env, layers, fixed, tail in (
+                (on, [318696, 634472, 318696, 571752, 471528, 318696], 12124416, 0),
+                (dict(on, COLI_VK_DENSE="1"), [318696, 634472, 318696, 571752, 471528, 318696], 12124416, 79616),
+                # prompts only, device only: wo_a per output group as well; chunks of 7 rows
+                (dict(on, COLI_VK_CHAIN="2", COLI_VK_DENSE_HOST="0", COLI_VK_CHAIN_ROWS="7"),
+                 [198376, 417000, 198376, 257512, 351208, 198376], 137736, 0)):
+            with self.subTest(env=env):
+                fit = vk_chain_fit(info, "deepseek_v41", env, cpu)
+                self.assertEqual(fit["layers"], layers)
+                self.assertEqual(fit["fixed"] - vk_fit_pools(0), fixed)
+                self.assertEqual(fit["n"], 6)
+                self.assertEqual(fit["tail"], True)
+
+    def test_kimi_layout_is_the_engines(self):
+        # "[VK] kimi_k3 chain fit: ..." for kimi_k3_tiny on Lavapipe at each bit width: the
+        # matrices go up in the forms the loader made of them (int4-g64, int8 rows, f32)
+        from resource_plan import vk_chain_fit, vk_fit_pools
+        info = self.write_k3()
+        cpu = {"type": "cpu", "budget_bytes": 64 * GB}
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"}
+        for bits, layers, tail in (
+                ({}, [47048, 133120, 53832, 139904, 139904, 139904], 42240),
+                ({"K3_BITS": "32", "K3_MLA_BITS": "32", "K3_HEAD_BITS": "32"}, [201672, 315904, 190280, 304512, 304512, 304512], 164096),
+                ({"K3_BITS": "4", "K3_MLA_BITS": "4", "K3_HEAD_BITS": "4"}, [47048, 120832, 53832, 127616, 127616, 127616], 23040),
+                ({"K3_BITS": "8"}, [67016, 144896, 68168, 146048, 146048, 146048], 42240)):
+            with self.subTest(bits=bits):
+                fit = vk_chain_fit(info, "kimi", dict(on, **bits), cpu)
+                self.assertEqual(fit["layers"], layers)
+                self.assertEqual(fit["fixed"] - vk_fit_pools(0), 2715904)
+                self.assertEqual(vk_chain_fit(info, "kimi", dict(on, COLI_VK_CHAIN_LAYERS="6", **bits), cpu)["tail"], True)
+                # the head is the tail: a device with room for every layer but not it
+                room = (1 << 30) + fit["fixed"] + sum(layers)
+                short = vk_chain_fit(info, "kimi", dict(on, **bits), {"type": "discrete", "budget_bytes": room + tail - 1})
+                self.assertEqual((short["n"], short["tail"]), (6, False))
+
+    def credit(self, info, family, k):
+        from resource_plan import _vk_released_tensor_bytes, _vk_layer_index
+        return sum(_vk_released_tensor_bytes(t, family, {}) for t in info["dense_tensors"]
+                   if (_vk_layer_index(t["name"]) if _vk_layer_index(t["name"]) is not None else 99) < k)
+
+    def test_device_only_credits_the_layers_on_the_device(self):
+        from resource_plan import vk_chain_fit
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "COLI_VK_DENSE_HOST": "0", "COLI_VK_TIER_RESERVE_GB": "0"}
+        big = {"type": "discrete", "budget_bytes": 64 * GB}
+        for family, write in (("deepseek_v41", self.write_v41), ("kimi", self.write_k3)):
+            info = write()
+            fit = vk_chain_fit(info, family, on, big)
+            layers, full_credit = fit["layers"], self.credit(info, family, 6)
+            self.assertGreater(full_credit, self.credit(info, family, 5))
+            full = build_plan(self.model, env=on, vulkan=big, **kwargs)["tiers"]["ram"]
+            self.assertEqual(full["vk_chain_layers"]["on_device"], 6)
+            for k in (1, 3, 5):
+                device = {"type": "discrete", "budget_bytes": fit["fixed"] + sum(layers[:k]) + layers[k] // 2}
+                with self.subTest(family=family, k=k):
+                    self.assertEqual(vk_chain_fit(info, family, on, device)["n"], k)
+                    plan = build_plan(self.model, env=on, vulkan=device, **kwargs)
+                    ram = plan["tiers"]["ram"]
+                    self.assertEqual(ram["vk_chain_layers"]["on_device"], k)
+                    self.assertEqual(ram["dense_on_device_bytes"], self.credit(info, family, k))
+                    self.assertIn(f"the first {k} of 6 layers", format_plan(plan))
+                    forced = build_plan(self.model, env=dict(on, COLI_VK_CHAIN_LAYERS=str(k)), vulkan=big, **kwargs)
+                    self.assertEqual(forced["tiers"]["ram"]["dense_on_device_bytes"], self.credit(info, family, k))
+            none = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": 1 << 20}, **kwargs)["tiers"]["ram"]
+            self.assertEqual((none["vk_chain_layers"]["on_device"], none["dense_on_device_bytes"]), (0, 0))
+
+
+class VulkanPartialChainInklingMimoTest(unittest.TestCase):
+    """inkling's and MiMo's partial chain in the planner: their layouts are the bytes the
+    engines' fits printed for the tiny fixtures on Lavapipe (tests/vulkan_partial_inkling-mimo.sh
+    runs the engines), and the plan credits only the first N layers' host copies."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.model = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_inkling(self, container=False):
+        """tools/make_tiny_inkling.py's geometry (8 layers, the global one at 5, layers 0
+        and 1 dense), f32; container: the dense-int4g64 converter's output beside it
+        (int4-g64 matrices, int8 down projections and lm_head, as the family converts it)."""
+        c = {"architectures": ["InklingForCausalLM"], "model_type": "inkling", "hidden_size": 64,
+             "num_hidden_layers": 8, "vocab_size": 256, "unpadded_vocab_size": 250,
+             "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
+             "swa_num_attention_heads": 4, "swa_num_key_value_heads": 4, "swa_head_dim": 16,
+             "sliding_window_size": 8, "d_rel": 8, "rel_extent": 32, "conv_kernel_size": 4,
+             "layer_types": ["hybrid_sliding"] * 5 + ["hybrid"] + ["hybrid_sliding"] * 2,
+             "mlp_layer_types": ["dense"] * 2 + ["sparse"] * 6, "intermediate_size": 96,
+             "moe_intermediate_size": 32, "n_routed_experts": 8, "n_shared_experts": 2,
+             "num_experts_per_tok": 2, "rms_norm_eps": 1e-06, "max_position_embeddings": 4096}
+        (self.model / "config.json").write_text(json.dumps(c))
+        main, quant = [], []
+
+        def add(name, *shape, q=None):
+            count = 1
+            for n in shape:
+                count *= n
+            main.append((name, 4 * count, "F32", list(shape)))
+            if q == "int4":     # one f32 scale per 64 columns of a row
+                quant.append((name, count // 2, "U8", [count // shape[-1], shape[-1] // 2]))
+                quant.append((name + ".qs", 4 * (count // 64 or 1), "F32", [count // shape[-1], max(shape[-1] // 64, 1)]))
+            elif q == "int8":
+                quant.append((name, count, "I8", list(shape)))
+                quant.append((name + ".qs", 4 * shape[0], "F32", [shape[0]]))
+        add("model.embed_tokens.weight", 256, 64)
+        add("model.norm.weight", 64)
+        add("lm_head.weight", 256, 64, q="int8")
+        for i in range(8):
+            p = f"model.layers.{i}."
+            kv = 64 if i != 5 else 32
+            for name in ("input_layernorm", "post_attention_layernorm"):
+                add(p + name + ".weight", 64)
+            for name, rows in (("q_proj", 64), ("k_proj", kv), ("v_proj", kv), ("r_proj", 32), ("o_proj", 64)):
+                add(p + "self_attn." + name + ".weight", rows, 64, q="int4")
+            add(p + "self_attn.q_norm.weight", 16)
+            add(p + "self_attn.k_norm.weight", 16)
+            add(p + "self_attn.rel_logits_proj.proj", 8, 8)
+            for name, width in (("self_attn.k_sconv", kv), ("self_attn.v_sconv", kv), ("attn_sconv", 64), ("mlp_sconv", 64)):
+                add(p + name + ".conv1d.weight", width, 1, 4)
+            if i < 2:
+                add(p + "mlp.gate_proj.weight", 96, 64, q="int4")
+                add(p + "mlp.up_proj.weight", 96, 64, q="int4")
+                add(p + "mlp.down_proj.weight", 64, 96, q="int8")
+                add(p + "mlp.global_scale", 1)
+            else:
+                add(p + "mlp.gate.weight", 10, 64)
+                add(p + "mlp.gate.e_score_correction_bias", 8)
+                add(p + "mlp.gate.global_scale", 1)
+                add(p + "mlp.shared_experts.gate_proj", 2, 32, 64, q="int4")
+                add(p + "mlp.shared_experts.up_proj", 2, 32, 64, q="int4")
+                add(p + "mlp.shared_experts.down_proj", 2, 64, 32)
+                add(p + "mlp.experts.gate_up_proj", 8, 64, 64)
+                add(p + "mlp.experts.down_proj", 8, 64, 32)
+        write_shard(self.model / "model.safetensors", main)
+        if container:
+            (self.model / "dense-int4g64").mkdir()
+            write_shard(self.model / "dense-int4g64" / "dense.safetensors", quant)
+        return analyze_model(self.model)
+
+    def write_mimo(self):
+        """tools/make_mimo_tiny.py's geometry: 6 layers (full attention at 0 and 3, sliding
+        windows of 8 elsewhere, the dense layer 0), the release's FP8 and BF16 forms, the
+        MXFP4 experts and the vision tower."""
+        c = {"architectures": ["MiMoV2ForCausalLM"], "model_type": "mimo_v2", "vocab_size": 320,
+             "hidden_size": 256, "intermediate_size": 256, "num_hidden_layers": 6,
+             "hybrid_layer_pattern": [0, 1, 1, 0, 1, 1], "moe_layer_freq": [0, 1, 1, 1, 1, 1],
+             "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 48, "v_head_dim": 32,
+             "swa_num_attention_heads": 4, "swa_num_key_value_heads": 4, "swa_head_dim": 48,
+             "swa_v_head_dim": 32, "sliding_window": 8, "add_full_attention_sink_bias": False,
+             "add_swa_attention_sink_bias": True, "attention_value_scale": 0.707,
+             "partial_rotary_factor": 0.334, "rope_theta": 10000000.0, "swa_rope_theta": 10000.0,
+             "n_routed_experts": 16, "num_experts_per_tok": 4, "moe_intermediate_size": 64,
+             "layernorm_epsilon": 1e-06, "max_position_embeddings": 256, "image_token_id": 300,
+             "quantization_config": {"quant_method": "fp8", "store_dtype": "mxfp4", "mxfp4_block_size": 32,
+                                     "weight_block_size": [128, 128]},
+             "vision_config": {"depth": 6, "hidden_size": 64, "intermediate_size": 96, "num_heads": 4,
+                               "num_key_value_heads": 2, "qk_channels": 16, "out_hidden_size": 256,
+                               "patch_size": 16, "spatial_patch_size": 16, "temporal_patch_size": 2,
+                               "spatial_merge_size": 2, "in_chans": 3}}
+        (self.model / "config.json").write_text(json.dumps(c))
+        width = {"BF16": 2, "F32": 4, "F8_E4M3": 1, "U8": 1}
+        tensors = []
+
+        def add(name, dtype, *shape):
+            count = 1
+            for n in shape:
+                count *= n
+            tensors.append((name, count * width[dtype], dtype, list(shape)))
+
+        def fp8(name, rows, cols):
+            add(name + ".weight", "F8_E4M3", rows, cols)
+            add(name + ".weight_scale_inv", "F32", -(-rows // 128), -(-cols // 128))
+        add("model.embed_tokens.weight", "BF16", 320, 256)
+        add("lm_head.weight", "BF16", 320, 256)
+        add("model.norm.weight", "BF16", 256)
+        for i in range(6):
+            p, swa = f"model.layers.{i}.", c["hybrid_layer_pattern"][i]
+            add(p + "input_layernorm.weight", "BF16", 256)
+            add(p + "post_attention_layernorm.weight", "BF16", 256)
+            fp8(p + "self_attn.qkv_proj", 352 if swa else 224, 256)
+            add(p + "self_attn.o_proj.weight", "BF16", 256, 128)
+            if swa:
+                add(p + "self_attn.attention_sink_bias", "BF16", 4)
+            if i == 0:
+                for name, rows, cols in (("gate_proj", 256, 256), ("up_proj", 256, 256), ("down_proj", 256, 256)):
+                    fp8(p + "mlp." + name, rows, cols)
+                continue
+            add(p + "mlp.gate.weight", "BF16", 16, 256)
+            add(p + "mlp.gate.e_score_correction_bias", "F32", 16)
+            for e in range(16):
+                for name, rows, cols in (("gate_proj", 64, 128), ("up_proj", 64, 128), ("down_proj", 256, 32)):
+                    add(p + f"mlp.experts.{e}.{name}.weight", "U8", rows, cols)
+                    add(p + f"mlp.experts.{e}.{name}.weight_scale", "U8", rows, cols // 16)
+        add("visual.patch_embed.proj.weight", "BF16", 64, 3, 2, 16, 16)
+        for b in range(6):
+            p = f"visual.blocks.{b}."
+            for name, rows, cols in (("attn.qkv", 128, 64), ("attn.proj", 64, 64), ("mlp.gate_proj", 96, 64),
+                                     ("mlp.up_proj", 96, 64), ("mlp.down_proj", 64, 96)):
+                add(p + name + ".weight", "BF16", rows, cols)
+                add(p + name + ".bias", "BF16", rows)
+            add(p + "norm1.weight", "BF16", 64)
+            add(p + "norm2.weight", "BF16", 64)
+        add("visual.merger.ln_q.weight", "BF16", 64)
+        add("visual.merger.mlp.0.weight", "BF16", 256, 256)
+        add("visual.merger.mlp.2.weight", "BF16", 256, 256)
+        write_shard(self.model / "model.safetensors", tensors)
+        return analyze_model(self.model)
+
+    def test_inkling_layout_is_the_engines(self):
+        # "[VK] inkling chain fit: ... fixed X B (the engine's 1566464 B, ...), tail 64256 B,
+        # layers 164736 164736 143744 ..." on tiny_inkling (f32), and with the dense-int4g64
+        # container (tiny_inkling_q): its int4-g64 and int8 forms; lm_head's int8 rows carry
+        # one scale a row of the padded vocabulary, a geometry inkling.c does not take, so
+        # the head stays f32 there
+        from resource_plan import vk_chain_fit, vk_fit_pools
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"}
+        lavapipe = {"type": "cpu", "budget_bytes": 64 * GB}
+        for container, layers in ((False, [164736, 164736, 143744, 143744, 143744, 123776, 143744, 143744]),
+                                  (True, [39296, 39296, 50560, 50560, 50560, 44928, 50560, 50560])):
+            with self.subTest(container=container):
+                self.tearDown(); self.setUp()
+                info = self.write_inkling(container)
+                fit = vk_chain_fit(info, "inkling", on, lavapipe)
+                self.assertEqual(fit["layers"], layers)
+                self.assertEqual(fit["fixed"] - vk_fit_pools(0), 1566464)
+                self.assertEqual((fit["n"], fit["tail"]), (8, True))
+                small = vk_chain_fit(info, "inkling", dict(on, COLI_VK_CHAIN_ROWS="3"), lavapipe)
+                self.assertLess(small["fixed"], fit["fixed"])
+                self.assertEqual(small["layers"], layers)
+        # a dtype the shaders do not take: no layout, the plan as before
+        self.tearDown(); self.setUp()
+        info = self.write_inkling()
+        info["dense_tensors"] = [dict(t, dtype="F8_E4M3") if t["name"].endswith("q_proj.weight") else t
+                                 for t in info["dense_tensors"]]
+        self.assertIsNone(vk_chain_fit(info, "inkling", on, lavapipe))
+
+    def test_mimo_layout_is_the_engines(self):
+        # the "[VK] mimo chain fit:" lines of mimo_tiny on Lavapipe, per MIMO_DENSE_BITS, and
+        # with the vision tower on the per-matrix path (COLI_VK_DENSE=1: the tail)
+        from resource_plan import vk_chain_fit, vk_fit_pools
+        info = self.write_mimo()
+        lavapipe = {"type": "cpu", "budget_bytes": 64 * GB}
+        cases = (("32", [1445120, 668176, 668176, 657920, 668176, 668176], 327936, None),
+                 ("0", [527360, 213264, 213264, 324608, 213264, 213264], 164096, 999936),
+                 ("8", [491008, 179216, 179216, 291328, 179216, 179216], 83200, 919040))
+        for bits, layers, tail, tower in cases:
+            with self.subTest(bits=bits):
+                env = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "MIMO_DENSE_BITS": bits}
+                fit = vk_chain_fit(info, "mimo", env, lavapipe)
+                self.assertEqual(fit["layers"], layers)
+                self.assertEqual(fit["fixed"] - vk_fit_pools(0), 929792)
+                self.assertEqual(fit["n"], 6)
+                layout = __import__("resource_plan")._VK_CHAIN_LAYOUT["mimo"](info, env, lavapipe)
+                self.assertEqual(layout.tail, tail)
+                if tower:
+                    dense = __import__("resource_plan")._VK_CHAIN_LAYOUT["mimo"](info, dict(env, COLI_VK_DENSE="1"), lavapipe)
+                    self.assertEqual(dense.tail, tower)
+        # COLI_VK_KV_DEVICE_ROWS shrinks the full layers' mirrors (0 and 3), not the rings
+        env = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "MIMO_DENSE_BITS": "32"}
+        fewer = vk_chain_fit(info, "mimo", dict(env, COLI_VK_KV_DEVICE_ROWS="16"), lavapipe)["layers"]
+        full = vk_chain_fit(info, "mimo", env, lavapipe)["layers"]
+        self.assertEqual([a < b for a, b in zip(fewer, full)], [True, False, False, True, False, False])
+
+    def test_mimo_credits_the_layers_on_the_device(self):
+        from resource_plan import vk_chain_fit
+        info = self.write_mimo()
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "COLI_VK_DENSE_HOST": "0", "COLI_VK_TIER_RESERVE_GB": "0"}
+        dgpu = {"type": "discrete", "budget_bytes": 64 * GB}
+
+        def droppable(k, head):   # mimo's dho pass: qkv, o_proj, the dense MLP, the head
+            total = 0
+            for t in info["dense_tensors"]:
+                name, shape = t["name"], t["shape"]
+                if len(shape) != 2 or name.endswith(("_scale_inv", ".bias")) or ".gate." in name:
+                    continue
+                if name == "lm_head.weight":
+                    total += min(t["resident"], shape[0] * shape[1]) if head else 0
+                elif name.startswith("model.layers.") and int(name.split(".")[2]) < k:
+                    total += min(t["resident"], shape[0] * shape[1])
+            return total
+        full = build_plan(self.model, env=on, vulkan=dgpu, **kwargs)["tiers"]["ram"]
+        self.assertEqual(full["vk_chain_layers"]["on_device"], 6)
+        self.assertEqual(full["dense_on_device_bytes"], droppable(6, True))
+        fit = vk_chain_fit(info, "mimo", on, dgpu)
+        for k in (1, 3, 5):
+            with self.subTest(k=k):
+                free = fit["fixed"] + sum(fit["layers"][:k]) + fit["layers"][k] // 2
+                ram = build_plan(self.model, env=on, vulkan={"type": "discrete", "budget_bytes": free}, **kwargs)["tiers"]["ram"]
+                self.assertEqual(ram["vk_chain_layers"]["on_device"], k)
+                self.assertEqual(ram["dense_on_device_bytes"], droppable(k, False))
+                forced = build_plan(self.model, env=dict(on, COLI_VK_CHAIN_LAYERS=str(k)), vulkan=dgpu, **kwargs)
+                self.assertEqual(forced["tiers"]["ram"]["dense_on_device_bytes"], droppable(k, False))
+        none = build_plan(self.model, env=dict(on, COLI_VK_CHAIN_LAYERS="0"), vulkan=dgpu, **kwargs)["tiers"]["ram"]
+        self.assertEqual(none["dense_on_device_bytes"], 0)
 
 
 class PhysicalCpuCountTest(unittest.TestCase):

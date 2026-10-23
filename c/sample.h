@@ -175,6 +175,130 @@ static void stops_arm_tok(const Cfg *c, int tok_eos, Tok *T){
 }
 static void stops_arm(const Cfg *c, int tok_eos){ stops_arm_tok(c, tok_eos, NULL); }
 
+/* ---- classified log-prob row reduction ----------------------------------- */
+/* These three are `static inline` rather than plain `static`: they are a
+ * header-only facility that different engine modes pull in as they need it,
+ * and a translation unit that includes this header without calling all of
+ * them should not have to explain itself to -Wunused-function.
+ *
+ * The plain logprob_target() below answers "what is the log-probability of this
+ * token", which is all a sampling loop needs.  Evidence-producing modes need a
+ * second answer as well: whether the logit row was numerically sound at all, so
+ * that a run can refuse a position instead of writing a NaN into an artifact a
+ * reader cannot distinguish from a real value.  The row reduction and the
+ * per-target subtraction are kept separately reusable because a caller often
+ * reduces a row once and then reads several targets out of it.  The
+ * per-target subtraction promotes the float logit to double before
+ * subtracting the row's own double logZ, so its value carries the double
+ * arithmetic's own rounding (a few ulp); logprob_target() below still takes the float-scale subtraction
+ * the sampling path has always used, so the two need not agree past a
+ * float's own precision on a widely spread row. */
+typedef enum {
+    LOGPROB_FINITE=0,          /* row reduced normally; the value is usable */
+    LOGPROB_NAN,               /* at least one logit was NaN */
+    LOGPROB_POS_INF,           /* at least one logit was +infinity */
+    LOGPROB_NEG_INF,           /* at least one logit was -infinity */
+    LOGPROB_ALL_NONFINITE,     /* no logit in the row was finite */
+    LOGPROB_FINITE_OVERFLOW,   /* every logit was finite, the reduction was not */
+    LOGPROB_INVALID,           /* no row was supplied, or it had no entries */
+} LogprobStatus;
+
+static inline const char *logprob_status_name(LogprobStatus status){
+    switch(status){
+    case LOGPROB_FINITE: return "FINITE";
+    case LOGPROB_NAN: return "NAN";
+    case LOGPROB_POS_INF: return "POS_INF";
+    case LOGPROB_NEG_INF: return "NEG_INF";
+    case LOGPROB_ALL_NONFINITE: return "ALL_NONFINITE";
+    case LOGPROB_FINITE_OVERFLOW: return "FINITE_OVERFLOW";
+    default: return "INVALID";
+    }
+}
+
+typedef struct {
+    float max;                 /* largest logit in the row */
+    double logse;              /* log of the shifted exponential sum */
+    double logZ;               /* max + logse: the row's log partition function */
+    int argmax;                /* index of the largest logit */
+    LogprobStatus status;
+} LogprobRow;
+
+/* Reduce one logit row, reporting why it failed rather than only that it did.
+ * No partition function is computed for a row that is not entirely finite.
+ *
+ * The classification is a fixed precedence, not the order the values appear in.
+ * A row with no finite entry at all is ALL_NONFINITE whatever it contains,
+ * because the shape of such a row, not one value in it, is what a reader needs.
+ * Otherwise a NaN outranks an infinity, and a positive infinity outranks a
+ * negative one: a NaN cannot arise from saturation, so it points at a different
+ * defect, and a positive infinity is what actually destroys the reduction. */
+static inline LogprobStatus logprob_row_checked(const float *lo, int V,
+                                                LogprobRow *out){
+    LogprobRow r={0,0,0,0,LOGPROB_INVALID};
+    if(!lo || V<=0){ if(out) *out=r; return r.status; }
+    int finite_count=0, saw_nan=0, saw_pos_inf=0, saw_neg_inf=0;
+    for(int i=0;i<V;i++){
+        if(isfinite(lo[i])) finite_count++;
+        else if(isnan(lo[i])) saw_nan=1;
+        else if(lo[i]>0) saw_pos_inf=1;
+        else saw_neg_inf=1;
+    }
+    if(finite_count!=V){
+        r.status=finite_count==0 ? LOGPROB_ALL_NONFINITE :
+                 saw_nan ? LOGPROB_NAN :
+                 saw_pos_inf ? LOGPROB_POS_INF :
+                 saw_neg_inf ? LOGPROB_NEG_INF : LOGPROB_INVALID;
+        if(out) *out=r;
+        return r.status;
+    }
+    r.max=lo[0]; r.argmax=0;
+    for(int i=1;i<V;i++) if(lo[i]>r.max){ r.max=lo[i]; r.argmax=i; }
+    double se=0;
+    for(int i=0;i<V;i++){
+        double term=exp((double)lo[i]-(double)r.max);
+        if(!isfinite(term) || !isfinite(se+term)){
+            r.status=LOGPROB_FINITE_OVERFLOW;
+            if(out) *out=r;
+            return r.status;
+        }
+        se+=term;
+    }
+    r.logse=log(se);
+    r.logZ=(double)r.max+r.logse;
+    r.status=(isfinite(r.logse) && isfinite(r.logZ)) ?
+        LOGPROB_FINITE : LOGPROB_FINITE_OVERFLOW;
+    if(out) *out=r;
+    return r.status;
+}
+
+/* Read one target out of an already reduced row.  A row that did not reduce
+ * cleanly propagates its own status, so a caller can report the original
+ * cause rather than a generic failure.
+ *
+ * Every return path writes *out, and only LOGPROB_FINITE leaves a usable value
+ * there.  A missing row, a missing logit vector or a negative target is
+ * INVALID rather than a propagated row status: those are caller mistakes, not
+ * properties of the data, and returning FINITE for them would hand the caller
+ * an uninitialised number that looks like a measurement.  (This function has
+ * no vocabulary size to check a target against from above; the caller is
+ * responsible for bounding it, same as `ablate_logit_record` does.) */
+static inline LogprobStatus logprob_from_row_checked(const float *lo, int target,
+                                                      const LogprobRow *r,
+                                                      double *out){
+    if(out) *out=NAN;
+    if(!lo || !r || target<0) return LOGPROB_INVALID;
+    if(r->status!=LOGPROB_FINITE) return r->status;
+    /* The subtraction is done wholly in double: the float logit is promoted
+     * BEFORE subtracting the row's own double logZ (max+logse).  Taking it in
+     * float first rounds away up to an ulp of the row maximum -- on a logit-
+     * scale row that is about 2e-6, visible in every digit a %.17g consumer
+     * reads past the seventh. */
+    double value=(double)lo[target]-r->logZ;
+    if(!isfinite(value)) return LOGPROB_FINITE_OVERFLOW;
+    if(out) *out=value;
+    return LOGPROB_FINITE;
+}
+
 /* ---- log-prob of a target token given the logit vector ------------------- */
 static double logprob_target(const float *lo, int V, int target, int *am){
     float mx = lo[0]; int best = 0;

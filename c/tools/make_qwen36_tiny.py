@@ -18,6 +18,17 @@ matching what qwen36.c Phase 1 computes. No tokenizer needed.
 Usage:
   python tools/make_qwen36_tiny.py --out ./qwen36_tiny
   python tools/make_qwen36_tiny.py --out ./qwen36_tiny --emit-ref ref_qwen36.json
+
+Geometry presets (--geometry): the structural numbers of a real checkpoint at
+toy widths, so the config-shape guards, the layer pattern, the routing and the
+converter's tensor contract are exercised without a single real weight:
+  qwen36-35b   8 layers (2 attention), 8 experts top-2, GQA 2:1  (default)
+  qwen38-2p4t  92 layers (23 attention), 512 experts top-10, GQA 16:1,
+               DeltaNet value:key heads 8:1, FUSED expert tensors and an
+               mtp.* head, exactly as Qwen/Qwen3.8-2.4T-A95B ships them
+--fused-experts rewrites the saved shard into the per-layer gate_up_proj /
+down_proj layout the real checkpoints use (transformers saves per-expert);
+--mtp adds a one-layer multi-token-prediction head the engine must skip.
 """
 import argparse, json, sys
 from pathlib import Path
@@ -36,7 +47,7 @@ except ImportError as exc:
     sys.exit(f"Missing deps: {exc}. Run: pip install torch transformers")
 
 
-def get_classes():
+def get_classes(dense=False):
     """Resolve the Qwen3-MoE model/config classes across transformers versions.
 
     Uses each model class's declared `config_class` (NOT a name guess): in
@@ -44,7 +55,7 @@ def get_classes():
     same-named `Qwen3_5MoeConfig` is the vision-language wrapper and lacks the
     text fields (vocab_size, head_dim, ...). Guessing by name picks the wrong one.
     """
-    candidates = [
+    candidates = ["Qwen3_5ForCausalLM"] if dense else [
         "Qwen3_5MoeForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextMoeForCausalLM",
@@ -56,7 +67,8 @@ def get_classes():
             cc = getattr(mc, "config_class", None)
             if cc is not None:
                 return mc, cc
-    sys.exit("No Qwen3-MoE model class found in this transformers build. Upgrade transformers.")
+    sys.exit(f"No {'dense Qwen3.5' if dense else 'Qwen3-MoE'} model class found in this "
+             "transformers build. Upgrade transformers.")
 
 
 class Zero(nn.Module):
@@ -68,15 +80,105 @@ class Zero(nn.Module):
         return hidden_states
 
 
+GEOMETRIES = {
+    # the shipped fixture: what CI has gated since #712
+    "qwen36-35b": dict(hidden=64, n_layers=8, q_heads=4, kv_heads=2, head_dim=16,
+                       rope_dim=8, n_experts=8, topk=2, inter=32,
+                       dn_key_heads=4, dn_value_heads=8,
+                       fused_experts=False, mtp=False),
+    # Qwen/Qwen3.8-2.4T-A95B, config.json: 92 layers / full_attention_interval 4
+    # / 512 experts top-10 / 64:4 attention heads / 128:16 DeltaNet heads /
+    # mtp_num_hidden_layers 1 / fused experts. Widths shrunk, ratios kept.
+    "qwen38-2p4t": dict(hidden=32, n_layers=92, q_heads=16, kv_heads=1, head_dim=16,
+                        rope_dim=8, n_experts=512, topk=10, inter=16,
+                        dn_key_heads=2, dn_value_heads=16,
+                        fused_experts=True, mtp=True),
+    # Qwen/Qwen3.8-27B, config.json: Qwen3_5ForConditionalGeneration, a DENSE model of
+    # the same family -- 64 layers / full_attention_interval 4 / 24:4 attention heads /
+    # 16:48 DeltaNet heads / one SwiGLU MLP per layer, no router (#1757).
+    "qwen38-27b-dense": dict(hidden=64, n_layers=8, q_heads=6, kv_heads=1, head_dim=16,
+                             rope_dim=8, n_experts=0, topk=0, inter=128,
+                             dn_key_heads=2, dn_value_heads=6,
+                             fused_experts=False, mtp=False, dense=True),
+    # Qwen/Qwen3-Coder-30B-A3B-Instruct, config.json: Qwen3MoeForCausalLM (qwen3_moe),
+    # 48 attention layers (no DeltaNet), 32:4 heads of 128, 128 experts top-8,
+    # norm_topk_prob, no shared expert, full rotary, rope_theta 1e7, plain RMSNorm.
+    "qwen3-coder-30b": dict(hidden=64, n_layers=6, q_heads=8, kv_heads=1, head_dim=16,
+                            rope_dim=16, n_experts=16, topk=4, inter=32,
+                            fused_experts=False, mtp=False, plain_qwen3=True),
+}
+
+
+def _rewrite_shard(out: Path, n_layers, fused_experts, mtp, hidden, seed):
+    """Post-process the transformers shard into the real checkpoints' layout.
+
+    transformers saves routed experts one tensor per expert and never writes an
+    mtp head. The real 35B and 2.4T checkpoints do the opposite on both counts,
+    and those are the two paths the converter's tensor contract has to be seen
+    handling: splitting the fused tensor, and skipping mtp.* on purpose.
+    """
+    from safetensors.torch import load_file, save_file
+    path = out / "model.safetensors"
+    tens = load_file(str(path))
+    if fused_experts:
+        for i in range(n_layers):
+            pre = f"model.layers.{i}.mlp.experts."
+            gate, up, down = [], [], []
+            e = 0
+            while f"{pre}{e}.gate_proj.weight" in tens:
+                gate.append(tens.pop(f"{pre}{e}.gate_proj.weight"))
+                up.append(tens.pop(f"{pre}{e}.up_proj.weight"))
+                down.append(tens.pop(f"{pre}{e}.down_proj.weight"))
+                e += 1
+            if e == 0:
+                sys.exit(f"layer {i}: no per-expert tensors to fuse")
+            # [E, 2*inter, H] with gate rows first, then up -- the split the
+            # converter performs is gu[:, :inter] / gu[:, inter:]
+            tens[f"{pre}gate_up_proj"] = torch.stack(
+                [torch.cat([g, u], dim=0) for g, u in zip(gate, up)]).contiguous()
+            tens[f"{pre}down_proj"] = torch.stack(down).contiguous()   # [E, H, inter]
+    if mtp:
+        # One MTP layer shaped like the last transformer layer (an attention
+        # layer, since (n_layers-1) % 4 == 3 for every geometry here), plus the
+        # four glue tensors the real checkpoints carry. Random, never read.
+        g = torch.Generator().manual_seed(seed + 1)
+        src = f"model.layers.{n_layers - 1}."
+        for k in list(tens):
+            if k.startswith(src):
+                tens["mtp.layers.0." + k[len(src):]] = torch.randn(
+                    tens[k].shape, generator=g, dtype=torch.float32).to(tens[k].dtype) * 0.02
+        tens["mtp.fc.weight"] = torch.randn((hidden, 2 * hidden), generator=g) * 0.02
+        for k in ("mtp.norm.weight", "mtp.pre_fc_norm_embedding.weight",
+                  "mtp.pre_fc_norm_hidden.weight"):
+            tens[k] = torch.ones(hidden)
+        cfg_path = out / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["mtp_num_hidden_layers"] = 1
+        cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    save_file(tens, str(path), metadata={"format": "pt"})
+    print(f"shard rewritten: fused_experts={fused_experts} mtp={mtp} ({len(tens)} tensors)")
+
+
 def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
           head_dim=16, rope_dim=8, n_experts=8, topk=2, inter=32,
           vocab=320, max_new=16, prompt_ids=None, emit_ref=None,
-          ref_mode="attention_only", seed=20260817):
+          ref_mode="attention_only", seed=20260817,
+          dn_key_heads=None, dn_value_heads=None,
+          fused_experts=False, mtp=False, dense=False, plain_qwen3=False):
+    if dn_key_heads is None:
+        dn_key_heads = q_heads
+    if dn_value_heads is None:
+        dn_value_heads = q_heads * 2
     # Fixed by default: an unseeded draw makes the gate flaky. Measured --
     # three local draws passed, one CI draw failed at 11/16, with identical
     # code. A gate that reddens at random gets muted within a week.
     torch.manual_seed(seed)
-    ModelCls, ConfigCls = get_classes()
+    if plain_qwen3:
+        model = _plain_qwen3(hidden, n_layers, q_heads, kv_heads, head_dim, n_experts,
+                             topk, inter, vocab)
+        return _save_and_reference(model, out, n_layers, max_new, prompt_ids, emit_ref,
+                                   "full", fused_experts, mtp, hidden, seed, "qwen3_moe_tiny")
+    ModelCls, ConfigCls = get_classes(dense)
     layer_types = ["full_attention" if i % 4 == 3 else "linear_attention"
                    for i in range(n_layers)]
     base = dict(
@@ -88,11 +190,17 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
         rms_norm_eps=1e-6, rope_theta=10000.0, tie_word_embeddings=False,
         head_dim=head_dim, linear_conv_kernel_dim=4,
         linear_key_head_dim=8, linear_value_head_dim=8,
-        linear_num_key_heads=q_heads, linear_num_value_heads=q_heads * 2,
+        linear_num_key_heads=dn_key_heads, linear_num_value_heads=dn_value_heads,
         layer_types=layer_types, hidden_act="silu",
         attention_bias=False, attention_dropout=0.0, use_cache=True,
         rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
     )
+    if dense:
+        # the dense text config has no router: one MLP of intermediate_size per layer
+        for key in ("num_experts", "num_experts_per_tok", "moe_intermediate_size",
+                    "shared_expert_intermediate_size"):
+            base.pop(key)
+        base["intermediate_size"] = inter
     # Qwen3_5MoeConfig uses **kwargs, so pass everything; fall back to filtered
     # only if a build rejects an unknown key.
     try:
@@ -112,6 +220,46 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
                 pass
 
     model = ModelCls(cfg)
+    return _save_and_reference(model, out, n_layers, max_new, prompt_ids, emit_ref,
+                               ref_mode, fused_experts, mtp, hidden, seed, "qwen36_tiny")
+
+
+def _plain_qwen3(hidden, n_layers, q_heads, kv_heads, head_dim, n_experts, topk, inter,
+                 vocab):
+    """Qwen3-MoE as transformers ships it (Qwen3MoeForCausalLM). The RMSNorm weights
+    are drawn around 1 instead of left at 1, so a container that applied them as
+    zero-centered (1 + w), the Qwen3.5/3.6 convention, could not pass."""
+    import transformers
+    ModelCls = getattr(transformers, "Qwen3MoeForCausalLM", None)
+    if ModelCls is None:
+        sys.exit("this transformers build has no Qwen3MoeForCausalLM")
+    ConfigCls = ModelCls.config_class
+    base = dict(
+        vocab_size=vocab, hidden_size=hidden, intermediate_size=hidden * 2,
+        num_hidden_layers=n_layers, num_attention_heads=q_heads,
+        num_key_value_heads=kv_heads, head_dim=head_dim, num_experts=n_experts,
+        num_experts_per_tok=topk, moe_intermediate_size=inter, norm_topk_prob=True,
+        decoder_sparse_step=1, mlp_only_layers=[], max_position_embeddings=512,
+        rms_norm_eps=1e-6, rope_theta=10000000.0, tie_word_embeddings=False,
+        attention_bias=False, use_sliding_window=False, hidden_act="silu",
+        rope_parameters={"rope_type": "default", "rope_theta": 10000000.0},
+        pad_token_id=0, bos_token_id=1, eos_token_id=vocab - 1)
+    try:
+        cfg = ConfigCls(**base)
+    except TypeError:
+        import inspect
+        allowed = set(inspect.signature(ConfigCls.__init__).parameters) - {"self"}
+        cfg = ConfigCls(**{k: v for k, v in base.items() if k in allowed})
+    model = ModelCls(cfg)
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name.endswith("norm.weight"):
+                param.copy_(1.0 + 0.2 * torch.randn_like(param))
+    return model
+
+
+def _save_and_reference(model, out, n_layers, max_new, prompt_ids, emit_ref, ref_mode,
+                        fused_experts, mtp, hidden, seed, label):
     model.eval()
     out.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(out))
@@ -128,7 +276,7 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
         # script encodes a text prompt through AutoTokenizer.from_pretrained(),
         # and this fixture is synthetic: it has weights and no tokenizer. The
         # oracle script stays the tool for real checkpoints.
-        if ref_mode == "attention_only":
+        if ref_mode == "attention_only" and label == "qwen36_tiny":
             replaced = 0
             for i in range(n_layers):
                 if i % 4 != 3:
@@ -146,11 +294,15 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
                                      use_cache=True)
         full = out_ids[0].tolist()
         payload = {"prompt_ids": prompt_ids, "full_ids": full,
-                   "mode": ref_mode, "model": "qwen36_tiny"}
+                   "mode": ref_mode, "model": label}
         Path(emit_ref).write_text(json.dumps(payload, indent=2))
         print(f"ref.json -> {emit_ref}")
         print(f"  prompt_ids={prompt_ids}")
         print(f"  full_ids ={full}")
+    if fused_experts or mtp:
+        # after the reference: generate() ran on the in-memory model, the
+        # rewrite only changes what is on disk
+        _rewrite_shard(out, n_layers, fused_experts, mtp, hidden, seed)
 
 
 def main():
@@ -168,7 +320,32 @@ def main():
     ap.add_argument("--max-new", type=int, default=16)
     ap.add_argument("--prompt-ids", default=None,
                     help="Comma-separated token ids for the prompt (default 1,2,3,4,5)")
+    ap.add_argument("--geometry", choices=sorted(GEOMETRIES), default="qwen36-35b",
+                    help="structural numbers of a real checkpoint at toy widths")
+    # --hidden/--inter override the preset's toy widths (qwen36-35b: 64/32). The
+    # shared expert kernel (expert_ffn.h) needs hidden and inter multiples of
+    # 64: --inter 64 exercises it (the CI's A/B step does exactly that).
+    # --vocab 128: every id is an ASCII byte of the byte tokenizer tests/prefix_serve_harness.py
+    # gives a fixture without one, so a serve test can resend a reply as text and the
+    # engine reads back the very ids it generated (tests/spec_drafts_harness.py)
+    for name in ("layers", "experts", "topk", "q-heads", "kv-heads", "hidden", "inter",
+                 "dn-key-heads", "dn-value-heads", "vocab"):
+        ap.add_argument(f"--{name}", type=int, default=None,
+                        help=f"override the preset's {name.replace('-', '_')}")
+    ap.add_argument("--fused-experts", action="store_true", default=None,
+                    help="save experts as per-layer gate_up_proj/down_proj (real layout)")
+    ap.add_argument("--mtp", action="store_true", default=None,
+                    help="add a one-layer mtp.* head and mtp_num_hidden_layers=1")
     args = ap.parse_args()
+    geo = dict(GEOMETRIES[args.geometry])
+    for arg, key in (("layers", "n_layers"), ("experts", "n_experts"), ("topk", "topk"),
+                     ("q_heads", "q_heads"), ("kv_heads", "kv_heads"), ("hidden", "hidden"),
+                     ("inter", "inter"), ("dn_key_heads", "dn_key_heads"),
+                     ("dn_value_heads", "dn_value_heads"), ("vocab", "vocab"), ("fused_experts", "fused_experts"),
+                     ("mtp", "mtp")):
+        if getattr(args, arg) is not None:
+            geo[key] = getattr(args, arg)
+    print(f"geometry {args.geometry}: " + ", ".join(f"{k}={v}" for k, v in geo.items()))
 
     prompt_ids = None
     if args.prompt_ids:
@@ -176,7 +353,7 @@ def main():
     emit = args.emit_ref if args.emit_ref else None
 
     build(Path(args.out), max_new=args.max_new, prompt_ids=prompt_ids, emit_ref=emit,
-          ref_mode=args.ref_mode, seed=args.seed)
+          ref_mode=args.ref_mode, seed=args.seed, **geo)
 
 
 if __name__ == "__main__":

@@ -99,8 +99,21 @@ class OlmoeDashboardHitsTest(unittest.TestCase):
         prof = self.line("PROF")
         self.assertEqual(len(prof), 10)
         self.assertEqual(int(prof[3]), MAXTOK, "completion tokens")
-        self.assertEqual(int(prof[9]), MAXTOK + 1,
-                         "prefill plus one forward per token: this engine steps the last one too")
+        # #1449: forwards is now counted, not derived. Serve mode steps the
+        # prompt once and then one step per token except the last (nothing
+        # reads past the reply), so a max_tok-limited turn is MAXTOK forwards.
+        self.assertEqual(int(prof[9]), MAXTOK, "prefill call plus one step per token but the last")
+
+    def test_prof_phases_are_measured(self):
+        """#1449: disk, matmul, attention and lm_head were literal zeros. They
+        are per-turn measurements now; on a tiny fixture the head can round to
+        0.000, the MoE and attention cannot both."""
+        prof = [float(x) for x in self.line("PROF")[1:9]]
+        wall, disk, wait, matmul, attention, head = prof[0], prof[3], prof[4], prof[5], prof[6], prof[7]
+        self.assertEqual(wait, 0.0)
+        self.assertGreaterEqual(min(disk, matmul, attention, head), 0.0)
+        self.assertGreater(matmul + attention, 0.0)
+        self.assertLessEqual(matmul + attention + head, wall * 1.05 + 0.05)
 
 
 if __name__ == "__main__":

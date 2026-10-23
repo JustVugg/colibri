@@ -1,0 +1,119 @@
+#version 450
+// Inkling's attention core (vk_chain.c, vkc_relattn): grouped-query attention of S query
+// rows with a learned relative-position bias, a log-length scale and an optional sliding
+// window, over a K/V cache on the device kept as a ring of `cap` rows per KV head
+// (position t at row t % cap; a global layer's cap is the whole context, so t itself).
+// One workgroup per (head h = WorkGroupID.x, row s = WorkGroupID.y), qpos = pos_base + s:
+//   the positions t0 .. qpos, t0 = window > 0 ? max(0, qpos - window + 1) : 0;
+//   score_t = tau[s] * (q . k_t * scale + (d < ext ? bias(d) : 0)),   d = qpos - t,
+//   bias(d) = sum_j r[s][h][j] * relp[j][d]   (j < d_rel in order: attention()'s rl[])
+//   ctx     = sum_t softmax(score)_t v_t.
+// Rows of positions inside this step (t >= pos_base) come from the step's own K/V rows
+// (kvs: k at ks_off, v at vs_off, kv_row floats a row), the earlier ones from the ring,
+// as inkling.c's attention() reads them: the step's rows go into the ring after this
+// dispatch, so a step that wraps the ring never overwrites a row an earlier query of
+// the same step still reads. tau comes from the host (the CPU's double log, one per row).
+// The softmax runs online over tiles of 128 positions, as chain_attn.comp's does; the
+// CPU normalizes first, so the two agree to rounding.
+// Limits: hd <= 256 (two dims per thread), d_rel <= 64.
+// s0 (the last push constant, 0 for a whole step): the step's row of this dispatch's
+// first row, when vk_chain.c cuts a prompt chunk's rows over several submissions; q, o,
+// r and tau's offsets then point at that row, pos_base stays the step's first position.
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer QB { float q[]; };
+layout(std430, binding = 1) readonly buffer KB { float kc[]; };
+layout(std430, binding = 2) readonly buffer VB { float vc[]; };
+layout(std430, binding = 3) writeonly buffer OB { float o[]; };
+layout(std430, binding = 4) readonly buffer SB { float kvs[]; };
+layout(std430, binding = 5) readonly buffer RB { float r[]; };
+layout(std430, binding = 6) readonly buffer PB { float relp[]; };
+layout(std430, binding = 7) readonly buffer TB { float tau[]; };
+
+layout(push_constant) uniform P {
+    int S, H, KVH, hd, pos_base, cap, window, ext, d_rel;
+    int q_off, q_row, o_off, o_row;
+    int k_off, v_off, ks_off, vs_off, kv_row;
+    int r_off, r_row, relp_off, tau_off;
+    float scale;
+    int s0;
+} p;
+
+shared float qs[256];
+shared float rs[64];
+shared float pe[128];
+shared int   pt[128];
+shared float red[128];
+
+void main() {
+    int h = int(gl_WorkGroupID.x), s = int(gl_WorkGroupID.y);
+    int tid = int(gl_LocalInvocationID.x);
+    int kvh = h / (p.H / p.KVH);
+    int qb = p.q_off + s * p.q_row + h * p.hd;
+    for (int d = tid; d < p.hd; d += 128) qs[d] = q[qb + d];
+    for (int j = tid; j < p.d_rel; j += 128) rs[j] = r[p.r_off + s * p.r_row + h * p.d_rel + j];
+    int qpos = p.pos_base + p.s0 + s;
+    int t0 = p.window > 0 ? max(0, qpos - p.window + 1) : 0;
+    int n = qpos - t0 + 1;
+    float ts = tau[p.tau_off + s];
+    barrier();
+    float m = -3.0e38, l = 0.0, acc0 = 0.0, acc1 = 0.0;
+    for (int b0 = 0; b0 < n; b0 += 128) {
+        int i = b0 + tid;
+        float sv = -3.0e38;
+        if (i < n) {
+            int t = t0 + i;
+            pt[tid] = t;
+            int kb = t < p.pos_base ? p.k_off + (kvh * p.cap + t % p.cap) * p.hd
+                                    : p.ks_off + (t - p.pos_base) * p.kv_row + kvh * p.hd;
+            float a = 0.0;
+            if (t < p.pos_base) for (int d = 0; d < p.hd; d++) a += qs[d] * kc[kb + d];
+            else                for (int d = 0; d < p.hd; d++) a += qs[d] * kvs[kb + d];
+            int dist = qpos - t;
+            float bias = 0.0;
+            if (dist < p.ext)
+                for (int j = 0; j < p.d_rel; j++) bias += rs[j] * relp[p.relp_off + j * p.ext + dist];
+            sv = ts * (a * p.scale + bias);
+        }
+        red[tid] = sv;
+        barrier();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (tid < off) red[tid] = max(red[tid], red[tid + off]);
+            barrier();
+        }
+        float mn = max(m, red[0]);
+        barrier();
+        float e = i < n ? exp(sv - mn) : 0.0;
+        pe[tid] = e;
+        red[tid] = e;
+        barrier();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (tid < off) red[tid] += red[tid + off];
+            barrier();
+        }
+        float corr = exp(m - mn);
+        l = l * corr + red[0];
+        acc0 *= corr; acc1 *= corr;
+        int cnt = min(128, n - b0);
+        int d0 = tid, d1 = tid + 128;
+        for (int j = 0; j < cnt; j++) {
+            int t = pt[j];
+            float w = pe[j];
+            if (t < p.pos_base) {
+                int vb = p.v_off + (kvh * p.cap + t % p.cap) * p.hd;
+                if (d0 < p.hd) acc0 += w * vc[vb + d0];
+                if (d1 < p.hd) acc1 += w * vc[vb + d1];
+            } else {
+                int vb = p.vs_off + (t - p.pos_base) * p.kv_row + kvh * p.hd;
+                if (d0 < p.hd) acc0 += w * kvs[vb + d0];
+                if (d1 < p.hd) acc1 += w * kvs[vb + d1];
+            }
+        }
+        m = mn;
+        barrier();
+    }
+    float inv = l > 0.0 ? 1.0 / l : 0.0;
+    int ob = p.o_off + s * p.o_row + h * p.hd;
+    if (tid < p.hd) o[ob + tid] = acc0 * inv;
+    if (tid + 128 < p.hd) o[ob + tid + 128] = acc1 * inv;
+}

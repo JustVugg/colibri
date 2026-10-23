@@ -64,6 +64,10 @@ int dsv4_cuda_fp8_ref_matmul(int device,const uint8_t *w,const float *bscale,
 int dsv4_cuda_backend_arch_ok(int device);
 const char *dsv4_cuda_backend_name(void);
 long long dsv4_cuda_mem_free_mb(int device);
+/* 1 on unified-memory devices (integrated GPU, or pageable access through the
+ * host page tables), where mem_free_mb is the system's free memory rather
+ * than headroom on a card. 0 when unknown. */
+int dsv4_cuda_device_unified(int device);
 /* Drain the device's expert stream (hybrid split: async fill DMA is enqueued,
  * the CPU subset computes meanwhile, this closes the pipeline). Returns 1 on
  * success, 0 when the backend is unavailable. */

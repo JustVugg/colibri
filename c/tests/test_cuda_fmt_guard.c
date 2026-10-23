@@ -36,21 +36,27 @@ static int fails = 0;
 #define CHECK(c) do{ if(!(c)){ printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } }while(0)
 
 int main(void) {
-    /* Decodable by weight_at's explicit branches. */
+    /* Decodable by weight_at's explicit branches. fmt=8 (fp8-e4m3-b128) joined
+     * this set when the absorb path gained its block-scale decode (weight_at's
+     * fmt==8 branch + absorb_scale's per-128x128-block branch); its decode
+     * additionally needs the e4m3 LUT live on the device, which is an
+     * UPLOAD-time gate (coli_cuda_tensor_upload refuses fmt=8 until
+     * coli_cuda_fp8_set_lut has run), deliberately not part of this truth
+     * table -- see the predicate's own caveat note in backend_cuda.h. */
     CHECK(coli_cuda_weight_at_supported(0));   /* f32           */
     CHECK(coli_cuda_weight_at_supported(1));   /* int8-row      */
     CHECK(coli_cuda_weight_at_supported(2));   /* int4 nibbles  */
     CHECK(coli_cuda_weight_at_supported(3));   /* int2          */
     CHECK(coli_cuda_weight_at_supported(4));   /* grouped int4  */
+    CHECK(coli_cuda_weight_at_supported(8));   /* fp8-e4m3-b128 */
 
     /* NOT decodable. Each of these has a real in-tree meaning, and each used to
      * be read as int2 by the fall-through. fmt=5 and fmt=6 are the ones that
-     * could already reach a CUDA tensor; fmt=8 is the one this branch is about;
-     * fmt=7 (MXFP4) has its own quant_matmul branch and never routes here. */
+     * could already reach a CUDA tensor; fmt=7 (MXFP4) has its own quant_matmul
+     * branch and never routes here. */
     CHECK(!coli_cuda_weight_at_supported(5));  /* int3-g64      */
     CHECK(!coli_cuda_weight_at_supported(6));  /* E8/IQ3        */
     CHECK(!coli_cuda_weight_at_supported(7));  /* MXFP4         */
-    CHECK(!coli_cuda_weight_at_supported(8));  /* fp8-e4m3-b128 */
 
     /* Out of range in both directions. The negative cases are the ones the
      * previous `fmt <= 4` host gate admitted: a descriptor whose fmt field is
@@ -62,10 +68,10 @@ int main(void) {
     CHECK(!coli_cuda_weight_at_supported(100));   /* PRIVATE ORDINAL BLOCK base */
     CHECK(!coli_cuda_weight_at_supported(1 << 30));
 
-    /* The set is exactly {0,1,2,3,4} and nothing else in a wide sweep -- so a
+    /* The set is exactly {0,1,2,3,4,8} and nothing else in a wide sweep -- so a
      * later edit that widens the predicate has to change this line too. */
     for (int fmt = -2048; fmt <= 2048; fmt++) {
-        int expect = (fmt >= 0 && fmt <= 4);
+        int expect = (fmt >= 0 && fmt <= 4) || fmt == 8;
         if (!!coli_cuda_weight_at_supported(fmt) != expect) {
             printf("FAIL fmt=%d: supported=%d, expected %d\n",
                    fmt, coli_cuda_weight_at_supported(fmt), expect);

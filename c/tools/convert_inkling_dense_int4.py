@@ -37,8 +37,18 @@ Uso:
        /path/al/modello/dense-int4g64/dense.safetensors
 Il motore trova il container da solo (INK_DENSE_Q4=0 lo ignora).
 """
-import argparse, json, os, re, struct, sys, time
+import argparse, json, os, re, shutil, struct, sys, time
 import numpy as np
+
+# The progress lines print "…" and the success line "✅", which a stdout in
+# cp949 or cp932 (a Korean or Japanese Windows console) or the C locale cannot
+# encode: the print raised and the run exited 1, after writing the container,
+# without the quantization-error report. Escape what the encoding cannot hold,
+# as CPython already does on stderr; a UTF-8 stdout is unaffected.
+try:
+    sys.stdout.reconfigure(errors="backslashreplace")
+except AttributeError:
+    pass
 
 DIR = os.environ.get("INKLING_DIR", ".")
 OUT = os.path.join(DIR, "dense-int4g64.safetensors")
@@ -203,7 +213,7 @@ def main():
     print(f"      densa da convertire: {len(plan)} tensori  {by}")
     print(f"      input  bf16/f32 : {tot_in/1e9:7.2f} GB")
     print(f"      output stimato   : {tot_out/1e9:7.2f} GB   ({100*tot_out/max(tot_in,1):.0f}%)")
-    free = os.statvfs(DIR).f_bavail * os.statvfs(DIR).f_frsize
+    free = shutil.disk_usage(DIR).free   # os.statvfs does not exist on Windows
     print(f"      spazio libero    : {free/1e9:7.2f} GB")
     if a.plan:
         print("\n[--plan] nessuna scrittura. Rilancia senza --plan per convertire.")

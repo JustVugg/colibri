@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -197,6 +198,76 @@ static void test_writer_golden_bytes(void)
     fclose(output);
 }
 
+/* The handshake with a CAPS line: what the engine loaded, said between READY
+ * and STAT so the server knows it before it takes a request. NULL caps must
+ * produce the handshake byte for byte as before. */
+static void test_ready_caps_golden_bytes(void)
+{
+    FILE *output = tmpfile();
+    assert(output);
+    binary_stream(output);
+    assert(coli_serve_write_ready_caps(output, 1.25, "vision=1"));
+    assert(coli_serve_write_ready_caps(output, 1.25, NULL));
+    static const unsigned char expected[] =
+        "\x01\x01READY\x01\x01\nCAPS vision=1\nSTAT 0 0.0 0.0 1.25 0 0\n"
+        "\x01\x01READY\x01\x01\nSTAT 0 0.0 0.0 1.25 0 0\n";
+    unsigned char actual[sizeof(expected) + 16];
+    size_t count = read_output(output, actual, sizeof(actual));
+    assert(count == sizeof(expected) - 1);
+    assert(memcmp(actual, expected, count) == 0);
+    fclose(output);
+}
+
+/* DECIDE carries a decision engine's record; DECISION frames its answer. The
+ * payload is consumed whenever the header parses, so a malformed record never
+ * desynchronizes the stream, and a header that does not parse is refused. */
+static void test_decide_and_decision(void)
+{
+    static const char frame[] = "DECIDE d-1 0 5\n{\"a\"}\nSTOP d-1\n";
+    FILE *input = bytes_input(frame, sizeof(frame) - 1);
+    ColiServeCommand command;
+    assert(coli_serve_read_command(input, &profile, &command) == COLI_SERVE_READ_OK);
+    assert(command.kind == COLI_SERVE_COMMAND_DECIDE);
+    assert(strcmp(command.id, "d-1") == 0);
+    assert(command.slot == 0 && command.payload_bytes == 5);
+    assert(memcmp(command.payload, "{\"a\"}", 5) == 0 && command.payload[5] == 0);
+    coli_serve_command_dispose(&command);
+    assert(coli_serve_read_command(input, &profile, &command) == COLI_SERVE_READ_OK);
+    assert(command.kind == COLI_SERVE_COMMAND_STOP);
+    coli_serve_command_dispose(&command);
+    fclose(input);
+
+    static const char *const bad[] = {
+        "DECIDE d-2 0\n",              /* no byte count */
+        "DECIDE d-2 0 9\nabc\n",      /* over the profile's payload limit */
+        "DECIDE d-2 -1 1\nx\n",       /* negative slot */
+        "DECIDE d-2 0 1 7\nx\n",      /* a field too many */
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        input = bytes_input(bad[i], strlen(bad[i]));
+        assert(coli_serve_read_command(input, &profile, &command) ==
+               COLI_SERVE_READ_BAD_REQUEST);
+        assert(command.kind == COLI_SERVE_COMMAND_DECIDE);
+        coli_serve_command_dispose(&command);
+        fclose(input);
+    }
+    static const char short_body[] = "DECIDE d-3 0 4\nab";
+    input = bytes_input(short_body, sizeof(short_body) - 1);
+    assert(coli_serve_read_command(input, &profile, &command) == COLI_SERVE_READ_BAD_FRAME);
+    fclose(input);
+
+    FILE *output = tmpfile();
+    assert(output);
+    binary_stream(output);
+    assert(coli_serve_write_decision(output, "d-1", "{\"answers\":[]}", 14));
+    static const unsigned char expected[] = "DECISION d-1 14\n{\"answers\":[]}\n";
+    unsigned char actual[sizeof(expected) + 16];
+    size_t count = read_output(output, actual, sizeof(actual));
+    assert(count == sizeof(expected) - 1);
+    assert(memcmp(actual, expected, count) == 0);
+    fclose(output);
+}
+
 static void test_allocation_failures_are_fatal_to_the_caller(void)
 {
     static const char frame[] = "SUBMIT req 0 1 1 0.7 0.95\nx\n";
@@ -214,12 +285,56 @@ static void test_allocation_failures_are_fatal_to_the_caller(void)
     }
 }
 
+/* The load-time failure class: errno maps to nomem or io, the kinds have
+ * their wire words, and the line is one line (a newline in the detail is a
+ * space), so the server can read the kind and keep the detail whole. */
+static void test_load_fail_kinds_and_line(void)
+{
+    assert(coli_load_fail_kind_from_errno(ENOMEM) == COLI_LOAD_FAIL_NOMEM);
+    assert(coli_load_fail_kind_from_errno(EAGAIN) == COLI_LOAD_FAIL_NOMEM);
+    assert(coli_load_fail_kind_from_errno(ENOENT) == COLI_LOAD_FAIL_IO);
+    assert(coli_load_fail_kind_from_errno(EACCES) == COLI_LOAD_FAIL_IO);
+    assert(coli_load_fail_kind_from_errno(EIO) == COLI_LOAD_FAIL_IO);
+    assert(coli_load_fail_kind_from_errno(EMFILE) == COLI_LOAD_FAIL_IO);
+    assert(coli_load_fail_kind_from_errno(0) == COLI_LOAD_FAIL_IO);
+    assert(strcmp(coli_load_fail_kind_string(COLI_LOAD_FAIL_NOMEM), "nomem") == 0);
+    assert(strcmp(coli_load_fail_kind_string(COLI_LOAD_FAIL_IO), "io") == 0);
+    assert(strcmp(coli_load_fail_kind_string(COLI_LOAD_FAIL_FORMAT), "format") == 0);
+    assert(strcmp(coli_load_fail_kind_string(COLI_LOAD_FAIL_UNSUPPORTED), "unsupported") == 0);
+
+    FILE *output = tmpfile();
+    assert(output);
+    binary_stream(output);
+    assert(coli_serve_write_load_fail(
+        output, COLI_LOAD_FAIL_FORMAT,
+        "model-00007.safetensors: short read at EOF (off 8, 0/16 bytes)\ntruncated?"));
+    static const char expected[] =
+        "LOAD_FAIL kind=format model-00007.safetensors: short read at EOF "
+        "(off 8, 0/16 bytes) truncated?\n";
+    unsigned char bytes[256];
+    size_t count = read_output(output, bytes, sizeof(bytes));
+    assert(count == sizeof(expected) - 1);
+    assert(memcmp(bytes, expected, count) == 0);
+    fclose(output);
+
+    output = tmpfile();
+    assert(output);
+    binary_stream(output);
+    assert(coli_serve_write_load_fail(output, COLI_LOAD_FAIL_NOMEM, NULL));
+    count = read_output(output, bytes, sizeof(bytes));
+    assert(count == 22 && memcmp(bytes, "LOAD_FAIL kind=nomem \n", 22) == 0);
+    fclose(output);
+}
+
 int main(void)
 {
     test_submit_and_controls();
     test_invalid_headers_and_bodies();
     test_writer_golden_bytes();
+    test_ready_caps_golden_bytes();
+    test_decide_and_decision();
     test_allocation_failures_are_fatal_to_the_caller();
+    test_load_fail_kinds_and_line();
     puts("serve codec tests: ok");
     return 0;
 }

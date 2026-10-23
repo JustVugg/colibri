@@ -322,14 +322,8 @@ static void test_shutdown_wakes_everyone(void) {
     check(!G.on, "shutdown_returns_with_four_waiters_parked");
     check(t_note_block_done && t_note_planned_done && t_fill_wait_done,
           "every cv_take waiter must return once shutdown has been requested");
-    /* the abandoned swaps left the books consistent: the victim still holds
-     * its tensor and says so, no queued flag survives */
-    pthread_mutex_lock(&G.mx);
-    int stale_queued = 0;
-    for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++) stale_queued += qs(l, e)->queued;
-    pthread_mutex_unlock(&G.mx);
-    check(qs(0, 0)->resident == 1 && qs(0, 0)->tg != NULL, "the victim of an abandoned swap keeps its tensor and its resident flag");
-    check(stale_queued == 0, "no expert may still read as queued after shutdown drained or abandoned the queue");
+    check(!G.slot && !G.is_x && !G.waiters,
+          "shutdown releases storage only after every parked caller has resumed");
 }
 
 /* ======================================================================== */

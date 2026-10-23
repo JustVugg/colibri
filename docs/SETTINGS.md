@@ -1,6 +1,6 @@
 # CLI & Settings Reference
 
-Command-line settings for the two user-facing programs: the **`coli`** CLI and the **`openai_server.py`** server. The underlying `glm` engine is driven by environment variables — see [ENVIRONMENT.md](ENVIRONMENT.md).
+Command-line settings for the two user-facing programs: the **`coli`** CLI and the **`openai_server.py`** server. The engines underneath (`colibri`, `glm53`, `kimi_k3`, `inkling`, `qwen36`, `qwen38`, `deepseek_v4`, `deepseek_v41`, `olmoe`) are driven by environment variables: see [ENVIRONMENT.md](ENVIRONMENT.md), which says which engine reads which.
 
 **Updated for the contribution based on `upstream/dev @ 21e7a35`** (argparse definitions in `c/coli` and `c/openai_server.py`). See [MAINTAINING-DOCS.md](MAINTAINING-DOCS.md) to regenerate.
 
@@ -21,11 +21,20 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `build` | Build/prepare the engine. |
 | `info` | Print model / build info. |
 | `plan` | Show the computed RAM/VRAM placement plan (`--json` for machine-readable). |
+| `mirror` | Plan, stage, or verify a usage-ranked partial model mirror (see [multidisk.md](multidisk.md)). |
 | `doctor` | Environment/health check (`--json` report, `--deep` strict preflight). |
 | `tune` | Measure and save the fastest quality-preserving execution profile for this machine/model. |
 | `run "<prompt>"` | One-shot generation for the given prompt (positional, may be multi-word). |
 | `chat` | Interactive REPL chat. |
 | `serve` | Start the OpenAI-compatible HTTP server. |
+| `web` | `serve`, then open the dashboard in the browser. |
+| `stop` | Shut down a running `coli serve` and its engine (default port: the one `coli setup` configured, else `8000`). |
+| `setup` | One step: detect the hardware, recommend a model, build or fetch the engine (Vulkan/CUDA when usable), download with resume, write the run configuration, start. A rerun starts directly, once `make` has brought the engine up to date with the sources (a rebuild only when they changed, as after `git pull`). See [AI_SETUP.md](AI_SETUP.md). |
+| `start` | Start what `coli setup` configured (`--background`, `--no-browser`, `--json`). |
+| `status` | What is set up, install progress, server state, URLs, API model id, tok/s of the last answer (`--json`). |
+| `logs` | Tail of the background server log (`-n N`, `--install` for the install log). |
+| `mcp` | Model Context Protocol server on stdio for AI coding assistants. See [MCP_SERVER.md](MCP_SERVER.md). |
+| `cluster coordinator` / `cluster worker` | Run the local-cluster control plane, or an expert worker that serves experts to it. |
 | `bench [tasks]` | Run benchmark tasks (`--limit`, `--data`). |
 | `convert` | Convert an FP8 repo to a colibrì int4 snapshot. |
 
@@ -47,6 +56,11 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `--vram` | `0` (auto) | CUDA plan | Total VRAM budget in GB. |
 | `--auto-tier` | off | resource plan | Automatically apply the RAM/VRAM placement plan. |
 | `--no-tune-profile` | off | profile loader | Ignore a saved measured profile. |
+| `--think` / `--no-think` | the model's default | `enable_thinking` in the chat request | Whether the model reasons before answering. Off, the prompt closes the reasoning block and the answer starts at the first word. |
+| `--effort` | the model's default | `reasoning_effort` in the chat request | `minimal`, `low`, `medium`, `high` or `xhigh`: how long the model reasons, on the families that take it. |
+| `--xdna` | off | `COLI_XDNA=1` | Experimental: run qualified GLM operations on the AMD XDNA2 NPU (reduced-precision BF16 path; output may differ). |
+| `--cluster-workers` | `$CLUSTER_WORKERS` | `CLUSTER_WORKERS` | Comma-separated expert workers, `host:port,...`. |
+| `--cluster-coordinator` | `$CLUSTER_COORDINATOR` | worker discovery | Control-plane URL used to discover expert workers. |
 
 ### Subcommand-specific flags
 
@@ -58,11 +72,37 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `--port` | `8000` | Port. |
 | `--model-id` | `$COLI_MODEL_ID` or `glm-5.2-colibri` | Model id reported by the API. |
 | `--api-key` | `$COLI_API_KEY` | Require this bearer token. |
-| `--cors-origin` | none (repeatable) | Allowed CORS origin(s). |
+| `--cors-origin` | none (repeatable) | Allowed CORS origin(s). A plain value replaces the default list; `+ORIGIN` adds to it. |
 | `--allowed-host` | `$COLI_ALLOWED_HOSTS` or none (repeatable) | Additional Host header accepted by the DNS-rebinding guard. |
 | `--max-queue` | `$COLI_MAX_QUEUE` or `8` | Max queued requests. |
 | `--queue-timeout` | `$COLI_QUEUE_TIMEOUT` or `300` | Seconds a request may wait. |
 | `--kv-slots` | `$COLI_KV_SLOTS` or `1` | Independent KV conversation slots (→ `KV_SLOTS`). |
+
+**`setup`** (no common flags: `--model` here is a catalog id, not a directory)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--yes`, `-y` | off | Non-interactive: the recommendation and every default. |
+| `--model ID` | the recommendation | Catalog model to install (`--list` shows the ids). |
+| `--model-dir DIR` | none | Use a model already on disk instead of downloading one. |
+| `--dir DIR` | `~/colibri-models` | Folder for downloaded models. |
+| `--backend` | `auto` | `auto`, `cpu`, `vulkan` or `cuda`: the engine build. `auto` takes CUDA, then Vulkan, then the CPU. |
+| `--no-gpu` | off | Same as `--backend cpu`. |
+| `--host`, `--port` | `127.0.0.1`, `8000` | Where the configured server listens. |
+| `--no-start` | off | Stop after writing the run configuration. |
+| `--background` | off | Start the server detached (log in the setup folder). |
+| `--no-browser` | off | Do not open the browser. |
+| `--reconfigure` | off | Choose again even if a setup is complete. |
+| `--list`, `--all` | off | List the catalog against this machine and exit; `--all` also shows what does not fit. |
+| `--via-windows` | `auto` | WSL only: download through Windows' `curl.exe` (`auto`: when it measures much faster). |
+| `--no-verify` | off | Skip the checksums of downloaded files. |
+| `--json` | off | Machine-readable result; implies `--yes` and a background start. |
+
+The run configuration, state and logs live in `COLI_SETUP_HOME` (default
+`~/.local/share/colibri`, `~/Library/Application Support/colibri`,
+`%LOCALAPPDATA%\colibri`). `COLI_SETUP_CATALOG` names a JSON list of extra
+catalog entries (a mirror or a private repository); `HF_ENDPOINT` and
+`HF_TOKEN` are honoured by the downloads.
 
 **`convert`**
 
@@ -102,7 +142,7 @@ Run directly (or via `coli serve`). OpenAI-compatible `/v1/chat/completions`.
 | `--port` | `8000` | Port. |
 | `--model-id` | `$COLI_MODEL_ID` or `glm-5.2-colibri` | Model id in API responses. |
 | `--api-key` | `$COLI_API_KEY` | Required bearer token. |
-| `--cors-origin` | none (repeatable) | Allowed CORS origin(s). |
+| `--cors-origin` | none (repeatable) | Allowed CORS origin(s). A plain value replaces the default list; `+ORIGIN` adds to it. |
 | `--allowed-host` | `$COLI_ALLOWED_HOSTS` or none (repeatable) | Additional Host header accepted by the DNS-rebinding guard. |
 | `--cap` | `0` (auto) | Expert-cache cap; `0` = engine default (`8`, or `1` on Metal + macOS + fast model volume — #379). |
 | `--max-tokens` | `1024` | Default max completion tokens. |
@@ -110,7 +150,7 @@ Run directly (or via `coli serve`). OpenAI-compatible `/v1/chat/completions`.
 | `--queue-timeout` | `$COLI_QUEUE_TIMEOUT` or `300` | Request queue timeout (s). |
 | `--kv-slots` | `$COLI_KV_SLOTS` or `1` | KV conversation slots. |
 
-Tool calling is supported by GLM and DeepSeek V4; Inkling, Kimi K3, and OLMoE reject active tool declarations and choices explicitly. See the [per-engine API matrix](api.md#tool-calling-support). The opt-in `COLI_TOOL_SALVAGE=1` env var recovers malformed GLM int4 tool calls; V4 uses its native DSML parser. Engine-specific runtime variables are listed in [ENVIRONMENT.md](ENVIRONMENT.md); the server passes the environment through to the selected engine.
+Tool calling is supported by GLM, DeepSeek V4, Kimi K3, Qwen3.6, and Qwen3.8; Inkling rejects active tool declarations and choices explicitly, and OLMoE does too unless `COLI_TOOL_FALLBACK=1`. See the [per-engine API matrix](api.md#tool-calling-support). The opt-in `COLI_TOOL_SALVAGE=1` env var recovers malformed GLM int4 tool calls; V4 uses its native DSML parser. Engine-specific runtime variables are listed in [ENVIRONMENT.md](ENVIRONMENT.md); the server passes the environment through to the selected engine.
 
 ---
 

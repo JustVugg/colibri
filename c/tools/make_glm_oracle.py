@@ -30,7 +30,7 @@ same quantizer), so the engine's decode reproduces the reference token-exactly.
 Regeneration (run from c/):
     python3 tools/make_glm_oracle.py --fmt6     # -> glm_tiny_fmt6/ (model.safetensors, config.json, ref_glm.json)
     python3 tools/make_glm_oracle.py --fmt4     # -> glm_tiny_fmt4/
-    # verify: SNAP=./glm_tiny_fmt6 REF=./glm_tiny_fmt6/ref_glm.json TF=1 COLI_TEMP=0 ./colibri 64 16 16"""
+    # verify: SNAP=./glm_tiny_fmt6 REF=./glm_tiny_fmt6/ref_glm.json TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16"""
 import json, sys, argparse
 from pathlib import Path
 

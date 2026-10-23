@@ -31,7 +31,7 @@
  * WHAT MAKES THIS TEST BITE RATHER THAN MERELY PASS. Three controls, because an
  * exit code that says "the child failed" is worthless if the child fails no
  * matter what:
- *   1. IN-PROCESS control: every supported fmt (0,1,2,3,4) is launched in the
+ *   1. IN-PROCESS control: every supported fmt (0,1,2,3,4,8) is launched in the
  *      parent and must complete cleanly. If weight_at trapped on those, the
  *      trap would be firing on valid input and this test would fail here.
  *   2. CHILD-HARNESS control: the probe list always contains SUPPORTED formats
@@ -56,13 +56,24 @@
  * landing in either order: whatever the predicate promises, the silicon must
  * deliver, and whatever it refuses, the silicon must refuse.
  *
- * The fmt set probed covers both sides of today's truth table (0,3 supported;
- * 5,6,7,8 unsupported container-carriable formats) plus the out-of-range values
- * a corrupt descriptor could present (-1, 9, 1<<30) -- the ones the previous
+ * The fmt set probed covers both sides of today's truth table (0,3,8 supported
+ * -- 8 since the fp8-e4m3 absorb decode widened the predicate; 5,6,7
+ * unsupported container-carriable formats) plus the out-of-range values a
+ * corrupt descriptor could present (-1, 9, 1<<30) -- the ones the previous
  * `fmt <= 4` host gate admitted.
+ *
+ * fmt=8 gets one extra obligation on top of the derived DECODED verdict: its
+ * decoded VALUE is checked against an independent arithmetic e4m3 reference
+ * (a6_e4m3_ref below), because a fresh child process starts with a
+ * zero-initialized c_e4m3 table -- a decode that "returns a number" from a
+ * zero LUT is exactly the fabricated-numbers failure mode this file exists to
+ * refuse. The child publishes the LUT through the real
+ * coli_cuda_init/coli_cuda_fp8_set_lut path first, the same way any real
+ * fmt=8 caller must before upload.
  *
  *   make -C c cuda-test CUDA_ARCH=native      (runs this among the CUDA tests)
  */
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -95,6 +106,8 @@
 #define A6_EXIT_TRAPPED  42   /* the launch aborted -- the refusal fired      */
 #define A6_EXIT_DECODED  43   /* the kernel returned a value -- no refusal    */
 #define A6_EXIT_HARNESS  44   /* could not run the probe at all               */
+#define A6_EXIT_MISMATCH 45   /* decoded without trapping, but not to the     *
+                                * value the independent reference expects     */
 
 #define A6_PROBE_FLAG "--a6-probe"
 
@@ -102,6 +115,38 @@
  * value under every packed branch, so an unguarded fall-through produces a
  * visible number rather than something that could be mistaken for "no output". */
 #define A6_FILL 0xA5
+
+/* Independent arithmetic e4m3 decoder (sign/exp/mantissa, OCP E4M3-FN: no
+ * infinities, only 0x7F/0xFF are NaN) -- same construction as t8_e4m3_ref in
+ * tests/test_backend_cuda.cu and e4m3_ref in tests/test_fp8_cuda.cu. Scope
+ * of the check, stated exactly: the device table is PUBLISHED FROM this
+ * reference (a6_publish_lut), so the comparison proves the table is nonzero
+ * and that weight_at's c_e4m3[base[i]] indexing is correct -- it cannot
+ * catch a wrong reference (a wrong table built from it would cancel), and
+ * the engine's own E4M3_LUT (quant.h) is not exercised by this harness at
+ * all. A6_FILL (0xA5) is not a NaN byte pattern. */
+static float a6_e4m3_ref(uint8_t b) {
+    int s = b >> 7, e = (b >> 3) & 15, m = b & 7;
+    if (e == 15 && m == 7) return NAN;              /* E4M3-FN: only NaN, no inf */
+    float v = e ? ldexpf(1.f + m/8.f, e-7) : ldexpf(m/8.f, -6);
+    return s ? -v : v;
+}
+
+/* Publish the e4m3 LUT through the engine's own path, so weight_at's fmt=8
+ * branch reads a real table instead of context-fresh zeros. Harmless for every
+ * other fmt (only the fmt==8 branch reads c_e4m3). coli_cuda_fp8_set_lut walks
+ * the engine's context table (g_nctx/g_ctx), which nothing else in this file
+ * populates -- the rest of the file talks to the device directly via the raw
+ * CUDA runtime API, deliberately, to stay independent of the engine's
+ * device-selection plumbing -- so coli_cuda_init(device 0) is called for this
+ * one dependency only. Returns 0 on harness failure. */
+static int a6_publish_lut(void) {
+    int dev0 = 0;
+    if (!coli_cuda_init(&dev0, 1)) return 0;
+    float lut[256];
+    for (int i = 0; i < 256; i++) lut[i] = a6_e4m3_ref((uint8_t)i);
+    return coli_cuda_fp8_set_lut(lut);
+}
 
 /* The deliberate bad launch. weight_at is file-static device code; this is the
  * only caller in this TU, and it passes fmt straight through as a runtime
@@ -115,6 +160,16 @@ __global__ static void a6_probe_kernel(const void *w, int fmt, float *out) {
 static int a6_probe_child(int fmt) {
     void *w = NULL;
     float *out = NULL;
+
+    /* Fresh execv'd process, fresh CUDA context: c_e4m3 starts zero-initialized
+     * here regardless of what the parent published. Published unconditionally
+     * rather than gated on fmt==8, so this child's setup mirrors a real
+     * caller's -- the engine publishes the LUT once at boot for every process
+     * that might touch fmt=8, not per tensor. */
+    if (!a6_publish_lut()) {
+        printf("  [child fmt=%d] coli_cuda_init/coli_cuda_fp8_set_lut failed\n", fmt);
+        return A6_EXIT_HARNESS;
+    }
 
     if (cudaMalloc(&w, 256) != cudaSuccess) {
         printf("  [child fmt=%d] cudaMalloc(weights) failed\n", fmt);
@@ -155,6 +210,24 @@ static int a6_probe_child(int fmt) {
         return A6_EXIT_TRAPPED;
     }
     printf("  [child fmt=%d] weight_at RETURNED %g\n", fmt, (double)v);
+
+    /* fmt=8's extra obligation (see the file header): the decoded value must
+     * match the independent e4m3 reference. Without this, a zero-LUT decode
+     * (or any wrong LUT/indexing) would still count as "DECODED" -- a wrong
+     * number is not meaningfully different from a fabricated one, which is
+     * the exact failure mode this file's __trap() backstop exists to refuse.
+     * The other DECODED fmts in the probe list (0, 3) are already pinned
+     * bit-exact elsewhere (inprocess_supported_control here, the dense-matmul
+     * oracle in tests/test_backend_cuda.cu). */
+    if (fmt == 8) {
+        float want = a6_e4m3_ref((uint8_t)A6_FILL);
+        if (v != want) {
+            printf("  [child fmt=%d] MISMATCH: weight_at(A6_FILL=0x%02X) = %g, "
+                   "independent e4m3 reference says %g\n", fmt, A6_FILL,
+                   (double)v, (double)want);
+            return A6_EXIT_MISMATCH;
+        }
+    }
     return A6_EXIT_DECODED;
 }
 
@@ -210,7 +283,11 @@ static void expect_child(const char *self, int fmt, int want, const char *why) {
         printf("ok   fmt=%-6d %s (child exit %d)\n", fmt, why, got);
         return;
     }
-    if (got == A6_EXIT_DECODED && want == A6_EXIT_TRAPPED) {
+    if (got == A6_EXIT_MISMATCH && want == A6_EXIT_DECODED) {
+        printf("FAIL fmt=%-6d %s -- decoded without trapping, but not to the "
+               "value the independent e4m3 reference expects (see child output "
+               "above)\n", fmt, why);
+    } else if (got == A6_EXIT_DECODED && want == A6_EXIT_TRAPPED) {
         printf("FAIL fmt=%-6d weight_at DECODED a format the host predicate "
                "refuses -- the device-side __trap() is not firing (dispatch "
                "disagrees with coli_cuda_weight_at_supported)\n", fmt);
@@ -247,7 +324,14 @@ static void inprocess_supported_control(void) {
         return;
     }
     (void)cudaGetLastError();
-    for (int fmt = 0; fmt <= 4; fmt++) {
+    /* The full predicate-true set, fmt=8 included -- its LUT is published by
+     * main() before this control runs (a6_publish_lut), so its in-process
+     * decode reads a real table, and its value is checked against the
+     * independent reference right here (the child probes re-check it in a
+     * fresh process, where the LUT must be re-published). */
+    static const int supported[] = {0, 1, 2, 3, 4, 8};
+    for (size_t fi = 0; fi < sizeof supported / sizeof supported[0]; fi++) {
+        int fmt = supported[fi];
         if (!coli_cuda_weight_at_supported(fmt)) {   /* keeps the two in step */
             printf("FAIL fmt=%d is in this loop but the host predicate rejects it\n", fmt);
             fails++;
@@ -267,6 +351,12 @@ static void inprocess_supported_control(void) {
             fails++;
             return;      /* the context is poisoned; nothing after this is valid */
         }
+        if (fmt == 8 && v != a6_e4m3_ref((uint8_t)A6_FILL)) {
+            printf("FAIL fmt=8 decoded in-process to %g, independent e4m3 "
+                   "reference says %g (wrong LUT or wrong indexing)\n",
+                   (double)v, (double)a6_e4m3_ref((uint8_t)A6_FILL));
+            fails++;
+        }
         printf("ok   fmt=%-6d supported: decoded in-process, weight_at = %g\n",
                fmt, (double)v);
     }
@@ -285,6 +375,13 @@ int main(int argc, char **argv) {
          * failing. */
         printf("cuda fmt trap test: NO CUDA DEVICE -- the device-side refusal "
                "cannot be verified here\n");
+        return 1;
+    }
+
+    if (!a6_publish_lut()) {
+        printf("cuda fmt trap test: could not publish the e4m3 LUT "
+               "(coli_cuda_init/coli_cuda_fp8_set_lut failed) -- the fmt=8 "
+               "control cannot run\n");
         return 1;
     }
 

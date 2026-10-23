@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Hardware and model placement planning for colibri's disk/RAM/VRAM tiers."""
 
+import collections
 import json
 import os
 import platform
@@ -10,15 +11,64 @@ import statistics
 import subprocess
 import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 from family_registry import (expert_contributions, planner_geometry,
                              fixed_resident_contribution, resident_contribution,
+                             trunk_contribution,
                              resolve_model)
 
 
 GB = 1_000_000_000
 EXPERT_RE = re.compile(r"(?:model\.)?layers\.(\d+)\.(?:mlp|ffn)\.experts\.(\d+)\.")
+
+# Cgroup and procfs inputs are tiny kernel-maintained text files. Bound every
+# read anyway: the planner may run in a container with a synthetic or partially
+# mounted cgroup tree, and admission must never turn an unexpected file into an
+# unbounded read or an unbounded hierarchy walk.
+_CGROUP_VALUE_MAX_BYTES = 128
+_CGROUP_STAT_MAX_BYTES = 64 * 1024
+_CGROUP_MEMBERSHIP_MAX_BYTES = 64 * 1024
+_CGROUP_MOUNTINFO_MAX_BYTES = 4 * 1024 * 1024
+_CGROUP_MAX_ANCESTORS = 64
+_MEMINFO_MAX_BYTES = 256 * 1024
+_CGROUP_UINT64_MAX = (1 << 64) - 1
+_CGROUP_UINT64_DIGITS = len(str(_CGROUP_UINT64_MAX))
+# cgroup v1 represents "unlimited" with a page-aligned value just below the
+# signed 64-bit maximum (commonly 9223372036854771712). No consumer host can
+# provide an exbibyte of usable RAM, so this conservative threshold also covers
+# the other kernel sentinel variants without confusing a real finite limit.
+_CGROUP_V1_UNLIMITED_MIN = 1 << 60
+
+
+class CgroupError(ValueError):
+    """A present cgroup or procfs input cannot be trusted for memory admission."""
+
+
+class CgroupFormatError(CgroupError):
+    """A present procfs or cgroup file does not have the kernel's grammar."""
+
+
+class CgroupAccessError(CgroupError):
+    """A present cgroup input cannot be read completely or mapped soundly."""
+
+
+@dataclass(frozen=True)
+class _CgroupMemberships:
+    v2: tuple | None
+    v1_memory: tuple | None
+
+
+@dataclass(frozen=True)
+class _CgroupMount:
+    mount_id: int
+    parent_id: int
+    root: tuple
+    mount_point: Path
+    fs_type: str
+    options: frozenset
+
 
 # analyze_model() scans every shard header + regex-matches ~116k tensor names on the
 # 372 GB model; it reruns on every `coli plan/doctor/tune/run --auto-tier`. Its output
@@ -26,7 +76,7 @@ EXPERT_RE = re.compile(r"(?:model\.)?layers\.(\d+)\.(?:mlp|ffn)\.experts\.(\d+)\
 # sidecar and self-invalidate on any change. Best-effort: any read/write failure falls
 # straight back to a full recompute (see analyze_model). Sits alongside .coli_usage/.coli_ssd.
 _ANALYSIS_CACHE_NAME = ".coli_analysis.json"
-_ANALYSIS_CACHE_VERSION = 7
+_ANALYSIS_CACHE_VERSION = 11
 
 
 def _dense_in_ram(descriptor, on_disk_bytes):
@@ -35,6 +85,11 @@ def _dense_in_ram(descriptor, on_disk_bytes):
     Coincidono per chi li carica come stanno; una famiglia che li riquantizza
     al caricamento lo dichiara nel registro. Un errore qui non e' cosmetico:
     e' la differenza fra dire a qualcuno che il modello ci sta e dirgli di no."""
+    # GLM53's quantization is per matrix, with F32 vectors/vision and an int8
+    # fallback for narrow rows. A whole-checkpoint ratio cannot represent it;
+    # _glm53_dense_tensors prices its source inventory below, outside the cache.
+    if descriptor.id == "glm53":
+        return on_disk_bytes
     ratio = getattr(descriptor, "dense_load_ratio", None)
     if ratio is None:
         return on_disk_bytes
@@ -42,6 +97,1323 @@ def _dense_in_ram(descriptor, on_disk_bytes):
         return max(0, int(ratio(on_disk_bytes)))
     except Exception:
         return on_disk_bytes
+
+
+# A token embedding table: "embed_tokens", DeepSeek's "embed", "tok_embeddings",
+# "wte"; not a vision tower's patch or position embedding.
+_EMBED_TABLE = re.compile(r"(^|\.)(embed_tokens|embed|tok_embeddings|wte|word_embeddings)\.weight$")
+
+
+def _vk_flag(env, name):
+    value = (env.get(name) or "").strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return 1
+
+
+# The families whose dense chain is on by default on an integrated GPU with the
+# expert tier (coli_vk_chain_decide's measured `igpu`, docs/vulkan.md).
+_VK_IGPU_CHAIN_ON = ("qwen36", "olmoe")
+_VK_DENSE_HOST_FAMILIES = frozenset((
+    "qwen36", "qwen38", "glm", "glm53", "inkling", "kimi", "mimo",
+    "olmoe", "deepseek_v4", "deepseek_v41",
+))
+
+
+def _vk_device(env, vulkan):
+    if vulkan is not None or not _vk_flag(env, "COLI_VULKAN"):
+        return vulkan
+    try:
+        from setup_hw import best_vulkan_device, detect_vulkan
+        return best_vulkan_device(detect_vulkan().get("devices", []))
+    except Exception:
+        return None
+
+
+def _vk_chain_dense(family_id, env, vulkan):
+    """(chain, dense): whether the engine runs its dense chain, and its per-matrix
+    path, on the Vulkan device (coli_vk_chain_decide, coli_vk_dense_decide); both
+    False when it does not open one."""
+    if (family_id not in _VK_DENSE_HOST_FAMILIES or
+            not _vk_flag(env, "COLI_VULKAN") or _vk_flag(env, "COLI_CUDA")):
+        return False, False
+    kind = (vulkan or {}).get("type")
+    if kind not in ("discrete", "integrated", "cpu", "virtual", "other"):
+        return False, False
+    tier = _vk_flag(env, "COLI_VK_TIER") != 0
+    chain, dense = _vk_flag(env, "COLI_VK_CHAIN"), _vk_flag(env, "COLI_VK_DENSE")
+    if chain is None:
+        chain = (kind not in ("integrated", "cpu") or
+                 kind == "integrated" and tier and family_id in _VK_IGPU_CHAIN_ON)
+    if dense is None:
+        # colibri.c passes default=0 to coli_vk_dense_decide; its chain is
+        # independent, but disabling that chain does not enable per-matrix GEMVs.
+        dense = family_id != "glm" and (kind not in ("integrated", "cpu") or not tier)
+    return bool(chain), bool(dense)
+
+
+def _vk_dense_active(family_id, env, vulkan):
+    return any(_vk_chain_dense(family_id, env, vulkan))
+
+
+def _text_weight_name(name):
+    return name.removeprefix("language_model.").replace("model.language_model.", "model.", 1)
+
+
+_Q38_TRUNK_COMPONENTS = {
+    "self_attn.q_proj": "attnq", "self_attn.k_proj": "attnk",
+    "self_attn.v_proj": "attnv", "self_attn.o_proj": "attno",
+    "self_attn.indexer.index_qk_proj": "qsaidx",
+    "linear_attn.in_proj_qkv": "dnqkv", "linear_attn.in_proj_z": "dnz",
+    "linear_attn.out_proj": "dnout", "mlp.gate": "router",
+    "mlp.shared_expert.gate_proj": "shg", "mlp.shared_expert.up_proj": "shu",
+    "mlp.shared_expert.down_proj": "shd",
+}
+for _block, _tag in (("attn", "hca"), ("mlp", "hcm")):
+    for _part, _suffix in (("input_mix_weight_down", "d"),
+                           ("input_mix_weight_up", "u"), ("block_inject_weight", "i")):
+        _Q38_TRUNK_COMPONENTS[f"{_block}_hyper_connection.{_part}"] = _tag + _suffix
+
+
+def _layer_component(name):
+    match = re.fullmatch(r"model\.layers\.\d+\.(.+)\.weight", _text_weight_name(name))
+    return match[1] if match else None
+
+
+def _matrix_shape(tensor):
+    shape = tensor.get("shape")
+    element = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1}.get(tensor["dtype"])
+    if (not element or not isinstance(shape, list) or len(shape) != 2 or
+            any(type(n) is not int or n <= 0 for n in shape) or
+            shape[0] * shape[1] * element != tensor["size"]):
+        return None
+    return shape
+
+
+def _q38_cpu_dense_tensors(info, env):
+    """Price q38_trunk_offer_all's CPU rows, independently of CUDA placement.
+
+    The scan cache is environment independent. Selection happens here on each
+    plan: the threshold includes a float scale per output row, the skip list is
+    component based, and F16 checkpoints are loaded as F32 before quantization.
+    """
+    tensors = info.get("dense_tensors", [])
+    if info["resolved_family"].descriptor.id != "qwen38" or env.get("Q38_TRUNK_CPU_INT8") == "0":
+        return info
+    threshold = re.match(r"\s*([+-]?\d+)", env.get("Q38_TRUNK_MIN_KB", "1024"))
+    min_kb = int(threshold[1]) if threshold else 0   # C atol; negative casts to size_t
+    skipped = set(env.get("Q38_TRUNK_SKIP", "").split(","))
+    adjusted, delta = [], 0
+    for tensor in tensors:
+        shape = _matrix_shape(tensor)
+        name = _text_weight_name(tensor["name"])
+        tag = "lmhead" if name == "lm_head.weight" else _Q38_TRUNK_COMPONENTS.get(_layer_component(name))
+        if shape and tag and tag not in skipped and min_kb >= 0:
+            rows, columns = shape
+            quantized = rows * columns + 4 * rows
+            if quantized >= min_kb * 1024:
+                delta += quantized - tensor["resident"]
+                tensor = dict(tensor, resident=quantized)
+        adjusted.append(tensor)
+    return dict(info, dense_bytes=info["dense_bytes"] + delta, dense_tensors=adjusted)
+
+
+_ATTENTION_PROJECTIONS = frozenset("self_attn." + p + "_proj" for p in ("q", "k", "v", "o"))
+_MLP_PROJECTIONS = frozenset("mlp." + p + "_proj" for p in ("gate", "up", "down"))
+_SHARED_PROJECTIONS = frozenset("mlp.shared_experts." + p + "_proj" for p in ("gate", "up", "down"))
+_G53_MATRICES = (_ATTENTION_PROJECTIONS | _MLP_PROJECTIONS | _SHARED_PROJECTIONS |
+                 frozenset("self_attn." + p + "_proj" for p in ("q_a", "q_b", "g_a", "g_b", "f_a", "f_b", "b")) |
+                 {"self_attn.kv_a_proj_with_mqa", "self_attn.indexer.wq_b",
+                  "self_attn.indexer.wk", "self_attn.indexer.weights_proj"})
+
+
+def _glm53_dense_tensors(info, env):
+    """Mirror glm53.c's quantize_loaded for known matrices, reserve F32 otherwise.
+
+    Cached scans contain source geometry. Never cache GLM53_BITS or multiply
+    vectors, embeddings and the vision tower by a quantized-matrix ratio. kv_b's
+    absorbed halves and unrecognized components retain a conservative F32 budget.
+    """
+    if info["resolved_family"].descriptor.id != "glm53":
+        return info
+    setting = re.match(r"\s*([+-]?\d+)", env.get("GLM53_BITS", "4"))
+    bits = int(setting[1]) if setting else 0
+    if bits not in (4, 8, 32):
+        raise ValueError("GLM53_BITS must be 4, 8 or 32")
+    adjusted, total, embedding = [], 0, 0
+    for tensor in info.get("dense_tensors", []):
+        name = _text_weight_name(tensor["name"])
+        size, dtype = tensor["size"], tensor["dtype"]
+        element = {"BF16": 2, "F16": 2, "F32": 4}.get(dtype)
+        resident = (size // element * 4) if element and size % element == 0 else size
+        shape = _matrix_shape(tensor)
+        known = (name == "lm_head.weight" or _layer_component(name) in _G53_MATRICES or
+                 re.fullmatch(r"model\.layers\.\d+\.self_attn\.indexer\.index_kpool_compress_gate", name))
+        if element and shape and known and bits != 32:
+            rows, columns = shape
+            if bits == 4 and columns % 64 == 0:
+                resident = rows * (columns // 2) + rows * (columns // 64) * 4
+            else:
+                resident = rows * columns + rows * 4
+        adjusted.append(dict(tensor, resident=resident))
+        total += resident
+        if _EMBED_TABLE.search(name):
+            embedding += resident
+    return dict(info, dense_bytes=total, embed_bytes=embedding, dense_tensors=adjusted)
+
+
+def _vk_released_tensor_bytes(tensor, family, env):
+    """A lower bound on the host allocation an engine's dho pass can free.
+
+    Only audited matrix names and source formats get credit. Keep norms, vision,
+    routers used by the CPU, unknown packed layouts and hardware-dependent BF16
+    kernels in RAM. Upload refusal can still retain a copy at runtime.
+    """
+    shape = _matrix_shape(tensor)
+    if not shape:
+        return 0
+    name, dtype = _text_weight_name(tensor["name"]), tensor["dtype"]
+    part = _layer_component(name)
+    rows, columns = shape
+    count, resident = rows * columns, tensor["resident"]
+    head = name == "lm_head.weight"
+    floating = dtype in ("BF16", "F16", "F32")
+    if family == "qwen38":
+        known = (head or part in _Q38_TRUNK_COMPONENTS or
+                 part in ("linear_attn.in_proj_a", "linear_attn.in_proj_b", "ple.key_proj", "ple.value_proj") or
+                 name in ("model.hyper_connection_mixer.input_mix_weight_down.weight",
+                          "model.hyper_connection_mixer.input_mix_weight_up.weight"))
+        return resident if known and floating else 0
+    if family == "qwen36":
+        known = (head or part in _ATTENTION_PROJECTIONS or part in _MLP_PROJECTIONS or
+                 part in ("mlp.gate", "linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.out_proj") or
+                 part in {p.replace("shared_experts", "shared_expert") for p in _SHARED_PROJECTIONS})
+        setting = re.match(r"\s*([+-]?\d+)", env.get("COLI_DENSE_BITS", "8"))
+        bits = int(setting[1]) if setting else 8
+        if not known or not floating or bits == 16:
+            return 0
+        # The checkpoint can be F32 while the engine holds int4/int8. Crediting
+        # the checkpoint bytes would also erase RAM that was never duplicated.
+        lower = count // 2 if bits == 4 else count
+        return min(resident, lower)
+    if family == "olmoe":
+        return min(resident, count * 4) if floating and (head or part in _ATTENTION_PROJECTIONS or part == "mlp.gate") else 0
+    if family == "glm53":
+        # kv_b's absorbed halves and a tied head can remain CPU-readable.
+        # Conservatively reserve those; every matrix listed here is in g53_dho_pass.
+        if not floating or part not in _G53_MATRICES:
+            return 0
+        bits = env.get("GLM53_BITS", "4")
+        lower = count * 4 if bits == "32" else count if bits == "8" else count // 2
+        return min(resident, lower)
+    if family == "kimi":
+        if env.get("K3_MMAP") not in (None, "", "0") or not floating:
+            return 0
+        known = (head or part in _ATTENTION_PROJECTIONS or part in _MLP_PROJECTIONS or
+                 part in ("self_attn.g_proj", "self_attn.q_a_proj", "self_attn.q_b_proj", "self_attn.kv_a_proj_with_mqa", "self_attn.kv_b_proj") or
+                 part in ("block_sparse_moe.routed_expert_down_proj", "block_sparse_moe.routed_expert_up_proj") or
+                 part in {p.replace("mlp.", "block_sparse_moe.", 1) for p in _SHARED_PROJECTIONS})
+        return min(resident, count // 2) if known else 0
+    if family == "inkling":
+        known = head or part in _ATTENTION_PROJECTIONS or part == "self_attn.r_proj" or part in _MLP_PROJECTIONS or part in _SHARED_PROJECTIONS
+        # BF16 may use AVX512-BF16 on the CPU and be ineligible for Vulkan;
+        # packed 2/3-bit or unknown group layouts may be ineligible as well.
+        return resident if known and dtype == "F32" else 0
+    if family == "mimo":
+        known = head or part in ("self_attn.qkv_proj", "self_attn.o_proj") or part in _MLP_PROJECTIONS
+        return min(resident, count) if known else 0
+    if family == "deepseek_v4":
+        # coli_v4_dense_device_only_tensor: layer FP8 matrices and the two
+        # BF16 compressor projections. Head, mHC, routers and scales stay.
+        known = re.fullmatch(r"layers\.\d+\.(?:attn|ffn)\..+\.weight", name)
+        droppable = dtype == "F8_E4M3" or (dtype == "BF16" and name.endswith(("compressor.wkv.weight", "compressor.wgate.weight")))
+        return resident if known and droppable else 0
+    if family == "deepseek_v41":
+        # v41_dho_bytes names the mapped trunk. Sidecar block scales stay.
+        known = re.fullmatch(r"layers\.\d+\.(?:attn\.(?:wq_a|wq_b|wkv|wo_a|wo_b|compressor\.(?:wkv|wgate)|indexer\.(?:wk|wq_b|weights_proj))|ffn\.shared_experts\.w[123]|engram\.wkv)\.weight", name)
+        return resident if known and dtype in ("BF16", "F8_E4M3") else 0
+    # GLM's CLI-selected QT format (including unsupported planar/IQ/E8/2-bit
+    # forms) is not described by this scan. Do not guess a releasable allocation.
+    return 0
+
+
+def vk_dense_device_only(dense_bytes, family_id=None, env=None, vulkan=None):
+    """(device_only, why): whether a Vulkan engine keeps its dense weights on the
+    device only, with no host copy (docs/vulkan.md, "Dense weights on the device
+    only"), as the engine's coli_vk_dense_host_decide() decides it: COLI_VULKAN=1,
+    the dense part on the device (the chain or the per-matrix path), and
+    COLI_VK_DENSE_HOST=0, or unset with an integrated GPU or a discrete one whose
+    free memory, less 1 GiB, holds them. `vulkan` is the device setup_hw would
+    report (probed when None and needed)."""
+    env = os.environ if env is None else env
+    host = _vk_flag(env, "COLI_VK_DENSE_HOST")
+    if host is not None and host != 0:
+        return False, None
+    vulkan = _vk_device(env, vulkan)
+    kind = (vulkan or {}).get("type")
+    if not _vk_dense_active(family_id, env, vulkan):
+        return False, None
+    if host == 0:
+        return True, "COLI_VK_DENSE_HOST=0"
+    if kind == "integrated":
+        return True, "an integrated GPU: its memory is the same RAM"
+    if kind == "discrete":
+        used = sum(heap.get("usage", 0) for heap in vulkan.get("heaps", [])
+                   if heap.get("device_local"))
+        free = ((vulkan.get("budget_bytes") or vulkan.get("device_local_bytes") or 0)
+                - used - (1 << 30))
+        if dense_bytes <= free:
+            return True, "a discrete GPU with room for the dense weights"
+    return False, None
+
+
+# ---- the partial chain (docs/vulkan.md, "A partial chain") ------------------------------
+# When the dense layers do not all fit the device, the chain takes the first N of them and
+# the CPU the rest and the head; only the N layers' host copies can then be dropped. The
+# engine decides N with vkc_fit (vk_chain.c) from what the device has free; this mirrors
+# it, per family, from the scanned tensors and the config:
+#   _VK_CHAIN_LAYOUT[family_id](info, env) -> VkChainLayout(layers, fixed, tail) or None
+#     layers  each layer's device bytes as the engine's fit counts them (its matrices,
+#             each range aligned, its state at its first size, its share of the
+#             parameters), fixed  the engine's fixed bytes (the scratch of one prompt
+#             chunk, without the pools' granularity), tail  what goes up only with every
+#             layer (the head, matrices the per-matrix path uploads as it meets them).
+# Families without an entry keep N = L (the plan as before).
+VkChainLayout = collections.namedtuple("VkChainLayout", "layers fixed tail")
+_VK_CHAIN_LAYOUT = {}
+_VK_ALIGN = 256   # coli_vk_buffer_alignment: a storage buffer's alignment, at least 256
+
+
+def _vk_up(value, align=_VK_ALIGN):
+    return (value + align - 1) // align * align
+
+
+def vk_tensor_bytes(fmt, columns, rows, group=0):
+    """vkc_fit_tensor: a resident tensor's rows at their padded stride and its scales,
+    each range aligned (fmt as the backend numbers them: 10 f32, 11 bf16, 12 fp8 in
+    groups, 1 int8 rows, 2 int4 rows, 4 int4 in groups, 7 MXFP4, 13 int8 in groups)."""
+    row = {10: 4 * columns, 11: 2 * columns, 14: 2 * columns, 12: columns, 13: columns, 1: columns,
+           2: (columns + 1) // 2, 4: (columns + 1) // 2, 7: (columns + 1) // 2}[fmt]
+    data = (row + 3) // 4 * 4 * rows
+    if fmt in (10, 11, 14):
+        scales = 1
+    elif fmt in (4, 7, 12, 13):
+        scales = rows * -(-columns // group)
+    else:
+        scales = rows
+    return _vk_up(data or 4) + _vk_up(4 * scales)
+
+
+def vk_buf_bytes(value):
+    """vkc_fit_buf: a chain buffer (vkc_buf) of `value` bytes."""
+    return _vk_up((max(value, 4) + 3) // 4 * 4)
+
+
+def _vk_layer_index(name):
+    match = re.match(r"(?:model\.)?layers\.(\d+)\.", _text_weight_name(name))
+    return int(match[1]) if match else None
+
+
+def _vk_cap_bytes(env):
+    value = (env.get("COLI_VK_DEVICE_CAP_MB") or "").strip()
+    try:
+        return max(0, int(float(value) * 1048576)) if value else 0
+    except ValueError:
+        return 0
+
+
+def _vk_block(cap, default):
+    """coli_vk_block_bytes: a pool's block, smaller under COLI_VK_DEVICE_CAP_MB."""
+    if not cap:
+        return default
+    block = 64 << 10
+    while block < cap // 4096:
+        block <<= 1
+    return min(block, default)
+
+
+def vk_fit_pools(cap=0):
+    """vkc_fit_pools: a weight block, a block of each chain pool, the frames' staging."""
+    return _vk_block(cap, 256 << 20) + 3 * _vk_block(cap, 64 << 20) + 4 * (4 << 20)
+
+
+def _vk_free_bytes(env, vulkan):
+    """coli_vk_free_bytes as a plan sees it: the cap (the process holds nothing yet),
+    else the device's budget (or its device-local heap) less its heaps' usage."""
+    cap = _vk_cap_bytes(env)
+    if cap:
+        return cap
+    vulkan = vulkan or {}
+    used = sum(heap.get("usage", 0) for heap in vulkan.get("heaps", []) if heap.get("device_local"))
+    return max(0, (vulkan.get("budget_bytes") or vulkan.get("device_local_bytes") or 0) - used)
+
+
+def vk_chain_fit(info, family_id, env=None, vulkan=None):
+    """The engine's vkc_fit for this model and device: {"n", "L", "tail", "forced",
+    "free", "reserve", "fixed", "layers"}, or None when the chain does not run or the
+    family has no layout (N = L then, as before)."""
+    env = os.environ if env is None else env
+    vulkan = _vk_device(env, vulkan)
+    chain, _ = _vk_chain_dense(family_id, env, vulkan)
+    layout_of = _VK_CHAIN_LAYOUT.get(family_id)
+    layout = layout_of(info, env, vulkan) if chain and layout_of else None
+    if layout is None:
+        return None
+    layers = list(layout.layers)
+    count = len(layers)
+    free = _vk_free_bytes(env, vulkan)
+    try:
+        reserve = max(0, int(float(env.get("COLI_VK_TIER_RESERVE_GB") or 1.0) * (1 << 30)))
+    except ValueError:
+        reserve = 1 << 30
+    fixed = layout.fixed + vk_fit_pools(_vk_cap_bytes(env))
+    room = max(0, free - reserve)
+    forced = (env.get("COLI_VK_CHAIN_LAYERS") or "").strip()
+    if forced and forced != "auto":
+        match = re.match(r"\s*([+-]?\d+)", forced)
+        n = min(max(int(match[1]) if match else 0, 0), count)
+        tail = n == count and count > 0
+    elif fixed + sum(layers) <= room:
+        n, tail = count, fixed + sum(layers) + layout.tail <= room
+    else:
+        n, used = 0, fixed
+        while n < count and used + layers[n] <= room:
+            used += layers[n]
+            n += 1
+        tail = False
+    return {"n": n, "L": count, "tail": tail, "forced": bool(forced and forced != "auto"),
+            "free": free, "reserve": reserve, "fixed": fixed, "layers": layers}
+
+
+def _v4_chain_rows(env):
+    """deepseek_v4_chain.h v4c_rows: the CPU's prefill block, COLI_VK_CHAIN_ROWS below it."""
+    def number(name, default):
+        match = re.match(r"\s*([+-]?\d+)", env.get(name) or "")
+        return int(match[1]) if match else default
+    block = number("V4_PREFILL_CHUNK", 128)
+    if block < 1 or block > 128:
+        block = 128
+    value = env.get("COLI_VK_CHAIN_ROWS") or ""
+    rows = number("COLI_VK_CHAIN_ROWS", block) if value.strip() and value.strip() != "auto" else block
+    return min(max(rows, 1), block)
+
+
+def _v4_chain_layout(info, env, vulkan):
+    """deepseek_v4_chain.h: v4c_layer_bytes, v4c_fixed_bytes, v4c_tail_bytes."""
+    c = info.get("config") or {}
+    try:
+        L = int(c["num_hidden_layers"])
+        ratios = [int(r) for r in c["compress_ratios"][:L]]
+        D, H, nh, hd = c["hidden_size"], c.get("hc_mult", 1), c["num_attention_heads"], c["head_dim"]
+        rd, QL, og, ol = c["qk_rope_head_dim"], c["q_lora_rank"], c.get("o_groups", 1), c["o_lora_rank"]
+        W, inter = c["sliding_window"], c["moe_intermediate_size"]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if len(ratios) < L or L < 1:
+        return None
+    IH = c.get("index_n_heads") or 0
+    IH = IH if IH > 0 else 1
+    ID = c.get("index_head_dim") or 0
+    ID = ID if ID > 0 else 2
+    topk = c.get("index_topk") or 0
+    HD, nm, hr = H * D, (2 + H) * H, 2 * H + H * H
+    rows = _v4_chain_rows(env)
+    layers = [0] * L
+    for tensor in info.get("dense_tensors", []):
+        layer, shape = _vk_layer_index(tensor["name"]), tensor.get("shape")
+        if layer is None or layer >= L or not isinstance(shape, list) or len(shape) != 2:
+            continue
+        suffix = re.sub(r"^(?:model\.)?layers\.\d+\.", "", _text_weight_name(tensor["name"]))
+        out, columns, parts, fmt = shape[0], shape[1], 1, 0
+        if tensor["dtype"] == "F8_E4M3":
+            fmt = 12
+            if suffix == "attn.wo_a.weight":
+                parts, out = og, ol
+        elif tensor["dtype"] == "BF16" and (suffix.endswith(("compressor.wkv.weight", "compressor.wgate.weight"))
+                                            or suffix == "attn.indexer.weights_proj.weight"):
+            fmt = 11
+        elif tensor["dtype"] == "F32" and suffix in ("hc_attn_fn", "hc_ffn_fn"):
+            fmt = 10
+        if fmt:
+            layers[layer] += parts * vk_tensor_bytes(fmt, columns, out, 128 if fmt == 12 else 0)
+    for i, r in enumerate(ratios):
+        crows, cproj = (8 if r == 4 else r), (2 if r == 4 else 1) * hd
+        state = vk_buf_bytes((W + rows) * hd * 4)
+        if r > 0:
+            state += vk_buf_bytes(2 * crows * cproj * 4) + vk_buf_bytes(64 * hd * 4)
+        if r == 4:
+            state += vk_buf_bytes(2 * 8 * 2 * ID * 4) + vk_buf_bytes(64 * ID * 4)
+        floats = 2 * D + QL + hd + nh + 2 * (3 + nm)
+        if r > 0:
+            floats += hd + r * cproj
+        if r == 4:
+            floats += ID + 8 * ID
+        floats += min(rows, W) * hd
+        if r > 0:
+            floats += (rows // r) * hd + 2 * (crows if r == 4 else min(rows, r)) * cproj
+        if r == 4:
+            floats += (rows // 4) * ID + 2 * 8 * 2 * ID
+        layers[i] += state + 4 * floats
+    # v4c_scratch's counting pass at `rows` rows, the context of the window and them
+    E = W + rows
+    K = max([topk if r == 4 else E // r if r > 0 else 0 for r in ratios] + [0])
+    LR = W + (K if K > 0 else 1)
+    kinds = 1 + len({r for r in ratios if r > 0 and r != 4})
+    rmax = max([1] + ratios)
+    taps = 3 if int(c.get("num_nextn_predict_layers") or 0) >= 3 else 1
+    r_ = rows
+    counts = [r_ * HD, r_ * HD, r_ * nm, r_ * hr, r_ * hr, r_ * D, r_ * D, r_ * D, r_ * QL, r_ * QL, r_ * QL,
+              r_ * nh * hd, r_ * hd, r_ * nh * hd, r_ * og * ol, r_ * D, r_ * 2 * hd, r_ * 2 * hd,
+              r_ * 2 * ID, r_ * 2 * ID, r_ * IH * ID, r_ * IH, r_ * max(E // 4, 1), kinds * r_ * LR,
+              (2 * r_ + rmax) * rd, r_ * D, r_ * inter, r_ * inter, r_ * inter, r_ * D, r_ * D, r_ * D,
+              r_ * HD, taps * r_ * HD]
+    fixed = sum(4 * (n if n else 1) for n in counts)
+    _, dense = _vk_chain_dense("deepseek_v4", env, vulkan)
+    tail = 0
+    if dense:
+        tail = (vk_tensor_bytes(11, D, int(c.get("vocab_size") or 0)) +
+                L * vk_tensor_bytes(11, D, int(c.get("n_routed_experts") or 0)))
+    return VkChainLayout(layers, fixed, tail)
+
+
+_VK_CHAIN_LAYOUT["deepseek_v4"] = _v4_chain_layout
+
+
+# ---- qwen36 (Qwen3.6, Qwen3-Coder, Qwen3.8-27B, Clef's backbone) and olmoe ------------
+def _vk_chain_rows(env, default=256):
+    """vkc_fit_rows: COLI_VK_CHAIN_ROWS when it is a number, else the engine's block."""
+    value = (env.get("COLI_VK_CHAIN_ROWS") or "").strip()
+    match = re.match(r"\s*([+-]?\d+)", value)
+    if not value or value == "auto" or not match:
+        return default
+    return min(max(int(match[1]), 1), 65535)
+
+
+def _vk_kv_block(env):
+    match = re.match(r"\s*([+-]?\d+)", env.get("COLI_VK_KV_BLOCK") or "")
+    return max(int(match[1]) if match else 64, 1)
+
+
+def _q36_dense_fmt(env, tag, columns):
+    """The format qwen36.c puts a dense matrix on the device in (load_tq, vk_qw_fmt): f32
+    with COLI_DENSE_I8=0, f16 with COLI_DENSE_BITS=16, int4 in groups of 64 with
+    COLI_DENSE_BITS=4 where COLI_DENSE_INT4 (unset: every tag) names its tag and the
+    columns divide by 64, else int8 rows."""
+    if (env.get("COLI_DENSE_I8") or "").strip() == "0":
+        return 10
+    match = re.match(r"\s*([+-]?\d+)", env.get("COLI_DENSE_BITS") or "")
+    bits = int(match[1]) if match else 8
+    if bits == 16:
+        return 14
+    if bits == 4 and columns % 64 == 0:
+        tags = (env.get("COLI_DENSE_INT4") or "").strip()
+        if not tags or tag in re.split(r"[ ,]+", tags):
+            return 4
+    return 1
+
+
+# the matrices qwen36's chain multiplies by, and load_tq's tag for each (a dense model's
+# MLP loads as the shared expert)
+_Q36_CHAIN_TAGS = {"self_attn.q_proj": "attn", "self_attn.k_proj": "attn", "self_attn.v_proj": "attn",
+                   "self_attn.o_proj": "attn", "linear_attn.in_proj_qkv": "dnproj",
+                   "linear_attn.in_proj_z": "dnproj", "linear_attn.out_proj": "dnout", "mlp.gate": "router",
+                   "mlp.shared_expert.gate_proj": "shexp", "mlp.shared_expert.up_proj": "shexp",
+                   "mlp.shared_expert.down_proj": "shexp", "mlp.gate_proj": "shexp", "mlp.up_proj": "shexp",
+                   "mlp.down_proj": "shexp"}
+
+
+def _q36_chain_layout(info, env, vulkan):
+    """qwen36_chain.h: q36c_fit_layer, q36c_start's fixed bytes and lm_head as the tail,
+    from the scanned matrices' shapes and the scalars of qwen36_meta.json (what the engine
+    reads; config.json's when the checkpoint has none)."""
+    try:
+        meta = json.loads((Path(info["path"]) / "qwen36_meta.json").read_text(encoding="utf-8"))
+    except (KeyError, OSError, ValueError):
+        meta = {}
+    c = info.get("config") or {}
+    c = c.get("text_config", c)
+    try:
+        L = int(meta.get("n_layers") or c["num_hidden_layers"])
+        D = int(meta.get("hidden") or c["hidden_size"])
+        hd = int(meta.get("head_dim") or c["head_dim"])
+        kdim = int(meta.get("dn_kdim") or c.get("linear_key_head_dim") or 0)
+        convk = int(meta.get("dn_convk") or c.get("linear_conv_kernel_dim") or 0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    types = meta.get("layer_types") or c.get("layer_types")
+    if not isinstance(types, list):
+        interval = int(c.get("full_attention_interval") or 4)
+        types = ["full_attention" if i % interval == interval - 1 else "linear_attention" for i in range(L)]
+    if L < 1 or len(types) < L:
+        return None
+    attn = [t == "full_attention" for t in types[:L]]
+    rot = int(meta.get("rotary_dim") or 0)
+    if rot <= 0:
+        factor = float(meta.get("partial_rotary_factor") or c.get("partial_rotary_factor") or 0)
+        rot = int(hd * factor + 0.5) if factor > 0 else hd
+        rot = min(max(rot + rot % 2, 2), hd)
+    # the shapes the engine loads, from the checkpoint
+    rows_of, layers, norms = {}, [0] * L, [0] * L
+    matrices = []
+    for tensor in info.get("dense_tensors", []):
+        name, shape = _text_weight_name(tensor["name"]), tensor.get("shape")
+        layer, part = _vk_layer_index(name), _layer_component(name)
+        if layer is not None and layer < L and part in ("self_attn.q_norm", "self_attn.k_norm"):
+            norms[layer] += hd
+            continue
+        if not isinstance(shape, list) or len(shape) != 2:
+            continue
+        if name == "lm_head.weight" or (layer is not None and layer < L and (part in _Q36_CHAIN_TAGS or part in (
+                "linear_attn.in_proj_b", "mlp.shared_expert_gate"))):
+            rows_of.setdefault(name if layer is None else part, shape)
+            matrices.append((layer, part if layer is not None else name, shape))
+    def rows(part, default=0):
+        return rows_of[part][0] if part in rows_of else default
+    E = rows("mlp.gate")
+    SI = rows("mlp.shared_expert.gate_proj") or rows("mlp.gate_proj")
+    vh = rows("linear_attn.in_proj_b")
+    conv, vd = rows("linear_attn.in_proj_qkv"), rows("linear_attn.in_proj_z")
+    qo, kvo = rows("self_attn.q_proj"), rows("self_attn.k_proj")
+    o_in = rows_of["self_attn.o_proj"][1] if "self_attn.o_proj" in rows_of else 0
+    vocab = rows("lm_head.weight", int(c.get("vocab_size") or 0))
+    vdim = vd // vh if vh else 0
+    # COLI_VK_IMPORT (qwen36.c main, vk_qw_tensor): int8 and f16 rows read in place, only
+    # their scales on the device; by default for a model without routed experts on a device
+    # sharing the CPU's RAM, never while host copies are dropped off a non-integrated one
+    kind = (vulkan or {}).get("type")
+    flag = _vk_flag(env, "COLI_VK_IMPORT")
+    imports = flag != 0 if flag is not None else E == 0 and kind in ("integrated", "cpu")
+    if imports and kind != "integrated" and _vk_flag(env, "COLI_VK_DENSE_HOST") == 0:
+        imports = False
+
+    def placed(tag, shape):
+        out, columns = shape
+        fmt = _q36_dense_fmt(env, tag, columns)
+        if imports and fmt in (1, 14):
+            return _vk_up(4 * (out if fmt == 1 else 1))
+        return vk_tensor_bytes(fmt, columns, out, 64 if fmt == 4 else 0)
+    head = 0
+    for layer, part, shape in matrices:
+        if layer is None:
+            head = placed("lmhead", shape)
+        elif part in _Q36_CHAIN_TAGS:
+            layers[layer] += placed(_Q36_CHAIN_TAGS[part], shape)
+        elif part == "mlp.shared_expert_gate" and E and SI:
+            layers[layer] += vk_tensor_bytes(10, D, 1)                 # the gate row, f32
+    for i in range(L):
+        floats = 2 * D
+        if attn[i]:
+            floats += norms[i]
+            layers[i] += 2 * vk_buf_bytes(kvo * 3 * _vk_kv_block(env) * 4)   # the K/V mirror at the split's floor
+        else:
+            floats += conv * convk + 2 * vh + vdim
+            layers[i] += vk_tensor_bytes(10, D, 2 * vh)                # the b|a rows, f32
+            layers[i] += vk_buf_bytes(vh * kdim * vdim * 4) + vk_buf_bytes(conv * (convk - 1) * 4)
+        layers[i] += 4 * floats                                        # its share of the parameters
+    # q36c_bufs for the fit's rows, their read-back, the arena's final norm
+    r, n_attn = _vk_chain_rows(env), sum(attn)
+    counts = [r * D, r * D, r * D, r * qo, r * kvo, r * kvo, r * o_in, r * conv, r * vd, r * 2 * vh, r * conv,
+              r * vd, r * D, r * max(E, 1), r * max(SI, 1), r * max(SI, 1), r * max(SI, 1), r * D, r, D, r * D,
+              r * max(E, 1), max(n_attn, 1) * 2 * r * kvo, vocab, r * D, r * max(rot, 2), r * D]
+    fixed = sum(vk_buf_bytes(4 * max(n, 1)) for n in counts) + vk_buf_bytes(4 * D) + vk_buf_bytes(4)
+    return VkChainLayout(layers, fixed, head)
+
+
+_VK_CHAIN_LAYOUT["qwen36"] = _q36_chain_layout
+
+
+def _olmoe_chain_layout(info, env, vulkan):
+    """olmoe_chain.h olc_fit_start: q, k, v, o and the router as f32 tensors, the K/V
+    mirror at the split's floor, the parameters; one chunk's scratch; lm_head the tail."""
+    c = info.get("config") or {}
+    try:
+        L, D, H = int(c["num_hidden_layers"]), int(c["hidden_size"]), int(c["num_attention_heads"])
+        E, vocab = int(c["num_experts"]), int(c["vocab_size"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if L < 1 or H < 1 or D % H:
+        return None
+    hd = D // H
+    layer = (4 * vk_tensor_bytes(10, D, D) + vk_tensor_bytes(10, D, E) +
+             2 * vk_buf_bytes(H * 3 * _vk_kv_block(env) * hd * 4) + 4 * 4 * D)
+    r = _vk_chain_rows(env)
+    counts = [r * D] * 8 + [r * E, D, r * D, r * E, 2 * r * D, vocab, r * D, r * hd, r * D]
+    if (env.get("PILOT") or "").strip() not in ("", "0"):
+        counts.append(r * D)   # PILOT's rows after attention
+    fixed = sum(vk_buf_bytes(4 * max(n, 1)) for n in counts) + vk_buf_bytes(4 * D) + vk_buf_bytes(4)
+    return VkChainLayout([layer] * L, fixed, vk_tensor_bytes(10, D, vocab))
+
+
+_VK_CHAIN_LAYOUT["olmoe"] = _olmoe_chain_layout
+
+
+_Q38_CHAIN_MATRICES = frozenset(_Q38_TRUNK_COMPONENTS) | {
+    "linear_attn.in_proj_a", "linear_attn.in_proj_b", "ple.key_proj", "ple.value_proj"}
+
+
+def _q38_env_int(env, name, default):
+    """C's atol/atoi: the leading integer, 0 when there is none."""
+    value = env.get(name)
+    if value is None or not value.strip():
+        return default
+    match = re.match(r"\s*([+-]?\d+)", value)
+    return int(match[1]) if match else 0
+
+
+def _q38_vk_fmt(tensor, tag, env):
+    """q38_vk_fmt: the format a resident matrix goes up in. The trunk's int8 rows (fmt 1)
+    when q38_trunk_cpu_int8 quantized it (a trunk component of at least Q38_TRUNK_MIN_KB
+    with its float scales, not in Q38_TRUNK_SKIP); else the rows as loaded: bf16 (fmt 11)
+    from a BF16 tensor with Q38_NATIVE_BF16, f32 (fmt 10) otherwise."""
+    rows, columns = tensor["shape"]
+    if tag and env.get("Q38_TRUNK_CPU_INT8") != "0":
+        min_kb = _q38_env_int(env, "Q38_TRUNK_MIN_KB", 1024)
+        skipped = set((env.get("Q38_TRUNK_SKIP") or "").split(","))
+        if min_kb >= 0 and rows * columns + 4 * rows >= min_kb * 1024 and tag not in skipped:
+            return 1
+    return 11 if tensor["dtype"] == "BF16" and env.get("Q38_NATIVE_BF16") != "0" else 10
+
+
+def _q38_chain_layout(info, env, vulkan):
+    """qwen38_chain.h: q38c_fit_layer, q38c_fit_fixed, q38c_fit_tail. None for a device
+    whose memory the plan does not know (no budget, no heap size, no cap) unless N is
+    forced: no prediction, the plan as before (every layer and every host copy)."""
+    device = vulkan or {}
+    known = _vk_cap_bytes(env) or device.get("budget_bytes") or device.get("device_local_bytes")
+    if not known and (env.get("COLI_VK_CHAIN_LAYERS") or "").strip() in ("", "auto"):
+        return None
+    c = info.get("config") or {}
+    c = c.get("text_config") or c
+    try:
+        L, H, vocab = int(c["num_hidden_layers"]), int(c["hidden_size"]), int(c["vocab_size"])
+        kinds = [0 if t == "linear_attention" else 1 for t in c["layer_types"]][:L]
+        QH, KVH, D = int(c["num_attention_heads"]), int(c["num_key_value_heads"]), int(c["head_dim"])
+        IQ, ID = int(c["indexer_n_heads"]), int(c["indexer_head_dim"])
+        budget, ratio = int(c["indexer_budget"]), int(c["indexer_compress_ratio"])
+        VH, VD = int(c["linear_num_value_heads"]), int(c["linear_value_head_dim"])
+        KH, KD, CK = int(c["linear_num_key_heads"]), int(c["linear_key_head_dim"]), int(c["linear_conv_kernel_dim"])
+        E, SI = int(c["num_experts"]), int(c["shared_expert_intermediate_size"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if L < 1 or len(kinds) != L:
+        return None
+    C, R = int(c.get("hc_count") or 4), int(c.get("hc_lowrank") or 320)
+    W = C * H
+    rope = c.get("rope_parameters") or {}
+    partial = rope.get("partial_rotary_factor", c.get("partial_rotary_factor", 1.0))
+    rotary = int(D * float(partial if partial is not None else 1.0))
+    ngram, per_ngram = int(c.get("ngram_size") or 3), int(c.get("heads_per_ngram") or 8)
+    ple_dim, ple_k = int(c.get("ple_embed_dim") or H), int(c.get("ple_conv_kernel_size") or 4)
+    heads = (ngram - 1) * per_ngram
+    Ep = max(heads * (ple_dim // heads if heads > 0 else 0), 1)
+    ids = c.get("ple_layer_ids") or []
+    ple = int(ids[0]) - 1 if ids else -1
+    CD = 2 * KH * KD + VH * VD
+    rows = _q38_chain_rows(env)
+    rows0 = 3 * max(_q38_env_int(env, "COLI_VK_KV_BLOCK", 64), 1)
+    kvo = KVH * D
+    # each layer's matrices as they go up, and the shared expert's gate (fmt 10, H x 1)
+    layers = [vk_tensor_bytes(10, H, 1) for _ in range(L)]
+    for tensor in info.get("dense_tensors", []):
+        layer, part, shape = _vk_layer_index(tensor["name"]), _layer_component(tensor["name"]), tensor.get("shape")
+        if layer is None or layer >= L or part not in _Q38_CHAIN_MATRICES or not isinstance(shape, list) or len(shape) != 2:
+            continue
+        if part.startswith("ple.") and layer != ple:
+            continue
+        fmt = _q38_vk_fmt(tensor, _Q38_TRUNK_COMPONENTS.get(part), env)
+        layers[layer] += vk_tensor_bytes(fmt, shape[1], shape[0])
+    for i in range(L):
+        floats = 2 * W
+        if kinds[i]:
+            floats += 2 * D + 2 * ID
+            layers[i] += (2 * vk_buf_bytes(kvo * rows0 * 4) + vk_buf_bytes(ID * rows0 * 4) +
+                          vk_buf_bytes(ID * (rows0 // max(ratio, 1) + 1) * 4) + rows * (2 * kvo + ID) * 4)
+        else:
+            floats += CD * CK + 2 * VH + VD
+            layers[i] += 2 * vk_buf_bytes(VH * KD * VD * 4) + 2 * vk_buf_bytes(CD * (CK - 1) * 4)
+        if i == ple:
+            floats += 3 * W + W * ple_k
+            layers[i] += vk_buf_bytes(2 * W * (ple_k - 1) * ngram * 4)
+        layers[i] += 4 * floats
+    # q38c_bufs' counting pass at `rows` rows, no context yet and no attention layer, the
+    # streams' read-back and the final norm
+    r, nb, rot = rows, 1, rotary if rotary > 0 else 2
+    counts = [r * W, r * W, r * R, r * W, r * H, r * C, r * C, r * H, r * QH * 2 * D, r * kvo, r * kvo,
+              r * (IQ + 1) * ID, r * QH * D, r * 2 * nb, r * (budget + ratio), r * CD, r * VH * VD, r * 2 * VH,
+              r * CD, r * VH * VD, r * E, r * SI, r * SI, r * SI, r * H, r, r * H, r * W, r * H, r * W, r * W,
+              r * H, r * E, r * (2 * kvo + ID), 2 * vocab, r * H, r * Ep, r * rot, nb * rot]
+    fixed = sum(4 * (n if n else 1) for n in counts) + (rows + 1) * W * 4
+    # the tail: the final mixer and lm_head; under Q38_MTP=1 the MTP head's matrices too
+    # (the scan leaves its tensors out: its decoder layer has an attention layer's shapes,
+    # its two projections are H x H and its mixer the final mixer's)
+    tail, head_dtype = 0, "BF16"
+    attn_parts = {}
+    last_attn = max([i for i in range(L) if kinds[i]] + [-1])
+    for tensor in info.get("dense_tensors", []):
+        name, shape = _text_weight_name(tensor["name"]), tensor.get("shape")
+        if not isinstance(shape, list) or len(shape) != 2:
+            continue
+        if name == "lm_head.weight":
+            head_dtype = tensor["dtype"]
+            tail += vk_tensor_bytes(_q38_vk_fmt(tensor, "lmhead", env), shape[1], shape[0])
+        elif name in ("model.hyper_connection_mixer.input_mix_weight_down.weight",
+                      "model.hyper_connection_mixer.input_mix_weight_up.weight"):
+            tail += vk_tensor_bytes(_q38_vk_fmt(tensor, None, env), shape[1], shape[0])
+        elif _vk_layer_index(tensor["name"]) == last_attn and _layer_component(tensor["name"]) in _Q38_CHAIN_MATRICES:
+            attn_parts[_layer_component(tensor["name"])] = tensor
+    if env.get("Q38_MTP") == "1" and int(c.get("mtp_num_hidden_layers") or 0) == 1:
+        for part, tensor in attn_parts.items():
+            tail += vk_tensor_bytes(_q38_vk_fmt(tensor, _Q38_TRUNK_COMPONENTS.get(part), env),
+                                    tensor["shape"][1], tensor["shape"][0])
+        for tag, out, cols in (("mtpfce", H, H), ("mtpfch", H, H), ("mtpmixd", R, W), ("mtpmixu", W, R)):
+            tensor = {"shape": [out, cols], "dtype": head_dtype}
+            tail += vk_tensor_bytes(_q38_vk_fmt(tensor, tag, env), cols, out)
+    return VkChainLayout(layers, fixed, tail)
+
+
+def _q38_chain_rows(env):
+    """vkc_fit_rows(256): COLI_VK_CHAIN_ROWS when it is a number, else 256."""
+    value = (env.get("COLI_VK_CHAIN_ROWS") or "").strip()
+    if not value or value == "auto":
+        return 256
+    return min(max(_q38_env_int(env, "COLI_VK_CHAIN_ROWS", 256), 1), 65535)
+
+
+_VK_CHAIN_LAYOUT["qwen38"] = _q38_chain_layout
+
+
+def _glm53_chain_layout(info, env, vulkan):
+    """glm53_chain.h g53c_fit_plan: each layer's device bytes (the mHC mixes in f32, its
+    matrices at GLM53_BITS as quantize_loaded leaves them, an int4 container's as it is,
+    the absorbed kv_b halves, its share of the parameter arena, a KDA layer's state and
+    window, an MLA layer's caches at their first 256 positions), the scratch of one prompt
+    chunk at GLM53_MAXT and the head."""
+    config = info.get("config") or {}
+    c = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
+    try:
+        L, D, V = int(c["num_hidden_layers"]), int(c["hidden_size"]), int(c["vocab_size"])
+        H = int(c.get("hc_mult") or 1)
+        linear = c["linear_attn_config"]
+        kh, kd, ck = int(linear["num_heads"]), int(linear["head_dim"]), int(linear["short_conv_kernel_size"])
+        nh, ql, kvl = int(c["num_attention_heads"]), int(c["q_lora_rank"]), int(c["kv_lora_rank"])
+        qn, qr, vh = int(c["qk_nope_head_dim"]), int(c.get("qk_rope_head_dim") or 0), int(c["v_head_dim"])
+        di, mi, ns = int(c["intermediate_size"]), int(c["moe_intermediate_size"]), int(c.get("n_shared_experts") or 1)
+        kinds = list(c["layer_types"])[:L]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if len(kinds) < L or L < 1:
+        return None
+    IH, ID = int(c.get("index_n_heads") or 0), int(c.get("index_head_dim") or 0)
+    pool, topk = int(c.get("index_kpool") or 1), int(c.get("index_topk") or 0)
+    full = ["linear" not in str(k) for k in kinds]
+    if c.get("first_k_dense_replace") is not None:
+        first_dense = int(c["first_k_dense_replace"])
+    else:
+        mlp = c.get("mlp_layer_types") or []
+        first_dense = next((i for i, k in enumerate(mlp) if "sparse" in str(k)), len(mlp))
+    setting = re.match(r"\s*([+-]?\d+)", env.get("GLM53_BITS", "4"))
+    bits = int(setting[1]) if setting else 4
+    packed = {_text_weight_name(t["name"]) for t in info.get("dense_tensors", []) if t.get("dtype") in ("U8", "I8")}
+    P, nm, HD = kh * kd, (2 + H) * H, H * D
+
+    def mat(rows, columns, name=None):
+        if name is not None and name in packed:
+            return vk_tensor_bytes(4, columns, rows, 64)
+        if bits == 32:
+            return vk_tensor_bytes(10, columns, rows)
+        if bits == 4 and columns % 64 == 0:
+            return vk_tensor_bytes(4, columns, rows, 64)
+        return vk_tensor_bytes(1, columns, rows)
+    layers = []
+    for i in range(L):
+        p = f"model.layers.{i}."
+        size = 2 * vk_tensor_bytes(10, HD, nm)
+        if full[i]:
+            a = p + "self_attn."
+            size += (mat(ql, D, a + "q_a_proj.weight") + mat(nh * (qn + qr), ql, a + "q_b_proj.weight") +
+                     mat(kvl + qr, D, a + "kv_a_proj_with_mqa.weight") + mat(nh * kvl, qn) + mat(nh * vh, kvl) +
+                     mat(D, nh * vh, a + "o_proj.weight") + mat(IH * ID, ql, a + "indexer.wq_b.weight") +
+                     mat(ID, D, a + "indexer.wk.weight") + mat(IH, D, a + "indexer.weights_proj.weight") +
+                     mat(ID, D, a + "indexer.index_kpool_compress_gate"))
+            floats = 2 * D + 2 * (3 + nm) + ql + kvl + 2 * ID + pool * ID
+            size += (vk_buf_bytes(256 * kvl * 4) + 2 * vk_buf_bytes(256 * ID * 4) +
+                     vk_buf_bytes((256 // pool + 1) * ID * 4))
+        else:
+            a = p + "self_attn."
+            size += (mat(P, D, a + "q_proj.weight") + mat(P, D, a + "k_proj.weight") + mat(P, D, a + "v_proj.weight") +
+                     mat(D, P, a + "o_proj.weight") + mat(kd, D, a + "g_a_proj.weight") + mat(P, kd, a + "g_b_proj.weight") +
+                     mat(kd, D, a + "f_a_proj.weight") + mat(P, kd, a + "f_b_proj.weight") + mat(kh, D, a + "b_proj.weight"))
+            floats = 2 * D + 2 * (3 + nm) + 3 * P * ck + kh + P + kd
+            size += vk_buf_bytes(3 * P * ck * 4) + vk_buf_bytes(kh * kd * kd * 4)
+        m = p + ("mlp." if i < first_dense else "mlp.shared_experts.")
+        inner = di if i < first_dense else mi * ns
+        size += mat(inner, D, m + "gate_proj.weight") + mat(inner, D, m + "up_proj.weight") + mat(D, inner, m + "down_proj.weight")
+        layers.append(size + 4 * floats)
+    # g53c_scratch's counting pass for one chunk (every layer's new rows down) and the MLA
+    # scratch, at vkc_fit_rows(128) rows and a serve slot's context
+    value = (env.get("COLI_VK_CHAIN_ROWS") or "").strip()
+    match = re.match(r"([+-]?\d+)", value) if value and value != "auto" else None
+    r = min(max(int(match[1]), 1), 65535) if match else 128
+    match = re.match(r"\s*([+-]?\d+)", env.get("GLM53_MAXT") or "")
+    ctx = max(int(match[1]) if match else 8192, 64)
+    wide = max(di, mi)
+    width = topk + pool - 1 if c.get("index_kpool_always_select_tail") else topk
+    counts = [r * HD, r * HD, r * D, r * D, r * D, r * nm, r * (2 * H + H * H), r * wide, r * wide, r * wide, r * D,
+              r * D, L * r * (kvl + 2 * ID), r * HD, r * D]
+    if P > 0:
+        counts += [3 * r * P, 3 * r * P, r * P, r * kh, r * P, r * kd, r * P]
+    if any(full):
+        counts += [r * ID, r * IH * ID, r * IH, r * ID, r * (ctx // pool + 1), r * (1 + width)]
+        counts += [r * ql, r * nh * qn, r * kvl, r * nh * kvl, r * nh * kvl, r * nh * vh]
+    fixed = sum(vk_buf_bytes(4 * (n if n else 1)) for n in counts) + vk_buf_bytes(4)
+    tail = 0 if c.get("tie_word_embeddings") else mat(V, D, "lm_head.weight")
+    return VkChainLayout(layers, fixed, tail)
+
+
+_VK_CHAIN_LAYOUT["glm53"] = _glm53_chain_layout
+
+
+def _vk_rows(env, default):
+    """vkc_fit_rows(default): COLI_VK_CHAIN_ROWS when a number, else the engine's block."""
+    value = (env.get("COLI_VK_CHAIN_ROWS") or "").strip()
+    if not value or value == "auto":
+        return default
+    match = re.match(r"\s*([+-]?\d+)", value)
+    rows = int(match[1]) if match else 0
+    return min(max(rows, 1), 65535)
+
+
+def _v41_chain_layout(info, env, vulkan):
+    """deepseek_v41_chain.h: v41c_layer_bytes, v41c_fixed_bytes, v41c_tail_bytes, with the
+    device-only placement's extra matrices when COLI_VK_DENSE_HOST may drop the host copies
+    (v41c_fit_now runs at v41_dho_open then)."""
+    root = info.get("config") or {}
+    c = root.get("text_config") or root
+    try:
+        L = int(c.get("n_layers") or c["num_hidden_layers"])
+        D = int(c.get("dim") or c["hidden_size"])
+        nh = int(c.get("n_heads") or c["num_attention_heads"])
+        hd, QL, ol = int(c["head_dim"]), int(c["q_lora_rank"]), int(c["o_lora_rank"])
+        og = int(c.get("o_groups") or 1)
+        inter = int(c.get("moe_inter_dim") or c["moe_intermediate_size"])
+        rd = int(c.get("rope_head_dim") or c["qk_rope_head_dim"])
+        W = int(c.get("window_size") or c.get("sliding_window") or 128)
+        ratios = [int(r) for r in c["compress_ratios"][:L]]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if L < 1 or len(ratios) < L or og < 1:
+        return None
+    H = int(c.get("hc_mult") or 1)
+    IH0, ID0 = int(c.get("index_n_heads") or 0), int(c.get("index_head_dim") or 0)
+    K = max(int(c.get("index_topk") or 0), 0)
+    kv_source = set(c.get("kv_source_layers") or c.get("kv_source_layer_ids") or [])
+    index_source = set(c.get("index_source_layers") or c.get("index_source_layer_ids") or [])
+    targets = len(c.get("dspark_target_layer_ids") or [])
+    maxpos = int(c.get("max_seq_len") or c.get("max_position_embeddings") or 4096)
+    match = re.match(r"\s*([+-]?\d+)", env.get("CTX") or "")
+    if match and 2 <= int(match[1]) < maxpos:
+        maxpos = int(match[1])
+    nm, hr, HD = (2 + H) * H, 2 * H + H * H, H * D
+    # the engram tables (a sidecar the scan does not read): the layers whose wkv is there
+    engram = {}
+    for tensor in info.get("dense_tensors", []):
+        name = _text_weight_name(tensor["name"])
+        found = re.fullmatch(r"layers\.(\d+)\.engram\.wkv\.weight", name)
+        if found and isinstance(tensor.get("shape"), list) and len(tensor["shape"]) == 2:
+            engram[int(found[1])] = tensor["shape"]
+    host = _vk_flag(env, "COLI_VK_DENSE_HOST")
+    dho = host is None or host == 0
+    prefill = _vk_flag(env, "COLI_VK_CHAIN") == 2
+    views = prefill and dho
+    rows = _vk_rows(env, 512)
+    ring = _vk_rows(env, 512)
+
+    def t(fmt, columns, out):
+        return vk_tensor_bytes(fmt, columns, out, 32 if fmt == 12 else 0)
+    layers = []
+    for i in range(L):
+        r = ratios[i]
+        b = 2 * t(10, HD, nm) + t(12, D, QL) + t(12, QL, nh * hd) + t(12, D, hd)
+        b += t(12, nh * hd // og, og * ol) + (og * t(12, nh * hd // og, ol) if views else 0)
+        b += t(12, og * ol, D) + 2 * t(12, D, inter) + t(12, inter, D)
+        if i in kv_source:
+            b += t(11, D, hd) + (t(11, D, hd) if r > 1 else 0) + t(11, hd, ID0)
+        if i in index_source and (r > 0 or dho):
+            b += t(12, QL, IH0 * ID0) + t(11, D, IH0)
+        if i in engram:
+            b += t(12, engram[i][1], engram[i][0])
+        b += vk_buf_bytes((W + ring) * hd * 4)
+        floats = 2 * D + QL + hd + nh + 2 * (3 + nm)
+        if i in kv_source and r > 0:
+            first = min(64, max(maxpos // r, 1))
+            if r > 1:
+                b += vk_buf_bytes(2 * r * hd * 4)
+            b += vk_buf_bytes(first * hd * 4) + vk_buf_bytes(first * ID0 * 4)
+            floats += hd + ID0 + (rows // r) * (hd + ID0) + (2 * r * hd if r > 1 else 0)
+        if i in engram:
+            floats += 2 * H * D
+        floats += min(rows, W) * hd
+        layers.append(b + 4 * floats)
+    # v41c_scratch's counting pass at `rows` rows, the context of the window and them
+    IH, ID = IH0 if IH0 > 0 else 1, ID0 if ID0 > 0 else 1
+    rmax = max([1] + [ratios[i] for i in kv_source if i < L])
+    ew = next(iter(engram.values()))[1] if engram else 1
+    T = targets if targets > 0 else 1
+    wcap, n = W + rows, rows
+    counts = [n * HD, n * HD, n * nm, n * hr, n * hr, n * D, n * D, n * QL, n * QL, n * nh * hd, n * hd,
+              n * nh * hd, n * og * ol, n * D, n * hd, n * hd, n * IH * ID, n * IH, n * wcap, n * wcap,
+              n * (W + K), (n + rmax) * 2 * rd, n * ew, n * D * (H + 1), n * inter, n * inter, n * inter,
+              n * D, n * D, n * T * D, n * HD, n * hr, n * D]
+    fixed = sum(4 * (x if x else 1) for x in counts)
+    _, dense = _vk_chain_dense("deepseek_v41", env, vulkan)
+    tail = 0
+    if dense:
+        tail = t(11, D, int(c.get("vocab_size") or 0)) + L * t(11, D, int(c.get("n_routed_experts") or 0))
+        if prefill and not dho:
+            tail += L * og * t(12, nh * hd // og, ol)
+    return VkChainLayout(layers, fixed, tail)
+
+
+def _k3_vk_fmt(tensors, name, out, columns, bits, explicit):
+    """kimi_k3.c w_load as the device takes the result (k3_vk_fmt): (fmt, group)."""
+    tensor = tensors.get(name)
+    if tensor is not None and tensor["dtype"] == "U8":   # a repacked container: its own bits
+        if tensor["size"] == out * columns:
+            return (4, 64) if explicit and bits == 4 and columns % 64 == 0 else (1, 0)
+        return (4, 64)
+    if bits >= 32:
+        return (10, 0)
+    if bits <= 4 and columns % 64 == 0:
+        return (4, 64)
+    return (1, 0)
+
+
+def _k3_chain_layout(info, env, vulkan):
+    """kimi_k3_chain.h: k3c_layer_bytes, k3c_fixed_bytes, the head as the tail."""
+    root = info.get("config") or {}
+    c = root.get("text_config") or root
+    la = c.get("linear_attn_config") or {}
+    try:
+        L, D, vocab = int(c["num_hidden_layers"]), int(c["hidden_size"]), int(c["vocab_size"])
+        first_dense, dense_inter = int(c["first_k_dense_replace"]), int(c["intermediate_size"])
+        nh, QL, KL = int(c["num_attention_heads"]), int(c["q_lora_rank"]), int(c["kv_lora_rank"])
+        nope, R, V = int(c["qk_nope_head_dim"]), int(c["qk_rope_head_dim"]), int(c["v_head_dim"])
+        E, inter, LT = int(c["num_experts"]), int(c["moe_intermediate_size"]), int(c["routed_expert_hidden_size"])
+        shared, res_bs = int(c["num_shared_experts"]), int(c["attn_res_block_size"])
+        heads, hd, conv = int(la["num_heads"]), int(la["head_dim"]), int(la["short_conv_kernel_size"])
+        kda = {int(v) - 1 for v in la["kda_layers"]}
+    except (KeyError, TypeError, ValueError):
+        return None
+    if L < 1 or res_bs < 1:
+        return None
+    P = heads * hd
+
+    def number(name, default):
+        match = re.match(r"\s*([+-]?\d+)", env.get(name) or "")
+        return int(match[1]) if match else default
+    explicit = (env.get("K3_BITS") is not None)
+    bits, mbits, hbits = number("K3_BITS", 4), number("K3_MLA_BITS", 8), number("K3_HEAD_BITS", 8)
+    tensors = {_text_weight_name(tensor["name"]): tensor for tensor in info.get("dense_tensors", [])}
+
+    def w(name, out, columns, b):
+        fmt, group = _k3_vk_fmt(tensors, name, out, columns, b, explicit)
+        return vk_tensor_bytes(fmt, columns, out, group)
+    rows = _vk_rows(env, 256)
+    layers = []
+    for i in range(L):
+        p = f"model.layers.{i}."
+        b, floats = 0, 4 * D
+        if i in kda:
+            for part in ("q", "k", "v", "g"):
+                b += w(p + f"self_attn.{part}_proj.weight", P, D, bits)
+            b += w(p + "self_attn.o_proj.weight", D, P, bits)
+            b += vk_tensor_bytes(10, D, hd) + vk_tensor_bytes(10, hd, P) + vk_tensor_bytes(10, D, heads)
+            b += vk_buf_bytes(3 * P * conv * 4) + vk_buf_bytes(heads * hd * hd * 4)
+            floats += 3 * P * conv + heads + P + hd
+        else:
+            b += (w(p + "self_attn.q_a_proj.weight", QL, D, mbits) +
+                  w(p + "self_attn.q_b_proj.weight", nh * (nope + R), QL, mbits) +
+                  w(p + "self_attn.kv_a_proj_with_mqa.weight", KL + R, D, mbits) +
+                  w(p + "self_attn.kv_b_proj.weight", nh * (nope + V), KL, mbits) +
+                  w(p + "self_attn.o_proj.weight", D, nh * V, mbits) +
+                  w(p + "self_attn.g_proj.weight", nh * V, D, mbits))
+            b += vk_buf_bytes(rows * KL * 4) + (vk_buf_bytes(rows * R * 4) if R > 0 else 0)
+            floats += QL + KL + rows * (KL + R)
+        if i >= first_dense:
+            moe, si = p + "block_sparse_moe.", inter * shared
+            b += vk_tensor_bytes(10, D, E)
+            b += (w(moe + "routed_expert_down_proj.weight", LT, D, bits) + w(moe + "routed_expert_up_proj.weight", D, LT, bits) +
+                  w(moe + "shared_experts.gate_proj.weight", si, D, bits) + w(moe + "shared_experts.up_proj.weight", si, D, bits) +
+                  w(moe + "shared_experts.down_proj.weight", D, si, bits))
+            floats += LT
+        else:
+            b += (w(p + "mlp.gate_proj.weight", dense_inter, D, bits) + w(p + "mlp.up_proj.weight", dense_inter, D, bits) +
+                  w(p + "mlp.down_proj.weight", D, dense_inter, bits))
+        layers.append(b + 4 * floats)
+    # k3c_scratch's counting pass at `rows` rows, the MLA scratch as k3c_chunk_rows counts
+    # it, and the output mix's parameters
+    nbmax = (L + res_bs - 1) // res_bs
+    MI = max(inter * shared, dense_inter)
+    n = rows
+    counts = [n * D, n * nbmax * D, n * D, n * D, n * D, 3 * n * P, n * 3 * P, n * hd, n * P, n * heads, n * P, n * P,
+              n * nh * V, n * E, n * LT, n * MI, n * MI, n * MI, n * D, n * LT, n * D, n * D, n * E, n * LT,
+              n * (KL + R), n * D, vocab, n * LT]
+    fixed = sum(4 * (x if x else 1) for x in counts) + (4 * n * R if R > 0 else 0)
+    if any(i not in kda for i in range(L)):
+        fixed += 4 * n * (QL + nh * (nope + R) + (KL + R) + 2 * nh * KL + nh * V)
+    fixed += 8 * D
+    tail = w("lm_head.weight", vocab, D, hbits)
+    return VkChainLayout(layers, fixed, tail)
+
+
+_VK_CHAIN_LAYOUT["deepseek_v41"] = _v41_chain_layout
+_VK_CHAIN_LAYOUT["kimi"] = _k3_chain_layout
+
+
+def _env_number(env, name, default):
+    match = re.match(r"\s*([+-]?\d+)", env.get(name) or "")
+    return int(match[1]) if match else default
+
+
+def _vk_fit_rows(env, default):
+    """vkc_fit_rows: COLI_VK_CHAIN_ROWS when it is a number, else the engine's block."""
+    value = (env.get("COLI_VK_CHAIN_ROWS") or "").strip()
+    if value and value != "auto":
+        return min(max(_env_number(env, "COLI_VK_CHAIN_ROWS", 1), 1), 65535)
+    return max(default, 1)
+
+
+def _inkling_chain_layout(info, env, vulkan):
+    """inkling_chain.h inkc_fit_start: each layer's matrices in the form inkling.c holds
+    them (f32 fmt 10, bf16 fmt 11, the dense-int4g64 container's int8 fmt 1 and int4-g64
+    fmt 4), the router's f32 copy, its share of the parameter arena, its convolution rings
+    and its K/V mirror at the window's rows; fixed, inkc_bufs at vkc_fit_rows(256) rows,
+    the residual's read-back and the final norm; the tail, lm_head."""
+    root = info.get("config") or {}
+    c = root.get("text_config") or root
+    try:
+        D, L = int(c.get("hidden_size", 6144)), int(c.get("num_hidden_layers", 66))
+        heads, kvh, hd = int(c.get("num_attention_heads", 64)), int(c.get("num_key_value_heads", 8)), int(c.get("head_dim", 128))
+        sheads = int(c.get("swa_num_attention_heads", heads))
+        skvh, shd = int(c.get("swa_num_key_value_heads", 16)), int(c.get("swa_head_dim", hd))
+        window, dr, ext = int(c.get("sliding_window_size", 512)), int(c.get("d_rel", 16)), int(c.get("rel_extent", 1024))
+        taps = int(c.get("sconv_kernel_size", c.get("conv_kernel_size", 4)))
+        E, ns = int(c.get("n_routed_experts", 256)), int(c.get("n_shared_experts", 2))
+        vocab = int(c.get("vocab_size", 201024))
+        unpad = int(c.get("unpadded_vocab_size", vocab))
+        if "dense_intermediate_size" in c:
+            dense_inter, inter = int(c["dense_intermediate_size"]), int(c.get("intermediate_size", 3072))
+        else:
+            dense_inter, inter = int(c.get("intermediate_size", 24576)), int(c.get("moe_intermediate_size", 3072))
+    except (TypeError, ValueError):
+        return None
+    if L < 1:
+        return None
+    types, ids = c.get("layer_types"), c.get("local_layer_ids")
+    local = []
+    for i in range(L):
+        kind = types[i] if isinstance(types, list) and i < len(types) and isinstance(types[i], str) else None
+        if kind is not None:
+            local.append(kind == "hybrid_sliding")
+        elif isinstance(ids, list):
+            local.append(i in ids)
+        else:
+            local.append((i + 1) % 6 != 0)
+    mlp, first_dense = c.get("mlp_layer_types"), int(c.get("dense_mlp_idx", 0) or 0)
+    sparse = [(mlp[i] == "sparse") if isinstance(mlp, list) and i < len(mlp) and isinstance(mlp[i], str)
+              else i >= first_dense for i in range(L)]
+    # the dense-int4g64 container beside the snapshot (load_w_quant): a byte tensor (U8 or
+    # I8) with its .qs scales replaces the original, int8 rows when it has as many bytes as
+    # the original has weights and few scales, int4-g64 when about half as many; any other
+    # geometry keeps the original
+    container = {}
+    sidecar = Path(info.get("path") or ".") / "dense-int4g64"
+    for shard in sorted(sidecar.glob("*.safetensors")) if sidecar.is_dir() else []:
+        try:
+            for name, size, dtype, _ in _tensor_sizes(shard, with_shape=True):
+                container[name] = (size, dtype)
+        except (OSError, ValueError):
+            return None
+    main = {}
+    for t in info.get("dense_tensors", []):
+        numel = 1
+        for n in t.get("shape") or [0]:
+            numel *= n
+        main[t["name"]] = (t["dtype"], numel)
+
+    def form(name):
+        dtype, numel = main.get(name, (None, 0))
+        q, s = container.get(name), container.get(name + ".qs")
+        if q and s and q[1] in ("U8", "I8"):
+            scales = s[0] // 4
+            if q[0] == numel and scales * 64 < q[0]:
+                return 1, 0
+            if numel <= 2 * q[0] <= numel + 2 * scales:
+                return 4, 64
+        return {"F32": (10, 0), "F16": (10, 0), "BF16": (11, 0)}.get(dtype)
+
+    layers = []
+    for i in range(L):
+        H, KV, d = (sheads, skvh, shd) if local[i] else (heads, kvh, hd)
+        kvo, p = KV * d, f"model.layers.{i}."
+        mats = [("self_attn.q_proj.weight", D, H * d), ("self_attn.k_proj.weight", D, kvo),
+                ("self_attn.v_proj.weight", D, kvo), ("self_attn.r_proj.weight", D, H * dr),
+                ("self_attn.o_proj.weight", H * d, D)]
+        if not sparse[i]:
+            mats += [("mlp.gate_proj.weight", D, dense_inter), ("mlp.up_proj.weight", D, dense_inter),
+                     ("mlp.down_proj.weight", dense_inter, D)]
+        total = 0
+        for suffix, columns, rows in mats:
+            f = form(p + suffix)
+            if f is None:
+                return None   # a form the shaders do not take: the chain declines, N = L as before
+            total += vk_tensor_bytes(f[0], columns, rows, f[1])
+        if sparse[i]:
+            total += vk_tensor_bytes(10, D, E + ns)   # the router's f32 copy
+            for suffix, columns, rows in (("mlp.shared_experts.gate_proj", D, inter),
+                                          ("mlp.shared_experts.up_proj", D, inter),
+                                          ("mlp.shared_experts.down_proj", inter, D)):
+                f = form(p + suffix)
+                if f is None:
+                    return None
+                total += ns * vk_tensor_bytes(f[0], columns, rows, f[1])
+        total += 4 * (2 * D + 2 * d + dr * (window if local[i] else ext) + 2 * kvo * taps + 2 * D * taps)
+        for bank in range(4):
+            cells = (kvo if bank < 2 else D) * (taps - 1)
+            total += vk_buf_bytes(4 * max(cells, 1)) + 4 * cells
+        total += 2 * vk_buf_bytes(4 * KV * max(window, 1) * d)
+        layers.append(total)
+    # inkc_bufs at R rows: the scratch's geometry over every layer and the frames (a MoE
+    # layer ends one)
+    R = _vk_fit_rows(env, 256)
+    kvo_max = max((skvh * shd if local[i] else kvh * hd) for i in range(L))
+    qo_max = max((sheads * shd if local[i] else heads * hd) for i in range(L))
+    ro_max = max((sheads if local[i] else heads) * dr for i in range(L))
+    mi_max = max((inter if sparse[i] else dense_inter) for i in range(L))
+    nslot, frame = 0, 0
+    for i in range(L):
+        frame += 1
+        nslot = max(nslot, frame)
+        if sparse[i]:
+            frame = 0
+    nsl, ET = max(ns, 1), E + ns
+    vs = (R * kvo_max + 63) & ~63
+    counts = [R * D, R * D, R * D, R * qo_max, vs + R * kvo_max, R * ro_max, R * qo_max, R * D, R * ET,
+              R * mi_max, R * mi_max, nsl * R * D, R * D, D, R * D, R * ET, nslot * 2 * R * kvo_max, 0,
+              unpad, R * D, nsl * R, 2 * R]
+    fixed = sum(vk_buf_bytes(4 * max(n, 1)) for n in counts) + vk_buf_bytes(4 * R * D) + vk_buf_bytes(4 * D)
+    head = form("lm_head.weight")
+    if head is None:
+        return None
+    return VkChainLayout(layers, fixed, vk_tensor_bytes(head[0], D, unpad, head[1]))
+
+
+_VK_CHAIN_LAYOUT["inkling"] = _inkling_chain_layout
+
+
+# the tower's matrices vk_dense_upload places (mimo_vision.h): the patch embedding (a
+# Conv3d read as a Linear over the flattened patch), each block's, the merger's two
+_MIMO_TOWER = re.compile(r"visual\.(?:patch_embed\.proj|blocks\.\d+\.(?:attn\.(?:qkv|proj)|mlp\.(?:gate|up|down)_proj)"
+                         r"|merger\.mlp\.[02])\.weight")
+
+
+def _mimo_chain_layout(info, env, vulkan):
+    """mimo.c mc_fit_start: each layer's matrices in their MIMO_DENSE_BITS form (0: the
+    release's FP8 with 128-column block scales, fmt 12, and BF16, fmt 11; 8: int8 rows,
+    fmt 1; 32: f32, fmt 10), its K/V mirror at the size the chain allocates (a sliding
+    layer's ring, a full layer's context or COLI_VK_KV_DEVICE_ROWS when that is fewer) and
+    its norms and sink logits; fixed, mc_scratch at vkc_fit_rows(MIMO_CHUNK) rows and the
+    final norm; the tail, the head (and the vision tower the per-matrix path takes)."""
+    c = info.get("config") or {}
+    try:
+        L, H, V = int(c["num_hidden_layers"]), int(c["hidden_size"]), int(c["vocab_size"])
+        dense_inter = int(c.get("intermediate_size") or 0)
+        heads = [int(c["num_attention_heads"]), 0]
+        kvh = [int(c["num_key_value_heads"]), 0]
+        hd = [int(c["head_dim"]), 0]
+        vd = [int(c.get("v_head_dim", hd[0])), 0]
+        heads[1] = int(c.get("swa_num_attention_heads", heads[0]))
+        kvh[1] = int(c.get("swa_num_key_value_heads", kvh[0]))
+        hd[1] = int(c.get("swa_head_dim", hd[0]))
+        vd[1] = int(c.get("swa_v_head_dim", vd[0]))
+        window = int(c.get("sliding_window") or 0)
+        prf = float(c.get("partial_rotary_factor", 1.0))
+        max_pos = int(c.get("max_position_embeddings", 32768))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if L < 1 or max(hd + vd) > 256:
+        return None
+    pattern, freq = c.get("hybrid_layer_pattern"), c.get("moe_layer_freq")
+    if not isinstance(pattern, list) or not isinstance(freq, list) or len(pattern) < L or len(freq) < L:
+        return None
+    swa = [pattern[i] == 1 for i in range(L)]
+    moe = [freq[i] != 0 for i in range(L)]
+    sink = [bool(c.get("add_full_attention_sink_bias")), bool(c.get("add_swa_attention_sink_bias"))]
+    bits = _env_number(env, "MIMO_DENSE_BITS", 0)
+
+    def size(fmt_native, columns, rows):
+        if bits == 32:
+            return vk_tensor_bytes(10, columns, rows)
+        if bits == 8:
+            return vk_tensor_bytes(1, columns, rows)
+        return vk_tensor_bytes(fmt_native, columns, rows, 128 if fmt_native == 12 else 0)
+
+    text = env.get("MIMO_CTX") or env.get("CTX") or ""   # mimo.c: MIMO_CTX, else CTX, else 8192
+    ctx = _env_number({"v": text}, "v", 0) if text else 8192
+    ctx = max(16, min(ctx, max_pos))
+    forced = _env_number(env, "COLI_VK_KV_DEVICE_ROWS", 0)
+    layers = []
+    for i in range(L):
+        k = 1 if swa[i] else 0
+        kd, vdd, qd = kvh[k] * hd[k], kvh[k] * vd[k], heads[k] * hd[k]
+        total = size(12, H, qd + kd + vdd) + size(11, heads[k] * vd[k], H)
+        if not moe[i]:
+            total += 2 * size(12, H, dense_inter) + size(12, dense_inter, H)
+        rows = min(window, ctx) if swa[i] and window > 0 else ctx
+        if not swa[i] and 0 < forced < rows:
+            rows = forced
+        total += vk_buf_bytes(4 * rows * kd) + vk_buf_bytes(4 * rows * vdd)
+        total += 4 * (2 * H + (heads[k] if sink[k] else 0))
+        layers.append(total)
+    # mc_scratch at R rows, one row of logits
+    R = _vk_fit_rows(env, _env_number(env, "MIMO_CHUNK", 64) if _env_number(env, "MIMO_CHUNK", 0) > 0 else 64)
+    geo = []
+    for i in range(L):
+        k = 1 if swa[i] else 0
+        rows = min(window, ctx) if swa[i] and window > 0 else ctx
+        geo.append((swa[i], kvh[k] * hd[k], kvh[k] * vd[k], heads[k] * hd[k], heads[k] * vd[k], rows))
+    rw = max(qd + kd + vdd for _, kd, vdd, qd, _, _ in geo)
+    kdm = max(g[1] for g in geo)
+    vdm = max(g[2] for g in geo)
+    ctxw = max(g[4] for g in geo)
+    kvd = sum((rows if s and rows < R else R) * (kd + vdd) for s, kd, vdd, _, _, rows in geo)
+    rope = [int(hd[0] * prf) // 2 * 2, int(hd[1] * prf) // 2 * 2]
+    counts = [R * H, R * H, R * H, R * rw, R * kdm, R * vdm, R * ctxw, H, R * H, kvd, V, R * H,
+              R * 2 * (rope[0] // 2 + rope[1] // 2)]
+    windowed = [g for g in geo if g[0]]
+    if windowed:
+        win = max(g[5] for g in windowed) - 1
+        counts += [(win + R) * max(g[1] for g in windowed), (win + R) * max(g[2] for g in windowed)]
+    if not all(moe):
+        counts += [R * dense_inter, R * dense_inter]
+    fixed = sum(vk_buf_bytes(4 * max(n, 1)) for n in counts) + vk_buf_bytes(4 * H)
+    tail = size(11, H, V)
+    _, dense = _vk_chain_dense("mimo", env, vulkan)
+    if dense:   # the vision tower, on the device through the per-matrix path
+        for tensor in info.get("dense_tensors", []):
+            shape = tensor.get("shape")
+            if _MIMO_TOWER.fullmatch(tensor["name"]) and isinstance(shape, list) and len(shape) >= 2:
+                columns = 1
+                for n in shape[1:]:
+                    columns *= n
+                tail += vk_tensor_bytes(10 if bits == 32 else 11, columns, shape[0])
+    return VkChainLayout(layers, fixed, tail)
+
+
+_VK_CHAIN_LAYOUT["mimo"] = _mimo_chain_layout
 
 
 def _analysis_signature(shards, config_path):
@@ -54,7 +1426,7 @@ def _analysis_signature(shards, config_path):
     return "|".join(parts)
 
 
-def _tensor_sizes(path):
+def _tensor_sizes(path, with_shape=False):
     file_size = path.stat().st_size
     with path.open("rb") as stream:
         raw = stream.read(8)
@@ -73,7 +1445,8 @@ def _tensor_sizes(path):
         dtype = meta.get("dtype")
         if not isinstance(dtype, str):
             raise ValueError(f"invalid tensor dtype for {name}: {path}")
-        yield name, end - start, dtype
+        item = (name, end - start, dtype)
+        yield (*item, meta.get("shape")) if with_shape else item
 
 
 def analyze_model(model):
@@ -116,15 +1489,25 @@ def analyze_model(model):
         pass  # missing/corrupt/unreadable cache -> recompute
 
     dense_bytes = 0
+    # The embedding tables among them: the engines gather their rows on the CPU, so
+    # they keep a host copy when the rest of the dense weights live on a Vulkan
+    # device only (vk_dense_device_only below).
+    embed_bytes = 0
     # Model-owned allocations that are retained once, independently of the
     # number of per-layer cache slots. Qwen3.8's native FP8 path uses this for
     # its normalized scale bank; fallback accounting remains conservative.
     expert_fixed_bytes = 0
+    # What the engine's GPU trunk offload would put in VRAM (int8), for the
+    # families that have one; taken out of the VRAM budget before experts.
+    trunk_int8_bytes = 0
+    # Keep the source geometry, dtype and resident contribution for placement
+    # decisions. These facts can be cached; environment-dependent credits cannot.
+    dense_tensors = []
     expert_groups = {}
     tensor_names = set()
     for shard in shards:
         try:
-            sizes = list(_tensor_sizes(shard))
+            sizes = list(_tensor_sizes(shard, with_shape=True))
         except OSError as error:
             # Name the file. An OSError raised by read() on an already-open
             # stream carries no filename, so `coli doctor` reported bare
@@ -135,7 +1518,7 @@ def analyze_model(model):
             # storage, all of them is the mount.
             raise OSError(error.errno,
                           f"{error.strerror or error}: {shard}") from error
-        for name, size, dtype in sizes:
+        for name, size, dtype, shape in sizes:
             tensor_names.add(name)
             contributions = expert_contributions(resolved, name, size, dtype)
             if contributions:
@@ -148,7 +1531,15 @@ def analyze_model(model):
                 if fixed_bytes:
                     expert_fixed_bytes += fixed_bytes
                 else:
-                    dense_bytes += resident_contribution(
+                    resident = resident_contribution(resolved, name, size, dtype)
+                    dense_bytes += resident
+                    if resident:
+                        dense_tensors.append({"name": name, "size": size, "dtype": dtype,
+                                              "shape": shape,
+                                              "resident": _dense_in_ram(resolved.descriptor, resident)})
+                    if _EMBED_TABLE.search(name):
+                        embed_bytes += resident
+                    trunk_int8_bytes += trunk_contribution(
                         resolved, name, size, dtype)
 
     layer_sizes = {}
@@ -191,7 +1582,10 @@ def analyze_model(model):
         # serve a rispondere "ci sta?", non "quanto pesa il file".
         "dense_bytes": _dense_in_ram(resolved.descriptor, dense_bytes),
         "dense_disk_bytes": dense_bytes,
+        "embed_bytes": _dense_in_ram(resolved.descriptor, embed_bytes),
         "expert_fixed_bytes": expert_fixed_bytes,
+        "trunk_int8_bytes": trunk_int8_bytes,
+        "dense_tensors": dense_tensors,
         "expert_bytes": sum(expert_groups.values()),
         "expert_count": len(expert_groups),
         "expert_layers": len(per_layer),
@@ -202,6 +1596,9 @@ def analyze_model(model):
         "config": config,
         "resolved_family": resolved,
     }
+    # analyze_model has one stable, default-format answer regardless of the
+    # caller's process environment. build_plan reapplies its requested settings.
+    result = _glm53_dense_tensors(result, {})
     try:  # best-effort write; a read-only model dir must never break planning.
         # Atomic write (tmp file + os.replace): a concurrent `coli plan` on the
         # same model dir must never observe a half-written cache -- write_text()
@@ -240,6 +1637,96 @@ def analyze_model(model):
     return result
 
 
+QWEN38_INT4_SIDECAR = "experts-int4g64"
+
+
+def qwen38_int4_sidecar(info):
+    """Price Qwen3.8's routed experts as qwen38 will hold them.
+
+    tools/convert_qwen38_experts_int4.py writes <model>/experts-int4g64/, and
+    the engine loads every routed expert from it instead of the FP8 shards
+    when its index says it is complete (Q38_EXPERT_INT4=0 keeps FP8). One of
+    its records is 56% of an FP8 expert, so pricing the cache with FP8 bytes
+    would hand the engine a cap for half the RAM it was given. Only the index
+    is read here; the engine validates the files themselves and refuses a
+    sidecar that disagrees with it. Returns the analysis unchanged when the
+    sidecar does not apply, otherwise a copy priced with its records and
+    marked `qwen38_int4_experts`: no FP8 scale bank is built either.
+    """
+    resolved = info["resolved_family"]
+    if resolved.descriptor.id != "qwen38" or os.environ.get("Q38_EXPERT_INT4") == "0":
+        return info
+    try:
+        index = json.loads((Path(info["path"]) / QWEN38_INT4_SIDECAR / "index.json")
+                           .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return info
+    config = info["config"]
+    text = config.get("text_config", config) if isinstance(config, dict) else {}
+    want = {"format": "colibri.qwen38.experts-int4g64", "version": 1, "complete": True,
+            "layers": text.get("num_hidden_layers"), "experts": text.get("num_experts"),
+            "hidden_size": text.get("hidden_size"),
+            "moe_intermediate_size": text.get("moe_intermediate_size")}
+    record = index.get("record_bytes") if isinstance(index, dict) else None
+    if (any(index.get(key) != value for key, value in want.items()) or
+            isinstance(record, bool) or not isinstance(record, int) or record < 1):
+        return info
+    per_layer = {layer: record for layer in info["expert_bytes_by_layer"]}
+    return dict(info,
+                expert_bytes=record * want["experts"] * len(per_layer),
+                typical_expert_bytes=record, max_expert_bytes=record,
+                expert_bytes_by_layer=per_layer, per_cap_bytes=record * len(per_layer),
+                expert_fixed_bytes=0, qwen38_int4_experts=True)
+
+
+def _q38_mtp_head(info, env):
+    """Price Qwen3.8's MTP head when the engine attaches it (qwen38_core.h,
+    q38_mtp_attach): on by default when the config names one head and the
+    checkpoint carries its weights, off with Q38_MTP=0. The head is one more
+    layer over the model's, which analyze_model does not count: its dense
+    tensors (attention with the indexer, the shared expert, the mixers, the two
+    fc projections) stay resident, priced here at their size on disk, and its
+    routed experts get their own cache of Q38_MTP_CAP slots, the layers' cap by
+    default, at the head's own record (the snapshot's FP8: the int4-g64 sidecar
+    holds the model's layers only). With the default that is one more expert per
+    cache slot; a fixed Q38_MTP_CAP is a fixed cost instead. Without this the
+    plan handed the cache about 0.9 GB the head then took (cap 161 on Qwen3.8
+    Flash Next: 161 FP8 experts of 4.69 MiB, and 173 MiB of head)."""
+    resolved = info["resolved_family"]
+    if resolved.descriptor.id != "qwen38" or (env.get("Q38_MTP") or "").strip() == "0":
+        return info
+    config = info.get("config") or {}
+    text = config.get("text_config", config) if isinstance(config, dict) else {}
+    if text.get("mtp_num_hidden_layers") != 1:
+        return info
+    dense, experts = 0, {}
+    try:
+        for shard in sorted(Path(info["path"]).glob("*.safetensors")):
+            for name, size, _dtype, _shape in _tensor_sizes(shard, with_shape=True):
+                if not (name.startswith("mtp.") or ".mtp." in name):
+                    continue
+                expert = re.search(r"\.experts\.(\d+)\.", name)
+                if expert:
+                    experts[int(expert[1])] = experts.get(int(expert[1]), 0) + size
+                else:
+                    dense += size
+    except OSError:
+        return info
+    if not dense or not experts:
+        return info      # a container without the head's weights: the engine decodes without it
+    record = max(experts.values())
+    fixed = info["expert_fixed_bytes"]
+    per_cap = info["per_cap_bytes"]
+    cap = (env.get("Q38_MTP_CAP") or "").strip()
+    if cap.isdigit() and int(cap) > 0:
+        fixed += min(int(cap), len(experts)) * record
+    else:
+        per_cap += record
+    return dict(info, dense_bytes=info["dense_bytes"] + dense, per_cap_bytes=per_cap,
+                expert_fixed_bytes=fixed, qwen38_mtp_head_bytes=dense,
+                qwen38_mtp_expert_bytes=record)
+
+
 #: MEMORYSTATUSEX as Windows defines it, in order. Kept as data so a test can
 #: pin the order without a Windows machine.
 WINDOWS_MEMORYSTATUSEX_FIELDS = (
@@ -265,13 +1752,465 @@ def windows_available_bytes(avail_phys, avail_pagefile):
     return avail_phys
 
 
-def memory_available():
-    # Linux (and MSYS2/Git-Bash CPython where /proc exists): MemAvailable.
+def _read_bounded_bytes(path, max_bytes, description):
+    """Return ``(present, raw)`` for one small kernel pseudo-file.
+
+    ``present`` keeps an absent file (that controller or proc path is simply
+    not mounted here) distinct from one that exists but cannot be trusted. Any
+    other read failure, and any file larger than the kernel would ever write,
+    is a typed refusal: it is never evidence that the process is unconstrained.
+    """
+    path = Path(path)
     try:
-        text = Path("/proc/meminfo").read_text()
-        return int(re.search(r"MemAvailable:\s+(\d+)", text).group(1)) * 1024
-    except (OSError, AttributeError):
-        pass
+        with path.open("rb") as stream:
+            raw = stream.read(max_bytes + 1)
+    except (FileNotFoundError, NotADirectoryError):
+        return (False, None)
+    except OSError as error:
+        raise CgroupAccessError(f"cannot read {description} {path}: {error}") from error
+    if len(raw) > max_bytes:
+        raise CgroupFormatError(f"oversized {description}: {path}")
+    return (True, raw)
+
+
+def _read_bounded_ascii(path, max_bytes, description):
+    present, raw = _read_bounded_bytes(path, max_bytes, description)
+    if not present:
+        return (False, None)
+    try:
+        return (True, raw.decode("ascii"))
+    except UnicodeDecodeError as error:
+        raise CgroupFormatError(f"non-ASCII {description}: {path}") from error
+
+
+def _proc_lines(text, description):
+    """Split one procfs record file; an empty file or a blank record is malformed."""
+    if not text:
+        raise CgroupFormatError(f"empty {description}")
+    newline = b"\n" if isinstance(text, bytes) else "\n"
+    lines = (text[:-1] if text.endswith(newline) else text).split(newline)
+    if any(not line for line in lines):
+        raise CgroupFormatError(f"blank record in {description}")
+    return lines
+
+
+def _parse_bounded_id(field, description, *, allow_zero=True):
+    """Parse one canonical decimal u64 procfs field after a lexical length bound."""
+    if (not field or len(field) > _CGROUP_UINT64_DIGITS or not field.isdigit()
+            or (len(field) > 1 and field.startswith(b"0"))):
+        raise CgroupFormatError(f"malformed {description}: {field!r}")
+    value = int(field)
+    if value > _CGROUP_UINT64_MAX or (value == 0 and not allow_zero):
+        raise CgroupFormatError(f"out-of-range {description}: {field!r}")
+    return value
+
+
+def _path_components(raw, description):
+    """Split one absolute kernel path into components; "", "." and ".." are malformed."""
+    if raw == b"/":
+        return ()
+    if not raw.startswith(b"/"):
+        raise CgroupFormatError(f"{description} is not absolute: {raw!r}")
+    components = raw[1:].split(b"/")
+    if any(component in (b"", b".", b"..") for component in components):
+        raise CgroupFormatError(f"unnormalized {description}: {raw!r}")
+    if len(components) >= _CGROUP_MAX_ANCESTORS:
+        raise CgroupFormatError(
+            f"{description} nesting exceeds {_CGROUP_MAX_ANCESTORS - 1} levels")
+    return tuple(os.fsdecode(component) for component in components)
+
+
+# mountinfo(5) escapes exactly these four bytes as three-digit octal.
+_PROC_PATH_ESCAPES = {b"011": b"\t", b"012": b"\n", b"040": b" ", b"134": b"\\"}
+
+
+def _decode_proc_path(field, description):
+    """Decode one escaped mountinfo path field into normalized components."""
+    decoded = bytearray()
+    index = 0
+    while index < len(field):
+        byte = field[index]
+        if byte == ord("\\"):
+            escape = field[index + 1:index + 4]
+            if escape not in _PROC_PATH_ESCAPES:
+                raise CgroupFormatError(f"malformed escape in {description}: {field!r}")
+            decoded += _PROC_PATH_ESCAPES[escape]
+            index += 4
+            continue
+        if byte in (0, ord(" "), ord("\t"), ord("\n")):
+            raise CgroupFormatError(f"unescaped byte in {description}: {field!r}")
+        decoded.append(byte)
+        index += 1
+    return _path_components(bytes(decoded), description)
+
+
+def _decode_cgroup_membership_path(field, description):
+    """Decode a raw /proc/self/cgroup path (the kernel does not escape it)."""
+    if b"\0" in field:
+        raise CgroupFormatError(f"NUL byte in {description}: {field!r}")
+    return _path_components(field, description)
+
+
+def _parse_cgroup_counter(text):
+    """Parse one non-negative cgroup byte counter under an explicit u64 cap."""
+    match = re.fullmatch(r"(\d+)\n?", text or "")
+    if match is None or len(match.group(1)) > _CGROUP_UINT64_DIGITS:
+        return None
+    value = int(match.group(1))
+    return value if value <= _CGROUP_UINT64_MAX else None
+
+
+def _cgroup_inactive_file(directory, v1=False):
+    """Return the inactive file cache charged to one cgroup, in bytes.
+
+    ``memory.current`` (v1: ``usage_in_bytes``) charges clean page cache -- for
+    this engine, the mmap'd shards a previous run left behind -- while the host
+    half of the minimum, MemAvailable, counts such cache as available. Subtract
+    ``inactive_file`` (v1: ``total_inactive_file``, the hierarchical figure that
+    pairs with the hierarchical usage counter) the way Docker and cAdvisor
+    derive a working set. Absent statistics, or a kernel without the key,
+    subtract nothing; a present but malformed file is a refusal.
+    """
+    stat_path = Path(directory) / "memory.stat"
+    present, text = _read_bounded_ascii(stat_path, _CGROUP_STAT_MAX_BYTES,
+                                        "cgroup memory statistics")
+    if not present:
+        return 0
+    key = "total_inactive_file" if v1 else "inactive_file"
+    values = []
+    for line in _proc_lines(text, "cgroup memory statistics"):
+        match = re.fullmatch(r"([A-Za-z0-9_]+) (\d+)", line)
+        if match is None:
+            raise CgroupFormatError(f"malformed cgroup memory statistics: {stat_path}")
+        if match.group(1) == key:
+            values.append(match.group(2))
+    if len(values) > 1:
+        raise CgroupFormatError(f"duplicate {key} in cgroup memory statistics: {stat_path}")
+    value = _parse_cgroup_counter(values[0]) if values else 0
+    if value is None:
+        raise CgroupFormatError(f"malformed {key} in cgroup memory statistics: {stat_path}")
+    return value
+
+
+def _cgroup_pair_remaining(directory, limit_name, current_name, v1=False):
+    """Return ``(controls_present, finite_remaining_or_none)`` for one cgroup.
+
+    Present controls with ``None`` remaining are the kernel's unlimited value
+    (v2 ``max``; v1's sentinel just below 2**63). Both files must be present
+    and well-formed together: an incomplete pair or a malformed counter is a
+    refusal, never something a looser ancestor may mask. Headroom is measured
+    against the working set, charged usage less reclaimable inactive file
+    cache, so a previous run's cached model pages do not read as spent budget.
+    """
+    directory = Path(directory)
+    limit_path = directory / limit_name
+    current_path = directory / current_name
+    limit_present, limit_text = _read_bounded_ascii(
+        limit_path, _CGROUP_VALUE_MAX_BYTES, "cgroup memory limit")
+    current_present, current_text = _read_bounded_ascii(
+        current_path, _CGROUP_VALUE_MAX_BYTES, "cgroup memory usage")
+    if not limit_present and not current_present:
+        return (False, None)
+    if not limit_present or not current_present:
+        missing = current_path if limit_present else limit_path
+        raise CgroupAccessError(f"incomplete cgroup memory control pair: {missing}")
+    current = _parse_cgroup_counter(current_text)
+    if current is None:
+        raise CgroupFormatError(f"malformed cgroup memory usage: {current_path}")
+    if not v1 and limit_text in ("max", "max\n"):
+        return (True, None)
+    limit = _parse_cgroup_counter(limit_text)
+    if limit is None:
+        raise CgroupFormatError(f"malformed cgroup memory limit: {limit_path}")
+    if v1 and limit >= _CGROUP_V1_UNLIMITED_MIN:
+        return (True, None)
+    working_set = max(0, current - _cgroup_inactive_file(directory, v1=v1))
+    return (True, max(0, limit - working_set))
+
+
+def _read_cgroup_memberships(proc_cgroup_path):
+    """Strictly parse v2 and v1-memory membership from ``/proc/self/cgroup``.
+
+    ``None`` means the file is absent. Hybrid layouts are ordinary -- a
+    ``0::/...`` v2 record beside v1 records for controllers this planner never
+    consumes, such as ``1:net_cls:/`` from a VPN client -- and must not fail.
+    """
+    present, raw = _read_bounded_bytes(
+        proc_cgroup_path, _CGROUP_MEMBERSHIP_MAX_BYTES, "cgroup membership file")
+    if not present:
+        return None
+    v2_path = None
+    v1_path = None
+    hierarchy_ids = set()
+    for line in _proc_lines(raw, "cgroup membership file"):
+        fields = line.split(b":", 2)
+        if len(fields) != 3:
+            raise CgroupFormatError(f"malformed cgroup membership record: {line!r}")
+        hierarchy, controllers, member_path = fields
+        hierarchy_id = _parse_bounded_id(hierarchy, "cgroup hierarchy id")
+        if hierarchy_id in hierarchy_ids:
+            raise CgroupFormatError(f"duplicate cgroup hierarchy id: {hierarchy!r}")
+        hierarchy_ids.add(hierarchy_id)
+        controller_list = controllers.split(b",") if controllers else []
+        if (any(re.fullmatch(rb"[A-Za-z0-9_.=-]+", item) is None for item in controller_list)
+                or len(set(controller_list)) != len(controller_list)):
+            raise CgroupFormatError(f"malformed cgroup controller list: {controllers!r}")
+        member = _decode_cgroup_membership_path(member_path, "cgroup membership path")
+        if hierarchy_id == 0:
+            if controller_list or v2_path is not None:
+                raise CgroupFormatError("ambiguous cgroup v2 membership")
+            v2_path = member
+        elif not controller_list:
+            raise CgroupFormatError(f"v1 cgroup membership lacks controllers: {line!r}")
+        elif b"memory" in controller_list:
+            if v1_path is not None:
+                raise CgroupFormatError("ambiguous cgroup v1 memory membership")
+            v1_path = member
+    return _CgroupMemberships(v2=v2_path, v1_memory=v1_path)
+
+
+def _parse_mount_options(field, description):
+    try:
+        options = field.decode("ascii").split(",")
+    except UnicodeDecodeError as error:
+        raise CgroupFormatError(f"non-ASCII {description}: {field!r}") from error
+    if any(not option for option in options):
+        raise CgroupFormatError(f"malformed {description}: {field!r}")
+    return frozenset(options)
+
+
+def _read_cgroup_mounts(proc_mountinfo_path):
+    """Return every cgroup/cgroup2 mount from a strict, bounded mountinfo read.
+
+    ``None`` means the file is absent. Every record is held to mountinfo(5)'s
+    grammar so a truncated or synthetic file is a refusal rather than a quiet
+    "no cgroup mounts here"; paths are decoded only for cgroup records, so an
+    unrelated mount with an unusual name cannot block discovery.
+    """
+    present, raw = _read_bounded_bytes(
+        proc_mountinfo_path, _CGROUP_MOUNTINFO_MAX_BYTES, "cgroup mountinfo file")
+    if not present:
+        return None
+    mounts = []
+    mount_ids = set()
+    for line in _proc_lines(raw, "cgroup mountinfo file"):
+        fields = line.split(b" ")
+        if any(not field for field in fields):
+            raise CgroupFormatError(f"malformed mountinfo spacing: {line!r}")
+        try:
+            separator = fields.index(b"-", 6)
+        except ValueError as error:
+            raise CgroupFormatError(f"mountinfo record lacks separator: {line!r}") from error
+        if len(fields) != separator + 4:
+            raise CgroupFormatError(f"malformed mountinfo record: {line!r}")
+        mount_id = _parse_bounded_id(fields[0], "mountinfo mount id", allow_zero=False)
+        parent_id = _parse_bounded_id(fields[1], "mountinfo parent id")
+        device = fields[2].split(b":")
+        if len(device) != 2:
+            raise CgroupFormatError(f"malformed mountinfo device: {line!r}")
+        for number in device:
+            _parse_bounded_id(number, "mountinfo device number")
+        if mount_id in mount_ids:
+            raise CgroupFormatError(f"duplicate mountinfo id: {fields[0]!r}")
+        mount_ids.add(mount_id)
+        fs_type = fields[separator + 1]
+        if fs_type not in (b"cgroup", b"cgroup2"):
+            continue
+        if fields[3].split(b"/")[1:2] == [b".."]:
+            # cgroup_namespaces(7): a cgroupfs mount inherited from outside the
+            # process's cgroup namespace reports its root relative to that
+            # namespace as leading ".." components. Membership is reported
+            # relative to the namespace root, so no sound mapping exists.
+            raise CgroupAccessError(
+                f"unsupported cgroup mount root {fields[3]!r}: remount cgroupfs "
+                "inside the cgroup namespace")
+        root = _decode_proc_path(fields[3], "cgroup mount root")
+        mount_point = Path("/").joinpath(
+            *_decode_proc_path(fields[4], "cgroup mount point"))
+        options = (_parse_mount_options(fields[5], "cgroup mount options")
+                   | _parse_mount_options(fields[separator + 3], "cgroup super options"))
+        mounts.append(_CgroupMount(mount_id=mount_id, parent_id=parent_id, root=root,
+                                   mount_point=mount_point,
+                                   fs_type=fs_type.decode("ascii"), options=options))
+    return mounts
+
+
+def _resolve_cgroup_hierarchy(mounts, member, *, v1=False):
+    """Return the mounts exposing ``member``, shallowest root first.
+
+    A mount's root is the cgroup its mount point shows; ``member`` maps into
+    it by stripping that root and appending the rest to the mount point. Of
+    several applicable mounts, the one with the shallowest root shows the
+    most ancestors: a deeper bind mount can hide an ancestor's limit, so it
+    must never be preferred. Every view is returned and the caller takes the
+    minimum, which also makes two mounts of one root harmless.
+    """
+    if v1:
+        applicable = [mount for mount in mounts
+                      if mount.fs_type == "cgroup" and "memory" in mount.options]
+    else:
+        applicable = [mount for mount in mounts if mount.fs_type == "cgroup2"]
+    views = [mount for mount in applicable if member[:len(mount.root)] == mount.root]
+    return sorted(views, key=lambda mount: len(mount.root))
+
+
+def _cgroup_hierarchy_remaining(views, member, limit_name, current_name, v1=False):
+    """Return ``(controls_seen, tightest finite headroom)`` across every view.
+
+    Each view is walked from the membership leaf up to and including its mount
+    point, so an ancestor's finite limit bounds the result whenever any view
+    exposes it. Missing directories simply contribute nothing.
+    """
+    seen = False
+    remaining = None
+    for mount in views:
+        suffix = member[len(mount.root):]
+        for depth in range(len(suffix), -1, -1):
+            directory = mount.mount_point.joinpath(*suffix[:depth])
+            present, candidate = _cgroup_pair_remaining(
+                directory, limit_name, current_name, v1=v1)
+            seen = seen or present
+            if candidate is not None:
+                remaining = candidate if remaining is None else min(remaining, candidate)
+    return (seen, remaining)
+
+
+_CGROUP_V2_CONTROLS = ("memory.max", "memory.current")
+_CGROUP_V1_CONTROLS = ("memory.limit_in_bytes", "memory.usage_in_bytes")
+
+
+def _fixed_root_view(root, v1=False):
+    """A synthetic whole-hierarchy mount at ``root`` for kernels without mountinfo."""
+    return _CgroupMount(mount_id=0, parent_id=0, root=(), mount_point=Path(root),
+                        fs_type="cgroup" if v1 else "cgroup2",
+                        options=frozenset({"memory"}) if v1 else frozenset())
+
+
+def _cgroup_memory_remaining(cgroup_root=Path("/sys/fs/cgroup"),
+                             proc_cgroup_path=Path("/proc/self/cgroup"),
+                             proc_mountinfo_path=Path("/proc/self/mountinfo")):
+    """Return this process's tightest finite cgroup memory headroom, or ``None``.
+
+    Cgroup v2 is authoritative when its memory controls are visible; v1 is
+    consulted through mounts whose options include the memory controller.
+    ``None`` means no finite limit applies (or no cgroupfs is mounted here at
+    all). Present but malformed, incomplete or unreadable inputs raise
+    ``CgroupError`` instead of reading as unconstrained. ``cgroup_root`` is
+    consulted only by the fixed-layout probe used when mountinfo is absent.
+    """
+    memberships = _read_cgroup_memberships(proc_cgroup_path)
+    mounts = _read_cgroup_mounts(proc_mountinfo_path)
+    v2_member = memberships.v2 if memberships else None
+    v1_member = memberships.v1_memory if memberships else None
+    if mounts is None:
+        # No mountinfo: probe the conventional roots. The leaf-to-mount-point
+        # walk also covers runtimes that mount the process's own subgroup at
+        # the root while procfs still reports its host-side path.
+        probes = ((cgroup_root, v2_member, _CGROUP_V2_CONTROLS, False),
+                  (Path(cgroup_root) / "memory", v1_member, _CGROUP_V1_CONTROLS, True),
+                  (cgroup_root, v1_member, _CGROUP_V1_CONTROLS, True))
+        for root, member, controls, v1 in probes:
+            seen, remaining = _cgroup_hierarchy_remaining(
+                [_fixed_root_view(root, v1=v1)], member or (), *controls, v1=v1)
+            if seen:
+                return remaining
+        return None
+
+    has_v2_mount = any(mount.fs_type == "cgroup2" for mount in mounts)
+    has_v1_memory_mount = any(mount.fs_type == "cgroup" and "memory" in mount.options
+                              for mount in mounts)
+    if memberships is None:
+        if has_v2_mount or has_v1_memory_mount:
+            raise CgroupAccessError(
+                "cgroup membership is unavailable for a mounted memory hierarchy")
+        return None
+    if has_v2_mount and v2_member is None:
+        raise CgroupAccessError("cgroup v2 mount has no corresponding membership record")
+    if has_v1_memory_mount and v1_member is None:
+        raise CgroupAccessError(
+            "cgroup v1 memory mount has no corresponding membership record")
+
+    if has_v2_mount:
+        views = _resolve_cgroup_hierarchy(mounts, v2_member)
+        if not views:
+            raise CgroupAccessError(
+                f"no visible cgroup2 mount exposes cgroup /{'/'.join(v2_member)}")
+        seen, remaining = _cgroup_hierarchy_remaining(views, v2_member, *_CGROUP_V2_CONTROLS)
+        if seen:
+            return remaining
+    if has_v1_memory_mount:
+        views = _resolve_cgroup_hierarchy(mounts, v1_member, v1=True)
+        if not views:
+            raise CgroupAccessError(
+                f"no visible cgroup v1 memory mount exposes cgroup /{'/'.join(v1_member)}")
+        seen, remaining = _cgroup_hierarchy_remaining(
+            views, v1_member, *_CGROUP_V1_CONTROLS, v1=True)
+        if not seen:
+            raise CgroupAccessError("cgroup v1 memory mount exposes no memory control files")
+        return remaining
+    return None
+
+
+def _host_memory_available(meminfo_path):
+    """Return strict host MemAvailable bytes, or ``None`` when it is unknown.
+
+    Unknown covers an absent ``/proc/meminfo`` and a kernel that predates
+    MemAvailable (3.14), exactly the cases the planner always fell back on. A
+    present line that is duplicated, not ``<digits> kB``, or beyond a u64 byte
+    counter is a refusal.
+    """
+    meminfo_path = Path(meminfo_path)
+    present, text = _read_bounded_ascii(meminfo_path, _MEMINFO_MAX_BYTES,
+                                        "memory information file")
+    if not present:
+        return None
+    lines = [line for line in text.split("\n") if line.startswith("MemAvailable")]
+    if not lines:
+        return None
+    match = (re.fullmatch(r"MemAvailable:[ \t]+(\d+)[ \t]+kB[ \t]*", lines[0])
+             if len(lines) == 1 else None)
+    if match is None:
+        raise CgroupFormatError(f"MemAvailable is malformed: {meminfo_path}")
+    kib = _parse_cgroup_counter(match.group(1))
+    if kib is None or kib > _CGROUP_UINT64_MAX // 1024:
+        raise CgroupFormatError(f"MemAvailable overflows a byte counter: {meminfo_path}")
+    return kib * 1024
+
+
+def memory_available(*, meminfo_path=Path("/proc/meminfo"),
+                     cgroup_root=Path("/sys/fs/cgroup"),
+                     proc_cgroup_path=Path("/proc/self/cgroup"),
+                     proc_mountinfo_path=Path("/proc/self/mountinfo")):
+    """Bytes this process may plan to allocate; ``None`` when nothing could measure it.
+
+    On Linux this is ``min(host MemAvailable, remaining finite cgroup budget)``:
+    a container started with a memory limit is killed at that limit however
+    much the host has free, and the cgroup half is what lets the planner refuse
+    an over-budget model before it allocates anything substantial. The result
+    is a tri-state -- an int (including an authoritative 0 when the budget is
+    already exhausted), ``None`` when no probe could measure anything so the
+    planner keeps its historical fallback, or ``CgroupError`` when a present
+    cgroup or procfs input is malformed, incomplete or unreadable. That last
+    case is a refusal with a reason, never permission to assume the process is
+    unconstrained, so it deliberately propagates.
+    """
+    # Linux (and MSYS2/Git-Bash CPython where /proc exists): MemAvailable.
+    host_available = _host_memory_available(meminfo_path)
+    cgroup_remaining = None
+    if sys.platform.startswith("linux"):
+        # Cgroups are a Linux kernel facility; nothing else has a hierarchy to
+        # read. Probed even when the host figure is unknown, because a finite
+        # limit is still a valid conservative bound when a restricted container
+        # hides /proc/meminfo.
+        cgroup_remaining = _cgroup_memory_remaining(
+            cgroup_root=cgroup_root, proc_cgroup_path=proc_cgroup_path,
+            proc_mountinfo_path=proc_mountinfo_path)
+    if host_available is not None and cgroup_remaining is not None:
+        return min(host_available, cgroup_remaining)
+    if host_available is not None:
+        return host_available
+    if cgroup_remaining is not None:
+        return cgroup_remaining
     # Windows native CPython: GlobalMemoryStatusEx -> ullAvailPhys.
     # Same definition the C engine uses (compat_meminfo in compat.h):
     # standby/free/zero pages, i.e. reclaimable without swapping.
@@ -328,7 +2267,7 @@ def memory_available():
                 return int(total)
         except (OSError, subprocess.SubprocessError, ValueError):
             pass
-    return 0
+    return None
 
 
 def _host_unified_memory():
@@ -427,6 +2366,8 @@ SSD_PROBE_PENDING = {
 
 
 def discover_gpus():
+    if sys.platform == "darwin":
+        return _discover_metal_gpus()
     # NVIDIA first; if there are none (or no nvidia-smi), fall back to ROCm/HIP so
     # a working AMD engine isn't planned CPU-only and --gpu N stops failing (#662).
     devices = _discover_nvidia_gpus()
@@ -435,19 +2376,60 @@ def discover_gpus():
     return _discover_amd_gpus()
 
 
-def _discover_nvidia_gpus():
-    command = ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free",
-               "--format=csv,noheader,nounits"]
+def _discover_metal_gpus():
+    """Return Apple Metal devices without pretending unified RAM is VRAM."""
     try:
-        result = subprocess.run(command, text=True, capture_output=True, check=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
+        result = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType", "-json"],
+            text=True, capture_output=True, check=True, timeout=10)
+        displays = json.loads(result.stdout).get("SPDisplaysDataType", [])
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return []
+    devices = []
+    for index, display in enumerate(displays):
+        if not isinstance(display, dict):
+            continue
+        metal = display.get("spdisplays_mtlgpufamilysupport")
+        if not metal:
+            continue
+        name = display.get("sppci_model") or display.get("_name")
+        if not isinstance(name, str) or not name:
+            continue
+        # Apple Silicon has one unified pool. Its free capacity cannot be used
+        # as an independent VRAM budget, so retain device identity only.
+        devices.append({"index": index, "name": name,
+                        "total_bytes": 0, "free_bytes": None,
+                        "unified_memory": True, "backend": "metal"})
+    return devices
+
+
+def _discover_nvidia_gpus():
+    # compute_cap last: a driver that predates the field refuses the whole query,
+    # and then the same without it (setup_hw.py does the same)
+    result = None
+    for fields_asked in ("index,name,memory.total,memory.free,compute_cap",
+                         "index,name,memory.total,memory.free"):
+        command = ["nvidia-smi", f"--query-gpu={fields_asked}", "--format=csv,noheader,nounits"]
+        try:
+            result = subprocess.run(command, text=True, capture_output=True, check=True, timeout=5)
+            break
+        except subprocess.CalledProcessError:
+            continue
+        except (OSError, subprocess.SubprocessError):
+            return []
+    if result is None:
         return []
     devices = []
     import csv
     for fields in csv.reader(result.stdout.splitlines()):
         fields = [f.strip() for f in fields]
-        if len(fields) != 4:
+        if len(fields) not in (4, 5):
             continue
+        cap = None
+        if len(fields) == 5:
+            m = re.fullmatch(r"(\d+)\.(\d+)", fields[4])
+            cap = (int(m.group(1)), int(m.group(2))) if m else None
+            fields = fields[:4]
         try:
             index = int(fields[0])
         except ValueError:
@@ -462,15 +2444,18 @@ def _discover_nvidia_gpus():
             try:
                 meminfo = Path("/proc/meminfo").read_text()
                 total = int(re.search(r"MemTotal:\s+(\d+)", meminfo).group(1)) // 1024
-                free = memory_available() // (1024 * 1024)
-            except (OSError, AttributeError):
+                free = (memory_available() or 0) // (1024 * 1024)
+            except (OSError, AttributeError, CgroupError):
                 total = free = 0
         name = fields[1]
         unified = any(token in name.lower() for token in ("gb10", "jetson", "grace blackwell"))
-        devices.append({"index": index, "name": name,
-                        "total_bytes": total * 1024 * 1024,
-                        "free_bytes": free * 1024 * 1024,
-                        "unified_memory": unified})
+        device = {"index": index, "name": name,
+                  "total_bytes": total * 1024 * 1024,
+                  "free_bytes": free * 1024 * 1024,
+                  "unified_memory": unified}
+        if cap:
+            device["compute_cap"] = cap
+        devices.append(device)
     return devices
 
 
@@ -641,6 +2626,13 @@ def _discover_amd_gpus():
                         "total_bytes": total, "free_bytes": free,
                         "unified_memory": False})
     return devices
+
+
+#: The oldest compute capability an engine's CUDA tier is built for by default, and
+#: what reaches older cards (docs/deepseek-v4.md).
+CUDA_TIER_FLOOR = {
+    "deepseek_v4": ((8, 0), "a build with CUDA_ARCH=portable-pre-ampere NO_TC=1 runs on Pascal and Turing"),
+}
 
 
 def plans_placement(gpu):
@@ -817,7 +2809,9 @@ def _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets, plan_has_meta
     # glm53 has its own loader/cache controls and does not consume the generic
     # DRAFT/PIPE/PIN/NUMA knobs below. Recommending them is worse than leaving
     # them unset because `coli tune` then reports changes the engine ignores.
-    if engine_group == "glm53":
+    # The same holds for every engine but colibri.c: DRAFT, PIPE, COLI_CUDA_PIPE,
+    # COLI_NUMA and PIN_GB have no reader anywhere else.
+    if engine_group is not None and engine_group != "colibri-core":
         return tune
 
     # MTP: costs more than it saves when compute-bound (#389 measured 42% loss)
@@ -925,16 +2919,86 @@ POLICIES = {
 }
 
 
+def _family_expert_cache_knob(family_id, cache_bytes):
+    """Env var that actually sizes the expert LRU, when it is not RAM_GB.
+
+    Kimi K3 reads K3_EXPERT_GB (default 8) and treats RAM_GB as a ceiling;
+    main() never takes argv as a cap. GLM-5.3 reads GLM53_EXPERT_GB and never
+    RAM_GB. Exporting only RAM_GB therefore left both engines on their own
+    default cache under --auto-tier.
+    """
+    if (not isinstance(cache_bytes, int) or isinstance(cache_bytes, bool)
+            or cache_bytes <= 0):
+        return None
+    if family_id == "kimi":
+        return ("K3_EXPERT_GB",
+                "Kimi K3 sizes the expert LRU from K3_EXPERT_GB; RAM_GB is only a ceiling")
+    if family_id == "glm53":
+        return ("GLM53_EXPERT_GB",
+                "GLM-5.3 sizes the expert LRU from GLM53_EXPERT_GB, not RAM_GB")
+    return None
+
+
 def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                available_memory=None, available_disk=None, gpus=None,
                policy="quality", physical_cpus=None, cpu_sockets=None,
-               kv_slots=1):
+               kv_slots=1, env=None, vulkan=None):
     if policy not in POLICIES:
         raise ValueError(f"unknown policy: {policy}")
-    info = analyze_model(model)
+    info = qwen38_int4_sidecar(analyze_model(model))
+    env_now = os.environ if env is None else env
+    info = _q38_cpu_dense_tensors(info, env_now)
+    info = _q38_mtp_head(info, env_now)
+    info = _glm53_dense_tensors(info, env_now)
+    # Only the matrices a family's dho pass can release earn RAM credit. The
+    # embedding, norms, CPU-only components and unrecognized formats stay reserved.
+    vulkan = _vk_device(env_now, vulkan)
+    family_id = info["resolved_family"].descriptor.id
+    kept = min(info["dense_bytes"], info.get("embed_bytes", 0))
+    device_dense_bytes = max(0, info["dense_bytes"] - kept)
+    # A partial chain (vk_chain_fit): only the first N layers' tensors go to the device;
+    # the CPU's layers and the head keep their host copies.
+    chain_fit = vk_chain_fit(info, family_id, env_now, vulkan)
+    partial = chain_fit is not None and (chain_fit["n"] < chain_fit["L"] or not chain_fit["tail"])
+
+    def on_device(tensor):
+        if not partial:
+            return True
+        layer = _vk_layer_index(tensor["name"])
+        return layer is not None and layer < chain_fit["n"]
+    tensors_on_device = [tensor for tensor in info.get("dense_tensors", []) if on_device(tensor)]
+    if partial:
+        released = sum(_vk_released_tensor_bytes(tensor, family_id, env_now) for tensor in tensors_on_device)
+        vk_dense, vk_dense_why = ((False, None) if chain_fit["n"] == 0 else
+                                  vk_dense_device_only(released, family_id, env_now, vulkan))
+    else:
+        vk_dense, vk_dense_why = vk_dense_device_only(
+            device_dense_bytes, family_id, env_now, vulkan)
+    dense_on_device = 0
+    if vk_dense:
+        dense_on_device = min(device_dense_bytes, sum(
+            _vk_released_tensor_bytes(tensor, family_id, env_now)
+            for tensor in tensors_on_device))
+        info = dict(info, dense_bytes=info["dense_bytes"] - dense_on_device)
+    # On an integrated/software device the remaining device copy still consumes
+    # physical RAM. Keeping host copies costs two copies; dropping them saves one,
+    # not both. Price the device copy even when COLI_VK_DENSE_HOST=1.
+    device_copy = (min(device_dense_bytes, sum(tensor["resident"] for tensor in tensors_on_device))
+                   if partial else device_dense_bytes)
+    shared_dense_bytes = (device_copy
+                          if (vulkan or {}).get("type") in ("integrated", "cpu")
+                          and _vk_dense_active(family_id, env_now, vulkan) else 0)
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
     cpu_sockets = cpu_socket_count() if cpu_sockets is None else cpu_sockets
     resolved = info["resolved_family"]
+    if info.get("qwen38_int4_experts"):
+        # qwen38's CUDA tier streams FP8 experts only and stays off when the
+        # int4-g64 sidecar is in use (trunk included): plan the CPU.
+        if gpu_indices or vram_gb > 0:
+            raise ValueError(
+                "Qwen3.8 int4-g64 experts (experts-int4g64/) run on the CPU; "
+                "Q38_EXPERT_INT4=0 gives the GPU tier the FP8 experts")
+        gpus = []
     if not resolved.descriptor.supports_accelerator:
         if gpu_indices:
             raise ValueError(
@@ -951,7 +3015,19 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if (isinstance(kv_slots, bool) or not isinstance(kv_slots, int) or
             not 1 <= kv_slots <= resolved.descriptor.limits.max_kv_slots):
         raise ValueError(f"{resolved.descriptor.id}: invalid KV slot count {kv_slots}")
-    available_memory = memory_available() if available_memory is None else available_memory
+    automatic_ram = ram_gb <= 0
+    if available_memory is None:
+        available_memory = memory_available()
+    available_memory_known = available_memory is not None
+    if not available_memory_known:
+        # Nothing could measure host memory (no /proc, vm_stat failed). Report
+        # the historical 0 and let the 8 GB compatibility fallback below size
+        # the budget; doctor's "could not be measured" warning keys on it.
+        available_memory = 0
+    elif automatic_ram and available_memory <= 0:
+        raise ValueError(
+            "no available RAM remains for automatic placement "
+            "(host/cgroup memory budget is exhausted)")
     if available_disk is None:
         try:
             usage = shutil.disk_usage(info["path"])
@@ -968,10 +3044,16 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     # stops "a GPU exists" from being read as "a GPU should be used" -- see
     # plans_placement().
     planning_gpus = [gpu for gpu in gpus if plans_placement(gpu)]
+    # A CUDA tier built for newer cards than the one found: that card drives no
+    # placement (#1906: a Quadro P2000, sm_61, planned as "GPU compute" for V4)
+    floor = CUDA_TIER_FLOOR.get(resolved.descriptor.id)
+    below = [gpu for gpu in planning_gpus
+             if floor and gpu.get("compute_cap") and tuple(gpu["compute_cap"]) < floor[0]]
+    planning_gpus = [gpu for gpu in planning_gpus if gpu not in below]
 
     placement_unified = any(gpu.get("unified_memory", False)
                             for gpu in planning_gpus)
-    unified = placement_unified or _host_unified_memory()
+    unified = placement_unified or _host_unified_memory() or bool(shared_dense_bytes)
     typical = info["typical_expert_bytes"]
     max_expert = info["max_expert_bytes"] or typical
     kv_bytes = (geometry.context_state_bytes + geometry.fixed_state_bytes) * kv_slots
@@ -981,7 +3063,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     # every cache slot. Include it in the resident runtime reservation so the
     # selected capacity cannot overrun the model's actual allocation.
     runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * max_expert +
-                        info["expert_fixed_bytes"] + kv_bytes + kv_buffer)
+                        info["expert_fixed_bytes"] + kv_bytes + kv_buffer + shared_dense_bytes)
     per_cap = info["per_cap_bytes"]
     configured_experts = geometry.configured_experts
 
@@ -989,10 +3071,20 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     gpu_plan = []
     safe_vram = 0
     for gpu in gpus:
-        usable = max(0, gpu["free_bytes"] - reserve) if plans_placement(gpu) else 0
+        usable = max(0, gpu["free_bytes"] - reserve) if plans_placement(gpu) and gpu not in below else 0
         safe_vram += usable
         gpu_plan.append(dict(gpu, reserve_bytes=reserve, usable_bytes=usable))
     requested_vram = int(vram_gb * GB) if vram_gb > 0 else safe_vram
+    # The engine's placer (qwen36_tier.c, COLI_PLACE=auto) takes the dense
+    # trunk first -- it is read every token -- on the first planned device,
+    # if it fits that device's allowance; the experts get what is left.
+    trunk_bytes = int(info.get("trunk_int8_bytes", 0) or 0)
+    trunk_placed = 0
+    if trunk_bytes and gpu_plan and gpu_plan[0]["usable_bytes"] >= trunk_bytes \
+            and requested_vram >= trunk_bytes:
+        trunk_placed = trunk_bytes
+    requested_vram = max(0, requested_vram - trunk_placed)
+    safe_vram = max(0, safe_vram - trunk_placed)
     requested_vram_before_clamp = requested_vram
     unified_pool = max(0, available_memory - info["dense_bytes"] - runtime_bytes)
     if placement_unified:
@@ -1005,28 +3097,55 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     vram_experts = int(vram_budget // typical) if typical else 0
     hot_bytes = min(info["expert_bytes"], vram_experts * typical)
     warnings = []
+    for gpu in below:
+        cc = gpu["compute_cap"]
+        warnings.append(
+            f"GPU {gpu['index']} ({gpu['name']}, sm_{cc[0]}{cc[1]}) is below the "
+            f"sm_{floor[0][0]}{floor[0][1]} {resolved.descriptor.id}'s CUDA tier is built for by "
+            f"default; planned without it ({floor[1]})")
     if placement_unified:
         requested_ram = int(ram_gb * GB) if ram_gb > 0 else int(available_memory * 0.88)
         requested_ram_experts = max(0, requested_ram - info["dense_bytes"] - runtime_bytes)
         ram_expert_bytes = min(requested_ram_experts,
                                max(0, unified_pool - vram_budget))
-        ram_budget = info["dense_bytes"] + runtime_bytes + ram_expert_bytes
+        # The fixed resident footprint can itself exceed a small requested or
+        # cgroup-derived budget. Keep reporting the actual admission ceiling in
+        # that case; inflating the tier to the fixed footprint would make an
+        # exhausted shared-memory plan look admissible. The zero-cache warning
+        # below still explains that the model cannot retain even one expert.
+        ram_budget = min(requested_ram,
+                         info["dense_bytes"] + runtime_bytes + ram_expert_bytes)
         if requested_ram_experts > ram_expert_bytes:
             warnings.append(
                 f"RAM budget clamped from {format_bytes(requested_ram)} to "
                 f"{format_bytes(ram_budget)} because the GPU shares physical memory")
     else:
         ram_budget = int(ram_gb * GB) if ram_gb > 0 else int(available_memory * 0.88)
-    if ram_budget < 4 * GB:
-        ram_budget = 8 * GB if not placement_unified else max(0, ram_budget)
+    # Keep the legacy 8 GB fallback only when every host-memory probe failed.
+    # A known small value -- especially finite cgroup headroom -- must retain
+    # the 12% safety reserve and can never be inflated above what is available.
+    # An explicit --ram is an intentional override, but its smaller value must
+    # likewise not be silently raised behind the user's back.
+    if automatic_ram and not available_memory_known and not placement_unified:
+        ram_budget = 8 * GB
     cache_bytes = max(0, ram_budget - info["dense_bytes"] - runtime_bytes)
     cap = int(cache_bytes // per_cap) if per_cap else 0
     if configured_experts:
         cap = min(cap, configured_experts)
+    if geometry.dense:
+        # Nothing to cache: the engine still takes a cache size, and one slot is
+        # the smallest it accepts; no slot is ever filled.
+        cap = 1
     warm_bytes = min(max(0, info["expert_bytes"] - hot_bytes), cache_bytes)
     cold_bytes = max(0, info["expert_bytes"] - hot_bytes - warm_bytes)
 
-    if cap < 1:
+    if geometry.dense:
+        if info["dense_bytes"] + runtime_bytes > ram_budget:
+            warnings.append(
+                f"a dense model keeps every weight resident: {format_bytes(info['dense_bytes'])} "
+                f"of weights (as stored; the engine quantizes them at load) do not fit the "
+                f"RAM budget of {format_bytes(ram_budget)}")
+    elif cap < 1:
         warnings.append("RAM budget cannot hold one expert slot per sparse layer")
     if gpu_indices is not None and len(gpus) != len(set(gpu_indices)):
         warnings.append("one or more requested GPUs were not detected")
@@ -1062,7 +3181,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     resident_expert = hot_bytes + warm_bytes
     projected_hit = resident_expert / total_expert if total_expert else 1.0
 
-    if cold_bytes:
+    if geometry.dense:
+        bottleneck = ("GPU compute (dense model, weights in VRAM)" if trunk_placed else
+                      "RAM bandwidth (dense model: every weight is read for every token)")
+        bottleneck_class = "compute" if trunk_placed else "memory"
+    elif cold_bytes:
         bottleneck = "disk expert misses"
         bottleneck_class = "disk"
     elif warm_bytes and planning_gpus:
@@ -1081,6 +3204,13 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     tune = _auto_tune(bottleneck_class, projected_hit, planning_gpus, cpu_sockets,
                       plan_has_metal=False,
                       engine_group=resolved.descriptor.engine_group)
+    # DRAFT/PIPE/PIN/NUMA stay colibri.c-only (#1585). These two are the
+    # opposite leftover: the engines that size the expert LRU from their own
+    # *EXPERT_GB variable, which RAM_GB does not set.
+    knob = _family_expert_cache_knob(resolved.descriptor.id, cache_bytes)
+    if knob:
+        name, reason = knob
+        tune[name] = {"value": f"{cache_bytes / GB:.3f}", "reason": reason}
     probe_state, probe_gbs = ssd_probe_state(info["path"])
     actions = _next_actions(bottleneck_class, projected_hit, probe_state,
                             probe_gbs, planning_gpus)
@@ -1103,6 +3233,12 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                      "available_bytes": available_disk, "cold_expert_bytes": cold_bytes},
             "ram": {"role": "resident+warm-experts", "available_bytes": available_memory,
                     "budget_bytes": ram_budget, "dense_bytes": info["dense_bytes"],
+                    "dense_on_device_bytes": dense_on_device,
+                    "dense_on_device_reason": vk_dense_why if vk_dense else None,
+                    "vk_chain_layers": ({"on_device": chain_fit["n"], "layers": chain_fit["L"],
+                                         "tail": chain_fit["tail"], "forced": chain_fit["forced"]}
+                                        if chain_fit is not None else None),
+                    "shared_device_dense_bytes": shared_dense_bytes,
                     "runtime_bytes": runtime_bytes,
                     "expert_fixed_bytes": info["expert_fixed_bytes"],
                     "sequence_state_bytes": geometry.context_state_bytes,
@@ -1112,6 +3248,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                     "warm_expert_bytes": warm_bytes, "cache_slots_per_layer": cap},
             "vram": {"role": "hot-experts", "devices": gpu_plan,
                      "budget_bytes": vram_budget, "hot_expert_bytes": hot_bytes,
+                     "trunk_bytes": trunk_placed,
                      "expert_capacity": vram_experts, "requires_host_backing": False},
         },
         "expected_bottleneck": bottleneck,
@@ -1121,11 +3258,15 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         "next_actions": actions,
         # Un motore solo-CPU non ha un tier VRAM: annunciarlo comunque fa
         # scrivere al piano una riga che nessuno puo' eseguire.
-        "decisions": ([{"target": "VRAM", "reason": "profile-ranked hot experts"}]
-                      if resolved.descriptor.supports_accelerator else []) + [
-            {"target": "RAM", "reason": "warm experts execute on CPU without quality loss"},
-            {"target": "Disk", "reason": "immutable recovery source for cold experts"},
-        ],
+        "decisions": ([{"target": "VRAM", "reason": "dense trunk as int8 residents"}]
+                      if trunk_placed else []) + (
+            [{"target": "RAM", "reason": "dense model: every weight resident, read every token"}]
+            if geometry.dense else
+            ([{"target": "VRAM", "reason": "profile-ranked hot experts"}]
+             if resolved.descriptor.supports_accelerator else []) + [
+                {"target": "RAM", "reason": "warm experts execute on CPU without quality loss"},
+                {"target": "Disk", "reason": "immutable recovery source for cold experts"},
+            ]),
         "warnings": warnings,
         # #379: read-only surfacing of the cached Metal-cache storage probe, if
         # the engine has already measured this model dir. gbs is None unless
@@ -1162,6 +3303,10 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
         result.setdefault("REPIN", "64")
     ram = plan["tiers"]["ram"]
     result.setdefault("RAM_GB", f"{ram['budget_bytes'] / GB:.3f}")
+    knob = _family_expert_cache_knob(plan.get("model", {}).get("family_id"),
+                                    ram.get("expert_cache_bytes"))
+    if knob:
+        result.setdefault(knob[0], f"{ram['expert_cache_bytes'] / GB:.3f}")
     planned_cap = ram.get("cache_slots_per_layer")
     if (plan.get("model", {}).get("family_id") == "qwen38" and
             (not isinstance(planned_cap, int) or
@@ -1213,18 +3358,34 @@ def format_plan(plan):
              f"disk   {format_bytes(tiers['disk']['cold_expert_bytes'])} cold experts · "
              f"{format_bytes(tiers['disk']['available_bytes'])} free",
              f"RAM    {format_bytes(tiers['ram']['budget_bytes'])} budget · "
-             f"{format_bytes(tiers['ram']['dense_bytes'])} dense · "
+             f"{format_bytes(tiers['ram']['dense_bytes'])} dense"
+             + (f" (+{format_bytes(tiers['ram']['dense_on_device_bytes'])} on the Vulkan device only"
+                + (f", the first {tiers['ram']['vk_chain_layers']['on_device']} of "
+                   f"{tiers['ram']['vk_chain_layers']['layers']} layers"
+                   if (tiers['ram'].get('vk_chain_layers') or {}).get('on_device', 0)
+                   < (tiers['ram'].get('vk_chain_layers') or {}).get('layers', 0) else "") + ")"
+                if tiers['ram'].get('dense_on_device_bytes') else "") + " · "
              f"{format_bytes(tiers['ram']['runtime_bytes'])} runtime · "
              f"{format_bytes(tiers['ram']['warm_expert_bytes'])} warm experts · "
              f"cap {tiers['ram']['cache_slots_per_layer']}/layer"]
     vram = tiers["vram"]
     if vram["devices"]:
-        names = ", ".join(
-            f"{gpu['index']}:{gpu['name']}"
-            + ("" if plans_placement(gpu) else " (identity only)")
-            for gpu in vram["devices"])
-        lines.append(f"VRAM   {format_bytes(vram['budget_bytes'])} hot tier · "
-                     f"~{vram['expert_capacity']} experts · {names}")
+        metal_identity = [gpu for gpu in vram["devices"]
+                          if gpu.get("backend") == "metal"
+                          and gpu.get("free_bytes") is None]
+        if len(metal_identity) == len(vram["devices"]):
+            names = ", ".join(f"{gpu['index']}:{gpu['name']}"
+                              for gpu in metal_identity)
+            lines.append(f"Metal  {names} · unified memory · no independent VRAM budget")
+        else:
+            names = ", ".join(
+                f"{gpu['index']}:{gpu['name']}"
+                + ("" if plans_placement(gpu) else " (identity only)")
+                for gpu in vram["devices"])
+            trunk = vram.get("trunk_bytes", 0)
+            lines.append("VRAM   " + (f"{format_bytes(trunk)} int8 trunk + " if trunk else "") +
+                         f"{format_bytes(vram['budget_bytes'])} hot tier · "
+                         f"~{vram['expert_capacity']} experts · {names}")
     else:
         # Backend-neutral, matching the accelerator wording #903 settled on:
         # an AMD or Intel host that finds nothing is not "no NVIDIA device".

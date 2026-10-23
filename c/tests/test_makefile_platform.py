@@ -60,6 +60,25 @@ class MakefilePlatformTests(unittest.TestCase):
                 result = self._dry_run("portable", triplet)
                 self.assertIn(expected_flag, result.stdout)
 
+    def test_vk_links_no_vulkan_loader(self):
+        # The loader is opened at run time (vk_load.h): a VK=1 binary has to
+        # start where there is none, as the release archives' do. Linux takes
+        # -ldl for dlopen; Windows stays fully -static (LoadLibrary is kernel32).
+        cases = (
+            ("x86_64-unknown-linux-gnu", "-o colibri ", ["-pthread", "-ldl"]),
+            ("x86_64-w64-mingw32", "-o colibri.exe ", ["-static", "-lpsapi"]),
+        )
+
+        for triplet, output, tail in cases:
+            with self.subTest(triplet=triplet):
+                result = self._dry_run("colibri", triplet, VK=1)
+                link = next(
+                    line for line in result.stdout.splitlines() if output in line
+                )
+                self.assertEqual(link.split()[-len(tail):], tail)
+                self.assertNotIn("-lvulkan", link)
+                self.assertNotIn("-Bdynamic", link)
+
     def test_darwin_portable_build_does_not_force_x86_architecture(self):
         missing_libomp = "/colibri-test/missing-libomp"
         result = self._dry_run(

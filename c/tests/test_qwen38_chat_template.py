@@ -22,7 +22,14 @@ visto: non da' errore, da' chiamate malformate.
 Il template vero viene reso con jinja2 e confrontato byte per byte con quello
 che produce il gateway. Se manca il template il test si dichiara SALTATO invece
 di passare: un test che non ha trovato il suo riferimento non ha verificato
-niente, e dirlo verde sarebbe peggio che non averlo.
+niente, e dirlo verde sarebbe peggio che non averlo -- percio' un salto esce con
+codice 2, distinto dallo 0 di un confronto riuscito.
+
+RIFERIMENTO (scaricato 2026-09-10):
+  repo     Qwen/Qwen3.8-Flash-Next-FP8
+  file     chat_template.jinja
+  sha256   c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041
+  hf download Qwen/Qwen3.8-Flash-Next-FP8 chat_template.jinja
 
 USO:
   python3 tests/test_qwen38_chat_template.py --template PATH/chat_template.jinja
@@ -115,7 +122,8 @@ CASES = {
 EFFORTS = ("xhigh", "medium", "low")
 
 
-def reference(template_text, *, messages, tools=None, reasoning_effort=None):
+def reference(template_text, *, messages, tools=None, reasoning_effort=None,
+              add_generation_prompt=True):
     import jinja2
 
     def raise_exception(message):
@@ -127,7 +135,7 @@ def reference(template_text, *, messages, tools=None, reasoning_effort=None):
         lambda value, ensure_ascii=False, **kw: json.dumps(value, ensure_ascii=ensure_ascii))
     environment.globals["raise_exception"] = raise_exception
     rendered = environment.from_string(template_text)
-    arguments = {"messages": messages, "add_generation_prompt": True,
+    arguments = {"messages": messages, "add_generation_prompt": add_generation_prompt,
                  "enable_thinking": True}
     if tools:
         arguments["tools"] = tools
@@ -157,12 +165,12 @@ def main() -> int:
     if not arguments.template.exists():
         print(f"SKIP: manca {arguments.template}; il riferimento non c'e' e "
               f"questo test non ha verificato nulla")
-        return 0
+        return 2                                  # salto != successo (vedi docstring)
     try:
         import jinja2                              # noqa: F401
     except ImportError:
         print("SKIP: jinja2 non installato; senza non c'e' riferimento")
-        return 0
+        return 2                                  # salto != successo (vedi docstring)
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import openai_server
@@ -184,6 +192,49 @@ def main() -> int:
             else:
                 show(name, ours, theirs)
                 failures += 1
+
+    # Prosecuzione: l'ultimo turno assistant e' da CONTINUARE, non uno gia' finito.
+    # ChatML chiude ogni turno con <|im_end|>, e questo template non ha un ramo di
+    # continuazione: il suo add_generation_prompt=False toglie solo la cue, il turno resta
+    # chiuso. La forma aperta e' percio' quel rendering MENO il <|im_end|>\n finale -- la
+    # posizione in cui il modello si trova mentre scrive un turno, e da cui prosegue.
+    aperto = [{"role": "user", "content": "capitale della Francia?"},
+              {"role": "assistant", "content": "La capitale e'"}]
+    produced = openai_server.render_chat_for_arch(aperto, enable_thinking=True,
+                                                  reasoning_effort="low",
+                                                  add_generation_prompt=False)
+    closed = reference(template_text, messages=aperto, reasoning_effort="low",
+                       add_generation_prompt=False)
+    # Il terminatore da togliere DEVE esserci nel riferimento: se il template cambiasse
+    # convenzione, toglierlo "se c'e'" sarebbe un no-op silenzioso e il confronto perderebbe
+    # senso. Percio' lo esigiamo prima di tagliarlo.
+    TERM = "<|im_end|>\n"
+    if not closed.endswith(TERM):
+        print(f"FAIL prosecuzione: il riferimento non finisce col terminatore {TERM!r} da "
+              f"togliere -- convenzione del template cambiata? coda: {closed[-40:]!r}")
+        failures += 1
+        expected = closed
+    else:
+        expected = closed[:-len(TERM)]
+    if produced == expected:
+        print("ok   prosecuzione: turno aperto = template(add_generation_prompt=False) "
+              "senza il <|im_end|> finale")
+    else:
+        show("prosecuzione", produced, expected)
+        failures += 1
+    if not produced.endswith("La capitale e'"):
+        print(f"FAIL prosecuzione: il prompt non finisce sull'apertura del client: "
+              f"{produced[-60:]!r}")
+        failures += 1
+    if produced.rstrip("\n").endswith("<|im_end|>"):
+        print("FAIL prosecuzione: il turno resta chiuso col terminatore")
+        failures += 1
+    # Controllo negativo: col ramo normale lo stesso scambio DEVE finire sulla cue, o il
+    # confronto qui sopra non starebbe distinguendo niente.
+    if not openai_server.render_chat_for_arch(
+            aperto, enable_thinking=True, reasoning_effort="low").endswith("<think>\n"):
+        print("FAIL prosecuzione: il ramo normale non emette piu' il prompt di generazione")
+        failures += 1
 
     # Il giro completo: rendere una chiamata e rileggerla deve restituire quello
     # che ci era stato dato. E' la meta' che il confronto col template non copre,

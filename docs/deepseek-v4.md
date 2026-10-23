@@ -90,6 +90,12 @@ experts per matrix and takes the original contiguous fast path everywhere else
 (#1310). The banner reports it by its measured geometry, `43L x 132E`, rather
 than the 284B of the official checkpoint, because that number is not its.
 
+Its experts take 76 GB, about half the official checkpoint's, so the RAM that suits the official
+checkpoint does not carry over, and more is not always faster: on a 128 GB
+Threadripper PRO 3975WX (#1906) `--ram 64` decoded 0.768 tok/s, 90 and 100
+0.745, 120 0.765. Two or three runs of your own prompt at different `--ram`
+values find the best one for a machine.
+
 A download can finish with a truncated shard even when the client reports
 success. If `st.h` rejects a shard as out of bounds, compare every local shard
 size with the Hugging Face repository before treating it as an engine failure.
@@ -102,6 +108,10 @@ CPU engine (all platforms):
 cd c
 make deepseek-v4            # ARCH=native for the local CPU (default x86-64-v3)
 ```
+
+The build uses link-time optimization by default. A gcc built without it (the
+portable w64devkit on Windows says `LTO support has not been enabled in this
+configuration`) builds with `make deepseek-v4 LTO=0`.
 
 ### Windows CUDA tier
 
@@ -178,11 +188,13 @@ $env:V4_LOADER_LANES = "3"   # GPU tier: 9-lane default tuned for the CPU path, 
 python ./coli serve --model C:\models\DeepSeek-V4-Flash --ram 32 --ctx 20000
 ```
 
-`coli run|chat|web` take the same environment. `--ngen` is a ceiling, not a
+`coli run|chat|web` take the same environment. On Windows a prompt with text
+outside ASCII (Chinese, accented letters) does not survive the command line of
+the engine run by hand: give it with `--prompt-file <UTF-8 file>`. `--ngen` is a ceiling, not a
 target (answers end at EOS; an oversized ceiling is clamped to the context
 with a stderr note). `CTX`/`--ctx` sets the context window.
 
-What the knobs do (full table in [Environment reference](#environment-reference)):
+What the knobs do (full table in [Environment reference](#environment-reference-v4-engine)):
 `COLI_CUDA_ATTN_BATCH=1` puts the batched prefill attention block on the GPU
 (compressor/indexer projections, sparse attention on a persistent device KV
 ring, wo, mHC) and enables the GPU decode attention/indexer paths;
@@ -218,6 +230,17 @@ the hit rate they add (~11 000 experts total; 600 mirrors ≈ 5 %); more RAM
 On non-Blackwell cards the generic DLL is selected automatically (fp32
 kernels): same settings, prefill roughly 2–3× slower than the DeepGEMM
 numbers, still far ahead of CPU.
+
+**Give it RAM.** 43 × 256 routed experts are ~137 GiB on disk and a token
+touches 301 of them, so the expert cache hit rate is what sets tok/s: `--ram`
+is the single most valuable knob, and it changes speed only, never output.
+
+Two opt-in GPU levers are looking for community numbers, both default off and
+byte-identical when unset: `DSV4_HYBRID=1` splits VRAM-tier misses between the
+GPU fill branch and the CPU branch using bandwidths measured at runtime, and
+`COLI_CUDA_MOE_DOUBLE=1` (on top of `COLI_CUDA_MOE_BATCH=1`) prefetches the next
+layer's full expert set into a second VRAM bank while the current layer
+computes, falling back to the single bank when VRAM is short.
 
 ## Prefill: segments, chunks, checkpoints
 
@@ -302,14 +325,65 @@ is no software path to fall back to.
 | CPU only (no DLL / `DSV4_CUDA=0` / Linux default) | — | CPU reference | CPU reference |
 | generic DLL / `CUDA=1` | any sm_80+ | GPU attention block, indexer, generic batched MoE on the VRAM bank | GPU attention, indexer, expert mirrors |
 | generic, pre-Ampere / `CUDA=1 CUDA_ARCH=portable-pre-ampere NO_TC=1` | sm_61 (Pascal), sm_75 (Turing) | as generic | as generic |
+| DeepGEMM DLL / `CUDA=1 DEEPGEMM=1` | compute 12.x | as generic + tensor-core dense/MoE GEMMs | same as generic |
+| multi-GPU | — | single device today (`DSV4_CUDA_DEVICE` selects); expert-parallel design drafted, not implemented | — |
 
 The runtime check `dsv4_cuda_backend_arch_ok` admits sm_60 and up for the
 generic build. It is deliberately independent of what the binary contains: a
 `CUDA_ARCH=portable` build has no sm_61/sm_75 cubin, and running it on such a
-card fails at launch with "no kernel image is available" rather than producing
+card fails at launch with `"no kernel image is available"` rather than producing
 a wrong answer. Build with `portable-pre-ampere` for those cards.
-| DeepGEMM DLL / `CUDA=1 DEEPGEMM=1` | compute 12.x | as generic + tensor-core dense/MoE GEMMs | same as generic |
-| multi-GPU | — | single device today (`DSV4_CUDA_DEVICE` selects); expert-parallel design drafted, not implemented | — |
+## Vulkan (`VK=1`, any GPU with a Vulkan 1.2 driver)
+
+`make deepseek-v4 VK=1` (the Vulkan headers and `glslc` at build time) links the shared
+Vulkan backend and its routed-expert tier; `COLI_VULKAN=1` opens the device once
+the engine has loaded. No usable device, or no shaders, and the run stays on the
+CPU with one `[VK] deepseek_v4:` line that says so. Two things go to the device:
+
+- **The matrices the engine keeps for its whole life**: the resident dense layers
+  (fp8 128x128 blocks as fmt 12, fed the activation after the CPU's own E4M3
+  rounding), the bf16 head, router and compressors (fmt 11). The `--oracle` path's
+  per-forward copies, the indexer's `weights_proj` and the DSpark stages stay on
+  the CPU.
+- **The routed experts**, on the shared tier ([vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc)):
+  a cache on the device that fills from the history and adapts while you chat,
+  computed while the CPU computes the experts it does not hold. The experts go up
+  as the store reads them, fp4 with a ue8m0 scale per 32 (MXFP4, fmt 7), with an
+  activation of this engine's own that makes every rounding its CPU expert makes:
+  x to E4M3 per 128 (on the host), gate and up to bf16, the weighted activation to
+  bf16, down's input to E4M3 per 128, the output to bf16
+  ([DeepSeek V4's activation](vulkan.md#deepseek-v4s-activation)). The decode step
+  and the prefill union hand the device their routes first, the store lends the CPU
+  only the experts the device did not take, and every position adds its experts in
+  the CPU path's order, so on what was measured (Lavapipe, the tiny fixtures) the
+  device's rows are the CPU's after those roundings: a served prompt's logprobs
+  with every expert on the device come back byte for byte.
+
+Where the dense matrices go follows the backend's one rule: on a device that shares
+the CPU's RAM (an integrated GPU, Lavapipe) they stay on the CPU while the tier is
+on, and `COLI_VK_DENSE=1` puts them on the device anyway. The tier's history is the
+store's `.coli_usage`: its warm start reads the hottest experts straight from disk
+outside the cache, and a routing the device served is counted as a lookup counts
+one (pins, HITS and heat, the saved history). A hot expert the store keeps in its
+rows16 layout is unpacked for the tier, and only when the tier will take it. EMAP
+shows a device-resident expert as tier 2; each run and serve turn ends with a
+`[VK] tier deepseek_v4` line (device and CPU shares, uploads, evictions, the time
+the device hid). With the CUDA tier on, CUDA wins and the Vulkan tier stays off.
+Variables: `COLI_VULKAN`, `COLI_VK_DENSE` and the `COLI_VK_TIER*` family in
+[ENVIRONMENT.md](ENVIRONMENT.md#vulkan-any-gpu-with-a-vulkan-12-driver). CI runs it
+on Lavapipe (`tests/vulkan_engines.sh deepseek`, `deepseek-sanitize`). The only GPU
+it has run on is an Intel Iris Xe through Mesa's Dozen (Direct3D 12 under WSL),
+for correctness: the same ids as the CPU in every configuration above. No speed
+has been measured.
+
+`COLI_VK_CHAIN=1` runs every layer as the dense chain instead
+([vulkan.md](vulkan.md#deepseek-v4-on-the-chain)): the streams, the attention with its
+window ring, compressors and indexer, every bf16 and E4M3 rounding the CPU makes, the
+mHC sites and the shared expert on the device, one host round trip per layer for the
+router and the routed experts; the host's state stays canonical. It needs resident
+dense layers and declines under the CUDA tier. Off by default on an integrated GPU (not
+measured on a V4 checkpoint); on the tiny fixtures every configuration gives the CPU's
+tokens (`tests/vulkan_engines.sh deepseek-chain`, `deepseek-chain-sanitize`).
 
 ## Environment reference (V4 engine)
 
@@ -358,6 +432,15 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 `V4_NGRAM_PARTIAL_KEEP`, `COLI_V4_MARKOV_SPEC`, `COLI_V4_MARKOV_BLOCK`,
 `COLI_V4_MARKOV_KEEP`.
 
+Why it is off: DSpark's markov drafter and full MTP are both implemented and
+verified. A draft can save forward passes but never change a token, because
+every accepted token is still the target's own argmax. Measured on real
+multi-turn chat, they accepted 1 in 15 and 10 in 24, and the rejected-suffix
+replay of this engine's recurrent attention state cost more than the drafts
+saved: one 14-token answer took 495 seconds. So `V4_DRAFT` and `V4_MTP` default
+to `0` and the code stays, with the numbers beside it, for whoever retries this
+on faster storage.
+
 **Diagnostics**: `DSV4_ATTN_PROF`, `DSV4_DECODE_PROF`, `DSV4_IDX_VERIFY`,
 `DSV4_CUDA_MOE_PROF`, `DSV4_CUDA_DG_PROFILE`/`_AB`/`_DUMP` (`.cu`),
 `COLI_NO_OMP_TUNE`, `OMP_NUM_THREADS`.
@@ -392,7 +475,11 @@ kernels are not bit-identical to each other in general — a GPU run and a CPU
 run of the same prompt diverge by a rounding flip after some tokens, exactly
 as two CPU runs with different hot-expert sets do (next section) — so text
 identity is a regression check within one configuration, not a proof across
-configurations.
+configurations. The same holds across builds: a binary built with
+`ARCH=native` and the release's (`x86-64-v3`) can differ by such a flip, the
+compiler having chosen other instructions (FMA contraction, vector width) for
+the same arithmetic (#1906 saw one word change after 384 characters), so a
+check of exact text compares runs of one binary.
 
 ### Linux CUDA tier under WSL2 (2026-08-16)
 

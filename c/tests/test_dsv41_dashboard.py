@@ -34,6 +34,18 @@ def get_json(url, timeout=10):
         return json.load(response)
 
 
+def get_settled(url, limit_s=30):
+    """HITS and PROF follow DONE on the engine's stdout, so the reply can reach the
+    client before the gateway has read them. Wait for `seq` to say they arrived; past
+    the limit return what is there and let the assertions name what is missing."""
+    deadline = time.time() + limit_s
+    while True:
+        payload = get_json(url)
+        if payload.get("seq", 0) >= 1 or time.time() > deadline:
+            return payload
+        time.sleep(0.05)
+
+
 @unittest.skipUnless(FIXTURE.name and (FIXTURE / "config.json").is_file()
                      and (FIXTURE / "tokenizer.json").is_file(),
                      "COLI_DSV41_FIXTURE not set to a V4.1 container with a tokenizer")
@@ -68,8 +80,8 @@ class Dsv41DashboardTest(unittest.TestCase):
                                          data=body, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=300) as response:
             cls.completion = json.load(response)
-        cls.experts = get_json(f"http://127.0.0.1:{cls.port}/experts")
-        cls.profile = get_json(f"http://127.0.0.1:{cls.port}/profile")
+        cls.experts = get_settled(f"http://127.0.0.1:{cls.port}/experts")
+        cls.profile = get_settled(f"http://127.0.0.1:{cls.port}/profile")
         cls.config = json.loads((FIXTURE / "config.json").read_text())
 
     @classmethod

@@ -30,6 +30,7 @@ static int check_state(const Model *m,float value){
 
 static void free_fake(Model *m){
     q38_prefix_cache_release(m);
+    kv_prefix_free(&m->kvp);
     for(int i=0;i<m->c.layers;i++){
         free(m->DN_rec[i]);free(m->DN_conv[i]);
         free(m->K[i]);free(m->V[i]);free(m->IK[i]);
@@ -61,7 +62,8 @@ int main(void){
 
     const int first[]={1,2,3};float first_logits[8];
     for(int i=0;i<8;i++)first_logits[i]=(float)(100+i);
-    fill_state(&m,7.f);CHECK(q38_prefix_cache_save(&m,first,3,first_logits));
+    kv_prefix_record(&m.kvp,first,0,3);
+    fill_state(&m,7.f);CHECK(q38_prefix_cache_save(&m,first,3,first_logits,0));
     fill_state(&m,99.f);m.kv_len=3;
     const int extension[]={1,2,3,4};
     CHECK(q38_prefix_restore(&m,extension,4)==3);CHECK(check_state(&m,7.f));
@@ -73,19 +75,45 @@ int main(void){
     /* An exact prompt restores the recurrent state and its saved logits. */
     fill_state(&m,55.f);CHECK(q38_prefix_restore(&m,first,3)==3);CHECK(check_state(&m,7.f));
     fill_state(&m,56.f);CHECK(q38_prefix_restore(&m,extension,4)==3);CHECK(check_state(&m,7.f));
-    CHECK(q38_prefix_cache_save(&m,extension,4,first_logits));
+    kv_prefix_record(&m.kvp,extension,0,4);
+    CHECK(q38_prefix_cache_save(&m,extension,4,first_logits,0));
     fill_state(&m,88.f);CHECK(q38_prefix_restore(&m,extension,4)==4);CHECK(check_state(&m,7.f));
     const float *cached=q38_prefix_cached_logits(&m);CHECK(cached&&cached[0]==100.f&&cached[7]==107.f);
+
+    /* La fotografia chiesta con pin=1 si riconosce, e invalidarla la spegne:
+     * e quel flag a decidere se una richiesta che estende il prefisso puo
+     * sovrascriverla, quindi deve sopravvivere al salvataggio e sparire con
+     * l'invalidazione. */
+    CHECK(q38_prefix_cache_save(&m,first,3,first_logits,1));
+    CHECK(g_q38_prefix.pinned&&g_q38_prefix.len==3);
+    CHECK(q38_prefix_restore(&m,extension,4)==3);
+    kv_prefix_record(&m.kvp,extension,0,4);
+    CHECK(q38_prefix_cache_save(&m,extension,4,first_logits,0));
+    CHECK(!g_q38_prefix.pinned&&g_q38_prefix.len==4);
+    CHECK(q38_prefix_cache_save(&m,extension,4,first_logits,1));
+    q38_prefix_cache_invalidate();
+    CHECK(!g_q38_prefix.pinned&&!g_q38_prefix.valid);
+    kv_prefix_record(&m.kvp,extension,0,4);
+    CHECK(q38_prefix_cache_save(&m,extension,4,first_logits,0));
 
     /* A mismatch is never restored; the serve miss path invalidates then
      * resets the live recurrent state before feeding the new prompt. */
     const int shorter[]={1,2,3};CHECK(q38_prefix_restore(&m,shorter,3)==0);
+    CHECK(q38_prefix_restore(&m,extension,4)==4);
     const int mismatch[]={1,2,4};CHECK(q38_prefix_restore(&m,mismatch,3)==0);
     q38_prefix_cache_invalidate();reset_recurrent(&m);m.kv_len=0;
     CHECK(!g_q38_prefix.valid&&m.kv_len==0&&m.ple_history_len==0);
     for(size_t i=0;i<g_q38_prefix.rec_cells;i++)CHECK(m.DN_rec[0][i]==0.f);
     for(size_t i=0;i<g_q38_prefix.conv_cells;i++)CHECK(m.DN_conv[0][i]==0.f);
     for(size_t i=0;i<g_q38_prefix.ple_cells;i++)CHECK(m.PLE_conv_state[i]==0.f);
+    /* A saved recurrent state cannot resurrect discarded attention rows. */
+    kv_prefix_record(&m.kvp,extension,0,4);
+    CHECK(q38_prefix_cache_save(&m,extension,4,first_logits,0));
+    kv_prefix_clear(&m.kvp);
+    CHECK(q38_prefix_restore(&m,extension,4)==0);
+    kv_prefix_record(&m.kvp,extension,0,4);
+    kv_prefix_taint(&m.kvp);
+    CHECK(q38_prefix_restore(&m,extension,4)==0);
     free_fake(&m);
     puts("qwen38 prefix: single QSA allocation, exact/extension reuse, reset: ok");
     return 0;

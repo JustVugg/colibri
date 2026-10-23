@@ -4,10 +4,23 @@ A start-to-finish, reproducible path from a fresh Windows 11 machine to GLM-5.2 
 
 ---
 
+## The one-step way
+
+Download the repository (**Code**, then **Download ZIP**, or `git clone`), unzip
+it and double-click **`START-HERE.bat`**. It checks for Python (and offers to
+install it with winget), finds your hardware, recommends a model that fits,
+gets the engine (built with MSYS2 when it is installed, with Vulkan when your
+GPU can use it; otherwise the prebuilt one from the release, which runs on the
+CPU or with Vulkan), downloads
+the model with resume and opens the dashboard. Running it again starts colibri
+directly. The same from a terminal: `py -3 c\coli setup`. See
+[quickstart.md](quickstart.md#the-one-step-way).
+
 ## If you downloaded a release archive, start here
 
 The archive contains **`coli.cmd`**: that is the program to run. Double-click it
-for the quick start, or from cmd/PowerShell:
+for the quick start (it offers `coli.cmd setup`, the one-step path above), or
+from cmd/PowerShell:
 
 ```
 coli.cmd chat   --model D:\models\glm52_i4
@@ -21,6 +34,20 @@ their own they have no model to load, print how to launch and exit, which from
 Explorer looks like a window that flashes and disappears (#1241). The launcher
 needs Python 3 from https://www.python.org/downloads/ with "Add python.exe to
 PATH" ticked; the engines themselves need nothing.
+
+The engines are built with Vulkan, their shaders in `shaders\`: `coli.cmd
+setup` runs them on a GPU with a Vulkan driver (NVIDIA's, AMD's and Intel's
+drivers all install one) and on the CPU everywhere else, with nothing to build.
+
+**NVIDIA, CUDA.** For an RTX 30, 40 or 50 series card (compute capability 8.0
+and newer: A100, H100 and later too) the release also has
+**`colibri-<version>-windows-x86_64-cuda.zip`**. Unpack it into the same folder:
+it replaces `colibri.exe`, `qwen36.exe` and `kimi_k3.exe` with the same engines
+plus CUDA, and adds `coli_cuda.dll` and NVIDIA's CUDA runtime
+(`cudart64_12.dll`), so no CUDA toolkit is needed, only an NVIDIA driver for
+CUDA 12. `coli.cmd setup` then picks CUDA for the models those three engines
+run; an older card keeps Vulkan. To build the DLL yourself, for a card the
+package does not cover, see below.
 
 The rest of this page is for building from source.
 
@@ -139,6 +166,11 @@ This is not Defender and not Mark-of-the-Web — SAC blocks *all* unsigned, unkn
 # 0 = off, 1 = enforced, 2 = evaluation
 ```
 
+SAC can also block the compiler itself: right after `pacman` installs gcc, its own
+`collect2.exe` is unknown to SAC until the cloud verdict arrives (two hours, in #1900),
+and gcc only says `cannot execute 'collect2.exe': CreateProcess: No such file or
+directory`. The fix is the same (SAC off and a reboot), or waiting for the verdict.
+
 ## 3. Build the CUDA DLL (GPU tier)
 
 nvcc needs MSVC as host compiler, so this one step must run from a shell with the MSVC environment: open **"x64 Native Tools Command Prompt for VS 2022"** from the Start menu (plain PowerShell will fail the `cl` check). Not the generic "Developer Command Prompt": that one is the 32-bit compiler, and nvcc then fails inside `cuda_fp16.hpp` with `asm operand type size(8) does not match ... constraint 'r'` (#1405). `cl` alone prints which one you have: `for x64` is the right banner. Then:
@@ -188,6 +220,10 @@ Size `CUDA_EXPERT_GB` so dense (~10 GB) + experts + working set stays under your
 |---|---|---|
 | `'printf' is not recognized` / `The system cannot find the path specified` during `make colibri.exe` | scoop MinGW has no `sh.exe`; make fell back to cmd.exe (#478) | §0 — use MSYS2/w64devkit, or `set PATH=%PATH%;C:\msys64\usr\bin` |
 | `An Application Control policy has blocked this file` | Smart App Control | §2 — turn SAC off + **reboot** |
+| `cannot execute 'collect2.exe': CreateProcess: No such file or directory` | Smart App Control blocked the freshly installed compiler (#1900) | §2: SAC off and a reboot, or wait for SAC's verdict |
+| `cannot find -lgomp` at the link | MSYS2's gcc 16 no longer pulls libgomp (#1900) | `pacman -S mingw-w64-ucrt-x86_64-libgomp` (`coli setup` lists it) |
+| `make qwen38` (or glm53, inkling, kimi_k3, olmoe, deepseek_v41) ends in `undefined reference to ...` | older tree: no bare target for that engine, make compiled the `.c` alone (#1945) | update, or name the binary: `make qwen38.exe ...` |
+| `coli setup` does not find MSYS2 installed by scoop, or uses another gcc on the PATH without Vulkan | older tree (#1900) | update, or set `MSYS2_ROOT` to the MSYS2 folder |
 | `cuda-dll ... Error 1` immediately | old tree: spaced CUDA_HOME / MSVC rejects `-Wextra` | update to current `dev` (#314) |
 | `colibri.exe is up to date` but GPU never engages | old tree: stale CPU-only binary | update to `dev`, or delete the binary and rebuild |
 | `cl.exe (MSVC) not in PATH` | built from plain PowerShell | use the x64 Native Tools prompt |
@@ -675,3 +711,14 @@ Remove-Item -Recurse -Force $tooling
 SDK paths containing spaces are supported — every SDK-derived path the recipe
 passes to the compiler is quoted. If you supply one yourself, quote it:
 `HIP_SDK_ROOT="<path with spaces>"`.
+
+## Expert readahead
+
+Expert readahead uses a bounded Windows thread-pool queue. A `WILLNEED` hint
+returns without reading the expert on the inference thread, even when the file
+was opened synchronously. The worker prefetches a read-only file mapping;
+there is no second, temporary copy of the expert. At most four hints per engine
+translation unit are pending, with each window capped at 64 MiB. Excess hints,
+unavailable APIs and failed mappings are safely skipped; ordinary model reads
+still supply the weights. This applies to the common file-advice path used by
+the CPU and GPU engines and does not change their weight formats or arithmetic.

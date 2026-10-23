@@ -28,6 +28,7 @@ typedef struct {
     size_t      acap, aoff;
     int         depth;     /* annidamento corrente: bound contro lo stack-overflow
                             * da JSON malevolo tipo [[[[...]]]] (discesa ricorsiva) */
+    int         error;     /* used by json_parse_checked; legacy parsing stays permissive */
 } jparser;
 
 /* tetto di annidamento: gli header safetensors / config sono piatti (profondita'
@@ -43,7 +44,13 @@ static char *j_dup(jparser *p, const char *b, int n) {
     return d;
 }
 
-static void j_ws(jparser *p) { while (*p->s && isspace((unsigned char)*p->s)) p->s++; }
+static void j_ws(jparser *p) {
+    while (*p->s && isspace((unsigned char)*p->s)) {
+        char c=*p->s++;
+        /* Preserve legacy consumption, but only JSON whitespace is valid. */
+        if (c!=' ' && c!='\t' && c!='\r' && c!='\n') p->error=1;
+    }
+}
 
 static jval *j_new(jtype t) {
     jval *v = (jval *)calloc(1, sizeof(jval));
@@ -52,12 +59,12 @@ static jval *j_new(jtype t) {
 
 static jval *j_parse_val(jparser *p);
 
-static char *j_parse_str_raw(jparser *p) {
+static char *j_parse_str_raw(jparser *p, int is_key) {
     /* SEC (GHSA-2qrj): fail closed if not actually at a quote. The old comment
      * "assume *p->s == '\"'" was violated on the object-key path, and the
      * unconditional p->s++ would step past the buffer's NUL terminator and scan
      * adjacent heap (OOB read leaking into tensor names). */
-    if (*p->s != '"') return j_dup(p, "", 0);
+    if (*p->s != '"') { p->error = 1; return j_dup(p, "", 0); }
     p->s++;
     /* buffer su heap che CRESCE: niente troncamento silenzioso a 64KB (le stringhe
      * lunghe di tokenizer.json/config venivano tagliate) e niente 64KB di stack. */
@@ -67,6 +74,7 @@ static char *j_parse_str_raw(jparser *p) {
         if (!tmp) { fprintf(stderr, "OOM parsing JSON string\n"); exit(1); } } tmp[n++] = (char)(ch); }while(0)
     while (*p->s && *p->s != '"') {
         char c = *p->s++;
+        if ((unsigned char)c < 0x20) p->error = 1;
         if (c == '\\' && *p->s) {
             char e = *p->s++;
             switch (e) {
@@ -75,9 +83,12 @@ static char *j_parse_str_raw(jparser *p) {
                 case 'f': c = '\f'; break; case '/': c = '/'; break;
                 case '\\': c = '\\'; break; case '"': c = '"'; break;
                 case 'u': {  /* \uXXXX -> codepoint UTF-8 (con coppie surrogate) */
-                    if (!p->s[0]||!p->s[1]||!p->s[2]||!p->s[3]) { c='?'; break; }   /* \u troncato: non leggere oltre il NUL */
+                    if (!p->s[0]||!p->s[1]||!p->s[2]||!p->s[3]) { p->error=1; c='?'; break; }   /* \u troncato: non leggere oltre il NUL */
+                    for (int i=0; i<4; i++) if (!isxdigit((unsigned char)p->s[i])) p->error=1;
                     unsigned cp = (unsigned)strtoul((char[]){p->s[0],p->s[1],p->s[2],p->s[3],0}, NULL, 16);
                     p->s += 4;
+                    /* Checked keys must retain their identity in C-string lookups. */
+                    if (is_key && cp==0) p->error=1;
                     if (cp >= 0xD800 && cp <= 0xDBFF && p->s[0]=='\\' && p->s[1]=='u'
                         && p->s[2] && p->s[3] && p->s[4] && p->s[5]) {
                         unsigned lo = (unsigned)strtoul((char[]){p->s[2],p->s[3],p->s[4],p->s[5],0}, NULL, 16);
@@ -89,13 +100,13 @@ static char *j_parse_str_raw(jparser *p) {
                     else { J_PUT(0xF0|(cp>>18)); J_PUT(0x80|((cp>>12)&0x3F)); J_PUT(0x80|((cp>>6)&0x3F)); J_PUT(0x80|(cp&0x3F)); }
                     continue;
                 }
-                default: c = e; break;
+                default: p->error = 1; c = e; break;
             }
         }
         J_PUT(c);
     }
     #undef J_PUT
-    if (*p->s == '"') p->s++;
+    if (*p->s == '"') p->s++; else p->error = 1;
     char *out = j_dup(p, tmp, (int)n); free(tmp);
     return out;
 }
@@ -103,9 +114,9 @@ static char *j_parse_str_raw(jparser *p) {
 static jval *j_parse_val(jparser *p) {
     j_ws(p);
     char c = *p->s;
-    if (c == '"') { jval *v = j_new(J_STR); v->str = j_parse_str_raw(p); return v; }
+    if (c == '"') { jval *v = j_new(J_STR); v->str = j_parse_str_raw(p,0); return v; }
     if (c == '{') {
-        if (++p->depth > J_MAX_DEPTH) { p->depth--; return j_new(J_NULL); }
+        if (++p->depth > J_MAX_DEPTH) { p->error=1; p->depth--; return j_new(J_NULL); }
         p->s++; jval *v = j_new(J_OBJ);
         int cap = 8;
         v->keys = malloc(cap * sizeof(char*));
@@ -116,9 +127,9 @@ static jval *j_parse_val(jparser *p) {
         if (*p->s == '}') { p->s++; p->depth--; return v; }
         for (;;) {
             j_ws(p);
-            if (*p->s != '"') break;   /* SEC (GHSA-2qrj): object key must be a quoted string; stop on malformed input */
-            char *key = j_parse_str_raw(p);
-            j_ws(p); if (*p->s == ':') p->s++;
+            if (*p->s != '"') { p->error=1; break; }   /* SEC (GHSA-2qrj): object key must be a quoted string; stop on malformed input */
+            char *key = j_parse_str_raw(p,1);
+            j_ws(p); if (*p->s == ':') p->s++; else p->error=1;
             jval *val = j_parse_val(p);
             if (v->len == cap) { cap *= 2;
                 char **nk = (char**)realloc(v->keys, cap*sizeof(char*));
@@ -131,13 +142,14 @@ static jval *j_parse_val(jparser *p) {
             j_ws(p);
             if (*p->s == ',') { p->s++; continue; }
             if (*p->s == '}') { p->s++; break; }
+            p->error = 1;
             break;
         }
         p->depth--;
         return v;
     }
     if (c == '[') {
-        if (++p->depth > J_MAX_DEPTH) { p->depth--; return j_new(J_NULL); }
+        if (++p->depth > J_MAX_DEPTH) { p->error=1; p->depth--; return j_new(J_NULL); }
         p->s++; jval *v = j_new(J_ARR);
         int cap = 8;
         v->kids = malloc(cap * sizeof(jval*));
@@ -154,6 +166,7 @@ static jval *j_parse_val(jparser *p) {
             j_ws(p);
             if (*p->s == ',') { p->s++; continue; }
             if (*p->s == ']') { p->s++; break; }
+            p->error = 1;
             break;
         }
         p->depth--;
@@ -163,12 +176,28 @@ static jval *j_parse_val(jparser *p) {
     if (c == 'f' && !strncmp(p->s, "false", 5)) { p->s += 5; jval *v = j_new(J_BOOL); v->boolean = 0; return v; }
     if (c == 'n' && !strncmp(p->s, "null", 4))  { p->s += 4; return j_new(J_NULL); }
     /* numero */
-    { char *end; double d = strtod(p->s, &end); p->s = end; jval *v = j_new(J_NUM); v->num = d; return v; }
+    { const char *start=p->s, *q=start;
+      if (*q=='-') q++;
+      if (*q=='0') q++;
+      else if (*q>='1' && *q<='9') { do { q++; } while (*q>='0' && *q<='9'); }
+      else p->error=1;
+      if (*q=='.') {
+          q++; if (*q<'0' || *q>'9') p->error=1;
+          while (*q>='0' && *q<='9') q++;
+      }
+      if (*q=='e' || *q=='E') {
+          q++; if (*q=='+' || *q=='-') q++;
+          if (*q<'0' || *q>'9') p->error=1;
+          while (*q>='0' && *q<='9') q++;
+      }
+      char *end; double d = strtod(start, &end);
+      if (end==start || end!=q) p->error=1;
+      p->s = end; jval *v = j_new(J_NUM); v->num = d; return v; }
 }
 
 /* API */
 static jval *json_parse(const char *text, char **arena_out) {
-    jparser p = { text, NULL, 0, 0, 0 };
+    jparser p = { text, NULL, 0, 0, 0, 0 };
     jval *v = j_parse_val(&p);
     if (arena_out) *arena_out = p.arena; else free(p.arena);
     return v;
@@ -193,6 +222,18 @@ static void json_free(jval *v) {
         free(v->str);
     }
     free(v);
+}
+
+/* An oracle must not accept a partial tree from a truncated/malformed file.
+ * Keep the existing API's permissive behavior for other engine consumers. */
+static jval *json_parse_checked(const char *text) {
+    if (!text) return NULL;
+    jparser p = { text, NULL, 0, 0, 0, 0 };
+    jval *v = j_parse_val(&p);
+    j_ws(&p);
+    if (p.error || *p.s) { json_free(v); v=NULL; }
+    free(p.arena);
+    return v;
 }
 
 #endif

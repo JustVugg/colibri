@@ -7,7 +7,7 @@ import {
   Clock,
   Cpu,
   Database,
-  Feather,
+  Search, SquarePen, History, Settings2, Sun, Moon, X, Download, Copy, ChevronDown, Code2,
   Gauge,
   Globe,
   HardDrive,
@@ -17,34 +17,45 @@ import {
   Link2,
   LoaderCircle,
   MemoryStick,
-  ImagePlus,
   MessageSquareText,
   MonitorDot,
   RefreshCw,
+  StepForward,
   SlidersHorizontal,
   Timer,
   Trash2,
-  Zap,
-} from "lucide-react"
+  Zap, ImagePlus, Camera, Grid3x3, Palette} from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
-import { getHealth, listModels, streamChat, type ChatMessage, type HealthResponse, type StreamChatResult } from "@/lib/api"
-import { activeRequests, supportsCacheSlots } from "@/lib/runtime"
-import { Brain } from "./Brain"
+import {
+  generateImage, generatesImages, getHealth, listModelInfo, streamChat,
+  type ChatMessage, type GeneratedImage, type HealthResponse, type StreamChatResult,
+} from "@/lib/api"
+import {
+  DEFAULT_SIZE, DEFAULT_STEPS, chatTurns, clampSteps, dataUrlBlob, imageFileName, parseSeed, parseSize,
+  presetOf, randomSeed, sizeKey, validSide, type ImageSize,
+} from "@/lib/images"
+import { resendFrom } from "@/lib/chat"
+import { activeRequests, supportsCacheSlots, supportsContinuation } from "@/lib/runtime"
+import Brio from "./Brio"
+import { BrainWorkspace } from "./BrainWorkspace"
+import { Brand } from "./components/Brand"
+import { ImageControls, ImageProgressCard, ImageResultCard, ImageStoppedCard, type ImageRun } from "./components/ImageTurn"
+import { Markdown } from "./components/Markdown"
+import { NavigationDock, type View } from "./components/NavigationDock"
 import { Profiling } from "./Profiling"
 import { persistPublicSettings, stored } from "@/lib/storage"
-import { Markdown } from "@/components/Markdown"
+import { appendDelta, continuable, continuation, setFinish } from "@/lib/transcript"
 import { cn } from "@/lib/utils"
 import { useLocale } from "./i18n"
-import { REASONING_EFFORT, modelForcesReasoning, reasoningLevelsFor, type ReasoningLevel } from "@/lib/reasoning"
 
-const message = (role: ChatMessage["role"], content: string): ChatMessage => {
+const message = (role: ChatMessage["role"], content: string, images?: string[]): ChatMessage => {
   let id: string
   try { id = crypto.randomUUID() } catch { id = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16) }) }
-  return { id, role, content }
+  return images?.length ? { id, role, content, images } : { id, role, content }
 }
 
 export default function App() {
@@ -59,39 +70,19 @@ export default function App() {
   })
   const [apiKey, setApiKey] = useState("")
   const [models, setModels] = useState<string[]>([])
+  /* Models the server marks with the image_generation capability. With one of
+     them selected the conversation generates pictures instead of text. */
+  const [imageModels, setImageModels] = useState<string[]>([])
   const [model, setModel] = useState(() => stored(localStorage, "colibri.model", "glm-5.2-colibri"))
   const [temperature, setTemperature] = useState(0.7)
   const [maxTokens, setMaxTokens] = useState(4096)
-  const [reasoning, setReasoning] = useState<ReasoningLevel>("off")
+  const [thinking, setThinking] = useState(false)
   const [cacheSlot, setCacheSlot] = useState(0)
   const [conversations, setConversations] = useState<Record<number, ChatMessage[]>>({ 0: [] })
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [healthError, setHealthError] = useState("")
   const [lastRun, setLastRun] = useState<StreamChatResult | null>(null)
   const [draft, setDraft] = useState("")
-  /* Immagini in attesa di partire col prossimo messaggio. Si tengono come
-     data: URI perche' e' quello che il server accetta e quello che il browser
-     puo' mostrare in anteprima senza inventarsi un percorso su disco. */
-  const [attachments, setAttachments] = useState<{ name: string; url: string }[]>([])
-  const fileInputRef = useRef<HTMLInputElement>(null)
-
-  const attachFiles = async (files: FileList | File[] | null) => {
-    if (!files) return
-    const images = Array.from(files).filter((file) => file.type.startsWith("image/"))
-    if (!images.length) return
-    const read = await Promise.all(
-      images.map(
-        (file) =>
-          new Promise<{ name: string; url: string }>((resolve, reject) => {
-            const reader = new FileReader()
-            reader.onload = () => resolve({ name: file.name, url: String(reader.result) })
-            reader.onerror = () => reject(reader.error)
-            reader.readAsDataURL(file)
-          }),
-      ),
-    )
-    setAttachments((current) => [...current, ...read])
-  }
   const [loading, setLoading] = useState(false)
   const [streamStart, setStreamStart] = useState<number | null>(null)
   const [tokenCount, setTokenCount] = useState(0)
@@ -100,7 +91,27 @@ export default function App() {
   const [totalTokens, setTotalTokens] = useState({ prompt: 0, completion: 0 })
   const [connecting, setConnecting] = useState(false)
   const [connected, setConnected] = useState(false)
-  const [view, setView] = useState<"chat" | "brain" | "profiling">("chat")
+  const [view, setView] = useState<View>("chat")
+  const [settingsPage, setSettingsPage] = useState("general")
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [query, setQuery] = useState("")
+  const [archives, setArchives] = useState<Array<{ id: string; slot: number; messages: ChatMessage[] }>>([])
+  const [theme, setTheme] = useState(() => stored(localStorage, "colibri.theme", "dark"))
+  const [copied, setCopied] = useState<string | null>(null)
+  const draftRef = useRef<HTMLTextAreaElement>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
+  /* Pictures wait here until the turn is sent, then travel on the message. */
+  const [pending, setPending] = useState<string[]>([])
+  /* Size and steps are remembered like the endpoint; the seed is not, because
+     a remembered seed would silently draw the same picture again. */
+  const [imageSize, setImageSize] = useState<ImageSize>(() => parseSize(stored(localStorage, "colibri.imageSize", "")) || DEFAULT_SIZE)
+  const [customSize, setCustomSize] = useState(() => !presetOf(parseSize(stored(localStorage, "colibri.imageSize", "")) || DEFAULT_SIZE))
+  const [imageSteps, setImageSteps] = useState(() => clampSteps(Number(stored(localStorage, "colibri.imageSteps", String(DEFAULT_STEPS)))))
+  const [seedText, setSeedText] = useState("")
+  const [imageRun, setImageRun] = useState<ImageRun | null>(null)
+  const historyDialog = useRef<HTMLDialogElement>(null)
+  useEffect(() => { document.documentElement.dataset.theme = theme; try { localStorage.setItem("colibri.theme", theme) } catch {} }, [theme])
+  useEffect(() => { if (historyOpen) historyDialog.current?.showModal(); else historyDialog.current?.close() }, [historyOpen])
   const [error, setError] = useState("")
   const autoConnected = useRef(false)
   const abortRef = useRef<AbortController | null>(null)
@@ -111,6 +122,8 @@ export default function App() {
   const active = activeRequests(health)
   const capacity = health?.scheduler?.capacity || kvSlots
   const failures = health?.scheduler ? health.scheduler.rejected + health.scheduler.timed_out + health.scheduler.cancelled : 0
+  const imageMode = imageModels.includes(model)
+  const seed = parseSeed(seedText)
 
   const updateMessages = (next: ChatMessage[] | ((current: ChatMessage[]) => ChatMessage[])) =>
     setConversations((current) => ({
@@ -122,6 +135,9 @@ export default function App() {
   useEffect(() => {
     persistPublicSettings(localStorage, baseUrl, model)
   }, [baseUrl, model])
+  useEffect(() => {
+    try { localStorage.setItem("colibri.imageSize", sizeKey(imageSize)); localStorage.setItem("colibri.imageSteps", String(imageSteps)) } catch { /* restricted storage mode */ }
+  }, [imageSize, imageSteps])
 
   // EFFECT #2
   useEffect(() => {
@@ -161,15 +177,6 @@ export default function App() {
   // EFFECT #6
   useEffect(() => { setLastRun(null) }, [cacheSlot])
 
-  /* GLM 5.3 cannot turn reasoning off and has no distinct "medium" (it collapses
-     onto High). If the user switches to such a model while "off" or "medium" is
-     selected, lift it to a level the model actually honors instead of leaving the
-     control on a value it no longer offers. */
-  useEffect(() => {
-    if (modelForcesReasoning(model))
-      setReasoning((level) => (level === "off" || level === "medium" ? "high" : level))
-  }, [model])
-
   // EFFECT #7
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }) }, [messages])
 
@@ -180,8 +187,10 @@ export default function App() {
     setConnecting(true)
     setError("")
     try {
-      const found = await listModels(baseUrl, apiKey, controller.signal)
+      const info = await listModelInfo(baseUrl, apiKey, controller.signal)
+      const found = info.map((item) => item.id)
       setModels(found)
+      setImageModels(info.filter(generatesImages).map((item) => item.id))
       if (found.length && !found.includes(model)) setModel(found[0])
       setConnected(true)
       try {
@@ -202,35 +211,45 @@ export default function App() {
     }
   }
 
-  // Auto-connect once when the UI is served by the engine itself. In an
-  // effect, not in the render body: a side effect during render breaks under
-  // StrictMode double-rendering and concurrent re-renders.
-  useEffect(() => {
-    if (servedByEngine && !autoConnected.current && !connected) {
-      autoConnected.current = true
-      connect()
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [servedByEngine, connected])
+  if (servedByEngine && !autoConnected.current && !connected) {
+    autoConnected.current = true
+    setTimeout(() => connect(), 0)
+  }
 
-  const canSend = useMemo(() => draft.trim() && model && !loading, [draft, loading, model])
+  /* A picture becomes a data URI here and nowhere else: the API takes one
+     directly, so there is no upload endpoint, no temporary file and nothing to
+     clean up. Anything that is not an image is ignored rather than refused --
+     a dropped PDF should not interrupt what someone was typing. */
+  const attach = async (files: FileList | File[] | null) => {
+    const pictures = Array.from(files || []).filter(file => file.type.startsWith("image/"))
+    if (!pictures.length) return
+    const read = (file: File) => new Promise<string>((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(String(reader.result))
+      reader.onerror = () => reject(reader.error)
+      reader.readAsDataURL(file)
+    })
+    try {
+      const urls = await Promise.all(pictures.map(read))
+      setPending(current => [...current, ...urls])
+    } catch { setError("status.serverError") }
+  }
 
-  const send = async () => {
-    const content = draft.trim()
-    /* Un'immagine da sola e' una domanda valida: "questa cosa e'?" si puo'
-       chiedere anche senza scrivere niente. */
-    if ((!content && !attachments.length) || loading) return
-    const user = message("user", content)
-    if (attachments.length) user.images = attachments.map((item) => item.url)
-    const assistant = message("assistant", "")
-    const history = [...messages, user]
-    setDraft("")
-    setAttachments([])
+  const canSend = useMemo(() => imageMode
+    ? Boolean(draft.trim() && model && !loading && seed !== undefined && validSide(imageSize.width) && validSide(imageSize.height))
+    : (draft.trim() || pending.length) && model && !loading, [draft, imageMode, imageSize, loading, model, pending, seed])
+
+  /* The shared streaming core. POSTs `payload` and appends every delta into the
+     message `targetId`, with the same live metrics and abort/error wiring whether
+     the turn is a fresh answer (send) or a continued one (continueTurn). The only
+     difference between the two callers is what they put in `payload` and which
+     bubble they stream into; everything below is identical, so it lives here. */
+  const runStream = async (payload: ChatMessage[], targetId: string) => {
     setError("")
-    updateMessages([...history, assistant])
     setLoading(true)
     setStreamStart(null)
     setTokenCount(0)
+    let decodeStart = 0
     setTokPerSec(null)
     setTtft(null)
     const t0 = performance.now()
@@ -243,78 +262,213 @@ export default function App() {
         baseUrl,
         apiKey,
         model,
-        messages: history,
+        messages: chatTurns(payload),
         temperature,
         maxTokens,
-        enableThinking: reasoning !== "off",
-        reasoningEffort: reasoning === "off" ? undefined : REASONING_EFFORT[reasoning],
+        enableThinking: thinking,
         cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
         signal: controller.signal,
         /* Reasoning tokens are tokens: they count toward the rate, and the
-           first one is the real time-to-first-token — the answer's first
-           token arrives much later on a reasoning model. */
+           first one is the real time-to-first-token. The answer's first token
+           arrives much later on a reasoning model. */
         onReasoning: (delta) => {
-          if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); firstToken = false }
+          if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); decodeStart = performance.now(); firstToken = false }
           count++
           setTokenCount(count)
-          const elapsed = (performance.now() - t0) / 1000
-          if (elapsed > 0.3) setTokPerSec(count / elapsed)
-          updateMessages((current) => current.map((item) =>
-            item.id === assistant.id ? { ...item, reasoning: (item.reasoning ?? "") + delta } : item,
-          ))
+          const since = (performance.now() - decodeStart) / 1000
+          if (count > 1 && since > 0.2) setTokPerSec((count - 1) / since)
+          updateMessages((current) => appendDelta(current, targetId, "reasoning", delta))
         },
         onDelta: (delta) => {
-          if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); firstToken = false }
+          if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); decodeStart = performance.now(); firstToken = false }
           count++
           setTokenCount(count)
-          const elapsed = (performance.now() - t0) / 1000
-          if (elapsed > 0.3) setTokPerSec(count / ((performance.now() - t0) / 1000))
-          updateMessages((current) => current.map((item) =>
-            item.id === assistant.id ? { ...item, content: item.content + delta } : item,
-          ))
+          /* The live rate is DECODE speed: measured from the first token, not
+             from the request, because the prefill wait belongs to TTFT and
+             averaging it in makes the number crawl upward for the whole turn
+             instead of showing what the engine is doing now. */
+          const since = (performance.now() - decodeStart) / 1000
+          if (count > 1 && since > 0.2) setTokPerSec((count - 1) / since)
+          updateMessages((current) => appendDelta(current, targetId, "content", delta))
         },
       })
-      const finalElapsed = (performance.now() - t0) / 1000
-      if (count > 0 && finalElapsed > 0) setTokPerSec(count / finalElapsed)
+      /* The turn's own figure keeps the same meaning as the live one, so the
+         badge does not jump to a different number the moment it stops moving. */
+      const decodeElapsed = (performance.now() - (decodeStart || t0)) / 1000
+      if (count > 1 && decodeElapsed > 0) setTokPerSec((count - 1) / decodeElapsed)
       if (result.usage) setTotalTokens(prev => ({
         prompt: prev.prompt + (result.usage?.prompt_tokens || 0),
         completion: prev.completion + (result.usage?.completion_tokens || 0),
       }))
       setLastRun(result)
+      updateMessages((current) => setFinish(current, targetId, result.finishReason))
       setConnected(true)
     } catch (cause) {
-      if (controller.signal.aborted) {
-        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content || item.reasoning))
-      } else {
-        setError(cause instanceof Error ? cause.message : "status.generationFailed")
-        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content || item.reasoning))
-      }
+      /* Drop the target bubble only if it is empty -- a first turn that never got
+         a token. A continued turn already carries the client's opening, so the
+         `|| item.content` keeps it on the screen through an abort or an error, and
+         `|| item.reasoning` keeps a turn stopped while it was still thinking. */
+      const finish = controller.signal.aborted ? "aborted" : "error"
+      if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : "status.generationFailed")
+      updateMessages((current) => setFinish(current, targetId, finish)
+        .filter((item) => item.id !== targetId || item.content || item.reasoning))
     } finally {
       abortRef.current = null
       setLoading(false)
     }
   }
 
-  return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand-row">
-          <div className="brand-mark"><Feather className="size-5" /></div>
-          <div><h1>colibrì</h1><p>{t("brand.tagline")}</p></div>
-        </div>
+  /* consumeDraft is false for regenerate so a follow-up already in the composer is not eaten. */
+  const send = async (text = draft, previous = messages, pictures = pending, consumeDraft = true) => {
+    const content = text.trim()
+    if ((!content && !pictures.length) || loading) return
+    const user = message("user", content, pictures)
+    const assistant = message("assistant", "")
+    const history = [...previous, user]
+    if (consumeDraft) {
+      setDraft("")
+      setPending([])
+    }
+    updateMessages([...history, assistant])
+    await runStream(history, assistant.id)
+  }
 
-        <section className="side-section">
+  /* Continue the trailing assistant turn instead of opening a new one. Offered
+     only when /health reports continue_assistant: with COLI_CONTINUE_ASSISTANT=0,
+     or on a server that predates the field, the turn would be answered fresh. */
+  const continueTurn = async () => {
+    if (loading) return
+    const request = continuation(messages)
+    if (!request) return
+    updateMessages(request.history)
+    await runStream(request.history, request.targetId)
+  }
+
+  /* The image counterpart of runStream: generates into the assistant turn
+     `targetId`, whose `generated` field already holds the request. Progress and
+     previews live in imageRun, outside the transcript; the finished picture is
+     written onto the turn. Cancel is the same abortRef as the chat's Stop. */
+  const runImage = async (targetId: string, request: GeneratedImage) => {
+    setError("")
+    setLoading(true)
+    const controller = new AbortController()
+    abortRef.current = controller
+    const started = performance.now()
+    setImageRun({ targetId, started: Date.now(), progress: null, preview: null })
+    const update = (change: Partial<ImageRun>) => setImageRun((run) => run && run.targetId === targetId ? { ...run, ...change } : run)
+    try {
+      const image = await generateImage({
+        baseUrl, apiKey, model, ...request, signal: controller.signal,
+        onProgress: (progress) => update({ progress }),
+        onPartial: (preview) => update({ preview }),
+        onPlainRequest: () => update({ plain: true }),
+      })
+      const seconds = (performance.now() - started) / 1000
+      updateMessages((current) => current.map((item) => item.id === targetId
+        ? { ...item, finish: "stop", generated: { ...image, seconds } } : item))
+      setConnected(true)
+    } catch (cause) {
+      const finish = controller.signal.aborted ? "aborted" : "error"
+      if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : "status.generationFailed")
+      updateMessages((current) => setFinish(current, targetId, finish))
+    } finally {
+      abortRef.current = null
+      setImageRun(null)
+      setLoading(false)
+    }
+  }
+
+  const imageTurn = (request: GeneratedImage): ChatMessage => ({ ...message("assistant", ""), mode: "image", generated: request })
+
+  const sendImage = async () => {
+    const prompt = draft.trim()
+    if (!prompt || loading || seed === undefined) return
+    const request = { prompt, width: imageSize.width, height: imageSize.height, steps: imageSteps, seed: seed ?? randomSeed() }
+    const assistant = imageTurn(request)
+    setDraft("")
+    updateMessages((current) => [...current, { ...message("user", prompt), mode: "image" }, assistant])
+    await runImage(assistant.id, request)
+  }
+
+  /* Same prompt, size and steps, a seed never used before: a new picture
+     under the old one, so the two can be compared. */
+  const imageAgain = async (image: GeneratedImage) => {
+    if (loading) return
+    const { prompt, width, height, steps } = image
+    const assistant = imageTurn({ prompt, width, height, steps, seed: randomSeed() })
+    updateMessages((current) => [...current, assistant])
+    await runImage(assistant.id, assistant.generated!)
+  }
+
+  const imageRetry = async (item: ChatMessage) => {
+    if (loading || !item.generated) return
+    const { prompt, width, height, steps, seed: previous } = item.generated
+    const request = { prompt, width, height, steps, seed: previous }
+    updateMessages((current) => current.map((turn) => turn.id === item.id ? { ...turn, finish: undefined, generated: request } : turn))
+    await runImage(item.id, request)
+  }
+
+  const downloadImage = (image: GeneratedImage) => {
+    if (!image.url) return
+    const url = image.url.startsWith("data:") ? URL.createObjectURL(dataUrlBlob(image.url)) : image.url
+    const anchor = document.createElement("a"); anchor.href = url; anchor.download = imageFileName(image.prompt, image.seed); anchor.click()
+    if (url !== image.url) setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+
+  const copySeed = async (item: ChatMessage) => {
+    if (!item.generated) return
+    try { await navigator.clipboard.writeText(String(item.generated.seed)); setCopied(`${item.id}:seed`) } catch { setError(t("ui.copyError")) }
+  }
+
+  const submit = () => { if (imageMode) void sendImage(); else void send() }
+
+  const openSettings = (page = "general") => { setSettingsPage(page); setView("settings") }
+  const clearChat = () => { updateMessages([]); setLastRun(null); setTokPerSec(null); setTtft(null); setTokenCount(0); setTotalTokens({ prompt: 0, completion: 0 }); setError("") }
+  const newChat = () => {
+    if (loading) return
+    if (messages.length) setArchives(items => [{ id: message("system", "").id, slot: cacheSlot, messages: [...messages] }, ...items])
+    clearChat(); setDraft(""); setView("chat"); requestAnimationFrame(() => draftRef.current?.focus())
+  }
+  const exportChat = () => {
+    const url = URL.createObjectURL(new Blob([JSON.stringify({ model, messages }, null, 2)], { type: "application/json" }))
+    const anchor = document.createElement("a"); anchor.href = url; anchor.download = "colibri-chat.json"; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+  const copyMessage = async (item: ChatMessage) => {
+    try { await navigator.clipboard.writeText(item.content); setCopied(item.id) } catch { setError(t("ui.copyError")) }
+  }
+  const restoreArchive = (entry: { id: string; slot: number; messages: ChatMessage[] }) => {
+    if (loading) return
+    const slot = entry.slot < kvSlots ? entry.slot : cacheSlot
+    const currentMessages = conversations[slot] || []
+    setArchives(items => [...(currentMessages.length ? [{ id: message("system", "").id, slot, messages: currentMessages }] : []), ...items.filter(item => item.id !== entry.id)])
+    setConversations(items => ({ ...items, [slot]: entry.messages })); setCacheSlot(slot); setView("chat"); setHistoryOpen(false); setLastRun(null); setError(""); setDraft("")
+  }
+  const empty = messages.length === 0
+  const connectionControls = (<fieldset disabled={loading}><section className="side-section">
           <div className="section-title"><Link2 className="size-3.5" /> {t("sidebar.connection")}</div>
-          <label>{t("sidebar.endpoint")}<Input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></label>
-          <label>{t("sidebar.apiKey")}<div className="relative"><KeyRound className="field-icon" /><Input className="pl-9" type="password" value={apiKey} placeholder={t("sidebar.apiKeyPlaceholder")} onChange={(event) => setApiKey(event.target.value)} /></div><span className="field-help">{t("sidebar.apiKeyHelp")}</span></label>
+          <label>{t("sidebar.endpoint")}<Input id="endpoint" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></label>
+          <label>{t("sidebar.apiKey")}<div className="relative"><KeyRound className="field-icon" /><Input id="api-key" className="pl-9" type="password" value={apiKey} placeholder={t("sidebar.apiKeyPlaceholder")} onChange={(event) => setApiKey(event.target.value)} /></div><span className="field-help">{t("sidebar.apiKeyHelp")}</span></label>
           <Button type="button" variant="secondary" onClick={connect} disabled={connecting}>
             {connecting ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
             {t("sidebar.probe")}
           </Button>
           <div className={cn("connection-state", connected && "connected")} aria-live="polite"><span />{connected ? t("status.connected") : t("status.notConnected")}</div>
-        </section>
-
-        <section className="side-section runtime-section" aria-live="polite">
+        </section></fieldset>)
+  const inferenceControls = (<fieldset disabled={loading}><section className="side-section">
+          <div className="section-title"><SlidersHorizontal className="size-3.5" /> {t("sidebar.inference")}</div>
+          <label>{t("sidebar.model")}<select id="model-select" value={model} onChange={(event) => setModel(event.target.value)}>{models.length ? models.map((id) => <option key={id}>{id}</option>) : <option>{model}</option>}</select></label>
+          {imageMode ? <p className="field-help">{t("image.modelNote")}</p> : <>
+          {health?.kv_slots && health.kv_slots > 1 ? <label>{t("sidebar.kvSession")}<select id="kv-slot" value={cacheSlot} onChange={(event) => setCacheSlot(Number(event.target.value))} disabled={loading}>
+            {Array.from({ length: kvSlots }, (_, slot) => <option key={slot} value={slot}>{t("sidebar.sessionLabel", { slot: slot + 1 })}</option>)}
+          </select><span className="field-help">{t("sidebar.kvSessionHelp")}</span></label> : null}
+          <label><span className="label-line"><span>{t("sidebar.temperature")}</span><code>{temperature.toFixed(1)}</code></span><input id="temperature" className="range" type="range" min="0" max="2" step="0.1" value={temperature} onChange={(event) => setTemperature(Number(event.target.value))} /></label>
+          <label>{t("sidebar.maxTokens")}<Input id="max-tokens" type="number" min={1} max={32768} value={maxTokens} onChange={(event) => { const value = Number(event.target.value); if (Number.isFinite(value)) setMaxTokens(Math.min(32768, Math.max(1, Math.round(value)))) }} /></label>
+          <button type="button" className={cn("toggle-row", thinking && "active")} aria-pressed={thinking} onClick={() => setThinking((value) => !value)}>
+            <span><BrainCircuit className="size-4" /> {t("sidebar.reasoning")}</span><i><b /></i>
+          </button>
+          </>}
+        </section></fieldset>)
+  const runtimeControls = (<><section className="side-section runtime-section" aria-live="polite">
           <div className="section-title"><Activity className="size-3.5" /> {t("sidebar.runtime")}</div>
           {health?.hwinfo ? <div className="hw-panel">
             {health.hwinfo.cpu ? <div className="hw-row"><Cpu className="size-3.5" /><span>{health.hwinfo.cpu}</span></div> : null}
@@ -350,116 +504,119 @@ export default function App() {
             </div> : null}
             <div className="runtime-foot"><span className="runtime-dot" /> {t("sidebar.schedulerOnline")} <code>{kvSlots} KV</code></div>
           </> : <p className="runtime-unavailable">{connected ? (healthError ? t(healthError) : t("status.runtimeUnavailable")) : t("sidebar.runtimeProbe")}</p>}
-        </section>
-
-        <section className="side-section">
-          <div className="section-title"><SlidersHorizontal className="size-3.5" /> {t("sidebar.inference")}</div>
-          <label>{t("sidebar.model")}<select value={model} onChange={(event) => setModel(event.target.value)}>{models.length ? models.map((id) => <option key={id}>{id}</option>) : <option>{model}</option>}</select></label>
-          {health?.kv_slots && health.kv_slots > 1 ? <label>{t("sidebar.kvSession")}<select value={cacheSlot} onChange={(event) => setCacheSlot(Number(event.target.value))} disabled={loading}>
-            {Array.from({ length: kvSlots }, (_, slot) => <option key={slot} value={slot}>{t("sidebar.sessionLabel", { slot: slot + 1 })}</option>)}
-          </select><span className="field-help">{t("sidebar.kvSessionHelp")}</span></label> : null}
-          <label><span className="label-line"><span>{t("sidebar.temperature")}</span><code>{temperature.toFixed(1)}</code></span><input className="range" type="range" min="0" max="2" step="0.1" value={temperature} onChange={(event) => setTemperature(Number(event.target.value))} /></label>
-          <label>{t("sidebar.maxTokens")}<Input type="number" min={1} max={32768} value={maxTokens} onChange={(event) => { const value = Number(event.target.value); if (Number.isFinite(value)) setMaxTokens(Math.min(32768, Math.max(1, Math.round(value)))) }} /></label>
-          <label><span className="label-line"><span><BrainCircuit className="size-4" /> {t("sidebar.reasoning")}</span></span>
-            <select value={reasoning} onChange={(event) => setReasoning(event.target.value as ReasoningLevel)} disabled={loading}>
-              {reasoningLevelsFor(model).map((level) => <option key={level} value={level}>{t(`sidebar.reasoning.${level}`)}</option>)}
-            </select>
-          </label>
-        </section>
-
-        <div className="sidebar-foot">
-          <div><Cpu className="size-3.5" /><span>{t("sidebar.transport")}</span></div>
-          <div className="locale-switcher">
-            <Globe className="size-3.5" />
-            <select value={locale} onChange={(e) => setLocale(e.target.value)}>
-              {locales.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
-            </select>
-          </div>
-        </div>
-      </aside>
-
-      <main className="chat-panel">
-        <header className="topbar">
-          <div><span className="eyebrow">{t("topbar.activeModel")}</span><strong>{model}</strong></div>
-          <div className="view-tabs">
-            <button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")}><MessageSquareText className="size-3.5" /> {t("nav.chat")}</button>
-            <button className={view === "brain" ? "active" : ""} onClick={() => setView("brain")}><BrainCircuit className="size-3.5" /> {t("nav.brain")}</button>
-            <button className={view === "profiling" ? "active" : ""} onClick={() => setView("profiling")}><Gauge className="size-3.5" /> {t("nav.profiling")}</button>
-          </div>
-          <div className="top-actions">
-              {loading && tokenCount > 0 ? <Badge className="badge-live"><Zap className="size-3 flash" /> {t("topbar.tokens", { n: tokenCount })}</Badge> : null}
-              {!loading && tokPerSec != null ? <Badge className="badge-speed"><Gauge className="size-3" /> {t("topbar.tokPerSec", { n: tokPerSec.toFixed(1) })}</Badge> : null}
+        </section></>)
+  const metrics = (<div className="live-metrics" aria-live="polite">              {loading && tokenCount > 0 ? <Badge className="badge-live"><Zap className="size-3 flash" /> {t("topbar.tokens", { n: tokenCount })}</Badge> : null}
+              {tokPerSec != null ? <Badge className={cn("badge-speed", loading && "badge-live")}><Gauge className="size-3" /> {t("topbar.tokPerSec", { n: tokPerSec.toFixed(1) })}</Badge> : null}
               {!loading && ttft != null ? <Badge><Timer className="size-3" /> TTFT {(ttft/1000).toFixed(1)}s</Badge> : null}
               {!loading && lastRun?.usage ? <Badge><Layers className="size-3" /> {lastRun.usage.prompt_tokens}→{lastRun.usage.completion_tokens}</Badge> : null}
               {!loading && lastRun?.finishReason === "length" ? <Badge className="badge-warn" title={t("topbar.truncatedHelp")}><AlertTriangle className="size-3" /> {t("topbar.truncated")}</Badge> : null}
               {lastRun?.queueWaitMs != null ? <Badge><Clock className="size-3" /> queue {Math.round(lastRun.queueWaitMs)}ms</Badge> : null}
-              <Badge><MonitorDot className="size-3" /> {t("topbar.slot", { n: cacheSlot + 1 })}</Badge>
-              <Button variant="ghost" size="sm" onClick={() => { updateMessages([]); setTokPerSec(null); setTtft(null); setTokenCount(0); setTotalTokens({prompt:0,completion:0}) }} disabled={!messages.length || loading}><Trash2 className="size-3.5" /> {t("topbar.clear")}</Button>
-            </div>
-        </header>
+              {!imageMode && <Badge><MonitorDot className="size-3" /> {t("topbar.slot", { n: cacheSlot + 1 })}</Badge>}
+</div>)
 
-        {view === "brain" ? <Brain baseUrl={baseUrl} apiKey={apiKey} connected={connected} />
-          : view === "profiling" ? <Profiling baseUrl={baseUrl} apiKey={apiKey} connected={connected} /> : <>
+  const imageCard = (item: ChatMessage) => {
+    const image = item.generated!
+    if (image.url) return <ImageResultCard image={image} copied={copied === `${item.id}:seed`} busy={loading || !imageMode}
+      onDownload={() => downloadImage(image)} onCopySeed={() => void copySeed(item)} onAgain={() => void imageAgain(image)} />
+    if (imageRun?.targetId === item.id) return <ImageProgressCard request={image} run={imageRun} onCancel={() => abortRef.current?.abort()} />
+    return <ImageStoppedCard request={image} finish={item.finish} busy={loading || !imageMode} onRetry={() => void imageRetry(item)} />
+  }
+  const suggestions = imageMode
+    ? [{ key: "image.prompt.photo", Icon: Camera, label: "image.suggest.photo" }, { key: "image.prompt.pixel", Icon: Grid3x3, label: "image.suggest.pixel" }, { key: "image.prompt.poster", Icon: Palette, label: "image.suggest.poster" }]
+    : [{ key: "prompts.routing", Icon: BrainCircuit, label: "ui.idea" }, { key: "prompts.benchmark", Icon: Code2, label: "ui.code" }, { key: "prompts.caching", Icon: Database, label: "ui.analyze" }]
 
-        <div className="conversation">
-          {!messages.length ? (
-            <div className="empty-state">
-              <div className="orb"><Feather /></div>
-              <span className="eyebrow">{t("hero.title")}</span>
-              <h2>{t("hero.subtitle")}<br /><em>{t("hero.tagline")}</em></h2>
-              <p>{t("hero.description")}</p>
-              <div className="suggestions">
-                {[t("prompts.routing"), t("prompts.benchmark"), t("prompts.caching")].map((item) => <button key={item} onClick={() => setDraft(item)}>{item}<ArrowUp className="size-3.5 rotate-45" /></button>)}
-              </div>
-            </div>
-          ) : (
-            <div className="message-list">
-              {messages.map((item) => (
-                <article key={item.id} className={cn("message", item.role)}>
-                  <div className="avatar">{item.role === "user" ? "Y" : <Feather className="size-4" />}</div>
-                  <div><div className="message-meta">{item.role === "user" ? t("chat.you") : t("chat.colibri")}</div><div className="message-body">{item.reasoning
-                    ? <details className="reasoning" open={!item.content}>
-                        <summary>{t("sidebar.reasoning")}</summary>
-                        <div className="reasoning-body">{item.reasoning}</div>
-                      </details>
-                    : null}{item.content
-                    ? (item.role === "assistant"
-                        /* User turns stay literal: the person typed those
-                           characters and expects to see them back. Only the
-                           model's output is markdown. */
-                        ? <Markdown source={item.content} />
-                        : item.content)
-                    : <span className="typing" aria-label="Generating"><i /><i /><i /></span>}</div></div>
-                </article>
-              ))}
-              <div ref={bottomRef} />
-            </div>
-          )}
+  return <div className="app-shell redesigned">
+    <aside className="rail" aria-label={t("ui.sidebar")}>
+      <button className="rail-brand" title="colibrì" onClick={() => setView("chat")}><Brand /></button>
+      <button className="rail-button" aria-label={t("ui.newChat")} title={t("ui.newChat")} onClick={newChat} disabled={loading}><SquarePen /></button>
+      <button className="rail-button" aria-label={t("ui.search")} title={t("ui.search")} onClick={() => { setQuery(""); setHistoryOpen(true) }}><Search /></button>
+      <button className="rail-button" aria-label={t("ui.history")} title={t("ui.history")} onClick={() => { setQuery(""); setHistoryOpen(true) }}><History /></button>
+      <div className="rail-bottom">
+        <button className={cn("rail-button", view === "settings" && "active")} aria-label={t("ui.settings")} title={t("ui.settings")} onClick={() => openSettings()}><Settings2 /></button>
+        <button className="rail-button" aria-label={t("ui.theme")} title={t("ui.theme")} onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun /> : <Moon />}</button>
+      </div>
+    </aside>
+    <main className={cn("workspace", view === "brain" && "brain-workspace")}>
+      {view !== "brain" && <header className="workspace-topbar">
+        <button className="model-button" onClick={() => openSettings("model")}><span>{model}</span><ChevronDown /></button>
+        <div className="workspace-actions">
+          <button className={cn("connection-state", connected && "connected")} onClick={() => openSettings("connection")}><span />{connected ? t("status.connected") : t("status.notConnected")}</button>
+          {view === "chat" && <><button className="icon-action" aria-label={t("ui.export")} title={t("ui.export")} disabled={empty} onClick={exportChat}><Download /></button><button className="icon-action" aria-label={t("topbar.clear")} title={t("topbar.clear")} disabled={empty || loading} onClick={clearChat}><Trash2 /></button></>}
         </div>
-
+      </header>}
+      {view === "settings" ? <section className="settings-page">
+        <header className="page-heading"><span>COLIBRI</span><h1>{t("ui.settings")}</h1><p>{t("ui.settingsIntro")}</p></header>
+        <nav className="settings-tabs" aria-label={t("ui.settings")}>
+          {["general", "model", "connection", "system"].map(id => <button key={id} aria-current={settingsPage === id ? "page" : undefined} onClick={() => setSettingsPage(id)}>{t(`ui.${id}`)}</button>)}
+        </nav>
+        {error && <div className="error-banner" role="alert">{t(error)}</div>}
+        <div className="settings-content">
+          {settingsPage === "general" && <section className="settings-card"><h2>{t("ui.appearance")}</h2><div className="theme-choices">{["dark", "light"].map(value => <button key={value} className={`theme-choice ${value}`} aria-pressed={theme === value} onClick={() => setTheme(value)}><span /><b>{t(`ui.${value}`)}</b></button>)}</div><label className="language-field"><Globe />{t("ui.language")}<select value={locale} onChange={e => setLocale(e.target.value)}>{locales.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}</select></label><p className="settings-help">{t("chat.inputHint")}</p></section>}
+          {settingsPage === "connection" && <section className="settings-card">{connectionControls}</section>}
+          {settingsPage === "model" && <section className="settings-card">{inferenceControls}</section>}
+          {settingsPage === "system" && <section className="settings-card">{runtimeControls}{metrics}</section>}
+        </div>
+      </section> : view === "brain" ? <BrainWorkspace baseUrl={baseUrl} apiKey={apiKey} connected={connected} />
+      : view === "profiling" ? <section className="profiling-workspace"><header className="page-heading"><span>COLIBRI / ENGINE</span><h1>Profiling</h1></header>{metrics}<Profiling baseUrl={baseUrl} apiKey={apiKey} connected={connected} /></section>
+      : <section className={cn("chat-view", empty && "empty")} hidden={view === "brio"}>
+        {empty ? <div className="welcome-brand"><Brand word /></div> : <div className="conversation" role="log" aria-label={t("nav.chat")}>
+          <div className="message-list">{messages.map((item, index) => <article key={item.id} className={cn("message", item.role)}>
+            {item.role !== "user" && <div className="assistant-brand"><Brand /><span>colibrì</span></div>}
+            {item.images?.length ? <div className="message-images">{item.images.map((url, at) =>
+              <img key={at} src={url} alt={t("ui.attachedImage", { n: at + 1 })} />)}</div> : null}
+            {item.role === "assistant" && item.generated ? imageCard(item) : <div className="message-body">{item.reasoning
+              ? <details className="reasoning" open={!item.content}>
+                  <summary>{t("sidebar.reasoning")}</summary>
+                  <div className="reasoning-body">{item.reasoning}</div>
+                </details>
+              : null}{item.content ? (item.role === "assistant" ? <Markdown text={item.content} /> : item.content) : <span className="typing" aria-label={t("ui.generating")}><i /><i /><i /></span>}</div>}
+            {item.role === "assistant" && item.content && <div className="message-actions"><button className="icon-action" aria-label={t("ui.copy")} title={t("ui.copy")} onClick={() => void copyMessage(item)}><Copy /></button>{copied === item.id && <span role="status">{t("ui.copied")}</span>}{index === messages.length - 1 && !loading && !imageMode && <button className="icon-action" aria-label={t("ui.regenerate")} title={t("ui.regenerate")} onClick={() => { const retry = resendFrom(messages, index); if (retry) void send(retry.text, retry.previous, retry.pictures, false) }}><RefreshCw /></button>}{index === messages.length - 1 && !loading && !imageMode && supportsContinuation(health) && continuable(item) && <button className="icon-action" aria-label={t("ui.continue")} title={t("ui.continue")} onClick={() => void continueTurn()}><StepForward /></button>}</div>}
+          </article>)}<div ref={bottomRef} /></div>
+        </div>}
         <div className="composer-wrap">
           {error && <div className="error-banner" role="alert">{t(error)}</div>}
-          <div className="composer">
-            <Textarea value={draft}
-              onPaste={(event) => { const files = Array.from(event.clipboardData.files); if (files.length) { event.preventDefault(); void attachFiles(files) } }}
-              onDragOver={(event) => event.preventDefault()}
-              onDrop={(event) => { if (event.dataTransfer.files.length) { event.preventDefault(); void attachFiles(event.dataTransfer.files) } }} onChange={(event) => setDraft(event.target.value)} placeholder={t("chat.placeholder")} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send() } }} />
-            {attachments.length > 0 && (
-              <div className="attachments">
-                {attachments.map((item, index) => (
-                  <span key={item.url + index} className="attachment">
-                    <img src={item.url} alt={item.name} />
-                    <button type="button" aria-label={t("chat.removeImage")}
-                      onClick={() => setAttachments((current) => current.filter((_, at) => at !== index))}>x</button>
-                  </span>
-                ))}
-              </div>
-            )}
-            <div className="composer-foot"><span><MessageSquareText className="size-3.5" /> {t("chat.inputHint")}</span><input ref={fileInputRef} type="file" accept="image/*" multiple hidden onChange={(event) => { void attachFiles(event.target.files); event.target.value = "" }} /><Button variant="ghost" size="icon" aria-label={t("chat.attachImage")} onClick={() => fileInputRef.current?.click()}><ImagePlus className="size-4" /></Button>{loading ? <Button variant="destructive" size="icon" aria-label={t("chat.stop")} onClick={() => abortRef.current?.abort()}><CircleStop className="size-4" /></Button> : <Button size="icon" aria-label={t("chat.send")} disabled={!canSend} onClick={() => void send()}><ArrowUp className="size-4" /></Button>}</div>
-          </div>
+          <form className={cn("composer", imageMode && "image-mode")} onSubmit={e => { e.preventDefault(); submit() }}
+            onDragOver={e => { if (!imageMode && e.dataTransfer.types.includes("Files")) e.preventDefault() }}
+            onDrop={e => { if (!imageMode && e.dataTransfer.files.length) { e.preventDefault(); void attach(e.dataTransfer.files) } }}>
+            {!imageMode && pending.length > 0 && <div className="composer-attachments">
+              {pending.map((url, at) => <span key={at} className="attachment">
+                <img src={url} alt={t("ui.attachedImage", { n: at + 1 })} />
+                <button type="button" aria-label={t("ui.removeImage")} title={t("ui.removeImage")}
+                  onClick={() => setPending(list => list.filter((_, index) => index !== at))}><X /></button>
+              </span>)}
+            </div>}
+            <Textarea ref={draftRef} id="draft" aria-label={imageMode ? t("image.placeholder") : t("chat.placeholder")} value={draft} onChange={e => setDraft(e.target.value)} placeholder={imageMode ? t("image.placeholder") : t("chat.placeholder")} onPaste={event => { if (imageMode) return; const files = Array.from(event.clipboardData.files || []); if (files.length) { event.preventDefault(); void attach(files) } }} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); submit() } }} />
+            <div className="composer-foot">
+              {imageMode ? <ImageControls size={imageSize} custom={customSize} steps={imageSteps} seed={seedText} seedValid={seed !== undefined}
+                onSize={setImageSize} onCustom={setCustomSize} onSteps={setImageSteps} onSeed={setSeedText} /> : <>
+              <input ref={fileRef} type="file" accept="image/*" multiple hidden
+                onChange={e => { void attach(e.target.files); e.target.value = "" }} />
+              <button type="button" className="attach-chip" aria-label={t("ui.attachImage")} title={t("ui.attachImage")}
+                onClick={() => fileRef.current?.click()}><ImagePlus /></button>
+              <button type="button" className="reasoning-chip" aria-pressed={thinking} onClick={() => setThinking(value => !value)}><BrainCircuit />{t("sidebar.reasoning")}</button>
+              <button type="button" className="slot-chip" onClick={() => openSettings("model")}><Database />{t("topbar.slot", { n: cacheSlot + 1 })}</button>
+              </>}
+              {loading ? <button type="button" className="send-button" aria-label={imageMode ? t("image.cancel") : t("chat.stop")} onClick={() => abortRef.current?.abort()}><CircleStop /></button> : <button type="submit" className="send-button" aria-label={imageMode ? t("image.generate") : t("chat.send")} disabled={!canSend}><ArrowUp /></button>}
+            </div>
+          </form>
+          {empty && <div className="suggestions">{suggestions.map(({ key, Icon, label }) => <button key={key} onClick={() => { setDraft(t(key)); draftRef.current?.focus() }}><Icon />{t(label)}</button>)}</div>}
+          {!empty && !imageMode && lastRun?.finishReason === "length" && <p className="truncation-note">{t("topbar.truncatedHelp")}</p>}
         </div>
-        </>}
-      </main>
-    </div>
-  )
+      </section>}
+      <section className="brio-workspace" hidden={view !== "brio"}>
+        <header className="page-heading"><span>COLIBRI / SYSTEM ONE</span><h1>{t("nav.brio")}</h1></header>
+        <Brio baseUrl={baseUrl} apiKey={apiKey} model={model} connected={connected} />
+      </section>
+    </main>
+    <NavigationDock view={view} onNavigate={setView} loading={loading} />
+    <dialog ref={historyDialog} className="history-dialog" onCancel={() => setHistoryOpen(false)} onClose={() => setHistoryOpen(false)} onClick={e => { if (e.target === e.currentTarget) { const r = e.currentTarget.getBoundingClientRect(); if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) setHistoryOpen(false) } }}>
+      <header><h2>{t("ui.history")}</h2><button className="icon-action" aria-label={t("ui.close")} onClick={() => setHistoryOpen(false)}><X /></button></header>
+      <label className="history-search"><Search /><input aria-label={t("ui.search")} placeholder={t("ui.search")} value={query} onChange={e => setQuery(e.target.value)} /></label>
+      <div className="history-results">
+        {Object.entries(conversations).filter(([slot, items]) => Number(slot) < kvSlots && items.some(m => m.content.toLocaleLowerCase().includes(query.toLocaleLowerCase()))).map(([slot, items]) => <button key={slot} disabled={loading} onClick={() => { setCacheSlot(Number(slot)); setView("chat"); setHistoryOpen(false); setDraft(""); setError("") }}><MessageSquareText /><span>{items.find(m => m.role === "user")?.content.slice(0, 85)}<small>{t("topbar.slot", { n: Number(slot) + 1 })}</small></span></button>)}
+        {archives.filter(entry => entry.messages.some(m => m.content.toLocaleLowerCase().includes(query.toLocaleLowerCase()))).map(entry => <button key={entry.id} disabled={loading} onClick={() => restoreArchive(entry)}><History /><span>{entry.messages.find(m => m.role === "user")?.content.slice(0, 85)}<small>{t("ui.archived")}</small></span></button>)}
+        <p>{t("ui.historyMemory")}</p>
+      </div>
+    </dialog>
+  </div>
 }

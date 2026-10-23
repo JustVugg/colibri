@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "commit": "8eb197e5900e3a30c0ec2e979c48016da6c7ed7e",
+  "model": "deepseek-ai/DeepSeek-V4.1-Flash, released checkpoint, 48 shards, 510.3 GB, fp8 dense + fp4 experts, no conversion",
+  "command": "OMP_NUM_THREADS=32 SNAP=/mnt/nvme0/DeepSeek-V4.1-Flash [ENV] ./deepseek_v41 8 /tmp/ref.json (25 prompt tokens, 16 generated, cap=8, page cache evicted per run, arms interleaved, 3 runs each)",
+  "prompt_hash": "79a5bcf37f1920a530cfee5ab7a484e00a1d6bb7f19d9a7418beaa53c14b454b",
+  "hardware": {
+    "cpu": "2x Intel Xeon Platinum 8555C, 52 cores/socket, 2 threads/core = 104 physical cores, 208 logical CPUs, 4 NUMA nodes",
+    "ram": "1007 GiB",
+    "storage": "A: Samsung MZQL2960HCJR (nvme0n1, 894 GB) ext4 noatime, /mnt/nvme0. B: 2x Samsung MZQLB7T6HMLA (7.6 TB) in RAID0 (md0) ext4, /mdr5. A and B are independent controllers.",
+    "os": "Ubuntu 24.04, kernel 6.8.0-31-generic, gcc 13.3.0, -O3 -march=native -fopenmp"
+  },
+  "warmup_runs": 0,
+  "hypothesis": "Reading the routed experts with O_DIRECT instead of through the page cache raises the expert read rate and, with the CPU side in order, the decode rate.",
+  "changed_variables": [
+    "V41_DIRECT"
+  ],
+  "baseline": {
+    "config": {
+      "V41_DIRECT": "0"
+    },
+    "samples": {
+      "tok_s": [
+        0.303721,
+        0.291333,
+        0.332364
+      ]
+    },
+    "median_tok_s": 0.303721,
+    "quality": {
+      "method": "token-exact vs a 16-token reference stream; the engine exits non-zero on any mismatch. All runs 16/16, in both regimes. tok_s is 16 generated tokens over the whole turn (READY to DONE), prefill included, with the engine's OpenMP team set to 32 threads (OMP_NUM_THREADS=32) so the CPU side is not the bottleneck -- see PR #1517 for why that matters",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/dsv41-expert-io-2026-09-14-raw.txt, section '32-D0'",
+      "sha256": "0ff930c3e7e70534a9e1535573115c8406e21ff2bf070e021c43ac2a3a754221"
+    }
+  },
+  "trial": {
+    "config": {
+      "V41_DIRECT": "1"
+    },
+    "samples": {
+      "tok_s": [
+        0.436205,
+        0.427122,
+        0.429646
+      ]
+    },
+    "median_tok_s": 0.429646,
+    "quality": {
+      "method": "token-exact vs a 16-token reference stream; the engine exits non-zero on any mismatch. All runs 16/16, in both regimes. tok_s is 16 generated tokens over the whole turn (READY to DONE), prefill included, with the engine's OpenMP team set to 32 threads (OMP_NUM_THREADS=32) so the CPU side is not the bottleneck -- see PR #1517 for why that matters",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/dsv41-expert-io-2026-09-14-raw.txt, section '32-P'",
+      "sha256": "a60703d6842a7667d1fe59438cf3d3e3a1ca381c598e4cc6c80673ed5b651687"
+    }
+  },
+  "outcome": "improvement"
+}

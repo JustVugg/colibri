@@ -128,6 +128,16 @@ static inline int coli_hc_pre(float *output, float *post, float *comb,
     for (int index = 0; index < flattened; index++)
         mean_square += input[index] * input[index];
     float inverse_rms = 1.0f / sqrtf(mean_square / flattened + norm_eps);
+    /* These two mallocs look like free money to remove: hc_mult is bounded to
+     * 8 by every loader, so fixed-size stack arrays would save an allocation
+     * at ~90 call sites per token. It was tried and it is measurably NOT
+     * numerics-neutral. Once hc's range is knowable at compile time -- whether
+     * from the array size itself or from an `hc <= 8` check added defensively
+     * -- GCC re-rounds the reductions below. Bisected across
+     * -fno-tree-vectorize, -ffp-contract=off, #pragma GCC unroll 1, an
+     * aliasing barrier and __attribute__((noipa)); none restored bit-identity,
+     * while keeping the mallocs and adding only the parallelism is
+     * bit-identical (checked directly). So the mallocs stay. */
     float *mixes = malloc((size_t)mix_count * sizeof(*mixes));
     float *pre = malloc((size_t)hc * sizeof(*pre));
     if (!mixes || !pre) {
@@ -135,6 +145,14 @@ static inline int coli_hc_pre(float *output, float *post, float *comb,
         free(pre);
         return -1;
     }
+    /* The ~400k-MAC mix (mix_count independent dot products, 24 rows at
+     * hc=4): each row's own untouched scalar reduction, so parallelising
+     * over rows changes nothing about any one row's summation order --
+     * this distributes whole rows across threads and is not a SIMD reduction
+     * reorder. Nested parallelism was checked separately and is safe here. */
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int row = 0; row < mix_count; row++) {
         float sum = 0.0f;
         for (int column = 0; column < flattened; column++)
@@ -147,6 +165,9 @@ static inline int coli_hc_pre(float *output, float *post, float *comb,
         free(mixes);
         return -1;
     }
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int column = 0; column < dimension; column++) {
         float sum = 0.0f;
         for (int copy = 0; copy < hc; copy++)
@@ -167,6 +188,12 @@ static inline int coli_hc_post(float *output, const float *branch,
     if (!output || !branch || !residual || !post || !comb ||
         hc < 1 || dimension < 1)
         return -1;
+    /* destination x column is embarrassingly parallel (disjoint output);
+     * collapse(2) gives full-width parallelism regardless of hc's small
+     * size. The inner source-reduction (hc terms) keeps its own order. */
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int destination = 0; destination < hc; destination++) {
         for (int column = 0; column < dimension; column++) {
             float value = 0.0f;

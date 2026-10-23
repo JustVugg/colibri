@@ -95,9 +95,11 @@ class ToolCallingV41E2E(unittest.TestCase):
             cls.port = probe.getsockname()[1]
         env = dict(os.environ, MOCK_LOG=str(cls.mock_log))
         env.pop("COLI_API_KEY", None)
+        # This protocol mock has no weights to plan; choose its cap explicitly.
         cls.server = subprocess.Popen(
             [sys.executable, str(SERVER), "--model", cls.tmp.name,
-             "--engine", str(mock), "--arch", "deepseek_v41", "--port", str(cls.port)],
+             "--engine", str(mock), "--arch", "deepseek_v41", "--port", str(cls.port),
+             "--cap", "8"],
             env=env, stderr=subprocess.DEVNULL)
         cls.base = f"http://127.0.0.1:{cls.port}/v1"
         for _ in range(100):

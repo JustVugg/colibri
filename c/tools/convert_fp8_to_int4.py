@@ -48,14 +48,19 @@ GLM52_MODEL_TYPES = {"glm_moe_dsa", "glm5_moe", "glm"}
 OTHER_FAMILY_PATHS = {
     "glm5_next":       "GLM-5.3-Flash: use tools/convert_glm53.py",
     "glm5_next_text":  "GLM-5.3-Flash: use tools/convert_glm53.py",
-    "qwen4_exp":       "Qwen3.8-Flash-Next is NOT converted: download the official "
-                       "FP8 checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) and run it "
-                       "directly; see docs/qwen38.md and issue #1304",
-    "qwen4_exp_text":  "Qwen3.8-Flash-Next is NOT converted: download the official "
-                       "FP8 checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) and run it "
-                       "directly; see docs/qwen38.md and issue #1304",
+    "qwen4_exp":       "Qwen3.8-Flash-Next is NOT converted by this tool: download the "
+                       "official FP8 checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) and run it "
+                       "directly, optionally adding int4-g64 experts with "
+                       "tools/convert_qwen38_experts_int4.py; see docs/qwen38.md",
+    "qwen4_exp_text":  "Qwen3.8-Flash-Next is NOT converted by this tool: download the "
+                       "official FP8 checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) and run it "
+                       "directly, optionally adding int4-g64 experts with "
+                       "tools/convert_qwen38_experts_int4.py; see docs/qwen38.md",
     "qwen3_5_moe":     "Qwen3.6: use tools/convert_qwen36.py",
     "qwen3_5_moe_text":"Qwen3.6: use tools/convert_qwen36.py",
+    "qwen3_5":         "Qwen3.8-27B (dense): use tools/convert_qwen36.py, see docs/qwen36.md",
+    "qwen3_5_text":    "Qwen3.8-27B (dense): use tools/convert_qwen36.py, see docs/qwen36.md",
+    "qwen3_moe":       "Qwen3-Coder-30B-A3B: use tools/convert_qwen36.py, see docs/qwen36.md",
     "inkling_mm_model":"Inkling: use tools/convert_inkling_int4.py",
     "inkling":         "Inkling: use tools/convert_inkling_int4.py",
     "olmoe":           "OLMoE: use tools/convert_olmoe.py",
@@ -64,7 +69,20 @@ OTHER_FAMILY_PATHS = {
     "deepseek_v4":     "DeepSeek V4: see docs/deepseek-v4.md, section Download",
     "deepseek_v41":    "DeepSeek V4.1: no conversion needed -- its experts already ship fp4 and its dense fp8; run tools/prepare_dsv41.py once, see docs/deepseek-v41.md",
     "deepseek_v41_text": "DeepSeek V4.1: no conversion needed -- see docs/deepseek-v41.md",
+    "mimo_v2":         "MiMo-V2.6 is NOT converted: its experts already ship MXFP4 and its "
+                       "dense FP8/BF16, and the engine reads the release as downloaded; "
+                       "see docs/mimo.md",
+    "qwenimage21pipeline": "Qwen-Image-2.1 is NOT converted: the image engine reads the "
+                           "diffusers checkpoint as downloaded; see docs/qwen-image.md",
+    "laya_modernbert": "Laya is NOT converted: the decision engine reads the release "
+                       "as downloaded; see docs/laya.md",
+    "gliner2_span_deberta-v2": "GLiNER2.5-Decide is NOT converted: the decision engine reads "
+                               "the release as downloaded; see docs/gliner_decide.md",
 }
+# A config.json whose model_type is not the registry's key for its family: a
+# GLiNER2 checkpoint says "extractor" for every architecture and encoder, and
+# the registry names it by both (family_registry._resolve_gliner2_checkpoint).
+CONFIG_MODEL_TYPE_ALIASES = {"extractor": "gliner2_span_deberta-v2"}
 
 
 def check_model_family(config, where):
@@ -80,7 +98,7 @@ def check_model_family(config, where):
                          "refusing to guess. This converter is for GLM-5.2 only.")
     if model_type in GLM52_MODEL_TYPES:
         return
-    hint = OTHER_FAMILY_PATHS.get(model_type)
+    hint = OTHER_FAMILY_PATHS.get(CONFIG_MODEL_TYPE_ALIASES.get(model_type, model_type))
     if hint:
         raise SystemExit(f"ERROR: {where} is '{model_type}', not GLM-5.2.\n"
                          f"  This converter would silently upcast most of its "

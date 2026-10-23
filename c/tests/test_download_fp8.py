@@ -1,6 +1,8 @@
 import os
 import sys
 import tempfile
+import types
+from urllib.parse import quote, parse_qs, urlsplit
 import unittest
 from unittest import mock
 
@@ -15,6 +17,50 @@ class DownloadExitStatusTests(unittest.TestCase):
         with mock.patch.object(download_fp8, "DEST", dest), \
              mock.patch.object(sys, "argv", ["download_fp8.py", *args]):
             return download_fp8.main()
+
+    def test_huggingface_listing_uses_download_revision(self):
+        for revision in (None, "refs/pr/12"):
+            api = mock.Mock()
+            api.repo_info.return_value = types.SimpleNamespace(siblings=[])
+            hub = types.SimpleNamespace(HfApi=mock.Mock(return_value=api))
+            with self.subTest(revision=revision), mock.patch.dict(sys.modules, {"huggingface_hub": hub}), \
+                    mock.patch.dict(os.environ, {}, clear=True):
+                if revision:
+                    os.environ["GLM_HF_REVISION"] = revision
+                download_fp8.get_shard_list_hf()
+                self.assertEqual(api.repo_info.call_args.kwargs.get("revision", "main"), revision or "main")
+
+    def test_modelscope_listing_uses_download_revision(self):
+        for revision in (None, "release/tag"):
+            requests = types.SimpleNamespace(get=mock.Mock())
+            requests.get.return_value.json.return_value = {"Data": {"Files": []}}
+            with self.subTest(revision=revision), mock.patch.dict(sys.modules, {"requests": requests}), \
+                    mock.patch.dict(os.environ, {}, clear=True):
+                if revision:
+                    os.environ["GLM_MS_REVISION"] = revision
+                download_fp8.get_shard_list_ms()
+                call = requests.get.call_args
+                query = parse_qs(urlsplit(call.args[0]).query, keep_blank_values=True)
+                query.update({key: [value] for key, value in call.kwargs.get("params", {}).items()})
+                self.assertEqual(query["Revision"], [revision or "master"])
+
+    def test_curl_fallback_uses_the_download_revision(self):
+        name = "model-00001.safetensors"
+        for source, variable in (("hf", "GLM_HF_REVISION"), ("ms", "GLM_MS_REVISION")):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as dest, \
+                    mock.patch.dict(os.environ, {variable: "release/tag"}), \
+                    mock.patch.object(download_fp8, f"get_shard_list_{source}", return_value=([name], {name: 4})), \
+                    mock.patch.object(download_fp8, f"download_file_{source}"), \
+                    mock.patch.object(download_fp8.time, "sleep"):
+                for metadata in self.META_FILES:
+                    open(os.path.join(dest, metadata), "wb").close()
+                def fallback(fn, base, expected):
+                    self.assertIn(quote("release/tag", safe=""), base)
+                    with open(os.path.join(dest, fn), "wb") as out:
+                        out.write(b"data")
+                    return True
+                with mock.patch.object(download_fp8, "download_file_curl", side_effect=fallback):
+                    self.assertEqual(self.run_main(dest, "--source", source), 0)
 
     def test_failed_shard_returns_nonzero(self):
         manifest = (["model-00001.safetensors"],
@@ -82,6 +128,22 @@ class DownloadExitStatusTests(unittest.TestCase):
                                    return_value=manifest), \
                  mock.patch.object(download_fp8, "download_file_hf"):
                 self.assertEqual(self.run_main(dest, "--source", "hf"), 1)
+
+    def test_unknown_shard_sizes_do_not_terminate_worker(self):
+        names = ["model-00001.safetensors", "model-00002.safetensors"]
+        manifest = (names, {name: 0 for name in names})
+        with tempfile.TemporaryDirectory() as dest, \
+             mock.patch.object(download_fp8, "get_shard_list_ms", return_value=manifest), \
+             mock.patch.object(download_fp8.threading, "excepthook") as failed_worker:
+            def download(name):
+                with open(os.path.join(dest, name), "wb") as output:
+                    output.write(b"data")
+            with mock.patch.object(download_fp8, "download_file_ms", side_effect=download):
+                self.assertEqual(self.run_main(dest, "--source", "ms", "--parallel", "1"), 0)
+            failed_worker.assert_not_called()
+            for name in names:
+                with open(os.path.join(dest, name), "rb") as shard:
+                    self.assertEqual(shard.read(), b"data")
 
     def test_empty_manifest_returns_nonzero(self):
         with tempfile.TemporaryDirectory() as dest, \

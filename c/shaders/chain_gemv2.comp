@@ -1,0 +1,93 @@
+#version 450
+// The dense chain's decode GEMV (vk_chain.c, S <= 4 rows): y[s,o] = sum_i x[s,i] *
+// dequant(W[o,i]) for int8 per row (fmt 1), int4 per row (2) and int4 per (row, gs) (4),
+// the bindings and push constants of chain_gemv.comp plus rpw. A workgroup takes rpw
+// output rows of one input row (WorkGroupID.x the block, .y the row); x is staged in
+// shared memory once, each output row's 16-byte weight words are spread over lpr lanes
+// (a power of two up to 64), RPS rows in flight per lane group, the partial sums joined
+// with clustered subgroup adds. The host picks rpw: fewer rows a workgroup for a short
+// matrix (more workgroups to fill the device), more for a long one. nr rows of x (up to
+// 4: a speculative verify's) share a workgroup and every weight load; each row keeps
+// its own sums in the same order, so its bits are a decode step's (nr = 1).
+// Host: I % 32 == 0, nr * I <= 16384, rowWords % 4 == 0; fmt 4: gs % 32 == 0.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer X { vec4 x4[]; };
+layout(std430, binding = 1) readonly buffer W { uvec4 wv[]; };
+layout(std430, binding = 2) readonly buffer Sc { float sc[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform P { int fmt, S, I, O, rowWords, gs, rpw, nr; } p;
+#define NRMAX 4
+
+#define RPS 4u
+shared vec4 xsh[4096];
+
+float i8(uint w, uint k) { return float(int(w << (24u - 8u * k)) >> 24); }
+float d8(uint w, vec4 a) { return a.x * i8(w, 0u) + a.y * i8(w, 1u) + a.z * i8(w, 2u) + a.w * i8(w, 3u); }
+float d4(uint w, vec4 a, vec4 b) {
+    return a.x * float(int(w & 15u) - 8) + a.y * float(int((w >> 4u) & 15u) - 8) +
+           a.z * float(int((w >> 8u) & 15u) - 8) + a.w * float(int((w >> 12u) & 15u) - 8) +
+           b.x * float(int((w >> 16u) & 15u) - 8) + b.y * float(int((w >> 20u) & 15u) - 8) +
+           b.z * float(int((w >> 24u) & 15u) - 8) + b.w * float(int(w >> 28u) - 8);
+}
+float red(float v, uint lpr) {
+    if (lpr == 64u) return subgroupClusteredAdd(v, 64u);
+    if (lpr == 32u) return subgroupClusteredAdd(v, 32u);
+    if (lpr == 16u) return subgroupClusteredAdd(v, 16u);
+    if (lpr == 8u) return subgroupClusteredAdd(v, 8u);
+    if (lpr == 4u) return subgroupClusteredAdd(v, 4u);
+    if (lpr == 2u) return subgroupClusteredAdd(v, 2u);
+    return v;
+}
+
+void main() {
+    uint nr = uint(max(p.nr, 1)), s0 = gl_WorkGroupID.y * nr, I = uint(p.I), I4 = I / 4u, O = uint(p.O);
+    for (uint r = 0u; r < nr; r++)
+        for (uint i = gl_LocalInvocationID.x; i < I4; i += 256u) xsh[r * I4 + i] = s0 + r < uint(p.S) ? x4[(s0 + r) * I4 + i] : vec4(0.0);
+    barrier();
+    int fmt = p.fmt;
+    uint rowWords = uint(p.rowWords), gs = uint(max(p.gs, 1)), ng = (I + gs - 1u) / gs;
+    uint W4 = fmt == 1 ? I / 16u : I / 32u;
+    uint cap = min(min(gl_SubgroupSize, W4), 64u), lpr = 1u;
+    while (lpr * 2u <= cap) lpr *= 2u;
+    uint rg = gl_SubgroupSize / lpr, rr = gl_SubgroupInvocationID / lpr, jj = gl_SubgroupInvocationID % lpr;
+    uint RW = uint(p.rpw), o0 = gl_WorkGroupID.x * RW;
+    uint rows_sg = (RW + gl_NumSubgroups - 1u) / gl_NumSubgroups;
+    for (uint base = 0u; base < rows_sg; base += RPS * rg) {
+        uint qbase = gl_SubgroupID * rows_sg + base + rr;
+        uint remaining = rows_sg - min(rows_sg, base + rr);
+        float acc[RPS * NRMAX];
+        [[unroll]] for (uint t = 0u; t < RPS * NRMAX; t++) acc[t] = 0.0;
+        for (uint j = jj; j < W4; j += lpr) {
+            uvec4 v[RPS]; float sv[RPS];
+            [[unroll]] for (uint t = 0u; t < RPS; t++) {
+                uint q = qbase + t * rg, o = o0 + q;
+                bool ok = t * rg < remaining && q < RW && o < O;
+                v[t] = ok ? wv[o * (rowWords / 4u) + j] : uvec4(0u);
+                sv[t] = fmt == 4 && ok ? sc[o * ng + (j * 32u) / gs] : 1.0;
+            }
+            [[unroll]] for (uint r = 0u; r < NRMAX; r++) if (r < nr) {
+                uint xb = r * I4;
+                [[unroll]] for (uint t = 0u; t < RPS; t++) {
+                    float d = 0.0;
+                    if (fmt == 1) {
+                        [[unroll]] for (uint h = 0u; h < 4u; h++) d += d8(v[t][h], xsh[xb + j * 4u + h]);
+                    } else {
+                        [[unroll]] for (uint h = 0u; h < 4u; h++) d += d4(v[t][h], xsh[xb + j * 8u + h * 2u], xsh[xb + j * 8u + h * 2u + 1u]);
+                    }
+                    acc[r * RPS + t] += sv[t] * d;
+                }
+            }
+        }
+        [[unroll]] for (uint r = 0u; r < NRMAX; r++) [[unroll]] for (uint t = 0u; t < RPS; t++) {
+            uint q = qbase + t * rg, o = o0 + q;
+            bool writer = r < nr && s0 + r < uint(p.S) && jj == 0u && t * rg < remaining && q < RW && o < O;
+            float v2 = red(acc[r * RPS + t], lpr);
+            if (writer) y[(s0 + r) * O + o] = fmt == 4 ? v2 : v2 * sc[o];
+        }
+    }
+}

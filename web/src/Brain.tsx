@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import { BrainCircuit, Flame, Layers } from "lucide-react"
 
-import { endpoint } from "@/lib/api"
+import { serverEndpoint } from "@/lib/api"
 import { useLocale } from "./i18n"
 
 interface ExpertMap { rows: number; cols: number; map: string; hits: string; seq: number }
@@ -30,21 +30,16 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
   const [atlas, setAtlas] = useState<Record<string, AtlasEntry> | null>(null)
   const [tip, setTip] = useState<{ x: number; y: number; row: number; col: number; tier: number; heat: number } | null>(null)
   const pulseRef = useRef<Float32Array | null>(null)   // per-expert pulse intensity 0..1
+  const usedRef = useRef<Float32Array | null>(null)    // per-expert residue: routed at least once this session
   const lastSeq = useRef(0)
   const rafRef = useRef(0)
 
   // load the expert atlas if published (measured topic affinity, #175)
   useEffect(() => {
-    // The atlas lives next to the engine's /experts endpoint, not on the page
-    // origin: when the UI is hosted elsewhere (dev server, static hosting) a
-    // root-relative fetch pointed at the wrong server and the atlas never
-    // loaded. Same base + auth as the live expert map above.
-    const base = baseUrl.replace(/\/v1\/?$/, "")
-    fetch(endpoint(base, "/experts.json"), { headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} })
-      .then(r => r.ok ? r.json() : null).then(d => {
-        if (d?.experts) setAtlas(d.experts)
-      }).catch(() => {})
-  }, [baseUrl, apiKey])
+    fetch("/experts.json").then(r => r.ok ? r.json() : null).then(d => {
+      if (d?.experts) setAtlas(d.experts)
+    }).catch(() => {})
+  }, [])
 
   // track container size for responsive cell sizing
   useEffect(() => {
@@ -64,7 +59,7 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
     const base = baseUrl.replace(/\/v1\/?$/, "")
     const poll = async () => {
       try {
-        const res = await fetch(endpoint(base, "/experts"), { headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} })
+        const res = await fetch(serverEndpoint(base, "/experts"), { headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} })
         if (!res.ok) throw new Error(`/experts ${res.status}`)
         const next = (await res.json()) as ExpertMap
         if (disposed || !next.rows) return
@@ -74,10 +69,11 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
           lastSeq.current = next.seq
           const n = next.rows * next.cols
           if (!pulseRef.current || pulseRef.current.length !== n) pulseRef.current = new Float32Array(n)
-          const p = pulseRef.current
+          if (!usedRef.current || usedRef.current.length !== n) usedRef.current = new Float32Array(n)
+          const p = pulseRef.current, used = usedRef.current
           for (let i = 0; i < n; i++) {
             const byte = parseInt(next.hits.substr((i >> 3) * 2, 2), 16) || 0
-            if (byte & (1 << (i & 7))) p[i] = 1
+            if (byte & (1 << (i & 7))) { p[i] = 1; used[i] = Math.min(1, used[i] + 0.34) }
           }
         }
       } catch { if (!disposed) setProbeErr(true) /* surface repeated failures; keep the last frame */ }
@@ -101,7 +97,7 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
 
     const draw = () => {
       ctx.clearRect(0, 0, canvas.width, canvas.height)
-      const p = pulseRef.current
+      const p = pulseRef.current, u = usedRef.current
       for (let r = 0; r < rows; r++) {
         for (let c = 0; c < cols; c++) {
           const i = r * cols + c
@@ -112,6 +108,13 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
           // heat scales brightness: cold experts dim, hot experts full colour
           const lum = 0.35 + 0.65 * Math.min(heat / 24, 1)
           let rr = R * lum, gg = G * lum, bb = B * lum
+          /* An expert this conversation has routed to stays lit, and gets
+             brighter the more turns pick it. The pulse alone decays in about a
+             second while the poll runs every 1.5, so the flash almost always
+             fell between two frames nobody was watching and the grid read as
+             "nothing ever happens". */
+          const seen = u ? u[i] : 0
+          if (seen > 0.01) { const k = 0.5 * (0.25 + 0.75 * seen); rr += (200 - rr) * k; gg += (235 - gg) * k; bb += (210 - bb) * k }
           const pulse = p ? p[i] : 0
           if (pulse > 0.01) { rr += (255 - rr) * pulse; gg += (255 - gg) * pulse; bb += (255 - bb) * pulse }
           ctx.fillStyle = `rgb(${rr | 0},${gg | 0},${bb | 0})`

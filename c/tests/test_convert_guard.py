@@ -56,6 +56,14 @@ class ConvertGuardTest(unittest.TestCase):
         self.assertIn("NOT converted", str(caught.exception))
         self.assertIn("FP8", str(caught.exception))
 
+    def test_a_gliner2_checkpoint_gets_its_pointer(self):
+        # GLiNER2's config.json says model_type "extractor", not the registry key
+        with self.assertRaises(SystemExit) as caught:
+            check_model_family({"model_type": "extractor", "architecture": "span"},
+                               "fastino/GLiNER2.5-Decide")
+        self.assertIn("NOT converted", str(caught.exception))
+        self.assertIn("docs/gliner_decide.md", str(caught.exception))
+
     def test_unknown_and_missing_types_are_refused_not_guessed(self):
         for config in ({"model_type": "llama"}, {"model_type": ""}, {}):
             with self.assertRaises(SystemExit):

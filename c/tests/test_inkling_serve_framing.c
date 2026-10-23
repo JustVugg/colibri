@@ -100,11 +100,27 @@ static void test_malformed_submit_cannot_become_control(void)
     fclose(input); fclose(output);
 }
 
+/* The gateway answers `ERROR <id> CONTEXT_EXCEEDED ...` with a 400
+ * context_length_exceeded; any other refusal text reaches the client as a 500.
+ * max_tokens is a ceiling: coli chat's 16384 used to 400 a prompt that fits. */
+static void test_over_long_prompt_is_refused_with_the_context_frame(void)
+{
+    assert(setenv("CTX_MAX","16",1)==0);
+    assert(prompt_reject(12,4)==NULL);
+    assert(prompt_reject(2,16384)==NULL);
+    assert(coli_serve_budget(2,16384,16,0)==14);
+    const char *refusal=prompt_reject(30,4);
+    assert(refusal);
+    assert(strcmp(refusal,"CONTEXT_EXCEEDED prompt_tokens=30 requested=4 capacity=16")==0);
+    assert(prompt_reject(16,4)!=NULL);
+}
+
 int main(void)
 {
     test_text_and_audio_submits_are_exact();
     test_controls_and_queue_full_preserve_behavior();
     test_malformed_submit_cannot_become_control();
+    test_over_long_prompt_is_refused_with_the_context_frame();
     puts("inkling serve framing baseline: ok");
     return 0;
 }

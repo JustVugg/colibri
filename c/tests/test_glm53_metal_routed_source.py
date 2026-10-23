@@ -15,7 +15,10 @@ class Glm53MetalRoutedSourceTests(unittest.TestCase):
     def test_cpu_mmap_path_is_preserved(self):
         self.assertIn("if (!metal_slot)", SRC)
         self.assertIn("st_map_shard_range", SRC)
-        self.assertIn("if (mapped_ok) { slot->eid = eid; return; }", SRC)
+        self.assertRegex(
+            SRC,
+            r"if\s*\(mapped_ok\)\s*\{\s*slot->eid\s*=\s*eid;\s*return;\s*\}",
+        )
 
     def test_routed_experts_use_clamped_batched_api(self):
         self.assertIn("coli_metal_moe_block_clamped(", SRC)

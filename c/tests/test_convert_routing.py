@@ -105,6 +105,18 @@ class ConvertRoutingTest(unittest.TestCase):
         self.assertTrue(calls, "no converter was launched at all")
         self.assertEqual(self.script_of(calls[0]), "convert_glm53.py")
 
+    def test_olmoe_checkpoint_reaches_convert_olmoe_merged(self):
+        """OLMoE\'s converter is convert_olmoe_merged.py (not GLM-5.2\'s
+        convert_fp8_to_int4.py).  The converter takes no precision flags;
+        the command must carry only --repo and --outdir."""
+        calls = self.run_convert("olmoe")
+        self.assertTrue(calls, "no converter was launched at all")
+        self.assertEqual(self.script_of(calls[0]), "convert_olmoe_merged.py")
+        for flag in ("--ebits", "--io-bits", "--xbits", "--group-size"):
+            self.assertNotIn(flag, calls[0],
+                             f"{flag} was passed to convert_olmoe_merged.py "
+                             f"but that converter does not accept it")
+
     def test_the_flash_command_carries_no_precision_flags(self):
         """convert_glm53.py has no --ebits/--io-bits/--xbits: it keeps the dense
         weights and the embedding wide and the engine picks the precision at
@@ -157,6 +169,51 @@ class ConvertRoutingTest(unittest.TestCase):
             self.assertEqual(command[command.index(flag) + 1], value)
         self.assertNotIn("--xbits", command, "xbits defaults to 0 and is omitted")
 
+    def test_an_output_directory_holding_a_checkpoint_is_refused(self):
+        """`coli convert --model <downloaded checkpoint>` used to start fetching
+        the default repo into that directory. Refuse, and say what the user
+        most likely wanted: nothing for a family that runs its official
+        checkpoint, the family's converter with --indir for one that converts."""
+        cli = self.cli
+        with tempfile.TemporaryDirectory() as out:
+            (Path(out) / "model-00001-of-00002.safetensors").write_bytes(b"\0" * 8)
+            (Path(out) / "config.json").write_text(json.dumps({"model_type": "qwen4_exp", "text_config": {}}))
+            text = cli.convert_output_refusal(out)
+            self.assertIsNotNone(text)
+            self.assertIn("already holds a checkpoint", text)
+            self.assertIn("no conversion needed", text)
+            self.assertIn("coli chat --model", text)
+        with tempfile.TemporaryDirectory() as out:
+            (Path(out) / "config.json").write_text(json.dumps({"model_type": "glm5_next", "text_config": {}}))
+            text = cli.convert_output_refusal(out)
+            self.assertIn("convert_glm53.py --indir", text)
+        with tempfile.TemporaryDirectory() as out:
+            (Path(out) / "model-00001-of-00001.safetensors").write_bytes(b"\0" * 8)
+            text = cli.convert_output_refusal(out)
+            self.assertIn("1 shard(s)", text)
+            self.assertIn("--repo <hf repo> --model <new dir>", text)
+        with tempfile.TemporaryDirectory() as out:
+            self.assertIsNone(cli.convert_output_refusal(out))
+        self.assertIsNone(cli.convert_output_refusal("/nonexistent/dir/for/convert"))
+
+    def test_cmd_convert_stops_before_any_subprocess_on_a_checkpoint_dir(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        (Path(directory.name) / "model-00001-of-00001.safetensors").write_bytes(b"\0" * 8)
+        calls = []
+        with mock.patch.object(self.cli, "subprocess") as subprocess_module, \
+             mock.patch.object(self.cli, "project_python", return_value="python3"), \
+             mock.patch.object(self.cli, "checkpoint_family", return_value=None):
+            subprocess_module.call = lambda command: calls.append(command) or 0
+            with self.assertRaises(SystemExit) as stop:
+                self.cli.cmd_convert(Args(directory.name, repo=None))
+        self.assertIn("already holds a checkpoint", str(stop.exception))
+        self.assertEqual(calls, [])
+
+    def test_the_default_repo_is_applied_when_none_is_written(self):
+        calls = self.run_convert("glm", repo=None)
+        self.assertEqual(calls[0][calls[0].index("--repo") + 1], "zai-org/GLM-5.2-FP8")
+
     def test_an_unresolvable_family_keeps_the_old_command(self):
         """A metadata fetch that fails is not a reason to refuse a conversion
         that would have worked. The converter's own guard downloads the same
@@ -186,10 +243,14 @@ class ConverterDeclarationTest(unittest.TestCase):
             self.assertTrue(
                 family.converter.endswith(".py"),
                 f"{family.id}: converter must be a script under tools/")
-            self.assertTrue(
-                family.converter_accepts,
-                f"{family.id}: names {family.converter} but says nothing about "
-                f"which coli options it takes, so every one of them is dropped")
+            # An explicit empty tuple is a valid declaration when the converter
+            # genuinely takes none of the four precision flags (ebits / io_bits
+            # / xbits / group_size).  OLMoE\'s convert_olmoe_merged.py is one
+            # such case: it has --flush-every and --min-free-gb, neither of
+            # which is a coli-convert precision flag.
+            self.assertIsInstance(
+                family.converter_accepts, tuple,
+                f"{family.id}: converter_accepts must be a tuple")
 
     def test_declared_converters_exist_on_disk(self):
         for family in FAMILIES:

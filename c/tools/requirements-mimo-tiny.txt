@@ -1,0 +1,4 @@
+# tiny MiMo-V2.6 fixture generation (CI): deterministic numpy weights, and Pillow for
+# the test picture and the gateway's Qwen2-VL preprocessing (tools/qwen38_image.py)
+numpy>=1.24
+pillow>=10

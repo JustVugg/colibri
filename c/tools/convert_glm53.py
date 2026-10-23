@@ -44,6 +44,60 @@ META_FILES = ("config.json", "generation_config.json", "tokenizer.json",
               "chat_template.jinja")
 
 
+def copy_meta_from_dir(indir, outdir):
+    """--indir: the metadata files sit next to the local shards; carry the ones
+    that exist into the container, and say which did not. Before this, --indir
+    copied none of them: a container without generation_config.json never
+    stops generating (#1478)."""
+    copied, missing = [], []
+    for meta in META_FILES:
+        src = os.path.join(indir, meta)
+        if os.path.isfile(src):
+            if not os.path.exists(os.path.join(outdir, meta)):
+                shutil.copy(src, os.path.join(outdir, meta))
+            copied.append(meta)
+        else:
+            missing.append(meta)
+    return copied, missing
+
+
+def eos_ids_from_config(config):
+    """eos_token_id as HF writes it: at the top level (text checkpoints) or under
+    text_config (multimodal wrappers such as GLM-5.3-Flash); int or list."""
+    for section in (config, config.get("text_config") if isinstance(config, dict) else None):
+        if not isinstance(section, dict):
+            continue
+        eos = section.get("eos_token_id")
+        if isinstance(eos, int):
+            return [eos]
+        if isinstance(eos, list) and eos and all(isinstance(x, int) for x in eos):
+            return list(eos)
+    return []
+
+
+def ensure_generation_config(outdir):
+    """The engine reads its stop ids from generation_config.json first and
+    config.json second; a container that has neither file carrying eos ids runs
+    to the token limit. When generation_config.json is absent and config.json
+    declares the ids, write the minimal file so every reader agrees. Returns
+    the ids written, or None when nothing was needed or nothing was known."""
+    gen = os.path.join(outdir, "generation_config.json")
+    cfg = os.path.join(outdir, "config.json")
+    if os.path.exists(gen) or not os.path.isfile(cfg):
+        return None
+    try:
+        with open(cfg, encoding="utf-8") as f:
+            ids = eos_ids_from_config(json.load(f))
+    except (OSError, ValueError):
+        return None
+    if not ids:
+        return None
+    with open(gen, "w", encoding="utf-8") as f:
+        json.dump({"eos_token_id": ids}, f, indent=2)
+        f.write("\n")
+    return ids
+
+
 # ---------------------------------------------------------------- quantizzatore
 def quant_int4_grouped(w, gs=64):
     """int4 group-scaled: una scala ogni `gs` elementi lungo l'asse di input.
@@ -345,6 +399,9 @@ def main():
     if a.indir:
         shards = sorted(x for x in os.listdir(a.indir) if x.endswith(".safetensors"))
         fetch = lambda fn: os.path.join(a.indir, fn)
+        copied, missing = copy_meta_from_dir(a.indir, a.outdir)
+        print(f"[meta] copied from {a.indir}: {', '.join(copied) or 'nothing'}"
+              + (f" | not there: {', '.join(missing)}" if missing else ""), flush=True)
     else:
         from huggingface_hub import hf_hub_download
         # Il token salvato in ~/.cache/huggingface puo' essere un OAuth scaduto
@@ -397,6 +454,14 @@ def main():
                 shutil.copy(pull(meta, "_meta"), os.path.join(a.outdir, meta))
             except Exception as exc:                       # noqa: BLE001
                 print(f"[meta] {meta}: {exc}", flush=True)
+
+    written = ensure_generation_config(a.outdir)
+    if written:
+        print(f"[meta] generation_config.json was missing: written from config.json "
+              f"(eos_token_id {written})", flush=True)
+    elif not os.path.exists(os.path.join(a.outdir, "generation_config.json")):
+        print("[meta] WARNING: no generation_config.json and no eos_token_id in config.json: "
+              "the engine will not know where the model stops", flush=True)
 
     if a.limit_shards:
         shards = shards[:a.limit_shards]

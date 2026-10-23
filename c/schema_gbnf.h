@@ -33,9 +33,13 @@
 
 #define SGB_MAX_DEPTH 32
 
+/* an array item that holds an array, compiled once as rule jitem<id> after root */
+typedef struct { jval *sc; int depth; } SgbItemRule;
+
 typedef struct {
     char  *s; size_t len, cap;      /* output GBNF text */
     int    nrule;                   /* next composite rule id */
+    SgbItemRule *items; int items_cap;  /* composite rule bodies, indexed by id */
     int    use_str, use_num, use_int;  /* shared terminal rules actually referenced */
     char   err[160];
     int    fail;
@@ -142,23 +146,57 @@ static void sgb_object(SgbCtx *C, jval *sc, int depth){
     sgb_put(C, " \"}\"");
 }
 
+/* true when a schema node is an array, or an object with an array below it */
+static int sgb_has_array(jval *sc, int depth){
+    if (!sc || sc->t != J_OBJ || depth > SGB_MAX_DEPTH) return 0;
+    jval *ty = json_get(sc, "type");
+    if (!ty || ty->t != J_STR) return 0;
+    if (!strcmp(ty->str, "array")) return 1;
+    jval *props = json_get(sc, "properties");
+    if (strcmp(ty->str, "object") || !props || props->t != J_OBJ) return 0;
+    for (int i = 0; i < props->len; i++)
+        if (sgb_has_array(props->kids[i], depth + 1)) return 1;
+    return 0;
+}
+
+static void sgb_item(SgbCtx *C, jval *items, int depth, const char *rule){
+    if (rule[0]) sgb_put(C, rule); else sgb_value(C, items, depth);
+}
+
+/* An array names its item grammar twice (the first item, then each ","-item).
+ * Inlining an item that holds an array at both places doubled everything below
+ * it at every nesting level: 2^depth copies of the innermost item. Such an item
+ * is queued as one composite rule, emitted after the root rule, and referenced
+ * by name. Any other item is inlined as before and costs no extra rule. */
 static void sgb_array(SgbCtx *C, jval *sc, int depth){
     jval *items = json_get(sc, "items");
     jval *mi    = json_get(sc, "minItems");
     int min1 = mi && mi->t == J_NUM && mi->num >= 1;
     if (mi && mi->t == J_NUM && mi->num > 1){ sgb_fail(C, "minItems > 1"); return; }
     if (!items){ sgb_fail(C, "array without items"); return; }
+    char rule[32] = "";
+    if (sgb_has_array(items, depth + 1)){
+        if (C->nrule == C->items_cap){
+            int nc = C->items_cap ? C->items_cap * 2 : 8;
+            SgbItemRule *ni = (SgbItemRule *)realloc(C->items, (size_t)nc * sizeof *ni);
+            if (!ni){ C->fail = 1; return; }
+            C->items = ni; C->items_cap = nc;
+        }
+        C->items[C->nrule].sc = items;
+        C->items[C->nrule].depth = depth + 1;
+        snprintf(rule, sizeof rule, "jitem%d", C->nrule++);
+    }
     if (min1){
         sgb_put(C, "\"[\" jws ");
-        sgb_value(C, items, depth + 1);
+        sgb_item(C, items, depth + 1, rule);
         sgb_put(C, " jws ( \",\" jws ");
-        sgb_value(C, items, depth + 1);
+        sgb_item(C, items, depth + 1, rule);
         sgb_put(C, " jws )* \"]\"");
     } else {
         sgb_put(C, "\"[\" jws ( ");
-        sgb_value(C, items, depth + 1);
+        sgb_item(C, items, depth + 1, rule);
         sgb_put(C, " jws ( \",\" jws ");
-        sgb_value(C, items, depth + 1);
+        sgb_item(C, items, depth + 1, rule);
         sgb_put(C, " jws )* )? \"]\"");
     }
 }
@@ -225,6 +263,15 @@ static char *schema_to_gbnf(const char *schema_json, char *err, int errsz){
     sgb_put(&C, "root ::= jws ");
     sgb_value(&C, sc, 0);
     sgb_put(&C, " jws\n");
+    /* item rules queued by sgb_array; compiling one can queue the next (a deeper
+     * array), so nrule grows while this loop runs */
+    for (int i = 0; i < C.nrule && !C.fail; i++){
+        char head[40]; snprintf(head, sizeof head, "jitem%d ::= ", i);
+        sgb_put(&C, head);
+        sgb_value(&C, C.items[i].sc, C.items[i].depth);
+        sgb_put(&C, "\n");
+    }
+    free(C.items);
     sgb_put(&C, "jws ::= ( \" \" | \"\\t\" | \"\\n\" | \"\\r\" )*\n");
     if (C.use_str)
         sgb_put(&C, "jstr ::= \"\\\"\" jchar* \"\\\"\"\n"

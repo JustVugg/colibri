@@ -102,7 +102,19 @@ static void test_submit_extension_fields(void)
     assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=1000", &sub));
     /* an extended header still validates the base fields */
     assert(!coli_submit_parse("SUBMIT 0 3 17 64 0.7 0.95 0 logprobs=5", &sub));
-    assert(!coli_submit_parse("SUBMIT 42 3 17 0 0.7 0.95 0 logprobs=5", &sub));
+
+    /* max_tokens=0 = "leggi il prompt e fermati", e vale SOLO con logprobs>0.
+     * Chi punteggia un insieme chiuso non vuole generare niente: dover chiedere
+     * almeno un token costa un passo di decodifica completo per ogni opzione,
+     * buttato via. Senza logprobs lo zero resta una richiesta malformata, cosi
+     * un client che dimentica il campo continua a prendere un errore invece di
+     * una risposta vuota. */
+    assert(coli_submit_parse("SUBMIT 42 3 17 0 0.7 0.95 0 logprobs=5", &sub));
+    assert(sub.max_tokens == 0 && sub.logprobs == 5);
+    assert(!coli_submit_parse("SUBMIT 42 3 17 0 0.7 0.95", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 0 0.7 0.95 0 logprobs=0", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 0 0.7 0.95 0 pin=1", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 -1 0.7 0.95 0 logprobs=5", &sub));
 }
 
 /* U7a token-ID intake: the ids the caller formatted are exactly the ids that

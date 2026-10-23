@@ -1,0 +1,116 @@
+#version 450
+// Qwen3.8's QSA indexer on the device (vk_chain.c, VKC_P_QSA), two modes.
+//
+// mode 0, the block keys: one workgroup per block b = b0 + WorkGroupID.x whose R index
+// keys are all written. Its key is what qwen38_core.h's q38_attention builds for every
+// query again: the mean of the block's R index keys (summed as the CPU does, k/R in
+// order), a zero-centred RMSNorm (1 + w), RoPE at the block's first position (cos/sin
+// row b - b0 of cs). A block's key depends on its own rows only, so the device keeps
+// it (pk[b]) and computes each block once, when a step completes it.
+//
+// mode 1, the selection: one workgroup per query row s, position pos_base + s. With
+// visible = pos + 1 positions, blocks = visible / R complete blocks and
+// take = min(blocks, budget / R): when every block is taken the row attends to all of
+// 0..pos (count -1 in sel, chain_attn.comp's contiguous case). Otherwise each block
+// scores sum_h max(0, q_h . pk[b]) / sqrt(ID) over the IQ index heads (the CPU's sums,
+// in its order), a block is taken when fewer than `take` blocks rank above it (score
+// higher, or equal with a lower index: the CPU's sort order), and sel gets the taken
+// blocks' positions in block order followed by the incomplete tail block's.
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer AB { float src[]; };   // mode 0: index keys [cap][ID]; mode 1: index queries
+layout(std430, binding = 1) readonly buffer WB { float w[]; };     // mode 0: k norm weight; mode 1: (unused)
+layout(std430, binding = 2) buffer PB { float pk[]; };             // block keys [nbmax][ID]
+layout(std430, binding = 3) readonly buffer CB { float cs[]; };    // mode 0: cos/sin rows
+layout(std430, binding = 4) buffer SB { float sc[]; };             // mode 1: scratch [S][2*nbmax]
+layout(std430, binding = 5) buffer LB { int sel[]; };              // mode 1: [S][sel_row]
+
+layout(push_constant) uniform P {
+    int mode, ID, R;
+    int b0, half_;                      // mode 0
+    int S, pos_base, budget, IQ;        // mode 1
+    int q_off, q_row, nbmax, sel_row;
+    float eps;
+    int src_off, w_off, pk_off, nb;
+} p;
+
+shared float pool[256];
+shared float red[128];
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x);
+    if (p.mode == 0) {
+        int b = p.b0 + int(gl_WorkGroupID.x);
+        float ss = 0.0;
+        for (int d = tid; d < p.ID; d += 128) {
+            float v = 0.0;
+            for (int r = 0; r < p.R; r++) v += src[p.src_off + (b * p.R + r) * p.ID + d] / float(p.R);
+            pool[d] = v;
+            ss += v * v;
+        }
+        red[tid] = ss;
+        barrier();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (tid < off) red[tid] += red[tid + off];
+            barrier();
+        }
+        float rr = 1.0 / sqrt(red[0] / float(p.ID) + p.eps);
+        barrier();
+        for (int d = tid; d < p.ID; d += 128) pool[d] = pool[d] * rr * (1.0 + w[p.w_off + d]);
+        barrier();
+        int cb = int(gl_WorkGroupID.x) * 2 * p.half_;
+        for (int d = tid; d < p.ID; d += 128) {
+            float v = pool[d];
+            if (d < p.half_) {
+                float c = cs[cb + 2 * d], s = cs[cb + 2 * d + 1];
+                v = pool[d] * c - pool[d + p.half_] * s;
+            } else if (d < 2 * p.half_) {
+                int j = d - p.half_;
+                float c = cs[cb + 2 * j], s = cs[cb + 2 * j + 1];
+                v = pool[d] * c + pool[j] * s;
+            }
+            pk[p.pk_off + b * p.ID + d] = v;
+        }
+        return;
+    }
+    int s = int(gl_WorkGroupID.x);
+    int visible = p.pos_base + s + 1, blocks = visible / p.R;
+    int take = min(blocks, p.budget / p.R);
+    int lb = s * p.sel_row;
+    if (take >= blocks) {
+        if (tid == 0) sel[lb] = -1;
+        return;
+    }
+    int sb = s * 2 * p.nbmax;
+    int qb = p.q_off + s * p.q_row;
+    for (int b = tid; b < blocks; b += 128) {
+        float score = 0.0;
+        for (int h = 0; h < p.IQ; h++) {
+            float a = 0.0;
+            for (int d = 0; d < p.ID; d++) a += src[qb + h * p.ID + d] * pk[p.pk_off + b * p.ID + d];
+            if (a > 0.0) score += a;
+        }
+        sc[sb + b] = score / sqrt(float(p.ID));
+    }
+    memoryBarrierBuffer();
+    barrier();
+    for (int b = tid; b < blocks; b += 128) {
+        float v = sc[sb + b];
+        int rank = 0;
+        for (int b2 = 0; b2 < blocks; b2++) {
+            float v2 = sc[sb + b2];
+            if (v2 > v || (v2 == v && b2 < b)) rank++;
+        }
+        sc[sb + p.nbmax + b] = rank < take ? 1.0 : 0.0;
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (tid == 0) {
+        int n = 0;
+        for (int b = 0; b < blocks; b++)
+            if (sc[sb + p.nbmax + b] != 0.0)
+                for (int r = 0; r < p.R; r++) sel[lb + 1 + n++] = b * p.R + r;
+        for (int t = blocks * p.R; t < visible; t++) sel[lb + 1 + n++] = t;
+        sel[lb] = n;
+    }
+}

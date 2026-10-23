@@ -20,9 +20,11 @@
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
+#include <math.h>
 #include "json.h"
 #include "tok_unicode.h"
 #include "tok_unicode_o200k.h"
+#include "tok_unicode_deepseek.h"
 
 /* ---------- hash map (chiavi binarie con lunghezza) ---------- */
 typedef struct { const char *k; int klen; int v; int used; } ment;
@@ -58,6 +60,13 @@ typedef struct {
     int o200k;           /* pre_tokenizer regex family: 0 = cl100k (GLM), 1 = o200k (Inkling) */
     int kimi;            /* 1 = Kimi (K3) family: o200k rules + a leading \p{Han}-run rule,
                           * Han excluded from the letter classes, no '/' tail in the punct rule */
+    int gpt2;            /* 1 = GPT-2 family (OLMoE / GPT-NeoX): a bare ByteLevel pre_tokenizer
+                          * with use_regex and no Split, so HF applies the original GPT-2 pattern */
+    int deepseek;        /* 1 = DeepSeek V4 / V4.1: three chained Splits (digit groups, CJK
+                          * runs, then a regex of its own) -- not cl100k, see
+                          * pretok_chunk_deepseek */
+    int ndig1;           /* 1 = digits split one at a time: Qwen's \p{N} where cl100k has
+                          * \p{N}{1,3}; the rest of the cl100k pretokenizer is the same */
     int rankbpe;         /* 1 = no merges list (tiktoken-derived vocab): merge the adjacent
                           * pair whose CONCATENATION has the lowest vocab id — exactly
                           * tiktoken's byte_pair_encode, no recovered merges to diverge */
@@ -132,18 +141,32 @@ static void tok_free(Tok *T){
     memset(T,0,sizeof(*T));
 }
 
+/* Validate the JSON number before converting it: casting an infinite or
+ * out-of-range double to int is undefined, and fractional ids silently alias
+ * a different token. The same bound applies to vocabulary and added tokens. */
+static int tk_checked_id(const jval *value){
+    if(!value || value->t!=J_NUM || !isfinite(value->num) ||
+       value->num<0 || value->num>(1<<21) || value->num!=(double)(int)value->num){
+        fprintf(stderr,"tokenizer.json: token id must be an integer between 0 and %d\n",1<<21);
+        exit(1);
+    }
+    return (int)value->num;
+}
+
 static void tok_load(Tok *T, const char *path){
     memset(T,0,sizeof(*T));
     tk_build_bytemap(T);
     long fn; char *buf=tk_read_file(path,&fn);
-    char *arena=NULL; jval *root=json_parse(buf,&arena);
+    jval *root=memchr(buf,0,(size_t)fn) ? NULL : json_parse_checked(buf);
     free(buf);
-    (void)arena;
+    if(!root){ fprintf(stderr,"tokenizer.json: malformed JSON\n"); exit(1); }
     jval *model=json_get(root,"model");
     jval *vocab=json_get(model,"vocab");
     jval *merges=json_get(model,"merges");
     jval *added=json_get(root,"added_tokens");
-    if(!vocab){ fprintf(stderr,"tokenizer.json: missing model.vocab\n"); exit(1); }
+    if(!vocab || vocab->t!=J_OBJ){ fprintf(stderr,"tokenizer.json: model.vocab must be an object\n"); exit(1); }
+    if(merges && merges->t!=J_ARR){ fprintf(stderr,"tokenizer.json: model.merges must be an array\n"); exit(1); }
+    if(added && added->t!=J_ARR){ fprintf(stderr,"tokenizer.json: added_tokens must be an array\n"); exit(1); }
     if(!merges||merges->len==0){ T->rankbpe=1; merges=NULL; }
 
     /* id massimo per dimensionare id2str. Gli id vengono da un tokenizer.json di
@@ -151,15 +174,11 @@ static void tok_load(Tok *T, const char *path){
      * (OOB write) e un added_token privo di "id"/"content" darebbe NULL-deref. */
     int maxid=0;
     for(int i=0;i<vocab->len;i++){
-        if(vocab->kids[i]->t!=J_NUM){ fprintf(stderr,"tokenizer.json: non-numeric vocab id at %d\n",i); exit(1); }
-        int id=(int)vocab->kids[i]->num;
-        if(id<0){ fprintf(stderr,"tokenizer.json: negative vocab id %d\n",id); exit(1); }
+        int id=tk_checked_id(vocab->kids[i]);
         if(id>maxid)maxid=id; }
     if(added) for(int i=0;i<added->len;i++){
         jval *ji=json_get(added->kids[i],"id");
-        if(!ji||ji->t!=J_NUM){ fprintf(stderr,"tokenizer.json: added_token missing numeric id\n"); exit(1); }
-        int id=(int)ji->num;
-        if(id<0){ fprintf(stderr,"tokenizer.json: negative added id %d\n",id); exit(1); }
+        int id=tk_checked_id(ji);
         if(id>maxid)maxid=id; }
     /* an id near INT_MAX would overflow n_ids=maxid+1 (UB) and calloc multi-GB */
     if(maxid > (1<<21)){ fprintf(stderr,"tokenizer.json: implausible max vocab id %d\n",maxid); exit(1); }
@@ -218,12 +237,24 @@ static void tok_load(Tok *T, const char *path){
      * case-category classes (\p{Lu}...) which cl100k does not use */
     jval *pt=json_get(root,"pre_tokenizer");
     if(pt){
+        /* No Split at all, just ByteLevel with use_regex (the default): HF runs
+         * the original GPT-2 regex, not cl100k. OLMoE's tokenizer.json is this. */
+        jval *pty=json_get(pt,"type");
+        if(pty && pty->t==J_STR && pty->str && !strcmp(pty->str,"ByteLevel")){
+            jval *ur=json_get(pt,"use_regex");
+            if(!ur || (ur->t==J_BOOL && ur->boolean)) T->gpt2=1;
+        }
         jval *ps=json_get(pt,"pretokenizers");
         if(ps&&ps->t==J_ARR) for(int i=0;i<ps->len;i++){
             jval *pat=json_get(ps->kids[i],"pattern");
             jval *rx=pat?json_get(pat,"Regex"):NULL;
             if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Lu}")) T->o200k=1;
             if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Han}")) T->kimi=1;
+            if(rx&&rx->t==J_STR&&strstr(rx->str,"|\\p{N}|")) T->ndig1=1;
+            /* DeepSeek's third Split: ASCII punctuation takes the ASCII letters after
+             * it, and marks join letter runs -- no other family writes either */
+            if(rx&&rx->t==J_STR&&strstr(rx->str,"][A-Za-z]+|")&&strstr(rx->str,"[\\p{L}\\p{M}]+"))
+                T->deepseek=1;
         }
     }
     T->json_root=root;
@@ -296,8 +327,8 @@ static void pretok_chunk(Tok *T, const unsigned char *p, int a, int b, int *out,
                 if(is_L(cp[j])){ while(j<n && is_L(cp[j])) j++; i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
             }
         }
-        /* 3) \p{N}{1,3} */
-        if(is_N(c)){ int j=i,k=0; while(j<n && is_N(cp[j]) && k<3){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        /* 3) \p{N}{1,3}, or \p{N} alone for Qwen (ndig1) */
+        if(is_N(c)){ int j=i,k=0,kmax=T->ndig1?1:3; while(j<n && is_N(cp[j]) && k<kmax){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
         /* 4) ' ?[^\s\p{L}\p{N}]+[\r\n]*' */
         {
             int j=i;
@@ -532,6 +563,161 @@ static void pretok_chunk_kimi(Tok *T, const unsigned char *p, int a, int b, int 
     free(cp); free(off);
 }
 
+/* ---------- pre-tokenizer GPT-2 (bare ByteLevel with use_regex: OLMoE, GPT-NeoX) ----------
+ * The original GPT-2 pattern, which HF applies when the pre_tokenizer is a
+ * ByteLevel with use_regex=true and no Split in front of it:
+ *   's|'t|'re|'ve|'m|'ll|'d | ?\p{L}+ | ?\p{N}+ | ?[^\s\p{L}\p{N}]+ | \s+(?!\S) | \s+
+ * It differs from cl100k in every rule: the contractions are case-sensitive,
+ * letters and digits take ONE optional leading space (not any non-letter),
+ * digit runs are unbounded, the punctuation run has no newline tail, and
+ * there is no \s*[\r\n]+ rule. Measured on OLMoE against `tokenizers`:
+ * 1560/1708 cases identical under the cl100k rules, every miss a " 4" /
+ * " 20"-style number or a non-space prefix glued to a word. */
+static void pretok_chunk_gpt2(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
+    int nb=b-a; if(nb<=0) return;
+    uint32_t *cp=malloc((nb+1)*sizeof(uint32_t)); int *off=malloc((nb+2)*sizeof(int)); int n=0;
+    for(int i=a;i<b;){ uint32_t c; int k=u8_next(p,b,i,&c); off[n]=i; cp[n]=c; n++; i+=k; }
+    off[n]=b;
+    int i=0;
+    while(i<n){
+        int start=i; uint32_t c=cp[i];
+        /* 1) 's|'t|'re|'ve|'m|'ll|'d  -- case-sensitive, unlike cl100k's (?i:) */
+        if(c=='\'' && i+1<n){
+            uint32_t d=cp[i+1];
+            if(i+2<n){ uint32_t d2=cp[i+2];
+                if((d=='r'&&d2=='e')||(d=='v'&&d2=='e')||(d=='l'&&d2=='l')){ i+=3; bpe_piece(T,p,off[start],off[i],out,no,max); continue; } }
+            if(d=='s'||d=='t'||d=='m'||d=='d'){ i+=2; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        }
+        /* 2) ' ?\p{L}+'  3) ' ?\p{N}+'  4) ' ?[^\s\p{L}\p{N}]+' : one optional space, then a run of one class */
+        {
+            int j=i; if(c==' ' && j+1<n) j++;
+            uint32_t d=cp[j];
+            if(is_L(d)){ while(j<n && is_L(cp[j])) j++; i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+            if(is_N(d)){ while(j<n && is_N(cp[j])) j++; i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+            if(!is_S(d)){ while(j<n && !is_S(cp[j]) && !is_L(cp[j]) && !is_N(cp[j])) j++; i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        }
+        /* 5) \s+(?!\S): a run followed by a non-space keeps its last char for the
+         * next piece (which takes it as its optional space); at the end of the
+         * input the whole run. 6) \s+: a single whitespace before a non-space. */
+        {
+            int r=i; while(r<n && is_S(cp[r])) r++;
+            if(r>i){ int end=(r<n)? r-1 : r; if(end<=i) end=i+1; i=end; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        }
+        i++;  /* unreachable: every codepoint is a letter, a digit, whitespace or none of them */
+        bpe_piece(T,p,off[start],off[i],out,no,max);
+    }
+    free(cp); free(off);
+}
+
+/* ---------- pre-tokenizer DeepSeek V4 / V4.1 ----------
+ * tokenizer.json chains three Splits, all "Isolated", each one applied to every piece the
+ * one before produced, then a ByteLevel without its own regex:
+ *   1. \p{N}{1,3}
+ *   2. [一-龥぀-ゟ゠-ヿ]+
+ *   3. [!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+
+ *      | [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
+ *      |  ?[\p{P}\p{S}]+[\r\n]*
+ *      | \s*[\r\n]+ | \s+(?!\S) | \s+
+ * Isolated keeps whatever a Split does not match as a piece of its own, so a digit group
+ * never joins a letter and a CJK run never takes the space before it.
+ * It is not cl100k, which this tokenizer used to be read as. There are no English
+ * contractions: the apostrophe takes the ASCII letters after it, so "1956'da" is 195|6|'da
+ * where cl100k made it 195|6|'d|a -- every Turkish suffix after an apostrophe that starts
+ * with d, s, t or m came out as a split the model never saw (#1772). Marks join letter
+ * runs, and the punctuation rule is \p{P}\p{S} instead of "neither space, letter nor
+ * number". */
+static int ds_ascii_punct(uint32_t c){
+    return (c>=0x21&&c<=0x2F)||(c>=0x3A&&c<=0x40)||(c>=0x5B&&c<=0x60)||(c>=0x7B&&c<=0x7E);
+}
+static int ds_ascii_alpha(uint32_t c){ return (c>='A'&&c<='Z')||(c>='a'&&c<='z'); }
+static int ds_cjk(uint32_t c){
+    return (c>=0x4E00&&c<=0x9FA5)||(c>=0x3040&&c<=0x309F)||(c>=0x30A0&&c<=0x30FF);
+}
+static int ds_lm(uint32_t c){ return is_L(c)||is_Mk(c); }
+static int ds_ps(uint32_t c){ return is_Pu(c)||is_Sy(c); }
+
+/* The third Split at position i of the piece [i, e): the end of the match, -1 if none of
+ * the alternatives matches here. Alternatives in order, as the regex engine tries them. */
+static int ds_match(const uint32_t *cp, int i, int e){
+    uint32_t c=cp[i];
+    /* [ASCII punctuation][A-Za-z]+ */
+    if(ds_ascii_punct(c) && i+1<e && ds_ascii_alpha(cp[i+1])){
+        int j=i+1; while(j<e && ds_ascii_alpha(cp[j])) j++; return j;
+    }
+    /* [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+ -- the optional prefix first, then without */
+    if(c!='\r' && c!='\n' && !is_L(c) && !ds_ps(c) && i+1<e && ds_lm(cp[i+1])){
+        int j=i+1; while(j<e && ds_lm(cp[j])) j++; return j;
+    }
+    if(ds_lm(c)){ int j=i; while(j<e && ds_lm(cp[j])) j++; return j; }
+    /*  ?[\p{P}\p{S}]+[\r\n]* */
+    {
+        int j=-1;
+        if(c==' ' && i+1<e && ds_ps(cp[i+1])) j=i+1;
+        else if(ds_ps(c)) j=i;
+        if(j>=0){
+            while(j<e && ds_ps(cp[j])) j++;
+            while(j<e && (cp[j]=='\r'||cp[j]=='\n')) j++;
+            return j;
+        }
+    }
+    /* \s*[\r\n]+ reaches the last newline of the whitespace run; \s+(?!\S) stops one short
+     * of a following non-space, unless that leaves nothing; \s+ takes the run */
+    {
+        int r=i; while(r<e && is_S(cp[r])) r++;
+        if(r>i){
+            int last=-1;
+            for(int j=i;j<r;j++) if(cp[j]=='\r'||cp[j]=='\n') last=j;
+            if(last>=0) return last+1;
+            return (r<e && r-1>i) ? r-1 : r;
+        }
+    }
+    return -1;
+}
+
+/* The third Split over one piece: every match is a piece, and so is every run between
+ * matches (Isolated). */
+static void ds_split3(Tok *T, const unsigned char *p, const uint32_t *cp, const int *off,
+                      int s, int e, int *out, int *no, int max){
+    int i=s, pending=s;
+    while(i<e){
+        int j=ds_match(cp,i,e);
+        if(j<0){ i++; continue; }
+        if(pending<i) bpe_piece(T,p,off[pending],off[i],out,no,max);
+        bpe_piece(T,p,off[i],off[j],out,no,max);
+        i=pending=j;
+    }
+    if(pending<e) bpe_piece(T,p,off[pending],off[e],out,no,max);
+}
+
+/* The second Split: CJK runs apart from the rest, and both through the third. */
+static void ds_split2(Tok *T, const unsigned char *p, const uint32_t *cp, const int *off,
+                      int s, int e, int *out, int *no, int max){
+    int i=s;
+    while(i<e){
+        int j=i, cjk=ds_cjk(cp[i]);
+        while(j<e && ds_cjk(cp[j])==cjk) j++;
+        ds_split3(T,p,cp,off,i,j,out,no,max);
+        i=j;
+    }
+}
+
+static void pretok_chunk_deepseek(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
+    int nb=b-a; if(nb<=0) return;
+    uint32_t *cp=malloc((nb+1)*sizeof(uint32_t)); int *off=malloc((nb+2)*sizeof(int)); int n=0;
+    for(int i=a;i<b;){ uint32_t c; int k=u8_next(p,b,i,&c); off[n]=i; cp[n]=c; n++; i+=k; }
+    off[n]=b;
+    /* the first Split: groups of up to three numbers, left to right, each its own piece */
+    int i=0;
+    while(i<n){
+        int j=i;
+        if(is_N(cp[i])){ while(j<n && is_N(cp[j]) && j-i<3) j++; }
+        else { while(j<n && !is_N(cp[j])) j++; }
+        ds_split2(T,p,cp,off,i,j,out,no,max);
+        i=j;
+    }
+    free(cp); free(off);
+}
+
 /* ---------- encode: testo -> id (split sugli added token, poi pretok+BPE) ---------- */
 static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
     const unsigned char *p=(const unsigned char*)text; int no=0; int i=0;
@@ -546,7 +732,9 @@ static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
         }
         int chunk_end = (hitpos<0) ? len : hitpos;
         if(chunk_end>i){
-            if(T->kimi)       pretok_chunk_kimi(T,p,i,chunk_end,out,&no,max);
+            if(T->gpt2)       pretok_chunk_gpt2(T,p,i,chunk_end,out,&no,max);
+            else if(T->deepseek) pretok_chunk_deepseek(T,p,i,chunk_end,out,&no,max);
+            else if(T->kimi)  pretok_chunk_kimi(T,p,i,chunk_end,out,&no,max);
             else if(T->o200k) pretok_chunk_o200k(T,p,i,chunk_end,out,&no,max);
             else              pretok_chunk(T,p,i,chunk_end,out,&no,max);
         }

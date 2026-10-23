@@ -105,6 +105,8 @@
             #    defers to a future `make install` that stages them itself.
             [ -e "$out/lib/colibri/v4_dsml.py" ] || \
               install -m 644 c/v4_dsml.py "$out/lib/colibri/"
+            [ -e "$out/lib/colibri/v41_dsml.py" ] || \
+              install -m 644 c/v41_dsml.py "$out/lib/colibri/"
             [ -e "$out/lib/colibri/tools/iq3xxs_grid.json" ] || \
               install -m 644 c/tools/iq3xxs_grid.json "$out/lib/colibri/tools/"
 

@@ -20,6 +20,7 @@ class ClusterRegistry:
     def __init__(self, stale_after=30.0):
         self.stale_after = float(stale_after)
         self._nodes = {}
+        self._last_seen = {}
         self._lock = threading.Lock()
 
     def register(self, node):
@@ -33,10 +34,17 @@ class ClusterRegistry:
         role = str(node["role"])
         if role not in ("expert", "dense", "coordinator"):
             raise ValueError("role must be expert, dense, or coordinator")
+        # The registry keys by str(node_id) and heartbeat looks it up the same
+        # way, so a numeric node_id has always registered. Store the string in
+        # the record too, or snapshot() sorts it against a string node_id and
+        # every topology/health request dies with a TypeError.
+        node_id = str(node["node_id"])
         record = dict(node)
-        record.update(protocol_version=PROTOCOL_VERSION, port=port, last_seen=time.time())
+        record.update(node_id=node_id, protocol_version=PROTOCOL_VERSION, port=port,
+                      last_seen=time.time())
         with self._lock:
-            self._nodes[str(node["node_id"])] = record
+            self._nodes[node_id] = record
+            self._last_seen[node_id] = time.monotonic()
         return record
 
     def heartbeat(self, node_id):
@@ -45,13 +53,14 @@ class ClusterRegistry:
             if node is None:
                 raise KeyError(node_id)
             node["last_seen"] = time.time()
+            self._last_seen[str(node_id)] = time.monotonic()
             return dict(node)
 
     def snapshot(self):
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
-            nodes = [dict(node) for node in self._nodes.values()
-                     if now - node["last_seen"] <= self.stale_after]
+            nodes = [dict(node) for node_id, node in self._nodes.items()
+                     if now - self._last_seen[node_id] <= self.stale_after]
         nodes.sort(key=lambda node: (node["role"], node["node_id"]))
         return {"protocol_version": PROTOCOL_VERSION, "nodes": nodes}
 

@@ -65,12 +65,30 @@ else ifeq ($(UNAME_S),Darwin)
 # ignored). No -march: NEON is baseline on arm64 and the per-feature gates in
 # the sources do the rest. Mirrors the parent Makefile's Darwin block.
 CC = clang
+# An OMPDIR from the command line survives the assignments below; one from the
+# environment would be overwritten by them. Both are the user's choice: record
+# that first, and probe nothing for it.
+OMP_EXPLICIT := $(filter command line environment,$(origin OMPDIR))
+ifeq ($(OMP_EXPLICIT),)
 OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
+ifeq ($(OMPDIR),)
+OMPDIR := $(firstword $(wildcard /opt/homebrew/opt/libomp /usr/local/opt/libomp))
+endif
+endif
 ifneq ($(and $(OMPDIR),$(wildcard $(OMPDIR)/include/omp.h),$(wildcard $(OMPDIR)/lib/libomp.*)),)
-OMPC = -Xclang -fopenmp -I$(OMPDIR)/include
-OMPL = -L$(OMPDIR)/lib -lomp
+OMPINC := $(OMPDIR)/include
+OMPLIB := $(OMPDIR)/lib
+else ifeq ($(OMP_EXPLICIT),)
+ifneq ($(and $(wildcard /opt/local/include/libomp/omp.h),$(wildcard /opt/local/lib/libomp/libomp.*)),)
+OMPINC := /opt/local/include/libomp
+OMPLIB := /opt/local/lib/libomp
+endif
+endif
+ifneq ($(OMPINC),)
+OMPC = -Xclang -fopenmp -I$(OMPINC)
+OMPL = -L$(OMPLIB) -lomp
 else
-$(warning libomp not found: building deepseek_v4 single-threaded. brew install libomp)
+$(warning libomp not found: building deepseek_v4 single-threaded. brew install libomp (or port install libomp))
 OMPC =
 OMPL =
 endif
@@ -194,19 +212,93 @@ LDFLAGS += -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib64/stubs -Wl,-rpath,$(CUDA_HOM
 endif
 endif
 
+# ---- Vulkan (opt-in): VK=1 ---------------------------------------------------
+# The parent Makefile's VK=1, for this engine: -DCOLI_VULKAN, the backend object
+# and the SPIR-V shaders it loads at run time (COLI_VK_SHADERS, else shaders/ next
+# to the binary). `make deepseek-v4 VK=1` in the parent reaches here through
+# MAKEFLAGS. The object has its own name because the parent builds
+# backend_vulkan.o with its own CFLAGS while these carry -flto and the units'
+# flags stamp: one file written by two builds is #1702 again. Independent of
+# CUDA=1, whose tier keeps running first when both are built. vk_tier_v4.o is the
+# routed-expert tier (vk_tier.c) under the same rule, and expert_act*.spv are its
+# shaders (expert_act_v4.spv: DeepSeek V4's activation).
+VK ?= 0
+GLSLC ?= glslc
+V4_VK_OBJ =
+V4_VK_SPV =
+ifeq ($(VK),1)
+CFLAGS += -DCOLI_VULKAN
+# As in the parent: the loader is opened at run time (vk_load.h), never linked.
+ifeq ($(IS_WIN),)
+LDFLAGS += -ldl
+endif
+V4_VK_OBJ = backend_vulkan_v4.o vk_tier_v4.o
+V4_VK_SPV = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \
+	shaders/attention_absorb.spv shaders/rmsnorm.spv \
+	shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv \
+	shaders/expert_act.spv shaders/expert_act_v4.spv
+# the dense chain (vk_chain.c, deepseek_v4_chain.h: COLI_VK_CHAIN) and its shaders
+V4_VK_OBJ += vk_chain_v4.o
+V4_VK_SPV += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv \
+	shaders/chain_dnconv.spv shaders/chain_dnrec.spv shaders/chain_ew.spv \
+	shaders/chain_qsa.spv shaders/chain_ple.spv shaders/chain_gemv.spv \
+	shaders/chain_mla.spv shaders/chain_hgemv.spv shaders/chain_dsa.spv \
+	shaders/chain_kda.spv shaders/chain_mhc.spv shaders/chain_dsv4.spv
+endif
+
 include Makefile.deepseek-v4.units
 
 TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
 V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
 V4_BATCH_TEST_OBJ = COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
-V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ)
+V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ) $(V4_VK_OBJ)
 REGISTRY_OBJ = expert_store_registry.o
 V4_SERVE_TEST := tests/test_v4_serve_framing$(if $(IS_WIN),.exe,)
 V4_SERVE_TEST_OBJS := $(filter-out COLI_V4_UNIT_GENERATE_STATS.o,$(V4_OBJS))
 
+# The objects are named after the unit, not after the flags they were built
+# with, and three builds share them: this engine (CUDA=1 adds
+# -DCOLI_V4_GPU_TIER), the parent's test-c (no GPU tier) and its test-asan
+# (EXTRA_CFLAGS). Timestamps cannot tell those apart, so make would report
+# "is up to date" and link one build's objects into another (#1702). The
+# compiler line is recorded here and rewritten only when it changes; every
+# object compiled with $(CFLAGS) depends on it. Same scheme as git's GIT-CFLAGS.
+V4_FLAGS_STAMP = deepseek_v4.cflags
+V4_TRACK_FLAGS = $(subst ','\'',$(CC) $(CFLAGS))
+$(V4_FLAGS_STAMP): FORCE
+	@flags='$(V4_TRACK_FLAGS)'; \
+	if test x"$$flags" != x"`cat $@ 2>/dev/null`"; then \
+		test -f $@ && echo "deepseek-v4: build flags changed, rebuilding the units" >&2; \
+		echo "$$flags" > $@; \
+	fi
+FORCE:
+
+# The same defect one level down. backend_cuda_dsv4.o is named after its source,
+# but what it contains comes from $(NVCC) $(V4_NVCCFLAGS): -arch=$(CUDA_ARCH)
+# (or the -gencode preset), the -DCOLI_DSV4_NO_TC guard and the DeepGEMM defines
+# all arrive through it. $(CFLAGS) above does not cover it, so without this:
+#
+#   make -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 CUDA_ARCH=sm_86
+#   make -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 CUDA_ARCH=sm_80
+#   -> no output at all, exit 0
+#
+# and the engine that asked for sm_80 links the sm_86 object, in silence. The
+# parent Makefile keeps the same class of state for the same reason, CUDA_ARCH
+# included, in .build-config (#306). Same scheme as $(V4_FLAGS_STAMP) above, so
+# a dry run (make -n) or a clean writes nothing: the file is only touched by the
+# recipe, and only when the command really changed.
+V4_CUDA_FLAGS_STAMP = deepseek_v4.cudaflags
+V4_TRACK_CUDA_FLAGS = $(subst ','\'',$(NVCC) $(V4_NVCCFLAGS))
+$(V4_CUDA_FLAGS_STAMP): FORCE
+	@flags='$(V4_TRACK_CUDA_FLAGS)'; \
+	if test x"$$flags" != x"`cat $@ 2>/dev/null`"; then \
+		test -f $@ && echo "deepseek-v4: CUDA build flags changed, rebuilding backend_cuda_dsv4.o" >&2; \
+		echo "$$flags" > $@; \
+	fi
+
 .PHONY: deepseek-v4 deepseek-v4-objs deepseek-v4-clean deepseek-v4-test-objs \
-	deepseek-v4-test-registry print-v4-objs
+	deepseek-v4-test-registry print-v4-objs FORCE
 deepseek-v4: $(V4_BINARY)
 
 # Build just the amalgamation unit + registry objects (no link). External
@@ -219,29 +311,46 @@ deepseek-v4-objs: $(V4_OBJS)
 print-v4-objs:
 	@echo $(V4_OBJS)
 
-$(V4_BINARY): $(V4_OBJS)
+$(V4_BINARY): $(V4_OBJS) $(V4_VK_SPV)
 	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
+
+# VK=1: the Vulkan backend compiled with this engine's flags, and the shaders.
+backend_vulkan_v4.o: backend_vulkan.c backend_vulkan.h $(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
+vk_tier_v4.o: vk_tier.c vk_tier.h backend_vulkan.h tier.h $(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) -c vk_tier.c -o $@
+vk_chain_v4.o: vk_chain.c vk_chain.h vk_alloc.h backend_vulkan.h $(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) -c vk_chain.c -o $@
+shaders/%.spv: shaders/%.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+# As in the parent: an older glslc keeps the committed cooperative-matrix .spv.
+shaders/qmatmul_coop.spv: shaders/qmatmul_coop.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@ || { [ -f $@ ] && touch $@ && \
+	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
 
 # Pluggable expert-store backend registry (standalone; not a deepseek_v4.c unit).
 # Linked into the binary so the engine can dispatch COLI_EXPERT_STORE backends.
-$(REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h expert_store.h
+$(REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h expert_store.h \
+	$(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -c expert_store_registry.c -o $@
 
 $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
-	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h \
-	route_trace.h \
+	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
+	route_trace.h vk_tier.h deepseek_v4_chain.h vk_chain.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
-	native_quant_fp4_rows16.h expert_store_registry.h
+	native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
 
 $(V4_HOT_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
-		st.h json.h compat.h tensor.h quant.h route_trace.h \
-		native_quant.h native_quant_fp4_rows16.h expert_store_registry.h
+		st.h json.h compat.h tensor.h quant.h fp8_format.h route_trace.h sse41_kernels.h \
+		native_quant.h native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS \
 		-DCOLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16 -c deepseek_v4.c -o $@
 
 $(V4_BATCH_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
-		tensor.h quant.h native_quant.h native_quant_batch.h
+		tensor.h quant.h fp8_format.h native_quant.h native_quant_batch.h $(V4_FLAGS_STAMP) sse41_kernels.h
 	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS \
 		-DCOLI_V4_UNIT_NATIVE_QUANT_BATCH -c deepseek_v4.c -o $@
 
@@ -254,11 +363,12 @@ $(V4_SERVE_TEST): tests/test_v4_serve_framing.c deepseek_v4.c deepseek_v4.h \
 # The CUDA tier loader object. Compiled only on Windows, where it is appended
 # to V4_OBJS and resolves the MSVC-built coli_cuda_dsv4.dll at runtime. On
 # Linux it is empty so the engine links without it.
-backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h
+backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -c backend_loader_dsv4.c -o $@
 
 # Linux/macOS CUDA=1: the tier compiled straight into the engine.
-backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h $(V4_DEEPGEMM_DEP)
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h $(V4_DEEPGEMM_DEP) \
+	$(V4_CUDA_FLAGS_STAMP)
 	"$(NVCC)" $(V4_NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
 
 ifneq ($(DEEPGEMM_STAMP),)
@@ -279,4 +389,5 @@ test_expert_store_registry: test_expert_store_registry.c expert_store_registry.c
 deepseek-v4-clean:
 	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_HOT_TEST_OBJ) \
 		$(V4_BATCH_TEST_OBJ) \
-		$(V4_SERVE_TEST) test_expert_store_registry
+		$(V4_SERVE_TEST) test_expert_store_registry $(V4_FLAGS_STAMP) \
+		$(V4_CUDA_FLAGS_STAMP) backend_vulkan_v4.o vk_tier_v4.o vk_chain_v4.o

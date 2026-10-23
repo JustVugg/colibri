@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "hypothesis": "Running each GLM-5.3 prefill block through the dense matrices once (S rows) instead of once per token cuts coordinator prefill time without changing any token's result.",
+  "commit": "e3b6756fc6a6b9abc39714dbe2d8ccf4c0f5dab9",
+  "model": "GLM-5.3-Flash (a community abliterated fine-tune; same architecture and tensor shapes), Colibri int4-gs64 streaming container, 195.8 GB",
+  "command": "make -C c glm53; OMP_NUM_THREADS=4 COLI_CLUSTER_WEIGHTS=52,48 CLUSTER_WORKERS=<worker-a>:9100,<worker-b>:9100 GLM53_VERBOSE=1 ./glm53 --model <model> --prompt \"$(cat prompt.txt)\" --greedy 1 ; tok_s = 241 / (prefill seconds printed on stderr)",
+  "prompt_hash": "50d8aaa383c093165cd3913e2051f340bb7cd2dc1312f7cc28c76e9f2dd02179",
+  "hardware": {
+    "cpu": "coordinator Intel i5-8500 (6C/6T); two expert workers Intel i5-4570 (4C/4T)",
+    "ram": "coordinator 31 GB DDR4 dual channel; workers 15 GB each",
+    "storage": "model on local SATA SSDs, ext4: coordinator Patriot P3 1 TB (~144 MB/s measured), workers ADATA SU650 (~371 MiB/s probe) and KingFast (~505 MiB/s probe)",
+    "os": "coordinator Linux 7.1.13-hardened, gcc 16.2.1; workers Linux 7.1.8-arch / 7.0.0 Ubuntu, worker binary built with gcc 16 -march=haswell-native; Tailscale TCP between hosts; SCHED_IDLE background miners on all hosts"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "coordinator_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "GLM-5.3-Flash, int4-gs64 Colibri container",
+      "prompt_tokens": 241,
+      "greedy": 1,
+      "OMP_NUM_THREADS": 4,
+      "GLM53_PREFILL_CHUNK": 128,
+      "expert_workers": "2 x glm53 EXPERT_WORKER, binary 7c986868 (fixed)",
+      "COLI_CLUSTER_WEIGHTS": "52,48",
+      "coordinator_build": "d762a9dc (dev + GLM-5.3 cluster workers + worker read-ahead, per-token dense)"
+    },
+    "samples": {
+      "tok_s": [
+        0.073979,
+        0.105716,
+        0.101611
+      ]
+    },
+    "median_tok_s": 0.101611,
+    "quality": {
+      "method": "teacher-forcing tokens byte-identical across all 7 runs (md5 de8dba3b5b94); tiny-fixture byte identity vs dev in tests/test_glm53_prefill_batch.py",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/glm53-batched-prefill-2026-09-27-raw.txt",
+      "sha256": "a041a1417769b058d38bff8a42265ec0cc9533a965cb5e4dd7bd2ab4673510f1"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "GLM-5.3-Flash, int4-gs64 Colibri container",
+      "prompt_tokens": 241,
+      "greedy": 1,
+      "OMP_NUM_THREADS": 4,
+      "GLM53_PREFILL_CHUNK": 128,
+      "expert_workers": "2 x glm53 EXPERT_WORKER, binary 7c986868 (fixed)",
+      "COLI_CLUSTER_WEIGHTS": "52,48",
+      "coordinator_build": "e3b6756f (d762a9dc + this change)"
+    },
+    "samples": {
+      "tok_s": [
+        0.127197,
+        0.158887,
+        0.149457
+      ]
+    },
+    "median_tok_s": 0.149457,
+    "quality": {
+      "method": "teacher-forcing tokens byte-identical across all 7 runs (md5 de8dba3b5b94); tiny-fixture byte identity vs dev in tests/test_glm53_prefill_batch.py",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/glm53-batched-prefill-2026-09-27-raw.txt",
+      "sha256": "a041a1417769b058d38bff8a42265ec0cc9533a965cb5e4dd7bd2ab4673510f1"
+    }
+  },
+  "outcome": "improvement"
+}

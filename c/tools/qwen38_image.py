@@ -129,6 +129,11 @@ def load_config(model_dir):
             settings["min_pixels"] = size["shortest_edge"]
         if "longest_edge" in size:
             settings["max_pixels"] = size["longest_edge"]
+        # The older Qwen2-VL spelling (MiMo-V2.6 ships it): the same window as
+        # top-level keys. `size` wins when both are there, as in the processor.
+        for key in ("min_pixels", "max_pixels"):
+            if key in raw:
+                settings.setdefault(key, raw[key])
     config = root / "config.json"
     if config.exists():
         vision = json.loads(config.read_text()).get("vision_config") or {}
@@ -169,6 +174,11 @@ def preprocess(source, model_dir=None, max_tokens=None):
         max_pixels = min(max_pixels, ceiling)
         min_pixels = min(min_pixels, max_pixels)
 
+    # The gateway hands over the bytes of a data: URI; Image.open would read
+    # them as a file name ("embedded null byte"), as glm53_image already knew.
+    if isinstance(source, (bytes, bytearray)):
+        import io
+        source = io.BytesIO(source)
     image = Image.open(source) if not hasattr(source, "mode") else source
     image = image.convert("RGB")
     width, height = image.size

@@ -7,7 +7,12 @@ last line of the turn.
 """
 import unittest
 
-from tests.test_inkling_prefix_serve import ENGINE, FIXTURE, MAXTOK, Engine, ensure_tokenizer
+try:
+    from tests.test_inkling_prefix_serve import ENGINE, FIXTURE, MAXTOK, Engine, ensure_tokenizer
+except ModuleNotFoundError as exc:
+    if exc.name != "tests.test_inkling_prefix_serve":
+        raise
+    from test_inkling_prefix_serve import ENGINE, FIXTURE, MAXTOK, Engine, ensure_tokenizer
 
 
 def read_until(engine, kind, limit=200):

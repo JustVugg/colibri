@@ -88,6 +88,17 @@ import json
 import os
 import sys
 
+# The notes and refusal details print U+2014, which a stdout in cp949 or cp932
+# (a redirected stdout on Korean or Japanese Windows) cannot encode: the print
+# raised, the E_INTERNAL fallback printed the same text and raised again, and
+# the verdict was lost. Escape what the encoding cannot hold, as CPython already
+# does on stderr; the encoding itself is left alone, so whoever reads this
+# output in that code page still can. A UTF-8 stdout is unaffected.
+try:
+    sys.stdout.reconfigure(errors="backslashreplace")
+except AttributeError:
+    pass
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rans_format as rf  # noqa: E402
 

@@ -1,0 +1,4 @@
+# Byte-exact production fixtures: hashes.json pins manifest.json by SHA-256,
+# so a CRLF checkout (Windows runners default to core.autocrlf=true) must not
+# rewrite them.
+*.json -text

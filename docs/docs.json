@@ -15,19 +15,19 @@
         "groups": [
           {
             "group": "Get started",
-            "pages": ["index", "quickstart"]
+            "pages": ["index", "quickstart", "AI_SETUP", "MCP_SERVER"]
           },
           {
             "group": "Serve models",
-            "pages": ["api-reference/overview", "api", "serve_protocol"]
+            "pages": ["api-reference/overview", "api", "systemone", "serve_protocol"]
           },
           {
             "group": "Model engines",
-            "pages": ["deepseek-v4", "kimi_k3", "qwen38", "qwen36", "inkling"]
+            "pages": ["deepseek-v4", "kimi_k3", "qwen38", "qwen36", "inkling", "mimo", "qwen-image", "laya", "gliner_decide", "clef"]
           },
           {
             "group": "Configure and tune",
-            "pages": ["SETTINGS", "ENVIRONMENT", "tuning", "CACHE_ROUTE"]
+            "pages": ["SETTINGS", "ENVIRONMENT", "tuning", "speculative", "CACHE_ROUTE"]
           },
           {
             "group": "Hardware backends",

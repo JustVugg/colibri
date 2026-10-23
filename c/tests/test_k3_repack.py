@@ -5,6 +5,7 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import types
@@ -185,6 +186,42 @@ class K3RepackResumeIntegrationTest(unittest.TestCase):
         before = index_path.read_bytes()
         self.run_main(1)
         self.assertEqual(index_path.read_bytes(), before)
+
+    def test_resume_survives_a_stdout_that_cannot_encode_its_messages(self):
+        """A resumed run prints `[ 1] exists — skipped (resume)` and a shard
+        still downloading prints `[ 3] SOURCE MISSING — skipped (rerun when
+        downloaded)`. On a Korean or Japanese Windows a redirected stdout is
+        encoded in cp949 or cp932, neither has U+2014, and the first of those
+        lines raised UnicodeEncodeError: the resume died on the first shard it
+        had already written, before the index was rebuilt. PYTHONIOENCODING
+        stands in for that code page, so this runs the same everywhere, and the
+        output is read back in it, the way such a caller would read it."""
+        self.run_main(1)
+        index_path = self.dst / "model.safetensors.index.json"
+        index_path.unlink()
+        # The resume and missing-source paths never touch numpy; stub it where
+        # the optional tooling is absent, as load_tool() does in-process.
+        runner = ("import runpy, sys, types\n"
+                  "try:\n    import numpy\n"
+                  "except ImportError:\n    sys.modules['numpy'] = types.ModuleType('numpy')\n"
+                  "sys.argv = sys.argv[1:]\n"
+                  "runpy.run_path(sys.argv[0], run_name='__main__')\n")
+        env = dict(os.environ, PYTHONIOENCODING="cp949")
+        result = subprocess.run(
+            [sys.executable, "-c", runner, str(TOOLS / "k3_repack.py"),
+             str(self.src), str(self.dst), "--shards", "1,3"],
+            capture_output=True, env=env)
+        out = result.stdout.decode("cp949")
+        err = result.stderr.decode("cp949", "backslashreplace")
+        self.assertNotIn("Traceback", err, msg=err)
+        self.assertEqual(result.returncode, 0, msg=out + err)
+        self.assertIn("[ 1] exists", out)
+        self.assertIn("skipped (resume)", out)
+        self.assertIn("[ 3] SOURCE MISSING", out)
+        self.assertIn("done:", out)
+        self.assertEqual(json.loads(index_path.read_text())["weight_map"],
+                         {"model.layers.1.input_layernorm.weight":
+                          "model-00001-of-000094.safetensors"})
 
 
 if __name__ == "__main__":

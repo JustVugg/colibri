@@ -1,0 +1,243 @@
+#version 450
+// Tiled GEMM twin of qmatmul.comp, for prefill-sized S:
+//   y[s,o] = sum_i x[s,i] * dequant(W[o,i])     (same fmt, layout and scales)
+// qmatmul.comp runs one GEMV per activation row, so every weight is fetched and
+// decoded S times. Here a workgroup owns a BM-output x BN-row tile of y and walks i
+// in BK-wide steps: each step decodes its BM weight rows into shared memory ONCE
+// and multiplies them against BN activation rows, staged in shared memory too, so a
+// weight is fetched ceil(S/BN) times and decoded once per tile.
+//   - both tiles keep i contiguous, wsh[m][i] and xsh[n][i], as vec4 quads with one
+//     quad of padding per row: the vec4 reads of 8 consecutive rows land on
+//     distinct banks, and the staging writes stay plain quad stores;
+//   - each thread accumulates a TM x TN block whose rows are strided by BM/TM and
+//     BN/TN, so neighbouring threads read neighbouring rows and store neighbouring
+//     outputs (coalesced y writes);
+//   - the grouped formats (4, 5, 7, 12, 13) fold their group scale into the weight as it
+//     enters shared memory, which frees the tile from group boundaries; the per-row
+//     formats (1, 2) multiply scale[o] at the end, as the GEMV does.
+// The tile shape is a set of specialization constants; backend_vulkan.c picks it, and
+// whether the next step's words are fetched during this step's products (PF): faster
+// for the narrow BN = 32 tile on the 780M, slower for the 64 x 64 one (registers).
+#extension GL_EXT_control_flow_attributes : require
+
+layout(constant_id = 0) const int BM = 64;    // outputs per tile
+layout(constant_id = 1) const int BN = 64;    // activation rows per tile
+layout(constant_id = 2) const int BK = 32;    // inputs per step, a multiple of 8
+layout(constant_id = 3) const int TM = 4;     // outputs per thread
+layout(constant_id = 4) const int TN = 4;     // activation rows per thread
+layout(local_size_x_id = 5) in;               // (BM/TM) * (BN/TN) threads
+layout(constant_id = 6) const bool PF = true; // fetch the next step during the products
+
+// One view of x: the expert batch binds it as a dynamic buffer, and SPIRV-Cross (under
+// MoltenVK's argument buffers) gives a dynamic buffer's offset to only one of its views.
+layout(std430, binding = 0) readonly buffer X4 { vec4  x4[]; };  // x[S*I], as quads
+layout(std430, binding = 1) readonly buffer W  { uint  w[]; };   // row o at o*rowWords
+layout(std430, binding = 1) readonly buffer W2 { uvec2 w2[]; };  // same buffer, pairs
+layout(std430, binding = 1) readonly buffer W4 { uvec4 w4[]; };  // same buffer, quads
+layout(std430, binding = 2) readonly buffer Sc { float scale[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int fmt;        // as qmatmul.comp: 1, 2, 4, 5, 7, 10, 11, 12, 13, 14
+    int S, I, O;
+    int rowWords;   // uint32 words per weight row
+    int gs;         // group size of fmt 4/7 (multiple of 8) and 12/13 (multiple of 4)
+} p;
+
+const int KQ  = BK / 4 + 1;          // quads per shared row, one of padding
+const int NTM = BM / TM, NTN = BN / TN;  // thread grid
+shared vec4 wsh[BM * KQ];
+shared vec4 xsh[BN * KQ];
+
+float i8(uint word, int lane) {
+    int b = int((word >> (uint(lane) * 8u)) & 0xffu);
+    if (b >= 128) b -= 256;
+    return float(b);
+}
+float i4(uint word, int lane) {
+    return float(int((word >> (uint(lane) * 4u)) & 0xfu) - 8);
+}
+float mx4(uint word, int lane) {     // e2m1, bit3 = sign (qmatmul.comp)
+    uint n = (word >> (uint(lane) * 4u)) & 0xfu;
+    const float lut[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    float v = lut[n & 7u];
+    return (n & 8u) != 0u ? -v : v;
+}
+float e4m3(uint word, int lane) {    // OCP E4M3-FN, arithmetic decode (qmatmul.comp)
+    uint b = (word >> (uint(lane) * 8u)) & 0xffu;
+    if ((b & 0x7fu) == 0x7fu) return uintBitsToFloat(0x7fc00000u);
+    uint e = (b >> 3) & 0xfu, m = b & 7u;
+    float v = e == 0u ? float(m) * 0.001953125 : ldexp(1.0 + float(m) * 0.125, int(e) - 7);
+    return (b & 0x80u) != 0u ? -v : v;
+}
+
+// One staging unit is 8 consecutive weights of a row. A step's units are fetched into
+// registers (with PF, before the previous step's products run, the loads in flight
+// during them) and decoded into shared memory after: fetch8 reads the words and group
+// scales, decode8 turns them into floats.
+//
+// fetch8: the words of weights k..k+7 of row o (k % 8 == 0, k < I) and their scales.
+// Words past the row's last input are never read: they belong to the next row, or
+// lie past the buffer for the last one. A lane past I decodes the row's zero padding
+// to a finite value and meets a zero activation, so it adds nothing.
+void fetch8(int o, int k, out uvec4 lo, out uvec4 hi, out vec2 sc) {
+    uint rb = uint(o) * uint(p.rowWords);
+    lo = uvec4(0u); hi = uvec4(0u); sc = vec2(0.0);
+    if (p.fmt == 1 || p.fmt == 12 || p.fmt == 13) {   // 4 bytes per word
+        if ((p.rowWords & 1) == 0) lo.xy = w2[(rb >> 1) + uint(k >> 3)];
+        else { lo.x = w[rb + uint(k >> 2)]; if (k + 4 < p.I) lo.y = w[rb + uint(k >> 2) + 1u]; }
+        if (k + 4 >= p.I) lo.y = 0u;
+        if (p.fmt != 1) {                        // gs % 4 == 0: a word never straddles
+            uint sb = uint(o) * uint((p.I + p.gs - 1) / p.gs);
+            sc.x = scale[sb + uint(k / p.gs)];
+            if (k + 4 < p.I) sc.y = scale[sb + uint((k + 4) / p.gs)];
+        }
+    } else if (p.fmt == 10) {                    // f32, one per word
+        if ((p.I & 7) == 0) { lo = w4[(rb + uint(k)) >> 2]; hi = w4[((rb + uint(k)) >> 2) + 1u]; }
+        else [[unroll]] for (int j = 0; j < 4; j++) {
+            if (k + j < p.I)     lo[j] = w[rb + uint(k + j)];
+            if (k + 4 + j < p.I) hi[j] = w[rb + uint(k + 4 + j)];
+        }
+    } else if (p.fmt == 11 || p.fmt == 14) {     // bf16, f16: two per word
+        if ((p.I & 7) == 0) lo = w4[(rb + uint(k >> 1)) >> 2];
+        else [[unroll]] for (int j = 0; j < 4; j++)
+            if (k + 2 * j < p.I) lo[j] = w[rb + uint((k >> 1) + j)];
+    } else if (p.fmt == 5) {                     // int3-g64: 16B low plane + 8B high plane
+        int g = k >> 6, j = k & 63;
+        lo.x = w[rb + uint(g * 6 + (j >> 4))] >> uint((j & 15) * 2);
+        lo.y = w[rb + uint(g * 6 + 4 + (j >> 5))] >> uint(j & 31);
+        sc.x = scale[uint(o) * uint((p.I + 63) >> 6) + uint(g)];
+    } else {                                     // nibbles: 2 int4, 4 grouped int4, 7 MXFP4
+        lo.x = w[rb + uint(k >> 3)];
+        if (p.fmt != 2)                          // gs % 8 == 0: the word is one group
+            sc.x = scale[uint(o) * uint((p.I + p.gs - 1) / p.gs) + uint(k / p.gs)];
+    }
+}
+
+// decode8: the 8 weights of a fetched unit, group scale folded in.
+void decode8(uvec4 a, uvec4 b, vec2 sc, out vec4 lo, out vec4 hi) {
+    if (p.fmt == 1) {
+        lo = vec4(i8(a.x, 0), i8(a.x, 1), i8(a.x, 2), i8(a.x, 3));
+        hi = vec4(i8(a.y, 0), i8(a.y, 1), i8(a.y, 2), i8(a.y, 3));
+    } else if (p.fmt == 12) {
+        lo = vec4(e4m3(a.x, 0), e4m3(a.x, 1), e4m3(a.x, 2), e4m3(a.x, 3)) * sc.x;
+        hi = vec4(e4m3(a.y, 0), e4m3(a.y, 1), e4m3(a.y, 2), e4m3(a.y, 3)) * sc.y;
+    } else if (p.fmt == 13) {                    // int8, one scale per gs inputs
+        lo = vec4(i8(a.x, 0), i8(a.x, 1), i8(a.x, 2), i8(a.x, 3)) * sc.x;
+        hi = vec4(i8(a.y, 0), i8(a.y, 1), i8(a.y, 2), i8(a.y, 3)) * sc.y;
+    } else if (p.fmt == 10) {
+        lo = uintBitsToFloat(a); hi = uintBitsToFloat(b);
+    } else if (p.fmt == 11) {                    // low half = even column
+        lo = vec4(uintBitsToFloat(a.x << 16), uintBitsToFloat(a.x & 0xffff0000u),
+                  uintBitsToFloat(a.y << 16), uintBitsToFloat(a.y & 0xffff0000u));
+        hi = vec4(uintBitsToFloat(a.z << 16), uintBitsToFloat(a.z & 0xffff0000u),
+                  uintBitsToFloat(a.w << 16), uintBitsToFloat(a.w & 0xffff0000u));
+    } else if (p.fmt == 14) {                    // f16, low half = even column
+        lo = vec4(unpackHalf2x16(a.x), unpackHalf2x16(a.y));
+        hi = vec4(unpackHalf2x16(a.z), unpackHalf2x16(a.w));
+    } else if (p.fmt == 5) {                     // value = 2 low-plane bits | high bit << 2, - 4
+        float v[8];
+        [[unroll]] for (int t = 0; t < 8; t++)
+            v[t] = float(int(((a.x >> uint(2 * t)) & 3u) | (((a.y >> uint(t)) & 1u) << 2)) - 4);
+        lo = vec4(v[0], v[1], v[2], v[3]) * sc.x; hi = vec4(v[4], v[5], v[6], v[7]) * sc.x;
+    } else if (p.fmt == 7) {
+        lo = vec4(mx4(a.x, 0), mx4(a.x, 1), mx4(a.x, 2), mx4(a.x, 3)) * sc.x;
+        hi = vec4(mx4(a.x, 4), mx4(a.x, 5), mx4(a.x, 6), mx4(a.x, 7)) * sc.x;
+    } else {
+        lo = vec4(i4(a.x, 0), i4(a.x, 1), i4(a.x, 2), i4(a.x, 3));
+        hi = vec4(i4(a.x, 4), i4(a.x, 5), i4(a.x, 6), i4(a.x, 7));
+        if (p.fmt == 4) { lo *= sc.x; hi *= sc.x; }
+    }
+}
+
+const int NT = NTM * NTN;
+const int WU = (BM * (BK / 8) + NT - 1) / NT;    // weight units per thread and step
+const int XU = (BN * (BK / 4) + NT - 1) / NT;    // activation quads per thread and step
+uvec4 rwa[WU], rwb[WU]; vec2 rws[WU]; vec4 rx[XU];
+
+float x_at(uint i) { return x4[i >> 2][i & 3u]; }   // x[i], one float of its quad
+
+// Fetch step k0 of this tile into registers (zeros past O, S and I).
+void fetch_step(int tid, int o0, int s0, int k0) {
+    [[unroll]] for (int r = 0; r < WU; r++) {
+        int u = tid + r * NT, m = u / (BK / 8), k = k0 + (u % (BK / 8)) * 8;
+        rwa[r] = uvec4(0u); rwb[r] = uvec4(0u); rws[r] = vec2(0.0);
+        if (u < BM * (BK / 8) && o0 + m < p.O && k < p.I) fetch8(o0 + m, k, rwa[r], rwb[r], rws[r]);
+    }
+    [[unroll]] for (int r = 0; r < XU; r++) {
+        int u = tid + r * NT, n = u / (BK / 4), s = s0 + n, k = k0 + (u % (BK / 4)) * 4;
+        vec4 v = vec4(0.0);
+        if (u < BN * (BK / 4) && s < p.S && k < p.I) {
+            uint b = uint(s) * uint(p.I) + uint(k);
+            if ((p.I & 3) == 0) v = x4[b >> 2];  // rows of x start on a quad
+            else {
+                v.x = x_at(b);
+                if (k + 1 < p.I) v.y = x_at(b + 1u);
+                if (k + 2 < p.I) v.z = x_at(b + 2u);
+                if (k + 3 < p.I) v.w = x_at(b + 3u);
+            }
+        }
+        rx[r] = v;
+    }
+}
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x);
+    int tm = tid % NTM, tn = tid / NTM;
+    int o0 = int(gl_WorkGroupID.x) * BM, s0 = int(gl_WorkGroupID.y) * BN;
+
+    float acc[TM][TN];
+    [[unroll]] for (int i = 0; i < TM; i++)
+        [[unroll]] for (int j = 0; j < TN; j++) acc[i][j] = 0.0;
+
+    if (PF) fetch_step(tid, o0, s0, 0);
+    for (int k0 = 0; k0 < p.I; k0 += BK) {
+        if (!PF) fetch_step(tid, o0, s0, k0);
+        // decode the fetched step into shared memory
+        [[unroll]] for (int r = 0; r < WU; r++) {
+            int u = tid + r * NT;
+            if (u < BM * (BK / 8)) {
+                int m = u / (BK / 8), kq = (u % (BK / 8)) * 2;
+                vec4 lo, hi;
+                decode8(rwa[r], rwb[r], rws[r], lo, hi);
+                wsh[m * KQ + kq] = lo;
+                wsh[m * KQ + kq + 1] = hi;
+            }
+        }
+        [[unroll]] for (int r = 0; r < XU; r++) {
+            int u = tid + r * NT;
+            if (u < BN * (BK / 4)) xsh[(u / (BK / 4)) * KQ + u % (BK / 4)] = rx[r];
+        }
+        barrier();
+        if (PF && k0 + BK < p.I) fetch_step(tid, o0, s0, k0 + BK);
+        // The step's BK products sum into a fresh partial that then joins acc: blocked
+        // summation keeps the rounding error near (BK + I/BK) ulps instead of I, the
+        // same order as the GEMV's per-lane sums plus subgroup tree.
+        float part[TM][TN];
+        [[unroll]] for (int i = 0; i < TM; i++)
+            [[unroll]] for (int j = 0; j < TN; j++) part[i][j] = 0.0;
+        [[unroll]] for (int q = 0; q < BK / 4; q++) {
+            vec4 a[TM], b[TN];
+            [[unroll]] for (int i = 0; i < TM; i++) a[i] = wsh[(tm + i * NTM) * KQ + q];
+            [[unroll]] for (int j = 0; j < TN; j++) b[j] = xsh[(tn + j * NTN) * KQ + q];
+            [[unroll]] for (int i = 0; i < TM; i++)
+                [[unroll]] for (int j = 0; j < TN; j++)
+                    part[i][j] = fma(a[i].w, b[j].w, fma(a[i].z, b[j].z,
+                                 fma(a[i].y, b[j].y, fma(a[i].x, b[j].x, part[i][j]))));
+        }
+        [[unroll]] for (int i = 0; i < TM; i++)
+            [[unroll]] for (int j = 0; j < TN; j++) acc[i][j] += part[i][j];
+        barrier();
+    }
+
+    bool perrow = p.fmt == 1 || p.fmt == 2;
+    [[unroll]] for (int i = 0; i < TM; i++) {
+        int o = o0 + tm + i * NTM;
+        if (o >= p.O) continue;
+        float sc = perrow ? scale[o] : 1.0;
+        [[unroll]] for (int j = 0; j < TN; j++) {
+            int s = s0 + tn + j * NTN;
+            if (s < p.S) y[uint(s) * uint(p.O) + uint(o)] = acc[i][j] * sc;
+        }
+    }
+}

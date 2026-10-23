@@ -37,6 +37,53 @@ int main(void){
         for(int j=0;j<m.c.kv_lora;j++)
             CHECK(m.Lc[i][(int64_t)p*m.c.kv_lora+j]==fill(i,p,j), "v1 Lc[%d] p%d j%d", i,p,j);
 
+#ifndef _WIN32
+    /* A real failed data flush must not publish an unwritten tail or suppress
+     * the next save. Keep two committed rows, then deny extending the file. */
+    if(m.kv->disk_fp){ fclose(m.kv->disk_fp); m.kv->disk_fp=NULL; }
+    kv_disk_truncate(&m,2);
+    int64_t committed_bytes=40+2*kv_rec_bytes(&m);
+    CHECK(truncate(PATH,(off_t)committed_bytes)==0,"truncate test fixture");
+    struct rlimit previous, limited;
+    CHECK(getrlimit(RLIMIT_FSIZE,&previous)==0,"read file-size limit");
+    limited=previous; limited.rlim_cur=(rlim_t)committed_bytes;
+    void (*previous_signal)(int)=signal(SIGXFSZ,SIG_IGN);
+    CHECK(setrlimit(RLIMIT_FSIZE,&limited)==0,"set file-size limit");
+    kv_disk_append(&m,hist,NP);
+    CHECK(setrlimit(RLIMIT_FSIZE,&previous)==0,"restore file-size limit");
+    signal(SIGXFSZ,previous_signal);
+    CHECK(m.kv->disk_nrec==2,"failed append must retain committed nrec=2, got %d",m.kv->disk_nrec);
+    { FILE *f=fopen(PATH,"rb"); int32_t nr=-1;
+      CHECK(f && fseek(f,32,SEEK_SET)==0 && fread(&nr,4,1,f)==1 && nr==2,
+            "failed data flush must leave header nrec=2, got %d",nr);
+      if(f) fclose(f); }
+    kv_disk_append(&m,hist,NP);
+    CHECK(m.kv->disk_nrec==NP,"retry must persist the unwritten rows");
+    kv_alloc(&m,16); m.kv->disk_nrec=0;
+    CHECK(kv_disk_load(&m,hist2,16)==NP,"retry load must include all rows");
+    for(int p=0;p<NP;p++) CHECK(hist2[p]==hist[p],"retry hist[%d]",p);
+
+    /* Failure while creating the first header must also recover; its magic
+     * alone does not make the truncated file a valid persistence target. */
+    if(m.kv->disk_fp){ fclose(m.kv->disk_fp); m.kv->disk_fp=NULL; }
+    snprintf(m.kv->disk_path,sizeof(m.kv->disk_path),"%s.init",PATH);
+    remove(m.kv->disk_path); m.kv->disk_nrec=0;
+    limited.rlim_cur=30;
+    previous_signal=signal(SIGXFSZ,SIG_IGN);
+    CHECK(setrlimit(RLIMIT_FSIZE,&limited)==0,"limit initial header write");
+    kv_disk_append(&m,hist,NP);
+    CHECK(setrlimit(RLIMIT_FSIZE,&previous)==0,"restore initial header limit");
+    signal(SIGXFSZ,previous_signal);
+    CHECK(m.kv->disk_nrec==0,"failed header cannot commit rows");
+    kv_disk_append(&m,hist,NP);
+    kv_alloc(&m,16); m.kv->disk_nrec=0;
+    CHECK(kv_disk_load(&m,hist2,16)==NP,"partial header must be recreated before retry");
+    for(int p=0;p<NP;p++) CHECK(hist2[p]==hist[p],"header retry hist[%d]",p);
+    if(m.kv->disk_fp){ fclose(m.kv->disk_fp); m.kv->disk_fp=NULL; }
+    remove(m.kv->disk_path);
+    snprintf(m.kv->disk_path,sizeof(m.kv->disk_path),"%s",PATH);
+#endif
+
     /* ---- v1 file + KV8: quantize-on-load; il file v1 resta INTATTO (un crash
      * prima del primo save non deve perdere la conversazione) ---- */
     if(m.kv->disk_fp){ fclose(m.kv->disk_fp); m.kv->disk_fp=NULL; }  /* "riavvio" del processo */

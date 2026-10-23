@@ -121,9 +121,12 @@ class ProjectPythonTest(unittest.TestCase):
             model="output", repo="repo", ebits=4, io_bits=4,
             group_size=128, xbits=None, no_mtp=True)
 
+        glm = next(family for family in all_families() if family.id == "glm")
         with mock.patch.object(self.cli, "HERE", str(self.root)), \
              mock.patch.object(self.cli.sys, "platform", "win32"), \
              mock.patch.object(self.cli, "need_model"), \
+             mock.patch.object(self.cli, "resolve_model",
+                               return_value=types.SimpleNamespace(descriptor=glm)), \
              mock.patch.object(self.cli, "banner"), \
              mock.patch.object(self.cli, "env_for", return_value={}), \
              mock.patch.object(self.cli.subprocess, "call", return_value=0) as call:
@@ -148,6 +151,45 @@ class ProjectPythonTest(unittest.TestCase):
         with mock.patch.object(self.cli, "HERE", str(self.root)), \
              mock.patch.object(self.cli.sys, "platform", "win32"):
             self.assertEqual(self.cli.project_python(), sys.executable)
+
+
+class BenchDispatchTest(unittest.TestCase):
+    """`coli bench` scores the GLM-5.2/5.3 engine and nothing else.
+
+    tools/eval_glm.py drives the `colibri` binary through the log-likelihood
+    scoring protocol only that engine speaks. cmd_bench handed it every model,
+    so `coli bench` on an OLMoE container printed the OLMoE banner, started the
+    GLM engine on it and died on "this engine requires n_group=1 (GLM-5.2)":
+    the shape #898 fixed for `coli tune`.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cli = load_cli()
+
+    def test_a_non_glm_model_is_refused_before_the_glm_engine_runs(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        model = root / "olmoe"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps({"model_type": "olmoe"}), encoding="utf-8")
+        (model / "tokenizer.json").write_text("{}", encoding="utf-8")
+        data = root / "data"
+        data.mkdir()
+        (data / "hellaswag.jsonl").write_text("", encoding="utf-8")
+        bench = types.SimpleNamespace(
+            model=str(model), tasks=["hellaswag"], data=str(data), limit=1, ram=None)
+
+        with mock.patch.object(self.cli, "need_model"), \
+             mock.patch.object(self.cli, "banner"), \
+             mock.patch.object(self.cli, "env_for", return_value={}), \
+             mock.patch.object(self.cli.subprocess, "call", return_value=0) as call:
+            with self.assertRaises(SystemExit) as exited:
+                self.cli.cmd_bench(bench)
+        self.assertIn("coli bench is not wired for OLMoE", str(exited.exception.code))
+        call.assert_not_called()
 
 
 if __name__ == "__main__":

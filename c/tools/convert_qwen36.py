@@ -17,11 +17,22 @@ Design notes (must stay in sync with c/qwen36.c):
     pack_int4(). The qs layout (per-row f32 scales) is identical either way. This matches
     what c/qwen36.c's load_expert_merged expects: it detects int4 by ON-DISK SIZE (N/2 bytes)
     and unpacks in-place to int8, so the rest of the MoE path is unchanged.
+  * --down-bits 8 (with --ebits <= 4) is the MIXED layout: gate and up stay packed int4,
+    down_proj is int8 (--down-gs groups along its input, 0 = per row). One merged_weight per
+    expert still: uint8 [gate int4 packed | up int4 packed | down int8], 2*inter*hidden bytes
+    (int4: 1.5x, int8: 3x), qs = [gate scales | up scales | down scales]. Written to meta as
+    expert_down_bits / expert_down_gs. Q4_K_M keeps down/output in Q6_K; this is the
+    experiment #1370 asked for, with the engine reading each matrix in its own format.
   * Attention + router + shared-expert + norms stay f16 (they are tiny vs experts).
   * Real Qwen3.6 is a vision-language checkpoint: config dims live under `text_config`,
     and weight keys are prefixed `model.language_model.`. Both are handled transparently.
   * The fused expert tensors `mlp.experts.gate_up_proj` / `down_proj` are split per expert
     into the merged_weight layout (gate_up = [gate; up] along dim 0).
+  * Every tensor name is classified against tools/qwen36_tensor_kinds.py before the first
+    shard is read. The `mtp.*` head and the `visual.*` tower are skipped ON PURPOSE and
+    reported with a count; a name the contract does not know stops the conversion. A
+    converter that silently drops what it does not recognise produces a container that
+    loads and is quietly missing a tensor (GLM-5.3 precedent, #1045).
   * Head dims are derived from the actual weight shapes (authoritative), not from config
     heuristics, because Qwen3.6's qk split (q_head_dim=512, k/v_head_dim=256, rope over
     256 dims) does not match naive head_dim=hidden/n_heads.
@@ -32,9 +43,12 @@ Usage (cloud, e.g. Colab free CPU):
 
 Usage (local tiny model for end-to-end testing):
   python tools/convert_qwen36.py --model ../qwen36_tiny --out ../qwen36_tiny_i4 --ebits 8
+
+Usage (mixed: int4 gs64 gate/up, int8 down -- the #1370 experiment):
+  python tools/convert_qwen36.py --model <hf> --out ./qwen36_i4_gs64_d8 --ebits 4 --gs 64 --down-bits 8
 """
 
-import argparse, json, math, os, struct, sys
+import argparse, json, math, os, struct, sys, tempfile
 from pathlib import Path
 
 # Windows: force UTF-8 output
@@ -49,7 +63,7 @@ try:
     import torch
     from safetensors.numpy import safe_open as safe_open_np
     from safetensors.torch import safe_open as safe_open_pt
-    from safetensors.torch import save_file
+    from safetensors.torch import save_file, load_file
 except ImportError as exc:
     sys.exit(f"Missing dependencies: {exc}. Install: pip install torch safetensors")
 
@@ -101,7 +115,7 @@ def quantize_row_grouped(w: "torch.Tensor", bits: int, gs: int):
     return q, scales.view(O, ng)
 
 
-def make_merged(gate, up, down, ebits, gs=0):
+def make_merged(gate, up, down, ebits, gs=0, down_bits=0, down_gs=0):
     gsz = gs   # local `gs` is rebound to the gate scales below -- keep the group size safe
     """gate/up: [inter, H]; down: [H, inter] (torch, any fp).
     -> (merged_weight, qs f32 1D).
@@ -113,20 +127,31 @@ def make_merged(gate, up, down, ebits, gs=0):
     The engine (c/qwen36.c) currently reads ebits>=5 (int8); the int4 path is WIP.
     qs (per-row f32 scales) is identical in both cases.
     """
-    def q(t):
-        if gsz:
-            qt, s = quantize_row_grouped(t, ebits, gsz)   # [O, ng] scales
+    def q(t, bits, group):
+        if group:
+            qt, s = quantize_row_grouped(t, bits, group)   # [O, ng] scales
             return qt, s.reshape(-1)
-        qt, s = quantize_row(t.reshape(t.shape[0], -1), ebits)  # rows along dim0
+        qt, s = quantize_row(t.reshape(t.shape[0], -1), bits)  # rows along dim0
         return qt, s
-    gq, gs = q(gate)
-    uq, us = q(up)
-    dq, ds = q(down)
-    mw_i8 = torch.cat([gq.flatten(), uq.flatten(), dq.flatten()]).contiguous()
-    if ebits <= 4:
-        mw = pack_int4(mw_i8)              # uint8, 2x4-bit per byte -> HALF size (true int4)
+    gq, gs = q(gate, ebits, gsz)
+    uq, us = q(up, ebits, gsz)
+    mixed = bool(down_bits) and down_bits != ebits
+    if mixed:
+        if not (ebits <= 4 and down_bits >= 5):
+            raise ValueError(f"mixed layout needs --ebits <= 4 and --down-bits >= 5 (got {ebits}/{down_bits})")
+        # gate|up packed int4, down int8 in the same uint8 slab: 2*inter*hidden bytes,
+        # which is neither the int4 (1.5x) nor the int8 (3x) size -- that is how the
+        # engine tells the three layouts apart, from the bytes, not from meta.
+        dq, ds = q(down, down_bits, down_gs)
+        gu = pack_int4(torch.cat([gq.flatten(), uq.flatten()]).contiguous())
+        mw = torch.cat([gu, dq.flatten().to(torch.int8).view(torch.uint8)]).contiguous()
     else:
-        mw = mw_i8.to(torch.int8)          # int8 storage (ebits 5..8)
+        dq, ds = q(down, ebits, gsz)
+        mw_i8 = torch.cat([gq.flatten(), uq.flatten(), dq.flatten()]).contiguous()
+        if ebits <= 4:
+            mw = pack_int4(mw_i8)              # uint8, 2x4-bit per byte -> HALF size (true int4)
+        else:
+            mw = mw_i8.to(torch.int8)          # int8 storage (ebits 5..8)
     qs = torch.cat([gs, us, ds]).contiguous().float()
     return mw, qs
 
@@ -144,7 +169,6 @@ def _unpack_int4(packed: "torch.Tensor") -> "torch.Tensor":
 
 def _selftest():
     """Round-trip check for the true-int4 packing used by --ebits<=4."""
-    import random
     print("=== int4 pack/unpack selftest ===")
     ok = True
     for ebits in (2, 3, 4):
@@ -155,9 +179,7 @@ def _selftest():
         d = torch.randn(H, inter) * 3
         mw, qs = make_merged(g, u, d, ebits)
         # serialize to safetensors + reload (exercises the real dtype path)
-        import tempfile, os
         td = tempfile.mkdtemp()
-        from safetensors.torch import save_file, load_file
         save_file({"merged_weight": mw, "qs": qs}, os.path.join(td, "e0.safetensors"))
         back = load_file(os.path.join(td, "e0.safetensors"))
         mw_r = back["merged_weight"]
@@ -184,23 +206,33 @@ def _selftest():
     mw8, _ = make_merged(g, u, d, 8)
     print(f"  ebits=8: dtype={mw8.dtype} (expected int8), bytes={mw8.numel()}")
     ok = ok and (mw8.dtype == torch.int8)
+    # mixed layout: gate/up int4 (gs 8 here), down int8 per row -- the bytes must be
+    # exactly the int4 packing of gate|up followed by the int8 rows of down, the size
+    # 2*inter*hidden, and the scales [gate ng | up ng | down per row]
+    inter, H, gsz = 8, 16, 8
+    g = torch.randn(inter, H) * 3; u = torch.randn(inter, H) * 3; d = torch.randn(H, inter) * 3
+    mwm, qsm = make_merged(g, u, d, 4, gs=gsz, down_bits=8, down_gs=0)
+    gq, _ = quantize_row_grouped(g, 4, gsz); uq, _ = quantize_row_grouped(u, 4, gsz)
+    dq, dsc = quantize_row(d, 8)
+    gu_ref = pack_int4(torch.cat([gq.flatten(), uq.flatten()]).contiguous())
+    n_gu = gu_ref.numel()
+    same_gu = bool(torch.equal(mwm[:n_gu], gu_ref))
+    same_d = bool(torch.equal(mwm[n_gu:].view(torch.int8), dq.flatten().to(torch.int8)))
+    size_ok = mwm.numel() == 2 * inter * H
+    ng = H // gsz
+    scales_ok = qsm.numel() == 2 * inter * ng + H and bool(torch.allclose(qsm[-H:], dsc.float()))
+    print(f"  mixed int4gs{gsz}+down int8: dtype={mwm.dtype} bytes={mwm.numel()} (expected {2*inter*H}) "
+          f"gate/up={same_gu} down={same_d} scales={scales_ok}")
+    ok = ok and mwm.dtype == torch.uint8 and same_gu and same_d and size_ok and scales_ok
     print("SELFTEST", "PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 
 
-def resolve_prefix(keys):
-    """Return the layer-weight prefix so that `prefix + "layers.{i}."` matches the
-    actual weight keys.  Handles the common layouts:
-      * 'model.'                for `model.layers.0...`            (standard HF Qwen3 MoE)
-      * 'model.language_model.' for `model.language_model.layers.0...` (some VL checkpoints)
-    """
-    for k in keys:
-        if k.startswith("model.language_model.layers."):
-            return "model.language_model."
-    for k in keys:
-        if k.startswith("model.layers."):
-            return "model."
-    return ""
+# Tensor-name contract: classify() places every name or raises. Kept torch-free
+# in its own module so the test that pins it to the real checkpoint indexes
+# runs wherever the registry tests run.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from qwen36_tensor_kinds import classify, resolve_prefix, skip_reason, UnknownTensor  # noqa: E402
 
 
 def main():
@@ -210,6 +242,11 @@ def main():
     src.add_argument("--model", help="Local HF checkpoint directory")
     ap.add_argument("--out", required=False, help="Output container directory")
     ap.add_argument("--ebits", type=int, default=4, help="Expert quant bits (2..8, default 4)")
+    ap.add_argument("--down-bits", type=int, default=0,
+                    help="bits for down_proj only (5..8; needs --ebits <= 4): the mixed layout, "
+                         "int4 gate/up + int8 down in one slab. 0 = same as --ebits")
+    ap.add_argument("--down-gs", type=int, default=0,
+                    help="scale group size along down_proj's input for --down-bits (0 = per row)")
     ap.add_argument("--gs", type=int, default=0,
                     help="Group size for expert scales (e.g. 64). 0 = per-row (default). "
                          "Group-scaled containers need engine support (expert_gs in meta).")
@@ -237,6 +274,11 @@ def main():
 
     if not 2 <= args.ebits <= 8:
         sys.exit(f"--ebits must be 2..8 (got {args.ebits})")
+    if args.down_bits and args.down_bits != args.ebits:
+        if not (args.ebits <= 4 and 5 <= args.down_bits <= 8):
+            sys.exit(f"--down-bits {args.down_bits} needs --ebits <= 4 and 5..8 (got --ebits {args.ebits})")
+        if args.down_gs < 0:
+            sys.exit("--down-gs must be >= 0")
 
     token = args.hf_token or os.environ.get("HF_TOKEN")
     if args.repo:
@@ -264,6 +306,10 @@ def main():
     cfg_full = json.load(open(cfg_path, encoding="utf-8"))
     # VL checkpoints nest dims under text_config
     mcfg = cfg_full.get("text_config", cfg_full)
+    # transformers 5 writes qwen3_moe's expert count as num_local_experts; the released
+    # checkpoints (written by 4.x) say num_experts. Read either.
+    if "num_experts" not in mcfg and "num_local_experts" in mcfg:
+        mcfg = dict(mcfg, num_experts=mcfg["num_local_experts"])
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     import shutil
@@ -288,6 +334,39 @@ def main():
             print("WARNING: tokenizer.json not found; the engine will need TOK=<path>")
     except Exception as e:
         print(f"WARNING: could not fetch tokenizer.json ({e}); the engine will need TOK=<path>")
+    # The chat template travels with the container: the gateway renders what the
+    # checkpoint was trained on, and a Qwen3.8 template on this engine (Qwen3.8-27B,
+    # #1757) is recognised from this file.
+    for extra in ("chat_template.jinja", "tokenizer_config.json", "generation_config.json",
+                  "preprocessor_config.json"):
+        try:
+            extra_path = (hf_hub_download(args.repo, extra, token=token) if args.repo
+                          else str(src_dir / extra))
+        except Exception:
+            continue
+        if Path(extra_path).is_file():
+            shutil.copy2(extra_path, out / extra)
+            print(f"{extra} -> {out / extra}")
+    # A decision head over the backbone (Cloudflare's Clef: docs/clef.md) is two
+    # files next to the shards, outside the index. They are copied as they are:
+    # the engine reads the head from them, and coli recognises the checkpoint by
+    # them. Both or neither: half a head would load as a chat model that cannot
+    # say why it does not decide.
+    head_files = ("joint_head_config.json", "joint_head.safetensors")
+    if args.repo:
+        listed = set(HfApi(token=token).list_repo_files(args.repo))
+        head_paths = ([hf_hub_download(args.repo, name, token=token) for name in head_files]
+                      if all(name in listed for name in head_files) else [])
+    else:
+        head_paths = [str(src_dir / name) for name in head_files]
+    present = [path for path in head_paths if Path(path).is_file()]
+    if len(present) == len(head_files):
+        for name, path in zip(head_files, head_paths):
+            shutil.copy2(path, out / name)
+            print(f"{name} -> {out / name}")
+    elif present:
+        sys.exit(f"ERROR: {Path(present[0]).name} without its sibling: a decision head needs "
+                 f"both {' and '.join(head_files)}")
 
     # ---- build weight map (key -> shard file) ----
     if idx_path:
@@ -298,23 +377,68 @@ def main():
             sys.exit("remote repo without index.json is unsupported; download the repo first")
         wm = {}
         for sh in sorted(src_dir.glob("*.safetensors")):
+            if sh.name in head_files:      # the decision head, copied above
+                continue
             with safe_open_np(str(sh), framework="np") as f:
                 for k in f.keys():
                     wm[k] = sh.name
 
-    # ---- detect prefix + layer count from weights ----
-    sample_layer_keys = [k for k in wm if ".layers.0." in k or ".layers.0." in k]
-    prefix = resolve_prefix(wm.keys())
-    # find max layer index present
+    # ---- classify every tensor name before touching a shard ----
+    # 5 KB of index settles whether the next hundreds of GB make sense: an
+    # unknown name stops here, a skipped subtree is counted and named.
     import re
-    layer_ids = set(int(m) for m in re.findall(r"\." + re.escape(prefix) + r"layers\.(\d+)\.", " ".join(wm.keys())))
+    prefix = resolve_prefix(wm.keys())
+    layer_map = {}      # layer index -> [keys]
+    global_map = {}     # kind -> key
+    vision_map = {}     # name after "visual." -> key
+    skipped = {}        # group -> count
+    unknown = []
+    for k in wm:
+        try:
+            placed = classify(k, prefix)
+        except UnknownTensor:
+            unknown.append(k)
+            continue
+        if placed[0] == "layer":
+            layer_map.setdefault(placed[1], []).append(k)
+        elif placed[0] == "global":
+            global_map[placed[1]] = k
+        elif placed[0] == "vision":
+            vision_map[placed[1]] = k
+        else:
+            skipped[placed[1]] = skipped.get(placed[1], 0) + 1
+    if unknown:
+        shown = "\n  ".join(unknown[:12])
+        more = f"\n  ... and {len(unknown) - 12} more" if len(unknown) > 12 else ""
+        sys.exit(f"ERROR: {len(unknown)} tensor name(s) this converter cannot place "
+                 f"(tools/qwen36_tensor_kinds.py):\n  {shown}{more}\n"
+                 "Refusing to convert: a container missing or blindly carrying a tensor "
+                 "loads and answers wrongly. Extend the contract if the name is legitimate.")
+    for group, count in sorted(skipped.items()):
+        declared = ""
+        if group == "mtp":
+            declared = f", config mtp_num_hidden_layers={mcfg.get('mtp_num_hidden_layers')!r}"
+        print(f"skipping {count} `{group}.*` tensor(s): {skip_reason(group)}{declared}")
+    if mcfg.get("mtp_num_hidden_layers") and "mtp" not in skipped:
+        print(f"note: config declares mtp_num_hidden_layers={mcfg['mtp_num_hidden_layers']} "
+              "but the checkpoint carries no mtp.* tensors")
+    layer_ids = set(layer_map)
     n_layers_weight = (max(layer_ids) + 1) if layer_ids else mcfg.get("num_hidden_layers", 0)
+    print(f"tensor kinds: {sum(len(v) for v in layer_map.values())} in {len(layer_ids)} layers, "
+          f"{len(global_map)} globals, prefix {prefix!r}")
 
+    # Qwen3 MoE (qwen3_moe, e.g. Qwen3-Coder-30B-A3B): every layer is plain attention,
+    # full rotary, ordinary RMSNorm weights and no shared expert. Qwen3.5/3.6 differ on
+    # each of those, so the defaults below branch on it.
+    plain_qwen3 = cfg_full.get("model_type") == "qwen3_moe"
     layer_types = mcfg.get("layer_types")
     if layer_types is None:
-        # infer: every 4th layer is full_attention (Qwen3.5/3.6 convention)
         n = mcfg.get("num_hidden_layers", n_layers_weight)
-        layer_types = ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(n)]
+        if plain_qwen3:
+            layer_types = ["full_attention"] * n
+        else:
+            # infer: every 4th layer is full_attention (Qwen3.5/3.6 convention)
+            layer_types = ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(n)]
     full_idx = [i for i, lt in enumerate(layer_types) if lt == "full_attention"]
     all_idx = list(range(len(layer_types)))
     print(f"layers: {len(layer_types)} total, {len(full_idx)} full_attention (Phase 2: all {len(all_idx)} stored)")
@@ -327,16 +451,18 @@ def main():
     shard_layers = {}     # shard name -> set of layer ids needing it (-1 = globals)
 
     def layer_keys(i):
-        p = f"{prefix}layers.{i}."
-        return [k for k in wm if k.startswith(p)]
-
+        return layer_map.get(i, [])
     for i in all_idx:
         for k in layer_keys(i):
             shard_layers.setdefault(wm[k], set()).add(i)
-    globals_keys = [k for k in (f"{prefix}embed_tokens.weight",
-                                "lm_head.weight", f"{prefix}lm_head.weight",
-                                f"{prefix}norm.weight")
-                    if k in wm]
+    missing_layers = [i for i in all_idx if i not in layer_map]
+    if missing_layers:
+        sys.exit(f"ERROR: config declares {len(all_idx)} layers but the checkpoint has no "
+                 f"tensors for layer(s) {missing_layers[:8]}")
+    globals_keys = [global_map[kind] for kind in ("embed_tokens.weight", "lm_head.weight",
+                                                  "norm.weight") if kind in global_map]
+    if len(globals_keys) != 3:
+        sys.exit(f"ERROR: expected embed_tokens, lm_head and final norm, found {sorted(global_map)}")
     for k in globals_keys:
         shard_layers.setdefault(wm[k], set()).add(-1)
 
@@ -422,6 +548,23 @@ def main():
             upload_local(gpath)
             gpath.unlink()
 
+    # ---- vision tower as f16, under model.visual.* (#1757) ----
+    # The same ViT in Qwen3.5/3.6/3.8; the engine runs it through qwen38_vision.h.
+    vcfg = cfg_full.get("vision_config") or {}
+    if vision_map and not vcfg:
+        print(f"note: {len(vision_map)} visual.* tensor(s) but no vision_config; the tower is left out")
+    if vision_map and vcfg:
+        if "model-vision.safetensors" in done_files:
+            print("[vision] already on HF, skip")
+        else:
+            v_out = {f"model.visual.{name}": get_tensor(k).half() for name, k in vision_map.items()}
+            vpath = out / "model-vision.safetensors"
+            save_file(v_out, str(vpath))
+            print(f"[vision] {vpath.name} ({len(v_out)} tensors)")
+            if args.stream_upload:
+                upload_local(vpath)
+                vpath.unlink()
+
     # ---- per layer: Gated-Attention (full_attention) AND Gated DeltaNet (linear_attention) ----
     # Every layer also carries its MoE/MLP block. DeltaNet layers export linear_attn.* which
     # the generic f16 copy below handles automatically; the engine implements the recurrence.
@@ -439,7 +582,8 @@ def main():
         # ---- MoE experts: handle BOTH layouts the source may use ----
         #  (a) FUSED:  model.layers.i.mlp.experts.gate_up_proj [E,2*inter,H]
         #              + model.layers.i.mlp.experts.down_proj    [E,H,inter]
-        #  (b) SEPARATE (standard HF Qwen3 MoE, incl. the real 35B):
+        #  (b) SEPARATE (transformers save_pretrained on the text model, e.g. the tiny fixture;
+        #      the real 35B and 2.4T checkpoints both ship the FUSED layout):
         #              model.layers.i.mlp.experts.{e}.gate_proj [inter,H]
         #              model.layers.i.mlp.experts.{e}.up_proj   [inter,H]
         #              model.layers.i.mlp.experts.{e}.down_proj [H,inter]
@@ -454,7 +598,7 @@ def main():
                 dk = k.replace("gate_up_proj", "down_proj")
                 down = get_tensor(dk).float()        # [E, H, inter]
                 for e in range(E):
-                    mw, qs = make_merged(gate[e], up[e], down[e], args.ebits, gs=args.gs)
+                    mw, qs = make_merged(gate[e], up[e], down[e], args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
                     tens[f"model.layers.{a}.mlp.experts.{e}.merged_weight"] = mw
                     tens[f"model.layers.{a}.mlp.experts.{e}.qs"] = qs
                 continue
@@ -466,7 +610,7 @@ def main():
         for e in sorted(sep):
             d = sep[e]
             if "gate_proj" in d and "up_proj" in d and "down_proj" in d:
-                mw, qs = make_merged(d["gate_proj"], d["up_proj"], d["down_proj"], args.ebits, gs=args.gs)
+                mw, qs = make_merged(d["gate_proj"], d["up_proj"], d["down_proj"], args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
                 tens[f"model.layers.{a}.mlp.experts.{e}.merged_weight"] = mw
                 tens[f"model.layers.{a}.mlp.experts.{e}.qs"] = qs
             else:
@@ -493,10 +637,15 @@ def main():
         "n_layers": int(mcfg["num_hidden_layers"]),
         "n_active": len(all_idx),
         "layer_types": layer_types,
-        "num_experts": int(mcfg["num_experts"]),
-        "topk": int(mcfg["num_experts_per_tok"]),
-        "moe_inter": int(mcfg.get("moe_intermediate_size", mcfg.get("intermediate_size", 0) // 2)),
-        "shared_inter": int(mcfg.get("shared_expert_intermediate_size", mcfg.get("moe_intermediate_size", 0))),
+        # A dense checkpoint of the family (no num_experts: Qwen3.5 / Qwen3.8 27B) routes
+        # nothing; the engine loads its MLP as an ungated shared expert of that width.
+        "num_experts": int(mcfg.get("num_experts", 0)),
+        "topk": int(mcfg.get("num_experts_per_tok", 0)) if mcfg.get("num_experts") else 0,
+        "moe_inter": (int(mcfg.get("moe_intermediate_size", mcfg.get("intermediate_size", 0) // 2))
+                      if mcfg.get("num_experts") else 0),
+        "shared_inter": (0 if plain_qwen3 else
+                         int(mcfg.get("shared_expert_intermediate_size", mcfg.get("moe_intermediate_size", 0)))
+                         if mcfg.get("num_experts") else int(mcfg["intermediate_size"])),
         "rms_eps": float(mcfg.get("rms_norm_eps", 1e-6)),
         "ebits": args.ebits,
         "scoring_func": mcfg.get("scoring_func", "softmax"),
@@ -504,10 +653,13 @@ def main():
         "topk_group": int(mcfg.get("topk_group", 1)),
         "norm_topk_prob": bool(mcfg.get("norm_topk_prob", False)),
         "attn_output_gate": bool(mcfg.get("attn_output_gate", False)),
-        "rope_theta": float((mcfg.get("rope_parameters") or {}).get("rope_theta", 10000000.0)),
+        "rope_theta": float((mcfg.get("rope_parameters") or {}).get(
+            "rope_theta", mcfg.get("rope_theta", 10000000.0))),
         "mrope_section": (mcfg.get("rope_parameters") or {}).get("mrope_section", [16, 16, 16]),
-        "partial_rotary_factor": float(mcfg.get("partial_rotary_factor", 0.25)),
+        "partial_rotary_factor": float(mcfg.get("partial_rotary_factor", 1.0 if plain_qwen3 else 0.25)),
     }
+    if plain_qwen3:
+        meta["zero_centered_norms"] = False
     # derive head dims from first full-attention layer weights (authoritative).
     # Read from SOURCE (not local output) so this works even when layer 0 was
     # skipped during a resume and its local shard was already stream-deleted.
@@ -538,8 +690,17 @@ def main():
         if qn is not None:
             meta["qk_rope_head_dim"] = qn[0]
         meta["expert_gs"] = args.gs   # 0 = per-row scales; >0 = group size along input dim
+        if args.down_bits and args.down_bits != args.ebits:
+            # mixed layout (docstring): down_proj in its own format, gate/up as ebits/gs
+            meta["expert_down_bits"] = args.down_bits
+            meta["expert_down_gs"] = args.down_gs
         meta["head_dim"] = meta.get("k_head_dim", meta.get("q_head_dim", 256))
         meta["rope_dim"] = meta.get("qk_rope_head_dim", meta["head_dim"] // 4)
+        if plain_qwen3:
+            # One position per token, so M-RoPE over sections that cover the whole
+            # rotary half is ordinary 1D RoPE; the engine needs the sections to add up.
+            half = int(meta["rope_dim"] * meta["partial_rotary_factor"]) // 2
+            meta["mrope_section"] = [half - 2 * (half // 3), half // 3, half // 3]
     # ---- DeltaNet (linear_attention) dims. From config (authoritative for dn; unlike the
     #      attention qk split, dn dims are explicit in config and never evicted shards). ----
     meta["dn_vheads"] = int(mcfg.get("linear_num_value_heads", mcfg.get("num_value_heads", 0)))
@@ -554,11 +715,29 @@ def main():
             h.__exit__(None, None, None)
         except Exception:
             pass
+    if vision_map and vcfg:
+        meta["image_token_id"] = int(cfg_full["image_token_id"])
+        meta["vision"] = {
+            "depth": int(vcfg["depth"]), "hidden": int(vcfg["hidden_size"]),
+            "heads": int(vcfg["num_heads"]), "inter": int(vcfg["intermediate_size"]),
+            "patch": int(vcfg["patch_size"]), "merge": int(vcfg["spatial_merge_size"]),
+            "temporal": int(vcfg["temporal_patch_size"]), "in_ch": int(vcfg["in_channels"]),
+            "out_hidden": int(vcfg["out_hidden_size"]),
+            "num_pos": int(vcfg["num_position_embeddings"]),
+        }
     (out / "qwen36_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"[meta] {out / 'qwen36_meta.json'}")
 
     # ---- README ----
-    if not args.no_readme:
+    if not args.no_readme and plain_qwen3:
+        lines = ["---", "tags:", "  - colibri", "  - qwen3_moe", "  - moe",
+                 "library_name: colibri", "---", "",
+                 "colibri container for a Qwen3 MoE checkpoint (qwen3_moe, e.g. Qwen3-Coder-30B-A3B):",
+                 f"{len(all_idx)} attention layers, no DeltaNet and no shared expert, routed experts",
+                 f"at {args.ebits} bits" + (f" with a scale per {args.gs} inputs." if args.gs else " with a scale per row."),
+                 "", "Engine: https://github.com/JustVugg/colibri (c/qwen36.c, docs/qwen36.md)"]
+        (out / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    elif not args.no_readme:
         lines = ["---", "tags:", "  - colibri", "  - qwen3.6", "  - qwen3.6-35b-a3b", "  - moe",
                  "library_name: colibri", "---", "",
                  "colibri container for Qwen3.6-35B-A3B (Phase 2: all layers, incl. Gated DeltaNet).",
@@ -589,7 +768,8 @@ def main():
         pass
 
     print(f"\nDone. Container at: {out}")
-    print(f"All {len(all_idx)} layers stored (incl. Gated DeltaNet). n_active={len(all_idx)}.")
+    n_linear = sum(kind == "linear_attention" for kind in layer_types)
+    print(f"All {len(all_idx)} layers stored ({n_linear} Gated DeltaNet). n_active={len(all_idx)}.")
     print(f"Run (engine):  SNAP={out} ./qwen36 16 {args.ebits} ref_qwen36.json")
 
 

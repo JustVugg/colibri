@@ -172,6 +172,7 @@ typedef int             (*fn_tensor_refill_fp4)(Dsv4CudaTensor *t, const uint8_t
 typedef int             (*fn_backend_arch_ok)(int device);
 typedef const char     *(*fn_backend_name)(void);
 typedef long long       (*fn_mem_free_mb)(int device);
+typedef int             (*fn_device_unified)(int device);
 typedef int             (*fn_stream_drain)(int device);
 typedef int             (*fn_kv_ring_append)(int device, int layer, const float *rows,
                                              int start_pos, int count, int window, int dim);
@@ -312,6 +313,7 @@ static struct {
     fn_backend_name backend_name;         /* optional */
     char loaded_name[64];
     fn_mem_free_mb mem_free_mb;
+    fn_device_unified device_unified;     /* optional: older DLLs answer 0 (discrete) */
     fn_stream_drain stream_drain;                /* optional (older DLLs) */
     fn_kv_ring_append kv_ring_append;
     fn_kv_comp_append kv_comp_append;
@@ -374,15 +376,30 @@ static int dsv4_cuda_load(void){
     int n = 0;
     if(forced && *forced) candidates[n++] = forced;
     else { candidates[n++] = DSV4_BACKEND_DLL_DG; candidates[n++] = DSV4_BACKEND_DLL; }
+    /* why each candidate was passed over, for the closing line (#1906: it named no cause) */
+    char why[512]; size_t wn = 0; why[0] = 0;
     for(int i = 0; i < n; i++){
         g_dsv4.dll = dsv4_load_one(candidates[i]);
-        if(!g_dsv4.dll) continue;
-        if(!dsv4_cuda_resolve(candidates[i])) continue;      /* unloaded inside */
+        if(!g_dsv4.dll){
+            DWORD err = GetLastError();
+            int w = snprintf(why + wn, sizeof(why) - wn, "%s%s: %s (Windows error %lu)", wn ? "; " : "", candidates[i],
+                             err == ERROR_MOD_NOT_FOUND ? "not next to the engine, or a DLL it needs (the CUDA runtime) is missing"
+                             : err == ERROR_BAD_EXE_FORMAT ? "not a 64-bit DLL" : "not loadable", (unsigned long)err);
+            if(w > 0 && (size_t)w < sizeof(why) - wn) wn += (size_t)w;
+            continue;
+        }
+        if(!dsv4_cuda_resolve(candidates[i])){                 /* unloaded inside; it said which symbol */
+            int w = snprintf(why + wn, sizeof(why) - wn, "%s%s: a missing symbol", wn ? "; " : "", candidates[i]);
+            if(w > 0 && (size_t)w < sizeof(why) - wn) wn += (size_t)w;
+            continue;
+        }
         /* Optional compatibility probe: a build whose kernels cannot run on
          * device 0 says so, and the next candidate is tried. */
         if(g_dsv4.backend_arch_ok && !g_dsv4.backend_arch_ok(0)){
             fprintf(stderr, DSV4_VENDOR_TAG " %s does not fit this GPU; trying the next backend\n",
                     candidates[i]);
+            int w = snprintf(why + wn, sizeof(why) - wn, "%s%s: not built for this GPU", wn ? "; " : "", candidates[i]);
+            if(w > 0 && (size_t)w < sizeof(why) - wn) wn += (size_t)w;
             FreeLibrary(g_dsv4.dll); g_dsv4.dll = NULL;
             memset(&g_dsv4, 0, sizeof(g_dsv4)); g_dsv4.loaded = 1;
             continue;
@@ -393,8 +410,10 @@ static int dsv4_cuda_load(void){
         g_dsv4.available = 1;
         return 1;
     }
-    fprintf(stderr, DSV4_VENDOR_TAG " no usable backend DLL (" DSV4_BACKEND_DLL_DG " / "
-                    DSV4_BACKEND_DLL "); GPU tier disabled (CPU path remains active).\n");
+    fprintf(stderr, DSV4_VENDOR_TAG " no usable backend DLL (%s); GPU tier disabled (CPU path remains active). "
+                    "The DLLs need an sm_80+ GPU (Ampere or newer); Pascal and Turing take a build with "
+                    "CUDA_ARCH=portable-pre-ampere NO_TC=1 (docs/deepseek-v4.md).\n",
+            wn ? why : DSV4_BACKEND_DLL_DG " / " DSV4_BACKEND_DLL);
     return 0;
 }
 
@@ -492,6 +511,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     _Pragma("GCC diagnostic push")
     _Pragma("GCC diagnostic ignored \"-Wcast-function-type\"")
     g_dsv4.backend_arch_ok = (fn_backend_arch_ok)GetProcAddress(g_dsv4.dll, "dsv4_cuda_backend_arch_ok");
+    g_dsv4.device_unified = (fn_device_unified)GetProcAddress(g_dsv4.dll, "dsv4_cuda_device_unified");
     /* optional: an older DLL without the export keeps the whole tier alive;
      * the engine probes this and simply stays on synchronous attaches. */
     g_dsv4.stream_drain = (fn_stream_drain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_stream_drain");
@@ -841,6 +861,11 @@ const char *dsv4_cuda_backend_name(void){
 long long dsv4_cuda_mem_free_mb(int device){
     if(!g_dsv4.available) return -1;
     return g_dsv4.mem_free_mb(device);
+}
+
+int dsv4_cuda_device_unified(int device){
+    if(!g_dsv4.available || !g_dsv4.device_unified) return 0;
+    return g_dsv4.device_unified(device);
 }
 
 int dsv4_cuda_stream_drain(int device){

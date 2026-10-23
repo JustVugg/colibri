@@ -31,9 +31,20 @@ model this existing overlap. Long-prefill felt-wait estimates are therefore
 conservative and must be checked with lower `felt_fraction` sensitivity.
 
 Kimi K3 traces are not currently safe input because that engine emits routes
-without advancing the trace call ID. Inkling and OLMoE initialize routing
-telemetry but do not currently emit route records. Their cache traversal also
-differs from GLM, so each needs an explicit engine profile before inclusion.
+without advancing the trace call ID. Inkling initializes routing telemetry but
+does not currently emit route records. Their cache traversal also differs from
+GLM, so each needs an explicit engine profile before inclusion.
+
+OLMoE **does** emit route records now. It announced `ROUTE_TRACE` at startup
+and wrote a zero-byte file for as long as the stream existed, because
+`rt_init()` opens the file but nothing in `moe()` ever called `rt_trace()` — a
+consumer saw "no data" rather than an error. `moe()` calls `rt_route()` per
+position and `rt_trace_end()` once per invocation, so the stream has one line
+per `(moe call, position, layer)` with `call` advancing once per layer per
+forward (16 calls per forward on OLMoE, rows `0..S-1` within each). It still
+needs an engine profile before this simulator accepts it, because its cache
+traversal is per-layer LRU with a `--cap` slot budget and its gates are raw
+softmax weights rather than a renormalised top-k (`norm_topk_prob=false`).
 
 ## Trace contract
 
@@ -240,7 +251,9 @@ first useful campaign needs:
 3. Exact commit, model/container identity, DRAFT/sampling settings, cache state,
    prefill chunk, and frozen `.coli_usage` snapshot.
 4. Separate instrumentation fixes and engine profiles before Kimi K3, Inkling,
-   or OLMoE data is interpreted by this simulator.
+   or OLMoE data is interpreted by this simulator. OLMoE's instrumentation fix
+   (it emitted no route records) has landed, so only its engine profile and a
+   trace campaign remain.
 
 No server is required to run the simulator. A model-capable machine is needed
 only to collect missing traces and later validate a policy end to end.

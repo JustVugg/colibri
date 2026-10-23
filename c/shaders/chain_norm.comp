@@ -1,0 +1,54 @@
+#version 450
+// The dense chain's RMSNorm (vk_chain.c, VKC_P_NORM): nseg segments of D floats, each
+//   y = x * r * weight * post,   r = 1 / sqrt(mean(x^2) + eps)
+// One workgroup per segment. Segment g sits in row g / per_row, at index j = g % per_row
+// of that row: x[x_off + row*x_row + j*x_seg + i] (the same for y). That covers a row of
+// the residual stream (per_row 1), the heads of a projection (q/k norms: per_row heads,
+// x_seg the head's stride, which may exceed D when a gate follows the query) and the
+// hyper-connection streams of Qwen3.8 (per_row 4, a weight slice per stream).
+//   weight of segment j: w[w_off + (w_mod > 0 ? (j % w_mod) * D : 0) + i]
+//   flags 1: zero-centred weight, scale by (1 + w) (Qwen3.6/3.8 text norms)
+//   flags 2: no weight (scale by 1)
+//   flags 4: L2 norm: r = 1 / sqrt(sum(x^2) + eps) (no mean)
+// x and y may be the same buffer and the same places (in place): every element is read
+// for the sum before the barrier and written after it by the thread that reads it.
+// The sum is a float tree; the CPU sums in double. The two differ by rounding only.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 2) buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int nseg, D, per_row;
+    int x_off, x_row, x_seg;
+    int y_off, y_row, y_seg;
+    int w_off, w_mod, flags;
+    float eps, post;
+} p;
+
+shared float red[256];
+
+void main() {
+    int g = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x);
+    if (g >= p.nseg) return;                       // uniform across the workgroup
+    int row = g / p.per_row, j = g - row * p.per_row;
+    int xb = p.x_off + row * p.x_row + j * p.x_seg;
+    int yb = p.y_off + row * p.y_row + j * p.y_seg;
+    int wb = p.w_off + (p.w_mod > 0 ? (j % p.w_mod) * p.D : 0);
+    int tid = int(gl_LocalInvocationID.x);
+    float acc = 0.0;
+    for (int i = tid; i < p.D; i += 256) { float v = x[xb + i]; acc += v * v; }
+    red[tid] = acc;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        barrier();
+    }
+    float r = (p.flags & 4) != 0 ? 1.0 / sqrt(red[0] + p.eps)
+                                 : 1.0 / sqrt(red[0] / float(p.D) + p.eps);
+    for (int i = tid; i < p.D; i += 256) {
+        float wv = (p.flags & 2) != 0 ? 1.0 : ((p.flags & 1) != 0 ? 1.0 + w[wb + i] : w[wb + i]);
+        y[yb + i] = x[xb + i] * r * wv * p.post;
+    }
+}

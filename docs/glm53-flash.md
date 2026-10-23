@@ -100,11 +100,30 @@ and any GPU. Faster silicon does not move it; fewer bytes would.
 That is also why the Vulkan path is offered for machines with enough VRAM to
 hold experts rather than as an accelerator here.
 
+**Vulkan.** In a `make VK=1 glm53` build, `COLI_VULKAN=1` gives the routed experts
+the shared expert tier (`c/vk_tier.c`, the one every MoE engine uses): a
+budget of experts kept on the device, warm from the history (`.coli_usage`) at
+startup and adapting while you chat, so a hot expert is neither read from disk nor
+computed by the CPU. Each MoE step sends the resident experts' rows to the device as
+one batch while the CPU reads and computes the others; then every expert joins its
+token in routing order, after the shared expert. The experts' SwiGLU clamp is the one
+condition: `swiglu_clamped` clamps at any `swiglu_limit`, including 0, while the device
+clamps only above 0, so with a limit of 0 the experts stay on the CPU and a line says
+so. The resident matrices follow `COLI_VK_DENSE` (on a device that shares the CPU's RAM
+they stay on the CPU while the tier is on). Each run ends with
+`[VK] tier glm53 run: device N of M routed experts ...`; the knobs are the
+`COLI_VK_TIER*` rows of `docs/ENVIRONMENT.md`, the details in
+[vulkan.md](vulkan.md#glm-52-and-glm-53-flash-on-the-tier). Measured on Lavapipe for
+correctness only: no GPU has run the real weights on it yet.
+
 ## Vision
 
-Reachable from every surface: a path pasted in `coli chat`, a file attached or
-dropped in `coli web`, or an OpenAI `image_url` part with a base64 data URI or a
-local path. Remote URLs are refused rather than fetched — a request should not
+Reachable from every surface: a path pasted in `coli chat` (read by the client,
+sent as a data URI), a file attached or dropped in `coli web`, or an OpenAI
+`image_url` part with a base64 data URI. A local path in the request is read
+only under `COLI_IMAGE_ROOT` (see `docs/ENVIRONMENT.md`): a file read by the
+server happens with its own rights, and an inference client is not the
+operator. Remote URLs are refused rather than fetched — a request should not
 make the server open a network connection of the sender's choosing.
 
 `tools/glm53_image.py` does the preprocessing and is pinned against the official
@@ -140,7 +159,7 @@ Tool calling is complete. GLM-5.3 declares tools differently from GLM-5.2 (its
 own preamble, its own JSON serialisation, its own spacing inside `<tools>`) but
 emits calls identically, so the existing parser handles them unchanged. The
 whole rendering is pinned byte for byte against `chat_template.jinja`
-(`tests/test_glm53_chat_template.py`).
+(`tests/glm53_chat_template_harness.py`).
 
 ## Environment
 
@@ -154,18 +173,27 @@ measured from available memory when unset), `GLM53_MAX_IMAGE_TOKENS`,
 ```
 python3 tools/make_glm53_multimodal_tiny.py --output ~/glm53_mm_tiny
 python3 tools/make_glm53_streaming_pair.py --fixture ~/glm53_mm_tiny --output ~/glm53_stream
-python3 tests/test_glm53_multimodal_tiny.py --binary ./glm53 --fixture ~/glm53_mm_tiny
-python3 tests/test_glm53_streaming.py --binary ./glm53 \
+python3 tests/glm53_multimodal_tiny_harness.py --binary ./glm53 --fixture ~/glm53_mm_tiny
+python3 tests/glm53_streaming_harness.py --binary ./glm53 \
         --quantized ~/glm53_stream-i4 --dequantized ~/glm53_stream-deq
-python3 tests/test_glm53_serve.py        --binary ./glm53 --fixture ~/glm53_mm_tiny
-python3 tests/test_glm53_vision_serve.py --binary ./glm53 --fixture ~/glm53_mm_tiny
-python3 tests/test_glm53_chat_template.py --template <model>/chat_template.jinja
-make VK=1 glm53 && python3 tests/test_glm53_vulkan.py --binary ./glm53 --fixture ~/glm53_mm_tiny
+python3 tests/glm53_serve_harness.py        --binary ./glm53 --fixture ~/glm53_mm_tiny
+python3 tests/glm53_vision_serve_harness.py --binary ./glm53 --fixture ~/glm53_mm_tiny
+python3 tests/glm53_chat_template_harness.py --template <model>/chat_template.jinja
+make VK=1 glm53 && python3 tests/glm53_vulkan_harness.py --binary ./glm53 --fixture ~/glm53_mm_tiny
+bash tests/vulkan_engines.sh glm     # the expert tier against the CPU, on Lavapipe (glm-sanitize: ASan, UBSan)
 ```
 
 The generators want transformers 5.16.1, pinned because an oracle written by a
-different version is a different oracle. Each test skips with the command that
-builds what it is missing rather than throwing.
+different version is a different oracle. Each harness skips with the command that
+builds what it is missing rather than throwing, and exits 2 when it does: a skip
+verified nothing and must not read as a pass.
+
+The harnesses are named `glm53_*_harness.py` so `make test-python` does not
+collect them as empty unittest modules. `tests/test_glm53_oracles.py` wraps the
+two stdlib-only oracles for unittest; it runs them when `GLM53_TINY`
+(`tools/make_glm53_tiny.py`) and `GLM53_MM_TINY` (the multimodal fixture above)
+point at their fixtures, as the GLM-5.3 CI job does, and skips with that reason
+otherwise.
 
 Two of the generators refuse to write a fixture that cannot fail: one rejects a
 degenerate model that answers the same token everywhere, the other a fixture

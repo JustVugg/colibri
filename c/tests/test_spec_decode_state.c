@@ -247,6 +247,39 @@ static int test_eos_and_non_limit_stop(void) {
     return 0;
 }
 
+static int test_oracle_reports_partial_generation(void) {
+    const int next[V] = {1, 2, 3, 4, 5, 6, 7, 0};
+    Toy t;
+    toy_init(&t, next);
+    reset_decode_globals(0);
+    /* Oracle comparison must not read unwritten output after a stop/interrupt. */
+    int prompt[] = {0, 1};
+    int out[5] = {-1, -1, -1, -1, -1}, finite = 0;
+    g_stop[0] = 3; g_nstop = 1;
+    CHECK(generate(&t.m, prompt, 2, 3, out, &finite) == 1);
+    CHECK(finite && out[2] == 2 && out[3] == -1 && out[4] == -1);
+    g_intr = 1;
+    CHECK(generate(&t.m, prompt, 2, 3, out, &finite) == 0);
+    reset_decode_globals(0);
+    toy_free(&t);
+    return 0;
+}
+
+static int test_teacher_forcing_reports_one_nonfinite_position(void) {
+    const int next[V] = {1, 2, 3, 4, 5, 6, 7, 0};
+    Toy t;
+    toy_init(&t, next);
+    reset_decode_globals(0);
+    int ids[] = {0, 1, 2}, pred[3];
+    CHECK(forward_all(&t.m, ids, 3, pred, NULL));
+    CHECK(pred[0] == 1 && pred[1] == 2 && pred[2] == 3);
+    t.m.embed.qf[2 * D + 2] = NAN;
+    CHECK(!forward_all(&t.m, ids, 3, pred, NULL));
+    CHECK(pred[0] == 1 && pred[1] == 2 && pred[2] == -1);
+    toy_free(&t);
+    return 0;
+}
+
 int main(void) {
     CHECK(test_ngen_zero_and_one_shot() == 0);
     CHECK(test_stateful_ngen_and_more() == 0);
@@ -254,6 +287,8 @@ int main(void) {
     CHECK(test_emit_carries_scoring_logits_for_accepted_drafts() == 0);
     CHECK(test_accepted_speculative_tokens() == 0);
     CHECK(test_eos_and_non_limit_stop() == 0);
+    CHECK(test_oracle_reports_partial_generation() == 0);
+    CHECK(test_teacher_forcing_reports_one_nonfinite_position() == 0);
     puts("spec_decode state tests: ok");
     return 0;
 }

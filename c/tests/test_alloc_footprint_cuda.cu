@@ -16,6 +16,9 @@
 #include <cstdlib>
 #include <vector>
 #include "../backend_cuda.h"
+#if defined(__HIPCC__)
+#include "../backend_gpu_compat.h"   /* separate TU: needs the CUDA->HIP mapping itself */
+#endif
 
 static int failures = 0;
 

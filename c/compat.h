@@ -71,7 +71,7 @@ static inline int compat_open_direct(const char *path){
  *                                  text-mode translation — NEVER use
  *                                  _read/_lseeki64 which are racy AND
  *                                  corrupt 0x0A bytes in binary files).
- * posix_fadvise -> no-op (advisory only; macOS already no-ops DONTNEED).
+ * posix_fadvise -> bounded background WILLNEED; other advice is a no-op.
  * mlock         -> compat_mlock  (VirtualLock + crescita working set).
  * posix_memalign->_aligned_malloc(free must be compat_aligned_free).
  * rename        -> compat_rename (MoveFileEx MOVEFILE_REPLACE_EXISTING;
@@ -112,18 +112,11 @@ static inline int compat_open_direct(const char *path){
 #define COMPAT_O_RDONLY (O_RDONLY | O_BINARY)
 #define COMPAT_O_BINARY O_BINARY
 
-/* --- posix_fadvise: Windows has no direct equivalent. Semantics:
- *      WILLNEED  -> warm the OS page cache so a later synchronous pread finds the
- *                   pages resident. Implemented as an overlapped background ReadFile
- *                   into a throwaway scratch buffer (fire-and-forget readahead). Called
- *                   from the dedicated PILOT I/O thread / next-block readahead in moe(),
- *                   NEVER inline on the hot path (the existing comment at glm.c:2847
- *                   measures inline fadvise submit at ~0.5ms x 169k calls = +92s/48tok).
- *                   Each call owns its OVERLAPPED + scratch buffer -> thread-safe.
- *      DONTNEED  -> no-op: Windows' standby-list trimming self-regulates under pressure,
- *                   and on a low-RAM host keeping the pages is what we want for reuse.
- *                   Matches macOS (compat.h:16-19) which no-ops DONTNEED for the same
- *                   reason. The engine only ever uses DONTNEED as an advisory. */
+/* WILLNEED schedules bounded background prefetch, including for ordinary
+ * synchronous CRT file handles. Supplying OVERLAPPED to ReadFile alone does
+ * not make such handles asynchronous. The worker owns a duplicate handle and
+ * prefetches a read-only mapping without a throwaway copy of the expert.
+ * DONTNEED remains advisory/no-op: Windows manages standby pages itself. */
 #ifndef POSIX_FADV_NORMAL
 #define POSIX_FADV_NORMAL      0
 #define POSIX_FADV_RANDOM      1
@@ -132,27 +125,9 @@ static inline int compat_open_direct(const char *path){
 #define POSIX_FADV_DONTNEED    4
 #define POSIX_FADV_NOREUSE     5
 #endif
+#include "compat_prefetch_win.h"
 static inline int compat_fadvise(int fd, off_t off, off_t len, int advice){
-    if(advice!=POSIX_FADV_WILLNEED || len<=0) return 0;
-    intptr_t osfh=_get_osfhandle(fd);
-    if(osfh==-1 || osfh==-2) return 0;
-    HANDLE h=(HANDLE)osfh;
-    /* Cap the readahead window: reading a whole 19MB expert per hint is fine on the
-     * PILOT thread, but a pathological huge len would spike transient memory. */
-    size_t rdlen = (len>(off_t)(64*1024*1024)) ? (size_t)(64*1024*1024) : (size_t)len;
-    char *buf=(char*)_aligned_malloc(rdlen, 4096);
-    if(!buf) return -1;
-    OVERLAPPED ov={0};
-    ov.Offset     = (DWORD)( (off_t)off        & 0xFFFFFFFFULL);
-    ov.OffsetHigh = (DWORD)(((off_t)off >> 32) & 0xFFFFFFFFULL);
-    /* Issue an overlapped read. With a non-OVERLAPPED-opened handle ReadFile still
-     * accepts lpOverlapped (it carries the 64-bit offset) and blocks until the read
-     * completes — but crucially it populates the standby page cache for this region,
-     * so the later synchronous pread on the same offsets faults from RAM not disk. */
-    DWORD got=0;
-    ReadFile(h, buf, (DWORD)rdlen, &got, &ov);
-    _aligned_free(buf);
-    return 0;
+    return advice == POSIX_FADV_WILLNEED ? compat_prefetch_file(fd, off, len) : 0;
 }
 #define posix_fadvise compat_fadvise
 
@@ -600,8 +575,10 @@ static inline void coli_hold_console(void)
 
 /* One wording for every engine: what this binary is, and the command that does
  * what the user was trying to do. Called on the "no model" exit path, which is
- * where a bare launch lands. `engine` is the family name for the message. */
-static inline void coli_print_launcher_help(const char *engine)
+ * where a bare launch lands. `engine` is the family name for the message,
+ * `by_hand` how this binary itself is run (they differ: some read the model
+ * from SNAP, some from their first argument; #1906). */
+static inline void coli_print_launcher_help(const char *engine, const char *by_hand)
 {
 #ifdef _WIN32
     const char *run = "coli.cmd";
@@ -618,9 +595,10 @@ static inline void coli_print_launcher_help(const char *engine)
         "    %s doctor --model <model directory>   check a model is usable\n"
         "\n"
         "The launcher needs Python 3 and picks the right engine for the model.\n"
+        "(Running the engine by hand: %s)\n"
         "Getting a model, step by step: https://github.com/JustVugg/colibri"
         "/blob/main/docs/quickstart.md\n",
-        engine, run, run, run, run);
+        engine, run, run, run, run, by_hand);
     coli_hold_console();
 }
 
@@ -639,28 +617,72 @@ static inline void coli_print_launcher_help(const char *engine)
  * 0 = non misurabile; e' il chiamante a decidere il fallback. */
 #ifdef __APPLE__
 #include <mach/mach.h>
+#include <sys/sysctl.h>
 #endif
 #include <unistd.h>
-static inline double compat_mem_available_gb(void){
+
+/* Total AND available in one call, one pass.
+ *
+ * "Available" alone was consolidated here by #1375 because there were two
+ * copies of it and one was wrong. "Total" is now in the same position: every
+ * caller that wants it hand-rolls its own #ifdef ladder (telemetry.h uses
+ * sysctl hw.memsize on macOS, olmoe.c uses sysconf(_SC_PHYS_PAGES), glm53.c
+ * read /proc/meminfo unconditionally), and those definitions do not agree.
+ * A budget computed from a total and an available that came from two
+ * different definitions is not a budget, it is a coincidence.
+ *
+ * One pass also matters on Linux specifically: MemTotal and MemAvailable are
+ * two lines of the same file, and reading it twice to get them is both a
+ * second open and a second chance to read a file that changed underneath.
+ *
+ * 0 means "not measurable" for either field; the caller decides the fallback. */
+static inline void compat_meminfo_gb(double *total_gb, double *avail_gb){
+    double total = 0, avail = 0;
 #ifdef __APPLE__
+    uint64_t memsize = 0; size_t len = sizeof memsize;
+    if(sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0) total = (double)memsize / 1e9;
     mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
     vm_statistics64_data_t vm;
-    if(host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &cnt) != KERN_SUCCESS) return 0;
-    return ((double)vm.free_count + (double)vm.inactive_count + (double)vm.purgeable_count)
-           * (double)sysconf(_SC_PAGESIZE) / 1e9;
+    if(host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &cnt) == KERN_SUCCESS)
+        avail = ((double)vm.free_count + (double)vm.inactive_count + (double)vm.purgeable_count)
+                * (double)sysconf(_SC_PAGESIZE) / 1e9;
 #elif defined(_WIN32)
     MEMORYSTATUSEX msx = {0};
     msx.dwLength = sizeof(msx);
-    if(!GlobalMemoryStatusEx(&msx)) return 0;
-    double phys = (double)msx.ullAvailPhys / 1e9;
-    double commit = (double)msx.ullAvailPageFile / 1e9;
-    return commit > 0 && commit < phys ? commit : phys;
+    if(GlobalMemoryStatusEx(&msx)){
+        total = (double)msx.ullTotalPhys / 1e9;
+        double phys = (double)msx.ullAvailPhys / 1e9;
+        double commit = (double)msx.ullAvailPageFile / 1e9;
+        avail = commit > 0 && commit < phys ? commit : phys;
+    }
 #else
-    FILE *f = fopen("/proc/meminfo", "r"); if(!f) return 0;
-    char ln[256]; double kb = 0;
-    while(fgets(ln, sizeof ln, f)) if(sscanf(ln, "MemAvailable: %lf", &kb) == 1) break;
-    fclose(f); return kb / 1e6;
+    FILE *f = fopen("/proc/meminfo", "r");
+    if(f){
+        char ln[256]; double kb;
+        /* /proc/meminfo's "kB" is KiB (1024 B), so a GB is kb*1024/1e9, not
+         * kb/1e6. The old kb/1e6 understated by 2.3% -- harmless while the
+         * number was only ever compared against itself, but glm53 now weighs
+         * it against a model size computed from byte counts (/1e9, true GB),
+         * and a budget that subtracts true GB from understated GB is wrong in
+         * the direction that matters: it hands back less than it should. */
+        /* MemTotal precedes MemAvailable in /proc/meminfo, but do not rely on
+         * the order: stop only once both have been seen. */
+        while((total == 0 || avail == 0) && fgets(ln, sizeof ln, f)){
+            if(total == 0 && sscanf(ln, "MemTotal: %lf", &kb) == 1){ total = kb * 1024.0 / 1e9; continue; }
+            if(avail == 0 && sscanf(ln, "MemAvailable: %lf", &kb) == 1) avail = kb * 1024.0 / 1e9;
+        }
+        fclose(f);
+    }
 #endif
+    if(total_gb) *total_gb = total;
+    if(avail_gb) *avail_gb = avail;
 }
+
+static inline double compat_mem_available_gb(void){
+    double avail = 0;
+    compat_meminfo_gb(NULL, &avail);
+    return avail;
+}
+
 
 #endif /* COMPAT_H */

@@ -3,12 +3,14 @@
 
 #include <errno.h>
 #include <math.h>
+#include "decode_batch.h"   /* ColiSubmit, coli_submit_ext, coli_logprob_tail */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "compat.h"
+#include "load_fail.h"   /* LOAD_FAIL kind=<kind> <detail>: the handshake that never reaches READY */
 
 /* Transport only: parse and emit frames. Admission, queueing, cancellation,
  * KV ownership, scheduling, and generation remain with each family engine. */
@@ -25,6 +27,13 @@ typedef enum {
      * vede come un comando che non sa trattare e lo rifiuta, che e' la risposta
      * giusta: meglio dire di no che accettare una foto e ignorarla. */
     COLI_SERVE_COMMAND_IMAGE,
+    /* DECIDE <id> <slot> <bytes>\n<payload>\n: one closed decision for a decision
+     * engine (docs/serve_protocol.md). The payload is a JSON record -- the state and
+     * the typed questions with their options in order -- and the answer comes back
+     * as one DECISION frame followed by DONE. An engine that does not decide never
+     * receives it: the gateway sends it only after the engine announced decide=1 in
+     * its CAPS line. */
+    COLI_SERVE_COMMAND_DECIDE,
 } ColiServeCommandKind;
 
 typedef enum {
@@ -60,6 +69,11 @@ typedef struct {
     /* IMAGE: la griglia di patch che accompagna il payload. Zero per ogni altro
      * comando. */
     int grid_h, grid_w;
+    /* SUBMIT logprobs=k: emissione top-k per token. 0 = canale spento.
+     * Le chiavi key=value stanno dopo i campi posizionali e usano lo
+     * stesso namespace di decode_batch.h, non un secondo dialetto. */
+    int logprobs;
+    int pin;        /* SUBMIT pin=1, vedi decode_batch.h */
     unsigned char *payload;
 } ColiServeCommand;
 
@@ -144,6 +158,8 @@ static inline void coli_serve_classify_line(
         command->kind = COLI_SERVE_COMMAND_CANCEL;
     else if (name_size == 5 && !memcmp(name, "IMAGE", 5))
         command->kind = COLI_SERVE_COMMAND_IMAGE;
+    else if (name_size == 6 && !memcmp(name, "DECIDE", 6))
+        command->kind = COLI_SERVE_COMMAND_DECIDE;
     else
         return;
     while (*cursor == ' ' || *cursor == '\t') cursor++;
@@ -211,6 +227,7 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
     else if (!strcmp(fields[0], "STOP")) command->kind = COLI_SERVE_COMMAND_STOP;
     else if (!strcmp(fields[0], "CANCEL")) command->kind = COLI_SERVE_COMMAND_CANCEL;
     else if (!strcmp(fields[0], "IMAGE")) command->kind = COLI_SERVE_COMMAND_IMAGE;
+    else if (!strcmp(fields[0], "DECIDE")) command->kind = COLI_SERVE_COMMAND_DECIDE;
     else {
         free(line);
         return COLI_SERVE_READ_IGNORED;
@@ -259,12 +276,67 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
         }
         return COLI_SERVE_READ_OK;
     }
+    if (command->kind == COLI_SERVE_COMMAND_DECIDE) {
+        /* DECIDE <id> <slot> <bytes>\n<payload>\n. Same rule as IMAGE: the payload
+         * is consumed whenever the header parses, so an engine that cannot decide
+         * answers with an ERROR and the next frame still starts on a header. */
+        if (nfields != 4 ||
+            !coli_serve_parse_i32(fields[2], &command->slot) ||
+            !coli_serve_parse_u64(fields[3], &command->payload_bytes) ||
+            command->payload_bytes > profile->max_payload_bytes ||
+            command->slot < 0) {
+            free(line);
+            return COLI_SERVE_READ_BAD_REQUEST;
+        }
+        free(line);
+        command->payload = (unsigned char *)allocate((size_t)command->payload_bytes + 1);
+        if (!command->payload) return COLI_SERVE_READ_NOMEM;
+        if (command->payload_bytes &&
+            fread(command->payload, 1, (size_t)command->payload_bytes, input)
+                != (size_t)command->payload_bytes) {
+            coli_serve_command_dispose(command);
+            return COLI_SERVE_READ_BAD_FRAME;
+        }
+        command->payload[command->payload_bytes] = 0;
+        int terminator = fgetc(input);
+        if (terminator != '\n' && !(terminator == '\r' && fgetc(input) == '\n')) {
+            coli_serve_command_dispose(command);
+            return COLI_SERVE_READ_BAD_FRAME;
+        }
+        return COLI_SERVE_READ_OK;
+    }
     int minimum_fields = 7;
     int maximum_fields = minimum_fields + !!profile->allow_extension_bytes +
                          !!profile->allow_prefix_hint;
-    if (nfields < minimum_fields || nfields > maximum_fields ||
-        (nfields >= 8 && !profile->allow_extension_bytes) ||
-        (nfields >= 9 && (!profile->allow_prefix_hint ||
+    /* I token key=value vengono dopo i campi posizionali. Il primo campo che
+     * contiene '=' apre l'estensione: da li in poi il conteggio posizionale si
+     * ferma, e le regole (chiavi note, niente duplicati, valori in campo) sono
+     * quelle di coli_submit_ext, non una seconda copia scritta qui. */
+    int positional = nfields;
+    for (int f = minimum_fields; f < nfields; f++)
+        if (strchr(fields[f], '=')) { positional = f; break; }
+    command->logprobs = 0;
+    command->pin = 0;
+    if (positional < nfields) {
+        char ext[128]; size_t used = 0; ext[0] = 0;
+        for (int f = positional; f < nfields; f++) {
+            size_t need = strlen(fields[f]) + 1;
+            if (used + need + 1 >= sizeof ext) { free(line); return COLI_SERVE_READ_BAD_REQUEST; }
+            ext[used++] = ' ';
+            memcpy(ext + used, fields[f], need);
+            used += need - 1;
+        }
+        {
+            ColiSubmit tmp;
+            memset(&tmp, 0, sizeof tmp);
+            if (!coli_submit_ext(ext, &tmp)) { free(line); return COLI_SERVE_READ_BAD_REQUEST; }
+            command->logprobs = tmp.logprobs;
+            command->pin = tmp.pin;
+        }
+    }
+    if (positional < minimum_fields || positional > maximum_fields ||
+        (positional >= 8 && !profile->allow_extension_bytes) ||
+        (positional >= 9 && (!profile->allow_prefix_hint ||
                           !profile->allow_extension_bytes))) {
         free(line);
         return COLI_SERVE_READ_BAD_REQUEST;
@@ -276,12 +348,19 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
         !coli_serve_parse_i32(fields[4], &command->max_tokens) ||
         !coli_serve_parse_f32(fields[5], &command->temperature) ||
         !coli_serve_parse_f32(fields[6], &command->top_p) ||
-        (nfields >= 8 &&
+        (positional >= 8 &&
          !coli_serve_parse_u64(fields[7], &command->extension_bytes)) ||
-        (nfields >= 9 && !coli_serve_parse_i32(fields[8], &command->prefix_bytes)) ||
+        (positional >= 9 && !coli_serve_parse_i32(fields[8], &command->prefix_bytes)) ||
         command->payload_bytes > profile->max_payload_bytes ||
         command->extension_bytes > profile->max_extension_bytes ||
-        command->max_tokens < 1 ||
+        /* max_tokens=0 vale SOLO in modalita jev (logprobs>0) e vuol dire
+         * "leggi il prompt e fermati", niente generazione. Senza, chi punteggia
+         * un menu chiuso deve chiedere almeno un token, e quel token lo paga:
+         * un passo di decodifica completo per opzione, buttato via. Misurato su
+         * qwen36: raddoppia il costo di un'opzione da un token. Una richiesta
+         * che non chiede logprobs continua a essere rifiutata a 0, come prima. */
+        (command->max_tokens < 1 &&
+         !(command->max_tokens == 0 && command->logprobs > 0)) ||
         (profile->max_tokens && command->max_tokens > profile->max_tokens) ||
         (profile->require_finite_sampling &&
          (!isfinite(command->temperature) || !isfinite(command->top_p)))) {
@@ -319,12 +398,23 @@ static inline ColiServeReadResult coli_serve_read_command(
     return coli_serve_read_command_alloc(input, profile, command, malloc);
 }
 
-static inline int coli_serve_write_ready(FILE *output, double rss_gb)
+/* The handshake, with an optional CAPS line between READY and STAT: what the
+ * engine loaded, as "key=value ..." (today `vision=0|1`). It sits BEFORE the
+ * status line on purpose: the server reads it while it waits for STAT, so it
+ * knows what it serves before the first request arrives. NULL writes the
+ * handshake exactly as coli_serve_write_ready() always has. */
+static inline int coli_serve_write_ready_caps(FILE *output, double rss_gb, const char *caps)
 {
     if (fputs("\x01\x01READY\x01\x01\n", output) == EOF ||
+        (caps && fprintf(output, "CAPS %s\n", caps) < 0) ||
         fprintf(output, "STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb) < 0)
         return 0;
     return fflush(output) == 0;
+}
+
+static inline int coli_serve_write_ready(FILE *output, double rss_gb)
+{
+    return coli_serve_write_ready_caps(output, rss_gb, NULL);
 }
 
 static inline int coli_serve_write_accept(FILE *output, const char *id, int prompt_tokens)
@@ -343,6 +433,21 @@ static inline int coli_serve_write_data(
     return fflush(output) == 0;
 }
 
+/* Come coli_serve_write_data, ma con la coda numerica del canale logprobs
+ * appesa all'intestazione: "DATA <id> <n> <lp> <k> [tid tlp]*k". Un frame per
+ * token, perche un client che punteggia vuole i token, non il testo accorpato.
+ * Si usa SOLO quando la richiesta ha chiesto logprobs=k: senza, il frame resta
+ * quello legacy byte per byte, e un gateway vecchio non vede mai questa forma. */
+static inline int coli_serve_write_data_lp(
+    FILE *output, const char *id, const void *data, size_t bytes, const char *tail)
+{
+    if (fprintf(output, "DATA %s %zu%s\n", id, bytes, tail ? tail : "") < 0 ||
+        (bytes && fwrite(data, 1, bytes, output) != bytes) ||
+        fputc('\n', output) == EOF)
+        return 0;
+    return fflush(output) == 0;
+}
+
 /* Engine-authenticated structured tool output. The payload is opaque to this
  * transport; the gateway applies the active family parser. A zero-byte frame
  * declares the sideband authoritative for the request, so ordinary DATA that
@@ -351,6 +456,19 @@ static inline int coli_serve_write_tool(
     FILE *output, const char *id, const void *data, size_t bytes)
 {
     if (fprintf(output, "TOOL %s %zu\n", id, bytes) < 0 ||
+        (bytes && fwrite(data, 1, bytes, output) != bytes) ||
+        fputc('\n', output) == EOF)
+        return 0;
+    return fflush(output) == 0;
+}
+
+/* A decision engine's answer to DECIDE: "DECISION <id> <n>\n<n bytes of JSON>\n",
+ * written once per request and followed by DONE. The JSON is the engine's; the
+ * transport only frames it. */
+static inline int coli_serve_write_decision(
+    FILE *output, const char *id, const void *data, size_t bytes)
+{
+    if (fprintf(output, "DECISION %s %zu\n", id, bytes) < 0 ||
         (bytes && fwrite(data, 1, bytes, output) != bytes) ||
         fputc('\n', output) == EOF)
         return 0;

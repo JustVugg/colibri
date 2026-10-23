@@ -82,6 +82,14 @@ int main(void){
     free_cache(&m);
     check_lookup_scaling(44);
     check_lookup_scaling(219);
+    {
+        double avail = mem_avail_bytes();
+        double probe = compat_mem_available_gb();
+        CHECK(avail > 0.0, "mem_avail_bytes returned 0; auto cap would be 16 experts/layer");
+        double gb = avail / 1e9;
+        double gap = gb > probe ? gb - probe : probe - gb;
+        CHECK(gap < 0.25, "mem_avail_bytes diverged from the shared probe (%.3f vs %.3f GB)", gb, probe);
+    }
     if(failures){ fprintf(stderr,"inkling cache index: %d failure(s)\n",failures); return 1; }
     puts("inkling cache index: ok");
     return 0;

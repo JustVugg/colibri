@@ -23,7 +23,9 @@ jobs:
   linux:
     name: Linux
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # make check takes about 14 minutes here now (14.9 at worst this week);
+    # at 15 the job was cut off with nothing failed.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: make check
@@ -40,7 +42,12 @@ jobs:
     # limit and reported as failures), including one on dev itself. The suite
     # has grown - segment conformance and adapters, the edge runtime, per-engine
     # cache indices - and MinGW is the slowest toolchain we build on.
-    timeout-minutes: 35
+    # 2026-10-05: the 35 minutes set then were reached in turn. Over the last
+    # two days the job took 21 to 34 minutes when it passed, and was cancelled
+    # at 35 three times with every test passed so far (#1907, #1911 and a dev
+    # run), after #1901 added its suites. 60 leaves room for the suites still
+    # coming; a real hang still ends the job.
+    timeout-minutes: 60
     defaults:
       run:
         shell: msys2 {0}
@@ -80,6 +87,33 @@ jobs:
         run: python -m pip install -r c/tools/requirements-kimi-k3-tiny.txt
       - name: Generate fixture and run vendor oracle
         run: make -C c kimi-k3-tiny-check
+
+  mimo-tiny:
+    name: Linux (generated tiny MiMo-V2.6 vendor oracle, text + vision)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-mimo-tiny.txt
+      - name: Install pinned tiny-fixture dependencies
+        run: python -m pip install -r c/tools/requirements-mimo-tiny.txt
+      - name: Generate fixture and run vendor oracle
+        run: make -C c mimo-tiny-check
+      - name: "Brio and the prompt cache: photos exact against a cold engine"
+        run: make -C c mimo-tiny-serve-check
+      - name: Same oracle under ASan and UBSan
+        run: |
+          make -C c clean >/dev/null
+          make -C c mimo EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+          ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            python c/tests/mimo_tiny_harness.py --binary c/mimo --fixture c/mimo_tiny
+          cd c && ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            python -m unittest tests.test_mimo_prefix_serve tests.test_brio_serve.MimoBrioServe \
+            tests.test_systemone_api.MimoSystemOneEndToEnd
 
   v4-tiny:
     name: Linux (generated tiny V4 target oracle)
@@ -127,13 +161,25 @@ jobs:
           python c/tools/make_glm53_streaming_pair.py --fixture /tmp/glm53_mm --output /tmp/glm53_stream
           python c/tools/make_edge_tiny_tokenizer.py --vocab-size 281 /tmp/glm53_stream-i4
           cd c && COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_dashboard
+          COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_context_exceeded
+          COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_hostile_weights
+          COLI_GLM53_FIXTURE=/tmp/glm53_mm python -m unittest -v tests.test_glm53_hostile_weights.Glm53MatrixShapeTest
+      # The two stdlib-only oracles used to be argparse scripts that `make
+      # test-python` collected as zero tests (#1700). They run here, on the
+      # fixtures generated above, token-exact against transformers in f32.
+      - name: Run the GLM-5.3 tiny oracles
+        run: |
+          cd c && GLM53_TINY=/tmp/glm53_tiny GLM53_MM_TINY=/tmp/glm53_mm python -m unittest -v tests.test_glm53_oracles
+          GLM53_TINY=/tmp/glm53_tiny COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_prefill_batch
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to
     # single-threaded automatically if it's ever missing).
     name: macOS (colibri + V4 platform gate)
     runs-on: macos-latest
-    timeout-minutes: 15
+    # `make check` here now takes about 14.5 minutes; at 15 the job was cut
+    # off inside the Python suite with no test failed, and showed as red.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: install libomp

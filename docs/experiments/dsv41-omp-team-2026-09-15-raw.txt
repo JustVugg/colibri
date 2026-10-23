@@ -1,0 +1,91 @@
+Raw per-run engine stderr for the OpenMP-team experiment, filtered to the
+lines it rests on, plus the perf symbol summary. Full logs are attached to
+the PR.
+
+--- before the fix: shipped default, 208 logical CPUs (three cold runs from the expert-I/O A/B, same container/prompt/reference) ---
+[ab_final_P_0.err]
+Matching tokens: 16/16
+[v41] prefill 25 tokens in 144.55s | decode 16 in 254.02s (0.06 tok/s)
+[v41] experts: 4956 hits, 5274 misses, 99154.6 MB read | disk 20.44s, expert matmul 190.64s, attention 111.50s, engram 0.79s
+
+[ab_final_P_1.err]
+Matching tokens: 16/16
+[v41] prefill 25 tokens in 142.95s | decode 16 in 251.48s (0.06 tok/s)
+[v41] experts: 4956 hits, 5274 misses, 99154.6 MB read | disk 20.29s, expert matmul 188.98s, attention 109.95s, engram 0.80s
+
+[ab_final_P_2.err]
+Matching tokens: 16/16
+[v41] prefill 25 tokens in 143.33s | decode 16 in 249.85s (0.06 tok/s)
+[v41] experts: 4956 hits, 5274 misses, 99154.6 MB read | disk 20.27s, expert matmul 186.93s, attention 110.52s, engram 0.80s
+
+--- thread sweep: one variable, cold cache, token-exact gate on every run ---
+[omp_8.err]
+Matching tokens: 16/16
+[v41] prefill 25 tokens in 14.02s | decode 16 in 17.34s (0.92 tok/s)
+[v41] experts: 4956 hits, 5274 misses, 99154.6 MB read | disk 15.93s, expert matmul 5.91s, attention 4.61s, engram 0.50s
+
+[omp_16.err]
+Matching tokens: 16/16
+[v41] prefill 25 tokens in 11.60s | decode 16 in 13.89s (1.15 tok/s)
+[v41] experts: 4956 hits, 5274 misses, 99154.6 MB read | disk 16.11s, expert matmul 3.68s, attention 2.54s, engram 0.37s
+
+[omp_32.err]
+Matching tokens: 16/16
+[v41] prefill 25 tokens in 10.51s | decode 16 in 13.24s (1.21 tok/s)
+[v41] experts: 4956 hits, 5274 misses, 99154.6 MB read | disk 16.12s, expert matmul 3.16s, attention 1.91s, engram 0.32s
+
+[omp_52.err]
+Matching tokens: 16/16
+[v41] prefill 25 tokens in 10.64s | decode 16 in 13.31s (1.20 tok/s)
+[v41] experts: 4956 hits, 5274 misses, 99154.6 MB read | disk 16.35s, expert matmul 3.83s, attention 1.56s, engram 0.32s
+
+[omp_64.err]
+Matching tokens: 16/16
+[v41] prefill 25 tokens in 10.72s | decode 16 in 21.57s (0.74 tok/s)
+[v41] experts: 4956 hits, 5274 misses, 99154.6 MB read | disk 16.73s, expert matmul 9.14s, attention 3.33s, engram 0.32s
+
+[omp_104.err]
+Matching tokens: 16/16
+[v41] prefill 25 tokens in 11.56s | decode 16 in 21.05s (0.76 tok/s)
+[v41] experts: 4956 hits, 5274 misses, 99154.6 MB read | disk 16.53s, expert matmul 10.45s, attention 2.61s, engram 0.36s
+
+[omp_208.err]
+Matching tokens: 16/16
+[v41] prefill 25 tokens in 141.26s | decode 16 in 247.23s (0.06 tok/s)
+[v41] experts: 4956 hits, 5274 misses, 99154.6 MB read | disk 20.32s, expert matmul 185.26s, attention 108.62s, engram 0.78s
+
+--- after the fix: shipped default, no env override (three cold runs) ---
+[after_1.err]
+[OMP] deepseek-v41: 104 physical-core threads instead of 208 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+Matching tokens: 16/16
+[v41] prefill 25 tokens in 11.37s | decode 16 in 18.64s (0.86 tok/s)
+[v41] experts: 4956 hits, 5274 misses, 99154.6 MB read | disk 16.46s, expert matmul 8.36s, attention 2.54s, engram 0.35s
+
+[after_2.err]
+[OMP] deepseek-v41: 104 physical-core threads instead of 208 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+Matching tokens: 16/16
+[v41] prefill 25 tokens in 11.28s | decode 16 in 18.55s (0.86 tok/s)
+[v41] experts: 4956 hits, 5274 misses, 99154.6 MB read | disk 16.71s, expert matmul 8.52s, attention 2.15s, engram 0.31s
+
+[after_3.err]
+[OMP] deepseek-v41: 104 physical-core threads instead of 208 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+Matching tokens: 16/16
+[v41] prefill 25 tokens in 12.86s | decode 16 in 20.96s (0.76 tok/s)
+[v41] experts: 4956 hits, 5274 misses, 99154.6 MB read | disk 17.17s, expert matmul 11.23s, attention 2.51s, engram 0.35s
+
+--- perf, 208 threads (the shipped default) ---
+# Total Lost Samples: 0
+# Samples: 5M of event 'cycles:P'
+# Overhead  Shared Object         Symbol                                          IPC   [IPC Coverage]
+    38.65%  libgomp.so.1.0.0      [.] 0x00000000000256c0                          -      -            
+    35.85%  libgomp.so.1.0.0      [.] 0x00000000000258a0                          -      -            
+     4.91%  libgomp.so.1.0.0      [.] 0x00000000000256c2                          -      -            
+     4.63%  libgomp.so.1.0.0      [.] 0x00000000000258a2                          -      -            
+     4.35%  libgomp.so.1.0.0      [.] 0x00000000000256cb                          -      -            
+     4.05%  libgomp.so.1.0.0      [.] 0x00000000000258ab                          -      -            
+     1.24%  [kernel.kallsyms]     [k] native_queued_spin_lock_slowpath            -      -            
+     1.15%  libgomp.so.1.0.0      [.] 0x00000000000256cf                          -      -            
+     1.10%  libgomp.so.1.0.0      [.] 0x00000000000258b1                          -      -            
+     0.56%  libgomp.so.1.0.0      [.] 0x00000000000256c6                          -      -            
+     0.55%  libgomp.so.1.0.0      [.] 0x00000000000258a6                          -      -            
+

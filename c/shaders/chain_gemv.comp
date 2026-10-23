@@ -1,0 +1,104 @@
+#version 450
+// The dense chain's decode GEMV (vk_chain.c, VKC_P_GEMV4): y[s,o] = sum_i x[s,i] *
+// dequant(W[o,i]), the qmatmul.comp contract (same bindings, push constants and weight
+// layout) for the formats a dense trunk uses, read 16 bytes per lane per step:
+//   1  int8 rows, one scale per row (16 weights per step)
+//   4  int4 in groups of 64, nibble - 8, low nibble = even column (32 per step)
+//   10 f32 (4 per step), 11 bf16 and 14 f16, low half = even column (8 per step)
+// qmatmul.comp reads one 32-bit word per lane per step and checks every element
+// against I; on an integrated GPU at its floor clock that leaves the GEMV short of
+// loads in flight and long on instructions (measured on a Radeon 780M: int8 at 22 to
+// 31 GB/s of weights). Here a lane loads a uvec4, decodes with one bitfield extract
+// per value, and four partial sums run side by side; x[s,:] sits in shared memory
+// padded with zeros to the row's padded length, and the weight rows' padding is zero
+// too (the backend zeroes it), so the steps carry no bounds checks.
+// A row is spread over lpr lanes (a power of two up to the subgroup, from the host:
+// about eight steps per lane), so a subgroup works on subgroup/lpr rows at once and
+// a short row does not leave most of its steps to the per-row reduction.
+// The host takes this shader only when a row is a whole number of 16-byte steps
+// (rowWords % 4 == 0), I % 4 == 0, and the padded row fits the staging array (XS
+// vec4s, a specialization constant from the device's shared-memory limit).
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int XS = 2048;
+
+layout(std430, binding = 0) readonly buffer X4 { vec4 x4[]; };
+layout(std430, binding = 1) readonly buffer W4 { uvec4 w4[]; };
+layout(std430, binding = 2) readonly buffer Sc { float scale[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int fmt, S, I, O, rowWords, gs;
+    int lpr;            // lanes per row, a power of two
+} p;
+
+shared vec4 xs[XS];
+
+float sb(uint w, int off) { return float(bitfieldExtract(int(w), off, 8)); }      // signed byte
+float nb(uint w, int off) { return float(bitfieldExtract(w, off, 4)) - 8.0; }      // nibble - 8
+vec2 bf(uint w) { return vec2(uintBitsToFloat(w << 16), uintBitsToFloat(w & 0xffff0000u)); }
+
+void main() {
+    int s = int(gl_WorkGroupID.y);
+    int tid = int(gl_LocalInvocationID.x);
+    int nq = p.rowWords / 4;                            // uvec4 steps per row
+    int per = p.fmt == 1 ? 16 : p.fmt == 4 ? 32 : p.fmt == 11 || p.fmt == 14 ? 8 : 4;   // values per step
+    int nx4 = nq * per / 4, i4 = p.I / 4;              // padded x length in vec4s
+    for (int k = tid; k < nx4; k += 256) xs[k] = k < i4 ? x4[s * i4 + k] : vec4(0.0);
+    barrier();
+    int sg = int(gl_SubgroupID), sgs = int(gl_SubgroupSize);
+    int lpr = min(p.lpr, sgs), rps = sgs / lpr;
+    int sub = int(gl_SubgroupInvocationID) / lpr, lane = int(gl_SubgroupInvocationID) % lpr;
+    int nsg = 256 / sgs, stride = int(gl_NumWorkGroups.x) * nsg * rps;
+    int ng = p.gs > 0 ? (p.I + p.gs - 1) / p.gs : 1;
+    for (int o0 = (int(gl_WorkGroupID.x) * nsg + sg) * rps; o0 < p.O; o0 += stride) {
+        int o = o0 + sub;
+        bool live = o < p.O;
+        int rb = o * nq, nql = live ? nq : 0;
+        float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+        if (p.fmt == 1) {
+            for (int q = lane; q < nql; q += lpr) {
+                uvec4 w = w4[rb + q]; int xb = q * 4;
+                vec4 x0 = xs[xb], x1 = xs[xb + 1], x2 = xs[xb + 2], x3 = xs[xb + 3];
+                a0 += x0.x * sb(w.x, 0) + x0.y * sb(w.x, 8) + x0.z * sb(w.x, 16) + x0.w * sb(w.x, 24);
+                a1 += x1.x * sb(w.y, 0) + x1.y * sb(w.y, 8) + x1.z * sb(w.y, 16) + x1.w * sb(w.y, 24);
+                a2 += x2.x * sb(w.z, 0) + x2.y * sb(w.z, 8) + x2.z * sb(w.z, 16) + x2.w * sb(w.z, 24);
+                a3 += x3.x * sb(w.w, 0) + x3.y * sb(w.w, 8) + x3.z * sb(w.w, 16) + x3.w * sb(w.w, 24);
+            }
+        } else if (p.fmt == 4) {
+            for (int q = lane; q < nql; q += lpr) {
+                uvec4 w = w4[rb + q]; int xb = q * 8;
+                float sc = scale[o * ng + (q * 32) / p.gs];
+                float t0 = 0.0, t1 = 0.0, t2 = 0.0, t3 = 0.0;
+                [[unroll]] for (int k = 0; k < 2; k++) {
+                    vec4 xa = xs[xb + k], xc = xs[xb + 2 + k], xe = xs[xb + 4 + k], xg = xs[xb + 6 + k];
+                    int sh = k * 16;
+                    t0 += xa.x * nb(w.x, sh) + xa.y * nb(w.x, sh + 4) + xa.z * nb(w.x, sh + 8) + xa.w * nb(w.x, sh + 12);
+                    t1 += xc.x * nb(w.y, sh) + xc.y * nb(w.y, sh + 4) + xc.z * nb(w.y, sh + 8) + xc.w * nb(w.y, sh + 12);
+                    t2 += xe.x * nb(w.z, sh) + xe.y * nb(w.z, sh + 4) + xe.z * nb(w.z, sh + 8) + xe.w * nb(w.z, sh + 12);
+                    t3 += xg.x * nb(w.w, sh) + xg.y * nb(w.w, sh + 4) + xg.z * nb(w.w, sh + 8) + xg.w * nb(w.w, sh + 12);
+                }
+                a0 += (t0 + t1 + t2 + t3) * sc;
+            }
+        } else if (p.fmt == 11 || p.fmt == 14) {
+            for (int q = lane; q < nql; q += lpr) {
+                uvec4 w = w4[rb + q]; int xb = q * 2;
+                vec4 x0 = xs[xb], x1 = xs[xb + 1];
+                vec2 b0, b1, b2, b3;
+                if (p.fmt == 11) { b0 = bf(w.x); b1 = bf(w.y); b2 = bf(w.z); b3 = bf(w.w); }
+                else { b0 = unpackHalf2x16(w.x); b1 = unpackHalf2x16(w.y); b2 = unpackHalf2x16(w.z); b3 = unpackHalf2x16(w.w); }
+                a0 += x0.x * b0.x + x0.y * b0.y;
+                a1 += x0.z * b1.x + x0.w * b1.y;
+                a2 += x1.x * b2.x + x1.y * b2.y;
+                a3 += x1.z * b3.x + x1.w * b3.y;
+            }
+        } else {
+            for (int q = lane; q < nql; q += lpr) a0 += dot(xs[q], uintBitsToFloat(w4[rb + q]));
+        }
+        float tot = (a0 + a1) + (a2 + a3);
+        for (int off = lpr / 2; off > 0; off >>= 1) tot += subgroupShuffleXor(tot, uint(off));
+        if (lane == 0 && live) y[s * p.O + o] = p.fmt == 1 ? tot * scale[o] : tot;
+    }
+}

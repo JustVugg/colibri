@@ -12,7 +12,9 @@
  *   - uniq[nu++] = -1 handed to expert_load().
  *
  * Fix under test: router_best_or_fallback() maps a failed scan to a deterministic
- * in-range expert and warns once. Degrade + diagnose, never index out of range.
+ * in-range expert and warns once, while router_select_topk() marks selected
+ * scores instead of rescanning the chosen prefix. Degrade + diagnose, never
+ * index out of range.
  *
  * No model file needed: exercises the guard and the exact scan that trips it. */
 #include <assert.h>
@@ -58,6 +60,23 @@ int main(void){
     for(int kk=E;kk<E+4;kk++){
         int b=router_best_or_fallback(-1,kk,E,0);
         assert(b>=0 && b<E && "fallback stays in range past E");
+    }
+
+    /* --- the fast scan preserves the old finite-score ordering --- */
+    { float choice[8]={0.11f,0.91f,0.37f,0.63f,NAN,0.22f,0.77f,0.48f};
+      float fast_choice[8]; memcpy(fast_choice,choice,sizeof choice);
+      int old[5], fast[5];
+      for(int kk=0;kk<5;kk++){
+          old[kk]=router_best_or_fallback(scan_best(choice,E,old,kk),kk,E,0);
+      }
+      router_select_topk(fast_choice,E,5,fast,0);
+      for(int kk=0;kk<5;kk++) assert(fast[kk]==old[kk] && "fast top-K ordering changed");
+    }
+
+    /* The optimized path keeps the NaN fallback bounded and distinct too. */
+    { float choice[8]; for(int e=0;e<E;e++) choice[e]=NAN;
+      int idx[4]; router_select_topk(choice,E,4,idx,0);
+      for(int kk=0;kk<4;kk++) assert(idx[kk]==kk && "fast fallback must stay deterministic");
     }
 
     /* --- end to end: the accounting arrays are indexed safely after the guard --- */

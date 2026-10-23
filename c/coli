@@ -3,6 +3,9 @@
 colibri — tiny engine, immense model.
 Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
 
+  coli setup                one step: find the hardware, pick a model, build or fetch
+                            the engine, download, then start the dashboard
+  coli start / status / logs  start, inspect, or read the log of what setup configured
   coli chat                 interactive chat (loads the model once)
   coli serve                OpenAI-compatible HTTP API (persistent engine)
   coli run "prompt"         one-shot generation
@@ -24,7 +27,7 @@ Configuration through environment variables or flags (also valid after the subco
   --topp P           adaptive expert top-p             --topk N   fixed top-k
   --ngen N           maximum response tokens           --cap N    cache slots/layer
 """
-import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct, shlex
+import os, sys, subprocess, argparse, json, math, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct, shlex
 
 # input() only gets line editing and UP/DOWN history once the readline module
 # has been LOADED — without it the terminal's arrow-key escape sequences are
@@ -32,9 +35,9 @@ import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re,
 # and the console provides its own editing; on FreeBSD Python links libedit,
 # which this activates the same way.
 try:
-    import readline  # noqa: F401 — importing it is the activation
+    import readline
 except ImportError:
-    pass
+    readline = None
 
 # The engine mmaps every shard (144+ files); macOS default RLIMIT_NOFILE is 256.
 if sys.platform != "win32":
@@ -53,7 +56,10 @@ if sys.platform == "win32":
         try: s.reconfigure(encoding="utf-8")
         except (AttributeError, OSError): pass
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# realpath, not abspath: on a merged-/usr system /bin and /sbin are symlinks
+# to /usr/bin, and an installed launcher invoked as /bin/coli would otherwise
+# derive /libexec/colibri instead of /usr/libexec/colibri (#1689).
+HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
 # version.py sits next to this script in a source checkout, but an installed
 # layout puts the launcher in $(PREFIX)/bin while the support modules live in
@@ -69,7 +75,7 @@ except ModuleNotFoundError:
         _version = "unknown"
 
 from family_registry import (FamilyConfigError, UnknownFamilyError, all_families,
-                             family_by_id, family_for_config, resolve_model,
+                             display_for, family_by_id, family_for_config, resolve_model,
                              tuning_replay_prompt)
 
 _TUNE_ROTATION_PROMPT = (
@@ -184,15 +190,33 @@ def model_banner_line(model):
                f"MoE experts streamed from disk · CPU")
     if not model:
         return generic
+    if is_image_model(model):
+        return image_banner_line(model) or generic
+    if is_decision_model(model):
+        try:
+            resolved = resolve_model(model)
+            name, scale = display_for(resolved)
+            size = os.path.getsize(os.path.join(model, "model.safetensors"))
+        except (FamilyConfigError, UnknownFamilyError, OSError):
+            return generic
+        return " · ".join(bit for bit in (name, scale, "decision model",
+                                          f"{size/1e6:.0f} MB on disk" if size else "") if bit)
     try:
         with open(os.path.join(model, "config.json"), encoding="utf-8") as f:
             cfg = json.load(f)
     except (OSError, ValueError, TypeError):
         return generic
     kind = (cfg.get("model_type") or "").lower()
+    geometry = cfg
     try:
-        family = resolve_model(model).descriptor
-        name, scale = family.display_name, family.display_scale
+        resolved = resolve_model(model)
+        family = resolved.descriptor
+        # Size-aware: a family's model_type can span checkpoints an order of
+        # magnitude apart (Qwen3.6-35B and Qwen3.8-2.4T both resolve to
+        # qwen36). display_for names the geometry actually on disk, and
+        # falls back to the model_type when it recognises none.
+        name, scale = display_for(resolved)
+        geometry = resolved.family_config
         # display_scale e' la taglia del checkpoint di riferimento. Un REAP ha
         # lo stesso model_type e meno esperti: "284B" su un 150B e' #1367
         # di nuovo. Quando la geometria non e' quella del riferimento si
@@ -206,10 +230,11 @@ def model_banner_line(model):
         scale = ""
 
     bits = [name]
+    experts = geometry.get("n_routed_experts") or geometry.get("num_experts")
     if scale:
-        bits.append(f"{scale} MoE" if cfg.get("n_routed_experts") else scale)
+        bits.append(f"{scale} MoE" if experts else scale)
     else:
-        layers, experts = cfg.get("num_hidden_layers"), cfg.get("n_routed_experts")
+        layers = geometry.get("num_hidden_layers")
         if layers and experts:
             bits.append(f"{layers}L x {experts}E MoE")
         elif layers:
@@ -226,6 +251,84 @@ def model_banner_line(model):
             bits.append(f"{size/1e6:.0f} MB on disk")
     except OSError:
         pass
+    return " · ".join(bits)
+
+def is_image_model(model):
+    """A diffusers pipeline (model_index.json, no root config.json): the image
+    REPL, the image planner and the images endpoint instead of chat."""
+    try:
+        from image_engine import is_image_model_dir
+    except ImportError:
+        return False
+    try:
+        return is_image_model_dir(model)
+    except (OSError, TypeError):
+        return False
+
+def is_decision_model(model):
+    """A decision checkpoint (Laya: rl_agent_config.json, no root config.json;
+    GLiNER2.5-Decide: a GLiNER2 extractor config.json): served by coli serve /
+    coli web on POST /v1/systemone, never chatted with."""
+    try:
+        return resolve_model(model).descriptor.modality == "decision"
+    except (FamilyConfigError, UnknownFamilyError, OSError, TypeError, ValueError):
+        return False
+
+# What bounds the tokens a decision engine reads, and the variable that moves it.
+DECISION_LENGTH = {
+    "laya": ("at most its checkpoint's max_len per question", "COLI_LAYA_MAX_LEN"),
+    "gliner_decide": ("every question and the state in one sequence of at most 4096 tokens",
+                      "COLI_GLINER_MAX_LEN"),
+}
+
+def is_gliner_decide(model):
+    try:
+        return resolve_model(model).descriptor.id == "gliner_decide"
+    except (FamilyConfigError, UnknownFamilyError, OSError, TypeError, ValueError):
+        return False
+
+def decision_head_line(model, resolved):
+    """`coli info`'s line for a decision head over a chat model (Clef): what it
+    adds, and that the chat stays."""
+    from family_registry import decision_head_of
+    head = decision_head_of(resolved)
+    try:
+        with open(os.path.join(model, head.files[0]), encoding="utf-8") as f:
+            cfg = json.load(f)
+        shape = (f"{cfg.get('routing_layers')} routing + {cfg.get('layers')} decoder layers, "
+                 f"width {cfg.get('width')}")
+    except (OSError, ValueError, AttributeError):
+        shape = "head config unreadable"
+    return (f"{head.display_name} joint schema head ({shape}): POST /v1/systemone answers "
+            f"natively; chat, completions and messages work as on any {resolved.descriptor.id} model")
+
+def decision_refusal(family):
+    """What every chatting command says about a decision model, and where to go.
+    Laya ships a calibration; GLiNER2.5-Decide gives its classifier's softmax."""
+    answers = "calibrated probabilities" if family.id == "laya" else "a probability per option"
+    return (f"{C.yel}{family.display_name} is a decision model:{C.r} it answers typed questions "
+            f"(choice, score, noul) with {answers} and does not chat.\n"
+            f"  Start it with: coli serve --model <dir>   (or coli web for the dashboard)\n"
+            f"  then POST /v1/systemone (docs/systemone.md, \"Decision engines\")")
+
+def image_banner_line(model):
+    """Banner line of an image model: name, what it does, bytes on disk. Sizes
+    come from stat() alone; the banner must never parse a header."""
+    try:
+        name = resolve_model(model).descriptor.display_name
+    except (FamilyConfigError, UnknownFamilyError, OSError):
+        return None
+    size = 0
+    for part in ("text_encoder", "transformer", "vae"):
+        folder = os.path.join(model, part)
+        try:
+            size += sum(os.path.getsize(os.path.join(folder, x)) for x in os.listdir(folder)
+                        if x.endswith(".safetensors"))
+        except OSError:
+            pass
+    bits = [name, "text-to-image"]
+    if size >= 1e9: bits.append(f"{size/1e9:.1f} GB on disk")
+    elif size: bits.append(f"{size/1e6:.0f} MB on disk")
     return " · ".join(bits)
 
 def banner(sub="", *, model=None):
@@ -363,10 +466,17 @@ def require_model(model, file="tokenizer.json", engine=None, target="", build="c
 def need_model(model, engine=None):
     # Directory/file checks come FIRST: resolving the family reads config.json,
     # and a missing model dir must say "model not found", not "unsupported model".
-    require_model(model, file="tokenizer.json")
+    # An image pipeline keeps its tokenizer in processor/, not at the root.
+    require_model(model, file=None)
+    tokenizer = "tokenizer.json"
+    if is_image_model(model) or is_decision_model(model):
+        # a decision checkpoint keeps it in tokenizer/ (Laya)
+        try: tokenizer = resolve_model(model).descriptor.tokenizer_file
+        except (FamilyConfigError, UnknownFamilyError): pass   # engine_for says why, below
+    require_model(model, file=tokenizer)
     engine = engine or engine_for(model)
     target = resolve_model(model).descriptor.build_target
-    require_model(model, file="tokenizer.json", engine=engine, target=target,
+    require_model(model, file=tokenizer, engine=engine, target=target,
                   build=f"make -C c {target}")
 
 # One-shot runs keep the historic 1024. Interactive sessions get 16384, because
@@ -431,6 +541,13 @@ def env_for_engine(a, arch, plan=None):
     env.pop(_PROFILE_CAP_ENV,None)
     env.pop(_PLAN_CAP_ENV,None)
     family=family_by_id(arch)
+    if family.modality == "image" and getattr(a, "ctx", None):
+        sys.exit(f"{C.yel}--ctx does not apply to {family.display_name}:{C.r} an image model has "
+                 f"no context window (the prompt goes through its text encoder once)")
+    if family.modality == "decision" and getattr(a, "ctx", None):
+        reads, knob = DECISION_LENGTH.get(family.id, ("what its engine allows", "its engine's own variable"))
+        sys.exit(f"{C.yel}--ctx does not apply to {family.display_name}:{C.r} a decision model reads "
+                 f"{reads} ({knob} overrides it)")
     if getattr(a,"ram",0): explicit_env.add("RAM_GB")
     # OMP_NUM_THREADS for the sister engines that do not size their own team.
     #
@@ -465,6 +582,14 @@ def env_for_engine(a, arch, plan=None):
                 env.setdefault("OMP_PLACES", "cores")
     env["NGEN"] = str(ngen_for(a, family=arch))
     if a.temp is not None: env["COLI_TEMP"] = str(a.temp)
+    # SNAP is how every engine but GLM learns its model directory. env_for()
+    # sets it for GLM and openai_server.py sets it for the gateway, so `coli
+    # chat` and `coli serve` worked while `coli run` handed the sister engines
+    # an environment without it: OLMoE exited with "started without a model"
+    # (#1501, #1600). Set it here, once, for all of them. --model is the
+    # directory, same as env_for(): a leftover SNAP must not load another model.
+    if getattr(a, "model", None):
+        env["SNAP"] = os.path.abspath(a.model)
     if arch == "olmoe":
         env["CHAT"] = "1"
         env["MAX_NEW"] = str(ngen_for(a, family=arch))
@@ -476,7 +601,7 @@ def env_for_engine(a, arch, plan=None):
     # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
     # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
     # user's session ran itself out of memory with the flag apparently set.
-    if arch in ("deepseek_v4", "kimi", "glm53", "olmoe"):
+    if arch in ("deepseek_v4", "deepseek_v41", "kimi", "glm53", "olmoe", "mimo"):
         if a.ram: env["RAM_GB"] = str(a.ram)
     if arch == "glm53":
         # I densi vanno a int4 di default: sono 9,7 B parametri su 321, e in
@@ -537,7 +662,7 @@ def env_for_engine(a, arch, plan=None):
             if arch == "deepseek_v4":
                 if not dsv4_cuda_available(a.model):
                     sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} {dsv4_cuda_build_hint()}")
-            elif not cuda_binary():
+            elif not cuda_binary(engine_for_gpu_check(a)):
                 sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} the engine binary is CPU-only")
             env["COLI_CUDA"] = "1"
             if gpu != "auto":
@@ -547,11 +672,16 @@ def env_for_engine(a, arch, plan=None):
         if arch == "deepseek_v4":
             if not dsv4_cuda_available(a.model):
                 sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} {dsv4_cuda_build_hint()}")
-        elif not cuda_binary():
+        elif not cuda_binary(engine_for_gpu_check(a)):
             sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
         env["COLI_CUDA"] = "1"
         env["CUDA_EXPERT_GB"] = str(vram)
-    if getattr(a, "auto_tier", False):
+    if getattr(a, "auto_tier", False) and family.modality in ("image", "decision"):
+        # The tier plan places experts and KV state; an image or decision model
+        # has neither, and build_plan would stop on "no safetensors shards".
+        print(f"  {C.dim}[PLAN] --auto-tier has nothing to place for "
+              f"{family.display_name}; coli plan shows its RAM{C.r}", file=sys.stderr)
+    elif getattr(a, "auto_tier", False):
         # GLM has historically applied both the resource plan and its measured
         # profile inside env_for().  The sibling launcher returned above that
         # code path, so #1196 could measure and save a perfectly valid Kimi,
@@ -562,16 +692,18 @@ def env_for_engine(a, arch, plan=None):
                 ram,ctx,devices,vram=resource_request(a,env)
                 plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
                                 kv_slots=requested_kv_slots(a,env))
-            # Preserve the existing non-GLM GPU contract: explicit --gpu/--vram
-            # selects a capable build above. Merely asking for auto-tier must not
-            # turn a CPU-only sibling binary into an attempted CUDA launch.
             plan_must_not_choose_omp=("OMP_NUM_THREADS" not in env
                                       and (arch == "deepseek_v4"
                                            or env.get("COLI_NO_OMP_TUNE")))
-            env=environment_for_plan(plan,env,
-                                     cuda_enabled=env.get("COLI_CUDA") == "1")
+            gpu_off_by_request = env.get("COLI_CUDA") == "0"
+            cuda_on = plan_cuda_enabled(a, arch, env)
+            env=environment_for_plan(plan,env,cuda_enabled=cuda_on)
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
+        # Outside the try on purpose: this only prints, and a display helper
+        # that stumbled inside it would be reported as "invalid resource plan"
+        # and take the launch down with it.
+        if not cuda_on: report_unapplied_vram_tier(plan, gpu_off_by_request)
         if plan_must_not_choose_omp:
             # environment_for_plan supplies the physical-core default used by
             # the other engines. V4 deliberately computes logical CPUs minus
@@ -589,6 +721,14 @@ def env_for_engine(a, arch, plan=None):
                 gain=100.0*profile["gain"]
                 print(f"  {C.dim}[TUNE] applied measured profile · +{gain:.1f}% "
                       f"calibration throughput{C.r}",file=sys.stderr)
+    # Kimi's CUDA path is gated on K3_CUDA, not COLI_CUDA. --gpu / --vram /
+    # auto-tier write COLI_CUDA=1 after proving the build; without this copy
+    # the flag was accepted and the experts still stayed on the CPU.
+    if arch == "kimi":
+        if env.get("COLI_CUDA") == "0":
+            env["K3_CUDA"] = "0"
+        elif env.get("COLI_CUDA") == "1" and "K3_CUDA" not in explicit_env:
+            env["K3_CUDA"] = "1"
     return env
 
 def dsv4_cuda_available(model=None):
@@ -600,8 +740,11 @@ def dsv4_cuda_available(model=None):
     # not make a CPU engine look GPU-capable.
     eng = engine_for(model) if model else GLM
     if sys.platform == "win32":
-        dll = os.path.join(os.path.dirname(eng), "coli_cuda_dsv4.dll")
-        return os.path.exists(dll)
+        # backend_loader_dsv4.c tries the DeepGEMM build first and the generic
+        # one second, so either next to the engine starts the tier (the same
+        # two names `coli doctor` accepts).
+        return any(os.path.exists(os.path.join(os.path.dirname(eng), name))
+                   for name in ("coli_cuda_dsv4_dg.dll", "coli_cuda_dsv4.dll"))
     if sys.platform == "linux" and os.path.exists(eng):
         try:
             linked = subprocess.run(["ldd", eng], capture_output=True, text=True, timeout=3)
@@ -629,30 +772,52 @@ def need_worker_model(model):
                   build=f"make -C c {family.build_target}")
     return engine
 
-def cuda_binary():
-    if not os.path.exists(GLM): return False
+def engine_for_gpu_check(a):
+    """The family's engine path for cuda_binary(), or None (the GLM default)
+    when the model cannot be resolved here: the check must not turn a missing
+    config.json into a different error than the one need_model() gives."""
+    model = getattr(a, "model", None)
+    if not model: return None
+    try: return engine_for(model)
+    except (FamilyConfigError, UnknownFamilyError, OSError): return None
+
+def cuda_binary(engine=None):
+    """Was `engine` (default: the GLM binary) built with the GPU backend?
+    Callers that know the family pass its engine: checking colibri.exe for a
+    qwen36 run refused --gpu on a correct qwen36 CUDA build (#1533)."""
+    engine = engine or GLM
+    if not os.path.exists(engine): return False
     if sys.platform == "linux":
         try:
-            linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
+            linked=subprocess.run(["ldd",engine],capture_output=True,text=True,timeout=3)
             # Detect both CUDA (libcudart) and HIP (libamdhip64) builds.
             return any(("libcudart" in line or "libamdhip64" in line) and "not found" not in line
                        for line in linked.stdout.splitlines())
         except (OSError,subprocess.SubprocessError): return False
     if sys.platform == "win32":
-        # Windows CUDA_DLL=1 builds never link libcudart directly: glm.exe loads
-        # coli_cuda.dll at runtime via LoadLibrary (backend_loader.c), so there's no
-        # import-table entry for ldd/dumpbin to see. Detect the COLI_CUDA build via a
-        # marker string baked into glm.c's #ifdef COLI_CUDA block instead, and require
-        # coli_cuda.dll to actually sit next to glm.exe (else CUDA init fails at startup).
+        # Windows CUDA_DLL/HIP_DLL hosts never link the GPU runtime directly:
+        # the engine LoadLibrary's its backend (backend_loader.c). The host
+        # compiles exactly one basename -- coli_hip.dll or coli_cuda.dll --
+        # and that is the file that must sit next to it. The GLM/Qwen banner
+        # is not a GPU-build marker: Kimi K3 CUDA_DLL builds link the same
+        # loader without printing it, and a HIP host that only had coli_hip.dll
+        # used to be refused as CPU-only.
         try:
-            with open(GLM,"rb") as f: built=b"[CUDA] mode: routed experts" in f.read()
+            with open(engine,"rb") as f: image=f.read()
         except OSError: return False
-        return built and os.path.exists(os.path.join(os.path.dirname(GLM),"coli_cuda.dll"))
+        from doctor import windows_backend_dll
+        expected=windows_backend_dll(image)
+        if not expected: return False
+        return os.path.exists(os.path.join(os.path.dirname(engine),expected))
     return False
 
 def resource_request(a, env):
-    family=resolve_model(a.model).descriptor if getattr(a,"model",None) else family_by_id("glm")
-    ctx=a.ctx or int(env.get(family.limits.context_env,family.limits.default_context))
+    from family_registry import default_context
+    resolved=resolve_model(a.model) if getattr(a,"model",None) else None
+    family=resolved.descriptor if resolved else family_by_id("glm")
+    # a Clef checkpoint plans for its own 16384 (family_registry.default_context)
+    fallback=default_context(resolved) if resolved else family.limits.default_context
+    ctx=a.ctx or int(env.get(family.limits.context_env,fallback))
     if ctx<1 or ctx>family.limits.max_context:
         raise ValueError(f"--ctx must be between 1 and {family.limits.max_context} "
                          f"for {family.display_name}")
@@ -673,6 +838,73 @@ def requested_kv_slots(a, env):
     value=getattr(a,"kv_slots",None)
     if value is None: value=int(env.get("COLI_KV_SLOTS","1"))
     return value
+
+def plan_cuda_enabled(a, arch, env):
+    """Should --auto-tier apply the VRAM tier that `coli plan` printed?
+
+    Yes exactly when the engine that is about to run was built with a GPU
+    backend, which is the question the GLM path has always asked
+    (`has_cuda=cuda_binary()`), and which is what --auto-tier documents: apply
+    the plan.
+
+    The sibling path used to answer a narrower question -- "did the user pass
+    --gpu or --vram" -- and the comment that guarded it was right at the time:
+    cuda_binary() could only inspect the GLM binary, so a perfectly good qwen36
+    CUDA build looked CPU-only to it and auto-tier had to assume the worst
+    rather than risk launching a CPU-only sibling as a CUDA one. Since #1533
+    the check takes the engine that will actually run, so the thing that
+    contract was protecting against can be TESTED instead of assumed, and
+    assuming it costs the user the tier they were just shown. On the box in
+    #1581 that was 11.8 tok/s against 21, with nothing on screen to explain it.
+
+    A CPU-only build still never gets a CUDA launch: that is what the check
+    below says. `--gpu none` (COLI_CUDA=0) is still the off switch, and an
+    explicit --gpu/--vram has already proved the build before we get here.
+    """
+    value = env.get("COLI_CUDA")
+    if value == "1": return True      # --gpu / --vram validated the build above
+    if value == "0": return False     # --gpu none, or the user set it by hand
+    # DeepSeek V4 links its tier differently on each platform, so it has its own
+    # probe; using cuda_binary() here would reject valid V4 CUDA builds (#1219).
+    if arch == "deepseek_v4": return dsv4_cuda_available(getattr(a, "model", None))
+    return cuda_binary(engine_for_gpu_check(a))
+
+
+def report_unapplied_vram_tier(plan, gpu_off_by_request=False):
+    """Say so when a real VRAM tier from the plan is not going into the launch.
+
+    After plan_cuda_enabled() there are only two ways to get here, and the user
+    can act on exactly one of them, so the notice says which: the GPU was turned
+    off by request, or the engine binary has no GPU backend to turn on.
+
+    Being told matters because `coli plan` and `coli doctor` print the VRAM tier
+    as part of the plan and --auto-tier is documented as applying that plan. In
+    #1581 the tier vanished with nothing on screen connecting the two, and the
+    reporter only found it by watching nvidia-smi.
+
+    The test for "real" is the planner's own: a device qualified to drive
+    placement, and a budget above zero. Anything else was not going to be
+    applied with the GPU on either, and saying so would be noise.
+    """
+    try:
+        from resource_plan import plans_placement, GB
+        vram = plan["tiers"]["vram"]
+        devices = [d for d in vram["devices"] if plans_placement(d)]
+        budget = vram["budget_bytes"]
+    except (ImportError, KeyError, TypeError, AttributeError):
+        return
+    if not devices or budget <= 0:
+        return
+    where = ", ".join(f"{d['index']}:{d.get('name') or 'GPU'}" for d in devices)
+    why = ("--gpu none turns the GPU off, so the tier is not applied. Drop it "
+           "to use the plan as printed."
+           if gpu_off_by_request else
+           "the engine binary has no GPU backend, so there is nothing to apply "
+           "it with. Rebuild the engine with CUDA=1 to use it.")
+    print(f"  {C.yel}[PLAN] the plan's VRAM tier is not being applied{C.r}\n"
+          f"  {C.dim}{budget / GB:.1f} GB on {where} stays unused: {why}{C.r}",
+          file=sys.stderr)
+
 
 def env_for(a):
     explicit_env = set(os.environ)
@@ -737,6 +969,9 @@ def env_for(a):
         e.setdefault("PIPE", "1")
         e.setdefault("PILOT_REAL", "1")
     e["COLI_POLICY"]=a.policy
+    # Explicit request only. Absent flag => variable absent => engine default,
+    # which is the current path. Never set from discovery or from a plan.
+    if getattr(a, "xdna", False): e["COLI_XDNA"]="1"
     if getattr(a, "cluster_workers", None): e["CLUSTER_WORKERS"] = a.cluster_workers
     if getattr(a, "cluster_coordinator", None): e["CLUSTER_COORDINATOR"] = a.cluster_coordinator
     if a.ram:  e["RAM_GB"]=str(a.ram)
@@ -802,8 +1037,11 @@ def env_for(a):
         # engine's "CPU" rows were GPU-assisted). --gpu none remains the
         # canonical hard off-switch (works on every platform, also clears the
         # CUDA_* sizing vars).
+        # COLI_VULKAN=1 is a backend choice too (coli setup's, on a card the CUDA
+        # DLL does not run on): CUDA does not stack on it unasked.
         if (sys.platform == "win32" and a.gpu is None and not a.vram
-                and e.get("COLI_CUDA") != "0"):
+                and e.get("COLI_CUDA") != "0"
+                and str(e.get("COLI_VULKAN","")).strip() in ("","0")):
             if cuda_binary():
                 from resource_plan import (discover_gpus, plans_placement, build_plan,
                                            environment_for_plan, format_bytes)
@@ -1009,7 +1247,7 @@ def engine_diag(p, errlog=None):
         try:
             errlog.flush()
             for _ in range(20):         # il drain thread scrive su errlog quando il child chiude
-                tail=open(errlog.name).read().strip()
+                tail=open(errlog.name, encoding="utf-8", errors="replace").read().strip()
                 if tail: break
                 time.sleep(0.05)
             if tail: print(f"  {C.dgray}" + "\n  ".join(tail.splitlines()[-6:]) + f"{C.r}")
@@ -1069,6 +1307,12 @@ def cmd_info(a):
             sys.exit(f"{C.yel}unsupported model:{C.r} {error}")
         family=None
     def row(k,v): print(f"   {C.gray}{k:<10}{C.r} {v}")
+    if family is not None and family.modality == "image":
+        info_image_model(a, family, row)
+        return
+    if family is not None and family.modality == "decision":
+        info_decision_model(a, resolved, row)
+        return
     if os.path.exists(cfgp):
         c=json.load(open(cfgp))
         # Multimodal wrappers such as Qwen3.8 keep the language architecture
@@ -1079,12 +1323,24 @@ def cmd_info(a):
         experts=arch_c.get("n_routed_experts",arch_c.get("num_experts"))
         row("model", a.model)
         row("arch", f"hidden {arch_c.get('hidden_size')} · {arch_c.get('num_hidden_layers')} layer · "
-                    f"{experts} expert/layer · top-{arch_c.get('num_experts_per_tok')}")
+                    + (f"{experts} expert/layer · top-{arch_c.get('num_experts_per_tok')}"
+                       if experts is not None else
+                       f"dense (MLP {arch_c.get('intermediate_size')}, no experts)"))
         sts=[x for x in os.listdir(a.model) if x.endswith('.safetensors')]
         sz=sum(os.path.getsize(os.path.join(a.model,x)) for x in sts)
         row("shards", f"{len(sts)} files · {sz/1e9:.0f} GB on disk")
+        if resolved is not None and resolved.decision_head:
+            row("decision", decision_head_line(a.model, resolved))
     else:
-        print(f"   {C.yel}config.json is missing (incomplete conversion?){C.r}")
+        # No config.json means no family, and no family means no engine: say so
+        # instead of letting the GLM default below stand in. A directory of shards
+        # copied without the small files is the usual shape of this (the Qwen3.8
+        # support case: the GLM engine then died on a tensor name it never had).
+        try: n_shards=len([x for x in os.listdir(a.model) if x.endswith('.safetensors')])
+        except OSError: n_shards=0
+        print(f"   {C.yel}config.json is missing{C.r}: coli picks the engine from it, so nothing can run here yet.")
+        print("   Copy the checkpoint's config.json (with tokenizer.json and model.safetensors.index.json)")
+        print(f"   from the model repo next to the {n_shards} shard(s) found here, then run coli info again.")
     try:
         mi=open('/proc/meminfo').read()
         tot=int(re.search(r'MemTotal:\s+(\d+)',mi).group(1))/1e6
@@ -1096,8 +1352,11 @@ def cmd_info(a):
         row("disk", f"{fs.free/1e9:.0f} GB free")
     except OSError:
         row("disk", "? GB (unavailable)")
-    engine=engine_for(a.model) if family else GLM
-    row("engine", "ready ✓" if os.path.exists(engine) else "not built (coli build)")
+    if family:
+        engine=engine_for(a.model)
+        row("engine", "ready ✓" if os.path.exists(engine) else "not built (coli build)")
+    else:
+        row("engine", "unknown until config.json is present")
     knobs=[]
     if a.ram: knobs.append(f"ram {a.ram}GB")
     if a.topp: knobs.append(f"topp {a.topp}")
@@ -1105,10 +1364,151 @@ def cmd_info(a):
     if knobs: row("tuning", " · ".join(knobs))
     print()
 
+def info_image_model(a, family, row):
+    """`coli info` for a text-to-image pipeline: its parts and their weight on
+    disk, what it produces and where it goes, instead of layers and experts."""
+    from image_engine import inspect_image_model, image_dir, TOKENIZER_FILE
+    try:
+        inv = inspect_image_model(a.model)
+    except (OSError, ValueError) as error:
+        sys.exit(f"{C.yel}cannot read the image model:{C.r} {error}")
+    comps = inv["components"]
+    row("model", a.model)
+    row("type", f"{family.display_name} · text-to-image · diffusers {inv['class']}")
+    labels = (("text_encoder", "text enc."), ("transformer", "DiT"), ("vae", "VAE"))
+    for key, label in labels:
+        comp = comps[key]
+        if not comp["present"]:
+            row(label, f"{C.yel}missing: {key}/ is not in the model directory{C.r}"); continue
+        dtypes = "/".join(d.lower() for d in comp["dtypes"]) or "no weights"
+        extra = ""
+        if key == "text_encoder" and comp.get("unloaded_params"):
+            used = (comp["params"] - comp["unloaded_params"]) / 1e9
+            extra = f" · {used:.1f}B used for prompts (vision tower and lm_head stay on disk)"
+        row(label, f"{comp['class'] or key} · {comp['disk_bytes']/1e9:.1f} GB {dtypes} · "
+                   f"{comp['params']/1e9:.2f}B params{extra}")
+    row("tokenizer", f"{TOKENIZER_FILE} " + ("✓" if inv["tokenizer"] else f"{C.yel}missing{C.r}"))
+    row("scheduler", comps["scheduler"]["class"] or ("present" if comps["scheduler"]["present"] else "missing"))
+    row("on disk", f"{inv['disk_bytes']/1e9:.1f} GB")
+    row("output", f"PNG (RGBA) · saved to {image_dir()} (COLI_IMAGE_DIR)")
+    row("use", "coli chat (TUI, shows the image) · coli run \"prompt\" --out x.png · "
+               "coli serve (POST /v1/images/generations)")
+    if inv["research_license"]:
+        row("license", "Qwen Research License: non-commercial; never redistribute the weights")
+    try:
+        mi=open('/proc/meminfo').read()
+        tot=int(re.search(r'MemTotal:\s+(\d+)',mi).group(1))/1e6
+        av=int(re.search(r'MemAvailable:\s+(\d+)',mi).group(1))/1e6
+        row("RAM", f"{tot:.0f} GB total · {av:.1f} GB available · coli plan sizes the model")
+    except Exception: pass
+    try:
+        row("disk", f"{shutil.disk_usage(a.model).free/1e9:.0f} GB free")
+    except OSError:
+        row("disk", "? GB (unavailable)")
+    engine=engine_for(a.model)
+    row("engine", "ready ✓" if os.path.exists(engine)
+        else f"not built (make -C c {family.build_target})")
+    print()
+
+def decision_weights(model):
+    """Parameters and bytes of a decision checkpoint, from its safetensors header."""
+    import struct
+    params = 0
+    with open(os.path.join(model, "model.safetensors"), "rb") as handle:
+        size = struct.unpack("<Q", handle.read(8))[0]
+        if size > 64 << 20:
+            raise ValueError("model.safetensors: implausible header size")
+        header = json.loads(handle.read(size))
+    for name, entry in header.items():
+        if name == "__metadata__" or not isinstance(entry, dict):
+            continue
+        count = 1
+        for dim in entry.get("shape", []):
+            count *= int(dim)
+        params += count
+    return params, os.path.getsize(os.path.join(model, "model.safetensors"))
+
+def info_decision_model(a, resolved, row):
+    """`coli info` for a decision model: the encoder, the head's budget, what it
+    serves, instead of layers and experts."""
+    family = resolved.descriptor
+    enc, cfg = resolved.family_config, resolved.config
+    name, scale = display_for(resolved)
+    row("model", a.model)
+    encoder = (f"{enc.get('model_type')} encoder, {enc.get('num_hidden_layers')} layer x "
+               f"{enc.get('hidden_size')}")
+    if family.id == "gliner_decide":
+        row("type", f"{name}{' · ' + scale if scale else ''} · decision model · {encoder} · "
+                    f"GLiNER2 {cfg.get('architecture') or 'span'} classification head")
+        max_len = os.environ.get("COLI_GLINER_MAX_LEN") or "4096"
+        row("budget", f"max_len {max_len} tokens per request: every question and the state "
+                      f"in one sequence (COLI_GLINER_MAX_LEN)")
+    else:
+        row("type", f"{name}{' · ' + scale if scale else ''} · decision model · {encoder} · "
+                    f"head {cfg.get('head_layers')} layer")
+        row("budget", f"max_len {cfg.get('max_len')} tokens per question, "
+                      f"head_max_len {cfg.get('head_max_len')} for the options")
+    try:
+        params, disk = decision_weights(a.model)
+        row("weights", f"{params/1e6:.0f}M params · {disk/1e6:.0f} MB on disk · "
+                       f"about {params*4/1e9:.1f} GB in RAM (f32)")
+    except (OSError, ValueError) as error:
+        row("weights", f"{C.yel}model.safetensors unreadable:{C.r} {error}")
+    row("use", "coli serve / coli web, then POST /v1/systemone (docs/systemone.md)")
+    engine=engine_for(a.model)
+    row("engine", "ready ✓" if os.path.exists(engine)
+        else f"not built (make -C c {family.build_target})")
+    print()
+
+def plan_decision_command(a):
+    """`coli plan` for a decision model: its weights in RAM, nothing that grows."""
+    if getattr(a, "ctx", 0):
+        sys.exit(f"{C.yel}--ctx does not apply to a decision model{C.r}")
+    try:
+        params, disk = decision_weights(a.model)
+    except (OSError, ValueError) as error:
+        sys.exit(f"{C.yel}cannot create resource plan:{C.r} {error}")
+    plan = {"model": os.path.abspath(a.model), "modality": "decision", "params": params,
+            "disk_bytes": disk, "ram_bytes": params * 4,
+            "note": "weights resident in f32; no KV cache, no experts, no VRAM tier"}
+    if a.json:
+        print(json.dumps(plan, indent=2)); return
+    banner("plan · RAM for a decision model", model=a.model)
+    print(f"  weights   {params/1e6:.0f}M params, {disk/1e6:.0f} MB on disk")
+    grows = ("activations that grow with the request's sequence (COLI_GLINER_MAX_LEN)"
+             if is_gliner_decide(a.model) else "activations of a few MB per question")
+    print(f"  RAM       about {params*4/1e9:.1f} GB (f32), plus {grows}")
+    print(f"  nothing grows with use: no KV cache, no experts to stream")
+    print()
+
+def plan_image_command(a):
+    """`coli plan` for an image model: weights per component, two schedules."""
+    from image_engine import plan_image_model, format_image_plan
+    from resource_plan import memory_available
+    if getattr(a, "ctx", 0):
+        sys.exit(f"{C.yel}--ctx does not apply to an image model{C.r}")
+    try:
+        disk = shutil.disk_usage(a.model).free
+    except OSError:
+        disk = None
+    try:
+        plan = plan_image_model(a.model, memory_available() or None, disk)
+    except (OSError, ValueError) as error:
+        sys.exit(f"{C.yel}cannot create resource plan:{C.r} {error}")
+    if a.json:
+        print(json.dumps(plan, indent=2)); return
+    banner("plan · RAM for text encoder, DiT and VAE", model=a.model)
+    print(textwrap.indent(format_image_plan(plan), "  "))
+    print()
+
 def cmd_plan(a):
     from resource_plan import build_plan, format_plan
     if not a.model:
         sys.exit(f"{C.yel}no model directory given.{C.r}\n  {NO_MODEL_HINT}")
+    if is_image_model(a.model):
+        return plan_image_command(a)
+    if is_decision_model(a.model):
+        return plan_decision_command(a)
     try:
         ram,ctx,devices,vram=resource_request(a,os.environ)
         if ctx<1: raise ValueError("--ctx must be positive")
@@ -1153,6 +1553,16 @@ def cmd_doctor(a):
     except (FamilyConfigError,UnknownFamilyError) as error:
         engine=GLM
         engine_error=error
+    if is_image_model(a.model) and engine_error is None:
+        from doctor import run_image_doctor
+        report=run_image_doctor(a.model, engine)
+        print(json.dumps(report,indent=2) if a.json else format_doctor(report))
+        return exit_code(report)
+    if is_decision_model(a.model) and engine_error is None:
+        from doctor import run_decision_doctor
+        report=run_decision_doctor(a.model, engine)
+        print(json.dumps(report,indent=2) if a.json else format_doctor(report))
+        return exit_code(report)
     report=run_doctor(
         # engine_path was hardcoded to GLM, so `coli doctor` inspected colibri
         # no matter which model it was pointed at: a built kimi_k3/inkling was
@@ -1192,6 +1602,9 @@ def cmd_tune(a):
     # family it then mis-dispatched.
     family=resolve_model(a.model).descriptor
     arch=family.id
+    if family.modality in ("image","decision"):
+        sys.exit(f"{C.yel}coli tune measures text engines;{C.r} {family.display_name} has no "
+                 f"expert cache or decode loop to tune")
     if not family.has_gateway_adapter:
         sys.exit(f"{family.display_name}: gateway adapter is not wired")
     engine=engine_for(a.model)
@@ -1255,6 +1668,10 @@ def cmd_run(a):
     need_model(a.model,engine)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
     banner("run", model=a.model)
+    if family.modality=="image":
+        return run_image(a, family, engine, prompt)
+    if family.modality=="decision":
+        sys.exit(decision_refusal(family))
     if not family.has_cli_adapter:
         sys.exit(f"{C.yel}coli run is not wired for {family.display_name};{C.r} "
                  f"use coli chat or coli serve")
@@ -1301,9 +1718,13 @@ def cmd_run(a):
         # emits the answer and exits cleanly. No reason to spin up the gateway
         # for a single non-interactive prompt.
         e=env_for_engine(a,arch)
+        # The engine tokenizes the bytes it reads as UTF-8. A text-mode pipe
+        # would encode the prompt in the locale's code page instead: a
+        # UnicodeEncodeError on cp949/cp932 or the C locale, garbled bytes on
+        # cp1252. Hand it the bytes, like the V4 path's UTF-8 prompt file.
         result=subprocess.run(
             [engine, str(cap_for_launch(a.cap,e,16)), "8"],
-            input=prompt+"\n", text=True, env=e, check=False)
+            input=(prompt+"\n").encode("utf-8"), env=e, check=False)
         sys.exit(result.returncode)
     # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
     # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
@@ -1328,6 +1749,186 @@ def server_probe(base, api_key=None, timeout=1.5):
     except Exception:
         return None
 
+# ---- generation statistics for the chat footer (#1475) ----------------------
+# Measurement and rendering apart: gen_stats() counts (exact completion tokens
+# from the server's usage block when it sends one, the historical chars/4
+# estimate otherwise), render_gen_stats() lays it out for one of three modes.
+# The private-engine chat already prints the engine's own exact counters; the
+# attached path is where the estimate lived and where tok/s was missing.
+CHAT_STATS_MODES = ("full", "compact", "off")
+
+def chat_stats_mode(a):
+    mode = getattr(a, "stats", None) or os.environ.get("COLI_CHAT_STATS", "full")
+    return mode if mode in CHAT_STATS_MODES else "full"
+
+def gen_stats(reply_text, elapsed, exact_tokens=None, interrupted=False):
+    exact = isinstance(exact_tokens, int) and not isinstance(exact_tokens, bool) and exact_tokens >= 0
+    tokens = exact_tokens if exact else len(reply_text) // 4
+    tps = tokens / elapsed if elapsed > 0 else None
+    return {"tokens": tokens, "exact": exact, "elapsed": elapsed, "tps": tps,
+            "interrupted": bool(interrupted)}
+
+def render_gen_stats(st, mode):
+    """'' for off; otherwise the footer body, without the box glyph or colour:
+    full    ~370 tok · 313s · ~1.18 tok/s   (372 tok · 313s · 1.19 tok/s when exact)
+    compact ~370 tok · ~1.18 tok/s
+    plus ' · ⏹ interrupted' when the answer was cut short."""
+    if mode == "off": return ""
+    approx = "" if st["exact"] else "~"
+    parts = [f"{approx}{st['tokens']} tok"]
+    if mode == "full": parts.append(f"{st['elapsed']:.0f}s")
+    if st["tps"] is not None: parts.append(f"{approx}{st['tps']:.2f} tok/s")
+    if st["interrupted"]: parts.append("⏹ interrupted")
+    return " · ".join(parts)
+
+
+
+# ---- comandi della chat ------------------------------------------------------
+#
+# Stanno in un posto solo perche servono a tre cose che devono restare
+# d'accordo: il completamento col TAB, l'elenco di /help, e il controllo che
+# impedisce a un comando scritto male di partire come messaggio al modello.
+# Quest'ultimo e il motivo per cui esistono: prima "/decide merge" con una lettera
+# sbagliata finiva dritto al modello, che rispondeva educatamente a una riga di
+# comando. Ogni forma si accetta sia con / sia con : -- i comandi storici usano
+# i due punti e non si toglie a nessuno l'abitudine.
+CHAT_COMMANDS = {
+    "decide": "a | b | c  System One mode: score the options instead of generating; no options returns to chat",
+    "reset": "            start the conversation again",
+    "help":  "            this list",
+    "quit":  "            leave (also :q)",
+}
+
+def chat_command(message):
+    """(nome, resto) se la riga e un comando, (None, None) se e un messaggio.
+
+    Il nome torna anche quando NON esiste: e il chiamante a decidere che farne,
+    e deve poter distinguere "comando sbagliato" da "testo che comincia con /"."""
+    if not message or message[0] not in "/:":
+        return None, None
+    # A picture's path is not a command. A file dragged into the terminal pastes
+    # "/home/me/photo.png" at the start of the line, and that line is a question
+    # about the picture; read as a command it got "comando sconosciuto" and the
+    # picture never left the prompt.
+    # The first word decides: "/save /tmp/x.png" is still the /save command.
+    if IMAGE_PATH.fullmatch(message.split()[0]):
+        return None, None
+    head, _, rest = message[1:].partition(" ")
+    return head.strip().lower(), rest.strip()
+
+def chat_commands_help(commands=None):
+    commands = CHAT_COMMANDS if commands is None else commands
+    print(f"  {C.dim}commands:{C.r}")
+    for name, what in commands.items():
+        print(f"    {C.teal}/{name}{C.r} {C.dim}{what}{C.r}")
+    print()
+
+def install_chat_completer(commands=None, arguments=None):
+    """TAB completa i comandi. Senza readline (Windows) si perde solo il TAB.
+    `arguments` maps a command to the values TAB offers after it (/size 1024x576)."""
+    if readline is None:
+        return
+    commands = CHAT_COMMANDS if commands is None else commands
+    arguments = arguments or {}
+    names = [p + n for n in commands for p in ("/", ":")]
+    def complete(text, state):
+        head = readline.get_line_buffer().lstrip()
+        name, _, rest = head[1:].partition(" ") if head[:1] in "/:" else ("", "", "")
+        if _ and name.lower() in arguments:
+            hits = [v + " " for v in arguments[name.lower()] if v.startswith(text)]
+        else:
+            hits = [n + " " for n in names if n.startswith(text)]
+        return hits[state] if state < len(hits) else None
+    readline.set_completer_delims(" \t\n")
+    readline.parse_and_bind("set show-all-if-ambiguous on")   # un TAB solo li mostra tutti
+    readline.parse_and_bind("tab: complete")
+    readline.set_completer(complete)
+
+def conversation_state(msgs):
+    """The conversation so far as one text state, a "role: content" line per
+    message with text parts joined: what /decide sends as the context."""
+    lines=[]
+    for message in msgs:
+        if not isinstance(message, dict): continue
+        content=message.get("content")
+        if isinstance(content, list):
+            content="".join(part.get("text","") for part in content
+                            if isinstance(part, dict) and isinstance(part.get("text",""), str))
+        if content:
+            lines.append(f"{message.get('role','user')}: {content}")
+    return "\n".join(lines)
+
+def decide_request(model_id, msgs, question, options):
+    """The POST /v1/systemone body of one /decide turn: the conversation as the
+    state, the question as one `choice` whose labels are the options."""
+    return {"model": model_id, "state": conversation_state(msgs),
+            "questions": {"decide": {"type": "choice", "instructions": question,
+                                     "criteria": {option: None for option in options}}}}
+
+def chat_brio(a, base, model_id, msgs, question, options, w):
+    """Un giro di modalita System One dalla TUI (/decide): una richiesta, una distribuzione.
+
+    Il ciclo (fotografia del prefisso, una lettura per opzione, normalizzazione)
+    sta nel gateway, non qui: sono tre cose facili da sbagliare e devono stare
+    in un posto solo. Qui si manda la conversazione come stato a
+    POST /v1/systemone, una domanda `choice`, e si disegnano le barre."""
+    import urllib.request, urllib.error
+    body=json.dumps(decide_request(model_id, msgs, question, options)).encode()
+    req=urllib.request.Request(base.rstrip("/")+"/v1/systemone", data=body,
+                               headers={"Content-Type":"application/json"})
+    if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
+    print(f"\n  {C.teal}◆ System One{C.r}")
+    sp=Spinner("scoring…"); sp.start(); t0=time.time()
+    try:
+        with urllib.request.urlopen(req) as r:
+            out=json.loads(r.read().decode("utf-8","replace"))
+    except urllib.error.HTTPError as e:
+        sp.stop()
+        try: detail=json.loads(e.read().decode("utf-8","replace")).get("error",{}).get("message","")
+        except Exception: detail=""
+        print(f"  {C.yel}[il server ha rifiutato: HTTP {e.code}{': '+detail if detail else ''}]{C.r}\n")
+        return
+    except OSError as e:
+        sp.stop(); print(f"  {C.yel}[server irraggiungibile: {e}]{C.r}\n"); return
+    sp.stop()
+    answer=(out.get("answers") or {}).get("decide") or {}
+    probabilities=answer.get("probabilities") or {}
+    ranked=sorted(((option, float(probabilities.get(option, 0.0))) for option in options),
+                  key=lambda item: -item[1])
+    bars=max(10, min(30, w-34))
+    for option, p in ranked:
+        filled=int(round(p*bars))
+        colour=C.grn if option==answer.get("choice") else C.dgray
+        print(f"     {colour}{option[:22]:<22}{C.r} {colour}{'█'*filled}{C.r}"
+              f"{C.dgray}{'░'*(bars-filled)}{C.r} {p*100:5.1f}%")
+    # L'entropia e la parte che la generazione non sa dare: non "qual e la
+    # risposta" ma "quanto il modello sa di saperlo". Normalizzata su log(n).
+    h=-sum(p*math.log(p) for _, p in ranked if p>0)/math.log(max(len(ranked),2))
+    verdict=(f"{C.grn}sure{C.r}" if h<.4 else
+             f"{C.yel}unsure{C.r}" if h<.8 else f"{C.yel}DOES NOT KNOW{C.r}")
+    usage=out.get("usage",{})
+    print(f"     {C.b}→ {answer.get('choice','?')}{C.r}  {C.dim}entropy {h:.3f}{C.r} ({verdict})")
+    print(f"  {C.dim}{time.time()-t0:.2f}s · {usage.get('input_tokens',0)} prompt tokens · "
+          f"{usage.get('output_tokens',0)} option tokens read · nothing generated{C.r}\n")
+
+# Families whose template thinks by default but that coli chat starts with thinking
+# OFF. On a model that streams its experts from disk at about 1 tok/s, the default
+# reasoning of MiMo-V2.6's template is minutes of tokens before the first word of the
+# answer, and a terminal that shows a spinner for that long looks hung. The API and
+# the web keep the template's default; here `--think` turns it on.
+CHAT_THINK_OFF = {"mimo"}
+
+def server_arch(base, api_key=None, timeout=1.5):
+    """The family a coli serve runs, from /health; None when it does not say."""
+    import urllib.request
+    try:
+        req=urllib.request.Request(base.rstrip("/")+"/health")
+        if api_key: req.add_header("Authorization", f"Bearer {api_key}")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8","replace")).get("arch")
+    except Exception:
+        return None
+
 def chat_attached(a, base, model_id):
     """The chat REPL over HTTP against a running `coli serve`.
 
@@ -1340,8 +1941,14 @@ def chat_attached(a, base, model_id):
     OpenAI SSE over localhost, stdlib only."""
     import urllib.request, urllib.error
     print(f"  {C.grn}✦ attached{C.r} {C.dim}to {base} · model {model_id} · the engine stays warm after you quit{C.r}")
-    print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :reset starts a new conversation · :q exits{C.r}\n")
+    print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :reset starts a new conversation · :q exits{C.r}")
+    print(f"  {C.dim}/ for commands · TAB completes · /decide puts the SAME model in System One mode{C.r}\n")
+    install_chat_completer()
+    arch=server_arch(base, getattr(a,"api_key",None))
+    if arch in CHAT_THINK_OFF and getattr(a,"think",None) is None:
+        print(f"  {C.dim}thinking is off here (--think turns it on){C.r}\n")
     msgs=[]
+    brio_options=[]          # non vuoto = modalita System One accesa (/decide)
     w=term_w()-4
     while True:
         if TTY:
@@ -1354,9 +1961,48 @@ def chat_attached(a, base, model_id):
             try: msg=input()
             except EOFError: break
         msg=msg.strip("\r\n")
-        if msg in (":q",":quit","exit"): break
+        if msg in (":q","/q","exit"): break
         if not msg.strip(): continue
-        if msg==":reset": msgs=[]; print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
+        # Una riga che comincia con / o : e un COMANDO, giusto o sbagliato che
+        # sia: non finisce mai al modello. Prima un refuso partiva come domanda.
+        name, rest = chat_command(msg)
+        if name is not None and name not in CHAT_COMMANDS:
+            print(f"  {C.yel}  comando sconosciuto: {msg.split()[0]}{C.r}")
+            chat_commands_help(); continue
+        if name in ("quit",): break
+        if name == "help": chat_commands_help(); continue
+        if name == "reset":
+            msgs=[]; brio_options=[]
+            print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
+        # ---- modalita System One (/decide) ---------------------------------
+        # Lo stesso modello con cui stai chattando smette di generare e comincia
+        # a punteggiare: gli si danno le opzioni ammesse e lui dice quanto e
+        # probabile ciascuna. La conversazione fin qui FA da contesto, quindi
+        # /decide a meta chat continua il discorso invece di ricominciarlo.
+        if name == "decide":
+            spec=rest
+            if not spec:
+                if brio_options:
+                    brio_options=[]
+                    print(f"  {C.dim}✦ chat{C.r}\n")
+                else:
+                    print(f"  {C.yel}  /decide needs the options: /decide merge | request changes | close{C.r}\n")
+                continue
+            # dict.fromkeys deduplica tenendo l'ordine: il server rifiuta due
+            # opzioni uguali con un 400, e "merge | merge | close" e' un refuso
+            # facile da fare a mano, non una domanda a tre opzioni.
+            brio_options=list(dict.fromkeys(o.strip() for o in spec.split("|") if o.strip()))
+            if len(brio_options)<2:
+                brio_options=[]
+                print(f"  {C.yel}  at least two options are needed, separated by |{C.r}\n")
+                continue
+            print(f"  {C.grn}✦ System One{C.r} {C.dim}· {len(brio_options)} options · "
+                  f"the model stops generating and scores instead · /decide returns to chat{C.r}\n")
+            continue
+        if brio_options:
+            chat_brio(a, base, model_id, msgs, msg, brio_options, w)
+            continue
+        # --------------------------------------------------------------------
         payload = message_with_images(msg)
         if payload is None: continue          # percorso sbagliato: gia' detto
         msgs.append({"role":"user","content":payload})
@@ -1364,9 +2010,12 @@ def chat_attached(a, base, model_id):
         # motore che streamma gli esperti da disco, "max" vuol dire centinaia
         # di token di riflessione prima della prima parola di risposta.
         request = {"model":model_id,"messages":msgs,"stream":True,
-                   "max_tokens":ngen_for(a,interactive=True)}
+                   "max_tokens":ngen_for(a,interactive=True),
+                   "stream_options":{"include_usage":True}}   # exact completion_tokens in the last chunk
         if getattr(a,"effort",None): request["reasoning_effort"]=a.effort
         if getattr(a,"think",None) is not None: request["enable_thinking"]=a.think
+        elif arch in CHAT_THINK_OFF:
+            request["enable_thinking"]=False   # --think turns it back on
         body=json.dumps(request).encode()
         req=urllib.request.Request(base.rstrip("/")+"/v1/chat/completions", data=body,
                                    headers={"Content-Type":"application/json"})
@@ -1374,6 +2023,7 @@ def chat_attached(a, base, model_id):
         print(f"\n  {C.teal}◆ colibri{C.r}")
         sp=Spinner("thinking…"); sp.start()
         md=MDStream("  "); reply=[]; first=True; t0=time.time(); interrupted=False; think_open=False
+        exact_tokens=None
         try:
             with urllib.request.urlopen(req) as r:
                 for raw in r:
@@ -1383,6 +2033,9 @@ def chat_attached(a, base, model_id):
                     if data=="[DONE]": break
                     try: ev=json.loads(data)
                     except ValueError: continue
+                    usage=ev.get("usage")
+                    if isinstance(usage,dict) and isinstance(usage.get("completion_tokens"),int):
+                        exact_tokens=usage["completion_tokens"]
                     for ch in ev.get("choices",[]):
                         d=ch.get("delta",{})
                         rtxt=d.get("reasoning_content")
@@ -1436,8 +2089,9 @@ def chat_attached(a, base, model_id):
         if reply: msgs.append({"role":"assistant","content":"".join(reply)})
         else: msgs.pop()                              # turno vuoto: non sporcare la history
         el=time.time()-t0
-        note=" · ⏹ interrupted" if interrupted else ""
-        print(f"\r  {C.dgray}└─ ~{len(''.join(reply))//4} tok · {el:.0f}s{note}{C.r}\n")
+        footer=render_gen_stats(gen_stats("".join(reply), el, exact_tokens, interrupted), chat_stats_mode(a))
+        if footer: print(f"\r  {C.dgray}└─ {footer}{C.r}\n")
+        else: print()
     print(f"  {C.dim}goodbye — the engine keeps running for the next chat 🐦{C.r}")
 
 def kv_resume_notice(model_dir):
@@ -1534,9 +2188,533 @@ def message_with_images(text):
     if rest:
         content.append({"type":"text","text":rest})
     for path in found:
-        content.append({"type":"image_url","image_url":{"url":path}})
+        # The file is read HERE, with the user's own rights, and travels as a
+        # data: URI. The server no longer opens local paths for a client (an
+        # inference client is not the operator; with the API key it could read
+        # any file the server process can), unless the operator sets
+        # COLI_IMAGE_ROOT, and a path sent by mistake would be refused.
+        content.append({"type":"image_url","image_url":{"url":image_data_uri(path)}})
     return content
 
+def image_data_uri(path):
+    """base64 data: URI of a local image, MIME from the extension (PNG when unknown)."""
+    import base64, mimetypes
+    mime = mimetypes.guess_type(path)[0] or "image/png"
+    with open(path, "rb") as handle:
+        return f"data:{mime};base64," + base64.b64encode(handle.read()).decode("ascii")
+
+
+# ---- image models: the REPL, coli run, and the two ways to reach an engine ----
+#
+# The same loop serves a private engine (coli starts qwenimage itself and
+# speaks its line protocol) and a running `coli serve` (POST
+# /v1/images/generations, streamed): the two backends below return the same
+# thing, so drawing, saving and the commands exist once.
+IMAGE_CHAT_COMMANDS = {
+    "size":   "WxH       image size; /size alone lists the presets (TAB completes them)",
+    "steps":  "N         denoising steps (more is slower and usually cleaner)",
+    "seed":   "N|random  fix the seed to reproduce an image, or a new one each time",
+    "render": "MODE      how images are drawn: kitty | iterm | sixel | blocks | none",
+    "save":   "[PATH]    a copy of the last image: a folder, or a file name (.png is added)",
+    "help":   "          this list",
+    "quit":   "          leave (also :q)",
+}
+
+class LocalImageBackend:
+    """coli owns the engine: spawned here, closed when the REPL ends."""
+    mode = "local engine"
+
+    def __init__(self, a, model, engine):
+        from image_engine import ImageEngine
+        self.log = []
+        def keep(line):
+            self.log.append(line)
+            del self.log[:-40]
+        # stderr is read by a thread from the first byte (see ImageEngine): the
+        # load log would otherwise interleave with the spinner. On Windows the
+        # engine keeps the console's stderr, as the text chat does, because two
+        # child pipes read at once can deadlock CPython's I/O there.
+        sink = keep if sys.platform != "win32" else None
+        self.engine = ImageEngine(engine, model, env=env_for_engine(a, "qwen_image"),
+                                  on_stderr=sink, on_log=keep)
+        self.info = self.engine.info
+
+    def generate(self, prompt, width, height, steps, seed, want_preview, on_progress,
+                 on_preview, on_interrupt):
+        from image_engine import encode_png
+        def preview(meta, pixels):
+            on_preview(meta.get("width"), meta.get("height"), meta.get("channels", 3), pixels)
+        result = self.engine.generate(prompt, width, height, steps, seed, preview=want_preview,
+                                      on_progress=on_progress, on_preview=preview,
+                                      interruptible=True, on_interrupt=on_interrupt)
+        result["png"] = encode_png(result["width"], result["height"], result["rgba"], 4)
+        return result
+
+    @property
+    def alive(self):
+        return self.engine.alive
+
+    def close(self):
+        self.engine.close()
+
+class RemoteImageBackend:
+    """A running `coli serve` with an image model, over its streamed endpoint."""
+    mode = "attached"
+
+    def __init__(self, base, model_id, api_key, info):
+        from image_engine import DEFAULT_INFO
+        self.base, self.model_id, self.api_key = base.rstrip("/"), model_id, api_key
+        self.info = dict(DEFAULT_INFO)
+        self.info.update({k: v for k, v in (info or {}).items() if v is not None})
+        self.alive = True
+
+    def generate(self, prompt, width, height, steps, seed, want_preview, on_progress,
+                 on_preview, on_interrupt):
+        import base64, urllib.request, urllib.error
+        from image_engine import ImageCancelled, ImageEngineError, decode_png
+        body = {"model": self.model_id, "prompt": prompt, "size": f"{width}x{height}",
+                "steps": steps, "seed": seed, "n": 1, "response_format": "b64_json",
+                "stream": True}
+        if not want_preview:
+            body["partial_images"] = 0
+        req = urllib.request.Request(self.base + "/v1/images/generations",
+                                     data=json.dumps(body).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"})
+        if self.api_key: req.add_header("Authorization", f"Bearer {self.api_key}")
+        completed = None
+        try:
+            with urllib.request.urlopen(req) as response:
+                name, data = None, []
+                for raw in response:
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                    if line.startswith(":"):
+                        continue                       # keepalive comment
+                    if line.startswith("event:"):
+                        name = line[6:].strip(); continue
+                    if line.startswith("data:"):
+                        data.append(line[5:].lstrip()); continue
+                    if line or not data:
+                        continue
+                    payload = "\n".join(data); data = []
+                    if payload == "[DONE]":
+                        break
+                    try: event = json.loads(payload)
+                    except ValueError: continue
+                    if name == "image_generation.progress":
+                        on_progress(event)
+                    elif name == "image_generation.partial_image":
+                        try:
+                            w, h, ch, pixels = decode_png(base64.b64decode(event["b64_json"]))
+                            on_preview(w, h, ch, pixels)
+                        except (KeyError, ValueError):
+                            pass
+                    elif name == "image_generation.completed":
+                        completed = event
+                    elif name == "error":
+                        error = event.get("error") or {}
+                        if error.get("type") == "cancelled" or error.get("message") == "cancelled":
+                            raise ImageCancelled()
+                        raise ImageEngineError(error.get("message")
+                                               or "the server reported an error")
+                    name = None
+        except KeyboardInterrupt:
+            # Closing the connection IS the cancel: the gateway notices the
+            # hang-up between frames and sends CANCEL to its engine.
+            raise ImageCancelled() from None
+        except urllib.error.HTTPError as error:
+            try:
+                detail = json.loads(error.read().decode("utf-8", "replace")).get("error", {}).get("message", "")
+            except Exception:
+                detail = ""
+            raise ImageEngineError(f"the server refused: HTTP {error.code}"
+                                   + (f" · {detail}" if detail else "")) from None
+        except OSError as error:
+            self.alive = False
+            raise ImageEngineError(f"server unreachable: {error}") from None
+        if not completed or not completed.get("data"):
+            raise ImageEngineError("the stream ended without an image")
+        png = base64.b64decode(completed["data"][0]["b64_json"])
+        width_out, height_out, channels, pixels = decode_png(png)
+        meta = completed.get("colibri") or {}
+        return {"width": width_out, "height": height_out, "channels": channels, "rgba": pixels,
+                "png": png, "seed": meta.get("seed", seed), "steps": meta.get("steps", steps),
+                "timings": meta.get("timings") or {}}
+
+    def close(self):
+        pass
+
+class ImageProgress:
+    """The live line under a generation, and the preview above it.
+
+        [preview, redrawn in place as half blocks when the engine sends one]
+        ⠹ denoising 3/8 · 41s · seed 1234
+
+    One lock serialises the spinner thread and the frames arriving from the
+    engine, so an escape sequence is never cut in half by the other writer."""
+    FRAMES = Spinner.FRAMES
+    STAGES = {"encode": "encoding the prompt", "denoise": "denoising", "decode": "decoding"}
+
+    def __init__(self, stream, seed, steps, previews=True, protocol="blocks"):
+        self.out = stream
+        # With sixel the preview is drawn as a picture, smoothly enlarged, in an
+        # area reserved once: the cursor is saved at its top (DECSC) and every
+        # step is drawn over the last one from there. kitty and iTerm2 place
+        # images by their own rules, so they keep the half blocks for previews
+        # (the finished picture is full resolution in every graphics protocol).
+        self.protocol = protocol
+        self.area = 0
+        self.live = bool(stream) and (stream.isatty() or os.environ.get("COLI_COLOR") == "1")
+        self.previews = previews and self.live
+        self.seed, self.steps = seed, steps
+        self.stage, self.step, self.note = "starting", 0, ""
+        self.rows = 0
+        self.t0 = time.time()
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.tick = 0
+
+    def _status(self):
+        stage = self.STAGES.get(self.stage, self.stage)
+        count = f" {self.step}/{self.steps}" if self.stage == "denoise" else ""
+        note = f" · {C.yel}{self.note}{C.r}" if self.note else ""
+        frame = self.FRAMES[self.tick % len(self.FRAMES)]
+        return (f"\r  {C.teal}{frame}{C.r} {C.dim}{stage}{count} · {time.time()-self.t0:.0f}s · "
+                f"seed {self.seed}{C.r}{note}\033[K")
+
+    def _draw(self):
+        if self.live:
+            self.out.write(self._status()); self.out.flush()
+
+    def start(self):
+        if not self.live:
+            return
+        def spin():
+            while not self.stop_event.wait(0.12):
+                with self.lock:
+                    self.tick += 1
+                    self._draw()
+        with self.lock:
+            self._draw()
+        self.thread = threading.Thread(target=spin, daemon=True)
+        self.thread.start()
+
+    def progress(self, frame):
+        with self.lock:
+            self.stage = frame.get("stage") or self.stage
+            step = frame.get("step")
+            if isinstance(step, int): self.step = step
+            steps = frame.get("steps")
+            if isinstance(steps, int) and steps > 0: self.steps = steps
+            self._draw()
+
+    def preview(self, width, height, channels, pixels):
+        if not self.previews or not width or not height:
+            return
+        import term_image
+        if self.protocol == "sixel":
+            self._preview_sixel(term_image, width, height, channels, pixels)
+            return
+        try:
+            text = term_image.render_blocks(pixels, width, height, channels,
+                                            max_columns=min(64, term_w() - 6), max_rows=16,
+                                            colour24=term_image.truecolor())
+        except (ValueError, IndexError):
+            return
+        with self.lock:
+            self.out.write(f"\r\033[{self.rows}A" if self.rows else "\r\033[K")
+            self.out.write(text)
+            self.rows = text.count("\n")
+            self._draw()
+
+    def _preview_sixel(self, term_image, width, height, channels, pixels):
+        columns, rows, cell_w, cell_h = term_image.terminal_geometry(self.out)
+        w_px = max(64, min(512, (columns - 6) * cell_w))
+        h_px = round(height * w_px / width)
+        cap = max(4, min(18, rows - 8)) * cell_h
+        if h_px > cap:
+            h_px, w_px = cap, max(64, round(width * cap / height))
+        try:
+            big = term_image.upscale_smooth(pixels, width, height, channels, w_px, h_px)
+            text = term_image.render_sixel(big, w_px, h_px, channels, w_px, h_px, "  ")
+        except (ValueError, IndexError):
+            return
+        # rows the picture covers, with a margin for a terminal whose real cells
+        # are smaller than the ones it reported (or than the 8x16 guess)
+        lines = -(-h_px // max(8, cell_h - 2)) + 1
+        with self.lock:
+            if not self.area:
+                # reserve the lines now, so the terminal scrolls here and never
+                # under a saved cursor
+                self.out.write("\r\033[K" + "\n" * lines + f"\033[{lines}A\r\0337")
+                self.area = lines
+            self.out.write("\0338" + text)
+            self.out.write(f"\0338\033[{self.area}B")
+            self._draw()
+
+    def interrupted(self):
+        with self.lock:
+            self.note = "stopping… (Ctrl-C again to quit)"
+            self._draw()
+
+    def stop(self):
+        if self.stop_event.is_set():
+            return
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=0.5)
+        if self.live:
+            with self.lock:
+                self.out.write("\r\033[K")
+                if self.area:
+                    self.out.write("\0338\033[J")          # the preview area, image and all
+                elif self.rows:
+                    self.out.write(f"\033[{self.rows}A\r\033[J")
+                self.out.flush()
+            self.rows = 0
+            self.area = 0
+
+def image_settings(a, info):
+    """Size, steps and seed for the first image: the flags when given, the
+    engine's defaults otherwise. Exits with the engine's rule on a bad flag."""
+    from image_engine import parse_size, check_size, check_steps, check_seed, ImageRequestError
+    width, height = info["default_width"], info["default_height"]
+    if getattr(a, "size", None):
+        try: width, height = parse_size(a.size)
+        except ImageRequestError as error: sys.exit(f"{C.yel}--size: {error}{C.r}")
+        problem = check_size(width, height, info)
+        if problem: sys.exit(f"{C.yel}--size: {problem}{C.r}")
+    steps = getattr(a, "steps", None) or info["default_steps"]
+    problem = check_steps(steps)
+    if problem: sys.exit(f"{C.yel}--steps: {problem}{C.r}")
+    seed = getattr(a, "seed", None)
+    if seed is not None:
+        problem = check_seed(seed)
+        if problem: sys.exit(f"{C.yel}--seed: {problem}{C.r}")
+    return {"width": width, "height": height, "steps": steps, "seed": seed}
+
+def generate_image(backend, prompt, settings, protocol, out=None, stream=None, last=None):
+    """One image: progress, the picture drawn in the terminal, the PNG on disk.
+    Returns the saved path, or None when it was cancelled or failed (said).
+    `last`, when given, is filled with the PNG and where it went, for /save."""
+    import term_image
+    from image_engine import (ImageCancelled, ImageEngineError, random_seed, save_png,
+                              image_dir)
+    stream = stream or sys.stdout
+    seed = settings["seed"] if settings["seed"] is not None else random_seed()
+    previews = protocol != "none" and os.environ.get("COLI_IMAGE_PREVIEW", "1") != "0"
+    progress = ImageProgress(stream, seed, settings["steps"], previews, protocol)
+    progress.start()
+    t0 = time.time()
+    try:
+        result = backend.generate(prompt, settings["width"], settings["height"],
+                                  settings["steps"], seed, previews, progress.progress,
+                                  progress.preview, progress.interrupted)
+    except ImageCancelled:
+        progress.stop()
+        print(f"  {C.yel}■ cancelled{C.r}\n", file=stream)
+        return None
+    except ImageEngineError as error:
+        progress.stop()
+        print(f"  {C.yel}✗ {error}{C.r}\n", file=stream)
+        return None
+    finally:
+        progress.stop()
+    elapsed = time.time() - t0
+    try:
+        if out:
+            os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+            with open(out, "wb") as handle: handle.write(result["png"])
+            path = out
+        else:
+            path = save_png(result["png"], prompt, result["seed"], image_dir())
+    except OSError as error:
+        print(f"  {C.yel}✗ cannot save the image: {error}{C.r}", file=stream)
+        path = None
+    if protocol != "none":
+        try:
+            stream.write(term_image.render(result["rgba"], result["width"], result["height"],
+                                           result.get("channels", 4), protocol,
+                                           png=result["png"], stream=stream))
+            stream.flush()
+        except (OSError, ValueError) as error:
+            print(f"  {C.yel}(cannot draw the image here: {error}){C.r}", file=stream)
+    timings = result.get("timings") or {}
+    parts = " · ".join(f"{k} {v:.1f}s" for k, v in timings.items()
+                       if isinstance(v, (int, float)))
+    print(f"  {C.dgray}└─ {result['width']}x{result['height']} · seed {result['seed']} · "
+          f"{result['steps']} steps · {elapsed:.0f}s{(' (' + parts + ')') if parts else ''}{C.r}",
+          file=stream)
+    if last is not None:
+        last.update(png=result["png"], path=path, prompt=prompt, seed=result["seed"])
+    if path:
+        print(f"  {C.grn}✓{C.r} saved {path}\n", file=stream)
+    return path
+
+
+def save_last_image(last, where):
+    """/save: the last image, where the user says. A folder keeps the automatic
+    name, a name gets .png when it has no extension, a Windows path pasted into
+    WSL is translated like an attachment's, and an existing file is never
+    overwritten: the images folder already holds every picture, so /save only
+    ever adds a copy. Returns (path, None) or (None, why)."""
+    if not last.get("png"):
+        return None, "no image yet: describe one first"
+    if not where:
+        return (last["path"], None) if last.get("path") else (None, "give a path: /save PATH")
+    target = to_local_path(where)
+    if os.path.isdir(target):
+        name = os.path.basename(last["path"]) if last.get("path") else f"colibri-s{last['seed']}.png"
+        target = os.path.join(target, name)
+    elif not os.path.splitext(target)[1]:
+        target += ".png"
+    if os.path.exists(target):
+        return None, f"{target} already exists: choose another name"
+    folder = os.path.dirname(os.path.abspath(target))
+    if not os.path.isdir(folder):
+        return None, f"no such folder: {folder}"
+    try:
+        with open(target, "xb") as handle:
+            handle.write(last["png"])
+    except OSError as error:
+        return None, f"cannot write {target}: {error}"
+    return target, None
+
+def image_repl(a, backend, model_id):
+    """coli chat for an image model: every line is a prompt, every answer a picture."""
+    import term_image
+    from image_engine import (parse_size, check_size, nearest_size, check_steps, check_seed,
+                              ImageRequestError, image_dir, SIZE_PRESETS)
+    info = backend.info
+    settings = image_settings(a, info)
+    protocol, why = term_image.detect(query=TTY and sys.stdin.isatty())
+    print(f"  {C.grn}✦ {model_id}{C.r} {C.dim}· {backend.mode} · images are saved to "
+          f"{image_dir()}{C.r}")
+    print(f"  {C.dim}describe an image and press Enter · Ctrl-C stops it · /size /steps /seed · "
+          f"/save · /help · :q exits{C.r}")
+    print(f"  {C.dim}{settings['width']}x{settings['height']} · {settings['steps']} steps · seed "
+          f"{settings['seed'] if settings['seed'] is not None else 'random'} · drawn with "
+          f"{protocol} ({why}){C.r}\n")
+    presets = ["x".join(map(str, preset)) for preset in SIZE_PRESETS]
+    install_chat_completer(IMAGE_CHAT_COMMANDS,
+                           {"size": presets, "seed": ["random"],
+                            "render": list(term_image.PROTOCOLS)})
+    w = term_w() - 4
+    last = {}                                  # the last image, for /save
+    while True:
+        if TTY:
+            print(f"  {C.dgray}╭{'─'*w}╮{C.r}")
+            try: msg = read_prompt(f"  {C.dgray}│{C.r} {C.teal}{C.b}›{C.r} ")
+            except EOFError: print(); break
+            except KeyboardInterrupt: print(); break
+            try: msg = redraw_prompt_box(msg, w)
+            except Exception: print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
+        else:
+            try: msg = input()
+            except EOFError: break
+        msg = msg.strip("\r\n")
+        if msg in (":q", "/q", "exit"): break
+        if not msg.strip(): continue
+        name, rest = chat_command(msg)
+        if name is not None and name not in IMAGE_CHAT_COMMANDS:
+            print(f"  {C.yel}  unknown command: {msg.split()[0]}{C.r}")
+            chat_commands_help(IMAGE_CHAT_COMMANDS); continue
+        if name == "quit": break
+        if name == "help": chat_commands_help(IMAGE_CHAT_COMMANDS); continue
+        if name == "size":
+            if not rest:
+                current = f"{settings['width']}x{settings['height']}"
+                listed = "  ".join(f"{C.b}{p}{C.r}{C.dim}" if p == current else p for p in presets)
+                print(f"  {C.dim}sizes: {listed} · now {current} · any WxH in multiples of "
+                      f"{info['multiple']} from {info['min_side']} to {info['max_side']}{C.r}\n")
+                continue
+            try:
+                width, height = parse_size(rest)
+            except ImageRequestError:
+                print(f"  {C.yel}  /size WxH, one of: {' '.join(presets)}{C.r}\n"); continue
+            problem = check_size(width, height, info)
+            if problem:
+                hint = "x".join(map(str, nearest_size(width, height, info)))
+                print(f"  {C.yel}  {problem} (closest: /size {hint}){C.r}\n"); continue
+            settings["width"], settings["height"] = width, height
+            print(f"  {C.dim}✦ size {width}x{height}{C.r}\n"); continue
+        if name == "steps":
+            try: steps = int(rest)
+            except ValueError: steps = None
+            problem = check_steps(steps)
+            if problem: print(f"  {C.yel}  {problem}{C.r}\n"); continue
+            settings["steps"] = steps
+            print(f"  {C.dim}✦ {steps} steps{C.r}\n"); continue
+        if name == "seed":
+            if rest.lower() in ("", "random", "rand", "none", "off"):
+                settings["seed"] = None
+                print(f"  {C.dim}✦ a new random seed for every image{C.r}\n"); continue
+            try: seed = int(rest)
+            except ValueError: seed = None
+            problem = check_seed(seed)
+            if problem: print(f"  {C.yel}  {problem}, or /seed random{C.r}\n"); continue
+            settings["seed"] = seed
+            print(f"  {C.dim}✦ seed {seed}: the same prompt now gives the same image{C.r}\n"); continue
+        if name == "save":
+            path, why = save_last_image(last, rest.strip())
+            if why: print(f"  {C.yel}  {why}{C.r}\n")
+            elif rest.strip(): print(f"  {C.grn}✓{C.r} saved {path}\n")
+            else: print(f"  {C.dim}✦ the last image is at {path} (/save PATH for a copy elsewhere){C.r}\n")
+            continue
+        if name == "render":
+            choice = rest.strip().lower()
+            if choice not in term_image.PROTOCOLS:
+                print(f"  {C.yel}  /render {' | '.join(term_image.PROTOCOLS)}{C.r}\n"); continue
+            protocol = choice
+            print(f"  {C.dim}✦ images drawn with {protocol}{C.r}\n"); continue
+        print(f"\n  {C.teal}◆ colibri{C.r}")
+        generate_image(backend, msg, settings, protocol, last=last)
+        if not backend.alive:
+            print(f"  {C.yel}the engine is gone; start coli chat again{C.r}"); break
+
+def start_local_image_backend(a, family, engine):
+    """Spawn the engine with a spinner; the load reads tens of GB."""
+    from image_engine import ImageEngineError
+    sp = Spinner(f"loading {family.display_name}…"); sp.start()
+    try:
+        backend = LocalImageBackend(a, a.model, engine)
+    except ImageEngineError as error:
+        sp.stop()
+        sys.exit(f"{C.yel}{error}{C.r}")
+    except KeyboardInterrupt:
+        sp.stop(); sys.exit(130)
+    sp.stop()
+    return backend
+
+def run_image(a, family, engine, prompt):
+    """coli run on an image model: one picture, written to --out (or the
+    images folder), drawn inline when stdout is a terminal."""
+    import term_image
+    backend = start_local_image_backend(a, family, engine)
+    try:
+        settings = image_settings(a, backend.info)
+        interactive = sys.stdout.isatty()
+        protocol = term_image.detect(query=interactive and sys.stdin.isatty())[0] if interactive else "none"
+        stream = sys.stdout if interactive else sys.stderr
+        path = generate_image(backend, prompt, settings, protocol, out=getattr(a, "out", None),
+                              stream=stream)
+        if path and not interactive:
+            print(path)                            # the one line a script wants
+        return 0 if path else 1
+    finally:
+        backend.close()
+
+def server_model_entry(base, api_key=None, timeout=1.5):
+    """The first /v1/models entry of a running server, or {}."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(base.rstrip("/") + "/v1/models")
+        if api_key: req.add_header("Authorization", f"Bearer {api_key}")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "replace")).get("data") or []
+        return data[0] if data and isinstance(data[0], dict) else {}
+    except Exception:
+        return {}
 
 def cmd_chat(a):
     # ATTACH: a running `coli serve` beats a private engine every time — the load
@@ -1547,19 +2725,54 @@ def cmd_chat(a):
         base=getattr(a,"attach",None) or "http://127.0.0.1:8000"
         mid=server_probe(base, getattr(a,"api_key",None))
         if mid:
-            banner(f"chat · {mid} · attached")
-            chat_attached(a, base, mid); return
-        if getattr(a,"attach",None):
+            entry=server_model_entry(base, getattr(a,"api_key",None))
+            serves_images="image_generation" in (entry.get("capabilities") or [])
+            wants_images=bool(a.model) and is_image_model(a.model)
+            # A server of the other kind is not the model asked for: an image
+            # --model must not end up chatting with a text server (or the other
+            # way round) just because something listens on the port. An
+            # explicit --attach still means "that server, whatever it is".
+            if getattr(a,"attach",None) or not a.model or serves_images==wants_images:
+                if serves_images:
+                    banner(f"images · {mid} · attached")
+                    image_repl(a, RemoteImageBackend(base, mid, getattr(a,"api_key",None),
+                                                     entry.get("image")), mid)
+                    print(f"  {C.dim}goodbye: the engine keeps running for the next session{C.r}")
+                    return
+                if "decision" in (entry.get("capabilities") or []):
+                    sys.exit(f"{C.yel}{base} serves {mid}, a decision model:{C.r} it does not chat. "
+                             f"POST /v1/systemone to it (docs/systemone.md)")
+                banner(f"chat · {mid} · attached")
+                chat_attached(a, base, mid); return
+            print(f"  {C.dim}{base} serves {mid}, not an "
+                  f"{'image' if wants_images else 'text'} model: starting a private engine{C.r}")
+        elif getattr(a,"attach",None):
             sys.exit(f"--attach: no coli serve answering at {base} (start one with: coli serve --model <dir>)")
     need_model(a.model)
-    family=resolve_model(a.model).descriptor
+    resolved=resolve_model(a.model); family=resolved.descriptor
     arch=family.id
     if not family.has_gateway_adapter:
         sys.exit(f"{family.display_name}: gateway adapter is not wired")
+    if family.modality=="decision":
+        sys.exit(decision_refusal(family))
+    if family.modality=="image":
+        engine=engine_for(a.model)
+        need_model(a.model,engine)
+        banner(f"images · {family.default_model_id} · local engine", model=a.model)
+        backend=start_local_image_backend(a, family, engine)
+        try:
+            image_repl(a, backend, family.default_model_id)
+        except KeyboardInterrupt:
+            print(f"\n  {C.dim}interrupted{C.r}")
+        finally:
+            backend.close()
+        print(f"  {C.teal}goodbye{C.r} {C.dim}the hummingbird returns to its nest{C.r}\n")
+        return
     if arch!="glm":
         engine=engine_for(a.model)
         need_model(a.model,engine)
-        model_id=family.default_model_id
+        from family_registry import default_model_id
+        model_id=default_model_id(resolved)
         banner(f"chat · {model_id} · local server", model=a.model)
         import openai_server
         # --cap rides along so an explicit `coli chat --cap N` reaches the
@@ -1593,7 +2806,11 @@ def cmd_chat(a):
     need_model(a.model)
     banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}", model=a.model)
     kv_resume_notice(a.model)
-    errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
+    # UTF-8, not the locale's code page: the engine writes "·" and "—", which
+    # cp932/cp949 and the C locale cannot encode. The drain thread below
+    # caught that UnicodeEncodeError (a ValueError) and stopped, and once
+    # nobody read the pipe the engine blocked on its next [prefill] line.
+    errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False, encoding="utf-8")
     e=env_for(a); e["SERVE"]="1"
     # stderr -> PIPE, NOT stderr=errlog (file). On Windows/MinGW, pointing the
     # child's stderr at a file/DEVNULL handle stalls the CRT so stdout (the byte
@@ -1651,7 +2868,7 @@ def cmd_chat(a):
                     _preamble.decode("utf-8","replace"))
     if mload: print(f"  {C.grn}✓{C.r} ready in {mload.group(1)}s {C.dim}· resident {float(mload.group(2))/1000:.1f} GB · RSS {st.get('rss','?')} GB{C.r}")
     try:
-        elog=open(errlog.name).read()
+        elog=open(errlog.name, encoding="utf-8", errors="replace").read()
         for l in elog.splitlines():                     # una riga di stato per riga, senza path
             # [METAL]/[CUDA] first: the splash tagline (model_banner_line) names the
             # checkpoint, not the backend — this engine line is the only confirmation
@@ -1692,7 +2909,7 @@ def cmd_chat(a):
             state={"first":True}
             def prefill_tick(path=errlog.name):
                 try:
-                    with open(path) as f:
+                    with open(path, encoding="utf-8", errors="replace") as f:
                         f.seek(max(0, os.path.getsize(path)-1500)); tail=f.read()
                     pl=[l for l in tail.splitlines() if l.startswith("[prefill]")]
                     return pl[-1].replace("[prefill] ","prefill ") if pl else ""
@@ -1714,7 +2931,10 @@ def cmd_chat(a):
             sp2.stop()
             if st is None: engine_diag(p, errlog); break
             el=time.time()-t0
-            if st.get("tok"):
+            if st.get("tok") and chat_stats_mode(a) == "off":
+                if st.get("interrupted"): print(f"  {C.yel}⏹ interrupted; type :more to continue the response{C.r}")
+                print()
+            elif st.get("tok"):
                 print(f"\r  {C.dgray}└─ {st['tok']} tok · {st['tps']:.2f} tok/s · hit {st['hit']:.0f}% · RSS {st['rss']:.1f} GB · {el:.0f}s{C.r}")
                 if st.get("interrupted"):
                     print(f"  {C.yel}⏹ interrupted; type :more to continue the response{C.r}")
@@ -1763,6 +2983,15 @@ def _serve_engine_env(a, arch):
     env["COLI_SERVE_PORT"]=str(a.port)
     return env
 
+def serve_model_id(a):
+    """The API model id `coli serve` announces: --model-id if given, else the id of
+    what was actually loaded. A family can serve checkpoints of different size
+    (MiMo-V2.6 Flash and Pro, Qwen3.6 and Qwen3.8-27B), and the family's default
+    named the larger sibling as the smaller one. `coli chat` already asks the
+    registry the same way."""
+    from family_registry import default_model_id
+    return a.model_id or default_model_id(resolve_model(a.model))
+
 def cmd_serve(a):
     need_model(a.model)
     family=resolve_model(a.model).descriptor
@@ -1780,7 +3009,7 @@ def cmd_serve(a):
     except OSError: pass
     import openai_server
     openai_server.ARCH=arch
-    model_id=a.model_id or family.default_model_id
+    model_id=serve_model_id(a)
     try:
         if a.temp is not None: os.environ["COLI_TEMP"] = str(a.temp)
         env=_serve_engine_env(a,arch)
@@ -1868,6 +3097,59 @@ def cmd_cluster_worker(a):
     finally:
         stop_heartbeat.set()
 
+def _stop_proc_table(port):
+    """(pid, cmdline, comm) for every process, in /proc's NUL-separated byte format.
+
+    macOS and the BSDs have no /proc, so cmd_stop's scan used to iterate an empty list and
+    report "nothing running" while a live serve and its multi-GB engine kept the box. That is
+    worse than a crash: this command exists to stop the ghost engines that once OOM'd a
+    machine, and a silent success invites the operator to walk away.
+
+    `ps` is asked for everything ONCE rather than per pid, and its space-separated output is
+    normalised to NUL-separated bytes so _serve_cmdline_matches_port keeps working unchanged."""
+    try:
+        pids=[int(d) for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        pids=None
+    if pids is not None:
+        table=[]
+        for pid in pids:
+            try:
+                with open(f"/proc/{pid}/cmdline","rb") as f: cmd=f.read()
+                with open(f"/proc/{pid}/comm") as f: comm=f.read().strip()
+            except (OSError,PermissionError): continue
+            table.append((pid,cmd,comm))
+        return table
+    try:
+        out=subprocess.run(["ps","-Ao","pid=,comm=,command="],capture_output=True,text=True,
+                           timeout=10).stdout
+    except (OSError,subprocess.SubprocessError):
+        return []
+    table=[]
+    for line in out.splitlines():
+        parts=line.strip().split(None,2)
+        if len(parts)<3 or not parts[0].isdigit(): continue
+        pid=int(parts[0]); comm=os.path.basename(parts[1])
+        try: argv=shlex.split(parts[2])
+        except ValueError: argv=parts[2].split()
+        table.append((pid,b"\0".join(a.encode("utf-8","replace") for a in argv)+b"\0",comm))
+    return table
+
+def _stop_environ(pid):
+    """A process's environment as NUL-separated KEY=VAL bytes, /proc or `ps eww`."""
+    try:
+        with open(f"/proc/{pid}/environ","rb") as f: return f.read()
+    except OSError:
+        pass
+    try:
+        out=subprocess.run(["ps","eww","-o","command=","-p",str(pid)],capture_output=True,
+                           text=True,timeout=5).stdout
+    except (OSError,subprocess.SubprocessError):
+        return b""
+    # `ps eww` appends the environment after the command line; keep only KEY=VAL tokens.
+    pairs=[t for t in out.split() if "=" in t and t.split("=",1)[0].replace("_","").isalnum()]
+    return b"\0".join(t.encode("utf-8","replace") for t in pairs)+b"\0"
+
 def cmd_stop(a):
     """Shut down a running `coli serve` AND its engine — one command, no pkill.
     The engine re-execs itself for OMP tuning, so its process is named `exe`,
@@ -1876,35 +3158,47 @@ def cmd_stop(a):
     real processes: the pidfile first, then /proc by cmdline/environ — only
     the requested port's tagged engine and matching `coli serve` wrapper."""
     banner("stop")
+    if a.port is None:
+        # Default 8000, or the port `coli setup` configured: the same server
+        # `coli start` launched is the one `coli stop` stops.
+        try:
+            from setup_flow import configured_port
+            a.port=configured_port(8000)
+        except Exception:
+            a.port=8000
     targets={}  # pid -> descrizione
     pf=serve_pidfile(a.port)
     try:
         with open(pf) as f: pid=int(f.read().split()[0])
         if _pid_alive(pid): targets[pid]=f"coli serve (pidfile, port {a.port})"
     except (OSError,ValueError,IndexError): pass
-    try: proc_entries=os.listdir("/proc")
-    except OSError: proc_entries=[]       # native Windows has no /proc; the pidfile still works
-    for pd in proc_entries:
-        if not pd.isdigit(): continue
-        pid=int(pd)
+    process_names={"exe"}
+    for family in all_families(): process_names.update(family.process_names)
+    for pid,cmd,comm in _stop_proc_table(a.port):
         try:
-            with open(f"/proc/{pd}/cmdline","rb") as f: cmd=f.read()
             if pid!=os.getpid() and _serve_cmdline_matches_port(cmd,a.port):
                 targets.setdefault(pid,f"coli serve (cmdline, port {a.port})")
-            with open(f"/proc/{pd}/comm") as f: comm=f.read().strip()
-            process_names={"exe"}
-            for family in all_families(): process_names.update(family.process_names)
-            if comm in process_names:
-                with open(f"/proc/{pd}/environ","rb") as f: env=f.read()
-                if _serve_environ_matches_port(env,a.port):
-                    targets.setdefault(pid,f"engine `{comm}` (port {a.port})")
+            if comm in process_names and _serve_environ_matches_port(_stop_environ(pid),a.port):
+                targets.setdefault(pid,f"engine `{comm}` (port {a.port})")
         except (OSError,PermissionError): continue
     if not targets:
         print(f"  nothing running — no serve on port {a.port}, no SERVE engines"); return
     for pid,desc in targets.items(): print(f"  {'would stop' if a.dry_run else 'stopping'} {pid}: {desc}")
     if a.dry_run: return
-    for pid in targets:
+    # Graceful first: only the launcher's Engine.close drains the engine
+    # (stdin EOF -> atexit -> HEAT_FILE save). SIGTERM the launchers and
+    # give them the drain window to exit on their own; engine pids left
+    # behind (orphaned, no launcher) get the old treatment after.
+    launchers = [pid for pid, d in targets.items() if d.startswith("coli serve")]
+    strays   = [pid for pid, d in targets.items() if not d.startswith("coli serve")]
+    deadline = time.time() + 30.0
+    for pid in launchers:
         try: os.kill(pid, signal.SIGTERM)
+        except OSError: pass
+    while time.time() < deadline and any(_pid_alive(p) for p in launchers):
+        time.sleep(0.25)
+    for pid in strays:
+        try: os.kill(pid, signal.SIGTERM)   # normally already gone with the launcher
         except OSError: pass
     time.sleep(2.0)
     for pid in targets:
@@ -1972,6 +3266,13 @@ def project_python():
 def cmd_bench(a):
     need_model(a.model)
     banner("bench", model=a.model)
+    # tools/eval_glm.py drives the GLM engine through a scoring protocol no
+    # sibling engine speaks; handed any other model it started the GLM engine
+    # on it, which died on "this engine requires n_group=1" (#898's shape).
+    family=resolve_model(a.model).descriptor
+    if family.id!="glm":
+        sys.exit(f"{C.yel}coli bench is not wired for {family.display_name};{C.r} "
+                 f"its harness scores the GLM-5.2/5.3 engine only")
     # python con `tokenizers`: l'ambiente del progetto se c'e', altrimenti quello corrente
     py = project_python()
     tasks = ",".join(a.tasks) if a.tasks else "hellaswag,arc_challenge,mmlu"
@@ -2034,6 +3335,41 @@ def checkpoint_family(repo):
         return None
 
 
+CONVERT_DEFAULT_REPO = "zai-org/GLM-5.2-FP8"
+
+def convert_output_refusal(out_dir):
+    """Why `coli convert --model out_dir` must not run, or None. A checkpoint
+    already living there is the tell: --model names the OUTPUT directory,
+    and a family that runs its official checkpoint as is needs no conversion
+    at all, which is the usual reason someone points convert at one."""
+    if not os.path.isdir(out_dir):
+        return None
+    try:
+        shards = [x for x in os.listdir(out_dir) if x.endswith(".safetensors")]
+    except OSError:
+        return None
+    has_config = os.path.isfile(os.path.join(out_dir, "config.json"))
+    if not shards and not has_config:
+        return None
+    what = f"{len(shards)} shard(s)" if shards else "a config.json"
+    family = None
+    if has_config:
+        try:
+            family = resolve_model(out_dir).descriptor
+        except (FamilyConfigError, UnknownFamilyError):
+            family = None
+    head = (f"{C.yel}{out_dir} already holds a checkpoint ({what}"
+            f"{', ' + family.display_name if family else ''}).{C.r}\n"
+            f"  --model is the OUTPUT directory of coli convert; the source is --repo <hf repo>.\n"
+            f"  Nothing was written.")
+    if family and not family.converter:
+        return (head + f"\n  {family.display_name} runs its official checkpoint as it is: no conversion needed.\n"
+                       f"  Point the engine at it: coli chat --model {out_dir}")
+    if family and family.converter:
+        return (head + f"\n  To convert shards already on disk, run the family's converter on them:\n"
+                       f"      python3 tools/{family.converter} --indir {out_dir} --outdir <new dir>")
+    return head + "\n  To convert into a fresh directory: coli convert --repo <hf repo> --model <new dir>"
+
 def cmd_convert(a):
     banner("convert")
     # here --model is the DESTINATION the converted weights are written to, not an
@@ -2041,6 +3377,16 @@ def cmd_convert(a):
     if not a.model:
         sys.exit(f"{C.yel}no output directory given.{C.r}\n"
                  f"  --model <dir> is where the converted model is written")
+    # A support case ran `coli convert --model <dir of a downloaded Qwen3.8>`,
+    # read --model as "the model to convert", and watched coli start fetching
+    # the default repo (GLM-5.2) INTO that directory. --model is the output:
+    # refuse to write into a directory that already holds a checkpoint, and
+    # say what the user most likely wanted instead.
+    refusal = convert_output_refusal(a.model)
+    if refusal:
+        sys.exit(refusal)
+    if a.repo is None:
+        a.repo = CONVERT_DEFAULT_REPO
     # python con torch/safetensors: l'ambiente del progetto se c'e', altrimenti quello corrente
     py = project_python()
 
@@ -2136,6 +3482,15 @@ def main():
                         default=os.environ.get("COLI_POLICY","quality"),
                         help="resource policy (explicit --topk/--topp overrides warn and proceed)")
     common.add_argument("--repin", type=int, default=0, help="adapt RAM/VRAM experts every N tokens")
+    # Explicit, default-off opt-in to the qualified native XDNA2 (Ryzen AI NPU)
+    # lane. Deliberately NOT a --policy value: --policy chooses how the planner may
+    # spend memory, this chooses a compute device, and a user wanting quality
+    # planning ON the NPU must be able to say both. Deliberately not inferred from
+    # hardware either -- the reduced-precision consequence means the user has to ask.
+    common.add_argument("--xdna", action="store_true",
+                        help="experimental: run qualified GLM operations on the AMD XDNA2 NPU "
+                             "(reduced-precision BF16 path; output may differ; unsupported "
+                             "operations use the normal path)")
     # Absent (None) = not explicitly set: the glm engine gets the 0 sentinel and picks
     # (8 historically; 1 on Metal+darwin+fast SSD, #379 -- an honest F_NOCACHE probe
     # measures "fast", cached in <model>/.coli_ssd), while non-glm arches get the
@@ -2191,7 +3546,14 @@ def main():
                     help="minimum fractional throughput gain required to accept a candidate")
     pt.add_argument("--profile-dir",default=None,help=argparse.SUPPRESS)
     pr=sub.add_parser("run", parents=[common]);  pr.add_argument("prompt", nargs="*")
+    # Image models: what to draw and where to put it. Ignored by text models.
+    image_flags=(("--size",dict(default=None,help="image size WxH (image models; default: the engine's)")),
+                 ("--steps",dict(type=int,default=None,help="denoising steps (image models)")),
+                 ("--seed",dict(type=int,default=None,help="image seed (image models; default: random)")))
+    for flag,kw in image_flags: pr.add_argument(flag,**kw)
+    pr.add_argument("--out",default=None,help="PNG path for an image model (default: the images folder)")
     pc=sub.add_parser("chat", parents=[common])
+    for flag,kw in image_flags: pc.add_argument(flag,**kw)
     pc.add_argument("--attach", nargs="?", const="http://127.0.0.1:8000", default=None,
                     help="chat against a running `coli serve` instead of spawning an engine "
                          "(keeps the model loaded and the expert cache warm across chat sessions). "
@@ -2199,11 +3561,16 @@ def main():
     pc.add_argument("--no-attach", action="store_true",
                     help="never auto-attach, always spawn a private engine")
     pc.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
+    pc.add_argument("--stats", choices=list(CHAT_STATS_MODES), default=None,
+                    help="generation statistics footer after each answer: full (tokens, seconds, tok/s), "
+                         "compact (tokens, tok/s), off. Default from COLI_CHAT_STATS, else full. "
+                         "Counts are exact when the server reports completion_tokens, ~estimated otherwise.")
     ps=sub.add_parser("serve", parents=[common])
     ps.add_argument("--host",default="127.0.0.1"); ps.add_argument("--port",type=int,default=8000)
     ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID"))
     ps.add_argument("--api-key",default=os.environ.get("COLI_API_KEY"))
-    ps.add_argument("--cors-origin",action="append",default=None)
+    ps.add_argument("--cors-origin",action="append",default=None,
+                    help="allowed browser origin, repeatable; plain values replace the default list, +ORIGIN adds to it")
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
     ps.add_argument("--queue-timeout",type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))
     ps.add_argument("--kv-slots",type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))
@@ -2225,12 +3592,15 @@ def main():
     pworker.add_argument("--layers",default="all",help="topology label, e.g. 0-37")
     pworker.add_argument("--ebits",type=int,default=8); pworker.add_argument("--dbits",type=int,default=8)
     pst=sub.add_parser("stop", parents=[common], help="shut down a running coli serve and its engine")
-    pst.add_argument("--port",type=int,default=8000); pst.add_argument("--dry-run",action="store_true")
+    pst.add_argument("--port",type=int,default=None,
+                     help="port of the server to stop (default 8000, or the one `coli setup` configured)")
+    pst.add_argument("--dry-run",action="store_true")
     pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
     for arg,kw in (("--host",dict(default="127.0.0.1")),("--port",dict(type=int,default=8000)),
                    ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID"))),
                    ("--api-key",dict(default=os.environ.get("COLI_API_KEY"))),
-                   ("--cors-origin",dict(action="append",default=None)),
+                   ("--cors-origin",dict(action="append",default=None,
+                                         help="allowed browser origin, repeatable; plain values replace the default list, +ORIGIN adds to it")),
                    ("--max-queue",dict(type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))),
                    ("--queue-timeout",dict(type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))),
                    ("--kv-slots",dict(type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))),
@@ -2239,6 +3609,47 @@ def main():
                        help="additional Host header accepted by the DNS-rebinding guard; repeat as needed"))):
         pw.add_argument(arg,**kw)
     pw.add_argument("--no-browser",action="store_true",help="don't auto-open the browser")
+    # One-step setup (setup_flow.py). No `common` parent: --model here names a
+    # catalog entry, not a model directory, and nothing below loads an engine.
+    pset=sub.add_parser("setup",help="one step: detect hardware, pick a model, build or fetch "
+                        "the engine, download with resume, then start the dashboard")
+    pset.add_argument("--yes","-y",action="store_true",
+                      help="non-interactive: take the recommendation and every default")
+    pset.add_argument("--model",dest="pick",default=None,metavar="ID",
+                      help="catalog model to install (see --list); default: the recommendation")
+    pset.add_argument("--model-dir",default=None,metavar="DIR",
+                      help="use a model already on disk instead of downloading one")
+    pset.add_argument("--dir",default=None,metavar="DIR",
+                      help="folder for downloaded models (default ~/colibri-models)")
+    pset.add_argument("--backend",choices=("auto","cpu","vulkan","cuda"),default=None,
+                      help="engine build: auto (default) picks CUDA when the toolkit builds for the "
+                      "card, then Vulkan, then the CPU, and a build that fails falls back to the next")
+    pset.add_argument("--no-gpu",action="store_true",help="same as --backend cpu")
+    pset.add_argument("--host",default=None,help="address to serve on (default 127.0.0.1)")
+    pset.add_argument("--port",type=int,default=None,help="port to serve on (default 8000)")
+    pset.add_argument("--no-start",action="store_true",help="set up, but do not start the server")
+    pset.add_argument("--background",action="store_true",
+                      help="start the server in the background (log in the setup folder)")
+    pset.add_argument("--no-browser",action="store_true",help="do not open the browser")
+    pset.add_argument("--reconfigure",action="store_true",
+                      help="choose again even if a setup is already complete")
+    pset.add_argument("--list",action="store_true",help="list the catalog against this machine and exit")
+    pset.add_argument("--all",action="store_true",help="also show the models that do not fit")
+    pset.add_argument("--via-windows",choices=("auto","yes","no"),default="auto",
+                      help="WSL only: download through Windows' curl.exe (auto: when it measures faster)")
+    pset.add_argument("--no-verify",action="store_true",help="skip the checksum of downloaded files")
+    pset.add_argument("--json",action="store_true",
+                      help="machine-readable result; implies --yes and a background start")
+    pstart=sub.add_parser("start",help="start what `coli setup` configured")
+    pstart.add_argument("--background",action="store_true",help="run in the background")
+    pstart.add_argument("--no-browser",action="store_true",help="do not open the browser")
+    pstart.add_argument("--json",action="store_true",help="background start, JSON status out")
+    pstatus=sub.add_parser("status",help="what is set up, whether it runs, its URLs and speed")
+    pstatus.add_argument("--json",action="store_true")
+    plogs=sub.add_parser("logs",help="the last lines of the background server (or install) log")
+    plogs.add_argument("-n","--lines",type=int,default=100)
+    plogs.add_argument("--install",action="store_true",help="the install log instead of the server's")
+    sub.add_parser("mcp",help="Model Context Protocol server on stdio, for AI coding assistants")
     pb=sub.add_parser("bench", parents=[common]); pb.add_argument("tasks", nargs="*")
     pb.add_argument("--limit",type=int,default=40)
     if sys.platform == "win32":
@@ -2247,7 +3658,10 @@ def main():
         _cache_root = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
     _bench_cache = os.path.join(_cache_root, "colibri", "bench")
     pb.add_argument("--data",default=_bench_cache)
-    pc=sub.add_parser("convert", parents=[common]); pc.add_argument("--repo",default="zai-org/GLM-5.2-FP8")
+    pc=sub.add_parser("convert", parents=[common])
+    pc.add_argument("--repo",default=None,
+                    help="HF repo to download and convert (default zai-org/GLM-5.2-FP8). "
+                         "--model is the OUTPUT directory, not a checkpoint to convert.")
     # default=None e non il valore: cosi' e' argparse a dire se l'opzione e'
     # stata SCRITTA (--ebits 3, --ebits=3, o abbreviata), e cmd_convert puo'
     # rifiutarla su un convertitore che non la prende invece di ignorarla.
@@ -2263,6 +3677,14 @@ def main():
              "doctor":cmd_doctor,"tune":cmd_tune,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
              "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
+    if a.cmd in ("setup","start","status","logs"):
+        import setup_flow
+        flow={"setup":setup_flow.cmd_setup,"start":setup_flow.cmd_start,
+              "status":setup_flow.cmd_status,"logs":setup_flow.cmd_logs}[a.cmd]
+        sys.exit(setup_flow.run(flow,a))
+    if a.cmd=="mcp":
+        import mcp_server
+        sys.exit(mcp_server.main())
     if a.cmd=="cluster":
         if a.cluster_cmd=="coordinator": handler=cmd_cluster_coordinator
         elif a.cluster_cmd=="worker": handler=cmd_cluster_worker

@@ -3,9 +3,17 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # A change to this file builds and verifies every archive before a tag depends on
+  # it, and publishes nothing (the release job runs on tags only).
+  pull_request:
+    paths: ['.github/workflows/release.yml']
 
 permissions:
   contents: write
+
+env:
+  # The version in the archives' names: the tag, or a stand-in on a pull request.
+  TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.0.0-test' }}
 
 jobs:
   build:
@@ -15,12 +23,21 @@ jobs:
           - os: ubuntu-latest
             name: linux-x86_64
             ext: ""
-            make_args: "ARCH=x86-64-v3"
+            # VK=1: every engine with its Vulkan backend, and shaders/ beside them. The
+            # loader is opened at run time (vk_load.h), so the engines start and run on
+            # the CPU where there is no Vulkan; COLI_VULKAN=1 (coli setup sets it for a
+            # Vulkan GPU) puts them on the GPU.
+            make_args: "ARCH=x86-64-v3 VK=1"
+            vk: "1"
             v4: "1"
           - os: macos-latest
             name: macos-arm64
             ext: ""
             make_args: ""
+            # The engines with a Metal backend get it (opt-in at run time: COLI_METAL=1,
+            # K3_METAL=1 for Kimi K3; docs/metal.md). Metal is part of macOS, so nothing
+            # changes where it is not asked for.
+            metal: "colibri inkling kimi_k3"
             # arm64 macOS joined COLI_V4_SUPPORTED; the archive verify step
             # asserts the engine is present and dispatchable like the others.
             v4: "1"
@@ -28,7 +45,15 @@ jobs:
           - os: windows-latest
             name: windows-x86_64
             ext: ".exe"
-            make_args: ""
+            # XDNA=1 compiles the optional AMD Ryzen AI NPU lane into the
+            # ordinary Windows host. It stays OFF unless the user passes
+            # `coli --xdna`, adds no XRT or helper import (the helper is
+            # resolved with LoadLibraryExA at runtime, and only on request),
+            # and needs nothing installed on the runner. The artifacts and
+            # coli_xdna.dll it would use are NOT built here -- they need XRT
+            # and the AIE toolchain -- and ship as a separate optional asset.
+            make_args: "XDNA=1 VK=1"
+            vk: "1"
             v4: "1"
             # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'
             # (the v1.0.0 tag build failed on exactly this). Same as ci.yml.
@@ -48,22 +73,34 @@ jobs:
           # inherit: the Package step calls the runner's 7z.exe, which lives on
           # the Windows PATH; the default minimal path would not see it.
           path-type: inherit
+          # the Vulkan headers and glslc for VK=1; nothing links the loader
           install: >-
             make
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-shaderc
 
       - if: matrix.os == 'macos-latest'
         run: brew install libomp
+
+      # libvulkan-dev for the headers, glslc for the shaders; mesa-vulkan-drivers is
+      # Lavapipe, which the verify step runs the packaged engine on.
+      - if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libvulkan-dev glslc mesa-vulkan-drivers
 
       # Every portable sibling engine, not just GLM. CI's all-platform engine
       # matrix proves the same list builds before these archives are assembled.
       - name: Build engines
         run: |
           cd c
-          for t in colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41; do
-            make $t ${{ matrix.make_args }}
+          for t in colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya gliner_decide; do
+            extra=""
+            case " ${{ matrix.metal }} " in *" $t "*) extra="METAL=1" ;; esac
+            make $t ${{ matrix.make_args }} $extra
           done
-          ls -lh colibri${{ matrix.ext }} glm53${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen36${{ matrix.ext }} qwen38${{ matrix.ext }} deepseek_v41${{ matrix.ext }}
+          ls -lh colibri${{ matrix.ext }} glm53${{ matrix.ext }} inkling${{ matrix.ext }} kimi_k3${{ matrix.ext }} olmoe${{ matrix.ext }} qwen36${{ matrix.ext }} qwen38${{ matrix.ext }} deepseek_v41${{ matrix.ext }} mimo${{ matrix.ext }}
 
       # DeepSeek V4 has its own Makefile and its own target name (`deepseek-v4`,
       # producing `deepseek_v4`), so it never joined the loop above -- and #858 is
@@ -84,7 +121,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -104,7 +141,6 @@ jobs:
 
       - name: Package
         run: |
-          TAG=${GITHUB_REF#refs/tags/}
           mkdir -p dist
           # The engine goes in under its PLAIN name. `coli` locates the engine by looking for
           # "colibri"/"colibri.exe" (then "glm") next to itself, so shipping it as
@@ -124,18 +160,33 @@ jobs:
           # with no platform gate, so every archive can carry it.
           cp c/qwen36${{ matrix.ext }} dist/qwen36${{ matrix.ext }}
           cp c/qwen38${{ matrix.ext }} dist/qwen38${{ matrix.ext }}
+          cp c/qwenimage${{ matrix.ext }} dist/qwenimage${{ matrix.ext }}
           cp c/deepseek_v41${{ matrix.ext }} dist/deepseek_v41${{ matrix.ext }}
+          cp c/mimo${{ matrix.ext }} dist/mimo${{ matrix.ext }}
+          cp c/laya${{ matrix.ext }} dist/laya${{ matrix.ext }}
+          cp c/gliner_decide${{ matrix.ext }} dist/gliner_decide${{ matrix.ext }}
           # deepseek_v4 -- underscore, not the hyphen of the make target: engine_for()
           # looks for "deepseek_v4" next to coli. Guarded, not unconditional, because
           # the macos-arm64 archive has no such engine to ship (#858).
           if [ "${{ matrix.v4 }}" = "1" ]; then
             cp c/deepseek_v4${{ matrix.ext }} dist/deepseek_v4${{ matrix.ext }}
           fi
+          # The Vulkan engines load their SPIR-V from shaders/ beside the binary
+          # (coli_vk_shader_path); coli setup points COLI_VK_SHADERS there as well.
+          if [ "${{ matrix.vk }}" = "1" ]; then
+            mkdir -p dist/shaders
+            cp c/shaders/*.spv dist/shaders/
+          fi
           # Kimi K3 ships tiktoken.model, not tokenizer.json; k3_tokenizer.py synthesizes
           # it. Without this the engine is in the archive but `coli chat` still cannot
           # run it -- the second half of #720.
           mkdir -p dist/tools
           cp c/tools/k3_tokenizer.py dist/tools/
+          # check_ablate_evidence.py verifies the ABLATE evidence that eval_glm.py
+          # (packaged above) produces. Nothing in the code names it -- its caller is a
+          # person with argparse arguments -- so pack_python's import walk cannot reach
+          # it, exactly like k3_tokenizer.py. Copied explicitly for the same reason.
+          cp c/tools/check_ablate_evidence.py dist/tools/
           cp c/coli dist/
           # Windows has nothing to click otherwise: `coli` is an extensionless
           # Python script, and the .exe files are engines that exit at once
@@ -167,7 +218,6 @@ jobs:
       # green, the tests are green, and the artifact is still unusable. Assert on behaviour.
       - name: Verify the packaged archive actually runs
         run: |
-          TAG=${GITHUB_REF#refs/tags/}
           mkdir -p verify && cd verify
           if [ "${{ matrix.ext }}" = ".exe" ]; then
             7z x ../dist/colibri-${TAG}-${{ matrix.name }}.zip > /dev/null
@@ -179,7 +229,7 @@ jobs:
           # a green build, green tests, and an archive with no engine for the model the
           # user actually had. Presence is not enough -- assert they are executable, and
           # that the launcher's own resolver finds them where it looks (next to coli).
-          SIBLINGS="inkling kimi_k3 olmoe qwen36 qwen38"
+          SIBLINGS="inkling kimi_k3 olmoe qwen36 qwen38 mimo"
           # deepseek_v4 only where the engine builds (COLI_V4_SUPPORTED); asserting it
           # unconditionally would fail the macos-arm64 archive for shipping an engine
           # that platform cannot have.
@@ -190,6 +240,9 @@ jobs:
           # Kimi K3 needs tokenizer.json synthesized from tiktoken.model; without this
           # script in the archive the engine ships but cannot be driven by coli chat.
           test -f tools/k3_tokenizer.py || { echo "FAIL: k3_tokenizer.py missing from archive"; exit 1; }
+          # Same position as k3_tokenizer.py: reachable only by a person, so only an
+          # explicit gate can prove it shipped.
+          test -f tools/check_ablate_evidence.py || { echo "FAIL: check_ablate_evidence.py missing from archive"; exit 1; }
           # E tutto cio' che coli raggiunge, import e sottoprocessi. Il controllo
           # qui sopra guarda l'unico file che il passo di copia aveva appena
           # scritto: conferma se stesso, ed e' il motivo per cui la v1.10.0 e'
@@ -202,6 +255,18 @@ jobs:
           # fine. The check was wrong, not the artifact.
           python3 -c "import ast; ast.parse(open('tools/k3_tokenizer.py', encoding='utf-8').read())" \
             || { echo "FAIL: packaged k3_tokenizer.py does not parse"; exit 1; }
+          python3 -c "import ast; ast.parse(open('tools/check_ablate_evidence.py', encoding='utf-8').read())" \
+            || { echo "FAIL: packaged check_ablate_evidence.py does not parse"; exit 1; }
+          # test -f and ast.parse both only look at this one file, and only at its
+          # syntax -- neither one executes it, so neither catches a real import-time
+          # failure: an undefined name at module scope, a decorator that raises, or
+          # (were a local import ever reintroduced here) a dependency pack_python's
+          # walk did not carry into the archive. Import it for real, from the archive
+          # root, the same way a person running the shipped `coli` would reach it --
+          # never execute it, an import is enough to prove every name it needs at
+          # module load resolves.
+          python3 -c "import tools.check_ablate_evidence" \
+            || { echo "FAIL: packaged check_ablate_evidence.py does not import"; exit 1; }
           COLI_EXPECT="$SIBLINGS" python3 - <<'PYCHK'
           import importlib.machinery, importlib.util, json, os, sys, tempfile
           from family_registry import all_families
@@ -268,6 +333,65 @@ jobs:
           test -f web/dist/experts.json || { echo "FAIL: expert atlas missing from archive"; exit 1; }
           python3 -c "import sys; sys.path.insert(0, '.'); from openai_server import APIHandler as A; d = A.WEB_DIST; assert (d / 'index.html').is_file(), 'server resolved WEB_DIST to %s, which has no index.html' % d; assert (d / 'experts.json').is_file(), 'no expert atlas under %s' % d; print('OK: the packaged server resolves the dashboard at', d)"
 
+      # The GPU backends in the archive, by behaviour as above. Vulkan (Linux, Windows):
+      # every shader the build compiled is in shaders/, every engine is a Vulkan build
+      # (what coli setup reads to offer the GPU), none links the Vulkan loader (a
+      # machine without one has to run them on the CPU), and the packaged engine, started
+      # from another directory, finds its shaders and a device (Lavapipe on Linux) or,
+      # with no loader, says so instead of failing to start.
+      - name: Verify the archive's Vulkan engines
+        if: matrix.vk == '1'
+        run: |
+          cd verify
+          for f in ../c/shaders/*.spv; do
+            test -f "shaders/$(basename "$f")" || { echo "FAIL: shaders/$(basename "$f") missing from archive"; exit 1; }
+          done
+          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya gliner_decide"
+          if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek_v4"; fi
+          COLI_ENGINES="$ENGINES" python3 - <<'PYCHK'
+          import os, sys
+          sys.path.insert(0, ".")
+          from setup_flow import binary_backends
+          exe = ".exe" if os.name == "nt" else ""
+          bad = [e for e in os.environ["COLI_ENGINES"].split() if "vulkan" not in binary_backends(e + exe)]
+          if bad:
+              sys.exit("FAIL: not Vulkan builds: " + ", ".join(bad))
+          print("OK: every engine is a Vulkan build")
+          PYCHK
+          for e in $ENGINES; do
+            if [ "${{ matrix.ext }}" = ".exe" ]; then deps=$(objdump -p $e.exe | grep 'DLL Name'); else deps=$(ldd $e); fi
+            if echo "$deps" | grep -qi vulkan; then echo "FAIL: $e links the Vulkan loader:"; echo "$deps"; exit 1; fi
+          done
+          echo "OK: no engine links the Vulkan loader"
+          mkdir -p probe && echo '{"model_type":"glm_moe_dsa"}' > probe/config.json
+          here=$(pwd)
+          if [ "${{ matrix.ext }}" = ".exe" ]; then
+            # no GPU on the runner: whatever it finds, a [VK] line and not a missing DLL
+            (cd .. && COLI_NO_OMP_TUNE=1 COLI_VULKAN=1 SNAP="$(cygpath -w "$here/probe")" \
+              timeout 120 "$here/colibri.exe" > vk.log 2>&1 || true)   # no device: the engine exits 2, as asked
+            cat ../vk.log
+            grep -q '^\[VK\]' ../vk.log || { echo "FAIL: the packaged engine did not reach its Vulkan backend"; exit 1; }
+          else
+            (cd / && VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json COLI_NO_OMP_TUNE=1 COLI_VULKAN=1 \
+              SNAP="$here/probe" timeout 120 "$here/colibri" > "$here/vk.log" 2>&1 || true)
+            cat vk.log
+            grep -q '\[VK\] ready:' vk.log || { echo "FAIL: the packaged engine did not find its shaders or Lavapipe"; exit 1; }
+            (cd / && COLI_VK_LOADER=/nonexistent/libvulkan.so.1 COLI_NO_OMP_TUNE=1 COLI_VULKAN=1 \
+              SNAP="$here/probe" timeout 120 "$here/colibri" > "$here/vk0.log" 2>&1 || true)
+            cat vk0.log
+            grep -q '\[VK\] no Vulkan loader' vk0.log || { echo "FAIL: no line for a missing loader"; exit 1; }
+          fi
+          echo "OK: the packaged engine runs its Vulkan backend from the archive"
+
+      - name: Verify the archive's Metal engines
+        if: matrix.metal != ''
+        run: |
+          cd verify
+          for e in ${{ matrix.metal }}; do
+            otool -L $e | grep -q Metal.framework || { echo "FAIL: $e is not a Metal build"; otool -L $e; exit 1; }
+          done
+          echo "OK: ${{ matrix.metal }} carry the Metal backend"
+
       # Only the archives -- never the loose files. `dist/colibri-*.*` used to work by accident
       # (the engine was versioned, so it did not match); now that the engine is plainly named,
       # be explicit about what gets published.
@@ -278,8 +402,101 @@ jobs:
             dist/colibri-*.zip
             dist/colibri-*.tar.gz
 
+  # The Windows CUDA package, an archive of its own: coli_cuda.dll (CUDA_ARCH=portable:
+  # SASS for sm_80/86/89/90/120 plus compute_120 PTX, so RTX 30, 40 and 50 cards and
+  # their datacenter peers), the CUDA runtime it links, and the three engines that load
+  # it (colibri, qwen36, kimi_k3; CUDA_DLL=1, with Vulkan and the NPU lane as in the
+  # main archive). Unpacked next to windows-x86_64.zip's engines it replaces those three,
+  # and coli setup / coli chat turn CUDA on for an NVIDIA card it runs on. A separate
+  # archive because the DLL is large and only an NVIDIA card can use it.
+  # windows-2022 and CUDA 12.8.1: the pins of ci.yml's windows-cuda-build, which builds
+  # the same files on every commit (the toolkit refuses windows-latest's MSVC).
+  cuda-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: MSVC environment (puts cl.exe on PATH for nvcc -ccbin)
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+      - name: Install CUDA toolkit (compiler and runtime)
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: '12.8.1'
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: UCRT64
+          update: false
+          path-type: inherit
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-shaderc
+      - name: Build coli_cuda.dll and the engines that load it
+        shell: msys2 {0}
+        run: |
+          cd c
+          make cuda-dll CUDA_ARCH=portable
+          # .exe names: only colibri has a phony alias (ci.yml, windows-cuda-build)
+          for t in colibri.exe qwen36.exe kimi_k3.exe; do make $t CUDA_DLL=1 VK=1 XDNA=1; done
+          ls -l coli_cuda.dll colibri.exe qwen36.exe kimi_k3.exe
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist/pkg
+          cp c/coli_cuda.dll c/colibri.exe c/qwen36.exe c/kimi_k3.exe dist/pkg/
+          cp "$CUDA_PATH"/bin/cudart64_*.dll dist/pkg/
+          printf '%s\r\n' \
+            "colibri ${TAG}: the CUDA backend for Windows" \
+            "" \
+            "Unpack these files into the folder of colibri-${TAG}-windows-x86_64.zip, next to" \
+            "coli.cmd, replacing colibri.exe, qwen36.exe and kimi_k3.exe. They are the same" \
+            "engines with CUDA added; coli setup then picks CUDA for an NVIDIA card." \
+            "" \
+            "coli_cuda.dll runs on compute capability 8.0 and newer (RTX 30, 40, 50 series," \
+            "A100, H100 and later) with an NVIDIA driver for CUDA 12. Older cards keep" \
+            "Vulkan. cudart64_12.dll is NVIDIA's CUDA runtime, redistributed with it." \
+            > dist/pkg/README-CUDA.txt
+          cd dist/pkg
+          7z a ../colibri-${TAG}-windows-x86_64-cuda.zip *
+      - name: Verify the CUDA package
+        shell: msys2 {0}
+        run: |
+          mkdir -p verify && cd verify
+          7z x ../dist/colibri-${TAG}-windows-x86_64-cuda.zip > /dev/null
+          ls -l
+          for f in coli_cuda.dll colibri.exe qwen36.exe kimi_k3.exe README-CUDA.txt; do
+            test -f $f || { echo "FAIL: $f missing from the CUDA package"; exit 1; }
+          done
+          # the DLL links the runtime that is beside it, and the engines neither CUDA
+          # nor Vulkan: they load coli_cuda.dll (backend_loader.c) and the Vulkan loader
+          # at run time
+          rt=$(objdump -p coli_cuda.dll | sed -n 's/.*DLL Name: \(cudart64_[0-9]*\.dll\).*/\1/p')
+          test -n "$rt" && test -f "$rt" || { echo "FAIL: coli_cuda.dll's runtime ($rt) is not in the package"; exit 1; }
+          for e in colibri qwen36 kimi_k3; do
+            deps=$(objdump -p $e.exe | grep 'DLL Name')
+            if echo "$deps" | grep -qiE 'cudart|vulkan|coli_cuda'; then echo "FAIL: $e.exe links $deps"; exit 1; fi
+          done
+          python3 - <<'PYCHK'
+          import sys
+          sys.path.insert(0, "../c")
+          from doctor import windows_backend_dll
+          from setup_flow import binary_backends
+          for e in ("colibri", "qwen36", "kimi_k3"):
+              image = open(e + ".exe", "rb").read()
+              if windows_backend_dll(image) != "coli_cuda.dll" or binary_backends(e + ".exe") != {"cuda", "vulkan"}:
+                  sys.exit(f"FAIL: {e}.exe is not a CUDA_DLL + Vulkan build")
+          print("OK: colibri, qwen36 and kimi_k3 load coli_cuda.dll and carry Vulkan")
+          PYCHK
+      - uses: actions/upload-artifact@v4
+        with:
+          name: colibri-windows-x86_64-cuda
+          path: dist/colibri-*-cuda.zip
+
   release:
-    needs: build
+    needs: [build, cuda-windows]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

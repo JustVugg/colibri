@@ -458,8 +458,11 @@ def run_fresh_engine(engine, snap, prompt, max_new, runs, cap, bits, memory_gb=N
             stdin_input = prompt + "\n"
 
         try:
+            # The engines read and write UTF-8. Text mode in the locale's code
+            # page could not encode a non-ASCII prompt on cp949/cp932 or the C
+            # locale, and died decoding lines like "[prefill] layer 1/78 · ...".
             proc = subprocess.run(cmd, input=stdin_input, capture_output=True,
-                                  text=True, env=env)
+                                  encoding="utf-8", errors="replace", env=env)
         finally:
             if prompt_path:
                 try:

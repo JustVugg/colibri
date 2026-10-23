@@ -122,7 +122,10 @@ jobs:
           # while backend_vulkan.c compiles perfectly. Assert all four exist.
           ls -l shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \
                 shaders/attention_absorb.spv shaders/rmsnorm.spv
-          ldd colibri | grep -q libvulkan || { echo "FAIL: built without linking libvulkan"; exit 1; }
+          # Nothing links the loader (vk_load.h): a VK=1 binary starts without one, as
+          # the release archives' must. The Vulkan build is the string it opens.
+          if ldd colibri | grep -q libvulkan; then echo "FAIL: colibri links libvulkan"; ldd colibri; exit 1; fi
+          grep -q libvulkan.so.1 colibri || { echo "FAIL: built without the Vulkan backend"; exit 1; }
       - name: Initialise the backend against Lavapipe
         run: |
           cd c
@@ -143,11 +146,335 @@ jobs:
           grep -q "expert tier active" vk.log || {
             echo "FAIL: Vulkan initialised but the expert tier did not activate"; exit 1; }
           echo "OK: shaders compiled, device negotiated, expert tier active"
+          # and with no loader, a line saying so instead of a binary that cannot start
+          COLI_VK_LOADER=/nonexistent/libvulkan.so.1 COLI_NO_OMP_TUNE=1 COLI_VULKAN=1 SNAP=/tmp/vkprobe \
+            timeout 120 ./colibri > vk0.log 2>&1 || true
+          cat vk0.log
+          grep -q "\[VK\] no Vulkan loader (/nonexistent/libvulkan.so.1)" vk0.log || {
+            echo "FAIL: no line for a missing Vulkan loader"; exit 1; }
+      - name: Every qmatmul weight format against a CPU reference
+        run: |
+          cd c
+          # int8, int4, grouped int4, int3, f32, bf16 and fp8-e4m3, through the staged,
+          # batched and unstaged paths and odd widths, before any engine is involved.
+          bash tests/vulkan_engines.sh shader
+      - name: Staged device-local uploads against mapped memory
+        run: |
+          cd c
+          # The path a discrete card without Resizable BAR takes (docs/vulkan.md, "Memory
+          # placement without Resizable BAR"), forced here: the harness's results bit for
+          # bit equal mapped, staged and under an emulated 246 MB window, which must
+          # choose staging on its own; then the formats, the tier and the chain's ops staged.
+          bash tests/vulkan_engines.sh staged
+          COLI_VK_STAGED=1 bash tests/vulkan_engines.sh shader
+
+  # Every engine with a Vulkan hook, run twice on its tiny fixture: on the CPU and on
+  # Lavapipe, with the same snapshot and settings. The gate is the CPU's tokens (and
+  # the engine's own oracle where the configuration is the one it was built for) plus
+  # a non-zero "[VK] <engine>: N matmuls on the GPU": a hook that declined every
+  # matrix would otherwise pass. One leg per family keeps each under its timeout.
+  vulkan-engines:
+    name: Vulkan engines (${{ matrix.family }}, Lavapipe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - family: qwen
+            req: c/tools/requirements-qwen38-tiny.txt
+          # the routed-expert tier of qwen36 and qwen38 under ASan and UBSan
+          - family: qwen-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+          # the dense chain (COLI_VK_CHAIN=1) of qwen36 and qwen38, and the same under
+          # ASan and UBSan
+          - family: qwen-chain
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: qwen-chain-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+          # speculative decoding with deeper verifies (MTP drafts up to 3, prompt-lookup
+          # drafts up to 5) on qwen36 and qwen38: against plain decoding on the CPU and
+          # in the dense chain, and the same under ASan and UBSan
+          - family: qwen-spec
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: qwen-spec-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+          # staged device-local uploads (COLI_VK_STAGED=1): the tier and the chain of qwen36
+          # and qwen38, and an engine choosing staging on its own under an emulated window
+          - family: qwen-staged
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: qwen-chain-staged
+            req: c/tools/requirements-qwen38-tiny.txt
+          # staged uploads failing at every point they can (COLI_VK_STAGED_FAULT): qwen36's
+          # matrices, tier and chain, colibri's KV mirror; the CPU's tokens, and the same
+          # under ASan and UBSan
+          - family: staged-faults
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: staged-faults-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: inkling-olmoe
+            req: c/tools/oracle-requirements.txt
+          # the routed-expert tier of inkling and olmoe under ASan and UBSan
+          - family: inkling-olmoe-sanitize
+            req: c/tools/oracle-requirements.txt
+          # the dense chain (COLI_VK_CHAIN=1) of inkling and olmoe, and the same under
+          # ASan and UBSan
+          - family: inkling-olmoe-chain
+            req: c/tools/oracle-requirements.txt
+          - family: inkling-olmoe-chain-sanitize
+            req: c/tools/oracle-requirements.txt
+          - family: mimo-qwenimage
+            req: c/tools/requirements-qwenimage-tiny.txt
+          - family: deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow   # the V4.1 fixture's reference and its vision tower
+          # the routed-expert tier of deepseek_v41 and deepseek_v4 under ASan and UBSan
+          - family: deepseek-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # Kimi K3's routed experts on the shared tier, and its and MiMo's tier under
+          # ASan and UBSan (MiMo's tier runs in mimo-qwenimage)
+          - family: kimi
+            req: c/tools/requirements-kimi-k3-tiny.txt
+          - family: kimi-mimo-sanitize
+            req: c/tools/requirements-mimo-tiny.txt
+            extra: -r c/tools/requirements-qwenimage-tiny.txt   # qwenimage under ASan too
+          # MiMo-V2.6's dense chain (COLI_VK_CHAIN=1), and the same under ASan and UBSan
+          - family: mimo-chain
+            req: c/tools/requirements-mimo-tiny.txt
+          - family: mimo-chain-sanitize
+            req: c/tools/requirements-mimo-tiny.txt
+          # GLM-5.2 (colibri) and GLM-5.3 Flash (glm53) on the routed-expert tier, and
+          # the same under ASan and UBSan
+          - family: glm
+            req: c/tools/requirements-glm53-tiny.txt
+          - family: glm-sanitize
+            req: c/tools/requirements-glm53-tiny.txt
+          # the dense chain (COLI_VK_CHAIN=1) of colibri and glm53: the MLA, KDA and mHC
+          # ops, and the same under ASan and UBSan
+          - family: glm-chain
+            req: c/tools/requirements-glm53-tiny.txt
+          - family: glm-chain-sanitize
+            req: c/tools/requirements-glm53-tiny.txt
+          # the dense chain (COLI_VK_CHAIN=1) of deepseek_v41 and deepseek_v4, and the same
+          # under ASan and UBSan
+          - family: deepseek-chain
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: deepseek-chain-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # the dense chain (COLI_VK_CHAIN=1) of Kimi K3: its attention residuals, KDA
+          # and gated MLA layers on the device, and the same under ASan and UBSan
+          - family: kimi-chain
+            req: c/tools/requirements-kimi-k3-tiny.txt
+          - family: kimi-chain-sanitize
+            req: c/tools/requirements-kimi-k3-tiny.txt
+          # the dense weights on the device only (COLI_VK_DENSE_HOST=0): the host copies
+          # given back, the CPU's tokens, a lost device reading them back from disk;
+          # one leg per engine group, staged, and the same under ASan and UBSan
+          - family: dense-only-qwen38
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: dense-only-qwen38-staged
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: dense-only-qwen38-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+          # qwen38's partial dense chain (the first N layers on the device, the rest and
+          # the head on the CPU), and the same under ASan and UBSan
+          - family: partial-qwen38
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: partial-qwen38-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: dense-only-qwen36-olmoe
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: dense-only-qwen36-olmoe-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+          # the partial chain of qwen36 and olmoe (the first N layers on the device, the
+          # rest and the head on the CPU), and the same under ASan and UBSan
+          - family: partial-qwen36-olmoe
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: partial-qwen36-olmoe-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: dense-only-inkling-mimo-kimi
+            req: c/tools/requirements-kimi-k3-tiny.txt
+            extra: -r c/tools/oracle-requirements.txt pillow
+          - family: dense-only-inkling-mimo-kimi-sanitize
+            req: c/tools/requirements-kimi-k3-tiny.txt
+            extra: -r c/tools/oracle-requirements.txt pillow
+          - family: dense-only-glm
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: pillow
+          - family: dense-only-glm-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: pillow
+          # the partial chain of colibri and glm53 (the first N layers on the device):
+          # COLI_VK_CHAIN_LAYERS, COLI_VK_DEVICE_CAP_MB, an upload failing mid-setup, the
+          # forward paths with N < L, and the same under ASan and UBSan
+          - family: partial-glm
+            req: c/tools/requirements-glm53-tiny.txt
+            extra: pillow
+          - family: partial-glm-sanitize
+            req: c/tools/requirements-glm53-tiny.txt
+            extra: pillow
+          - family: dense-only-deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: dense-only-deepseek-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # the partial chain (docs/vulkan.md, "A partial chain"): the first N layers on
+          # the device and the CPU the rest, N forced, from a small device
+          # (COLI_VK_DEVICE_CAP_MB) and after an upload failing mid-setup; every forward
+          # path with N below the layers; one leg per engine group, and the same under
+          # ASan and UBSan
+          - family: partial-deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: partial-deepseek-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # the routed-expert tier on two devices (COLI_VK_DEV2): every MoE engine on
+          # Lavapipe opened twice, in decode, a warm start before big prompt steps, both
+          # devices evicting and the second one failing; the shared code under ASan and UBSan
+          - family: dev2
+            req: c/tools/requirements-glm53-tiny.txt
+          - family: dev2-deepseek-kimi-mimo
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: dev2-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # DeepSeek V4.1 Flash and Kimi K3 (the V4.1 fixture's requirements; Kimi K3's
+          # fixture needs numpy alone)
+          - family: partial-dsk
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: partial-dsk-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # inkling's and MiMo's partial chain (the first N layers on the device, the
+          # rest and the head on the CPU): N forced, from a device cap and from an upload
+          # failing inside a layer, the chain's forward paths with N < L, and the same
+          # under ASan and UBSan
+          - family: partial-inkling-mimo
+            req: c/tools/requirements-kimi-k3-tiny.txt
+            extra: -r c/tools/oracle-requirements.txt pillow
+          - family: partial-inkling-mimo-sanitize
+            req: c/tools/requirements-kimi-k3-tiny.txt
+            extra: -r c/tools/oracle-requirements.txt pillow
+          # big prompt chunks and expert streaming (docs/vulkan.md): every chain engine on a
+          # prompt past its usual block, the chunk from the budget, a forced small chunk and
+          # streaming threshold, staged, the feature off, and the forced runs under ASan
+          # and UBSan
+          - family: prefill-qwen
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: prefill-qwen-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+          - family: prefill-inkling-olmoe
+            req: c/tools/oracle-requirements.txt
+          - family: prefill-mimo-kimi
+            req: c/tools/requirements-mimo-tiny.txt
+          - family: prefill-glm
+            req: c/tools/requirements-glm53-tiny.txt
+          - family: prefill-deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # the KV cache split between the device and the host past the device's budget
+          # (COLI_VK_KV_DEVICE_ROWS emulates a small device): every chain engine against its
+          # CPU run, prefix reuse, serve sessions and a lost device across the split, and the
+          # same under ASan and UBSan; DeepSeek's in legs of their own (their fixtures pin
+          # another transformers)
+          - family: kv-split
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: kv-split-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          # the same with the host's part on the device too (COLI_VK_KV_COLD=device)
+          - family: kv-split-cold
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: kv-split-cold-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: kv-split-deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: kv-split-deepseek-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # the dense chain's layers on two devices (Lavapipe opened twice, COLI_VK_DEV2=0):
+          # every chain engine against its CPU run, split at every kind of layer, the state
+          # crossing between the devices, the second device lost; the same under ASan and
+          # UBSan; GLM and Kimi K3, and DeepSeek, in legs of their own
+          - family: layers-dev2
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: layers-dev2-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: layers-dev2-mla
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: layers-dev2-mla-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: layers-dev2-deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: layers-dev2-deepseek-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          # the decision engines: Laya's and GLiNER2.5-Decide's forward on the device and
+          # matrix by matrix, Clef's DECIDE on qwen36's paths in f32, int8 and f16, the
+          # tiny oracles, the serve tests and TypeSafe's SDKs through the device; and the
+          # same (but the SDKs) under ASan and UBSan
+          - family: decide
+            req: c/tools/requirements-jev-sdk.txt
+            extra: -r c/tools/oracle-requirements.txt
+            npm: c/tools/jev-sdk
+          - family: decide-sanitize
+            req: c/tools/requirements-jev-sdk.txt
+            extra: -r c/tools/oracle-requirements.txt
+          # several conversations at once (KV_SLOTS, tests/serve_mux_check.py): each engine's
+          # requests decoded together, frame for frame against the same requests served
+          # alone, on the CPU and with the expert tier; the same under ASan and UBSan;
+          # DeepSeek's in legs of their own (their fixtures pin another transformers)
+          - family: mux
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: mux-sanitize
+            req: c/tools/requirements-qwen38-tiny.txt
+            extra: numpy pillow
+          - family: mux-deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+          - family: mux-deepseek-sanitize
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: ${{ matrix.req }}
+      - name: Install the Vulkan toolchain, Lavapipe and the fixture dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan-dev glslc mesa-vulkan-drivers
+          pip install -r ${{ matrix.req }} ${{ matrix.extra }}
+      - name: The pinned TypeScript SDK
+        if: ${{ matrix.npm }}
+        run: cd ${{ matrix.npm }} && npm ci
+      - name: CPU against Vulkan, engine by engine
+        run: bash c/tests/vulkan_engines.sh ${{ matrix.family }}
 
   musl:
     name: musl libc (Alpine)
     runs-on: ubuntu-latest
-    container: alpine:3.21
+    container: alpine:3.24
     steps:
       # #1430: colibri did not compile against musl, because malloc_trim is a
       # glibc extension guarded on __linux__ rather than on __GLIBC__. Nothing in
@@ -198,6 +525,11 @@ jobs:
             # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'.
             shell: "msys2 {0}"
             v4: "1"
+            # The same make_args as release.yml's windows row, so the shipped
+            # configuration is built here before a tag builds it for the first
+            # time. XDNA=1 needs nothing installed on the runner: the lane's host
+            # side links no XRT, and the helper is loaded at runtime on request.
+            make_args: "XDNA=1"
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -226,14 +558,36 @@ jobs:
         run: |
           cd c
           rc=0
-          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41"
+          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya gliner_decide"
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
           for t in $ENGINES; do
             echo "::group::$t"
-            make $t || { echo "FAILED: $t"; rc=1; }
+            make $t ${{ matrix.make_args }} || { echo "FAILED: $t"; rc=1; }
             echo "::endgroup::"
           done
           exit $rc
+      - if: matrix.os == 'windows-latest'
+        name: "The release configuration is what got built (XDNA=1)"
+        run: |
+          cd c
+          # A switch that silently did nothing would still leave the loop above
+          # green, so check the binary rather than the command line. Only an
+          # XDNA=1 host carries the helper's name (its LoadLibraryExA argument),
+          # and only a default host carries the "no XDNA support" answer.
+          if ! grep -aq 'coli_xdna.dll' colibri.exe; then
+            echo "FAIL: colibri.exe was built without the XDNA lane"; exit 1
+          fi
+          if grep -aq 'this build has no XDNA support' colibri.exe; then
+            echo "FAIL: colibri.exe is the default build, not XDNA=1"; exit 1
+          fi
+          # The lane must not cost the ordinary download a dependency: XRT and
+          # the helper are resolved at runtime, only when the user asks.
+          imports=$(objdump -p colibri.exe | sed -n 's/.*DLL Name: //p' | tr 'A-Z' 'a-z')
+          echo "$imports"
+          if echo "$imports" | grep -Eq '^(xrt_core|xrt_coreutil|coli_xdna)\.dll'; then
+            echo "FAIL: the XDNA=1 host imports XRT or the helper"; exit 1
+          fi
+          echo "OK: colibri.exe carries the XDNA lane and imports neither XRT nor the helper"
       - name: "Environment shims: setenv is visible to getenv in-process"
         run: |
           cd c
@@ -446,6 +800,99 @@ jobs:
               ./qwen36 "$cap" 8 qwen36_tiny/ref_full.json
             echo "::endgroup::"
           done
+      - name: Qwen3.8-2.4T geometry, fused experts + mtp head (converter contract + token-exact)
+        run: |
+          cd c
+          # The 2.4T checkpoint declares the same model_type as the 35B and
+          # resolves to this engine (#1045). Its structural numbers at toy
+          # widths: 92 layers / interval 4 / 512 experts top-10 / 16:1 attention
+          # heads / 8:1 DeltaNet heads. The shard is rewritten into the layout
+          # the real checkpoints ship -- fused expert tensors and an mtp.* head
+          # -- so the converter is seen splitting the one and skipping the other
+          # ON PURPOSE (it must say so), not by never selecting them.
+          # --seed 3: the default seed collapses this geometry's reference to a
+          # single repeated token, which a shape error could still reproduce.
+          python3 tools/make_qwen36_tiny.py --geometry qwen38-2p4t --seed 3 \
+                  --out qwen38_2p4t_tiny --ref-mode full \
+                  --emit-ref qwen38_2p4t_tiny/ref_full.json
+          python3 tools/convert_qwen36.py --model qwen38_2p4t_tiny \
+                  --out qwen38_2p4t_tiny_c --ebits 8 | tee convert_2p4t.log
+          grep -q "skipping 19 \`mtp.\*\` tensor" convert_2p4t.log
+          grep -q "tensor kinds: 1587 in 92 layers, 3 globals" convert_2p4t.log
+          # the container must not carry the head it skipped
+          python3 - <<'EOF'
+          import glob
+          from safetensors import safe_open
+          for path in glob.glob("qwen38_2p4t_tiny_c/*.safetensors"):
+              with safe_open(path, "pt") as f:
+                  assert not [k for k in f.keys() if k.startswith("mtp.")], path
+          EOF
+          for cap in 1 2 512; do
+            echo "::group::2.4T geometry cap=$cap"
+            COLI_DENSE_I8=0 SNAP=qwen38_2p4t_tiny_c \
+              ./qwen36 "$cap" 8 qwen38_2p4t_tiny/ref_full.json
+            echo "::endgroup::"
+          done
+      - name: "Qwen3-Coder geometry: qwen3_moe, every layer attention, no shared expert"
+        run: |
+          cd c
+          # Qwen/Qwen3-Coder-30B-A3B-Instruct is Qwen3MoeForCausalLM: no DeltaNet, no
+          # attention output gate, no shared expert, full rotary and plain RMSNorm
+          # weights. The fixture draws its norms around 1 so a container that applied
+          # them zero-centered could not pass, and the converter has to say so in the
+          # meta; the engine runs it token for token against transformers.
+          python3 tools/make_qwen36_tiny.py --geometry qwen3-coder-30b \
+                  --out qwen3_coder_tiny --ref-mode full \
+                  --emit-ref qwen3_coder_tiny/ref_full.json
+          python3 tools/convert_qwen36.py --model qwen3_coder_tiny \
+                  --out qwen3_coder_tiny_c --ebits 8
+          python3 -c "import json; m = json.load(open('qwen3_coder_tiny_c/qwen36_meta.json')); \
+                      assert (m['shared_inter'], m['zero_centered_norms'], m['partial_rotary_factor'], \
+                              set(m['layer_types'])) == (0, False, 1.0, {'full_attention'}), m"
+          for cap in 1 8; do
+            echo "::group::Qwen3-Coder geometry cap=$cap"
+            COLI_DENSE_I8=0 SNAP=qwen3_coder_tiny_c \
+              ./qwen36 "$cap" 8 qwen3_coder_tiny/ref_full.json
+            echo "::endgroup::"
+          done
+      - name: "Qwen3.8-27B geometry: a dense checkpoint of the same architecture (#1757)"
+        run: |
+          cd c
+          # Qwen/Qwen3.8-27B is Qwen3_5ForConditionalGeneration: the hybrid
+          # DeltaNet + gated attention of this engine with one SwiGLU MLP per
+          # layer and no router. The converter has to write num_experts 0 and
+          # the MLP width, and the engine has to run that MLP as an ungated
+          # shared expert, token for token against Qwen3_5ForCausalLM.
+          python3 tools/make_qwen36_tiny.py --geometry qwen38-27b-dense \
+                  --out qwen38_27b_tiny --ref-mode full \
+                  --emit-ref qwen38_27b_tiny/ref_full.json
+          python3 tools/convert_qwen36.py --model qwen38_27b_tiny \
+                  --out qwen38_27b_tiny_c --ebits 8
+          python3 -c "import json; m = json.load(open('qwen38_27b_tiny_c/qwen36_meta.json')); \
+                      assert (m['num_experts'], m['topk'], m['shared_inter']) == (0, 0, 128), m"
+          for cap in 1 8; do
+            echo "::group::27B dense geometry cap=$cap"
+            COLI_DENSE_I8=0 SNAP=qwen38_27b_tiny_c \
+              ./qwen36 "$cap" 8 qwen38_27b_tiny/ref_full.json
+            echo "::endgroup::"
+          done
+          # The same model with its vision tower (Qwen3_5ForConditionalGeneration):
+          # a prompt with one 4x8-patch image, token-exact against transformers.
+          # Every position after the image depends on the 3D M-RoPE positions
+          # (1D positions give 6/16 here), and the serve test holds the IMAGE
+          # frame path to the same tokens.
+          python3 tools/make_qwen36_vl_tiny.py --out qwen38_27b_vl_tiny
+          python3 tools/convert_qwen36.py --model qwen38_27b_vl_tiny \
+                  --out qwen38_27b_vl_tiny_c --ebits 8 | tee convert_vl.log
+          grep -q "\[vision\] model-vision.safetensors" convert_vl.log
+          for cap in 1 8; do
+            echo "::group::27B vision cap=$cap"
+            COLI_DENSE_I8=0 SNAP=qwen38_27b_vl_tiny_c \
+              ./qwen36 "$cap" 8 qwen38_27b_vl_tiny/ref.json
+            echo "::endgroup::"
+          done
+          QWEN36_VL_TINY=qwen38_27b_vl_tiny_c QWEN36_VL_REF=qwen38_27b_vl_tiny/ref.json \
+            python3 -m unittest -v tests.test_qwen36_vision_serve
       - name: Same run under ASan + UBSan
         run: |
           cd c
@@ -465,13 +912,138 @@ jobs:
           # diagnostic.
           make clean >/dev/null 2>&1 || true
           make qwen36 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
-          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
-            COLI_DENSE_I8=0 SNAP=qwen36_tiny_c PILOT=1 WIDE=2 \
-            ./qwen36 1 8 qwen36_tiny/ref_full.json > san.log 2>&1 || true
-          if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then
-            echo "FAIL: sanitizer diagnostic under PILOT"; cat san.log; exit 1
-          fi
-          echo "sanitizers clean:"; grep -E "Matching tokens" san.log || true
+          for fx in qwen36_tiny qwen38_2p4t_tiny; do
+            ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 \
+              COLI_DENSE_I8=0 SNAP=${fx}_c PILOT=1 WIDE=2 \
+              ./qwen36 1 8 $fx/ref_full.json > san.log 2>&1 || true
+            if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then
+              echo "FAIL: sanitizer diagnostic under PILOT ($fx)"; cat san.log; exit 1
+            fi
+            echo "sanitizers clean ($fx):"; grep -E "Matching tokens" san.log || true
+          done
+          # Same sanitized binary on hostile weights: an all-NaN router row and an
+          # oversized e_score_correction_bias must degrade or be refused, never
+          # reach the heap.
+          ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 QWEN36_TINY_C=qwen36_tiny_c \
+            QWEN36_TINY_REF=qwen36_tiny/ref_full.json \
+            python3 -m unittest -v tests.test_qwen36_hostile_weights
+      - name: KV prefix reuse is token-identical (serve, several turns)
+        run: |
+          cd c
+          # Reusing a previous turn's state must change the timing and nothing
+          # else. A wrong reuse length does not crash: it answers from another
+          # conversation's state and still reads plausibly, so this is the only
+          # gate that would catch it. The sanitizer step above rebuilt the
+          # engine, so rebuild the normal one first.
+          make clean >/dev/null 2>&1 || true
+          make qwen36
+          QWEN36_TINY=qwen36_tiny_c python3 -m unittest -v tests.test_qwen36_prefix_serve
+      - name: Expert kernel A/B on an int4 gs64 fixture (old path vs expert_ffn.h, byte-identical ids)
+        run: |
+          cd c
+          make clean >/dev/null 2>&1 || true
+          make qwen36
+          # The int8 gate above never enters the shared kernel (it needs an int4
+          # gs=64 container with widths that are multiples of 64: the default
+          # tiny has inter=32). This fixture does. The reference is the same
+          # torch model, but what this step asserts is not oracle agreement
+          # (int4 experts drift from f32 by design): it is that the kernel and
+          # the unpack-to-int8 path it replaces emit the SAME ids at every cap,
+          # including cap=1 (one expert resident: the per-pair cut) and cap=16
+          # (the whole prompt in one run). Within each path the last logits must
+          # be the same bytes at every cap: an id survives a last-bit drift, and
+          # the per-pair cut once rounded twice where an FMA build rounds once.
+          python3 tools/make_qwen36_tiny.py --out qwen36_tiny64 --ref-mode full --inter 64 \
+                  --emit-ref qwen36_tiny64/ref_full.json
+          python3 tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_c --ebits 4 --gs 64
+          for cap in 1 2 8 16; do
+            for k in 0 1; do
+              QWEN_EXPERT_KERNEL=$k COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c DUMP=logits_${cap}_$k.f32 \
+                ./qwen36 "$cap" 4 qwen36_tiny64/ref_full.json > ab_${cap}_$k.log 2>&1 || true
+              grep -E "^C engine" ab_${cap}_$k.log > ids_${cap}_$k.txt
+            done
+            grep -q "expert kernel: planar int4" ab_${cap}_1.log || { echo "FAIL: kernel did not engage at cap=$cap"; cat ab_${cap}_1.log; exit 1; }
+            grep -q "expert kernel: planar int4" ab_${cap}_0.log && { echo "FAIL: QWEN_EXPERT_KERNEL=0 still engaged the kernel"; exit 1; }
+            test -s ids_${cap}_1.txt || { echo "FAIL: no ids at cap=$cap"; cat ab_${cap}_1.log; exit 1; }
+            cmp ids_${cap}_0.txt ids_${cap}_1.txt || { echo "FAIL: ids differ at cap=$cap"; cat ids_${cap}_0.txt ids_${cap}_1.txt; exit 1; }
+            echo "cap=$cap: identical ($(cat ids_${cap}_1.txt))"
+          done
+          for k in 0 1; do
+            for cap in 1 2 8; do
+              test -s logits_${cap}_$k.f32 || { echo "FAIL: no logits dump at cap=$cap kernel=$k"; exit 1; }
+              cmp logits_${cap}_$k.f32 logits_16_$k.f32 || { echo "FAIL: kernel=$k logits at cap=$cap differ from cap=16"; exit 1; }
+            done
+            echo "kernel=$k: identical logits at cap 1/2/8/16"
+          done
+          make tests/test_expert_ffn && ./tests/test_expert_ffn
+      - name: Mixed expert layout (int4 gs64 gate/up, int8 down) loads and is cap-independent
+        run: |
+          cd c
+          # The #1370 experiment knob: one slab per expert with int4 gate/up and int8
+          # down (2*inter*hidden bytes). The engine must tell it apart from int4 and
+          # int8 by size, read every matrix in its own format, and give the same ids
+          # at every cache capacity (cap=1 recycles the single slot after each expert,
+          # which is where a wrong slab offset would show). The ids are not compared to
+          # the torch oracle: int4 gate/up drift from f32 by design, as in the A/B above.
+          python3 tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_d8 --ebits 4 --gs 64 --down-bits 8
+          python3 - <<'PY'
+          import json; m = json.load(open("qwen36_tiny64_d8/qwen36_meta.json"))
+          assert m["expert_down_bits"] == 8 and m["expert_down_gs"] == 0 and m["expert_gs"] == 64, m
+          PY
+          for cap in 1 2 8; do
+            COLI_DENSE_I8=0 SNAP=qwen36_tiny64_d8 ./qwen36 "$cap" 4 qwen36_tiny64/ref_full.json > mixed_$cap.log 2>&1 || true
+            grep -q "expert format on disk: int4 gate/up + int8 down" mixed_$cap.log || { echo "FAIL: mixed layout not detected at cap=$cap"; cat mixed_$cap.log; exit 1; }
+            grep -E "^C engine" mixed_$cap.log > mixed_ids_$cap.txt
+            test -s mixed_ids_$cap.txt || { echo "FAIL: no ids at cap=$cap"; cat mixed_$cap.log; exit 1; }
+          done
+          cmp mixed_ids_1.txt mixed_ids_8.txt && cmp mixed_ids_2.txt mixed_ids_8.txt || { echo "FAIL: ids differ across caps"; cat mixed_ids_*.txt; exit 1; }
+          echo "mixed layout: identical ids at cap 1/2/8 ($(cat mixed_ids_8.txt))"
+          # COLI_CUDA=1 on a mixed container is refused with a line, the CPU path stands
+          COLI_CUDA=1 COLI_DENSE_I8=0 SNAP=qwen36_tiny64_d8 ./qwen36 8 4 qwen36_tiny64/ref_full.json > mixed_cuda.log 2>&1 || true
+          grep -q "COLI_CUDA=1 ignored: the VRAM expert tier does not take the mixed layout" mixed_cuda.log || { echo "FAIL: tier refusal line missing"; cat mixed_cuda.log; exit 1; }
+      - name: Pinned experts and PILOT prefetch never change the logits (int4 gs64 fixture)
+        run: |
+          cd c
+          # HOT and COLIBRI_RESIDENT pin experts, PILOT loads the next layers' from a
+          # worker thread: they decide which experts stay in RAM, never what is
+          # computed, so the last logits must be the bytes of cap=16 without them.
+          # At a small cap they were not: a moe run read its experts from slots that
+          # nothing marked busy, so the run's own next load (fewer unpinned slots than
+          # topk) or the worker could reload one under the kernel. cap starts at 2 =
+          # topk: this step is about eviction, the cap=1 cut is the A/B step's.
+          B=./qwen36
+          run() {  # tag kernel cap [VAR=value...]
+            local tag=$1 k=$2 cap=$3; shift 3
+            env "$@" QWEN_EXPERT_KERNEL=$k COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c DUMP=pin_$tag.f32 \
+              $B "$cap" 4 qwen36_tiny64/ref_full.json > pin_$tag.log 2>&1 || true
+            test -s pin_$tag.f32 || { echo "FAIL: no logits dump ($tag)"; cat pin_$tag.log; exit 1; }
+          }
+          fail=0
+          for k in 0 1; do
+            run ref_$k $k 16
+            for cap in 2 3 4; do
+              for hot in 1 2 3; do
+                run k${k}_cap${cap}_hot$hot $k $cap HOT=$hot
+                grep -q "^\[HOT\] Pinned [1-9]" pin_k${k}_cap${cap}_hot$hot.log || { echo "FAIL: HOT pinned nothing"; exit 1; }
+              done
+              for r in 1 2; do
+                run k${k}_cap${cap}_res$r $k $cap COLIBRI_RESIDENT=$r
+                grep -q "^\[RESIDENT\] Pinned [1-9]" pin_k${k}_cap${cap}_res$r.log || { echo "FAIL: RESIDENT pinned nothing"; exit 1; }
+              done
+            done
+            # PILOT races a loader thread against the moe run: repeat it
+            for i in $(seq 10); do
+              run k${k}_pilot1_$i $k 2 PILOT=1
+              run k${k}_pilot3_$i $k 2 PILOT=3 WIDE=4
+            done
+            n=0 bad=0
+            for f in pin_k${k}_*.f32; do
+              n=$((n+1)); cmp -s "$f" pin_ref_$k.f32 || { echo "kernel=$k: ${f#pin_k${k}_} differs from cap=16"; bad=$((bad+1)); }
+            done
+            echo "kernel=$k: $((n-bad))/$n runs give the cap=16 logits"
+            [ $bad -eq 0 ] || fail=1
+          done
+          exit $fail
       - name: A malformed container is refused, not read
         run: |
           cd c
@@ -549,6 +1121,11 @@ jobs:
           SNAP=olmoe_tiny_c ./olmoe 8 8 olmoe_tiny/ref_olmoe.json | tee oracle.log
           # the engine prints the score and exits 0 either way: the gate is here
           grep -qE 'Matching tokens: ([0-9]+)/\1$' oracle.log
+      - name: "Dense tensors: the shape config.json gives, or the load refuses"
+        run: |
+          cd c
+          COLI_OLMOE_FIXTURE=olmoe_tiny_c COLI_OLMOE_REFERENCE=olmoe_tiny/ref_olmoe.json \
+            python3 -m unittest -v tests.test_olmoe_dense_shape
       - name: "Cache cap: the sentinel takes the budget, an explicit cap is left alone"
         run: |
           cd c
@@ -561,6 +1138,30 @@ jobs:
         run: |
           cd c
           OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_dashboard_hits
+      - name: "Over-long prompt: CONTEXT_EXCEEDED, so the gateway answers 400"
+        run: |
+          cd c
+          COLI_OLMOE_FIXTURE=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_context_exceeded
+      - name: "Reference: lengths and ids checked before the run"
+        run: |
+          cd c
+          COLI_OLMOE_FIXTURE=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_reference_bounds
+      - name: KV prefix reuse is token-identical (serve, several turns)
+        run: |
+          cd c
+          # Same contract as the Qwen3.6 job runs, from the same harness: a
+          # reused prefix must produce exactly what a cold engine produces for
+          # the same prompt. Wrong reuse is silent, so the gate is the only
+          # thing between it and a user.
+          OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_prefix_serve
+      - name: "Brio over serve: snapshot scoring is exact, and invisible to chat"
+        run: |
+          cd c
+          # Closed-set scoring must give the log probabilities a cold recompute
+          # gives, and a request without the keys must stay byte-identical.
+          # Both are silent when wrong; this module was skipping everywhere
+          # until it was named here (#1742).
+          OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_brio_serve
 
   dsv41-tiny-check:
     name: DeepSeek V4.1 tiny oracle (engram + DSA + fp4 experts + vision)
@@ -596,6 +1197,52 @@ jobs:
             SNAP=dsv41_tiny ./deepseek_v41 "$cap" dsv41_tiny/ref.json
             echo "::endgroup::"
           done
+      - name: "Multi-SSD mirror and O_DIRECT change nothing about the answer"
+        run: |
+          cd c
+          # A replica answers the same bytes: the same container in a second directory
+          # must produce the same token stream, on the primary and through the mirror,
+          # with the O_DIRECT window and with the buffered path it replaces. Routing an
+          # expert to a drive is an I/O decision and must not be visible downstream.
+          mkdir -p dsv41_mirror
+          cp dsv41_tiny/model.safetensors dsv41_mirror/
+          SNAP=dsv41_tiny ./deepseek_v41 8 dsv41_tiny/ref.json > primary.txt 2>/dev/null
+          SNAP=dsv41_tiny COLI_MODEL_MIRROR=dsv41_mirror ./deepseek_v41 8 dsv41_tiny/ref.json > mirror.txt 2>/dev/null
+          SNAP=dsv41_tiny COLI_MODEL_MIRROR=dsv41_mirror V41_DIRECT=0 ./deepseek_v41 8 dsv41_tiny/ref.json > buffered.txt 2>/dev/null
+          cmp primary.txt mirror.txt
+          cmp primary.txt buffered.txt
+          # COLI_MODEL_DIRS splits the container as DISTINCT shards -- no second copy,
+          # which is the only multi-drive layout most people can build out of a 510 GB
+          # checkpoint. The shards move; the answer must not.
+          mkdir -p dsv41_split_meta dsv41_split_shard
+          cp dsv41_tiny/config.json dsv41_tiny/tokenizer.json dsv41_tiny/dsv41_engram.json dsv41_split_meta/
+          cp dsv41_tiny/model.safetensors dsv41_split_shard/
+          SNAP=dsv41_split_meta COLI_MODEL_DIRS=dsv41_split_shard ./deepseek_v41 8 dsv41_tiny/ref.json > split.txt 2>split.err
+          cmp primary.txt split.txt
+          grep -q "\[SPLIT\] model across 2 dir(s)" split.err
+          # A copy that is not byte-identical is not a replica: it is refused, and the
+          # run stays on the primary rather than reading someone else's offsets.
+          mkdir -p dsv41_divergent
+          python3 - <<'PY'
+          import pathlib
+          src = pathlib.Path("dsv41_tiny/model.safetensors")
+          data = bytearray(src.read_bytes())
+          data[8] ^= 0x01        # inside the safetensors header
+          pathlib.Path("dsv41_divergent/model.safetensors").write_bytes(bytes(data))
+          PY
+          SNAP=dsv41_tiny COLI_MODEL_MIRROR=dsv41_divergent ./deepseek_v41 8 dsv41_tiny/ref.json > divergent.txt 2>divergent.err
+          cmp primary.txt divergent.txt
+          grep -q "header differs from the primary copy" divergent.err
+      - name: KV prefix reuse (opt-in here) and the resumed-prefill exactness
+        run: |
+          cd c
+          # Two gates in one file. The first is exactness and is ours: a prefill
+          # that resumes mid-sequence must compute what a cold prefill computes,
+          # which is what the index-key schedule fix is for. The second is the
+          # shared contract, minus the one scenario this engine cannot satisfy --
+          # a prefix holding generated positions, which attend differently from
+          # prefilled ones by the vendor's own design. The override says so.
+          DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefix_serve
       - name: "A prompt longer than one block, so the block boundary is crossed"
         run: |
           cd c
@@ -632,9 +1279,12 @@ jobs:
           # accepted and the verification path would never run. V41_SPEC_FORCE drafts
           # the reference's own tokens instead: 1 accepts the whole block, 2 corrupts
           # the last draft so a round is rejected part way and the rollback runs, 3
-          # keeps the head's drafts, which is what serving does. All three have to
-          # reproduce the reference token for token, at any cache capacity.
-          for force in 1 2 3; do
+          # keeps the head's drafts, which is what serving does, 4 rejects the first
+          # draft of every round (all drafted rows rolled back, what serving at 10-30%
+          # acceptance does most of the time) and 5 a different one each round. All
+          # of them have to reproduce the reference token for token, at any cache
+          # capacity.
+          for force in 1 2 3 4 5; do
             for cap in 1 8; do
               echo "::group::V41_SPEC_FORCE=$force cap=$cap"
               SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=$force ./deepseek_v41 "$cap" dsv41_tiny/ref.json
@@ -673,18 +1323,33 @@ jobs:
         run: pip install -r c/tools/requirements-qwen38-tiny.txt
       - name: Generate the upstream text fixture and run the token-and-logit oracle
         run: make -C c qwen38-tiny-check
+      - name: Routed experts as the release ships them (FP8 shards), then the engine on the fake CUDA tier
+        run: make -C c qwen38-tiny-fp8-check qwen38-tier-engine-check qwen38-dn-gpu-check
+      - name: Routed experts as int4-g64 from the converter's sidecar
+        run: make -C c qwen38-tiny-int4-check
+      - name: MTP speculative decoding against plain decoding (lossless gate)
+        run: make -C c qwen38-tiny-mtp-check
       - name: Repeat the eviction path under ASan and UBSan
         run: |
           cd c
           make -B qwen38 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
-          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+          ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 \
             OMP_NUM_THREADS=2 SNAP=./qwen38_tiny \
             ./qwen38 1 8 ./qwen38_tiny/ref.json > qwen38-san.log 2>&1
-          if grep -qE "ERROR: AddressSanitizer|runtime error:" qwen38-san.log; then
-            cat qwen38-san.log
+          # the int4-g64 sidecar's load and matmul, evicting at cap 1
+          ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 \
+            Q38_EXPERT_INT4=1 OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_int4 \
+            ./qwen38 1 8 ./qwen38_tiny_int4/ref_int4.json > qwen38-san-int4.log 2>&1
+          if grep -qE "ERROR: AddressSanitizer|runtime error:" qwen38-san.log qwen38-san-int4.log; then
+            cat qwen38-san.log qwen38-san-int4.log
             exit 1
           fi
           grep -q "Matching tokens: 8/8" qwen38-san.log
+          grep -q "Matching tokens: 8/8" qwen38-san-int4.log
+          # the MTP head, the S=2 verify and the rollback on every fixture kind
+          ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+            python3 tests/qwen38_mtp_harness.py --engine ./qwen38 --bf16 ./qwen38_tiny_mtp \
+            --fp8 ./qwen38_tiny_fp8_mtp --int4 ./qwen38_tiny_int4_mtp
       - name: Refuse config and tensor-shape disagreement
         run: |
           cd c
@@ -708,7 +1373,118 @@ jobs:
           # the oracle fixture has no tokenizer; serve mode needs one
           python3 tools/make_edge_tiny_tokenizer.py --vocab-size "$(python3 -c 'import json;print(json.load(open("qwen38_tiny/config.json"))["vocab_size"])')" qwen38_tiny
           make qwen38 >/dev/null
-          QWEN38_TINY=qwen38_tiny python3 -m unittest -v tests.test_qwen38_dashboard
+          QWEN38_TINY=qwen38_tiny python3 -m unittest -v tests.test_qwen38_dashboard tests.test_qwen38_brio
+          python3 tools/make_edge_tiny_tokenizer.py --vocab-size 64 qwen38_tiny_fp8
+          QWEN38_TINY=qwen38_tiny_fp8 python3 -m unittest -v tests.test_qwen38_brio
+
+  laya-tiny-check:
+    name: Laya tiny oracle (vs the laya package) and POST /v1/systemone end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the fixture generator's one dependency
+        run: pip install numpy
+      - name: Generate the fixture, build laya, compare with the committed reference
+        run: make -C c laya-tiny-check
+
+  gliner-decide-tiny-check:
+    name: GLiNER2.5-Decide tiny oracle (vs the gliner2 package) and POST /v1/systemone end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the fixture generator's one dependency
+        run: pip install numpy
+      - name: Generate the fixture, build gliner_decide, compare with the committed reference
+        run: make -C c gliner-decide-tiny-check
+
+  clef-tiny-check:
+    name: Clef tiny oracle (vs joint_schema_model.py) and POST /v1/systemone on qwen36
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install the generator's numpy and the converter's torch + safetensors
+        run: pip install numpy -r c/tools/oracle-requirements.txt
+      - name: Generate and convert the fixture, build qwen36, compare with the committed reference
+        run: make -C c clef-tiny-check
+
+  jev-sdk-check:
+    name: TypeSafe's SDKs (Python, TypeScript) against coli serve, base URL changed only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install the pinned SDKs, and torch for the Clef fixture's converter
+        run: |
+          pip install -r c/tools/requirements-jev-sdk.txt
+          pip install numpy -r c/tools/oracle-requirements.txt
+          cd c/tools/jev-sdk && npm ci
+      - name: Both SDKs against a language model (tiny MiMo), the decision engines (tiny Laya, tiny GLiNER2.5-Decide) and Clef
+        run: make -C c jev-sdk-check
+
+  qwenimage-tiny-check:
+    name: Qwen-Image tiny oracle (text encoder, DiT, scheduler, VAE vs diffusers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-qwenimage-tiny.txt
+      - name: Install the pinned diffusers reference
+        run: pip install -r c/tools/requirements-qwenimage-tiny.txt
+      - name: Every stage against diffusers, from the reference input of that stage
+        run: |
+          cd c
+          # A tiny random pipeline in the real checkpoint's layout (bf16 text
+          # encoder and DiT, f32 VAE, non-square 64x96, z_dim 16) and its f32
+          # reference. With COLI_IMG_BITS=16 the engine computes on exactly those
+          # weights, so each stage must match to summation order; the engine exits
+          # non-zero on a mismatch, and the RGBA must agree to 1 in 1000 bytes.
+          python3 tools/make_qwenimage_tiny.py qwenimage_tiny
+          make qwenimage tests/test_qi_gemm tests/test_qwenimage_vae
+          tests/test_qi_gemm
+          COLI_IMG_BITS=16 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny --ref qwenimage_tiny/ref
+      - name: "The VAE alone: tiny decoder at two latent shapes"
+        run: |
+          cd c
+          python3 tools/make_qwenimage_vae_tiny.py qwenimage_vae_tiny
+          tests/test_qwenimage_vae qwenimage_vae_tiny
+      - name: The shipping defaults (int8 weights) end to end, and the serve protocol
+        run: |
+          cd c
+          ./qwenimage --model qwenimage_tiny --prompt "a red fox in the snow" \
+                      --width 256 --height 256 --steps 2 --seed 1 --out tiny.png
+          python3 -c "import sys; sys.path.insert(0, '.'); import image_engine as e; w, h, c, px = e.decode_png(open('tiny.png', 'rb').read()); assert (w, h, c) == (256, 256, 4), (w, h, c)"
+          QWENIMAGE_TINY=qwenimage_tiny python3 -m unittest -v tests.test_qwenimage_engine_serve
+      - name: The oracle and the serve tests again under ASan and UBSan
+        run: |
+          cd c
+          make -B qwenimage EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+          export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2
+          COLI_IMG_BITS=16 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny --ref qwenimage_tiny/ref > qwenimage-san.log 2>&1 || true
+          QWENIMAGE_TINY=qwenimage_tiny python3 -m unittest tests.test_qwenimage_engine_serve >> qwenimage-san.log 2>&1 || true
+          if grep -qE "ERROR: AddressSanitizer|runtime error:" qwenimage-san.log; then
+            cat qwenimage-san.log
+            exit 1
+          fi
+          grep -q "all stages within tolerance" qwenimage-san.log
 
   inkling-oracle:
     name: Inkling oracle (token-exact vs transformers)
@@ -788,10 +1564,15 @@ jobs:
           /tmp/tike
       - name: Generate the glm_tiny fixture
         run: cd c && python3 tools/make_glm_oracle.py
-      - name: Token-exact oracle (teacher forcing)
-        # The fixture is only trustworthy if the engine reproduces it, so assert
-        # that before reading anything else out of a run.
-        run: cd c && SNAP=./glm_tiny TF=1 COLI_TEMP=0 ./colibri 64 16 16
+      - name: Oracle (30–32/32 teacher forcing + exact greedy)
+        # Preserve CONTRIBUTING.md's two TF near-tie allowance. Greedy remains
+        # exact, and invalid/non-finite results cannot consume the allowance.
+        run: |
+          cd c
+          SNAP=./glm_tiny TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16
+          SNAP=./glm_tiny COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16
+      - name: Oracle allowance and failure regressions
+        run: cd c && python3 tests/test_glm_oracle.py
       - name: Structural efficiency tests
         # test_cpu_vs_cpu_tok_s_stability is NOT in this list: it is a tok/s
         # bound (two runs within 25%) over a ~15 ms tiny replay -- it measured
@@ -1065,9 +1846,33 @@ jobs:
       # rieseguiva un binario non strumentato. Uno di quei test era rosso da
       # settimane senza che nessuno potesse vederlo.
       - name: Build the engines those tests exercise
-        run: make -C c kimi_k3 inkling colibri olmoe qwen38
+        run: make -C c kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41 qwenimage
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
+
+  gguf:
+    name: GGUF reader + converter tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-gguf.txt
+      # This job is what makes the numerical GGUF evidence real: without these
+      # deps those tests skip at import, so the generic `python` job alone only
+      # exercises test_gguf_reader.py (pure stdlib).
+      - name: Install GGUF test dependencies
+        run: pip install -r c/tools/requirements-gguf.txt
+      - name: GGUF reader, dequant, profile and converter tests
+        run: |
+          cd c
+          python3 -m unittest -v \
+            tests.test_gguf_reader \
+            tests.test_gguf_dequant \
+            tests.test_gguf_olmoe_profile \
+            tests.test_convert_gguf_to_olmoe
 
   windows-python-focused:
     name: Python tests (Windows focused)
@@ -1094,7 +1899,7 @@ jobs:
   # This job builds every engine on arm64 (NEON compile coverage), runs the
   # integer-kernel bit-exactness gate with the NEON branches live, and replays
   # the glm_tiny teacher-forcing oracle against a fixture generated on THIS
-  # runner (same-machine torch reference, so no cross-ISA float excuses).
+  # runner. As on x86, allow two TF near ties; greedy remains exact.
   oracle-arm:
     name: ARM (engines + NEON kernel exactness + tiny oracle)
     runs-on: ubuntu-24.04-arm
@@ -1110,6 +1915,12 @@ jobs:
         run: pip install -r c/tools/oracle-requirements.txt
       - name: Build every engine (NEON branches must compile)
         run: make -C c colibri inkling kimi_k3 olmoe
+      - name: "DeepSeek V4 FP4 expert kernels: NEON arm bit-exact against the scalar arm (#1696)"
+        run: |
+          cd c
+          # batch (prefill) and S=1 (the matvec the decode uses)
+          bash tools/bench_fp4_matmul.sh 32 256 128 1
+          bash tools/bench_fp4_matmul.sh 1 256 128 1
       - name: Integer-kernel exactness, NEON branches live (#1081)
         run: |
           cd c
@@ -1117,5 +1928,10 @@ jobs:
           /tmp/tike
       - name: Generate the glm_tiny fixture on this runner
         run: cd c && python3 tools/make_glm_oracle.py
-      - name: Token-exact oracle on ARM (teacher forcing)
-        run: cd c && SNAP=./glm_tiny TF=1 COLI_TEMP=0 ./colibri 64 16 16
+      - name: Oracle on ARM (30–32/32 teacher forcing + exact greedy)
+        run: |
+          cd c
+          SNAP=./glm_tiny TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16
+          SNAP=./glm_tiny COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16
+      - name: Oracle allowance and failure regressions on ARM
+        run: cd c && python3 tests/test_glm_oracle.py
