@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "hypothesis": "The three changes that let the Metal graph run a GGUF leave the model's own format (canonical.qc, experts.qc) as fast as before: the 32 decode steps after a 512-token prompt on an 8 GB M1, with the same logits.",
+  "commit": "082939226ee63b5f04adf52004b2555760cc0ced",
+  "model": "Qwen3.6-35B-A3B (Qwen3_5MoeForConditionalGeneration) in Colibri's qwen36 container: INT4 routed experts with gs=64 group scales and f16 dense weights, canonical.qc beside it (1.94 GB of INT8 dense matrices, written on 2026-10-01) and experts.qc (17.1 GB, last written on 2026-10-07)",
+  "command": "git archive <commit> c | tar -x -C <dir>, make -C <dir>/c qwen36_metal.o backend_metal.o METAL=1, then from the repository root, with the compiler flags make -C c qwen36 METAL=1 gives qwen36.c except its qpack path (-DQWEN36_QPACK and its objects, which the harness does not use): clang -O3 -Xclang -fopenmp -I<libomp>/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_METAL -DQWEN36_METAL -I<dir>/c docs/experiments/qwen36-gguf-metal-2026-10-19/bench.c <dir>/c/qwen36_metal.o <dir>/c/backend_metal.o -o bin-<commit>/qwen36-bench -lm -L<libomp>/lib -lomp -framework Metal -framework Foundation -framework Accelerate -lc++; every run: /usr/bin/time -l env -i PATH=/usr/bin:/bin HOME=$HOME TEACHER=1 launchers/<name>/qwen36-bench code.txt 64,512 32, where each launcher is a script of one line that sets SNAP and its variables and runs a harness; baseline = launchers/own-085b5fc4/, trial = launchers/own/: the same model directory and the same defaults, bin-085b5fc4/ against bin-08293922/",
+  "prompt_hash": "ff641dc87569e6e3b56c3e7996fce21627a4b8cea5489d90864d6102232a2e72",
+  "hardware": {
+    "cpu": "Apple M1, 4 performance + 4 efficiency cores (MacBook Air, MacBookAir10,1, no fan)",
+    "ram": "8 GB unified memory",
+    "storage": "internal APPLE SSD AP0256Q, APFS",
+    "os": "macOS 26.6.2 (25G83), Apple clang 21.0.0 (clang-2100.3.34.2), Homebrew libomp"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "ENGINE_COMMIT"
+  ],
+  "baseline": {
+    "config": {
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "PROMPT": "the first 64 and the first 512 tokens of code.txt (an earlier version of c/qwen36_graph.h, of which the harness reads the first 21,504 bytes; prompt_hash is its SHA-256), each from an empty state; after each, 32 tokens, each fed the text's own next token (teacher forcing: both versions read the same tokens)",
+      "ORDER": "1 warm-up run of the baseline (discarded; both versions read the same file), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "ENGINE": "the Metal graph, default (fast) kernels",
+      "EXPERT_CACHE": "the Metal graph's default: a sixteenth of the RAM, 512 MiB: 303 slots of 1.77 MB",
+      "SNAP": "Qwen3.6-35B-A3B, Colibri qwen36 container, INT4 experts gs=64, internal SSD",
+      "MEASURED": "tokens per second of decode steps 2 to 32 after the 512-token prompt, each step fed the text's next token (teacher forcing)",
+      "ENGINE_COMMIT": "085b5fc4, the base of the three GGUF changes"
+    },
+    "samples": {
+      "tok_s": [
+        8.022,
+        8.037,
+        7.989,
+        8.026
+      ]
+    },
+    "median_tok_s": 8.024000000000001,
+    "quality": {
+      "method": "Correctness: the GGUF changes leave the model's own format as it was: both versions give the same logits, bit for bit (the same fingerprint in every run of both). Fingerprints of every logit and hashes of the tokens (baseline / trial), each the same in every run of its version: 64 tokens 2ca892c20f9dfdfa/24b5cd77c9db23fb / 2ca892c20f9dfdfa/24b5cd77c9db23fb, 512 tokens 31fb860c5d30aac5/561100505ac9d4ca / 31fb860c5d30aac5/561100505ac9d4ca; the 32 tokens' mean negative log-likelihood and top-1 rate (baseline / trial): after 64 tokens 2.85014 0.406 / 2.85014 0.406, after 512 tokens 2.59694 0.562 / 2.59694 0.562.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-gguf-metal-2026-10-19/baseline-own-format-code.txt",
+      "sha256": "4e2fd3c7447634ab9c598f3745aa00ecf609b31f8f2d0b71b61db834f4fe410f"
+    }
+  },
+  "trial": {
+    "config": {
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "PROMPT": "the first 64 and the first 512 tokens of code.txt (an earlier version of c/qwen36_graph.h, of which the harness reads the first 21,504 bytes; prompt_hash is its SHA-256), each from an empty state; after each, 32 tokens, each fed the text's own next token (teacher forcing: both versions read the same tokens)",
+      "ORDER": "1 warm-up run of the baseline (discarded; both versions read the same file), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "ENGINE": "the Metal graph, default (fast) kernels",
+      "EXPERT_CACHE": "the Metal graph's default: a sixteenth of the RAM, 512 MiB: 303 slots of 1.77 MB",
+      "SNAP": "Qwen3.6-35B-A3B, Colibri qwen36 container, INT4 experts gs=64, internal SSD",
+      "MEASURED": "tokens per second of decode steps 2 to 32 after the 512-token prompt, each step fed the text's next token (teacher forcing)",
+      "ENGINE_COMMIT": "08293922, the three GGUF changes on 085b5fc4"
+    },
+    "samples": {
+      "tok_s": [
+        8.037,
+        8.031,
+        8.039,
+        8.021
+      ]
+    },
+    "median_tok_s": 8.034,
+    "quality": {
+      "method": "Correctness: the GGUF changes leave the model's own format as it was: both versions give the same logits, bit for bit (the same fingerprint in every run of both). Fingerprints of every logit and hashes of the tokens (baseline / trial), each the same in every run of its version: 64 tokens 2ca892c20f9dfdfa/24b5cd77c9db23fb / 2ca892c20f9dfdfa/24b5cd77c9db23fb, 512 tokens 31fb860c5d30aac5/561100505ac9d4ca / 31fb860c5d30aac5/561100505ac9d4ca; the 32 tokens' mean negative log-likelihood and top-1 rate (baseline / trial): after 64 tokens 2.85014 0.406 / 2.85014 0.406, after 512 tokens 2.59694 0.562 / 2.59694 0.562.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-gguf-metal-2026-10-19/trial-own-format-code.txt",
+      "sha256": "b94a132bbdafb4e34345bfc16ba61e419b6131e0d8375125b8ea8c4e66021130"
+    }
+  },
+  "outcome": "no-change"
+}
