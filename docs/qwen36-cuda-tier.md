@@ -525,7 +525,7 @@ routing, against 82 % for that question itself -- and every miss is a row the CP
 while the device waits (`qt_cpu_misses`, about 0.1 ms each).
 
 After a decode-sized step the chain asks the tier for promotions (`qt_chain_promote`): up to
-`COLI_CUDA_CHAIN_PROMOTE` (8) of the step's misses routed at least `COLI_CUDA_CHAIN_PROMOTE_MIN`
+`COLI_CUDA_CHAIN_PROMOTE` (4) of the step's misses routed at least `COLI_CUDA_CHAIN_PROMOTE_MIN`
 (2) times in this conversation, the worth the most first. An expert's worth is its heat --
 the history's routes, decayed, plus this conversation's (`qt_chain_count` for the residents,
 `qt_note` for the misses) -- plus this conversation's routes once more, so that a conversation
@@ -547,22 +547,30 @@ before that forward, in parallel). The chain's table takes the changes entry by 
 again only where the tier lost count), and the staged table of a prompt chunk follows when
 a chunk needs it.
 
+The brake: where the last 64 decode steps found `COLI_CUDA_CHAIN_PROMOTE_HITS` percent (75)
+or more of their routes on the card, the step promotes nothing and its misses are dropped. A
+conversation the history fits pays for every swap -- a promoted expert displaces a resident
+the history still routes to -- and gains little; one away from it, at 40-65 % hits, does not
+reach the brake for hundreds of tokens. `0` brakes never.
+
 **Measured** (RTX 3070 alone, Qwen3.6-35B-A3B int4 per row, `COLI_PLACE=auto
 COLI_TRUNK_PROBE=0 CUDA_EXPERT_GB=auto`, OMP 12 threads, the heat file frozen; decode ms a
 token = (N / speed - TTFT) / (N - 1)):
 
-| prompt, heat file | tokens | `COLI_CUDA_CHAIN_PROMOTE=0` | the default (8) |
-|---|---|---|---|
-| a story; the heat file from the MoE question | 200 | 44.5 % hits, 25.1 / 23.2 ms | 65.0 % hits, 21.3 / 21.6 ms (543 promoted) |
-| the same | 600 | 38.2 % hits, 28.8 ms | 67.3 % hits, 21.9 ms (1016 promoted) |
-| the MoE question; its own heat file | 200 | 81.7-82.8 % hits, 14.5-14.9 ms | 80.1 % hits, 16.5 ms (159 promoted) |
+| prompt, heat file | tokens | `COLI_CUDA_CHAIN_PROMOTE=0` | the default (4 a step, the brake at 75 %) | the brake at 80 % |
+|---|---|---|---|---|
+| a story; the heat file from the MoE question | 200 | 44.5 % hits, 24.3 / 24.8 ms | 64.6 % hits, 20.8 ms (548 promoted, no step braked) | 64.3 %, 23.1 / 23.2 / 22.6 ms (543 promoted) |
+| the same | 600 | 38.2 % hits, 26.4 ms | 63.0 % hits, 22.9 ms (1062 promoted, 70 steps braked) | 63.4-67.0 %, 20.8 / 21.6 ms (1008-1075 promoted, 0-21 braked) |
+| the MoE question; its own heat file | 200 | 81.5-82.4 % hits, 14.9 / 15.0 ms | 82.2-82.4 % hits, 15.3 / 14.9 ms (12 / 4 promoted, 196 / 198 of 200 steps braked) | 79.6-81.7 %, 15.5-17.9 ms (79-158 promoted, 56-155 braked); without the brake 16.7 ms (166 promoted) |
 
-Away from the history a token gets 15 % cheaper over 200 tokens and 24 % over 600, where the
-set keeps adapting; on the very prompt the history was trained on the swaps cost about 1.5 ms
-a token (a promoted expert displaces a resident the history still routes to) -- the margin
-keeps that to 159 swaps, and `0` keeps the warm start's set. The greedy text with and without
-is the same. A promotion costs the engine thread about 0.15 ms (the staging memcpy) and the
-victim's int8 rebuild about 0.85 ms of one CPU thread before the next forward.
+Away from the history a token gets 10-15 % cheaper over 200 tokens and 13 % over 600, where
+the set keeps adapting until the brake takes over near the end; on the very prompt the
+history was trained on (80-82 % hits here) the brake holds from the first steps and nothing is
+lost, where at 80 % it was marginal and let 79-158 swaps through. Eight a step instead of four
+moved the same experts in 200 tokens (the margin limits, not the rate) and measured the same
+within noise; `0` keeps the warm start's set. The greedy text with and without is the same. A
+promotion costs the engine thread about 0.15 ms (the staging memcpy) and the victim's int8
+rebuild about 0.85 ms of one CPU thread before the next forward.
 
 ### A prompt's experts past VRAM: the host pool (`COLI_CUDA_HOST_POOL`, on by default)
 

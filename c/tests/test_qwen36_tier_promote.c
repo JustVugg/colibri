@@ -153,8 +153,13 @@ int main(void) {
     uint32_t c4b; pthread_mutex_lock(&G.mx); c4b = qs(0, 4)->conv; pthread_mutex_unlock(&G.mx);
     check(c4 > 0 && c4b < c4, "the counts decayed");
 
-    /* a tier the chain owns (a GGUF's arena) promotes nothing here */
+    /* no rate, or the chain's brake: nothing moves, and the step's misses are dropped (the list is a step's) */
+    for (int t = 0; t < 3; t++) step(0, 0, 1);   /* 0 and 1 miss now (4..7 hold layer 0), three routes each */
     check(qt_chain_promote(0, pr) == 0 && qt_chain_promote(8, NULL) == 0, "no rate, no out: nothing");
+    check(qt_chain_promote(8, pr) == 0, "the braked step's misses were dropped: the next step begins empty");
+    step(0, 0, 1);
+    check(qt_chain_promote(8, pr) == 1 && pr[0].ci == 0, "the step after routes 0 again: 0 (four routes, a score of 8) takes the coldest of 4..7");
+    qt_chain_promote_done(pr[0].ci, pr[0].vi, 1);
 
     qt_shutdown();
     if (fails) { printf("test_qwen36_tier_promote: %d failure(s)\n", fails); return 1; }

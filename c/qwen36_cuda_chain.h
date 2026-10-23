@@ -53,6 +53,7 @@
 #define Q36CC_BOTH 2
 
 #define Q36CC_PROMO_SLOTS 32   /* promotions in flight at most (their staging: an expert each) */
+#define Q36CC_PROMO_WIN 64     /* decode steps the brake looks back on (q36cc_promote) */
 typedef struct {
     int ok, failed;
     int dev;                                   /* the CUDA ordinal every matrix sits on */
@@ -91,6 +92,11 @@ typedef struct {
     int promo_rate, pr_n, pr_busy[Q36CC_PROMO_SLOTS]; size_t pr_stride; CcBuf *pr_buf;
     struct { int ci, vi, slot; unsigned tk; } pr_pend[Q36CC_PROMO_SLOTS]; int pr_npend;
     unsigned long long dm_promoted, dm_landed, dm_rebuilds, dm_patches; double promo_ms, patch_ms;
+    /* the brake (q36cc_promote): the decode steps of the last Q36CC_PROMO_WIN, their routes and
+     * misses; above promo_hits percent hits nothing moves (the baselines: the counters at the
+     * last step that was looked at) */
+    int promo_hits, pr_wi, pr_wn; unsigned pr_wroute[Q36CC_PROMO_WIN], pr_wmiss[Q36CC_PROMO_WIN];
+    unsigned long long pr_pairs0, pr_steps0, pr_braked;
     CcExpert *dm_host; uint8_t *dm_res; int *dm_part; uint8_t *dm_ran;   /* dm_ran: the step's layers that ran so */
     /* a prompt chunk's table (more than Q36CC_STAGE_ROWS rows): the residents, and the tier's host
      * pool staged a layer at a time into dm_stage (planar; dm_fr the copies, dm_fro and dm_frn each
@@ -774,10 +780,19 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
  * entry by entry (qt_chain_changes). The victim computes on the CPU from the next step on. The
  * warm start's set comes from the history, and a conversation's experts drift from it.
  * COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set, =n sets the rate (qwen38's chain reads
- * the same knob). */
-#define Q36CC_PROMOTE 8
+ * the same knob). The brake: where the last Q36CC_PROMO_WIN decode steps found at least
+ * COLI_CUDA_CHAIN_PROMOTE_HITS percent (75) of their routes on the card, the step promotes
+ * nothing -- a conversation the history fits (80-82 % on an RTX 3070) pays for every swap (a
+ * promoted expert displaces a resident the history still routes to) and gains little; at 80 the
+ * brake was marginal for it. 0 brakes never. */
+#define Q36CC_PROMOTE 4
+#define Q36CC_PROMO_HITS 75
 #define QT_CHG_LIST 512   /* residency changes read at once (the tier's ring holds as many) */
 static int q36cc_promote_rate(void) { const char *e = getenv("COLI_CUDA_CHAIN_PROMOTE"); return e && *e ? atoi(e) : Q36CC_PROMOTE; }
+static int q36cc_promote_hits(void) {
+    const char *e = getenv("COLI_CUDA_CHAIN_PROMOTE_HITS"); int h = e && *e ? atoi(e) : Q36CC_PROMO_HITS;
+    return h < 0 ? 0 : h > 100 ? 100 : h;
+}
 /* entry (i, e) of the host's table from the tier: 1 resident on this device */
 static int q36cc_dm_entry(Q36CChain *ch, int E, int i, int e) {
     CcExpert *x = &ch->dm_host[(size_t)i * E + e];
@@ -788,11 +803,17 @@ static int q36cc_dm_entry(Q36CChain *ch, int E, int i, int e) {
     if (!on) memset(x, 0, sizeof *x);
     return on;
 }
-/* the pairs whose copies landed: the tier hands the buffers over; then this step's promotions */
-static void q36cc_promote(Q36CChain *ch, Model *m) {
-    Cfg *c = &m->c; int D = c->hidden, I = c->inter;
+/* the pairs whose copies landed: the tier hands the buffers over; then this step's promotions,
+ * unless the brake holds: the last Q36CC_PROMO_WIN decode steps (this one among them, rows
+ * rows each) found promo_hits percent or more of their routes on the card */
+static void q36cc_promote(Q36CChain *ch, Model *m, int rows) {
+    Cfg *c = &m->c; int D = c->hidden, I = c->inter, K = c->topk;
     if (ch->promo_rate <= 0) return;
     double t0 = tm_now();
+    unsigned route = (unsigned)((ch->dm_steps - ch->pr_steps0) * (unsigned long long)rows * (unsigned long long)K), miss = (unsigned)(ch->dm_pairs - ch->pr_pairs0);
+    ch->pr_steps0 = ch->dm_steps; ch->pr_pairs0 = ch->dm_pairs;
+    ch->pr_wroute[ch->pr_wi] = route; ch->pr_wmiss[ch->pr_wi] = miss;
+    ch->pr_wi = (ch->pr_wi + 1) % Q36CC_PROMO_WIN; if (ch->pr_wn < Q36CC_PROMO_WIN) ch->pr_wn++;
     int w = 0;
     for (int p = 0; p < ch->pr_npend; p++) {
         if (!cc_host_up_done(ch->pr_pend[p].tk)) { ch->pr_pend[w++] = ch->pr_pend[p]; continue; }
@@ -801,7 +822,12 @@ static void q36cc_promote(Q36CChain *ch, Model *m) {
     }
     ch->pr_npend = w;
     int room = Q36CC_PROMO_SLOTS - ch->pr_npend, max = room < ch->promo_rate ? room : ch->promo_rate;
-    if (max <= 0) { ch->promo_ms += tm_now() - t0; return; }
+    if (max > 0 && ch->promo_hits > 0) {
+        unsigned long long wr = 0, wm = 0;
+        for (int j = 0; j < ch->pr_wn; j++) { wr += ch->pr_wroute[j]; wm += ch->pr_wmiss[j]; }
+        if (wr > 0 && (wr - wm) * 100 >= (unsigned long long)ch->promo_hits * wr) { max = 0; ch->pr_braked++; }
+    }
+    if (max <= 0) { qt_chain_promote(0, NULL); ch->promo_ms += tm_now() - t0; return; }   /* the step's misses dropped: the tier's list is a step's */
     if (!ch->pr_buf) {   /* the staging: three matrices and their scales an expert, 256-byte aligned */
         size_t mb = ch->dm_fmt == 2 || ch->dm_fmt == 4 ? (size_t)D * I / 2 : (size_t)D * I, sb = (size_t)(2 * I + D) * sizeof(float);
         if (ch->dm_fmt == 4) sb = (size_t)(2 * I * ((D + ch->dm_gs - 1) / ch->dm_gs) + D * ((I + ch->dm_gs - 1) / ch->dm_gs)) * sizeof(float);
@@ -905,10 +931,11 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
         ch->dm_ran = calloc(L, 1); ch->dm_nres = calloc(L, sizeof(int));
         ch->dm_g = falloc(I); ch->dm_u = falloc(I); ch->dm_hh = falloc(D);
         if (!ch->dm_host || !ch->dm_res || !ch->dm_part || !ch->dm_ran || !ch->dm_nres) return 0;
-        ch->promo_rate = q36cc_promote_rate();
+        ch->promo_rate = q36cc_promote_rate(); ch->promo_hits = q36cc_promote_hits();
         if (ch->promo_rate > 0 && qt_chain_devices() == 1 && ch->dm_fmt < 100 && cc_host_up_ready())
             fprintf(stderr, "[chain] qwen36: up to %d experts a step promoted into the card by this conversation's routes, "
-                            "the coldest residents giving way (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)\n", ch->promo_rate);
+                            "the coldest residents giving way, none while the last %d steps hit %d %% or more "
+                            "(COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)\n", ch->promo_rate, Q36CC_PROMO_WIN, ch->promo_hits);
         else ch->promo_rate = 0;
     }
     if (!cc_reserve(&ch->dm_ids, (size_t)L * r * K * 4, CC_DEV) || !cc_reserve(&ch->dm_w, (size_t)L * r * K * F, CC_DEV) ||
@@ -1218,7 +1245,8 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         ch->wait_ms += tm_now() - t0;
         if (!ok) goto lost;
         if (dm) q36cc_dm_books(ch, m, n, pb);
-        if (dm && n <= Q36CC_DM_ROWS) q36cc_promote(ch, m);
+        if (dm && n <= Q36CC_DM_ROWS) q36cc_promote(ch, m, n);
+        else if (dm) { ch->pr_steps0 = ch->dm_steps; ch->pr_pairs0 = ch->dm_pairs; }   /* a prompt chunk's misses are not the brake's */
         /* a dense model reads its K/V rows back here, and so does a Flint dense layer (no
          * expert step ends its frame; q36c_forward_seg says what went wrong without it) */
         for (int i = 0; i < L; i++) {
@@ -1255,10 +1283,10 @@ static void q36cc_report(Model *m) {
         fprintf(stderr, "[chain] qwen36: %llu layer steps with the routed experts in the frame, %llu of them hybrid "
                         "(%llu slots on the host in %.1f ms, %.1f ms waiting for the device's routes)\n",
                 ch->dm_steps, ch->dm_hyb, ch->dm_pairs, ch->dm_host_ms, ch->dm_spin_ms);
-    if (ch->dm_promoted || ch->dm_rebuilds > 1)
-        fprintf(stderr, "[chain] qwen36: %llu experts promoted into the card by this conversation's routes (%llu landed); "
+    if (ch->dm_promoted || ch->pr_braked || ch->dm_rebuilds > 1)
+        fprintf(stderr, "[chain] qwen36: %llu experts promoted into the card by this conversation's routes (%llu landed), %llu steps braked; "
                         "the table read whole %llu times, %llu entries patched; %.1f ms choosing and staging, %.1f ms patching\n",
-                ch->dm_promoted, ch->dm_landed, ch->dm_rebuilds, ch->dm_patches, ch->promo_ms, ch->patch_ms);
+                ch->dm_promoted, ch->dm_landed, ch->pr_braked, ch->dm_rebuilds, ch->dm_patches, ch->promo_ms, ch->patch_ms);
     if (ch->dm_staged)
         fprintf(stderr, "[chain] qwen36: %llu prompt layer steps staged the host pool's experts (%.2f GB copied over the bus)\n",
                 ch->dm_staged, ch->dm_stage_bytes / 1073741824.0);

@@ -1384,7 +1384,8 @@ void qt_chain_count(int layer,const int *eids,int K){
  * frame waits for the host: a deadlock inside the driver, seen on an RTX 3070). The bytes go
  * as the RAM holds them, which the device's int8 and int4 rows are (the upload's XOR and the
  * device's undo it); int4 per group from planar blocks needs the conversion and is refused.
- * Returns how many pairs out holds. */
+ * Returns how many pairs out holds. max 0 (the chain's brake held, or its rate is 0) drops the
+ * step's misses: the list is a step's, the next step's begins empty. */
 /* an expert's worth: its heat (the history's routes, decayed, plus this conversation's: the
  * residents' from qt_chain_count, the misses' from qt_note) and this conversation's routes
  * once more, so that a conversation away from the history overtakes within tens of tokens */
@@ -1399,7 +1400,9 @@ static int cmp_pm(const void *a,const void *b){          /* score desc, conv des
 }
 static int G_promo_min=-1;   /* COLI_CUDA_CHAIN_PROMOTE_MIN: routes in this conversation a miss needs before it is promoted (a one-off is not worth a swap) */
 int qt_chain_promote(int max,QtPromo *out){
-    if(!G.on || G_chain_own || G_trunk_only || G_stream || max<=0 || !out) return 0;
+    if(!G.on) return 0;
+    if(max<=0 || !out){ pthread_mutex_lock(&G.mx); G.pm_n=0; pthread_mutex_unlock(&G.mx); return 0; }
+    if(G_chain_own || G_trunk_only || G_stream) return 0;
     if(G_promo_min<0){ const char *e=getenv("COLI_CUDA_CHAIN_PROMOTE_MIN"); G_promo_min = e && *e ? atoi(e) : 2; if(G_promo_min<1) G_promo_min=1; }
     if(G.wfmt==QT_GGUF || (G.wfmt==4 && G_src_planar)) { G.pm_n=0; return 0; }   /* the bytes need the stage's conversion */
     pthread_mutex_lock(&G.mx);
