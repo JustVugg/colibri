@@ -206,6 +206,27 @@ int coli_metal_layer_decode(float *x,
 
 int coli_metal_gemm(float *y, const float *x, const void *weights, const float *scales,
                     int fmt, int S, int I, int O, int gs);   /* large-batch sync GEMM; 0 -> CPU. gs: fmt=4 group size (0 otherwise) */
+
+/*
+ * Metal Performance Shaders (MPS) GEMM path.
+ *
+ * coli_metal_gemm and coli_metal_matmul route calls with S >= COLI_METAL_MPS_MIN rows
+ * (default 8) through Apple's MPSMatrixMultiplication: the quantized weight is decoded
+ * once per call to an f32 scratch on the GPU (mm_dequant), then MPS runs a tiled GEMM
+ * that reuses each weight tile across all S rows, instead of mm_gemv re-reading and
+ * re-decoding every weight row S times. Supported weight formats: 0,1,2,3,4,8. Any
+ * MPS failure falls back to the built-in kernel, so results never depend on MPS working.
+ * Runtime: COLI_METAL_MPS=0 opts out; COLI_METAL_MPS_SCRATCH_MB bounds the dequant
+ * scratch (default 256, larger weights run in output-column chunks).
+ * Build: on by default with METAL=1 (links MetalPerformanceShaders); -DCOLI_METAL_NO_MPS
+ * compiles it out.
+ */
+int  coli_metal_mps_available(void);
+/* Test/tuning hook. enabled: 1 on, 0 off, -1 unchanged. min_rows / scratch_bytes: 0 keeps
+ * the current value. Enabling still requires a device MPS supports. */
+void coli_metal_mps_config(int enabled, int min_rows, size_t scratch_bytes);
+/* Successful MPS GEMMs, MPS attempts that fell back to the built-in kernel, GPU seconds. */
+void coli_metal_mps_counts(uint64_t *calls, uint64_t *fallbacks, double *gpu_s);
 /* Parallel top-8 expert selection (r_top8_par): run ONE top-8 selection kernel standalone
  * on host arrays — par=0 the serial r_top8, par=1 the parallel exact-match replica gated
  * in the engine by COLI_RTOP8 (default ON; COLI_RTOP8=0 opts out to the serial kernel).

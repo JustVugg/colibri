@@ -9317,6 +9317,9 @@ static void profile_print(Model *m, double elapsed){
           printf("METAL-ATTN: layer GPU %llu | gpu-wall %.2fs (kernel %.2fs | cpu-sched %.2fs gpu-sched %.2fs)\n",(unsigned long long)aok,aw,ak,ks,gs); } }
         printf("METAL: blocchi GPU %llu | fallback CPU %llu | expert su GPU %llu | setup %.2fs gpu-wall %.2fs (kernel %.2fs) scatter %.2fs\n",
                (unsigned long long)ok,(unsigned long long)fb,(unsigned long long)ex,su,gp,coli_metal_moe_kernel_time(),sc);
+        { uint64_t mc=0,mf=0; double mg=0; coli_metal_mps_counts(&mc,&mf,&mg);
+          if(mc||mf) printf("METAL-MPS: GEMM %llu | fallback %llu | gpu %.2fs\n",
+                            (unsigned long long)mc,(unsigned long long)mf,mg); }
         { double rsf=0; if(coli_metal_resset_stats(&rsf))   /* E5: printed only when the gate is on */
             printf("METAL-RESSET: flush %.2fs (residency-set commit in moe_submit, outside setup/gpu-wall)\n",rsf); } }
 #endif
@@ -12934,6 +12937,8 @@ int main(int argc, char **argv){
         g_metal_enabled = coli_metal_init();
         if(!g_metal_enabled){ fprintf(stderr,"[METAL] backend requested but not available\n"); return 2; }
         fprintf(stderr,"[METAL] mode: batched routed experts on GPU (unified-memory zero-copy)\n");
+        fprintf(stderr,"[METAL] MPS GEMM (prefill / multi-row matmuls): %s\n",
+                coli_metal_mps_available() ? "on (MetalPerformanceShaders; COLI_METAL_MPS=0 disables)" : "off");
         if(getenv("COLI_METAL_SPIN") && atoi(getenv("COLI_METAL_SPIN"))){ coli_metal_spin_start(); fprintf(stderr,"[METAL] keep-alive spinner ON\n"); }
         if(getenv("COLI_METAL_GEMM_MIN")) g_metal_gemm_min=atoi(getenv("COLI_METAL_GEMM_MIN"));
         { const char *e=getenv("COLI_METAL_MOE_EXACT"); g_moe_exact=(e&&e[0]&&e[0]!='0'); }

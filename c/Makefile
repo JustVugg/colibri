@@ -668,15 +668,26 @@ endif
 
 # METAL=1 adds an opt-in Apple-GPU backend (macOS only). The shader is compiled at
 # runtime, so no Xcode / offline metal compiler is required. Default build unchanged.
+# METAL_MPS=1 (default) also routes the multi-row GEMMs through Apple's Metal
+# Performance Shaders (MPSMatrixMultiplication; part of every macOS SDK). Runtime
+# opt-out: COLI_METAL_MPS=0. METAL_MPS=0 compiles MPS out (hand-written kernels only).
 METAL     ?= 0
+METAL_MPS ?= 1
 METAL_OBJ  =
-METALXX    = clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3
+ifeq ($(METAL_MPS),1)
+METAL_FRAMEWORKS = -framework Metal -framework MetalPerformanceShaders -framework Foundation
+METAL_MPS_DEF    =
+else
+METAL_FRAMEWORKS = -framework Metal -framework Foundation
+METAL_MPS_DEF    = -DCOLI_METAL_NO_MPS
+endif
+METALXX    = clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3 $(METAL_MPS_DEF)
 ifeq ($(METAL),1)
 ifeq (,$(DARWIN))
 $(error METAL=1 is supported only on macOS)
 endif
 CFLAGS   += -DCOLI_METAL
-LDFLAGS  += -framework Metal -framework Foundation -lc++
+LDFLAGS  += $(METAL_FRAMEWORKS) -lc++
 METAL_OBJ = backend_metal.o
 endif
 
@@ -849,7 +860,7 @@ glm: colibri$(EXE)
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|METAL_MPS=$(METAL_MPS)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
@@ -1048,11 +1059,11 @@ cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def $(DEEPGEMM_S
 dsv4-cuda-loader-test: tests/test_dsv4_decode_cuda.c backend_loader_dsv4.c backend_cuda_dsv4.h
 	$(CC) $(CFLAGS) tests/test_dsv4_decode_cuda.c backend_loader_dsv4.c -o dsv4_decode_loader_test$(EXE)
 	./dsv4_decode_loader_test$(EXE)
-backend_metal.o: backend_metal.mm backend_metal.h affine_quant.h
+backend_metal.o: backend_metal.mm backend_metal.h affine_quant.h .build-config
 	$(METALXX) -c backend_metal.mm -o $@
 
 metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h affine_quant.h
-	$(METALXX) tests/test_backend_metal.mm backend_metal.mm -framework Metal -framework Foundation -o backend_metal_test
+	$(METALXX) tests/test_backend_metal.mm backend_metal.mm $(METAL_FRAMEWORKS) -o backend_metal_test
 	./backend_metal_test
 
 # GLM-5.3 Metal correctness oracles. These exercise the clamped SwiGLU
@@ -1079,7 +1090,7 @@ glm53-metal-check: backend_metal.o tests/test_glm53_clamped_metal.c tests/test_g
 # Standalone large-batch GEMM correctness sweep — reproduces the long-context prefill
 # corruption in seconds (no model). OMP-parallel CPU reference.
 gemm-test: tests/test_gemm_largebatch.mm backend_metal.mm backend_metal.h affine_quant.h
-	$(METALXX) $(OMPC) tests/test_gemm_largebatch.mm backend_metal.mm $(OMPL) -framework Metal -framework Foundation -o gemm_largebatch_test
+	$(METALXX) $(OMPC) tests/test_gemm_largebatch.mm backend_metal.mm $(OMPL) $(METAL_FRAMEWORKS) -o gemm_largebatch_test
 	./gemm_largebatch_test
 
 # Apple gate: qwen36 routed experts through the MLX affine path, Metal vs
@@ -1092,7 +1103,7 @@ gemm-test: tests/test_gemm_largebatch.mm backend_metal.mm backend_metal.h affine
 qwen36-metal-test: qwen36_qpack_metal_test
 	./qwen36_qpack_metal_test
 qwen36_qpack_metal_test: tests/test_qwen36_qpack_metal.c qwen36.c qwen36_qpack.c qwen36_qpack.h qpack.c qpack.h affine_quant.h qwen36_tier.h st.h json.h compat.h backend_metal.o $(VK_OBJ)
-	$(CC) $(CFLAGS) -DCOLI_METAL -DQWEN36_QPACK tests/test_qwen36_qpack_metal.c qwen36_qpack.c qpack.c backend_metal.o $(VK_OBJ) -o qwen36_qpack_metal_test -framework Metal -framework Foundation -lc++ $(LDFLAGS)
+	$(CC) $(CFLAGS) -DCOLI_METAL -DQWEN36_QPACK tests/test_qwen36_qpack_metal.c qwen36_qpack.c qpack.c backend_metal.o $(VK_OBJ) -o qwen36_qpack_metal_test $(METAL_FRAMEWORKS) -lc++ $(LDFLAGS)
 
 # fmt=6 (E8/IQ3) encoder for tools/convert_fp8_to_int4.py. OPTIONAL: iq3_pack.py
 # falls back to its numpy path when the library is absent, producing the same

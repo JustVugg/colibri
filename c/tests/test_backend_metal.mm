@@ -923,6 +923,90 @@ static int report_err(const float *cpu, const float *gpu, size_t n, const char *
   return ok ? 0 : 1;
 }
 
+// ---- MPS GEMM path (mm_dequant + MPSMatrixMultiplication) ------------------------
+// Runs the SAME weights/activations through coli_metal_matmul twice -- once with the
+// MPS path forced on (min_rows=1, caller-chosen scratch so multi-chunk execution can be
+// forced), once with MPS off (the mm_gemv kernel) -- and checks both against the CPU
+// reference. The MPS GEMM counter must advance on the MPS run: otherwise a silent
+// fallback to mm_gemv would pass this test without MPS ever executing.
+static int run_mps(int fmt, int O, int I, int S, int gs, size_t scratch, const char *name) {
+  int rb4=(I+1)/2, rb2=(I+3)/4;
+  size_t wn = (fmt==I8||fmt==FP8)?(size_t)O*I : (fmt==I4||fmt==I4G)?(size_t)O*rb4
+            : (fmt==I2)?(size_t)O*rb2 : (size_t)O*I*sizeof(float);
+  std::vector<uint8_t> W(wn);
+  srand(7300 + fmt*31 + O*3 + I*7 + S*13 + gs);
+  if (fmt==F32) { float *f=(float*)W.data(); for(size_t i=0;i<(size_t)O*I;i++) f[i]=((rand()%2000)-1000)/1000.f; }
+  else if (fmt==FP8) { for (auto &b : W) do { b=(uint8_t)(rand()&0xFF); } while (b==0x7F||b==0xFF); }
+  else for (auto &b : W) b=(uint8_t)((fmt==I8)?((rand()%255)-127):(rand()&0xFF));
+  size_t ns = (fmt==F32)?0 : (fmt==I4G)?(size_t)O*((I+gs-1)/gs)
+            : (fmt==FP8)?(size_t)(ref_fp8_nblk(O)*ref_fp8_nblk(I)) : (size_t)O;
+  std::vector<float> s(ns ? ns : 1), x((size_t)S*I), ym((size_t)S*O), yk((size_t)S*O);
+  for (auto &v : s) v = (fmt==I4G||fmt==FP8) ? (0.001f+(rand()%1000)/1000.f)*((rand()&1)?1.f:-1.f)
+                                             : (0.01f+(rand()%100)/10000.f);
+  for (auto &v : x) v=((rand()%2000)-1000)/1000.f;
+  std::vector<double> yr((size_t)S*O), mag((size_t)S*O, 0.0);
+  if (fmt==I4G) cpu_ref_grouped(W.data(), s.data(), x.data(), yr.data(), mag.data(), S, I, O, gs);
+  else if (fmt==FP8) cpu_ref_fp8(W.data(), s.data(), x.data(), yr.data(), mag.data(), S, I, O);
+  else { std::vector<float> yf((size_t)S*O), one(O, 1.0f);
+         cpu_ref(fmt, W.data(), fmt==F32 ? one.data() : s.data(), x.data(), yf.data(), S, I, O);
+         for (size_t i=0;i<yf.size();i++) yr[i]=yf[i]; }
+  const float *sp = (fmt==F32) ? nullptr : s.data();
+  uint64_t c0=0, c1=0, f0=0, f1=0;
+  coli_metal_mps_counts(&c0, &f0, nullptr);
+  coli_metal_mps_config(1, 1, scratch);
+  ColiMetalTensor *t1=nullptr, *t2=nullptr;
+  int ok1 = coli_metal_matmul(&t1, ym.data(), x.data(), W.data(), sp, fmt, S, I, O, gs);
+  coli_metal_mps_counts(&c1, &f1, nullptr);
+  coli_metal_mps_config(0, 0, 0);
+  int ok2 = coli_metal_matmul(&t2, yk.data(), x.data(), W.data(), sp, fmt, S, I, O, gs);
+  coli_metal_mps_config(1, 8, (size_t)256 << 20);          // restore defaults
+  auto err = [&](const std::vector<float> &y) {
+    double ymax=0, worst=0;
+    for (size_t i=0;i<y.size();i++) ymax=fmax(ymax, fabs(yr[i]));
+    for (size_t i=0;i<y.size();i++) {
+      double d=fabs((double)y[i]-yr[i]);
+      double den = mag[i] > 1e-30 ? mag[i] : ymax + 1e-9;   // grouped/fp8: magnitude-relative
+      if (d/den > worst) worst = d/den;
+    }
+    return worst;
+  };
+  double em = ok1 ? err(ym) : 1.0, ek = ok2 ? err(yk) : 1.0;
+  int used = (c1 == c0 + 1) && (f1 == f0);
+  int pass = ok1 && ok2 && used && em < 1e-4 && ek < 1e-4;
+  printf("  %-36s mps=%.2e kernel=%.2e%s  %s\n", name, em, ek,
+         used ? "" : " (MPS DID NOT RUN)", pass ? "ok" : "*** MISMATCH");
+  coli_metal_tensor_free(t1); coli_metal_tensor_free(t2);
+  return pass ? 0 : 1;
+}
+
+// coli_metal_gemm (registered zero-copy slab, the engine's prefill path) through MPS,
+// with a scratch small enough to force several output-column chunks.
+static int run_mps_gemm_chunked(const char *name) {
+  srand(9191); int O=1000, I=2048, S=37, gs=128, rb=(I+1)/2, ng=(I+gs-1)/gs;
+  size_t wb=(((size_t)O*rb)+16383)&~(size_t)16383, sbz=(((size_t)O*ng*4)+16383)&~(size_t)16383;
+  uint8_t *W; float *Sc;
+  posix_memalign((void**)&W,16384,wb); posix_memalign((void**)&Sc,16384,sbz);
+  for (size_t i=0;i<(size_t)O*rb;i++) W[i]=(uint8_t)(rand()&0xFF);
+  for (int i=0;i<O*ng;i++) Sc[i]=(0.001f+(rand()%1000)/1000.f)*((rand()&1)?1.f:-1.f);
+  coli_metal_register(W,wb); coli_metal_register(Sc,sbz);
+  std::vector<float> x((size_t)S*I), yg((size_t)S*O);
+  std::vector<double> yr((size_t)S*O), mag((size_t)S*O);
+  for (auto &v : x) v=((rand()%2000)-1000)/1000.f;
+  cpu_ref_grouped(W,Sc,x.data(),yr.data(),mag.data(),S,I,O,gs);
+  uint64_t c0=0,c1=0; coli_metal_mps_counts(&c0,nullptr,nullptr);
+  coli_metal_mps_config(1, 1, (size_t)I*4*192);   // 192-row budget -> 192-row chunks: 5 full + a 40-row ragged tail
+  int ok = coli_metal_gemm(yg.data(),x.data(),W,Sc,I4G,S,I,O,gs);
+  coli_metal_mps_counts(&c1,nullptr,nullptr);
+  coli_metal_mps_config(1, 8, (size_t)256 << 20);
+  double worst=0; for (size_t i=0;i<yg.size();i++){ double d=fabs((double)yg[i]-yr[i]);
+    double rel=mag[i]>1e-30?d/mag[i]:d; if(rel>worst) worst=rel; }
+  int pass = ok && c1==c0+1 && worst<1e-4;
+  printf("  %-36s worst_rel=%.2e%s  %s\n", name, worst, c1==c0+1?"":" (MPS DID NOT RUN)",
+         pass?"ok":"*** MISMATCH");
+  coli_metal_unregister(W); coli_metal_unregister(Sc); free(W); free(Sc);
+  return pass?0:1;
+}
+
 // ---- RMSNorm CPU reference -------------------------------------------------------
 static void cpu_rmsnorm(float *out, const float *x, const float *w, int D, float eps) {
   double ms = 0; for (int i=0; i<D; i++) ms += (double)x[i] * (double)x[i];
@@ -1189,6 +1273,23 @@ int main(void) {
     printf("  gemm S=64 int4-grouped   worst_rel=%.2e  %s\n", worst, pass?"ok":"*** MISMATCH");
     fail |= !pass;
     coli_metal_unregister(W); coli_metal_unregister(Sc); free(W); free(Sc);
+  }
+  if (coli_metal_mps_available()) {
+    const size_t BIG=(size_t)256<<20;
+    printf("Metal MPS GEMM tests (dequant + MPSMatrixMultiplication vs kernel vs CPU):\n");
+    fail |= run_mps(F32, 512,  1024, 16, 0,   BIG, "mps f32  S=16");
+    fail |= run_mps(I8,  2048, 6144, 64, 0,   BIG, "mps int8 S=64");
+    fail |= run_mps(I4,  2048, 6144, 64, 0,   BIG, "mps int4 S=64");
+    fail |= run_mps(I2,  768,  2048, 33, 0,   BIG, "mps int2 S=33 (odd S)");
+    fail |= run_mps(I4G, 2048, 6144, 64, 64,  BIG, "mps int4-grouped g64 S=64");
+    fail |= run_mps(I4G, 1536, 4096, 9,  128, BIG, "mps int4-grouped g128 S=9");
+    fail |= run_mps(FP8, 1024, 2048, 24, 0,   BIG, "mps fp8 S=24");
+    fail |= run_mps(I4,  333,  1000, 17, 0,   BIG, "mps int4 odd dims O=333 I=1000");
+    fail |= run_mps(I8,  4096, 1024, 48, 0,   (size_t)1024*4*256, "mps int8 chunked (16 x 256 cols)");
+    fail |= run_mps(I4,  1000, 512,  20, 0,   (size_t)512*4*100,  "mps int4 chunked ragged (100-col budget)");
+    fail |= run_mps_gemm_chunked("mps gemm registered fmt4 chunked");
+  } else {
+    printf("Metal MPS GEMM tests: SKIPPED (MPS unavailable or COLI_METAL_MPS=0)\n");
   }
   printf("Metal fused attention tests:\n");
   fail |= run_attn(1, 0,   0,   "attn S=1 pos=0");

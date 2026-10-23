@@ -45,6 +45,36 @@ first cold run). An M5 Max with a 46.9 GB learned pin reached **2.06 tok/s**
 ([#103](https://github.com/JustVugg/colibri/issues/103); see also the
 [M5 Max performance report](METAL-M5MAX-PERF-REPORT.md)).
 
+## Metal Performance Shaders (MPS) GEMM
+
+The multi-row matmuls -- prefill's large GEMMs (`coli_metal_gemm`) and the resident-tensor
+matmuls GLM-5.3 and Kimi K3 use (`coli_metal_matmul`) -- run on Apple's
+**MPSMatrixMultiplication** whenever a call has at least `COLI_METAL_MPS_MIN` rows
+(default 8). The built-in `mm_gemv` kernel computes one output element per simdgroup,
+so at S rows it reads and decodes every weight row S times; the MPS path decodes the
+quantized weight **once** into an f32 scratch on the GPU (`mm_dequant`, all formats
+0/1/2/3/4/8) and lets MPS's tiled GEMM reuse each weight tile across all S rows. The
+decode and the GEMM share one command buffer. Single-row decode calls are untouched.
+
+| variable | default | effect |
+|---|---|---|
+| `COLI_METAL_MPS` | on | `0` keeps every matmul on the built-in kernels (pre-MPS behavior) |
+| `COLI_METAL_MPS_MIN` | `8` | minimum rows S for the MPS path |
+| `COLI_METAL_MPS_SCRATCH_MB` | `256` | f32 decode scratch; bigger weights run in output-column chunks |
+
+It is built with `METAL=1` (MetalPerformanceShaders ships with macOS; nothing to
+install). `make ... METAL=1 METAL_MPS=0` compiles it out. Any MPS failure -- device not
+supported, allocation, command-buffer error -- falls back to the built-in kernel for
+that call, so MPS never turns a GPU call into a CPU fallback. At exit the engine prints
+`METAL-MPS: GEMM N | fallback M | gpu Xs`; `fallback` should be 0.
+
+Numerics: f32 throughout (f32 weights after decode, f32 activations, f32 accumulate), so
+the error budget is the same as `mm_gemv`'s; only the summation order differs, which is
+the same near-tie class described above (#622). `COLI_METAL_GEMM_MIN=100000` still keeps
+every prefill GEMM on the CPU for bit-exact runs. `make metal-test` checks every format
+through MPS **and** the built-in kernel against the CPU reference, including multi-chunk
+runs, and fails if the MPS counter does not advance (a silent fallback cannot pass).
+
 Key design points: Metal's ~5 ms submit latency makes per-matmul dispatch a
 loss — everything is batched into few command buffers per layer, and the
 resident experts' GPU work is submitted *before* the missed experts' disk reads
