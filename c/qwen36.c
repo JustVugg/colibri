@@ -2795,6 +2795,8 @@ static const gguf_tensor *gg_tensor(const char *hf) {
     char nm[256]; const char *g = gg_name(hf, nm, sizeof nm);
     /* tied embeddings (the small dense models): no output.weight, the head reads token_embd */
     if (g && !strcmp(g, "output.weight") && !gguf_find(&g_gg, g)) g = "token_embd.weight";
+    /* Ollama's converter names the DeltaNet's dt bias blk.N.ssm_dt (the same values) */
+    if (g && !gguf_find(&g_gg, g)) { size_t L = strlen(g); if (L > 12 && !strcmp(g + L - 12, ".ssm_dt.bias")) { nm[L - 5] = 0; g = nm; } }
     return g ? gguf_mark(&g_gg, g) : NULL;
 }
 static int64_t gg_numel(const gguf_tensor *t) { return t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3]; }
@@ -3350,6 +3352,11 @@ static void gguf_load_cfg(Cfg *c) {
     c->hidden   = (int)gguf_get_int(g, GK("embedding_length"), 0);
     c->q_heads  = (int)gguf_get_int(g, GK("attention.head_count"), 0);
     c->kv_heads = (int)gguf_get_int(g, GK("attention.head_count_kv"), 0);
+    {   /* Ollama's converter writes it per layer (0 on the DeltaNet layers): the attention layers' value */
+        const gguf_kv *kvh = gguf_get(g, GK("attention.head_count_kv"));
+        if (kvh && kvh->type == GGUF_T_ARRAY && kvh->arr && (kvh->atype == GGUF_T_U32 || kvh->atype == GGUF_T_I32))
+            for (uint64_t j = 0; j < kvh->n; j++) { int v = (int)((const int32_t *)kvh->arr)[j]; if (v > c->kv_heads) c->kv_heads = v; }
+    }
     c->head_dim = (int)gguf_get_int(g, GK("attention.key_length"), c->q_heads > 0 ? c->hidden / c->q_heads : 0);
     c->k_head_dim = c->head_dim;
     c->v_head_dim = (int)gguf_get_int(g, GK("attention.value_length"), c->head_dim);
@@ -3614,6 +3621,8 @@ static int gguf_report_unused(const Cfg *c) {
         if (L > 12 && !strcmp(t->name + L - 12, ".input_scale")) continue;
         int layer = -1;
         if (sscanf(t->name, "blk.%d.", &layer) == 1 && layer >= c->n_layers) continue;   /* MTP / nextn */
+        /* Ollama's files carry the MTP head (mtp.*) and the vision tower and projector (v.*, mm.*) in the model's file */
+        if (!strncmp(t->name, "mtp.", 4) || !strncmp(t->name, "v.", 2) || !strncmp(t->name, "mm.", 3)) continue;
         n++;
         char pat[96]; const char *d = t->name; int o = 0;   /* blk.N. -> blk.*. for a short summary */
         while (*d && o < 90) { if (d[0] == '.' && d[1] >= '0' && d[1] <= '9') { pat[o++] = '.'; pat[o++] = '*'; d++; while (*d >= '0' && *d <= '9') d++; } else pat[o++] = *d++; }
