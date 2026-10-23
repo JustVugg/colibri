@@ -4224,7 +4224,7 @@ static void tier_rebuild_evicted(Model *m) {
     int ls[512], es[512];
     int n = qt_evicted_take(ls, es, 512);
     if (n <= 0) return;
-    #pragma omp parallel for schedule(dynamic, 4)
+    #pragma omp parallel for schedule(dynamic, 1)   /* a promotion's few victims a token: every thread one */
     for (int i = 0; i < n; i++) {
         Slot *e; expert_get(m, ls[i], es[i], &e);
         slot_ensure_int8(m, e);
