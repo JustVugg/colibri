@@ -1294,6 +1294,18 @@ def stream_turn(p, sentinel, on_bytes):
             line=p.stdout.readline().decode("utf-8","replace").strip()   # STAT tok tps hit rss
             m=re.match(r"STAT (\S+) (\S+) (\S+) (\S+)", line)
             st={"tok":int(m.group(1)),"tps":float(m.group(2)),"hit":float(m.group(3)),"rss":float(m.group(4))} if m else {}
+            fields=line.split()
+            # STAT tok tps hit rss prompt_tokens 0 CONTEXT_EXCEEDED [cause]:
+            # the token sits at fields[7] (the PR's "7th token" counts past
+            # the STAT keyword).
+            if len(fields)>=8 and fields[7]=="CONTEXT_EXCEEDED":
+                # #2097: the legacy protocol has no ERROR frame; the engine
+                # refuses an over-context turn with an empty answer plus this
+                # token (and the cause as the next field: PROMPT_TOO_LONG,
+                # HISTORY_FULL, or RENDER_CLIPPED). The chat loop turns it
+                # into the message the user actually sees; older engines send
+                # no cause, hence True as the fallback.
+                st["context_exceeded"]=fields[8] if len(fields)>=9 else True
             if interrupted: st["interrupted"]=True
             return st
         if len(pend)>len(sentinel):
@@ -3066,6 +3078,23 @@ def cmd_chat(a):
             if not raw: md.close()
             sp2.stop()
             if st is None: engine_diag(p, errlog); break
+            if st.get("context_exceeded"):
+                # #2097: the turn was refused, not answered. An empty answer
+                # here used to read as the model going silent, with the reason
+                # only in the engine's stderr, which this client drains to a
+                # temporary log and never shows. Say why, and what fixes it.
+                cause=st["context_exceeded"]
+                if cause=="HISTORY_FULL":
+                    why="the conversation history no longer fits the context"
+                    hint="type :reset to clear it and continue"
+                elif cause=="RENDER_CLIPPED":
+                    why="the prompt text exceeded the 64KB render buffer and was clipped"
+                    hint="paste it in shorter chunks"
+                else:  # PROMPT_TOO_LONG, or an older engine with no cause token
+                    why="this turn does not fit the context"
+                    hint="shorten the prompt or raise CTX (:reset only clears history)"
+                print(f"  {C.yel}[context is full: {why}; {hint}]{C.r}\n")
+                continue
             el=time.time()-t0
             if st.get("tok") and chat_stats_mode(a) == "off":
                 if st.get("interrupted"): print(f"  {C.yel}⏹ interrupted; type :more to continue the response{C.r}")

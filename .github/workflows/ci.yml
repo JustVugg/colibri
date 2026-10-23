@@ -1728,7 +1728,12 @@ jobs:
           SNAP=./glm_tiny TF=1 COLI_TEMP=0 ORACLE_STRICT=1 ORACLE_TF_MAX_MISMATCHES=2 ./colibri 64 16 16
           SNAP=./glm_tiny COLI_TEMP=0 ORACLE_STRICT=1 ./colibri 64 16 16
       - name: Oracle allowance and failure regressions
-        run: cd c && python3 tests/test_glm_oracle.py
+        run: |
+          cd c
+          python3 tests/test_glm_oracle.py
+          # Reuse the generated fixture: discovery without this variable skips
+          # every serving context-refusal regression.
+          COLI_ORACLE_FIXTURE="$PWD/glm_tiny" python3 -m unittest -v tests.test_run_serve_context_exceeded
       - name: The MTP head under the draft gate (docs/speculative.md)
         # Greedy stays exact whatever the gate picks (a draft is only ever verified),
         # with the gate deciding from measured times and with every draft carried.

@@ -11431,7 +11431,28 @@ static void run_serve(Model *m, const char *snap){
         const char *tk = getenv("THINK")&&atoi(getenv("THINK"))? "<think>" : "<think></think>";
         if(raw_mode){
             int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM raw tokens\n");exit(1);}
-            prompt_tokens=tok_encode(&T,input,input_n,tmp,maxctx-8-g_draft);
+            /* #2097: encode with one token of headroom (maxctx-1, buffer is
+             * maxctx) purely to DETECT overflow -- tok_encode stops dead at its
+             * cap with no signal, so the old cap (maxctx-8-g_draft) silently
+             * truncated an over-long prompt and the engine answered from the
+             * cut text. A full buffer means the prompt does not fit: refuse
+             * like mux_submit instead of generating from a truncated prompt. */
+            prompt_tokens=tok_encode(&T,input,input_n,tmp,maxctx-1);
+            if(prompt_tokens>maxctx-2){
+                /* The legacy protocol has no ERROR frame: this is an empty
+                 * answer plus a STAT line carrying CONTEXT_EXCEEDED as a 7th
+                 * token and the cause (PROMPT_TOO_LONG here) as an 8th
+                 * ('coli' matches the first fields and ignores the rest),
+                 * plus a stderr line the operator can act on. */
+                free(tmp); free(raw); g_temp=base_temp; g_nuc=base_nuc;
+                fprintf(stderr,"[API] prompt does not fit: >=%d tokens, context is %d "
+                               "(CTX=%d). Raise CTX or shorten the prompt.\n",
+                        prompt_tokens,maxctx-2,maxctx);
+                printf("\x01\x01" "END" "\x01\x01\n");
+                printf("STAT 0 0.00 0.0 %.2f %d 0 CONTEXT_EXCEEDED PROMPT_TOO_LONG\n",
+                       rss_gb(),prompt_tokens);
+                fflush(stdout); continue;
+            }
             int old_len=len, prefix=0;
             while(prefix<old_len && prefix<prompt_tokens && hist[prefix]==tmp[prefix]) prefix++;
             if(prefix<old_len){
@@ -11445,16 +11466,54 @@ static void run_serve(Model *m, const char *snap){
                 active,len,prompt_tokens,k);
             free(tmp);
         } else {
-            if(templ){ if(first) bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop>");
-                       bl+=snprintf(buf+bl,(1<<16)-bl,"<|user|>%s<|assistant|>%s",input,tk); }
-            else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
-            k=tok_encode(&T,buf,bl,hist+len,maxctx-len); prompt_tokens=k;
-            if(len+k+8+g_draft>=maxctx){ len=0; first=1; kv_disk_reset(m);
-                bl=0; if(templ){ bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop><|user|>%s<|assistant|>%s",input,tk); }
-                else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
-                k=tok_encode(&T,buf,bl,hist,maxctx); if(k>maxctx-8-g_draft) k=maxctx-8-g_draft;
-                prompt_tokens=k;
+            /* Render the turn into the 64KB buf first, watching for a clipped
+             * render (snprintf returns what it *would* have written), then
+             * encode with one token of headroom to DETECT overflow. The old
+             * code reset the conversation (len=0) and clamped k to
+             * maxctx-8-g_draft, silently dropping history and the tail of the
+             * prompt; refuse loudly in every case instead. */
+            int clipped=0, w;
+            if(templ){
+                if(first){ w=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop>");
+                           if(w<0||w>=(1<<16)-bl) clipped=1; else bl+=w; }
+                w=snprintf(buf+bl,(1<<16)-bl,"<|user|>%s<|assistant|>%s",input,tk);
+                if(w<0||w>=(1<<16)-bl) clipped=1; else bl+=w;
+            } else {
+                w=snprintf(buf+bl,(1<<16)-bl,"%s",input);
+                if(w<0||w>=(1<<16)-bl) clipped=1; else bl+=w;
             }
+            int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM turn tokens\n");exit(1);}
+            k=tok_encode(&T,buf,bl,tmp,maxctx-1); prompt_tokens=k;
+            if(clipped || k>maxctx-2 || len+k+8+g_draft>=maxctx){
+                /* Same refusal contract as the API arm above, with the cause
+                 * as the 8th STAT token so 'coli chat' can print the right
+                 * hint: HISTORY_FULL wants :reset, PROMPT_TOO_LONG wants a
+                 * shorter prompt or a bigger CTX, RENDER_CLIPPED wants the
+                 * prompt pasted in smaller chunks. */
+                free(tmp); g_temp=base_temp; g_nuc=base_nuc;
+                const char *cause;
+                if(clipped){
+                    cause="RENDER_CLIPPED";
+                    fprintf(stderr,"[chat] prompt text exceeded the 64KB render buffer and was "
+                                   "clipped; refusing rather than answering from clipped text. "
+                                   "Paste shorter chunks.\n");
+                } else if(k>maxctx-2){
+                    cause="PROMPT_TOO_LONG";
+                    fprintf(stderr,"[chat] turn does not fit: >=%d tokens, context is %d "
+                                   "(CTX=%d). Raise CTX or shorten the prompt.\n",
+                            k,maxctx-2,maxctx);
+                } else {
+                    cause="HISTORY_FULL";
+                    fprintf(stderr,"[chat] conversation history no longer fits the context "
+                                   "(CTX=%d); clear it (\\x02RESET) to continue.\n",maxctx);
+                }
+                printf("\n\x01\x01" "END" "\x01\x01\n");
+                printf("STAT 0 0.00 0.0 %.2f %d 0 CONTEXT_EXCEEDED %s\n",
+                       rss_gb(),prompt_tokens,cause);
+                fflush(stdout); continue;
+            }
+            if(k>0) memcpy(hist+len,tmp,k*sizeof(int));
+            free(tmp);
         }
         if(prompt_tokens<1){ free(raw); g_temp=base_temp; g_nuc=base_nuc;
             printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f 0 0\n", rss_gb()); fflush(stdout); continue; }
