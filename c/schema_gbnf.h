@@ -88,6 +88,13 @@ static void sgb_put_json_string_lit(SgbCtx *C, const char *raw){
 /* emit a number the way a model would print it: shortest round-trip via %g */
 static void sgb_put_number_lit(SgbCtx *C, double d){
     char b[64]; snprintf(b, sizeof b, "\"%.17g\"", d);
+    /* %.17g writes 0.1 as 0.10000000000000001: a fraction takes the fewest
+     * digits that read back as the same double, the text a model writes. */
+    if (d < 9007199254740992.0 && d > -9007199254740992.0 && d != (double)(long long)d)
+        for (int prec = 15; prec < 17; prec++){
+            char t[64]; snprintf(t, sizeof t, "\"%.*g\"", prec, d);
+            if (strtod(t + 1, NULL) == d){ memcpy(b, t, sizeof b); break; }
+        }
     /* Check the formatting range before converting: finite schema numbers
      * outside it need not be representable as long long. */
     if (d < 1e15 && d > -1e15 && d == (double)(long long)d)

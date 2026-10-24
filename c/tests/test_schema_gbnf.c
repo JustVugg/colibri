@@ -45,7 +45,10 @@ static void number_literals(void){
         {"-999999999999999", "-999999999999999"},
         {"1e-100", "1e-100"}, {"-1e-100", "-1e-100"},
         {"0", "0"}, {"-0", "0"}, {"42.0", "42"}, {"-42", "-42"},
-        {"0.5", "0.5"}, {"-0.5", "-0.5"}
+        {"0.5", "0.5"}, {"-0.5", "-0.5"},
+        /* A fraction is the shortest text that reads back as the same double. */
+        {"0.1", "0.1"}, {"-0.3", "-0.3"}, {"2.675", "2.675"}, {"1.1e-7", "1.1e-07"},
+        {"0.30000000000000004", "0.30000000000000004"}
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++){
         /* Both numeric callers share the formatter. Keep a mixed enum so the
