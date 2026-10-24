@@ -3729,6 +3729,22 @@ class HTTPTest(unittest.TestCase):
                     self.assertEqual(actual, expected)
                     self.assertEqual(len(self.engine.calls), before)
 
+    def test_non_json_numeric_constants_are_rejected(self):
+        """Python's json.loads accepts NaN, Infinity and -Infinity, none of which
+        is JSON (RFC 8259 section 6): they reached the engine as a 200."""
+        for path, fields in self._json_limit_routes():
+            for metadata in (b"NaN", b"Infinity", b"-Infinity",
+                             b'{"x":[1,NaN]}'):
+                with self.subTest(path=path, metadata=metadata):
+                    before = len(self.engine.calls)
+                    with self.assertRaises(HTTPError) as caught:
+                        self._request_with_raw_metadata(path, fields, metadata)
+                    with caught.exception as response:
+                        self.assertEqual(response.code, 400)
+                        self.assertEqual(json.load(response)["error"]["type"],
+                                         "invalid_request_error")
+                    self.assertEqual(len(self.engine.calls), before)
+
     def test_unpaired_surrogate_is_a_client_error(self):
         """JSON can spell a lone UTF-16 surrogate ("\\ud83d": a client that cut a
         string between the two halves of an emoji). json.loads accepts it, no
