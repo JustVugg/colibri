@@ -2246,7 +2246,7 @@ def _muse_fn_line(fn, where):
     desc = fn.get("description") or ""
     params = fn.get("parameters") or {}
     if fn.get("defer_loading"):
-        desc = desc + " [deferred: use tool_search to load full schema]"
+        desc = _jinja_string(desc) + " [deferred: use tool_search to load full schema]"
         return ('\n{"name": ' + _muse_esc(_muse_json(name)) + ', "description": ' +
                 _muse_esc(_muse_json(desc)) + ', "defer_loading": true}')
     if isinstance(params, dict) and not params:
