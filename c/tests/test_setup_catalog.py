@@ -149,6 +149,16 @@ class Versions(unittest.TestCase):
         self.assertLess(v("1.12.9"), v("v1.13.0"))
         self.assertEqual(v("1.12"), (1, 12, 0))
 
+    def test_prerelease_suffix_does_not_inflate_the_patch(self):
+        # setup refuses a prebuilt older than entry.prebuilt_since by this
+        # comparison. "0-rc1" must stay patch 0; reading it as 1 makes
+        # v2.0.0-rc1 look newer than 2.0.0 and the guard never fires.
+        v = setup_catalog.version_tuple
+        self.assertEqual(v("v2.0.0-rc1"), (2, 0, 0))
+        self.assertFalse(v("v2.0.0-rc1") > v("2.0.0"))
+        self.assertLess(v("1.2.3-rc1"), v("1.2.4"))
+        self.assertLess(v("1.10.0-rc2"), v("1.10.1"))
+
 
 if __name__ == "__main__":
     unittest.main()

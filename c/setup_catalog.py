@@ -180,8 +180,13 @@ def by_id(model_id):
 def version_tuple(text):
     parts = []
     for piece in str(text or "").lstrip("v").split("."):
-        digits = "".join(ch for ch in piece if ch.isdigit())
-        parts.append(int(digits) if digits else 0)
+        # Leading digits only. "0-rc1" is patch 0, not 1.
+        digits = []
+        for ch in piece:
+            if not ch.isdigit():
+                break
+            digits.append(ch)
+        parts.append(int("".join(digits)) if digits else 0)
     return tuple((parts + [0, 0, 0])[:3])
 
 
