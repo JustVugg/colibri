@@ -4124,10 +4124,147 @@ class StaticServingTest(unittest.TestCase):
     def test_static_root_stays_inside_dist_directory(self):
         with urlopen(self.base + "/", timeout=2) as response:
             self.assertEqual(response.read(), b"dashboard")
+            self.assertIsNone(response.headers.get("Set-Cookie"))
         with self.assertRaises(HTTPError) as caught:
             urlopen(self.base + "/%2e%2e/dist-private/secret.txt", timeout=2)
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 404)
+
+
+class DashboardSessionTest(unittest.TestCase):
+    """A loopback dashboard gets a process-local cookie. The API key stays on the server."""
+
+    API_KEY = "dashboard-key-should-stay-private"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        dist = Path(self.tmp.name) / "dist"
+        dist.mkdir()
+        (dist / "index.html").write_text("<html>dashboard</html>", encoding="utf-8")
+        (dist / "app.js").write_text("console.log('ui')", encoding="utf-8")
+        self.web_dist = patch.object(APIHandler, "WEB_DIST", dist)
+        self.web_dist.start()
+        self.server = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model",
+                                api_key=self.API_KEY)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        self.origin = self.base
+
+    def tearDown(self):
+        self.server.scheduler.close()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.web_dist.stop()
+        self.tmp.cleanup()
+
+    def _open(self, path, headers=None, body=None):
+        data = None if body is None else json.dumps(body).encode()
+        request = Request(self.base + path, data=data, headers=headers or {})
+        return urlopen(request, timeout=2)
+
+    def _cookie(self, headers):
+        request = Request(self.base + "/", headers=headers)
+        with urlopen(request, timeout=2) as response:
+            body = response.read()
+            set_cookie = response.headers.get("Set-Cookie")
+        return set_cookie, body
+
+    def test_local_dashboard_load_sets_an_httponly_session_cookie(self):
+        set_cookie, body = self._cookie({"Sec-Fetch-Site": "none"})
+        self.assertIsNotNone(set_cookie)
+        self.assertIn("colibri_dashboard=", set_cookie)
+        self.assertIn("HttpOnly", set_cookie)
+        self.assertIn("SameSite=Strict", set_cookie)
+        self.assertNotIn(self.API_KEY, set_cookie)
+        self.assertNotIn(self.API_KEY.encode(), body)
+        self.assertNotIn(self.server.dashboard_session.encode(), body)
+
+    def test_local_dashboard_cookie_authorizes_its_own_api(self):
+        set_cookie, _ = self._cookie({"Sec-Fetch-Site": "none"})
+        token = set_cookie.split(";", 1)[0]
+        headers = {
+            "Cookie": token,
+            "Origin": self.origin,
+            "Sec-Fetch-Site": "same-origin",
+        }
+        with self._open("/health", headers) as response:
+            health = json.load(response)
+        self.assertIn("scheduler", health)
+        with self._open("/v1/models", headers) as response:
+            self.assertEqual(json.load(response)["data"][0]["id"], "test-model")
+        status_headers = dict(headers)
+        status_headers["Content-Type"] = "application/json"
+        with self._open("/v1/chat/completions", status_headers, {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 4,
+        }) as response:
+            self.assertEqual(json.load(response)["object"], "chat.completion")
+
+    def test_cross_site_request_does_not_receive_or_use_the_session(self):
+        set_cookie, _ = self._cookie({
+            "Origin": "http://evil.example",
+            "Sec-Fetch-Site": "cross-site",
+        })
+        self.assertIsNone(set_cookie)
+        stolen = f"colibri_dashboard={self.server.dashboard_session}"
+        with self._open("/health", {
+            "Cookie": stolen,
+            "Origin": "http://evil.example",
+            "Sec-Fetch-Site": "cross-site",
+        }) as response:
+            self.assertEqual(json.load(response), {"status": "ok"})
+        with self.assertRaises(HTTPError) as caught:
+            self._open("/v1/models", {
+                "Cookie": stolen,
+                "Origin": "http://evil.example",
+                "Sec-Fetch-Site": "cross-site",
+            })
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 401)
+
+    def test_missing_session_is_rejected_and_the_api_key_still_works(self):
+        with self.assertRaises(HTTPError) as caught:
+            self._open("/v1/models")
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 401)
+        with self._open("/v1/models", {"Authorization": f"Bearer {self.API_KEY}"}) as response:
+            self.assertEqual(response.status, 200)
+
+    def test_a_new_process_does_not_honour_the_previous_session(self):
+        set_cookie, _ = self._cookie({"Sec-Fetch-Site": "none"})
+        token = set_cookie.split(";", 1)[0]
+        other = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model", api_key=self.API_KEY)
+        thread = threading.Thread(target=other.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(other.scheduler.close)
+        self.addCleanup(other.shutdown)
+        self.addCleanup(other.server_close)
+        self.addCleanup(lambda: thread.join(timeout=2))
+        other_base = f"http://127.0.0.1:{other.server_port}"
+        request = Request(other_base + "/v1/models", headers={
+            "Cookie": token,
+            "Origin": other_base,
+            "Sec-Fetch-Site": "same-origin",
+        })
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(request, timeout=2)
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 401)
+
+    def test_public_bind_does_not_issue_a_dashboard_session(self):
+        public = APIServer(("0.0.0.0", 0), FakeEngine(), "test-model", api_key=self.API_KEY)
+        thread = threading.Thread(target=public.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(public.scheduler.close)
+        self.addCleanup(public.shutdown)
+        self.addCleanup(public.server_close)
+        self.addCleanup(lambda: thread.join(timeout=2))
+        base = f"http://127.0.0.1:{public.server_port}/"
+        with urlopen(Request(base, headers={"Sec-Fetch-Site": "none"}), timeout=2) as response:
+            self.assertIsNone(response.headers.get("Set-Cookie"))
 
 
 class SchedulerHTTPTest(unittest.TestCase):
