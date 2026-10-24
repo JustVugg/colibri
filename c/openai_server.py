@@ -3924,7 +3924,8 @@ def _dsv41_merge_turns(messages):
                           "reasoning_content": reasoning,
                           "tool_calls": _history_tool_calls(message.get("tool_calls"), index)})
         elif role in ("user", "tool"):
-            block = ({"kind": "tool_result", "id": message.get("tool_call_id") or "",
+            result_id = message.get("tool_call_id")
+            block = ({"kind": "tool_result", "id": result_id if isinstance(result_id, str) else "",
                       "text": v41_dsml.render_tool_result(text)} if role == "tool"
                      else {"kind": "text", "id": "", "text": text})
             if turns and turns[-1]["role"] == "user":
@@ -3941,7 +3942,7 @@ def _dsv41_merge_turns(messages):
             order = {}
             for at, call in enumerate(turn["tool_calls"]):
                 identifier = call.get("id") if isinstance(call, dict) else None
-                if identifier:
+                if isinstance(identifier, str) and identifier:   # an object or array id is unhashable
                     order[identifier] = at
         elif turn["role"] == "user" and order:
             results = [p for p in turn["parts"] if p["kind"] == "tool_result"]
