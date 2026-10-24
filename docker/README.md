@@ -378,7 +378,7 @@ Then retry the `hf_download` command.
 **Solution**:
 
 1. Wait and retry the `hf_download` command
-2. If it continues, download manually from [here](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp)
+2. If the problem persists, download the model manually from here [here](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp)
 3. Unzip the ZIP file into the desired folder
 
 ---
