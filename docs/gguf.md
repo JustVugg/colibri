@@ -89,6 +89,17 @@ Both are lossless: the same blocks, the same tokens.
 - **The other engines' dense matrices stay on the CPU** on CUDA, and their CUDA tiers take no ggml block types yet.
 - **A GGUF those engines' CUDA path does not take runs on Vulkan on an NVIDIA card** (qwen38 for a file whose expert types the CUDA chain's frame lacks, colibri for GLM-5.2, whose CUDA path keeps a GGUF's matrices and experts on the CPU, deepseek_v4, whose CUDA tier mirrors native FP4 experts only, and qwen36 for a file whose expert types the CUDA chain's frame lacks). A CUDA run of such a GGUF computed every routed expert on the CPU (Qwen3.8 IQ2_S/Q2_0 on an RTX PRO 4000: 28 tok/s of prompt, 9 of decode). A build with both backends switches such a run to Vulkan on the same card when CUDA was asked for and `COLI_VULKAN` was not set (114-118 and 46-49 tok/s); `COLI_VULKAN=0` keeps CUDA. `coli setup` builds these engines' CUDA engine with Vulkan too where the Vulkan toolchain is there (on Linux; the Windows CUDA package has both).
 
+## Ollama's files
+
+The blobs Ollama pulls for Qwen3.5 / Qwen3.6 (`qwen3.6:35b`: 23.9 GB, Q4_K_M, under `/usr/share/ollama/.ollama/models/blobs/sha256-...` on Linux) come from Ollama's own converter, not llama.cpp's, and differ in three places `coli import` and the qwen36 engine know: `attention.head_count_kv` is an array per layer (0 on the DeltaNet layers), whose maximum is the config's; the DeltaNet's dt bias is `blk.N.ssm_dt` (llama.cpp's `ssm_dt.bias`, the same values); and the MTP head (`mtp.*`) and the vision tower (`v.*`, `mm.*`) sit in the model's file, which the engine leaves unread. `ssm.v_head_reordered` and `rope.mrope_interleaved` carry no change of layout. A symlink with a `.gguf` suffix on the blob serves as the import's file:
+
+```bash
+ln -s /usr/share/ollama/.ollama/models/blobs/sha256-<digest> ~/models/qwen3.6-35b-ollama.gguf
+./coli import --out ~/models/qwen3.6-35b-ollama ~/models/qwen3.6-35b-ollama.gguf
+```
+
+Qwen3.6-35B-A3B from that blob on an RTX 3070 (8 GB) with the CUDA chain, 2619 experts on the card: 73-78 tok/s of decode where Ollama 0.40.3 decodes the same file at 38 on the same card.
+
 ## Checking a GGUF before downloading it
 
 `tools/gguf_header.py` fetches only the header of a model on the Hugging Face Hub (a few MB). With `GGUF_CHECK=1` the importer writes the model directory from that header alone, so you see the config it would get. The qwen36, deepseek_v4 and deepseek_v41 engines then check the folder against every tensor they would load, without reading one:
