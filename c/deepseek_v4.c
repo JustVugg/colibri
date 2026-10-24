@@ -2492,12 +2492,14 @@ static int attention_token_impl(float *output,
     int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
     if (!result) {
+        int grouped_on_gpu = 0;
 #ifdef COLI_V4_GPU_TIER
-        if (wo_a.gpu) {
-            result = coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups);
-        } else
+        /* A refusal (CUDA lost after a sticky fault, F18) falls through to
+         * the CPU groups below, like coli_fp8_matvec_ref's own fallback. */
+        grouped_on_gpu = wo_a.gpu &&
+            coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups) == 0;
 #endif
-        for (int group = 0; group < groups; group++) {
+        for (int group = 0; !grouped_on_gpu && group < groups; group++) {
             ColiTensorView group_view = wo_a;
             group_view.rows = o_rank;
             group_view.columns = group_width;
@@ -2938,12 +2940,14 @@ static int attention_token_impl(float *output,
     int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
     if (!result) {
+        int grouped_on_gpu = 0;
 #ifdef COLI_V4_GPU_TIER
-        if (wo_a.gpu) {
-            result = coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups);
-        } else
+        /* A refusal (CUDA lost after a sticky fault, F18) falls through to
+         * the CPU groups below, like coli_fp8_matvec_ref's own fallback. */
+        grouped_on_gpu = wo_a.gpu &&
+            coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups) == 0;
 #endif
-        for (int group = 0; group < groups; group++) {
+        for (int group = 0; !grouped_on_gpu && group < groups; group++) {
             ColiTensorView group_view = wo_a;
             group_view.rows = o_rank;
             group_view.columns = group_width;
@@ -8425,12 +8429,14 @@ static int attention_token_impl(float *output,
     int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
     if (!result) {
+        int grouped_on_gpu = 0;
 #ifdef COLI_V4_GPU_TIER
-        if (wo_a.gpu) {
-            result = coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups);
-        } else
+        /* A refusal (CUDA lost after a sticky fault, F18) falls through to
+         * the CPU groups below, like coli_fp8_matvec_ref's own fallback. */
+        grouped_on_gpu = wo_a.gpu &&
+            coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups) == 0;
 #endif
-        for (int group = 0; group < groups; group++) {
+        for (int group = 0; !grouped_on_gpu && group < groups; group++) {
             ColiTensorView group_view = wo_a;
             group_view.rows = o_rank;
             group_view.columns = group_width;

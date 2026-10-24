@@ -17,7 +17,10 @@ fault needs a debug build and two GPUs, so this pins the shape at source level
 - dsv4_cuda_lost is exported (dsv4.def, the DLL loader) and the engine's mirror
   lookups (peek, attach) and the decode MoE's host fallback read it;
 - the peer-latch message only says decode continues on the primary when the
-  error is not sticky.
+  error is not sticky;
+- the attention output's grouped wo_a matvec falls back to the CPU groups when
+  the backend refuses (final12 S7b: after the latch, every request failed in
+  attention, at that call, until it did).
 """
 import re
 import unittest
@@ -74,6 +77,14 @@ class Dsv4CudaLostSourceTest(unittest.TestCase):
         latch = latch[:latch.index("return alive?-1:0;}")]
         self.assertRegex(latch, r"if\(sticky\(err\)\)\s*fprintf\(stderr,\"\[DSV4 CUDA\] peer device %d failed in the decode MoE \(%s: %s\); latched off\. The fault is sticky")
         self.assertIn("if(sticky(err))cuda_lost(", latch)
+
+    def test_grouped_wo_a_falls_back_to_the_cpu(self):
+        gpu = "grouped_on_gpu = wo_a.gpu &&\n            coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups) == 0;"
+        loop = "for (int group = 0; !grouped_on_gpu && group < groups; group++) {"
+        self.assertEqual(self.engine.count("coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups)"), 3)
+        self.assertEqual(self.engine.count(gpu), 3)
+        self.assertEqual(self.engine.count(loop), 3)
+        self.assertNotIn("result = coli_v4_gpu_matvec_grouped(&wo_a", self.engine)
 
 
 if __name__ == "__main__":
