@@ -49,6 +49,35 @@ class WavAudioTest(unittest.TestCase):
         self.assertEqual(error['code'], 'invalid_value')
         self.assertEqual(engine.calls, [])
 
+    def extensible_fmt(self, bits=16, subtype=1, extension_size=22):
+        # WAVEFORMATEXTENSIBLE: cbSize, valid bits, channel mask, SubFormat GUID.
+        guid = struct.pack('<IHH8s', subtype, 0, 0x0010, bytes.fromhex('800000aa00389b71'))
+        return (self.fmt(bits=bits, encoding=0xfffe) +
+                struct.pack('<HHI', extension_size, bits, 0) + guid)
+
+    def test_extensible_requires_the_full_extension(self):
+        for fmt in (self.fmt(encoding=0xfffe), self.extensible_fmt()[:-1],
+                    self.extensible_fmt(extension_size=40),
+                    self.extensible_fmt(extension_size=20)):
+            with self.subTest(fmt=fmt.hex()):
+                self.assert_invalid_http(self.wav(fmt=fmt))
+
+    def test_extensible_rejects_unknown_subformat(self):
+        self.assert_invalid_http(self.wav(fmt=self.extensible_fmt(subtype=6)))
+
+    def test_extensible_pcm32_is_not_misread_as_float32(self):
+        # 0x40000000 is PCM amplitude +0.5 but IEEE float value +2.0.
+        self.assert_invalid_http(self.wav(fmt=self.extensible_fmt(bits=32),
+                                          data=struct.pack('<iiii', *([0x40000000] * 4))))
+
+    def test_extensible_pcm16_and_ieee_float32_decode(self):
+        for bits, subtype, data, expected in (
+                (16, 1, struct.pack('<hh', 16384, -8192), [0.5, -0.25]),
+                (32, 3, struct.pack('<ff', 0.5, -0.25), [0.5, -0.25])):
+            decoded = openai_server.decode_wav_mono16k(
+                self.wav(fmt=self.extensible_fmt(bits, subtype), data=data), 'audio')
+            self.np.testing.assert_array_equal(decoded, expected)
+
     def test_short_fmt_is_client_error(self):
         self.assert_invalid_http(self.wav(fmt=b'\x01\0'))
 
