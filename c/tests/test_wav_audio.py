@@ -9,6 +9,18 @@ import openai_server
 from test_openai_server import ScriptedEngine, _spawn_test_server, _post_chat, _error_body
 
 
+class WavHeaderTest(unittest.TestCase):
+    def test_data_chunk_after_declared_riff_boundary_is_rejected(self):
+        fmt = struct.pack('<HHIIHH', 1, 1, 16000, 32000, 2, 16)
+        inside = b'fmt ' + struct.pack('<I', len(fmt)) + fmt
+        outside = b'data' + struct.pack('<I', 16) + b'\0' * 16
+        wav = b'RIFF' + struct.pack('<I', len(inside) + 4) + b'WAVE' + inside + outside
+        with patch.object(openai_server, '_np', return_value=None), \
+                self.assertRaises(openai_server.APIError) as caught:
+            openai_server.decode_wav_mono16k(wav, "audio")
+        self.assertIn("missing fmt/data", str(caught.exception))
+
+
 class WavAudioTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

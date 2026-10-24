@@ -1325,13 +1325,15 @@ def decode_wav_mono16k(data, param):
     down), sample rate must already be 16 kHz — resampling belongs at the
     capture edge, not in the gateway."""
     import struct as _struct
-    np = _np()
     if len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
         raise APIError(400, "Audio must be a RIFF/WAVE file.", param, "invalid_value")
+    end = 8 + _struct.unpack_from("<I", data, 4)[0]
+    if end < 12 or end > len(data):
+        raise APIError(400, "WAV file has an invalid RIFF boundary.", param, "invalid_value")
     pos, fmt, raw = 12, None, None
-    while pos + 8 <= len(data):
+    while pos + 8 <= end:
         cid, size = data[pos:pos + 4], _struct.unpack_from("<I", data, pos + 4)[0]
-        if pos + 8 + size > len(data):
+        if pos + 8 + size + (size & 1) > end:
             raise APIError(400, "WAV file has a truncated chunk.", param, "invalid_value")
         body = data[pos + 8:pos + 8 + size]
         if cid == b"fmt ":
@@ -1341,8 +1343,11 @@ def decode_wav_mono16k(data, param):
         elif cid == b"data":
             raw = body
         pos += 8 + size + (size & 1)
+    if pos != end:
+        raise APIError(400, "WAV file has a truncated chunk header.", param, "invalid_value")
     if fmt is None or raw is None:
         raise APIError(400, "WAV file is missing fmt/data chunks.", param, "invalid_value")
+    np = _np()
     audio_format, channels, rate, _, _, bits = fmt
     if channels == 0:
         raise APIError(400, "WAV channel count must be positive.", param, "invalid_value")
