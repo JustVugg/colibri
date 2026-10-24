@@ -4698,6 +4698,19 @@ class TrailingAssistantTurnTest(unittest.TestCase):
                 with self.assertRaises(APIError):
                     resolve_generation_prompt(messages, {})
 
+    def test_glm53_rejects_non_string_assistant_content(self):
+        """A completed assistant turn bypasses continuation validation. Numeric and
+        object content reached `"</think>" in content` and became HTTP 500."""
+        for content in (1.5, {"text": "not a content-part list"}):
+            messages = [{"role": "user", "content": "a"},
+                        {"role": "assistant", "content": content},
+                        {"role": "user", "content": "b"}]
+            with self.subTest(content=content):
+                with self.assertRaises(APIError) as caught:
+                    render_chat_glm53(messages)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.param, "messages.1.content")
+
     def test_rejects_tools_and_tool_calls(self):
         with self.on(), patch("openai_server.ARCH", "glm53"):
             with self.assertRaises(APIError):

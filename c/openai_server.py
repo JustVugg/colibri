@@ -3803,7 +3803,11 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
                                    f"messages.{index}.content.{position}.text")
                 texts.append(text)
             content = "".join(texts)
-        content = content or ""
+        if content is None:
+            content = ""
+        elif not isinstance(content, str):
+            raise APIError(400, "Message content must be a string or an array of text parts.",
+                           f"messages.{index}.content")
         if role == "user":
             prompt.append(f"<|user|>{content}")
         elif role == "system":
