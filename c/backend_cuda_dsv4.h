@@ -209,6 +209,11 @@ int dsv4_cuda_peer_compute(int device,int peer);
  * off for the rest of the process (after the call that latched it, no kernel
  * reads its memory from another device again), else 1. */
 int dsv4_cuda_peer_healthy(int device);
+/* 1 once a sticky CUDA error (a kernel fault) has latched CUDA off for the
+ * whole process: with peer access a fault on one GPU takes the others' contexts
+ * with it, and no context recovers in-process. From then on every entry point
+ * refuses without touching CUDA; the engine takes its host paths. */
+int dsv4_cuda_lost(void);
 Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count,int hidden,int intermediate,int device,
                                                  Dsv4CudaTensor *shared_gate,Dsv4CudaTensor *shared_up,
                                                  Dsv4CudaTensor *shared_down);

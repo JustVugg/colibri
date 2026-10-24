@@ -6042,6 +6042,7 @@ static int moe_token_pipeline(float *output,
                 downs[i] = views[i].down.gpu;
             }
             int peer_up = coli_v4_gpu_peer_pool_up();
+            extern int dsv4_cuda_lost(void);
             if (moe_ok) {
                 extern int dsv4_cuda_moe(
                     void *const *gate, void *const *up, void *const *down,
@@ -6052,15 +6053,16 @@ static int moe_token_pipeline(float *output,
                     selected, sg, su, sd, config->swiglu_limit,
                     expert_output, input)) moe_ok = 0;
             }
-            if (!moe_ok && peer_up && !coli_v4_gpu_peer_pool_up()) {
+            if (!moe_ok && ((peer_up && !coli_v4_gpu_peer_pool_up()) || dsv4_cuda_lost())) {
                 /* The peer GPU failed under this call and its memory is no
                  * longer read (when it still could be, dsv4_cuda_moe already
-                 * recomputed those experts on the primary and succeeded):
-                 * compute the routed experts from host data on the CPU, as
-                 * the path without GPU compute does. Its mirrors are misses
-                 * from the next lookup on. The views drop their mirror
-                 * handles: coli_v4_expert_forward_ref would otherwise hand
-                 * the peer's back to the backend's matvec. */
+                 * recomputed those experts on the primary and succeeded), or
+                 * a sticky fault took CUDA itself (dsv4_cuda_lost): compute
+                 * the routed experts from host data on the CPU, as the path
+                 * without GPU compute does. Their mirrors are misses from
+                 * the next lookup on. The views drop their mirror handles:
+                 * coli_v4_expert_forward_ref would otherwise hand them back
+                 * to the backend's matvec. */
                 result = v4_views_fetch_host(store, views, leased, selected,
                                              weights->plan.layer, fetch,
                                              jobs, loaders, loader_active, dec);
@@ -12529,7 +12531,7 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
 static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
                                             ColiExpertView *view, int sync,
                                             int grow_only) {
-    if (!cache || !view) return -1;
+    if (!cache || !view || dsv4_cuda_lost()) return -1;   /* no mirror after a sticky CUDA fault */
     if (view->gate.block_rows != 1 || view->up.block_rows != 1 ||
         view->down.block_rows != 1)
         return -1;
@@ -12877,7 +12879,9 @@ int coli_v4_gpu_expert_drain(ColiExpertStore *store) {
  * peer pool only on a primary miss. */
 int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view) {
     V4GpuExpertMirrorCache *peer = v4_peer_pool();   /* the only read here */
-    if (!store || !view || !store->gpu) return -1;
+    /* after a sticky CUDA fault no mirror is readable: every expert is a miss
+     * and the token takes host copies (dsv4_cuda_lost) */
+    if (!store || !view || !store->gpu || dsv4_cuda_lost()) return -1;
     if (v4_mirror_peek_cache((V4GpuExpertMirrorCache *)store->gpu, view) == 0)
         return 0;
     return v4_mirror_peek_cache(peer, view);

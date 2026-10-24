@@ -436,7 +436,17 @@ latches it off for the rest of the run, with one
 `[DSV4 CUDA] peer device N failed in the decode MoE (...)` line. The token in
 flight is recomputed on the primary GPU, or on the CPU from host copies when
 the peer no longer answers, and the pool's mirrors count as misses from then
-on. The latch covers peer compute (`mode=compute`); a peer that stops
+on. That holds for an error the devices survive (an allocation or launch
+failure). A kernel fault (launch failure, illegal address, trap) is sticky,
+and with peer access between the GPUs it takes the primary's context with it
+too: measured on two RTX 3090s with NVLink, a `__trap()` on the peer left
+device 0's next calls failing, whether device 0's stream or the host waited
+for the peer. So a sticky error anywhere in the backend latches CUDA off for
+the whole process, with one `[DSV4 CUDA] ...: CUDA is lost for this process`
+line: every backend call is refused from then on without touching CUDA, the
+token in flight and every later one take host copies (the CPU paths, as
+without `CUDA=1`), and the server keeps answering, more slowly, until it is
+restarted. The latch covers peer compute (`mode=compute`); a peer that stops
 answering without reporting an error is not detected. The pool's VRAM on that
 GPU is released only when the engine closes.
 
@@ -664,7 +674,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_GPU_RESIDENT_FIRST` (0) | `1` = decode computes VRAM-mirrored experts without an expert-store lookup, and the RAM pins skip them (VRAM adds to the RAM tier); off under `DSV4_HYBRID=1` |
 | `DSV4_CUDA_PEER_DEVICE` (unset) | second GPU for a decode mirror pool (peer access required; unused under `DSV4_HYBRID=1`) |
 | `DSV4_CUDA_PEER_COMPUTE` (1, `.cu`) | run the peer pool's experts on the peer GPU (both GPUs at the same SM version; `mode=` in the `peer-mirrors` line); `0` = read them in place over P2P; no effect with `DSV4_CUDA_BATCHED=0`, which reads them in place |
-| `DSV4_CUDA_PEER_FAULT` (unset, `.cu`) | tests: `n` = the n-th peer-compute pass fails at its join and the peer is latched off (that call recomputes on the primary); `n:lost` = the peer also counts as lost (the call fails, decode takes host copies) |
+| `DSV4_CUDA_PEER_FAULT` (unset, `.cu`) | tests: `n` = the n-th peer-compute pass fails at its join with an error the devices survive, and the peer is latched off (that call recomputes on the primary); `n:lost` = the peer also counts as lost (the call fails, decode takes host copies); `n:sticky` = the error is a kernel fault's, which latches CUDA off for the whole process (every later call refused, host paths), as a real fault does |
 | `DSV4_CUDA_PEER_MIRRORS` (4096) / `DSV4_CUDA_PEER_RESERVE_MB` (1024) | upper bound on peer pool mirrors (12.75 MiB each; free VRAM sizes the pool), minimum 8 (a smaller or non-numeric value leaves the pool off) / VRAM kept free on the peer |
 | `DSV4_CUDA_PIN_CAP_GB` (20, `.cu`) | cap on page-locked expert-slab bytes for uploads, in GiB; negative = 0 (nothing pinned), empty or unparsable = 20, at most 1 PiB (no cap) |
 | `V4_SERVE_STATS_LOG` (0) | `1` = per-turn `v4_serve_turn` (the turn's DONE/PROF numbers, VRAM-first totals) and `v4_dec_moe` (decode MoE totals) lines on stderr |

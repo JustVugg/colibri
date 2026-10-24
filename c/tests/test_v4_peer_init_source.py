@@ -65,9 +65,9 @@ class V4PeerInitSourceTest(unittest.TestCase):
     def test_init_failures_release_and_clear(self):
         init = function_body(self.backend, 'extern "C" int dsv4_cuda_init(const int *dev,int n){',
                              "\n    return 1;}")
-        # the only plain refusal is the argument check, before any device work
+        # the only plain refusal is the argument check (and CUDA lost to a sticky fault), before any device work
         self.assertEqual(init.count("return 0;"), 1)
-        self.assertTrue(init.startswith('extern "C" int dsv4_cuda_init(const int *dev,int n){if(n<1||n>16)return 0;'))
+        self.assertTrue(init.startswith('extern "C" int dsv4_cuda_init(const int *dev,int n){if(n<1||n>16||g_cuda_lost)return 0;'))
         self.assertGreaterEqual(init.count("return init_fail("), 5)
         # the slot's device is known before its first resource is created
         self.assertLess(init.index("g[i].id=dev[i];"), init.index("cudaStreamCreateWithFlags"))
