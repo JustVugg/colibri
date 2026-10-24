@@ -1272,7 +1272,9 @@ static int mps_gemm(id<MTLBuffer> wb, size_t woff, id<MTLBuffer> sb, size_t soff
           resultRows:(NSUInteger)S resultColumns:(NSUInteger)n interiorColumns:(NSUInteger)I
           alpha:1.0 beta:0.0];
       if (!mw || !mm) { g_mps_fb++; return 0; }   // nothing committed yet: cb is dropped
-      mm.resultMatrixOrigin = MTLOriginMake((NSUInteger)o0, 0, 0);   // x = column offset
+      // MPS matrix origins are (x = ROW, y = COLUMN): this chunk writes columns [o0, o0+n)
+      // of every row. (x = o0 trips MPS's "requested rows exceeds result matrix" assert.)
+      mm.resultMatrixOrigin = MTLOriginMake(0, (NSUInteger)o0, 0);
       [mm encodeToCommandBuffer:cb leftMatrix:mx rightMatrix:mw resultMatrix:my];
     }
     [cb commit]; [cb waitUntilCompleted];
