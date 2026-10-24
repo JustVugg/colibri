@@ -125,6 +125,7 @@ stats*.txt
 /sweep.py
 c/backend_metal.o
 c/backend_metal_test
+c/mps_bench
 c/tests/test_tier
 c/mio_env/
 c/bench/

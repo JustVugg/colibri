@@ -1093,6 +1093,12 @@ gemm-test: tests/test_gemm_largebatch.mm backend_metal.mm backend_metal.h affine
 	$(METALXX) $(OMPC) tests/test_gemm_largebatch.mm backend_metal.mm $(OMPL) $(METAL_FRAMEWORKS) -o gemm_largebatch_test
 	./gemm_largebatch_test
 
+# MPS vs built-in-kernel speed for the prefill GEMM on real GLM-5.x shapes (no model).
+.PHONY: mps-bench
+mps-bench: tests/bench_mps_gemm.mm backend_metal.mm backend_metal.h affine_quant.h
+	$(METALXX) tests/bench_mps_gemm.mm backend_metal.mm $(METAL_FRAMEWORKS) -o mps_bench
+	./mps_bench
+
 # Apple gate: qwen36 routed experts through the MLX affine path, Metal vs
 # the CPU reference -- one-layer MoE parity plus end-to-end logit parity on
 # the tiny hybrid stack. Needs QWEN36_QPACK_FIXTURE=<dir> pointing at a real
