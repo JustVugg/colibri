@@ -7618,8 +7618,13 @@ class APIHandler(BaseHTTPRequestHandler):
         # Only a full read leaves nothing to drain; a short read means the peer went away
         # mid-body, and the drain will notice the EOF and close (#597 item 3).
         self._body_read = len(raw) == length
+
+        def reject_non_json_constant(_value):
+            # Python accepts NaN and Infinity by default, but neither is JSON.
+            raise APIError(400, "Request body must be valid JSON.")
+
         try:
-            body = json.loads(raw)
+            body = json.loads(raw, parse_constant=reject_non_json_constant)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise APIError(400, "Request body must be valid JSON.")
         except (ValueError, RecursionError):
