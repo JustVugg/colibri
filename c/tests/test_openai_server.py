@@ -4810,6 +4810,15 @@ class TrailingAssistantTurnTest(unittest.TestCase):
             self.assertTrue(cont.endswith("La capitale e'"), cont[-40:])
             self.assertFalse(cont.endswith("<|end_message|>"))
 
+    def test_inkling_rejects_an_object_role(self):
+        """A role that is an object is unhashable. role_token.get(role) raised
+        TypeError, which do_POST answered with HTTP 500."""
+        messages = [{"role": {"x": 1}, "content": "go"}]
+        with self.assertRaises(APIError) as caught:
+            render_chat_inkling(messages)
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.param, "messages.0.role")
+
     def test_only_the_final_assistant_turn_is_opened(self):
         """Across every continuation family: only the TRAILING assistant turn is opened, and
         each earlier turn renders exactly as it does in a completed conversation. The

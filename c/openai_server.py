@@ -3211,9 +3211,9 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
-        rtok = role_token.get(role)
-        if rtok is None:
+        if not isinstance(role, str) or role not in role_token:
             raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        rtok = role_token[role]
         # the template emits the effort hint inline, right before the first
         # non-system message — not at the end. Position matters: it changes the
         # exact token sequence the model was trained on.
