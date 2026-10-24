@@ -82,6 +82,16 @@ int main(void){
     LoraAdapter *lu=lora_load(adir,0xdeadbeefULL,1);
     CHECK(lu!=NULL); lora_free(lu);
 
+    /* 5) a target's layer index sizes and indexes the lookup table: a negative
+     * index, or one no model has, is refused instead of written out of bounds */
+    const int bad_layers[2]={-1,1<<20};
+    for(int k=0;k<2;k++){
+        t.layer=bad_layers[k];
+        CHECK(lora_save(adir,&save)==0);
+        CHECK(lora_load(adir,0xabcdef12345678ULL,0)==NULL);
+    }
+    t.layer=2;
+
     /* cleanup */
     char cmd[1200]; snprintf(cmd,sizeof(cmd),"rm -rf %s",adir); system(cmd);
 

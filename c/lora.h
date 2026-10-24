@@ -24,6 +24,7 @@
 
 #define LORA_FORMAT   "colibri-lora-v1"
 #define LORA_MAX_RANK 256
+#define LORA_MAX_LAYERS 65536
 
 /* v1 target allowlist: resident dense attention projections only (AGENTS.md §4).
  * Routed experts / router / embeddings / lm_head are deliberately absent. */
@@ -87,6 +88,8 @@ static void lora_apply(const LoraTensor *t, const float *x, float *y, int S){
 static int lora_parse_target(const char *name, int *layer, int *tgt){
     int n=-1, off=-1;
     if(sscanf(name,"model.layers.%d.%n",&n,&off)!=1 || off<0) return -1;
+    /* the index sizes and addresses lut[]: below zero it writes before it */
+    if(n<0 || n>=LORA_MAX_LAYERS) return -1;
     for(int k=0;k<LORA_NTGT;k++)
         if(!strcmp(name+off,lora_tgt_suffix[k])){ *layer=n; *tgt=k; return 0; }
     return -1;
