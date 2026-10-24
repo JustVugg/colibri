@@ -2407,9 +2407,16 @@ def render_chat_muse(messages, enable_thinking=True, reasoning_effort=None, tool
                 call_id = message.get("tool_call_id")
                 name = call_id or ""
                 for other in messages:
-                    for call in (other.get("tool_calls") or []) if isinstance(other, dict) else []:
-                        if call_id is not None and isinstance(call, dict) and call.get("id") == call_id:
-                            name = (call.get("function") or {}).get("name", name)
+                    calls = other.get("tool_calls") if isinstance(other, dict) else None
+                    if not isinstance(calls, list):
+                        continue
+                    for call in calls:
+                        if not isinstance(call, dict) or call.get("id") != call_id:
+                            continue
+                        function = call.get("function")
+                        found = function.get("name") if isinstance(function, dict) else None
+                        if isinstance(found, str) and found:
+                            name = found
             if not name:
                 raise APIError(400, "A tool message needs a `name` or a `tool_call_id` that names a call.",
                                f"messages.{index}")

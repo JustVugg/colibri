@@ -201,6 +201,30 @@ class MuseGatewayTest(unittest.TestCase):
         self.assertNotIn("atem:function_calls", got)
         self.assertIn('# Valid recipients: "self", "commentary", "user".', got)
 
+    def test_a_tool_result_survives_malformed_call_history(self):
+        """The name lookup walks every earlier tool_calls list. A non-list, or a
+        function that is not an object, raised before the call validator's 400."""
+        history = [
+            {"role": "user", "content": "hi", "tool_calls": 1},
+            {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+        ]
+        rendered = openai_server.render_chat_muse(history, tools=[WEATHER], current_date=DATE)
+        self.assertIn("sunny", rendered)
+        named = [
+            {"role": "user", "content": "hi",
+             "tool_calls": [{"id": "c1", "function": "get_weather"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+        ]
+        rendered = openai_server.render_chat_muse(named, tools=[WEATHER], current_date=DATE)
+        self.assertIn("sunny", rendered)
+        ordered = [
+            {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": "get_weather"}]},
+        ]
+        with self.assertRaises(openai_server.APIError):
+            openai_server.render_chat_muse(ordered, tools=[WEATHER], current_date=DATE)
+
 
 if __name__ == "__main__":
     unittest.main()
