@@ -50,7 +50,7 @@ typedef struct { uint8_t bits[32]; } GrCls;              /* insieme di byte amme
 enum { GR_CLS = 0, GR_REF = 1 };
 typedef struct { uint8_t t; int16_t ref; GrCls c; } GrSym;
 typedef struct { GrSym *s; int n, cap; } GrAlt;          /* una sequenza di simboli */
-typedef struct { GrAlt *a; int n, cap; char name[64]; } GrRule;
+typedef struct { GrAlt *a; int n, cap; char *name; } GrRule;
 typedef struct { GrRule r[GR_MAX_RULES]; int n; int root; char err[160]; } Grammar;
 
 /* frame = posizione dentro un alternate: (regola, alternate, simbolo) */
@@ -77,19 +77,22 @@ static int gr__push(Grammar *G, int ri, int ai, const GrSym *sy){
         A->s=ns; A->cap=nc; }
     A->s[A->n++]=*sy; return 0;
 }
+/* Names are kept whole: generated grammars (llama.cpp's schema converter) use
+ * long names that share their first 63 bytes and are still different rules. */
 static int gr__rule(Grammar *G, const char *name, int len){
-    if(len>63) len=63;
     for(int i=0;i<G->n;i++)
         if((int)strlen(G->r[i].name)==len && !memcmp(G->r[i].name,name,(size_t)len)) return i;
     if(G->n>=GR_MAX_RULES) return -1;
     GrRule *R=&G->r[G->n]; memset(R,0,sizeof *R);
-    memcpy(R->name,name,(size_t)len);
+    R->name=(char*)malloc((size_t)len+1); if(!R->name) return -1;
+    memcpy(R->name,name,(size_t)len); R->name[len]=0;
     return G->n++;
 }
 static int gr__anon(Grammar *G){                          /* regola sintetica ($n non collide: '$' non e' un identificatore */
     if(G->n>=GR_MAX_RULES) return -1;
     GrRule *R=&G->r[G->n]; memset(R,0,sizeof *R);
-    snprintf(R->name,sizeof R->name,"$%d",G->n);
+    R->name=(char*)malloc(16); if(!R->name) return -1;
+    snprintf(R->name,16,"$%d",G->n);
     return G->n++;
 }
 
@@ -285,6 +288,7 @@ static void gr_free(Grammar *G){
     for(int i=0;i<G->n;i++){
         for(int a=0;a<G->r[i].n;a++) free(G->r[i].a[a].s);
         free(G->r[i].a);
+        free(G->r[i].name);
     }
     G->n=0;
 }

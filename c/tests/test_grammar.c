@@ -51,6 +51,20 @@ int main(void){
     CHECK(gr_forced(&S,buf,sizeof buf)==6 && !memcmp(buf,"o_fit\"",6));
     gr_free(&G);
 
+    /* rule names longer than 63 bytes that share a prefix stay distinct rules:
+     * llama.cpp's schema converter writes names like these for nested objects */
+    {
+        static char src[1024];
+        const char *pre = "root-properties-shipping-address-properties-street-line-number-kind";
+        snprintf(src, sizeof src,
+                 "root ::= %s-a %s-b\n%s-a ::= \"x\"\n%s-b ::= \"y\"\n", pre, pre, pre, pre);
+        CHECK(gr_parse(&G, src) == 0);
+        gr_state_init(&S, &G);
+        CHECK(feed(&S, "xy") == 2);
+        CHECK(gr_admissible(&S, m, &end) == 0 && end == 1);
+        gr_free(&G);
+    }
+
     /* classi con range, star: niente forcing dove la grammatica dirama */
     CHECK(gr_parse(&G,"root ::= \"a\" [0-9]* \"b\"")==0);
     gr_state_init(&S,&G);
