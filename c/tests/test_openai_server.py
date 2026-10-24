@@ -4698,6 +4698,18 @@ class TrailingAssistantTurnTest(unittest.TestCase):
                 with self.assertRaises(APIError):
                     resolve_generation_prompt(messages, {})
 
+    def test_rejects_a_non_string_text_part(self):
+        """A text part whose `text` is not a string is a client error: joining it
+        raised TypeError, which do_POST answered with HTTP 500."""
+        for text in (5, None, ["x"]):
+            messages = [{"role": "user", "content": "a"},
+                        {"role": "assistant", "content": [{"type": "text", "text": text}]}]
+            with self.on(), patch("openai_server.ARCH", "qwen36"):
+                with self.assertRaises(APIError) as caught:
+                    resolve_generation_prompt(messages, {})
+            self.assertEqual(caught.exception.status, 400)
+            self.assertEqual(caught.exception.param, "messages.1.content.0.text")
+
     def test_rejects_tools_and_tool_calls(self):
         with self.on(), patch("openai_server.ARCH", "glm53"):
             with self.assertRaises(APIError):

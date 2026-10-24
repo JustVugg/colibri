@@ -4115,8 +4115,14 @@ def resolve_generation_prompt(messages, body):
                        "continue from.", "messages")
     raw = last.get("content")
     if isinstance(raw, list):                       # multimodal parts: only the text counts
-        text = "".join(part.get("text", "") for part in raw
-                       if isinstance(part, dict) and part.get("type") == "text")
+        texts = []
+        for index, part in enumerate(raw):
+            if isinstance(part, dict) and part.get("type") == "text":
+                if not isinstance(part.get("text"), str):
+                    raise APIError(400, "Text content parts require a string `text` field.",
+                                   f"{where}.content.{index}.text")
+                texts.append(part["text"])
+        text = "".join(texts)
     elif raw is None:
         text = ""
     elif isinstance(raw, str):
