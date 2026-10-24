@@ -4987,20 +4987,28 @@ static int block_token_impl(float *output_hc,
         return set_error(error, error_size, "out of memory in block");
     }
     memcpy(residual, input_hc, hd * sizeof(*residual));
+    /* the stage that failed, for the error (the request's only report) */
+    const char *stage = "attention hyper-connection";
+    if (error && error_size) error[0] = 0;
     int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
+    if (!result) stage = "attention";
     if (!result) result = attention
         ? coli_v4_attention_window_token_ref(branch, attention, weights, config,
                                              normalized, position, error, error_size)
         : coli_v4_attention_token_ref(branch, weights, config, normalized,
                                       position, error, error_size);
+    if (!result) stage = "attention hyper-connection post";
     if (!result) result = coli_v4_hc_post(state, branch, residual, post, comb, hc, d);
     if (!result) coli_bf16_round_array(state, hd);
 
     if (!result) memcpy(residual, state, hd * sizeof(*residual));
+    if (!result) stage = "FFN hyper-connection";
     if (!result) result = normalized_hc_pre(reduced, post, comb, normalized, state,
                                             weights, config, "ffn", "ffn_norm.weight");
+    if (!result) stage = "MoE";
     if (!result) result = moe_token(branch, weights, config, experts, normalized, token);
+    if (!result) stage = "FFN hyper-connection post";
     if (!result) result = coli_v4_hc_post(output_hc, branch, residual, post, comb, hc, d);
     if (!result) coli_bf16_round_array(output_hc, hd);
 
@@ -5010,7 +5018,14 @@ static int block_token_impl(float *output_hc,
     if (moe_reason()[0])
         return set_error(error, error_size, "block computation failed in MoE: %s",
                          moe_reason());
-    return set_error(error, error_size, "block computation failed");
+    if (error && error_size && error[0]) {
+        char inner[256];
+        snprintf(inner, sizeof inner, "%s", error);
+        return set_error(error, error_size, "block computation failed in %s, layer %d: %s",
+                         stage, weights->plan.layer, inner);
+    }
+    return set_error(error, error_size, "block computation failed in %s, layer %d",
+                     stage, weights->plan.layer);
 }
 
 int coli_v4_block_token_ref(float *output_hc,
@@ -6354,26 +6369,34 @@ static int block_token_pipeline(float *output_hc,
     }
 #define DP_MARK(acc) do { if (dprof) { clock_gettime(CLOCK_MONOTONIC, &dp1); acc += (dp1.tv_sec - dp0.tv_sec) + (dp1.tv_nsec - dp0.tv_nsec) * 1e-9; dp0 = dp1; } } while (0)
     if (dprof) clock_gettime(CLOCK_MONOTONIC, &dp0);
+    /* the stage that failed, for the error (the request's only report) */
+    const char *stage = "attention hyper-connection";
+    if (error && error_size) error[0] = 0;
     int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
     DP_MARK(dp_hc);
+    if (!result) stage = "attention";
     if (!result) result = attention
         ? coli_v4_attention_window_token_ref(branch, attention, weights, config,
                                              normalized, position, error, error_size)
         : coli_v4_attention_token_ref(branch, weights, config, normalized,
                                       position, error, error_size);
     DP_MARK(dp_attn);
+    if (!result) stage = "attention hyper-connection post";
     if (!result) result = coli_v4_hc_post(state, branch, residual,
                                           post, comb, hc, d);
     if (!result) coli_bf16_round_array(state, hd);
     if (!result) memcpy(residual, state, hd * sizeof(*residual));
+    if (!result) stage = "FFN hyper-connection";
     if (!result) result = normalized_hc_pre(reduced, post, comb, normalized, state,
                                             weights, config, "ffn",
                                             "ffn_norm.weight");
     DP_MARK(dp_hc);
+    if (!result) stage = "MoE";
     if (!result) result = moe_token_pipeline(branch, weights, config, experts,
                                              normalized, token);
     DP_MARK(dp_moe);
+    if (!result) stage = "FFN hyper-connection post";
     if (!result) result = coli_v4_hc_post(output_hc, branch, residual,
                                           post, comb, hc, d);
     if (!result) coli_bf16_round_array(output_hc, hd);
@@ -6386,7 +6409,14 @@ static int block_token_pipeline(float *output_hc,
     if (moe_reason()[0])
         return set_error(error, error_size, "block computation failed in MoE: %s",
                          moe_reason());
-    return set_error(error, error_size, "block computation failed");
+    if (error && error_size && error[0]) {
+        char inner[256];
+        snprintf(inner, sizeof inner, "%s", error);
+        return set_error(error, error_size, "block computation failed in %s, layer %d: %s",
+                         stage, weights->plan.layer, inner);
+    }
+    return set_error(error, error_size, "block computation failed in %s, layer %d",
+                     stage, weights->plan.layer);
 }
 
 int coli_v4_block_token_ref(float *output_hc,
