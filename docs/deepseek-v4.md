@@ -222,43 +222,45 @@ device the engine opened.
 What the tier keeps in VRAM (measured on a 16 GB RTX 5080): dense/attention
 mirrors **6.3 GB** (needed for GPU attention and the GPU dense matvecs in
 decode), the transient prefill expert bank (`COLI_CUDA_MOE_BATCH`, freed when
-decode starts; 256 slots of 12.75 MiB, 13.5 MiB on DeepGEMM builds:
-**3264 MiB**, 3456 MiB on DeepGEMM), attention/KV/work buffers **~0.5 GB**,
+decode starts; 12.75 MiB per slot, 13.5 MiB on DeepGEMM builds: **3.2 GiB**
+for 256 experts, 3.4 GiB on DeepGEMM), attention/KV/work buffers **~0.5 GB**,
 and the rest as decode expert mirrors at **12.75 MiB each** (gate, up and
-down in fp4 with their scales). `DSV4_CUDA_EXPERT_MIRRORS` is only an upper
-bound (default 4096): the cache grows while at least
-`DSV4_CUDA_VRAM_RESERVE_MB` (default 2800 with the bank enabled, 600
-without) stays free, so free VRAM sizes it at run time — you normally do not
-need to set it. Decode is disk-bound, so more mirrors help in proportion to
-the hit rate they add (~11 000 experts total; 600 mirrors ≈ 5 %); more RAM
-(`--ram`) buys more than more VRAM.
+down in fp4 with their scales).
+`DSV4_CUDA_EXPERT_MIRRORS` is only an upper bound (default 4096): the cache
+grows while at least `DSV4_CUDA_VRAM_RESERVE_MB` stays free, so free VRAM
+sizes it at run time — you normally do not need to set it. Decode is
+disk-bound, so more mirrors help in proportion to the hit rate they add
+(~11 000 experts total; 600 mirrors ≈ 5 %); more RAM (`--ram`) buys more than
+more VRAM.
 
-The 2800 MiB default is smaller than the bank, and free VRAM is re-read only
-every 64 mirror misses (up to ~800 MiB of mirrors past the reserve): once
-decode has grown the mirror cache to the reserve, a later large prefill
-cannot allocate the bank and runs on the CPU union (`v4_gpu moe-batch=off
-(bank allocation failed; CPU union stays)`). `DSV4_CUDA_VRAM_RESERVE_MB=4700`
-(the bank, 64 mirrors and ~600 MiB of headroom; 4900 on DeepGEMM builds)
-keeps the bank's room across requests, for ~150 mirrors fewer. With
-`COLI_CUDA_MOE_DOUBLE=1` add another bank for the second one; without that
-room the second bank fails to allocate once decode has filled the card and
-the process stays single-bank.
+The default reserve is 600 MiB without the bank. With `COLI_CUDA_MOE_BATCH=1`
+it is sized from the model's bank at engine open, so the next large prefill
+still finds room for it after decode has filled the card: 600 MiB + the bank
+(two banks with `COLI_CUDA_MOE_DOUBLE=1`, back to one once its prefetch has
+turned itself off; a second bank that did not fit is retried by the next
+prefill, so its room stays reserved) + 64 mirrors, because free VRAM is
+re-read only every 64 misses. That is 4681 MiB for 256 experts on generic
+builds, 4873 on DeepGEMM and 3100 for a 132-expert checkpoint (7945, 8329 and
+4783 with the second bank); the engine logs it as `v4_gpu mirror-reserve=`.
+Below 32 live mirrors the default keeps only 600 MiB free, so a card too small
+for the bank still decodes from a working mirror set (the bank then falls back
+to the CPU union). An explicit `DSV4_CUDA_VRAM_RESERVE_MB` is used as given.
 
 | VRAM | dense mirrors | prefill bank | recommended env | expected |
 |---|---|---|---|---|
-| 6 GB | no (6.3 GB does not fit) | yes (3.2 GiB) | `CUDA_DENSE=0 COLI_CUDA_MOE_BATCH=1 COLI_CUDA_ATTN_BATCH=0 DSV4_CUDA_VRAM_RESERVE_MB=4700` | GPU MoE prefill (generic kernels on non-RTX50), CPU attention/decode; ~90 mirrors between prefills |
+| 6 GB | no (6.3 GB does not fit) | yes (3.2 GiB) | `CUDA_DENSE=0 COLI_CUDA_MOE_BATCH=1 COLI_CUDA_ATTN_BATCH=0` | GPU MoE prefill (generic kernels on non-RTX50), CPU attention/decode; ~90 mirrors between prefills |
 | 8 GB | yes | no (~0.9 GiB left) | `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=0` | GPU attention + GPU decode dense; MoE prefill on the CPU union; ~25 mirrors |
-| 10–12 GB | yes | 12 GB: yes (tight); 10 GB: no (~2.9 GiB left) | 12 GB: `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=1 DSV4_CUDA_VRAM_RESERVE_MB=4700`; 10 GB: as 8 GB | 12 GB: full GPU prefill, ~25 decode mirrors between prefills (~350 with `COLI_CUDA_MOE_BATCH=0`); 10 GB: GPU attention + GPU decode dense, MoE prefill on the CPU union, ~190 mirrors |
-| 16 GB (this box) | yes | yes | the canonical line above (mirror cap can be left unset); `DSV4_CUDA_VRAM_RESERVE_MB=4900` keeps GPU prefill once decode has filled the card | ~490 mirrors with the default reserve (the numbers in this document), ~330 with 4900 |
-| 24 GB | yes | yes | canonical + `DSV4_CUDA_VRAM_RESERVE_MB=4700` | ~1 000 mirrors (~9 %) |
-| 32 GB | yes | yes | canonical + `DSV4_CUDA_VRAM_RESERVE_MB=4700` | ~1 600 mirrors (~15 %); raise `--ram` first if RAM allows |
+| 10–12 GB | yes | 12 GB: yes (tight); 10 GB: only a pruned checkpoint's smaller bank on generic builds | `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=1` | full GPU prefill; 12 GB: the 32-mirror minimum beside a 256-expert bank's reserve (~350 mirrors with `COLI_CUDA_MOE_BATCH=0`), ~150 beside a 132-expert one; 10 GB: the 32-mirror minimum beside a 132-expert bank (256 experts: `COLI_CUDA_MOE_BATCH=0`, ~190 mirrors) |
+| 16 GB (this box) | yes | yes | the canonical line above (mirror cap can be left unset) | ~330 mirrors; the numbers in this document predate the bank-sized reserve (the fixed 2800 MiB default left more mirrors, but too little room for the bank once decode had filled the card) |
+| 24 GB | yes | yes | canonical | ~1 000 mirrors (~9 %) |
+| 32 GB | yes | yes | canonical | ~1 600 mirrors (~15 %); raise `--ram` first if RAM allows |
 
-Mirror counts are estimates for a card of N × 1024 MiB on a generic build
-(DeepGEMM on the 16 GB row): free VRAM after the dense mirrors (6.3 GiB;
-none in the 6 GB row) and ~0.8 GiB of CUDA context and attention/KV buffers
-(~0.3 GiB with CPU attention), minus the reserve, divided by 12.75 MiB.
-DeepGEMM builds need 200 MiB more reserve for their larger bank (~15 mirrors
-fewer).
+Mirror counts are estimates for a card of N × 1024 MiB and a 256-expert model
+unless noted (DeepGEMM bank on RTX 50, generic elsewhere): free VRAM after the
+dense mirrors (6.3 GiB; none in the 6 GB row) and ~0.8 GiB of CUDA context and
+attention/KV buffers (~0.3 GiB with CPU attention), minus the default reserve,
+divided by 12.75 MiB. `COLI_CUDA_MOE_DOUBLE=1` reserves one more bank (~260
+mirrors fewer for 256 experts).
 
 On non-Blackwell cards the generic DLL is selected automatically (fp32
 kernels): same settings, prefill roughly 2–3× slower than the DeepGEMM
@@ -279,6 +281,97 @@ GPU fill branch and the CPU branch using bandwidths measured at runtime, and
 `COLI_CUDA_MOE_DOUBLE=1` (on top of `COLI_CUDA_MOE_BATCH=1`) prefetches the next
 layer's full expert set into a second VRAM bank while the current layer
 computes, falling back to the single bank when VRAM is short.
+
+### Expert-pruned checkpoints (REAP) and the generic kernels
+
+Expert-pruned checkpoints such as `puwaer/DeepSeek-V4-Flash-0731-reap-150b`
+(132 routed experts instead of 256) use the batched prefill MoE path too: the
+CPU router picks their experts (tokens in parallel, bit-identical to the CPU
+union; Vulkan builds take the chunk's gate logits from one device call, as the
+union does) because the GPU top-6 kernel assumes 256 logits, and on generic
+(non-DeepGEMM) builds the bank is sized to the model's expert count
+(132 slots, 1683 MiB, instead of 256 slots, 3264 MiB). DeepGEMM builds keep a
+256-slot bank.
+
+The generic kernels themselves got two bit-identical rewrites (same operands
+in the same order for every output; `_VERIFY=1` runs old and new side by side,
+keeps the old kernel's results and counts mismatching bits; it does that even
+when the switch below is `0`, and says so once at startup):
+
+- `DSV4_MOE_EXPERT_MAJOR` (1): the routed experts run expert-major — one warp
+  per expert row walks every token of the chunk that picked that expert, so
+  each expert's weights are read once per chunk instead of once per route.
+  It takes 2 routes per pass while the chunk averages fewer than 4 routes per
+  routed expert (small prompts, tail chunks) and 4 otherwise.
+- `DSV4_MM_WARP` (auto): warp-per-row dense batch matmul for fp8 shapes whose
+  I is a multiple of 256: short rows only (I ≤ 1024, e.g. `attn.wq_b`; unset,
+  empty or `auto`), all of them with `1`, none with `0`. Against the old
+  kernel it also measured faster for I = 2048 (~0.8× the time on the
+  shared-expert w2, 4096×2048), but slower for I = 4096 (~1.1×) and I = 8192
+  (~1.65×).
+
+Measured on 2× RTX 3090 (one used; sm_86, CUDA 12.0 `NO_TC=1`), Ryzen 9 9950X3D,
+62 GB RAM (`--ram 40`), one SN850X, REAP 150B, greedy, `--ctx 8192`, a fresh
+server per run (the model's `.coli_usage` was empty, so the serve prewarm read
+nothing), medians of three runs per cell, against upstream dev 736a0682:
+
+| prompt | CPU union | GPU batch | + `COLI_CUDA_MOE_DOUBLE=1` |
+|---|---|---|---|
+| 1,992 tokens | 130.2 s | 76.8 s (1.70×) | **64.1 s** (2.03×) |
+| 3,005 tokens | 205.9 s | 111.0 s (1.86×) | **97.8 s** (2.10×) |
+
+The kernels' share, measured earlier on 7b55a9b3 (before upstream's faster CPU
+decode kernels, #2069, and the serve prewarm, #2109), one run per cell:
+
+| prompt | CPU union (before) | GPU batch, per-route kernels | + expert-major + warp dense | + `COLI_CUDA_MOE_DOUBLE=1` |
+|---|---|---|---|---|
+| 1,992 tokens | 220.5 s | 125.4 s | 79.7 s | **69.1 s** |
+| ~3,000 tokens | 334.4 s\* | 183.5 s | 118.2 s | **105.8 s** |
+
+\* Not measured on upstream: this request ran on the CPU union of a patched
+build whose bank had failed to allocate, at upstream's per-token rate
+(0.111 s/token, as in the 1,992-token cell).
+
+Answers were identical to the CPU union in every run here. That is not
+guaranteed for every prompt: the routing is the same, but the GPU and CPU
+expert arithmetic is not bit-identical, so a near-tie can flip a token. Decode (disk-bound) is
+unchanged after short prompts, which stay below `COLI_CUDA_MOE_BATCH_MIN` and
+never use the bank, but after these two GPU-batch prefills it measured slower
+than after a CPU-union prefill: the 24-token answer to the 1,992-token prompt
+at 2.18 tok/s instead of 2.42 (~10 %), the answer to the ~3,000-token prompt
+at ~2.75 instead of 2.85 (~3 %). Those runs predate the bank keeping the RAM
+expert store's routing books. Measured again on one binary and one VRAM
+reserve, with the same answer text after either prefill, the 1,992-token case
+was 7.4 % slower (2.13 vs 2.30 tok/s), and the cause was the store's books: the
+bank reads each routed expert once per layer per prompt and those reads were
+all the store counted, so decode started with every RAM-resident expert at
+usage 1, the pins ranked by expert id and only 7-9 of 16 pins active, and took
+~57 % more RAM-cache misses, most of them in its first ten tokens. The bank now
+counts each chunk's routed union as the CPU union's lookups do (usage, the pin
+ramp, repins, the `.coli_usage` history) and keeps the members already in RAM
+recent, without extra reads. Measured again on the series with and without that
+change (the same answer text, five cold runs each), decode after the 1,992-token
+bank prefill went from 2.13 to 2.26 tok/s (+6.3 %, medians), against 2.30 after
+a CPU-union prefill: 67 % (means) to 79 % (medians) of the gap recovered. The
+bank prefill takes as long as before: 82 s to the first token with or without
+the change, against 216 s for the CPU union (medians of these later runs, so
+not quite the table's single-run times). The rest of the gap sits in the first
+~5 decode tokens and comes from which experts are resident at decode start. For
+one, the bank reads each routed expert once per layer, so a member the RAM cache
+evicted earlier in the layer is not read back as the CPU union's per-chunk
+lookups read it. The books also decide which experts a later request's prefill
+(or a long prompt's later segments) finds in RAM, so a table cell whose request
+followed another may move as well; that has not been measured.
+On 736a0682 (the medians above), decode after the bank prefill was 3.2 %
+(1,992 tokens) and 1.6 % (3,005) behind decode after the CPU union's; the
+bank's share of the VRAM reserve (below) leaves room for fewer decode mirrors.
+
+With `COLI_CUDA_MOE_DOUBLE=1` the default VRAM
+reserve also covers the prefetch bank (one more bank: +1683 MiB for this
+132-expert model, +3264 MiB for 256 experts), so it still allocates after
+decode has grown its mirror cache; the mirrors that room holds back cost some
+decode speed, and the reserve drops back to one bank once the prefetch has
+turned itself off (`moe-double=off`).
 
 ## Prefill: segments, chunks, checkpoints
 
@@ -437,11 +530,15 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `COLI_CUDA_MOE_BATCH` (0) | `1` = prefill MoE on the transient VRAM expert bank |
 | `COLI_CUDA_MOE_BATCH_MIN` (256) | min fresh tokens to engage the bank |
 | `DSV4_CUDA_EXPERT_MIRRORS` (4096) | upper bound on decode VRAM expert mirrors (12.75 MiB each); free VRAM sizes the cache at run time |
-| `DSV4_CUDA_VRAM_RESERVE_MB` (2800 with the bank, else 600) | VRAM kept free while mirrors grow (bank + attention buffers); the default is below the 3264 MiB bank, `4700` (`4900` DeepGEMM) keeps its room across requests, see [VRAM budget](#vram-budget-and-per-card-settings) |
+| `DSV4_CUDA_VRAM_RESERVE_MB` (600; with the bank 600 + the bank, ×2 with `COLI_CUDA_MOE_DOUBLE=1`, + 64 mirrors, logged as `v4_gpu mirror-reserve=`) | VRAM kept free while mirrors grow (bank + attention buffers; the default only from 32 live mirrors on, see [VRAM budget](#vram-budget-and-per-card-settings)); an explicit value is used as given |
 | `V4_MTP_GPU_MIRRORS` (16) | separate mirror cache for the MTP drafter |
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
 | `V4_MOE_BANK_FULL` (off) | `=N`: prefetch a whole layer's experts above N tokens (measured worse) |
+| `DSV4_MOE_EXPERT_MAJOR` (1, `.cu`) | generic batched MoE: expert-major fp4 kernel (weights read once per chunk); `0` = one matvec per route; `_VERIFY=1` compares both bit for bit (keeps the per-route results, also with `0`) |
+| `DSV4_MOE_EM_TB` (auto, `.cu`) | routes per pass of the expert-major kernel: unset = 2 below 4 routes per routed expert in the chunk, else 4; `2`, `3`, `4` or `6` forces one (anything else is ignored with a warning) |
+| `DSV4_MM_WARP` (auto, `.cu`) | generic dense batch matmul, fp8 shapes whose I is a multiple of 256: warp-per-row kernel for I ≤ 1024 (unset, empty or `auto`), `1` = all of them, `0` = off; `DSV4_MM_WARP_VERIFY=1` compares bit for bit (keeps the old kernel's results, also with `0`) |
+| `V4_MOE_BATCH_PROF` (0) | `1` = one `moebprof` line per chunk-layer: switch (layer change: prefetch-worker wait, bank swap) / route / refill / compute ms |
 
 **Prefill / checkpoints**
 | var | meaning |

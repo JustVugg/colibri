@@ -1404,6 +1404,462 @@ out:
     puts("DeepSeek-V4 ExpertStore prewarm: ok");
     return 0;
 }
+
+/* The CUDA expert bank's books (coli_v4_expert_store_touch_union and
+ * note_union). The bank reads each routed expert once per layer per prompt,
+ * uncounted, and hands the store each chunk's routing (the router's ids, every
+ * token's top-k) with one touch before its reads and one note once the chunk
+ * is done. The same synthetic layer-major routing runs through two stores:
+ * "union" looks up every chunk's union in ascending order, as
+ * v4_moe_batch_union does; "bank" touches the routing, reads in routing order
+ * only the experts its layer has not read yet (later chunks are mostly, some
+ * wholly, bank hits) and notes the routing, as coli_v4_gpu_moe_batch_union
+ * does. Two chunks per layer fail after the touch and one read and fall back to
+ * the CPU union's counted lookups, unnoted, as a refused bank chunk does. After
+ * every chunk the books must be the same (usage, HITS, heat, the request clock
+ * and the active pins, through the pin ramp, the repins and a usage decay), and
+ * so must the saved .coli_usage; the bank store reads only what its own lookups
+ * missed, and a touch or a note reads nothing. */
+enum {
+    BOOKS_LAYERS = 2, BOOKS_EXPERTS = 24, BOOKS_SLOTS = 14, BOOKS_CHUNKS = 48,
+    BOOKS_TOKENS = 4, BOOKS_TOPK = 6, BOOKS_ROUTES = BOOKS_TOKENS * BOOKS_TOPK
+};
+
+typedef struct {
+    uint64_t usage[BOOKS_EXPERTS];
+    unsigned char hit[BOOKS_EXPERTS], heat[BOOKS_EXPERTS];
+    uint64_t requests;
+    int pins[BOOKS_SLOTS];
+    int pin_count;
+} BooksSnapshot;
+
+static int books_reads;
+static void books_read_hook(ColiExpertKey key) { (void)key; books_reads++; }
+
+static int books_has(const int *ids, int count, int expert) {
+    for (int i = 0; i < count; i++)
+        if (ids[i] == expert) return 1;
+    return 0;
+}
+
+/* A chunk's routing as the router returns it: each token's top-6, distinct
+ * within the token, in no particular order, so experts repeat across tokens.
+ * Skewed, with a hot set that drifts every 12 chunks, so the pins change. */
+static void books_routing(int layer, int chunk, int ids[BOOKS_ROUTES]) {
+    uint32_t x = 2166136261u ^ (uint32_t)(layer * 977 + chunk * 131);
+    for (int token = 0; token < BOOKS_TOKENS; token++) {
+        int *top = ids + token * BOOKS_TOPK;
+        for (int rank = 0; rank < BOOKS_TOPK; rank++) {
+            x = x * 1664525u + 1013904223u;
+            int draw = (int)((x >> 8) % 100);
+            int expert = draw < 60 ? draw % 6 : 6 + draw % (BOOKS_EXPERTS - 6);
+            expert = (expert + chunk / 12 * 5) % BOOKS_EXPERTS;
+            while (books_has(top, rank, expert))
+                expert = (expert + 1) % BOOKS_EXPERTS;
+            top[rank] = expert;
+        }
+    }
+}
+
+/* The CPU union's keys: the routing's members, each once, ascending. */
+static int books_union_keys(const int *ids, int *keys) {
+    unsigned char used[BOOKS_EXPERTS] = {0};
+    int count = 0;
+    for (int route = 0; route < BOOKS_ROUTES; route++) used[ids[route]] = 1;
+    for (int expert = 0; expert < BOOKS_EXPERTS; expert++)
+        if (used[expert]) keys[count++] = expert;
+    return count;
+}
+
+/* The bank's refill: the routed experts it does not hold yet, in routing
+ * order, each once, as coli_v4_gpu_moe_batch_union collects `missing`. */
+static int books_missing_keys(const int *ids, const unsigned char *in_bank,
+                              int *keys) {
+    int count = 0;
+    for (int route = 0; route < BOOKS_ROUTES; route++)
+        if (!in_bank[ids[route]] && !books_has(keys, count, ids[route]))
+            keys[count++] = ids[route];
+    return count;
+}
+
+/* Looks up `layer`'s `keys` in order: counted, as the CPU union's lookups, or
+ * uncounted, as the bank's reads, which the bank then holds (in_bank); at most
+ * `limit` of them (-1: all). */
+static int books_lookups(ColiExpertStore *store, int layer, const int *keys,
+                         int key_count, unsigned char *in_bank, int limit,
+                         int counted, int *lookups) {
+    for (int k = 0; k < key_count && limit; k++) {
+        int expert = keys[k];
+        ColiExpertKey key = {layer, expert};
+        ColiExpertView view;
+        int result = counted
+            ? coli_expert_lookup(store, key, &view)
+            : coli_v4_expert_store_lookup_uncounted(store, key, &view);
+        if (result || !expect_fixture_expert_at(&view, layer, expert,
+                                                BOOKS_EXPERTS)) {
+            fprintf(stderr, "books: %s lookup %d/%d failed\n",
+                    counted ? "union" : "bank", layer, expert);
+            if (!result) coli_expert_release(store, &view);
+            return 1;
+        }
+        coli_expert_release(store, &view);
+        if (in_bank) in_bank[expert] = 1;
+        ++*lookups;
+        if (limit > 0) limit--;
+    }
+    return 0;
+}
+
+/* bank_only: the bank's chunks served wholly from VRAM (no read, a note). */
+static int run_books_case(const char *directory, int bank,
+                          BooksSnapshot *snapshots, int *reads, int *bank_only,
+                          ColiExpertStoreStats *stats) {
+    char error[256];
+    ColiDeepSeekV4ExpertStoreOptions options = {
+        directory, BOOKS_LAYERS, BOOKS_EXPERTS,
+        (uint64_t)BOOKS_LAYERS * BOOKS_SLOTS * 51, -1, 0, 0, 0
+    };
+    ColiExpertStore *store = NULL;
+    if (coli_deepseek_v4_expert_store_open(&options, &store,
+                                            error, sizeof(error))) {
+        fprintf(stderr, "books store open failed: %s\n", error);
+        return 1;
+    }
+    int failed = 0, lookups = 0;
+    books_reads = 0;
+    coli_v4_test_expert_read_hook = books_read_hook;
+    for (int layer = 0; layer < BOOKS_LAYERS && !failed; layer++) {
+        unsigned char in_bank[BOOKS_EXPERTS] = {0};
+        for (int chunk = 0; chunk < BOOKS_CHUNKS && !failed; chunk++) {
+            int ids[BOOKS_ROUTES], keys[BOOKS_EXPERTS];
+            books_routing(layer, chunk, ids);
+            int union_count = books_union_keys(ids, keys);
+            if (!bank) {
+                failed = books_lookups(store, layer, keys, union_count, NULL,
+                                       -1, 1, &lookups);
+            } else {
+                /* Chunks 5 and 30: the bank refuses the chunk after its first
+                 * read, and the CPU union runs it, with no note. */
+                int refused = chunk == 5 || chunk == 30;
+                int missing[BOOKS_EXPERTS];
+                int missing_count = books_missing_keys(ids, in_bank, missing);
+                if (!refused && !missing_count) *bank_only += 1;
+                int before = books_reads;
+                coli_v4_expert_store_touch_union(store, layer, ids,
+                                                 BOOKS_ROUTES);
+                int touch_reads = books_reads - before;
+                failed = books_lookups(store, layer, missing, missing_count,
+                                       in_bank, refused ? 1 : -1, 0,
+                                       &lookups);
+                if (!failed && refused)
+                    failed = books_lookups(store, layer, keys, union_count,
+                                           NULL, -1, 1, &lookups);
+                before = books_reads;
+                if (!failed && !refused)
+                    coli_v4_expert_store_note_union(store, layer, ids,
+                                                    BOOKS_ROUTES);
+                if (touch_reads || books_reads != before) {
+                    fprintf(stderr, "books: touch_union read %d, note_union "
+                                    "%d experts\n", touch_reads,
+                            books_reads - before);
+                    failed = 1;
+                }
+            }
+            BooksSnapshot *snapshot = &snapshots[layer * BOOKS_CHUNKS + chunk];
+            memset(snapshot, 0, sizeof(*snapshot));
+            snapshot->pin_count = coli_v4_test_expert_books(
+                store, layer, snapshot->usage, snapshot->hit, snapshot->heat,
+                &snapshot->requests, snapshot->pins);
+            if (snapshot->pin_count < 1 || snapshot->pin_count > BOOKS_SLOTS) {
+                fprintf(stderr, "books: pin slots=%d\n", snapshot->pin_count);
+                failed = 1;
+            }
+        }
+    }
+    coli_v4_test_expert_read_hook = NULL;
+    store->ops->stats(store, stats);
+    *reads = books_reads;
+    if (stats->requests != (uint64_t)lookups ||
+        stats->misses != (uint64_t)books_reads) {
+        fprintf(stderr, "books: %s requests=%llu (lookups %d) misses=%llu "
+                        "(reads %d)\n", bank ? "bank" : "union",
+                (unsigned long long)stats->requests, lookups,
+                (unsigned long long)stats->misses, books_reads);
+        failed = 1;
+    }
+    store->ops->destroy(store);   /* saves <directory>/.coli_usage */
+    return failed;
+}
+
+static int books_read_file(const char *path, char *buffer, size_t capacity,
+                           size_t *length) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return -1;
+    *length = fread(buffer, 1, capacity, file);
+    int result = ferror(file) || !feof(file) ? -1 : 0;
+    fclose(file);
+    return result;
+}
+
+static int test_expert_store_bank_books(void) {
+    char directories[2][32] = {"colibri-v4-books-u-XXXXXX",
+                               "colibri-v4-books-b-XXXXXX"};
+    char paths[2][256], histories[2][256];
+    static BooksSnapshot snapshots[2][BOOKS_LAYERS * BOOKS_CHUNKS];
+    static char saved[2][1 << 16];
+    size_t saved_length[2] = {0, 0};
+    int reads[2] = {0, 0}, bank_only = 0;
+    ColiExpertStoreStats stats[2];
+    setenv("COLI_V4_AUTOPIN", "0", 1);    /* no history in, so none carried over */
+    setenv("COLI_V4_SAVE_USAGE", "1", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    setenv("COLI_V4_PREWARM", "0", 1);
+    int failed = 0, made[2] = {0, 0};
+    for (int bank = 0; bank < 2 && !failed; bank++) {
+        if (!mkdtemp(directories[bank])) {
+            perror("mkdtemp books");
+            failed = 1;
+            break;
+        }
+        made[bank] = 1;
+        snprintf(paths[bank], sizeof(paths[bank]), "%s/model.safetensors",
+                 directories[bank]);
+        snprintf(histories[bank], sizeof(histories[bank]), "%s/.coli_usage",
+                 directories[bank]);
+        if (write_fixture_layers(paths[bank], BOOKS_LAYERS, BOOKS_EXPERTS)) {
+            perror("write books fixture");
+            failed = 1;
+            break;
+        }
+        failed = run_books_case(directories[bank], bank, snapshots[bank],
+                                &reads[bank], &bank_only, &stats[bank]);
+        if (!failed && books_read_file(histories[bank], saved[bank],
+                                       sizeof(saved[bank]),
+                                       &saved_length[bank])) {
+            fprintf(stderr, "books: no saved history %s\n", histories[bank]);
+            failed = 1;
+        }
+    }
+    for (int i = 0; !failed && i < BOOKS_LAYERS * BOOKS_CHUNKS; i++) {
+        const BooksSnapshot *u = &snapshots[0][i], *b = &snapshots[1][i];
+        if (memcmp(u->usage, b->usage, sizeof(u->usage)) ||
+            memcmp(u->hit, b->hit, sizeof(u->hit)) ||
+            memcmp(u->heat, b->heat, sizeof(u->heat)) ||
+            u->requests != b->requests || u->pin_count != b->pin_count ||
+            memcmp(u->pins, b->pins, sizeof(u->pins))) {
+            fprintf(stderr, "books differ at layer %d chunk %d: requests "
+                            "%llu/%llu pins %d,%d,%d,%d/%d,%d,%d,%d\n",
+                    i / BOOKS_CHUNKS, i % BOOKS_CHUNKS,
+                    (unsigned long long)u->requests,
+                    (unsigned long long)b->requests, u->pins[0], u->pins[1],
+                    u->pins[2], u->pins[3], b->pins[0], b->pins[1],
+                    b->pins[2], b->pins[3]);
+            failed = 1;
+        }
+    }
+    /* The case must reach what it claims to cover: the whole pin ramp, the
+     * usage decay at 64 repin intervals (384 requests per layer), and chunks
+     * the bank serves without a read, which only the note counts. */
+    const BooksSnapshot *last = &snapshots[0][BOOKS_CHUNKS - 1];
+    int active = 0;
+    for (int rank = 0; rank < last->pin_count; rank++)
+        active += last->pins[rank] >= 0;
+    if (!failed && (active != last->pin_count || last->requests <= 384 ||
+                    reads[1] >= reads[0] || bank_only < 1)) {
+        fprintf(stderr, "books: case too weak: pins %d/%d requests=%llu "
+                        "reads union=%d bank=%d, %d chunks bank only\n",
+                active, last->pin_count, (unsigned long long)last->requests,
+                reads[0], reads[1], bank_only);
+        failed = 1;
+    }
+    if (!failed && (!saved_length[0] || saved_length[0] != saved_length[1] ||
+                    memcmp(saved[0], saved[1], saved_length[0]))) {
+        fprintf(stderr, "books: saved histories differ (%zu vs %zu bytes)\n",
+                saved_length[0], saved_length[1]);
+        failed = 1;
+    }
+    for (int bank = 0; bank < 2; bank++) {
+        if (!made[bank]) continue;
+        unlink(histories[bank]);
+        failed |= scratch_remove(directories[bank], paths[bank]);
+    }
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    if (failed) return 1;
+    printf("DeepSeek-V4 ExpertStore bank books: ok (%d chunk-layers, %d of "
+           "them bank only, %d pins, %llu requests/layer, reads union=%d "
+           "bank=%d, .coli_usage %zu bytes identical)\n",
+           BOOKS_LAYERS * BOOKS_CHUNKS, bank_only, last->pin_count,
+           (unsigned long long)last->requests, reads[0], reads[1],
+           saved_length[0]);
+    return 0;
+}
+
+/* touch_union makes the members the RAM cache holds recent, as a hit would,
+ * and counts nothing; note_union counts, and touches only what a lookup's
+ * counting touches: the resident pins, when a repin fires. Neither moves
+ * anything in or out. Another ExpertStore backend (here the plain base store)
+ * keeps no books and still serves the uncounted read. */
+enum { RECENCY_EXPERTS = 16 };
+
+/* A one-layer hot store of `slots` slots holding experts 0..slots-1, read
+ * uncounted in that order (so 0 is the LRU slot). */
+static ColiExpertStore *recency_store(const char *directory, int slots) {
+    char error[256];
+    ColiDeepSeekV4ExpertStoreOptions options = {
+        directory, 1, RECENCY_EXPERTS, (uint64_t)slots * 51, -1, 0, 0, 0
+    };
+    ColiExpertStore *store = NULL;
+    if (coli_deepseek_v4_expert_store_open(&options, &store,
+                                            error, sizeof(error))) {
+        fprintf(stderr, "recency store open failed: %s\n", error);
+        return NULL;
+    }
+    for (int expert = 0; expert < slots; expert++) {
+        ColiExpertView view;
+        if (coli_v4_expert_store_lookup_uncounted(
+                store, (ColiExpertKey){0, expert}, &view)) {
+            fprintf(stderr, "recency fill %d failed\n", expert);
+            store->ops->destroy(store);
+            return NULL;
+        }
+        coli_expert_release(store, &view);
+    }
+    return store;
+}
+
+static int recency_resident(ColiExpertStore *store, int expert) {
+    return coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, expert})
+        >= 0;
+}
+
+/* An uncounted read of an expert not in RAM: it evicts the LRU victim. */
+static int recency_miss(ColiExpertStore *store, int expert) {
+    ColiExpertView view;
+    if (coli_v4_expert_store_lookup_uncounted(
+            store, (ColiExpertKey){0, expert}, &view))
+        return 1;
+    coli_expert_release(store, &view);
+    return 0;
+}
+
+static int test_expert_store_union_recency(void) {
+    char directory[] = "colibri-v4-note-XXXXXX";
+    char path[256], error[256];
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    if (!mkdtemp(directory)) { perror("mkdtemp note"); return 1; }
+    snprintf(path, sizeof(path), "%s/model.safetensors", directory);
+    if (write_fixture_experts(path, RECENCY_EXPERTS)) {
+        perror("write note fixture");
+        rmdir(directory);
+        return 1;
+    }
+    int failed = 0, pin_count;
+    uint64_t usage[RECENCY_EXPERTS], requests = 0;
+    unsigned char hit[RECENCY_EXPERTS], heat[RECENCY_EXPERTS];
+    int pins[RECENCY_EXPERTS];
+
+    /* Six slots, so no pins: plain LRU. Note 1 and 7, touch 0 and 7 (7 is
+     * not in RAM), each routed more than once and 99 outside the layer: the
+     * next miss evicts 1, the LRU slot, and keeps 0. */
+    ColiExpertStore *store = recency_store(directory, 6);
+    if (!store) {
+        failed = 1;
+    } else {
+        const int noted[] = {7, 1, 99, 7, 1}, touched[] = {7, 0, 7, 0};
+        books_reads = 0;
+        coli_v4_test_expert_read_hook = books_read_hook;
+        coli_v4_expert_store_note_union(store, 0, noted, 5);
+        coli_v4_expert_store_touch_union(store, 0, touched, 4);
+        int union_reads = books_reads;
+        int missed = recency_miss(store, 6);
+        coli_v4_test_expert_read_hook = NULL;
+        pin_count = coli_v4_test_expert_books(store, 0, usage, hit, heat,
+                                              &requests, pins);
+        if (missed || union_reads || books_reads != 1 ||
+            !recency_resident(store, 0) || recency_resident(store, 1) ||
+            !recency_resident(store, 2) || !recency_resident(store, 6) ||
+            recency_resident(store, 7) || pin_count != 0 || requests != 2 ||
+            usage[0] || usage[1] != 1 || usage[6] || usage[7] != 1 ||
+            hit[0] || heat[1] != 1 || !hit[7]) {
+            fprintf(stderr, "union recency: missed=%d reads=%d/%d resident "
+                            "0:%d 1:%d 2:%d 6:%d 7:%d pins=%d requests=%llu "
+                            "usage 0:%llu 1:%llu 7:%llu\n", missed,
+                    union_reads, books_reads, recency_resident(store, 0),
+                    recency_resident(store, 1), recency_resident(store, 2),
+                    recency_resident(store, 6), recency_resident(store, 7),
+                    pin_count, (unsigned long long)requests,
+                    (unsigned long long)usage[0], (unsigned long long)usage[1],
+                    (unsigned long long)usage[7]);
+            failed = 1;
+        }
+        store->ops->destroy(store);
+    }
+
+    /* Fourteen slots: eight pins, four active at the ramp's start, a repin
+     * every six requests. Noting 0..5 fires one: it pins 0..5 by usage (0..3
+     * active) and touches them, as a lookup's counting would, so the next
+     * miss evicts 6, the oldest slot, not 4 (or 0, uncounted). */
+    store = failed ? NULL : recency_store(directory, 14);
+    if (!failed && !store) failed = 1;
+    if (store) {
+        const int noted[] = {5, 3, 1, 0, 2, 4, 3};
+        coli_v4_expert_store_note_union(store, 0, noted, 7);
+        int missed = recency_miss(store, 14);
+        pin_count = coli_v4_test_expert_books(store, 0, usage, hit, heat,
+                                              &requests, pins);
+        if (missed || pin_count != 8 || requests != 6 || pins[0] != 0 ||
+            pins[3] != 3 || pins[4] != -1 || recency_resident(store, 6) ||
+            !recency_resident(store, 0) || !recency_resident(store, 4) ||
+            !recency_resident(store, 5) || !recency_resident(store, 14)) {
+            fprintf(stderr, "union recency, repin: missed=%d pins=%d "
+                            "requests=%llu active 0:%d 3:%d 4:%d resident "
+                            "0:%d 4:%d 5:%d 6:%d 14:%d\n", missed, pin_count,
+                    (unsigned long long)requests, pins[0], pins[3], pins[4],
+                    recency_resident(store, 0), recency_resident(store, 4),
+                    recency_resident(store, 5), recency_resident(store, 6),
+                    recency_resident(store, 14));
+            failed = 1;
+        }
+        store->ops->destroy(store);
+    }
+
+    ColiDeepSeekV4ExpertStoreOptions options = {
+        directory, 1, RECENCY_EXPERTS, 6 * 51, -1, 0, 0, 0
+    };
+    ColiExpertStore *base = NULL;
+    if (coli_deepseek_v4_expert_store_open_base(&options, &base,
+                                                error, sizeof(error))) {
+        fprintf(stderr, "recency base store open failed: %s\n", error);
+        failed = 1;
+    } else {
+        const int routed[] = {0, 3};
+        ColiExpertView view;
+        coli_v4_expert_store_touch_union(base, 0, routed, 2);
+        coli_v4_expert_store_note_union(base, 0, routed, 2);
+        coli_v4_expert_store_touch_union(NULL, 0, routed, 2);
+        coli_v4_expert_store_note_union(NULL, 0, routed, 2);
+        if (coli_v4_test_expert_books(base, 0, usage, hit, heat, &requests,
+                                      pins) != -1 ||
+            coli_v4_expert_store_lookup_uncounted(
+                base, (ColiExpertKey){0, 3}, &view) ||
+            !expect_fixture_expert(&view, 3)) {
+            fprintf(stderr, "union books on the base store: not a plain "
+                            "lookup\n");
+            failed = 1;
+        } else {
+            coli_expert_release(base, &view);
+        }
+        base->ops->destroy(base);
+    }
+    failed |= scratch_remove(directory, path);
+    if (failed) return 1;
+    puts("DeepSeek-V4 ExpertStore union touch/note recency: ok (touched "
+         "member kept over the LRU, notes touch only repinned residents, no "
+         "reads, base store no-op)");
+    return 0;
+}
 /* ==== end test_deepseek_v4_expert_store.c ==== */
 
 /* ==== begin test_deepseek_v4_kv_cache.c ==== */
@@ -1997,6 +2453,14 @@ int main(int argc, char **argv) {
     }
     if (test_expert_store_prewarm() != 0) {
         fprintf(stderr, "FAIL: test_expert_store_prewarm\n");
+        return 1;
+    }
+    if (test_expert_store_bank_books() != 0) {
+        fprintf(stderr, "FAIL: test_expert_store_bank_books\n");
+        return 1;
+    }
+    if (test_expert_store_union_recency() != 0) {
+        fprintf(stderr, "FAIL: test_expert_store_union_recency\n");
         return 1;
     }
     if (test_kv_cache() != 0) {

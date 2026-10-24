@@ -206,6 +206,8 @@ typedef Dsv4CudaExpertSet *(*fn_expert_set_create)(Dsv4CudaTensor *const *gate, 
                                                    Dsv4CudaTensor *const *down, int count,
                                                    Dsv4CudaTensor *shared_gate, Dsv4CudaTensor *shared_up,
                                                    Dsv4CudaTensor *shared_down);
+typedef int             (*fn_expert_bank_slots)(int experts);
+typedef long long       (*fn_expert_bank_slot_bytes)(int hidden, int intermediate);
 typedef Dsv4CudaExpertSet *(*fn_expert_bank_create)(int count, int hidden, int intermediate, int device,
                                                     Dsv4CudaTensor *shared_gate, Dsv4CudaTensor *shared_up,
                                                     Dsv4CudaTensor *shared_down);
@@ -326,6 +328,8 @@ static struct {
     fn_moe_activation  moe_activation;
     fn_expert_set_create expert_set_create;
     fn_expert_bank_create expert_bank_create;
+    fn_expert_bank_slots expert_bank_slots; /* optional (older DLLs: 256 only) */
+    fn_expert_bank_slot_bytes expert_bank_slot_bytes; /* optional (older DLLs) */
     fn_expert_bank_upload expert_bank_upload;
     fn_expert_bank_set_shared expert_bank_set_shared;
     fn_expert_bank_upload_tp2 expert_bank_upload_tp2;
@@ -523,6 +527,8 @@ static int dsv4_cuda_resolve(const char *dllname){
      * the engine probes this and simply stays on synchronous attaches. */
     g_dsv4.stream_drain = (fn_stream_drain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_stream_drain");
     g_dsv4.expert_bank_upload_aux = (fn_expert_bank_upload_aux)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_upload_aux");
+    g_dsv4.expert_bank_slots = (fn_expert_bank_slots)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slots");
+    g_dsv4.expert_bank_slot_bytes = (fn_expert_bank_slot_bytes)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slot_bytes");
     g_dsv4.backend_name = (fn_backend_name)GetProcAddress(g_dsv4.dll, "dsv4_cuda_backend_name");
     _Pragma("GCC diagnostic pop")
     return 1;
@@ -951,6 +957,23 @@ Dsv4CudaExpertSet *dsv4_cuda_expert_set_create(Dsv4CudaTensor *const *gate, Dsv4
                                                Dsv4CudaTensor *shared_down){
     if(!g_dsv4.available) return NULL;
     return g_dsv4.expert_set_create(gate, up, down, count, shared_gate, shared_up, shared_down);
+}
+
+int dsv4_cuda_expert_bank_slots(int experts){
+    if(g_dsv4.available && g_dsv4.expert_bank_slots) return g_dsv4.expert_bank_slots(experts);
+    return experts >= 1 && experts <= 256 ? 256 : 0;
+}
+
+long long dsv4_cuda_expert_bank_slot_bytes(int hidden, int intermediate){
+    if(g_dsv4.available && g_dsv4.expert_bank_slot_bytes)
+        return g_dsv4.expert_bank_slot_bytes(hidden, intermediate);
+    /* Older DLL: size the slot like the larger, DeepGEMM flavour (its packed
+     * scale copies double the scale bytes) — the engine only uses this to keep
+     * VRAM free for the bank, so erring high is the safe side. */
+    if(hidden < 1 || intermediate < 1) return 0;
+    long long scales = 2LL * intermediate * (hidden / 32) + (long long)hidden * (intermediate / 32);
+    return (long long)intermediate * hidden + (long long)hidden * (intermediate / 2) + 2 * scales +
+           3 * 2 * (long long)sizeof(void *);
 }
 
 Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count, int hidden, int intermediate, int device,

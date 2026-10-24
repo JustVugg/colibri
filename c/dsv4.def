@@ -64,7 +64,9 @@ EXPORTS
     dsv4_cuda_rmsnorm
     dsv4_cuda_moe_activation
     dsv4_cuda_expert_set_create
+    dsv4_cuda_expert_bank_slots
     dsv4_cuda_expert_bank_create
+    dsv4_cuda_expert_bank_slot_bytes
     dsv4_cuda_expert_bank_upload
     dsv4_cuda_expert_bank_set_shared
     dsv4_cuda_expert_bank_upload_tp2

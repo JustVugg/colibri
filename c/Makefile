@@ -1306,15 +1306,21 @@ cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_fo
 
 
 # The DeepSeek V4 kernels on their own: dense, batched attention and routed MoE
-# against the CPU reference in each test. Needs a GPU, so CI compiles it via
-# gpu-compile rather than running it.
-dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
+# against the CPU reference in each test, then the generic build's kernel
+# variants (expert-major vs per-route MoE, warp vs block dense batch) against
+# each other bit for bit. Needs a GPU, so CI runs none of it; it does not
+# build these tests either, only backend_cuda_dsv4.cu itself.
+dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c tests/test_dsv4_generic_bitwise_cuda.c tests/test_dsv4_bank_bytes_cuda.c backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
+	$(CC) $(CFLAGS) tests/test_dsv4_bank_bytes_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_bank_bytes_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_bank_bytes_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_dense_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_attention_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_attention_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_attention_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_moe_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_moe_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_moe_cuda_test$(EXE)
+	$(CC) $(CFLAGS) tests/test_dsv4_generic_bitwise_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_generic_bitwise_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_generic_bitwise_cuda_test$(EXE)
 
 # Pure-CPU unit tests for the two headers the kernels consume. No GPU, no model.
 tests/test_dsv4_mhc$(EXE): tests/test_dsv4_mhc.c

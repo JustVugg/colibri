@@ -735,6 +735,23 @@ int coli_deepseek_v4_expert_store_open_base(
  * Alternative registered ExpertStore backends safely ignore the request. */
 void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer);
 
+/* The CUDA expert bank (COLI_CUDA_MOE_BATCH=1 prefill) reads through
+ * lookup_uncounted, a lookup that leaves the routing books alone, and keeps the
+ * books for one chunk's routing on `layer` (`count` expert ids, each token's
+ * top-k as the router returned them): each member of its union once, in
+ * ascending order as the CPU union looks them up. touch_union, before the
+ * bank's reads, gives the members the RAM cache holds the recency touch a hit
+ * gives; note_union, once the chunk is done, counts each member the way a
+ * lookup counts it. Neither leases, reads, inserts nor evicts. Another
+ * ExpertStore backend gets a plain lookup and no books. */
+int coli_v4_expert_store_lookup_uncounted(ColiExpertStore *store,
+                                          ColiExpertKey key,
+                                          ColiExpertView *view);
+void coli_v4_expert_store_touch_union(ColiExpertStore *store, int layer,
+                                      const int *ids, int count);
+void coli_v4_expert_store_note_union(ColiExpertStore *store, int layer,
+                                     const int *ids, int count);
+
 /* Exclusive RAM/VRAM (vk_tier.h's vkt_ram_first): when set, a full RAM cache gives up
  * first a slot whose expert the device holds, and reports it through ram_gave. The
  * store's eviction reads them in every build; only a Vulkan one sets them. */
@@ -1239,6 +1256,13 @@ extern void (*coli_v4_test_expert_wait_hook)(ColiExpertKey key);
 extern uint64_t coli_v4_test_fp4_batch_calls;
 extern uint64_t coli_v4_test_expert_victim_probes;
 int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key);
+/* One layer's routing books: usage, HITS and heat per expert, the request
+ * clock and the active pins (-1 past the pin ramp); returns the pin slot count
+ * (-1: not the hot store). */
+int coli_v4_test_expert_books(ColiExpertStore *store, int layer,
+                              uint64_t *usage, unsigned char *hit,
+                              unsigned char *heat, uint64_t *requests,
+                              int *pins);
 void coli_v4_test_reset_direct_io_stats(void);
 uint64_t coli_v4_test_direct_reads(void);
 uint64_t coli_v4_test_direct_fallbacks(void);
