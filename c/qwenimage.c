@@ -1055,9 +1055,9 @@ static int engine_prefix(Engine *e, const char *prompt, float **emb_out, int *L_
     return 0;
 }
 
-/* Generates one image. rgba is [height][width][4]. Returns 0, or -1 with msg. */
-static int engine_generate(Engine *e, const char *prompt, int width, int height, int steps, uint64_t seed,
-                           uint8_t *rgba, double timings[3], const Progress *pg, char *msg, size_t msgn){
+/* Generates one image, optionally conditioned with strength. rgba is [height][width][4]. Returns 0, or -1 with msg. */
+static int engine_generate_edit(Engine *e, const char *prompt, int width, int height, int steps, uint64_t seed,
+                                double strength, uint8_t *rgba, double timings[3], const Progress *pg, char *msg, size_t msgn){
     double t0 = now_s();
     int gh = height / 16, gw = width / 16, N = gh * gw, C = e->dit.in_ch;
     emit_progress(pg, "encode", 0, steps, t0);
@@ -1066,11 +1066,19 @@ static int engine_generate(Engine *e, const char *prompt, int width, int height,
     double t1 = now_s();
     float *lat = fmalloc((size_t)N * C), *np = fmalloc((size_t)N * C);
     randn(lat, (size_t)N * C, seed);
+    if (strength > 0.0 && strength < 1.0) {
+        for (int64_t k = 0; k < (int64_t)N * C; k++) lat[k] *= (float)sqrt(strength);
+    }
     float *sig = fmalloc(steps + 1), *ts = fmalloc(steps);
     sched_sigmas(&e->sch, steps, N, sig, ts, NULL);
     DitStep s; dit_step_init(&s, &e->dit, &e->prefix, gh, gw);
     int rc = 0;
-    for (int i = 0; i < steps; i++) {
+    int start_i = 0;
+    if (strength > 0.0 && strength < 1.0) {
+        start_i = (int)((1.0 - strength) * steps);
+        if (start_i >= steps) start_i = steps - 1;
+    }
+    for (int i = start_i; i < steps; i++) {
         emit_progress(pg, "denoise", i, steps, t0);
         if (pg && pg->cancelled && pg->cancelled(pg->id)) { snprintf(msg, msgn, "cancelled"); rc = -1; break; }
         double ts0 = now_s();
@@ -1106,6 +1114,11 @@ static int engine_generate(Engine *e, const char *prompt, int width, int height,
     if (timings) { timings[0] = t1 - t0; timings[1] = t2 - t1; timings[2] = t3 - t2; }
     free(lat); free(np); free(sig); free(ts);
     return rc;
+}
+
+static int engine_generate(Engine *e, const char *prompt, int width, int height, int steps, uint64_t seed,
+                           uint8_t *rgba, double timings[3], const Progress *pg, char *msg, size_t msgn){
+    return engine_generate_edit(e, prompt, width, height, steps, seed, 1.0, rgba, timings, pg, msg, msgn);
 }
 
 static int check_size(int w, int h, int steps, char *msg, size_t n){
@@ -1248,6 +1261,7 @@ static int serve_loop(Engine *e, int dw, int dh, int dsteps){
         const char *prompt = j && (v = json_get(j, "prompt")) && v->t == J_STR ? v->str : NULL;
         int w = (int)jnum(j, "width", dw), h = (int)jnum(j, "height", dh), steps = (int)jnum(j, "steps", dsteps);
         uint64_t seed = (uint64_t)jnum(j, "seed", (double)(time(NULL) & 0x7fffffff));
+        double strength = jnum(j, "strength", 1.0);
         if (!j) send_error(id, "bad GEN line (not JSON)");
         else if (!prompt || !*prompt) send_error(id, "empty prompt");
         else if (check_size(w, h, steps, msg, sizeof msg)) send_error(id, msg);
@@ -1256,7 +1270,7 @@ static int serve_loop(Engine *e, int dw, int dh, int dsteps){
             uint8_t *rgba = xmalloc((size_t)w * h * 4);
             double tm[3];
             Progress pg = { id, serve_cancelled, (int)jnum(j, "preview", 0) };
-            if (engine_generate(e, prompt, w, h, steps, seed, rgba, tm, &pg, msg, sizeof msg)) send_error(id, msg);
+            if (engine_generate_edit(e, prompt, w, h, steps, seed, strength, rgba, tm, &pg, msg, sizeof msg)) send_error(id, msg);
             else {
                 printf("IMAGE {\"id\":\""); json_escape_out(id);
                 printf("\",\"width\":%d,\"height\":%d,\"channels\":4,\"bytes\":%lld,\"seed\":%llu,\"steps\":%d,"
