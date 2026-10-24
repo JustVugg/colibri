@@ -81,9 +81,9 @@ the setup:
 
 1. **looks at your machine**: RAM, free disk, CPU and GPUs;
 2. **recommends a model that fits**: the part of the model that always stays in
-   RAM, plus a minimum cache of experts, must fit in your RAM, and the download
-   on your disk;
-3. **gets the engine**: it builds it for your machine when a compiler is there,
+   RAM, plus a minimum cache of experts, must fit in your RAM, and the downloaded
+   model must fit in your disk.
+4. **gets the engine**: it builds it for your machine when a compiler is there,
    otherwise it downloads the prebuilt one, which runs on the CPU and, on Linux
    and Windows, on a Vulkan GPU too. It builds
    for your GPU when that pays: CUDA for an NVIDIA card on Linux when the CUDA toolkit is installed,
@@ -92,9 +92,9 @@ the setup:
    (Qwen3.6, Qwen3-Coder and Qwen3.8-Flash-Next). If a package is missing it
    prints the exact command to install it and carries on with the CPU; run the
    setup again afterwards and it rebuilds for the GPU;
-4. **downloads the model** with progress and resume: stop it whenever you like,
+5. **downloads the model** with progress and resume: stop it whenever you like,
    run it again and it continues where it stopped;
-5. **starts colibri and opens the dashboard** in your browser, and prints the
+6. **starts colibri and opens the dashboard** in your browser, and prints the
    addresses other apps can use:
 
 ```
