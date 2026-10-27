@@ -198,6 +198,9 @@ static inline int coli_v4_vk_fp8(float *output, const ColiTensorView *weight,
 }
 #endif
 
+/* C only: ggml_quants.h's type table uses C99 designated array initializers,
+ * which C++ rejects, and no C++ includer uses the GGUF helpers below. */
+#ifndef __cplusplus
 #include "ggml_view.h"   /* coli_ggml_matmul: a GGUF matrix on the CPU */
 
 /* A GGUF's dense matrix on the CUDA device the expert tier opened (deepseek_v4.c, v4_cu_ggml):
@@ -223,5 +226,6 @@ static inline int coli_v4_ggml_mm2(float *y1, const ColiTensorView *w1, float *y
 #endif
     return coli_ggml_matmul2(y1, w1, y2, w2, x, S);
 }
+#endif /* !__cplusplus */
 
 #endif
