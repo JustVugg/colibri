@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "hypothesis": "A prompt chunk of the qwen36 CUDA chain stages a layer's experts from the tier's host pool in one buffer, and the copy of the next staged layer waits until this layer's experts were read, so a layer's MoE and the next copy run in line. With the residents spread over the layers (a Colab T4 holding 6605 of the 10240 experts: 91 experts to copy a layer, the copy and the layer's kernels ~15 ms each) two staging places, the staged layers taking them in turn, let the copy run beside the layer before: the 512-token prompt alone gets faster, and the logits are what they were.",
+  "commit": "7ef075096af0552f026e46585df276fb96935b00",
+  "model": "q36",
+  "command": "bench.c built against c/ (cd c && make <objects> CUDA=1 CUDA_ARCH=sm_75, as bench build does); COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close ./qwen36-bench --model <model> --text promessi_sposi.txt --lengths 512 --gen 1 --teacher",
+  "prompt_hash": "f53e0d80cb2d4492",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.00GHz (4 cores / 8 threads, 38.5 MiB L3) + NVIDIA Tesla T4 (15360 MiB, sm_75, up to PCIe Gen3 x16)",
+    "ram": "51 GiB",
+    "storage": "Google Colab VM disk (the model downloaded to /content before the runs)",
+    "os": "Ubuntu 24.04.4 LTS, Linux 6.6.159+ x86_64 (Google Colab, T4 high-RAM), CUDA 13.0 (nvcc V13.0.88), driver 580.82.07, gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "COLI_CUDA": "1",
+      "COLI_GPUS": "0",
+      "CUDA_EXPERT_GB": "auto",
+      "OMP_WAIT_POLICY": "ACTIVE",
+      "OMP_PROC_BIND": "close",
+      "engine_build": "7ef07509 (the spread residents); commit 7ef075096af0552f026e46585df276fb96935b00; harness qwen36_bench.c edbe7ddcc146; CUDA",
+      "prompt_tokens": 512,
+      "decode_steps": 0,
+      "heat_file": "none"
+    },
+    "samples": {
+      "tok_s": [
+        519.41,
+        518.7,
+        519.18,
+        520.96
+      ]
+    },
+    "median_tok_s": 519.295,
+    "quality": {
+      "method": "the fingerprint of every logit is the same in every run of each version (summary.md)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "solo.txt",
+      "sha256": "b4c34574310c24899d2ee2e72410856b485e62c8c4b8fbbb3864139ac0a56814"
+    }
+  },
+  "trial": {
+    "config": {
+      "COLI_CUDA": "1",
+      "COLI_GPUS": "0",
+      "CUDA_EXPERT_GB": "auto",
+      "OMP_WAIT_POLICY": "ACTIVE",
+      "OMP_PROC_BIND": "close",
+      "engine_build": "808b1757 (7ef07509 + two staging places); commit 808b17579ecd0085ef5ff0959bf2fb3d32fe775e; harness qwen36_bench.c edbe7ddcc146; CUDA",
+      "prompt_tokens": 512,
+      "decode_steps": 0,
+      "heat_file": "none"
+    },
+    "samples": {
+      "tok_s": [
+        658.39,
+        655.44,
+        656.12,
+        660.96
+      ]
+    },
+    "median_tok_s": 657.255,
+    "quality": {
+      "method": "the fingerprint of every logit is the same in every run of each version (summary.md)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "solo.txt",
+      "sha256": "b4c34574310c24899d2ee2e72410856b485e62c8c4b8fbbb3864139ac0a56814"
+    }
+  },
+  "outcome": "improvement"
+}

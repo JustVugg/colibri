@@ -113,7 +113,10 @@ static int g_cuda_chain = 0;     /* COLI_CUDA_CHAIN asked for it and the chain i
 static int q38cc_env_on(void) { const char *e = getenv("COLI_CUDA_CHAIN"); return e && *e ? *e == '1' : g_q38_gguf; }
 static int q38cc_rows_env(void) {
     const char *e = getenv("COLI_CUDA_CHAIN_ROWS");
-    int r = e && *e ? atoi(e) : 512;   /* a chunk reads every pooled expert over the bus once: 256 rows read a 507-token prompt's twice */
+    /* a chunk reads every pooled expert over the bus once: at 512 rows a 1628-token prompt read them four times
+     * (90.8 GB on an RTX 4090), at 2048 once (22.8 GB), 148.7 -> 352.4 tok/s. Each row keeps ~0.6 MiB of the
+     * card for the chain (q38cc_reserve_bytes): 2048 rows hold 0.9 GiB more than 512, fewer experts there */
+    int r = e && *e ? atoi(e) : 2048;
     return r < 1 ? 1 : r > 8192 ? 8192 : r;
 }
 static void q38cc_fatal(const char *what) {

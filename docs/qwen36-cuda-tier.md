@@ -23,7 +23,13 @@ more GPUs and computed there through the existing shared CUDA backend
   so a long-lived process can replace experts from an old workload instead of
   permanently freezing its initial hot set. A parallel **warmstart** fills the per-device
   budget before the first token — ordered by a persisted heat table
-  (`HEAT_FILE`) when present, so a second run starts fully placed.
+  (`HEAT_FILE`) when present, so a second run starts fully placed. Without one
+  it takes expert 0 of every layer, then expert 1, and so on, so each layer
+  holds its share: in index order the card held whole layers (on a Colab T4,
+  layers 0-24 and part of 25), and a prompt chunk copied the other layers'
+  experts over the bus one layer after another, after 25 layers with the bus
+  idle (a Colab T4's 512-token prompt, after a 64-token one and its decode,
+  reads 14 % faster: `docs/experiments/qwen36-tier-spread-2026-10-27`).
 - **Decode:** per (token, layer) the resident experts are issued as async
   groups on all devices (`coli_cuda_expert_group_issue/take`); VRAM misses
   fall back to the CPU and overlap with the in-flight groups, as does the
@@ -367,7 +373,11 @@ both the same way:
   The host routes, runs the routed experts through the tier (`moe_ex` routed only) and
   hands the sum up. Frame A2, not waited for: the shared expert and its gate, on the
   chain's stream while the tier's groups run on the backend's. The last frame runs the
-  final norm and lm_head on the last row, or on every row of a speculative verify.
+  final norm and lm_head on the last row, or on every row of a speculative verify; the
+  logits are written in device memory and one copy brings them to the host's buffer.
+  (Written into it directly, one float per warp over the bus, the head took 7.4 ms of a
+  13.5 ms step on an RTX PRO 4000. On an L4 the step does not get faster and the extra
+  copy costs 0.1 ms.)
 
 **What it needs.** Every projection of every layer, the shared expert's three matrices
 and lm_head on one card: `COLI_CUDA_CHAIN=1` offers the shared expert to the placer
@@ -404,14 +414,15 @@ the fake's host-side table (`tests/qwen36_fake_cuda.h`, the same arithmetic as t
 kernels): a prompt and decode tokens give the CPU path's logits (max diff 2e-5 of 20),
 the host state is untouched while the chain runs and reads back as the CPU path's, the
 K/V rows reach the host cache, a reset and a CPU step in between continue from the right
-state, a verify's three rows and the rollback of a rejected draft, a frame that fails
-(the state rebuilt, the step and the rest on the CPU, the same logits), and a backend
-without the table. `tests/test_cuda_chain.cu` (`make cuda-chain-check CUDA=1`, needs a
-device; `gpu-compile` builds it) checks every op on a real card against the same CPU
-references: buffers and frames, int8 and f32 matmuls at offsets, the four norms, RoPE,
-causal GQA with the gate and a selection list, the convolution in both orders with its
-ring and snapshot, the recurrence at KD 8 and 128 with both gates, every element-wise
-op, and a failed launch marking the device lost.
+state, a verify's three rows and the rollback of a rejected draft, the head's logits
+computed on the card and copied down (a prompt and a verify read in chunks of three and
+two rows), a frame that fails (the state rebuilt, the step and the rest on the CPU, the
+same logits), and a backend without the table. `tests/test_cuda_chain.cu`
+(`make cuda-chain-check CUDA=1`, needs a device; `gpu-compile` builds it) checks every op
+on a real card against the same CPU references: buffers and frames, int8 and f32 matmuls
+at offsets, the four norms, RoPE, causal GQA with the gate and a selection list, the
+convolution in both orders with its ring and snapshot, the recurrence at KD 8 and 128 with
+both gates, every element-wise op, and a failed launch marking the device lost.
 
 **Measured** (RTX 3070 alone, Qwen3.6-35B-A3B int4, the trunk in VRAM by `COLI_PLACE=auto`,
 expert tier at 81-82 % hits, the usual 49-token prompt, 200 new tokens, two runs each):
@@ -600,6 +611,17 @@ conversation the history fits pays for every swap -- a promoted expert displaces
 the history still routes to -- and gains little; one away from it, at 40-65 % hits, does not
 reach the brake for hundreds of tokens. `0` brakes never.
 
+The brake holds only where the warm start's set came from a history: a heat file with this
+model's shape, its layers and experts (`qt_chain_history`). Without one the set is the experts
+in index order, no conversation's, and the brake starts off (the chain's startup line says so).
+On a Google Colab T4 (6605 of 10240 experts in VRAM, OMP 4 threads, no heat file) the 41-token
+story at 75 held at 78-79 % hits, 24.4 / 23.9 ms a token over 200 / 600 tokens; without the
+brake it reached 86 / 94 %, 22.6 / 19.7 ms. Through the server's path on another such T4 a chat
+of 5 turns (1458 answer tokens, no heat file) took 29.4 s instead of 36.7. On a rented RTX 3070
+(EPYC 7B13, 2654 experts in VRAM, OMP 12 threads) the same runs differ by 0.6 and 2.0 % (17.5 /
+14.8 ms at 75 against 17.6 / 14.5), and the chat's session by less than 1 %.
+`COLI_CUDA_CHAIN_PROMOTE_HITS`, when set, wins either way.
+
 **Measured** (RTX 3070 alone, Qwen3.6-35B-A3B int4 per row, `COLI_PLACE=auto
 COLI_TRUNK_PROBE=0 CUDA_EXPERT_GB=auto`, OMP 12 threads, the heat file frozen; decode ms a
 token = (N / speed - TTFT) / (N - 1)):
@@ -676,11 +698,32 @@ a layer's non-resident experts into VRAM and runs them with the residents:
   weight k low and k + 32 high, both v + 8). No second copy in RAM, no conversion. On when
   the RAM holds every expert (no slot is ever recycled), one card, int4-g64 and the f16
   GEMMs (`coli_cuda_planar_rows`).
-- The staging (`cc_fetch`, `cc_fetch_wait`, `cc_fetch_done`): one layer's worth of VRAM,
-  the most non-resident experts any layer has, filled on a copy stream of its own. The copy
-  of the next such layer starts once the layer before has run its experts' GEMMs, so it
-  overlaps that layer's sum and the next layer's attention; one buffer, because the copy
-  is the longer of the two and a second one would buy little.
+- The pool follows the residents (`qt_chain_host_follow`). The chain's promotions and the
+  tier's LFRU swaps move experts between the card and the RAM after the warm start; before a
+  prompt chunk of 128 rows or more (`Q36CC_FOLLOW_ROWS`), the experts that left the card are
+  page-locked into the pool and those that came in are released, so the pool is the
+  non-residents and nothing else. Without it an expert that left the card was in neither, and
+  a chunk's layer holding one went to the host's step whole. It costs about 0.3 ms for each
+  expert moved on the T4 below, and after a long answer that is more than the copies give
+  back to a chunk of a few dozen rows: a smaller chunk leaves the pool behind for the next
+  large one, its layers holding an expert that left on the host's step as before. An expert
+  whose page-lock is refused stays out until the next follow.
+- The staging (`cc_fetch`, `cc_fetch_wait`, `cc_fetch_done`): VRAM for the most
+  non-resident experts any layer has, filled on a copy stream of its own. The copy of the
+  next such layer starts once the layer before has run its experts' GEMMs, so it overlaps
+  that layer's sum and the next layer's attention. With whole layers off the card (the
+  warm start in index order, before the spread residents) a staged layer has 256 experts
+  to copy, the copy is the longer of the two and one place is all there is. With the
+  residents spread over the layers (91 experts a layer on a Colab T4, the copy and the
+  layer's kernels ~15 ms each) the buffer has two places, the staged layers taking them
+  in turn (`cc_fetch_at`, `cc_fetch_wait_at`, `cc_fetch_done_at`, a pair of events each):
+  a layer's copy runs beside the layer before's experts. Two places only where both fit
+  in the `n_experts` experts `q36cc_rows_max` sets aside for the staging
+  (`2 * hmax <= n_experts`), so the residents and the chunk size are what they were; the
+  memory left for the KV mirrors is one place smaller than with one place (161 MB on the
+  T4). The line `stages the host pool's experts in` says how many places and how many
+  experts each. A staged table that sets no places (a GGUF's, which writes none) has one
+  (`q36cc_places`).
 - The prompt chunk's table points each staged expert at its place in the staging; a
   decode step keeps the table of the residents and the CPU's share (a row at a time,
   the CPU's kernel is faster than a copy).
@@ -706,6 +749,35 @@ after a 2000-token prompt (200 tokens scored): 1.7567 nats every expert in VRAM,
 host pool, 1.7555 the host's step. The staging takes about 450 MB of VRAM here;
 without room for it the chain says so once and the chunk keeps the host's step.
 `COLI_CUDA_HOST_POOL=0` keeps the host's step for a prompt's non-resident experts.
+
+**After a conversation** (the pool following the residents): a Google Colab T4 high-RAM VM
+(15 GiB, 6605 of 10240 experts on the card under `auto`, 3635 in the host pool), the
+record's harness (`bench.c`), a warm-up and 4 runs each in A B B A order, min-max of the runs
+(record: `docs/experiments/qwen36-cuda-host-pool-follow-2026-10-26/`). A 64-token prompt and
+its 32 teacher-forced steps, then a 512-token prompt in the same process:
+
+| | 512-token prompt, after | 64-token prompt | decode after 64 / 512 |
+|---|---|---|---|
+| the pool as the warm start left it (before) | 179.19-180.94 tok/s | 73.78-79.01 | 38.85-40.09 / 46.81-47.73 |
+| the pool following the residents | 436.44-441.96 | 76.09-77.90 | 39.99-40.50 / 47.28-47.56 |
+
+Two conversations replayed through the server's path (`bench.c --session`, each answer
+teacher-forced), the time to the first token of every turn summed, and of the turn after the
+longest answer:
+
+| | agent, 8 turns: all / turn 8 (35 tokens) | chat, 5 turns: all / turn 3 (36 tokens) |
+|---|---|---|
+| before | 46.7-47.1 s / 0.92-0.94 s | 3.4-3.5 s / 0.76-0.77 s |
+| the pool following the residents | 18.7-18.8 s / 0.90-0.92 s | 3.4-3.5 s / 0.76-0.77 s |
+
+The 64-token run, its 32 steps with promotions included, gives the same logits in every run of
+both; after 512 the teacher-forced loss over the next 32 tokens is 2.9578 before and 2.9328
+with the pool following, the layers that held an expert that left the card now in the chain's
+frame on its f16 GEMMs instead of the host's path. No chunk of the chat reads 128 tokens: it
+runs as before, with the same logits. In one run each with a diagnostic line (`diag.txt` in
+the record) the follow took 58 ms of the 512 prompt's 1.14 s (98 experts joining the pool, 98
+leaving it), and 0.08 to 147 ms before the agent's prompts, 365 ms in all. `threshold.txt` has
+the runs behind the 128 rows.
 
 **A GGUF's experts** take the same road. When the tier takes them (`qt_init_gguf`), the
 engine holds the file's rows in RAM instead of the rows interleaved by 16, so the tier and

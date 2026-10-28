@@ -1,0 +1,422 @@
+# qwen36 CUDA chain, no promotion brake without a heat file: raw evidence (2026-10-26)
+# A rented RTX 3070 (vast.ai): AMD EPYC 7B13 64-Core Processor (128 threads, 30.7 of them and 242 GiB of RAM to the container) + NVIDIA GeForce RTX 3070 (8192 MiB, sm_86, PCIe Gen4 x16); Ubuntu 24.04.1 LTS, CUDA 12.8, driver 595.71.05.
+# Model: Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 (int4, 64-input groups; 40 layers of 256 experts); CUDA_EXPERT_GB=auto with COLI_PLACE=auto COLI_TRUNK_PROBE=0 OMP_NUM_THREADS=12 on every run (the owner's
+#   settings for this card in docs/qwen36-cuda-tier.md: with 12 threads the trunk probe would keep the
+#   trunk on the CPU): 2654 of the 10240 experts on the card.
+# v0 = origin/dev 77530b49; v1 = 77530b49 + this change as measured (ecb64b31, c/ git tree
+#   cbc647ec999dd613b3af53f39e596a4be90df6d6); this commit's c/ differs from it only in a comment, rewritten
+#   after the runs (normal.txt gives the diff).
+# Harness: bench.c beside this file (sha256 edbe7ddcc146af34d10c3d8a871fb1d3b93404537e374f9bc1504cf2c6886c17), built against each version's c/ by bench's driver.
+# A warm-up run of v0 (not counted), then v0 v1 v1 v0 v0 v1 v1 v0, each once the card was under 70 C with no
+#   thermal clock event, then 60 s of rest.
+# The base (as normal.txt), then the agent and the chat (as sessions.txt): bench's setup, every run's
+#   CSV in the order they ran, bench's report; each run's stderr and steps file by their sha256.
+
+===== base: setup
+bench 482e1711d589; engine qwen36; Linux (AMD EPYC 7B13 64-Core Processor, NVIDIA GeForce RTX 3070); 2026-10-26 14:30
+model /content/q36; text promessi_sposi.txt (sha256 f53e0d80cb2d4492); lengths 64,512; gen 32; teacher-forced
+runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+v0 dev: /content/fase3/bin-dev/qwen36-bench (commit 77530b49ddd2f4e6ad1b3bb52500491e0c8ed9bb; harness qwen36_bench.c edbe7ddcc146; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close COLI_PLACE=auto COLI_TRUNK_PROBE=0 OMP_NUM_THREADS=12
+   command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/local/cuda/lib64 COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close COLI_PLACE=auto COLI_TRUNK_PROBE=0 OMP_NUM_THREADS=12 /content/fase3/bin-dev/qwen36-bench --model /content/q36 --text /content/bench/promessi_sposi.txt --lengths 64,512 --gen 32 --teacher --steps /content/fase3/misura/v0-runN.steps
+v1 pr: /content/fase3/bin-pr/qwen36-bench (commit ecb64b31e417fc3fc5d4884e662c47f95dcfa9f1; harness qwen36_bench.c edbe7ddcc146; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close COLI_PLACE=auto COLI_TRUNK_PROBE=0 OMP_NUM_THREADS=12
+   command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/local/cuda/lib64 COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close COLI_PLACE=auto COLI_TRUNK_PROBE=0 OMP_NUM_THREADS=12 /content/fase3/bin-pr/qwen36-bench --model /content/q36 --text /content/bench/promessi_sposi.txt --lengths 64,512 --gen 32 --teacher --steps /content/fase3/misura/v1-runN.steps
+
+===== base: warmup.csv (sha256 d007e8f738e3c53343032d70b87c3cb21d639b7f1524988342dac92762b2c509); warmup.err sha256 b3458d283d44b0b817b8650cabd90f19da961e71367848d4ee08921df1c00fb0; warmup.steps sha256 115685377022f67f5685e7a90dc7683664c9bf74466cc1129d6c5c30aeef28fc
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.671,95.33,32,47.1,48.044,0,0.00,48e115186a25d2c3,5cb23346ab6be1d8,2.69393,0.469
+512,512,1.395,366.95,32,19.9,58.830,0,0.00,da5030d5c36aa22e,7a8848450b863c49,2.96698,0.438
+===== base: v0-run1.csv (sha256 2af80f93efff6e5ba476cf3d82fd8c6f0813fdca456a92e3463952f5f94862a2); v0-run1.err sha256 b9a10ab63caceb19d5a77415315af9e87c14ab650783370b8bcd736f2d4964ae; v0-run1.steps sha256 356684e63d79d143c89022a099231745bc4685b29354dbe12ac9303a81330fa4
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.671,95.32,32,47.4,47.792,0,0.00,48e115186a25d2c3,5cb23346ab6be1d8,2.69393,0.469
+512,512,1.385,369.80,32,19.8,58.690,0,0.00,da5030d5c36aa22e,7a8848450b863c49,2.96698,0.438
+===== base: v1-run1.csv (sha256 c8ef1517aa1192bf4fd116d267cfb5a7588b68e70594aeea125a67bf0eb1cfee); v1-run1.err sha256 17c7256d2b4990c46b63177ecff92c68f146218c02fc977eeba08c9a33a0cd48; v1-run1.steps sha256 77e4d7dc9a4afcd3eeb868180edc9adf7f68411b8500641fa69cf645f1cdaa4c
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.674,94.95,32,46.7,47.990,0,0.00,48e115186a25d2c3,5cb23346ab6be1d8,2.69393,0.469
+512,512,1.422,360.00,32,19.7,58.687,0,0.00,d2f3e742b947671d,7a8848450b863c49,2.96683,0.438
+===== base: v1-run2.csv (sha256 00a85dfd26dd0009787fd1ab5d4616862c7925d6e686a0d3f61ffd39a832f441); v1-run2.err sha256 937e5916e93cd738f40f745d2fdcc7271c813f6f0de230cc3f438a9b8cfb7dde; v1-run2.steps sha256 173f36517ef44c3350532fce73ce085fba8b62b7c45de7de0634d148d1cb8b29
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.674,94.90,32,48.5,47.963,0,0.00,48e115186a25d2c3,5cb23346ab6be1d8,2.69393,0.469
+512,512,1.381,370.74,32,20.0,57.826,0,0.00,d2f3e742b947671d,7a8848450b863c49,2.96683,0.438
+===== base: v0-run2.csv (sha256 bf99b0d78752e14ca980cc63dd80ea1a388652db9214a048af01b6428ce6366d); v0-run2.err sha256 567a7a57387e9a7aac4232bddab0264a2922f2e2c073124731ddd8c156cab454; v0-run2.steps sha256 3d04c5633c7c29e4e982d921e37c7a30026d1435c6bea64e12683429194e1706
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.670,95.49,32,46.9,47.773,0,0.00,48e115186a25d2c3,5cb23346ab6be1d8,2.69393,0.469
+512,512,1.382,370.45,32,20.0,58.644,0,0.00,da5030d5c36aa22e,7a8848450b863c49,2.96698,0.438
+===== base: v0-run3.csv (sha256 2b234b2d79564cfca2dff014aea3c525b664a8123f4aa0a9dd59c6ebed279297); v0-run3.err sha256 49bf4d87ea4c19807ebee3550e9a3893cfe552c73028f9b79d6951aebb376227; v0-run3.steps sha256 70554d426d16555563e1312fae0a2125a2265597b97afd80c33870bc30269d30
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.670,95.53,32,47.3,48.026,0,0.00,48e115186a25d2c3,5cb23346ab6be1d8,2.69393,0.469
+512,512,1.376,372.09,32,20.0,58.651,0,0.00,da5030d5c36aa22e,7a8848450b863c49,2.96698,0.438
+===== base: v1-run3.csv (sha256 6eeb659c183609504a3962ce1e3e0f05f15c7227324881ee81fbf5c1cf835261); v1-run3.err sha256 58b2cd32794054b5940f58828f7b1c4d64d9d99604d793903b6abde8b40d9101; v1-run3.steps sha256 6ec6dc4115ddcb8a5067e40fb32a4e2cc2a597000ca65eaa3b9ea9c36e0a4642
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.673,95.11,32,46.9,47.619,0,0.00,48e115186a25d2c3,5cb23346ab6be1d8,2.69393,0.469
+512,512,1.382,370.47,32,20.1,58.490,0,0.00,da5030d5c36aa22e,7a8848450b863c49,2.96698,0.438
+===== base: v1-run4.csv (sha256 5051da7f23dcd954152e98a8979ea636e55c96890e4de8fd944e657764752e7e); v1-run4.err sha256 bc545b00c7a34119c479ebd6a60ee8c7743e8a4559cf4f09e1a2d31206326960; v1-run4.steps sha256 c37c183bf50cfbb88ca3501c99078f641a203b80762e3c5eee178a6d015c3b7f
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.658,97.34,32,49.5,47.359,0,0.00,48e115186a25d2c3,5cb23346ab6be1d8,2.69393,0.469
+512,512,1.377,371.76,32,20.5,58.787,0,0.00,2ce9065efe62c6c8,7a8848450b863c49,2.95541,0.438
+===== base: v0-run4.csv (sha256 2d15624abee6f85f6a896574cb1e27881748a9a8d195e658b6dc5479dae9dac6); v0-run4.err sha256 365cf4fb5238e32629dd087e66ef9345b544fe4776c607e105fc9d1fb2cd943c; v0-run4.steps sha256 f9d7a47e79075befe8ad0c480aab12414dfbd3cab95f816019c5ddc33cc9c5e5
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.654,97.89,32,49.2,47.395,0,0.00,48e115186a25d2c3,5cb23346ab6be1d8,2.69393,0.469
+512,512,1.379,371.28,32,21.5,57.767,0,0.00,2ce9065efe62c6c8,7a8848450b863c49,2.95541,0.438
+
+===== base: summary (bench's report of the runs above)
+# bench: misura
+
+- bench 482e1711d589; engine qwen36; Linux (AMD EPYC 7B13 64-Core Processor, NVIDIA GeForce RTX 3070); 2026-10-26 14:30
+- model q36; text promessi_sposi.txt (sha256 f53e0d80cb2d4492); lengths 64,512; gen 32; teacher-forced
+- runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+
+## v0 dev: 4 runs (median, min–max)
+
+| tokens | new | prompt tok/s | first step ms | decode tok/s | experts read | reads' s | nll | top1 | fingerprint |
+|---|---|---|---|---|---|---|---|---|---|
+| 64 | 64 | 95.51 (95.32–97.89) | 47 (47–49) | 47.782 (47.395–48.026) | 0 | 0.00 | 2.6939 | 0.469 | 48e115186a25d2c3 |
+| 512 | 512 | 370.87 (369.80–372.09) | 20 (20–22) | 58.648 (57.767–58.690) | 0 | 0.00 | 2.9670 | 0.438 | DIFFERENT between runs: ['2ce9065efe62c6c8', 'da5030d5c36aa22e'] |
+
+peak memory 19855 MiB, model ready in 19.55 s (medians)
+
+decode by steps (step 1 gives the second new word; medians of 4 runs):
+
+| tokens | steps | experts read | decode tok/s | reads' s |
+|---|---|---|---|---|
+| 64 | 2 to 32 | 0 | 47.782 | 0.000 |
+| 512 | 2 to 32 | 0 | 58.647 | 0.000 |
+
+## v1 pr: 4 runs (median, min–max)
+
+| tokens | new | prompt tok/s | first step ms | decode tok/s | experts read | reads' s | nll | top1 | fingerprint |
+|---|---|---|---|---|---|---|---|---|---|
+| 64 | 64 | 95.03 (94.90–97.34) | 48 (47–50) | 47.791 (47.359–47.990) | 0 | 0.00 | 2.6939 | 0.469 | 48e115186a25d2c3 |
+| 512 | 512 | 370.61 (360.00–371.76) | 20 (20–20) | 58.588 (57.826–58.787) | 0 | 0.00 | 2.9668 | 0.438 | DIFFERENT between runs: ['2ce9065efe62c6c8', 'd2f3e742b947671d', 'da5030d5c36aa22e'] |
+
+peak memory 19855 MiB, model ready in 19.48 s (medians)
+
+decode by steps (step 1 gives the second new word; medians of 4 runs):
+
+| tokens | steps | experts read | decode tok/s | reads' s |
+|---|---|---|---|---|
+| 64 | 2 to 32 | 0 | 47.791 | 0.000 |
+| 512 | 2 to 32 | 0 | 58.588 | 0.000 |
+
+## v1 pr against v0 dev (medians; positive = faster)
+
+| tokens | prompt | first step | decode | results |
+|---|---|---|---|---|
+| 64 | -0.5%, ranges overlap | -0.7%, ranges overlap | +0.0%, ranges overlap | same results; nll 2.6939 → 2.6939, top1 0.469 → 0.469 |
+| 512 | -0.1%, ranges overlap | -0.2%, ranges overlap | -0.1%, ranges overlap | same words, logits differ; nll 2.9670 → 2.9668, top1 0.438 → 0.438 |
+
+| tokens | steps | experts read | decode | reads' s |
+|---|---|---|---|---|
+| 64 | 2 to 32 | 0 → 0 | +0.0%, ranges overlap | 0.000 → 0.000 s |
+| 512 | 2 to 32 | 0 → 0 | -0.1%, ranges overlap | 0.000 → 0.000 s |
+
+warm-up (does not count): 64 tokens: prompt 95.33 tok/s, decode 48.044 tok/s; 512 tokens: prompt 366.95 tok/s, decode 58.830 tok/s
+runs not cool: none
+pages written to swap during the measurement: 0, 0 of them in the runs that count
+
+===== agent: setup
+bench 482e1711d589; engine qwen36; Linux (AMD EPYC 7B13 64-Core Processor, NVIDIA GeForce RTX 3070); 2026-10-26 14:43
+model /content/q36; session agente.sess
+runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+v0 dev: /content/fase3/bin-dev/qwen36-bench (commit 77530b49ddd2f4e6ad1b3bb52500491e0c8ed9bb; harness qwen36_bench.c edbe7ddcc146; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close COLI_PLACE=auto COLI_TRUNK_PROBE=0 OMP_NUM_THREADS=12
+   command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/local/cuda/lib64 COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close COLI_PLACE=auto COLI_TRUNK_PROBE=0 OMP_NUM_THREADS=12 /content/fase3/bin-dev/qwen36-bench --model /content/q36 --session /content/bench/sessioni/agente.sess --steps /content/fase3/agente/v0-runN.steps
+v1 pr: /content/fase3/bin-pr/qwen36-bench (commit ecb64b31e417fc3fc5d4884e662c47f95dcfa9f1; harness qwen36_bench.c edbe7ddcc146; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close COLI_PLACE=auto COLI_TRUNK_PROBE=0 OMP_NUM_THREADS=12
+   command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/local/cuda/lib64 COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close COLI_PLACE=auto COLI_TRUNK_PROBE=0 OMP_NUM_THREADS=12 /content/fase3/bin-pr/qwen36-bench --model /content/q36 --session /content/bench/sessioni/agente.sess --steps /content/fase3/agente/v1-runN.steps
+
+===== agent: warmup.csv (sha256 e1e8b7455d9e99c85eac260ee0a877f358decef6facdaba673ae029366060e6e); warmup.err sha256 db3e2d1aaae3d84548332775e6c5daa12399e9c4d690844797ed5f109aef0c81; warmup.steps sha256 41183ded794c706b042fae86bca96665ec68c65a7f392815a7698ed8bbe45157
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,0.904,733.04,57,51.9,44.765,0,0.00,22abb77669aa5df8,a9232a16bd227f2d,1.73742,0.737,0,720,19.34,0,1,0,1
+1954,1234,3.271,377.27,32,23.3,49.044,0,0.00,41ddc946d20d5502,7d6e0f6d44b5cecc,0.02027,1.000,720,1986,19.50,32,1,1,0
+4248,2262,5.569,406.20,87,22.0,50.948,0,0.00,2e2b2710f8e09de8,159540b062b93762,1.11686,0.724,1986,4335,19.56,0,1,0,1
+5741,1406,3.599,390.63,44,21.8,51.134,0,0.00,dbc88a6cad195964,23d625e741190180,0.22184,0.932,4335,5785,19.59,0,1,0,1
+7083,1298,3.617,358.89,54,24.3,49.536,0,0.00,71b53961e8f513fe,24b73c35bded487b,1.09640,0.796,5785,7137,19.65,1,1,0,1
+8041,904,2.373,380.92,24,22.1,50.379,0,0.00,2254c10c0c544b12,331c8c8593842500,0.27646,0.875,7137,8065,19.70,0,1,0,1
+8413,348,1.363,255.25,467,23.5,56.809,0,0.00,32ddeff2a3664b08,c005de8ea3c4e76e,0.84162,0.764,8065,8880,19.75,0,1,0,1
+8915,35,0.711,49.20,186,20.9,58.431,0,0.00,3824cddf14fb7016,1ac06551ca8a243e,0.88650,0.726,8880,9101,19.77,0,0,0,1
+===== agent: v0-run1.csv (sha256 5d9f94cced92f61cece740e32ed5f9b3824fbc96e054f6ec2af1701db9b7488d); v0-run1.err sha256 dad5737f6b7288d80307cbe825b82c2dfccfe5b9e3c298fee1de203f2a4328fd; v0-run1.steps sha256 e548201c28943a6d22d7a692119725036e5ceedc983e9862b1e19dc706855acb
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,0.888,746.29,57,49.9,44.612,0,0.00,22abb77669aa5df8,a9232a16bd227f2d,1.73742,0.737,0,720,19.36,0,1,0,1
+1954,1234,3.260,378.58,32,23.0,48.683,0,0.00,41ddc946d20d5502,7d6e0f6d44b5cecc,0.02027,1.000,720,1986,19.52,32,1,1,0
+4248,2262,5.561,406.76,87,22.0,50.554,0,0.00,2e2b2710f8e09de8,159540b062b93762,1.11686,0.724,1986,4335,19.58,0,1,0,1
+5741,1406,3.588,391.89,44,22.0,51.001,0,0.00,eae4a26fcb8e6d1d,23d625e741190180,0.22324,0.932,4335,5785,19.61,0,1,0,1
+7083,1298,3.631,357.44,54,24.4,49.436,0,0.00,77a65d6a4932f804,24b73c35bded487b,1.09923,0.796,5785,7137,19.67,1,1,0,1
+8041,904,2.368,381.72,24,24.9,50.522,0,0.00,35e8d82b289bf913,331c8c8593842500,0.29555,0.875,7137,8065,19.72,0,1,0,1
+8413,348,1.357,256.43,467,24.0,56.330,0,0.00,0597eab45fd6c5d4,c005de8ea3c4e76e,0.83922,0.756,8065,8880,19.76,0,1,0,1
+8915,35,0.714,48.99,186,21.0,57.548,0,0.00,d65b3ff1827814eb,1ac06551ca8a243e,0.88096,0.726,8880,9101,19.78,0,0,0,1
+===== agent: v1-run1.csv (sha256 16f78c5786d2097b259a37f21ce6c32025aa512ed0990c63272d0c74417d0043); v1-run1.err sha256 84b8c9be240d58d5e48440c6fdf3ab2771b398f2ee2ff5589c4105d3872bba05; v1-run1.steps sha256 7edf14c0528dcf29b858e9694f3854dcadc1ad3a14cd7f226a1ed446656009bd
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,0.897,739.34,57,50.2,44.618,0,0.00,22abb77669aa5df8,a9232a16bd227f2d,1.73742,0.737,0,720,19.37,0,1,0,1
+1954,1234,3.277,376.57,32,23.2,48.775,0,0.00,8928ff48b16a396b,7d6e0f6d44b5cecc,0.01985,1.000,720,1986,19.53,32,1,1,0
+4248,2262,5.594,404.39,87,21.7,50.573,0,0.00,eb6bf92dfa499008,159540b062b93762,1.11399,0.713,1986,4335,19.58,0,1,0,1
+5741,1406,3.610,389.45,44,22.0,50.886,0,0.00,0128927ad0aeef08,23d625e741190180,0.22144,0.932,4335,5785,19.62,0,1,0,1
+7083,1298,3.613,359.21,54,24.2,49.484,0,0.00,3dbe0a53c7f29620,24b73c35bded487b,1.09402,0.796,5785,7137,19.67,1,1,0,1
+8041,904,2.383,379.39,24,21.9,50.725,0,0.00,889c53827aecf467,331c8c8593842500,0.29119,0.875,7137,8065,19.72,0,1,0,1
+8413,348,1.359,256.05,467,23.4,56.427,0,0.00,a68745729a9e2117,c005de8ea3c4e76e,0.84214,0.762,8065,8880,19.76,0,1,0,1
+8915,35,0.725,48.27,186,20.6,58.063,0,0.00,6905f22567112a60,1ac06551ca8a243e,0.88511,0.726,8880,9101,19.79,0,0,0,1
+===== agent: v1-run2.csv (sha256 ae8225325fd19a856ecd29817c372a1c6524db9172ab7d579df9ff92c7447743); v1-run2.err sha256 31013322266cf646135f6fe6b3325c51ee6f6237d22ce6d3c6e6aa1bc0f939f9; v1-run2.steps sha256 f3c3c0d56bbe56460154d7695acdd0cee689e83606195684cd97480f58156882
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,0.895,740.65,57,50.8,44.662,0,0.00,22abb77669aa5df8,a9232a16bd227f2d,1.73742,0.737,0,720,19.38,0,1,0,1
+1954,1234,3.255,379.16,32,22.8,48.640,0,0.00,41ddc946d20d5502,7d6e0f6d44b5cecc,0.02027,1.000,720,1986,19.53,32,1,1,0
+4248,2262,5.586,404.92,87,22.2,50.523,0,0.00,2e2b2710f8e09de8,159540b062b93762,1.11686,0.724,1986,4335,19.59,0,1,0,1
+5741,1406,3.614,389.04,44,21.8,51.079,0,0.00,eae4a26fcb8e6d1d,23d625e741190180,0.22324,0.932,4335,5785,19.62,0,1,0,1
+7083,1298,3.631,357.50,54,24.7,49.378,0,0.00,77a65d6a4932f804,24b73c35bded487b,1.09923,0.796,5785,7137,19.68,1,1,0,1
+8041,904,2.380,379.85,24,22.3,50.754,0,0.00,35e8d82b289bf913,331c8c8593842500,0.29555,0.875,7137,8065,19.73,0,1,0,1
+8413,348,1.363,255.23,467,23.7,56.337,0,0.00,0597eab45fd6c5d4,c005de8ea3c4e76e,0.83922,0.756,8065,8880,19.76,0,1,0,1
+8915,35,0.731,47.86,186,21.0,57.557,0,0.00,d65b3ff1827814eb,1ac06551ca8a243e,0.88096,0.726,8880,9101,19.80,0,0,0,1
+===== agent: v0-run2.csv (sha256 618cfccab7c25e066be22f28f4a583cceb9e2c99c4d9f43ca40d63344d33f9c7); v0-run2.err sha256 fd65e6259a849045e9f674fc8e96f00cdbeae71e5c8895b2e85453ac99fb96fc; v0-run2.steps sha256 b676b462a4501d59fa2a97e2d24da8027e79bd8c663d6a1d12a2e5b4df97eb0a
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,0.897,738.82,57,50.1,44.549,0,0.00,22abb77669aa5df8,a9232a16bd227f2d,1.73742,0.737,0,720,19.38,0,1,0,1
+1954,1234,3.348,368.59,32,23.4,48.758,0,0.00,24fc82b335acbb8d,7d6e0f6d44b5cecc,0.02027,1.000,720,1986,19.54,32,1,1,0
+4248,2262,5.578,405.50,87,22.2,50.535,0,0.00,825d5358b0c85d4d,159540b062b93762,1.12091,0.713,1986,4335,19.60,0,1,0,1
+5741,1406,3.594,391.19,44,22.0,50.789,0,0.00,941d5ff792c39790,23d625e741190180,0.22121,0.932,4335,5785,19.63,0,1,0,1
+7083,1298,3.609,359.66,54,24.8,49.309,0,0.00,3794d0c36d57d2b7,24b73c35bded487b,1.09352,0.796,5785,7137,19.69,1,1,0,1
+8041,904,2.377,380.30,24,22.2,50.538,0,0.00,6201c684bc1bb245,331c8c8593842500,0.28378,0.875,7137,8065,19.74,0,1,0,1
+8413,348,1.359,256.10,467,23.4,56.138,0,0.00,7cb780c7b0509f1c,c005de8ea3c4e76e,0.84207,0.767,8065,8880,19.78,0,1,0,1
+8915,35,0.721,48.55,186,20.7,57.799,0,0.00,6a33ce51c81260a0,1ac06551ca8a243e,0.89521,0.726,8880,9101,19.80,0,0,0,1
+===== agent: v0-run3.csv (sha256 7764aedba68c4df1d9befd26bc616984fc1f7c4662f5a99868e68ba11fa76a52); v0-run3.err sha256 5ba7ff4c30cfdd9a6cd35757d859bc01840065345a17a858e6ab7251ddc65bed; v0-run3.steps sha256 bd634f543eac08e5fde8b6ccc49ccb0f676e1a4dbfadd36a72670f3d616770c5
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,0.902,734.67,57,52.1,44.489,0,0.00,22abb77669aa5df8,a9232a16bd227f2d,1.73742,0.737,0,720,19.34,0,1,0,1
+1954,1234,3.336,369.92,32,23.6,48.722,0,0.00,41ddc946d20d5502,7d6e0f6d44b5cecc,0.02027,1.000,720,1986,19.49,32,1,1,0
+4248,2262,5.623,402.27,87,22.1,50.406,0,0.00,d124fd7848a71387,159540b062b93762,1.11698,0.724,1986,4335,19.55,0,1,0,1
+5741,1406,3.618,388.59,44,22.3,50.728,0,0.00,5302afdc059ebdb5,23d625e741190180,0.22515,0.932,4335,5785,19.58,0,1,0,1
+7083,1298,3.632,357.43,54,25.1,49.061,0,0.00,af7bfc3b07810dbd,24b73c35bded487b,1.09537,0.796,5785,7137,19.64,1,1,0,1
+8041,904,2.388,378.53,24,22.1,50.490,0,0.00,89fe9e65e21d21a8,331c8c8593842500,0.29031,0.875,7137,8065,19.69,0,1,0,1
+8413,348,1.375,253.11,467,24.2,56.268,0,0.00,c1d5aa7be872942e,c005de8ea3c4e76e,0.83987,0.764,8065,8880,19.74,0,1,0,1
+8915,35,0.721,48.52,186,21.1,57.630,0,0.00,2bac9553afedcd4b,1ac06551ca8a243e,0.88233,0.731,8880,9101,19.76,0,0,0,1
+===== agent: v1-run3.csv (sha256 36abb6f1691b39ce656414b465964179d94b8736f613629fc26406ef2f34674e); v1-run3.err sha256 63065a5c58187e36028e50ba214b0d7b941aa6a2ec929881da8a601377a8a466; v1-run3.steps sha256 36a1e3bab2156f57304011df3c3f96a87324a221995fb7c1b789fbe2a1519739
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,0.898,738.00,57,51.0,44.544,0,0.00,22abb77669aa5df8,a9232a16bd227f2d,1.73742,0.737,0,720,19.34,0,1,0,1
+1954,1234,3.291,374.96,32,23.4,47.545,0,0.00,41ddc946d20d5502,7d6e0f6d44b5cecc,0.02027,1.000,720,1986,19.49,32,1,1,0
+4248,2262,5.578,405.54,87,22.1,50.727,0,0.00,d124fd7848a71387,159540b062b93762,1.11698,0.724,1986,4335,19.55,0,1,0,1
+5741,1406,3.609,389.61,44,24.3,51.048,0,0.00,cbecdebeeac36550,23d625e741190180,0.22528,0.932,4335,5785,19.58,0,1,0,1
+7083,1298,3.601,360.42,54,24.4,49.205,0,0.00,8ee6428960b2be2b,24b73c35bded487b,1.09482,0.796,5785,7137,19.64,1,1,0,1
+8041,904,2.386,378.81,24,22.4,50.641,0,0.00,245ccb470dd577a4,331c8c8593842500,0.30456,0.875,7137,8065,19.69,0,1,0,1
+8413,348,1.363,255.24,467,23.5,56.372,0,0.00,da7424ebede6d06e,c005de8ea3c4e76e,0.83812,0.760,8065,8880,19.72,0,1,0,1
+8915,35,0.724,48.36,186,20.7,57.888,0,0.00,ce0f349612c1c254,1ac06551ca8a243e,0.87952,0.731,8880,9101,19.75,0,0,0,1
+===== agent: v1-run4.csv (sha256 8b04499a227963ee98ad4735b768a5f4e2ce3d8429648c88d83374376bfeedcf); v1-run4.err sha256 87a293e1c8295bf0db1008da03041597415a2930cd90a95940d3366cca91ba3f; v1-run4.steps sha256 0ceb1c34144e616a36c131e5b21cf27117b6d89bed8488063106c6c9a17e7ab6
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,0.896,739.61,57,51.6,44.647,0,0.00,22abb77669aa5df8,a9232a16bd227f2d,1.73742,0.737,0,720,19.36,0,1,0,1
+1954,1234,3.258,378.72,32,23.3,48.754,0,0.00,8928ff48b16a396b,7d6e0f6d44b5cecc,0.01985,1.000,720,1986,19.51,32,1,1,0
+4248,2262,5.581,405.28,87,22.2,50.438,0,0.00,29b33c6847b42d91,159540b062b93762,1.11001,0.724,1986,4335,19.57,0,1,0,1
+5741,1406,3.598,390.79,44,22.1,50.837,0,0.00,9d41e91317452e49,23d625e741190180,0.22191,0.932,4335,5785,19.60,0,1,0,1
+7083,1298,3.621,358.50,54,24.6,49.213,0,0.00,7f3001786fd783d2,24b73c35bded487b,1.09296,0.796,5785,7137,19.66,1,1,0,1
+8041,904,2.384,379.22,24,22.2,50.663,0,0.00,f9f3235c3b7ac3ea,331c8c8593842500,0.28531,0.875,7137,8065,19.71,0,1,0,1
+8413,348,1.367,254.66,467,23.4,56.269,0,0.00,8ff830782867c4ff,c005de8ea3c4e76e,0.84470,0.762,8065,8880,19.75,0,1,0,1
+8915,35,0.718,48.77,186,21.2,57.555,0,0.00,d9883f13ec8cbd96,1ac06551ca8a243e,0.88992,0.720,8880,9101,19.77,0,0,0,1
+===== agent: v0-run4.csv (sha256 99ff3dbf757c3b83457b0368255d73ce9e0bd5aaa7d6eb1c19cd40f839be48c5); v0-run4.err sha256 da97bd4ac354518319b8e4406fc248c4d1bc7d6ad2b74564ccaa5d79bf8e9ffd; v0-run4.steps sha256 af10a5407cf0b00b440641836fad9b710c4887269a6eb8d93b91a7eae1252561
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+663,663,0.895,740.98,57,51.2,44.279,0,0.00,22abb77669aa5df8,a9232a16bd227f2d,1.73742,0.737,0,720,19.37,0,1,0,1
+1954,1234,3.252,379.50,32,23.5,48.635,0,0.00,8928ff48b16a396b,7d6e0f6d44b5cecc,0.01985,1.000,720,1986,19.53,32,1,1,0
+4248,2262,5.607,403.39,87,22.1,50.441,0,0.00,eb6bf92dfa499008,159540b062b93762,1.11399,0.713,1986,4335,19.59,0,1,0,1
+5741,1406,3.587,392.01,44,21.8,50.737,0,0.00,0128927ad0aeef08,23d625e741190180,0.22144,0.932,4335,5785,19.62,0,1,0,1
+7083,1298,3.618,358.71,54,24.7,49.314,0,0.00,3dbe0a53c7f29620,24b73c35bded487b,1.09402,0.796,5785,7137,19.67,1,1,0,1
+8041,904,2.377,380.35,24,22.2,50.534,0,0.00,1988984e69e825fa,331c8c8593842500,0.29119,0.875,7137,8065,19.72,0,1,0,1
+8413,348,1.357,256.44,467,24.0,56.295,0,0.00,a8e37dc75f77afd1,c005de8ea3c4e76e,0.84010,0.764,8065,8880,19.76,0,1,0,1
+8915,35,0.718,48.73,186,21.0,57.656,0,0.00,91db5fcdb1537da4,1ac06551ca8a243e,0.88267,0.726,8880,9101,19.79,0,0,0,1
+
+===== agent: summary (bench's report of the runs above)
+# bench: agente
+
+- bench 482e1711d589; engine qwen36; Linux (AMD EPYC 7B13 64-Core Processor, NVIDIA GeForce RTX 3070); 2026-10-26 14:43
+- model q36; session agente.sess
+- runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+
+## v0 dev: 4 runs (median, min–max)
+
+| turn | prompt | reused | read | to first token s | first step ms | decode tok/s | answer | nll | top1 | greedy same | tool calls exact | stops | RSS GB | experts read |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 663 | 0 | 663 | 0.90 (0.89–0.90) | 51 (50–52) | 44.52 (44.28–44.61) | 57 | 1.7374 | 0.737 | 0/57 | 0/1 | yes | 19.37 | 0 |
+| 2 | 1954 | 720 | 1234 | 3.30 (3.25–3.35) | 23 (23–24) | 48.70 (48.63–48.76) | 32 | 0.0203 | 1.000 | 32/32 | 1/1 | no | 19.52 | 0 |
+| 3 | 4248 | 1986 | 2262 | 5.59 (5.56–5.62) | 22 (22–22) | 50.49 (50.41–50.55) | 87 | 1.1169 | 0.718 | 0/87 | 0/1 | yes | 19.59 | 0 |
+| 4 | 5741 | 4335 | 1406 | 3.59 (3.59–3.62) | 22 (22–22) | 50.76 (50.73–51.00) | 44 | 0.2223 | 0.932 | 0/44 | 0/1 | yes | 19.62 | 0 |
+| 5 | 7083 | 5785 | 1298 | 3.62 (3.61–3.63) | 25 (24–25) | 49.31 (49.06–49.44) | 54 | 1.0947 | 0.796 | 1/54 | 0/1 | yes | 19.67 | 0 |
+| 6 | 8041 | 7137 | 904 | 2.38 (2.37–2.39) | 22 (22–25) | 50.53 (50.49–50.54) | 24 | 0.2908 | 0.875 | 0/24 | 0/1 | yes | 19.72 | 0 |
+| 7 | 8413 | 8065 | 348 | 1.36 (1.36–1.38) | 24 (23–24) | 56.28 (56.14–56.33) | 467 | 0.8400 | 0.764 | 0/467 | 0/1 | yes | 19.76 | 0 |
+| 8 | 8915 | 8880 | 35 | 0.72 (0.71–0.72) | 21 (21–21) | 57.64 (57.55–57.80) | 186 | 0.8825 | 0.726 | 0/186 | 0/0 | yes | 19.79 | 0 |
+
+session: 8 turns; prompts read 8150 tokens, reused 36908; all turns 39.1 (39.0–39.3) s; to first token in all 21.4 (21.4–21.6) s; answers 951 tokens, nll 0.8716, top1 0.768; tool calls exact 1 of 7; turns that stop 7 of 8
+fingerprints equal in every run: NO, turns [2, 3, 4, 5, 6, 7, 8]
+
+## v1 pr: 4 runs (median, min–max)
+
+| turn | prompt | reused | read | to first token s | first step ms | decode tok/s | answer | nll | top1 | greedy same | tool calls exact | stops | RSS GB | experts read |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 663 | 0 | 663 | 0.90 (0.90–0.90) | 51 (50–52) | 44.63 (44.54–44.66) | 57 | 1.7374 | 0.737 | 0/57 | 0/1 | yes | 19.37 | 0 |
+| 2 | 1954 | 720 | 1234 | 3.27 (3.25–3.29) | 23 (23–23) | 48.70 (47.55–48.77) | 32 | 0.0201 | 1.000 | 32/32 | 1/1 | no | 19.52 | 0 |
+| 3 | 4248 | 1986 | 2262 | 5.58 (5.58–5.59) | 22 (22–22) | 50.55 (50.44–50.73) | 87 | 1.1154 | 0.724 | 0/87 | 0/1 | yes | 19.57 | 0 |
+| 4 | 5741 | 4335 | 1406 | 3.61 (3.60–3.61) | 22 (22–24) | 50.97 (50.84–51.08) | 44 | 0.2226 | 0.932 | 0/44 | 0/1 | yes | 19.61 | 0 |
+| 5 | 7083 | 5785 | 1298 | 3.62 (3.60–3.63) | 24 (24–25) | 49.30 (49.20–49.48) | 54 | 1.0944 | 0.796 | 1/54 | 0/1 | yes | 19.66 | 0 |
+| 6 | 8041 | 7137 | 904 | 2.38 (2.38–2.39) | 22 (22–22) | 50.69 (50.64–50.75) | 24 | 0.2934 | 0.875 | 0/24 | 0/1 | yes | 19.71 | 0 |
+| 7 | 8413 | 8065 | 348 | 1.36 (1.36–1.37) | 23 (23–24) | 56.35 (56.27–56.43) | 467 | 0.8407 | 0.761 | 0/467 | 0/1 | yes | 19.76 | 0 |
+| 8 | 8915 | 8880 | 35 | 0.72 (0.72–0.73) | 21 (21–21) | 57.72 (57.55–58.06) | 186 | 0.8830 | 0.726 | 0/186 | 0/0 | yes | 19.78 | 0 |
+
+session: 8 turns; prompts read 8150 tokens, reused 36908; all turns 39.1 (39.1–39.1) s; to first token in all 21.5 (21.4–21.5) s; answers 951 tokens, nll 0.8731, top1 0.770; tool calls exact 1 of 7; turns that stop 7 of 8
+fingerprints equal in every run: NO, turns [2, 3, 4, 5, 6, 7, 8]
+
+## v1 pr against v0 dev (medians; positive = faster)
+
+same prompts and teacher-forced answers: yes
+
+| turn | to first token | first step | decode | nll | experts read |
+|---|---|---|---|---|---|
+| 1 | -0.1%, ranges overlap | -0.5%, ranges overlap | +0.3%, ranges overlap | +0.0000 | 0 → 0 |
+| 2 | +0.9%, ranges overlap | +0.9%, ranges overlap | -0.0%, ranges overlap | -0.0002 | 0 → 0 |
+| 3 | +0.2%, ranges overlap | -0.2%, ranges overlap | +0.1%, ranges overlap | -0.0015 | 0 → 0 |
+| 4 | -0.5%, ranges overlap | -0.2%, ranges overlap | +0.4%, ranges overlap | +0.0002 | 0 → 0 |
+| 5 | +0.2%, ranges overlap | +1.0%, ranges overlap | -0.0%, ranges overlap | -0.0003 | 0 → 0 |
+| 6 | -0.3%, ranges overlap | -0.2%, ranges overlap | +0.3%, every run faster | +0.0026 | 0 → 0 |
+| 7 | -0.4%, ranges overlap | +2.3%, ranges overlap | +0.1%, ranges overlap | +0.0007 | 0 → 0 |
+| 8 | -0.7%, ranges overlap | +0.7%, ranges overlap | +0.1%, ranges overlap | +0.0005 | 0 → 0 |
+
+all turns: +0.1%, ranges overlap; to first token in all: -0.0%, ranges overlap
+runs not cool: none
+pages written to swap during the measurement: 0, 0 of them in the runs that count
+
+===== chat: setup
+bench 482e1711d589; engine qwen36; Linux (AMD EPYC 7B13 64-Core Processor, NVIDIA GeForce RTX 3070); 2026-10-26 15:02
+model /content/q36; session chat.sess
+runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+v0 dev: /content/fase3/bin-dev/qwen36-bench (commit 77530b49ddd2f4e6ad1b3bb52500491e0c8ed9bb; harness qwen36_bench.c edbe7ddcc146; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close COLI_PLACE=auto COLI_TRUNK_PROBE=0 OMP_NUM_THREADS=12
+   command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/local/cuda/lib64 COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close COLI_PLACE=auto COLI_TRUNK_PROBE=0 OMP_NUM_THREADS=12 /content/fase3/bin-dev/qwen36-bench --model /content/q36 --session /content/bench/sessioni/chat.sess --steps /content/fase3/chat/v0-runN.steps
+v1 pr: /content/fase3/bin-pr/qwen36-bench (commit ecb64b31e417fc3fc5d4884e662c47f95dcfa9f1; harness qwen36_bench.c edbe7ddcc146; CUDA); env: COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close COLI_PLACE=auto COLI_TRUNK_PROBE=0 OMP_NUM_THREADS=12
+   command: env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/local/cuda/lib64 COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close COLI_PLACE=auto COLI_TRUNK_PROBE=0 OMP_NUM_THREADS=12 /content/fase3/bin-pr/qwen36-bench --model /content/q36 --session /content/bench/sessioni/chat.sess --steps /content/fase3/chat/v1-runN.steps
+
+===== chat: warmup.csv (sha256 78bc716f104b25291e4583777c9f72ccd0238444e9fd8d449f3b68222b9164fd); warmup.err sha256 4017a1fd31fd2b0fe3d1d07511d00b8cac06840b818abc204f6139b7af9c65ec; warmup.steps sha256 b2aa27c177a1fb189b767abda151fc1c7d3315d73061cf9de76b48ffa59cf68c
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.683,55.67,256,50.8,58.121,0,0.00,c796f8aad094c521,22216b578f19b9a6,1.38691,0.672,0,294,19.29,0,0,0,1
+321,27,0.317,85.10,489,18.8,71.441,0,0.00,1bede627d41d29ce,4d025f2a5d326967,1.38779,0.628,294,810,19.31,2,0,0,0
+846,36,0.594,60.62,243,14.7,72.252,0,0.00,83283483baa4a219,d016f9d61eb84ab2,1.27533,0.630,810,1089,19.33,0,0,0,1
+1120,31,0.334,92.85,315,12.3,77.891,0,0.00,98e366cc4e56c01c,2f91aea627876859,1.11914,0.673,1089,1435,19.35,0,0,0,0
+1475,40,0.603,66.33,155,15.0,78.870,0,0.00,d9580f7e6d59b143,fd3476fff1520e03,1.09209,0.665,1435,1630,19.36,7,0,0,0
+===== chat: v0-run1.csv (sha256 705d2357adb33fa128cae16fdd0d744a5c679c7ab4730d5521dc0726ba473f3c); v0-run1.err sha256 96bcef33c7b862d13a0f135bf6e77e7255b1aac601cb868241afbefa34d2567b; v0-run1.steps sha256 de1437ad262a1fb16d79d5564fac08757fc3e6509e22491b11c416802499d27c
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.682,55.70,256,54.9,58.667,0,0.00,c796f8aad094c521,22216b578f19b9a6,1.38691,0.672,0,294,19.31,0,0,0,1
+321,27,0.300,89.93,489,18.7,72.281,0,0.00,1bede627d41d29ce,4d025f2a5d326967,1.38779,0.628,294,810,19.34,2,0,0,0
+846,36,0.587,61.28,243,14.6,73.359,0,0.00,83283483baa4a219,d016f9d61eb84ab2,1.27533,0.630,810,1089,19.36,0,0,0,1
+1120,31,0.322,96.16,315,12.2,78.359,0,0.00,98e366cc4e56c01c,2f91aea627876859,1.11914,0.673,1089,1435,19.37,0,0,0,0
+1475,40,0.600,66.70,155,15.2,79.433,0,0.00,d9580f7e6d59b143,fd3476fff1520e03,1.09209,0.665,1435,1630,19.39,7,0,0,0
+===== chat: v1-run1.csv (sha256 8a219c780c79ff0dc6f56baaa91683c1145cd098ec410f383a5e81193fab360c); v1-run1.err sha256 52c80457a602d19cddad93a13796a9554d26fcf4615088245c8b2a98d95a5404; v1-run1.steps sha256 4f5ae9bade66c8ecc66aff3b598934978a8f930ffa7d8700ecaa0a8933f5d63f
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.682,55.71,256,50.6,58.323,0,0.00,f83761f2e9f77d1b,22216b578f19b9a6,1.38694,0.672,0,294,19.28,0,0,0,1
+321,27,0.291,92.69,489,18.1,73.085,0,0.00,fdae6dcfb538ccc3,4d025f2a5d326967,1.39104,0.632,294,810,19.31,2,0,0,0
+846,36,0.586,61.47,243,15.7,72.719,0,0.00,7713a65a3ac555ec,d016f9d61eb84ab2,1.27565,0.630,810,1089,19.33,0,0,0,1
+1120,31,0.318,97.52,315,12.7,76.453,0,0.00,4e2699b9d2ee3640,2f91aea627876859,1.11932,0.679,1089,1435,19.35,0,0,0,0
+1475,40,0.600,66.71,155,16.4,77.767,0,0.00,d908dfc9696756eb,fd3476fff1520e03,1.08944,0.677,1435,1630,19.36,7,0,0,0
+===== chat: v1-run2.csv (sha256 1d2f0409190da0b89e6045aded7d207d23da1bbd207e723fb576cb18e17a4bb2); v1-run2.err sha256 263f3701e191424285a8b402db9f026534a58f222d2c3a03785a8bbccd0306cd; v1-run2.steps sha256 ea3f3aad2e934688122086dfad3e07b286fabd586101b5b8852fb6bee2aa5800
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.684,55.57,256,51.2,57.831,0,0.00,f83761f2e9f77d1b,22216b578f19b9a6,1.38694,0.672,0,294,19.28,0,0,0,1
+321,27,0.292,92.44,489,18.1,72.798,0,0.00,fdae6dcfb538ccc3,4d025f2a5d326967,1.39104,0.632,294,810,19.31,2,0,0,0
+846,36,0.587,61.37,243,15.9,71.889,0,0.00,7713a65a3ac555ec,d016f9d61eb84ab2,1.27565,0.630,810,1089,19.33,0,0,0,1
+1120,31,0.319,97.08,315,12.3,76.043,0,0.00,4e2699b9d2ee3640,2f91aea627876859,1.11932,0.679,1089,1435,19.35,0,0,0,0
+1475,40,0.601,66.54,155,16.2,77.463,0,0.00,d908dfc9696756eb,fd3476fff1520e03,1.08944,0.677,1435,1630,19.36,7,0,0,0
+===== chat: v0-run2.csv (sha256 9783298a5383b28b8f91b0c9c38353fa78c29d25315d35e8e836ac91428d386f); v0-run2.err sha256 22dc10b96629e24d8ac7bef7b15bc6eb280c8f3600fac74c35373ce39dd5d142; v0-run2.steps sha256 5da1d0c774439c4f38f2338e8a7987651b58d40f93720613c23003a0c98d94c7
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.687,55.29,256,50.7,58.539,0,0.00,c796f8aad094c521,22216b578f19b9a6,1.38691,0.672,0,294,19.28,0,0,0,1
+321,27,0.301,89.74,489,18.7,71.855,0,0.00,1bede627d41d29ce,4d025f2a5d326967,1.38779,0.628,294,810,19.31,2,0,0,0
+846,36,0.590,60.97,243,14.8,73.110,0,0.00,83283483baa4a219,d016f9d61eb84ab2,1.27533,0.630,810,1089,19.33,0,0,0,1
+1120,31,0.325,95.32,315,12.1,77.788,0,0.00,98e366cc4e56c01c,2f91aea627876859,1.11914,0.673,1089,1435,19.35,0,0,0,0
+1475,40,0.602,66.43,155,15.3,78.998,0,0.00,d9580f7e6d59b143,fd3476fff1520e03,1.09209,0.665,1435,1630,19.36,7,0,0,0
+===== chat: v0-run3.csv (sha256 0b5dca19f942092f3b90e412e6ad139e2580b6657fd4df0be86ec4959240766f); v0-run3.err sha256 4bf068a11e28c502df662943ded70a700db6e100255b37509a9ef2f306efb937; v0-run3.steps sha256 5f9cd25b17a758256d03c9918786b782af1ad1f6a00db433249feb112b938ca2
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.683,55.67,256,50.5,58.162,0,0.00,c796f8aad094c521,22216b578f19b9a6,1.38691,0.672,0,294,19.29,0,0,0,1
+321,27,0.303,89.13,489,18.9,71.618,0,0.00,1bede627d41d29ce,4d025f2a5d326967,1.38779,0.628,294,810,19.31,2,0,0,0
+846,36,0.587,61.32,243,14.8,72.556,0,0.00,83283483baa4a219,d016f9d61eb84ab2,1.27533,0.630,810,1089,19.33,0,0,0,1
+1120,31,0.325,95.40,315,12.2,78.151,0,0.00,98e366cc4e56c01c,2f91aea627876859,1.11914,0.673,1089,1435,19.35,0,0,0,0
+1475,40,0.603,66.37,155,15.0,78.932,0,0.00,d9580f7e6d59b143,fd3476fff1520e03,1.09209,0.665,1435,1630,19.36,7,0,0,0
+===== chat: v1-run3.csv (sha256 4a4d31dfc8dfcac275c296c11766dce98f2a57d9de4c90bf5f80fec0c3ea43f4); v1-run3.err sha256 a7cf98bb8d27245379f94d859504aba8a481e715d212c6b1d553e8e9cc69e320; v1-run3.steps sha256 cbd10520a8c66e6239c436c8605f5633738e8c1c693c2c3bda88bc46c8c0344f
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.683,55.60,256,51.9,57.966,0,0.00,f83761f2e9f77d1b,22216b578f19b9a6,1.38694,0.672,0,294,19.28,0,0,0,1
+321,27,0.299,90.38,489,18.2,72.677,0,0.00,fdae6dcfb538ccc3,4d025f2a5d326967,1.39104,0.632,294,810,19.31,2,0,0,0
+846,36,0.590,60.99,243,15.6,72.084,0,0.00,7713a65a3ac555ec,d016f9d61eb84ab2,1.27565,0.630,810,1089,19.33,0,0,0,1
+1120,31,0.328,94.42,315,12.5,75.964,0,0.00,4e2699b9d2ee3640,2f91aea627876859,1.11932,0.679,1089,1435,19.34,0,0,0,0
+1475,40,0.602,66.46,155,16.7,77.333,0,0.00,d908dfc9696756eb,fd3476fff1520e03,1.08944,0.677,1435,1630,19.36,7,0,0,0
+===== chat: v1-run4.csv (sha256 621c37b612985684deb18c0f4bc8027d24ed9d8e00183462537b12a09f823ce5); v1-run4.err sha256 8fc18142b16e5338260bfb4b13960b5ae5ce884ed123ae3f4bbec02db1a97fe5; v1-run4.steps sha256 cf699e15ecd4a87a0ea7938d4e0d4e33d3566d3f59c81006d042d16b9366e39c
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.686,55.36,256,52.4,57.434,0,0.00,f83761f2e9f77d1b,22216b578f19b9a6,1.38694,0.672,0,294,19.28,0,0,0,1
+321,27,0.302,89.54,489,18.2,71.594,0,0.00,fdae6dcfb538ccc3,4d025f2a5d326967,1.39104,0.632,294,810,19.31,2,0,0,0
+846,36,0.599,60.09,243,15.8,70.857,0,0.00,7713a65a3ac555ec,d016f9d61eb84ab2,1.27565,0.630,810,1089,19.33,0,0,0,1
+1120,31,0.352,88.11,315,17.4,74.806,0,0.00,4e2699b9d2ee3640,2f91aea627876859,1.11932,0.679,1089,1435,19.35,0,0,0,0
+1475,40,0.615,65.07,155,16.6,76.284,0,0.00,d908dfc9696756eb,fd3476fff1520e03,1.08944,0.677,1435,1630,19.36,7,0,0,0
+===== chat: v0-run4.csv (sha256 5798d6461ff97adc239991a7bcb6d7827e6414cc3fb9c7797dc75bfc3b92bac1); v0-run4.err sha256 c11825e040b6770a4ad1afe8362030427afc6850929fe0b594de9ebffb9488e4; v0-run4.steps sha256 96442eb42699ff1679210e9a50bf4260293a2779ba29da211c636b58dfda2893
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok
+38,38,0.686,55.37,256,53.4,57.447,0,0.00,c796f8aad094c521,22216b578f19b9a6,1.38691,0.672,0,294,19.29,0,0,0,1
+321,27,0.332,81.34,489,18.9,70.751,0,0.00,1bede627d41d29ce,4d025f2a5d326967,1.38779,0.628,294,810,19.31,2,0,0,0
+846,36,0.592,60.79,243,15.0,72.032,0,0.00,83283483baa4a219,d016f9d61eb84ab2,1.27533,0.630,810,1089,19.33,0,0,0,1
+1120,31,0.336,92.17,315,12.3,76.697,0,0.00,98e366cc4e56c01c,2f91aea627876859,1.11914,0.673,1089,1435,19.35,0,0,0,0
+1475,40,0.608,65.76,155,15.3,77.932,0,0.00,d9580f7e6d59b143,fd3476fff1520e03,1.09209,0.665,1435,1630,19.36,7,0,0,0
+
+===== chat: summary (bench's report of the runs above)
+# bench: chat
+
+- bench 482e1711d589; engine qwen36; Linux (AMD EPYC 7B13 64-Core Processor, NVIDIA GeForce RTX 3070); 2026-10-26 15:02
+- model q36; session chat.sess
+- runs: a warm-up of v0 (does not count), then 4 per version, the order turning at every round (ABBA); before every run: wait until cool (at most 900 s), then 60 s of rest
+
+## v0 dev: 4 runs (median, min–max)
+
+| turn | prompt | reused | read | to first token s | first step ms | decode tok/s | answer | nll | top1 | greedy same | tool calls exact | stops | RSS GB | experts read |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 38 | 0 | 38 | 0.68 (0.68–0.69) | 52 (50–55) | 58.35 (57.45–58.67) | 256 | 1.3869 | 0.672 | 0/256 | 0/0 | yes | 19.29 | 0 |
+| 2 | 321 | 294 | 27 | 0.30 (0.30–0.33) | 19 (19–19) | 71.74 (70.75–72.28) | 489 | 1.3878 | 0.628 | 2/489 | 0/0 | no | 19.31 | 0 |
+| 3 | 846 | 810 | 36 | 0.59 (0.59–0.59) | 15 (15–15) | 72.83 (72.03–73.36) | 243 | 1.2753 | 0.630 | 0/243 | 0/0 | yes | 19.33 | 0 |
+| 4 | 1120 | 1089 | 31 | 0.33 (0.32–0.34) | 12 (12–12) | 77.97 (76.70–78.36) | 315 | 1.1191 | 0.673 | 0/315 | 0/0 | no | 19.35 | 0 |
+| 5 | 1475 | 1435 | 40 | 0.60 (0.60–0.61) | 15 (15–15) | 78.97 (77.93–79.43) | 155 | 1.0921 | 0.665 | 7/155 | 0/0 | no | 19.36 | 0 |
+
+session: 5 turns; prompts read 172 tokens, reused 3628; all turns 23.1 (22.9–23.4) s; to first token in all 2.5 (2.5–2.6) s; answers 1458 tokens, nll 1.2794, top1 0.650; tool calls exact 0 of 0; turns that stop 2 of 5
+fingerprints equal in every run: yes
+
+## v1 pr: 4 runs (median, min–max)
+
+| turn | prompt | reused | read | to first token s | first step ms | decode tok/s | answer | nll | top1 | greedy same | tool calls exact | stops | RSS GB | experts read |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 38 | 0 | 38 | 0.68 (0.68–0.69) | 52 (51–52) | 57.90 (57.43–58.32) | 256 | 1.3869 | 0.672 | 0/256 | 0/0 | yes | 19.28 | 0 |
+| 2 | 321 | 294 | 27 | 0.30 (0.29–0.30) | 18 (18–18) | 72.74 (71.59–73.08) | 489 | 1.3910 | 0.632 | 2/489 | 0/0 | no | 19.31 | 0 |
+| 3 | 846 | 810 | 36 | 0.59 (0.59–0.60) | 16 (16–16) | 71.99 (70.86–72.72) | 243 | 1.2756 | 0.630 | 0/243 | 0/0 | yes | 19.33 | 0 |
+| 4 | 1120 | 1089 | 31 | 0.32 (0.32–0.35) | 13 (12–17) | 76.00 (74.81–76.45) | 315 | 1.1193 | 0.679 | 0/315 | 0/0 | no | 19.35 | 0 |
+| 5 | 1475 | 1435 | 40 | 0.60 (0.60–0.61) | 16 (16–17) | 77.40 (76.28–77.77) | 155 | 1.0894 | 0.677 | 7/155 | 0/0 | no | 19.36 | 0 |
+
+session: 5 turns; prompts read 172 tokens, reused 3628; all turns 23.2 (23.1–23.6) s; to first token in all 2.5 (2.5–2.6) s; answers 1458 tokens, nll 1.2803, top1 0.654; tool calls exact 0 of 0; turns that stop 2 of 5
+fingerprints equal in every run: yes
+
+## v1 pr against v0 dev (medians; positive = faster)
+
+same prompts and teacher-forced answers: yes
+
+| turn | to first token | first step | decode | nll | experts read |
+|---|---|---|---|---|---|
+| 1 | +0.1%, ranges overlap | +1.0%, ranges overlap | -0.8%, ranges overlap | +0.0000 | 0 → 0 |
+| 2 | +2.2%, ranges overlap | +3.6%, every run faster | +1.4%, ranges overlap | +0.0032 | 0 → 0 |
+| 3 | +0.0%, ranges overlap | -6.0%, every run slower | -1.2%, ranges overlap | +0.0003 | 0 → 0 |
+| 4 | +0.5%, ranges overlap | -3.2%, ranges overlap | -2.5%, every run slower | +0.0002 | 0 → 0 |
+| 5 | +0.2%, ranges overlap | -7.6%, every run slower | -2.0%, every run slower | -0.0027 | 0 → 0 |
+
+all turns: -0.5%, ranges overlap; to first token in all: +0.4%, ranges overlap
+runs not cool: none
+pages written to swap during the measurement: 0, 0 of them in the runs that count
+
+===== the owner's case with the CLI (s2ab.py): the heat file of one run on the MoE question, frozen (every
+#   run starts from a copy), the same question; dev's c/qwen36 against the PR's, 200 and 600 generated tokens,
+#   a warm-up run of dev, then dev pr pr dev dev pr pr dev, 60 s of rest before each. Both run the brake at 75.
+#   Each run's log by its sha256; ms a token = the engine's COLI_TIMERS step() total.
+# command (N = 200, 600): cd colibri && COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_NUM_THREADS=64 OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close SNAP=q36 COLI_TEMP=0 COLI_TIMERS=1 NOSTREAM=1 N_NEW=200 COLI_PLACE=auto COLI_TRUNK_PROBE=0 OMP_NUM_THREADS=12 HEAT_FILE=s2ab/heat_run.bin colibri/c/qwen36 256 4 prompt/moe.txt
+200-0-warmup-dev: 13.2 ms/token, 57.13 tok/s, decode hits 81.1 %, promoted 0, braked 199, text sha256 a790063040d95e36..., log sha256 3a77f2d5055be4f18ba43c502876569f8c5c764c259082bf839cbb2a672aa9ab
+200-1-dev: 13.2 ms/token, 57.09 tok/s, decode hits 81.1 %, promoted 0, braked 199, text sha256 a790063040d95e36..., log sha256 15a3d9259d1601245f76ca4e93e2e699a8d70b4ec9696f9d0f886399cd468554
+200-2-pr: 13.2 ms/token, 56.92 tok/s, decode hits 81.1 %, promoted 0, braked 199, text sha256 a790063040d95e36..., log sha256 c23cc5d7db86e54b30e55693191bd8cbfbab63eef0d6e08b82e3cad54c1ec38e
+200-3-pr: 13.2 ms/token, 56.98 tok/s, decode hits 81.1 %, promoted 0, braked 199, text sha256 a790063040d95e36..., log sha256 8c499994667f965dedcbb1efaddfec81856efa90c58db8545da4668965cb897e
+200-4-dev: 13.2 ms/token, 56.92 tok/s, decode hits 81.1 %, promoted 0, braked 199, text sha256 a790063040d95e36..., log sha256 20838d024ad35a6b68bd921298327652245ef2154d808773a6407f150ee75caf
+200-5-dev: 13.2 ms/token, 56.94 tok/s, decode hits 81.1 %, promoted 0, braked 199, text sha256 a790063040d95e36..., log sha256 55c8f62a3b5c76534560e29cdbd5994de936761de72294b477f91d63e90fddd8
+200-6-pr: 13.3 ms/token, 56.71 tok/s, decode hits 81.1 %, promoted 0, braked 199, text sha256 a790063040d95e36..., log sha256 9187e0c60af6cca900354cca555cde582d424d5b931ef27d6600f51aa88ce19d
+200-7-pr: 13.2 ms/token, 56.93 tok/s, decode hits 81.1 %, promoted 0, braked 199, text sha256 a790063040d95e36..., log sha256 1745131467fac27386f835f77d0d29b446e3b40132328b1abeb0e74173754ef9
+200-8-dev: 13.2 ms/token, 57.15 tok/s, decode hits 81.1 %, promoted 0, braked 199, text sha256 a790063040d95e36..., log sha256 ac6650df3521607b731555455fc0ad7e0b8c6cb8c2b0df6273dfa258ee2f57cf
+600-0-warmup-dev: 13.9 ms/token, 64.67 tok/s, decode hits 78.1 %, promoted 469, braked 465, text sha256 efed01f4957b13aa..., log sha256 23e43cc36df1dc73ad6466263ebdf115721448e759a9248e6251e90995123ea0
+600-1-dev: 13.9 ms/token, 64.71 tok/s, decode hits 78.1 %, promoted 469, braked 465, text sha256 efed01f4957b13aa..., log sha256 6a50a2259850f65d6fcd6a715297fcab51a49305316a9aca969db84dd67b5867
+600-2-pr: 13.9 ms/token, 64.74 tok/s, decode hits 78.1 %, promoted 469, braked 465, text sha256 efed01f4957b13aa..., log sha256 c7b0e0f619cf4bd9528ed72daaff79341f6c0f8f4d157bdf92216dcd354d2504
+600-3-pr: 13.9 ms/token, 64.77 tok/s, decode hits 78.1 %, promoted 469, braked 465, text sha256 efed01f4957b13aa..., log sha256 038baee1c4821c3219da60d87ec3196768c76c8e5d6ffa2e9f209ed0a87c652b
+600-4-dev: 13.9 ms/token, 64.78 tok/s, decode hits 78.1 %, promoted 469, braked 465, text sha256 efed01f4957b13aa..., log sha256 0d5f2dd3ff9228cc9196269dc5a6ad918ecc5499a772f37f8971c26f55fee75d
+600-5-dev: 13.9 ms/token, 64.78 tok/s, decode hits 78.1 %, promoted 469, braked 465, text sha256 efed01f4957b13aa..., log sha256 211669c69ab27a23bbef4c23e359602728a12761dad277f6310f26b003a9bfcb
+600-6-pr: 14.0 ms/token, 64.41 tok/s, decode hits 78.0 %, promoted 469, braked 465, text sha256 3fcdb547fffa6834..., log sha256 c2b9471f22b58920102a9393cab54237824ece753437d100939ba33a4def3422
+600-7-pr: 14.0 ms/token, 64.48 tok/s, decode hits 78.1 %, promoted 469, braked 465, text sha256 efed01f4957b13aa..., log sha256 e408ac39b8f9b3d71fba20f4b36dee2279b15d7df4b0d6345a811a2bcaf52cab
+600-8-dev: 13.9 ms/token, 64.45 tok/s, decode hits 78.0 %, promoted 469, braked 465, text sha256 3fcdb547fffa6834..., log sha256 6916a132c246a5fc0bbff62478141ec4ecaa039479ffecd728f8b09cf089eb02
+200 dev: median 13.20 ms/token, range 13.2-13.2 (4 runs)
+200 pr: median 13.20 ms/token, range 13.2-13.3 (4 runs)
+600 dev: median 13.90 ms/token, range 13.9-13.9 (4 runs)
+600 pr: median 13.95 ms/token, range 13.9-14.0 (4 runs)

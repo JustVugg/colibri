@@ -2924,6 +2924,31 @@ static void test_kvs_cold(void) {
  * situation: no host gap between matrices), per weight format, in GB/s of weights.
  * COLI_VK_BENCH_S: rows of x (a speculative verify's: the decode GEMV, vkc_gemm_rows 0). */
 #include <time.h>
+#include "../vk_hyb_gate.h"
+/* The gate on the hybrid steps (vk_hyb_gate.h): the device's reads timed first, then the
+ * hybrid steps, the faster kept, measured again after VKC_HYB_REPROBE forwards. */
+static void test_hyb_gate(void) {
+    VkcHybGate g; vkc_hyb_gate_init(&g, 1);
+    CHECK(g.use && g.phase == 3, "hyb gate: the hybrid until an engine reports a forward");
+    CHECK(!vkc_hyb_gate_forward(&g, 25.0) && !g.use && g.phase == 0, "hyb gate: the first report starts the probe, the device's reads first");
+    int decided = 0;
+    for (int i = 0; i < VKC_HYB_PROBE + 1; i++) decided += vkc_hyb_gate_forward(&g, 20.0);   /* warm + 3 at 20 ms */
+    CHECK(!decided && g.use && g.phase == 1, "hyb gate: then the hybrid steps");
+    for (int i = 0; i < VKC_HYB_PROBE + 1; i++) decided += vkc_hyb_gate_forward(&g, 50.0);   /* the hybrid at 50 ms */
+    CHECK(decided == 1 && !g.use && g.phase == 2 && g.probes == 1 && g.gate_off == 1, "hyb gate: the slower hybrid dropped");
+    CHECK(g.kept[0] == 50.0 && g.kept[1] == 20.0, "hyb gate: the decision's times, a forward each");
+    int settled = 1;
+    for (int i = 0; i < VKC_HYB_REPROBE - 1; i++) settled = settled && !vkc_hyb_gate_forward(&g, 20.0) && g.phase == 2;
+    CHECK(settled, "hyb gate: settled");
+    vkc_hyb_gate_forward(&g, 20.0);
+    CHECK(g.phase == 0 && !g.use, "hyb gate: measured again after a while, the device's reads first");
+    for (int i = 0; i < VKC_HYB_PROBE + 1; i++) vkc_hyb_gate_forward(&g, 30.0);
+    for (int i = 0; i < VKC_HYB_PROBE + 1; i++) vkc_hyb_gate_forward(&g, 29.0);   /* the hybrid a little faster */
+    CHECK(g.use && g.probes == 2 && g.gate_off == 1, "hyb gate: the hybrid kept where it is not slower");
+    VkcHybGate u; vkc_hyb_gate_init(&u, 0);
+    for (int i = 0; i < 10; i++) vkc_hyb_gate_forward(&u, 99.0);
+    CHECK(u.use && u.phase == 2 && u.probes == 0, "hyb gate off (COLI_VK_HYBRID_GATE=0): the hybrid stays on");
+}
 static double bnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static void bench_gemv(void) {
     int shapes[3][2] = {{2560, 10240}, {6144, 2560}, {2560, 640}}, nsh = 3;
@@ -3989,6 +4014,7 @@ static void test_gemv_rows(int fmt, int S, int I, int O) {
     free(x); free(codes); free(sc);
 }
 int main(int argc, char **argv) {
+    test_hyb_gate();   /* no device needed */
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
     {   /* the CPU a software device runs on (llvmpipe compiles for it): CI runners differ */
         FILE *ci = fopen("/proc/cpuinfo", "r"); char line[512], model[256] = ""; int avx512 = 0, n = 0;

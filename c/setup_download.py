@@ -321,16 +321,20 @@ def parse_curl_speed(text):
 
 
 def probe_throughput_windows(url, curl, *, token=None, max_bytes=4 << 20, max_seconds=8):
-    cmd = [curl, "-s", "-L", "-r", f"0-{max_bytes - 1}", "--max-time", str(int(max_seconds)),
+    cmd = [curl, "-s", "-L", "--fail", "-r", f"0-{max_bytes - 1}", "--max-time", str(int(max_seconds)),
            "-o", "NUL", "-w", "%{speed_download}", url]
     if token:
         cmd[1:1] = ["-H", f"Authorization: Bearer {token}"]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                             timeout=max_seconds + 20).stdout
+        result = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                                timeout=max_seconds + 20)
     except (OSError, subprocess.SubprocessError):
         return None
-    speed = parse_curl_speed(out)
+    # Exit 28 is the expected bound when a slow ranged sample hits --max-time;
+    # other failures (including HTTP errors with --fail) are not throughput.
+    if result.returncode not in (0, 28):
+        return None
+    speed = parse_curl_speed(result.stdout)
     return speed if speed and speed > 0 else None
 
 

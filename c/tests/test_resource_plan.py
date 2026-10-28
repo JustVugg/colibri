@@ -1277,6 +1277,21 @@ memInfo.free:                     23.50 GB (97%)
         environment = environment_for_plan(plan)
         self.assertEqual(environment["COLI_PLAN_CAP"], str(cap))
         self.assertEqual(environment["COLI_CUDA"], "1")
+        # qwen36_tier.c reads CUDA_EXPERT_GB as GiB for the card, trunk included.
+        # This card shares the host's memory: it gets the plan's budget with the
+        # trunk back in, in GiB. A card of its own sizes itself; the user's wins.
+        tier = plan["tiers"]["vram"]["budget_bytes"] + 2 * MiB
+        self.assertEqual(environment["CUDA_EXPERT_GB"], f"{tier / (1 << 30):.3f}")
+        # the units, at a size where GB and GiB differ: 20 GB and a 3 GiB trunk
+        vram = dict(plan["tiers"]["vram"], budget_bytes=20 * GB, trunk_bytes=3 << 30)
+        big = dict(plan, tiers=dict(plan["tiers"], vram=vram))
+        self.assertEqual(environment_for_plan(big)["CUDA_EXPERT_GB"], "21.626")
+        own = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB,
+                         gpus=[dict(gpu, unified_memory=False)])
+        self.assertGreater(own["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertNotIn("CUDA_EXPERT_GB", environment_for_plan(own))
+        self.assertEqual(environment_for_plan(own, {"CUDA_EXPERT_GB": "6"})["CUDA_EXPERT_GB"], "6")
+        self.assertEqual(environment_for_plan(plan, {"CUDA_EXPERT_GB": "6"})["CUDA_EXPERT_GB"], "6")   # and where it shares memory
         self.assertEqual(environment["COLI_GPU"], "0")
         for variable in ("Q38_NATIVE_FP8", "Q38_NATIVE_BF16"):
             with self.subTest(variable=variable), self.assertRaisesRegex(
@@ -1633,6 +1648,13 @@ memInfo.free:                     23.50 GB (97%)
         self.assertNotIn("OMP_PROC_BIND", env)
         self.assertNotIn("OMP_PLACES", env)
         self.assertEqual(env["PIN_GB"], env["CUDA_EXPERT_GB"])
+        # GLM's engine reads the plan's budget as it is: GB for all the cards
+        self.assertEqual(env["CUDA_EXPERT_GB"], f"{plan['tiers']['vram']['budget_bytes'] / GB:.3f}")
+        # the unit, at a size where GB and GiB differ; the user's number stays
+        vram = dict(plan["tiers"]["vram"], budget_bytes=20 * GB)
+        big = dict(plan, tiers=dict(plan["tiers"], vram=vram))
+        self.assertEqual(environment_for_plan(big)["CUDA_EXPERT_GB"], "20.000")
+        self.assertEqual(environment_for_plan(plan, {"CUDA_EXPERT_GB": "6"})["CUDA_EXPERT_GB"], "6")
 
         explicit_threads = environment_for_plan(plan, {"OMP_NUM_THREADS": "7",
                                                         "OMP_PROC_BIND": "close"})
@@ -2103,6 +2125,19 @@ class VulkanPartialChainQwenOlmoeTest(unittest.TestCase):
                 tensors.append((p + f"mlp.experts.{e}.qs", (2 * 32 + 64) * 4, "F32", [2 * 32 + 64]))
         write_shard(self.model / "model.safetensors", tensors, f32_fill=f32_fill)
         return analyze_model(self.model)
+
+    def test_cuda_plan_leaves_qwen36_tier_to_size_each_card(self):
+        # qwen36_tier.c reads CUDA_EXPERT_GB as GiB for each card: the plan's GB
+        # for both cards would give each of them the total
+        self.write_qwen36()
+        gpus = [{"index": i, "name": "card", "total_bytes": 24 * GB, "free_bytes": 22 * GB} for i in (0, 1)]
+        plan = build_plan(self.model, context=64, available_memory=16 * GB,
+                          available_disk=16 * GB, gpus=gpus)
+        self.assertGreater(plan["tiers"]["vram"]["budget_bytes"], 0)
+        env = environment_for_plan(plan)
+        self.assertEqual(env["COLI_CUDA"], "1")
+        self.assertEqual(env["COLI_GPUS"], "0,1")
+        self.assertNotIn("CUDA_EXPERT_GB", env)
 
     def test_olmoe_matrices_that_are_bf16_go_up_as_bf16(self):
         """backend_vulkan.c coli_vk_f32_fmt: an f32 matrix whose every value is a bf16

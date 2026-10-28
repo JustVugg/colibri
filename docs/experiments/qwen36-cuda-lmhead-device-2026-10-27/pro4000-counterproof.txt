@@ -1,0 +1,34 @@
+# qwen36 CUDA chain, the head's logits written on the card then copied to the host: the counter-proof on the card (2026-10-27)
+# An RTX PRO 4000 rented on Vast.ai: Intel(R) Core(TM) Ultra 9 285K (24 CPUs, 36 MiB L3) + NVIDIA RTX PRO 4000 Blackwell (24467 MiB, sm_120); Ubuntu 24.04.1 LTS, Linux 6.8.0-146-generic x86_64, CUDA 12.8 (nvcc V12.8.93), driver 615.71.09, gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0.
+# The harness (bench.c beside this file), run once for each build in the environment of the timed runs (COLI_CUDA=1 COLI_GPUS=0
+# CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close OMP_NUM_THREADS=10) with --lengths 64,512 --gen 64 --teacher (64
+# forced decode steps after each prompt, so the fingerprints are not those of the 32-step runs):
+#   dev       = c1c06ac6 (origin/dev)
+#   change    = c1c06ac6 + this change (local commit eb455b74, tree b947d7ba0685: the first commit of this PR differs from it only in a comment of c/qwen36_cuda_chain.h, two paragraphs of docs/qwen36-cuda-tier.md and one line of c/tests/test_qwen36_cuda_chain.c)
+#   no-copy   = the change with the copy of the logits to the host taken out: the head's matmul writes the card's buffer and
+#               outd stays zero. The edit, applied to c/qwen36_cuda_chain.h before the build:
+#     -                 cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->out, (size_t)dst * c->vocab, lo_n) &&
+#     -                 cc_copy(ch->outd, (size_t)dst * c->vocab, ch->out, (size_t)dst * c->vocab, (size_t)lo_n * c->vocab);
+#     +                 cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->out, (size_t)dst * c->vocab, lo_n);
+# The fingerprint (column fingerprint) hashes every logit and token: the change must equal dev and the build without the copy must not.
+#   dev.csv sha256 01111ca44c42cfedcc3964f7cef182c08320134cbcf20f8684aa27cdf46102f0
+#   dev.err sha256 9af6022813bf840b90e8064ae8823d5159b5a815d0f54137e34f0c5514169844
+#   change.csv sha256 e1cd631e5cbcb26a4fe4c9ddaebe949c56b2ba7a1091574205c7ecfc1b1accbf
+#   change.err sha256 68c0418096a27969a33a35a7df10d07d51985b320a4d655684b79986e599fc67
+#   no-copy.csv sha256 1285b50ba8a74bff5a0f13ec75a76def259e5148c9bd7b11ef08e920086b4e9a
+#   no-copy.err sha256 060e4295c7aa95196f581e08b78b2f0ec3f0db571feb7ff956126a364994ea4c
+
+===== dev (dev.csv)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.064,1005.91,64,13.4,73.605,0,0.00,2ddac97e05140e52,84947ae6f5661dcf,3.02152,0.438
+512,512,0.182,2810.18,64,13.3,72.844,0,0.00,8048c74fd5e8a417,c3eb83d2bc86fae5,2.90783,0.422
+
+===== change (change.csv)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.057,1119.85,64,6.9,144.353,0,0.00,2ddac97e05140e52,84947ae6f5661dcf,3.02152,0.438
+512,512,0.175,2923.83,64,6.9,144.053,0,0.00,8048c74fd5e8a417,c3eb83d2bc86fae5,2.90783,0.422
+
+===== no-copy (no-copy.csv)
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,0.057,1130.51,64,6.8,146.409,0,0.00,54670e423ecf3dcf,84947ae6f5661dcf,12.42247,0.000
+512,512,0.173,2959.02,64,6.9,146.112,0,0.00,a645035cb6a9dae5,c3eb83d2bc86fae5,12.42247,0.000

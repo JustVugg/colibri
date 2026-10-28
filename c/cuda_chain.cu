@@ -46,8 +46,9 @@ struct CcCtx {
     int f2_big_h;   /* the same for its float16 cache's kernel */
     cudaStream_t stream;
     cudaEvent_t ev; int ev_ok, ev_pending;
-    /* staging (cc_fetch): the copy stream, its copies' event and the buffer's last reader's */
-    cudaStream_t cs; cudaEvent_t ev_fetched, ev_free; int cs_ok;
+    /* staging (cc_fetch): the copy stream, and for each of its two places the copies' event and the
+     * buffer's last reader's */
+    cudaStream_t cs; cudaEvent_t ev_fetched[2], ev_free[2]; int cs_ok;
     /* host_up: the copies' marks, a ring of CC_UP_MARKS events on the copy stream */
     cudaEvent_t up_ev[CC_UP_MARKS]; unsigned up_seq, up_made; cudaEvent_t up_after;
     float *adec; size_t adec_bytes;   /* cc_attn_dec_k's blocks */
@@ -1250,7 +1251,8 @@ static void cc_shutdown(void) {
             cudaStreamDestroy(c->stream);
             if (c->cs_ok) {
                 if (!c->lost) cudaStreamSynchronize(c->cs);
-                cudaEventDestroy(c->ev_fetched); cudaEventDestroy(c->ev_free); cudaStreamDestroy(c->cs);
+                for (int s = 0; s < 2; s++) { cudaEventDestroy(c->ev_fetched[s]); cudaEventDestroy(c->ev_free[s]); }
+                cudaStreamDestroy(c->cs);
             }
             if (c->up_made) { for (int i = 0; i < CC_UP_MARKS; i++) cudaEventDestroy(c->up_ev[i]); cudaEventDestroy(c->up_after); }
             c->up_made = 0; c->up_seq = 0;
@@ -2034,41 +2036,44 @@ static void cc_stats(CcStats *st) { if (st) *st = g_st; }
 static int cc_copy_stream(CcCtx *c) {
     if (c->cs_ok) return 1;
     if (!cc_ok(c, cudaStreamCreateWithFlags(&c->cs, cudaStreamNonBlocking), "copy stream")) return 0;
-    if (cudaEventCreateWithFlags(&c->ev_fetched, cudaEventDisableTiming) != cudaSuccess) {
+    cudaEvent_t *ev[4] = {&c->ev_fetched[0], &c->ev_fetched[1], &c->ev_free[0], &c->ev_free[1]};
+    for (int s = 0; s < 4; s++) {
+        if (cudaEventCreateWithFlags(ev[s], cudaEventDisableTiming) == cudaSuccess) continue;
+        while (s--) (void)cudaEventDestroy(*ev[s]);
         (void)cudaStreamDestroy(c->cs); return cc_ok(c, cudaErrorMemoryAllocation, "copy event");
-    }
-    if (cudaEventCreateWithFlags(&c->ev_free, cudaEventDisableTiming) != cudaSuccess) {
-        (void)cudaEventDestroy(c->ev_fetched); (void)cudaStreamDestroy(c->cs); return cc_ok(c, cudaErrorMemoryAllocation, "copy event");
     }
     c->cs_ok = 1;
     return 1;
 }
-static int cc_fetch(CcBuf *dst, const CcFetch *r, int n) {
+static int cc_fetch_at(CcBuf *dst, const CcFetch *r, int n, int slot) {
     CcCtx *c = live();
-    if (!c || !dst || dst->kind != CC_DEV || n < 0 || (n && !r)) return 0;
+    if (!c || !dst || dst->kind != CC_DEV || n < 0 || (n && !r) || (unsigned)slot > 1) return 0;
     for (int i = 0; i < n; i++) if (!r[i].src || r[i].dst > dst->bytes || r[i].bytes > dst->bytes - r[i].dst) return 0;
     if (!cc_copy_stream(c)) return 0;
     /* an event never recorded is no wait: the first fetch starts at once */
-    if (!cc_ok(c, cudaStreamWaitEvent(c->cs, c->ev_free, 0), "fetch's reader")) return 0;
+    if (!cc_ok(c, cudaStreamWaitEvent(c->cs, c->ev_free[slot], 0), "fetch's reader")) return 0;
     for (int i = 0; i < n; i++) {
         if (!r[i].bytes) continue;
         if (!cc_ok(c, cudaMemcpyAsync((char *)dst->d + r[i].dst, r[i].src, r[i].bytes, cudaMemcpyHostToDevice, c->cs), "fetch")) return 0;
         g_st.bytes_up += r[i].bytes;
     }
     g_st.ops++;
-    return cc_ok(c, cudaEventRecord(c->ev_fetched, c->cs), "fetch event");
+    return cc_ok(c, cudaEventRecord(c->ev_fetched[slot], c->cs), "fetch event");
 }
-static int cc_fetch_wait(void) {
+static int cc_fetch_wait_at(int slot) {
     CcCtx *c = live();
-    if (!c || !c->cs_ok) return 0;
+    if (!c || !c->cs_ok || (unsigned)slot > 1) return 0;
     g_st.ops++;
-    return cc_ok(c, cudaStreamWaitEvent(c->stream, c->ev_fetched, 0), "fetch wait");
+    return cc_ok(c, cudaStreamWaitEvent(c->stream, c->ev_fetched[slot], 0), "fetch wait");
 }
-static int cc_fetch_done(void) {
+static int cc_fetch_done_at(int slot) {
     CcCtx *c = live();
-    if (!c || !c->cs_ok) return 0;
-    return cc_ok(c, cudaEventRecord(c->ev_free, c->stream), "fetch done");
+    if (!c || !c->cs_ok || (unsigned)slot > 1) return 0;
+    return cc_ok(c, cudaEventRecord(c->ev_free[slot], c->stream), "fetch done");
 }
+static int cc_fetch(CcBuf *dst, const CcFetch *r, int n) { return cc_fetch_at(dst, r, n, 0); }
+static int cc_fetch_wait(void) { return cc_fetch_wait_at(0); }
+static int cc_fetch_done(void) { return cc_fetch_done_at(0); }
 static int cc_host_up(void *dst, const void *src, size_t bytes, unsigned *ticket) {
     CcCtx *c = live();
     if (!c || !dst || !src || !ticket) return 0;
@@ -2279,5 +2284,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_attn_h,
     cc_attn_wh,
     cc_copy_regions_h,
+    cc_fetch_at, cc_fetch_wait_at, cc_fetch_done_at,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

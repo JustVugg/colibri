@@ -1,0 +1,250 @@
+# qwen36 CUDA chain, the head's logits written on the card then copied to the host: a decode step launch by launch, nsys (2026-10-27)
+# An RTX PRO 4000 rented on Vast.ai: Intel(R) Core(TM) Ultra 9 285K (24 CPUs, 36 MiB L3) + NVIDIA RTX PRO 4000 Blackwell (24467 MiB, sm_120); Ubuntu 24.04.1 LTS, Linux 6.8.0-146-generic x86_64, CUDA 12.8 (nvcc V12.8.93), driver 615.71.09, gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0.
+# v0 = c1c06ac6 (origin/dev); v1 = c1c06ac6 + this change. The harness (bench.c beside this file) run once for each
+# version under `nsys profile --trace=cuda`, in the environment of the timed runs (COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto
+# OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close OMP_NUM_THREADS=10), with --lengths 64,512 --gen 64 --teacher (64 forced decode
+# steps after each prompt). Each table is the median decode step of the launches nsys recorded, by kind of launch: launches a
+# step, ms, median us, GB/s of weights read, ms above the floor the card's read bandwidth sets (620 GB/s, measured with a
+# read-only kernel), ms of idle before the launches. Steps that run more than one row (the lookup probe) are left out. The
+# int8 GEMV rows are named by their O x I: i8 248320x2048 is the lm_head. The tables come from a script that reads the
+# launch parameters out of the SQLite export; the traces are not here, they are named by their sha256 below.
+#   base.sqlite sha256 f48c509ecdf332c4dfb5a3ed09a15dd7015cf25083298a694862aec1dc1b19c4
+#   base.steps sha256 586a7e2daf42c247fb3f4bc632396bcd6e2825c6d0386620b22aaca4f6a32d69
+#   pr.sqlite sha256 9d8a8a99576a9a2654ec22e18b96ee18c062b81c2a1da888bb1856d83ed04e01
+#   pr.steps sha256 1767649e4896e9260eca62e8a61b919caab94a851154e0fa7d505342ee00340d
+
+===== v0 (origin/dev), after 64 tokens
+stretch 207 is the prompt of 64; 64 stretches before the next prompt or the end, 64 steps taken
+length 64: 64 decode steps in the steps file, 13.975 ms a step; the trace's: 13.852 ms; read floor at 620 GB/s
+
+by kind (a step): launches, ms, median us, GB/s, ms above the floor, ms of idle before them
+  i8 248320x2048                  1.0    7.729    7724.8     66    6.908    0.000
+  i8 12288x2048                  30.0    1.331      44.6    569    0.110    0.009
+  experts gate+up                40.0    0.775      19.1    487    0.166    0.011
+  i8 2048x4096                   40.0    0.685      17.2    491    0.143    0.011
+  experts down                   40.0    0.431      10.7    438    0.127    0.011
+  i8 512x2048                   100.0    0.393       3.9    270    0.222    0.028
+  cc_dnrec_k                     30.0    0.366      12.2      -        -    0.009
+  i8 8192x2048                   10.0    0.309      30.9    544    0.038    0.003
+  cc_attn_k                       9.8    0.251      25.4      -        -    0.052
+  cc_norm_k                     101.0    0.233       2.4      -        -    0.032
+  cc_route_k                     40.0    0.220       5.5      -        -    0.011
+  cc_ew_k                       120.0    0.142       1.1      -        -    0.034
+  i8 256x2048                    40.0    0.136       3.4    156    0.102    0.011
+  moe_sum_k                      40.0    0.136       3.4      -        -    0.011
+  i8 2048x512                    40.0    0.136       3.3    313    0.067    0.011
+  f32 64x2048                    30.0    0.079       2.8    203    0.053    0.008
+  f32 1x2048                     40.0    0.060       1.5     11    0.059    0.011
+  cc_dnconv_k                    30.0    0.049       1.6      -        -    0.009
+  cc_copy_grid_k                 20.0    0.021       1.1      -        -    0.006
+  copy DtoH                      21.0    0.014       0.7      -        -    0.044
+  cc_rope_f16_k                  10.0    0.013       1.3      -        -    0.003
+  cc_rope_k                      10.0    0.011       1.1      -        -    0.003
+  cc_attn_dec_k                   0.3    0.003       8.9      -        -    0.001
+
+idle inside a step: 0.330 ms = under 20 us 0.329 + over 0.001
+the pairs with the most idle before the second (a step: count, ms):
+  copy DtoH                    -> cc_attn_k                       9.8  0.052
+  cc_copy_grid_k               -> copy DtoH                      10.0  0.038
+  cc_ew_k                      -> cc_norm_k                      79.0  0.022
+  i8 512x2048                  -> i8 512x2048                    50.0  0.014
+  f32 1x2048                   -> experts gate+up                40.0  0.011
+  cc_norm_k                    -> i8 256x2048                    40.0  0.011
+  cc_ew_k                      -> i8 2048x512                    40.0  0.011
+  i8 2048x512                  -> f32 1x2048                     40.0  0.011
+  experts down                 -> moe_sum_k                      40.0  0.011
+  experts gate+up              -> experts down                   40.0  0.011
+  i8 512x2048                  -> cc_ew_k                        40.0  0.011
+  i8 2048x4096                 -> cc_ew_k                        40.0  0.011
+  cc_route_k                   -> i8 512x2048                    40.0  0.011
+  i8 256x2048                  -> cc_route_k                     40.0  0.011
+  moe_sum_k                    -> cc_ew_k                        40.0  0.011
+
+the recoverable, a step (ms):
+  idle between launches                   0.330
+  lm_head above the floor                 6.908  (of 7.729)
+  GEMV i8 >= 8 MB above the floor         0.291  (of 2.325)
+  GEMV i8 < 8 MB above the floor          0.391  (of 0.664)
+  f32 GEMV above the floor                0.112  (of 0.138)
+  experts above the floor                 0.293  (of 1.206)
+  small ops, their whole time (at most)    0.825  (cc_norm_k, cc_ew_k, cc_route_k, cc_rope_k, cc_rope_f16_k, moe_sum_k, cc_dnconv_k, cc_copy_grid_k, cc_signal_k)
+  copies, their whole time (at most)       0.014
+
+the median step (13.847 ms, 843 launches and copies) in base-64-passo.csv
+
+===== v0 (origin/dev), after 512 tokens
+stretch 272 is the prompt of 512; 64 stretches before the next prompt or the end, 64 steps taken
+step 24 of 512 runs more than one row (21.71 ms on the card, 26.23 ms in the steps file): left out
+length 512: 63 decode steps in the steps file, 14.024 ms a step; the trace's: 13.516 ms; read floor at 620 GB/s
+
+by kind (a step): launches, ms, median us, GB/s, ms above the floor, ms of idle before them
+  i8 248320x2048                  1.0    7.437    7352.5     69    6.615    0.000
+  i8 12288x2048                  30.0    1.330      44.6    569    0.110    0.009
+  experts gate+up                40.0    0.770      19.1    490    0.161    0.011
+  i8 2048x4096                   40.0    0.684      17.2    492    0.141    0.011
+  experts down                   40.0    0.427      10.6    442    0.123    0.011
+  i8 512x2048                   100.0    0.392       3.9    270    0.221    0.028
+  cc_dnrec_k                     30.0    0.367      12.2      -        -    0.009
+  i8 8192x2048                   10.0    0.309      30.9    544    0.038    0.003
+  cc_norm_k                     101.0    0.233       2.4      -        -    0.032
+  cc_route_k                     40.0    0.220       5.5      -        -    0.011
+  cc_attn_dec_k                  20.0    0.217      10.2      -        -    0.053
+  cc_ew_k                       120.0    0.142       1.1      -        -    0.034
+  i8 256x2048                    40.0    0.137       3.4    156    0.102    0.011
+  moe_sum_k                      40.0    0.136       3.4      -        -    0.011
+  i8 2048x512                    40.0    0.135       3.3    314    0.066    0.011
+  f32 64x2048                    30.0    0.079       2.8    202    0.053    0.008
+  f32 1x2048                     40.0    0.060       1.5     11    0.059    0.011
+  cc_dnconv_k                    30.0    0.050       1.6      -        -    0.009
+  cc_copy_grid_k                 20.0    0.021       1.1      -        -    0.006
+  copy DtoH                      21.0    0.014       0.6      -        -    0.046
+  cc_rope_f16_k                  10.0    0.013       1.3      -        -    0.003
+  cc_rope_k                      10.0    0.011       1.1      -        -    0.003
+
+idle inside a step: 0.331 ms = under 20 us 0.331 + over 0.000
+the pairs with the most idle before the second (a step: count, ms):
+  copy DtoH                    -> cc_attn_dec_k                  10.0  0.050
+  cc_copy_grid_k               -> copy DtoH                      10.0  0.039
+  cc_ew_k                      -> cc_norm_k                      79.0  0.022
+  i8 512x2048                  -> i8 512x2048                    50.0  0.014
+  cc_norm_k                    -> i8 256x2048                    40.0  0.011
+  cc_ew_k                      -> i8 2048x512                    40.0  0.011
+  i8 2048x512                  -> f32 1x2048                     40.0  0.011
+  f32 1x2048                   -> experts gate+up                40.0  0.011
+  i8 512x2048                  -> cc_ew_k                        40.0  0.011
+  i8 2048x4096                 -> cc_ew_k                        40.0  0.011
+  experts down                 -> moe_sum_k                      40.0  0.011
+  experts gate+up              -> experts down                   40.0  0.011
+  cc_route_k                   -> i8 512x2048                    40.0  0.011
+  i8 256x2048                  -> cc_route_k                     40.0  0.011
+  moe_sum_k                    -> cc_ew_k                        40.0  0.011
+
+the recoverable, a step (ms):
+  idle between launches                   0.331
+  lm_head above the floor                 6.615  (of 7.437)
+  GEMV i8 >= 8 MB above the floor         0.289  (of 2.323)
+  GEMV i8 < 8 MB above the floor          0.389  (of 0.663)
+  f32 GEMV above the floor                0.112  (of 0.139)
+  experts above the floor                 0.284  (of 1.198)
+  small ops, their whole time (at most)    0.827  (cc_norm_k, cc_ew_k, cc_route_k, cc_rope_k, cc_rope_f16_k, moe_sum_k, cc_dnconv_k, cc_copy_grid_k, cc_signal_k)
+  copies, their whole time (at most)       0.014
+
+the median step (13.417 ms, 853 launches and copies) in base-512-passo.csv
+
+===== v1 (this change), after 64 tokens
+stretch 220 is the prompt of 64; 64 stretches before the next prompt or the end, 64 steps taken
+length 64: 64 decode steps in the steps file, 7.136 ms a step; the trace's: 6.954 ms; read floor at 620 GB/s
+
+by kind (a step): launches, ms, median us, GB/s, ms above the floor, ms of idle before them
+  i8 12288x2048                  30.0    1.331      44.6    568    0.111    0.009
+  i8 248320x2048                  1.0    0.827     827.4    616    0.006    0.000
+  experts gate+up                40.0    0.773      19.0    488    0.164    0.011
+  i8 2048x4096                   40.0    0.686      17.2    490    0.144    0.011
+  experts down                   40.0    0.429      10.7    439    0.125    0.011
+  i8 512x2048                   100.0    0.395       3.9    268    0.224    0.028
+  cc_dnrec_k                     30.0    0.366      12.2      -        -    0.009
+  i8 8192x2048                   10.0    0.309      30.9    544    0.038    0.003
+  cc_attn_k                       9.8    0.251      25.5      -        -    0.052
+  cc_norm_k                     101.0    0.233       2.4      -        -    0.032
+  cc_route_k                     40.0    0.220       5.5      -        -    0.011
+  cc_ew_k                       120.0    0.143       1.1      -        -    0.034
+  i8 256x2048                    40.0    0.137       3.4    156    0.102    0.011
+  moe_sum_k                      40.0    0.136       3.4      -        -    0.011
+  i8 2048x512                    40.0    0.135       3.3    313    0.067    0.011
+  f32 64x2048                    30.0    0.079       2.8    203    0.053    0.008
+  copy DtoH                      22.0    0.068       0.7      -        -    0.047
+  f32 1x2048                     40.0    0.060       1.5     11    0.059    0.011
+  cc_dnconv_k                    30.0    0.049       1.6      -        -    0.009
+  cc_copy_grid_k                 20.0    0.021       1.1      -        -    0.006
+  cc_rope_f16_k                  10.0    0.013       1.3      -        -    0.003
+  cc_rope_k                      10.0    0.011       1.1      -        -    0.003
+  cc_attn_dec_k                   0.3    0.003       8.8      -        -    0.001
+
+idle inside a step: 0.334 ms = under 20 us 0.334 + over 0.000
+the pairs with the most idle before the second (a step: count, ms):
+  copy DtoH                    -> cc_attn_k                       9.8  0.052
+  cc_copy_grid_k               -> copy DtoH                      10.0  0.038
+  cc_ew_k                      -> cc_norm_k                      79.0  0.022
+  i8 512x2048                  -> i8 512x2048                    50.0  0.014
+  cc_norm_k                    -> i8 256x2048                    40.0  0.011
+  f32 1x2048                   -> experts gate+up                40.0  0.011
+  cc_ew_k                      -> i8 2048x512                    40.0  0.011
+  experts gate+up              -> experts down                   40.0  0.011
+  i8 2048x512                  -> f32 1x2048                     40.0  0.011
+  experts down                 -> moe_sum_k                      40.0  0.011
+  i8 2048x4096                 -> cc_ew_k                        40.0  0.011
+  i8 512x2048                  -> cc_ew_k                        40.0  0.011
+  cc_route_k                   -> i8 512x2048                    40.0  0.011
+  i8 256x2048                  -> cc_route_k                     40.0  0.011
+  moe_sum_k                    -> cc_ew_k                        40.0  0.011
+
+the recoverable, a step (ms):
+  idle between launches                   0.334
+  lm_head above the floor                 0.006  (of 0.827)
+  GEMV i8 >= 8 MB above the floor         0.292  (of 2.326)
+  GEMV i8 < 8 MB above the floor          0.393  (of 0.667)
+  f32 GEMV above the floor                0.112  (of 0.138)
+  experts above the floor                 0.289  (of 1.202)
+  small ops, their whole time (at most)    0.827  (cc_norm_k, cc_ew_k, cc_route_k, cc_rope_k, cc_rope_f16_k, moe_sum_k, cc_dnconv_k, cc_copy_grid_k, cc_signal_k)
+  copies, their whole time (at most)       0.068
+
+the median step (6.963 ms, 844 launches and copies) in pr-64-passo.csv
+
+===== v1 (this change), after 512 tokens
+stretch 285 is the prompt of 512; 64 stretches before the next prompt or the end, 64 steps taken
+step 24 of 512 runs more than one row (8.17 ms on the card, 11.65 ms in the steps file): left out
+length 512: 63 decode steps in the steps file, 7.063 ms a step; the trace's: 6.910 ms; read floor at 620 GB/s
+
+by kind (a step): launches, ms, median us, GB/s, ms above the floor, ms of idle before them
+  i8 12288x2048                  30.0    1.331      44.6    569    0.111    0.009
+  i8 248320x2048                  1.0    0.828     827.5    616    0.006    0.000
+  experts gate+up                40.0    0.767      19.0    492    0.158    0.011
+  i8 2048x4096                   40.0    0.684      17.1    492    0.141    0.011
+  experts down                   40.0    0.427      10.7    442    0.122    0.011
+  i8 512x2048                   100.0    0.394       3.9    269    0.223    0.028
+  cc_dnrec_k                     30.0    0.367      12.2      -        -    0.009
+  i8 8192x2048                   10.0    0.309      30.9    545    0.038    0.003
+  cc_norm_k                     101.0    0.233       2.4      -        -    0.032
+  cc_route_k                     40.0    0.220       5.5      -        -    0.011
+  cc_attn_dec_k                  20.0    0.218      10.4      -        -    0.055
+  cc_ew_k                       120.0    0.142       1.1      -        -    0.034
+  i8 256x2048                    40.0    0.137       3.4    156    0.102    0.011
+  moe_sum_k                      40.0    0.136       3.4      -        -    0.011
+  i8 2048x512                    40.0    0.134       3.3    315    0.066    0.011
+  f32 64x2048                    30.0    0.079       2.8    202    0.053    0.008
+  copy DtoH                      22.0    0.069       0.6      -        -    0.048
+  f32 1x2048                     40.0    0.060       1.5     11    0.059    0.011
+  cc_dnconv_k                    30.0    0.050       1.6      -        -    0.009
+  cc_copy_grid_k                 20.0    0.021       1.1      -        -    0.006
+  cc_rope_f16_k                  10.0    0.013       1.3      -        -    0.003
+  cc_rope_k                      10.0    0.011       1.1      -        -    0.003
+
+idle inside a step: 0.336 ms = under 20 us 0.336 + over 0.000
+the pairs with the most idle before the second (a step: count, ms):
+  copy DtoH                    -> cc_attn_dec_k                  10.0  0.052
+  cc_copy_grid_k               -> copy DtoH                      10.0  0.039
+  cc_ew_k                      -> cc_norm_k                      79.0  0.022
+  i8 512x2048                  -> i8 512x2048                    50.0  0.014
+  cc_norm_k                    -> i8 256x2048                    40.0  0.011
+  cc_ew_k                      -> i8 2048x512                    40.0  0.011
+  i8 2048x512                  -> f32 1x2048                     40.0  0.011
+  f32 1x2048                   -> experts gate+up                40.0  0.011
+  i8 512x2048                  -> cc_ew_k                        40.0  0.011
+  i8 2048x4096                 -> cc_ew_k                        40.0  0.011
+  experts down                 -> moe_sum_k                      40.0  0.011
+  experts gate+up              -> experts down                   40.0  0.011
+  cc_route_k                   -> i8 512x2048                    40.0  0.011
+  i8 256x2048                  -> cc_route_k                     40.0  0.011
+  moe_sum_k                    -> cc_ew_k                        40.0  0.011
+
+the recoverable, a step (ms):
+  idle between launches                   0.336
+  lm_head above the floor                 0.006  (of 0.828)
+  GEMV i8 >= 8 MB above the floor         0.289  (of 2.324)
+  GEMV i8 < 8 MB above the floor          0.392  (of 0.665)
+  f32 GEMV above the floor                0.112  (of 0.139)
+  experts above the floor                 0.280  (of 1.194)
+  small ops, their whole time (at most)    0.827  (cc_norm_k, cc_ew_k, cc_route_k, cc_rope_k, cc_rope_f16_k, moe_sum_k, cc_dnconv_k, cc_copy_grid_k, cc_signal_k)
+  copies, their whole time (at most)       0.069
+
+the median step (6.912 ms, 854 launches and copies) in pr-512-passo.csv

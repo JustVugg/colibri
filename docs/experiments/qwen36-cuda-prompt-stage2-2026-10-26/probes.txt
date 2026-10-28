@@ -1,0 +1,239 @@
+# qwen36 CUDA chain, two places to stage a prompt chunk's experts: the probes cited in the description (2026-10-26)
+# Google Colab T4 high-RAM VM, Qwen3.6-35B-A3B int4-g64, CUDA_EXPERT_GB=auto (6605 of the 10240 experts on the card), no heat file.
+# v0 = the spread residents, v1 = the same plus this change (as in the other files). Not bench measures: no manifest.
+
+## 1. The SM clock while the 512-token prompt alone computes
+# fase-a.sh step 11: A B B A = v0 v1 v1 v0, 60 s apart, a fresh process each (`qwen36-bench --model <model> --text promessi_sposi.txt --lengths 512 --gen 1 --teacher`,
+# the bench's environment), `nvidia-smi --query-gpu=timestamp,clocks.sm,clocks.mem,power.draw,temperature.gpu --format=csv -lms 50` beside it
+# (about 59 ms apart); the run's start and end as `date +%s.%N` in N-<version>.t0 and .t1. The card: 1590 MHz at most, 70 W limit, 585 MHz and 27 W idle.
+# The throttle-reasons column was asked for and not accepted by the driver: not captured.
+#   sha256 63e12dba75d1be16452f0e0151ae0bd9f17a48a8279b7e47a633082dccaf92ee  1-sparsi.smi
+#   sha256 6aa94e9af8375d2f99e891b0a98256c8688e82df3e0fc5d7a7ff1d6d8c499ac0  1-sparsi.t0
+#   sha256 20e37ed0a5ca2bf6e881b0731e92dfd34699e2bbbd1cc89d185da589d4d55d47  1-sparsi.t1
+#   sha256 0f8e5080c73ba792c6c72b542c9ce1712bfbbd3ec52b7a3dbc77f5d051787b6f  1-sparsi.csv
+#   sha256 fa4d533d55c464e2285d5943968d1b3b5c88631589470016b19db017279dcda3  2-sparsi2.smi
+#   sha256 e752d0cf135ba7433b2fbf044599d94364f000cbdc3314ba273751e10a46606e  2-sparsi2.t0
+#   sha256 52bdaf1137429789cb9d3c7ac965c6cd276d579193f249c68db220539cb5cd44  2-sparsi2.t1
+#   sha256 46839ec5db7e75992dc30c84f37bd88efe325be035a660bb6430cbc3bb507a9f  2-sparsi2.csv
+#   sha256 6d0422a0f3d54f7061c1aec57490ef9a96f1e774cffad43fda4f2284cf465d50  3-sparsi2.smi
+#   sha256 164c12f0923ecb646f2027b1e724084999f19331e2a06b21a8ff4b92d09445e4  3-sparsi2.t0
+#   sha256 122b580510745e0282a3e8928b13fa300c1f9bc51a716908582a4fb3e4910116  3-sparsi2.t1
+#   sha256 4cdb7cb228c994e0dcfd136ace8a0b3c4035f615e4d5e3f9a6e3d22e702a13f5  3-sparsi2.csv
+#   sha256 d64d1c883891afaea772e0b22d1861e57bae4b26e2b16d7361ab16d08eea944a  4-sparsi.smi
+#   sha256 3f46127df17d28c9139e755ed9f8aca154c87fe49cdb060e78a73532b175dd2e  4-sparsi.t0
+#   sha256 8ed44d4fa9fa10dafd0427da64aa77af457f571ad4ab293aa4bb66e4807dd960  4-sparsi.t1
+#   sha256 7d4b2b2e5113148146019dfd68751212e55086ae16248093d0c29fb2b7210b21  4-sparsi.csv
+
+### riassunto_orologi.py (the samples above 45 W in the last 5 s before the process ended)
+1-sparsi: prefill_s 1.010; 12 samples above 45 W in the last 5 s over 0.65 s; SM clock mean 1402 min 1200 max 1470 MHz; power mean 62.7 max 79.3 W; temp 51 C; 2 samples at 69 W or more; 471 samples, median spacing 58 ms
+2-sparsi2: prefill_s 0.782; 12 samples above 45 W in the last 5 s over 0.67 s; SM clock mean 1154 min 840 max 1575 MHz; power mean 59.5 max 69.3 W; temp 51 C; 2 samples at 69 W or more; 468 samples, median spacing 59 ms
+3-sparsi2: prefill_s 0.805; 10 samples above 45 W in the last 5 s over 0.54 s; SM clock mean 1318 min 1230 max 1575 MHz; power mean 62.4 max 70.4 W; temp 51 C; 1 samples at 69 W or more; 468 samples, median spacing 59 ms
+4-sparsi: prefill_s 1.003; 15 samples above 45 W in the last 5 s over 0.82 s; SM clock mean 1289 min 660 max 1575 MHz; power mean 59.2 max 68.7 W; temp 51 C; 0 samples at 69 W or more; 472 samples, median spacing 58 ms
+
+### analizza_orologi.py (bins of 0.5 s, the last 5 s before the process ended)
+== 1-sparsi: 24.7 s, prefill 1.010 s (507.17 tok/s), first token 74.9 ms, 471 samples, first -2.0 s, last +1.0 s from the run's ends
+   t-t1(s)   sm mean/min   power W   temp  throttle
+     -5.0       585/ 585      27.0     47  
+     -4.5       585/ 585      27.1     47  
+     -4.0       585/ 585      28.3     48  
+     -3.5      1212/ 585      53.4     51  
+     -3.0      1478/1350      58.4     51  
+     -2.5      1590/1590      36.2     50  
+     -2.0      1590/1590      35.3     49  
+     -1.5      1590/1590      35.0     49  
+     -1.0      1226/ 795      31.8     49  
+     -0.5       730/ 660      26.7     49  
+     +0.0       698/ 630      26.6     48  
+     +0.5       600/ 585      26.5     48  
+== 2-sparsi2: 24.4 s, prefill 0.782 s (654.69 tok/s), first token 60.1 ms, 468 samples, first -2.0 s, last +1.0 s from the run's ends
+   t-t1(s)   sm mean/min   power W   temp  throttle
+     -5.0       585/ 585      27.0     48  
+     -4.5       585/ 585      27.0     48  
+     -4.0       585/ 585      27.1     48  
+     -3.5       791/ 585      45.0     50  
+     -3.0      1356/1200      59.2     51  
+     -2.5      1590/1590      35.8     50  
+     -2.0      1590/1590      35.7     50  
+     -1.5      1590/1590      35.6     50  
+     -1.0      1309/ 840      32.0     49  
+     -0.5       725/ 630      26.7     49  
+     +0.0       641/ 630      26.7     49  
+     +0.5       585/ 585      26.6     49  
+== 3-sparsi2: 24.4 s, prefill 0.805 s (636.17 tok/s), first token 67.9 ms, 468 samples, first -2.0 s, last +1.0 s from the run's ends
+   t-t1(s)   sm mean/min   power W   temp  throttle
+     -5.0       585/ 585      27.0     48  
+     -4.5       585/ 585      27.0     48  
+     -4.0       585/ 585      27.0     48  
+     -3.5       908/ 585      48.2     51  
+     -3.0      1380/1245      57.4     51  
+     -2.5      1590/1590      35.8     50  
+     -2.0      1590/1590      35.3     50  
+     -1.5      1590/1590      35.5     50  
+     -1.0      1190/ 810      31.0     49  
+     -0.5       732/ 675      26.8     49  
+     +0.0       686/ 630      26.8     49  
+     +0.5       600/ 585      26.6     49  
+== 4-sparsi: 24.6 s, prefill 1.003 s (510.39 tok/s), first token 60.6 ms, 472 samples, first -2.0 s, last +1.0 s from the run's ends
+   t-t1(s)   sm mean/min   power W   temp  throttle
+     -5.0       585/ 585      27.0     48  
+     -4.5       585/ 585      27.0     48  
+     -4.0       585/ 585      29.6     48  
+     -3.5      1195/ 660      55.4     51  
+     -3.0      1468/1350      57.8     51  
+     -2.5      1590/1590      35.8     50  
+     -2.0      1590/1590      35.6     49  
+     -1.5      1590/1590      35.5     49  
+     -1.0      1263/ 855      31.6     49  
+     -0.5       717/ 645      26.8     49  
+     +0.0       696/ 645      26.8     49  
+     +0.5       600/ 585      26.6     48  
+
+## 2. nsys of the 512-token prompt alone: copies and kernels
+# `nsys profile --trace=cuda --sample=none --cpuctxsw=none` on the same command, one run (fase-c.sh step 15). The warm start's copies come right before the
+# prompt, so the window is the span from the first MoE kernel (hcg_moe_gu_k, 40 launches) to the end of the last (hcg_moe_dn_k).
+#   sha256 e2e0b0b7f5d7906b4fc5072ec247ce385d727e78131919631c5853f8f8d1bb9c  sparsi2-512.sqlite (this change; the VM of the runs above)
+#   sha256 cc643f4f7774bdadecbef9196c5ab65e6c04a2387d512e00afbb4cd5a376c1f5  sparsi2-512.steps
+#   sha256 b58d722883f803d3b66c6479ff2a5ef386b02678d78aeb028d212f8d3e1e2266  n512.sqlite (the spread warm start without this change, a heat file giving that layout; another VM of the same shape)
+#   sha256 2afe4132a91f287a8034ee1a318353d2a1defcfd584b182fd098be688821fa47  n512.steps
+
+### analizza_foto.py, with this change
+steps file: prompt 825.4 ms; MoE span 700.3 ms (first hcg_moe_gu_k to the last hcg_moe_dn_k end)
+in the span: kernels 585.6 ms, HtoD copies 582.6 ms, both at once 470.4 ms; 6.14 GB copied (10.5 GB/s while copying)
+layer period (first MoE start to the next): median 15.3 ms, mean 17.8, min 13.3, max 47.3
+
+### analizza_foto.py, without this change (the other trace)
+steps file: prompt 1010.6 ms; MoE span 904.9 ms (first hcg_moe_gu_k to the last hcg_moe_dn_k end)
+in the span: kernels 557.0 ms, HtoD copies 581.7 ms, both at once 241.9 ms; 6.30 GB copied (10.8 GB/s while copying)
+layer period (first MoE start to the next): median 21.0 ms, mean 23.1, min 18.9, max 46.8
+
+## 3. The base's sequence without promotions
+# fase-c.sh step 14: `COLI_CUDA_CHAIN_PROMOTE=0 qwen36-bench --model <model> --text promessi_sposi.txt --lengths 64,512 --gen 32 --teacher`, the bench's environment,
+# v0 v1 v1 v0 (runs 1 to 4), 30 s apart. Two runs a version: a probe of why the base's 512-token prompt does not change, not a measure.
+#   sha256 6ac88f44bd1781c380cc63d5e1eea9a99e8e16a0e0f3d869013db02e85599001  1-sparsi.csv
+#   sha256 462850803e50d280af811bba38acb1122610eda343beddfad2c56d5306c9a656  2-sparsi2.csv
+#   sha256 7e5bad038ad05928a6c937f4f6978cd66aff249d32c350960684627f1b8e2167  3-sparsi2.csv
+#   sha256 2c9353d0a70ea17eee9c3f15dee379c2b6507f002f5b348c8a3097c784eb7e68  4-sparsi.csv
+
+== 1 sparsi rc=0
+ctx_tokens,prefill_s,prefill_tps,gen_steady_tps,fingerprint,nll,top1
+64,0.772,82.87,38.564,241679338828cdee,2.70533,0.469
+512,1.148,446.15,41.493,041fa377ca3c4f96,2.98500,0.438
+== 2 sparsi2 rc=0
+ctx_tokens,prefill_s,prefill_tps,gen_steady_tps,fingerprint,nll,top1
+64,0.671,95.36,38.231,241679338828cdee,2.70533,0.469
+512,0.952,537.77,40.775,041fa377ca3c4f96,2.98500,0.438
+== 3 sparsi2 rc=0
+ctx_tokens,prefill_s,prefill_tps,gen_steady_tps,fingerprint,nll,top1
+64,0.670,95.47,36.421,241679338828cdee,2.70533,0.469
+512,0.959,533.83,39.849,041fa377ca3c4f96,2.98500,0.438
+== 4 sparsi rc=0
+ctx_tokens,prefill_s,prefill_tps,gen_steady_tps,fingerprint,nll,top1
+64,0.768,83.34,37.777,241679338828cdee,2.70533,0.469
+512,1.151,444.75,41.047,4c50020723e0ead3,2.97133,0.438
+
+## The scripts that read the raw files
+
+### riassunto_orologi.py
+#!/usr/bin/env python3
+"""riassunto_orologi.py <dir>: for each N-<version>.smi of fase-a.sh's step 11 (nvidia-smi samples beside the 512-token prompt alone),
+the samples above 45 W in the last 5 s before the process ended (N-<version>.t1): how many, over how long, the SM clock (mean, min,
+max, MHz), the power (mean, max, W), the temperature (C) and how many samples are at 69 W or more; then the spacing of the samples."""
+import csv, datetime, glob, os, re, statistics, sys
+num = lambda s: float(re.findall(r"[-+]?\d+\.?\d*", s)[0])
+for smi in sorted(glob.glob(os.path.join(sys.argv[1], "*.smi"))):
+    base = smi[:-4]
+    t1 = float(open(base + ".t1").read())
+    c = list(csv.DictReader(open(base + ".csv")))[-1]
+    rows = []
+    for x in list(csv.reader(open(smi)))[1:]:
+        ts = datetime.datetime.strptime(x[0].strip(), "%Y/%m/%d %H:%M:%S.%f").replace(tzinfo=datetime.timezone.utc).timestamp()
+        rows.append((ts - t1, num(x[1]), num(x[3]), num(x[4])))
+    w = [r for r in rows if -5 <= r[0] <= 0 and r[2] >= 45]
+    gaps = [(b[0] - a[0]) * 1000 for a, b in zip(rows, rows[1:])]
+    print(f"{os.path.basename(base)}: prefill_s {c['prefill_s']}; {len(w)} samples above 45 W in the last 5 s over {w[-1][0] - w[0][0]:.2f} s; "
+          f"SM clock mean {sum(r[1] for r in w) / len(w):.0f} min {min(r[1] for r in w):.0f} max {max(r[1] for r in w):.0f} MHz; "
+          f"power mean {sum(r[2] for r in w) / len(w):.1f} max {max(r[2] for r in w):.1f} W; temp {max(r[3] for r in w):.0f} C; "
+          f"{sum(1 for r in w if r[2] >= 69)} samples at 69 W or more; {len(rows)} samples, median spacing {statistics.median(gaps):.0f} ms")
+
+### analizza_orologi.py
+#!/usr/bin/env python3
+"""analizza_orologi.py <dir> [secondi]: the clocks during the 512 alone (fase-a.sh step 11). For each N-<versione>.smi
+(nvidia-smi every 50 ms: timestamp, clocks.sm, clocks.mem, power.draw, temperature.gpu[, throttle reasons]) it prints,
+for the last <secondi> (default 6) before the process ended (N-<versione>.t1), the bins of 0.5 s: mean and minimum
+SM clock (MHz), mean power (W), temperature, throttle reasons seen. The csv of the run says how long the prompt took."""
+import csv, re, sys, os, glob, datetime
+
+d = sys.argv[1]
+tail = float(sys.argv[2]) if len(sys.argv) > 2 else 6.0
+num = lambda s: float(re.findall(r"[-+]?\d+\.?\d*", s)[0])
+
+def parse(path):
+    rows = []
+    with open(path) as f:
+        r = csv.reader(f)
+        head = next(r)
+        for x in r:
+            if len(x) < 5:
+                continue
+            ts = datetime.datetime.strptime(x[0].strip(), "%Y/%m/%d %H:%M:%S.%f").replace(tzinfo=datetime.timezone.utc).timestamp()
+            rows.append((ts, num(x[1]), num(x[2]), num(x[3]), num(x[4]), x[5].strip() if len(x) > 5 else ""))
+    return head, rows
+
+for smi in sorted(glob.glob(os.path.join(d, "*.smi"))):
+    base = smi[:-4]
+    t0 = float(open(base + ".t0").read()); t1 = float(open(base + ".t1").read())
+    c = list(csv.DictReader(open(base + ".csv")))[-1]
+    head, rows = parse(smi)
+    print(f"== {os.path.basename(base)}: {t1 - t0:.1f} s, prefill {c['prefill_s']} s ({c['prefill_tps']} tok/s), first token {c['gen_first_ms']} ms, "
+          f"{len(rows)} samples, first {rows[0][0] - t0:+.1f} s, last {rows[-1][0] - t1:+.1f} s from the run's ends")
+    lo = t1 - tail
+    bins = {}
+    for ts, sm, mem, w, tmp, th in rows:
+        if ts < lo or ts > t1 + 1:
+            continue
+        bins.setdefault(int((ts - lo) / 0.5), []).append((sm, w, tmp, th))
+    print("   t-t1(s)   sm mean/min   power W   temp  throttle")
+    for b in sorted(bins):
+        v = bins[b]
+        print(f"   {lo + b * 0.5 - t1:+6.1f}   {sum(x[0] for x in v) / len(v):7.0f}/{min(x[0] for x in v):4.0f}   {sum(x[1] for x in v) / len(v):7.1f}   {max(x[2] for x in v):4.0f}  {','.join(sorted(set(x[3] for x in v)))}")
+
+### analizza_foto.py
+#!/usr/bin/env python3
+"""analizza_foto.py <p.sqlite> <p.steps>: the prompt of an nsys run of the bench (one chunk, 40 layers), window anchored on the
+MoE kernels: from the first hcg_moe_gu_k to the end of the last hcg_moe_dn_k (the warm start's copies come before and the
+idle-gap rule of analizza_nsys.py cannot cut them off here). In it: how long the card was busy with kernels, with copies, with
+both at once, the HtoD bytes, and the layers' period (the start of one MoE to the next), so the median layer."""
+import sqlite3, sys
+from statistics import median
+
+db, steps = sqlite3.connect(sys.argv[1]), sys.argv[2]
+names = dict(db.execute("SELECT id, value FROM StringIds"))
+K = sorted((s, e, names.get(n, str(n))) for s, e, n in db.execute("SELECT start, end, shortName FROM CUPTI_ACTIVITY_KIND_KERNEL"))
+C = sorted(db.execute("SELECT start, end, bytes, copyKind FROM CUPTI_ACTIVITY_KIND_MEMCPY"))
+gu = [k for k in K if k[2] == "hcg_moe_gu_k"]; dn = [k for k in K if k[2] == "hcg_moe_dn_k"]
+t0 = gu[-40][0]; t1 = dn[-1][1]
+ms = lambda ns: ns / 1e6
+prompt = [float(l.split()[4]) for l in open(steps) if l.split()[1] == "-1"][0]
+def union(iv):
+    iv = sorted(iv); out = []
+    for s, e in iv:
+        if out and s <= out[-1][1]: out[-1][1] = max(out[-1][1], e)
+        else: out.append([s, e])
+    return out
+def length(u): return sum(e - s for s, e in u)
+def inter(a, b):
+    i = j = tot = 0
+    while i < len(a) and j < len(b):
+        s, e = max(a[i][0], b[j][0]), min(a[i][1], b[j][1])
+        if e > s: tot += e - s
+        if a[i][1] < b[j][1]: i += 1
+        else: j += 1
+    return tot
+def clip(iv): return [(max(s, t0), min(e, t1)) for s, e in iv if e > t0 and s < t1]
+ku = union(clip([(s, e) for s, e, _ in K])); cu = union(clip([(s, e) for s, e, b, kind in C if kind == 1]))
+hb = sum(b for s, e, b, kind in C if kind == 1 and s >= t0 and s < t1)
+per = [ms(gu[-40 + i + 1][0] - gu[-40 + i][0]) for i in range(39)]
+print(f"steps file: prompt {prompt:.1f} ms; MoE span {ms(t1 - t0):.1f} ms (first hcg_moe_gu_k to the last hcg_moe_dn_k end)")
+print(f"in the span: kernels {ms(length(ku)):.1f} ms, HtoD copies {ms(length(cu)):.1f} ms, both at once {ms(inter(ku, cu)):.1f} ms; "
+      f"{hb / 1e9:.2f} GB copied ({hb / 1e9 / ms(length(cu)) * 1e3:.1f} GB/s while copying)")
+print(f"layer period (first MoE start to the next): median {median(per):.1f} ms, mean {sum(per) / len(per):.1f}, min {min(per):.1f}, max {max(per):.1f}")

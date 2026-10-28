@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "hypothesis": "Without a heat file the CUDA tier's warm start fills the card in index order, whole layers: on a T4 holding 6605 of 10240 experts layers 0-24 sit on the card and layers 26-39 hold none, so a prompt chunk copies all of each later layer's experts over the bus after running 25 layers with the bus idle (by construction; no bus timeline was taken). Taking expert 0 of every layer, then expert 1, makes every layer copy its share beside the work of the layer before, and the 512-token prompt that follows a 64-token one and its 32 decode steps is faster.",
+  "commit": "c1c06ac6fcb32157e4da130fd96775a32a757052",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64",
+  "command": "bench.c built against c/ (cd c && make <objects> CUDA=1 CUDA_ARCH=sm_75, as the record's setup); COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close ./qwen36-bench --model <model> --text promessi_sposi.txt --lengths 64,512 --gen 32 --teacher",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.00GHz (4 cores / 8 threads) + NVIDIA Tesla T4 (15360 MiB, sm_75, up to PCIe Gen3 x16)",
+    "ram": "51 GiB",
+    "storage": "Google Colab VM disk",
+    "os": "Ubuntu 24.04.4 LTS (Google Colab, T4 high-RAM), CUDA 13.0, driver 580.82.07"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "heat_file": "none",
+      "scenario": "the 512-token prompt after a 64-token prompt and its 32 decode steps, one process",
+      "tok_s": "prompt tokens / the prompt's seconds (bench's prefill_tps of the 512 row)",
+      "engine_build": "dev c1c06ac6 + #2416 + #2417 (c9de4e91)"
+    },
+    "samples": {
+      "tok_s": [
+        438.14,
+        439.53,
+        439.92,
+        438.27
+      ],
+      "prefill_s_512": [
+        1.169,
+        1.165,
+        1.164,
+        1.168
+      ],
+      "decode_tok_s_512": [
+        48.879,
+        48.944,
+        48.756,
+        48.679
+      ],
+      "nll_512": [
+        2.93403,
+        2.93403,
+        2.93403,
+        2.93403
+      ]
+    },
+    "median_tok_s": 438.9,
+    "quality": {
+      "method": "make -C c check (macOS arm64), 2763 tests; on the T4 and on the RTX 3070 with the code measured make -C c cuda-test, cuda-chain-check, tests/test_qwen36_cuda_chain and the tier tests pass. The PR without a heat file gives the bits of dev with a heat file in the same order (correctness.txt: 64 and 512 tokens on both cards); the same prompts and teacher-forced answers in every run of both versions; the experts moved to the card run on its kernels instead of the CPU's, so the logits of a conversation move in the last digits",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-tier-spread-2026-10-27/t4-t1t2.txt",
+      "sha256": "c9a3c532e6789c741c0038f6650a4e68b52367b15843f42800444a03905d6091"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "heat_file": "none",
+      "scenario": "the 512-token prompt after a 64-token prompt and its 32 decode steps, one process",
+      "tok_s": "prompt tokens / the prompt's seconds (bench's prefill_tps of the 512 row)",
+      "engine_build": "c9de4e91 + this change (4168061c)"
+    },
+    "samples": {
+      "tok_s": [
+        500.93,
+        502.1,
+        502.02,
+        501.7
+      ],
+      "prefill_s_512": [
+        1.022,
+        1.02,
+        1.02,
+        1.021
+      ],
+      "decode_tok_s_512": [
+        48.431,
+        47.953,
+        48.461,
+        48.165
+      ],
+      "nll_512": [
+        2.94173,
+        2.94173,
+        2.94173,
+        2.94173
+      ]
+    },
+    "median_tok_s": 501.86,
+    "quality": {
+      "method": "make -C c check (macOS arm64), 2763 tests; on the T4 and on the RTX 3070 with the code measured make -C c cuda-test, cuda-chain-check, tests/test_qwen36_cuda_chain and the tier tests pass. The PR without a heat file gives the bits of dev with a heat file in the same order (correctness.txt: 64 and 512 tokens on both cards); the same prompts and teacher-forced answers in every run of both versions; the experts moved to the card run on its kernels instead of the CPU's, so the logits of a conversation move in the last digits",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-tier-spread-2026-10-27/t4-t1t2.txt",
+      "sha256": "c9a3c532e6789c741c0038f6650a4e68b52367b15843f42800444a03905d6091"
+    }
+  },
+  "outcome": "improvement"
+}

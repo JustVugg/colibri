@@ -50,23 +50,33 @@ def blocks(name, shape, rng, std=0.02):
     return raw.reshape(*shape[:-1], nb * size)
 
 
-def write_model(path, rng, dense=False, same_gate_up=False, token=None):
+def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=False):
     """dense: llama.cpp's qwen35 (a dense model of the family): an MLP per layer instead of the
     experts, and no output.weight (the head tied to token_embd), as the small checkpoints ship.
     same_gate_up: every layer's expert up in its gate's type (layer 0 IQ2_XXS, the others
-    Q4_K), the pairing the Vulkan tier keeps as the file's blocks."""
+    Q4_K), the pairing the Vulkan tier keeps as the file's blocks.
+    ollama: the file as Ollama's converter writes it (the blob of qwen3.6:35b): head_count_kv
+    an array per layer (0 on the DeltaNet layers), rope.dimension_sections of three, the flags
+    ssm.v_head_reordered and rope.mrope_interleaved, the DeltaNet's dt bias named ssm_dt, the
+    shared expert's gate as F16 of shape [H, 1], and the MTP head (mtp.*) and the vision tower
+    (v.*) in the model's file. The same weights as without."""
     arch = "qwen35" if dense else "qwen35moe"
     w = gguf.GGUFWriter(str(path), arch)
     p = arch + "."
     moe = (("feed_forward_length", I),) if dense else \
         (("expert_count", E), ("expert_used_count", TOPK), ("expert_feed_forward_length", I), ("expert_shared_feed_forward_length", I))
     for k, v in (("block_count", LAYERS), ("embedding_length", H), ("attention.head_count", QH),
-                 ("attention.head_count_kv", KVH), ("attention.key_length", HD), ("attention.value_length", HD),
+                 *(() if ollama else (("attention.head_count_kv", KVH),)), ("attention.key_length", HD), ("attention.value_length", HD),
                  *moe, ("full_attention_interval", 4),
                  ("rope.dimension_count", HD // 4), ("ssm.conv_kernel", 4), ("ssm.state_size", KD),
                  ("ssm.group_count", KH), ("ssm.time_step_rank", VH), ("ssm.inner_size", VH * KD),
                  ("context_length", 4096)):
         w.add_uint32(p + k, v)
+    if ollama:
+        w.add_array(p + "attention.head_count_kv", [KVH if (L + 1) % 4 == 0 else 0 for L in range(LAYERS)])
+        w.add_array(p + "rope.dimension_sections", [HD // 16, HD // 16, HD // 8])
+        w.add_bool(p + "ssm.v_head_reordered", True); w.add_bool(p + "rope.mrope_interleaved", True)
+        w.add_uint32(p + "vision.block_count", 1); w.add_uint32(p + "image_token_id", VOCAB - 2)
     w.add_float32(p + "rope.freq_base", 1e7); w.add_float32(p + "attention.layer_norm_rms_epsilon", 1e-6)
     toks = [f"<0x{b:02X}>" if b < 256 else f"t{b}" for b in range(VOCAB - 3)] + ["<|endoftext|>", "<|im_start|>", "<|im_end|>"]
     if token:   # token: one of the vocabulary's words in its place (a non-ASCII one, say)
@@ -90,7 +100,10 @@ def write_model(path, rng, dense=False, same_gate_up=False, token=None):
             q(b + "ffn_gate.weight", (I, H), "Q4_K"); q(b + "ffn_up.weight", (I, H), "Q4_K")
             q(b + "ffn_down.weight", (H, I), "Q6_K" if L % 2 else "Q5_K")
         else:
-            f32(b + "ffn_gate_inp.weight", (E, H)); f32(b + "ffn_gate_inp_shexp.weight", (H,))
+            f32(b + "ffn_gate_inp.weight", (E, H))
+            sg = (rng.standard_normal((H,)) * 0.02).astype(np.float32)
+            if ollama: w.add_tensor(b + "ffn_gate_inp_shexp.weight", sg.astype(np.float16).reshape(1, H))
+            else: w.add_tensor(b + "ffn_gate_inp_shexp.weight", sg.astype(np.float16).astype(np.float32))
             q(b + "ffn_gate_shexp.weight", (I, H), "Q8_0"); q(b + "ffn_up_shexp.weight", (I, H), "Q8_0")
             q(b + "ffn_down_shexp.weight", (H, I), "Q8_0")
             q(b + "ffn_gate_exps.weight", (E, I, H), "IQ2_XXS" if L == 0 else "Q4_K")
@@ -104,9 +117,12 @@ def write_model(path, rng, dense=False, same_gate_up=False, token=None):
             q(b + "attn_qkv.weight", (conv, H), "Q8_0"); q(b + "attn_gate.weight", (VH * KD, H), "Q8_0")
             w.add_tensor(b + "ssm_a", -np.exp(rng.standard_normal(VH).astype(np.float32) * 0.1))
             f32(b + "ssm_alpha.weight", (VH, H)); f32(b + "ssm_beta.weight", (VH, H))
-            f32(b + "ssm_conv1d.weight", (conv, 4)); w.add_tensor(b + "ssm_dt.bias", np.zeros(VH, np.float32))
+            f32(b + "ssm_conv1d.weight", (conv, 4)); w.add_tensor(b + ("ssm_dt" if ollama else "ssm_dt.bias"), np.zeros(VH, np.float32))
             w.add_tensor(b + "ssm_norm.weight", np.ones(KD, np.float32))
             q(b + "ssm_out.weight", (H, VH * KD), "Q8_0")
+    if ollama:   # the MTP head and the vision tower, in the model's file
+        f32("mtp.fc.weight", (H, 2 * H)); f32("mtp.layers.0.attn_norm.weight", (H,)); f32("mtp.layers.0.ffn_gate_inp.weight", (E, H))
+        f32("v.blk.0.attn_q.weight", (H, H)); f32("v.blk.0.attn_q.bias", (H,)); f32("v.patch_embd.weight", (H, 3, 2, 2))
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
 
 
@@ -551,6 +567,56 @@ class GgufImport(unittest.TestCase):
         for k in ("expert_count", "expert_layers", "expert_bytes", "per_cap_bytes", "dense_bytes"):
             self.assertEqual(a[k], b[k], k)
         self.assertEqual(a["expert_count"], LAYERS * E)
+
+
+@unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+@unittest.skipUnless(ENGINE.is_file(), "qwen36 is not built")
+class OllamaQwen35Moe(unittest.TestCase):
+    """The blob Ollama pulls for qwen3.6:35b comes from Ollama's converter, not llama.cpp's:
+    head_count_kv is an array per layer (0 on the DeltaNet layers), the DeltaNet's dt bias is
+    blk.N.ssm_dt, and the MTP head and the vision tower sit in the model's file. The import
+    used to stop on the array, and the engine's check refused the file for the tensors it
+    would not use; now both give the llama.cpp file's config and tokens."""
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(); d = Path(cls.tmp.name)
+        cls.src = {}
+        for kind in ("llama", "ollama"):
+            cls.src[kind] = d / f"tiny-{kind}.gguf"
+            write_model(cls.src[kind], np.random.default_rng(11), ollama=kind == "ollama")
+            p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(cls.src[kind]), str(d / kind), "--mode", "link"],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            assert p.returncode == 0, p.stdout.decode()
+        cls.ref = d / "ref.json"
+        cls.ref.write_text(json.dumps({"prompt_ids": [5, 6, 7, 8], "full_ids": [5, 6, 7, 8] + [0] * 12}))
+        cls.dir = d
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_the_same_config(self):
+        a = json.loads((self.dir / "llama" / "config.json").read_text())
+        b = json.loads((self.dir / "ollama" / "config.json").read_text())
+        self.assertEqual(b["num_key_value_heads"], KVH)
+        for cfg in (a, b):   # the import's record of its source names the file
+            for k in [k for k, v in cfg.items() if isinstance(v, dict) and "source" in v]: cfg.pop(k)
+        self.assertEqual(a, b)
+
+    def test_the_check_passes(self):
+        p = subprocess.run([str(ENGINE), "2", "8", str(self.ref)], env=dict(os.environ, SNAP=str(self.src["ollama"]), GGUF_CHECK="1",
+                           OMP_NUM_THREADS="2", COLI_NO_OMP_TUNE="1"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        out = p.stdout.decode("utf-8", "replace")
+        self.assertEqual(p.returncode, 0, out[-2000:])
+        self.assertIn("GGUF CHECK OK", out)
+        self.assertNotIn("not used by the qwen36 engine", out)
+
+    def test_the_same_tokens(self):
+        for env in ({}, {"GQ_EXACT": "1"}):
+            with self.subTest(path="exact" if env else "integer"):
+                a = engine_tokens(self.src["llama"], self.ref, env)
+                self.assertEqual(engine_tokens(self.src["ollama"], self.ref, env), a)
+                self.assertEqual(engine_tokens(self.dir / "ollama", self.ref, env), a)
 
 
 @unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")

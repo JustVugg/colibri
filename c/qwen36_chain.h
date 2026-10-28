@@ -1545,6 +1545,7 @@ static void q36c_dmoe_done(Q36Chain *ch, Model *m, int from, int to, int n, int 
  * layers after it run elsewhere (the second device's chain, the CPU). */
 static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_base, FILE *lf, int want_x, int nlogits,
                             float *logit, int *rows_only, int *lost) {
+    double t_fwd = tm_now();   /* the hybrid steps' gate times the forward (vkc_dmoe_forward_done) */
     *rows_only = 0; *lost = 0;
     Cfg *c = &m->c; int D = c->hidden, L = ch->n, lo = ch->lo, hi = lo + L, E = c->n_experts;   /* L: the layers on the device */
     int part = hi < c->n_layers || !ch->head;
@@ -1721,6 +1722,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
     ch->snap_valid = snapped;
     vkc_gemm_rows(-1);
     ch->forwards++;
+    if (dmoe) vkc_dmoe_forward_done(&ch->dm, S, tm_now() - t_fwd);
     *rows_only = part;
     return L;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */

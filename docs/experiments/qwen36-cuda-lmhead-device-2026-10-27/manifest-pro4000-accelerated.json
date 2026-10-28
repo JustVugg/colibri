@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "hypothesis": "Writing the lm_head's 248320 logits in device memory and copying them to the host once, instead of storing a float a warp into mapped host memory, raises Qwen3.6's decode with the MTP head's drafts on an RTX PRO 4000 with every expert in VRAM, with the same logits",
+  "commit": "c1c06ac6fcb32157e4da130fd96775a32a757052",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64",
+  "command": "cd c && make qwen36_tier.o backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o CUDA=1 CUDA_ARCH=sm_120 && gcc -O3 -march=native -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_CUDA -I. ../docs/experiments/qwen36-cuda-lmhead-device-2026-10-27/bench.c qwen36_tier.o backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o -o qwen36-bench -lm -fopenmp -pthread -L/usr/local/cuda/lib64 -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -lcublasLt -lcublas -lstdc++; LD_LIBRARY_PATH=/usr/local/cuda/lib64 COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close OMP_NUM_THREADS=10 Q36_MTP=1 Q36_MTP_DRAFTS=1 ./qwen36-bench --model <model> --text <dir>/promessi_sposi.txt --lengths 64,512 --gen 32 --teacher --steps /workspace/m/accelerato/v1-runN.steps",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "cpu": "Intel(R) Core(TM) Ultra 9 285K (24 CPUs, 36 MiB L3) + NVIDIA RTX PRO 4000 Blackwell (24467 MiB, sm_120)",
+    "ram": "125 GiB",
+    "storage": "the model on the machine's local disk before the runs, then read once into the page cache",
+    "os": "Ubuntu 24.04.1 LTS, Linux 6.8.0-146-generic x86_64, CUDA 12.8 (nvcc V12.8.93), driver 615.71.09, gcc (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "prompt_tokens": 64,
+      "decode_steps": 32,
+      "engine_build": "c1c06ac6",
+      "Q36_MTP": 1,
+      "Q36_MTP_DRAFTS": 1,
+      "mtp_head": "convert_qwen36.py --mtp-only",
+      "OMP_NUM_THREADS": 10
+    },
+    "samples": {
+      "tok_s": [
+        60.102,
+        60.002,
+        59.841,
+        59.703
+      ],
+      "decode_tok_s_after_512": [
+        66.571,
+        66.756,
+        66.917,
+        66.868
+      ],
+      "prompt_tok_s_64": [
+        319.66,
+        333.96,
+        332.95,
+        319.41
+      ],
+      "prompt_tok_s_512": [
+        2755.31,
+        2754.77,
+        2759.91,
+        2733.82
+      ]
+    },
+    "median_tok_s": 59.9215,
+    "quality": {
+      "method": "make -C c check (macOS arm64) and make -C c cuda-chain-check cuda-test CUDA=1 CUDA_ARCH=sm_120 pass; every run of both versions gives the same fingerprint of every logit and token (FNV-1a: 01f80ce3d69b39fd at 64 tokens, 4d9728e495c7aba9 at 512) and the same teacher-forced nll (2.69932 and 2.95291)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-lmhead-device-2026-10-27/pro4000-accelerated.txt",
+      "sha256": "331d0cb9c65e32bee3a9284c4584b759cc82471172230ec82eb81c8be0dc60ad"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "prompt_tokens": 64,
+      "decode_steps": 32,
+      "engine_build": "c1c06ac6 + this change",
+      "Q36_MTP": 1,
+      "Q36_MTP_DRAFTS": 1,
+      "mtp_head": "convert_qwen36.py --mtp-only",
+      "OMP_NUM_THREADS": 10
+    },
+    "samples": {
+      "tok_s": [
+        157.684,
+        157.42,
+        157.745,
+        157.747
+      ],
+      "decode_tok_s_after_512": [
+        174.295,
+        174.116,
+        174.101,
+        173.877
+      ],
+      "prompt_tok_s_64": [
+        328.39,
+        328.65,
+        344.9,
+        344.69
+      ],
+      "prompt_tok_s_512": [
+        2865.08,
+        2868.88,
+        2873.33,
+        2873.19
+      ]
+    },
+    "median_tok_s": 157.7145,
+    "quality": {
+      "method": "make -C c check (macOS arm64) and make -C c cuda-chain-check cuda-test CUDA=1 CUDA_ARCH=sm_120 pass; every run of both versions gives the same fingerprint of every logit and token (FNV-1a: 01f80ce3d69b39fd at 64 tokens, 4d9728e495c7aba9 at 512) and the same teacher-forced nll (2.69932 and 2.95291)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-lmhead-device-2026-10-27/pro4000-accelerated.txt",
+      "sha256": "331d0cb9c65e32bee3a9284c4584b759cc82471172230ec82eb81c8be0dc60ad"
+    }
+  },
+  "outcome": "improvement"
+}
