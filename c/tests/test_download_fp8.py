@@ -1,4 +1,7 @@
 import os
+import http.server
+import shutil
+import threading
 import sys
 import tempfile
 import types
@@ -54,13 +57,77 @@ class DownloadExitStatusTests(unittest.TestCase):
                     mock.patch.object(download_fp8.time, "sleep"):
                 for metadata in self.META_FILES:
                     open(os.path.join(dest, metadata), "wb").close()
-                def fallback(fn, base, expected):
-                    self.assertIn(quote("release/tag", safe=""), base)
+                def fallback(fn, url, expected):
+                    self.assertIn(quote("release/tag", safe=""), url)
+                    if source == "ms":
+                        self.assertEqual(parse_qs(urlsplit(url).query)["FilePath"], [name])
+                    else:
+                        self.assertTrue(urlsplit(url).path.endswith("/" + name))
                     with open(os.path.join(dest, fn), "wb") as out:
                         out.write(b"data")
                     return True
                 with mock.patch.object(download_fp8, "download_file_curl", side_effect=fallback):
                     self.assertEqual(self.run_main(dest, "--source", source), 0)
+
+    @unittest.skipUnless(shutil.which("curl"), "curl is required for the fallback")
+    def test_curl_fallback_requests_the_exact_remote_filename(self):
+        # Check the actual request sent by curl against the two service contracts:
+        # ModelScope uses FilePath as a query value; HF uses a resolve path.
+        name = "nested/model#1&part.safetensors"
+        revision = "release/tag"
+        requests_seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests_seen.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Length", "4")
+                self.end_headers()
+                self.wfile.write(b"data")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        real_run = download_fp8.subprocess.run
+        try:
+            for source, variable in (("ms", "GLM_MS_REVISION"), ("hf", "GLM_HF_REVISION")):
+                def local_run(command, **kwargs):
+                    command = list(command)
+                    remote = urlsplit(command[-1])
+                    command[-1] = (f"http://127.0.0.1:{server.server_port}"
+                                   f"{remote.path}?{remote.query}")
+                    # The transport is real; only its origin is replaced.
+                    return real_run(command, **kwargs)
+
+                with self.subTest(source=source), tempfile.TemporaryDirectory() as dest, \
+                        mock.patch.dict(os.environ, {variable: revision}), \
+                        mock.patch.object(download_fp8, f"get_shard_list_{source}",
+                                          return_value=([name], {name: 4})), \
+                        mock.patch.object(download_fp8, f"download_file_{source}"), \
+                        mock.patch.object(download_fp8.subprocess, "run", side_effect=local_run):
+                    os.makedirs(os.path.join(dest, "nested"))
+                    for metadata in self.META_FILES:
+                        open(os.path.join(dest, metadata), "wb").close()
+                    self.assertEqual(self.run_main(dest, "--source", source, "--parallel", "1"), 0)
+                    request = urlsplit(requests_seen[-1])
+                    if source == "ms":
+                        query = parse_qs(request.query)
+                        self.assertEqual(query["Revision"], [revision])
+                        self.assertEqual(query["FilePath"], [name])
+                    else:
+                        self.assertEqual(request.path,
+                                         f"/{download_fp8.REPO_HF}/resolve/"
+                                         f"{quote(revision, safe='')}/{quote(name, safe='/')}")
+                        self.assertEqual(request.query, "")
+                    with open(os.path.join(dest, name), "rb") as shard:
+                        self.assertEqual(shard.read(), b"data")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
     def test_wrong_size_sdk_shard_reaches_curl_fallback(self):
         name = "model-00001.safetensors"
