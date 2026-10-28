@@ -2364,6 +2364,22 @@ class WindowsToolchainTests(unittest.TestCase):
 
 
 
+class SetupPortValidation(unittest.TestCase):
+    def test_explicit_invalid_port_stops_before_setup_work(self):
+        # In particular, zero must not disappear into the default-port fallback.
+        for port in (0, -1, 65536):
+            for saved in (None, {"status": "ready", "port": 8123}):
+                with self.subTest(port=port, saved=saved), \
+                     mock.patch.object(setup_flow, "load_config", return_value=saved) as load, \
+                     mock.patch.object(setup_flow, "write_state") as state, \
+                     mock.patch.object(setup_hw, "detect", side_effect=AssertionError("hardware probed")) as detect:
+                    with self.assertRaisesRegex(setup_flow.SetupError, "port must be from 1 to 65535"):
+                        setup_flow.cmd_setup(setup_args(port=port))
+                    load.assert_not_called()
+                    state.assert_not_called()
+                    detect.assert_not_called()
+
+
 class PortFreeTest(unittest.TestCase):
     """A port is free when nothing answers on it AND a server could bind it now."""
 
