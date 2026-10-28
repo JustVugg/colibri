@@ -1657,12 +1657,27 @@ class WholeSetup(HomeTestCase):
 
     def test_list_json(self):
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        # RAM and catalog are fixtures; disk capacity must describe that same
+        # machine, rather than the filesystem the test happens to run on.
+        with mock.patch.object(setup_hw, "disk_free", return_value=10 * 10**9), \
+             contextlib.redirect_stdout(out):
             code = setup_flow.run(setup_flow.cmd_setup, setup_args(list=True, json=True))
         self.assertEqual(code, 0)
         rows = json.loads(out.getvalue()[out.getvalue().index("["):])
         self.assertEqual(rows[0]["id"], "tiny")
         self.assertTrue(rows[0]["recommended"])
+
+    def test_list_json_without_disk_has_no_recommendation(self):
+        out = io.StringIO()
+        with mock.patch.object(setup_hw, "disk_free", return_value=0), \
+             contextlib.redirect_stdout(out):
+            code = setup_flow.run(setup_flow.cmd_setup, setup_args(list=True, json=True))
+        self.assertEqual(code, 0)
+        rows = json.loads(out.getvalue()[out.getvalue().index("["):])
+        self.assertEqual(rows[0]["id"], "tiny")
+        self.assertFalse(rows[0]["recommended"])
+        self.assertFalse(rows[0]["fits"])
+        self.assertEqual(rows[0]["status"], "needs-disk")
 
 
 FAKE_SERVER = r'''
