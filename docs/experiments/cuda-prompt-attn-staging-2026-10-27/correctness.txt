@@ -1,0 +1,212 @@
+# CUDA chain, the prompt attention stages K and V with 16-byte loads: the tests, and the kernel each version runs (2026-10-27)
+# Google Colab T4 high-RAM VM: Intel(R) Xeon(R) CPU @ 2.00GHz (4 cores / 8 threads, 38.5 MiB L3) + NVIDIA Tesla T4 (15360 MiB, sm_75, up to PCIe Gen3 x16), 51 GiB; Ubuntu 24.04.4 LTS, CUDA 13.0 (nvcc V13.0.88), driver 580.82.07, gcc 13.3.0.
+# Model: Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 (int4, 64-input groups; 40 layers of 256 experts, 10 of them full attention with 16 query heads and 2 kv heads of 256); CUDA_EXPERT_GB=auto: 6605 of the 10240 experts on the card, 3635 in the page-locked host pool, no heat file.
+# This change's commit is ab62cf3d (c/ tree fe6dc21f6a6a8135f95623b25d9d655b6d63c604), on origin/dev c1c06ac6.
+# Harness: bench.c beside this file (sha256 8bfbeab882467558e8647dd03543ded67696e64917c4a4c2b137d146de2db458), built against each version's c/ by bench's driver (make CUDA=1 CUDA_ARCH=sm_75).
+
+## the tests of this commit, on another Colab T4 high-RAM VM of the same shape: each make log's sha256 and its result lines
+
+=== make cuda-chain-check CUDA_ARCH=sm_75, on this change on origin/dev (ab62cf3d) (make log sha256 ff8a66c38f2f320122791cf68979400d12ae78b7fa3096461fa434a602227094, rc 0) ===
+ab62cf3d CUDA chain: the prompt attention stages K and V with 16-byte loads
+  ok   prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate
+  prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate: max |diff| 1.52e-04
+  ok   prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate
+  prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate: max |diff| 7.48e-05
+  ok   prompt rows: H 8 KV 8 hd 128, 17 rows after 200
+  prompt rows: H 8 KV 8 hd 128, 17 rows after 200: max |diff| 4.84e-05
+  ok   prompt rows: H 16 KV 4 hd 128, 64 rows after 0
+  prompt rows: H 16 KV 4 hd 128, 64 rows after 0: max |diff| 3.16e-04
+  ok   prompt rows: H 16 KV 2 hd 256, 2043 rows after 6144: aligned K and V, the scalar loop's bits
+  ok   and rows 0, 1, 1024 and 2042 within 4e-3 of the reference
+  rows 0, 1, 1024 and 2042 after 6144: max |diff| 1.38e-05
+OK test_cuda_chain: every op of the CUDA chain matches its reference
+  ok   a failed launch loses the device to the chain
+  ok   every later call returns 0
+OK test_cuda_chain: every op of the CUDA chain matches its reference
+
+=== the same with the 16-byte staging rounding toward zero (__float2half_rz, by sed): the bits check must fail, the check against the reference must pass (make log sha256 aade7fbdbc63fff7cc9c24d3d1bd31894479e6c744f38fb707bb71792d0b2cbb, make rc 2, as the step wants) ===
+ c/cuda_chain.cu | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+  FAIL prompt rows: H 16 KV 2 hd 256, 2043 rows after 6144: aligned K and V, the scalar loop's bits
+  ok   and rows 0, 1, 1024 and 2042 within 4e-3 of the reference
+  rows 0, 1, 1024 and 2042 after 6144: max |diff| 3.49e-05
+make rc=2
+?? cuda_chain_test
+
+=== make cuda-test CUDA=1 CUDA_ARCH=sm_75, on ab62cf3d: each test binary and its last line (make log sha256 a6ad0c4e876b24fee241ae10fd06708c1447d688548d16f68f9e92237dd8fce6, rc 0) ===
+./backend_cuda_test: cuda backend: q8/q4/q2/f32/e8 correctness ok on 1 device(s)
+./cuda_init_failure_test: CUDA initialization rollback: PASS
+./ragged_attention_test: ragged_relative_rms=0 ragged_g64_relative_rms=0 warm_ms=5.853 cross_page_growth_ms=0.112 grow_1024_ms=2.526 steady_1024_ms=0.284
+./cuda_fmt_trap_test: cuda fmt trap tests: ok
+./fp8_warp_test: OK
+./absorb_determinism_test: absorb_determinism iters_per_cell=30 S_batch=128 S_ragged=128 batch_differing=0/145 batch_worst_pct_of_range=0 ragged_differing=0/29 ragged_worst_pct_of_range=0
+./fp8_cuda_test: OK
+./weights_owned_test: weights_owned upload-failure test passed (8 fail cycles, 0 bytes cumulative)
+./mxfp4_cuda_test: test_mxfp4_cuda: ok
+./mxfp4_expert_cuda_test: ok SiTU expert S=1 D=64 I=128 b1=1.5 b2=2.5
+./alloc_footprint_test: test_alloc_footprint_cuda: ok
+
+=== ab62cf3d cherry-picked on the stack (3cf06708): the test file conflicts with the stack's two staging places (fetch_at), whose test functions go in the same place before main; both kept, the lines added and removed are this change's ===
+M  c/cuda_chain.cu
+UU c/tests/test_cuda_chain.cu
+M  docs/ENVIRONMENT.md
+M  docs/qwen36-cuda-tier.md
+12478b4d CUDA chain: the prompt attention stages K and V with 16-byte loads
+3cf06708 pila 20261027-2343
+ c/cuda_chain.cu            | 38 ++++++++++++++++++++++++++++++++++++--
+ c/tests/test_cuda_chain.cu | 29 +++++++++++++++++++++++++++++
+ docs/ENVIRONMENT.md        |  2 +-
+ docs/qwen36-cuda-tier.md   | 11 +++++++++++
+ 4 files changed, 77 insertions(+), 3 deletions(-)
+the same lines added and removed as the PR
+
+=== make cuda-chain-check CUDA_ARCH=sm_75, on the stack + this change (3cf06708 + ab62cf3d, cherry-picked) (make log sha256 ba5f592b37c7bb8dc97dad19f3f3a4930b8ecd2fd8fd643624f2884f13399ea4, rc 0) ===
+  ok   prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate
+  prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate: max |diff| 1.52e-04
+  ok   prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate
+  prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate: max |diff| 7.48e-05
+  ok   prompt rows: H 8 KV 8 hd 128, 17 rows after 200
+  prompt rows: H 8 KV 8 hd 128, 17 rows after 200: max |diff| 4.84e-05
+  ok   prompt rows: H 16 KV 4 hd 128, 64 rows after 0
+  prompt rows: H 16 KV 4 hd 128, 64 rows after 0: max |diff| 3.16e-04
+  ok   prompt rows: H 16 KV 2 hd 256, 2043 rows after 6144: aligned K and V, the scalar loop's bits
+  ok   and rows 0, 1, 1024 and 2042 within 4e-3 of the reference
+  rows 0, 1, 1024 and 2042 after 6144: max |diff| 1.38e-05
+  ok   forty rows, three layers in two places (the first and the third in place 0): the other place is copied while the first waits to be read, the third layer's copy waits for the first's fetch_done_at
+  ok   forty rows, three layers in two places (the first and the third in place 1): the other place is copied while the first waits to be read, the third layer's copy waits for the first's fetch_done_at
+  ok   a third place refused
+OK test_cuda_chain: every op of the CUDA chain matches its reference
+  ok   a failed launch loses the device to the chain
+  ok   every later call returns 0
+OK test_cuda_chain: every op of the CUDA chain matches its reference
+
+=== the kernels' resources in this commit's test binary, sm_75 (cuobjdump --dump-resource-usage) ===
+-rwxr-xr-x 1 root root 8415856 Oct 28 01:31 cuda_chain_test
+ Function _Z10cc_attn_fkILi256ELb0EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:161 STACK:0 SHARED:40576 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi256ELb1EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:219 STACK:0 SHARED:40576 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi128ELb0EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:102 STACK:0 SHARED:24192 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi64ELb0EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:91 STACK:0 SHARED:16000 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+
+## the same tests on the code as measured (af7ef308, before the review reshaped the test: 2048 rows, rows 0, 1, 1024 and 2047), on the VM of the runs
+
+=== make cuda-chain-check CUDA_ARCH=sm_75, on this change on origin/dev (af7ef308) (make log sha256 ed74416b038730eb2798a539067fa2863a88ddb5d1ff0f3086414bfcdab516ec, rc 0) ===
+af7ef308 WIP (local): cc_attn_fk stages K and V 16 bytes a load at head dim 256
+  ok   prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate
+  prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate: max |diff| 1.52e-04
+  ok   prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate
+  prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate: max |diff| 7.48e-05
+  ok   prompt rows: H 8 KV 8 hd 128, 17 rows after 200
+  prompt rows: H 8 KV 8 hd 128, 17 rows after 200: max |diff| 4.84e-05
+  ok   prompt rows: H 16 KV 4 hd 128, 64 rows after 0
+  prompt rows: H 16 KV 4 hd 128, 64 rows after 0: max |diff| 3.16e-04
+  ok   prompt rows: H 16 KV 2 hd 256, 2048 rows after 6144: aligned K and V, the scalar loop's bits
+  ok   and rows 0, 1, 1024 and 2047 within 4e-3 of the reference
+  rows 0, 1, 1024 and 2047 after 6144: max |diff| 1.38e-05
+OK test_cuda_chain: every op of the CUDA chain matches its reference
+  ok   a failed launch loses the device to the chain
+  ok   every later call returns 0
+OK test_cuda_chain: every op of the CUDA chain matches its reference
+
+=== the same with the 16-byte staging rounding toward zero (__float2half_rz, by sed): the bits check must fail, the check against the reference must pass (make log sha256 d19a837b8949d28ad5d18de0c769550e4a7eadd54b450119c10950c12b9c4118, make rc 2, as the step wants) ===
+ c/cuda_chain.cu | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+  FAIL prompt rows: H 16 KV 2 hd 256, 2048 rows after 6144: aligned K and V, the scalar loop's bits
+  ok   and rows 0, 1, 1024 and 2047 within 4e-3 of the reference
+  rows 0, 1, 1024 and 2047 after 6144: max |diff| 3.49e-05
+make rc=2
+?? cuda_chain_test
+
+=== make cuda-test CUDA=1 CUDA_ARCH=sm_75, on af7ef308: each test binary and its last line (make log sha256 f3b3df9662c3a4ec2889b628a211967d168863b3d98749b591811b4cba1562fc, rc 0) ===
+./backend_cuda_test: cuda backend: q8/q4/q2/f32/e8 correctness ok on 1 device(s)
+./cuda_init_failure_test: CUDA initialization rollback: PASS
+./ragged_attention_test: ragged_relative_rms=0 ragged_g64_relative_rms=0 warm_ms=6.399 cross_page_growth_ms=0.122 grow_1024_ms=2.571 steady_1024_ms=0.317
+./cuda_fmt_trap_test: cuda fmt trap tests: ok
+./fp8_warp_test: OK
+./absorb_determinism_test: absorb_determinism iters_per_cell=30 S_batch=128 S_ragged=128 batch_differing=0/145 batch_worst_pct_of_range=0 ragged_differing=0/29 ragged_worst_pct_of_range=0
+./fp8_cuda_test: OK
+./weights_owned_test: weights_owned upload-failure test passed (8 fail cycles, 0 bytes cumulative)
+./mxfp4_cuda_test: test_mxfp4_cuda: ok
+./mxfp4_expert_cuda_test: ok SiTU expert S=1 D=64 I=128 b1=1.5 b2=2.5
+./alloc_footprint_test: test_alloc_footprint_cuda: ok
+
+=== make cuda-chain-check CUDA_ARCH=sm_75, on the stack + this change (ac5cf17b) (make log sha256 b1fde38a3d566ee87f0d42c423211d4d54ec6b8de26ae1758f48346da0945c32, rc 0) ===
+ac5cf17b WIP (local): cc_attn_fk stages K and V 16 bytes a load at head dim 256
+  ok   prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate
+  prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate: max |diff| 1.52e-04
+  ok   prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate
+  prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate: max |diff| 7.48e-05
+  ok   prompt rows: H 8 KV 8 hd 128, 17 rows after 200
+  prompt rows: H 8 KV 8 hd 128, 17 rows after 200: max |diff| 4.84e-05
+  ok   prompt rows: H 16 KV 4 hd 128, 64 rows after 0
+  prompt rows: H 16 KV 4 hd 128, 64 rows after 0: max |diff| 3.16e-04
+  ok   prompt rows: H 16 KV 2 hd 256, 2048 rows after 6144: aligned K and V, the scalar loop's bits
+  ok   and rows 0, 1, 1024 and 2047 within 4e-3 of the reference
+  rows 0, 1, 1024 and 2047 after 6144: max |diff| 1.38e-05
+OK test_cuda_chain: every op of the CUDA chain matches its reference
+  ok   a failed launch loses the device to the chain
+  ok   every later call returns 0
+OK test_cuda_chain: every op of the CUDA chain matches its reference
+
+## the kernel each version runs: a 2048-token prompt under nsys (--trace=cuda), nsys stats cuda_gpu_kern_sum, the prompt attention's rows (one chunk: the 10 attention layers' calls)
+
+=== T4, a = origin/dev c1c06ac6 + our 14 open PRs that build on it (#2015, #2016, #2413, #2414, #2415, #2416, #2417, #2418, #2421, #2422, #2423, #2424, #2425, #2428), one commit each, in number order (3cf06708, c/ tree b53ba5e7f032e60b49d3d0de6afd828ef94ea5b6) ===
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+13.3,312949025,10,31294902.5,31092986.0,29611700,34332898,1499138.6,"void cc_attn_fk<(int)256>(const float *, const float *, const float *, float *, const float *, CcAttn, int, int, const float *, int, int)"
+0.0,694453,20,34722.7,34431.5,8544,61311,26702.8,"cc_attn_dec_k(const float *, const float *, const float *, float *, const float *, float *, CcAttn, int, int, int, const float *, int, int)"
+
+=== T4, b = the same + this change (ac5cf17b, c/ tree a697679dae6faf40ed6f207ee0b60d3de1aeec4a) ===
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+8.3,189578263,10,18957826.3,18655764.5,17842115,20751696,947810.6,"void cc_attn_fk<(int)256, (bool)1>(const float *, const float *, const float *, float *, const float *, CcAttn, int, int, const float *, int, int)"
+0.0,693365,20,34668.3,34399.5,8480,60895,26715.2,"cc_attn_dec_k(const float *, const float *, const float *, float *, const float *, float *, CcAttn, int, int, int, const float *, int, int)"
+
+=== L4, a = origin/dev c1c06ac6 + our 14 open PRs that build on it (#2015, #2016, #2413, #2414, #2415, #2416, #2417, #2418, #2421, #2422, #2423, #2424, #2425, #2428), one commit each, in number order (3cf06708, c/ tree b53ba5e7f032e60b49d3d0de6afd828ef94ea5b6) ===
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+10.4,94296887,10,9429688.7,9627273.0,8200936,9839977,490163.3,"void cc_attn_fk<(int)256>(const float *, const float *, const float *, float *, const float *, CcAttn, int, int, const float *, int, int)"
+0.1,617280,20,30864.0,29072.0,6144,57408,25307.8,"cc_attn_dec_k(const float *, const float *, const float *, float *, const float *, float *, CcAttn, int, int, int, const float *, int, int)"
+
+=== L4, b = the same + this change (ac5cf17b, c/ tree a697679dae6faf40ed6f207ee0b60d3de1aeec4a) ===
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+6.1,54799458,10,5479945.8,5552378.0,4865993,5656778,228180.7,"void cc_attn_fk<(int)256, (bool)1>(const float *, const float *, const float *, float *, const float *, CcAttn, int, int, const float *, int, int)"
+0.1,616961,20,30848.0,28704.0,6240,57568,25265.4,"cc_attn_dec_k(const float *, const float *, const float *, float *, const float *, float *, CcAttn, int, int, int, const float *, int, int)"
+
+## the kernels' resources in the measured binaries (cuobjdump --dump-resource-usage of qwen36-bench)
+
+=== T4, sm_75 (a, then b) ===
+== a
+ Function _Z10cc_attn_fkILi256EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:161 STACK:0 SHARED:40576 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi128EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:102 STACK:0 SHARED:24192 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi64EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:91 STACK:0 SHARED:16000 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+== b
+ Function _Z10cc_attn_fkILi256ELb0EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:161 STACK:0 SHARED:40576 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi256ELb1EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:219 STACK:0 SHARED:40576 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi128ELb0EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:102 STACK:0 SHARED:24192 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi64ELb0EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:91 STACK:0 SHARED:16000 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+
+=== L4, sm_89 (a, then b) ===
+== a
+ Function _Z10cc_attn_fkILi256EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:162 STACK:0 SHARED:40576 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi128EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:97 STACK:0 SHARED:24192 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi64EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:80 STACK:0 SHARED:16000 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+== b
+ Function _Z10cc_attn_fkILi256ELb0EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:162 STACK:0 SHARED:40576 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi256ELb1EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:218 STACK:0 SHARED:40576 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi128ELb0EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:97 STACK:0 SHARED:24192 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi64ELb0EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:80 STACK:0 SHARED:16000 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0

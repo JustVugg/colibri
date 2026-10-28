@@ -309,6 +309,34 @@ static ColiCudaTensor *moe_mat(int fmt, int gs, int I, int O, unsigned seed, std
     return ok ? t : NULL;
 }
 
+/* Qwen3.6's last chunk of an 8192-token prompt, 2043 rows after 6144 (the last block of keys is partial): K and V
+ * 16-byte aligned take cc_attn_fk's 16-byte staging, which must give the scalar loop's bits (the same K and V one float
+ * further on take the scalar loop); four rows against the reference. */
+static void prompt_rows_16byte_staging(void) {
+    const int H = 16, KV = 2, hd = 256, S = 2043, pos = 6144, cap = 8384, qdim = 2 * hd;
+    std::vector<float> q = rnd((size_t)S * H * qdim, 54), kc = rnd((size_t)33 + (size_t)KV * cap * hd, 55),
+                       vc = rnd((size_t)33 + (size_t)KV * cap * hd, 56), kc1(kc.size()), vc1(vc.size());
+    memcpy(kc1.data() + 1, kc.data(), (kc.size() - 1) * 4); memcpy(vc1.data() + 1, vc.data(), (vc.size() - 1) * 4);
+    size_t n = (size_t)S * H * hd;
+    CcAttn p = {S, H, KV, hd, pos, cap, 0, H * qdim, qdim, hd, H * qdim, qdim, 1, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), 32, 32};
+    CcAttn p1 = p; p1.k_off = p1.v_off = 33;
+    CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *kb1 = up(kc1), *vb1 = up(vc1);
+    CcBuf *ob = T->buf(n * 4, CC_DEV), *ob1 = T->buf(n * 4, CC_DEV);
+    int ran = T->begin() && T->attn(qb, kb, vb, ob, qb, NULL, &p) && T->attn(qb, kb1, vb1, ob1, qb, NULL, &p1) && T->submit(1);
+    std::vector<float> o = down(ob, n), o1 = down(ob1, n);
+    ck(ran && !memcmp(o.data(), o1.data(), n * 4), "prompt rows: H 16 KV 2 hd 256, 2043 rows after 6144: aligned K and V, the scalar loop's bits");
+    double d = 0;
+    for (int r : {0, 1, 1024, 2042}) {   /* a row alone: one position more each */
+        CcAttn pr = p; pr.S = 1; pr.pos_base = pos + r; pr.q_off = r * p.q_row; pr.g_off = p.g_off + r * p.g_row; pr.o_off = 0;
+        std::vector<float> ref((size_t)H * hd);
+        ref_attn(q.data(), kc.data(), vc.data(), ref.data(), q.data(), NULL, &pr);
+        d = fmax(d, maxdiff(o.data() + (size_t)r * H * hd, ref.data(), ref.size()));
+    }
+    ck(d < 4e-3, "and rows 0, 1, 1024 and 2042 within 4e-3 of the reference");
+    printf("  rows 0, 1, 1024 and 2042 after 6144: max |diff| %.2e\n", d);
+    T->free(qb); T->free(kb); T->free(vb); T->free(kb1); T->free(vb1); T->free(ob); T->free(ob1);
+}
+
 int main(void) {
     int dev = 0;
     if (!coli_cuda_init(&dev, 1)) { printf("no CUDA device: skipped\n"); return 0; }
@@ -614,6 +642,7 @@ int main(void) {
             T->free(qb); T->free(kb); T->free(vb); T->free(ob);
         }
     }
+    prompt_rows_16byte_staging();
     printf("dnconv\n");
     {
         const int CD = 200, CK = 4, S = 5, PD = CD + 16;

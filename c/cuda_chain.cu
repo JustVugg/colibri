@@ -267,7 +267,37 @@ __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict_
 #else
 #define CC_FA_BODY 0
 #endif
+#if CC_FA_BODY
+/* cc_attn_fk<HD, true>: a key block of K or V (keys k0 .. k0 + 63) into skv 16 bytes a load. Each thread starts a
+ * group of float4 loads (16 at head dim 256) before it converts and stores any: the scalar loop waits on each 4-byte
+ * load as it uses it, with one warp a scheduler to hide the wait (on a T4, the last chunk of an 8192-token prompt:
+ * two thirds of the warps' samples on the two conversions after those loads). The same layout and rounding as
+ * the scalar loop: the same bits. The groups one after the other, not unrolled: Q's fragments already hold 128
+ * registers. Needs src + off 16-byte aligned (cc_attn checks). */
 template<int HD>
+__device__ static inline void cc_fa_stage4(__half *skv, const float *__restrict__ src, int off, int g, int cap, int k0,
+                                           int nt, int ring, int tid) {
+    constexpr int LD = HD + 8, NV = CC_FA_BC * HD / 4 / 128, NB = NV < 16 ? NV : 16;   /* a thread's float4s, a group */
+    static_assert(HD % 4 == 0 && NV % NB == 0, "whole float4s and whole groups");
+    #pragma unroll 1
+    for (int b0 = 0; b0 < NV; b0 += NB) {
+        float4 r[NB];
+        #pragma unroll
+        for (int i = 0; i < NB; i++) {
+            int e = (tid + 128 * (b0 + i)) * 4, kl = e / HD, d = e - kl * HD, key = k0 + kl;
+            r[i] = key < nt ? __ldg(reinterpret_cast<const float4 *>(src + off + (g * cap + (ring ? key % ring : key)) * HD + d))
+                            : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        #pragma unroll
+        for (int i = 0; i < NB; i++) {
+            int e = (tid + 128 * (b0 + i)) * 4, kl = e / HD, d = e - kl * HD;
+            __half2 lo = __floats2half2_rn(r[i].x, r[i].y), hi = __floats2half2_rn(r[i].z, r[i].w);
+            *reinterpret_cast<uint2 *>(skv + kl * LD + d) = make_uint2(*reinterpret_cast<unsigned *>(&lo), *reinterpret_cast<unsigned *>(&hi));
+        }
+    }
+}
+#endif
+template<int HD, bool F4 = false>   /* F4: K and V staged 16 bytes a load (cc_fa_stage4) */
 __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict__ q, const float *__restrict__ kc,
         const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, CcAttn p, int GQ,
         int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0, int ring = 0) {   /* CcAttnW's window and sinks, a ring */
@@ -317,7 +347,8 @@ __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict
         }
         for (int kb = kb_lo; kb < nkb; kb++) {
             int k0 = kb * CC_FA_BC;
-            for (int e = tid; e < CC_FA_BC * HD; e += 128) {   /* K of keys k0 .. k0 + 63, zero past nt */
+            if (F4) cc_fa_stage4<HD>(skv, kc, p.k_off, g, p.cap, k0, nt, ring, tid);
+            else for (int e = tid; e < CC_FA_BC * HD; e += 128) {   /* K of keys k0 .. k0 + 63, zero past nt */
                 int kl = e / HD, d = e - kl * HD, key = k0 + kl;
                 float v = key < nt ? kc[p.k_off + (g * p.cap + (ring ? key % ring : key)) * HD + d] : 0.f;
                 skv[kl * LD + d] = __float2half(v);
@@ -356,7 +387,8 @@ __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict
                 sp[row * LP + cl + i] = __float2half(key <= qpos && (win <= 0 || key > qpos - win) ? __expf(sv - m) : 0.f);
             }
             __syncthreads();   /* P complete, K consumed */
-            for (int e = tid; e < CC_FA_BC * HD; e += 128) {   /* V of the same keys */
+            if (F4) cc_fa_stage4<HD>(skv, vc, p.v_off, g, p.cap, k0, nt, ring, tid);
+            else for (int e = tid; e < CC_FA_BC * HD; e += 128) {   /* V of the same keys */
                 int kl = e / HD, d = e - kl * HD, key = k0 + kl;
                 float v = key < nt ? vc[p.v_off + (g * p.cap + (ring ? key % ring : key)) * HD + d] : 0.f;
                 skv[kl * LD + d] = __float2half(v);
@@ -1348,6 +1380,8 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
         dim3 fg((unsigned)((p->S + 16 / G - 1) / (16 / G)), (unsigned)p->KVH);
         if (p->hd == 64) cc_attn_fk<64><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G);
         else if (p->hd == 128) cc_attn_fk<128><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G);
+        else if (((p->k_off | p->v_off) & 3) == 0 && (((size_t)fp(kc) | (size_t)fp(vc)) & 15) == 0)   /* float4 loads */
+            cc_attn_fk<256, true><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G);
         else cc_attn_fk<256><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G);
         return launched(c, "attn (tensor cores)");
     }

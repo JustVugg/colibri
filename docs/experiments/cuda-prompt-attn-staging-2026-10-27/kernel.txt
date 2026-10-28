@@ -1,0 +1,258 @@
+# CUDA chain, the prompt attention stages K and V with 16-byte loads: the kernel alone, before the engine (2026-10-27)
+# Another Google Colab T4 high-RAM VM, before the runs of the other files (its log names the card: Tesla T4, 15.6 GB, sm_75; nvcc for sm_75 as make cuda-chain-check builds).
+# A test program (its source at the end) calls the chain's attention (T->attn, cc_attn) on the four chunks of an
+#   8192-token prompt as Qwen3.6 runs them: 2048 rows after 0, 2048, 4096 and 6144 positions, 16 query heads on
+#   2 kv heads of 256, the output gate, the cache's capacity 8384. A call is begin, attn, submit(1), on the host's
+#   clock; each chunk checks rows 0, 1, 1024 and 2047 against a reference in double, and hashes the whole output.
+# The kernel measured is a prototype of this change behind a variable, on origin/dev c1c06ac6 (cuda_chain.cu sha256
+#   c21aa520c8cbc2851816fb052843f8484d40e0386ca8265b1d5f3cf9637c3001; dev's 065437daeafe739e5301c7c35d2c4803b788da7afed6cef4eb24d62def2479a8):
+#   COLI_CUDA_CHAIN_FA_V16=16 stages with this change's loop (groups of 16 float4 loads), =8 with groups of 8;
+#   A is dev's kernel. The resources (cuobjdump) are at the top of the log: dev's 161 registers, 16's 219, stack 0.
+
+## the times: the log, in full (sha256 0838beefc440d95da1ed39629c5827f77ab00adcf5eda1096ce01261aa808871); the clock locked to 1320 MHz, two rounds of A, 8, 16,
+## 5 calls a chunk each
+[19:57:25] prova v16c: COLI_CUDA_CHAIN_FA_V16=8 COLI_CUDA_CHAIN_FA_V16=16
+065437daeafe739e5301c7c35d2c4803b788da7afed6cef4eb24d62def2479a8  /content/colibri/c/cuda_chain.cu.dev
+c21aa520c8cbc2851816fb052843f8484d40e0386ca8265b1d5f3cf9637c3001  /content/colibri/c/cuda_chain.cu
+== resources
+ Function _Z10cc_attn_fkILi256ELi0EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:161 STACK:0 SHARED:40576 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi256ELi16EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:219 STACK:0 SHARED:40576 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi256ELi8EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:171 STACK:0 SHARED:40576 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi256ELi4EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:161 STACK:0 SHARED:40576 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z10cc_attn_fkILi256ELi2EEvPKfS1_S1_PfS1_6CcAttniiS1_ii:
+  REG:161 STACK:0 SHARED:40576 LOCAL:0 CONSTANT[0]:496 TEXTURE:0 SURFACE:0 SAMPLER:0
+== the chain's test with COLI_CUDA_CHAIN_FA_V16=8
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+  prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate: max |diff| 1.52e-04
+  prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate: max |diff| 7.48e-05
+  prompt rows: H 8 KV 8 hd 128, 17 rows after 200: max |diff| 4.84e-05
+  prompt rows: H 16 KV 4 hd 128, 64 rows after 0: max |diff| 3.16e-04
+OK test_cuda_chain: every op of the CUDA chain matches its reference
+test rc=0
+== the chain's test with COLI_CUDA_CHAIN_FA_V16=16
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+  prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate: max |diff| 1.52e-04
+  prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate: max |diff| 7.48e-05
+  prompt rows: H 8 KV 8 hd 128, 17 rows after 200: max |diff| 4.84e-05
+  prompt rows: H 16 KV 4 hd 128, 64 rows after 0: max |diff| 3.16e-04
+OK test_cuda_chain: every op of the CUDA chain matches its reference
+test rc=0
+== the bench, clock locked
+All done.
+-- A (dev's kernel), round 1
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+chunk  after  calls  median ms  best ms  TFLOP/s  max|diff| rows 0,1,1024,2047  output hash
+    0      0      5     27.197   26.797     1.26  2.84e-04  2cdaf57d8a27196a
+       calls: 26.797 26.863 27.198 27.413 27.197
+    1   2048      5    110.224  110.195     0.94  1.56e-05  31a636631bce4f00
+       calls: 110.232 110.208 110.240 110.224 110.195
+    2   4096      5    183.568  183.516     0.94  1.45e-05  1678e750e1dabff1
+       calls: 183.516 184.799 183.568 184.802 183.523
+    3   6144      5    259.879  258.777     0.93  1.19e-05  c2f79ae567d951ec
+       calls: 259.991 259.879 260.021 259.280 258.777
+-- COLI_CUDA_CHAIN_FA_V16=8, round 1
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+chunk  after  calls  median ms  best ms  TFLOP/s  max|diff| rows 0,1,1024,2047  output hash
+    0      0      5     16.147   16.097     2.13  2.84e-04  2cdaf57d8a27196a
+       calls: 16.120 16.147 16.160 16.097 16.182
+    1   2048      5     47.774   47.731     2.16  1.56e-05  31a636631bce4f00
+       calls: 47.776 47.734 47.777 47.774 47.731
+    2   4096      5     78.744   78.728     2.18  1.45e-05  1678e750e1dabff1
+       calls: 78.819 78.949 78.744 78.736 78.728
+    3   6144      5    109.984  109.800     2.19  1.19e-05  c2f79ae567d951ec
+       calls: 110.035 109.984 109.850 109.800 110.053
+-- COLI_CUDA_CHAIN_FA_V16=16, round 1
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+chunk  after  calls  median ms  best ms  TFLOP/s  max|diff| rows 0,1,1024,2047  output hash
+    0      0      5     15.713   15.698     2.19  2.84e-04  2cdaf57d8a27196a
+       calls: 15.763 15.713 15.794 15.698 15.712
+    1   2048      5     41.999   41.960     2.45  1.56e-05  31a636631bce4f00
+       calls: 42.069 41.975 42.161 41.960 41.999
+    2   4096      5     69.016   68.852     2.49  1.45e-05  1678e750e1dabff1
+       calls: 69.206 69.016 68.852 68.896 69.445
+    3   6144      5     96.502   96.175     2.49  1.19e-05  c2f79ae567d951ec
+       calls: 96.673 96.326 96.763 96.175 96.502
+-- A (dev's kernel), round 2
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+chunk  after  calls  median ms  best ms  TFLOP/s  max|diff| rows 0,1,1024,2047  output hash
+    0      0      5     27.067   26.544     1.27  2.84e-04  2cdaf57d8a27196a
+       calls: 27.196 27.064 27.188 26.544 27.067
+    1   2048      5    110.194  110.189     0.94  1.56e-05  31a636631bce4f00
+       calls: 110.214 110.189 110.189 110.194 110.234
+    2   4096      5    183.861  182.818     0.93  1.45e-05  1678e750e1dabff1
+       calls: 183.786 183.950 182.818 183.973 183.861
+    3   6144      5    260.002  259.012     0.93  1.19e-05  c2f79ae567d951ec
+       calls: 260.002 259.012 261.311 260.202 259.695
+-- COLI_CUDA_CHAIN_FA_V16=8, round 2
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+chunk  after  calls  median ms  best ms  TFLOP/s  max|diff| rows 0,1,1024,2047  output hash
+    0      0      5     16.128   16.099     2.13  2.84e-04  2cdaf57d8a27196a
+       calls: 16.099 16.128 16.136 16.122 16.170
+    1   2048      5     47.758   47.750     2.16  1.56e-05  31a636631bce4f00
+       calls: 47.758 47.757 47.750 48.084 48.245
+    2   4096      5     78.572   78.410     2.19  1.45e-05  1678e750e1dabff1
+       calls: 78.572 78.410 78.566 79.453 79.353
+    3   6144      5    109.572  109.553     2.20  1.19e-05  c2f79ae567d951ec
+       calls: 109.700 109.643 109.572 109.560 109.553
+-- COLI_CUDA_CHAIN_FA_V16=16, round 2
+[CUDA] device 0: Tesla T4, 15.6 GB VRAM, sm_75
+chunk  after  calls  median ms  best ms  TFLOP/s  max|diff| rows 0,1,1024,2047  output hash
+    0      0      5     15.619   15.587     2.20  2.84e-04  2cdaf57d8a27196a
+       calls: 15.821 15.648 15.619 15.587 15.589
+    1   2048      5     41.835   41.696     2.46  1.56e-05  31a636631bce4f00
+       calls: 41.748 41.696 42.080 42.045 41.835
+    2   4096      5     68.875   68.620     2.49  1.45e-05  1678e750e1dabff1
+       calls: 68.917 68.966 68.788 68.620 68.875
+    3   6144      5     95.886   95.516     2.51  1.19e-05  c2f79ae567d951ec
+       calls: 95.800 96.591 95.516 96.006 95.886
+All done.
+    208 1320 MHz
+
+## the medians of all the calls of each kernel, a call (one layer), ms (banco.py over the log above)
+kernel                                chunk 0          chunk 1          chunk 2          chunk 3    sum ms      x  bits
+A                               27.13 (1.00x)   110.21 (1.00x)   183.82 (1.00x)   259.94 (1.00x)    581.10   1.00  same as A; max|diff| 2.84e-04; calls a chunk 10
+COLI_CUDA_CHAIN_FA_V16=8        16.13 (1.68x)    47.77 (2.31x)    78.74 (2.33x)   109.75 (2.37x)    252.39   2.30  same as A; max|diff| 2.84e-04; calls a chunk 10
+COLI_CUDA_CHAIN_FA_V16=16       15.71 (1.73x)    41.99 (2.62x)    68.91 (2.67x)    96.25 (2.70x)    222.85   2.61  same as A; max|diff| 2.84e-04; calls a chunk 10
+
+## where the warps wait: ncu --clock-control none --set full on one call of chunk 3 (after 6144), its source
+## page in SASS (--page source --csv --print-source sass), each instruction's warp stall samples summed
+
+=== dev's kernel (source csv sha256 ecf89c5dec3d8770e0e18272e25296ed1b74744cc435ea7166fba485fbdd6daf) ===
+3168 instructions, 3670009 samples
+  stall_long_sb               2610030   71.1%
+  stall_wait                   496347   13.5%
+  stall_selected               377342   10.3%
+  stall_short_sb                83667    2.3%
+  stall_barrier                 47321    1.3%
+  stall_branch_resolving        21484    0.6%
+  stall_no_inst                 15266    0.4%
+  stall_mio                     12086    0.3%
+
+the 6 instructions with the most samples (address, SASS, samples, % of all, main reasons)
+  0x7c254325ddd0       F2F.F16.F32 R120, R120                                 1618229  44.1%  long_sb 1614617, selected 3612
+  0x7c2543260b00       F2F.F16.F32 R117, R117                                  804415  21.9%  long_sb 802580, selected 1835
+  0x7c254325ddf0       F2F.F16.F32 R124, R124                                   89761   2.4%  long_sb 60575, wait 25553
+  0x7c254325dde0       F2F.F16.F32 R117, R117                                   87850   2.4%  long_sb 58467, wait 25670
+  0x7c2543260b20       F2F.F16.F32 R124, R124                                   44297   1.2%  long_sb 29861, wait 12623
+  0x7c2543260b10       F2F.F16.F32 R120, R120                                   42425   1.2%  long_sb 27978, wait 12687
+
+=== COLI_CUDA_CHAIN_FA_V16=16 (source csv sha256 c5c17e024de33d94b695e09e3ae0a3863bf159a63d5137d7c40dbfddbf5ce928) ===
+4128 instructions, 3670009 samples
+  stall_wait                  1760662   48.0%
+  stall_selected               694236   18.9%
+  stall_long_sb                459520   12.5%
+  stall_no_inst                289189    7.9%
+  stall_branch_resolving       186365    5.1%
+  stall_short_sb               162175    4.4%
+  stall_barrier                 74618    2.0%
+  stall_mio                     30769    0.8%
+
+the 6 instructions with the most samples (address, SASS, samples, % of all, main reasons)
+  0x7eff0f25f350       F2F.F16.F32 R96, R96                                    280317   7.6%  long_sb 271587, branch_resolving 5985
+  0x7eff0f263ec0       F2F.F16.F32 R96, R96                                    147943   4.0%  long_sb 143679, branch_resolving 2937
+  0x7eff0f260630  @!P0 BRA 0x7eff0f265150                                       22291   0.6%  barrier 20930, wait 1046
+  0x7eff0f2653f0       FSETP.GT.AND P1, PT, R96, -9.99999968028569246507e+37    19226   0.5%  barrier 18368, wait 705
+  0x7eff0f25fca0       S2R R2, SR_TID.X                                         17707   0.5%  barrier 16394, wait 972
+  0x7eff0f25c280       IMAD.MOV.U32 R179, RZ, RZ, R174                          13563   0.4%  no_inst 12549, branch_resolving 1007
+
+## the test program, vm/banco_attn.cu (built from c/ as make cuda-chain-check builds its test: backend_cuda.cu cuda_chain.cu tests/banco_attn.cu)
+/* banco_attn.cu: the prompt attention of Qwen3.6's CUDA chain on the engine's shapes, for the plan of
+ * model-inspection/pr-cuda-prompt-attn-20261027 (step 1, the diagnosis; step 3, the prototype). It takes the engine's
+ * own entry (T->attn = cc_attn, which runs cc_attn_fk<256> from 16 rows) with the fields qwen36_cuda_chain.h:932-935
+ * fills: 2048 rows after 0, 2048, 4096 and 6144 positions (the four chunks of an 8192 prompt), 16 query heads on 2 kv
+ * heads of 256, the output gate beside each head's query (the test's "prompt rows" case), the cache's capacity 8384
+ * (the bench's Q36_MAXT at 8192). Built like `make cuda-chain-check` (c/Makefile:1333), from c/:
+ * backend_cuda.cu cuda_chain.cu tests/banco_attn.cu.
+ *   banco_attn [reps [shape]]   reps timed calls a shape after one warm-up (default 5); shape 0..3, or -1 for all
+ * A call is begin, attn, submit(1) (submit waits for the device), timed on the host's clock. Each shape then checks
+ * rows 0, 1, 1024 and 2047 against a reference in double over all their positions, and prints a hash of the whole
+ * output: two kernels that agree bit for bit print the same hash. */
+#include "../backend_cuda.h"
+#include "../cuda_chain.h"
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+static const ColiCudaChainOps *T;
+static float frand(unsigned *s) { *s = *s * 1664525u + 1013904223u; return ((*s >> 8) & 0xFFFF) / 65535.f * 2.f - 1.f; }
+static std::vector<float> rnd(size_t n, unsigned seed) { std::vector<float> v(n); unsigned s = seed; for (auto &x : v) x = frand(&s); return v; }
+static CcBuf *up(const std::vector<float> &v) {
+    CcBuf *b = T->buf(v.size() * 4, CC_DEV);
+    if (!b || !T->begin() || !T->write(b, 0, v.data(), v.size() * 4) || !T->submit(1)) { printf("upload failed\n"); exit(1); }
+    return b;
+}
+/* one row's output, every head, in double (the test's ref_attn, no selection list) */
+static void ref_row(const float *q, const float *kc, const float *vc, const CcAttn *p, int s, std::vector<double> &out) {
+    int rep = p->H / p->KVH, n = p->pos_base + s + 1;
+    std::vector<double> e(n);
+    out.assign((size_t)p->H * p->hd, 0.0);
+    for (int h = 0; h < p->H; h++) {
+        const float *qs = q + p->q_off + (size_t)s * p->q_row + h * p->q_seg, *g = q + p->g_off + (size_t)s * p->g_row + h * p->g_seg;
+        size_t kb = (size_t)(h / rep) * p->cap;
+        double m = -1e300, l = 0, *o = &out[(size_t)h * p->hd];
+        for (int t = 0; t < n; t++) {
+            const float *k = kc + p->k_off + (kb + t) * p->hd;
+            double a = 0; for (int d = 0; d < p->hd; d++) a += (double)qs[d] * k[d];
+            e[t] = a * p->scale; m = std::max(m, e[t]);
+        }
+        for (int t = 0; t < n; t++) { e[t] = exp(e[t] - m); l += e[t]; }
+        for (int t = 0; t < n; t++) { const float *v = vc + p->v_off + (kb + t) * p->hd; for (int d = 0; d < p->hd; d++) o[d] += e[t] * v[d]; }
+        for (int d = 0; d < p->hd; d++) o[d] = o[d] / l / (1.0 + exp(-(double)g[d]));
+    }
+}
+static uint64_t fnv(const void *b, size_t n) {   /* FNV-1a over the output's bytes */
+    const unsigned char *c = (const unsigned char *)b; uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) { h ^= c[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+int main(int argc, char **argv) {
+    int reps = argc > 1 ? atoi(argv[1]) : 5, only = argc > 2 ? atoi(argv[2]) : -1;
+    int dev = 0;
+    if (!coli_cuda_init(&dev, 1)) { printf("no CUDA device\n"); return 1; }
+    T = coli_cuda_chain_ops();
+    if (!T || !T->init(0)) { printf("no chain context\n"); return 1; }
+    const int H = 16, KV = 2, HD = 256, S = 2048, CAP = 8384, qdim = 2 * HD;   /* a head's query, then its gate */
+    std::vector<float> q = rnd((size_t)S * H * qdim, 51), kc = rnd((size_t)KV * CAP * HD, 52), vc = rnd((size_t)KV * CAP * HD, 53);
+    std::vector<float> o((size_t)S * H * HD);
+    CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *ob = T->buf(o.size() * 4, CC_DEV);
+    const int rows[4] = {0, 1, S / 2, S - 1};
+    printf("chunk  after  calls  median ms  best ms  TFLOP/s  max|diff| rows 0,1,%d,%d  output hash\n", S / 2, S - 1);
+    for (int c = 0; c < 4; c++) {
+        if (only >= 0 && c != only) continue;
+        int pb = 2048 * c;
+        CcAttn p = {S, H, KV, HD, pb, CAP, 0, H * qdim, qdim, HD, H * qdim, qdim, 1, 0, H * HD, 0, 0, 1.f / sqrtf((float)HD), 0, 0};
+        std::vector<double> ms;
+        for (int r = 0; r <= reps; r++) {   /* r 0 is the warm-up */
+            auto t0 = std::chrono::steady_clock::now();
+            if (!(T->begin() && T->attn(qb, kb, vb, ob, qb, NULL, &p) && T->submit(1))) { printf("attn failed\n"); return 1; }
+            double t = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (r) ms.push_back(t);
+        }
+        if (!T->read(ob, 0, o.data(), o.size() * 4)) { printf("read back failed\n"); return 1; }
+        double d = 0;
+        std::vector<double> ref;
+        for (int s : rows) {
+            ref_row(q.data(), kc.data(), vc.data(), &p, s, ref);
+            for (size_t i = 0; i < ref.size(); i++) d = std::max(d, fabs(ref[i] - o[(size_t)s * H * HD + i]));
+        }
+        std::vector<double> sm = ms;
+        std::sort(sm.begin(), sm.end());
+        double med = sm[sm.size() / 2], pairs = (double)S * pb + (double)S * (S + 1) / 2;
+        printf("%5d  %5d  %5d  %9.3f  %7.3f  %7.2f  %.2e  %016llx\n", c, pb, reps, med, sm[0],
+               pairs * 2 * 2 * H * HD / (med / 1e3) / 1e12, d, (unsigned long long)fnv(o.data(), o.size() * 4));
+        printf("       calls:");
+        for (double t : ms) printf(" %.3f", t);
+        printf("\n");
+    }
+    T->free(qb); T->free(kb); T->free(vb); T->free(ob);
+    return 0;
+}

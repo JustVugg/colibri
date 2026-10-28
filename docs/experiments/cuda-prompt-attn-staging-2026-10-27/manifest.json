@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "hypothesis": "The CUDA chain's prompt attention (cc_attn_fk) stages each block of K and V into shared memory as f16 with one 4-byte load at a time, and at head dim 256 on a T4 the warps wait on those loads most of the time (one warp a scheduler). Starting 16 loads of 16 bytes before converting the first keeps the same bits and makes a long prompt faster.",
+  "commit": "c1c06ac6fcb32157e4da130fd96775a32a757052",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64",
+  "command": "bench.c built against c/ (make CUDA=1 CUDA_ARCH=sm_75, as bench build does); COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close ./qwen36-bench --model <model> --text promessi_sposi.txt --lengths 2048,3072,4096,5120,6144,7168,8192 --gen 128 --teacher",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.00GHz (4 cores / 8 threads, 38.5 MiB L3) + NVIDIA Tesla T4 (15360 MiB, sm_75, up to PCIe Gen3 x16)",
+    "ram": "51 GiB",
+    "storage": "Google Colab VM disk (the model downloaded to /content before the runs)",
+    "os": "Ubuntu 24.04.4 LTS (Google Colab, T4 high-RAM), CUDA 13.0 (nvcc V13.0.88), driver 580.82.07, gcc 13.3.0"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "heat_file": "none",
+      "scenario": "the 8192-token prompt of the ladder up (2048, 3072, ... 8192 in one process, each followed by 128 teacher-forced words)",
+      "tok_s": "prompt tokens / the prompt's seconds (bench's prefill_tps of the 8192 row)",
+      "engine_build": "origin/dev c1c06ac6 + our 14 other open PRs (3cf06708, measure-only)"
+    },
+    "samples": {
+      "tok_s": [
+        589.87,
+        591.51,
+        589.59,
+        590.1
+      ],
+      "prefill_s_8192": [
+        13.888,
+        13.849,
+        13.894,
+        13.882
+      ],
+      "decode_tok_s_8192": [
+        49.158,
+        49.207,
+        49.168,
+        49.01
+      ],
+      "nll_8192": [
+        2.41529,
+        2.41529,
+        2.41529,
+        2.41529
+      ]
+    },
+    "median_tok_s": 589.985,
+    "quality": {
+      "method": "make -C c check (macOS arm64); on the T4, make -C c cuda-chain-check (on origin/dev + this change and on the measured stack + this change) and make -C c cuda-test pass, and the chain's test fails when the 16-byte staging rounds toward zero (correctness.txt). Every run of both versions here has the same 8192-token fingerprint (13fc52094ee1426c); the nll of 1024 teacher-forced words after an 8192-token prompt is the same byte for byte (quality.txt)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/cuda-prompt-attn-staging-2026-10-27/ladder-up.txt",
+      "sha256": "0f008bb0d5fa8251aa027119372263ea2cc77c1b442e7c0fd1bcdea196c905b9"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64",
+      "CUDA_EXPERT_GB": "auto",
+      "heat_file": "none",
+      "scenario": "the 8192-token prompt of the ladder up (2048, 3072, ... 8192 in one process, each followed by 128 teacher-forced words)",
+      "tok_s": "prompt tokens / the prompt's seconds (bench's prefill_tps of the 8192 row)",
+      "engine_build": "3cf06708 + this change (measure-only)"
+    },
+    "samples": {
+      "tok_s": [
+        738.54,
+        739.94,
+        737.21,
+        739.41
+      ],
+      "prefill_s_8192": [
+        11.092,
+        11.071,
+        11.112,
+        11.079
+      ],
+      "decode_tok_s_8192": [
+        48.867,
+        49.009,
+        48.917,
+        48.874
+      ],
+      "nll_8192": [
+        2.41529,
+        2.41529,
+        2.41529,
+        2.41529
+      ]
+    },
+    "median_tok_s": 738.9749999999999,
+    "quality": {
+      "method": "make -C c check (macOS arm64); on the T4, make -C c cuda-chain-check (on origin/dev + this change and on the measured stack + this change) and make -C c cuda-test pass, and the chain's test fails when the 16-byte staging rounds toward zero (correctness.txt). Every run of both versions here has the same 8192-token fingerprint (13fc52094ee1426c); the nll of 1024 teacher-forced words after an 8192-token prompt is the same byte for byte (quality.txt)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/cuda-prompt-attn-staging-2026-10-27/ladder-up.txt",
+      "sha256": "0f008bb0d5fa8251aa027119372263ea2cc77c1b442e7c0fd1bcdea196c905b9"
+    }
+  },
+  "outcome": "improvement"
+}

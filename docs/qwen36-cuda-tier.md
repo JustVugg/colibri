@@ -488,6 +488,17 @@ it replaces gave each (head, row) a block that read every K and V row again. On 
 35B, a 1024-token prompt: 226 ms of attention -> 23 ms; a 467-token prompt 819-837 ->
 890-903 tok/s; the loss above 3.2223 -> 3.2271.
 
+At head dim 256 (Qwen3.6) a thread stages K and V 16 bytes a load (`cc_fa_stage4`): it
+starts 16 float4 loads, then converts and stores them, with the 4-byte loop's layout and
+rounding (the same bits). The 4-byte loop waited on each load as it used it, with one
+warp a scheduler to cover the wait: on a T4, in the last chunk of an 8192-token prompt,
+two thirds of the warps' samples sat on the two conversions after those loads. It needs
+K and V 16-byte aligned, as the chain's mirrors are (`cc_attn` checks); head dim 64 and
+128 and `cc_attn_w2` (windows, sinks, the ring) keep the 4-byte loop. The kernel takes
+219 registers instead of 161 on a T4 (218 and 162 on an L4), with no spill. Qwen3.6-35B,
+an 8192-token prompt after shorter ones: 25 % faster on a T4 (6605 experts on the card),
+11 % on an L4 (every expert on the card), with the same logits.
+
 On sm_70 and later the same GEMMs run in f16 (`hcg_tile`: `hcg_dense_k`, `hcg_moe_gu_k`,
 `hcg_moe_dn_k`), at twice the TF32 fragments' rate and with a tile that keeps more of the
 card busy: 256 threads (eight warps) for 64 rows x 64 outputs, K in steps of 64, the next
