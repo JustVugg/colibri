@@ -23,7 +23,10 @@ class ScoreRowsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "rows.txt"
             path.write_bytes(rows.encode() if isinstance(rows, str) else rows)
-            env.update(SNAP=str(SNAP), SCORE=str(path), SCORE_PREFIX="0", OMP_NUM_THREADS="4")
+            # The numeric fixture reference uses float32 KV, as the TF oracle does.
+            # Do not let the serving default (float16 KV) change this score pin.
+            env.update(SNAP=str(SNAP), SCORE=str(path), SCORE_PREFIX="0", KV16="0",
+                       OMP_NUM_THREADS="4")
             return subprocess.run([str(ENGINE), "64", "16", "16"], cwd=C_DIR,
                                   env=env, capture_output=True, text=True, timeout=30)
 
