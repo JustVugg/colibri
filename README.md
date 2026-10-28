@@ -457,6 +457,12 @@ with the last 30 turns as a trend.
 - **images in** on GLM-5.3-Flash, DeepSeek V4.1 Flash, MiMo-V2.6,
   Qwen3.8-Flash-Next and Qwen3.8-27B: a path in a `coli chat` message, an
   attachment in `coli web`, or an `image_url` part;
+- **documents in** on every chat engine: `/file PATH` in `coli chat` (or
+  `coli chat --file PATH`) sends a text file's or a PDF's text with the next
+  message. Only a file named that way is read, never a path inside a message;
+  it must be a regular file with a text suffix or `.pdf`, within 64 MiB and
+  2 million characters. A PDF is parsed in a separate process with a time and
+  memory limit, by `pdftotext` (poppler) or `pypdf`;
 - **pictures out** with Qwen-Image-2.1 on `POST /v1/images/generations`,
   and drawn inside the terminal by `coli chat`
   ([qwen-image.md](docs/qwen-image.md));
